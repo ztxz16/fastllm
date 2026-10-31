@@ -19,7 +19,11 @@ VAE::Tensor VAE::causal(const Tensor &x,const std::string &p,int t,int h,int w,V
     require(weight.cols==x.cols*27,"unsupported Wan VAE causal kernel");
     auto found=s.features.find(p);
     auto prior=found==s.features.end()?Tensor{}:found->second;
-    auto input=prior.rows?rt_.concat({prior,x}):x;
+    // Autocast rounds only at the convolution boundary. Moving that cast
+    // before concatenation/history storage preserves every convolution input
+    // while halving BF16 decoder state and device-to-device copy traffic.
+    auto values=rt_.cast(x,rt_.convolutionRuntime().isFloat32());
+    auto input=prior.rows?rt_.concat({prior,values}):values;
     int history=prior.rows/(h*w);
     // A rowSlice retains its complete backing allocation. Copy just the
     // causal history so a two-frame cache does not pin a six-frame chunk.
@@ -28,14 +32,14 @@ VAE::Tensor VAE::causal(const Tensor &x,const std::string &p,int t,int h,int w,V
 }
 VAE::Tensor VAE::residual(const Tensor &x,const std::string &p,int t,int h,int w,VAEState &s) {
     auto skip=convWeights_.optional(p+".shortcut.weight")?pointwise(x,p+".shortcut"):x;
-    auto y=rt_.activation(rt_.channelNorm(x,weights_.get(p+".residual.0.gamma")));
+    auto y=rt_.channelNormForConv(x,weights_.get(p+".residual.0.gamma"),true);
     y=causal(y,p+".residual.2",t,h,w,s);
-    y=rt_.activation(rt_.channelNorm(y,weights_.get(p+".residual.3.gamma")));
+    y=rt_.channelNormForConv(y,weights_.get(p+".residual.3.gamma"),true);
     return rt_.add(causal(y,p+".residual.6",t,h,w,s),skip);
 }
 VAE::Tensor VAE::middle(const Tensor &input,const std::string &p,int t,int h,int w,VAEState &s) {
     auto x=residual(input,p+".0",t,h,w,s);
-    auto y=rt_.channelNorm(x,weights_.get(p+".1.norm.gamma"));
+    auto y=rt_.channelNormForConv(x,weights_.get(p+".1.norm.gamma"),false);
     auto qkv=pointwise(y,p+".1.to_qkv");
     std::vector<Tensor> frames;
     for(int i=0;i<t;++i) {
@@ -58,12 +62,13 @@ VAE::Tensor VAE::resample(const Tensor &input,const std::string &p,int &t,int &h
             s.features.emplace(key,Tensor{});
         } else {
             auto prior=found->second;
-            auto joined=prior.rows?rt_.concat({prior,x}):x;
+            auto values=rt_.cast(x,rt_.convolutionRuntime().isFloat32());
+            auto joined=prior.rows?rt_.concat({prior,values}):values;
             int history=prior.rows/(h*w);
             Tensor next=rt_.concat({joined.rowSlice(std::max(0,joined.rows-2*h*w),std::min(joined.rows,2*h*w))});
             if(next.rows<h*w*2) {
                 std::vector<float> zeros(size_t(h)*w*x.cols,0.f);
-                next=rt_.concat({rt_.cast(rt_.upload(zeros.data(),h*w,x.cols),x.fp32),next});
+                next=rt_.concat({rt_.cast(rt_.upload(zeros.data(),h*w,x.cols),next.fp32),next});
             }
             x=rt_.conv3d(joined,convWeights_.get(key+".weight"),convWeights_.optional(key+".bias"),
                          t+history,h,w,3,1,1,2-history);
@@ -142,7 +147,7 @@ VAE::Tensor VAE::encodeChunk(const Tensor &input,int t,int h,int w,VAEState &s) 
         }
     }
     x=middle(x,"encoder.middle",t,h,w,s);
-    x=rt_.activation(rt_.channelNorm(x,weights_.get("encoder.head.0.gamma")));
+    x=rt_.channelNormForConv(x,weights_.get("encoder.head.0.gamma"),true);
     x=causal(x,"encoder.head.2",t,h,w,s);
     x=pointwise(x,"conv1");
     auto result=rt_.latentScale(rt_.columns(x,0,16),false);
@@ -168,7 +173,7 @@ VAE::Tensor VAE::decodeChunk(const Tensor &input,int h,int w,VAEState &s) {
             x=resample(x,p,t,h,w,true,stage<2,s);
         }
     }
-    x=rt_.activation(rt_.channelNorm(x,weights_.get("decoder.head.0.gamma")));
+    x=rt_.channelNormForConv(x,weights_.get("decoder.head.0.gamma"),true);
     x=causal(x,"decoder.head.2",t,h,w,s);
     return rt_.clampPixels(x);
 }

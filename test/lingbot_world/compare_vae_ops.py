@@ -67,6 +67,31 @@ def main():
             if status:
                 raise RuntimeError(lib.lingbot_test_error().decode())
             record(f'norm_{c}_{h}_{w}', actual, expected)
+    if bf16:
+        fused = lib.lingbot_test_vae_norm_conv
+        fused.argtypes = [ptr]*4 + [ctypes.c_int]*4
+        for c in [96, 192, 384]:
+            for rows in [1, 7, 16, 64, 240]:
+                for low_input in [False, True]:
+                    for silu in [False, True]:
+                        x = torch.randn(rows, c, device='cuda')
+                        # Exercise epsilon clamping as well as signed gamma.
+                        x[0] = 0
+                        if low_input:
+                            x = x.bfloat16()
+                        gamma = torch.randn(c, device='cuda')
+                        expected = F.normalize(x.float(), dim=1)*math.sqrt(c)*gamma
+                        if silu:
+                            expected = F.silu(expected)
+                        expected = array(expected.bfloat16())
+                        values, weight = array(x), array(gamma)
+                        actual, unfused = np.empty_like(values), np.empty_like(values)
+                        if fused(pointer(values), pointer(weight), pointer(actual), pointer(unfused),
+                                 rows, c, low_input, silu):
+                            raise RuntimeError(lib.lingbot_test_error().decode())
+                        record(f'norm_conv_{rows}_{c}_{int(low_input)}_{int(silu)}', actual, expected)
+                        results[-1]['unfused_exact'] = bool(np.array_equal(actual.view(np.uint32), unfused.view(np.uint32)))
+                        results[-1]['passed'] &= results[-1]['unfused_exact']
     for t, h, w, ic, oc, kt, kernel, stride, pad in [
         (1, 16, 24, 3, 96, 3, 3, 1, 2),
         (6, 8, 12, 96, 96, 3, 3, 1, 0),

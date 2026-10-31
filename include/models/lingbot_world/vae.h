@@ -12,6 +12,8 @@ public:
         : qwen_image::Runtime(device), low_(bf16 ? new nomas::Runtime(device, false) : nullptr) {}
     nomas::Runtime &convolutionRuntime() { return low_ ? *low_ : *this; }
     nomas::Tensor channelNorm(const nomas::Tensor &, const nomas::Tensor &weight);
+    // Fuse normalization, optional SiLU and the following convolution's cast.
+    nomas::Tensor channelNormForConv(const nomas::Tensor &, const nomas::Tensor &weight, bool silu);
     nomas::Tensor spatialAttention(const nomas::Tensor &queries, const nomas::Tensor &keys,
                                   const nomas::Tensor &values);
     nomas::Tensor conv2d(const nomas::Tensor &, const nomas::Tensor &weight,

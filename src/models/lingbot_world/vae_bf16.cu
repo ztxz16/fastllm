@@ -59,11 +59,20 @@ bool implicitConvolution(const Tensor &x,const Tensor &weight,const Tensor &out,
     if(status!=cutlass::Status::kSuccess) throw std::runtime_error("Wan BF16 implicit convolution failed");
     return true;
 }
-__global__ void packWeight(const uint16_t *x,uint16_t *out,size_t n,int channels,int spatial) {
+__global__ void packWeight(const uint16_t *x,uint16_t *out,size_t n,int channels,int spatial,size_t sourceElements) {
     int inner=channels*spatial;
     for(size_t i=size_t(blockIdx.x)*256+threadIdx.x;i<n;i+=size_t(gridDim.x)*256) {
+        if(i>=sourceElements) { out[i]=0; continue; }
         int k=i%inner;
         out[i]=x[(i/inner)*inner+(k%channels)*spatial+k/channels];
+    }
+}
+// The RGB head has three output channels. Pad only the filter's output
+// dimension for the existing Tensor Core convolution, then discard padding.
+__global__ void unpackConvolution(const B *input,const B *bias,B *out,size_t n,int channels,int padded) {
+    for(size_t i=size_t(blockIdx.x)*256+threadIdx.x;i<n;i+=size_t(gridDim.x)*256) {
+        B value=input[(i/channels)*padded+i%channels];
+        out[i]=bias?B(float(value)+float(bias[i%channels])):value;
     }
 }
 }
@@ -77,20 +86,26 @@ Tensor VAERuntime::convolutionBF16(const Tensor &x,const Tensor &weight,const Te
         if(!entry.first.rows) {
             // Keep the source allocation alive with the packed view: pointer
             // reuse can never retrieve another checkpoint's packed weights.
-            entry.first=weight; entry.second=Tensor(weight.rows,weight.cols,false);
-            packWeight<<<grid(weight.size()),256,0,cudaStreamPerThread>>>(weight.data,entry.second.data,
-                weight.size(),x.cols,kt*kernel*kernel);
+            entry.first=weight; entry.second=Tensor(weight.rows==3 && x.cols%8==0?8:weight.rows,weight.cols,false);
+            packWeight<<<grid(entry.second.size()),256,0,cudaStreamPerThread>>>(weight.data,entry.second.data,
+                entry.second.size(),x.cols,kt*kernel*kernel,weight.size());
             check(cudaGetLastError());
         }
         packed=entry.second;
     }
     int ot=(frames+padT-kt)/strideT+1;
     Tensor out(ot*oh*ow,weight.rows,false);
-    if(kt*kernel*kernel>1 && x.cols%8==0 && weight.rows%8==0) {
+    if(kt*kernel*kernel>1 && x.cols%8==0 && packed.rows%8==0) {
         auto input=cast(x,false);
-        if(implicitConvolution(input,packed,out,frames,h,w,kt,kernel,strideT,padT,strideS,padS,ot,oh,ow))
-            return bias?low_->bias(out,*bias):out;
+        auto value=packed.rows==weight.rows?out:Tensor(out.rows,packed.rows,false);
+        if(implicitConvolution(input,packed,value,frames,h,w,kt,kernel,strideT,padT,strideS,padS,ot,oh,ow)) {
+            if(packed.rows==weight.rows) return bias?low_->bias(out,*bias):out;
+            unpackConvolution<<<grid(out.size()),256,0,cudaStreamPerThread>>>(ptr<B>(value),
+                bias?ptr<B>(*bias):nullptr,ptr<B>(out),out.size(),weight.rows,packed.rows);
+            check(cudaGetLastError()); return out;
+        }
     }
+    if(packed.rows!=weight.rows) packed=packed.rowSlice(0,weight.rows);
     // Bound scratch memory; reuse the same BF16 Tensor Core GEMM and FP32
     // accumulation as other continuous models. cuDNN autocast rounds the
     // convolution before adding its BF16 bias, so keep those two boundaries.

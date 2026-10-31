@@ -1,4 +1,5 @@
 #include "models/lingbot_world/vae.h"
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <cmath>
@@ -16,8 +17,8 @@ int grid(size_t n) { return int(std::min<size_t>((n+255)/256,4096)); }
 // Match the channel-first FP32 vector norm before division. The reference
 // maintains four independent accumulation chains and reduces channel groups.
 // Storage remains THWC so subsequent native spatial operators can reuse it.
-__global__ void channelNormKernel(const float *x,const float *weight,float *out,
-                                  int rows,int channels,int groups) {
+template<class In,class Out> __global__ void channelNormKernel(const In *x,const float *weight,Out *out,
+                                  int rows,int channels,int groups,bool silu) {
     int lane=threadIdx.x%32,row=blockIdx.x*4+threadIdx.x/32;
     if(row>=rows) return;
     float accum[4]={0,0,0,0};
@@ -27,7 +28,7 @@ __global__ void channelNormKernel(const float *x,const float *weight,float *out,
             for(int i=0;i<4;++i) {
                 int c=base+i*groups;
                 if(c<channels) {
-                    float v=x[size_t(row)*channels+c];
+                    float v=float(x[size_t(row)*channels+c]);
                     accum[i]=fmaf(v,v,accum[i]);
                 }
             }
@@ -38,8 +39,16 @@ __global__ void channelNormKernel(const float *x,const float *weight,float *out,
         sum+=__shfl_down_sync(0xffffffff,sum,offset);
     float denom=fmaxf(sqrtf(__shfl_sync(0xffffffff,sum,0)),1e-12f);
     float scale=sqrtf(float(channels));
-    for(int c=lane;c<channels;c+=32)
-        out[size_t(row)*channels+c]=(x[size_t(row)*channels+c]/denom)*scale*weight[c];
+    for(int c=lane;c<channels;c+=32) {
+        float v=(float(x[size_t(row)*channels+c])/denom)*scale*weight[c];
+        if(silu) v=v/(1.f+expf(-v));
+        out[size_t(row)*channels+c]=Out(v);
+    }
+}
+int normalizationGroups(int rows,int cols) {
+    auto power=[](int value) { int result=1; while(result<=value/2) result*=2; return result; };
+    int width=std::min(power(rows/4),32),height=std::min(power(cols),128/width);
+    return cols>=std::min(height*16,256)?height:1;
 }
 __global__ void im2colConvolution(const float *x,float *out,int frames,int h,int w,int c,
                         int kt,int kernel,int strideT,int padT,int strideS,int padS,
@@ -58,7 +67,9 @@ __global__ void im2colConvolution(const float *x,float *out,int frames,int h,int
 // Tile rows/output channels while preserving the per-output FMA sequence.
 __global__ void convolutionMatmul(const float *x,const float *weight,const float *bias,
                                   float *out,int rows,int columns,int inner) {
-    __shared__ float a[32][32],b[64][32];
+    // Pad the leading stride: warp lanes read different output channels
+    // at the same reduction index. A stride of 32 aliases those banks.
+    __shared__ float a[32][33],b[64][33];
     int tid=threadIdx.x,r=tid/16,c=tid%16;
     float accum[2][4]={};
     for(int base=0;base<inner;base+=32) {
@@ -135,11 +146,28 @@ nomas::Tensor VAERuntime::channelNorm(const Tensor &x,const Tensor &weight) {
     if(x.rows<=0 || x.cols<=0 || weight.size()!=size_t(x.cols))
         throw std::invalid_argument("Wan VAE channel norm shape");
     if(x.rows<16 || x.rows%4) return specialNorm(x,weight,1);
-    auto power=[](int value) { int result=1; while(result<=value/2) result*=2; return result; };
-    int width=std::min(power(x.rows/4),32),height=std::min(power(x.cols),128/width);
-    int groups=x.cols>=std::min(height*16,256)?height:1;
     Tensor out(x.rows,x.cols,true);
-    channelNormKernel<<<(x.rows+3)/4,128,0,cudaStreamPerThread>>>(ptr(x),ptr(weight),ptr(out),x.rows,x.cols,groups);
+    channelNormKernel<<<(x.rows+3)/4,128,0,cudaStreamPerThread>>>(ptr(x),ptr(weight),ptr(out),
+        x.rows,x.cols,normalizationGroups(x.rows,x.cols),false);
+    check(cudaGetLastError()); return out;
+}
+nomas::Tensor VAERuntime::channelNormForConv(const Tensor &x,const Tensor &weight,bool silu) {
+    if(!low_ || x.rows<16 || x.rows%4) {
+        auto out=channelNorm(x,weight);
+        if(silu) out=activation(out);
+        return cast(out,!low_);
+    }
+    if(x.cols<=0 || !weight.fp32 || weight.size()!=size_t(x.cols))
+        throw std::invalid_argument("Wan VAE channel norm shape");
+    // Keep the FP32 reduction and activation arithmetic; round only where
+    // the separate convolution input cast previously rounded to BF16.
+    Tensor out(x.rows,x.cols,false);
+    int groups=normalizationGroups(x.rows,x.cols);
+    auto result=reinterpret_cast<__nv_bfloat16 *>(out.data);
+    if(x.fp32) channelNormKernel<<<(x.rows+3)/4,128,0,cudaStreamPerThread>>>(
+        ptr(x),ptr(weight),result,x.rows,x.cols,groups,silu);
+    else channelNormKernel<<<(x.rows+3)/4,128,0,cudaStreamPerThread>>>(
+        reinterpret_cast<const __nv_bfloat16 *>(x.data),ptr(weight),result,x.rows,x.cols,groups,silu);
     check(cudaGetLastError()); return out;
 }
 nomas::Tensor VAERuntime::conv3d(const Tensor &x,const Tensor &w,const Tensor *bias,

@@ -90,6 +90,20 @@ int lingbot_test_vae_bf16_norm(const float *input,const float *weight,float *out
         std::memcpy(output,values.data(),values.size()*sizeof(float));
     });
 }
+int lingbot_test_vae_norm_conv(const float *input,const float *weight,float *output,float *unfused,
+                              int rows,int cols,int bf16Input,int silu) {
+    return checked([&] {
+        VAERuntime rt(0,true);
+        auto x=rt.cast(rt.upload(input,rows,cols),!bf16Input),w=rt.upload(weight,1,cols);
+        auto reference=rt.channelNorm(x,w);
+        if(silu) reference=rt.activation(reference);
+        reference=rt.cast(reference,false);
+        auto values=rt.download(rt.channelNormForConv(x,w,silu));
+        auto expected=rt.download(reference);
+        std::memcpy(output,values.data(),values.size()*sizeof(float));
+        std::memcpy(unfused,expected.data(),expected.size()*sizeof(float));
+    });
+}
 int lingbot_test_vae_bf16_attention(const float *input,float *output,int rows) {
     return checked([&] {
         VAERuntime rt(0,true);
