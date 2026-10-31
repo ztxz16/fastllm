@@ -550,7 +550,7 @@ if (USE_CUDA)
             src/devices/cuda/linear/fastllm-linear-fp8-mxfp8.cu
             src/devices/cuda/moe/fastllm-moe-mxfp4-sm120.cu
             src/devices/cuda/linear/fastllm-native-nvfp4-tma-sm120.cu)
-        set_property(SOURCE src/fastllm.cpp src/models/deepseekv41.cpp
+        set_property(SOURCE src/fastllm.cpp src/models/deepseekv41.cpp src/models/deepseekv41_dspark.cpp
             APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_CUTLASS_MXFP8_SM120)
         set_property(SOURCE src/devices/cuda/cudadevice.cpp
             APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_DSV41_MXFP4_SM120)
@@ -2667,6 +2667,14 @@ if (UNIT_TEST)
         set_target_properties(cuda_shared_weight_upload_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
         add_test(NAME cuda_shared_weight_upload COMMAND cuda_shared_weight_upload_test)
         set_tests_properties(cuda_shared_weight_upload PROPERTIES LABELS "cuda;moe;numa" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
+
+        if (FASTLLM_CUDA_SM120_SOURCES)
+            add_executable(cuda_draft_fp8_head_test test/basic/test_cuda_draft_fp8_head.cu)
+            target_link_libraries(cuda_draft_fp8_head_test PRIVATE fastllm)
+            set_target_properties(cuda_draft_fp8_head_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+            add_test(NAME cuda_draft_fp8_head COMMAND cuda_draft_fp8_head_test)
+            set_tests_properties(cuda_draft_fp8_head PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+        endif()
 
         add_executable(cuda_small_projection_test test/basic/test_cuda_small_projection.cu)
         target_link_libraries(cuda_small_projection_test PRIVATE fastllm)

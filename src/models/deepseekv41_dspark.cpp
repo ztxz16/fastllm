@@ -45,6 +45,7 @@
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
 #include "devices/cuda/fastllm-cuda-dspark.h"
+#include "devices/cuda/fastllm-draft-head.cuh"
 #include "devices/cuda/fastllm-fp8-auxiliary.h"
 #include "devices/cuda/fastllm-v41-decode.cuh"
 #include "devices/cuda/naive-n05-cuda.cuh"
@@ -2584,6 +2585,14 @@ namespace fastllm {
                 headProjected = MultiCudaLinearOutputGatherPersistent(normed, weight["head.weight"], logits,
                     v41DsparkHeadWorkspace, &request);
                 shardedMarkov = request.completed;
+            }
+#endif
+#if defined(USE_CUDA) && defined(FASTLLM_ENABLE_CUTLASS_MXFP8_SM120)
+            // This entry is draft-only. DsparkProjectHead also projects target
+            // verification logits, which must retain the original BF16 head.
+            if (!headProjected && v41DsparkTpDevices.empty() &&
+                !DsEnvFlag("FASTLLM_DSV41_REFERENCE_MATH")) {
+                headProjected = FastllmCudaTryFp8DraftHead(normed, weight["head.weight"], logits);
             }
 #endif
             if (!headProjected) {
