@@ -51,6 +51,14 @@ DEFINE_HAS_MEMBER(maybe_max_item_len_ptr)
 DEFINE_HAS_MEMBER(maybe_k_cache_sf)
 DEFINE_HAS_MEMBER(maybe_v_cache_sf)
 
+// Opt-in for models whose reference softmax sums the unrounded FP32
+// exponentials. Existing attention variants retain the Tensor Core rowsum.
+template <typename T, typename = void>
+struct prefill_fp32_softmax_sum : std::false_type {};
+template <typename T>
+struct prefill_fp32_softmax_sum<T, std::void_t<decltype(T::use_fp32_softmax_sum)>>
+    : std::bool_constant<T::use_fp32_softmax_sum> {};
+
 // Type trait to detect packed NVFP4 KV cache types (__nv_fp4x2_e2m1 stores 2 FP4 per byte).
 template <typename T>
 struct is_fp4_type : std::false_type {};
@@ -1704,14 +1712,36 @@ __device__ __forceinline__ void compute_sfm_v(
   }
 
   if constexpr (KTraits::AttentionVariant::use_softmax) {
+    if constexpr (std::is_same_v<typename KTraits::DTypeQKAccum, float> &&
+                  prefill_fp32_softmax_sum<typename KTraits::AttentionVariant>::value) {
 #pragma unroll
-    for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
+      for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
 #pragma unroll
-      for (uint32_t mma_kv = 0; mma_kv < KTraits::NUM_MMA_KV; ++mma_kv) {
-        if constexpr (std::is_same_v<typename KTraits::DTypeQKAccum, float>) {
-          mma::m16k16_rowsum_f16f16f32(d[mma_q], s_frag_f16[mma_q][mma_kv]);
-        } else {
-          mma::m16k16_rowsum_f16f16f32(d[mma_q], s_frag[mma_q][mma_kv]);
+        for (uint32_t j = 0; j < 2; ++j) {
+          float sum = 0.f;
+#pragma unroll
+          for (uint32_t mma_kv = 0; mma_kv < KTraits::NUM_MMA_KV; ++mma_kv) {
+            const auto &s = s_frag[mma_q][mma_kv];
+            sum += s[j * 2];
+            sum += s[j * 2 + 1];
+            sum += s[j * 2 + 4];
+            sum += s[j * 2 + 5];
+          }
+          sum += math::shfl_xor_sync(sum, 0x2);
+          sum += math::shfl_xor_sync(sum, 0x1);
+          d[mma_q][j] += sum;
+        }
+      }
+    } else {
+#pragma unroll
+      for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
+#pragma unroll
+        for (uint32_t mma_kv = 0; mma_kv < KTraits::NUM_MMA_KV; ++mma_kv) {
+          if constexpr (std::is_same_v<typename KTraits::DTypeQKAccum, float>) {
+            mma::m16k16_rowsum_f16f16f32(d[mma_q], s_frag_f16[mma_q][mma_kv]);
+          } else {
+            mma::m16k16_rowsum_f16f16f32(d[mma_q], s_frag[mma_q][mma_kv]);
+          }
         }
       }
     }
