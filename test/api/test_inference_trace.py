@@ -24,7 +24,7 @@ class InferenceTraceTests(unittest.TestCase):
                        check=True, capture_output=True, text=True)
 
     def test_disabled_by_default(self):
-        env = {k: v for k, v in os.environ.items() if k != 'FASTLLM_INFERENCE_TRACE'}
+        env = {k: v for k, v in os.environ.items() if not k.startswith('FASTLLM_INFERENCE_TRACE')}
         result = subprocess.run([str(self.binary)], env=env, capture_output=True, text=True, check=True)
         self.assertEqual(result.stdout, '')
         self.assertEqual(result.stderr, '')
@@ -55,6 +55,32 @@ class InferenceTraceTests(unittest.TestCase):
             self.assertAlmostEqual(row['outside_forward_ms'] + row['forward_api_ms'], row['total_ms'], places=4)
             self.assertEqual(row['forward_count'], sum(f['step_id'] == row['step_id'] for f in forwards))
             self.assertGreaterEqual(row['forward_trace_emit_ms'], 0)
+
+    def test_sampled_host_detail(self):
+        for interval in ('1', '2', '0', '-1', '1x', '4294967296'):
+            with self.subTest(interval=interval):
+                path = self.root / ('detail-' + interval + '.jsonl')
+                subprocess.run([str(self.binary)], env={**os.environ,
+                    'FASTLLM_INFERENCE_TRACE': str(path),
+                    'FASTLLM_INFERENCE_TRACE_DETAIL_EVERY': interval},
+                    check=True, capture_output=True, text=True)
+                steps = [json.loads(x) for x in path.read_text().splitlines()
+                         if json.loads(x)['event'] == 'scheduler_step']
+                selected = [x for x in steps if 'host_detail' in x]
+                expected = 3 if interval == '1' else 1 if interval == '2' else 0
+                self.assertEqual(len(selected), expected)
+                if interval == '2': self.assertEqual(selected[0]['step_id'], 2)
+                if interval == '1':
+                    detail = selected[0]['host_detail']
+                    self.assertEqual(detail['dropped_metrics'], 0)
+                    metrics = {(x['region'], x['name']): x for x in detail['metrics']}
+                    self.assertEqual(metrics['fixture', 'requests']['count'], 3)
+                    self.assertEqual(metrics['nested', 'requests']['count'], 2)
+                    self.assertEqual(metrics['fixture', 'outer']['calls'], 1)
+                    for metric in metrics.values():
+                        self.assertGreaterEqual(metric['wall_ms'], 0)
+                        if 'thread_cpu_ms' in metric:
+                            self.assertGreaterEqual(metric['thread_cpu_ms'], 0)
 
     def test_unwritable_path_does_not_break_inference(self):
         result = subprocess.run([str(self.binary)],

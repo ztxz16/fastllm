@@ -1,6 +1,7 @@
 #include "naive_n05_kvmem.h"
 #include "naive_n05_tp.h"
 #include "utils/decode_graph.h"
+#include "utils/inference_trace.h"
 #include <climits>
 #include <stdexcept>
 #ifdef USE_CUDA
@@ -52,10 +53,14 @@ NaiveN05FlashModel::SparseKvState::~SparseKvState() {
 void NaiveN05FlashModel::OnResponseContextFinished(ResponseContext *context) {
     if (!sparseKv || !context->isEnding || context->pastKeyValues.empty() ||
         !context->pastKeyValues.front().first.kvStorageOwner) return;
+    auto *detail = inference_trace::CurrentDetail();
+    if (detail) detail->Count("finish.layers", context->pastKeyValues.size());
+    inference_trace::DetailSpan finishTrace("finish.request_id_lock", detail);
     {
         std::lock_guard<std::mutex> guard(tpRequestMutex);
         tpRequestIds.erase(&context->pastKeyValues.front().first);
     }
+    finishTrace.Next("finish.detach_descriptors");
     // Retain the lease until all borrowed descriptors are detached. Forward
     // completion already synchronized the rank streams before publication.
     auto lease = std::move(context->pastKeyValues.front().first.kvStorageOwner);
@@ -67,6 +72,7 @@ void NaiveN05FlashModel::OnResponseContextFinished(ResponseContext *context) {
         root->dims.clear(); root->expansionDims.clear(); root->strides.clear();
         root->expansionSize = root->expansionBytes = 0;
     }
+    finishTrace.Next("finish.release_lease");
 }
 
 void NaiveN05FlashModel::InitSparseKv() {

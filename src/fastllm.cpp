@@ -5,6 +5,7 @@
 #include "utils.h"
 
 #include "fastllm.h"
+#include "utils/inference_trace.h"
 #include "kvmem.h"
 #if defined(USE_CUDA) && !defined(USE_ROCM)
 #include "devices/cuda/fastllm-fp8-auxiliary.h"
@@ -6133,7 +6134,10 @@ namespace fastllm {
     }
 
     void PagedCacheManager::ReleasePageIndices(const std::vector<int> &pageIndices) {
+        auto *detail = inference_trace::CurrentDetail();
+        inference_trace::DetailSpan pageTrace("pages.release.lock", detail);
         std::lock_guard<std::mutex> guard(pageIndexLocker);
+        pageTrace.Next("pages.release.work");
         for (int pageIndex : pageIndices) ReleasePageIndexLocked(pageIndex);
     }
 
@@ -6173,7 +6177,10 @@ namespace fastllm {
     }
 
     void PagedCacheManager::RecordPrefix(const std::vector<uint64_t> &hashes, const std::vector<int> &pages) {
+        auto *detail = inference_trace::CurrentDetail();
+        inference_trace::DetailSpan pageTrace("pages.publish.lock", detail);
         std::lock_guard<std::mutex> guard(pageIndexLocker);
+        pageTrace.Next("pages.publish.work");
         const long long access = ++currentTimestamp;
         const int count = std::min(hashes.size(), pages.size());
         CacheTrieNode *cur = trieRoot;
@@ -6257,11 +6264,16 @@ namespace fastllm {
             cur = cached;
             count = match.pages;
         }
+        const int reused = count;
         for (; count < (int)hashes.size(); ++count) {
             auto *child = cur->FindChild(hashes[count]);
             if (!child) break;
             if (child->pageId < 0 || pageTimestamp[child->pageId] != child->timestamp) break;
             cur = child;
+        }
+        if (auto *detail = inference_trace::CurrentDetail()) {
+            detail->Count("pages.reused_prefix_pages", reused);
+            detail->Count("pages.walked_prefix_pages", count - reused);
         }
         match = {};
         if (count) {
@@ -6274,7 +6286,10 @@ namespace fastllm {
     }
 
     int PagedCacheManager::PreviewPrefix(const std::vector<uint64_t> &hashes, PagedPrefixMatch &match) {
+        auto *detail = inference_trace::CurrentDetail();
+        inference_trace::DetailSpan pageTrace("pages.preview.lock", detail);
         std::lock_guard<std::mutex> guard(pageIndexLocker);
+        pageTrace.Next("pages.preview.work");
         auto *cur = FindPrefixLocked(hashes, match);
         if (match.pages) {
             // Only a leaf can be evicted. Refresh its recency without walking
@@ -6307,7 +6322,10 @@ namespace fastllm {
 
     bool PagedCacheManager::PreviewUnreferencedPrefixPages(const PagedPrefixMatch &match, int pages,
                                                           std::vector<int> &unreferenced, PagedPrefixPath &path) {
+        auto *detail = inference_trace::CurrentDetail();
+        inference_trace::DetailSpan pageTrace("pages.reclaimable.lock", detail);
         std::lock_guard<std::mutex> guard(pageIndexLocker);
+        pageTrace.Next("pages.reclaimable.work");
         unreferenced.clear();
         if (pages == 0) return true;
         auto *node = match.pageId >= 0 && match.pageId < maxPages ? pageToTrieNode[match.pageId] : nullptr;
@@ -6317,6 +6335,7 @@ namespace fastllm {
         if (path.manager != this || path.anchor.nodeId != match.nodeId || path.anchor.generation != match.generation ||
             path.anchor.pageId != match.pageId || path.bindingVersion != prefixBindingVersion ||
             path.pageIds.size() != (size_t)match.pages) {
+            if (detail) detail->Count("pages.ancestor_rebuild_pages", match.pages);
             path.manager = nullptr;
             path.anchor = {};
             path.pageIds.resize(match.pages);
@@ -6336,6 +6355,7 @@ namespace fastllm {
         // guards trie lifetime; bindingVersion additionally guards
         // same-content physical-page replacement along its ancestor path.
         // Reference counts remain live: never memoize whether a page is pinned.
+        if (detail) detail->Count("pages.reference_checks", pages);
         for (int i = pages - 1; i >= 0; --i)
             if (pageRefCount[path.pageIds[i]] == 0) unreferenced.push_back(path.pageIds[i]);
         return true;

@@ -72,6 +72,8 @@ namespace fastllm {
         }
 
         static void ReleasePagedCachePages(Data &cache, bool clearDims = false) {
+            auto *detail = inference_trace::CurrentDetail();
+            inference_trace::DetailSpan releaseTrace("release.descriptors", detail);
             // A TP root can mirror a local shard, and views may partially
             // overlap. Deduplicate by physical pool/page, preserving first-use
             // release order without allocating a tree node for every page.
@@ -108,13 +110,21 @@ namespace fastllm {
                     std::find(pools.begin(), pools.end(), view->pagedKVCacheData) == pools.end())
                     pools.push_back(view->pagedKVCacheData);
             }
+            if (detail) {
+                detail->Count("release.descriptor_count", descriptors.size());
+                detail->Count("release.pool_count", pools.size());
+            }
             for (auto *pool : pools) {
+                releaseTrace.Next("release.deduplicate");
                 marks.Begin(pool->maxPages);
                 for (auto *view : descriptors) {
                     if (!view->isPagedKVCache || view->pagedKVCacheData != pool) continue;
                     for (int page : view->pageIndex) marks.Add(page);
                 }
+                if (detail) detail->Count("release.page_count", marks.pages.size());
+                releaseTrace.Next("release.manager");
                 pool->ReleasePageIndices(marks.pages);
+                releaseTrace.Next("release.clear_views");
                 for (auto *view : descriptors)
                     if (view->isPagedKVCache && view->pagedKVCacheData == pool) {
                         view->pageIndex.clear(); view->lastPageLen = 0;
@@ -641,11 +651,14 @@ namespace fastllm {
     }
 
     void ResponseContext::TryRecordPagedCache(basellm *model) {
+        auto *detail = inference_trace::CurrentDetail();
+        inference_trace::DetailSpan recordTrace("record.model_history", detail);
         if (model->kvMemConfig.enabled && !model->SupportsKvMemPrefixCache()) return;
         if (model->DeferHistoryCacheRestore()) model->TryRecordResponseContext(this);
         if (!this->multimodalInput.empty()) {
             return;
         }
+        recordTrace.Next("record.descriptor_scan");
         bool hasLinearAttentionCache = false;
         bool hasBoundedAttentionCache = false;
         for (int i = 0; i < (int)this->pastKeyValues.size(); i++) {
@@ -717,6 +730,7 @@ namespace fastllm {
             reusablePrefixLen = 0;
         }
 
+        recordTrace.Next("record.paged_publish");
         std::map<int, std::vector<uint64_t>> recordHashes;
         std::function<void(Data&)> recordPagedCache = [&](Data &cache) {
             if (cache.multiDeviceData && !cache.multiDeviceDatas.empty()) {
@@ -733,6 +747,7 @@ namespace fastllm {
             }
             if (cache.pagedKVCacheData != nullptr && !cache.pageIndex.empty() &&
                 cache.pagedKVCacheData->type == PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE) {
+                inference_trace::DetailSpan descriptorTrace("record.page_copy_hash", detail);
                 auto pages = cache.pageIndex;
                 if (cache.lastPageLen < cache.pageLen) pages.pop_back();
                 const int pageLen = cache.pagedKVCacheData->pageLen;
@@ -740,6 +755,8 @@ namespace fastllm {
                 const int count = std::min(this->allTokens.size() / pageLen, pages.size());
                 for (int i = hashes.size(); i < count; ++i)
                     hashes.push_back(PagedCacheManager::HashTokenPage(this->allTokens.data() + i * pageLen, pageLen));
+                if (detail) detail->Count("record.page_count", pages.size());
+                descriptorTrace.Next("record.trie_publish");
                 cache.pagedKVCacheData->RecordPrefix(hashes, pages);
             }
         };
@@ -1389,6 +1406,9 @@ namespace fastllm {
     static int PreviewResidentPrefix(basellm *model, ResponseContext *ctx,
                                      PagedCacheManager *budgetManager, std::vector<int> &unreferenced,
                                      ResidentPrefixManagers &plan) {
+        auto *detail = inference_trace::CurrentDetail();
+        inference_trace::DetailSpan previewTrace("preview.reset", detail);
+        if (detail) detail->Count("preview.query_tokens", ctx->currentTokens.size());
         unreferenced.clear();
         if (!model->DeferHistoryCacheRestore() || ctx->cacheLen || !ctx->multimodalInput.empty() ||
             (model->kvMemConfig.enabled && !model->SupportsKvMemPrefixCache()) ||
@@ -1396,11 +1416,15 @@ namespace fastllm {
         if (!ctx->prefillPreview) ctx->prefillPreview.reset(new PrefillPrefixPreview());
         auto &preview = *ctx->prefillPreview;
         preview.Reset(ctx->currentTokens);
+        previewTrace.Next("preview.managers");
         plan.Init(model);
         auto *probe = plan.probe;
         int length = 0;
         if (probe && probe->pageLen > 0) {
+            previewTrace.Next("preview.page_hashes");
             const auto &hashes = preview.Hashes(probe->pageLen);
+            if (detail) detail->Count("preview.manager_count", plan.managers.size());
+            previewTrace.Next("preview.trie_queries");
             int pages = probe->PreviewPrefix(hashes, preview.matches[probe]);
             // A full prompt match must leave at least one token for logits.
             if ((size_t)pages * probe->pageLen >= ctx->currentTokens.size()) --pages;
@@ -1409,7 +1433,9 @@ namespace fastllm {
                 pages = std::min(pages, manager->PreviewPrefix(hashes, preview.matches[manager]));
             }
             if (pages > 0) {
+                previewTrace.Next("preview.model_history");
                 length = model->PreviewPagedPrefixCacheExtra(ctx, pages * probe->pageLen, preview);
+                previewTrace.Next("preview.reclaimable_pages");
                 length = std::max(0, std::min(length, pages * probe->pageLen)) / probe->pageLen * probe->pageLen;
                 if (length && budgetManager) {
                     if (budgetManager->pageLen != probe->pageLen ||
@@ -3043,6 +3069,9 @@ namespace fastllm {
                         if (model->isFree) break;
                         auto &forwardLocker = model->forwardLocker;
 
+                        inference_trace::DetailRegion retireRegion("retire_requests");
+                        auto *detail = inference_trace::CurrentDetail();
+                        if (detail) detail->Count("requests_scanned", model->responseContextDict.dicts.size());
                         // 首先把已经abort的请求删除掉
                         std::set <int> abortHandles;
                         for (auto &it: model->responseContextDict.dicts) {
@@ -3051,12 +3080,19 @@ namespace fastllm {
                                 abortHandles.insert(it.first);
                             }
                         }
+                        if (detail) detail->Count("aborted", abortHandles.size());
                         for (auto &it : abortHandles) {
+                            inference_trace::DetailSpan removeTrace("remove_context", detail);
                             model->RemoveResponseContext(it);
                         }
 
                         for (auto &entry : model->responseContextDict.dicts)
-                            if (entry.second->isEnding) model->OnResponseContextFinished(entry.second);
+                            if (entry.second->isEnding) {
+                                if (detail) detail->Count("finished");
+                                inference_trace::DetailSpan finishedTrace("finish_context", detail);
+                                model->OnResponseContextFinished(entry.second);
+                            }
+                        retireRegion.Stop();
                         if (trace) trace->Mark("retire_requests_ms");
 
                         int limit = maxTotalLens;
@@ -3186,6 +3222,7 @@ namespace fastllm {
                         std::set<int> plannedPrefills;
                         bool deferPrefill = false;
                         if (batchPrefill) {
+                            inference_trace::DetailRegion previewRegion("prefill_preview");
                             const auto &policy = model->prefillBatchPolicy;
                             currentActivate = activeDecode;
                             int slots = std::max(0, maxBatch - activeDecode);
@@ -3217,6 +3254,8 @@ namespace fastllm {
                                         break;
                                     }
                                     if (sharedKvPool) {
+                                        inference_trace::DetailSpan capacityTrace("capacity_and_dedup", detail);
+                                        if (detail) detail->Count("unreferenced_pages", unreferenced.size());
                                         long long pins = 0;
                                         for (int page : unreferenced) pins += !protectedPages.count(page);
                                         const long long growth = std::max(0LL, remainingPages(ctx) - prefix / pageLen);
@@ -3240,6 +3279,7 @@ namespace fastllm {
                             const char *reason = policy.Decide(pendingTokens, candidates, activeDecode,
                                 capacityLimited, oldest, PrefillBatchPolicy::Clock::now());
                             deferPrefill = std::strcmp(reason, "wait") == 0;
+                            previewRegion.Stop();
                             if (trace) {
                                 trace->prefillDecision = reason;
                                 trace->prefillCandidates = candidates;
@@ -3675,8 +3715,12 @@ namespace fastllm {
                             }
 
                             if (trace) trace->Mark("legacy_decode_log_ms");
+                            inference_trace::DetailRegion postRegion("postprocess");
+                            if (detail) detail->Count("requests", handles.size());
                             for (int i = 0; i < handles.size(); i++) {
+                                inference_trace::DetailSpan tokenTrace("lookup", detail);
                                 auto &it = *model->responseContextDict.dicts.find(handles[i]);
+                                tokenTrace.Next("stop_check_and_record");
                                 int curRet = ret[i];
                                 if (curRet == model->eos_token_id || model->eos_token_ids.find(curRet) != model->eos_token_ids.end()) {
                                     it.second->isEnding = true;
@@ -3689,6 +3733,7 @@ namespace fastllm {
                                     }
                                 }
                                 if (it.second->isEnding == false) {
+                                    tokenTrace.Next("token_state_and_queue");
                                     model->UpdateToolCallConstraintState(it.second, curRet);
                                     if (it.second->curTokens > 0 && it.second->currentTokens.size() == 1)
                                         it.second->currentTokens[0] = curRet;
@@ -3701,6 +3746,7 @@ namespace fastllm {
                                     if (it.second->generationConfig.NeedsTokenHistory())
                                         it.second->tokens.Push(curRet);
                                     it.second->curTokens++;
+                                    tokenTrace.Next("limit_check_and_record");
                                     if (it.second->curTokens == it.second->generationConfig.output_token_limit
                                         || (maxTotalLens > 0 && it.second->allTokens.size() >= maxTotalLens)
                                         || it.second->allTokens.size() >= model->max_positions) {
@@ -3709,8 +3755,15 @@ namespace fastllm {
                                     }
                                 }
                             }
-                            model->dictCV.notify_all();
-                            ReleasePendingResultLogits(logits);
+                            {
+                                inference_trace::DetailSpan notifyTrace("notify_consumers", detail);
+                                model->dictCV.notify_all();
+                            }
+                            {
+                                inference_trace::DetailSpan logitsTrace("release_logits", detail);
+                                ReleasePendingResultLogits(logits);
+                            }
+                            postRegion.Stop();
                             if (trace) trace->Mark("postprocess_ms");
                         } else {
                             // Finished requests keep their pages until the

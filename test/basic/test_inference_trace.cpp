@@ -28,10 +28,28 @@ int main() {
     std::vector<int> longArray(4096);
     for (size_t i = 0; i < longArray.size(); ++i) longArray[i] = int(i) * 137 - 200000;
     CheckArray(longArray);
+    // Inactive probes must be safe even without a trace sink / current step.
+    { DetailRegion region("inactive"); DetailSpan span("inactive"); span.Next("inactive2"); }
+    assert(CurrentDetail() == nullptr);
     if (!Enabled()) return 0;
     {
         Step step;
         step.phase = "prefill";
+        {
+            DetailRegion region("fixture");
+            DetailSpan span("outer");
+            if (auto *detail = CurrentDetail()) {
+                detail->Count("requests", 3);
+                {
+                    DetailRegion nested("nested");
+                    DetailSpan child("child");
+                    detail->Count("requests", 2);
+                }
+                assert(std::string(detail->region) == "fixture");
+                std::thread worker([] { assert(CurrentDetail() == nullptr); });
+                worker.join();
+            }
+        }
         step.handles = {9};
         step.lengths = {24};
         step.contextBefore = {100};
@@ -44,7 +62,7 @@ int main() {
         }
         step.Mark("forward_dispatch_ms");
     }
-    assert(CurrentStep() == nullptr && CurrentForward() == nullptr);
+    assert(CurrentStep() == nullptr && CurrentForward() == nullptr && CurrentDetail() == nullptr);
     {
         Step step;
         step.phase = "decode";
@@ -75,5 +93,5 @@ int main() {
             step.failed = true;
         }
     }
-    assert(CurrentStep() == nullptr && CurrentForward() == nullptr);
+    assert(CurrentStep() == nullptr && CurrentForward() == nullptr && CurrentDetail() == nullptr);
 }

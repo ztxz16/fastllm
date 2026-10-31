@@ -1,5 +1,6 @@
 #include "models/naive_n05_flash.h"
 #include <algorithm>
+#include "utils/inference_trace.h"
 #ifdef USE_CUDA
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/cuda/naive-n05-cuda.cuh"
@@ -219,7 +220,10 @@ void NaiveN05FlashModel::CopyPrefixWindow(const PrefixSnapshot &snapshot,
 }
 
 void NaiveN05FlashModel::TryRecordResponseContext(ResponseContext *context) {
+    auto *detail = inference_trace::CurrentDetail();
+    inference_trace::DetailSpan recordTrace("history.publish_lock", detail);
     std::lock_guard<std::mutex> guard(historyMutex);
+    recordTrace.Next("history.publish_setup");
     if (!saveHistoryChat || !prefixPool || !context || context->error != ResponseContextErrorNone ||
         !context->multimodalInput.empty()) return;
     auto active = activePrefixes.find(&context->pastKeyValues.front().first);
@@ -227,12 +231,19 @@ void NaiveN05FlashModel::TryRecordResponseContext(ResponseContext *context) {
     ++prefixPool->historyVersion;
     PrefixSnapshots snapshots = active->second.prefill;
     if (active->second.decode) snapshots.push_back(active->second.decode);
+    if (detail) {
+        detail->Count("history.snapshots", snapshots.size());
+        detail->Count("history.entries_before_publish", prefixHistory.size());
+    }
     for (const auto &snapshot : snapshots) {
+        recordTrace.Next("history.snapshot_copy_hash");
         if ((int)context->allTokens.size() < snapshot->length) continue;
         if (snapshot->tokens.empty()) {
+            if (detail) detail->Count("history.copied_tokens", snapshot->length);
             snapshot->tokens.assign(context->allTokens.begin(), context->allTokens.begin() + snapshot->length);
             snapshot->tokenHash = PagedCacheManager::HashTokenPage(snapshot->tokens.data(), snapshot->length);
         }
+        recordTrace.Next("history.snapshot_pool");
         if (!snapshot->fullPool) {
             for (int layer = 0; layer < block_cnt; ++layer) {
                 auto *manager = GetPagedKVCacheManager(layer, true);
@@ -252,7 +263,9 @@ void NaiveN05FlashModel::TryRecordResponseContext(ResponseContext *context) {
         }
         // A checkpoint is immutable after publication. Repeated calls refresh
         // its LRU position; an equivalent new checkpoint replaces the old one.
-        prefixHistory.erase(std::remove_if(prefixHistory.begin(), prefixHistory.end(), [&](const auto &entry) {
+        recordTrace.Next("history.dedup_publish");
+        prefixHistory.erase(std::remove_if(prefixHistory.begin(), prefixHistory.end(),
+            [&](const auto &entry) {
             return entry == snapshot || (entry->tokenHash == snapshot->tokenHash &&
                                          entry->tokens == snapshot->tokens);
         }), prefixHistory.end());
@@ -297,10 +310,17 @@ int NaiveN05FlashModel::PreviewPagedPrefixCacheExtra(ResponseContext *context, i
     };
     if (!preview.modelState) preview.modelState = std::make_shared<PrefixPreview>();
     auto &memo = *std::static_pointer_cast<PrefixPreview>(preview.modelState);
+    auto *detail = inference_trace::CurrentDetail();
+    inference_trace::DetailSpan previewTrace("history.preview_lock", detail);
     std::lock_guard<std::mutex> guard(historyMutex);
+    previewTrace.Next("history.memo_rebuild");
     // Do not retain even an SWA checkpoint while waiting for more prompts.
     // Cache only token equality; residency/generation is checked every pass.
     if (!memo.initialized || memo.version != prefixPool->historyVersion) {
+        if (detail) {
+            detail->Count("history.memo_misses");
+            detail->Count("history.entries_scanned", prefixHistory.size());
+        }
         if (memo.matches.size() > prefixHistory.size() * 2 + 16) {
             for (auto it = memo.matches.begin(); it != memo.matches.end();)
                 if (it->second.snapshot.expired()) it = memo.matches.erase(it); else ++it;
@@ -310,6 +330,7 @@ int NaiveN05FlashModel::PreviewPagedPrefixCacheExtra(ResponseContext *context, i
             if (entry->tokens.size() > preview.tokens.size()) continue;
             auto &match = memo.matches[entry.get()];
             if (match.snapshot.lock() != entry) {
+                if (detail) detail->Count("history.new_match_checks");
                 match.snapshot = entry;
                 match.equal = entry->tokenHash == preview.TokenHash(entry->tokens.size()) &&
                     std::equal(entry->tokens.begin(), entry->tokens.end(), preview.tokens.begin());
@@ -320,6 +341,8 @@ int NaiveN05FlashModel::PreviewPagedPrefixCacheExtra(ResponseContext *context, i
         memo.initialized = true;
     }
     int best = 0;
+    previewTrace.Next("history.residency_check");
+    if (detail) detail->Count("history.candidates_checked", memo.candidates.size());
     for (const auto &candidate : memo.candidates) {
         auto entry = candidate.lock();
         if (entry && entry->length > best && entry->length <= length && entry->HasResidentPrefix())
