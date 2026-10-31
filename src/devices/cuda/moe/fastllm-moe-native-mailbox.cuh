@@ -373,7 +373,7 @@ struct NativeMoeMailbox {
     }
     static void Compute(Layer &w, const OffloadLayout &layout, const uint8_t *records,
             const int32_t *slots, const float *scores, cudaStream_t stream, bool resident = false) {
-        if (resident && w.hidden % 256 == 0 && layout.inter % 32 == 0 && FastllmCudaRuntimeArch() == 120) {
+        if (resident && !layout.planarMxfp4 && w.hidden % 256 == 0 && layout.inter % 32 == 0 && FastllmCudaRuntimeArch() == 120) {
             fastllm::cuda::dsv41_cache::GateResident<<<dim3(layout.inter / 32, w.topk), 512, 0, stream>>>(
                 static_cast<const __nv_bfloat16 *>(w.quantized.cudaData), slots, records, scores,
                 static_cast<__nv_bfloat16 *>(w.gate.cudaData), w.hidden, layout.inter,
@@ -381,10 +381,10 @@ struct NativeMoeMailbox {
         } else fastllm::cuda::dsv41_cache::Gate<<<dim3(layout.inter / 32, w.topk), 512, 0, stream>>>(
             static_cast<const __nv_bfloat16 *>(w.quantized.cudaData), slots, records,
             scores, static_cast<__nv_bfloat16 *>(w.gate.cudaData),
-            w.hidden, layout.inter, layout.recordStride, layout.swigluLimit);
+            w.hidden, layout.inter, layout.recordStride, layout.swigluLimit, 1, nullptr, layout.planarMxfp4);
         fastllm::cuda::dsv41_cache::Down<<<dim3(w.hidden / 8, w.topk), 128, 0, stream>>>(
             static_cast<const __nv_bfloat16 *>(w.gate.cudaData), slots, records, w.partial,
-            w.hidden, layout.inter, layout.recordStride, layout.downOffset);
+            w.hidden, layout.inter, layout.recordStride, layout.downOffset, nullptr, layout.planarMxfp4);
     }
     bool Capture(Layer &w, int table, const fastllm::Data &input,
             const fastllm::Data &index, const fastllm::Data &score, fastllm::Data &output) {

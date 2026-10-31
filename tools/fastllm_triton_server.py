@@ -160,6 +160,79 @@ if triton is not None:
 
 
     @triton.jit
+    def _fastllm_mxfp4_planar_tile(W, slot, rows, begin,
+                                  K: tl.constexpr, N: tl.constexpr,
+                                  OFFSET: tl.constexpr, STRIDE: tl.constexpr,
+                                  BN: tl.constexpr, BK: tl.constexpr):
+        # Matrix-local payload and UE8M0 planes; lossless cache admission.
+        base = W + slot.to(tl.int64) * STRIDE + OFFSET
+        pairs = begin // 2 + tl.arange(0, BK // 2)
+        packed = tl.load(base + rows[:, None].to(tl.int64) * (K // 2) + pairs[None, :]).to(tl.uint32)
+        exponents = tl.load(base + N * (K // 2) + rows[:, None].to(tl.int64) * (K // 32) +
+                            begin // 32 + tl.arange(0, BK // 32)[None, :]).to(tl.uint32)
+        scale = tl.where(exponents == 0, 2.0 ** -127,
+                         tl.where(exponents == 255, float('nan'),
+                                  (exponents << 23).to(tl.float32, bitcast=True)))
+        scale = tl.reshape(tl.broadcast_to(scale[:, :, None], (BN, BK // 32, 16)), (BN, BK // 2))
+        halves = tl.inline_asm_elementwise(
+            "{ .reg .b8 v; cvt.u8.u32 v, $1; cvt.rn.f16x2.e2m1x2 $0, v; }",
+            constraints="=r,r", args=[packed], dtype=tl.uint32, is_pure=True, pack=1)
+        even = (halves & 65535).to(tl.uint16).to(tl.float16, bitcast=True)
+        odd = (halves >> 16).to(tl.uint16).to(tl.float16, bitcast=True)
+        return (even.to(tl.float32) * scale).to(tl.bfloat16), (odd.to(tl.float32) * scale).to(tl.bfloat16)
+
+
+    @triton.jit
+    def fastllm_mxfp4_planar_grouped(X, W, Slots, Routes, Scores, Y, COUNT,
+                                   H: tl.constexpr, I: tl.constexpr, TOPK: tl.constexpr,
+                                   STRIDE: tl.constexpr, DOWN: tl.constexpr,
+                                   GATE: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+        first = tl.program_id(1)
+        slot = tl.load(Slots + first)
+        previous = tl.load(Slots + first - 1, first > 0, other=-2)
+        if slot >= 0 and slot != previous:
+            m = tl.arange(0, 16)
+            valid = (first + m < COUNT) & (m < 8)
+            active = tl.load(Slots + first + m, valid, other=-2) == slot
+            route = tl.load(Routes + first + m, valid, other=0)
+            row = route // TOPK if GATE else route
+            n = tl.program_id(0) * BN + tl.arange(0, BN)
+            K: tl.constexpr = H if GATE else I
+            N: tl.constexpr = 2 * I if GATE else H
+            acc = tl.zeros((16, BN), tl.float32)
+            if GATE:
+                up = tl.zeros((16, BN), tl.float32)
+            for begin in range(0, K, BK):
+                k = begin + 2 * tl.arange(0, BK // 2)
+                even = tl.load(X + row[:, None] * K + k[None, :], active[:, None], other=0)
+                odd = tl.load(X + row[:, None] * K + k[None, :] + 1, active[:, None], other=0)
+                we, wo = _fastllm_mxfp4_planar_tile(W, slot, n, begin, K, N,
+                                                   0 if GATE else DOWN, STRIDE, BN, BK)
+                acc = tl.dot(even, tl.trans(we), acc)
+                acc = tl.dot(odd, tl.trans(wo), acc)
+                if GATE:
+                    ue, uo = _fastllm_mxfp4_planar_tile(W, slot, n + I, begin, K, N, 0, STRIDE, BN, BK)
+                    up = tl.dot(even, tl.trans(ue), up)
+                    up = tl.dot(odd, tl.trans(uo), up)
+            value = acc.to(tl.bfloat16).to(tl.float32)
+            if GATE:
+                u = up.to(tl.bfloat16).to(tl.float32)
+                value = tl.minimum(value, 10.0)
+                u = tl.maximum(-10.0, tl.minimum(u, 10.0))
+                value = ((value / (1.0 + libdevice.exp(-value)) * u) *
+                         tl.load(Scores + route)[:, None]).to(tl.bfloat16).to(tl.float32)
+                blocks = tl.reshape(tl.abs(value), (16, BN // 32, 32))
+                amax = tl.maximum(tl.max(blocks, 2), 1e-4) / 448.0
+                bits = amax.to(tl.uint32, bitcast=True)
+                exponent = ((bits >> 23) & 255).to(tl.int32) - 127 + ((bits & 0x7fffff) != 0).to(tl.int32)
+                scales = libdevice.exp2(exponent.to(tl.float32))
+                scale = tl.reshape(tl.broadcast_to(scales[:, :, None], (16, BN // 32, 32)), (16, BN))
+                value = tl.maximum(-448.0, tl.minimum(448.0, value / scale)).to(tl.float8e4nv).to(tl.float32) * scale
+                value = value.to(tl.bfloat16)
+            tl.store(Y + route[:, None] * (I if GATE else H) + n[None, :], value, active[:, None])
+
+
+    @triton.jit
     def _fastllm_fp8e4m3_to_float(x):
         x = x.to(tl.uint32)
         bits = ((x & 0x80) << 8) | ((x & 0x7F) << 7)
@@ -4683,10 +4756,17 @@ def compile_merge_moe_fp8(payload):
 def mxfp4_grouped_cache_paths(payload):
     arch = require_int(payload, "arch")
     # Fixed original DSV4.1 layout and rounding, with runtime route count.
-    base = f"mxfp4_grouped_v3_sm{arch}_h5120_i2304_k6_n64_k128_w4_s3"
+    planar = payload.get("planar", False)
+    if not isinstance(planar, bool):
+        raise ValueError("planar must be boolean")
+    topk = payload.get("topk", 6)
+    if type(topk) is not int or topk not in ((3, 6) if planar else (6,)):
+        raise ValueError("unsupported grouped MXFP4 topk")
+    base = (f"mxfp4_grouped_v5_planar_sm{arch}_h5120_i2304_k{topk}_n32_64_k256_w4_s2" if planar else
+            f"mxfp4_grouped_v3_sm{arch}_h5120_i2304_k6_n64_k128_w4_s3")
     root = Path(payload["cache_dir"])
     return {
-        name: root / f"{base}_{name}.cubin" for name in ("gate", "activate", "down")
+        name: root / f"{base}_{name}.cubin" for name in (("gate", "down") if planar else ("gate", "activate", "down"))
     }, root / f"{base}.json"
 
 
@@ -4700,9 +4780,25 @@ def compile_mxfp4_grouped(payload):
     if meta_path.exists() and all(p.exists() for p in paths.values()):
         return json.loads(meta_path.read_text())
     meta_path.parent.mkdir(parents=True, exist_ok=True)
-    h, i, topk = 5120, 2304, 6
+    h, i, topk = 5120, 2304, payload.get("topk", 6)
     down = 2 * i * (h // 32) * 17
     stride = down + h * (i // 32) * 17
+    if payload.get("planar", False):
+        infos = {}
+        for name, bn in (("gate", 32), ("down", 64)):
+            infos[name] = _compile_cubin(fastllm_mxfp4_planar_grouped,
+                dict(X="*bf16", W="*u8", Slots="*i32", Routes="*i32", Scores="*fp32",
+                     Y="*bf16" if name == "gate" else "*fp32", COUNT="i32",
+                     H="constexpr", I="constexpr", TOPK="constexpr", STRIDE="constexpr",
+                     DOWN="constexpr", GATE="constexpr", BN="constexpr", BK="constexpr"),
+                dict(H=h, I=i, TOPK=topk, STRIDE=stride, DOWN=down, GATE=name == "gate", BN=bn, BK=256),
+                arch, 4, 2, paths[name], enable_fp_fusion=False)
+        meta = dict(ok=True, op="mxfp4_grouped", version=5, planar=True, arch=arch, topk=topk,
+                    kernels={k: dict(cubin=str(paths[k]), kernel=v.metadata.name,
+                                     shared=int(v.metadata.shared), num_warps=int(v.metadata.num_warps))
+                             for k,v in infos.items()})
+        meta_path.write_text(json.dumps(meta, sort_keys=True))
+        return meta
     signature = dict(
         X="*bf16",
         W="*u8",

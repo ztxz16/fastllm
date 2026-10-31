@@ -12,7 +12,7 @@ static void Require(bool ok, const char *message) {
     if (!ok) throw std::runtime_error(message);
 }
 
-static void Run(unsigned hidden, unsigned inter, unsigned shards) {
+static void Run(unsigned hidden, unsigned inter, unsigned shards, bool planar) {
     using namespace fastllm::cuda;
     SharedExpertLayout layout;
     layout.shards = shards;
@@ -20,6 +20,7 @@ static void Run(unsigned hidden, unsigned inter, unsigned shards) {
     layout.weights[1] = SharedWeightView::Rows(hidden, inter / 32 * 17, shards);
     layout.weights[1].destinationOffset = 2 * inter * layout.weights[0].rowBytes;
     layout.recordBytes = layout.weights[1].destinationOffset + hidden * layout.weights[1].rowBytes;
+    for (auto &view : layout.weights) view.block32Planar = planar;
     Require(layout.Prepare(), "layout rejected");
     const size_t bytes = size_t(layout.sourceBytes[0]) + layout.sourceBytes[1];
     constexpr unsigned records = 2, guard = 32;
@@ -65,8 +66,15 @@ static void Run(unsigned hidden, unsigned inter, unsigned shards) {
                 for (unsigned row = 0; row < v.rows; ++row) {
                     const unsigned physical = part == 0 ? 2 * (row % inter) + row / inter : row;
                     const unsigned node = physical / v.rowsPerShard, local = physical % v.rowsPerShard;
-                    std::memcpy(expected.data() + record * layout.recordBytes + v.destinationOffset + size_t(row) * v.rowBytes,
-                        static_cast<uint8_t *>(host[(record * 2 + part) * shards + node]) + size_t(local) * v.rowBytes, v.rowBytes);
+                    const auto *source = static_cast<uint8_t *>(host[(record * 2 + part) * shards + node]) + size_t(local) * v.rowBytes;
+                    auto *destination = expected.data() + record * layout.recordBytes + v.destinationOffset;
+                    for (unsigned byte = 0; byte < v.rowBytes; ++byte) {
+                        const size_t canonical = size_t(row) * v.rowBytes + byte;
+                        const size_t block = canonical / 17, within = canonical % 17;
+                        const size_t offset = planar ? (within < 16 ? block * 16 + within :
+                            size_t(v.rows) * (v.rowBytes / 17) * 16 + block) : canonical;
+                        destination[offset] = source[byte];
+                    }
                 }
             }
             Require(CopySharedExpertRecord(layout, devicePointers + record * 2 * shards,
@@ -93,14 +101,15 @@ static void Run(unsigned hidden, unsigned inter, unsigned shards) {
         hidden, inter, shards, layout.recordBytes);
 }
 
-int main() {
+int main(int argc, char **argv) {
+    const bool planar = argc > 1 && std::string(argv[1]) == "--planar";
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices) return 77;
     try {
         for (unsigned shards : {1u, 2u, 4u}) {
-            Run(128, 128, shards);
-            Run(512, 256, shards);
-            Run(5120, 2304, shards);
+            Run(128, 128, shards, planar);
+            Run(512, 256, shards, planar);
+            Run(5120, 2304, shards, planar);
         }
         std::puts("ALL_PASS shared expert DMA upload");
         return 0;

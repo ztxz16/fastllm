@@ -19,7 +19,21 @@ namespace ref = fastllm::cuda::dsv41_cache;
 
 // Optional SM12x test: enable FASTLLM_CUDA_TRITON and select a compiler/cache.
 // The CUDA GEMV oracle preserves the original MXFP4 and activation rounding.
-int main() {
+int main(int argc, char **argv) {
+    bool planar = false, draft = false;
+    for (int i = 1; i < argc; ++i) {
+        const std::string option = argv[i];
+        if (option == "--planar") planar = true;
+        else if (option == "--draft") draft = true;
+        else {
+            std::fprintf(stderr, "Unknown option: %s\n", argv[i]);
+            return 1;
+        }
+    }
+    if (draft && !planar) {
+        std::fprintf(stderr, "--draft requires --planar\n");
+        return 1;
+    }
     if (!fastllm::CudaTritonMxfp4GroupedEnabled())
         return 77;
     const char *flag = std::getenv("FASTLLM_CUDA_TRITON_MXFP4_GROUPED");
@@ -37,7 +51,8 @@ int main() {
         setenv("FASTLLM_CUDA_TRITON_MXFP4_GROUPED", original.c_str(), 1);
     else
         unsetenv("FASTLLM_CUDA_TRITON_MXFP4_GROUPED");
-    constexpr int H = 5120, I = 2304, K = 6, S = 32;
+    constexpr int H = 5120, I = 2304, S = 32;
+    const int K = draft ? 3 : 6;
     const size_t down = size_t(2) * I * (H / 32) * 17, stride = down + size_t(H) * (I / 32) * 17;
     std::mt19937 gen(42);
     std::vector<uint8_t> w(stride * S);
@@ -46,6 +61,21 @@ int main() {
     uint8_t *dw;
     CUDA(cudaMalloc(&dw, w.size()));
     CUDA(cudaMemcpy(dw, w.data(), w.size(), cudaMemcpyHostToDevice));
+    uint8_t *dwPlanar = nullptr;
+    if (planar) {
+        std::vector<uint8_t> packed(w.size());
+        for (int slot = 0; slot < S; ++slot) for (int part = 0; part < 2; ++part) {
+            const size_t offset = part ? down : 0, bytes = part ? stride - down : down;
+            const auto *src = w.data() + size_t(slot) * stride + offset;
+            auto *dst = packed.data() + size_t(slot) * stride + offset;
+            for (size_t block = 0; block < bytes / 17; ++block) {
+                std::memcpy(dst + block * 16, src + block * 17, 16);
+                dst[bytes / 17 * 16 + block] = src[block * 17 + 16];
+            }
+        }
+        CUDA(cudaMalloc(&dwPlanar, packed.size()));
+        CUDA(cudaMemcpy(dwPlanar, packed.data(), packed.size(), cudaMemcpyHostToDevice));
+    }
     w.clear();
     w.shrink_to_fit();
     __nv_bfloat16 *x, *a, *b;
@@ -70,7 +100,7 @@ int main() {
     cudaEvent_t start, end;
     CUDA(cudaEventCreate(&start));
     CUDA(cudaEventCreate(&end));
-    for (int rows : {2, 4, 6, 8})
+    for (int rows : {2, 3, 4, 6, 8})
         for (int shift : {0, 2, 6})
             for (int active : {0, 4}) {
                 int n = rows * K;
@@ -100,8 +130,8 @@ int main() {
                     ss[i] = slot(order[i]);
                 CUDA(cudaMemcpy(slots, ss.data(), n * 4, cudaMemcpyHostToDevice));
                 CUDA(cudaMemcpy(map, order.data(), n * 4, cudaMemcpyHostToDevice));
-                void *raw;
-                CUDA(cudaMalloc(&raw, 8 * K * 2 * I * 2));
+                void *raw = nullptr;
+                if (!planar) CUDA(cudaMalloc(&raw, 8 * K * 2 * I * 2));
                 fastllm::Data input(fastllm::BFLOAT16, {rows, H}), activation(fastllm::BFLOAT16, {rows * K, I});
                 for (auto *d : {&input, &activation}) {
                     d->isFake = true;
@@ -111,8 +141,8 @@ int main() {
                 input.cudaData = x;
                 activation.cudaData = b;
                 auto admitted = [&](int count) {
-                    return fastllm::TryCudaTritonMxfp4Grouped(input, activation, dw, slots, map, scores, z, raw,
-                                                              count, H, I, K, stride, down, 10);
+                    return fastllm::TryCudaTritonMxfp4Grouped(input, activation, planar ? dwPlanar : dw, slots, map, scores, z, raw,
+                                                              count, H, I, K, stride, down, 10, planar);
                 };
                 if (admitted(n + 1) || admitted(3))
                     return 6;
@@ -134,8 +164,8 @@ int main() {
                             x, slots, dw, scores, a, H, I, stride, 10, K, map);
                         ref::Down<<<dim3(H / 8, count), 128, 0, cudaStreamPerThread>>>(a, slots, dw, y, H, I, stride,
                                                                                    down, map);
-                    } else if (!fastllm::TryCudaTritonMxfp4Grouped(input, activation, dw, slots, map, scores, z,
-                                                                  raw, count, H, I, K, stride, down, 10)) {
+                    } else if (!fastllm::TryCudaTritonMxfp4Grouped(input, activation, planar ? dwPlanar : dw, slots, map, scores, z,
+                                                                  raw, count, H, I, K, stride, down, 10, planar)) {
                         fprintf(stderr, "Triton path rejected\n");
                         exit(2);
                     }
@@ -212,9 +242,10 @@ int main() {
                     CUDA(cudaGraphExecDestroy(executable));
                     CUDA(cudaGraphDestroy(graph));
                 }
-                CUDA(cudaFree(raw));
+                if (raw) CUDA(cudaFree(raw));
             }
-    puts("ALL_PASS: 24 full/partial route layouts through engine compiler metadata and CUDA wrapper");
+    puts("ALL_PASS: 30 full/partial route layouts through engine compiler metadata and CUDA wrapper");
+    if (dwPlanar) CUDA(cudaFree(dwPlanar));
     for (void *p : {(void *)x, (void *)a, (void *)b, (void *)y, (void *)z, (void *)scores, (void *)slots,
                     (void *)map, (void *)dw})
         CUDA(cudaFree(p));

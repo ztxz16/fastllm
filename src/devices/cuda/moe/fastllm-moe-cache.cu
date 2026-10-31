@@ -93,6 +93,7 @@ size_t AlignUp(size_t value, size_t alignment) {
 
 struct OffloadLayout {
     bool deepSeekV41 = false;
+    bool planarMxfp4 = false;
     bool glm5 = false;
     float swigluLimit = 0.0f;
     fastllm::DataType weightType = fastllm::DataType::NVFP4_BLOCK_16_E4M3;
@@ -417,7 +418,7 @@ bool NativeSharedRecords(const OffloadGroup &group) {
     const auto &plan = group.sharedLayout;
     if (!plan.shards || plan.auxiliaryBytes) return false;
     for (const auto &view : plan.weights) {
-        if (view.rowGroups != 1 || view.sourceOffset || view.tileRows != 1 ||
+        if (view.block32Planar || view.rowGroups != 1 || view.sourceOffset || view.tileRows != 1 ||
             view.tileStride != view.rowBytes || view.rowStride != view.rowBytes ||
             view.blockBytes != view.rowBytes || view.blockStride != view.rowBytes) return false;
     }
@@ -752,6 +753,7 @@ bool BindNumaWeights(OffloadGroup &group, const std::vector<fastllm::Data *> &we
         view.rowGroups = part == 0 ? 2 : 1;
         view.destinationOffset = part == 0 ? 0 : layout.downOffset;
         if (!storage.bind(layout, *weights[part], part, view)) return false;
+        view.block32Planar = layout.planarMxfp4;
     }
     if (!plan.Prepare()) return false;
     std::vector<void *> pointers;
@@ -2087,6 +2089,11 @@ bool FastllmCudaPrepareMoeCache(
         layerLayouts.push_back(layerLayout);
     }
 
+    // The destination format is immutable for the lifetime of this group.
+    // Every CUDA fallback and prefill restore explicitly consumes the tag.
+    layout.planarMxfp4 = layout.weightType == fastllm::NVFP4_BLOCK_32_E8M0 &&
+        bool(registerNumaWeights) &&
+        fastllm::CudaTritonMxfp4GroupedEnabled();
     std::unique_ptr<OffloadGroup> group(new OffloadGroup());
     group->layout = layout;
     for (int layer = 0; layer < layerCount; ++layer)
@@ -2550,10 +2557,10 @@ bool ComputeV41Cache(const fastllm::Data &input, fastllm::Data &activation,
     using namespace fastllm::cuda::dsv41_cache;
     Gate<><<<dim3(layout.inter / 32, topk), 512, 0, cudaStreamPerThread>>>(
         (const __nv_bfloat16*)input.cudaData, cache.routeSlots, cache.records, scores,
-        (__nv_bfloat16*)activation.cudaData, layout.hidden, layout.inter, layout.recordStride, layout.swigluLimit);
+        (__nv_bfloat16*)activation.cudaData, layout.hidden, layout.inter, layout.recordStride, layout.swigluLimit, 1, nullptr, layout.planarMxfp4);
     Down<<<dim3(layout.hidden / 8, topk), 128, 0, cudaStreamPerThread>>>(
         (const __nv_bfloat16*)activation.cudaData, cache.routeSlots, cache.records, perExpert,
-        layout.hidden, layout.inter, layout.recordStride, layout.downOffset);
+        layout.hidden, layout.inter, layout.recordStride, layout.downOffset, nullptr, layout.planarMxfp4);
     return cudaGetLastError() == cudaSuccess;
 }
 
@@ -3117,7 +3124,7 @@ void FastllmCudaMoePrefillCache::Upload(int slot, void *streamPointer) {
     const int blocks = int(std::min<size_t>(256, (size_t(rows) * pitch + 255) / 256));
     if (layout.weightType == fastllm::FP8_E4M3_BLOCK_128 ||
         layout.weightType == fastllm::NVFP4_BLOCK_32_E8M0) {
-        fastllm_prefill::RestorePackedRows<<<blocks, 256, 0, stream>>>(source, output, rows, pitch, part == 0);
+        fastllm_prefill::RestorePackedRows<<<blocks, 256, 0, stream>>>(source, output, rows, pitch, part == 0, layout.planarMxfp4);
     } else if (layout.weightType == fastllm::FP8_E4M3) {
         const auto *record = static_cast<const uint8_t *>(s.resident.weights[at - part]);
         const auto *scales = reinterpret_cast<const float *>(record + layout.scalesOffset +
@@ -3430,15 +3437,15 @@ static bool ComputeBatchExperts(const fastllm::Data &input, fastllm::Data &activ
     if (grouped && fastllm::TryCudaTritonMxfp4Grouped(input, activation,
             view.records, view.routeSlots, view.routeMap, scores, perExpert,
             view.workspace, view.routeCount, layout.hidden, layout.inter,
-            topk, layout.recordStride, layout.downOffset, layout.swigluLimit)) return true;
+            topk, layout.recordStride, layout.downOffset, layout.swigluLimit, layout.planarMxfp4)) return true;
     using namespace fastllm::cuda::dsv41_cache;
     Gate<true><<<dim3(layout.inter / 32, view.routeCount), 512, 0, cudaStreamPerThread>>>(
         (const __nv_bfloat16 *)input.cudaData, view.routeSlots, view.records, scores,
         (__nv_bfloat16 *)activation.cudaData, layout.hidden, layout.inter,
-        layout.recordStride, layout.swigluLimit, topk, view.routeMap);
+        layout.recordStride, layout.swigluLimit, topk, view.routeMap, layout.planarMxfp4);
     Down<<<dim3(layout.hidden / 8, view.routeCount), 128, 0, cudaStreamPerThread>>>(
         (const __nv_bfloat16 *)activation.cudaData, view.routeSlots, view.records, perExpert,
-        layout.hidden, layout.inter, layout.recordStride, layout.downOffset, view.routeMap);
+        layout.hidden, layout.inter, layout.recordStride, layout.downOffset, view.routeMap, layout.planarMxfp4);
     return cudaGetLastError() == cudaSuccess;
 }
 
@@ -3814,7 +3821,7 @@ bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int 
         const size_t bytes = v41Batch
             ? FastllmCudaMoeGGUFCacheWorkspaceBytes(hidden, layout.inter)
             : FastllmCudaMoeGGUFCacheBatchWorkspaceBytes(hidden, layout.inter, rows, topk);
-        if (groupedEnabled) {
+        if (groupedEnabled && !layout.planarMxfp4) {
             const size_t rawBytes = size_t(routes) * 2 * layout.inter * sizeof(uint16_t);
             allocate(work.batchWorkspace, INT8, {int(std::max(bytes, rawBytes))});
         } else if (batchGGUF && bytes) allocate(work.batchWorkspace, INT8, {int(bytes)});

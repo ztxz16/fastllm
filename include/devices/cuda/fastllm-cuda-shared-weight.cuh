@@ -16,6 +16,8 @@ struct SharedWeightView {
     uint32_t blockBytes = 0, blockStride = 0, sourceOffset = 0;
     uint32_t destinationOffset = 0;
     uint32_t groupRows = 0, shardBytes = 0;
+    // Destination stores all block32 FP4 payloads, then all UE8M0 scales.
+    bool block32Planar = false;
 
     static SharedWeightView Rows(uint32_t rows, uint32_t rowBytes,
                                  uint32_t shards, uint32_t groups = 1) {
@@ -23,7 +25,8 @@ struct SharedWeightView {
                 1, rowBytes, rowBytes, rowBytes, rowBytes, 0, 0};
     }
     bool Valid(uint32_t shards, uint32_t recordBytes) const {
-        return rows && rowBytes && shards && rows % shards == 0 &&
+        return (!block32Planar || rowBytes % 17 == 0) &&
+            rows && rowBytes && shards && rows % shards == 0 &&
             rowsPerShard == rows / shards && rowGroups && rows % rowGroups == 0 &&
             tileRows && rowsPerShard % tileRows == 0 && blockBytes &&
             blockStride >= blockBytes &&
@@ -33,8 +36,9 @@ struct SharedWeightView {
             uint64_t(destinationOffset) + uint64_t(rows) * rowBytes <= recordBytes;
     }
     uint32_t Alignment() const {
+        // Separating 16-byte payloads from 1-byte scales requires byte gather.
         return rowBytes | tileStride | rowStride | blockBytes | blockStride |
-               sourceOffset | destinationOffset;
+               sourceOffset | destinationOffset | uint32_t(block32Planar);
     }
 };
 
@@ -90,6 +94,11 @@ namespace shared_weight_detail {
 // Resolve the same byte view for mapped NUMA shards and concatenated uploads.
 __device__ inline size_t SourceOffset(const SharedWeightView &view, uint32_t offset,
                                      uint32_t &shard) {
+    if (view.block32Planar) {
+        const uint32_t payload = view.rows * (view.rowBytes / 17) * 16;
+        offset = offset < payload ? (offset / 16) * 17 + offset % 16 :
+                                   (offset - payload) * 17 + 16;
+    }
     uint32_t row = offset / view.rowBytes;
     const uint32_t column = offset - row * view.rowBytes;
     const uint32_t group = row / view.groupRows;
@@ -265,7 +274,7 @@ inline bool ContiguousInterleavedRows(const SharedExpertLayout &layout) {
         (layout.weights[0].rowBytes & 15)) return false;
     uint64_t bytes = 0;
     for (const auto &view : layout.weights) {
-        if (!view.Valid(layout.shards, layout.recordBytes) || view.sourceOffset || view.tileRows != 1 ||
+        if (view.block32Planar || !view.Valid(layout.shards, layout.recordBytes) || view.sourceOffset || view.tileRows != 1 ||
             view.tileStride != view.rowBytes || view.rowStride != view.rowBytes ||
             view.blockBytes != view.rowBytes || view.blockStride != view.rowBytes ||
             view.rowsPerShard % view.rowGroups || view.groupRows != view.rows / view.rowGroups ||

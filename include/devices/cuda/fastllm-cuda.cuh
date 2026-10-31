@@ -2741,13 +2741,13 @@ bool CudaTritonMxfp4GroupedEnabled();
 bool TryCudaTritonMxfp4Grouped(const Data &input, Data &activation,
     const unsigned char *records, const int *slots, const int *routes,
     const float *scores, float *output, void *scratch, int count,
-    int hidden, int inter, int topk, size_t stride, size_t down, float limit);
+    int hidden, int inter, int topk, size_t stride, size_t down, float limit, bool planar = false);
 }
 extern "C" bool FastllmCudaTritonMxfp4Grouped(
     const char *const *cubins, const char *const *names, const int *shared,
     const fastllm::Data &input, fastllm::Data &activation,
     const unsigned char *records, const int *slots, const int *routes,
-    const float *scores, float *output, void *scratch, int count);
+    const float *scores, float *output, void *scratch, int count, bool planar = false);
 
 // Native single-GPU NUMA MoE child graph. The model keeps the source buffers
 // and weight objects alive; the cache owns the returned handle and graph.

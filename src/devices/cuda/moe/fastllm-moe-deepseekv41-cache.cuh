@@ -65,14 +65,16 @@ __device__ __forceinline__ float2 FP4Pair(unsigned packed, unsigned exponent) {
     return make_float2(BFloat(__fmul_rn(values.x,scale)), BFloat(__fmul_rn(values.y,scale)));
 #endif
 }
-__device__ inline float Dot(const __nv_bfloat16 *input, const uint8_t *weight, int columns) {
+template<bool Planar = false>
+__device__ inline float Dot(const __nv_bfloat16 *input, const uint8_t *weight, int columns,
+                            const uint8_t *scales = nullptr) {
     const int lane = threadIdx.x & 15;
     float sum = 0;
     // Independent loads/decodes overlap; additions retain the original order.
     #pragma unroll 8
     for (int block = 0; block < columns / 32; ++block) {
-        const uint8_t *w = weight + block * 17;
-        const float2 value = FP4Pair(w[lane], w[16]);
+        const uint8_t *w = weight + block * (Planar ? 16 : 17);
+        const float2 value = FP4Pair(w[lane], Planar ? scales[block] : w[16]);
         // Each adjacent BF16 input pair is aligned, including every block.
         const unsigned x = reinterpret_cast<const unsigned *>(input)[block * 16 + lane];
         const float x0 = __uint_as_float(x << 16), x1 = __uint_as_float(x & 0xffff0000u);
@@ -85,14 +87,16 @@ __device__ inline float Dot(const __nv_bfloat16 *input, const uint8_t *weight, i
 }
 // Reuse each input pair for both projections without changing either dot's
 // accumulation order. Dot remains the independent single-projection path.
+template<bool Planar = false>
 __device__ inline float2 DotGateUp(const __nv_bfloat16 *input, const uint8_t *gate,
-        const uint8_t *up, int columns) {
+        const uint8_t *up, int columns, const uint8_t *gateScales = nullptr, const uint8_t *upScales = nullptr) {
     const int lane = threadIdx.x & 15;
     float gs = 0, us = 0;
     #pragma unroll 4
     for (int block = 0; block < columns / 32; ++block) {
-        const uint8_t *g = gate + block * 17, *u = up + block * 17;
-        const float2 gv = FP4Pair(g[lane], g[16]), uv = FP4Pair(u[lane], u[16]);
+        const uint8_t *g = gate + block * (Planar ? 16 : 17), *u = up + block * (Planar ? 16 : 17);
+        const float2 gv = FP4Pair(g[lane], Planar ? gateScales[block] : g[16]);
+        const float2 uv = FP4Pair(u[lane], Planar ? upScales[block] : u[16]);
         const unsigned x = reinterpret_cast<const unsigned *>(input)[block * 16 + lane];
         const float x0 = __uint_as_float(x << 16), x1 = __uint_as_float(x & 0xffff0000u);
         gs = __fadd_rn(gs, __fadd_rn(__fmul_rn(x0, gv.x), __fmul_rn(x1, gv.y)));
@@ -134,7 +138,7 @@ __device__ inline void StoreGate(float2 pair, float score, __nv_bfloat16 *activa
 template <bool Batched = false>
 __global__ void Gate(const __nv_bfloat16 *input, const int32_t *slots, const uint8_t *records, const float *scores,
                      __nv_bfloat16 *activation, int hidden, int inter, size_t stride, float limit, int topk = 1,
-                     const int32_t *routeMap = nullptr) {
+                     const int32_t *routeMap = nullptr, bool planar = false) {
     const int selected = blockIdx.y, route = routeMap ? routeMap[selected] : selected;
     const int slot = slots[selected];
     if constexpr (Batched)
@@ -144,7 +148,12 @@ __global__ void Gate(const __nv_bfloat16 *input, const int32_t *slots, const uin
     const int column = blockIdx.x * 32 + threadIdx.x / 16;
     const size_t pitch = size_t(hidden / 32) * 17;
     const uint8_t *record = records + size_t(slot) * stride;
-    const float2 pair = DotGateUp(input, record + column * pitch, record + (column + inter) * pitch, hidden);
+    const size_t qpitch = hidden / 2, spitch = hidden / 32;
+    const uint8_t *scales = record + size_t(2 * inter) * qpitch;
+    const float2 pair = planar ? DotGateUp<true>(input, record + column * qpitch,
+        record + (column + inter) * qpitch, hidden, scales + column * spitch,
+        scales + (column + inter) * spitch) :
+        DotGateUp(input, record + column * pitch, record + (column + inter) * pitch, hidden);
     StoreGate(pair, scores[route], activation, route, inter, limit);
 }
 // Coalesced weight staging avoids repeatedly fetching small fragments of
@@ -220,14 +229,18 @@ static __global__ void GateResident(const __nv_bfloat16 *input, const int32_t *s
 }
 static __global__ void Down(const __nv_bfloat16 *activation, const int32_t *slots, const uint8_t *records,
                             float *output, int hidden, int inter, size_t stride, size_t downOffset,
-                            const int32_t *routeMap = nullptr) {
+                            const int32_t *routeMap = nullptr, bool planar = false) {
     const int selected = blockIdx.y, route = routeMap ? routeMap[selected] : selected;
     const int slot = slots[selected];
     if (slot < 0)
         return;
     const int column = blockIdx.x * 8 + threadIdx.x / 16;
     const uint8_t *weight = records + size_t(slot) * stride + downOffset + size_t(column) * (inter / 32) * 17;
-    const float value = Dot(activation + route * inter, weight, inter);
+    const uint8_t *matrix = records + size_t(slot) * stride + downOffset;
+    const float value = planar ? Dot<true>(activation + route * inter,
+        matrix + size_t(column) * (inter / 2), inter,
+        matrix + size_t(hidden) * (inter / 2) + size_t(column) * (inter / 32)) :
+        Dot(activation + route * inter, weight, inter);
     if ((threadIdx.x & 15) == 0)
         output[route * hidden + column] = BFloat(value);
 }
