@@ -25,6 +25,7 @@ extern "C" bool FastllmCudaDeepSeekV41HcPost(const fastllm::Data&, const fastllm
 
 #include <cmath>
 #include <chrono>
+#include <climits>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -1232,6 +1233,87 @@ namespace fastllm {
         }
         state = 0;
         return false;
+    }
+
+    bool TryCudaTritonSmallProjection(const Data &input, Data &weight, Data &output, int groups) {
+        if (!CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON")) return false;
+        const char *flag = std::getenv("FASTLLM_CUDA_TRITON_SMALL_PROJECTION");
+        if (flag && flag[0] && !CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON_SMALL_PROJECTION")) return false;
+        const int arch = CudaTritonRuntimeArch(), device = FastllmCudaGetDevice();
+        auto local = [device](const Data &d) {
+            if (d.multiDeviceData || d.dataDevice != CUDA || !d.cudaData ||
+                d.dataDeviceIds != std::vector<int>{device} || d.dims.empty() ||
+                d.strides.size() != d.dims.size() || (reinterpret_cast<uintptr_t>(d.cudaData) & 15)) return false;
+            uint64_t stride = 1;
+            for (int i = int(d.dims.size()) - 1; i >= 0; --i) {
+                if (d.dims[i] <= 0 || d.strides[i] != stride) return false;
+                stride *= d.dims[i];
+            }
+            return true;
+        };
+        if ((arch != 120 && arch != 121) || groups <= 0 ||
+            !local(input) || !local(weight) || !local(output) ||
+            input.dataType != BFLOAT16 || output.dataType != BFLOAT16 ||
+            (weight.dataType != FP8_E4M3 && weight.dataType != BFLOAT16) ||
+            weight.IsRepacked || weight.dims.size() != 2 || weight.dims[0] % groups) return false;
+        const int n = weight.dims[0] / groups, k = weight.dims[1];
+        const uint64_t width = uint64_t(groups) * k;
+        if (n <= 0 || k <= 0 || n % 32 || k % 32 || input.Count(0) % width ||
+            weight.Count(0) > INT_MAX || input.Count(0) > INT_MAX) return false;
+        const uint64_t rows64 = input.Count(0) / width;
+        if (rows64 < 2 || rows64 > 16 || output.Count(0) != rows64 * groups * n) return false;
+        auto overlaps = [](const Data &a, const Data &b) {
+            const uintptr_t x = reinterpret_cast<uintptr_t>(a.cudaData), y = reinterpret_cast<uintptr_t>(b.cudaData);
+            return x < y + b.GetBytes() && y < x + a.GetBytes();
+        };
+        if (overlaps(output, input) || overlaps(output, weight)) return false;
+        const int fp8 = weight.dataType == FP8_E4M3;
+        if (fp8 && (weight.blockM != 32 || weight.blockK != 32 ||
+            weight.scales.size() != size_t(weight.dims[0] / 32) * (k / 32) ||
+            weight.extraCudaData.empty() || !weight.extraCudaData[0] ||
+            (reinterpret_cast<uintptr_t>(weight.extraCudaData[0]) & 15))) return false;
+        // Small N needs more CTAs; wider K benefits from a larger reduction tile.
+        const int bn = groups == 1 && n >= 16384 && k <= 2048 ? 64 : 32;
+        const int bk = bn == 64 ? 64 : (groups > 1 ? 128 : 256);
+        const std::string dir = CudaTritonCacheDir();
+        const std::string base = "small_projection_v1_sm" + std::to_string(arch) + "_fp8" +
+            std::to_string(fp8) + "_n" + std::to_string(n) + "_k" + std::to_string(k) +
+            "_bn" + std::to_string(bn) + "_bk" + std::to_string(bk) + "_w4_s3";
+        const std::string path = CudaTritonJoinPath(dir, base + ".json");
+        static std::mutex mutex;
+        static std::map<std::string, CudaTritonKernelMeta> cache;
+        CudaTritonKernelMeta meta;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            auto found = cache.find(path);
+            if (found != cache.end()) meta = found->second;
+            else {
+                if (FastllmCudaGraphIsCapturing()) return false;
+                std::ifstream file(path);
+                std::string body((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>()), error;
+                auto json = json11::Json::parse(body, error);
+                if (!error.empty() || !json["ok"].bool_value()) {
+                    if (!CudaTritonEnsureServer()) return false;
+                    json11::Json request = json11::Json::object{{"op", "small_projection"}, {"arch", arch},
+                        {"cache_dir", dir}, {"n", n}, {"k", k}, {"fp8", fp8}, {"block_n", bn}, {"block_k", bk}};
+                    int status = 0;
+                    if (!CudaTritonHttpRequest("POST", "/compile", request.dump(), &status, body) || status != 200)
+                        return false;
+                    error.clear();
+                    json = json11::Json::parse(body, error);
+                }
+                meta.cubinPath = json["cubin"].string_value(); meta.kernelName = json["kernel"].string_value();
+                meta.shared = json["shared"].int_value(); meta.numWarps = json["num_warps"].int_value();
+                if (!error.empty() || !json["ok"].bool_value() || json["version"].int_value() != 1 ||
+                    json["arch"].int_value() != arch || json["n"].int_value() != n || json["k"].int_value() != k ||
+                    json["fp8"].int_value() != fp8 || json["block_n"].int_value() != bn || json["block_k"].int_value() != bk ||
+                    meta.kernelName.empty() || meta.shared < 0 || meta.shared > 101376 || meta.numWarps != 4 ||
+                    !CudaTritonFileExists(meta.cubinPath)) return false;
+                cache.emplace(path, meta);
+            }
+        }
+        return FastllmCudaTritonSmallProjection(meta.cubinPath.c_str(), meta.kernelName.c_str(), meta.shared,
+                                               input, weight, output, int(rows64), groups, n, bn);
     }
 
     bool CudaTritonMxfp4GroupedEnabled() {

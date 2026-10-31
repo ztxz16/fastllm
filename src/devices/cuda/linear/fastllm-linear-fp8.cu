@@ -2799,6 +2799,12 @@ bool FastllmCudaBFloat16MatMulFP8E4M3(const fastllm::Data &input, fastllm::Data 
         return true;
     }
 
+    if (bias.dims.empty() && fastllm::TryCudaTritonSmallProjection(input, weight, output)) {
+        FastllmCudaFinishInput(input, cudaInput);
+        FastllmCudaFinishOutput(output, cudaOutput);
+        return true;
+    }
+
     // See the FP32 adapter above: this path is only needed if a caller reuses
     // an FP16-repacked weight with BF16 activations later in its lifetime.
     if (FastllmCudaFp8E4M3HasSm70Layout(weight)) {

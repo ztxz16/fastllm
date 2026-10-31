@@ -29,6 +29,34 @@ except Exception as exc:  # pragma: no cover - this is reported through /compile
 
 if triton is not None:
     @triton.jit
+    def fastllm_small_projection(X, W, S, Y, rows, groups, N: tl.constexpr, K: tl.constexpr,
+                                FP8: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+        # One CTA owns a complete output tile: no rounded split-K partials.
+        n = tl.program_id(0) * BN + tl.arange(0, BN)
+        group = tl.program_id(1)
+        m = tl.arange(0, 16)
+        kk = tl.arange(0, BK)
+        acc = tl.zeros((16, BN), tl.float32)
+        for tile in range(tl.cdiv(K, BK)):
+            k = tile * BK + kk
+            a = tl.load(X + (m[:, None] * groups + group) * K + k[None, :],
+                        (m[:, None] < rows) & (k[None, :] < K), other=0.0)
+            b = tl.load(W + (group * N + n[:, None]) * K + k[None, :],
+                        (n[:, None] < N) & (k[None, :] < K), other=0)
+            if FP8:
+                b = b.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+                sk = tile * (BK // 32) + tl.arange(0, BK // 32)
+                scales = tl.load(S + ((group * N + n[:, None]) // 32) * (K // 32) + sk[None, :],
+                                 (n[:, None] < N) & (sk[None, :] * 32 < K), other=0.0)
+                # Load each block scale once, then broadcast across its 32 values.
+                b = tl.reshape(tl.reshape(b, (BN, BK // 32, 32)) * scales[:, :, None],
+                               (BN, BK)).to(tl.bfloat16)
+            acc = tl.dot(a, tl.trans(b), acc)
+        tl.store(Y + (m[:, None] * groups + group) * N + n[None, :], acc.to(tl.bfloat16),
+                 (m[:, None] < rows) & (n[None, :] < N))
+
+
+    @triton.jit
     def _fastllm_mxfp4_decode_pair(packed, exponent):
         return tl.inline_asm_elementwise(
             """{
@@ -4742,9 +4770,38 @@ def compile_mxfp4_grouped(payload):
     return meta
 
 
+def compile_small_projection(payload):
+    if triton is None:
+        raise RuntimeError(f"failed to import triton: {_triton_error}")
+    arch, n, k, bn, bk = (require_int(payload, key) for key in
+                         ("arch", "n", "k", "block_n", "block_k"))
+    fp8 = int(payload["fp8"])
+    if arch not in {120, 121} or n <= 0 or k <= 0 or n % 32 or k % 32 or fp8 not in {0, 1}:
+        raise ValueError("small projection requires SM12x, aligned BF16 / block-32 FP8 weights")
+    if (bn, bk) not in {(64, 64), (32, 128), (32, 256)}:
+        raise ValueError("unsupported small projection tile")
+    root = Path(payload["cache_dir"])
+    base = f"small_projection_v1_sm{arch}_fp8{fp8}_n{n}_k{k}_bn{bn}_bk{bk}_w4_s3"
+    cubin, meta_path = root / (base + ".cubin"), root / (base + ".json")
+    if meta_path.exists() and cubin.exists():
+        return json.loads(meta_path.read_text())
+    root.mkdir(parents=True, exist_ok=True)
+    compiled = _compile_cubin(fastllm_small_projection,
+        dict(X="*bf16", W="*u8" if fp8 else "*bf16", S="*fp32", Y="*bf16", rows="i32", groups="i32",
+             N="constexpr", K="constexpr", FP8="constexpr", BN="constexpr", BK="constexpr"),
+        dict(N=n, K=k, FP8=bool(fp8), BN=bn, BK=bk), arch, 4, 3, cubin)
+    meta = dict(ok=True, op="small_projection", version=1, arch=arch, n=n, k=k, fp8=fp8,
+                block_n=bn, block_k=bk, cubin=str(cubin), kernel=compiled.metadata.name,
+                shared=int(compiled.metadata.shared), num_warps=int(compiled.metadata.num_warps))
+    meta_path.write_text(json.dumps(meta, sort_keys=True))
+    return meta
+
+
 def handle_compile(payload):
     op = payload.get("op")
     with _compile_lock:
+        if op == "small_projection":
+            return compile_small_projection(payload)
         if op == "mxfp4_grouped":
             return compile_mxfp4_grouped(payload)
         if op == "linear":

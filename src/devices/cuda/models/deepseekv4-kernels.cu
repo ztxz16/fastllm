@@ -10256,6 +10256,7 @@ extern "C" bool FastllmCudaDeepSeekV41CompactWoA(const fastllm::Data &input,
             scales, static_cast<__nv_bfloat16 *>(output.cudaData), groups, rank, hidden);
         return cudaGetLastError() == cudaSuccess;
     }
+    if (fastllm::TryCudaTritonSmallProjection(input, mutableWeight, output, groups)) return true;
     // Runtime SM alone is insufficient: a lower-architecture PTX build can
     // run on newer GPUs while its WMMA kernel body was compiled out.
 #if !defined(USE_ROCM) && !defined(CUDA_NO_TENSOR_CORE)
@@ -10332,6 +10333,8 @@ extern "C" bool FastllmCudaDeepSeekV4WoA(const fastllm::Data &o, const fastllm::
     }
 
     fastllm::Data &mutableWoA = const_cast<fastllm::Data&>(woA);
+    if (allowTriton && woA.dataType == fastllm::DataType::BFLOAT16 &&
+        fastllm::TryCudaTritonSmallProjection(*projectionInput, mutableWoA, output, groups)) return true;
     if (allowTriton && fastllm::FastllmCudaTryTritonDeepSeekV4WoA(
             *projectionInput, mutableWoA, groups, oRank, output)) {
         DeviceSync();

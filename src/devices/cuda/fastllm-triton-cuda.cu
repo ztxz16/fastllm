@@ -95,7 +95,7 @@ static bool EnsureCudaDriverContext() {
     return CheckCu(cuCtxSetCurrent(context), "cuCtxSetCurrent");
 }
 
-static LoadedTritonKernel *LoadTritonKernel(const char *cubinPath, const char *kernelName, int shared) {
+static LoadedTritonKernel *LoadTritonKernel(const char *cubinPath, const char *kernelName, int shared, bool forbidCaptureLoad = false) {
     int device = -1;
     cudaGetDevice(&device);
 
@@ -119,6 +119,8 @@ static LoadedTritonKernel *LoadTritonKernel(const char *cubinPath, const char *k
     if (it != g_tritonKernels.end()) {
         return &it->second;
     }
+    // A warmed kernel can replay in a graph; loading a module cannot.
+    if (forbidCaptureLoad && FastllmCudaGraphIsCapturing()) return nullptr;
 
     std::vector<char> cubin;
     if (!ReadBinaryFile(cubinPath, cubin)) {
@@ -1613,6 +1615,25 @@ extern "C" bool FastllmCudaTritonDeepSeekV4SparseAttentionDecodeGraph(
         mergeArgs);
     return CheckCu(
         mergeResult, "cuLaunchKernel deepseek_v4_sparse_decode_merge");
+}
+
+extern "C" bool FastllmCudaTritonSmallProjection(const char *cubin, const char *name, int shared,
+    const fastllm::Data &input, const fastllm::Data &weight, fastllm::Data &output,
+    int rows, int groups, int columns, int blockN) {
+    auto *kernel = LoadTritonKernel(cubin, name, shared, true);
+    if (!kernel) return false;
+    CUdeviceptr x = (CUdeviceptr)FastllmCudaPrepareInput(input);
+    CUdeviceptr w = (CUdeviceptr)FastllmCudaPrepareInput(weight);
+    CUdeviceptr y = (CUdeviceptr)FastllmCudaPrepareOutput(output);
+    CUdeviceptr scales = weight.dataType == fastllm::FP8_E4M3 ? (CUdeviceptr)weight.extraCudaData[0] : w;
+    CUdeviceptr globalScratch = 0, profileScratch = 0;
+    void *args[] = {&x, &w, &scales, &y, &rows, &groups, &globalScratch, &profileScratch};
+    const CUresult result = LaunchTritonKernel(kernel, (columns + blockN - 1) / blockN, groups, 1,
+                                               128, shared, args, CU_STREAM_PER_THREAD);
+    FastllmCudaFinishInput(input, (void *)x);
+    FastllmCudaFinishInput(weight, (void *)w);
+    FastllmCudaFinishOutput(output, (void *)y);
+    return CheckCu(result, "cuLaunchKernel small_projection");
 }
 
 extern "C" bool FastllmCudaTritonMxfp4Grouped(const char *const *cubins, const char *const *names,

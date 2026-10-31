@@ -2728,6 +2728,13 @@ struct FastllmCudaDiskMxfp4Scope {
 };
 
 
+namespace fastllm {
+bool TryCudaTritonSmallProjection(const Data &input, Data &weight, Data &output, int groups = 1);
+}
+extern "C" bool FastllmCudaTritonSmallProjection(const char *cubin, const char *name, int shared,
+    const fastllm::Data &input, const fastllm::Data &weight, fastllm::Data &output,
+    int rows, int groups, int columns, int blockN);
+
 // Sorted original MXFP4 expert slots, at most eight routes per slot.
 namespace fastllm {
 bool CudaTritonMxfp4GroupedEnabled();
