@@ -5,10 +5,10 @@
 #include <cuda_bf16.h>
 
 namespace {
-constexpr int Moe16WgmmaRows = 64, Moe16WgmmaColumns = 64, Moe16WgmmaK = 64, Moe16WgmmaStages = 3;
-template<bool Gate> constexpr int Moe16WgmmaSharedBytes() {
+constexpr int Moe16WgmmaRows = 64, Moe16WgmmaColumns = 64, Moe16WgmmaStages = 3;
+template<bool Gate, int K = 64> constexpr int Moe16WgmmaSharedBytes() {
     return Moe16WgmmaStages * (Moe16WgmmaRows + Moe16WgmmaColumns * (Gate ? 2 : 1)) *
-        Moe16WgmmaK * sizeof(__nv_bfloat16);
+        K * sizeof(__nv_bfloat16);
 }
 struct Moe16ExpertMaps { CUtensorMap input, weight; };
 __device__ __forceinline__ unsigned Moe16SharedAddress(const void *p) {
@@ -31,10 +31,11 @@ __device__ __forceinline__ void Moe16TmaWait(unsigned long long *barrier, int ph
 // Instruction and shared-descriptor encoding follow NVIDIA PTX ISA:
 // https://docs.nvidia.com/cuda/parallel-thread-execution/#asynchronous-warpgroup-level-matrix-instructions
 // CUDA/PTX implementation; no CUTLASS or SGLang runtime dependency.
+template<int K>
 __device__ __forceinline__ unsigned long long Moe16WgmmaDescriptor(const void *p) {
-    // 128-byte swizzle, K-major BF16: one 16-byte leading unit and a
-    // 64-unit stride between eight-row groups. Each K slice starts at p.
-    return (1ull << 62) | (64ull << 32) | (1ull << 16) |
+    // K-major BF16, with a 16-byte leading unit and eight rows per stride.
+    // The descriptor swizzle must match the TMA map's 64/128-byte layout.
+    return ((K == 32 ? 2ull : 1ull) << 62) | ((unsigned long long)K << 32) | (1ull << 16) |
         ((Moe16SharedAddress(p) >> 4) & 0x3fff);
 }
 __device__ __forceinline__ void Moe16Wgmma64(float *c, unsigned long long a, unsigned long long b) {
@@ -58,17 +59,27 @@ __device__ __forceinline__ void Moe16StoreExpertPair(__nv_bfloat16 *p, float x, 
     }
 }
 
-template<bool Gate>
+template<bool Gate, int K = 64>
 __global__ void Moe16WgmmaExpertGemm(const __grid_constant__ Moe16ExpertMaps maps,
         const float *scores, const int *workspace, __nv_bfloat16 *output,
         __nv_bfloat16 *packedMiddle, int rows, int hidden, int intermediate, int experts) {
 #if defined(__CUDA_ARCH_FEAT_SM90_ALL)
-    constexpr int M = Moe16WgmmaRows, N = Moe16WgmmaColumns, K = Moe16WgmmaK, Stages = Moe16WgmmaStages;
+    constexpr int M = Moe16WgmmaRows, N = Moe16WgmmaColumns, Stages = Moe16WgmmaStages;
     constexpr int StageElements = (M + N * (Gate ? 2 : 1)) * K;
     const int *tiles = workspace + (size_t)experts * (rows + 1);
-    if (blockIdx.y >= tiles[0]) return;
-    int tid = threadIdx.x, lane = tid % 32, warp = tid / 32, column = blockIdx.x * N;
-    int index = tiles[blockIdx.y + 1], expert = index / (rows + 1), start = index % (rows + 1);
+    int tile = blockIdx.y, column = blockIdx.x * N;
+    if constexpr (!Gate && K == 32) {
+        // Interleave nearby M tiles before advancing N to reuse expert weights
+        // in L2. Use the actual tile count for the final partial group.
+        int count = -tiles[0], linear = blockIdx.y * gridDim.x + blockIdx.x;
+        if (linear >= count * int(gridDim.x)) return;
+        int group = linear / (8 * int(gridDim.x));
+        int groupRows = min(8, count - group * 8), within = linear % (8 * int(gridDim.x));
+        tile = group * 8 + within % groupRows;
+        column = within / groupRows * N;
+    } else if (tile >= -tiles[0]) return;
+    int tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
+    int index = tiles[tile + 1], expert = index / (rows + 1), start = index % (rows + 1);
     int inputWidth = Gate ? hidden : intermediate, outputWidth = Gate ? intermediate : hidden;
     extern __shared__ __align__(1024) __nv_bfloat16 storage[];
     __shared__ unsigned long long barriers[Stages];
@@ -88,7 +99,7 @@ __global__ void Moe16WgmmaExpertGemm(const __grid_constant__ Moe16ExpertMaps map
             int weightRow = expert * outputWidth * (Gate ? 2 : 1) + column;
             asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::
                 "r"(Moe16SharedAddress(barriers + stage)), "r"(StageElements * 2) : "memory");
-            Moe16TmaLoad(ptr, &maps.input, step * K, blockIdx.y * M, barriers + stage);
+            Moe16TmaLoad(ptr, &maps.input, step * K, tile * M, barriers + stage);
             Moe16TmaLoad(ptr + M * K, &maps.weight, step * K, weightRow, barriers + stage);
             if (Gate) Moe16TmaLoad(ptr + (M + N) * K, &maps.weight, step * K, weightRow + outputWidth, barriers + stage);
         }
@@ -102,9 +113,9 @@ __global__ void Moe16WgmmaExpertGemm(const __grid_constant__ Moe16ExpertMaps map
         auto *a = storage + stage * StageElements, *b = a + M * K;
 #pragma unroll
         for (int j = 0; j < K; j += 16) {
-            auto ad = Moe16WgmmaDescriptor(a + j), bd = Moe16WgmmaDescriptor(b + j);
+            auto ad = Moe16WgmmaDescriptor<K>(a + j), bd = Moe16WgmmaDescriptor<K>(b + j);
             Moe16Wgmma64(acc, ad, bd);
-            if (Gate) Moe16Wgmma64(up, ad, Moe16WgmmaDescriptor(b + N * K + j));
+            if (Gate) Moe16Wgmma64(up, ad, Moe16WgmmaDescriptor<K>(b + N * K + j));
         }
         asm volatile("wgmma.commit_group.sync.aligned;" ::: "memory");
         // Keep the newest group in flight. At step zero, stage two is unused;
@@ -116,6 +127,12 @@ __global__ void Moe16WgmmaExpertGemm(const __grid_constant__ Moe16ExpertMaps map
         load(step + Stages - 1);
     }
     asm volatile("wgmma.wait_group.sync.aligned 0;" ::: "memory");
+    if constexpr (!Gate && K == 32) {
+        // The MMA fragments scatter short column pairs. Reuse the retired
+        // staging buffer to coalesce the down output into 16-byte stores.
+        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+        __syncthreads();
+    }
 #pragma unroll
     for (int j = 0; j < 32; j += 2) {
         int row = warp * 16 + lane / 4 + ((j % 4) / 2) * 8;
@@ -131,11 +148,32 @@ __global__ void Moe16WgmmaExpertGemm(const __grid_constant__ Moe16ExpertMaps map
             } else if (task >= 0)
                 values[h] *= scores[task];
         }
-        if (task >= 0)
-            Moe16StoreExpertPair(output + (size_t)task * outputWidth + col, values[0], values[1]);
-        if (Gate)
-            Moe16StoreExpertPair(packedMiddle + ((size_t)blockIdx.y * M + row) * intermediate + col,
+        if constexpr (Gate || K == 64) {
+            if (task >= 0)
+                Moe16StoreExpertPair(output + (size_t)task * outputWidth + col, values[0], values[1]);
+        }
+        if constexpr (Gate) {
+            Moe16StoreExpertPair(packedMiddle + ((size_t)tile * M + row) * intermediate + col,
                                   task >= 0 ? values[0] : 0.f, task >= 0 ? values[1] : 0.f);
+        } else if constexpr (K == 32) {
+            int offset = row * N + col - column;
+            Moe16StoreExpertPair(storage + (offset ^ ((row & 7) << 3)), values[0], values[1]);
+        }
+    }
+    if constexpr (!Gate && K == 32) {
+        __syncthreads();
+        for (int offset = tid * 8; offset < M * N; offset += blockDim.x * 8) {
+            int row = offset / N, task = tasks[row];
+            if (task < 0) continue;
+            auto *src = storage + (offset ^ ((row & 7) << 3));
+            auto *dst = output + (size_t)task * outputWidth + column + offset % N;
+            if ((reinterpret_cast<uintptr_t>(dst) & 15) == 0)
+                *(uint4 *)dst = *(const uint4 *)src;
+            else {
+#pragma unroll
+                for (int i = 0; i < 8; ++i) dst[i] = src[i];
+            }
+        }
     }
 #endif
 }
@@ -175,6 +213,12 @@ void FastllmCudaMoe16WgmmaExperts(const CUtensorMap *inputMap, const CUtensorMap
     Moe16WgmmaExpertGemm<true><<<dim3(intermediate / 64, tiles), 128, Moe16WgmmaSharedBytes<true>(), stream>>>(gate,
         scores, workspace, (__nv_bfloat16 *)middle, (__nv_bfloat16 *)packedMiddle,
         rows, hidden, intermediate, experts);
-    Moe16WgmmaExpertGemm<false><<<dim3(hidden / 64, tiles), 128, Moe16WgmmaSharedBytes<false>(), stream>>>(down,
-        scores, workspace, (__nv_bfloat16 *)parts, nullptr, rows, hidden, intermediate, experts);
+    // Keep the established K64 path for longer reductions. The tensor-map
+    // selection in fastllm-moe16-sm90.cuh uses the same short-reduction bound.
+    if (intermediate <= 256)
+        Moe16WgmmaExpertGemm<false, 32><<<dim3(hidden / 64, tiles), 128, Moe16WgmmaSharedBytes<false, 32>(), stream>>>(down,
+            scores, workspace, (__nv_bfloat16 *)parts, nullptr, rows, hidden, intermediate, experts);
+    else
+        Moe16WgmmaExpertGemm<false><<<dim3(hidden / 64, tiles), 128, Moe16WgmmaSharedBytes<false>(), stream>>>(down,
+            scores, workspace, (__nv_bfloat16 *)parts, nullptr, rows, hidden, intermediate, experts);
 }

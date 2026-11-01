@@ -163,7 +163,23 @@ template<int TileRows = 16>
 __global__ void Moe16ExpertTiles(int *workspace, int rows, int experts) {
     int e = threadIdx.x, lane = e % 32, warp = e / 32;
     int rowsForExpert = e < experts ? workspace[(size_t)e * (rows + 1) + rows] : 0;
-    int count = (rowsForExpert + TileRows - 1) / TileRows, inclusive = count;
+    int tileRows = TileRows;
+    if constexpr (TileRows == 0) {
+        // Choose on-device: wide tiles benefit concentrated routes, but can
+        // double the work for sparse experts. No host readback is required.
+        __shared__ int work16[256], work64[256], selected;
+        work16[e] = (rowsForExpert + 15) / 16 * 16;
+        work64[e] = (rowsForExpert + 63) / 64 * 64;
+        __syncthreads();
+        for (int step = 128; step; step /= 2) {
+            if (e < step) { work16[e] += work16[e + step]; work64[e] += work64[e + step]; }
+            __syncthreads();
+        }
+        if (e == 0) selected = work64[0] * 4 <= work16[0] * 5 ? 64 : 16;
+        __syncthreads();
+        tileRows = selected;
+    }
+    int count = (rowsForExpert + tileRows - 1) / tileRows, inclusive = count;
     for (int d = 1; d < 32; d *= 2) {
         int v = __shfl_up_sync(0xffffffff, inclusive, d);
         if (lane >= d) inclusive += v;
@@ -177,8 +193,10 @@ __global__ void Moe16ExpertTiles(int *workspace, int rows, int experts) {
         if (w < warp) before += totals[w];
     }
     int *tiles = workspace + (size_t)experts * (rows + 1);
-    if (e == 0) tiles[0] = total;
-    for (int m = 0; m < count; ++m) tiles[1 + before + m] = e * (rows + 1) + m * TileRows;
+    // Negative counts select the wide implementation. Both implementations
+    // consume the same descriptor list and skip themselves when not selected.
+    if (e == 0) tiles[0] = tileRows == 64 ? -total : total;
+    for (int m = 0; m < count; ++m) tiles[1 + before + m] = e * (rows + 1) + m * tileRows;
 }
 
 // Small decode batches build stable expert rows and tile descriptors in one

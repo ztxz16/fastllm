@@ -271,6 +271,13 @@ int main(int argc, char **argv) {
         Experts(1025, 520, 136, 33, 2, false);
         Experts(1024, 512, 128, 33, 2, false, 1);
         Experts(1024, 512, 128, 17, 1, true);
+        // Adaptive wide tiles must follow changed graph routes and preserve
+        // unaligned output/shared views as well as zero routing weights.
+        Experts(1024, 512, 128, 33, 2, false, 1, 1, true, 1, 320, true);
+        Experts(1024, 512, 128, 65, 2, false);
+        // A diffuse route distribution needs multiple narrow tiles per CTA;
+        // replaying concentrated routes then switches to wide down tiles.
+        Experts(1024, 512, 128, 256, 8, false, 0, 1, false, 0, 1, true);
         // Verification batches use the same atomic buckets and four-row
         // packing as prefill. Cover threshold edges, sparse/clustered routes,
         // dynamic graph updates and unaligned input/output views.
