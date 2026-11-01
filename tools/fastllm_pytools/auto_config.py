@@ -358,7 +358,7 @@ def mixed_disk_plan(args, baseline, metadata, tensors, model, gpu, ram, ratio):
                     host + disk_staging, largest, snapshot)
         try:
             capacity = memory.plan(prepared, model, adjusted, mode, mapping, gpu, ram,
-                                   implicit_embedding_bytes=implicit_embedding)
+                                   implicit_embedding_bytes=implicit_embedding, disk_experts=True)
         except ValueError:
             continue
         workspace = capacity["workspace_bytes_per_device"] - capacity["expert_transport_bytes_per_device"]
@@ -386,7 +386,7 @@ def mixed_disk_plan(args, baseline, metadata, tensors, model, gpu, ram, ratio):
                     host + disk_staging + extra_workspace + cpu_cache, largest, snapshot)
         try:
             plan = memory.plan(checked, model, adjusted, mode, mapping, gpu, ram,
-                               implicit_embedding_bytes=implicit_embedding)
+                               implicit_embedding_bytes=implicit_embedding, disk_experts=True)
         except ValueError:
             continue
         front = {}

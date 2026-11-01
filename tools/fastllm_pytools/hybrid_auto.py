@@ -502,6 +502,9 @@ def geometry(metadata, kv_dtype, mtp, dspark=0):
             "index_topk": int(config.get("index_topk", 512)),
             "index_sources": list(config["index_source_layer_ids"]),
             "vocab": int(config.get("vocab_size", 0)),
+            "draft_layers": len(kv) - layers,
+            "draft_experts": int(config.get("dspark_n_routed_experts", 0)),
+            "draft_topk": int(config.get("dspark_num_experts_per_tok", 0)),
         }
         result.kv_reallocation = [0] * len(kv)
         result.kv_padding = [0] * len(kv)
@@ -729,6 +732,9 @@ def weight_costs(tensors, model, args):
     common, host, largest = 0, 0, 0
     snapshot = False
     gguf_layers = {}
+    gguf_storage_layers = set()
+    q5_projections = {}
+    shared_q5_gate = {}
     model.eager_expert_layers = set()
     packed_sizes = _packed_fp4_sizes(tensors, args)
     native_sizes = (_deepseek_v41_weight_sizes(tensors, args) if model.family == "deepseek_v41" else
@@ -754,10 +760,26 @@ def weight_costs(tensors, model, args):
             raise ValueError("Hybrid auto: tensor layer outside model")
         is_expert = _is_routed_expert(name)
         is_shared = "_shexp." in name or ".shared_experts." in name
+        if (is_expert and tensor.kind.startswith("gguf:") and layer is not None and
+                not (is_draft and tensor.kind == "gguf:39")):
+            gguf_storage_layers.add(layer)
         if is_expert and tensor.kind.startswith("gguf:") and layer is not None and not is_draft:
             gguf_layers[layer] = gguf_layers.get(layer, 0) + tensor.bytes
         if is_draft and is_expert and tensor.kind == "gguf:39":
             model.eager_expert_layers.add(layer)
+        # Small-row SM75 MMQ keeps two scratch buffers per captured dense
+        # projection. Expert kernels own separate workspace; embeddings are
+        # lookups. The PP output head belongs to the final target layer.
+        if (model.runtime and tensor.kind == "gguf:13" and len(tensor.shape) == 2 and
+                not is_expert and name not in ("embed.weight", "token_embd.weight") and
+                (not is_shared or str(args.cuda_shared_expert).lower() not in ("", "false", "0", "off"))):
+            owner = model.layers - 1 if name in ("head.weight", "output.weight") else layer
+            if owner is not None:
+                if is_shared and name.endswith((".w1.weight", ".w3.weight",
+                                                      ".ffn_gate_shexp.weight", ".ffn_up_shexp.weight")):
+                    shared_q5_gate.setdefault(owner, []).append(tensor.shape)
+                else:
+                    q5_projections.setdefault(owner, []).append(tensor.shape)
         size = native_sizes.get(name, tensor.bytes)
         if is_expert and tensor.kind in ("gguf:13", "gguf:14"):
             # NUMA Q5_K/Q6_K R4 cannot currently be restored by the cache;
@@ -849,9 +871,17 @@ def weight_costs(tensors, model, args):
     model.gguf_expert_bytes = {layer: math.ceil(size / model.experts)
                                for layer, size in gguf_layers.items()}
     if model.runtime:
-        model.runtime["native_records"] = {
-            i: math.ceil(size / model.experts) for i, size in enumerate(expert[:model.layers])
-            if size and i not in model.gguf_expert_bytes}
+        model.runtime["expert_records"] = {
+            i: math.ceil(size / (model.experts if i < model.layers else model.runtime["draft_experts"]))
+            for i, size in enumerate(expert) if size}
+        model.runtime["gguf_layers"] = gguf_storage_layers
+        # The shared expert concatenates compatible Gate/Up matrices before
+        # dispatch. Budget that fused width, including the 5..8-row MMQ case.
+        for layer, shapes in shared_q5_gate.items():
+            if len(shapes) == 2 and shapes[0] == shapes[1]:
+                shapes = [(2 * shapes[0][0], shapes[0][1])]
+            q5_projections.setdefault(layer, []).extend(shapes)
+        model.runtime["q5_projections"] = q5_projections
     if model.disk_prefill.get("canonical_gguf", False):
         # Match FastllmCudaV41GGUFGroupedWorkspaceBytes, not all GGUF formats.
         supported = {"gguf:" + str(t) for t in (11, 12, 16, 17, 18, 19, 22, 29, 42)}
@@ -974,7 +1004,7 @@ def _workspace_bytes(args, model, rows, context, mode, resident, *, gguf_mmq=Tru
             resident_scratch + streamed_scratch + 32 * MiB)
 
 
-def _v41_runtime_bytes(args, model, mode, mapping, resident, context, batch, chunk):
+def _v41_runtime_bytes(args, model, mode, mapping, resident, context, batch, chunk, gpu=None, *, disk_experts=False):
     """Persistent decode graphs and staging coexist with eager prefill workspace.
 
     These are capacity bounds, not allocation predictions. In particular, sum
@@ -994,6 +1024,10 @@ def _v41_runtime_bytes(args, model, mode, mapping, resident, context, batch, chu
             os.environ.get("FASTLLM_DSV41_REFERENCE_MATH", "0") not in ("", "0")):
         graphs = False
     hybrid = resident < model.layers
+    # InitExecutionMode disables capture for every V4.1 layer when any expert
+    # uses disk, including mixed NUMA/disk placement. Eager staging still lives.
+    if hybrid and (disk_experts or args.moe_device == "disk"):
+        graphs = False
     host = args.moe_device == "numa" or (args.moe_device == "cpu" and getattr(args, "_host_moe_shared", False))
     drafts = max(0, getattr(args, "dspark", 0))
     topk = max(model.topk, args.moe_experts)
@@ -1009,15 +1043,59 @@ def _v41_runtime_bytes(args, model, mode, mapping, resident, context, batch, chu
     def page(n):
         return (n + page_bytes - 1) // page_bytes * page_bytes
 
+    def small_q5_workspace(rows, owners, device):
+        if not gpu or gpu[device].get("capability") != 75 or not 4 <= rows <= 8:
+            return 0
+        total = 0
+        for layer in owners:
+            for outputs, columns in r.get("q5_projections", {}).get(layer, ()):
+                # Match SM75 BF16 Q5_K dispatch. MMQ packs groups of 128
+                # activations into 144 bytes and reserves a 128-block guard.
+                if columns >= 1280 and columns % 256 == 0 and outputs >= (5120 if rows == 4 else 4096):
+                    total += page((rows * columns // 128 + 128) * 144) + page(rows * outputs * 4)
+        return total
+
+    # Canonical GGUF branches share the fixed 8-row/16-route capacity formula.
+    gguf_scratch = page((8 * model.hidden + 128 * model.intermediate) // 32 * 36 +
+                        128 * (2 * model.intermediate + model.hidden) * 2 + 128 * 4)
     for d in mapping:
         owners = [i for i in range(len(model.kv)) if mode == "tp" or layer_device(i, model.layers, mapping) == d]
         layers = [i for i in owners if i < model.layers]
-        record = max((r.get("native_records", {}).get(i, 0) for i in layers if i >= resident), default=0)
-        if host and record:
-            # Ordinary overlap and full-graph mailbox own separate upload rings;
-            # the latter has kMaxTopK=16 slots, independent of verifier rows.
-            if args.moe_cuda_cache != 0:
-                result["staging"][d] = ((16 if graphs else 0) + topk + 1) * page(record)
+        host_layers = [i for i in range(model.layers) if i >= resident]
+        draft_layers = [i for i in range(model.layers, len(model.kv))
+                        if expert_layer(i, model) >= resident]
+        # MakeDecodeOverlap uses the largest record in the whole cache group,
+        # including heterogeneous GGUF layers owned by another PP device.
+        def record_bytes(group):
+            return max((r.get("expert_records", {}).get(i, 0) for i in group), default=0)
+
+        def upload_bytes(group, capacities):
+            restore = any(i in r.get("gguf_layers", ()) for i in group)
+            stride = (record_bytes(group) + 127) // 128 * 128
+            return sum(page((capacity + int(restore)) * stride + capacity * 4)
+                       for capacity in capacities) if stride else 0
+
+        has_target = record_bytes(host_layers) and any(i in host_layers for i in layers)
+        has_draft = record_bytes(draft_layers) and any(i in draft_layers for i in owners)
+        if host and (has_target or has_draft):
+            # Eager one-row, eager multi-row and full-graph mailbox rings
+            # coexist. Warmup/prefill tails can retain the eight-row eager
+            # buffer even when ordinary decode requests only one row.
+            if args.moe_cuda_cache != 0 and has_target:
+                eager_rows = max(8, min(32, max(batch, drafts + 1)))
+                capacities = [16, min(model.experts, eager_rows * topk)]
+                if not drafts:
+                    capacities.append(topk)  # ordinary decode mailbox
+                if graphs:
+                    capacities.append(16)
+                result["staging"][d] += upload_bytes(host_layers, capacities)
+            if has_draft:
+                capacities = [min(r["draft_experts"], min(32, model.dspark_block_size) * r["draft_topk"])]
+                if model.dspark_block_size == 1:
+                    capacities += [16, r["draft_topk"]]
+                if graphs:
+                    capacities.append(16)
+                result["staging"][d] += upload_bytes(draft_layers, capacities)
             if chunk > r["window"]:
                 # CudaMergeMoeFromCpuWorkspace keeps these BF16/FP32 tensors
                 # between layers; attention releases cannot reclaim them.
@@ -1030,6 +1108,7 @@ def _v41_runtime_bytes(args, model, mode, mapping, resident, context, batch, chu
         if not graphs:
             continue
         for rows in shapes:
+            result["graphs"][d] += small_q5_workspace(rows, layers, d)
             # Segmented graphs retain their workspace too, including shapes
             # outside the full-graph fast path. Keep the generic scratch bound.
             result["graphs"][d] += _workspace_bytes(args, model, rows, context, mode, resident, prefill=False)
@@ -1041,22 +1120,45 @@ def _v41_runtime_bytes(args, model, mode, mapping, resident, context, batch, chu
                 route = rows * (topk * (4 * model.hidden + 2 * model.intermediate) + 2 * model.hidden)
                 index = rows * context * 5 if i in r["index_sources"] else 0
                 result["graphs"][d] += page(score) + page(route) + page(index) + 6 * page_bytes
+                if i >= resident and i in r.get("gguf_layers", ()):
+                    # NativeMoeMailbox::Layer owns two independent GGUF
+                    # branches. Their scratch is bounded at 8 rows * 16
+                    # routes even for a smaller verification slot.
+                    result["graphs"][d] += 2 * (gguf_scratch + page(min(rows, 8) * topk * model.intermediate * 2))
             # FlashInfer split accumulators and selected KV are shared across
             # serial layers within a slot, never across different row counts.
             result["graphs"][d] += rows * (math.ceil(r["heads"] / 16) * 16 *
                 (4 + math.ceil(r["index_topk"] / 64)) * (r["head_dim"] * 2 + 4) +
                 (r["window"] + r["index_topk"]) * (r["head_dim"] * 2 + 4))
+            # SM75 FP16 attention retains Q, gathered KV and 8 split
+            # outputs for window and sparse layers independently. Reserve
+            # both shapes; this bound also covers BF16-capable devices.
+            for keys in (r["window"], r["window"] + r["index_topk"]):
+                result["graphs"][d] += page(rows * ((9*r["heads"] + keys) * r["head_dim"] * 2 +
+                                                       8*r["heads"]*4 + keys + 4))
             if model.layers - 1 in owners:
                 result["graphs"][d] += page(rows * r["vocab"] * 4) * 3
         if drafts and model.layers - 1 in owners:
             # The draft graph is additional to the target verifier slots.
-            result["graphs"][d] += _workspace_bytes(args, model, model.dspark_block_size, context, mode, resident, prefill=False)
+            rows = model.dspark_block_size
+            result["graphs"][d] += small_q5_workspace(rows, [i for i in owners if i >= model.layers], d)
+            result["graphs"][d] += _workspace_bytes(args, model, rows, context, mode, resident, prefill=False)
+            # Accepted prefixes create separate context-update slots. Those
+            # graphs keep projected features, normalized inputs and Q8 scratch.
+            for accepted in range(1, drafts + 2):
+                result["graphs"][d] += page(accepted * model.hidden * (8 + 6*r["draft_layers"]))
+            for i in owners:
+                if i < model.layers or expert_layer(i, model) < resident: continue
+                routes = rows * r["draft_topk"]
+                result["graphs"][d] += page(routes * (4*model.hidden + 4*model.intermediate) + rows*model.hidden*2)
+                if i in r.get("gguf_layers", ()):
+                    result["graphs"][d] += 2 * gguf_scratch
     return result
 
 
 def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_gpu=False,
          kv_resident=0, per_device_cache=False, implicit_embedding_bytes=0,
-         hybrid_cpu_embedding=False):
+         hybrid_cpu_embedding=False, disk_experts=False):
     """Deterministic capacity solver. Explicit fields are never overwritten."""
     experts, dense, common, host, largest, snapshot = costs
     context = int(args.max_context_length) if args.max_context_length > 0 else model.context
@@ -1160,12 +1262,6 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
             # one additional record for decode frequency-admission DMA.
             bounded_rings = gguf_mmq and _v41_streamed_mmq(model, rows, max(model.topk, args.moe_experts))
             ring_records = (48 if canonical_gguf and bounded_rings else 96) + int(canonical_gguf)
-            # The asynchronous two-device decoder retains one additional
-            # temporary expert batch plus a restore record on each device.
-            decode_topk = max(model.topk, args.moe_experts)
-            if (canonical_gguf and gguf_mmq and mode == "pp" and len(mapping) == 2 and
-                    not speculative and args.moe_cuda_cache != 0 and 0 < decode_topk <= 16):
-                ring_records += decode_topk + 1
             transport = (ring_records * (math.ceil(record / 256) * 256) + 272 * MiB
                          if model.family == "deepseek_v41" and shared_host and record else 0)
             disk_streamed = (canonical_gguf and gguf_mmq and
@@ -1180,7 +1276,8 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
                 # Host storage also includes eight next-layer read-ahead slots.
                 disk_staging = 32 * (math.ceil(record / 256) * 256 + 24 * 1024)
                 transport = disk_ring + math.ceil(record / 256) * 256 + 16 * MiB
-            runtime = _v41_runtime_bytes(args, model, mode, mapping, resident, context, batch, chunk)
+            runtime = _v41_runtime_bytes(args, model, mode, mapping, resident, context, batch, chunk, gpu,
+                                         disk_experts=disk_experts)
             used = {d: common + workspace + transport + guard +
                     sum(values[d] for values in runtime.values()) for d in mapping}
             reallocation = dict.fromkeys(mapping, 0)
@@ -1271,6 +1368,25 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
                     if budget < 16 * (record + 256):
                         budget = 0
                 cache[d] = budget
+            if (cache_auto and model.dspark_block_size and
+                    (args.moe_device == "numa" or (args.moe_device == "cpu" and getattr(args, "_host_moe_shared", False))) and
+                    any(runtime["graphs"].values())):
+                draft_host = [i for i in range(model.layers, len(experts))
+                              if expert_layer(i, model) >= resident]
+                draft_bytes = sum(experts[i] for i in draft_host)
+                record = max((model.runtime.get("expert_records", {}).get(i, 0)
+                              for i in draft_host), default=0)
+                if draft_bytes and record:
+                    # Preparation needs 16 records before sharing the budget;
+                    # the draft cache then needs at least one complete record
+                    # after its payload-proportional fraction is applied.
+                    # A zero/tiny automatic cache would silently lose the
+                    # requested draft graph. Try a smaller chunk instead.
+                    minimum = max(16 * (record + 256),
+                                  math.ceil((record + 256) * sum(experts) / draft_bytes))
+                    draft_devices = mapping if mode == "tp" else {layer_device(i, model.layers, mapping) for i in draft_host}
+                    if any(cache[d] < minimum for d in draft_devices):
+                        continue
             if any(remaining[d] < cache[d] for d in mapping):
                 continue
             # The scalar ceiling also enables registration; allocation uses the

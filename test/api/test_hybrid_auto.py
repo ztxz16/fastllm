@@ -758,10 +758,18 @@ class HybridAutoTest(unittest.TestCase):
                 "dspark_markov_rank": 32, "dspark_n_routed_experts": 128,
                 "dspark_num_experts_per_tok": 3, "vocab_size": 1024}
 
+    def test_v41_runtime_records_use_each_groups_expert_count(self):
+        g = auto.geometry(self.dspark_metadata(), "fp4", 0, 7)
+        tensors = [auto.Tensor("layers.0.ffn.experts.0.w1.weight", (8, 8), 256 * MiB, "gguf:8"),
+                   auto.Tensor("mtp.0.ffn.experts.0.w1.weight", (8, 8), 256 * MiB, "gguf:8")]
+        auto.weight_costs(tensors, g, args(dspark=7))
+        self.assertEqual(g.runtime["expert_records"], {0: MiB, 4: 2 * MiB})
+        self.assertEqual(g.runtime["gguf_layers"], {0, 4})
+
     def test_v41_graph_slots_coexist_with_prefill_and_scale_with_draft_lengths(self):
         def reserve(drafts, chunk=4096, graph="1", mapping=None):
             g = auto.geometry(self.dspark_metadata(), "fp4", 0, drafts)
-            g.runtime["native_records"] = {i: 16 * MiB for i in range(g.layers)}
+            g.runtime["expert_records"] = {i: 16 * MiB for i in range(g.layers)}
             a = args(auto=True, dspark=drafts, fast_prefill=True, moe_device_layers=-1)
             devices = mapping or {0: 1, 1: 1}
             with patch.dict(os.environ, {"FASTLLM_CUDA_GRAPH": graph}, clear=True):
@@ -774,23 +782,127 @@ class HybridAutoTest(unittest.TestCase):
         self.assertEqual(reserve(7, graph="0")["graphs"], {0: 0, 1: 0})
         self.assertEqual(reserve(7, mapping={3: 1})["prefill_persistent"][3], long["prefill_persistent"][0])
 
+    def test_sm75_small_q5_graph_workspace_tracks_placement_and_shapes(self):
+        g = auto.geometry(self.dspark_metadata(), "fp4", 0, 7)
+        tensors = [auto.Tensor("layers.0.ffn.experts.0.w1.weight", (8, 8), MiB, "gguf:8"),
+                   auto.Tensor("layers.0.attn.wq_b.weight", (8192, 2048), MiB, "gguf:13"),
+                   auto.Tensor("layers.1.attn.wo_a.weight", (1024, 4096), MiB, "gguf:13"),
+                   auto.Tensor("layers.0.ffn.shared_experts.w1.weight", (2304, 5120), MiB, "gguf:13"),
+                   auto.Tensor("layers.0.ffn.shared_experts.w3.weight", (2304, 5120), MiB, "gguf:13"),
+                   auto.Tensor("head.weight", (32768, 4096), MiB, "gguf:13"),
+                   auto.Tensor("mtp.0.attn.wq_b.weight", (8192, 2048), MiB, "gguf:13")]
+        a = args(auto=True, dspark=7, moe_device_layers=-1)
+        auto.weight_costs(tensors, g, a)
+        self.assertEqual(set(g.runtime["q5_projections"]), {0, 1, 3, 4})
+        native = g.runtime["q5_projections"]
+        aliases = {"layers.0.ffn.shared_experts.w1.weight": "blk.0.ffn_gate_shexp.weight",
+                   "layers.0.ffn.shared_experts.w3.weight": "blk.0.ffn_up_shexp.weight",
+                   "head.weight": "output.weight"}
+        auto.weight_costs([auto.Tensor(aliases.get(t.name, t.name), t.shape, t.bytes, t.kind)
+                           for t in tensors], g, a)
+        self.assertEqual(g.runtime["q5_projections"], native)
+        def reserve(capability, graph="1", chunk=512):
+            with patch.dict(os.environ, {"FASTLLM_CUDA_GRAPH": graph}, clear=True):
+                return auto._v41_runtime_bytes(a, g, "pp", {0: 1, 1: 1}, 0, 8192, 1, chunk,
+                                               {d: {"capability": capability} for d in (0, 1)})
+        old, new = reserve(120), reserve(75)
+        # Five verifier slots (4..8 rows), plus the seven-row draft on GPU 1.
+        self.assertEqual(new["graphs"][0] - old["graphs"][0], 34 * 65536)
+        self.assertEqual(new["graphs"][1] - old["graphs"][1], 70 * 65536)
+        self.assertEqual(reserve(75, chunk=2048)["graphs"], new["graphs"])
+        self.assertEqual(reserve(75, graph="0")["graphs"], {0: 0, 1: 0})
+        a.dspark = 0
+        g.dspark_block_size = 0
+        self.assertEqual(reserve(75)["graphs"], reserve(120)["graphs"])
+
+    def test_v41_disk_experts_do_not_reserve_disabled_graphs(self):
+        g = auto.geometry(self.dspark_metadata(), "fp4", 0, 7)
+        g.runtime["expert_records"] = {i: 16*MiB for i in range(g.layers)}
+        a = args(auto=True, dspark=7, moe_device_layers=-1)
+        def reserve(graph, disk=False):
+            with patch.dict(os.environ, {"FASTLLM_CUDA_GRAPH": graph}, clear=True):
+                return auto._v41_runtime_bytes(a, g, "pp", {0: 1, 1: 1}, 0, 8192, 1, 4096,
+                                               disk_experts=disk)
+        eager = reserve("0")
+        self.assertEqual(reserve("1", disk=True), eager)
+        self.assertGreater(eager["staging"][0], 0)
+        self.assertGreater(eager["prefill_persistent"][0], 0)
+        self.assertGreater(reserve("1")["graphs"][0], 0)
+        a.moe_device = "disk"
+        self.assertEqual(reserve("1")["graphs"], {0: 0, 1: 0})
+
     def test_v41_native_moe_staging_is_separate_from_resident_cache(self):
         g = auto.geometry(self.dspark_metadata(), "fp4", 0, 7)
-        g.runtime["native_records"] = {0: 16 * MiB, 2: 24 * MiB}
+        g.runtime["expert_records"] = {0: 16 * MiB, 2: 24 * MiB}
         a = args(auto=True, dspark=7, moe_device_layers=-1)
         with patch.dict(os.environ, {"FASTLLM_CUDA_GRAPH": "1"}, clear=True):
             def reserve(resident):
                 return auto._v41_runtime_bytes(a, g, "pp", {0: 1, 1: 1}, resident, 8192, 1, 4096)
             both = reserve(0)
-            self.assertGreater(both["staging"][1], both["staging"][0])
+            self.assertEqual(both["staging"][1], both["staging"][0])  # shared group stride
             self.assertEqual(reserve(2)["staging"][0], 0)
             a.moe_cuda_cache = 0
             self.assertEqual(reserve(0)["staging"], {0: 0, 1: 0})
             self.assertGreater(reserve(0)["prefill_persistent"][0], 0)
 
+    def test_v41_gguf_verifier_reserves_both_fixed_capacity_branches(self):
+        g = auto.geometry(self.dspark_metadata(), "fp4", 0, 7)
+        a = args(auto=True, dspark=7, moe_device_layers=-1)
+        with patch.dict(os.environ, {"FASTLLM_CUDA_GRAPH": "1"}, clear=True):
+            baseline = auto._v41_runtime_bytes(a, g, "pp", {0: 1, 1: 1}, 0, 8192, 1, 1024)
+            g.runtime["gguf_layers"] = set(range(g.layers))
+            gguf = auto._v41_runtime_bytes(a, g, "pp", {0: 1, 1: 1}, 0, 8192, 1, 1024)
+        # Every host layer and every 2..8-row slot owns both 8x16-route
+        # workspaces, including the two-row slots which used to undercount.
+        minimum_scratch = 128 * (2*g.intermediate + g.hidden) * 2
+        for d in [0, 1]:
+            self.assertGreaterEqual(gguf['graphs'][d] - baseline['graphs'][d],
+                                    2 * 7 * 2 * minimum_scratch)
+
+    def test_v41_draft_upload_ring_is_separate_from_target_group(self):
+        g = auto.geometry(self.dspark_metadata(), "fp4", 0, 7)
+        g.runtime['expert_records'] = {0: 8*MiB, 2: 8*MiB, 4: 24*MiB, 5: 24*MiB}
+        a = args(auto=True, dspark=7, moe_device_layers=-1)
+        with patch.dict(os.environ, {"FASTLLM_CUDA_GRAPH": "1"}, clear=True):
+            b = auto._v41_runtime_bytes(a, g, 'pp', {0:1, 1:1}, 0, 8192, 1, 1024)
+        self.assertEqual(b['staging'][1]-b['staging'][0], (16+7*3)*24*MiB + 2*64*1024)
+
+    def test_v41_pp_upload_uses_global_record_and_coexisting_batch_rings(self):
+        g = auto.geometry(self.dspark_metadata(), "fp4", 0, 7)
+        g.runtime["expert_records"] = {0: 8*MiB, 2: 24*MiB}
+        g.runtime["gguf_layers"] = {0, 2}
+        a = args(auto=True, dspark=7, moe_device_layers=-1)
+        with patch.dict(os.environ, {"FASTLLM_CUDA_GRAPH": "1"}, clear=True):
+            b = auto._v41_runtime_bytes(a, g, "pp", {0:1, 1:1}, 0, 8192, 1, 1024)
+        # Separate one-row, eight-row and full-graph buffers, each with a
+        # restore record. Both PP devices use the group's largest record.
+        expected = (16 + 8*g.topk + 16 + 3)*24*MiB + 3*64*1024
+        self.assertEqual(b["staging"], {0: expected, 1: expected})
+
+    def test_v41_auto_preserves_a_usable_draft_cache_when_shrinking_chunk(self):
+        g = auto.geometry(self.dspark_metadata(), "fp4", 0, 7)
+        g.runtime["expert_records"] = {0: 16*MiB, 4: 24*MiB, 5: 24*MiB}
+        costs = ([4*GiB]*4 + [GiB]*2, [MiB]*6, 0, 0, MiB, False)
+        a = args(auto=True, dspark=7, moe_device_layers=-1, chunked_prefill_size=1024,
+                 tokens=8192, max_context_length=8192)
+        gpu = {0: dict(total=16*GiB, free=16*GiB)}
+        ram = dict(total=128*GiB, available=128*GiB)
+        with patch.dict(os.environ, {"FASTLLM_CUDA_GRAPH": "1"}, clear=True):
+            roomy = auto.plan(a, g, costs, "pp", {0:1}, gpu, ram)
+            # Leave 128 MiB beyond the fixed runtime costs: old planning
+            # rounded this to zero and silently lost the native draft graph.
+            gpu[0]["free"] = (roomy["gpu_estimated_bytes"][0] - roomy["moe_cuda_cache"] +
+                              128*MiB + gpu[0]["total"] - roomy["gpu_budget_bytes"][0])
+            with self.assertRaises(ValueError):
+                auto.plan(a, g, costs, "pp", {0:1}, gpu, ram)
+            a.chunked_prefill_size = "auto"
+            smaller = auto.plan(a, g, costs, "pp", {0:1}, gpu, ram)
+        self.assertLess(smaller["chunked_prefill_size"], 1024)
+        self.assertGreaterEqual(smaller["moe_cuda_cache"], 16*(24*MiB+256))
+
     def test_v41_capture_disabled_keeps_persistent_prefill_reserve(self):
         g = auto.geometry(self.dspark_metadata(), "fp4", 0, 7)
-        g.runtime["native_records"] = {i: 16 * MiB for i in range(g.layers)}
+        g.runtime["expert_records"] = {i: 16 * MiB for i in range(g.layers)}
         a = args(auto=True, dspark=7, moe_device_layers=-1)
         def reserve(env):
             with patch.dict(os.environ, env, clear=True):
@@ -958,7 +1070,7 @@ class HybridAutoTest(unittest.TestCase):
                          {d: dict(total=16*GiB, free=16*GiB, capability=75) for d in (0,1)},
                          dict(total=64*GiB, available=64*GiB))
         self.assertEqual(pair['expert_transport_bytes_per_device'],
-                         (49 + g.topk + 1) * 10 * MiB + 272 * MiB)
+                         49 * 10 * MiB + 272 * MiB)
         fallback = auto.plan(a, g, costs, 'pp', {0: 1},
                             {0: dict(total=16*GiB, free=16*GiB, capability=60)},
                             dict(total=64*GiB, available=64*GiB))
