@@ -209,19 +209,32 @@ public:
     BlockResult block(int layer, const Tensor &image, const Tensor &text,
                       const Tensor &time, const RopeTable &rope,
                       const Tensor *historyK = nullptr, const Tensor *historyV = nullptr,
-                      const uint8_t *attentionMask = nullptr);
+                      const uint8_t *attentionMask = nullptr,
+                      const Tensor *imageModulation = nullptr, const Tensor *textModulation = nullptr,
+                      Tensor *keyWorkspace = nullptr, Tensor *valueWorkspace = nullptr);
+    // workspace belongs to one action with fixed history/shape. Successful
+    // commit transfers its buffers to cache; failures never mutate cache.
     Tensor forward(const Tensor &latent, const Tensor &textFeatures, float timestep,
                    int frames, int height, int width, int frameOffset = 0,
                    DiTCache *cache = nullptr, bool commit = false,
-                   const Tensor *camera = nullptr);
+                   const std::vector<Tensor> *camera = nullptr, DiTCache *workspace = nullptr);
     Tensor cameraEmbedding(const Tensor &extrinsics);
+    // Prepare once per action; retain the original projection shapes/rounding.
+    std::vector<Tensor> cameraProjections(const Tensor &camera, int tokensPerFrame);
     Tensor cameraBlock(int layer, const Tensor &image, const Tensor &camera, int tokensPerFrame);
-    void unload() { weights_.clear(); }
+    void unload();
 private:
+    struct Modulation {
+        Tensor time, output;
+        std::vector<Tensor> image, text;
+    };
+    const Modulation &prepare(float timestep);
     Tensor timeEmbedding(float timestep, const std::string &prefix);
     Tensor refineText(const Tensor &text, float timestep);
+    Tensor projectCamera(int layer, const Tensor &camera, int tokensPerFrame);
     Runtime &rt_;
     Weights weights_;
+    std::unordered_map<float,Modulation> modulation_;
 };
 
 class PixelDecoder {

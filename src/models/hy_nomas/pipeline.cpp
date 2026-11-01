@@ -199,15 +199,16 @@ std::vector<uint8_t> Pipeline::stepWorld(WorldState &world,int action,Progress p
     const bool cameraContinuation=hasCamera && world.frameOffset>0 && !promptChanged;
     const Tensor &segmentFeatures=cameraContinuation?cameraContinuationFeatures_:next.features;
     auto poses=hasCamera?cameraTrajectory(20,action):std::vector<float>();
-    Tensor camera;
-    if(hasCamera) camera=dit_.cameraEmbedding(rt_.upload(poses.data(),t,64));
+    std::vector<Tensor> camera;
+    if(hasCamera) camera=dit_.cameraProjections(dit_.cameraEmbedding(rt_.upload(poses.data(),t,64)),h*w);
     trace("camera",poses); trace("latent_0",latent);
     trace("features",segmentFeatures);
     auto sigma=[&](int i) { float s=1.f-float(i)/world.steps; return 5.f*s/(1.f+4.f*s); };
+    DiTCache workspace;
     for(int step=0;step<world.steps;++step) {
         update(2,step,world.steps+1);
         auto velocity=rt_.download(dit_.forward(rt_.upload(latent.data(),n,32),segmentFeatures,sigma(step)*1000.f,t,h,w,
-                                              world.frameOffset,&next.cache,false,hasCamera?&camera:nullptr));
+                                              world.frameOffset,&next.cache,false,hasCamera?&camera:nullptr,&workspace));
         float dt=sigma(step+1)-sigma(step);
         for(size_t i=0;i<latent.size();++i) latent[i]+=velocity[i]*dt;
         trace("latent_"+std::to_string(step+1),latent);
@@ -223,7 +224,7 @@ std::vector<uint8_t> Pipeline::stepWorld(WorldState &world,int action,Progress p
     trace("cache_noise",cacheNoise);
     trace("cache_input",cacheInput);
     dit_.forward(rt_.upload(cacheInput.data(),n,32),segmentFeatures,cacheSigma*1000.f,t,h,w,
-                 world.frameOffset,&next.cache,true,hasCamera?&camera:nullptr);
+                 world.frameOffset,&next.cache,true,hasCamera?&camera:nullptr,&workspace);
     next.segmentTokens.push_back(n+segmentFeatures.rows);
     int remove=0;
     while(int(next.segmentTokens.size())>next.maxHistorySegments) {

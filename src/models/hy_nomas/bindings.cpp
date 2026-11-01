@@ -7,27 +7,48 @@ namespace fastllm { namespace nomas {
 namespace { void require(bool ok, const char *message) { if (!ok) throw std::invalid_argument(message); } }
 
 DiT::DiT(Runtime &rt,const std::string &path):rt_(rt),weights_(rt,path) {}
+void DiT::unload() { weights_.clear(); modulation_.clear(); }
 BlockResult DiT::block(int layer,const Tensor &image,const Tensor &text,const Tensor &time,
     const float *cos,const float *sin,const Tensor *historyK,const Tensor *historyV,const uint8_t *mask) {
     return block(layer,image,text,time,rt_.prepareRope(cos,sin,image.rows,128),historyK,historyV,mask);
 }
 BlockResult DiT::block(int layer,const Tensor &image,const Tensor &text,const Tensor &time,
-    const RopeTable &rope,const Tensor *historyK,const Tensor *historyV,const uint8_t *mask) {
+    const RopeTable &rope,const Tensor *historyK,const Tensor *historyV,const uint8_t *mask,
+    const Tensor *imageMod,const Tensor *textMod,Tensor *keyWorkspace,Tensor *valueWorkspace) {
     require(layer>=0 && layer<54 && image.cols==2048 && text.cols==2048 && time.rows==1 && time.cols==2048,"invalid DiT block input");
     require(bool(historyK)==bool(historyV),"both K and V history required");
-    auto p="double_blocks."+std::to_string(layer)+"."; auto act=rt_.activation(time);
-    auto im=weights_.linear(act,p+"img_mod.linear"),tm=weights_.linear(act,p+"txt_mod.linear");
+    require(bool(keyWorkspace)==bool(valueWorkspace),"both K and V workspaces required");
+    auto p="double_blocks."+std::to_string(layer)+".";
+    auto act=imageMod && textMod?Tensor{}:rt_.activation(time);
+    auto im=imageMod?*imageMod:weights_.linear(act,p+"img_mod.linear");
+    auto tm=textMod?*textMod:weights_.linear(act,p+"txt_mod.linear");
     auto inputI=rt_.modulate(rt_.norm(image,false),im,0,1),inputT=rt_.modulate(rt_.norm(text,false),tm,0,1);
     auto project=[&](const Tensor &x,const std::string &s) {
         auto q=weights_.linear(x,p+s+"_attn_q"),k=weights_.linear(x,p+s+"_attn_k"),v=weights_.linear(x,p+s+"_attn_v");
         q=rt_.norm(q,true,&weights_.get(p+s+"_attn_q_norm.weight"),nullptr,1e-6f,128);
         k=rt_.norm(k,true,&weights_.get(p+s+"_attn_k_norm.weight"),nullptr,1e-6f,128);
         if(s=="img") { q=rt_.rope(q,rope); k=rt_.rope(k,rope); }
-        return std::vector<Tensor>{q,k,v};
+        return std::array<Tensor,3>{q,k,v};
     };
     auto i=project(inputI,"img"),t=project(inputT,"txt");
-    auto q=rt_.concat({i[0],t[0]}),k=rt_.concat({i[1],t[1]}),v=rt_.concat({i[2],t[2]});
-    auto allK=historyK?rt_.concat({*historyK,k}):k, allV=historyV?rt_.concat({*historyV,v}):v;
+    auto append=[&](const Tensor &image,const Tensor &text,const Tensor *history,Tensor *workspace) {
+        if(!workspace || !workspace->data) {
+            auto joined=history?rt_.concat({*history,image,text}):rt_.concat({image,text});
+            if(workspace) *workspace=joined;
+            return joined;
+        }
+        int offset=history?history->rows:0;
+        require(workspace->rows==offset+image.rows+text.rows && workspace->cols==image.cols &&
+                workspace->dtype==image.dtype && (!history || workspace->storage!=history->storage),
+                "invalid or aliased DiT workspace");
+        auto current=workspace->rowSlice(offset,image.rows+text.rows);
+        rt_.concatInto({image,text},current);
+        return *workspace;
+    };
+    auto q=rt_.concat({i[0],t[0]});
+    auto allK=append(i[1],t[1],historyK,keyWorkspace),allV=append(i[2],t[2],historyV,valueWorkspace);
+    auto k=allK.rowSlice(historyK?historyK->rows:0,image.rows+text.rows);
+    auto v=allV.rowSlice(historyV?historyV->rows:0,image.rows+text.rows);
     auto attn=rt_.attention(q,allK,allV,16,mask);
     auto finish=[&](const Tensor &x,const Tensor &m,const Tensor &a,const std::string &s) {
         auto h=rt_.residual(x,weights_.linear(a,p+s+"_attn_proj"),m,2);
@@ -198,7 +219,8 @@ int fastllm_nomas_dit_camera(void *handle,int t,int h,int w,int nt,const float *
         lastError.clear(); if(!handle || !output || nt<1 || nt>1280 || (commit!=0 && commit!=1)) throw std::invalid_argument("invalid camera DiT arguments");
         int n=checkedTokens(t,h,w); auto &ctx=*static_cast<NomasHandle *>(handle); auto &r=ctx.runtime;
         auto camera=ctx.dit.cameraEmbedding(r.upload(extrinsics,t,64));
-        copyOutput(r,ctx.dit.forward(r.upload(latent,n,32),r.upload(features,nt,3584),timestep,t,h,w,offset,&ctx.cache,commit,&camera),output);
+        auto projections=ctx.dit.cameraProjections(camera,h*w);
+        copyOutput(r,ctx.dit.forward(r.upload(latent,n,32),r.upload(features,nt,3584),timestep,t,h,w,offset,&ctx.cache,commit,&projections),output);
         return 0;
     } catch(const std::exception &e) { lastError=e.what(); return -1; }
 }
