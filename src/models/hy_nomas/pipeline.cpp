@@ -1,38 +1,32 @@
 #include "models/hy_nomas/runtime.h"
+#include "models/hy_nomas/parallel_model.h"
 #include <algorithm>
 #include <cmath>
-#include <cstdlib>
-#include <fstream>
 #include <random>
 #include <stdexcept>
 
-namespace fastllm { namespace nomas {
-namespace {
-// One opt-in trace for identical-input reference tests. Disabled tracing must
-// not download GPU tensors. The caller supplies an existing private directory.
-class PipelineTrace {
-    Runtime &rt_;
-    std::string directory_,prefix_;
-public:
-    explicit PipelineTrace(Runtime &rt,const std::string &prefix={}):rt_(rt),prefix_(prefix) {
-        if(const char *directory=std::getenv("FASTLLM_NOMAS_TRACE")) directory_=directory;
-    }
-    void operator()(const std::string &name,const std::vector<float> &values) const {
-        if(directory_.empty()) return;
-        std::ofstream file(directory_+"/"+prefix_+name+".f32",std::ios::binary);
-        file.write(reinterpret_cast<const char *>(values.data()),values.size()*sizeof(float));
-        if(!file) throw std::runtime_error("cannot write HY-Nomas pipeline trace");
-    }
-    void operator()(const std::string &name,const Tensor &values) const {
-        if(!directory_.empty()) (*this)(name,rt_.download(values));
-    }
-};
-}
+#ifdef FASTLLM_NOMAS_TEST_TRACE
+#include "pipeline_trace.h"
+#else
+#define NOMAS_TRACE_SCOPE(...) ((void)0)
+#define NOMAS_TRACE(...) ((void)0)
+#endif
 
+namespace fastllm { namespace nomas {
 Pipeline::Pipeline(const std::string &model,const std::string &text,int device):
     rt_(device),tokenizer_(text),text_(rt_,text),
     dit_(rt_,model+"/DiT/distilled/diffusion_pytorch_model_ema_0_995.safetensors"),
     decoder_(rt_,model+"/VAE/PixelUMM_FT/diffusion_pytorch_model.safetensors") {}
+Pipeline::Pipeline(const std::string &model,const std::string &text,const ParallelOptions &options)
+    :Pipeline(model,text,options.devices.empty()?throw std::invalid_argument("empty parallel devices"):options.devices[0]) {
+    if(options.devices.size()>1)
+        parallel_=std::make_unique<ParallelModel>(model,options,rt_.dtype());
+}
+Pipeline::~Pipeline()=default;
+void Pipeline::unloadModels() {
+    dit_.unload(); decoder_.unload();
+    if(parallel_) parallel_->unload();
+}
 
 std::vector<uint8_t> Pipeline::generate(const std::string &prompt,int width,int height,int frames,
                                        uint64_t seed,int steps,Progress progress,void *user) {
@@ -44,15 +38,15 @@ std::vector<uint8_t> Pipeline::generate(const std::string &prompt,int width,int 
     auto update=[&](int stage,int current,int total) {
         if(progress && progress(stage,current,total,user)) throw std::runtime_error("generation cancelled");
     };
-    PipelineTrace trace(rt_);
+    NOMAS_TRACE_SCOPE(rt_);
     try {
         // World sessions keep both networks resident between actions. Release
         // those weights before encoding an independent video prompt as well.
-        dit_.unload(); decoder_.unload();
+        unloadModels();
         update(1,0,1);
         int crop=0; auto ids=tokenizer_.videoPrompt(prompt,crop);
         auto features=text_.encode(ids).rowSlice(crop,int(ids.size())-crop);
-        trace("features",features);
+        NOMAS_TRACE("features",features);
         text_.unload(); update(1,1,1);
         int t=frames/4,h=height/32,w=width/32,n=t*h*w;
         std::mt19937_64 generator(seed); std::normal_distribution<float> normal;
@@ -60,25 +54,28 @@ std::vector<uint8_t> Pipeline::generate(const std::string &prompt,int width,int 
         // DiT RNG is reproducible within this implementation. Precision
         // tests inject identical tensors, rather than assuming torch seed parity.
         for(auto &v:latent) v=normal(generator);
-        trace("latent_0",latent);
+        NOMAS_TRACE("latent_0",latent);
         auto sigma=[steps](int i) { float s=1.f-float(i)/steps; return 5.f*s/(1.f+4.f*s); };
         for(int step=0;step<steps;++step) {
             update(2,step,steps);
-            auto velocity=rt_.download(dit_.forward(rt_.upload(latent.data(),n,32),features,sigma(step)*1000.f,t,h,w));
+            auto input=rt_.upload(latent.data(),n,32);
+            auto velocity=rt_.download(parallel_?parallel_->forward(input,features,sigma(step)*1000.f,t,h,w,0,nullptr,false,false)
+                                            :dit_.forward(input,features,sigma(step)*1000.f,t,h,w));
             float dt=sigma(step+1)-sigma(step);
             for(size_t i=0;i<latent.size();++i) latent[i]+=velocity[i]*dt;
-            trace("latent_"+std::to_string(step+1),latent);
+            NOMAS_TRACE("latent_"+std::to_string(step+1),latent);
         }
-        dit_.unload(); update(2,steps,steps); update(3,0,1);
+        unloadModels(); update(2,steps,steps); update(3,0,1);
         auto noise=rt_.pixelNoise(seed,0,t,height,width);
-        trace("pixel_noise",noise);
-        auto pixels=decoder_.forward(rt_.upload(latent.data(),n,32),noise,t,h,w);
-        trace("pixels",pixels);
+        NOMAS_TRACE("pixel_noise",noise);
+        auto input=rt_.upload(latent.data(),n,32);
+        auto pixels=parallel_?parallel_->decode(input,noise,t,h,w):decoder_.forward(input,noise,t,h,w);
+        NOMAS_TRACE("pixels",pixels);
         auto rgb=rt_.downloadPixelRGB(pixels,width,height,0,frames);
-        decoder_.unload(); update(3,1,1);
+        unloadModels(); update(3,1,1);
         update(4,1,1); return rgb;
     } catch(...) {
-        text_.unload(); dit_.unload(); decoder_.unload(); throw;
+        text_.unload(); unloadModels(); throw;
     }
 }
 
@@ -154,7 +151,7 @@ Tensor Pipeline::encodeWorldPrompt(const std::string &prompt) {
     int crop=0; auto ids=tokenizer_.videoPrompt(prompt,crop);
     // Reuse the native encoder. Keep world KV/decoder history while switching
     // resident weights so that a live edit fits the same GPU memory budget.
-    dit_.unload(); decoder_.unload();
+    unloadModels();
     try {
         auto features=text_.encode(ids).rowSlice(crop,int(ids.size())-crop);
         // Encode the official camera-minimal continuation while Qwen is already
@@ -179,7 +176,7 @@ std::vector<uint8_t> Pipeline::stepWorld(WorldState &world,int action,Progress p
     auto update=[&](int stage,int current,int total) {
         if(progress && progress(stage,current,total,user)) throw std::runtime_error("generation cancelled");
     };
-    PipelineTrace trace(rt_,"step_"+std::to_string(world.frameOffset/5)+"_");
+    NOMAS_TRACE_SCOPE(rt_,"step_"+std::to_string(world.frameOffset/5)+"_");
     // All state changes are transactional, including RNG and the KV commit.
     // A cancelled/failed step can be retried without advancing the world.
     WorldState next=world;
@@ -199,18 +196,28 @@ std::vector<uint8_t> Pipeline::stepWorld(WorldState &world,int action,Progress p
     const bool cameraContinuation=hasCamera && world.frameOffset>0 && !promptChanged;
     const Tensor &segmentFeatures=cameraContinuation?cameraContinuationFeatures_:next.features;
     auto poses=hasCamera?cameraTrajectory(20,action):std::vector<float>();
-    Tensor camera;
-    if(hasCamera) camera=dit_.cameraEmbedding(rt_.upload(poses.data(),t,64));
-    trace("camera",poses); trace("latent_0",latent);
-    trace("features",segmentFeatures);
+    std::vector<Tensor> camera;
+    if(hasCamera) {
+        auto input=rt_.upload(poses.data(),t,64);
+        if(parallel_) parallel_->prepareCamera(input,h*w);
+        else camera=dit_.cameraProjections(dit_.cameraEmbedding(input),h*w);
+    }
+    NOMAS_TRACE("camera",poses); NOMAS_TRACE("latent_0",latent);
+    NOMAS_TRACE("features",segmentFeatures);
     auto sigma=[&](int i) { float s=1.f-float(i)/world.steps; return 5.f*s/(1.f+4.f*s); };
+    DiTCache workspace;
+    std::vector<DiTCache> parallelWorkspace;
     for(int step=0;step<world.steps;++step) {
         update(2,step,world.steps+1);
-        auto velocity=rt_.download(dit_.forward(rt_.upload(latent.data(),n,32),segmentFeatures,sigma(step)*1000.f,t,h,w,
-                                              world.frameOffset,&next.cache,false,hasCamera?&camera:nullptr));
+        auto input=rt_.upload(latent.data(),n,32);
+        auto velocity=rt_.download(parallel_
+            ?parallel_->forward(input,segmentFeatures,sigma(step)*1000.f,t,h,w,world.frameOffset,
+                                &next.parallelCaches,false,hasCamera,&parallelWorkspace)
+            :dit_.forward(input,segmentFeatures,sigma(step)*1000.f,t,h,w,world.frameOffset,
+                          &next.cache,false,hasCamera?&camera:nullptr,&workspace));
         float dt=sigma(step+1)-sigma(step);
         for(size_t i=0;i<latent.size();++i) latent[i]+=velocity[i]*dt;
-        trace("latent_"+std::to_string(step+1),latent);
+        NOMAS_TRACE("latent_"+std::to_string(step+1),latent);
     }
     update(2,world.steps,world.steps+1);
     std::vector<float> cacheInput=latent;
@@ -220,19 +227,28 @@ std::vector<uint8_t> Pipeline::stepWorld(WorldState &world,int action,Progress p
         cacheNoise[i]=normal(next.generator);
         cacheInput[i]=(1.f-cacheSigma)*cacheInput[i]+cacheSigma*cacheNoise[i];
     }
-    trace("cache_noise",cacheNoise);
-    trace("cache_input",cacheInput);
-    dit_.forward(rt_.upload(cacheInput.data(),n,32),segmentFeatures,cacheSigma*1000.f,t,h,w,
-                 world.frameOffset,&next.cache,true,hasCamera?&camera:nullptr);
+    NOMAS_TRACE("cache_noise",cacheNoise);
+    NOMAS_TRACE("cache_input",cacheInput);
+    auto cacheTensor=rt_.upload(cacheInput.data(),n,32);
+    if(parallel_) parallel_->forward(cacheTensor,segmentFeatures,cacheSigma*1000.f,t,h,w,world.frameOffset,
+                                    &next.parallelCaches,true,hasCamera,&parallelWorkspace);
+    else dit_.forward(cacheTensor,segmentFeatures,cacheSigma*1000.f,t,h,w,world.frameOffset,
+                      &next.cache,true,hasCamera?&camera:nullptr,&workspace);
     next.segmentTokens.push_back(n+segmentFeatures.rows);
     int remove=0;
     while(int(next.segmentTokens.size())>next.maxHistorySegments) {
         remove+=next.segmentTokens.front(); next.segmentTokens.erase(next.segmentTokens.begin());
     }
-    if(remove) for(int i=0;i<54;++i) {
-        int kept=next.cache.key[i].rows-remove;
-        next.cache.key[i]=next.cache.key[i].rowSlice(remove,kept);
-        next.cache.value[i]=next.cache.value[i].rowSlice(remove,kept);
+    if(remove) {
+        auto trim=[&](DiTCache &cache) {
+            for(size_t i=0;i<cache.key.size();++i) {
+                int kept=cache.key[i].rows-remove;
+                cache.key[i]=cache.key[i].rowSlice(remove,kept);
+                cache.value[i]=cache.value[i].rowSlice(remove,kept);
+            }
+        };
+        if(parallel_) for(auto &cache:next.parallelCaches) trim(cache);
+        else trim(next.cache);
     }
     update(2,world.steps+1,world.steps+1); update(3,0,1);
     std::vector<float> context=world.decoderLatents;
@@ -240,10 +256,11 @@ std::vector<uint8_t> Pipeline::stepWorld(WorldState &world,int action,Progress p
     context.insert(context.end(),latent.begin(),latent.end());
     int decodeT=previous+t,begin=world.frameOffset-previous;
     auto noise=rt_.pixelNoise(world.seed,begin,decodeT,world.height,world.width);
-    trace("decoder_latents",context);
-    trace("pixel_noise",noise);
-    auto pixels=decoder_.forward(rt_.upload(context.data(),decodeT*h*w,32),noise,decodeT,h,w);
-    trace("pixels",pixels);
+    NOMAS_TRACE("decoder_latents",context);
+    NOMAS_TRACE("pixel_noise",noise);
+    auto input=rt_.upload(context.data(),decodeT*h*w,32);
+    auto pixels=parallel_?parallel_->decode(input,noise,decodeT,h,w):decoder_.forward(input,noise,decodeT,h,w);
+    NOMAS_TRACE("pixels",pixels);
     auto rgb=rt_.downloadPixelRGB(pixels,world.width,world.height,previous*4,20);
     next.decoderLatents=std::move(latent); next.frameOffset+=t;
     update(3,1,1); update(4,1,1);

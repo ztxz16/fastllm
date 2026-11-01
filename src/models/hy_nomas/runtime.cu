@@ -15,6 +15,8 @@
 #include <mutex>
 #include <stdexcept>
 #include <type_traits>
+#include <atomic>
+#include <map>
 #ifndef _WIN32
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -37,9 +39,54 @@ void copy(void *dst,const void *src,size_t bytes,cudaMemcpyKind kind) {
 }
 // Never change the process-wide default pool: other fastllm models may use it.
 // Tensors retain this pool so their storage may safely outlive Runtime.
+uint64_t allocationThread() {
+    static std::atomic<uint64_t> next{1};
+    thread_local const uint64_t id=next.fetch_add(1,std::memory_order_relaxed);
+    return id; // Unlike std::thread::id, never reused after a worker exits.
+}
 struct MemoryPool {
     cudaMemPool_t handle = nullptr;
     int device;
+    size_t cacheLimit=0,cachedBytes=0;
+    std::mutex cacheMutex;
+    using FreeBlocks=std::map<size_t,std::vector<void *>>;
+    std::unordered_map<uint64_t,FreeBlocks> freeBlocks;
+    void *reuse(size_t bytes) {
+        if(!cacheLimit) return nullptr;
+        std::lock_guard<std::mutex> lock(cacheMutex);
+        auto thread=freeBlocks.find(allocationThread());
+        if(thread==freeBlocks.end()) return nullptr;
+        auto found=thread->second.find(bytes);
+        if(found==thread->second.end() || found->second.empty()) return nullptr;
+        auto &blocks=found->second;
+        void *p=blocks.back();blocks.pop_back();cachedBytes-=bytes;return p;
+    }
+    bool recycle(void *p,size_t bytes) noexcept {
+        if(!cacheLimit || bytes>cacheLimit) return false;
+        try {
+            std::lock_guard<std::mutex> lock(cacheMutex);
+            auto &sizes=freeBlocks[allocationThread()];
+            // Weight-loading scratch must not crowd out smaller recurring
+            // activations. Eviction stays on the allocating thread's stream.
+            auto largest=sizes.rbegin();
+            while(bytes>cacheLimit-cachedBytes) {
+                while(largest!=sizes.rend() && largest->second.empty()) ++largest;
+                if(largest==sizes.rend() || largest->first<=bytes) return false;
+                auto &blocks=largest->second;
+                cudaFreeAsync(blocks.back(),cudaStreamPerThread);
+                blocks.pop_back();cachedBytes-=largest->first;
+            }
+            sizes[bytes].push_back(p);cachedBytes+=bytes;return true;
+        } catch(...) {return false;}
+    }
+    // The caller synchronizes before trimming. Cached blocks belong to the
+    // allocating thread's stream; they are never recycled onto another stream.
+    void clearCache() {
+        std::lock_guard<std::mutex> lock(cacheMutex);
+        for(auto &thread:freeBlocks) for(auto &size:thread.second)
+            for(void *p:size.second) cudaFree(p);
+        freeBlocks.clear();cachedBytes=0;
+    }
     explicit MemoryPool(int device, uint64_t retained=2ULL*1024*1024*1024):device(device) {
         cudaMemPoolProps props{};
         props.allocType = cudaMemAllocationTypePinned;
@@ -52,7 +99,11 @@ struct MemoryPool {
             check(status);
         }
     }
-    ~MemoryPool() { cudaMemPoolDestroy(handle); }
+    ~MemoryPool() {
+        int previous=device;cudaGetDevice(&previous);cudaSetDevice(device);
+        if(cachedBytes) {cudaDeviceSynchronize();clearCache();}
+        cudaMemPoolDestroy(handle);cudaSetDevice(previous);
+    }
 };
 thread_local std::shared_ptr<MemoryPool> activePool;
 std::shared_ptr<MemoryPool> memoryPool(int device) {
@@ -71,10 +122,13 @@ std::shared_ptr<void> allocate(size_t bytes) {
     require(bytes > 0, "empty CUDA allocation");
     int device; check(cudaGetDevice(&device));
     auto pool = memoryPool(device);
-    void *p = nullptr;
-    check(cudaMallocFromPoolAsync(&p,bytes,pool->handle,cudaStreamPerThread));
-    return {p, [device,pool](void *x) {
-        int previous = device; cudaGetDevice(&previous); cudaSetDevice(device);
+    void *p = pool->reuse(bytes);
+    if(!p) check(cudaMallocFromPoolAsync(&p,bytes,pool->handle,cudaStreamPerThread));
+    auto owner=allocationThread();
+    return {p, [device,pool,bytes,owner](void *x) {
+        int previous = device; cudaGetDevice(&previous);
+        if(previous==device && activePool==pool && owner==allocationThread() && pool->recycle(x,bytes)) return;
+        cudaSetDevice(device);
         cudaFreeAsync(x,cudaStreamPerThread);
         cudaSetDevice(previous);
     }};
@@ -115,29 +169,75 @@ template<class T> __global__ void addBias(const T *x,const T *bias,T *y,size_t n
     for(size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;i<n;i+=size_t(gridDim.x)*blockDim.x) y[i]=cast<T>(f(x[i])+f(bias[i%cols]));
 }
 __device__ float sumBlock(float v, float *scratch) {
+    // Callers use power-of-two blocks of at least 64 threads. Preserve the
+    // descending reduction tree. Only the final warp uses
+    // shuffles; a warp-sum-first reduction would change the addition order.
     scratch[threadIdx.x]=v; __syncthreads();
-    for (int d=blockDim.x/2; d; d/=2) { if(threadIdx.x<d) scratch[threadIdx.x]+=scratch[threadIdx.x+d]; __syncthreads(); }
+    for(int d=blockDim.x/2;d>=64;d/=2) {
+        if(threadIdx.x<d) scratch[threadIdx.x]+=scratch[threadIdx.x+d];
+        __syncthreads();
+    }
+    if(threadIdx.x<32) {
+        float sum=scratch[threadIdx.x]+scratch[threadIdx.x+32];
+        for(int d=16;d;d/=2) sum+=__shfl_down_sync(0xffffffffu,sum,d);
+        if(threadIdx.x==0) scratch[0]=sum;
+    }
+    __syncthreads();
     return scratch[0];
 }
-template<class T, bool FusedAffine=true> __global__ void normKernel(const T *x, T *y, const T *weight, const T *bias, int width, bool rms, float eps) {
+template<class T> __device__ float modulatedValue(float value, float shift, float scale) {
+    return roundTo<T>(value*roundTo<T>(1.f+scale))+shift;
+}
+template<class T, bool FusedAffine=true, bool Modulate=false> __global__ void normKernel(const T *x, T *y, const T *weight, const T *bias, int width, bool rms, float eps, int rows, const T *mod=nullptr, int shift=0, int scale=0) {
+    if(!Modulate && rms && width==128) {
+        // One warp per row, four rows per block. Keep the old block reduction's
+        // (0+64)+(32+96) tree and the cast before the affine, unlike LLM RMSNorm.
+        int row=blockIdx.x*4+threadIdx.x/32,lane=threadIdx.x%32;
+        if(row>=rows) return;
+        float value[4];
+#pragma unroll
+        for(int i=0;i<4;++i) value[i]=f(x[size_t(row)*128+lane+32*i]);
+        float sum=(value[0]*value[0]+value[2]*value[2])+(value[1]*value[1]+value[3]*value[3]);
+#pragma unroll
+        for(int d=16;d;d/=2) sum+=__shfl_down_sync(0xffffffffu,sum,d);
+        float inv=rsqrtf(__shfl_sync(0xffffffffu,sum,0)/128+eps);
+#pragma unroll
+        for(int i=0;i<4;++i) {
+            int c=lane+32*i;
+            float v=roundTo<T>(value[i]*inv);
+            if(weight) v*=f(weight[c]);
+            if(bias) v+=f(bias[c]);
+            y[size_t(row)*128+c]=cast<T>(v);
+        }
+        return;
+    }
     __shared__ float scratch[256]; __shared__ float mean, inv;
     int row=blockIdx.x; float s=0;
-    for(int c=threadIdx.x;c<width;c+=blockDim.x) s+=f(x[size_t(row)*width+c]);
-    float total=sumBlock(s,scratch);
-    if(threadIdx.x==0) mean=rms?0.f:total/width;
+    if(!Modulate && rms) {
+        if(threadIdx.x==0) mean=0;
+    } else {
+        for(int c=threadIdx.x;c<width;c+=blockDim.x) s+=f(x[size_t(row)*width+c]);
+        float total=sumBlock(s,scratch);
+        if(threadIdx.x==0) mean=total/width;
+    }
     __syncthreads(); s=0;
     for(int c=threadIdx.x;c<width;c+=blockDim.x) { float v=f(x[size_t(row)*width+c])-mean; s+=v*v; }
-    total=sumBlock(s,scratch);
+    float total=sumBlock(s,scratch);
     if(threadIdx.x==0) inv=rsqrtf(total/width+eps);
     __syncthreads();
     for(int c=threadIdx.x;c<width;c+=blockDim.x) {
         float v=(f(x[size_t(row)*width+c])-mean)*inv;
-        // Official RMSNorm casts before applying weight; LayerNorm has a fused affine.
-        if(rms) v=roundTo<T>(v);
-        if constexpr (std::is_same_v<T,B> && FusedAffine) {
-            if(!rms && weight && bias) v=__fmaf_rn(v,f(weight[c]),f(bias[c]));
-            else { if(weight) v*=f(weight[c]); if(bias) v+=f(bias[c]); }
-        } else { if(weight) v*=f(weight[c]); if(bias) v+=f(bias[c]); }
+        if constexpr (Modulate) {
+            // Keep the materialized LayerNorm result's rounding before modulation.
+            v=modulatedValue<T>(roundTo<T>(v),f(mod[shift*width+c]),f(mod[scale*width+c]));
+        } else {
+            // Official RMSNorm casts before weight; LayerNorm has a fused affine.
+            if(rms) v=roundTo<T>(v);
+            if constexpr (std::is_same_v<T,B> && FusedAffine) {
+                if(!rms && weight && bias) v=__fmaf_rn(v,f(weight[c]),f(bias[c]));
+                else { if(weight) v*=f(weight[c]); if(bias) v+=f(bias[c]); }
+            } else { if(weight) v*=f(weight[c]); if(bias) v+=f(bias[c]); }
+        }
         y[size_t(row)*width+c]=cast<T>(v);
     }
 }
@@ -169,7 +269,7 @@ template<class T,bool Indexed=false> __global__ void modulation(const T *x, cons
         if constexpr(Indexed) j+=size_t(indices[i/c])*modCols;
         // Match eager BF16 boundaries, including the rounding of (1 + scale).
         float v=residual ? f(x[i])+roundTo<T>(f(y[i])*f(mod[a*c+j]))
-                         : roundTo<T>(f(x[i])*roundTo<T>(1.f+f(mod[d*c+j])))+f(mod[a*c+j]);
+                         : modulatedValue<T>(f(x[i]),f(mod[a*c+j]),f(mod[d*c+j]));
         z[i]=cast<T>(v);
     }
 }
@@ -338,9 +438,17 @@ template<class T> __global__ void textRopeKernel(const T *x,T *y,size_t n,int co
 }
 }
 
-TensorPool::TensorPool(int device):pool_(std::make_shared<MemoryPool>(device,UINT64_MAX)) {}
+TensorPool::TensorPool(int device,size_t cacheBytes):pool_(std::make_shared<MemoryPool>(device,UINT64_MAX)) {
+    std::static_pointer_cast<MemoryPool>(pool_)->cacheLimit=cacheBytes;
+}
 TensorPool::Scope::Scope(const TensorPool &pool):previous_(activePool) {
-    activePool=std::static_pointer_cast<MemoryPool>(pool.pool_);
+    auto next=std::static_pointer_cast<MemoryPool>(pool.pool_);
+    if(next->cacheLimit) {
+        cudaStreamCaptureStatus status;
+        check(cudaStreamIsCapturing(cudaStreamPerThread,&status));
+        require(status==cudaStreamCaptureStatusNone,"host tensor reuse does not support CUDA capture");
+    }
+    activePool=std::move(next);
 }
 TensorPool::Scope::~Scope() { activePool=std::static_pointer_cast<MemoryPool>(previous_); }
 size_t TensorPool::reusableBytes() const {
@@ -348,10 +456,11 @@ size_t TensorPool::reusableBytes() const {
     uint64_t reserved=0,used=0;
     check(cudaMemPoolGetAttribute(pool->handle,cudaMemPoolAttrReservedMemCurrent,&reserved));
     check(cudaMemPoolGetAttribute(pool->handle,cudaMemPoolAttrUsedMemCurrent,&used));
-    return reserved>used?reserved-used:0;
+    return (reserved>used?reserved-used:0)+pool->cachedBytes;
 }
 void TensorPool::trim() {
-    check(cudaMemPoolTrimTo(std::static_pointer_cast<MemoryPool>(pool_)->handle,0));
+    auto pool=std::static_pointer_cast<MemoryPool>(pool_);pool->clearCache();
+    check(cudaMemPoolTrimTo(pool->handle,0));
 }
 
 struct Runtime::LtState {
@@ -506,11 +615,21 @@ Tensor Runtime::norm(const Tensor &x,bool rms,const Tensor *w,const Tensor *bias
     require((!w || w->dtype==x.dtype) && (!bias || bias->dtype==x.dtype),"norm dtype mismatch");
     require((!w || w->size()==size_t(width)) && (!bias || bias->size()==size_t(width)),"norm weight mismatch");
     Tensor out(x.rows,x.cols,x.dtype);
+    int rows=int(x.size()/width),threads=rms && width==128?128:256;
+    int blocks=rms && width==128?(rows+3)/4:rows;
     if(x.dtype==DType::BF16 && !numerics_.layerNormFMA) {
-        normKernel<B,false><<<x.size()/width,256,0,cudaStreamPerThread>>>(as<B>(x),as<B>(out),w?as<B>(*w):nullptr,bias?as<B>(*bias):nullptr,width,rms,eps);
+        normKernel<B,false><<<blocks,threads,0,cudaStreamPerThread>>>(as<B>(x),as<B>(out),w?as<B>(*w):nullptr,bias?as<B>(*bias):nullptr,width,rms,eps,rows);
     } else {
-        DISPATCH_TENSOR(x.dtype, T, normKernel<T><<<x.size()/width,256,0,cudaStreamPerThread>>>(as<T>(x),as<T>(out),w?as<T>(*w):nullptr,bias?as<T>(*bias):nullptr,width,rms,eps));
+        DISPATCH_TENSOR(x.dtype, T, normKernel<T><<<blocks,threads,0,cudaStreamPerThread>>>(as<T>(x),as<T>(out),w?as<T>(*w):nullptr,bias?as<T>(*bias):nullptr,width,rms,eps,rows));
     }
+    check(cudaGetLastError()); return out;
+}
+Tensor Runtime::normModulate(const Tensor &x,const Tensor &m,int shift,int scale,float eps) {
+    require(x.cols>0 && m.dtype==x.dtype && m.rows==1 && shift>=0 && scale>=0 &&
+            m.cols>=(std::max(shift,scale)+1)*x.cols,"norm modulation dimension mismatch");
+    Tensor out(x.rows,x.cols,x.dtype);
+    DISPATCH_TENSOR(x.dtype, T, (normKernel<T,true,true><<<x.rows,256,0,cudaStreamPerThread>>>(
+        as<T>(x),as<T>(out),nullptr,nullptr,x.cols,false,eps,x.rows,as<T>(m),shift,scale)));
     check(cudaGetLastError()); return out;
 }
 Tensor Runtime::activation(const Tensor &x,bool gelu) {
@@ -712,12 +831,25 @@ Tensor Runtime::textRope(const Tensor &x,float theta) {
     require(x.cols%128==0,"invalid Qwen RoPE shape"); Tensor out(x.rows,x.cols,x.dtype);
     DISPATCH_TENSOR(x.dtype, T, textRopeKernel<T><<<grid(x.size()),256,0,cudaStreamPerThread>>>(as<T>(x),as<T>(out),x.size(),x.cols,theta)); check(cudaGetLastError()); return out;
 }
-Tensor Runtime::concat(const std::vector<Tensor> &xs) {
+namespace {
+Tensor concatenate(const std::vector<Tensor> &xs,Tensor *target) {
     require(!xs.empty(),"empty concat"); int rows=0;
-    for(auto &x:xs) { require(x.cols==xs[0].cols && x.dtype==xs[0].dtype && x.rows<=INT32_MAX-rows,"concat shape mismatch"); rows+=x.rows; }
-    Tensor out(rows,xs[0].cols,xs[0].dtype); size_t pos=0;
-    for(auto &x:xs) { copy(out.data+pos,x.data,x.bytes(),cudaMemcpyDeviceToDevice); pos+=x.size()*(x.isFloat32()?2:1); } return out;
+    for(const auto &x:xs) {
+        require(x.data && x.rows>0 && x.cols==xs[0].cols && x.dtype==xs[0].dtype && x.rows<=INT32_MAX-rows,
+                "concat shape/dtype mismatch");
+        require(!target || x.storage!=target->storage,"concat output must not share input storage");
+        rows+=x.rows;
+    }
+    Tensor out=target?*target:Tensor(rows,xs[0].cols,xs[0].dtype);
+    require(out.data && out.rows==rows && out.cols==xs[0].cols && out.dtype==xs[0].dtype,
+            "concat output shape/dtype mismatch");
+    size_t pos=0;
+    for(const auto &x:xs) { copy(out.data+pos,x.data,x.bytes(),cudaMemcpyDeviceToDevice); pos+=x.size()*(x.isFloat32()?2:1); }
+    return out;
 }
+}
+Tensor Runtime::concat(const std::vector<Tensor> &xs) { return concatenate(xs,nullptr); }
+void Runtime::concatInto(const std::vector<Tensor> &xs,Tensor &out) { concatenate(xs,&out); }
 Tensor Runtime::rope(const Tensor &x,const float *cos,const float *sin,int dim) {
     return rope(x,prepareRope(cos,sin,x.rows,dim));
 }

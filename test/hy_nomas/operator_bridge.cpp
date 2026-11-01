@@ -34,6 +34,12 @@ int nomas_test_op(void *ctx, const char *name, const int *shape,
             auto w=rt.upload(y,shape[2],cols); Tensor bias;
             if(z) bias=rt.upload(z,1,shape[2]);
             out=rt.linear(a,w,z?&bias:nullptr);
+        } else if(op=="concat_into") {
+            auto b=rt.upload(y,shape[2],cols);
+            std::vector<float> guard(size_t(rows+shape[2]+2)*cols,13.f);
+            out=rt.upload(guard.data(),rows+shape[2]+2,cols);
+            auto view=out.rowSlice(1,rows+shape[2]);
+            rt.concatInto({a,b},view);
         } else if(op=="rms" || op=="layernorm") {
             auto weight=rt.upload(y,1,cols); Tensor bias;
             if(z) bias=rt.upload(z,1,cols);

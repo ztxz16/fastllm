@@ -1,4 +1,5 @@
 #include "models/hy_nomas/runtime.h"
+#include "models/hy_nomas/parallel.h"
 #include <algorithm>
 #include <cstring>
 #include <mutex>
@@ -6,35 +7,88 @@
 namespace fastllm { namespace nomas {
 namespace { void require(bool ok, const char *message) { if (!ok) throw std::invalid_argument(message); } }
 
-DiT::DiT(Runtime &rt,const std::string &path):rt_(rt),weights_(rt,path) {}
+DiT::DiT(Runtime &rt,const std::string &path):DiT(rt,path,ParallelContext{}) {}
+DiT::DiT(Runtime &rt,const std::string &path,const ParallelContext &parallel)
+    :rt_(rt),weights_(rt,path),parallel_(new ParallelContext(parallel)) {}
+DiT::~DiT()=default;
+int DiT::sequencePartitions(int rows) const {
+    // Tiny shards change the GEMM algorithm/rounding and cannot amortize NCCL.
+    return rows/parallel_->size()>=64?parallel_->size():1;
+}
+void DiT::unload() { weights_.clear(); modulation_.clear(); }
 BlockResult DiT::block(int layer,const Tensor &image,const Tensor &text,const Tensor &time,
     const float *cos,const float *sin,const Tensor *historyK,const Tensor *historyV,const uint8_t *mask) {
     return block(layer,image,text,time,rt_.prepareRope(cos,sin,image.rows,128),historyK,historyV,mask);
 }
 BlockResult DiT::block(int layer,const Tensor &image,const Tensor &text,const Tensor &time,
-    const RopeTable &rope,const Tensor *historyK,const Tensor *historyV,const uint8_t *mask) {
+    const RopeTable &rope,const Tensor *historyK,const Tensor *historyV,const uint8_t *mask,
+    const Tensor *imageMod,const Tensor *textMod,Tensor *keyWorkspace,Tensor *valueWorkspace,int globalImageRows) {
     require(layer>=0 && layer<54 && image.cols==2048 && text.cols==2048 && time.rows==1 && time.cols==2048,"invalid DiT block input");
     require(bool(historyK)==bool(historyV),"both K and V history required");
-    auto p="double_blocks."+std::to_string(layer)+"."; auto act=rt_.activation(time);
-    auto im=weights_.linear(act,p+"img_mod.linear"),tm=weights_.linear(act,p+"txt_mod.linear");
-    auto inputI=rt_.modulate(rt_.norm(image,false),im,0,1),inputT=rt_.modulate(rt_.norm(text,false),tm,0,1);
+    require(bool(keyWorkspace)==bool(valueWorkspace),"both K and V workspaces required");
+    require(globalImageRows>=0,"invalid distributed image rows");
+    const int total=globalImageRows?globalImageRows:image.rows;
+    const int ranks=sequencePartitions(total),rank=ranks>1?parallel_->rank:0;
+    const bool split=ranks>1;
+    const int chunk=(total+ranks-1)/ranks,first=rank*chunk,rows=std::min(chunk,total-first);
+    require(!globalImageRows || image.rows==rows,"invalid distributed image rows");
+    auto local=globalImageRows?image:image.rowSlice(first,rows);
+    RopeTable localRope=globalImageRows?rope:RopeTable{rope.cos.rowSlice(first,rows),rope.sin.rowSlice(first,rows)};
+    auto p="double_blocks."+std::to_string(layer)+".";
+    auto act=imageMod && textMod?Tensor{}:rt_.activation(time);
+    auto im=imageMod?*imageMod:weights_.linear(act,p+"img_mod.linear");
+    auto tm=textMod?*textMod:weights_.linear(act,p+"txt_mod.linear");
+    auto inputI=rt_.normModulate(local,im,0,1),inputT=rt_.normModulate(text,tm,0,1);
     auto project=[&](const Tensor &x,const std::string &s) {
         auto q=weights_.linear(x,p+s+"_attn_q"),k=weights_.linear(x,p+s+"_attn_k"),v=weights_.linear(x,p+s+"_attn_v");
         q=rt_.norm(q,true,&weights_.get(p+s+"_attn_q_norm.weight"),nullptr,1e-6f,128);
         k=rt_.norm(k,true,&weights_.get(p+s+"_attn_k_norm.weight"),nullptr,1e-6f,128);
-        if(s=="img") { q=rt_.rope(q,rope); k=rt_.rope(k,rope); }
-        return std::vector<Tensor>{q,k,v};
+        if(s=="img") {q=rt_.rope(q,localRope);k=rt_.rope(k,localRope);}
+        return std::array<Tensor,3>{q,k,v};
     };
-    auto i=project(inputI,"img"),t=project(inputT,"txt");
-    auto q=rt_.concat({i[0],t[0]}),k=rt_.concat({i[1],t[1]}),v=rt_.concat({i[2],t[2]});
-    auto allK=historyK?rt_.concat({*historyK,k}):k, allV=historyV?rt_.concat({*historyV,v}):v;
+    auto i=project(inputI,"img");
+    auto imageK=i[1],imageV=i[2];
+    if(split) {
+        auto full=parallel_->gatherRows(rt_,rt_.concat({imageK,imageV}),total,2,true);
+        imageK=full.rowSlice(0,total);imageV=full.rowSlice(total,total);
+    }
+    auto t=project(inputT,"txt");
+    if(split) parallel_->group->wait(parallel_->rank);
+    auto append=[&](const Tensor &image,const Tensor &text,const Tensor *history,Tensor *workspace) {
+        if(!workspace || !workspace->data) {
+            auto joined=history?rt_.concat({*history,image,text}):rt_.concat({image,text});
+            if(workspace) *workspace=joined;
+            return joined;
+        }
+        int offset=history?history->rows:0;
+        require(workspace->rows==offset+image.rows+text.rows && workspace->cols==image.cols &&
+                workspace->dtype==image.dtype && (!history || workspace->storage!=history->storage),
+                "invalid or aliased DiT workspace");
+        auto current=workspace->rowSlice(offset,image.rows+text.rows);
+        rt_.concatInto({image,text},current);
+        return *workspace;
+    };
+    auto q=rt_.concat({i[0],t[0]});
+    auto allK=append(imageK,t[1],historyK,keyWorkspace),allV=append(imageV,t[2],historyV,valueWorkspace);
+    auto k=allK.rowSlice(historyK?historyK->rows:0,total+text.rows);
+    auto v=allV.rowSlice(historyV?historyV->rows:0,total+text.rows);
+    std::vector<uint8_t> localMask;
+    if(mask && split) {
+        localMask.resize(size_t(rows+text.rows)*allK.rows);
+        std::copy_n(mask+size_t(first)*allK.rows,size_t(rows)*allK.rows,localMask.data());
+        std::copy_n(mask+size_t(total)*allK.rows,size_t(text.rows)*allK.rows,localMask.data()+size_t(rows)*allK.rows);
+        mask=localMask.data();
+    }
     auto attn=rt_.attention(q,allK,allV,16,mask);
     auto finish=[&](const Tensor &x,const Tensor &m,const Tensor &a,const std::string &s) {
         auto h=rt_.residual(x,weights_.linear(a,p+s+"_attn_proj"),m,2);
-        auto mlp=weights_.linear(rt_.activation(weights_.linear(rt_.modulate(rt_.norm(h,false),m,3,4),p+s+"_mlp.fc1"),true),p+s+"_mlp.fc2");
+        auto mlp=weights_.linear(rt_.activation(weights_.linear(rt_.normModulate(h,m,3,4),p+s+"_mlp.fc1"),true),p+s+"_mlp.fc2");
         return rt_.residual(h,mlp,m,5);
     };
-    return {finish(image,im,attn.rowSlice(0,image.rows),"img"),finish(text,tm,attn.rowSlice(image.rows,text.rows),"txt"),k,v};
+    auto imageOut=finish(local,im,attn.rowSlice(0,rows),"img");
+    auto textOut=finish(text,tm,attn.rowSlice(rows,text.rows),"txt");
+    if(split && !globalImageRows) imageOut=parallel_->gatherRows(rt_,imageOut,total);
+    return {imageOut,textOut,k,v};
 }
 
 }} // namespace fastllm::nomas
@@ -62,6 +116,9 @@ struct PipelineHandle {
     std::mutex mutex;
     fastllm::nomas::Pipeline pipeline;
     PipelineHandle(const char *model,const char *text,int device):pipeline(model,text,device) {}
+    PipelineHandle(const char *model,const char *text,const char *devices)
+        :pipeline(model,text,fastllm::nomas::ParallelOptions{fastllm::nomas::parseParallelDevices(devices),
+                                                          fastllm::nomas::RowReduction::Activation}) {}
 };
 int checkedTokens(int t,int h,int w) {
     if(t<1 || h<1 || w<1 || t>64 || h>128 || w>128 || int64_t(t)*h*w>16384)
@@ -145,6 +202,13 @@ void *fastllm_nomas_pipeline_create(const char *model,const char *text,int devic
     try { lastError.clear(); if(!model || !text) throw std::invalid_argument("null model directory"); return new PipelineHandle(model,text,device); }
     catch(const std::exception &e) { lastError=e.what(); return nullptr; }
 }
+void *fastllm_nomas_pipeline_create_parallel(const char *model,const char *text,const char *devices) {
+    try {
+        lastError.clear();
+        if(!model || !text || !devices) throw std::invalid_argument("null model directory or parallel devices");
+        return new PipelineHandle(model,text,devices);
+    } catch(const std::exception &e) {lastError=e.what();return nullptr;}
+}
 void fastllm_nomas_pipeline_destroy(void *handle) { delete static_cast<PipelineHandle *>(handle); }
 int fastllm_nomas_generate(void *handle,const char *prompt,int width,int height,int frames,uint64_t seed,int steps,
                           uint8_t *rgb,size_t capacity,fastllm::nomas::Progress progress,void *user) {
@@ -198,7 +262,8 @@ int fastllm_nomas_dit_camera(void *handle,int t,int h,int w,int nt,const float *
         lastError.clear(); if(!handle || !output || nt<1 || nt>1280 || (commit!=0 && commit!=1)) throw std::invalid_argument("invalid camera DiT arguments");
         int n=checkedTokens(t,h,w); auto &ctx=*static_cast<NomasHandle *>(handle); auto &r=ctx.runtime;
         auto camera=ctx.dit.cameraEmbedding(r.upload(extrinsics,t,64));
-        copyOutput(r,ctx.dit.forward(r.upload(latent,n,32),r.upload(features,nt,3584),timestep,t,h,w,offset,&ctx.cache,commit,&camera),output);
+        auto projections=ctx.dit.cameraProjections(camera,h*w);
+        copyOutput(r,ctx.dit.forward(r.upload(latent,n,32),r.upload(features,nt,3584),timestep,t,h,w,offset,&ctx.cache,commit,&projections),output);
         return 0;
     } catch(const std::exception &e) { lastError=e.what(); return -1; }
 }

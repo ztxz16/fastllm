@@ -15,7 +15,8 @@ public:
     int size() const;
     void run(const std::function<void(int)> &);
     Tensor broadcast(const Tensor &root, int rank);
-    Tensor gatherColumns(const Tensor &, int rank, int groups = 1);
+    // Async gathers retain their buffers; wait() before consuming the result.
+    Tensor gatherColumns(const Tensor &, int rank, int groups = 1, bool async = false);
     void sum(Tensor &, int rank);
     // In-place AllReduce on the communication stream; wait() before consuming.
     void sumAsync(const Tensor &, int rank);
@@ -36,6 +37,10 @@ private:
 
 // Select partial-output/collective precision; 16-bit GEMMs still accumulate in FP32.
 enum class RowReduction { FP32, Activation };
+struct ParallelOptions {
+    std::vector<int> devices;
+    RowReduction rowReduction = RowReduction::FP32;
+};
 
 // Column parallel: replicate input, shard output (optionally gather).
 // Row parallel: consume sharded input, sum partial outputs, add bias once.
@@ -52,6 +57,10 @@ struct ParallelContext {
     void rowWeights(Weights &, const std::string &prefix) const;
     Tensor column(Weights &, const Tensor &, const std::string &prefix, bool gather = false) const;
     Tensor row(Runtime &, Weights &, const Tensor &, const std::string &prefix) const;
+    // Gather contiguous token partitions, preserving group order (e.g. K/V).
+    // Every rank supplies ceil(rows/size) rows except the final shorter shard.
+    // Async may finish early when trimming uneven grouped partitions.
+    Tensor gatherRows(Runtime &,const Tensor &,int rows,int groups=1,bool async=false) const;
     // Activation precision rounds each GEMM partial before AllReduce, with bias
     // included only on rank 0. FP32 keeps the original sum-before-rounding path.
     void rowPartial(Runtime &, Weights &, const Tensor &, const std::string &prefix, Tensor &) const;
