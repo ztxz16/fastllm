@@ -543,6 +543,76 @@ static void CheckResidentAssist(std::vector<Data *> &weights) {
     }
 }
 
+// PP changes cache ownership, not expert arithmetic. Both devices are live
+// before capture, and a graph must reject any layer owned by the other stage.
+static void CheckPipelineMailbox(std::vector<Data *> *weights) {
+    const int hidden = weights[0][2]->dims[1], topk = 6;
+    const int experts = weights[0].size() / 2 - 1;
+    FastllmCudaReleaseMoeCache(weights[0].data(), weights[0].size());
+    FastllmCudaMoeCacheLayer layers[2];
+    for (int d = 0; d < 2; ++d)
+        layers[d] = {weights[d].data(), int(weights[d].size()), true, 10.f, false, d};
+    Require(FastllmCudaPrepareMoeCache(layers, 2, [] {}), "PP cache preparation");
+    for (int d = 0; d < 2; ++d) {
+        Check(cudaSetDevice(d));
+        void *scope = FastllmCudaBeginMoeDecode(weights[d].data(), weights[d].size(), topk);
+        Require(scope, "PP initial scope"); FastllmCudaEndMoeDecode(scope);
+    }
+    int checks = 0;
+    for (int rows : {1, 2, 6, 9, 32}) for (int device : {0, 1, 0}) {
+        Check(cudaSetDevice(device));
+        Data input(BFLOAT16, {rows, hidden}), ids(INT32, {rows, topk});
+        Data scores(FLOAT32, {rows, topk}), output(BFLOAT16, {rows, hidden});
+        for (auto *p : {&input, &ids, &scores, &output}) {
+            p->dataDevice = DataDevice::CUDA; p->dataDeviceIds = {device}; p->Allocate(false);
+        }
+        cudaGraph_t shared; cudaGraphNode_t empty;
+        Check(cudaGraphCreate(&shared, 0)); Check(cudaGraphAddEmptyNode(&empty, shared, nullptr, 0));
+        void *child = nullptr;
+        Require(!FastllmCudaCreateNativeMoeFullGraph(input, ids, scores, output,
+            weights[1-device].data(), weights[1-device].size(), 1-device, shared, &child) && !child,
+            "PP graph accepted another stage's cache");
+        void *handle = FastllmCudaCreateNativeMoeFullGraph(input, ids, scores, output,
+            weights[device].data(), weights[device].size(), device, shared, &child);
+        Require(handle && child, "PP owned graph creation");
+        Check(cudaGraphDestroy(shared));
+        void *graph = nullptr, *exec = nullptr, *untimed = nullptr;
+        Require(FastllmCudaGraphCompose(const_cast<const void *const *>(&child), 1, &graph, &exec), "PP compose");
+        Require(FastllmCudaCreateNativeMoeReplayGraph(graph, &handle, 1, &untimed), "PP untimed compose");
+        for (int pass = 0; pass < 16; ++pass) {
+            std::vector<uint16_t> x(rows * hidden), reference(x.size()), actual(x.size());
+            std::vector<int32_t> selected(rows * topk), none(selected.size(), -1);
+            std::vector<float> scale(selected.size());
+            for (size_t i = 0; i < x.size(); ++i)
+                x[i] = Float32ToBFloat16RNEBits(float(int((i * 7 + pass * 13) % 61) - 30) / 32);
+            for (size_t i = 0; i < selected.size(); ++i) {
+                selected[i] = (pass * 7 + device * 3 + (i % topk) * 5 + i / topk) % experts;
+                scale[i] = i % 5 == 0 ? 0.f : float(i % 4 + 1) / 32;
+            }
+            if (pass % 3 == 1) for (int row = 0; row < rows; ++row) selected[row * topk + 1] = selected[row * topk + 2];
+            NumasMoeVerifyExperts(x.data(), reference.data(), rows, weights[device].data(), weights[device].size(),
+                selected.data(), none.data(), scale.data(), topk, device, 10, false);
+            Check(cudaMemcpy(input.cudaData, x.data(), x.size() * 2, cudaMemcpyHostToDevice));
+            Check(cudaMemcpy(ids.cudaData, selected.data(), selected.size() * 4, cudaMemcpyHostToDevice));
+            Check(cudaMemcpy(scores.cudaData, scale.data(), scale.size() * 4, cudaMemcpyHostToDevice));
+            void *scope = FastllmCudaBeginMoeDecode(weights[device].data(), weights[device].size(), topk);
+            Require(scope, "PP replay scope");
+            Require(FastllmCudaLaunchNativeMoeFullGraph(pass % 3 ? untimed : exec, &handle, 1, pass % 3 == 0), "PP replay");
+            FastllmCudaEndMoeDecode(scope);
+            Check(cudaMemcpy(actual.data(), output.cudaData, actual.size() * 2, cudaMemcpyDeviceToHost));
+            std::vector<float> a(x.size()), b(x.size());
+            for (size_t i = 0; i < x.size(); ++i) {
+                a[i] = __bfloat162float(*reinterpret_cast<__nv_bfloat16 *>(&actual[i]));
+                b[i] = __bfloat162float(*reinterpret_cast<__nv_bfloat16 *>(&reference[i]));
+            }
+            Compare(a, b, "PP mailbox / NUMA oracle mismatch"); ++checks;
+        }
+        FastllmCudaGraphExecDestroy(untimed); FastllmCudaGraphExecDestroy(exec); FastllmCudaGraphDestroy(graph);
+    }
+    Check(cudaSetDevice(0));
+    std::printf("PP_MAILBOX_GRAPH_PASS %d checks; rows 1/2/6/9/32, devices 0/1/0\n", checks);
+}
+
 int main(int argc, char **argv) {
     try {
         Require(prctl(PR_SET_DUMPABLE, 0) == 0, "disable test core dumps");
@@ -555,7 +625,7 @@ int main(int argc, char **argv) {
         std::printf("V4.1 cache weights: %s\n", fp8 ? "FP8 block128" : "NVFP4 block32");
         int devices = 0;
         Check(cudaGetDeviceCount(&devices));
-        Require(!dual || devices >= 2, "--dual requires two CUDA devices");
+        Require((!dual && !option("--pp-fullgraph")) || devices >= 2, "--dual requires two CUDA devices");
         unsetenv("FASTLLM_MOE_CUDA_CACHE_BYTES_0");
         unsetenv("FASTLLM_MOE_CUDA_CACHE_BYTES_1");
         unsetenv("FASTLLM_DSV41_MOE_CACHE_MODE");
@@ -1249,7 +1319,7 @@ int main(int argc, char **argv) {
             }
         }
         std::printf("VERIFY_PASS %d multirow CPU/GPU oracle checks\n", verifyChecks);
-        if ((option("--mailbox") || option("--fullgraph")) && !fp8 && !dual) {
+        if ((option("--fullgraph") || (option("--mailbox") && !fp8)) && !dual) {
             // Two GPU-dependent layers in one scope. Inputs, routes and scores
             // change between replays, while pointer tables go out of scope as
             // soon as submission returns. Compare every layer to NUMA arithmetic.
@@ -1374,7 +1444,8 @@ int main(int argc, char **argv) {
             std::printf("%s_CHAIN_PASS %d replays, %d dependent layer comparisons\n", full ? "FULL_GRAPH" : "MAILBOX", chainReplays, 2 * chainReplays);
         }
 
-        if (option("--verify-mailbox") && !fp8 && !dual) CheckVerifierMailbox(weights);
+        if (option("--verify-mailbox") && !dual) CheckVerifierMailbox(weights);
+        if (option("--pp-fullgraph")) CheckPipelineMailbox(weights);
         unsetenv("FASTLLM_DSV41_MOE_CACHE_PREFETCH");
         unsetenv("FASTLLM_DSV41_MOE_CACHE_GPU_EXPERTS");
         unsetenv("FASTLLM_DSV41_MOE_CACHE_MODE");

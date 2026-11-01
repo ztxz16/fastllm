@@ -49,6 +49,7 @@ namespace fastllm {
         std::function<void()> releaseSharedScratch;
         std::mutex *pipelineHostExperts = nullptr;
         int pipelineFirstLayer = -1;
+        bool residentGraph = false; // Validated resident routed backend; routes stay on CUDA.
         bool parallelShared = false;  // Set only after resident graph buffers pass validation.
         std::function<void()> joinSharedSegment;
     };

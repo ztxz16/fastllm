@@ -296,11 +296,12 @@ namespace fastllm {
         ExecutionMode executionMode = ExecutionMode::Cpu;
         bool v41MoeCudaGraphCompatible = true;
         void InitExecutionMode();
-        void BeginHybridMoeStep(HybridMoeDecodeStep &, bool tp, bool single, int seqlen, int firstLayer = -1);
+        void BeginHybridMoeStep(HybridMoeDecodeStep &, bool tp, bool single, int seqlen, int firstLayer = -1, int endLayer = -1);
         bool RunGpuMoe(DeepSeekV41MoeContext &);
         bool RunHybridMoe(DeepSeekV41MoeContext &, HybridMoeDecodeStep *);
         bool moeExpertCacheAttempted = false;
         std::vector<int> hybridMoeDevices;
+        bool hybridMoeStageOwned = false;
         // Source FP8/FP4 linears still require block-32 FP8 activations after
         // their weights have been decoded into the requested storage dtype.
         std::set<std::string> quantizedLinearNames;

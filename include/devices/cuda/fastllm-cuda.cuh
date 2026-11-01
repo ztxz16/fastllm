@@ -163,6 +163,9 @@ void FastllmCudaStreamWaitEvent(void *stream, void *event);
 void FastllmCudaCurrentThreadStreamWaitEvent(void *event);
 
 bool FastllmCudaGraphBeginCapture();
+// Register a stream joined to an existing capture by a cross-device event.
+// Its temporary allocations must be retained by the same graph memory pool.
+bool FastllmCudaGraphJoinCapture();
 // Resolve per-device process-lifetime graph sentinels before any stream in a
 // multi-GPU capture has begun. Calling cudaMalloc after the first rank starts
 // capture invalidates that rank even when the allocation targets another GPU.
@@ -2754,6 +2757,13 @@ extern "C" bool FastllmCudaTritonMxfp4Grouped(
     const fastllm::Data &input, fastllm::Data &activation,
     const unsigned char *records, const int *slots, const int *routes,
     const float *scores, float *output, void *scratch, int count, bool planar = false);
+
+// Return the owning cache only when a complete layer can use a native child
+// at the requested row count. Equal non-null owners can share one launch.
+void *FastllmCudaNativeMoeGraphOwner(fastllm::Data **weights, int count, int rows);
+bool FastllmCudaGraphAppendChild(const void *child);
+// Release only after all parent graphs and executables referencing this child.
+void FastllmCudaReleaseNativeMoeFullGraph(void *handle);
 
 // Native single-GPU NUMA MoE child graph. The model keeps the source buffers
 // and weight objects alive; the cache owns the returned handle and graph.

@@ -1234,7 +1234,7 @@ bool NativeMailboxOwnsLayer(const OffloadGroup &group, const DeviceCache &cache,
             [&](int d) { return d >= 0 && d != cache.device; })) return true;
     // Serial PP: each complete layer has one immutable owner. It never borrows
     // another device's expert cache (unlike EP/cooperative GGUF execution).
-    return group.layout.deepSeekV41 && group.layout.weightType == fastllm::NVFP4_BLOCK_32_E8M0 &&
+    return group.layout.deepSeekV41 &&
         table >= 0 && table < int(group.cacheDevices.size()) && group.cacheDevices[table] == cache.device;
 }
 
@@ -1244,7 +1244,7 @@ bool CanOverlapNativeAdmissions(const OffloadGroup &group, const DeviceCache &ca
     if (!cache.nativeMailbox || !group.expertDevices.empty() || group.tensorParallelRequested ||
         cache.prefillOwnerCount != 1) return false;
     if (group.deviceCaches.size() == 1) return true;
-    if (!group.layout.deepSeekV41 || group.layout.weightType != fastllm::NVFP4_BLOCK_32_E8M0 ||
+    if (!group.layout.deepSeekV41 ||
         group.cacheDevices.size() != group.tableKeys.size() || cache.layerSlots.size() != group.tableKeys.size())
         return false;
     for (int l = 0; l < int(group.tableKeys.size()); ++l)
@@ -1339,10 +1339,18 @@ DeviceCache *GetDeviceCache(OffloadGroup &group, bool waitForAdmission = true) {
     if (budgetBytes == 0 && !streamOnly) return nullptr;
     size_t slots = RequestedSlots(
         group.layout.recordStride, group.totalRecords, budgetBytes);
-    if (!streamOnly && !ppPlacement && slots < kMaxTopK) {
+    // Hybrid V4.1 uses separate upload rings for misses. Its resident cache
+    // may hold fewer than top-k experts (e.g. a budget-shared draft group);
+    // absent routes go to CPU/staging and never evict an in-flight resident.
+    const char *requestedMode = std::getenv("FASTLLM_DSV41_MOE_CACHE_MODE");
+    const bool smallHybridCache = group.layout.deepSeekV41 && group.cpuDecodeReady &&
+        group.expertDevices.empty() && !group.tensorParallelRequested &&
+        !(requestedMode && std::strcmp(requestedMode, "gpu") == 0);
+    const size_t minimumSlots = smallHybridCache && !ppPlacement ? 1 : kMaxTopK;
+    if (!streamOnly && !ppPlacement && slots < minimumSlots) {
         std::fprintf(stderr,
             "[Fastllm] CUDA expert cache needs at least %d slots; "
-            "requested %zu.\n", kMaxTopK, slots);
+            "requested %zu.\n", int(minimumSlots), slots);
         return nullptr;
     }
 
@@ -1380,7 +1388,7 @@ DeviceCache *GetDeviceCache(OffloadGroup &group, bool waitForAdmission = true) {
             cache.prefillOwnerRank) / cache.prefillOwnerCount;
         slotPlan = fastllm::cuda::PlanDeviceCacheSlots(strides,
             group.expertDevices.empty() ? group.cacheDevices : std::vector<int>{}, device, ownedExperts,
-            std::min(uint64_t(usableBytes), budgetBytes), kMaxTopK);
+            std::min(uint64_t(usableBytes), budgetBytes), minimumSlots);
         slots = slotPlan.offsets.size();
         cache.recordBytes = slotPlan.bytes;
         cache.layerSlots = slotPlan.layers;
@@ -1393,7 +1401,7 @@ DeviceCache *GetDeviceCache(OffloadGroup &group, bool waitForAdmission = true) {
         for (size_t slot = 0; slot < slots; ++slot)
             cache.hostSlotOffsets[slot] = slot * group.layout.recordStride;
     }
-    if (!streamOnly && slots < kMaxTopK) {
+    if (!streamOnly && slots < minimumSlots) {
         std::fprintf(stderr,
             "[Fastllm] CUDA expert cache has insufficient free GPU "
             "memory after reserving %.3f GiB for runtime allocations.\n",
@@ -4720,7 +4728,7 @@ static bool MergeMOEHybrid(const fastllm::Data &input,
             (group->layout.glm5 ? input.dataType != fastllm::DataType::BFLOAT16 || !NativeSharedRecords(*group) :
              input.dataType != fastllm::DataType::FLOAT32)) return false;
         auto *cache = GetDeviceCache(*group);
-        if (!cache) return false;
+        if (!cache || (cache->slots < kMaxTopK && !cache->frequencyActive)) return false;
         if (!devices && group->layout.glm5 && TryCooperativeMoe(*group, *cache, table,
                 input, index, score, output, weights, weightsBatch, layer, launchParallel)) return true;
         // Keep resident experts on GPU and dynamically split quantized misses
@@ -4744,6 +4752,9 @@ static bool MergeMOEHybrid(const fastllm::Data &input,
     auto *cache = GetDeviceCache(*group);
     const auto &layout = group->LayerLayout(tableId);
     auto *frequency = cache->frequencyActive ? cache->frequency.get() : nullptr;
+    // The legacy demand-refill path needs a complete route-sized cache. A
+    // smaller hybrid cache is valid only with its separate staging policy.
+    if (!frequency && cache->slots < kMaxTopK) return false;
     if (!frequency && cache->decode && cache->decode->policy.UseGpu()) return false;
     const bool scoredBfloat = layout.deepSeekV41 || layout.glm5;
     if (scoredBfloat != (input.dataType == fastllm::DataType::BFLOAT16)) return false;
@@ -5424,6 +5435,38 @@ extern "C" bool fastllm_moe_cuda_cache_prefill_stats(int device, uint64_t *value
     return ok;
 }
 
+void *FastllmCudaNativeMoeGraphOwner(fastllm::Data **weights, int weightsBatch, int rows) {
+#if defined(USE_NUMAS) && !defined(USE_ROCM) && CUDART_VERSION >= 11070
+    const char *mode = std::getenv("FASTLLM_DSV41_MOE_CACHE_MODE");
+    if ((mode && std::strcmp(mode, "gpu") == 0) || rows < 1 || rows > kNativeMoeMaxRows ||
+        FastllmCudaGraphIsCapturingFast()) return nullptr;
+    int table = -1;
+    auto *group = FindHybridGroup(weights, weightsBatch, &table);
+    if (!group || !group->cpuDecodeReady || !group->expertDevices.empty() ||
+        group->tensorParallelRequested) return nullptr;
+    const auto &layout = group->LayerLayout(table);
+    const bool supportedGGUF = layout.weightType == fastllm::DATA_GGUF_FORMAT &&
+        FastllmCudaV41GGUFSupported(layout.gateGgmlType, layout.downGgmlType) &&
+        FastllmCudaV41CanonicalGGUFCacheWorkspaceBytes(layout.hidden, layout.inter) != 0;
+    if (!layout.deepSeekV41 ||
+        (layout.weightType != fastllm::NVFP4_BLOCK_32_E8M0 &&
+         layout.weightType != fastllm::FP8_E4M3_BLOCK_128 && !supportedGGUF)) return nullptr;
+    auto *cache = GetDeviceCache(*group, true);
+    if (!cache || !NativeMailboxOwnsLayer(*group, *cache, table)) return nullptr;
+    return cache;
+#else
+    return nullptr;
+#endif
+}
+
+void FastllmCudaReleaseNativeMoeFullGraph(void *handle) {
+#if defined(USE_NUMAS) && !defined(USE_ROCM) && CUDART_VERSION >= 11070
+    if (!handle) return;
+    auto *layer = static_cast<NativeMoeMailbox::Layer *>(handle);
+    layer->owner->ReleaseFull(layer);
+#endif
+}
+
 void *FastllmCudaCreateNativeMoeFullGraph(const fastllm::Data &input, const fastllm::Data &index,
         const fastllm::Data &score, fastllm::Data &output, fastllm::Data **weights, int weightsBatch,
         int layer, const void *sharedGraph, void **graph) {
@@ -5435,7 +5478,7 @@ void *FastllmCudaCreateNativeMoeFullGraph(const fastllm::Data &input, const fast
     const char *mode = std::getenv("FASTLLM_DSV41_MOE_CACHE_MODE");
     if (mode && std::strcmp(mode, "gpu") == 0) return nullptr;
     const std::vector<int> device{FastllmCudaGetDevice()};
-    if (!sharedGraph || FastllmCudaGraphIsCapturingFast() ||
+    if (FastllmCudaGraphIsCapturingFast() ||
         !PackedCacheRows(input) || !PackedCacheRows(index) || !PackedCacheRows(score) ||
         !input.cudaData || input.dataDevice != fastllm::CUDA ||
         index.dataDevice != fastllm::CUDA || score.dataDevice != fastllm::CUDA ||
@@ -5447,18 +5490,11 @@ void *FastllmCudaCreateNativeMoeFullGraph(const fastllm::Data &input, const fast
         score.dims != index.dims || score.dataType != fastllm::FLOAT32 ||
         !index.cudaData || !score.cudaData ||
         index.dims.back() < 1 || index.dims.back() > kMaxTopK) return nullptr;
+    auto *cache = static_cast<DeviceCache *>(FastllmCudaNativeMoeGraphOwner(weights, weightsBatch, input.dims[0]));
+    if (!cache) return nullptr;
     int table = -1;
     auto *group = FindHybridGroup(weights, weightsBatch, &table);
-    if (!group || !group->cpuDecodeReady || !group->expertDevices.empty() ||
-        group->tensorParallelRequested) return nullptr;
-    const auto &layout = group->LayerLayout(table);
-    const bool supportedGGUF = layout.weightType == fastllm::DATA_GGUF_FORMAT &&
-        FastllmCudaV41GGUFSupported(layout.gateGgmlType, layout.downGgmlType) &&
-        FastllmCudaV41CanonicalGGUFCacheWorkspaceBytes(layout.hidden, layout.inter) != 0;
-    if (!layout.deepSeekV41 || input.dims[1] != layout.hidden ||
-        (layout.weightType != fastllm::NVFP4_BLOCK_32_E8M0 && !supportedGGUF)) return nullptr;
-    auto *cache = GetDeviceCache(*group, false);
-    if (!cache || !cache->frequency || !NativeMailboxOwnsLayer(*group, *cache, table)) return nullptr;
+    if (!group || !cache->frequency || input.dims[1] != group->LayerLayout(table).hidden) return nullptr;
     if (!cache->nativeMailbox) cache->nativeMailbox = std::make_shared<NativeMoeMailbox>(*group, *cache);
     auto *handle = cache->nativeMailbox->CreateFull(table, input, index, score, output,
         weights, weightsBatch, layer, reinterpret_cast<cudaGraph_t>(const_cast<void *>(sharedGraph)));

@@ -929,6 +929,14 @@ bool FastllmCudaGraphBeginCapture() {
     return ok;
 }
 
+bool FastllmCudaGraphJoinCapture() {
+    if (!FastllmCudaGraphIsCapturing()) return false;
+    if (fastllmCudaGraphPoolPhase.load(std::memory_order_acquire) ==
+            FASTLLM_CUDA_GRAPH_POOL_CAPTURING)
+        FastllmCudaGraphRegisterCurrentCapture();
+    return !FastllmCudaGetThreadError();
+}
+
 bool FastllmCudaGraphPrepareCaptureDevice() {
     return FastllmCudaGraphSetError(
         "prepare allocation-failure placeholder",
@@ -25034,4 +25042,25 @@ extern "C" bool FastllmCudaGraphCompose(const void *const *children, int count,
     *outGraph = graph;
     *outExec = exec;
     return true;
+}
+
+// Insert a prepared child at the current stream's exact dependency frontier.
+// The child owns no host callbacks; its caller arms any CPU mailbox at replay.
+bool FastllmCudaGraphAppendChild(const void *child) {
+#if CUDART_VERSION >= 11030
+    if (!child) return false;
+    cudaStreamCaptureStatus status;
+    cudaGraph_t graph = nullptr;
+    const cudaGraphNode_t *deps = nullptr;
+    size_t count = 0;
+    cudaGraphNode_t node = nullptr;
+    if (cudaStreamGetCaptureInfo(cudaStreamPerThread, &status, nullptr, &graph, &deps, &count) != cudaSuccess ||
+        status != cudaStreamCaptureStatusActive) return false;
+    if (cudaGraphAddChildGraphNode(&node, graph, deps, count,
+            reinterpret_cast<cudaGraph_t>(const_cast<void *>(child))) != cudaSuccess) return false;
+    return cudaStreamUpdateCaptureDependencies(cudaStreamPerThread, &node, 1,
+        cudaStreamSetCaptureDependencies) == cudaSuccess;
+#else
+    return false;
+#endif
 }

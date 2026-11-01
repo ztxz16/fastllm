@@ -2369,12 +2369,17 @@ namespace fastllm {
     DeepSeekV41Model::~DeepSeekV41Model() {
         ShutdownRuntime();
         DsparkReportStats();
-        ReleaseMoeCudaCache(weights);
-        ReleaseMoeCudaCache(v41DsparkMoeWeights);
+        // Request-owned draft children borrow their MoE cache owner. Retire
+        // those graphs before releasing the caches, including both state keys.
         {
             std::lock_guard<std::mutex> guard(v41StateMutex);
             v41States.clear();
+            v41StatesByFirstKey.clear();
+            v41PendingRestoredState.reset();
         }
+        v41CudaGraphSlots.clear();
+        ReleaseMoeCudaCache(weights);
+        ReleaseMoeCudaCache(v41DsparkMoeWeights);
         engramTables.clear();
     }
 
@@ -5179,7 +5184,8 @@ namespace fastllm {
         if (work->model.executionMode == ExecutionMode::Hybrid) {
             work->moeStep.emplace();
             work->model.BeginHybridMoeStep(*work->moeStep, work->tp, work->single, work->seqlen,
-                work->pipeline ? work->pipeline->firstLayer : -1);
+                work->pipeline ? work->pipeline->firstLayer : -1,
+                work->pipeline ? work->pipeline->endLayer : -1);
         }
     }
     void DeepSeekV41Model::ForwardState::GpuExperts(int layer) {
@@ -5250,6 +5256,39 @@ namespace fastllm {
     void DeepSeekV41Model::ForwardState::HybridExperts(int layer) {
         auto ctx=work->model.MakeForwardMoeContext(*work, layer);
 #ifdef USE_CUDA
+        // Keep the hybrid backend's FP32 sum/shared rounding unchanged. Only
+        // remove host route staging once the resident CUDA backend is ready.
+        const auto moeDevice = work->model.SelectMoeDeviceForLayer(layer);
+        const auto mainDevice = SelectDeviceFromMap(work->model.deviceMap, layer + 1,
+                                                   work->model.block_cnt);
+        ctx.residentGraph = work->graphActive && !work->tp && work->cudaRouteCapturable &&
+            V41DeviceSpecUsesType(moeDevice, "cuda") &&
+            V41DeviceSpecUsesType(mainDevice, "cuda") &&
+            work->ws->ffnInput.dataType == DataType::BFLOAT16 &&
+            ctx.moeWeights.size() > 2 && FastllmCudaV41MoeGraphReady(
+                ctx.moeWeights[2], work->seqlen, work->model.num_experts_per_tok);
+        const int residentIndex = kV41GraphSegmentsPerLayer * layer + 3;
+        if (work->graphReplay) {
+            const bool captured = work->graphState->segments[residentIndex].containsGpuMoe;
+            if (captured && !ctx.residentGraph) work->model.GiveUpForwardGraph(*work, "resident MoE buffers");
+            if (!captured) ctx.residentGraph = false;
+        }
+        if (ctx.residentGraph) {
+            work->captureGpuMoeTogether = true;
+            work->model.RunForwardGraphSegment(*work, [&] {
+                work->combineFfnPostDispatch = work->model.RunHybridMoe(ctx, nullptr);
+                work->model.EndForwardLayer(*work, layer);
+            }, residentIndex, true,
+            [](DeepSeekV41GraphSegmentMeta &meta) { meta.containsGpuMoe = true; },
+            [&](const DeepSeekV41GraphSegmentMeta &) {
+                work->ws->ffnOut.Reshape(work->ffnDims);
+                std::swap(work->curHidden, work->nextHidden);
+                work->preMixPtr = &work->ws->ffnPre;
+            });
+            work->endedLayerInGraph = layer;
+            work->captureGpuMoeTogether = false;
+            return;
+        }
         // Only replay an established, independent shared-expert graph. Eager,
         // capture, TP and diagnostic paths retain their existing ordering.
         const int sharedIndex = kV41GraphSegmentsPerLayer * layer + 3;

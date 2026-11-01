@@ -378,10 +378,7 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
     if (batch < 1 || batch > (verifying ? (hybrid ? 32 : 8) : 16) || (!hybrid && executionMode != ExecutionMode::Gpu) ||
         (!verifying && v41DsparkEnabled) ||
         (!hybrid && (kvCacheDataType == DataType::FP8_E4M3 || kvCacheDataType == DataType::FP4_E2M1)) ||
-        (!verifying && !v41CudaGraphWarmingUp) || head_dim_full != 512 || hc_mult != 4 || index_head_dim != 128 ||
-        (weight["head.weight"].dataType != DataType::FLOAT32 &&
-         (!hybrid || (weight["head.weight"].dataType != DataType::BFLOAT16 &&
-                      weight["head.weight"].dataType != DataType::DATA_GGUF_FORMAT))))
+        (!verifying && !v41CudaGraphWarmingUp) || head_dim_full != 512 || hc_mult != 4 || index_head_dim != 128)
         return;
     // Explicit reference/debug modes must retain their selected arithmetic.
     if (V41DecodeCudaGraphReplayMask() != 15 || V41EnvFlag("FASTLLM_DSV41_DISABLE_FAKE_QUANT") ||
@@ -399,9 +396,17 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
     for (int i = firstLayer * 4; i < endLayer * 4; ++i)
         if (state->segments[i].passthrough || state->segments[i].graphs.size() != state->devices.size())
             return;
-    for (int layer = firstLayer; layer < endLayer; ++layer)
-        if ((!hybrid && !state->segments[layer * 4 + 3].containsGpuMoe) ||
+    for (int layer = firstLayer; layer < endLayer; ++layer) {
+        const bool capturedMoe = state->segments[layer * 4 + 3].containsGpuMoe;
+        const auto moeDevice = SelectMoeDeviceForLayer(layer);
+        const bool hostMoe = V41DeviceSpecUsesType(moeDevice, "numa") || moeDevice == "cpu";
+        // A GPU expert placed on a different PP device is not a host-cache
+        // layer. Reject before warming any child or changing captured operands.
+        // Its ordinary peer transfer and remote compute remain segmented.
+        if ((!hybrid && !capturedMoe) ||
+            (hybrid && !capturedMoe && !hostMoe) ||
             state->segments[layer * 4].kvOutputs.size() != state->devices.size()) return;
+    }
     if (!hybrid) for (auto &table : engramTables)
         if (!std::static_pointer_cast<V41EngramTable>(table)->gpuTable) return;
     auto g = std::make_shared<V41FullGraph>();
@@ -759,14 +764,15 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
                                     "full graph attention failed");
                 });
             });
+            const bool hostMoe = hybrid && !state->segments[l * 4 + 3].containsGpuMoe;
             if (hybrid) {
                 hcJoin.back() = children[0].size();
-                hcStart.push_back(children[0].size()); hcJoin.push_back(-1);
+                if (hostMoe) { hcStart.push_back(children[0].size()); hcJoin.push_back(-1); }
             }
-            for (int piece = 1; piece < (hybrid ? 3 : 4); ++piece)
+            for (int piece = 1; piece < (hostMoe ? 3 : 4); ++piece)
                 for (size_t rank = 0; rank < children.size(); ++rank)
                     children[rank].push_back(state->segments[l * 4 + piece].graphs[rank]);
-            if (hybrid) {
+            if (hostMoe) {
                 auto routed = weights[l]; routed[0] = routed[1] = nullptr;
                 Data input;
                 input.FakeFrom(ws.ffnInput, 0); input.Resize({batch, embed_dim});
@@ -791,18 +797,23 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
         }
         if (endLayer == block_cnt) capture([&] {
             V41HcApplyPre(ws.hiddenStates, ws.ffnPre, g->head);
-            V41RMSNormBF16(g->head, weight["norm.weight"], rms_norm_eps, g->norm);
             weight["head.weight"].tpLinearType = TP_LINEAR_ROW;
-            if (weight["head.weight"].dataType == DataType::DATA_GGUF_FORMAT) {
-                // Match the existing GGUF head boundary: BF16 projection,
-                // then FP32 logits. Separate buffers keep both addresses
-                // stable across warmup and capture.
+            const bool compactHead = weight["head.weight"].dataType == DataType::FLOAT32 ||
+                (weight["head.weight"].dataType == DataType::BFLOAT16 &&
+                 !quantizedLinearNames.count("head.weight"));
+            if (verifying || !compactHead) {
+                // Preserve the ordinary quantized-head / verifier boundary.
+                // mHC may produce FP32; forcing BF16 here changes GGUF logits.
+                RMSNorm(g->head, weight["norm.weight"], rms_norm_eps, g->norm);
                 if (verifying) DsparkProjectHead(g->norm, g->headLogits);
                 else Linear(g->norm, weight["head.weight"], *GetEmptyData(), g->headLogits);
                 ToDataType(g->headLogits, g->logits, DataType::FLOAT32);
-            } else if (!TryBFloat16HeadLinear(g->norm, g->logits)) {
-                ToDataType(g->norm, g->normFloat, DataType::FLOAT32);
-                Linear(g->normFloat, weight["head.weight"], *GetEmptyData(), g->logits);
+            } else {
+                V41RMSNormBF16(g->head, weight["norm.weight"], rms_norm_eps, g->norm);
+                if (!TryBFloat16HeadLinear(g->norm, g->logits)) {
+                    ToDataType(g->norm, g->normFloat, DataType::FLOAT32);
+                    Linear(g->normFloat, weight["head.weight"], *GetEmptyData(), g->logits);
+                }
             }
             if (verifying && !g->tensorParallel) {
                 g->gatheredLogits.CopyFrom(g->logits);
@@ -850,7 +861,7 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
                                          &g->graphs[rank], &g->execs[rank]))
                 throw std::runtime_error("full graph composition failed");
         }
-        if (hybrid && !FastllmCudaCreateNativeMoeReplayGraph(g->graphs[0], g->moeHandles.data(),
+        if (!g->moeHandles.empty() && !FastllmCudaCreateNativeMoeReplayGraph(g->graphs[0], g->moeHandles.data(),
                 g->moeHandles.size(), &g->untimedExec))
             throw std::runtime_error("full graph timing removal failed");
         if (verifying) {
@@ -936,7 +947,7 @@ bool DeepSeekV41Model::TryFullDecodeGraph(ForwardWorkspace &f, bool inputsPrepar
     }
     if (!f.graphState->fullDecode) return false;
     auto g = std::static_pointer_cast<V41FullGraph>(f.graphState->fullDecode);
-    if (g->hybrid && (!f.moeStep || !*f.moeStep)) return false;
+    if (!g->moeHandles.empty() && (!f.moeStep || !*f.moeStep)) return false;
     V41FullCallerAffinity affinity(g->coordinatorCpus);
     if (g->capturesInput) {
         if ((int)f.tokenIds.size() != g->batch) return false;
@@ -985,7 +996,7 @@ bool DeepSeekV41Model::TryFullDecodeGraph(ForwardWorkspace &f, bool inputsPrepar
             std::this_thread::yield();
         if (std::all_of(uploaded.begin(), uploaded.end(), [](int v) { return v == 1; })) {
             void *exec = timed ? g->execs[rank] : g->untimedExec;
-            const bool success = g->hybrid
+            const bool success = !g->moeHandles.empty()
                 ? FastllmCudaLaunchNativeMoeFullGraph(exec, g->moeHandles.data(), g->moeHandles.size(), timed)
                 : FastllmCudaGraphLaunch(exec);
             ok[rank] = success ? 1 : -1;

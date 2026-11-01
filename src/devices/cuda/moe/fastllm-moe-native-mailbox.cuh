@@ -508,7 +508,7 @@ struct NativeMoeMailbox {
             gate.FakeFrom(w.gate, size_t(base) * layout.inter * 2); gate.Resize({rows*w.topk, layout.inter});
             FastllmCudaMoeGGUFCacheView view{};
             view.records = records; view.routeSlots = const_cast<int32_t *>(slots + base);
-            view.routeMap = w.routeMap + base; view.routeCount = rows * w.topk;
+            view.routeMap = w.routeMap ? w.routeMap + base : nullptr; view.routeCount = rows * w.topk;
             if (!ComputeBatchExperts(input, gate, dummy, layout, view, scores + base,
                     w.topk, w.partial + size_t(base) * w.hidden, true)) return false;
         }
@@ -605,7 +605,7 @@ struct NativeMoeMailbox {
     Layer *CreateFull(int table, const fastllm::Data &input, const fastllm::Data &index,
             const fastllm::Data &score, fastllm::Data &output, fastllm::Data **weights,
             int weightsBatch, int layer, cudaGraph_t sharedGraph) {
-        if (failed || !sharedGraph) return nullptr;
+        if (failed) return nullptr;
         Finish(true);
         const auto &layout = group.LayerLayout(table);
         const int topk = index.dims.back();
@@ -643,8 +643,9 @@ struct NativeMoeMailbox {
             const cudaGraphNode_t *deps = nullptr;
             size_t count = 0;
             cudaGraphNode_t shared = nullptr;
-            if (cudaStreamGetCaptureInfo(cudaStreamPerThread, &status, nullptr, &graph, &deps, &count) != cudaSuccess ||
-                cudaGraphAddChildGraphNode(&shared, graph, nullptr, 0, sharedGraph) != cudaSuccess) return false;
+            if (sharedGraph &&
+                (cudaStreamGetCaptureInfo(cudaStreamPerThread, &status, nullptr, &graph, &deps, &count) != cudaSuccess ||
+                 cudaGraphAddChildGraphNode(&shared, graph, nullptr, 0, sharedGraph) != cudaSuccess)) return false;
             if (!FastllmCudaDeepSeekV41QuantizeActivation(input, w.quantized)) return false;
             if (cudaEventRecordWithFlags(w.begin, cudaStreamPerThread, cudaEventRecordExternal) != cudaSuccess) return false;
             if (cudaStreamGetCaptureInfo(cudaStreamPerThread, &status, nullptr, &graph, &deps, &count) != cudaSuccess) return false;
@@ -652,7 +653,7 @@ struct NativeMoeMailbox {
             if (layout.weightType == fastllm::DATA_GGUF_FORMAT) {
                 if (!ComputeGGUF(w, layout, cache.records, w.slots,
                         static_cast<const float *>(score.cudaData), true)) return false;
-            } else if (w.rows > 1) {
+            } else if (w.rows > 1 || layout.weightType == fastllm::FP8_E4M3_BLOCK_128) {
                 if (!ComputeBatch(w, layout, cache.records, w.slots, static_cast<const float *>(score.cudaData))) return false;
             } else Compute(w, layout, cache.records, w.slots, static_cast<const float *>(score.cudaData), cudaStreamPerThread, true);
             if (cudaEventRecordWithFlags(w.residentDone, cudaStreamPerThread, cudaEventRecordExternal) != cudaSuccess) return false;
@@ -699,7 +700,7 @@ struct NativeMoeMailbox {
             if (layout.weightType == fastllm::DATA_GGUF_FORMAT) {
                 if (!ComputeGGUF(w, layout, fullCopy->records, w.slots + w.routes,
                         static_cast<const float *>(score.cudaData), false)) return false;
-            } else if (w.rows > 1) {
+            } else if (w.rows > 1 || layout.weightType == fastllm::FP8_E4M3_BLOCK_128) {
                 if (!ComputeBatch(w, layout, fullCopy->records, w.slots + w.routes, static_cast<const float *>(score.cudaData))) return false;
             } else Compute(w, layout, fullCopy->records, w.slots + topk, static_cast<const float *>(score.cudaData), cudaStreamPerThread);
             if (cudaEventRecordWithFlags(w.done, cudaStreamPerThread, cudaEventRecordExternal) != cudaSuccess) return false;
@@ -717,6 +718,12 @@ struct NativeMoeMailbox {
         auto *handle = fresh.get();
         fullLayers.push_back(std::move(fresh));
         return handle;
+    }
+    void ReleaseFull(Layer *handle) {
+        Finish(true);
+        auto it = std::find_if(fullLayers.begin(), fullLayers.end(),
+            [handle](const std::unique_ptr<Layer> &layer) { return layer.get() == handle; });
+        if (it != fullLayers.end()) fullLayers.erase(it);
     }
     static bool StripTiming(cudaGraph_t graph, const std::vector<cudaEvent_t> &events) {
         // Batch-memop nodes have no CUDA Runtime node-type counterpart.
@@ -787,7 +794,8 @@ struct NativeMoeMailbox {
         std::deque<Request> requests;
         for (int i = 0; i < count; ++i)
             requests.push_back({static_cast<Layer *>(handles[i]),
-                static_cast<Layer *>(handles[i])->rows > 1 ? FastllmMoeRoutePhase::Verify : FastllmMoeRoutePhase::Decode});
+                routePhase != FastllmMoeRoutePhase::Unspecified ? routePhase :
+                (static_cast<Layer *>(handles[i])->rows > 1 ? FastllmMoeRoutePhase::Verify : FastllmMoeRoutePhase::Decode)});
         if (!dispatcher.joinable()) dispatcher = std::thread([this] { Run(); });
         {
             std::lock_guard<std::mutex> lock(mutex);
