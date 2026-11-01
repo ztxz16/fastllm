@@ -660,6 +660,7 @@ void CloverModel::Finish(ResponseContext *ctx) {
 
 void CloverModel::RunModelSpecificScheduler() {
     std::unique_lock<std::mutex> lock(dictLocker);
+    bool prefillTurn = false;
     while (!isFree) {
         std::vector<ResponseContext *> contexts;
         std::vector<std::shared_ptr<Request>> batch;
@@ -673,13 +674,31 @@ void CloverModel::RunModelSpecificScheduler() {
         }
         for (int id : aborted) RemoveResponseContext(id);
         if (contexts.empty()) { dictCV.wait(lock); continue; }
+        // Alternate prefill-only and decode-only phases. Each pending prompt
+        // advances by one bounded chunk; already-ready requests stay batched.
+        // Advancing all pending prompts together avoids fragmenting a burst
+        // of arrivals into many small decode batches. Admission is unchanged.
+        std::vector<size_t> prefill, decode;
+        for (size_t b = 0; b < contexts.size(); ++b) {
+            bool pending = !batch[b]->prefixChecked || batch[b]->prefilled < contexts[b]->currentTokens.size();
+            (pending ? prefill : decode).push_back(b);
+        }
+        bool runPrefill = !prefill.empty() && (prefillTurn || decode.empty());
+        const auto &selected = runPrefill ? prefill : decode;
+        prefillTurn = !runPrefill && !prefill.empty();
+        // Selection preserves handle order, so in-place compaction is safe.
+        for (size_t i = 0; i < selected.size(); ++i) {
+            size_t b = selected[i];
+            contexts[i] = contexts[b]; batch[i] = batch[b]; handles[i] = handles[b];
+        }
+        contexts.resize(selected.size()); batch.resize(selected.size()); handles.resize(selected.size());
         lock.unlock();
         std::vector<std::vector<int>> output(contexts.size());
         std::vector<std::string> errors(contexts.size());
         {
             std::lock_guard<std::mutex> forward(forwardLocker);
-            // Prefill stays chunked and independent. Once all requests are
-            // ready, their preview/verify MoE and head execute as one batch.
+            // This phase contains either bounded prefill chunks or ready
+            // decode requests. Non-speculative requests retain their fallback.
             bool ready = contexts.size() > 1;
             for (size_t b = 0; b < contexts.size(); ++b)
                 ready = ready && batch[b]->options.speculative && batch[b]->prefilled == contexts[b]->currentTokens.size();
