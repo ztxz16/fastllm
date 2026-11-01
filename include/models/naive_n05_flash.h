@@ -195,7 +195,7 @@ namespace fastllm {
         std::map<int, std::shared_ptr<void>> draftLinearGraphWorkspaces;
         struct DraftContext {
             int committed = 0;
-            Data prefixHidden; // Bounded prefill tail; never retained through speculative decode.
+            Data prefixHidden; // Logical prefill tail; backing belongs to the request workspace.
             std::vector<std::pair<Data, Data>> kv;
             std::shared_ptr<DraftWorkspace> workspace;
             Data proposalProbs{FLOAT32}; // Actual GPU proposal distributions, retained until verification.
@@ -273,6 +273,8 @@ namespace fastllm {
         std::vector<int> draftTargetLayers;
         std::map<const std::vector<std::pair<Data, Data>> *, std::shared_ptr<DraftContext>> draftContexts;
         std::shared_ptr<DraftContext> idleDraftContext;
+        std::vector<std::shared_ptr<DraftContext>> idleDraftContexts;
+        void PrepareDraftServingMemory(bool history);
 
     private:
         friend struct NaiveN05PrefixCacheTestAccess;
@@ -340,6 +342,9 @@ namespace fastllm {
         std::shared_ptr<FastllmCudaMimoEp8Mega> tpEp8MegaState;
         std::vector<std::shared_ptr<TargetWorkspace>> tpVerifyWorkspaces;
         std::vector<std::shared_ptr<TargetWorkspace>> tpBatchWorkspaces;
+        std::vector<std::shared_ptr<TargetWorkspace>> tpPrefillWorkspaces;
+        std::vector<Data> tpPrefillScores;
+        void PrepareTensorParallelMemory();
         std::vector<Data> tpDraftHeadInputs, tpDraftHeadLogits;
         Data tpDraftHeadOutput;
         struct DraftHeadState;

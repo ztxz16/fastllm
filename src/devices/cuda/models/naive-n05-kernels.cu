@@ -3393,7 +3393,7 @@ void FastllmCudaNaiveRestoreIndexerRows(fastllm::Data &indices, int ranks) {
 
 void FastllmCudaNaiveIndexer(const fastllm::Data &query, const fastllm::Data &weights,
                             const fastllm::Data &packedKeys, int heads, int dim,
-                            int queryStart, int topK, bool fp8Query, fastllm::Data &indices, bool peerKeys) {
+                            int queryStart, int topK, bool fp8Query, fastllm::Data &indices, bool peerKeys, fastllm::Data *scoreScratch) {
     using namespace fastllm;
     // Indexer quantization is defined on 128-element blocks. The score kernel
     // has a general head-count path, but a different block width is unsupported.
@@ -3427,7 +3427,7 @@ void FastllmCudaNaiveIndexer(const fastllm::Data &query, const fastllm::Data &we
             tileWeights.FakeFrom(weights, size_t(first) * heads * weights.unitSize);
             tileIndices.FakeFrom(indices, size_t(first) * topK * sizeof(int));
             FastllmCudaNaiveIndexer(tileQuery, tileWeights, packedKeys, heads, dim,
-                queryStart + first, topK, fp8Query, tileIndices, peerKeys);
+                queryStart + first, topK, fp8Query, tileIndices, peerKeys, scoreScratch);
             first += count;
         }
         return;
@@ -3435,7 +3435,8 @@ void FastllmCudaNaiveIndexer(const fastllm::Data &query, const fastllm::Data &we
     int stride = packedKeys.dims[2];
     bool decodeTopK = queries == 1 && heads == 16;
     int selectBlocks = decodeTopK ? CooperativeTopKBlocks(queryStart + 1, topK) : 0;
-    Data q, k, scores, positions;
+    Data q, k, localScores, positions;
+    Data &scores = scoreScratch ? *scoreScratch : localScores;
     Output(scores, decodeTopK ? INT32 : FLOAT32, {queries, keys});
     if (decodeTopK && !selectBlocks) Output(positions, INT32, {keys});
     IndexerTopKOutput topKOutput{(unsigned *)scores.cudaData, (int *)positions.cudaData};
@@ -3561,7 +3562,7 @@ static bool BalancedIndexerSupported(const fastllm::Data &query, const fastllm::
 // Return false before allocating/writing output for all other shapes.
 bool FastllmCudaNaiveBalancedIndexer(const fastllm::Data &query, const fastllm::Data &weights,
                                      const fastllm::Data &keys, int past, int rank, int ranks, bool fp8Query,
-                                     bool peerKeys, fastllm::Data &indices) {
+                                     bool peerKeys, fastllm::Data &indices, fastllm::Data *scoreScratch) {
 #ifdef FASTLLM_NAIVE_DSA_MMA
     using namespace fastllm;
     if (!BalancedIndexerSupported(query, weights, keys, past, rank, ranks, fp8Query, peerKeys) ||
@@ -3569,7 +3570,8 @@ bool FastllmCudaNaiveBalancedIndexer(const fastllm::Data &query, const fastllm::
     const int part = query.dims[1] / (2 * ranks), rows = part * 2, count = keys.dims[1];
     const int first = rank * part, second = query.dims[1] - (rank + 1) * part;
     const int start = past + first, gap = second - first - part;
-    Data q, scale, w, scores, encoded, offsets;
+    Data q, scale, w, localScores, encoded, offsets;
+    Data &scores = scoreScratch ? *scoreScratch : localScores;
     Output(q, BFLOAT16, {rows, 16, 128});
     Output(scale, FLOAT32, {rows, 16});
     Output(w, BFLOAT16, {rows, 16});
@@ -3604,7 +3606,7 @@ bool FastllmCudaNaiveBalancedIndexer(const fastllm::Data &query, const fastllm::
 }
 
 bool FastllmCudaNaiveBatchBalancedIndexer(const std::vector<FastllmNaivePrefillIndexerItem> &items, int rank, int ranks,
-                                          bool fp8Query, bool peerKeys) {
+                                          bool fp8Query, bool peerKeys, fastllm::Data *scoreScratch) {
 #ifdef FASTLLM_NAIVE_DSA_MMA
     using namespace fastllm;
     if (items.empty() || items.size() > 8 ||
@@ -3646,7 +3648,8 @@ bool FastllmCudaNaiveBatchBalancedIndexer(const std::vector<FastllmNaivePrefillI
         Output(*items[i].indices, INT32, {batch.entries[i].rows, 2048});
         batch.entries[i].output = (int *)items[i].indices->cudaData;
     }
-    Data q, scale, w, scores, encoded, offsets;
+    Data q, scale, w, localScores, encoded, offsets;
+    Data &scores = scoreScratch ? *scoreScratch : localScores;
     Output(q, BFLOAT16, {batch.rows, 16, 128});
     Output(scale, FLOAT32, {batch.rows, 16});
     Output(w, BFLOAT16, {batch.rows, 16});

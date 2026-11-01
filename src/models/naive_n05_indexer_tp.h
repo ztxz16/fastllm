@@ -12,7 +12,7 @@ namespace {
 // last shard's excess rows; each shard remains above the prefill dispatch gate.
 int RaggedIndexerRows(int length, int ranks) { return length / ranks + (length % ranks != 0); }
 void ScoreRaggedIndexer(const Data &query, const Data &weights, const Data &key, int past, int topK, bool fp8, int rank,
-                        int ranks, Data &gathered) {
+                        int ranks, Data &gathered, Data *scoreScratch = nullptr) {
     const int length = query.dims[1], rows = RaggedIndexerRows(length, ranks);
     const int heads = weights.dims.back(), width = query.dims.back();
     AssertInFastLLM(rows <= length && rank >= 0 && rank < ranks, "Invalid ragged Indexer partition.");
@@ -29,7 +29,7 @@ void ScoreRaggedIndexer(const Data &query, const Data &weights, const Data &key,
     localIndices.Resize({rows, topK});
     localIndices.FakeFrom(gathered, (size_t)rank * rows * topK * sizeof(int));
     // The chronological key view is local, including context-sharded caches.
-    FastllmCudaNaiveIndexer(localQ, localWeights, key, heads, width / heads, past + first, topK, fp8, localIndices);
+    FastllmCudaNaiveIndexer(localQ, localWeights, key, heads, width / heads, past + first, topK, fp8, localIndices, false, scoreScratch);
 }
 void CompactRaggedIndexer(const Data &gathered, int length, int ranks, Data &indices) {
     const int rows = RaggedIndexerRows(length, ranks), topK = gathered.dims.back();

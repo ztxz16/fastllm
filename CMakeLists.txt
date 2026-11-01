@@ -2363,6 +2363,10 @@ if (UNIT_TEST)
             set_tests_properties(naive_n05_kv_pool PROPERTIES
                 LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
                 PASS_REGULAR_EXPRESSION "KV POOL PASS")
+            add_test(NAME naive_n05_draft_prefill_tail COMMAND naive_n05_verify_graph_test 1 draft_prefill_tail)
+            set_tests_properties(naive_n05_draft_prefill_tail PROPERTIES
+                LABELS "cuda" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
+                PASS_REGULAR_EXPRESSION "DRAFT PREFILL TAIL PASS")
             foreach(NAIVE_KV_TYPE bf16 fp8)
                 add_test(NAME naive_n05_draft_prefix_${NAIVE_KV_TYPE}
                     COMMAND naive_n05_verify_graph_test 4 draft_prefix ${NAIVE_KV_TYPE})
@@ -2422,6 +2426,14 @@ if (UNIT_TEST)
                     COMMAND naive_n05_verify_graph_test 2 draft_batch merged ${NAIVE_DRAFT_TP_BLOCK})
                 set_tests_properties(naive_n05_draft_tp_batch_block${NAIVE_DRAFT_TP_BLOCK} PROPERTIES
                     LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240)
+            endforeach()
+            foreach(NAIVE_DRAFT_PREFIX_KV bf16 fp8)
+                add_test(NAME naive_n05_draft_tp_prefix_${NAIVE_DRAFT_PREFIX_KV}
+                    COMMAND naive_n05_verify_graph_test 4 draft_prefix ${NAIVE_DRAFT_PREFIX_KV})
+                set_tests_properties(naive_n05_draft_tp_prefix_${NAIVE_DRAFT_PREFIX_KV} PROPERTIES
+                    ENVIRONMENT "FASTLLM_DSPARK_TP=4" LABELS "cuda;multigpu"
+                    SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 300
+                    PASS_REGULAR_EXPRESSION "DSPARK PREFIX PASS")
             endforeach()
             add_test(NAME naive_n05_draft_tp8_large COMMAND naive_n05_verify_graph_test 8 draft_tp_large)
             add_test(NAME naive_n05_draft_tp8_wide COMMAND naive_n05_verify_graph_test 8 draft_tp_wide)

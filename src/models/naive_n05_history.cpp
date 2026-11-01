@@ -47,7 +47,11 @@ void NaiveN05FlashModel::OnResponseContextRemoved(ResponseContext *context) {
             std::cout << "[Naive DSpark] rounds=" << s.rounds << " proposed=" << s.proposed
                       << " accepted=" << s.accepted << " acceptance=" << (double)s.accepted / s.proposed
                       << " tokens_per_round=" << 1.0 + (double)s.accepted / s.rounds << std::endl;
-        if (s.workspace || !s.kv.empty()) idleDraftContext = std::move(draft->second);
+        if (s.workspace || !s.kv.empty()) {
+            if (idleDraftContext && idleDraftContexts.size() + 1 < (size_t)(maxBatch > 0 ? maxBatch : 512))
+                idleDraftContexts.push_back(std::move(idleDraftContext));
+            idleDraftContext = std::move(draft->second);
+        }
         draftContexts.erase(draft);
     }
 }

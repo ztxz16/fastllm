@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <set>
+#include <numeric>
 #ifdef USE_CUDA
 #include "devices/cuda/cudaworkspace.h"
 #include "devices/cuda/fastllm-cuda.cuh"
@@ -369,6 +370,85 @@ void NaiveN05FlashModel::PrepareTensorParallel() {
         indexDim == 128 && indexTopK == 2048 && FastllmCudaNaiveIndexerContextSupported(tpDevices)),
         "Indexer context_shard requires KVMem, the 16x128 FP8-query Indexer and CUDA SM80+ TP.");
     tpPrepared = true;
+#endif
+}
+
+void NaiveN05FlashModel::PrepareTensorParallelMemory() {
+#ifdef USE_CUDA
+    const char *serving = std::getenv("FASTLLM_CUDA_SERVING_WARMUP");
+    if (!serving || std::string(serving) != "1" || !draftEnabled || !tpPrepared ||
+        tpDevices.size() <= 1 || kvMemConfig.enabled || !tpKVPool.empty()) return;
+    const int batch = maxBatch > 0 ? maxBatch : 512;
+    const int contextLimit = contextPlan.effectiveLength > 0 ? std::min(max_positions, contextPlan.effectiveLength) : max_positions;
+    const int chunk = std::max(1, std::min(contextLimit, GetChunkedPrefillSize()));
+    const int verifyRows = std::max(1, draftTokens + 1);
+    const bool history = saveHistoryChat;
+    saveHistoryChat = false;
+    struct Restore { bool &value; bool saved; ~Restore() { value = saved; } } restore{saveHistoryChat, history};
+    // Balanced prefill caps at 512 MiB. The generic path caps at 256 MiB
+    // plus one partial 64-query tile at the configured context limit.
+    const size_t scoreBytes = std::max(size_t(512) << 20,
+        (size_t(256) << 20) + size_t(63) * contextLimit * sizeof(float));
+    tpPrefillScores.resize(tpDevices.size());
+    for (size_t rank = 0; rank < tpDevices.size(); ++rank) {
+        FastllmCudaSetDevice(tpDevices[rank]);
+        auto &scores = tpPrefillScores[rank];
+        scores.dataType = FLOAT32; scores.Resize({(int)(scoreBytes / sizeof(float))});
+        scores.ToDevice(DataDevice::CUDA, {tpDevices[rank]}, false); scores.Allocate(false);
+    }
+    printf("[Naive serving memory] preparing chunk %d, batch %d, verification rows %d before KV allocation.\n",
+        chunk, batch, verifyRows); fflush(stdout);
+    GenerationConfig config;
+    config.input_token_length = chunk; config.output_token_limit = verifyRows + 1;
+    config.top_k = weight["lm_head.weight"].dims[0]; config.temperature = 1.0f; config.top_p = 0.95f;
+    LogitsSelection selection; selection.cudaLogits = true;
+    std::vector<std::pair<Data, Data>> cache;
+    for (int layer = 0; layer < block_cnt; ++layer) cache.emplace_back(Data(kvCacheDataType), Data(kvCacheDataType));
+    std::vector<float> positions(chunk); std::iota(positions.begin(), positions.end(), 0.0f);
+    Data ids(FLOAT32, {1, chunk}, std::vector<float>(chunk, 1.0f));
+    Data pos(FLOAT32, {1, chunk}, positions);
+    TargetCapture capture; capture.collectHidden = true; capture.borrowOutputs = true;
+    ForwardTensorParallel(ids, pos, cache, config, &capture, &selection);
+    cache.clear(); capture.hidden.clear();
+    std::vector<std::pair<Data, Data>> roots;
+    roots.reserve((size_t)batch * block_cnt);
+    for (int i = 0; i < batch * block_cnt; ++i) roots.emplace_back(Data(kvCacheDataType), Data(kvCacheDataType));
+    std::vector<std::pair<Data *, Data *>> pointers;
+    for (auto &root : roots) pointers.emplace_back(&root.first, &root.second);
+    config.input_token_length = 2;
+    // Reserve a complete SWA ring plus candidates even for this short prompt.
+    // Otherwise warmup misses the shared dynamic-cache verification workspace.
+    config.output_token_limit = std::max(config.output_token_limit, window + verifyRows);
+    std::vector<GenerationConfig> configs(batch, config);
+    std::vector<int> lengths(batch, 2);
+    TargetBatch target{pointers, configs, lengths, block_cnt};
+    ids.CopyFrom(Data(FLOAT32, {1, batch * 2}, std::vector<float>(batch * 2, 1.0f)));
+    positions.resize(batch * 2);
+    for (int i = 0; i < batch * 2; ++i) positions[i] = i % 2;
+    pos.CopyFrom(Data(FLOAT32, {1, batch * 2}, positions));
+    ForwardTensorParallel(ids, pos, cache, config, &capture, &selection, &target);
+    lengths.assign(batch, verifyRows);
+    ids.CopyFrom(Data(FLOAT32, {1, batch * verifyRows}, std::vector<float>(batch * verifyRows, 1.0f)));
+    positions.resize(batch * verifyRows);
+    for (int i = 0; i < batch * verifyRows; ++i) positions[i] = 2 + i % verifyRows;
+    pos.CopyFrom(Data(FLOAT32, {1, batch * verifyRows}, positions));
+    capture.verifying = true;
+    ForwardTensorParallel(ids, pos, cache, config, &capture, &selection, &target);
+    // Query-by-key Indexer scratch is the only large verification buffer
+    // whose capacity depends on context instead of batch/draft length.
+    if (tpBatchVerifyStorage) for (size_t rank = 0; rank < tpDevices.size(); ++rank) {
+        FastllmCudaSetDevice(tpDevices[rank]);
+        auto &scores = tpBatchVerifyStorage->ranks[rank]->storage->buffers.decode.indexScores;
+        scores.dataType = INT32; scores.UpdateUnitSize();
+        scores.Resize({batch * verifyRows, (int)std::min<int64_t>(max_positions, ((int64_t)contextLimit + 4095) / 4096 * 4096)});
+        scores.ToDevice(DataDevice::CUDA, {tpDevices[rank]}, false); scores.Allocate(false);
+    }
+    for (auto &graph : tpBatchVerifyGraphs) graph->ClearGraphs();
+    roots.clear(); capture.hidden.clear();
+    PrepareDraftServingMemory(history);
+    for (int device : tpDevices) { FastllmCudaSetDevice(device); ForceDeviceSync(); }
+    printf("[Naive serving memory] prefill, verification and draft workspaces prepared; sizing KV from remaining memory.\n");
+    fflush(stdout);
 #endif
 }
 
@@ -1400,7 +1480,7 @@ Data NaiveN05FlashModel::ForwardSingleGPU(int rank, const Data &inputIds, const 
     // Generic operators can move their inputs. Give every worker its own IDs.
     Data localIds(inputIds), localPositions(positions);
     TargetWorkspace *workspace = batch ? tpBatchWorkspaces.at(rank).get() : capture && capture->verifying
-        ? tpVerifyWorkspaces.at(rank).get() : nullptr;
+        ? tpVerifyWorkspaces.at(rank).get() : tpPrefillWorkspaces.at(rank).get();
     Data logits = RunTarget(localIds, localPositions, kv, config, capture, rank, embedding, workspace, batch);
     if (candidateResult && !isIntermediateChunkedPrefill) {
         Data partial, top;
@@ -1426,6 +1506,9 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
 #ifdef USE_CUDA
     auto *trace = inference_trace::CurrentForward();
     PrepareTensorParallel();
+    if (tpPrefillWorkspaces.empty())
+        for (size_t rank = 0; rank < tpDevices.size(); ++rank)
+            tpPrefillWorkspaces.emplace_back(new TargetWorkspace());
     if (trace) trace->ranks.resize(tpDevices.size());
     std::vector<std::pair<Data *, Data *>> singleKV;
     std::vector<GenerationConfig> singleConfigs;

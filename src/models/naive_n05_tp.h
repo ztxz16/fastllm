@@ -14,6 +14,7 @@ struct NaiveN05FlashModel::TargetWorkspace {
     Data last, logits, logitsBf16, inputIds, liveKeys;
     Data sparsePointers, sparseLengths, sparseSelected;
     Data denseGate, denseUp, denseDown;
+    std::map<int, Data> features;
     FastllmNaiveDecodeScratch decode;
     const void *const *cacheTable = nullptr;
     const unsigned char *cacheMaps = nullptr;
@@ -31,6 +32,7 @@ struct NaiveN05FlashModel::TargetWorkspace {
                 &decode.indexScale, &decode.indexScores, &decode.topk, &decode.attentionScores,
                 &decode.attentionPartial, &decode.windowKey, &decode.windowValue})
             out.push_back(p->isFake ? nullptr : p->cudaData);
+        for (const auto &feature : features) out.push_back(feature.second.cudaData);
         for (const auto &part : sequences) part->Pointers(out);
     }
 };

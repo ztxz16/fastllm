@@ -85,7 +85,7 @@ struct NaiveN05GraphTestAccess {
         if (!inspectDraftPrefixAllocations) return;
         std::lock_guard<std::mutex> historyGuard(model.historyMutex);
         auto it = model.draftContexts.find(&kv);
-        if (it != model.draftContexts.end() && it->second->prefixHidden.cudaData) {
+        if (it != model.draftContexts.end() && it->second->prefixHidden.cudaData && !it->second->prefixHidden.isFake) {
             std::lock_guard<std::mutex> guard(draftPrefixAllocationMutex);
             draftPrefixAllocations.insert(it->second->prefixHidden.cudaData);
         }
@@ -2494,6 +2494,41 @@ class DraftFixture : public NaiveN05FlashModel {
         weight["model.embed_tokens.weight"].ToDevice(DataDevice::CUDA, std::vector<int>{owner});
         weight["dspark.mask_embedding"].ToDevice(DataDevice::CUDA, std::vector<int>{owner});
     }
+    void PrefillCommitChecks() {
+        setenv("FASTLLM_DSPARK_TP", "1", 1);
+        auto actual = CreateDraftContext(), reference = CreateDraftContext();
+        auto bits = [](const Data &x) {
+            Data host(x); host.ToDevice(DataDevice::CPU);
+            return std::vector<uint16_t>((uint16_t *)host.cpuData, (uint16_t *)host.cpuData + host.Count(0));
+        };
+        int total = 0;
+        for (int rows : {8192, 3, 512, 7, 4096, 1}) {
+            TargetCapture capture;
+            for (int layer : draftTargetLayers) {
+                Data &feature = capture.hidden[layer];
+                feature.dataType = BFLOAT16; feature.Resize({1, rows, embed_dim}); feature.Allocate();
+                for (size_t i = 0; i < feature.Count(0); ++i)
+                    ((uint16_t *)feature.cpuData)[i] = Float32ToBFloat16RNEBits(std::sin((i + total + layer * 19) * .031f));
+                feature.ToDevice(DataDevice::CUDA, {0});
+            }
+            std::vector<std::pair<Data, Data>> unused;
+            CommitDraftContext(capture, rows, *actual, unused);
+            Data combined, projected, hidden;
+            Cat(capture.hidden.at(0), capture.hidden.at(1), -1, combined);
+            if (rows > 1) MatMulTransB(combined, weight["dspark.fc.weight"], projected);
+            else Linear(combined, weight["dspark.fc.weight"], Data(), projected);
+            KimiK3RMSNorm(projected, weight["dspark.hidden_norm.weight"], draftEps, hidden);
+            AppendDraftContext(hidden, reference->committed, *reference);
+            total += rows;
+            if (actual->committed != total || reference->committed != total)
+                throw std::runtime_error("prefill tail changed logical context length");
+            for (int layer = 0; layer < draftLayers; ++layer)
+                if (bits(actual->kv[layer].first) != bits(reference->kv[layer].first) ||
+                    bits(actual->kv[layer].second) != bits(reference->kv[layer].second))
+                    throw std::runtime_error("prefill tail projection changed visible draft KV");
+        }
+        std::cout << "DRAFT PREFILL TAIL PASS" << std::endl;
+    }
     static void RunTPChecks(int ranks, bool mlpOnly, bool singleKV = false, int owner = 0) {
         const std::string tp = (mlpOnly ? "mlp:" : "") + std::to_string(ranks);
         DraftFixture reference(true, singleKV ? 1 : ranks, owner);
@@ -2891,6 +2926,10 @@ int main(int argc, char **argv) {
         SetThreads(4);
         SetDeviceMap({{"cuda:0", 1}});
         FastllmCudaSetDevice(0);
+        if (argc > 2 && std::string(argv[2]) == "draft_prefill_tail") {
+            SetCudaEmbedding(true); SetCudaGraph(true);
+            DraftFixture fixture(true, 2, 0, 5); fixture.PrefillCommitChecks(); return 0;
+        }
         if (argc > 2 && std::string(argv[2]) == "draft_prefix") {
             SetCudaEmbedding(true); SetCudaGraph(!(argc > 4 && std::string(argv[4]) == "eager"));
             Fixture fixture(ranks, false, true, true, true);
