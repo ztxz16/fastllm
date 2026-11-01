@@ -758,6 +758,66 @@ class HybridAutoTest(unittest.TestCase):
                 "dspark_markov_rank": 32, "dspark_n_routed_experts": 128,
                 "dspark_num_experts_per_tok": 3, "vocab_size": 1024}
 
+    def test_v41_graph_slots_coexist_with_prefill_and_scale_with_draft_lengths(self):
+        def reserve(drafts, chunk=4096, graph="1", mapping=None):
+            g = auto.geometry(self.dspark_metadata(), "fp4", 0, drafts)
+            g.runtime["native_records"] = {i: 16 * MiB for i in range(g.layers)}
+            a = args(auto=True, dspark=drafts, fast_prefill=True, moe_device_layers=-1)
+            devices = mapping or {0: 1, 1: 1}
+            with patch.dict(os.environ, {"FASTLLM_CUDA_GRAPH": graph}, clear=True):
+                return auto._v41_runtime_bytes(a, g, "pp", devices, 0, 8192, 1, chunk)
+        short, long = reserve(3), reserve(7)
+        self.assertGreater(long["graphs"][0], short["graphs"][0])
+        self.assertGreater(long["graphs"][1], long["graphs"][0])  # draft/head on final PP stage
+        self.assertEqual(reserve(7, 8192)["graphs"], long["graphs"])  # prefill is never captured
+        self.assertGreater(reserve(7, 8192)["prefill_persistent"][0], long["prefill_persistent"][0])
+        self.assertEqual(reserve(7, graph="0")["graphs"], {0: 0, 1: 0})
+        self.assertEqual(reserve(7, mapping={3: 1})["prefill_persistent"][3], long["prefill_persistent"][0])
+
+    def test_v41_native_moe_staging_is_separate_from_resident_cache(self):
+        g = auto.geometry(self.dspark_metadata(), "fp4", 0, 7)
+        g.runtime["native_records"] = {0: 16 * MiB, 2: 24 * MiB}
+        a = args(auto=True, dspark=7, moe_device_layers=-1)
+        with patch.dict(os.environ, {"FASTLLM_CUDA_GRAPH": "1"}, clear=True):
+            def reserve(resident):
+                return auto._v41_runtime_bytes(a, g, "pp", {0: 1, 1: 1}, resident, 8192, 1, 4096)
+            both = reserve(0)
+            self.assertGreater(both["staging"][1], both["staging"][0])
+            self.assertEqual(reserve(2)["staging"][0], 0)
+            a.moe_cuda_cache = 0
+            self.assertEqual(reserve(0)["staging"], {0: 0, 1: 0})
+            self.assertGreater(reserve(0)["prefill_persistent"][0], 0)
+
+    def test_v41_capture_disabled_keeps_persistent_prefill_reserve(self):
+        g = auto.geometry(self.dspark_metadata(), "fp4", 0, 7)
+        g.runtime["native_records"] = {i: 16 * MiB for i in range(g.layers)}
+        a = args(auto=True, dspark=7, moe_device_layers=-1)
+        def reserve(env):
+            with patch.dict(os.environ, env, clear=True):
+                return auto._v41_runtime_bytes(a, g, "pp", {0: 1, 1: 1}, 0, 8192, 1, 4096)
+        eager = reserve({"FASTLLM_CUDA_GRAPH": "0"})
+        self.assertGreater(eager["prefill_persistent"][0], 0)
+        for flag in ("FASTLLM_DSV41_REFERENCE_MATH", "FASTLLM_DSV41_DUMP_DIR"):
+            with self.subTest(flag=flag):
+                self.assertEqual(reserve({"FASTLLM_CUDA_GRAPH": "1", flag: "1"}), eager)
+        self.assertEqual(reserve({"FASTLLM_DSV41_REFERENCE_MATH": "0"}), reserve({}))
+
+    def test_v41_new_runtime_reserve_reduces_cache_without_changing_context(self):
+        g = auto.geometry(self.dspark_metadata(), "fp4", 0, 7)
+        costs = ([4 * GiB] * len(g.kv), [MiB] * len(g.kv), 0, 0, MiB, False)
+        gpu = {0: dict(total=16 * GiB, free=16 * GiB, capability=120)}
+        ram = dict(total=128 * GiB, available=128 * GiB)
+        a = args(auto=True, dspark=7, moe_device_layers=-1, chunked_prefill_size=4096,
+                 tokens=8192, max_context_length=8192)
+        with patch.dict(os.environ, {"FASTLLM_CUDA_GRAPH": "0"}, clear=True):
+            eager = auto.plan(a, g, costs, "pp", {0: 1}, gpu, ram)
+        with patch.dict(os.environ, {"FASTLLM_CUDA_GRAPH": "1"}, clear=True):
+            graph = auto.plan(a, g, costs, "pp", {0: 1}, gpu, ram)
+        self.assertLess(graph["moe_cuda_cache"], eager["moe_cuda_cache"])
+        self.assertEqual((graph["context_tokens"], graph["chunked_prefill_size"]), (8192, 4096))
+        self.assertIsNone(graph["auto_gpu_memory_limit"])
+        self.assertLessEqual(graph["gpu_estimated_bytes"][0], graph["gpu_budget_bytes"][0])
+
     def test_v41_gguf_prefill_transport_does_not_consume_decode_cache_budget(self):
         g = auto.geometry(self.dspark_metadata(), "float16", 0)
         a = args(tokens=4096, max_context_length=4096, moe_device_layers=-1)

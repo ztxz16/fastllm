@@ -293,6 +293,7 @@ class Geometry:
     tp_kv_heads: int = 0  # Qwen3.5 GQA KV heads available for TP sharding
     gguf_expert_bytes: dict = field(default_factory=dict)  # packed per-expert bytes by layer
     disk_prefill: dict = field(default_factory=dict)  # bounded V4.1 BF16 workspace phases (native/GGUF)
+    runtime: dict = field(default_factory=dict)  # persistent V4.1 allocations, separate from request scratch
 
 
 def geometry(metadata, kv_dtype, mtp, dspark=0):
@@ -495,6 +496,13 @@ def geometry(metadata, kv_dtype, mtp, dspark=0):
     result = Geometry(family, layers, context, hidden, experts, topk, inter, kv, state,
                       score_divisor, width, chunk, streamed_kv, dspark_block)
     if family == "deepseek_v41":
+        result.runtime = {
+            "heads": int(config["num_attention_heads"]), "head_dim": dim,
+            "hc": int(config.get("hc_mult", 4)), "window": int(config["sliding_window"]),
+            "index_topk": int(config.get("index_topk", 512)),
+            "index_sources": list(config["index_source_layer_ids"]),
+            "vocab": int(config.get("vocab_size", 0)),
+        }
         result.kv_reallocation = [0] * len(kv)
         result.kv_padding = [0] * len(kv)
         for i in config["kv_source_layer_ids"]:
@@ -840,6 +848,10 @@ def weight_costs(tensors, model, args):
         raise ValueError("Hybrid auto: no routed experts found")
     model.gguf_expert_bytes = {layer: math.ceil(size / model.experts)
                                for layer, size in gguf_layers.items()}
+    if model.runtime:
+        model.runtime["native_records"] = {
+            i: math.ceil(size / model.experts) for i, size in enumerate(expert[:model.layers])
+            if size and i not in model.gguf_expert_bytes}
     if model.disk_prefill.get("canonical_gguf", False):
         # Match FastllmCudaV41GGUFGroupedWorkspaceBytes, not all GGUF formats.
         supported = {"gguf:" + str(t) for t in (11, 12, 16, 17, 18, 19, 22, 29, 42)}
@@ -960,6 +972,86 @@ def _workspace_bytes(args, model, rows, context, mode, resident, *, gguf_mmq=Tru
         woa = max(woa, rows * phase["woa"] + 256 * MiB)
     return (rows * phase["retained"] + max(attention, woa, moe) +
             resident_scratch + streamed_scratch + 32 * MiB)
+
+
+def _v41_runtime_bytes(args, model, mode, mapping, resident, context, batch, chunk):
+    """Persistent decode graphs and staging coexist with eager prefill workspace.
+
+    These are capacity bounds, not allocation predictions. In particular, sum
+    graph slots instead of taking max(prefill, decode): captured addresses cannot
+    be recycled by a subsequent prompt. Prefill itself is never graph-captured.
+    """
+    result = {name: dict.fromkeys(mapping, 0) for name in
+              ("graphs", "staging", "prefill_persistent")}
+    r = model.runtime
+    if not r or args.atype not in ("auto", "bfloat16"):
+        return result
+    from .util import _fastllm_env_flag_enabled
+    graphs = (_fastllm_env_flag_enabled("FASTLLM_CUDA_GRAPH") if "FASTLLM_CUDA_GRAPH" in os.environ
+              else bool(getattr(args, "auto", False)))
+    # These existing modes disable capture, not persistent eager workspace.
+    if ("FASTLLM_DSV41_DUMP_DIR" in os.environ or
+            os.environ.get("FASTLLM_DSV41_REFERENCE_MATH", "0") not in ("", "0")):
+        graphs = False
+    hybrid = resident < model.layers
+    host = args.moe_device == "numa" or (args.moe_device == "cpu" and getattr(args, "_host_moe_shared", False))
+    drafts = max(0, getattr(args, "dspark", 0))
+    topk = max(model.topk, args.moe_experts)
+    # Ordinary decode warms powers of two plus the requested maximum. Every
+    # possible shortened verifier can get its own slot, also with adaptation off
+    # (the output limit may shorten the final proposal).
+    shapes = list(dict.fromkeys([1 << i for i in range(batch.bit_length())] + [batch]))
+    if hybrid and mode == "pp" and len(mapping) > 1 and drafts:
+        shapes = []  # PP DSpark captures verifier stages, not ordinary one-token forwards.
+    shapes.extend(range(2, drafts + 2))
+    page_bytes = 64 * 1024
+
+    def page(n):
+        return (n + page_bytes - 1) // page_bytes * page_bytes
+
+    for d in mapping:
+        owners = [i for i in range(len(model.kv)) if mode == "tp" or layer_device(i, model.layers, mapping) == d]
+        layers = [i for i in owners if i < model.layers]
+        record = max((r.get("native_records", {}).get(i, 0) for i in layers if i >= resident), default=0)
+        if host and record:
+            # Ordinary overlap and full-graph mailbox own separate upload rings;
+            # the latter has kMaxTopK=16 slots, independent of verifier rows.
+            if args.moe_cuda_cache != 0:
+                result["staging"][d] = ((16 if graphs else 0) + topk + 1) * page(record)
+            if chunk > r["window"]:
+                # CudaMergeMoeFromCpuWorkspace keeps these BF16/FP32 tensors
+                # between layers; attention releases cannot reclaim them.
+                result["prefill_persistent"][d] += chunk * (12 * model.hidden + 6 * model.intermediate)
+        if (hybrid and mode == "pp" and len(mapping) > 1 and not drafts and
+                args.moe_cuda_cache == 0 and context > chunk and
+                os.environ.get("FASTLLM_DSV41_HYBRID_PP", "0") not in ("", "0")):
+            # CudaChunkedPrefillPipeline double-buffers the HC stage payload.
+            result["prefill_persistent"][d] += 2 * chunk * r["hc"] * (model.hidden + 2) * 2
+        if not graphs:
+            continue
+        for rows in shapes:
+            # Segmented graphs retain their workspace too, including shapes
+            # outside the full-graph fast path. Keep the generic scratch bound.
+            result["graphs"][d] += _workspace_bytes(args, model, rows, context, mode, resident, prefill=False)
+            for i in layers:
+                # Full-decode attention scores and native mailbox route output,
+                # gate, quantized input. Small direct allocations have GPU page
+                # granularity; six control/descriptor arrays accompany a layer.
+                score = rows * r["heads"] * (r["window"] + r["index_topk"]) * 4
+                route = rows * (topk * (4 * model.hidden + 2 * model.intermediate) + 2 * model.hidden)
+                index = rows * context * 5 if i in r["index_sources"] else 0
+                result["graphs"][d] += page(score) + page(route) + page(index) + 6 * page_bytes
+            # FlashInfer split accumulators and selected KV are shared across
+            # serial layers within a slot, never across different row counts.
+            result["graphs"][d] += rows * (math.ceil(r["heads"] / 16) * 16 *
+                (4 + math.ceil(r["index_topk"] / 64)) * (r["head_dim"] * 2 + 4) +
+                (r["window"] + r["index_topk"]) * (r["head_dim"] * 2 + 4))
+            if model.layers - 1 in owners:
+                result["graphs"][d] += page(rows * r["vocab"] * 4) * 3
+        if drafts and model.layers - 1 in owners:
+            # The draft graph is additional to the target verifier slots.
+            result["graphs"][d] += _workspace_bytes(args, model, model.dspark_block_size, context, mode, resident, prefill=False)
+    return result
 
 
 def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_gpu=False,
@@ -1088,7 +1180,9 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
                 # Host storage also includes eight next-layer read-ahead slots.
                 disk_staging = 32 * (math.ceil(record / 256) * 256 + 24 * 1024)
                 transport = disk_ring + math.ceil(record / 256) * 256 + 16 * MiB
-            used = {d: common + workspace + transport + guard for d in mapping}
+            runtime = _v41_runtime_bytes(args, model, mode, mapping, resident, context, batch, chunk)
+            used = {d: common + workspace + transport + guard +
+                    sum(values[d] for values in runtime.values()) for d in mapping}
             reallocation = dict.fromkeys(mapping, 0)
             logical_kv = dict.fromkeys(mapping, 0)
             capacity_kv = dict.fromkeys(mapping, 0)
@@ -1226,6 +1320,7 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
             if independent and host_experts:
                 candidate["moe_cuda_cache_per_device"] = cache
             if model.family == "deepseek_v41":
+                candidate["runtime_bytes_per_device"] = runtime
                 candidate["kv_logical_bytes_per_device"] = logical_kv
                 candidate["kv_capacity_bytes_per_device"] = capacity_kv
                 candidate["kv_reallocation_bytes_per_device"] = reallocation
