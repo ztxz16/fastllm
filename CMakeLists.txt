@@ -3025,6 +3025,9 @@ if (UNIT_TEST)
         endforeach()
         set_tests_properties(clover_graph clover_parallel PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
         set_tests_properties(clover_parallel clover_parallel_fp16 PROPERTIES LABELS "cuda;multigpu")
+        add_test(NAME clover_p2p_allreduce COMMAND cloverParallelRegression allreduce)
+        set_tests_properties(clover_p2p_allreduce PROPERTIES
+            LABELS "cuda;multigpu" TIMEOUT 120 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
         add_test(NAME clover_p2p_abort COMMAND cloverParallelRegression abort)
         set_tests_properties(clover_p2p_abort PROPERTIES
             LABELS "cuda;multigpu" TIMEOUT 15 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)

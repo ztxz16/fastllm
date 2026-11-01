@@ -17,6 +17,92 @@ void Check(bool ok, const char *message) { if (!ok) throw std::runtime_error(mes
 uint16_t Bf16(float value) {
     uint32_t bits; std::memcpy(&bits, &value, 4); bits += 0x7fff + ((bits >> 16) & 1); return bits >> 16;
 }
+void AllReduceChecks() {
+    Check(FastllmInitNccl({0, 1}), "NCCL initialization failed");
+    FastllmCudaSetNcclForceSync(false);
+    std::exception_ptr errors[2];
+    auto worker = [&](int rank) { try {
+        Check(cudaSetDevice(rank) == cudaSuccess, "set rank");
+        auto cuda = [](cudaError_t e) { Check(e == cudaSuccess, cudaGetErrorString(e)); };
+        auto encode = [](float v, int type, unsigned char *p) {
+            if (type == FLOAT32) std::memcpy(p, &v, 4);
+            else { uint16_t bits = type == FLOAT16 ? __half_raw(__float2half_rn(v)).x : Bf16(v); std::memcpy(p, &bits, 2); }
+        };
+        auto round = [](float v, int type) {
+            if (type == FLOAT16) return __half2float(__float2half_rn(v));
+            if (type == BFLOAT16) { uint32_t bits = uint32_t(Bf16(v)) << 16; std::memcpy(&v, &bits, 4); }
+            return v;
+        };
+        auto value = [](int i, int rank, int variant) { return .007f * ((i % 32) - 16 + rank * 3 + variant); };
+        for (int type : {int(BFLOAT16), int(FLOAT16), int(FLOAT32)})
+        for (int bytes : {16, 1024, 294912, 294928, 1048576, 4194304, 8388608})
+        for (bool inplace : {false, true}) {
+            int unit = type == FLOAT32 ? 4 : 2, count = bytes / unit;
+            unsigned char *seed, *source, *target, *samples;
+            cuda(cudaMalloc(&seed, bytes * 2)); cuda(cudaMalloc(&source, bytes + 32));
+            cuda(cudaMalloc(&target, bytes + 32)); cuda(cudaMalloc(&samples, 16 * 48));
+            std::vector<unsigned char> host(bytes * 2);
+            for (int variant = 0; variant < 2; ++variant)
+                for (int i = 0; i < count; ++i)
+                    encode(value(i, rank, variant), type, host.data() + variant * bytes + i * unit);
+            cuda(cudaMemcpy(seed, host.data(), host.size(), cudaMemcpyHostToDevice));
+            cuda(cudaMemsetAsync(source, 0xa5, bytes + 32, cudaStreamPerThread));
+            cuda(cudaMemsetAsync(target, 0xa5, bytes + 32, cudaStreamPerThread));
+            auto *destination = inplace ? source + 16 : target + 16;
+            // No intervening stream sync: a fast rank must not overwrite the
+            // staged input while its peer is still reading the preceding call.
+            for (int iteration = 0; iteration < 16; ++iteration) {
+                cuda(cudaMemcpyAsync(source + 16, seed + (iteration % 2) * bytes, bytes,
+                                     cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+                Check(FastllmTryTP2P2PAllReduce(source + 16, destination, count, type, rank), "P2P sum dispatch");
+                Check(FastllmTryTP2P2PAllReduce(destination, destination, count, type, rank), "P2P repeated sum");
+                int offsets[] = {0, (bytes / 32) * 16, bytes - 16};
+                for (int j = 0; j < 3; ++j)
+                    cuda(cudaMemcpyAsync(samples + iteration * 48 + j * 16, destination + offsets[j], 16,
+                                         cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+            }
+            cuda(cudaStreamSynchronize(cudaStreamPerThread));
+            std::vector<unsigned char> actual(16 * 48), expected(actual.size());
+            cuda(cudaMemcpy(actual.data(), samples, actual.size(), cudaMemcpyDeviceToHost));
+            for (int iteration = 0; iteration < 16; ++iteration) {
+                int offsets[] = {0, (bytes / 32) * 16, bytes - 16};
+                for (int j = 0; j < 3; ++j) for (int k = 0; k < 16 / unit; ++k) {
+                    int i = offsets[j] / unit + k;
+                    float sum = round(round(value(i, 0, iteration % 2), type) +
+                                      round(value(i, 1, iteration % 2), type), type);
+                    float v = round(sum + sum, type);
+                    encode(v, type, expected.data() + iteration * 48 + j * 16 + k * unit);
+                }
+            }
+            Check(actual == expected, "P2P sum bits differ from independent reference");
+            for (auto *buffer : {source, target}) {
+                unsigned char guards[32]; cuda(cudaMemcpy(guards, buffer, 16, cudaMemcpyDeviceToHost));
+                cuda(cudaMemcpy(guards + 16, buffer + bytes + 16, 16, cudaMemcpyDeviceToHost));
+                for (auto v : guards) Check(v == 0xa5, "P2P output guard overwritten");
+            }
+            if (bytes == 8388608) {
+                Check(!FastllmTryTP2P2PAllReduce(source + 16 + (rank ? 0 : unit), target + 16, count, type, rank), "unaligned peer fallback");
+                Check(!FastllmTryTP2P2PAllReduce(source + 16, target + 16, count + 16, type, rank), "oversize fallback");
+            }
+            cuda(cudaFree(seed)); cuda(cudaFree(source)); cuda(cudaFree(target)); cuda(cudaFree(samples));
+        }
+    } catch (...) { errors[rank] = std::current_exception(); FastllmNcclAbort("P2P regression failed"); } };
+    std::thread a(worker, 0), b(worker, 1); a.join(); b.join();
+    for (auto &error : errors) if (error) std::rethrow_exception(error);
+    Check(cudaSetDevice(0) == cudaSuccess, "fallback device");
+    void *data = nullptr; Check(cudaMalloc(&data, 4096) == cudaSuccess, "fallback allocation");
+    FastllmCudaSetNcclForceSync(true);
+    Check(!FastllmTryTP2P2PAllReduce(data, data, 2048, BFLOAT16, 0), "synchronous fallback");
+    FastllmCudaSetNcclForceSync(false);
+    Check(!FastllmTryTP2P2PAllReduce(data, data, 7, BFLOAT16, 0), "unaligned size fallback");
+    Check(!FastllmTryTP2P2PAllReduce(data, data, 1024, INT32, 0), "unsupported type fallback");
+    Check(FastllmCudaGraphBeginCapture(), "fallback capture begin");
+    Check(!FastllmTryTP2P2PAllReduce(data, data, 2048, BFLOAT16, 0), "capture fallback");
+    void *graph = nullptr; Check(FastllmCudaGraphEndCapture(&graph), "fallback capture end");
+    if (graph) FastllmCudaGraphDestroy(graph);
+    Check(cudaFree(data) == cudaSuccess, "fallback free");
+    std::cout << "TP2 allreduce BF16/FP16/FP32, in-place, guards, asynchronous repeats and fallbacks PASS" << std::endl;
+}
 void Populate(CloverModel &m, const std::string &devices, bool fp16) {
     m.deviceMap = {{devices, 1}};
     m.weight.dicts = {{"hidden_size", "512"}, {"num_hidden_layers", "2"},
@@ -186,12 +272,13 @@ int main(int argc, char **argv) {
     try {
         int devices = 0; if (cudaGetDeviceCount(&devices) != cudaSuccess || devices < 2) return 77;
         const std::string mode = argc > 1 ? argv[1] : "bf16";
-        if (mode == "abort") {
+        if (mode == "allreduce" || mode == "abort") {
             for (int rank = 0; rank < 2; ++rank) {
                 int peer = 0;
                 if (cudaDeviceCanAccessPeer(&peer, rank, 1 - rank) != cudaSuccess || !peer) return 77;
             }
         }
+        if (mode == "allreduce") { AllReduceChecks(); return 0; }
         if (mode == "abort") {
             Check(FastllmInitNccl({0, 1}), "NCCL initialization failed");
             FastllmCudaSetNcclForceSync(false);
