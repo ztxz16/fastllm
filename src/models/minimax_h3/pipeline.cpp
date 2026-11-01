@@ -129,7 +129,7 @@ Pipeline::Pipeline(const std::string &dir, const std::vector<int> &devices, bool
         parallel_ = std::make_unique<ParallelModel>(dir, devices, fp32, videoPrecision, video_);
         video_.setTileRunner([this](size_t count, const std::function<Tensor(VideoVAE &,size_t)> &task) {
             return parallel_->videoTiles(count, task);
-        });
+        }, devices.size());
     }
     rt_.activate();
 }

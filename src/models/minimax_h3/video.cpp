@@ -257,9 +257,15 @@ Tensor VideoVAE::decodeClip(const VideoTensor &z, std::function<void()> checkpoi
     // Tiles remain independent attention sequences; only row-wise projections share a batch.
     const size_t capacity = rt_.isFloat32() ? 1 : 4;
     const size_t count = ys.start.size() * xs.start.size();
+    const size_t batches = (count + capacity - 1) / capacity;
+    const size_t jobs = tileRunner_ ? std::max(batches, std::min(count, tileWorkers_)) : batches;
+    // Preserve existing batch shapes unless they would leave tile workers idle.
+    auto begin = [&](size_t job) {
+        return jobs > batches ? job * count / jobs : std::min(job * capacity, count);
+    };
     auto decode = [&](VideoVAE &worker, size_t job) {
-        size_t first = job * capacity;
-        size_t batch = std::min(capacity, count - first);
+        size_t first = begin(job);
+        size_t batch = begin(job + 1) - first;
         std::vector<float> values;
         int rows = z.frames * ys.length[0] * xs.length[0];
         values.reserve(batch * rows * 24);
@@ -275,13 +281,12 @@ Tensor VideoVAE::decodeClip(const VideoTensor &z, std::function<void()> checkpoi
                                           checkpoint();
                                   });
     };
-    const size_t jobs = (count + capacity - 1) / capacity;
     std::vector<Tensor> decoded;
     if (tileRunner_ && jobs > 1)
         decoded = tileRunner_(jobs, decode);
     for (size_t job = 0; job < jobs; ++job) {
         auto output = decoded.empty() ? decode(*this, job) : decoded[job];
-        size_t batch = std::min(capacity, count - job * capacity);
+        size_t batch = begin(job + 1) - begin(job);
         int rows = z.frames * ys.length[0] * xs.length[0];
         for (size_t i = 0; i < batch; ++i)
             patches.push_back(output.rowSlice(int(i) * rows, rows));

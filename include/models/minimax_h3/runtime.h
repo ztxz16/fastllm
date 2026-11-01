@@ -159,7 +159,10 @@ class VideoVAE {
     using TileRunner = std::function<std::vector<Tensor>(size_t, const std::function<Tensor(VideoVAE &,size_t)> &)>;
     VideoVAE(Runtime &compute, Runtime &fp32, const std::string &directory);
     // Optional independent-tile executor; each worker owns a separate VAE cache.
-    void setTileRunner(TileRunner run) { tileRunner_ = std::move(run); }
+    void setTileRunner(TileRunner run, size_t workers = 1) {
+        tileRunner_ = std::move(run);
+        tileWorkers_ = workers ? workers : 1;
+    }
     // ImageNet-normalized THWC pixels -> FP32 posterior moments (mean, log variance).
     Tensor encodeTile(const Tensor &, int frames, int height, int width, Trace trace = {});
     VideoTensor encodeMoments(const VideoTensor &, std::function<void(int, int)> progress = {});
@@ -187,6 +190,7 @@ class VideoVAE {
     std::pair<Tensor, Tensor> rope_;
     Tensor zero_;
     TileRunner tileRunner_;
+    size_t tileWorkers_ = 1;
 };
 DType parseVideoPrecision(const std::string &name, bool fp32 = false);
 const char *precisionName(DType);

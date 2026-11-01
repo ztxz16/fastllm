@@ -82,13 +82,15 @@ struct MP4Writer::Impl {
         file.close();
         if (!file)
             throw std::runtime_error("cannot save media input: " + audio);
+        unsigned threads = std::thread::hardware_concurrency();
+        threads = threads ? std::min(threads, 8u) : 4;
         std::vector<std::string> args = {
             ffmpeg, "-v", "error", "-nostdin", "-y",
             "-f", "rawvideo", "-pixel_format", "rgb24",
             "-video_size", std::to_string(g.width) + "x" + std::to_string(g.height),
             "-framerate", std::to_string(g.fps), "-i", "pipe:0",
             "-f", "f32le", "-ar", std::to_string(g.sampleRate), "-ac", "2", "-i", audio,
-            "-c:v", "libx264", "-threads", "4", "-preset", "fast", "-crf", "18", "-pix_fmt", "yuv420p",
+            "-c:v", "libx264", "-threads", std::to_string(threads), "-preset", "fast", "-crf", "18", "-pix_fmt", "yuv420p",
             "-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags", "+faststart", video};
         std::vector<char *> argv;
         for (auto &arg : args)
