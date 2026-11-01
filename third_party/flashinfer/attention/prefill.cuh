@@ -2542,20 +2542,38 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
 #endif
 }
 
-template <typename KTraits, typename Params>
+template <typename KTraits, typename Params, bool STRIDED_BATCH = false>
 __global__ __launch_bounds__(KTraits::NUM_THREADS) void SinglePrefillWithKVCacheKernel(
     const __grid_constant__ Params params) {
   extern __shared__ uint8_t smem[];
   using SmemStorage = typename KTraits::SharedStorageSingle;
   auto& smem_storage = reinterpret_cast<SmemStorage&>(smem);
-  SinglePrefillWithKVCacheDevice<KTraits>(params, smem_storage);
+  if constexpr (STRIDED_BATCH) {
+    // Independent, equal-length NHD sequences share the original attention math.
+    // The y dimension selects a sequence instead of a split-KV partition.
+    auto p = params;
+    const size_t batch = blockIdx.y;
+    p.q += batch * p.qo_len * p.q_stride_n;
+    p.k += batch * p.kv_len * p.k_stride_n;
+    p.v += batch * p.kv_len * p.v_stride_n;
+    p.o += batch * p.qo_len * p.num_qo_heads * KTraits::HEAD_DIM_VO;
+    if (p.lse) p.lse += batch * p.qo_len * p.num_qo_heads;
+    SinglePrefillWithKVCacheDevice<KTraits>(p, smem_storage, threadIdx, blockIdx.x,
+                                            0, blockIdx.z, 1, gridDim.z);
+  } else {
+    SinglePrefillWithKVCacheDevice<KTraits>(params, smem_storage);
+  }
 }
 
 template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, PosEncodingMode POS_ENCODING_MODE,
           bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE, typename AttentionVariant,
-          bool ENABLE_SM75_FP16_VO_SPLIT, typename Params, bool ENABLE_SPLIT_KV = true>
+          bool ENABLE_SM75_FP16_VO_SPLIT, typename Params, bool ENABLE_SPLIT_KV = true,
+          bool STRIDED_BATCH = false>
 cudaError_t SinglePrefillWithKVCacheDispatchedImpl(Params params, typename Params::DTypeO* tmp,
                                                  cudaStream_t stream) {
+  static_assert(!STRIDED_BATCH || (!ENABLE_SPLIT_KV && MASK_MODE == MaskMode::kNone &&
+                                   POS_ENCODING_MODE == PosEncodingMode::kNone),
+                "strided prefill batches require unmasked attention without split-KV or RoPE");
   using DTypeQ = typename Params::DTypeQ;
   using DTypeKV = typename Params::DTypeKV;
   using DTypeO = typename Params::DTypeO;
@@ -2685,7 +2703,7 @@ cudaError_t SinglePrefillWithKVCacheDispatchedImpl(Params params, typename Param
             FLASHINFER_ERROR(err_msg.str());
           } else {
             constexpr uint32_t num_threads = (NUM_WARPS_Q * NUM_WARPS_KV) * WARP_SIZE;
-            auto kernel = SinglePrefillWithKVCacheKernel<KTraits, Params>;
+            auto kernel = SinglePrefillWithKVCacheKernel<KTraits, Params, STRIDED_BATCH>;
             using SmemStorage = typename KTraits::SharedStorageSingle;
             size_t smem_size = sizeof(SmemStorage);
             if (smem_size > (size_t)max_smem_per_block_optin) {
@@ -2720,6 +2738,7 @@ cudaError_t SinglePrefillWithKVCacheDispatchedImpl(Params params, typename Param
               params.partition_kv = false;
               void* args[] = {(void*)&params};
               dim3 nblks(ceil_div(qo_len * group_size, CTA_TILE_Q), 1, num_kv_heads);
+              if constexpr (STRIDED_BATCH) nblks.y = params.batch_size;
               dim3 nthrs(32, NUM_WARPS_Q, NUM_WARPS_KV);
               FLASHINFER_CUDA_CALL(
                   cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
@@ -2753,7 +2772,7 @@ cudaError_t SinglePrefillWithKVCacheDispatchedImpl(Params params, typename Param
 
 template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, PosEncodingMode POS_ENCODING_MODE,
           bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE, typename AttentionVariant,
-          typename Params, bool ENABLE_SPLIT_KV = true>
+          typename Params, bool ENABLE_SPLIT_KV = true, bool STRIDED_BATCH = false>
 cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::DTypeO* tmp,
                                               cudaStream_t stream) {
   // Pass an explicit specialization flag to both the host planner and kernel.
@@ -2770,12 +2789,12 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
                                   (params.num_qo_heads / params.num_kv_heads);
     if (use_sm75_single_prefill_vo_split(capability.first, capability.second, packed_qo_len)) {
       return SinglePrefillWithKVCacheDispatchedImpl<HEAD_DIM_QK, HEAD_DIM_VO,
-          POS_ENCODING_MODE, USE_FP16_QK_REDUCTION, MASK_MODE, AttentionVariant, true, Params, ENABLE_SPLIT_KV>(
+          POS_ENCODING_MODE, USE_FP16_QK_REDUCTION, MASK_MODE, AttentionVariant, true, Params, ENABLE_SPLIT_KV, STRIDED_BATCH>(
               params, tmp, stream);
     }
   }
   return SinglePrefillWithKVCacheDispatchedImpl<HEAD_DIM_QK, HEAD_DIM_VO,
-      POS_ENCODING_MODE, USE_FP16_QK_REDUCTION, MASK_MODE, AttentionVariant, false, Params, ENABLE_SPLIT_KV>(
+      POS_ENCODING_MODE, USE_FP16_QK_REDUCTION, MASK_MODE, AttentionVariant, false, Params, ENABLE_SPLIT_KV, STRIDED_BATCH>(
           params, tmp, stream);
 }
 

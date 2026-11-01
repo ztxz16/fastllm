@@ -636,19 +636,20 @@ int main() {
                 std::cout << std::endl;
             }
             for (int dim : {64, 128}) {
-                for (int batch : {1, 4}) {
-                    auto packed = randomTensor(r, batch * 19, dim * 6);
+                for (int batch : {1, 2, 4}) for (int tokens : {19, 1797}) {
+                    if (dtype == DType::FP32 && tokens != 19) continue;
+                    auto packed = randomTensor(r, batch * tokens, dim * 6);
                     auto q = r.columns(packed, 0, dim * 2), k = r.columns(packed, dim * 2, dim * 2),
                          v = r.columns(packed, dim * 4, dim * 2);
                     std::vector<Tensor> outputs;
                     for (int i = 0; i < batch; ++i)
-                        outputs.push_back(r.attention(q.rowSlice(i * 19, 19), k.rowSlice(i * 19, 19),
-                                                      v.rowSlice(i * 19, 19), 2));
-                    std::cout << "packed_attention dtype=" << int(dtype) << " dim=" << dim << " batch=" << batch;
+                        outputs.push_back(r.attention(q.rowSlice(i * tokens, tokens), k.rowSlice(i * tokens, tokens),
+                                                      v.rowSlice(i * tokens, tokens), 2));
+                    std::cout << "packed_attention dtype=" << int(dtype) << " dim=" << dim << " batch=" << batch << " tokens=" << tokens;
                     equal(r, r.concat(outputs), r.packedSelfAttention(packed, 2, batch));
                     std::cout << std::endl;
                     rejects([&] { r.packedSelfAttention(packed, 2, 0); });
-                    rejects([&] { r.packedSelfAttention(packed, 2, 3); });
+                    rejects([&] { r.packedSelfAttention(packed, 2, packed.rows + 1); });
                     auto unaligned = randomTensor(r, 1, int(packed.size()) + 1);
                     unaligned.data += unaligned.isFloat32() ? 2 : 1;
                     unaligned.rows = packed.rows;

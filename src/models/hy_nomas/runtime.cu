@@ -22,7 +22,7 @@
 #endif
 
 namespace fastllm { namespace nomas {
-cudaError_t fusedAttention(const void *,const void *,const void *,void *,int,int,int,int,int,bool,bool,int,int,int,float,bool,cudaStream_t,int=0,int=0);
+cudaError_t fusedAttention(const void *,const void *,const void *,void *,int,int,int,int,int,bool,bool,int,int,int,float,bool,cudaStream_t,int=0,int=0,int=1);
 namespace {
 using B = __nv_bfloat16;
 using H = __half;
@@ -749,12 +749,14 @@ Tensor Runtime::packedSelfAttention(const Tensor &qkv,int heads,int batch) {
     int width=qkv.cols/3,dim=width/heads,tokens=qkv.rows/batch;
     if(!qkv.isFloat32() && (dim==64 || dim==128) && uintptr_t(qkv.data)%16==0) {
         Tensor out(qkv.rows,width,qkv.dtype);
-        for(int i=0;i<batch;++i) {
+        for(int i=0;i<batch;) {
+            int count=std::min(batch-i,65535);
             const auto *p=qkv.data+size_t(i)*tokens*qkv.cols;
-            auto target=out.rowSlice(i*tokens,tokens);
+            auto target=out.rowSlice(i*tokens,count*tokens);
             check(fusedAttention(p,p+width,p+2*width,target.data,tokens,tokens,heads,heads,dim,
                 qkv.dtype==DType::FP16,false,0,0,0,1.f/std::sqrt(float(dim)),numerics_.fp32SoftmaxSum,
-                cudaStreamPerThread,qkv.cols,qkv.cols));
+                cudaStreamPerThread,qkv.cols,qkv.cols,count));
+            i+=count;
         }
         return out;
     }
