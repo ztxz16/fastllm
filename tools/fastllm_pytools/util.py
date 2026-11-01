@@ -1791,6 +1791,10 @@ def make_normal_llm_model(args, startup_progress = None):
             args.device = target_spec
             if (not user_set_moe_device):
                 args.moe_device = target_spec
+        elif is_clover_model:
+            args.device = cuda_spec
+            if not user_set_moe_device:
+                args.moe_device = cuda_spec
         elif is_laguna_hybrid_tp_model:
             multicuda_spec = "multicuda:" + cuda_spec.split(":", 1)[1]
             if (not user_set_device):

@@ -25,7 +25,7 @@ class CloverAutoTest(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.config = dict(model_type="clover_moe", block_size=32,
             max_position_embeddings=131072, layer_types=["linear_attention"] * 30 + ["full_attention"] * 10,
-            linear_num_key_heads=16, linear_num_value_heads=32, num_key_value_heads=2, head_dim=256,
+            num_attention_heads=16, linear_num_key_heads=16, linear_num_value_heads=32, num_key_value_heads=2, head_dim=256,
             hidden_size=2048, moe_intermediate_size=512, shared_expert_intermediate_size=512,
             num_experts=256, num_experts_per_tok=8, vocab_size=248320)
         (Path(self.temp.name) / "config.json").write_text(json.dumps(self.config))
@@ -50,6 +50,24 @@ class CloverAutoTest(unittest.TestCase):
         self.assertEqual(result["kv_bytes"], 131072 * 20480)
         self.assertEqual(result["snapshot_bytes"], 16 * result["recurrent_state_bytes"])
         self.assertEqual(args.chunked_prefill_size, 4096)
+
+    def test_tp_capacity_and_kv_replication(self):
+        from fastllm_pytools import clover_config
+        single = self.resolve(self.args("--max_context_length", "4096"))
+        for ranks in (2, 4):
+            args = self.args("--tp", "cuda:" + ",".join(map(str, range(ranks))),
+                             "--max_context_length", "4096")
+            with patch.object(hybrid_auto, "inventory", return_value=(self.config, self.weights)), redirect_stdout(io.StringIO()):
+                result = clover_config.resolve(args, lambda d: dict(free=140 << 30, total=144 << 30), self.config,
+                    hardware=({d: {"capability": 90} for d in range(ranks)}, {}), ram=dict(available=400 << 30))
+            self.assertEqual(result["mode"], "thread_tp")
+            self.assertEqual(result["weights_bytes"] * ranks, single["weights_bytes"])
+            self.assertEqual(result["recurrent_state_bytes"] * ranks, single["recurrent_state_bytes"])
+            self.assertEqual(result["kv_bytes"], single["kv_bytes"] // 2)
+            self.assertEqual(args.device, args.tp)
+        for spec in ("cuda:0,0", "cuda:0:1,1:2", "cuda:0,1,2"):
+            with self.assertRaises(ValueError):
+                clover_config.prepare(self.args("--tp", spec), self.config)
 
     def test_explicit_fp16(self):
         args = self.args("--atype", "float16")

@@ -1,4 +1,4 @@
-"""Single-GPU native Clover placement and generation configuration."""
+"""Native Clover thread-TP placement and generation configuration."""
 import json
 import math
 import os
@@ -15,6 +15,29 @@ def workspace_reserve(config, batch, width):
                4 * int(config["num_experts"]) + 4 * int(config["num_experts_per_tok"]) *
                (int(config["hidden_size"]) + int(config["moe_intermediate_size"])))
     return (graph_batch + 2) * (1 << 30) + extra_rows * per_row
+
+
+def tp_devices(args):
+    from .util import _thread_tp_cuda_device_spec
+    spec = _thread_tp_cuda_device_spec(getattr(args, "tp", ""))
+    if not spec:
+        return []
+    if not re.fullmatch(r"cuda:[0-9]+(?:,[0-9]+)*", spec):
+        raise ValueError("Clover TP requires equally sized ranks: --tp cuda:0,1")
+    devices = list(map(int, spec[5:].split(",")))
+    if len(set(devices)) != len(devices):
+        raise ValueError("Clover TP contains duplicate CUDA devices")
+    return devices
+
+
+def validate_tp(config, count):
+    for key in ("num_attention_heads", "linear_num_key_heads", "linear_num_value_heads",
+                "moe_intermediate_size", "shared_expert_intermediate_size", "vocab_size"):
+        if int(config[key]) % count:
+            raise ValueError("Clover TP does not divide " + key)
+    kv = int(config["num_key_value_heads"])
+    if kv % count and count % kv:
+        raise ValueError("Clover TP cannot partition or replicate the KV heads")
 
 
 def prepare(args, config):
@@ -40,13 +63,19 @@ def prepare(args, config):
         except ValueError:
             info = {}  # Native initialization reports missing CUDA support.
         match = re.fullmatch(r"cuda(?::(\d+))?", args.device or "cuda")
-        if match and 0 < info.get(int(match[1] or 0), {}).get("capability", 0) < 80:
+        selected = tp_devices(args) or ([int(match[1] or 0)] if match else [])
+        if any(0 < info.get(d, {}).get("capability", 0) < 80 for d in selected):
             precision = "float16"
     for key in precision_keys:
         setattr(args, key, precision)
-    if (args.tp or args.mtp or args.dspark or args.speculative_draft_model_path or
+    devices = tp_devices(args)
+    if len(devices) > 1:
+        validate_tp(config, len(devices))
+        if args.moe_device and args.moe_device != "cuda:" + ",".join(map(str, devices)):
+            raise ValueError("Clover TP experts must use the same CUDA ranks")
+    if (args.mtp or args.dspark or args.speculative_draft_model_path or
             args.lora or args.dtype_config or args.mmproj or args.kvmem):
-        raise ValueError("Clover requires one GPU, original weights and no external draft/adapter/KVMem")
+        raise ValueError("Clover requires original weights and no external draft/adapter/KVMem")
     if args.speculative_algorithm not in ("", "clover"):
         raise ValueError("Clover supports --speculative_algorithm clover or off")
     if args.low_gpu_mem or args.moe_experts > 0 or args.prefill_batch_tokens > 0:
@@ -79,14 +108,34 @@ def resolve(args, query_gpu, config, *, hardware=None, ram=None):
     weights = sum(t.bytes * (2 if ("norm.weight" in t.name or ".A_log" in t.name or
                   ".dt_bias" in t.name or ".bd_softmax_" in t.name) else 1) for t in tensors)
     info, _ = hardware if hardware is not None else cuda_hardware()
-    devices = list(info)
-    if args.device:
+    requested_devices = tp_devices(args)
+    ranks = max(1, len(requested_devices))
+    devices = requested_devices or list(info)
+    if args.device and not requested_devices:
         match = re.fullmatch(r"cuda(?::(\d+))?", args.device)
         if not match:
             raise ValueError("Clover requires --device cuda:N with exactly one GPU")
         devices = [int(match[1] or 0)]
     if any(d not in info for d in devices):
         raise ValueError("Clover selected CUDA ordinal is not visible")
+    host_weights = weights
+    if ranks > 1:
+        # Embedding/router/norm parameters are replicated. K/V projections are
+        # replicated once there are more ranks than KV heads; all other large
+        # projections and experts are sharded.
+        def divisor(name):
+            if name == "lm_head.weight" or ".mlp.experts." in name or ".mlp.shared_expert." in name:
+                return ranks
+            if ".linear_attn." in name and not name.endswith("norm.weight"):
+                return ranks
+            if ".self_attn." in name:
+                if name.endswith(("k_proj.weight", "v_proj.weight")):
+                    return min(ranks, int(config["num_key_value_heads"]))
+                if name.endswith(("q_proj.weight", "o_proj.weight")):
+                    return ranks
+            return 1
+        weights = sum(t.bytes * (2 if ("norm.weight" in t.name or ".A_log" in t.name or
+                      ".dt_bias" in t.name or ".bd_softmax_" in t.name) else 1) // divisor(t.name) for t in tensors)
     ratio = float(args.gpu_mem_ratio)
     if not math.isfinite(ratio) or not 0 < ratio <= 1:
         raise ValueError("gpu_mem_ratio must be in (0, 1]")
@@ -100,7 +149,8 @@ def resolve(args, query_gpu, config, *, hardware=None, ram=None):
     attention = types.count("full_attention")
     channels = (2 * int(config["linear_num_key_heads"]) + int(config["linear_num_value_heads"])) * 128
     state = linear * (4 * int(config["linear_num_value_heads"]) * 128 * 128 + 2 * channels * 3)
-    kv_per_token = attention * 2 * int(config["num_key_value_heads"]) * int(config["head_dim"]) * 2
+    state //= ranks
+    kv_per_token = attention * 2 * max(1, int(config["num_key_value_heads"]) // ranks) * int(config["head_dim"]) * 2
     speculative = args.speculative_algorithm == "clover" or "speculative_algorithm" not in explicit
     width = args.speculative_num_draft_tokens
     if width <= 0:
@@ -126,14 +176,14 @@ def resolve(args, query_gpu, config, *, hardware=None, ram=None):
             budget = min(budget, limit)
         if budget >= required:
             choices.append((budget, d))
-    if not choices:
-        raise ValueError("Clover needs one CUDA GPU with at least %.2f GiB available under the memory budget" %
+    if not choices or (requested_devices and len(choices) != len(devices)):
+        raise ValueError(("Clover needs each TP GPU" if ranks > 1 else "Clover needs one CUDA GPU") + " with at least %.2f GiB available under the memory budget" %
                          (required / memory.GiB))
     _, device = max(choices)
-    if info[device].get("capability", 0) < 80:
+    if any(info[d].get("capability", 0) < 80 for d in (requested_devices or [device])):
         for key in ("dtype", "atype", "kv_cache_dtype", "moe_dtype", "moe_atype"):
             setattr(args, key, "float16")
-    device = "cuda:%d" % device
+    device = "cuda:" + ",".join(map(str, requested_devices or [device]))
     if args.moe_device and args.moe_device != device:
         raise ValueError("Clover experts must reside on the same GPU as the main model")
     host_limit = memory._memory_limit_bytes(getattr(args, "auto_host_memory_limit", None), "auto_host_memory_limit")
@@ -160,9 +210,9 @@ def resolve(args, query_gpu, config, *, hardware=None, ram=None):
     # conversations and active requests can each retain a full context.
     # Readers can retain replaced checkpoints; allow one transactional publish
     # in addition to cached entries and each request's held checkpoint.
-    prefix_host = (records + args.max_batch + 1) * (kv // args.max_batch + state // args.max_batch +
+    prefix_host = (records + args.max_batch + 1) * ((kv + state) * ranks // args.max_batch +
                    4 * int(config.get("vocab_size", 248320))) if prefix_enabled else 0
-    if available_host < weights + prefix_host + 2 * memory.GiB:
+    if available_host < host_weights + (weights * ranks if ranks > 1 else 0) + prefix_host + 2 * memory.GiB:
         raise ValueError("Insufficient host RAM for Clover weights and prefix-cache budget")
     args.device = args.moe_device = device
     args.max_context_length = args.tokens = context
@@ -178,14 +228,14 @@ def resolve(args, query_gpu, config, *, hardware=None, ram=None):
     if "speculative_algorithm" not in explicit:
         args.speculative_algorithm = "clover"
     args.speculative_num_draft_tokens = width
-    result = dict(model="clover_moe", mode="single_gpu", device=device, max_batch=args.max_batch,
+    result = dict(model="clover_moe", mode="thread_tp" if ranks > 1 else "single_gpu", tp_size=ranks, device=device, max_batch=args.max_batch,
                   dtype=args.atype, max_context_length=context, weights_bytes=weights,
                   recurrent_state_bytes=state, snapshot_bytes=snapshots,
                   kv_bytes=kv, workspace_reserve_bytes=reserve, estimated_gpu_bytes=required,
                   prefix_cache_host_bytes=prefix_host,
                   prefix_cache_max_records=records if prefix_enabled else 0,
                   speculative_algorithm=args.speculative_algorithm, block_size=width,
-                  automatic={"policy": "single GPU; BF16 or legacy FP16; native context", "cuda_graph": False,
+                  automatic={"policy": "resident CUDA ranks; BF16 or legacy FP16; native context", "cuda_graph": False,
                              "moe_cuda_graph": os.environ.get("FASTLLM_CUDA_GRAPH", "").lower() not in ("0", "false", "off", "no")})
     print("[auto] " + json.dumps(result, sort_keys=True), flush=True)
     return result

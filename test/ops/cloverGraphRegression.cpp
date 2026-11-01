@@ -158,7 +158,7 @@ std::vector<std::vector<unsigned char>> Run(int seed, bool graphs, bool busyPool
     }
     return results;
 }
-std::vector<std::vector<unsigned char>> RunBatch(int seed, bool graphs, int batch = 2) {
+std::vector<std::vector<unsigned char>> RunBatch(int seed, bool graphs, int batch = 2, bool busyPool = false) {
     setenv("FASTLLM_CUDA_GRAPH", graphs ? "1" : "0", 1);
     CloverModel model; Populate(model, seed);
     using Cache = std::vector<std::pair<Data, Data>>;
@@ -169,6 +169,7 @@ std::vector<std::vector<unsigned char>> RunBatch(int seed, bool graphs, int batc
         for (int i = 0; i < (int)prefix.size(); ++i) prefix[i] = (b * 31 + i * 7) % 127;
         model.ForwardLogits(prefix, caches[b], false, ignored);
     }
+    if (busyPool) Require(FastllmCudaGraphMemoryPoolBegin(), "batch test pool begin");
     std::vector<Cache *> cachePtrs;
     for (auto &cache : caches) cachePtrs.push_back(&cache);
     std::vector<std::vector<unsigned char>> results;
@@ -220,6 +221,11 @@ std::vector<std::vector<unsigned char>> RunBatch(int seed, bool graphs, int batc
             Require(Bytes(caches[b][0].first) == Bytes(reference[b][0].first) &&
                     Bytes(caches[b][0].second) == Bytes(reference[b][0].second), "batch rollback crossed request state");
         }
+    }
+    if (busyPool) {
+        std::vector<void *> reserved;
+        Require(FastllmCudaGraphMemoryPoolEnd(reserved), "batch fallback aborted another pool owner");
+        FastllmCudaGraphMemoryPoolRelease(reserved);
     }
     return results;
 }
@@ -351,6 +357,7 @@ int main(int argc, char **argv) {
         }
         for (int batch : {3, 4, 8, 9, 32, 50, 64})
             Require(RunBatch(13, true, batch) == RunBatch(13, false, batch), "larger batch graph replay differs from eager");
+        Require(RunBatch(13, true, 64, true) == RunBatch(13, false, 64), "64-batch capture fallback differs from eager");
         restore();
         std::cout << "Clover MoE graphs: changing inputs/widths, model destruction, read-only preview KV, verification and capture fallback PASS" << std::endl;
     } catch (const std::exception &e) { restore(); std::cerr << e.what() << std::endl; return 1; }

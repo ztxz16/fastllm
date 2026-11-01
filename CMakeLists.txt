@@ -230,7 +230,7 @@ set(FASTLLM_CXX_SOURCES src/fastllm.cpp src/device.cpp src/model.cpp src/context
         src/utils/hybrid_moe.cpp src/utils/hybrid_parallel.cpp src/models/kimi_k3.cpp src/models/naive_n05_flash.cpp src/models/naive_n05_tp.cpp src/models/naive_n05_history.cpp src/models/naive_n05_draft.cpp src/models/naive_n05_kvmem.cpp
         src/models/minimax.cpp src/models/hunyuan.cpp
         src/models/ernie4_5.cpp src/models/pangu_moe.cpp src/models/glm4_moe.cpp src/models/glm5_moe_dsa.cpp src/models/glm5_next.cpp src/models/glm5_next_gpu.cpp src/models/glm5_next_hybrid.cpp src/models/gpt_oss.cpp
-        src/models/clover.cpp src/models/clover_sampling.cpp src/models/clover_generation.cpp src/models/minimax_m2.cpp src/models/qwen2.cpp src/models/gemma4.cpp src/models/step3p5.cpp src/models/laguna.cpp
+        src/models/clover.cpp src/models/clover_parallel.cpp src/models/clover_sampling.cpp src/models/clover_generation.cpp src/models/minimax_m2.cpp src/models/qwen2.cpp src/models/gemma4.cpp src/models/step3p5.cpp src/models/laguna.cpp
         third_party/json11/json11.cpp
         third_party/gguf/gguf.cpp third_party/gguf/ggml-quant.cpp third_party/gguf/ggml-iqk.cpp third_party/gguf/ggml-dequantize.cpp
         third_party/gguf/gguf-adapter.cpp
@@ -580,7 +580,7 @@ if (USE_CUDA)
     endif()
 
     # These C++ units include CUDA runtime/driver headers without going through nvcc.
-    set_property(SOURCE src/devices/cuda/models/glm5-next-dsa.cpp src/models/clover.cpp
+    set_property(SOURCE src/devices/cuda/models/glm5-next-dsa.cpp src/models/clover.cpp src/models/clover_parallel.cpp
         src/models/naive_n05_flash.cpp src/models/naive_n05_tp.cpp src/models/naive_n05_kvmem.cpp
         APPEND PROPERTY INCLUDE_DIRECTORIES "${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}")
 
@@ -3008,7 +3008,7 @@ if (UNIT_TEST)
         set_tests_properties(moe16_bf16 moe16_fp16 PROPERTIES
             LABELS cuda TIMEOUT 180 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
 
-        foreach(component Sampling Gdn Experts Graph)
+        foreach(component Sampling Gdn Experts Graph Parallel)
             set(target clover${component}Regression)
             string(TOLOWER ${component} component_lower)
             add_executable(${target} test/ops/${target}.cpp)
@@ -3023,7 +3023,11 @@ if (UNIT_TEST)
                     LABELS cuda TIMEOUT 180 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
             endif()
         endforeach()
-        set_tests_properties(clover_graph PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
+        set_tests_properties(clover_graph clover_parallel PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
+        set_tests_properties(clover_parallel clover_parallel_fp16 PROPERTIES LABELS "cuda;multigpu")
+        add_test(NAME clover_p2p_abort COMMAND cloverParallelRegression abort)
+        set_tests_properties(clover_p2p_abort PROPERTIES
+            LABELS "cuda;multigpu" TIMEOUT 15 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
 
         if (USE_NUMAS)
             add_executable(hybridBF16Regression test/ops/hybridBF16Regression.cpp)

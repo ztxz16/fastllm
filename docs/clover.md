@@ -1,11 +1,11 @@
-# Clover-35B-A3B-Preview 单卡部署
+# Clover-35B-A3B-Preview 部署
 
 此路径使用 FastLLM 的原生 C++ / CUDA 前向和生成循环，支持原版 BF16 checkpoint。GPU 计算不需要安装 SGLang 或 Triton。
 
 使用包含 Clover 支持的 FastLLM CUDA 构建：
 
 ```bash
-ftllm server /path/to/Clover-35B-A3B-Preview --auto \
+ftllm serve /path/to/Clover-35B-A3B-Preview --auto \
   --model_name clover --host 127.0.0.1 --port 8080
 ```
 
@@ -24,6 +24,20 @@ SM80 及更新架构默认使用 BF16。SM75 及以下自动使用 FP16 权重�
 路由专家使用公共 CUDA FP16/BF16 MoE 后端，Clover 仅生成路由索引与分数。SM70/75 的 4～32 行专家计算复用 cuBLAS 批量矩阵乘、通用 FP32 SwiGLU 和精度转换；专家指针表在 GPU 上更新，支持动态路由的图回放。较大块及不满足对齐条件的形状保留通用分组矩阵乘，更低架构使用普通 CUDA 专家计算。cuBLAS 路径保留 FP32 累加和 FP16 存储舍入边界，但归约顺序不同，不保证与原路径生成相同 token。注意力在 SM75 及以上复用 FlashInfer，SM70 及以下使用有界工作区的在线 softmax 内核。FP16 GDN prefill 使用因果递推，不调用 BF16 专用内核。此 FP16 路径当前用于全 GPU 驻留，NUMA 混推仍使用 BF16。
 
 需为目标架构编译，例如 `-DUSE_CUDA=ON -DCUDA_ARCH=75`。SM70 及以下使用仍支持对应架构的 CUDA 12.x 工具链；CUDA 13 不再生成这些架构的代码。FP16 与 BF16 都是两字节权重，精度切换不会降低模型的显存容量要求。
+
+## 张量并行
+
+使用 `--tp` 指定 GPU，每张卡由一个常驻线程执行本地分片。数字表示卡数，也可以显式指定可见设备编号：
+
+```bash
+ftllm serve /path/to/Clover-35B-A3B-Preview --auto --tp cuda:0,1 \
+  --max_batch 16 --max_context_length 32768 \
+  --model_name clover --host 127.0.0.1 --port 8080
+```
+
+原版模型支持 TP2、TP4、TP8 和 TP16 的分片形状；实际卡数需满足头数、专家中间维度和词表的整除条件。各卡等分 Q/GDN 头、专家中间维度和 LM head 词表。超过两个 rank 时复制相应的 GQA KV 头。Embedding、router 和归一化参数复制；每层 attention 输出归约一次，共享专家与路由专家的本地结果合并后归约一次。LM head 汇集 BF16/FP16 logits，主卡统一采样和提交接受长度。归约复用公共 MultiCUDA/NCCL 后端，不增加外部算子库。
+
+KV、FP32 GDN 状态、预览和部分接受回滚均按 rank 保存，跨请求前缀缓存恢复各卡独立的可写状态。`--auto --tp` 对每张卡检查容量，并计入权重主存副本及分片缓存；单卡默认行为不变。TP 暂不与 NUMA 路由专家混用，不支持不等比例分片。TP 改变浮点归约顺序，不保证与 TP1 逐 token 相同；同一组 GPU 使用相同精度，包含 SM75 或更早设备时统一使用 FP16。
 
 ## 生成方式
 
@@ -46,7 +60,7 @@ SM80 及更新架构默认使用 BF16。SM75 及以下自动使用 FP16 权重�
 如需官方 Hugging Face 的低置信度迭代填充方式：
 
 ```bash
-ftllm server /path/to/Clover-35B-A3B-Preview --auto --speculative_algorithm off
+ftllm serve /path/to/Clover-35B-A3B-Preview --auto --speculative_algorithm off
 ```
 
 或者在单个请求中设置：
@@ -78,7 +92,7 @@ ftllm server /path/to/Clover-35B-A3B-Preview --auto --speculative_algorithm off
 编译时启用 `USE_CUDA` 和 `USE_NUMAS`，可将路由专家放在主存，主干、router 和共享专家仍在单张 GPU 上计算。此路径使用原生 BF16 专家，不需要额外的算子库。
 
 ```bash
-ftllm server /path/to/Clover-35B-A3B-Preview \
+ftllm serve /path/to/Clover-35B-A3B-Preview \
   --device cuda:0 --moe_device numa --moe_cuda_cache 0 \
   --cuda_embedding --threads 32 --max_batch 1 \
   --max_context_length 4096 --chunked_prefill_size 256 \
@@ -113,7 +127,7 @@ CPU 按整个请求块归并同一专家的路由；缓存与动态分流复用�
 - Preview 只读已提交状态；部分接受恢复对应前缀的卷积及 GDN 状态，并截断 Attention KV 的逻辑长度。
 - Attention KV 在 256 token 以内按 256 预留，之后按 1024 token 扩容，减少连续缓冲的分配、搬运和释放；预留容量不超过有效上下文按 256 向上取整的预算，逻辑长度与回滚规则不变。
 - 支持流式 / 非流式文本 API、EOS、停止字符串、取消请求和运行时错误返回。
-- 当前不支持多卡、BF16/FP16 以外的权重精度、多模态、LoRA 或约束解码。默认 `--max_batch 1`；自推测模式可设 `--max_batch 2`～`64`，相同 16/32-token 块宽的请求合批执行输入投影、GDN、MoE 和输出 head；输出投影保留 32 行分块的归约顺序，SM90 BF16 使用同一 cuBLASLt 算法合并发射；其他路径保留原分块。Q/K 归一化、RoPE 和 KV 追加合批执行，SM90 full attention 复用 FlashInfer 合批内核，其他架构保留逐请求内核；prefill 按请求执行。不同请求的可写 KV、循环状态、coreset 和接受前缀相互独立；低置信度扩散模式仍限单请求。64 是调度和算子的容量上限，实际可用并发还取决于显存、上下文和推测块宽；`--auto` 为每个活跃请求完整计算 KV、循环状态和回滚快照，并计入 MoE 图与 logits 工作区。显存不足时需减少并发或缩短上下文，不会自动截断请求。
+- 当前不支持 BF16/FP16 以外的权重精度、多模态、LoRA 或约束解码。默认 `--max_batch 1`；自推测模式可设 `--max_batch 2`～`64`，相同 16/32-token 块宽的请求合批执行输入投影、GDN、MoE 和输出 head；输出投影保留 32 行分块的归约顺序，SM90 BF16 使用同一 cuBLASLt 算法合并发射；其他路径保留原分块。Q/K 归一化、RoPE 和 KV 追加合批执行，SM90 full attention 复用 FlashInfer 合批内核，其他架构保留逐请求内核；prefill 按请求执行。不同请求的可写 KV、循环状态、coreset 和接受前缀相互独立；低置信度扩散模式仍限单请求。64 是调度和算子的容量上限，实际可用并发还取决于显存、上下文和推测块宽；`--auto` 为每个活跃请求完整计算 KV、循环状态和回滚快照，并计入 MoE 图与 logits 工作区。显存不足时需减少并发或缩短上下文，不会自动截断请求。
 - 至少 8 个请求、16/32-token 验证块的 GDN 快照保存初始 FP32 状态及逐 token 更新记录；部分接受时按原有舍入顺序重建状态，在 CTA 内复用 K、残差和衰减系数，避免为每个 token 写出完整矩阵。较小批次保留完整快照。`--auto` 仍按完整快照保守估算容量，以覆盖批次缩小和混合块宽时的回退。
 - 推测预览和验证在至多 32 个请求时使用模型持有的 MoE 子图，更大批次走 eager；切换合批形状会释放旧图，捕获失败回退到 eager。已有的 `FASTLLM_CUDA_GRAPH=0` 可关闭子图。当前未启用整模型 CUDA Graph。
 - SM90 及以上且实际加载的 PTX 支持时，GDN、归一化、旋转位置编码和采样辅助算子使用 CUDA PDL 隐藏相邻 kernel 的发射开销。每个 kernel 在读取前驱输出前等待依赖完成，计算及舍入顺序不变；旧架构或旧 PTX 保留普通 stream 发射，不增加环境变量或外部依赖。

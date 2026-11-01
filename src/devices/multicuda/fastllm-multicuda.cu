@@ -2999,6 +2999,13 @@ const void *FastllmTP2P2PExchangeHostPointer(
     while (hostSlot.sequences[peerRank].load(std::memory_order_acquire) !=
            sequence) {
         if ((++spins & 1023U) == 0) {
+            // Share the NCCL group's cancellation state. A rank failure must
+            // also release peers waiting in the eager P2P pointer exchange.
+            if (g_ncclSubmitRendezvous && !g_ncclSubmitRendezvous->Error().empty()) {
+                if (bothEligible) *bothEligible = false;
+                FastllmCudaSetThreadError();
+                return nullptr;
+            }
             std::this_thread::yield();
         }
     }
@@ -3307,6 +3314,7 @@ bool FastllmTryTP2P2PAllReduceAdd(void* data, void* dest, int count,
     cudaSetDevice(deviceId);
     cudaStream_t stream = cudaStreamPerThread;
     const void *peerData = FastllmTP2P2PExchangeHostPointer(state, rank, sequence, data);
+    if (!peerData) return true; // Cancellation is already recorded as a thread error.
     if (dataType == fastllm::DataType::FLOAT16) {
         FastllmLaunchTP2P2PReduceAddKnownPeer(
             (half*)dest, (const half*)dest, (const half*)data,
@@ -3580,6 +3588,10 @@ static void FastllmNcclAllReduceImpl(void* data, void* dest, int count,
         cudaError_t syncState = cudaStreamSynchronize(stream);
         checkCudaErrors("Error: CUDA error when synchronizing NCCL allreduce!", syncState);
     }
+}
+
+void FastllmNcclAbort(const char *reason) {
+    if (g_ncclSubmitRendezvous) g_ncclSubmitRendezvous->Abort(reason);
 }
 
 void FastllmNcclAllReduce(void* data, void* dest, int count, int dataType, int deviceId) {

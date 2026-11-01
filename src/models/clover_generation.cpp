@@ -192,7 +192,8 @@ struct CloverModel::Request {
         auto stats = Summarize(m, logits, candidates, !options.exact, !options.exact);
         int accepted = Accepted(candidates, stats.data());
         bonus = Sample(m, ctx, logits, accepted, stats[accepted].token);
-        return Commit(m, ctx, candidates, accepted);
+        m.RestorePrefix(ctx.pastKeyValues, snapshots, accepted + 1);
+        return AcceptedOutput(candidates, accepted);
     }
     int Accepted(const std::vector<int> &candidates, const CloverCudaTokenStats *stats) const {
         int accepted = 0;
@@ -206,9 +207,7 @@ struct CloverModel::Request {
         }
         return accepted;
     }
-    std::vector<int> Commit(CloverModel &m, ResponseContext &ctx,
-            const std::vector<int> &candidates, int accepted) {
-        m.RestorePrefix(ctx.pastKeyValues, snapshots, accepted + 1);
+    std::vector<int> AcceptedOutput(const std::vector<int> &candidates, int accepted) const {
         std::vector<int> output(candidates.begin() + 1, candidates.begin() + accepted + 1);
         output.push_back(bonus);
         return output;
@@ -233,10 +232,21 @@ void CloverModel::LoadPrefix(ResponseContext &ctx, Request &r, Data &logits) {
     if (!snapshot) return;
     FastllmCudaSetDevice(cudaDevice);
     // Restore independent writable storage. Cached chunks and states are immutable.
-    auto restore = [&](const Data &src, Data &dst) {
+    std::function<void(const Data &, Data &, int)> restore = [&](const Data &src, Data &dst, int device) {
+        if (src.multiDeviceData) {
+            dst.multiDeviceData = true;
+            for (auto &entry : src.multiDeviceDatas) {
+                auto &shard = dst.multiDeviceDatas[entry.first];
+                if (!shard) shard = new Data();
+                restore(*entry.second, *shard, entry.first);
+            }
+            dst.dataType = src.dataType; dst.UpdateUnitSize(); dst.Resize(src.dims);
+            return;
+        }
+        FastllmCudaSetDevice(device);
         dst.dataType = src.dataType; dst.UpdateUnitSize();
         dst.Resize(src.dims);
-        dst.ToDevice(DataDevice::CUDA, std::vector<int>{cudaDevice}, false);
+        dst.ToDevice(DataDevice::CUDA, std::vector<int>{device}, false);
         dst.Allocate(false);
         FastllmCudaCopyFromHostToDevice(dst.cudaData, src.cpuData, src.GetBytes());
     };
@@ -245,25 +255,41 @@ void CloverModel::LoadPrefix(ResponseContext &ctx, Request &r, Data &logits) {
         auto &dst = second ? restored[i].second : restored[i].first;
         if (linearLayers[i]) {
             const auto &src = second ? snapshot->recurrent[i].second : snapshot->recurrent[i].first;
-            restore(src, dst);
+            restore(src, dst, cudaDevice);
         } else {
-            dst.dataType = dataType; dst.UpdateUnitSize();
-            dst.ToDevice(DataDevice::CUDA, std::vector<int>{cudaDevice}, false);
-            dst.Expansion({(snapshot->cachedLen + 255) / 256 * 256, num_key_value_heads, head_dim});
-            dst.Resize({snapshot->cachedLen, num_key_value_heads, head_dim});
-            const size_t rowBytes = size_t(num_key_value_heads) * head_dim * 2;
-            for (auto chunk = snapshot->kv; chunk; chunk = chunk->previous) {
-                const auto &src = second ? chunk->layers[i].second : chunk->layers[i].first;
-                FastllmCudaCopyFromHostToDevice((char *)dst.cudaData + size_t(chunk->begin) * rowBytes,
-                    src.cpuData, size_t(chunk->end - chunk->begin) * rowBytes);
+            auto devices = parallelDevices.empty() ? std::vector<int>{cudaDevice} : parallelDevices;
+            for (int device : devices) {
+                Data *target = &dst;
+                if (!parallelDevices.empty()) {
+                    dst.multiDeviceData = true;
+                    target = dst.multiDeviceDatas[device] = new Data();
+                }
+                FastllmCudaSetDevice(device);
+                const auto &root = second ? snapshot->kv->layers[i].second : snapshot->kv->layers[i].first;
+                const auto &example = root.multiDeviceData ? *root.multiDeviceDatas.at(device) : root;
+                int heads = example.dims.at(1);
+                target->dataType = dataType; target->UpdateUnitSize();
+                target->ToDevice(DataDevice::CUDA, std::vector<int>{device}, false);
+                target->Expansion({(snapshot->cachedLen + 255) / 256 * 256, heads, head_dim});
+                target->Resize({snapshot->cachedLen, heads, head_dim});
+                const size_t rowBytes = size_t(heads) * head_dim * 2;
+                for (auto chunk = snapshot->kv; chunk; chunk = chunk->previous) {
+                    const auto &root = second ? chunk->layers[i].second : chunk->layers[i].first;
+                    const auto &src = root.multiDeviceData ? *root.multiDeviceDatas.at(device) : root;
+                    FastllmCudaCopyFromHostToDevice((char *)target->cudaData + size_t(chunk->begin) * rowBytes,
+                        src.cpuData, size_t(chunk->end - chunk->begin) * rowBytes);
+                }
+                target->isKVCache = true;
             }
         }
         dst.isKVCache = true;
         dst.isLinearAttention = linearLayers[i];
     }
     if (snapshot->cachedLen == int(ctx.currentTokens.size()) && r.options.speculative) {
-        restore(snapshot->logits, logits);
+        restore(snapshot->logits, logits, cudaDevice);
     }
+    PublishCache(restored);
+    FastllmCudaSetDevice(cudaDevice);
     ctx.pastKeyValues.swap(restored);
     r.prefilled = r.restoredTokens = r.lastSavedLength = snapshot->cachedLen;
     r.prefixSnapshot = std::move(snapshot);
@@ -299,24 +325,42 @@ void CloverModel::SavePrefix(ResponseContext &ctx, Request &r, const Data *logit
     chunk->layers.resize(block_cnt);
     // Host checkpoints do not consume the GPU inference budget. KV is copied
     // incrementally, once per committed span, and shared by interval snapshots.
-    auto copy = [&](const Data &src, Data &dst, std::vector<int> shape, size_t offset = 0) {
-        dst.dataType = src.dataType; dst.UpdateUnitSize();
-        dst.Resize(shape); dst.Allocate();
+    std::function<void(const Data &, Data &, int, int)> copy =
+        [&](const Data &src, Data &dst, int begin, int end) {
+        auto shape = src.dims;
+        size_t offset = 0;
+        if (begin >= 0) {
+            Require(shape.size() == 3, "invalid prefix KV shape");
+            shape[0] = end - begin;
+            offset = size_t(begin) * shape[1] * shape[2] * src.unitSize;
+        }
+        dst.dataType = src.dataType; dst.UpdateUnitSize(); dst.Resize(shape);
         dst.isLinearAttention = src.isLinearAttention;
-        FastllmCudaCopyFromDeviceToHost(dst.cpuData, (char *)src.cudaData + offset, dst.GetBytes());
+        if (src.multiDeviceData) {
+            dst.multiDeviceData = true;
+            for (auto &entry : src.multiDeviceDatas) {
+                auto &shard = dst.multiDeviceDatas[entry.first];
+                if (!shard) shard = new Data();
+                copy(*entry.second, *shard, begin, end);
+            }
+        } else {
+            FastllmCudaSetDevice(src.dataDeviceIds.empty() ? cudaDevice : src.dataDeviceIds[0]);
+            dst.Allocate();
+            FastllmCudaCopyFromDeviceToHost(dst.cpuData, (char *)src.cudaData + offset, dst.GetBytes());
+        }
     };
     for (int i = 0; i < block_cnt; ++i) for (bool second : {false, true}) {
         const auto &src = second ? ctx.pastKeyValues[i].second : ctx.pastKeyValues[i].first;
         if (linearLayers[i]) {
             auto &dst = second ? snapshot->recurrent[i].second : snapshot->recurrent[i].first;
-            copy(src, dst, src.dims);
+            copy(src, dst, -1, 0);
         } else {
             auto &dst = second ? chunk->layers[i].second : chunk->layers[i].first;
-            copy(src, dst, {length - chunk->begin, num_key_value_heads, head_dim},
-                size_t(chunk->begin) * num_key_value_heads * head_dim * 2);
+            copy(src, dst, chunk->begin, length);
         }
     }
-    if (logits) copy(*logits, snapshot->logits, logits->dims);
+    if (logits) copy(*logits, snapshot->logits, -1, 0);
+    FastllmCudaSetDevice(cudaDevice);
     snapshot->kv = chunk;
     prefixCache->store.Publish(std::move(snapshot), r.prefixSnapshot,
         RecurrentPrefixMaxPerRequest(), RecurrentPrefixMaxRecords(maxBatch));
@@ -326,6 +370,7 @@ void CloverModel::SavePrefix(ResponseContext &ctx, Request &r, const Data *logit
 
 CloverModel::~CloverModel() {
     ShutdownRuntime();
+    parallel.reset();
     moeGraphs.reset();
 }
 
@@ -633,10 +678,13 @@ std::vector<std::vector<int>> CloverModel::StepBatch(const std::vector<ResponseC
             rows.push_back(r.SamplingRow(*contexts[b], logits[b], accepted[b], vocabSize));
     }
     auto sampled = batch[0]->SampleRows(*this, rows);
+    std::vector<int> acceptedInputs;
+    for (int n : accepted) acceptedInputs.push_back(n + 1);
+    RestorePrefixBatch(caches, {snapshots.begin(), snapshots.end()}, acceptedInputs);
     size_t nextSample = 0;
     for (int b = 0; b < size; ++b) {
         if (contexts[b]->generationConfig.do_sample) batch[b]->bonus = sampled[nextSample++];
-        output[b] = batch[b]->Commit(*this, *contexts[b], candidates[b], accepted[b]);
+        output[b] = batch[b]->AcceptedOutput(candidates[b], accepted[b]);
     }
     return output;
 #else

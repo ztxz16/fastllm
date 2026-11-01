@@ -38,6 +38,8 @@ public:
         const std::vector<CloverSnapshots *> &snapshots = {});
     void RestorePrefix(std::vector<std::pair<Data, Data>> &cache,
         const CloverSnapshots &snapshots, int acceptedInputs);
+    void RestorePrefixBatch(const std::vector<std::vector<std::pair<Data, Data>> *> &caches,
+        const std::vector<const CloverSnapshots *> &snapshots, const std::vector<int> &acceptedInputs);
     ModelContextSpec GetContextSpec() const override { return {true, false, ""}; }
     bool UseModelSpecificScheduler() const override { return true; }
     void RunModelSpecificScheduler() override;
@@ -54,6 +56,29 @@ public:
         const std::string &input, const std::string &output) override;
     void WarmUp() override;
 private:
+    using CachePair = std::pair<Data *, Data *>;
+    using CacheView = std::vector<CachePair>;
+    struct SnapshotView {
+        int position = 0, tokens = 0;
+        CacheView layers;
+    };
+    struct Parallel;
+    std::shared_ptr<Parallel> parallel;
+    std::vector<int> parallelDevices;
+    int tpRank = 0, tpSize = 1;
+    bool rankLocal = false;
+    bool InitParallel();
+    void RunParallel(const std::function<void(CloverModel &, int)> &task);
+    CacheView ViewCache(std::vector<std::pair<Data, Data>> &cache, int device = -1);
+    void PublishCache(std::vector<std::pair<Data, Data>> &cache);
+    void ForwardLogitsLocal(const std::vector<int> &tokens, CacheView &cache, bool preview,
+        Data &logits, bool lastOnly, SnapshotView *snapshots, bool needLogits);
+    void ForwardLogitsBatchLocal(const std::vector<std::vector<int>> &tokens,
+        const std::vector<CacheView *> &caches, bool preview, std::vector<Data> &logits,
+        const std::vector<SnapshotView *> &snapshots);
+    void RestorePrefixLocal(CacheView &cache, const SnapshotView &snapshots, int acceptedInputs);
+    void Reduce(Data &data);
+    void GatherLogits(Data &data);
     std::vector<bool> linearLayers;
     int keyHeads = 16, valueHeads = 32, intermediate = 512;
     int blockSize = 32;
@@ -90,16 +115,16 @@ private:
     void Norm(Data &input, const std::string &name, Data &output,
         Data *gate = nullptr, bool zeroCentered = true);
     void AddNorm(Data &residual, Data &input, const std::string &name, Data &output);
-    void Gdn(Data &input, int layer, std::pair<Data, Data> &cache,
-        bool preview, Data &output, std::pair<Data, Data> *snapshots = nullptr);
-    void FullAttention(Data &input, int layer, std::pair<Data, Data> &cache,
+    void Gdn(Data &input, int layer, CachePair &cache,
+        bool preview, Data &output, CachePair *snapshots = nullptr);
+    void FullAttention(Data &input, int layer, CachePair &cache,
         int position, bool preview, Data &output);
-    void GdnCoreBatch(Data &projected, int layer, std::pair<Data, Data> *const *caches, int batch,
-        bool preview, Data &normalized, std::pair<Data, Data> *const *snapshots);
+    void GdnCoreBatch(Data &projected, int layer, CachePair *const *caches, int batch,
+        bool preview, Data &normalized, CachePair *const *snapshots);
     void FullAttentionCore(Data &qgate, Data &k, Data &v, int layer,
-        std::pair<Data, Data> &cache, int position, bool preview, Data &output);
+        CachePair &cache, int position, bool preview, Data &output);
     void FullAttentionCoreBatch(Data &projected, int layer,
-        const std::vector<std::vector<std::pair<Data, Data>> *> &caches,
+        const std::vector<CacheView *> &caches,
         const std::vector<int> &positions, int width, bool preview, Data &output);
     void Moe(Data &input, int layer, bool preview, Data &output, bool graphAllowed, int batch = 1);
 };
