@@ -2710,7 +2710,7 @@ __global__ void FastllmTransposeByRowKernel(uint8_t *dst, uint8_t *ori, int n, i
     }
 }
 
-template <int THREAD_PER_BLOCK>
+template <int THREAD_PER_BLOCK, typename Pack = uint8_t>
 __global__ void FastllmTransposeLastTwoByBatchKernel(
         uint8_t *dst, const uint8_t *ori, int batch, int n, int m, int k) {
     int batchIndex = blockIdx.x / (n * m);
@@ -2718,11 +2718,29 @@ __global__ void FastllmTransposeLastTwoByBatchKernel(
     int row = inner / m;
     int col = inner % m;
     const uint8_t *curInput = ori +
-        ((batchIndex * n + row) * m + col) * k;
+        ((size_t(batchIndex) * n + row) * m + col) * k;
     uint8_t *curOutput = dst +
-        ((batchIndex * m + col) * n + row) * k;
-    for (int i = threadIdx.x; i < k; i += THREAD_PER_BLOCK) {
-        curOutput[i] = curInput[i];
+        ((size_t(batchIndex) * m + col) * n + row) * k;
+    for (size_t i = size_t(blockIdx.y) * THREAD_PER_BLOCK + threadIdx.x;
+         i < size_t(k) / sizeof(Pack); i += size_t(gridDim.y) * THREAD_PER_BLOCK) {
+        ((Pack*)curOutput)[i] = ((const Pack*)curInput)[i];
+    }
+}
+
+static void FastllmLaunchBlockTranspose(void *dst, const void *src,
+                                      int batch, int n, int m, int rowBytes) {
+    // Wide contiguous blocks need multiple CTAs per row. Preserve the byte
+    // fallback for short rows and unaligned tensor views of any data type.
+    if (rowBytes >= 4096 && rowBytes % 16 == 0 &&
+        ((reinterpret_cast<uintptr_t>(dst) | reinterpret_cast<uintptr_t>(src)) & 15) == 0) {
+        const unsigned tiles = std::min<size_t>((size_t(rowBytes) + 4095) / 4096, 65535);
+        FastllmTransposeLastTwoByBatchKernel<256, uint4>
+            <<<dim3(batch * n * m, tiles), 256, 0, cudaStreamPerThread>>>(
+                (uint8_t*)dst, (const uint8_t*)src, batch, n, m, rowBytes);
+    } else {
+        FastllmTransposeLastTwoByBatchKernel<256>
+            <<<batch * n * m, 256, 0, cudaStreamPerThread>>>(
+                (uint8_t*)dst, (const uint8_t*)src, batch, n, m, rowBytes);
     }
 }
 
@@ -13363,10 +13381,7 @@ bool FastllmCudaPermute(fastllm::Data &input, const std::vector<int> &axis) {
         int n = input.dims[1];
         int m = input.dims[2];
         int rowBytes = input.dims[3] * input.unitSize;
-        FastllmTransposeLastTwoByBatchKernel<256>
-            <<<batch * n * m, 256, 0, cudaStreamPerThread>>>(
-                (uint8_t*)input.cudaData, (const uint8_t*)tempData,
-                batch, n, m, rowBytes);
+        FastllmLaunchBlockTranspose(input.cudaData, tempData, batch, n, m, rowBytes);
         input.Resize(new_dims);
     } else {
         std::vector<int> temp;
@@ -13435,10 +13450,7 @@ bool FastllmCudaPermuteTo(const fastllm::Data &input, fastllm::Data &output,
         int n = input.dims[1];
         int m = input.dims[2];
         int rowBytes = input.dims[3] * input.unitSize;
-        FastllmTransposeLastTwoByBatchKernel<256><<<batch * n * m, 256,
-                                                   0, cudaStreamPerThread>>>(
-            (uint8_t*)output.cudaData, (const uint8_t*)input.cudaData,
-            batch, n, m, rowBytes);
+        FastllmLaunchBlockTranspose(output.cudaData, input.cudaData, batch, n, m, rowBytes);
     } else {
         return false;
     }

@@ -1707,6 +1707,13 @@ if (UNIT_TEST)
                 "PASS [0-9]+ borrowed CUDA conversions" 300)
             set_tests_properties(cudaBorrowedConversion PROPERTIES LABELS cuda RUN_SERIAL TRUE)
 
+            add_executable(cudaBlockTransposeRegression test/ops/cudaBlockTransposeRegression.cpp)
+            target_link_libraries(cudaBlockTransposeRegression PRIVATE fastllm)
+            target_include_directories(cudaBlockTransposeRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            fastllm_add_checked_test(cudaBlockTranspose cudaBlockTransposeRegression
+                "PASS [0-9]+ block transpose oracle" 120)
+            set_tests_properties(cudaBlockTranspose PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+
             add_executable(multiCudaOutputGatherRegression test/ops/multiCudaOutputGatherRegression.cpp)
             target_link_libraries(multiCudaOutputGatherRegression PRIVATE fastllm)
             target_include_directories(multiCudaOutputGatherRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
