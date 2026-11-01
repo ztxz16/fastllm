@@ -16,14 +16,19 @@ struct Plan {
     float scale = 1.f;
     bool verifying = false;
     void *storage = nullptr;
+    std::shared_ptr<void> owner;
+    int device = -1;
     bool gathered = false;
     bf16 *decoded = nullptr;
     int32_t *decodedIndices = nullptr;
     bf16 *mid = nullptr;
     float *midLse = nullptr;
-    ~Plan() {
-        if (storage)
-            cudaFree(storage);
+    void BindStorage() {
+        const size_t count = size_t(batch) * scratchHeads * splits;
+        mid = static_cast<bf16 *>(storage);
+        midLse = reinterpret_cast<float *>(mid + count * 512);
+        decoded = gathered ? reinterpret_cast<bf16 *>(midLse + count) : nullptr;
+        decodedIndices = gathered ? reinterpret_cast<int32_t *>(decoded + size_t(batch) * (128 + width) * 512) : nullptr;
     }
 };
 
@@ -298,13 +303,24 @@ void *FastllmV41FlashInferCreate(const FastllmV41FullDecodeConfig &c) {
         }
         p->gathered = false;
     }
-    p->mid = static_cast<bf16 *>(p->storage);
-    p->midLse = reinterpret_cast<float *>(p->mid + midCount * 512);
-    if (p->gathered) {
-        p->decoded = reinterpret_cast<bf16 *>(p->midLse + midCount);
-        p->decodedIndices = reinterpret_cast<int32_t *>(p->decoded + selectedRows * 512);
-    }
+    cudaGetDevice(&p->device);
+    p->owner = std::shared_ptr<void>(p->storage, [device = p->device](void *data) {
+        int old = 0; cudaGetDevice(&old); cudaSetDevice(device);
+        cudaFree(data); cudaSetDevice(old);
+    });
+    p->BindStorage();
     return p.release();
+}
+
+bool FastllmV41FlashInferShareWorkspace(void *handle, void *source) {
+    auto *p = static_cast<Plan *>(handle), *q = static_cast<Plan *>(source);
+    if (!p || !q || p->device != q->device || p->batch != q->batch ||
+        p->scratchHeads != q->scratchHeads || p->splits != q->splits ||
+        p->width != q->width || p->gathered != q->gathered || !q->owner) return false;
+    p->owner = q->owner;
+    p->storage = p->owner.get();
+    p->BindStorage();
+    return true;
 }
 
 void FastllmV41FlashInferDestroy(void *plan) {

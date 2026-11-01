@@ -1226,11 +1226,30 @@ void PrepareEpResidency(OffloadGroup &group, DeviceCache &cache) {
     } else FinishEpAdmissions(cache);
 }
 
+bool NativeMailboxOwnsLayer(const OffloadGroup &group, const DeviceCache &cache, int table) {
+    if (!group.expertDevices.empty() || group.tensorParallelRequested || cache.prefillOwnerCount != 1)
+        return false;
+    if (group.deviceCaches.size() == 1 &&
+        std::none_of(group.cacheDevices.begin(), group.cacheDevices.end(),
+            [&](int d) { return d >= 0 && d != cache.device; })) return true;
+    // Serial PP: each complete layer has one immutable owner. It never borrows
+    // another device's expert cache (unlike EP/cooperative GGUF execution).
+    return group.layout.deepSeekV41 && group.layout.weightType == fastllm::NVFP4_BLOCK_32_E8M0 &&
+        table >= 0 && table < int(group.cacheDevices.size()) && group.cacheDevices[table] == cache.device;
+}
+
 bool CanOverlapNativeAdmissions(const OffloadGroup &group, const DeviceCache &cache) {
     // A mailbox can outlive its active mode. Never extend its acquire/release
-    // protocol to another cache owner or to an EP/PP transition.
-    return cache.nativeMailbox && group.deviceCaches.size() == 1 &&
-        group.expertDevices.empty() && cache.prefillOwnerCount == 1;
+    // protocol to another cache owner or an unpartitioned multi-GPU group.
+    if (!cache.nativeMailbox || !group.expertDevices.empty() || group.tensorParallelRequested ||
+        cache.prefillOwnerCount != 1) return false;
+    if (group.deviceCaches.size() == 1) return true;
+    if (!group.layout.deepSeekV41 || group.layout.weightType != fastllm::NVFP4_BLOCK_32_E8M0 ||
+        group.cacheDevices.size() != group.tableKeys.size() || cache.layerSlots.size() != group.tableKeys.size())
+        return false;
+    for (int l = 0; l < int(group.tableKeys.size()); ++l)
+        if (cache.layerSlots[l].count && group.cacheDevices[l] != cache.device) return false;
+    return true;
 }
 
 void WaitCacheAdmission(const DeviceCache &cache) {
@@ -4564,6 +4583,10 @@ static int EndMoeFrequencyStep(DeviceCache &cache) {
 }
 
 static void EndDeviceMoeDecode(DeviceCache &cache) {
+    int previous = 0;
+    checkCudaErrors("MoE finish current device", cudaGetDevice(&previous));
+    struct Restore { int device; ~Restore() { cudaSetDevice(device); } } restore{previous};
+    checkCudaErrors("MoE finish owner device", cudaSetDevice(cache.device));
     FinishNativeMoeMailbox(cache, true);
     if (cache.frequency && cache.frequencyActive) {
         EndMoeFrequencyStep(cache);
@@ -5427,7 +5450,7 @@ void *FastllmCudaCreateNativeMoeFullGraph(const fastllm::Data &input, const fast
     int table = -1;
     auto *group = FindHybridGroup(weights, weightsBatch, &table);
     if (!group || !group->cpuDecodeReady || !group->expertDevices.empty() ||
-        group->tensorParallelRequested || group->deviceCaches.size() != 1) return nullptr;
+        group->tensorParallelRequested) return nullptr;
     const auto &layout = group->LayerLayout(table);
     const bool supportedGGUF = layout.weightType == fastllm::DATA_GGUF_FORMAT &&
         FastllmCudaV41GGUFSupported(layout.gateGgmlType, layout.downGgmlType) &&
@@ -5435,7 +5458,7 @@ void *FastllmCudaCreateNativeMoeFullGraph(const fastllm::Data &input, const fast
     if (!layout.deepSeekV41 || input.dims[1] != layout.hidden ||
         (layout.weightType != fastllm::NVFP4_BLOCK_32_E8M0 && !supportedGGUF)) return nullptr;
     auto *cache = GetDeviceCache(*group, false);
-    if (!cache || !cache->frequency) return nullptr;
+    if (!cache || !cache->frequency || !NativeMailboxOwnsLayer(*group, *cache, table)) return nullptr;
     if (!cache->nativeMailbox) cache->nativeMailbox = std::make_shared<NativeMoeMailbox>(*group, *cache);
     auto *handle = cache->nativeMailbox->CreateFull(table, input, index, score, output,
         weights, weightsBatch, layer, reinterpret_cast<cudaGraph_t>(const_cast<void *>(sharedGraph)));

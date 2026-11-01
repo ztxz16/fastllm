@@ -901,9 +901,7 @@ bool TryNativeMoeMailbox(OffloadGroup &group, DeviceCache &cache, int table,
     // Keep its allocation/capture phase synchronous; asynchronous replay
     // starts only after that model graph and its workspace are established.
     if (!fastllm::GetFastllmEnv().cudaGraph || FastllmCudaGraphMemoryPoolActive() || !cache.frequencyActive ||
-        (devices && devices->size() != 1) || !group.expertDevices.empty() || group.deviceCaches.size() != 1 ||
-        std::any_of(group.cacheDevices.begin(), group.cacheDevices.end(),
-            [&](int d) { return d >= 0 && d != cache.device; }) ||
+        (devices && devices->size() != 1) || !NativeMailboxOwnsLayer(group, cache, table) ||
         !layout.deepSeekV41 || layout.weightType != fastllm::NVFP4_BLOCK_32_E8M0 ||
         input.dataType != fastllm::BFLOAT16 || input.dims[0] != 1 ||
         (routePhase != FastllmMoeRoutePhase::Decode && routePhase != FastllmMoeRoutePhase::Unspecified)) return false;

@@ -296,7 +296,7 @@ namespace fastllm {
         ExecutionMode executionMode = ExecutionMode::Cpu;
         bool v41MoeCudaGraphCompatible = true;
         void InitExecutionMode();
-        void BeginHybridMoeStep(HybridMoeDecodeStep &, bool tp, bool single, int seqlen);
+        void BeginHybridMoeStep(HybridMoeDecodeStep &, bool tp, bool single, int seqlen, int firstLayer = -1);
         bool RunGpuMoe(DeepSeekV41MoeContext &);
         bool RunHybridMoe(DeepSeekV41MoeContext &, HybridMoeDecodeStep *);
         bool moeExpertCacheAttempted = false;
@@ -375,6 +375,7 @@ namespace fastllm {
         // 捕获和回放共用互斥量，抢不到锁的前向退回逐算子。
         std::mutex v41CudaGraphMutex;
         std::map<int, std::shared_ptr<void>> v41CudaGraphSlots;
+        std::mutex v41PpDecodeMutex;
         bool v41CudaGraphWarmingUp = false;
         // One bounded eager verifier workspace, protected by v41CudaGraphMutex.
         // No graph captures these buffers, so candidate counts can share them.
@@ -411,6 +412,7 @@ namespace fastllm {
         // inputEmbeds 非空时直接作为嵌入（[1, tokens, dim]，供视觉输入使用）；
         // imageMask 非空时标记每个 token 是否为图像 token（Engram 历史置 -1，路由改用 gate.bias_vl）。
         struct HybridPrefillStage;
+        struct HybridDecodeStage;
         void PrepareForwardWeights();
         void PrepareHybridPrefill();
         bool TryForwardHybridChunkedPrefill(const Data &inputIds, const Data &attentionMask,
@@ -424,7 +426,8 @@ namespace fastllm {
         void PrepareForwardInputs(ForwardWorkspace &);
 #ifdef USE_CUDA
         bool TryFullDecodeGraph(ForwardWorkspace &, bool inputsPrepared);
-        void BuildFullDecodeGraph(int batch, const std::vector<DeepSeekV41Segment> &segments);
+        void BuildFullDecodeGraph(int batch, const std::vector<DeepSeekV41Segment> &segments,
+                                  int firstLayer = -1, int endLayer = -1);
 #endif
         void BeginForwardLayer(ForwardWorkspace &, int layer);
         void EndForwardLayer(ForwardWorkspace &, int layer);

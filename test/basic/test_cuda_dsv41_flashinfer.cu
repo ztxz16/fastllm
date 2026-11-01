@@ -190,6 +190,18 @@ double RunCase(Cache &first, Cache &second, std::mt19937 &rng, int heads, int ba
     std::unique_ptr<void, decltype(&FastllmV41FlashInferDestroy)> plan(
         denseBatches ? nullptr : FastllmV41FlashInferCreate(config), FastllmV41FlashInferDestroy);
     Require(denseBatches || bool(plan), "supported FlashInfer configuration rejected");
+    if (plan) {
+        std::unique_ptr<void, decltype(&FastllmV41FlashInferDestroy)> shared(
+            FastllmV41FlashInferCreate(config), FastllmV41FlashInferDestroy);
+        Require(shared && FastllmV41FlashInferShareWorkspace(shared.get(), plan.get()),
+                "matching sequential attention workspace rejected");
+        auto mismatch = config; ++mismatch.batch;
+        std::unique_ptr<void, decltype(&FastllmV41FlashInferDestroy)> other(
+            FastllmV41FlashInferCreate(mismatch), FastllmV41FlashInferDestroy);
+        Require(!other || !FastllmV41FlashInferShareWorkspace(shared.get(), other.get()),
+                "incompatible attention workspace accepted");
+        plan = std::move(shared); // The captured plan must outlive its original owner.
+    }
     std::vector<__nv_bfloat16> q(batch * heads * kDim), current(batch * kDim), output(q.size());
     std::vector<float> sink(heads);
     std::vector<int32_t> indices(batch * std::max(1, width));

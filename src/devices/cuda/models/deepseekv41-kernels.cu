@@ -7153,6 +7153,16 @@ void *FastllmCudaV41CreateFullDecode(const FastllmV41FullDecodeConfig &c,
 }
 
 void FastllmCudaV41DestroyFullDecode(void *plan) { delete static_cast<V41FullDecodePlan *>(plan); }
+bool FastllmCudaV41ShareAttentionWorkspace(void *handle, void *source) {
+#ifdef FASTLLM_ENABLE_DSV41_FLASHINFER_SM120
+    auto *p = static_cast<V41FullDecodePlan *>(handle), *q = static_cast<V41FullDecodePlan *>(source);
+    return p && q && p->device == q->device &&
+        FastllmV41FlashInferShareWorkspace(p->flashInfer, q->flashInfer);
+#else
+    (void)handle; (void)source;
+    return false;
+#endif
+}
 
 namespace {
 bool V41ValidateFullDecodeRequests(const V41FullDecodePlan *p,

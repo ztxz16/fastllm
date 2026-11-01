@@ -116,6 +116,7 @@ struct V41FullEngramWorker {
 struct V41FullGraph {
     std::vector<int> devices, coordinatorCpus;
     int batch = 1, maxKeys = 131072;
+    int firstLayer = 0, endLayer = 0;
     bool verifying = false, capturesInput = false, hybrid = false, tensorParallel = true;
     std::vector<void *> moeHandles;
     Data inputIds, embedding, deferredHcMix;
@@ -150,7 +151,7 @@ struct V41FullGraph {
         }
         if (untimedExec) FastllmCudaGraphExecDestroy(untimedExec);
         pieces.reset();
-        for (auto &layer : layers)
+        for (auto &layer : layers) if (layer)
             for (void *plan : layer->plans)
                 FastllmCudaV41DestroyFullDecode(plan);
         FastllmCudaSetDevice(old);
@@ -189,7 +190,7 @@ bool V41FullReserve(V41FullGraph &g, const std::vector<DeepSeekV41Segment> &segm
         if (!s.state || !validMode || s.startPos < 1 ||
             (int)s.state->layers.size() != (int)g.layers.size())
             return false;
-        for (size_t l = 0; l < g.layers.size(); ++l) {
+        for (int l = g.firstLayer; l < g.endLayer; ++l) {
             const auto &cfg = g.layers[l]->config;
             auto &cache = s.state->layers[l];
             if (cfg.ratio && (s.startPos + (long long)s.seqlen) / cfg.ratio > g.maxKeys)
@@ -206,7 +207,7 @@ bool V41FullReserve(V41FullGraph &g, const std::vector<DeepSeekV41Segment> &segm
         }
     }
     for (const auto &s : segments)
-        for (size_t l = 0; l < g.layers.size(); ++l) {
+        for (int l = g.firstLayer; l < g.endLayer; ++l) {
             const auto &cfg = g.layers[l]->config;
             if (!cfg.kvSource)
                 continue;
@@ -234,7 +235,7 @@ bool V41FullUploadRank(V41FullGraph &g, const std::vector<DeepSeekV41Segment> &s
     auto ptr = [device](Data &d) -> void * {
         return V41FullLocal(d, device).cudaData;
     };
-    for (size_t l = 0; l < g.layers.size(); ++l) {
+    for (int l = g.firstLayer; l < g.endLayer; ++l) {
         const auto &layer = *g.layers[l];
         if (layer.plans.empty())
             continue;
@@ -277,7 +278,7 @@ void V41FullAdvance(V41FullGraph &g, const std::vector<DeepSeekV41Segment> &segm
         if (g.tensorParallel) V41SyncRootFromReplica(data, g.devices);
     };
     for (const auto &s : segments)
-        for (size_t l = 0; l < g.layers.size(); ++l) {
+        for (int l = g.firstLayer; l < g.endLayer; ++l) {
             auto &cache = s.state->layers[l];
             cache.totalLen = s.startPos + s.seqlen;
             const auto &cfg = g.layers[l]->config;
@@ -316,19 +317,32 @@ void V41FullBindVerify(const std::shared_ptr<V41FullGraph> &owner, const DeepSee
     const int layers = g.layers.size();
     scratch.prevRawTail.resize(layers);
     scratch.prevBlocks.resize(layers);
-    for (int l = 0; l < layers; ++l) {
+    const bool pipeline = g.firstLayer > 0 || g.endLayer < layers;
+    if (pipeline) {
+        scratch.windowKV.resize(layers);
+        scratch.rawKV.resize(layers);
+        scratch.rawScore.resize(layers);
+    }
+    for (int l = g.firstLayer; l < g.endLayer; ++l) {
         const auto &layer = *g.layers[l];
+        if (pipeline) borrow(scratch.windowKV[l], layer.savedKV, g.batch);
         if (!layer.config.kvSource) continue;
+        if (pipeline) {
+            const int rawRows = segment.startPos % layer.config.ratio + g.batch;
+            borrow(scratch.rawKV[l], layer.savedRawKV, rawRows);
+            if (layer.config.ratio == 2) borrow(scratch.rawScore[l], layer.savedRawScore, rawRows);
+        }
         scratch.prevRawTail[l] = segment.startPos % layer.config.ratio;
         scratch.prevBlocks[l] = segment.startPos / layer.config.ratio;
     }
-    scratch.commitKV = [owner](int accepted) {
+    scratch.commitKV = [owner, previous = std::move(scratch.commitKV)](int accepted) {
+        if (previous) previous(accepted);
         const auto &graph = *owner;
         std::vector<int> ok(graph.devices.size(), 0);
         const bool submitted = V41FullDispatch(graph, [&](int rank, int) {
             ok[rank] = FastllmCudaV41CommitVerifiedPrefix(
                 static_cast<const FastllmV41VerifyCommitLayer *>(graph.commitDescriptors[rank].cudaData),
-                (int)graph.layers.size(), accepted, graph.batch);
+                graph.endLayer - graph.firstLayer, accepted, graph.batch);
         });
         AssertInFastLLM(submitted && std::all_of(ok.begin(), ok.end(), [](int v) { return v != 0; }),
                         "full verifier KV commit failed");
@@ -336,13 +350,26 @@ void V41FullBindVerify(const std::shared_ptr<V41FullGraph> &owner, const DeepSee
     if (scratch.captureMain) {
         scratch.mainHidden.resize(targetLayers.size());
         for (size_t i = 0; i < targetLayers.size(); ++i)
-            borrow(scratch.mainHidden[i], g.mainHidden.at(targetLayers[i]), g.batch);
+            if (targetLayers[i] >= g.firstLayer && targetLayers[i] < g.endLayer)
+                borrow(scratch.mainHidden[i], g.mainHidden.at(targetLayers[i]), g.batch);
     }
 }
 } // namespace
 
 void DeepSeekV41Model::BuildFullDecodeGraph(
-    int batch, const std::vector<DeepSeekV41Segment> &segments) {
+    int batch, const std::vector<DeepSeekV41Segment> &segments, int firstLayer, int endLayer) {
+    if (firstLayer < 0 && executionMode == ExecutionMode::Hybrid &&
+        V41DeviceMapCudaDeviceCount(deviceMap) > 1 && !V41DeviceMapUsesMultiCuda(deviceMap)) {
+        std::vector<CudaPrefillStage> stages;
+        const bool verify = segments.size() == 1 && segments[0].spec && segments[0].spec->deferWindow;
+        if ((verify || (batch == 1 && !v41DsparkEnabled)) && BuildCudaPrefillStages(deviceMap, block_cnt, stages))
+            for (const auto &stage : stages)
+                BuildFullDecodeGraph(batch, segments, stage.firstLayer, stage.endLayer);
+        return;
+    }
+    const bool pipeline = firstLayer >= 0;
+    const int graphKey = pipeline ? V41PipelineGraphKey(firstLayer, batch) : batch;
+    if (!pipeline) { firstLayer = 0; endLayer = block_cnt; }
     const bool verifying = segments.size() == 1 && segments[0].spec && segments[0].spec->deferWindow;
     const bool hybrid = executionMode == ExecutionMode::Hybrid &&
         (verifying || (batch == 1 && !v41DsparkEnabled)) && FastllmCudaMoeCacheRequested();
@@ -361,7 +388,7 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
         V41EnvFlag("FASTLLM_DSV41_LEGACY_ATTN") || V41EnvFlag("FASTLLM_DSV41_LEGACY_INDEXER") ||
         V41EnvFlag("FASTLLM_DSV41_LEGACY_TOPK") || V41EnvFlag("FASTLLM_DSV41_LEGACY_ROTARY"))
         return;
-    auto slot = v41CudaGraphSlots.find(verifying ? -batch : batch);
+    auto slot = v41CudaGraphSlots.find(verifying && !pipeline ? -batch : graphKey);
     if (slot == v41CudaGraphSlots.end())
         return;
     auto state = V41GetCudaGraphState(slot->second);
@@ -369,16 +396,21 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
         (hybrid && (state->tensorParallel || state->devices.size() != 1)) || state->fullDecode ||
         state->segments.size() != (size_t)block_cnt * 4)
         return;
-    for (const auto &s : state->segments)
-        if (s.passthrough || s.graphs.size() != state->devices.size())
+    for (int i = firstLayer * 4; i < endLayer * 4; ++i)
+        if (state->segments[i].passthrough || state->segments[i].graphs.size() != state->devices.size())
             return;
-    for (int layer = 0; layer < block_cnt; ++layer)
+    for (int layer = firstLayer; layer < endLayer; ++layer)
         if ((!hybrid && !state->segments[layer * 4 + 3].containsGpuMoe) ||
             state->segments[layer * 4].kvOutputs.size() != state->devices.size()) return;
     if (!hybrid) for (auto &table : engramTables)
         if (!std::static_pointer_cast<V41EngramTable>(table)->gpuTable) return;
     auto g = std::make_shared<V41FullGraph>();
     g->devices = state->devices;
+    g->firstLayer = firstLayer; g->endLayer = endLayer;
+    if (pipeline) {
+        ApplyDeviceMap(deviceMap, firstLayer + 1, block_cnt);
+        FastllmCudaSetDevice(g->devices.front());
+    }
     g->hybrid = hybrid; g->tensorParallel = state->tensorParallel;
 #ifdef USE_NUMAS
     if (hybrid && !weights.empty() && weights[0].size() > 2 && weights[0][2]) {
@@ -413,7 +445,7 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
     // Keep BF16 embedding outputs and token operands at fixed addresses. The
     // ordinary/input-embedding and other precision paths retain their frontend.
     auto &embeddingWeight = weight["embed.weight"];
-    g->capturesInput = (verifying || hybrid) && embeddingWeight.dataType == DataType::BFLOAT16 &&
+    g->capturesInput = firstLayer == 0 && (verifying || hybrid) && embeddingWeight.dataType == DataType::BFLOAT16 &&
         embeddingWeight.dataDevice == DataDevice::CUDA && embeddingWeight.cudaData &&
         !embeddingWeight.multiDeviceData && embeddingWeight.dims.size() == 2 &&
         embeddingWeight.dims[1] == embed_dim &&
@@ -430,7 +462,8 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
     alloc(g->candidates, DataType::INT8, {1, batch, (g->maxKeys + blockSize - 1) / blockSize});
     alloc(g->candidateBlocks, DataType::INT32, {batch, (g->maxKeys + blockSize - 1) / blockSize});
     alloc(g->candidateCounts, DataType::INT32, {batch});
-    for (int l = 0; l < block_cnt; ++l) {
+    g->layers.resize(block_cnt);
+    for (int l = firstLayer; l < endLayer; ++l) {
         auto layer = std::make_unique<V41FullLayer>();
         auto &c = layer->config;
         c.batch = batch;
@@ -481,12 +514,13 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
             if (c.indexSource)
                 alloc(layer->keys, DataType::BFLOAT16, {1, batch, 128});
         }
-        g->layers.emplace_back(std::move(layer));
+        g->layers[l] = std::move(layer);
     }
     if (!V41FullReserve(*g, segments))
         return;
     const auto snapshots = V41SnapshotSegments(segments, engram_max_ngram_size);
     for (int i = 0; i < (int)engram_layer_ids.size(); ++i) {
+        if (engram_layer_ids[i] < firstLayer || engram_layer_ids[i] >= endLayer) continue;
         auto e = std::make_unique<V41FullEngram>();
         e->index = i;
         e->table = std::static_pointer_cast<V41EngramTable>(engramTables[i]);
@@ -606,7 +640,8 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
             });
         }
         int candidateWorkspaceRatio = -1;
-        for (int l = 0; l < block_cnt; ++l) {
+        std::vector<std::map<bool, void *>> attentionScratch(g->devices.size());
+        for (int l = firstLayer; l < endLayer; ++l) {
             const std::string prefix = "layers." + std::to_string(l);
             auto engram = g->engrams.find(l);
             if (engram != g->engrams.end()) {
@@ -694,6 +729,11 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
                 if (layer.config.kvSource)
                     b.compressNorm = ptr(weight[prefix + ".attn.compressor.norm.weight"]);
                 layer.plans[rank] = FastllmCudaV41CreateFullDecode(layer.config, b);
+                // Hidden-state dependencies serialize every layer's attention,
+                // including when independent mHC/MoE branches overlap.
+                auto &prior = attentionScratch[rank][layer.config.ratio != 0];
+                if (prior) FastllmCudaV41ShareAttentionWorkspace(layer.plans[rank], prior);
+                else prior = layer.plans[rank];
             });
             for (void *plan : layer.plans)
                 plansOk &= plan != nullptr;
@@ -736,7 +776,7 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
                 void *handle = FastllmCudaCreateNativeMoeFullGraph(input, ws.expertIndex,
                     ws.expertScore, ws.ffnOut, routed.data(), routed.size(), l,
                     state->segments[l * 4 + 3].graphs[0], &moeGraph);
-                if (!handle || !moeGraph) throw std::runtime_error("native MoE full graph rejected");
+                if (!handle || !moeGraph) throw std::runtime_error("native MoE full graph rejected at layer " + std::to_string(l));
                 g->moeHandles.push_back(handle);
                 children[0].push_back(moeGraph);
                 // Router and expert computation read ffnInput, not ffnPre /
@@ -749,7 +789,7 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
                 });
             }
         }
-        capture([&] {
+        if (endLayer == block_cnt) capture([&] {
             V41HcApplyPre(ws.hiddenStates, ws.ffnPre, g->head);
             V41RMSNormBF16(g->head, weight["norm.weight"], rms_norm_eps, g->norm);
             weight["head.weight"].tpLinearType = TP_LINEAR_ROW;
@@ -823,8 +863,8 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
                 };
                 const auto *requests = static_cast<const FastllmV41FullDecodeRequest *>(ptr(g->requests));
                 std::vector<FastllmV41VerifyCommitLayer> descriptors;
-                descriptors.reserve(g->layers.size());
-                for (size_t layer = 0; layer < g->layers.size(); ++layer) {
+                descriptors.reserve(g->endLayer - g->firstLayer);
+                for (int layer = g->firstLayer; layer < g->endLayer; ++layer) {
                     const auto &l = *g->layers[layer];
                     descriptors.push_back({
                         requests + layer * g->batch,
@@ -848,8 +888,8 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
         state->fullDecode = g;
         fprintf(stderr,
                 "[Fastllm] DeepSeek-V4.1 full %s graph ready: %s=%d, ranks=%zu, one graph "
-                "per rank/step, maxKeys=%d\n",
-                verifying ? "verify" : "decode", verifying ? "tokens" : "batch", batch, g->devices.size(), g->maxKeys);
+                "per rank/step, layers=[%d,%d), maxKeys=%d\n",
+                verifying ? "verify" : "decode", verifying ? "tokens" : "batch", batch, g->devices.size(), firstLayer, endLayer, g->maxKeys);
     } catch (const std::exception &error) {
         if (poolOpen)
             FastllmCudaGraphMemoryPoolAbort();
@@ -891,7 +931,8 @@ bool DeepSeekV41Model::TryFullDecodeGraph(ForwardWorkspace &f, bool inputsPrepar
     }
     if (f.dsparkVerify && !f.graphState->fullVerifyAttempted) {
         f.graphState->fullVerifyAttempted = true;
-        BuildFullDecodeGraph(f.seqlen, f.inputSegments);
+        BuildFullDecodeGraph(f.seqlen, f.inputSegments,
+            f.pipeline ? f.pipeline->firstLayer : -1, f.pipeline ? f.pipeline->endLayer : -1);
     }
     if (!f.graphState->fullDecode) return false;
     auto g = std::static_pointer_cast<V41FullGraph>(f.graphState->fullDecode);
@@ -959,13 +1000,14 @@ bool DeepSeekV41Model::TryFullDecodeGraph(ForwardWorkspace &f, bool inputsPrepar
         FastllmCudaSetDevice(g->devices.front());
         for (void *event : g->ready) FastllmCudaCurrentThreadStreamWaitEvent(event);
         V41FullBindVerify(g, f.inputSegments[0], v41DsparkTargetLayerIds);
+        if (f.pipeline) f.pipeline->fullVerify = true;
     }
     ++g->replays;
     V41FullAdvance(*g, f.inputSegments);
     f.curHidden = &f.ws->hiddenStates;
     f.preMixPtr = &f.ws->ffnPre;
     if (!inputsPrepared) ++f.graphState->replayCount;
-    f.fullGraphHead = &g->head;
-    f.fullGraphLogits = g->verifying ? &g->gatheredLogits : &g->logits;
+    f.fullGraphHead = g->endLayer == block_cnt ? &g->head : nullptr;
+    f.fullGraphLogits = g->endLayer != block_cnt ? nullptr : g->verifying ? &g->gatheredLogits : &g->logits;
     return true;
 }

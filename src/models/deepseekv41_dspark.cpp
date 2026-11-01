@@ -1906,7 +1906,11 @@ namespace fastllm {
             }
         }
 #endif
+        const bool pipelineCommit = v41DsparkTpDevices.empty() &&
+            deviceMap.size() > 1;
         for (int layer = 0; layer < block_cnt; layer++) {
+            // Eager fallback and partially captured PP stages retain local KV.
+            if (pipelineCommit && !scratch.commitKV) ApplyDeviceMap(deviceMap, layer + 1, block_cnt);
             DeepSeekV41LayerCache &cache = state.layers[layer];
             // 1) 滑窗环形缓冲：只写入被接受的行
             if (!batchedWindows && layer < (int)scratch.windowKV.size() &&

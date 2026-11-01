@@ -16,6 +16,7 @@
 #include "devices/cuda/fastllm-cuda-graph-workspace.h"
 #endif
 #include "utils/hybrid_moe.h"
+#include "utils/hybrid_parallel.h"
 #if defined(USE_NUMAS) && defined(__linux__)
 #include "devices/numas/numasdevice.h"
 #include <sched.h>
@@ -2742,13 +2743,13 @@ namespace fastllm {
         // FASTLLM_DSV41_ENGRAM_WKV_FP8=0 可退回解量化。
         static const bool wkvFp8 = V41EnvFlagOn("FASTLLM_DSV41_ENGRAM_WKV_FP8") && !V41EnvFlag("FASTLLM_DSV41_REFERENCE_MATH");
         std::set<std::string> tensorNameSet(tensorNames.begin(), tensorNames.end());
-        // Restrict compact storage to the single-CUDA hybrid path. TP/full-GPU
-        // graph layouts and explicit reference math retain their current weights.
+        // Hybrid single-GPU and serial PP keep complete projections on their
+        // layer owner. TP/full-GPU and reference math retain their current layouts.
         bool compactProjections = false;
 #if defined(USE_CUDA) && !defined(USE_ROCM)
         compactProjections = executionMode == ExecutionMode::Hybrid &&
             V41DeviceMapUsesCuda(deviceMap) && !V41DeviceMapUsesMultiCuda(deviceMap) &&
-            V41DeviceMapCudaDeviceCount(deviceMap) == 1 && FastllmCudaRuntimeArch() >= 80 &&
+            FastllmCudaRuntimeArch() >= 80 &&
             !V41ReferenceMathEnabled() && std::getenv("FASTLLM_DSV41_DUMP_DIR") == nullptr;
 #endif
         auto compactCheckpoint = [&](const std::string &name, bool head) {
@@ -4713,6 +4714,7 @@ namespace fastllm {
             std::shared_ptr<void> fullDecode;
             bool fullVerifyAttempted = false;
             void *sharedStream = nullptr, *sharedReady = nullptr, *sharedDone = nullptr;
+            void *stageReady = nullptr;
             bool sharedPending = false;
 
             void JoinShared() {
@@ -4731,6 +4733,12 @@ namespace fastllm {
                     FastllmCudaEventDestroy(sharedDone);
                     sharedStream = sharedReady = sharedDone = nullptr;
                     sharedPending = false;
+                    FastllmCudaSetDevice(oriDevice);
+                }
+                if (stageReady) {
+                    FastllmCudaSetDevice(devices.front());
+                    FastllmCudaSyncDevice(devices.front());
+                    FastllmCudaEventDestroy(stageReady); stageReady = nullptr;
                     FastllmCudaSetDevice(oriDevice);
                 }
                 fullDecode.reset();
@@ -5054,6 +5062,7 @@ namespace fastllm {
     struct DeepSeekV41Model::ForwardWorkspace {
         DeepSeekV41Model &model;
         HybridPrefillStage *prefill = nullptr;
+        HybridDecodeStage *pipeline = nullptr;
         const std::vector<DeepSeekV41Segment> &inputSegments;
         const Data &inputIds;
         const Data *inputEmbeds;
@@ -5141,9 +5150,10 @@ namespace fastllm {
                                                        const std::vector<GenerationConfig> &generationConfigsIn,
                                                        const LastTokensManager &lastTokens,
                                                        std::vector<std::vector<float>*> *retLogits,
-                                                       std::vector<std::pair<Data*, Data*> > &samplingPastKeyValues, HybridPrefillStage *prefill)
+                                                       std::vector<std::pair<Data*, Data*> > &samplingPastKeyValues, HybridPrefillStage *prefill, HybridDecodeStage *pipeline)
         : work(new ForwardWorkspace(model, inputSegments, inputIds, inputEmbeds, imageMask, generationConfigsIn, lastTokens, retLogits, samplingPastKeyValues)) {
         work->prefill = prefill;
+        work->pipeline = pipeline;
         model.PrepareForward(*work);
     }
     DeepSeekV41Model::ForwardState::~ForwardState() = default;
@@ -5158,7 +5168,8 @@ namespace fastllm {
     int DeepSeekV41Model::ForwardState::Layers() const {
         const int end = work->inputSegments[0].prefillCacheOnly ?
             work->model.decoderSwaTailLayer : work->model.block_cnt;
-        return work->prefill ? std::min(end, work->prefill->endLayer) : end;
+        return work->pipeline ? work->pipeline->endLayer :
+            work->prefill ? std::min(end, work->prefill->endLayer) : end;
     }
     void DeepSeekV41Model::ForwardState::BeginLayer(int layer) { work->model.BeginForwardLayer(*work, layer); }
     void DeepSeekV41Model::ForwardState::EndLayer(int layer) {
@@ -5167,7 +5178,8 @@ namespace fastllm {
     void DeepSeekV41Model::ForwardState::BeginHybridStep() {
         if (work->model.executionMode == ExecutionMode::Hybrid) {
             work->moeStep.emplace();
-            work->model.BeginHybridMoeStep(*work->moeStep, work->tp, work->single, work->seqlen);
+            work->model.BeginHybridMoeStep(*work->moeStep, work->tp, work->single, work->seqlen,
+                work->pipeline ? work->pipeline->firstLayer : -1);
         }
     }
     void DeepSeekV41Model::ForwardState::GpuExperts(int layer) {
@@ -5378,7 +5390,10 @@ namespace fastllm {
         // 按 query head 切分，wo_b 按列切并 all-reduce，共享专家保持复制。
         // FastllmGetMulticudaDeviceAndRatio 读的是 ApplyDeviceMap 设置的全局设备表，
         // 首次前向前必须先应用一次主 device map，否则拿到的是空列表。
-        ApplyDeviceMap(this->deviceMap, f.prefill ? f.prefill->firstLayer + 1 : 1, block_cnt);
+        ApplyDeviceMap(this->deviceMap, f.pipeline ? f.pipeline->firstLayer + 1 : f.prefill ? f.prefill->firstLayer + 1 : 1, block_cnt);
+#ifdef USE_CUDA
+        if (f.pipeline) FastllmCudaSetDevice(f.pipeline->device);
+#endif
         tpDevices = V41TpDevices(this->deviceMap);
         tp = !tpDevices.empty();
         // 与 InitParams 使用相同的 head/o_group 对齐条件；kernel 内部处理尾部 head。
@@ -5423,20 +5438,22 @@ namespace fastllm {
             std::getenv("FASTLLM_DSV41_DUMP_DIR") == nullptr &&
             !GetFastllmEnv().cudaSync && !GetFastllmEnv().printProfile &&
             (this->deviceMap.empty() || V41DeviceMapUsesCuda(this->deviceMap)) &&
-            // 按层切分不支持分段图；仅允许单卡或 multicuda 张量并行。
-            (V41DeviceMapUsesMultiCuda(this->deviceMap) ||
+            // PP enters only with a validated, device-local stage workspace.
+            (f.pipeline || V41DeviceMapUsesMultiCuda(this->deviceMap) ||
              V41DeviceMapCudaDeviceCount(this->deviceMap) <= 1) &&
             !V41EnvFlag("FASTLLM_DSV41_REFERENCE_MATH") && GetFastllmEnv().cudaGraph) {
-            graphLock = std::unique_lock<std::mutex>(v41CudaGraphMutex, std::try_to_lock);
+            graphLock = f.pipeline ? std::unique_lock<std::mutex>(v41CudaGraphMutex) :
+                std::unique_lock<std::mutex>(v41CudaGraphMutex, std::try_to_lock);
             if (graphLock.owns_lock()) {
                 // Verification and independent requests have different host metadata.
-                const int graphKey = verifyGraph ? -seqlen : seqlen;
+                const int graphKey = f.pipeline ? V41PipelineGraphKey(f.pipeline->firstLayer, seqlen) :
+                    verifyGraph ? -seqlen : seqlen;
                 auto found = v41CudaGraphSlots.find(graphKey);
                 if (v41CudaGraphWarmingUp || verifyGraph || found != v41CudaGraphSlots.end()) {
                     graphState = V41GetCudaGraphState(v41CudaGraphSlots[graphKey]);
                 }
             }
-            if (!graphState || graphState->disabled) {
+            if (!graphState || (graphState->disabled && !f.pipeline)) {
                 graphState.reset();
             } else {
                 // 设备布局 / dtype 变化时丢弃旧图（图里烤死了每张卡上的权重地址）
@@ -5448,6 +5465,8 @@ namespace fastllm {
                 for (int device : tpDevices) {
                     signature += std::to_string(device) + ",";
                 }
+                if (f.pipeline) signature += "pp:" + std::to_string(f.pipeline->firstLayer) + ":" +
+                    std::to_string(f.pipeline->endLayer) + ":" + std::to_string(f.pipeline->device);
                 if (graphState->signature != signature) {
                     graphState->DestroyCapturedGraph();
                     graphState->ResetWorkspace();
@@ -5482,10 +5501,10 @@ namespace fastllm {
                     graphState->PrepareDevices(graphDevices, tp);
                     ws = graphState->workspace.get();
                     graphActive = true;
-                    if (graphState->captured &&
+                    if (!graphState->disabled && graphState->captured &&
                         (int)graphState->segments.size() == kV41GraphSegmentsPerLayer * block_cnt) {
                         graphReplay = true;
-                    } else if ((v41CudaGraphWarmingUp || verifyGraph) &&
+                    } else if (!graphState->disabled && (v41CudaGraphWarmingUp || verifyGraph) &&
                                graphState->warmupRounds >= std::max(graphState->devices.size() == 1 ? 2 : 1,
                                                                   V41DecodeCudaGraphWarmupRounds())) {
                         graphCapture = true;
@@ -5554,6 +5573,7 @@ namespace fastllm {
             } else {
                 graphPoolOpen = true;
                 graphState->segments.clear();
+                if (f.pipeline) graphState->segments.resize(f.pipeline->firstLayer * kV41GraphSegmentsPerLayer);
                 graphState->captureFailed = false;
             }
         }
@@ -5563,7 +5583,7 @@ namespace fastllm {
         f.tokenIds = V41ReadTokenIds(inputIds);
         const auto &tokenIds = f.tokenIds;
         AssertInFastLLM((int)tokenIds.size() == total, "DeepSeekV41Model::ForwardSegments: inputIds length mismatch.");
-        if (!engram_layer_ids.empty()) {
+        if (!engram_layer_ids.empty() && (!f.pipeline || f.pipeline->firstLayer == 0)) {
             for (auto &seg : segments) {
                 AssertInFastLLM((int)seg.state->engramHistory.size() == seg.startPos,
                                 "DeepSeekV41: engram history is out of sync with the cache.");
@@ -5660,8 +5680,8 @@ namespace fastllm {
         // before embedding/layer 0, rather than waiting until Engram layer 1.
         // A pipeline stage only prefetches layers that it will consume.
         if (seqlen >= V41EngramPrefetchMinTokens && V41EnvFlagOn("FASTLLM_DSV41_ENGRAM_PREFETCH")) {
-            const int first = f.prefill ? f.prefill->firstLayer : 0;
-            const int end = f.prefill ? f.prefill->endLayer : block_cnt;
+            const int first = f.pipeline ? f.pipeline->firstLayer : f.prefill ? f.prefill->firstLayer : 0;
+            const int end = f.pipeline ? f.pipeline->endLayer : f.prefill ? f.prefill->endLayer : block_cnt;
             for (size_t i = 0; i < engram_layer_ids.size() && i < engramTables.size(); ++i) {
                 if (engram_layer_ids[i] < first || engram_layer_ids[i] >= end) continue;
                 auto table = std::static_pointer_cast<V41EngramTable>(engramTables[i]);
@@ -5678,7 +5698,21 @@ namespace fastllm {
         // 图模式下这些张量来自常驻工作区，地址必须在两次 decode 之间保持不变。
         Data &hiddenStates = ws->hiddenStates;
         Data &hiddenTemp = ws->hiddenTemp;
-        if (f.prefill && f.prefill->firstLayer > 0) {
+        if (f.pipeline && f.pipeline->previous) {
+#ifdef USE_CUDA
+            auto &source = *f.pipeline->previous;
+            FastllmCudaSetDevice(f.pipeline->device);
+            FastllmCudaCurrentThreadStreamWaitEvent(source.ready);
+            auto receive = [&](Data &dst, const Data &src) {
+                dst.dataType = src.dataType; dst.UpdateUnitSize(); dst.Resize(src.dims);
+                dst.ToDevice(CUDA, {f.pipeline->device}, false); dst.Allocate();
+                AssertInFastLLM(FastllmCudaMemcpyPeerAsyncCurrentThread(f.pipeline->device,
+                    dst.cudaData, source.device, src.cudaData, src.GetBytes()), "PP decode handoff failed");
+            };
+            receive(hiddenStates, source.hidden);
+            receive(ws->preMix, source.pre);
+#endif
+        } else if (f.prefill && f.prefill->firstLayer > 0) {
             Data view;
             view.FakeFrom(*f.prefill->payload, 0);
             view.Resize({1, seqlen, hc_mult, dim});
@@ -5722,7 +5756,9 @@ namespace fastllm {
         Data &preMix = ws->preMix;
         // 内容是常量 one-hot，长度没变就不重建：CopyFrom 会先把它搬回 CPU 再搬上卡，
         // 每次换一个设备地址，图就废了。
-        if (f.prefill && f.prefill->firstLayer > 0) {
+        if (f.pipeline && f.pipeline->previous) {
+            // Received with hiddenStates; preserve the preceding stage's HC pre.
+        } else if (f.prefill && f.prefill->firstLayer > 0) {
             Data view;
             view.FakeFrom(*f.prefill->payload, uint64_t(seqlen) * hc_mult * dim * 2);
             view.dataType = FLOAT32;
@@ -7055,7 +7091,10 @@ namespace fastllm {
             }
             return acc;
         };
-        if (moeStep) moeStep->Finish();
+        if (moeStep && f.pipeline) {
+            f.pipeline->step = std::make_unique<HybridMoeDecodeStep>(std::move(*moeStep));
+            moeStep.reset();
+        } else if (moeStep) moeStep->Finish();
 #ifdef USE_CUDA
         if (f.prefill && !f.prefill->sampleOutput) {
             auto &payload = *f.prefill->payload;
@@ -7081,6 +7120,8 @@ namespace fastllm {
         // ---- 收尾：结束捕获 / 累计预热轮次 ----
         if (graphState) {
             if (graphCapture) {
+                if (f.pipeline && graphState->segments.size() == size_t(f.pipeline->endLayer * 4))
+                    graphState->segments.resize(block_cnt * 4);
                 bool ok = !graphState->captureFailed &&
                           (int)graphState->segments.size() == kV41GraphSegmentsPerLayer * block_cnt &&
                           !FastllmCudaGetThreadError() && !FastllmCudaGetGraphError();
@@ -7109,6 +7150,20 @@ namespace fastllm {
             } else if (!graphReplay && !graphState->disabled) {
                 graphState->warmupRounds++;
             }
+        }
+        if (f.pipeline && f.pipeline->endLayer < block_cnt) {
+            // Graph-owned operands remain valid after this ForwardWorkspace.
+            // A disabled graph retains its workspace for the same ownership rule.
+            AssertInFastLLM(f.ws != &f.localWorkspace && f.graphState,
+                            "PP decode requires persistent stage workspace");
+            f.pipeline->hidden.FakeFrom(*curHidden, 0);
+            f.pipeline->hidden.Resize(curHidden->dims);
+            f.pipeline->pre.FakeFrom(*preMixPtr, 0);
+            f.pipeline->pre.Resize(preMixPtr->dims);
+            if (!graphState->stageReady) graphState->stageReady = FastllmCudaEventCreate();
+            f.pipeline->ready = graphState->stageReady;
+            FastllmCudaEventRecordCurrentThread(f.pipeline->ready);
+            return {-1};
         }
 #endif
 

@@ -42,7 +42,7 @@ namespace fastllm {
     }
 
     void DeepSeekV41Model::BeginHybridMoeStep(
-            HybridMoeDecodeStep &step, bool tp, bool single, int seqlen) {
+            HybridMoeDecodeStep &step, bool tp, bool single, int seqlen, int firstLayer) {
 #if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
         const bool streamGGUF = !tp && weights[0][2]->dataType == DATA_GGUF_FORMAT;
         bool cpuHost = false;
@@ -99,7 +99,11 @@ namespace fastllm {
                 if (!UsesHostMoe(device)) continue;
                 supported &= quantizedLinearNames.count("layers." + std::to_string(layer) + ".ffn.experts.0.w1.weight");
                 routedWeights[layer][0] = routedWeights[layer][1] = nullptr;
-                cache.Add(routedWeights[layer], device);
+                int owner = -1;
+                if (!tp && stages.size() > 1 && weights[layer][2]->dataType == NVFP4_BLOCK_32_E8M0)
+                    for (const auto &stage : stages)
+                        if (layer >= stage.firstLayer && layer < stage.endLayer) owner = stage.device;
+                cache.Add(routedWeights[layer], device, owner);
             }
             if (supported && cpuHost) WarmupNumaMoeWeights(true);
             if (!supported || !cache.Prepare(
@@ -135,11 +139,11 @@ namespace fastllm {
             !V41ReferenceMathEnabled() && GetCudaSharedExpert() &&
             std::getenv("FASTLLM_DSV41_DUMP_DIR") == nullptr &&
             (this->deviceMap.empty() || V41DeviceMapUsesCuda(this->deviceMap)) &&
-            (streamGGUF || V41DeviceMapCudaDeviceCount(this->deviceMap) <= 1)) {
+            (firstLayer >= 0 || streamGGUF || V41DeviceMapCudaDeviceCount(this->deviceMap) <= 1)) {
             // A fixed cache budget may let auto keep initial layers fully
             // resident. Start the shared scope from its first host table;
             // a GPU-only first layer is not registered with the host cache.
-            int first = 0;
+            int first = std::max(0, firstLayer);
             if (streamGGUF)
                 while (first < block_cnt && !UsesHostMoe(SelectMoeDeviceForLayer(first))) ++first;
             if (first < block_cnt)
@@ -499,6 +503,71 @@ namespace fastllm {
 #ifdef USE_CUDA
         FastllmCudaHybridPrefillScope prefillMath(inputSegments.size() == 1 &&
             inputSegments[0].seqlen >= 1024 && !V41ReferenceMathEnabled());
+#endif
+#if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
+        // Stage-local graphs use the existing arithmetic, with explicit ownership
+        // at the boundary. Unsupported splits retain ordinary serial PP.
+        std::vector<CudaPrefillStage> stages;
+        const bool verify = inputSegments.size() == 1 && inputSegments[0].spec &&
+            inputSegments[0].spec->wantAllTokens && inputSegments[0].spec->deferWindow &&
+            inputSegments[0].seqlen >= 2 && inputSegments[0].seqlen <= 32;
+        const bool decode = inputSegments.size() == 1 && !v41DsparkEnabled &&
+            inputSegments[0].seqlen == 1 && !inputSegments[0].spec;
+        bool pipeline = GetFastllmEnv().cudaGraph && v41MoeCudaGraphCompatible &&
+            (decode || verify) && inputSegments[0].startPos > 0 && !inputEmbeds && !imageMask &&
+            FastllmCudaMoeCacheRequested() && GetCudaSharedExpert() &&
+            !V41ReferenceMathEnabled() && !GetFastllmEnv().cudaSync && !GetFastllmEnv().printProfile &&
+            !std::getenv("FASTLLM_DSV41_DUMP_DIR") && BuildCudaPrefillStages(deviceMap, block_cnt, stages);
+        std::unique_lock<std::mutex> pipelineLock;
+        if (pipeline) {
+            pipelineLock = std::unique_lock<std::mutex>(v41PpDecodeMutex);
+            PrepareForwardWeights();
+            for (const auto &stage : stages) {
+                for (int l = stage.firstLayer; l < stage.endLayer; ++l) {
+                    pipeline &= UsesHostMoe(SelectMoeDeviceForLayer(l)) && weights[l][2] &&
+                        weights[l][2]->dataType == NVFP4_BLOCK_32_E8M0;
+                    if (compress_ratios[l] > 0)
+                        pipeline &= kvSourceOf[l] >= stage.firstLayer && indexSourceOf[l] >= stage.firstLayer &&
+                            !(candidate_source_layer_id >= 0 && l > candidate_source_layer_id &&
+                              candidate_source_layer_id < stage.firstLayer);
+                }
+                // Ordinary requests require warm graph workspaces. Warmup is
+                // the sole creator, and cannot expose partially built stages.
+                const int key = V41PipelineGraphKey(stage.firstLayer, inputSegments[0].seqlen);
+                pipeline &= v41CudaGraphWarmingUp || verify || v41CudaGraphSlots.count(key);
+            }
+        }
+        if (pipeline) {
+            std::vector<HybridDecodeStage> contexts(stages.size());
+            std::vector<int> devices, result;
+            for (const auto &stage : stages) devices.push_back(stage.device);
+            if (v41CudaGraphWarmingUp) FastllmCudaPeerAccessInit(devices);
+            for (size_t i = 0; i < stages.size(); ++i) {
+                auto &ctx = contexts[i];
+                ctx.firstLayer = stages[i].firstLayer; ctx.endLayer = stages[i].endLayer;
+                ctx.device = stages[i].device;
+                ctx.previous = i ? &contexts[i - 1] : nullptr;
+                ForwardState stage(*this, inputSegments, inputIds, inputEmbeds, imageMask, generationConfigsIn,
+                    lastTokens, retLogits, samplingPastKeyValues, nullptr, &ctx);
+                stage.BeginHybridStep();
+                stage.PrepareInputs();
+                if (!stage.FullGraph()) {
+                    for (int l = ctx.firstLayer; l < ctx.endLayer; ++l) {
+                        stage.BeginLayer(l); stage.HybridExperts(l); stage.EndLayer(l);
+                    }
+                }
+                result = stage.Finish();
+            }
+            // A partial capture must commit eager and full-graph scratch
+            // together. Full stages expose the same borrowed KV views as eager.
+            if (verify && !std::all_of(contexts.begin(), contexts.end(),
+                    [](const HybridDecodeStage &stage) { return stage.fullVerify; }))
+                inputSegments[0].spec->commitKV = {};
+            // Last-stage sampling has joined the whole chain. Only now may
+            // cache admissions or CPU result buffers be recycled.
+            for (auto &ctx : contexts) if (ctx.step) ctx.step->Finish();
+            return result;
+        }
 #endif
         ForwardState frame(*this, inputSegments, inputIds, inputEmbeds, imageMask, generationConfigsIn,
             lastTokens, retLogits, samplingPastKeyValues);

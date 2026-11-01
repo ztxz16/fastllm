@@ -61,6 +61,9 @@ bool FastllmCudaV41CommitVerifiedPrefix(const FastllmV41VerifyCommitLayer *layer
 void *FastllmCudaV41CreateFullDecode(const FastllmV41FullDecodeConfig &config,
                                      const FastllmV41FullDecodeBuffers &buffers);
 void FastllmCudaV41DestroyFullDecode(void *plan);
+// Before capture, share attention scratch between strictly sequential layers.
+// Different devices/layouts and unavailable backends keep independent storage.
+bool FastllmCudaV41ShareAttentionWorkspace(void *plan, void *source);
 bool FastllmCudaV41UploadFullDecode(void *plan, const FastllmV41FullDecodeRequest *requests,
                                     size_t count);
 // Plans use consecutive slices of storage. Null slots are allowed while the
