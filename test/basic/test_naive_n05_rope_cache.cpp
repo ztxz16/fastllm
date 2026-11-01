@@ -25,6 +25,12 @@ static void Init(Data &x, std::vector<int> shape, int device) {
     x.Allocate(false);
 }
 static void Fill(Data &x, unsigned seed) {
+    if (x.dataType == FP8_E4M3) {
+        std::vector<uint8_t> bits(x.GetBytes());
+        for (auto &v : bits) { seed = seed * 1664525u + 1013904223u; v = (seed >> 24) & 0xbf; }
+        Cuda(cudaMemcpy(x.cudaData, bits.data(), bits.size(), cudaMemcpyHostToDevice));
+        return;
+    }
     std::vector<uint16_t> bits(x.Count(0));
     for (auto &v : bits) {
         seed = seed * 1664525u + 1013904223u;
@@ -33,13 +39,13 @@ static void Fill(Data &x, unsigned seed) {
     }
     Cuda(cudaMemcpy(x.cudaData, bits.data(), bits.size() * 2, cudaMemcpyHostToDevice));
 }
-static std::vector<uint16_t> Read(const Data &x) {
-    std::vector<uint16_t> v(x.Count(0));
-    Cuda(cudaMemcpy(v.data(), x.cudaData, v.size() * 2, cudaMemcpyDeviceToHost));
+static std::vector<uint8_t> Read(const Data &x) {
+    std::vector<uint8_t> v(x.GetBytes());
+    Cuda(cudaMemcpy(v.data(), x.cudaData, v.size(), cudaMemcpyDeviceToHost));
     return v;
 }
 static void CopyDevice(const Data &a, Data &b) {
-    Cuda(cudaMemcpy(b.cudaData, a.cudaData, a.Count(0) * 2, cudaMemcpyDeviceToDevice));
+    Cuda(cudaMemcpy(b.cudaData, a.cudaData, a.GetBytes(), cudaMemcpyDeviceToDevice));
 }
 static void Run(int device, int rows, int heads, int kvHeads, int dim, int vd,
                 int rd, int indexDim, int window, float scale, bool merged = false) {
@@ -169,27 +175,33 @@ static void RunStatic(int device, int rows, int heads, int kvHeads, int dim, int
         "rejected static append changed outputs");
 }
 
-static void RunBatch(int batch, bool merged, bool ring) {
+static void RunBatch(int batch, bool merged, bool ring, bool staged = false, bool indirect = false, bool fp8 = false) {
     const int heads = 8, kvHeads = 1, dim = 192, vd = 128, rd = 64;
-    const int indexDim = ring ? 0 : 128, capacity = ring ? 128 : 2052;
+    const int indexDim = ring || staged ? 0 : 128, capacity = staged ? 136 : ring ? 128 : 2052;
     const int kc = dim + indexDim;
     Data q(BFLOAT16), qr(BFLOAT16), k(BFLOAT16), v(BFLOAT16), qkv(BFLOAT16), positions(FLOAT32), live(INT32);
     Init(q, {1, batch, heads * dim}, 0); Init(qr, q.dims, 0);
     Init(k, {1, batch, dim}, 0); Init(v, {1, batch, vd}, 0);
     Init(qkv, {1, batch, (heads + kvHeads) * dim + vd}, 0);
     Init(positions, {1, batch}, 0); Init(live, {batch}, 0);
-    std::vector<Data> keys(batch, Data(BFLOAT16)), values(batch, Data(BFLOAT16)),
-        keyRef(batch, Data(BFLOAT16)), valueRef(batch, Data(BFLOAT16)), index(batch, Data(BFLOAT16));
+    const auto cacheType = fp8 ? FP8_E4M3 : BFLOAT16;
+    std::vector<Data> keys(batch, Data(cacheType)), values(batch, Data(cacheType)),
+        keyRef(batch, Data(cacheType)), valueRef(batch, Data(cacheType)), index(batch, Data(BFLOAT16));
+    Data cacheTable(INT32);
+    std::vector<const void *> bindings(batch * 2);
+    if (indirect) Init(cacheTable, {batch * 2 * int(sizeof(void *) / sizeof(int))}, 0);
     std::vector<FastllmNaiveRopeCacheRow> rows;
     for (int b = 0; b < batch; ++b) {
         Init(keys[b], {1, capacity, kc}, 0); Init(keyRef[b], keys[b].dims, 0);
         Init(values[b], {1, capacity, vd}, 0); Init(valueRef[b], values[b].dims, 0);
         if (indexDim) Init(index[b], {1, 1, indexDim}, 0);
         rows.push_back({&keys[b], &values[b], indexDim ? &index[b] : nullptr});
+        if (staged) rows.back().verifyOffset = indirect ? b % 8 : 0;
+        if (indirect) rows.back().cache = (const void *const *)cacheTable.cudaData + 2 * b;
     }
     auto body = [&] {
         Require(FastllmCudaNaiveBatchRopeAppendCache(q, k, v, positions, rows, live,
-            heads, kvHeads, dim, vd, rd, 10000.f, .707f, ring ? 128 : 0,
+            heads, kvHeads, dim, vd, rd, 10000.f, .707f, ring || staged ? 128 : 0,
             merged ? &qkv : nullptr, ring), "batch cache layout rejected");
     };
     Cuda(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
@@ -213,7 +225,22 @@ static void RunBatch(int batch, bool merged, bool ring) {
         }
         Cuda(cudaMemcpy(positions.cudaData, pos.data(), batch * sizeof(float), cudaMemcpyHostToDevice));
         Cuda(cudaMemcpy(live.cudaData, lengths.data(), batch * sizeof(int), cudaMemcpyHostToDevice));
-        for (int b = 0; b < batch; ++b) {
+        if (indirect) {
+            auto reference = rows;
+            for (int b = 0; b < batch; ++b) {
+                const int destination = replay % 2 ? batch - 1 - b : b;
+                bindings[2 * b] = keys[destination].cudaData;
+                bindings[2 * b + 1] = values[destination].cudaData;
+                reference[b].key = &keyRef[destination]; reference[b].value = &valueRef[destination];
+                reference[b].cache = nullptr;
+                if (replay == 3 && b % 11 == 0) lengths[b] = 0;
+            }
+            Cuda(cudaMemcpy(cacheTable.cudaData, bindings.data(), bindings.size() * sizeof(void *), cudaMemcpyHostToDevice));
+            Cuda(cudaMemcpy(live.cudaData, lengths.data(), batch * sizeof(int), cudaMemcpyHostToDevice));
+            Require(FastllmCudaNaiveBatchRopeAppendCache(qr, k, v, positions, reference, live,
+                heads, kvHeads, dim, vd, rd, 10000.f, .707f, 128,
+                merged ? &qkv : nullptr, false), "reference staged batch rejected");
+        } else for (int b = 0; b < batch; ++b) {
             auto view = [b](Data &dst, const Data &src) {
                 dst.Resize({1, 1, src.dims.back()});
                 dst.FakeFrom(src, (size_t)b * src.dims.back() * src.unitSize);
@@ -224,7 +251,7 @@ static void RunBatch(int batch, bool merged, bool ring) {
             rl.Resize({1}); rl.FakeFrom(live, b * sizeof(int));
             Require(FastllmCudaNaiveRopeAppendCache(rq, rk, rv, index[b], rp,
                 keyRef[b], valueRef[b], rl, heads, kvHeads, dim, vd, rd, 10000.f,
-                .707f, ring ? 128 : 0, merged ? &packed : nullptr, ring), "scalar cache rejected");
+                .707f, ring || staged ? 128 : 0, merged ? &packed : nullptr, ring, staged), "scalar cache rejected");
         }
         if (!replay) body();
         else Cuda(cudaGraphLaunch(exec, cudaStreamPerThread));
@@ -239,12 +266,12 @@ static void RunBatch(int batch, bool merged, bool ring) {
     const auto before = Read(q), cacheBefore = Read(keys.front());
     keys.back().strides[1]++;
     Require(!FastllmCudaNaiveBatchRopeAppendCache(q, k, v, positions, rows, live,
-        heads, kvHeads, dim, vd, rd, 10000.f, .707f, ring ? 128 : 0,
+        heads, kvHeads, dim, vd, rd, 10000.f, .707f, ring || staged ? 128 : 0,
         merged ? &qkv : nullptr, ring), "batch accepted invalid final cache");
     keys.back().strides[1]--;
     k.strides[1]++;
     Require(!FastllmCudaNaiveBatchRopeAppendCache(q, k, v, positions, rows, live,
-        heads, kvHeads, dim, vd, rd, 10000.f, .707f, ring ? 128 : 0,
+        heads, kvHeads, dim, vd, rd, 10000.f, .707f, ring || staged ? 128 : 0,
         merged ? &qkv : nullptr, ring), "batch accepted strided projection");
     k.strides[1]--;
     Require(Read(q) == before && Read(keys.front()) == cacheBefore, "rejected batch modified output");
@@ -277,6 +304,12 @@ int main() {
         for (int batch : {1, 2, 3, 4, 8, 33})
             for (bool merged : {false, true}) for (bool ring : {false, true})
                 RunBatch(batch, merged, ring);
+        for (int batch : {80, 193, 257}) for (bool merged : {false, true}) {
+            RunBatch(batch, merged, false, true);
+            RunBatch(batch, merged, true);
+        }
+        for (int batch : {193, 257, 1025}) for (bool merged : {false, true})
+            for (bool fp8 : {false, true}) RunBatch(batch, merged, false, true, true, fp8);
         std::printf("Naive RoPE/cache: %d checks passed\n", checks);
         return 0;
     } catch (const std::exception &e) {

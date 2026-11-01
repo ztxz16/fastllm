@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstring>
 #include <numeric>
+#include <map>
 #include <stdexcept>
 #include <vector>
 
@@ -198,7 +199,8 @@ void MarkovGraphCase() {
     std::printf("MARKOV_FILTER_GRAPH_PASS %d replays; 3 dtypes; block 1/2/3/5/7/8/9/16/31\n", checks);
 }
 void ChainCase(const char *name, std::vector<float> p, std::vector<float> qdist,
-               int drafts, int vocab) {
+               int drafts, int vocab, float targetTemperature = 1.f,
+               int targetK = 0, float targetP = 1.f) {
     const int batch = 16384, qRows = batch * drafts, pRows = batch * (drafts + 1);
     std::vector<float> qLogits(qRows * vocab, -INFINITY), pLogits(pRows * vocab, -INFINITY);
     const float bonus[] = {.1f, .2f, .7f};
@@ -213,8 +215,8 @@ void ChainCase(const char *name, std::vector<float> p, std::vector<float> qdist,
             pLogits[(b * (drafts + 1) + drafts) * vocab + i] = std::log(bonus[i]);
     }
     Buffer ql(qLogits), pl(pLogits), q(qLogits.size());
-    std::vector<float> qt(qRows, 1), qp(qRows, 1), pt(pRows, 1), pp(pRows, 1);
-    std::vector<int> qk(qRows, vocab), pk(pRows, vocab), ids(qRows), out(pRows), accepted(batch);
+    std::vector<float> qt(qRows, 1), qp(qRows, 1), pt(pRows, targetTemperature), pp(pRows, targetP);
+    std::vector<int> qk(qRows, 0), pk(pRows, targetK), ids(qRows), out(pRows), accepted(batch);
     Require(FastllmCudaMtpSampleDraft(ql.p, q.p, qt.data(), qk.data(), qp.data(), ids.data(),
                                      qRows, vocab), "chain proposal sampling failed");
     auto snapshot = q.Read();
@@ -240,6 +242,13 @@ void ChainCase(const char *name, std::vector<float> p, std::vector<float> qdist,
                 Require(out[off + d] == -1, "rejected suffix was emitted");
         }
     }
+    // The proposal is full softmax even when target p has a smaller support.
+    // Check the final law after rejection/correction, not just sampler bounds.
+    std::vector<float> logP, logBonus;
+    for (int i = 0; i < 3; ++i) { logP.push_back(std::log(p[i])); logBonus.push_back(std::log(bonus[i])); }
+    auto filteredP = Oracle(logP, targetTemperature, targetK, targetP);
+    auto filteredBonus = Oracle(logBonus, targetTemperature, targetK, targetP);
+    p.assign(filteredP.begin(), filteredP.end());
     double alpha = 0, residualMass = 0;
     for (int i = 0; i < 3; ++i) {
         alpha += std::min(p[i], qdist[i]);
@@ -256,7 +265,7 @@ void ChainCase(const char *name, std::vector<float> p, std::vector<float> qdist,
             Require(std::fabs(double(residuals[i])/rejected -
                 std::max(p[i]-qdist[i], 0.f)/residualMass) < .03, "wrong residual distribution");
         if (allAccepted > 1000)
-            Require(std::fabs(double(bonuses[i])/allAccepted - bonus[i]) < .03, "wrong bonus distribution");
+            Require(std::fabs(double(bonuses[i])/allAccepted - filteredBonus[i]) < .03, "wrong bonus distribution");
     }
     std::printf("%s drafts=%d vocab=%d p_out=[%.4f %.4f %.4f] accept_first=%.4f all=%.4f: PASS\n",
         name, drafts, vocab, double(counts[0])/batch, double(counts[1])/batch,
@@ -359,6 +368,60 @@ void GraphTopPCase() {
         }
     }
     std::puts("graph top-p: sparse/dense transitions, ties, masks, joint top-k, fallback boundaries: PASS");
+}
+
+void ResizableGraphSamplerCase() {
+    const int capacity = 64, vocab = 65536;
+    std::vector<float> temperatures(capacity, 1.f), topPs(capacity, 1.f);
+    std::vector<int> topKs(capacity, 0);
+    void *sampler = FastllmCudaMtpCreateDraftSamplerBatch(capacity, vocab,
+        temperatures.data(), topKs.data(), topPs.data());
+    Require(sampler, "cannot create bounded sampler");
+    Require(!FastllmCudaMtpDraftSamplerSetParameters(sampler, capacity + 1,
+        temperatures.data(), topKs.data(), topPs.data()), "sampler accepted out-of-capacity rows");
+    Buffer logits((size_t)capacity * vocab), q((size_t)capacity * vocab), expected((size_t)capacity * vocab);
+    Buffer token(capacity), referenceToken(capacity);
+    std::map<int, std::pair<cudaGraph_t, cudaGraphExec_t>> graphs;
+    int phase = 0;
+    for (int rows : {1, 8, 33, 64, 3, 32, 64, 1}) {
+        std::vector<float> values((size_t)rows * vocab);
+        for (int row = 0; row < rows; ++row) {
+            temperatures[row] = .7f + ((row + phase) % 9) * .07f;
+            for (int id = 0; id < vocab; ++id)
+                values[(size_t)row * vocab + id] = std::sin((id + row + phase) * .031f) * 3;
+        }
+        Check(cudaMemcpy(logits.p, values.data(), values.size() * sizeof(float), cudaMemcpyHostToDevice));
+        Require(FastllmCudaMtpDraftSamplerSetParameters(sampler, rows, temperatures.data(), topKs.data(), topPs.data()),
+            "bounded sampler parameter update failed");
+        Require(FastllmCudaMtpDraftSamplerSetSeed(sampler), "bounded sampler seed failed");
+        if (!graphs.count(rows)) {
+            Require(FastllmCudaMtpDraftSamplerRunBatch(sampler, logits.p, q.p, token.p, 0), "bounded sampler warmup failed");
+            Check(cudaStreamSynchronize(cudaStreamPerThread));
+            auto &g = graphs[rows];
+            Check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+            Require(FastllmCudaMtpDraftSamplerRunBatch(sampler, logits.p, q.p, token.p, 0), "bounded sampler capture failed");
+            Check(cudaStreamEndCapture(cudaStreamPerThread, &g.first));
+            Check(cudaGraphInstantiate(&g.second, g.first, nullptr, nullptr, 0));
+        }
+        Check(cudaGraphLaunch(graphs.at(rows).second, cudaStreamPerThread));
+        auto actual = q.Read(); auto ids = token.Read();
+        void *reference = FastllmCudaMtpCreateDraftSamplerBatch(rows, vocab,
+            temperatures.data(), topKs.data(), topPs.data());
+        Require(reference && FastllmCudaMtpDraftSamplerSetSeed(reference) &&
+            FastllmCudaMtpDraftSamplerRunBatch(reference, logits.p, expected.p, referenceToken.p, 0),
+            "reference sampler failed");
+        auto oracle = expected.Read();
+        for (size_t i = 0; i < values.size(); ++i)
+            Require(actual[i] == oracle[i], "resized sampler changed proposal probabilities");
+        for (int row = 0; row < rows; ++row)
+            Require(ids[row] >= 0 && ids[row] < vocab && ids[row] == (int)ids[row], "resized sampler returned invalid token");
+        FastllmCudaMtpDestroyDraftSampler(reference); ++phase;
+    }
+    for (auto &entry : graphs) {
+        Check(cudaGraphExecDestroy(entry.second.second)); Check(cudaGraphDestroy(entry.second.first));
+    }
+    FastllmCudaMtpDestroyDraftSampler(sampler);
+    std::puts("bounded sampler: batch growth/shrink, changing temperatures and graph replay: PASS");
 }
 
 void GraphSamplerCase() {
@@ -470,7 +533,11 @@ int main() {
         FullVocabularyCase();
         LargeVocabularyCase();
         GraphSamplerCase();
+        ResizableGraphSamplerCase();
         GraphTopPCase();
+        for (int drafts : {1, 3, 5, 7})
+            ChainCase("unfiltered-q filtered-p", {.55f, .30f, .15f}, {.10f, .40f, .50f},
+                  drafts, 32, .7f, 2, .8f);
         ChainCase("identical", {.6f,.3f,.1f}, {.6f,.3f,.1f}, 3, 32);
         ChainCase("different", {.6f,.3f,.1f}, {.3f,.5f,.2f}, 3, 17);
         ChainCase("seven drafts", {.6f,.3f,.1f}, {.3f,.5f,.2f}, 7, 32);

@@ -175,6 +175,9 @@ namespace fastllm {
             LogitsSelection *selection = nullptr;
             bool verifying = false;
             bool collectHidden = true;
+            // Internal consumers finish before the next target forward. Public
+            // callers keep owning outputs unless they explicitly opt in.
+            bool borrowOutputs = false;
             bool ringVerify = false; // Candidates are staged after the retained SWA ring.
             std::map<int, Data> hidden;
             std::vector<PrefixSnapshots> prefixes;
@@ -185,6 +188,9 @@ namespace fastllm {
         // Bounded LRU; graph-owned inputs are refreshed on every replay.
         std::vector<std::shared_ptr<DraftWorkspace>> draftBatchWorkspaces;
         std::vector<std::shared_ptr<DraftWorkspace>> draftProposalWorkspaces;
+        // Graph variants execute serially and share their large activation buffers.
+        std::shared_ptr<DraftWorkspace> draftBatchStorage, draftContextStorage;
+        std::shared_ptr<DraftWorkspace> draftProposalStorage;
         // Single-device draft graphs execute serially, including request churn.
         std::map<int, std::shared_ptr<void>> draftLinearGraphWorkspaces;
         struct DraftContext {
@@ -222,7 +228,6 @@ namespace fastllm {
         std::shared_ptr<DraftContext> CreateDraftContext();
         bool PrepareDraftTP();
         bool AppendDraftContextTP(Data &hidden, int start, DraftContext &context);
-        bool RunDraftTP(int anchor, DraftContext &context, Data &output);
         bool RunDraftGraph(int anchor, DraftContext &context, Data &output);
         bool RunDraftSamplingStep(int previous, int step, const Data &baseLogits,
             DraftContext &context, const GenerationConfig &config, int &token);
@@ -247,6 +252,7 @@ namespace fastllm {
         void PrepareDraftRound(DraftRound &round, const Data *preparedLogits = nullptr);
         bool PrepareDraftBatch(std::vector<std::unique_ptr<DraftRound>> &rounds, const Data &baseLogits);
         bool PrepareDraftBatchGraph(std::vector<std::unique_ptr<DraftRound>> &rounds, const Data &baseLogits);
+        void PrepareDraftSamplingMemory(int rows, int steps, int vocab, int latentWidth);
         void PrepareDraftAcceptance(std::vector<std::unique_ptr<DraftRound>> &rounds, Data &logits);
         int FinishDraftRound(DraftRound &round, Data &logits, TargetCapture &capture,
                              std::vector<std::pair<Data, Data>> &kv);
@@ -292,6 +298,8 @@ namespace fastllm {
         struct TPDecodeState;
         std::shared_ptr<TPDecodeState> tpDecodeState, tpVerifyState, tpBatchState, tpBatchVerifyState;
         std::vector<std::shared_ptr<TPDecodeState>> tpBatchVerifyGraphs;
+        std::shared_ptr<TPDecodeState> tpBatchVerifyStorage;
+        Data tpSamplingLogits{FLOAT32};
         struct TPServingState;
         std::shared_ptr<TPServingState> tpServingState;
         std::atomic<uint64_t> tpCacheEpoch{0};
@@ -305,7 +313,7 @@ namespace fastllm {
                                         std::vector<std::pair<Data, Data>> &kv, bool verifying,
                                         const LogitsSelection &selection, std::vector<int *> &cacheLengths,
                                         const TargetBatch *batch = nullptr,
-                                        bool collectHidden = false);
+                                        bool collectHidden = false, bool reuseOnly = false);
         Data ForwardTensorParallelDecode(int rank, const Data &inputIds, const Data &positions,
                                         std::vector<std::pair<Data, Data>> &kv,
                                         const GenerationConfig &config, const Data *embedding, TargetCapture *capture,

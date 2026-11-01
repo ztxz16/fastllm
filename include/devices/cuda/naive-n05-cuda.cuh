@@ -6,6 +6,24 @@ inline bool FastllmNaiveKVType(fastllm::DataType type) {
     return type == fastllm::BFLOAT16 || type == fastllm::FP8_E4M3;
 }
 
+// Expanded BF16/FP8 KV caches keep physical strides/capacity when logical length
+// changes. Other layouts retain Data::Resize and its layout invalidation rules.
+inline bool FastllmNaiveCanResizeKVLength(const fastllm::Data &cache, int length, int width) {
+    return length >= 0 && FastllmNaiveKVType(cache.dataType) && !cache.cudaNativeNvfp4Layout &&
+        cache.tpLayout == fastllm::TP_LAYOUT_NONE && cache.unitSize == (cache.dataType == fastllm::FP8_E4M3 ? 1 : 2) && cache.unitSizeDiv == 1 &&
+        cache.dims.size() == 3 && cache.dims[0] == 1 && cache.dims[2] == width &&
+        cache.expansionDims.size() == 3 && cache.expansionDims[0] == 1 &&
+        cache.expansionDims[1] >= length && cache.expansionDims[2] == width;
+}
+
+inline void FastllmNaiveResizeKVLength(fastllm::Data &cache, int length, int width) {
+    if (FastllmNaiveCanResizeKVLength(cache, length, width)) {
+        cache.dims[1] = length;
+    } else {
+        cache.Resize({1, length, width});
+    }
+}
+
 // Match the full-vocabulary CUDA Top1's 256-lane reduction order on ties.
 // Global IDs are essential: shards need not start at a multiple of 256.
 #ifdef __CUDACC__
@@ -84,7 +102,8 @@ struct FastllmNaiveDraftRow {
 bool FastllmCudaNaiveBatchDraftQKV(const fastllm::Data &raw,
     const fastllm::Data &qNorm, const fastllm::Data &kNorm,
     const std::vector<FastllmNaiveDraftRow> &requests, fastllm::Data &query,
-    int heads, int kvHeads, int dim, int window, float eps, float theta);
+    int heads, int kvHeads, int dim, int window, float eps, float theta,
+    fastllm::Data *descriptorsWorkspace = nullptr);
 bool FastllmCudaNaiveBatchDraftAttention(const fastllm::Data &query,
     const std::vector<FastllmNaiveDraftRow> &requests,
     int heads, int kvHeads, int dim, int window, fastllm::Data &scores, fastllm::Data &output);
@@ -359,7 +378,8 @@ void FastllmCudaNaiveDraftArgmax(const fastllm::Data &base,
     fastllm::Data &ids);
 // One BF16 base/bias row and independent vocabulary mask per request.
 void FastllmCudaNaiveBatchDraftSamplingLogits(const fastllm::Data &base,
-    const fastllm::Data &bias, const fastllm::Data &mask, fastllm::Data &output);
+    const fastllm::Data &bias, const fastllm::Data &mask, fastllm::Data &output,
+    int step = 0, int steps = 1);
 // Merge one BF16 draft row and bias with BF16 rounding, then apply its token mask.
 void FastllmCudaNaiveDraftSamplingLogits(const fastllm::Data &base,
     const fastllm::Data &bias, const fastllm::Data &mask, int step, fastllm::Data &output);

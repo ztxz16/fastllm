@@ -1,3 +1,6 @@
+#ifndef CUDA_API_PER_THREAD_DEFAULT_STREAM
+#define CUDA_API_PER_THREAD_DEFAULT_STREAM 1
+#endif
 #include "fastllm.h"
 #include "executor.h"
 #include "utils/utils.h"
@@ -6,6 +9,7 @@
 #include <cuda_runtime_api.h>
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <iostream>
 #include <stdexcept>
 using namespace fastllm;
@@ -32,8 +36,50 @@ static std::vector<uint16_t> Bits(const Data &x, size_t count = 0) {
     return out;
 }
 
-static void BatchDraft(int count, int rows, int dim, int heads, int window) {
-    const int kh = 4, qw = heads * dim, kw = kh * dim, cap = window + rows;
+static float Float(uint16_t bits) {
+    uint32_t word = uint32_t(bits) << 16; float value;
+    std::memcpy(&value, &word, sizeof(value)); return value;
+}
+static void SamplingRows(int count, int steps) {
+    const int vocab = 263, words = (vocab + 31) / 32;
+    Data base = BF({1, count * steps, vocab}, 331), bias = BF({1, count, vocab}, 73);
+    Data mask(INT32, {count, words}), output;
+    mask.Allocate();
+    for (int i = 0; i < count * words; ++i) ((uint32_t *)mask.cpuData)[i] = ~(uint32_t(1) << (i % 32));
+    mask.ToDevice(DataDevice::CUDA, std::vector<int>{0});
+    const auto b = Bits(bias);
+    auto input = Bits(base);
+    for (int step = 0; step < steps; ++step) {
+        auto body = [&] { FastllmCudaNaiveBatchDraftSamplingLogits(base, bias, mask, output, step, steps); };
+        body();
+        void *graph = nullptr, *exec = nullptr;
+        Require(FastllmCudaGraphBeginCapture(), "sampling rows capture"); body();
+        Require(FastllmCudaGraphEndCapture(&graph) && FastllmCudaGraphInstantiate(graph, &exec), "sampling rows graph");
+        for (int replay = 0; replay < 2; ++replay) {
+            for (int row = 0; row < count; ++row)
+                input[((size_t)row * steps + step) * vocab] = Float32ToBFloat16RNEBits(float(replay + row));
+            Require(cudaMemcpy(base.cudaData, input.data(), input.size() * 2, cudaMemcpyHostToDevice) == cudaSuccess, "sampling rows upload");
+            Require(FastllmCudaGraphLaunch(exec), "sampling rows replay");
+            std::vector<float> got(count * vocab);
+            Require(cudaMemcpy(got.data(), output.cudaData, got.size() * sizeof(float), cudaMemcpyDeviceToHost) == cudaSuccess, "sampling rows read");
+            for (int row = 0; row < count; ++row) for (int col = 0; col < vocab; ++col) {
+                const bool allowed = ((uint32_t *)mask.cpuData)[row * words + col / 32] & (uint32_t(1) << (col % 32));
+                const float expected = allowed ? Float(Float32ToBFloat16RNEBits(
+                    Float(input[((size_t)row * steps + step) * vocab + col]) + Float(b[row * vocab + col]))) : -INFINITY;
+                if (got[row * vocab + col] != expected) {
+                    std::cerr << "sampling count=" << count << " steps=" << steps << " step=" << step
+                              << " replay=" << replay << " row=" << row << " col=" << col
+                              << " got=" << got[row * vocab + col] << " expected=" << expected << '\n';
+                    throw std::runtime_error("strided sampling logits differ from CPU oracle");
+                }
+            }
+        }
+        FastllmCudaGraphExecDestroy(exec); FastllmCudaGraphDestroy(graph);
+    }
+}
+static void BatchDraft(int count, int rows, int dim, int heads, int window, int kvHeads = 4) {
+    const int kh = kvHeads, qw = heads * dim, kw = kh * dim, cap = window + rows;
+    const bool fused = count >= 8 && dim == 128 && heads / kvHeads <= 32 && window >= rows;
     Data raw = BF({1, rows * count, qw + 2 * kw}, 119);
     Data qn(FLOAT32, {dim}), kn(FLOAT32, {dim});
     qn.Allocate(); kn.Allocate();
@@ -57,8 +103,9 @@ static void BatchDraft(int count, int rows, int dim, int heads, int window) {
         *(int *)live[b].cpuData = past + 1; live[b].ToDevice(DataDevice::CUDA, std::vector<int>{0});
         descriptors.push_back({&keys[b], &values[b], &pos[b], &live[b], std::min(past, window - 1) + rows <= 256});
     }
-    Data query, scores, output;
-    Require(FastllmCudaNaiveBatchDraftQKV(raw, qn, kn, descriptors, query, heads, kh, dim, window, 1e-5, 10000), "batch QKV rejected");
+    Data query, scores, output, qkvDescriptors;
+    Require(FastllmCudaNaiveBatchDraftQKV(raw, qn, kn, descriptors, query, heads, kh, dim, window, 1e-5, 10000,
+        &qkvDescriptors), "batch QKV rejected");
     Require(FastllmCudaNaiveBatchDraftAttention(query, descriptors, heads, kh, dim, window, scores, output), "batch attention rejected");
     auto qbits = Bits(query), out = Bits(output);
     for (int b = 0; b < count; ++b) {
@@ -72,7 +119,67 @@ static void BatchDraft(int count, int rows, int dim, int heads, int window) {
         Require(std::equal(expectedQ.begin(), expectedQ.end(), qbits.begin() + (size_t)b * rows * qw), "batch query differs");
         Require(Bits(keys[b], (size_t)cap * kw) == Bits(rk[b], (size_t)cap * kw), "batch K/prefix differs");
         Require(Bits(values[b], (size_t)cap * kw) == Bits(rv[b], (size_t)cap * kw), "batch V/prefix differs");
-        Require(std::equal(expectedOut.begin(), expectedOut.end(), out.begin() + (size_t)b * rows * qw), "batch attention bits differ");
+
+        if (!fused) {
+            Require(std::equal(expectedOut.begin(), expectedOut.end(), out.begin() + (size_t)b * rows * qw), "batch attention bits differ");
+        } else {
+            // Tensor-core online softmax changes the probability rounding point.
+            // Bound its error against the existing full FP32 reduction path.
+            double error = 0, norm = 0;
+            for (size_t j = 0; j < expectedOut.size(); ++j) {
+                double ref = Float(expectedOut[j]);
+                double delta = Float(out[(size_t)b * rows * qw + j]) - ref;
+                error += delta * delta; norm += ref * ref;
+            }
+            Require(std::sqrt(error / std::max(norm, 1e-20)) < .01, "fused attention relative error");
+            // Independently check the window, request/head addressing and
+            // numerical error with a double-precision CPU softmax and PV.
+            if (b == 0 || b == count - 1) {
+                const auto kb = Bits(rk[b], (size_t)cap * kw), vb = Bits(rv[b], (size_t)cap * kw);
+                const int past = std::min(*(int *)live[b].cpuData - 1, window - 1), keys = past + rows;
+                for (int row : {0, rows - 1}) for (int h : {0, heads - 1}) {
+                    const int start = std::max(0, past + row - window + 1), head = h / (heads / kh);
+                    std::vector<double> weights(keys);
+                    double maximum = -1e30, sum = 0;
+                    for (int k = start; k < keys; ++k) {
+                        double dot = 0;
+                        for (int d = 0; d < dim; ++d)
+                            dot += double(Float(expectedQ[(row * heads + h) * dim + d])) *
+                                   Float(kb[k * kw + head * dim + d]);
+                        weights[k] = Float(Float32ToBFloat16RNEBits(
+                            Float(Float32ToBFloat16RNEBits(float(dot))) / std::sqrt(float(dim))));
+                        maximum = std::max(maximum, weights[k]);
+                    }
+                    for (int k = start; k < keys; ++k) { weights[k] = std::exp(weights[k] - maximum); sum += weights[k]; }
+                    for (int d : {0, dim / 2, dim - 1}) {
+                        double expected = 0;
+                        for (int k = start; k < keys; ++k)
+                            expected += weights[k] / sum * Float(vb[k * kw + head * dim + d]);
+                        const double actual = Float(out[((size_t)b * rows * heads + row * heads + h) * dim + d]);
+                        Require(std::abs(actual - expected) <= .04 + .01 * std::abs(expected), "fused attention CPU reference differs");
+                    }
+                }
+            }
+        }
+    }
+
+    if (fused) {
+        void *graph = nullptr, *exec = nullptr;
+        Require(FastllmCudaGraphBeginCapture(), "draft attention capture");
+        Require(FastllmCudaNaiveBatchDraftAttention(query, descriptors, heads, kh, dim, window,
+            scores, output), "captured attention rejected");
+        Require(FastllmCudaGraphEndCapture(&graph), "draft attention end capture");
+        Require(FastllmCudaGraphInstantiate(graph, &exec), "draft attention instantiate");
+        // Change a short request to a long one without recapturing.
+        int longer = window * 9;
+        Require(cudaMemcpy(live[0].cudaData, &longer, sizeof(longer), cudaMemcpyHostToDevice) == cudaSuccess, "update live length");
+        Require(FastllmCudaGraphLaunch(exec), "draft attention replay");
+        auto replay = Bits(output);
+        Require(FastllmCudaNaiveBatchDraftAttention(query, descriptors, heads, kh, dim, window,
+            scores, output), "eager attention rejected");
+        Require(Bits(output) == replay, "dynamic draft attention graph differs");
+        FastllmCudaGraphExecDestroy(exec); FastllmCudaGraphDestroy(graph);
+        std::cout << "DRAFT FLASH PASS batch=" << count << " rows=" << rows << '\n';
     }
     auto before = Bits(keys[0], (size_t)cap * kw);
     descriptors.back().liveKeys = nullptr;
@@ -106,12 +213,20 @@ int main() {
             return 77;
         ApplyDeviceMap({{"cuda:0", 1}}, 1, 1);
         SetCudaEmbedding(true);
+        for (int count : {1, 33, 129}) for (int steps : {1, 3, 5, 7}) SamplingRows(count, steps);
         for (int count : {2, 8, 40}) BatchInput(count);
         for (int count : {2, 8, 40}) for (int dim : {128, 192, 256})
             for (int rows : {2, 7}) for (int window : {64, 1024, 1152})
                 BatchDraft(count, rows, dim, 16, window);
         for (int count : {1, 2, 3, 4, 8, 16, 40}) for (int rows : {2, 5, 7, 8, 15})
             BatchDraft(count, rows, 128, 32, 1024);
+        for (int count : {32, 128}) for (int rows : {3, 5, 7})
+            BatchDraft(count, rows, 128, 32, 1024);
+        for (int count : {8, 33, 128}) for (int rows : {3, 5, 7})
+            BatchDraft(count, rows, 128, 4, 1024, 1);
+        // Cross both the old 32-request boundary and the descriptor upload
+        // chunk boundary; graph replay must own its descriptor values.
+        for (int rows : {3, 5, 7}) BatchDraft(257, rows, 128, 4, 1024, 1);
         int checks = 0;
         for (int rows : {1, 2, 7, 8, 17})
             for (int dim : {6, 32, 64, 128, 192, 256})

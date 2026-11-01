@@ -17525,7 +17525,8 @@ __global__ void FastllmMtpTopPApply(const float *probs, float *output, const flo
 // Intersect top-k/top-p on the original temperature softmax, matching the
 // ordinary CUDA sampler. Filtering and renormalizing top-k first changes p.
 struct FastllmMtpSamplingWorkspace {
-    const int vocab, rows;
+    const int vocab, capacity;
+    int rows;
     uint8_t *scratch = nullptr;
     bool own = false, dedicated = false, needTopP = false, needTopK = false;
     bool uniformTemperature = true;
@@ -17540,7 +17541,7 @@ struct FastllmMtpSamplingWorkspace {
     FastllmMtpTopPState *topPState = nullptr;
     float2 *topPCuts = nullptr;
     explicit FastllmMtpSamplingWorkspace(int rows, int vocab, bool dedicated = false)
-        : vocab(vocab), rows(rows), dedicated(dedicated) {
+        : vocab(vocab), capacity(rows), rows(rows), dedicated(dedicated) {
         size_t need = 0;
         auto reserve = [&](size_t bytes) {
             size_t offset = need;
@@ -17556,7 +17557,7 @@ struct FastllmMtpSamplingWorkspace {
         size_t doff = reserve(rows * sizeof(int)), ac = reserve(rows * sizeof(int));
         size_t va = reserve(rows * sizeof(bool));
         size_t rs = reserve(rows * sizeof(flashinfer::sampling::RadixRowState));
-        softmaxTiles = dedicated && rows <= 32 && vocab >= 65536 ? (vocab + 4095) / 4096 : 0;
+        softmaxTiles = vocab >= 65536 ? (vocab + 4095) / 4096 : 0;
         size_t sm = reserve((size_t)rows * softmaxTiles * sizeof(float2));
         size_t so = dedicated ? reserve(sizeof(uint64_t)) : 0;
         // The exact sparse shortcut is independent of workspace ownership and
@@ -17597,7 +17598,8 @@ struct FastllmMtpSamplingWorkspace {
         if (!scratch) return false;
         static_assert(sizeof(float) == sizeof(uint32_t) && sizeof(int) == sizeof(uint32_t),
                       "MTP sampling parameter layout requires 32-bit scalars.");
-        std::vector<uint32_t> params((size_t)rows * 3);
+        if (rows <= 0 || rows > capacity || vocab != this->vocab) return false;
+        std::vector<uint32_t> params((size_t)capacity * 3);
         needTopP = needTopK = false;
         uniformTemperature = true;
         scalarTemperature = hostTemperatures[0];
@@ -17608,8 +17610,8 @@ struct FastllmMtpSamplingWorkspace {
             uniformTemperature &= hostTemperatures[i] == scalarTemperature;
             int topK = hostTopKs[i] <= 0 ? vocab : std::min(hostTopKs[i], vocab);
             memcpy(&params[i], &hostTemperatures[i], sizeof(float));
-            memcpy(&params[rows + i], &topK, sizeof(int));
-            memcpy(&params[2 * rows + i], &hostTopPs[i], sizeof(float));
+            memcpy(&params[capacity + i], &topK, sizeof(int));
+            memcpy(&params[2 * capacity + i], &hostTopPs[i], sizeof(float));
             needTopP |= hostTopPs[i] < 1;
             needTopK |= topK < vocab;
         }
@@ -17621,9 +17623,9 @@ struct FastllmMtpSamplingWorkspace {
             if (!tiled || !uniformTemperature)
                 FastllmCudaCopyFromHostToDevice(temperatures, params.data(), rows * sizeof(float));
             if (needTopK)
-                FastllmCudaCopyFromHostToDevice(topKs, params.data() + rows, rows * sizeof(int));
+                FastllmCudaCopyFromHostToDevice(topKs, params.data() + capacity, rows * sizeof(int));
             if (needTopP)
-                FastllmCudaCopyFromHostToDevice(topPs, params.data() + 2 * rows, rows * sizeof(float));
+                FastllmCudaCopyFromHostToDevice(topPs, params.data() + 2 * capacity, rows * sizeof(float));
         }
         return true;
     }
@@ -17639,7 +17641,7 @@ struct FastllmMtpSamplingWorkspace {
                 logits, (float2*)b, tsDevice, scalarTemperature, vocab, chunks);
             FastllmTemperatureSoftmaxNormalizeKernel<256, 4096><<<dim3(chunks, rows), 256, 0, stream>>>(
                 logits, a, (const float2*)b, tsDevice, scalarTemperature, vocab, chunks);
-        } else if (softmaxTiles) {
+        } else if (softmaxTiles && rows <= 32) {
             dim3 grid(softmaxTiles, rows);
             FastllmMtpSoftmaxPartialKernel<<<grid, 256, 0, stream>>>(
                 logits, temperatures, softmaxPartials, vocab, softmaxTiles);
@@ -17704,6 +17706,14 @@ void *FastllmCudaMtpCreateDraftSamplerBatch(int rows, int vocab,
         return nullptr;
     }
     return state;
+}
+bool FastllmCudaMtpDraftSamplerSetParameters(void *sampler, int rows,
+        const float *temperatures, const int *topKs, const float *topPs) {
+    if (!sampler || !temperatures || !topKs || !topPs) return false;
+    auto &ws = *static_cast<FastllmMtpSamplingWorkspace *>(sampler);
+    if (!ws.UploadParameters(temperatures, topKs, topPs, rows, ws.vocab)) return false;
+    ws.rows = rows;
+    return true;
 }
 void FastllmCudaMtpDestroyDraftSampler(void *sampler) {
     delete static_cast<FastllmMtpSamplingWorkspace *>(sampler);

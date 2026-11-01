@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <cmath>
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <stdexcept>
 #include <vector>
@@ -36,6 +38,51 @@ static void Fill(Data &d, unsigned seed) {
         x = __float2bfloat16_rn((int(seed >> 24) - 128) / 128.f);
     }
     Check(cudaMemcpy(d.cudaData, v.data(), v.size() * 2, cudaMemcpyHostToDevice));
+}
+static double HostBF(const unsigned char *data, size_t i) {
+    unsigned short bits; memcpy(&bits, data + i * 2, 2);
+    return __bfloat162float(__ushort_as_bfloat16(bits));
+}
+static double HostKV(const unsigned char *data, size_t i, bool fp8) {
+    if (!fp8) return HostBF(data, i);
+    __nv_fp8_e4m3 value; value.__x = data[i]; return float(value);
+}
+static double Rounded(double x) { return __bfloat162float(__float2bfloat16_rn(float(x))); }
+static void CheckSwaOracle(const Data &q, const Data &key, const Data &value, const Data &sink,
+        const std::vector<unsigned char> &output, int requests, int rows, int heads, int past) {
+    const auto query = Read(q), keys = Read(key, (size_t)256 * 192 * key.unitSize),
+        values = Read(value, (size_t)256 * 128 * value.unitSize), bias = Read(sink);
+    const bool fp8 = key.dataType == FP8_E4M3;
+    double error = 0, norm = 0;
+    for (int request : {0, requests - 1}) for (int row : {0, rows - 1}) for (int head : {0, heads - 1}) {
+        const int length = past + row + 1, start = std::max(0, length - 128);
+        std::vector<double> scores(length - start), probabilities(scores.size());
+        float sinkValue; memcpy(&sinkValue, bias.data() + head * sizeof(float), sizeof(float));
+        double maximum = sinkValue;
+        auto physical = [&](int logical) { return logical >= past ? 128 + logical - past : logical & 127; };
+        for (int logical = start; logical < length; ++logical) {
+            double dot = 0;
+            for (int d = 0; d < 192; ++d)
+                dot += HostBF(query.data(), ((size_t)(request * rows + row) * heads + head) * 192 + d) *
+                    HostKV(keys.data(), (size_t)physical(logical) * 192 + d, fp8);
+            scores[logical - start] = Rounded(Rounded(dot) / std::sqrt(192.0));
+            maximum = std::max(maximum, scores[logical - start]);
+        }
+        double denominator = std::exp(double(sinkValue) - maximum);
+        for (double score : scores) denominator += std::exp(score - maximum);
+        for (size_t i = 0; i < scores.size(); ++i) probabilities[i] = Rounded(std::exp(scores[i] - maximum) / denominator);
+        for (int d = 0; d < 128; ++d) {
+            double expected = 0;
+            for (int logical = start; logical < length; ++logical)
+                expected += probabilities[logical - start] * HostKV(values.data(), (size_t)physical(logical) * 128 + d, fp8);
+            expected = Rounded(expected);
+            const double got = HostBF(output.data(), ((size_t)(request * rows + row) * heads + head) * 128 + d);
+            const double delta = got - expected;
+            Require(std::isfinite(got) && std::abs(delta) <= .004 + .01 * std::abs(expected), "SWA double oracle element error");
+            error += delta * delta; norm += expected * expected;
+        }
+    }
+    Require(std::sqrt(error / std::max(norm, 1e-20)) < .004, "SWA double oracle relative error");
 }
 static void BatchCommit(int requests, DataType type) {
     std::vector<Data> keys(requests), values(requests), rk(requests), rv(requests);
@@ -168,13 +215,27 @@ int main() {
                                 FastllmCudaNaiveBatchSWADecode(queries, sink, descriptors, empty,
                                     heads, 1, batched);
                                 auto got = Read(batched);
+                                CheckSwaOracle(queries, key, value, sink, got, requests, rows, heads, past);
                                 for (int request = 0; request < requests; ++request) {
                                     Data query(BFLOAT16, {1, rows, heads * 192}), expected;
                                     query.FakeFrom(queries, (size_t)request * rows * heads * 192 * 2);
                                     FastllmCudaNaiveGraphVerifyAttention(query, key, value, empty, sink, live,
                                         256, heads, 1, 192, 128, 128, refScratch, expected, true);
                                     auto values = Read(expected);
-                                    Require(std::equal(values.begin(), values.end(),
+                                    if (rows * requests >= 32) {
+                                        // The bulk path uses Tensor Core accumulation;
+                                        // use the existing BF16 bound plus the independent
+                                        // double oracle, not scalar-kernel bit identity.
+                                        double err = 0, norm = 0;
+                                        for (size_t j = 0; j < values.size() / 2; ++j) {
+                                            double ref = HostBF(values.data(), j);
+                                            double gotValue = HostBF(got.data(), (size_t)request * rows * heads * 128 + j);
+                                            double delta = gotValue - ref;
+                                            Require(std::isfinite(gotValue) && std::abs(delta) <= .004 + .01 * std::abs(ref), "bulk SWA element error");
+                                            err += delta * delta; norm += ref * ref;
+                                        }
+                                        Require(std::sqrt(err / std::max(norm, 1e-20)) < .004, "bulk SWA relative error");
+                                    } else Require(std::equal(values.begin(), values.end(),
                                         got.begin() + (size_t)request * rows * heads * 128 * 2),
                                         "large batch staged SWA differs from independent request");
                                     ++checks;

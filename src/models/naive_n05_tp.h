@@ -20,6 +20,19 @@ struct NaiveN05FlashModel::TargetWorkspace {
     int tableRows = 0;
     int capacity = 0;
     std::vector<std::unique_ptr<TargetWorkspace>> sequences;
+    void Pointers(std::vector<void *> &out) const {
+        for (const Data *p : {&hidden, &normed, &q, &k, &v, &qkv, &packed, &packedIndexer,
+                &attn, &projected, &routerInput, &router, &expertIndex, &expertScore,
+                &w1, &w2, &w3, &tempInput, &tempOutput, &moeOutput, &moeInputTemp, &moeOutputTemp,
+                &indexQ, &indexKey, &indexKeyFloat, &indexWeights, &indices, &indexBroadcast,
+                &positions, &indexContextGather, &indexContextFull, &indexContextExchange,
+                &last, &logits, &logitsBf16, &inputIds, &liveKeys, &sparsePointers, &sparseLengths,
+                &sparseSelected, &denseGate, &denseUp, &denseDown, &decode.indexQuery,
+                &decode.indexScale, &decode.indexScores, &decode.topk, &decode.attentionScores,
+                &decode.attentionPartial, &decode.windowKey, &decode.windowValue})
+            out.push_back(p->isFake ? nullptr : p->cudaData);
+        for (const auto &part : sequences) part->Pointers(out);
+    }
 };
 
 struct NaiveN05FlashModel::TPDecodeState {
@@ -36,6 +49,15 @@ struct NaiveN05FlashModel::TPDecodeState {
         int maxRows = 0;
         TargetWorkspace buffers;
         Data logitsPartial, logitsCandidates;
+        std::map<int, Data> features;
+        std::vector<void *> Pointers() const {
+            std::vector<void *> out;
+            for (const Data *p : {&inputStorage, &cacheTable, &cacheMaps, &indexScores,
+                    &indexExchange, &logitsPartial, &logitsCandidates}) out.push_back(p->isFake ? nullptr : p->cudaData);
+            for (const auto &feature : features) out.push_back(feature.second.cudaData);
+            buffers.Pointers(out);
+            return out;
+        }
     };
     struct Rank {
         explicit Rank(std::shared_ptr<Storage> workspace = std::make_shared<Storage>())

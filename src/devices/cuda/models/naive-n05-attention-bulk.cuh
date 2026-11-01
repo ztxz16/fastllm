@@ -21,9 +21,37 @@ struct Batch {
 };
 static_assert(sizeof(Batch) + 128 <= (CUDART_VERSION >= 12010 ? 32764 : 4096),
               "Attention arguments exceed CUDA parameter space");
+__device__ inline FastllmNaiveDSARow BatchRow(const Batch &batch, int i) { return batch.rows[i]; }
+#if CUDART_VERSION >= 12010
+// Verification queries may share KV bindings while using independent lengths
+// and selection lists. Common geometry leaves room for larger argument batches.
+struct CompactRow {
+    const void *const *cache;
+    const int *liveKeys, *indices;
+};
+constexpr int CompactLimit = 1024;
+struct CompactBatch {
+    FastllmNaiveDSARow geometry;
+    CompactRow rows[CompactLimit];
+};
+static_assert(sizeof(CompactBatch) + 128 <= 32764);
+__device__ inline FastllmNaiveDSARow BatchRow(const CompactBatch &batch, int i) {
+    auto row = batch.geometry;
+    row.cache = batch.rows[i].cache;
+    row.liveKeys = batch.rows[i].liveKeys;
+    row.indices = batch.rows[i].indices;
+    return row;
+}
+#endif
+
 __device__ inline int index(const FastllmNaiveDSARow &r, int i, int length, bool ring) {
-    if (ring)
-        return i < min(length, 128) ? ((max(0, length - 128) + i) & 127) : -1;
+    if (ring) {
+        if (i >= min(length, 128)) return -1;
+        const int logical = max(0, length - 128) + i;
+        const int prefix = length - r.verifyOffset - 1;
+        return r.verifyOffset >= 0 && logical >= prefix
+            ? 128 + logical - prefix : logical & 127;
+    }
     int k = i < (r.indices ? r.selectedCount : length) ? (r.indices ? r.indices[i] : i) : -1;
     return k >= 0 && k < length ? k : -1;
 }
@@ -115,8 +143,12 @@ template <int Max, bool FP8 = false> struct Storage : PackedStorage<FP8> {
 };
 // Do not emit large-argument Tensor Core kernels for unsupported architectures.
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
-template <int Max, bool Ring, bool FP8, bool AsyncFP8 = true>
-__global__ __launch_bounds__(256) void Decode(const BF *q, Batch batch, const float *sink, BF *out,
+template <int Max, bool Ring, bool FP8, bool AsyncFP8 = true, class BatchType = Batch>
+__global__ __launch_bounds__(256) void Decode(const BF *q,
+#if CUDART_VERSION >= 12010
+        const __grid_constant__
+#endif
+        BatchType batch, const float *sink, BF *out,
                                               int heads, int kvHeads) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     using namespace naive_dsa_decode;
@@ -124,7 +156,7 @@ __global__ __launch_bounds__(256) void Decode(const BF *q, Batch batch, const fl
     auto &s = *(Storage<Max, FP8 && AsyncFP8> *)buffer;
     const int row = blockIdx.x, group = blockIdx.y, head = group * 8, t = threadIdx.x, l = t % 32,
               w = t / 32, kh = head / (heads / kvHeads);
-    auto r = FastllmNaiveResolveDSARow(batch.rows[row]);
+    auto r = FastllmNaiveResolveDSARow(BatchRow(batch, row));
     if (ZeroInactive(r, out + ((size_t)row * heads + head) * 128, 8 * 128)) return;
     r.fp8 = FP8;
     int len = Ring ? (r.liveKeys ? *r.liveKeys : r.length) : Length(r);

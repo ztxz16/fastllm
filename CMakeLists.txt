@@ -2242,6 +2242,12 @@ if (UNIT_TEST)
         add_test(NAME naive_n05_attention COMMAND naive_n05_attention_test)
         set_tests_properties(naive_n05_attention PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
 
+        add_executable(naive_n05_topk_fused_test test/basic/test_naive_n05_topk_fused.cu)
+        set_target_properties(naive_n05_topk_fused_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        fastllm_add_checked_test(naive_n05_topk_fused naive_n05_topk_fused_test
+            "PASS: exact fused TopK" 120)
+        set_tests_properties(naive_n05_topk_fused PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+
         add_executable(naive_n05_topk_threshold_test test/basic/test_naive_n05_topk_threshold.cpp)
         target_link_libraries(naive_n05_topk_threshold_test PRIVATE fastllm)
         target_include_directories(naive_n05_topk_threshold_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
@@ -2410,6 +2416,27 @@ if (UNIT_TEST)
                     COMMAND naive_n05_verify_graph_test 1 draft_batch merged ${NAIVE_DRAFT_BLOCK})
                 set_tests_properties(naive_n05_draft_batch_block${NAIVE_DRAFT_BLOCK} PROPERTIES
                     LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+            endforeach()
+            foreach(NAIVE_DRAFT_TP_BLOCK 3 5 7)
+                add_test(NAME naive_n05_draft_tp_batch_block${NAIVE_DRAFT_TP_BLOCK}
+                    COMMAND naive_n05_verify_graph_test 2 draft_batch merged ${NAIVE_DRAFT_TP_BLOCK})
+                set_tests_properties(naive_n05_draft_tp_batch_block${NAIVE_DRAFT_TP_BLOCK} PROPERTIES
+                    LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240)
+            endforeach()
+            add_test(NAME naive_n05_draft_tp8_large COMMAND naive_n05_verify_graph_test 8 draft_tp_large)
+            add_test(NAME naive_n05_draft_tp8_wide COMMAND naive_n05_verify_graph_test 8 draft_tp_wide)
+            set_tests_properties(naive_n05_draft_tp8_wide PROPERTIES
+                LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+            set_tests_properties(naive_n05_draft_tp8_large PROPERTIES
+                LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240)
+            add_test(NAME naive_n05_draft_tp8_batch COMMAND naive_n05_verify_graph_test 8 draft_batch merged 5)
+            set_tests_properties(naive_n05_draft_tp8_batch PROPERTIES
+                LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240)
+            foreach(NAIVE_DRAFT_TP_FAILURE failbegin failinstantiate)
+                add_test(NAME naive_n05_draft_tp_batch_${NAIVE_DRAFT_TP_FAILURE}
+                    COMMAND naive_n05_verify_graph_test 2 draft_batch merged 5 ${NAIVE_DRAFT_TP_FAILURE})
+                set_tests_properties(naive_n05_draft_tp_batch_${NAIVE_DRAFT_TP_FAILURE} PROPERTIES
+                    LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240)
             endforeach()
             add_test(NAME naive_n05_verify_selection_graph COMMAND naive_n05_verify_graph_test 8 selection)
             set_tests_properties(naive_n05_verify_selection_graph

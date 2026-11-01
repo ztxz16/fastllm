@@ -319,18 +319,19 @@ static void TestVerifyIndexerView(int rows, int past, bool fp8) {
 }
 // Independent causal blocks, mixed lengths and descriptor chunking must agree
 // with the original one-query Indexer, including output-view canaries.
-static void TestBatchVerifyIndexer(int requests, bool fp8) {
+static void TestBatchVerifyIndexer(int requests, bool fp8, int width = 0, bool uniform = false) {
     int total = 0;
     std::vector<int> offsets, widths, past;
     for (int i = 0; i < requests; ++i) {
         offsets.push_back(total);
-        widths.push_back(1 + i % 8);
+        widths.push_back(width ? width : 1 + i % 8);
         past.push_back(i == 0 ? 32765 : i % 3 == 0 ? 127 : i % 3 == 1 ? 2045 : 4097);
         total += widths.back();
     }
     Data q(BFLOAT16), w(BFLOAT16), live;
     Upload(q, {1, total, 2048}, 871);
     Upload(w, {1, total, 16}, 872);
+    if (uniform) FastllmCudaMemset0(w.cudaData, w.GetBytes());
     std::vector<Data> keys(requests, Data(BFLOAT16)), storage(requests, Data(INT32)), outputs(requests);
     std::vector<FastllmNaiveVerifyIndexerItem> items;
     for (int i = 0; i < requests; ++i) {
@@ -669,6 +670,9 @@ int main() {
             return 77;
         FastllmCudaSetDevice(0);
         for (int requests : {2, 70}) for (bool fp8 : {false, true}) TestBatchVerifyIndexer(requests, fp8);
+        for (int requests : {1, 3, 128}) for (int width : {3, 4, 6, 8})
+            TestBatchVerifyIndexer(requests, true, width);
+        TestBatchVerifyIndexer(128, true, 6, true);
         for (int rows : {1, 2, 3, 4, 8, 33}) TestIndexerKeyNorm(rows);
         if (!FastllmCudaNaiveDecodeGraphSupported())
             return 77;

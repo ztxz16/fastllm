@@ -91,6 +91,33 @@ struct NaiveN05GraphTestAccess {
         }
     }
 #endif
+    static void CheckRejectedVerificationReuse(NaiveN05FlashModel &model,
+            const Data &ids, const NaiveN05FlashModel::TargetBatch &batch) {
+        auto saved = model.tpDecodeState;
+        model.tpDecodeState = std::make_shared<NaiveN05FlashModel::TPDecodeState>();
+        auto &embedding = *model.weight["model.embed_tokens.weight"].multiDeviceDatas.at(model.tpDevices.front());
+        const auto type = embedding.dataType;
+        struct Restore {
+            NaiveN05FlashModel &model; std::shared_ptr<NaiveN05FlashModel::TPDecodeState> saved;
+            Data &embedding; DataType type;
+            ~Restore() { embedding.dataType = type; model.tpDecodeState = std::move(saved); }
+        } restore{model, saved, embedding, type};
+        std::vector<std::pair<Data, Data>> unused;
+        std::vector<int *> lengths;
+        NaiveN05FlashModel::LogitsSelection selection;
+        selection.cudaLogits = true;
+        // Reject after cache metadata is populated, before any rank is made.
+        embedding.dataType = FLOAT32;
+        if (model.PrepareTensorParallelDecode(ids, unused, true, selection, lengths, &batch, false) ||
+            !model.tpDecodeState->dynamicCache || !model.tpDecodeState->disabled ||
+            !model.tpDecodeState->ranks.empty())
+            throw std::runtime_error("verification rejection fixture did not reach partial state");
+        embedding.dataType = type;
+        for (int repeat = 0; repeat < 3; ++repeat)
+            if (model.PrepareTensorParallelDecode(ids, unused, true, selection, lengths, &batch, false) ||
+                !lengths.empty())
+                throw std::runtime_error("rejected verification graph did not retain eager fallback");
+    }
     static void CheckSharedVerificationWorkspace(const NaiveN05FlashModel &model, int ranks) {
         // Acceptance tails and request churn must not consume one Lt lease
         // per graph: the bounded pool is shared with concurrent owners.
@@ -98,6 +125,9 @@ struct NaiveN05GraphTestAccess {
             void *lease = nullptr;
             for (const auto &state : model.tpBatchVerifyGraphs) {
                 if (rank >= (int)state->ranks.size()) continue;
+                if (state->dynamicCache && model.tpBatchVerifyStorage &&
+                    state->ranks[rank]->storage != model.tpBatchVerifyStorage->ranks[rank]->storage)
+                    throw std::runtime_error("verification shapes duplicated their activation workspace");
                 void *current = state->ranks[rank]->storage->linearGraphWorkspace.get();
                 if (current && lease && current != lease)
                     throw std::runtime_error("verification shapes duplicated their Lt lease");
@@ -161,7 +191,8 @@ static void CheckLogitComparison() {
         throw std::runtime_error("non-finite logit accepted");
 }
 // Shared deterministic draft weights; existing target embeddings stay untouched.
-static void AddDraftTestWeights(WeightMap &weight, int layers, int kvHeads, int vocab, bool merged) {
+static void AddDraftTestWeights(WeightMap &weight, int layers, int kvHeads, int vocab, bool merged,
+                                int hidden = 256, int head = 32, int intermediate = 512) {
     unsigned seed = 17;
     auto add = [&](const std::string &name, std::vector<int> dims, bool norm = false) {
         weight.AddEmptyWeight(name, dims, norm ? FLOAT32 : BFLOAT16);
@@ -177,25 +208,25 @@ static void AddDraftTestWeights(WeightMap &weight, int layers, int kvHeads, int 
         }
     };
     if (!weight.weight.count("model.embed_tokens.weight"))
-        add("model.embed_tokens.weight", {256, 256});
-    add("dspark.mask_embedding", {256});
-    add("dspark.norm.weight", {256}, true);
-    add("dspark.markov_head.markov_w1.weight", {vocab, 256});
-    add("dspark.markov_head.markov_w2.weight", {vocab, 256});
-    add("dspark.fc.weight", {256, 512});
-    add("dspark.hidden_norm.weight", {256}, true);
+        add("model.embed_tokens.weight", {256, hidden});
+    add("dspark.mask_embedding", {hidden});
+    add("dspark.norm.weight", {hidden}, true);
+    add("dspark.markov_head.markov_w1.weight", {vocab, hidden});
+    add("dspark.markov_head.markov_w2.weight", {vocab, hidden});
+    add("dspark.fc.weight", {hidden, 2 * hidden});
+    add("dspark.hidden_norm.weight", {hidden}, true);
     for (int i = 0; i < layers; ++i) {
         std::string p = "dspark.layers." + std::to_string(i) + ".";
-        add(p + "input_layernorm.weight", {256}, true);
-        add(p + "post_attention_layernorm.weight", {256}, true);
+        add(p + "input_layernorm.weight", {hidden}, true);
+        add(p + "post_attention_layernorm.weight", {hidden}, true);
         for (const char *n : {"q", "k", "v"})
-            add(p + "self_attn." + n + "_proj.weight", {n[0] == 'q' ? 256 : kvHeads * 32, 256});
-        add(p + "self_attn.o_proj.weight", {256, 256});
-        add(p + "self_attn.q_norm.weight", {32}, true);
-        add(p + "self_attn.k_norm.weight", {32}, true);
-        add(p + "mlp.gate_proj.weight", {512, 256});
-        add(p + "mlp.up_proj.weight", {512, 256});
-        add(p + "mlp.down_proj.weight", {256, 512});
+            add(p + "self_attn." + n + "_proj.weight", {n[0] == 'q' ? hidden : kvHeads * head, hidden});
+        add(p + "self_attn.o_proj.weight", {hidden, hidden});
+        add(p + "self_attn.q_norm.weight", {head}, true);
+        add(p + "self_attn.k_norm.weight", {head}, true);
+        add(p + "mlp.gate_proj.weight", {intermediate, hidden});
+        add(p + "mlp.up_proj.weight", {intermediate, hidden});
+        add(p + "mlp.down_proj.weight", {hidden, intermediate});
     }
     if (merged) for (int i = 0; i < layers; ++i) {
         const std::string p = "dspark.layers." + std::to_string(i) + ".";
@@ -203,7 +234,7 @@ static void AddDraftTestWeights(WeightMap &weight, int layers, int kvHeads, int 
             int rows = 0;
             for (auto &name : names) rows += weight[p + name].dims[0];
             Data &w = weight[p + out];
-            w.dataType = BFLOAT16; w.isModelWeight = true; w.Resize({rows, 256}); w.Allocate();
+            w.dataType = BFLOAT16; w.isModelWeight = true; w.Resize({rows, hidden}); w.Allocate();
             size_t offset = 0;
             for (auto &name : names) {
                 Data &part = weight[p + name];
@@ -1950,6 +1981,7 @@ class Fixture : public NaiveN05FlashModel {
             }
             TargetBatch requests{caches, configs, lengths, block_cnt};
             TargetCapture capture; capture.verifying = true;
+            capture.borrowOutputs = (checks % 3) != 0;
             LogitsSelection selection; selection.cudaLogits = true; capture.selection = &selection;
             Cache unused;
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
@@ -1958,17 +1990,25 @@ class Fixture : public NaiveN05FlashModel {
             Data logits = RunDraftTarget(Data(FLOAT32, {1, (int)ids.size()}, ids),
                 Data(FLOAT32, {1, (int)positions.size()}, positions), unused, cfg, capture, &requests);
             #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
-            if (!boundary && checks == 4 && !failVerifyBegin && !failVerifyInstantiate &&
+            if (checks == 4 && !failVerifyBegin && !failVerifyInstantiate &&
                 verifyGraphLaunches - launches != ranks)
                 throw std::runtime_error("multi-request verification did not replay one graph per rank");
             if (rebind && checks == 4 && !failVerifyBegin && !failVerifyInstantiate &&
                 verifyGraphCaptures != captures)
                 throw std::runtime_error("request replacement recaptured its verification graph");
 #endif
+            if (!boundary && checks == 0)
+                NaiveN05GraphTestAccess::CheckRejectedVerificationReuse(*this,
+                    Data(FLOAT32, {1, (int)ids.size()}, ids), requests);
             NaiveN05GraphTestAccess::CheckSharedVerificationWorkspace(*this, ranks);
             if (logits.dataDevice != DataDevice::CUDA || logits.Count(0) != ids.size() * 256)
                 throw std::runtime_error("batch verification did not return all device rows");
-            logits.ToDevice(DataDevice::CPU);
+            if (logits.isFake != capture.borrowOutputs)
+                throw std::runtime_error("batch verification output ownership mismatch");
+            // Borrowed CUDA views cannot migrate their backing allocation.
+            // Materialize an owned host copy for the numerical oracle.
+            Data hostLogits(logits);
+            hostLogits.ToDevice(DataDevice::CPU);
             std::vector<Cache *> commitCaches;
             std::vector<int> commitPast, commitCounts;
             for (int b = 0; b < batch; ++b) {
@@ -1978,7 +2018,7 @@ class Fixture : public NaiveN05FlashModel {
             CommitTargetCaches(commitCaches, commitPast, commitCounts, capture.ringVerify);
             int offset = 0;
             for (int b = 0; b < batch; ++b) {
-                RequireCloseLogits((float *)logits.cpuData + offset * 256, expected[b], "batch verify logits b=" + std::to_string(b) + " past=" + std::to_string(past[b]) + " check=" + std::to_string(checks));
+                RequireCloseLogits((float *)hostLogits.cpuData + offset * 256, expected[b], "batch verify logits b=" + std::to_string(b) + " past=" + std::to_string(past[b]) + " check=" + std::to_string(checks));
                 offset += lengths[b];
                 // Different rollback lengths, followed by another verify round,
                 // exercise sequence isolation and the second request's SWA ring.
@@ -2309,6 +2349,54 @@ class Fixture : public NaiveN05FlashModel {
 };
 // A 4096-wide BF16 verification block crosses the TP8 48-KiB policy
 // boundary at six rows. Compare full-block reduction against ordinary decode.
+static void VerifyDraftReduction(int ranks) {
+    std::vector<int> devices(ranks);
+    for(int i=0;i<ranks;++i) devices[i]=i;
+    void *group=FastllmCudaNaiveDraftTPCreate(devices);
+    if(!group) throw std::runtime_error("draft reduction group");
+    int checks=0;
+    {
+        PersistentWorkerGroup workers;
+        for(int rows : {5,40,640}) {
+            constexpr int width=4096;
+            const size_t count=(size_t)rows*width;
+            std::vector<double> expected(count), absolute(count);
+            std::vector<Data> inputs(ranks);
+            for(int rank=0;rank<ranks;++rank) {
+                auto &x=inputs[rank];x.dataType=FLOAT32;x.UpdateUnitSize();x.Resize({rows,width});x.Allocate();
+                unsigned seed=43+rank;
+                for(size_t i=0;i<count;++i) {
+                    seed=seed*1664525u+1013904223u;
+                    float value=std::ldexp((int(seed>>16)-32768)/32768.f,int((i+rank*7)%25)-12);
+                    value=BFloat16BitsToFloat32(Float32ToBFloat16RNEBits(value));
+                    ((float*)x.cpuData)[i]=value;expected[i]+=value;absolute[i]+=std::abs(double(value));
+                }
+                FastllmCudaSetDevice(rank);x.ToDevice(DataDevice::CUDA,std::vector<int>{rank});
+            }
+            std::vector<std::exception_ptr> errors(ranks);
+            workers.Run(devices,[&](int rank) {
+                FastllmCudaSetDevice(rank);
+                FastllmCudaNaiveDraftTPReduce(group,rank,inputs[rank]);ForceDeviceSync();
+            },errors);
+            for(auto error:errors) if(error) std::rethrow_exception(error);
+            for(int rank=0;rank<ranks;++rank) {
+                FastllmCudaSetDevice(rank);inputs[rank].ToDevice(DataDevice::CPU);
+                for(size_t i=0;i<count;++i) {
+                    double actual=((float*)inputs[rank].cpuData)[i];
+                    // FP32 summation forward-error bound, independent of the
+                    // NCCL tree/channel order; the CPU sum is exact for these BF16 inputs.
+                    double bound=ranks*std::numeric_limits<float>::epsilon()*absolute[i];
+                    if(!std::isfinite(actual) || std::abs(actual-expected[i])>bound)
+                        throw std::runtime_error("draft FP32 reduction violates CPU error bound");
+                }
+                ++checks;
+            }
+        }
+    }
+    FastllmCudaNaiveDraftTPDestroy(group);FastllmCudaSetDevice(0);
+    std::cout<<"DRAFT REDUCTION CPU PASS checks="<<checks<<std::endl;
+}
+
 static void VerifyRowAllReduce(int ranks) {
     SetCudaGraph(true);
     std::vector<int> devices(ranks);
@@ -2389,18 +2477,19 @@ static void VerifyRowAllReduce(int ranks) {
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
 class DraftFixture : public NaiveN05FlashModel {
   public:
-    DraftFixture(bool merged = false, int kvHeads = 2, int owner = 0, int block = 7) {
-        embed_dim = 256;
+    DraftFixture(bool merged = false, int kvHeads = 2, int owner = 0, int block = 7, bool large = false, int layers = 2) {
+        embed_dim = large ? 4096 : 256;
         block_cnt = 2;
-        draftLayers = 2;
+        draftLayers = layers;
         draftBlock = block;
-        draftHeads = 8;
+        draftHeads = large ? 32 : 8;
         draftKvHeads = kvHeads;
-        draftHeadDim = 32;
+        draftHeadDim = large ? 128 : 32;
         draftWindow = 1024;
         deviceMap = {{"cuda:" + std::to_string(owner), 1}};
         draftTargetLayers = {0, 1};
-        AddDraftTestWeights(weight, draftLayers, draftKvHeads, 513, merged);
+        AddDraftTestWeights(weight, draftLayers, draftKvHeads, 513, merged,
+                            embed_dim, draftHeadDim, large ? 4096 : 512);
         // Match the model loader's GPU embedding placement in both paths.
         weight["model.embed_tokens.weight"].ToDevice(DataDevice::CUDA, std::vector<int>{owner});
         weight["dspark.mask_embedding"].ToDevice(DataDevice::CUDA, std::vector<int>{owner});
@@ -2496,6 +2585,71 @@ class DraftFixture : public NaiveN05FlashModel {
         std::cout << "DRAFT " << (mlpOnly ? "MLP " : "") << "TP" << ranks << " PASS checks=" << checks << " relative=" << largestLogitRelative
                   << " maximum=" << largestLogitAbsolute << " captures=" << verifyGraphCaptures << " launches=" << verifyGraphLaunches << std::endl;
         unsetenv("FASTLLM_DSPARK_TP");
+    }
+    void RunWideBatchChecks() {
+        constexpr int count = 128;
+        auto read = [](const Data &x) {
+            std::vector<uint16_t> bits(x.Count(0));
+            if (cudaMemcpy(bits.data(), x.cudaData, bits.size() * 2, cudaMemcpyDeviceToHost) != cudaSuccess)
+                throw std::runtime_error("wide draft read");
+            return bits;
+        };
+        auto equal = [&](const std::vector<uint16_t> &a, const std::vector<uint16_t> &b, const char *what) {
+            if (a==b) return;
+            std::vector<float> af, bf; size_t changed=0;
+            for(size_t i=0;i<a.size();++i) {af.push_back(BFloat16BitsToFloat32(a[i]));bf.push_back(BFloat16BitsToFloat32(b[i]));changed+=a[i]!=b[i];}
+            auto e=CompareLogits(af.data(),bf.data(),af.size());
+            std::cerr<<what<<" changed="<<changed<<" relative="<<e.relative<<" max_abs="<<e.maximum<<" reference_max="<<e.scale<<std::endl;
+            // FP32 NCCL can reorder additions (notably NVLS); small BF16
+            // boundary changes may propagate through the five draft layers.
+            // Keep a much tighter bound than the cross-GEMM model oracle.
+            if (!e.acceptable || e.relative > 1.0/1024 || e.maximum > .01*e.scale)
+                throw std::runtime_error(what);
+        };
+        std::vector<std::shared_ptr<DraftContext>> owned;
+        std::vector<DraftContext *> contexts;
+        std::vector<int> anchors;
+        Data hidden(BFLOAT16, {1, draftWindow - 1, embed_dim}); hidden.Allocate();
+        for (int i=0;i<hidden.Count(0);++i)
+            ((uint16_t*)hidden.cpuData)[i]=Float32ToBFloat16RNEBits(std::sin(i*.137f));
+        hidden.ToDevice(DataDevice::CUDA,std::vector<int>{0});
+        for (int i=0;i<count;++i) {
+            owned.push_back(CreateDraftContext()); contexts.push_back(owned.back().get());
+            AppendDraftContext(hidden, i * 1024, *contexts.back());
+            anchors.push_back((i*37+11)%256);
+        }
+        int checks=0;
+        for (int turn=0;turn<3;++turn) {
+            Data output;
+            if (!RunDraftBatch(anchors,contexts,output)) throw std::runtime_error("wide draft fallback");
+            auto expected=read(output);
+            for (int trial=0;trial<10;++trial) {
+                Data replay;
+                if (!RunDraftBatch(anchors,contexts,replay)) throw std::runtime_error("wide replay fallback");
+                equal(read(replay),expected,"wide draft replay exceeds FP32 reduction tolerance");
+                ++checks;
+            }
+            SetCudaGraph(false); Data eager;
+            if (!RunDraftBatch(anchors,contexts,eager)) throw std::runtime_error("wide eager fallback");
+            equal(read(eager),expected,"wide draft graph/eager exceeds FP32 reduction tolerance");
+            SetCudaGraph(true);
+            std::vector<int> reordered;
+            std::vector<DraftContext*> selected;
+            for (int i=0;i<count;++i) {int at=(i*37+11)%count;reordered.push_back(anchors[at]);selected.push_back(contexts[at]);}
+            Data permuted;
+            if (!RunDraftBatch(reordered,selected,permuted)) throw std::runtime_error("wide reordered draft fallback");
+            auto values=read(permuted);
+            const size_t width=draftBlock*embed_dim;
+            for(int i=0;i<count;++i) {
+                int at=(i*37+11)%count;
+                equal(std::vector<uint16_t>(values.begin()+i*width,values.begin()+(i+1)*width),
+                    std::vector<uint16_t>(expected.begin()+at*width,expected.begin()+(at+1)*width),
+                    "wide draft request permutation differs");
+                ++checks;
+            }
+            for (auto &anchor : anchors) anchor=(anchor+17)%256;
+        }
+        std::cout << "DRAFT WIDE PASS checks=" << checks << std::endl;
     }
     void RunBatchChecks() {
         auto hidden = [&](int rows, int seed) {
@@ -2760,6 +2914,21 @@ int main(int argc, char **argv) {
             return 0;
         }
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+        if (argc > 2 && std::string(argv[2]) == "draft_tp_wide") {
+            SetCudaEmbedding(true); SetCudaGraph(true);
+            setenv("FASTLLM_DSPARK_TP", std::to_string(ranks).c_str(), 1);
+            VerifyDraftReduction(ranks);
+            DraftFixture fixture(true, 4, 0, 5, true, 5);
+            fixture.RunWideBatchChecks();
+            unsetenv("FASTLLM_DSPARK_TP"); return 0;
+        }
+        if (argc > 2 && std::string(argv[2]) == "draft_tp_large") {
+            SetCudaEmbedding(true); SetCudaGraph(true);
+            setenv("FASTLLM_DSPARK_TP", std::to_string(ranks).c_str(), 1);
+            DraftFixture fixture(true, 4, 0, 5, true);
+            fixture.RunBatchChecks();
+            unsetenv("FASTLLM_DSPARK_TP"); return 0;
+        }
         if (argc > 2 && std::string(argv[2]) == "draft_batch") {
             SetCudaEmbedding(true); SetCudaGraph(true);
             failGraphDevice = 0;
@@ -2767,8 +2936,11 @@ int main(int argc, char **argv) {
                 failVerifyBegin = std::string(argv[5]) == "failbegin";
                 failVerifyInstantiate = std::string(argv[5]) == "failinstantiate";
             }
-            DraftFixture fixture(argc > 3 && std::string(argv[3]) == "merged", 2, 0, argc > 4 ? std::stoi(argv[4]) : 7);
-            fixture.RunBatchChecks(); return 0;
+            if (ranks > 1) setenv("FASTLLM_DSPARK_TP", std::to_string(ranks).c_str(), 1);
+            DraftFixture fixture(argc > 3 && std::string(argv[3]) == "merged", ranks > 1 ? std::min(4, ranks) : 2,
+                                 0, argc > 4 ? std::stoi(argv[4]) : 7);
+            fixture.RunBatchChecks();
+            unsetenv("FASTLLM_DSPARK_TP"); return 0;
         }
         if (argc > 2 && std::string(argv[2]) == "kvmem_pool") {
             SetCudaEmbedding(true); SetCudaGraph(true);

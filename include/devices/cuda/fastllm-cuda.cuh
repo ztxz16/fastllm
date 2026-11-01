@@ -1735,6 +1735,10 @@ void *FastllmCudaMtpCreateDraftSamplerBatch(int rows, int vocab,
 // Per-row persistent workspace; offset separates successive draws in one graph.
 bool FastllmCudaMtpDraftSamplerRunBatch(void *sampler, float *logits, float *proposalProbs,
     float *deviceTokens, uint64_t offset);
+// Change the active rows/parameters within the creation-time capacity. No allocation.
+// Call before capture/replay; graph owners must preserve their captured filtering branch.
+bool FastllmCudaMtpDraftSamplerSetParameters(void *sampler, int rows,
+    const float *temperatures, const int *topKs, const float *topPs);
 void FastllmCudaMtpDestroyDraftSampler(void *sampler);
 bool FastllmCudaMtpDraftSamplerSetSeed(void *sampler);
 bool FastllmCudaMtpDraftSamplerRun(void *sampler, float *logits, float *proposalProbs,

@@ -104,7 +104,8 @@ static double Relative(const Data &a, const Data &b) {
 }
 // Exercise row views, changing row counts, multiple pointer-table groups,
 // reuse with different weights, and graph replay against separate GEMMs.
-int ProjectTests(int layers, int inner, int columns) {
+int ProjectTests(int layers, int inner, int columns,
+                 const std::vector<int> &rowCounts = {1, 2, 3, 4, 5, 6, 7, 8, 2, 1}) {
     std::vector<Data> owners(layers), views(layers);
     std::vector<const Data *> weights;
     for (int i = 0; i < layers; ++i) {
@@ -116,7 +117,7 @@ int ProjectTests(int layers, int inner, int columns) {
     }
     Data output, pointers;
     int checks = 0;
-    for (int rows : {1, 2, 3, 4, 5, 6, 7, 8, 2, 1}) {
+    for (int rows : rowCounts) {
         Data input = BF({1, rows, inner}, rows * 101);
         std::reverse(weights.begin(), weights.end());
         Check(FastllmCudaNaiveDraftKVProject(input, weights, output, pointers), "batched projection rejected");
@@ -202,7 +203,7 @@ int main() {
         if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices)
             return 77;
         ApplyDeviceMap({{"cuda:0", 1}}, 1, 1);
-        for (int n : {2, 8, 80}) for (int window : {17, 1024, 1152}) MixedBatch(n, window);
+        for (int n : {2, 8, 80, 81, 640}) for (int window : {17, 1024, 1152}) MixedBatch(n, window);
         int checks = 0;
         for (int dim : {64, 128, 256})
             for (int rows : {1, 2, 3, 4, 5, 6, 7, 8})
@@ -304,6 +305,8 @@ int main() {
                     checks += 6;
                 }
             checks += ProjectTests(3, 256, 128);
+            // Ragged committed batches at the real TP8 K/V projection width.
+            checks += ProjectTests(5, 4096, 256, {40, 127, 384, 511, 768, 1280, 7, 1});
             checks += ProjectTests(17, 64, 32);
             checks += ProjectTests(5, 4096, 512);
             checks += ProjectTests(5, 4096, 256);

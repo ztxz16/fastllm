@@ -200,10 +200,47 @@ void NaiveN05FlashModel::ReserveCache(Data &cache, int capacity, int width, bool
 void NaiveN05FlashModel::UploadPagedCacheTables(const std::vector<Data *> &pendingPageTables) {
 #ifdef USE_CUDA
     if (pendingPageTables.empty()) return;
+    // A single table is cheaper to copy directly. For a batch, upload packed
+    // indices once, then scatter using the generic bounded batch-copy kernel.
+    // Scratch is per worker and device; the stream completes before reuse.
+    if (pendingPageTables.size() == 1) {
+        Data &cache = *pendingPageTables.front();
+        FastllmCudaCopyFromHostToDevice(cache.cudaData, cache.pageIndex.data(),
+            cache.pageIndex.size() * sizeof(int));
+        return;
+    }
+    struct Staging {
+        Data device{INT32};
+        std::vector<int> host;
+        std::vector<void *> dst;
+        std::vector<const void *> src;
+        std::vector<size_t> sizes;
+    };
+    static thread_local std::map<int, Staging> stagingByDevice;
+    const int device = pendingPageTables.front()->dataDeviceIds[0];
+    auto &staging = stagingByDevice[device];
+    size_t count = 0;
+    for (Data *cache : pendingPageTables) count += cache->pageIndex.size();
+    staging.host.resize(count);
+    staging.device.Resize({(int)count});
+    staging.device.ToDevice(DataDevice::CUDA, {device}, false);
+    staging.device.Allocate(false);
+    staging.dst.clear(); staging.src.clear(); staging.sizes.clear();
+    size_t offset = 0;
+    for (Data *cache : pendingPageTables) {
+        const size_t size = cache->pageIndex.size();
+        std::copy(cache->pageIndex.begin(), cache->pageIndex.end(), staging.host.begin() + offset);
+        staging.dst.push_back(cache->cudaData);
+        staging.src.push_back((int *)staging.device.cudaData + offset);
+        staging.sizes.push_back(size * sizeof(int));
+        offset += size;
+    }
     try {
-        for (Data *cache : pendingPageTables)
-            FastllmCudaCopyFromHostToDeviceAsync(cache->cudaData, cache->pageIndex.data(),
-                cache->pageIndex.size() * sizeof(int), cudaStreamPerThread);
+        FastllmCudaCopyFromHostToDeviceAsync(staging.device.cudaData, staging.host.data(),
+            count * sizeof(int), cudaStreamPerThread);
+        AssertInFastLLM(FastllmCudaBatchCopyFromDeviceToDeviceAsyncCurrentThread(
+            staging.dst.data(), staging.src.data(), staging.sizes.data(), staging.dst.size()),
+            "Naive page table upload failed.");
     } catch (...) {
         FastllmCudaSyncCurrentThreadStream();
         throw;
