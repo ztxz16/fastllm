@@ -1,5 +1,5 @@
 // GPU regression for a graph captured once and replayed with changing request
-// lengths, masks and KV pointers. Requires one SM80+ GPU; returns 77 otherwise.
+// lengths, masks and KV pointers. Requires one SM70+ GPU; returns 77 otherwise.
 // The eager attention path is the independent reference. Pass --stress for
 // larger activations. Both modes require bitwise equality with eager decode.
 #include "fastllm.h"
@@ -24,6 +24,8 @@ static void Cuda(cudaError_t e) {
 }
 static float amplitude = .3f;
 static bool stress = false;
+static bool fp16Attention = false;
+static double worstAttentionL2 = 0;
 static bool pooled = false;
 static bool longContext = false;
 static int indexHeads = 32;
@@ -70,6 +72,27 @@ static void Equal(const Data &a, const Data &b, const char *name) {
     Cuda(cudaMemcpy(y.data(), b.cudaData, y.size(), cudaMemcpyDeviceToHost));
     if (x != y)
         throw std::runtime_error(std::string("bits changed: ") + name);
+}
+// Tensor Core attention changes the softmax/PV rounding, while every other
+// state update remains byte-exact. Enable only in the explicit FP16 regression.
+static void AttentionEqual(const Data &a, const Data &b, const char *name) {
+    if (!fp16Attention) { Equal(a, b, name); return; }
+    Check(a.GetBytes() == b.GetBytes(), "attention shape");
+    std::vector<__nv_bfloat16> x(a.Count(0)), y(b.Count(0));
+    Cuda(cudaMemcpy(x.data(), a.cudaData, a.GetBytes(), cudaMemcpyDeviceToHost));
+    Cuda(cudaMemcpy(y.data(), b.cudaData, b.GetBytes(), cudaMemcpyDeviceToHost));
+    double error = 0, norm = 0;
+    for (size_t i = 0; i < x.size(); ++i) {
+        double u = __bfloat162float(x[i]), v = __bfloat162float(y[i]);
+        Check(std::isfinite(u) && std::isfinite(v), "attention nonfinite");
+        error += (u-v)*(u-v); norm += v*v;
+    }
+    double l2 = std::sqrt(error / std::max(norm, 1e-30));
+    worstAttentionL2 = std::max(l2, worstAttentionL2);
+    if (l2 > .003163) {
+        std::cerr << name << " relative L2=" << l2 << std::endl;
+        throw std::runtime_error("FP16 attention L2");
+    }
 }
 // Exercise caller-owned candidate storage against the independent eager
 // reference, with a producer that cannot modify the consumer's Q/KV or cache.
@@ -131,6 +154,7 @@ struct CandidateReuseProducer {
     }
 };
 #include "deepseekV41FullVerifyRegression.inc"
+#include "deepseekV41Fp16AttentionRegression.inc"
 
 static void RunAttentionLocalityRegression(int devices) {
     int checks = 0;
@@ -211,16 +235,17 @@ static void RunRotaryCrossPathRegression() {
 }
 
 int main(int argc, char **argv) {
-    int devices = 0, major = 0;
+    int devices = 0, major = 0, minor = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices < 1 ||
         cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, 0) != cudaSuccess ||
-        major < 8)
+        major < 7)
         return 77;
     bool verify = false, locality = false;
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--stress") { stress = true; amplitude = 1.f; }
         if (std::string(argv[i]) == "--pooled") pooled = true;
         if (std::string(argv[i]) == "--verify") verify = true;
+        if (std::string(argv[i]) == "--fp16-attention") fp16Attention = true;
         if (std::string(argv[i]) == "--locality") locality = true;
         if (std::string(argv[i]).rfind("--index-heads=", 0) == 0)
             indexHeads = std::stoi(std::string(argv[i]).substr(14));
@@ -228,11 +253,14 @@ int main(int argc, char **argv) {
         if (std::string(argv[i]) == "--shared-candidates") sharedCandidates = true;
     }
     if (locality && devices < 2) return 77;
+    Cuda(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, 0));
+    if (fp16Attention && (major != 7 || minor != 5)) return 77;
     try {
         ApplyDeviceMap({{"cpu", 1}}, 0, 1);
         FastllmCudaSetDevice(0);
         if (locality) { RunAttentionLocalityRegression(devices); return 0; }
         if (verify) { RunVerifyRegression(); return 0; }
+        if (fp16Attention) { RunFp16AttentionRegression(); return 0; }
         RunRotaryCrossPathRegression();
         int checked = 0;
         for (int batch : {1, 2, 4, 8, 16, 128})
@@ -421,15 +449,35 @@ int main(int argc, char **argv) {
                                                                   c.originalSeqLen, c.ropeFactor,
                                                                   c.betaFast, c.betaSlow, c.window),
                               "reference transform");
-                        if (ratio)
-                            Check(FastllmCudaV41DecodeIndexerBatch(
-                                      idx, ratio, c.topK, c.blockSize, c.candidateTopK, c.ropeDim,
-                                      c.ropeBase, c.originalSeqLen, c.ropeFactor, c.betaFast,
-                                      c.betaSlow, true),
-                                  "reference indexer");
-                        Check(FastllmCudaDeepSeekV41SparseAttentionBatch(att, sink, c.window,
-                                                                         c.softmaxScale),
-                              "reference attention");
+                        if (major < 8) {
+                            // SM75 has FP16 Tensor Cores, but the independent
+                            // batched BF16 MMA reference requires SM80.
+                            for (auto &i : idx) {
+                                Check(FastllmCudaDeepSeekV41RotaryQuant(*i.query, c.ropeDim,
+                                    c.ropeBase, i.startPos, 1, false, c.originalSeqLen,
+                                    c.ropeFactor, c.betaFast, c.betaSlow, 2, -1, 32), "reference index rope");
+                                Data scores;
+                                Check(FastllmCudaDeepSeekV41IndexerScore(*i.query, *i.weights,
+                                    *i.keys, ratio, i.startPos, scores), "reference index scores");
+                                if (i.writeCandidates)
+                                    Check(FastllmCudaDeepSeekV41CandidateBlocks(scores, c.blockSize,
+                                        c.candidateTopK, ratio, i.startPos, *i.candidates), "reference candidates");
+                                Check(FastllmCudaDeepSeekV41IndexerTopK(scores, i.useCandidates?i.candidates:nullptr,
+                                    c.topK, ratio, i.startPos, c.blockSize, *i.topk), "reference topk");
+                            }
+                            for (auto &i : att)
+                                Check(FastllmCudaDeepSeekV41SparseAttention(*i.q, *i.chunkKV,
+                                    i.ringKV, i.compressedKV, i.indices, sink, c.window,
+                                    i.startPos, c.softmaxScale, *i.output), "reference attention");
+                        } else {
+                            if (ratio)
+                                Check(FastllmCudaV41DecodeIndexerBatch(
+                                          idx, ratio, c.topK, c.blockSize, c.candidateTopK, c.ropeDim,
+                                          c.ropeBase, c.originalSeqLen, c.ropeFactor, c.betaFast,
+                                          c.betaSlow, true), "reference indexer");
+                            Check(FastllmCudaDeepSeekV41SparseAttentionBatch(att, sink, c.window,
+                                c.softmaxScale), "reference attention");
+                        }
                         Check(FastllmCudaV41DecodeTransformsBatch(finish, c.ropeDim, c.ropeBase,
                                                                   c.originalSeqLen, c.ropeFactor,
                                                                   c.betaFast, c.betaSlow, c.window),
