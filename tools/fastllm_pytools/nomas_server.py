@@ -530,7 +530,7 @@ if __name__ == "__main__":
     parser.add_argument("--output", required=True)
     devices = parser.add_mutually_exclusive_group()
     devices.add_argument("--device", type=int, default=0)
-    devices.add_argument("--devices", help="CUDA-visible devices for PixelUMM tensor parallelism, e.g. 0,1")
+    devices.add_argument("--devices", help="CUDA-visible devices for parallel DiT and PixelUMM, e.g. 0,1")
     parser.add_argument("--precision", choices=["fp32", "bf16"], default="bf16")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8007)

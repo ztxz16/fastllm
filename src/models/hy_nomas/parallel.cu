@@ -271,20 +271,26 @@ void ParallelGroup::wait(int rank) {
     check(cudaStreamWaitEvent(cudaStreamPerThread,c.done,0));
     c.retained.clear(); c.pending=false;
 }
-Tensor ParallelGroup::gatherColumns(const Tensor &x,int rank,int groups) {
+Tensor ParallelGroup::gatherColumns(const Tensor &x,int rank,int groups,bool async) {
     if(size()==1) return x;
     if(x.cols>INT_MAX/size()) throw std::invalid_argument("gathered tensor too wide");
     if(groups<1 || x.cols%groups) throw std::invalid_argument("invalid gathered projection groups");
     Tensor packed(x.rows,x.cols*size(),x.dtype),out(x.rows,x.cols*size(),x.dtype);
     auto &i=*impl_;
+    cudaStream_t stream=cudaStreamPerThread;
+    if(async) {
+        auto &c=i.beginCommunication(rank);
+        c.retained.insert(c.retained.end(),{x,packed,out});
+        stream=c.stream;
+    }
     i.boundary(rank,NcclSubmitRendezvous::Before,x,2);
-    check(ncclAllGather(x.data,packed.data,x.size(),type(x.dtype),i.comms[rank],cudaStreamPerThread));
+    check(ncclAllGather(x.data,packed.data,x.size(),type(x.dtype),i.comms[rank],stream));
     i.boundary(rank,NcclSubmitRendezvous::After,x,2);
     int blocks=std::min<size_t>((out.size()+255)/256,65535);
     if(x.isFloat32())
-        gatherLayout<<<blocks,256,0,cudaStreamPerThread>>>((const uint32_t *)packed.data,(uint32_t *)out.data,out.size(),x.rows,x.cols,size(),groups);
+        gatherLayout<<<blocks,256,0,stream>>>((const uint32_t *)packed.data,(uint32_t *)out.data,out.size(),x.rows,x.cols,size(),groups);
     else
-        gatherLayout<<<blocks,256,0,cudaStreamPerThread>>>(packed.data,out.data,out.size(),x.rows,x.cols,size(),groups);
+        gatherLayout<<<blocks,256,0,stream>>>(packed.data,out.data,out.size(),x.rows,x.cols,size(),groups);
     check(cudaGetLastError());
     return out;
 }
@@ -323,7 +329,7 @@ void ParallelGroup::run(const std::function<void(int)> &task) {
     check(cudaSetDevice(impl_->device)); task(0); check(cudaStreamSynchronize(cudaStreamPerThread));
 }
 Tensor ParallelGroup::broadcast(const Tensor &x,int) { return x; }
-Tensor ParallelGroup::gatherColumns(const Tensor &x,int,int) { return x; }
+Tensor ParallelGroup::gatherColumns(const Tensor &x,int,int,bool) { return x; }
 void ParallelGroup::sum(Tensor &,int) {}
 void ParallelGroup::sumAsync(const Tensor &,int) {}
 Tensor ParallelGroup::sumCast(Runtime &rt,Tensor partial,const Tensor *bias,DType output,int) {
@@ -351,6 +357,36 @@ void ParallelContext::rowWeights(Weights &w,const std::string &p) const {
 Tensor ParallelContext::column(Weights &w,const Tensor &x,const std::string &p,bool gather) const {
     auto out=w.linear(x,p);
     return gather && group?group->gatherColumns(out,rank,w.shardGroups(p+".weight")):out;
+}
+Tensor ParallelContext::gatherRows(Runtime &rt,const Tensor &x,int rows,int groups,bool async) const {
+    if(rows<1 || groups<1 || !x.data || x.cols<1 || x.rows%groups || rank<0 || rank>=size())
+        throw std::invalid_argument("invalid row gather shape");
+    int chunk=int((int64_t(rows)+size()-1)/size());
+    if(int64_t(chunk)*size()*std::max(groups,x.cols)>INT_MAX)
+        throw std::invalid_argument("row gather partition too large");
+    int local=std::min(chunk,rows-rank*chunk);
+    if(local<1 || x.rows/groups!=local)
+        throw std::invalid_argument("row gather partition mismatch");
+    if(size()==1) return x;
+    Tensor packed=x;
+    if(local<chunk) {
+        std::vector<Tensor> pieces;
+        for(int g=0;g<groups;++g) {
+            auto part=x.rowSlice(g*local,local);
+            pieces.push_back(part);
+            pieces.push_back(rt.repeatRows(part.rowSlice(local-1,1),chunk-local));
+        }
+        packed=rt.concat(pieces);
+    }
+    packed.rows=groups;packed.cols=chunk*x.cols;
+    auto full=group->gatherColumns(packed,rank,1,async);
+    int padded=chunk*size();full.rows=groups*padded;full.cols=x.cols;
+    if(padded==rows) return full;
+    if(groups==1) return full.rowSlice(0,rows);
+    if(async) group->wait(rank);
+    std::vector<Tensor> pieces;
+    for(int g=0;g<groups;++g) pieces.push_back(full.rowSlice(g*padded,rows));
+    return rt.concat(pieces);
 }
 Tensor ParallelContext::row(Runtime &rt,Weights &w,const Tensor &x,const std::string &p) const {
     if(size()==1) return w.linear(x,p);

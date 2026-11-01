@@ -1,5 +1,5 @@
 #include "models/hy_nomas/runtime.h"
-#include "models/hy_nomas/parallel_decoder.h"
+#include "models/hy_nomas/parallel_model.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -37,7 +37,7 @@ Pipeline::Pipeline(const std::string &model,const std::string &text,int device):
 Pipeline::Pipeline(const std::string &model,const std::string &text,const ParallelOptions &options)
     :Pipeline(model,text,options.devices.empty()?throw std::invalid_argument("empty parallel devices"):options.devices[0]) {
     if(options.devices.size()>1)
-        parallel_=std::make_unique<ParallelPixelDecoder>(model,options,rt_.dtype());
+        parallel_=std::make_unique<ParallelModel>(model,options,rt_.dtype());
 }
 Pipeline::~Pipeline()=default;
 void Pipeline::unloadModels() {
@@ -75,7 +75,9 @@ std::vector<uint8_t> Pipeline::generate(const std::string &prompt,int width,int 
         auto sigma=[steps](int i) { float s=1.f-float(i)/steps; return 5.f*s/(1.f+4.f*s); };
         for(int step=0;step<steps;++step) {
             update(2,step,steps);
-            auto velocity=rt_.download(dit_.forward(rt_.upload(latent.data(),n,32),features,sigma(step)*1000.f,t,h,w));
+            auto input=rt_.upload(latent.data(),n,32);
+            auto velocity=rt_.download(parallel_?parallel_->forward(input,features,sigma(step)*1000.f,t,h,w,0,nullptr,false,false)
+                                            :dit_.forward(input,features,sigma(step)*1000.f,t,h,w));
             float dt=sigma(step+1)-sigma(step);
             for(size_t i=0;i<latent.size();++i) latent[i]+=velocity[i]*dt;
             trace("latent_"+std::to_string(step+1),latent);
@@ -212,15 +214,24 @@ std::vector<uint8_t> Pipeline::stepWorld(WorldState &world,int action,Progress p
     const Tensor &segmentFeatures=cameraContinuation?cameraContinuationFeatures_:next.features;
     auto poses=hasCamera?cameraTrajectory(20,action):std::vector<float>();
     std::vector<Tensor> camera;
-    if(hasCamera) camera=dit_.cameraProjections(dit_.cameraEmbedding(rt_.upload(poses.data(),t,64)),h*w);
+    if(hasCamera) {
+        auto input=rt_.upload(poses.data(),t,64);
+        if(parallel_) parallel_->prepareCamera(input,h*w);
+        else camera=dit_.cameraProjections(dit_.cameraEmbedding(input),h*w);
+    }
     trace("camera",poses); trace("latent_0",latent);
     trace("features",segmentFeatures);
     auto sigma=[&](int i) { float s=1.f-float(i)/world.steps; return 5.f*s/(1.f+4.f*s); };
     DiTCache workspace;
+    std::vector<DiTCache> parallelWorkspace;
     for(int step=0;step<world.steps;++step) {
         update(2,step,world.steps+1);
-        auto velocity=rt_.download(dit_.forward(rt_.upload(latent.data(),n,32),segmentFeatures,sigma(step)*1000.f,t,h,w,
-                                              world.frameOffset,&next.cache,false,hasCamera?&camera:nullptr,&workspace));
+        auto input=rt_.upload(latent.data(),n,32);
+        auto velocity=rt_.download(parallel_
+            ?parallel_->forward(input,segmentFeatures,sigma(step)*1000.f,t,h,w,world.frameOffset,
+                                &next.parallelCaches,false,hasCamera,&parallelWorkspace)
+            :dit_.forward(input,segmentFeatures,sigma(step)*1000.f,t,h,w,world.frameOffset,
+                          &next.cache,false,hasCamera?&camera:nullptr,&workspace));
         float dt=sigma(step+1)-sigma(step);
         for(size_t i=0;i<latent.size();++i) latent[i]+=velocity[i]*dt;
         trace("latent_"+std::to_string(step+1),latent);
@@ -235,17 +246,26 @@ std::vector<uint8_t> Pipeline::stepWorld(WorldState &world,int action,Progress p
     }
     trace("cache_noise",cacheNoise);
     trace("cache_input",cacheInput);
-    dit_.forward(rt_.upload(cacheInput.data(),n,32),segmentFeatures,cacheSigma*1000.f,t,h,w,
-                 world.frameOffset,&next.cache,true,hasCamera?&camera:nullptr,&workspace);
+    auto cacheTensor=rt_.upload(cacheInput.data(),n,32);
+    if(parallel_) parallel_->forward(cacheTensor,segmentFeatures,cacheSigma*1000.f,t,h,w,world.frameOffset,
+                                    &next.parallelCaches,true,hasCamera,&parallelWorkspace);
+    else dit_.forward(cacheTensor,segmentFeatures,cacheSigma*1000.f,t,h,w,world.frameOffset,
+                      &next.cache,true,hasCamera?&camera:nullptr,&workspace);
     next.segmentTokens.push_back(n+segmentFeatures.rows);
     int remove=0;
     while(int(next.segmentTokens.size())>next.maxHistorySegments) {
         remove+=next.segmentTokens.front(); next.segmentTokens.erase(next.segmentTokens.begin());
     }
-    if(remove) for(int i=0;i<54;++i) {
-        int kept=next.cache.key[i].rows-remove;
-        next.cache.key[i]=next.cache.key[i].rowSlice(remove,kept);
-        next.cache.value[i]=next.cache.value[i].rowSlice(remove,kept);
+    if(remove) {
+        auto trim=[&](DiTCache &cache) {
+            for(size_t i=0;i<cache.key.size();++i) {
+                int kept=cache.key[i].rows-remove;
+                cache.key[i]=cache.key[i].rowSlice(remove,kept);
+                cache.value[i]=cache.value[i].rowSlice(remove,kept);
+            }
+        };
+        if(parallel_) for(auto &cache:next.parallelCaches) trim(cache);
+        else trim(next.cache);
     }
     update(2,world.steps+1,world.steps+1); update(3,0,1);
     std::vector<float> context=world.decoderLatents;

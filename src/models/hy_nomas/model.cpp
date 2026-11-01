@@ -99,18 +99,28 @@ Tensor DiT::forward(const Tensor &latent,const Tensor &features,float timestep,i
     auto rope=rt_.prepareRope(cos.data(),sin.data(),tokens,128);
     const auto &modulation=prepare(timestep);
     auto x=weights_.linear(latent,"img_in.proj"),txt=refineText(features,timestep);
+    // Keep image rows resident on their rank through all double blocks. Text
+    // stays replicated; only current image K/V is gathered inside each block.
+    int partitions=sequencePartitions(tokens),first=0,rows=tokens;
+    if(partitions>1) {
+        int chunk=(tokens+partitions-1)/partitions;
+        first=parallel_->rank*chunk;rows=std::min(chunk,tokens-first);
+        x=x.rowSlice(first,rows);
+        rope.cos=rope.cos.rowSlice(first,rows);rope.sin=rope.sin.rowSlice(first,rows);
+    }
     DiTCache next;
     for(int layer=0;layer<54;++layer) {
         auto out=block(layer,x,txt,modulation.time,rope,hasCache?&cache->key[layer]:nullptr,hasCache?&cache->value[layer]:nullptr,
                        nullptr,&modulation.image[layer],&modulation.text[layer],
-                       workspace?&workspace->key[layer]:nullptr,workspace?&workspace->value[layer]:nullptr);
+                       workspace?&workspace->key[layer]:nullptr,workspace?&workspace->value[layer]:nullptr,partitions>1?tokens:0);
         x=out.image; txt=out.text;
-        if(camera) x=rt_.add(x,(*camera)[layer]);
+        if(camera) x=rt_.add(x,(*camera)[layer].rowSlice(first,rows));
         if(commit && !workspace) {
             next.key.push_back(hasCache?rt_.concat({cache->key[layer],out.key}):out.key);
             next.value.push_back(hasCache?rt_.concat({cache->value[layer],out.value}):out.value);
         }
     }
+    if(partitions>1) x=parallel_->gatherRows(rt_,x,tokens);
     auto out=weights_.linear(rt_.modulate(rt_.norm(x,false),modulation.output,0,1),"final_layer.linear");
     // Publish cache atomically after every layer and the output have succeeded.
     rt_.synchronize();

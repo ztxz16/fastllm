@@ -61,6 +61,18 @@ int main() {
             try { parseParallelDevices(value); } catch(const std::exception &) { rejected=true; }
             require(rejected,"invalid device list accepted");
         }
+        {
+            Runtime root(0,DType::FP32),other(1,DType::FP32);
+            root.activate();TensorPool pool(0,1u<<20);
+            TensorPool::Scope scope(pool);
+            std::vector<float> values(257*16,.5f);
+            auto saved=root.upload(values.data(),257,16);
+            for(int i=0;i<40;++i) {
+                root.activate();auto temporary=root.add(saved,saved);
+                other.activate();temporary={}; // Free while another device is current.
+            }
+            root.activate();near(root.download(saved),values,0);root.synchronize();pool.trim();
+        }
         path=fixture();
         for(int ranks:{2,4}) {
             if(count<ranks) continue;
@@ -98,6 +110,62 @@ int main() {
                     near(rt.download(x),std::vector<float>(values.size(),ranks*ranks*.5f),0);
                 });
             }
+            // Token partitions may be uneven; K and V are separate groups.
+            // Gather only moves data and must preserve every value on every rank.
+            for(auto dtype:{DType::FP32,DType::BF16,DType::FP16})
+                for(int rows:{67,128}) for(int groups:{1,2,3}) for(bool async:{false,true}) {
+                    activationGroup.run([&](int rank) {
+                        Runtime rt(rank,dtype);
+                        ParallelContext p{&activationGroup,rank};
+                        constexpr int cols=17;
+                        int chunk=(rows+ranks-1)/ranks,first=rank*chunk,local=std::min(chunk,rows-first);
+                        std::vector<float> expected(groups*rows*cols),values;
+                        for(size_t i=0;i<expected.size();++i) expected[i]=float(int(i%113)-56)/16;
+                        for(int g=0;g<groups;++g) {
+                            auto begin=expected.begin()+(g*rows+first)*cols;
+                            values.insert(values.end(),begin,begin+local*cols);
+                        }
+                        auto input=rt.upload(values.data(),groups*local,cols);
+                        auto actual=p.gatherRows(rt,input,rows,groups,async);
+                        input={}; // Communication owns inputs until wait().
+                        // Reuse allocations and queue independent work before consuming.
+                        for(int j=0;j<8;++j) {
+                            auto scratch=rt.upload(values.data(),groups*local,cols);
+                            scratch=rt.add(scratch,scratch);
+                        }
+                        if(async) activationGroup.wait(rank);
+                        require(actual.rows==groups*rows && actual.cols==cols,"row gather output shape");
+                        near(rt.download(actual),expected,0);
+                    });
+                }
+            bool gatherFailed=false;
+            try {
+                activationGroup.run([&](int rank) {
+                    Runtime rt(rank,DType::BF16);
+                    TensorPool pool(rank,4u<<20);TensorPool::Scope scope(pool);
+                    ParallelContext p{&activationGroup,rank};
+                    std::vector<float> values(128*2048,float(rank));
+                    auto x=rt.upload(values.data(),128,2048);
+                    auto out=p.gatherRows(rt,x,128*ranks,1,true);
+                    x={};out={};
+                    if(rank==0) throw std::runtime_error("cancel asynchronous gather");
+                });
+            } catch(const std::exception &) {gatherFailed=true;}
+            require(gatherFailed,"asynchronous gather cancellation not propagated");
+            activationGroup.run([&](int rank) {
+                Runtime rt(rank,DType::BF16);float one=1;auto x=rt.upload(&one,1,1);
+                activationGroup.sum(x,rank);
+                require(rt.download(x)[0]==ranks,"asynchronous gather cancellation recovery");
+            });
+            bool invalidRows=false;
+            try {
+                activationGroup.run([&](int rank) {
+                    Runtime rt(rank,DType::BF16);ParallelContext p{&activationGroup,rank};
+                    float one=1;auto x=rt.upload(&one,1,1);
+                    p.gatherRows(rt,x,128);
+                });
+            } catch(const std::invalid_argument &) {invalidRows=true;}
+            require(invalidRows,"invalid row partition accepted");
             bool failed=false;
             try {
                 activationGroup.run([&](int rank) {

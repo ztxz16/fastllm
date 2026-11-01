@@ -36,6 +36,12 @@ endif()
 
 if(UNIT_TEST)
     enable_testing()
+    add_executable(continuous_tensor_pool ${PROJECT_SOURCE_DIR}/test/hy_nomas/test_tensor_pool.cpp)
+    target_include_directories(continuous_tensor_pool PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+    target_link_libraries(continuous_tensor_pool PRIVATE fastllm_continuous cudart)
+    set_target_properties(continuous_tensor_pool PROPERTIES CXX_STANDARD 17)
+    add_test(NAME continuous_tensor_pool COMMAND continuous_tensor_pool)
+    set_tests_properties(continuous_tensor_pool PROPERTIES LABELS cuda TIMEOUT 120 SKIP_RETURN_CODE 77)
     add_executable(continuous_parallel ${PROJECT_SOURCE_DIR}/test/hy_nomas/test_parallel.cpp)
     target_include_directories(continuous_parallel PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
     target_link_libraries(continuous_parallel PRIVATE fastllm_continuous cudart)
@@ -48,7 +54,7 @@ if(UNIT_TEST)
 endif()
 
 if(BUILD_HY_NOMAS)
-    add_library(fastllm_nomas SHARED bindings.cpp model.cpp pipeline.cpp parallel_decoder.cpp noise.cu)
+    add_library(fastllm_nomas SHARED bindings.cpp model.cpp pipeline.cpp parallel_model.cpp noise.cu)
     target_link_libraries(fastllm_nomas PRIVATE fastllm_continuous)
     target_compile_options(fastllm_nomas PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>

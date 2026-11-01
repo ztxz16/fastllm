@@ -18,7 +18,9 @@ namespace fastllm { namespace nomas {
 // affects only allocations on its thread/device; other models keep the default.
 class TensorPool {
 public:
-    explicit TensorPool(int device);
+    // Optional bounded reuse of freed blocks on their original inference thread.
+    // Disabled by default; the host cache cannot be used during CUDA capture.
+    explicit TensorPool(int device, size_t cacheBytes=0);
     class Scope {
     public:
         explicit Scope(const TensorPool &);
@@ -200,11 +202,13 @@ struct BlockResult { Tensor image, text, key, value; };
 struct DiTCache { std::vector<Tensor> key, value; };
 struct ParallelContext;
 struct ParallelOptions;
-class ParallelPixelDecoder;
+class ParallelModel;
 
 class DiT {
 public:
     DiT(Runtime &runtime, const std::string &checkpoint);
+    DiT(Runtime &, const std::string &, const ParallelContext &);
+    ~DiT();
     BlockResult block(int layer, const Tensor &image, const Tensor &text,
                       const Tensor &time, const float *cos, const float *sin,
                       const Tensor *historyK = nullptr, const Tensor *historyV = nullptr,
@@ -214,7 +218,7 @@ public:
                       const Tensor *historyK = nullptr, const Tensor *historyV = nullptr,
                       const uint8_t *attentionMask = nullptr,
                       const Tensor *imageModulation = nullptr, const Tensor *textModulation = nullptr,
-                      Tensor *keyWorkspace = nullptr, Tensor *valueWorkspace = nullptr);
+                      Tensor *keyWorkspace = nullptr, Tensor *valueWorkspace = nullptr, int globalImageRows = 0);
     // workspace belongs to one action with fixed history/shape. Successful
     // commit transfers its buffers to cache; failures never mutate cache.
     Tensor forward(const Tensor &latent, const Tensor &textFeatures, float timestep,
@@ -227,6 +231,7 @@ public:
     Tensor cameraBlock(int layer, const Tensor &image, const Tensor &camera, int tokensPerFrame);
     void unload();
 private:
+    int sequencePartitions(int rows) const;
     struct Modulation {
         Tensor time, output;
         std::vector<Tensor> image, text;
@@ -238,6 +243,7 @@ private:
     Runtime &rt_;
     Weights weights_;
     std::unordered_map<float,Modulation> modulation_;
+    std::unique_ptr<ParallelContext> parallel_;
 };
 
 class PixelDecoder {
@@ -287,6 +293,7 @@ struct WorldState {
     Tensor features;
     std::string prompt;
     DiTCache cache;
+    std::vector<DiTCache> parallelCaches;
     std::vector<float> decoderLatents;
     std::vector<int> segmentTokens;
     std::mt19937_64 generator;
@@ -323,7 +330,7 @@ private:
     DiT dit_;
     PixelDecoder decoder_;
     Tensor cameraContinuationFeatures_;
-    std::unique_ptr<ParallelPixelDecoder> parallel_;
+    std::unique_ptr<ParallelModel> parallel_;
 };
 
 }} // namespace fastllm::nomas
@@ -355,7 +362,7 @@ int fastllm_nomas_tokenize(void *handle, const char *text, int videoTemplate,
                          int *tokens, int capacity, int *crop);
 int fastllm_nomas_encode(void *handle, const int *tokens, int count, float *features);
 void *fastllm_nomas_pipeline_create(const char *modelDirectory, const char *textDirectory, int device);
-// Tensor-parallel PixelUMM; DiT and recurrent world state stay on the first device.
+// Sequence-parallel DiT and tensor-parallel PixelUMM, one worker per device.
 void *fastllm_nomas_pipeline_create_parallel(const char *modelDirectory, const char *textDirectory,
                                             const char *devices);
 void fastllm_nomas_pipeline_destroy(void *handle);

@@ -15,6 +15,8 @@
 #include <mutex>
 #include <stdexcept>
 #include <type_traits>
+#include <atomic>
+#include <map>
 #ifndef _WIN32
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -37,9 +39,54 @@ void copy(void *dst,const void *src,size_t bytes,cudaMemcpyKind kind) {
 }
 // Never change the process-wide default pool: other fastllm models may use it.
 // Tensors retain this pool so their storage may safely outlive Runtime.
+uint64_t allocationThread() {
+    static std::atomic<uint64_t> next{1};
+    thread_local const uint64_t id=next.fetch_add(1,std::memory_order_relaxed);
+    return id; // Unlike std::thread::id, never reused after a worker exits.
+}
 struct MemoryPool {
     cudaMemPool_t handle = nullptr;
     int device;
+    size_t cacheLimit=0,cachedBytes=0;
+    std::mutex cacheMutex;
+    using FreeBlocks=std::map<size_t,std::vector<void *>>;
+    std::unordered_map<uint64_t,FreeBlocks> freeBlocks;
+    void *reuse(size_t bytes) {
+        if(!cacheLimit) return nullptr;
+        std::lock_guard<std::mutex> lock(cacheMutex);
+        auto thread=freeBlocks.find(allocationThread());
+        if(thread==freeBlocks.end()) return nullptr;
+        auto found=thread->second.find(bytes);
+        if(found==thread->second.end() || found->second.empty()) return nullptr;
+        auto &blocks=found->second;
+        void *p=blocks.back();blocks.pop_back();cachedBytes-=bytes;return p;
+    }
+    bool recycle(void *p,size_t bytes) noexcept {
+        if(!cacheLimit || bytes>cacheLimit) return false;
+        try {
+            std::lock_guard<std::mutex> lock(cacheMutex);
+            auto &sizes=freeBlocks[allocationThread()];
+            // Weight-loading scratch must not crowd out smaller recurring
+            // activations. Eviction stays on the allocating thread's stream.
+            auto largest=sizes.rbegin();
+            while(bytes>cacheLimit-cachedBytes) {
+                while(largest!=sizes.rend() && largest->second.empty()) ++largest;
+                if(largest==sizes.rend() || largest->first<=bytes) return false;
+                auto &blocks=largest->second;
+                cudaFreeAsync(blocks.back(),cudaStreamPerThread);
+                blocks.pop_back();cachedBytes-=largest->first;
+            }
+            sizes[bytes].push_back(p);cachedBytes+=bytes;return true;
+        } catch(...) {return false;}
+    }
+    // The caller synchronizes before trimming. Cached blocks belong to the
+    // allocating thread's stream; they are never recycled onto another stream.
+    void clearCache() {
+        std::lock_guard<std::mutex> lock(cacheMutex);
+        for(auto &thread:freeBlocks) for(auto &size:thread.second)
+            for(void *p:size.second) cudaFree(p);
+        freeBlocks.clear();cachedBytes=0;
+    }
     explicit MemoryPool(int device, uint64_t retained=2ULL*1024*1024*1024):device(device) {
         cudaMemPoolProps props{};
         props.allocType = cudaMemAllocationTypePinned;
@@ -52,7 +99,11 @@ struct MemoryPool {
             check(status);
         }
     }
-    ~MemoryPool() { cudaMemPoolDestroy(handle); }
+    ~MemoryPool() {
+        int previous=device;cudaGetDevice(&previous);cudaSetDevice(device);
+        if(cachedBytes) {cudaDeviceSynchronize();clearCache();}
+        cudaMemPoolDestroy(handle);cudaSetDevice(previous);
+    }
 };
 thread_local std::shared_ptr<MemoryPool> activePool;
 std::shared_ptr<MemoryPool> memoryPool(int device) {
@@ -71,10 +122,13 @@ std::shared_ptr<void> allocate(size_t bytes) {
     require(bytes > 0, "empty CUDA allocation");
     int device; check(cudaGetDevice(&device));
     auto pool = memoryPool(device);
-    void *p = nullptr;
-    check(cudaMallocFromPoolAsync(&p,bytes,pool->handle,cudaStreamPerThread));
-    return {p, [device,pool](void *x) {
-        int previous = device; cudaGetDevice(&previous); cudaSetDevice(device);
+    void *p = pool->reuse(bytes);
+    if(!p) check(cudaMallocFromPoolAsync(&p,bytes,pool->handle,cudaStreamPerThread));
+    auto owner=allocationThread();
+    return {p, [device,pool,bytes,owner](void *x) {
+        int previous = device; cudaGetDevice(&previous);
+        if(previous==device && activePool==pool && owner==allocationThread() && pool->recycle(x,bytes)) return;
+        cudaSetDevice(device);
         cudaFreeAsync(x,cudaStreamPerThread);
         cudaSetDevice(previous);
     }};
@@ -364,9 +418,17 @@ template<class T> __global__ void textRopeKernel(const T *x,T *y,size_t n,int co
 }
 }
 
-TensorPool::TensorPool(int device):pool_(std::make_shared<MemoryPool>(device,UINT64_MAX)) {}
+TensorPool::TensorPool(int device,size_t cacheBytes):pool_(std::make_shared<MemoryPool>(device,UINT64_MAX)) {
+    std::static_pointer_cast<MemoryPool>(pool_)->cacheLimit=cacheBytes;
+}
 TensorPool::Scope::Scope(const TensorPool &pool):previous_(activePool) {
-    activePool=std::static_pointer_cast<MemoryPool>(pool.pool_);
+    auto next=std::static_pointer_cast<MemoryPool>(pool.pool_);
+    if(next->cacheLimit) {
+        cudaStreamCaptureStatus status;
+        check(cudaStreamIsCapturing(cudaStreamPerThread,&status));
+        require(status==cudaStreamCaptureStatusNone,"host tensor reuse does not support CUDA capture");
+    }
+    activePool=std::move(next);
 }
 TensorPool::Scope::~Scope() { activePool=std::static_pointer_cast<MemoryPool>(previous_); }
 size_t TensorPool::reusableBytes() const {
@@ -374,10 +436,11 @@ size_t TensorPool::reusableBytes() const {
     uint64_t reserved=0,used=0;
     check(cudaMemPoolGetAttribute(pool->handle,cudaMemPoolAttrReservedMemCurrent,&reserved));
     check(cudaMemPoolGetAttribute(pool->handle,cudaMemPoolAttrUsedMemCurrent,&used));
-    return reserved>used?reserved-used:0;
+    return (reserved>used?reserved-used:0)+pool->cachedBytes;
 }
 void TensorPool::trim() {
-    check(cudaMemPoolTrimTo(std::static_pointer_cast<MemoryPool>(pool_)->handle,0));
+    auto pool=std::static_pointer_cast<MemoryPool>(pool_);pool->clearCache();
+    check(cudaMemPoolTrimTo(pool->handle,0));
 }
 
 struct Runtime::LtState {
