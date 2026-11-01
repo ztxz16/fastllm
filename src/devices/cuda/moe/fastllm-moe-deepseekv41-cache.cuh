@@ -163,25 +163,57 @@ __global__ void Gate(const __nv_bfloat16 *input, const int32_t *slots, const uin
 // so every record row and partial tile stay aligned to the 8-byte copies.
 // The end of each iteration needs no extra barrier:
 // the next iteration's wait + CTA barrier retires reads before buffer reuse.
+template <bool Planar = false>
 __device__ inline float2 DotGateUpTiled(const __nv_bfloat16 *input,
-        const uint8_t *gate, const uint8_t *up, int columns) {
+        const uint8_t *gate, const uint8_t *up, int columns,
+        const uint8_t *gateScale = nullptr, const uint8_t *upScale = nullptr) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     constexpr int tileBlocks = 16, tileBytes = tileBlocks * 17, rows = 32;
     const int lane = threadIdx.x & 15, row = threadIdx.x / 16;
-    const int blocks = columns / 32, pitch = blocks * 17;
+    const int blocks = columns / 32, pitch = blocks * (Planar ? 16 : 17);
+    // The planar value tile uses the same padded stride to avoid shared-memory
+    // bank conflicts. Scale copies stay 8-byte aligned for 256-column tails.
     __shared__ __align__(16) uint8_t tiles[2][2][rows][tileBytes];
+    __shared__ __align__(16) uint8_t scales[2][2][rows][Planar ? tileBlocks : 1];
     auto prefetch = [&](int tile) {
-        for (int item = threadIdx.x; item < rows * (tileBytes / 8); item += 512) {
-            const int r = item / (tileBytes / 8), offset = item % (tileBytes / 8) * 8;
-            const int columnOffset = tile * tileBytes + offset;
-            const int validBytes = columnOffset < pitch ? 8 : 0;
-            const size_t source = size_t(r) * pitch + columnOffset;
-            const unsigned g = __cvta_generic_to_shared(&tiles[tile & 1][0][r][offset]);
-            const unsigned u = __cvta_generic_to_shared(&tiles[tile & 1][1][r][offset]);
-            asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;" ::
-                "r"(g), "l"(gate + source), "r"(validBytes) : "memory");
-            asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;" ::
-                "r"(u), "l"(up + source), "r"(validBytes) : "memory");
+        if constexpr (Planar) {
+            for (int item = threadIdx.x; item < rows * tileBlocks; item += 512) {
+                const int r = item / tileBlocks, offset = item % tileBlocks * 16;
+                const int column = tile * tileBlocks * 16 + offset;
+                const int valid = column < pitch ? 16 : 0;
+                const size_t source = size_t(r) * pitch + column;
+                const unsigned g = __cvta_generic_to_shared(&tiles[tile & 1][0][r][offset]);
+                const unsigned u = __cvta_generic_to_shared(&tiles[tile & 1][1][r][offset]);
+                asm volatile("cp.async.ca.shared.global [%0], [%1], 16, %2;" ::
+                    "r"(g), "l"(gate + source), "r"(valid) : "memory");
+                asm volatile("cp.async.ca.shared.global [%0], [%1], 16, %2;" ::
+                    "r"(u), "l"(up + source), "r"(valid) : "memory");
+            }
+            for (int item = threadIdx.x; item < rows * (tileBlocks / 8); item += 512) {
+                const int r = item / (tileBlocks / 8), offset = item % (tileBlocks / 8) * 8;
+                const int column = tile * tileBlocks + offset;
+                const int valid = column < blocks ? 8 : 0;
+                const size_t source = size_t(r) * blocks + column;
+                const unsigned g = __cvta_generic_to_shared(&scales[tile & 1][0][r][offset]);
+                const unsigned u = __cvta_generic_to_shared(&scales[tile & 1][1][r][offset]);
+                asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;" ::
+                    "r"(g), "l"(gateScale + source), "r"(valid) : "memory");
+                asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;" ::
+                    "r"(u), "l"(upScale + source), "r"(valid) : "memory");
+            }
+        } else {
+            for (int item = threadIdx.x; item < rows * (tileBytes / 8); item += 512) {
+                const int r = item / (tileBytes / 8), offset = item % (tileBytes / 8) * 8;
+                const int columnOffset = tile * tileBytes + offset;
+                const int validBytes = columnOffset < pitch ? 8 : 0;
+                const size_t source = size_t(r) * pitch + columnOffset;
+                const unsigned g = __cvta_generic_to_shared(&tiles[tile & 1][0][r][offset]);
+                const unsigned u = __cvta_generic_to_shared(&tiles[tile & 1][1][r][offset]);
+                asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;" ::
+                    "r"(g), "l"(gate + source), "r"(validBytes) : "memory");
+                asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;" ::
+                    "r"(u), "l"(up + source), "r"(validBytes) : "memory");
+            }
         }
         asm volatile("cp.async.commit_group;" ::: "memory");
     };
@@ -195,9 +227,10 @@ __device__ inline float2 DotGateUpTiled(const __nv_bfloat16 *input,
         for (int b = 0; b < tileBlocks; ++b) if (tile * tileBlocks + b < blocks) {
             const unsigned x = reinterpret_cast<const unsigned *>(input)[(tile * tileBlocks + b) * 16 + lane];
             const float x0 = __uint_as_float(x << 16), x1 = __uint_as_float(x & 0xffff0000u);
-            const uint8_t *g = &tiles[tile & 1][0][row][b * 17];
-            const uint8_t *u = &tiles[tile & 1][1][row][b * 17];
-            const float2 gv = FP4Pair(g[lane], g[16]), uv = FP4Pair(u[lane], u[16]);
+            const uint8_t *g = &tiles[tile & 1][0][row][b * (Planar ? 16 : 17)];
+            const uint8_t *u = &tiles[tile & 1][1][row][b * (Planar ? 16 : 17)];
+            const float2 gv = FP4Pair(g[lane], Planar ? scales[tile & 1][0][row][b] : g[16]);
+            const float2 uv = FP4Pair(u[lane], Planar ? scales[tile & 1][1][row][b] : u[16]);
             gs = __fadd_rn(gs, __fadd_rn(__fmul_rn(x0, gv.x), __fmul_rn(x1, gv.y)));
             us = __fadd_rn(us, __fadd_rn(__fmul_rn(x0, uv.x), __fmul_rn(x1, uv.y)));
         }
@@ -208,23 +241,32 @@ __device__ inline float2 DotGateUpTiled(const __nv_bfloat16 *input,
     }
     return make_float2(gs, us);
 #else
-    const size_t pitch = size_t(columns / 32) * 17;
-    return DotGateUp(input, gate + (threadIdx.x / 16) * pitch,
-                    up + (threadIdx.x / 16) * pitch, columns);
+    const size_t pitch = size_t(columns / 32) * (Planar ? 16 : 17);
+    const int row = threadIdx.x / 16;
+    if constexpr (Planar)
+        return DotGateUp<true>(input, gate + row * pitch, up + row * pitch, columns,
+            gateScale + size_t(row) * (columns / 32), upScale + size_t(row) * (columns / 32));
+    else
+        return DotGateUp(input, gate + row * pitch, up + row * pitch, columns);
 #endif
 }
 
 // Resident experts rotate through a cache much larger than L2. Staged experts
 // keep the ordinary path because their freshly copied weights can be warm in L2.
+template <bool Planar = false>
 static __global__ void GateResident(const __nv_bfloat16 *input, const int32_t *slots,
         const uint8_t *records, const float *scores, __nv_bfloat16 *activation,
         int hidden, int inter, size_t stride, float limit) {
     const int route = blockIdx.y, slot = slots[route];
     if (slot < 0) return;
-    const size_t pitch = size_t(hidden / 32) * 17;
-    const uint8_t *gate = records + size_t(slot) * stride + size_t(blockIdx.x * 32) * pitch;
+    const size_t pitch = size_t(hidden / 32) * (Planar ? 16 : 17);
+    const uint8_t *record = records + size_t(slot) * stride;
+    const uint8_t *gate = record + size_t(blockIdx.x * 32) * pitch;
     const uint8_t *up = gate + size_t(inter) * pitch;
-    const float2 pair = DotGateUpTiled(input, gate, up, hidden);
+    const uint8_t *scale = Planar ? record + size_t(2 * inter) * pitch +
+        size_t(blockIdx.x * 32) * (hidden / 32) : nullptr;
+    const float2 pair = DotGateUpTiled<Planar>(input, gate, up, hidden, scale,
+        Planar ? scale + size_t(inter) * (hidden / 32) : nullptr);
     StoreGate(pair, scores[route], activation, route, inter, limit);
 }
 static __global__ void Down(const __nv_bfloat16 *activation, const int32_t *slots, const uint8_t *records,
