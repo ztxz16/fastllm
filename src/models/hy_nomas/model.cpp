@@ -121,7 +121,7 @@ Tensor DiT::forward(const Tensor &latent,const Tensor &features,float timestep,i
         }
     }
     if(partitions>1) x=parallel_->gatherRows(rt_,x,tokens);
-    auto out=weights_.linear(rt_.modulate(rt_.norm(x,false),modulation.output,0,1),"final_layer.linear");
+    auto out=weights_.linear(rt_.normModulate(x,modulation.output,0,1),"final_layer.linear");
     // Publish cache atomically after every layer and the output have succeeded.
     rt_.synchronize();
     if(commit) *cache=workspace?std::move(*workspace):std::move(next);

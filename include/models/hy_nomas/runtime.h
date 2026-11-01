@@ -106,6 +106,8 @@ public:
                        int frames, int height, int width);
     Tensor pixelCondition(const Tensor &x, int frames, int height, int width);
     Tensor modulate(const Tensor &x, const Tensor &mod, int shift, int scale);
+    // LayerNorm followed by modulation, preserving the intermediate dtype rounding.
+    Tensor normModulate(const Tensor &x, const Tensor &mod, int shift, int scale, float eps = 1e-6f);
     Tensor residual(const Tensor &x, const Tensor &y, const Tensor &mod, int gate);
     // Indexed BF16/FP32 modulation; each token selects one row of the table.
     Tensor modulateRows(const Tensor &, const Tensor &table, const Tensor &indices, int shift, int scale);

@@ -169,12 +169,27 @@ template<class T> __global__ void addBias(const T *x,const T *bias,T *y,size_t n
     for(size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;i<n;i+=size_t(gridDim.x)*blockDim.x) y[i]=cast<T>(f(x[i])+f(bias[i%cols]));
 }
 __device__ float sumBlock(float v, float *scratch) {
+    // Callers use power-of-two blocks of at least 64 threads. Preserve the
+    // descending reduction tree. Only the final warp uses
+    // shuffles; a warp-sum-first reduction would change the addition order.
     scratch[threadIdx.x]=v; __syncthreads();
-    for (int d=blockDim.x/2; d; d/=2) { if(threadIdx.x<d) scratch[threadIdx.x]+=scratch[threadIdx.x+d]; __syncthreads(); }
+    for(int d=blockDim.x/2;d>=64;d/=2) {
+        if(threadIdx.x<d) scratch[threadIdx.x]+=scratch[threadIdx.x+d];
+        __syncthreads();
+    }
+    if(threadIdx.x<32) {
+        float sum=scratch[threadIdx.x]+scratch[threadIdx.x+32];
+        for(int d=16;d;d/=2) sum+=__shfl_down_sync(0xffffffffu,sum,d);
+        if(threadIdx.x==0) scratch[0]=sum;
+    }
+    __syncthreads();
     return scratch[0];
 }
-template<class T, bool FusedAffine=true> __global__ void normKernel(const T *x, T *y, const T *weight, const T *bias, int width, bool rms, float eps, int rows) {
-    if(rms && width==128) {
+template<class T> __device__ float modulatedValue(float value, float shift, float scale) {
+    return roundTo<T>(value*roundTo<T>(1.f+scale))+shift;
+}
+template<class T, bool FusedAffine=true, bool Modulate=false> __global__ void normKernel(const T *x, T *y, const T *weight, const T *bias, int width, bool rms, float eps, int rows, const T *mod=nullptr, int shift=0, int scale=0) {
+    if(!Modulate && rms && width==128) {
         // One warp per row, four rows per block. Keep the old block reduction's
         // (0+64)+(32+96) tree and the cast before the affine, unlike LLM RMSNorm.
         int row=blockIdx.x*4+threadIdx.x/32,lane=threadIdx.x%32;
@@ -198,7 +213,7 @@ template<class T, bool FusedAffine=true> __global__ void normKernel(const T *x, 
     }
     __shared__ float scratch[256]; __shared__ float mean, inv;
     int row=blockIdx.x; float s=0;
-    if(rms) {
+    if(!Modulate && rms) {
         if(threadIdx.x==0) mean=0;
     } else {
         for(int c=threadIdx.x;c<width;c+=blockDim.x) s+=f(x[size_t(row)*width+c]);
@@ -212,12 +227,17 @@ template<class T, bool FusedAffine=true> __global__ void normKernel(const T *x, 
     __syncthreads();
     for(int c=threadIdx.x;c<width;c+=blockDim.x) {
         float v=(f(x[size_t(row)*width+c])-mean)*inv;
-        // Official RMSNorm casts before applying weight; LayerNorm has a fused affine.
-        if(rms) v=roundTo<T>(v);
-        if constexpr (std::is_same_v<T,B> && FusedAffine) {
-            if(!rms && weight && bias) v=__fmaf_rn(v,f(weight[c]),f(bias[c]));
-            else { if(weight) v*=f(weight[c]); if(bias) v+=f(bias[c]); }
-        } else { if(weight) v*=f(weight[c]); if(bias) v+=f(bias[c]); }
+        if constexpr (Modulate) {
+            // Keep the materialized LayerNorm result's rounding before modulation.
+            v=modulatedValue<T>(roundTo<T>(v),f(mod[shift*width+c]),f(mod[scale*width+c]));
+        } else {
+            // Official RMSNorm casts before weight; LayerNorm has a fused affine.
+            if(rms) v=roundTo<T>(v);
+            if constexpr (std::is_same_v<T,B> && FusedAffine) {
+                if(!rms && weight && bias) v=__fmaf_rn(v,f(weight[c]),f(bias[c]));
+                else { if(weight) v*=f(weight[c]); if(bias) v+=f(bias[c]); }
+            } else { if(weight) v*=f(weight[c]); if(bias) v+=f(bias[c]); }
+        }
         y[size_t(row)*width+c]=cast<T>(v);
     }
 }
@@ -249,7 +269,7 @@ template<class T,bool Indexed=false> __global__ void modulation(const T *x, cons
         if constexpr(Indexed) j+=size_t(indices[i/c])*modCols;
         // Match eager BF16 boundaries, including the rounding of (1 + scale).
         float v=residual ? f(x[i])+roundTo<T>(f(y[i])*f(mod[a*c+j]))
-                         : roundTo<T>(f(x[i])*roundTo<T>(1.f+f(mod[d*c+j])))+f(mod[a*c+j]);
+                         : modulatedValue<T>(f(x[i]),f(mod[a*c+j]),f(mod[d*c+j]));
         z[i]=cast<T>(v);
     }
 }
@@ -602,6 +622,14 @@ Tensor Runtime::norm(const Tensor &x,bool rms,const Tensor *w,const Tensor *bias
     } else {
         DISPATCH_TENSOR(x.dtype, T, normKernel<T><<<blocks,threads,0,cudaStreamPerThread>>>(as<T>(x),as<T>(out),w?as<T>(*w):nullptr,bias?as<T>(*bias):nullptr,width,rms,eps,rows));
     }
+    check(cudaGetLastError()); return out;
+}
+Tensor Runtime::normModulate(const Tensor &x,const Tensor &m,int shift,int scale,float eps) {
+    require(x.cols>0 && m.dtype==x.dtype && m.rows==1 && shift>=0 && scale>=0 &&
+            m.cols>=(std::max(shift,scale)+1)*x.cols,"norm modulation dimension mismatch");
+    Tensor out(x.rows,x.cols,x.dtype);
+    DISPATCH_TENSOR(x.dtype, T, (normKernel<T,true,true><<<x.rows,256,0,cudaStreamPerThread>>>(
+        as<T>(x),as<T>(out),nullptr,nullptr,x.cols,false,eps,x.rows,as<T>(m),shift,scale)));
     check(cudaGetLastError()); return out;
 }
 Tensor Runtime::activation(const Tensor &x,bool gelu) {

@@ -38,7 +38,7 @@ BlockResult DiT::block(int layer,const Tensor &image,const Tensor &text,const Te
     auto act=imageMod && textMod?Tensor{}:rt_.activation(time);
     auto im=imageMod?*imageMod:weights_.linear(act,p+"img_mod.linear");
     auto tm=textMod?*textMod:weights_.linear(act,p+"txt_mod.linear");
-    auto inputI=rt_.modulate(rt_.norm(local,false),im,0,1),inputT=rt_.modulate(rt_.norm(text,false),tm,0,1);
+    auto inputI=rt_.normModulate(local,im,0,1),inputT=rt_.normModulate(text,tm,0,1);
     auto project=[&](const Tensor &x,const std::string &s) {
         auto q=weights_.linear(x,p+s+"_attn_q"),k=weights_.linear(x,p+s+"_attn_k"),v=weights_.linear(x,p+s+"_attn_v");
         q=rt_.norm(q,true,&weights_.get(p+s+"_attn_q_norm.weight"),nullptr,1e-6f,128);
@@ -82,7 +82,7 @@ BlockResult DiT::block(int layer,const Tensor &image,const Tensor &text,const Te
     auto attn=rt_.attention(q,allK,allV,16,mask);
     auto finish=[&](const Tensor &x,const Tensor &m,const Tensor &a,const std::string &s) {
         auto h=rt_.residual(x,weights_.linear(a,p+s+"_attn_proj"),m,2);
-        auto mlp=weights_.linear(rt_.activation(weights_.linear(rt_.modulate(rt_.norm(h,false),m,3,4),p+s+"_mlp.fc1"),true),p+s+"_mlp.fc2");
+        auto mlp=weights_.linear(rt_.activation(weights_.linear(rt_.normModulate(h,m,3,4),p+s+"_mlp.fc1"),true),p+s+"_mlp.fc2");
         return rt_.residual(h,mlp,m,5);
     };
     auto imageOut=finish(local,im,attn.rowSlice(0,rows),"img");
