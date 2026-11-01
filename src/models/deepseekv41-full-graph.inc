@@ -81,9 +81,14 @@ struct V41FullEngramWorker {
             try {
                 for (auto *e : entries) {
                     auto &t = *e->table;
-                    v41_engram_detail::GatherNativeRows(t.data, t.scale,
-                        t.diskValueReader.get(), t.diskScaleReader.get(), t.rows,
-                        t.dim, t.scaleBlock, e->hostRows, static_cast<uint16_t *>(e->asyncData));
+                    auto *dst = static_cast<uint16_t *>(e->asyncData);
+                    if (t.ggufWeight) {
+                        V41GatherGgufEngramRows(t, e->hostRows, dst);
+                    } else {
+                        v41_engram_detail::GatherNativeRows(t.data, t.scale,
+                            t.diskValueReader.get(), t.diskScaleReader.get(), t.rows,
+                            t.dim, t.scaleBlock, e->hostRows, dst);
+                    }
                     e->asyncReady->store(1u, std::memory_order_release);
                 }
             } catch (...) {
@@ -118,7 +123,7 @@ struct V41FullGraph {
     std::vector<std::unique_ptr<V41FullLayer>> layers;
     std::map<int, std::unique_ptr<V41FullEngram>> engrams;
     std::unique_ptr<V41FullEngramWorker> engramWorker;
-    Data topk, candidates, head, norm, normFloat, logits, requests, gatheredLogits;
+    Data topk, candidates, head, norm, normFloat, headLogits, logits, requests, gatheredLogits;
     Data candidateBlocks, candidateCounts;
     std::map<int, Data> mainHidden;
     std::vector<void *> ready;
@@ -348,7 +353,8 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
         (!hybrid && (kvCacheDataType == DataType::FP8_E4M3 || kvCacheDataType == DataType::FP4_E2M1)) ||
         (!verifying && !v41CudaGraphWarmingUp) || head_dim_full != 512 || hc_mult != 4 || index_head_dim != 128 ||
         (weight["head.weight"].dataType != DataType::FLOAT32 &&
-         (!hybrid || weight["head.weight"].dataType != DataType::BFLOAT16)))
+         (!hybrid || (weight["head.weight"].dataType != DataType::BFLOAT16 &&
+                      weight["head.weight"].dataType != DataType::DATA_GGUF_FORMAT))))
         return;
     // Explicit reference/debug modes must retain their selected arithmetic.
     if (V41DecodeCudaGraphReplayMask() != 15 || V41EnvFlag("FASTLLM_DSV41_DISABLE_FAKE_QUANT") ||
@@ -496,8 +502,7 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
         if (!e->table->gpuTable)
             GatherEngramRows(engram_layer_ids[i], e->hostRows, batch, e->hostGathered);
         const auto &t = *e->table;
-        if (hybrid && !t.gpuTable && !t.ggufWeight &&
-            ((t.data && t.scale) || (t.diskValueReader && t.diskScaleReader))) {
+        if (hybrid && V41CanPrefetchEngramRows(t)) {
             // Unsupported devices keep the existing synchronous gather path.
             if (FastllmCudaV41CreateHostCopy(e->gathered.cudaData, e->gathered.GetBytes(),
                     &e->asyncData, &e->asyncReady, &e->asyncGraph)) {
@@ -559,9 +564,17 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
     try {
         std::vector<std::vector<const void *>> children(g->devices.size());
         auto capture = [&](const std::function<void()> &body) {
-            body(); // Warm GEMM plans and allocate persistent operands before capture.
+            std::vector<size_t> allocations;
+            {
+                FastllmCudaAllocationRecorder recorder(g->hybrid ? &allocations : nullptr);
+                body(); // Warm GEMM plans and persistent operands before capture.
+            }
             for (int d : g->devices)
                 FastllmCudaSyncDevice(d);
+            // GGUF GEMM releases its dequantization scratch through an event.
+            // Retire that event and reserve capture-safe temporary storage.
+            if (g->hybrid && !FastllmCudaReserveGraphWorkspace(allocations))
+                throw std::runtime_error("full graph temporary workspace");
             if (!poolOpen) {
                 FastllmCudaClearThreadError();
                 FastllmCudaClearGraphError();
@@ -740,7 +753,14 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
             V41HcApplyPre(ws.hiddenStates, ws.ffnPre, g->head);
             V41RMSNormBF16(g->head, weight["norm.weight"], rms_norm_eps, g->norm);
             weight["head.weight"].tpLinearType = TP_LINEAR_ROW;
-            if (!TryBFloat16HeadLinear(g->norm, g->logits)) {
+            if (weight["head.weight"].dataType == DataType::DATA_GGUF_FORMAT) {
+                // Match the existing GGUF head boundary: BF16 projection,
+                // then FP32 logits. Separate buffers keep both addresses
+                // stable across warmup and capture.
+                if (verifying) DsparkProjectHead(g->norm, g->headLogits);
+                else Linear(g->norm, weight["head.weight"], *GetEmptyData(), g->headLogits);
+                ToDataType(g->headLogits, g->logits, DataType::FLOAT32);
+            } else if (!TryBFloat16HeadLinear(g->norm, g->logits)) {
                 ToDataType(g->norm, g->normFloat, DataType::FLOAT32);
                 Linear(g->normFloat, weight["head.weight"], *GetEmptyData(), g->logits);
             }
@@ -875,6 +895,7 @@ bool DeepSeekV41Model::TryFullDecodeGraph(ForwardWorkspace &f, bool inputsPrepar
     }
     if (!f.graphState->fullDecode) return false;
     auto g = std::static_pointer_cast<V41FullGraph>(f.graphState->fullDecode);
+    if (g->hybrid && (!f.moeStep || !*f.moeStep)) return false;
     V41FullCallerAffinity affinity(g->coordinatorCpus);
     if (g->capturesInput) {
         if ((int)f.tokenIds.size() != g->batch) return false;
@@ -897,7 +918,7 @@ bool DeepSeekV41Model::TryFullDecodeGraph(ForwardWorkspace &f, bool inputsPrepar
                         [&](int64_t row) { return row < 0 || row >= e.table->rows; }))
             return false;
     }
-    // Native CPU rows are prepared alongside layer 0. Each Engram consumer
+    // CPU rows are prepared alongside layer 0. Each Engram consumer
     // waits on its own publication, so late I/O cannot expose stale rows.
     // Finish on exceptional launch paths before hostRows can be reused.
     struct JoinEngram {

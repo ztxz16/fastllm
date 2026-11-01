@@ -5427,10 +5427,13 @@ void *FastllmCudaCreateNativeMoeFullGraph(const fastllm::Data &input, const fast
     int table = -1;
     auto *group = FindHybridGroup(weights, weightsBatch, &table);
     if (!group || !group->cpuDecodeReady || !group->expertDevices.empty() ||
-        group->tensorParallelRequested || group->deviceCaches.size() != 1 ||
-        group->LayerLayout(table).weightType != fastllm::NVFP4_BLOCK_32_E8M0 ||
-        !group->LayerLayout(table).deepSeekV41 ||
-        input.dims[1] != group->LayerLayout(table).hidden) return nullptr;
+        group->tensorParallelRequested || group->deviceCaches.size() != 1) return nullptr;
+    const auto &layout = group->LayerLayout(table);
+    const bool supportedGGUF = layout.weightType == fastllm::DATA_GGUF_FORMAT &&
+        FastllmCudaV41GGUFSupported(layout.gateGgmlType, layout.downGgmlType) &&
+        FastllmCudaV41CanonicalGGUFCacheWorkspaceBytes(layout.hidden, layout.inter) != 0;
+    if (!layout.deepSeekV41 || input.dims[1] != layout.hidden ||
+        (layout.weightType != fastllm::NVFP4_BLOCK_32_E8M0 && !supportedGGUF)) return nullptr;
     auto *cache = GetDeviceCache(*group, false);
     if (!cache || !cache->frequency) return nullptr;
     if (!cache->nativeMailbox) cache->nativeMailbox = std::make_shared<NativeMoeMailbox>(*group, *cache);

@@ -287,6 +287,16 @@ __device__ __forceinline__ void V41GGUFGateUpActBody(const block_q8_1 *input, __
     if constexpr (StaticColumns) columns = StaticColumns;
     const int route = blockIdx.y;
     const uint8_t *weight = V41Weight(weights, indices, route, experts, true);
+    // Inactive cache routes still produce zero activation, but do not need
+    // to stage the IQ codebook or input shared by the active projections.
+    if (!weight) {
+        const float zero = 0.f * (scores ? scores[route] : 1.f);
+        for (int r = threadIdx.x; r < Tile; r += Threads) {
+            const int row = blockIdx.x * Tile + r;
+            if (row < inter) output[size_t(route) * inter + row] = __float2bfloat16_rn(zero);
+        }
+        return;
+    }
     const auto *x = input + size_t(V41Route(weights, route)/topk)*(columns/32);
     extern __shared__ uint32_t activation[];
     constexpr int gridWords = (Type == GGML_TYPE_IQ1_S || Type == GGML_TYPE_IQ1_M || Type == GGML_TYPE_IQ2_S) ? 2048 :
@@ -305,7 +315,7 @@ __device__ __forceinline__ void V41GGUFGateUpActBody(const block_q8_1 *input, __
     for (int r = threadIdx.x/LaneWidth; r < Tile; r += Threads/LaneWidth) {
         const int row = blockIdx.x*Tile+r;
         float g=0, u=0;
-        if (weight && row < inter) {
+        if (row < inter) {
             const int gateRow = V41WeightRow(weights,row,2*inter,true);
             const int upRow = V41WeightRow(weights,row+inter,2*inter,true);
             float2 pair;

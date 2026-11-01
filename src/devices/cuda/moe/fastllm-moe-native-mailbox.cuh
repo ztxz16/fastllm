@@ -184,6 +184,7 @@ struct NativeMoeMailbox {
         int32_t *slots = nullptr; // resident, staged, GPU route IDs
         int32_t *routeMap = nullptr;
         fastllm::Data quantized, gate;
+        fastllm::Data ggufWorkspace[2], ggufActivation[2];
         cudaGraphExec_t exec = nullptr, finishExec = nullptr;
         cudaGraph_t fullGraph = nullptr;
         NativeMoeMailbox *owner = nullptr;
@@ -217,10 +218,30 @@ struct NativeMoeMailbox {
             std::fill_n(hostData, (routes + rows) * hidden, 0.0f);
             for (auto *e : {&begin, &residentDone, &stagedBegin, &done, &completed, &uploadBegin, &uploadDone})
                 if (cudaEventCreate(e) != cudaSuccess) return false;
-            for (auto *d : {&quantized, &gate}) {
-                d->dataType = fastllm::BFLOAT16;
-                d->Resize(d == &quantized ? std::vector<int>{rows, hidden} : std::vector<int>{routes, layout.inter});
-                d->ToDevice(fastllm::CUDA, {device}, false); d->Allocate(false);
+            quantized.dataType = fastllm::BFLOAT16;
+            quantized.Resize({rows, hidden});
+            quantized.ToDevice(fastllm::CUDA, {device}, false); quantized.Allocate(false);
+            // GGUF owns separate resident/staged projection scratch below.
+            // Only native experts consume this Gate buffer.
+            if (layout.weightType != fastllm::DATA_GGUF_FORMAT) {
+                gate.dataType = fastllm::BFLOAT16;
+                gate.Resize({routes, layout.inter});
+                gate.ToDevice(fastllm::CUDA, {device}, false); gate.Allocate(false);
+            }
+            if (layout.weightType == fastllm::DATA_GGUF_FORMAT) {
+                const size_t bytes = FastllmCudaV41CanonicalGGUFCacheWorkspaceBytes(hidden, layout.inter);
+                if (!bytes) return false;
+                // Resident and staged branches execute concurrently. Neither
+                // quantization scratch nor activation storage may alias.
+                for (int branch = 0; branch < 2; ++branch) {
+                    auto &scratch = ggufWorkspace[branch];
+                    scratch.dataType = fastllm::INT8; scratch.Resize({int(bytes)});
+                    scratch.ToDevice(fastllm::CUDA, {device}, false); scratch.Allocate(false);
+                    auto &activation = ggufActivation[branch];
+                    activation.dataType = fastllm::BFLOAT16;
+                    activation.Resize({std::min(rows, 8) * topk, layout.inter});
+                    activation.ToDevice(fastllm::CUDA, {device}, false); activation.Allocate(false);
+                }
             }
             return true;
         }
@@ -457,12 +478,19 @@ struct NativeMoeMailbox {
         // The CPU producer publishes a complete immutable plan and submits no
         // CUDA work. The graph can already execute shared and resident experts.
         __atomic_store_n(&box.planned, 1u, __ATOMIC_RELEASE);
-        const double begin = HybridNowUs();
-        fastllm::NumasMoeVerifyExperts(reinterpret_cast<const uint16_t *>(w.hostData),
-            w.hostData + w.rows * w.hidden, w.rows, w.weights.data(), w.weights.size(),
-            box.ids, box.gpu, box.scores, w.topk, w.modelLayer, layout.swigluLimit, true);
         const int cpuRoutes = w.routes - w.hits - w.stagedRoutes;
-        if (cpuRoutes > 0) w.cost.cpuExpert.Observe((HybridNowUs() - begin) / cpuRoutes);
+        if (cpuRoutes > 0) {
+            const double begin = HybridNowUs();
+            // Cache preparation already validated every immutable weight.
+            // Reuse that result, as the segmented verifier does, instead of
+            // scanning every expert again on each layer's critical path.
+            fastllm::NumasMoeVerifyExpertsWithOverlap(
+                reinterpret_cast<const uint16_t *>(w.hostData),
+                w.hostData + w.rows * w.hidden, w.rows, w.weights.data(), w.weights.size(),
+                box.ids, box.gpu, box.scores, w.topk, w.modelLayer, layout.swigluLimit,
+                true, 32, {}, nullptr, group.cpuDecodeReady);
+            w.cost.cpuExpert.Observe((HybridNowUs() - begin) / cpuRoutes);
+        }
         ++w.cost.calls;
         const uint64_t d[8] = {1, uint64_t(w.routes), uint64_t(w.hits), uint64_t(w.routes-w.hits),
             uint64_t(w.hits+w.stagedRoutes), uint64_t(cpuRoutes), uint64_t(w.hits), 0};
@@ -483,6 +511,29 @@ struct NativeMoeMailbox {
             view.routeMap = w.routeMap + base; view.routeCount = rows * w.topk;
             if (!ComputeBatchExperts(input, gate, dummy, layout, view, scores + base,
                     w.topk, w.partial + size_t(base) * w.hidden, true)) return false;
+        }
+        return true;
+    }
+    bool ComputeGGUF(Layer &w, const OffloadLayout &layout, const uint8_t *records,
+                     const int32_t *slots, const float *scores, bool resident) {
+        const int branch = resident ? 0 : 1;
+        for (int first = 0; first < w.rows; first += 8) {
+            const int rows = std::min(8, w.rows - first), base = first * w.topk;
+            fastllm::Data input;
+            input.FakeFrom(w.quantized, size_t(first) * w.hidden * sizeof(uint16_t));
+            input.Resize({rows, w.hidden});
+            FastllmCudaMoeGGUFCacheView view{records, const_cast<int32_t *>(slots + base),
+                layout.recordStride, layout.downOffset, layout.gateGgmlType, layout.downGgmlType,
+                layout.hidden, layout.inter, w.ggufWorkspace[branch].cudaData,
+                size_t(w.ggufWorkspace[branch].GetBytes()), resident ? cache.slotOffsets : nullptr};
+            view.routeMap = w.routeMap ? w.routeMap + base : nullptr;
+            view.routeCount = rows * w.topk;
+            // Missing routes belong to the other branch (or CPU). Never
+            // overwrite their partials while publishing this branch's rows.
+            view.preserveMissing = true;
+            if (!FastllmCudaMoeV41CanonicalGGUFCacheCompute(input, w.ggufActivation[branch],
+                    view, scores + base, w.topk, layout.swigluLimit,
+                    w.partial + size_t(base) * w.hidden)) return false;
         }
         return true;
     }
@@ -592,7 +643,10 @@ struct NativeMoeMailbox {
             if (cudaEventRecordWithFlags(w.begin, cudaStreamPerThread, cudaEventRecordExternal) != cudaSuccess) return false;
             if (cudaStreamGetCaptureInfo(cudaStreamPerThread, &status, nullptr, &graph, &deps, &count) != cudaSuccess) return false;
             std::vector<cudaGraphNode_t> fork(deps, deps + count);
-            if (w.rows > 1) {
+            if (layout.weightType == fastllm::DATA_GGUF_FORMAT) {
+                if (!ComputeGGUF(w, layout, cache.records, w.slots,
+                        static_cast<const float *>(score.cudaData), true)) return false;
+            } else if (w.rows > 1) {
                 if (!ComputeBatch(w, layout, cache.records, w.slots, static_cast<const float *>(score.cudaData))) return false;
             } else Compute(w, layout, cache.records, w.slots, static_cast<const float *>(score.cudaData), cudaStreamPerThread, true);
             if (cudaEventRecordWithFlags(w.residentDone, cudaStreamPerThread, cudaEventRecordExternal) != cudaSuccess) return false;
@@ -615,7 +669,14 @@ struct NativeMoeMailbox {
             const int32_t *stagedSlots = w.rows > 1 ? w.mapped->stagedSlots : w.slots + 4 * topk;
             const int32_t *stagedCount = w.rows > 1 ? &w.mapped->stagedCount : w.slots + 5 * topk;
             const int maxStaged = w.rows > 1 ? kMaxTopK : topk;
-            if (group.sharedLayout.shards) {
+            if (!group.ggufSources.empty()) {
+                const auto &source = group.ggufSources[table];
+                auto *pointers = cache.numaPointers + size_t(table) * layout.experts * 2 * source.shards;
+                // Device IDs select immutable mapped NUMA shards. Restore the
+                // canonical record losslessly, including per-layer IQ/R4 types.
+                if (fastllm_gguf_restore::CopyRecords(source, pointers, fullCopy->records,
+                        cudaStreamPerThread, stagedExperts, stagedSlots, stagedCount) != cudaSuccess) return false;
+            } else if (group.sharedLayout.shards) {
                 const auto &shared = group.sharedLayout;
                 auto *pointers = cache.numaPointers + size_t(table) * layout.experts * 2 * shared.shards;
                 const auto *auxiliary = shared.auxiliaryBytes ? group.deviceHostRecords +
@@ -629,7 +690,10 @@ struct NativeMoeMailbox {
                         maxStaged, launch, cudaStreamPerThread)) return false;
             }
             if (cudaEventRecordWithFlags(w.uploadDone, cudaStreamPerThread, cudaEventRecordExternal) != cudaSuccess) return false;
-            if (w.rows > 1) {
+            if (layout.weightType == fastllm::DATA_GGUF_FORMAT) {
+                if (!ComputeGGUF(w, layout, fullCopy->records, w.slots + w.routes,
+                        static_cast<const float *>(score.cudaData), false)) return false;
+            } else if (w.rows > 1) {
                 if (!ComputeBatch(w, layout, fullCopy->records, w.slots + w.routes, static_cast<const float *>(score.cudaData))) return false;
             } else Compute(w, layout, fullCopy->records, w.slots + topk, static_cast<const float *>(score.cudaData), cudaStreamPerThread);
             if (cudaEventRecordWithFlags(w.done, cudaStreamPerThread, cudaEventRecordExternal) != cudaSuccess) return false;

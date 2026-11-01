@@ -124,12 +124,13 @@ namespace fastllm {
         // Native cache requests (including --auto) enable admission directly.
         const bool nativeFrequency = weights[0][2]->dataType == NVFP4_BLOCK_32_E8M0 ||
                                      weights[0][2]->dataType == FP8_E4M3_BLOCK_128 || streamGGUF;
-        // Native verification uses the same global admission policy as decode.
-        // Otherwise every layer can independently replace a cache entry, and
-        // the next layer drains that upload before launching its experts.
-        const bool nativeVerify = v41DsparkEnabled && weights[0][2]->dataType == NVFP4_BLOCK_32_E8M0 &&
-                                  seqlen > 1 && seqlen <= 32;
-        if (!tp && single && (seqlen == 1 || nativeVerify) && nativeFrequency &&
+        // Verification uses one admission scope across all layers. GGUF
+        // full-graph replay needs the same stable cache ownership as native
+        // weights; PP keeps its existing multi-device scheduling policy.
+        const bool cachedVerify = v41DsparkEnabled && seqlen > 1 && seqlen <= 32 &&
+            (weights[0][2]->dataType == NVFP4_BLOCK_32_E8M0 ||
+             (streamGGUF && V41DeviceMapCudaDeviceCount(this->deviceMap) <= 1));
+        if (!tp && single && (seqlen == 1 || cachedVerify) && nativeFrequency &&
             FastllmCudaMoeCacheRequested() &&
             !V41ReferenceMathEnabled() && GetCudaSharedExpert() &&
             std::getenv("FASTLLM_DSV41_DUMP_DIR") == nullptr &&
