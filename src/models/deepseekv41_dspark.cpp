@@ -319,10 +319,15 @@ namespace fastllm {
 #endif
 
         void DsHcApplyPreNorm(const Data &input, const Data &pre, Data &normWeight,
-                             float eps, Data &scratch, Data &output) {
+                             float eps, Data &scratch, Data &output, bool retainHidden = false) {
 #ifdef USE_CUDA
             if (DsFusedHcEnabled() &&
-                FastllmCudaDeepSeekV41HcPreNorm(input, pre, normWeight, eps, output)) return;
+                FastllmCudaDeepSeekV41HcPreNorm(input, pre, normWeight, eps, output)) {
+                // Confidence consumes the pre-normalization BF16 hidden state.
+                // The fused norm only writes output; materialize it on demand.
+                if (retainHidden) DsHcApplyPre(input, pre, scratch);
+                return;
+            }
 #endif
             DsHcApplyPre(input, pre, scratch);
             DsRMSNormBF16(scratch, normWeight, eps, output);
@@ -2227,6 +2232,9 @@ namespace fastllm {
         };
 
         const std::string last = "mtp." + std::to_string(v41DsparkLayers - 1);
+        const auto confidenceIt = weight.weight.find(last + ".confidence_head.proj.weight");
+        Data *confidenceWeight = v41DsparkConfidenceThreshold > 0.0f && confidenceIt != weight.weight.end()
+            ? &confidenceIt->second : nullptr;
         const bool randomDraft = config.top_k > 1;
         Data &markovEmbedWeight = weight[last + ".markov_head.embed.weight"];
         Data &markovHeadWeight = weight[last + ".markov_head.head.weight"];
@@ -2604,7 +2612,7 @@ namespace fastllm {
             DsDraftTimingSlot().layers = DsElapsed(layersStart);
 
             DsHcApplyPreNorm(*curHidden, layerPreMix, weight[last + ".norm.weight"],
-                             rms_norm_eps, headHidden, normed);
+                             rms_norm_eps, headHidden, normed, confidenceWeight != nullptr);
             // ---- head：mtp.<last>.norm + 共享 lm_head ----
             const double headStart = DsTick();
             bool headProjected = false, shardedMarkov = false;
@@ -2765,14 +2773,12 @@ namespace fastllm {
         // ---- confidence head：sigmoid(proj(cat(hidden, markov_embed))) ----
         const double confStart = DsTick();
         confidence.assign(block, 1.0f);
-        auto confIt = weight.weight.find(last + ".confidence_head.proj.weight");
-        if (confIt != weight.weight.end() && v41DsparkConfidenceThreshold > 0.0f &&
-            markovAll.dims.size() == 3) {
+        if (confidenceWeight && markovAll.dims.size() == 3) {
             Data hiddenFloat, markovFloat, features, confLogits;
             ToDataType(headHidden, hiddenFloat, DataType::FLOAT32);
             ToDataType(markovAll, markovFloat, DataType::FLOAT32);
             Cat(hiddenFloat, markovFloat, -1, features);
-            Linear(features, confIt->second, Data(), confLogits);
+            Linear(features, *confidenceWeight, Data(), confLogits);
             ToDataType(confLogits, DataType::FLOAT32);
             confLogits.ToDevice(DataDevice::CPU);
             const float *values = (const float*)confLogits.cpuData;
