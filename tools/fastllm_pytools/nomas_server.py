@@ -90,7 +90,7 @@ class WorldGenerationRequest(WorldRequest):
 class NativeBackend:
     callback_type = C.CFUNCTYPE(C.c_int, C.c_int, C.c_int, C.c_int, C.c_void_p)
 
-    def __init__(self, library, model, text_encoder, device=0):
+    def __init__(self, library, model, text_encoder, device=0, devices=None):
         self.lib = C.CDLL(str(Path(library).resolve()))
         self.lib.fastllm_nomas_error.restype = C.c_char_p
         self.lib.fastllm_nomas_pipeline_create.argtypes = [C.c_char_p, C.c_char_p, C.c_int]
@@ -105,7 +105,13 @@ class NativeBackend:
         self.lib.fastllm_nomas_world_destroy.argtypes = [C.c_void_p, C.c_void_p]
         self.lib.fastllm_nomas_world_step.argtypes = [C.c_void_p, C.c_void_p, C.c_int, C.POINTER(C.c_uint8), C.c_size_t, self.callback_type, C.c_void_p]
         self.lib.fastllm_nomas_world_step_prompt.argtypes = [C.c_void_p, C.c_void_p, C.c_char_p, C.c_int, C.POINTER(C.c_uint8), C.c_size_t, self.callback_type, C.c_void_p]
-        self.handle = self.lib.fastllm_nomas_pipeline_create(str(model).encode(), str(text_encoder).encode(), device)
+        if devices is None:
+            self.handle = self.lib.fastllm_nomas_pipeline_create(str(model).encode(), str(text_encoder).encode(), device)
+        else:
+            create = self.lib.fastllm_nomas_pipeline_create_parallel
+            create.argtypes = [C.c_char_p, C.c_char_p, C.c_char_p]
+            create.restype = C.c_void_p
+            self.handle = create(str(model).encode(), str(text_encoder).encode(), devices.encode())
         if not self.handle:
             raise RuntimeError(self.lib.fastllm_nomas_error().decode())
 
@@ -522,7 +528,9 @@ if __name__ == "__main__":
     parser.add_argument("--model", required=True)
     parser.add_argument("--text-encoder", required=True)
     parser.add_argument("--output", required=True)
-    parser.add_argument("--device", type=int, default=0)
+    devices = parser.add_mutually_exclusive_group()
+    devices.add_argument("--device", type=int, default=0)
+    devices.add_argument("--devices", help="CUDA-visible devices for PixelUMM tensor parallelism, e.g. 0,1")
     parser.add_argument("--precision", choices=["fp32", "bf16"], default="bf16")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8007)
@@ -539,5 +547,5 @@ if __name__ == "__main__":
         enhancer = PromptEnhancer(args.prompt_enhancer_url, args.prompt_enhancer_model,
                                   args.prompt_enhancer_prompts, args.prompt_enhancer_timeout)
     os.environ["FASTLLM_NOMAS_PRECISION"] = args.precision
-    uvicorn.run(create_app(NativeBackend(args.library, args.model, args.text_encoder, args.device), args.output, args.precision, enhancer),
+    uvicorn.run(create_app(NativeBackend(args.library, args.model, args.text_encoder, args.device, args.devices), args.output, args.precision, enhancer),
                 host=args.host, port=args.port, workers=1)

@@ -1,4 +1,5 @@
 #include "models/hy_nomas/runtime.h"
+#include "models/hy_nomas/parallel.h"
 #include <algorithm>
 #include <cstring>
 #include <mutex>
@@ -83,6 +84,9 @@ struct PipelineHandle {
     std::mutex mutex;
     fastllm::nomas::Pipeline pipeline;
     PipelineHandle(const char *model,const char *text,int device):pipeline(model,text,device) {}
+    PipelineHandle(const char *model,const char *text,const char *devices)
+        :pipeline(model,text,fastllm::nomas::ParallelOptions{fastllm::nomas::parseParallelDevices(devices),
+                                                          fastllm::nomas::RowReduction::Activation}) {}
 };
 int checkedTokens(int t,int h,int w) {
     if(t<1 || h<1 || w<1 || t>64 || h>128 || w>128 || int64_t(t)*h*w>16384)
@@ -165,6 +169,13 @@ int fastllm_nomas_encode(void *handle,const int *tokens,int count,float *feature
 void *fastllm_nomas_pipeline_create(const char *model,const char *text,int device) {
     try { lastError.clear(); if(!model || !text) throw std::invalid_argument("null model directory"); return new PipelineHandle(model,text,device); }
     catch(const std::exception &e) { lastError=e.what(); return nullptr; }
+}
+void *fastllm_nomas_pipeline_create_parallel(const char *model,const char *text,const char *devices) {
+    try {
+        lastError.clear();
+        if(!model || !text || !devices) throw std::invalid_argument("null model directory or parallel devices");
+        return new PipelineHandle(model,text,devices);
+    } catch(const std::exception &e) {lastError=e.what();return nullptr;}
 }
 void fastllm_nomas_pipeline_destroy(void *handle) { delete static_cast<PipelineHandle *>(handle); }
 int fastllm_nomas_generate(void *handle,const char *prompt,int width,int height,int frames,uint64_t seed,int steps,

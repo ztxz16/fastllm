@@ -36,6 +36,10 @@ private:
 
 // Select partial-output/collective precision; 16-bit GEMMs still accumulate in FP32.
 enum class RowReduction { FP32, Activation };
+struct ParallelOptions {
+    std::vector<int> devices;
+    RowReduction rowReduction = RowReduction::FP32;
+};
 
 // Column parallel: replicate input, shard output (optionally gather).
 // Row parallel: consume sharded input, sum partial outputs, add bias once.

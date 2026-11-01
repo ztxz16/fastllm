@@ -198,6 +198,9 @@ std::vector<Tensor> qwenVision(Runtime &, Weights &, int width, int height, cons
 
 struct BlockResult { Tensor image, text, key, value; };
 struct DiTCache { std::vector<Tensor> key, value; };
+struct ParallelContext;
+struct ParallelOptions;
+class ParallelPixelDecoder;
 
 class DiT {
 public:
@@ -240,6 +243,8 @@ private:
 class PixelDecoder {
 public:
     PixelDecoder(Runtime &runtime, const std::string &checkpoint);
+    PixelDecoder(Runtime &, const std::string &, const ParallelContext &);
+    ~PixelDecoder();
     Tensor block(int layer, const Tensor &x, int frames, int height, int width, int tile = 8);
     // latent is [T*H*W,32]; noise and output are patchified [T*2H*2W,3072].
     Tensor forward(const Tensor &latent, const Tensor &noise, int frames, int height, int width);
@@ -247,6 +252,7 @@ public:
 private:
     Runtime &rt_;
     Weights weights_;
+    std::unique_ptr<ParallelContext> parallel_;
 };
 
 class QwenTextEncoder {
@@ -295,6 +301,8 @@ std::vector<float> cameraTrajectory(int frames, int action);
 class Pipeline {
 public:
     Pipeline(const std::string &modelDirectory, const std::string &textDirectory, int device);
+    Pipeline(const std::string &, const std::string &, const ParallelOptions &);
+    ~Pipeline();
     std::vector<uint8_t> generate(const std::string &prompt, int width, int height,
                                   int frames, uint64_t seed, int steps,
                                   Progress progress = nullptr, void *user = nullptr);
@@ -308,12 +316,14 @@ public:
                                    const std::string *prompt = nullptr);
 private:
     Tensor encodeWorldPrompt(const std::string &prompt);
+    void unloadModels();
     Runtime rt_;
     QwenTokenizer tokenizer_;
     QwenTextEncoder text_;
     DiT dit_;
     PixelDecoder decoder_;
     Tensor cameraContinuationFeatures_;
+    std::unique_ptr<ParallelPixelDecoder> parallel_;
 };
 
 }} // namespace fastllm::nomas
@@ -345,6 +355,9 @@ int fastllm_nomas_tokenize(void *handle, const char *text, int videoTemplate,
                          int *tokens, int capacity, int *crop);
 int fastllm_nomas_encode(void *handle, const int *tokens, int count, float *features);
 void *fastllm_nomas_pipeline_create(const char *modelDirectory, const char *textDirectory, int device);
+// Tensor-parallel PixelUMM; DiT and recurrent world state stay on the first device.
+void *fastllm_nomas_pipeline_create_parallel(const char *modelDirectory, const char *textDirectory,
+                                            const char *devices);
 void fastllm_nomas_pipeline_destroy(void *handle);
 int fastllm_nomas_generate(void *handle, const char *prompt, int width, int height,
                           int frames, uint64_t seed, int steps, uint8_t *rgb,

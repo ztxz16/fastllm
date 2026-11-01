@@ -1,4 +1,5 @@
 #include "models/hy_nomas/runtime.h"
+#include "models/hy_nomas/parallel_decoder.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -33,6 +34,16 @@ Pipeline::Pipeline(const std::string &model,const std::string &text,int device):
     rt_(device),tokenizer_(text),text_(rt_,text),
     dit_(rt_,model+"/DiT/distilled/diffusion_pytorch_model_ema_0_995.safetensors"),
     decoder_(rt_,model+"/VAE/PixelUMM_FT/diffusion_pytorch_model.safetensors") {}
+Pipeline::Pipeline(const std::string &model,const std::string &text,const ParallelOptions &options)
+    :Pipeline(model,text,options.devices.empty()?throw std::invalid_argument("empty parallel devices"):options.devices[0]) {
+    if(options.devices.size()>1)
+        parallel_=std::make_unique<ParallelPixelDecoder>(model,options,rt_.dtype());
+}
+Pipeline::~Pipeline()=default;
+void Pipeline::unloadModels() {
+    dit_.unload(); decoder_.unload();
+    if(parallel_) parallel_->unload();
+}
 
 std::vector<uint8_t> Pipeline::generate(const std::string &prompt,int width,int height,int frames,
                                        uint64_t seed,int steps,Progress progress,void *user) {
@@ -48,7 +59,7 @@ std::vector<uint8_t> Pipeline::generate(const std::string &prompt,int width,int 
     try {
         // World sessions keep both networks resident between actions. Release
         // those weights before encoding an independent video prompt as well.
-        dit_.unload(); decoder_.unload();
+        unloadModels();
         update(1,0,1);
         int crop=0; auto ids=tokenizer_.videoPrompt(prompt,crop);
         auto features=text_.encode(ids).rowSlice(crop,int(ids.size())-crop);
@@ -69,16 +80,17 @@ std::vector<uint8_t> Pipeline::generate(const std::string &prompt,int width,int 
             for(size_t i=0;i<latent.size();++i) latent[i]+=velocity[i]*dt;
             trace("latent_"+std::to_string(step+1),latent);
         }
-        dit_.unload(); update(2,steps,steps); update(3,0,1);
+        unloadModels(); update(2,steps,steps); update(3,0,1);
         auto noise=rt_.pixelNoise(seed,0,t,height,width);
         trace("pixel_noise",noise);
-        auto pixels=decoder_.forward(rt_.upload(latent.data(),n,32),noise,t,h,w);
+        auto input=rt_.upload(latent.data(),n,32);
+        auto pixels=parallel_?parallel_->decode(input,noise,t,h,w):decoder_.forward(input,noise,t,h,w);
         trace("pixels",pixels);
         auto rgb=rt_.downloadPixelRGB(pixels,width,height,0,frames);
-        decoder_.unload(); update(3,1,1);
+        unloadModels(); update(3,1,1);
         update(4,1,1); return rgb;
     } catch(...) {
-        text_.unload(); dit_.unload(); decoder_.unload(); throw;
+        text_.unload(); unloadModels(); throw;
     }
 }
 
@@ -154,7 +166,7 @@ Tensor Pipeline::encodeWorldPrompt(const std::string &prompt) {
     int crop=0; auto ids=tokenizer_.videoPrompt(prompt,crop);
     // Reuse the native encoder. Keep world KV/decoder history while switching
     // resident weights so that a live edit fits the same GPU memory budget.
-    dit_.unload(); decoder_.unload();
+    unloadModels();
     try {
         auto features=text_.encode(ids).rowSlice(crop,int(ids.size())-crop);
         // Encode the official camera-minimal continuation while Qwen is already
@@ -243,7 +255,8 @@ std::vector<uint8_t> Pipeline::stepWorld(WorldState &world,int action,Progress p
     auto noise=rt_.pixelNoise(world.seed,begin,decodeT,world.height,world.width);
     trace("decoder_latents",context);
     trace("pixel_noise",noise);
-    auto pixels=decoder_.forward(rt_.upload(context.data(),decodeT*h*w,32),noise,decodeT,h,w);
+    auto input=rt_.upload(context.data(),decodeT*h*w,32);
+    auto pixels=parallel_?parallel_->decode(input,noise,decodeT,h,w):decoder_.forward(input,noise,decodeT,h,w);
     trace("pixels",pixels);
     auto rgb=rt_.downloadPixelRGB(pixels,world.width,world.height,previous*4,20);
     next.decoderLatents=std::move(latent); next.frameOffset+=t;

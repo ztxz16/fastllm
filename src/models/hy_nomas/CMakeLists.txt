@@ -48,7 +48,7 @@ if(UNIT_TEST)
 endif()
 
 if(BUILD_HY_NOMAS)
-    add_library(fastllm_nomas SHARED bindings.cpp model.cpp pipeline.cpp noise.cu)
+    add_library(fastllm_nomas SHARED bindings.cpp model.cpp pipeline.cpp parallel_decoder.cpp noise.cu)
     target_link_libraries(fastllm_nomas PRIVATE fastllm_continuous)
     target_compile_options(fastllm_nomas PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>
@@ -59,4 +59,10 @@ if(BUILD_HY_NOMAS)
     set_target_properties(fastllm_nomas PROPERTIES CUDA_STANDARD 17 CXX_STANDARD 17
         CUDA_ARCHITECTURES "${FASTLLM_CUDA_ARCHITECTURES}"
         LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+    if(UNIT_TEST)
+        add_executable(nomas_world_parallel EXCLUDE_FROM_ALL ${PROJECT_SOURCE_DIR}/test/hy_nomas/test_world_parallel.cpp)
+        target_link_libraries(nomas_world_parallel PRIVATE fastllm_nomas)
+        target_include_directories(nomas_world_parallel PRIVATE ${PROJECT_SOURCE_DIR}/include)
+        set_target_properties(nomas_world_parallel PROPERTIES CXX_STANDARD 17)
+    endif()
 endif()

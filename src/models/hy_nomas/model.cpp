@@ -1,4 +1,5 @@
 #include "models/hy_nomas/runtime.h"
+#include "models/hy_nomas/parallel.h"
 #include <cmath>
 #include <stdexcept>
 
@@ -146,7 +147,19 @@ Tensor DiT::projectCamera(int layer,const Tensor &camera,int spatial) {
     return weights_.linear(rt_.repeatRows(value,spatial),p+"proj_keyboard");
 }
 
-PixelDecoder::PixelDecoder(Runtime &rt,const std::string &path):rt_(rt),weights_(rt,path) {}
+PixelDecoder::PixelDecoder(Runtime &rt,const std::string &path):PixelDecoder(rt,path,ParallelContext{}) {}
+PixelDecoder::PixelDecoder(Runtime &rt,const std::string &path,const ParallelContext &parallel)
+    :rt_(rt),weights_(rt,path),parallel_(new ParallelContext(parallel)) {
+    if(8%parallel.size() || 12288%parallel.size())
+        throw std::invalid_argument("PixelUMM KV heads and FFN width must divide TP size");
+    for(int layer=0;layer<36;++layer) {
+        auto p="decoder.layers."+std::to_string(layer)+".";
+        for(auto name:{"attn.q_proj","attn.k_proj","attn.v_proj","mlp.gate_proj","mlp.up_proj"})
+            parallel.columnWeights(weights_,p+name);
+        for(auto name:{"attn.o_proj","mlp.down_proj"}) parallel.rowWeights(weights_,p+name);
+    }
+}
+PixelDecoder::~PixelDecoder()=default;
 Tensor PixelDecoder::block(int layer,const Tensor &input,int t,int h,int w,int tile) {
     if(layer<0 || layer>=36 || input.rows!=tokenCount(t,h,w) || input.cols!=4096 || tile<0)
         throw std::invalid_argument("invalid PixelUMM block input");
@@ -155,11 +168,11 @@ Tensor PixelDecoder::block(int layer,const Tensor &input,int t,int h,int w,int t
     auto q=weights_.linear(norm,p+"attn.q_proj"),k=weights_.linear(norm,p+"attn.k_proj"),v=weights_.linear(norm,p+"attn.v_proj");
     q=rt_.pixelQKRope(q,weights_.get(p+"attn.q_norm_t.weight"),weights_.get(p+"attn.q_norm_hw.weight"),t,h,w);
     k=rt_.pixelQKRope(k,weights_.get(p+"attn.k_norm_t.weight"),weights_.get(p+"attn.k_norm_hw.weight"),t,h,w);
-    auto a=rt_.attention(q,k,v,32,nullptr,128,8,false,tile,h,w);
-    auto x=rt_.add(input,weights_.linear(a,p+"attn.o_proj"));
+    auto a=rt_.attention(q,k,v,32/parallel_->size(),nullptr,128,8/parallel_->size(),false,tile,h,w);
+    auto x=rt_.add(input,parallel_->row(rt_,weights_,a,p+"attn.o_proj"));
     norm=rt_.norm(x,true,&weights_.get(p+"post_attn_norm.weight"));
     auto gate=weights_.linear(norm,p+"mlp.gate_proj");
-    auto mlp=weights_.linear(rt_.siluMultiply(gate,weights_.linear(norm,p+"mlp.up_proj")),p+"mlp.down_proj");
+    auto mlp=parallel_->row(rt_,weights_,rt_.siluMultiply(gate,weights_.linear(norm,p+"mlp.up_proj")),p+"mlp.down_proj");
     return rt_.add(x,mlp);
 }
 Tensor PixelDecoder::forward(const Tensor &latent,const Tensor &noise,int t,int h,int w) {
