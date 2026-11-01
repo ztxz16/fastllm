@@ -1,9 +1,10 @@
 // Generate weights.bin with prepareGgufMmqFixtures.py. Build with the same
 // include paths and libfastllm_tools as cudaGgufFastPathRegression.cu.
 // Run input rows 9, 16, 32, 33, 65, 129 and 1024; 16 includes model widths.
-// Small-row MMVQ is covered separately by cudaGgufFastPathRegression.cu.
+// On SM75+, rows 1..8 exercise Q5_K dispatch, MMVQ accuracy and graph replay.
 #include "fastllm-gguf-dequant.cuh"
 #include "fastllm-cuda-gguf-projections.h"
+#include "devices/cuda/fastllm-cuda-graph-workspace.h"
 
 #include <algorithm>
 #include <cmath>
@@ -103,6 +104,8 @@ void CheckUnsupportedShapes() {
     }
 }
 
+#include "cudaGgufSmallQ5Regression.inc"
+
 } // namespace
 
 int main(int argc, char **argv) try {
@@ -110,11 +113,12 @@ int main(int argc, char **argv) try {
         throw std::runtime_error("Usage: test-mmq weights.bin [input-rows=16]");
     }
     const int tokens = argc == 3 ? std::stoi(argv[2]) : 16;
-    if (tokens < 9 || tokens > 1024) {
-        throw std::runtime_error("MMQ input rows must be in [9, 1024]");
+    if (tokens < 1 || tokens > 1024) {
+        throw std::runtime_error("MMQ input rows must be in [1, 1024]");
     }
     FastllmCudaSetDevice(0);
     CheckUnsupportedShapes();
+    if (tokens < 9) return CheckSmallQ5(argv[1], tokens);
 
     std::ifstream file(argv[1], std::ios::binary);
     file.exceptions(std::ios::failbit | std::ios::badbit);

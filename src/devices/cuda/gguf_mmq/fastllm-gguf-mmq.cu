@@ -185,7 +185,7 @@ static bool gate_up_mmvq(
     return true;
 }
 
-template <mmq_q8_1_ds_layout layout, typename InputType>
+template <mmq_q8_1_ds_layout layout, typename InputType, bool QuantizedSum = false>
 static __global__ void quantize_mmq_q8_1(
         const InputType *__restrict__ input, void *__restrict__ quantized,
         int64_t cols, int64_t rows, int64_t padded_cols) {
@@ -230,7 +230,7 @@ static __global__ void quantize_mmq_q8_1(
     }
 
     float sum = 0.0f;
-    if constexpr (layout != MMQ_Q8_1_DS_LAYOUT_D4) {
+    if constexpr (layout != MMQ_Q8_1_DS_LAYOUT_D4 && !QuantizedSum) {
         sum = values.x + values.y + values.z + values.w;
 #pragma unroll
         for (int mask = values_per_sum / 8; mask > 0; mask >>= 1) {
@@ -246,6 +246,15 @@ static __global__ void quantize_mmq_q8_1(
     quants.z = static_cast<int8_t>(roundf(values.z * inverse_scale));
     quants.w = static_cast<int8_t>(roundf(values.w * inverse_scale));
     reinterpret_cast<char4 *>(output[block].qs)[quant_index / 4] = quants;
+    if constexpr (QuantizedSum) {
+        // Q5_K MMVQ applies the minimum term to quantized activations. Match
+        // that arithmetic instead of using the unquantized activation sum.
+        int isum = int(quants.x) + int(quants.y) + int(quants.z) + int(quants.w);
+        #pragma unroll
+        for (int mask = 4; mask > 0; mask >>= 1)
+            isum += __shfl_xor_sync(0xffffffff, isum, mask, WARP_SIZE);
+        sum = __half2float(__float2half(scale)) * float(isum);
+    }
 
     if constexpr (layout == MMQ_Q8_1_DS_LAYOUT_D2S6) {
         if (quant_index % 16 != 0 || quant_index >= 96) {
@@ -289,7 +298,8 @@ template <typename InputType>
 static void launch_quantize(
         ggml_type type, const InputType *input,
         block_q8_1_mmq *quantized,
-        int rows, int cols, int padded_cols, cudaStream_t stream) {
+        int rows, int cols, int padded_cols, cudaStream_t stream,
+        bool q5MmvqSum = false) {
     const dim3 blocks((padded_cols + 4 * kQuantizeBlockSize - 1) /
                           (4 * kQuantizeBlockSize),
                       rows, 1);
@@ -301,6 +311,12 @@ static void launch_quantize(
                     input, quantized, cols, rows, padded_cols);
             break;
         case MMQ_Q8_1_DS_LAYOUT_DS4:
+            if (q5MmvqSum) {
+                quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4, InputType, true>
+                    <<<blocks, threads, 0, stream>>>(
+                        input, quantized, cols, rows, padded_cols);
+                break;
+            }
             quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4, InputType>
                 <<<blocks, threads, 0, stream>>>(
                     input, quantized, cols, rows, padded_cols);
@@ -424,8 +440,15 @@ static bool matmul(
 
     const int device = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[device].cc;
-    const int min_rows = cc >= 1200 ?
-        kBlackwellMinMmqRows : kDefaultMinMmqRows;
+    // Small BF16 Q5_K projections use the architecture's INT8 MMA backend.
+    // Keep narrow/grouped projections and other formats on the existing
+    // policy; the 4-row gate/up shape has no measured benefit.
+    const bool smallQ5 = std::is_same_v<InputType, __nv_bfloat16> &&
+        std::is_same_v<OutputType, __nv_bfloat16> && int8_mma_available(cc) &&
+        type == GGML_TYPE_Q5_K && rows >= 4 && rows <= 8 && cols >= 1280 &&
+        output_cols >= (rows == 4 ? 5120 : 4096);
+    const int min_rows = smallQ5 ? 4 : (cc >= 1200 ?
+        kBlackwellMinMmqRows : kDefaultMinMmqRows);
     if (rows < min_rows || !int8_mma_available(cc)) {
         return false;
     }
@@ -482,7 +505,7 @@ static bool matmul(
     for (int offset = 0; offset < rows;) {
         const int count = std::min(chunk_rows, rows - offset);
         launch_quantize(type, input + static_cast<size_t>(offset) * cols,
-                        quantized, count, cols, padded_cols, stream);
+                        quantized, count, cols, padded_cols, stream, smallQ5);
         // Small final chunks are valid MMQ inputs too: min_rows is only the
         // admission policy for the complete operation, not a kernel limit.
         args.ne11 = count;
