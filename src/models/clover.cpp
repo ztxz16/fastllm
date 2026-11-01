@@ -66,7 +66,8 @@ struct CloverModel::MoeGraphs {
 #ifdef USE_CUDA
     // Bound retained graph workspaces; larger request batches keep the eager
     // fallback. This is a graph memory policy, not a request admission limit.
-    static constexpr int MaxBatch = 32;
+    static constexpr int MaxBatch = 64;
+    static constexpr size_t MaxWorkspaceBytes = 32ULL << 30;
     struct Entry {
         Data input, output;
         void *graph = nullptr, *executable = nullptr;
@@ -79,6 +80,7 @@ struct CloverModel::MoeGraphs {
         }
     };
     int device, rows = 0, batch = 1;
+    size_t workspaceBytes = 0;
     bool enabled;
     std::map<std::pair<int, bool>, std::unique_ptr<Entry>> entries;
     explicit MoeGraphs(int device) : device(device) {
@@ -101,6 +103,7 @@ struct CloverModel::MoeGraphs {
         if (rows == value && batch == batchValue) return;
         Check(cudaStreamSynchronize(cudaStreamPerThread) == cudaSuccess, "MoE graph reset sync failed");
         entries.clear();
+        workspaceBytes = 0;
         rows = value;
         batch = batchValue;
     }
@@ -611,6 +614,26 @@ void CloverModel::Moe(Data &input, int layer, bool preview, Data &output, bool g
         // and the following TP reduction remain concurrent across ranks.
         static std::mutex captureMutex;
         std::lock_guard<std::mutex> captureLock(captureMutex);
+        // Reserve conservatively for all pinned intermediates, allocator
+        // rounding and library scratch. Graphs are optional: keep the normal
+        // execution path when retaining another entry would crowd out KV or
+        // the next eager operation. This budget matches workspace_reserve.
+        const size_t packed = FastllmCudaMoe16PackedBytes(t, embed_dim, intermediate,
+            num_experts, num_experts_per_tok, dataType == FLOAT16);
+        const size_t workspace = FastllmCudaMoe16WorkspaceBytes(t, embed_dim, intermediate,
+            num_experts, num_experts_per_tok, dataType == FLOAT16);
+        const size_t estimate = (64ULL << 20) + 2 * (packed + workspace + size_t(t) *
+            (16ULL * (embed_dim + intermediate) + 4ULL * num_experts +
+             32ULL * num_experts_per_tok + 2ULL * num_experts_per_tok * (embed_dim + intermediate)));
+        size_t freeBytes = 0, totalBytes = 0;
+        if (estimate > MoeGraphs::MaxWorkspaceBytes - moeGraphs->workspaceBytes ||
+            cudaMemGetInfo(&freeBytes, &totalBytes) != cudaSuccess ||
+            freeBytes < 2 * estimate + (1ULL << 30)) {
+            entry = std::make_unique<MoeGraphs::Entry>();
+            entry->disabled = true;
+            eager(input, output);
+            return;
+        }
         auto candidate = std::make_unique<MoeGraphs::Entry>();
         bool poolActive = false, captureActive = false, ready = false, poolBusy = false;
         try {
@@ -652,6 +675,7 @@ void CloverModel::Moe(Data &input, int layer, bool preview, Data &output, bool g
                 candidate->disabled = true;
             }
         }
+        if (ready) moeGraphs->workspaceBytes += estimate;
         entry = std::move(candidate);
     }
     if (!entry || entry->disabled) { eager(input, output); return; }

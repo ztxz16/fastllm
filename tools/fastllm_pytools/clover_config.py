@@ -6,8 +6,8 @@ import re
 
 
 def workspace_reserve(config, batch, width):
-    """Small batches retain MoE graphs; larger batches reuse eager scratch."""
-    graph_batch = min(batch, 32)  # CloverModel::MoeGraphs::MaxBatch
+    """Bound graph retention, plus eager scratch for larger batches."""
+    graph_batch = min(batch, 32)  # MoE graphs retain at most a 32 GiB estimated workspace budget.
     extra_rows = (batch - graph_batch) * width
     # Two FP32 logits sets and the 16-bit head output may overlap. Include
     # projections, routing and expert scratch; prefill runs one request at a time.

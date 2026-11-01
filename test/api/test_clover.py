@@ -124,8 +124,8 @@ class CloverAutoTest(unittest.TestCase):
         short = self.resolve(self.args("--max_batch", "32", "--max_context_length", "4096",
                                        "--gpu_mem_ratio", "0.98"))
         self.assertLess(short["estimated_gpu_bytes"], 140 << 30)
-        # Larger runs can drain through a 32-request MoE graph batch. Account
-        # for those retained allocations even while their peak batch is eager.
+        # Larger batches retain a bounded MoE graph workspace budget as well
+        # as their full per-request caches and eager/logits scratch.
         with self.assertRaisesRegex(ValueError, "one CUDA"):
             self.resolve(self.args("--max_batch", "50", "--max_context_length", "4096",
                                    "--gpu_mem_ratio", "0.98"))
