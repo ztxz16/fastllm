@@ -425,6 +425,14 @@ int main() {
                 shape.second, 1024, 2, 16, true, 2));
             chunkCases += 16;
         }
+        // Ordinary reuse covers multiple sequences, odd index strides and
+        // the temporary-storage cutoff, always against the same FP64 oracle.
+        for (int width : {127, 128, 129, 513, 1023})
+            for (auto shape : {std::pair<int,int>{33,3}, {64,7}, {127,17}, {64,32}}) {
+                chunkWorst = std::max(chunkWorst, RunCase(first, second, rng,
+                    shape.first, shape.second * 2, width, 2, 8, true, 2));
+                chunkCases += 8;
+            }
         std::printf("FLASHINFER_CHUNK_PASS %d cases (3 graph replays each), worst relative L2 %.9g\n",
                     chunkCases, chunkWorst);
         std::printf("FLASHINFER_PASS %d graph cases, 26 dispatch guards, environment policy, worst relative L2 %.9g\n", cases,
