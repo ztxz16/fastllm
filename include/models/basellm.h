@@ -382,6 +382,12 @@ namespace fastllm {
                                          const GenerationConfig &generationConfig = GenerationConfig(),
                                          const std::map <std::string, std::vector <Data*> > &multimodalInput = {}); // 启动一个response任务，返回分配的handleId
         
+        // A speculative forward may have already verified more than one token.
+        // Publish these through the normal per-token stop/grammar/history path
+        // before the next scheduling turn. Ordinary models have no pending block.
+        virtual bool PopPendingResponseToken(ResponseContext *context, int previousToken,
+                                              int &token) { return false; }
+
         virtual bool CanFetchResponse(int handleId); // 判断当前是否能fetch到，用于异步操作
 
         virtual int FetchResponseTokens(int handleId); // 获取指定handle的输出, -1代表输出结束了 

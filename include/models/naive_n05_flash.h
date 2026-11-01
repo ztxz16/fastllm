@@ -45,6 +45,8 @@ namespace fastllm {
                               const GenerationConfig &config, const Data *embedding = nullptr,
                               TargetCapture *capture = nullptr, float *candidateResult = nullptr,
                               const LogitsSelection *selection = nullptr, const TargetBatch *batch = nullptr);
+        bool PopPendingResponseToken(ResponseContext *context, int previousToken,
+                                     int &token) override;
         bool NeedAttentionMask(int, int) override { return false; }
         bool SupportsPrefillBatching() const override;
         // Bound idle TP prefill workspace with the shared pressure-aware pool.

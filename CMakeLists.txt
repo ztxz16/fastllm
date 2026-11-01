@@ -1365,6 +1365,11 @@ if (UNIT_TEST)
     fastllm_add_checked_test(prefill_batch_scheduler prefill_batch_scheduler_test "ALL_PASS" 30)
     set_tests_properties(prefill_batch_scheduler PROPERTIES RUN_SERIAL TRUE)
 
+    add_executable(pending_response_tokens_test test/basic/test_pending_response_tokens.cpp)
+    target_link_libraries(pending_response_tokens_test PRIVATE fastllm)
+    fastllm_add_checked_test(pending_response_tokens pending_response_tokens_test "ALL_PASS" 60)
+    set_tests_properties(pending_response_tokens PROPERTIES RUN_SERIAL TRUE)
+
     add_executable(legacy_scheduler_history_test test/basic/test_legacy_scheduler_history.cpp)
     target_link_libraries(legacy_scheduler_history_test PRIVATE fastllm)
     fastllm_add_checked_test(legacy_scheduler_history legacy_scheduler_history_test "ALL_PASS" 60)

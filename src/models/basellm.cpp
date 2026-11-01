@@ -2824,45 +2824,45 @@ namespace fastllm {
                 for (int i = 0; i < handles.size(); i++) {
                     ResponseContext *ctx = tokenContexts[i];
                     int curRet = ret[i];
-                    if (curRet == model->eos_token_id || model->eos_token_ids.find(curRet) != model->eos_token_ids.end()) {
-                        ctx->isEnding = true;
-                        ctx->TryRecordPagedCache(model);
-                        // printf("[Handle %d] Finished. Reason: eos token (token_id=%d), total tokens: %d.\n", handles[i], curRet, it.second->curTokens);
-                    } else {
-                        auto itStopTk = ctx->generationConfig.stop_token_ids.find(curRet);
-                        if (itStopTk != ctx->generationConfig.stop_token_ids.end()) {
+                    do {
+                        if (curRet == model->eos_token_id || model->eos_token_ids.find(curRet) != model->eos_token_ids.end()) {
                             ctx->isEnding = true;
                             ctx->TryRecordPagedCache(model);
-                            // printf("[Handle %d] Finished. Reason: stop token (token_id=%d), total tokens: %d.\n", handles[i], curRet, it.second->curTokens);
-                        }
-                    }
-                    if (ctx->isEnding == false) {
-                        model->UpdateToolCallConstraintState(ctx, curRet);
-                        if (ctx->currentTokens.size() == 1) {
-                            ctx->currentTokens[0] = curRet;
                         } else {
-                            ctx->currentTokens.assign(1, curRet);
+                            auto itStopTk = ctx->generationConfig.stop_token_ids.find(curRet);
+                            if (itStopTk != ctx->generationConfig.stop_token_ids.end()) {
+                                ctx->isEnding = true;
+                                ctx->TryRecordPagedCache(model);
+                            }
                         }
-                        ctx->resultTokenQueue.push(curRet);
-                        QueueGeneratedResultLogits(ctx, logits, i);
-                        ctx->allTokens.push_back(curRet);
-                        if (NeedRepeatPenalty(ctx->generationConfig)) {
-                            ctx->tokens.Push(curRet);
+                        if (ctx->isEnding == false) {
+                            model->UpdateToolCallConstraintState(ctx, curRet);
+                            if (ctx->currentTokens.size() == 1) {
+                                ctx->currentTokens[0] = curRet;
+                            } else {
+                                ctx->currentTokens.assign(1, curRet);
+                            }
+                            ctx->resultTokenQueue.push(curRet);
+                            QueueGeneratedResultLogits(ctx, logits, i);
+                            ctx->allTokens.push_back(curRet);
+                            if (NeedRepeatPenalty(ctx->generationConfig)) {
+                                ctx->tokens.Push(curRet);
+                            }
+                            ctx->curTokens++;
+                            if (ctx->curTokens == ctx->generationConfig.output_token_limit) {
+                                ctx->isEnding = true;
+                                ctx->TryRecordPagedCache(model);
+                            } else if ((maxTotalLens > 0 && (int)ctx->allTokens.size() >= maxTotalLens) ||
+                                       ctx->allTokens.size() >= model->max_positions) {
+                                ctx->isEnding = true;
+                                ctx->TryRecordPagedCache(model);
+                            }
                         }
-                        ctx->curTokens++;
-                        if (ctx->curTokens == ctx->generationConfig.output_token_limit) {
-                            ctx->isEnding = true;
-                            ctx->TryRecordPagedCache(model);
-                            // printf("[Handle %d] Finished. Reason: output token limit reached (curTokens=%d, limit=%d).\n",
-                                   // handles[i], it.second->curTokens, it.second->generationConfig.output_token_limit);
-                        } else if ((maxTotalLens > 0 && (int)ctx->allTokens.size() >= maxTotalLens) ||
-                                   ctx->allTokens.size() >= model->max_positions) {
-                            ctx->isEnding = true;
-                            ctx->TryRecordPagedCache(model);
-                            // printf("[Handle %d] Finished. Reason: max positions reached (allTokens=%d, max_positions=%d).\n",
-                                   //handles[i], (int)it.second->allTokens.size(), model->max_positions);
-                        }
-                    }
+                        if (ctx->isEnding || !model->PopPendingResponseToken(ctx, curRet, curRet)) break;
+                        ++ctx->intParams["index"];
+                        ++ctx->preTokens;
+                        if (model->verbose) ++genTokens;
+                    } while (true);
                 }
                 model->dictCV.notify_all();
                 ReleasePendingResultLogits(logits);
@@ -3672,35 +3672,41 @@ namespace fastllm {
                             for (int i = 0; i < handles.size(); i++) {
                                 auto &it = *model->responseContextDict.dicts.find(handles[i]);
                                 int curRet = ret[i];
-                                if (curRet == model->eos_token_id || model->eos_token_ids.find(curRet) != model->eos_token_ids.end()) {
-                                    it.second->isEnding = true;
-                                    it.second->TryRecord(model);
-                                } else {
-                                    auto itStopTk = it.second->generationConfig.stop_token_ids.find(curRet);
-                                    if (itStopTk != it.second->generationConfig.stop_token_ids.end()) {
+                                do {
+                                    if (curRet == model->eos_token_id || model->eos_token_ids.find(curRet) != model->eos_token_ids.end()) {
                                         it.second->isEnding = true;
                                         it.second->TryRecord(model);
+                                    } else {
+                                        auto itStopTk = it.second->generationConfig.stop_token_ids.find(curRet);
+                                        if (itStopTk != it.second->generationConfig.stop_token_ids.end()) {
+                                            it.second->isEnding = true;
+                                            it.second->TryRecord(model);
+                                        }
                                     }
-                                }
-                                if (it.second->isEnding == false) {
-                                    model->UpdateToolCallConstraintState(it.second, curRet);
-                                    if (it.second->curTokens > 0 && it.second->currentTokens.size() == 1)
-                                        it.second->currentTokens[0] = curRet;
-                                    else
-                                        // Release a potentially large prompt buffer once.
-                                        it.second->currentTokens = std::vector<int>{curRet};
-                                    it.second->resultTokenQueue.push(curRet);
-                                    QueueGeneratedResultLogits(it.second, logits, i);
-                                    it.second->allTokens.push_back(curRet);
-                                    it.second->tokens.Push(curRet);
-                                    it.second->curTokens++;
-                                    if (it.second->curTokens == it.second->generationConfig.output_token_limit
-                                        || (maxTotalLens > 0 && it.second->allTokens.size() >= maxTotalLens)
-                                        || it.second->allTokens.size() >= model->max_positions) {
-                                        it.second->isEnding = true;
-                                        it.second->TryRecord(model);
+                                    if (it.second->isEnding == false) {
+                                        model->UpdateToolCallConstraintState(it.second, curRet);
+                                        if (it.second->curTokens > 0 && it.second->currentTokens.size() == 1)
+                                            it.second->currentTokens[0] = curRet;
+                                        else
+                                            // Release a potentially large prompt buffer once.
+                                            it.second->currentTokens = std::vector<int>{curRet};
+                                        it.second->resultTokenQueue.push(curRet);
+                                        QueueGeneratedResultLogits(it.second, logits, i);
+                                        it.second->allTokens.push_back(curRet);
+                                        it.second->tokens.Push(curRet);
+                                        it.second->curTokens++;
+                                        if (it.second->curTokens == it.second->generationConfig.output_token_limit
+                                            || (maxTotalLens > 0 && it.second->allTokens.size() >= maxTotalLens)
+                                            || it.second->allTokens.size() >= model->max_positions) {
+                                            it.second->isEnding = true;
+                                            it.second->TryRecord(model);
+                                        }
                                     }
-                                }
+                                    if (it.second->isEnding || !model->PopPendingResponseToken(it.second, curRet, curRet)) break;
+                                    ++it.second->intParams["index"];
+                                    ++it.second->preTokens;
+                                    if (model->verbose) ++genTokens;
+                                } while (true);
                             }
                             model->dictCV.notify_all();
                             ReleasePendingResultLogits(logits);

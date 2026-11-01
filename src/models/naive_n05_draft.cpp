@@ -2168,6 +2168,20 @@ std::vector<int> NaiveN05FlashModel::ForwardDraftBatch(int batch, const Data &in
     return result;
 }
 
+bool NaiveN05FlashModel::PopPendingResponseToken(ResponseContext *response,
+        int previousToken, int &token) {
+    if (!draftEnabled || !response || response->generationConfig.output_logits) return false;
+    std::lock_guard<std::mutex> guard(historyMutex);
+    auto it = draftContexts.find(&response->pastKeyValues);
+    if (it == draftContexts.end() || !it->second || it->second->pending.empty()) return false;
+    auto &pending = it->second->pending;
+    AssertInFastLLM(pending.front().first == previousToken,
+                   "DSpark published token chain is out of sync.");
+    token = pending.front().second;
+    pending.pop_front();
+    return true;
+}
+
 int NaiveN05FlashModel::ForwardDraft(
         const Data &inputIds, const Data &positions, std::vector<std::pair<Data, Data>> &kv,
         const GenerationConfig &config, const LastTokensManager &lastTokens,
