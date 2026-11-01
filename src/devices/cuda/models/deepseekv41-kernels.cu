@@ -1533,7 +1533,7 @@ namespace {
         }
         const float a = V41Load<T>(base, 0), b = V41Load<T>(base, 1);
         V41Store<T>(base, 0, a * c - b * s);
-        V41Store<T>(base, 1, a * s + b * c);
+        V41Store<T>(base, 1, __fmaf_rn(b, c, __fmul_rn(a, s)));
     }
 
     // quantMode > 0：一个线程一个元素，旋转对通过相邻 lane 的 __shfl_xor 交换，
@@ -1605,7 +1605,7 @@ namespace {
             const float c = cosf(ang), s = sinf(ang);
             const float a = V41Load<__nv_bfloat16>(base, 0), b = V41Load<__nv_bfloat16>(base, 1);
             V41Store<__nv_bfloat16>(base, 0, a * c - b * s);
-            V41Store<__nv_bfloat16>(base, 1, a * s + b * c);
+            V41Store<__nv_bfloat16>(base, 1, __fmaf_rn(b, c, __fmul_rn(a, s)));
         } else if (block < qBlocks + tokens) {
             const int row = block - qBlocks, d = threadIdx.x;
             auto *base = kv + (size_t)row * dim;
@@ -1653,11 +1653,10 @@ namespace {
             const float angle = (float)item.position * rope.invFreq[k >> 1];
             float c = cosf(angle), s = sinf(angle);
             if (item.inverse) s = -s;
-            // The RoPE-only reference evaluates the odd component with
-            // sine fused into the first product. Keep that FMA ordering:
-            // swapping the fused product can cross a BF16 rounding boundary.
+            // Match RoPE-only and draft Q: round the sine product before
+            // fusing the cosine product. Reversing them can cross a BF16 tie.
             if (item.mode == 0 && (k & 1))
-                v = __fmaf_rn(other, s, __fmul_rn(v, c));
+                v = __fmaf_rn(v, c, __fmul_rn(other, s));
             else
                 v = (k & 1) ? (other * s + v * c) : (v * c - other * s);
         }

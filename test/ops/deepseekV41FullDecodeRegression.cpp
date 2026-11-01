@@ -179,6 +179,37 @@ static void RunAttentionLocalityRegression(int devices) {
     std::cout << "PASS " << checks << " attention locality checks; BF16/FP8/FP4" << std::endl;
 }
 
+// Compare the fused transform against the ordinary RoPE kernel, not another
+// call to the fused transform. Include a real BF16 midpoint cancellation.
+static void RunRotaryCrossPathRegression() {
+    int checked = 0;
+    for (int dim : {128, 512}) for (int ropeDim : {64, 128})
+        for (int mode : {0, 1, 2, 3}) for (bool inverse : {false, true})
+            for (int position : {0, 127, 4096, 32767, 1048575}) {
+                std::vector<float> values(64 * dim);
+                for (size_t i = 0; i < values.size(); ++i)
+                    values[i] = std::sin(float(i * 13 % 1009)) * 3.f;
+                const int offset = 32 * dim + dim - ropeDim + 44;
+                values[offset] = -2.515625f;
+                values[offset + 1] = 1.1796875f;
+                Data cpu(DataType::FLOAT32, {1, 1, 64, dim}, values);
+                ToDataType(cpu, DataType::BFLOAT16);
+                Data ordinary, fused;
+                ordinary.CopyFrom(cpu); fused.CopyFrom(cpu);
+                ordinary.ToDevice(DataDevice::CUDA, std::vector<int>{0});
+                fused.ToDevice(DataDevice::CUDA, std::vector<int>{0});
+                Check(FastllmCudaDeepSeekV41RotaryQuantPosition(ordinary, ropeDim,
+                      160000.f, position, 1, inverse, 65536, 16.f, 32, 1,
+                      mode, dim, 32, nullptr), "ordinary rotary");
+                Check(FastllmCudaV41DecodeTransformsBatch({{&fused, nullptr,
+                      position, mode, inverse}}, ropeDim, 160000.f, 65536,
+                      16.f, 32, 1, 128), "fused rotary");
+                Equal(fused, ordinary, "ordinary/fused rotary");
+                ++checked;
+            }
+    std::cout << "Rotary cross-path passed: " << checked << " cases\n";
+}
+
 int main(int argc, char **argv) {
     int devices = 0, major = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices < 1 ||
@@ -202,6 +233,7 @@ int main(int argc, char **argv) {
         FastllmCudaSetDevice(0);
         if (locality) { RunAttentionLocalityRegression(devices); return 0; }
         if (verify) { RunVerifyRegression(); return 0; }
+        RunRotaryCrossPathRegression();
         int checked = 0;
         for (int batch : {1, 2, 4, 8, 16, 128})
             for (int ratio : {0, 1, 2})

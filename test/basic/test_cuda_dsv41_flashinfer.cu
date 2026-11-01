@@ -290,6 +290,26 @@ double RunCase(Cache &first, Cache &second, std::mt19937 &rng, int heads, int ba
         }
         Check(cudaMemcpy(output.data(), gpuOutput.data, output.size() * sizeof(output[0]),
                          cudaMemcpyDeviceToHost));
+        // A one-token chunk and a one-request decode graph must use the
+        // same reduction before the model's low-precision activation boundary.
+        if (batch == 1 && !verifying && !denseBatches && !missingCompressed) {
+            const int position = requests[0].position;
+            FastllmV41FlashInferChunkConfig single{1, 1, heads, width, kCapacity, position, config.softmaxScale};
+            Buffer<uint8_t> scratch(FastllmV41FlashInferChunkWorkspace(single));
+            auto filtered = indices;
+            const int visible = ratio ? (position + 1) / ratio : 0;
+            for (int k = 0; k < width; ++k)
+                if (k >= visible || filtered[k] >= visible) filtered[k] = -1;
+            gpuIndices.Upload(filtered);
+            Check(FastllmV41FlashInferChunkRun(single, buffers, requests[0].windowKV,
+                width ? requests[0].compressedKV : nullptr, scratch.data, cudaStreamPerThread));
+            Check(cudaStreamSynchronize(cudaStreamPerThread));
+            std::vector<__nv_bfloat16> ordinary(output.size());
+            Check(cudaMemcpy(ordinary.data(), gpuOutput.data, ordinary.size() * sizeof(ordinary[0]),
+                             cudaMemcpyDeviceToHost));
+            Require(std::memcmp(ordinary.data(), output.data(), output.size() * sizeof(output[0])) == 0,
+                    "single-query graph and ordinary attention differ");
+        }
         for (int token = 0; token < batch; ++token) {
             Cache &cache = (replay + (denseBatches ? token / length : verifying ? 0 : token)) % 2 ? first : second;
             const int position = requests[token].position;

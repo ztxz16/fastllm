@@ -341,7 +341,8 @@ cudaError_t FastllmV41FlashInferRun(void *handle, const FastllmV41FullDecodeBuff
     const cudaError_t status = cudaGetLastError();
     if (status != cudaSuccess)
         return status;
-    if (p->verifying) {
+    // Keep a single-query graph on the ordinary one-token reduction order.
+    if (p->verifying || p->batch == 1) {
         MergeVerify<<<dim3(p->heads, p->batch), 128, 0, stream>>>(
             static_cast<const bf16 *>(b.q), static_cast<const bf16 *>(b.kv), p->mid, p->midLse,
             static_cast<const float *>(b.sink), static_cast<bf16 *>(b.output), p->scale, p->heads,
