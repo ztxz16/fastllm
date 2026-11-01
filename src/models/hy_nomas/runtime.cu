@@ -119,15 +119,41 @@ __device__ float sumBlock(float v, float *scratch) {
     for (int d=blockDim.x/2; d; d/=2) { if(threadIdx.x<d) scratch[threadIdx.x]+=scratch[threadIdx.x+d]; __syncthreads(); }
     return scratch[0];
 }
-template<class T, bool FusedAffine=true> __global__ void normKernel(const T *x, T *y, const T *weight, const T *bias, int width, bool rms, float eps) {
+template<class T, bool FusedAffine=true> __global__ void normKernel(const T *x, T *y, const T *weight, const T *bias, int width, bool rms, float eps, int rows) {
+    if(rms && width==128) {
+        // One warp per row, four rows per block. Keep the old block reduction's
+        // (0+64)+(32+96) tree and the cast before the affine, unlike LLM RMSNorm.
+        int row=blockIdx.x*4+threadIdx.x/32,lane=threadIdx.x%32;
+        if(row>=rows) return;
+        float value[4];
+#pragma unroll
+        for(int i=0;i<4;++i) value[i]=f(x[size_t(row)*128+lane+32*i]);
+        float sum=(value[0]*value[0]+value[2]*value[2])+(value[1]*value[1]+value[3]*value[3]);
+#pragma unroll
+        for(int d=16;d;d/=2) sum+=__shfl_down_sync(0xffffffffu,sum,d);
+        float inv=rsqrtf(__shfl_sync(0xffffffffu,sum,0)/128+eps);
+#pragma unroll
+        for(int i=0;i<4;++i) {
+            int c=lane+32*i;
+            float v=roundTo<T>(value[i]*inv);
+            if(weight) v*=f(weight[c]);
+            if(bias) v+=f(bias[c]);
+            y[size_t(row)*128+c]=cast<T>(v);
+        }
+        return;
+    }
     __shared__ float scratch[256]; __shared__ float mean, inv;
     int row=blockIdx.x; float s=0;
-    for(int c=threadIdx.x;c<width;c+=blockDim.x) s+=f(x[size_t(row)*width+c]);
-    float total=sumBlock(s,scratch);
-    if(threadIdx.x==0) mean=rms?0.f:total/width;
+    if(rms) {
+        if(threadIdx.x==0) mean=0;
+    } else {
+        for(int c=threadIdx.x;c<width;c+=blockDim.x) s+=f(x[size_t(row)*width+c]);
+        float total=sumBlock(s,scratch);
+        if(threadIdx.x==0) mean=total/width;
+    }
     __syncthreads(); s=0;
     for(int c=threadIdx.x;c<width;c+=blockDim.x) { float v=f(x[size_t(row)*width+c])-mean; s+=v*v; }
-    total=sumBlock(s,scratch);
+    float total=sumBlock(s,scratch);
     if(threadIdx.x==0) inv=rsqrtf(total/width+eps);
     __syncthreads();
     for(int c=threadIdx.x;c<width;c+=blockDim.x) {
@@ -506,10 +532,12 @@ Tensor Runtime::norm(const Tensor &x,bool rms,const Tensor *w,const Tensor *bias
     require((!w || w->dtype==x.dtype) && (!bias || bias->dtype==x.dtype),"norm dtype mismatch");
     require((!w || w->size()==size_t(width)) && (!bias || bias->size()==size_t(width)),"norm weight mismatch");
     Tensor out(x.rows,x.cols,x.dtype);
+    int rows=int(x.size()/width),threads=rms && width==128?128:256;
+    int blocks=rms && width==128?(rows+3)/4:rows;
     if(x.dtype==DType::BF16 && !numerics_.layerNormFMA) {
-        normKernel<B,false><<<x.size()/width,256,0,cudaStreamPerThread>>>(as<B>(x),as<B>(out),w?as<B>(*w):nullptr,bias?as<B>(*bias):nullptr,width,rms,eps);
+        normKernel<B,false><<<blocks,threads,0,cudaStreamPerThread>>>(as<B>(x),as<B>(out),w?as<B>(*w):nullptr,bias?as<B>(*bias):nullptr,width,rms,eps,rows);
     } else {
-        DISPATCH_TENSOR(x.dtype, T, normKernel<T><<<x.size()/width,256,0,cudaStreamPerThread>>>(as<T>(x),as<T>(out),w?as<T>(*w):nullptr,bias?as<T>(*bias):nullptr,width,rms,eps));
+        DISPATCH_TENSOR(x.dtype, T, normKernel<T><<<blocks,threads,0,cudaStreamPerThread>>>(as<T>(x),as<T>(out),w?as<T>(*w):nullptr,bias?as<T>(*bias):nullptr,width,rms,eps,rows));
     }
     check(cudaGetLastError()); return out;
 }
@@ -712,12 +740,25 @@ Tensor Runtime::textRope(const Tensor &x,float theta) {
     require(x.cols%128==0,"invalid Qwen RoPE shape"); Tensor out(x.rows,x.cols,x.dtype);
     DISPATCH_TENSOR(x.dtype, T, textRopeKernel<T><<<grid(x.size()),256,0,cudaStreamPerThread>>>(as<T>(x),as<T>(out),x.size(),x.cols,theta)); check(cudaGetLastError()); return out;
 }
-Tensor Runtime::concat(const std::vector<Tensor> &xs) {
+namespace {
+Tensor concatenate(const std::vector<Tensor> &xs,Tensor *target) {
     require(!xs.empty(),"empty concat"); int rows=0;
-    for(auto &x:xs) { require(x.cols==xs[0].cols && x.dtype==xs[0].dtype && x.rows<=INT32_MAX-rows,"concat shape mismatch"); rows+=x.rows; }
-    Tensor out(rows,xs[0].cols,xs[0].dtype); size_t pos=0;
-    for(auto &x:xs) { copy(out.data+pos,x.data,x.bytes(),cudaMemcpyDeviceToDevice); pos+=x.size()*(x.isFloat32()?2:1); } return out;
+    for(const auto &x:xs) {
+        require(x.data && x.rows>0 && x.cols==xs[0].cols && x.dtype==xs[0].dtype && x.rows<=INT32_MAX-rows,
+                "concat shape/dtype mismatch");
+        require(!target || x.storage!=target->storage,"concat output must not share input storage");
+        rows+=x.rows;
+    }
+    Tensor out=target?*target:Tensor(rows,xs[0].cols,xs[0].dtype);
+    require(out.data && out.rows==rows && out.cols==xs[0].cols && out.dtype==xs[0].dtype,
+            "concat output shape/dtype mismatch");
+    size_t pos=0;
+    for(const auto &x:xs) { copy(out.data+pos,x.data,x.bytes(),cudaMemcpyDeviceToDevice); pos+=x.size()*(x.isFloat32()?2:1); }
+    return out;
 }
+}
+Tensor Runtime::concat(const std::vector<Tensor> &xs) { return concatenate(xs,nullptr); }
+void Runtime::concatInto(const std::vector<Tensor> &xs,Tensor &out) { concatenate(xs,&out); }
 Tensor Runtime::rope(const Tensor &x,const float *cos,const float *sin,int dim) {
     return rope(x,prepareRope(cos,sin,x.rows,dim));
 }

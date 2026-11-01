@@ -123,6 +123,8 @@ public:
                                       const Tensor &learned, const std::vector<uint8_t> *secondFrame = nullptr);
     Tensor geluExact(const Tensor &);
     Tensor concat(const std::vector<Tensor> &xs);
+    // Concatenate rows into an existing buffer/view, disjoint from every input.
+    void concatInto(const std::vector<Tensor> &xs, Tensor &out);
     Tensor rope(const Tensor &x, const float *cos, const float *sin, int headDim);
     RopeTable prepareRope(const float *cos, const float *sin, int rows, int headDim);
     Tensor rope(const Tensor &x, const RopeTable &table);
