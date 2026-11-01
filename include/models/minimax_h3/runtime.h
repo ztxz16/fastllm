@@ -237,6 +237,8 @@ class Pipeline {
     Pipeline(const std::string &directory, int device, bool fp32 = false);
     Pipeline(const std::string &directory, int device, bool fp32, DType videoPrecision);
     Pipeline(const std::string &directory, const std::vector<int> &devices, bool fp32, DType videoPrecision);
+    Pipeline(const std::string &directory, const std::vector<int> &devices, bool fp32, DType videoPrecision,
+             nomas::RowReduction ditReduction);
     ~Pipeline();
     Generation generate(const GenerateOptions &, Progress progress = {}, Trace trace = {},
                         const std::vector<float> *initialVideo = nullptr,

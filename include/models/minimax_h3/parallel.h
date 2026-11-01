@@ -6,7 +6,8 @@ namespace fastllm { namespace minimax_h3 {
 // nomas::ParallelContext. CPU conditioning, sampler and media remain on rank 0.
 class ParallelModel {
 public:
-    ParallelModel(const std::string &, const std::vector<int> &, bool fp32, DType videoPrecision, VideoVAE &);
+    ParallelModel(const std::string &, const std::vector<int> &, bool fp32, DType videoPrecision, VideoVAE &,
+                  nomas::RowReduction);
     ~ParallelModel();
     Tensor encode(const std::vector<int> &, const std::vector<VisionInput> &, Trace);
     void prepare(const std::vector<std::vector<float>> &, bool reference,

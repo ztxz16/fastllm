@@ -17,6 +17,8 @@ public:
     Tensor broadcast(const Tensor &root, int rank);
     Tensor gatherColumns(const Tensor &, int rank, int groups = 1);
     void sum(Tensor &, int rank);
+    // In-place AllReduce on the communication stream; wait() before consuming.
+    void sumAsync(const Tensor &, int rank);
     // Sum FP32 partials before rounding. Reduce-scatter in FP32, then gather
     // rounded shards, avoiding a full FP32 all-reduce for 16-bit outputs.
     Tensor sumCast(Runtime &, Tensor partial, const Tensor *bias, DType output, int rank);
@@ -32,19 +34,27 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
+// Select partial-output/collective precision; 16-bit GEMMs still accumulate in FP32.
+enum class RowReduction { FP32, Activation };
+
 // Column parallel: replicate input, shard output (optionally gather).
 // Row parallel: consume sharded input, sum partial outputs, add bias once.
 // Norms/residuals stay replicated. This contract is independent of the model.
 struct ParallelContext {
     ParallelGroup *group = nullptr;
     int rank = 0;
+    RowReduction rowReduction = RowReduction::FP32;
     int size() const { return group ? group->size() : 1; }
+    DType partialType(DType activation) const {
+        return rowReduction == RowReduction::FP32 ? DType::FP32 : activation;
+    }
     void columnWeights(Weights &, const std::string &prefix, int groups = 1) const;
     void rowWeights(Weights &, const std::string &prefix) const;
     Tensor column(Weights &, const Tensor &, const std::string &prefix, bool gather = false) const;
     Tensor row(Runtime &, Weights &, const Tensor &, const std::string &prefix) const;
-    // Chunked GEMMs may write FP32 partials into row slices with linearInto,
-    // then reduce the entire output, rounding only after summing rank partials.
+    // Activation precision rounds each GEMM partial before AllReduce, with bias
+    // included only on rank 0. FP32 keeps the original sum-before-rounding path.
+    void rowPartial(Runtime &, Weights &, const Tensor &, const std::string &prefix, Tensor &) const;
     Tensor finishRow(Runtime &, Weights &, Tensor partial, const std::string &prefix, DType output) const;
     void finishRowAsync(Runtime &, Weights &, const Tensor &partial, const std::string &prefix,
                         Tensor &output) const;

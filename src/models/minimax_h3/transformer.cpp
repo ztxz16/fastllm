@@ -134,10 +134,10 @@ Tensor Transformer::feedForward(const Tensor &x, const std::string &p) {
     Tensor out;
     const bool overlap = parallel_.size() > 1 && !x.isFloat32() && x.rows > 4096;
     Tensor reduced;
-    if (overlap)
-        reduced = Tensor(x.rows, config_.hidden, x.dtype);
     if (!x.isFloat32() || parallel_.size() > 1)
-        out = Tensor(x.rows, config_.hidden, parallel_.size() > 1 ? DType::FP32 : x.dtype);
+        out = Tensor(x.rows, config_.hidden, parallel_.size() > 1 ? parallel_.partialType(x.dtype) : x.dtype);
+    if (overlap)
+        reduced = out.dtype == x.dtype ? out : Tensor(x.rows, config_.hidden, x.dtype);
     // Bound BF16 scratch and preserve the original sub-512 tail GEMM: folding
     // it into a larger batch selects a different reduction/rounding algorithm.
     // FP32 diagnostics retain all their original GEMM shapes.
@@ -150,7 +150,7 @@ Tensor Transformer::feedForward(const Tensor &x, const std::string &p) {
         if (out.data) {
             auto target = out.rowSlice(first, count);
             if (parallel_.size() > 1) {
-                rt_.linearInto(rt_.siluMultiply(y), weights_.get(p + ".net.2.weight"), target);
+                parallel_.rowPartial(rt_, weights_, rt_.siluMultiply(y), p + ".net.2", target);
                 if (overlap) {
                     auto result = reduced.rowSlice(first, count);
                     parallel_.finishRowAsync(rt_, weights_, target, p + ".net.2", result);

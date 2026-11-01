@@ -62,6 +62,58 @@ int main() {
             require(rejected,"invalid device list accepted");
         }
         path=fixture();
+        for(int ranks:{2,4}) {
+            if(count<ranks) continue;
+            std::vector<int> devices(ranks);
+            for(int rank=0;rank<ranks;++rank) devices[rank]=rank;
+            ParallelGroup activationGroup(devices);
+            for(auto dtype:{DType::BF16,DType::FP16}) {
+                Runtime root(0,dtype); Weights full(root,path);
+                for(int rows:{67,8193}) {
+                    std::vector<float> values(rows*256);
+                    for(size_t i=0;i<values.size();++i) values[i]=std::cos(i*.013)*.4;
+                    auto input=root.upload(values.data(),rows,256);
+                    auto expected=root.download(full.linear(input,"wide"));
+                    std::vector<std::vector<float>> actual(ranks);
+                    activationGroup.run([&](int rank) {
+                        Runtime rt(rank,dtype); Weights w(rt,path);
+                        ParallelContext p{&activationGroup,rank,RowReduction::Activation};
+                        p.rowWeights(w,"wide");
+                        auto x=activationGroup.broadcast(input,rank);
+                        x=rt.columns(x,rank*256/ranks,256/ranks);
+                        actual[rank]=rt.download(p.row(rt,w,x,"wide"));
+                    });
+                    // Compare with the unsharded projection, including a single
+                    // bias, not a second invocation of the distributed code.
+                    near(actual[0],expected,dtype==DType::BF16?.007:.001);
+                    for(int rank=1;rank<ranks;++rank) near(actual[rank],actual[0],0);
+                }
+                activationGroup.run([&](int rank) {
+                    Runtime rt(rank,dtype);
+                    std::vector<float> values(777*1025,float(rank)+.5f);
+                    auto x=rt.upload(values.data(),777,1025);
+                    for(int first=0;first<777;first+=257)
+                        activationGroup.sumAsync(x.rowSlice(first,std::min(257,777-first)),rank);
+                    activationGroup.wait(rank);
+                    near(rt.download(x),std::vector<float>(values.size(),ranks*ranks*.5f),0);
+                });
+            }
+            bool failed=false;
+            try {
+                activationGroup.run([&](int rank) {
+                    Runtime rt(rank,DType::BF16); std::vector<float> values(257*1024,.5f);
+                    auto x=rt.upload(values.data(),257,1024);
+                    activationGroup.sumAsync(x,rank);
+                    if(rank==0) throw std::runtime_error("cancel activation reduction");
+                });
+            } catch(const std::exception &) { failed=true; }
+            require(failed,"activation reduction cancellation not propagated");
+            activationGroup.run([&](int rank) {
+                Runtime rt(rank,true); float one=1;auto x=rt.upload(&one,1,1);
+                activationGroup.sum(x,rank);
+                require(rt.download(x)[0]==ranks,"activation reduction cancellation recovery");
+            });
+        }
         {
             const std::string cachePath=path+".bf16";
             const std::string header="{\"weight\":{\"dtype\":\"BF16\",\"shape\":[2,4],\"data_offsets\":[0,16]}}";

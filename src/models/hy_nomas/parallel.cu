@@ -66,6 +66,18 @@ struct ParallelGroup::Impl {
         bool pending=false;
     };
     std::vector<Communication> communication;
+    Communication &beginCommunication(int rank) {
+        auto &c=communication[rank];
+        if(!c.stream) {
+            check(cudaStreamCreateWithFlags(&c.stream,cudaStreamNonBlocking));
+            check(cudaEventCreateWithFlags(&c.ready,cudaEventDisableTiming));
+            check(cudaEventCreateWithFlags(&c.done,cudaEventDisableTiming));
+        }
+        c.pending=true;
+        check(cudaEventRecord(c.ready,cudaStreamPerThread));
+        check(cudaStreamWaitEvent(c.stream,c.ready,0));
+        return c;
+    }
     PersistentWorkerGroup workers;
     std::unique_ptr<NcclSubmitRendezvous> rendezvous;
     std::mutex abortMutex;
@@ -190,6 +202,15 @@ void ParallelGroup::sum(Tensor &x,int rank) {
     check(ncclAllReduce(x.data,x.data,x.size(),type(x.dtype),ncclSum,i.comms[rank],cudaStreamPerThread));
     i.boundary(rank,NcclSubmitRendezvous::After,x,1);
 }
+void ParallelGroup::sumAsync(const Tensor &x,int rank) {
+    if(size()==1) return;
+    if(!x.data) throw std::invalid_argument("empty asynchronous reduction");
+    auto &i=*impl_; auto &c=i.beginCommunication(rank);
+    c.retained.push_back(x);
+    i.boundary(rank,NcclSubmitRendezvous::Before,x,8);
+    check(ncclAllReduce(x.data,x.data,x.size(),type(x.dtype),ncclSum,i.comms[rank],c.stream));
+    i.boundary(rank,NcclSubmitRendezvous::After,x,8);
+}
 Tensor ParallelGroup::sumCast(Runtime &rt,Tensor partial,const Tensor *bias,DType output,int rank) {
     if(!partial.isFloat32() || (bias && (!bias->isFloat32() || bias->size()!=size_t(partial.cols))))
         throw std::invalid_argument("parallel sum/cast requires FP32 partials and bias");
@@ -218,24 +239,17 @@ void ParallelGroup::sumCastAsync(const Tensor &partial,const Tensor *bias,Tensor
     if(!partial.data || !output.data || !partial.isFloat32() || output.isFloat32() || partial.rows!=output.rows || partial.cols!=output.cols ||
        partial.storage==output.storage || (bias && (!bias->isFloat32() || bias->size()!=size_t(partial.cols))))
         throw std::invalid_argument("invalid asynchronous row reduction");
-    auto &i=*impl_; auto &c=i.communication[rank];
-    if(!c.stream) {
-        check(cudaStreamCreateWithFlags(&c.stream,cudaStreamNonBlocking));
-        check(cudaEventCreateWithFlags(&c.ready,cudaEventDisableTiming));
-        check(cudaEventCreateWithFlags(&c.done,cudaEventDisableTiming));
-    }
+    auto &i=*impl_;
     const bool scatter=size()>1 && partial.bytes()>=(1u<<20) && partial.size()%size()==0;
     const size_t count=scatter?partial.size()/size():partial.size();
     if(count>INT_MAX) throw std::invalid_argument("parallel reduction shard too large");
     Tensor reduced=scatter?Tensor(1,int(count),DType::FP32):partial;
     Tensor rounded=scatter?Tensor(1,int(count),output.dtype):output;
+    auto &c=i.beginCommunication(rank);
     // All allocations and GEMMs are on the forward stream. Keep their storage
     // alive while NCCL consumes it on the communication stream.
     c.retained.insert(c.retained.end(),{partial,output,reduced,rounded});
     if(bias) c.retained.push_back(*bias);
-    c.pending=true;
-    check(cudaEventRecord(c.ready,cudaStreamPerThread));
-    check(cudaStreamWaitEvent(c.stream,c.ready,0));
     i.boundary(rank,NcclSubmitRendezvous::Before,partial,scatter?5:6);
     if(scatter)
         check(ncclReduceScatter(partial.data,reduced.data,count,ncclFloat32,ncclSum,i.comms[rank],c.stream));
@@ -311,6 +325,7 @@ void ParallelGroup::run(const std::function<void(int)> &task) {
 Tensor ParallelGroup::broadcast(const Tensor &x,int) { return x; }
 Tensor ParallelGroup::gatherColumns(const Tensor &x,int,int) { return x; }
 void ParallelGroup::sum(Tensor &,int) {}
+void ParallelGroup::sumAsync(const Tensor &,int) {}
 Tensor ParallelGroup::sumCast(Runtime &rt,Tensor partial,const Tensor *bias,DType output,int) {
     if(bias) partial=rt.bias(partial,*bias);
     return rt.cast(partial,output);
@@ -340,25 +355,34 @@ Tensor ParallelContext::column(Weights &w,const Tensor &x,const std::string &p,b
 Tensor ParallelContext::row(Runtime &rt,Weights &w,const Tensor &x,const std::string &p) const {
     if(size()==1) return w.linear(x,p);
     const auto &weight=w.get(p+".weight");
-    // Keep GEMM partials and the collective in FP32; round once after the sum.
-    // Casting already-rounded BF16 partials to FP32 cannot recover these bits.
-    Tensor partial(x.rows,weight.rows,DType::FP32);
-    if(!x.isFloat32() && x.rows>4096 && partial.bytes()>=(64u<<20)) {
-        Tensor output(x.rows,weight.rows,x.dtype);
+    Tensor partial(x.rows,weight.rows,partialType(x.dtype));
+    // Keep the same GEMM shapes when changing collective precision.
+    if(!x.isFloat32() && x.rows>4096 && partial.size()*sizeof(float)>=(64u<<20)) {
+        Tensor output=partial.dtype==x.dtype?partial:Tensor(x.rows,weight.rows,x.dtype);
         for(int first=0;first<x.rows;first+=4096) {
             int rows=std::min(4096,x.rows-first);
             auto target=partial.rowSlice(first,rows),result=output.rowSlice(first,rows);
-            rt.linearInto(x.rowSlice(first,rows),weight,target);
+            rowPartial(rt,w,x.rowSlice(first,rows),p,target);
             finishRowAsync(rt,w,target,p,result);
         }
         group->wait(rank);
         return output;
     }
-    rt.linearInto(x,weight,partial);
+    rowPartial(rt,w,x,p,partial);
     return finishRow(rt,w,std::move(partial),p,x.dtype);
 }
+void ParallelContext::rowPartial(Runtime &rt,Weights &w,const Tensor &x,const std::string &p,Tensor &out) const {
+    if(out.dtype!=partialType(x.dtype)) throw std::invalid_argument("row-parallel partial precision mismatch");
+    const auto *bias=!out.isFloat32() && rank==0?w.optional(p+".bias"):nullptr;
+    rt.linearInto(x,w.get(p+".weight"),out,bias);
+}
 Tensor ParallelContext::finishRow(Runtime &rt,Weights &w,Tensor partial,const std::string &p,DType output) const {
-    if(!partial.isFloat32()) throw std::invalid_argument("row-parallel partials must be FP32");
+    if(!partial.isFloat32()) {
+        if(rowReduction!=RowReduction::Activation || partial.dtype!=output)
+            throw std::invalid_argument("row-parallel partial precision mismatch");
+        if(group) group->sum(partial,rank);
+        return partial;
+    }
     const auto *bias=w.optional(p+".bias");
     Tensor fullBias;
     if(bias) fullBias=rt.cast(*bias,DType::FP32);
@@ -369,6 +393,13 @@ Tensor ParallelContext::finishRow(Runtime &rt,Weights &w,Tensor partial,const st
 void ParallelContext::finishRowAsync(Runtime &rt,Weights &w,const Tensor &partial,const std::string &p,
                                     Tensor &output) const {
     if(!group) throw std::logic_error("asynchronous row reduction requires a parallel group");
+    if(!partial.isFloat32()) {
+        if(rowReduction!=RowReduction::Activation || partial.dtype!=output.dtype ||
+           partial.data!=output.data || partial.rows!=output.rows || partial.cols!=output.cols)
+            throw std::invalid_argument("activation reduction requires an in-place output");
+        group->sumAsync(partial,rank);
+        return;
+    }
     const auto *bias=w.optional(p+".bias");
     Tensor fullBias;
     if(bias) fullBias=rt.cast(*bias,DType::FP32);

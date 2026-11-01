@@ -21,12 +21,15 @@ struct ParallelModel::Rank {
         }
     }
 };
-ParallelModel::ParallelModel(const std::string &dir,const std::vector<int> &devices,bool fp32,DType videoPrecision,VideoVAE &video)
+ParallelModel::ParallelModel(const std::string &dir,const std::vector<int> &devices,bool fp32,DType videoPrecision,VideoVAE &video,
+                             nomas::RowReduction ditReduction)
     :group_(devices),ranks_(devices.size()) {
     // Construct and use each runtime on its forward thread, including cuBLAS
     // workspace and per-thread CUDA stream ownership.
     group_.run([&](int rank) {
         ranks_[rank]=std::make_unique<Rank>(dir,devices[rank],fp32,nomas::ParallelContext{&group_,rank},videoPrecision,video);
+        // The text encoder keeps FP32 reduction; this context is used by DiT.
+        ranks_[rank]->context.rowReduction=ditReduction;
     });
 }
 ParallelModel::~ParallelModel() {

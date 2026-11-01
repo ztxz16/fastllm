@@ -123,10 +123,13 @@ Pipeline::Pipeline(const std::string &dir, int device, bool fp32, DType videoPre
                      available >= (size_t(60) << 30);
 }
 Pipeline::Pipeline(const std::string &dir, const std::vector<int> &devices, bool fp32, DType videoPrecision)
+    : Pipeline(dir, devices, fp32, videoPrecision, nomas::RowReduction::Activation) {}
+Pipeline::Pipeline(const std::string &dir, const std::vector<int> &devices, bool fp32, DType videoPrecision,
+                   nomas::RowReduction ditReduction)
     : Pipeline(dir, devices.empty() ? throw std::invalid_argument("empty CUDA device list") : devices[0],
                fp32, videoPrecision) {
     if (devices.size() > 1) {
-        parallel_ = std::make_unique<ParallelModel>(dir, devices, fp32, videoPrecision, video_);
+        parallel_ = std::make_unique<ParallelModel>(dir, devices, fp32, videoPrecision, video_, ditReduction);
         video_.setTileRunner([this](size_t count, const std::function<Tensor(VideoVAE &,size_t)> &task) {
             return parallel_->videoTiles(count, task);
         }, devices.size());
