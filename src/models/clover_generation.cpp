@@ -8,6 +8,7 @@
 #include <stdexcept>
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
+#include "fastllm-cuda-sampling.h"
 #endif
 
 namespace fastllm {
@@ -156,23 +157,44 @@ struct CloverModel::Request {
         for (const auto &x : result) if (x.error) throw std::runtime_error("Clover: invalid sampling logits");
         return result;
     }
+    FastllmCudaSamplingRow SamplingRow(ResponseContext &ctx, Data &logits, int row, int vocab) {
+        const auto &c = ctx.generationConfig;
+        return {(float *)logits.cudaData + size_t(row) * vocab,
+            std::generate_canonical<double, 53>(rng), c.temperature, c.top_p, c.top_k};
+    }
+    std::vector<int> SampleRows(CloverModel &m, const std::vector<FastllmCudaSamplingRow> &rows) {
+        if (rows.empty()) return {};
+        static_assert(sizeof(FastllmCudaSamplingResult) == 2 * sizeof(int), "GPU sampling result layout");
+        size_t bytes = FastllmCudaSampleLogitsWorkspaceBytes(rows.size(), m.vocabSize);
+        Require(bytes && (bytes + 3) / 4 <= size_t(std::numeric_limits<int>::max()), "sampling workspace too large");
+        Upload(m, m.samplingWorkspace, INT32, {int((bytes + 3) / 4)}, nullptr);
+        Data output;
+        Upload(m, output, INT32, {int(rows.size()), 2}, nullptr);
+        Require(FastllmCudaSampleLogits(rows.data(), rows.size(), m.vocabSize,
+            (FastllmCudaSamplingResult *)output.cudaData, m.samplingWorkspace.cudaData, bytes), "GPU sampling failed");
+        std::vector<FastllmCudaSamplingResult> sampled(rows.size());
+        FastllmCudaCopyFromDeviceToHost(sampled.data(), output.cudaData, sampled.size() * sizeof(sampled[0]));
+        std::vector<int> result;
+        for (const auto &s : sampled) {
+            Require(!s.error, "invalid sampling logits");
+            result.push_back(s.token);
+        }
+        return result;
+    }
     int Sample(CloverModel &m, ResponseContext &ctx, Data &logits, int row, int greedyToken) {
         const auto &c = ctx.generationConfig;
         if (!c.do_sample) return greedyToken;
-        // The stochastic bonus needs one row only; draft/acceptance remain on GPU.
-        std::vector<float> scores(m.vocabSize);
-        FastllmCudaCopyFromDeviceToHost(scores.data(), (float *)logits.cudaData + (size_t)row * m.vocabSize,
-            scores.size() * sizeof(float));
-        return CloverSample(scores.data(), m.vocabSize, c, rng);
+        return SampleRows(m, {SamplingRow(ctx, logits, row, m.vocabSize)})[0];
     }
     std::vector<int> Accept(CloverModel &m, ResponseContext &ctx, Data &logits,
             const std::vector<int> &candidates) {
         Penalize(m, ctx, logits, candidates, false);
         auto stats = Summarize(m, logits, candidates, !options.exact, !options.exact);
-        return AcceptStats(m, ctx, logits, candidates, stats.data());
+        int accepted = Accepted(candidates, stats.data());
+        bonus = Sample(m, ctx, logits, accepted, stats[accepted].token);
+        return Commit(m, ctx, candidates, accepted);
     }
-    std::vector<int> AcceptStats(CloverModel &m, ResponseContext &ctx, Data &logits,
-            const std::vector<int> &candidates, const CloverCudaTokenStats *stats) {
+    int Accepted(const std::vector<int> &candidates, const CloverCudaTokenStats *stats) const {
         int accepted = 0;
         while (accepted + 1 < (int)candidates.size()) {
             const auto &s = stats[accepted];
@@ -182,7 +204,10 @@ struct CloverModel::Request {
             if (!accept) break;
             ++accepted;
         }
-        bonus = Sample(m, ctx, logits, accepted, stats[accepted].token);
+        return accepted;
+    }
+    std::vector<int> Commit(CloverModel &m, ResponseContext &ctx,
+            const std::vector<int> &candidates, int accepted) {
         m.RestorePrefix(ctx.pastKeyValues, snapshots, accepted + 1);
         std::vector<int> output(candidates.begin() + 1, candidates.begin() + accepted + 1);
         output.push_back(bonus);
@@ -598,8 +623,21 @@ std::vector<std::vector<int>> CloverModel::StepBatch(const std::vector<ResponseC
     }
     ForwardLogitsBatch(candidates, caches, false, logits, snapshots);
     auto stats = summarize(false);
-    for (int b = 0; b < size; ++b)
-        output[b] = batch[b]->AcceptStats(*this, *contexts[b], logits[b], candidates[b], stats.data() + b * width);
+    std::vector<int> accepted(size);
+    std::vector<FastllmCudaSamplingRow> rows;
+    for (int b = 0; b < size; ++b) {
+        auto &r = *batch[b];
+        accepted[b] = r.Accepted(candidates[b], stats.data() + b * width);
+        r.bonus = stats[b * width + accepted[b]].token;
+        if (contexts[b]->generationConfig.do_sample)
+            rows.push_back(r.SamplingRow(*contexts[b], logits[b], accepted[b], vocabSize));
+    }
+    auto sampled = batch[0]->SampleRows(*this, rows);
+    size_t nextSample = 0;
+    for (int b = 0; b < size; ++b) {
+        if (contexts[b]->generationConfig.do_sample) batch[b]->bonus = sampled[nextSample++];
+        output[b] = batch[b]->Commit(*this, *contexts[b], candidates[b], accepted[b]);
+    }
     return output;
 #else
     throw std::runtime_error("Clover: batch generation requires CUDA");

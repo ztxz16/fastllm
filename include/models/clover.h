@@ -64,6 +64,7 @@ private:
     // Serialized forwards reuse one prefill workspace across layers. It is
     // released with the model after ShutdownRuntime has joined the worker.
     Data gdnPrefillWorkspace;
+    Data samplingWorkspace;
     int maskToken = 151669, vocabSize = 248320;
     std::shared_ptr<class HybridMoeBF16> hybridMoe;
     std::vector<bool> hostExperts;

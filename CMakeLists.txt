@@ -406,6 +406,7 @@ if (USE_CUDA)
         src/devices/cuda/fastllm-cuda-vision.cu
         src/devices/cuda/fastllm-cuda.cu
         src/devices/cuda/fastllm-cuda-mtp.cu
+        src/devices/cuda/fastllm-cuda-sampling.cu
         src/devices/cuda/fastllm-kvmem.cu
         src/devices/cuda/fastllm-kvmem-sparse.cu
         src/devices/cuda/fastllm-triton-cuda.cu

@@ -1,6 +1,7 @@
 #include "fastllm.h"
 #include "models/clover_sampling.h"
 #include "devices/cuda/fastllm-clover.h"
+#include "devices/cuda/fastllm-cuda-sampling.h"
 #include <cuda_runtime.h>
 #include <cmath>
 #include <cstring>
@@ -274,12 +275,106 @@ void Batched(int batch, int rows, int vocab) {
     Check(cudaGraphExecDestroy(executable)); Check(cudaGraphDestroy(graph));
 }
 
+// Fixed request-owned draws verify the complete top-k -> top-p distribution,
+// stable ties, batch independence and graph replay against the CPU reference.
+void RandomSampling(int vocab, int batch, bool ties) {
+    std::mt19937_64 random(71);
+    std::normal_distribution<float> normal(0.f, 3.f);
+    std::vector<float> logits(size_t(batch) * vocab);
+    std::vector<GenerationConfig> configs(batch);
+    std::vector<uint64_t> seeds(batch);
+    std::vector<FastllmCudaSamplingRow> rows(batch);
+    Buffer input(logits.size() * 4), output(batch * sizeof(FastllmCudaSamplingResult));
+    size_t bytes = FastllmCudaSampleLogitsWorkspaceBytes(batch, vocab);
+    Require(bytes > 0, "random sampling workspace");
+    Buffer workspace(bytes);
+    for (int b = 0; b < batch; ++b) {
+        auto &c = configs[b]; c.do_sample = true;
+        c.temperature = b % 3 == 0 ? .5f : (b % 3 == 1 ? 1.f : 2.f);
+        c.top_k = b % 4 == 0 ? 0 : (b % 4 == 1 ? 1 : (b % 4 == 2 ? 7 : vocab + 1));
+        c.top_p = b % 5 == 0 ? 1.f : (b % 5 == 1 ? .95f : (b % 5 == 2 ? .5f : .01f));
+        seeds[b] = random(); std::mt19937_64 rng(seeds[b]);
+        rows[b] = {(float *)input.p + size_t(b) * vocab,
+            std::generate_canonical<double, 53>(rng), c.temperature, c.top_p, c.top_k};
+    }
+    auto prepare = [&]() {
+        for (int b = 0; b < batch; ++b) for (int i = 0; i < vocab; ++i) {
+            float v = ties ? float((i + b) % 5) : normal(random);
+            if ((i + b) % 19 == 0 && vocab > 1 && i != vocab - 1) v = -INFINITY;
+            logits[size_t(b) * vocab + i] = v;
+        }
+        input.Put(logits.data(), logits.size() * 4);
+    };
+    auto launch = [&]() {
+        Require(FastllmCudaSampleLogits(rows.data(), batch, vocab,
+            (FastllmCudaSamplingResult *)output.p, workspace.p, bytes), "random sampling launch");
+    };
+    auto verify = [&]() {
+        std::vector<FastllmCudaSamplingResult> actual(batch);
+        Check(cudaMemcpy(actual.data(), output.p, actual.size() * sizeof(actual[0]), cudaMemcpyDeviceToHost));
+        for (int b = 0; b < batch; ++b) {
+            std::mt19937_64 rng(seeds[b]);
+            int expected = CloverSample(logits.data() + size_t(b) * vocab, vocab, configs[b], rng);
+            if (actual[b].error || actual[b].token != expected) {
+                std::cerr << "random sampling vocab=" << vocab << " batch=" << batch << " row=" << b
+                    << " ties=" << ties << " expected=" << expected << " actual=" << actual[b].token << std::endl;
+                throw std::runtime_error("random sampling differs from CPU reference");
+            }
+        }
+        std::vector<float> unchanged(logits.size());
+        Check(cudaMemcpy(unchanged.data(), input.p, logits.size() * 4, cudaMemcpyDeviceToHost));
+        Require(std::memcmp(unchanged.data(), logits.data(), logits.size() * 4) == 0, "sampling mutated logits");
+    };
+    prepare(); launch(); verify();
+    cudaGraph_t graph; cudaGraphExec_t executable;
+    Check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal)); launch();
+    Check(cudaStreamEndCapture(cudaStreamPerThread, &graph));
+    Check(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
+    prepare(); Check(cudaGraphLaunch(executable, cudaStreamPerThread)); verify();
+    Check(cudaGraphExecDestroy(executable)); Check(cudaGraphDestroy(graph));
+}
+void RandomSamplingEdges() {
+    constexpr int vocab = 2051, batch = 8;
+    std::vector<float> logits(vocab, 0.f);
+    Buffer input(vocab * 4), output(batch * sizeof(FastllmCudaSamplingResult));
+    size_t bytes = FastllmCudaSampleLogitsWorkspaceBytes(batch, vocab);
+    Buffer workspace(bytes);
+    FastllmCudaSamplingRow rows[batch];
+    for (int b = 0; b < batch; ++b)
+        rows[b] = {(float *)input.p, b % 2 ? std::nextafter(1., 0.) : 0., 1.f, b < 4 ? .5f : 1.f, b < 2 ? 1 : 0};
+    auto launch = [&]() {
+        input.Put(logits.data(), vocab * 4);
+        Require(FastllmCudaSampleLogits(rows, batch, vocab, (FastllmCudaSamplingResult *)output.p,
+            workspace.p, bytes), "edge sampling launch");
+        std::vector<FastllmCudaSamplingResult> actual(batch);
+        Check(cudaMemcpy(actual.data(), output.p, actual.size() * sizeof(actual[0]), cudaMemcpyDeviceToHost));
+        return actual;
+    };
+    auto actual = launch();
+    for (int b = 0; b < batch; ++b)
+        Require(!actual[b].error && actual[b].token == (b % 2 ? (b < 4 ? 1025 : 2050) : 0), "top-p cutoff ties or uniform edge");
+    for (float invalid : {NAN, INFINITY}) {
+        logits[17] = invalid; actual = launch();
+        for (auto x : actual) Require(x.error && x.token == -1, "invalid sampling row accepted");
+    }
+    std::fill(logits.begin(), logits.end(), -INFINITY); actual = launch();
+    for (auto x : actual) Require(x.error && x.token == -1, "all masked sampling row accepted");
+    logits[1025] = -4.f; actual = launch();
+    for (auto x : actual) Require(!x.error && x.token == 1025, "single sampling candidate");
+    rows[0].uniform = 1.;
+    Require(!FastllmCudaSampleLogits(rows, batch, vocab, (FastllmCudaSamplingResult *)output.p,
+        workspace.p, bytes), "invalid uniform accepted");
+}
 }
 int main() {
     try {
         int devices = 0;
         if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) return 77;
         Check(cudaSetDevice(0));
+        RandomSamplingEdges();
+        for (int vocab : {1, 31, 513, 1023, 1024, 1025, 248320})
+            for (bool ties : {false, true}) RandomSampling(vocab, 65, ties);
+        RandomSampling(7, 4096, false);
         for (int batch : {1, 2, 7, 31, 32, 33, 64}) Batched(batch, 16, 513);
         Batched(3, 16, 248320); Batched(33, 1, 248320);
         Batched(32, 16, 16385); Batched(2, 32, 16383);
