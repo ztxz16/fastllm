@@ -234,11 +234,81 @@ template <int H, int M> void TestNativeFullGraph(bool large) {
     TrimDiskMoeCache();
     puts("PASS: native NVFP4 disk full graph");
 }
+void TestNativeMultiDeviceGraph() {
+    if (FastllmCudaGetDeviceCount() < 2) return;
+    SetMoeCpuCacheBytes(1ULL << 30);
+    SetMoeCudaCacheBytes(0);
+    constexpr int H = 256, M = 256, E = 8, topk = 6;
+    Fixture<H, M, E> fixture(false, true);
+    for (int rows : {1, 4, 6, 8, 16, 32}) {
+        Data inputs[2], ids[2], scores[2], outputs[2];
+        DiskMoeV41Graph manager;
+        void *execs[2] = {};
+        for (int device = 0; device < 2; ++device) {
+            FastllmCudaSetDevice(device);
+            auto alloc = [device](Data &d, DataType type, std::vector<int> shape) {
+                d.dataType = type; d.UpdateUnitSize(); d.Resize(shape); d.Allocate(false);
+                memset(d.cpuData, 0, d.GetBytes()); d.ToDevice(CUDA, {device}, true);
+            };
+            alloc(inputs[device], BFLOAT16, {rows, H});
+            alloc(ids[device], INT32, {rows, topk});
+            alloc(scores[device], FLOAT32, {rows, topk});
+            void *child = manager.Add(inputs[device], ids[device], scores[device], outputs[device], fixture.disk, 2.f);
+            Require(child && FastllmCudaGraphInstantiate(child, &execs[device]), "two-device graph capture");
+        }
+        auto replay = [&] {
+            bool ok = true;
+            for (int device = 0; device < 2; ++device) {
+                FastllmCudaSetDevice(device);
+                ok = FastllmCudaGraphLaunch(execs[device]) && ok;
+            }
+            return ok;
+        };
+        // Both graphs have been submitted when cancellation drains the lease.
+        Require(!manager.Launch([&] { replay(); return false; }), "two-device cancellation");
+        for (int pass = 0; pass < 4; ++pass) {
+            for (int device = 0; device < 2; ++device) {
+                FastllmCudaSetDevice(device);
+                const int seed = pass + device;
+                const float phase = .13f * seed;
+                for (int row = 0; row < rows; ++row) {
+                    for (int col = 0; col < H; ++col)
+                        reinterpret_cast<uint16_t *>(inputs[device].cpuData)[size_t(row)*H+col] =
+                            Float32ToBFloat16RNEBits(std::sin(float(row*H+col)*.71f+phase)*.4f);
+                    for (int j = 0; j < topk; ++j) {
+                        reinterpret_cast<int32_t *>(ids[device].cpuData)[row*topk+j] = (seed+(topk-1-j)*2+row%2)%E;
+                        reinterpret_cast<float *>(scores[device].cpuData)[row*topk+j] = .17f+j*.21f;
+                    }
+                }
+                for (Data *data : {&inputs[device], &ids[device], &scores[device]})
+                    FastllmCudaCopyFromHostToDevice(data->cudaData, data->cpuData, data->GetBytes());
+            }
+            Require(manager.Launch(replay), "two-device graph replay");
+            for (int device = 0; device < 2; ++device) {
+                FastllmCudaSetDevice(device);
+                std::vector<uint16_t> actual(size_t(rows)*H);
+                FastllmCudaCopyFromDeviceToHost(actual.data(), outputs[device].cudaData, actual.size()*2);
+                auto expected = fixture.Run(true, rows, pass+device, device, false, topk, true, .13f*(pass+device));
+                Compare(actual, expected, false);
+            }
+        }
+        for (int device = 0; device < 2; ++device) {
+            FastllmCudaSetDevice(device); FastllmCudaGraphExecDestroy(execs[device]);
+        }
+    }
+    SetMoeCpuCacheBytes(0); TrimDiskMoeCache();
+    puts("PASS: two-device disk graph replay and cancellation");
+}
+
 #endif
 
 int main(int argc, char **argv) {
     try {
 #if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
+        if (argc > 1 && !strcmp(argv[1], "--multi-device-graph")) {
+            if (FastllmCudaGetDeviceCount() < 2) return 77;
+            SetThreads(4); TestNativeMultiDeviceGraph(); return 0;
+        }
         if (argc > 1 && (!strcmp(argv[1], "--full-graph") || !strcmp(argv[1], "--full-graph-large"))) {
             if (FastllmCudaGetDeviceCount() < 1) return 77;
             SetThreads(4);

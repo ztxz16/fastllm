@@ -1266,6 +1266,9 @@ if (UNIT_TEST)
                 "PASS: tuned V4.1 GGUF decode" 360 --tuned)
             set_tests_properties(cuda_v41_gguf_tuned PROPERTIES LABELS "cuda;gguf" RUN_SERIAL TRUE)
             if (USE_NUMAS)
+                fastllm_add_checked_test(disk_moe_multi_device_graph disk_moe_cache_test
+                    "PASS: two-device disk graph replay and cancellation" 180 --multi-device-graph)
+                set_tests_properties(disk_moe_multi_device_graph PROPERTIES LABELS "cuda;disk;graph" RUN_SERIAL TRUE)
                 foreach(size IN ITEMS full-graph full-graph-large)
                     fastllm_add_checked_test(disk_nvfp4_${size} disk_moe_cache_test
                         "PASS: native NVFP4 disk full graph" 300 --${size})

@@ -1,6 +1,9 @@
-// A graph leases resident records for one PP stage. CPU cache misses may read
-// and compute in parallel with GPU hits, but never submit CUDA before retirement.
+// A graph leases resident records for its PP stage or TP cache owners. CPU
+// misses may read/compute beside GPU hits, but submit CUDA only after retirement.
 #include "devices/cuda/fastllm-cuda-disk-v41-graph.h"
+#ifdef USE_CUDA
+#include "devices/multicuda/fastllm-multicuda.cuh"
+#endif
 namespace fastllm {
 #if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
 // Reuse disk's compact CPU kernel, including BF16 and block-32 FP8 boundaries.
@@ -53,11 +56,10 @@ struct DiskMoeV41Graph::Impl {
     struct Layer {
         std::vector<Data *> weights;
         std::unique_ptr<FastllmCudaDiskV41Graph> gpu;
-        int rows, hidden, topk;
+        int rows, hidden, topk, device;
         float limit;
         const Data *candidate = nullptr;
     };
-    int device = FastllmCudaGetDevice();
     std::vector<Layer> layers;
     std::thread worker;
     std::mutex mutex;
@@ -218,8 +220,9 @@ struct DiskMoeV41Graph::Impl {
             std::unique_lock<std::mutex> lease;
             try {
                 lease = cache.Lock();
-                FastllmCudaSetDevice(device);
                 for (auto &l : layers) {
+                    const int device = l.device;
+                    FastllmCudaSetDevice(device);
                     l.candidate = nullptr;
                     auto request = l.gpu->Request();
                     for (size_t e = 0; e < l.weights.size() / 2 - 1; ++e) {
@@ -265,9 +268,10 @@ struct DiskMoeV41Graph::Impl {
                 // The caller has retired every graph reader. Cache promotion
                 // may now issue CUDA and recycle records without stale pointers.
                 if (!error && !cancel) {
-                    FastllmCudaSetDevice(device);
                     for (auto &l : layers)
                         if (l.candidate) {
+                            const int device = l.device;
+                            FastllmCudaSetDevice(device);
                             auto &entry = cache.entries.at(l.candidate);
                             if (!entry.cpu || entry.Cuda(device))
                                 continue;
@@ -330,8 +334,7 @@ bool DiskMoeV41Graph::Supports(const std::vector<Data *> &w) {
 }
 void *DiskMoeV41Graph::Add(const Data &input, const Data &index, const Data &score, Data &output,
                            const std::vector<Data *> &weights, float limit) {
-    if (!Supports(weights) || weights[0] || weights[1] || impl->worker.joinable() ||
-        FastllmCudaGetDevice() != impl->device)
+    if (!Supports(weights) || weights[0] || weights[1] || impl->worker.joinable())
         return nullptr;
     auto gpu = FastllmCudaDiskV41Graph::Create(
         input, index, score, output, weights[2]->dataType, weights[2]->ggmlType, weights[3]->ggmlType,
@@ -340,7 +343,7 @@ void *DiskMoeV41Graph::Add(const Data &input, const Data &index, const Data &sco
     if (!gpu)
         return nullptr;
     void *graph = gpu->Graph();
-    impl->layers.push_back({weights, std::move(gpu), input.dims[0], input.dims[1], index.dims[1], limit});
+    impl->layers.push_back({weights, std::move(gpu), input.dims[0], input.dims[1], index.dims[1], FastllmCudaGetDevice(), limit});
     return graph;
 }
 bool DiskMoeV41Graph::Launch(const std::function<bool()> &launch) {
@@ -379,7 +382,11 @@ bool DiskMoeV41Graph::Launch(const std::function<bool()> &launch) {
         try {
             // Drain even a failed callback: it may already have launched the
             // graph. The worker keeps cache records leased until this returns.
-            FastllmCudaSyncCurrentThreadStream();
+            std::set<int> devices;
+            for (const auto &layer : s.layers) devices.insert(layer.device);
+            if (devices.size() == 1 && *devices.begin() == FastllmCudaGetDevice())
+                FastllmCudaSyncCurrentThreadStream();
+            else for (int device : devices) FastllmCudaSyncDevice(device);
         } catch (...) {
             if (!failure)
                 failure = std::current_exception();

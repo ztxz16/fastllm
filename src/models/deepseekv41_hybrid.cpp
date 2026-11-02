@@ -64,6 +64,14 @@ namespace fastllm {
         }
         if ((FastllmCudaMoeCacheRequested() || streamGGUF || cpuHost) && !moeExpertCacheAttempted) {
             moeExpertCacheAttempted = true;
+            std::vector<int> tpOwners;
+            if (tp) {
+                tpOwners = ((Executor *)GetExecutor())->GetDeviceIds("multicuda");
+                if (tpOwners.size() < 2) {
+                    std::map<int, int> ratios;
+                    FastllmGetMulticudaDeviceAndRatio(tpOwners, ratios, true);
+                }
+            }
             std::vector<CudaPrefillStage> stages;
             if (!tp && BuildCudaPrefillStages(deviceMap, block_cnt, stages))
                 for (const auto &stage : stages) hybridMoeDevices.push_back(stage.device);
@@ -111,7 +119,7 @@ namespace fastllm {
                 if (!UsesHostMoe(device)) continue;
                 supported &= quantizedLinearNames.count("layers." + std::to_string(layer) + ".ffn.experts.0.w1.weight");
                 routedWeights[layer][0] = routedWeights[layer][1] = nullptr;
-                int owner = -1;
+                int owner = tpOwners.empty() ? -1 : tpOwners[size_t(layer) * tpOwners.size() / block_cnt];
                 if (hybridMoeStageOwned || (!tp && stages.size() > 1 &&
                         weights[layer][2]->dataType == NVFP4_BLOCK_32_E8M0))
                     for (const auto &stage : stages)
@@ -130,7 +138,8 @@ namespace fastllm {
                     auto &table = draftWeights[stage];
                     table[0] = table[1] = nullptr;
                     draftCache.Add(table, SelectSpecialWeightDevice("mtp." + std::to_string(stage) +
-                        ".ffn.experts.0.gateup.weight", std::max(0, block_cnt - v41DsparkLayers + int(stage))));
+                        ".ffn.experts.0.gateup.weight", std::max(0, block_cnt - v41DsparkLayers + int(stage))),
+                        tpOwners.empty() ? -1 : tpOwners.front());
                 }
                 if (!draftCache.Prepare([this] { WarmupNumaMoeWeights(true); }))
                     fprintf(stderr, "[Fastllm] DSpark expert cache unavailable; retaining host fallback.\n");

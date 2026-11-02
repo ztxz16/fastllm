@@ -115,10 +115,15 @@ struct V41FullEngramWorker {
 };
 struct V41FullGraph {
     std::vector<int> devices, coordinatorCpus;
+    std::vector<std::vector<int>> rankCoordinatorCpus;
     int batch = 1, maxKeys = 131072;
     int firstLayer = 0, endLayer = 0;
     bool verifying = false, capturesInput = false, hybrid = false, tensorParallel = true;
     std::vector<void *> moeHandles;
+    std::vector<std::vector<void *>> rankMoeHandles;
+    std::vector<void *> rankUntimedExecs;
+    std::vector<int> rankMoeFirstLayer;
+    Data routedOutput;
     std::unique_ptr<DiskMoeV41Graph> diskMoe;
     Data inputIds, embedding, deferredHcMix;
     std::vector<float> hostTokens;
@@ -151,6 +156,15 @@ struct V41FullGraph {
                 FastllmCudaEventDestroy(ready[rank]);
         }
         if (untimedExec) FastllmCudaGraphExecDestroy(untimedExec);
+        for (size_t rank = 0; rank < rankUntimedExecs.size(); ++rank) {
+            FastllmCudaSetDevice(devices[rank]);
+            if (rankUntimedExecs[rank]) FastllmCudaGraphExecDestroy(rankUntimedExecs[rank]);
+        }
+        for (void *handle : moeHandles) FastllmCudaReleaseNativeMoeFullGraph(handle);
+        for (size_t rank = 0; rank < rankMoeHandles.size(); ++rank) {
+            FastllmCudaSetDevice(devices[rank]);
+            for (void *handle : rankMoeHandles[rank]) FastllmCudaReleaseNativeMoeFullGraph(handle);
+        }
         diskMoe.reset();
         pieces.reset();
         for (auto &layer : layers) if (layer)
@@ -161,7 +175,12 @@ struct V41FullGraph {
 };
 
 bool V41FullDispatch(const V41FullGraph &g, const std::function<void(int, int)> &body) {
-    if (g.tensorParallel) return MultiCudaRunDeviceCallbacks(g.devices, body);
+    if (g.tensorParallel) return MultiCudaRunDeviceCallbacks(g.devices, [&](int rank, int device) {
+        const std::vector<int> empty;
+        V41FullCallerAffinity affinity(rank < int(g.rankCoordinatorCpus.size())
+            ? g.rankCoordinatorCpus[rank] : empty);
+        body(rank, device);
+    });
     FastllmCudaSetDevice(g.devices.front());
     body(0, g.devices.front());
     return true;
@@ -399,7 +418,7 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
         return;
     auto state = V41GetCudaGraphState(slot->second);
     if (!state->captured || (!hybrid && !state->tensorParallel) ||
-        (hybrid && (state->tensorParallel || state->devices.size() != 1)) || state->fullDecode ||
+        (hybrid && !state->tensorParallel && state->devices.size() != 1) || state->fullDecode ||
         state->segments.size() != (size_t)block_cnt * 4)
         return;
     for (int i = firstLayer * 4; i < endLayer * 4; ++i)
@@ -427,11 +446,14 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
         FastllmCudaSetDevice(g->devices.front());
     }
     g->hybrid = hybrid; g->tensorParallel = state->tensorParallel;
+    g->rankMoeHandles.resize(g->devices.size());
+    g->rankUntimedExecs.resize(g->devices.size(), nullptr);
+    g->rankMoeFirstLayer.resize(g->devices.size(), -1);
 #ifdef USE_NUMAS
     if (hybrid && !weights.empty() && weights[0].size() > 2 && weights[0][2]) {
         HostMoePlacementScope placement(weights[0][2]);
-        const auto cpus = GetNumasCudaWorkerCpuSets(g->devices);
-        if (cpus.size() == 1) g->coordinatorCpus = cpus.front();
+        g->rankCoordinatorCpus = GetNumasCudaWorkerCpuSets(g->devices);
+        if (!g->rankCoordinatorCpus.empty()) g->coordinatorCpus = g->rankCoordinatorCpus.front();
     }
 #endif
     V41FullCallerAffinity affinity(g->coordinatorCpus);
@@ -460,7 +482,7 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
     // Keep BF16 embedding outputs and token operands at fixed addresses. The
     // ordinary/input-embedding and other precision paths retain their frontend.
     auto &embeddingWeight = weight["embed.weight"];
-    g->capturesInput = firstLayer == 0 && (verifying || hybrid) && embeddingWeight.dataType == DataType::BFLOAT16 &&
+    g->capturesInput = firstLayer == 0 && (verifying || (hybrid && !g->tensorParallel)) && embeddingWeight.dataType == DataType::BFLOAT16 &&
         embeddingWeight.dataDevice == DataDevice::CUDA && embeddingWeight.cudaData &&
         !embeddingWeight.multiDeviceData && embeddingWeight.dims.size() == 2 &&
         embeddingWeight.dims[1] == embed_dim &&
@@ -470,7 +492,10 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
         g->hostTokens.assign(batch, 0.f);
         if (!verifying) alloc(g->inputIds, DataType::FLOAT32, {1, batch});
     }
-    if (hybrid && batch == 1) alloc(g->deferredHcMix, DataType::FLOAT32, {2 * block_cnt, 32});
+    if (hybrid && g->tensorParallel) {
+        alloc(g->routedOutput, DataType::BFLOAT16, {batch, embed_dim});
+    }
+    if (hybrid && !g->tensorParallel && batch == 1) alloc(g->deferredHcMix, DataType::FLOAT32, {2 * block_cnt, 32});
     std::vector<int> hcStart, hcJoin;
     const int blockSize = std::max(1, candidate_block_size);
     alloc(g->topk, DataType::INT32, {1, batch, index_topk});
@@ -552,11 +577,12 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
             GatherEngramRows(engram_layer_ids[i], e->hostRows, batch, e->hostGathered);
         const auto &t = *e->table;
         if (hybrid && V41CanPrefetchEngramRows(t)) {
+            FastllmCudaSetDevice(g->devices.front());
             // Unsupported devices keep the existing synchronous gather path.
-            if (FastllmCudaV41CreateHostCopy(e->gathered.cudaData, e->gathered.GetBytes(),
+            if (FastllmCudaV41CreateHostCopy(V41FullLocal(e->gathered, g->devices.front()).cudaData, e->gathered.GetBytes(),
                     &e->asyncData, &e->asyncReady, &e->asyncGraph)) {
                 std::memcpy(e->asyncData, e->hostGathered.cpuData, e->gathered.GetBytes());
-                FastllmCudaCopyFromHostToDevice(e->gathered.cudaData, e->asyncData, e->gathered.GetBytes());
+                FastllmCudaCopyFromHostToDevice(V41FullLocal(e->gathered, g->devices.front()).cudaData, e->asyncData, e->gathered.GetBytes());
             }
         }
         g->engrams[engram_layer_ids[i]] = std::move(e);
@@ -666,6 +692,11 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
                 });
                 if (e.asyncGraph) children[0].push_back(e.asyncGraph);
                 capture([&] {
+                    if (e.asyncGraph && g->tensorParallel) V41FullDispatch(*g, [&](int, int device) {
+                        auto &local = V41FullLocal(e.gathered, device);
+                        FastllmNcclBroadcastFrom(local.cudaData, local.cudaData, local.Count(0),
+                            local.dataType, g->devices.front(), device);
+                    });
                     if (e.table->gpuTable) V41FullDispatch(*g, [&](int, int device) {
                         bool ok = FastllmCudaV41GatherEngramDevice(
                             e.table->gpuTable,
@@ -785,7 +816,57 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
             for (int piece = 1; piece < (hostMoe ? 3 : 4); ++piece)
                 for (size_t rank = 0; rank < children.size(); ++rank)
                     children[rank].push_back(state->segments[l * 4 + piece].graphs[rank]);
-            if (hostMoe) {
+            if (hostMoe && g->tensorParallel) {
+                // TP shards attention; each complete routed layer retains one
+                // cache owner. Broadcast its result directly inside the graph.
+                const size_t owner = size_t(l) * g->devices.size() / block_cnt;
+                const int device = g->devices[owner];
+                FastllmCudaSetDevice(device);
+                auto routed = weights[l]; routed[0] = routed[1] = nullptr;
+                Data input, index, score;
+                input.FakeFrom(V41FullLocal(ws.ffnInput, device), 0);
+                input.Resize({batch, embed_dim});
+                index.FakeFrom(V41FullLocal(ws.expertIndex, device), 0);
+                index.Resize(state->segments[l * 4 + 2].expertIndexDims);
+                score.FakeFrom(V41FullLocal(ws.expertScore, device), 0);
+                score.Resize(state->segments[l * 4 + 2].expertScoreDims);
+                void *moeGraph = nullptr;
+                auto &output = V41FullLocal(g->routedOutput, device);
+                // Shared and routed experts only read ffnInput. On the owner,
+                // let the native mailbox fork them and join before broadcast.
+                // The other ranks compute their shared result independently.
+                for (size_t rank = 0; rank < children.size(); ++rank)
+                    if (rank != owner || routed[2]->isDiskWeight)
+                        children[rank].push_back(state->segments[l * 4 + 3].graphs[rank]);
+                if (routed[2]->isDiskWeight) {
+                    if (!g->diskMoe) g->diskMoe = std::make_unique<DiskMoeV41Graph>();
+                    moeGraph = g->diskMoe->Add(input, index, score, output, routed, swiglu_limit);
+                } else {
+                    // Segmented TP has no model-wide admission scope. Prepare
+                    // this owner's policy before creating its mailbox children.
+                    HybridMoeDecodeStep preparation(true);
+                    preparation.Begin(routed.data(), routed.size(), num_experts_per_tok);
+                    void *handle = FastllmCudaCreateNativeMoeFullGraph(input, index, score, output,
+                        routed.data(), routed.size(), l, state->segments[l * 4 + 3].graphs[owner], &moeGraph);
+                    if (handle) {
+                        g->rankMoeHandles[owner].push_back(handle);
+                        if (g->rankMoeFirstLayer[owner] < 0) g->rankMoeFirstLayer[owner] = l;
+                    }
+                }
+                if (!moeGraph) throw std::runtime_error("TP MoE full graph rejected at layer " + std::to_string(l));
+                children[owner].push_back(moeGraph);
+                capture([&] {
+                    V41FullDispatch(*g, [&](int, int rankDevice) {
+                        auto local = [&](Data &data) -> Data & { return V41FullLocal(data, rankDevice); };
+                        auto &result = local(g->routedOutput);
+                        FastllmNcclBroadcastFrom(result.cudaData, result.cudaData, batch * embed_dim,
+                            result.dataType, device, rankDevice);
+                        AssertInFastLLM(FastllmCudaDeepSeekV41MoeHcPost(result, local(ws.sharedExpertOut),
+                            local(ws.hiddenTemp), local(ws.ffnPost), local(ws.ffnComb), local(ws.hiddenStates)),
+                            "full TP hybrid MoE residual failed");
+                    });
+                });
+            } else if (hostMoe) {
                 auto routed = weights[l]; routed[0] = routed[1] = nullptr;
                 Data input;
                 input.FakeFrom(ws.ffnInput, 0); input.Resize({batch, embed_dim});
@@ -825,7 +906,17 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
                 // Preserve the ordinary quantized-head / verifier boundary.
                 // mHC may produce FP32; forcing BF16 here changes GGUF logits.
                 RMSNorm(g->head, weight["norm.weight"], rms_norm_eps, g->norm);
-                if (verifying) DsparkProjectHead(g->norm, g->headLogits);
+                if (verifying && g->tensorParallel) {
+                    // Keep vocabulary shards and the TP executor through the
+                    // dtype conversion below; gather explicitly after it.
+                    ApplyDeviceMap(deviceMap, block_cnt, block_cnt);
+                    Data *headInput = &g->norm;
+                    if (weight["head.weight"].dataType == DataType::FLOAT32) {
+                        ToDataType(g->norm, g->normFloat, DataType::FLOAT32);
+                        headInput = &g->normFloat;
+                    }
+                    LinearWithActivationQuant(*headInput, "head.weight", g->headLogits);
+                } else if (verifying) DsparkProjectHead(g->norm, g->headLogits);
                 else Linear(g->norm, weight["head.weight"], *GetEmptyData(), g->headLogits);
                 ToDataType(g->headLogits, g->logits, DataType::FLOAT32);
             } else {
@@ -873,7 +964,7 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
                 g->ready[rank] = FastllmCudaEventCreate();
                 if (!g->ready[rank]) throw std::runtime_error("full verify completion event");
             }
-            const bool deferred = hybrid && batch == 1 && FastllmCudaV41ComposeHcGraph(
+            const bool deferred = hybrid && !g->tensorParallel && batch == 1 && FastllmCudaV41ComposeHcGraph(
                 children[rank].data(), children[rank].size(), hcStart.data(), hcJoin.data(),
                 hcStart.size(), static_cast<float *>(g->deferredHcMix.cudaData),
                 &g->graphs[rank], &g->execs[rank]);
@@ -884,6 +975,13 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
         if (!g->moeHandles.empty() && !FastllmCudaCreateNativeMoeReplayGraph(g->graphs[0], g->moeHandles.data(),
                 g->moeHandles.size(), &g->untimedExec))
             throw std::runtime_error("full graph timing removal failed");
+        for (size_t rank = 0; rank < g->devices.size(); ++rank) {
+            auto &handles = g->rankMoeHandles[rank];
+            FastllmCudaSetDevice(g->devices[rank]);
+            if (!handles.empty() && !FastllmCudaCreateNativeMoeReplayGraph(g->graphs[rank],
+                    handles.data(), handles.size(), &g->rankUntimedExecs[rank]))
+                throw std::runtime_error("TP full graph timing removal failed");
+        }
         if (verifying) {
             g->commitDescriptors.resize(g->devices.size());
             for (size_t rank = 0; rank < g->devices.size(); ++rank) {
@@ -944,7 +1042,10 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
 bool DeepSeekV41Model::TryFullDecodeGraph(ForwardWorkspace &f, bool inputsPrepared) {
     // Verification warmup uses the same composition/replay path as requests.
     // Ordinary decode still builds its full graph explicitly after warmup.
-    if (!f.graphReplay || !f.graphState || (v41CudaGraphWarmingUp && !f.dsparkVerify) ||
+    // A graph captured for ordinary decode has no DSpark target features.
+    // Keep plain DSpark steps on their feature-producing segmented path.
+    if ((v41DsparkEnabled && !f.dsparkVerify) || !f.graphReplay || !f.graphState ||
+        (v41CudaGraphWarmingUp && !f.dsparkVerify) ||
         (f.quantKV && executionMode != ExecutionMode::Hybrid &&
             (f.dsparkVerify || kvCacheDataType != DataType::FP8_E4M3)) ||
         f.hasImageTokens || f.inputEmbeds)
@@ -1011,23 +1112,36 @@ bool DeepSeekV41Model::TryFullDecodeGraph(ForwardWorkspace &f, bool inputsPrepar
     const bool timed = !g->untimedExec || g->replays < 8 || (g->replays % 32 == 0);
     std::vector<int> uploaded(g->devices.size(), 0), ok(g->devices.size(), 0);
     std::atomic<int> ready{0};
-    const bool launched = V41FullDispatch(*g, [&](int rank, int device) {
+    auto dispatchReplay = [&] { return V41FullDispatch(*g, [&](int rank, int device) {
         uploaded[rank] = V41FullUploadRank(*g, f.inputSegments, rank, device) ? 1 : 0;
         ready.fetch_add(1, std::memory_order_release);
         while (ready.load(std::memory_order_acquire) < (int)g->devices.size())
             std::this_thread::yield();
         if (std::all_of(uploaded.begin(), uploaded.end(), [](int v) { return v == 1; })) {
-            void *exec = timed ? g->execs[rank] : g->untimedExec;
+            const auto &handles = g->rankMoeHandles[rank];
+            HybridMoeDecodeStep rankStep(true);
+            if (!handles.empty()) {
+                auto &table = weights[g->rankMoeFirstLayer[rank]];
+                rankStep.Begin(table.data(), table.size(), num_experts_per_tok);
+                AssertInFastLLM(bool(rankStep), "TP full graph cache policy unavailable");
+            }
+            const bool rankTimed = g->replays < 8 || g->replays % 32 == 0 || !g->rankUntimedExecs[rank];
+            void *exec = g->tensorParallel
+                ? (rankTimed ? g->execs[rank] : g->rankUntimedExecs[rank])
+                : (timed ? g->execs[rank] : g->untimedExec);
             auto replay = [&] {
+                if (!handles.empty()) return FastllmCudaLaunchNativeMoeFullGraph(
+                    exec, handles.data(), handles.size(), rankTimed);
                 return !g->moeHandles.empty()
                     ? FastllmCudaLaunchNativeMoeFullGraph(exec, g->moeHandles.data(), g->moeHandles.size(), timed)
                     : FastllmCudaGraphLaunch(exec);
             };
-            const bool success = g->diskMoe ? g->diskMoe->Launch(replay) : replay();
+            const bool success = replay();
             ok[rank] = success ? 1 : -1;
             if (g->verifying) FastllmCudaEventRecordCurrentThread(g->ready[rank]);
         }
-    });
+    }); };
+    const bool launched = g->diskMoe ? g->diskMoe->Launch(dispatchReplay) : dispatchReplay();
     joinEngram.Finish();
     AssertInFastLLM(launched && std::all_of(ok.begin(), ok.end(), [](int v) { return v == 1; }),
                     "full decode graph replay failed");

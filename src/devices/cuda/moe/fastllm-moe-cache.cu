@@ -4622,6 +4622,10 @@ static void EndDeviceMoeDecode(DeviceCache &cache) {
 namespace { void WaitCooperativeCpu(OffloadGroup &group); }
 #endif
 
+void FastllmCudaEndMoeDecodeOnDevice(void *state) {
+    if (state) EndDeviceMoeDecode(*static_cast<DeviceCache *>(state));
+}
+
 void FastllmCudaEndMoeDecode(void *state) {
     if (!state) return;
     auto &cache = *static_cast<DeviceCache *>(state);

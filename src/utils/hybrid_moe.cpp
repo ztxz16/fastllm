@@ -108,7 +108,8 @@ void HybridMoeDecodeStep::Finish() {
 #if defined(USE_CUDA) && !defined(USE_ROCM)
     void *current = policy;
     policy = nullptr;
-    FastllmCudaEndMoeDecode(current);
+    if (deviceLocal) FastllmCudaEndMoeDecodeOnDevice(current);
+    else FastllmCudaEndMoeDecode(current);
 #endif
 }
 HybridMoeDecodeGroup::~HybridMoeDecodeGroup() {

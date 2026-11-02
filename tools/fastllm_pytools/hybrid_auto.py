@@ -1027,10 +1027,9 @@ def _v41_runtime_bytes(args, model, mode, mapping, resident, context, batch, chu
     hybrid = resident < model.layers
     draft_graphs = graphs
     disk = hybrid and (disk_experts or args.moe_device == "disk")
-    # Canonical GGUF and native block-32 disk experts have graph mailboxes in PP.
-    # Other disk formats and TP retain eager execution. The independently
-    # placed draft can still capture its own graph.
-    disk_graphs = disk and mode == "pp" and model.disk_prefill.get("graph_experts", False)
+    # Canonical GGUF and native block-32 disk experts use graph mailboxes
+    # for both PP and TP. Other disk formats retain eager execution.
+    disk_graphs = disk and model.disk_prefill.get("graph_experts", False)
     if disk and not disk_graphs:
         graphs = False
     host = args.moe_device == "numa" or (args.moe_device == "cpu" and getattr(args, "_host_moe_shared", False))
@@ -1127,7 +1126,8 @@ def _v41_runtime_bytes(args, model, mode, mapping, resident, context, batch, chu
                 route = rows * (topk * (4 * model.hidden + 2 * model.intermediate) + 2 * model.hidden)
                 index = rows * context * 5 if i in r["index_sources"] else 0
                 result["graphs"][d] += page(score) + page(route) + page(index) + 6 * page_bytes
-                if disk_graphs and i >= resident:
+                if disk_graphs and i >= resident and (mode != "tp" or
+                        d == list(mapping)[i * len(mapping) // model.layers]):
                     # Pinned route payload and CPU output live for every slot;
                     # charge RAM separately instead of hiding it in GPU reserve.
                     result["host_graphs"][d] += disk_mailbox_bytes(rows, model.experts, topk)
@@ -1161,7 +1161,7 @@ def _v41_runtime_bytes(args, model, mode, mapping, resident, context, batch, chu
             for i in owners:
                 if i < model.layers or expert_layer(i, model) < resident: continue
                 routes = rows * r["draft_topk"]
-                if disk_graphs:
+                if disk_graphs and (mode != "tp" or d == next(iter(mapping))):
                     result["host_graphs"][d] += disk_mailbox_bytes(rows, r["draft_experts"], r["draft_topk"])
                 result["graphs"][d] += page(routes * (4*model.hidden + 4*model.intermediate) + rows*model.hidden*2)
                 if i in r.get("gguf_layers", ()):

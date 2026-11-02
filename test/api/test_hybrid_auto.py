@@ -859,7 +859,12 @@ class HybridAutoTest(unittest.TestCase):
         self.assertTrue(all(n > 0 for n in captured["host_graphs"].values()))
         self.assertTrue(all(captured["graphs"][i] > eager["graphs"][i] for i in (0, 1)))
         self.assertEqual(eager["host_graphs"], {0: 0, 1: 0})
-        self.assertEqual(reserve("1", "tp")["host_graphs"], {0: 0, 1: 0})
+        tp = reserve("1", "tp")
+        self.assertTrue(all(n > 0 for n in tp["host_graphs"].values()))
+        # Ordinary TP warms one extra decode slot. Routed mailboxes retain
+        # one owner per layer; TP does not duplicate the whole host payload.
+        self.assertLess(sum(tp["host_graphs"].values()), 2 * sum(captured["host_graphs"].values()))
+        self.assertEqual(reserve("0", "tp")["host_graphs"], {0: 0, 1: 0})
         metadata["quantization_config"]["weight_block_size"] = [128, 128]
         self.assertFalse(auto.geometry(metadata, "fp4", 0, 5).disk_prefill.get("graph_experts", False))
 

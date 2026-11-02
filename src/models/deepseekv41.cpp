@@ -5675,8 +5675,7 @@ namespace fastllm {
                 }
             }
 #if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
-            if (!v41MoeCudaGraphCompatible && executionMode == ExecutionMode::Hybrid &&
-                    !V41DeviceMapUsesMultiCuda(deviceMap)) {
+            if (!v41MoeCudaGraphCompatible && executionMode == ExecutionMode::Hybrid) {
                 // Disk I/O stays outside capture. Supported canonical GGUF and
                 // native FP4 layers use fixed-address mailboxes in the graph.
                 v41MoeCudaGraphCompatible = true;

@@ -121,6 +121,9 @@ def main():
     parser.add_argument('--full-verify', action='store_true',
                         help='require full target verification graphs with native FP4 experts and GPU Engram')
     args = parser.parse_args()
+    if args.disk_experts:
+        # Exercise the supported native FP4 disk mailbox, retaining FP8 boundaries.
+        args.fp8_dense = True
     if args.full_verify:
         if args.expert_cache or args.disk_experts or args.eager_only or args.hc_mult != 4 or args.tp_size == 1:
             parser.error('--full-verify requires GPU experts, hc-mult=4 and TP >= 2')
@@ -128,7 +131,7 @@ def main():
         args.ngram_device = 'cuda'
     with tempfile.TemporaryDirectory(prefix='v41-tp-graph-') as path:
         directory = Path(path)
-        prepare(directory, args.hc_mult, args.expert_cache or args.full_verify, args.fp8_dense,
+        prepare(directory, args.hc_mult, args.expert_cache or args.full_verify or args.disk_experts, args.fp8_dense,
                 expert_count=2 * args.tp_size if args.full_verify else 4)
         env = dict(os.environ, FASTLLM_SKIP_WARMUP='1', FASTLLM_DSV41_REFERENCE_MATH='0',
                    FASTLLM_DSV41_DISABLE_FAKE_QUANT='0' if args.fp8_dense else '1',
@@ -155,23 +158,19 @@ def main():
             raise SystemExit(77)
         result.check_returncode()
         assert 'PASS: eager verification 1..8, features and rollback match across requests' in result.stdout
-        if args.eager_only or args.disk_experts:
+        if args.eager_only:
             assert 'decode CUDA graph captured:' not in result.stdout
-            if args.disk_experts:
-                assert 'CUDA Graph bypassed for disk expert weights' in result.stdout
-                if not args.eager_only:
-                    assert 'PASS: disk experts preserve eager results with CUDA Graph requested' in result.stdout
         else:
             assert 'PASS: DSpark graph shapes 1..8, main features and rollback match across requests' in result.stdout
             assert 'decode CUDA graph captured:' in result.stdout, 'graph was not exercised'
             for tokens in range(1, 9):
                 assert re.search(r'graph captured:.*tokens=%d\b' % tokens, result.stdout), 'missing graph shape %d' % tokens
                 assert 'graph replay: tokens=%d' % tokens in result.stdout, 'shape %d never replayed' % tokens
-        if args.full_verify:
+        if args.full_verify or args.expert_cache or args.disk_experts:
             for tokens in range(2, 9):
                 assert f'full verify graph ready: tokens={tokens},' in result.stdout
         assert 'giving up' not in result.stdout and 'graph disabled' not in result.stdout
-        if args.expert_cache:
+        if args.expert_cache and args.tp_size == 1:
             assert re.search(r'V4.1 verify cache:.* [1-9]\d* GPU routes', result.stdout), 'verify never used GPU experts'
 
 

@@ -67,11 +67,12 @@ private:
 // Weight-table pointers remain cache keys; this class never copies the tables.
 class HybridMoeDecodeStep {
 public:
-    HybridMoeDecodeStep() = default;
+    // Concurrent TP ranks own disjoint caches and finish only their owner.
+    explicit HybridMoeDecodeStep(bool deviceLocal = false) : deviceLocal(deviceLocal) {}
     HybridMoeDecodeStep(const HybridMoeDecodeStep &) = delete;
     HybridMoeDecodeStep &operator=(const HybridMoeDecodeStep &) = delete;
     HybridMoeDecodeStep(HybridMoeDecodeStep &&other) noexcept
-        : policy(std::exchange(other.policy, nullptr)) {}
+        : policy(std::exchange(other.policy, nullptr)), deviceLocal(other.deviceLocal) {}
     ~HybridMoeDecodeStep();
     void Begin(Data **weights, int count, int topk,
                const std::vector<int> *devices = nullptr);
@@ -81,6 +82,7 @@ public:
     explicit operator bool() const { return policy != nullptr; }
 private:
     void *policy = nullptr;
+    bool deviceLocal = false;
 };
 
 // One policy per cache-owning device, started lazily when its first MoE layer

@@ -49,6 +49,9 @@ static void AppendTensor(std::vector<float> &result, const Data &input) {
 // Exercise every candidate count, fresh request state, ring wrap and rejected
 // suffixes. Compare actual target features and committed KV, not only argmax.
 static std::vector<float> RunDsparkRequests(DeepSeekV41Model &model, int candidates = 8) {
+    // The fixture switches modes in one model; real service startup fixes
+    // DSpark before capture. Ordinary graphs do not own target features.
+    if (!(model.*(&Access::v41DsparkEnabled))) (model.*(&Access::v41CudaGraphSlots)).clear();
     model.*(&Access::v41DsparkEnabled) = true;
     model.*(&Access::v41DsparkTpDevices) = tpDevices;
     // Real requests enter DsparkAdvance after prefill before verifying drafts.
@@ -194,7 +197,7 @@ int main(int argc, char **argv) {
             (expertCache ? "numa" : (diskExperts ? "disk" : "cpu"));
         SetMoeDeviceMap({{moeDevice, 1}});
         SetNgramDevice(gpuEngram ? "cuda" : diskEngram ? "disk" : "cpu");
-        if (expertCache) {
+        if (expertCache || diskExperts) {
             SetMoeCudaCacheBytes(16ULL << 20);
             // Keep the split deterministic while testing graph replay and KV.
             setenv("FASTLLM_DSV41_MOE_CACHE_GPU_EXPERTS", "2", 1);
@@ -208,6 +211,8 @@ int main(int argc, char **argv) {
             throw std::runtime_error("wrong execution backend selected");
         }
         // Initialize weight shards and kernel plans before comparing dispatch.
+        model.maxBatch = 1;
+        model.WarmUp();
         RunRequests(model, {7});
         const auto expected = RunRequests(model, {7, 17, 33, 7});
         if (!logitsOnly.empty()) {
@@ -225,7 +230,7 @@ int main(int argc, char **argv) {
             // same warmup here instead of relying on request-time capture.
             model.maxBatch = 1;
             model.WarmUp();
-            const size_t ordinaryShapes = diskExperts ? 0 : 1;
+            const size_t ordinaryShapes = 1;
             if ((model.*(&Access::v41CudaGraphSlots)).size() != ordinaryShapes)
                 throw std::runtime_error("unexpected startup decode graph shapes");
             Compare(expected, RunRequests(model, {7, 17, 33, 7}));
@@ -264,7 +269,7 @@ int main(int argc, char **argv) {
             std::cout << "PASS: graph verification cache routes=" << cacheAfter[1] - cacheBefore[1]
                       << " GPU routes=" << cacheAfter[4] - cacheBefore[4] << '\n';
         }
-        const size_t expectedGraphShapes = diskExperts ? 0 : 8;
+        const size_t expectedGraphShapes = 7; // verification rows 2..8; ordinary decode checked above
         if ((model.*(&Access::v41CudaGraphSlots)).size() != expectedGraphShapes)
             throw std::runtime_error("unexpected DSpark graph shapes or disk graph fallback");
         SetCudaGraph(false);
@@ -283,11 +288,7 @@ int main(int argc, char **argv) {
             Compare(verifyEight, RunDsparkRequests(model));
             std::cout << "PASS: graph verification survives NUMA fallback and resident cache transitions\n";
         }
-        if (diskExperts) {
-            std::cout << "PASS: disk experts preserve eager results with CUDA Graph requested, including verification and rollback\n";
-        } else {
-            std::cout << "PASS: DSpark graph shapes 1..8, main features and rollback match across requests\n";
-        }
+        std::cout << "PASS: DSpark graph shapes 1..8, main features and rollback match across requests\n";
     } catch (const std::exception &e) {
         std::cerr << "FAIL: " << e.what() << '\n';
         return 1;

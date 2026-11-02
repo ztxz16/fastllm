@@ -21,6 +21,8 @@ bool FastllmCudaPrepareMoeExpertCache(fastllm::Data **weights, int weightsBatch,
 void *FastllmCudaBeginMoeDecode(fastllm::Data **weights, int weightsBatch, int topk,
                               const std::vector<int> *devices);
 void FastllmCudaEndMoeDecode(void *state);
+// Finish an independently owned cache; concurrent ranks must not iterate peers.
+void FastllmCudaEndMoeDecodeOnDevice(void *state);
 // Join deferred CPU experts before another operation borrows the host pool.
 void FastllmCudaWaitMoeDecodeCpu(void *state);
 
