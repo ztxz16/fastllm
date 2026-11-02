@@ -720,8 +720,11 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
                 // graph, even if another layer later replaced ws.kv storage.
                 b.kv = state->segments[l * 4].kvOutputs.at(rank);
                 b.output = ptr(ws.attnOut);
-                b.rawKV = ptr(ws.rawKVAll);
-                b.rawScore = ptr(ws.rawScoreAll);
+                const auto &projection = state->segments[l * 4];
+                if (layer.config.kvSource) {
+                    b.rawKV = projection.rawKVOutputs.at(rank);
+                    if (layer.config.ratio > 1) b.rawScore = projection.rawScoreOutputs.at(rank);
+                }
                 b.joined = ptr(layer.joined);
                 b.scores = ptr(layer.scores);
                 b.latents = ptr(layer.latents);

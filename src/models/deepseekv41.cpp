@@ -4598,7 +4598,7 @@ namespace fastllm {
         int composedLast = -1;
         std::vector<int> qDims, kvDims, qIdxDims;
         std::vector<int> ffnDims, ffnInputDims, expertIndexDims, expertScoreDims;
-        std::vector<void *> kvOutputs;
+        std::vector<void *> kvOutputs, rawKVOutputs, rawScoreOutputs;
         bool swapHidden = false;
         bool ffnInputQuantizedReady = false;
     };
@@ -6251,12 +6251,16 @@ namespace fastllm {
 #ifdef USE_CUDA
                     // Later layers may replace this workspace allocation.
                     // Graph kernels retain the output address captured here.
-                    meta.kvOutputs.clear();
-                    if (tp) {
-                        for (int device : tpDevices)
-                            meta.kvOutputs.push_back(kv.multiDeviceDatas.at(device)->cudaData);
-                    } else {
-                        meta.kvOutputs.push_back(kv.cudaData);
+                    auto remember = [&](Data &data, std::vector<void *> &pointers) {
+                        pointers.clear();
+                        if (tp) for (int device : tpDevices)
+                            pointers.push_back(data.multiDeviceDatas.at(device)->cudaData);
+                        else pointers.push_back(data.cudaData);
+                    };
+                    remember(kv, meta.kvOutputs);
+                    if (ratio > 0 && isKvSource[layer]) {
+                        remember(rawKVAll, meta.rawKVOutputs);
+                        if (ratio > 1) remember(rawScoreAll, meta.rawScoreOutputs);
                     }
 #endif
                     meta.qIdxDims = qIdxAll.dims;
@@ -6269,22 +6273,24 @@ namespace fastllm {
                         kv.Reshape(meta.kvDims);
                     }
 #ifdef USE_CUDA
-                    if (tp) {
-                        bool moved = false;
-                        if (meta.kvOutputs.size() == tpDevices.size()) {
+                    auto restoreOutput = [&](Data &data, const std::vector<void *> &pointers) {
+                        if (pointers.empty()) return;
+                        if (tp) {
+                            bool moved = false;
                             for (size_t rank = 0; rank < tpDevices.size(); ++rank)
-                                moved |= kv.multiDeviceDatas.at(tpDevices[rank])->cudaData != meta.kvOutputs[rank];
-                        }
-                        if (moved) {
-                            MultiCudaRunDeviceCallbacks(tpDevices, [&](int rank, int device) {
-                                Data &local = *kv.multiDeviceDatas.at(device);
-                                if (local.cudaData != meta.kvOutputs[rank])
-                                    FastllmCudaCopyFromDeviceToDevice(local.cudaData, meta.kvOutputs[rank], local.GetBytes());
+                                moved |= data.multiDeviceDatas.at(tpDevices[rank])->cudaData != pointers.at(rank);
+                            if (moved) MultiCudaRunDeviceCallbacks(tpDevices, [&](int rank, int device) {
+                                Data &local = *data.multiDeviceDatas.at(device);
+                                if (local.cudaData != pointers[rank])
+                                    FastllmCudaCopyFromDeviceToDevice(local.cudaData, pointers[rank], local.GetBytes());
                             });
+                        } else if (data.cudaData != pointers[0]) {
+                            FastllmCudaCopyFromDeviceToDevice(data.cudaData, pointers[0], data.GetBytes());
                         }
-                    } else if (meta.kvOutputs.size() == 1 && kv.cudaData != meta.kvOutputs[0]) {
-                        FastllmCudaCopyFromDeviceToDevice(kv.cudaData, meta.kvOutputs[0], kv.GetBytes());
-                    }
+                    };
+                    restoreOutput(kv, meta.kvOutputs);
+                    restoreOutput(rawKVAll, meta.rawKVOutputs);
+                    restoreOutput(rawScoreAll, meta.rawScoreOutputs);
 #endif
                     if (!meta.qIdxDims.empty() && qIdxAll.dims != meta.qIdxDims) {
                         qIdxAll.Reshape(meta.qIdxDims);
