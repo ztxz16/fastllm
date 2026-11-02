@@ -1,4 +1,7 @@
 #include "fastllm.h"
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+#include "disk_moe_graph_test.h"
+#endif
 #include "utils.h"
 #include "devices/disk/diskdevice.h"
 #include "devices/cpu/alivethreadpool.h"
@@ -77,14 +80,14 @@ struct Fixture {
     }
     ~Fixture() { storage.clear(); unlink(path.c_str()); }
     std::vector<uint16_t> Run(bool cached, int batch, int offset, int device = -1,
-                              bool borrowedInput = false, int topk = 3, bool quantShared = true) {
+                              bool borrowedInput = false, int topk = 3, bool quantShared = true, float phase = 0) {
         Data x(DataType::BFLOAT16, {batch, hidden}), y(DataType::BFLOAT16, {batch, hidden});
         Data ids(DataType::INT32PARAM, {batch, topk}), scores(DataType::FLOAT32, {batch, topk});
         Data a, b, c;
         x.Allocate(false); ids.Allocate(false); scores.Allocate(false);
         for (int row = 0; row < batch; ++row) {
             for (int col = 0; col < hidden; ++col) {
-                float value = RoundFloat32ToBFloat16RNE(std::sin(float(row * hidden + col) * .71f) * .4f);
+                float value = RoundFloat32ToBFloat16RNE(std::sin(float(row * hidden + col) * .71f + phase) * .4f);
                 uint32_t bits; memcpy(&bits, &value, 4);
                 ((uint16_t*)x.cpuData)[row * hidden + col] = bits >> 16;
             }
@@ -149,8 +152,101 @@ void Compare(const std::vector<uint16_t> &actual, const std::vector<uint16_t> &e
     }
 }
 }
+#if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
+template <int H, int M> void TestNativeFullGraph(bool large) {
+    for (int device = 0; device < (large ? 1 : std::min(2, FastllmCudaGetDeviceCount())); ++device) {
+        FastllmCudaSetDevice(device);
+        Fixture<H, M, 8> f(false, true);
+        Require(DiskMoeV41Graph::Supports(f.disk), "native disk graph eligibility");
+        Require(!DiskMoeV41Graph::Supports(f.memory), "non-disk weights admitted");
+        f.disk[2]->blockM = 16;
+        Require(!DiskMoeV41Graph::Supports(f.disk), "wrong FP4 scale block admitted");
+        f.disk[2]->blockM = 32;
+        for (int tier : {0, 1, 2, 3}) {
+            SetMoeCpuCacheBytes(0);
+            SetMoeCudaCacheBytes(0);
+            TrimDiskMoeCache();
+            SetMoeCpuCacheBytes(tier == 0 ? 0 : tier == 2 ? f.expertBytes * 2 : 1ULL << 30);
+            SetMoeCudaCacheBytes(tier < 2 ? 0 : f.expertBytes * (tier == 2 ? 2 : 8));
+            if (tier == 3)
+                for (int pass = 0; pass < 64; ++pass)
+                    f.Run(true, 1, pass, device, false, 8);
+            if (tier == 3)
+                Require(GetDiskMoeCacheStats().cudaBytes == f.expertBytes * 8,
+                        "native GPU tier not populated");
+            for (int rows :
+                 large ? std::vector<int>{1, 4, 6, 8} : std::vector<int>{1, 2, 3, 4, 6, 8, 9, 16, 32}) {
+                constexpr int topk = 6;
+                Data x(BFLOAT16, {rows, H}), ids(INT32, {rows, topk}), scores(FLOAT32, {rows, topk}), out;
+                for (Data *d : {&x, &ids, &scores}) {
+                    d->Allocate(false);
+                    memset(d->cpuData, 0, d->GetBytes());
+                    d->ToDevice(CUDA, {device}, true);
+                }
+                DiskMoeV41Graph graph;
+                void *child = graph.Add(x, ids, scores, out, f.disk, 2.f), *exec = nullptr;
+                Require(child && FastllmCudaGraphInstantiate(child, &exec), "native disk graph capture");
+                if (rows == 1 && tier == 0) CheckDiskGraphCancellation(graph, exec);
+                for (int pass = 0; pass < (large ? 2 : 4); ++pass) {
+                    const float phase = .13f * pass;
+                    for (int row = 0; row < rows; ++row) {
+                        for (int col = 0; col < H; ++col)
+                            reinterpret_cast<uint16_t *>(x.cpuData)[size_t(row) * H + col] =
+                                Float32ToBFloat16RNEBits(std::sin(float(row * H + col) * .71f + phase) * .4f);
+                        for (int j = 0; j < topk; ++j) {
+                            reinterpret_cast<int32_t *>(ids.cpuData)[row * topk + j] =
+                                (pass + (topk - 1 - j) * 2 + row % 2) % 8;
+                            reinterpret_cast<float *>(scores.cpuData)[row * topk + j] = .17f + j * .21f;
+                        }
+                    }
+                    for (Data *d : {&x, &ids, &scores})
+                        FastllmCudaCopyFromHostToDevice(d->cudaData, d->cpuData, d->GetBytes());
+                    Require(graph.Launch([&] { return FastllmCudaGraphLaunch(exec); }),
+                            "native disk graph replay");
+                    std::vector<uint16_t> actual(size_t(rows) * H);
+                    FastllmCudaCopyFromDeviceToHost(actual.data(), out.cudaData, actual.size() * 2);
+                    auto expected = f.Run(true, rows, pass, device, false, topk, true, phase);
+                    double diff = 0, norm = 0;
+                    for (size_t i = 0; i < actual.size(); ++i) {
+                        float a = Float(actual[i]), b = Float(expected[i]);
+                        Require(std::isfinite(a) && std::isfinite(b), "native graph nonfinite");
+                        diff += double(a - b) * (a - b);
+                        norm += double(b) * b;
+                    }
+                    const double l2 = std::sqrt(diff / std::max(1e-12, norm));
+                    printf("NATIVE_GRAPH device=%d hidden=%d inter=%d tier=%d rows=%d pass=%d "
+                           "relative_l2=%.9g\n",
+                           device, H, M, tier, rows, pass, l2);
+                    Require(l2 < .003, "native disk graph numerical mismatch");
+                    auto stats = GetDiskMoeCacheStats();
+                    Require(stats.cpuBytes + stats.cpuWorkspaceBytes <= GetMoeCpuCacheBytes(),
+                            "native graph RAM budget");
+                    Require(stats.cudaBytes <=
+                                GetMoeCudaCacheBytes() * std::min(2, FastllmCudaGetDeviceCount()),
+                            "native graph VRAM budget");
+                }
+                FastllmCudaGraphExecDestroy(exec);
+            }
+        }
+    }
+    SetMoeCpuCacheBytes(0);
+    SetMoeCudaCacheBytes(0);
+    TrimDiskMoeCache();
+    puts("PASS: native NVFP4 disk full graph");
+}
+#endif
+
 int main(int argc, char **argv) {
     try {
+#if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
+        if (argc > 1 && (!strcmp(argv[1], "--full-graph") || !strcmp(argv[1], "--full-graph-large"))) {
+            if (FastllmCudaGetDeviceCount() < 1) return 77;
+            SetThreads(4);
+            if (!strcmp(argv[1], "--full-graph-large")) TestNativeFullGraph<5120, 2304>(true);
+            else TestNativeFullGraph<512, 256>(false);
+            return 0;
+        }
+#endif
         int devices = argc > 1 ? std::stoi(argv[1]) : 0;
 #ifndef USE_CUDA
         Require(devices == 0, "CUDA not built");

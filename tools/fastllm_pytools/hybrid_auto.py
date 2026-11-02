@@ -521,6 +521,7 @@ def geometry(metadata, kv_dtype, mtp, dspark=0):
             # Byte counts, not FP32 element counts. ReleaseForwardPrefill frees
             # attention temporaries before WoA and MoE; hidden/features survive.
             result.disk_prefill = {
+                "graph_experts": True,
                 "window": int(config["sliding_window"]),
                 "retained": hidden * hc * 4 + (hidden * (len(targets) + 1) * 2 if dspark else 0),
                 "attention": (heads * dim * 4 + hidden * 8 +
@@ -1012,7 +1013,7 @@ def _v41_runtime_bytes(args, model, mode, mapping, resident, context, batch, chu
     be recycled by a subsequent prompt. Prefill itself is never graph-captured.
     """
     result = {name: dict.fromkeys(mapping, 0) for name in
-              ("graphs", "staging", "prefill_persistent")}
+              ("graphs", "staging", "prefill_persistent", "host_graphs")}
     r = model.runtime
     if not r or args.atype not in ("auto", "bfloat16"):
         return result
@@ -1024,9 +1025,13 @@ def _v41_runtime_bytes(args, model, mode, mapping, resident, context, batch, chu
             os.environ.get("FASTLLM_DSV41_REFERENCE_MATH", "0") not in ("", "0")):
         graphs = False
     hybrid = resident < model.layers
-    # InitExecutionMode disables capture for every V4.1 layer when any expert
-    # uses disk, including mixed NUMA/disk placement. Eager staging still lives.
-    if hybrid and (disk_experts or args.moe_device == "disk"):
+    draft_graphs = graphs
+    disk = hybrid and (disk_experts or args.moe_device == "disk")
+    # Canonical GGUF and native block-32 disk experts have graph mailboxes in PP.
+    # Other disk formats and TP retain eager execution. The independently
+    # placed draft can still capture its own graph.
+    disk_graphs = disk and mode == "pp" and model.disk_prefill.get("graph_experts", False)
+    if disk and not disk_graphs:
         graphs = False
     host = args.moe_device == "numa" or (args.moe_device == "cpu" and getattr(args, "_host_moe_shared", False))
     drafts = max(0, getattr(args, "dspark", 0))
@@ -1042,6 +1047,10 @@ def _v41_runtime_bytes(args, model, mode, mapping, resident, context, batch, chu
 
     def page(n):
         return (n + page_bytes - 1) // page_bytes * page_bytes
+
+    def disk_mailbox_bytes(rows, experts, topk):
+        # Six separately aligned arrays follow the mailbox control cache lines.
+        return page(rows * model.hidden * (1 + topk) * 4 + rows * topk * 12 + experts * 8 + 7 * 256)
 
     def small_q5_workspace(rows, owners, device):
         if not gpu or gpu[device].get("capability") != 75 or not 4 <= rows <= 8:
@@ -1077,11 +1086,11 @@ def _v41_runtime_bytes(args, model, mode, mapping, resident, context, batch, chu
 
         has_target = record_bytes(host_layers) and any(i in host_layers for i in layers)
         has_draft = record_bytes(draft_layers) and any(i in draft_layers for i in owners)
-        if host and (has_target or has_draft):
+        if (host and has_target) or has_draft:
             # Eager one-row, eager multi-row and full-graph mailbox rings
             # coexist. Warmup/prefill tails can retain the eight-row eager
             # buffer even when ordinary decode requests only one row.
-            if args.moe_cuda_cache != 0 and has_target:
+            if host and args.moe_cuda_cache != 0 and has_target:
                 eager_rows = max(8, min(32, max(batch, drafts + 1)))
                 capacities = [16, min(model.experts, eager_rows * topk)]
                 if not drafts:
@@ -1093,7 +1102,7 @@ def _v41_runtime_bytes(args, model, mode, mapping, resident, context, batch, chu
                 capacities = [min(r["draft_experts"], min(32, model.dspark_block_size) * r["draft_topk"])]
                 if model.dspark_block_size == 1:
                     capacities += [16, r["draft_topk"]]
-                if graphs:
+                if draft_graphs:
                     capacities.append(16)
                 result["staging"][d] += upload_bytes(draft_layers, capacities)
             if chunk > r["window"]:
@@ -1105,9 +1114,7 @@ def _v41_runtime_bytes(args, model, mode, mapping, resident, context, batch, chu
                 os.environ.get("FASTLLM_DSV41_HYBRID_PP", "0") not in ("", "0")):
             # CudaChunkedPrefillPipeline double-buffers the HC stage payload.
             result["prefill_persistent"][d] += 2 * chunk * r["hc"] * (model.hidden + 2) * 2
-        if not graphs:
-            continue
-        for rows in shapes:
+        for rows in shapes if graphs else ():
             result["graphs"][d] += small_q5_workspace(rows, layers, d)
             # Segmented graphs retain their workspace too, including shapes
             # outside the full-graph fast path. Keep the generic scratch bound.
@@ -1120,6 +1127,10 @@ def _v41_runtime_bytes(args, model, mode, mapping, resident, context, batch, chu
                 route = rows * (topk * (4 * model.hidden + 2 * model.intermediate) + 2 * model.hidden)
                 index = rows * context * 5 if i in r["index_sources"] else 0
                 result["graphs"][d] += page(score) + page(route) + page(index) + 6 * page_bytes
+                if disk_graphs and i >= resident:
+                    # Pinned route payload and CPU output live for every slot;
+                    # charge RAM separately instead of hiding it in GPU reserve.
+                    result["host_graphs"][d] += disk_mailbox_bytes(rows, model.experts, topk)
                 if i >= resident and i in r.get("gguf_layers", ()):
                     # NativeMoeMailbox::Layer owns two independent GGUF
                     # branches. Their scratch is bounded at 8 rows * 16
@@ -1138,7 +1149,7 @@ def _v41_runtime_bytes(args, model, mode, mapping, resident, context, batch, chu
                                                        8*r["heads"]*4 + keys + 4))
             if model.layers - 1 in owners:
                 result["graphs"][d] += page(rows * r["vocab"] * 4) * 3
-        if drafts and model.layers - 1 in owners:
+        if draft_graphs and drafts and model.layers - 1 in owners:
             # The draft graph is additional to the target verifier slots.
             rows = model.dspark_block_size
             result["graphs"][d] += small_q5_workspace(rows, [i for i in owners if i >= model.layers], d)
@@ -1150,6 +1161,8 @@ def _v41_runtime_bytes(args, model, mode, mapping, resident, context, batch, chu
             for i in owners:
                 if i < model.layers or expert_layer(i, model) < resident: continue
                 routes = rows * r["draft_topk"]
+                if disk_graphs:
+                    result["host_graphs"][d] += disk_mailbox_bytes(rows, r["draft_experts"], r["draft_topk"])
                 result["graphs"][d] += page(routes * (4*model.hidden + 4*model.intermediate) + rows*model.hidden*2)
                 if i in r.get("gguf_layers", ()):
                     result["graphs"][d] += 2 * gguf_scratch
@@ -1279,7 +1292,7 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
             runtime = _v41_runtime_bytes(args, model, mode, mapping, resident, context, batch, chunk, gpu,
                                          disk_experts=disk_experts)
             used = {d: common + workspace + transport + guard +
-                    sum(values[d] for values in runtime.values()) for d in mapping}
+                    sum(values[d] for key, values in runtime.items() if key != "host_graphs") for d in mapping}
             reallocation = dict.fromkeys(mapping, 0)
             logical_kv = dict.fromkeys(mapping, 0)
             capacity_kv = dict.fromkeys(mapping, 0)
@@ -1400,7 +1413,7 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
                           "FASTLLM_DSV41_DUMP_DIR" not in os.environ and
                           os.environ.get("FASTLLM_DSV41_REFERENCE_MATH", "0") in ("", "0"))
             host_workspace = max(staging, workspace) if early_cuda else staging + workspace
-            host_required = host + host_workspace + GiB + len(mapping) * disk_staging
+            host_required = host + host_workspace + GiB + len(mapping) * disk_staging + sum(runtime["host_graphs"].values())
             if args.moe_device == "disk":
                 host_required += eager_host_experts
             if args.moe_device != "disk":

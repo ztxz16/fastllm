@@ -1266,6 +1266,14 @@ if (UNIT_TEST)
                 "PASS: tuned V4.1 GGUF decode" 360 --tuned)
             set_tests_properties(cuda_v41_gguf_tuned PROPERTIES LABELS "cuda;gguf" RUN_SERIAL TRUE)
             if (USE_NUMAS)
+                foreach(size IN ITEMS full-graph full-graph-large)
+                    fastllm_add_checked_test(disk_nvfp4_${size} disk_moe_cache_test
+                        "PASS: native NVFP4 disk full graph" 300 --${size})
+                    fastllm_add_checked_test(disk_gguf_${size} disk_v41_gguf_cache_test
+                        "PASS: disk full graph" 300 --${size})
+                    set_tests_properties(disk_nvfp4_${size} disk_gguf_${size}
+                        PROPERTIES LABELS "cuda;disk;graph" RUN_SERIAL TRUE)
+                endforeach()
                 fastllm_add_checked_test(disk_v41_gguf_iq2_batch disk_v41_gguf_cache_test
                     "PASS: IQ2 canonical and NUMA multirow integration" 300 --iq2-batch)
                 set_tests_properties(disk_v41_gguf_iq2_batch PROPERTIES LABELS "cuda;gguf;numa" RUN_SERIAL TRUE)

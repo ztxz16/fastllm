@@ -2571,12 +2571,6 @@ namespace fastllm {
         executionMode = ResolveExecutionMode(requested, placements);
         printf("[Fastllm] FASTLLM_EXECUTION_MODE=%s -> %s (DeepSeek-V4.1)\n",
                NormalizeExecutionMode(requested ? requested : "auto").c_str(), ExecutionModeName(executionMode));
-        if (!v41MoeCudaGraphCompatible) {
-            // Disk experts load/release temporary weights during a forward.
-            // They do not satisfy the persistent graph workspace contract.
-            // Engram disk lookups are independent and remain graph-compatible.
-            printf("[Fastllm] DeepSeek-V4.1: CUDA Graph bypassed for disk expert weights; using eager execution.\n");
-        }
         fflush(stdout);
     }
 
@@ -5680,6 +5674,17 @@ namespace fastllm {
                     biass[layer].push_back(nullptr);
                 }
             }
+#if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
+            if (!v41MoeCudaGraphCompatible && executionMode == ExecutionMode::Hybrid &&
+                    !V41DeviceMapUsesMultiCuda(deviceMap)) {
+                // Disk I/O stays outside capture. Supported canonical GGUF and
+                // native FP4 layers use fixed-address mailboxes in the graph.
+                v41MoeCudaGraphCompatible = true;
+                for (int layer = 0; layer < block_cnt; ++layer)
+                    if (V41DeviceSpecUsesType(SelectMoeDeviceForLayer(layer), "disk"))
+                        v41MoeCudaGraphCompatible &= DiskMoeV41Graph::Supports(weights[layer]);
+            }
+#endif
         }
 
     }

@@ -204,4 +204,6 @@ bool FastllmCudaDiskMoeAsync::Run(int layer,const fastllm::Data &input,const fas
     fastllm::AssertInFastLLM(ok,"Disk asynchronous GGUF launch failed.\n");
     return true;
 }
+
+#include "fastllm-disk-v41-graph.cuh"
 #endif

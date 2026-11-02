@@ -5656,3 +5656,5 @@ namespace fastllm {
         releaseOwnedWeights();
     }
 }
+
+#include "disk-moe-v41-graph.inc"

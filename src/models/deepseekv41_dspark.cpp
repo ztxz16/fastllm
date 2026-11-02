@@ -54,6 +54,7 @@
 #endif
 
 #include <algorithm>
+#include "devices/disk/diskdevice.h"
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -96,6 +97,7 @@ namespace fastllm {
         std::vector<RoutedExpertWorkspace> routedExperts;
         std::vector<void *> moeHandles;
         bool hybridExperts = false;
+        std::unique_ptr<DiskMoeV41Graph> diskExperts;
         // Resolve immutable packed weights during warmup and keep them alive
         // until ClearGraphs has destroyed every graph referencing them.
         std::map<int, Data> packedQkvWeights;
@@ -120,6 +122,7 @@ namespace fastllm {
                 if (routedExperts[i].exec) FastllmCudaGraphExecDestroy(routedExperts[i].exec);
                 if (i < moeHandles.size()) FastllmCudaReleaseNativeMoeFullGraph(moeHandles[i]);
             }
+            diskExperts.reset();
             routedExperts.clear(); moeHandles.clear();
             FastllmCudaGraphMemoryPoolRelease(reserved);
             graphs.clear(); execs.clear(); starts.clear(); ends.clear(); reserved.clear();
@@ -142,9 +145,12 @@ namespace fastllm {
                 } else {
                     for (size_t i = 0; i < state.devices.size(); ++i) {
                         FastllmCudaSetDevice(state.devices[i]);
-                        const bool ok = state.moeHandles.empty() ? FastllmCudaGraphLaunch(state.execs[i]) :
-                            FastllmCudaLaunchNativeMoeFullGraph(state.execs[i], state.moeHandles.data(),
-                                                              int(state.moeHandles.size()));
+                        const auto replay = [&] {
+                            return state.moeHandles.empty() ? FastllmCudaGraphLaunch(state.execs[i]) :
+                                FastllmCudaLaunchNativeMoeFullGraph(state.execs[i], state.moeHandles.data(),
+                                                                  int(state.moeHandles.size()));
+                        };
+                        const bool ok = state.diskExperts ? state.diskExperts->Launch(replay) : replay();
                         AssertInFastLLM(ok, "DeepSeekV41 DSpark graph launch failed.");
                     }
                 }
@@ -2256,7 +2262,7 @@ namespace fastllm {
         Data &markovHeadWeight = weight[last + ".markov_head.head.weight"];
         Data eagerHeadHidden, eagerNormed, eagerMarkov;
         DeepSeekV41DsparkWorkspace *graphState = nullptr;
-        bool residentDraft = false, hybridDraft = false;
+        bool residentDraft = false, hybridDraft = false, diskDraft = false;
 #ifdef USE_CUDA
         // Device-resident experts can capture on one GPU as well as TP.
         // Partial windows use uploaded indices keyed by their gather width.
@@ -2277,6 +2283,15 @@ namespace fastllm {
                 hybridDraft &= next && (!owner || owner == next);
                 owner = next;
             }
+        }
+        // Native disk drafts own a serial mailbox worker independently of
+        // target verification. Add every child during eager warmup, then start
+        // that worker only when the complete draft graph is replayed.
+        if (!residentDraft && !hybridDraft && v41DsparkTpDevices.empty() &&
+                block <= 32 && DsDraftGraphEnabled() && GetCudaSharedExpert()) {
+            diskDraft = !v41DsparkMoeWeights.empty();
+            for (const auto &table : v41DsparkMoeWeights)
+                diskDraft &= DiskMoeV41Graph::Supports(table);
         }
         const int vocab = weight["head.weight"].dims[0];
         const bool fusedMarkovAllowed = !config.tool_call_name_constraint_enabled &&
@@ -2306,8 +2321,7 @@ namespace fastllm {
              markovEmbedWeight.dataType == DataType::FLOAT16 || markovEmbedWeight.dataType == DataType::FLOAT32);
         const bool graphEligible = graphMarkov && DsDraftGraphEnabled() &&
             fusedMarkovAllowed && (!randomDraft || sampledMarkov) &&
-            v41MoeCudaGraphCompatible &&
-            (residentDraft || hybridDraft || v41DsparkTpDevices.size() > 1) &&
+            (residentDraft || hybridDraft || diskDraft || v41DsparkTpDevices.size() > 1) &&
             !DsEnvFlag("FASTLLM_DSV41_DISABLE_CUDA_ROUTE") && !DsEnvFlag("FASTLLM_DISABLE_NCCL");
         if (graphEligible && randomDraft) prepareProposalProbs(FastllmCudaGetDevice(), vocab);
         const Data &embedding = weight["embed.weight"];
@@ -2336,7 +2350,8 @@ namespace fastllm {
                 auto &w = *dspark.workspace;
                 w.devices = graphDevices; w.block = block; w.width = width;
                 w.hybridExperts = hybridDraft;
-                if (hybridDraft) w.parallelExperts = false;
+                if (diskDraft) w.diskExperts = std::make_unique<DiskMoeV41Graph>();
+                if (hybridDraft || diskDraft) w.parallelExperts = false;
                 w.deviceInputs = deviceInputs;
                 w.sampledMarkov = sampledMarkov; w.temperature = config.temperature;
                 w.topK = config.top_k; w.topP = config.top_p;
@@ -2608,8 +2623,29 @@ namespace fastllm {
                         SelectSpecialWeightDevice(pre + ".ffn.experts.0.gateup.weight", layerId));
                     bool hybrid = false;
 #if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
-                    if (graphState && graphState->hybridExperts && !hasSharedExpertOut)
+                    if (graphState && (graphState->hybridExperts || graphState->diskExperts) && !hasSharedExpertOut)
                         graphState->disabled = true;
+                    if (graphState && graphState->diskExperts && hasSharedExpertOut) {
+                        auto &state = *graphState;
+                        state.routedExperts.resize(v41DsparkLayers);
+                        auto &routed = state.routedExperts[stage];
+                        routed.input.CopyFrom(ffnInput);
+                        routed.index.CopyFrom(expertIndex);
+                        routed.score.CopyFrom(expertScore);
+                        if (!routed.graph && !dsparkCapturing) {
+                            routed.graph = state.diskExperts->Add(routed.input, routed.index, routed.score,
+                                routed.output, moeWeights, swiglu_limit);
+                            if (!routed.graph) state.disabled = true;
+                        }
+                        if (dsparkCapturing && !state.disabled) {
+                            AssertInFastLLM(FastllmCudaGraphAppendChild(routed.graph),
+                                           "DeepSeekV41 DSpark disk MoE graph failed.");
+                            ffnOut.CopyFrom(routed.output);
+                            hybrid = true;
+                        }
+                        // Eager warmups use MergeMOE below. A partial draft
+                        // must not launch a worker that expects later layers.
+                    }
                     if (graphState && graphState->hybridExperts && hasSharedExpertOut) {
                         auto &state = *graphState;
                         state.routedExperts.resize(v41DsparkLayers);
@@ -2651,7 +2687,7 @@ namespace fastllm {
                                   quantizedLinearNames.count(pre + ".ffn.experts.0.w1.weight") ? 32 : 128,
                                   quantizedLinearNames.count(pre + ".ffn.shared_experts.w1.weight") != 0);
                     // Only the persistent packet path supplies graph-safe EP buffers.
-                    if (graphState && !residentDraft && !graphState->hybridExperts && !ffnOut.cudaDataBorrowed) graphState->disabled = true;
+                    if (graphState && !residentDraft && !graphState->hybridExperts && !graphState->diskExperts && !ffnOut.cudaDataBorrowed) graphState->disabled = true;
                     ApplyDsparkDevice();
                     if (hasSharedExpertOut) {
 #ifdef USE_CUDA

@@ -1,4 +1,7 @@
 #include "fastllm.h"
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+#include "disk_moe_graph_test.h"
+#endif
 #include "utils.h"
 #include "gguf.h"
 #include "gguf_iq2_s_r4_fixture.h"
@@ -85,13 +88,13 @@ struct Fixture {
         fclose(file);
     }
     ~Fixture() { owned.clear(); unlink(path.c_str()); }
-    std::vector<float> Run(bool lazy, int rows, int offset, int device, int topk=6, bool grouped=false, bool gpuIo=false, int lastExpert=-1, float sharedScale=0) {
+    std::vector<float> Run(bool lazy, int rows, int offset, int device, int topk=6, bool grouped=false, bool gpuIo=false, int lastExpert=-1, float sharedScale=0, float phase=0) {
         Data x(BFLOAT16,{rows,hidden}), y(BFLOAT16,{rows,hidden});
         Data ids(INT32,{rows,topk}), scores(FLOAT32,{rows,topk}),a,b,c;
         x.Allocate(false); ids.Allocate(false); scores.Allocate(false);
         for (int r=0; r<rows; ++r) {
             for (int j=0; j<hidden; ++j) ((uint16_t *)x.cpuData)[r*hidden+j] =
-                Float32ToBFloat16RNEBits(std::sin((r*hidden+j)*.71f)*3);
+                Float32ToBFloat16RNEBits(std::sin((r*hidden+j)*.71f+phase)*3);
             for (int k=0; k<topk; ++k) {
                 ((int32_t *)ids.cpuData)[r*topk+k] = (offset+(k==2 && r%3==0 ? 0 : k)+(experts > 8 ? r : r%2))%experts;
                 ((float *)scores.cpuData)[r*topk+k] = topk==1 ? .37f : k==0 ? 0 : k==1 ? -.17f : .2f+.13f*k;
@@ -693,9 +696,94 @@ static void TestColdBatchBound() {
           "bounded cold batch reread expert");
 }
 
+// Replay the same graph while changing inputs and routes. Exercise cold SSD,
+// RAM hits, GPU hits, promotion, bounded eviction, and every verifier tile edge.
+static void TestDiskFullGraph(bool large = false) {
+    for (int device = 0; device < (large ? 1 : std::min(2, FastllmCudaGetDeviceCount())); ++device)
+        for (auto types :
+             {std::pair<int, int>{GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ1_M}, {GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S}}) {
+            FastllmCudaSetDevice(device);
+            Fixture f(types.first, types.second, device, large ? 5120 : 512, large ? 2304 : 256);
+            Check(DiskMoeV41Graph::Supports(f.disk), "disk graph weight eligibility");
+            Check(!DiskMoeV41Graph::Supports(f.gpu), "disk graph accepted resident weights");
+            for (int cacheMode : {0, 1, 2, 3}) {
+                SetMoeCpuCacheBytes(0);
+                SetMoeCudaCacheBytes(0);
+                TrimDiskMoeCache();
+                SetMoeCpuCacheBytes(cacheMode == 0 ? 0 : cacheMode == 2 ? f.bytes * 2 : 1ULL << 30);
+                SetMoeCudaCacheBytes(cacheMode < 2 ? 0 : f.bytes * (cacheMode == 2 ? 2 : 8));
+                if (cacheMode == 3)
+                    for (int pass = 0; pass < 32; ++pass)
+                        f.Run(true, 1, pass % 8, device, 8);
+                if (cacheMode == 3)
+                    Check(GetDiskMoeCacheStats().cudaBytes == f.bytes * 8,
+                          "full graph GPU tier not populated");
+                for (int rows :
+                     large ? std::vector<int>{1, 6, 8} : std::vector<int>{1, 2, 3, 4, 6, 8, 9, 16, 32}) {
+                    constexpr int topk = 6;
+                    Data x(BFLOAT16, {rows, f.hidden}), ids(INT32, {rows, topk}),
+                        scores(FLOAT32, {rows, topk}), out;
+                    x.Allocate(false);
+                    ids.Allocate(false);
+                    scores.Allocate(false);
+                    std::fill_n(reinterpret_cast<uint16_t *>(x.cpuData), rows * f.hidden, 0);
+                    std::fill_n(reinterpret_cast<int32_t *>(ids.cpuData), rows * topk, 0);
+                    std::fill_n(reinterpret_cast<float *>(scores.cpuData), rows * topk, 0.f);
+                    for (Data *d : {&x, &ids, &scores})
+                        d->ToDevice(CUDA, {device}, true);
+                    DiskMoeV41Graph graph;
+                    void *child = graph.Add(x, ids, scores, out, f.disk, .8f), *exec = nullptr;
+                    Check(child && FastllmCudaGraphInstantiate(child, &exec), "disk full graph capture");
+                    if (rows == 1 && cacheMode == 0) CheckDiskGraphCancellation(graph, exec);
+                    for (int pass = 0; pass < (large ? 2 : 4); ++pass) {
+                        const float phase = .13f * pass;
+                        for (int r = 0; r < rows; ++r) {
+                            for (int c = 0; c < f.hidden; ++c)
+                                ((uint16_t *)x.cpuData)[r * f.hidden + c] =
+                                    Float32ToBFloat16RNEBits(std::sin((r * f.hidden + c) * .71f + phase) * 3);
+                            for (int k = 0; k < topk; ++k) {
+                                ((int32_t *)ids.cpuData)[r * topk + k] =
+                                    (pass + (k == 2 && r % 3 == 0 ? 0 : k) + r % 2) % f.experts;
+                                ((float *)scores.cpuData)[r * topk + k] = k == 0   ? 0
+                                                                          : k == 1 ? -.17f
+                                                                                   : .2f + .13f * k;
+                            }
+                        }
+                        for (Data *d : {&x, &ids, &scores})
+                            FastllmCudaCopyFromHostToDevice(d->cudaData, d->cpuData, d->GetBytes());
+                        Check(graph.Launch([&] { return FastllmCudaGraphLaunch(exec); }),
+                              "disk full graph replay");
+                        std::vector<uint16_t> bits(rows * f.hidden);
+                        FastllmCudaCopyFromDeviceToHost(bits.data(), out.cudaData, bits.size() * 2);
+                        std::vector<float> actual(bits.size());
+                        for (size_t i = 0; i < bits.size(); ++i)
+                            actual[i] = BFloat16BitsToFloat32(bits[i]);
+                        auto expected = f.Run(true, rows, pass, device, topk, false, false, -1, 0, phase);
+                        printf("GRAPH device=%d type=%d/%d cache=%d rows=%d pass=%d ", device, types.first,
+                               types.second, cacheMode, rows, pass);
+                        Compare(actual, expected, cacheMode == 2 ? .003 : 0);
+                        auto stats = GetDiskMoeCacheStats();
+                        Check(stats.cpuBytes + stats.cpuWorkspaceBytes <= GetMoeCpuCacheBytes(),
+                              "disk graph RAM budget");
+                        Check(stats.cudaBytes <=
+                                  GetMoeCudaCacheBytes() * std::min(2, FastllmCudaGetDeviceCount()),
+                              "disk graph CUDA budget");
+                    }
+                    FastllmCudaGraphExecDestroy(exec);
+                }
+            }
+        }
+    SetMoeCpuCacheBytes(0);
+    SetMoeCudaCacheBytes(0);
+    TrimDiskMoeCache();
+    puts("PASS: disk full graph, changing inputs/routes, rows 1..32, both PP devices and all cache tiers");
+}
+
 int main(int argc, char **argv) { try {
     if (FastllmCudaGetDeviceCount()<1) return 77;
     SetThreads(4);
+    if(argc>1 && !strcmp(argv[1],"--full-graph")){TestDiskFullGraph();return 0;}
+    if(argc>1 && !strcmp(argv[1],"--full-graph-large")){TestDiskFullGraph(true);return 0;}
     if (argc > 1 && !strcmp(argv[1], "--disk-decode-handoff")) { TestDiskDecodeHandoff(); return 0; }
 #ifdef USE_NUMAS
     if (argc > 1 && !strcmp(argv[1], "--iq2-batch")) {

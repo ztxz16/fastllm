@@ -58,12 +58,11 @@ namespace fastllm {
 #if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
         const bool streamGGUF = !tp && weights[0][2]->dataType == DATA_GGUF_FORMAT;
         bool cpuHost = false;
-        if (!moeExpertCacheAttempted && !weights[0][2]->isDiskWeight) {
+        if (!moeExpertCacheAttempted) {
             for (int layer = 0; layer < block_cnt && !cpuHost; ++layer)
                 cpuHost = SelectMoeDeviceForLayer(layer) == "cpu";
         }
-        if ((FastllmCudaMoeCacheRequested() || streamGGUF || cpuHost) && !moeExpertCacheAttempted &&
-            !weights[0][2]->isDiskWeight) {
+        if ((FastllmCudaMoeCacheRequested() || streamGGUF || cpuHost) && !moeExpertCacheAttempted) {
             moeExpertCacheAttempted = true;
             std::vector<CudaPrefillStage> stages;
             if (!tp && BuildCudaPrefillStages(deviceMap, block_cnt, stages))
@@ -78,7 +77,7 @@ namespace fastllm {
                 for (int stage = 0; stage < int(draftWeights.size()); ++stage) {
                     const int layer = std::max(0, block_cnt - v41DsparkLayers + stage);
                     const std::string pre = "mtp." + std::to_string(stage) + ".ffn";
-                    if (!UsesHostMoe(SelectMoeDeviceForLayer(layer)) ||
+                    if (!UsesHostMoe(SelectSpecialWeightDevice(pre + ".experts.0.gateup.weight", layer)) ||
                         !quantizedLinearNames.count(pre + ".experts.0.w1.weight")) {
                         draftWeights.clear(); break;
                     }
@@ -130,7 +129,8 @@ namespace fastllm {
                 for (size_t stage = 0; stage < draftWeights.size(); ++stage) {
                     auto &table = draftWeights[stage];
                     table[0] = table[1] = nullptr;
-                    draftCache.Add(table, SelectMoeDeviceForLayer(std::max(0, block_cnt - v41DsparkLayers + int(stage))));
+                    draftCache.Add(table, SelectSpecialWeightDevice("mtp." + std::to_string(stage) +
+                        ".ffn.experts.0.gateup.weight", std::max(0, block_cnt - v41DsparkLayers + int(stage))));
                 }
                 if (!draftCache.Prepare([this] { WarmupNumaMoeWeights(true); }))
                     fprintf(stderr, "[Fastllm] DSpark expert cache unavailable; retaining host fallback.\n");

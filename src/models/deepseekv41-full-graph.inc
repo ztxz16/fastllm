@@ -119,6 +119,7 @@ struct V41FullGraph {
     int firstLayer = 0, endLayer = 0;
     bool verifying = false, capturesInput = false, hybrid = false, tensorParallel = true;
     std::vector<void *> moeHandles;
+    std::unique_ptr<DiskMoeV41Graph> diskMoe;
     Data inputIds, embedding, deferredHcMix;
     std::vector<float> hostTokens;
     std::vector<std::unique_ptr<V41FullLayer>> layers;
@@ -150,6 +151,7 @@ struct V41FullGraph {
                 FastllmCudaEventDestroy(ready[rank]);
         }
         if (untimedExec) FastllmCudaGraphExecDestroy(untimedExec);
+        diskMoe.reset();
         pieces.reset();
         for (auto &layer : layers) if (layer)
             for (void *plan : layer->plans)
@@ -406,7 +408,8 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
     for (int layer = firstLayer; layer < endLayer; ++layer) {
         const bool capturedMoe = state->segments[layer * 4 + 3].containsGpuMoe;
         const auto moeDevice = SelectMoeDeviceForLayer(layer);
-        const bool hostMoe = V41DeviceSpecUsesType(moeDevice, "numa") || moeDevice == "cpu";
+        const bool hostMoe = V41DeviceSpecUsesType(moeDevice, "numa") || moeDevice == "cpu" ||
+            (V41DeviceSpecUsesType(moeDevice, "disk") && DiskMoeV41Graph::Supports(weights[layer]));
         // A GPU expert placed on a different PP device is not a host-cache
         // layer. Reject before warming any child or changing captured operands.
         // Its ordinary peer transfer and remote compute remain segmented.
@@ -786,11 +789,18 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
                 ws.expertIndex.Reshape(state->segments[l * 4 + 2].expertIndexDims);
                 ws.expertScore.Reshape(state->segments[l * 4 + 2].expertScoreDims);
                 void *moeGraph = nullptr;
-                void *handle = FastllmCudaCreateNativeMoeFullGraph(input, ws.expertIndex,
-                    ws.expertScore, ws.ffnOut, routed.data(), routed.size(), l,
-                    state->segments[l * 4 + 3].graphs[0], &moeGraph);
-                if (!handle || !moeGraph) throw std::runtime_error("native MoE full graph rejected at layer " + std::to_string(l));
-                g->moeHandles.push_back(handle);
+                if (routed[2]->isDiskWeight) {
+                    if (!g->diskMoe) g->diskMoe = std::make_unique<DiskMoeV41Graph>();
+                    moeGraph = g->diskMoe->Add(input, ws.expertIndex, ws.expertScore,
+                        ws.ffnOut, routed, swiglu_limit);
+                    children[0].push_back(state->segments[l * 4 + 3].graphs[0]);
+                } else {
+                    void *handle = FastllmCudaCreateNativeMoeFullGraph(input, ws.expertIndex,
+                        ws.expertScore, ws.ffnOut, routed.data(), routed.size(), l,
+                        state->segments[l * 4 + 3].graphs[0], &moeGraph);
+                    if (handle) g->moeHandles.push_back(handle);
+                }
+                if (!moeGraph) throw std::runtime_error("MoE full graph rejected at layer " + std::to_string(l));
                 children[0].push_back(moeGraph);
                 // Router and expert computation read ffnInput, not ffnPre /
                 // ffnPost / ffnComb. Join before the residual consumes them.
@@ -1005,9 +1015,12 @@ bool DeepSeekV41Model::TryFullDecodeGraph(ForwardWorkspace &f, bool inputsPrepar
             std::this_thread::yield();
         if (std::all_of(uploaded.begin(), uploaded.end(), [](int v) { return v == 1; })) {
             void *exec = timed ? g->execs[rank] : g->untimedExec;
-            const bool success = !g->moeHandles.empty()
-                ? FastllmCudaLaunchNativeMoeFullGraph(exec, g->moeHandles.data(), g->moeHandles.size(), timed)
-                : FastllmCudaGraphLaunch(exec);
+            auto replay = [&] {
+                return !g->moeHandles.empty()
+                    ? FastllmCudaLaunchNativeMoeFullGraph(exec, g->moeHandles.data(), g->moeHandles.size(), timed)
+                    : FastllmCudaGraphLaunch(exec);
+            };
+            const bool success = g->diskMoe ? g->diskMoe->Launch(replay) : replay();
             ok[rank] = success ? 1 : -1;
             if (g->verifying) FastllmCudaEventRecordCurrentThread(g->ready[rank]);
         }

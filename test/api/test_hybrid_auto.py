@@ -815,7 +815,7 @@ class HybridAutoTest(unittest.TestCase):
         g.dspark_block_size = 0
         self.assertEqual(reserve(75)["graphs"], reserve(120)["graphs"])
 
-    def test_v41_disk_experts_do_not_reserve_disabled_graphs(self):
+    def test_v41_disk_and_independent_draft_graph_reservations(self):
         g = auto.geometry(self.dspark_metadata(), "fp4", 0, 7)
         g.runtime["expert_records"] = {i: 16*MiB for i in range(g.layers)}
         a = args(auto=True, dspark=7, moe_device_layers=-1)
@@ -824,12 +824,44 @@ class HybridAutoTest(unittest.TestCase):
                 return auto._v41_runtime_bytes(a, g, "pp", {0: 1, 1: 1}, 0, 8192, 1, 4096,
                                                disk_experts=disk)
         eager = reserve("0")
-        self.assertEqual(reserve("1", disk=True), eager)
+        disk = reserve("1", disk=True)
+        self.assertEqual(disk["graphs"][0], 0)
+        self.assertGreater(disk["graphs"][1], 0)  # independent draft on the last PP stage
         self.assertGreater(eager["staging"][0], 0)
         self.assertGreater(eager["prefill_persistent"][0], 0)
         self.assertGreater(reserve("1")["graphs"][0], 0)
         a.moe_device = "disk"
+        self.assertEqual(reserve("1")["graphs"][0], 0)
+        self.assertGreater(reserve("1")["graphs"][1], 0)
+        g.disk_prefill["graph_experts"] = True
+        disk = reserve("1")
+        self.assertTrue(all(n > 0 for n in disk["graphs"].values()))
+        self.assertTrue(all(n > 0 for n in disk["host_graphs"].values()))
+        self.assertEqual(reserve("0")["host_graphs"], {0: 0, 1: 0})
+        a.dspark = 0
+        self.assertTrue(all(n > 0 for n in reserve("1")["graphs"].values()))
+        g.disk_prefill.clear()
         self.assertEqual(reserve("1")["graphs"], {0: 0, 1: 0})
+
+    def test_v41_native_disk_graph_reserves_ram_and_vram(self):
+        metadata = self.dspark_metadata()
+        metadata["quantization_config"] = {"quant_method": "fp8", "expert_dtype": "fp4",
+                                             "weight_block_size": [32, 32]}
+        g = auto.geometry(metadata, "fp4", 0, 5)
+        self.assertTrue(g.disk_prefill["graph_experts"])
+        self.assertFalse(g.disk_prefill.get("canonical_gguf", False))
+        a = args(auto=True, dspark=5, moe_device="disk", moe_device_layers=-1)
+        def reserve(graph, mode="pp"):
+            with patch.dict(os.environ, {"FASTLLM_CUDA_GRAPH": graph}, clear=True):
+                return auto._v41_runtime_bytes(a, g, mode, {0: 1, 1: 1}, 0, 8192, 1, 1024,
+                                               disk_experts=True)
+        captured, eager = reserve("1"), reserve("0")
+        self.assertTrue(all(n > 0 for n in captured["host_graphs"].values()))
+        self.assertTrue(all(captured["graphs"][i] > eager["graphs"][i] for i in (0, 1)))
+        self.assertEqual(eager["host_graphs"], {0: 0, 1: 0})
+        self.assertEqual(reserve("1", "tp")["host_graphs"], {0: 0, 1: 0})
+        metadata["quantization_config"]["weight_block_size"] = [128, 128]
+        self.assertFalse(auto.geometry(metadata, "fp4", 0, 5).disk_prefill.get("graph_experts", False))
 
     def test_v41_native_moe_staging_is_separate_from_resident_cache(self):
         g = auto.geometry(self.dspark_metadata(), "fp4", 0, 7)
