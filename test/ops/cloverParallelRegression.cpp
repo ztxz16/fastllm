@@ -104,7 +104,6 @@ void AllReduceChecks() {
     std::cout << "TP2 allreduce BF16/FP16/FP32, in-place, guards, asynchronous repeats and fallbacks PASS" << std::endl;
 }
 void Populate(CloverModel &m, const std::string &devices, bool fp16) {
-    m.deviceMap = {{devices, 1}};
     m.weight.dicts = {{"hidden_size", "512"}, {"num_hidden_layers", "2"},
         {"num_attention_heads", "4"}, {"num_key_value_heads", "2"}, {"head_dim", "256"},
         {"linear_num_key_heads", "4"}, {"linear_num_value_heads", "8"},
@@ -113,6 +112,8 @@ void Populate(CloverModel &m, const std::string &devices, bool fp16) {
         {"vocab_size", "128"}, {"mask_token_id", "127"}, {"dllm_think_end_token_id", "17"},
         {"layer_types", "[\"linear_attention\",\"full_attention\"]"}};
     m.InitParams();
+    // InitParams imports the global placement; override it afterwards.
+    m.deviceMap = {{devices, 1}};
     std::mt19937 rng(251); std::normal_distribution<float> normal(0.f, .02f);
     auto add = [&](const std::string &name, std::vector<int> shape, bool scalar = false) {
         auto &w = m.weight[name]; w.name = name; w.dataType = scalar ? FLOAT32 : BFLOAT16;
@@ -120,6 +121,13 @@ void Populate(CloverModel &m, const std::string &devices, bool fp16) {
         for (size_t i = 0; i < w.Count(0); ++i) {
             float value = normal(rng);
             if (name.find("linear_attn.norm.weight") != std::string::npos) value += 1;
+            // Keep routing well separated when comparing TP partitions.
+            // Random near-ties can select different experts after legitimate
+            // 16-bit reduction rounding and obscure cache/addressing errors.
+            if (name.find(".mlp.gate.weight") != std::string::npos)
+                value = i % shape.back() ? 0.f : float(i / shape.back() + 1) / 16;
+            if (name == "model.embed_tokens.weight" && i % shape.back() == 0)
+                value = (i / shape.back()) % 2 ? .5f : -.5f;
             if (scalar) ((float *)w.cpuData)[i] = value;
             else ((uint16_t *)w.cpuData)[i] = Bf16(value);
         }
@@ -194,10 +202,12 @@ void Close(const Cache &a, const Cache &b, double tolerance) {
 std::vector<int> Tokens(int count, int seed) {
     std::vector<int> values(count); for (int i = 0; i < count; ++i) values[i] = (seed + i * 17) % 127; return values;
 }
-void ForwardChecks(CloverModel &single, CloverModel &tp) {
+void ForwardChecks(CloverModel &single, CloverModel &tp, int ranks) {
     Cache a, b; Data x, y;
     single.ForwardLogits(Tokens(301, 3), a, false, x, true);
     tp.ForwardLogits(Tokens(301, 3), b, false, y, true);
+    Check(b[0].first.multiDeviceData && b[0].first.multiDeviceDatas.size() == size_t(ranks),
+        "TP regression did not create per-rank caches");
     Close(x, y);
     Cache before; CloneCache(b, before);
     for (int width : {1, 2, 8, 16, 32, 16}) {
@@ -237,8 +247,16 @@ void ForwardChecks(CloverModel &single, CloverModel &tp) {
             Close(caches[i], serial[i], 0);
             tp.ForwardLogits(std::vector<int>(tokens[i].begin(), tokens[i].begin() + accepted), refs[i], false, y);
             Close(caches[i], refs[i], .015);
+            // Next-token comparisons need the same verification geometry:
+            // prefix-only FP16 GEMMs can round differently at router ties.
+            Cache reference; CloneCache(before, reference);
+            CloverSnapshots referenceSnapshots;
+            tp.ForwardLogits(tokens[i], reference, false, y, false, &referenceSnapshots);
+            Close(outputs[i], y, .015);
+            tp.RestorePrefix(reference, referenceSnapshots, accepted);
+            Close(caches[i], reference, .015);
             tp.ForwardLogits({21}, caches[i], false, x);
-            tp.ForwardLogits({21}, refs[i], false, y); Close(x, y, .015);
+            tp.ForwardLogits({21}, reference, false, y); Close(x, y, .015);
         }
     }
 }
@@ -305,7 +323,7 @@ int main(int argc, char **argv) {
         CloverModel single, tp; Populate(single, "cuda:0", fp16);
         std::string spec = "cuda:0"; for (int r = 1; r < ranks; ++r) spec += "," + std::to_string(r);
         Populate(tp, spec, fp16);
-        ForwardChecks(single, tp); GenerationChecks(tp);
+        ForwardChecks(single, tp, ranks); GenerationChecks(tp);
         std::cout << "Clover TP" << ranks << (fp16 ? " FP16" : " BF16") << " PASS: logits, preview, full/compact rollback, prefix cache and seeded sampling" << std::endl;
     } catch (const std::exception &e) { std::cerr << e.what() << std::endl; return 1; }
 }
