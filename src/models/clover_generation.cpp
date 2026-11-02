@@ -426,7 +426,9 @@ void CloverModel::ConfigureClover(const json11::Json &j) {
 void CloverModel::ValidateRequest(const std::vector<int> &tokens, const GenerationConfig &c,
         const CloverOptions &o) const {
     const int capacity = contextPlan.configured ? contextPlan.effectiveLength : max_positions;
-    Require(maxBatch <= CloverCudaGdnCaches::Capacity, "max_batch exceeds the Clover cache capacity (64)");
+    Require(maxBatch <= MaxBatch, "max_batch exceeds the Clover request capacity (256)");
+    Require(maxBatch <= 64 || o.width <= defaults.width,
+        "large-batch block_size exceeds the configured snapshot budget");
     Require(maxBatch <= 1 || o.speculative, "batch generation currently requires self_speculative mode");
     Require(maxBatch <= 1 || o.width >= 16, "batch generation requires block_size 16 or 32");
     Require(!tokens.empty(), "empty prompt");
@@ -485,6 +487,14 @@ int CloverModel::LaunchClover(const std::vector<int> &tokens, const json11::Json
 
 void CloverModel::OnResponseContextCreated(ResponseContext *ctx) {
     auto r = std::make_shared<Request>();
+    if (maxBatch > 64) {
+        // Reserve the original low-latency layout for at most seven live
+        // requests. Others remain compact through all width/tail fallbacks.
+        // The admission budget includes these seven full-snapshot slots.
+        int full = 0;
+        for (const auto &entry : requests) full += !entry.second->snapshots.compact;
+        r->snapshots.compact = full >= 7;
+    }
     r->cacheRequestId = ++nextRequestId;
     r->options = launchingOptions;
     r->counts.assign(vocabSize, 0);
@@ -610,7 +620,7 @@ std::vector<int> CloverModel::Step(ResponseContext &ctx, Request &r) {
 std::vector<std::vector<int>> CloverModel::StepBatch(const std::vector<ResponseContext *> &contexts,
         const std::vector<std::shared_ptr<Request>> &batch) {
     const int size = contexts.size();
-    Require(size >= 2 && size <= CloverCudaGdnCaches::Capacity && batch.size() == contexts.size(), "invalid active request batch");
+    Require(size >= 2 && size <= MaxBatch && batch.size() == contexts.size(), "invalid active request batch");
     const int capacity = contextPlan.configured ? contextPlan.effectiveLength : max_positions;
     std::vector<std::vector<int>> candidates(size), output(size);
     std::vector<std::vector<std::pair<Data, Data>> *> caches;
@@ -715,7 +725,7 @@ void CloverModel::RunModelSpecificScheduler() {
         std::vector<int> handles, aborted;
         for (const auto &entry : responseContextDict.dicts) {
             if (entry.second->isAbort) aborted.push_back(entry.first);
-            else if (!entry.second->isEnding && contexts.size() < (size_t)std::max(1, std::min(CloverCudaGdnCaches::Capacity, maxBatch))) {
+            else if (!entry.second->isEnding && contexts.size() < (size_t)std::max(1, std::min(MaxBatch, maxBatch))) {
                 handles.push_back(entry.first); contexts.push_back(entry.second);
                 batch.push_back(requests.at(entry.second));
             }

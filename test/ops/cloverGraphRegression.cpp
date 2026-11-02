@@ -46,11 +46,11 @@ void ProjectionPrecision() {
         }
     }
 }
-void Populate(CloverModel &m, int seed, bool zeroHead = false, int maxPositions = 1024) {
+void Populate(CloverModel &m, int seed, bool zeroHead = false, int maxPositions = 1024, int topk = 4) {
     m.weight.dicts = {{"hidden_size", "512"}, {"num_hidden_layers", "1"},
         {"num_attention_heads", "1"}, {"num_key_value_heads", "1"},
         {"head_dim", "256"}, {"moe_intermediate_size", "128"},
-        {"num_experts", "16"}, {"num_experts_per_tok", "4"},
+        {"num_experts", "16"}, {"num_experts_per_tok", std::to_string(topk)},
         {"max_position_embeddings", std::to_string(maxPositions)}, {"vocab_size", "128"},
         {"mask_token_id", "127"}, {"layer_types", "[\"full_attention\"]"}};
     m.InitParams();
@@ -158,9 +158,9 @@ std::vector<std::vector<unsigned char>> Run(int seed, bool graphs, bool busyPool
     }
     return results;
 }
-std::vector<std::vector<unsigned char>> RunBatch(int seed, bool graphs, int batch = 2, bool busyPool = false) {
+std::vector<std::vector<unsigned char>> RunBatch(int seed, bool graphs, int batch = 2, bool busyPool = false, int topk = 4) {
     setenv("FASTLLM_CUDA_GRAPH", graphs ? "1" : "0", 1);
-    CloverModel model; Populate(model, seed);
+    CloverModel model; Populate(model, seed, false, 1024, topk);
     using Cache = std::vector<std::pair<Data, Data>>;
     std::vector<Cache> caches(batch), reference(batch);
     for (int b = 0; b < batch; ++b) {
@@ -345,6 +345,8 @@ int main(int argc, char **argv) {
         cudaSetDevice(0); SetThreads(2); SetDeviceMap({{"cuda:0", 1}}); SetCudaEmbedding(true);
         for (int batch : {2, 8, 33}) for (bool sample : {false, true}) SamplingMetadataBatch(batch, sample);
         SamplingMetadataBatch(64, false);
+        for (bool sample : {false, true}) SamplingMetadataBatch(128, sample);
+        SamplingMetadataBatch(256, false);
         CacheGrowth();
         ProjectionPrecision();
         FixedRowProjection();
@@ -355,9 +357,11 @@ int main(int argc, char **argv) {
             Require(Run(seed, true, false) == eager, "graph replay differs from eager");
             Require(Run(seed, true, true) == eager, "capture-unavailable fallback differs from eager");
         }
-        for (int batch : {3, 4, 8, 9, 32, 50, 64})
+        for (int batch : {3, 4, 8, 9, 32, 50, 64, 65, 128, 256})
             Require(RunBatch(13, true, batch) == RunBatch(13, false, batch), "larger batch graph replay differs from eager");
         Require(RunBatch(13, true, 64, true) == RunBatch(13, false, 64), "64-batch capture fallback differs from eager");
+        Require(RunBatch(13, true, 256, false, 8) == RunBatch(13, false, 256, false, 8),
+            "large routed-task tiling differs from eager");
         restore();
         std::cout << "Clover MoE graphs: changing inputs/widths, model destruction, read-only preview KV, verification and capture fallback PASS" << std::endl;
     } catch (const std::exception &e) { restore(); std::cerr << e.what() << std::endl; return 1; }

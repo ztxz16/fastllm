@@ -215,7 +215,7 @@ void ForwardChecks(CloverModel &single, CloverModel &tp, int ranks) {
         tp.ForwardLogits(Tokens(width, 19), b, true, y);
         Close(x, y); Close(b, before, 0);
     }
-    for (int batch : {2, 8, 64}) {
+    for (int batch : {2, 8, 64, 65, 127, 128, 256}) {
         std::vector<Cache> caches(batch), refs(batch), serial(batch);
         std::vector<Cache *> cv;
         std::vector<CloverSnapshots> snapshots(batch); std::vector<CloverSnapshots *> sv;
@@ -257,6 +257,26 @@ void ForwardChecks(CloverModel &single, CloverModel &tp, int ranks) {
             Close(caches[i], reference, .015);
             tp.ForwardLogits({21}, caches[i], false, x);
             tp.ForwardLogits({21}, reference, false, y); Close(x, y, .015);
+        }
+    }
+}
+void CompactChecks(CloverModel &m) {
+    Cache initial; Data ignored;
+    m.ForwardLogits(Tokens(97, 9), initial, false, ignored);
+    CloverSnapshots full, compact;
+    compact.compact = true;
+    for (int width : {32, 16, 8, 4, 2, 1, 16}) {
+        Cache a, b; CloneCache(initial, a); CloneCache(initial, b);
+        Data x, y;
+        m.ForwardLogits(Tokens(width, 23), a, false, x, false, &full);
+        m.ForwardLogits(Tokens(width, 23), b, false, y, false, &compact);
+        Close(x, y, 0); Close(a, b, 0);
+        Check(compact.layers[0].second.dims.size() == 1, "large-capacity tail retained a full snapshot");
+        for (int accepted = 1; accepted <= width; ++accepted) {
+            Cache expected, actual; CloneCache(a, expected); CloneCache(b, actual);
+            m.RestorePrefix(expected, full, accepted);
+            m.RestorePrefix(actual, compact, accepted);
+            Close(expected, actual, 0);
         }
     }
 }
@@ -323,7 +343,7 @@ int main(int argc, char **argv) {
         CloverModel single, tp; Populate(single, "cuda:0", fp16);
         std::string spec = "cuda:0"; for (int r = 1; r < ranks; ++r) spec += "," + std::to_string(r);
         Populate(tp, spec, fp16);
-        ForwardChecks(single, tp, ranks); GenerationChecks(tp);
+        ForwardChecks(single, tp, ranks); CompactChecks(tp); GenerationChecks(tp);
         std::cout << "Clover TP" << ranks << (fp16 ? " FP16" : " BF16") << " PASS: logits, preview, full/compact rollback, prefix cache and seeded sampling" << std::endl;
     } catch (const std::exception &e) { std::cerr << e.what() << std::endl; return 1; }
 }

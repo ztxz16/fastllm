@@ -8,6 +8,7 @@ namespace fastllm {
 // Prefix indexing is shared with Qwen3.5; tensor layouts remain model-specific.
 struct CloverSnapshots {
     int position = 0, tokens = 0;
+    bool compact = false; // Require bounded journals even for short/tail blocks.
     std::vector<std::pair<Data, Data>> layers;
 };
 
@@ -56,10 +57,12 @@ public:
         const std::string &input, const std::string &output) override;
     void WarmUp() override;
 private:
+    static constexpr int MaxBatch = 256;
     using CachePair = std::pair<Data *, Data *>;
     using CacheView = std::vector<CachePair>;
     struct SnapshotView {
         int position = 0, tokens = 0;
+        bool compact = false;
         CacheView layers;
     };
     struct Parallel;
@@ -116,11 +119,11 @@ private:
         Data *gate = nullptr, bool zeroCentered = true);
     void AddNorm(Data &residual, Data &input, const std::string &name, Data &output);
     void Gdn(Data &input, int layer, CachePair &cache,
-        bool preview, Data &output, CachePair *snapshots = nullptr);
+        bool preview, Data &output, CachePair *snapshots = nullptr, bool compact = false);
     void FullAttention(Data &input, int layer, CachePair &cache,
         int position, bool preview, Data &output);
     void GdnCoreBatch(Data &projected, int layer, CachePair *const *caches, int batch,
-        bool preview, Data &normalized, CachePair *const *snapshots);
+        bool preview, Data &normalized, CachePair *const *snapshots, bool compact = false);
     void FullAttentionCore(Data &qgate, Data &k, Data &v, int layer,
         CachePair &cache, int position, bool preview, Data &output);
     void FullAttentionCoreBatch(Data &projected, int layer,

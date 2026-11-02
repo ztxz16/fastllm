@@ -80,8 +80,8 @@ def prepare(args, config):
         raise ValueError("Clover supports --speculative_algorithm clover or off")
     if args.low_gpu_mem or args.moe_experts > 0 or args.prefill_batch_tokens > 0:
         raise ValueError("Clover requires resident weights, the checkpoint expert count and serial prefill")
-    if args.max_batch > 64:
-        raise ValueError("Clover currently supports --max_batch up to 64")
+    if args.max_batch > 256:
+        raise ValueError("Clover currently supports --max_batch up to 256")
     args.max_batch = max(1, args.max_batch)
     if args.max_batch > 1 and "speculative_algorithm" in getattr(args, "_auto_explicit", ()) and not args.speculative_algorithm:
         raise ValueError("Clover batch generation requires self_speculative mode")
@@ -160,11 +160,22 @@ def resolve(args, query_gpu, config, *, hardware=None, ram=None):
     # not a throughput prediction. Every active request owns independent caches.
     kv = math.ceil(context / 256) * 256 * kv_per_token
     reserve = workspace_reserve(config, args.max_batch, width)
-    # Keep the full-snapshot bound: mixed widths or a shrinking active batch
-    # can select the original layout even when compact records usually fit.
+    # Small-capacity services retain the full bound for their original
+    # mixed-width and tail fallbacks.
     snapshots = state * width if speculative else 0
+    snapshot_extra = 0
+    if speculative and args.max_batch > 64:
+        # Seven live requests may retain the original low-latency layout;
+        # all others keep compact journals across width/tail fallbacks.
+        # Per-request widths cannot exceed this bound (ValidateRequest).
+        kh = int(config["linear_num_key_heads"]) // ranks
+        vh = int(config["linear_num_value_heads"]) // ranks
+        compact = linear * (4 * (vh * 128 * 128 + width * ((kh + vh) * 128 + vh)) +
+                            2 * width * (2 * kh + vh) * 128 * 3)
+        snapshot_extra = 7 * max(0, snapshots - compact)
+        snapshots = compact
     state *= args.max_batch
-    snapshots *= args.max_batch
+    snapshots = snapshots * args.max_batch + snapshot_extra
     kv *= args.max_batch
     required = weights + state + snapshots + kv + reserve
     limit = memory._memory_limit_bytes(getattr(args, "auto_gpu_memory_limit", None), "auto_gpu_memory_limit")

@@ -132,6 +132,32 @@ class CloverAutoTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "one CUDA"):
             self.resolve(self.args("--max_batch", "50", "--gpu_mem_ratio", "0.98"))
 
+    def test_large_capacity_compact_snapshot_bound(self):
+        from fastllm_pytools import clover_config
+        for size in (65, 127, 128, 256):
+            for width in (16, 32):
+                args = self.args("--tp", "cuda:0,1", "--max_batch", str(size),
+                                 "--max_context_length", "8192", "--prefix_cache", "false",
+                                 "--speculative_num_draft_tokens", str(width))
+                with patch.object(hybrid_auto, "inventory", return_value=(self.config, self.weights)), redirect_stdout(io.StringIO()):
+                    result = clover_config.resolve(args, lambda d: dict(free=200 << 30, total=200 << 30), self.config,
+                        hardware=({0: {"capability": 90}, 1: {"capability": 90}}, {}), ram=dict(available=400 << 30))
+                # Per layer: one FP32 recurrent matrix, K/delta/decay per
+                # token, and the unchanged three-tap 16-bit conv snapshots.
+                compact = 30 * (4 * (16 * 128 * 128 + width * (24 * 128 + 16)) +
+                                2 * width * 32 * 128 * 3)
+                full = width * 30 * (4 * 16 * 128 * 128 + 2 * 32 * 128 * 3)
+                expected = size * compact + 7 * (full - compact)
+                self.assertEqual(result["snapshot_bytes"], expected)
+                self.assertEqual(result["kv_bytes"], size * 8192 * 10240)
+        with self.assertRaisesRegex(ValueError, "256"):
+            clover_config.prepare(self.args("--max_batch", "257"), self.config)
+        with self.assertRaisesRegex(ValueError, "each TP GPU"):
+            args = self.args("--tp", "cuda:0,1", "--max_batch", "256", "--max_context_length", "32768")
+            with patch.object(hybrid_auto, "inventory", return_value=(self.config, self.weights)), redirect_stdout(io.StringIO()):
+                clover_config.resolve(args, lambda d: dict(free=140 << 30, total=140 << 30), self.config,
+                    hardware=({0: {"capability": 90}, 1: {"capability": 90}}, {}), ram=dict(available=400 << 30))
+
     def test_insufficient_memory_is_transactional(self):
         args = self.args(); original = copy.deepcopy(vars(args))
         with self.assertRaisesRegex(ValueError, "one CUDA"):

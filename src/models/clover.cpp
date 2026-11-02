@@ -64,9 +64,7 @@ std::string Layer(int i) { return "model.layers." + std::to_string(i) + "."; }
 // joins its worker, before the resident weights are destroyed.
 struct CloverModel::MoeGraphs {
 #ifdef USE_CUDA
-    // Bound retained graph workspaces; larger request batches keep the eager
-    // fallback. This is a graph memory policy, not a request admission limit.
-    static constexpr int MaxBatch = 64;
+    // Bound retained graph workspaces independently of request admission.
     static constexpr size_t MaxWorkspaceBytes = 32ULL << 30;
     struct Entry {
         Data input, output;
@@ -318,24 +316,42 @@ void CloverModel::AddNorm(Data &residual, Data &input, const std::string &name, 
         "residual normalization failed");
 #endif
 }
-void CloverModel::Gdn(Data &input, int layer, CachePair &cache, bool preview, Data &output, CachePair *snapshots) {
+void CloverModel::Gdn(Data &input, int layer, CachePair &cache, bool preview, Data &output, CachePair *snapshots, bool compact) {
 #ifdef USE_CUDA
     std::string p = Layer(layer) + "linear_attn.";
     Data projected, normalized;
     CloverLinear(input, weight[p + "fused_in_proj.weight"], projected);
     auto *cachePointer = &cache;
-    GdnCoreBatch(projected, layer, &cachePointer, 1, preview, normalized, snapshots ? &snapshots : nullptr);
+    GdnCoreBatch(projected, layer, &cachePointer, 1, preview, normalized, snapshots ? &snapshots : nullptr, compact);
     CloverLinear(normalized, weight[p + "out_proj.weight"], output);
 #endif
 }
 void CloverModel::GdnCoreBatch(Data &projected, int layer, CachePair *const *caches, int batch,
-        bool preview, Data &normalized, CachePair *const *snapshots) {
+        bool preview, Data &normalized, CachePair *const *snapshots, bool compact) {
 #ifdef USE_CUDA
     std::string p = Layer(layer) + "linear_attn.";
-    Check(batch > 0 && batch <= CloverCudaGdnCaches::Capacity && projected.dims[0] % batch == 0,
+    Check(batch > 0 && batch <= MaxBatch && projected.dims[0] % batch == 0,
         "invalid GDN batch shape");
     const int rows = projected.dims[0], t = rows / batch, channels = (2 * keyHeads + valueHeads) * 128;
-    const size_t compactBytes = snapshots && batch >= 8 && t >= 16
+    // Only cache-dependent operators are tiled. Dense/MoE/head projections
+    // still see all requests, and kernel arguments retain the legacy ABI.
+    if (batch > CloverCudaGdnCaches::Capacity) {
+        PrepareCloverData(normalized, dataType, {rows, valueHeads * 128}, cudaDevice);
+        for (int first = 0; first < batch; first += CloverCudaGdnCaches::Capacity) {
+            const int count = std::min(batch - first, CloverCudaGdnCaches::Capacity);
+            Data input, output;
+            input.FakeFrom(projected, size_t(first) * t * projected.dims.back() * sizeof(uint16_t));
+            input.Resize({count * t, projected.dims.back()});
+            output.FakeFrom(normalized, size_t(first) * t * valueHeads * 128 * sizeof(uint16_t));
+            output.Resize({count * t, valueHeads * 128});
+            GdnCoreBatch(input, layer, caches + first, count, preview, output,
+                snapshots ? snapshots + first : nullptr, compact);
+        }
+        return;
+    }
+    // Requests without a full-snapshot reservation keep bounded journals
+    // even when mixed widths or a shrinking batch select serial execution.
+    const size_t compactBytes = snapshots && (compact || (batch >= 8 && t >= 16))
         ? FastllmCudaCloverGdnSnapshotBytes(t, keyHeads, valueHeads) : 0;
     CloverCudaGdnCaches pointers;
     for (int b = 0; b < batch; ++b) {
@@ -395,7 +411,7 @@ void CloverModel::GdnCoreBatch(Data &projected, int layer, CachePair *const *cac
                 gdnPrefillWorkspace.cudaData, gdnPrefillWorkspace.GetBytes(), nullptr, channels),
                 "block prefill GDN failed");
         } else {
-            if (t >= 16) PrepareCloverData(causalWorkspace, FLOAT32,
+            if (t >= 16 || compactBytes) PrepareCloverData(causalWorkspace, FLOAT32,
                 {rows, 2 * keyHeads * 128 + valueHeads}, cudaDevice);
             Check(FastllmCudaCloverCausalGdn(q, k, v, (float *)g.cudaData,
                 beta.cudaData, pointers.state[0], y.cudaData, pointers.stateSnapshots[0],
@@ -489,6 +505,19 @@ void CloverModel::FullAttentionCoreBatch(Data &projected, int layer,
         const std::vector<int> &positions, int width, bool preview, Data &output) {
 #ifdef USE_CUDA
     const int batch = caches.size(), rows = batch * width;
+    if (batch > CloverCudaAttentionCaches::Capacity) {
+        for (int first = 0; first < batch; first += CloverCudaAttentionCaches::Capacity) {
+            const int count = std::min(batch - first, CloverCudaAttentionCaches::Capacity);
+            Data input, attended;
+            input.FakeFrom(projected, size_t(first) * width * projected.dims.back() * sizeof(uint16_t));
+            input.Resize({count * width, projected.dims.back()});
+            attended.FakeFrom(output, size_t(first) * width * num_attention_heads * head_dim * sizeof(uint16_t));
+            attended.Resize({count * width, num_attention_heads * head_dim});
+            FullAttentionCoreBatch(input, layer, {caches.begin() + first, caches.begin() + first + count},
+                {positions.begin() + first, positions.begin() + first + count}, width, preview, attended);
+        }
+        return;
+    }
     const std::string p = Layer(layer) + "self_attn.";
     auto &qw = weight[p + "q_norm.weight"], &kw = weight[p + "k_norm.weight"];
     Check(qw.dataType == FLOAT32 && kw.dataType == FLOAT32 &&
@@ -538,7 +567,28 @@ void CloverModel::FullAttentionCoreBatch(Data &projected, int layer,
 void CloverModel::Moe(Data &input, int layer, bool preview, Data &output, bool graphAllowed, int batch) {
 #ifdef USE_CUDA
     const int t = input.dims[0];
-    Check(batch > 0 && t % batch == 0, "invalid MoE request geometry");
+    Check(t > 0 && batch > 0 && t % batch == 0, "invalid MoE request geometry");
+    const int width = t / batch;
+    if (!hostExperts[layer] && t > 65535 / num_experts_per_tok) {
+        // The generic expert fallback uses a 16-bit CUDA grid dimension for
+        // routed tasks. Tile whole requests, retaining coreset boundaries.
+        const int limit = 65535 / num_experts_per_tok / width;
+        Check(limit > 0, "MoE block exceeds the routed-task capacity");
+        int tile = 1;
+        while (tile <= limit / 2) tile *= 2;
+        PrepareCloverData(output, dataType, input.dims, cudaDevice);
+        for (int first = 0; first < batch; first += tile) {
+            const int count = std::min(batch - first, tile);
+            Data part, result;
+            const size_t offset = size_t(first) * width * embed_dim * sizeof(uint16_t);
+            part.FakeFrom(input, offset); part.Resize({count * width, embed_dim});
+            Moe(part, layer, preview, result, graphAllowed, count);
+            Check(FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(
+                (uint8_t *)output.cudaData + offset, result.cudaData, result.GetBytes()),
+                "MoE request tile copy failed");
+        }
+        return;
+    }
     std::string p = Layer(layer) + "mlp.";
     auto eager = [&](Data &input, Data &output, bool graphPath = false) {
         Data sharedGateUp, sharedMiddle, shared, sharedScale;
@@ -596,10 +646,7 @@ void CloverModel::Moe(Data &input, int layer, bool preview, Data &output, bool g
                                        fusedGate ? routerStride : 1, dataType == FLOAT16),
               "experts failed");
     };
-    const int width = t / batch;
-    if (batch > MoeGraphs::MaxBatch && moeGraphs && !moeGraphs->entries.empty() &&
-        !FastllmCudaGraphIsCapturingFast()) moeGraphs->SetRows(t, batch);
-    if (hostExperts[layer] || !graphAllowed || batch > MoeGraphs::MaxBatch || width < 4 || width > blockSize || blockSize % width ||
+    if (hostExperts[layer] || !graphAllowed || width < 4 || width > blockSize || blockSize % width ||
         FastllmCudaGraphIsCapturingFast()) {
         eager(input, output);
         return;
@@ -716,7 +763,8 @@ void CloverModel::ForwardLogitsLocal(const std::vector<int> &tokens,
     for (int i = 0; i < block_cnt; ++i) {
         Data attention, post, moe;
         if (i == 0) Norm(hidden, Layer(i) + "input_layernorm.weight", norm);
-        if (linearLayers[i]) Gdn(norm, i, cache[i], preview, attention, snapshots ? &snapshots->layers[i] : nullptr);
+        if (linearLayers[i]) Gdn(norm, i, cache[i], preview, attention,
+            snapshots ? &snapshots->layers[i] : nullptr, snapshots && snapshots->compact);
         else FullAttention(norm, i, cache[i], position, preview, attention);
         // Replays can normalize directly into the graph's fixed input buffer.
         // A new width, disabled graph or external capture uses ordinary owned
@@ -754,7 +802,7 @@ void CloverModel::ForwardLogitsBatchLocal(const std::vector<std::vector<int>> &t
         bool preview, std::vector<Data> &logits,
         const std::vector<SnapshotView *> &snapshots) {
     const int batch = tokens.size();
-    Check(batch >= 2 && batch <= CloverCudaGdnCaches::Capacity && caches.size() == tokens.size(), "invalid request batch size");
+    Check(batch >= 2 && batch <= MaxBatch && caches.size() == tokens.size(), "invalid request batch size");
     const int width = tokens[0].size(), rows = batch * width;
     Check(width > 0 && width <= blockSize && blockSize % width == 0, "invalid batch block width");
     Check(snapshots.empty() || (!preview && snapshots.size() == tokens.size()), "invalid batch snapshots");
@@ -773,6 +821,8 @@ void CloverModel::ForwardLogitsBatchLocal(const std::vector<std::vector<int>> &t
     }
 #ifdef USE_CUDA
     EnsureResident();
+    const bool compact = std::any_of(snapshots.begin(), snapshots.end(),
+        [](const SnapshotView *s) { return s->compact; });
     std::vector<int> positions(batch);
     std::vector<float> values;
     for (int b = 0; b < batch; ++b) {
@@ -805,14 +855,13 @@ void CloverModel::ForwardLogitsBatchLocal(const std::vector<std::vector<int>> &t
         else
             CloverLinear(norm, weight[p + "qkv_proj.weight"], projected);
         if (linearLayers[layer]) {
-            CachePair *cachePointers[CloverCudaGdnCaches::Capacity],
-                                  *snapshotPointers[CloverCudaGdnCaches::Capacity];
+            CachePair *cachePointers[MaxBatch], *snapshotPointers[MaxBatch];
             for (int b = 0; b < batch; ++b) {
                 cachePointers[b] = &(*caches[b])[layer];
                 snapshotPointers[b] = snapshots.empty() ? nullptr : &snapshots[b]->layers[layer];
             }
             GdnCoreBatch(projected, layer, cachePointers, batch, preview, attended,
-                snapshots.empty() ? nullptr : snapshotPointers);
+                snapshots.empty() ? nullptr : snapshotPointers, compact);
         } else
             FullAttentionCoreBatch(projected, layer, caches, positions, width, preview, attended);
         // Preserve the output projection's reduction geometry: its wider

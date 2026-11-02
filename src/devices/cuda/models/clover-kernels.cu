@@ -666,13 +666,13 @@ bool FastllmCudaCloverCausalGdnImpl(const void *query, const void *key, const vo
         qkvRowStride < 0 || (qkvRowStride && qkvRowStride < valueHeads * 128))
         return false;
     if (compactSnapshots) {
-        if (!workspace || tokens < 16 || tokens > 32 || (!caches && !snapshots)) return false;
+        if (!workspace || tokens > 32 || (!caches && !snapshots)) return false;
         if (caches) for (int b = 0; b < batch; ++b) if (!caches->stateSnapshots[b]) return false;
     }
     const int qkStride = qkvRowStride ? qkvRowStride : keyHeads * 128;
     const int vStride = qkvRowStride ? qkvRowStride : valueHeads * 128;
     auto dispatch = [&](auto indirect) {
-        if (workspace && tokens >= 16 && tokens <= 65535) {
+        if (workspace && (tokens >= 16 || compactSnapshots) && tokens <= 65535) {
             size_t qk = (size_t)batch * tokens * keyHeads * 128;
             if (!Launch<CloverPrepareCausalGdn<T>>(dim3(keyHeads, tokens, batch), 32, 0, Stream(stream),
                                                       (const T *)query, (const T *)key, g,
@@ -1320,7 +1320,7 @@ bool FastllmCudaCloverCausalGdn(const void *query, const void *key, const void *
 }
 
 std::size_t FastllmCudaCloverGdnSnapshotBytes(int tokens, int keyHeads, int valueHeads) {
-    if (tokens < 16 || tokens > 32 || keyHeads < 1 || valueHeads < 1 ||
+    if (tokens < 1 || tokens > 32 || keyHeads < 1 || valueHeads < 1 ||
         valueHeads > 65535 || valueHeads % keyHeads) return 0;
     return (size_t(valueHeads) * 128 * 128 + size_t(tokens) *
         ((size_t(keyHeads) + valueHeads) * 128 + valueHeads)) * sizeof(float);

@@ -265,7 +265,7 @@ void CloverModel::ForwardLogits(const std::vector<int> &tokens,
     if (!parallel) {
         auto view = ViewCache(cache);
         SnapshotView snap;
-        if (snapshots) snap.layers = ViewCache(snapshots->layers);
+        if (snapshots) { snap.layers = ViewCache(snapshots->layers); snap.compact = snapshots->compact; }
         ForwardLogitsLocal(tokens, view, preview, logits, lastOnly, snapshots ? &snap : nullptr, needLogits);
         if (snapshots) { snapshots->position = snap.position; snapshots->tokens = snap.tokens; }
         return;
@@ -274,7 +274,10 @@ void CloverModel::ForwardLogits(const std::vector<int> &tokens,
     std::vector<SnapshotView> snaps(parallelDevices.size());
     for (int r = 0; r < int(parallelDevices.size()); ++r) {
         views.push_back(ViewCache(cache, parallelDevices[r]));
-        if (snapshots) snaps[r].layers = ViewCache(snapshots->layers, parallelDevices[r]);
+        if (snapshots) {
+            snaps[r].layers = ViewCache(snapshots->layers, parallelDevices[r]);
+            snaps[r].compact = snapshots->compact;
+        }
     }
     RunParallel([&](CloverModel &local, int rank) {
         Data unused;
@@ -305,7 +308,10 @@ void CloverModel::ForwardLogitsBatch(const std::vector<std::vector<int>> &tokens
         for (size_t b = 0; b < caches.size(); ++b) {
             int device = parallel ? parallelDevices[r] : -1;
             views[r].push_back(ViewCache(*caches[b], device));
-            if (!snapshots.empty()) snaps[r][b].layers = ViewCache(snapshots[b]->layers, device);
+            if (!snapshots.empty()) {
+                snaps[r][b].layers = ViewCache(snapshots[b]->layers, device);
+                snaps[r][b].compact = snapshots[b]->compact;
+            }
         }
     }
     auto run = [&](CloverModel &local, int rank) {

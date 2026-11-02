@@ -66,7 +66,7 @@ bool FastllmCudaCloverCausalGdn(const void *query, const void *key, const void *
     bool fp16 = false, bool compactSnapshots = false);
 // Compact records keep the initial FP32 state and each token's normalized K,
 // update residual and decay. Replaying these updates reproduces any accepted
-// prefix exactly, without writing one full recurrent matrix per token.
+// prefix exactly for 1..32 tokens, without a full recurrent matrix per token.
 std::size_t FastllmCudaCloverGdnSnapshotBytes(int tokens, int keyHeads, int valueHeads);
 // Record/state pointers must be aligned to 16 bytes for vectorized replay.
 bool FastllmCudaCloverRestoreGdn(const CloverCudaGdnCaches &records, int count,
