@@ -518,7 +518,8 @@ namespace fastllm {
         void InitDsparkParams();
         void ApplyDsparkDevice(bool targetComplete = false);
         void DsparkEmbedInput(const Data &inputIds, Data &hiddenStates);
-        void DsparkProjectHead(Data &input, Data &output, bool persistent = false);
+        // The verifier's full graph gathers TP vocabulary shards itself.
+        void DsparkProjectHead(Data &input, Data &output, bool persistent = false, bool sharded = false);
         bool DsparkPrepareQkv(int stage, const Data &input, Data &inputQuant,
                               Data &raw, Data &qNorm, Data &qQuant, Data &kv, bool inputQuantized = false,
                               Data *joinedWeight = nullptr);

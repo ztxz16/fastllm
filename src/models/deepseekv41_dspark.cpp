@@ -1354,10 +1354,12 @@ namespace fastllm {
         Repeat(embedOut, 2, hc_mult, hiddenStates);
     }
 
-    void DeepSeekV41Model::DsparkProjectHead(Data &input, Data &output, bool persistent) {
+    void DeepSeekV41Model::DsparkProjectHead(Data &input, Data &output, bool persistent, bool sharded) {
+        if (sharded && !v41DsparkTpDevices.empty())
+            ApplyDeviceMap(this->deviceMap, block_cnt, block_cnt);
         if (v41DsparkTpDevices.empty() && TryBFloat16HeadLinear(input, output)) return;
 #ifdef USE_CUDA
-        if (persistent && input.dataType == DataType::BFLOAT16 && !v41DsparkTpDevices.empty() &&
+        if (persistent && !sharded && input.dataType == DataType::BFLOAT16 && !v41DsparkTpDevices.empty() &&
             !quantizedLinearNames.count("head.weight")) {
             ApplyDsparkDevice();
             FastllmMultiCudaSetDevice(v41DsparkTpDevices);
@@ -1375,13 +1377,19 @@ namespace fastllm {
             LinearWithActivationQuant(*headInput, "head.weight", output);
             return;
         }
-        ApplyDeviceMap(this->deviceMap, block_cnt, block_cnt);
+        if (!sharded) ApplyDeviceMap(this->deviceMap, block_cnt, block_cnt);
         Data quantized;
         Data *source = headInput;
         if (quantizedLinearNames.count("head.weight")) {
             DsExecutor().Run("DeepSeekV41QuantizeActivation",
                 {{"input", &input}, {"output", &quantized}}, {}, {});
             source = &quantized;
+        }
+        if (sharded) {
+            // Preserve the same casts and quantization as the gathered draft head,
+            // while keeping the target executor and vocabulary layout for capture.
+            Linear(*source, weight["head.weight"], *GetEmptyData(), output);
+            return;
         }
         // Quantization and target operators can leave another rank current.
         // Drain their streams and allocate the gather destination on rank 0.
