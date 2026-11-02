@@ -2,23 +2,33 @@
 #include "devices/cuda/fastllm-cuda.cuh"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <cstdint>
 #include <cstdio>
 #include <limits>
 #include <stdexcept>
+#include <unordered_map>
 #include <utility>
 
 namespace fastllm {
 namespace {
 struct WorkspaceOwners {
     std::mutex mutex;
-    std::map<void*, std::shared_ptr<CudaWorkspace>> allocations;
+    std::unordered_map<void*, std::shared_ptr<CudaWorkspace>> allocations;
 };
-WorkspaceOwners &Owners() {
+WorkspaceOwners &Owners(const void *pointer) {
     // CUDA tensors in other translation units can be destroyed during process
     // shutdown. Keep the registry available regardless of static teardown order.
-    static auto *owners = new WorkspaceOwners;
-    return *owners;
+    static auto *owners = new std::array<WorkspaceOwners, 64>;
+    // Every ordinary CUDA free also checks this registry. A single mutex
+    // serializes TP ranks even when none of their scratch tensors are arena
+    // slices. Mix high address bits: CUDA allocations are heavily aligned.
+    uint64_t bits = reinterpret_cast<std::uintptr_t>(pointer);
+    bits ^= bits >> 33;
+    bits *= 0xff51afd7ed558ccdULL;
+    bits ^= bits >> 33;
+    return (*owners)[bits % owners->size()];
 }
 thread_local std::shared_ptr<CudaWorkspace> currentWorkspace;
 std::atomic<size_t> workspacePointers{0};
@@ -26,11 +36,24 @@ constexpr size_t alignment = 256;
 }
 
 CudaWorkspace::CudaWorkspace(int device, size_t bytes)
+    : CudaWorkspace(device, bytes, 0) {}
+
+CudaWorkspace::CudaWorkspace(int device, size_t bytes, size_t minimumBytes)
     : device(device), capacity(bytes - bytes % alignment) {
     if (capacity == 0) throw std::invalid_argument("CUDA workspace must contain at least 256 bytes");
+    if (minimumBytes > capacity) throw std::invalid_argument("Invalid CUDA workspace minimum");
+    const size_t minimum = minimumBytes ? (minimumBytes + alignment - 1) / alignment * alignment : capacity;
     const int previous = FastllmCudaGetDevice();
     FastllmCudaSetDevice(device);
-    base = FastllmCudaDirectMalloc(capacity);
+    if (minimumBytes) {
+        for (;;) {
+            const auto result = FastllmCudaTryDirectMalloc(&base, capacity);
+            if (result != FASTLLM_CUDA_TRY_MALLOC_CAPACITY_FAILURE || capacity == minimum) break;
+            capacity = std::max(minimum, capacity / 2 / alignment * alignment);
+        }
+    } else {
+        base = FastllmCudaDirectMalloc(capacity);
+    }
     FastllmCudaSetDevice(previous);
     if (!base) throw std::runtime_error("Cannot allocate CUDA workspace");
     available.emplace(0, capacity);
@@ -109,13 +132,18 @@ bool TryAllocateCudaWorkspace(int device, size_t bytes, void **pointer) {
 }
 
 void *AllocateCudaWorkspace(const std::shared_ptr<CudaWorkspace> &owner, size_t bytes) {
+    return AllocateCudaWorkspace(owner, bytes, true);
+}
+
+void *AllocateCudaWorkspace(const std::shared_ptr<CudaWorkspace> &owner, size_t bytes,
+                            bool reportExhaustion) {
     void *pointer = owner->Allocate(bytes);
     if (pointer) {
-        auto &owners = Owners();
+        auto &owners = Owners(pointer);
         std::lock_guard<std::mutex> guard(owners.mutex);
         owners.allocations.emplace(pointer, owner);
         workspacePointers.fetch_add(1, std::memory_order_release);
-    } else {
+    } else if (reportExhaustion) {
         fprintf(stderr, "[Fastllm] CUDA arena exhausted: request %.2f MiB, live %.2f MiB, capacity %.2f MiB.\n",
                 bytes / 1048576.0, owner->LiveBytes() / 1048576.0, owner->Capacity() / 1048576.0);
     }
@@ -124,7 +152,7 @@ void *AllocateCudaWorkspace(const std::shared_ptr<CudaWorkspace> &owner, size_t 
 
 bool IsCudaWorkspacePointer(void *pointer) {
     if (workspacePointers.load(std::memory_order_acquire) == 0) return false;
-    auto &owners = Owners();
+    auto &owners = Owners(pointer);
     std::lock_guard<std::mutex> guard(owners.mutex);
     return owners.allocations.count(pointer) != 0;
 }
@@ -133,7 +161,7 @@ bool TryFreeCudaWorkspace(void *pointer) {
     if (workspacePointers.load(std::memory_order_acquire) == 0) return false;
     std::shared_ptr<CudaWorkspace> owner;
     {
-        auto &owners = Owners();
+        auto &owners = Owners(pointer);
         std::lock_guard<std::mutex> guard(owners.mutex);
         auto it = owners.allocations.find(pointer);
         if (it == owners.allocations.end()) return false;

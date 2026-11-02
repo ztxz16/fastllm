@@ -16,6 +16,9 @@ public:
 class CudaWorkspace {
 public:
     CudaWorkspace(int device, size_t bytes);
+    // A growable pool can reduce a new slab under memory pressure, down to
+    // the actual allocation size. Fixed-budget arenas keep the two-arg API.
+    CudaWorkspace(int device, size_t bytes, size_t minimumBytes);
     ~CudaWorkspace();
     CudaWorkspace(const CudaWorkspace&) = delete;
     CudaWorkspace &operator=(const CudaWorkspace&) = delete;
@@ -39,6 +42,8 @@ bool TryAllocateCudaWorkspace(int device, size_t bytes, void **pointer);
 // Explicit allocation for persistent storage, without redirecting scratch
 // allocations on the calling thread. The allocation retains its arena owner.
 void *AllocateCudaWorkspace(const std::shared_ptr<CudaWorkspace> &workspace, size_t bytes);
+void *AllocateCudaWorkspace(const std::shared_ptr<CudaWorkspace> &workspace, size_t bytes,
+                            bool reportExhaustion);
 bool IsCudaWorkspacePointer(void *pointer);
 bool TryFreeCudaWorkspace(void *pointer);
 
