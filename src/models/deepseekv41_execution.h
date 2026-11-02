@@ -2,6 +2,7 @@
 #define FASTLLM_DEEPSEEKV41_EXECUTION_H
 
 #include "deepseekv41.h"
+#include "utils/hybrid_moe.h"
 #include <functional>
 
 namespace fastllm {
@@ -48,7 +49,9 @@ namespace fastllm {
         std::function<void()> releaseSharedScratch;
         std::mutex *pipelineHostExperts = nullptr;
         int pipelineFirstLayer = -1;
+        bool residentGraph = false; // Validated resident routed backend; routes stay on CUDA.
         bool parallelShared = false;  // Set only after resident graph buffers pass validation.
+        std::function<void()> joinSharedSegment;
     };
 
     // Tensor-copy helpers shared with attention/KV code. They preserve graph
@@ -75,6 +78,19 @@ struct DeepSeekV41Model::HybridPrefillStage {
     std::mutex *hostExperts = nullptr;
     bool sampleOutput = false;
 };
+inline int V41PipelineGraphKey(int firstLayer, int rows) {
+    return (1 << 20) + 64 * firstLayer + rows;
+}
+// Decode stages share the request's KV/history, but never their CUDA scratch.
+// Borrowed outputs live in the graph workspace until the next token.
+struct DeepSeekV41Model::HybridDecodeStage {
+    int firstLayer = 0, endLayer = 0, device = 0;
+    HybridDecodeStage *previous = nullptr;
+    Data hidden, pre;
+    void *ready = nullptr;
+    bool fullVerify = false;
+    std::unique_ptr<HybridMoeDecodeStep> step;
+};
 struct DeepSeekV41Model::ForwardState {
     std::unique_ptr<ForwardWorkspace> work;
     ForwardState(DeepSeekV41Model &model, const std::vector<DeepSeekV41Segment> &inputSegments,
@@ -85,7 +101,7 @@ struct DeepSeekV41Model::ForwardState {
                                                        const LastTokensManager &lastTokens,
                                                        std::vector<std::vector<float>*> *retLogits,
                                                        std::vector<std::pair<Data*, Data*> > &samplingPastKeyValues,
-                                                       HybridPrefillStage *prefill = nullptr);
+                                                       HybridPrefillStage *prefill = nullptr, HybridDecodeStage *pipeline = nullptr);
     ~ForwardState();
     int Layers() const;
     void BeginLayer(int layer);

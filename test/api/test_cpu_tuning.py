@@ -1,11 +1,13 @@
 """Quota, isolation and bounded native-calibration policy; no model or GPU."""
+from contextlib import redirect_stdout
+import io
 import json
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'tools'))
 from fastllm_pytools import cpu_tuning as tuning
@@ -82,6 +84,40 @@ class CpuTuningTest(unittest.TestCase):
             self.assertEqual(chosen, 4)
             self.assertEqual(detail['fallback'], 'ValueError')
 
+    def test_numa_candidates_are_balanced_and_use_verifier_workload(self):
+        samples = {'samples_ms': {'2': 8, '4': 4, '8': 2, '16': 1.5, '32': 1.3, '64': 1, '124': 1.2}}
+        with patch.object(tuning, 'numa_node_count', return_value=2), \
+                patch.object(tuning, '_measure', return_value=samples) as measure:
+            chosen, detail = tuning.select_threads(5120, 2304, 17, 124, numa=True, rows=6, topk=6)
+        self.assertEqual(chosen, 64)
+        self.assertEqual(detail['method'], 'numa-moe')
+        measure.assert_called_once_with(5120, 2304, 17, (2, 4, 8, 16, 32, 64, 124), 6, 6)
+
+    def test_numa_layout_respects_affinity_and_explicit_node_count(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for node, cpus in enumerate(('0-3', '4-7')):
+                path = root / ('node%d' % node)
+                path.mkdir()
+                (path / 'cpulist').write_text(cpus)
+            with patch.dict(tuning.os.environ, {}, clear=True), \
+                    patch.object(tuning.os, 'sched_getaffinity', return_value=set(range(8))):
+                self.assertEqual(tuning.numa_node_count(root), 2)
+            with patch.dict(tuning.os.environ, {'FT_NUMAS': '1'}, clear=True), \
+                    patch.object(tuning.os, 'sched_getaffinity', return_value=set(range(4))):
+                self.assertEqual(tuning.numa_node_count(root), 1)
+            with patch.dict(tuning.os.environ, {}, clear=True), \
+                    patch.object(tuning.os, 'sched_getaffinity', return_value=set(range(4))):
+                self.assertEqual(tuning.numa_node_count(root), 0)
+
+    def test_unavailable_numa_layout_retains_linear_fallback(self):
+        with patch.object(tuning, 'numa_node_count', return_value=0), \
+                patch.object(tuning, '_measure', return_value={'samples_ms': {'1': 2, '2': 1}}) as measure:
+            chosen, detail = tuning.select_threads(5120, 2304, 16, 2, numa=True, rows=6, topk=6)
+        self.assertEqual(chosen, 2)
+        self.assertEqual(detail['method'], 'quantized-gemv')
+        measure.assert_called_once_with(5120, 2304, 16, (1, 2))
+
     def test_worker_is_separate_and_has_hard_timeout(self):
         tuning._measure.cache_clear()
         value = {'samples_ms': {'1': 1, '2': .6, '4': .4}}
@@ -91,6 +127,22 @@ class CpuTuningTest(unittest.TestCase):
         self.assertEqual(run.call_args.kwargs['timeout'], 10.0)
         self.assertIn('--worker', run.call_args.args[0])
         tuning._measure.cache_clear()
+
+    def test_linear_worker_does_not_require_process_libc_symbols(self):
+        value = {'samples_ms': {'1': 1, '2': .6}}
+        native = Mock()
+        native.benchmark_cpu_linear_threads.return_value = json.dumps(value).encode()
+        library = Path('/native/libfastllm_tools.so')
+        def load(path):
+            if path is None:
+                raise AttributeError('process does not export libc symbols')
+            return native
+        output = io.StringIO()
+        with patch('ctypes.CDLL', side_effect=load) as cdll, \
+                patch.object(Path, 'glob', return_value=[library]), redirect_stdout(output):
+            tuning._worker(json.dumps([5120, 2304, 16, [1, 2], 1000, 0, 1]))
+        self.assertEqual(json.loads(output.getvalue())['samples_ms'], value['samples_ms'])
+        cdll.assert_called_once_with(str(library))
 
 
 if __name__ == '__main__':

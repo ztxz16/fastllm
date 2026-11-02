@@ -111,3 +111,7 @@ extern "C" bool FastllmCudaV41RouterSelect(const fastllm::Data &input, fastllm::
 extern "C" bool FastllmCudaV41RouterSelectTopK(const fastllm::Data &input, fastllm::Data &weight,
     fastllm::Data &bias, float temperature, float routeScale, fastllm::Data &logits,
     fastllm::Data &indices, fastllm::Data &scores, int topk);
+
+// Single-token hybrid mHC outputs are consumed only at the supplied join child.
+extern "C" bool FastllmCudaV41ComposeHcGraph(const void *const *children, int count,
+    const int *start, const int *join, int branches, float *saved, void **outGraph, void **outExec);

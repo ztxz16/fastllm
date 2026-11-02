@@ -10,6 +10,7 @@
 
 #include "fastllm-cuda.cuh"
 #include "fastllm.h"
+#include "devices/cuda/fastllm-draft-head.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -18,6 +19,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <climits>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
@@ -39,6 +41,7 @@ namespace gemm {
 // The bundled CUTLASS requires an N tile of at least 128 for MXFP8 TMA
 // scale loads. Instantiate the supported prefill tile.
 INSTANTIATE_MXFP8_GEMM_KERNEL_LAUNCHER_SM120(__nv_bfloat16, 128, 128, 128, false)
+INSTANTIATE_MXFP8_GEMM_KERNEL_LAUNCHER_SM120(float, 128, 128, 128, false)
 
 }  // namespace gemm
 }  // namespace flashinfer
@@ -60,6 +63,12 @@ struct Mxfp8WeightRegistry {
 };
 
 Mxfp8WeightRegistry &Mxfp8Registry() {
+    static auto *registry = new Mxfp8WeightRegistry;
+    return *registry;
+}
+
+// Lossy draft-head copies must never satisfy a lossless WoA cache lookup.
+Mxfp8WeightRegistry &DraftHeadRegistry() {
     static auto *registry = new Mxfp8WeightRegistry;
     return *registry;
 }
@@ -216,10 +225,10 @@ __global__ void QuantizeToMxfp8Kernel(const __nv_bfloat16 *__restrict__ input,
     }
 }
 
-bool EnsureLosslessMxfp8Weight(const fastllm::Data &weight, int rows, int cols,
-                             const uint8_t *&quant, const uint8_t *&scales) {
+bool EnsureMxfp8Weight(const fastllm::Data &weight, int rows, int cols,
+                       const uint8_t *&quant, const uint8_t *&scales, bool allowLossy = false) {
     const int device = FastllmCudaGetDevice();
-    auto &registry = Mxfp8Registry();
+    auto &registry = allowLossy ? DraftHeadRegistry() : Mxfp8Registry();
     std::lock_guard<std::mutex> lock(registry.mutex);
     auto cached = registry.entries.find(&weight);
     if (cached != registry.entries.end() && cached->second.device == device &&
@@ -230,24 +239,27 @@ bool EnsureLosslessMxfp8Weight(const fastllm::Data &weight, int rows, int cols,
             return true;
         }
     }
+    // Graphs may reuse a fully initialized immutable weight, never allocate
+    // or synchronize a new conversion during capture.
+    if (FastllmCudaGraphIsCapturingFast()) return false;
     const size_t quantBytes = (size_t)rows * cols;
     const size_t scaleBytes = (size_t)((rows + 127) / 128) * ((cols + 127) / 128) * 512;
-    const size_t total = quantBytes + scaleBytes + sizeof(int);
+    const size_t total = quantBytes + scaleBytes + (allowLossy ? 0 : sizeof(int));
     size_t freeBytes = 0, deviceBytes = 0;
     if (cudaMemGetInfo(&freeBytes, &deviceBytes) != cudaSuccess || freeBytes < total + (512u << 20))
         return false;
     void *storage = nullptr;
     if (FastllmCudaTryDirectMalloc(&storage, total) != FASTLLM_CUDA_TRY_MALLOC_SUCCESS) return false;
     auto *allocation = static_cast<uint8_t *>(storage);
-    auto *flag = reinterpret_cast<int *>(allocation + quantBytes + scaleBytes);
+    auto *flag = allowLossy ? nullptr : reinterpret_cast<int *>(allocation + quantBytes + scaleBytes);
     cudaStream_t stream = cudaStreamPerThread;
-    cudaMemsetAsync(allocation + quantBytes, 0, scaleBytes + sizeof(int), stream);
+    cudaMemsetAsync(allocation + quantBytes, 0, total - quantBytes, stream);
     QuantizeToMxfp8Kernel<<<(rows * (cols / 32) + 63) / 64, 256, 0, stream>>>(
         static_cast<const __nv_bfloat16 *>(weight.cudaData), allocation, allocation + quantBytes,
         rows, cols, 1, scaleBytes, flag);
-    int inexact = 1;
+    int inexact = allowLossy ? 0 : 1;
     cudaError_t status = cudaGetLastError();
-    if (status == cudaSuccess)
+    if (status == cudaSuccess && !allowLossy)
         status = cudaMemcpyAsync(&inexact, flag, sizeof(int), cudaMemcpyDeviceToHost, stream);
     if (status == cudaSuccess) status = cudaStreamSynchronize(stream);
     if (status != cudaSuccess) { FastllmCudaDirectFree(allocation); cudaGetLastError(); return false; }
@@ -278,19 +290,21 @@ Mxfp8Config MakeMxfp8Config() {
                        /*swap_ab=*/false);
 }
 
+template <typename Output = __nv_bfloat16>
 size_t Mxfp8DispatchWorkspace(const Mxfp8Config &config, int m, int n, int k, int batch = 1) {
     return flashinfer::gemm::genericMxfp8GemmKernelLauncherSm120<
-            __nv_bfloat16, cute::Int<128>, cute::Int<128>, cute::Int<128>, false>(
+            Output, cute::Int<128>, cute::Int<128>, cute::Int<128>, false>(
                 nullptr, nullptr, nullptr, nullptr, nullptr, m, n, k, batch,
                 config, nullptr, 0, cudaStreamPerThread, nullptr);
 }
 
+template <typename Output = __nv_bfloat16>
 void Mxfp8DispatchGemm(const Mxfp8Config &config, void *output, const void *input,
                        const void *weight, const void *inputScales, const void *weightScales,
                        int m, int n, int k, char *workspace, size_t workspaceBytes,
                        cudaStream_t stream) {
     flashinfer::gemm::genericMxfp8GemmKernelLauncherSm120<
-            __nv_bfloat16, cute::Int<128>, cute::Int<128>, cute::Int<128>, false>(
+            Output, cute::Int<128>, cute::Int<128>, cute::Int<128>, false>(
                 output, input, weight, inputScales, weightScales, m, n, k, 1,
                 config, workspace, workspaceBytes, stream, nullptr);
 }
@@ -298,22 +312,90 @@ void Mxfp8DispatchGemm(const Mxfp8Config &config, void *output, const void *inpu
 }  // namespace
 
 extern "C" void FastllmCudaReleaseMxfp8CutlassCache(const fastllm::Data *weight) {
-    if (weight == nullptr) return;
-    auto &registry = Mxfp8Registry();
-    Mxfp8WeightCache owned;
-    {
-        std::lock_guard<std::mutex> lock(registry.mutex);
-        auto it = registry.entries.find(weight);
-        if (it == registry.entries.end()) return;
-        owned = it->second;
-        registry.entries.erase(it);
+    if (!weight) return;
+    for (auto *registry : {&Mxfp8Registry(), &DraftHeadRegistry()}) {
+        Mxfp8WeightCache owned;
+        {
+            std::lock_guard<std::mutex> lock(registry->mutex);
+            auto it = registry->entries.find(weight);
+            if (it == registry->entries.end()) continue;
+            owned = it->second;
+            registry->entries.erase(it);
+        }
+        if (owned.scales) {
+            const int previous = FastllmCudaGetDevice();
+            FastllmCudaSetDevice(owned.device);
+            FastllmCudaDirectFree(owned.quant ? owned.quant : owned.scales);
+            FastllmCudaSetDevice(previous);
+        }
     }
-    if (owned.scales != nullptr) {
-        const int previous = FastllmCudaGetDevice();
-        FastllmCudaSetDevice(owned.device);
-        FastllmCudaDirectFree(owned.quant ? owned.quant : owned.scales);
-        FastllmCudaSetDevice(previous);
-    }
+}
+
+// Draft only: block-32 W8A8 with FP32 accumulation and FP32 logits.
+// The shared target BF16 weight remains intact. Warm the immutable conversion
+// before capture; transient operands use the graph-owned allocation pool.
+extern "C" bool FastllmCudaTryFp8DraftHead(const fastllm::Data &input,
+        const fastllm::Data &weight, fastllm::Data &output) {
+    using namespace fastllm;
+    const char *flag = std::getenv("FASTLLM_DSPARK_FP8_HEAD");
+    if ((flag && flag[0] && std::strcmp(flag, "1") != 0) || !Mxfp8EnvEnabled() ||
+        FastllmCudaRuntimeArch() < 120 || FastllmCudaRuntimeArch() > 121 ||
+        &input == &output || &weight == &output || input.multiDeviceData || weight.multiDeviceData || output.multiDeviceData ||
+        input.dataType != BFLOAT16 || weight.dataType != BFLOAT16 || weight.isFake ||
+        input.dataDevice != CUDA || weight.dataDevice != CUDA || !input.cudaData || !weight.cudaData ||
+        input.dataDeviceIds != std::vector<int>{FastllmCudaGetDevice()} || weight.dataDeviceIds != input.dataDeviceIds ||
+        input.dims.empty() || weight.dims.size() != 2 || input.dims.back() != weight.dims[1] ||
+        weight.dims[0] <= 0 || weight.dims[1] <= 0 || weight.dims[0] % 32 || weight.dims[1] % 32 ||
+        (reinterpret_cast<uintptr_t>(input.cudaData) & 15) || (reinterpret_cast<uintptr_t>(weight.cudaData) & 15)) return false;
+    const int n = weight.dims[0], k = weight.dims[1];
+    const uint64_t rows = input.Count(0) / k;
+    if (rows < 1 || rows > 16 || weight.Count(0) > INT_MAX) return false;
+    auto dense = [](const Data &d) {
+        if (d.strides.size() != d.dims.size()) return false;
+        uint64_t stride = 1;
+        for (int i = int(d.dims.size()) - 1; i >= 0; --i) {
+            if (d.dims[i] <= 0 || d.strides[i] != stride) return false;
+            stride *= d.dims[i];
+        }
+        return true;
+    };
+    if (!dense(input) || !dense(weight)) return false;
+    auto overlap = [](const Data &a, const Data &b) {
+        if (!a.cudaData || !b.cudaData) return false;
+        const uintptr_t x = reinterpret_cast<uintptr_t>(a.cudaData), y = reinterpret_cast<uintptr_t>(b.cudaData);
+        return x < y + b.GetBytes() && y < x + a.GetBytes();
+    };
+    if (overlap(output, input) || overlap(output, weight)) return false;
+    const uint8_t *w = nullptr, *sw = nullptr;
+    if (!EnsureMxfp8Weight(weight, n, k, w, sw, true)) return false;
+    const auto config = MakeMxfp8Config();
+    size_t workspaceBytes = 0;
+    try { workspaceBytes = Mxfp8DispatchWorkspace<float>(config, int(rows), n, k); }
+    catch (...) { FastllmCudaClearThreadError(); return false; }
+    const size_t quantBytes = rows * k, scaleBytes = size_t((k + 127) / 128) * 512;
+    const size_t totalBytes = quantBytes + scaleBytes + workspaceBytes;
+    if (totalBytes > INT_MAX) return false;
+    // A shared temporary buffer can grow after capture and invalidate replay
+    // addresses. Pooled Data storage is instead retained by the graph owner.
+    Data scratchData(INT8, {int(totalBytes)});
+    scratchData.ToDevice(CUDA, input.dataDeviceIds, false);
+    scratchData.Allocate(false);
+    auto *scratch = static_cast<uint8_t *>(scratchData.cudaData);
+    if (!scratch) return false;
+    auto dims = input.dims; dims.back() = n;
+    output.dataType = FLOAT32; output.UpdateUnitSize(); output.Resize(dims);
+    output.ToDevice(CUDA, input.dataDeviceIds); output.Allocate();
+    cudaStream_t stream = cudaStreamPerThread;
+    cudaMemsetAsync(scratch + quantBytes, 0, scaleBytes, stream);
+    QuantizeToMxfp8Kernel<<<(int(rows) * (k / 32) + 63) / 64, 256, 0, stream>>>(
+        static_cast<const __nv_bfloat16 *>(input.cudaData), scratch, scratch + quantBytes, int(rows), k, 1, scaleBytes);
+    bool ok = output.cudaData && cudaGetLastError() == cudaSuccess;
+    if (ok) try {
+        Mxfp8DispatchGemm<float>(config, output.cudaData, scratch, w, scratch + quantBytes, sw,
+                                int(rows), n, k, reinterpret_cast<char *>(scratch + quantBytes + scaleBytes), workspaceBytes, stream);
+        ok = cudaGetLastError() == cudaSuccess;
+    } catch (...) { FastllmCudaClearThreadError(); ok = false; }
+    return ok;
 }
 
 extern "C" bool FastllmCudaTryMxfp8QuantizedLinear(const fastllm::Data &input,
@@ -417,14 +499,16 @@ extern "C" bool FastllmCudaTryMxfp8WoA(const fastllm::Data &input,
         weight.dataDevice != fastllm::DataDevice::CUDA || !weight.cudaData ||
         input.dataDeviceIds != std::vector<int>{FastllmCudaGetDevice()} ||
         weight.dataDeviceIds != input.dataDeviceIds ||
-        weight.dataType != fastllm::DataType::BFLOAT16 || weight.dims.size() != 2 ||
+        (weight.dataType != fastllm::DataType::BFLOAT16 && weight.dataType != fastllm::DataType::FP8_E4M3) || weight.dims.size() != 2 ||
         groups <= 0 || rank <= 0 || rank % 128) return false;
     const int rows = input.dims[0] * input.dims[1], cols = weight.dims[1];
     if (rows < 128 || cols <= 0 || cols % 128 || weight.dims[0] != groups * rank ||
         input.Count(0) != (size_t)rows * groups * cols) return false;
     const uint8_t *weightScales = nullptr;
     const uint8_t *weightData = static_cast<const uint8_t *>(weight.cudaData);
-    if (!EnsureLosslessMxfp8Weight(weight, groups * rank, cols, weightData, weightScales)) return false;
+    if (weight.dataType == fastllm::DataType::FP8_E4M3) {
+        if (!EnsureMxfp8WeightScales(weight, groups * rank, cols, weightScales)) return false;
+    } else if (!EnsureMxfp8Weight(weight, groups * rank, cols, weightData, weightScales)) return false;
     output.dataType = fastllm::DataType::BFLOAT16;
     output.UpdateUnitSize();
     output.Resize({input.dims[0], input.dims[1], groups * rank});
@@ -466,6 +550,7 @@ extern "C" bool FastllmCudaTryMxfp8WoA(const fastllm::Data &input,
 #else
 
 extern "C" void FastllmCudaReleaseMxfp8CutlassCache(const fastllm::Data *) {}
+extern "C" bool FastllmCudaTryFp8DraftHead(const fastllm::Data &, const fastllm::Data &, fastllm::Data &) { return false; }
 
 extern "C" bool FastllmCudaTryMxfp8QuantizedLinear(const fastllm::Data &,
         fastllm::Data &, fastllm::Data &) { return false; }

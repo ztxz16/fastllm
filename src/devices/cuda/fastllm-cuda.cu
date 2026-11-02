@@ -466,9 +466,11 @@ struct FastllmCublasState {
     cublasHandle_t handle = nullptr;
     void *workspace = nullptr;
 };
-static std::map<int, std::unique_ptr<FastllmCublasState>> s_fastllmCublasHandleMap;
+// Precision modes use distinct handles/workspaces; never mutate a handle
+// another operator or graph family may be using.
+static std::map<std::pair<int, bool>, std::unique_ptr<FastllmCublasState>> s_fastllmCublasHandleMap;
 static std::mutex s_fastllmCublasHandleMapMutex;
-cublasHandle_t getFastllmCublasHandle() {
+static cublasHandle_t GetFastllmCublasHandle(bool fp32Reduction) {
     int id = -1;
     cudaGetDevice(&id);
     FastllmCublasState *state;
@@ -477,7 +479,7 @@ cublasHandle_t getFastllmCublasHandle() {
         // wait for this rank's pending NCCL work; holding a cross-device lock
         // would prevent another rank from reaching the matching collective.
         std::lock_guard<std::mutex> guard(s_fastllmCublasHandleMapMutex);
-        auto &entry = s_fastllmCublasHandleMap[id];
+        auto &entry = s_fastllmCublasHandleMap[{id, fp32Reduction}];
         if (!entry) entry = std::make_unique<FastllmCublasState>();
         state = entry.get();
     }
@@ -492,6 +494,13 @@ cublasHandle_t getFastllmCublasHandle() {
         // stable after creation so warmed GEMMs can be captured and replayed.
         return state->handle;
     }
+    if (fp32Reduction) {
+        // Warmed handles are capture-safe. A first-use capture must take the
+        // caller's allocation-free fallback instead of initializing cuBLAS.
+        cudaStreamCaptureStatus capture;
+        if (cudaStreamIsCapturing(cudaStreamPerThread, &capture) != cudaSuccess ||
+            capture != cudaStreamCaptureStatusNone) return nullptr;
+    }
     cublasHandle_t handler = nullptr;
     auto stat = cublasCreate(&handler);
 
@@ -505,6 +514,14 @@ cublasHandle_t getFastllmCublasHandle() {
             cublasDestroy(handler);
             exit(0);
         }
+#if !defined(USE_ROCM) && CUBLAS_VERSION >= 11000
+        if (fp32Reduction && cublasSetMathMode(handler,
+                static_cast<cublasMath_t>(CUBLAS_DEFAULT_MATH |
+                    CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION)) != CUBLAS_STATUS_SUCCESS) {
+            cublasDestroy(handler);
+            return nullptr;
+        }
+#endif
         if (fastllm::GetFastllmEnv().cudaGraph) {
             static size_t graphWorkspaceBytes = []() {
                 const char *env = std::getenv("FASTLLM_CUBLAS_GRAPH_WORKSPACE_MB");
@@ -536,6 +553,18 @@ cublasHandle_t getFastllmCublasHandle() {
     }
 
     return handler;
+}
+
+cublasHandle_t getFastllmCublasHandle() {
+    return GetFastllmCublasHandle(false);
+}
+
+cublasHandle_t getFastllmCublasFp32ReductionHandle() {
+#if !defined(USE_ROCM) && CUBLAS_VERSION >= 11000
+    return GetFastllmCublasHandle(true);
+#else
+    return nullptr;
+#endif
 }
 
 std::vector <long long> FastllmCudaGetFreeSizes() {
@@ -901,6 +930,14 @@ bool FastllmCudaGraphBeginCapture() {
         FastllmCudaGraphRegisterCurrentCapture();
     }
     return ok;
+}
+
+bool FastllmCudaGraphJoinCapture() {
+    if (!FastllmCudaGraphIsCapturing()) return false;
+    if (fastllmCudaGraphPoolPhase.load(std::memory_order_acquire) ==
+            FASTLLM_CUDA_GRAPH_POOL_CAPTURING)
+        FastllmCudaGraphRegisterCurrentCapture();
+    return !FastllmCudaGetThreadError();
 }
 
 bool FastllmCudaGraphPrepareCaptureDevice() {
@@ -1646,8 +1683,12 @@ bool FastllmCudaTensorParallelGreedyGatherGraphCreate(
 }
 
 bool FastllmCudaGraphLaunch(void *exec) {
-    cudaError_t state = cudaGraphLaunch((cudaGraphExec_t)exec, cudaStreamPerThread);
-    return FastllmCudaGraphSetError("cudaGraphLaunch", state);
+    return FastllmCudaGraphLaunchOnStream(exec, cudaStreamPerThread);
+}
+
+bool FastllmCudaGraphLaunchOnStream(void *exec, void *stream) {
+    return FastllmCudaGraphSetError("cudaGraphLaunch",
+        cudaGraphLaunch((cudaGraphExec_t)exec, (cudaStream_t)stream));
 }
 
 // 清掉当前线程/上下文粘着的 CUDA 运行时错误。捕获失败后回退到逐算子之前必须调用，
@@ -5345,6 +5386,10 @@ static bool FastllmCudaRetryMallocAfterReleasingIdle(
         *failureState = state;
     }
     return state == cudaSuccess;
+}
+
+bool FastllmCudaGraphMemoryPoolActive() {
+    return fastllmCudaGraphPoolPhase.load(std::memory_order_acquire) != FASTLLM_CUDA_GRAPH_POOL_IDLE;
 }
 
 bool FastllmCudaGraphMemoryPoolBegin() {
@@ -17413,6 +17458,67 @@ bool FastllmCudaMtpSampleDraft(float *logits, float *proposalProbs,
                        [vocabSize](int id) { return id >= 0 && id < vocabSize; });
 }
 
+namespace {
+__global__ void PrepareMtpDeviceSampling(float *temperature, int *topK, float *topP,
+        float t, int k, float p) {
+    *temperature = t; *topK = k; *topP = p;
+}
+__global__ void AdvanceMtpDeviceSampling(uint64_t *offset) { ++*offset; }
+}
+
+bool FastllmCudaMtpSampleDraftDevice(float *logits, float *proposalProbs,
+        float temperature, int topK, float topP, int *output, int vocabSize,
+        fastllm::Data &workspace) {
+    if (!logits || !proposalProbs || !output || vocabSize <= 0 ||
+        !std::isfinite(temperature) || temperature <= 0 ||
+        !std::isfinite(topP) || topP <= 0 || topP > 1) return false;
+    const size_t row = FastllmCudaAlignBytes(size_t(vocabSize) * sizeof(float), 256);
+    const size_t bytes = 2 * row + 512 + FastllmCudaAlignBytes(sizeof(flashinfer::sampling::RadixRowState), 256);
+    if (bytes > INT_MAX) return false;
+    const int device = FastllmCudaGetDevice();
+    if (workspace.dataType != fastllm::INT8 || workspace.dims != std::vector<int>{int(bytes)} ||
+        workspace.dataDevice != fastllm::CUDA || workspace.dataDeviceIds != std::vector<int>{device} || !workspace.cudaData) {
+        if (FastllmCudaGraphIsCapturing()) return false;
+        workspace.dataType = fastllm::INT8; workspace.UpdateUnitSize(); workspace.Resize({int(bytes)});
+        workspace.ToDevice(fastllm::CUDA, {device}, false); workspace.Allocate(false);
+        uint64_t state[2] = {FastllmMtpSamplingSeed(), 0};
+        if (cudaMemcpy(static_cast<uint8_t *>(workspace.cudaData) + 2 * row + 256,
+                state, sizeof(state), cudaMemcpyHostToDevice) != cudaSuccess) return false;
+    }
+    auto *base = static_cast<uint8_t *>(workspace.cudaData);
+    float *a = reinterpret_cast<float *>(base), *b = reinterpret_cast<float *>(base + row);
+    auto *t = reinterpret_cast<float *>(base + 2 * row);
+    auto *k = reinterpret_cast<int *>(t + 1);
+    auto *p = t + 2;
+    auto *valid = reinterpret_cast<bool *>(t + 3);
+    auto *seed = reinterpret_cast<uint64_t *>(base + 2 * row + 256);
+    auto *states = reinterpret_cast<flashinfer::sampling::RadixRowState *>(base + 2 * row + 512);
+    topK = topK <= 0 ? vocabSize : std::min(topK, vocabSize);
+    cudaStream_t stream = cudaStreamPerThread;
+    PrepareMtpDeviceSampling<<<1, 1, 0, stream>>>(t, k, p, temperature, topK, topP);
+    FastllmTemperatureSoftmaxKernel<1024><<<1, 1024, 0, stream>>>(logits, a, t, vocabSize);
+    cudaError_t status = cudaGetLastError();
+    if (status == cudaSuccess && topP < 1) {
+        status = flashinfer::sampling::TopPRenormProb<float>(a, b, p, 1, 1.0f, vocabSize, stream);
+        std::swap(a, b);
+    }
+    if (status == cudaSuccess && topK < vocabSize) {
+        status = cudaMemsetAsync(states, 0, sizeof(*states), stream);
+        if (status == cudaSuccess) {
+            status = flashinfer::sampling::RadixTopKRenormProbMultiCTA<float, int>(
+                a, b, k, 1, 0, vocabSize, states, stream);
+            std::swap(a, b);
+        }
+    }
+    if (status == cudaSuccess) status = cudaMemcpyAsync(proposalProbs, a,
+        size_t(vocabSize) * sizeof(float), cudaMemcpyDeviceToDevice, stream);
+    if (status == cudaSuccess) status = flashinfer::sampling::SamplingFromProb<float, int, 1>(
+        proposalProbs, output, valid, nullptr, 1, vocabSize, true, seed, 0, seed + 1, 0, stream);
+    if (status != cudaSuccess) return false;
+    AdvanceMtpDeviceSampling<<<1, 1, 0, stream>>>(seed + 1);
+    return cudaGetLastError() == cudaSuccess;
+}
+
 bool FastllmCudaMtpRejectionSampling(float *logits, float *proposalProbs,
                                     const float *temperatures, const int *topKs,
                                     const float *topPs, const int *draftTokenIds,
@@ -24927,4 +25033,25 @@ extern "C" bool FastllmCudaGraphCompose(const void *const *children, int count,
     *outGraph = graph;
     *outExec = exec;
     return true;
+}
+
+// Insert a prepared child at the current stream's exact dependency frontier.
+// The child owns no host callbacks; its caller arms any CPU mailbox at replay.
+bool FastllmCudaGraphAppendChild(const void *child) {
+#if !defined(USE_ROCM) && CUDART_VERSION >= 11030
+    if (!child) return false;
+    cudaStreamCaptureStatus status;
+    cudaGraph_t graph = nullptr;
+    const cudaGraphNode_t *deps = nullptr;
+    size_t count = 0;
+    cudaGraphNode_t node = nullptr;
+    if (FastllmCudaStreamGetCaptureDependencies(cudaStreamPerThread, &status, &graph, &deps, &count) != cudaSuccess ||
+        status != cudaStreamCaptureStatusActive) return false;
+    if (cudaGraphAddChildGraphNode(&node, graph, deps, count,
+            reinterpret_cast<cudaGraph_t>(const_cast<void *>(child))) != cudaSuccess) return false;
+    return FastllmCudaStreamUpdateCaptureDependencies(cudaStreamPerThread, &node, 1,
+        cudaStreamSetCaptureDependencies) == cudaSuccess;
+#else
+    return false;
+#endif
 }

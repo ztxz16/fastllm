@@ -10,7 +10,9 @@ static void RunFP8DecodeRegression() {
     for (int mask : {0, 1, 2}) {
         if ((!ratio && (source || mask)) || (longContext && (batch != 1 || heads != 8))) continue;
         FastllmV41FullDecodeConfig c;
-        c.fp8KV = true; c.batch = batch; c.heads = heads; c.ratio = ratio;
+        c.ringMode = c.cmpMode = c.indexMode = 1;
+        c.ringRowBytes = c.cmpRowBytes = 528; c.indexRowBytes = 132;
+        c.batch = batch; c.heads = heads; c.ratio = ratio;
         c.kvSource = source; c.indexSource = ratio != 0;
         c.maxKeys = longContext ? 262144 : 32768;
         c.writeCandidates = mask == 1; c.useCandidates = mask == 2;
@@ -51,13 +53,11 @@ static void RunFP8DecodeRegression() {
         b.rawKV = raw.cudaData; b.rawScore = rawScore.cudaData;
         b.joined = joined.cudaData; b.scores = scores.cudaData;
         b.latents = latent.cudaData; b.newIndexKeys = nk.cudaData; b.compressNorm = norm.cudaData;
-        auto unsupported = c; unsupported.verifying = true;
-        Data saved; Fill(saved, kv.dims, 0);
-        auto verifyBuffers = b;
-        verifyBuffers.savedKV = saved.cudaData;
-        verifyBuffers.savedRawKV = raw.cudaData;
-        verifyBuffers.savedRawScore = rawScore.cudaData;
-        Check(!FastllmCudaV41CreateFullDecode(unsupported, verifyBuffers), "FP8 verifier accepted");
+        Check(!FastllmCudaV41CreateFullDecode(c, b), "FP8 plan accepted missing packed scratch");
+        Data saved; Fill(saved, {1, batch, c.ringRowBytes}, 0, INT8);
+        b.savedKV = saved.cudaData;
+        auto unsupported = c; unsupported.ringRowBytes = 512;
+        Check(!FastllmCudaV41CreateFullDecode(unsupported, b), "FP8 plan accepted invalid row stride");
         void *plan = FastllmCudaV41CreateFullDecode(c, b);
         Check(plan, "FP8 plan create");
         std::vector<FastllmV41FullDecodeRequest> requests(batch);

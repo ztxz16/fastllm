@@ -106,6 +106,24 @@ extern "C" {
         } catch (...) { return nullptr; }
     }
 
+    DLL_EXPORT const char *benchmark_cpu_moe_threads(int hidden, int intermediate, int kind,
+            int rows, int topk, const int *counts, int count, int budgetMs) {
+#ifdef USE_NUMAS
+        static thread_local std::string result;
+        try {
+            if (!counts || count < 1 || count > 8 || hidden < 256 || hidden > 8192 ||
+                    intermediate < 256 || intermediate > 4096 || rows < 1 || rows > 32 ||
+                    topk < 1 || topk > 16 || budgetMs < 1 || budgetMs > 1000) return nullptr;
+            for (int i = 0; i < count; ++i)
+                if (counts[i] < 1 || counts[i] > 128) return nullptr;
+            result = BenchmarkCpuMoeThreads(hidden, intermediate, kind, rows, topk, counts, count, budgetMs);
+            return result.c_str();
+        } catch (...) { return nullptr; }
+#else
+        return nullptr;
+#endif
+    }
+
     DLL_EXPORT void set_cpu_low_mem(bool low) {
         fastllm::SetLowMemMode(low);
     }

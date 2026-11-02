@@ -1,6 +1,8 @@
 #define CUDA_API_PER_THREAD_DEFAULT_STREAM
 #include <cuda_runtime.h>
 #include "devices/cuda/fastllm-cuda.cuh"
+#include "devices/cuda/fastllm-cuda-dspark.h"
+#include "baseblock.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -86,6 +88,109 @@ void FilterCase() {
     Require(saved == q.Read(), "scratch reuse overwrote saved q");
     std::puts("joint top-k/top-p, temperatures, ties, saved q, ordinary sampler agreement: PASS");
 }
+void DeviceFilterCase() {
+    const int vocab = 32;
+    std::vector<float> values(vocab, -80);
+    for (int i = 0; i < 8; ++i) values[i] = -i * .35f;
+    Buffer logits(values), q(vocab);
+    int *token;
+    Check(cudaMalloc(&token, sizeof(int)));
+    for (float t : {.7f, 1.f, 1.5f}) for (int k : {0, 1, 5, 32}) for (float p : {.55f, 1.f}) {
+        fastllm::Data workspace;
+        const auto expected = Oracle(values, t, k, p);
+        Require(FastllmCudaMtpSampleDraftDevice(logits.p, q.p, t, k, p, token, vocab, workspace), "device sampler warmup");
+        Check(cudaDeviceSynchronize());
+        cudaGraph_t graph; cudaGraphExec_t exec;
+        Check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+        Require(FastllmCudaMtpSampleDraftDevice(logits.p, q.p, t, k, p, token, vocab, workspace), "device sampler capture");
+        Check(cudaStreamEndCapture(cudaStreamPerThread, &graph));
+        Check(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+        std::vector<int> counts(vocab);
+        constexpr int repeats = 2048;
+        for (int i = 0; i < repeats; ++i) {
+            Check(cudaGraphLaunch(exec, cudaStreamPerThread));
+            int selected = -1;
+            Check(cudaMemcpy(&selected, token, sizeof(int), cudaMemcpyDeviceToHost));
+            Require(selected >= 0 && selected < vocab && expected[selected] > 0, "device sample outside q");
+            ++counts[selected];
+        }
+        const auto actual = q.Read();
+        for (int i = 0; i < vocab; ++i) {
+            Require(std::fabs(actual[i] - expected[i]) < 2e-5, "device q differs from CPU joint-filter oracle");
+            Require(std::fabs(double(counts[i]) / repeats - expected[i]) < .05, "graph RNG/distribution mismatch");
+        }
+        cudaGraphExecDestroy(exec); cudaGraphDestroy(graph);
+    }
+    cudaFree(token);
+    std::puts("DEVICE_FILTER_GRAPH_PASS 24 distributions, 49152 replays, saved q and RNG checked");
+}
+void MarkovGraphCase() {
+    using namespace fastllm;
+    const int vocab = 64, rank = 32;
+    std::vector<float> embed(vocab * rank), head(embed.size());
+    // Powers of two keep the independent CPU dot exact for every dtype.
+    for (int i = 0; i < vocab * rank; ++i) {
+        embed[i] = (int(i * 13 % 17) - 8) / 32.f;
+        head[i] = (int(i * 7 % 13) - 6) / 64.f;
+    }
+    int checks = 0;
+    for (DataType dtype : {FLOAT32, BFLOAT16, FLOAT16}) for (int block : {1, 2, 3, 5, 7, 8, 9, 16, 31}) {
+        auto values = [&](const std::vector<float> &src) {
+            Data x(FLOAT32, {vocab, rank}, src);
+            x.ToDevice(CUDA, {0}, true);
+            if (dtype != FLOAT32) ToDataType(x, dtype);
+            return x;
+        };
+        Data e = values(embed), h = values(head);
+        std::vector<float> input(block * vocab);
+        for (size_t i = 0; i < input.size(); ++i) input[i] = float(int(i * 11 % 31) - 15) / 8;
+        Data logits(FLOAT32, {1, block, vocab}, input); logits.ToDevice(CUDA, {0}, true);
+        Data tokens(INT32, {block+1}), probs, outEmbeds, workspace;
+        tokens.ToDevice(CUDA, {0}, false); tokens.Allocate(false);
+        const float temperature = .7f, topP = .8f; const int topK = 7;
+        int anchor = 3;
+        Check(cudaMemcpy(tokens.cudaData, &anchor, sizeof(anchor), cudaMemcpyHostToDevice));
+        auto run = [&] { return FastllmCudaDeepSeekV41MarkovFilteredSampleDevice(logits, e, h,
+            block, temperature, topK, topP, tokens, probs, outEmbeds, workspace); };
+        Require(run(), "filtered Markov warmup"); Check(cudaDeviceSynchronize());
+        cudaGraph_t graph; cudaGraphExec_t exec;
+        Check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+        Require(run(), "filtered Markov capture");
+        Check(cudaStreamEndCapture(cudaStreamPerThread, &graph));
+        Check(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+        for (int replay = 0; replay < 8; ++replay) {
+            anchor = (replay * 7) % vocab;
+            Check(cudaMemcpy(tokens.cudaData, &anchor, sizeof(anchor), cudaMemcpyHostToDevice));
+            Check(cudaGraphLaunch(exec, cudaStreamPerThread));
+            std::vector<int> selected(block+1);
+            std::vector<float> q(block*vocab), emb(block*rank);
+            Check(cudaMemcpy(selected.data(), tokens.cudaData, selected.size()*4, cudaMemcpyDeviceToHost));
+            Check(cudaMemcpy(q.data(), probs.cudaData, q.size()*4, cudaMemcpyDeviceToHost));
+            Check(cudaMemcpy(emb.data(), outEmbeds.cudaData, emb.size()*4, cudaMemcpyDeviceToHost));
+            Require(selected[0] == anchor, "graph anchor stale");
+            for (int step=0;step<block;++step) {
+                Require(selected[step] >= 0 && selected[step] < vocab, "invalid graph Markov token");
+                std::vector<float> row(vocab);
+                for (int v=0;v<vocab;++v) {
+                    float dot=0;
+                    for (int j=0;j<rank;++j) dot += embed[selected[step]*rank+j]*head[v*rank+j];
+                    // Dot sums in this fixture are exactly representable in BF16/FP16.
+                    row[v]=input[step*vocab+v]+dot;
+                }
+                const auto expected=Oracle(row,temperature,topK,topP);
+                for (int v=0;v<vocab;++v)
+                    Require(std::fabs(q[step*vocab+v]-expected[v])<2e-5, "Markov saved q/conditional CPU oracle mismatch");
+                Require(selected[step+1] >= 0 && selected[step+1] < vocab && expected[selected[step+1]] > 0,
+                    "Markov sample outside conditional q");
+                for (int j=0;j<rank;++j)
+                    Require(emb[step*rank+j] == embed[selected[step]*rank+j], "Markov confidence embedding mismatch");
+            }
+            ++checks;
+        }
+        cudaGraphExecDestroy(exec); cudaGraphDestroy(graph);
+    }
+    std::printf("MARKOV_FILTER_GRAPH_PASS %d replays; 3 dtypes; block 1/2/3/5/7/8/9/16/31\n", checks);
+}
 void ChainCase(const char *name, std::vector<float> p, std::vector<float> qdist,
                int drafts, int vocab) {
     const int batch = 16384, qRows = batch * drafts, pRows = batch * (drafts + 1);
@@ -158,6 +263,8 @@ int main() {
     try {
         Check(cudaSetDevice(0));
         FilterCase();
+        DeviceFilterCase();
+        MarkovGraphCase();
         ChainCase("identical", {.6f,.3f,.1f}, {.6f,.3f,.1f}, 3, 32);
         ChainCase("different", {.6f,.3f,.1f}, {.3f,.5f,.2f}, 3, 17);
         ChainCase("two-wide", {.6f,.3f,.1f}, {.3f,.5f,.2f}, 3, 18);

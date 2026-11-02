@@ -29,6 +29,218 @@ except Exception as exc:  # pragma: no cover - this is reported through /compile
 
 if triton is not None:
     @triton.jit
+    def fastllm_small_projection(X, W, S, Y, rows, groups, N: tl.constexpr, K: tl.constexpr,
+                                FP8: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+        # One CTA owns a complete output tile: no rounded split-K partials.
+        n = tl.program_id(0) * BN + tl.arange(0, BN)
+        group = tl.program_id(1)
+        m = tl.arange(0, 16)
+        kk = tl.arange(0, BK)
+        acc = tl.zeros((16, BN), tl.float32)
+        for tile in range(tl.cdiv(K, BK)):
+            k = tile * BK + kk
+            a = tl.load(X + (m[:, None] * groups + group) * K + k[None, :],
+                        (m[:, None] < rows) & (k[None, :] < K), other=0.0)
+            b = tl.load(W + (group * N + n[:, None]) * K + k[None, :],
+                        (n[:, None] < N) & (k[None, :] < K), other=0)
+            if FP8:
+                b = b.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+                sk = tile * (BK // 32) + tl.arange(0, BK // 32)
+                scales = tl.load(S + ((group * N + n[:, None]) // 32) * (K // 32) + sk[None, :],
+                                 (n[:, None] < N) & (sk[None, :] * 32 < K), other=0.0)
+                # Load each block scale once, then broadcast across its 32 values.
+                b = tl.reshape(tl.reshape(b, (BN, BK // 32, 32)) * scales[:, :, None],
+                               (BN, BK)).to(tl.bfloat16)
+            acc = tl.dot(a, tl.trans(b), acc)
+        tl.store(Y + (m[:, None] * groups + group) * N + n[None, :], acc.to(tl.bfloat16),
+                 (m[:, None] < rows) & (n[None, :] < N))
+
+
+    @triton.jit
+    def _fastllm_mxfp4_decode_pair(packed, exponent):
+        return tl.inline_asm_elementwise(
+            """{
+              .reg .b8 lo, hi;
+              .reg .b16 h0, h1, b0, b1;
+              .reg .b32 halves, sc, vals, result;
+              .reg .f32 f0, f1;
+              mov.b16 {lo,hi}, $2;
+              cvt.rn.f16x2.e2m1x2 halves, lo;
+              mov.b32 {h0,h1}, halves;
+              cvt.f32.f16 f0, h0;
+              cvt.f32.f16 f1, h1;
+              cvt.rn.bf16.f32 b0, f0;
+              cvt.rn.bf16.f32 b1, f1;
+              mov.b32 vals, {b0,b1};
+              cvt.rn.bf16x2.ue8m0x2 sc, $3;
+              mul.rn.bf16x2 result, vals, sc;
+              mov.b32 {$0,$1}, result;
+            }""",
+            constraints="=h,=h,h,h",
+            args=[packed.to(tl.uint16), (exponent * 257).to(tl.uint16)],
+            dtype=(tl.bfloat16, tl.bfloat16),
+            is_pure=True,
+            pack=1,
+        )
+
+
+    @triton.jit
+    def fastllm_mxfp4_grouped_gemm(
+        X,
+        W,
+        Slots,
+        Routes,
+        Y,
+        H: tl.constexpr,
+        I: tl.constexpr,
+        TOPK: tl.constexpr,
+        COUNT,
+        STRIDE: tl.constexpr,
+        DOWN: tl.constexpr,
+        GATE: tl.constexpr,
+        BN: tl.constexpr,
+        BK: tl.constexpr,
+    ):
+        first = tl.program_id(1)
+        slot = tl.load(Slots + first)
+        prev = tl.load(Slots + first - 1, first > 0, other=-2)
+        if slot >= 0 and slot != prev:
+            m = tl.arange(0, 16)
+            q = first + m
+            same = tl.load(Slots + q, (q < COUNT) & (m < 8), other=-2) == slot
+            route = tl.load(Routes + q, (q < COUNT) & (m < 8), other=0)
+            n = tl.program_id(0) * BN + tl.arange(0, BN)
+            kk = tl.arange(0, BK)
+            K: tl.constexpr = H if GATE else I
+            N: tl.constexpr = 2 * I if GATE else H
+            row = route // TOPK if GATE else route
+            acc = tl.full((16, BN), 0, tl.float32)
+            for begin in range(0, K, 2 * BK):
+                k = begin + 2 * kk
+                xe = tl.load(X + row[:, None] * K + k[None, :], same[:, None] & (k[None, :] < K), other=0)
+                xo = tl.load(X + row[:, None] * K + k[None, :] + 1, same[:, None] & (k[None, :] + 1 < K), other=0)
+                offset = (
+                    slot.to(tl.int64) * STRIDE
+                    + (0 if GATE else DOWN)
+                    + (n[:, None].to(tl.int64) * (K // 32) + k[None, :] // 32) * 17
+                )
+                packed = tl.load(
+                    W + offset + (k[None, :] % 32) // 2, (n[:, None] < N) & (k[None, :] < K), other=0
+                ).to(tl.uint32)
+                exponent = tl.load(W + offset + 16, (n[:, None] < N) & (k[None, :] < K), other=127).to(tl.uint32)
+                # Same BF16 pair conversion as dsv41_cache::FP4Pair. Keep
+                # the original BF16 operands and FP32 Tensor Core accumulation.
+                even, odd = _fastllm_mxfp4_decode_pair(packed, exponent)
+                acc = tl.dot(xe, tl.trans(even), acc)
+                acc = tl.dot(xo, tl.trans(odd), acc)
+            rounded = acc.to(tl.bfloat16)
+            tl.store(Y + route[:, None] * N + n[None, :], rounded, same[:, None] & (n[None, :] < N))
+
+
+    @triton.jit
+    def fastllm_mxfp4_grouped_activate(
+        Raw, Routes, Scores, Y, I: tl.constexpr, LIMIT: tl.constexpr, B: tl.constexpr
+    ):
+        route = tl.load(Routes + tl.program_id(1))
+        c = tl.program_id(0) * B + tl.arange(0, B)
+        g = tl.load(Raw + route * 2 * I + c, c < I, other=0).to(tl.float32)
+        u = tl.load(Raw + route * 2 * I + I + c, c < I, other=0).to(tl.float32)
+        if LIMIT > 0:
+            g = tl.minimum(g, LIMIT)
+            u = tl.maximum(-LIMIT, tl.minimum(u, LIMIT))
+        val = ((g / (1 + libdevice.exp(-g)) * u) * tl.load(Scores + route)).to(tl.bfloat16).to(tl.float32)
+        blocks = tl.reshape(tl.abs(val), (B // 32, 32))
+        amax = tl.maximum(tl.max(blocks, 1), 1e-4) / 448.0
+        bits = amax.to(tl.uint32, bitcast=True)
+        e = ((bits >> 23) & 255).to(tl.int32) - 127 + ((bits & 0x7FFFFF) != 0).to(tl.int32)
+        scales = libdevice.exp2(e.to(tl.float32))
+        scale = tl.reshape(tl.broadcast_to(scales[:, None], (B // 32, 32)), (B,))
+        q = tl.maximum(-448.0, tl.minimum(448.0, val / scale)).to(tl.float8e4nv).to(tl.float32) * scale
+        tl.store(Y + route * I + c, q.to(tl.bfloat16), c < I)
+
+
+    @triton.jit
+    def _fastllm_mxfp4_planar_tile(W, slot, rows, begin,
+                                  K: tl.constexpr, N: tl.constexpr,
+                                  OFFSET: tl.constexpr, STRIDE: tl.constexpr,
+                                  BN: tl.constexpr, BK: tl.constexpr):
+        # Matrix-local payload and UE8M0 planes; lossless cache admission.
+        base = W + slot.to(tl.int64) * STRIDE + OFFSET
+        pairs = begin // 2 + tl.arange(0, BK // 2)
+        packed = tl.load(base + rows[:, None].to(tl.int64) * (K // 2) + pairs[None, :]).to(tl.uint32)
+        exponents = tl.load(base + N * (K // 2) + rows[:, None].to(tl.int64) * (K // 32) +
+                            begin // 32 + tl.arange(0, BK // 32)[None, :]).to(tl.uint32)
+        scale = tl.where(exponents == 0, 2.0 ** -127,
+                         tl.where(exponents == 255, float('nan'),
+                                  (exponents << 23).to(tl.float32, bitcast=True)))
+        scale = tl.reshape(tl.broadcast_to(scale[:, :, None], (BN, BK // 32, 16)), (BN, BK // 2))
+        halves = tl.inline_asm_elementwise(
+            "{ .reg .b8 v; cvt.u8.u32 v, $1; cvt.rn.f16x2.e2m1x2 $0, v; }",
+            constraints="=r,r", args=[packed], dtype=tl.uint32, is_pure=True, pack=1)
+        even = (halves & 65535).to(tl.uint16).to(tl.float16, bitcast=True)
+        odd = (halves >> 16).to(tl.uint16).to(tl.float16, bitcast=True)
+        return (even.to(tl.float32) * scale).to(tl.bfloat16), (odd.to(tl.float32) * scale).to(tl.bfloat16)
+
+
+    @triton.jit
+    def fastllm_mxfp4_planar_grouped(X, W, Slots, Routes, Scores, Y, COUNT,
+                                   H: tl.constexpr, I: tl.constexpr, TOPK: tl.constexpr,
+                                   STRIDE: tl.constexpr, DOWN: tl.constexpr,
+                                   GATE: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+        first = tl.program_id(1)
+        slot = tl.load(Slots + first)
+        previous = tl.load(Slots + first - 1, first > 0, other=-2)
+        # A tile covers eight routes. Repeated indices can make an expert's
+        # run longer than eight even with at most eight input rows.
+        start = slot != previous
+        earlier = tl.load(Slots + first - 8, first >= 8, other=-2)
+        if slot >= 0 and slot == earlier:
+            prior = tl.arange(0, 64)
+            same = (prior < first) & (tl.load(Slots + prior, prior < first, other=-2) == slot)
+            start = (tl.sum(same.to(tl.int32), 0) % 8) == 0
+        if slot >= 0 and start:
+            m = tl.arange(0, 16)
+            valid = (first + m < COUNT) & (m < 8)
+            active = tl.load(Slots + first + m, valid, other=-2) == slot
+            route = tl.load(Routes + first + m, valid, other=0)
+            row = route // TOPK if GATE else route
+            n = tl.program_id(0) * BN + tl.arange(0, BN)
+            K: tl.constexpr = H if GATE else I
+            N: tl.constexpr = 2 * I if GATE else H
+            acc = tl.zeros((16, BN), tl.float32)
+            if GATE:
+                up = tl.zeros((16, BN), tl.float32)
+            for begin in range(0, K, BK):
+                k = begin + 2 * tl.arange(0, BK // 2)
+                even = tl.load(X + row[:, None] * K + k[None, :], active[:, None], other=0)
+                odd = tl.load(X + row[:, None] * K + k[None, :] + 1, active[:, None], other=0)
+                we, wo = _fastllm_mxfp4_planar_tile(W, slot, n, begin, K, N,
+                                                   0 if GATE else DOWN, STRIDE, BN, BK)
+                acc = tl.dot(even, tl.trans(we), acc)
+                acc = tl.dot(odd, tl.trans(wo), acc)
+                if GATE:
+                    ue, uo = _fastllm_mxfp4_planar_tile(W, slot, n + I, begin, K, N, 0, STRIDE, BN, BK)
+                    up = tl.dot(even, tl.trans(ue), up)
+                    up = tl.dot(odd, tl.trans(uo), up)
+            value = acc.to(tl.bfloat16).to(tl.float32)
+            if GATE:
+                u = up.to(tl.bfloat16).to(tl.float32)
+                value = tl.minimum(value, 10.0)
+                u = tl.maximum(-10.0, tl.minimum(u, 10.0))
+                value = ((value / (1.0 + libdevice.exp(-value)) * u) *
+                         tl.load(Scores + route)[:, None]).to(tl.bfloat16).to(tl.float32)
+                blocks = tl.reshape(tl.abs(value), (16, BN // 32, 32))
+                amax = tl.maximum(tl.max(blocks, 2), 1e-4) / 448.0
+                bits = amax.to(tl.uint32, bitcast=True)
+                exponent = ((bits >> 23) & 255).to(tl.int32) - 127 + ((bits & 0x7fffff) != 0).to(tl.int32)
+                scales = libdevice.exp2(exponent.to(tl.float32))
+                scale = tl.reshape(tl.broadcast_to(scales[:, :, None], (16, BN // 32, 32)), (16, BN))
+                value = tl.maximum(-448.0, tl.minimum(448.0, value / scale)).to(tl.float8e4nv).to(tl.float32) * scale
+                value = value.to(tl.bfloat16)
+            tl.store(Y + route[:, None] * (I if GATE else H) + n[None, :], value, active[:, None])
+
+
+    @triton.jit
     def _fastllm_fp8e4m3_to_float(x):
         x = x.to(tl.uint32)
         bits = ((x & 0x80) << 8) | ((x & 0x7F) << 7)
@@ -3496,7 +3708,7 @@ def compile_chunk_gdn_recompute(payload):
 
 def _compile_cubin(
     fn, signature, constexprs, arch, num_warps, num_stages, cubin_path,
-    extra_divisible_by_16=None,
+    extra_divisible_by_16=None, enable_fp_fusion=True,
 ):
     extra_divisible_by_16 = set(extra_divisible_by_16 or ())
     attrs = {
@@ -3514,7 +3726,7 @@ def _compile_cubin(
         src = ASTSource(fn=fn, signature=signature, constexprs=constexprs, attrs=attrs)
     target = GPUTarget("cuda", arch, 32)
     backend = triton.compiler.make_backend(target)
-    options = backend.parse_options({"num_warps": num_warps, "num_stages": num_stages})
+    options = backend.parse_options({"num_warps": num_warps, "num_stages": num_stages, "enable_fp_fusion": enable_fp_fusion})
     ccinfo = triton.compile(src, target=target, options=options.__dict__)
     cubin_path.write_bytes(ccinfo.asm[backend.binary_ext])
     return ccinfo
@@ -4548,9 +4760,154 @@ def compile_merge_moe_fp8(payload):
     return meta
 
 
+
+def mxfp4_grouped_cache_paths(payload):
+    arch = require_int(payload, "arch")
+    # Fixed original DSV4.1 layout and rounding, with runtime route count.
+    planar = payload.get("planar", False)
+    if not isinstance(planar, bool):
+        raise ValueError("planar must be boolean")
+    topk = payload.get("topk", 6)
+    if type(topk) is not int or topk not in ((3, 6) if planar else (6,)):
+        raise ValueError("unsupported grouped MXFP4 topk")
+    base = (f"mxfp4_grouped_v6_planar_sm{arch}_h5120_i2304_k{topk}_n32_64_k256_w4_s2" if planar else
+            f"mxfp4_grouped_v3_sm{arch}_h5120_i2304_k6_n64_k128_w4_s3")
+    root = Path(payload["cache_dir"])
+    return {
+        name: root / f"{base}_{name}.cubin" for name in (("gate", "down") if planar else ("gate", "activate", "down"))
+    }, root / f"{base}.json"
+
+
+def compile_mxfp4_grouped(payload):
+    if triton is None:
+        raise RuntimeError(f"failed to import triton: {_triton_error}")
+    arch = require_int(payload, "arch")
+    if arch not in {120, 121}:
+        raise ValueError("grouped MXFP4 requires SM12x")
+    paths, meta_path = mxfp4_grouped_cache_paths(payload)
+    if meta_path.exists() and all(p.exists() for p in paths.values()):
+        return json.loads(meta_path.read_text())
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+    h, i, topk = 5120, 2304, payload.get("topk", 6)
+    down = 2 * i * (h // 32) * 17
+    stride = down + h * (i // 32) * 17
+    if payload.get("planar", False):
+        infos = {}
+        for name, bn in (("gate", 32), ("down", 64)):
+            infos[name] = _compile_cubin(fastllm_mxfp4_planar_grouped,
+                dict(X="*bf16", W="*u8", Slots="*i32", Routes="*i32", Scores="*fp32",
+                     Y="*bf16" if name == "gate" else "*fp32", COUNT="i32",
+                     H="constexpr", I="constexpr", TOPK="constexpr", STRIDE="constexpr",
+                     DOWN="constexpr", GATE="constexpr", BN="constexpr", BK="constexpr"),
+                dict(H=h, I=i, TOPK=topk, STRIDE=stride, DOWN=down, GATE=name == "gate", BN=bn, BK=256),
+                arch, 4, 2, paths[name], enable_fp_fusion=False)
+        meta = dict(ok=True, op="mxfp4_grouped", version=6, planar=True, arch=arch, topk=topk,
+                    kernels={k: dict(cubin=str(paths[k]), kernel=v.metadata.name,
+                                     shared=int(v.metadata.shared), num_warps=int(v.metadata.num_warps))
+                             for k,v in infos.items()})
+        meta_path.write_text(json.dumps(meta, sort_keys=True))
+        return meta
+    signature = dict(
+        X="*bf16",
+        W="*u8",
+        Slots="*i32",
+        Routes="*i32",
+        Y="*bf16",
+        H="constexpr",
+        I="constexpr",
+        TOPK="constexpr",
+        COUNT="i32",
+        STRIDE="constexpr",
+        DOWN="constexpr",
+        GATE="constexpr",
+        BN="constexpr",
+        BK="constexpr",
+    )
+    constants = dict(H=h, I=i, TOPK=topk, STRIDE=stride, DOWN=down, BN=64, BK=128)
+    infos = {}
+    for name in ("gate", "down"):
+        sig = dict(signature, Y="*bf16" if name == "gate" else "*fp32")
+        infos[name] = _compile_cubin(
+            fastllm_mxfp4_grouped_gemm,
+            sig,
+            dict(constants, GATE=name == "gate"),
+            arch,
+            4,
+            3,
+            paths[name],
+            enable_fp_fusion=False,
+        )
+    infos["activate"] = _compile_cubin(
+        fastllm_mxfp4_grouped_activate,
+        dict(
+            Raw="*bf16",
+            Routes="*i32",
+            Scores="*fp32",
+            Y="*bf16",
+            I="constexpr",
+            LIMIT="constexpr",
+            B="constexpr",
+        ),
+        dict(I=i, LIMIT=10.0, B=128),
+        arch,
+        4,
+        1,
+        paths["activate"],
+        enable_fp_fusion=False,
+    )
+    meta = dict(
+        ok=True,
+        op="mxfp4_grouped",
+        version=3,
+        arch=arch,
+        kernels={
+            k: dict(
+                cubin=str(paths[k]),
+                kernel=v.metadata.name,
+                shared=int(v.metadata.shared),
+                num_warps=int(v.metadata.num_warps),
+            )
+            for k, v in infos.items()
+        },
+    )
+    meta_path.write_text(json.dumps(meta, sort_keys=True))
+    return meta
+
+
+def compile_small_projection(payload):
+    if triton is None:
+        raise RuntimeError(f"failed to import triton: {_triton_error}")
+    arch, n, k, bn, bk = (require_int(payload, key) for key in
+                         ("arch", "n", "k", "block_n", "block_k"))
+    fp8 = int(payload["fp8"])
+    if arch not in {120, 121} or n <= 0 or k <= 0 or n % 32 or k % 32 or fp8 not in {0, 1}:
+        raise ValueError("small projection requires SM12x, aligned BF16 / block-32 FP8 weights")
+    if (bn, bk) not in {(64, 64), (64, 128), (32, 128), (32, 256)}:
+        raise ValueError("unsupported small projection tile")
+    root = Path(payload["cache_dir"])
+    base = f"small_projection_v1_sm{arch}_fp8{fp8}_n{n}_k{k}_bn{bn}_bk{bk}_w4_s3"
+    cubin, meta_path = root / (base + ".cubin"), root / (base + ".json")
+    if meta_path.exists() and cubin.exists():
+        return json.loads(meta_path.read_text())
+    root.mkdir(parents=True, exist_ok=True)
+    compiled = _compile_cubin(fastllm_small_projection,
+        dict(X="*bf16", W="*u8" if fp8 else "*bf16", S="*fp32", Y="*bf16", rows="i32", groups="i32",
+             N="constexpr", K="constexpr", FP8="constexpr", BN="constexpr", BK="constexpr"),
+        dict(N=n, K=k, FP8=bool(fp8), BN=bn, BK=bk), arch, 4, 3, cubin)
+    meta = dict(ok=True, op="small_projection", version=1, arch=arch, n=n, k=k, fp8=fp8,
+                block_n=bn, block_k=bk, cubin=str(cubin), kernel=compiled.metadata.name,
+                shared=int(compiled.metadata.shared), num_warps=int(compiled.metadata.num_warps))
+    meta_path.write_text(json.dumps(meta, sort_keys=True))
+    return meta
+
+
 def handle_compile(payload):
     op = payload.get("op")
     with _compile_lock:
+        if op == "small_projection":
+            return compile_small_projection(payload)
+        if op == "mxfp4_grouped":
+            return compile_mxfp4_grouped(payload)
         if op == "linear":
             return compile_linear(payload)
         if op == "chunk_gdn_prefill":
