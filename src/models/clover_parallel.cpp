@@ -4,6 +4,7 @@
 #include "utils/hybrid_moe.h"
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
 #include <cstring>
 #include <set>
 #include <sstream>
@@ -171,6 +172,7 @@ void CloverModel::RunParallel(const std::function<void(CloverModel &, int)> &tas
     RequireTP(parallel && !parallel->failed, "parallel runtime is unavailable after a rank failure");
     RequireTP(parallel->generation == FastllmGetNcclGeneration(), "NCCL group changed after initialization");
     std::vector<std::exception_ptr> errors(parallelDevices.size());
+    std::exception_ptr firstError;
     parallel->workers.RunWithCaller(parallelDevices, [&](int rank) {
         struct RestoreExecutor {
             void *previous = GetExecutor();
@@ -182,14 +184,31 @@ void CloverModel::RunParallel(const std::function<void(CloverModel &, int)> &tas
             FastllmCudaSetDevice(local.cudaDevice);
             FastllmCudaClearThreadError();
             task(local, rank);
-            RequireTP(!FastllmCudaGetThreadError() && cudaStreamSynchronize(cudaStreamPerThread) == cudaSuccess,
-                "rank execution failed");
+            RequireTP(!FastllmCudaGetThreadError(), "rank CUDA operation failed");
+            const auto status = cudaStreamSynchronize(cudaStreamPerThread);
+            if (status != cudaSuccess)
+                throw std::runtime_error(std::string("Clover TP: CUDA stream synchronization failed: ") +
+                    cudaGetErrorString(status));
         } catch (...) {
-            if (!parallel->failed.exchange(true)) FastllmNcclAbort("Clover rank execution failed");
+            if (!parallel->failed.exchange(true)) {
+                firstError = std::current_exception();
+                try { std::rethrow_exception(firstError); }
+                catch (const std::exception &error) {
+                    std::fprintf(stderr, "Clover TP rank %d (cuda:%d) failed: %s\n",
+                        rank, parallelDevices[rank], error.what());
+                } catch (...) {
+                    std::fprintf(stderr, "Clover TP rank %d (cuda:%d) failed with an unknown exception\n",
+                        rank, parallelDevices[rank]);
+                }
+                FastllmNcclAbort("Clover rank execution failed");
+            }
             throw;
         }
     }, errors);
     FastllmCudaSetDevice(cudaDevice);
+    // Abort can make a lower-numbered peer fail its next collective. Report
+    // the initiating exception, not whichever rank happens to sort first.
+    if (firstError) std::rethrow_exception(firstError);
     for (auto error : errors) if (error) std::rethrow_exception(error);
 #endif
 }

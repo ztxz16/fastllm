@@ -351,6 +351,21 @@ int main(int argc, char **argv) {
         Populate(single, "cuda:0", fp16, heads);
         std::string spec = "cuda:0"; for (int r = 1; r < ranks; ++r) spec += "," + std::to_string(r);
         Populate(tp, spec, fp16, heads);
+        if (mode == "rank-error") {
+            Cache cache; Data logits;
+            tp.ForwardLogits(Tokens(3, 11), cache, false, logits);
+            // Only the last rank rejects its context. Peers may already have
+            // reached a collective; their cancellation must not hide it.
+            cache[1].first.multiDeviceDatas.at(ranks - 1)->dims[0] = 1024;
+            bool failed = false;
+            try { tp.ForwardLogits(Tokens(1, 13), cache, false, logits); }
+            catch (const std::exception &error) {
+                failed = std::string(error.what()) == "Clover: context limit exceeded";
+            }
+            Check(failed, "peer cancellation masked the initiating rank error");
+            std::cout << "Clover TP first-rank error propagation PASS" << std::endl;
+            return 0;
+        }
         ForwardChecks(single, tp, ranks); CompactChecks(tp); GenerationChecks(tp);
         std::cout << "Clover TP" << ranks << (fp16 ? " FP16" : " BF16") << " PASS: logits, preview, full/compact rollback, prefix cache and seeded sampling" << std::endl;
     } catch (const std::exception &e) { std::cerr << e.what() << std::endl; return 1; }
