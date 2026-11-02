@@ -245,9 +245,9 @@ void CloverModel::LoadPrefix(ResponseContext &ctx, Request &r, Data &logits) {
         }
         FastllmCudaSetDevice(device);
         dst.dataType = src.dataType; dst.UpdateUnitSize();
-        dst.Resize(src.dims);
         dst.ToDevice(DataDevice::CUDA, std::vector<int>{device}, false);
-        dst.Allocate(false);
+        ReserveCache(dst, src.dims);
+        dst.Resize(src.dims);
         FastllmCudaCopyFromHostToDevice(dst.cudaData, src.cpuData, src.GetBytes());
     };
     std::vector<std::pair<Data, Data>> restored(block_cnt);
@@ -270,7 +270,7 @@ void CloverModel::LoadPrefix(ResponseContext &ctx, Request &r, Data &logits) {
                 int heads = example.dims.at(1);
                 target->dataType = dataType; target->UpdateUnitSize();
                 target->ToDevice(DataDevice::CUDA, std::vector<int>{device}, false);
-                target->Expansion({(snapshot->cachedLen + 255) / 256 * 256, heads, head_dim});
+                ReserveCache(*target, {(snapshot->cachedLen + 255) / 256 * 256, heads, head_dim});
                 target->Resize({snapshot->cachedLen, heads, head_dim});
                 const size_t rowBytes = size_t(heads) * head_dim * 2;
                 for (auto chunk = snapshot->kv; chunk; chunk = chunk->previous) {

@@ -93,6 +93,10 @@ private:
     // released with the model after ShutdownRuntime has joined the worker.
     Data gdnPrefillWorkspace;
     Data samplingWorkspace;
+    // The existing CUDA arena owns cache slices even if they outlive the model.
+    // Forwards and prefix restoration are serialized by the model scheduler.
+    std::map<int, std::vector<std::weak_ptr<class CudaWorkspace>>> cacheArenas;
+    void ReserveCache(Data &data, const std::vector<int> &capacity, bool overwrite = false);
     int maskToken = 151669, vocabSize = 248320;
     std::shared_ptr<class HybridMoeBF16> hybridMoe;
     std::vector<bool> hostExperts;

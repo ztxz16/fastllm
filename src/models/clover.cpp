@@ -10,6 +10,7 @@
 #include <stdexcept>
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
+#include "devices/cuda/cudaworkspace.h"
 #include <cuda_runtime.h>
 #include "devices/cuda/fastllm-cuda-norm.h"
 #include "devices/cuda/fastllm-moe.h"
@@ -59,6 +60,80 @@ void CloverLinear(Data &input, Data &weight, Data &output) {
 #endif
 std::string Layer(int i) { return "model.layers." + std::to_string(i) + "."; }
 }
+
+void CloverModel::ReserveCache(Data &data, const std::vector<int> &capacity, bool overwrite) {
+#ifdef USE_CUDA
+    Check(!capacity.empty() && data.dataDevice == DataDevice::CUDA && data.dataDeviceIds.size() == 1 &&
+        !data.isFake && (overwrite || data.dims.empty() || (data.dims.size() == capacity.size() &&
+        data.dims[0] <= capacity[0] && std::equal(data.dims.begin() + 1, data.dims.end(), capacity.begin() + 1))),
+        "invalid cache reservation");
+    // Fixed-width verification overwrites the same journals every round.
+    // Avoid constructing tensor metadata when their existing layout fits.
+    if (overwrite && data.cudaData && data.dims == capacity &&
+        data.GetBytes() <= data.expansionBytes) return;
+    Data layout(data.dataType, capacity);
+    const size_t bytes = layout.GetBytes(), oldBytes = overwrite ? 0 : data.GetBytes();
+    Check(bytes > 0 && oldBytes <= bytes, "invalid cache size");
+    if (overwrite && data.cudaData && data.expansionBytes >= bytes) {
+        data.dims = capacity;
+        data.expansionDims = capacity;
+        data.strides = layout.strides;
+        return;
+    }
+    const int device = data.dataDeviceIds[0];
+    FastllmCudaSetDevice(device);
+    void *pointer = nullptr;
+    // Thousands of independent KV/state allocations exhaust CUDA allocation
+    // resources with TP8 peer access. Reuse the shared arena allocator;
+    // large contiguous caches retain the direct-allocation path.
+    constexpr size_t slabBytes = 64ULL << 20;
+    if (bytes <= slabBytes / 2) {
+        auto &arenas = cacheArenas[device];
+        // Slices retain their arena; freeing its last slice releases the slab
+        // immediately instead of retaining a high-concurrency idle KV peak.
+        arenas.erase(std::remove_if(arenas.begin(), arenas.end(),
+            [](const auto &arena) { return arena.expired(); }), arenas.end());
+        for (auto &entry : arenas) {
+            auto arena = entry.lock();
+            if (!arena) continue;
+            if (arena->Capacity() - arena->LiveBytes() < bytes) continue;
+            pointer = AllocateCudaWorkspace(arena, bytes, false);
+            if (pointer) break;
+        }
+        if (!pointer) {
+            // Small recurrent caches should not reserve 64 MiB per rank.
+            const size_t aligned = (bytes + 255) / 256 * 256;
+            auto arena = std::make_shared<CudaWorkspace>(device,
+                std::min(slabBytes, std::max(size_t(1) << 20, aligned * 32)), aligned);
+            pointer = AllocateCudaWorkspace(arena, bytes);
+            arenas.push_back(arena);
+        }
+    } else {
+        pointer = FastllmCudaDirectMalloc(bytes);
+    }
+    Check(pointer != nullptr, "cache allocation failed");
+    // Arena release does not implicitly synchronize like cudaFree. Complete
+    // the copy before returning old storage to the shared free list.
+    if (data.cudaData) {
+        const bool copied = !oldBytes ||
+            FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(pointer, data.cudaData, oldBytes);
+        if (!copied || cudaStreamSynchronize(cudaStreamPerThread) != cudaSuccess) {
+            FastllmCudaDirectFree(pointer);
+            Check(false, "cache growth copy failed");
+        }
+    }
+    data.FreeSpace();
+    data.cudaData = pointer;
+    data.cudaDataBorrowed = false;
+    data.directMemory = true;
+    data.expansionDims = capacity;
+    data.expansionSize = layout.Count(0);
+    data.expansionBytes = bytes;
+    data.strides = layout.strides;
+    if (overwrite) data.dims = capacity;
+#endif
+}
+
 // One fixed-width set of stateless MoE graphs belongs to this model. The
 // scheduler serializes forwards; graphs are released after ShutdownRuntime
 // joins its worker, before the resident weights are destroyed.
@@ -354,18 +429,24 @@ void CloverModel::GdnCoreBatch(Data &projected, int layer, CachePair *const *cac
     const size_t compactBytes = snapshots && (compact || (batch >= 8 && t >= 16))
         ? FastllmCudaCloverGdnSnapshotBytes(t, keyHeads, valueHeads) : 0;
     CloverCudaGdnCaches pointers;
+    auto prepare = [&](Data &data, DataType type, const std::vector<int> &shape, bool zero = false) {
+        data.dataType = type; data.UpdateUnitSize();
+        data.ToDevice(DataDevice::CUDA, std::vector<int>{cudaDevice}, false);
+        ReserveCache(data, shape, true);
+        if (zero) data.Allocate(0.f);
+    };
     for (int b = 0; b < batch; ++b) {
         auto &conv = *caches[b]->first; auto &state = *caches[b]->second;
-        if (conv.dims.empty()) PrepareCloverData(conv, dataType, {1, channels, 3}, cudaDevice, true);
-        if (state.dims.empty()) PrepareCloverData(state, FLOAT32, {1, valueHeads, 128, 128}, cudaDevice, true);
+        if (conv.dims.empty()) prepare(conv, dataType, {1, channels, 3}, true);
+        if (state.dims.empty()) prepare(state, FLOAT32, {1, valueHeads, 128, 128}, true);
         pointers.conv[b] = conv.cudaData; pointers.state[b] = (float *)state.cudaData;
         if (snapshots) {
-            PrepareCloverData(*snapshots[b]->first, dataType, {t, 1, channels, 3}, cudaDevice);
+            prepare(*snapshots[b]->first, dataType, {t, 1, channels, 3});
             // A one-dimensional record denotes the compact initial-state /
             // update journal; the existing five-dimensional layout is full.
-            PrepareCloverData(*snapshots[b]->second, FLOAT32, compactBytes
+            prepare(*snapshots[b]->second, FLOAT32, compactBytes
                 ? std::vector<int>{int(compactBytes / sizeof(float))}
-                : std::vector<int>{t, 1, valueHeads, 128, 128}, cudaDevice);
+                : std::vector<int>{t, 1, valueHeads, 128, 128});
             pointers.convSnapshots[b] = snapshots[b]->first->cudaData;
             pointers.stateSnapshots[b] = (float *)snapshots[b]->second->cudaData;
         }
@@ -475,7 +556,7 @@ void CloverModel::FullAttentionCore(Data &qgate, Data &k, Data &v, int layer,
         dst.ToDevice(DataDevice::CUDA, std::vector<int>{cudaDevice});
         int required = position + t;
         if (dst.expansionDims.empty() || dst.expansionDims[0] < required)
-            dst.Expansion({CloverAttentionCapacity(required, max_positions), num_key_value_heads, head_dim});
+            ReserveCache(dst, {CloverAttentionCapacity(required, max_positions), num_key_value_heads, head_dim});
         CatDirect(dst, src, 0);
     };
     append(*cache.first, kn); append(*cache.second, v);
@@ -532,7 +613,7 @@ void CloverModel::FullAttentionCoreBatch(Data &projected, int layer,
             dst->dataType = dataType; dst->UpdateUnitSize();
             dst->ToDevice(DataDevice::CUDA, std::vector<int>{cudaDevice});
             if (dst->expansionDims.empty() || dst->expansionDims[0] < required)
-                dst->Expansion({CloverAttentionCapacity(required, max_positions), num_key_value_heads, head_dim});
+                ReserveCache(*dst, {CloverAttentionCapacity(required, max_positions), num_key_value_heads, head_dim});
         }
         table.key[b] = cache.first->cudaData; table.value[b] = cache.second->cudaData;
         table.position[b] = positions[b];

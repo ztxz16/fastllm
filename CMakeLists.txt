@@ -3135,6 +3135,9 @@ if (UNIT_TEST)
         add_test(NAME clover_p2p_abort COMMAND cloverParallelRegression abort)
         set_tests_properties(clover_p2p_abort PROPERTIES
             LABELS "cuda;multigpu" TIMEOUT 15 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+        add_test(NAME clover_parallel_tp8 COMMAND cloverParallelRegression bf16 8)
+        set_tests_properties(clover_parallel_tp8 PROPERTIES
+            LABELS "cuda;multigpu" TIMEOUT 180 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
 
         if (USE_NUMAS)
             add_executable(hybridBF16Regression test/ops/hybridBF16Regression.cpp)

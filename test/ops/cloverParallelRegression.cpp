@@ -1,5 +1,6 @@
 #include "models/clover.h"
 #include "devices/cuda/fastllm-cuda.cuh"
+#include "devices/cuda/cudaworkspace.h"
 #include "devices/multicuda/fastllm-multicuda.cuh"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -103,10 +104,10 @@ void AllReduceChecks() {
     Check(cudaFree(data) == cudaSuccess, "fallback free");
     std::cout << "TP2 allreduce BF16/FP16/FP32, in-place, guards, asynchronous repeats and fallbacks PASS" << std::endl;
 }
-void Populate(CloverModel &m, const std::string &devices, bool fp16) {
+void Populate(CloverModel &m, const std::string &devices, bool fp16, int heads) {
     m.weight.dicts = {{"hidden_size", "512"}, {"num_hidden_layers", "2"},
-        {"num_attention_heads", "4"}, {"num_key_value_heads", "2"}, {"head_dim", "256"},
-        {"linear_num_key_heads", "4"}, {"linear_num_value_heads", "8"},
+        {"num_attention_heads", std::to_string(heads)}, {"num_key_value_heads", "2"}, {"head_dim", "256"},
+        {"linear_num_key_heads", std::to_string(heads)}, {"linear_num_value_heads", std::to_string(2 * heads)},
         {"moe_intermediate_size", "512"}, {"shared_expert_intermediate_size", "512"},
         {"num_experts", "16"}, {"num_experts_per_tok", "4"}, {"max_position_embeddings", "1024"},
         {"vocab_size", "128"}, {"mask_token_id", "127"}, {"dllm_think_end_token_id", "17"},
@@ -140,17 +141,17 @@ void Populate(CloverModel &m, const std::string &devices, bool fp16) {
         add(p + "post_attention_layernorm.weight", {512}, true);
         if (!layer) {
             const auto a = p + "linear_attn.";
-            add(a + "in_proj_qkv.weight", {2048, 512}); add(a + "in_proj_z.weight", {1024, 512});
-            add(a + "in_proj_a.weight", {8, 512}); add(a + "in_proj_b.weight", {8, 512});
-            add(a + "out_proj.weight", {512, 1024});
-            add(a + "conv1d.weight", {2048, 1, 4}); add(a + "conv_right_weight", {2048, 1, 3});
+            add(a + "in_proj_qkv.weight", {heads * 512, 512}); add(a + "in_proj_z.weight", {heads * 256, 512});
+            add(a + "in_proj_a.weight", {heads * 2, 512}); add(a + "in_proj_b.weight", {heads * 2, 512});
+            add(a + "out_proj.weight", {512, heads * 256});
+            add(a + "conv1d.weight", {heads * 512, 1, 4}); add(a + "conv_right_weight", {heads * 512, 1, 3});
             for (auto name : {"A_log", "dt_bias", "bd_softmax_logit_scale", "bd_softmax_history_bias", "bd_softmax_history_c"})
-                add(a + name, {8}, true);
+                add(a + name, {heads * 2}, true);
             add(a + "norm.weight", {128}, true);
         } else {
             const auto a = p + "self_attn.";
-            add(a + "q_proj.weight", {2048, 512}); add(a + "k_proj.weight", {512, 512});
-            add(a + "v_proj.weight", {512, 512}); add(a + "o_proj.weight", {512, 1024});
+            add(a + "q_proj.weight", {heads * 512, 512}); add(a + "k_proj.weight", {512, 512});
+            add(a + "v_proj.weight", {512, 512}); add(a + "o_proj.weight", {512, heads * 256});
             add(a + "q_norm.weight", {256}, true); add(a + "k_norm.weight", {256}, true);
         }
         add(p + "mlp.gate.weight", {16, 512}); add(p + "mlp.experts.gate_up_proj", {16, 1024, 512});
@@ -204,10 +205,15 @@ std::vector<int> Tokens(int count, int seed) {
 }
 void ForwardChecks(CloverModel &single, CloverModel &tp, int ranks) {
     Cache a, b; Data x, y;
-    single.ForwardLogits(Tokens(301, 3), a, false, x, true);
-    tp.ForwardLogits(Tokens(301, 3), b, false, y, true);
+    // Preview crosses the 256-token allocation boundary without committing
+    // any KV bytes. Also verify that initial recurrent/KV storage is pooled.
+    single.ForwardLogits(Tokens(241, 3), a, false, x, true);
+    tp.ForwardLogits(Tokens(241, 3), b, false, y, true);
     Check(b[0].first.multiDeviceData && b[0].first.multiDeviceDatas.size() == size_t(ranks),
         "TP regression did not create per-rank caches");
+    for (const auto &layer : b) for (const Data *data : {&layer.first, &layer.second})
+        for (const auto &shard : data->multiDeviceDatas)
+            Check(IsCudaWorkspacePointer(shard.second->cudaData), "cache bypassed CUDA arena");
     Close(x, y);
     Cache before; CloneCache(b, before);
     for (int width : {1, 2, 8, 16, 32, 16}) {
@@ -340,9 +346,11 @@ int main(int argc, char **argv) {
         if (devices < ranks) return 77;
         SetThreads(4); SetCudaEmbedding(true); SetDeviceMap({{"cuda:0", 1}});
         setenv("FASTLLM_PREFIX_CACHE", "1", 1);
-        CloverModel single, tp; Populate(single, "cuda:0", fp16);
+        CloverModel single, tp;
+        const int heads = std::max(4, ranks);
+        Populate(single, "cuda:0", fp16, heads);
         std::string spec = "cuda:0"; for (int r = 1; r < ranks; ++r) spec += "," + std::to_string(r);
-        Populate(tp, spec, fp16);
+        Populate(tp, spec, fp16, heads);
         ForwardChecks(single, tp, ranks); CompactChecks(tp); GenerationChecks(tp);
         std::cout << "Clover TP" << ranks << (fp16 ? " FP16" : " BF16") << " PASS: logits, preview, full/compact rollback, prefix cache and seeded sampling" << std::endl;
     } catch (const std::exception &e) { std::cerr << e.what() << std::endl; return 1; }
