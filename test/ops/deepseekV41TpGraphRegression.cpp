@@ -56,7 +56,7 @@ static std::vector<float> RunDsparkRequests(DeepSeekV41Model &model, int candida
     model.*(&Access::v41DsparkTpDevices) = tpDevices;
     // Real requests enter DsparkAdvance after prefill before verifying drafts.
     // Reproduce its device setup without loading synthetic draft weights.
-    (model.*(&Access::ApplyDsparkDevice))();
+    (model.*(&Access::ApplyDsparkDevice))(false);
     auto &targets = model.*(&Access::v41DsparkTargetLayerIds);
     targets = {model.block_cnt - 3, model.block_cnt - 2, model.block_cnt - 1};
     auto &mask = model.*(&Access::v41IsDsparkTarget);

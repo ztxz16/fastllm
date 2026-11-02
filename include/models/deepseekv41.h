@@ -516,7 +516,7 @@ namespace fastllm {
         std::atomic<long long> v41DsparkVerifyRounds{0};
 
         void InitDsparkParams();
-        void ApplyDsparkDevice();
+        void ApplyDsparkDevice(bool targetComplete = false);
         void DsparkEmbedInput(const Data &inputIds, Data &hiddenStates);
         void DsparkProjectHead(Data &input, Data &output, bool persistent = false);
         bool DsparkPrepareQkv(int stage, const Data &input, Data &inputQuant,

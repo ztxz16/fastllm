@@ -561,6 +561,7 @@ if (USE_CUDA)
             src/devices/cuda/moe/fastllm-moe-mxfp4-sm120.cu
             src/devices/cuda/linear/fastllm-native-nvfp4-tma-sm120.cu)
         set_property(SOURCE src/fastllm.cpp src/models/deepseekv41.cpp src/models/deepseekv41_dspark.cpp
+            src/devices/multicuda/multicudadevice.cpp
             APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_CUTLASS_MXFP8_SM120)
         set_property(SOURCE src/devices/cuda/cudadevice.cpp
             APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_DSV41_MXFP4_SM120)

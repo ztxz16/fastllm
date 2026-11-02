@@ -183,7 +183,7 @@ namespace fastllm {
     };
     bool MultiCudaLinearOutputGatherPersistent(Data &input, Data &weight, Data &output,
                                                std::shared_ptr<void> &workspace,
-                                               MultiCudaDsparkMarkovRequest *markov = nullptr);
+                                               MultiCudaDsparkMarkovRequest *markov = nullptr, bool draftFp8 = false);
     bool MultiCudaLinearRow(Data &input, Data &weight, Data &bias, Data &output);
     bool MultiCudaLinearColumn(Data &input, Data &weight, Data &bias, Data &output);
     struct MultiCudaAsyncMLPHandle;

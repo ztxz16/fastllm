@@ -6,6 +6,7 @@
 #include "devices/cuda/cudadevice.h"
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/cuda/fastllm-cuda-linear-output.h"
+#include "devices/cuda/fastllm-draft-head.cuh"
 #include "devices/cuda/fastllm-cuda-dspark.h"
 #include "devices/cuda/fastllm-cuda-nvfp4-fused.h"
 #include "devices/cuda/fastllm-cuda-v41-gguf.h"
@@ -4081,7 +4082,8 @@ namespace fastllm {
         DataType type = DataType::FLOAT32;
         DivisionScheme ranges;
         int rows = 0, vocab = 0, width = 0;
-        struct Rank { Data input, output, packet, gathered, compactWeight; };
+        bool compact = false;
+        struct Rank { Data input, output, linearOutput, packet, gathered, compactWeight; };
         std::vector<std::unique_ptr<Rank>> ranks;
         Data result;
         void *ready = nullptr;
@@ -4205,12 +4207,12 @@ namespace fastllm {
 
     bool MultiCudaLinearOutputGatherPersistent(Data &input, Data &weight, Data &output,
                                                std::shared_ptr<void> &workspace,
-                                               MultiCudaDsparkMarkovRequest *markov) {
+                                               MultiCudaDsparkMarkovRequest *markov, bool draftFp8) {
         if (markov) markov->completed = false;
         if (input.multiDeviceData || input.dataDevice != DataDevice::CUDA || !input.cudaData ||
             input.dims.empty() || weight.dims.size() != 2 || input.dims.back() != weight.dims[1] ||
             (input.dataType != DataType::FLOAT32 && input.dataType != DataType::BFLOAT16) ||
-            weight.dataType != DataType::FLOAT32 ||
+            (weight.dataType != DataType::FLOAT32 && weight.dataType != DataType::DATA_GGUF_FORMAT) ||
             MultiCudaEnvFlagEnabled("FASTLLM_DISABLE_NCCL")) return false;
         std::vector<int> devices; std::map<int, int> ratios;
         FastllmGetMulticudaDeviceAndRatio(devices, ratios, true);
@@ -4237,7 +4239,7 @@ namespace fastllm {
                 data.dataDevice = DataDevice::CUDA; data.dataDeviceIds = {device};
                 FastllmCudaSetDevice(device); data.Allocate(false);
             };
-            bool compact = input.dataType == DataType::BFLOAT16;
+            bool compact = input.dataType == DataType::BFLOAT16 && weight.dataType == DataType::FLOAT32;
             for (int device : devices) {
                 auto rank = std::make_unique<MultiCudaOutputGatherWorkspace::Rank>();
                 FastllmCudaSetDevice(device);
@@ -4247,13 +4249,16 @@ namespace fastllm {
             }
             // Remember an unsupported checkpoint in the same workspace so the
             // ordinary FP32 fallback does not retry a weight scan every token.
-            if (!compact) state->type = DataType::FLOAT32;
+            state->compact = compact;
+            if (!compact && weight.dataType != DataType::DATA_GGUF_FORMAT) state->type = DataType::FLOAT32;
             for (size_t index = 0; index < devices.size(); ++index) {
                 const int device = devices[index];
                 auto &rank = state->ranks[index];
                 if (!compact) rank->compactWeight.FreeSpace();
                 allocate(rank->input, input.dims, device, state->type);
                 allocate(rank->output, {state->rows, weight.multiDeviceDatas.at(device)->dims[0]}, device);
+                if (!compact && state->type == DataType::BFLOAT16)
+                    allocate(rank->linearOutput, rank->output.dims, device, state->type);
                 allocate(rank->packet, {state->rows, state->width}, device);
                 allocate(rank->gathered, {(int)devices.size(), state->rows, state->width}, device);
                 FastllmCudaMemset0(rank->packet.cudaData, rank->packet.GetBytes());
@@ -4272,9 +4277,22 @@ namespace fastllm {
             if (device == root) FastllmCudaCurrentThreadStreamWaitEvent(state->ready);
             FastllmNcclBroadcastFrom(input.cudaData, rank.input.cudaData, input.Count(0), input.dataType, root, device);
             Data &localWeight = *weight.multiDeviceDatas.at(device);
-            if (state->type == DataType::BFLOAT16) {
-                AssertInFastLLM(FastllmCudaBFloat16LinearFloat32(rank.input, rank.compactWeight, rank.output),
-                                "MultiCuda BF16 projection with FP32 output failed.");
+            if (state->compact) {
+                bool projected = false;
+#ifdef FASTLLM_ENABLE_CUTLASS_MXFP8_SM120
+                // Approximation is requested only by the draft caller. Target
+                // verification retains the original compact BF16 projection.
+                if (draftFp8) projected = FastllmCudaTryFp8DraftHead(
+                    rank.input, rank.compactWeight, rank.output);
+#endif
+                AssertInFastLLM(projected || FastllmCudaBFloat16LinearFloat32(
+                    rank.input, rank.compactWeight, rank.output),
+                    "MultiCuda BF16 projection with FP32 output failed.");
+            } else if (state->type == DataType::BFLOAT16) {
+                // Preserve the ordinary GGUF linear's activation/output dtype
+                // before gathering FP32 logits into the persistent buffer.
+                DoCudaLinear(rank.input, localWeight, *GetEmptyData(), rank.linearOutput);
+                FastllmBF16ToFloat(rank.linearOutput.cudaData, rank.output.cudaData, rank.linearOutput.Count(0));
             } else DoCudaLinear(rank.input, localWeight, *GetEmptyData(), rank.output);
             if (markovState) {
                 auto &chain = *markovState->ranks[index];
