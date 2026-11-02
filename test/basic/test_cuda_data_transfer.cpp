@@ -6,6 +6,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <thread>
@@ -227,6 +228,56 @@ void CheckLargePeerTransfer(int devices) {
     }
     std::puts("PASS large peer transfer, tail, reuse and cross-thread handoff");
 }
+
+void CheckPeerStreamOrdering(int devices) {
+    if (devices < 2 || std::getenv("FASTLLM_CUDA_FORCE_STAGED_COPY")) return;
+    int peer = 0;
+    Check(cudaDeviceCanAccessPeer(&peer, 0, 1));
+    if (!peer) return;
+    Check(cudaDeviceCanAccessPeer(&peer, 1, 0));
+    if (!peer) return;
+    constexpr size_t capacity = 8ULL << 20;
+    void *buffers[2] = {nullptr, nullptr};
+    cudaStream_t streams[2];
+    for (int device = 0; device < 2; ++device) {
+        Check(cudaSetDevice(device));
+        Check(cudaMalloc(&buffers[device], capacity));
+        Check(cudaStreamCreateWithFlags(&streams[device], cudaStreamNonBlocking));
+    }
+    // Includes the 18-token mHC transfer that failed after PP graph capture.
+    // Pending writes on independent streams must finish before the handoff.
+    for (size_t bytes : {size_t(288), size_t(737280), capacity - 17}) {
+        for (int pass = 0; pass < 4; ++pass) {
+            const int src = pass % 2, dst = 1 - src;
+            for (int device = 0; device < 2; ++device) {
+                Check(cudaSetDevice(device));
+                for (int repeat = 0; repeat < 8; ++repeat) {
+                    Check(cudaMemsetAsync(buffers[device],
+                        device == src ? 0x41 + pass : 0x19,
+                        capacity, streams[device]));
+                }
+            }
+            const int caller = pass / 2;
+            Check(cudaSetDevice(caller));
+            FastllmCudaMemcpyBetweenDevices(dst, (uint8_t *)buffers[dst] + 7,
+                src, (uint8_t *)buffers[src] + 3, bytes);
+            int restored = -1;
+            Check(cudaGetDevice(&restored));
+            if (restored != caller) throw std::runtime_error("peer copy changed caller device");
+            Check(cudaSetDevice(dst));
+            std::vector<uint8_t> actual(bytes + 7);
+            Check(cudaMemcpy(actual.data(), buffers[dst], actual.size(), cudaMemcpyDeviceToHost));
+            ExpectBytes(actual.data(), 7, 0x19);
+            ExpectBytes(actual.data() + 7, bytes, 0x41 + pass);
+        }
+    }
+    for (int device = 0; device < 2; ++device) {
+        Check(cudaSetDevice(device));
+        Check(cudaStreamDestroy(streams[device]));
+        Check(cudaFree(buffers[device]));
+    }
+    std::puts("PASS peer producer ordering, offsets and caller restoration");
+}
 }
 
 int main() {
@@ -250,6 +301,7 @@ int main() {
         }
         for (int kind = 0; kind < 3; ++kind) CheckPersistentTransfer(kind, devices);
         CheckLargePeerTransfer(devices);
+        CheckPeerStreamOrdering(devices);
         std::puts("CUDA scratch, host staging, RMSNorm, zero fill and persistent transfer tests passed");
         return 0;
     } catch (const std::exception &error) {

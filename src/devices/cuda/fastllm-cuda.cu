@@ -6585,13 +6585,23 @@ void FastllmCudaMemcpyBetweenDevices(int dstId, void *dst, int srcId, void *src,
         cudaSetDevice(oriId);
         return;
     }
-    const char *failedStage = "cudaMemcpyPeer";
+    const char *failedStage = "cudaMemcpyPeerAsync";
     if (canPeerAccess) {
-        state = cudaMemcpyPeer(dst, dstId, src, srcId, size);
+        // Keep the synchronous handoff, but use an explicit stream for the
+        // transfer. The synchronous peer API can fail inside the driver after
+        // PP graph capture. Wait for producers on both devices before copying;
+        // consumers on any thread may read the destination when we return.
+        state = cudaSetDevice(srcId);
+        if (state == cudaSuccess) state = cudaDeviceSynchronize();
+        if (state == cudaSuccess) state = cudaSetDevice(dstId);
+        if (state == cudaSuccess) state = cudaDeviceSynchronize();
         if (state == cudaSuccess) {
-            FastllmCudaSetDevice(dstId);
-            DeviceSync();
-            FastllmCudaSetDevice(oriId);
+            state = cudaMemcpyPeerAsync(dst, dstId, src, srcId, size,
+                                        cudaStreamPerThread);
+        }
+        if (state == cudaSuccess) state = cudaStreamSynchronize(cudaStreamPerThread);
+        cudaSetDevice(oriId);
+        if (state == cudaSuccess) {
             return;
         }
         cudaGetLastError();
