@@ -84,3 +84,123 @@ static std::string BenchmarkCpuLinearThreads(int hidden, int intermediate, int k
         << "\",\"weight_bytes\":" << pairBytes * banks << '}';
     return out.str();
 }
+
+#ifdef USE_NUMAS
+#include "devices/numas/numasdevice.h"
+
+// Match the bound/sharded V4.1 GGUF host path, including activation conversion,
+// Gate/Up, SwiGLU and Down. This runs only in the isolated calibration worker.
+static std::string BenchmarkCpuMoeThreads(int hidden, int intermediate, int kind,
+        int rows, int topk, const int *counts, int count, int budgetMs) {
+    using namespace fastllm;
+    using Clock = std::chrono::steady_clock;
+    const auto started = Clock::now();
+    auto elapsed = [&] { return std::chrono::duration<double, std::milli>(Clock::now() - started).count(); };
+    const auto type = static_cast<ggml_type>(kind);
+    if (type != GGML_TYPE_IQ2_XXS && type != GGML_TYPE_IQ2_XS && type != GGML_TYPE_Q4_K && type != GGML_TYPE_IQ1_M)
+        throw std::runtime_error("unsupported MoE calibration format");
+    SetThreads(counts[count - 1]);
+    const int nodes = GetNumasMoeShardCount();
+    if (nodes < 1 || hidden % 256 || intermediate % 256 || hidden % (4 * nodes) || intermediate % (4 * nodes))
+        throw std::runtime_error("unsupported MoE calibration shard shape");
+    const size_t pairBytes = ggml_row_size(type, hidden) * (2 * intermediate) +
+                             ggml_row_size(type, intermediate) * hidden;
+    // Rotate a substantial expert set instead of repeatedly timing one hot GEMV.
+    const int experts = std::max(topk, std::min(64, int(((512ull << 20) + pairBytes - 1) / pairBytes)));
+    struct Weights {
+        std::vector<std::unique_ptr<Data>> data;
+        ~Weights() {
+            ClearNumasMoeRuntimeCache();
+            for (const auto &weight : data) ReleaseNumasMoeWeightArena(weight.get());
+        }
+    } owned;
+    std::vector<Data *> weights((experts + 1) * 2, nullptr);
+    std::vector<std::pair<Data *, std::string>> registration;
+    for (int expert = 0; expert < experts; ++expert) for (int part = 0; part < 2; ++part) {
+        auto w = std::make_unique<Data>(DATA_GGUF_FORMAT, type,
+            std::vector<int>{part ? hidden : 2 * intermediate, part ? intermediate : hidden});
+        w->disableGGUFRepack = true;
+        w->Allocate();
+        std::memset(w->cpuData, 0x11 + expert % 16, w->GetBytes());
+        const uint16_t scale = 0x2400; // small, finite FP16 scale
+        for (size_t offset = 0; offset < w->GetBytes(); offset += ggml_type_size(type)) {
+            if (type == GGML_TYPE_IQ1_M) {
+                // IQ1_M stores the FP16 scale across four high nibbles.
+                auto *block = reinterpret_cast<block_iq1_m *>(w->cpuData + offset);
+                for (int j = 0; j < 4; ++j) {
+                    const uint16_t packed = 0x111 | (((scale >> (4 * j)) & 15) << 12);
+                    std::memcpy(block->scales + 2 * j, &packed, sizeof(packed));
+                }
+            } else {
+                std::memcpy(w->cpuData + offset, &scale, sizeof(scale));
+            }
+        }
+        weights[(expert + 1) * 2 + part] = w.get();
+        registration.emplace_back(w.get(), part ? "linear" : "linearSwiglu");
+        owned.data.push_back(std::move(w));
+    }
+    RegisterNumasMoeWeightBatch(registration);
+    if (!CanRunNumasMoeDecodeExperts(weights.data(), weights.size()))
+        throw std::runtime_error("NUMA MoE calibration path unavailable");
+    std::vector<uint16_t> input(size_t(rows) * hidden);
+    for (size_t i = 0; i < input.size(); ++i) {
+        const float value = float(int(i % 31) - 15) / 32;
+        uint32_t bits; std::memcpy(&bits, &value, sizeof(bits));
+        input[i] = uint16_t(bits >> 16); // exactly representable BF16 values
+    }
+    std::vector<int32_t> indices(rows * topk), gpuIndices(rows * topk, -1);
+    std::vector<float> scores(rows * topk, 1.f / topk);
+    std::vector<float> output(size_t(rows) * topk * hidden), reference;
+    auto pass = [&](int step) {
+        for (int row = 0; row < rows; ++row) for (int k = 0; k < topk; ++k)
+            indices[row * topk + k] = (step * topk + row + k) % experts;
+        NumasMoeVerifyExperts(input.data(), output.data(), rows, weights.data(), weights.size(),
+            indices.data(), gpuIndices.data(), scores.data(), topk, 0, 7.f, true, 32);
+    };
+    const double setupMs = elapsed();
+    std::ostringstream samples;
+    bool first = true;
+    double maxL2 = 0;
+    for (int i = 0; i < count; ++i) {
+        const int threads = counts[i];
+        if (threads < nodes || threads % nodes || (i && threads <= counts[i - 1]))
+            throw std::runtime_error("invalid NUMA thread candidate");
+        SetThreads(threads);
+        pass(0); // bind resized workers and warm dispatch outside the timer
+        std::vector<double> times;
+        for (int repeat = 0; repeat < 5; ++repeat) {
+            if (elapsed() - setupMs >= budgetMs)
+                throw std::runtime_error("incomplete NUMA calibration samples");
+            const auto begin = Clock::now();
+            pass(repeat + 1);
+            times.push_back(std::chrono::duration<double, std::milli>(Clock::now() - begin).count());
+        }
+        double error = 0, norm = 0, outputNorm = 0;
+        for (size_t j = 0; j < output.size(); ++j) {
+            if (!std::isfinite(output[j])) throw std::runtime_error("nonfinite NUMA calibration output");
+            outputNorm += double(output[j]) * output[j];
+            if (!reference.empty()) {
+                const double delta = double(output[j]) - reference[j];
+                error += delta * delta; norm += double(reference[j]) * reference[j];
+            }
+        }
+        if (!(outputNorm > 0)) throw std::runtime_error("empty NUMA calibration output");
+        if (reference.empty()) reference = output;
+        const double l2 = std::sqrt(error / std::max(norm, 1e-30));
+        if (l2 > 1e-6) throw std::runtime_error("NUMA thread count changed calibration output");
+        maxL2 = std::max(maxL2, l2);
+        std::sort(times.begin(), times.end());
+        if (!first) samples << ',';
+        first = false;
+        samples << '"' << threads << "\":" << times[times.size() / 2];
+    }
+    std::ostringstream out;
+    out << "{\"samples_ms\":{" << samples.str() << "},\"setup_ms\":" << setupMs
+        << ",\"native_elapsed_ms\":" << elapsed() << ",\"hidden\":" << hidden
+        << ",\"intermediate\":" << intermediate << ",\"numa_nodes\":" << nodes
+        << ",\"rows\":" << rows << ",\"topk\":" << topk << ",\"experts\":" << experts
+        << ",\"gguf_type\":\"" << ggml_type_name(type) << "\",\"weight_bytes\":" << pairBytes * experts
+        << ",\"thread_output_l2\":" << maxL2 << '}';
+    return out.str();
+}
+#endif

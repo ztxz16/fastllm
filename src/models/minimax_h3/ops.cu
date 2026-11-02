@@ -201,49 +201,71 @@ __global__ void qkNormRope128(const B *q, const B *k, const B *qw, const B *kw, 
 }
 // VAE Q/K normalization accumulates in FP32 and rounds only its output.
 // A warp owns a 64-wide head, preserving normKernel's 32,16,...,1 reduction tree.
-template <class T, bool packed = false>
+template <class T, bool packed = false, class Index = size_t>
 __global__ void videoQkNormRope64(const T *q, const T *k, const float *cs, const float *sn,
-                                 T *qo, T *ko, size_t heads, int headsPerToken, int rotaryDim,
-                                 T *vo = nullptr, int sequenceRows = 0) {
+                                 T *qo, T *ko, Index heads, int headsPerToken, int rotaryDim,
+                                 int sequenceRows = 0) {
     int lane = threadIdx.x % 32;
-    for (size_t h = size_t(blockIdx.x) * 8 + threadIdx.x / 32; h < (packed ? 3 : 2) * heads;
-         h += size_t(gridDim.x) * 8) {
-        size_t head = h % heads;
-        size_t token = head / headsPerToken;
-        const T *x;
-        if constexpr (packed)
-            x = q + (token * 3 * headsPerToken + (h / heads) * headsPerToken + head % headsPerToken) * 64;
-        else
-            x = (h < heads ? q : k) + head * 64;
-        T *out = (h < heads ? qo : h < 2 * heads ? ko : vo) + head * 64;
-        if constexpr (packed) {
-            if (h >= 2 * heads) {
-                out[lane] = x[lane];
-                out[lane + 32] = x[lane + 32];
-                continue;
-            }
-        }
-        float a = value(x[lane]), b = value(x[lane + 32]);
-        float sum = a * a + b * b;
-        for (int step = 16; step; step /= 2)
-            sum += __shfl_down_sync(0xffffffff, sum, step);
-        float inv = rsqrtf(__shfl_sync(0xffffffff, sum, 0) / 64.f + 1e-5f);
-        size_t pos = (packed ? token % sequenceRows : token) * rotaryDim;
+    const unsigned component = blockIdx.y;
+    const Index tokens = heads / headsPerToken;
+    for (Index token = blockIdx.x; token < tokens; token += gridDim.x) {
+        size_t pos = size_t(packed ? token % sequenceRows : token) * rotaryDim;
+        for (int head = threadIdx.x / 32; head < headsPerToken; head += 8) {
+            const T *x;
+            if constexpr (packed)
+                x = q + (size_t(token) * 3 * headsPerToken + component * headsPerToken + head) * 64;
+            else
+                x = (component == 0 ? q : k) + (size_t(token) * headsPerToken + head) * 64;
+            T *out;
+            if constexpr (packed) out = const_cast<T *>(x);
+            else out = (component == 0 ? qo : ko) +
+                       (size_t(token) * headsPerToken + head) * 64;
+            float a = value(x[lane]), b = value(x[lane + 32]);
+            float sum = a * a + b * b;
+            for (int step = 16; step; step /= 2)
+                sum += __shfl_down_sync(0xffffffff, sum, step);
+            float inv = rsqrtf(__shfl_sync(0xffffffff, sum, 0) / 64.f + 1e-5f);
 #pragma unroll
-        for (int j = 0; j < 2; ++j) {
-            int d = lane + j * 32;
-            float normalized = rounded<T>(value(x[d]) * inv);
-            if (d < rotaryDim) {
+            for (int j = 0; j < 2; ++j) {
+                int d = lane + j * 32;
                 int other = d < rotaryDim / 2 ? d + rotaryDim / 2 : d - rotaryDim / 2;
-                float rotated = rounded<T>(value(x[other]) * inv);
-                if (d < rotaryDim / 2)
-                    rotated = -rotated;
-                normalized = rounded<T>(normalized * rounded<T>(cs[pos + d])) +
-                             rounded<T>(rotated * rounded<T>(sn[pos + d]));
+                float original, rotatedValue;
+                if constexpr (packed) {
+                    // Read the original registers; both shuffles execute in every lane.
+                    float first = __shfl_sync(0xffffffff, a, other % 32);
+                    float second = __shfl_sync(0xffffffff, b, other % 32);
+                    original = j == 0 ? a : b;
+                    rotatedValue = other < 32 ? first : second;
+                } else {
+                    original = value(x[d]);
+                    rotatedValue = d < rotaryDim ? value(x[other]) : 0.f;
+                }
+                float normalized = rounded<T>(original * inv);
+                if (d < rotaryDim) {
+                    float rotated = rounded<T>(rotatedValue * inv);
+                    if (d < rotaryDim / 2)
+                        rotated = -rotated;
+                    normalized = rounded<T>(normalized * rounded<T>(cs[pos + d])) +
+                                 rounded<T>(rotated * rounded<T>(sn[pos + d]));
+                }
+                out[d] = T(normalized);
             }
-            out[d] = T(normalized);
         }
     }
+}
+
+template<class T,bool packed=false>
+void launchVideoQk(const T *q,const T *k,const float *cs,const float *sn,T *qo,T *ko,
+                   size_t heads,int headsPerToken,int rotaryDim,int sequenceRows=0) {
+    dim3 blocks(std::min<size_t>(heads / headsPerToken, 2048), 2);
+    // Pointer offsets remain size_t; narrow only the index divisions when the
+    // complete loop range fits. This changes no floating-point operations.
+    if(heads<=size_t(INT32_MAX)/3)
+        videoQkNormRope64<T,packed,uint32_t><<<blocks,256,0,cudaStreamPerThread>>>(
+            q,k,cs,sn,qo,ko,uint32_t(heads),headsPerToken,rotaryDim,sequenceRows);
+    else
+        videoQkNormRope64<T,packed,size_t><<<blocks,256,0,cudaStreamPerThread>>>(
+            q,k,cs,sn,qo,ko,heads,headsPerToken,rotaryDim,sequenceRows);
 }
 __global__ void timeFeatures(const float *times, float *out, size_t n, int d) {
     for (size_t i = size_t(blockIdx.x) * 256 + threadIdx.x; i < n; i += size_t(gridDim.x) * 256) {
@@ -277,46 +299,35 @@ std::pair<Tensor, Tensor> Runtime::videoQkNormRotary(const Tensor &q, const Tens
             "invalid VAE Q/K norm and rotary inputs");
     Tensor qo(q.rows, q.cols, q.dtype), ko(k.rows, k.cols, k.dtype);
     size_t heads = q.size() / 64;
-    int blocks = std::min<size_t>((2 * heads + 7) / 8, 4096);
     if (q.dtype == DType::FP16)
-        videoQkNormRope64<<<blocks, 256, 0, cudaStreamPerThread>>>(
+        launchVideoQk(
             ptr<H>(q), ptr<H>(k), ptr<float>(cs), ptr<float>(sn), ptr<H>(qo), ptr<H>(ko),
             heads, q.cols / 64, cs.cols);
     else if (q.dtype == DType::BF16)
-        videoQkNormRope64<<<blocks, 256, 0, cudaStreamPerThread>>>(
+        launchVideoQk(
             ptr<B>(q), ptr<B>(k), ptr<float>(cs), ptr<float>(sn), ptr<B>(qo), ptr<B>(ko),
             heads, q.cols / 64, cs.cols);
     else
-        videoQkNormRope64<<<blocks, 256, 0, cudaStreamPerThread>>>(
+        launchVideoQk(
             ptr<float>(q), ptr<float>(k), ptr<float>(cs), ptr<float>(sn), ptr<float>(qo), ptr<float>(ko),
             heads, q.cols / 64, cs.cols);
     check(cudaGetLastError());
     return {qo, ko};
 }
-std::array<Tensor, 3> Runtime::videoQkvNormRotary(const Tensor &qkv, const Tensor &cs, const Tensor &sn) {
+void Runtime::videoQkvNormRotaryInPlace(Tensor &qkv, const Tensor &cs, const Tensor &sn) {
     require(qkv.rows > 0 && qkv.cols > 0 && qkv.cols % 192 == 0 && cs.isFloat32() && sn.isFloat32() &&
                 cs.rows > 0 && qkv.rows % cs.rows == 0 && cs.rows == sn.rows && cs.cols == sn.cols &&
                 cs.cols > 0 && cs.cols <= 64 && cs.cols % 2 == 0,
             "invalid packed VAE QKV inputs");
-    int width = qkv.cols / 3;
-    std::array<Tensor, 3> out{Tensor(qkv.rows, width, qkv.dtype), Tensor(qkv.rows, width, qkv.dtype),
-                               Tensor(qkv.rows, width, qkv.dtype)};
-    size_t heads = out[0].size() / 64;
-    int blocks = std::min<size_t>((3 * heads + 7) / 8, 4096);
     auto launch = [&](auto *type) {
         using T = std::remove_pointer_t<decltype(type)>;
-        videoQkNormRope64<T, true><<<blocks, 256, 0, cudaStreamPerThread>>>(
-            ptr<T>(qkv), nullptr, ptr<float>(cs), ptr<float>(sn), ptr<T>(out[0]), ptr<T>(out[1]),
-            heads, width / 64, cs.cols, ptr<T>(out[2]), cs.rows);
+        launchVideoQk<T, true>(ptr<T>(qkv), nullptr, ptr<float>(cs), ptr<float>(sn), nullptr,
+            nullptr, qkv.size() / 192, qkv.cols / 192, cs.cols, cs.rows);
     };
-    if (qkv.dtype == DType::FP16)
-        launch(static_cast<H *>(nullptr));
-    else if (qkv.dtype == DType::BF16)
-        launch(static_cast<B *>(nullptr));
-    else
-        launch(static_cast<float *>(nullptr));
+    if (qkv.dtype == DType::FP16) launch(static_cast<H *>(nullptr));
+    else if (qkv.dtype == DType::BF16) launch(static_cast<B *>(nullptr));
+    else launch(static_cast<float *>(nullptr));
     check(cudaGetLastError());
-    return out;
 }
 Tensor Runtime::rms(const Tensor &x, const Tensor &w, float eps, int width) {
     if (!width)

@@ -550,7 +550,7 @@ if (USE_CUDA)
             src/devices/cuda/linear/fastllm-linear-fp8-mxfp8.cu
             src/devices/cuda/moe/fastllm-moe-mxfp4-sm120.cu
             src/devices/cuda/linear/fastllm-native-nvfp4-tma-sm120.cu)
-        set_property(SOURCE src/fastllm.cpp src/models/deepseekv41.cpp
+        set_property(SOURCE src/fastllm.cpp src/models/deepseekv41.cpp src/models/deepseekv41_dspark.cpp
             APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_CUTLASS_MXFP8_SM120)
         set_property(SOURCE src/devices/cuda/cudadevice.cpp
             APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_DSV41_MXFP4_SM120)
@@ -584,6 +584,14 @@ if (USE_CUDA)
         message(STATUS "GLM53 FlashInfer sparse prefill: ON (sm_120a)")
     else()
         message(STATUS "GLM53 FlashInfer sparse prefill: OFF (BF16 DSA fallback)")
+    endif()
+
+    # Keep DSV4.1's pinned headers and architecture-specific cubins isolated.
+    if ((FASTLLM_CUTLASS_FP8_SM120_ENABLED OR FASTLLM_CUTLASS_FP8_SM121_ENABLED)
+        AND NOT CUDA_NO_TENSOR_CORE AND CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.9)
+        set(FASTLLM_DSV41_FLASHINFER_ENABLED ON)
+        set_property(SOURCE src/devices/cuda/models/deepseekv41-kernels.cu
+            APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_DSV41_FLASHINFER_SM120)
     endif()
 
     # Marlin 内核需要 sm_75+，但通过 __CUDA_ARCH__ 宏保护可在低算力（如 sm_70）下编译为占位实现，
@@ -641,7 +649,7 @@ if (USE_CUDA)
         src/devices/multicuda/fastllm-custom-allreduce.cu)
 
     add_compile_definitions(FASTLLM_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
-    set(FASTLLM_LINKED_LIBS ${FASTLLM_LINKED_LIBS} cublasLt cublas nccl cuda ${CMAKE_DL_LIBS})
+    set(FASTLLM_LINKED_LIBS ${FASTLLM_LINKED_LIBS} cublasLt cublas nccl cuda)
     set(CMAKE_CUDA_ARCHITECTURES ${FASTLLM_CUDA_ARCHITECTURES})
 endif()
 
@@ -807,6 +815,22 @@ if (FASTLLM_GLM53_FLASHINFER_SM120_ENABLED)
     set(FASTLLM_GLM53_FLASHINFER_OBJECTS $<TARGET_OBJECTS:fastllm_glm53_flashinfer_sm120>)
 endif()
 
+if (FASTLLM_DSV41_FLASHINFER_ENABLED)
+    add_library(fastllm_dsv41_flashinfer_sm120 OBJECT
+        src/devices/cuda/models/deepseekv41-flashinfer-sm120.cu)
+    set_target_properties(fastllm_dsv41_flashinfer_sm120 PROPERTIES
+        CUDA_ARCHITECTURES OFF POSITION_INDEPENDENT_CODE ON)
+    target_compile_options(fastllm_dsv41_flashinfer_sm120 PRIVATE
+        "--generate-code=arch=compute_120a,code=sm_120a"
+        "--generate-code=arch=compute_121a,code=sm_121a" "--use_fast_math")
+    target_include_directories(fastllm_dsv41_flashinfer_sm120 BEFORE PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/flashinfer_dsv41/include")
+    set(FASTLLM_DSV41_FLASHINFER_OBJECTS $<TARGET_OBJECTS:fastllm_dsv41_flashinfer_sm120>)
+endif()
+
+# Disk loading also uses dlsym in CPU-only builds and the Python extension.
+list(APPEND FASTLLM_LINKED_LIBS ${CMAKE_DL_LIBS})
+
 if (PY_API)
     if(POLICY CMP0148)
         cmake_policy(SET CMP0148 NEW)
@@ -820,7 +844,7 @@ if (PY_API)
 
     include_directories(third_party/pybind11/include)
     file(GLOB FASTLLM_CXX_HEADERS include/**/*.h)
-    add_library(pyfastllm MODULE src/pybinding.cpp ${FASTLLM_LARGE_MODEL_SOURCES} ${FASTLLM_CXX_SOURCES} ${FASTLLM_CXX_HEADERS} ${FASTLLM_CUDA_SOURCES} ${FASTLLM_CUDA_SM120_OBJECTS} ${FASTLLM_CUDA_SM90_OBJECTS} ${FASTLLM_MIMO_EP8_MEGA_OBJECTS} ${FASTLLM_GLM53_FLASHINFER_OBJECTS} ${FASTLLM_TFACC_SOURCES} ${FASTLLM_TOPS_SOURCES})
+    add_library(pyfastllm MODULE src/pybinding.cpp ${FASTLLM_LARGE_MODEL_SOURCES} ${FASTLLM_CXX_SOURCES} ${FASTLLM_CXX_HEADERS} ${FASTLLM_CUDA_SOURCES} ${FASTLLM_CUDA_SM120_OBJECTS} ${FASTLLM_CUDA_SM90_OBJECTS} ${FASTLLM_MIMO_EP8_MEGA_OBJECTS} ${FASTLLM_GLM53_FLASHINFER_OBJECTS} ${FASTLLM_DSV41_FLASHINFER_OBJECTS} ${FASTLLM_TFACC_SOURCES} ${FASTLLM_TOPS_SOURCES})
     target_link_libraries(pyfastllm PUBLIC pybind11::module ${FASTLLM_LINKED_LIBS})
     pybind11_extension(pyfastllm)
 else()
@@ -851,6 +875,9 @@ endif()
 
 if (FASTLLM_GLM53_FLASHINFER_SM120_ENABLED)
     target_link_libraries(fastllm INTERFACE ${FASTLLM_GLM53_FLASHINFER_OBJECTS})
+endif()
+if (FASTLLM_DSV41_FLASHINFER_ENABLED)
+    target_link_libraries(fastllm INTERFACE ${FASTLLM_DSV41_FLASHINFER_OBJECTS})
 endif()
 
 add_executable(main main.cpp)
@@ -1179,10 +1206,21 @@ if (UNIT_TEST)
         add_test(NAME disk_moe_cache COMMAND disk_moe_cache_test)
         set_tests_properties(disk_moe_cache PROPERTIES TIMEOUT 180)
 
+        add_executable(deepseek_v41_compact_head_test test/basic/test_deepseek_v41_compact_head.cpp)
+        target_link_libraries(deepseek_v41_compact_head_test PRIVATE fastllm)
+        fastllm_add_checked_test(deepseek_v41_compact_head deepseek_v41_compact_head_test
+            "PASS: CPU compact head" 60)
+
         add_executable(deepseek_v41_disk_shared_test test/basic/test_deepseek_v41_disk_shared.cpp)
         target_link_libraries(deepseek_v41_disk_shared_test PRIVATE fastllm)
         find_package(Python3 COMPONENTS Interpreter QUIET)
         if (Python3_Interpreter_FOUND)
+            if (USE_CUDA AND NOT USE_ROCM AND CUDA_ARCH MATCHES "12[01]")
+                add_test(NAME triton_compiler_cold_cache
+                    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/basic/test_triton_compiler_cold_cache.py)
+                set_tests_properties(triton_compiler_cold_cache PROPERTIES
+                    LABELS triton SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+            endif()
             add_test(NAME deepseek_v41_disk_shared
                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/basic/test_deepseek_v41_disk_shared.py
                         $<TARGET_FILE:deepseek_v41_disk_shared_test>)
@@ -2646,11 +2684,72 @@ if (UNIT_TEST)
 
         set_tests_properties(cuda_moe_cache_compact PROPERTIES LABELS cuda RUN_SERIAL TRUE)
 
+        add_executable(cuda_shared_weight_upload_test test/basic/test_cuda_shared_weight_upload.cu)
+        target_link_libraries(cuda_shared_weight_upload_test PRIVATE fastllm)
+        set_target_properties(cuda_shared_weight_upload_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        add_test(NAME cuda_shared_weight_upload COMMAND cuda_shared_weight_upload_test)
+        set_tests_properties(cuda_shared_weight_upload PROPERTIES LABELS "cuda;moe;numa" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
+
+        if (FASTLLM_CUDA_SM120_SOURCES)
+            add_executable(cuda_draft_fp8_head_test test/basic/test_cuda_draft_fp8_head.cu)
+            target_link_libraries(cuda_draft_fp8_head_test PRIVATE fastllm)
+            set_target_properties(cuda_draft_fp8_head_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+            add_test(NAME cuda_draft_fp8_head COMMAND cuda_draft_fp8_head_test)
+            set_tests_properties(cuda_draft_fp8_head PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+        endif()
+
+        add_executable(cuda_small_projection_test test/basic/test_cuda_small_projection.cu)
+        target_link_libraries(cuda_small_projection_test PRIVATE fastllm)
+        set_target_properties(cuda_small_projection_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        add_test(NAME cuda_small_projection COMMAND cuda_small_projection_test)
+        set_tests_properties(cuda_small_projection PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 600)
+
+        add_executable(cuda_dsv41_compact_projections_test test/basic/test_cuda_dsv41_compact_projections.cu)
+        target_link_libraries(cuda_dsv41_compact_projections_test PRIVATE fastllm)
+        set_target_properties(cuda_dsv41_compact_projections_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        add_test(NAME cuda_dsv41_compact_projections COMMAND cuda_dsv41_compact_projections_test)
+        set_tests_properties(cuda_dsv41_compact_projections PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+
+        if (FASTLLM_DSV41_FLASHINFER_ENABLED)
+            add_executable(cuda_dsv41_flashinfer_test test/basic/test_cuda_dsv41_flashinfer.cu)
+            target_link_libraries(cuda_dsv41_flashinfer_test PRIVATE fastllm)
+            set_target_properties(cuda_dsv41_flashinfer_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+            fastllm_add_checked_test(cuda_dsv41_flashinfer cuda_dsv41_flashinfer_test "FLASHINFER_PASS" 300)
+            set_tests_properties(cuda_dsv41_flashinfer PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+        endif()
+
+        if (NOT USE_ROCM)
+            add_executable(cuda_dsv41_hc_graph_test test/basic/test_cuda_dsv41_hc_graph.cu)
+            target_link_libraries(cuda_dsv41_hc_graph_test PRIVATE fastllm)
+            set_target_properties(cuda_dsv41_hc_graph_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+            fastllm_add_checked_test(cuda_dsv41_hc_graph cuda_dsv41_hc_graph_test "HC_GRAPH_PASS" 180)
+            set_tests_properties(cuda_dsv41_hc_graph PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+        endif()
+
         if (USE_NUMAS)
             add_executable(cuda_dsv41_moe_cache_test test/basic/test_cuda_dsv41_moe_cache.cu)
             target_link_libraries(cuda_dsv41_moe_cache_test PRIVATE fastllm)
             set_target_properties(cuda_dsv41_moe_cache_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
             add_test(NAME cuda_dsv41_moe_cache COMMAND cuda_dsv41_moe_cache_test)
+            if (NOT USE_ROCM AND CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 11.7)
+                fastllm_add_checked_test(cuda_dsv41_moe_mailbox cuda_dsv41_moe_cache_test
+                    "MAILBOX_CHAIN_PASS" 180 --mailbox)
+                fastllm_add_checked_test(cuda_dsv41_moe_fullgraph cuda_dsv41_moe_cache_test
+                    "FULL_GRAPH_CHAIN_PASS" 180 --fullgraph)
+                set_tests_properties(cuda_dsv41_moe_mailbox cuda_dsv41_moe_fullgraph PROPERTIES
+                    LABELS "cuda;moe;numa" RUN_SERIAL TRUE ENVIRONMENT "OMP_NUM_THREADS=1")
+            endif()
+            add_executable(cuda_dsv41_mxfp4_resident_test test/basic/test_cuda_dsv41_mxfp4_resident.cu)
+            target_link_libraries(cuda_dsv41_mxfp4_resident_test PRIVATE fastllm)
+            set_target_properties(cuda_dsv41_mxfp4_resident_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+            add_test(NAME cuda_dsv41_mxfp4_resident COMMAND cuda_dsv41_mxfp4_resident_test)
+            set_tests_properties(cuda_dsv41_mxfp4_resident PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+
+            add_executable(cuda_dsv41_mxfp4_grouped_test test/basic/test_cuda_dsv41_mxfp4_grouped.cu)
+            target_link_libraries(cuda_dsv41_mxfp4_grouped_test PRIVATE fastllm)
+            set_target_properties(cuda_dsv41_mxfp4_grouped_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+            add_test(NAME cuda_dsv41_mxfp4_grouped COMMAND cuda_dsv41_mxfp4_grouped_test)
+            set_tests_properties(cuda_dsv41_mxfp4_grouped PROPERTIES LABELS "cuda;triton" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
             fastllm_add_checked_test(cuda_dsv41_moe_prefill cuda_dsv41_moe_cache_test "COMMON_PREFILL_PASS" 180 --prefill)
             fastllm_add_checked_test(cuda_dsv41_fp8_moe_prefill cuda_dsv41_moe_cache_test "COMMON_PREFILL_PASS" 180 --fp8 --prefill)
             set_tests_properties(cuda_dsv41_moe_prefill cuda_dsv41_fp8_moe_prefill PROPERTIES LABELS cuda RUN_SERIAL TRUE)

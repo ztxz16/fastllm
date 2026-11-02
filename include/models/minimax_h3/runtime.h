@@ -1,4 +1,5 @@
 #pragma once
+#include "models/hy_nomas/parallel.h"
 
 #include "models/hy_nomas/runtime.h"
 #include "models/qwen_image/runtime.h"
@@ -29,7 +30,8 @@ class Runtime : public nomas::Runtime {
     Tensor videoRms(const Tensor &fp32Input, const Tensor &fp32Weight);
     std::pair<Tensor, Tensor> videoQkNormRotary(const Tensor &q, const Tensor &k,
                                                const Tensor &cos, const Tensor &sin);
-    std::array<Tensor, 3> videoQkvNormRotary(const Tensor &qkv, const Tensor &cos, const Tensor &sin);
+    // Preserve packed QKV for strided attention; V is left untouched.
+    void videoQkvNormRotaryInPlace(Tensor &, const Tensor &cos, const Tensor &sin);
     Tensor gather(const Tensor &, const Tensor &indices);
     void scatter(Tensor &out, const Tensor &input, const Tensor &indices);
     Tensor rotary(const Tensor &, const Tensor &cos, const Tensor &sin, int headDim);
@@ -65,7 +67,7 @@ struct PackedLayout {
 
 class Transformer {
   public:
-    Transformer(Runtime &, Runtime &fp32, const std::string &directory);
+    Transformer(Runtime &, Runtime &fp32, const std::string &directory, nomas::ParallelContext = {});
     const TransformerConfig &config() const { return config_; }
     Tensor timeEmbedding(const std::vector<float> &times);
     // input is SiLU(temb), rounded to the main runtime's dtype after activation.
@@ -87,6 +89,7 @@ class Transformer {
     Runtime &rt_, &fp32_;
     Weights weights_, fullWeights_;
     TransformerConfig config_;
+    nomas::ParallelContext parallel_;
     std::vector<Tensor> modulation_;
     Tensor outputModulation_;
     std::vector<std::vector<float>> plans_;
@@ -135,13 +138,13 @@ struct Reference {
 };
 class TextEncoder {
   public:
-    TextEncoder(Runtime &, const std::string &directory);
+    TextEncoder(Runtime &, const std::string &directory, nomas::ParallelContext = {});
     Tensor encode(const std::vector<int> &, Trace trace = {});
     Tensor encodeVisual(const std::vector<int> &, const std::vector<VisionInput> &, Trace trace = {});
-    void unload() {
-        weights_.clear();
+    void unload(bool keepPackedCache = false) {
+        weights_.clear(keepPackedCache);
         if (prefetchedWeights_)
-            prefetchedWeights_->clear();
+            prefetchedWeights_->clear(keepPackedCache);
     }
 
   private:
@@ -149,17 +152,24 @@ class TextEncoder {
     Weights weights_;
     std::unique_ptr<Weights> prefetchedWeights_;
     bool hostCacheWarm_ = false;
+    nomas::ParallelContext parallel_;
 };
 class VideoVAE {
   public:
+    using TileRunner = std::function<std::vector<Tensor>(size_t, const std::function<Tensor(VideoVAE &,size_t)> &)>;
     VideoVAE(Runtime &compute, Runtime &fp32, const std::string &directory);
+    // Optional independent-tile executor; each worker owns a separate VAE cache.
+    void setTileRunner(TileRunner run, size_t workers = 1) {
+        tileRunner_ = std::move(run);
+        tileWorkers_ = workers ? workers : 1;
+    }
     // ImageNet-normalized THWC pixels -> FP32 posterior moments (mean, log variance).
     Tensor encodeTile(const Tensor &, int frames, int height, int width, Trace trace = {});
     VideoTensor encodeMoments(const VideoTensor &, std::function<void(int, int)> progress = {});
     Tensor decodeTile(const Tensor &, int frames, int height, int width, Trace trace = {});
     VideoTensor decode(const VideoTensor &, std::function<void(int, int)> progress = {});
     std::vector<uint8_t> decodeRGB(const VideoTensor &, std::function<void(int, int)> progress = {},
-                                   std::function<void(const std::vector<uint8_t> &)> onFrames = {});
+                                   std::function<void(std::vector<uint8_t>)> onFrames = {}, bool retainRGB = true);
     void unload() {
         weights_.clear();
         fullWeights_.clear();
@@ -179,6 +189,8 @@ class VideoVAE {
     std::array<int, 3> ropeShape_{};
     std::pair<Tensor, Tensor> rope_;
     Tensor zero_;
+    TileRunner tileRunner_;
+    size_t tileWorkers_ = 1;
 };
 DType parseVideoPrecision(const std::string &name, bool fp32 = false);
 const char *precisionName(DType);
@@ -219,21 +231,27 @@ struct ReferenceGeometry {
 PackedLayout referenceLayout(const std::vector<int> &textTags, int frames, int height, int width,
                              int audioFrames, const std::vector<ReferenceGeometry> &);
 std::vector<float> sigmaSchedule(int steps, float shift);
+class ParallelModel;
 class Pipeline {
   public:
     Pipeline(const std::string &directory, int device, bool fp32 = false);
     Pipeline(const std::string &directory, int device, bool fp32, DType videoPrecision);
+    Pipeline(const std::string &directory, const std::vector<int> &devices, bool fp32, DType videoPrecision);
+    Pipeline(const std::string &directory, const std::vector<int> &devices, bool fp32, DType videoPrecision,
+             nomas::RowReduction ditReduction);
+    ~Pipeline();
     Generation generate(const GenerateOptions &, Progress progress = {}, Trace trace = {},
                         const std::vector<float> *initialVideo = nullptr,
                         const std::vector<float> *initialAudio = nullptr);
+    // File-only callers may omit the full RGB return buffer; C++ defaults retain it.
     Generation generateMP4(const GenerateOptions &, const std::string &path,
                            const std::string &ffmpeg = "ffmpeg", Progress progress = {}, Trace trace = {},
                            const std::vector<float> *initialVideo = nullptr,
-                           const std::vector<float> *initialAudio = nullptr);
+                           const std::vector<float> *initialAudio = nullptr, bool retainRGB = true);
 
   private:
     Generation generateImpl(const GenerateOptions &, Progress, Trace, const std::vector<float> *,
-                            const std::vector<float> *, const std::string &path, const std::string &ffmpeg);
+                            const std::vector<float> *, const std::string &path, const std::string &ffmpeg, bool retainRGB);
     Runtime rt_, full_, videoRuntime_;
     nomas::QwenTokenizer tokenizer_;
     TextEncoder text_;
@@ -244,6 +262,7 @@ class Pipeline {
     AudioVAE audio_;
     std::vector<float> videoMean_, videoStd_, audioMean_, audioStd_;
     bool retainWeights_ = false;
+    std::unique_ptr<ParallelModel> parallel_;
 };
 // FFmpeg is only a media encoder; model inference remains entirely C++/CUDA.
 class MP4Writer {
@@ -252,6 +271,8 @@ class MP4Writer {
               const std::string &ffmpeg = "ffmpeg");
     ~MP4Writer();
     void write(const uint8_t *rgb, size_t bytes, std::function<void()> checkpoint = {});
+    // Transfer ownership of a decoded chunk to the bounded encoder queue.
+    void write(std::vector<uint8_t> rgb, std::function<void()> checkpoint = {});
     void finish(std::function<void()> checkpoint = {});
 
   private:

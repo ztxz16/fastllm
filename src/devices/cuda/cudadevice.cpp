@@ -25,6 +25,7 @@ extern "C" bool FastllmCudaDeepSeekV41HcPost(const fastllm::Data&, const fastllm
 
 #include <cmath>
 #include <chrono>
+#include <climits>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -1232,6 +1233,189 @@ namespace fastllm {
         }
         state = 0;
         return false;
+    }
+
+    bool TryCudaTritonSmallProjection(const Data &input, Data &weight, Data &output, int groups) {
+        if (!CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON")) return false;
+        const char *flag = std::getenv("FASTLLM_CUDA_TRITON_SMALL_PROJECTION");
+        if (flag && flag[0] && !CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON_SMALL_PROJECTION")) return false;
+        const int arch = CudaTritonRuntimeArch(), device = FastllmCudaGetDevice();
+        auto local = [device](const Data &d) {
+            if (d.multiDeviceData || d.dataDevice != CUDA || !d.cudaData ||
+                d.dataDeviceIds != std::vector<int>{device} || d.dims.empty() ||
+                d.strides.size() != d.dims.size() || (reinterpret_cast<uintptr_t>(d.cudaData) & 15)) return false;
+            uint64_t stride = 1;
+            for (int i = int(d.dims.size()) - 1; i >= 0; --i) {
+                if (d.dims[i] <= 0 || d.strides[i] != stride) return false;
+                stride *= d.dims[i];
+            }
+            return true;
+        };
+        if ((arch != 120 && arch != 121) || groups <= 0 ||
+            !local(input) || !local(weight) || !local(output) ||
+            input.dataType != BFLOAT16 || output.dataType != BFLOAT16 ||
+            (weight.dataType != FP8_E4M3 && weight.dataType != BFLOAT16) ||
+            weight.IsRepacked || weight.dims.size() != 2 || weight.dims[0] % groups) return false;
+        const int n = weight.dims[0] / groups, k = weight.dims[1];
+        const uint64_t width = uint64_t(groups) * k;
+        if (n <= 0 || k <= 0 || n % 32 || k % 32 || input.Count(0) % width ||
+            weight.Count(0) > INT_MAX || input.Count(0) > INT_MAX) return false;
+        const uint64_t rows64 = input.Count(0) / width;
+        if (rows64 < 2 || rows64 > 16 || output.Count(0) != rows64 * groups * n) return false;
+        auto overlaps = [](const Data &a, const Data &b) {
+            const uintptr_t x = reinterpret_cast<uintptr_t>(a.cudaData), y = reinterpret_cast<uintptr_t>(b.cudaData);
+            return x < y + b.GetBytes() && y < x + a.GetBytes();
+        };
+        if (overlaps(output, input) || overlaps(output, weight)) return false;
+        const int fp8 = weight.dataType == FP8_E4M3;
+        if (fp8 && (weight.blockM != 32 || weight.blockK != 32 ||
+            weight.scales.size() != size_t(weight.dims[0] / 32) * (k / 32) ||
+            weight.extraCudaData.empty() || !weight.extraCudaData[0] ||
+            (reinterpret_cast<uintptr_t>(weight.extraCudaData[0]) & 15))) return false;
+        // Small N needs more CTAs; wider K benefits from a larger reduction tile.
+        const int bn = groups == 1 && n >= 16384 && k <= 2048 ? 64 : 32;
+        const int bk = bn == 64 ? (fp8 ? 128 : 64) : (groups > 1 ? 128 : 256);
+        const std::string dir = CudaTritonCacheDir();
+        const std::string base = "small_projection_v1_sm" + std::to_string(arch) + "_fp8" +
+            std::to_string(fp8) + "_n" + std::to_string(n) + "_k" + std::to_string(k) +
+            "_bn" + std::to_string(bn) + "_bk" + std::to_string(bk) + "_w4_s3";
+        const std::string path = CudaTritonJoinPath(dir, base + ".json");
+        static std::mutex mutex;
+        static std::map<std::string, CudaTritonKernelMeta> cache;
+        CudaTritonKernelMeta meta;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            auto found = cache.find(path);
+            if (found != cache.end()) meta = found->second;
+            else {
+                if (FastllmCudaGraphIsCapturing()) return false;
+                std::ifstream file(path);
+                std::string body((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>()), error;
+                auto json = json11::Json::parse(body, error);
+                if (!error.empty() || !json["ok"].bool_value()) {
+                    if (!CudaTritonEnsureServer()) return false;
+                    json11::Json request = json11::Json::object{{"op", "small_projection"}, {"arch", arch},
+                        {"cache_dir", dir}, {"n", n}, {"k", k}, {"fp8", fp8}, {"block_n", bn}, {"block_k", bk}};
+                    int status = 0;
+                    if (!CudaTritonHttpRequest("POST", "/compile", request.dump(), &status, body) || status != 200)
+                        return false;
+                    error.clear();
+                    json = json11::Json::parse(body, error);
+                }
+                meta.cubinPath = json["cubin"].string_value(); meta.kernelName = json["kernel"].string_value();
+                meta.shared = json["shared"].int_value(); meta.numWarps = json["num_warps"].int_value();
+                if (!error.empty() || !json["ok"].bool_value() || json["version"].int_value() != 1 ||
+                    json["arch"].int_value() != arch || json["n"].int_value() != n || json["k"].int_value() != k ||
+                    json["fp8"].int_value() != fp8 || json["block_n"].int_value() != bn || json["block_k"].int_value() != bk ||
+                    meta.kernelName.empty() || meta.shared < 0 || meta.shared > 101376 || meta.numWarps != 4 ||
+                    !CudaTritonFileExists(meta.cubinPath)) return false;
+                cache.emplace(path, meta);
+            }
+        }
+        return FastllmCudaTritonSmallProjection(meta.cubinPath.c_str(), meta.kernelName.c_str(), meta.shared,
+                                               input, weight, output, int(rows64), groups, n, bn);
+    }
+
+    bool CudaTritonMxfp4GroupedEnabled() {
+        if (!CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON"))
+            return false;
+        const char *flag = std::getenv("FASTLLM_CUDA_TRITON_MXFP4_GROUPED");
+        if (flag && flag[0] && !CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON_MXFP4_GROUPED"))
+            return false;
+        const int arch = CudaTritonRuntimeArch();
+        return arch == 120 || arch == 121;
+    }
+
+    bool TryCudaTritonMxfp4Grouped(const Data &input, Data &activation, const unsigned char *records,
+                                   const int *slots, const int *routes, const float *scores, float *output,
+                                   void *scratch, int count, int hidden, int inter, int topk, size_t stride,
+                                   size_t down, float limit, bool planar) {
+        if (!CudaTritonMxfp4GroupedEnabled())
+            return false;
+        if (hidden != 5120 || inter != 2304 || (topk != 6 && (!planar || topk != 3)) || limit != 10.0f ||
+            down != size_t(2 * inter) * (hidden / 32) * 17 ||
+            stride != down + size_t(hidden) * (inter / 32) * 17 || count < 4 || count > 48 || !records ||
+            !slots || !routes || !scores || !output || (!planar && !scratch) || input.dataType != BFLOAT16 ||
+            input.dataDevice != CUDA || !input.cudaData || input.dims.size() != 2 || input.dims[0] < 2 ||
+            input.dims[0] > 8 || input.dims[1] != hidden || activation.dataType != BFLOAT16 ||
+            activation.dataDevice != CUDA || !activation.cudaData ||
+            activation.Count(0) < size_t(input.dims[0]) * topk * inter || count > input.dims[0] * topk ||
+            input.multiDeviceData || activation.multiDeviceData || input.cudaData == activation.cudaData ||
+            input.dataDeviceIds != activation.dataDeviceIds ||
+            input.dataDeviceIds != std::vector<int>{FastllmCudaGetDevice()})
+            return false;
+        int arch = CudaTritonRuntimeArch();
+        std::string dir = CudaTritonCacheDir();
+        std::string base = planar ?
+            "mxfp4_grouped_v6_planar_sm" + std::to_string(arch) + "_h5120_i2304_k" + std::to_string(topk) + "_n32_64_k256_w4_s2" :
+            "mxfp4_grouped_v3_sm" + std::to_string(arch) + "_h5120_i2304_k6_n64_k128_w4_s3";
+        std::string path = CudaTritonJoinPath(dir, base + ".json");
+        struct Meta {
+            CudaTritonKernelMeta kernels[3];
+            bool valid = false;
+        };
+        const int kernelCount = planar ? 2 : 3;
+        static std::mutex mutex;
+        static std::map<std::string, Meta> cache;
+        Meta meta;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            auto it = cache.find(path);
+            if (it == cache.end()) {
+                // Compilation and module loading must be warmed before capture.
+                // Do not cache this miss: a subsequent ordinary call can warm it.
+                if (FastllmCudaGraphIsCapturing())
+                    return false;
+                std::ifstream file(path);
+                std::string body((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+                std::string error;
+                auto json = json11::Json::parse(body, error);
+                if (!error.empty() || !json["ok"].bool_value()) {
+                    if (!CudaTritonEnsureServer()) {
+                        cache[path] = meta;
+                        return false;
+                    }
+                    json11::Json request =
+                        json11::Json::object{{"op", "mxfp4_grouped"}, {"arch", arch}, {"cache_dir", dir}, {"planar", planar}, {"topk", topk}};
+                    int status = 0;
+                    if (!CudaTritonHttpRequest("POST", "/compile", request.dump(), &status, body) ||
+                        status != 200) {
+                        cache[path] = meta;
+                        return false;
+                    }
+                    error.clear();
+                    json = json11::Json::parse(body, error);
+                }
+                bool valid = error.empty() && json["ok"].bool_value() && json["version"].int_value() == (planar ? 6 : 3) &&
+                             json["arch"].int_value() == arch && json["planar"].bool_value() == planar &&
+                             (!planar || json["topk"].int_value() == topk);
+                const char *keys[] = {"gate", planar ? "down" : "activate", "down"};
+                for (int i = 0; i < kernelCount; ++i) {
+                    auto item = json["kernels"][keys[i]];
+                    auto &k = meta.kernels[i];
+                    k.cubinPath = item["cubin"].string_value();
+                    k.kernelName = item["kernel"].string_value();
+                    k.shared = item["shared"].int_value();
+                    k.numWarps = item["num_warps"].int_value();
+                    valid = valid && !k.kernelName.empty() && k.numWarps == 4 && k.shared >= 0 &&
+                            k.shared <= 101376 && CudaTritonFileExists(k.cubinPath);
+                }
+                meta.valid = valid;
+                cache[path] = meta;
+            } else
+                meta = it->second;
+        }
+        if (!meta.valid)
+            return false;
+        const char *cubins[3] = {}, *names[3] = {};
+        int shared[3] = {};
+        for (int i = 0; i < kernelCount; ++i) {
+            cubins[i] = meta.kernels[i].cubinPath.c_str();
+            names[i] = meta.kernels[i].kernelName.c_str();
+            shared[i] = meta.kernels[i].shared;
+        }
+        return FastllmCudaTritonMxfp4Grouped(cubins, names, shared, input, activation, records, slots, routes,
+                                             scores, output, scratch, count, planar);
     }
 
     static bool CudaTritonRequestLinearFp8Block128Kernel(

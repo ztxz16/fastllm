@@ -18,7 +18,9 @@ namespace fastllm { namespace nomas {
 // affects only allocations on its thread/device; other models keep the default.
 class TensorPool {
 public:
-    explicit TensorPool(int device);
+    // Optional bounded reuse of freed blocks on their original inference thread.
+    // Disabled by default; the host cache cannot be used during CUDA capture.
+    explicit TensorPool(int device, size_t cacheBytes=0);
     class Scope {
     public:
         explicit Scope(const TensorPool &);
@@ -83,6 +85,7 @@ public:
     Tensor linear(const Tensor &x, const Tensor &weight, const Tensor *bias = nullptr);
     // Output storage must not be shared with inputs. For 16-bit biased GEMM,
     // its address must retain the cuBLASLt plan's 256-byte alignment.
+    // Without bias, FP32 output also preserves partial sums for tensor parallelism.
     void linearInto(const Tensor &x, const Tensor &weight, Tensor &out, const Tensor *bias = nullptr);
     Tensor norm(const Tensor &x, bool rms, const Tensor *weight = nullptr,
                 const Tensor *bias = nullptr, float eps = 1e-6f, int width = 0);
@@ -103,6 +106,8 @@ public:
                        int frames, int height, int width);
     Tensor pixelCondition(const Tensor &x, int frames, int height, int width);
     Tensor modulate(const Tensor &x, const Tensor &mod, int shift, int scale);
+    // LayerNorm followed by modulation, preserving the intermediate dtype rounding.
+    Tensor normModulate(const Tensor &x, const Tensor &mod, int shift, int scale, float eps = 1e-6f);
     Tensor residual(const Tensor &x, const Tensor &y, const Tensor &mod, int gate);
     // Indexed BF16/FP32 modulation; each token selects one row of the table.
     Tensor modulateRows(const Tensor &, const Tensor &table, const Tensor &indices, int shift, int scale);
@@ -122,6 +127,8 @@ public:
                                       const Tensor &learned, const std::vector<uint8_t> *secondFrame = nullptr);
     Tensor geluExact(const Tensor &);
     Tensor concat(const std::vector<Tensor> &xs);
+    // Concatenate rows into an existing buffer/view, disjoint from every input.
+    void concatInto(const std::vector<Tensor> &xs, Tensor &out);
     Tensor rope(const Tensor &x, const float *cos, const float *sin, int headDim);
     RopeTable prepareRope(const float *cos, const float *sin, int rows, int headDim);
     Tensor rope(const Tensor &x, const RopeTable &table);
@@ -131,6 +138,9 @@ public:
                      int heads, const uint8_t *mask = nullptr, int queryChunk = 128,
                      int kvHeads = 0, bool causal = false, int tile = 0,
                      int gridHeight = 0, int gridWidth = 0);
+    // Bidirectional self-attention on [batch * tokens, 3 * heads * dim] QKV.
+    // Read the interleaved rows directly and write one contiguous output.
+    Tensor packedSelfAttention(const Tensor &qkv, int heads, int batch = 1);
     // FP32 attention with an explicit score scale, including pre-scaled Q/K.
     Tensor attentionScaled(const Tensor &q, const Tensor &k, const Tensor &v,
                            int heads, float scoreScale, const uint8_t *mask = nullptr,
@@ -152,16 +162,23 @@ public:
     ~Weights();
     const Tensor &get(const std::string &name);
     const Tensor *optional(const std::string &name);
+    // Slice checkpoint bytes before upload. Axis 0 splits output channels (also
+    // 1D biases), axis 1 input channels. Packed projections split each group
+    // independently, e.g. [up, gate] uses groups=2. Configure before first get().
+    void shard(const std::string &name, int axis, int rank, int size, int groups = 1);
+    int shardGroups(const std::string &name) const;
     Tensor linear(const Tensor &x, const std::string &prefix, bool separateBias = false);
     // A supplied output cannot be combined with separateBias.
     Tensor linear(const Tensor &x, const std::string &prefix, bool separateBias, Tensor *out);
-    void clear();
+    void clear(bool keepPackedCache = false);
     // Optional lossless host cache for callers that swap model stages.
     void offload();
-    // Optionally retain checkpoint BF16 tensors while streaming expanded FP32
-    // layers. Use at most half the currently free memory, leaving reserveBytes.
-    // clear() releases both representations; disabled unless explicitly enabled.
+    // Retain checkpoint BF16 tensors for resident inference or streamed FP32
+    // expansion. Use at most half the free memory, leaving reserveBytes.
+    // clear() releases both representations; clear(true) retains this cache.
     void enablePackedCache(size_t reserveBytes);
+    // Same rank/partition; cache population must be serialized, as for host caches.
+    void sharePackedCache(const Weights &source);
     // Retain immutable CPU checkpoint bytes across clear(), preferring pinned
     // memory. Capped by one quarter of available host RAM; rejected pinning
     // uses ordinary memory, exhaustion uses files. Zero releases the cache.
@@ -185,10 +202,15 @@ std::vector<Tensor> qwenVision(Runtime &, Weights &, int width, int height, cons
 
 struct BlockResult { Tensor image, text, key, value; };
 struct DiTCache { std::vector<Tensor> key, value; };
+struct ParallelContext;
+struct ParallelOptions;
+class ParallelModel;
 
 class DiT {
 public:
     DiT(Runtime &runtime, const std::string &checkpoint);
+    DiT(Runtime &, const std::string &, const ParallelContext &);
+    ~DiT();
     BlockResult block(int layer, const Tensor &image, const Tensor &text,
                       const Tensor &time, const float *cos, const float *sin,
                       const Tensor *historyK = nullptr, const Tensor *historyV = nullptr,
@@ -196,24 +218,41 @@ public:
     BlockResult block(int layer, const Tensor &image, const Tensor &text,
                       const Tensor &time, const RopeTable &rope,
                       const Tensor *historyK = nullptr, const Tensor *historyV = nullptr,
-                      const uint8_t *attentionMask = nullptr);
+                      const uint8_t *attentionMask = nullptr,
+                      const Tensor *imageModulation = nullptr, const Tensor *textModulation = nullptr,
+                      Tensor *keyWorkspace = nullptr, Tensor *valueWorkspace = nullptr, int globalImageRows = 0);
+    // workspace belongs to one action with fixed history/shape. Successful
+    // commit transfers its buffers to cache; failures never mutate cache.
     Tensor forward(const Tensor &latent, const Tensor &textFeatures, float timestep,
                    int frames, int height, int width, int frameOffset = 0,
                    DiTCache *cache = nullptr, bool commit = false,
-                   const Tensor *camera = nullptr);
+                   const std::vector<Tensor> *camera = nullptr, DiTCache *workspace = nullptr);
     Tensor cameraEmbedding(const Tensor &extrinsics);
+    // Prepare once per action; retain the original projection shapes/rounding.
+    std::vector<Tensor> cameraProjections(const Tensor &camera, int tokensPerFrame);
     Tensor cameraBlock(int layer, const Tensor &image, const Tensor &camera, int tokensPerFrame);
-    void unload() { weights_.clear(); }
+    void unload();
 private:
+    int sequencePartitions(int rows) const;
+    struct Modulation {
+        Tensor time, output;
+        std::vector<Tensor> image, text;
+    };
+    const Modulation &prepare(float timestep);
     Tensor timeEmbedding(float timestep, const std::string &prefix);
     Tensor refineText(const Tensor &text, float timestep);
+    Tensor projectCamera(int layer, const Tensor &camera, int tokensPerFrame);
     Runtime &rt_;
     Weights weights_;
+    std::unordered_map<float,Modulation> modulation_;
+    std::unique_ptr<ParallelContext> parallel_;
 };
 
 class PixelDecoder {
 public:
     PixelDecoder(Runtime &runtime, const std::string &checkpoint);
+    PixelDecoder(Runtime &, const std::string &, const ParallelContext &);
+    ~PixelDecoder();
     Tensor block(int layer, const Tensor &x, int frames, int height, int width, int tile = 8);
     // latent is [T*H*W,32]; noise and output are patchified [T*2H*2W,3072].
     Tensor forward(const Tensor &latent, const Tensor &noise, int frames, int height, int width);
@@ -221,6 +260,7 @@ public:
 private:
     Runtime &rt_;
     Weights weights_;
+    std::unique_ptr<ParallelContext> parallel_;
 };
 
 class QwenTextEncoder {
@@ -255,6 +295,7 @@ struct WorldState {
     Tensor features;
     std::string prompt;
     DiTCache cache;
+    std::vector<DiTCache> parallelCaches;
     std::vector<float> decoderLatents;
     std::vector<int> segmentTokens;
     std::mt19937_64 generator;
@@ -269,6 +310,8 @@ std::vector<float> cameraTrajectory(int frames, int action);
 class Pipeline {
 public:
     Pipeline(const std::string &modelDirectory, const std::string &textDirectory, int device);
+    Pipeline(const std::string &, const std::string &, const ParallelOptions &);
+    ~Pipeline();
     std::vector<uint8_t> generate(const std::string &prompt, int width, int height,
                                   int frames, uint64_t seed, int steps,
                                   Progress progress = nullptr, void *user = nullptr);
@@ -282,12 +325,14 @@ public:
                                    const std::string *prompt = nullptr);
 private:
     Tensor encodeWorldPrompt(const std::string &prompt);
+    void unloadModels();
     Runtime rt_;
     QwenTokenizer tokenizer_;
     QwenTextEncoder text_;
     DiT dit_;
     PixelDecoder decoder_;
     Tensor cameraContinuationFeatures_;
+    std::unique_ptr<ParallelModel> parallel_;
 };
 
 }} // namespace fastllm::nomas
@@ -319,6 +364,9 @@ int fastllm_nomas_tokenize(void *handle, const char *text, int videoTemplate,
                          int *tokens, int capacity, int *crop);
 int fastllm_nomas_encode(void *handle, const int *tokens, int count, float *features);
 void *fastllm_nomas_pipeline_create(const char *modelDirectory, const char *textDirectory, int device);
+// Sequence-parallel DiT and tensor-parallel PixelUMM, one worker per device.
+void *fastllm_nomas_pipeline_create_parallel(const char *modelDirectory, const char *textDirectory,
+                                            const char *devices);
 void fastllm_nomas_pipeline_destroy(void *handle);
 int fastllm_nomas_generate(void *handle, const char *prompt, int width, int height,
                           int frames, uint64_t seed, int steps, uint8_t *rgb,

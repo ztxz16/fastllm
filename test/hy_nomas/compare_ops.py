@@ -66,6 +66,14 @@ def main(args):
             rms=(x.float()*torch.rsqrt(x.float().square().mean(-1,keepdim=True)+1e-6)).bfloat16()*weight
             run(f"rms_{width}","rms",list(x.shape),x,weight,None,rms)
             run(f"layernorm_{width}","layernorm",list(x.shape),x,weight,bias,F.layer_norm(x,(width,),weight,bias,1e-6))
+        for rows in (1,3,176,6720):
+            x,weight,bias=rand(rows,128),rand(128),rand(128)
+            x[::7]=0
+            rms=((x.float()*torch.rsqrt(x.float().square().mean(-1,keepdim=True)+1e-6)).bfloat16().float()*weight.float()+bias.float()).bfloat16()
+            run(f"rms128_tail_{rows}","rms",list(x.shape),x,weight,bias,rms)
+        x,y=rand(3,128),rand(7,128)
+        guard=torch.full((1,128),13,device="cuda",dtype=torch.bfloat16)
+        run("concat_into_view","concat_into",[3,128,7],x,y,None,torch.cat((guard,x,y,guard)))
         x,y = rand(257,2048),rand(257,2048)
         run("swiglu","swiglu",list(x.shape),x,y,None,F.silu(x)*y)
         for op in ("silu","gelu"):

@@ -56,6 +56,18 @@ int main() {
             writer.finish();
         }
         check(read(dir / "serial.mp4") == read(dir / "stream.mp4"), "chunking changed MP4 bytes");
+        // Moving bounded chunks and splitting a large owned chunk must preserve output.
+        for (bool split : {false, true}) {
+            auto path = dir / (split ? "owned-large.mp4" : "owned-chunks.mp4");
+            MP4Writer writer(g, path.string());
+            size_t step = split ? g.rgb.size() : frameBytes * 17;
+            for (size_t offset = 0; offset < g.rgb.size(); offset += step) {
+                size_t count = std::min(step, g.rgb.size() - offset);
+                writer.write(std::vector<uint8_t>(g.rgb.begin() + offset, g.rgb.begin() + offset + count));
+            }
+            writer.finish();
+            check(read(dir / "serial.mp4") == read(path), "owned chunks changed MP4 bytes");
+        }
         auto destination = (dir / "preserve.mp4").string();
         std::ofstream(destination) << "preserve";
         int initialFDs = descriptors();
@@ -89,7 +101,7 @@ int main() {
             auto cancel = [] { throw std::runtime_error("cancelled"); };
             try {
                 MP4Writer writer(large, destination, blocked);
-                writer.write(large.rgb.data(), large.rgb.size(), cancel);
+                writer.write(std::move(large.rgb), cancel);
                 writer.finish(cancel);
             } catch (const std::runtime_error &) { cancelled = true; }
             check(cancelled, "blocked encoder did not observe cancellation");

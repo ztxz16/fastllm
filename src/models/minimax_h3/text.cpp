@@ -6,7 +6,21 @@
 
 namespace fastllm {
 namespace minimax_h3 {
-TextEncoder::TextEncoder(Runtime &rt, const std::string &dir) : rt_(rt), weights_(rt, componentWeights(dir)) {
+TextEncoder::TextEncoder(Runtime &rt, const std::string &dir, nomas::ParallelContext parallel)
+    : rt_(rt), weights_(rt, componentWeights(dir)), parallel_(parallel) {
+    if (64 % parallel_.size() || 8 % parallel_.size() || 25600 % parallel_.size())
+        throw std::invalid_argument("H3 text attention/KV heads and FFN width must divide TP size");
+    auto partition = [&](Weights &weights) {
+        for (int layer = 0; layer < 50; ++layer) {
+            auto p = "model.language_model.layers." + std::to_string(layer) + ".";
+            for (auto name : {"self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj",
+                              "mlp.gate_proj", "mlp.up_proj"})
+                parallel_.columnWeights(weights, p + name);
+            for (auto name : {"self_attn.o_proj", "mlp.down_proj"})
+                parallel_.rowWeights(weights, p + name);
+        }
+    };
+    partition(weights_);
     weights_.enableHostCache(size_t(64) << 30);
     rt_.activate();
     size_t available = 0, total = 0;
@@ -17,6 +31,7 @@ TextEncoder::TextEncoder(Runtime &rt, const std::string &dir) : rt_(rt), weights
     // Keep the original memory footprint for smaller devices and FP32 diagnostics.
     if (!rt.isFloat32() && total >= (size_t(68) << 30) && available >= (size_t(8) << 30)) {
         prefetchedWeights_ = std::make_unique<Weights>(rt, componentWeights(dir));
+        partition(*prefetchedWeights_);
         prefetchedWeights_->shareHostCache(weights_);
     }
 }
@@ -27,6 +42,13 @@ Tensor TextEncoder::encodeVisual(const std::vector<int> &tokens, const std::vect
                                  Trace trace) {
     if (tokens.empty() || tokens.size() > 65536)
         throw std::invalid_argument("H3 presentation requires 1..65536 tokens");
+    if (parallel_.size() > 1 && !rt_.isFloat32()) {
+        // Reserve room for the sharded DiT, replicated VAEs and activations.
+        // Re-enable after cancellation/unload; uncached weights still stream.
+        weights_.enablePackedCache((size_t(16) << 30) + (size_t(40) << 30) / parallel_.size());
+        if (prefetchedWeights_)
+            prefetchedWeights_->sharePackedCache(weights_);
+    }
     const std::string root = "model.language_model.";
     auto x = rt_.embedding(weights_.get(root + "embed_tokens.weight"), tokens);
     weights_.erasePrefix(root + "embed_tokens.");
@@ -121,9 +143,11 @@ Tensor TextEncoder::encodeVisual(const std::vector<int> &tokens, const std::vect
         q = images.empty() ? rt_.textRope(q, 5000000.f) : rt_.textRope(q, ropePositions, 5000000.f);
         k = images.empty() ? rt_.textRope(k, 5000000.f) : rt_.textRope(k, ropePositions, 5000000.f);
         x = rt_.add(
-            x, weights.linear(rt_.attention(q, k, v, 64, nullptr, 128, 8, true), p + "self_attn.o_proj"));
+            x, parallel_.row(rt_, weights,
+                rt_.attention(q, k, v, 64 / parallel_.size(), nullptr, 128, 8 / parallel_.size(), true),
+                p + "self_attn.o_proj"));
         y = rt_.norm(x, true, &weights.get(p + "post_attention_layernorm.weight"));
-        Tensor output(y.rows, y.cols, y.dtype);
+        Tensor output(y.rows, y.cols, parallel_.size() > 1 ? DType::FP32 : y.dtype);
         for (int first = 0; first < y.rows;) {
             // Preserve the original small tail GEMM and FP32 diagnostic shapes.
             int count = std::min(y.isFloat32() ? 256 : 4096, y.rows - first);
@@ -132,10 +156,15 @@ Tensor TextEncoder::encodeVisual(const std::vector<int> &tokens, const std::vect
             auto input = y.rowSlice(first, count);
             auto gate = weights.linear(input, p + "mlp.gate_proj");
             auto target = output.rowSlice(first, count);
-            weights.linear(rt_.siluMultiply(gate, weights.linear(input, p + "mlp.up_proj")), p + "mlp.down_proj",
-                           false, &target);
+            auto hidden = rt_.siluMultiply(gate, weights.linear(input, p + "mlp.up_proj"));
+            if (parallel_.size() > 1)
+                rt_.linearInto(hidden, weights.get(p + "mlp.down_proj.weight"), target);
+            else
+                weights.linear(hidden, p + "mlp.down_proj", false, &target);
             first += count;
         }
+        if (parallel_.size() > 1)
+            output = parallel_.finishRow(rt_, weights, output, p + "mlp.down_proj", y.dtype);
         x = rt_.add(x, output);
         if (layer < 3)
             x = applyVisual(x, layer);

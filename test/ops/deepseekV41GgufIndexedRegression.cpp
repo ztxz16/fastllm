@@ -13,6 +13,7 @@
 #include "devices/numas/numasdevice.h"
 #include "devices/cuda/fastllm-cuda-moe-cache-stats.h"
 #include "utils/hybrid_moe.h"
+#include "devices/cuda/fastllm-cuda-moe-policy.h"
 namespace fastllm { void RegisterNumas(Data *data, std::string weightType); }
 #endif
 #include <algorithm>
@@ -183,7 +184,8 @@ struct RegisteredFixture {
 };
 static std::vector<RegisteredFixture> registeredFixtures;
 static void CollectRegistrationFixture(std::vector<Data *> &weights, int gt, int dt, int device) {
-    if (!((gt==GGML_TYPE_IQ1_S && dt==GGML_TYPE_IQ1_M) ||
+    if (!((gt==GGML_TYPE_Q8_0 && dt==GGML_TYPE_Q8_0) ||
+          (gt==GGML_TYPE_IQ1_S && dt==GGML_TYPE_IQ1_M) ||
           (gt==GGML_TYPE_Q2_0 && dt==GGML_TYPE_Q3_K) ||
           (gt==GGML_TYPE_Q4_K && dt==GGML_TYPE_Q2_0) ||
           (gt==GGML_TYPE_Q2_K && dt==GGML_TYPE_Q4_K) ||
@@ -508,6 +510,116 @@ static void CheckPrefillCache() {
     registeredFixtures.clear();
     puts("PASS: V4.1 GGUF prefill admission and resident reuse");
 }
+static void Gpu(Data &data) { data.ToDevice(CUDA,{0},false);data.Allocate(false); }
+static float BfValue(uint16_t value) { uint32_t bits=uint32_t(value)<<16;float out;std::memcpy(&out,&bits,4);return out; }
+static void CheckDraftMailbox(std::vector<Data *> *weights) {
+    const int hidden=weights[0][2]->dims[1], experts=weights[0].size()/2-1, topk=3;
+    int checks=0;
+    for (int rows : {3,5,7,8,16,32}) {
+        Data input(BFLOAT16,{rows,hidden}), ids[2], scores[2], output[2]; Gpu(input);
+        for(int l=0;l<2;++l){ids[l].dataType=INT32;ids[l].Resize({rows,topk});Gpu(ids[l]);
+            scores[l].dataType=FLOAT32;scores[l].Resize({rows,topk});Gpu(scores[l]);
+            output[l].dataType=BFLOAT16;output[l].Resize({rows,hidden});Gpu(output[l]);}
+        void *handles[2]{}, *children[2]{}, *graph=nullptr,*exec=nullptr,*untimed=nullptr;
+        cudaGraph_t shared;cudaGraphNode_t empty;Cuda(cudaGraphCreate(&shared,0));
+        Cuda(cudaGraphAddEmptyNode(&empty,shared,nullptr,0));
+        void *scope=FastllmCudaBeginMoeDecode(weights[0].data(),weights[0].size(),topk);
+        Check(scope,"verifier mailbox initial scope");FastllmCudaEndMoeDecode(scope);
+        // Invalid views must be rejected before capturing a device access.
+        auto rejected = [&](Data &destination) {
+            void *child = nullptr;
+            Check(!FastllmCudaCreateNativeMoeFullGraph(input, ids[0], scores[0], destination,
+                weights[0].data(), weights[0].size(), 0, shared, &child) && !child,
+                "invalid verifier mailbox view accepted");
+        };
+        for (Data *view : {&input, &ids[0], &scores[0]}) {
+            ++view->strides[0]; rejected(output[0]); --view->strides[0];
+            const auto devices = view->dataDeviceIds;
+            view->dataDeviceIds = {1}; rejected(output[0]); view->dataDeviceIds = devices;
+            view->multiDeviceData = true; rejected(output[0]); view->multiDeviceData = false;
+        }
+        input.Resize({rows, hidden - 32}); rejected(output[0]); input.Resize({rows, hidden});
+        rejected(input); rejected(ids[0]); rejected(scores[0]);
+        for(int l=0;l<2;++l){
+            handles[l]=FastllmCudaCreateNativeMoeFullGraph(l?output[0]:input,ids[l],scores[l],output[l],
+                weights[l].data(),weights[l].size(),l,nullptr,&children[l]);
+            Check(handles[l]&&children[l],"verifier mailbox creation");}
+        Cuda(cudaGraphDestroy(shared));
+        Check(FastllmCudaNativeMoeGraphOwner(weights[0].data(),weights[0].size(),rows) ==
+              FastllmCudaNativeMoeGraphOwner(weights[1].data(),weights[1].size(),rows), "draft owner mismatch");
+        Check(!FastllmCudaNativeMoeGraphOwner(weights[0].data(),weights[0].size(),33), "unbounded graph rows");
+        Check(FastllmCudaGraphBeginCapture(), "draft parent capture");
+        for (auto child : children) Check(FastllmCudaGraphAppendChild(child), "draft child append");
+        Check(FastllmCudaGraphEndCapture(&graph), "draft parent end");
+        Check(FastllmCudaGraphInstantiate(graph,&exec), "draft parent instantiate");
+        Check(FastllmCudaCreateNativeMoeReplayGraph(graph,handles,2,&untimed),"verifier untimed compose");
+        for(int pass=0;pass<24;++pass){
+            std::vector<uint16_t> reference(rows*hidden),result(reference.size());
+            for(size_t i=0;i<reference.size();++i)reference[i]=Float32ToBFloat16RNEBits(float(int((i*7+pass*13)%61)-30)/32);
+            Cuda(cudaMemcpy(input.cudaData,reference.data(),reference.size()*2,cudaMemcpyHostToDevice));
+            for(int l=0;l<2;++l){
+                std::vector<int32_t> selected(rows*topk),none(selected.size(),-1);
+                std::vector<float> scale(selected.size());
+                for(size_t i=0;i<selected.size();++i){selected[i]=(pass*7+l*3+(i%topk)*5+i/topk)%experts;scale[i]=i%5==0?0.f:float(i%4+1)/32;}
+                if(pass%3==1)for(int row=0;row<rows;++row)selected[row*topk+1]=selected[row*topk+2];
+                Cuda(cudaMemcpy(ids[l].cudaData,selected.data(),selected.size()*4,cudaMemcpyHostToDevice));
+                Cuda(cudaMemcpy(scores[l].cudaData,scale.data(),scale.size()*4,cudaMemcpyHostToDevice));
+            }
+            FastllmCudaMoeRouteScope phase(FastllmMoeRoutePhase::Draft);
+            scope=FastllmCudaBeginMoeDecode(weights[0].data(),weights[0].size(),topk);Check(scope,"verifier scope");
+            Check(FastllmCudaLaunchNativeMoeFullGraph(pass%3==0?exec:untimed,handles,2,pass%3==0),"verifier launch");
+            FastllmCudaEndMoeDecode(scope);
+            for(int l=0;l<2;++l){Cuda(cudaMemcpy(result.data(),output[l].cudaData,result.size()*2,cudaMemcpyDeviceToHost));
+                std::vector<float> actual(result.size());for(size_t i=0;i<result.size();++i)actual[i]=BfValue(result[i]);
+                // CPU Q8_0 and CUDA Q8_1 use different activation rounding.
+                // Check the scheduled split against both independent expert
+                // oracles, not an all-CPU sum that assumes identical formats.
+                std::vector<uint16_t> source(rows*hidden);
+                Cuda(cudaMemcpy(source.data(),l?output[0].cudaData:input.cudaData,source.size()*2,cudaMemcpyDeviceToHost));
+                std::vector<int32_t> selected(rows*topk),none(rows*topk,-1);
+                std::vector<float> scale(rows*topk),cpu(rows*topk*hidden),gpu(cpu.size());
+                Cuda(cudaMemcpy(selected.data(),ids[l].cudaData,selected.size()*4,cudaMemcpyDeviceToHost));
+                Cuda(cudaMemcpy(scale.data(),scores[l].cudaData,scale.size()*4,cudaMemcpyDeviceToHost));
+                NumasMoeVerifyExperts(source.data(),cpu.data(),rows,weights[l].data(),weights[l].size(),
+                    selected.data(),none.data(),scale.data(),topk,l,.8f,true,32);
+                Data oracleInput(BFLOAT16,{rows,hidden},CPU,source.data());oracleInput.ToDevice(CUDA,{0},true);
+                for(int k=0;k<topk;++k){
+                    std::vector<int32_t> chosen(rows);std::vector<float> scales(rows);
+                    for(int row=0;row<rows;++row){chosen[row]=selected[row*topk+k];scales[row]=scale[row*topk+k];}
+                    Data index(INT32,{rows,1},CPU,chosen.data()),score(FLOAT32,{rows,1},scales);
+                    index.ToDevice(CUDA,{0},true);score.ToDevice(CUDA,{0},true);
+                    Data gate,activation,scratch,ref;
+                    auto &resident=registeredFixtures[l].gpu;
+                    Check(FastllmCudaMergeMOEV41GGUFResident(oracleInput,gate,activation,scratch,ref,
+                        resident.data(),resident.size(),index,score,0,.8f),"draft CUDA oracle rejected");
+                    const auto partial=Read(ref);
+                    for(int row=0;row<rows;++row)std::copy_n(partial.data()+row*hidden,hidden,gpu.data()+(row*topk+k)*hidden);
+                }
+                for(int row=0;row<rows;++row){
+                    double best=1e30;
+                    for(int split=0;split<(1<<topk);++split){
+                        double error=0,norm=0;
+                        for(int c=0;c<hidden;++c){
+                            float sum=0;
+                            for(int k=0;k<topk;++k)sum+=((split>>k)&1?gpu:cpu)[(row*topk+k)*hidden+c];
+                            const float ref=BfValue(Float32ToBFloat16RNEBits(sum));
+                            Check(std::isfinite(actual[row*hidden+c]),"nonfinite draft output");
+                            error+=std::pow(double(actual[row*hidden+c])-ref,2);norm+=double(ref)*ref;
+                        }
+                        best=std::min(best,std::sqrt(error/std::max(norm,1e-30)));
+                    }
+                    if(best>.003163)printf("draft rows=%d pass=%d layer=%d row=%d split L2=%g\n",rows,pass,l,row,best);
+                    Check(best<=.003163,"draft mailbox differs from every CPU/GPU split oracle");
+                }
+                ++checks;}
+
+        }
+        FastllmCudaGraphExecDestroy(untimed);FastllmCudaGraphExecDestroy(exec);FastllmCudaGraphDestroy(graph);
+        for(auto handle : handles) FastllmCudaReleaseNativeMoeFullGraph(handle);
+    }
+    std::printf("DRAFT_MAILBOX_GRAPH_PASS %d dependent layer checks; rows 3/5/7/8/16/32\n",checks);
+}
+
 static void CheckRegistration() {
     FastllmCudaSetDevice(0); EnableAMX(false);
     std::vector<FastllmCudaMoeCacheLayer> layers;
@@ -923,6 +1035,52 @@ int main(int argc, char **argv) {
         }
         hybridTest = mode == "--hybrid";
         cacheTest = mode == "--cache";
+        if (mode == "--q8-mailbox") {
+#ifdef USE_NUMAS
+            EnableAMX(false); cacheTest=true; SetCudaGraph(true);
+            for(int layer=0;layer<2;++layer) Case(GGML_TYPE_Q8_0,GGML_TYPE_Q8_0,512,256,0,false);
+            std::vector<FastllmCudaMoeCacheLayer> layers;
+            size_t stride=0;
+            for(auto &f:registeredFixtures){
+                layers.push_back({f.host.data(),int(f.host.size()),true,.8f});
+                stride=std::max(stride,((f.host[2]->GetBytes()+15)&~size_t(15))+f.host[3]->GetBytes());
+            }
+            SetMoeCudaCacheBytes(16*((stride+127)&~size_t(127)));
+            Check(FastllmCudaPrepareMoeCache(layers.data(),layers.size(),[&]{
+                for(auto &f:registeredFixtures)for(size_t i=2;i<f.host.size();++i)
+                    RegisterNumas(f.host[i],i%2?"linear":"linearSwiglu");
+            }),"draft Q8 registration failed");
+            std::vector<Data *> tables[2]{registeredFixtures[0].host,registeredFixtures[1].host};
+            Check(FastllmCudaSetMoeCacheBudgetFraction(tables[0].data(),tables[0].size(),.125),
+                  "draft tiny-cache budget share rejected");
+            Check(FastllmCudaNativeMoeGraphOwner(tables[0].data(),tables[0].size(),7),
+                  "cold draft preflight requires an already active policy");
+            Data cold(BFLOAT16,{1,512});cold.Allocate(0.f);cold.ToDevice(CUDA,{0},true);
+            int32_t coldIds[3]={0,1,2};
+            Data index(INT32,{1,3},CPU,coldIds),score(FLOAT32,{1,3},std::vector<float>(3,.25f)),out;
+            index.ToDevice(CUDA,{0},true);score.ToDevice(CUDA,{0},true);
+            Check(!FastllmCudaMergeMOEHybrid(cold,index,score,out,tables[0].data(),tables[0].size(),0),
+                  "tiny cache admitted unsafe legacy demand refill");
+            cold.Resize({3,512});cold.Allocate(0.f);
+            int32_t batchIds[9]={0,1,2,1,2,3,2,3,4};
+            index.CopyFrom(Data(INT32,{3,3},CPU,batchIds));index.ToDevice(CUDA,{0},true);
+            score.CopyFrom(Data(FLOAT32,{3,3},std::vector<float>(9,.25f)));score.ToDevice(CUDA,{0},true);
+            Check(!FastllmCudaMergeMOEHybrid(cold,index,score,out,tables[0].data(),tables[0].size(),0),
+                  "tiny cache admitted unsafe eager batch admission");
+            CheckDraftMailbox(tables);
+            registeredFixtures.clear();
+            return 0;
+#else
+            return 77;
+#endif
+        }
+        if (mode == "--q8-draft") {
+            batchGridTest = cacheTest = true;
+            const int checks = Case(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0,
+                                    5120, 2304, devices > 1 ? 1 : 0, true);
+            printf("PASS: V4.1 Q8_0 draft (%d checks, %d changed-input graph replays)\n", checks, graphReplays);
+            return 0;
+        }
         if (mode == "--batch-grid") {
             batchGridTest = cacheTest = true;
             int checks = 0;

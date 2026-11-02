@@ -89,6 +89,27 @@ curl http://127.0.0.1:8007/health
 
 正常返回 `status: "ok"`、`backend: "native_cpp_cuda"` 和 `torch_loaded: false`。
 
+### 可选：多卡推理
+
+编译时需要已有的 NCCL 头文件和动态库，CMake 会自动查找。非标准安装位置可在
+配置命令中指定 `FASTLLM_NCCL_INCLUDE_DIR` 和 `FASTLLM_NCCL_LIBRARY`；不启用多卡时
+无需 NCCL。
+
+将启动命令中的 `CUDA_VISIBLE_DEVICES=0` 改为 `CUDA_VISIBLE_DEVICES=0,1`，并把
+`--device 0` 替换为 `--devices 0,1`。设备编号均相对于 CUDA 可见设备列表。
+网页和 HTTP 请求格式保持不变。
+
+每张卡由一个推理线程执行，DiT 和 PixelUMM 共用这组线程及通信器。
+DiT 按图像 token 切分计算，各卡保留完整权重和文本分支，每层聚合当前图像 K/V，
+完整图像输出只在 DiT 末尾聚合；每卡不足 64 个图像 token 时保留完整计算。
+PixelUMM 按注意力头和 FFN 通道切分权重。文本编码和采样器在第一张卡执行，
+场景历史由各卡独立持有，取消请求不会修改已提交的历史。
+
+BF16 模式保留 FP32 GEMM 累加；PixelUMM 使用 BF16 部分输出及归约。
+需要全 FP32 对照时仍可使用 `--precision fp32`。双卡使用 `--devices 0,1`，
+四卡使用 `--devices 0,1,2,3`，同时设置对应的 `CUDA_VISIBLE_DEVICES`。
+单卡继续使用原来的 `--device` 配置。
+
 ### 可选：接入 Nomas-PE 场景扩写
 
 准备 HY-Nomas 发布的 `PE/` 完整权重目录，并下载官方仓库的提示词文件（不需要安装官方 Python 推理环境）：

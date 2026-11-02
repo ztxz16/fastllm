@@ -2354,10 +2354,10 @@ __device__ __forceinline__ void FastllmGemvBF16FP8E4M3RegisterRowsBody(
 #pragma unroll
     for (int x = 0; x < PART; x++) partial[x] = 0.0f;
     union_bf16_4_fp8 regA;
-    // Hopper batch-one projections benefit from overlapping address/decode
+    // Hopper and SM120 batch-one projections benefit from overlapping address/decode
     // work across consecutive iterations. Preserve every lane's FMA order
     // and the compensated reduction; other architectures keep the old loop.
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 900
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 900 || __CUDA_ARCH__ == 1200)
 #pragma unroll (PART == 1 ? 4 : 1)
 #endif
     for (int i = tid * 4; i < m; i += 256) {
@@ -2794,6 +2794,12 @@ bool FastllmCudaBFloat16MatMulFP8E4M3(const fastllm::Data &input, fastllm::Data 
     // Measured crossover: retain GEMV for one row and cuBLAS for large M.
     if (n > 1 && n <= 64 && bias.dims.empty() && FastllmCudaTryMarlinBFloat16MatMulFP8E4M3(
             cudaInput, weight, cudaOutput, n, m, k)) {
+        FastllmCudaFinishInput(input, cudaInput);
+        FastllmCudaFinishOutput(output, cudaOutput);
+        return true;
+    }
+
+    if (bias.dims.empty() && fastllm::TryCudaTritonSmallProjection(input, weight, output)) {
         FastllmCudaFinishInput(input, cudaInput);
         FastllmCudaFinishOutput(output, cudaOutput);
         return true;

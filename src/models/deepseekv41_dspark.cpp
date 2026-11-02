@@ -44,7 +44,9 @@
 
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
+#include "fastllm-cuda-graph-workspace.h"
 #include "devices/cuda/fastllm-cuda-dspark.h"
+#include "devices/cuda/fastllm-draft-head.cuh"
 #include "devices/cuda/fastllm-fp8-auxiliary.h"
 #include "devices/cuda/fastllm-v41-decode.cuh"
 #include "devices/cuda/naive-n05-cuda.cuh"
@@ -73,10 +75,13 @@ namespace fastllm {
         bool disabled = false, parallelExperts = true, deviceInputs = false, parallelAttention = false;
         bool sampledMarkov = false;
         float temperature = 1.0f;
+        int topK = 0;
+        float topP = 1.0f;
         std::vector<int> devices;
         std::vector<void*> cachePointers;
         Data input, preMix, indices, position, headHidden, normalized, logits;
         Data markovTokens, markovValues, markovIndices, markovEmbeds;
+        Data samplingWorkspace;
         std::shared_ptr<void> markovWorkspace;
         // The graph optimizer may run shared and routed branches concurrently.
         // Their scratch must remain disjoint throughout every replay.
@@ -84,6 +89,13 @@ namespace fastllm {
             Data output, gateup, activated, floatOutput;
         };
         std::vector<SharedExpertWorkspace> sharedExperts;
+        struct RoutedExpertWorkspace {
+            Data input, index, score, output;
+            void *graph = nullptr, *exec = nullptr;
+        };
+        std::vector<RoutedExpertWorkspace> routedExperts;
+        std::vector<void *> moeHandles;
+        bool hybridExperts = false;
         // Resolve immutable packed weights during warmup and keep them alive
         // until ClearGraphs has destroyed every graph referencing them.
         std::map<int, Data> packedQkvWeights;
@@ -102,6 +114,13 @@ namespace fastllm {
                 if (i < starts.size() && starts[i]) FastllmCudaEventDestroy(starts[i]);
                 if (i < ends.size() && ends[i]) FastllmCudaEventDestroy(ends[i]);
             }
+            // Parent executables must die before their native child buffers.
+            for (size_t i = 0; i < routedExperts.size(); ++i) {
+                FastllmCudaSetDevice(devices.front());
+                if (routedExperts[i].exec) FastllmCudaGraphExecDestroy(routedExperts[i].exec);
+                if (i < moeHandles.size()) FastllmCudaReleaseNativeMoeFullGraph(moeHandles[i]);
+            }
+            routedExperts.clear(); moeHandles.clear();
             FastllmCudaGraphMemoryPoolRelease(reserved);
             graphs.clear(); execs.clear(); starts.clear(); ends.clear(); reserved.clear();
             FastllmCudaSetDevice(original);
@@ -123,8 +142,10 @@ namespace fastllm {
                 } else {
                     for (size_t i = 0; i < state.devices.size(); ++i) {
                         FastllmCudaSetDevice(state.devices[i]);
-                        AssertInFastLLM(FastllmCudaGraphLaunch(state.execs[i]),
-                                        "DeepSeekV41 DSpark graph launch failed.");
+                        const bool ok = state.moeHandles.empty() ? FastllmCudaGraphLaunch(state.execs[i]) :
+                            FastllmCudaLaunchNativeMoeFullGraph(state.execs[i], state.moeHandles.data(),
+                                                              int(state.moeHandles.size()));
+                        AssertInFastLLM(ok, "DeepSeekV41 DSpark graph launch failed.");
                     }
                 }
                 FastllmCudaSetDevice(root);
@@ -134,6 +155,22 @@ namespace fastllm {
             body(); // Resolve weights, collective buffers and all kernel workspaces.
             if (state.disabled) return true; // Warmup already produced valid eager outputs.
             const int count = state.devices.size();
+            std::vector<size_t> allocations;
+            if (count == 1) {
+                // Resolve persistent weights first, then record only transient
+                // work. Eager reuse alone does not provision every graph buffer.
+                FastllmCudaAllocationRecorder record(&allocations);
+                body();
+            }
+            if (state.disabled) return true;
+            if (count == 1) {
+                FastllmCudaSyncDevice(root);
+                if (!FastllmCudaReserveGraphWorkspace(allocations)) {
+                    state.disabled = true;
+                    fprintf(stderr, "[Fastllm] DSpark graph workspace unavailable; using eager.\n");
+                    return true; // Warmup has already produced the requested outputs.
+                }
+            }
             state.graphs.assign(count, nullptr); state.execs.assign(count, nullptr);
             state.starts.assign(count, nullptr); state.ends.assign(count, nullptr);
             bool ok = true;
@@ -298,10 +335,15 @@ namespace fastllm {
 #endif
 
         void DsHcApplyPreNorm(const Data &input, const Data &pre, Data &normWeight,
-                             float eps, Data &scratch, Data &output) {
+                             float eps, Data &scratch, Data &output, bool retainHidden = false) {
 #ifdef USE_CUDA
             if (DsFusedHcEnabled() &&
-                FastllmCudaDeepSeekV41HcPreNorm(input, pre, normWeight, eps, output)) return;
+                FastllmCudaDeepSeekV41HcPreNorm(input, pre, normWeight, eps, output)) {
+                // Confidence consumes the pre-normalization BF16 hidden state.
+                // The fused norm only writes output; materialize it on demand.
+                if (retainHidden) DsHcApplyPre(input, pre, scratch);
+                return;
+            }
 #endif
             DsHcApplyPre(input, pre, scratch);
             DsRMSNormBF16(scratch, normWeight, eps, output);
@@ -1283,6 +1325,7 @@ namespace fastllm {
     }
 
     void DeepSeekV41Model::DsparkProjectHead(Data &input, Data &output, bool persistent) {
+        if (v41DsparkTpDevices.empty() && TryBFloat16HeadLinear(input, output)) return;
 #ifdef USE_CUDA
         if (persistent && input.dataType == DataType::BFLOAT16 && !v41DsparkTpDevices.empty() &&
             !quantizedLinearNames.count("head.weight")) {
@@ -1884,7 +1927,11 @@ namespace fastllm {
             }
         }
 #endif
+        const bool pipelineCommit = v41DsparkTpDevices.empty() &&
+            deviceMap.size() > 1;
         for (int layer = 0; layer < block_cnt; layer++) {
+            // Eager fallback and partially captured PP stages retain local KV.
+            if (pipelineCommit && !scratch.commitKV) ApplyDeviceMap(deviceMap, layer + 1, block_cnt);
             DeepSeekV41LayerCache &cache = state.layers[layer];
             // 1) 滑窗环形缓冲：只写入被接受的行
             if (!batchedWindows && layer < (int)scratch.windowKV.size() &&
@@ -2049,10 +2096,10 @@ namespace fastllm {
             caches.push_back(layer.windowKV.cudaData);
             cacheReady &= layer.windowKV.dataDevice == DataDevice::CUDA && layer.windowKV.cudaData;
         }
-        if (DsDraftGraphEnabled() && !v41DsparkTpDevices.empty() &&
-            rows <= 8 && cacheReady && combined.dataDevice == DataDevice::CUDA && contextLock.try_lock()) {
+        if (DsDraftGraphEnabled() && rows <= v41DsparkBlockSize + 1 && cacheReady &&
+            combined.dataDevice == DataDevice::CUDA && contextLock.try_lock()) {
             auto &slot = dspark.contextWorkspaces[rows];
-            const std::vector<int> devices{v41DsparkTpDevices.front()};
+            const std::vector<int> devices{v41DsparkTpDevices.empty() ? FastllmCudaGetDevice() : v41DsparkTpDevices.front()};
             if (slot && (slot->devices != devices || slot->cachePointers != caches)) slot.reset();
             if (!slot) {
                 slot = std::make_shared<DeepSeekV41DsparkWorkspace>();
@@ -2201,15 +2248,36 @@ namespace fastllm {
         };
 
         const std::string last = "mtp." + std::to_string(v41DsparkLayers - 1);
+        const auto confidenceIt = weight.weight.find(last + ".confidence_head.proj.weight");
+        Data *confidenceWeight = v41DsparkConfidenceThreshold > 0.0f && confidenceIt != weight.weight.end()
+            ? &confidenceIt->second : nullptr;
         const bool randomDraft = config.top_k > 1;
         Data &markovEmbedWeight = weight[last + ".markov_head.embed.weight"];
         Data &markovHeadWeight = weight[last + ".markov_head.head.weight"];
         Data eagerHeadHidden, eagerNormed, eagerMarkov;
         DeepSeekV41DsparkWorkspace *graphState = nullptr;
+        bool residentDraft = false, hybridDraft = false;
 #ifdef USE_CUDA
-        // A full window has a fixed gather width. Short prefixes, CPU routing,
-        // reference math and unsupported expert layouts keep the eager path.
+        // Device-resident experts can capture on one GPU as well as TP.
+        // Partial windows use uploaded indices keyed by their gather width.
         std::unique_lock<std::mutex> graphLock(v41CudaGraphMutex, std::defer_lock);
+        const std::vector<int> graphDevices = v41DsparkTpDevices.empty()
+            ? std::vector<int>{FastllmCudaGetDevice()} : v41DsparkTpDevices;
+        residentDraft = v41DsparkTpDevices.empty();
+        if (residentDraft) for (auto &table : v41DsparkMoeWeights)
+            residentDraft &= FastllmCudaMoeCacheFullyResident(table.data(), int(table.size()));
+        // Each native child must belong to the same serial cache owner. TP/EP
+        // continues through its persistent packet path; unsupported layouts
+        // stay eager. Do not reinterpret a partial cache as full residency.
+        if (!residentDraft && v41DsparkTpDevices.empty() && DsDraftGraphEnabled() && GetCudaSharedExpert()) {
+            void *owner = nullptr;
+            hybridDraft = !v41DsparkMoeWeights.empty();
+            for (auto &table : v41DsparkMoeWeights) {
+                void *next = FastllmCudaNativeMoeGraphOwner(table.data(), int(table.size()), block);
+                hybridDraft &= next && (!owner || owner == next);
+                owner = next;
+            }
+        }
         const int vocab = weight["head.weight"].dims[0];
         const bool fusedMarkovAllowed = !config.tool_call_name_constraint_enabled &&
             !config.tool_call_parameter_name_constraint_enabled && !DsEnvFlag("FASTLLM_DSPARK_DISABLE_FUSED_MARKOV");
@@ -2217,9 +2285,9 @@ namespace fastllm {
             return !w.multiDeviceData && w.dims.size() == 2 && w.strides.size() == 2 &&
                 w.strides[0] == w.dims[1] && w.strides[1] == 1;
         };
-        // Filtered and constrained proposals retain the general sampler. The
-        // full-support path saves its actual conditional q for rejection.
-        const bool sampledMarkov = randomDraft && config.top_k >= vocab && config.top_p == 1.0f &&
+        // Device sampling retains the filtered conditional q for rejection.
+        const bool sampledMarkov = randomDraft && std::isfinite(config.top_p) &&
+            config.top_p > 0 && config.top_p <= 1 &&
             std::isfinite(config.temperature) && config.temperature > 0.0f &&
             denseMarkovWeight(markovEmbedWeight) && denseMarkovWeight(markovHeadWeight);
         auto prepareProposalProbs = [&](int device, int vocabulary) {
@@ -2236,16 +2304,16 @@ namespace fastllm {
             markovEmbedWeight.dataType == markovHeadWeight.dataType &&
             (markovEmbedWeight.dataType == DataType::BFLOAT16 ||
              markovEmbedWeight.dataType == DataType::FLOAT16 || markovEmbedWeight.dataType == DataType::FLOAT32);
-        const bool graphEligible = graphMarkov && DsDraftGraphEnabled() && valid == window_size && block <= 8 &&
+        const bool graphEligible = graphMarkov && DsDraftGraphEnabled() &&
             fusedMarkovAllowed && (!randomDraft || sampledMarkov) &&
             v41MoeCudaGraphCompatible &&
-            v41DsparkTpDevices.size() > 1 &&
+            (residentDraft || hybridDraft || v41DsparkTpDevices.size() > 1) &&
             !DsEnvFlag("FASTLLM_DSV41_DISABLE_CUDA_ROUTE") && !DsEnvFlag("FASTLLM_DISABLE_NCCL");
         if (graphEligible && randomDraft) prepareProposalProbs(FastllmCudaGetDevice(), vocab);
         const Data &embedding = weight["embed.weight"];
-        const bool deviceInputs = graphEligible && embedding.dataType == DataType::BFLOAT16 &&
+        const bool deviceInputs = graphEligible && valid == window_size && embedding.dataType == DataType::BFLOAT16 &&
             embedding.dataDevice == DataDevice::CUDA && embedding.cudaData && !embedding.multiDeviceData &&
-            !embedding.dataDeviceIds.empty() && embedding.dataDeviceIds.front() == v41DsparkTpDevices.front() &&
+            !embedding.dataDeviceIds.empty() && embedding.dataDeviceIds.front() == graphDevices.front() &&
             embedding.dims.size() == 2 && embedding.dims[1] == dim &&
             embedding.strides.size() == 2 && embedding.strides[0] == dim && embedding.strides[1] == 1 &&
             anchorToken >= 0 && anchorToken < embedding.dims[0] &&
@@ -2256,18 +2324,22 @@ namespace fastllm {
         if (deviceInputs) cachePointers.push_back(embedding.cudaData);
         if (sampledMarkov) cachePointers.push_back(dspark.proposalProbs.cudaData);
         if (graphEligible && (deviceInputs || embedded.dataDevice == DataDevice::CUDA) && graphLock.try_lock()) {
-            if (dspark.workspace && (dspark.workspace->devices != v41DsparkTpDevices ||
+            if (dspark.workspace && (dspark.workspace->devices != graphDevices ||
                 dspark.workspace->block != block || dspark.workspace->width != width ||
                 dspark.workspace->deviceInputs != deviceInputs ||
                 dspark.workspace->sampledMarkov != sampledMarkov ||
-                (sampledMarkov && dspark.workspace->temperature != config.temperature) ||
+                (sampledMarkov && (dspark.workspace->temperature != config.temperature ||
+                    dspark.workspace->topK != config.top_k || dspark.workspace->topP != config.top_p)) ||
                 dspark.workspace->cachePointers != cachePointers)) dspark.workspace.reset();
             if (!dspark.workspace) {
                 dspark.workspace = std::make_shared<DeepSeekV41DsparkWorkspace>();
                 auto &w = *dspark.workspace;
-                w.devices = v41DsparkTpDevices; w.block = block; w.width = width;
+                w.devices = graphDevices; w.block = block; w.width = width;
+                w.hybridExperts = hybridDraft;
+                if (hybridDraft) w.parallelExperts = false;
                 w.deviceInputs = deviceInputs;
                 w.sampledMarkov = sampledMarkov; w.temperature = config.temperature;
+                w.topK = config.top_k; w.topP = config.top_p;
                 w.cachePointers = cachePointers;
             }
             if (!dspark.workspace->disabled) {
@@ -2276,7 +2348,7 @@ namespace fastllm {
                 auto upload = [&](Data &dst, DataType type, const std::vector<int> &dims, const void *data) {
                     if (dst.dims.empty()) {
                         dst.dataType = type; dst.UpdateUnitSize(); dst.Resize(dims);
-                        dst.ToDevice(DataDevice::CUDA, {v41DsparkTpDevices.front()}, false); dst.Allocate();
+                        dst.ToDevice(DataDevice::CUDA, {graphDevices.front()}, false); dst.Allocate();
                     }
                     FastllmCudaCopyFromHostToDevice(dst.cudaData, const_cast<void*>(data), dst.GetBytes());
                 };
@@ -2289,13 +2361,26 @@ namespace fastllm {
                     if (graphState->markovTokens.dims.empty()) {
                         Data &d = graphState->markovTokens;
                         d.dataType = DataType::INT32; d.UpdateUnitSize(); d.Resize({block + 1});
-                        d.ToDevice(DataDevice::CUDA, {v41DsparkTpDevices.front()}, false); d.Allocate();
+                        d.ToDevice(DataDevice::CUDA, {graphDevices.front()}, false); d.Allocate();
                     }
                     FastllmCudaCopyFromHostToDevice(graphState->markovTokens.cudaData, &anchorToken, sizeof(int));
                 }
                 markovEmbedWeight.ToDevice(DataDevice::CUDA);
                 markovHeadWeight.ToDevice(DataDevice::CUDA);
             }
+        }
+#endif
+#if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
+        FastllmCudaMoeRouteScope draftRouteScope(FastllmMoeRoutePhase::Draft);
+        HybridMoeDecodeStep draftStep;
+        // Eager and captured drafts use the same frequency/staging policy.
+        // Keep the scope through all draft layers and close it after sampling.
+        if (v41DsparkTpDevices.empty() && !v41DsparkMoeWeights.empty()) {
+            auto &table = v41DsparkMoeWeights.front();
+            draftStep.Begin(table.data(), int(table.size()), v41DsparkTopk);
+        }
+        if (graphState && graphState->hybridExperts && !draftStep) {
+            graphState->disabled = true; graphState = nullptr;
         }
 #endif
         if (!graphState) prepareInputs();
@@ -2350,7 +2435,7 @@ namespace fastllm {
                 }
                 bool parallelAttention = false;
 #ifdef USE_CUDA
-                if (graphState && qkvPrepared && graphState->deviceInputs) {
+                if (graphState && graphState->devices.size() > 1 && qkvPrepared && graphState->deviceInputs) {
                     parallelAttention = DsParallelAttention(
                         graphState->devices, qQuant, kv, dspark.layers[stage].windowKV, attentionIndices,
                         graphState->position, weight[pre + ".attn.wq_b.weight"],
@@ -2523,13 +2608,38 @@ namespace fastllm {
                         SelectSpecialWeightDevice(pre + ".ffn.experts.0.gateup.weight", layerId));
                     bool hybrid = false;
 #if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
-                    if (hasSharedExpertOut &&
+                    if (graphState && graphState->hybridExperts && !hasSharedExpertOut)
+                        graphState->disabled = true;
+                    if (graphState && graphState->hybridExperts && hasSharedExpertOut) {
+                        auto &state = *graphState;
+                        state.routedExperts.resize(v41DsparkLayers);
+                        state.moeHandles.resize(v41DsparkLayers, nullptr);
+                        auto &routed = state.routedExperts[stage];
+                        routed.input.CopyFrom(ffnInput);
+                        routed.index.CopyFrom(expertIndex);
+                        routed.score.CopyFrom(expertScore);
+                        if (!state.moeHandles[stage] && !dsparkCapturing) {
+                            state.moeHandles[stage] = FastllmCudaCreateNativeMoeFullGraph(
+                                routed.input, routed.index, routed.score, routed.output,
+                                moeWeights.data(), int(moeWeights.size()), layerId, nullptr, &routed.graph);
+                            if (state.moeHandles[stage] &&
+                                !FastllmCudaGraphInstantiate(routed.graph, &routed.exec)) state.disabled = true;
+                            if (!state.moeHandles[stage]) state.disabled = true;
+                        }
+                        if (!state.disabled) {
+                            AssertInFastLLM(dsparkCapturing ? FastllmCudaGraphAppendChild(routed.graph) :
+                                FastllmCudaLaunchNativeMoeFullGraph(routed.exec, &state.moeHandles[stage], 1),
+                                "DeepSeekV41 DSpark native MoE graph failed.");
+                            ffnOut.CopyFrom(routed.output);
+                            hybrid = true;
+                        }
+                    }
+                    if (!hybrid && hasSharedExpertOut &&
                         ffnInput.dataDevice == DataDevice::CUDA && ffnInput.dims.size() == 2 &&
-                        ffnInput.dims[0] < 32 &&
+                        (ffnInput.dims[0] < 32 || FastllmCudaMoeCacheFullyResident(moeWeights.data(), int(moeWeights.size()))) &&
                         FastllmCudaCanRunMoeHybrid(moeWeights.data(), (int)moeWeights.size())) {
                         expertIndex.ToDevice(DataDevice::CUDA, ffnInput.dataDeviceIds, true);
                         expertScore.ToDevice(DataDevice::CUDA, ffnInput.dataDeviceIds, true);
-                        FastllmCudaMoeRouteScope routeScope(FastllmMoeRoutePhase::Draft);
                         hybrid = fastllm::RunHybridMoe(ffnInput, expertIndex, expertScore, ffnOut,
                             moeWeights.data(), (int)moeWeights.size(), layerId);
                     }
@@ -2541,7 +2651,7 @@ namespace fastllm {
                                   quantizedLinearNames.count(pre + ".ffn.experts.0.w1.weight") ? 32 : 128,
                                   quantizedLinearNames.count(pre + ".ffn.shared_experts.w1.weight") != 0);
                     // Only the persistent packet path supplies graph-safe EP buffers.
-                    if (graphState && !ffnOut.cudaDataBorrowed) graphState->disabled = true;
+                    if (graphState && !residentDraft && !graphState->hybridExperts && !ffnOut.cudaDataBorrowed) graphState->disabled = true;
                     ApplyDsparkDevice();
                     if (hasSharedExpertOut) {
 #ifdef USE_CUDA
@@ -2570,12 +2680,12 @@ namespace fastllm {
             DsDraftTimingSlot().layers = DsElapsed(layersStart);
 
             DsHcApplyPreNorm(*curHidden, layerPreMix, weight[last + ".norm.weight"],
-                             rms_norm_eps, headHidden, normed);
+                             rms_norm_eps, headHidden, normed, confidenceWeight != nullptr);
             // ---- head：mtp.<last>.norm + 共享 lm_head ----
             const double headStart = DsTick();
             bool headProjected = false, shardedMarkov = false;
 #ifdef USE_CUDA
-            if (graphState && !randomDraft && normed.dataType == DataType::BFLOAT16 &&
+            if (graphState && !v41DsparkTpDevices.empty() && !randomDraft && normed.dataType == DataType::BFLOAT16 &&
                 !quantizedLinearNames.count("head.weight")) {
                 ApplyDsparkDevice(); FastllmMultiCudaSetDevice(v41DsparkTpDevices);
                 MultiCudaDsparkMarkovRequest request{markovEmbedWeight, markovHeadWeight,
@@ -2585,9 +2695,18 @@ namespace fastllm {
                 shardedMarkov = request.completed;
             }
 #endif
+#if defined(USE_CUDA) && defined(FASTLLM_ENABLE_CUTLASS_MXFP8_SM120)
+            // This entry is draft-only. DsparkProjectHead also projects target
+            // verification logits, which must retain the original BF16 head.
+            if (!headProjected && v41DsparkTpDevices.empty() &&
+                !DsEnvFlag("FASTLLM_DSV41_REFERENCE_MATH")) {
+                headProjected = FastllmCudaTryFp8DraftHead(normed, weight["head.weight"], logits);
+            }
+#endif
             if (!headProjected) {
                 if (v41DsparkTpDevices.empty()) {
-                    Linear(normed, weight["head.weight"], *GetEmptyData(), logits);
+                    if (!TryBFloat16HeadLinear(normed, logits))
+                        Linear(normed, weight["head.weight"], *GetEmptyData(), logits);
                 } else {
                     DsparkProjectHead(normed, logits, true);
                 }
@@ -2595,12 +2714,12 @@ namespace fastllm {
             if (!shardedMarkov) ToDataType(logits, DataType::FLOAT32);
 
             DsDraftTimingSlot().head = DsElapsed(headStart);
-            if (graphState && !v41DsparkHeadWorkspace) graphState->disabled = true;
+            if (graphState && !v41DsparkTpDevices.empty() && !v41DsparkHeadWorkspace) graphState->disabled = true;
 #ifdef USE_CUDA
             if (graphState && !shardedMarkov) {
-                const bool ok = randomDraft ? FastllmCudaDeepSeekV41MarkovSampleDevice(logits,
-                    markovEmbedWeight, markovHeadWeight, block, config.temperature,
-                    graphState->markovTokens, dspark.proposalProbs, graphState->markovValues, markovAll) :
+                const bool ok = randomDraft ? FastllmCudaDeepSeekV41MarkovFilteredSampleDevice(logits,
+                    markovEmbedWeight, markovHeadWeight, block, config.temperature, config.top_k, config.top_p,
+                    graphState->markovTokens, dspark.proposalProbs, markovAll, graphState->samplingWorkspace) :
                     FastllmCudaDeepSeekV41MarkovChainDevice(logits, markovEmbedWeight, markovHeadWeight,
                     block, graphState->markovTokens, graphState->markovValues, graphState->markovIndices, markovAll);
                 AssertInFastLLM(ok,
@@ -2638,17 +2757,18 @@ namespace fastllm {
             DsDraftTimingSlot().markovFused = true;
         }
         if (!fusedMarkov && fusedMarkovAllowed && logits.dataDevice == DataDevice::CUDA &&
-            (!randomDraft || (sampledMarkov && graphMarkov && block <= 8))) {
+            (!randomDraft || (sampledMarkov && graphMarkov))) {
             if (!logits.dataDeviceIds.empty()) FastllmCudaSetDevice(logits.dataDeviceIds[0]);
             markovEmbedWeight.ToDevice(DataDevice::CUDA);
             markovHeadWeight.ToDevice(DataDevice::CUDA);
             if (randomDraft) {
-                Data tokenBuffer(DataType::INT32, {block + 1}), scratch;
+                Data tokenBuffer(DataType::INT32, {block + 1}), samplingWorkspace;
                 tokenBuffer.ToDevice(DataDevice::CUDA, {FastllmCudaGetDevice()}, false);
                 tokenBuffer.Allocate();
                 FastllmCudaCopyFromHostToDevice(tokenBuffer.cudaData, &anchorToken, sizeof(int));
-                fusedMarkov = FastllmCudaDeepSeekV41MarkovSampleDevice(logits, markovEmbedWeight,
-                    markovHeadWeight, block, config.temperature, tokenBuffer, dspark.proposalProbs, scratch, markovAll);
+                fusedMarkov = FastllmCudaDeepSeekV41MarkovFilteredSampleDevice(logits, markovEmbedWeight,
+                    markovHeadWeight, block, config.temperature, config.top_k, config.top_p,
+                    tokenBuffer, dspark.proposalProbs, markovAll, samplingWorkspace);
                 if (fusedMarkov) {
                     tokens.resize(block);
                     FastllmCudaCopyFromDeviceToHost(tokens.data(), (int*)tokenBuffer.cudaData + 1, block * sizeof(int));
@@ -2721,14 +2841,12 @@ namespace fastllm {
         // ---- confidence head：sigmoid(proj(cat(hidden, markov_embed))) ----
         const double confStart = DsTick();
         confidence.assign(block, 1.0f);
-        auto confIt = weight.weight.find(last + ".confidence_head.proj.weight");
-        if (confIt != weight.weight.end() && v41DsparkConfidenceThreshold > 0.0f &&
-            markovAll.dims.size() == 3) {
+        if (confidenceWeight && markovAll.dims.size() == 3) {
             Data hiddenFloat, markovFloat, features, confLogits;
             ToDataType(headHidden, hiddenFloat, DataType::FLOAT32);
             ToDataType(markovAll, markovFloat, DataType::FLOAT32);
             Cat(hiddenFloat, markovFloat, -1, features);
-            Linear(features, confIt->second, Data(), confLogits);
+            Linear(features, *confidenceWeight, Data(), confLogits);
             ToDataType(confLogits, DataType::FLOAT32);
             confLogits.ToDevice(DataDevice::CPU);
             const float *values = (const float*)confLogits.cpuData;

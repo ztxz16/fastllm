@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <atomic>
 
 // Fixed tensor addresses and launch shapes; request-dependent values are
 // uploaded separately before replay. The caller owns all tensor buffers.
@@ -8,11 +9,15 @@ struct FastllmV41FullDecodeConfig {
     int batch = 1, heads = 8, indexHeads = 32;
     int ratio = 0, window = 128, maxKeys = 131072, topK = 512;
     int blockSize = 64, candidateTopK = 32;
+    // Storage modes match QuantizeKV: 0 BF16, 1 FP8, 2/3 FP4.
+    int ringMode = 0, cmpMode = 0, indexMode = 0;
+    int ringRowBytes = 1024, cmpRowBytes = 1024, indexRowBytes = 256;
     int ropeDim = 64, originalSeqLen = 4096, betaFast = 32, betaSlow = 1;
     float ropeBase = 10000.f, ropeFactor = 1.f, normEps = 1e-6f, softmaxScale = 1.f;
     // A verification plan treats batch rows as one causal chunk. Ring writes
     // remain deferred until acceptance; the saved raw stream supports rollback.
     bool verifying = false;
+    bool vectorUnpack = false; // resolved from the existing unpack policy at plan creation
     bool kvSource = false, indexSource = false;
     bool writeCandidates = false, useCandidates = false;
 };
@@ -45,7 +50,7 @@ struct FastllmV41FullDecodeRequest {
 struct FastllmV41VerifyCommitLayer {
     const FastllmV41FullDecodeRequest *requests = nullptr;
     const void *savedKV = nullptr, *savedRawKV = nullptr, *savedRawScore = nullptr;
-    int window = 128, ratio = 0;
+    int window = 128, ratio = 0, ringRowBytes = 1024;
 };
 bool FastllmCudaV41CommitVerifiedPrefix(const FastllmV41VerifyCommitLayer *layers,
                                       int layerCount, int accepted, int forwarded);
@@ -56,6 +61,9 @@ bool FastllmCudaV41CommitVerifiedPrefix(const FastllmV41VerifyCommitLayer *layer
 void *FastllmCudaV41CreateFullDecode(const FastllmV41FullDecodeConfig &config,
                                      const FastllmV41FullDecodeBuffers &buffers);
 void FastllmCudaV41DestroyFullDecode(void *plan);
+// Before capture, share attention scratch between strictly sequential layers.
+// Different devices/layouts and unavailable backends keep independent storage.
+bool FastllmCudaV41ShareAttentionWorkspace(void *plan, void *source);
 bool FastllmCudaV41UploadFullDecode(void *plan, const FastllmV41FullDecodeRequest *requests,
                                     size_t count);
 // Plans use consecutive slices of storage. Null slots are allowed while the
@@ -70,3 +78,10 @@ struct FastllmV41HostCopy { void *dst; const void *src; size_t bytes; };
 bool FastllmCudaV41UploadFullDecodeInputs(void *storage, void *const *plans, size_t layers,
     const FastllmV41FullDecodeRequest *requests, size_t batch,
     const FastllmV41HostCopy *extra, size_t extraCount);
+
+// A graph-owned wait/copy pair for CPU-produced rows. The caller owns the
+// mapped ready allocation (free with FastllmCudaHostFree) and the graph.
+// Before replay: reset ready, fill hostData, release-store ready = 1.
+// Do not reuse either buffer until the previous graph has consumed it.
+bool FastllmCudaV41CreateHostCopy(void *dst, size_t bytes, void **hostData,
+    std::atomic<unsigned> **ready, void **graph);

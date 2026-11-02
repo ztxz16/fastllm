@@ -1,4 +1,5 @@
 #include "models/hy_nomas/runtime.h"
+#include "models/hy_nomas/parallel.h"
 #include <cmath>
 #include <stdexcept>
 
@@ -23,6 +24,23 @@ Tensor DiT::timeEmbedding(float timestep,const std::string &prefix) {
     return weights_.linear(rt_.activation(weights_.linear(rt_.upload(values,1,256),prefix+".mlp.0")),prefix+".mlp.2");
 }
 
+const DiT::Modulation &DiT::prepare(float timestep) {
+    auto found=modulation_.find(timestep);
+    if(found!=modulation_.end()) return found->second;
+    // A world schedule has at most 32 denoising steps plus one cache update.
+    if(modulation_.size()>=33) modulation_.clear();
+    Modulation table;
+    table.time=timeEmbedding(timestep,"time_in");
+    auto act=rt_.activation(table.time);
+    for(int layer=0;layer<54;++layer) {
+        auto p="double_blocks."+std::to_string(layer)+".";
+        table.image.push_back(weights_.linear(act,p+"img_mod.linear"));
+        table.text.push_back(weights_.linear(act,p+"txt_mod.linear"));
+    }
+    table.output=weights_.linear(act,"final_layer.adaLN_modulation.1");
+    return modulation_.emplace(timestep,std::move(table)).first->second;
+}
+
 Tensor DiT::refineText(const Tensor &text,float timestep) {
     if(text.cols!=3584 || text.rows>1280) throw std::invalid_argument("expected up to 1280 valid Qwen features of width 3584");
     auto context=weights_.linear(rt_.activation(weights_.linear(rt_.mean(text),"txt_in.c_embedder.linear_1")),"txt_in.c_embedder.linear_2");
@@ -43,7 +61,7 @@ Tensor DiT::refineText(const Tensor &text,float timestep) {
 }
 
 Tensor DiT::forward(const Tensor &latent,const Tensor &features,float timestep,int t,int h,int w,
-                    int offset,DiTCache *cache,bool commit,const Tensor *camera) {
+                    int offset,DiTCache *cache,bool commit,const std::vector<Tensor> *camera,DiTCache *workspace) {
     int tokens=tokenCount(t,h,w);
     if(latent.rows!=tokens || latent.cols!=32 || offset<0 || offset>1000000 || (commit && !cache))
         throw std::invalid_argument("invalid DiT forward input");
@@ -52,7 +70,20 @@ Tensor DiT::forward(const Tensor &latent,const Tensor &features,float timestep,i
         throw std::invalid_argument("invalid DiT cache layer count");
     int history=hasCache?cache->key[0].rows:0;
     if(history+tokens+features.rows>32768) throw std::invalid_argument("DiT cache limit exceeded; start a new session");
-    if(camera && (camera->rows!=t || camera->cols!=64)) throw std::invalid_argument("invalid camera embedding");
+    if(workspace) {
+        if(workspace==cache) throw std::invalid_argument("DiT workspace must not be the history cache");
+        if(workspace->key.empty() && workspace->value.empty()) {
+            workspace->key.resize(54); workspace->value.resize(54);
+        }
+        if(workspace->key.size()!=54 || workspace->value.size()!=54)
+            throw std::invalid_argument("invalid DiT workspace layer count");
+    }
+    if(camera) {
+        if(camera->size()!=54) throw std::invalid_argument("invalid camera projection count");
+        for(const auto &projection:*camera)
+            if(projection.rows!=tokens || projection.cols!=2048 || projection.dtype!=latent.dtype)
+                throw std::invalid_argument("invalid camera projection shape/dtype");
+    }
     std::vector<float> cos(size_t(tokens)*128),sin(cos.size());
     int dims[]={16,56,56};
     for(int token=0;token<tokens;++token) {
@@ -66,22 +97,34 @@ Tensor DiT::forward(const Tensor &latent,const Tensor &features,float timestep,i
         }
     }
     auto rope=rt_.prepareRope(cos.data(),sin.data(),tokens,128);
-    auto x=weights_.linear(latent,"img_in.proj"),vec=timeEmbedding(timestep,"time_in"),txt=refineText(features,timestep);
+    const auto &modulation=prepare(timestep);
+    auto x=weights_.linear(latent,"img_in.proj"),txt=refineText(features,timestep);
+    // Keep image rows resident on their rank through all double blocks. Text
+    // stays replicated; only current image K/V is gathered inside each block.
+    int partitions=sequencePartitions(tokens),first=0,rows=tokens;
+    if(partitions>1) {
+        int chunk=(tokens+partitions-1)/partitions;
+        first=parallel_->rank*chunk;rows=std::min(chunk,tokens-first);
+        x=x.rowSlice(first,rows);
+        rope.cos=rope.cos.rowSlice(first,rows);rope.sin=rope.sin.rowSlice(first,rows);
+    }
     DiTCache next;
     for(int layer=0;layer<54;++layer) {
-        auto out=block(layer,x,txt,vec,rope,hasCache?&cache->key[layer]:nullptr,hasCache?&cache->value[layer]:nullptr);
+        auto out=block(layer,x,txt,modulation.time,rope,hasCache?&cache->key[layer]:nullptr,hasCache?&cache->value[layer]:nullptr,
+                       nullptr,&modulation.image[layer],&modulation.text[layer],
+                       workspace?&workspace->key[layer]:nullptr,workspace?&workspace->value[layer]:nullptr,partitions>1?tokens:0);
         x=out.image; txt=out.text;
-        if(camera) x=cameraBlock(layer,x,*camera,h*w);
-        if(commit) {
+        if(camera) x=rt_.add(x,(*camera)[layer].rowSlice(first,rows));
+        if(commit && !workspace) {
             next.key.push_back(hasCache?rt_.concat({cache->key[layer],out.key}):out.key);
             next.value.push_back(hasCache?rt_.concat({cache->value[layer],out.value}):out.value);
         }
     }
-    auto mod=weights_.linear(rt_.activation(vec),"final_layer.adaLN_modulation.1");
-    auto out=weights_.linear(rt_.modulate(rt_.norm(x,false),mod,0,1),"final_layer.linear");
+    if(partitions>1) x=parallel_->gatherRows(rt_,x,tokens);
+    auto out=weights_.linear(rt_.normModulate(x,modulation.output,0,1),"final_layer.linear");
     // Publish cache atomically after every layer and the output have succeeded.
     rt_.synchronize();
-    if(commit) *cache=std::move(next);
+    if(commit) *cache=workspace?std::move(*workspace):std::move(next);
     return out;
 }
 
@@ -93,6 +136,17 @@ Tensor DiT::cameraEmbedding(const Tensor &extrinsics) {
 Tensor DiT::cameraBlock(int layer,const Tensor &image,const Tensor &camera,int spatial) {
     if(layer<0 || layer>=54 || spatial<1 || image.cols!=2048 || camera.cols!=64 || image.rows!=camera.rows*spatial)
         throw std::invalid_argument("invalid camera block shape");
+    return rt_.add(image,projectCamera(layer,camera,spatial));
+}
+std::vector<Tensor> DiT::cameraProjections(const Tensor &camera,int spatial) {
+    if(camera.rows<1 || camera.cols!=64 || spatial<1 || int64_t(camera.rows)*spatial>16384)
+        throw std::invalid_argument("invalid camera projection input");
+    std::vector<Tensor> result;
+    result.reserve(54);
+    for(int layer=0;layer<54;++layer) result.push_back(projectCamera(layer,camera,spatial));
+    return result;
+}
+Tensor DiT::projectCamera(int layer,const Tensor &camera,int spatial) {
     auto p="action_modules."+std::to_string(layer)+".";
     auto keyboard=weights_.linear(rt_.activation(weights_.linear(camera,p+"keyboard_embed.0")),p+"keyboard_embed.2");
     auto kv=weights_.linear(keyboard,p+"keyboard_attn_kv");
@@ -100,11 +154,22 @@ Tensor DiT::cameraBlock(int layer,const Tensor &image,const Tensor &camera,int s
     // exactly one camera key: softmax is exactly one, so Q/K norm and RoPE
     // cannot affect the result. Preserve the V and output projection rounding.
     auto value=rt_.columns(kv,1024,1024);
-    auto projected=weights_.linear(rt_.repeatRows(value,spatial),p+"proj_keyboard");
-    return rt_.add(image,projected);
+    return weights_.linear(rt_.repeatRows(value,spatial),p+"proj_keyboard");
 }
 
-PixelDecoder::PixelDecoder(Runtime &rt,const std::string &path):rt_(rt),weights_(rt,path) {}
+PixelDecoder::PixelDecoder(Runtime &rt,const std::string &path):PixelDecoder(rt,path,ParallelContext{}) {}
+PixelDecoder::PixelDecoder(Runtime &rt,const std::string &path,const ParallelContext &parallel)
+    :rt_(rt),weights_(rt,path),parallel_(new ParallelContext(parallel)) {
+    if(8%parallel.size() || 12288%parallel.size())
+        throw std::invalid_argument("PixelUMM KV heads and FFN width must divide TP size");
+    for(int layer=0;layer<36;++layer) {
+        auto p="decoder.layers."+std::to_string(layer)+".";
+        for(auto name:{"attn.q_proj","attn.k_proj","attn.v_proj","mlp.gate_proj","mlp.up_proj"})
+            parallel.columnWeights(weights_,p+name);
+        for(auto name:{"attn.o_proj","mlp.down_proj"}) parallel.rowWeights(weights_,p+name);
+    }
+}
+PixelDecoder::~PixelDecoder()=default;
 Tensor PixelDecoder::block(int layer,const Tensor &input,int t,int h,int w,int tile) {
     if(layer<0 || layer>=36 || input.rows!=tokenCount(t,h,w) || input.cols!=4096 || tile<0)
         throw std::invalid_argument("invalid PixelUMM block input");
@@ -113,11 +178,11 @@ Tensor PixelDecoder::block(int layer,const Tensor &input,int t,int h,int w,int t
     auto q=weights_.linear(norm,p+"attn.q_proj"),k=weights_.linear(norm,p+"attn.k_proj"),v=weights_.linear(norm,p+"attn.v_proj");
     q=rt_.pixelQKRope(q,weights_.get(p+"attn.q_norm_t.weight"),weights_.get(p+"attn.q_norm_hw.weight"),t,h,w);
     k=rt_.pixelQKRope(k,weights_.get(p+"attn.k_norm_t.weight"),weights_.get(p+"attn.k_norm_hw.weight"),t,h,w);
-    auto a=rt_.attention(q,k,v,32,nullptr,128,8,false,tile,h,w);
-    auto x=rt_.add(input,weights_.linear(a,p+"attn.o_proj"));
+    auto a=rt_.attention(q,k,v,32/parallel_->size(),nullptr,128,8/parallel_->size(),false,tile,h,w);
+    auto x=rt_.add(input,parallel_->row(rt_,weights_,a,p+"attn.o_proj"));
     norm=rt_.norm(x,true,&weights_.get(p+"post_attn_norm.weight"));
     auto gate=weights_.linear(norm,p+"mlp.gate_proj");
-    auto mlp=weights_.linear(rt_.siluMultiply(gate,weights_.linear(norm,p+"mlp.up_proj")),p+"mlp.down_proj");
+    auto mlp=parallel_->row(rt_,weights_,rt_.siluMultiply(gate,weights_.linear(norm,p+"mlp.up_proj")),p+"mlp.down_proj");
     return rt_.add(x,mlp);
 }
 Tensor PixelDecoder::forward(const Tensor &latent,const Tensor &noise,int t,int h,int w) {

@@ -358,7 +358,7 @@ def mixed_disk_plan(args, baseline, metadata, tensors, model, gpu, ram, ratio):
                     host + disk_staging, largest, snapshot)
         try:
             capacity = memory.plan(prepared, model, adjusted, mode, mapping, gpu, ram,
-                                   implicit_embedding_bytes=implicit_embedding)
+                                   implicit_embedding_bytes=implicit_embedding, disk_experts=True)
         except ValueError:
             continue
         workspace = capacity["workspace_bytes_per_device"] - capacity["expert_transport_bytes_per_device"]
@@ -386,7 +386,7 @@ def mixed_disk_plan(args, baseline, metadata, tensors, model, gpu, ram, ratio):
                     host + disk_staging + extra_workspace + cpu_cache, largest, snapshot)
         try:
             plan = memory.plan(checked, model, adjusted, mode, mapping, gpu, ram,
-                               implicit_embedding_bytes=implicit_embedding)
+                               implicit_embedding_bytes=implicit_embedding, disk_experts=True)
         except ValueError:
             continue
         front = {}
@@ -509,20 +509,31 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
     if base.threads < 1:
         raise ValueError("--auto requires positive CPU threads")
     metadata, tensors, model = memory.model_inputs(base)
+    apply_model_defaults(base, metadata)
     if (("threads" not in explicit or args.threads == -1) and
             "FT_THREADS" not in os.environ and "FASTLLM_NUMA_THREADS" not in os.environ and
             model.hidden >= 1024 and model.intermediate >= 256):
         from .cpu_tuning import select_threads
-        kinds = {t.kind for t in tensors if memory._is_routed_expert(t.name)}
+        kinds = {}
+        for tensor in tensors:
+            if memory._is_routed_expert(tensor.name):
+                kinds[tensor.kind] = kinds.get(tensor.kind, 0) + tensor.bytes
+        dominant = max(kinds, key=kinds.get, default="")
+        numa_calibration = (model.family == "deepseek_v41" and
+                            (env.use_numas if use_numa is None else use_numa) and
+                            base.moe_device not in ("cpu", "disk") and
+                            dominant in ("gguf:12", "gguf:16", "gguf:17", "gguf:29"))
+        kind = int(dominant[5:]) if numa_calibration else (16 if 'gguf:16' in kinds else 12)
+        workload = ({"numa": True, "rows": max(1, base.max_batch) * (max(base.mtp, base.dspark) + 1),
+                     "topk": model.topk} if numa_calibration else {})
         base.threads, base._cpu_thread_benchmark = select_threads(
-            model.hidden, model.intermediate, 16 if 'gguf:16' in kinds else 12, base.threads)
+            model.hidden, model.intermediate, kind, base.threads, **workload)
     # Dense Qwen3's graph warmup currently hits stream-capture-unsupported
     # in the deferred CUDA pool. Keep its new auto adapter on eager CUDA;
     # an explicit environment override still opts into graph execution.
     disable_qwen3_graph = model.family == "qwen3" and "FASTLLM_CUDA_GRAPH" not in os.environ
     if disable_qwen3_graph:
         graph_enabled = False
-    apply_model_defaults(base, metadata)
     if (model.family == "deepseek_v41" and "cuda_slab" not in explicit and
             any(t.kind.startswith("gguf:") and memory._is_routed_expert(t.name) for t in tensors)):
         # Thousands of standalone GGUF expert allocations waste CUDA pages.

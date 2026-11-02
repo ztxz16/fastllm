@@ -82,13 +82,15 @@ struct MP4Writer::Impl {
         file.close();
         if (!file)
             throw std::runtime_error("cannot save media input: " + audio);
+        unsigned threads = std::thread::hardware_concurrency();
+        threads = threads ? std::min(threads, 8u) : 4;
         std::vector<std::string> args = {
             ffmpeg, "-v", "error", "-nostdin", "-y",
             "-f", "rawvideo", "-pixel_format", "rgb24",
             "-video_size", std::to_string(g.width) + "x" + std::to_string(g.height),
             "-framerate", std::to_string(g.fps), "-i", "pipe:0",
             "-f", "f32le", "-ar", std::to_string(g.sampleRate), "-ac", "2", "-i", audio,
-            "-c:v", "libx264", "-threads", "4", "-preset", "fast", "-crf", "18", "-pix_fmt", "yuv420p",
+            "-c:v", "libx264", "-threads", std::to_string(threads), "-preset", "fast", "-crf", "18", "-pix_fmt", "yuv420p",
             "-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags", "+faststart", video};
         std::vector<char *> argv;
         for (auto &arg : args)
@@ -154,7 +156,8 @@ struct MP4Writer::Impl {
         });
     }
 
-    void write(const uint8_t *data, size_t bytes, const std::function<void()> &checkpoint) {
+    void write(const uint8_t *data, size_t bytes, const std::function<void()> &checkpoint,
+               std::vector<uint8_t> *owned = nullptr) {
         if (!data || !bytes || bytes % frameBytes || bytes > expected - submitted)
             throw std::invalid_argument("invalid H3 RGB chunk");
         // Keep host staging bounded even for the non-streaming writeMP4 API.
@@ -174,8 +177,15 @@ struct MP4Writer::Impl {
             // finish() still checks the child status before publishing the result.
             if (inputError && inputError != EPIPE)
                 throw std::runtime_error("cannot send RGB to FFmpeg");
-            if (!inputError)
+            if (!inputError) {
+                if (owned && count == owned->size()) {
+                    queue.emplace_back(std::move(*owned));
+                    submitted += count;
+                    changed.notify_all();
+                    return;
+                }
                 queue.emplace_back(data, data + count);
+            }
             submitted += count;
             data += count;
             bytes -= count;
@@ -233,6 +243,9 @@ MP4Writer::MP4Writer(const Generation &g, const std::string &path, const std::st
 MP4Writer::~MP4Writer() = default;
 void MP4Writer::write(const uint8_t *rgb, size_t bytes, std::function<void()> checkpoint) {
     impl_->write(rgb, bytes, checkpoint);
+}
+void MP4Writer::write(std::vector<uint8_t> rgb, std::function<void()> checkpoint) {
+    impl_->write(rgb.data(), rgb.size(), checkpoint, &rgb);
 }
 void MP4Writer::finish(std::function<void()> checkpoint) { impl_->finish(checkpoint); }
 void writeMP4(const Generation &g, const std::string &path, const std::string &ffmpeg) {

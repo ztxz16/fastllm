@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <cfloat>
+#include <climits>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -323,7 +324,7 @@ namespace {
     template<typename WT, bool GROUPED>
     __global__ void DsparkMarkovLogitsKernel(const float *logits, const WT *embed,
         const WT *head, const int *tokens, int step, int vocab, int rank,
-        float *scores, float *maxima, float *outEmbeds) {
+        float *scores, float *maxima, float *outEmbeds, bool roundProjection) {
         __shared__ float e[kDsparkMarkovMaxRank];
         __shared__ float reduce[kDsparkMarkovWarps];
         for (int d = threadIdx.x; d < rank; d += blockDim.x) {
@@ -353,13 +354,19 @@ namespace {
                 dot = DsRowDot(head + (int64_t)v * rank, e, rank);
             }
             if (lane == 0) {
+                if (roundProjection) {
+                    const WT rounded = static_cast<WT>(dot);
+                    dot = DsLoad(&rounded, 0);
+                }
                 const float score = logits[(int64_t)step * vocab + v] + dot;
                 scores[v] = score;
-                maximum = fmaxf(maximum, score);
+                if (maxima) maximum = fmaxf(maximum, score);
             }
         }
-        maximum = DsSampleBlockMax(maximum, reduce);
-        if (threadIdx.x == 0) maxima[blockIdx.x] = maximum;
+        if (maxima) {
+            maximum = DsSampleBlockMax(maximum, reduce);
+            if (threadIdx.x == 0) maxima[blockIdx.x] = maximum;
+        }
     }
 
     // Center before dividing by temperature: large common offsets must not
@@ -379,26 +386,32 @@ namespace {
 
     template<typename WT>
     bool DsLaunchSample(const Data &logits, const Data &embed, const Data &head,
-        int block, float temperature, Data &tokens, Data &probs, Data &scratch, Data &outEmbeds) {
+        int block, float temperature, Data &tokens, Data &probs, Data *scratch, Data &outEmbeds,
+        int topK, float topP, Data *samplingWorkspace) {
         const int vocab = logits.dims.back(), rank = embed.dims[1];
         const bool grouped = DsGroupedScore(head, vocab, rank);
         const int chunks = grouped ? kDsparkMarkovGroupedChunks : kDsparkMarkovChunks;
         const float unitTemperature = 1.0f;
         // Steps execute on one stream. Only q and tokens survive to verification;
         // block maxima and the log-normalizer can share one scratch row.
-        float *lse = (float*)scratch.cudaData;
-        float *maxima = lse + 1;
+        float *lse = scratch ? static_cast<float *>(scratch->cudaData) : nullptr;
+        float *maxima = lse ? lse + 1 : nullptr;
         for (int step = 0; step < block; ++step) {
             float *q = (float*)probs.cudaData + (size_t)step * vocab;
             if (grouped) {
                 DsparkMarkovLogitsKernel<__nv_bfloat16, true><<<chunks, kDsparkMarkovThreads, 0, cudaStreamPerThread>>>(
                     (const float*)logits.cudaData, (const __nv_bfloat16*)embed.cudaData,
                     (const __nv_bfloat16*)head.cudaData, (const int*)tokens.cudaData,
-                    step, vocab, rank, q, maxima, (float*)outEmbeds.cudaData);
+                    step, vocab, rank, q, maxima, (float*)outEmbeds.cudaData, samplingWorkspace != nullptr);
             } else {
                 DsparkMarkovLogitsKernel<WT, false><<<chunks, kDsparkMarkovThreads, 0, cudaStreamPerThread>>>(
                     (const float*)logits.cudaData, (const WT*)embed.cudaData, (const WT*)head.cudaData,
-                    (const int*)tokens.cudaData, step, vocab, rank, q, maxima, (float*)outEmbeds.cudaData);
+                    (const int*)tokens.cudaData, step, vocab, rank, q, maxima, (float*)outEmbeds.cudaData, samplingWorkspace != nullptr);
+            }
+            if (samplingWorkspace) {
+                if (!FastllmCudaMtpSampleDraftDevice(q, q, temperature, topK, topP,
+                        (int*)tokens.cudaData + step + 1, vocab, *samplingWorkspace)) return false;
+                continue;
             }
             DsparkCenterScoresKernel<<<(vocab + 255) / 256, 256, 0, cudaStreamPerThread>>>(
                 q, maxima, chunks, vocab, std::max(temperature, 1.0e-6f));
@@ -434,9 +447,10 @@ namespace {
     }
 }
 
-extern "C" bool FastllmCudaDeepSeekV41MarkovSampleDevice(const Data &logits,
+static bool DsMarkovSampleDevice(const Data &logits,
     const Data &embed, const Data &head, int block, float temperature,
-    Data &tokens, Data &probs, Data &scratch, Data &outEmbeds) {
+    Data &tokens, Data &probs, Data *scratch, Data &outEmbeds,
+    int topK, float topP, Data *samplingWorkspace) {
     const int device = FastllmCudaGetDevice();
     auto dense = [device](const Data &d) {
         if (!DsOnCuda(d) || d.dataDeviceIds != std::vector<int>{device} ||
@@ -448,7 +462,8 @@ extern "C" bool FastllmCudaDeepSeekV41MarkovSampleDevice(const Data &logits,
         }
         return true;
     };
-    if (!std::isfinite(temperature) || temperature <= 0 || block < 1 || block > 8 ||
+    if (!std::isfinite(temperature) || temperature <= 0 || block < 1 ||
+        !std::isfinite(topP) || topP <= 0 || topP > 1 ||
         !dense(logits) || logits.dataType != DataType::FLOAT32 || logits.dims.size() != 3 ||
         logits.dims[0] != 1 || logits.dims[1] < block || !dense(embed) || !dense(head) ||
         embed.dims.size() != 2 || head.dims.size() != 2 || !DsSupportedWeight(embed) ||
@@ -457,13 +472,26 @@ extern "C" bool FastllmCudaDeepSeekV41MarkovSampleDevice(const Data &logits,
         embed.dims[1] > kDsparkMarkovMaxRank || !dense(tokens) ||
         tokens.dataType != DataType::INT32 || tokens.dims != std::vector<int>{block + 1}) return false;
     if (!DsPrepareOutput(probs, DataType::FLOAT32, {block, logits.dims[2]}) ||
-        !DsPrepareOutput(scratch, DataType::FLOAT32, {kDsparkMarkovGroupedChunks + 1}) ||
+        (scratch && !DsPrepareOutput(*scratch, DataType::FLOAT32, {kDsparkMarkovGroupedChunks + 1})) ||
         !DsPrepareOutput(outEmbeds, DataType::FLOAT32, {1, block, embed.dims[1]})) return false;
     if (embed.dataType == DataType::BFLOAT16)
-        return DsLaunchSample<__nv_bfloat16>(logits, embed, head, block, temperature, tokens, probs, scratch, outEmbeds);
+        return DsLaunchSample<__nv_bfloat16>(logits, embed, head, block, temperature, tokens, probs, scratch, outEmbeds, topK, topP, samplingWorkspace);
     if (embed.dataType == DataType::FLOAT16)
-        return DsLaunchSample<half>(logits, embed, head, block, temperature, tokens, probs, scratch, outEmbeds);
-    return DsLaunchSample<float>(logits, embed, head, block, temperature, tokens, probs, scratch, outEmbeds);
+        return DsLaunchSample<half>(logits, embed, head, block, temperature, tokens, probs, scratch, outEmbeds, topK, topP, samplingWorkspace);
+    return DsLaunchSample<float>(logits, embed, head, block, temperature, tokens, probs, scratch, outEmbeds, topK, topP, samplingWorkspace);
+}
+
+extern "C" bool FastllmCudaDeepSeekV41MarkovSampleDevice(const Data &logits,
+    const Data &embed, const Data &head, int block, float temperature,
+    Data &tokens, Data &probs, Data &scratch, Data &outEmbeds) {
+    return DsMarkovSampleDevice(logits, embed, head, block, temperature, tokens, probs, &scratch, outEmbeds, 0, 1, nullptr);
+}
+
+extern "C" bool FastllmCudaDeepSeekV41MarkovFilteredSampleDevice(const Data &logits,
+    const Data &embed, const Data &head, int block, float temperature, int topK, float topP,
+    Data &tokens, Data &probs, Data &outEmbeds, Data &samplingWorkspace) {
+    return DsMarkovSampleDevice(logits, embed, head, block, temperature, tokens, probs,
+        nullptr, outEmbeds, topK, topP, &samplingWorkspace);
 }
 
 extern "C" bool FastllmCudaDeepSeekV41DraftInput(const Data &embedding, const Data &metadata,
@@ -477,7 +505,7 @@ extern "C" bool FastllmCudaDeepSeekV41DraftInput(const Data &embedding, const Da
         !DsOnCuda(metadata) || metadata.dataDeviceIds != std::vector<int>{FastllmCudaGetDevice()} ||
         metadata.dataType != DataType::INT32 || metadata.dims != std::vector<int>{2} ||
         metadata.strides.size() != 1 || metadata.strides[0] != 1 ||
-        block <= 0 || block > 8 || hcMult <= 0 || windowSize <= 0) return false;
+        block <= 0 || hcMult <= 0 || windowSize <= 0 || block > INT_MAX - windowSize) return false;
     const int dim = embedding.dims[1], width = windowSize + block - 1;
     if (!DsPrepareOutput(hidden, DataType::BFLOAT16, {1, block, hcMult, dim}) ||
         !DsPrepareOutput(preMix, DataType::FLOAT32, {1, block, hcMult}) ||

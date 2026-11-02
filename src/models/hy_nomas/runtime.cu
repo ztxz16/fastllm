@@ -15,6 +15,8 @@
 #include <mutex>
 #include <stdexcept>
 #include <type_traits>
+#include <atomic>
+#include <map>
 #ifndef _WIN32
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -22,7 +24,7 @@
 #endif
 
 namespace fastllm { namespace nomas {
-cudaError_t fusedAttention(const void *,const void *,const void *,void *,int,int,int,int,int,bool,bool,int,int,int,float,bool,cudaStream_t);
+cudaError_t fusedAttention(const void *,const void *,const void *,void *,int,int,int,int,int,bool,bool,int,int,int,float,bool,cudaStream_t,int=0,int=0,int=1);
 namespace {
 using B = __nv_bfloat16;
 using H = __half;
@@ -37,9 +39,54 @@ void copy(void *dst,const void *src,size_t bytes,cudaMemcpyKind kind) {
 }
 // Never change the process-wide default pool: other fastllm models may use it.
 // Tensors retain this pool so their storage may safely outlive Runtime.
+uint64_t allocationThread() {
+    static std::atomic<uint64_t> next{1};
+    thread_local const uint64_t id=next.fetch_add(1,std::memory_order_relaxed);
+    return id; // Unlike std::thread::id, never reused after a worker exits.
+}
 struct MemoryPool {
     cudaMemPool_t handle = nullptr;
     int device;
+    size_t cacheLimit=0,cachedBytes=0;
+    std::mutex cacheMutex;
+    using FreeBlocks=std::map<size_t,std::vector<void *>>;
+    std::unordered_map<uint64_t,FreeBlocks> freeBlocks;
+    void *reuse(size_t bytes) {
+        if(!cacheLimit) return nullptr;
+        std::lock_guard<std::mutex> lock(cacheMutex);
+        auto thread=freeBlocks.find(allocationThread());
+        if(thread==freeBlocks.end()) return nullptr;
+        auto found=thread->second.find(bytes);
+        if(found==thread->second.end() || found->second.empty()) return nullptr;
+        auto &blocks=found->second;
+        void *p=blocks.back();blocks.pop_back();cachedBytes-=bytes;return p;
+    }
+    bool recycle(void *p,size_t bytes) noexcept {
+        if(!cacheLimit || bytes>cacheLimit) return false;
+        try {
+            std::lock_guard<std::mutex> lock(cacheMutex);
+            auto &sizes=freeBlocks[allocationThread()];
+            // Weight-loading scratch must not crowd out smaller recurring
+            // activations. Eviction stays on the allocating thread's stream.
+            auto largest=sizes.rbegin();
+            while(bytes>cacheLimit-cachedBytes) {
+                while(largest!=sizes.rend() && largest->second.empty()) ++largest;
+                if(largest==sizes.rend() || largest->first<=bytes) return false;
+                auto &blocks=largest->second;
+                cudaFreeAsync(blocks.back(),cudaStreamPerThread);
+                blocks.pop_back();cachedBytes-=largest->first;
+            }
+            sizes[bytes].push_back(p);cachedBytes+=bytes;return true;
+        } catch(...) {return false;}
+    }
+    // The caller synchronizes before trimming. Cached blocks belong to the
+    // allocating thread's stream; they are never recycled onto another stream.
+    void clearCache() {
+        std::lock_guard<std::mutex> lock(cacheMutex);
+        for(auto &thread:freeBlocks) for(auto &size:thread.second)
+            for(void *p:size.second) cudaFree(p);
+        freeBlocks.clear();cachedBytes=0;
+    }
     explicit MemoryPool(int device, uint64_t retained=2ULL*1024*1024*1024):device(device) {
         cudaMemPoolProps props{};
         props.allocType = cudaMemAllocationTypePinned;
@@ -52,7 +99,11 @@ struct MemoryPool {
             check(status);
         }
     }
-    ~MemoryPool() { cudaMemPoolDestroy(handle); }
+    ~MemoryPool() {
+        int previous=device;cudaGetDevice(&previous);cudaSetDevice(device);
+        if(cachedBytes) {cudaDeviceSynchronize();clearCache();}
+        cudaMemPoolDestroy(handle);cudaSetDevice(previous);
+    }
 };
 thread_local std::shared_ptr<MemoryPool> activePool;
 std::shared_ptr<MemoryPool> memoryPool(int device) {
@@ -71,10 +122,13 @@ std::shared_ptr<void> allocate(size_t bytes) {
     require(bytes > 0, "empty CUDA allocation");
     int device; check(cudaGetDevice(&device));
     auto pool = memoryPool(device);
-    void *p = nullptr;
-    check(cudaMallocFromPoolAsync(&p,bytes,pool->handle,cudaStreamPerThread));
-    return {p, [device,pool](void *x) {
-        int previous = device; cudaGetDevice(&previous); cudaSetDevice(device);
+    void *p = pool->reuse(bytes);
+    if(!p) check(cudaMallocFromPoolAsync(&p,bytes,pool->handle,cudaStreamPerThread));
+    auto owner=allocationThread();
+    return {p, [device,pool,bytes,owner](void *x) {
+        int previous = device; cudaGetDevice(&previous);
+        if(previous==device && activePool==pool && owner==allocationThread() && pool->recycle(x,bytes)) return;
+        cudaSetDevice(device);
         cudaFreeAsync(x,cudaStreamPerThread);
         cudaSetDevice(previous);
     }};
@@ -115,37 +169,93 @@ template<class T> __global__ void addBias(const T *x,const T *bias,T *y,size_t n
     for(size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;i<n;i+=size_t(gridDim.x)*blockDim.x) y[i]=cast<T>(f(x[i])+f(bias[i%cols]));
 }
 __device__ float sumBlock(float v, float *scratch) {
+    // Callers use power-of-two blocks of at least 64 threads. Preserve the
+    // descending reduction tree. Only the final warp uses
+    // shuffles; a warp-sum-first reduction would change the addition order.
     scratch[threadIdx.x]=v; __syncthreads();
-    for (int d=blockDim.x/2; d; d/=2) { if(threadIdx.x<d) scratch[threadIdx.x]+=scratch[threadIdx.x+d]; __syncthreads(); }
+    for(int d=blockDim.x/2;d>=64;d/=2) {
+        if(threadIdx.x<d) scratch[threadIdx.x]+=scratch[threadIdx.x+d];
+        __syncthreads();
+    }
+    if(threadIdx.x<32) {
+        float sum=scratch[threadIdx.x]+scratch[threadIdx.x+32];
+        for(int d=16;d;d/=2) sum+=__shfl_down_sync(0xffffffffu,sum,d);
+        if(threadIdx.x==0) scratch[0]=sum;
+    }
+    __syncthreads();
     return scratch[0];
 }
-template<class T, bool FusedAffine=true> __global__ void normKernel(const T *x, T *y, const T *weight, const T *bias, int width, bool rms, float eps) {
+template<class T> __device__ float modulatedValue(float value, float shift, float scale) {
+    return roundTo<T>(value*roundTo<T>(1.f+scale))+shift;
+}
+template<class T, bool FusedAffine=true, bool Modulate=false> __global__ void normKernel(const T *x, T *y, const T *weight, const T *bias, int width, bool rms, float eps, int rows, const T *mod=nullptr, int shift=0, int scale=0) {
+    if(!Modulate && rms && width==128) {
+        // One warp per row, four rows per block. Keep the old block reduction's
+        // (0+64)+(32+96) tree and the cast before the affine, unlike LLM RMSNorm.
+        int row=blockIdx.x*4+threadIdx.x/32,lane=threadIdx.x%32;
+        if(row>=rows) return;
+        float value[4];
+#pragma unroll
+        for(int i=0;i<4;++i) value[i]=f(x[size_t(row)*128+lane+32*i]);
+        float sum=(value[0]*value[0]+value[2]*value[2])+(value[1]*value[1]+value[3]*value[3]);
+#pragma unroll
+        for(int d=16;d;d/=2) sum+=__shfl_down_sync(0xffffffffu,sum,d);
+        float inv=rsqrtf(__shfl_sync(0xffffffffu,sum,0)/128+eps);
+#pragma unroll
+        for(int i=0;i<4;++i) {
+            int c=lane+32*i;
+            float v=roundTo<T>(value[i]*inv);
+            if(weight) v*=f(weight[c]);
+            if(bias) v+=f(bias[c]);
+            y[size_t(row)*128+c]=cast<T>(v);
+        }
+        return;
+    }
     __shared__ float scratch[256]; __shared__ float mean, inv;
     int row=blockIdx.x; float s=0;
-    for(int c=threadIdx.x;c<width;c+=blockDim.x) s+=f(x[size_t(row)*width+c]);
-    float total=sumBlock(s,scratch);
-    if(threadIdx.x==0) mean=rms?0.f:total/width;
+    if(!Modulate && rms) {
+        if(threadIdx.x==0) mean=0;
+    } else {
+        for(int c=threadIdx.x;c<width;c+=blockDim.x) s+=f(x[size_t(row)*width+c]);
+        float total=sumBlock(s,scratch);
+        if(threadIdx.x==0) mean=total/width;
+    }
     __syncthreads(); s=0;
     for(int c=threadIdx.x;c<width;c+=blockDim.x) { float v=f(x[size_t(row)*width+c])-mean; s+=v*v; }
-    total=sumBlock(s,scratch);
+    float total=sumBlock(s,scratch);
     if(threadIdx.x==0) inv=rsqrtf(total/width+eps);
     __syncthreads();
     for(int c=threadIdx.x;c<width;c+=blockDim.x) {
         float v=(f(x[size_t(row)*width+c])-mean)*inv;
-        // Official RMSNorm casts before applying weight; LayerNorm has a fused affine.
-        if(rms) v=roundTo<T>(v);
-        if constexpr (std::is_same_v<T,B> && FusedAffine) {
-            if(!rms && weight && bias) v=__fmaf_rn(v,f(weight[c]),f(bias[c]));
-            else { if(weight) v*=f(weight[c]); if(bias) v+=f(bias[c]); }
-        } else { if(weight) v*=f(weight[c]); if(bias) v+=f(bias[c]); }
+        if constexpr (Modulate) {
+            // Keep the materialized LayerNorm result's rounding before modulation.
+            v=modulatedValue<T>(roundTo<T>(v),f(mod[shift*width+c]),f(mod[scale*width+c]));
+        } else {
+            // Official RMSNorm casts before weight; LayerNorm has a fused affine.
+            if(rms) v=roundTo<T>(v);
+            if constexpr (std::is_same_v<T,B> && FusedAffine) {
+                if(!rms && weight && bias) v=__fmaf_rn(v,f(weight[c]),f(bias[c]));
+                else { if(weight) v*=f(weight[c]); if(bias) v+=f(bias[c]); }
+            } else { if(weight) v*=f(weight[c]); if(bias) v+=f(bias[c]); }
+        }
         y[size_t(row)*width+c]=cast<T>(v);
     }
 }
-template<class T> __global__ void packedSiluMultiply(const T *x,T *out,size_t n,int width) {
-    for(size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;i<n;i+=size_t(gridDim.x)*blockDim.x) {
-        size_t p=(i/width)*(2*width)+i%width;
-        float gate=f(x[p+width]);
-        out[i]=cast<T>(f(x[p])*roundTo<T>(gate/(1.f+expf(-gate))));
+template<class T,int Pack> struct alignas(sizeof(T)*Pack) ElementPack { T value[Pack]; };
+template<class T,class Index,int Pack=1>
+__global__ void packedSiluMultiply(const T *x,T *out,Index n,int width) {
+    auto input=reinterpret_cast<const ElementPack<T,Pack> *>(x);
+    auto output=reinterpret_cast<ElementPack<T,Pack> *>(out);
+    for(Index i=Index(blockIdx.x)*blockDim.x+threadIdx.x;i<n;i+=Index(gridDim.x)*blockDim.x) {
+        Index p=(i/width)*(Index(2)*width)+i%width;
+        auto hidden=input[p], gates=input[p+width];
+        ElementPack<T,Pack> result;
+#pragma unroll
+        for(int j=0;j<Pack;++j) {
+            float gate=f(gates.value[j]);
+            result.value[j]=cast<T>(f(hidden.value[j])*roundTo<T>(gate/(1.f+expf(-gate))));
+        }
+        output[i]=result;
     }
 }
 template<class T,bool Broadcast> __global__ void scaledResidualKernel(const float *x,const T *y,const float *scale,
@@ -159,7 +269,7 @@ template<class T,bool Indexed=false> __global__ void modulation(const T *x, cons
         if constexpr(Indexed) j+=size_t(indices[i/c])*modCols;
         // Match eager BF16 boundaries, including the rounding of (1 + scale).
         float v=residual ? f(x[i])+roundTo<T>(f(y[i])*f(mod[a*c+j]))
-                         : roundTo<T>(f(x[i])*roundTo<T>(1.f+f(mod[d*c+j])))+f(mod[a*c+j]);
+                         : modulatedValue<T>(f(x[i]),f(mod[a*c+j]),f(mod[d*c+j]));
         z[i]=cast<T>(v);
     }
 }
@@ -328,9 +438,17 @@ template<class T> __global__ void textRopeKernel(const T *x,T *y,size_t n,int co
 }
 }
 
-TensorPool::TensorPool(int device):pool_(std::make_shared<MemoryPool>(device,UINT64_MAX)) {}
+TensorPool::TensorPool(int device,size_t cacheBytes):pool_(std::make_shared<MemoryPool>(device,UINT64_MAX)) {
+    std::static_pointer_cast<MemoryPool>(pool_)->cacheLimit=cacheBytes;
+}
 TensorPool::Scope::Scope(const TensorPool &pool):previous_(activePool) {
-    activePool=std::static_pointer_cast<MemoryPool>(pool.pool_);
+    auto next=std::static_pointer_cast<MemoryPool>(pool.pool_);
+    if(next->cacheLimit) {
+        cudaStreamCaptureStatus status;
+        check(cudaStreamIsCapturing(cudaStreamPerThread,&status));
+        require(status==cudaStreamCaptureStatusNone,"host tensor reuse does not support CUDA capture");
+    }
+    activePool=std::move(next);
 }
 TensorPool::Scope::~Scope() { activePool=std::static_pointer_cast<MemoryPool>(previous_); }
 size_t TensorPool::reusableBytes() const {
@@ -338,10 +456,11 @@ size_t TensorPool::reusableBytes() const {
     uint64_t reserved=0,used=0;
     check(cudaMemPoolGetAttribute(pool->handle,cudaMemPoolAttrReservedMemCurrent,&reserved));
     check(cudaMemPoolGetAttribute(pool->handle,cudaMemPoolAttrUsedMemCurrent,&used));
-    return reserved>used?reserved-used:0;
+    return (reserved>used?reserved-used:0)+pool->cachedBytes;
 }
 void TensorPool::trim() {
-    check(cudaMemPoolTrimTo(std::static_pointer_cast<MemoryPool>(pool_)->handle,0));
+    auto pool=std::static_pointer_cast<MemoryPool>(pool_);pool->clearCache();
+    check(cudaMemPoolTrimTo(pool->handle,0));
 }
 
 struct Runtime::LtState {
@@ -443,7 +562,8 @@ Tensor Runtime::linear(const Tensor &x,const Tensor &w,const Tensor *bias) {
 void Runtime::linearInto(const Tensor &x,const Tensor &w,Tensor &out,const Tensor *bias) {
     require(x.cols==w.cols,"linear dimension mismatch"); require(!bias || bias->size()==size_t(w.rows),"linear bias mismatch");
     require(x.dtype==w.dtype && (!bias || bias->dtype==x.dtype),"linear dtype mismatch");
-    require(out.data && out.rows==x.rows && out.cols==w.rows && out.dtype==x.dtype,"linear output shape/dtype mismatch");
+    require(out.data && out.rows==x.rows && out.cols==w.rows &&
+            (out.dtype==x.dtype || (!bias && out.isFloat32())),"linear output shape/dtype mismatch");
     require(out.storage!=x.storage && out.storage!=w.storage && (!bias || out.storage!=bias->storage),
             "linear output must not share input storage");
     require(x.isFloat32() || !bias || reinterpret_cast<uintptr_t>(out.data)%256==0,
@@ -485,7 +605,7 @@ void Runtime::linearInto(const Tensor &x,const Tensor &w,Tensor &out,const Tenso
     } else {
         check(cublasGemmEx(static_cast<cublasHandle_t>(blas_),CUBLAS_OP_T,CUBLAS_OP_N,
             w.rows,x.rows,x.cols,&one,w.data,scalarType,w.cols,x.data,scalarType,x.cols,
-            &zero,out.data,scalarType,w.rows,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT));
+            &zero,out.data,out.isFloat32()?CUDA_R_32F:scalarType,w.rows,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT));
     }
     check(cudaGetLastError());
 }
@@ -495,11 +615,21 @@ Tensor Runtime::norm(const Tensor &x,bool rms,const Tensor *w,const Tensor *bias
     require((!w || w->dtype==x.dtype) && (!bias || bias->dtype==x.dtype),"norm dtype mismatch");
     require((!w || w->size()==size_t(width)) && (!bias || bias->size()==size_t(width)),"norm weight mismatch");
     Tensor out(x.rows,x.cols,x.dtype);
+    int rows=int(x.size()/width),threads=rms && width==128?128:256;
+    int blocks=rms && width==128?(rows+3)/4:rows;
     if(x.dtype==DType::BF16 && !numerics_.layerNormFMA) {
-        normKernel<B,false><<<x.size()/width,256,0,cudaStreamPerThread>>>(as<B>(x),as<B>(out),w?as<B>(*w):nullptr,bias?as<B>(*bias):nullptr,width,rms,eps);
+        normKernel<B,false><<<blocks,threads,0,cudaStreamPerThread>>>(as<B>(x),as<B>(out),w?as<B>(*w):nullptr,bias?as<B>(*bias):nullptr,width,rms,eps,rows);
     } else {
-        DISPATCH_TENSOR(x.dtype, T, normKernel<T><<<x.size()/width,256,0,cudaStreamPerThread>>>(as<T>(x),as<T>(out),w?as<T>(*w):nullptr,bias?as<T>(*bias):nullptr,width,rms,eps));
+        DISPATCH_TENSOR(x.dtype, T, normKernel<T><<<blocks,threads,0,cudaStreamPerThread>>>(as<T>(x),as<T>(out),w?as<T>(*w):nullptr,bias?as<T>(*bias):nullptr,width,rms,eps,rows));
     }
+    check(cudaGetLastError()); return out;
+}
+Tensor Runtime::normModulate(const Tensor &x,const Tensor &m,int shift,int scale,float eps) {
+    require(x.cols>0 && m.dtype==x.dtype && m.rows==1 && shift>=0 && scale>=0 &&
+            m.cols>=(std::max(shift,scale)+1)*x.cols,"norm modulation dimension mismatch");
+    Tensor out(x.rows,x.cols,x.dtype);
+    DISPATCH_TENSOR(x.dtype, T, (normKernel<T,true,true><<<x.rows,256,0,cudaStreamPerThread>>>(
+        as<T>(x),as<T>(out),nullptr,nullptr,x.cols,false,eps,x.rows,as<T>(m),shift,scale)));
     check(cudaGetLastError()); return out;
 }
 Tensor Runtime::activation(const Tensor &x,bool gelu) {
@@ -523,8 +653,22 @@ Tensor Runtime::siluMultiply(const Tensor &x,const Tensor &y) {
 Tensor Runtime::siluMultiply(const Tensor &x) {
     require(x.cols%2==0,"invalid packed SiLU width");
     Tensor out(x.rows,x.cols/2,x.dtype);
-    DISPATCH_TENSOR(x.dtype, T, packedSiluMultiply<T><<<grid(out.size()),256,0,cudaStreamPerThread>>>(
-        as<T>(x),as<T>(out),out.size(),out.cols));
+    // Vectorize 16-bit loads/stores without changing the scalar FP32 arithmetic or
+    // activation rounding. Odd widths and unaligned views retain the scalar path.
+    DISPATCH_TENSOR(x.dtype, T,
+        if(sizeof(T)==2 && out.cols%8==0 && uintptr_t(as<T>(x))%16==0 && out.size()<=size_t(INT32_MAX)) {
+            packedSiluMultiply<T,uint32_t,8><<<grid(out.size()/8),256,0,cudaStreamPerThread>>>(
+                as<T>(x),as<T>(out),uint32_t(out.size()/8),out.cols/8);
+        } else if(sizeof(T)==2 && out.cols%2==0 && uintptr_t(as<T>(x))%4==0 && out.size()<=size_t(INT32_MAX)) {
+            packedSiluMultiply<T,uint32_t,2><<<grid(out.size()/2),256,0,cudaStreamPerThread>>>(
+                as<T>(x),as<T>(out),uint32_t(out.size()/2),out.cols/2);
+        } else if(out.size()<=size_t(INT32_MAX)) {
+            packedSiluMultiply<T,uint32_t><<<grid(out.size()),256,0,cudaStreamPerThread>>>(
+                as<T>(x),as<T>(out),uint32_t(out.size()),out.cols);
+        } else {
+            packedSiluMultiply<T,size_t><<<grid(out.size()),256,0,cudaStreamPerThread>>>(
+                as<T>(x),as<T>(out),out.size(),out.cols);
+        });
     check(cudaGetLastError()); return out;
 }
 Tensor Runtime::scaledResidual(const Tensor &x,const Tensor &y,const Tensor &scale) {
@@ -687,12 +831,25 @@ Tensor Runtime::textRope(const Tensor &x,float theta) {
     require(x.cols%128==0,"invalid Qwen RoPE shape"); Tensor out(x.rows,x.cols,x.dtype);
     DISPATCH_TENSOR(x.dtype, T, textRopeKernel<T><<<grid(x.size()),256,0,cudaStreamPerThread>>>(as<T>(x),as<T>(out),x.size(),x.cols,theta)); check(cudaGetLastError()); return out;
 }
-Tensor Runtime::concat(const std::vector<Tensor> &xs) {
+namespace {
+Tensor concatenate(const std::vector<Tensor> &xs,Tensor *target) {
     require(!xs.empty(),"empty concat"); int rows=0;
-    for(auto &x:xs) { require(x.cols==xs[0].cols && x.dtype==xs[0].dtype && x.rows<=INT32_MAX-rows,"concat shape mismatch"); rows+=x.rows; }
-    Tensor out(rows,xs[0].cols,xs[0].dtype); size_t pos=0;
-    for(auto &x:xs) { copy(out.data+pos,x.data,x.bytes(),cudaMemcpyDeviceToDevice); pos+=x.size()*(x.isFloat32()?2:1); } return out;
+    for(const auto &x:xs) {
+        require(x.data && x.rows>0 && x.cols==xs[0].cols && x.dtype==xs[0].dtype && x.rows<=INT32_MAX-rows,
+                "concat shape/dtype mismatch");
+        require(!target || x.storage!=target->storage,"concat output must not share input storage");
+        rows+=x.rows;
+    }
+    Tensor out=target?*target:Tensor(rows,xs[0].cols,xs[0].dtype);
+    require(out.data && out.rows==rows && out.cols==xs[0].cols && out.dtype==xs[0].dtype,
+            "concat output shape/dtype mismatch");
+    size_t pos=0;
+    for(const auto &x:xs) { copy(out.data+pos,x.data,x.bytes(),cudaMemcpyDeviceToDevice); pos+=x.size()*(x.isFloat32()?2:1); }
+    return out;
 }
+}
+Tensor Runtime::concat(const std::vector<Tensor> &xs) { return concatenate(xs,nullptr); }
+void Runtime::concatInto(const std::vector<Tensor> &xs,Tensor &out) { concatenate(xs,&out); }
 Tensor Runtime::rope(const Tensor &x,const float *cos,const float *sin,int dim) {
     return rope(x,prepareRope(cos,sin,x.rows,dim));
 }
@@ -717,6 +874,30 @@ Tensor Runtime::attention(const Tensor &q,const Tensor &k,const Tensor &v,int he
                           int kvHeads,bool causal,int tile,int height,int width) {
     require(heads>0 && q.cols%heads==0,"invalid attention heads");
     return attentionScaled(q,k,v,heads,1.f/std::sqrt(float(q.cols/heads)),mask,chunk,kvHeads,causal,tile,height,width);
+}
+Tensor Runtime::packedSelfAttention(const Tensor &qkv,int heads,int batch) {
+    require(batch>0 && qkv.rows>0 && qkv.rows%batch==0 && heads>0 && qkv.cols>0 &&
+            qkv.cols%3==0 && (qkv.cols/3)%heads==0,"invalid packed self-attention shape");
+    int width=qkv.cols/3,dim=width/heads,tokens=qkv.rows/batch;
+    if(!qkv.isFloat32() && (dim==64 || dim==128) && uintptr_t(qkv.data)%16==0) {
+        Tensor out(qkv.rows,width,qkv.dtype);
+        for(int i=0;i<batch;) {
+            int count=std::min(batch-i,65535);
+            const auto *p=qkv.data+size_t(i)*tokens*qkv.cols;
+            auto target=out.rowSlice(i*tokens,count*tokens);
+            check(fusedAttention(p,p+width,p+2*width,target.data,tokens,tokens,heads,heads,dim,
+                qkv.dtype==DType::FP16,false,0,0,0,1.f/std::sqrt(float(dim)),numerics_.fp32SoftmaxSum,
+                cudaStreamPerThread,qkv.cols,qkv.cols,count));
+            i+=count;
+        }
+        return out;
+    }
+    auto q=columns(qkv,0,width),k=columns(qkv,width,width),v=columns(qkv,2*width,width);
+    std::vector<Tensor> outputs;
+    for(int i=0;i<batch;++i)
+        outputs.push_back(attention(q.rowSlice(i*tokens,tokens),k.rowSlice(i*tokens,tokens),
+                                    v.rowSlice(i*tokens,tokens),heads));
+    return batch==1 ? outputs[0] : concat(outputs);
 }
 Tensor Runtime::attentionScaled(const Tensor &q,const Tensor &k,const Tensor &v,int heads,float scoreScale,
                                 const uint8_t *mask,int chunk,int kvHeads,bool causal,int tile,int height,int width) {
@@ -849,12 +1030,23 @@ struct Weights::Impl {
     Runtime &rt; std::ifstream file; json11::Json header; uint64_t base=0,fileSize=0;
     std::shared_ptr<void> mapping;
     std::unordered_map<std::string,Tensor> cache;
+    struct Partition {
+        int axis,rank,size,groups;
+        bool operator==(const Partition &b) const {
+            return axis==b.axis && rank==b.rank && size==b.size && groups==b.groups;
+        }
+    };
+    std::unordered_map<std::string,Partition> partitions;
     struct HostWeight { int rows,cols; DType dtype; std::vector<uint8_t> bytes; };
     std::unordered_map<std::string,HostWeight> offloaded;
     std::shared_ptr<PackedCache> packed;
     std::shared_ptr<HostCache> host;
     std::string directory,checkpoint;
     std::unordered_map<std::string,std::unique_ptr<Weights>> shards;
+    void checkCacheSource(const Impl &source) const {
+        require(&rt==&source.rt && checkpoint==source.checkpoint && partitions==source.partitions,
+                "shared weight cache requires the same runtime, checkpoint and partitions");
+    }
     Impl(Runtime &rt,const std::string &path):rt(rt),checkpoint(path) {
         if(std::filesystem::is_directory(path)) {
             directory=path;
@@ -886,6 +1078,19 @@ struct Weights::Impl {
 };
 Weights::Weights(Runtime &rt,const std::string &path):impl_(new Impl(rt,path)) {}
 Weights::~Weights()=default;
+void Weights::shard(const std::string &name,int axis,int rank,int size,int groups) {
+    auto &i=*impl_;
+    require((axis==0 || axis==1) && size>0 && rank>=0 && rank<size && groups>0,
+            "invalid weight partition");
+    require(i.cache.empty() && i.offloaded.empty() && i.shards.empty() &&
+            (!i.host || i.host->tensors.empty()) && (!i.packed || i.packed->tensors.empty()),
+            "configure weight partitions before loading");
+    i.partitions[name]={axis,rank,size,groups};
+}
+int Weights::shardGroups(const std::string &name) const {
+    auto found=impl_->partitions.find(name);
+    return found==impl_->partitions.end()?1:found->second.groups;
+}
 const Tensor *Weights::optional(const std::string &name) {
     if(impl_->header[name].is_null()) return nullptr; return &get(name);
 }
@@ -908,6 +1113,7 @@ const Tensor &Weights::get(const std::string &name) {
             shard.reset(new Weights(i.rt,i.directory+"/"+file));
             shard->impl_->packed=i.packed;
             shard->impl_->host=i.host;
+            shard->impl_->partitions=i.partitions;
         }
         return shard->get(name);
     }
@@ -920,8 +1126,23 @@ const Tensor &Weights::get(const std::string &name) {
     double a=offsets[0].number_value(),z=offsets[1].number_value();
     require(a>=0 && z>=a && std::floor(a)==a && std::floor(z)==z && z<=double(i.fileSize-i.base),"weight offset outside file");
     require(z-a==double(n*(dtype=="F32"?4:2)),"weight size mismatch");
+    const auto partition=i.partitions.find(name);
+    bool sliced=partition!=i.partitions.end() && partition->second.size>1;
+    const int originalRows=rows,originalCols=cols;
+    int axis=0,groupWidth=0,partWidth=0;
+    if(sliced) {
+        const auto &p=partition->second;
+        require(shape.size()<=2,"partition requires a matrix or vector");
+        axis=shape.size()==1?1:p.axis;
+        int width=axis==0?rows:cols;
+        require(width%p.groups==0 && (width/p.groups)%p.size==0,
+                "weight dimension must divide partition groups and ranks");
+        groupWidth=width/p.groups; partWidth=groupWidth/p.size;
+        if(axis==0) rows/=p.size; else cols/=p.size;
+    }
+    const size_t weightBytes=size_t(rows)*cols*(dtype=="F32"?4:2);
     Tensor raw;
-    if(i.packed && dtype=="BF16" && i.rt.isFloat32()) {
+    if(i.packed && dtype=="BF16") {
         auto cached=i.packed->tensors.find(name);
         if(cached!=i.packed->tensors.end()) raw=cached->second;
     }
@@ -940,16 +1161,35 @@ const Tensor &Weights::get(const std::string &name) {
         i.file.read(reinterpret_cast<char *>(buffer.data()),buffer.size()); require(bool(i.file),"truncated weight");
         source=buffer.data();
     }
-    if(source && i.host && !i.host->tensors.count(name) && uint64_t(z-a)<=i.host->budget-i.host->bytes) {
+    std::vector<uint8_t> partitionBytes;
+    if(source && sliced && !(i.host && i.host->tensors.count(name))) {
+        const auto &p=partition->second;
+        const size_t scalarBytes=dtype=="F32"?4:2;
+        partitionBytes.resize(weightBytes);
+        if(axis==0) {
+            size_t chunk=size_t(partWidth)*originalCols*scalarBytes;
+            for(int g=0;g<p.groups;++g)
+                std::memcpy(partitionBytes.data()+g*chunk,
+                    static_cast<const uint8_t *>(source)+size_t(g*groupWidth+p.rank*partWidth)*originalCols*scalarBytes,chunk);
+        } else {
+            for(int row=0;row<originalRows;++row)
+                for(int g=0;g<p.groups;++g)
+                    std::memcpy(partitionBytes.data()+(size_t(row)*cols+g*partWidth)*scalarBytes,
+                        static_cast<const uint8_t *>(source)+(size_t(row)*originalCols+g*groupWidth+p.rank*partWidth)*scalarBytes,
+                        size_t(partWidth)*scalarBytes);
+        }
+        source=partitionBytes.data();
+    }
+    if(source && i.host && !i.host->tensors.count(name) && weightBytes<=i.host->budget-i.host->bytes) {
         void *p=nullptr;
-        auto status=cudaHostAlloc(&p,uint64_t(z-a),cudaHostAllocPortable);
+        auto status=cudaHostAlloc(&p,weightBytes,cudaHostAllocPortable);
         pinned=status==cudaSuccess;
         if(status==cudaErrorInvalidValue) {
             // Large pinned allocations can be rejected despite valid size/flags.
             // Cache ordinary host bytes instead, avoiding expensive retries and
             // file-backed uploads on subsequent requests.
             cudaGetLastError();
-            p=std::malloc(uint64_t(z-a));
+            p=std::malloc(weightBytes);
             if(!p) i.host->budget=i.host->bytes;
         } else if(status==cudaErrorMemoryAllocation) {
             cudaGetLastError();
@@ -960,9 +1200,9 @@ const Tensor &Weights::get(const std::string &name) {
             std::shared_ptr<void> storage(p,[pinned](void *x) {
                 if(pinned) cudaFreeHost(x); else std::free(x);
             });
-            std::memcpy(p,source,uint64_t(z-a));
+            std::memcpy(p,source,weightBytes);
             i.host->tensors.emplace(name,Impl::HostCache::Buffer{std::move(storage),pinned});
-            i.host->bytes+=uint64_t(z-a);
+            i.host->bytes+=weightBytes;
             source=p;
         }
     }
@@ -996,7 +1236,10 @@ Tensor Weights::linear(const Tensor &x,const std::string &prefix,bool separateBi
     if(separateBias && bias) out=impl_->rt.bias(out,*bias);
     return out;
 }
-void Weights::clear() { impl_->cache.clear(); impl_->offloaded.clear(); impl_->shards.clear(); impl_->packed.reset(); }
+void Weights::clear(bool keepPackedCache) {
+    impl_->cache.clear(); impl_->offloaded.clear(); impl_->shards.clear();
+    if(!keepPackedCache) impl_->packed.reset();
+}
 void Weights::offload() {
     impl_->rt.activate();
     for(const auto &entry:impl_->cache) {
@@ -1026,14 +1269,13 @@ void Weights::enableHostCache(size_t maxBytes) {
     for(auto &shard:i.shards) shard.second->impl_->host=i.host;
 }
 void Weights::shareHostCache(const Weights &source) {
-    require(&impl_->rt==&source.impl_->rt && impl_->checkpoint==source.impl_->checkpoint,
-            "shared host cache requires the same runtime and checkpoint");
+    impl_->checkCacheSource(*source.impl_);
     impl_->host=source.impl_->host;
     for(auto &shard:impl_->shards) shard.second->impl_->host=impl_->host;
 }
 void Weights::enablePackedCache(size_t reserveBytes) {
     auto &i=*impl_;
-    if(!i.rt.isFloat32() || i.packed) return;
+    if(i.packed) return;
     i.rt.activate();
     size_t available=0,total=0; check(cudaMemGetInfo(&available,&total));
     if(available<=reserveBytes) return;
@@ -1041,6 +1283,11 @@ void Weights::enablePackedCache(size_t reserveBytes) {
     i.packed->budget=std::min(available/2,available-reserveBytes);
     // A single budget is shared by every shard, including those already opened.
     for(auto &shard:i.shards) shard.second->impl_->packed=i.packed;
+}
+void Weights::sharePackedCache(const Weights &source) {
+    impl_->checkCacheSource(*source.impl_);
+    impl_->packed=source.impl_->packed;
+    for(auto &shard:impl_->shards) shard.second->impl_->packed=impl_->packed;
 }
 void Weights::erasePrefix(const std::string &prefix) {
     for(auto it=impl_->cache.begin();it!=impl_->cache.end();) {

@@ -1,7 +1,8 @@
 """Exercise the real HTTP service, including cancellation and recovery after it.
 
-The server must be launched with --api-key test-h3 (or supply --key), and a single
-permitted GPU. This test produces a small 124-frame MP4 with a two-point schedule.
+The server must be launched with --api-key test-h3 (or supply --key), on the
+permitted GPU(s). This also checks tensor-parallel cancellation/recovery when
+the server uses --devices. It produces a small 124-frame MP4 with a two-point schedule.
 """
 
 import argparse
@@ -14,6 +15,7 @@ from pathlib import Path
 p = argparse.ArgumentParser()
 p.add_argument("--base", default="http://127.0.0.1:8009")
 p.add_argument("--key", default="test-h3")
+p.add_argument("--tp-size", type=int, default=1)
 p.add_argument("--output", required=True)
 a = p.parse_args()
 out = Path(a.output)
@@ -52,6 +54,7 @@ for _ in range(60):
     time.sleep(1)
 else:
     raise RuntimeError("server did not become ready")
+assert obj("GET", "/health").get("tensor_parallel_size", 1) == a.tp_size
 assert request("GET", "/demo", auth=False)[0] == 200
 assert obj("GET", "/openapi.json", auth=False)["openapi"] == "3.1.0"
 obj("GET", "/v1/models", auth=False, expected=401)

@@ -1,4 +1,5 @@
 #include "models/minimax_h3/runtime.h"
+#include "models/minimax_h3/parallel.h"
 #include "json11.hpp"
 #include <cuda_runtime_api.h>
 #include <algorithm>
@@ -121,22 +122,37 @@ Pipeline::Pipeline(const std::string &dir, int device, bool fp32, DType videoPre
     retainWeights_ = !fp32 && videoPrecision != DType::FP32 && total >= (size_t(68) << 30) &&
                      available >= (size_t(60) << 30);
 }
+Pipeline::Pipeline(const std::string &dir, const std::vector<int> &devices, bool fp32, DType videoPrecision)
+    : Pipeline(dir, devices, fp32, videoPrecision, nomas::RowReduction::Activation) {}
+Pipeline::Pipeline(const std::string &dir, const std::vector<int> &devices, bool fp32, DType videoPrecision,
+                   nomas::RowReduction ditReduction)
+    : Pipeline(dir, devices.empty() ? throw std::invalid_argument("empty CUDA device list") : devices[0],
+               fp32, videoPrecision) {
+    if (devices.size() > 1) {
+        parallel_ = std::make_unique<ParallelModel>(dir, devices, fp32, videoPrecision, video_, ditReduction);
+        video_.setTileRunner([this](size_t count, const std::function<Tensor(VideoVAE &,size_t)> &task) {
+            return parallel_->videoTiles(count, task);
+        }, devices.size());
+    }
+    rt_.activate();
+}
+Pipeline::~Pipeline() = default;
 Generation Pipeline::generate(const GenerateOptions &o, Progress progress, Trace trace,
                               const std::vector<float> *initialVideo,
                               const std::vector<float> *initialAudio) {
-    return generateImpl(o, std::move(progress), std::move(trace), initialVideo, initialAudio, {}, {});
+    return generateImpl(o, std::move(progress), std::move(trace), initialVideo, initialAudio, {}, {}, true);
 }
 Generation Pipeline::generateMP4(const GenerateOptions &o, const std::string &path, const std::string &ffmpeg,
                                  Progress progress, Trace trace, const std::vector<float> *initialVideo,
-                                 const std::vector<float> *initialAudio) {
+                                 const std::vector<float> *initialAudio, bool retainRGB) {
     if (path.empty())
         throw std::invalid_argument("MP4 output path is empty");
-    return generateImpl(o, std::move(progress), std::move(trace), initialVideo, initialAudio, path, ffmpeg);
+    return generateImpl(o, std::move(progress), std::move(trace), initialVideo, initialAudio, path, ffmpeg, retainRGB);
 }
 Generation Pipeline::generateImpl(const GenerateOptions &o, Progress progress, Trace trace,
                                   const std::vector<float> *initialVideo,
                                   const std::vector<float> *initialAudio, const std::string &path,
-                                  const std::string &ffmpeg) {
+                                  const std::string &ffmpeg, bool retainRGB) {
     o.validate();
     rt_.activate();
     auto tick = [&](const std::string &stage, int i, int n) {
@@ -144,6 +160,8 @@ Generation Pipeline::generateImpl(const GenerateOptions &o, Progress progress, T
             progress(stage, i, n);
     };
     auto unload = [&] {
+        if (parallel_)
+            parallel_->unload();
         text_.unload();
         transformer_.unload();
         if (referenceTransformer_)
@@ -154,9 +172,10 @@ Generation Pipeline::generateImpl(const GenerateOptions &o, Progress progress, T
     try {
         auto images = prepareKeyframes(o);
         auto references = prepareReferences(o);
+        const bool referenceMode = !references.empty();
         bool conditioned = !images.empty() || !references.empty();
         Transformer *denoiser = &transformer_;
-        if (!references.empty()) {
+        if (!parallel_ && referenceMode) {
             transformer_.unload();
             if (!referenceTransformer_)
                 referenceTransformer_ =
@@ -213,12 +232,14 @@ Generation Pipeline::generateImpl(const GenerateOptions &o, Progress progress, T
         tokens.insert(tokens.end(), prompt.begin(), prompt.end());
         textTags.insert(textTags.end(), prompt.size(), 1);
         tick("text", 0, 50);
-        auto text = text_.encodeVisual(tokens, visual, [&](const std::string &name, const Tensor &) {
+        auto textProgress = [&](const std::string &name, const Tensor &) {
             if (name.compare(0, 6, "layer.") == 0)
                 tick("text", std::stoi(name.substr(6)) + 1, 50);
             else
                 tick("vision", 0, visual.size());
-        });
+        };
+        auto text = parallel_ ? parallel_->encode(tokens, visual, textProgress)
+                              : text_.encodeVisual(tokens, visual, textProgress);
         text_.unload();
         if (trace)
             trace("text", text);
@@ -299,7 +320,8 @@ Generation Pipeline::generateImpl(const GenerateOptions &o, Progress progress, T
         // Reuse both VAE encoders and decoders when the residency budget permits.
         // Smaller devices keep the streaming lifecycle before loading the denoiser.
         if (conditioned && !retainWeights_) {
-            video_.unload();
+            if (parallel_) parallel_->unloadVideo();
+            else video_.unload();
             audio_.unload();
         }
         images.clear();
@@ -372,7 +394,11 @@ Generation Pipeline::generateImpl(const GenerateOptions &o, Progress progress, T
             plans.push_back(std::move(times));
         }
         tick("prepare", 0, 50);
-        denoiser->prepare(plans, [&](int current, int total) { tick("prepare", current, total); });
+        auto prepared = [&](int current, int total) { tick("prepare", current, total); };
+        if (parallel_)
+            parallel_->prepare(plans, referenceMode, prepared);
+        else
+            denoiser->prepare(plans, prepared);
         tick("prepare", 50, 50);
         for (size_t i = 0; i + 1 < vs.size(); ++i) {
             auto [vi, ai, ci, aci] = timeIndices[i];
@@ -383,9 +409,11 @@ Generation Pipeline::generateImpl(const GenerateOptions &o, Progress progress, T
             for (int row = 0; row < audioConditionRows; ++row)
                 layout.timeIndices[layout.audio[row]] = aci;
             tick("denoise", i, vs.size() - 1);
-            auto velocity = denoiser->forward(v, a, text, layout, [&](const std::string &, const Tensor &) {
+            auto denoiseProgress = [&](const std::string &, const Tensor &) {
                 tick("denoise", i, vs.size() - 1);
-            });
+            };
+            auto velocity = parallel_ ? parallel_->forward(v, a, text, layout, denoiseProgress)
+                                      : denoiser->forward(v, a, text, layout, denoiseProgress);
             auto generated = full_.step(v.rowSlice(conditionRows, v.rows - conditionRows),
                                         velocity.first.rowSlice(conditionRows, v.rows - conditionRows),
                                         1.f - vs[i], vs[i], vs[i + 1]);
@@ -406,8 +434,10 @@ Generation Pipeline::generateImpl(const GenerateOptions &o, Progress progress, T
         v = {};
         a = {};
         text = {};
-        if (!retainWeights_)
-            denoiser->unload();
+        if (!retainWeights_) {
+            if (parallel_) parallel_->unload();
+            else denoiser->unload();
+        }
         VideoTensor latents(lt, lh, lw, 24);
         for (int t = 0; t < lt; ++t)
             for (int y = 0; y < lh; ++y)
@@ -443,10 +473,10 @@ Generation Pipeline::generateImpl(const GenerateOptions &o, Progress progress, T
         int videoCurrent = 0, videoTotal = 1;
         if (!path.empty())
             writer = std::make_unique<MP4Writer>(result, path, ffmpeg);
-        std::function<void(const std::vector<uint8_t> &)> onFrames;
+        std::function<void(std::vector<uint8_t>)> onFrames;
         if (writer)
-            onFrames = [&](const std::vector<uint8_t> &rgb) {
-                writer->write(rgb.data(), rgb.size(),
+            onFrames = [&](std::vector<uint8_t> rgb) {
+                writer->write(std::move(rgb),
                               [&] { tick("video_decode", videoCurrent, videoTotal); });
             };
         result.rgb = video_.decodeRGB(
@@ -456,11 +486,13 @@ Generation Pipeline::generateImpl(const GenerateOptions &o, Progress progress, T
                 videoTotal = total;
                 tick("video_decode", current, total);
             },
-            std::move(onFrames));
-        if (!retainWeights_)
-            video_.unload();
+            std::move(onFrames), retainRGB);
+        if (!retainWeights_) {
+            if (parallel_) parallel_->unloadVideo();
+            else video_.unload();
+        }
         tick("video_decode", 1, 1);
-        if (result.rgb.size() != size_t(o.frames) * o.width * o.height * 3)
+        if (retainRGB && result.rgb.size() != size_t(o.frames) * o.width * o.height * 3)
             throw std::runtime_error("decoded H3 frame count mismatch");
         latents = {};
         if (writer) {

@@ -29,4 +29,10 @@ bool FastllmCudaDeepSeekV41MarkovSampleDevice(const fastllm::Data &logits,
     const fastllm::Data &embedWeight, const fastllm::Data &headWeight,
     int block, float temperature, fastllm::Data &tokens, fastllm::Data &probs,
     fastllm::Data &scratch, fastllm::Data &outEmbeds);
+// Filtered proposal q with graph-stable scratch and a replay-advancing RNG.
+bool FastllmCudaDeepSeekV41MarkovFilteredSampleDevice(const fastllm::Data &logits,
+    const fastllm::Data &embedWeight, const fastllm::Data &headWeight,
+    int block, float temperature, int topK, float topP,
+    fastllm::Data &tokens, fastllm::Data &probs, fastllm::Data &outEmbeds,
+    fastllm::Data &samplingWorkspace);
 }

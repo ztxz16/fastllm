@@ -468,6 +468,27 @@ class AutoConfigTest(unittest.TestCase):
             p = self.resolve(self.args('-t', '8'))
         self.assertEqual(p['threads'], 8)
 
+    def test_v41_numa_calibration_uses_dominant_format_and_decode_rows(self):
+        from fastllm_pytools import cpu_tuning
+        self.g.family, self.g.hidden, self.g.intermediate, self.g.topk = 'deepseek_v41', 5120, 2304, 6
+        tensors = [memory.Tensor('blk.0.ffn_gate_exps.weight', (2, 2), 100, 'gguf:29'),
+                   memory.Tensor('blk.1.ffn_gate_exps.weight', (2, 2), 10, 'gguf:16')]
+        for drafts, backend in ((None, ''), (0, ''), (3, ''), (5, ''), (7, ''), (5, 'cpu'), (5, 'disk')):
+            args = self.args() if drafts is None else self.args('--dspark', str(drafts))
+            args.moe_device = backend
+            metadata = {'model_type': 'deepseek_v41'}
+            with self.subTest(drafts=drafts, backend=backend), \
+                    patch.object(memory, 'model_inputs', return_value=(metadata, tensors, self.g)), \
+                    patch.object(auto, 'cpu_threads', return_value=64), \
+                    patch.dict(os.environ, {}, clear=True), \
+                    patch.object(cpu_tuning, 'select_threads', side_effect=RuntimeError('stop after dispatch')) as calibrate:
+                with self.assertRaisesRegex(RuntimeError, 'stop after dispatch'):
+                    auto.resolve(args, self.gpu.__getitem__, hardware=self.hardware, ram=self.ram, use_numa=True)
+            if not backend:
+                calibrate.assert_called_once_with(5120, 2304, 29, 64, numa=True, rows=(5 if drafts is None else drafts) + 1, topk=6)
+            else:
+                calibrate.assert_called_once_with(5120, 2304, 16, 64)
+
     def test_auto_threads_record_linear_calibration(self):
         from fastllm_pytools import cpu_tuning
         self.g.hidden, self.g.intermediate = 2048, 1024

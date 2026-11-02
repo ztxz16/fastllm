@@ -56,7 +56,7 @@ struct Glm5TensorParallel {
             const size_t reserve = DeviceMemoryReserveBytes(total) + 64 * maxStride;
             budget = std::min(budget, std::min(DeviceCacheBudgetBytes(d), uint64_t(free > reserve ? free - reserve : 0)));
         }
-        plan = cuda::PlanCacheSlots(strides, group.layout.experts, budget, kMaxTopK);
+        plan = fastllm::cuda::PlanCacheSlots(strides, group.layout.experts, budget, kMaxTopK);
         AssertInFastLLM(plan.offsets.size() >= kMaxTopK, "Insufficient cache budget for MoE TP.");
         const size_t residentSlots = plan.offsets.size();
         std::vector<int> keyParts(group.totalRecords), slotParts(residentSlots);
@@ -284,7 +284,7 @@ bool RunGlm5Tp(OffloadGroup &group, int table, const fastllm::Data &input,
     }
     checkCudaErrors("TP reduce IDs", cudaMemcpyAsync(root.ids.cudaData,s.Ids(),routes*4,cudaMemcpyHostToDevice,cudaStreamPerThread));
     checkCudaErrors("TP reduce owners", cudaMemcpyAsync(root.owners.cudaData,s.Owners(),routes*4,cudaMemcpyHostToDevice,cudaStreamPerThread));
-    cuda::dsv41_cache::Reduce<<<dim3(16,rows),256,0,cudaStreamPerThread>>>(static_cast<float *>(root.cpu.cudaData),
+    fastllm::cuda::dsv41_cache::Reduce<<<dim3(16,rows),256,0,cudaStreamPerThread>>>(static_cast<float *>(root.cpu.cudaData),
         static_cast<float *>(root.result.cudaData),static_cast<int32_t *>(root.owners.cudaData),static_cast<int32_t *>(root.ids.cudaData),
         static_cast<__nv_bfloat16 *>(output.cudaData),4096,topk);
     checkCudaErrors("TP ordered reduction",cudaGetLastError());
