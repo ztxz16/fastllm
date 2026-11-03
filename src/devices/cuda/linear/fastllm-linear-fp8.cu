@@ -1657,22 +1657,27 @@ bool FastllmCudaMatMulFloatFP8E4M3PerChannel(const fastllm::Data &input, fastllm
 void FastllmCudaFP8E4M3EnsureScalesAndBiasOnDevice(fastllm::Data &weight, const fastllm::Data &bias, int k) {
     // After FP8 Marlin converts cudaData in place, scales/bias remain in
     // extraCudaData. Do not use the weight layout as the cache-init signal.
-    if (weight.extraCudaData.size() == 0) {
+    // A cached output-channel shard can reserve the auxiliary vector before
+    // this owner runs a GEMV. Reserved slots do not imply initialized scales.
+    if (weight.extraCudaData.size() < 2) weight.extraCudaData.resize(2, nullptr);
+    if (weight.extraCudaData[0] == nullptr) {
         float *cudaScales;
         cudaError_t state = cudaSuccess;
         state = cudaMalloc(&cudaScales, weight.scales.size() * sizeof(float));
         state = cudaMemcpy(cudaScales, weight.scales.data(), weight.scales.size() * sizeof(float), cudaMemcpyHostToDevice);
-        weight.extraCudaData.push_back((void*)cudaScales);
-
+        checkCudaErrors("Error: CUDA error when moving FP8 scales to device!", state);
+        weight.extraCudaData[0] = cudaScales;
+    }
+    if (weight.extraCudaData[1] == nullptr) {
         float *cudaBiasData;
-        state = cudaMalloc(&cudaBiasData, k * sizeof(float));
+        cudaError_t state = cudaMalloc(&cudaBiasData, k * sizeof(float));
         if (bias.dims.size() > 0) {
             state = cudaMemcpy(cudaBiasData, (uint8_t*)bias.cudaData, k * sizeof(float), cudaMemcpyDeviceToDevice);
         } else {
             state = cudaMemset(cudaBiasData, 0, k * sizeof(float));
         }
         checkCudaErrors("Error: CUDA error when moving bias to device!", state);
-        weight.extraCudaData.push_back((void*)cudaBiasData);
+        weight.extraCudaData[1] = cudaBiasData;
     }
 }
 

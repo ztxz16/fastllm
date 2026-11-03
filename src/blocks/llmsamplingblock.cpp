@@ -219,6 +219,11 @@ namespace fastllm {
             for (const auto &deviceData : logits.multiDeviceDatas) {
                 FastllmCudaCurrentThreadStreamWaitEvent(sourceReady->at(deviceData.first));
             }
+            std::vector<int> devices;
+            for (const auto &entry : logits.multiDeviceDatas) devices.push_back(entry.first);
+            const bool peerGather = FastllmCudaPeerAccessInit(devices);
+            std::vector<void*> destinations, sources;
+            std::vector<size_t> destPitches, sourcePitches, widths, heights;
             for (auto &deviceData : logits.multiDeviceDatas) {
                 int device = deviceData.first;
                 Data *local = deviceData.second;
@@ -236,20 +241,30 @@ namespace fastllm {
                                     localOffset + len <= localVocab,
                                     "Tensor-parallel logits have an invalid shard range.\n");
                     if (len > 0) {
-                        FastllmCudaMemcpy2DDeviceToDeviceAuto(
-                            (uint8_t*)logits.cudaData + (size_t)range.first * elementBytes,
-                            (size_t)vocabSize * elementBytes,
-                            (uint8_t*)local->cudaData + (size_t)localOffset * elementBytes,
-                            (size_t)localVocab * elementBytes,
-                            (size_t)len * elementBytes,
-                            (size_t)rows,
-                            rootDevice,
-                            device);
+                        auto *dest = (uint8_t*)logits.cudaData + (size_t)range.first * elementBytes;
+                        auto *source = (uint8_t*)local->cudaData + (size_t)localOffset * elementBytes;
+                        if (peerGather) {
+                            destinations.push_back(dest); sources.push_back(source);
+                            destPitches.push_back((size_t)vocabSize * elementBytes);
+                            sourcePitches.push_back((size_t)localVocab * elementBytes);
+                            widths.push_back((size_t)len * elementBytes); heights.push_back(rows);
+                        } else {
+                            FastllmCudaMemcpy2DDeviceToDeviceAuto(dest, (size_t)vocabSize * elementBytes,
+                                source, (size_t)localVocab * elementBytes, (size_t)len * elementBytes,
+                                rows, rootDevice, device);
+                        }
                     }
                     localOffset += len;
                 }
                 AssertInFastLLM(localOffset == localVocab,
                                 "Tensor-parallel logits shard size mismatch.\n");
+            }
+            // Reuse the batched copy kernel for direct peer reads. CUDA's
+            // copy-engine path can crash for valid logits buffers on H20;
+            // the kernel stays ordered after all shard readiness events.
+            if (!destinations.empty()) {
+                FastllmCudaMemcpy2DDeviceToDeviceBatch(destinations.data(), destPitches.data(),
+                    sources.data(), sourcePitches.data(), widths.data(), heights.data(), destinations.size());
             }
 
             // Reset returns source shards to their device memory pools. Keep

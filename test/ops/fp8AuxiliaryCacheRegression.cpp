@@ -3,6 +3,7 @@
 #include "utils.h"
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/cuda/fastllm-fp8-auxiliary.h"
+#include "devices/cuda/fastllm-v41-decode.cuh"
 #include <cuda_runtime.h>
 #include <cstdio>
 #include <stdexcept>
@@ -58,6 +59,26 @@ int main() {
             Check(FastllmCudaFP8RowShard(owner, 32, 32) == views[0], "row cache miss");
             Check(FastllmCudaFP8PairedRowShard(owner, 32, 32) == views[1], "paired-row cache miss");
             Check(FastllmCudaFP8ColumnShard(owner, 32, 32) == views[2], "column cache miss");
+            // Prefill creates slice caches before decode first uses the
+            // owner's scales. Seven reserved auxiliary slots are still null.
+            if (generation != 2) continue;
+            Data input(BFLOAT16, {1, 128}, std::vector<float>(128, 1.0f));
+            input.ToDevice(CUDA, std::vector<int>{0});
+            Data output(BFLOAT16, {1, 256});
+            output.ToDevice(CUDA, {0}, false);
+            Check(FastllmCudaBFloat16FP8ReplicatedRowSlice(input, owner, output, 32, 32),
+                  "single-token projection after shard caching");
+            Check(cudaStreamSynchronize(cudaStreamPerThread) == cudaSuccess, "projection completion");
+            output.ToDevice(CPU);
+            ToDataTypeForceCPU(output, FLOAT32);
+            const float expected = (16.0f + 2.0f * generation) * scale;
+            for (int row = 32; row < 64; ++row) {
+                if (reinterpret_cast<float*>(output.cpuData)[row] != expected)
+                    std::fprintf(stderr, "generation=%d row=%d actual=%g expected=%g\n", generation, row,
+                        reinterpret_cast<float*>(output.cpuData)[row], expected);
+                Check(reinterpret_cast<float*>(output.cpuData)[row] == expected,
+                      "projection read uninitialized or stale scales");
+            }
         }
         std::puts("PASS FP8 row/paired-row/column caches: reuse, CopyFrom and FreeSpace invalidation");
     } catch (const std::exception &error) {

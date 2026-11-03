@@ -127,6 +127,17 @@ static void CheckFailures() {
     });
     Require(failedSubmit.Error() == "injected NCCL submission failure", "lost failure reason");
 
+    // Matching counts and dtypes are insufficient across distinct collective
+    // operations or broadcast roots. Reject them before submitting to NCCL.
+    for (uint64_t mismatch : {uint64_t(1), uint64_t(1) << 32}) {
+        NcclSubmitRendezvous signature(2, 5s);
+        RunRanks(2, [&](int rank) {
+            Require(!signature.Wait(rank, NcclSubmitRendezvous::Before, 4, 0, 0us,
+                                    uint64_t(3) + (rank ? mismatch : 0)),
+                    "inconsistent collective signature accepted");
+        });
+    }
+
     NcclSubmitRendezvous invalid(3, 5s);
     Require(!invalid.Wait(3, NcclSubmitRendezvous::Before, 4, 0), "invalid rank accepted");
     // A new communicator generation owns fresh state, independent of all

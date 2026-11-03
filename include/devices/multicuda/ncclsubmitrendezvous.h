@@ -5,6 +5,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -23,8 +24,9 @@ public:
             std::chrono::milliseconds timeout = std::chrono::minutes(5))
         : nextPhase(ranks, 0), timeout(timeout) {}
 
-    bool Wait(int rank, Phase phase, int count, int dataType,
-              std::chrono::microseconds spinBudget = std::chrono::microseconds::zero()) {
+    bool Wait(int rank, Phase phase, size_t count, int dataType,
+              std::chrono::microseconds spinBudget = std::chrono::microseconds::zero(),
+              uint64_t signature = 0) {
         std::unique_lock<std::mutex> lock(mutex);
         if (!error.empty()) {
             return false;
@@ -36,9 +38,10 @@ public:
         if (arrived == 0 && phase == Before) {
             expectedCount = count;
             expectedDataType = dataType;
+            expectedSignature = signature;
         }
-        if (count != expectedCount || dataType != expectedDataType) {
-            return FailLocked("inconsistent AllReduce count or data type");
+        if (count != expectedCount || dataType != expectedDataType || signature != expectedSignature) {
+            return FailLocked("inconsistent collective count, data type, operation or root");
         }
         const uint64_t current = epoch;
         ++nextPhase[rank];
@@ -113,7 +116,8 @@ private:
     std::atomic<bool> aborted{false};
     uint64_t epoch = 0;
     int arrived = 0;
-    int expectedCount = 0;
+    size_t expectedCount = 0;
+    uint64_t expectedSignature = 0;
     int expectedDataType = 0;
     std::string error;
 };
