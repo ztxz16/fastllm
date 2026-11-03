@@ -7,6 +7,7 @@
 
 #define FASTLLM_CUDA_NO_MALLOC_CHECK_MACRO
 #include "fastllm-cuda.cuh"
+#include "fastllm-cuda-graph-compat.cuh"
 #include "devices/cuda/fastllm-cuda-v41-gguf.h"
 #include "devices/cuda/fastllm-cuda-graph-workspace.h"
 #include "devices/cuda/fastllm-cuda-gdn.h"
@@ -25054,11 +25055,11 @@ bool FastllmCudaGraphAppendChild(const void *child) {
     const cudaGraphNode_t *deps = nullptr;
     size_t count = 0;
     cudaGraphNode_t node = nullptr;
-    if (cudaStreamGetCaptureInfo(cudaStreamPerThread, &status, nullptr, &graph, &deps, &count) != cudaSuccess ||
+    if (fastllm_cuda_graph_compat::CaptureInfo(cudaStreamPerThread, &status, nullptr, &graph, &deps, &count) != cudaSuccess ||
         status != cudaStreamCaptureStatusActive) return false;
     if (cudaGraphAddChildGraphNode(&node, graph, deps, count,
             reinterpret_cast<cudaGraph_t>(const_cast<void *>(child))) != cudaSuccess) return false;
-    return cudaStreamUpdateCaptureDependencies(cudaStreamPerThread, &node, 1,
+    return fastllm_cuda_graph_compat::UpdateCaptureDependencies(cudaStreamPerThread, &node, 1,
         cudaStreamSetCaptureDependencies) == cudaSuccess;
 #else
     return false;
