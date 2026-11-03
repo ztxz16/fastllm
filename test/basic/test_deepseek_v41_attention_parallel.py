@@ -24,7 +24,8 @@ def run(args, directory):
         prepare(fixture, hc_mult=4, expert_cache=True, fp8_dense=True, expert_count=16)
     env = dict(os.environ, FASTLLM_SKIP_WARMUP="1", FASTLLM_EXECUTION_MODE="gpu",
                FASTLLM_TP="8", FASTLLM_CUDA_GRAPH="0", OMP_NUM_THREADS="1",
-               FASTLLM_CUDA_CUSTOM_ALLREDUCE="0")
+               FASTLLM_CUDA_CUSTOM_ALLREDUCE="0",
+               FASTLLM_DSV41_DECODER_SWA_BOUNDED_REPLAY="1" if args.fast_prefill else "0")
     results = {}
     for kv in ("bf16", "fp4"):
         reference = None
@@ -98,6 +99,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True, type=lambda value: Path(value).resolve())
     parser.add_argument("--fixture", type=lambda value: Path(value).resolve())
+    parser.add_argument("--fast-prefill", action="store_true", help="exercise bounded prefill before decode")
     parser.add_argument("--graphs", action="store_true", help="also compare DP graphs against eager logits")
     parser.add_argument("--full-graphs", action="store_true", help="compare full DP/TP decode graphs against eager logits")
     parser.add_argument("--output-dir", type=Path, help="retain logs and logits")

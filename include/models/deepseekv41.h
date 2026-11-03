@@ -445,6 +445,7 @@ namespace fastllm {
         void BuildFullDecodeGraph(int batch, const std::vector<DeepSeekV41Segment> &segments,
                                   int firstLayer = -1, int endLayer = -1);
 #endif
+        void TrimForwardPrefill(ForwardWorkspace &, int layer, bool inputsTrimmed = false);
         void BeginForwardLayer(ForwardWorkspace &, int layer);
         void EndForwardLayer(ForwardWorkspace &, int layer);
         void RunForwardSharedExpert(ForwardWorkspace &, int layer);

@@ -1,6 +1,6 @@
 # 通用 Attention DP 与 TP 并行运行时设计
 
-状态：已接通运行时、DeepSeek V4.1 适配器及普通 decode 整轮 CUDA Graph。下节描述当前实现；其余章节保留完整目标设计，不能视为所有阶段均已交付。
+状态：已接通运行时、DeepSeek V4.1 适配器、bounded prefill 及普通 decode 整轮 CUDA Graph。下节描述当前实现；其余章节保留完整目标设计，不能视为所有阶段均已交付。
 
 ## 当前实现
 
@@ -9,10 +9,12 @@
 ```sh
 FASTLLM_CUDA_GRAPH=1 ftllm serve MODEL --tp 8 --attn-dp-size 4 \
   --moe_device multicuda:0,1,2,3,4,5,6,7 --ngram_device cuda \
-  --kv_cache_dtype fp4_e2m1 --no_fast_prefill --max_batch 64
+  --kv_cache_dtype fp4_e2m1 --fast_prefill --max_batch 64
 ```
 
-启动时需要选择纯 GPU 专家路径；不支持的模型、设备数、专家布局、推测解码或 bounded replay 会明确报错。使用已有 `FASTLLM_CUDA_GRAPH=1` 开启 decode 图，关闭时保留 eager 路径。尚不支持 DSpark 或混合专家推理。
+启动时需要选择纯 GPU 专家路径；不支持的模型、设备数、专家布局或推测解码会明确报错。使用已有 `FASTLLM_CUDA_GRAPH=1` 开启 decode 图，关闭时保留 eager 路径。尚不支持 DSpark 或混合专家推理。
+
+`--fast_prefill` 仍使用模型已有的近似 bounded replay：完整生成共享 KV 后，父级和各 attention 组同步裁剪 hidden、HC 系数及 query 索引；cache-only chunk 同步推进各 rank 的请求位置。图像输入和 DSpark 验证不裁剪候选行，未启用时保持原 prefill 语义。
 
 普通 decode 在预热阶段复用局部投影图和已有动态 KV/稀疏 attention 算子，将选行、Attention TP 归约、合并收集、Engram、全局 FFN/router/MoE 及输出头组成每卡每轮一张图。BF16、FP8、FP4 KV 共用同一组成路径；输入 embedding 和最终采样仍在图外。请求的 KV 地址与位置逐轮上传，行置换更新到图持有的稳定缓冲区。
 
@@ -33,6 +35,8 @@ Attention TP 宽度变化仍会改变 `W_oB` 局部矩阵乘法的 BF16 舍入�
 原 TP 路径和 Attention DP 路径均支持普通 FP4 KV decode 整图。当前动态 attention 每组最多 16 行，因此整图总 batch 上限随 DP 组数变化；这不是服务合批上限，超出的 batch 保留分段/eager 路径。
 
 可复现检查：CPU 的 `parallel_topology_test`，八卡的 `parallelRuntimeRegression`，以及 `test/basic/test_deepseek_v41_attention_parallel.py --binary BUILD/deepseekV41AttentionParallelRegression --full-graphs`。模型检查覆盖 BF16/FP4 KV、四种布局、混合长度、解码、KV 物理归属、跨组前缀恢复、请求复用和跨布局 teacher-forced logits；需要 NumPy，生成 fixture 另需 PyTorch 与 safetensors。
+
+追加 `--fast-prefill` 检查 bounded / cache-only prefill。
 
 目标是在同一模型实例内组合 Attention DP、Attention TP 和 MoE EP/TP，并让每张 GPU 始终由一个固定工作线程负责。DeepSeek V4.1 是首个接入模型；分组、通信、张量布局、请求归属和生命周期管理不依赖其层数、head 数、KV 格式或推测解码算法。
 

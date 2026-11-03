@@ -5140,7 +5140,7 @@ namespace fastllm {
         std::unique_ptr<EngramPrefetch> engramPrefetch;
         std::vector<int> tokenIds;
         int numSegments = 0;
-        bool boundedPrefill = false;
+        bool boundedPrefill = false, boundedTailPrepared = false;
         int total = 0;
         std::vector<DeepSeekV41Segment> tailSegments;
         bool single = false;
@@ -5470,7 +5470,8 @@ namespace fastllm {
         AssertInFastLLM(numSegments >= 1 && (int)generationConfigsIn.size() == numSegments,
                         "DeepSeekV41Model::ForwardSegments: bad segments.");
         boundedPrefill = decoderSwaTailLayer >= 0 && decoderSwaTailLayer < block_cnt &&
-                              inputEmbeds == nullptr && imageMask == nullptr;
+                              (inputEmbeds == nullptr || (v41AttentionRankRuntime && boundedPrefill)) &&
+                              imageMask == nullptr;
         bool hasLongSegment = false;
         total = 0;
         for (const auto &seg : inputSegments) {
@@ -5482,7 +5483,9 @@ namespace fastllm {
                 boundedPrefill = false; // verify 必须计算每个候选位置
             }
         }
-        boundedPrefill &= hasLongSegment;
+        // A DP rank can own only short requests within a bounded mixed batch.
+        // Preserve the parent's decision even when this rank needs no trimming.
+        boundedPrefill &= hasLongSegment || v41AttentionRankRuntime != nullptr;
         for (const auto &seg : inputSegments) if (seg.prefillCacheOnly) {
             AssertInFastLLM(numSegments == 1 && boundedPrefill && !v41DsparkEnabled && !seg.spec,
                 "DeepSeekV41: cache-only chunks require single-sequence bounded prefill.");
@@ -6031,6 +6034,65 @@ namespace fastllm {
         // restore 在回放时把它们补回来。任何一步失败都就地退回逐算子并永久关掉图。
 
     }
+    // Parent and rank adapters share the same tail/query-index transition.
+    // A rank may receive already trimmed hidden rows from its DP parent.
+    void DeepSeekV41Model::TrimForwardPrefill(ForwardWorkspace &f, int layer, bool inputsTrimmed) {
+        if (!f.boundedPrefill || f.boundedTailPrepared || layer != decoderSwaTailLayer) return;
+        auto &ws = f.ws;
+        // 跨层共享 KV 已完整生成；hidden / HC pre 与逐 query 的索引同步取尾部。
+        auto trimBatch = [&](Data &data) {
+            std::vector<Data> parts(f.numSegments);
+            for (int s = 0; s < f.numSegments; s++) {
+                const auto &seg = f.tailSegments[s];
+                const int end = seg.offset + seg.seqlen;
+                Split(data, 1, end - std::min(seg.seqlen, window_size), end, parts[s]);
+            }
+            Data tmp[2];
+            Data *acc = &parts[0];
+            int t = 0;
+            for (size_t i = 1; i < parts.size(); i++) {
+                Cat(*acc, parts[i], 1, tmp[t]);
+                acc = &tmp[t]; t ^= 1;
+            }
+            V41Assign(data, *acc, f.tpDevices);
+        };
+        if (!inputsTrimmed) {
+            trimBatch(*f.curHidden);
+            trimBatch(*f.preMixPtr);
+        }
+        // Other intermediates were released after their last use. Drop
+        // the remaining full-chunk scratch before switching to tail rows.
+        ReleaseForwardPrefill(f, {&ws->preMix, &ws->attnPre, &ws->expertIndex, &ws->expertScore,
+                        &ws->w1, &ws->w2, &ws->w3, &ws->tempInput, &ws->tempOutput,
+                        &ws->moeInputTemp, &ws->moeOutputTemp,
+                        &ws->cpuMoeInput, &ws->cpuMoeIndex, &ws->cpuMoeScore});
+        f.seqlen = 0;
+        for (int s = 0; s < f.numSegments; s++) {
+            auto &seg = f.tailSegments[s];
+            const int skip = std::max(0, seg.seqlen - window_size);
+            if (skip > 0) {
+                auto trimRows = [&](Data &data) {
+                    if (data.dims.size() >= 3 && data.dims[1] == seg.seqlen) {
+                        Data tmp;
+                        Split(data, 1, skip, seg.seqlen, tmp);
+                        V41Assign(data, tmp, f.tpDevices);
+                    }
+                };
+                trimRows(ws->segTopK[s]);
+                trimRows(ws->segCandidate[s]);
+                if (seg.spec != nullptr && seg.spec->captureMain) {
+                    for (Data &hidden : seg.spec->mainHidden)
+                        trimRows(hidden); // 目标层也可能位于裁剪边界之前
+                    seg.spec->mainHiddenStartPos = seg.startPos + skip;
+                }
+                seg.startPos += skip;
+                seg.seqlen -= skip;
+            }
+            seg.offset = f.seqlen;
+            f.seqlen += seg.seqlen;
+        }
+        f.boundedTailPrepared = true;
+    }
     void DeepSeekV41Model::BeginForwardLayer(ForwardWorkspace &f, int layer) {
         auto &inputSegments = f.inputSegments;
         auto &imageMask = f.imageMask;
@@ -6074,7 +6136,6 @@ namespace fastllm {
         auto &hasSharedExpertOut = f.hasSharedExpertOut;
         auto &ffnDims = f.ffnDims;
         const auto &segments = boundedPrefill ? tailSegments : inputSegments;
-        auto &preMix = ws->preMix;
         auto &attnPre = ws->attnPre;
         auto &attnPost = ws->attnPost;
         auto &attnComb = ws->attnComb;
@@ -6097,9 +6158,6 @@ namespace fastllm {
         auto &rawScoreAll = ws->rawScoreAll;
         auto &qIdxAll = ws->qIdxAll;
         auto &idxWeightsAll = ws->idxWeightsAll;
-        auto &cpuMoeInput = ws->cpuMoeInput;
-        auto &cpuMoeIndex = ws->cpuMoeIndex;
-        auto &cpuMoeScore = ws->cpuMoeScore;
         auto sliceOf = [&](Data &full, int i, Data &tmp) -> Data* {
             if (single) {
                 return &full;
@@ -6142,53 +6200,7 @@ namespace fastllm {
             const int ratio = compress_ratios[layer];
             const V41RopeParams &rope = ratio > 0 ? compressRope : windowRope;
 
-            if (boundedPrefill && layer == decoderSwaTailLayer) {
-                // 跨层共享 KV 已完整生成；hidden / HC pre 与逐 query 的索引同步取尾部。
-                auto trimBatch = [&](Data &data) {
-                    std::vector<Data> parts(numSegments);
-                    for (int s = 0; s < numSegments; s++) {
-                        const auto &seg = segments[s];
-                        const int end = seg.offset + seg.seqlen;
-                        Split(data, 1, end - std::min(seg.seqlen, window_size), end, parts[s]);
-                    }
-                    Data tmp[2];
-                    V41Assign(data, *catSegments(parts, tmp), tpDevices);
-                };
-                trimBatch(*curHidden);
-                trimBatch(*preMixPtr);
-                // Other intermediates were released after their last use. Drop
-                // the remaining full-chunk scratch before switching to tail rows.
-                ReleaseForwardPrefill(f, {&preMix, &attnPre, &expertIndex, &expertScore,
-                                &ws->w1, &ws->w2, &ws->w3, &ws->tempInput, &ws->tempOutput,
-                                &ws->moeInputTemp, &ws->moeOutputTemp,
-                                &cpuMoeInput, &cpuMoeIndex, &cpuMoeScore});
-                seqlen = 0;
-                for (int s = 0; s < numSegments; s++) {
-                    auto &seg = tailSegments[s];
-                    const int skip = std::max(0, seg.seqlen - window_size);
-                    if (skip > 0) {
-                        auto trimRows = [&](Data &data) {
-                            if (data.dims.size() >= 3 && data.dims[1] == seg.seqlen) {
-                                Data tmp;
-                                Split(data, 1, skip, seg.seqlen, tmp);
-                                V41Assign(data, tmp, tpDevices);
-                            }
-                        };
-                        trimRows(segTopK[s]);
-                        trimRows(segCandidate[s]);
-                        if (seg.spec != nullptr && seg.spec->captureMain) {
-                            for (Data &hidden : seg.spec->mainHidden) {
-                                trimRows(hidden); // 目标层也可能位于裁剪边界之前
-                            }
-                            seg.spec->mainHiddenStartPos = seg.startPos + skip;
-                        }
-                        seg.startPos += skip;
-                        seg.seqlen -= skip;
-                    }
-                    seg.offset = seqlen;
-                    seqlen += seg.seqlen;
-                }
-            }
+            TrimForwardPrefill(f, layer);
 
             if (layer == 0 && !tp && !f.prefill && this->deviceMap.size() == 1)
                 PrefetchDiskMoeV41(weights[layer], seqlen);
@@ -7310,14 +7322,20 @@ namespace fastllm {
             FastllmCudaCopyFromDeviceToDevice(payload.cudaData, curHidden->cudaData, curHidden->GetBytes());
             FastllmCudaCopyFromDeviceToDevice((uint8_t*)payload.cudaData + curHidden->GetBytes(),
                 preMixPtr->cudaData, preMixPtr->GetBytes());
-            for (const auto &seg : inputSegments) seg.state->totalLen += seg.seqlen;
+            for (const auto &seg : inputSegments) {
+                seg.state->totalLen += seg.seqlen;
+                for (auto &rank : seg.state->attentionRanks) if (rank) rank->totalLen = seg.state->totalLen;
+            }
             return std::vector<int>{-1};
         }
 #endif
         if (inputSegments[0].prefillCacheOnly) {
             // The last chunk rebuilds all late SWA windows in bounded replay.
             // No intermediate logits are consumed by the scheduler.
-            for (const auto &seg : inputSegments) seg.state->totalLen += seg.seqlen;
+            for (const auto &seg : inputSegments) {
+                seg.state->totalLen += seg.seqlen;
+                for (auto &rank : seg.state->attentionRanks) if (rank) rank->totalLen = seg.state->totalLen;
+            }
             return std::vector<int>{-1};
         }
 #ifdef USE_CUDA

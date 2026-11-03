@@ -11,6 +11,7 @@
 using namespace fastllm;
 struct Access : DeepSeekV41Model {
     using DeepSeekV41Model::ForwardSegments;
+    using DeepSeekV41Model::decoderSwaTailLayer;
     using DeepSeekV41Model::SnapshotState;
     using DeepSeekV41Model::RestoreState;
     using DeepSeekV41Model::GetOrCreateState;
@@ -22,7 +23,7 @@ struct Access : DeepSeekV41Model {
 static void Require(bool ok, const char *message) { if (!ok) throw std::runtime_error(message); }
 static std::vector<float> Step(DeepSeekV41Model &model,
         const std::vector<std::shared_ptr<DeepSeekV41RequestState>> &states,
-        const std::vector<int> &lengths, int seed, int sampleMode = -1) {
+        const std::vector<int> &lengths, int seed, int sampleMode = -1, bool cacheOnly = false) {
     std::vector<DeepSeekV41Segment> segments;
     std::vector<float> tokens;
     std::vector<GenerationConfig> configs(states.size());
@@ -32,6 +33,7 @@ static std::vector<float> Step(DeepSeekV41Model &model,
         DeepSeekV41Segment seg;
         seg.state = states[i]; seg.startPos = states[i]->totalLen;
         seg.seqlen = lengths[i]; seg.offset = tokens.size();
+        seg.prefillCacheOnly = cacheOnly;
         for (int j = 0; j < seg.seqlen; ++j) tokens.push_back((seg.startPos + j + seed + i * 7) * 17 % 123 + 3);
         segments.push_back(seg); configs[i].output_logits = true;
         if (sampleMode >= 0) {
@@ -50,6 +52,7 @@ static std::vector<float> Step(DeepSeekV41Model &model,
     for (size_t i = 0; i < dummy.size(); i += 2) past.emplace_back(&dummy[i], &dummy[i+1]);
     const auto sampled = (model.*(&Access::ForwardSegments))(
         segments, ids, nullptr, nullptr, configs, last, sampleMode < 0 ? &pointers : nullptr, past);
+    if (cacheOnly) return {};
     if (sampleMode >= 0) {
         Require(sampled.size() == states.size(), "missing sampled tokens");
         for (int token : sampled)
@@ -184,6 +187,19 @@ int main(int argc, char **argv) {
             };
             if (sampling) std::async(std::launch::async, exerciseRequests).get();
             else exerciseRequests();
+        }
+        if (model.*(&Access::decoderSwaTailLayer) >= 0) {
+            auto state = std::make_shared<DeepSeekV41RequestState>();
+            state->layers.resize(model.block_cnt);
+            Step(model, {state}, {17}, 3, -1, true);
+            Require(state->totalLen == 17, "cache-only chunk lost logical position");
+            for (const auto &local : state->attentionRanks)
+                Require(local && local->totalLen == 17, "cache-only rank position drift");
+            Step(model, {state}, {33}, 5);
+            CheckOwnership(*state, dp);
+            Step(model, {state}, {1}, 7);
+            CheckOwnership(*state, dp);
+            std::cout << "PASS bounded cache-only chunk and continuation\n";
         }
         std::vector<std::pair<Data, Data>> past(model.block_cnt);
         auto reused = (model.*static_cast<std::shared_ptr<DeepSeekV41RequestState> (DeepSeekV41Model::*)(

@@ -45,7 +45,7 @@ struct DeepSeekV41Model::AttentionParallelFrame {
     std::vector<std::unique_ptr<RankStep>> ranks;
     static parallel::RowPartition Partition(AttentionParallel &parallel, ForwardWorkspace &parent) {
         std::vector<int> owners;
-        for (const auto &seg : parent.inputSegments) {
+        for (const auto &seg : parent.boundedPrefill ? parent.tailSegments : parent.inputSegments) {
             int group = parallel.Place(seg.state);
             owners.insert(owners.end(), seg.seqlen, group);
         }
@@ -105,6 +105,9 @@ struct DeepSeekV41Model::AttentionParallelFrame {
             step.embeddings.CopyFrom(Data(BFLOAT16, {1, offset, parent.dim}, std::vector<float>(size_t(offset) * parent.dim, 0)));
             step.work.reset(new ForwardWorkspace(model, step.segments, step.ids, &step.embeddings,
                 nullptr, step.configs, step.last, nullptr, step.past));
+            // Placeholder embeddings must not override the parent's decision
+            // for text-only bounded prefill, including mixed request lengths.
+            step.work->boundedPrefill = parent.boundedPrefill;
             step.work->attentionGraphParent = parent.graphState;
             step.work->attentionParentCapturing = parent.graphCapture;
             model.PrepareForward(*step.work);
@@ -137,8 +140,8 @@ void DeepSeekV41Model::ConfigureAttentionParallel(int dp) {
     ApplyDeviceMap(deviceMap, 1, block_cnt);
     auto devices = V41TpDevices(deviceMap);
     parallel::Topology topology(devices, dp, devices.size());
-    if (executionMode != ExecutionMode::Gpu || v41DsparkEnabled || decoderSwaTailLayer >= 0)
-        throw std::invalid_argument("attention DP requires GPU experts, no DSpark, and --no_fast_prefill");
+    if (executionMode != ExecutionMode::Gpu || v41DsparkEnabled)
+        throw std::invalid_argument("attention DP requires GPU experts and no DSpark");
     if (o_groups % topology.attentionTP || num_attention_heads % topology.attentionTP)
         throw std::invalid_argument("attention heads/output groups are not divisible by attention TP");
     for (int layer = 0; layer < block_cnt; ++layer)
@@ -169,7 +172,7 @@ void DeepSeekV41Model::PrepareAttentionParallel() {
         local->dataType = dataType; local->kvCacheDataType = kvCacheDataType;
         local->v41MoeCudaGraphCompatible = true;
         local->engram_layer_ids.clear(); local->engramTables.clear();
-        local->v41DsparkEnabled = false; local->decoderSwaTailLayer = -1;
+        local->v41DsparkEnabled = false; local->decoderSwaTailLayer = decoderSwaTailLayer;
         local->num_attention_heads /= topology.attentionTP;
         local->o_groups /= topology.attentionTP;
         local->v41AttentionRankRuntime = &state->runtime;
@@ -226,6 +229,10 @@ void DeepSeekV41Model::RunAttentionParallel(ForwardWorkspace &f, int layer) {
     auto &frame = *f.attentionParallel;
     auto &runtime = v41AttentionParallel->runtime;
     auto &topology = runtime.Layout();
+    if (frame.rows.Rows() != f.seqlen) {
+        frame.rows = AttentionParallelFrame::Partition(*v41AttentionParallel, f);
+        frame.transfer.Reset(frame.rows);
+    }
     auto ensureGlobal = [&](Data &data, DataType type, std::vector<int> dims) {
         data.dataType = type; data.UpdateUnitSize(); data.Resize(dims);
         data.dataDevice = CUDA; data.dataDeviceIds = topology.devices;
@@ -254,6 +261,8 @@ void DeepSeekV41Model::RunAttentionParallel(ForwardWorkspace &f, int layer) {
         auto &step = *frame.ranks[rank];
         if (step.work) {
             auto &local = *step.work;
+            local.model.v41AttentionLogicalRows = f.seqlen;
+            local.model.TrimForwardPrefill(local, layer, true);
             auto select = [&](Data &dest, const Data &source) {
                 auto dims = source.dims; dims[1] = local.seqlen;
                 dest.dataType = source.dataType; dest.UpdateUnitSize(); dest.Resize(dims);
