@@ -218,12 +218,15 @@ namespace fastllm {
     }
 #endif
 
-    Executor::Executor() {
+    Executor::Executor() : Executor(false) {}
+
+    Executor::Executor(bool localOnly) {
         this->devices.clear();
 #ifdef USE_CUDA
         if (FastllmCudaGetDeviceCount() > 0) {
             this->devices.push_back((BaseDevice*) new CudaDevice());
-            this->devices.push_back((BaseDevice*) new MultiCudaDevice((CudaDevice*)this->devices.back()));
+            if (!localOnly)
+                this->devices.push_back((BaseDevice*) new MultiCudaDevice((CudaDevice*)this->devices.back()));
         }
 #endif
 #ifdef USE_TOPS
@@ -233,7 +236,7 @@ namespace fastllm {
         this->devices.push_back((BaseDevice*) new TfaccDevice());
 #endif
 #ifdef USE_NUMAS
-        this->devices.push_back((BaseDevice*) new NumasDevice());
+        if (!localOnly) this->devices.push_back((BaseDevice*) new NumasDevice());
 #endif
         this->devices.push_back((BaseDevice*) new DiskDevice());
         this->devices.push_back((BaseDevice*) new CpuDevice());

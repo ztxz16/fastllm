@@ -314,7 +314,9 @@ namespace fastllm {
     static int maxTokens = -1;
     static int defaultPageLen = 128;
     static float gpuMemRatio = 0.9f;
-    static Data emptyData;
+    // Executors update even empty tensors' placement metadata. Rank workers
+    // must not concurrently mutate one process-wide optional-bias sentinel.
+    static thread_local Data emptyData;
 
     void SetModelLoadProgressCallback(const ModelLoadProgressCallback &callback) {
         std::lock_guard<std::mutex> guard(modelLoadProgressLocker);

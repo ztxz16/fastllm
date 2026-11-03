@@ -15,6 +15,7 @@ namespace fastllm {
 
     public:
         Executor (); // 创建默认的Executor
+        explicit Executor(bool localOnly); // Rank worker: no distributed/NUMA redispatch.
 
         ~Executor(); // 析构
 

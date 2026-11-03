@@ -656,6 +656,7 @@ if (USE_CUDA)
     include_directories(include/devices/multicuda)
     set(FASTLLM_CUDA_SOURCES ${FASTLLM_CUDA_SOURCES}
         src/devices/multicuda/multicudadevice.cpp
+        src/devices/multicuda/parallel_runtime.cu
         src/devices/multicuda/fastllm-multicuda.cu
         src/devices/multicuda/fastllm-custom-allreduce.cu)
 
@@ -899,6 +900,9 @@ target_link_libraries(quant fastllm)
 
 if (UNIT_TEST)
     enable_testing()
+    add_executable(parallel_topology_test test/basic/test_parallel_topology.cpp)
+    target_include_directories(parallel_topology_test PRIVATE include)
+    add_test(NAME parallel_topology COMMAND parallel_topology_test)
     add_executable(recurrent_prefix_cache_test test/basic/test_recurrent_prefix_cache.cpp)
     target_include_directories(recurrent_prefix_cache_test PRIVATE include)
     add_test(NAME recurrent_prefix_cache COMMAND recurrent_prefix_cache_test)
@@ -3180,6 +3184,10 @@ if (UNIT_TEST)
         set_tests_properties(deepseek_v41_ops PROPERTIES LABELS cuda)
 
         add_executable(ncclOddTpRegression test/ops/ncclOddTpRegression.cu)
+        add_executable(parallelRuntimeRegression test/ops/parallelRuntimeRegression.cu)
+        target_link_libraries(parallelRuntimeRegression fastllm)
+        add_test(NAME parallelRuntime COMMAND parallelRuntimeRegression)
+        set_tests_properties(parallelRuntime PROPERTIES LABELS "cuda;multigpu" TIMEOUT 240 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
         target_link_libraries(ncclOddTpRegression fastllm)
         target_include_directories(ncclOddTpRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
         add_test(NAME ncclOddTp COMMAND ncclOddTpRegression)
