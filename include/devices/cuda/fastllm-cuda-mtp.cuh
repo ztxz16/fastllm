@@ -29,6 +29,11 @@ bool FastllmCudaMtpRejectionFromProbs(const float *targetProbs,
     const float *proposalLogits, const float *proposalLogsumexp,
     const int *deviceDraftTokens, int *output, int *accepted,
     int batch, int drafts, int vocab);
+// Same rejection law when the proposal is already stored as probabilities.
+// Parallelizes only the first residual/bonus row over vocabulary tiles.
+bool FastllmCudaMtpRejectionFromProbabilities(const float *targetProbs,
+    const float *proposalProbs, const int *deviceDraftTokens,
+    int *output, int *accepted, int batch, int drafts, int vocab);
 
 bool FastllmCudaMtpRejectionSamplingLogits(float *targetLogits,
     const float *proposalLogits, const float *proposalLogsumexp,

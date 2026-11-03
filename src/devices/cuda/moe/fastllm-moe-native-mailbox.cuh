@@ -1,5 +1,4 @@
 #pragma once
-#include "../fastllm-cuda-graph-compat.cuh"
 
 // Native, single-GPU decode handoff. A CPU dispatcher owns NUMA execution;
 // the caller only submits graphs. Full replay uses an explicit one-thread
@@ -155,7 +154,7 @@ struct NativeMoeMemOps {
         size_t count = 0;
         CUcontext ctx = nullptr;
         if (!ready || context(&ctx) != CUDA_SUCCESS ||
-            fastllm_cuda_graph_compat::CaptureInfo(cudaStreamPerThread, &status, nullptr, &graph, &deps, &count) != cudaSuccess ||
+            FastllmCudaStreamGetCaptureDependencies(cudaStreamPerThread, &status, &graph, &deps, &count) != cudaSuccess ||
             status != cudaStreamCaptureStatusActive) return false;
         CUstreamBatchMemOpParams op{};
         if (wait) {
@@ -172,7 +171,7 @@ struct NativeMoeMemOps {
         if (add(&node, reinterpret_cast<CUgraph>(graph),
                 reinterpret_cast<const CUgraphNode *>(deps), count, &params) != CUDA_SUCCESS) return false;
         auto next = reinterpret_cast<cudaGraphNode_t>(node);
-        return fastllm_cuda_graph_compat::UpdateCaptureDependencies(cudaStreamPerThread, &next, 1,
+        return FastllmCudaStreamUpdateCaptureDependencies(cudaStreamPerThread, &next, 1,
                     cudaStreamSetCaptureDependencies) == cudaSuccess;
     }
 };
@@ -645,11 +644,11 @@ struct NativeMoeMailbox {
             size_t count = 0;
             cudaGraphNode_t shared = nullptr;
             if (sharedGraph &&
-                (fastllm_cuda_graph_compat::CaptureInfo(cudaStreamPerThread, &status, nullptr, &graph, &deps, &count) != cudaSuccess ||
+                (FastllmCudaStreamGetCaptureDependencies(cudaStreamPerThread, &status, &graph, &deps, &count) != cudaSuccess ||
                  cudaGraphAddChildGraphNode(&shared, graph, nullptr, 0, sharedGraph) != cudaSuccess)) return false;
             if (!FastllmCudaDeepSeekV41QuantizeActivation(input, w.quantized)) return false;
             if (cudaEventRecordWithFlags(w.begin, cudaStreamPerThread, cudaEventRecordExternal) != cudaSuccess) return false;
-            if (fastllm_cuda_graph_compat::CaptureInfo(cudaStreamPerThread, &status, nullptr, &graph, &deps, &count) != cudaSuccess) return false;
+            if (FastllmCudaStreamGetCaptureDependencies(cudaStreamPerThread, &status, &graph, &deps, &count) != cudaSuccess) return false;
             std::vector<cudaGraphNode_t> fork(deps, deps + count);
             if (layout.weightType == fastllm::DATA_GGUF_FORMAT) {
                 if (!ComputeGGUF(w, layout, cache.records, w.slots,
@@ -658,11 +657,11 @@ struct NativeMoeMailbox {
                 if (!ComputeBatch(w, layout, cache.records, w.slots, static_cast<const float *>(score.cudaData))) return false;
             } else Compute(w, layout, cache.records, w.slots, static_cast<const float *>(score.cudaData), cudaStreamPerThread, true);
             if (cudaEventRecordWithFlags(w.residentDone, cudaStreamPerThread, cudaEventRecordExternal) != cudaSuccess) return false;
-            if (fastllm_cuda_graph_compat::CaptureInfo(cudaStreamPerThread, &status, nullptr, &graph, &deps, &count) != cudaSuccess) return false;
+            if (FastllmCudaStreamGetCaptureDependencies(cudaStreamPerThread, &status, &graph, &deps, &count) != cudaSuccess) return false;
             std::vector<cudaGraphNode_t> residentTail(deps, deps + count);
             // Resident and staged routes write disjoint gate/partial rows.
             // Both depend on publication and quantization, and join at Reduce.
-            if (fastllm_cuda_graph_compat::UpdateCaptureDependencies(cudaStreamPerThread, fork.data(), fork.size(),
+            if (FastllmCudaStreamUpdateCaptureDependencies(cudaStreamPerThread, fork.data(), fork.size(),
                     cudaStreamSetCaptureDependencies) != cudaSuccess) return false;
             if (w.rows > 1) {
                 WaitNativeMoe<<<1, 1, 0, cudaStreamPerThread>>>(&w.mapped->planned);
@@ -705,7 +704,7 @@ struct NativeMoeMailbox {
                 if (!ComputeBatch(w, layout, fullCopy->records, w.slots + w.routes, static_cast<const float *>(score.cudaData))) return false;
             } else Compute(w, layout, fullCopy->records, w.slots + topk, static_cast<const float *>(score.cudaData), cudaStreamPerThread);
             if (cudaEventRecordWithFlags(w.done, cudaStreamPerThread, cudaEventRecordExternal) != cudaSuccess) return false;
-            if (fastllm_cuda_graph_compat::UpdateCaptureDependencies(cudaStreamPerThread, residentTail.data(), residentTail.size(),
+            if (FastllmCudaStreamUpdateCaptureDependencies(cudaStreamPerThread, residentTail.data(), residentTail.size(),
                     cudaStreamAddCaptureDependencies) != cudaSuccess) return false;
             WaitNativeMoe<<<1, 1, 0, cudaStreamPerThread>>>(&w.mapped->computed);
             fastllm::cuda::dsv41_cache::Reduce<<<dim3((w.hidden+255)/256, w.rows), 256, 0, cudaStreamPerThread>>>(
@@ -748,19 +747,19 @@ struct NativeMoeMailbox {
                 if (cudaGraphEventRecordNodeGetEvent(node, &event) != cudaSuccess) return false;
                 if (std::find(events.begin(), events.end(), event) == events.end()) continue;
                 size_t beforeCount = 0, afterCount = 0;
-                if (fastllm_cuda_graph_compat::GetDependencies(node, nullptr, &beforeCount) != cudaSuccess ||
-                    fastllm_cuda_graph_compat::GetDependentNodes(node, nullptr, &afterCount) != cudaSuccess) return false;
+                if (FastllmCudaGraphNodeGetDependencies(node, nullptr, &beforeCount) != cudaSuccess ||
+                    FastllmCudaGraphNodeGetDependentNodes(node, nullptr, &afterCount) != cudaSuccess) return false;
                 std::vector<cudaGraphNode_t> before(beforeCount), after(afterCount);
-                if (fastllm_cuda_graph_compat::GetDependencies(node, before.data(), &beforeCount) != cudaSuccess ||
-                    fastllm_cuda_graph_compat::GetDependentNodes(node, after.data(), &afterCount) != cudaSuccess) return false;
+                if (FastllmCudaGraphNodeGetDependencies(node, before.data(), &beforeCount) != cudaSuccess ||
+                    FastllmCudaGraphNodeGetDependentNodes(node, after.data(), &afterCount) != cudaSuccess) return false;
                 for (auto next : after) {
                     size_t n = 0;
-                    if (fastllm_cuda_graph_compat::GetDependencies(next, nullptr, &n) != cudaSuccess) return false;
+                    if (FastllmCudaGraphNodeGetDependencies(next, nullptr, &n) != cudaSuccess) return false;
                     std::vector<cudaGraphNode_t> existing(n);
-                    if (fastllm_cuda_graph_compat::GetDependencies(next, existing.data(), &n) != cudaSuccess) return false;
+                    if (FastllmCudaGraphNodeGetDependencies(next, existing.data(), &n) != cudaSuccess) return false;
                     for (auto prev : before)
                         if (std::find(existing.begin(), existing.end(), prev) == existing.end() &&
-                            fastllm_cuda_graph_compat::AddDependencies(graph, &prev, &next, 1) != cudaSuccess) return false;
+                            FastllmCudaGraphAddDependencies(graph, &prev, &next, 1) != cudaSuccess) return false;
                 }
                 if (cudaGraphDestroyNode(node) != cudaSuccess) return false;
             }

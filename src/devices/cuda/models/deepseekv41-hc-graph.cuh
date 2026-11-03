@@ -1,5 +1,4 @@
 #pragma once
-#include "../fastllm-cuda-graph-compat.cuh"
 // The caller supplies only mHC segments whose pre/post/comb outputs are first
 // consumed at join[i], and the hidden input remains unchanged until that join.
 // Each side branch owns its mix scratch; graph-pool temporaries may be reused.
@@ -102,12 +101,12 @@ inline bool Compose(const void *const *children, int count, const int *start, co
                 return fail();
             }
             size_t dependencies = 0;
-            if (fastllm_cuda_graph_compat::GetDependencies(target, nullptr, &dependencies) != cudaSuccess ||
+            if (FastllmCudaGraphNodeGetDependencies(target, nullptr, &dependencies) != cudaSuccess ||
                 dependencies != 1) {
                 return fail();
             }
             cudaGraphNode_t dependency;
-            if (fastllm_cuda_graph_compat::GetDependencies(target, &dependency, &dependencies) != cudaSuccess ||
+            if (FastllmCudaGraphNodeGetDependencies(target, &dependency, &dependencies) != cudaSuccess ||
                 dependency != combined) {
                 return fail();
             }
@@ -141,11 +140,11 @@ inline bool Compose(const void *const *children, int count, const int *start, co
                 return fail();
             }
             size_t successors = 0;
-            if (fastllm_cuda_graph_compat::GetDependentNodes(target, nullptr, &successors) != cudaSuccess) {
+            if (FastllmCudaGraphNodeGetDependentNodes(target, nullptr, &successors) != cudaSuccess) {
                 return fail();
             }
             std::vector<cudaGraphNode_t> dependent(successors);
-            if (fastllm_cuda_graph_compat::GetDependentNodes(target, dependent.data(), &successors) != cudaSuccess) {
+            if (FastllmCudaGraphNodeGetDependentNodes(target, dependent.data(), &successors) != cudaSuccess) {
                 return fail();
             }
             // All work following Finish still waits for normalization. The
@@ -154,7 +153,7 @@ inline bool Compose(const void *const *children, int count, const int *start, co
                 return fail();
             }
             for (auto node : dependent) {
-                if (fastllm_cuda_graph_compat::AddDependencies(cloned, &combined, &node, 1) != cudaSuccess) {
+                if (FastllmCudaGraphAddDependencies(cloned, &combined, &node, 1) != cudaSuccess) {
                     return fail();
                 }
             }
@@ -174,7 +173,7 @@ inline bool Compose(const void *const *children, int count, const int *start, co
             cudaGraphDestroy(cloned);
             cloned = nullptr;
         }
-        if (b >= 0 && fastllm_cuda_graph_compat::AddDependencies(graph, &next, &dotNode, 1) != cudaSuccess) {
+        if (b >= 0 && FastllmCudaGraphAddDependencies(graph, &next, &dotNode, 1) != cudaSuccess) {
             return fail();
         }
         previous = next;

@@ -47,6 +47,60 @@ void showError(cudaError_t result, char const* const message, const char* const 
 #include "fastllm-hip.h"
 #endif
 
+#if !defined(USE_ROCM)
+// CUDA 13 adds edge metadata to the capture dependency APIs. These callers
+// use ordinary full dependencies, so no edge metadata is needed.
+#if CUDART_VERSION >= 11030
+inline cudaError_t FastllmCudaStreamGetCaptureDependencies(cudaStream_t stream,
+        cudaStreamCaptureStatus *status, cudaGraph_t *graph,
+        const cudaGraphNode_t **dependencies, size_t *count) {
+#if CUDART_VERSION >= 13000
+    return cudaStreamGetCaptureInfo(stream, status, nullptr, graph, dependencies, nullptr, count);
+#elif CUDART_VERSION >= 12000
+    return cudaStreamGetCaptureInfo(stream, status, nullptr, graph, dependencies, count);
+#else
+    return cudaStreamGetCaptureInfo_v2(stream, status, nullptr, graph, dependencies, count);
+#endif
+}
+
+inline cudaError_t FastllmCudaStreamUpdateCaptureDependencies(cudaStream_t stream,
+        cudaGraphNode_t *dependencies, size_t count, unsigned int flags) {
+#if CUDART_VERSION >= 13000
+    return cudaStreamUpdateCaptureDependencies(stream, dependencies, nullptr, count, flags);
+#else
+    return cudaStreamUpdateCaptureDependencies(stream, dependencies, count, flags);
+#endif
+}
+#endif
+
+inline cudaError_t FastllmCudaGraphNodeGetDependencies(cudaGraphNode_t node,
+        cudaGraphNode_t *dependencies, size_t *count) {
+#if CUDART_VERSION >= 13000
+    return cudaGraphNodeGetDependencies(node, dependencies, nullptr, count);
+#else
+    return cudaGraphNodeGetDependencies(node, dependencies, count);
+#endif
+}
+
+inline cudaError_t FastllmCudaGraphNodeGetDependentNodes(cudaGraphNode_t node,
+        cudaGraphNode_t *dependents, size_t *count) {
+#if CUDART_VERSION >= 13000
+    return cudaGraphNodeGetDependentNodes(node, dependents, nullptr, count);
+#else
+    return cudaGraphNodeGetDependentNodes(node, dependents, count);
+#endif
+}
+
+inline cudaError_t FastllmCudaGraphAddDependencies(cudaGraph_t graph,
+        const cudaGraphNode_t *from, const cudaGraphNode_t *to, size_t count) {
+#if CUDART_VERSION >= 13000
+    return cudaGraphAddDependencies(graph, from, to, nullptr, count);
+#else
+    return cudaGraphAddDependencies(graph, from, to, count);
+#endif
+}
+#endif
+
 #define CUDA_MAX(a, b) ((a) > (b) ? (a) : (b))
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 // support tensor core
@@ -1811,6 +1865,9 @@ bool FastllmCudaDFlashAttention(
                           int runtimeBlockSize, int slidingWindow);
 bool FastllmCudaHalfPagedAttention(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v, fastllm::Data &output, int group, float scale, bool inited = false);
 bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches, fastllm::Data &vCaches, fastllm::Data &qSizes, fastllm::Data &pageSizes, fastllm::Data &pageIndexs, fastllm::Data &lastPageLens, fastllm::Data &output, int group, float scale, int attentionType, bool inited = false, bool sync = true, bool enableCudaGraph = false, int flashInferCudaGraph = -1, int windowLeft = -1);
+// Contiguous FP16 [n,m] x [k,m]^T, FP32 accumulation, FP16 output.
+// Explicit opt-in for models whose routing requires FP32 reductions.
+bool FastllmCudaHalfMatMulFloat16Fp32(const void *input, const void *weight, void *output, int n, int m, int k);
 bool FastllmCudaHalfMatMulFloat16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k, bool addTo = false);
 // Runs up to four independent no-bias FP16 linears that share the same one-to-
 // eight-row input. Each output row keeps the native compensated reduction

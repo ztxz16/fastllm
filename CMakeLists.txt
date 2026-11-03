@@ -230,7 +230,7 @@ set(FASTLLM_CXX_SOURCES src/fastllm.cpp src/device.cpp src/model.cpp src/context
         src/utils/hybrid_moe.cpp src/utils/hybrid_parallel.cpp src/models/kimi_k3.cpp src/models/naive_n05_flash.cpp src/models/naive_n05_tp.cpp src/models/naive_n05_history.cpp src/models/naive_n05_draft.cpp src/models/naive_n05_kvmem.cpp
         src/models/minimax.cpp src/models/hunyuan.cpp
         src/models/ernie4_5.cpp src/models/pangu_moe.cpp src/models/glm4_moe.cpp src/models/glm5_moe_dsa.cpp src/models/glm5_next.cpp src/models/glm5_next_gpu.cpp src/models/glm5_next_hybrid.cpp src/models/gpt_oss.cpp
-        src/models/minimax_m2.cpp src/models/qwen2.cpp src/models/gemma4.cpp src/models/step3p5.cpp src/models/laguna.cpp
+        src/models/clover.cpp src/models/clover_parallel.cpp src/models/clover_sampling.cpp src/models/clover_generation.cpp src/models/minimax_m2.cpp src/models/qwen2.cpp src/models/gemma4.cpp src/models/step3p5.cpp src/models/laguna.cpp
         third_party/json11/json11.cpp
         third_party/gguf/gguf.cpp third_party/gguf/ggml-quant.cpp third_party/gguf/ggml-iqk.cpp third_party/gguf/ggml-dequantize.cpp
         third_party/gguf/gguf-adapter.cpp
@@ -406,6 +406,7 @@ if (USE_CUDA)
         src/devices/cuda/fastllm-cuda-vision.cu
         src/devices/cuda/fastllm-cuda.cu
         src/devices/cuda/fastllm-cuda-mtp.cu
+        src/devices/cuda/fastllm-cuda-sampling.cu
         src/devices/cuda/fastllm-kvmem.cu
         src/devices/cuda/fastllm-kvmem-sparse.cu
         src/devices/cuda/fastllm-triton-cuda.cu
@@ -487,6 +488,12 @@ if (USE_CUDA)
         src/devices/cuda/models/deepseekv41-engram.cu
         src/devices/cuda/models/deepseekv41-reference.cu
         src/devices/cuda/models/deepseekv41-dspark-kernels.cu
+        src/devices/cuda/moe/fastllm-moe-bf16.cu
+        src/devices/cuda/moe/fastllm-moe16.cu
+        src/devices/cuda/fastllm-norm.cu
+        src/devices/cuda/fastllm-router.cu
+        src/devices/cuda/models/clover-kernels.cu
+        src/devices/cuda/models/clover-attention.cu
         src/devices/cuda/models/qwen4-kernels.cu)
 
     set_source_files_properties(src/devices/cuda/models/deepseekv41-reference.cu PROPERTIES COMPILE_OPTIONS "--fmad=false")
@@ -510,10 +517,13 @@ if (USE_CUDA)
           CMAKE_CUDA_ARCHITECTURES_NATIVE MATCHES "(^|;)90(-real|-virtual)?(;|$)")))
         list(APPEND FASTLLM_CUDA_SM90_SOURCES
             src/devices/cuda/models/naive-n05-qkv.cu
-            src/devices/cuda/models/naive-n05-indexer.cu)
+            src/devices/cuda/models/naive-n05-indexer.cu
+            src/devices/cuda/moe/fastllm-moe16-wgmma.cu)
         set_property(SOURCE src/devices/cuda/models/naive-n05-kernels.cu
             APPEND PROPERTY COMPILE_DEFINITIONS
                 FASTLLM_ENABLE_NAIVE_QKV_SM90 FASTLLM_ENABLE_NAIVE_INDEXER_SM90)
+        set_property(SOURCE src/devices/cuda/moe/fastllm-moe16.cu
+            APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_MOE16_SM90)
     endif()
 
     # EP4/EP8 uses an isolated, pinned DeepGEMM source subset. Compile the kernel
@@ -570,7 +580,7 @@ if (USE_CUDA)
     endif()
 
     # These C++ units include CUDA runtime/driver headers without going through nvcc.
-    set_property(SOURCE src/devices/cuda/models/glm5-next-dsa.cpp
+    set_property(SOURCE src/devices/cuda/models/glm5-next-dsa.cpp src/models/clover.cpp src/models/clover_parallel.cpp
         src/models/naive_n05_flash.cpp src/models/naive_n05_tp.cpp src/models/naive_n05_kvmem.cpp
         APPEND PROPERTY INCLUDE_DIRECTORIES "${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}")
 
@@ -888,6 +898,9 @@ target_link_libraries(quant fastllm)
 
 if (UNIT_TEST)
     enable_testing()
+    add_executable(recurrent_prefix_cache_test test/basic/test_recurrent_prefix_cache.cpp)
+    target_include_directories(recurrent_prefix_cache_test PRIVATE include)
+    add_test(NAME recurrent_prefix_cache COMMAND recurrent_prefix_cache_test)
     find_package(Threads REQUIRED)
     add_executable(alive_thread_pool_test test/basic/test_alive_thread_pool.cpp)
     target_include_directories(alive_thread_pool_test PRIVATE include)
@@ -1677,6 +1690,10 @@ if (UNIT_TEST)
                 "PASS [0-9]+ changing-context graph replays; stress=1" 300 --stress)
             fastllm_add_checked_test(deepseekV41FullDecodePooled deepseekV41FullDecodeRegression
                 "PASS [0-9]+ changing-context graph replays; stress=0" 300 --pooled)
+            fastllm_add_checked_test(deepseekV41FullDecodeFP8 deepseekV41FullDecodeRegression
+                "PASS [0-9]+ FP8 full decode rows" 900 --fp8)
+            fastllm_add_checked_test(deepseekV41FullDecodeFP8LongContext deepseekV41FullDecodeRegression
+                "PASS [0-9]+ FP8 full decode rows" 900 --fp8 --long-context)
             fastllm_add_checked_test(deepseekV41FullVerify deepseekV41FullDecodeRegression
                 "PASS [0-9]+ full verify graph replays" 300 --verify)
             fastllm_add_checked_test(deepseekV41AttentionLocality deepseekV41FullDecodeRegression
@@ -1692,6 +1709,7 @@ if (UNIT_TEST)
             fastllm_add_checked_test(deepseekV41CandidateReuseVerify deepseekV41FullDecodeRegression
                 "PASS [0-9]+ full verify graph replays" 900 --verify --shared-candidates --long-context)
             set_tests_properties(deepseekV41FullDecode deepseekV41FullDecodeStress
+                deepseekV41FullDecodeFP8 deepseekV41FullDecodeFP8LongContext
                 deepseekV41FullDecodePooled deepseekV41FullVerify deepseekV41VerifyIndexHeads17 deepseekV41AttentionLocality
                 deepseekV41FullDecodeLongContext deepseekV41FullVerifyLongContext
                 deepseekV41CandidateReuse deepseekV41CandidateReuseVerify
@@ -1736,6 +1754,13 @@ if (UNIT_TEST)
             fastllm_add_checked_test(cudaBorrowedConversion cudaBorrowedConversionRegression
                 "PASS [0-9]+ borrowed CUDA conversions" 300)
             set_tests_properties(cudaBorrowedConversion PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+
+            add_executable(cudaBlockTransposeRegression test/ops/cudaBlockTransposeRegression.cpp)
+            target_link_libraries(cudaBlockTransposeRegression PRIVATE fastllm)
+            target_include_directories(cudaBlockTransposeRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            fastllm_add_checked_test(cudaBlockTranspose cudaBlockTransposeRegression
+                "PASS [0-9]+ block transpose oracle" 120)
+            set_tests_properties(cudaBlockTranspose PROPERTIES LABELS cuda RUN_SERIAL TRUE)
 
             add_executable(multiCudaOutputGatherRegression test/ops/multiCudaOutputGatherRegression.cpp)
             target_link_libraries(multiCudaOutputGatherRegression PRIVATE fastllm)
@@ -1826,6 +1851,11 @@ if (UNIT_TEST)
     if (USE_CUDA AND NOT USE_ROCM)
         add_executable(multimodal_workspace_test test/basic/test_multimodal_workspace.cpp)
         target_link_libraries(multimodal_workspace_test PRIVATE fastllm)
+        if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+            # Inject allocation failures in the test, without runtime flags.
+            target_compile_definitions(multimodal_workspace_test PRIVATE FASTLLM_TEST_WRAP_WORKSPACE)
+            target_link_libraries(multimodal_workspace_test PRIVATE "-Wl,--wrap=FastllmCudaTryDirectMalloc")
+        endif()
         add_test(NAME multimodal_workspace COMMAND multimodal_workspace_test)
         set_tests_properties(multimodal_workspace PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
         add_executable(qwen35_vision_tp_test test/basic/test_qwen35_vision_tp.cpp)
@@ -3095,6 +3125,51 @@ if (UNIT_TEST)
         add_test(NAME qwen4TpMtpCollective COMMAND qwen4TpMtpCollectiveRegression)
         set_tests_properties(qwen4TpMtpCollective PROPERTIES
             LABELS "cuda;multigpu" TIMEOUT 180 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+
+        add_executable(moe16Regression test/ops/moe16Regression.cpp)
+        target_link_libraries(moe16Regression fastllm)
+        target_include_directories(moe16Regression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        add_test(NAME moe16_bf16 COMMAND moe16Regression)
+        add_test(NAME moe16_fp16 COMMAND moe16Regression fp16)
+        set_tests_properties(moe16_bf16 moe16_fp16 PROPERTIES
+            LABELS cuda TIMEOUT 180 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+
+        foreach(component Sampling Gdn Experts Graph Parallel)
+            set(target clover${component}Regression)
+            string(TOLOWER ${component} component_lower)
+            add_executable(${target} test/ops/${target}.cpp)
+            target_link_libraries(${target} fastllm)
+            target_include_directories(${target} PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            add_test(NAME clover_${component_lower} COMMAND ${target})
+            set_tests_properties(clover_${component_lower} PROPERTIES
+                LABELS cuda TIMEOUT 120 SKIP_RETURN_CODE 77)
+            if (NOT component STREQUAL "Sampling")
+                add_test(NAME clover_${component_lower}_fp16 COMMAND ${target} fp16)
+                set_tests_properties(clover_${component_lower}_fp16 PROPERTIES
+                    LABELS cuda TIMEOUT 180 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+            endif()
+        endforeach()
+        set_tests_properties(clover_graph clover_parallel PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
+        set_tests_properties(clover_parallel clover_parallel_fp16 PROPERTIES LABELS "cuda;multigpu")
+        add_test(NAME clover_p2p_allreduce COMMAND cloverParallelRegression allreduce)
+        set_tests_properties(clover_p2p_allreduce PROPERTIES
+            LABELS "cuda;multigpu" TIMEOUT 120 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+        add_test(NAME clover_p2p_abort COMMAND cloverParallelRegression abort)
+        set_tests_properties(clover_p2p_abort PROPERTIES
+            LABELS "cuda;multigpu" TIMEOUT 15 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+        add_test(NAME clover_parallel_rank_error COMMAND cloverParallelRegression rank-error)
+        add_test(NAME clover_parallel_tp8 COMMAND cloverParallelRegression bf16 8)
+        set_tests_properties(clover_parallel_rank_error clover_parallel_tp8 PROPERTIES
+            LABELS "cuda;multigpu" TIMEOUT 180 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+
+        if (USE_NUMAS)
+            add_executable(hybridBF16Regression test/ops/hybridBF16Regression.cpp)
+            target_link_libraries(hybridBF16Regression fastllm)
+            target_include_directories(hybridBF16Regression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            add_test(NAME hybrid_bf16 COMMAND hybridBF16Regression)
+            add_test(NAME hybrid_bf16_cache COMMAND hybridBF16Regression 67108864)
+            set_tests_properties(hybrid_bf16 hybrid_bf16_cache PROPERTIES LABELS "cuda;numa" TIMEOUT 180 SKIP_RETURN_CODE 77)
+        endif()
 
         add_executable(bf16MoeRegression test/ops/bf16MoeRegression.cpp)
         target_link_libraries(bf16MoeRegression fastllm)

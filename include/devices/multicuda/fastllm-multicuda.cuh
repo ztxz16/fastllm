@@ -96,6 +96,8 @@ bool FastllmNcclGraphPeerCopy(int dstDevice, void *dst,
                               int srcDevice, const void *src, size_t bytes);
 void FastllmNcclBroadcast(void* data, int count, int dataType, int root, int deviceId);
 void FastllmNcclBroadcastFrom(void* send, void* recv, int count, int dataType, int root, int deviceId);
+// Stop waiting ranks after a thread-TP forward fails. The group is unusable afterwards.
+void FastllmNcclAbort(const char *reason);
 void FastllmNcclAllReduce(void* data, void* dest, int count, int dataType, int deviceId);
 bool FastllmNcclAllReduceMaxUint64(void *data, int count, int deviceId);
 // Runs NCCL directly, bypassing the graph-safe custom all-reduce. Large TP
@@ -176,6 +178,8 @@ namespace fastllm {
         Data &embed, &head, &tokens, &outEmbeds;
         std::shared_ptr<void> &workspace;
         bool completed = false;
+        Data *proposalProbs = nullptr;
+        float temperature = 1.0f;
     };
     bool MultiCudaLinearOutputGatherPersistent(Data &input, Data &weight, Data &output,
                                                std::shared_ptr<void> &workspace,

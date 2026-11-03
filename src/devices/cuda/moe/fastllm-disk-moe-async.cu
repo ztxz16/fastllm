@@ -119,9 +119,8 @@ std::unique_ptr<FastllmCudaDiskMoeAsync> FastllmCudaDiskMoeAsync::Create(
     if(layers.empty())return {};
     cudaDeviceProp prop{};
     if(cudaGetDeviceProperties(&prop,device)!=cudaSuccess || !prop.canMapHostMemory || !prop.unifiedAddressing)return {};
-    int clockRate = 0;
-    if (cudaDeviceGetAttribute(&clockRate, cudaDevAttrClockRate, device) != cudaSuccess || clockRate <= 0)
-        return {};
+    int clockRate=0;
+    if(cudaDeviceGetAttribute(&clockRate,cudaDevAttrClockRate,device)!=cudaSuccess || clockRate<=0)return {};
     auto p=std::make_unique<Impl>();p->device=device;
     p->timeoutCycles=static_cast<unsigned long long>(clockRate)*1000*10;p->layers=layers;p->hidden=layers[0].hidden;p->maxInter=0;
     int experts=0;

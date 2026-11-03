@@ -7232,19 +7232,19 @@ namespace fastllm {
                 DsparkMaskToolLogits(*verifyLogits, sampling, segments[0].spec->draftTokens);
                 TopK(*verifyLogits, topk, 1);
                 topk.ToDevice(DataDevice::CPU);
-#ifdef USE_CUDA
-                // Full verification joins every rank's completion event onto
-                // this stream. The blocking readback has drained that join,
-                // so frame teardown needs no second device-wide barrier.
-                if (f.fullGraphLogits && f.tpDecodeDispatch && !FastllmCudaGetThreadError())
-                    f.tpDecodeDispatch->MarkDeviceWorkComplete();
-#endif
                 const int stride = topk.dims[topk.dims.size() - 1];
                 const float *topkData = (const float*)topk.cpuData;
                 for (int i = 0; i < seqlen; i++) {
                     segments[0].spec->tokens[i] = (int)(topkData[(uint64_t)i * stride] + 1e-3);
                 }
             }
+#ifdef USE_CUDA
+            // Both samplers finish with a blocking result readback. Full
+            // verification joins every rank onto that stream before sampling,
+            // so teardown needs no second device-wide barrier.
+            if (f.fullGraphLogits && f.tpDecodeDispatch && !FastllmCudaGetThreadError())
+                f.tpDecodeDispatch->MarkDeviceWorkComplete();
+#endif
             for (auto &seg : segments) {
                 seg.state->totalLen += seg.seqlen;
             }

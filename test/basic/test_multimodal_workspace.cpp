@@ -5,10 +5,32 @@
 #include "utils/utils.h"
 
 #include <iostream>
+#include <array>
+#include <exception>
+#include <limits>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 using namespace fastllm;
+
+#ifdef FASTLLM_TEST_WRAP_WORKSPACE
+namespace {
+size_t allocationLimit = 0;
+bool allocationError = false;
+int allocationCalls = 0;
+}
+extern "C" FastllmCudaTryMallocResult __real_FastllmCudaTryDirectMalloc(void **pointer, size_t bytes);
+extern "C" FastllmCudaTryMallocResult __wrap_FastllmCudaTryDirectMalloc(void **pointer, size_t bytes) {
+    if (allocationLimit || allocationError) {
+        ++allocationCalls;
+        *pointer = nullptr;
+        if (allocationError) return FASTLLM_CUDA_TRY_MALLOC_ERROR;
+        if (bytes > allocationLimit) return FASTLLM_CUDA_TRY_MALLOC_CAPACITY_FAILURE;
+    }
+    return __real_FastllmCudaTryDirectMalloc(pointer, bytes);
+}
+#endif
 
 namespace {
 void Require(bool value, const char *message) {
@@ -63,6 +85,73 @@ void CheckArena() {
     void *normal = FastllmCudaMalloc(4096);
     Require(normal && !IsCudaWorkspacePointer(normal), "scope leaked into ordinary CUDA allocations");
     FastllmCudaFree(normal);
+}
+
+void CheckArenaFallback() {
+    for (size_t minimum : {size_t(4097), std::numeric_limits<size_t>::max()}) {
+        bool rejected = false;
+        try { CudaWorkspace invalid(0, 4096, minimum); }
+        catch (const std::invalid_argument &) { rejected = true; }
+        Require(rejected, "invalid arena minimum accepted");
+    }
+#ifdef FASTLLM_TEST_WRAP_WORKSPACE
+    struct Restore {
+        int device = FastllmCudaGetDevice();
+        ~Restore() { allocationLimit = 0; allocationError = false; FastllmCudaSetDevice(device); }
+    } restore;
+    const int previous = FastllmCudaGetDeviceCount() > 1 ? 1 : 0;
+    FastllmCudaSetDevice(previous);
+    allocationLimit = 4096;
+    {
+        auto arena = std::make_shared<CudaWorkspace>(0, 16384, 2048);
+        Require(arena->Capacity() >= 2048 && arena->Capacity() <= allocationLimit,
+                "arena did not shrink within requested bounds");
+        Require(FastllmCudaGetDevice() == previous, "arena allocation changed current device");
+        void *pointer = AllocateCudaWorkspace(arena, 2048);
+        Require(pointer && TryFreeCudaWorkspace(pointer), "shrunken arena is unusable");
+    }
+    allocationLimit = 1024;
+    bool exhausted = false;
+    try { CudaWorkspace arena(0, 16384, 2048); }
+    catch (const std::runtime_error &) { exhausted = true; }
+    Require(exhausted && FastllmCudaGetDevice() == previous && !FastllmCudaGetThreadError(),
+            "arena exhaustion changed device or poisoned CUDA state");
+    allocationError = true;
+    allocationCalls = 0;
+    bool failed = false;
+    try { CudaWorkspace arena(0, 16384, 2048); }
+    catch (const std::runtime_error &) { failed = true; }
+    Require(failed && allocationCalls == 1 && FastllmCudaGetDevice() == previous,
+            "non-capacity allocation error was retried or changed device");
+#endif
+}
+
+void CheckConcurrentArena() {
+    auto arena = std::make_shared<CudaWorkspace>(0, 2 << 20);
+    std::array<std::vector<void *>, 8> blocks;
+    auto parallel = [&](const auto &task) {
+        std::array<std::exception_ptr, 8> errors;
+        std::vector<std::thread> threads;
+        for (int rank = 0; rank < 8; ++rank) threads.emplace_back([&, rank] {
+            try { task(rank); } catch (...) { errors[rank] = std::current_exception(); }
+        });
+        for (auto &thread : threads) thread.join();
+        for (auto error : errors) if (error) std::rethrow_exception(error);
+    };
+    parallel([&](int rank) {
+        for (int i = 0; i < 1024; ++i) {
+            auto *pointer = AllocateCudaWorkspace(arena, 256, false);
+            Require(pointer && IsCudaWorkspacePointer(pointer), "concurrent arena allocation failed");
+            blocks[rank].push_back(pointer);
+        }
+    });
+    Require(arena->LiveBytes() == arena->Capacity(), "concurrent arena accounting mismatch");
+    Require(!AllocateCudaWorkspace(arena, 256, false), "full arena allocation must fail");
+    parallel([&](int rank) {
+        for (auto *pointer : blocks[(rank + 1) % 8])
+            Require(TryFreeCudaWorkspace(pointer), "cross-thread release lost arena ownership");
+    });
+    Require(arena->LiveBytes() == 0, "concurrent arena release leaked storage");
 }
 
 class TestModel : public Qwen3_5Model {
@@ -153,6 +242,8 @@ int main() {
     SetThreads(4);
     try {
         CheckArena();
+        CheckArenaFallback();
+        CheckConcurrentArena();
         for (bool cudaEmbedding : {false, true}) {
             for (DataType dtype : {FLOAT32, FLOAT16, BFLOAT16}) CheckCpuStaging(cudaEmbedding, dtype);
         }

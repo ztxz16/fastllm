@@ -29,7 +29,7 @@ namespace fastllm {
     using ChatMessages = std::vector <std::pair <std::string, std::string> >;
 
     enum ResponseContextError {
-        ResponseContextErrorNone = 0, ResponseContextErrorPromptTooLong
+        ResponseContextErrorNone = 0, ResponseContextErrorPromptTooLong, ResponseContextErrorRuntime
     };
 
     class basellm;
@@ -415,7 +415,8 @@ namespace fastllm {
 
         // Drain several already-generated tokens under one scheduler lock.
         // Returns the number written, -1 on normal completion, or -2 when the
-        // prompt is too long.  Speculative decoders use this to publish an
+        // prompt is too long, or -3 after a native runtime failure.
+        // Speculative decoders use this to publish an
         // accepted block without one Python/ASGI round trip per token.
         virtual int FetchResponseTokensBatch(int handleId, int *output,
                                              int maxTokens);

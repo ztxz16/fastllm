@@ -97,6 +97,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 | Qwen3.5 / Qwen3.6 / Qwen3.8 | [Qwen 指南](docs/qwen3.md) |
 | DeepSeek-V4 / V4-Flash | [DeepSeek-V4 指南](docs/deepseek.md) |
 | DeepSeek-V4.1-Flash 1017 | [DeepSeek-V4.1 指南](docs/deepseek_v41.md) |
+| Clover-35B-A3B-Preview | [Clover 单卡指南](docs/clover.md) |
 | Kimi-K3 | [Kimi-K3 指南](docs/kimi_k3.md) |
 | GLM-5 / GLM-5.3-Flash | [GLM-5 指南](docs/glm5.md) |
 | Dots3-Note / Laguna | [Dots3-Note](docs/dots3_note.md) · [Laguna](docs/laguna.md) |

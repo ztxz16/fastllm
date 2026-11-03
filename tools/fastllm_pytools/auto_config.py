@@ -492,6 +492,16 @@ def _resolve_dense_qwen35(args, base, explicit, metadata, tensors, model, info, 
 
 def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
     """Resolve one --auto invocation transactionally, before model allocation."""
+    config_path = Path(args.path) / "config.json"
+    if config_path.is_file():
+        with config_path.open() as stream:
+            config = json.load(stream)
+        if config.get("model_type") == "clover_moe":
+            from .clover_config import resolve as resolve_clover
+            trial = copy.copy(args)
+            result = resolve_clover(trial, query_gpu, config, hardware=hardware, ram=ram)
+            vars(args).update(vars(trial))
+            return result
     from .env import env
     from .util import _fastllm_env_flag_enabled
     graph_enabled = ("FASTLLM_CUDA_GRAPH" not in os.environ or

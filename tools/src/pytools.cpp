@@ -4,6 +4,7 @@
 
 #include "model.h"
 #include "models/naive_n05_flash.h"
+#include "models/clover.h"
 #include "devices/disk/diskdevice.h"
 #include "moe_cache_config.h"
 #include "utils/autotune.h"
@@ -46,6 +47,7 @@ struct FASTLLM_PYTOOLS_INIT {
 
 static thread_local std::string fastllmPytoolsWarmupError;
 static thread_local std::string fastllmPytoolsContextResult;
+static thread_local std::string fastllmPytoolsCloverError;
 
 extern "C" {
     DLL_EXPORT bool start_autotune_recording(const char *path) {
@@ -1029,6 +1031,37 @@ extern "C" {
         int ret = model->FetchResponseTokens(handleId);
         std::string s = (ret == -1 ? "<flmeos>" : model->weight.tokenizer.DecodeTokens(std::vector <int> {ret}));
         return string_to_chars(s);
+    }
+
+    DLL_EXPORT const char *get_clover_error() {
+        return fastllmPytoolsCloverError.c_str();
+    }
+
+    DLL_EXPORT bool configure_clover_llm_model(int modelId, const char *options) {
+        try {
+            auto *model = dynamic_cast<fastllm::CloverModel *>(models.GetModel(modelId));
+            if (!model || !options) throw std::invalid_argument("Clover model/options required");
+            std::string error;
+            auto config = json11::Json::parse(options, error);
+            if (!error.empty()) throw std::invalid_argument(error);
+            model->ConfigureClover(config);
+            fastllmPytoolsCloverError.clear();
+            return true;
+        } catch (const std::exception &e) { fastllmPytoolsCloverError = e.what(); return false; }
+    }
+
+    DLL_EXPORT int launch_response_clover_llm_model(int modelId, int len, const int *values, const char *options) {
+        try {
+            auto *model = dynamic_cast<fastllm::CloverModel *>(models.GetModel(modelId));
+            if (!model || !options || !values || len <= 0)
+                throw std::invalid_argument("Clover model, nonempty prompt and options required");
+            std::string error;
+            auto config = json11::Json::parse(options, error);
+            if (!error.empty()) throw std::invalid_argument(error);
+            int handle = model->LaunchClover(std::vector<int>(values, values + len), config);
+            fastllmPytoolsCloverError.clear();
+            return handle;
+        } catch (const std::exception &e) { fastllmPytoolsCloverError = e.what(); return -1; }
     }
 
     DLL_EXPORT int launch_response_llm_model(int modelId, int len, int *values,

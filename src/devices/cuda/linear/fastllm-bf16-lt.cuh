@@ -22,7 +22,7 @@ constexpr size_t maxWorkspacesPerDevice = 16; // 128 MiB, including graph-held b
 constexpr int maxCandidates = 8;
 constexpr int timingRepeats = 32;
 constexpr int timingSamples = 2;
-using Key = std::array<int, 7>; // M, N, K, alignment(A), alignment(B), alignment(C/D), storage type
+using Key = std::array<int, 8>; // M, N, K, alignments(A,B,C/D), storage, reference rows (0 = ordinary)
 
 inline void CheckCuda(cudaError_t status) {
     if (status != cudaSuccess) {
@@ -295,8 +295,7 @@ inline bool Run(State &s, Plan &p, const cublasLtMatmulAlgo_t &algo,
         &beta, output, p.c, output, p.c, &algo, workspace, workspaceBytes, cudaStreamPerThread));
 }
 
-inline void MakePlan(State &s, Plan &p, const Key &key,
-                     const void *weight, const void *input, void *output) {
+inline bool MakeLayouts(Plan &p, const Key &key) {
     const int M = key[0], N = key[1], K = key[2];
     const auto dtype = static_cast<cudaDataType_t>(key[6]);
     cublasOperation_t trans = CUBLAS_OP_T;
@@ -304,7 +303,15 @@ inline void MakePlan(State &s, Plan &p, const Key &key,
         !CheckBlas(cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_TRANSA, &trans, sizeof(trans))) ||
         !CheckBlas(cublasLtMatrixLayoutCreate(&p.a, dtype, K, N, K)) ||
         !CheckBlas(cublasLtMatrixLayoutCreate(&p.b, dtype, K, M, K)) ||
-        !CheckBlas(cublasLtMatrixLayoutCreate(&p.c, dtype, N, M, N))) return;
+        !CheckBlas(cublasLtMatrixLayoutCreate(&p.c, dtype, N, M, N))) return false;
+    return true;
+}
+
+inline void MakePlan(State &s, Plan &p, const Key &key,
+                     const void *weight, const void *input, void *output) {
+    if (!MakeLayouts(p, key)) return;
+    const int M = key[0];
+    const auto dtype = static_cast<cudaDataType_t>(key[6]);
 
     SearchResources search;
     if (!CheckBlas(cublasLtMatmulPreferenceCreate(&search.preference))) return;
@@ -412,29 +419,49 @@ inline void MakePlan(State &s, Plan &p, const Key &key,
 }
 
 inline bool Matmul(const void *input, const void *weight, void *output, int M, int K, int N,
-                   cudaDataType_t storage = CUDA_R_16BF) {
+                   cudaDataType_t storage = CUDA_R_16BF, int referenceRows = 0) {
     // This bounds tuning cost, not model/architecture-specific dispatch.
     if (N <= 0 || K <= 0) return false;
     if (storage == CUDA_R_16BF) {
-        if (M < 1 || M > 32) return false;
+        if (M < 1 || M > (referenceRows ? 256 : 32) ||
+            (referenceRows && (referenceRows != 32 || M % referenceRows))) return false;
     } else if (storage == CUDA_R_16F) {
         // Large decode heads amortize tuning and saturate Hopper bandwidth.
         // Other shapes retain their native GEMV and exact-row reduction tree.
         if (M < 1 || M >= 32 || N < 65536 || (N % 8) || (K % 8)) return false;
     } else return false;
+    if (referenceRows && storage != CUDA_R_16BF) return false;
     cudaStreamCaptureStatus capture;
     CheckCuda(cudaStreamIsCapturing(cudaStreamPerThread, &capture));
     int device = 0;
     CheckCuda(cudaGetDevice(&device));
     State *s = GetState(device, capture != cudaStreamCaptureStatusNone);
-    if (!s) return false;
-    Key key{M, N, K, Alignment(weight), Alignment(input), Alignment(output), static_cast<int>(storage)};
+    if (!s || (referenceRows && s->arch != 90)) return false;
+    Key key{M, N, K, Alignment(weight), Alignment(input), Alignment(output), static_cast<int>(storage), referenceRows};
     auto found = s->plans.find(key);
     if (found == s->plans.end()) {
         if (capture != cudaStreamCaptureStatusNone) return false;
-        if (s->plans.size() >= maxPlans) s->plans.erase(s->plans.begin());
+        while (s->plans.size() > maxPlans - (referenceRows ? 2 : 1))
+            s->plans.erase(s->plans.begin());
         auto plan = std::make_unique<Plan>();
-        MakePlan(*s, *plan, key, weight, input, output);
+        if (referenceRows) {
+            // Select exactly the ordinary 32-row plan, then keep its tile and
+            // reduction configuration while extending only the row dimension.
+            Key reference = key; reference[0] = referenceRows; reference[7] = 0;
+            auto original = s->plans.find(reference);
+            if (original == s->plans.end()) {
+                auto base = std::make_unique<Plan>();
+                MakePlan(*s, *base, reference, weight, input, output);
+                original = s->plans.emplace(reference, std::move(base)).first;
+            }
+            if (original->second->valid && MakeLayouts(*plan, key)) {
+                cublasLtMatmulHeuristicResult_t checked{};
+                plan->algo = original->second->algo;
+                plan->valid = CheckBlas(cublasLtMatmulAlgoCheck(s->handle, plan->op,
+                    plan->a, plan->b, plan->c, plan->c, &plan->algo, &checked)) &&
+                    checked.state == CUBLAS_STATUS_SUCCESS && checked.workspaceSize <= workspaceBytes;
+            }
+        } else MakePlan(*s, *plan, key, weight, input, output);
         found = s->plans.emplace(key, std::move(plan)).first;
     }
     Plan &p = *found->second;

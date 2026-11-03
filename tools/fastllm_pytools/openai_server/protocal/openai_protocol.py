@@ -101,6 +101,9 @@ class ChatCompletionRequest(BaseModel):
     stream: Optional[bool] = False
     presence_penalty: Optional[float] = 0.0
     frequency_penalty: Optional[float] = 0.0
+    repetition_penalty: Optional[float] = None
+    do_sample: Optional[bool] = None
+    clover_options: Optional[Dict[str, Any]] = None
     user: Optional[str] = None
     tools: Optional[list[ChatCompletionToolsParam]] = None
     tool_choice: Optional[Union[

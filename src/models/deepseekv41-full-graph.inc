@@ -200,6 +200,12 @@ bool V41FullReserve(V41FullGraph &g, const std::vector<DeepSeekV41Segment> &segm
                 (g.tensorParallel && (!cache.windowKV.multiDeviceData ||
                 !cache.windowKV.IsTensorParallelReplicated())))
                 return false;
+            auto validRows = [](const Data &data, int mode, int width) {
+                return data.dims.empty() || (data.dataType == (mode ? DataType::INT8 : DataType::BFLOAT16) &&
+                    data.dims.size() == 3 && data.dims[0] == 1 && data.dims[2] == width);
+            };
+            if (cfg.kvSource && (!validRows(cache.compressedKV, cfg.cmpMode, cfg.cmpMode ? cfg.cmpRowBytes : 512) ||
+                (cfg.indexSource && !validRows(cache.indexK, cfg.indexMode, cfg.indexMode ? cfg.indexRowBytes : 128)))) return false;
             for (int device : g.devices) {
                 if (!V41FullLocal(cache.windowKV, device).cudaData)
                     return false;
@@ -377,7 +383,8 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
     // request descriptors. Other shapes keep the segmented/eager path.
     if (batch < 1 || batch > (verifying ? (hybrid ? 32 : 8) : 16) || (!hybrid && executionMode != ExecutionMode::Gpu) ||
         (!verifying && v41DsparkEnabled) ||
-        (!hybrid && (kvCacheDataType == DataType::FP8_E4M3 || kvCacheDataType == DataType::FP4_E2M1)) ||
+        (!hybrid && (kvCacheDataType == DataType::FP4_E2M1 ||
+            (verifying && kvCacheDataType == DataType::FP8_E4M3))) ||
         (!verifying && !v41CudaGraphWarmingUp) || head_dim_full != 512 || hc_mult != 4 || index_head_dim != 128)
         return;
     // Explicit reference/debug modes must retain their selected arithmetic.
@@ -924,7 +931,9 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
 bool DeepSeekV41Model::TryFullDecodeGraph(ForwardWorkspace &f, bool inputsPrepared) {
     // Verification warmup uses the same composition/replay path as requests.
     // Ordinary decode still builds its full graph explicitly after warmup.
-    if (!f.graphReplay || !f.graphState || (v41CudaGraphWarmingUp && !f.dsparkVerify) || (f.quantKV && !f.dsparkVerify && executionMode != ExecutionMode::Hybrid) ||
+    if (!f.graphReplay || !f.graphState || (v41CudaGraphWarmingUp && !f.dsparkVerify) ||
+        (f.quantKV && executionMode != ExecutionMode::Hybrid &&
+            (f.dsparkVerify || kvCacheDataType != DataType::FP8_E4M3)) ||
         f.hasImageTokens || f.inputEmbeds)
         return false;
     // Building a graph warms its children and therefore still needs the eager

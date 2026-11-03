@@ -3,6 +3,7 @@
 #include "fastllm.h"
 #include <functional>
 #include <map>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -39,6 +40,26 @@ private:
     float swigluLimit;
     double budgetFraction; // Model subgroups share one per-device cache budget.
     bool allNuma = true, allCpu = true;
+};
+
+// Packed native BF16 experts share the NUMA workers and generic cache /
+// whole-expert scheduling policies. The caller retains immutable CPU weights
+// and serializes Run calls. Construction registers host shards before requests.
+class HybridMoeBF16 {
+public:
+    HybridMoeBF16(const std::vector<std::pair<Data *, Data *>> &layers, int device);
+    ~HybridMoeBF16();
+    struct Stats { uint64_t cpuRoutes = 0, gpuRoutes = 0, cacheHits = 0, uploads = 0; };
+    Stats GetStats() const;
+    // Set before a serialized forward; prefill does not create decode heat.
+    void SetPrefill(bool prefill);
+    // The callback may submit GPU work while NUMA workers are active; it must
+    // not submit CPU work to the shared host MoE pool.
+    void Run(const Data &input, const Data &index, const Data &score,
+             Data &output, int layer, const std::function<void()> &launchParallel = {});
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl;
 };
 
 // One complete target token/verification step owns one policy scope. Cache

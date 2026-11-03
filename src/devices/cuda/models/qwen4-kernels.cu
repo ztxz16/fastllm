@@ -1,3 +1,4 @@
+#include "devices/cuda/fastllm-cuda-conv.cuh"
 #include "fastllm-cuda.cuh"
 #include "devices/cuda/fastllm-cuda-hybrid-dsa.h"
 #include "fastllm-cuda-rope.cuh"
@@ -1199,11 +1200,7 @@ namespace {
         stateRow[kernel - 1] =
             Qwen4CudaLoadActivation(input, inputType, item);
         const float *weightRow = weight + (uint64_t)channel * kernel;
-        float value = 0.0f;
-        #pragma unroll
-        for (int tap = 0; tap < kernel; tap++) {
-            value += stateRow[tap] * weightRow[tap];
-        }
+        float value = fastllm::cuda_conv::Dot<float, float, false>(stateRow, weightRow, kernel);
         if (silu) {
             value = value / (1.0 + expf(-value));
         }
@@ -1225,16 +1222,9 @@ namespace {
             const float *weightRow = weight + (uint64_t)channel * kernel;
             const float *stateRow = state +
                 ((uint64_t)batch * channels + channel) * kernel;
-            float value = 0.0f;
-            for (int tap = 0; tap < kernel; tap++) {
-                const int sourceToken = token - kernel + 1 + tap;
-                const float sample = sourceToken >= 0
-                    ? Qwen4CudaToFloat(input[
-                          ((uint64_t)batch * sequence + sourceToken) *
-                              channels + channel])
-                    : stateRow[kernel + sourceToken];
-                value += sample * weightRow[tap];
-            }
+            float value = fastllm::cuda_conv::At<T, float, float, false>(
+                input + (uint64_t)batch * sequence * channels + channel,
+                stateRow, weightRow, token, channels, kernel, kernel);
             if (silu) {
                 // Keep bitwise parity with FastllmSiluKernel(float).
                 value = value / (1.0 + expf(-value));
