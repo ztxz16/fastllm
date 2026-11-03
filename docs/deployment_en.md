@@ -96,6 +96,8 @@ ftllm server /data/models/qwen3.8 \
   --draft_tokens 7
 ~~~
 
+For external DSpark checkpoints, `--draft_tokens N` and `--dspark N` select the candidate prefix to verify; the draft backbone still computes the full checkpoint `block_size`. For example, a block-7 checkpoint with `--draft_tokens 3` computes seven draft positions and verifies at most three candidates. Keep the original checkpoint configuration: changing `block_size` changes the noncausal draft attention and can reduce acceptance. Candidate counts above the checkpoint block size are rejected.
+
 `--draft` detects MTP, DFlash2, or DSpark from the draft checkpoint. Standalone MTP currently targets Qwen3.5 GGUF and may be either a directory containing `config.json` plus `mtp.safetensors`, or the `mtp.safetensors` file itself; it defaults to five draft tokens. For DFlash2, `--draft_tokens` counts actual draft tokens and excludes the anchor token.
 
 See the [Qwen3.8 DFlash2 report](benchmarks/qwen38_27b_dflash2.md) for the complete configuration and validation results.
@@ -165,7 +167,7 @@ These are CLI defaults; `--auto` chooses model-specific values for options you l
 | `--enable_thinking` | Control the model's thinking template when supported |
 | `--mtp` | Draft tokens per step for models with MTP support; `0` disables it and the current maximum is 8 |
 | `--mtp_fp8_draft_head` / `--mtp-fp8-draft-head` | FP8 draft output head for Qwen3.5-family multi-GPU MTP: `1` enables it; `0` reuses the original head to save VRAM, potentially reducing generation speed. Does not change the MTP draft count. An explicit value overrides `FASTLLM_MTP_FP8_DRAFT_HEAD`; otherwise the environment is preserved, with the head enabled by default |
-| `--dspark` | Enable embedded DSpark and set draft tokens per step |
+| `--dspark` | Enable DSpark and set candidates per step; use with `--draft` for an external checkpoint |
 | `--draft` / `--draft_model_path` | External MTP, DSpark, or DFlash checkpoint; MTP may point directly to `mtp.safetensors` |
 | `--draft_tokens` | Maximum draft tokens per step; defaults to the draft configuration |
 | `--tool_call_parser` | Tool-call parser; defaults to `auto` |

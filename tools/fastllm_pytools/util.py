@@ -1113,7 +1113,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         type = int, choices = [0, 1], default = None,
                         help = "Qwen3.5 系列多卡 MTP 的 FP8 draft 输出头；1 开启，0 复用原输出头以节省显存；未指定时沿用 FASTLLM_MTP_FP8_DRAFT_HEAD（默认开启）")
     parser.add_argument("--dspark", type = int, default = 0,
-                        help = "启用模型内置 DSpark，并指定每轮 draft token 数；例如 --dspark 7")
+                        help = "启用 DSpark 并指定每轮候选数；外置草稿配合 --draft 使用，保留 checkpoint 的训练 block size")
     parser.add_argument("--speculative_algorithm", "--speculative-algorithm",
                         dest = "speculative_algorithm", type = str, default = "",
                         help = "投机解码算法；off 关闭，或选择 mtp、dspark、dflash、clover")
@@ -1122,7 +1122,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         dest = "speculative_draft_model_path", type = str, default = "",
                         help = "MTP/DSpark/DFlash draft 模型目录；MTP 也可指定 mtp.safetensors 或 Qwen4 MTP GGUF")
     parser.add_argument("--draft_tokens", type = _positive_int, default = -1,
-                        help = "每轮最多使用的 draft token 数；未指定时读取 draft 配置")
+                        help = "每轮最多使用的 draft token 数；未指定时读取 draft 配置；外置 DSpark 仍计算完整训练 block，只截取候选前缀")
     parser.add_argument("--draft_gpu_resident", "--draft-gpu-resident", type=int, choices=(0, 1), default=None,
                         help="DeepSeek-V4.1 DSpark 草稿专家显存策略：1 要求全驻留，0 关闭全驻留优先；未指定保持现有策略。支持单卡/PP/TP，需 MXFP4 草稿；--auto 会检查预算，显存不足时报错")
     parser.add_argument("--speculative_num_draft_tokens", "--speculative-num-draft-tokens",
@@ -1130,10 +1130,10 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         help = "DFlash/Clover 每轮 block token 数（含 anchor）")
     parser.add_argument("--speculative_dspark_block_size", "--speculative-dspark-block-size",
                         dest = "speculative_dspark_block_size", type = int, default = -1,
-                        help = "DSpark block size；默认读取 draft config")
+                        help = "外置 DSpark 的训练 block size 校验值；必须与 draft config 一致，候选数使用 --draft_tokens")
     parser.add_argument("--speculative_dspark_confidence_threshold", "--speculative-dspark-confidence-threshold",
                         dest = "speculative_dspark_confidence_threshold", type = float, default = 0.5,
-                        help = "DSpark confidence 前缀阈值，范围 [0,1]；0 表示固定验证完整 block")
+                        help = "DSpark confidence 前缀阈值，范围 [0,1]；0 表示不按置信度提前截短候选")
     parser.add_argument("--triton", action = "store_true", help = "启用Triton CUDA算子")
     
     parser.add_argument('--custom', type = str, default = "", help = '指定描述自定义模型的python文件')
@@ -1462,22 +1462,26 @@ def make_normal_llm_model(args, startup_progress = None):
         configured_block = int(draft_config.get("block_size", 0))
         requested_block = int(
             getattr(args, "speculative_dspark_block_size", -1))
-        if dspark_tokens > 0:
-            requested_block = dspark_tokens
         if requested_block > 0 and requested_block != configured_block:
             raise ValueError(
                 "FastLLM currently requires the DSpark runtime block size "
                 "to match the checkpoint (requested=%d, checkpoint=%d)" %
                 (requested_block, configured_block))
+        if draft_tokens > 0 and dspark_tokens > 0 and draft_tokens != dspark_tokens:
+            raise ValueError("--draft_tokens and --dspark specify different token counts")
+        # Candidate count is independent of the noncausal draft backbone block.
+        # Preserve the checkpoint block even when verifying only its prefix.
+        draft_tokens = draft_tokens if draft_tokens > 0 else dspark_tokens or -1
         if (draft_tokens > 0 and
                 not 1 <= draft_tokens <= configured_block):
             raise ValueError(
-                "DSpark --draft_tokens must be in [1, checkpoint block_size] "
+                "DSpark --draft_tokens/--dspark must be in [1, checkpoint block_size] "
                 "(requested=%d, checkpoint block_size=%d)" %
                 (draft_tokens, configured_block))
         os.environ["FASTLLM_DSPARK_MODEL_PATH"] = speculative_draft_path
         if draft_tokens > 0:
             os.environ["FASTLLM_DSPARK_TOKENS"] = str(draft_tokens)
+            args.draft_tokens = draft_tokens
         confidence_threshold = float(getattr(
             args, "speculative_dspark_confidence_threshold", 0.5))
         if not 0.0 <= confidence_threshold <= 1.0:

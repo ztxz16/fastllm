@@ -81,6 +81,21 @@ using namespace fastllm;
 namespace fastllm {
 struct NaiveN05GraphTestAccess {
     static auto &DraftPrefixPool(NaiveN05FlashModel &model) { return model.prefixPool; }
+    static void CheckDraftWarmup(NaiveN05FlashModel &model) {
+        const char *warmup = std::getenv("FASTLLM_CUDA_SERVING_WARMUP");
+        if (!warmup || std::string(warmup) != "1" || !model.draftTP) return;
+        const int vocab = model.weight["lm_head.weight"].dims.front();
+        const size_t bytes = size_t(model.maxBatch) * (model.draftTokens + 1) * vocab * sizeof(float);
+        if (model.tpSamplingLogits.GetBytes() != bytes)
+            throw std::runtime_error("draft warmup sized verification logits for the training block");
+        if (model.tpBatchVerifyStorage) for (const auto &rank : model.tpBatchVerifyStorage->ranks) {
+            const auto &scratch = rank->storage->buffers.decode;
+            const size_t rows = size_t(model.maxBatch) * (model.draftTokens + 1);
+            if (scratch.indexQuery.Count(0) < rows * 16 * 128 ||
+                scratch.indexScale.Count(0) < rows * 16 || scratch.topk.dims.empty())
+                throw std::runtime_error("draft warmup omitted verification Indexer scratch");
+        }
+    }
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
     static void WatchDraftPrefix(NaiveN05FlashModel &model, const std::vector<std::pair<Data, Data>> &kv) {
         if (!inspectDraftPrefixAllocations) return;
@@ -772,7 +787,7 @@ class Fixture : public NaiveN05FlashModel {
         inspectDraftPrefixAllocations = true;
 #endif
         draftEnabled = canDoConcurrentForward = true;
-        draftLayers = 2; draftBlock = 7; draftTokens = 5;
+        draftLayers = 2; draftBlock = 7; draftTokens = 3;
         draftHeads = 8; draftKvHeads = 2; draftHeadDim = 32; draftWindow = 1024;
         draftConfidenceThreshold = 0; draftTargetLayers = {0, 1};
         AddDraftTestWeights(weight, draftLayers, draftKvHeads, 256, true);
@@ -782,6 +797,7 @@ class Fixture : public NaiveN05FlashModel {
             cfg.prefillTokens = 1024; cfg.hostBytes = 1ULL << 30; ConfigureKvMem(cfg);
         }
         WarmUp(); useRealScheduler = true; eos_token_id = -1; eos_token_ids.clear();
+        NaiveN05GraphTestAccess::CheckDraftWarmup(*this);
         auto &prefixPool = NaiveN05GraphTestAccess::DraftPrefixPool(*this);
         if (!prefixPool || prefixPool->draftStorage.size() != size_t(ranks))
             throw std::runtime_error("draft checkpoints are not distributed across TP ranks");
@@ -863,10 +879,11 @@ class Fixture : public NaiveN05FlashModel {
         inspectDraftPrefix = false;
         // Exercise actual speculative verification across a page boundary,
         // with independent request lengths, shared prefixes and request churn.
-        auto batch = [&](const std::vector<std::vector<int>> &prompts) {
+        auto batch = [&](const std::vector<std::vector<int>> &prompts, bool sampled = false) {
             std::vector<int> handles;
             for (const auto &tokens : prompts) {
-                GenerationConfig cfg; cfg.top_k = 1; cfg.output_token_limit = 20;
+                GenerationConfig cfg; cfg.top_k = sampled ? 0 : 1; cfg.output_token_limit = 20;
+                cfg.temperature = 1.f; cfg.top_p = .95f;
                 cfg.input_token_length = tokens.size();
                 handles.push_back(LaunchResponseTokens(tokens, cfg));
             }
@@ -878,7 +895,7 @@ class Fixture : public NaiveN05FlashModel {
             }
             return result;
         };
-        for (int proposed : {1, 5, 7}) for (int count : {1, 2, 8, 16}) {
+        for (int proposed : {1, 3, 5, 7}) for (int count : {1, 2, 8, 16}) {
             draftTokens = proposed;
             std::vector<std::vector<int>> prompts;
             for (int i = 0; i < count; ++i) prompts.push_back(prompt(2040 + i % 4, i % 3));
@@ -910,6 +927,17 @@ class Fixture : public NaiveN05FlashModel {
                           << " row=" << row << " token=" << first << std::endl;
             }
             std::cout << "DSPARK PREFIX batch=" << count << " draft=" << proposed << " pass\n";
+        }
+        // Grow and reuse proposal/acceptance arenas after a block7/prefix3
+        // warmup. Stochastic acceptance naturally produces ragged verify groups.
+        for (int proposed : {3, 5, 7, 3}) for (int count : {2, 8, 16}) {
+            draftTokens = proposed;
+            std::vector<std::vector<int>> prompts;
+            for (int i = 0; i < count; ++i) prompts.push_back(prompt(2040 + i % 4, i % 3));
+            SetSaveHistoryChat(false); SetSaveHistoryChat(true);
+            batch(prompts, true); const int before = pagedRestores;
+            batch(prompts, true);
+            if (pagedRestores - before != count) throw std::runtime_error("sampled draft prefix miss");
         }
         ShutdownRuntime();
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS

@@ -117,18 +117,45 @@ class SpeculativeDraftCliAliasesTest(unittest.TestCase):
                 ])
                 self.assertEqual(os.environ["FASTLLM_DFLASH_BLOCK_SIZE"], "6")
 
-    def test_external_dspark_caps_draft_tokens(self):
+    def test_external_dspark_preserves_trained_block_for_candidate_prefix(self):
+        with tempfile.TemporaryDirectory() as draft_path:
+            for block in (7, 8):
+                self.write_draft_config(draft_path, {
+                    "architectures": ["DSparkDraftModel"], "block_size": block,
+                })
+                config_path = os.path.join(draft_path, "config.json")
+                with open(config_path, "rb") as file:
+                    original = file.read()
+                for flag in ("--draft_tokens", "--dspark"):
+                    for tokens in (1, 3, 5, block):
+                        with self.subTest(block=block, flag=flag, tokens=tokens), \
+                                patch.dict(os.environ, {}, clear=True):
+                            args = self.configure_without_target([
+                                "--draft", draft_path, flag, str(tokens),
+                                "--speculative_dspark_block_size", str(block),
+                            ])
+                            self.assertEqual(args.draft_tokens, tokens)
+                            self.assertEqual(os.environ["FASTLLM_DSPARK_TOKENS"], str(tokens))
+                            self.assertEqual(os.environ["FASTLLM_DSPARK_MODEL_PATH"], draft_path)
+                            with open(config_path, "rb") as file:
+                                self.assertEqual(file.read(), original)
+
+    def test_external_dspark_rejects_block_override_and_invalid_candidate_counts(self):
         with tempfile.TemporaryDirectory() as draft_path:
             self.write_draft_config(draft_path, {
-                "architectures": ["DSparkDraftModel"],
-                "block_size": 7,
+                "architectures": ["DSparkDraftModel"], "block_size": 7,
             })
-            with patch.dict(os.environ, {}, clear=True):
-                self.configure_without_target([
-                    "--draft", draft_path,
-                    "--draft_tokens", "4",
-                ])
-                self.assertEqual(os.environ["FASTLLM_DSPARK_TOKENS"], "4")
+            cases = [
+                (["--draft_tokens", "10"], "checkpoint block_size"),
+                (["--dspark", "10"], "checkpoint block_size"),
+                (["--dspark", "3", "--draft_tokens", "5"], "different token counts"),
+                (["--dspark", "3", "--speculative_dspark_block_size", "3"], "match the checkpoint"),
+            ]
+            for options, message in cases:
+                with self.subTest(options=options), patch.dict(os.environ, {}, clear=True):
+                    args = make_normal_parser("test").parse_args(["--draft", draft_path, *options])
+                    with self.assertRaisesRegex(ValueError, message):
+                        make_normal_llm_model(args)
 
     def test_external_dspark_uses_checkpoint_default_when_unspecified(self):
         with tempfile.TemporaryDirectory() as draft_path:

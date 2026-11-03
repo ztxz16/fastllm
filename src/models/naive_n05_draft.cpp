@@ -32,6 +32,23 @@ namespace {
         if (weight.isFake || input.Count(0) / input.dims.back() > 1) MatMulTransB(input, weight, output);
         else Linear(input, weight, Data(), output);
     }
+#ifdef USE_CUDA
+    void GatherDraftHeadInput(const Data &hidden, const std::vector<int> &limits, int block, Data &input) {
+        const int width = hidden.dims.back(), rows = std::accumulate(limits.begin(), limits.end(), 0);
+        input.dataType = hidden.dataType; input.UpdateUnitSize(); input.Resize({1, rows, width});
+        input.ToDevice(hidden.dataDevice, hidden.dataDeviceIds, false); input.Allocate(false);
+        std::vector<void *> dst; std::vector<const void *> src; std::vector<size_t> bytes;
+        size_t offset = 0;
+        for (size_t row = 0; row < limits.size(); ++row) {
+            dst.push_back((uint8_t *)input.cudaData + offset);
+            src.push_back((const uint8_t *)hidden.cudaData + row * block * width * hidden.unitSize);
+            const size_t size = (size_t)limits[row] * width * hidden.unitSize;
+            bytes.push_back(size); offset += size;
+        }
+        AssertInFastLLM(FastllmCudaBatchCopyFromDeviceToDeviceAsyncCurrentThread(dst.data(), src.data(), bytes.data(), dst.size()),
+            "Cannot gather batch draft head input.");
+    }
+#endif
 }
 
 #ifdef USE_CUDA
@@ -1796,7 +1813,7 @@ void NaiveN05FlashModel::PrepareDraftSamplingMemory(int count, int steps, int vo
     }
     auto &shared = draftProposalStorage->sampling;
     const int rows = std::max(count, maxBatch > 0 ? maxBatch : 512);
-    steps = std::max(steps, draftBlock);
+    steps = std::max({1, steps, draftTokens});
     if (shared.rows >= rows && shared.steps >= steps && !shared.probabilities.dims.empty()) return;
     // Graph and eager/masked proposals execute serially and share this bounded
     // arena. Ragged verification groups have their own packing buffers.
@@ -2060,7 +2077,9 @@ void NaiveN05FlashModel::PrepareDraftAcceptance(std::vector<std::unique_ptr<Draf
     if (logits.dataDevice != DataDevice::CUDA || logits.dataType != FLOAT32 || rounds.empty()) return;
     ApplyDraftDevice();
     const int vocab = logits.dims.back();
-    PrepareDraftSamplingMemory(rounds.size(), draftBlock, vocab,
+    int steps = 0;
+    for (const auto &round : rounds) steps = std::max(steps, (int)round->proposed.size());
+    PrepareDraftSamplingMemory(rounds.size(), steps, vocab,
         weight["dspark.markov_head.markov_w1.weight"].dims.back());
     auto &packing = draftProposalStorage->sampling;
     std::vector<int> offsets;
@@ -2352,19 +2371,7 @@ std::vector<int> NaiveN05FlashModel::ForwardDraftBatch(int batch, const Data &in
     Data hidden, headInput;
     if (RunDraftBatch(draftAnchors, draftContexts, hidden)) {
 #ifdef USE_CUDA
-        const int rows = std::accumulate(limits.begin(), limits.end(), 0);
-        headInput.dataType = hidden.dataType; headInput.UpdateUnitSize(); headInput.Resize({1, rows, embed_dim});
-        headInput.ToDevice(hidden.dataDevice, hidden.dataDeviceIds, false); headInput.Allocate(false);
-        std::vector<void *> dst; std::vector<const void *> src; std::vector<size_t> bytes;
-        size_t offset = 0;
-        for (size_t row = 0; row < selected.size(); ++row) {
-            dst.push_back((uint8_t *)headInput.cudaData + offset);
-            src.push_back((const uint8_t *)hidden.cudaData + row * draftBlock * embed_dim * hidden.unitSize);
-            const size_t size = (size_t)limits[row] * embed_dim * hidden.unitSize;
-            bytes.push_back(size); offset += size;
-        }
-        AssertInFastLLM(FastllmCudaBatchCopyFromDeviceToDeviceAsyncCurrentThread(dst.data(), src.data(), bytes.data(), dst.size()),
-            "Cannot gather batch draft head input.");
+        GatherDraftHeadInput(hidden, limits, draftBlock, headInput);
 #endif
     }
     Data headLogits = headInput.dims.empty() ? Data() : RunDraftHead(headInput);
@@ -2541,6 +2548,7 @@ void NaiveN05FlashModel::PrepareDraftServingMemory(bool history) {
 #ifdef USE_CUDA
     const int batch = maxBatch > 0 ? maxBatch : 512;
     if (!draftEnabled || !PrepareDraftTP()) return;
+    const int steps = std::max(1, std::min(draftTokens, draftBlock)), verifyRows = steps + 1;
     ApplyDraftDevice();
     Data hidden(BFLOAT16, {1, draftWindow - 1, embed_dim});
     hidden.ToDevice(DataDevice::CUDA, {draftTP->devices.front()}, false); hidden.Allocate(true);
@@ -2559,17 +2567,21 @@ void NaiveN05FlashModel::PrepareDraftServingMemory(bool history) {
     }
     Data normalized;
     if (RunDraftBatch(anchors, contexts, normalized)) {
-        Data head = RunDraftHead(normalized);
+        // The backbone always keeps its trained block. Only the proposed
+        // prefix and its verification distributions need vocabulary buffers.
+        Data headInput;
+        GatherDraftHeadInput(normalized, std::vector<int>(batch, steps), draftBlock, headInput);
+        Data head = RunDraftHead(headInput);
         std::vector<GenerationConfig> configs(batch);
         std::vector<std::unique_ptr<DraftRound>> rounds;
         LastTokensUnit history;
         for (int i = 0; i < batch; ++i) {
             configs[i].temperature = 1.0f; configs[i].top_p = 0.95f;
             configs[i].top_k = head.dims.back();
-            rounds.emplace_back(new DraftRound(*this, *contexts[i], configs[i], history, 1, draftBlock));
+            rounds.emplace_back(new DraftRound(*this, *contexts[i], configs[i], history, 1, steps));
         }
         if (PrepareDraftBatch(rounds, head)) {
-            tpSamplingLogits.Resize({batch * (draftBlock + 1), head.dims.back()});
+            tpSamplingLogits.Resize({batch * verifyRows, head.dims.back()});
             tpSamplingLogits.ToDevice(DataDevice::CUDA, {draftTP->devices.front()}, false);
             tpSamplingLogits.Allocate(false);
             FastllmCudaMemset0(tpSamplingLogits.cudaData, tpSamplingLogits.GetBytes());
@@ -2579,10 +2591,10 @@ void NaiveN05FlashModel::PrepareDraftServingMemory(bool history) {
         capture.verifying = true;
         for (int layer : draftTargetLayers) {
             Data &feature = capture.hidden[layer];
-            feature.dataType = BFLOAT16; feature.Resize({1, batch * draftBlock, embed_dim});
+            feature.dataType = BFLOAT16; feature.Resize({1, batch * verifyRows, embed_dim});
             feature.ToDevice(DataDevice::CUDA, {draftTP->devices.front()}, false); feature.Allocate(true);
         }
-        CommitDraftContexts(capture, std::vector<int>(batch, draftBlock), std::vector<int>(batch, draftBlock), contexts);
+        CommitDraftContexts(capture, std::vector<int>(batch, verifyRows), std::vector<int>(batch, verifyRows), contexts);
         capture.hidden.clear(); capture.verifying = false;
         for (int layer : draftTargetLayers) {
             Data &feature = capture.hidden[layer];
