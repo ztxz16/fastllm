@@ -1331,23 +1331,23 @@ DeviceCache *GetDeviceCache(OffloadGroup &group, bool waitForAdmission = true) {
     const uint64_t budgetBytes = uint64_t(DeviceCacheBudgetBytes(device) * group.budgetFraction);
     const bool ppPlacement = group.expertDevices.empty() &&
         std::any_of(group.cacheDevices.begin(), group.cacheDevices.end(), [](int d) { return d >= 0; });
-    // A zero per-device budget can still execute streamed decode misses. No
-    // resident payload or slots are allocated; all route lookups miss.
-    const bool streamOnly = budgetBytes == 0 && group.cpuDecodeReady &&
-        ((group.layout.weightType == fastllm::DataType::DATA_GGUF_FORMAT &&
-          group.sharedLayout.shards == 0) || (group.layout.glm5 && NativeSharedRecords(group)));
-    if (budgetBytes == 0 && !streamOnly) return nullptr;
-    size_t slots = RequestedSlots(
-        group.layout.recordStride, group.totalRecords, budgetBytes);
-    // Hybrid V4.1 uses separate upload rings for misses. Its resident cache
-    // may hold fewer than top-k experts (e.g. a budget-shared draft group);
-    // absent routes go to CPU/staging and never evict an in-flight resident.
+    // Hybrid V4.1 has independent CPU/staging paths for every cache miss.
     const char *requestedMode = std::getenv("FASTLLM_DSV41_MOE_CACHE_MODE");
     const bool smallHybridCache = group.layout.deepSeekV41 && group.cpuDecodeReady &&
         group.expertDevices.empty() && !group.tensorParallelRequested &&
         !(requestedMode && std::strcmp(requestedMode, "gpu") == 0);
-    const size_t minimumSlots = smallHybridCache && !ppPlacement ? 1 : kMaxTopK;
-    if (!streamOnly && !ppPlacement && slots < minimumSlots) {
+    // A small draft share can be below one expert record. Keep its mailbox
+    // and staging metadata without allocating any resident payload.
+    bool streamOnly = budgetBytes == 0 && group.cpuDecodeReady &&
+        (smallHybridCache || (group.layout.weightType == fastllm::DataType::DATA_GGUF_FORMAT &&
+          group.sharedLayout.shards == 0) || (group.layout.glm5 && NativeSharedRecords(group)));
+    if (budgetBytes == 0 && !streamOnly) return nullptr;
+    size_t slots = RequestedSlots(
+        group.layout.recordStride, group.totalRecords, budgetBytes);
+    // A layer owner also sends absent routes to CPU/staging. Plan any
+    // resident records that fit, then retain streaming when none fit.
+    const size_t minimumSlots = smallHybridCache ? 1 : kMaxTopK;
+    if (!streamOnly && !ppPlacement && !smallHybridCache && slots < minimumSlots) {
         std::fprintf(stderr,
             "[Fastllm] CUDA expert cache needs at least %d slots; "
             "requested %zu.\n", int(minimumSlots), slots);
@@ -1400,6 +1400,13 @@ DeviceCache *GetDeviceCache(OffloadGroup &group, bool waitForAdmission = true) {
         cache.hostSlotOffsets.resize(slots);
         for (size_t slot = 0; slot < slots; ++slot)
             cache.hostSlotOffsets[slot] = slot * group.layout.recordStride;
+    }
+    if (!streamOnly && smallHybridCache && slots < minimumSlots) {
+        streamOnly = true;
+        slots = cache.recordBytes = 0;
+        slotPlan = {};
+        cache.hostSlotOffsets.clear();
+        cache.layerSlots.assign(group.tableKeys.size(), {0, 0});
     }
     if (!streamOnly && slots < minimumSlots) {
         std::fprintf(stderr,
@@ -2185,13 +2192,17 @@ bool FastllmCudaPrepareMoeCache(
     }
     const size_t requestedSlots = RequestedSlots(
         layout.recordStride, group->totalRecords);
-    if (requestedSlots < kMaxTopK &&
+    // V4.1 has registered host experts and separate staging for misses.
+    // Admit its small hybrid budgets; each device still validates the actual
+    // minimum for its execution mode before allocating resident records.
+    const int registrationMinimumSlots = layout.deepSeekV41 ? 0 : kMaxTopK;
+    if (requestedSlots < registrationMinimumSlots &&
         !(fastllm::GetMoeCudaCacheBytes() == 0 && group->allowStreaming)) {
         std::fprintf(
             stderr,
             "[Fastllm] CUDA expert cache needs at least %d slots; "
             "the configured budget holds %zu.\n",
-            kMaxTopK, requestedSlots);
+            registrationMinimumSlots, requestedSlots);
         return false;
     }
     // A registered backend supplies byte layouts and only the metadata that
