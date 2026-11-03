@@ -2359,7 +2359,14 @@ namespace fastllm {
             embedding.strides.size() == 2 && embedding.strides[0] == dim && embedding.strides[1] == 1 &&
             anchorToken >= 0 && anchorToken < embedding.dims[0] &&
             v41DsparkNoiseTokenId >= 0 && v41DsparkNoiseTokenId < embedding.dims[0];
-        if (!deviceInputs) prepareInputs();
+        if (!deviceInputs) {
+            prepareInputs();
+            // Low-memory placement keeps embedding weights on the CPU. Only
+            // upload this small draft activation before capture/replay; the
+            // backbone and Markov head can still use the same complete graph.
+            if (graphEligible && embedded.dataDevice == DataDevice::CPU)
+                embedded.ToDevice(DataDevice::CUDA, {graphDevices.front()});
+        }
         std::vector<void*> cachePointers;
         for (auto &layer : dspark.layers) cachePointers.push_back(layer.windowKV.cudaData);
         if (deviceInputs) cachePointers.push_back(embedding.cudaData);

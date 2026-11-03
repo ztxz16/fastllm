@@ -126,6 +126,7 @@ struct V41FullGraph {
     Data routedOutput;
     std::unique_ptr<DiskMoeV41Graph> diskMoe;
     Data inputIds, embedding, deferredHcMix;
+    const void *embeddingWeightAddress = nullptr;
     std::vector<float> hostTokens;
     std::vector<std::unique_ptr<V41FullLayer>> layers;
     std::map<int, std::unique_ptr<V41FullEngram>> engrams;
@@ -488,6 +489,7 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
         embeddingWeight.dims[1] == embed_dim &&
         GetPointerDeviceId(embeddingWeight.cudaData) == g->devices.front();
     if (g->capturesInput) {
+        g->embeddingWeightAddress = embeddingWeight.cudaData;
         alloc(g->embedding, DataType::BFLOAT16, {1, batch, 1, embed_dim});
         g->hostTokens.assign(batch, 0.f);
         if (!verifying) alloc(g->inputIds, DataType::FLOAT32, {1, batch});
@@ -1050,6 +1052,17 @@ bool DeepSeekV41Model::TryFullDecodeGraph(ForwardWorkspace &f, bool inputsPrepar
             (f.dsparkVerify || kvCacheDataType != DataType::FP8_E4M3)) ||
         f.hasImageTokens || f.inputEmbeds)
         return false;
+    if (f.graphState->fullDecode) {
+        const auto &graph = *std::static_pointer_cast<V41FullGraph>(f.graphState->fullDecode);
+        // With no explicit embedding policy, disabling graphs moves this
+        // weight back to CPU. Re-enabling can allocate a new CUDA address.
+        // Only the composed input child owns that address; layer segments
+        // remain valid and can be reused after the frontend uploads it again.
+        if (graph.capturesInput && graph.embeddingWeightAddress != weight["embed.weight"].cudaData) {
+            f.graphState->fullDecode.reset();
+            f.graphState->fullVerifyAttempted = false;
+        }
+    }
     // Building a graph warms its children and therefore still needs the eager
     // input on its first call. Only an existing graph may bypass that frontend.
     if (!inputsPrepared && (!f.graphState->fullDecode ||
