@@ -74,6 +74,10 @@ namespace fastllm {
     bool HostMoeIsUnbound() { return hostMoeUnbound; }
 
     static std::atomic<bool> numaPoolConfigured{false};
+#ifdef __linux__
+    static cpu_set_t hostMoeWorkerAffinity;
+    static bool hostMoeWorkerAffinityValid = false;
+#endif
     static AliveThreadPool *GetHostMoePool() {
         // CPU-only execution can share the normal, unbound workers. Creating
         // a second spinning pool would compete with activation/routing work.
@@ -85,8 +89,20 @@ namespace fastllm {
         static AliveThreadPool *pool = nullptr;
         std::lock_guard<std::mutex> lock(mutex);
         const int threads = std::max(1, GetAlivePool()->curActivateThreadInterval.second);
-        if (!pool) pool = new AliveThreadPool(threads);
+        if (!pool) pool = new AliveThreadPool(0);
+        const int previousThreads = pool->threads.size();
         pool->ResizeThreads(threads);
+#ifdef __linux__
+        // A graph mailbox may create this pool from a coordinator pinned to
+        // one CPU. Compute workers must retain the process CPU allowance,
+        // including an outer taskset/numactl mask, rather than inherit that
+        // temporary coordinator affinity.
+        if (hostMoeWorkerAffinityValid) {
+            for (int i = previousThreads; i < threads; ++i)
+                pthread_setaffinity_np(pool->threads[i]->native_handle(),
+                    sizeof(hostMoeWorkerAffinity), &hostMoeWorkerAffinity);
+        }
+#endif
         return pool;
     }
 
@@ -614,6 +630,13 @@ namespace fastllm {
         if (fastllmNumaConfig == nullptr || configuredPoolThreads != activeThreads) {
             // NumaConfig uses worker ids from zero up to the configured
             // pool size. SetThreads() keeps allocated and active counts equal.
+#ifdef __linux__
+            // Remember the caller's allowance before graph scopes pin the
+            // scheduler/coordinator. Publish it together with NUMA setup.
+            if (!numaPoolConfigured.load(std::memory_order_relaxed))
+                hostMoeWorkerAffinityValid = sched_getaffinity(0,
+                    sizeof(hostMoeWorkerAffinity), &hostMoeWorkerAffinity) == 0;
+#endif
             numaPoolConfigured.store(true, std::memory_order_release);
             if (fastllmNumaConfig == nullptr) fastllmNumaConfig = new NumaConfig();
             // Keep the config object's address stable, but refresh worker
