@@ -2773,6 +2773,19 @@ bool FastllmCudaCustomAllReduceInit(const std::vector<int> &devices) {
         return false;
     }
     state.initAttempted = true;
+    // The SM75 path has not passed repeated mixed-graph correctness checks
+    // with direct peer reductions. Keep the graph-capable NCCL backend in
+    // auto mode until that path is validated; explicit force mode remains
+    // available for diagnosing the custom implementation.
+    if (autoMode) for (int device : devices) {
+        int major = 0, minor = 0;
+        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) == cudaSuccess &&
+            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) == cudaSuccess &&
+            major == 7 && minor == 5) {
+            std::fprintf(stderr, "[Fastllm] custom all-reduce auto mode retains NCCL on SM75.\n");
+            return false;
+        }
+    }
     state.initializing = true;
     state.devices = devices;
     state.ncclGeneration = ncclGeneration;
