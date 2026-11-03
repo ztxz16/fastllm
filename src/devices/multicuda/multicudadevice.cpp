@@ -580,10 +580,18 @@ namespace fastllm {
             return;
         }
 
-        // The caller (normally the scheduler thread) and the dedicated workers may use
-        // distinct internal streams.  Complete the producer side of the cross-thread handoff
-        // before workers consume pointers created by the caller's CUDA work.
+        // The caller and workers use distinct per-thread streams. A synchronous
+        // dispatch (e.g. output-gather after an async TP scope) must finish caller
+        // producers on every participating CUDA device, not just the current one.
+        // Waiting on workers after Run() cannot repair an earlier stale-input read.
+        const int producerDevice = FastllmCudaGetDevice();
         ForceDeviceSync();
+        for (int device : opDevices) {
+            if (device != producerDevice && IsDedicatedWorkerCudaDevice(device)) {
+                FastllmCudaSyncDevice(device);
+            }
+        }
+        FastllmCudaSetDevice(producerDevice);
         if (SubmitMultiCudaDeviceOps(opDevices, ops, workers, targetIds)) {
             WaitMultiCudaDeviceOps(workers, targetIds);
             return;
