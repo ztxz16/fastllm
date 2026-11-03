@@ -143,6 +143,38 @@ static std::vector<float> RunRequests(DeepSeekV41Model &model, const std::vector
     return result;
 }
 
+// Keep the previous allocation alive but invalidate its contents. This makes
+// stale captured embedding pointers fail deterministically, regardless of
+// whether the CUDA allocator would reuse an address after CPU/GPU migration.
+static std::unique_ptr<Data> RelocateGraphEmbedding(DeepSeekV41Model &model) {
+    auto &embedding = model.weight["embed.weight"];
+    if (embedding.dataType != DataType::BFLOAT16 || embedding.multiDeviceData ||
+        embedding.dataDevice != DataDevice::CUDA || !embedding.cudaData)
+        return nullptr;
+    const int original = FastllmCudaGetDevice();
+    for (int device : tpDevices.empty() ? std::vector<int>{original} : tpDevices) {
+        FastllmCudaSetDevice(device);
+        if (cudaDeviceSynchronize() != cudaSuccess)
+            throw std::runtime_error("embedding relocation synchronization failed");
+    }
+    const int owner = embedding.dataDeviceIds.empty() ? original : embedding.dataDeviceIds.front();
+    FastllmCudaSetDevice(owner);
+    if (embedding.cudaDataBorrowed || embedding.isFake)
+        throw std::runtime_error("embedding relocation requires owned storage");
+    auto retired = std::make_unique<Data>();
+    retired->isModelWeight = embedding.isModelWeight;
+    retired->directMemory = embedding.directMemory;
+    retired->CopyFrom(embedding);
+    if (!retired->cudaData || retired->cudaData == embedding.cudaData)
+        throw std::runtime_error("embedding relocation did not change its address");
+    std::swap(embedding.cudaData, retired->cudaData);
+    if (cudaMemset(retired->cudaData, 0, retired->GetBytes()) != cudaSuccess ||
+        cudaDeviceSynchronize() != cudaSuccess)
+        throw std::runtime_error("retired embedding poisoning failed");
+    FastllmCudaSetDevice(original);
+    return retired;
+}
+
 static void Compare(const std::vector<float> &expected, const std::vector<float> &actual) {
     if (actual.size() != expected.size()) throw std::runtime_error("request result size mismatch");
     for (size_t i = 0; i < actual.size(); ++i) {
@@ -286,6 +318,12 @@ int main(int argc, char **argv) {
         const size_t expectedGraphShapes = 7; // verification rows 2..8; ordinary decode checked above
         if ((model.*(&Access::v41CudaGraphSlots)).size() != expectedGraphShapes)
             throw std::runtime_error("unexpected DSpark graph shapes or disk graph fallback");
+        auto retiredEmbedding = RelocateGraphEmbedding(model);
+        if (retiredEmbedding) {
+            std::cout << "CHECK: graph verification after embedding relocation" << std::endl;
+            Compare(verifyEight, RunDsparkRequests(model));
+            std::cout << "PASS: graph verification survives embedding relocation with poisoned old storage\n";
+        }
         SetCudaGraph(false);
         Compare(verifyEight, RunDsparkRequests(model));
         SetCudaGraph(true);
