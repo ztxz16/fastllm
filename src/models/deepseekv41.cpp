@@ -4653,6 +4653,7 @@ namespace fastllm {
         std::vector<void *> kvOutputs, rawKVOutputs, rawScoreOutputs;
         bool swapHidden = false;
         bool ffnInputQuantizedReady = false;
+        V41SharedExpertPartition sharedExpertPartition = V41SharedExpertPartition::Replicated;
     };
 
 #ifdef USE_CUDA
@@ -5271,8 +5272,11 @@ namespace fastllm {
                         break;
                     }
                 }
+                const auto quantized = work->ws->ffnInputQuantized.multiDeviceDatas.find(device);
+                const Data *input = work->ws->ffnInputQuantizedReady &&
+                    quantized != work->ws->ffnInputQuantized.multiDeviceDatas.end() ? quantized->second : nullptr;
                 ready &= FastllmCudaV41MoeGraphReady(
-                    key, work->seqlen, work->model.num_experts_per_tok);
+                    key, work->seqlen, work->model.num_experts_per_tok, input);
             }
         }
         if (work->graphReplay) {
@@ -7510,9 +7514,9 @@ namespace fastllm {
 #ifdef USE_CUDA
                 // Verification owns matching gate/up intermediate channels.
                 // Down emits FP32 partials to merge into the routed reduction.
-                // Only RunGpuMoe consumes deferred shared-expert partitions.
-                // Hybrid resident capture retains the replicated shared sum.
-                if (!f.residentMoeGraph && f.captureGpuMoeTogether && f.tp && f.single && f.dsparkVerify &&
+                // Partition/rounding must not depend on whether verification
+                // is warming, replaying a graph, or taking its eager fallback.
+                if (executionMode == ExecutionMode::Gpu && f.tp && f.single && f.dsparkVerify &&
                     seqlen >= 2 && seqlen <= 8 && !f.dumpDebug &&
                     !V41EnvFlag("FASTLLM_DSV41_REFERENCE_MATH") &&
                     quantizedLinearNames.count(pre + ".ffn.shared_experts.gateup.weight") &&
@@ -7606,7 +7610,15 @@ namespace fastllm {
             return;
         }
         RunForwardGraphSegment(f, body, kV41GraphSegmentsPerLayer * layer + 3, hasSharedExpertOut,
-            [](DeepSeekV41GraphSegmentMeta &) {}, [](const DeepSeekV41GraphSegmentMeta &) {});
+            [&](DeepSeekV41GraphSegmentMeta &meta) {
+                meta.sharedExpertPartition = ws->sharedExpertPartition;
+            }, [&](const DeepSeekV41GraphSegmentMeta &meta) {
+                // A standalone shared graph can feed an eager routed backend.
+                // Its partial output must retain the matching joint reduction.
+                ws->sharedExpertPartition = meta.sharedExpertPartition;
+                if (ws->sharedExpertPartition == V41SharedExpertPartition::Intermediate)
+                    ws->ffnOut.Reshape(ffnInput.dims);
+            });
     }
     DeepSeekV41MoeContext DeepSeekV41Model::MakeForwardMoeContext(ForwardWorkspace &f, int layer) {
         auto &inputSegments = f.inputSegments;

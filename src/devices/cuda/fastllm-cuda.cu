@@ -320,11 +320,12 @@ static bool FastllmCudaGraphParallelStage(int region, int stage) {
     return false;
 }
 
-bool FastllmCudaV41MoeGraphReady(const fastllm::Data *key, int rows, int topk) {
+bool FastllmCudaV41MoeGraphReady(const fastllm::Data *key, int rows, int topk,
+        const fastllm::Data *prequantizedInput) {
 #ifndef USE_ROCM
     if (!key || rows <= 0 || topk <= 0) return false;
     return FastllmCudaV41GGUFGraphReady(key, rows, topk) ||
-        (topk <= 16 && FastllmCudaV41MarlinGraphReady(key, rows));
+        (topk <= 16 && FastllmCudaV41MarlinGraphReady(key, rows, prequantizedInput));
 #else
     return false;
 #endif

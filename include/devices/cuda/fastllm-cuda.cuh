@@ -2407,10 +2407,12 @@ bool FastllmCudaV41MarlinExpertParallelShared(
 bool FastllmCudaPrepareNVFP4E4M3Moe(fastllm::Data **weights, int weightsBatch);
 void FastllmCudaReleaseMergeMOEVllmMarlinCache(const fastllm::Data *layerKey);
 // Read-only readiness check: no repacking or allocation during graph capture.
-bool FastllmCudaV41MarlinGraphReady(const fastllm::Data *layerKey, int rows);
+bool FastllmCudaV41MarlinGraphReady(const fastllm::Data *layerKey, int rows,
+        const fastllm::Data *prequantizedInput = nullptr);
 // Resident backend admission, independent of checkpoint bit width. Unknown
 // backends and CPU routing fallbacks must not enter a GPU MoE graph.
-bool FastllmCudaV41MoeGraphReady(const fastllm::Data *layerKey, int rows, int topk);
+bool FastllmCudaV41MoeGraphReady(const fastllm::Data *layerKey, int rows, int topk,
+        const fastllm::Data *prequantizedInput = nullptr);
 #ifdef FASTLLM_ENABLE_DSV4_MOE_DEEPGEMM_SM120
 bool FastllmCudaBFloat16MergeMOEDeepGemmSm120ExpertParallel(
         const fastllm::Data &input, fastllm::Data &output,

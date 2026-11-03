@@ -1369,7 +1369,7 @@ namespace fastllm {
 #endif
         Data floatInput;
         Data *headInput = &input;
-        if (weight["head.weight"].dataType == DataType::FLOAT32) {
+        if (weight["head.weight"].dataType == DataType::FLOAT32 && input.dataType != DataType::FLOAT32) {
             ToDataType(input, floatInput, DataType::FLOAT32);
             headInput = &floatInput;
         }

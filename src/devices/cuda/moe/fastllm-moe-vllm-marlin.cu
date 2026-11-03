@@ -4311,7 +4311,8 @@ bool FastllmCudaV41MarlinExpertParallelShared(
         &sharedPartial, &joinedOutput, parallelJoinLayer);
 }
 
-bool FastllmCudaV41MarlinGraphReady(const fastllm::Data *layerKey, int rows) {
+bool FastllmCudaV41MarlinGraphReady(const fastllm::Data *layerKey, int rows,
+        const fastllm::Data *prequantizedInput) {
     using namespace fastllm_marlin_moe;
     std::lock_guard<std::mutex> lock(LayerCacheRegistryMutex());
     auto it = LayerCacheRegistry().find(layerKey);
@@ -4319,7 +4320,17 @@ bool FastllmCudaV41MarlinGraphReady(const fastllm::Data *layerKey, int rows) {
         it->second->retired.load(std::memory_order_acquire)) return false;
     int bucket = 1;
     while (bucket < rows && bucket < MarlinLayerCache::kV41BatchRows) bucket *= 2;
-    if (rows > bucket) return false;
+    if (rows < 1 || rows > bucket) return false;
+    // Fused mHC supplies graph-owned quantized input. That path deliberately
+    // skips the internal quantization buffer, so its absence is not a cold MoE.
+    const auto &cache = *it->second;
+    if (prequantizedInput && prequantizedInput->cudaData &&
+        !prequantizedInput->multiDeviceData &&
+        prequantizedInput->dataType == fastllm::DataType::BFLOAT16 &&
+        prequantizedInput->dataDevice == fastllm::DataDevice::CUDA &&
+        prequantizedInput->dataDeviceIds.size() == 1 && prequantizedInput->dataDeviceIds[0] == cache.device &&
+        prequantizedInput->dims.size() == 2 && prequantizedInput->dims[0] == rows &&
+        prequantizedInput->dims[1] == cache.hidden) return true;
     auto input = it->second->decodeQuantizedInputs.find(bucket);
     return input != it->second->decodeQuantizedInputs.end() && input->second.cudaData != nullptr;
 }

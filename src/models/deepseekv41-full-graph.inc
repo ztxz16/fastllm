@@ -754,7 +754,8 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
                 poolOpen = true;
             }
             if (!V41CaptureGraphSegment(*g->pieces, body))
-                throw std::runtime_error("full graph child capture");
+                throw std::runtime_error("full graph child capture " + std::to_string(g->pieces->segments.size()) +
+                    (attentionOnly ? " (attention)" : " (main)"));
             const auto &s = g->pieces->segments.back();
             for (size_t rank = 0; rank < children.size(); ++rank)
                 children[rank].push_back(s.graphs[rank]);
@@ -1049,17 +1050,17 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
                 // Preserve the ordinary quantized-head / verifier boundary.
                 // mHC may produce FP32; forcing BF16 here changes GGUF logits.
                 RMSNorm(g->head, weight["norm.weight"], rms_norm_eps, g->norm);
-                if (verifying && g->tensorParallel) {
-                    // Keep vocabulary shards and the TP executor through the
-                    // dtype conversion below; gather explicitly after it.
-                    ApplyDeviceMap(deviceMap, block_cnt, block_cnt);
+                if (verifying) {
                     Data *headInput = &g->norm;
+                    // Keep the FP32 head cast at a stable address for every
+                    // verification shape; worker-local temporaries cannot be
+                    // reserved by the caller's allocation recorder.
                     if (weight["head.weight"].dataType == DataType::FLOAT32) {
                         ToDataType(g->norm, g->normFloat, DataType::FLOAT32);
                         headInput = &g->normFloat;
                     }
-                    LinearWithActivationQuant(*headInput, "head.weight", g->headLogits);
-                } else if (verifying) DsparkProjectHead(g->norm, g->headLogits);
+                    DsparkProjectHead(*headInput, g->headLogits, false, g->tensorParallel);
+                }
                 else Linear(g->norm, weight["head.weight"], *GetEmptyData(), g->headLogits);
                 ToDataType(g->headLogits, g->logits, DataType::FLOAT32);
             } else {
