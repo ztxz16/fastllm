@@ -159,12 +159,13 @@ int main(int argc, char **argv) {
     try {
         bool expertCache = false, fp8Dense = false, eagerOnly = false, gpuExperts = false;
         bool diskExperts = false, diskEngram = false, gpuEngram = false;
-        int tpSize = 2;
+        int tpSize = 2, moeDeviceLayers = -1;
+        uint64_t cacheBytes = 0;
         std::string logitsOnly;
         if (argc < 2)
             throw std::runtime_error("usage: deepseekV41TpGraphRegression FIXTURE_DIR "
                 "[--expert-cache | --gpu-experts | --disk-experts] [--disk-engram | --gpu-engram] [--fp8-dense] [--eager-only] "
-                "[--tp-size N] [--logits-only FILE]");
+                "[--tp-size N] [--moe-device-layers N] [--cache-bytes N] [--logits-only FILE]");
         for (int i = 2; i < argc; ++i) {
             const std::string option = argv[i];
             if (option == "--expert-cache") expertCache = true;
@@ -175,6 +176,8 @@ int main(int argc, char **argv) {
             else if (option == "--fp8-dense") fp8Dense = true;
             else if (option == "--eager-only") eagerOnly = true;
             else if (option == "--tp-size" && i + 1 < argc) tpSize = std::stoi(argv[++i]);
+            else if (option == "--moe-device-layers" && i + 1 < argc) moeDeviceLayers = std::stoi(argv[++i]);
+            else if (option == "--cache-bytes" && i + 1 < argc) cacheBytes = std::stoull(argv[++i]);
             else if (option == "--logits-only" && i + 1 < argc) logitsOnly = argv[++i];
             else throw std::runtime_error("unknown option: " + option);
         }
@@ -195,10 +198,17 @@ int main(int argc, char **argv) {
         SetDeviceMap({{mainDevice, 1}});
         const std::string moeDevice = gpuExperts ? mainDevice :
             (expertCache ? "numa" : (diskExperts ? "disk" : "cpu"));
-        SetMoeDeviceMap({{moeDevice, 1}});
+        SetMoeDeviceMap({{moeDeviceLayers >= 0 ? mainDevice : moeDevice, 1}});
+        SetLayeredMoeDeviceMap(moeDeviceLayers >= 0 ? std::map<std::string, int>{{moeDevice, 1}} :
+                                                   std::map<std::string, int>{});
+        // A resident prefix followed by host layers must compose one graph
+        // per rank, with the same hybrid sum/rounding as eager execution.
+        SetMoeDeviceLayers(moeDeviceLayers);
         SetNgramDevice(gpuEngram ? "cuda" : diskEngram ? "disk" : "cpu");
         if (expertCache || diskExperts) {
-            SetMoeCudaCacheBytes(16ULL << 20);
+            // Exercise a small cache on each TP layer owner.
+            // Misses must retain CPU/staged execution and graph eligibility.
+            SetMoeCudaCacheBytes(cacheBytes ? cacheBytes : (expertCache ? 1ULL : 16ULL) << 20);
             // Keep the split deterministic while testing graph replay and KV.
             setenv("FASTLLM_DSV41_MOE_CACHE_GPU_EXPERTS", "2", 1);
             setenv("FASTLLM_DSV41_MOE_CACHE_PREFETCH", "0", 1);
@@ -210,6 +220,10 @@ int main(int argc, char **argv) {
         if (model.GetExecutionMode() != (gpuExperts ? ExecutionMode::Gpu : ExecutionMode::Hybrid)) {
             throw std::runtime_error("wrong execution backend selected");
         }
+        if (moeDeviceLayers > 0 && moeDeviceLayers < model.block_cnt &&
+            (model.SelectMoeDeviceForLayer(0) != mainDevice ||
+             model.SelectMoeDeviceForLayer(model.block_cnt - 1) != moeDevice))
+            throw std::runtime_error("resident prefix / host suffix placement was not applied");
         // Initialize weight shards and kernel plans before comparing dispatch.
         model.maxBatch = 1;
         model.WarmUp();

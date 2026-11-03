@@ -5118,6 +5118,9 @@ namespace fastllm {
         std::vector<int> ffnDims;
         bool combineFfnPostDispatch = false;
         bool captureGpuMoeTogether = false;
+        // True only while the current layer is using the validated resident
+        // MoE graph; ordinary hybrid layers retain their shared-expert path.
+        bool residentMoeGraph = false;
         int endedLayerInGraph = -1;
 #ifdef USE_CUDA
         std::shared_ptr<DeepSeekV41CudaGraphState> graphState;
@@ -5249,18 +5252,42 @@ namespace fastllm {
     }
     void DeepSeekV41Model::ForwardState::HybridExperts(int layer) {
         auto ctx=work->model.MakeForwardMoeContext(*work, layer);
+        work->residentMoeGraph = false;
 #ifdef USE_CUDA
         // Keep the hybrid backend's FP32 sum/shared rounding unchanged. Only
         // remove host route staging once the resident CUDA backend is ready.
         const auto moeDevice = work->model.SelectMoeDeviceForLayer(layer);
         const auto mainDevice = SelectDeviceFromMap(work->model.deviceMap, layer + 1,
                                                    work->model.block_cnt);
-        ctx.residentGraph = work->graphActive && !work->tp && work->cudaRouteCapturable &&
-            V41DeviceSpecUsesType(moeDevice, "cuda") &&
-            V41DeviceSpecUsesType(mainDevice, "cuda") &&
-            work->ws->ffnInput.dataType == DataType::BFLOAT16 &&
-            ctx.moeWeights.size() > 2 && FastllmCudaV41MoeGraphReady(
+        const bool residentPlacement = work->tp
+            ? V41DeviceSpecUsesType(moeDevice, "multicuda") && moeDevice == mainDevice
+            : V41DeviceSpecUsesType(moeDevice, "cuda") && V41DeviceSpecUsesType(mainDevice, "cuda");
+        const auto residentType = ctx.moeWeights.size() > 2 && ctx.moeWeights[2] ?
+            ctx.moeWeights[2]->dataType : DataType::FLOAT32;
+        const bool residentFormat = residentType == DataType::DATA_GGUF_FORMAT ||
+            residentType == DataType::NVFP4 || residentType == DataType::NVFP4_BLOCK_32_E8M0;
+        ctx.residentGraph = work->graphActive && work->cudaRouteCapturable && residentPlacement &&
+            residentFormat && work->ws->ffnInput.dataType == DataType::BFLOAT16 && ctx.moeWeights.size() > 2;
+        if (ctx.residentGraph && work->tp) {
+            // Expert-parallel ranks own disjoint expert tables. Validate each
+            // rank's persistent backend before capturing the shared/routed sum.
+            for (int device : work->tpDevices) {
+                const Data *key = nullptr;
+                for (size_t slot = 2; slot < ctx.moeWeights.size(); slot += 2) {
+                    if (!ctx.moeWeights[slot]) continue;
+                    auto it = ctx.moeWeights[slot]->multiDeviceDatas.find(device);
+                    if (it != ctx.moeWeights[slot]->multiDeviceDatas.end() && it->second) {
+                        key = it->second;
+                        break;
+                    }
+                }
+                ctx.residentGraph &= FastllmCudaV41MoeGraphReady(
+                    key, work->seqlen, work->model.num_experts_per_tok);
+            }
+        } else if (ctx.residentGraph) {
+            ctx.residentGraph = FastllmCudaV41MoeGraphReady(
                 ctx.moeWeights[2], work->seqlen, work->model.num_experts_per_tok);
+        }
         const int residentIndex = kV41GraphSegmentsPerLayer * layer + 3;
         if (work->graphReplay) {
             const bool captured = work->graphState->segments[residentIndex].containsGpuMoe;
@@ -5268,6 +5295,7 @@ namespace fastllm {
             if (!captured) ctx.residentGraph = false;
         }
         if (ctx.residentGraph) {
+            work->residentMoeGraph = true;
             work->captureGpuMoeTogether = true;
             work->model.RunForwardGraphSegment(*work, [&] {
                 work->combineFfnPostDispatch = work->model.RunHybridMoe(ctx, nullptr);
@@ -5275,7 +5303,7 @@ namespace fastllm {
             }, residentIndex, true,
             [](DeepSeekV41GraphSegmentMeta &meta) { meta.containsGpuMoe = true; },
             [&](const DeepSeekV41GraphSegmentMeta &) {
-                work->ws->ffnOut.Reshape(work->ffnDims);
+                (work->tp ? work->ws->residentFfnOut : work->ws->ffnOut).Reshape(work->ffnDims);
                 std::swap(work->curHidden, work->nextHidden);
                 work->preMixPtr = &work->ws->ffnPre;
             });
@@ -7041,7 +7069,9 @@ namespace fastllm {
         auto &ffnPost = ws->ffnPost;
         auto &ffnComb = ws->ffnComb;
         auto &ffnInput = ws->ffnInput;
-        auto &ffnOut = ws->ffnOut;
+        auto &ffnOut = executionMode == ExecutionMode::Hybrid && f.tp &&
+            V41DeviceSpecUsesType(SelectMoeDeviceForLayer(layer), "multicuda")
+            ? ws->residentFfnOut : ws->ffnOut;
         auto &expertIndex = ws->expertIndex;
         auto &expertScore = ws->expertScore;
         auto &sharedExpertOut = ws->sharedExpertOut;
@@ -7389,7 +7419,9 @@ namespace fastllm {
 #ifdef USE_CUDA
                 // Verification owns matching gate/up intermediate channels.
                 // Down emits FP32 partials to merge into the routed reduction.
-                if (f.captureGpuMoeTogether && f.tp && f.single && f.dsparkVerify &&
+                // Only RunGpuMoe consumes deferred shared-expert partitions.
+                // Hybrid resident capture retains the replicated shared sum.
+                if (!f.residentMoeGraph && f.captureGpuMoeTogether && f.tp && f.single && f.dsparkVerify &&
                     seqlen >= 2 && seqlen <= 8 && !f.dumpDebug &&
                     !V41EnvFlag("FASTLLM_DSV41_REFERENCE_MATH") &&
                     quantizedLinearNames.count(pre + ".ffn.shared_experts.gateup.weight") &&
@@ -7441,7 +7473,7 @@ namespace fastllm {
                 Swiglu(ww3, ww1);
 #endif
 #ifdef USE_CUDA
-                if (sharedQuantized && f.captureGpuMoeTogether && f.tp && f.single &&
+                if (!f.residentMoeGraph && sharedQuantized && f.captureGpuMoeTogether && f.tp && f.single &&
                     (seqlen == 1 || (f.dsparkVerify && seqlen >= 2 && seqlen <= 8)) && !f.dumpDebug &&
                     quantizedLinearNames.count(pre + ".ffn.experts.0.w1.weight")) {
                     std::string main = SelectDeviceFromMap(deviceMap, layer + 1, block_cnt);
@@ -7597,7 +7629,7 @@ namespace fastllm {
                 &x, &attnInput, &qr, &qNorm, &q, &kv, &attnOut, &woAOut, &attnProj,
                 &rawKVAll, &rawScoreAll, &qIdxAll, &idxWeightsAll,
                 &ffnInput, &ws->ffnInputQuantized, &expertIndex, &expertScore, &ws->sharedExpertOut,
-                &ws->ffnOut, &ws->w1, &ws->w2, &ws->w3};
+                &ws->ffnOut, &ws->residentFfnOut, &ws->w1, &ws->w2, &ws->w3};
             for (const auto &entry : ws->reductionBuffers) tensors.push_back(&entry.second);
             for (const Data *data : tensors) {
                 out.push_back(data->cudaData);

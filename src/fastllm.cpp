@@ -2330,7 +2330,7 @@ namespace fastllm {
 #endif
 
 #if defined(USE_CUDA) && !defined(USE_ROCM)
-        if (this->dataType == DataType::DATA_GGUF_FORMAT) {
+        if (this->dataType == DataType::DATA_GGUF_FORMAT || this->dataType == DataType::NVFP4) {
             FastllmCudaReleaseMoeGGUFResident(this);
         }
 #endif
@@ -2507,7 +2507,7 @@ namespace fastllm {
         }
 #ifdef USE_CUDA
 #ifndef USE_ROCM
-        if (this->dataType == DataType::DATA_GGUF_FORMAT) {
+        if (this->dataType == DataType::DATA_GGUF_FORMAT || this->dataType == DataType::NVFP4) {
             FastllmCudaReleaseMoeGGUFResident(this);
         }
 #endif
@@ -2924,7 +2924,7 @@ namespace fastllm {
 #endif
 
 #if defined(USE_CUDA) && !defined(USE_ROCM)
-        if (this->dataType == DataType::DATA_GGUF_FORMAT) {
+        if (this->dataType == DataType::DATA_GGUF_FORMAT || this->dataType == DataType::NVFP4) {
             FastllmCudaReleaseMoeGGUFResident(this);
         }
 #endif

@@ -188,7 +188,9 @@ namespace fastllm {
 #endif
         const auto &runSharedSegment = ctx.runSharedSegment;
         const std::string pre = "layers." + std::to_string(layer);
-        Data &ffnInput = ws->ffnInput, &ffnOut = ws->ffnOut;
+        Data &ffnInput = ws->ffnInput;
+        Data &ffnOut = tp && V41DeviceSpecUsesType(SelectMoeDeviceForLayer(layer), "multicuda")
+            ? ws->residentFfnOut : ws->ffnOut;
         Data &expertIndex = ws->expertIndex, &expertScore = ws->expertScore;
         Data &sharedExpertOut = ws->sharedExpertOut;
         Data &cpuMoeInput = ws->cpuMoeInput, &cpuMoeIndex = ws->cpuMoeIndex, &cpuMoeScore = ws->cpuMoeScore;

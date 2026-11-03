@@ -7206,6 +7206,17 @@ auto st = std::chrono::system_clock::now();
                 expertOwnerRank(expertOwnerRank), expertOwnerCount(expertOwnerCount),
                 gateType(MoeGateSwiglu) {}
 
+        bool RunNative(const Data &routedInput, const MultiCudaEpLocalExpertTable &table,
+                       const int32_t *ids, const float *scores, int topk) {
+            if (!deepSeekV41 || FastllmCudaRuntimeArch() != 75) return false;
+            Data routeIndex(INT32, {routedInput.dims[0], topk}, CUDA, const_cast<int32_t *>(ids));
+            Data routeScore(FLOAT32, routeIndex.dims, CUDA, const_cast<float *>(scores));
+            routeIndex.cudaDataBorrowed = routeScore.cudaDataBorrowed = true;
+            routeIndex.dataDeviceIds = routeScore.dataDeviceIds = {deviceId};
+            return FastllmCudaMergeMOEV41NativeResident(routedInput, *output,
+                const_cast<Data **>(table.globalWeights.data()), wBatch, routeIndex, routeScore, swigluLimit);
+        }
+
         bool RunMarlin(const Data &routedInput, Data **localWeights, int localCount,
                        const int32_t *indices, const float *scores, int topk) {
             if (joinOutput && FastllmCudaV41MarlinExpertParallelShared(
@@ -7378,6 +7389,7 @@ auto st = std::chrono::system_clock::now();
                         expertOwnerRank, expertOwnerCount, swigluLimit);
                 }
 #endif
+                if (!ok) ok = RunNative(packetInput, *localExpertTable, gpuRouteIndex, gpuRouteScore, topk);
                 if (!ok && useVllmMarlin) {
                     ok = RunMarlin(packetInput, localExpertTable->localWeights.data(),
                         (int)localExpertTable->localWeights.size(), gpuRouteIndex, gpuRouteScore, topk);
@@ -7514,7 +7526,8 @@ auto st = std::chrono::system_clock::now();
                 (useVllmMarlin || batchOneDecode)) {
                 broadcastInput();
                 int topk = deviceIndex->dims[1];
-                bool deepGemmOk = false;
+                bool deepGemmOk = RunNative(*input, *localExpertTable,
+                    (const int32_t *)deviceIndex->cudaData, (const float *)deviceScore->cudaData, topk);
 #ifdef FASTLLM_ENABLE_DSV4_MOE_DEEPGEMM_SM120
                 if (!deepSeekV41 && MultiCudaDsv4DeepGemmMoeEnabled() &&
                     input->dataType == DataType::BFLOAT16) {

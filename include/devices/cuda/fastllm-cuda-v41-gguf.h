@@ -69,3 +69,8 @@ bool FastllmCudaMergeMOEGGUFDisk(const fastllm::Data &input,
     fastllm::Data &workspace, fastllm::Data &output, fastllm::Data **weights,
     int experts, const int32_t *indices, const float *scores, int topk,
     const FastllmCudaV41DiskExperts &source);
+
+// SM75 fallback for canonical block-32 native FP4 resident experts.
+bool FastllmCudaMergeMOEV41NativeResident(
+    const fastllm::Data &input, fastllm::Data &output, fastllm::Data **weights, int weightsBatch,
+    const fastllm::Data &indices, const fastllm::Data &scores, float swigluLimit);

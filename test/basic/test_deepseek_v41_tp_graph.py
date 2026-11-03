@@ -71,8 +71,8 @@ def prepare(directory, hc_mult=4, expert_cache=False, fp8_dense=False,
                 value = (tensor.float().repeat(1, copies) / copies).to(tensor.dtype)
         weights[name] = value.contiguous()
     if expert_cache:
-        # At least 16 records are required by the cache. Duplicate the two
-        # fixture experts, then store block-32 E2M1 weights and UE8M0 scales.
+        # Duplicate the two fixture experts, then store block-32 E2M1
+        # weights and UE8M0 scales for resident and staged execution.
         values = torch.tensor([0., .5, 1., 1.5, 2., 3., 4., 6.])
         for name, tensor in list(weights.items()):
             if '.ffn.gate.' in name:
@@ -113,6 +113,10 @@ def main():
     backend.add_argument('--expert-cache', action='store_true')
     backend.add_argument('--gpu-experts', action='store_true')
     backend.add_argument('--disk-experts', action='store_true')
+    parser.add_argument('--moe-device-layers', type=int, default=-1,
+                        help='place only the last N layers on the host backend; keep the prefix on GPU')
+    parser.add_argument('--cache-bytes', type=int, default=0,
+                        help='exercise tiny/zero-resident hybrid caches, e.g. 65536')
     parser.add_argument('--ngram-device', choices=('cpu', 'disk', 'cuda'), default='cpu')
     parser.add_argument('--fp8-dense', action='store_true',
                         help='exercise block-32 FP8 weights and persistent activation quantization buffers')
@@ -137,6 +141,10 @@ def main():
                    FASTLLM_DSV41_DISABLE_FAKE_QUANT='0' if args.fp8_dense else '1',
                    FASTLLM_DSV41_CUDA_GRAPH_DEBUG='1')
         command = [args.binary, str(directory), '--tp-size', str(args.tp_size)] + (['--expert-cache'] if args.expert_cache else [])
+        if args.moe_device_layers >= 0:
+            command += ['--moe-device-layers', str(args.moe_device_layers)]
+        if args.cache_bytes:
+            command += ['--cache-bytes', str(args.cache_bytes)]
         if args.gpu_experts:
             command.append('--gpu-experts')
         if args.disk_experts:
@@ -169,6 +177,8 @@ def main():
         if args.full_verify or args.expert_cache or args.disk_experts:
             for tokens in range(2, 9):
                 assert f'full verify graph ready: tokens={tokens},' in result.stdout
+        if not args.eager_only and args.moe_device_layers >= 0:
+            assert 'full decode graph ready:' in result.stdout, 'resident/host decode was not composed'
         assert 'giving up' not in result.stdout and 'graph disabled' not in result.stdout
         if args.expert_cache and args.tp_size == 1:
             assert re.search(r'V4.1 verify cache:.* [1-9]\d* GPU routes', result.stdout), 'verify never used GPU experts'

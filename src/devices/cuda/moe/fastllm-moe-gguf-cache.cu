@@ -453,6 +453,10 @@ bool Compute(const fastllm::Data &input, fastllm::Data &gate, fastllm::Data &out
 }
 
 struct ResidentLayer {
+    struct NativeWorkspace {
+        fastllm::Data quantized, activation, partial;
+    };
+    std::map<std::pair<int, int>, std::unique_ptr<NativeWorkspace>> nativeWorkspaces;
     int device = -1, experts = 0, gateType = -1, downType = -1, hidden = 0, inter = 0;
     void *table = nullptr;
     std::vector<const fastllm::Data *> sources;
@@ -481,7 +485,7 @@ ResidentRegistry &ResidentLayers() {
 }
 thread_local std::unordered_map<const fastllm::Data *, std::weak_ptr<ResidentLayer>> residentFront;
 
-std::shared_ptr<ResidentLayer> GetResidentLayer(fastllm::Data **weights, int count, int device) {
+std::shared_ptr<ResidentLayer> GetResidentLayer(fastllm::Data **weights, int count, int device, bool native = false) {
     // Tensor-parallel EP passes a full global slot array whose remote expert
     // entries are null.  Use the first complete local pair as the cache key
     // and metadata source; the grouped route table still retains the global
@@ -496,8 +500,9 @@ std::shared_ptr<ResidentLayer> GetResidentLayer(fastllm::Data **weights, int cou
     if (firstPair < 0) return {};
     const auto *gate0 = weights[firstPair];
     const auto *down0 = weights[firstPair + 1];
-    if (gate0->dataType != fastllm::DATA_GGUF_FORMAT ||
-        down0->dataType != fastllm::DATA_GGUF_FORMAT ||
+    const auto weightType = native ? fastllm::NVFP4 : fastllm::DATA_GGUF_FORMAT;
+    if (gate0->dataType != weightType ||
+        down0->dataType != weightType ||
         gate0->dims.size() != 2 || down0->dims.size() != 2) return {};
     const auto *key = gate0;
     auto front = residentFront.find(key);
@@ -528,8 +533,10 @@ std::shared_ptr<ResidentLayer> GetResidentLayer(fastllm::Data **weights, int cou
     layer->inter = weights[firstPair]->dims[0]/2;
     layer->gateType = weights[firstPair]->ggmlType;
     layer->downType = weights[firstPair + 1]->ggmlType;
-    if (layer->inter <= 0 || !FastllmCudaMoeGGUFCacheSupported(layer->gateType, layer->hidden) ||
-        !FastllmCudaMoeGGUFCacheSupported(layer->downType, layer->inter)) return {};
+    if (layer->hidden <= 0 || layer->inter <= 0 || (native
+        ? layer->hidden % 32 || layer->inter % 32
+        : !FastllmCudaMoeGGUFCacheSupported(layer->gateType, layer->hidden) ||
+          !FastllmCudaMoeGGUFCacheSupported(layer->downType, layer->inter))) return {};
     std::vector<const uint8_t *> pointers(2*layer->experts, nullptr);
     for (int e = 0; e < layer->experts; ++e) {
         auto *gate = weights[2*(e+1)], *down = weights[2*(e+1)+1];
@@ -540,10 +547,13 @@ std::shared_ptr<ResidentLayer> GetResidentLayer(fastllm::Data **weights, int cou
             const int rows = part ? layer->hidden : 2*layer->inter;
             const int cols = part ? layer->inter : layer->hidden;
             const int type = part ? layer->downType : layer->gateType;
-            if (weight->dataType != fastllm::DATA_GGUF_FORMAT ||
+            if (weight->dataType != weightType ||
                 weight->dataDevice != fastllm::CUDA || !weight->cudaData ||
                 weight->dataDeviceIds != std::vector<int>{device} ||
-                weight->ggmlType != type || weight->dims != std::vector<int>({rows, cols})) return {};
+                (!native && weight->ggmlType != type) || weight->dims != std::vector<int>({rows, cols})) return {};
+            if (native && (!weight->directMemory || weight->blockK != 1 || weight->blockM != 32 ||
+                    !weight->scales.empty() || weight->expansionBytes < size_t(rows) * (cols / 32) * 17))
+                return {};
             auto owner = registry.owners.find(weight);
             if (owner != registry.owners.end() && owner->second != key) return {};
             pointers[2*e+part] = static_cast<const uint8_t *>(weight->cudaData);
@@ -1291,6 +1301,107 @@ bool FastllmCudaMergeMOEV41GGUFResident(
         hidden, inter, layer->experts, topk, swigluLimit, compactEpRoutes), "V4.1 resident GGUF CUDA launch failed.");
     if (rows <= 32)
         layer->v41DecodeTopks[rows - 1].fetch_or(uint32_t(1) << (topk - 1), std::memory_order_release);
+    return true;
+}
+
+namespace v41_native_resident {
+__global__ void Gate(const __nv_bfloat16 *input, const int32_t *ids, const float *scores,
+        const uint8_t *const *weights, __nv_bfloat16 *activation,
+        int rows, int hidden, int inter, int experts, int topk, float limit) {
+    const int route = blockIdx.y, expert = ids[route];
+    if (expert < 0 || expert >= experts || !weights[2 * expert]) return;
+    const int column = blockIdx.x * 32 + threadIdx.x / 16;
+    const uint8_t *gate = weights[2 * expert];
+    const uint8_t *scale = gate + size_t(2 * inter) * (hidden / 2);
+    using namespace fastllm::cuda::dsv41_cache;
+    const float2 pair = DotGateUp<true>(input + size_t(route / topk) * hidden,
+        gate + size_t(column) * (hidden / 2), gate + size_t(column + inter) * (hidden / 2), hidden,
+        scale + size_t(column) * (hidden / 32), scale + size_t(column + inter) * (hidden / 32));
+    StoreGate(pair, scores[route], activation, route, inter, limit);
+}
+__global__ void Down(const __nv_bfloat16 *activation, const int32_t *ids,
+        const uint8_t *const *weights, float *partial, int hidden, int inter, int experts) {
+    const int route = blockIdx.y, expert = ids[route];
+    if (expert < 0 || expert >= experts || !weights[2 * expert + 1]) return;
+    const int column = blockIdx.x * 8 + threadIdx.x / 16;
+    const uint8_t *down = weights[2 * expert + 1];
+    using namespace fastllm::cuda::dsv41_cache;
+    const float value = Dot<true>(activation + size_t(route) * inter,
+        down + size_t(column) * (inter / 2), inter,
+        down + size_t(hidden) * (inter / 2) + size_t(column) * (inter / 32));
+    if ((threadIdx.x & 15) == 0) partial[size_t(route) * hidden + column] = BFloat(value);
+}
+__global__ void Reduce(const float *partial, const int32_t *ids,
+        const uint8_t *const *weights, float *output, int hidden, int experts, int topk) {
+    const int col = blockIdx.x * blockDim.x + threadIdx.x, row = blockIdx.y;
+    __shared__ int order[16];
+    if (threadIdx.x < topk) {
+        const int r = threadIdx.x, id = ids[row * topk + r];
+        int rank = 0;
+        for (int i = 0; i < topk; ++i) {
+            const int other = ids[row * topk + i];
+            rank += other < id || (other == id && i < r);
+        }
+        order[rank] = r;
+    }
+    __syncthreads();
+    if (col >= hidden) return;
+    float sum = 0;
+    for (int i = 0; i < topk; ++i) {
+        const int route = row * topk + order[i], expert = ids[route];
+        if (expert >= 0 && expert < experts && weights[2 * expert])
+            sum = __fadd_rn(sum, partial[size_t(route) * hidden + col]);
+    }
+    output[size_t(row) * hidden + col] = sum;
+}
+}
+
+bool FastllmCudaMergeMOEV41NativeResident(
+        const fastllm::Data &input, fastllm::Data &output, fastllm::Data **weights, int weightsBatch,
+        const fastllm::Data &indices, const fastllm::Data &scores, float swigluLimit) {
+    using namespace fastllm;
+    using fastllm_gguf_moe::AllocateTensor;
+    const int device = FastllmCudaGetDevice();
+    if (input.dataType != BFLOAT16 || input.dims.size() != 2 || input.dims[0] < 1 || input.dims[0] > 8 ||
+        indices.dataType != INT32 || scores.dataType != FLOAT32 || indices.dims != scores.dims ||
+        indices.dims.size() != 2 || indices.dims[0] != input.dims[0] ||
+        indices.dims[1] < 1 || indices.dims[1] > 16 || !std::isfinite(swigluLimit) || swigluLimit < 0)
+        return false;
+    for (const Data *d : {&input, &indices, &scores})
+        if (d->dataDevice != CUDA || !d->cudaData || d->multiDeviceData ||
+            d->dataDeviceIds != std::vector<int>{device}) return false;
+    auto layer = GetResidentLayer(weights, weightsBatch, device, true);
+    if (!layer || layer->hidden != input.dims[1]) return false;
+    const int rows = input.dims[0], topk = indices.dims[1], hidden = layer->hidden, inter = layer->inter;
+    // Host layers reuse the operator scratch tensors after a resident
+    // layer. Keep native graph scratch with its weight table and shape so
+    // subsequent CPU/disk execution cannot retire captured device pointers.
+    auto &owned = layer->nativeWorkspaces[{rows, topk}];
+    if (!owned) {
+        if (FastllmCudaGraphIsCapturingFast()) return false;
+        owned = std::make_unique<ResidentLayer::NativeWorkspace>();
+    }
+    auto &quantized = owned->quantized;
+    auto &activation = owned->activation;
+    auto &partial = owned->partial;
+    AllocateTensor(quantized, BFLOAT16, input.dims, device);
+    AllocateTensor(activation, BFLOAT16, {rows * topk, inter}, device);
+    AllocateTensor(partial, FLOAT32, {rows * topk, hidden}, device);
+    AllocateTensor(output, FLOAT32, input.dims, device);
+    if (!FastllmCudaDeepSeekV41QuantizeActivation(input, quantized)) return false;
+    const auto *table = static_cast<const uint8_t *const *>(layer->table);
+    const auto *ids = static_cast<const int32_t *>(indices.cudaData);
+    v41_native_resident::Gate<<<dim3(inter / 32, rows * topk), 512, 0, cudaStreamPerThread>>>(
+        static_cast<const __nv_bfloat16 *>(quantized.cudaData), ids, static_cast<const float *>(scores.cudaData),
+        table, static_cast<__nv_bfloat16 *>(activation.cudaData), rows, hidden, inter, layer->experts, topk, swigluLimit);
+    v41_native_resident::Down<<<dim3(hidden / 8, rows * topk), 128, 0, cudaStreamPerThread>>>(
+        static_cast<const __nv_bfloat16 *>(activation.cudaData), ids, table,
+        static_cast<float *>(partial.cudaData), hidden, inter, layer->experts);
+    v41_native_resident::Reduce<<<dim3((hidden + 255) / 256, rows), 256, 0, cudaStreamPerThread>>>(
+        static_cast<const float *>(partial.cudaData), ids, table,
+        static_cast<float *>(output.cudaData), hidden, layer->experts, topk);
+    AssertInFastLLM(cudaGetLastError() == cudaSuccess, "V4.1 native resident launch failed");
+    layer->v41DecodeTopks[rows - 1].fetch_or(uint32_t(1) << (topk - 1), std::memory_order_release);
     return true;
 }
 
