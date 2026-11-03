@@ -163,22 +163,42 @@ int ProjectTests(int layers, int inner, int columns,
     }
     return checks;
 }
-static void MixedBatch(int count, int window) {
+static void MixedBatch(int count, int window, bool mixedStorage = false, int appendedRows = 0) {
     constexpr int heads = 2, dim = 64, width = heads * dim;
     std::vector<Data> raw(count), norms(count);
     std::vector<std::pair<Data, Data>> actual(count), expected(count);
+    std::vector<std::pair<Data, Data>> views(count);
     std::vector<FastllmNaiveDraftKVUpdate> updates;
+    std::vector<void *> original(count);
     for (int i = 0; i < count; ++i) {
-        int rows = 1 + i % 8, old = i % 3 == 0 ? 3 : window - 1, start = i % 3 == 0 ? 3 : 32767 + i;
+        int rows = appendedRows ? appendedRows + i % 3 : 1 + i % 8;
+        int old = i % 3 == 0 ? 3 : window - 1, start = i % 3 == 0 ? 3 : 32767 + i;
         raw[i].CopyFrom(BF({1, rows, 2 * width}, 91 + i));
         norms[i].CopyFrom(Data(FLOAT32, {dim}, std::vector<float>(dim, 1.0f)));
         norms[i].ToDevice(DataDevice::CUDA, std::vector<int>{device});
         for (int part = 0; part < 2; ++part) {
             Data initial = BF({1, old, width}, i * 71 + part);
-            Append(part ? actual[i].second : actual[i].first, initial, window + 16);
-            Append(part ? expected[i].second : expected[i].first, initial, window + 16);
+            Append(part ? actual[i].second : actual[i].first, initial,
+                   mixedStorage && i % 4 == 2 ? old : window + 16);
+            Append(part ? expected[i].second : expected[i].first, initial, window + std::max(16, rows));
         }
         updates.push_back({&raw[i], &norms[i], &actual[i].first, &actual[i].second, start});
+        original[i] = actual[i].first.cudaData;
+        if (mixedStorage && i % 4 == 1) {
+            actual[i].first.isKVCache = actual[i].second.isKVCache = false;
+        } else if (mixedStorage && i % 4 == 3) {
+            for (int part = 0; part < 2; ++part) {
+                Data &owner = part ? actual[i].second : actual[i].first;
+                Data &view = part ? views[i].second : views[i].first;
+                view.FakeFrom(owner, 0);
+                view.Resize(owner.dims);
+                view.expansionDims = owner.expansionDims;
+                view.strides = owner.strides;
+                view.isKVCache = true;
+            }
+            updates.back().key = &views[i].first;
+            updates.back().value = &views[i].second;
+        }
         Data key, value; Split(raw[i], 2, 0, width, key); Split(raw[i], 2, width, 2 * width, value);
         key.Reshape({1, rows * heads, dim}); KimiK3RMSNorm(key, norms[i], 1e-5f, key); key.Reshape({1, rows, width});
         std::vector<float> positions(rows); for (int r = 0; r < rows; ++r) positions[r] = start + r;
@@ -189,8 +209,20 @@ static void MixedBatch(int count, int window) {
     }
     Check(FastllmCudaNaiveBatchDraftKV(updates, heads, dim, window, window + 16, 1e-5f, 10000.f), "mixed KV batch rejected");
     for (int i = 0; i < count; ++i) {
-        Check(actual[i].first.dims == expected[i].first.dims, "mixed KV metadata differs");
-        Check(Bits(actual[i].first) == Bits(expected[i].first) && Bits(actual[i].second) == Bits(expected[i].second), "mixed KV differs bitwise");
+        const auto &u = updates[i];
+        Check(u.key->dims == expected[i].first.dims && u.value->dims == expected[i].second.dims,
+              "mixed KV metadata differs");
+        Check(Bits(*u.key) == Bits(expected[i].first) && Bits(*u.value) == Bits(expected[i].second), "mixed KV differs bitwise");
+        Check(u.key->isKVCache && u.value->isKVCache, "cache flag missing");
+        if (i % 4 == 0) Check(u.key->cudaData == original[i], "warm cache reallocated");
+        if (appendedRows) {
+            Check(u.key->cudaData == original[i] && u.key->expansionDims[1] == window + 16,
+                  "long append grew the bounded draft KV cache");
+        }
+        if (mixedStorage && i % 4 == 2)
+            Check(u.key->expansionDims[1] >= window + 16, "cache reserve did not grow");
+        if (mixedStorage && i % 4 == 3)
+            Check(u.key->isFake && u.key->cudaData == original[i], "view ownership changed");
     }
     auto before = Bits(actual.front().first);
     updates.back().norm = nullptr;
@@ -204,6 +236,9 @@ int main() {
             return 77;
         ApplyDeviceMap({{"cuda:0", 1}}, 1, 1);
         for (int n : {2, 8, 80, 81, 640}) for (int window : {17, 1024, 1152}) MixedBatch(n, window);
+        for (int n : {81, 256, 380, 1280, 1900}) MixedBatch(n, 17, true);
+        for (int window : {17, 1024, 1152})
+            for (int rows : {128, 1023, 1100, 4096}) MixedBatch(81, window, false, rows);
         int checks = 0;
         for (int dim : {64, 128, 256})
             for (int rows : {1, 2, 3, 4, 5, 6, 7, 8})

@@ -114,7 +114,8 @@ int main() {
         if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices)
             return 77;
         Check(cudaSetDevice(0));
-        for (int n : {2, 8, 80}) for (DataType type : {BFLOAT16, FP8_E4M3}) BatchCommit(n, type);
+        for (int n : {2, 8, 80, 112, 113, 380, 1025})
+            for (DataType type : {BFLOAT16, FP8_E4M3}) BatchCommit(n, type);
         int checks = 0;
         for (DataType type : {BFLOAT16, FP8_E4M3})
             for (int heads : {4, 8, 16, 32})

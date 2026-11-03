@@ -892,7 +892,7 @@ void NaiveN05FlashModel::TPDecodeState::ClearGraphs() {
     }
     FastllmCudaGraphMemoryPoolRelease(reservedPointers);
     reservedPointers.clear();
-    warmed = captured = disabled = active = false;
+    warmed = captured = disabled = active = preparedEager = false;
 }
 
 NaiveN05FlashModel::TPDecodeState::~TPDecodeState() { ClearGraphs(); }
@@ -1201,7 +1201,7 @@ bool NaiveN05FlashModel::PrepareTensorParallelDecode(const Data &inputIds,
         tpDecodeState->sequenceCapacities == sequenceCapacities && tpDecodeState->ncclGeneration == generation) {
         // Eligibility can fail before rank storage is created. A disabled
         // entry is an eager fallback, not a partially prepared cache binding.
-        if (tpDecodeState->disabled) {
+        if (tpDecodeState->disabled && !tpDecodeState->preparedEager) {
             cacheLengths.clear();
             return false;
         }
@@ -1210,7 +1210,7 @@ bool NaiveN05FlashModel::PrepareTensorParallelDecode(const Data &inputIds,
             cacheLengths.clear();
         bindCache(*tpDecodeState);
         tpDecodeState->cachePointers = std::move(pointers);
-        return tpDecodeState->active = !tpDecodeState->disabled;
+        return tpDecodeState->active = !tpDecodeState->disabled || tpDecodeState->preparedEager;
     }
     cacheLengths.clear();
     auto state = tpDecodeState ? tpDecodeState : std::make_shared<TPDecodeState>();
@@ -1331,6 +1331,8 @@ Data NaiveN05FlashModel::ForwardTensorParallelDecode(int rank, const Data &input
         const Data &positions, std::vector<std::pair<Data, Data>> &kv,
         const GenerationConfig &config, const Data *embedding, TargetCapture *capture,
         float *candidateResult, const TargetBatch *batch, bool keepCudaLogits) {
+    // Use one return object on every branch so NRVO preserves borrowed storage.
+    Data output;
     auto &state = *tpDecodeState;
     auto &r = *state.ranks.at(rank);
     auto &storage = *r.storage;
@@ -1429,12 +1431,15 @@ Data NaiveN05FlashModel::ForwardTensorParallelDecode(int rank, const Data &input
                 storage.hostMaps.data(), storage.hostMaps.size());
             storage.mapsDirty = false;
         }
-        if (state.mode == TPDecodeState::Prepare) return Data();
+        if (state.mode == TPDecodeState::Prepare) return output;
     }
     if (state.mode == TPDecodeState::Replay) {
         AssertInFastLLM(FastllmCudaGraphLaunch(r.exec), "Naive TP decode graph launch failed.");
     } else {
-        if (state.mode == TPDecodeState::Warm) r.communicationPointers.clear();
+        if (state.mode == TPDecodeState::Warm) {
+            r.communicationPointers.clear();
+            r.ok = true;
+        }
         FastllmCudaMergeMOEClearGraphUnsafeFallbackFlag();
 #ifndef USE_ROCM
         // These variants already share activation/KV metadata buffers and are
@@ -1454,7 +1459,7 @@ Data NaiveN05FlashModel::ForwardTensorParallelDecode(int rank, const Data &input
             r.ok = FastllmCudaGraphEndCapture(&r.graph) && clean && r.ok;
             if (!r.ok) fprintf(stderr, "[Fastllm] Naive TP graph rank %d: %s\n", rank,
                                FastllmCudaGraphLastError());
-            return Data();
+            return output;
         }
     }
     if (capture && capture->collectHidden)
@@ -1466,21 +1471,20 @@ Data NaiveN05FlashModel::ForwardTensorParallelDecode(int rank, const Data &input
         }
     if (state.selection.count && candidateResult) {
         FastllmCudaCopyFromDeviceToHost(candidateResult, storage.logitsCandidates.cudaData, (size_t)actualRows * state.selection.count * 2 * sizeof(float));
-        return Data();
+        return output;
     }
     if (keepCudaLogits) {
         // Borrow the graph's stable output; never release or move its storage.
-        Data output;
         output.FakeFrom(buf.logits, 0);
         // Storage is shared across batch graphs; its host shape may describe
         // the last captured batch rather than the graph being replayed.
         output.Resize({1, actualRows, tpVocabRanges[rank].second - tpVocabRanges[rank].first});
-        return output;
+    } else {
+        // ToDevice(CPU) would release the graph's persistent output allocation.
+        output.Resize({1, actualRows, tpVocabRanges[rank].second - tpVocabRanges[rank].first});
+        output.Allocate();
+        FastllmCudaCopyFromDeviceToHost(output.cpuData, buf.logits.cudaData, output.GetBytes());
     }
-    // ToDevice(CPU) would release the graph's persistent output allocation.
-    Data output(FLOAT32, {1, actualRows, tpVocabRanges[rank].second - tpVocabRanges[rank].first});
-    output.Allocate();
-    FastllmCudaCopyFromDeviceToHost(output.cpuData, buf.logits.cudaData, output.GetBytes());
     return output;
 }
 #endif
@@ -1499,7 +1503,8 @@ Data NaiveN05FlashModel::ForwardSingleGPU(int rank, const Data &inputIds, const 
         ~RestoreExecutor() { SetCurrentThreadExecutor(previous); }
     } restore{GetExecutor()};
     SetCurrentThreadExecutor(executor.get());
-    if (tpDecodeState && tpDecodeState->active && !tpDecodeState->disabled)
+    if (tpDecodeState && tpDecodeState->active &&
+        (!tpDecodeState->disabled || tpDecodeState->preparedEager))
         return ForwardTensorParallelDecode(rank, inputIds, positions, kv, config, embedding, capture,
             candidateResult, batch, selection && (selection->cudaSampling || selection->cudaLogits));
     // Generic operators can move their inputs. Give every worker its own IDs.
@@ -1850,7 +1855,7 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
             }
         });
     };
-    if (graphDecode && tpDecodeState->warmed && !tpDecodeState->captured &&
+    if (graphDecode && !tpDecodeState->disabled && tpDecodeState->warmed && !tpDecodeState->captured &&
         (!tpServingState || !tpServingState->preparing || tpServingState->capturing)) {
         auto &state = *tpDecodeState;
         state.mode = TPDecodeState::Prepare;
@@ -1900,15 +1905,22 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
         if (!ok) {
             // Capture has not executed the token or committed KV metadata.
             // All ranks agree on fallback before any graph is launched.
+            // Drop partial graphs and their pool pins before eager needs the
+            // same scratch. A disabled cache must not retain failed captures.
+            state.ClearGraphs();
             state.disabled = true;
+            state.preparedEager = state.active = verify;
             runRanks([&](int rank) {
                 FastllmCudaSetDevice(tpDevices[rank]);
                 FastllmCudaClearLastError();
                 FastllmCudaClearThreadError();
             });
             fprintf(stderr, "[Fastllm] Naive TP decode graph capture failed; using eager for this cache.\n");
-            graphDecode = false;
-            if (ringVerify && !eagerRingVerify) {
+            // Verification already completed warmup with these exact kernels.
+            // Keep its workspace on fallback; the generic path would allocate
+            // a second activation/logits set after the KV pool was budgeted.
+            graphDecode = state.preparedEager;
+            if (!graphDecode && ringVerify && !eagerRingVerify) {
                 // Capture did not execute any writes. Unsupported eager shapes require
                 // the chronological prefix, including on a failed capture.
                 linearizeVerifyRing();
@@ -1969,7 +1981,8 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
     if (capture) capture->ringVerify = ringVerify;
     for (auto &rankCapture : captures) rankCapture.ringVerify = ringVerify;
     if (trace) {
-        trace->mode = graphDecode ? (tpDecodeState->captured ? "cuda_graph" : "graph_warmup") : "eager";
+        trace->mode = graphDecode && !tpDecodeState->preparedEager
+            ? (tpDecodeState->captured ? "cuda_graph" : "graph_warmup") : "eager";
         trace->Mark("graph_capture_reserve_ms");
     }
     std::vector<std::vector<void *>> sharedPointers;
@@ -2195,8 +2208,9 @@ struct NaiveN05FlashModel::DraftHeadState {
 #endif
 
 Data NaiveN05FlashModel::RunDraftHead(Data &hidden) {
+    // Separate branch-local return objects would copy the borrowed GPU logits.
+    Data output;
     if (tpDevices.empty()) {
-        Data output;
         if (hidden.dims[1] > 1) MatMulTransB(hidden, weight["lm_head.weight"], output);
         else Linear(hidden, weight["lm_head.weight"], Data(), output);
         return output;
@@ -2262,7 +2276,6 @@ Data NaiveN05FlashModel::RunDraftHead(Data &hidden) {
         FastllmCudaSetDevice(owner);
         for (auto error : errors) if (error) std::rethrow_exception(error);
         for (auto event : state.done) FastllmCudaCurrentThreadStreamWaitEvent(event);
-        Data output;
         // The round consumes this view before another head forward. Each
         // following forward publishes ready after those owner-stream reads,
         // so rank workers cannot overwrite the joined logits too early.
@@ -2294,7 +2307,8 @@ Data NaiveN05FlashModel::RunDraftHead(Data &hidden) {
         logits[rank].ToDevice(DataDevice::CPU);
     }, errors);
     for (auto error : errors) if (error) std::rethrow_exception(error);
-    Data output(BFLOAT16, {1, rows, vocab});
+    output.dataType = BFLOAT16; output.UpdateUnitSize();
+    output.Resize({1, rows, vocab});
     output.Allocate();
     for (int rank = 0; rank < (int)tpDevices.size(); ++rank) {
         const auto range = tpVocabRanges[rank];
@@ -2308,7 +2322,7 @@ Data NaiveN05FlashModel::RunDraftHead(Data &hidden) {
     output.ToDevice(DataDevice::CUDA, std::vector<int>{tpDevices.front()});
     return output;
 #else
-    return Data();
+    return output;
 #endif
 }
 

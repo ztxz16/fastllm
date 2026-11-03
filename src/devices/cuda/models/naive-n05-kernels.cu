@@ -2543,9 +2543,10 @@ __global__ void DraftRoundedSwiGLU(const BF16 *input, BF16 *output, int width, i
     float gate = (float)input[at], up = (float)input[at + width];
     output[i] = __float2bfloat16(RoundBF16(gate / (1.0f + expf(-gate))) * up);
 }
-bool DraftDense(const fastllm::Data &x, fastllm::DataType type) {
+bool DraftDense(const fastllm::Data &x, fastllm::DataType type, int device = -1) {
     if (x.dataType != type || x.dataDevice != fastllm::DataDevice::CUDA ||
-        x.multiDeviceData || x.dataDeviceIds != std::vector<int>{FastllmCudaGetDevice()} ||
+        x.multiDeviceData || x.dataDeviceIds.size() != 1 ||
+        x.dataDeviceIds[0] != (device < 0 ? FastllmCudaGetDevice() : device) ||
         !x.cudaData || x.dims.empty() || x.strides.size() != x.dims.size()) return false;
     uint64_t stride = 1;
     for (int i = (int)x.dims.size() - 1; i >= 0; --i) {
@@ -2803,11 +2804,12 @@ bool FastllmCudaNaiveBatchDraftKV(const std::vector<FastllmNaiveDraftKVUpdate> &
         window <= 1 || reserve < 0 || (int64_t)heads * dim > INT_MAX / 2 ||
         !std::isfinite(eps) || eps < 0 || !std::isfinite(theta) || theta <= 0) return false;
     const int width = heads * dim;
-    const std::vector<int> devices{FastllmCudaGetDevice()};
+    const int device = FastllmCudaGetDevice();
+    const std::vector<int> devices{device};
     for (const auto &u : updates) {
         if (!u.raw || !u.norm || !u.key || !u.value || u.start < 0 ||
-            !DraftDense(*u.raw, BFLOAT16) || !DraftDense(*u.norm, FLOAT32) ||
-            u.norm->dims != std::vector<int>{dim} || u.raw->dims.size() != 3 ||
+            !DraftDense(*u.raw, BFLOAT16, device) || !DraftDense(*u.norm, FLOAT32, device) ||
+            u.norm->dims.size() != 1 || u.norm->dims[0] != dim || u.raw->dims.size() != 3 ||
             u.raw->dims[0] != 1 || u.raw->dims[2] != 2 * width || u.raw->dims[1] <= 0 ||
             (int64_t)u.start + u.raw->dims[1] > INT_MAX ||
             (int64_t)16 * u.raw->dims[1] * heads > INT_MAX || u.key->dims != u.value->dims) return false;
@@ -2833,25 +2835,36 @@ bool FastllmCudaNaiveBatchDraftKV(const std::vector<FastllmNaiveDraftKVUpdate> &
         bool needsTrim = false;
         for (int i = 0; i < count; ++i) {
             const auto &u = updates[first + i];
-            int old = u.key->dims.empty() ? 0 : u.key->dims[1], n = u.raw->dims[1];
+            const int old = u.key->dims.empty() ? 0 : u.key->dims[1];
+            const int n = std::min(u.raw->dims[1], window - 1);
+            const int skip = u.raw->dims[1] - n;
+            const int keep = std::min(old, window - 1 - n);
             rows = std::max(rows, n);
-            dst.raw[i] = (const BF16 *)u.raw->cudaData; dst.norm[i] = (const float *)u.norm->cudaData;
-            dst.length[i] = old; dst.rows[i] = n; dst.start[i] = u.start;
+            dst.raw[i] = (const BF16 *)u.raw->cudaData + (size_t)skip * 2 * width;
+            dst.norm[i] = (const float *)u.norm->cudaData;
+            dst.length[i] = keep; dst.rows[i] = n; dst.start[i] = u.start + skip;
             for (Data *cache : {u.key, u.value}) {
-                cache->dataType = BFLOAT16; cache->UpdateUnitSize();
-                cache->ToDevice(DataDevice::CUDA, devices);
-                int64_t wanted = std::max(old + n, reserve);
-                if (cache->expansionDims.empty() || cache->expansionDims[1] < wanted)
-                    cache->Expansion({1, (int)std::min<int64_t>(INT_MAX, (wanted + 127) / 128 * 128), width});
-                cache->Resize({1, old + n, width}); cache->isKVCache = true;
+                int64_t wanted = std::max(keep + n, reserve);
+                // Owned, initialized caches were preflighted above. Their
+                // placement and capacity stay fixed through warm decode;
+                // views, initialization and growth retain ToDevice's checks.
+                if (!cache->isKVCache || cache->isFake ||
+                    !FastllmNaiveCanResizeKVLength(*cache, (int)wanted, width)) {
+                    cache->dataType = BFLOAT16; cache->UpdateUnitSize();
+                    cache->ToDevice(DataDevice::CUDA, devices);
+                    if (cache->expansionDims.empty() || cache->expansionDims[1] < wanted)
+                        cache->Expansion({1, (int)std::min<int64_t>(INT_MAX, (wanted + 127) / 128 * 128), width});
+                }
+                FastllmNaiveResizeKVLength(*cache, keep + n, width); cache->isKVCache = true;
             }
             dst.key[i] = trim.key[i] = (BF16 *)u.key->cudaData;
             dst.value[i] = trim.value[i] = (BF16 *)u.value->cudaData;
-            trim.width[i] = width; trim.keep[i] = std::min(old + n, window - 1);
-            trim.drop[i] = old + n - trim.keep[i]; needsTrim |= trim.drop[i] > 0;
+            trim.width[i] = width; trim.keep[i] = keep;
+            trim.drop[i] = old - keep; needsTrim |= keep > 0 && trim.drop[i] > 0;
         }
-        DraftNormRopeWrite<<<count * rows * heads, 256, 0, cudaStreamPerThread>>>(dst, rows, heads, dim, eps, theta);
-        CheckLaunch();
+        // Evict before appending: old+new can approach two windows during
+        // prefix restore/chunked prefill, but only the retained suffix is live.
+        // Skipped raw rows keep their absolute RoPE positions via dst.start.
         if (needsTrim) {
             if (vectorTrim) {
                 BatchDraftTrimVector<64><<<dim3(2 * ((width + 31) / 32), count), 256, 1024 * 64>>>(trim);
@@ -2863,8 +2876,8 @@ bool FastllmCudaNaiveBatchDraftKV(const std::vector<FastllmNaiveDraftKVUpdate> &
             } else BatchDraftTrimColumns<<<dim3((2 * width + 255) / 256, count), 256>>>(trim);
             CheckLaunch();
         }
-        for (int i = 0; i < count; ++i) for (Data *cache : {updates[first + i].key, updates[first + i].value})
-            cache->Resize({1, trim.keep[i], width});
+        DraftNormRopeWrite<<<count * rows * heads, 256, 0, cudaStreamPerThread>>>(dst, rows, heads, dim, eps, theta);
+        CheckLaunch();
     }
     return true;
 }
@@ -4413,15 +4426,17 @@ void FastllmCudaNaiveCommitSwaVerify(fastllm::Data &key, fastllm::Data &value,
 
 void FastllmCudaNaiveBatchCommitSwaVerify(const std::vector<FastllmNaiveCacheCommit> &caches) {
     using namespace fastllm;
+    const int device = FastllmCudaGetDevice();
     for (const auto &c : caches) {
-        AssertInFastLLM(c.key && c.value && c.past >= 0 && c.count >= 0 && c.count <= 8 &&
+        const bool valid = c.key && c.value && c.past >= 0 && c.count >= 0 && c.count <= 8 &&
             c.past <= INT_MAX - c.count && FastllmNaiveKVType(c.key->dataType) && c.key->dataType == c.value->dataType &&
             c.key->dims.size() == 3 && c.value->dims.size() == 3 && c.key->dims[0] == 1 && c.value->dims[0] == 1 &&
             c.key->dataDevice == DataDevice::CUDA && c.value->dataDevice == DataDevice::CUDA &&
-            c.key->dataDeviceIds == std::vector<int>{FastllmCudaGetDevice()} && c.key->dataDeviceIds == c.value->dataDeviceIds &&
+            c.key->dataDeviceIds.size() == 1 && c.key->dataDeviceIds[0] == device &&
+            c.value->dataDeviceIds.size() == 1 && c.value->dataDeviceIds[0] == device &&
             c.key->expansionDims.size() == 3 && c.value->expansionDims.size() == 3 &&
-            std::min(c.key->expansionDims[1], c.value->expansionDims[1]) >= kSwaWindow + c.count,
-            "Invalid batched SWA commit.");
+            std::min(c.key->expansionDims[1], c.value->expansionDims[1]) >= kSwaWindow + c.count;
+        if (!valid) AssertInFastLLM(false, "Invalid batched SWA commit.");
     }
     for (size_t first = 0; first < caches.size(); first += kSwaCommitsPerLaunch) {
         SwaCommitBatch batch{}; int count = std::min<size_t>(kSwaCommitsPerLaunch, caches.size() - first), rows = 0, columns = 0;

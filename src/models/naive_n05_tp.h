@@ -79,6 +79,9 @@ struct NaiveN05FlashModel::TPDecodeState {
     bool verifying = false, collectHidden = false, dynamicCache = false;
     LogitsSelection selection;
     bool warmed = false, captured = false, disabled = false, active = false;
+    // A failed capture can still execute the successfully warmed verification
+    // kernels eagerly, using the same bounded buffers and dynamic KV bindings.
+    bool preparedEager = false;
     void ClearGraphs();
     ~TPDecodeState();
 };

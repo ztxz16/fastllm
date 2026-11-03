@@ -82,6 +82,11 @@ using namespace fastllm;
 namespace fastllm {
 struct NaiveN05GraphTestAccess {
     static auto &DraftPrefixPool(NaiveN05FlashModel &model) { return model.prefixPool; }
+    static void CheckHeadReturn(const NaiveN05FlashModel &model, const Data &output, bool deviceInput) {
+        const bool borrowed = deviceInput && !model.tpDevices.empty() && FastllmCudaPeerAccessInit(model.tpDevices);
+        if (output.isFake != borrowed || (borrowed && output.cudaData != model.tpDraftHeadOutput.cudaData))
+            throw std::runtime_error("head return lost its borrowed/owned storage contract");
+    }
     static void CheckDraftWarmup(NaiveN05FlashModel &model) {
         const char *warmup = std::getenv("FASTLLM_CUDA_SERVING_WARMUP");
         if (!warmup || std::string(warmup) != "1" || !model.draftTP) return;
@@ -141,6 +146,13 @@ struct NaiveN05GraphTestAccess {
         for (int rank = 0; rank < ranks; ++rank) {
             void *lease = nullptr;
             for (const auto &state : model.tpBatchVerifyGraphs) {
+                if (state->disabled) {
+                    if (!state->reservedPointers.empty())
+                        throw std::runtime_error("failed verification capture retained pool pins");
+                    for (const auto &part : state->ranks)
+                        if (part->graph || part->exec)
+                            throw std::runtime_error("failed verification capture retained graph resources");
+                }
                 if (rank >= (int)state->ranks.size()) continue;
                 if (state->dynamicCache && model.tpBatchVerifyStorage &&
                     state->ranks[rank]->storage != model.tpBatchVerifyStorage->ranks[rank]->storage)
@@ -290,7 +302,9 @@ class Fixture : public NaiveN05FlashModel {
         if (inspectDraftPrefix && !isIntermediateChunkedPrefill && config.output_logits) {
             auto draft = draftContexts.at(&kv);
             if (draft->committed == config.input_token_length) {
-                Data h = RunDraft(17, *draft), scores = RunDraftHead(h);
+                Data h = RunDraft(17, *draft), head = RunDraftHead(h);
+                // The head may borrow persistent logits; convert an owned oracle.
+                Data scores(head);
                 ToDataType(scores, FLOAT32); scores.ToDevice(DataDevice::CPU);
                 observedDraft.assign((float *)scores.cpuData, (float *)scores.cpuData + scores.Count(0));
             }
@@ -2324,7 +2338,7 @@ class Fixture : public NaiveN05FlashModel {
         GenerationConfig cfg;
         TargetCapture capture;
         RunDraftTarget(ids, pos, kv, cfg, capture);
-        for (int rows : {1, 2, 7, 3, 8, 7, 5, 10, 15, 5}) {
+        for (int rows : {1, 2, 7, 3, 8, 7, 5, 10, 15, 5, 380, 343, 350, 360}) for (bool deviceInput : {true, false}) {
             Data hidden(BFLOAT16, {1, rows, 256});
             hidden.Allocate();
             for (int i = 0; i < hidden.Count(0); ++i) {
@@ -2333,8 +2347,11 @@ class Fixture : public NaiveN05FlashModel {
                 std::memcpy(&bits, &x, 4);
                 ((uint16_t *)hidden.cpuData)[i] = bits >> 16;
             }
+            if (deviceInput) hidden.ToDevice(DataDevice::CUDA, std::vector<int>{0});
+            Data result = RunDraftHead(hidden), expected;
+            NaiveN05GraphTestAccess::CheckHeadReturn(*this, result, deviceInput);
+            Data actual(result); // Materialize only the test oracle before moving it to CPU.
             hidden.ToDevice(DataDevice::CUDA, std::vector<int>{0});
-            Data actual = RunDraftHead(hidden), expected;
             ApplyDraftDevice();
             if (rows > 1)
                 MatMulTransB(hidden, referenceHead, expected);
@@ -2357,7 +2374,7 @@ class Fixture : public NaiveN05FlashModel {
             if (differing)
                 throw std::runtime_error("head differs");
         }
-        std::cout << "HEAD PASS checks=10" << std::endl;
+        std::cout << "HEAD PASS checks=28" << std::endl;
     }
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
     void VerifyGraphBlocks() {
