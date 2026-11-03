@@ -1,6 +1,6 @@
 // Full verification graphs must preserve the eager chunk's causal attention,
 // compressor stream and deferred ring writes, including changing cache pointers.
-static void RunVerifyRegression() {
+static void RunVerifyRegression(int packedMode = 0) {
     int checked = 0;
     for (int heads : {8, 17, 64})
     for (int tokens : {2, 3, 4, 5, 6, 7, 8})
@@ -14,6 +14,12 @@ static void RunVerifyRegression() {
                 c.heads = heads;
                 c.indexHeads = indexHeads;
                 c.verifying = true;
+                if (packedMode) {
+                    const bool fp4 = packedMode == 3;
+                    c.ringMode = 1; c.ringRowBytes = 528;
+                    c.cmpMode = fp4 ? 3 : 1; c.cmpRowBytes = fp4 ? 288 : 528;
+                    c.indexMode = fp4 ? 2 : 1; c.indexRowBytes = fp4 ? 68 : 132;
+                }
                 c.ratio = ratio;
                 c.kvSource = c.indexSource = ratio != 0;
                 c.maxKeys = longContext ? 1048576 : 32768;
@@ -40,7 +46,8 @@ static void RunVerifyRegression() {
                 Fill(latent, {1, tokens, 512}, 13);
                 Fill(newKeys, {1, tokens, 128}, 14);
                 Fill(norm, {512}, 15, FLOAT32);
-                Fill(saved, kv.dims, 16);
+                Fill(saved, packedMode ? std::vector<int>{1, tokens, c.ringRowBytes} : kv.dims,
+                    16, packedMode ? INT8 : BFLOAT16);
                 Fill(savedRaw, {1, tokens + 1, 512}, 17, FLOAT32);
                 Fill(savedScore, savedRaw.dims, 18, FLOAT32);
                 Data q0(q), k0(kv), iq0(iq), nk0(newKeys), qr(q), kr(kv), iqr(iq), ring, relocated,
@@ -49,6 +56,15 @@ static void RunVerifyRegression() {
                 Fill(relocated, ring.dims, 21);
                 Fill(cmp, {1, c.maxKeys, 512}, 22);
                 Fill(keys, {1, c.maxKeys, 128}, 23);
+                auto pack = [&](Data &data, int mode) {
+                    if (!mode) return;
+                    Data encoded;
+                    Check(FastllmCudaDeepSeekV41QuantizeKV(data, encoded, mode, mode == 3 ? 16 : 32),
+                        "verify packed KV");
+                    data.CopyFrom(encoded);
+                };
+                pack(ring, c.ringMode); pack(relocated, c.ringMode);
+                pack(cmp, c.cmpMode); pack(keys, c.indexMode);
                 Fill(tail, {1, 1, 512}, 24, FLOAT32);
                 Fill(tailScore, tail.dims, 25, FLOAT32);
                 tail0.CopyFrom(tail);
@@ -177,14 +193,15 @@ static void RunVerifyRegression() {
                         }
                         rotary(refLatent, old * ratio, ratio, 3);
                         rotary(refNewKeys, old * ratio, ratio, 2);
-                        Cuda(cudaMemcpyAsync((char *)cmpReference.cudaData + size_t(old) * 512 * 2,
+                        pack(refLatent, c.cmpMode); pack(refNewKeys, c.indexMode);
+                        Cuda(cudaMemcpyAsync((char *)cmpReference.cudaData + size_t(old) * c.cmpRowBytes,
                                              refLatent.cudaData, refLatent.GetBytes(),
                                              cudaMemcpyDeviceToDevice, cudaStreamPerThread));
-                        Cuda(cudaMemcpyAsync((char *)keyReference.cudaData + size_t(old) * 128 * 2,
+                        Cuda(cudaMemcpyAsync((char *)keyReference.cudaData + size_t(old) * c.indexRowBytes,
                                              refNewKeys.cudaData, refNewKeys.GetBytes(),
                                              cudaMemcpyDeviceToDevice, cudaStreamPerThread));
-                        View(refCmp, cmpReference, 0, {1, count, 512});
-                        View(refKeys, keyReference, 0, {1, count, 128});
+                        View(refCmp, cmpReference, 0, {1, count, packedMode ? c.cmpRowBytes : 512});
+                        View(refKeys, keyReference, 0, {1, count, packedMode ? c.indexRowBytes : 128});
                         rotary(iqr, pos, 1, 2);
                         Check(FastllmCudaDeepSeekV41IndexerScore(iqr, iw, refKeys, ratio, pos,
                                                                  refScores),
@@ -220,7 +237,8 @@ static void RunVerifyRegression() {
                     Equal(q, qr, "verify q");
                     Equal(kv, kr, "verify kv");
                     Equal(out, refOut, "verify output");
-                    Equal(saved, kr, "deferred ring rows");
+                    Data expectedSaved(kr); pack(expectedSaved, c.ringMode);
+                    Equal(saved, expectedSaved, "deferred ring rows");
                     Equal(r, ring0, "committed ring untouched");
                     Equal(tail, tail0, "committed tail untouched");
                     Equal(tailScore, tailScore0, "tail score untouched");

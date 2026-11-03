@@ -125,6 +125,9 @@ namespace fastllm {
         // Full verifier graphs retain their own buffers and request descriptors.
         // This callback commits an accepted prefix without materializing per-layer views.
         std::function<void(int)> commitKV;
+        // Attention DP: target KV and rollback scratch belong to the request's
+        // TP ranks. The parent alone owns sampling and draft/main features.
+        std::vector<std::shared_ptr<DeepSeekV41SpecScratch>> attentionRanks;
         std::vector<int> prevRawTail;         // kv source 层：前向之前的 rawTail 行数
         std::vector<int> prevBlocks;          // kv source 层：前向之前的压缩块数
         std::vector<int> tokens, draftTokens;
@@ -437,6 +440,8 @@ namespace fastllm {
         struct EngramPrefetch;
         struct ForwardWorkspace;
         void RunAttentionParallel(ForwardWorkspace &, int layer);
+        void CommitAttentionParallel(DeepSeekV41RequestState &, DeepSeekV41SpecScratch &,
+                                     int startPos, int accept, int forwarded);
         struct ForwardState;
         void PrepareForward(ForwardWorkspace &);
         void PrepareForwardInputs(ForwardWorkspace &);

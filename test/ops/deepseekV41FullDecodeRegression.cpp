@@ -264,8 +264,8 @@ int main(int argc, char **argv) {
         ApplyDeviceMap({{"cpu", 1}}, 0, 1);
         FastllmCudaSetDevice(0);
         if (locality) { RunAttentionLocalityRegression(devices); return 0; }
+        if (verify) { RunVerifyRegression(fp4 ? 3 : fp8 ? 1 : 0); return 0; }
         if (fp8 || fp4) { RunPackedDecodeRegression(fp4); return 0; }
-        if (verify) { RunVerifyRegression(); return 0; }
         if (fp16Attention) { RunFp16AttentionRegression(); return 0; }
         RunRotaryCrossPathRegression();
         int checked = 0;

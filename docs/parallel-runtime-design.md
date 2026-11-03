@@ -1,6 +1,6 @@
 # 通用 Attention DP 与 TP 并行运行时设计
 
-状态：已接通运行时、DeepSeek V4.1 适配器、bounded prefill 及普通 decode 整轮 CUDA Graph。下节描述当前实现；其余章节保留完整目标设计，不能视为所有阶段均已交付。
+状态：已接通运行时、DeepSeek V4.1 适配器、bounded prefill、DSpark 及普通 decode / 验证整轮 CUDA Graph。下节描述当前实现；其余章节保留完整目标设计，不能视为所有阶段均已交付。
 
 ## 当前实现
 
@@ -9,12 +9,16 @@
 ```sh
 FASTLLM_CUDA_GRAPH=1 ftllm serve MODEL --tp 8 --attn-dp-size 4 \
   --moe_device multicuda:0,1,2,3,4,5,6,7 --ngram_device cuda \
-  --kv_cache_dtype fp4_e2m1 --fast_prefill --max_batch 64
+  --kv_cache_dtype fp4_e2m1 --fast_prefill --dspark 5 --max_batch 64
 ```
 
-启动时需要选择纯 GPU 专家路径；不支持的模型、设备数、专家布局或推测解码会明确报错。使用已有 `FASTLLM_CUDA_GRAPH=1` 开启 decode 图，关闭时保留 eager 路径。尚不支持 DSpark 或混合专家推理。
+启动时需要选择纯 GPU 专家路径；不支持的模型、设备数、专家布局或其它推测算法会明确报错。使用已有 `FASTLLM_CUDA_GRAPH=1` 开启 decode / 验证图，关闭时保留 eager 路径。尚不支持混合专家推理。
 
 `--fast_prefill` 仍使用模型已有的近似 bounded replay：完整生成共享 KV 后，父级和各 attention 组同步裁剪 hidden、HC 系数及 query 索引；cache-only chunk 同步推进各 rank 的请求位置。图像输入和 DSpark 验证不裁剪候选行，未启用时保持原 prefill 语义。
+
+DSpark 沿用原调度策略：仅一个活动请求时生成候选，多请求合批时执行普通推理并同步草稿状态；这时仍需采集草稿特征，当前使用分段/eager 路径，不进入普通 decode 整图。草稿模型继续使用原全局 TP 路径；主模型验证的 KV、暂存候选及部分接受回滚只位于该请求所属 Attention TP 组，每卡固定 worker 复用已有提交算子。没有将主模型 KV 临时复制到全局 TP，也没有改变拒绝采样算法。
+
+2～8 行验证支持 BF16、FP8、FP4 KV 整图；每张卡每轮发射一张主模型图，组外卡仍参与全局 FFN/EP。验证候选、主干特征、动态 KV 描述符与提交缓冲由图持有，接受长度确定后更新所属组的滑窗、压缩块与 raw tail。候选长度或活动组分布不匹配现有图时使用同一 placement 的分段/eager 路径；不会借用另一个组的 KV。
 
 普通 decode 在预热阶段复用局部投影图和已有动态 KV/稀疏 attention 算子，将选行、Attention TP 归约、合并收集、Engram、全局 FFN/router/MoE 及输出头组成每卡每轮一张图。BF16、FP8、FP4 KV 共用同一组成路径；输入 embedding 和最终采样仍在图外。请求的 KV 地址与位置逐轮上传，行置换更新到图持有的稳定缓冲区。
 
@@ -32,11 +36,13 @@ Attention TP 宽度变化仍会改变 `W_oB` 局部矩阵乘法的 BF16 舍入�
 
 当前按存活请求长度平衡 placement，**尚未实现设计中的逐设备显存准入账本**；原调度器 token 预算仍有效，不能直接将其放大 DP 倍数。MLA KV 的副本数确实降为 Attention TP 宽度，但 Attention 权重复制、workspace 与负载偏斜也需要占用显存。原生 DP→EP 路由和其他模型适配属于后续阶段。
 
-原 TP 路径和 Attention DP 路径均支持普通 FP4 KV decode 整图。当前动态 attention 每组最多 16 行，因此整图总 batch 上限随 DP 组数变化；这不是服务合批上限，超出的 batch 保留分段/eager 路径。
+原 TP 路径和 Attention DP 路径均支持普通 FP4 KV decode 整图。原 TP 动态 attention 支持最多 128 行；当前 DP 整图仍限制每组最多 16 行，因此其整图总 batch 上限随 DP 组数变化。这不是服务合批上限，超出的 batch 保留分段/eager 路径。
 
 可复现检查：CPU 的 `parallel_topology_test`，八卡的 `parallelRuntimeRegression`，以及 `test/basic/test_deepseek_v41_attention_parallel.py --binary BUILD/deepseekV41AttentionParallelRegression --full-graphs`。模型检查覆盖 BF16/FP4 KV、四种布局、混合长度、解码、KV 物理归属、跨组前缀恢复、请求复用和跨布局 teacher-forced logits；需要 NumPy，生成 fixture 另需 PyTorch 与 safetensors。
 
-追加 `--fast-prefill` 检查 bounded / cache-only prefill。
+追加 `--fast-prefill` 检查 bounded / cache-only prefill。原生程序的 `FIXTURE DP OUTPUT verify graph [fp4|fp8]` 模式逐字节比较 eager 与验证图的 token、主干特征和提交后的 KV，覆盖 2～8 行、各接受长度、滑窗环绕和请求组切换。单算子 `deepseekV41FullVerify`、`deepseekV41FullVerifyFP8`、`deepseekV41FullVerifyFP4` 覆盖动态 attention 的因果性、压缩边界和缓存地址变化。
+
+实际宽度可用 `verify-run graph` 在两个独立进程中比较：一侧将已有 `FASTLLM_DSV41_CUDA_GRAPH_WARMUP` 设为大于测试轮数，另一侧保留默认预热轮数。这样两边采用相同的融合算子，只改变是否捕图，避免把合并 QKV 等算子的舍入差异误判为回放错误。
 
 目标是在同一模型实例内组合 Attention DP、Attention TP 和 MoE EP/TP，并让每张 GPU 始终由一个固定工作线程负责。DeepSeek V4.1 是首个接入模型；分组、通信、张量布局、请求归属和生命周期管理不依赖其层数、head 数、KV 格式或推测解码算法。
 
@@ -307,7 +313,7 @@ prefill 预算需要覆盖多个 attention 组，避免调度器始终只投喂�
 
 采样由每个逻辑请求的指定 rank 负责，结果广播到其 TP 组。随机数流按请求 seed、requestEpoch、阶段和抽样计数管理，不使用物理 GPU 编号决定随机序列。改变分片可能改变浮点舍入，但不能重复抽样或因 padding 消耗随机数。
 
-当前 DSV4.1 的多请求路径没有 batched DSpark。新 Attention DP 首期显式关闭该组合，旧 TP DSpark 服务路径继续保留。请求数量下降到 1 时也不能自动切到旧 TP DSpark：其 KV 布局不同。后续支持时，各请求可以有不同接受长度，但组内必须共识提交范围、草稿分布和返回 token。
+当前 DSV4.1 的多请求路径没有 batched DSpark。Attention DP 已支持单活动请求的 DSpark 验证与提交，请求数量变化时保留原 Attention TP 组及 KV 布局；草稿保持原全局 TP。后续扩展 batched DSpark 时，各请求可以有不同接受长度，但组内必须共识提交范围、草稿分布和返回 token。
 
 ## CUDA Graph 与异步资源
 

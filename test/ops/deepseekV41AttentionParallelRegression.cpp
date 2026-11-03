@@ -12,6 +12,12 @@ using namespace fastllm;
 struct Access : DeepSeekV41Model {
     using DeepSeekV41Model::ForwardSegments;
     using DeepSeekV41Model::decoderSwaTailLayer;
+    using DeepSeekV41Model::DsparkCommitPrefix;
+    using DeepSeekV41Model::ApplyDsparkDevice;
+    using DeepSeekV41Model::v41DsparkEnabled;
+    using DeepSeekV41Model::v41DsparkTpDevices;
+    using DeepSeekV41Model::v41DsparkTargetLayerIds;
+    using DeepSeekV41Model::v41IsDsparkTarget;
     using DeepSeekV41Model::SnapshotState;
     using DeepSeekV41Model::RestoreState;
     using DeepSeekV41Model::GetOrCreateState;
@@ -88,14 +94,83 @@ static void CheckOwnership(const DeepSeekV41RequestState &state, int dp) {
         }
     }
 }
+// Use actual target features and committed KV as the oracle for graph replay.
+// All acceptance lengths are exercised; a rejected suffix must never reappear.
+static void WriteTensor(std::ofstream &file, const Data &source) {
+    uint64_t count = source.dims.empty() ? 0 : 1;
+    for (int d : source.dims) count *= d;
+    const uint64_t bytes = count * source.unitSize / source.unitSizeDiv;
+    file.write(reinterpret_cast<const char*>(&bytes), sizeof(bytes));
+    if (!bytes) return;
+    const Data &local = source.multiDeviceData ? *source.multiDeviceDatas.begin()->second : source;
+    const int previous = FastllmCudaGetDevice();
+    FastllmCudaSetDevice(local.dataDeviceIds.empty() ? 0 : local.dataDeviceIds.front());
+    Data copy; copy.CopyFrom(local); copy.ToDevice(CPU);
+    FastllmCudaSetDevice(previous);
+    // Cache allocation strides can exceed the live logical row count.
+    file.write(reinterpret_cast<const char*>(copy.cpuData), bytes);
+}
+static void VerifyRequests(DeepSeekV41Model &model, int dp, std::ofstream &file) {
+    model.*(&Access::v41DsparkEnabled) = true;
+    model.*(&Access::v41DsparkTpDevices) = {0,1,2,3,4,5,6,7};
+    (model.*(&Access::ApplyDsparkDevice))(false);
+    auto &targets = model.*(&Access::v41DsparkTargetLayerIds);
+    targets.clear();
+    for (int layer = 0; layer < model.block_cnt; ++layer) targets.push_back(layer);
+    auto &mask = model.*(&Access::v41IsDsparkTarget);
+    mask.assign(model.block_cnt, false);
+    for (int layer : targets) mask[layer] = true;
+    for (int owner : {0, dp - 1, 0}) {
+        auto state = std::make_shared<DeepSeekV41RequestState>();
+        state->layers.resize(model.block_cnt);
+        if (dp > 1) { state->attentionGroup = owner; state->attentionRanks.resize(8 / dp); }
+        const auto prefill = Step(model, {state}, {17}, 3);
+        file.write(reinterpret_cast<const char*>(prefill.data()), prefill.size() * sizeof(float));
+        for (int width = 2; width <= 8; ++width) for (int round = 0; round < width + 4; ++round) {
+            DeepSeekV41SpecScratch scratch;
+            scratch.captureMain = scratch.deferWindow = scratch.wantAllTokens = true;
+            scratch.windowKV.resize(model.block_cnt); scratch.rawKV.resize(model.block_cnt);
+            scratch.rawScore.resize(model.block_cnt); scratch.prevRawTail.resize(model.block_cnt);
+            scratch.prevBlocks.resize(model.block_cnt);
+            DeepSeekV41Segment seg;
+            seg.state = state; seg.startPos = state->totalLen; seg.seqlen = width; seg.spec = &scratch;
+            std::vector<float> tokens(width);
+            for (int i = 0; i < width; ++i) tokens[i] = (seg.startPos + i) * 17 % 123 + 3;
+            Data ids(FLOAT32, {1,width}, tokens);
+            std::vector<Data> dummy(2 * model.block_cnt);
+            std::vector<std::pair<Data*,Data*>> past;
+            for (size_t i = 0; i < dummy.size(); i += 2) past.emplace_back(&dummy[i], &dummy[i+1]);
+            GenerationConfig config; config.do_sample = false; config.top_k = 1;
+            LastTokensManager last(1,64);
+            (model.*(&Access::ForwardSegments))({seg}, ids, nullptr, nullptr, {config}, last, nullptr, past);
+            Require(scratch.tokens.size() == size_t(width), "missing verification outputs");
+            Require(scratch.mainHidden.size() == targets.size(), "missing DSpark main features");
+            const int record[] = {owner, width, round, seg.startPos};
+            file.write(reinterpret_cast<const char*>(record), sizeof(record));
+            file.write(reinterpret_cast<const char*>(scratch.tokens.data()), width * sizeof(int));
+            for (auto &hidden : scratch.mainHidden) WriteTensor(file, hidden);
+            const int accept = 1 + round % width;
+            (model.*(&Access::DsparkCommitPrefix))(*state, scratch, seg.startPos, accept, width);
+            Require(state->totalLen == seg.startPos + accept, "parent rollback position");
+            CheckOwnership(*state, dp);
+            auto snapshot = (model.*(&Access::SnapshotState))(*state, std::vector<int>(state->totalLen, 3));
+            Require(bool(snapshot), "committed prefix snapshot missing");
+            for (const auto &cache : snapshot->layers) {
+                for (const Data *data : {&cache.windowKV, &cache.compressedKV, &cache.indexK}) WriteTensor(file, *data);
+                if (cache.rawTail) { WriteTensor(file, cache.rawTailKV); WriteTensor(file, cache.rawTailScore); }
+            }
+        }
+        std::cout << "PASS verify owner=" << owner << " widths=2..8, all accepted prefixes, wrap and snapshots\n";
+    }
+}
 int main(int argc, char **argv) {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices < 8) return 77;
     try {
-        Require(argc >= 4 && argc <= 11, "usage: regression FIXTURE_DIR ATTENTION_DP OUTPUT [fp4|fp8] [single-group] [reorder] [sampling] [graph|full-graph] [large-batch]");
+        Require(argc >= 4 && argc <= 11, "usage: regression FIXTURE_DIR ATTENTION_DP OUTPUT [fp4|fp8] [single-group] [reorder] [sampling] [graph|full-graph] [large-batch] [verify|verify-run]");
         const int dp = std::stoi(argv[2]);
         bool fp4 = false, fp8 = false, singleGroup = false, reorder = false, graph = false, full = false;
-        bool sampling = false, largeBatch = false;
+        bool sampling = false, largeBatch = false, verify = false, verifyRun = false;
         for (int i = 4; i < argc; ++i) {
             const std::string option = argv[i];
             if (option == "graph") graph = true;
@@ -106,6 +181,8 @@ int main(int argc, char **argv) {
             else if (option == "reorder") reorder = true;
             else if (option == "sampling") sampling = true;
             else if (option == "large-batch") largeBatch = true;
+            else if (option == "verify") verify = true;
+            else if (option == "verify-run") verify = verifyRun = true;
             else throw std::invalid_argument("unknown regression option");
         }
         SetCudaGraph(graph); SetThreads(2); SetCudaSharedExpert(true);
@@ -119,6 +196,31 @@ int main(int argc, char **argv) {
         model.ConfigureAttentionParallel(dp);
         Access::WarmGraphs(model, graph);
         std::ofstream file(argv[3], std::ios::binary);
+        if (verify) {
+            // Initialize CUDA libraries with the requested graph policy, as
+            // serve does. cuBLAS handles created with graphs disabled do not
+            // have the persistent workspace required for child-graph composition.
+            VerifyRequests(model, dp, file);
+            Require(bool(file), "cannot write verification outputs");
+            file.close();
+            // verify-run lets separate processes compare graph replay against
+            // graph-compatible eager kernels (capture delayed by warmup rounds).
+            if (graph && !verifyRun) {
+                SetCudaGraph(false); Access::WarmGraphs(model, false);
+                std::ofstream eager(std::string(argv[3]) + ".eager", std::ios::binary);
+                VerifyRequests(model, dp, eager);
+                Require(bool(eager), "cannot write eager verification outputs");
+                eager.close();
+                std::ifstream reference(std::string(argv[3]) + ".eager", std::ios::binary);
+                std::ifstream actual(argv[3], std::ios::binary);
+                Require(bool(reference) && bool(actual), "cannot read verification outputs");
+                std::vector<char> expected((std::istreambuf_iterator<char>(reference)), {});
+                std::vector<char> got((std::istreambuf_iterator<char>(actual)), {});
+                Require(expected == got, "verify graph/eager tokens, main features or committed KV differ");
+                std::cout << "PASS verify graph/eager bitwise equal " << got.size() << " bytes\n";
+            }
+            return 0;
+        }
         const std::vector<int> batches = largeBatch ? std::vector<int>{17, 32, 64, 128} :
                                                      std::vector<int>{1, 3, 9, 32};
         for (int batch : batches) {

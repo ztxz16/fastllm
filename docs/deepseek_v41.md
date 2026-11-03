@@ -336,15 +336,17 @@ ftllm server /path/to/DeepSeek-V4.1-Flash --auto --fast_prefill
 
 ## decode 与 DSpark 校验的 CUDA Graph
 
-`FASTLLM_CUDA_GRAPH=1` 在启动预热时捕获普通 decode 图。按照 `max_batch` 预热 1、2、4 等二次幂，以及配置的最大 batch；未预热的 batch 或失效图使用 eager，不在普通请求内重新捕获。DSpark 目标验证仍保留独立的分段图。
+`FASTLLM_CUDA_GRAPH=1` 在启动预热时捕获普通 decode 图。按照 `max_batch` 预热 1、2、4 等二次幂，以及配置的最大 batch；未预热的 batch 或失效图使用 eager，不在普通请求内重新捕获。DSpark 目标验证使用独立的图槽，兼容形状可进一步组成整图。
 
-GPU 执行模式下，单请求文本 decode 满足以下条件时，会进一步组成每卡一张整图：
+GPU 执行模式下，文本 decode / DSpark 验证满足以下条件时，会进一步组成每卡一张整图：
 
 - `--ngram_device cuda`，全部 Engram 表均已成功放到 GPU；
-- 普通 BF16 KV，未开启 DSpark，兼容的 TP head 分片；
+- 普通 decode 支持 BF16、FP8 或 FP4 KV，且不需要采集草稿特征；2～8 行 DSpark 验证支持 BF16 KV，Attention DP 验证还支持 FP8 / FP4 KV；TP head 分片需要兼容；
 - 当前支持的 512 维 Full Attention、128 维 Indexer、四路 HC 布局。
 
 整图包含各层投影、归一化、动态 KV 更新、Indexer、Attention、路由专家、共享专家、Engram GPU 计算及 LM head。每个 decode step 每张卡只调用一次 `cudaGraphLaunch`，上下文长度和 KV 地址通过固定元数据缓冲更新，不随上下文增长重新捕获。请求准备、embedding 输入准备、Engram 地址计算和采样仍在图外；不能把它理解为整个 HTTP 请求只有一个 GPU 操作。
+
+`--attn-dp-size` 可与 `--fast_prefill`、DSpark 及验证整图组合。请求 KV 和部分接受后的提交仍只位于所属 Attention TP 组；草稿模型保留全局 TP。多请求合批仍执行普通推理，不生成 batched DSpark 候选。具体布局、整图匹配条件及回退见 [并行运行时说明](parallel-runtime-design.md#当前实现)。
 
 启动日志出现以下信息，才表示整图已就绪：
 

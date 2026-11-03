@@ -1706,6 +1706,10 @@ if (UNIT_TEST)
                 "PASS [0-9]+ FP4 full decode rows" 900 --fp4 --long-context)
             fastllm_add_checked_test(deepseekV41FullVerify deepseekV41FullDecodeRegression
                 "PASS [0-9]+ full verify graph replays" 300 --verify)
+            fastllm_add_checked_test(deepseekV41FullVerifyFP8 deepseekV41FullDecodeRegression
+                "PASS [0-9]+ full verify graph replays" 900 --verify --fp8)
+            fastllm_add_checked_test(deepseekV41FullVerifyFP4 deepseekV41FullDecodeRegression
+                "PASS [0-9]+ full verify graph replays" 900 --verify --fp4)
             fastllm_add_checked_test(deepseekV41AttentionLocality deepseekV41FullDecodeRegression
                 "PASS [0-9]+ attention locality checks" 60 --locality)
             fastllm_add_checked_test(deepseekV41VerifyIndexHeads17 deepseekV41FullDecodeRegression
@@ -1721,7 +1725,8 @@ if (UNIT_TEST)
             set_tests_properties(deepseekV41FullDecode deepseekV41FullDecodeStress
                 deepseekV41FullDecodeFP8 deepseekV41FullDecodeFP8LongContext
                 deepseekV41FullDecodeFP4 deepseekV41FullDecodeFP4LongContext
-                deepseekV41FullDecodePooled deepseekV41FullVerify deepseekV41VerifyIndexHeads17 deepseekV41AttentionLocality
+                deepseekV41FullDecodePooled deepseekV41FullVerify deepseekV41FullVerifyFP8 deepseekV41FullVerifyFP4
+                deepseekV41VerifyIndexHeads17 deepseekV41AttentionLocality
                 deepseekV41FullDecodeLongContext deepseekV41FullVerifyLongContext
                 deepseekV41CandidateReuse deepseekV41CandidateReuseVerify
                 PROPERTIES LABELS cuda RUN_SERIAL TRUE)

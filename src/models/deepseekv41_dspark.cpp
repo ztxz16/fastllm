@@ -1902,6 +1902,12 @@ namespace fastllm {
                                               int startPos, int accept, int forwarded) {
         AssertInFastLLM(accept >= 1 && accept <= forwarded,
                         "DeepSeekV41 DSpark: invalid accepted prefix length.");
+        if (v41AttentionDP > 1) {
+            CommitAttentionParallel(state, scratch, startPos, accept, forwarded);
+            state.totalLen = startPos + accept;
+            if ((int)state.engramHistory.size() > state.totalLen) state.engramHistory.resize(state.totalLen);
+            return;
+        }
         ApplyDeviceMap(this->deviceMap, block_cnt, block_cnt);
         const int newLen = startPos + accept;
         bool batchedWindows = false, batchedTails = false;

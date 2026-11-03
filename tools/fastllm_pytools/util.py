@@ -2038,8 +2038,8 @@ def make_normal_llm_model(args, startup_progress = None):
         world = _thread_tp_cuda_device_count(getattr(args, "tp", ""))
         if world < attention_dp or world % attention_dp:
             raise ValueError("--attn-dp-size must divide the total --tp device count")
-        if speculative_algorithm not in ("", "none"):
-            raise ValueError("Attention DP does not yet support speculative decoding")
+        if speculative_algorithm not in ("", "none", "dspark"):
+            raise ValueError("Attention DP currently supports DSpark or ordinary decoding")
     _configure_qwen35_auto_fast_paths(args, is_qwen35_model, mtp)
     os.environ["FASTLLM_DSV41_DECODER_SWA_BOUNDED_REPLAY"] = (
         "1" if _arg_enabled(getattr(args, "fast_prefill", False)) else "0")

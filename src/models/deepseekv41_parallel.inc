@@ -30,6 +30,22 @@ struct DeepSeekV41Model::AttentionParallel {
     }
 };
 
+// Called before worker dispatch and also when a full graph bypasses the frame.
+static void V41PrepareAttentionSpec(DeepSeekV41SpecScratch &parent, int tp, int layers) {
+    parent.attentionRanks.resize(tp);
+    for (auto &scratch : parent.attentionRanks) {
+        if (scratch) continue;
+        scratch = std::make_shared<DeepSeekV41SpecScratch>();
+        scratch->deferWindow = parent.deferWindow;
+        scratch->wantAllTokens = parent.wantAllTokens;
+        scratch->windowKV.resize(layers);
+        scratch->rawKV.resize(layers);
+        scratch->rawScore.resize(layers);
+        scratch->prevRawTail.resize(layers);
+        scratch->prevBlocks.resize(layers);
+    }
+}
+
 struct DeepSeekV41Model::AttentionParallelFrame {
     struct RankStep {
         std::vector<DeepSeekV41Segment> segments;
@@ -57,6 +73,9 @@ struct DeepSeekV41Model::AttentionParallelFrame {
         const auto &topology = runtime.Layout();
         transfer.Reserve(size_t(parent.dim) * sizeof(uint16_t) +
             size_t(2 * parent.model.hc_mult + parent.model.hc_mult * parent.model.hc_mult) * sizeof(float));
+        for (const auto &seg : parent.inputSegments)
+            if (seg.spec && seg.spec->deferWindow)
+                V41PrepareAttentionSpec(*seg.spec, topology.attentionTP, parent.model.block_cnt);
         for (int rank = 0; rank < topology.Size(); ++rank) ranks.emplace_back(new RankStep);
         runtime.Run([&](int rank, int device) {
             auto &step = *ranks[rank];
@@ -93,6 +112,8 @@ struct DeepSeekV41Model::AttentionParallelFrame {
                 AssertInFastLLM(local->totalLen == seg.startPos, "Attention DP request position mismatch");
                 DeepSeekV41Segment segment = seg;
                 segment.state = local; segment.offset = offset;
+                segment.spec = seg.spec && seg.spec->deferWindow ?
+                    seg.spec->attentionRanks.at(topology.AttentionRank(rank)).get() : nullptr;
                 step.segments.push_back(segment);
                 step.configs.push_back(parent.generationConfigsIn[i]);
                 for (int j = 0; j < seg.seqlen; ++j) tokens.push_back(parent.tokenIds[seg.offset + j]);
@@ -140,8 +161,8 @@ void DeepSeekV41Model::ConfigureAttentionParallel(int dp) {
     ApplyDeviceMap(deviceMap, 1, block_cnt);
     auto devices = V41TpDevices(deviceMap);
     parallel::Topology topology(devices, dp, devices.size());
-    if (executionMode != ExecutionMode::Gpu || v41DsparkEnabled)
-        throw std::invalid_argument("attention DP requires GPU experts and no DSpark");
+    if (executionMode != ExecutionMode::Gpu)
+        throw std::invalid_argument("attention DP requires GPU experts");
     if (o_groups % topology.attentionTP || num_attention_heads % topology.attentionTP)
         throw std::invalid_argument("attention heads/output groups are not divisible by attention TP");
     for (int layer = 0; layer < block_cnt; ++layer)
@@ -172,7 +193,11 @@ void DeepSeekV41Model::PrepareAttentionParallel() {
         local->dataType = dataType; local->kvCacheDataType = kvCacheDataType;
         local->v41MoeCudaGraphCompatible = true;
         local->engram_layer_ids.clear(); local->engramTables.clear();
-        local->v41DsparkEnabled = false; local->decoderSwaTailLayer = decoderSwaTailLayer;
+        local->v41DsparkEnabled = false;
+        local->v41DsparkTpDevices.clear();
+        local->v41DsparkTargetLayerIds.clear();
+        local->v41IsDsparkTarget.clear();
+        local->decoderSwaTailLayer = decoderSwaTailLayer;
         local->num_attention_heads /= topology.attentionTP;
         local->o_groups /= topology.attentionTP;
         local->v41AttentionRankRuntime = &state->runtime;
@@ -289,10 +314,27 @@ void DeepSeekV41Model::RunAttentionParallel(ForwardWorkspace &f, int layer) {
         frame.transfer.Collect(rank, fields, 4);
     });
 }
+void DeepSeekV41Model::CommitAttentionParallel(DeepSeekV41RequestState &state,
+        DeepSeekV41SpecScratch &scratch, int startPos, int accept, int forwarded) {
+    auto &parallel = *v41AttentionParallel;
+    const auto &layout = parallel.runtime.Layout();
+    AssertInFastLLM(state.attentionGroup >= 0 && state.attentionGroup < layout.attentionDP &&
+        state.attentionRanks.size() == size_t(layout.attentionTP) &&
+        scratch.attentionRanks.size() == size_t(layout.attentionTP), "invalid attention DP commit state");
+    parallel.runtime.Run([&](int rank, int) {
+        if (layout.AttentionOwner(rank) != state.attentionGroup) return;
+        const int t = layout.AttentionRank(rank);
+        AssertInFastLLM(state.attentionRanks[t] && scratch.attentionRanks[t], "missing rank rollback state");
+        parallel.models[rank]->DsparkCommitPrefix(*state.attentionRanks[t], *scratch.attentionRanks[t],
+            startPos, accept, forwarded);
+    });
+}
 #else
 void DeepSeekV41Model::ConfigureAttentionParallel(int dp) {
     if (dp != 1) throw std::invalid_argument("attention DP requires CUDA");
 }
 void DeepSeekV41Model::PrepareAttentionParallel() {}
 void DeepSeekV41Model::RunAttentionParallel(ForwardWorkspace &, int) {}
+void DeepSeekV41Model::CommitAttentionParallel(DeepSeekV41RequestState &, DeepSeekV41SpecScratch &,
+        int, int, int) { throw std::runtime_error("attention DP requires CUDA"); }
 #endif

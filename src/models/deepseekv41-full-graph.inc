@@ -196,14 +196,18 @@ bool V41FullPartition(V41FullGraph &g, const std::vector<DeepSeekV41Segment> &se
     std::vector<int> owners;
     local.assign(topology.Size(), {});
     for (const auto &s : segments) {
-        if (!s.state || s.spec || s.seqlen != 1 || s.startPos < 1 ||
+        const bool mode = g.verifying ? segments.size() == 1 && s.spec &&
+            s.spec->deferWindow && s.spec->wantAllTokens && s.seqlen == g.batch : !s.spec && s.seqlen == 1;
+        if (!s.state || !mode || s.startPos < 1 ||
             s.state->attentionGroup < 0 || s.state->attentionGroup >= topology.attentionDP ||
             s.state->attentionRanks.size() != size_t(topology.attentionTP)) return false;
-        owners.push_back(s.state->attentionGroup);
+        owners.insert(owners.end(), s.seqlen, s.state->attentionGroup);
+        if (g.verifying) V41PrepareAttentionSpec(*s.spec, topology.attentionTP, s.state->layers.size());
         for (int t = 0; t < topology.attentionTP; ++t) {
             const int rank = s.state->attentionGroup * topology.attentionTP + t;
             auto part = s;
             part.state = s.state->attentionRanks[t];
+            if (g.verifying) part.spec = s.spec->attentionRanks[t].get();
             if (!part.state) return false;
             part.offset = local[rank].size();
             local[rank].push_back(std::move(part));
@@ -212,7 +216,9 @@ bool V41FullPartition(V41FullGraph &g, const std::vector<DeepSeekV41Segment> &se
     rows = parallel::RowPartition(topology.attentionDP, owners);
     if (!g.attentionGraphs.empty()) for (int r = 0; r < topology.Size(); ++r) {
         const auto &graph = g.attentionGraphs[r];
-        if (local[r].size() != size_t(graph ? graph->batch : 0)) return false;
+        int count = 0;
+        for (const auto &part : local[r]) count += part.seqlen;
+        if (count != (graph ? graph->batch : 0)) return false;
         if (graph && (!g.attentionStates[r]->captured || g.attentionStates[r]->disabled ||
             g.attentionStates[r]->fullDecode != graph)) return false;
     }
@@ -398,6 +404,7 @@ void V41FullBindVerify(const std::shared_ptr<V41FullGraph> &owner, const DeepSee
         scratch.rawScore.resize(layers);
     }
     for (int l = g.firstLayer; l < g.endLayer; ++l) {
+        if (!g.layers[l]) continue;
         const auto &layer = *g.layers[l];
         if (pipeline) borrow(scratch.windowKV[l], layer.savedKV, g.batch);
         if (!layer.config.kvSource) continue;
@@ -409,7 +416,7 @@ void V41FullBindVerify(const std::shared_ptr<V41FullGraph> &owner, const DeepSee
         scratch.prevRawTail[l] = segment.startPos % layer.config.ratio;
         scratch.prevBlocks[l] = segment.startPos / layer.config.ratio;
     }
-    scratch.commitKV = [owner, previous = std::move(scratch.commitKV)](int accepted) {
+    if (!g.attentionRuntime) scratch.commitKV = [owner, previous = std::move(scratch.commitKV)](int accepted) {
         if (previous) previous(accepted);
         const auto &graph = *owner;
         std::vector<int> ok(graph.devices.size(), 0);
@@ -457,8 +464,8 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
         distributedAttention ? 16 * v41AttentionDP : attentionOnly ? 16 : FastllmV41FullDecodeMaxBatch;
     if (batch < 1 || batch > batchLimit || (!hybrid && executionMode != ExecutionMode::Gpu) ||
         (!verifying && v41DsparkEnabled) ||
-        (!hybrid && verifying && (kvCacheDataType == DataType::FP4_E2M1 ||
-            kvCacheDataType == DataType::FP8_E4M3)) ||
+        (!hybrid && !distributedAttention && !attentionOnly && verifying &&
+            (kvCacheDataType == DataType::FP4_E2M1 || kvCacheDataType == DataType::FP8_E4M3)) ||
         (!verifying && !v41CudaGraphWarmingUp) || head_dim_full != 512 || hc_mult != 4 || index_head_dim != 128)
         return;
     // Explicit reference/debug modes must retain their selected arithmetic.
@@ -507,6 +514,7 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
     g->rankMoeHandles.resize(g->devices.size());
     g->rankUntimedExecs.resize(g->devices.size(), nullptr);
     g->rankMoeFirstLayer.resize(g->devices.size(), -1);
+    g->batch = batch; g->verifying = verifying;
     g->attentionOnly = attentionOnly;
     if (attentionOnly) g->attentionLayers.resize(block_cnt);
     if (distributedAttention) {
@@ -527,8 +535,9 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
                 if (rank != r) return;
                 auto &model = *parallel.models[rank];
                 model.v41AttentionLogicalRows = batch;
-                model.BuildFullDecodeGraph(local[rank].size(), local[rank]);
-                const int key = local[rank].size() * 3 + (batch == 1 ? 0 : batch <= 8 ? 1 : 2);
+                const int count = rows.localToGlobal[runtime.Layout().AttentionOwner(rank)].size();
+                model.BuildFullDecodeGraph(count, local[rank]);
+                const int key = verifying ? -count : count * 3 + (batch == 1 ? 0 : batch <= 8 ? 1 : 2);
                 auto found = model.v41CudaGraphSlots.find(key);
                 if (found == model.v41CudaGraphSlots.end()) return;
                 auto state = V41GetCudaGraphState(found->second);
@@ -552,7 +561,6 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
     V41FullCallerAffinity affinity(g->coordinatorCpus);
     g->hostRequests.resize(g->devices.size());
     g->hostPlans.resize(g->devices.size());
-    g->batch = batch;
     // Reserve the configured context before capture. Growing these operands
     // during a live request would invalidate graph addresses and require a
     // warm replay that can modify its KV state. Keep short-context capacity
@@ -562,7 +570,6 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
         contextCapacity = tokensLimit;
     g->maxKeys = hybrid && contextCapacity > 0 ? std::max(index_topk, contextCapacity) :
         std::max(g->maxKeys, contextCapacity);
-    g->verifying = verifying;
     g->pieces = std::make_shared<DeepSeekV41CudaGraphState>();
     g->pieces->PrepareDevices(g->devices, g->tensorParallel);
     auto &ws = *state->workspace;
@@ -1126,7 +1133,7 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
                     handles.data(), handles.size(), &g->rankUntimedExecs[rank]))
                 throw std::runtime_error("TP full graph timing removal failed");
         }
-        if (verifying) {
+        if (verifying && !distributedAttention) {
             g->commitDescriptors.resize(g->devices.size());
             for (size_t rank = 0; rank < g->devices.size(); ++rank) {
                 const int device = g->devices[rank];
@@ -1162,7 +1169,7 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
         if (!attentionOnly) fprintf(stderr,
                 "[Fastllm] DeepSeek-V4.1 full %s graph ready: %s=%d, ranks=%zu, one graph "
                 "per rank/step, layers=[%d,%d), maxKeys=%d\n",
-                distributedAttention ? "DP decode" : verifying ? "verify" : "decode",
+                distributedAttention ? (verifying ? "DP verify" : "DP decode") : verifying ? "verify" : "decode",
                 verifying ? "tokens" : "batch", batch, g->devices.size(), firstLayer, endLayer, g->maxKeys);
     } catch (const std::exception &error) {
         if (poolOpen)
@@ -1191,7 +1198,7 @@ bool DeepSeekV41Model::TryFullDecodeGraph(ForwardWorkspace &f, bool inputsPrepar
     // Keep plain DSpark steps on their feature-producing segmented path.
     if ((v41DsparkEnabled && !f.dsparkVerify) || !f.graphReplay || !f.graphState ||
         (v41CudaGraphWarmingUp && !f.dsparkVerify) ||
-        (f.quantKV && executionMode != ExecutionMode::Hybrid && f.dsparkVerify) ||
+        (f.quantKV && executionMode != ExecutionMode::Hybrid && f.dsparkVerify && v41AttentionDP == 1) ||
         f.hasImageTokens || f.inputEmbeds)
         return false;
     if (f.graphState->fullDecode) {
@@ -1318,6 +1325,10 @@ bool DeepSeekV41Model::TryFullDecodeGraph(ForwardWorkspace &f, bool inputsPrepar
         FastllmCudaSetDevice(g->devices.front());
         for (void *event : g->ready) FastllmCudaCurrentThreadStreamWaitEvent(event);
         V41FullBindVerify(g, f.inputSegments[0], v41DsparkTargetLayerIds);
+        if (g->attentionRuntime) g->attentionRuntime->Run([&](int rank, int) {
+            if (g->attentionGraphs[rank])
+                V41FullBindVerify(g->attentionGraphs[rank], attentionSegments[rank][0], {});
+        });
         if (f.pipeline) f.pipeline->fullVerify = true;
     }
     ++g->replays;
