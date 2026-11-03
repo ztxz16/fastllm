@@ -2347,6 +2347,55 @@ if (UNIT_TEST)
                     PROPERTIES LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 300
                     PASS_REGULAR_EXPRESSION "TP GPU PREFIX PASS")
             endforeach()
+            foreach(NAIVE_SPARSE_DRAFT_KV bf16 fp8)
+                add_test(NAME naive_n05_kvmem_draft_${NAIVE_SPARSE_DRAFT_KV}
+                    COMMAND naive_n05_verify_graph_test 2 kvmem_draft ${NAIVE_SPARSE_DRAFT_KV} 5 16384)
+                add_test(NAME naive_n05_kvmem_draft_prefix_${NAIVE_SPARSE_DRAFT_KV}
+                    COMMAND naive_n05_verify_graph_test 4 kvmem_draft_prefix ${NAIVE_SPARSE_DRAFT_KV})
+                set_tests_properties(naive_n05_kvmem_draft_${NAIVE_SPARSE_DRAFT_KV}
+                    naive_n05_kvmem_draft_prefix_${NAIVE_SPARSE_DRAFT_KV}
+                    PROPERTIES LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 300)
+                set_tests_properties(naive_n05_kvmem_draft_${NAIVE_SPARSE_DRAFT_KV}
+                    PROPERTIES PASS_REGULAR_EXPRESSION "KVMEM DSPARK PASS")
+                set_tests_properties(naive_n05_kvmem_draft_prefix_${NAIVE_SPARSE_DRAFT_KV}
+                    PROPERTIES PASS_REGULAR_EXPRESSION "DSPARK PREFIX PASS")
+            endforeach()
+            add_test(NAME naive_n05_kvmem_draft_small_cache COMMAND naive_n05_verify_graph_test 2 kvmem_draft fp8 5 2048)
+            add_test(NAME naive_n05_kvmem_draft_block3 COMMAND naive_n05_verify_graph_test 2 kvmem_draft bf16 3 16384)
+            add_test(NAME naive_n05_kvmem_draft_block7 COMMAND naive_n05_verify_graph_test 4 kvmem_draft fp8 7 4096)
+            add_test(NAME naive_n05_kvmem_draft_tp8 COMMAND naive_n05_verify_graph_test 8 kvmem_draft fp8 5 16384)
+            add_test(NAME naive_n05_kvmem_draft_warmup COMMAND naive_n05_verify_graph_test 2 kvmem_draft fp8 5 16384)
+            add_test(NAME naive_n05_kvmem_draft_replicated COMMAND naive_n05_verify_graph_test 2 kvmem_draft fp8 5 16384 replicated)
+            add_test(NAME naive_n05_kvmem_draft_scaled_indexer COMMAND naive_n05_verify_graph_test 2 kvmem_draft fp8 5 16384 scaled_fp8)
+            add_test(NAME naive_n05_kvmem_draft_context_shard COMMAND naive_n05_verify_graph_test 4 kvmem_draft fp8 5 16384 context_shard)
+            set_tests_properties(naive_n05_kvmem_draft_small_cache naive_n05_kvmem_draft_block3
+                naive_n05_kvmem_draft_block7 naive_n05_kvmem_draft_tp8 naive_n05_kvmem_draft_warmup
+                naive_n05_kvmem_draft_replicated naive_n05_kvmem_draft_scaled_indexer naive_n05_kvmem_draft_context_shard
+                PROPERTIES LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 300
+                PASS_REGULAR_EXPRESSION "KVMEM DSPARK PASS")
+            set_tests_properties(naive_n05_kvmem_draft_warmup PROPERTIES ENVIRONMENT "FASTLLM_CUDA_SERVING_WARMUP=1")
+            foreach(NAIVE_CONTEXT_DRAFT_RANKS 2 4 8)
+                foreach(NAIVE_CONTEXT_DRAFT_BLOCK 3 5 7)
+                    add_test(NAME naive_n05_context_verify_${NAIVE_CONTEXT_DRAFT_RANKS}_${NAIVE_CONTEXT_DRAFT_BLOCK}
+                        COMMAND naive_n05_verify_graph_test ${NAIVE_CONTEXT_DRAFT_RANKS} kvmem_draft fp8
+                            ${NAIVE_CONTEXT_DRAFT_BLOCK} 8192 context_shard)
+                    set_tests_properties(naive_n05_context_verify_${NAIVE_CONTEXT_DRAFT_RANKS}_${NAIVE_CONTEXT_DRAFT_BLOCK}
+                        PROPERTIES LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 300
+                        PASS_REGULAR_EXPRESSION "KVMEM DSPARK PASS")
+                endforeach()
+            endforeach()
+            add_test(NAME naive_n05_context_verify_warmup
+                COMMAND naive_n05_verify_graph_test 4 kvmem_draft fp8 3 8192 context_shard warmup)
+            set_tests_properties(naive_n05_context_verify_warmup PROPERTIES
+                ENVIRONMENT "FASTLLM_CUDA_SERVING_WARMUP=1" LABELS "cuda;multigpu"
+                SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 300 PASS_REGULAR_EXPRESSION "KVMEM DSPARK PASS")
+            foreach(NAIVE_CONTEXT_DRAFT_FAILURE failbegin failinstantiate)
+                add_test(NAME naive_n05_context_verify_${NAIVE_CONTEXT_DRAFT_FAILURE}
+                    COMMAND naive_n05_verify_graph_test 2 kvmem_draft fp8 3 8192 context_shard ${NAIVE_CONTEXT_DRAFT_FAILURE})
+                set_tests_properties(naive_n05_context_verify_${NAIVE_CONTEXT_DRAFT_FAILURE}
+                    PROPERTIES LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 300
+                    PASS_REGULAR_EXPRESSION "KVMEM DSPARK PASS")
+            endforeach()
             add_test(NAME naive_n05_serving_large COMMAND naive_n05_verify_graph_test 4 serving_large)
             set_tests_properties(naive_n05_serving_large
                 PROPERTIES LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 300

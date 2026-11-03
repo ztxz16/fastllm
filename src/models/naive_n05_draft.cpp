@@ -658,7 +658,14 @@ bool NaiveN05FlashModel::RunDraftSamplingStep(int previous, int step, const Data
 
 void NaiveN05FlashModel::ApplyDraftDevice() {
     if (tpDevices.empty()) ApplyDeviceMap(deviceMap, block_cnt, block_cnt);
-    else ApplyDeviceMap({{"cuda:" + std::to_string(tpDevices.front()), 1}}, 1, 1);
+    else {
+        ApplyDeviceMap({{"cuda:" + std::to_string(tpDevices.front()), 1}}, 1, 1);
+#ifdef USE_CUDA
+        // The dispatcher does not select the CUDA context. Events and raw
+        // stream operations must use the draft owner's device as well.
+        FastllmCudaSetDevice(tpDevices.front());
+#endif
+    }
 }
 
 Data &NaiveN05FlashModel::DraftWeight(const std::string &name) {
@@ -960,6 +967,35 @@ void NaiveN05FlashModel::AppendDraftContext(Data &hidden, int start, DraftContex
 #endif
 }
 
+void NaiveN05FlashModel::RestoreDraftPrefix(const PrefixSnapshot &snapshot, int length, DraftContext &context) {
+#ifdef USE_CUDA
+    ApplyDraftDevice();
+    const int rows = std::min(length, draftWindow - 1);
+    Data &shard = snapshot.pool->DraftShard(snapshot.slot);
+    Data local, hidden;
+    Data &storage = context.workspace ? context.workspace->prefixStorage : local;
+    storage.dataType = BFLOAT16; storage.UpdateUnitSize();
+    storage.Resize({1, draftWindow + GetPageLen() - 1, embed_dim});
+    storage.ToDevice(DataDevice::CUDA, {FastllmCudaGetDevice()}, false); storage.Allocate(false);
+    void *src = (uint8_t *)shard.cudaData + snapshot.pool->DraftOffset(snapshot.slot);
+    const size_t bytes = (size_t)rows * embed_dim * sizeof(uint16_t);
+    if (shard.dataDeviceIds.front() == storage.dataDeviceIds.front()) {
+        AssertInFastLLM(FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(storage.cudaData, src, bytes),
+                       "Draft prefix restore failed.");
+    } else {
+        FastllmCudaMemcpyBetweenDevices(storage.dataDeviceIds.front(), storage.cudaData,
+            shard.dataDeviceIds.front(), src, bytes);
+    }
+    hidden.FakeFrom(storage, 0); hidden.Resize({1, rows, embed_dim});
+    AppendDraftContext(hidden, length - rows, context);
+    if (context.workspace) {
+        context.prefixHidden.FreeSpace();
+        context.prefixHidden.FakeFrom(storage, 0); context.prefixHidden.Resize(hidden.dims);
+    } else Copy(hidden, context.prefixHidden);
+    FastllmCudaSyncCurrentThreadStream();
+#endif
+}
+
 void NaiveN05FlashModel::CommitDraftContext(TargetCapture &capture, int tokens,
         DraftContext &context, std::vector<std::pair<Data, Data>> &kv) {
     ApplyDraftDevice();
@@ -1030,10 +1066,20 @@ void NaiveN05FlashModel::CommitDraftContext(TargetCapture &capture, int tokens,
             const int count = std::min(snapshot->length, draftWindow - 1);
             const int begin = snapshot->length - count - start;
             if (begin < 0 || begin + count > rows) continue;
-            AssertInFastLLM(FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(
-                (uint8_t *)prefixPool->draftStorage.cudaData + (size_t)snapshot->slot * prefixPool->draftSlotBytes,
-                (uint16_t *)context.prefixHidden.cudaData + (size_t)begin * embed_dim,
-                (size_t)count * embed_dim * sizeof(uint16_t)), "Draft prefix copy failed.");
+            Data &storage = prefixPool->DraftShard(snapshot->slot);
+            void *dst = (uint8_t *)storage.cudaData + prefixPool->DraftOffset(snapshot->slot);
+            void *src = (uint16_t *)context.prefixHidden.cudaData + (size_t)begin * embed_dim;
+            const size_t bytes = (size_t)count * embed_dim * sizeof(uint16_t);
+            if (storage.dataDeviceIds.front() == hidden.dataDeviceIds.front()) {
+                AssertInFastLLM(FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(dst, src, bytes),
+                               "Draft prefix copy failed.");
+            } else {
+                // Complete the source writes before handing the slot to another
+                // device; the common copy retains its bounded host-staged fallback.
+                FastllmCudaSyncCurrentThreadStream();
+                FastllmCudaMemcpyBetweenDevices(storage.dataDeviceIds.front(), dst,
+                    hidden.dataDeviceIds.front(), src, bytes);
+            }
             snapshot->draftReady = true;
         }
     } else ClearDraftPrefixHidden(context.prefixHidden);

@@ -15,6 +15,7 @@ struct KvMemSparseConfig {
     int maxTokens = 32768;
     int residentTokens = 4096;
     int maxSelected = 2048;    // Must fit in residentTokens, even on a total miss.
+    int maxQueries = 1;        // Rows per owner in a resolve; their worst-case union must fit.
     size_t keyRowBytes = 0;
     size_t valueRowBytes = 0;  // Opaque rows also preserve FP8 scales/padding.
     size_t hostBudgetBytes = size_t(8) << 30;
@@ -28,6 +29,16 @@ struct KvMemSparseConfig {
 
 struct KvMemSparseStats {
     unsigned long long hits = 0, misses = 0, evictions = 0, copiedBytes = 0;
+};
+
+// Host descriptors are copied by value into CUDA kernels, including during
+// capture. Bindings and lengths may change on replay without retaining host memory.
+struct KvMemSparseQuery {
+    const void *key = nullptr;
+    const void *const *keyBinding = nullptr;
+    const int *length = nullptr;
+    const int *selected = nullptr;
+    int tokens = 0, count = 0;
 };
 
 class KvMemSparseCache {
@@ -44,7 +55,8 @@ public:
     void *HostKey(int request);
     void *HostValue(int request);
     // CUDA-visible aliases of the same pinned backing, for fused GPU append
-    // kernels. Direct writes must be append-only; overwrite via Write instead.
+    // kernels. Overwrites require Write, InvalidateTail before the write, or
+    // ResolveQueries(appendedRows=true) before the next attention read.
     void *DeviceHostKey(int request);
     void *DeviceHostValue(int request);
     // Fixed per-request device tables, or nullptr in contiguous mode. The
@@ -71,7 +83,7 @@ public:
     void Write(const int *requests, const int *positions, const void *keys,
                const void *values, int rows, cudaStream_t stream);
 
-    // One row per active owner (duplicate nonnegative request IDs are invalid).
+    // At most maxQueries rows per active owner (one by default).
     // selected has fixed [batch, maxSelected] stride; null means arange.
     // selectedRows optionally supplies one selected pointer per row.
     // counts may be null (all maxSelected entries). Negative/past-length
@@ -91,6 +103,16 @@ public:
                  const int *lengths, const int *selected, const int *counts,
                  int batch, cudaStream_t stream,
                  const int *const *selectedRows = nullptr);
+
+    // Multiple causal queries may share an owner, up to maxQueries. Protect and
+    // fetch their union once, retaining each query's order, duplicates and length.
+    // appendedRows invalidates hot rows at/after the first new query position:
+    // mapped-host writers may overwrite candidates rejected by the previous round.
+    void ResolveQueries(const KvMemSparseQuery *queries, int batch, cudaStream_t stream,
+                        bool appendedRows = false);
+    // Before an eager multi-token append, invalidate any old speculative suffix.
+    // key is DeviceHostKey(owner), or KeyPages(owner) in paged mode.
+    void InvalidateTail(const void *key, int first, cudaStream_t stream);
 
     // Stable outputs for attention: physical token IDs in the original TopK
     // order, [batch,2] K/V bases, and physical bounds (0 for padding/error).

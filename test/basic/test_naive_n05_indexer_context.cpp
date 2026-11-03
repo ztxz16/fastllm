@@ -40,7 +40,7 @@ struct ContextShard {
         view.strides = {size_t(pages * local) * width, size_t(width), 1};
     }
 };
-static void ContextCase(int capacity, int page, int ranks, int batch, int kind, bool uniform, bool graph) {
+static void ContextCase(int capacity, int page, int ranks, int batch, int kind, bool uniform, bool graph, int verifyBlock = 0) {
     DataType type = (kind == 0 || kind == 3) ? BFLOAT16 : FP8_E4M3;
     bool scaled = kind == 2 || kind == 3;
     int width = scaled ? (type == FP8_E4M3 ? 144 : 72) : 128;
@@ -135,8 +135,29 @@ static void ContextCase(int capacity, int page, int ranks, int batch, int kind, 
         Device(result[i], INT32, {1, 2048});
         merged.push_back({&reference, &scratch[0][i], &result[i], i, capacity, nullptr});
     }
+    std::vector<FastllmNaiveDecodeScratch> verifyScratch(ranks);
+    std::vector<std::vector<Data>> verifyOutputs(ranks);
+    std::vector<std::vector<FastllmNaiveVerifyIndexerItem>> verifyItems(ranks);
+    if (verifyBlock) for (int rank = 0; rank < ranks; ++rank) {
+        verifyOutputs[rank].resize(batch);
+        for (int first = 0, group = 0; first < batch; ++group) {
+            const int count = std::min(batch - first, std::max(1, verifyBlock - group % 3));
+            const int past = std::max(0, capacity - count - group * 19);
+            for (int row = 0; row < count; ++row) lengths[first + row] = past + row + 1;
+            verifyItems[rank].push_back({&shards[rank]->view, &verifyOutputs[rank][group],
+                first, count, past, capacity, (const void *const *)bindings[rank].cudaData});
+            first += count;
+        }
+    }
     auto run = [&] {
         Require(FastllmCudaNaiveBatchDecodeIndexer(q, weights, live, refRows, true), "reference dispatch");
+        if (verifyBlock) {
+            for (int rank = 0; rank < ranks; ++rank)
+                Require(FastllmCudaNaiveBatchVerifyIndexer(q, weights, verifyItems[rank], true,
+                    verifyScratch[rank], live, rank, ranks, &candidates, page), "context verify dispatch");
+            FastllmCudaNaiveMergeVerifyIndexer(verifyItems[0], verifyScratch[0], live, candidates, ranks, page);
+            return;
+        }
         for (int rank = 0; rank < ranks; rank++)
             Require(FastllmCudaNaiveBatchDecodeIndexer(q, weights, live, localRows[rank], true, rank, ranks,
                                                        &candidates, page),
@@ -168,11 +189,27 @@ static void ContextCase(int capacity, int page, int ranks, int batch, int kind, 
             captured.Run();
         else
             run();
+        std::vector<int> verified;
+        std::vector<std::vector<unsigned>> verifyScores(ranks);
+        if (verifyBlock) for (int rank = 0; rank < ranks; ++rank)
+            verifyScores[rank] = Read<unsigned>(verifyScratch[rank].indexScores);
+        if (verifyBlock) for (const auto &item : verifyItems[0]) {
+            auto values = Read<int>(*item.indices);
+            verified.insert(verified.end(), values.begin(), values.end());
+        }
         for (int i = 0; i < batch; i++) {
-            Require(Read<int>(result[i]) == Read<int>(refIndices[i]), "context global TopK differs");
+            auto expected = Read<int>(refIndices[i]);
+            if (verifyBlock)
+                Require(std::equal(expected.begin(), expected.end(), verified.begin() + i * 2048),
+                    "context verification global TopK differs");
+            else Require(Read<int>(result[i]) == expected, "context global TopK differs");
             auto scores = Read<unsigned>(refScratch[i].indexScores);
             for (int rank = 0; rank < ranks; rank++) {
-                auto local = Read<unsigned>(scratch[rank][i].indexScores);
+                std::vector<unsigned> local;
+                if (verifyBlock) {
+                    const auto &all = verifyScores[rank];
+                    local.assign(all.begin() + size_t(i) * capacity, all.begin() + size_t(i + 1) * capacity);
+                } else local = Read<unsigned>(scratch[rank][i].indexScores);
                 int p = page / ranks;
                 int count = lengths[i] / page * p + std::clamp(lengths[i] % page - rank * p, 0, p);
                 for (int j = 0; j < count; j++) {
@@ -183,8 +220,8 @@ static void ContextCase(int capacity, int page, int ranks, int batch, int kind, 
         }
         checks++;
     }
-    printf("CONTEXT PASS len=%d page=%d TP=%d B=%d kind=%d uniform=%d graph=%d\n", capacity, page, ranks,
-           batch, kind, uniform, graph);
+    printf("CONTEXT PASS len=%d page=%d TP=%d B=%d kind=%d uniform=%d graph=%d verify=%d\n", capacity, page, ranks,
+           batch, kind, uniform, graph, verifyBlock);
     fflush(stdout);
 }
 static void ContextRope(int ranks, bool scaled) {
@@ -323,7 +360,7 @@ struct NaiveN05PrefixCacheTestAccess : NaiveN05FlashModel {
     }
 };
 } // namespace fastllm
-int main(int argc, char **argv) {
+int main() {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0)
         return 77;
@@ -331,6 +368,13 @@ int main(int argc, char **argv) {
     if (cudaGetDeviceProperties(&properties, 0) != cudaSuccess || properties.major < 8)
         return 77;
     try {
+        for (int ranks : {2, 4, 8})
+            for (int kind : {0, 1, 2, 3})
+                for (int block : {4, 6, 8})
+                    ContextCase(4097, 128, ranks, 17, kind, false, true, block);
+        for (int batch : {1, 4, 128, 512, 1536, 3072})
+            ContextCase(8193, 128, 4, batch, 1, batch == 128, true, 4);
+        ContextCase(200000, 128, 4, 4, 2, false, true, 4);
         for (int ranks : {2, 4, 8})
             for (DataType type : {BFLOAT16, FP8_E4M3})
                 for (bool scaled : {false, true})

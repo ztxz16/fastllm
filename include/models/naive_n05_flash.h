@@ -110,7 +110,14 @@ namespace fastllm {
             std::vector<size_t> offsets;
             size_t slotBytes = 0;
             size_t draftSlotBytes = 0;
-            Data draftStorage{BFLOAT16}; // Normalized draft inputs, only on the draft owner.
+            // Distribute complete normalized-input checkpoints across TP ranks.
+            // Keeping a slot intact also supports peers without direct GPU access.
+            std::vector<Data> draftStorage;
+            static int DraftShardSlots(int slots, int rank, int ranks) {
+                return (slots + ranks - 1 - rank) / ranks;
+            }
+            Data &DraftShard(int slot) { return draftStorage.at(slot % draftStorage.size()); }
+            size_t DraftOffset(int slot) const { return size_t(slot / draftStorage.size()) * draftSlotBytes; }
             // Serialized by historyMutex. Metadata previews never own slots.
             uint64_t historyVersion = 0;
             int SlotCount(int requests, int64_t budget) const {
@@ -222,6 +229,7 @@ namespace fastllm {
                          std::vector<float> *retLogits, LogitsSelection *selection = nullptr);
         void InitDraft();
         void AppendDraftContext(Data &hidden, int start, DraftContext &context);
+        void RestoreDraftPrefix(const PrefixSnapshot &snapshot, int length, DraftContext &context);
         bool AppendDraftContextFused(Data &hidden, int start, DraftContext &context);
         void CommitDraftContext(TargetCapture &capture, int tokens, DraftContext &context,
                                 std::vector<std::pair<Data, Data>> &kv);

@@ -322,10 +322,19 @@ struct FastllmNaiveVerifyIndexerItem {
     int capacity = 0;
     const void *const *cache = nullptr;
 };
+void FastllmCudaNaivePrepareVerifyIndexerScratch(int rows, int capacity, bool fp8Query,
+    FastllmNaiveDecodeScratch &scratch);
 bool FastllmCudaNaiveBatchVerifyIndexer(const fastllm::Data &query,
     const fastllm::Data &weights,
     const std::vector<FastllmNaiveVerifyIndexerItem> &items, bool fp8Query,
-    FastllmNaiveDecodeScratch &scratch, fastllm::Data &liveKeys);
+    FastllmNaiveDecodeScratch &scratch, fastllm::Data &liveKeys,
+    int contextRank = 0, int contextRanks = 1, fastllm::Data *exchange = nullptr,
+    int contextPageLen = 0);
+// Complete the same causal rows after exchanging their local TopK candidates.
+void FastllmCudaNaiveMergeVerifyIndexer(
+    const std::vector<FastllmNaiveVerifyIndexerItem> &items,
+    FastllmNaiveDecodeScratch &scratch, const fastllm::Data &liveKeys,
+    const fastllm::Data &exchange, int contextRanks, int contextPageLen);
 // Collective dispatch must agree across the entire TP group, including mixed GPUs.
 bool FastllmCudaNaiveIndexerContextSupported(const std::vector<int> &devices);
 // Merge rank-major (score bits, logical position) pairs after an all-gather.

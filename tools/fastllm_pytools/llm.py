@@ -3553,7 +3553,9 @@ class model:
         remains available. MiMo/Naive N0.5 supports CUDA TP with an explicit
         max_batch set before KVMem, BF16/FP8 KV and CUDA Graph. Its Indexer stays
         on GPU and preserves exact TopK; prefill stages one layer at a time.
-        MiMo KVMem supports shared paged prefixes and GPU SWA checkpoints; draft models remain disabled.
+        MiMo KVMem supports DSpark, shared paged prefixes and GPU SWA/draft checkpoints.
+        Draft KV remains on GPU; target verification unions sparse queries per request,
+        splitting them into bounded batches when resident_tokens is small.
         Its global physical pool can be set with set_max_tokens / --tokens before
         configuring KVMem, independently of the per-request max_tokens limit.
         host_mib covers all requests, ranks and KV layers (including graph padding).

@@ -80,6 +80,7 @@ extern "C" bool FastllmCudaGraphInstantiate(void *graph, void **exec) {
 using namespace fastllm;
 namespace fastllm {
 struct NaiveN05GraphTestAccess {
+    static auto &DraftPrefixPool(NaiveN05FlashModel &model) { return model.prefixPool; }
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
     static void WatchDraftPrefix(NaiveN05FlashModel &model, const std::vector<std::pair<Data, Data>> &kv) {
         if (!inspectDraftPrefixAllocations) return;
@@ -404,6 +405,133 @@ class Fixture : public NaiveN05FlashModel {
         }
     }
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+    std::vector<float> SparseDraftChecks(bool enabled, int block, int resident, bool graphSupported = true, int chunk = 1024) {
+        draftEnabled = canDoConcurrentForward = true;
+        draftLayers = 2; draftBlock = draftTokens = block;
+        draftHeads = 8; draftKvHeads = 2; draftHeadDim = 32; draftWindow = 1024;
+        draftConfidenceThreshold = 0; draftTargetLayers = {0, 1};
+        AddDraftTestWeights(weight, draftLayers, draftKvHeads, 256, true);
+        maxBatch = 4; max_positions = 16384; SetMaxTokens(65536); SetChunkedPrefillSize(chunk);
+        if (enabled) {
+            KvMemConfig cfg; cfg.enabled = true; cfg.maxTokens = max_positions;
+            cfg.residentTokens = resident; cfg.prefillTokens = chunk; cfg.hostBytes = 1ULL << 30;
+            ConfigureKvMem(cfg);
+        }
+        WarmUp();
+        std::vector<float> result;
+        auto record = [&](const Data &x) {
+            Data host(x); host.ToDevice(DataDevice::CPU);
+            for (size_t i = 0; i < host.Count(0); ++i)
+                result.push_back(host.dataType == FLOAT32 ? ((float *)host.cpuData)[i] :
+                    BFloat16BitsToFloat32(((uint16_t *)host.cpuData)[i]));
+        };
+        using Cache = std::vector<std::pair<Data, Data>>;
+        GenerationConfig config; config.top_k = 0; config.top_p = .95f; config.temperature = 1.f;
+        config.input_token_length = 5000; config.output_token_limit = 128;
+        LogitsSelection selection; selection.cudaLogits = true;
+        for (int wave = 0; wave < 2; ++wave) {
+            std::vector<Cache> kv(4);
+            std::vector<std::shared_ptr<DraftContext>> draft;
+            std::vector<int> past{126, 2047, 2051, 4100};
+            for (int owner = 0; owner < 4; ++owner) {
+                draft.push_back(CreateDraftContext());
+                for (int layer = 0; layer < block_cnt; ++layer) kv[owner].emplace_back(Data(kvCacheDataType), Data(kvCacheDataType));
+                for (int start = 0; start < past[owner]; start += 1024) {
+                    const int count = std::min(1024, past[owner] - start);
+                    std::vector<float> ids(count), positions(count);
+                    for (int row = 0; row < count; ++row) { ids[row] = (start + row + owner * 7 + wave) % 251; positions[row] = start + row; }
+                    TargetCapture capture; capture.selection = &selection;
+                    Data logits = RunDraftTarget(Data(FLOAT32, {1, count}, ids), Data(FLOAT32, {1, count}, positions), kv[owner], config, capture);
+                    record(logits); CommitDraftContext(capture, count, *draft[owner], kv[owner]);
+                }
+            }
+            for (int turn = 0; turn < 8; ++turn) {
+                const int count = turn % 4 == 0 ? 1 : turn % 4 == 1 ? 4 : 2;
+                std::vector<int> owners, lengths, before, kept, anchors;
+                std::vector<float> ids, positions;
+                std::vector<std::pair<Data *, Data *>> pointers;
+                std::vector<Cache *> caches;
+                std::vector<DraftContext *> contexts;
+                for (int i = 0; i < count; ++i) {
+                    int owner = (i + turn) % 4, rows = turn % 3 == 0 ? block + 1 : 1 + (i + turn) % (block + 1);
+                    owners.push_back(owner); lengths.push_back(rows); before.push_back(past[owner]);
+                    kept.push_back(turn % 4 == 0 ? 0 : turn % 4 == 1 ? rows : std::max(1, rows / 2));
+                    caches.push_back(&kv[owner]); contexts.push_back(draft[owner].get()); anchors.push_back((turn * 11 + owner) % 251);
+                    for (auto &pair : kv[owner]) pointers.emplace_back(&pair.first, &pair.second);
+                    for (int row = 0; row < rows; ++row) {
+                        ids.push_back((past[owner] + row + turn * 23 + wave) % 251);
+                        positions.push_back(past[owner] + row);
+                    }
+                }
+                std::vector<GenerationConfig> configs(count, config);
+                TargetBatch batch{pointers, configs, lengths, block_cnt};
+                TargetCapture capture; capture.verifying = true; capture.borrowOutputs = true; capture.selection = &selection;
+                Cache unused;
+                const bool single = count == 1 && turn % 8 == 4;
+                Cache &target = single ? kv[owners.front()] : unused;
+                const TargetBatch *targetBatch = single ? nullptr : &batch;
+                SetCudaGraph(turn % 4 != 2);
+                Data logits = RunDraftTarget(Data(FLOAT32, {1, (int)ids.size()}, ids),
+                    Data(FLOAT32, {1, (int)positions.size()}, positions), target, config, capture, targetBatch);
+                record(logits);
+                const int launches = verifyGraphLaunches;
+                for (int replay = 0; replay < 3 && GetFastllmEnv().cudaGraph; ++replay) {
+                    CommitTargetCaches(caches, before, std::vector<int>(count, 0), capture.ringVerify);
+                    TargetCapture repeated; repeated.verifying = true; repeated.borrowOutputs = true; repeated.selection = &selection;
+                    Data again = RunDraftTarget(Data(FLOAT32, {1, (int)ids.size()}, ids),
+                        Data(FLOAT32, {1, (int)positions.size()}, positions), target, config, repeated, targetBatch);
+                    record(again); capture = std::move(repeated);
+                }
+                if (GetFastllmEnv().cudaGraph && graphSupported && verifyGraphLaunches <= launches)
+                    throw std::runtime_error("sparse/native verification did not replay its graph");
+                for (const auto &feature : capture.hidden) record(feature.second);
+                CommitTargetCaches(caches, before, kept, capture.ringVerify);
+                if (std::find(kept.begin(), kept.end(), 0) == kept.end()) {
+                    if (!CommitDraftContexts(capture, lengths, kept, contexts))
+                        throw std::runtime_error("sparse draft context batch fell back");
+                } else {
+                    // Zero acceptance here is a storage rollback oracle; real
+                    // speculative rounds always retain the anchor input.
+                    if (count != 1) throw std::runtime_error("rollback fixture shape");
+                }
+                for (int i = 0; i < count; ++i) past[owners[i]] += kept[i];
+                Data hidden;
+                if (!RunDraftBatch(anchors, contexts, hidden)) throw std::runtime_error("sparse draft TP batch fell back");
+                record(hidden); Data head = RunDraftHead(hidden); record(head);
+                // A different token overwrites the first rejected candidate.
+                // Exercise ordinary target decoding after each partial rollback.
+                for (int owner : owners) {
+                    TargetCapture next; next.selection = &selection;
+                    Data token(FLOAT32, {1, 1}, {(float)((past[owner] + turn * 31 + 137) % 251)});
+                    Data pos(FLOAT32, {1, 1}, {(float)past[owner]});
+                    Data nextLogits = RunDraftTarget(token, pos, kv[owner], config, next);
+                    record(nextLogits); CommitDraftContext(next, 1, *draft[owner], kv[owner]); ++past[owner];
+                }
+            }
+            SetCudaGraph(true);
+            // A single-request graph must observe accepted length growth on
+            // replay, not a history staging length frozen during capture.
+            const int launches = verifyGraphLaunches;
+            for (int step = 0; step < 6; ++step) {
+                const int owner = 3, rows = block + 1, kept = 1 + step % 3;
+                std::vector<float> ids(rows), positions(rows);
+                for (int row = 0; row < rows; ++row) {
+                    ids[row] = (past[owner] + row + step * 19) % 251;
+                    positions[row] = past[owner] + row;
+                }
+                TargetCapture capture; capture.verifying = true; capture.selection = &selection;
+                Data logits = RunDraftTarget(Data(FLOAT32, {1, rows}, ids),
+                    Data(FLOAT32, {1, rows}, positions), kv[owner], config, capture);
+                record(logits);
+                for (const auto &feature : capture.hidden) record(feature.second);
+                CommitTargetCaches({&kv[owner]}, {past[owner]}, {kept}, capture.ringVerify);
+                past[owner] += kept;
+            }
+            if (graphSupported && verifyGraphLaunches <= launches)
+                throw std::runtime_error("growing single-request verification did not replay its graph");
+        }
+        return result;
+    }
     std::vector<float> SparseKvRun(bool enabled) {
         maxBatch = 4; SetMaxTokens(16384); SetChunkedPrefillSize(1024);
         if (enabled) {
@@ -639,7 +767,7 @@ class Fixture : public NaiveN05FlashModel {
                   << " max_abs=" << largestLogitAbsolute << std::endl;
     }
 #endif
-    void DraftPrefixChecks() {
+    void DraftPrefixChecks(bool sparse = false) {
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
         inspectDraftPrefixAllocations = true;
 #endif
@@ -649,7 +777,50 @@ class Fixture : public NaiveN05FlashModel {
         draftConfidenceThreshold = 0; draftTargetLayers = {0, 1};
         AddDraftTestWeights(weight, draftLayers, draftKvHeads, 256, true);
         maxBatch = 16; SetMaxTokens(131072); SetChunkedPrefillSize(1024);
+        if (sparse) {
+            KvMemConfig cfg; cfg.enabled = true; cfg.maxTokens = 8192; cfg.residentTokens = 8192;
+            cfg.prefillTokens = 1024; cfg.hostBytes = 1ULL << 30; ConfigureKvMem(cfg);
+        }
         WarmUp(); useRealScheduler = true; eos_token_id = -1; eos_token_ids.clear();
+        auto &prefixPool = NaiveN05GraphTestAccess::DraftPrefixPool(*this);
+        if (!prefixPool || prefixPool->draftStorage.size() != size_t(ranks))
+            throw std::runtime_error("draft checkpoints are not distributed across TP ranks");
+        int prefixSlots = 0;
+        for (const auto &shard : prefixPool->draftStorage)
+            if (!shard.dims.empty()) prefixSlots += shard.dims.front();
+        size_t draftBytes = 0;
+        for (int rank = 0; rank < ranks; ++rank) {
+            auto &shard = prefixPool->draftStorage[rank];
+            const size_t expected = size_t(PrefixPool::DraftShardSlots(prefixSlots, rank, ranks)) *
+                prefixPool->draftSlotBytes;
+            if (shard.GetBytes() != expected || (expected && shard.dataDeviceIds != std::vector<int>{rank}))
+                throw std::runtime_error("draft checkpoint shard budget or device mismatch");
+            draftBytes += shard.GetBytes();
+        }
+        if (draftBytes != size_t(prefixSlots) * prefixPool->draftSlotBytes)
+            throw std::runtime_error("draft checkpoint sharding lost or duplicated slots");
+        for (int length : {127, 1023, 4097}) {
+            PrefixSnapshots snapshots;
+            for (int rank = 0; rank < ranks; ++rank) {
+                auto snapshot = std::make_shared<PrefixSnapshot>();
+                snapshot->pool = prefixPool; snapshot->slot = prefixPool->freeSlots.back();
+                prefixPool->freeSlots.pop_back(); snapshots.push_back(snapshot);
+                const int rows = std::min(length, draftWindow - 1);
+                std::vector<uint16_t> expected(size_t(rows) * embed_dim), actual(expected.size());
+                for (size_t i = 0; i < expected.size(); ++i)
+                    expected[i] = Float32ToBFloat16RNEBits(std::sin((i + rank * 7 + length) * .019f));
+                auto &shard = prefixPool->DraftShard(snapshot->slot);
+                FastllmCudaSetDevice(shard.dataDeviceIds.front());
+                FastllmCudaCopyFromHostToDevice((uint8_t *)shard.cudaData + prefixPool->DraftOffset(snapshot->slot),
+                                               expected.data(), expected.size() * sizeof(uint16_t));
+                auto restored = CreateDraftContext();
+                RestoreDraftPrefix(*snapshot, length, *restored);
+                FastllmCudaCopyFromDeviceToHost(actual.data(), restored->prefixHidden.cudaData,
+                                               actual.size() * sizeof(uint16_t));
+                if (actual != expected || restored->committed != length)
+                    throw std::runtime_error("distributed draft checkpoint changed normalized inputs or position");
+            }
+        }
         auto prompt = [](int length, int salt = 0) {
             std::vector<int> result(length);
             for (int i = 0; i < length; ++i) result[i] = (i * 3 + salt) % 251;
@@ -2926,10 +3097,12 @@ int main(int argc, char **argv) {
         SetThreads(4);
         SetDeviceMap({{"cuda:0", 1}});
         FastllmCudaSetDevice(0);
+#ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
         if (argc > 2 && std::string(argv[2]) == "draft_prefill_tail") {
             SetCudaEmbedding(true); SetCudaGraph(true);
             DraftFixture fixture(true, 2, 0, 5); fixture.PrefillCommitChecks(); return 0;
         }
+#endif
         if (argc > 2 && std::string(argv[2]) == "draft_prefix") {
             SetCudaEmbedding(true); SetCudaGraph(!(argc > 4 && std::string(argv[4]) == "eager"));
             Fixture fixture(ranks, false, true, true, true);
@@ -2980,6 +3153,47 @@ int main(int argc, char **argv) {
                                  0, argc > 4 ? std::stoi(argv[4]) : 7);
             fixture.RunBatchChecks();
             unsetenv("FASTLLM_DSPARK_TP"); return 0;
+        }
+        if (argc > 2 && std::string(argv[2]) == "kvmem_draft") {
+            SetCudaEmbedding(true); SetCudaGraph(true);
+            setenv("FASTLLM_DSPARK_TP", std::to_string(ranks).c_str(), 1);
+            failGraphDevice = 0;
+            failVerifyBegin = argc > 7 && std::string(argv[7]) == "failbegin";
+            failVerifyInstantiate = argc > 7 && std::string(argv[7]) == "failinstantiate";
+            const int block = argc > 4 ? std::stoi(argv[4]) : 5;
+            const int resident = argc > 5 ? std::stoi(argv[5]) : 16384;
+            std::vector<float> reference;
+            for (bool enabled : {false, true}) {
+                Fixture fixture(ranks, false, true, true, true);
+                const std::string storage = argc > 6 ? argv[6] : "layer_shard";
+                fixture.SetIndexerTPStorage(storage != "replicated" && !(enabled && storage == "context_shard"),
+                                            enabled && storage == "context_shard");
+                if (storage == "scaled_fp8" || storage == "context_shard") fixture.SetIndexerDataType(FP8_E4M3);
+                if (argc > 3 && std::string(argv[3]) == "fp8") fixture.SetKVCacheDataType(FP8_E4M3);
+                auto result = fixture.SparseDraftChecks(enabled, block, resident, !failVerifyBegin && !failVerifyInstantiate,
+                    argc > 7 && std::string(argv[7]) == "warmup" ? 4096 : 1024);
+                if (!enabled) reference = std::move(result);
+                else {
+                    if (result.size() != reference.size()) throw std::runtime_error("sparse draft trace shape");
+                    RequireCloseLogits(result.data(), reference, "sparse draft target/hidden/backbone/head differs");
+                    size_t exact = 0; for (size_t i = 0; i < result.size(); ++i) exact += result[i] == reference[i];
+                    std::cout << "KVMEM DSPARK PASS exact=" << exact << "/" << result.size()
+                              << " relative=" << largestLogitRelative << " max_abs=" << largestLogitAbsolute << std::endl;
+                }
+            }
+            if ((failVerifyBegin || failVerifyInstantiate) && verifyGraphLaunches)
+                throw std::runtime_error("failed verification capture was replayed");
+            std::cout << "KVMEM VERIFY GRAPH captures=" << verifyGraphCaptures
+                      << " launches=" << verifyGraphLaunches << std::endl;
+            unsetenv("FASTLLM_DSPARK_TP"); return 0;
+        }
+        if (argc > 2 && std::string(argv[2]) == "kvmem_draft_prefix") {
+            SetCudaEmbedding(true); SetCudaGraph(true);
+            setenv("FASTLLM_DSPARK_TP", std::to_string(ranks).c_str(), 1);
+            Fixture fixture(ranks, false, true, true, true);
+            fixture.SetIndexerTPStorage(true);
+            if (argc > 3 && std::string(argv[3]) == "fp8") fixture.SetKVCacheDataType(FP8_E4M3);
+            fixture.DraftPrefixChecks(true); unsetenv("FASTLLM_DSPARK_TP"); return 0;
         }
         if (argc > 2 && std::string(argv[2]) == "kvmem_pool") {
             SetCudaEmbedding(true); SetCudaGraph(true);

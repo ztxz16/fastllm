@@ -4857,34 +4857,59 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
 #endif
 }
 
+void FastllmCudaNaivePrepareVerifyIndexerScratch(int count, int capacity, bool fp8Query,
+        FastllmNaiveDecodeScratch &scratch) {
+#ifdef FASTLLM_NAIVE_BATCH_INDEXER
+    using namespace fastllm;
+#ifdef FASTLLM_NAIVE_DSA_MMA
+    const bool mma = fp8Query && FastllmCudaFlashInferDataTypeSupported(BFLOAT16);
+#else
+    const bool mma = false;
+#endif
+    Output(scratch.indexQuery, mma ? BFLOAT16 : FLOAT32, {count, 16, 128});
+    Output(scratch.indexScale, FLOAT32, {count, 16});
+    Output(scratch.indexScores, INT32, {count, capacity});
+    Output(scratch.topk, INT32, {count, (int)(sizeof(naive_topk::Workspace) / sizeof(int))});
+#endif
+}
+
 bool FastllmCudaNaiveBatchVerifyIndexer(const fastllm::Data &query,
         const fastllm::Data &weights,
         const std::vector<FastllmNaiveVerifyIndexerItem> &items, bool fp8Query,
-        FastllmNaiveDecodeScratch &scratch, fastllm::Data &liveKeys) {
+        FastllmNaiveDecodeScratch &scratch, fastllm::Data &liveKeys,
+        int contextRank, int contextRanks, fastllm::Data *exchange, int contextPageLen) {
 #ifdef FASTLLM_NAIVE_BATCH_INDEXER
     using namespace fastllm;
     const int count = query.Count(0) / (16 * 128);
     if (items.empty() || query.dataType != BFLOAT16 || weights.dataType != BFLOAT16 ||
         query.dims.size() != 3 || query.dims.back() != 16 * 128 ||
         weights.Count(0) != (size_t)count * 16) return false;
+    const bool sharded = contextPageLen > 0;
+    if (sharded && (contextRanks <= 1 || contextRank < 0 || contextRank >= contextRanks ||
+        contextPageLen % contextRanks || !exchange || !fp8Query)) return false;
+    auto localLength = [&](int length) {
+        if (!sharded) return length;
+        const int page = contextPageLen / contextRanks;
+        return length / contextPageLen * page +
+            std::clamp(length % contextPageLen - contextRank * page, 0, page);
+    };
+    auto limit = [&](const FastllmNaiveVerifyIndexerItem &item) {
+        return item.capacity > 0 ? item.capacity : sharded ? item.past + item.rows : item.key->dims[1];
+    };
     int capacity = 0;
     const bool dynamic = items.front().capacity > 0;
     for (const auto &item : items) {
         if (!item.key || !item.indices || item.offset < 0 || item.rows < 1 ||
             item.offset + item.rows > count || item.past < 0 || item.key->dims.size() != 3 ||
             (dynamic != (item.capacity > 0)) ||
-            (!dynamic && item.past + item.rows > item.key->dims[1]) ||
+            (!dynamic && localLength(item.past + item.rows) > item.key->dims[1]) ||
             (dynamic && (item.key->expansionDims.size() != 3 ||
-                item.capacity > item.key->expansionDims[1])) ||
-            !FastllmNaiveKVType(item.key->dataType) || item.key->dims[2] < 128 ||
-            item.key->dims[1] <= 0 || item.key->dims[1] > naive_topk::kMaxKeys) return false;
-        capacity = std::max(capacity, dynamic ? item.capacity : item.key->dims[1]);
+                localLength(item.capacity) > item.key->expansionDims[1])) ||
+            !FastllmNaiveKVType(item.key->dataType) || item.key->dims[2] <
+                (sharded && item.key->kvCacheFp8Indexer ? FastllmNaiveIndexerBytes / item.key->unitSize : 128) ||
+            (!sharded && item.key->dims[1] <= 0) || limit(item) > naive_topk::kMaxKeys) return false;
+        capacity = std::max(capacity, limit(item));
     }
-#ifdef FASTLLM_NAIVE_DSA_MMA
-    const bool mma = fp8Query && FastllmCudaFlashInferDataTypeSupported(BFLOAT16);
-#else
-    const bool mma = false;
-#endif
     if (dynamic && (liveKeys.dataType != INT32 || liveKeys.Count(0) != count || !liveKeys.cudaData)) return false;
     if (!dynamic) Output(liveKeys, INT32, {count});
     for (size_t first = 0; !dynamic && first < items.size(); first += 32) {
@@ -4897,11 +4922,8 @@ bool FastllmCudaNaiveBatchVerifyIndexer(const fastllm::Data &query,
         }
         VerifyIndexerLengths<<<size, 32>>>(lengths, (int *)liveKeys.cudaData);
     }
-    Output(scratch.indexQuery, mma ? BFLOAT16 : FLOAT32, {count, 16, 128});
-    Output(scratch.indexScale, FLOAT32, {count, 16});
-    Output(scratch.indexScores, INT32, {count, capacity});
+    FastllmCudaNaivePrepareVerifyIndexerScratch(count, capacity, fp8Query, scratch);
     const int words = sizeof(naive_topk::Workspace) / sizeof(int);
-    Output(scratch.topk, INT32, {count, words});
     std::vector<FastllmNaiveDecodeScratch> views(count);
     std::vector<Data> indices(count);
     std::vector<FastllmNaiveIndexerRow> rows;
@@ -4916,15 +4938,38 @@ bool FastllmCudaNaiveBatchVerifyIndexer(const fastllm::Data &query,
             };
             view(v.indexQuery, scratch.indexQuery, (size_t)offset * 2048, {16, 128});
             view(v.indexScale, scratch.indexScale, (size_t)offset * 16, {16});
-            view(v.indexScores, scratch.indexScores, (size_t)offset * capacity, {dynamic ? item.capacity : item.key->dims[1]});
+            view(v.indexScores, scratch.indexScores, (size_t)offset * capacity, {limit(item)});
             view(v.topk, scratch.topk, (size_t)offset * words, {words});
             view(indices[offset], *item.indices, (size_t)row * naive_topk::kTopK, {1, naive_topk::kTopK});
-            rows.push_back({item.key, &v, &indices[offset], offset, dynamic ? item.capacity : item.key->dims[1], item.cache});
+            rows.push_back({item.key, &v, &indices[offset], offset, limit(item), item.cache});
         }
     }
-    return FastllmCudaNaiveBatchDecodeIndexer(query, weights, liveKeys, rows, fp8Query);
+    return FastllmCudaNaiveBatchDecodeIndexer(query, weights, liveKeys, rows, fp8Query,
+        contextRank, contextRanks, exchange, contextPageLen);
 #else
     return false;
+#endif
+}
+
+void FastllmCudaNaiveMergeVerifyIndexer(
+        const std::vector<FastllmNaiveVerifyIndexerItem> &items,
+        FastllmNaiveDecodeScratch &scratch, const fastllm::Data &liveKeys,
+        const fastllm::Data &exchange, int contextRanks, int contextPageLen) {
+#ifdef FASTLLM_NAIVE_BATCH_INDEXER
+    using namespace fastllm;
+    const int count = liveKeys.Count(0), words = sizeof(naive_topk::Workspace) / sizeof(int);
+    std::vector<FastllmNaiveDecodeScratch> views(count);
+    std::vector<Data> indices(count);
+    std::vector<FastllmNaiveIndexerRow> rows;
+    for (const auto &item : items) for (int row = 0; row < item.rows; ++row) {
+        const int offset = item.offset + row;
+        auto &workspace = views[offset].topk;
+        workspace.Resize({words}); workspace.FakeFrom(scratch.topk, size_t(offset) * words * sizeof(int));
+        indices[offset].Resize({1, naive_topk::kTopK});
+        indices[offset].FakeFrom(*item.indices, size_t(row) * naive_topk::kTopK * sizeof(int));
+        rows.push_back({item.key, &views[offset], &indices[offset], offset, item.capacity, item.cache});
+    }
+    FastllmCudaNaiveMergeDecodeIndexer(liveKeys, rows, exchange, contextRanks, contextPageLen);
 #endif
 }
 

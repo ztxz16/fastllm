@@ -423,14 +423,7 @@ bool NaiveN05FlashModel::RestorePagedPrefixCacheExtra(ResponseContext *context, 
             draft = self->CreateDraftContext();
             self->draftContexts[&context->pastKeyValues] = draft;
         }
-        self->ApplyDraftDevice();
-        const int rows = std::min(length, draftWindow - 1);
-        Data hidden;
-        hidden.FakeFrom(snapshot->pool->draftStorage, (size_t)snapshot->slot * snapshot->pool->draftSlotBytes);
-        hidden.Resize({1, rows, embed_dim});
-        self->AppendDraftContext(hidden, length - rows, *draft);
-        Copy(hidden, draft->prefixHidden);
-        FastllmCudaSyncCurrentThreadStream();
+        self->RestoreDraftPrefix(*snapshot, length, *draft);
     }
     context->preTokens = length;
     context->intParams["add_special_tokens"] = 0;

@@ -12,7 +12,7 @@ struct NaiveN05FlashModel::TargetWorkspace {
     Data indexQ, indexKey, indexKeyFloat, indexWeights, indices, indexBroadcast, positions;
     Data indexContextGather, indexContextFull, indexContextExchange;
     Data last, logits, logitsBf16, inputIds, liveKeys;
-    Data sparsePointers, sparseLengths, sparseSelected;
+    Data sparseQuery, sparseAttention;
     Data denseGate, denseUp, denseDown;
     std::map<int, Data> features;
     FastllmNaiveDecodeScratch decode;
@@ -27,8 +27,7 @@ struct NaiveN05FlashModel::TargetWorkspace {
                 &w1, &w2, &w3, &tempInput, &tempOutput, &moeOutput, &moeInputTemp, &moeOutputTemp,
                 &indexQ, &indexKey, &indexKeyFloat, &indexWeights, &indices, &indexBroadcast,
                 &positions, &indexContextGather, &indexContextFull, &indexContextExchange,
-                &last, &logits, &logitsBf16, &inputIds, &liveKeys, &sparsePointers, &sparseLengths,
-                &sparseSelected, &denseGate, &denseUp, &denseDown, &decode.indexQuery,
+                &last, &logits, &logitsBf16, &inputIds, &liveKeys, &sparseQuery, &sparseAttention, &denseGate, &denseUp, &denseDown, &decode.indexQuery,
                 &decode.indexScale, &decode.indexScores, &decode.topk, &decode.attentionScores,
                 &decode.attentionPartial, &decode.windowKey, &decode.windowValue})
             out.push_back(p->isFake ? nullptr : p->cudaData);
