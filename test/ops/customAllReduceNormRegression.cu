@@ -47,7 +47,7 @@ struct Case {
     Data source{BFLOAT16}, residual{BFLOAT16}, expected{BFLOAT16}, lower{BFLOAT16}, upper{BFLOAT16};
     Data referenceNorm{BFLOAT16};
     cudaGraphExec_t graph = nullptr;
-    Case(int rows, int rank, bool gather) : count(rows * 4096), rank(rank), gather(gather) {
+    Case(int rows, int rank, int ranks, bool gather) : count(rows * 4096), rank(rank), gather(gather) {
         for (Data *d : {&input, &hidden, &output, &source, &residual, &expected, &lower, &upper})
             Init(*d, {1, rows, 4096}, rank);
         if (gather) Init(referenceNorm, {1, rows, 4096}, rank);
@@ -65,7 +65,10 @@ struct Case {
         Check(cudaMemcpy(residual.cudaData, h.data(), count * 2, cudaMemcpyHostToDevice));
         Check(cudaMemcpy(weight.cudaData, w.data(), 4096 * 4, cudaMemcpyHostToDevice));
         Reset();
-        Require(gather ? FastllmCudaCustomAllGatherRows(input.cudaData, count, 4096, BFLOAT16, rank)
+        // Independent NCCL gather reference also covers batches beyond the
+        // ordinary custom gather's bounded message policy.
+        Require(gather ? FastllmNcclAllGather((BF *)input.cudaData + rank * (count / ranks),
+                    input.cudaData, count / ranks, BFLOAT16, rank)
             : FastllmCudaCustomAllReduceRows(input.cudaData, input.cudaData, count, 4096, BFLOAT16, rank),
             "reference collective rejected");
         FastllmCudaNaiveAddDecodeRMSNorm(hidden, input, weight, 1e-5f, output);
@@ -145,6 +148,11 @@ int main(int argc, char **argv) {
         for (int n = ranks; n <= 256; n += ranks) shapes.push_back(n);
         shapes.push_back(512 / ranks * ranks);
         shapes.push_back(1024 / ranks * ranks);
+        // First shard-aligned size above 8 MiB, C380/DS3 and larger windows.
+        shapes.push_back((1024 / ranks + 1) * ranks);
+        for (int n : {1520, 1536, 2280, 3040, 4096}) shapes.push_back(n / ranks * ranks);
+        std::sort(shapes.begin(), shapes.end());
+        shapes.erase(std::unique(shapes.begin(), shapes.end()), shapes.end());
     }
     std::vector<std::thread> workers;
     std::vector<int> errors(ranks);
@@ -153,7 +161,7 @@ int main(int argc, char **argv) {
         int *deviceErrors; Check(cudaMalloc(&deviceErrors, sizeof(int))); Check(cudaMemset(deviceErrors, 0, sizeof(int)));
         std::vector<std::unique_ptr<Case>> cases;
         for (int rows : shapes) {
-            cases.emplace_back(new Case(rows, rank, gather)); auto &c = *cases.back();
+            cases.emplace_back(new Case(rows, rank, ranks, gather)); auto &c = *cases.back();
             c.Reset(); Require(c.Fused(c.output.cudaData), "warmup rejected"); c.Validate(deviceErrors);
             Require(!c.Fused(rank == 0 ? (char *)c.output.cudaData + 2 : c.output.cudaData), "asymmetric alignment accepted");
             c.Validate(deviceErrors);

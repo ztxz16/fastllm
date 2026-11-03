@@ -2308,6 +2308,14 @@ if (UNIT_TEST)
         set_tests_properties(naive_n05_verify_allreduce
             PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
             PASS_REGULAR_EXPRESSION "ROW ALLREDUCE PASS")
+        foreach(NAIVE_REDUCE_CHUNK_RANKS 2 4 8)
+            add_test(NAME naive_n05_verify_allreduce_chunks_${NAIVE_REDUCE_CHUNK_RANKS}
+                COMMAND naive_n05_tp_model_test ${NAIVE_REDUCE_CHUNK_RANKS} reduce_chunks)
+            set_tests_properties(naive_n05_verify_allreduce_chunks_${NAIVE_REDUCE_CHUNK_RANKS}
+                PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 300
+                ENVIRONMENT "FASTLLM_CUDA_CUSTOM_ALLREDUCE=1"
+                PASS_REGULAR_EXPRESSION "CHUNKED ROW ALLREDUCE PASS")
+        endforeach()
         foreach(NAIVE_SELECTION_RANKS 2 4 8)
             add_test(NAME naive_n05_verify_selection_${NAIVE_SELECTION_RANKS}
                 COMMAND naive_n05_tp_model_test ${NAIVE_SELECTION_RANKS} selection)

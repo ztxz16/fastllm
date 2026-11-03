@@ -6,6 +6,7 @@
 #include "models/speculative_sampling.h"
 #include "utils/utils.h"
 #include <cmath>
+#include <cuda_fp16.h>
 #include <cuda_runtime_api.h>
 #include <iostream>
 #include <limits>
@@ -2596,6 +2597,153 @@ static void VerifyDraftReduction(int ranks) {
     std::cout<<"DRAFT REDUCTION CPU PASS checks="<<checks<<std::endl;
 }
 
+static void VerifyChunkedRowAllReduce(int ranks) {
+    SetCudaGraph(true);
+    std::vector<int> devices(ranks);
+    std::iota(devices.begin(), devices.end(), 0);
+    if (!FastllmInitNccl(devices)) throw std::runtime_error("collective init");
+    PersistentWorkerGroup workers;
+    std::vector<std::exception_ptr> errors(ranks);
+    auto run = [&](const std::function<void(int)> &fn) {
+        std::fill(errors.begin(), errors.end(), nullptr);
+        workers.Run(devices, [&](int rank) { FastllmCudaSetDevice(rank); fn(rank); }, errors);
+        for (auto e : errors) if (e) std::rethrow_exception(e);
+    };
+    auto cuda = [](cudaError_t error) {
+        if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+    };
+    int checks = 0;
+    for (DataType type : {FLOAT16, BFLOAT16, FLOAT32}) {
+        const int unit = type == FLOAT32 ? 4 : 2;
+        auto store = [type](void *p, int i, float value) -> float {
+            if (type == FLOAT32) { ((float *)p)[i] = value; return value; }
+            if (type == BFLOAT16) {
+                const uint16_t bits = Float32ToBFloat16RNEBits(value);
+                ((uint16_t *)p)[i] = bits; return BFloat16BitsToFloat32(bits);
+            }
+            const __half half = __float2half_rn(value);
+            std::memcpy((uint16_t *)p + i, &half, sizeof(half));
+            return __half2float(half);
+        };
+        for (auto shape : std::vector<std::pair<int, int>>{
+                {4096, 8 * 1024 * 1024 / (4096 * unit) - 1},
+                {4096, 8 * 1024 * 1024 / (4096 * unit)},
+                {4096, 8 * 1024 * 1024 / (4096 * unit) + 1},
+                {4096, 1520}, {4096, 2 * 8 * 1024 * 1024 / (4096 * unit) + 3},
+                {3072, 1801}}) {
+            const int width = shape.first, rows = shape.second, count = rows * width;
+            const size_t bytes = (size_t)count * unit;
+            std::vector<std::vector<uint8_t>> host(ranks, std::vector<uint8_t>(bytes));
+            std::vector<float> sum(count, 0.0f);
+            std::vector<uint8_t> expected(bytes);
+            std::vector<void *> input(ranks), output(ranks);
+            for (int rank = 0; rank < ranks; ++rank) {
+                unsigned seed = 71 + rank;
+                for (int i = 0; i < count; ++i) {
+                    seed = seed * 1664525u + 1013904223u;
+                    const float value = std::ldexp((int(seed >> 16) - 32768) / 32768.f,
+                                                   (i + rank * 3) % 17 - 8);
+                    sum[i] += store(host[rank].data(), i, value);
+                }
+            }
+            for (int i = 0; i < count; ++i) store(expected.data(), i, sum[i]);
+            run([&](int rank) {
+                cuda(cudaMalloc(&input[rank], bytes)); cuda(cudaMalloc(&output[rank], bytes));
+            });
+            auto reset = [&]() {
+                run([&](int rank) {
+                    cuda(cudaMemcpy(input[rank], host[rank].data(), bytes, cudaMemcpyHostToDevice));
+                    cuda(cudaMemset(output[rank], 0xa5, bytes));
+                    cuda(cudaStreamSynchronize(cudaStreamPerThread));
+                });
+            };
+            auto check = [&](bool inplace) {
+                run([&](int rank) {
+                    std::vector<uint8_t> actual(bytes);
+                    cuda(cudaMemcpy(actual.data(), inplace ? input[rank] : output[rank],
+                                    bytes, cudaMemcpyDeviceToHost));
+                    if (actual != expected) throw std::runtime_error("chunked reduction differs from CPU rank sum");
+                    if (!inplace) {
+                        cuda(cudaMemcpy(actual.data(), input[rank], bytes, cudaMemcpyDeviceToHost));
+                        if (actual != host[rank]) throw std::runtime_error("out-of-place input changed");
+                    }
+                });
+                checks += ranks;
+            };
+            reset();
+            // Even when the first chunk is registered, a cold later chunk must
+            // reject the entire capture before enqueueing a reduction.
+            if (bytes > 8 * 1024 * 1024) {
+                const int first = (8 * 1024 * 1024 / (width * unit)) * width;
+                // Reset registrations so allocator address reuse cannot make
+                // this deliberately cold second chunk look warm.
+                FastllmCudaCustomAllReduceReset();
+                if (!FastllmCudaCustomAllReduceInit(devices)) throw std::runtime_error("collective reinit");
+                run([&](int rank) {
+                    if (!FastllmCudaCustomAllReduceRows(input[rank], output[rank], first, width, type, rank))
+                        throw std::runtime_error("first chunk registration");
+                    ForceDeviceSync();
+                });
+                reset();
+                run([&](int rank) {
+                    cudaGraph_t graph = nullptr;
+                    cuda(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeRelaxed));
+                    bool accepted = FastllmCudaCustomAllReduceRows(input[rank], input[rank], count, width, type, rank);
+                    cuda(cudaStreamEndCapture(cudaStreamPerThread, &graph));
+                    size_t nodes = 0; cuda(cudaGraphGetNodes(graph, nullptr, &nodes));
+                    cuda(cudaGraphDestroy(graph));
+                    if (accepted || nodes) throw std::runtime_error("cold chunk partially captured");
+                    std::vector<uint8_t> actual(bytes);
+                    cuda(cudaMemcpy(actual.data(), input[rank], bytes, cudaMemcpyDeviceToHost));
+                    if (actual != host[rank]) throw std::runtime_error("cold capture modified input");
+                });
+                checks += ranks;
+                run([&](int rank) {
+                    void *bad = rank ? input[rank] : (uint8_t *)input[rank] + unit;
+                    if (FastllmCudaCustomAllReduceRows(bad, input[rank], count, width, type, rank))
+                        throw std::runtime_error("misaligned rank accepted");
+                    std::vector<uint8_t> actual(bytes);
+                    cuda(cudaMemcpy(actual.data(), input[rank], bytes, cudaMemcpyDeviceToHost));
+                    if (actual != host[rank]) throw std::runtime_error("rejected reduction modified input");
+                });
+                checks += ranks;
+            }
+            for (bool inplace : {false, true}) {
+                reset();
+                run([&](int rank) {
+                    if (!FastllmCudaCustomAllReduceRows(input[rank], inplace ? input[rank] : output[rank],
+                                                       count, width, type, rank))
+                        throw std::runtime_error("chunked row reduction fell back");
+                    ForceDeviceSync();
+                });
+                check(inplace);
+                std::vector<cudaGraphExec_t> execs(ranks);
+                run([&](int rank) {
+                    cudaGraph_t graph = nullptr;
+                    cuda(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeRelaxed));
+                    bool accepted = FastllmCudaCustomAllReduceRows(input[rank], inplace ? input[rank] : output[rank],
+                                                                  count, width, type, rank);
+                    cuda(cudaStreamEndCapture(cudaStreamPerThread, &graph));
+                    if (!accepted) throw std::runtime_error("warm chunk graph fell back");
+                    size_t nodes = 0; cuda(cudaGraphGetNodes(graph, nullptr, &nodes));
+                    if (!nodes || nodes > 16) throw std::runtime_error("unexpected chunk graph size");
+                    cuda(cudaGraphInstantiateWithFlags(&execs[rank], graph, 0));
+                    cuda(cudaGraphDestroy(graph));
+                });
+                for (int replay = 0; replay < 3; ++replay) {
+                    reset();
+                    run([&](int rank) { cuda(cudaGraphLaunch(execs[rank], cudaStreamPerThread)); ForceDeviceSync(); });
+                    check(inplace);
+                }
+                run([&](int rank) { cuda(cudaGraphExecDestroy(execs[rank])); });
+            }
+            run([&](int rank) { cuda(cudaFree(input[rank])); cuda(cudaFree(output[rank])); });
+        }
+    }
+    FastllmCudaCustomAllReduceReset();
+    std::cout << "CHUNKED ROW ALLREDUCE PASS checks=" << checks << std::endl;
+}
+
 static void VerifyRowAllReduce(int ranks) {
     SetCudaGraph(true);
     std::vector<int> devices(ranks);
@@ -3120,6 +3268,10 @@ int main(int argc, char **argv) {
             return 77;
         if (argc > 2 && std::string(argv[2]) == "reduce_rows") {
             VerifyRowAllReduce(ranks);
+            return 0;
+        }
+        if (argc > 2 && std::string(argv[2]) == "reduce_chunks") {
+            VerifyChunkedRowAllReduce(ranks);
             return 0;
         }
         SetThreads(4);
