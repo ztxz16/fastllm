@@ -129,7 +129,7 @@ bool CopyAndCheck(const std::vector<int> &devices,
         for (int index = 0; index < count; ++index) {
             const float actualValue = HostToFloat(actual[index]);
             const float expectedValue = HostToFloat(expected[index]);
-            if (std::fabs(actualValue - expectedValue) >
+            if (!std::isfinite(actualValue) || std::fabs(actualValue - expectedValue) >
                     CheckTolerance<T>()) {
                 std::cerr << label << " mismatch on rank " << rank
                           << " at " << index << ": expected "
@@ -644,6 +644,40 @@ bool SupportedRankCount(int ranks) {
     return ranks == 2 || ranks == 4 || ranks == 6 || ranks == 8;
 }
 
+bool RunNcclFallbackRegression(const std::vector<int> &devices, int count) {
+    const int dataType = (int)fastllm::DataType::FLOAT32;
+    if (FastllmCudaCustomAllReduceCanRun(count, dataType, devices[0])) {
+        std::cerr << "fallback test unexpectedly accepted the custom path.\n";
+        return false;
+    }
+    const int ranks = (int)devices.size();
+    std::vector<void *> inputs(ranks, nullptr), outputs(ranks, nullptr);
+    std::vector<std::vector<float>> host(ranks, std::vector<float>(count));
+    std::vector<float> expected(count, 0.0f);
+    bool ok = true;
+    for (int rank = 0; rank < ranks && ok; ++rank) {
+        for (int i = 0; i < count; ++i) {
+            host[rank][i] = rank + 1.0f + i * 0.125f;
+            expected[i] += host[rank][i];
+        }
+        ok = CheckCuda(cudaSetDevice(devices[rank]), "cudaSetDevice") &&
+             CheckCuda(cudaMalloc(&inputs[rank], count * sizeof(float)), "cudaMalloc") &&
+             CheckCuda(cudaMalloc(&outputs[rank], count * sizeof(float)), "cudaMalloc") &&
+             CheckCuda(cudaMemcpy(inputs[rank], host[rank].data(), count * sizeof(float),
+                                  cudaMemcpyHostToDevice), "cudaMemcpy") &&
+             CheckCuda(cudaDeviceSynchronize(), "producer synchronization");
+    }
+    if (ok) {
+        ok = RunOnRanks(devices, [&](int rank) {
+            FastllmNcclAllReduce(inputs[rank], outputs[rank], count, dataType, devices[rank]);
+            return !FastllmCudaGetThreadError();
+        });
+        ok = ok && CopyAndCheck(devices, outputs, expected, count, "NCCL fallback");
+    }
+    FreeBuffers(devices, inputs, outputs);
+    return ok;
+}
+
 template <typename T>
 bool RunSelectedPaths(const std::vector<int> &devices, int dataType,
                       const char *typeName, int &selectedPaths,
@@ -710,13 +744,15 @@ int main() {
     if (expectedValue == nullptr ||
         (std::string(expectedValue) != "0" &&
          std::string(expectedValue) != "1" &&
+         std::string(expectedValue) != "prefer" &&
          std::string(expectedValue) != "auto")) {
         std::cerr << "FASTLLM_TEST_EXPECT_CUSTOM_ALLREDUCE must be 0, 1, "
-                     "or auto.\n";
+                     "prefer, or auto.\n";
         return 2;
     }
     const bool checkExpected = std::string(expectedValue) != "auto";
-    const bool expectedEnabled = std::string(expectedValue) == "1";
+    const bool requireAllPaths = std::string(expectedValue) == "prefer";
+    const bool expectedEnabled = std::string(expectedValue) == "1" || requireAllPaths;
 
     int ranks = 2;
     const char *ranksValue =
@@ -769,6 +805,13 @@ int main() {
         return 1;
     }
 
+    // 13 FP32 values violate custom's 16-byte packet requirement. With custom
+    // disabled (or rejected by startup validation), also test an eligible size.
+    if (!RunNcclFallbackRegression(devices, 13) ||
+        (!actualEnabled && !RunNcclFallbackRegression(devices, 16))) {
+        return 1;
+    }
+
     bool graphCaptureMissFallbackTested = false;
     if (!RunGraphCaptureMissFallbackRegression<half>(
             devices, (int)fastllm::DataType::FLOAT16, "FP16",
@@ -779,6 +822,10 @@ int main() {
     int selectedPaths = 0;
     int testedPaths = 0;
     if (!RunAllSelectedPaths(devices, selectedPaths, testedPaths)) {
+        return 1;
+    }
+    if (requireAllPaths && selectedPaths != 21) {
+        std::cerr << "preferred custom policy did not select all dtype/size cases.\n";
         return 1;
     }
     float fp16B8GraphFusedUs = 0.0f;
@@ -833,6 +880,10 @@ int main() {
         (reinitializedEnabled && reinitializedSelectedPaths == 0)) {
         return 1;
     }
+    if (requireAllPaths && reinitializedSelectedPaths != 21) {
+        std::cerr << "preferred custom policy lost paths after reinitialization.\n";
+        return 1;
+    }
 
     bool switchedGroupTested = false;
     if (deviceCount > ranks) {
@@ -864,6 +915,10 @@ int main() {
                 (switchedEnabled && switchedSelectedPaths == 0)) {
                 return 1;
             }
+            if (requireAllPaths && switchedSelectedPaths != 21) {
+                std::cerr << "preferred custom policy lost paths after group switch.\n";
+                return 1;
+            }
             switchedGroupTested = true;
         } else if (!switchedP2PQueryOk) {
             return 1;
@@ -880,7 +935,7 @@ int main() {
               << graphCaptureMissFallbackTested
               << ", graph_inplace_ordering="
               << graphInPlaceOrderingTested
-              << ", reset_reinit=1, switched_group="
+              << ", nccl_fallback=1, reset_reinit=1, switched_group="
               << switchedGroupTested << ")\n";
     return 0;
 }
