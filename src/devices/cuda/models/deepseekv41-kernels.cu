@@ -1635,15 +1635,29 @@ namespace {
         }
     }
 
+    constexpr int kKvQuantThreads = 128;
+    template <typename T>
+    __device__ __forceinline__ void V41QuantizeKVRow(const T *src, uint8_t *dst, int dim,
+                                                    int quantMode, int blockSize);
+
     struct V41DecodeTransformDescriptor {
         __nv_bfloat16 *input, *window;
         int rows, dim, position, mode, inverse, quantBlock;
+        uint8_t *packedWindow = nullptr;
     };
 
     __device__ __forceinline__ void V41DecodeTransformRow(
             const V41DecodeTransformDescriptor &item, int row, int d,
             V41RopeTable rope, int ropeDim, int windowSize) {
         auto *base = item.input + (size_t)row * item.dim;
+        if (item.packedWindow) {
+            // Reuse the packed-KV encoder's four-warp layout. Other warps
+            // leave the already quantized BF16 input unchanged.
+            if (threadIdx.x < kKvQuantThreads)
+                V41QuantizeKVRow(base, item.packedWindow +
+                    (size_t)(item.position % windowSize) * 528, 512, 1, 32);
+            return;
+        }
         if (item.window) {
             item.window[(size_t)(item.position % windowSize) * 512 + d] = base[d];
             return;
@@ -4574,8 +4588,6 @@ __global__ void V41QuantizeActivationVectorKernel(const __nv_bfloat16 *input, __
 
     // ---------------- QuantizeKV ----------------
 
-    constexpr int kKvQuantThreads = 128;
-
     // 每个 block 处理一行；blockSize 个线程为一组处理一个 scale 块，lane 对应块内元素。
     // Reuse the fake-quantization grid, including the subnormal E4M3 case
     // where the quantized maximum alone would otherwise halve the scale.
@@ -6706,12 +6718,14 @@ extern "C" bool FastllmCudaV41DecodeTransformsBatch(
         const int dim = item.input->dims.back();
         const int rows = item.input->Count(0) / dim;
         if (!rows) return false;
+        const bool packedWindow = item.window && item.window->dataType == DataType::INT8;
         if (item.window && (dim != 512 || rows != 1 || !V41OnCuda(*item.window) ||
-            item.window->dataType != DataType::BFLOAT16 ||
-            item.window->dims != std::vector<int>({1, windowSize, 512}))) return false;
+            (!packedWindow && item.window->dataType != DataType::BFLOAT16) ||
+            item.window->dims != std::vector<int>({1, windowSize, packedWindow ? 528 : 512}))) return false;
         descriptors.push_back({(__nv_bfloat16 *)item.input->cudaData,
-            item.window ? (__nv_bfloat16 *)item.window->cudaData : nullptr,
+            item.window && !packedWindow ? (__nv_bfloat16 *)item.window->cudaData : nullptr,
             rows, dim, item.startPos, item.quantMode, item.inverse ? 1 : 0, item.quantBlock});
+        if (packedWindow) descriptors.back().packedWindow = (uint8_t *)item.window->cudaData;
         maxRows = std::max(maxRows, (rows + 512 / dim - 1) / (512 / dim));
     }
     const size_t bytes = descriptors.size() * sizeof(V41DecodeTransformDescriptor);
@@ -6754,11 +6768,16 @@ extern "C" bool FastllmCudaV41DecodeIndexerBatch(
     for (const auto &item : items) {
         if (!item.query || !item.weights || !item.keys || !item.topk ||
             !V41OnCuda(*item.query) || !V41OnCuda(*item.weights) || !V41OnCuda(*item.keys) ||
-            item.query->dataType != DataType::BFLOAT16 || item.keys->dataType != DataType::BFLOAT16 ||
+            item.query->dataType != DataType::BFLOAT16 ||
+            (item.keys->dataType != DataType::BFLOAT16 && item.keys->dataType != DataType::INT8) ||
             item.weights->dataType != DataType::FLOAT32 || item.query->dims.size() != 4 ||
             item.query->dims[0] != 1 || item.query->dims[1] != 1 || item.query->dims[3] != 128 ||
-            item.keys->dims.size() != 3 || item.keys->dims[0] != 1 || item.keys->dims[2] != 128 ||
+            item.keys->dims.size() != 3 || item.keys->dims[0] != 1 ||
             item.keys->dims[1] <= 0 || item.startPos < 0 || ropeDim <= 0 || ropeDim > 128 || (ropeDim & 1)) return false;
+        int keyMode = 0, ignoredBlockSize = 0;
+        const bool packedKeys = item.keys->dataType == DataType::INT8;
+        if (packedKeys ? !V41ParseKvRowHost(128, item.keys->dims[2], &keyMode, &ignoredBlockSize) :
+                         item.keys->dims[2] != 128) return false;
         const int m = item.keys->dims[1], heads = item.query->dims[2], blocks = (m + blockSize - 1) / blockSize;
         if (heads <= 0 || item.weights->Count(0) != size_t(heads)) return false;
         if ((item.useCandidates || item.writeCandidates) && (!item.candidates ||
@@ -6770,6 +6789,14 @@ extern "C" bool FastllmCudaV41DecodeIndexerBatch(
             nullptr, nullptr, (item.useCandidates || item.writeCandidates) ? (uint8_t *)item.candidates->cudaData : nullptr,
             (int32_t *)item.topk->cudaData, heads, m, std::min(topK, m), item.startPos, blocks,
             item.writeCandidates, item.useCandidates});
+        if (packedKeys) {
+            auto &d = descriptors.back();
+            d.keys = nullptr;
+            d.packedKeys = (const uint8_t *)item.keys->cudaData;
+            d.keyMode = keyMode;
+            d.keyRowBytes = item.keys->dims[2];
+            d.keyVectorUnpack = V41Fp4VecUnpack();
+        }
         transforms.push_back({item.query, nullptr, item.startPos, quantizeQuery ? 2 : 0, false});
         scoreCount += m; blockCount += blocks;
         maxCount = std::max(maxCount, m); maxBlocks = std::max(maxBlocks, blocks);
@@ -7097,7 +7124,7 @@ bool V41FullDecodeAttention(V41FullDecodePlan &p) {
 
 void *FastllmCudaV41CreateFullDecode(const FastllmV41FullDecodeConfig &c,
                                    const FastllmV41FullDecodeBuffers &b) {
-    if (FastllmCudaGraphIsCapturingFast() || c.batch <= 0 || c.batch > 128 || c.heads <= 0 ||
+    if (FastllmCudaGraphIsCapturingFast() || c.batch <= 0 || c.batch > FastllmV41FullDecodeMaxBatch || c.heads <= 0 ||
         c.indexHeads <= 0 || c.ratio < 0 || c.ratio > 2 || c.window <= 0 ||
         c.maxKeys <= 0 || c.topK <= 0 || c.topK > c.maxKeys || c.blockSize <= 0 ||
         c.ropeDim <= 0 || c.ropeDim > 128 || (c.ropeDim & 1) ||

@@ -1700,6 +1700,10 @@ if (UNIT_TEST)
                 "PASS [0-9]+ FP8 full decode rows" 900 --fp8)
             fastllm_add_checked_test(deepseekV41FullDecodeFP8LongContext deepseekV41FullDecodeRegression
                 "PASS [0-9]+ FP8 full decode rows" 900 --fp8 --long-context)
+            fastllm_add_checked_test(deepseekV41FullDecodeFP4 deepseekV41FullDecodeRegression
+                "PASS [0-9]+ FP4 full decode rows" 900 --fp4)
+            fastllm_add_checked_test(deepseekV41FullDecodeFP4LongContext deepseekV41FullDecodeRegression
+                "PASS [0-9]+ FP4 full decode rows" 900 --fp4 --long-context)
             fastllm_add_checked_test(deepseekV41FullVerify deepseekV41FullDecodeRegression
                 "PASS [0-9]+ full verify graph replays" 300 --verify)
             fastllm_add_checked_test(deepseekV41AttentionLocality deepseekV41FullDecodeRegression
@@ -1716,6 +1720,7 @@ if (UNIT_TEST)
                 "PASS [0-9]+ full verify graph replays" 900 --verify --shared-candidates --long-context)
             set_tests_properties(deepseekV41FullDecode deepseekV41FullDecodeStress
                 deepseekV41FullDecodeFP8 deepseekV41FullDecodeFP8LongContext
+                deepseekV41FullDecodeFP4 deepseekV41FullDecodeFP4LongContext
                 deepseekV41FullDecodePooled deepseekV41FullVerify deepseekV41VerifyIndexHeads17 deepseekV41AttentionLocality
                 deepseekV41FullDecodeLongContext deepseekV41FullVerifyLongContext
                 deepseekV41CandidateReuse deepseekV41CandidateReuseVerify
@@ -3185,6 +3190,9 @@ if (UNIT_TEST)
 
         add_executable(ncclOddTpRegression test/ops/ncclOddTpRegression.cu)
         add_executable(parallelRuntimeRegression test/ops/parallelRuntimeRegression.cu)
+        add_executable(deepseekV41AttentionParallelRegression test/ops/deepseekV41AttentionParallelRegression.cpp)
+        target_link_libraries(deepseekV41AttentionParallelRegression fastllm)
+        target_include_directories(deepseekV41AttentionParallelRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
         target_link_libraries(parallelRuntimeRegression fastllm)
         add_test(NAME parallelRuntime COMMAND parallelRuntimeRegression)
         set_tests_properties(parallelRuntime PROPERTIES LABELS "cuda;multigpu" TIMEOUT 240 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)

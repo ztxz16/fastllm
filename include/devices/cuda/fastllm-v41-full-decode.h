@@ -3,6 +3,8 @@
 #include <cstddef>
 #include <atomic>
 
+constexpr int FastllmV41FullDecodeMaxBatch = 128;
+
 // Fixed tensor addresses and launch shapes; request-dependent values are
 // uploaded separately before replay. The caller owns all tensor buffers.
 struct FastllmV41FullDecodeConfig {

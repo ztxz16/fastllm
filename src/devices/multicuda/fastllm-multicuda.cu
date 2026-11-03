@@ -1891,6 +1891,11 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
     }
     ClearGGUFExtraCudaCaches(weight);
     weight.cudaData = nullptr;
+    // Preserve the actual (possibly layer-balanced) weight ranges for later
+    // topology changes. Keep tpLayout unchanged: it describes activation
+    // dispatch semantics and existing linear callers set those separately.
+    weight.tpAxis = splitAxis;
+    weight.tpRanges = divisionScheme;
     ReleaseMultiCudaSplitSource(weight);
     return true;
 }

@@ -28,6 +28,7 @@ static bool fp16Attention = false;
 static double worstAttentionL2 = 0;
 static bool pooled = false;
 static bool longContext = false;
+static bool largeBatch = false;
 static int indexHeads = 32;
 static void Fill(Data &d, const std::vector<int> &dims, int seed,
                  DataType type = DataType::BFLOAT16) {
@@ -241,17 +242,19 @@ int main(int argc, char **argv) {
         cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, 0) != cudaSuccess ||
         major < 7)
         return 77;
-    bool verify = false, locality = false, fp8 = false;
+    bool verify = false, locality = false, fp8 = false, fp4 = false;
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--stress") { stress = true; amplitude = 1.f; }
         if (std::string(argv[i]) == "--pooled") pooled = true;
         if (std::string(argv[i]) == "--verify") verify = true;
         if (std::string(argv[i]) == "--fp8") fp8 = true;
+        if (std::string(argv[i]) == "--fp4") fp4 = true;
         if (std::string(argv[i]) == "--fp16-attention") fp16Attention = true;
         if (std::string(argv[i]) == "--locality") locality = true;
         if (std::string(argv[i]).rfind("--index-heads=", 0) == 0)
             indexHeads = std::stoi(std::string(argv[i]).substr(14));
         if (std::string(argv[i]) == "--long-context") longContext = true;
+        if (std::string(argv[i]) == "--large-batch") largeBatch = true;
         if (std::string(argv[i]) == "--shared-candidates") sharedCandidates = true;
     }
     if (locality && devices < 2) return 77;
@@ -261,7 +264,7 @@ int main(int argc, char **argv) {
         ApplyDeviceMap({{"cpu", 1}}, 0, 1);
         FastllmCudaSetDevice(0);
         if (locality) { RunAttentionLocalityRegression(devices); return 0; }
-        if (fp8) { RunFP8DecodeRegression(); return 0; }
+        if (fp8 || fp4) { RunPackedDecodeRegression(fp4); return 0; }
         if (verify) { RunVerifyRegression(); return 0; }
         if (fp16Attention) { RunFp16AttentionRegression(); return 0; }
         RunRotaryCrossPathRegression();

@@ -30,6 +30,7 @@
 
 #include "utils/execution_mode.h"
 #include "deepseekv4.h"
+#include "parallel/model.h"
 
 #include <atomic>
 #include <cstdint>
@@ -43,6 +44,7 @@
 #include <vector>
 
 namespace fastllm {
+    namespace parallel { class CudaRuntime; }
     // Per image: absolute start, ViT height/width, span length, SHA-256 (8 words)
     // of the normalized FLOAT32 patches, computed by the native Python adapter.
     using DeepSeekV41ImageCacheKeys = std::vector<std::vector<int>>;
@@ -130,6 +132,9 @@ namespace fastllm {
     };
 
     struct DeepSeekV41RequestState {
+        // MLA state is replicated only inside this request's attention TP group.
+        int attentionGroup = -1;
+        std::vector<std::shared_ptr<DeepSeekV41RequestState>> attentionRanks;
         std::vector<DeepSeekV41LayerCache> layers;
         std::vector<int> engramHistory;   // 每个已处理 token 的压缩 id（图像 token 为 -1）
         int totalLen = 0;
@@ -195,13 +200,14 @@ namespace fastllm {
     class HybridMoeDecodeStep;
     struct DeepSeekV41GraphSegmentMeta;
 
-    class DeepSeekV41Model : public DeepSeekV4Model {
+    class DeepSeekV41Model : public DeepSeekV4Model, public parallel::AttentionParallelModel {
     public:
         DeepSeekV41Model();
 
         ~DeepSeekV41Model() override;
 
         void InitParams() override;
+        void ConfigureAttentionParallel(int attentionDP) override;
         std::string SelectSpecialWeightDevice(const std::string &weightName, int layerId) const override;
 
         std::map<std::string, std::vector<std::pair<std::string, DataType> > >
@@ -293,6 +299,14 @@ namespace fastllm {
         ExecutionMode GetExecutionMode() const { return executionMode; }
 
     protected:
+        struct AttentionParallel;
+        struct AttentionParallelFrame;
+        std::shared_ptr<AttentionParallel> v41AttentionParallel;
+        int v41AttentionDP = 1;
+        parallel::CudaRuntime *v41AttentionRankRuntime = nullptr;
+        int v41AttentionRank = -1;
+        int v41AttentionLogicalRows = 0;
+        void PrepareAttentionParallel();
         ExecutionMode executionMode = ExecutionMode::Cpu;
         bool v41MoeCudaGraphCompatible = true;
         void InitExecutionMode();
@@ -422,6 +436,7 @@ namespace fastllm {
             std::vector<float> *logits, int &outputToken);
         struct EngramPrefetch;
         struct ForwardWorkspace;
+        void RunAttentionParallel(ForwardWorkspace &, int layer);
         struct ForwardState;
         void PrepareForward(ForwardWorkspace &);
         void PrepareForwardInputs(ForwardWorkspace &);
@@ -435,6 +450,7 @@ namespace fastllm {
         void RunForwardSharedExpert(ForwardWorkspace &, int layer);
         DeepSeekV41MoeContext MakeForwardMoeContext(ForwardWorkspace &, int layer);
         std::vector<int> FinishForward(ForwardWorkspace &);
+        void FinishForwardGraphs(ForwardWorkspace &);
         void GiveUpForwardGraph(ForwardWorkspace &, const char *stage);
         void CollectForwardGraphPointers(ForwardWorkspace &, std::vector<const void*> &out);
         void ReleaseForwardPrefill(ForwardWorkspace &, std::initializer_list<Data *> tensors);

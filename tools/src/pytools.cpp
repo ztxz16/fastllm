@@ -5,6 +5,7 @@
 #include "model.h"
 #include "models/naive_n05_flash.h"
 #include "models/clover.h"
+#include "parallel/model.h"
 #include "devices/disk/diskdevice.h"
 #include "moe_cache_config.h"
 #include "utils/autotune.h"
@@ -828,6 +829,17 @@ extern "C" {
             fastllm::ErrorInFastLLM("set_model_atype error: atype should be float32, float16 or bfloat16.");
         }
         return;
+    }
+
+    DLL_EXPORT const char *configure_attention_parallel_llm_model(int modelId, int size) {
+        fastllmPytoolsContextResult.clear();
+        try {
+            auto *adapter = dynamic_cast<fastllm::parallel::AttentionParallelModel*>(models.GetModel(modelId));
+            if (size < 1 || (!adapter && size != 1))
+                throw std::invalid_argument("model does not support the requested attention DP layout");
+            if (adapter) adapter->ConfigureAttentionParallel(size);
+        } catch (const std::exception &error) { fastllmPytoolsContextResult = error.what(); }
+        return fastllmPytoolsContextResult.c_str();
     }
 
     DLL_EXPORT void set_model_indexer_dtype(int modelId, const char *dtype) {

@@ -564,6 +564,9 @@ fastllm_lib.set_verbose_llm_model.argtypes = [ctypes.c_int, ctypes.c_bool]
 
 fastllm_lib.warmup_llm_model.argtypes = [ctypes.c_int]
 fastllm_lib.warmup_llm_model.restype = ctypes.c_char_p
+if hasattr(fastllm_lib, "configure_attention_parallel_llm_model"):
+    fastllm_lib.configure_attention_parallel_llm_model.argtypes = [ctypes.c_int, ctypes.c_int]
+    fastllm_lib.configure_attention_parallel_llm_model.restype = ctypes.c_char_p
 
 fastllm_lib.get_max_input_len_llm_model.argtypes = [ctypes.c_int]
 fastllm_lib.get_max_input_len_llm_model.restype = ctypes.c_int
@@ -3516,6 +3519,16 @@ class model:
         if getattr(self, "kvmem_enabled", False):
             raise ValueError("Set KV dtype before configuring KVMem")
         fastllm_lib.set_model_kv_cache_dtype(self.model, str(kv_cache_dtype).encode())
+
+    def configure_attention_parallel(self, size: int):
+        setter = getattr(fastllm_lib, "configure_attention_parallel_llm_model", None)
+        if setter is None:
+            if size != 1:
+                raise RuntimeError("Native library does not support attention DP; rebuild it first")
+            return
+        error = setter(self.model, size)
+        if error:
+            raise ValueError(error.decode("utf-8", errors="replace"))
 
     def warmup(self):
         error = fastllm_lib.warmup_llm_model(self.model)

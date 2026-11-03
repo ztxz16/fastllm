@@ -7227,7 +7227,9 @@ namespace fastllm {
                                                   const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &q = *(datas.find("q")->second);
         Data &chunkKV = *(datas.find("chunkKV")->second);
-        return q.dims.size() == 4 && q.dims[3] == 512 && q.dims[2] % 32 == 0 &&
+        // Head-sharded attention can have fewer than 32 heads. The native
+        // kernel already handles arbitrary positive head counts.
+        return q.dims.size() == 4 && q.dims[3] == 512 && q.dims[2] > 0 &&
                (q.dataType == DataType::BFLOAT16 || q.dataType == DataType::FLOAT32) &&
                chunkKV.dataType == DataType::BFLOAT16;
     }

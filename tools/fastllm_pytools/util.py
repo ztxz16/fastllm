@@ -1042,6 +1042,8 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--multimodal', action = 'store_true',
                         help = 'Qwen3.5/Qwen3.8启动时加载视觉权重并预分配工作区，再分配KV cache；按processor的图片/视频像素上限预热')
     parser.add_argument('--tp', type = str, default = "", help = '线程级张量并行设备；裸数字X表示使用前X张卡，0表示0号卡，也可写 0,1 或 auto')
+    parser.add_argument('--attn-dp-size', type=int, default=1,
+                        help='Attention DP组数；组内TP宽度为--tp总卡数/此值，当前支持DeepSeek V4.1纯GPU路径')
     parser.add_argument('--ep', type = int, choices = (1, 4, 8), default = None,
                         help = '专家并行数；1为原MoE TP路径（默认），4/8为MiMo FP8/H20的专家并行，使用内置MegaMoE W8A8；需配合相同大小的--tp')
     parser.add_argument('--moe_device', type = str, default = "", help = 'moe使用的设备')
@@ -2027,6 +2029,19 @@ def make_normal_llm_model(args, startup_progress = None):
     _configure_sm89_fp8_linear_triton(args)
     _configure_sm120_mxfp4_grouped_triton(
         args, config if is_deepseek_v41_model else {})
+    attention_dp = getattr(args, "attn_dp_size", 1)
+    if attention_dp < 1:
+        raise ValueError("--attn-dp-size must be positive")
+    if attention_dp > 1:
+        if not is_deepseek_v41_model:
+            raise ValueError("Attention DP currently requires the DeepSeek V4.1 adapter")
+        world = _thread_tp_cuda_device_count(getattr(args, "tp", ""))
+        if world < attention_dp or world % attention_dp:
+            raise ValueError("--attn-dp-size must divide the total --tp device count")
+        if speculative_algorithm not in ("", "none"):
+            raise ValueError("Attention DP does not yet support speculative decoding")
+        if _arg_enabled(getattr(args, "fast_prefill", False)):
+            raise ValueError("Attention DP currently requires --no_fast_prefill")
     _configure_qwen35_auto_fast_paths(args, is_qwen35_model, mtp)
     os.environ["FASTLLM_DSV41_DECODER_SWA_BOUNDED_REPLAY"] = (
         "1" if _arg_enabled(getattr(args, "fast_prefill", False)) else "0")
@@ -2190,6 +2205,8 @@ def make_normal_llm_model(args, startup_progress = None):
         if (args.enable_thinking.lower() in ["", "false", "0", "off"]):
             model.enable_thinking = False
         model.set_atype(args.atype)
+        if attention_dp > 1:
+            model.configure_attention_parallel(attention_dp)
         if (args.moe_atype != ""):
             model.set_moe_atype(args.moe_atype)
         if (args.cache_history.lower() not in ["", "false", "0", "off"]):

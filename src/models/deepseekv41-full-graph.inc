@@ -119,6 +119,14 @@ struct V41FullGraph {
     int batch = 1, maxKeys = 131072;
     int firstLayer = 0, endLayer = 0;
     bool verifying = false, capturesInput = false, hybrid = false, tensorParallel = true;
+    // Rank-local attention uses the same dynamic KV plans as ordinary TP.
+    // Its children are interleaved with global Engram/MoE by the DP parent.
+    bool attentionOnly = false;
+    std::vector<std::vector<const void *>> attentionLayers;
+    parallel::CudaRuntime *attentionRuntime = nullptr;
+    std::unique_ptr<parallel::CudaRowTransfer> rowTransfer;
+    std::vector<std::shared_ptr<DeepSeekV41CudaGraphState>> attentionStates;
+    std::vector<std::shared_ptr<V41FullGraph>> attentionGraphs;
     std::vector<void *> moeHandles;
     std::vector<std::vector<void *>> rankMoeHandles;
     std::vector<void *> rankUntimedExecs;
@@ -167,6 +175,9 @@ struct V41FullGraph {
             for (void *handle : rankMoeHandles[rank]) FastllmCudaReleaseNativeMoeFullGraph(handle);
         }
         diskMoe.reset();
+        rowTransfer.reset();
+        attentionGraphs.clear();
+        attentionStates.clear();
         pieces.reset();
         for (auto &layer : layers) if (layer)
             for (void *plan : layer->plans)
@@ -175,7 +186,41 @@ struct V41FullGraph {
     }
 };
 
+// Match the captured row counts, but not request identities or their order.
+// KV pointers and positions are uploaded anew; the persistent permutation is
+// updated when requests move within the batch. Unknown layouts stay eager.
+bool V41FullPartition(V41FullGraph &g, const std::vector<DeepSeekV41Segment> &segments,
+                      std::vector<std::vector<DeepSeekV41Segment>> &local,
+                      parallel::RowPartition &rows) {
+    const auto &topology = g.attentionRuntime->Layout();
+    std::vector<int> owners;
+    local.assign(topology.Size(), {});
+    for (const auto &s : segments) {
+        if (!s.state || s.spec || s.seqlen != 1 || s.startPos < 1 ||
+            s.state->attentionGroup < 0 || s.state->attentionGroup >= topology.attentionDP ||
+            s.state->attentionRanks.size() != size_t(topology.attentionTP)) return false;
+        owners.push_back(s.state->attentionGroup);
+        for (int t = 0; t < topology.attentionTP; ++t) {
+            const int rank = s.state->attentionGroup * topology.attentionTP + t;
+            auto part = s;
+            part.state = s.state->attentionRanks[t];
+            if (!part.state) return false;
+            part.offset = local[rank].size();
+            local[rank].push_back(std::move(part));
+        }
+    }
+    rows = parallel::RowPartition(topology.attentionDP, owners);
+    if (!g.attentionGraphs.empty()) for (int r = 0; r < topology.Size(); ++r) {
+        const auto &graph = g.attentionGraphs[r];
+        if (local[r].size() != size_t(graph ? graph->batch : 0)) return false;
+        if (graph && (!g.attentionStates[r]->captured || g.attentionStates[r]->disabled ||
+            g.attentionStates[r]->fullDecode != graph)) return false;
+    }
+    return true;
+}
+
 bool V41FullDispatch(const V41FullGraph &g, const std::function<void(int, int)> &body) {
+    if (g.attentionRuntime) { g.attentionRuntime->Enqueue(body); return true; }
     if (g.tensorParallel) return MultiCudaRunDeviceCallbacks(g.devices, [&](int rank, int device) {
         const std::vector<int> empty;
         V41FullCallerAffinity affinity(rank < int(g.rankCoordinatorCpus.size())
@@ -264,6 +309,7 @@ bool V41FullUploadRank(V41FullGraph &g, const std::vector<DeepSeekV41Segment> &s
         return V41FullLocal(d, device).cudaData;
     };
     for (int l = g.firstLayer; l < g.endLayer; ++l) {
+        if (!g.layers[l]) continue;
         const auto &layer = *g.layers[l];
         if (layer.plans.empty())
             continue;
@@ -386,6 +432,8 @@ void V41FullBindVerify(const std::shared_ptr<V41FullGraph> &owner, const DeepSee
 
 void DeepSeekV41Model::BuildFullDecodeGraph(
     int batch, const std::vector<DeepSeekV41Segment> &segments, int firstLayer, int endLayer) {
+    const bool distributedAttention = v41AttentionDP > 1;
+    const bool attentionOnly = v41AttentionRankRuntime != nullptr;
     if (firstLayer < 0 && executionMode == ExecutionMode::Hybrid &&
         V41DeviceMapCudaDeviceCount(deviceMap) > 1 && !V41DeviceMapUsesMultiCuda(deviceMap)) {
         std::vector<CudaPrefillStage> stages;
@@ -396,17 +444,21 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
         return;
     }
     const bool pipeline = firstLayer >= 0;
-    const int graphKey = pipeline ? V41PipelineGraphKey(firstLayer, batch) : batch;
+    const int graphKey = pipeline ? V41PipelineGraphKey(firstLayer, batch) : attentionOnly ?
+        batch * 3 + (v41AttentionLogicalRows == 1 ? 0 : v41AttentionLogicalRows <= 8 ? 1 : 2) : batch;
     if (!pipeline) { firstLayer = 0; endLayer = block_cnt; }
     const bool verifying = segments.size() == 1 && segments[0].spec && segments[0].spec->deferWindow;
     const bool hybrid = executionMode == ExecutionMode::Hybrid &&
         (verifying || (batch == 1 && !v41DsparkEnabled)) && FastllmCudaMoeCacheRequested();
-    // Small target chunks share decode's fixed operands and dynamic
-    // request descriptors. Other shapes keep the segmented/eager path.
-    if (batch < 1 || batch > (verifying ? (hybrid ? 32 : 8) : 16) || (!hybrid && executionMode != ExecutionMode::Gpu) ||
+    // Decode rows are independent requests, including packed FP4/FP8 KV.
+    // Use the dynamic kernel's batch bound; verification keeps its causal
+    // chunk bound, and DP retains the previously validated local-row budget.
+    const int batchLimit = verifying ? (hybrid ? 32 : 8) :
+        distributedAttention ? 16 * v41AttentionDP : attentionOnly ? 16 : FastllmV41FullDecodeMaxBatch;
+    if (batch < 1 || batch > batchLimit || (!hybrid && executionMode != ExecutionMode::Gpu) ||
         (!verifying && v41DsparkEnabled) ||
-        (!hybrid && (kvCacheDataType == DataType::FP4_E2M1 ||
-            (verifying && kvCacheDataType == DataType::FP8_E4M3))) ||
+        (!hybrid && verifying && (kvCacheDataType == DataType::FP4_E2M1 ||
+            kvCacheDataType == DataType::FP8_E4M3)) ||
         (!verifying && !v41CudaGraphWarmingUp) || head_dim_full != 512 || hc_mult != 4 || index_head_dim != 128)
         return;
     // Explicit reference/debug modes must retain their selected arithmetic.
@@ -420,14 +472,17 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
     if (slot == v41CudaGraphSlots.end())
         return;
     auto state = V41GetCudaGraphState(slot->second);
-    if (!state->captured || (!hybrid && !state->tensorParallel) ||
+    if (!state->captured || (!hybrid && !attentionOnly && !state->tensorParallel) ||
         (hybrid && !state->tensorParallel && state->devices.size() != 1) || state->fullDecode ||
         state->segments.size() != (size_t)block_cnt * 4)
         return;
-    for (int i = firstLayer * 4; i < endLayer * 4; ++i)
+    for (int i = firstLayer * 4; i < endLayer * 4; ++i) {
+        if ((distributedAttention && i % 4 == 0) || (attentionOnly && i % 4 >= 2)) continue;
         if (state->segments[i].passthrough || state->segments[i].graphs.size() != state->devices.size())
             return;
+    }
     for (int layer = firstLayer; layer < endLayer; ++layer) {
+        if (attentionOnly) continue;
         const bool capturedMoe = state->segments[layer * 4 + 3].containsGpuMoe;
         const auto moeDevice = SelectMoeDeviceForLayer(layer);
         const bool hostMoe = V41DeviceSpecUsesType(moeDevice, "numa") || moeDevice == "cpu" ||
@@ -437,7 +492,7 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
         // Its ordinary peer transfer and remote compute remain segmented.
         if ((!hybrid && !capturedMoe) ||
             (hybrid && !capturedMoe && !hostMoe) ||
-            state->segments[layer * 4].kvOutputs.size() != state->devices.size()) return;
+            (!distributedAttention && state->segments[layer * 4].kvOutputs.size() != state->devices.size())) return;
     }
     if (!hybrid) for (auto &table : engramTables)
         if (!std::static_pointer_cast<V41EngramTable>(table)->gpuTable) return;
@@ -452,6 +507,41 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
     g->rankMoeHandles.resize(g->devices.size());
     g->rankUntimedExecs.resize(g->devices.size(), nullptr);
     g->rankMoeFirstLayer.resize(g->devices.size(), -1);
+    g->attentionOnly = attentionOnly;
+    if (attentionOnly) g->attentionLayers.resize(block_cnt);
+    if (distributedAttention) {
+        if (!v41AttentionParallel) return;
+        auto &parallel = *v41AttentionParallel;
+        auto &runtime = parallel.runtime;
+        g->attentionRuntime = &runtime;
+        std::vector<std::vector<DeepSeekV41Segment>> local;
+        parallel::RowPartition rows(v41AttentionDP, {});
+        if (!V41FullPartition(*g, segments, local, rows)) return;
+        g->attentionStates.resize(g->devices.size());
+        g->attentionGraphs.resize(g->devices.size());
+        // The allocation pinning transaction is process-wide. Build rank
+        // compute pieces sequentially, always on that GPU's fixed worker.
+        for (int r = 0; r < int(g->devices.size()); ++r) {
+            if (local[r].empty()) continue;
+            runtime.Run([&](int rank, int) {
+                if (rank != r) return;
+                auto &model = *parallel.models[rank];
+                model.v41AttentionLogicalRows = batch;
+                model.BuildFullDecodeGraph(local[rank].size(), local[rank]);
+                const int key = local[rank].size() * 3 + (batch == 1 ? 0 : batch <= 8 ? 1 : 2);
+                auto found = model.v41CudaGraphSlots.find(key);
+                if (found == model.v41CudaGraphSlots.end()) return;
+                auto state = V41GetCudaGraphState(found->second);
+                if (!state->fullDecode) return;
+                g->attentionStates[rank] = state;
+                g->attentionGraphs[rank] = std::static_pointer_cast<V41FullGraph>(state->fullDecode);
+            });
+            if (!g->attentionGraphs[r]) return;
+        }
+        g->rowTransfer.reset(new parallel::CudaRowTransfer(runtime, rows));
+        g->rowTransfer->Reserve(size_t(embed_dim) * sizeof(uint16_t) +
+            size_t(2 * hc_mult + hc_mult * hc_mult) * sizeof(float));
+    }
 #ifdef USE_NUMAS
     if (hybrid && !weights.empty() && weights[0].size() > 2 && weights[0][2]) {
         HostMoePlacementScope placement(weights[0][2]);
@@ -485,7 +575,7 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
     // Keep BF16 embedding outputs and token operands at fixed addresses. The
     // ordinary/input-embedding and other precision paths retain their frontend.
     auto &embeddingWeight = weight["embed.weight"];
-    g->capturesInput = firstLayer == 0 && (verifying || (hybrid && !g->tensorParallel)) && embeddingWeight.dataType == DataType::BFLOAT16 &&
+    g->capturesInput = !attentionOnly && firstLayer == 0 && (verifying || (hybrid && !g->tensorParallel)) && embeddingWeight.dataType == DataType::BFLOAT16 &&
         embeddingWeight.dataDevice == DataDevice::CUDA && embeddingWeight.cudaData &&
         !embeddingWeight.multiDeviceData && embeddingWeight.dims.size() == 2 &&
         embeddingWeight.dims[1] == embed_dim &&
@@ -502,11 +592,12 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
     if (hybrid && !g->tensorParallel && batch == 1) alloc(g->deferredHcMix, DataType::FLOAT32, {2 * block_cnt, 32});
     std::vector<int> hcStart, hcJoin;
     const int blockSize = std::max(1, candidate_block_size);
+    g->layers.resize(block_cnt);
+    if (!distributedAttention) {
     alloc(g->topk, DataType::INT32, {1, batch, index_topk});
     alloc(g->candidates, DataType::INT8, {1, batch, (g->maxKeys + blockSize - 1) / blockSize});
     alloc(g->candidateBlocks, DataType::INT32, {batch, (g->maxKeys + blockSize - 1) / blockSize});
     alloc(g->candidateCounts, DataType::INT32, {batch});
-    g->layers.resize(block_cnt);
     for (int l = firstLayer; l < endLayer; ++l) {
         auto layer = std::make_unique<V41FullLayer>();
         auto &c = layer->config;
@@ -562,6 +653,7 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
     }
     if (!V41FullReserve(*g, segments))
         return;
+    }
     const auto snapshots = V41SnapshotSegments(segments, engram_max_ngram_size);
     for (int i = 0; i < (int)engram_layer_ids.size(); ++i) {
         if (engram_layer_ids[i] < firstLayer || engram_layer_ids[i] >= endLayer) continue;
@@ -687,6 +779,7 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
         int candidateWorkspaceRatio = -1;
         std::vector<std::map<bool, void *>> attentionScratch(g->devices.size());
         for (int l = firstLayer; l < endLayer; ++l) {
+            const size_t attentionStart = children[0].size();
             const std::string prefix = "layers." + std::to_string(l);
             auto engram = g->engrams.find(l);
             if (engram != g->engrams.end()) {
@@ -725,6 +818,46 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
             // Delayed-pre normalization consumes the preceding layer's pre.
             // This attention mix is first read by the attention residual below.
             if (hybrid) { hcStart.push_back(children[0].size()); hcJoin.push_back(-1); }
+            if (distributedAttention) {
+                auto &runtime = *g->attentionRuntime;
+                const auto &topology = runtime.Layout();
+                capture([&] {
+                    runtime.Enqueue([&](int rank, int device) {
+                        if (!g->attentionGraphs[rank]) return;
+                        auto &local = *g->attentionStates[rank]->workspace;
+                        g->rowTransfer->Select(rank, V41FullLocal(ws.hiddenStates, device).cudaData,
+                            local.hiddenStates.cudaData, size_t(embed_dim) * hc_mult * sizeof(uint16_t));
+                        g->rowTransfer->Select(rank, V41FullLocal(l ? ws.ffnPre : ws.preMix, device).cudaData,
+                            local.preMix.cudaData, hc_mult * sizeof(float));
+                    });
+                });
+                for (size_t rank = 0; rank < children.size(); ++rank) if (g->attentionGraphs[rank]) {
+                    const auto &parts = g->attentionGraphs[rank]->attentionLayers.at(l);
+                    children[rank].insert(children[rank].end(), parts.begin(), parts.end());
+                }
+                capture([&] {
+                    runtime.Enqueue([&](int rank, int device) {
+                        auto *local = g->attentionStates[rank] ? g->attentionStates[rank]->workspace.get() : nullptr;
+                        if (local && topology.attentionTP > 1) {
+                            auto &projection = local->attnProj;
+                            auto &sum = local->reductionBuffers["attention_tp"];
+                            const auto type = projection.dataType;
+                            ToDataType(projection, sum, FLOAT32);
+                            runtime.AllReduce(topology.attention[topology.AttentionOwner(rank)],
+                                rank, sum.cudaData, sum.Count(0), parallel::ScalarType::Float32);
+                            ToDataType(sum, projection, type);
+                        }
+                        parallel::CudaRowTransfer::Field fields[4];
+                        Data *globals[] = {&ws.attnProj, &ws.attnPre, &ws.attnPost, &ws.attnComb};
+                        Data *locals[] = {local ? &local->attnProj : nullptr, local ? &local->attnPre : nullptr,
+                            local ? &local->attnPost : nullptr, local ? &local->attnComb : nullptr};
+                        for (int i = 0; i < 4; ++i)
+                            fields[i] = {locals[i] ? locals[i]->cudaData : nullptr,
+                                V41FullLocal(*globals[i], device).cudaData, globals[i]->GetBytes() / batch};
+                        g->rowTransfer->Collect(rank, fields, 4);
+                    });
+                });
+            } else {
             for (size_t rank = 0; rank < children.size(); ++rank)
                 children[rank].push_back(state->segments[l * 4].graphs[rank]);
             auto &layer = *g->layers[l];
@@ -812,6 +945,12 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
                                     "full graph attention failed");
                 });
             });
+            } // dynamic local/world attention
+            if (attentionOnly) {
+                children[0].push_back(state->segments[l * 4 + 1].graphs[0]);
+                g->attentionLayers[l].assign(children[0].begin() + attentionStart, children[0].end());
+                continue;
+            }
             const bool hostMoe = hybrid && !state->segments[l * 4 + 3].containsGpuMoe;
             if (hybrid) {
                 hcJoin.back() = children[0].size();
@@ -900,7 +1039,7 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
                 });
             }
         }
-        if (endLayer == block_cnt) capture([&] {
+        if (!attentionOnly && endLayer == block_cnt) capture([&] {
             V41HcApplyPre(ws.hiddenStates, ws.ffnPre, g->head);
             weight["head.weight"].tpLinearType = TP_LINEAR_ROW;
             const bool compactHead = weight["head.weight"].dataType == DataType::FLOAT32 ||
@@ -962,7 +1101,7 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
         g->graphs.resize(g->devices.size(), nullptr);
         g->execs.resize(g->devices.size(), nullptr);
         if (verifying) g->ready.resize(g->devices.size(), nullptr);
-        for (size_t rank = 0; rank < g->devices.size(); ++rank) {
+        for (size_t rank = 0; !attentionOnly && rank < g->devices.size(); ++rank) {
             FastllmCudaSetDevice(g->devices[rank]);
             if (verifying) {
                 g->ready[rank] = FastllmCudaEventCreate();
@@ -1019,10 +1158,11 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
         if (!asyncEntries.empty())
             g->engramWorker.reset(new V41FullEngramWorker(std::move(asyncEntries)));
         state->fullDecode = g;
-        fprintf(stderr,
+        if (!attentionOnly) fprintf(stderr,
                 "[Fastllm] DeepSeek-V4.1 full %s graph ready: %s=%d, ranks=%zu, one graph "
                 "per rank/step, layers=[%d,%d), maxKeys=%d\n",
-                verifying ? "verify" : "decode", verifying ? "tokens" : "batch", batch, g->devices.size(), firstLayer, endLayer, g->maxKeys);
+                distributedAttention ? "DP decode" : verifying ? "verify" : "decode",
+                verifying ? "tokens" : "batch", batch, g->devices.size(), firstLayer, endLayer, g->maxKeys);
     } catch (const std::exception &error) {
         if (poolOpen)
             FastllmCudaGraphMemoryPoolAbort();
@@ -1050,8 +1190,7 @@ bool DeepSeekV41Model::TryFullDecodeGraph(ForwardWorkspace &f, bool inputsPrepar
     // Keep plain DSpark steps on their feature-producing segmented path.
     if ((v41DsparkEnabled && !f.dsparkVerify) || !f.graphReplay || !f.graphState ||
         (v41CudaGraphWarmingUp && !f.dsparkVerify) ||
-        (f.quantKV && executionMode != ExecutionMode::Hybrid &&
-            (f.dsparkVerify || kvCacheDataType != DataType::FP8_E4M3)) ||
+        (f.quantKV && executionMode != ExecutionMode::Hybrid && f.dsparkVerify) ||
         f.hasImageTokens || f.inputEmbeds)
         return false;
     if (f.graphState->fullDecode) {
@@ -1085,6 +1224,7 @@ bool DeepSeekV41Model::TryFullDecodeGraph(ForwardWorkspace &f, bool inputsPrepar
     }
     if (!f.graphState->fullDecode) return false;
     auto g = std::static_pointer_cast<V41FullGraph>(f.graphState->fullDecode);
+    if (g->attentionOnly) return false;
     if (!g->moeHandles.empty() && (!f.moeStep || !*f.moeStep)) return false;
     V41FullCallerAffinity affinity(g->coordinatorCpus);
     if (g->capturesInput) {
@@ -1095,8 +1235,18 @@ bool DeepSeekV41Model::TryFullDecodeGraph(ForwardWorkspace &f, bool inputsPrepar
             g->hostTokens[i] = f.tokenIds[i];
         }
     }
-    if (!V41FullReserve(*g, f.inputSegments))
-        return false;
+    std::vector<std::vector<DeepSeekV41Segment>> attentionSegments;
+    if (g->attentionRuntime) {
+        parallel::RowPartition rows(v41AttentionDP, {});
+        if (!V41FullPartition(*g, f.inputSegments, attentionSegments, rows)) return false;
+        std::vector<int> reserved(g->devices.size(), 1);
+        g->attentionRuntime->Run([&](int rank, int) {
+            if (g->attentionGraphs[rank])
+                reserved[rank] = V41FullReserve(*g->attentionGraphs[rank], attentionSegments[rank]);
+        });
+        if (std::find(reserved.begin(), reserved.end(), 0) != reserved.end()) return false;
+        g->rowTransfer->Reset(std::move(rows));
+    } else if (!V41FullReserve(*g, f.inputSegments)) return false;
     const auto snapshots = V41SnapshotSegments(f.inputSegments, engram_max_ngram_size);
     for (auto &entry : g->engrams) {
         auto &e = *entry.second;
@@ -1129,6 +1279,8 @@ bool DeepSeekV41Model::TryFullDecodeGraph(ForwardWorkspace &f, bool inputsPrepar
     std::atomic<int> ready{0};
     auto dispatchReplay = [&] { return V41FullDispatch(*g, [&](int rank, int device) {
         uploaded[rank] = V41FullUploadRank(*g, f.inputSegments, rank, device) ? 1 : 0;
+        if (g->attentionRuntime && g->attentionGraphs[rank])
+            uploaded[rank] &= V41FullUploadRank(*g->attentionGraphs[rank], attentionSegments[rank], 0, device);
         ready.fetch_add(1, std::memory_order_release);
         while (ready.load(std::memory_order_acquire) < (int)g->devices.size())
             std::this_thread::yield();
@@ -1168,7 +1320,13 @@ bool DeepSeekV41Model::TryFullDecodeGraph(ForwardWorkspace &f, bool inputsPrepar
         if (f.pipeline) f.pipeline->fullVerify = true;
     }
     ++g->replays;
-    V41FullAdvance(*g, f.inputSegments);
+    if (V41DecodeCudaGraphVerbose() && g->replays <= 2)
+        fprintf(stderr, "[Fastllm] DeepSeek-V4.1 full graph replay: batch=%d attention_dp=%d ranks=%zu\n",
+            g->batch, v41AttentionDP, g->devices.size());
+    if (g->attentionRuntime) {
+        for (size_t r = 0; r < g->attentionGraphs.size(); ++r)
+            if (g->attentionGraphs[r]) V41FullAdvance(*g->attentionGraphs[r], attentionSegments[r]);
+    } else V41FullAdvance(*g, f.inputSegments);
     f.curHidden = &f.ws->hiddenStates;
     f.preMixPtr = &f.ws->ffnPre;
     if (!inputsPrepared) ++f.graphState->replayCount;

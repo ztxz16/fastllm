@@ -15,6 +15,7 @@ namespace fastllm {
         std::vector<Data> segTopK, segCandidate, segQ, segKV, segAttnOut;
         std::vector<Data> segIndexQ, segIndexWeight;
         Data compressJoined, compressScores, compressLatents, compressKeys;
+        Data compressPackedLatents, compressPackedKeys;
         std::vector<Data> compressLatentViews, compressKeyViews;
 
         DeepSeekV41DecodeWorkspace();
