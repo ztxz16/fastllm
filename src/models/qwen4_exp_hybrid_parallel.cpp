@@ -55,6 +55,7 @@ namespace fastllm {
     bool Qwen4ExpModel::TryPipelineMoeReadback(const Data &input, const Data &index,
                                                const Data &score) {
 #ifdef USE_NUMAS
+        if (hybridOwnedPp) return false;
         if (threadTpRank >= 0) {
             return threadTpRank == 0 && threadTpOwner && threadTpOwner->hybrid.expertParallel &&
                    FastllmCudaMoeExpertParallelReadback(*threadTpOwner->hybrid.expertParallel,
@@ -74,6 +75,7 @@ namespace fastllm {
                                           const std::function<void()> &sharedExpert,
                                           Data **deferredPeer, bool preparedReadback) {
 #ifdef USE_NUMAS
+        if (hybridOwnedPp) return false;
         if (threadTpState || threadTpRank >= 0 || input.dataDevice != CUDA ||
             input.dims.size() != 2 || input.dims[0] < 1 ||
             input.dims[0] > FASTLLM_CUDA_MOE_CACHE_MAX_BATCH || !MoeCudaCacheRequested() ||
@@ -96,7 +98,7 @@ namespace fastllm {
     Qwen4ExpModel::HybridExecutionScope::HybridExecutionScope(Qwen4ExpModel &model,
                                                               const Data &inputIds,
                                                               bool pipelinedPrefill,
-                                                              bool mtpIteration) {
+                                                              bool mtpIteration, bool targetVerifier) {
 #if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM) && defined(__linux__)
         const bool bind =
             mtpIteration
@@ -106,12 +108,42 @@ namespace fastllm {
         affinity.reset(
             new HybridPeerState::CallerAffinity(bind ? model.hybridPeer.get() : nullptr));
 #endif
+        const char *fullGraph = std::getenv("FASTLLM_QWEN38_HYBRID_GRAPH");
+        const bool verifierPolicy = targetVerifier && fullGraph && std::string(fullGraph) == "1";
+        // One scope spans the complete target forward, including all PLE and
+        // device ranges. Draft proposals and small prefill chunks are not
+        // verifier steps and must not start an independent admission cycle.
         if (!mtpIteration && model.executionMode == ExecutionMode::Hybrid &&
-            model.threadTpRank < 0 && inputIds.dims[1] == 1 &&
-            Qwen4CudaOnlyDeviceMap(model.deviceMap) && !model.weights.empty() &&
-            !model.weights[0].empty()) {
-            decodeStep.Begin(model.weights[0].data(), model.weights[0].size(),
-                             model.num_experts_per_tok);
+            model.threadTpRank < 0 && (inputIds.dims[1] == 1 || verifierPolicy) &&
+            Qwen4CudaOnlyDeviceMap(model.deviceMap) && !model.weights.empty()) {
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+            if (model.hybridOwnedPp) {
+                // Each immutable PP owner has one complete-forward policy.
+                // No peer reads these caches, so their admission lifetimes
+                // can be managed by the common per-device scope.
+                std::vector<CudaPrefillStage> stages;
+                if (BuildCudaPrefillStages(model.deviceMap, model.block_cnt, stages)) {
+                    const int previous = FastllmCudaGetDevice();
+                    for (const auto &stage : stages) {
+                        FastllmCudaSetDevice(stage.device);
+                        for (int layer = stage.firstLayer; layer < stage.endLayer; ++layer)
+                            if (deviceSteps.Begin(stage.device, model.weights[layer].data(),
+                                    model.weights[layer].size(), model.num_experts_per_tok)) break;
+                    }
+                    FastllmCudaSetDevice(previous);
+                    return;
+                }
+            }
+#endif
+            // A resident prefix is not a host-cache key. Find the first target
+            // layer that owns the shared cache so later NUMA layers still use
+            // complete-forward observation and admission.
+            for (int layer = 0; layer < model.block_cnt && layer < int(model.weights.size()); ++layer) {
+                auto &weights = model.weights[layer];
+                if (weights.empty()) continue;
+                decodeStep.Begin(weights.data(), weights.size(), model.num_experts_per_tok);
+                if (decodeStep) break;
+            }
         }
     }
     Qwen4ExpModel::HybridExecutionScope::~HybridExecutionScope() = default;

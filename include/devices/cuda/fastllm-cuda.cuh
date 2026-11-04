@@ -1966,6 +1966,7 @@ struct FastllmCudaMoeCacheLayer {
     // PP cache placement only; -1 permits every device. Expert-distributed
     // execution supplies its own ownership and does not use this restriction.
     int cacheDevice = -1;
+    bool qwen38FlashNext = false; // Explicit caller profile; Standard arithmetic.
 };
 // One anchor plus up to eight speculative tokens. Larger prefill batches
 // keep using the configured MoE backend.
@@ -1989,6 +1990,7 @@ bool FastllmCudaPrepareMoeCacheWithBudgets(
         const FastllmCudaMoeCacheLayer *layers, int layerCount,
         const std::function<void()> &registerNumaWeights, bool allowStreaming,
         const std::map<int, uint64_t> &deviceBudgets, bool fullyResident);
+bool FastllmCudaMoeCacheIsQwen38(fastllm::Data **weights, int weightsBatch);
 bool FastllmCudaCanRunMoeCache(
         fastllm::Data **weights, int weightsBatch);
 
@@ -2002,6 +2004,7 @@ struct FastllmCudaMoePrefillResidents {
     int gateType = -1, downType = -1, hidden = 0, inter = 0;
     int ownerRank = 0, ownerCount = 1;
     bool nativeGlm = false; // GGUF grouped backend math compatibility
+    bool nativeGGUF = false; // Preserve packed NUMA records; grouped prefill restores its working tiles.
     bool nativeWeights = false; // Directly consumed by existing host-prefill kernels.
     bool sharedWeights = false; // Native or losslessly restored NUMA layout.
 };
@@ -2055,7 +2058,13 @@ struct FastllmCudaMoeGGUFCacheView {
     // the launch bound; only the first *activeRouteCount entries are read or
     // written. Keep this count and the routing arrays alive through replay.
     const int32_t *activeRouteCount = nullptr;
+    // Immutable Q8_1 [rows, hidden] input shared by forked resident/miss
+    // branches. The producer must precede both branches; gate scratch stays
+    // private. Null retains this view's ordinary workspace/input preparation.
+    const void *preparedQ8Input = nullptr;
+    bool exactSubwarp = false; // Qwen verification; other callers retain warp kernels.
 };
+bool FastllmCudaMoeGGUFPrepareQ8Input(const fastllm::Data &input, void *destination, size_t bytes);
 bool FastllmCudaMoeGGUFCacheSupported(int type, int columns);
 bool FastllmCudaMoeGGUFCacheNumaSupported(int gateType, int downType,
     int hidden, int inter, int rows);

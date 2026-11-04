@@ -9107,7 +9107,14 @@ namespace fastllm {
             // admission of the next request into this same bounded pool.
             {
                 std::lock_guard<std::mutex> stateGuard(stateMutex);
-                ResetDecodeServingState(requestStates[&slot->cache.front().first], true);
+                // Single-device hybrid segments may be only partly captured
+                // when a short generation ends. Preserve their storage and
+                // let later requests finish capture instead of freezing that
+                // partial topology forever. Other serving strategies retain
+                // their existing first-request capture policy.
+                const bool freezeGraphs = executionMode != ExecutionMode::Hybrid ||
+                                          slot->devices.size() != 1;
+                ResetDecodeServingState(requestStates[&slot->cache.front().first], freezeGraphs);
             }
             for (int layer = 0; layer < block_cnt; ++layer) {
                 if (IsLinearAttentionLayer(layer)) continue;
@@ -9183,7 +9190,9 @@ namespace fastllm {
                     }
                     {
                         std::lock_guard<std::mutex> stateGuard(stateMutex);
-                        ResetDecodeServingState(requestStates[&slot->cache.front().first], reused);
+                        const bool freezeGraphs = reused &&
+                            (executionMode != ExecutionMode::Hybrid || slot->devices.size() != 1);
+                        ResetDecodeServingState(requestStates[&slot->cache.front().first], freezeGraphs);
                     }
                     for (int layer = 0; reused && layer < block_cnt; ++layer) {
                         for (Data *tensor : {&slot->cache[layer].first, &slot->cache[layer].second}) {
@@ -9906,7 +9915,8 @@ namespace fastllm {
     }
 
     void Qwen4ExpModel::ForwardState::BeginHybridStep() {
-        work->hybridStep.emplace(work->model, work->inputIds, work->prefill != nullptr);
+        work->hybridStep.emplace(work->model, work->inputIds, work->prefill != nullptr,
+                                false, work->verificationCapture != nullptr);
     }
     void Qwen4ExpModel::ForwardState::PrefetchExperts(int layer) {
         work->model.PrefetchHybridExperts(work->inputIds, work->prefill != nullptr, layer, work->endLayer);

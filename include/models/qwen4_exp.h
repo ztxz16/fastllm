@@ -23,6 +23,7 @@
 namespace fastllm {
     class CudaChunkedPrefillPipeline;
     class HybridMoePeerRuntime;
+    struct HybridMoeRemoteWorkspace;
     class Qwen4ExpModel : public Qwen3NextModel {
     public:
         Qwen4ExpModel();
@@ -222,6 +223,7 @@ namespace fastllm {
 #ifndef USE_ROCM
         using HybridPeerState = HybridMoePeerRuntime;
         std::unique_ptr<HybridPeerState> hybridPeer;
+        bool hybridOwnedPp = false;
         bool TryRunPipelineMoe(int layer, const Data &input, const Data &index,
                 const Data &score, Data &output, std::vector<Data *> &moeWeights,
                 const std::function<void()> &sharedExpert, Data **deferredPeer, bool preparedReadback);
@@ -574,6 +576,9 @@ namespace fastllm {
         struct MoEPrepared {
             Data index, score;
             MoEResult result;
+#ifdef USE_CUDA
+            std::shared_ptr<HybridMoeRemoteWorkspace> remote;
+#endif
             // Optional stable, graph-owned destination; never owned here.
             Data *outputTarget = nullptr;
             bool readbackPrepared = false;

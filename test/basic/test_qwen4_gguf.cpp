@@ -1,6 +1,7 @@
 #include "model.h"
 #include "models/qwen4_exp.h"
 #include "executor.h"
+#include "utils.h"
 #include "devices/disk/diskdevice.h"
 #include "gguf.h"
 #include "json11.hpp"
@@ -293,6 +294,106 @@ void TestEmbeddingImport(const Fixture &fixture) {
 }
 namespace fastllm {
 struct Qwen4GGUFTestAccess {
+    static void CheckRemoteMoeDispatch() {
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+        setenv("FASTLLM_QWEN38_REMOTE_GRAPH", "1", 1);
+        SetCudaGraph(true);
+        for (int source : {0, 1}) for (DataType type : {FLOAT32, FLOAT16})
+        for (int rows : {1, 4, 8}) for (int format : {-1, int(GGML_TYPE_IQ2_XS), int(GGML_TYPE_Q2_0),
+                                                     int(GGML_TYPE_IQ3_XXS), int(GGML_TYPE_IQ3_S)}) {
+            const int owner = 1 - source, hidden = 256, intermediate = 256, experts = 4;
+            const std::string dense = "cuda:" + std::to_string(source);
+            const std::string remote = "cuda:" + std::to_string(owner);
+            SetDeviceMap({{dense, 1}}); SetMoeDeviceMap({{remote, 1}});
+            Qwen4ExpModel model;
+            model.block_cnt = 1; model.executionMode = ExecutionMode::Hybrid;
+            model.deviceMap = {{dense, 1}}; model.moeDeviceMap = {{remote, 1}};
+            std::vector<std::unique_ptr<Data>> storage(2 * experts);
+            std::vector<Data *> weights(2 + 2 * experts, nullptr), bias(weights.size(), nullptr);
+            for (int expert = 0; expert < experts; ++expert) for (int projection = 0; projection < 2; ++projection) {
+                const std::vector<int> dims = projection ? std::vector<int>{hidden, intermediate}
+                                                        : std::vector<int>{2 * intermediate, hidden};
+                auto &weight = storage[2 * expert + projection];
+                if (format < 0) {
+                    weight.reset(new Data(NVFP4_BLOCK_16_E4M3, dims));
+                    weight->blockK = 1; weight->blockM = 16; weight->Allocate();
+                    std::memset(weight->cpuData, 0, weight->GetBytes());
+                    const size_t packed = GetNVFP4WeightBytes(dims[0], dims[1]);
+                    std::memset(weight->cpuData + packed, 0x38, size_t(dims[0]) * dims[1] / 16);
+                    for (int row = 0; row < dims[0]; ++row) {
+                        const int col = (row * 17 + expert * 7) % dims[1];
+                        weight->cpuData[size_t(row) * dims[1] / 2 + col / 2] = (row % 3 ? 2 : 10) << ((col & 1) * 4);
+                    }
+                    weight->scales = projection ? std::vector<float>{.125f} : std::vector<float>{.5f, .25f};
+                } else {
+                    const auto quant = static_cast<ggml_type>(format);
+                    weight.reset(new Data(DATA_GGUF_FORMAT, quant, dims)); weight->Allocate();
+                    unsigned random = expert * 17 + projection + 937;
+                    for (size_t i = 0; i < weight->GetBytes(); ++i) {
+                        random = random * 1664525u + 1013904223u; weight->cpuData[i] = random >> 24;
+                    }
+                    const uint16_t scale = float_to_half(1.f / 256);
+                    for (size_t i = 0; i < weight->GetBytes(); i += ggml_type_size(quant))
+                        std::memcpy(weight->cpuData + i, &scale, sizeof(scale));
+                }
+                weight->directMemory = true;
+                weight->ToDevice(CUDA, std::vector<int>{owner});
+                weights[2 + 2 * expert + projection] = weight.get();
+            }
+            Qwen4ExpModel::MoEExecutionPlan plan{ExecutionMode::Gpu, 0,
+                "model.layers.0.mlp.", &weights, &bias};
+            Qwen4ExpModel::MoEPrepared prepared;
+            Data input(type, {1, rows, hidden}, std::vector<float>(rows * hidden, 0.125f)), output;
+            input.ToDevice(CUDA, std::vector<int>{source});
+            prepared.index.dataType = INT32; prepared.index.Resize({rows, 2});
+            prepared.index.ToDevice(CUDA, std::vector<int>{source}, false); prepared.index.Allocate(false);
+            prepared.score.CopyFrom(Data(FLOAT32, {rows, 2}, std::vector<float>(2 * rows, 0.5f)));
+            prepared.score.ToDevice(CUDA, std::vector<int>{source});
+            prepared.result.sharedOutput.CopyFrom(Data(type, {1, rows, hidden}, std::vector<float>(rows * hidden, 0.25f)));
+            prepared.result.sharedOutput.ToDevice(CUDA, std::vector<int>{source});
+            std::vector<int> indices(rows * 2);
+            FastllmCudaCopyFromHostToDevice(prepared.index.cudaData, indices.data(), indices.size() * sizeof(int));
+            auto run = [&] {
+                ApplyDeviceMap(model.deviceMap, 1, 1);
+                model.RunMoE(plan, input, output, false, nullptr, &prepared, [] {});
+            };
+            const void *inputPointer = input.cudaData, *indexPointer = prepared.index.cudaData,
+                       *scorePointer = prepared.score.cudaData;
+            run(); FastllmCudaSyncCurrentThreadStream();
+            Check(prepared.remote != nullptr, "resident GPU plan bypassed remote hybrid workspace");
+            void *graph = nullptr, *exec = nullptr; std::vector<void *> pins;
+            Check(FastllmCudaGraphPrepareCaptureDevice() && FastllmCudaGraphMemoryPoolBegin() &&
+                  FastllmCudaGraphBeginCapture(), "remote model capture begin");
+            run();
+            Check(FastllmCudaGraphEndCapture(&graph) && graph && FastllmCudaGraphMemoryPoolEnd(pins) &&
+                  FastllmCudaGraphInstantiate(graph, &exec), "remote model capture finish");
+            std::vector<unsigned char> expected(output.GetBytes()), actual(expected.size());
+            for (int pass = 0; pass < 16; ++pass) {
+                std::vector<float> values(rows * hidden);
+                for (size_t i = 0; i < values.size(); ++i)
+                    values[i] = float(int((i * 13 + pass * 3) % 53) - 26) / 32;
+                Data changed(type, input.dims, values);
+                FastllmCudaCopyFromHostToDevice(input.cudaData, changed.cpuData, changed.GetBytes());
+                for (size_t i = 0; i < indices.size(); ++i) indices[i] = (i + pass) % experts;
+                FastllmCudaCopyFromHostToDevice(prepared.index.cudaData, indices.data(), indices.size() * sizeof(int));
+                run(); FastllmCudaSyncCurrentThreadStream();
+                FastllmCudaCopyFromDeviceToHost(expected.data(), output.cudaData, expected.size());
+                Check(FastllmCudaGraphLaunch(exec), "remote model replay");
+                FastllmCudaSyncCurrentThreadStream();
+                FastllmCudaCopyFromDeviceToHost(actual.data(), output.cudaData, actual.size());
+                Check(expected == actual, "remote model graph differs from eager execution");
+                Check(input.cudaData == inputPointer && prepared.index.cudaData == indexPointer &&
+                      prepared.score.cudaData == scorePointer && input.dataDeviceIds == std::vector<int>{source} &&
+                      prepared.index.dataDeviceIds == input.dataDeviceIds && prepared.score.dataDeviceIds == input.dataDeviceIds,
+                      "remote model migrated dense graph routing buffers");
+            }
+            FastllmCudaGraphExecDestroy(exec); FastllmCudaGraphDestroy(graph);
+            FastllmCudaGraphMemoryPoolRelease(pins);
+            std::printf("PASS: Qwen4 remote GPU-plan graph source=%d type=%d rows=%d format=%d 16 exact replays\n", source, int(type), rows, format);
+        }
+#endif
+    }
+
     static void CheckQsaCausalMask() {
 #ifdef USE_CUDA
         SetDeviceMap({{"cuda:0", 1}});
@@ -435,9 +536,10 @@ struct Qwen4GGUFTestAccess {
         std::cout << "PASS: Qwen4 graph slot resets history and preserves captured storage\n";
 #endif
     }
-    static void CheckGraphSlotOwnership(int secondDevice) {
+    static void CheckGraphSlotOwnership(int secondDevice, bool hybrid = false) {
 #ifdef USE_CUDA
         Qwen4ExpModel model;
+        model.executionMode = hybrid ? ExecutionMode::Hybrid : ExecutionMode::Gpu;
         model.block_cnt = 2;
         model.linearLayers = {true, true};
         model.servingCache = std::make_shared<Qwen4ExpModel::ServingCache>();
@@ -463,17 +565,27 @@ struct Qwen4GGUFTestAccess {
             }
         }
         const Data *slotKey = nullptr;
-        for (int request = 0; request < 2; ++request) {
+        // A one-output request runs only prefill and captures no decode shape.
+        // Subsequent hybrid requests must still be able to capture, while the
+        // same KV storage and MTP checkpoint owners survive every boundary.
+        for (int request = 0; request < 4; ++request) {
             std::vector<std::pair<Data, Data>> cache(2);
             const Data *rootKey = &cache.front().first;
             model.requestStates[rootKey].reusableGraphRequest = true;
-            for (int phase = 0; phase < 2; ++phase) {
+            for (int phase = 0; phase < (request == 0 ? 1 : 2); ++phase) {
                 Check(model.WithDecodeServingCache(cache, [&](auto &owned) {
                     const Data *key = &owned.front().first;
                     if (!slotKey) slotKey = key;
                     Check(key == slotKey && key != rootKey,
                           "prefill, decode and repeated requests changed slot ownership");
                     auto &state = model.requestStates[key];
+                    const bool expectedFrozen = request > 0 && (!hybrid || secondDevice != 0);
+                    Check(state.decodeGraphsFrozen == expectedFrozen,
+                          "reused hybrid slot cannot finish capture after a short request");
+                    if (state.mtpState)
+                        Check(state.mtpState->attentionState.decodeGraphsFrozen == expectedFrozen,
+                              "draft capture policy diverged from its reused target slot");
+                    else state.mtpState = std::make_shared<Qwen4ExpModel::MtpRuntimeState>();
                     Check(state.processedTokens == (phase == 0 ? std::vector<int>{} :
                                                                 std::vector<int>{17}),
                           "prefill history was lost or leaked into the next request");
@@ -1016,14 +1128,25 @@ int main(int argc, char **argv) {
             return 77;
 #endif
         }
+        if (argc == 2 && std::string(argv[1]) == "--remote-moe") {
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+            if (FastllmCudaGetDeviceCount() < 2) return 77;
+            Qwen4GGUFTestAccess::CheckRemoteMoeDispatch();
+            return 0;
+#else
+            return 77;
+#endif
+        }
         if (argc == 2 && std::string(argv[1]) == "--graph-slot-reset") {
 #ifdef USE_CUDA
             if (FastllmCudaGetDeviceCount() < 1) return 77;
             FastllmCudaSetDevice(0);
             Qwen4GGUFTestAccess::CheckGraphSlotReset();
             Qwen4GGUFTestAccess::CheckGraphSlotOwnership(0);
+            Qwen4GGUFTestAccess::CheckGraphSlotOwnership(0, true);
             if (FastllmCudaGetDeviceCount() >= 2) {
                 Qwen4GGUFTestAccess::CheckGraphSlotOwnership(1);
+                Qwen4GGUFTestAccess::CheckGraphSlotOwnership(1, true);
                 Qwen4GGUFTestAccess::CheckGraphSlotReset(0, 1);
                 Qwen4GGUFTestAccess::CheckGraphSlotReset(1, 0);
             }

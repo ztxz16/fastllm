@@ -25,6 +25,14 @@ namespace fastllm {
         if (device >= 0) {
             FastllmCudaSetDevice(device);
         }
+        for (auto &item : hybridFullGraphs) {
+            auto &full = item.second;
+            if (full.replay) FastllmCudaGraphExecDestroy(full.replay);
+            if (full.exec) FastllmCudaGraphExecDestroy(full.exec);
+            if (full.graph) FastllmCudaGraphDestroy(full.graph);
+            for (void *handle : full.handles) FastllmCudaReleaseNativeMoeFullGraph(handle);
+        }
+        hybridFullGraphs.clear();
         for (auto &item : segments) {
             Segment &segment = item.second;
             if (segment.exec != nullptr) {
@@ -888,9 +896,14 @@ namespace fastllm {
         // Honor the same startup budget on every rank; serving requests
         // still take the frozen/eager branch before attempting any capture.
         const bool prepareReusableTp = threadTpRank >= 0 && requestState.reusableGraphRequest;
+        // A hybrid backbone has a dense and a shared segment per layer,
+        // plus QSA remainders. One capture per token can outlast an entire
+        // response; amortize startup across eight segments for reusable slots.
+        const bool prepareReusableHybrid = threadTpRank < 0 && hybridDenseGraph &&
+                                           requestState.reusableGraphRequest;
         const int captureBudget = threadTpRank >= 0 && !prepareReusableTp ? 1 :
             (captureBudgetEnv ? std::max(1, std::min(128, std::atoi(captureBudgetEnv)))
-                              : (prepareReusableTp ? 8 : 1));
+                              : (prepareReusableTp || prepareReusableHybrid ? 8 : 1));
         auto runCapturedSegment = [&](int segmentKey, const auto &runBody) {
             DecodeCudaGraphState::Segment &segment = graphState->segments[segmentKey];
             FastllmCudaSetDevice(device);
@@ -917,8 +930,9 @@ namespace fastllm {
                 return;
             }
 
-            // Serving requests only replay the shapes captured by the first
-            // request. An unseen or invalidated shape stays eager thereafter.
+            // Frozen serving strategies only replay their first request's
+            // shapes. Single-device hybrid slots can complete partial captures
+            // across requests; pointer/capacity changes still reset them above.
             if (requestState.decodeGraphsFrozen) {
                 runBody();
                 return;

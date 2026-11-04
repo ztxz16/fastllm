@@ -1,5 +1,6 @@
 // Hybrid graph boundaries, expert overlap and output joins.
 #include "qwen4_exp_tp.h"
+#include <cstring>
 #include "qwen4_exp_graph.h"
 #include "qwen4_exp_execution.h"
 #include "models/qwen4_paged_cache.h"
@@ -26,14 +27,21 @@ namespace fastllm {
         // per-device budgets; expert dispatch handles their cache fallback.
         const bool tpHostMoe =
             threadTpRank >= 0 && threadTpOwner != nullptr && threadTpOwner->hybrid.hostMoe;
-        const bool moeCudaCache =
-            !tpHostMoe && hiddenStates.dims.size() == 3 && hiddenStates.dims[1] > 0 &&
+        const bool cacheShape = hiddenStates.dims.size() == 3 && hiddenStates.dims[1] > 0 &&
             hiddenStates.dims[1] <= FASTLLM_CUDA_MOE_CACHE_MAX_BATCH &&
-            (hiddenStates.dims[1] == 1 || mtpTargetGraph) && !this->weights.empty() &&
-            !this->weights[0].empty() && MoeCudaCacheAvailable(this->weights[0]);
-        const bool hybridMoe =
-            !tpHostMoe && !this->weights.empty() && !this->weights[0].empty() &&
-            FastllmCudaUseMoeHybrid(this->weights[0].data(), this->weights[0].size());
+            (hiddenStates.dims[1] == 1 || mtpTargetGraph);
+        bool moeCudaCache = false, hybridMoe = false;
+        if (!tpHostMoe) {
+            // A resident prefix has no host-cache entry. Inspect the target
+            // layers until finding the cache on the current dense-stage GPU;
+            // later NUMA layers still need stable hybrid graph boundaries.
+            for (auto &table : this->weights) {
+                if (table.empty()) continue;
+                moeCudaCache |= cacheShape && MoeCudaCacheAvailable(table);
+                hybridMoe |= FastllmCudaUseMoeHybrid(table.data(), table.size());
+                if (moeCudaCache && hybridMoe) break;
+            }
+        }
         // Disk experts execute outside each dense graph, through the same
         // stable input/output boundaries as the host expert backend. Whole
         // CUDA-resident layers use those boundaries too, without disk dispatch.
@@ -175,12 +183,104 @@ namespace fastllm {
                 std::make_unique<Data>(Qwen4BuildCausalMask(decodePreviousLength, graphSequence));
         }
     }
+    bool Qwen4ExpModel::DecodeGraphExecution::TryRunHybridFull() {
+#if defined(USE_NUMAS) && !defined(USE_ROCM)
+        const char *enabled = std::getenv("FASTLLM_QWEN38_HYBRID_GRAPH");
+        if (!enabled || std::strcmp(enabled, "1") != 0 ||
+            hybridEagerAttention || model.threadTpRank >= 0 ||
+            (graphSequence != 1 && !mtpTargetGraph))
+            return false;
+        const int joinedKeyOffset = (model.block_cnt + 1) * (model.indexerCompressRatio + 2);
+        std::vector<int> denseKeys, sharedKeys;
+        void *owner = nullptr;
+        for (int layer = graphStartLayer; layer < graphEndLayer; ++layer) {
+            auto &boundary = graphState->hybridBoundaries[layer];
+            if (boundary.moe.result.peerOutput || !boundary.moe.result.sharedDeferred ||
+                boundary.output.dataType != FLOAT32 || !boundary.output.cudaData) return false;
+            auto *current = FastllmCudaNativeMoeGraphOwner(model.weights[layer].data(),
+                model.weights[layer].size(), graphSequence);
+            if (!current || (owner && current != owner)) return false;
+            owner = current;
+            const auto *previous = layer > graphStartLayer ? &graphState->hybridBoundaries[layer-1].moe : nullptr;
+            const int join = previous ? previous->result.JoinMask() : 0;
+            const int variant = model.IsLinearAttentionLayer(layer) ? 0 :
+                mtpTargetGraph ? model.indexerCompressRatio : wholeGraphRemainder;
+            denseKeys.push_back(layer + (model.block_cnt+1) * variant + join * joinedKeyOffset);
+            sharedKeys.push_back((model.block_cnt+1) * (model.indexerCompressRatio+1) + layer);
+        }
+        const int finalKey = graphEndLayer +
+            graphState->hybridBoundaries[graphEndLayer-1].moe.result.JoinMask() * joinedKeyOffset;
+        auto ready = [&](int key) {
+            auto it = graphState->segments.find(key);
+            return it != graphState->segments.end() && it->second.captured && it->second.graph;
+        };
+        if (!ready(finalKey)) return false;
+        for (size_t i = 0; i < denseKeys.size(); ++i)
+            if (!ready(denseKeys[i]) || !ready(sharedKeys[i])) return false;
+        const int fullVariant = mtpTargetGraph ? model.indexerCompressRatio : wholeGraphRemainder;
+        auto &full = graphState->hybridFullGraphs[fullVariant];
+        if (full.disabled) return false;
+        if (!full.exec) {
+            FastllmCudaSyncCurrentThreadStream();
+            std::vector<const void *> children;
+            bool ok = true;
+            for (int layer = graphStartLayer; layer < graphEndLayer; ++layer) {
+                const int index = layer - graphStartLayer;
+                auto &boundary = graphState->hybridBoundaries[layer];
+                Data input;
+                input.FakeFrom(boundary.input, 0);
+                input.Resize({graphSequence, boundary.input.dims.back()});
+                const auto shape = boundary.output.dims;
+                const void *storage = boundary.output.cudaData;
+                void *child = nullptr;
+                void *handle = FastllmCudaCreateNativeMoeFullGraph(input, boundary.moe.index,
+                    boundary.moe.score, boundary.output, model.weights[layer].data(), model.weights[layer].size(),
+                    layer, graphState->segments[sharedKeys[index]].graph, &child);
+                AssertInFastLLM(storage == boundary.output.cudaData,
+                    "Qwen4 full hybrid graph replaced a captured MoE output");
+                boundary.output.Reshape(shape);
+                if (!handle || !child) { ok = false; break; }
+                full.handles.push_back(handle);
+                children.push_back(graphState->segments[denseKeys[index]].graph);
+                children.push_back(child);
+            }
+            children.push_back(graphState->segments[finalKey].graph);
+            ok = ok && FastllmCudaGraphCompose(children.data(), children.size(), &full.graph, &full.exec);
+            ok = ok && FastllmCudaCreateNativeMoeReplayGraph(full.graph, full.handles.data(),
+                full.handles.size(), &full.replay);
+            if (!ok) {
+                if (full.replay) FastllmCudaGraphExecDestroy(full.replay);
+                if (full.exec) FastllmCudaGraphExecDestroy(full.exec);
+                if (full.graph) FastllmCudaGraphDestroy(full.graph);
+                for (void *handle : full.handles) FastllmCudaReleaseNativeMoeFullGraph(handle);
+                full.handles.clear(); full.graph = full.exec = full.replay = nullptr;
+                full.disabled = true;
+                FastllmCudaClearThreadError(); FastllmCudaClearGraphError();
+                std::fprintf(stderr, "[Fastllm] Qwen4 hybrid full graph unavailable for layers %d..%d.\n",
+                    graphStartLayer, graphEndLayer);
+                return false;
+            }
+            std::fprintf(stderr, "[Fastllm] Qwen4 hybrid full graph ready: cuda:%d layers %d..%d rows=%d remainder=%d.\n",
+                device, graphStartLayer, graphEndLayer, graphSequence, wholeGraphRemainder);
+        }
+        const bool timed = full.launches < 8 || full.launches % 64 == 0;
+        AssertInFastLLM(FastllmCudaLaunchNativeMoeFullGraph(timed ? full.exec : full.replay,
+            full.handles.data(), full.handles.size(), timed), "Qwen4 hybrid full graph replay failed");
+        ++full.launches;
+        return true;
+#else
+        return false;
+#endif
+    }
+
     void Qwen4ExpModel::DecodeGraphExecution::RunHybrid() {
         // A fully CUDA-capturable cache retains the existing GPU segment strategy.
         if (!hybridDenseGraph) {
             RunGpu();
             return;
         }
+
+        if (TryRunHybridFull()) return;
 
         // EP acceptance is collective in TP. Keep the fallback join
         // topology separate if an expert backend becomes unavailable.
@@ -201,7 +301,6 @@ namespace fastllm {
                     layer + (model.block_cnt + 1) * variant + joinMask * joinedKeyOffset;
                 runCapturedSegment(key, [&]() { RunHybridDenseBody(layer); });
             }
-            Data moeOutput;
             auto &boundary = graphState->hybridBoundaries[layer];
             auto sharedGraph = [&]() {
                 // This branch must launch after route readback, beside
@@ -218,15 +317,36 @@ namespace fastllm {
                     ToDataType(boundary.moe.result.sharedOutput, DataType::FLOAT32);
                 });
             };
-            const void *previous = boundary.output.cudaData;
-            boundary.moe.outputTarget = &boundary.output;
-            model.RunMoE(layer, boundary.input, moeOutput, false, nullptr, &boundary.moe,
-                         sharedGraph);
-            // EP writes directly into this stable boundary. Other
-            // backends keep their existing owning result and copy.
-            AssertInFastLLM(Qwen4PrepareDecodeGraphTensor(boundary.output, moeOutput, device) &&
-                                (previous == nullptr || previous == boundary.output.cudaData),
-                            "Qwen4 hybrid MoE graph boundary changed storage.");
+            const char *remoteOption = std::getenv("FASTLLM_QWEN38_REMOTE_GRAPH");
+            const auto &weights = model.weights[layer];
+            const bool remoteResident = remoteOption && std::strcmp(remoteOption,"1") == 0 &&
+                model.threadTpRank < 0 && weights.size() > 2 && weights[2] &&
+                weights[2]->dataDevice == CUDA && weights[2]->dataDeviceIds.size() == 1 &&
+                weights[2]->dataDeviceIds.front() != device;
+            auto runMoe = [&]() {
+                Data moeOutput;
+                const void *previous = boundary.output.cudaData;
+                boundary.moe.outputTarget = &boundary.output;
+                model.RunMoE(layer, boundary.input, moeOutput, false, nullptr, &boundary.moe,
+                    remoteResident ? std::function<void()>([] {}) : std::function<void()>(sharedGraph));
+                // EP writes directly into this stable boundary. Resident
+                // experts retain their established result conversion/copy.
+                AssertInFastLLM(Qwen4PrepareDecodeGraphTensor(boundary.output, moeOutput, device) &&
+                                    (previous == nullptr || previous == boundary.output.cudaData),
+                                "Qwen4 hybrid MoE graph boundary changed storage.");
+            };
+            if (remoteResident) {
+                // Capture the remote routed projection after its shared
+                // expert graph. The callback must not nest another capture.
+                sharedGraph();
+                const int remoteKey = 8 * joinedKeyOffset + layer;
+                runCapturedSegment(remoteKey, runMoe);
+                if (!boundary.remoteGraphReported && graphState->segments[remoteKey].captured) {
+                    std::fprintf(stderr, "[Fastllm] Qwen4 remote expert graph ready: cuda:%d -> cuda:%d layer=%d rows=%d.\n",
+                        device, weights[2]->dataDeviceIds.front(), layer, graphSequence);
+                    boundary.remoteGraphReported = true;
+                }
+            } else runMoe();
         }
         const auto &last = graphState->hybridBoundaries[graphEndLayer - 1].moe;
         const int joinMask = last.result.JoinMask();

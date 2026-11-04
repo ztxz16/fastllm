@@ -11,7 +11,26 @@
 namespace fastllm {
 // Numerical semantics belong to the expert layout, not to the storage tier.
 // Keep score placement, projection rounding and activation quantization distinct.
-enum class HybridMoeMath { Standard, Glm5, DeepSeekV41 };
+enum class HybridMoeMath { Standard, Glm5, DeepSeekV41, Qwen38FlashNext };
+
+#ifdef USE_CUDA
+// A graph owns both ends of a remote resident-expert transfer. Model-specific
+// arithmetic receives these persistent tensors; transport never migrates the
+// dense stage's captured input or changes the expert weight owner.
+struct HybridMoeRemoteWorkspace {
+    int source = -1, device = -1;
+    void *ready = nullptr, *done = nullptr;
+    Data input, index, score, output;
+    Data w1, w2, w3, tempInput, tempOutput, inputTemp, outputTemp;
+    HybridMoeRemoteWorkspace() = default;
+    HybridMoeRemoteWorkspace(const HybridMoeRemoteWorkspace &) = delete;
+    HybridMoeRemoteWorkspace &operator=(const HybridMoeRemoteWorkspace &) = delete;
+    ~HybridMoeRemoteWorkspace();
+};
+void RunRemoteHybridMoe(HybridMoeRemoteWorkspace &workspace,
+    const Data &input, const Data &index, const Data &score, Data &output, int device,
+    const std::function<void(HybridMoeRemoteWorkspace &)> &compute);
+#endif
 
 // Both placements use the same kernels and cache policy in NUMA-enabled builds.
 bool IsSharedHostMoeDevice(const std::string &device);

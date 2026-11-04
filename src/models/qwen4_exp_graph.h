@@ -27,6 +27,7 @@ namespace fastllm {
             Data injection;
             Data output;
             MoEPrepared moe;
+            bool remoteGraphReported = false;
         };
         // CPU experts execute between dense graphs. Each boundary owns stable
         // storage, with dtype and shape established by its eager warmup.
@@ -45,6 +46,16 @@ namespace fastllm {
         std::map<int, Data> qsaTailPositionSnapshots;
         int32_t *pinnedDecodeMeta = nullptr;
         std::map<int, Segment> segments;
+        struct HybridFullGraph {
+            void *graph = nullptr, *exec = nullptr, *replay = nullptr;
+            std::vector<void *> handles;
+            uint64_t launches = 0;
+            bool disabled = false;
+        };
+        // Each QSA remainder owns a composition of the existing dense graphs
+        // and shared-backend MoE children; their source storage stays alive.
+        std::map<int, HybridFullGraph> hybridFullGraphs;
+
 
         // Layer 0 has no growing full-attention cache. Keep its TP graph
         // through backbone recaptures, but release it with the request slot.
@@ -88,6 +99,7 @@ namespace fastllm {
         void RunGpuWholeBody();
         void PrepareHybridMask();
         void RunHybrid();
+        bool TryRunHybridFull();
         void RunHybridDenseBody(int layer);
         void RunHybridFinalBody();
     };

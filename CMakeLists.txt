@@ -270,13 +270,14 @@ if (USE_CUDA)
         message(STATUS "CUDA20 is unavailable for this CMake/NVCC combination, falling back to CUDA17")
     endif()
     set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-    # NVCC 12.8/13.0 ICEs in std::_Destroy for this unit's C++20 host containers.
-    # It requires only C++17; retain C++20 for the other CUDA/DeepGEMM units.
+    # NVCC 12.8-13.0 ICEs in std::_Destroy for these C++20 host containers.
+    # They require only C++17; retain C++20 for the other CUDA/DeepGEMM units.
     if (CMAKE_CUDA_COMPILER_ID STREQUAL "NVIDIA" AND
         CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.8 AND
         CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.1)
         set_source_files_properties(
             src/devices/cuda/linear/fastllm-native-lowbit-prefill.cu
+            test/basic/test_cuda_gguf_moe_cache.cu
             PROPERTIES COMPILE_OPTIONS "-std=c++17")
     endif()
     add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:--default-stream=per-thread>)
@@ -966,6 +967,8 @@ if (UNIT_TEST)
         set_tests_properties(cuda_gguf_moe_split_upload PROPERTIES LABELS "cuda;gguf;moe" RUN_SERIAL TRUE)
         fastllm_add_checked_test(cuda_gguf_moe_reuse_input cuda_gguf_moe_cache_test "PASS: GGUF input quantization reuse" 60 --reuse-input)
         set_tests_properties(cuda_gguf_moe_reuse_input PROPERTIES LABELS "cuda;gguf;moe" RUN_SERIAL TRUE)
+        fastllm_add_checked_test(cuda_gguf_moe_subwarp cuda_gguf_moe_cache_test "PASS: exact subwarp" 180 --subwarp)
+        set_tests_properties(cuda_gguf_moe_subwarp PROPERTIES LABELS "cuda;gguf;moe" RUN_SERIAL TRUE)
         fastllm_add_checked_test(cuda_gguf_moe_routed_batch cuda_gguf_moe_cache_test "PASS: routed GGUF batch" 300 --routed-batch)
         set_tests_properties(cuda_gguf_moe_routed_batch PROPERTIES LABELS "cuda;gguf;moe" RUN_SERIAL TRUE)
         fastllm_add_checked_test(cuda_gguf_moe_numa_layout cuda_gguf_moe_cache_test "PASS: direct NUMA GGUF layout" 300 --numa-layout)
@@ -979,6 +982,8 @@ if (UNIT_TEST)
         fastllm_add_checked_test(cuda_gguf_moe_host cuda_gguf_moe_cache_test "PASS: streamed GGUF prefill" 600 --host)
         set_tests_properties(cuda_gguf_moe_host PROPERTIES LABELS "cuda;gguf;moe" RUN_SERIAL TRUE)
         if (USE_NUMAS)
+            fastllm_add_checked_test(cuda_gguf_moe_native_prefill cuda_gguf_moe_cache_test "PASS: native cached GGUF prefill" 120 --host-native-cache)
+            set_tests_properties(cuda_gguf_moe_native_prefill PROPERTIES LABELS "cuda;gguf;moe;numa" RUN_SERIAL TRUE)
             fastllm_add_checked_test(cuda_gguf_moe_shared_weights cuda_gguf_moe_cache_test "PASS: shared GGUF weights" 300 --shared-weights)
             set_tests_properties(cuda_gguf_moe_shared_weights PROPERTIES LABELS "cuda;gguf;moe;numa" RUN_SERIAL TRUE)
             fastllm_add_checked_test(cuda_gguf_moe_hybrid cuda_gguf_moe_cache_test "PASS: GGUF CPU/GPU hybrid expert decode" 300 --hybrid)
@@ -1185,6 +1190,9 @@ if (UNIT_TEST)
             fastllm_add_checked_test(qwen4_draft_vocab qwen4_gguf_test
                 "PASS: draft vocabulary format=" 60 --draft-vocab)
             set_tests_properties(qwen4_draft_vocab PROPERTIES LABELS "cuda;gguf" RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
+            fastllm_add_checked_test(qwen4_remote_moe qwen4_gguf_test
+                "PASS: Qwen4 remote GPU-plan graph" 120 --remote-moe)
+            set_tests_properties(qwen4_remote_moe PROPERTIES LABELS "cuda;hybrid;multi-gpu" RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
             fastllm_add_checked_test(qwen4_graph_slot_reset qwen4_gguf_test
                 "PASS: Qwen4 graph slot resets history" 60 --graph-slot-reset)
             set_tests_properties(qwen4_graph_slot_reset PROPERTIES LABELS "cuda;gguf" RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
@@ -2582,6 +2590,31 @@ if (UNIT_TEST)
                 ENVIRONMENT "FT_NUMAS=1;FT_THREADS=4;FT_PINNED_WEIGHT=1;LD_PRELOAD=$<TARGET_FILE:cuda_host_register_fault>;FASTLLM_TEST_PIN_MAX_BYTES=65536" LABELS cuda RUN_SERIAL TRUE)
             set_tests_properties(numas_moe_pin_failure PROPERTIES
                 ENVIRONMENT "FT_NUMAS=1;FT_THREADS=4;FT_PINNED_WEIGHT=1;LD_PRELOAD=$<TARGET_FILE:cuda_host_register_fault>;FASTLLM_TEST_PIN_MAX_BYTES=0" LABELS cuda RUN_SERIAL TRUE)
+            add_executable(cuda_hybrid_remote_test test/basic/test_cuda_hybrid_remote.cpp)
+            target_link_libraries(cuda_hybrid_remote_test PRIVATE fastllm)
+            target_include_directories(cuda_hybrid_remote_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            fastllm_add_checked_test(cuda_hybrid_remote cuda_hybrid_remote_test
+                "ALL_PASS remote hybrid transport" 180)
+            set_tests_properties(cuda_hybrid_remote PROPERTIES LABELS cuda
+                SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+
+            add_executable(cuda_standard_moe_mailbox_test test/basic/test_cuda_standard_moe_mailbox.cpp)
+            target_link_libraries(cuda_standard_moe_mailbox_test PRIVATE fastllm)
+            target_include_directories(cuda_standard_moe_mailbox_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            fastllm_add_checked_test(cuda_standard_moe_mailbox cuda_standard_moe_mailbox_test "ALL_PASS" 240)
+            set_tests_properties(cuda_standard_moe_mailbox PROPERTIES LABELS cuda
+                ENVIRONMENT "FT_NUMAS=1;FT_THREADS=4" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240)
+            fastllm_add_checked_test(cuda_standard_moe_placement_policy
+                cuda_standard_moe_mailbox_test "ALL_PASS" 120 --placement-policy)
+            set_tests_properties(cuda_standard_moe_placement_policy PROPERTIES LABELS cuda
+                ENVIRONMENT "FT_NUMAS=1;FT_THREADS=4" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
+
+            fastllm_add_checked_test(cuda_qwen4_mailbox_topk10
+                cuda_standard_moe_mailbox_test "ALL_PASS" 360 --qwen-topk10)
+            set_tests_properties(cuda_qwen4_mailbox_topk10 PROPERTIES
+                ENVIRONMENT "FT_NUMAS=1;FT_THREADS=4"
+                LABELS "cuda;hybrid" RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
+
             add_executable(numas_cuda_affinity_test test/basic/test_numas_cuda_affinity.cpp)
             target_link_libraries(numas_cuda_affinity_test PRIVATE fastllm)
             add_test(NAME numas_cuda_affinity COMMAND numas_cuda_affinity_test)

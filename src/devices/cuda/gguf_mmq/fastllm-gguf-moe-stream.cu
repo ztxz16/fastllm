@@ -178,7 +178,7 @@ static bool RunPipelined(const fastllm::Data &input, fastllm::Data &gate,
     } else FastllmCudaGetMoePrefillResidents(weights, expertCount, resident, glm5);
     // Generic probes can share a GLM weight table, but this pipeline restores
     // canonical records. Never read or publish those in a native NUMA cache.
-    if (resident.nativeGlm && !glm5) return false;
+    if (resident.nativeGGUF && !glm5) return false;
     std::vector<std::vector<int>> routes(expertCount);
     for (int r = 0; r < rows * topk; ++r) {
         const int e = indices[r];
@@ -258,7 +258,7 @@ static bool RunPipelined(const fastllm::Data &input, fastllm::Data &gate,
     const bool misses = std::any_of(order.begin(), order.end(), [&](int e) { return !cached(e); });
     // Native EP residents remain R4 in cache. Restore their bounded working
     // group on the GPU, just as for misses, without changing cache ownership.
-    const size_t ringBytes = misses || resident.nativeGlm
+    const size_t ringBytes = misses || resident.nativeGGUF
         ? Pipeline::groups * batchExperts * stride : 0;
     const size_t rawOffset = 0, canonicalOffset = ringBytes, metaOffset = (disk ? 1 : 2) * ringBytes;
     const size_t descOffset = reserve(2 * order.size() * sizeof(WeightCopy));
@@ -331,21 +331,21 @@ static bool RunPipelined(const fastllm::Data &input, fastllm::Data &gate,
             for (int part = 0; part < 2; ++part) {
                 const auto &w = *weights[2 * (e + 1) + part];
                 const bool hit = cached(e);
-                if (hit && !resident.nativeGlm) { pointers.push_back(resident.weights[2 * e + part]); continue; }
+                if (hit && !resident.nativeGGUF) { pointers.push_back(resident.weights[2 * e + part]); continue; }
                 const size_t offset = ((g % Pipeline::groups) * batchExperts + j) * stride +
                     (part ? gateWeightBytes : 0);
                 auto *admitted = 2 * e + part < int(admission.weights.size())
                     ? static_cast<uint8_t *>(admission.weights[2 * e + part]) : nullptr;
                 const bool restore = (cross && part == 0) || Ordinary(w.ggmlType) != w.ggmlType;
-                auto *destination = !resident.nativeGlm && admitted
+                auto *destination = !resident.nativeGGUF && admitted
                     ? admitted : base + (disk ? 0 : canonicalOffset) + offset;
                 auto *target = restore ? base + rawOffset + offset : destination;
-                if (resident.nativeGlm) {
+                if (resident.nativeGGUF) {
                     target = hit ? const_cast<uint8_t *>(static_cast<const uint8_t *>(resident.weights[2 * e + part]))
                                  : admitted ? admitted : base + rawOffset + offset;
                     if (!restore) destination = target;
                 }
-                const auto *prefetched = !disk && !hit && !resident.nativeGlm && pipeline.prefetch
+                const auto *prefetched = !disk && !hit && !resident.nativeGGUF && pipeline.prefetch
                     ? pipeline.prefetch->Find(weights, w) : nullptr;
                 if (prefetched) {
                     batch.lastPrefetchedGroup = std::max(batch.lastPrefetchedGroup, prefetched->group);
@@ -544,7 +544,7 @@ bool FastllmCudaPrefetchMoeGGUFHost(fastllm::Data **weights, int expertCount) {
     if (previous == pipeline.prefillOrder.end()) return false;
     FastllmCudaMoePrefillResidents resident;
     FastllmCudaGetMoePrefillResidents(weights, expertCount, resident, false);
-    if (resident.nativeGlm) return false;
+    if (resident.nativeGGUF) return false;
     std::vector<const fastllm::Data *> plan;
     size_t bytes = 0;
     for (int e : previous->second) {
