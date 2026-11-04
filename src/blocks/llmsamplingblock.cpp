@@ -9,9 +9,12 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <cmath>
+#include <limits>
 
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
+#include "devices/cuda/fastllm-cuda-sampling.h"
 #include "devices/multicuda/fastllm-multicuda.cuh"
 #endif
 
@@ -23,6 +26,85 @@ namespace fastllm {
         }
 
 #ifdef USE_CUDA
+        // The caller opts in only for pure GPU execution. All buffers belong to
+        // this inference thread/device; no logits or request masks are retained.
+        static bool SampleToolConstrainedCuda(Data &logits, int batch,
+                const std::vector<GenerationConfig> &configs,
+                const LastTokensManager &lastTokens, std::vector<int> &result) {
+            if (logits.dataDevice != DataDevice::CUDA || logits.dataType != FLOAT32 ||
+                logits.dims.empty() || batch <= 0) return false;
+            const int vocab = logits.dims.back();
+            if (vocab <= 0 || logits.Count(0) != uint64_t(batch) * vocab) return false;
+            const int device = logits.dataDeviceIds.empty() ? FastllmCudaGetDevice() : logits.dataDeviceIds[0];
+            FastllmCudaSetDevice(device);
+            size_t bytes = FastllmCudaSampleLogitsWorkspaceBytes(batch, vocab);
+            if (!bytes || (bytes + 3) / 4 > size_t(std::numeric_limits<int>::max())) return false;
+            std::vector<FastllmCudaSamplingRow> rows(batch);
+            std::vector<int> ids;
+            std::vector<size_t> allowedOffsets(batch), repeatOffsets(batch);
+            for (int b = 0; b < batch; ++b) {
+                const auto &c = configs[b];
+                if (!std::isfinite(c.temperature) || c.temperature <= 0.f ||
+                    !std::isfinite(c.top_p) || c.top_p <= 0.f || c.top_p > 1.f ||
+                    !std::isfinite(c.repeat_penalty) || c.repeat_penalty <= 0.f) return false;
+                auto &row = rows[b];
+                row.logits = (const float *)logits.cudaData + size_t(b) * vocab;
+                row.temperature = c.temperature;
+                row.topP = c.top_p;
+                row.topK = std::max(1, std::min(vocab, c.top_k));
+                row.policy = FastllmCudaSamplingPolicy::LLMSampling;
+                allowedOffsets[b] = ids.size();
+                const auto &allowed = c.tool_call_allowed_token_ids;
+                // Constraint preparation already sorts the IDs; reuse that order.
+                if (!std::is_sorted(allowed.begin(), allowed.end())) return false;
+                ids.insert(ids.end(), std::lower_bound(allowed.begin(), allowed.end(), 0),
+                           std::lower_bound(allowed.begin(), allowed.end(), vocab));
+                row.allowedCount = ids.size() - allowedOffsets[b];
+                // Preserve the legacy empty-candidate fallback, including its penalties.
+                if (!c.tool_call_allowed_token_ids.empty() && !row.allowedCount) return false;
+                repeatOffsets[b] = ids.size();
+                if (NeedRepeatPenalty(c) && b < (int)lastTokens.units.size()) {
+                    row.repeatPenalty = c.repeat_penalty;
+                    for (int id : lastTokens.units[b].tokenSet) {
+                        if (id < 0 || id >= vocab) return false;
+                        if (c.last_n > 0 || ids.size() == repeatOffsets[b] || ids.back() != id)
+                            ids.push_back(id);
+                    }
+                }
+                row.repeatCount = ids.size() - repeatOffsets[b];
+            }
+            if (ids.size() > size_t(std::numeric_limits<int>::max())) return false;
+            struct Workspace { Data ids, output, scratch; };
+            static thread_local std::map<int, Workspace> workspaces;
+            auto &work = workspaces[device];
+            auto allocate = [&](Data &data, size_t count) {
+                data.dataType = INT32;
+                data.Resize({int(count)});
+                data.ToDevice(DataDevice::CUDA, {device}, false);
+                data.Allocate();
+            };
+            allocate(work.ids, std::max(size_t(1), ids.size()));
+            allocate(work.output, size_t(batch) * 2);
+            allocate(work.scratch, (bytes + 3) / 4);
+            if (!ids.empty()) FastllmCudaCopyFromHostToDevice(work.ids.cudaData, ids.data(), ids.size() * sizeof(int));
+            for (int b = 0; b < batch; ++b) {
+                rows[b].allowedTokens = (int *)work.ids.cudaData + allowedOffsets[b];
+                rows[b].repeatTokens = (int *)work.ids.cudaData + repeatOffsets[b];
+                // Preserve the existing sampler's RNG grid; the GPU API takes [0, 1).
+                rows[b].uniform = std::min(double(float(std::rand() % 10001) * .0001f),
+                                           std::nextafter(1., 0.));
+            }
+            if (!FastllmCudaSampleLogits(rows.data(), batch, vocab,
+                    (FastllmCudaSamplingResult *)work.output.cudaData,
+                    work.scratch.cudaData, bytes)) return false;
+            std::vector<FastllmCudaSamplingResult> sampled(batch);
+            FastllmCudaCopyFromDeviceToHost(sampled.data(), work.output.cudaData,
+                                           sampled.size() * sizeof(sampled[0]));
+            for (const auto &sample : sampled) if (sample.error) return false;
+            for (const auto &sample : sampled) result.push_back(sample.token);
+            return true;
+        }
+
         struct TensorParallelGreedyDeviceWorkspace {
             Data cudaIds;
             Data cudaScores;
@@ -687,6 +769,13 @@ namespace fastllm {
             printf("LLMSamplingBlock logits:\n");
             logits.Print();
         }
+
+#ifdef USE_CUDA
+        if (needToolNameMask && !needLogits && model->UseGpuToolCallConstraints() &&
+            SampleToolConstrainedCuda(logits, batch, generationConfigs, lastTokens, lastRet)) {
+            return;
+        }
+#endif
 
         if (allSimple && !needLogits) {
             Data topk;

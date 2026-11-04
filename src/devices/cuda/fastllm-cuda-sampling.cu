@@ -11,7 +11,7 @@
 namespace {
 constexpr int Threads = 256, Items = 4, Tile = Threads * Items;
 struct Rows {
-    static constexpr int Capacity = 64;
+    static constexpr int Capacity = 32;
     FastllmCudaSamplingRow row[Capacity];
 };
 static_assert(sizeof(Rows) + 128 < 4096, "sampling kernel argument limit");
@@ -45,6 +45,15 @@ bool SortBytes(int batch, int vocab, size_t &bytes) {
         (const float *)nullptr, (float *)nullptr, (const int *)nullptr, (int *)nullptr,
         batch * vocab, batch, (const int *)nullptr, (const int *)nullptr) == cudaSuccess;
 }
+__device__ int LowerBound(const int *ids, int count, int token) {
+    int lo = 0, hi = count;
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (ids[mid] < token) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo;
+}
 __global__ void Prepare(Rows rows, int begin, int batch, int vocab, int chunks, Layout w) {
     int row = begin + blockIdx.y, tile = blockIdx.x;
     auto request = rows.row[blockIdx.y];
@@ -52,8 +61,19 @@ __global__ void Prepare(Rows rows, int begin, int batch, int vocab, int chunks, 
     for (int j = 0; j < Items; ++j) {
         int token = tile * Tile + threadIdx.x + j * Threads;
         if (token >= vocab) continue;
-        float raw = request.logits[token];
-        float value = __fdiv_rn(raw, request.temperature);
+        bool allowed = true;
+        if (request.allowedCount) {
+            int i = LowerBound(request.allowedTokens, request.allowedCount, token);
+            allowed = i < request.allowedCount && request.allowedTokens[i] == token;
+        }
+        float raw = allowed ? request.logits[token] : -INFINITY;
+        if (allowed && request.repeatCount) {
+            int i = LowerBound(request.repeatTokens, request.repeatCount, token);
+            for (; i < request.repeatCount && request.repeatTokens[i] == token; ++i)
+                raw = raw < 0.f ? raw * request.repeatPenalty : __fdiv_rn(raw, request.repeatPenalty);
+        }
+        float value = request.policy == FastllmCudaSamplingPolicy::LLMSampling
+            ? raw * __fdiv_rn(1.f, request.temperature) : __fdiv_rn(raw, request.temperature);
         invalid |= isnan(raw) || raw == INFINITY || value == INFINITY;
         // Canonicalize signed zero; both CPU comparison and stable radix sort
         // must resolve equal scores by the original token order.
@@ -81,9 +101,10 @@ __global__ void PartialMass(Rows rows, int begin, int vocab, int chunks, Layout 
     const float *scores = w.sorted + size_t(row) * vocab;
     int k = rows.row[blockIdx.y].topK;
     float cutoff = k > 0 && k < vocab ? scores[k - 1] : -INFINITY;
+    int limit = rows.row[blockIdx.y].policy == FastllmCudaSamplingPolicy::LLMSampling && k > 0 && k < vocab ? k : vocab;
     double sum = 0.;
     for (int j = 0; j < Items; ++j)
-        sum += Mass(scores, blockIdx.x * Tile + threadIdx.x + j * Threads, vocab, cutoff);
+        sum += Mass(scores, blockIdx.x * Tile + threadIdx.x + j * Threads, limit, cutoff);
     __shared__ cub::BlockReduce<double, Threads>::TempStorage reduce;
     sum = cub::BlockReduce<double, Threads>(reduce).Sum(sum);
     if (!threadIdx.x) w.sums[row * chunks + blockIdx.x] = sum;
@@ -99,13 +120,14 @@ __global__ void Draw(Rows rows, int begin, int vocab, int chunks, Layout w,
     const float *scores = w.sorted + size_t(row) * vocab;
     const double *sums = w.sums + row * chunks;
     float cutoff = request.topK > 0 && request.topK < vocab ? scores[request.topK - 1] : -INFINITY;
+    int limit = request.policy == FastllmCudaSamplingPolicy::LLMSampling && request.topK > 0 && request.topK < vocab ? request.topK : vocab;
     if (!threadIdx.x) {
         total = 0.; invalid = !isfinite(scores[0]);
         for (int c = 0; c < chunks; ++c) { total += sums[c]; invalid |= w.errors[row * chunks + c]; }
         invalid |= !(total > 0.) || !isfinite(total);
         output[row] = {-1, invalid ? 1 : 0};
         kept = total;
-        lastKept = vocab - 1;
+        lastKept = limit - 1;
     }
     __syncthreads();
     if (invalid) return;
@@ -119,7 +141,7 @@ __global__ void Draw(Rows rows, int begin, int vocab, int chunks, Layout w,
         __syncthreads();
         double values[Items];
         for (int j = 0; j < Items; ++j)
-            values[j] = Mass(scores, tile * Tile + threadIdx.x * Items + j, vocab, cutoff);
+            values[j] = Mass(scores, tile * Tile + threadIdx.x * Items + j, limit, cutoff);
         Scan(scan).InclusiveSum(values, values);
         for (int j = 0; j < Items; ++j)
             if ((prefix + values[j]) / total > request.topP)
@@ -141,7 +163,7 @@ __global__ void Draw(Rows rows, int begin, int vocab, int chunks, Layout w,
     double values[Items];
     for (int j = 0; j < Items; ++j) {
         int i = int(threadIdx.x) * Items + j;
-        values[j] = tile * Tile + i <= lastKept ? Mass(scores, tile * Tile + i, vocab, cutoff) : 0.;
+        values[j] = tile * Tile + i <= lastKept ? Mass(scores, tile * Tile + i, limit, cutoff) : 0.;
         if (values[j] > 0.) atomicMax(&fallback, i);
     }
     Scan(scan).InclusiveSum(values, values);
@@ -175,7 +197,12 @@ bool FastllmCudaSampleLogits(const FastllmCudaSamplingRow *rows, int batch,
     for (int r = 0; r < batch; ++r)
         if (!rows[r].logits || !std::isfinite(rows[r].temperature) || rows[r].temperature <= 0.f ||
             !std::isfinite(rows[r].topP) || rows[r].topP <= 0.f || rows[r].topP > 1.f ||
-            !std::isfinite(rows[r].uniform) || rows[r].uniform < 0. || rows[r].uniform >= 1.) return false;
+            !std::isfinite(rows[r].uniform) || rows[r].uniform < 0. || rows[r].uniform >= 1. ||
+            rows[r].allowedCount < 0 || (rows[r].allowedCount && !rows[r].allowedTokens) ||
+            rows[r].repeatCount < 0 || (rows[r].repeatCount && !rows[r].repeatTokens) ||
+            (rows[r].policy != FastllmCudaSamplingPolicy::TopKWithTies &&
+             rows[r].policy != FastllmCudaSamplingPolicy::LLMSampling) ||
+            !std::isfinite(rows[r].repeatPenalty) || rows[r].repeatPenalty <= 0.f) return false;
     cudaStream_t cudaStream = stream ? (cudaStream_t)stream : cudaStreamPerThread;
     int chunks = (vocab + Tile - 1) / Tile;
     auto launch = [&](bool prepare) {
