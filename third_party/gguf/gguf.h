@@ -2199,6 +2199,10 @@ namespace fastllm {
         }
     };
 
+    void LoadDeepSeekV41UpstreamGGUFConfig(basellm *model, const json11::Json &params);
+    void PrepareDeepSeekV41UpstreamGGUFTasks(basellm *model, const json11::Json &params,
+                                            std::vector<ReadGGUFTask> &tasks);
+
     // Append validated auxiliary weights and install parameters before InitParams.
     void AppendDeepSeekV41GGUFAux(basellm *model, const json11::Json &target,
                                  const std::string &path, bool vision,

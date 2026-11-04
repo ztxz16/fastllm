@@ -23,7 +23,11 @@ ftllm server /path/to/model-00001-of-00002.gguf --auto \
   --model_name deepseek-v4.1-flash --host 0.0.0.0 --port 8080
 ```
 
-示例文件名需替换为实际路径。GGUF 所引用的 Engram 文件必须放在主模型旁边，文件名和来源需与元数据一致；多个量化版本可以链接到同一份匹配的 Engram 文件。HF 模型保留自己的 Engram 权重与配置。`--ngram_device disk` 控制 Engram 按需读取，与专家是否使用磁盘后端分别设置。
+示例文件名需替换为实际路径。支持早期四分片加独立 Engram 的布局，以及 llama.cpp 主线使用的六分片布局，加载时自动识别，无需转换旧模型或增加格式开关。
+
+保留 `--ori` 时，仍按 GGUF 实际权重选择启动默认值，不会因原始 HF 配置包含草稿层而误开启 DSpark。
+
+旧布局的 Engram 文件名和来源需与主干元数据一致。ISTA 六分片新版需保留主干的第 1–5 分片，以及同目录的 `DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf`；该文件作为第 6 分片，既可使用原名，也可建立 `...-00006-of-00006.gguf` 链接。新旧布局的 Engram 文件头不同，应分别保留匹配的文件。多个相同布局的量化版本可以共享一份匹配的 Engram 文件。HF 模型保留自己的 Engram 权重与配置。`--ngram_device disk` 控制 Engram 按需读取，与专家是否使用磁盘后端分别设置。
 
 自动模式默认单请求、最多 1M 原生窗口、FP4 KV 和快速 Prefill。带内置 DSpark 权重时默认使用 DSpark 5；没有草稿权重的 GGUF 不会自动开启。设备、chunk 和专家缓存以 `[auto]` 日志为准。显卡和主存能容纳专家时优先避免磁盘专家，Engram 仍可独立使用磁盘。
 

@@ -20,7 +20,11 @@ ftllm server /path/to/model-00001-of-00002.gguf --auto \
   --model_name deepseek-v4.1-flash --host 0.0.0.0 --port 8080
 ```
 
-Replace the example filename with the actual path. Keep the GGUF-referenced Engram file beside the backbone, with the filename and source matching its metadata. Multiple quantizations can link to one matching Engram file. HF models need their own Engram weights and configuration. `--ngram_device disk` controls on-demand table reads independently of the expert backend.
+Replace the example filename with the actual path. Both the earlier four-shard backbone plus separate Engram layout and the upstream llama.cpp six-shard layout are detected automatically. Existing models do not need conversion or a format flag.
+
+With `--ori`, startup defaults still follow the actual GGUF weights. Draft layers listed in the original HF configuration do not enable DSpark when those weights are absent from the GGUF.
+
+For the old layout, keep the Engram filename and source consistent with the backbone metadata. For ISTA's six-shard layout, keep shards 1–5 and `DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf` in the same directory. The shared file is shard 6; its original name or a `...-00006-of-00006.gguf` link is accepted. The old and new Engram headers differ, so retain matching files for each layout. Quantizations using the same layout can share a matching Engram file. HF models need their own Engram weights and configuration. `--ngram_device disk` controls on-demand table reads independently of the expert backend.
 
 Automatic defaults are one request, up to a 1M-token native window, FP4 KV, and fast prefill. Embedded DSpark weights enable DSpark 5 by default; GGUF files without those weights do not. Check `[auto]` for the selected devices, chunks, and caches. The planner prioritizes avoiding disk experts when GPU and host memory can hold them; Engram may still use disk independently.
 

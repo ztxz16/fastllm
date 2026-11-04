@@ -1525,9 +1525,12 @@ def make_normal_llm_model(args, startup_progress = None):
     if (not(os.path.exists(config_path)) and args.ori != "" and os.path.exists(os.path.join(args.ori, "config.json"))):
         config_path = os.path.join(args.ori, "config.json")
     gguf_config = None
-    if (not os.path.exists(config_path) and os.path.isfile(args.path) and
-            args.path.lower().endswith(".gguf")):
-        gguf_config = get_gguf_model_config(args.path)
+    if os.path.isfile(args.path) and args.path.lower().endswith(".gguf"):
+        # --ori may describe HF DSpark weights that are absent from the GGUF.
+        # V4.1 startup defaults must follow the actual backbone metadata.
+        if (not os.path.exists(config_path) or
+                read_gguf_metadata(args.path, {"general.architecture"}).get("general.architecture") == "deepseek41"):
+            gguf_config = get_gguf_model_config(args.path)
     is_moe_model = False
     is_thread_tp_moe_model = False
     is_multicuda_tp_model = False

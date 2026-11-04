@@ -3087,6 +3087,21 @@ namespace fastllm {
 
     void DeepSeekV41Model::OnModelWeightsLoaded() {
         if (V41HasKey(this->weight, "gguf_architecture")) LoadEngramMeta();
+        if (V41HasKey(this->weight, "gguf_architecture") && V41HasKey(this->weight, "ple.layers")) {
+            // Upstream GGUF exports the exact FP32 product of the old BF16
+            // q/k parameters. Keep the existing kernels' q*k expression by
+            // using the imported product as q and a neutral k.
+            for (int layer : engram_layer_ids) {
+                const std::string prefix = "layers." + std::to_string(layer) + ".engram.";
+                auto q = weight.weight.find(prefix + "q_weight");
+                AssertInFastLLM(q != weight.weight.end() && q->second.dataType == FLOAT32 &&
+                    q->second.Count(0) == (uint64_t)hc_mult * embed_dim,
+                    "DeepSeekV41: invalid upstream Engram gate.");
+                if (!weight.weight.count(prefix + "k_weight"))
+                    weight[prefix + "k_weight"].CopyFrom(Data(FLOAT32, q->second.dims,
+                        std::vector<float>(q->second.Count(0), 1.0f)));
+            }
+        }
         v41TargetHeadWeights.reset();
         v41DsparkAttentionWeights.clear();
         if (engram_layer_ids.empty()) {
