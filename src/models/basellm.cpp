@@ -451,13 +451,15 @@ namespace fastllm {
     }
 
     int ResponseContextDict::CreateHandle() {
-        locker.lock();
-        int newId = 0;
-        while (dicts.find(newId) != dicts.end()) {
-            newId++;
-        }
+        std::lock_guard<std::mutex> lock(locker);
+        // Cancelled async fetches may outlive removal. Do not immediately
+        // recycle their handle for the next request (the ABA problem).
+        int newId;
+        do {
+            newId = nextHandle;
+            nextHandle = nextHandle == INT_MAX ? 0 : nextHandle + 1;
+        } while (dicts.find(newId) != dicts.end());
         dicts[newId] = new ResponseContext();
-        locker.unlock();
         return newId;
     }
 
@@ -3823,7 +3825,9 @@ namespace fastllm {
         this->OnResponseContextCreated(context);
 
         dictLocker.unlock();
-        dictCV.notify_one();
+        // Scheduler and token consumers share this condition variable. A
+        // single notification can wake only a consumer and strand new work.
+        dictCV.notify_all();
         return handleId;
     }
 
@@ -3882,6 +3886,8 @@ namespace fastllm {
             return -1;
         } else {
             while (true) {
+                context = responseContextDict.GetHandle(handleId);
+                if (context == nullptr || context->isAbort) return -1;
                 if (context->resultTokenQueue.size() > 0) {
                     int ret = context->resultTokenQueue.front();
                     context->resultTokenQueue.pop();
@@ -3891,7 +3897,7 @@ namespace fastllm {
                         ResponseContextError err = context->error;
                         RemoveResponseContext(handleId);
                         dictLocker.unlock();
-                        dictCV.notify_one();
+                        dictCV.notify_all();
                         if (err == ResponseContextErrorPromptTooLong) {
                             return -2;
                         }
@@ -3925,6 +3931,7 @@ namespace fastllm {
             return -1;
         }
         while (true) {
+            if (context->isAbort) return -1;
             if (statistics != nullptr) {
                 CopyResponseStatistics(*context, statistics);
             }
@@ -3941,7 +3948,7 @@ namespace fastllm {
                 ResponseContextError err = context->error;
                 RemoveResponseContext(handleId);
                 dictLocker.unlock();
-                dictCV.notify_one();
+                dictCV.notify_all();
                 return err == ResponseContextErrorPromptTooLong ? -2 :
                        err == ResponseContextErrorRuntime ? -3 : -1;
             }
@@ -3970,6 +3977,8 @@ namespace fastllm {
             return -1;
         } else {
             while (true) {
+                context = responseContextDict.GetHandle(handleId);
+                if (context == nullptr || context->isAbort) return -1;
                 if (context->resultTokenQueue.size() > 0) {
                     int ret = context->resultTokenQueue.front();
                     context->resultTokenQueue.pop();
@@ -3983,7 +3992,7 @@ namespace fastllm {
                     if (context->isEnding) {
                         RemoveResponseContext(handleId);
                         dictLocker.unlock();
-                        dictCV.notify_one();
+                        dictCV.notify_all();
                         return -1;
                     }
                 }

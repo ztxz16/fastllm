@@ -93,6 +93,7 @@ namespace fastllm {
     struct ResponseContextDict {
         std::mutex locker;
         std::map <int, ResponseContext*> dicts;
+        int nextHandle = 0;
 
         int CreateHandle();
 

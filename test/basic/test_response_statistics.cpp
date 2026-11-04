@@ -1,7 +1,9 @@
 #include "models/basellm.h"
+#include <chrono>
 #include <future>
 #include <iostream>
 #include <stdexcept>
+#include <thread>
 
 using namespace fastllm;
 
@@ -47,7 +49,7 @@ int main() {
     try {
         StatisticsFixture model;
         int tokens[64], statistics[3];
-        // Exercise partial drains and immediately recycle the terminal handle.
+        // Exercise partial drains and start a new request after terminal fetch.
         for (int iteration = 0; iteration < 1000; ++iteration) {
             int output = iteration % 130;
             int handle = model.Create(10000, 8000, output);
@@ -61,7 +63,9 @@ int main() {
             }
             Check(count == -1 && received == output, "terminal result changed");
             int next = model.Create(17000, 0, 0);
-            Check(next == handle, "handle reuse was not exercised");
+            Check(next != handle, "terminal handle was immediately recycled");
+            Check(model.FetchResponseTokensBatch(handle, tokens, 64) == -1,
+                  "a stale fetch reached the next request");
             Check(statistics[0] == 8000 && statistics[1] == 2000 &&
                   statistics[2] == output, "terminal snapshot was overwritten");
             int cached, missed, generated;
@@ -98,10 +102,44 @@ int main() {
         handle = model.Create(100, 80, 2, false);
         model.FetchResponseTokensBatch(handle, tokens, 64, statistics);
         model.AbortResponse(handle);
+        Check(model.FetchResponseTokensBatch(handle, tokens, 64, statistics) == -1 &&
+              statistics[0] == -1, "cancelled fetch must stop before scheduler removal");
         model.RemoveAborted(handle);
         Check(model.FetchResponseTokensBatch(handle, tokens, 64, statistics) == -1 &&
               statistics[0] == -1, "aborted context returned stale statistics");
-        std::cout << "Response statistics tests passed (1000 immediate handle reuses)\n";
+        const int replacement = model.Create(30, 0, 1);
+        Check(replacement != handle, "cancelled handle was immediately recycled");
+        std::vector<float> logits;
+        Check(model.FetchResponseTokens(handle) == -1 &&
+              model.FetchResponseLogits(handle, logits) == -1,
+              "stale single-token or logits fetch reached the replacement");
+        Check(model.FetchResponseTokensBatch(replacement, tokens, 64) == 1 && tokens[0] == 10,
+              "replacement token was consumed by a stale fetch");
+        Check(model.FetchResponseTokensBatch(replacement, tokens, 64) == -1,
+              "replacement request did not finish");
+        // The scheduler and a cancelled request's outstanding token fetch
+        // can both be asleep. Launch must wake both classes of waiter.
+        StatisticsFixture wake;
+        wake.mainLoop = new std::thread([] {});
+        std::promise<void> ready[2];
+        std::atomic<int> notified{0};
+        std::thread waiters[2];
+        for (int i = 0; i < 2; ++i) {
+            waiters[i] = std::thread([&, i] {
+                std::unique_lock<std::mutex> lock(wake.dictLocker);
+                ready[i].set_value();
+                if (wake.dictCV.wait_for(lock, std::chrono::milliseconds(500)) ==
+                    std::cv_status::no_timeout)
+                    ++notified;
+            });
+            ready[i].get_future().wait();
+        }
+        const int wakeHandle = wake.LaunchResponseTokens({1, 2, 3});
+        for (auto &waiter : waiters)
+            waiter.join();
+        wake.RemoveResponseContext(wakeHandle);
+        Check(notified == 2, "new requests must wake the scheduler as well as token consumers");
+        std::cout << "Response statistics and cancellation tests passed (1000 request transitions)\n";
     } catch (const std::exception &error) {
         std::cerr << error.what() << '\n';
         return 1;
