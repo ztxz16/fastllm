@@ -3997,7 +3997,9 @@ bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int 
             allocate(work.batchWorkspace, INT8, {int(std::max(bytes, rawBytes))});
         } else if (batchGGUF && bytes) allocate(work.batchWorkspace, INT8, {int(bytes)});
     }
-    work.admitted = candidate >= 0 && work.cache->slots > 0 && cpuCount + stagedRoutes > 0;
+    const int admissionSlots = !work.cache ? 0 : work.cache->layerSlots.empty()
+        ? work.cache->slots : work.cache->layerSlots[work.table].count;
+    work.admitted = candidate >= 0 && admissionSlots >= topk && cpuCount + stagedRoutes > 0;
     if (work.admitted && !work.cache->admissionStream) {
         checkCudaErrors("EP admission stream", cudaStreamCreateWithFlags(
             &work.cache->admissionStream, cudaStreamNonBlocking));
@@ -4769,7 +4771,10 @@ static bool MergeMOEHybrid(const fastllm::Data &input,
     auto *frequency = cache->frequencyActive ? cache->frequency.get() : nullptr;
     // The legacy demand-refill path needs a complete route-sized cache. A
     // smaller hybrid cache is valid only with its separate staging policy.
-    if (!frequency && cache->slots < kMaxTopK) return false;
+    // Heterogeneous records have separate slot partitions. A large total
+    // cache does not guarantee enough slots for this table's top-k refill.
+    if (!frequency && (cache->slots < kMaxTopK ||
+            (!cache->layerSlots.empty() && cache->layerSlots[tableId].count < index.dims[1]))) return false;
     if (!frequency && cache->decode && cache->decode->policy.UseGpu()) return false;
     const bool scoredBfloat = layout.deepSeekV41 || layout.glm5;
     if (scoredBfloat != (input.dataType == fastllm::DataType::BFLOAT16)) return false;
