@@ -61,10 +61,23 @@ __device__ __forceinline__ void FastllmWriteFP4KVBlock(
     *sf = scale.__x;
     const float roundedScale = float(scale);
     const float invScale = roundedScale > 0.0f ? 1.0f / roundedScale : 0.0f;
+    uint32_t encoded[2] = {};
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
-        packed[i] = FastllmFP4KVEncode(values[2 * i] * invScale) |
+        const uint32_t byte = FastllmFP4KVEncode(values[2 * i] * invScale) |
             (FastllmFP4KVEncode(values[2 * i + 1] * invScale) << 4);
+        encoded[i / 4] |= byte << ((i % 4) * 8);
+    }
+    // Row-packed caches can have a 4-byte-aligned stride (e.g. 108 bytes).
+    // Keep byte stores for unaligned views; never touch an adjacent block.
+    if ((reinterpret_cast<uintptr_t>(packed) & 7) == 0) {
+        *reinterpret_cast<uint2 *>(packed) = make_uint2(encoded[0], encoded[1]);
+    } else if ((reinterpret_cast<uintptr_t>(packed) & 3) == 0) {
+        reinterpret_cast<uint32_t *>(packed)[0] = encoded[0];
+        reinterpret_cast<uint32_t *>(packed)[1] = encoded[1];
+    } else {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) packed[i] = encoded[i / 4] >> ((i % 4) * 8);
     }
 }
 

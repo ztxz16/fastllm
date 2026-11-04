@@ -139,11 +139,11 @@ static void PointerBindingTest() {
     std::puts("PASS graph pointer binding, implicit selection and request reorder");
 }
 
-static void PagedSharingTest(int totalTokens = 0) {
+static void PagedSharingTest(int totalTokens = 0, size_t keyBytes = 16, size_t valueBytes = 7) {
     KvMemSparseConfig c;
     c.maxRequests = 2; c.maxBatch = 3; c.maxTokens = 320; c.pageLen = 64;
     c.totalTokens = totalTokens;
-    c.residentTokens = 16; c.maxSelected = 8; c.keyRowBytes = 16; c.valueRowBytes = 7;
+    c.residentTokens = 16; c.maxSelected = 8; c.keyRowBytes = keyBytes; c.valueRowBytes = valueBytes;
     KvMemSparseCache cache(c); Stream stream; Fill(cache, c);
     Require(cache.HostBytes() == size_t(totalTokens ? totalTokens : 640) *
         (c.keyRowBytes + c.valueRowBytes), "physical pool used per-request capacity");
@@ -206,16 +206,16 @@ static void PagedSharingTest(int totalTokens = 0) {
     std::puts("PASS shared paged prefixes, private hot buffers, reordered graph and exact prefill gather");
 }
 
-static void StorageTest(int requests, int padded, int tokens, int selected, int resident, size_t kb, size_t vb) {
+static void StorageTest(int requests, int padded, int tokens, int selected, int resident, size_t kb, size_t vb, int inputOffset = 0) {
     KvMemSparseConfig c;
     c.maxRequests = requests; c.maxBatch = padded; c.maxTokens = tokens;
     c.maxSelected = selected; c.residentTokens = resident; c.keyRowBytes = kb; c.valueRowBytes = vb;
     KvMemSparseCache cache(c); Stream stream;
     Fill(cache, c);
     Buffer<int> ids(padded), lengths(padded), counts(padded), topk(size_t(padded) * selected), positions(padded);
-    Buffer<unsigned char> writeK(size_t(padded) * kb), writeV(size_t(padded) * vb);
+    Buffer<unsigned char> writeK(size_t(padded) * kb + inputOffset), writeV(size_t(padded) * vb + inputOffset);
     std::vector<int> hi(padded), hl(padded), hc(padded), ht(size_t(padded) * selected), hp(padded);
-    std::vector<unsigned char> wk(size_t(padded) * kb), wv(size_t(padded) * vb);
+    std::vector<unsigned char> wk(size_t(padded) * kb + inputOffset), wv(size_t(padded) * vb + inputOffset);
     for (size_t i = 0; i < wk.size(); ++i) wk[i] = (i * 17 + 21) % 253;
     for (size_t i = 0; i < wv.size(); ++i) wv[i] = (i * 29 + 11) % 247;
     writeK.Put(wk); writeV.Put(wv);
@@ -223,7 +223,7 @@ static void StorageTest(int requests, int padded, int tokens, int selected, int 
     Graph graph, append;
     graph.Capture(stream.s, resolve);
     append.Capture(stream.s, [&] {
-        cache.Write(ids.p, positions.p, writeK.p, writeV.p, padded, stream.s); resolve();
+        cache.Write(ids.p, positions.p, writeK.p + inputOffset, writeV.p + inputOffset, padded, stream.s); resolve();
     });
     const void *address = cache.Indices(); const size_t memory = cache.DeviceBytes();
     unsigned long long totalMiss = 0, totalEvicted = 0;
@@ -262,9 +262,9 @@ static void StorageTest(int requests, int padded, int tokens, int selected, int 
         if (round % 3 == 0) {
             for (int b = 0; b < padded; ++b) if (hi[b] >= 0) {
                 Require(!std::memcmp((unsigned char *)cache.HostKey(hi[b]) + size_t(hp[b]) * kb,
-                                    wk.data() + size_t(b) * kb, kb), "DDR key append missing");
+                                    wk.data() + inputOffset + size_t(b) * kb, kb), "DDR key append missing");
                 Require(!std::memcmp((unsigned char *)cache.HostValue(hi[b]) + size_t(hp[b]) * vb,
-                                    wv.data() + size_t(b) * vb, vb), "DDR value append missing");
+                                    wv.data() + inputOffset + size_t(b) * vb, vb), "DDR value append missing");
             }
         }
         auto before = Read(cache.DeviceStats(), requests);
@@ -500,9 +500,20 @@ int main(int argc, char **argv) {
         PointerBindingTest();
         PagedSharingTest();
         PagedSharingTest(512); // Two 320-token histories share a smaller physical pool.
+        PagedSharingTest(512, 108, 72); // Block-scaled FP4 K/V rows use different copy widths.
         PackedAppendTest();
         StorageTest(1, 1, 257, 1, 1, 3, 7);
         StorageTest(3, 4, 4099, 33, 65, 385, 259);
+        // Odd request strides exercise the weakest guaranteed row alignment.
+        // Cover every vector width, byte fallback and the real FP4 row layout.
+        for (const auto sizes : {std::pair<size_t, size_t>{2, 6}, {4, 12}, {8, 24},
+                                 {16, 48}, {108, 72}, {36, 18}, {17, 9}})
+            StorageTest(3, 4, 259, 33, 65, sizes.first, sizes.second);
+        // Non-aligned input views must safely select narrower copies.
+        for (int offset : {1, 2, 4, 8}) {
+            StorageTest(3, 4, 259, 33, 65, 108, 72, offset);
+            StorageTest(3, 4, 259, 33, 65, 16, 48, offset);
+        }
         StorageTest(1, 1, 200003, 2048, 4096, 384, 256);
         StorageTest(32, 32, 4099, 257, 512, 192, 128);
         StorageTest(220, 224, 4099, 64, 128, 64, 32);
