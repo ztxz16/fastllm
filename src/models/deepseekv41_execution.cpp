@@ -121,10 +121,20 @@ namespace fastllm {
 
 #endif
             void V41Assign(Data &dst, const Data &src, const std::vector<int> &tpDevices) {
+                if (&dst == &src) return;
     #ifdef USE_CUDA
                 if (!tpDevices.empty() && src.multiDeviceData && src.IsTensorParallelReplicated()) {
                     V41CopyTensor(dst, src, tpDevices);
                     return;
+                }
+                // Prefix continuation can produce an ordinary tensor after a
+                // replicated tail. CopyFrom does not own/reset TP replicas;
+                // discard them before publishing the new single-owner value.
+                if (dst.multiDeviceData) {
+                    V41ResetMultiDevice(dst);
+                    // A TP root can have shape metadata without a payload.
+                    // Switching memory kinds must not copy that old root.
+                    dst.ToDevice(src.dataDevice, src.dataDeviceIds, false);
                 }
     #endif
                 dst.CopyFrom(src);
