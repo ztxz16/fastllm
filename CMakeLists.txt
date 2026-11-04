@@ -2540,6 +2540,11 @@ if (UNIT_TEST)
         set_tests_properties(naive_n05_dsa_batch PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
             PASS_REGULAR_EXPRESSION "BATCH DSA PASS")
 
+        add_executable(naive_n05_fp4_vector_test test/basic/test_naive_n05_fp4_vector.cu)
+        target_link_libraries(naive_n05_fp4_vector_test PRIVATE fastllm)
+        set_target_properties(naive_n05_fp4_vector_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        add_test(NAME naive_n05_fp4_vector COMMAND naive_n05_fp4_vector_test)
+        set_tests_properties(naive_n05_fp4_vector PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 60)
         add_executable(naive_n05_fp4_kv_test test/basic/test_naive_n05_fp4_kv.cpp)
         target_link_libraries(naive_n05_fp4_kv_test PRIVATE fastllm)
         target_include_directories(naive_n05_fp4_kv_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})

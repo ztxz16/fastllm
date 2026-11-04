@@ -9,7 +9,7 @@ __device__ __forceinline__ void RotateCachedPair(const BF16 *src, Output dst,
     dst[d + rd / 2] = __float2bfloat16(RoundBF16(b * c) + RoundBF16(a * s));
 }
 
-template<bool Packed, class Batch = RopeCacheBatch, int FixedKvHeads = 0>
+template<bool Packed, class Batch = RopeCacheBatch, int FixedKvHeads = 0, bool FP4 = false>
 __global__ __launch_bounds__(128) void RequestRope(
 #if CUDART_VERSION >= 12010
         const __grid_constant__
@@ -17,6 +17,7 @@ __global__ __launch_bounds__(128) void RequestRope(
         Batch batch,
         int headsArg, int kvHeadsArg, int dimArg, int vdArg, int idArg, int rdArg,
         float theta, BF16 valueScale, int windowArg, bool ringArg) {
+    static_assert(!FP4 || FixedKvHeads == 1, "FP4 compact RoPE requires one KV head");
     const int heads = FixedKvHeads ? 16 : headsArg;
     const int kvHeads = FixedKvHeads ? FixedKvHeads : kvHeadsArg;
     const int dim = FixedKvHeads ? 192 : dimArg, vd = FixedKvHeads ? 128 : vdArg;
@@ -57,25 +58,47 @@ __global__ __launch_bounds__(128) void RequestRope(
     const int *vp = r.pageLen && r.cache ? (const int *)r.cache[3] : r.valuePages;
     const int physicalK = kp ? kp[row / r.pageLen] * r.pageLen + row % r.pageLen : row;
     const int physicalV = vp ? vp[row / r.pageLen] * r.pageLen + row % r.pageLen : row;
-    const int tail = r.scaledIndexer ? FastllmNaiveIndexerBytes / (r.fp8 ? 1 : 2) : id;
+    const bool indexFp8 = FP4 ? r.indexFp8 : r.fp8;
+    const int tail = r.scaledIndexer ? FastllmNaiveIndexerBytes / (indexFp8 ? 1 : 2) : id;
     FastllmNaiveKVWriteRow key{r.cache ? (void *)r.cache[0] : r.key, r.fp8};
     FastllmNaiveKVWriteRow value{r.cache ? (void *)r.cache[1] : r.value, r.fp8};
     const int keyStride = kvHeads * dim + (r.separateIndex ? 0 : tail);
-    for (int i = t; i < kvHeads * (rd / 2); i += 128) {
-        const int h = i / (rd / 2), d = i % (rd / 2);
-        const BF16 *src = Packed ? r.qkv + (heads + h) * dim : r.k + h * dim;
-        auto dst = key + (size_t)physicalK * keyStride + h * dim;
-        RotateCachedPair(src, dst, d, rd, cosine, sine);
-    }
-    for (int i = t; i < kvHeads * (dim - rd); i += 128) {
-        const int h = i / (dim - rd), d = rd + i % (dim - rd);
-        const BF16 *src = Packed ? r.qkv + (heads + h) * dim : r.k + h * dim;
-        (key + (size_t)physicalK * keyStride + h * dim)[d] = src[d];
-    }
-    for (int i = t; i < kvHeads * vd; i += 128) {
-        const BF16 *src = Packed ? r.qkv + (heads + kvHeads) * dim : r.v;
-        (value + (size_t)physicalV * kvHeads * vd)[i] =
-            __float2bfloat16_rn((float)src[i] * (float)valueScale);
+    if constexpr (FP4) {
+        // Share the existing Q/K/Indexer angles and preserve each BF16
+        // rounding point before the unchanged block quantizer runs.
+        __shared__ BF16 rotatedKey[192], scaledValue[128];
+        const BF16 *srcK = Packed ? r.qkv + heads * dim : r.k;
+        const BF16 *srcV = Packed ? r.qkv + (heads + kvHeads) * dim : r.v;
+        if (t < rd / 2) RotateCachedPair(srcK, rotatedKey, t, rd, cosine, sine);
+        for (int d = rd + t; d < dim; d += 128) rotatedKey[d] = srcK[d];
+        for (int d = t; d < vd; d += 128)
+            scaledValue[d] = __float2bfloat16_rn((float)srcV[d] * (float)valueScale);
+        __syncthreads();
+        if (t < (dim + vd) / 16) {
+            const bool isKey = t < dim / 16;
+            const int block = isKey ? t : t - dim / 16, width = isKey ? dim : vd;
+            auto *destination = (uint8_t *)(isKey ? key.data : value.data) +
+                (size_t)(isKey ? physicalK : physicalV) * (width / 16 * 9);
+            FastllmWriteFP4KVBlock(destination, (isKey ? rotatedKey : scaledValue) + block * 16,
+                block * 16, width);
+        }
+    } else {
+        for (int i = t; i < kvHeads * (rd / 2); i += 128) {
+            const int h = i / (rd / 2), d = i % (rd / 2);
+            const BF16 *src = Packed ? r.qkv + (heads + h) * dim : r.k + h * dim;
+            auto dst = key + (size_t)physicalK * keyStride + h * dim;
+            RotateCachedPair(src, dst, d, rd, cosine, sine);
+        }
+        for (int i = t; i < kvHeads * (dim - rd); i += 128) {
+            const int h = i / (dim - rd), d = rd + i % (dim - rd);
+            const BF16 *src = Packed ? r.qkv + (heads + h) * dim : r.k + h * dim;
+            (key + (size_t)physicalK * keyStride + h * dim)[d] = src[d];
+        }
+        for (int i = t; i < kvHeads * vd; i += 128) {
+            const BF16 *src = Packed ? r.qkv + (heads + kvHeads) * dim : r.v;
+            (value + (size_t)physicalV * kvHeads * vd)[i] =
+                __float2bfloat16_rn((float)src[i] * (float)valueScale);
+        }
     }
     if (!id) return;
     auto dst = key + (size_t)physicalK * keyStride + kvHeads * dim;
@@ -85,7 +108,7 @@ __global__ __launch_bounds__(128) void RequestRope(
             if (row % r.pageLen / r.indexPageLen != r.indexContextRank) return;
             physical = physical / r.pageLen * r.indexPageLen + row % r.indexPageLen;
         }
-        dst = FastllmNaiveKVWriteRow{r.cache ? (void *)r.cache[r.pageLen ? 4 : 2] : r.indexCache, r.fp8} + (size_t)physical * tail;
+        dst = FastllmNaiveKVWriteRow{r.cache ? (void *)r.cache[r.pageLen ? 4 : 2] : r.indexCache, indexFp8} + (size_t)physical * tail;
     }
     if (r.scaledIndexer) {
         if (t < rd / 2) RotateCachedPair(r.indexKey, rotatedIndex, t, rd, cosine, sine);

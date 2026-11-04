@@ -129,6 +129,43 @@ __global__ void DirectScores(const BF16 *q, FastllmNaiveDSABatch batch, float *s
                 valid ? Round(Round(dot) * rsqrtf(192.f)) : -INFINITY;
     }
 }
+// Share a decoded KV tile across GQA heads, retaining the six FMAs and
+// warp reduction of DirectScores for every score.
+template<int Heads, int Keys, class Batch = FastllmNaiveDSABatch>
+__global__ void GroupedScores(const BF16 *query, Batch batch, float *scores,
+                       int heads, int kvHeads, int stride) {
+    const auto r=FastllmNaiveResolveDSARow(batch.rows[blockIdx.z]);
+    const int length=Length(r);
+    if (!length) return;
+    const int t=threadIdx.x,lane=t%32,head=blockIdx.x*Heads+t/32;
+    const int first=blockIdx.y*Keys,kh=head/(heads/kvHeads);
+    __shared__ __align__(16) BF16 tile[Keys][192];
+    __shared__ int selected[Keys];
+    if(t<Keys) {
+        int i=first+t,k=i<r.selectedCount?r.indices[i]:-1;
+        selected[t]=k>=0&&k<length?k:-1;
+    }
+    __syncthreads();
+    FastllmNaiveKV key(r.key,r.keyPages,r.pageLen,r.fp8,r.fp4);
+    for(int i=t;i<Keys*24;i+=Heads*32) {
+        int k=selected[i/24];
+        Copy<false>(&tile[i/24][i%24*8],key.Row(max(k,0),r.keyStride)+kh*192+i%24*8,k>=0);
+    }
+    float q[6];
+#pragma unroll
+    for(int d=0;d<6;++d)q[d]=float(query[((size_t)blockIdx.z*heads+head)*192+lane+d*32]);
+    __syncthreads();
+#pragma unroll
+    for(int i=0;i<Keys;++i) {
+        float sum=0;
+#pragma unroll
+        for(int d=0;d<6;++d)sum=fmaf(q[d],float(tile[i][lane+d*32]),sum);
+        sum=WarpSum(sum);
+        if(!lane&&first+i<r.selectedCount)
+            scores[((size_t)blockIdx.z*heads+head)*stride+first+i]=selected[i]>=0?Round(Round(sum)*rsqrtf(192.f)):-INFINITY;
+    }
+}
+
 // Preserve the original 256-lane reduction tree and BF16 probability rounding.
 __device__ __forceinline__ void Normalize(const float *input, float *output, const float *sink, int head,
                                           int count, float *scratch, float &maximum, float &denominator,
@@ -466,6 +503,71 @@ __global__ void GroupedValues(const float *scores, const float *sink, FastllmNai
             out[((size_t)b * heads + firstHead + h) * 128 + column + c] = __float2bfloat16(sum);
         }
     }
+}
+
+// Normalize once for every head, then share each 64-row V tile across all
+// output columns and GQA heads. The old column-split kernel repeated the same
+// softmax sixteen times. Keep its 32 partial sums of 64 FMAs, followed by the
+// ordered sum of those partials; pairing output columns changes no arithmetic.
+template <int Groups> struct TiledValueStorage {
+    BF16 values[64][128];
+    float probabilities[Groups][2048], scratch[Groups / 4][256];
+    float maximum[Groups / 4], denominator[Groups / 4];
+    int selected[64];
+};
+
+template <int Groups, class Batch>
+__global__ void TiledSparseValues(const float *scores, Batch batch, const float *sink,
+                                  BF16 *out, int heads) {
+    static_assert(Groups >= 4 && Groups % 4 == 0 && Groups <= 16);
+    constexpr int Threads = Groups * 64;
+    const int t = threadIdx.x, b = blockIdx.x, firstHead = blockIdx.y * Groups;
+    const auto r = FastllmNaiveResolveDSARow(batch.rows[b]);
+    if (ZeroInactive(r, out + ((size_t)b * heads + firstHead) * 128, Groups * 128))
+        return;
+    const int length = Length(r);
+    extern __shared__ __align__(16) unsigned char memory[];
+    auto &s = *(TiledValueStorage<Groups> *)memory;
+    for (int i = t; i < Groups * 2048; i += Threads)
+        s.probabilities[i / 2048][i % 2048] = scores[((size_t)b * heads + firstHead) * 2048 + i];
+    __syncthreads();
+    for (int wave = 0; wave < 4; ++wave) {
+        const int group = t / 256, h = group + wave * (Groups / 4);
+        Normalize(s.probabilities[h], s.probabilities[h], sink, firstHead + h, 2048,
+                  s.scratch[group], s.maximum[group], s.denominator[group], t % 256);
+        __syncthreads();
+    }
+    // Resolve V's page mapping once per selected row, before loading columns.
+    // K and V may have different page tables, including after graph rebinding.
+    FastllmNaiveKV value(r.value, nullptr, 0, r.fp8, r.fp4);
+    float result0 = 0, result1 = 0;
+    for (int first = 0; first < 2048; first += 64) {
+        if (t < 64) {
+            const int k = r.indices[first + t];
+            s.selected[t] = k >= 0 && k < length ? FastllmNaivePhysicalRow(r, k, true) : -1;
+        }
+        __syncthreads();
+        for (int i = t; i < 64 * 16; i += Threads) {
+            const int k = s.selected[i / 16];
+            Copy<false>(&s.values[i / 16][i % 16 * 8],
+                        value.Row(max(k, 0), 128) + i % 16 * 8, k >= 0);
+        }
+        __syncthreads();
+        float part0 = 0, part1 = 0;
+#pragma unroll
+        for (int i = 0; i < 64; ++i) {
+            const auto pair = *(__nv_bfloat162 *)&s.values[i][t % 64 * 2];
+            const float2 v = __bfloat1622float2(pair);
+            const float p = s.probabilities[t / 64][first + i];
+            part0 = fmaf(p, v.x, part0);
+            part1 = fmaf(p, v.y, part1);
+        }
+        result0 += part0;
+        result1 += part1;
+        __syncthreads();
+    }
+    *(__nv_bfloat162 *)(out + ((size_t)b * heads + firstHead) * 128 + t * 2) =
+        __floats2bfloat162_rn(result0, result1);
 }
 
 } // namespace naive_dsa_decode

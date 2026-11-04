@@ -15,7 +15,7 @@ struct CompactRopeRequest {
 constexpr int kCompactRopeRequests=448;
 struct CompactRopeRequests {
     int keyRows,valueRows,pageLen,indexPageLen;
-    bool fp8,scaledIndexer,separateIndex;
+    bool fp8,scaledIndexer,separateIndex,fp4,indexFp8;
     CompactRopeRequest rows[kCompactRopeRequests];
 };
 static_assert(sizeof(CompactRopeRequest)==72);
@@ -27,6 +27,7 @@ __device__ __forceinline__ RopeCacheRow RopeRequestRow(const CompactRopeRequests
     r.positions=x.positions;r.length=x.length;r.cache=x.cache;
     r.keyRows=b.keyRows;r.valueRows=b.valueRows;r.pageLen=b.pageLen;
     r.indexPageLen=b.indexPageLen;r.fp8=b.fp8;r.scaledIndexer=b.scaledIndexer;
+    r.fp4=b.fp4;r.indexFp8=b.indexFp8;
     r.separateIndex=b.separateIndex;r.indexContextRank=x.indexContextRank;
     return r;
 }
@@ -34,12 +35,14 @@ inline bool PackRope(const RopeCacheRow *rows,int count,CompactRopeRequests &bat
     const auto &first=rows[0];
     batch.keyRows=first.keyRows;batch.valueRows=first.valueRows;batch.pageLen=first.pageLen;
     batch.indexPageLen=first.indexPageLen;batch.fp8=first.fp8;
+    batch.fp4=first.fp4;batch.indexFp8=first.indexFp8;
     batch.scaledIndexer=first.scaledIndexer;batch.separateIndex=first.separateIndex;
     for(int i=0;i<count;++i){
         const auto &r=rows[i];
         if(!r.cache||!r.length||r.keyRows!=batch.keyRows||r.valueRows!=batch.valueRows||
            r.pageLen!=batch.pageLen||r.indexPageLen!=batch.indexPageLen||
-           r.fp8!=batch.fp8||r.scaledIndexer!=batch.scaledIndexer||r.separateIndex!=batch.separateIndex)return false;
+           r.fp8!=batch.fp8||r.fp4!=batch.fp4||r.indexFp8!=batch.indexFp8||
+           r.scaledIndexer!=batch.scaledIndexer||r.separateIndex!=batch.separateIndex)return false;
         batch.rows[i]={r.q,r.k,r.v,r.indexKey,r.qkv,r.positions,r.length,r.cache,r.indexContextRank};
     }
     return true;

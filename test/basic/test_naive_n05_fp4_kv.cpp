@@ -255,17 +255,23 @@ void ReadWrite() {
         Require(Read<uint16_t>(restored) == c.Decode(), "FP4 paged prefill/history decode");
     }
 }
-void DSA(int batch, int length, bool sparse, int heads) {
+void DSA(int batch, int length, bool sparse, int heads, bool withSink = false, bool uniform = false) {
     Cache k(length, 192, 71), v(length, 128, 79), k2(length, 192, 83), v2(length, 128, 89);
     Data q(BFLOAT16), live(INT32), indices(INT32), table(INT32), a, b, sink;
     Allocate(q, {1, batch, heads * 192});
-    Upload(q, Input(batch * heads * 192, 97));
+    Upload(q, uniform ? std::vector<uint16_t>(batch * heads * 192, 0) : Input(batch * heads * 192, 97));
+    if (withSink) {
+        Allocate(sink, {heads});
+        std::vector<float> values(heads);
+        for (int h = 0; h < heads; ++h) values[h] = (h - heads / 2) * 0.35f;
+        Cuda(cudaMemcpy(sink.cudaData, values.data(), values.size() * sizeof(float), cudaMemcpyHostToDevice));
+    }
     Allocate(live, {batch});
     Allocate(indices, {batch, 2048});
     Allocate(table, {batch * 4 * int(sizeof(void *) / 4)});
     std::vector<int> selected(batch * 2048);
     for (size_t i = 0; i < selected.size(); ++i)
-        selected[i] = i % 17 ? int(i * 37 % length) : -1;
+        selected[i] = i % 17 == 0 ? -1 : i % 29 == 0 ? length + 1 : int(i * 37 % length);
     Cuda(cudaMemcpy(indices.cudaData, selected.data(), selected.size() * 4, cudaMemcpyHostToDevice));
     std::vector<FastllmNaiveDSARow> packed(batch), reference(batch);
     auto bind = [&](Cache &key, Cache &value, bool padded) {
@@ -314,7 +320,56 @@ void DSA(int batch, int length, bool sparse, int heads) {
         graph.Run();
         FastllmCudaNaiveBatchDSADecode(q, sink, reference, heads, 1, 192, 128, sb, b);
         Near(a, b);
+        if (FastllmCudaRuntimeArch() == 90 && sparse && heads == 16 && batch >= 32) {
+            // Tensor Core accumulation may differ from the scalar fallback.
+            // Keep the existing bounded-error check against both references,
+            // including graph rebind, descriptor boundaries and inactive rows.
+            std::vector<int> checked = {0, 31, 32, 255, 256, batch / 2, batch - 1};
+            std::sort(checked.begin(), checked.end());
+            checked.erase(std::unique(checked.begin(), checked.end()), checked.end());
+            for (int row : checked) {
+                if (row >= batch) continue;
+                Data singleQuery(BFLOAT16, {1, 1, heads * 192}), singleOutput;
+                singleQuery.FakeFrom(q, size_t(row) * heads * 192 * 2);
+                FastllmNaiveDecodeScratch singleScratch;
+                FastllmCudaNaiveBatchDSADecode(singleQuery, sink, {packed[row]},
+                    heads, 1, 192, 128, singleScratch, singleOutput);
+                Data actualRow(BFLOAT16, {1, 1, heads * 128});
+                actualRow.FakeFrom(a, size_t(row) * heads * 128 * 2);
+                Near(actualRow, singleOutput);
+            }
+        }
     }
+}
+void Prefill() {
+    constexpr int length = 8192, queries = 2048, heads = 16;
+    Cache k(length, 192, 701), v(length, 128, 709);
+    Data q(BFLOAT16), indices(INT32), a, b, sink;
+    Allocate(q, {1, queries, heads * 192});
+    Upload(q, Input(queries * heads * 192, 719));
+    Allocate(indices, {queries, 2048});
+    std::vector<int> selected(queries * 2048);
+    for (size_t i = 0; i < selected.size(); ++i)
+        selected[i] = i % 17 == 0 ? -1 : i % 29 == 0 ? length + 1 : int(i * 37 % length);
+    Cuda(cudaMemcpy(indices.cudaData, selected.data(), selected.size() * 4, cudaMemcpyHostToDevice));
+    FastllmCudaNaiveAttention(q, k.view, v.view, indices, sink, heads, 1, 192, 128,
+        length - queries, 0, a, true);
+    // Subdivide only queries so the dequantized reference retains the
+    // established fallback, independent of the large-prefill dispatch.
+    b.dataType = BFLOAT16;
+    Allocate(b, {1, queries, heads * 128});
+    for (int first = 0; first < queries; first += 512) {
+        Data qr(BFLOAT16, {1, 512, heads * 192}), ir(INT32, {512, 2048});
+        Data result(BFLOAT16, {1, 512, heads * 128});
+        qr.FakeFrom(q, size_t(first) * heads * 192 * 2);
+        ir.FakeFrom(indices, size_t(first) * 2048 * 4);
+        result.FakeFrom(b, size_t(first) * heads * 128 * 2);
+        FastllmCudaNaiveAttention(qr, k.dense, v.dense, ir, sink, heads, 1, 192, 128,
+            length - queries + first, 0, result, true);
+    }
+    Near(a, b);
+    Require(Read<uint16_t>(a) == Read<uint16_t>(b),
+            "FP4 prefill changed dequantized fallback bits");
 }
 void RopeGraph() {
     Cache key(512, 192, 101), value(512, 128, 103), otherKey(512, 192, 107), otherValue(512, 128, 109);
@@ -395,8 +450,9 @@ void RopeGraph() {
 // Cover the later >=80-request RoPE dispatch and context-sharded Indexer.
 // Each row owns distinct pages, so accidental BF16 stores or cross-row writes
 // cannot hide behind identical inputs or aliased cache pointers.
-void RopeBatch(int batch, int contextRank) {
+void RopeBatch(int batch, int contextRank, bool packed = false, bool scaled = false) {
     constexpr int heads = 16, indexPage = 32;
+    const int indexWidth = scaled ? 144 : 128; // 128 FP8 values, FP32 scale and padding.
     Data q(BFLOAT16), k(BFLOAT16), v(BFLOAT16), ik(BFLOAT16), pos(FLOAT32), live(INT32), bindings(INT32);
     Allocate(q, {1, batch, heads * 192});
     Allocate(k, {1, batch, 192}); Allocate(v, {1, batch, 128});
@@ -405,6 +461,19 @@ void RopeBatch(int batch, int contextRank) {
     auto hq = Input(batch * heads * 192, 191), hk = Input(batch * 192, 193);
     auto hv = Input(batch * 128, 197), hi = Input(batch * 128, 199);
     Upload(q, hq); Upload(k, hk); Upload(v, hv); Upload(ik, hi);
+    Data qkv(BFLOAT16);
+    if (packed) {
+        const int width = (heads + 1) * 192 + 128;
+        Allocate(qkv, {1, batch, width});
+        std::vector<uint16_t> input(batch * width);
+        for (int b = 0; b < batch; ++b) {
+            auto start = input.begin() + b * width;
+            std::copy_n(hq.begin() + b * heads * 192, heads * 192, start);
+            std::copy_n(hk.begin() + b * 192, 192, start + heads * 192);
+            std::copy_n(hv.begin() + b * 128, 128, start + (heads + 1) * 192);
+        }
+        Upload(qkv, input);
+    }
     std::vector<std::unique_ptr<Cache>> keys, values;
     std::vector<std::unique_ptr<PagedCacheManager>> indexes;
     std::vector<Data> indexViews(batch), indexInputs(batch);
@@ -418,10 +487,11 @@ void RopeBatch(int batch, int contextRank) {
         indexes.emplace_back(new PagedCacheManager());
         auto &index = *indexes.back();
         index.dataType = FP8_E4M3; index.pageLen = indexPage; index.SetMaxPages(2);
-        Allocate(index, {2, indexPage, 1, 128});
+        Allocate(index, {2, indexPage, 1, indexWidth});
         auto &view = indexViews[b];
         view.FakeFrom(keys[b]->table, 0); view.dataType = FP8_E4M3; view.UpdateUnitSize();
-        view.Resize({1, 64, 128}); view.expansionDims = {1, 64, 128};
+        view.Resize({1, 64, indexWidth}); view.expansionDims = {1, 64, indexWidth};
+        view.kvCacheFp8Indexer = scaled;
         view.isPagedKVCache = true; view.pagedKVCacheData = &index; view.pageLen = indexPage;
         indexInputs[b].FakeFrom(ik, size_t(b) * 128 * 2);
         indexInputs[b].Resize({1, 1, 128});
@@ -437,29 +507,63 @@ void RopeBatch(int batch, int contextRank) {
     Graph graph;
     graph.Capture([&] {
         Require(FastllmCudaNaiveBatchRopeAppendCache(q, k, v, pos, rows, live,
-            heads, 1, 192, 128, 64, 1e7f, .707f, 0), "FP4 batch/context RoPE rejected");
+            heads, 1, 192, 128, 64, 1e7f, .707f, 0, packed ? &qkv : nullptr), "FP4 batch/context RoPE rejected");
     });
-    Upload(q, hq); graph.Run();
     Data qr(BFLOAT16), kr(BFLOAT16), vr(BFLOAT16), ir(BFLOAT16);
     Allocate(qr, q.dims); Allocate(kr, k.dims); Allocate(vr, v.dims); Allocate(ir, ik.dims);
-    Upload(qr, hq); Upload(kr, hk); Upload(vr, hv); Upload(ir, hi);
-    FastllmCudaNaiveRopeQKScaleV(qr, kr, vr, pos, heads, 1, 192, 128, 64, 1e7f, .707f);
-    FastllmCudaNaiveRope(ir, pos, 1, 128, 64, 1e7f);
-    Require(Read<uint16_t>(q) == Read<uint16_t>(qr), "FP4 batch RoPE changed Q");
-    auto rotatedK = Read<uint16_t>(kr), scaledV = Read<uint16_t>(vr), rotatedIndex = Read<uint16_t>(ir);
-    for (int b = 0; b < batch; ++b) {
-        const int row = lengths[b] - 1;
-        keys[b]->ReferenceWrite({rotatedK.begin() + b * 192, rotatedK.begin() + (b + 1) * 192}, row);
-        values[b]->ReferenceWrite({scaledV.begin() + b * 128, scaledV.begin() + (b + 1) * 128}, row);
-        keys[b]->Verify(); values[b]->Verify();
-        std::vector<uint8_t> expected(indexes[b]->GetBytes());
-        if (row % 128 / indexPage == contextRank) {
-            const int physical = keys[b]->ids[row / 128] * indexPage + row % indexPage;
-            for (int c = 0; c < 128; ++c)
-                expected[physical * 128 + c] = __nv_fp8_e4m3(Float(rotatedIndex[b * 128 + c])).__x;
+    std::vector<std::vector<uint8_t>> expectedIndex(batch);
+    for (int b = 0; b < batch; ++b) expectedIndex[b].resize(indexes[b]->GetBytes());
+    for (int pass = 0; pass < 2; ++pass) {
+        if (pass) {
+            // Rebind the captured graph, cross page boundaries and remove rows.
+            for (int b = 0; b < batch; ++b) {
+                const int target = (b + 1) % batch;
+                lengths[b] = b % 7 ? 1 + (b * 37) % 255 : 0;
+                positions[b] = 70000.f + lengths[b];
+                const void *binding[5] = {keys[target]->pool.cudaData, values[target]->pool.cudaData,
+                    keys[target]->table.cudaData, values[target]->table.cudaData, indexes[target]->cudaData};
+                for (int j = 0; j < 5; ++j) pointers[b * 5 + j] = lengths[b] ? binding[j] : nullptr;
+            }
+            Cuda(cudaMemcpy(bindings.cudaData, pointers.data(), pointers.size() * sizeof(void *), cudaMemcpyHostToDevice));
+            Cuda(cudaMemcpy(live.cudaData, lengths.data(), lengths.size() * sizeof(int), cudaMemcpyHostToDevice));
+            Cuda(cudaMemcpy(pos.cudaData, positions.data(), positions.size() * sizeof(float), cudaMemcpyHostToDevice));
         }
-        Require(Read<uint8_t>(*indexes[b]) == expected, "FP4 changed sharded Indexer or adjacent rows");
+        Upload(q, hq); graph.Run();
+        Upload(qr, hq); Upload(kr, hk); Upload(vr, hv); Upload(ir, hi);
+        FastllmCudaNaiveRopeQKScaleV(qr, kr, vr, pos, heads, 1, 192, 128, 64, 1e7f, .707f);
+        FastllmCudaNaiveRope(ir, pos, 1, 128, 64, 1e7f);
+        auto expectedQ = Read<uint16_t>(qr);
+        for (int b = 0; b < batch; ++b) if (!lengths[b])
+            std::fill_n(expectedQ.begin() + b * heads * 192, heads * 192, 0);
+        Require(Read<uint16_t>(q) == expectedQ, "FP4 batch RoPE changed Q");
+        auto rotatedK = Read<uint16_t>(kr), scaledV = Read<uint16_t>(vr), rotatedIndex = Read<uint16_t>(ir);
+        for (int b = 0; b < batch; ++b) {
+            if (!lengths[b]) continue;
+            const int target = pass ? (b + 1) % batch : b, row = lengths[b] - 1;
+            keys[target]->ReferenceWrite({rotatedK.begin() + b * 192, rotatedK.begin() + (b + 1) * 192}, row);
+            values[target]->ReferenceWrite({scaledV.begin() + b * 128, scaledV.begin() + (b + 1) * 128}, row);
+            if (row % 128 / indexPage == contextRank) {
+                const int physical = keys[target]->ids[row / 128] * indexPage + row % indexPage;
+                auto *expected = expectedIndex[target].data() + physical * indexWidth;
+                float scale = 1.f;
+                if (scaled) {
+                    float maximum = 0.f;
+                    for (int c = 0; c < 128; ++c) maximum = std::max(maximum, std::abs(Float(rotatedIndex[b * 128 + c])));
+                    scale = std::max(maximum, 1e-4f) / 448.f;
+                    std::memcpy(expected + 128, &scale, sizeof(scale));
+                }
+                for (int c = 0; c < 128; ++c) {
+                    float x = Float(rotatedIndex[b * 128 + c]) / scale;
+                    expected[c] = __nv_fp8_e4m3(scaled ? std::max(-448.f, std::min(448.f, x)) : x).__x;
+                }
+            }
+        }
+        for (int b = 0; b < batch; ++b) {
+            keys[b]->Verify(); values[b]->Verify();
+            Require(Read<uint8_t>(*indexes[b]) == expectedIndex[b], "FP4 changed sharded Indexer or adjacent rows");
+        }
     }
+    std::printf("PASS FP4 RoPE batch=%d rank=%d packed=%d scaled=%d with graph rebind\n", batch, contextRank, packed, scaled);
 }
 void SparseRoundTrip() {
     Cache key(512, 192, 137), value(512, 128, 139);
@@ -536,14 +640,20 @@ int main() {
             return 77;
         FastllmCudaSetDevice(0);
         ReadWrite();
+        Prefill();
         PrefixCopy();
         RopeGraph();
         for (int rank = 0; rank < 4; ++rank) RopeBatch(128, rank);
+        for (int rank = 0; rank < 4; ++rank) RopeBatch(320, rank, true, true);
+        for (int batch : {79, 80, 193, 448, 449}) RopeBatch(batch, 0, true, true);
         SparseRoundTrip();
-        for (int heads : {8, 16}) for (int batch : {1, 4, 7, 33}) {
+        for (int heads : {8, 16}) for (int batch : {1, 4, 7, 32, 33, 64, 256, 257, 360, 380}) {
             DSA(batch, 257, false, heads);
             DSA(batch, 4097, true, heads);
         }
+        DSA(449, 4097, true, 16); // Cross the compact descriptor boundary.
+        DSA(64, 8193, true, 16, true);
+        DSA(64, 8193, true, 16, true, true);
         Cuda(cudaDeviceSynchronize());
         std::puts("ALL FP4 DSA CHECKS PASSED");
         return 0;

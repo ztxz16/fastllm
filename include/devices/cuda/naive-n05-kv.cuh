@@ -48,14 +48,28 @@ struct FastllmNaiveKVRow {
         return *reinterpret_cast<unsigned *>(&b);
     }
     __device__ __forceinline__ uint4 Load8() const {
-        if (scales) return make_uint4(FP4Pair(0), FP4Pair(2), FP4Pair(4), FP4Pair(6));
+        if (scales) {
+            if (!(column & 7) && !((uintptr_t)data & 3)) {
+                uint4 values;
+                LoadFP4Pairs<4>((unsigned *)&values);
+                return values;
+            }
+            return make_uint4(FP4Pair(0), FP4Pair(2), FP4Pair(4), FP4Pair(6));
+        }
         if (!fp8) return *(const uint4 *)data;
         uint2 packed = *(const uint2 *)data;
         return make_uint4(ConvertPair(packed.x), ConvertPair(packed.x >> 16),
                           ConvertPair(packed.y), ConvertPair(packed.y >> 16));
     }
     __device__ __forceinline__ uint2 Load4() const {
-        if (scales) return make_uint2(FP4Pair(0), FP4Pair(2));
+        if (scales) {
+            if (!(column & 3) && !((uintptr_t)data & 1)) {
+                uint2 values;
+                LoadFP4Pairs<2>((unsigned *)&values);
+                return values;
+            }
+            return make_uint2(FP4Pair(0), FP4Pair(2));
+        }
         if (!fp8) return *(const uint2 *)data;
         unsigned packed = *(const unsigned *)data;
         return make_uint2(ConvertPair(packed), ConvertPair(packed >> 16));
@@ -63,6 +77,35 @@ struct FastllmNaiveKVRow {
     __device__ __forceinline__ unsigned FP4Pair(int n) const {
         __nv_bfloat162 pair = __halves2bfloat162((*this)[n], (*this)[n + 1]);
         return *reinterpret_cast<unsigned *>(&pair);
+    }
+    // Caller guarantees 2/4-byte alignment and no crossing of a 16-value block.
+    template<int Pairs>
+    __device__ __forceinline__ void LoadFP4Pairs(unsigned *out) const {
+        const auto *source = (const uint8_t *)data + column / 2;
+        static_assert(Pairs == 2 || Pairs == 4 || Pairs == 8);
+        const unsigned raw = Pairs >= 4 ? *(const unsigned *)source : *(const unsigned short *)source;
+        const unsigned high = Pairs == 8 ? *(const unsigned *)(source + 4) : 0;
+        const unsigned sf = scales[column / 16];
+        // Keep CUDA's scalar NaN conversion. Every finite E2M1 * E4M3
+        // product is exact in FP16 (including the smallest block scale).
+        // Decode pairs with a byte permutation and a single packed multiply,
+        // then convert to exactly the same BF16 values as scalar LoadFloat.
+        if ((sf & 127) == 127) {
+#pragma unroll
+            for (int i = 0; i < Pairs; ++i) out[i] = FP4Pair(i * 2);
+            return;
+        }
+        const __half2 scale = __nv_cvt_fp8x2_to_halfraw2(sf | (sf << 8), __NV_E4M3);
+#pragma unroll
+        for (int i = 0; i < Pairs; ++i) {
+            const unsigned pair = ((i < 4 ? raw : high) >> ((i % 4) * 8)) & 255;
+            const unsigned selector = (pair & 7) | (((pair >> 4) & 7) << 8);
+            unsigned bits = (__byte_perm(0x3e3c3800, 0x46444240, selector) & 0x00ff00ff) << 8;
+            bits |= ((pair & 8) << 12) | ((pair & 128) << 24);
+            const float2 values = __half22float2(__hmul2(*reinterpret_cast<__half2 *>(&bits), scale));
+            __nv_bfloat162 result = __floats2bfloat162_rn(values.x, values.y);
+            out[i] = *reinterpret_cast<unsigned *>(&result);
+        }
     }
 };
 

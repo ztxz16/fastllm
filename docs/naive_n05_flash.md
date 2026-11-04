@@ -71,20 +71,30 @@ DSA K/V 的净存储降为 FP8 的 9/16，减少 43.75%；页表、Indexer、SWA
 
 Prefill 将已有 FP4 历史解码到预分配、各层复用的 BF16 工作区；decode 直接读取
 热缓存中的 FP4。CUDA Graph 沿用设备指针表与动态页表，不固化请求地址。
-FP4 不进入要求 BF16/FP8 原始布局的 bulk/TMA 路径，可能增加解码开销，
-不能仅凭存储减少推断吞吐提升。FP4 是有损量化，长上下文精度和端到端速度
-需在独立评测中确认。
+满足形状与资源条件时，Hopper 上至少 32 行、16-head GQA、单 KV head、
+QK=192/V=128、TopK=2048 的 FP4 decode 复用 FP8 融合路径的 BF16 Tensor Core
+QK/PV 和全局 softmax；FP4 tile 异步预取到共享内存后解包，不生成全局 score 工作区。
+缓存仍保存 FP4，并非使用原生 FP4 Tensor Core 指令；MMA 累加顺序可能与标量路径
+产生合理的数值差异，不要求逐位一致。每个 tile 由 16 个 head 共享，紧凑参数表保留
+Graph 重绑和动态页表；资源不足时回退到 8-head 共享或原有标量路径。
+其他形状保留原路径；不使用要求 BF16/FP8 原始布局的 TMA 路径。
+FP4 解包使用向量读取，prefill 的 BF16 工作区可复用 Hopper 分块注意力，
+减少重复解包与全局 FP32 score 工作区。
+FP4 block 的 payload 写入和 KVMem 行搬运按实际地址对齐选择向量宽度，
+非对齐视图保留较窄或逐字节回退。Hopper 的匹配 decode 形状还复用单请求内
+的 RoPE 角度，融合 DSA KV 量化及 Indexer 写入；量化和 BF16 舍入规则保持不变。
 
 回归目标为 `naive_n05_fp4_kv_test` / CTest `naive_n05_fp4_kv`，覆盖独立
 CPU 量化参考、K/V 跨页读写、共享前缀尾页复制、KVMem 热缓存换出与重载、
 稠密/稀疏 DSA 和 CUDA Graph 回放时切换缓存地址、页表及有效 batch；
-另有 128 路 RoPE 写入和 TP4 两种 Indexer 分片的扩页、请求生命周期、前缀恢复回归。
+RoPE 写入还覆盖 packed QKV、带 scale 的 FP8 Indexer、79～449 路边界和 Graph
+重绑；TP4 回归覆盖两种 Indexer 分片的扩页、请求生命周期与前缀恢复。
 在启用 `-DUNIT_TEST=ON` 的 CUDA 构建中，GPU 空闲后可运行：
 
 ```bash
-cmake --build build --target naive_n05_fp4_kv_test -j2
+cmake --build build --target naive_n05_fp4_kv_test naive_n05_fp4_vector_test -j2
 cmake --build build --target naive_n05_verify_graph_test -j2
-ctest --test-dir build -R '^naive_n05_(fp4_kv|kvmem_(transition|prefix)_fp4_.*)$' --output-on-failure
+ctest --test-dir build -R '^naive_n05_(fp4_(kv|vector)|kvmem(_transition|_prefix)?_fp4_.*)$' --output-on-failure
 ```
 
 这是实验路径；上述回归检查存储和执行一致性，不代表 FP4 与原模型精度等价。
