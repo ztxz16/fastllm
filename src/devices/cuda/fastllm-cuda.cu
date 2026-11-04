@@ -13556,6 +13556,12 @@ bool FastllmHalfToBF16(void *a, void *b, int len) {
 }
 
 bool FastllmCudaEmbedding(const fastllm::Data &input, const fastllm::Data &weight,fastllm::Data &output) {
+    if (weight.dataType == fastllm::DATA_GGUF_FORMAT) {
+        const bool ok = FastllmCudaGGUFEmbedding(input, weight, output);
+        fastllm::AssertInFastLLM(ok, "Unsupported packed CUDA embedding.\n");
+        DeviceSync();
+        return ok;
+    }
     int vocabSize = weight.dims[0], embSize = weight.dims[1];
     uint64_t inputLen = input.Count(0);
 

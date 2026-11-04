@@ -101,14 +101,29 @@ class CpuTuningTest(unittest.TestCase):
                 path.mkdir()
                 (path / 'cpulist').write_text(cpus)
             with patch.dict(tuning.os.environ, {}, clear=True), \
-                    patch.object(tuning.os, 'sched_getaffinity', return_value=set(range(8))):
+                    patch.object(tuning.os, 'sched_getaffinity', create=True, return_value=set(range(8))):
                 self.assertEqual(tuning.numa_node_count(root), 2)
             with patch.dict(tuning.os.environ, {'FT_NUMAS': '1'}, clear=True), \
-                    patch.object(tuning.os, 'sched_getaffinity', return_value=set(range(4))):
+                    patch.object(tuning.os, 'sched_getaffinity', create=True, return_value=set(range(4))):
                 self.assertEqual(tuning.numa_node_count(root), 1)
             with patch.dict(tuning.os.environ, {}, clear=True), \
-                    patch.object(tuning.os, 'sched_getaffinity', return_value=set(range(4))):
-                self.assertEqual(tuning.numa_node_count(root), 0)
+                    patch.object(tuning.os, 'sched_getaffinity', create=True, return_value=set(range(4))):
+                self.assertEqual(tuning.numa_node_count(root), 1)
+
+    def test_numa_nonzero_and_sparse_nodes_with_partial_cpu_masks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for node, cpus in ((1, '4-7'), (3, '12-15')):
+                path = root / ('node%d' % node)
+                path.mkdir()
+                (path / 'cpulist').write_text(cpus)
+            for mask, requested, expected in (({6}, '1', 1), ({6, 14}, '0', 2),
+                                               ({6, 14}, '1', 1), ({6}, '8', 1),
+                                               ({0}, '0', 0)):
+                with self.subTest(mask=mask, requested=requested), \
+                        patch.dict(tuning.os.environ, {'FT_NUMAS': requested}, clear=True), \
+                        patch.object(tuning.os, 'sched_getaffinity', create=True, return_value=mask):
+                    self.assertEqual(tuning.numa_node_count(root), expected)
 
     def test_unavailable_numa_layout_retains_linear_fallback(self):
         with patch.object(tuning, 'numa_node_count', return_value=0), \
@@ -117,6 +132,13 @@ class CpuTuningTest(unittest.TestCase):
         self.assertEqual(chosen, 2)
         self.assertEqual(detail['method'], 'quantized-gemv')
         measure.assert_called_once_with(5120, 2304, 16, (1, 2))
+
+    def test_standard_numa_dispatch_preserves_gate_down_pair(self):
+        with patch.object(tuning, 'numa_node_count', return_value=1), \
+                patch.object(tuning, '_measure', return_value={'samples_ms': {'1': 2, '2': 1}}) as measure:
+            chosen, detail = tuning.select_threads(2560, 640, 22, 2, numa=True, rows=4, topk=10, down_type=42)
+        self.assertEqual(chosen, 2)
+        measure.assert_called_once_with(2560, 640, 22, (1, 2), 4, 10, 42)
 
     def test_worker_is_separate_and_has_hard_timeout(self):
         tuning._measure.cache_clear()

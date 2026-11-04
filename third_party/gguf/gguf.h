@@ -2128,6 +2128,13 @@ template <int nrc_y>
 static void mul_mat_q6_k_r4_q8_k(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x);
 
 namespace fastllm {
+    // Ordinary row layouts with exact FP32 CUDA lookup decoders. Keep this
+    // predicate shared by import and dispatch so unsupported tables stay dense.
+    inline bool GGUFSupportsCudaEmbedding(ggml_type type) {
+        return type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_IQ4_NL ||
+               type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S || type == GGML_TYPE_Q3_K;
+    }
+
     const std::string GGUF_KEY_GENERAL_ALIGNMENT = "general.alignment";
     const int GGUF_DEFAULT_ALIGNMENT = 32;
 

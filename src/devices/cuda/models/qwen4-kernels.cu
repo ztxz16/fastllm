@@ -5256,11 +5256,7 @@ bool FastllmCudaQwen4SparsePrefill(const fastllm::Data &query, const fastllm::Da
             tensor->dataDeviceIds = {device};
             tensor->Allocate(false);
         }
-        const uint64_t layerBytes = uint64_t(key.dims[0]) * key.dims[1] * dim * sizeof(half);
-        AssertInFastLLM(cudaMemcpyAsync(stagedKey.cudaData, tiered->hostKey, layerBytes,
-            cudaMemcpyHostToDevice, cudaStreamPerThread) == cudaSuccess &&
-            cudaMemcpyAsync(stagedValue.cudaData, tiered->hostValue, layerBytes,
-            cudaMemcpyHostToDevice, cudaStreamPerThread) == cudaSuccess,
+        AssertInFastLLM(tiered->StagePrefix(stagedKey.cudaData, stagedValue.cudaData, key.dims[1]),
             "Qwen4 KVMem prefill staging failed.");
     }
     output.Resize(query.dims);

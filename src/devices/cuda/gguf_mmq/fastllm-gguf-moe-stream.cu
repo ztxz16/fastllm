@@ -178,7 +178,7 @@ static bool RunPipelined(const fastllm::Data &input, fastllm::Data &gate,
     } else FastllmCudaGetMoePrefillResidents(weights, expertCount, resident, glm5);
     // Generic probes can share a GLM weight table, but this pipeline restores
     // canonical records. Never read or publish those in a native NUMA cache.
-    if (resident.nativeGGUF && !glm5) return false;
+    if (resident.nativeGlm && !glm5) return false;
     std::vector<std::vector<int>> routes(expertCount);
     for (int r = 0; r < rows * topk; ++r) {
         const int e = indices[r];
@@ -255,17 +255,31 @@ static bool RunPipelined(const fastllm::Data &input, fastllm::Data &gate,
     const auto *gu = weights[2 * (order[0] + 1)], *down = weights[2 * (order[0] + 1) + 1];
     const size_t gateWeightBytes = Align(gu->GetBytes());
     const size_t stride = gateWeightBytes + Align(down->GetBytes());
+    // With phase reuse enabled the caller releases this workspace after
+    // every eager MoE. Recycle it through the event-aware tensor pool rather
+    // than synchronizing and cudaFree/cudaMalloc at each layer. The default
+    // persistent path retains direct ownership to bound routing-driven growth.
+    const char *reuse = std::getenv("FASTLLM_QWEN38_PREFILL_REUSE");
+    const bool direct = !(FastllmCudaMoeCacheIsQwen38(weights, 4) &&
+                          reuse && std::string(reuse) == "1");
     const bool misses = std::any_of(order.begin(), order.end(), [&](int e) { return !cached(e); });
     // Native EP residents remain R4 in cache. Restore their bounded working
     // group on the GPU, just as for misses, without changing cache ownership.
-    const size_t ringBytes = misses || resident.nativeGGUF
+    const size_t ringBytes = !direct || misses || resident.nativeGGUF
         ? Pipeline::groups * batchExperts * stride : 0;
     const size_t rawOffset = 0, canonicalOffset = ringBytes, metaOffset = (disk ? 1 : 2) * ringBytes;
     const size_t descOffset = reserve(2 * order.size() * sizeof(WeightCopy));
     const size_t scoreOffset = reserve(size_t(rows) * topk * sizeof(float));
     const size_t indexOffset = reserve((glm5 || nativeV41) ? size_t(rows) * topk * sizeof(int32_t) : 0);
-    const size_t computeOffset = metaOffset + metaBytes;
-    const size_t bytes = Align(computeOffset + StreamedMoeWorkspaceBytes(rows, hidden, inter, topk, capacity, nativeV41));
+    // A pooled buffer must not grow a little at each layer and strand every
+    // previous allocation. Bound routing metadata and projection capacity by
+    // the request shape; only ownership changes, logical GEMM routes do not.
+    constexpr size_t pooledMetadata = 2 * size_t(1024 * 1024);
+    if (!direct && metaBytes > pooledMetadata) return false;
+    const size_t computeOffset = metaOffset + (direct ? metaBytes : pooledMetadata);
+    const int allocationCapacity = direct ? capacity : rows * topk + 15 * batchExperts;
+    const size_t bytes = Align(computeOffset + StreamedMoeWorkspaceBytes(
+        rows, hidden, inter, topk, allocationCapacity, nativeV41));
     const size_t gateBytes = nativeV41 ? 0 : size_t(rows) * topk * inter * (input.dataType == fastllm::FLOAT32 ? 4 : 2);
     // This eager-only workspace persists across layers. Tiny routing-driven
     // growth used to leave each retired hundreds-of-MiB block in the general
@@ -273,8 +287,8 @@ static bool RunPipelined(const fastllm::Data &input, fastllm::Data &gate,
     // RunPipelined synchronizes every consumer before returning.
     if (workspace.isFake || workspace.cudaDataBorrowed) return false;
     size_t reservedBytes = std::max(bytes, workspace.expansionBytes);
-    if (!workspace.cudaData || workspace.expansionBytes < bytes ||
-        (gateBytes && (!gate.cudaData || gate.expansionBytes < gateBytes)) || !workspace.directMemory) {
+    if (direct && (!workspace.cudaData || workspace.expansionBytes < bytes ||
+        (gateBytes && (!gate.cudaData || gate.expansionBytes < gateBytes)) || workspace.directMemory != direct)) {
         size_t freeBytes = 0, totalBytes = 0;
         CUDA_CHECK(cudaMemGetInfo(&freeBytes, &totalBytes));
         const size_t reusable = (workspace.cudaData ? workspace.expansionBytes : 0) +
@@ -295,9 +309,46 @@ static bool RunPipelined(const fastllm::Data &input, fastllm::Data &gate,
         if (rounded + gateBytes + reserve <= freeBytes + reusable) reservedBytes = rounded;
     }
     if (reservedBytes / 256 > size_t(INT32_MAX)) return false;
-    if (!workspace.directMemory) {
+    if (workspace.directMemory != direct) {
         workspace.FreeSpace();
-        workspace.directMemory = true;
+        workspace.directMemory = direct;
+    }
+    if (!direct && (!workspace.cudaData || workspace.expansionBytes < reservedBytes)) {
+        // Driver free memory excludes ready pooled buffers. Probe the shared
+        // allocator itself before falling back; a capacity miss remains clean
+        // and cannot poison later CUDA Graph captures.
+        constexpr size_t quantum = 16 * size_t(1024 * 1024);
+        reservedBytes = (reservedBytes + quantum - 1) / quantum * quantum;
+        workspace.FreeSpace();
+        workspace.dataType = fastllm::INT8;
+        workspace.UpdateUnitSize();
+        workspace.dataDevice = fastllm::CUDA;
+        workspace.dataDeviceIds = {device};
+        workspace.multiDeviceData = false;
+        workspace.Resize({int(reservedBytes / 256), 256});
+        void *allocation = nullptr;
+        if (FastllmCudaTryMalloc(&allocation, reservedBytes) != FASTLLM_CUDA_TRY_MALLOC_SUCCESS)
+            return false;
+        workspace.cudaData = allocation;
+        workspace.expansionDims = workspace.dims;
+        workspace.expansionSize = reservedBytes;
+        workspace.expansionBytes = reservedBytes;
+        size_t freeBytes = 0, totalBytes = 0;
+        CUDA_CHECK(cudaMemGetInfo(&freeBytes, &totalBytes));
+        const size_t remainingReserve = 256 * size_t(1024 * 1024) +
+            (gate.cudaData ? 0 : gateBytes);
+        if (freeBytes < remainingReserve) {
+            // An eager prefill may leave large, completed attention buffers
+            // idle in the same allocator. Driver free bytes exclude them.
+            // Keep the acquired workspace live while reclaiming only idle,
+            // unpinned, completed blocks, then retain the original margin.
+            FastllmCudaClearBigBufferCurrentDevice();
+            CUDA_CHECK(cudaMemGetInfo(&freeBytes, &totalBytes));
+        }
+        if (freeBytes < remainingReserve) {
+            workspace.FreeSpace();
+            return false;
+        }
     }
     AllocateTensor(workspace, fastllm::INT8, {int(reservedBytes / 256), 256}, device);
     if (gateBytes) AllocateTensor(gate, input.dataType, {rows * topk, inter}, device);

@@ -604,6 +604,7 @@ bool FastllmCudaMLAPagedBatch(const fastllm::Data &qNope, const fastllm::Data &q
         const std::vector<const fastllm::Data*> &physicalTokenIndices,
         fastllm::Data &output, float softmaxScale);
 
+bool FastllmCudaGGUFEmbedding(const fastllm::Data &input, const fastllm::Data &weight, fastllm::Data &output);
 bool FastllmCudaEmbedding(const fastllm::Data &input, const fastllm::Data &weight, fastllm::Data &output);
 bool FastllmCudaEmbeddingDirect(const fastllm::Data &input, const fastllm::Data &weight, fastllm::Data &output);
 bool FastllmCudaAttention(const fastllm::Data &q, const fastllm::Data &k, const fastllm::Data &v,

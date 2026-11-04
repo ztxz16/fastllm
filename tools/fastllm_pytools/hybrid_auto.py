@@ -303,6 +303,7 @@ class Geometry:
     gguf_expert_bytes: dict = field(default_factory=dict)  # packed per-expert bytes by layer
     disk_prefill: dict = field(default_factory=dict)  # bounded V4.1 BF16 workspace phases (native/GGUF)
     runtime: dict = field(default_factory=dict)  # persistent V4.1 allocations, separate from request scratch
+    prefill_retained_width: int = 0  # shared forward state live across attention and host-expert phases
 
 
 def geometry(metadata, kv_dtype, mtp, dspark=0):
@@ -507,6 +508,8 @@ def geometry(metadata, kv_dtype, mtp, dspark=0):
             state[-1] += (2 * dspark_block + 1) * int(get("vocab_size", "")) * 4
     result = Geometry(family, layers, context, hidden, experts, topk, inter, kv, state,
                       score_divisor, width, chunk, streamed_kv, dspark_block)
+    if family == "qwen4":
+        result.prefill_retained_width = hidden * int(get("hc_count", "hyper_connection.count", 4)) * 8
     if family == "deepseek_v41":
         result.runtime = {
             "heads": int(config["num_attention_heads"]), "head_dim": dim,
@@ -753,6 +756,66 @@ def _qwen35_weight_sizes(tensors, args):
     return sizes
 
 
+def _qwen_q8_rules(args):
+    """Budget only explicit, exact-name Q8 overrides understood by the loader.
+
+    General C++ regular expressions and arbitrary precision conversions remain
+    unsupported by auto. This opt-in subset cannot silently quantize experts,
+    lookup tables, routers, norms or visual weights.
+    """
+    value = getattr(args, "dtype_config", "")
+    if not value:
+        return {}
+    try:
+        text = value if value.lstrip().startswith("[") else Path(value).read_text(encoding="utf-8")
+        rules = json.loads(text)
+        if not isinstance(rules, list) or not rules:
+            raise ValueError("expected a nonempty list")
+        names = {}
+        for rule in rules:
+            if not isinstance(rule, dict) or set(rule) != {"key", "dtype"} or rule["dtype"].lower() != "ggml_q8_0":
+                raise ValueError("only ggml_q8_0 rules are budgeted")
+            key = rule["key"]
+            if not isinstance(key, str):
+                raise ValueError("invalid weight name")
+            name = key[1:-1].replace("\\.", ".")
+            if key != "^" + re.escape(name) + "$" or not re.fullmatch(r"[A-Za-z0-9_.]+", name):
+                raise ValueError("use an anchored, escaped exact weight name")
+            projection = re.fullmatch(
+                r"(?:model\.language_model\.|mtp\.)(?:"
+                r"hyper_connection_mixer\.input_mix_weight_(?:down|up)|"
+                r"layers\.\d+\.(?:(?:attn|mlp)_hyper_connection\.input_mix_weight_(?:down|up)|"
+                r"linear_attn\.(?:in_proj_qkv|in_proj_z|out_proj)|"
+                r"self_attn\.(?:[qkvo]_proj|indexer\.index_qk_proj)|"
+                r"mlp\.shared_expert\.(?:gate|up|down)_proj))\.weight", name)
+            if name != "lm_head.weight" and name not in ("mtp.fc_embedding.weight", "mtp.fc_hidden.weight") and not projection:
+                raise ValueError("unsupported Qwen dense projection: " + name)
+            if name in names:
+                raise ValueError("duplicate weight rule: " + name)
+            names[name] = rule["dtype"]
+        return names
+    except (OSError, ValueError, TypeError, AttributeError) as error:
+        raise ValueError("Hybrid auto: unsupported dtype_config: " + str(error)) from error
+
+
+def _qwen_q8_weight_sizes(tensors, model, args):
+    rules = _qwen_q8_rules(args)
+    if not rules:
+        return {}
+    if model.family != "qwen4" or args.dtype != "auto" or args.moe_dtype not in ("", "auto"):
+        raise ValueError("Hybrid auto: Q8 overrides require native Qwen4 with auto source precision")
+    by_name = {t.name: t for t in tensors}
+    sizes = {}
+    for name in rules:
+        tensor = by_name.get(name)
+        if (tensor is None or tensor.kind not in ("F16", "BF16", "F32") or
+                len(tensor.shape) != 2 or min(tensor.shape) <= 0 or tensor.shape[1] % 32):
+            raise ValueError("Hybrid auto: Q8 override requires a native floating matrix with block-aligned rows: " + name)
+        # ggml Q8_0 stores 32 int8 values and one FP16 scale per block.
+        sizes[name] = math.prod(tensor.shape) // 32 * 34
+    return sizes
+
+
 def weight_costs(tensors, model, args):
     """Expert bytes by layer, replicated dense upper bounds and host tables."""
     expert = [0] * len(model.kv)
@@ -765,6 +828,7 @@ def weight_costs(tensors, model, args):
     shared_q5_gate = {}
     model.eager_expert_layers = set()
     packed_sizes = _packed_fp4_sizes(tensors, args)
+    q8_sizes = _qwen_q8_weight_sizes(tensors, model, args)
     native_sizes = (_deepseek_v41_weight_sizes(tensors, args) if model.family == "deepseek_v41" else
                     _qwen35_weight_sizes(tensors, args) if model.family == "qwen35" else {})
     for tensor in tensors:
@@ -830,7 +894,9 @@ def weight_costs(tensors, model, args):
                 raise ValueError("Hybrid auto: unsupported HF target weight precision " + dtype)
             # Norms/scales retain source precision. Compressed FP8/NVFP4
             # sources and their scale tensors are budgeted from their headers.
-            if name in native_sizes:
+            if name in q8_sizes:
+                size = q8_sizes[name]
+            elif name in native_sizes:
                 size = native_sizes[name]
             elif name in packed_sizes:
                 size = packed_sizes[name]
@@ -856,9 +922,14 @@ def weight_costs(tensors, model, args):
             if args.ngram_device != "disk":
                 host += size
         elif is_embedding:
-            # The Qwen GGUF adapter expands token embeddings to FP32.
+            # Match the GGUF import policy: supported Qwen4 CUDA lookups
+            # retain packed rows; CPU lookups already support packed tables.
             if model.family in ("qwen4", "qwen3") and tensor.kind.startswith("gguf:"):
-                size = math.prod(tensor.shape) * 4
+                packed_cuda = (model.family == "qwen4" and
+                               tensor.kind in ("gguf:11", "gguf:18", "gguf:20", "gguf:21", "gguf:23"))
+                if not packed_cuda:
+                    # Retain a conservative FP32 bound for unsupported layouts.
+                    size = math.prod(tensor.shape) * 4
             host += size
             if model.family == "qwen3":
                 # Cover implicit CUDA embedding and Prepare()'s output-head
@@ -874,6 +945,16 @@ def weight_costs(tensors, model, args):
             if layer is None:
                 raise ValueError("Hybrid auto: cannot place expert " + name)
             expert[layer] += size
+        elif model.family == "qwen4" and name.startswith("model.visual."):
+            # Qwen's text warmup leaves the visual tower on the host. The
+            # constrained hybrid policy also executes later media requests
+            # there; an explicit GPU vision choice keeps its reservation.
+            host += size
+            vision = getattr(args, "vision_device", None)
+            if vision is None:
+                vision = os.environ.get("FASTLLM_QWEN4_VISION_DEVICE", "auto")
+            if vision != "cpu":
+                common += size
         elif model.family == "deepseek_v41" and name in ("head.weight", "head.scale", "norm.weight"):
             # PP samples on its final stage. TP retains the conservative
             # replicated bound, as it does for other decoder projections.
@@ -962,6 +1043,35 @@ def _workspace_bytes(args, model, rows, context, mode, resident, *, gguf_mmq=Tru
     topk = max(model.topk, args.moe_experts)
     scores = _score_workspace(model, rows, context)
     dense = model.hidden * model.intermediate * 3 * 2
+    # Optional dense FP16 dequant/GEMM owns a bounded 64 MiB arena. It can
+    # coexist with persistent expert/MMQ scratch; never spend that reservation
+    # on extra cache slots before the new path has allocated it.
+    dequant = 0
+    if (model.family == "qwen4" and os.environ.get("FASTLLM_QWEN38_PREFILL_DEQUANT") == "1" and
+            ((prefill and rows >= 128) or os.environ.get("FASTLLM_QWEN38_PREFILL_ARENA") == "1")):
+        # A dedicated eager arena stays allocated during later decode/verify.
+        # It cannot be reclaimed by the general pool at a different phase peak.
+        # The FP32-reduction handle has its own immutable cuBLAS workspace.
+        # Include it even when the ordinary GEMM handle has already warmed.
+        workspace = os.environ.get("FASTLLM_CUBLAS_GRAPH_WORKSPACE_MB", "32") or "32"
+        try:
+            workspace = max(0, min(256, int(workspace)))
+        except ValueError:
+            workspace = 32  # Conservative for a malformed native atoi value.
+        dequant = (64 + workspace) * MiB
+    # The eager host-expert adapter releases its complete GPU workspace at
+    # return, including grouped-GGUF scratch. Qwen releases attention tensors
+    # before MoE. Charge the larger phase plus shared state, not their sum.
+    # Captured decode/verification buffers remain separately reserved.
+    if (prefill and rows >= 32 and model.family == "qwen4" and
+            model.prefill_retained_width > 0 and mode == "pp" and resident == 0 and
+            args.max_batch == 1 and len(devices(args)[1]) == 1 and
+            args.moe_device == "numa" and
+            os.environ.get("FASTLLM_QWEN38_PREFILL_REUSE") == "1"):
+        retained = rows * model.prefill_retained_width * 4
+        attention = scores + rows * (model.activation_width - model.prefill_retained_width) * 4
+        expert = rows * topk * (model.hidden + 3 * model.intermediate) * 4 + dense
+        return retained + max(attention, expert) + dequant
     phase = model.disk_prefill
     # PP releases attention temporaries between phases even when some expert
     # layers are CUDA-resident. The resident GGUF route buffers survive those
@@ -982,7 +1092,7 @@ def _workspace_bytes(args, model, rows, context, mode, resident, *, gguf_mmq=Tru
                            (args.moe_device == "disk" and not disk_streamed)):
         reusable = False
     if not reusable:
-        return scores + rows * (model.activation_width + topk * (model.hidden + 3 * model.intermediate)) * 4 + dense
+        return scores + rows * (model.activation_width + topk * (model.hidden + 3 * model.intermediate)) * 4 + dense + dequant
     # Indexer scores retain their full-context budget. WoA's FP32 fallback
     # expands one weight and at most 1024 rows (normally <=160 MiB).
     attention = rows * phase["attention"] + scores
@@ -1029,7 +1139,7 @@ def _workspace_bytes(args, model, rows, context, mode, resident, *, gguf_mmq=Tru
         # Keep the 256 MiB dense dequant fallback independent of those rings.
         woa = max(woa, rows * phase["woa"] + 256 * MiB)
     return (rows * phase["retained"] + max(attention, woa, moe) +
-            resident_scratch + streamed_scratch + 32 * MiB)
+            resident_scratch + streamed_scratch + 32 * MiB + dequant)
 
 
 def _v41_runtime_bytes(args, model, mode, mapping, resident, context, batch, chunk, gpu=None, *, disk_experts=False):
@@ -1196,6 +1306,59 @@ def _v41_runtime_bytes(args, model, mode, mapping, resident, context, batch, chu
     return result
 
 
+
+def _standard_full_graph_bytes(args, model, mode, mapping, resident, experts, batch):
+    """Additional shared-backend graph storage, beyond existing eager scratch.
+
+    Full graphs retain private layer routing buffers plus one arithmetic
+    workspace per shape/profile. Their 16-record upload ring coexists with
+    eager prefill and decode rings; max(prefill, decode) cannot cover it.
+    """
+    result = {name: dict.fromkeys(mapping, 0) for name in ("graphs", "staging")}
+    from .util import _fastllm_env_flag_enabled
+    if (model.family != "qwen4" or mode != "pp" or resident >= model.layers or
+            args.moe_cuda_cache == 0 or os.environ.get("FASTLLM_QWEN38_HYBRID_GRAPH") != "1" or
+            ("FASTLLM_CUDA_GRAPH" in os.environ and not _fastllm_env_flag_enabled("FASTLLM_CUDA_GRAPH")) or
+            (len(mapping) > 1 and os.environ.get("FASTLLM_QWEN38_OWNED_PP") != "1") or
+            not (args.moe_device == "numa" or (args.moe_device == "cpu" and getattr(args, "_host_moe_shared", False)))):
+        return result
+    topk = max(model.topk, args.moe_experts)
+    if not 0 < topk <= 16:
+        return result
+    drafts = max(0, args.mtp)
+    shapes = range(1, min(32, drafts + 1) + 1)
+    # Ordinary decode composes each QSA remainder separately. MTP uses one
+    # causal-mask variant per verifier length, including a shortened suffix.
+    variants = 1 if drafts else max(1, model.score_divisor)
+    page = lambda n: math.ceil(n / (64 * 1024)) * (64 * 1024)
+    host_layers = [i for i in range(resident, model.layers) if experts[i]]
+    stride = max((math.ceil(experts[i] / model.experts) + 256 for i in host_layers), default=0)
+    stride = math.ceil(stride / 128) * 128
+    for d in mapping:
+        layers = [i for i in host_layers if layer_device(i, model.layers, mapping) == d]
+        if not layers:
+            continue
+        gguf = any(i in model.gguf_expert_bytes for i in layers)
+        native = any(i not in model.gguf_expert_bytes for i in layers)
+        # Include a restore record for GGUF and the shared-source upload
+        # scratch needed by non-contiguous native auxiliary layouts.
+        result["staging"][d] = page((16 + int(gguf)) * stride + 16 * 4) + page(stride)
+        for rows in shapes:
+            routes = rows * topk
+            private = page((3 * routes if rows > 1 else 5 * routes + 1) * 4)
+            # Standard arithmetic preserves original route order; only V4.1
+            # needs a separate map for its sorted eight-row compute tiles.
+            result["graphs"][d] += len(layers) * batch * variants * private
+            scratch = page(2 * routes * model.hidden * 4) + page(rows * model.hidden * 4)
+            scratch += page(2 * routes * model.intermediate * 4)
+            result["graphs"][d] += (int(gguf) + int(native)) * scratch
+            if gguf:
+                q8 = lambda n, width: math.ceil((n * (width // 32) * 36) / 16) * 16
+                workspace = q8(rows, model.hidden) + q8(routes, model.intermediate) + routes * model.hidden * 4
+                result["graphs"][d] += 2 * page(workspace)
+    return result
+
+
 def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_gpu=False,
          kv_resident=0, per_device_cache=False, implicit_embedding_bytes=0,
          hybrid_cpu_embedding=False, disk_experts=False):
@@ -1324,6 +1487,10 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
                 transport = disk_ring + math.ceil(record / 256) * 256 + 16 * MiB
             runtime = _v41_runtime_bytes(args, model, mode, mapping, resident, context, batch, chunk, gpu,
                                          disk_experts=disk_experts)
+            standard_graph = _standard_full_graph_bytes(args, model, mode, mapping, resident, experts, batch)
+            for kind, devices in standard_graph.items():
+                for d, size in devices.items():
+                    runtime[kind][d] += size
             used = {d: common + workspace + transport + guard +
                     sum(values[d] for key, values in runtime.items() if key != "host_graphs") for d in mapping}
             reallocation = dict.fromkeys(mapping, 0)
@@ -1379,6 +1546,12 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
                         # Gate/up is merged with a separate down matrix. With
                         # slabs disabled, allow a CUDA allocation page per
                         # matrix instead of treating file bytes as device use.
+                        allocation_overhead = 2 * model.experts * 2 * MiB
+                    if (model.family == "qwen4" and layer >= model.layers and args.mtp and
+                            layer not in model.gguf_expert_bytes and not getattr(args, "cuda_slab", None)):
+                        # Native draft gate/up and down are separate BF16
+                        # allocations. Bound two CUDA allocation pages/expert
+                        # when the user explicitly disables weight slabs.
                         allocation_overhead = 2 * model.experts * 2 * MiB
                     expert_targets = list(mapping) if mode == "tp" else [
                         layer_device(owner, resident, mapping) if owner < model.layers else next(reversed(mapping))]
@@ -1506,6 +1679,8 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
                 candidate["kv_logical_bytes_per_device"] = logical_kv
                 candidate["kv_capacity_bytes_per_device"] = capacity_kv
                 candidate["kv_reallocation_bytes_per_device"] = reallocation
+            if any(size for devices in standard_graph.values() for size in devices.values()):
+                candidate["runtime_bytes_per_device"] = runtime
             if streaming:
                 candidate["kvmem"] = {"max_tokens": context, "resident_tokens": kv_resident,
                                       "host_mib": kv_host_bytes // MiB, "prefill_tokens": chunk}
@@ -1531,9 +1706,10 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
 
 
 def validate_options(args):
+    _qwen_q8_rules(args)
     if str(args.moe_device).lower() not in ("cpu", "numa", "disk") or os.environ.get("FASTLLM_EXECUTION_MODE", "auto") not in ("auto", "hybrid"):
         raise ValueError("Hybrid auto requires CUDA + --moe_device cpu/numa/disk in auto/hybrid execution mode")
-    if (args.kvmem or args.kv_cache_limit not in ("", "auto") or args.dtype_config or
+    if (args.kvmem or args.kv_cache_limit not in ("", "auto") or
             args.custom or args.lora or args.multimodal or args.rope_scaling or
             getattr(args, "speculative_algorithm", "") not in ("", "off", "mtp", "dspark") or
             (getattr(args, "speculative_algorithm", "") == "dspark" and

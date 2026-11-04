@@ -574,6 +574,8 @@ def apply_image_embedding_cache_env(args):
 
 def apply_vision_device_env(args):
     device = getattr(args, "vision_device", None)
+    if device is not None:
+        os.environ["FASTLLM_QWEN4_VISION_DEVICE"] = _vision_device(device)
     if device is None:
         device = os.environ.get("FASTLLM_QWEN35_VISION_DEVICE", "auto")
     os.environ["FASTLLM_QWEN35_VISION_DEVICE"] = _vision_device(device)
@@ -1038,7 +1040,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--device', type = str, help = '使用的设备')
     parser.add_argument('--vision_device', '--vision-device', dest = 'vision_device',
                         type = _vision_device, default = None,
-                        help = 'Qwen3.5 视觉编码器设备: auto/cpu/cuda/cuda:N；默认auto，CUDA视觉随普通TP设备与比例，多卡时cuda:N不单独覆盖')
+                        help = 'Qwen3.5/Qwen4 视觉编码器设备: auto/cpu/cuda/cuda:N；Qwen3.5 CUDA视觉随普通TP设备与比例，多卡时cuda:N不单独覆盖')
     parser.add_argument('--multimodal', action = 'store_true',
                         help = 'Qwen3.5/Qwen3.8启动时加载视觉权重并预分配工作区，再分配KV cache；按processor的图片/视频像素上限预热')
     parser.add_argument('--tp', type = str, default = "", help = '线程级张量并行设备；裸数字X表示使用前X张卡，0表示0号卡，也可写 0,1 或 auto')
@@ -1908,12 +1910,12 @@ def make_normal_llm_model(args, startup_progress = None):
         # expert tensors.
         args.cuda_slab = 225
     elif (is_qwen38_flash_next_model and cuda_slab_auto and
-            gguf_config is not None and _uses_cuda_device(args.device) and
+            _uses_cuda_device(args.device) and
             args.moe_device_layers < 0 and
             str(args.moe_device).strip().lower() in ("cpu", "numa", "disk")):
         # Host-offloaded experts have their own cache arena. Pack the persistent
-        # dense GPU weights instead: their many 6.25 MiB and smaller allocations
-        # otherwise waste hundreds of MiB at the CUDA allocation granularity.
+        # dense GPU weights and native BF16 draft experts instead: their many
+        # small allocations otherwise waste CUDA allocation pages.
         # A 64 MiB slab retains 256-byte alignment and the existing compute paths.
         args.cuda_slab = 64
     if (is_glm5_next_model and gguf_config is not None and cuda_slab_auto and
@@ -1923,6 +1925,8 @@ def make_normal_llm_model(args, startup_progress = None):
         # Pack them into the existing weight slabs instead of paying CUDA's
         # allocation granularity for each shard. Explicit --cuda_slab wins.
         args.cuda_slab = 64
+    if is_qwen38_flash_next_model and hybrid_auto_plan is not None:
+        hybrid_auto_plan["cuda_slab"] = args.cuda_slab
     if ((args.device and args.device.find("numa") != -1) or args.moe_device.find("numa") != -1 or
         (args.device and args.device.find("tfacc") != -1) or args.moe_device.find("tfacc") != -1):
         os.environ["FASTLLM_ACTIVATE_NUMA"] = "ON"

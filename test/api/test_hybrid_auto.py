@@ -5,6 +5,7 @@ import types
 from contextlib import redirect_stdout
 import json
 import os
+import re
 from pathlib import Path
 import struct
 import sys
@@ -53,6 +54,129 @@ def write_gguf(path, metadata, tensors):
         offset += size
     header += b"\0" * (-len(header) % 32)
     path.write_bytes(header + b"\0" * offset)
+
+
+class QwenDenseQ8BudgetTest(unittest.TestCase):
+    def fixture(self):
+        g, *_ = fixture()
+        g.family = "qwen4"
+        tensors = [auto.Tensor("model.language_model.layers.0.mlp.experts.0.up_proj.weight", (64, 64), 4096, "F8_E4M3"),
+                   auto.Tensor("model.language_model.layers.0.linear_attn.in_proj_qkv.weight", (64, 64), 8192, "BF16"),
+                   auto.Tensor("lm_head.weight", (128, 64), 16384, "BF16"),
+                   auto.Tensor("model.language_model.embed_tokens.weight", (128, 64), 16384, "BF16")]
+        return g, tensors
+
+    def config(self, *names):
+        return json.dumps([dict(key="^" + re.escape(n) + "$", dtype="ggml_q8_0") for n in names])
+
+    def test_payload_savings_never_include_experts_or_embedding(self):
+        g, tensors = self.fixture()
+        baseline = auto.weight_costs(tensors, g, args())
+        a = args(dtype_config=self.config(tensors[1].name, tensors[2].name))
+        auto.validate_options(a)
+        result = auto.weight_costs(tensors, g, a)
+        self.assertEqual(result[0], baseline[0])
+        self.assertEqual(result[1][0], 64 * 64 // 32 * 34)
+        self.assertEqual(baseline[2] - result[2], 128 * 64 * 2 - 128 * 64 // 32 * 34)
+        self.assertEqual(result[3], baseline[3])
+        self.assertEqual(a.dtype_config, self.config(tensors[1].name, tensors[2].name))
+
+    def test_file_and_inline_have_identical_accounting(self):
+        g, tensors = self.fixture()
+        config = self.config(tensors[1].name)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "q8.json"
+            path.write_text(config)
+            self.assertEqual(auto.weight_costs(tensors, g, args(dtype_config=str(path))),
+                             auto.weight_costs(tensors, g, args(dtype_config=config)))
+
+    def test_general_rules_and_sensitive_weights_stay_rejected(self):
+        for config in ('[]', '{}', '[{"key":".*","dtype":"ggml_q8_0"}]',
+                       json.dumps([dict(key="^" + re.escape("lm_head.weight") + "$", dtype="int8")]),
+                       self.config("model.language_model.layers.0.mlp.experts.0.up_proj.weight"),
+                       self.config("model.language_model.layers.0.mlp.gate.weight"),
+                       self.config("model.language_model.embed_tokens.weight"),
+                       self.config("model.visual.blocks.0.attn.qkv.weight"),
+                       self.config("lm_head.weight", "lm_head.weight")):
+            with self.subTest(config=config), self.assertRaises(ValueError):
+                auto.validate_options(args(dtype_config=config))
+
+    def test_missing_and_incompatible_tensors_cannot_reduce_budget(self):
+        g, tensors = self.fixture()
+        a = args(dtype_config=self.config("lm_head.weight"))
+        for replacement in (None, auto.Tensor("lm_head.weight", (128, 63), 16128, "BF16"),
+                            auto.Tensor("lm_head.weight", (128, 64), 8704, "gguf:8")):
+            altered = [t for t in tensors if t.name != "lm_head.weight"]
+            if replacement: altered.append(replacement)
+            with self.subTest(replacement=replacement), self.assertRaises(ValueError):
+                auto.weight_costs(altered, g, a)
+        g.family = "deepseek_v41"
+        with self.assertRaises(ValueError): auto.weight_costs(tensors, g, a)
+
+
+class PrefillDequantBudgetTest(unittest.TestCase):
+    def test_persistent_arena_remains_reserved_for_decode_and_verify(self):
+        g, *_ = fixture()
+        g.family = "qwen4"
+        a = args()
+        for rows in (1, 4, 127, 128, 4096):
+            for prefill in (False, True):
+                with patch.dict(os.environ, {"FASTLLM_QWEN38_PREFILL_DEQUANT":"0"}, clear=True):
+                    baseline = auto._workspace_bytes(a, g, rows, 4096, "pp", 0, prefill=prefill)
+                with patch.dict(os.environ, {"FASTLLM_QWEN38_PREFILL_DEQUANT":"1", "FASTLLM_QWEN38_PREFILL_ARENA":"1"}, clear=True):
+                    arena = auto._workspace_bytes(a, g, rows, 4096, "pp", 0, prefill=prefill)
+                self.assertEqual(arena - baseline, 96 * MiB)
+
+    def test_dense_scratch_cannot_be_spent_on_expert_cache(self):
+        geometry, costs, gpu, ram = fixture()
+        geometry.family, geometry.experts = "qwen4", 256
+        costs = ([4 * GiB] * 4, *costs[1:])
+        a = args(moe_device_layers=-1)
+        with patch.dict(os.environ, {"FASTLLM_QWEN38_PREFILL_DEQUANT": "0"}):
+            off = auto.plan(a, geometry, costs, "pp", {0: 1}, gpu, ram)
+            decode = auto._workspace_bytes(a, geometry, 4, 4096, "pp", 0, prefill=False)
+        with patch.dict(os.environ, {"FASTLLM_QWEN38_PREFILL_DEQUANT": "1"}):
+            on = auto.plan(a, geometry, costs, "pp", {0: 1}, gpu, ram)
+            self.assertEqual(auto._workspace_bytes(a, geometry, 4, 4096, "pp", 0, prefill=False), decode)
+        self.assertEqual(on["workspace_bytes_per_device"]-off["workspace_bytes_per_device"], 96 * MiB)
+        self.assertGreaterEqual(off["moe_cuda_cache"]-on["moe_cuda_cache"], 96 * MiB)
+        self.assertLessEqual(on["gpu_estimated_bytes"][0], on["gpu_budget_bytes"][0])
+
+
+    def test_other_models_ignore_qwen_prefill_environment(self):
+        g, *_ = fixture()
+        a = args()
+        for family in ("deepseek_v41", "glm5", "qwen35", "qwen3"):
+            g.family = family
+            with patch.dict(os.environ, {}, clear=True):
+                baseline = auto._workspace_bytes(a, g, 512, 4096, "pp", 0)
+            with patch.dict(os.environ, {"FASTLLM_QWEN38_PREFILL_DEQUANT": "1",
+                    "FASTLLM_QWEN38_PREFILL_ARENA": "1", "FASTLLM_QWEN38_PREFILL_REUSE": "1"}, clear=True):
+                self.assertEqual(auto._workspace_bytes(a, g, 512, 4096, "pp", 0), baseline)
+
+
+class QwenPhasePrefillBudgetTest(unittest.TestCase):
+    def test_qwen_phase_peak_requires_complete_workspace_release(self):
+        g, costs, gpu, ram = fixture()
+        g.family, g.activation_width, g.prefill_retained_width = "qwen4", 8192, 2048
+        a = args(moe_device_layers=-1)
+        switches = {"FASTLLM_QWEN38_PREFILL_REUSE": "1"}
+        with patch.dict(os.environ, {}, clear=True):
+            old = auto._workspace_bytes(a, g, 512, 4096, "pp", 0)
+            decode = auto._workspace_bytes(a, g, 4, 4096, "pp", 0, prefill=False)
+        with patch.dict(os.environ, switches, clear=True):
+            phased = auto._workspace_bytes(a, g, 512, 4096, "pp", 0)
+            self.assertLess(phased, old)
+            self.assertGreaterEqual(phased, auto._score_workspace(g, 512, 4096) + 512 * g.activation_width * 4)
+            self.assertEqual(auto._workspace_bytes(a, g, 4, 4096, "pp", 0, prefill=False), decode)
+            for mode, resident in (("tp", 0), ("pp", 1)):
+                self.assertEqual(auto._workspace_bytes(a, g, 512, 4096, mode, resident), old)
+            a.device = "cudapp=2"
+            self.assertEqual(auto._workspace_bytes(a, g, 512, 4096, "pp", 0), old)
+        for key in switches:
+            with patch.dict(os.environ, {**switches, key: "0"}, clear=True):
+                self.assertEqual(auto._workspace_bytes(a, g, 512, 4096, "pp", 0), old)
+
 
 
 class HostMemoryTest(unittest.TestCase):
@@ -177,7 +301,8 @@ class HybridAutoTest(unittest.TestCase):
                     redirect_stdout(io.StringIO()):
                 self.assertIs(make_normal_llm_model(a), model)
             model.set_chunked_prefill_size.assert_called_once_with(1024)
-            self.assertEqual(model.hybrid_auto_plan, {"moe_cuda_cache": GiB})
+            self.assertEqual(model.hybrid_auto_plan, {"moe_cuda_cache": GiB, "cuda_slab": 64})
+            runtime.set_cuda_slab.assert_called_once_with(64)
 
     def test_independent_cache_respects_stage_ownership_and_tiny_budget(self):
         g, c, gpu, ram = fixture()
@@ -220,17 +345,19 @@ class HybridAutoTest(unittest.TestCase):
         for d in gpu:
             self.assertEqual(p['gpu_estimated_bytes'][d] - q['gpu_estimated_bytes'][d], GiB)
 
-    def test_qwen_gguf_embedding_budgets_expanded_fp32_table(self):
+    def test_qwen_gguf_embedding_budget_matches_packed_cuda_import(self):
         g, _, _, _ = fixture()
-        g.family = 'qwen4'
-        tensors = [auto.Tensor('blk.0.ffn_up_exps.weight', (8, 64, 128), MiB, 'gguf:11'),
-                   auto.Tensor('token_embd.weight', (1024, 128), 1024 * 128, 'gguf:23')]
-        a = args(cuda_embedding=True)
-        costs = auto.weight_costs(tensors, g, a)
-        self.assertEqual(costs[2:4], (1024 * 128 * 4, 1024 * 128 * 4))
-        a.low_gpu_mem = True
-        costs = auto.weight_costs(tensors, g, a)
-        self.assertEqual(costs[2:4], (0, 1024 * 128 * 4))
+        g.family = "qwen4"
+        for kind in (11, 18, 20, 23, 21, 8):
+            tensors = [auto.Tensor("blk.0.ffn_up_exps.weight", (8, 64, 128), MiB, "gguf:11"),
+                       auto.Tensor("token_embd.weight", (1024, 256), 1024 * 136, "gguf:" + str(kind))]
+            for cpu in (False, True):
+                a = args(cuda_embedding=True, low_gpu_mem=cpu)
+                costs = auto.weight_costs(tensors, g, a)
+                expected = 1024 * 136 if kind in (11, 18, 20, 21, 23) else 1024 * 256 * 4
+                self.assertEqual(costs[2:4], (0 if cpu else expected, expected))
+        g.family = "qwen3"
+        self.assertEqual(auto.weight_costs(tensors, g, args())[3], 1024 * 256 * 4)
 
     def test_cpu_and_gpu_paths_reject_auto_before_hardware_query(self):
         for main, moe, mode in [("cpu", "numa", "auto"), ("cuda:0", "cuda:0", "auto"),
@@ -428,6 +555,22 @@ class HybridAutoTest(unittest.TestCase):
         a.moe_cuda_cache = "auto"
         with self.assertRaises(ValueError):
             auto.weight_costs(t, g, a)
+
+    def test_qwen_visual_budget_matches_execution_device(self):
+        g, _, _, _ = fixture()
+        g.family = "qwen4"
+        tensors = [auto.Tensor("model.layers.0.mlp.experts.0.up_proj.weight", (8, 8), 64, "F8_E4M3"),
+                   auto.Tensor("model.visual.blocks.0.attn.qkv.weight", (24, 8), 384, "F16"),
+                   auto.Tensor("model.visual.blocks.0.norm1.weight", (8,), 32, "F32")]
+        for environment in ({}, {"FASTLLM_QWEN4_VISION_DEVICE": "cpu"}):
+            for device in (None, "auto", "cpu", "cuda", "cuda:1"):
+                with self.subTest(environment=environment, device=device), patch.dict(os.environ, environment, clear=True):
+                    e, dense, common, host, _, _ = auto.weight_costs(tensors, g, args(vision_device=device))
+                    cpu = (device or environment.get("FASTLLM_QWEN4_VISION_DEVICE")) == "cpu"
+                    self.assertEqual(common, 0 if cpu else 416)
+                    self.assertEqual(host, 416)
+                    self.assertEqual(sum(e), 64)
+                    self.assertEqual(sum(dense), 0)
 
     def test_hf_integer_auxiliary_buffers_are_not_packed_weights(self):
         g, _, _, _ = fixture()
@@ -705,8 +848,14 @@ class HybridAutoTest(unittest.TestCase):
         glm = auto.plan(a, g, costs, "tp", {0: 1, 1: 1}, gpu, ram)
         self.assertEqual(glm["host_estimated_bytes"] - qwen["host_estimated_bytes"], GiB)
         for d in gpu:
-            self.assertEqual(qwen["gpu_estimated_bytes"][d] - glm["gpu_estimated_bytes"][d], GiB // 2)
+            self.assertEqual(qwen["gpu_estimated_bytes"][d] - glm["gpu_estimated_bytes"][d],
+                             GiB // 2 + 2 * g.experts * 2 * MiB)
         self.assertEqual(vars(a), before)
+        a.cuda_slab = 64
+        g.family = "qwen4"
+        packed = auto.plan(a, g, costs, "tp", {0: 1, 1: 1}, gpu, ram)
+        for d in gpu:
+            self.assertEqual(packed["gpu_estimated_bytes"][d] - glm["gpu_estimated_bytes"][d], GiB // 2)
 
     def test_auto_kv_precision_follows_explicit_activation_precision(self):
         g, costs, gpu, ram = fixture()
@@ -1620,6 +1769,64 @@ class HybridAutoTest(unittest.TestCase):
         # Model calls SelectDeviceFromMap(layer + 1, block_cnt), using <=.
         self.assertEqual([auto.layer_device(i, 4, {0: 1, 1: 1}) for i in range(4)], [0, 0, 1, 1])
         self.assertEqual(auto.devices(args(device="cudapp=0,1")), ("pp", {0: 1, 1: 1}))
+
+
+
+class StandardGraphCapacityTest(unittest.TestCase):
+    def test_extra_graph_storage_reduces_cache_without_changing_context(self):
+        g, costs, gpu, ram = fixture()
+        g.family = "qwen4"
+        g.experts = 512
+        gpu = {d: {"total":4*GiB, "free":4*GiB} for d in gpu}
+        a = args(auto=True, moe_device_layers=-1)
+        with patch.dict(os.environ, {}, clear=True):
+            base = auto.plan(a, g, costs, "pp", {0: 1}, gpu, ram)
+        with patch.dict(os.environ, {"FASTLLM_QWEN38_HYBRID_GRAPH": "1"}, clear=True):
+            full = auto.plan(a, g, costs, "pp", {0: 1}, gpu, ram)
+            budget = full["runtime_bytes_per_device"]
+            extra = sum(x[0] for x in budget.values())
+            self.assertGreater(extra, 0)
+            self.assertLess(full["moe_cuda_cache"], base["moe_cuda_cache"])
+            self.assertGreaterEqual(base["moe_cuda_cache"]-full["moe_cuda_cache"], extra)
+            self.assertEqual(full["context_tokens"], base["context_tokens"])
+            self.assertEqual(full["chunked_prefill_size"], base["chunked_prefill_size"])
+            with self.assertRaises(ValueError):
+                auto.plan(args(auto=True, moe_device_layers=-1, moe_cuda_cache=base["moe_cuda_cache"]),
+                          g, costs, "pp", {0: 1}, gpu, ram)
+
+    def test_owner_and_graph_guards_preserve_existing_plans(self):
+        g, costs, gpu, ram = fixture()
+        g.family = "qwen4"
+        g.experts = 512
+        gpu = {d: {"total":4*GiB, "free":4*GiB} for d in gpu}
+        a = args(auto=True, moe_device_layers=-1)
+        with patch.dict(os.environ, {}, clear=True):
+            base = auto.plan(a, g, costs, "pp", {0: 1, 1: 1}, gpu, ram)
+        with patch.dict(os.environ, {"FASTLLM_QWEN38_HYBRID_GRAPH":"1"}, clear=True):
+            self.assertEqual(auto.plan(a, g, costs, "pp", {0: 1, 1: 1}, gpu, ram), base)
+        with patch.dict(os.environ, {"FASTLLM_QWEN38_HYBRID_GRAPH":"1", "FASTLLM_QWEN38_OWNED_PP":"1"}, clear=True):
+            full = auto.plan(a, g, costs, "pp", {0: 1, 1: 1}, gpu, ram)
+            self.assertLess(full["moe_cuda_cache"], base["moe_cuda_cache"])
+            self.assertTrue(all(x > 0 for x in full["runtime_bytes_per_device"]["graphs"].values()))
+            os.environ["FASTLLM_CUDA_GRAPH"] = "0"
+            self.assertEqual(auto.plan(a, g, costs, "pp", {0: 1, 1: 1}, gpu, ram), base)
+
+    def test_gguf_and_shortened_verifiers_keep_separate_capacity(self):
+        g, costs, gpu, ram = fixture()
+        g.family = "qwen4"
+        g.experts = 512
+        gpu = {d: {"total":4*GiB, "free":4*GiB} for d in gpu}
+        a = args(auto=True, moe_device_layers=-1)
+        with patch.dict(os.environ, {"FASTLLM_QWEN38_HYBRID_GRAPH":"1"}, clear=True):
+            one = auto._standard_full_graph_bytes(a, g, "pp", {0:1}, 0, costs[0], 1)
+            g.gguf_expert_bytes = {i: costs[0][i]//g.experts for i in range(g.layers)}
+            packed = auto._standard_full_graph_bytes(a, g, "pp", {0:1}, 0, costs[0], 1)
+            self.assertGreater(packed["graphs"][0], one["graphs"][0])
+            self.assertGreater(packed["staging"][0], one["staging"][0])
+            a.mtp = 3
+            verify = auto._standard_full_graph_bytes(a, g, "pp", {0:1}, 0, costs[0], 1)
+            self.assertGreater(verify["graphs"][0], packed["graphs"][0])
+            self.assertEqual(verify["staging"], packed["staging"])
 
 
 if __name__ == "__main__":

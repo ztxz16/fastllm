@@ -1,3 +1,4 @@
+#include "utils/qwen38_hybrid.h"
 //
 // Qwen4-Exp / Qwen3.8-Flash-Next text model.
 //
@@ -27,6 +28,7 @@
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
 #include "devices/cuda/fastllm-cuda-graph-workspace.h"
+#include "devices/cuda/fastllm-prefill-workspace.h"
 #include "fastllm-cuda-mtp.cuh"
 #ifndef USE_ROCM
 #include "devices/cuda/fastllm-cuda-moe-policy.h"
@@ -846,6 +848,12 @@ namespace fastllm {
     }
 
 #ifdef USE_CUDA
+    static bool Qwen4ReusePrefillWorkspace(int sequence) {
+        const char *value = std::getenv("FASTLLM_QWEN38_PREFILL_REUSE");
+        return sequence >= 32 && value && std::strcmp(value, "1") == 0 &&
+            !FastllmCudaGraphIsCapturingFast();
+    }
+
     bool Qwen4PrepareCudaWorkspaceOnCurrentDevice(Data &workspace, DataType dataType,
                                                   const std::vector<int> &dims, int device) {
         const bool reset = workspace.isFake ||
@@ -3529,9 +3537,28 @@ namespace fastllm {
             visualPrefix + "patch_embed.proj.bias";
         const float attentionScale =
             std::pow((float)this->visionHeadDim, -0.5f);
-        const std::string visionDevice = SelectDeviceFromMap(
+        std::string visionDevice = SelectDeviceFromMap(
             this->deviceMap, 1, std::max(1, this->block_cnt));
-        ApplyDeviceMap(this->deviceMap, 1, std::max(1, this->block_cnt));
+        const char *visionOverride = std::getenv("FASTLLM_QWEN4_VISION_DEVICE");
+        if (visionOverride && visionOverride[0] && std::string(visionOverride) != "auto") {
+            visionDevice = visionOverride;
+            AssertInFastLLM(visionDevice == "cpu" || visionDevice == "cuda" ||
+                Qwen4StartsWith(visionDevice, "cuda:"),
+                "Qwen4 vision device must be auto, cpu, cuda or cuda:N.");
+            ApplyDeviceMap({{visionDevice, 1}}, 1, 1);
+            if (visionDevice == "cpu") {
+                for (auto &entry : this->weight.weight)
+                    if (Qwen4StartsWith(entry.first, visualPrefix))
+                        entry.second.ToDevice(DataDevice::CPU);
+            }
+        } else {
+            ApplyDeviceMap(this->deviceMap, 1, std::max(1, this->block_cnt));
+        }
+        // CPU LayerNorm and the vision nonlinearities consume FP32. Keep
+        // checkpoint weights in their original representation, but do not
+        // pass half-sized activation storage to those host operators.
+        const DataType visionDataType = visionDevice == "cpu"
+            ? DataType::FLOAT32 : this->dataType;
         std::vector<float> allFeatures;
         int featureCount = 0;
 
@@ -3599,6 +3626,10 @@ namespace fastllm {
                 // the patch projection's checkpoint dtype before convolution.
                 ToDataType(pixelOnDevice, patchWeight.dataType);
             }
+            if (visionDevice == "cpu") {
+                // Preserve checkpoint pixel rounding before host FP32 math.
+                ToDataType(pixelOnDevice, DataType::FLOAT32);
+            }
 #ifdef USE_CUDA
             if (visionDevice == "cuda" ||
                 Qwen4StartsWith(visionDevice, "cuda:")) {
@@ -3627,8 +3658,8 @@ namespace fastllm {
             Data hiddenStates;
             Linear(pixelOnDevice, patchWeight,
                    this->weight[patchBiasName], hiddenStates);
-            if (hiddenStates.dataType != this->dataType) {
-                ToDataType(hiddenStates, this->dataType);
+            if (hiddenStates.dataType != visionDataType) {
+                ToDataType(hiddenStates, visionDataType);
             }
             hiddenStates.Reshape(
                 {1, patchCount, this->visionHiddenSize});
@@ -3709,15 +3740,18 @@ namespace fastllm {
                 PermuteSelf(attentionOutput, {1, 2, 0, 3});
                 attentionOutput.Reshape(
                     {1, patchCount, this->visionHiddenSize});
+                // Linear cannot overwrite its input: host output-column
+                // workers still read that input while other workers write.
+                Data projectedAttention;
                 Linear(
                     attentionOutput,
                     this->weight[prefix + ".attn.proj.weight"],
                     this->weight[prefix + ".attn.proj.bias"],
-                    attentionOutput);
-                if (attentionOutput.dataType != residual.dataType) {
-                    ToDataType(attentionOutput, residual.dataType);
+                    projectedAttention);
+                if (projectedAttention.dataType != residual.dataType) {
+                    ToDataType(projectedAttention, residual.dataType);
                 }
-                AddTo(residual, attentionOutput);
+                AddTo(residual, projectedAttention);
                 hiddenStates.CopyFrom(residual);
 
                 Mul(hiddenStates, 1.0f, residual);
@@ -5594,6 +5628,11 @@ namespace fastllm {
             pastConv.expansionDims = pastConv.dims;
         }
 
+#ifdef USE_CUDA
+        if (Qwen4ReusePrefillWorkspace(sequence) && !convInputCapture)
+            ReleasePrefillTemporary(qkv);
+#endif
+
         if (pastRecurrent.dims.empty()) {
             pastRecurrent.Resize({batch, this->num_v_heads,
                                   this->head_k_dim, this->head_v_dim});
@@ -5648,6 +5687,13 @@ namespace fastllm {
                     this->head_v_dim, 1e-6f, core,
                     recurrentStateOutput);
             }
+#ifdef USE_CUDA
+            if (Qwen4ReusePrefillWorkspace(sequence) && !convInputCapture) {
+                ReleasePrefillTemporary(currentConvolved);
+                ReleasePrefillTemporary(alpha);
+                ReleasePrefillTemporary(beta);
+            }
+#endif
             core.Reshape({-1, this->head_v_dim});
             z.Reshape({-1, this->head_v_dim});
             Data gatedCore;
@@ -9567,6 +9613,9 @@ namespace fastllm {
                 mtpTokens.push_back(ids.front());
                 mtpPositions.push_back(mtp.deferredPosition);
                 mtp.hasDeferredTargetHidden = false;
+                // Data assignment does not release the owned chunk-tail buffer.
+                // Retire it after pairing, before resetting the metadata.
+                mtp.deferredTargetHidden.FreeSpace();
                 mtp.deferredTargetHidden = Data();
             }
 
@@ -9635,6 +9684,9 @@ namespace fastllm {
                 MaybeRecordPrefixSnapshot(pastKeyValues, *requestState);
                 mtp.hasDeferredTargetHidden = false;
                 mtp.deferredPosition = -1;
+                // Data assignment does not release the owned chunk-tail buffer.
+                // Retire it after pairing, before resetting the metadata.
+                mtp.deferredTargetHidden.FreeSpace();
                 mtp.deferredTargetHidden = Data();
                 generateProposalChain(
                     finalPairedHidden, {mtpTokens.back()},
@@ -9850,6 +9902,7 @@ namespace fastllm {
         };
         std::optional<LayerWorkspace> layerData;
         Qwen4MtpGdnModeGuard mtpGdnMode;
+        Qwen38ForwardScope qwenDispatch;
         std::optional<HybridExecutionScope> hybridStep;
 #ifdef USE_CUDA
         int previousLinearExactBatchThreshold = FastllmCudaGetLinearExactBatchThreshold();
@@ -10098,6 +10151,10 @@ namespace fastllm {
             hiddenStates->Reshape({batch, inputIds.dims[1],
                                    this->hcCount * this->embed_dim});
             DumpTensorIfRequested("embedding", *hiddenStates);
+#ifdef USE_CUDA
+            if (Qwen4ReusePrefillWorkspace(inputIds.dims[1]) && !verificationCapture)
+                ReleasePrefillTemporary(embedding);
+#endif
         }
 
         for (int layer = firstLayer; layer < endLayer; layer++) {
@@ -10477,6 +10534,13 @@ namespace fastllm {
                 this->weight[mlpHyperPrefix + "hc_norm.weight"],
                 *nextHiddenStates, mlpNorm, mlpProjectionStorage);
             std::swap(hiddenStates, nextHiddenStates);
+#ifdef USE_CUDA
+            if (Qwen4ReusePrefillWorkspace(inputIds.dims[1]) && !verificationCapture) {
+                ReleasePrefillTemporary(attentionInput);
+                ReleasePrefillTemporary(attentionOutput);
+                ReleasePrefillTemporary(attentionInjection);
+            }
+#endif
 
             HyperMixNormalized(mlpNorm, mlpHyperPrefix,
                                mlpInput, &mlpInjection,

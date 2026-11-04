@@ -1,3 +1,4 @@
+#include "utils/qwen38_hybrid.h"
 #include "model.h"
 #include "models/qwen4_exp.h"
 #include "executor.h"
@@ -248,6 +249,7 @@ void TestFloatImport(const std::string &directory) {
 }
 
 void TestEmbeddingImport(const Fixture &fixture) {
+    Qwen38ForwardScope qwenDispatch;
     const std::string name = "model.language_model.embed_tokens.weight";
     // Compare against the previous full-table FP32 import, including repeated
     // indices, the last vocabulary row, and FP16 token IDs/output conversion.
@@ -259,9 +261,8 @@ void TestEmbeddingImport(const Fixture &fixture) {
             return t.name == name;
         });
         Check(task != tasks.end(), "missing embedding import task");
-        Check(task->replaceType == (cudaEmbedding
-              ? GGUFWeightReplaceRule::GGUFWeightReplaceForceFP32
-              : GGUFWeightReplaceRule::GGUFWeightReplaceDirect), "embedding placement policy");
+        Check(task->replaceType == GGUFWeightReplaceRule::GGUFWeightReplaceDirect,
+              "embedding placement policy");
         // Match the loader's AddEmptyWeight placeholder before direct import.
         Data weight(FLOAT32, {1}), reference(FLOAT32, {1});
         WeightImportGGUFTensor(&weight, &task->tensor, task->fileName, task->offset, task->replaceType);
@@ -294,6 +295,64 @@ void TestEmbeddingImport(const Fixture &fixture) {
 }
 namespace fastllm {
 struct Qwen4GGUFTestAccess {
+    static void CheckVisionCpuActivationType() {
+        ApplyDeviceMap({{"cpu", 1}}, 1, 1);
+        setenv("FASTLLM_QWEN4_VISION_DEVICE", "cpu", 1);
+        std::vector<float> reference;
+        for (DataType type : {FLOAT32, FLOAT16, BFLOAT16}) {
+            Qwen4ExpModel m;
+            m.dataType = type;
+            m.deviceMap = {{"cpu", 1}};
+            m.visionDepth = 1; m.visionHiddenSize = 8;
+            m.visionNumHeads = 2; m.visionHeadDim = 4;
+            m.visionIntermediateSize = 12; m.visionOutHiddenSize = 8;
+            m.visionNumPositionEmbeddings = 4; m.visionNumGridPerSide = 2;
+            m.visionPatchSize = 2; m.visionTemporalPatchSize = 2;
+            m.visionSpatialMergeSize = 2;
+            m.visionImageMean = {0.5f, 0.5f, 0.5f};
+            m.visionImageStd = {0.5f, 0.5f, 0.5f};
+            auto put = [&](const std::string &name, std::vector<int> dims, bool norm = false) {
+                int count = 1; for (int dim : dims) count *= dim;
+                std::vector<float> values(count);
+                for (int i = 0; i < count; ++i)
+                    values[i] = norm ? 1.0f : 0.02f * std::sin(float(i + 1));
+                Data value(FLOAT32, dims, values);
+                if (dims.size() > 1) ToDataType(value, FLOAT16);
+                m.weight.weight["model.visual." + name].CopyFrom(value);
+            };
+            auto linear = [&](const std::string &name, int out, int in) {
+                put(name + ".weight", {out, in}); put(name + ".bias", {out});
+            };
+            auto norm = [&](const std::string &name, int dim) {
+                put(name + ".weight", {dim}, true); put(name + ".bias", {dim});
+            };
+            linear("patch_embed.proj", 8, 24);
+            put("pos_embed.weight", {4, 8});
+            norm("blocks.0.norm1", 8); norm("blocks.0.norm2", 8);
+            linear("blocks.0.attn.qkv", 24, 8); linear("blocks.0.attn.proj", 8, 8);
+            linear("blocks.0.mlp.linear_fc1", 12, 8); linear("blocks.0.mlp.linear_fc2", 8, 12);
+            norm("merger.norm", 8);
+            linear("merger.linear_fc1", 32, 32); linear("merger.linear_fc2", 8, 32);
+            std::vector<float> pixels(4 * 4 * 3);
+            for (size_t i = 0; i < pixels.size(); ++i) pixels[i] = float((i * 31) % 256);
+            Data raw(FLOAT32, {4, 4, 3}, pixels), grid(FLOAT32, {1, 3}, {1, 2, 2}), output;
+            std::vector<std::vector<int>> grids;
+            m.EncodeVisualItems({&raw}, &grid, false, output, grids);
+            Check(output.dataType == FLOAT32 && output.dims == std::vector<int>({1, 1, 8}), "CPU vision output shape");
+            const float *data = reinterpret_cast<const float *>(output.cpuData);
+            std::vector<float> values(data, data + 8);
+            for (float value : values) Check(std::isfinite(value), "CPU vision nonfinite output");
+            if (reference.empty()) reference = values;
+            else Check(reference == values, "CPU vision must not depend on language activation dtype");
+            Data replay;
+            m.EncodeVisualItems({&raw}, &grid, false, replay, grids);
+            Check(std::memcmp(output.cpuData, replay.cpuData, 8 * sizeof(float)) == 0,
+                  "CPU vision replay must be deterministic");
+            for (auto &entry : m.weight.weight) Check(entry.second.dataDevice == DataDevice::CPU, "CPU vision moved a weight to GPU");
+        }
+        unsetenv("FASTLLM_QWEN4_VISION_DEVICE");
+        std::cout << "CPU vision activation regression passed" << std::endl;
+    }
     static void CheckRemoteMoeDispatch() {
 #if defined(USE_CUDA) && !defined(USE_ROCM)
         setenv("FASTLLM_QWEN38_REMOTE_GRAPH", "1", 1);
@@ -1113,11 +1172,98 @@ static void TestDirectMergeFormats() {
     std::cout << "PASS: direct merge formats, disk fallback and parallel read failure\n";
 }
 
+
+static void TestCudaPackedEmbedding() {
+#ifdef USE_CUDA
+    FastllmCudaSetDevice(0);
+    SetCudaEmbedding(true);
+    auto &executor = *static_cast<Executor *>(GetExecutor());
+    size_t checked = 0;
+    for (auto type : {GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_Q3_K}) {
+        for (int width : {256, 768, 2560}) {
+            const int vocab = 37;
+            const size_t rowBytes = ggml_row_size(type, width), blockBytes = ggml_type_size(type);
+            Tensor table{"token_embd.weight", {vocab, width}, type, Bytes(vocab * rowBytes)};
+            for (size_t i = 0; i < table.bytes.size(); ++i) table.bytes[i] = (i*73 + i/7 + 19) % 256;
+            for (size_t b = 0; b < table.bytes.size()/blockBytes; ++b) {
+                auto *block = table.bytes.data() + b * blockBytes;
+                const uint16_t scale = float_to_half(float(int(b % 29) - 14) / 4096);
+                if (type == GGML_TYPE_Q3_K) reinterpret_cast<block_q3_K *>(block)->d = scale;
+                else std::memcpy(block, &scale, sizeof(scale));
+            }
+            const std::string path = "/tmp/fastllm-embedding-" + std::to_string(getpid()) + ".gguf";
+            Write(path, {{"general.architecture", "qwen4exp"}}, {table});
+            std::vector<ReadGGUFTask> tasks;
+            AppendGGUFTasks("qwen4_exp", path, tasks);
+            Check(tasks.size() == 1 && tasks[0].replaceType == GGUFWeightReplaceRule::GGUFWeightReplaceDirect,
+                  "packed GPU embedding import policy");
+            Data weight(FLOAT32, {1}), reference(FLOAT32, {1});
+            auto &task = tasks[0];
+            WeightImportGGUFTensor(&weight, &task.tensor, task.fileName, task.offset, task.replaceType);
+            WeightImportGGUFTensor(&reference, &task.tensor, task.fileName, task.offset,
+                                  GGUFWeightReplaceRule::GGUFWeightReplaceForceFP32);
+            unlink(path.c_str());
+            Check(weight.GetBytes() == table.bytes.size(), "GPU embedding expanded at import");
+            weight.ToDevice(DataDevice::CUDA, std::vector<int>{0});
+            for (int rows : {1, 4, 4096}) {
+                std::vector<float> ids(rows);
+                for (int i = 0; i < rows; ++i) ids[i] = (i*17 + vocab-1) % vocab;
+                Data input(FLOAT32, {1, rows}, ids), actual, expected;
+                DataDict dense{{"input", &input}, {"weight", &reference}, {"output", &expected}};
+                executor.RunOnDevice("cpu", "Embedding", dense, {}, {});
+                input.ToDevice(DataDevice::CUDA, std::vector<int>{0});
+                actual.dataType = FLOAT32; actual.Resize({1, rows, width});
+                actual.ToDevice(DataDevice::CUDA, std::vector<int>{0}); actual.Allocate();
+                Check(FastllmCudaGGUFEmbedding(input, weight, actual), "packed CUDA embedding dispatch");
+                ForceDeviceSync();
+                Data host(actual); host.ToDevice(DataDevice::CPU);
+                if (std::memcmp(host.cpuData, expected.cpuData, expected.GetBytes()) != 0) {
+                    const float *a = (float *)host.cpuData, *e = (float *)expected.cpuData;
+                    double maximum = 0; size_t mismatches = 0;
+                    for (size_t i = 0; i < expected.Count(0); ++i) {
+                        maximum = std::max(maximum, double(std::abs(a[i]-e[i])));
+                        mismatches += a[i] != e[i];
+                    }
+                    std::cerr << "embedding mismatch type=" << int(type) << " width=" << width
+                              << " rows=" << rows << " count=" << mismatches << " max=" << maximum << "\n";
+                    Check(false, "packed CUDA embedding differs from CPU FP32 import");
+                }
+                // Replay with a changed token buffer catches accidental host IDs
+                // or captured pointers to a temporary row-dequantization buffer.
+                void *graph = nullptr, *exec = nullptr;
+                Check(FastllmCudaGraphBeginCapture(), "embedding begin capture");
+                Check(FastllmCudaGGUFEmbedding(input, weight, actual), "embedding captured dispatch");
+                Check(FastllmCudaGraphEndCapture(&graph) && FastllmCudaGraphInstantiate(graph, &exec), "embedding instantiate");
+                for (float &id : ids) id = int(id + 9) % vocab;
+                FastllmCudaCopyFromHostToDevice(input.cudaData, ids.data(), ids.size()*sizeof(float));
+                Check(FastllmCudaGraphLaunch(exec), "embedding graph replay");
+                ForceDeviceSync();
+                Data replay(actual); replay.ToDevice(DataDevice::CPU);
+                const float *ref = (const float *)reference.cpuData;
+                for (int i = 0; i < rows; ++i)
+                    Check(std::memcmp(replay.cpuData + size_t(i)*width*4, ref+size_t(ids[i])*width, width*4) == 0,
+                          "packed CUDA embedding replay mismatch");
+                FastllmCudaGraphExecDestroy(exec); FastllmCudaGraphDestroy(graph);
+                checked += size_t(rows)*width*2;
+            }
+        }
+    }
+    std::cout << "PASS: packed CUDA embedding and graph replay match CPU FP32 import exactly: "
+              << checked << " elements\n";
+#endif
+}
+
 int main(int argc, char **argv) {
     try {
         SetThreads(2); SetDeviceMap({{"cpu", 1}}); SetMoeDeviceMap({{"cpu", 1}});
         SetCudaEmbedding(false);
         SetMoeCudaCacheBytes(0); setenv("FASTLLM_QWEN4_ENABLE_MTP", "0", 1);
+        if (argc == 2 && std::string(argv[1]) == "--vision-cpu") {
+            Qwen4GGUFTestAccess::CheckVisionCpuActivationType(); return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "--packed-embedding") {
+            TestCudaPackedEmbedding(); return 0;
+        }
         if (argc == 2 && std::string(argv[1]) == "--qsa-causal-mask") {
 #ifdef USE_CUDA
             if (FastllmCudaGetDeviceCount() < 1) return 77;

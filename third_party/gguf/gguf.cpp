@@ -1138,13 +1138,13 @@ namespace fastllm {
                     } else if (it.type == GGUFWeightReplaceRule::GGUFWeightReplaceForceFP32 ||
                                 it.type == GGUFWeightReplaceRule::GGUFWeightReplaceForceFP16 ||
                                 it.type == GGUFWeightReplaceRule::GGUFWeightReplaceForceBF16) {
-                        // CPU embedding can decode individual GGUF rows for
-                        // models that keep the imported lookup table unchanged.
-                        // Preserve floating-point imports and the CUDA embedding
-                        // path, which still require the original dense layout.
+                        // CPU and supported CUDA embeddings decode only selected
+                        // rows. Preserve floating-point and unsupported GPU imports.
+                        const bool packedCudaEmbedding = arch == "qwen4_exp" &&
+                            GGUFSupportsCudaEmbedding(tensors[i].first.type);
                         const bool packedEmbedding = (arch == "qwen4_exp" || arch == "glm5_next" || arch == "deepseek_v41") &&
                             name == "token_embd.weight" &&
-                            (GetLowMemMode() || !GetCudaEmbedding()) &&
+                            (GetLowMemMode() || !GetCudaEmbedding() || packedCudaEmbedding) &&
                             ggml_is_quantized(tensors[i].first.type);
                         name = std::regex_replace(name, it.pattern, it.names[0]);
                         if (name == "ignore") {
