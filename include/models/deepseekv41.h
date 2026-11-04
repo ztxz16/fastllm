@@ -300,6 +300,7 @@ namespace fastllm {
         bool UseModelSpecificScheduler() const override { return false; }
 
         ExecutionMode GetExecutionMode() const { return executionMode; }
+        bool UseGpuToolCallConstraints() const override { return executionMode == ExecutionMode::Gpu; }
 
     protected:
         struct AttentionParallel;

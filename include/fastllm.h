@@ -952,6 +952,9 @@ namespace fastllm {
 
         void SetSpecialTokens(const std::map <std::string, int> &specialTokens); // 设置需要优先处理的特殊token
 
+        // Derived caches must also account for decoder options such as byteAsChar.
+        uint64_t GetVocabularyRevision() const { return vocabularyRevision; }
+
         void SetTokenizerConfig(const json11::Json &config);
 
         std::string Normalize(const std::string &ori, const bool addDummyPrefix=true); // 字符规范化
@@ -966,6 +969,7 @@ namespace fastllm {
 
         std::string GetToken(int id); // 获取id对应的token
     private:
+        uint64_t vocabularyRevision = 0;
         std::vector<float> BytePairEncode(const std::string &s);
 
         std::vector<float> UnigramEncode(const std::string &s);

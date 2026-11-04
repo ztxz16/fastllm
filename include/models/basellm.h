@@ -211,6 +211,10 @@ namespace fastllm {
         // managers only after no request Data object still references them.
         void ShutdownRuntime();
 
+        struct ToolCallConstraintCache;
+        std::shared_ptr<ToolCallConstraintCache> toolCallConstraintCache;
+        std::mutex toolCallConstraintCacheMutex;
+
     public:
 
         virtual void LoadFromFile(const std::string &fileName); // 从文件读取 
@@ -512,6 +516,9 @@ namespace fastllm {
         virtual bool RestorePagedPrefixCacheExtra(ResponseContext *context, int cachedLen) const;
 
         virtual void PrepareToolCallConstraint(ResponseContext *context, GenerationConfig &generationConfig);
+
+        // Explicit opt-in: GPU-resident logits alone do not imply pure GPU inference.
+        virtual bool UseGpuToolCallConstraints() const { return false; }
 
         void PrepareToolCallConstraint(GenerationConfig &generationConfig);
         void AdvanceToolCallConstraintText(std::string &text, int tokenId);

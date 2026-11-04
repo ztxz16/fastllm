@@ -137,6 +137,10 @@ namespace fastllm {
     }
 
     void basellm::InitParams() {
+        {
+            std::lock_guard<std::mutex> lock(toolCallConstraintCacheMutex);
+            toolCallConstraintCache.reset();
+        }
         if (this->weight.dicts.find("bos_token_id") != this->weight.dicts.end()) {
             if (this->weight.dicts["bos_token_id"]!="None") {
                 this->bos_token_id = atoi(this->weight.dicts["bos_token_id"].c_str());

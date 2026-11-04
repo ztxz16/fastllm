@@ -546,6 +546,16 @@ namespace fastllm {
         }
     }
 
+    struct basellm::ToolCallConstraintCache {
+        using Key = std::tuple<std::string, std::string, std::vector<std::string>>;
+        uint64_t vocabularyRevision = 0;
+        bool byteAsChar = false;
+        std::string preTokenizer;
+        std::vector<std::pair<int, std::string>> decodedTokens;
+        std::map<Key, std::vector<int>> states;
+        size_t stateBytes = 0;
+    };
+
     void basellm::PrepareToolCallConstraint(ResponseContext *context, GenerationConfig &generationConfig) {
         generationConfig.tool_call_generated_text = context ? context->toolCallConstraintGeneratedText : "";
         PrepareToolCallConstraint(generationConfig);
@@ -576,21 +586,65 @@ namespace fastllm {
             return;
         }
 
-        std::vector<int> allowedIds;
-        allowedIds.reserve(allowedValues.size() * 4);
         const std::string terminator =
                 generationConfig.tool_call_name_terminator.empty()
                 ? "\"" : generationConfig.tool_call_name_terminator;
-        for (const auto &item : this->weight.tokenizer.tokenToStringDict) {
-            int tokenId = item.first;
-            std::string tokenText = this->weight.tokenizer.DecodeTokens(std::vector<int>{tokenId});
-            if (IsToolCallEnumTokenAllowed(partial, tokenText,
-                                           allowedValues, terminator)) {
-                allowedIds.push_back(tokenId);
+        std::unique_lock<std::mutex> lock(toolCallConstraintCacheMutex, std::defer_lock);
+        ToolCallConstraintCache *cache = nullptr;
+        ToolCallConstraintCache::Key key;
+        if (UseGpuToolCallConstraints()) {
+            lock.lock();
+            auto &tokenizer = weight.tokenizer;
+            if (!toolCallConstraintCache || toolCallConstraintCache->decodedTokens.size() !=
+                    tokenizer.tokenToStringDict.size() ||
+                toolCallConstraintCache->vocabularyRevision != tokenizer.GetVocabularyRevision() ||
+                toolCallConstraintCache->byteAsChar != tokenizer.byteAsChar ||
+                toolCallConstraintCache->preTokenizer != tokenizer.preTokenizer) {
+                toolCallConstraintCache = std::make_shared<ToolCallConstraintCache>();
+                toolCallConstraintCache->vocabularyRevision = tokenizer.GetVocabularyRevision();
+                toolCallConstraintCache->byteAsChar = tokenizer.byteAsChar;
+                toolCallConstraintCache->preTokenizer = tokenizer.preTokenizer;
+                toolCallConstraintCache->decodedTokens.reserve(tokenizer.tokenToStringDict.size());
+                for (const auto &item : tokenizer.tokenToStringDict)
+                    toolCallConstraintCache->decodedTokens.emplace_back(item.first,
+                        tokenizer.DecodeTokens(std::vector<int>{item.first}));
             }
+            cache = toolCallConstraintCache.get();
+            key = std::make_tuple(partial, terminator, allowedValues);
+            auto found = cache->states.find(key);
+            if (found != cache->states.end()) {
+                generationConfig.tool_call_allowed_token_ids = found->second;
+                return;
+            }
+        }
+        std::vector<int> allowedIds;
+        allowedIds.reserve(allowedValues.size() * 4);
+        auto consider = [&](int tokenId, const std::string &tokenText) {
+            if (IsToolCallEnumTokenAllowed(partial, tokenText, allowedValues, terminator))
+                allowedIds.push_back(tokenId);
+        };
+        if (cache) {
+            for (const auto &item : cache->decodedTokens) consider(item.first, item.second);
+        } else {
+            for (const auto &item : weight.tokenizer.tokenToStringDict)
+                consider(item.first, weight.tokenizer.DecodeTokens(std::vector<int>{item.first}));
         }
         std::sort(allowedIds.begin(), allowedIds.end());
         allowedIds.erase(std::unique(allowedIds.begin(), allowedIds.end()), allowedIds.end());
+        if (cache) {
+            size_t bytes = partial.size() + terminator.size() + allowedIds.size() * sizeof(int);
+            for (const auto &name : allowedValues) bytes += name.size() + sizeof(std::string);
+            // Bound request-defined schemas/states; a miss always uses the original matcher.
+            constexpr size_t maxBytes = 8 * 1024 * 1024;
+            if (cache->states.size() >= 512 || cache->stateBytes + bytes > maxBytes) {
+                cache->states.clear();
+                cache->stateBytes = 0;
+            }
+            if (bytes <= maxBytes) {
+                cache->states.emplace(std::move(key), allowedIds);
+                cache->stateBytes += bytes;
+            }
+        }
         generationConfig.tool_call_allowed_token_ids = std::move(allowedIds);
     }
 

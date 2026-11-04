@@ -138,6 +138,7 @@ namespace fastllm {
     }
 
     void Tokenizer::Clear() {
+        ++vocabularyRevision;
         std::vector <TrieNode*> q;
         q.push_back(root);
         for (int i = 0; i < q.size(); i++) {
@@ -168,6 +169,7 @@ namespace fastllm {
     }
 
     void Tokenizer::Insert(const std::string &s, int tokenId, float score) {
+        ++vocabularyRevision;
         TrieNode *now = this->root;
         for (int i = 0; i < s.size(); i++) {
             if (now->next.find(s[i]) == now->next.end()) {
@@ -183,6 +185,7 @@ namespace fastllm {
     }
 
     void Tokenizer::SetSpecialTokens(const std::map<std::string, int>& specialTokenMap) {
+        ++vocabularyRevision;
         if (specialRoot == nullptr)
             specialRoot = new TrieNode();
         for (auto &it : specialTokenMap) {
