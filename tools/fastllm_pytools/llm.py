@@ -1205,10 +1205,13 @@ class TokenizerCache:
     def __init__ (self):
         from collections import deque
         self.caches = deque(maxlen = 100)
+        self.lock = threading.Lock()
     
     def add(self, prompt, tokens):
-        # print("add cache", prompt[:100], tokens[:100])
-        self.caches.append([prompt, tokens])
+        # A cancelled stream may still hold its mutable history lists.
+        entry = (tuple(prompt), tuple(tuple(part) for part in tokens))
+        with self.lock:
+            self.caches.append(entry)
     
     def prompt_can_match(self, prompt, cur_len, s):
         if (cur_len + len(s) > len(prompt)):
@@ -1222,7 +1225,11 @@ class TokenizerCache:
         max_len = 0
         use_cahce_prompt = ""
         use_cache_tokens = []
-        for it in self.caches:
+        # Input preparation and completed streams run on different threads.
+        # Keep matching/tokenization outside the short publication lock.
+        with self.lock:
+            entries = tuple(self.caches)
+        for it in entries:
             cur_tokens = []
             cur_prompt = ""
             cur_len = 0
