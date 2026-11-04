@@ -1887,7 +1887,8 @@ namespace fastllm {
                 continue;
             }
             // prefill 分块的中间结果不是真正的下一个 token，这时只更新滑窗、不生成候选
-            const int anchor = textOnly && segments[i].seqlen == 1 && (int)ret.size() > i ? ret[i] : -1;
+            const int anchor = !isIntermediateChunkedPrefill && textOnly &&
+                segments[i].seqlen == 1 && (int)ret.size() > i ? ret[i] : -1;
             DsparkDebugDumpState(*segments[i].state, "plain");
             DsparkAdvance(*segments[i].state, scratches[i], segments[i].startPos,
                           segments[i].startPos + segments[i].seqlen, anchor, generationConfigs[i]);

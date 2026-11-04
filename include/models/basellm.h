@@ -24,7 +24,11 @@ using RuntimeResult = std::function<void(int index, const char* content)>;
 using RuntimeResultBatch = std::function<void(int index, std::vector <std::string> &contents)>;
 #endif
 
+namespace fastkv { struct Message; }
+
 namespace fastllm {
+    struct PDRuntime;
+    struct PDPending;
     using ChatMessages = std::vector <std::pair <std::string, std::string> >;
 
     enum ResponseContextError {
@@ -60,6 +64,7 @@ namespace fastllm {
     };
 
     struct ResponseContext {
+        std::shared_ptr<PDPending> pdPending;
         std::unique_ptr<PrefillPrefixPreview> prefillPreview;
         PrefillBatchPolicy::Clock::time_point queuedAt = PrefillBatchPolicy::Clock::now();
         bool isEnding = false; // 代表这个请求已经处理完成了，不需要再forward了，但生成的token可能还没有被fetch
@@ -654,6 +659,16 @@ namespace fastllm {
         std::map <std::string, Data*> deviceSinDatas, deviceCosDatas; // deviceSinDatas[xxx]代表xxx设备上的sinData
 
         ResponseContextDict responseContextDict;
+
+        void ConfigurePD(const json11::Json &config);
+        void StopPD();
+        bool IsPDDecode() const;
+        void BeginPD(ResponseContext *context);
+        bool PollPD(ResponseContext *context);
+        virtual std::string PDLayout() const;
+        virtual fastkv::Message ExportPDState(ResponseContext &context);
+        virtual void ImportPDState(ResponseContext &context, const fastkv::Message &state);
+        std::shared_ptr<PDRuntime> pdRuntime;
 
         void RemoveResponseContext(int handleId);
 

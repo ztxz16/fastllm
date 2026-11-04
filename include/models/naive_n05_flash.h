@@ -65,6 +65,9 @@ namespace fastllm {
         void OnResponseContextRemoved(ResponseContext *context) override;
         void OnResponseContextFinished(ResponseContext *context) override;
         bool SetSaveHistoryChat(bool save) override;
+        std::string PDLayout() const override;
+        fastkv::Message ExportPDState(ResponseContext &context) override;
+        void ImportPDState(ResponseContext &context, const fastkv::Message &state) override;
         void AddPromptCache(const std::vector<int> &tokens) override;
         int GetKVCacheRetainedTokens(int layer) const override;
         void WarmUp() override;

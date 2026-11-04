@@ -219,6 +219,9 @@ namespace fastllm {
         void OnModelWeightsLoaded() override;
 
         bool MoveSpecialWeightToCudaIfNeeded(const std::string &weightName, Data &data) const override;
+        std::string PDLayout() const override;
+        fastkv::Message ExportPDState(ResponseContext &context) override;
+        void ImportPDState(ResponseContext &context, const fastkv::Message &state) override;
 
         // Reuse prefill scratch through decode. The existing pool bounds idle
         // storage per device and reclaims it on allocation pressure.

@@ -10,6 +10,7 @@
 //
 
 #include "deepseekv41.h"
+#include "pd.h"
 #include "deepseekv41_execution.h"
 #ifdef USE_CUDA
 #include "devices/cuda/fastllm-v41-full-decode.h"
@@ -4331,6 +4332,8 @@ namespace fastllm {
         return true;
     }
 
+    #include "deepseekv41_pd.inc"
+
     int DeepSeekV41Model::Forward(const Data &inputIds, const Data &attentionMask, const Data &positionIds,
                                   std::vector<std::pair<Data, Data> > &pastKeyValues,
                                   const GenerationConfig &generationConfig,
@@ -4413,7 +4416,7 @@ namespace fastllm {
         }
         std::vector<int> ret = ForwardSegmentsWithDspark(segments, inputIds, inputEmbeds, imageMask,
                                                          generationConfigs, lastTokens, retLogits,
-                                                         samplingPastKeyValues, true);
+                                                         samplingPastKeyValues, !isIntermediateChunkedPrefill);
         if (!pastKeyValues.empty()) {
             V41UpdateStubKV(pastKeyValues[0].first, pastKeyValues[0].second, state->totalLen);
         }

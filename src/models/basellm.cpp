@@ -962,6 +962,7 @@ namespace fastllm {
     }
 
     void basellm::ShutdownRuntime() {
+        StopPD();
         {
             std::lock_guard<std::mutex> guard(dictLocker);
             this->isFree = true;
@@ -2187,6 +2188,7 @@ namespace fastllm {
             std::vector <int> abortHandles;
             int busyPages = 0, currentActivate = 0;
             bool hasPrefill = false;
+            bool pendingPD = false;
             struct DecodeOrder {
                 int sortKey;
                 int handle;
@@ -2203,6 +2205,7 @@ namespace fastllm {
                     continue;
                 }
                 if (it.second->isEnding) {
+                    it.second->pdPending.reset();
                     model->OnResponseContextFinished(it.second);
                     for (int i = 0; i < model->block_cnt; i++) {
                         auto &kvFirst = it.second->pastKeyValues[i].first;
@@ -2210,6 +2213,10 @@ namespace fastllm {
                         ReleasePagedCachePages(kvFirst);
                         ReleasePagedCachePages(kvSecond);
                     }
+                    continue;
+                }
+                if (!model->PollPD(it.second)) {
+                    pendingPD |= bool(it.second->pdPending);
                     continue;
                 }
                 if (it.second->preTokens > 0) {
@@ -2896,7 +2903,7 @@ namespace fastllm {
             }
 
             if (seqLens.size() == 0) {
-                if (!orders.empty()) {
+                if (!orders.empty() || pendingPD) {
                     model->dictCV.wait_for(dictLocker, std::chrono::milliseconds(10));
                 } else {
                     model->dictCV.wait(dictLocker);
@@ -3063,8 +3070,16 @@ namespace fastllm {
                             model->RemoveResponseContext(it);
                         }
 
+                        std::set<int> waitingPD;
+                        for (auto &entry : model->responseContextDict.dicts) {
+                            if (!entry.second->isEnding && !model->PollPD(entry.second) && entry.second->pdPending)
+                                waitingPD.insert(entry.first);
+                        }
                         for (auto &entry : model->responseContextDict.dicts)
-                            if (entry.second->isEnding) model->OnResponseContextFinished(entry.second);
+                            if (entry.second->isEnding) {
+                                entry.second->pdPending.reset();
+                                model->OnResponseContextFinished(entry.second);
+                            }
                         if (trace) trace->Mark("retire_requests_ms");
 
                         int limit = maxTotalLens;
@@ -3171,6 +3186,7 @@ namespace fastllm {
                         std::vector <std::pair <int, int> > orders;
                         bool hasPrefillRequests = false;
                         for (auto &it : model->responseContextDict.dicts) {
+                            if (waitingPD.count(it.first)) continue;
                             hasPrefillRequests |= it.second->curTokens == 0;
                             orders.push_back(std::make_pair(-(int)it.second->currentTokens.size(), it.first));
                         }
@@ -3735,7 +3751,8 @@ namespace fastllm {
                                         return entry.second->isEnding && allocatedTokens(
                                             entry.second->pastKeyValues[model->kvCacheId].first) > 0;
                                     })) {
-                                model->dictCV.wait(dictLocker);
+                                if (!waitingPD.empty()) model->dictCV.wait_for(dictLocker, std::chrono::milliseconds(10));
+                                else model->dictCV.wait(dictLocker);
                                 continue;
                             }
                             int maxLen = -1, select = -1;
@@ -3764,7 +3781,8 @@ namespace fastllm {
                         if (trace) trace->Mark("cleanup_ms");
 
                         if (seqLens.size() == 0) {
-                            model->dictCV.wait(dictLocker);
+                            if (!waitingPD.empty()) model->dictCV.wait_for(dictLocker, std::chrono::milliseconds(10));
+                            else model->dictCV.wait(dictLocker);
                         }
                     }
                 }, this);
@@ -3789,8 +3807,8 @@ namespace fastllm {
         // a restored media prefix may belong to different images with the same
         // placeholder tokens. Keep request-local KV reuse, but do not restore
         // cross-request token-only caches for multimodal prompts.
-        bool allowHistoryCache = context->multimodalInput.empty();
-        bool restoredNativeHistory = !this->DeferHistoryCacheRestore() &&
+        bool allowHistoryCache = context->multimodalInput.empty() && !IsPDDecode();
+        bool restoredNativeHistory = !IsPDDecode() && !this->DeferHistoryCacheRestore() &&
             (allowHistoryCache ? this->TryRestoreHistoryCache(context->currentTokens, context->cacheLen) :
                                  this->TryRestoreMultimodalHistoryCache(context));
 
@@ -3823,6 +3841,13 @@ namespace fastllm {
         }
 
         this->OnResponseContextCreated(context);
+
+        try { BeginPD(context); }
+        catch (const std::exception &error) {
+            std::cerr << "[FastKV PD] request rejected: " << error.what() << std::endl;
+            context->error = ResponseContextErrorRuntime;
+            context->isEnding = true;
+        }
 
         dictLocker.unlock();
         // Scheduler and token consumers share this condition variable. A

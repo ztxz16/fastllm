@@ -217,7 +217,7 @@ file(GLOB CPU_DEVICE_FILES "src/devices/cpu/*.cpp")
 # Large model units should start alongside CUDA templates rather than after
 # all CUDA jobs have been queued. Keep them out of FASTLLM_CXX_SOURCES below.
 set(FASTLLM_LARGE_MODEL_SOURCES src/models/qwen3_5.cpp)
-set(FASTLLM_CXX_SOURCES src/fastllm.cpp src/device.cpp src/model.cpp src/contextconfig.cpp src/executor.cpp src/template.cpp src/graph.cpp src/tokenizer.cpp
+set(FASTLLM_CXX_SOURCES src/fastllm.cpp src/pd.cpp src/models/naive_n05_pd.cpp src/device.cpp src/model.cpp src/contextconfig.cpp src/executor.cpp src/template.cpp src/graph.cpp src/tokenizer.cpp
         src/devices/disk/diskdevice.cpp src/utils/autotune.cpp
         src/models/graphllm.cpp src/models/chatglm.cpp src/models/moss.cpp src/models/llama.cpp src/models/qwen.cpp src/models/basellm.cpp src/kvmem.cpp src/models/basellmkvmem.cpp
         src/models/glm.cpp src/models/minicpm.cpp src/models/minicpm3.cpp src/models/internlm2.cpp src/models/bert.cpp src/models/moe.cpp src/models/deepseekv2.cpp src/models/deepseekv4.cpp
@@ -840,8 +840,17 @@ if (FASTLLM_DSV41_FLASHINFER_ENABLED)
     set(FASTLLM_DSV41_FLASHINFER_OBJECTS $<TARGET_OBJECTS:fastllm_dsv41_flashinfer_sm120>)
 endif()
 
+# The embedded component follows the framework build; its standalone
+# project still exposes separate CUDA/test options. Avoid stale cache values
+# when an existing build switches between CPU and CUDA.
+set(FASTKV_CUDA OFF)
+if(USE_CUDA AND NOT USE_ROCM)
+    set(FASTKV_CUDA ON)
+endif()
+set(FASTKV_TESTS ${UNIT_TEST})
+add_subdirectory(fastkv)
 # Disk loading also uses dlsym in CPU-only builds and the Python extension.
-list(APPEND FASTLLM_LINKED_LIBS ${CMAKE_DL_LIBS})
+list(APPEND FASTLLM_LINKED_LIBS ${CMAKE_DL_LIBS} fastkv)
 
 if (PY_API)
     if(POLICY CMP0148)
@@ -939,6 +948,11 @@ if (UNIT_TEST)
     target_link_libraries(deepseekV41StubKVRegression PRIVATE fastllm)
     fastllm_add_checked_test(deepseekV41StubKV deepseekV41StubKVRegression "PASS [0-9]+ scheduler stub states" 60)
     add_executable(kvmem_pages_test test/basic/test_kvmem_pages.cpp src/kvmem.cpp)
+    if(UNIX)
+        add_executable(pd_state_test test/basic/test_pd_state.cpp)
+        target_link_libraries(pd_state_test PRIVATE fastllm_tools fastkv)
+        fastllm_add_checked_test(pd_state pd_state_test "PASS PD" 30)
+    endif()
     target_include_directories(kvmem_pages_test PRIVATE include)
     set_target_properties(kvmem_pages_test PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
     fastllm_add_checked_test(kvmem_pages kvmem_pages_test "KVMem page tests passed" 60)

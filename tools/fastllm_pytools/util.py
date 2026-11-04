@@ -1149,6 +1149,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     return parser
 
 def add_server_args(parser):
+    parser.add_argument("--pd", default="", help="Fast KV Manager PD configuration as a JSON object")
     parser.add_argument("--model_name", type = str, default = '', help = "部署的模型名称, 调用api时会进行名称核验")
     parser.add_argument("--host", type = str, default="0.0.0.0", help = "API server host")
     parser.add_argument("--port", type = int, default = 8080, help = "API server port")
@@ -2260,6 +2261,8 @@ def make_normal_llm_model(args, startup_progress = None):
                 "to %d or less, reduce --mtp, or use GPUs with more memory."
                 % (args.max_batch, effective_max_batch, effective_max_batch)
             )
+        if getattr(args, "pd", ""):
+            model.configure_pd(**json.loads(args.pd))
         return model
     except Exception:
         if model is not None:

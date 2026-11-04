@@ -1049,6 +1049,20 @@ extern "C" {
         return fastllmPytoolsCloverError.c_str();
     }
 
+    static thread_local std::string fastkvPDError;
+    DLL_EXPORT const char *get_pd_error() { return fastkvPDError.c_str(); }
+    DLL_EXPORT bool configure_pd_llm_model(int modelId, const char *options) {
+        try {
+            if (!options) throw std::invalid_argument("PD options required");
+            std::string error;
+            auto config = json11::Json::parse(options, error);
+            if (!error.empty()) throw std::invalid_argument(error);
+            models.GetModel(modelId)->ConfigurePD(config);
+            fastkvPDError.clear();
+            return true;
+        } catch (const std::exception &e) { fastkvPDError = e.what(); return false; }
+    }
+
     DLL_EXPORT bool configure_clover_llm_model(int modelId, const char *options) {
         try {
             auto *model = dynamic_cast<fastllm::CloverModel *>(models.GetModel(modelId));

@@ -2773,6 +2773,15 @@ class model:
     def _is_clover(self):
         return (getattr(self, "config", None) or {}).get("model_type") == "clover_moe"
 
+    def configure_pd(self, **options):
+        if not hasattr(fastllm_lib, "configure_pd_llm_model"):
+            raise RuntimeError("Rebuild FastLLM with Fast KV Manager support")
+        fastllm_lib.configure_pd_llm_model.argtypes = [ctypes.c_int, ctypes.c_char_p]
+        fastllm_lib.configure_pd_llm_model.restype = ctypes.c_bool
+        fastllm_lib.get_pd_error.restype = ctypes.c_char_p
+        if not fastllm_lib.configure_pd_llm_model(self.model, json.dumps(options, allow_nan=False).encode()):
+            raise ValueError(fastllm_lib.get_pd_error().decode())
+
     def configure_clover(self, **options):
         if not self._is_clover():
             raise ValueError("Clover generation options require a Clover model")
