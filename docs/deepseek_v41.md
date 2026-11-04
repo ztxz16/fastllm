@@ -585,10 +585,9 @@ ftllm server /models/DeepSeek-V4.1-Flash-1017-IQ2_XXS.gguf \
 TP 卡号需按升序指定；反序 TP 尚未通过数值校验，此选项会在加载前拒绝反序配置。
 如需指定另一张物理首卡，可调整 `CUDA_VISIBLE_DEVICES` 顺序，再使用 `--tp 2`。
 
-兼容性处理：TP 混合执行开启强制草稿常驻时，custom all-reduce 与目标图回放的组合出现过错误输出，
-当前会保留目标模型的逐算子执行，草稿专家仍完整缓存到 GPU；单卡、PP 和未指定此选项的策略不变。
-显式设置 `FASTLLM_CUDA_CUSTOM_ALLREDUCE=0` 使用 NCCL 时可保留目标图加速。
-这属于正确性回退，图回放差异的底层原因尚未解决，不能保证强制常驻一定更快。
+TP 混合执行下，强制草稿常驻可与 custom all-reduce 和目标 CUDA Graph 一起使用。
+仍可通过 `FASTLLM_CUDA_CUSTOM_ALLREDUCE=0` 选择 NCCL。常驻草稿会占用主模型专家缓存预算，
+实际速度取决于显存容量、缓存命中率和草稿接受率，不保证强制常驻一定更快。
 
 ```bash
 ftllm server /models/DeepSeek-V4.1-Flash-1017-IQ2_XXS.gguf \

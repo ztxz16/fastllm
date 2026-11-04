@@ -515,15 +515,19 @@ namespace fastllm {
                 // Reuse capacity when the logical Top-K/candidate width changes.
                 uint64_t required = 1;
                 for (int dim : dims) required *= dim;
+                // Generic TP operators may publish only the root device ID.
+                // The replica map/local placements remain authoritative; rebuilding
+                // valid replicas here would invalidate captured router operands.
                 bool reuse = dst.multiDeviceData && dst.IsTensorParallelReplicated() &&
                     !dst.isFake && dst.dataType == type &&
-                    dst.dataDeviceIds == tpDevices && dst.multiDeviceDatas.size() == tpDevices.size();
+                    dst.multiDeviceDatas.size() == tpDevices.size();
                 if (reuse) {
                     for (int device : tpDevices) {
                         auto it = dst.multiDeviceDatas.find(device);
                         if (it == dst.multiDeviceDatas.end() || !it->second ||
                             !it->second->cudaData || it->second->isFake ||
                             it->second->dataDevice != DataDevice::CUDA ||
+                            it->second->dataDeviceIds.size() != 1 || it->second->dataDeviceIds[0] != device ||
                             it->second->dataType != type || it->second->expansionSize < required) {
                             reuse = false;
                             break;
@@ -4634,16 +4638,12 @@ namespace fastllm {
         }
 
         // 排查用：位 0～3 分别回放 pre / post / route / sharedExpert，默认全开。
-        int V41DecodeCudaGraphReplayMask(bool residentTpDraft = false) {
+        int V41DecodeCudaGraphReplayMask() {
             static const int mask = []() -> int {
                 const char *env = std::getenv("FASTLLM_DSV41_CUDA_GRAPH_REPLAY_MASK");
                 return env != nullptr && env[0] != 0 ? atoi(env) : 15;
             }();
-            // Forced resident TP drafts currently corrupt random verification
-            // under combined custom-collective graph replay. Retain the normal
-            // operator dispatch until that replay path has a numerical fix.
-            // NCCL and the existing placement policy keep their graph paths.
-            return residentTpDraft && FastllmCudaCustomAllReduceEnabled() ? 0 : mask;
+            return mask;
         }
 
         // 排查用：让第 N 段的捕获强制失败，验证"就地退回逐算子"这条回退路径
@@ -7214,7 +7214,7 @@ namespace fastllm {
                 }
                 if (ok) {
                     V41ComposeGraphSegments(*graphState, !dsparkVerify && !v41DsparkEnabled, engram_layer_ids,
-                        V41DecodeCudaGraphReplayMask(executionMode == ExecutionMode::Hybrid && tp && V41EnvFlag("FASTLLM_DSPARK_GPU_RESIDENT")));
+                        V41DecodeCudaGraphReplayMask());
                     graphState->captured = true;
                     CollectForwardGraphPointers(f, graphState->boundaryPointers);
                     if (V41DecodeCudaGraphVerbose()) {
@@ -7699,9 +7699,7 @@ namespace fastllm {
         const auto &segments = boundedPrefill ? tailSegments : inputSegments;
 #ifdef USE_CUDA
             if (graphReplay) {
-                const bool residentTpDraft = executionMode == ExecutionMode::Hybrid && f.tp &&
-                    V41EnvFlag("FASTLLM_DSPARK_GPU_RESIDENT");
-                if ((V41DecodeCudaGraphReplayMask(residentTpDraft) & (1 << (index % kV41GraphSegmentsPerLayer))) == 0 ||
+                if ((V41DecodeCudaGraphReplayMask() & (1 << (index % kV41GraphSegmentsPerLayer))) == 0 ||
                     (index < (int)graphState->segments.size() &&
                      graphState->segments[index].passthrough)) {
                     body();

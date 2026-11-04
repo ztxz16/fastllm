@@ -63,7 +63,7 @@ The option supports DeepSeek-V4.1 MXFP4 drafts on a single CUDA device, PP, or T
 
 TP CUDA ordinals must be ascending: reversed TP has not passed numerical validation and this option rejects it before loading weights. To choose a different physical root, reorder `CUDA_VISIBLE_DEVICES` and use `--tp 2`.
 
-For forced-resident hybrid TP with custom all-reduce enabled, target graph replay currently produces incorrect output. This option retains ordinary target operator dispatch while keeping draft experts fully cached on GPU. Single-device, PP, and the existing placement policy are unaffected. Explicitly selecting NCCL with `FASTLLM_CUDA_CUSTOM_ALLREDUCE=0` retains target graph acceleration. This is a correctness fallback; the underlying graph discrepancy remains unresolved, and full residency is not guaranteed to improve speed.
+Forced-resident hybrid TP supports custom all-reduce together with target CUDA Graph replay. `FASTLLM_CUDA_CUSTOM_ALLREDUCE=0` selects NCCL. Full draft residency consumes some of the target expert cache budget; performance depends on available VRAM, cache hit rates, and draft acceptance, so it is not guaranteed to improve speed.
 
 CPU/NUMA expert caches and already GPU-resident experts are supported. Disk expert caches (`--moe_device disk`) are not supported by this option; Engram may still use disk independently.
 
