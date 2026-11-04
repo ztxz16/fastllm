@@ -121,6 +121,9 @@ def args_parser():
     deploy_parser = subparsers.add_parser('deploy', help='Manage independent model replicas')
     add_deploy_args(deploy_parser)
 
+    from .router import add_router_args
+    add_router_args(subparsers.add_parser('router', help='Deploy prefill/decode groups with Fast KV Manager'))
+
     config_parser_ = subparsers.add_parser('config', help = '创建配置文件')
     config_parser_.add_argument('file', nargs='?', help = '配置文件的路径')
 
@@ -134,6 +137,13 @@ def args_parser():
 
 def main(argv=None):
     raw_argv = list(sys.argv[1:] if argv is None else argv)
+    # Remote lifecycle control needs only the standard library. Do not import
+    # model, download or Web UI dependencies just to manage P/D processes.
+    if raw_argv and raw_argv[0] == 'router':
+        from .router import add_router_args, main as router_main
+        parser = argparse.ArgumentParser(prog='ftllm router')
+        add_router_args(parser)
+        raise SystemExit(router_main(parser.parse_args(raw_argv[1:])))
     if not raw_argv:
         raw_argv = ["launch"]
     args = args_parser().parse_args(raw_argv)
