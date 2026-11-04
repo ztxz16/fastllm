@@ -24,6 +24,10 @@ Replace the example filename with the actual path. Keep the GGUF-referenced Engr
 
 Automatic defaults are one request, up to a 1M-token native window, FP4 KV, and fast prefill. Embedded DSpark weights enable DSpark 5 by default; GGUF files without those weights do not. Check `[auto]` for the selected devices, chunks, and caches. The planner prioritizes avoiding disk experts when GPU and host memory can hold them; Engram may still use disk independently.
 
+On SM120, `--auto` selects MXFP4 grouped MoE for single-GPU, single-request native HF FP4 models with DSpark 1–7, a CPU/NUMA expert cache, and Triton available in the current Python environment. Supported model dimensions are hidden 5120, MoE intermediate 2304, target top-6, draft top-3, SwiGLU limit 10, and block-32 UE8M0 expert weights. Only this operator is enabled automatically. SM121 retains manual `--triton` opt-in.
+
+Startup reports `SM120 MXFP4 grouped MoE enabled automatically`. With one visible GPU and sufficient space within the existing expert-cache budget, the cache policy prioritizes full draft residency. Unsupported inputs or compilation/loading failures fall back to built-in CUDA. Set `FASTLLM_CUDA_TRITON_MXFP4_GROUPED=0` to disable this operator, or `FASTLLM_CUDA_TRITON=0` to disable Triton automatic selection. Explicit environment settings take precedence.
+
 ## Common adjustments
 
 Append only the options you need:

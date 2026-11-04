@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import re
 import sys
 import subprocess
 import glob
@@ -162,11 +163,11 @@ def _is_nvidia_cuda_platform() -> bool:
             if device_class.startswith("0x03") and vendor == "0x10de":
                 has_nvidia_display_controller = True
         if accelerator_vendors:
-            # Server boards commonly expose an ASPEED or Matrox BMC as a VGA
-            # controller alongside the compute GPUs.  They are display-only
-            # management devices and must not make an NVIDIA host look mixed.
-            bmc_display_vendors = {"0x1a03", "0x102b"}
-            compute_vendors = accelerator_vendors - bmc_display_vendors
+            # Server boards and VMs may expose ASPEED, Matrox or Cirrus VGA
+            # alongside the compute GPUs. These display-only adapters must
+            # not make an NVIDIA host look mixed.
+            display_only_vendors = {"0x1a03", "0x102b", "0x1013"}
+            compute_vendors = accelerator_vendors - display_only_vendors
             return (has_nvidia_display_controller and
                     compute_vendors == {"0x10de"})
     except Exception:
@@ -855,6 +856,54 @@ def _configure_sm89_fp8_linear_triton(args) -> str:
         "the current Python environment: %s" % detected,
         flush=True,
     )
+    return detected
+
+def _configure_sm120_mxfp4_grouped_triton(args, config) -> str:
+    """Select the measured single-GPU DSpark backend without enabling other ops."""
+    auto_env_name = "FASTLLM_CUDA_TRITON_MXFP4_GROUPED_AUTO"
+    # This flag belongs to model selection, not to the user's environment.
+    # Re-evaluate it when a process loads a subsequent model.
+    os.environ.pop(auto_env_name, None)
+    if (not getattr(args, "auto", False) or
+            not 1 <= getattr(args, "dspark", 0) <= 7 or
+            getattr(args, "max_batch", 0) != 1 or
+            _uses_thread_tp(getattr(args, "tp", "")) or
+            getattr(args, "moe_cuda_cache", 0) <= 0 or
+            str(getattr(args, "moe_device", "")).lower() not in ("cpu", "numa") or
+            str(getattr(args, "path", "")).lower().endswith(".gguf")):
+        return ""
+    if ("FASTLLM_CUDA_TRITON" in os.environ or
+            "FASTLLM_CUDA_TRITON_MXFP4_GROUPED" in os.environ):
+        return ""
+    text = config.get("text_config", config)
+    quant = config.get("quantization_config", {})
+    if not isinstance(text, dict) or not isinstance(quant, dict):
+        return ""
+    if (config.get("model_type") != "deepseek_v41" or
+            text.get("hidden_size") != 5120 or
+            text.get("moe_intermediate_size") != 2304 or
+            text.get("num_experts_per_tok") != 6 or
+            text.get("dspark_num_experts_per_tok") != 3 or
+            text.get("swiglu_limit") != 10.0 or
+            quant.get("expert_dtype") != "fp4" or
+            quant.get("scale_fmt") != "ue8m0" or
+            quant.get("weight_block_size") != [32, 32]):
+        return ""
+    device = str(getattr(args, "device", "")).strip().lower()
+    if not re.fullmatch(r"cuda:\d+", device) or not _is_nvidia_cuda_platform():
+        return ""
+    device_id = int(device.split(":", 1)[1])
+    if _nvidia_cuda_compute_capabilities([device_id]).get(device_id) != 120:
+        return ""
+    detected = _find_triton_python()
+    if not detected:
+        print("[Fastllm] SM120 MXFP4 grouped MoE: Triton is unavailable; "
+              "built-in CUDA will be used.", flush=True)
+        return ""
+    os.environ["FASTLLM_CUDA_TRITON_PYTHON"] = detected
+    os.environ[auto_env_name] = "1"
+    print("[Fastllm] SM120 MXFP4 grouped MoE enabled automatically for DSpark "
+          "with the current Python environment: %s" % detected, flush=True)
     return detected
 
 def _is_naive_n05_family(config) -> bool:
@@ -1964,6 +2013,8 @@ def make_normal_llm_model(args, startup_progress = None):
         # placements, after TP fallback. Keep auto intact for subsequent models.
         os.environ.setdefault("FASTLLM_EXECUTION_MODE", "auto")
     _configure_sm89_fp8_linear_triton(args)
+    _configure_sm120_mxfp4_grouped_triton(
+        args, config if is_deepseek_v41_model else {})
     _configure_qwen35_auto_fast_paths(args, is_qwen35_model, mtp)
     os.environ["FASTLLM_DSV41_DECODER_SWA_BOUNDED_REPLAY"] = (
         "1" if _arg_enabled(getattr(args, "fast_prefill", False)) else "0")

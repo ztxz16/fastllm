@@ -1317,13 +1317,19 @@ namespace fastllm {
     }
 
     bool CudaTritonMxfp4GroupedEnabled() {
-        if (!CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON"))
-            return false;
+        const char *global = std::getenv("FASTLLM_CUDA_TRITON");
         const char *flag = std::getenv("FASTLLM_CUDA_TRITON_MXFP4_GROUPED");
+        const bool globalEnabled = CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON");
+        if (global && global[0] && !globalEnabled)
+            return false;
         if (flag && flag[0] && !CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON_MXFP4_GROUPED"))
             return false;
+        const bool explicitlyEnabled = globalEnabled || (flag && flag[0]);
+        if (!explicitlyEnabled && !CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON_MXFP4_GROUPED_AUTO"))
+            return false;
         const int arch = CudaTritonRuntimeArch();
-        return arch == 120 || arch == 121;
+        // SM121 retains manual opt-in; the automatic policy was measured on SM120.
+        return arch == 120 || (arch == 121 && explicitlyEnabled);
     }
 
     bool TryCudaTritonMxfp4Grouped(const Data &input, Data &activation, const unsigned char *records,

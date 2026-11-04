@@ -27,6 +27,10 @@ ftllm server /path/to/model-00001-of-00002.gguf --auto \
 
 自动模式默认单请求、最多 1M 原生窗口、FP4 KV 和快速 Prefill。带内置 DSpark 权重时默认使用 DSpark 5；没有草稿权重的 GGUF 不会自动开启。设备、chunk 和专家缓存以 `[auto]` 日志为准。显卡和主存能容纳专家时优先避免磁盘专家，Engram 仍可独立使用磁盘。
 
+对于 SM120 上的单卡、单请求 HF 原生 FP4 模型，`--auto` 在 DSpark 1–7、CPU/NUMA 专家缓存开启且当前 Python 环境可用 Triton 时，自动选择 MXFP4 grouped MoE。当前形状范围是 hidden 5120、MoE intermediate 2304、主模型 top-6、草稿 top-3、SwiGLU limit 10，以及 block-32 UE8M0 专家权重。只自动启用该算子；SM121 可手动使用 `--triton`，暂不自动启用。
+
+启动日志会显示 `SM120 MXFP4 grouped MoE enabled automatically`。单张可见 GPU 且现有专家缓存预算允许时，缓存策略优先容纳完整草稿专家。算子不支持当前输入或编译／加载失败时回退到原 CUDA 实现。设置 `FASTLLM_CUDA_TRITON_MXFP4_GROUPED=0` 可关闭该算子，`FASTLLM_CUDA_TRITON=0` 可关闭 Triton 自动选择；显式环境设置优先。
+
 上下文长度和内存预算允许时，自动规划先保证 chunk 1024，再争取每卡 3 GiB 专家缓存，之后按预计延迟选择更大的 chunk 或缓存。流式 GGUF 磁盘专家路径优先争取 chunk 4096。预算不足时允许缩小 chunk，显式指定的 chunk 和缓存参数仍优先。
 
 | 需要调整 | 追加参数 |
