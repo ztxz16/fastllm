@@ -4637,33 +4637,6 @@ namespace fastllm {
             return rounds;
         }
 
-        // 排查用：位 0～3 分别回放 pre / post / route / sharedExpert，默认全开。
-        int V41DecodeCudaGraphReplayMask() {
-            static const int mask = []() -> int {
-                const char *env = std::getenv("FASTLLM_DSV41_CUDA_GRAPH_REPLAY_MASK");
-                return env != nullptr && env[0] != 0 ? atoi(env) : 15;
-            }();
-            return mask;
-        }
-
-        // 排查用：让第 N 段的捕获强制失败，验证"就地退回逐算子"这条回退路径
-        int V41DecodeCudaGraphFailAt() {
-            static const int at = []() -> int {
-                const char *env = std::getenv("FASTLLM_DSV41_CUDA_GRAPH_FAIL_AT");
-                return env != nullptr && env[0] != '\0' ? atoi(env) : -1;
-            }();
-            return at;
-        }
-
-        // 排查用：每 N 次回放模拟地址失效；普通 decode 退回 eager，verify 可重新捕获
-        int V41DecodeCudaGraphInvalidateEvery() {
-            static const int n = []() -> int {
-                const char *env = std::getenv("FASTLLM_DSV41_CUDA_GRAPH_INVALIDATE_EVERY");
-                return env != nullptr && env[0] != '\0' ? atoi(env) : 0;
-            }();
-            return n;
-        }
-
         bool V41DecodeCudaGraphVerbose() {
             static const bool v = V41EnvFlag("FASTLLM_DSV41_CUDA_GRAPH_DEBUG");
             return v;
@@ -4832,8 +4805,8 @@ namespace fastllm {
         }
 
         void V41ComposeGraphSegments(DeepSeekV41CudaGraphState &state,
-                                     bool crossLayer, const std::vector<int> &engramLayers, int replayMask) {
-            if (!state.tensorParallel || (replayMask & 14) != 14) return;
+                                     bool crossLayer, const std::vector<int> &engramLayers) {
+            if (!state.tensorParallel) return;
             const int original = FastllmCudaGetDevice();
             for (int first = 1; first + 2 < (int)state.segments.size(); first += 4) {
                 if (!state.segments[first + 2].containsGpuMoe) continue;
@@ -4844,7 +4817,7 @@ namespace fastllm {
                 if (!eligible) continue;
                 int last = first + 2;
                 const int nextLayer = (first + 3) / kV41GraphSegmentsPerLayer;
-                if (crossLayer && (replayMask & 1) &&
+                if (crossLayer &&
                     first + 3 < (int)state.segments.size() &&
                     std::find(engramLayers.begin(), engramLayers.end(), nextLayer) == engramLayers.end() &&
                     !state.segments[first + 3].passthrough &&
@@ -5325,7 +5298,6 @@ namespace fastllm {
             ctx.moeWeights[2]->dataType == NVFP4_BLOCK_32_E8M0 &&
             !V41EnvFlag("FASTLLM_DSV41_DISABLE_SHARED_OVERLAP") &&
             !V41EnvFlag("FASTLLM_DSV41_REFERENCE_MATH") &&
-            (V41DecodeCudaGraphReplayMask() & 8) &&
             sharedIndex < (int)work->graphState->segments.size()) {
             const auto &segment = work->graphState->segments[sharedIndex];
             if (!segment.passthrough && segment.execs.size() == 1 && segment.execs[0]) {
@@ -5884,16 +5856,13 @@ namespace fastllm {
         if (graphReplay) {
             std::vector<const void*> current;
             CollectForwardGraphPointers(f, current);
-            const int invalidateEvery = V41DecodeCudaGraphInvalidateEvery();
             ++graphState->replayCount;
-            const bool forceInvalidate = invalidateEvery > 0 &&
-                                         graphState->replayCount % invalidateEvery == 0;
-            if (forceInvalidate || current != graphState->boundaryPointers) {
+            if (current != graphState->boundaryPointers) {
                 graphState->DestroyCapturedGraph();
                 graphState->recaptureCount++;
                 graphReplay = false;
                 if ((!v41CudaGraphWarmingUp && !f.dsparkVerify) ||
-                    (graphState->recaptureCount > 3 && !forceInvalidate)) {
+                    graphState->recaptureCount > 3) {
                     graphState->disabled = true;
                 }
                 if (V41DecodeCudaGraphVerbose()) {
@@ -5912,17 +5881,14 @@ namespace fastllm {
 
         // Both native CUDA score transformation and TopK iterate over the
         // expert dimension; 384 experts do not require a host round-trip.
-        cudaRouteCapturable =
-            V41EnvFlag("FASTLLM_DSV41_CUDA_GRAPH_FORCE_ROUTE_CAPTURE") ||
-            (!hasImageTokens && num_experts > 0 && num_experts_per_tok <= 50 &&
-             !V41EnvFlag("FASTLLM_DSV41_DISABLE_CUDA_ROUTE"));
+        cudaRouteCapturable = !hasImageTokens && num_experts > 0 && num_experts_per_tok <= 50 &&
+            !V41EnvFlag("FASTLLM_DSV41_DISABLE_CUDA_ROUTE");
 
 #ifdef USE_CUDA
         // Only the fully GPU, ordinary decode path has worker-only graph
         // boundaries. CPU experts, speculative feature copies, packed KV and
         // partially captured graphs keep the conservative caller-stream order.
         f.workerOrderedGraphReplay = graphReplay && tp && f.tpAttention &&
-            V41DecodeCudaGraphReplayMask() == 15 &&
             executionMode == ExecutionMode::Gpu && !v41DsparkEnabled &&
             !f.quantKV && cudaRouteCapturable &&
             std::all_of(f.inputSegments.begin(), f.inputSegments.end(),
@@ -7213,8 +7179,7 @@ namespace fastllm {
                     graphPoolOpen = false;
                 }
                 if (ok) {
-                    V41ComposeGraphSegments(*graphState, !dsparkVerify && !v41DsparkEnabled, engram_layer_ids,
-                        V41DecodeCudaGraphReplayMask());
+                    V41ComposeGraphSegments(*graphState, !dsparkVerify && !v41DsparkEnabled, engram_layer_ids);
                     graphState->captured = true;
                     CollectForwardGraphPointers(f, graphState->boundaryPointers);
                     if (V41DecodeCudaGraphVerbose()) {
@@ -7686,65 +7651,60 @@ namespace fastllm {
                 data->strides.clear();
             }
     }
-    void DeepSeekV41Model::RunForwardGraphSegment(ForwardWorkspace &f, const std::function<void()> &body, int index, bool capturable, const std::function<void(DeepSeekV41GraphSegmentMeta&)> &record, const std::function<void(const DeepSeekV41GraphSegmentMeta&)> &restore) {
-        auto &inputSegments = f.inputSegments;
-        auto &boundedPrefill = f.boundedPrefill;
-        auto &tailSegments = f.tailSegments;
+    void DeepSeekV41Model::RunForwardGraphSegment(
+            ForwardWorkspace &f, const std::function<void()> &body, int index, bool capturable,
+            const std::function<void(DeepSeekV41GraphSegmentMeta&)> &record,
+            const std::function<void(const DeepSeekV41GraphSegmentMeta&)> &restore) {
 #ifdef USE_CUDA
         auto &graphState = f.graphState;
         auto &graphReplay = f.graphReplay;
         auto &graphCapture = f.graphCapture;
         auto &graphPoolOpen = f.graphPoolOpen;
-#endif
-        const auto &segments = boundedPrefill ? tailSegments : inputSegments;
-#ifdef USE_CUDA
-            if (graphReplay) {
-                if ((V41DecodeCudaGraphReplayMask() & (1 << (index % kV41GraphSegmentsPerLayer))) == 0 ||
-                    (index < (int)graphState->segments.size() &&
-                     graphState->segments[index].passthrough)) {
-                    body();
-                    return;
-                }
-                if (index < (int)graphState->segments.size() &&
-                    V41LaunchGraphSegment(*graphState, index, f.workerOrderedGraphReplay)) {
-                    restore(graphState->segments[index]);
-                    return;
-                }
-                GiveUpForwardGraph(f, "replay");
+        if (graphReplay) {
+            if (index < (int)graphState->segments.size() &&
+                graphState->segments[index].passthrough) {
                 body();
                 return;
             }
-            if (graphCapture) {
-                if (!capturable) {
-                    // 占位段：逐算子跑，但要占住段号，回放时也走同一条路
-                    body();
-                    DeepSeekV41GraphSegment placeholder;
-                    placeholder.passthrough = true;
-                    graphState->segments.push_back(placeholder);
-                    record(graphState->segments.back());
-                    return;
-                }
-                if (index != V41DecodeCudaGraphFailAt() &&
-                    V41CaptureGraphSegment(*graphState, body)) {
-                    record(graphState->segments.back());
-                    return;
-                }
-                if (graphPoolOpen) {
-                    FastllmCudaGraphMemoryPoolAbort();
-                    graphPoolOpen = false;
-                }
-                GiveUpForwardGraph(f, "capture");
-                // 捕获时没有真正执行任何 kernel，输入也没被改动，直接逐算子重跑一遍。
-                body();
+            if (index < (int)graphState->segments.size() &&
+                V41LaunchGraphSegment(*graphState, index, f.workerOrderedGraphReplay)) {
+                restore(graphState->segments[index]);
                 return;
             }
-#else
-            (void)index;
-            (void)capturable;
-            (void)record;
-            (void)restore;
-#endif
+            GiveUpForwardGraph(f, "replay");
             body();
+            return;
+        }
+        if (graphCapture) {
+            if (!capturable) {
+                // 占位段：逐算子跑，但要占住段号，回放时也走同一条路
+                body();
+                DeepSeekV41GraphSegment placeholder;
+                placeholder.passthrough = true;
+                graphState->segments.push_back(placeholder);
+                record(graphState->segments.back());
+                return;
+            }
+            if (V41CaptureGraphSegment(*graphState, body)) {
+                record(graphState->segments.back());
+                return;
+            }
+            if (graphPoolOpen) {
+                FastllmCudaGraphMemoryPoolAbort();
+                graphPoolOpen = false;
+            }
+            GiveUpForwardGraph(f, "capture");
+            // 捕获时没有真正执行任何 kernel，输入也没被改动，直接逐算子重跑一遍。
+            body();
+            return;
+        }
+#else
+        (void)index;
+        (void)capturable;
+        (void)record;
+        (void)restore;
+#endif
+        body();
     }
     std::vector<int> DeepSeekV41Model::ForwardSegments(const std::vector<DeepSeekV41Segment> &inputSegments,
                                                        const Data &inputIds,

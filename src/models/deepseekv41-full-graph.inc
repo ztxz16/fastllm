@@ -410,7 +410,7 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
         (!verifying && !v41CudaGraphWarmingUp) || head_dim_full != 512 || hc_mult != 4 || index_head_dim != 128)
         return;
     // Explicit reference/debug modes must retain their selected arithmetic.
-    if (V41DecodeCudaGraphReplayMask() != 15 || V41EnvFlag("FASTLLM_DSV41_DISABLE_FAKE_QUANT") ||
+    if (V41EnvFlag("FASTLLM_DSV41_DISABLE_FAKE_QUANT") ||
         V41EnvFlag("FASTLLM_DSV41_LEGACY_ATTN") || V41EnvFlag("FASTLLM_DSV41_LEGACY_INDEXER") ||
         V41EnvFlag("FASTLLM_DSV41_LEGACY_TOPK") || V41EnvFlag("FASTLLM_DSV41_LEGACY_ROTARY"))
         return;
@@ -1070,8 +1070,6 @@ bool DeepSeekV41Model::TryFullDecodeGraph(ForwardWorkspace &f, bool inputsPrepar
         return false;
     if (!inputsPrepared) {
         // Preserve the address checks normally performed by PrepareInputs.
-        // Forced-invalidation diagnostics use that frontend's recapture path.
-        if (V41DecodeCudaGraphInvalidateEvery() > 0) return false;
         std::vector<const void *> current;
         CollectForwardGraphPointers(f, current);
         if (current != f.graphState->boundaryPointers) return false;
