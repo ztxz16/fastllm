@@ -2,27 +2,40 @@
 #include "fastllm.h"
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
+#include "devices/cuda/attention/fastllm-fp4-kv.cuh"
 
 // Storage conversion happens at the load/store boundary. Attention still
 // accumulates in FP32 and retains its established BF16 rounding points.
 struct FastllmNaiveKVRow {
     const void *data = nullptr;
     bool fp8 = false;
-    __host__ __device__ FastllmNaiveKVRow(const void *data = nullptr, bool fp8 = false)
-        : data(data), fp8(fp8) {}
+    const uint8_t *scales = nullptr;
+    size_t column = 0;
+    __host__ __device__ FastllmNaiveKVRow(const void *data = nullptr, bool fp8 = false,
+            const uint8_t *scales = nullptr, size_t column = 0)
+        : data(data), fp8(fp8), scales(scales), column(column) {}
     __device__ __forceinline__ FastllmNaiveKVRow operator+(size_t n) const {
+        if (scales) return {data, false, scales, column + n};
         return {(const char *)data + n * (fp8 ? 1 : 2), fp8};
     }
     __device__ __forceinline__ FastllmNaiveKVRow operator-(size_t n) const {
+        if (scales) return {data, false, scales, column - n};
         return {(const char *)data - n * (fp8 ? 1 : 2), fp8};
     }
     __device__ __forceinline__ __nv_bfloat16 operator[](size_t n) const {
+        if (scales) return __float2bfloat16_rn(LoadFloat(n));
         return fp8 ? __float2bfloat16_rn((float)((const __nv_fp8_e4m3 *)data)[n])
                    : ((const __nv_bfloat16 *)data)[n];
     }
     // Every finite E4M3 value is exactly representable in BF16. Scalar
     // FP32 consumers can skip the redundant BF16 round-trip.
     __device__ __forceinline__ float LoadFloat(size_t n) const {
+        if (scales) {
+            n += column;
+            const uint8_t packed = ((const uint8_t *)data)[n / 2];
+            __nv_fp8_e4m3 scale; scale.__x = scales[n / 16];
+            return FastllmFP4KVDecode((packed >> ((n & 1) * 4)) & 15) * float(scale);
+        }
         return fp8 ? (float)((const __nv_fp8_e4m3 *)data)[n]
                    : (float)((const __nv_bfloat16 *)data)[n];
     }
@@ -35,15 +48,21 @@ struct FastllmNaiveKVRow {
         return *reinterpret_cast<unsigned *>(&b);
     }
     __device__ __forceinline__ uint4 Load8() const {
+        if (scales) return make_uint4(FP4Pair(0), FP4Pair(2), FP4Pair(4), FP4Pair(6));
         if (!fp8) return *(const uint4 *)data;
         uint2 packed = *(const uint2 *)data;
         return make_uint4(ConvertPair(packed.x), ConvertPair(packed.x >> 16),
                           ConvertPair(packed.y), ConvertPair(packed.y >> 16));
     }
     __device__ __forceinline__ uint2 Load4() const {
+        if (scales) return make_uint2(FP4Pair(0), FP4Pair(2));
         if (!fp8) return *(const uint2 *)data;
         unsigned packed = *(const unsigned *)data;
         return make_uint2(ConvertPair(packed), ConvertPair(packed >> 16));
+    }
+    __device__ __forceinline__ unsigned FP4Pair(int n) const {
+        __nv_bfloat162 pair = __halves2bfloat162((*this)[n], (*this)[n + 1]);
+        return *reinterpret_cast<unsigned *>(&pair);
     }
 };
 
@@ -95,11 +114,12 @@ struct FastllmNaiveKV {
     const int *pages = nullptr;
     int pageLen = 0, pageShift = -1;
     size_t offset = 0;
-    bool fp8 = false, scaledIndexer = false;
+    bool fp8 = false, scaledIndexer = false, fp4 = false;
 
     __host__ __device__ FastllmNaiveKV(const void *data = nullptr) : base((const __nv_bfloat16 *)data) {}
-    __host__ __device__ FastllmNaiveKV(const void *data, const int *table, int length, bool fp8 = false)
-        : base((const __nv_bfloat16 *)data), pages(table), pageLen(length), fp8(fp8) {
+    __host__ __device__ FastllmNaiveKV(const void *data, const int *table, int length,
+            bool fp8 = false, bool fp4 = false)
+        : base((const __nv_bfloat16 *)data), pages(table), pageLen(length), fp8(fp8), fp4(fp4) {
         if (length > 0 && (length & (length - 1)) == 0) {
 #if defined(__CUDA_ARCH__)
             pageShift = __ffs(length) - 1;
@@ -113,7 +133,8 @@ struct FastllmNaiveKV {
         : FastllmNaiveKV((const __nv_bfloat16 *)(data.isPagedKVCache
             ? data.pagedKVCacheData->cudaData : data.cudaData),
             data.isPagedKVCache ? (const int *)data.cudaData : nullptr,
-            data.isPagedKVCache ? data.pageLen : 0, data.dataType == fastllm::FP8_E4M3) {
+            data.isPagedKVCache ? data.pageLen : 0, data.dataType == fastllm::FP8_E4M3,
+            data.dataType == fastllm::FP4_E2M1) {
         scaledIndexer = data.kvCacheFp8Indexer;
     }
     // Callers retain logical rows instead of reconstructing them from element
@@ -127,6 +148,12 @@ struct FastllmNaiveKV {
     }
     __device__ __forceinline__ FastllmNaiveKVRow Row(int row, int stride) const {
         row = PhysicalRow(row);
+        if (fp4) {
+            // Naive sparse KV copies opaque rows, including their scales.
+            // Each row is [stride/2 packed bytes][stride/16 E4M3 scales].
+            const auto *packed = (const uint8_t *)base + (size_t)row * (stride / 16 * 9);
+            return {packed, false, packed + stride / 2, offset};
+        }
         return FastllmNaiveKVRow(base, fp8) + ((size_t)row * stride + offset);
     }
     __device__ __forceinline__ FastllmNaiveKVRow IndexRow(int row, int stride) const {

@@ -2291,6 +2291,23 @@ if (UNIT_TEST)
                     PROPERTIES LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 300
                     PASS_REGULAR_EXPRESSION "TP GPU PREFIX PASS")
             endforeach()
+            foreach(NAIVE_FP4_INDEXER_STORAGE layer_shard context_shard)
+                add_test(NAME naive_n05_kvmem_fp4_${NAIVE_FP4_INDEXER_STORAGE}
+                    COMMAND naive_n05_verify_graph_test 4 kvmem_fp4 ${NAIVE_FP4_INDEXER_STORAGE})
+                set_tests_properties(naive_n05_kvmem_fp4_${NAIVE_FP4_INDEXER_STORAGE} PROPERTIES
+                    LABELS "cuda;multigpu" RUN_SERIAL TRUE TIMEOUT 180 SKIP_RETURN_CODE 77
+                    PASS_REGULAR_EXPRESSION "FP4 EXECUTION PASS")
+                add_test(NAME naive_n05_kvmem_transition_fp4_${NAIVE_FP4_INDEXER_STORAGE}
+                    COMMAND naive_n05_verify_graph_test 4 serving_kvmem_transition fp4 ${NAIVE_FP4_INDEXER_STORAGE} fp8)
+                set_tests_properties(naive_n05_kvmem_transition_fp4_${NAIVE_FP4_INDEXER_STORAGE} PROPERTIES
+                    LABELS "cuda;multigpu" RUN_SERIAL TRUE TIMEOUT 180 SKIP_RETURN_CODE 77
+                    PASS_REGULAR_EXPRESSION "SERVING PAGE GROWTH PASS" ENVIRONMENT "FASTLLM_CUDA_GRAPH=1")
+                add_test(NAME naive_n05_kvmem_prefix_fp4_${NAIVE_FP4_INDEXER_STORAGE}
+                    COMMAND naive_n05_verify_graph_test 4 kvmem_prefix fp4 fp8 ${NAIVE_FP4_INDEXER_STORAGE})
+                set_tests_properties(naive_n05_kvmem_prefix_fp4_${NAIVE_FP4_INDEXER_STORAGE} PROPERTIES
+                    LABELS "cuda;multigpu" RUN_SERIAL TRUE TIMEOUT 300 SKIP_RETURN_CODE 77
+                    PASS_REGULAR_EXPRESSION "TP GPU PREFIX PASS")
+            endforeach()
             add_test(NAME naive_n05_serving_large COMMAND naive_n05_verify_graph_test 4 serving_large)
             set_tests_properties(naive_n05_serving_large
                 PROPERTIES LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 300
@@ -2522,6 +2539,13 @@ if (UNIT_TEST)
         add_test(NAME naive_n05_dsa_batch COMMAND naive_n05_dsa_batch_test)
         set_tests_properties(naive_n05_dsa_batch PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
             PASS_REGULAR_EXPRESSION "BATCH DSA PASS")
+
+        add_executable(naive_n05_fp4_kv_test test/basic/test_naive_n05_fp4_kv.cpp)
+        target_link_libraries(naive_n05_fp4_kv_test PRIVATE fastllm)
+        target_include_directories(naive_n05_fp4_kv_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        add_test(NAME naive_n05_fp4_kv COMMAND naive_n05_fp4_kv_test)
+        set_tests_properties(naive_n05_fp4_kv PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
+            PASS_REGULAR_EXPRESSION "ALL FP4 DSA CHECKS PASSED")
 
         add_executable(naive_n05_fp8_kv_test test/basic/test_naive_n05_fp8_kv.cpp)
         target_link_libraries(naive_n05_fp8_kv_test PRIVATE fastllm)

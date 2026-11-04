@@ -273,7 +273,7 @@ class Fixture : public NaiveN05FlashModel {
         }
     }
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
-    std::vector<float> SparseKvRun(bool enabled) {
+    std::vector<float> SparseKvRun(bool enabled, bool useDecodeGraph = true) {
         maxBatch = 4; SetMaxTokens(16384); SetChunkedPrefillSize(1024);
         if (enabled) {
             SetMaxTokens(13312); // Less than 4 * 4096, enough for the actual mixed histories.
@@ -326,7 +326,7 @@ class Fixture : public NaiveN05FlashModel {
                     for (auto &layer : requests[owner]) caches.emplace_back(&layer.first, &layer.second);
                     ++past[owner];
                 }
-                const bool graph = step % 3 != 0;
+                const bool graph = useDecodeGraph && step % 3 != 0;
                 SetCudaGraph(graph);
                 const int launches = verifyGraphLaunches;
                 ForwardBatch(count, Data(FLOAT32, {1, count}, ids), {}, pos, std::vector<int>(count, 1), caches,
@@ -2360,6 +2360,26 @@ int main(int argc, char **argv) {
         SetDeviceMap({{"cuda:0", 1}});
         FastllmCudaSetDevice(0);
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+        if (argc > 2 && std::string(argv[2]) == "kvmem_fp4") {
+            SetCudaEmbedding(true); SetCudaGraph(true);
+            std::vector<float> reference;
+            for (bool graph : {false, true}) {
+                Fixture fixture(ranks, false, true, true, true);
+                const bool context = argc > 3 && std::string(argv[3]) == "context_shard";
+                fixture.SetIndexerTPStorage(!context, context);
+                fixture.SetKVCacheDataType(FP4_E2M1);
+                fixture.SetIndexerDataType(FP8_E4M3);
+                auto result = fixture.SparseKvRun(true, graph);
+                if (!graph) reference = std::move(result);
+                else {
+                    if (result.size() != reference.size()) throw std::runtime_error("FP4 logits missing");
+                    RequireCloseLogits(result.data(), reference, "FP4 graph changed model logits");
+                    std::cout << "FP4 EXECUTION PASS logits=" << result.size()
+                              << " relative=" << largestLogitRelative << std::endl;
+                }
+            }
+            return 0;
+        }
         if (argc > 2 && std::string(argv[2]) == "kvmem_pool") {
             SetCudaEmbedding(true); SetCudaGraph(true);
             Fixture fixture(ranks, false, true, true, true);
@@ -2415,6 +2435,7 @@ int main(int argc, char **argv) {
             SetCudaEmbedding(true); SetCudaGraph(true);
             Fixture fixture(ranks, false, true, true, true);
             if (argc > 3 && std::string(argv[3]) == "fp8") fixture.SetKVCacheDataType(FP8_E4M3);
+            if (argc > 3 && std::string(argv[3]) == "fp4") fixture.SetKVCacheDataType(FP4_E2M1);
             if (argc > 4 && std::string(argv[4]) == "layer_shard") fixture.SetIndexerTPStorage(true);
             if (argc > 4 && std::string(argv[4]) == "context_shard") fixture.SetIndexerTPStorage(false, true);
             if (argc > 5 && std::string(argv[5]) == "fp8") fixture.SetIndexerDataType(FP8_E4M3);
@@ -2431,8 +2452,10 @@ int main(int argc, char **argv) {
             SetCudaEmbedding(true); SetCudaGraph(true);
             Fixture fixture(ranks, false, true, true, true);
             if (argc > 3 && std::string(argv[3]) == "fp8") fixture.SetKVCacheDataType(FP8_E4M3);
+            if (argc > 3 && std::string(argv[3]) == "fp4") fixture.SetKVCacheDataType(FP4_E2M1);
             if (argc > 4 && std::string(argv[4]) == "fp8") fixture.SetIndexerDataType(FP8_E4M3);
             if (argc > 5 && std::string(argv[5]) == "layer_shard") fixture.SetIndexerTPStorage(true);
+            if (argc > 5 && std::string(argv[5]) == "context_shard") fixture.SetIndexerTPStorage(false, true);
             fixture.HistoryServingChecks(true, std::string(argv[2]) == "kvmem_prefix");
             return 0;
         }

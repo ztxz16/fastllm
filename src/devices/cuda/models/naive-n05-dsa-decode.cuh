@@ -35,7 +35,7 @@ template <bool Async> __device__ __forceinline__ void Copy(void *dst, const void
     *reinterpret_cast<uint4 *>(dst) = valid ? *reinterpret_cast<const uint4 *>(src) : make_uint4(0, 0, 0, 0);
 }
 template <bool Async> __device__ __forceinline__ void Copy(void *dst, FastllmNaiveKVRow src, bool valid) {
-    if (src.fp8) *(uint4 *)dst = valid ? src.Load8() : make_uint4(0, 0, 0, 0);
+    if (src.fp8 || src.scales) *(uint4 *)dst = valid ? src.Load8() : make_uint4(0, 0, 0, 0);
     else Copy<Async>(dst, src.data, valid);
 }
 template <int FixedDim = 0>
@@ -55,7 +55,7 @@ __global__ void Scores(const BF16 *q, FastllmNaiveDSABatch batch, float *scores,
         selected[t] = index >= 0 && index < length ? index : -1;
     }
     __syncthreads();
-    FastllmNaiveKV key((const BF16 *)r.key, r.keyPages, r.pageLen, r.fp8);
+    FastllmNaiveKV key((const BF16 *)r.key, r.keyPages, r.pageLen, r.fp8, r.fp4);
     if (dim % 8 == 0 && r.keyStride % 8 == 0 && (size_t)key.base % 16 == 0) {
         for (int i = t; i < 64 * (dim / 8); i += 256) {
             int row = i / (dim / 8), d = i % (dim / 8) * 8, index = selected[row];
@@ -104,7 +104,7 @@ __global__ void DirectScores(const BF16 *q, FastllmNaiveDSABatch batch, float *s
     const auto r = FastllmNaiveResolveDSARow(batch.rows[b]);
     if (Length(r) == 0) return;
     int length = Length(r), count = r.indices ? r.selectedCount : length, kh = h / (heads / kvHeads);
-    FastllmNaiveKV key((const BF16 *)r.key, r.keyPages, r.pageLen, r.fp8);
+    FastllmNaiveKV key((const BF16 *)r.key, r.keyPages, r.pageLen, r.fp8, r.fp4);
     float qr[6];
 #pragma unroll
     for (int d = 0; d < 6; ++d)
@@ -210,7 +210,7 @@ __global__ void Values(const float *scores, FastllmNaiveDSABatch batch, BF16 *ou
     auto r = FastllmNaiveResolveDSARow(batch.rows[b]);
     if (ZeroInactive(r, out + ((size_t)b * heads + h) * ValueDim + column, Columns)) return;
     int length = Length(r), count = r.indices ? r.selectedCount : length, kh = h / (heads / kvHeads);
-    FastllmNaiveKV value((const BF16 *)r.value, r.valuePages, r.pageLen, r.fp8);
+    FastllmNaiveKV value((const BF16 *)r.value, r.valuePages, r.pageLen, r.fp8, r.fp4);
     const float *p = scores + ((size_t)b * heads + h) * stride;
     __shared__ __align__(16) BF16 values[Tile][Columns];
     __shared__ float prob[Tile];
@@ -261,7 +261,7 @@ __global__ void SoftmaxTransposedValues(const float *scores, const float *sink, 
     auto &scratch = st.temp;
     auto &maximum = st.maximum;
     auto &denominator = st.denominator;
-    FastllmNaiveKV v((const BF16 *)r.value, r.valuePages, r.pageLen, r.fp8);
+    FastllmNaiveKV v((const BF16 *)r.value, r.valuePages, r.pageLen, r.fp8, r.fp4);
     const float *src = scores + ((size_t)b * heads + h) * stride;
     for (int i = t; i < count * (Columns / 8); i += 256) {
         int row = i / (Columns / 8), d = i % (Columns / 8) * 8, index = r.indices ? r.indices[row] : row;
@@ -328,7 +328,7 @@ __global__ void SoftmaxSparseValues(const float *scores, const float *sink, Fast
     auto &scratch = st.temp;
     auto &maximum = st.maximum;
     auto &denominator = st.denominator;
-    FastllmNaiveKV v((const BF16 *)r.value, r.valuePages, r.pageLen, r.fp8);
+    FastllmNaiveKV v((const BF16 *)r.value, r.valuePages, r.pageLen, r.fp8, r.fp4);
     const float *src = scores + ((size_t)b * heads + h) * stride;
     for (int i = t; i < count * (Columns / 8); i += 32 * Columns) {
         int row = i / (Columns / 8), d = i % (Columns / 8) * 8, index = r.indices ? r.indices[row] : row;
@@ -391,7 +391,7 @@ __global__ void GroupedValues(const float *scores, const float *sink, FastllmNai
     int length = Length(r), count = r.indices ? r.selectedCount : length, kh = firstHead / (heads / kvHeads);
     extern __shared__ __align__(16) unsigned char memory[];
     auto &s = *(GroupStorage<MaxKeys, Groups, Columns> *)memory;
-    FastllmNaiveKV v((const BF16 *)r.value, r.valuePages, r.pageLen, r.fp8);
+    FastllmNaiveKV v((const BF16 *)r.value, r.valuePages, r.pageLen, r.fp8, r.fp4);
     for (int i = t; i < count * (Columns / 8); i += Groups * 256) {
         int row = i / (Columns / 8), col = i % (Columns / 8) * 8, index = r.indices ? r.indices[row] : row;
         bool valid = index >= 0 && index < length;

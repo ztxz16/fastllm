@@ -920,6 +920,7 @@ struct RopeCacheRow {
     void *indexCache = nullptr;
     bool separateIndex = false;
     int indexPageLen = 0, indexContextRank = 0;
+    bool fp4 = false, indexFp8 = false;
 };
 constexpr int kRopeArgumentBytes = CUDART_VERSION >= 12010 ? 32764 : 4096;
 constexpr int kRopeCacheBatch = std::min(192, (kRopeArgumentBytes - 128) / int(sizeof(RopeCacheRow)));
@@ -962,7 +963,19 @@ __device__ void AppendRopeCacheRow(RopeCacheRow r, int token, int head,
                       : k + ((size_t)token * kvHeads + head - heads) * dim);
         const int *pages = r.pageLen && r.cache ? (const int *)r.cache[2] : r.keyPages;
         int physical = pages ? pages[row / r.pageLen] * r.pageLen + row % r.pageLen : row;
-        const int tail = r.scaledIndexer ? FastllmNaiveIndexerBytes / (r.fp8 ? 1 : 2) : indexDim;
+        const int tail = r.scaledIndexer ? FastllmNaiveIndexerBytes / (r.indexFp8 ? 1 : 2) : indexDim;
+        if (r.fp4 && !index) {
+            __shared__ BF16 rotatedFP4[256];
+            RopeHeadTo(src, rotatedFP4, positions[token], rotaryDim, theta);
+            for (int d = rotaryDim + threadIdx.x; d < width; d += blockDim.x) rotatedFP4[d] = src[d];
+            __syncthreads();
+            const int columns = kvHeads * dim;
+            auto *packedRow = (uint8_t *)key.data + (size_t)physical * (columns / 16 * 9);
+            for (int block = threadIdx.x; block < dim / 16; block += blockDim.x)
+                FastllmWriteFP4KVBlock(packedRow, rotatedFP4 + block * 16,
+                    (head - heads) * dim + block * 16, columns);
+            return;
+        }
         auto dst = key + (size_t)physical * (kvHeads * dim + (r.separateIndex ? 0 : tail))
             + (index ? kvHeads * dim : (head - heads) * dim);
         if (index && r.separateIndex) {
@@ -970,7 +983,7 @@ __device__ void AppendRopeCacheRow(RopeCacheRow r, int token, int head,
                 if (row % r.pageLen / r.indexPageLen != r.indexContextRank) return;
                 physical = (physical / r.pageLen) * r.indexPageLen + row % r.indexPageLen;
             }
-            dst = FastllmNaiveKVWriteRow{r.cache ? (void *)r.cache[r.pageLen ? 4 : 2] : r.indexCache, r.fp8} + (size_t)physical * tail;
+            dst = FastllmNaiveKVWriteRow{r.cache ? (void *)r.cache[r.pageLen ? 4 : 2] : r.indexCache, r.indexFp8} + (size_t)physical * tail;
         }
         if (index && r.scaledIndexer) {
             __shared__ BF16 rotated[128];
@@ -988,6 +1001,18 @@ __device__ void AppendRopeCacheRow(RopeCacheRow r, int token, int head,
                                 : v + ((size_t)token * kvHeads + h) * valueDim;
         const int *pages = r.pageLen && r.cache ? (const int *)r.cache[3] : r.valuePages;
         int physical = pages ? pages[row / r.pageLen] * r.pageLen + row % r.pageLen : row;
+        if (r.fp4) {
+            __shared__ BF16 scaledFP4[256];
+            for (int d = threadIdx.x; d < valueDim; d += blockDim.x)
+                scaledFP4[d] = __float2bfloat16_rn((float)src[d] * (float)valueScale);
+            __syncthreads();
+            const int columns = kvHeads * valueDim;
+            auto *packedRow = (uint8_t *)value.data + (size_t)physical * (columns / 16 * 9);
+            for (int block = threadIdx.x; block < valueDim / 16; block += blockDim.x)
+                FastllmWriteFP4KVBlock(packedRow, scaledFP4 + block * 16,
+                    h * valueDim + block * 16, columns);
+            return;
+        }
         auto dst = value + ((size_t)physical * kvHeads + h) * valueDim;
         for (int d = threadIdx.x; d < valueDim; d += blockDim.x)
             dst[d] = __float2bfloat16_rn((float)src[d] * (float)valueScale);
@@ -2485,7 +2510,7 @@ static bool PrepareRopeCache(fastllm::Data &q, const fastllm::Data &k,
             x.dataDeviceIds == device && x.cudaData;
     };
     auto matrix = [&](const Data &x, int64_t columns, bool cache = false) {
-        return resident(x, cache ? x.dataType : BFLOAT16) && (!cache || FastllmNaiveKVType(x.dataType)) && x.dims.size() == 3 && x.dims[0] == 1 &&
+        return resident(x, cache ? x.dataType : BFLOAT16) && (!cache || FastllmNaiveAttentionKVType(x.dataType)) && x.dims.size() == 3 && x.dims[0] == 1 &&
             x.dims[1] >= 0 && x.dims[2] == columns && x.strides.size() == 3 &&
             x.strides[2] == 1 && x.strides[1] == columns;
     };
@@ -2531,10 +2556,15 @@ static bool PrepareRopeCache(fastllm::Data &q, const fastllm::Data &k,
         (const float *)positions.cudaData, dynamicLength ? (const int *)liveKeys.cudaData : nullptr,
         keyRows, valueRows, cachePast};
     row.fp8 = key.dataType == FP8_E4M3;
+    row.fp4 = key.dataType == FP4_E2M1;
+    row.indexFp8 = indexCache ? indexCache->dataType == FP8_E4M3 : row.fp8;
+    if (row.fp4 && (window || ring || dim % 16 || valueDim % 16 || dim > 256 || valueDim > 256 ||
+                    key.kvCacheFp8Indexer || (indexDim && !indexCache))) return false;
     row.scaledIndexer = indexCache ? indexCache->kvCacheFp8Indexer : key.kvCacheFp8Indexer;
     if (indexCache) {
-        const int width = row.scaledIndexer ? FastllmNaiveIndexerBytes / key.unitSize : indexDim;
-        if (indexDim != 128 || !matrix(*indexCache, width, true) || indexCache->dataType != key.dataType ||
+        const int width = row.scaledIndexer ? FastllmNaiveIndexerBytes / indexCache->unitSize : indexDim;
+        if (indexDim != 128 || !matrix(*indexCache, width, true) ||
+            indexCache->dataType != (row.fp4 ? FP8_E4M3 : key.dataType) ||
             indexCache->expansionDims.size() != 3 || indexCache->isPagedKVCache != key.isPagedKVCache) return false;
         if (key.isPagedKVCache) {
             // The Indexer borrows exactly K's page IDs. Serving can extend the
@@ -2632,6 +2662,7 @@ bool FastllmCudaNaiveBatchRopeAppendCache(fastllm::Data &q, const fastllm::Data 
     // Validate the complete batch before any kernel can modify Q or KV.
 #if CUDART_VERSION >= 12010
     const bool compactGeometry = count >= 80 && count <= kCompactRopeRequests &&
+        std::none_of(descriptors.begin(), descriptors.end(), [](const auto &r) { return r.fp4; }) &&
         heads == 16 && kvHeads == (ring ? 2 : 1) && dim == 192 && valueDim == 128 &&
         rotaryDim == 64 && indexDim == (ring ? 0 : 128) && window == (ring ? 128 : 0);
     if (compactGeometry && FastllmCudaRuntimeArch() == 90) {
@@ -2661,6 +2692,7 @@ bool FastllmCudaNaiveBatchRopeAppendCache(fastllm::Data &q, const fastllm::Data 
         // One CTA per request amortizes angle calculation for sufficiently
         // large batches. Keep the original launch for small or wider shapes.
         const bool requestFusion = batchSize >= 80 && rotaryDim > 0 &&
+            std::none_of(batch.rows, batch.rows + batchSize, [](const auto &r) { return r.fp4; }) &&
             rotaryDim <= 192 && rotaryDim % 2 == 0 && rotaryDim <= dim &&
             (!indexDim || (indexDim == 128 && rotaryDim <= indexDim));
         auto kernel = requestFusion ? (packedQkv ? RequestRope<true> : RequestRope<false>)
@@ -2707,7 +2739,7 @@ bool FastllmCudaNaiveBatchQkvRopeAppendCache(const fastllm::Data &input,
             dim, valueDim, rotaryDim, theta, valueScale, window, nullptr, ring,
             descriptors, indexDim) || (indexDim && indexDim != 128)) return false;
     const auto &first = descriptors.front();
-    if (!first.cache || first.separateIndex) return false;
+    if (!first.cache || first.separateIndex || first.fp4) return false;
     for (int b = 0; b < count; ++b) {
         const auto &r = descriptors[b];
         if (r.cache != first.cache + b * 4 || r.keyRows != first.keyRows ||
@@ -3681,7 +3713,7 @@ void FastllmCudaNaiveReadCache(const std::vector<FastllmNaiveKVRead> &slices) {
         for (int i = 0; i < count; ++i) {
             const auto &s = slices[first + i];
             const auto &data = *s.source;
-            fastllm::AssertInFastLLM(FastllmNaiveKVType(data.dataType) &&
+            fastllm::AssertInFastLLM(FastllmNaiveAttentionKVType(data.dataType) &&
                 data.dataDevice == fastllm::DataDevice::CUDA && data.dims.size() == 3 &&
                 s.target && s.first >= 0 && s.rows > 0, "Invalid Naive KV read.");
             int outWidth = data.dims[2];
@@ -3704,10 +3736,24 @@ void FastllmCudaNaivePackIndexer(const fastllm::Data &input, fastllm::Data &outp
     PackIndexer<<<input.dims[1], 128>>>((const BF16 *)input.cudaData, (BF16 *)output.cudaData, input.dims[2]);
     CheckLaunch();
 }
+namespace {
+__global__ void PagedWriteFP4(uint8_t *pool, const int *pages, const BF16 *input,
+        int start, int count, int width, int pageLen, const int *liveKeys, int capacity) {
+    if (liveKeys) { start = *liveKeys - count; if (start < 0 || *liveKeys > capacity) return; }
+    const size_t block = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const int blocksPerRow = width / 16;
+    if (block >= (size_t)count * blocksPerRow) return;
+    const int token = block / blocksPerRow, column = (block % blocksPerRow) * 16;
+    const int row = start + token;
+    const size_t physical = pages ? (size_t)pages[row / pageLen] * pageLen + row % pageLen : row;
+    FastllmWriteFP4KVBlock(pool + physical * (blocksPerRow * 9),
+        input + (size_t)token * width + column, column, width);
+}
+}
 void FastllmCudaNaivePagedWrite(fastllm::Data &cache, const fastllm::Data &input, int start,
         const fastllm::Data *liveKeys) {
     using namespace fastllm;
-    AssertInFastLLM(FastllmNaiveKVType(cache.dataType) && input.dataType == BFLOAT16 &&
+    AssertInFastLLM(FastllmNaiveAttentionKVType(cache.dataType) && input.dataType == BFLOAT16 &&
         cache.dataDevice == DataDevice::CUDA && input.dataDevice == DataDevice::CUDA &&
         cache.dims.size() == 3 && input.dims.size() == 3 &&
         cache.kvCacheFp8Indexer == input.kvCacheFp8Indexer &&
@@ -3717,6 +3763,19 @@ void FastllmCudaNaivePagedWrite(fastllm::Data &cache, const fastllm::Data &input
             ? (int)cache.pageIndex.size() * cache.pageLen
             : (cache.expansionDims.empty() ? cache.dims[1] : cache.expansionDims[1])),
         "Invalid Naive KV append.");
+    if (cache.dataType == FP4_E2M1) {
+        AssertInFastLLM(!cache.kvCacheFp8Indexer && !input.kvCacheFp8Indexer && cache.dims[2] % 16 == 0,
+                        "FP4 DSA KV stores block16-aligned K/V with a separate Indexer cache.");
+        const size_t blocks = (size_t)input.dims[1] * (input.dims[2] / 16);
+        if (blocks) PagedWriteFP4<<<(blocks + 127) / 128, 128>>>(
+            (uint8_t *)(cache.isPagedKVCache ? cache.pagedKVCacheData->cudaData : cache.cudaData),
+            cache.isPagedKVCache ? (const int *)cache.cudaData : nullptr,
+            (const BF16 *)input.cudaData, start, input.dims[1], input.dims[2], cache.pageLen,
+            liveKeys ? (const int *)liveKeys->cudaData : nullptr,
+            cache.expansionDims.empty() ? cache.dims[1] : cache.expansionDims[1]);
+        CheckLaunch();
+        return;
+    }
     if (cache.kvCacheFp8Indexer) {
         WriteIndexerCache<<<input.dims[1], 128>>>(FastllmNaiveKV(cache), (const BF16 *)input.cudaData,
             cache.dims[2], start, liveKeys ? (const int *)liveKeys->cudaData : nullptr);
@@ -3737,6 +3796,13 @@ void FastllmCudaNaiveAppendDecodeCache(fastllm::Data &key, fastllm::Data &value,
         const fastllm::Data &newKey, const fastllm::Data &newValue,
         const fastllm::Data &liveKeys, int window, bool ring) {
     fastllm::AssertInFastLLM(!ring || window == kSwaWindow, "Invalid SWA ring window.");
+    if (key.dataType == fastllm::FP4_E2M1) {
+        fastllm::AssertInFastLLM(value.dataType == key.dataType && !window && !ring,
+                               "FP4 KV is only supported for DSA, not SWA.");
+        FastllmCudaNaivePagedWrite(key, newKey, 0, &liveKeys);
+        FastllmCudaNaivePagedWrite(value, newValue, 0, &liveKeys);
+        return;
+    }
     if (key.kvCacheFp8Indexer) {
         WriteIndexerCache<<<1, 128>>>(FastllmNaiveKV(key), (const BF16 *)newKey.cudaData,
             key.dims[2], 0, (const int *)liveKeys.cudaData, FastllmNaiveKV(value),
@@ -4233,7 +4299,7 @@ bool BulkAttention(const fastllm::Data &query, const float *bias,
     const bool fp8 = rows.front().fp8;
     bool asyncFP8 = fp8;
     for (const auto &row : rows) {
-        if (row.fp8 != fp8) return false;
+        if (row.fp8 != fp8 || row.fp4) return false;
         asyncFP8 = asyncFP8 && row.keyStride % 16 == 0;
     }
     auto kernel = fp8 ? (asyncFP8 ? bulk::Decode<Max, Ring, true> : bulk::Decode<Max, Ring, true, false>)
@@ -4266,7 +4332,8 @@ bool HopperBulkAttention(const fastllm::Data &query, const float *bias,
         const std::vector<FastllmNaiveDSARow> &rows, int heads, fastllm::Data &output) {
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900
     namespace bulk = naive_attention_bulk;
-    if (FastllmCudaRuntimeArch() != 90 ||
+    if (std::any_of(rows.begin(), rows.end(), [](const auto &r) { return r.fp4; }) ||
+        FastllmCudaRuntimeArch() != 90 ||
         !BulkKernelSupported(bulk::HopperDecode<Max>, sizeof(bulk::TmaStorage<Max>), 90)) return false;
     // Encode every row before launching anything: unsupported TMA layouts can
     // fall back without partially writing output. No H2D copy or global buffer.
@@ -4337,7 +4404,7 @@ void FastllmCudaNaiveBatchDSADecode(const fastllm::Data &query,
     bool bulk = rows.size() >= 32 && dim == 192 && valueDim == 128 &&
         (heads / kvHeads) % 8 == 0 && count > 0;
     for (const auto &row : rows)
-        bulk = bulk && row.keyStride % 8 == 0 && (uintptr_t)row.key % 16 == 0 &&
+        bulk = bulk && !row.fp4 && row.keyStride % 8 == 0 && (uintptr_t)row.key % 16 == 0 &&
             (uintptr_t)row.value % 16 == 0;
     if (bulk) {
         Output(output, BFLOAT16, {1, (int)rows.size(), heads * valueDim});

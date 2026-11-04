@@ -11,6 +11,7 @@ struct FastllmNaiveDSARow {
     const int *keyPages = nullptr, *valuePages = nullptr;
     int pageLen = 0, poolTokens = 0;
     bool fp8 = false;
+    bool fp4 = false;
 };
 
 // Two Hopper tensor maps, stored in a 128-byte-aligned device allocation.

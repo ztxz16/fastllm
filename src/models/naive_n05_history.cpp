@@ -193,7 +193,7 @@ void NaiveN05FlashModel::AppendPrefixWindowCopies(PrefixWindowCopies &copies, co
     for (int part = 0; part < 2; ++part) {
         const Data &cache = part ? value : key;
         AssertInFastLLM(cache.dataDevice == DataDevice::CUDA && !cache.isPagedKVCache &&
-            cache.dataType == kvCacheDataType && first >= 0 &&
+            cache.dataType == AuxiliaryKVType() && first >= 0 &&
             (ring || first + rows <= cache.dims[1]), "Invalid GPU prefix window.");
         const size_t rowBytes = (size_t)cache.dims[2] * cache.unitSize;
         auto *target = (uint8_t *)snapshot.pool->storage.at(rank).cudaData + base +
@@ -411,11 +411,12 @@ bool NaiveN05FlashModel::RestorePagedPrefixCacheExtra(ResponseContext *context, 
                 root.multiDeviceData = true;
                 root.dataDevice = DataDevice::CUDA;
                 root.dataDeviceIds = tpDevices;
+                root.dataType = AuxiliaryKVType(); root.UpdateUnitSize();
                 root.Resize({1, rows, sliding.kvHeads * dim});
                 root.expansionDims = {1, capacity, sliding.kvHeads * dim};
                 for (int device : tpDevices) {
                     Data *&cache = root.multiDeviceDatas[device];
-                    if (!cache) cache = new Data(kvCacheDataType);
+                    if (!cache) cache = new Data(AuxiliaryKVType());
                 }
             }
         }

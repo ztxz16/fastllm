@@ -24,6 +24,7 @@ namespace fastllm {
         ~NaiveN05FlashModel() override;
         void InitParams() override;
         void SetIndexerDataType(DataType dataType) override;
+        void SetKVCacheDataType(DataType dataType) override;
         void SetIndexerTPStorage(bool shardByLayer, bool shardByContext = false);
         std::map<std::string, std::vector<std::pair<std::string, DataType>>>
         GetTensorMap(const std::vector<std::string> &names) override;
@@ -236,6 +237,7 @@ namespace fastllm {
 
     private:
         friend struct NaiveN05PrefixCacheTestAccess;
+        friend struct NaiveN05FP4KVTestAccess;
         // Only request lifecycle callbacks (serialized by dictLocker) own this
         // single idle allocation set. No token contents are reused.
         std::vector<std::pair<Data, Data>> tpIdleCache;
@@ -248,7 +250,10 @@ namespace fastllm {
         void AttachSparseKv(const std::vector<std::pair<Data *, Data *>> &roots);
         Data SparseIndexer(int layer, int rank, const Data &key) const;
         void StageSparseKv(int rank, int layer, const Data &key, const Data &value, Data &outKey, Data &outValue);
-        int PackedIndexerWidth() const { return sparseKv ? 0 : IndexerCacheWidth(kvCacheDataType); }
+        // FP4 is limited to DSA K/V. SWA and the independent Indexer retain FP8.
+        DataType AuxiliaryKVType() const { return kvCacheDataType == FP4_E2M1 ? FP8_E4M3 : kvCacheDataType; }
+        DataType LayerKVType(int layer) const { return slidingLayers[layer] ? AuxiliaryKVType() : kvCacheDataType; }
+        int PackedIndexerWidth() const { return sparseKv ? 0 : IndexerCacheWidth(AuxiliaryKVType()); }
         bool InitTensorParallel();
         void PrepareTensorParallel();
         void InitTensorParallelKVPool();
@@ -343,7 +348,7 @@ namespace fastllm {
             return fp8IndexerCache ? 144 / (type == FP8_E4M3 ? 1 : 2) : indexDim;
         }
         int LocalIndexerCacheWidth(int layer, int rank) const {
-            return !sparseKv && HasLocalIndexer(layer, rank) ? IndexerCacheWidth(kvCacheDataType) : 0;
+            return !sparseKv && HasLocalIndexer(layer, rank) ? IndexerCacheWidth(AuxiliaryKVType()) : 0;
         }
         std::vector<std::vector<Data *>> moeWeights, moeBiases;
     };

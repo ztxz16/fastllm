@@ -6,6 +6,12 @@ inline bool FastllmNaiveKVType(fastllm::DataType type) {
     return type == fastllm::BFLOAT16 || type == fastllm::FP8_E4M3;
 }
 
+// Attention K/V can additionally use row-packed FP4. Indexer/SWA callers
+// deliberately keep using FastllmNaiveKVType.
+inline bool FastllmNaiveAttentionKVType(fastllm::DataType type) {
+    return FastllmNaiveKVType(type) || type == fastllm::FP4_E2M1;
+}
+
 // Match the full-vocabulary CUDA Top1's 256-lane reduction order on ties.
 // Global IDs are essential: shards need not start at a multiple of 256.
 #ifdef __CUDACC__
