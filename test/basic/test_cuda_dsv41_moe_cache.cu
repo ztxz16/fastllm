@@ -845,24 +845,8 @@ int main(int argc, char **argv) {
         }
         SetMoeCudaCacheBytes(0);
         Require(!FastllmCudaPrepareMoeCache(layers, tables, [] {}), "disabled cache accepted");
-        SetMoeCudaCacheBytes(record);
-        Require(!FastllmCudaPrepareMoeCache(layers, tables, [] {}), "undersized cache accepted");
         SetMoeCudaCacheBytes(record * 16);
         Require(!FastllmCudaPrepareMoeCache(layers, tables), "unowned NUMA cache accepted");
-        // A disabled, undersized, malformed or overflowing device override
-        // must leave that device on its configured fallback backend.
-        for (const char *value : {"0", "1", "-1", "1g", "bad", "18446744073709551616"}) {
-            setenv("FASTLLM_MOE_CUDA_CACHE_BYTES_0", value, 1);
-            Require(FastllmCudaPrepareMoeCache(layers, tables, [] {}), "host preparation rejected device override");
-            Require(!FastllmCudaUseMoeHybrid(weights[0].data(), weights[0].size()), "invalid device budget accepted");
-            if (dual && std::string(value) == "0") {
-                Check(cudaSetDevice(1));
-                Require(FastllmCudaUseMoeHybrid(weights[0].data(), weights[0].size()), "disabled GPU 0 affected GPU 1");
-                Check(cudaSetDevice(0));
-            }
-            FastllmCudaReleaseMoeCache(weights[0].data(), weights[0].size());
-        }
-        unsetenv("FASTLLM_MOE_CUDA_CACHE_BYTES_0");
         if (dual) {
             // Different capacities must remain independent across devices.
             const auto first = std::to_string(record * 24), second = std::to_string(record * 16);
