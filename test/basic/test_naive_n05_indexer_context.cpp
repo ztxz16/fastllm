@@ -107,9 +107,15 @@ static void ContextCase(int capacity, int page, int ranks, int batch, int kind, 
     }
     std::vector<FastllmNaiveDecodeScratch> refScratch(baseBatch);
     std::vector<Data> refIndices(baseBatch), result(batch);
+    // Distinct descriptors keep the reference on the original independent
+    // query path even when the tested CP rows share the same historical K.
+    std::vector<Data> refKeys(baseBatch);
     std::vector<FastllmNaiveIndexerRow> refRows;
-    for (int i = 0; i < baseBatch; i++)
-        refRows.push_back({scoreReference, &refScratch[i], &refIndices[i], i, capacity, nullptr});
+    for (int i = 0; i < baseBatch; i++) {
+        refKeys[i].Resize(scoreReference->dims);
+        refKeys[i].FakeFrom(*scoreReference, 0);
+        refRows.push_back({&refKeys[i], &refScratch[i], &refIndices[i], i, capacity, nullptr});
+    }
     std::vector<std::vector<FastllmNaiveDecodeScratch>> scratch(ranks);
     std::vector<std::vector<Data>> localIndices(ranks);
     std::vector<std::vector<FastllmNaiveIndexerRow>> localRows(ranks);
@@ -375,6 +381,10 @@ int main() {
         for (int batch : {1, 4, 128, 512, 1536, 3072})
             ContextCase(8193, 128, 4, batch, 1, batch == 128, true, 4);
         ContextCase(200000, 128, 4, 4, 2, false, true, 4);
+        // Large verification batches span differently sized descriptor chunks;
+        // check exact score bits and CP exchange offsets after query grouping.
+        ContextCase(77825, 128, 4, 1280, 1, false, true, 4);
+        ContextCase(65537, 128, 4, 239, 2, false, true, 6);
         for (int ranks : {2, 4, 8})
             for (DataType type : {BFLOAT16, FP8_E4M3})
                 for (bool scaled : {false, true})

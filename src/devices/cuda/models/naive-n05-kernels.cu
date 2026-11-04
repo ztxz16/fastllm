@@ -4607,6 +4607,7 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
         (cp && (!exchange || exchange->dataType != INT32 ||
          exchange->Count(0) < (size_t)contextRanks * rows.size() * naive_topk::kTopK * 2))) return false;
     std::vector<batch::Batch> packedBatches;
+    std::vector<int> packedStarts;
     if (cp) packedBatches.reserve((rows.size() + batch::BatchLimit - 1) / batch::BatchLimit);
     bool hopper = FastllmCudaRuntimeArch() == 90;
     const auto cacheType = rows.front().key ? rows.front().key->dataType : BFLOAT16;
@@ -4753,8 +4754,32 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
     }
     for (int first = 0; first < (int)rows.size();) {
         const bool pairChunk = first < pairedRows;
-        const int count = std::min(pairChunk ? (batch::BatchLimit / 2) * 2 : batch::BatchLimit,
+        int count = std::min(pairChunk ? (batch::BatchLimit / 2) * 2 : batch::BatchLimit,
             (pairChunk ? pairedRows : (int)rows.size()) - first);
+        int sharedQueries = 1;
+#if CUDART_VERSION >= 12040
+        // Reuse one K tile across adjacent verification queries. Keep row
+        // order intact for CP exchange; ragged groups and other layouts fall
+        // back to the single-query kernel. Paged CP has a common local origin;
+        // contiguous CP can change Begin() with each device length.
+        if (!compactScores && hopper && cacheType == FP8_E4M3 && rows.size() >= 16 &&
+                (!cp || contextPageLen) && rowOrder.empty()) {
+            for (int queries : {4, 2}) {
+                const int aligned = count / queries * queries;
+                bool compatible = aligned > 0;
+                for (int i = 0; compatible && i < aligned; ++i) {
+                    const auto &a = rows[first + i], &b = rows[first + i / queries * queries];
+                    compatible = a.key == b.key && a.cache == b.cache && a.capacity == b.capacity;
+                }
+                auto kernel = queries == 4 ? batch::HopperScoresSharedHead<4> : batch::HopperScoresSharedHead<2>;
+                if (compatible && BulkKernelSupported(kernel, 0, 90)) {
+                    sharedQueries = queries;
+                    count = aligned;
+                    break;
+                }
+            }
+        }
+#endif
         batch::Batch descriptors{};
         int capacity = 0;
         for (int i = 0; i < count; ++i) {
@@ -4772,9 +4797,9 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
             auto pairedKernel = batch::HopperScores<false, false, 2>;
             bool paired = pairChunk && count >= 16;
             paired = paired && BulkKernelSupported(pairedKernel, 0, 90);
-            const int scoreBlocks = DecodeIndexerScoreBlocks(paired ? count / 2 : count,
+            const int scoreBlocks = DecodeIndexerScoreBlocks(paired ? count / 2 : count / sharedQueries,
                 (capacity + naive_dsa_mma::kKeys - 1) / naive_dsa_mma::kKeys, hopper && fp8Keys && CUDART_VERSION >= 12040 ? 64 : 32);
-            const dim3 grid(scoreBlocks, paired ? count / 2 : count);
+            const dim3 grid(scoreBlocks, paired ? count / 2 : count / sharedQueries);
             if (paired) {
                 pairedKernel<<<grid, 128>>>((const BF16 *)weights.cudaData, descriptors);
             } else
@@ -4782,8 +4807,10 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
             // Check the compiled PTX image as well as the runtime GPU: an SM80
             // image JITed on Hopper must retain the original compatible path.
             if (hopper && cacheType == FP8_E4M3 && rows.size() >= 16 &&
-                BulkKernelSupported(batch::HopperScoresSharedHead, 0, 90)) {
-                batch::HopperScoresSharedHead<<<grid, 128>>>((const BF16 *)weights.cudaData, descriptors);
+                BulkKernelSupported(batch::HopperScoresSharedHead<>, 0, 90)) {
+                auto kernel = sharedQueries == 4 ? batch::HopperScoresSharedHead<4> :
+                    sharedQueries == 2 ? batch::HopperScoresSharedHead<2> : batch::HopperScoresSharedHead<>;
+                kernel<<<grid, 128>>>((const BF16 *)weights.cudaData, descriptors);
             } else
     #endif
             if (hopper) {
@@ -4854,14 +4881,17 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
             batch::Sort<><<<count, naive_topk::kThreads>>>(descriptors);
             if (cp) batch::PackLocal<<<count, naive_topk::kThreads>>>(descriptors);
         }
-        if (cp) packedBatches.push_back(descriptors);
+        if (cp) {
+            packedBatches.push_back(descriptors);
+            packedStarts.push_back(first);
+        }
         first += count;
     }
     // Scores may alias the exchange arena. Finish packing every row before
     // any copy can overwrite another row's score slice (CUDA 12.0 batches).
     if (cp) for (int b = 0; b < (int)packedBatches.size(); ++b) {
-        int first = b * batch::BatchLimit;
-        int count = std::min(batch::BatchLimit, (int)rows.size() - first);
+        const int first = packedStarts[b];
+        const int count = (b + 1 < (int)packedStarts.size() ? packedStarts[b + 1] : (int)rows.size()) - first;
         batch::CopyPacked<<<count, naive_topk::kThreads>>>(packedBatches[b],
             (unsigned *)exchange->cudaData, rows.size(), first);
     }
