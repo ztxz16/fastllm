@@ -17,6 +17,7 @@ static constexpr float inf = __builtin_inff();
 namespace {
 using namespace fastllm_ep8_deep_gemm;
 constexpr int H = 4096, I = 2048, E = 256, K = 8, CAP = 128;
+constexpr int BATCH_CAP = 512;
 constexpr int BM = 32, BN = 256, BK = 128, STAGES = 4, SMS = 78;
 constexpr int PREFILL_BM = 64;
 constexpr int PREFILL_FIRST_CAP = 128;
@@ -142,14 +143,19 @@ struct Layer : LayerBase {
     int device, rank;
     std::array<int64_t, R> peers;
     Scratch scratch;
+    Scratch batch;
     Scratch prefill;
     void *prefillBase = nullptr;
     int prefillCapacity = 0;
     Metadata prefillMetadata;
 };
-static size_t WorkspaceBytes() {
+static size_t BatchOffset() {
     Scratch s{};
     return s.slice(nullptr);
+}
+static size_t WorkspaceBytes() {
+    Scratch s{};
+    return BatchOffset() + s.slice(nullptr, BATCH_CAP);
 }
 static size_t PrefillWorkspaceBytes(int inputRows) {
     Scratch s{};
@@ -211,6 +217,14 @@ static void *Create(const void *const *gate, const void *const *down,
         activationDescriptors(s, CAP);
         check(cudaMemcpy(s.metadata, &metadata, sizeof(Metadata), cudaMemcpyHostToDevice));
         check(cudaFuncSetAttribute(kernel(), cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM));
+        // Both bounded decode arenas are allocated before KV budgeting. Their
+        // addresses and descriptors remain stable across batch changes/Graphs.
+        auto &batch = layer->batch;
+        batch.slice(static_cast<char *>(workspace) + BatchOffset(), BATCH_CAP);
+        batch.metadata += slot;
+        activationDescriptors(batch, BATCH_CAP);
+        check(cudaMemcpy(batch.metadata, &metadata, sizeof(Metadata), cudaMemcpyHostToDevice));
+        check(cudaFuncSetAttribute(kernel<BATCH_CAP>(), cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM));
         layer->prefillMetadata = metadata;
         for (int e = 0; e < LOCAL_E; ++e)
             descriptor(layer->prefillMetadata.down[e], CU_TENSOR_MAP_DATA_TYPE_UINT8,
@@ -263,7 +277,7 @@ static int Run(void *handle, const void *x, void *y, const int32_t *idx,
             if (!handle || !x || !y || !idx || !scores || rows < 0 || rows > capacity)
             throw std::runtime_error("MegaMoE requires valid pointers and 0..capacity rows");
         auto &l = *static_cast<Layer *>(handle);
-        auto &s = Prefill ? l.prefill : l.scratch;
+        auto &s = Prefill ? l.prefill : (capacity == BATCH_CAP ? l.batch : l.scratch);
         int device;
         check(cudaGetDevice(&device));
         if (device != l.device)
@@ -273,6 +287,8 @@ static int Run(void *handle, const void *x, void *y, const int32_t *idx,
         // Zero-token ranks still dispatch a fully masked table and participate
         // in expert computation/barriers. Their combine writes no output rows.
         std::array<int64_t, R> addresses = l.peers;
+        if constexpr (!Prefill && capacity == BATCH_CAP)
+            for (auto &address : addresses) address += BatchOffset();
         if constexpr (Prefill) {
             if (!peers || !l.prefillBase || l.prefillCapacity != capacity ||
                 peers[l.rank] != l.prefillBase)
@@ -346,6 +362,11 @@ extern "C" int fastllm_ep8_mega_moe_supported() {
 // at creation; all subsequent launches use the immutable handle specialization.
 extern "C" const char *fastllm_ep8_mega_moe_error() { return error.c_str(); }
 extern "C" int fastllm_ep8_mega_moe_max_rows() { return CAP; }
+extern "C" int fastllm_ep8_mega_moe_decode_capacity(int inputRows, int ranks) {
+    // Select from the common shape, never rank-local rows: all peers must
+    // enter the same arena, including idle/uneven source ranks.
+    return (ranks == 4 || ranks == 8) && inputRows > ranks * CAP ? BATCH_CAP : CAP;
+}
 extern "C" size_t fastllm_ep8_mega_moe_workspace_bytes(int ranks) {
     return ranks == 4 ? Mega<4>::WorkspaceBytes() : ranks == 8 ? Mega<8>::WorkspaceBytes() : 0;
 }
@@ -379,6 +400,14 @@ extern "C" int fastllm_ep8_mega_moe_run_masked(void *handle, const void *x, void
 extern "C" int fastllm_ep8_mega_moe_run(void *handle, const void *x, void *y,
         const int32_t *idx, const float *scores, int rows) {
     return fastllm_ep8_mega_moe_run_masked(handle, x, y, idx, scores, rows, nullptr);
+}
+extern "C" int fastllm_ep8_mega_moe_run_batched(void *handle, const void *x, void *y,
+        const int32_t *idx, const float *scores, int rows, int capacity, const int *liveKeys) {
+    if (capacity == CAP)
+        return fastllm_ep8_mega_moe_run_masked(handle, x, y, idx, scores, rows, liveKeys);
+    if (!handle || capacity != BATCH_CAP) { error = "Invalid MegaMoE decode capacity"; return 0; }
+    return static_cast<LayerBase *>(handle)->ranks == 4 ? Mega<4>::Run<BATCH_CAP>(handle, x, y, idx, scores, rows, nullptr, liveKeys)
+                                                      : Mega<8>::Run<BATCH_CAP>(handle, x, y, idx, scores, rows, nullptr, liveKeys);
 }
 extern "C" int fastllm_ep8_mega_moe_run_prefill(void *handle, const void *const *peers,
         const void *x, void *y, const int32_t *idx, const float *scores, int rows) {

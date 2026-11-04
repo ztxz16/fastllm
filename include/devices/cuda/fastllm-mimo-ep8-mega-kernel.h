@@ -16,6 +16,10 @@ void *fastllm_ep8_mega_moe_create(const void *const *, const void *const *,
 int fastllm_ep8_mega_moe_run(void *, const void *, void *, const int32_t *, const float *, int);
 // Zero device lengths mask padded rows inside the existing pre-dispatch kernel.
 int fastllm_ep8_mega_moe_run_masked(void *, const void *, void *, const int32_t *, const float *, int, const int *);
+// The common global row count selects a bounded decode arena. Every peer
+// must pass the same capacity, even when its local input has zero rows.
+int fastllm_ep8_mega_moe_decode_capacity(int inputRows, int ranks);
+int fastllm_ep8_mega_moe_run_batched(void *, const void *, void *, const int32_t *, const float *, int, int capacity, const int *);
 // Eager prefill may borrow dead activations instead of allocating a larger
 // arena. Prepare enqueues local initialization; the caller must record its
 // completion event and make all peer streams wait before Run. Keep every
