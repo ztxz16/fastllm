@@ -283,11 +283,14 @@ class Fixture : public NaiveN05FlashModel {
     bool failDecodeAllocation = false;
     bool inspectDraftPrefix = false;
     int batchedPrefills = 0;
+    std::atomic<int> largestDecodeBatch{0};
     std::vector<int> ForwardBatch(int batch, const Data &ids, const std::vector<Data *> &masks,
             const std::vector<Data *> &positions, const std::vector<int> &lengths,
             std::vector<std::pair<Data *, Data *>> &kv, const std::vector<GenerationConfig> &configs,
             const LastTokensManager &tokens = LastTokensManager(), std::vector<std::vector<float> *> *logits = nullptr) override {
         batchedPrefills += batch > 1 && std::any_of(lengths.begin(), lengths.end(), [](int n) { return n > 1; });
+        if (std::all_of(lengths.begin(), lengths.end(), [](int n) { return n == 1; }))
+            largestDecodeBatch = std::max(largestDecodeBatch.load(), batch);
         return NaiveN05FlashModel::ForwardBatch(batch, ids, masks, positions, lengths, kv, configs, tokens, logits);
     }
     std::vector<float> observedDraft;
@@ -714,19 +717,24 @@ class Fixture : public NaiveN05FlashModel {
     bool UseModelSpecificScheduler() const override { return !useRealScheduler; }
     void RunModelSpecificScheduler() override {}
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
-    void SparsePoolServingChecks() {
+    void SharedPoolServingChecks(bool kvmem = true, bool batchPrefill = true) {
         maxBatch = 8; SetMaxTokens(7937); SetChunkedPrefillSize(128);
         KvMemConfig cfg; cfg.enabled = true; cfg.maxTokens = 7937;
         cfg.residentTokens = 2048; cfg.prefillTokens = 128; cfg.hostBytes = 1ULL << 30;
-        bool rejected = false;
-        try { ConfigureKvMem(cfg); } catch (const std::invalid_argument &) { rejected = true; }
-        if (!rejected) throw std::runtime_error("pool smaller than one rounded request was accepted");
+        if (kvmem) {
+            bool rejected = false;
+            try { ConfigureKvMem(cfg); } catch (const std::invalid_argument &) { rejected = true; }
+            if (!rejected) throw std::runtime_error("pool smaller than one rounded request was accepted");
+        }
         SetMaxTokens(8193); // The physical pool rounds down to complete pages.
-        ConfigureKvMem(cfg); WarmUp();
-        if (tokensLimit != 8192 || GetPagedKVCacheManager(0, true)->maxPages != 64)
+        if (kvmem) ConfigureKvMem(cfg);
+        else max_positions = cfg.maxTokens;
+        WarmUp();
+        if (kvmem && (tokensLimit != 8192 || GetPagedKVCacheManager(0, true)->maxPages != 64))
             throw std::runtime_error("independent pool allocation mismatch");
+        if (!SupportsSharedPagedKVPool()) throw std::runtime_error("physical pool budget disabled");
         useRealScheduler = true; eos_token_id = -1; eos_token_ids.clear();
-        SetPrefillBatching(8192, 20);
+        if (batchPrefill) SetPrefillBatching(8192, 20);
         const int captures = verifyGraphCaptures;
         auto run = [&](const std::vector<std::vector<int>> &prompts, int count,
                        std::vector<std::vector<int>> *sampled = nullptr) {
@@ -759,10 +767,13 @@ class Fixture : public NaiveN05FlashModel {
         std::vector<std::vector<int>> forks(8, prefix);
         for (int i = 0; i < 8; ++i) forks[i].push_back(240 + i);
         const int hits = pagedRestores;
+        largestDecodeBatch = 0;
         std::vector<std::vector<int>> sharedTokens;
         const auto shared = run(forks, 132, &sharedTokens); // Nearly fills the physical pool.
         if (pagedRestores - hits != 8)
             throw std::runtime_error("physical pool double-counted shared prefixes");
+        if (largestDecodeBatch.load() != 8)
+            throw std::runtime_error("shared prefixes did not decode as a full batch");
         // Larger suffixes require queuing even though all eight prefixes hit.
         // Rejected candidates must release references and restore them later.
         std::vector<std::vector<int>> queuedTokens;
@@ -801,7 +812,7 @@ class Fixture : public NaiveN05FlashModel {
             throw std::runtime_error("shared pool exceeded the per-request context limit");
         if (verifyGraphCaptures != captures) throw std::runtime_error("shared pool recaptured graphs");
         ShutdownRuntime();
-        std::cout << "KVMEM POOL PASS max_relative=" << largestLogitRelative
+        std::cout << (kvmem ? "KVMEM POOL PASS max_relative=" : "GPU POOL PASS max_relative=") << largestLogitRelative
                   << " max_abs=" << largestLogitAbsolute << std::endl;
     }
 #endif
@@ -3492,12 +3503,15 @@ int main(int argc, char **argv) {
             if (argc > 3 && std::string(argv[3]) == "fp8") fixture.SetKVCacheDataType(FP8_E4M3);
             fixture.DraftPrefixChecks(true); unsetenv("FASTLLM_DSPARK_TP"); return 0;
         }
-        if (argc > 2 && std::string(argv[2]) == "kvmem_pool") {
+        if (argc > 2 && (std::string(argv[2]) == "kvmem_pool" || std::string(argv[2]) == "gpu_pool")) {
             SetCudaEmbedding(true); SetCudaGraph(true);
             Fixture fixture(ranks, false, true, true, true);
-            fixture.SetIndexerTPStorage(true);
+            const bool context = argc > 4 && std::string(argv[4]) == "context_shard";
+            fixture.SetIndexerTPStorage(!context, context);
+            if (context) fixture.SetIndexerDataType(FP8_E4M3);
             if (argc > 3 && std::string(argv[3]) == "fp8") fixture.SetKVCacheDataType(FP8_E4M3);
-            fixture.SparsePoolServingChecks();
+            fixture.SharedPoolServingChecks(std::string(argv[2]) == "kvmem_pool",
+                argc <= 5 || std::string(argv[5]) != "single_prefill");
             return 0;
         }
         if (argc > 2 && (std::string(argv[2]) == "kvmem" || std::string(argv[2]) == "gpu_context")) {

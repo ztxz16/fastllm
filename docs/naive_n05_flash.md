@@ -42,6 +42,9 @@ FASTLLM_CUDA_GRAPH=1 ftllm server /path/to/MiMo-V2-DSA \
 的请求窗口。GPU 前缀缓存共享全局页引用，并在预算内保存滑窗快照，不使用 CPU
 KV 历史缓存。页表和滑窗按分配大小使用独立的池，避免请求结束、恢复及冷启动的
 分配顺序不同造成碎片。运行期间不为这些 KV 调用 `cudaMalloc`。
+纯显存与 KVMem 的共享页池均按实际物理页准入，并预留请求剩余输出所需的页；
+多个请求共享的前缀只计一次。因此活跃请求的逻辑长度之和可以超过物理 token 池，
+互不共享的输入仍受实际容量限制。余量不足时排队，前缀命中本身不会绕过输出预算。
 `--indexer_tp_storage context_shard` 可同时用于纯显存 KV 和 KVMem：每个 TP rank
 只保存各逻辑页中的一段 Indexer K，独立存储复用主 K 的页号、前缀引用和写时复制。
 纯显存路径中的默认 `replicated` 与 `layer_shard` 仍将本卡的 Indexer K 和主 K 存在同一页中。

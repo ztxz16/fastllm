@@ -2999,7 +2999,7 @@ namespace fastllm {
                     const bool batchPrefill = maxBatch > 1 && model->SupportsPrefillBatching() &&
                                               model->prefillBatchPolicy.targetTokens > 0;
                     const bool fixedKvSlots = model->kvMemConfig.enabled && model->SupportsKvMemBatch();
-                    const bool sharedKvPool = fixedKvSlots && model->SupportsKvMemPrefixCache();
+                    const bool sharedKvPool = model->SupportsSharedPagedKVPool();
                     const int maxPromptTokens = model->max_positions - (sharedKvPool ? 1 : 0);
                     const int prefillChunk = model->GetChunkedPrefillSize();
                     const int prefillBatchLimit = model->GetBatchedPrefillTokenLimit();
@@ -3082,7 +3082,7 @@ namespace fastllm {
                             }
                         }
                         auto reservePagedAppend = [&](const Data &cache, int append) {
-                            // Shared KVMem reserves growth through the requested
+                            // Shared KV pools reserve growth through the requested
                             // output limit at admission, using physical pages.
                             if (sharedKvPool) return true;
                             const long long length = cache.dims.size() > 1 ? cache.dims[1] : 0;
@@ -3339,7 +3339,7 @@ namespace fastllm {
                                 // A lone request can still make progress and the decode path
                                 // below will stop it when no more KV space is available.
                                 if (isPrompt && currentActivate > 0 &&
-                                    !fixedKvSlots &&
+                                    !fixedKvSlots && !sharedKvPool &&
                                     lenSum + it.second->currentTokens.size() +
                                         (currentActivate + 1) * 256 > maxTotalLens) {
                                     continue;
@@ -3481,11 +3481,11 @@ namespace fastllm {
                                     // break;
                                 }
 
-                                // Fixed-slot KV already reserves every request's full
-                                // context. Charging another decode reserve here would
-                                // serialize a completely occupied batch.
+                                // Fixed slots and shared physical pools already reserve
+                                // decode growth. A logical-length sum would double-count
+                                // shared prefixes and serialize a fully admitted batch.
                                 if (seqLens.size() >= maxBatch ||
-                                    (!fixedKvSlots && lenSum + seqLens.size() * 128 > limit)) {
+                                    (!fixedKvSlots && !sharedKvPool && lenSum + seqLens.size() * 128 > limit)) {
                                     break;
                                 }
                             }

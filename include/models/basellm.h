@@ -490,6 +490,11 @@ namespace fastllm {
         virtual bool SupportsKvMem() const { return false; }
         virtual bool SupportsKvMemBatch() const { return false; }
         virtual bool SupportsKvMemPrefixCache() const { return false; }
+        // Reserve remaining output against physical pages, counting a shared
+        // prefix once. Models without a shared pool keep their existing budget.
+        virtual bool SupportsSharedPagedKVPool() const {
+            return kvMemConfig.enabled && SupportsKvMemBatch() && SupportsKvMemPrefixCache();
+        }
         virtual bool KvMemLayerEligible(int layer) const { return GetKVCacheRetainedTokens(layer) < 0; }
         // Models provide the actual per-layer KV geometry; derived models may
         // shadow legacy head-count fields on basellm.

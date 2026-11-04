@@ -74,6 +74,7 @@ namespace fastllm {
         bool SupportsKvMem() const override { return true; }
         bool SupportsKvMemBatch() const override { return true; }
         bool SupportsKvMemPrefixCache() const override { return true; }
+        bool SupportsSharedPagedKVPool() const override { return !tpPagedCaches.empty(); }
         int Ep8ExpertDevice(int expert, const std::vector<int> &loadDevices) const {
             AssertInFastLLM(tpEp8Mega && loadDevices == tpDevices && expert >= 0 && expert < 256,
                            "MiMo EP8 expert loading must use the same ordered devices as TP.");

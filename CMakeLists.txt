@@ -2446,6 +2446,20 @@ if (UNIT_TEST)
                 PROPERTIES LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 300
                 PASS_REGULAR_EXPRESSION "SERVING GRAPH PASS")
             add_test(NAME naive_n05_kvmem_pool COMMAND naive_n05_verify_graph_test 4 kvmem_pool fp8)
+            foreach(NAIVE_GPU_POOL_KV bf16 fp8)
+                add_test(NAME naive_n05_gpu_shared_pool_${NAIVE_GPU_POOL_KV}
+                    COMMAND naive_n05_verify_graph_test 4 gpu_pool ${NAIVE_GPU_POOL_KV} context_shard)
+                set_tests_properties(naive_n05_gpu_shared_pool_${NAIVE_GPU_POOL_KV} PROPERTIES
+                    LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 600
+                    PASS_REGULAR_EXPRESSION "GPU POOL PASS")
+            endforeach()
+            add_test(NAME naive_n05_gpu_shared_pool_single_prefill
+                COMMAND naive_n05_verify_graph_test 4 gpu_pool fp8 context_shard single_prefill)
+            add_test(NAME naive_n05_gpu_shared_pool_layer_shard
+                COMMAND naive_n05_verify_graph_test 4 gpu_pool fp8 layer_shard)
+            set_tests_properties(naive_n05_gpu_shared_pool_single_prefill naive_n05_gpu_shared_pool_layer_shard
+                PROPERTIES LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 600
+                PASS_REGULAR_EXPRESSION "GPU POOL PASS")
             set_tests_properties(naive_n05_kvmem_pool
                 PROPERTIES LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 300
                 PASS_REGULAR_EXPRESSION "KVMEM POOL PASS")
