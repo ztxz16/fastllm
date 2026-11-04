@@ -139,11 +139,11 @@ static void PointerBindingTest() {
     std::puts("PASS graph pointer binding, implicit selection and request reorder");
 }
 
-static void QueryUnionTest(int queries, bool paged, int ownersCount = 4) {
+static void QueryUnionTest(int queries, bool paged, int ownersCount = 4, int selectedCount = 17) {
     KvMemSparseConfig c;
     c.maxRequests = ownersCount; c.maxQueries = queries; c.maxBatch = ownersCount * queries;
     c.maxTokens = 512; c.pageLen = paged ? 64 : 0;
-    c.maxSelected = 17; c.residentTokens = queries * c.maxSelected;
+    c.maxSelected = selectedCount; c.residentTokens = queries * c.maxSelected;
     c.keyRowBytes = 192; c.valueRowBytes = 7;
     KvMemSparseCache cache(c); Stream stream; Fill(cache, c);
     if (paged) for (int owner = 0; owner < c.maxRequests; ++owner) {
@@ -230,7 +230,7 @@ static void QueryUnionTest(int queries, bool paged, int ownersCount = 4) {
             owners[row] = owner; live[row] = c.maxTokens;
             pointers[row] = paged ? cache.KeyPages(owner) : cache.DeviceHostKey(owner);
             for (int k = 0; k < c.maxSelected; ++k)
-                selected[size_t(row) * c.maxSelected + k] = phase * 200 + row % queries * c.maxSelected + k;
+                selected[size_t(row) * c.maxSelected + k] = phase * c.residentTokens + row % queries * c.maxSelected + k;
         }
         bindings.Put(pointers); lengths.Put(live); indices.Put(selected);
         graph.Run(stream.s); stream.Sync(); Verify(cache, c, owners, live, selected, counts);
@@ -621,6 +621,8 @@ int main(int argc, char **argv) {
         for (int queries : {1, 2, 3, 6, 8}) for (bool paged : {false, true}) QueryUnionTest(queries, paged);
         // Cross kernel argument groups and exercise the large-batch refill path.
         for (bool paged : {false, true}) QueryUnionTest(6, paged, 128);
+        // Multiple refill CTAs must preserve grouped ownership and byte tails.
+        for (bool paged : {false, true}) QueryUnionTest(4, paged, 160, 64);
         PagedSharingTest();
         PagedSharingTest(512); // Two 320-token histories share a smaller physical pool.
         PackedAppendTest();
@@ -628,6 +630,7 @@ int main(int argc, char **argv) {
         StorageTest(3, 4, 4099, 33, 65, 385, 259);
         StorageTest(1, 1, 200003, 2048, 4096, 384, 256);
         StorageTest(32, 32, 4099, 257, 512, 192, 128);
+        StorageTest(160, 160, 4099, 257, 512, 192, 128);
         StorageTest(220, 224, 4099, 64, 128, 64, 32);
 #if CUDART_VERSION >= 12000
         for (bool fp8 : {false, true}) {

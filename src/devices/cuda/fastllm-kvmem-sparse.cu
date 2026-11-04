@@ -445,8 +445,10 @@ void LaunchResolve(Storage s, const int *requests, const int *lengths, const int
     Check(cudaGetLastError());
     const int selectedCapacity = s.cfg.maxSelected * (Grouped ? s.cfg.maxQueries : 1);
     if (wideRefill && groups >= 64 && selectedCapacity >= 256) {
+        // Keep two independent CTAs per owner in large batches. The strided
+        // copy partitions each miss queue without extra storage or transfers.
         const int blocks = std::min({128, (selectedCapacity - 1) / 32 + 1,
-                                    (multiprocessors * 2 + groups - 1) / groups});
+                                    std::max(2, (multiprocessors * 2 + groups - 1) / groups)});
         Refill<1024, Grouped><<<dim3(blocks, groups), 1024, 0, stream>>>(s, requests);
     } else {
         const int blocks = std::min({128, (selectedCapacity - 1) / 8 + 1,
