@@ -143,20 +143,15 @@ template <int Max, bool FP8 = false> struct Storage : PackedStorage<FP8> {
 };
 // Do not emit large-argument Tensor Core kernels for unsupported architectures.
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
-template <int Max, bool Ring, bool FP8, bool AsyncFP8 = true, class BatchType = Batch>
-__global__ __launch_bounds__(256) void Decode(const BF *q,
-#if CUDART_VERSION >= 12010
-        const __grid_constant__
-#endif
-        BatchType batch, const float *sink, BF *out,
-                                              int heads, int kvHeads) {
+template <int Max, bool Ring, bool FP8, bool AsyncFP8 = true>
+__device__ __forceinline__ void DecodeRow(const BF *q, FastllmNaiveDSARow r,
+        const float *sink, BF *out, int heads, int kvHeads, int row, int group) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     using namespace naive_dsa_decode;
     extern __shared__ __align__(16) char buffer[];
     auto &s = *(Storage<Max, FP8 && AsyncFP8> *)buffer;
-    const int row = blockIdx.x, group = blockIdx.y, head = group * 8, t = threadIdx.x, l = t % 32,
+    const int head = group * 8, t = threadIdx.x, l = t % 32,
               w = t / 32, kh = head / (heads / kvHeads);
-    auto r = FastllmNaiveResolveDSARow(BatchRow(batch, row));
     if (ZeroInactive(r, out + ((size_t)row * heads + head) * 128, 8 * 128)) return;
     r.fp8 = FP8;
     int len = Ring ? (r.liveKeys ? *r.liveKeys : r.length) : Length(r);
@@ -262,6 +257,15 @@ __global__ __launch_bounds__(256) void Decode(const BF *q,
             (i / 2) * 8] = __float2bfloat16(acc[i]);
 
 #endif
+}
+template <int Max, bool Ring, bool FP8, bool AsyncFP8 = true, class BatchType = Batch>
+__global__ __launch_bounds__(256) void Decode(const BF *q,
+#if CUDART_VERSION >= 12010
+        const __grid_constant__
+#endif
+        BatchType batch, const float *sink, BF *out, int heads, int kvHeads) {
+    DecodeRow<Max, Ring, FP8, AsyncFP8>(q, FastllmNaiveResolveDSARow(BatchRow(batch, blockIdx.x)),
+                                      sink, out, heads, kvHeads, blockIdx.x, blockIdx.y);
 }
 #endif
 } // namespace naive_attention_bulk

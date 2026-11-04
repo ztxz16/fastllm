@@ -5243,6 +5243,46 @@ bool CompactAttentionSupported(const std::vector<FastllmNaiveDSARow> &rows) {
 }
 #endif
 
+bool VerifySwaQueryReuse(const fastllm::Data &query, const float *bias,
+        const std::vector<FastllmNaiveDSARow> &rows, int heads, int kvHeads, fastllm::Data &output) {
+    namespace swa = naive_prefill_mma;
+    if (rows.empty() || rows.front().verifyOffset < 0) return false;
+    const bool fp8 = rows.front().fp8;
+    auto kernel = fp8 ? swa::SwaVerifyQueries<4, true> : swa::SwaVerifyQueries<4, false>;
+    const size_t shared = std::max(sizeof(swa::SwaQueryStorage<4>),
+        fp8 ? sizeof(naive_attention_bulk::Storage<128, true>) : sizeof(naive_attention_bulk::Storage<128>));
+    if (!BulkKernelSupported(kernel, shared, 80)) return false;
+    std::vector<swa::SwaVerifyGroup> groups;
+    groups.reserve(rows.size());
+    bool reused = false;
+    for (int first = 0; first < (int)rows.size();) {
+        const auto &base = rows[first];
+        if (base.fp8 != fp8 || base.verifyOffset < 0) return false;
+        int count = 1;
+        while (count < 4 && first + count < (int)rows.size()) {
+            const auto &next = rows[first + count];
+            if (next.key != base.key || next.value != base.value || next.cache != base.cache ||
+                next.fp8 != base.fp8 || next.verifyOffset != base.verifyOffset + count ||
+                next.keyStride != base.keyStride ||
+                (base.liveKeys ? next.liveKeys != base.liveKeys + count :
+                                next.liveKeys || next.length != base.length + count)) break;
+            ++count;
+        }
+        groups.push_back({base, first, count});
+        reused = reused || count > 1;
+        first += count;
+    }
+    if (!reused) return false;
+    for (int first = 0; first < (int)groups.size(); first += swa::SwaVerifyLimit) {
+        const int count = std::min(swa::SwaVerifyLimit, (int)groups.size() - first);
+        swa::SwaVerifyBatch descriptors{};
+        std::copy_n(groups.begin() + first, count, descriptors.groups);
+        kernel<<<dim3(count, heads / 8), 256, shared>>>(
+            (const BF16 *)query.cudaData, descriptors, bias, (BF16 *)output.cudaData, heads, kvHeads);
+    }
+    return true;
+}
+
 template <int Max, bool Ring>
 bool BulkAttention(const fastllm::Data &query, const float *bias,
         const std::vector<FastllmNaiveDSARow> &rows, int heads, int kvHeads, fastllm::Data &output) {
@@ -5545,7 +5585,8 @@ void FastllmCudaNaiveBatchSWADecode(const fastllm::Data &query,
             aligned = aligned && r.key && r.value && (uintptr_t)r.key % 16 == 0 && (uintptr_t)r.value % 16 == 0;
         }
         const auto *bias = sink.dims.empty() ? nullptr : (const float *)sink.cudaData;
-        if (aligned && BulkAttention<128, true>(query, bias, descriptors, heads, kvHeads, output)) {
+        if (aligned && (VerifySwaQueryReuse(query, bias, descriptors, heads, kvHeads, output) ||
+                        BulkAttention<128, true>(query, bias, descriptors, heads, kvHeads, output))) {
             CheckLaunch(); return;
         }
     }
