@@ -375,11 +375,14 @@ int main() {
     try {
         for (int ranks : {2, 4, 8})
             for (int kind : {0, 1, 2, 3})
-                for (int block : {4, 6, 8})
+                for (int block : {3, 4, 5, 6, 8, 11})
                     ContextCase(4097, 128, ranks, 17, kind, false, true, block);
         for (int batch : {1, 4, 128, 512, 1536, 3072})
             ContextCase(8193, 128, 4, batch, 1, batch == 128, true, 4);
         ContextCase(200000, 128, 4, 4, 2, false, true, 4);
+        ContextCase(65537, 128, 4, 512, 1, true, true, 4);
+        ContextCase(65537, 128, 4, 513, 2, false, true, 5);
+        for (int batch : {2037, 2038}) ContextCase(2049, 128, 4, batch, 1, false, true, 11);
         // Large verification batches span differently sized descriptor chunks;
         // check exact score bits and CP exchange offsets after query grouping.
         ContextCase(77825, 128, 4, 1280, 1, false, true, 4);

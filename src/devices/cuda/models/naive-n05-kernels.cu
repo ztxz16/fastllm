@@ -4695,41 +4695,21 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
                 (const BF16 *)weights.cudaData, descriptors);
         }
     }
-#endif
 
-#if CUDART_VERSION >= 12040
-    // Scores for every row have finished before this branch. Only combine
-    // the already validated Hopper/FP8/CP4 layout; retain all other paths.
-    if (compactScores && rows.size() <= batch::kLocalTopKLimit) {
-        int capacity = 0;
-        for (const auto &row : rows) capacity = std::max(capacity, row.capacity);
-        capacity = ((capacity + contextPageLen - 1) / contextPageLen) *
-            (contextPageLen / contextRanks);
-        auto select = naive_indexer_wide_select::SelectWide<batch::LocalTopKBatch>;
-        auto sort = naive_indexer_sortpack::SortPack<256, 5, true, true, batch::LocalTopKBatch>;
-        auto copy = batch::CopyPacked<batch::LocalTopKBatch>;
-        constexpr size_t bytes = naive_indexer_sortpack::SortBytes<256, 5, true>();
-        if (capacity > 16384 && capacity <= 65536 &&
-                BulkKernelSupported(select, 0, 90) &&
-                BulkKernelSupported(sort, bytes, 90) &&
-                BulkKernelSupported(copy, 0, 90)) {
-            batch::LocalTopKBatch descriptors{};
-            descriptors.rank=contextRank; descriptors.ranks=contextRanks;
-            descriptors.page=contextPageLen;
-            for (int i=0; i<(int)compactRows.size(); ++i) {
-                const auto &r=compactRows[i];
-                descriptors.rows[i]={r.live, r.scores, r.workspace, r.indices};
-            }
-            select<<<rows.size(), 1024>>>(descriptors);
-            sort<<<rows.size(), 256, bytes>>>(descriptors);
-            // Exchange storage may alias score slices. All selection and
-            // sorting must finish before any packed candidate is copied.
-            copy<<<rows.size(), naive_topk::kThreads>>>(descriptors,
-                (unsigned *)exchange->cudaData, rows.size(), 0);
-            CheckLaunch();
-            return true;
-        }
-    }
+    // Score descriptors contain KV geometry; selection needs only four
+    // pointers per row. Keep its batch size independent of score chunking.
+    int localCapacity = 0;
+    for (const auto &row : rows) localCapacity = std::max(localCapacity, row.capacity);
+    if (contextPageLen) localCapacity = ((localCapacity + contextPageLen - 1) / contextPageLen) *
+        (contextPageLen / contextRanks);
+    constexpr size_t localSortBytes = naive_indexer_sortpack::SortBytes<256, 5, true>();
+    const bool compactTopK = hopper && contextRanks == 4 && contextPageLen && rows.size() >= 128 &&
+        localCapacity > 16384 && localCapacity <= 65536 &&
+        BulkKernelSupported(naive_indexer_wide_select::SelectWide<batch::LocalTopKBatch>, 0, 90) &&
+        BulkKernelSupported(naive_indexer_sortpack::SortPack<256, 5, true, true, batch::LocalTopKBatch>,
+                            localSortBytes, 90) &&
+        BulkKernelSupported(batch::CopyPacked<batch::LocalTopKBatch>, 0, 90);
+    if (compactTopK && !compactScores) compactRows.reserve(rows.size());
 #endif
 
     std::vector<int> rowOrder;
@@ -4786,6 +4766,9 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
             const int index = rowOrder.empty() ? first + i : rowOrder[first + i];
             const auto &row = rows[index];
             descriptors.rows[i] = compactScores ? compactRows[first + i] : prepareRow(index);
+#if CUDART_VERSION >= 12040
+            if (compactTopK && !compactScores) compactRows.push_back(descriptors.rows[i]);
+#endif
             capacity = std::max(capacity, row.capacity);
         }
         if (contextPageLen) capacity = ((capacity + contextPageLen - 1) / contextPageLen) * (contextPageLen / contextRanks);
@@ -4819,6 +4802,12 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
             }
             else batch::Scores<<<grid, naive_dsa_mma::kThreads>>>((const BF16 *)weights.cudaData, descriptors);
         }
+#if CUDART_VERSION >= 12040
+        if (compactTopK) {
+            first += count;
+            continue;
+        }
+#endif
         // Fuse exact threshold selection and stable sorting. Refining to 2048
         // candidates pays off for short contexts; longer rows keep 4096 slots.
         // CP layouts, long contexts and unsupported images retain their paths.
@@ -4887,6 +4876,32 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
         }
         first += count;
     }
+#if CUDART_VERSION >= 12040
+    if (compactTopK) {
+        std::vector<batch::LocalTopKBatch> batches((rows.size() + batch::kLocalTopKLimit - 1) /
+                                                  batch::kLocalTopKLimit);
+        for (int first = 0; first < (int)rows.size(); first += batch::kLocalTopKLimit) {
+            const int count = std::min(batch::kLocalTopKLimit, (int)rows.size() - first);
+            auto &descriptors = batches[first / batch::kLocalTopKLimit];
+            descriptors.rank = contextRank; descriptors.ranks = contextRanks; descriptors.page = contextPageLen;
+            for (int i = 0; i < count; ++i) {
+                const auto &r = compactRows[first + i];
+                descriptors.rows[i] = {r.live, r.scores, r.workspace, r.indices};
+            }
+            naive_indexer_wide_select::SelectWide<<<count, 1024>>>(descriptors);
+            naive_indexer_sortpack::SortPack<256, 5, true, true><<<count, 256, localSortBytes>>>(descriptors);
+        }
+        // Exchange can alias any row's scores. Complete every selection/sort
+        // before copying even the first chunk, including ragged final chunks.
+        for (int first = 0; first < (int)rows.size(); first += batch::kLocalTopKLimit) {
+            const int count = std::min(batch::kLocalTopKLimit, (int)rows.size() - first);
+            batch::CopyPacked<<<count, naive_topk::kThreads>>>(batches[first / batch::kLocalTopKLimit],
+                (unsigned *)exchange->cudaData, rows.size(), first);
+        }
+        CheckLaunch();
+        return true;
+    }
+#endif
     // Scores may alias the exchange arena. Finish packing every row before
     // any copy can overwrite another row's score slice (CUDA 12.0 batches).
     if (cp) for (int b = 0; b < (int)packedBatches.size(); ++b) {
@@ -5040,6 +5055,29 @@ void FastllmCudaNaiveMergeDecodeIndexer(const fastllm::Data &liveKeys,
         const fastllm::Data &exchange, int contextRanks, int contextPageLen) {
 #if defined(FASTLLM_NAIVE_DSA_MMA) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800)
     namespace batch = naive_indexer_batch;
+    // Merge uses only live lengths and output pointers. Compact those fields
+    // so arbitrary verification widths do not strand a small generic tail.
+    if (contextPageLen && contextRanks == 4 && rows.size() >= 64) {
+        namespace merge = merge_chunk_screen;
+        constexpr size_t bytes = 6 * naive_topk::kTopK * sizeof(unsigned long long);
+        auto kernel = merge::MergeFourChunked<1024, 4, merge::CompactBatch>;
+        if (BulkKernelSupported(kernel, bytes, 90)) {
+            for (int first = 0; first < (int)rows.size(); first += merge::CompactLimit) {
+                const int count = std::min(merge::CompactLimit, (int)rows.size() - first);
+                merge::CompactBatch descriptors{};
+                descriptors.merged = (const unsigned *)exchange.cudaData;
+                descriptors.total = rows.size(); descriptors.first = first; descriptors.page = contextPageLen;
+                for (int i = 0; i < count; ++i) {
+                    const auto &source = rows[first + i];
+                    descriptors.rows[i] = {(const int *)liveKeys.cudaData + source.sequence,
+                                           (int *)source.indices->cudaData};
+                }
+                kernel<<<count, 1024, bytes>>>(descriptors);
+            }
+            CheckLaunch();
+            return;
+        }
+    }
     for (int first = 0; first < (int)rows.size(); first += batch::BatchLimit) {
         int count = std::min(batch::BatchLimit, (int)rows.size() - first);
         batch::Batch descriptors{};
