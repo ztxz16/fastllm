@@ -5117,16 +5117,44 @@ bool PrefetchDSAAttention(const fastllm::Data &query, const float *bias,
             return false;
     // Share KV loads across two eight-warp groups without changing per-head
     // accumulation. Keep small batches and unsupported resources on the old path.
-    if (rows.size() >= 64 && rows.size() <= bulk::MaxBatchLimit) {
+    if (rows.size() >= 64) {
         auto sharedHeads = bulk::Decode<2048, false, true, true, true, true, true,
             bulk::MaxBatchLimit, true>;
         constexpr size_t shared = sizeof(bulk::Storage<2048, true, 16>);
         if (BulkKernelSupported(sharedHeads, shared, 90)) {
-            bulk::BatchT<bulk::MaxBatchLimit> descriptors{};
-            std::copy(rows.begin(), rows.end(), descriptors.rows);
-            sharedHeads<<<dim3(heads / 16, rows.size()), 512, shared>>>(
-                (const BF16 *)query.cudaData, descriptors, bias,
-                (BF16 *)output.cudaData, heads, kvHeads);
+            // End full descriptor batches on a resident-wave boundary. A
+            // parameter-sized tail in every launch wastes SMs even when the
+            // complete query batch has enough independent work to fill them.
+            int batchLimit = bulk::MaxBatchLimit;
+            if (rows.size() > bulk::MaxBatchLimit) {
+                static thread_local std::map<int, int> batchLimits;
+                const int device = FastllmCudaGetDevice();
+                auto it = batchLimits.find(device);
+                if (it == batchLimits.end()) {
+                    int sms = 0, resident = 0;
+                    if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) == cudaSuccess &&
+                        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&resident,
+                            sharedHeads, 512, shared) == cudaSuccess && sms > 0 && resident > 0) {
+                        const int wave = sms * resident;
+                        if (wave <= batchLimit) batchLimit = batchLimit / wave * wave;
+                    } else {
+                        cudaGetLastError(); // Retain the descriptor-sized fallback.
+                    }
+                    it = batchLimits.emplace(device, batchLimit).first;
+                }
+                batchLimit = it->second;
+            }
+            for (int first = 0; first < (int)rows.size();) {
+                const int remaining = rows.size() - first;
+                // Keep a fitting final batch intact, including a partial wave.
+                const int count = remaining <= bulk::MaxBatchLimit ? remaining : batchLimit;
+                bulk::BatchT<bulk::MaxBatchLimit> descriptors{};
+                std::copy_n(rows.begin() + first, count, descriptors.rows);
+                sharedHeads<<<dim3(heads / 16, count), 512, shared>>>(
+                    (const BF16 *)query.cudaData + (size_t)first * heads * 192, descriptors, bias,
+                    (BF16 *)output.cudaData + (size_t)first * heads * 128, heads, kvHeads);
+                first += count;
+            }
             return true;
         }
     }

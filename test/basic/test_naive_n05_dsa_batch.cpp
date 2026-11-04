@@ -258,8 +258,8 @@ static void Test(int batch, int heads, int kvHeads, int dim, int vd, int capacit
 // Replace and reorder KV behind one captured graph. The original addresses
 // remain valid but contain different values, so stale kernel parameters cannot
 // pass this test accidentally.
-static void TestRebinding(int batch, int capacity, bool sparse, bool generic = false, bool contiguousSelection = false, bool fp8 = false, int sharedQueries = 1) {
-    const int heads = 8, kvHeads = 1, dim = generic ? 128 : 192, vd = generic ? 256 : 128, stride = dim + 128;
+static void TestRebinding(int batch, int capacity, bool sparse, bool generic = false, bool contiguousSelection = false, bool fp8 = false, int sharedQueries = 1, int heads = 8) {
+    const int kvHeads = 1, dim = generic ? 128 : 192, vd = generic ? 256 : 128, stride = dim + 128;
     Data q(BFLOAT16), sink(FLOAT32), live(INT32), table(INT32), maps(INT32), actual, expected;
     const bool useMaps = !generic && !contiguousSelection && !fp8 && sharedQueries == 1 && FastllmCudaNaiveDSAMapsSupported();
     std::vector<unsigned char> hostMaps(batch * FastllmNaiveDSAMapBytes);
@@ -341,8 +341,29 @@ static void TestRebinding(int batch, int capacity, bool sparse, bool generic = f
         Cuda(cudaMemcpy(live.cudaData, lengths.data(), batch * sizeof(int), cudaMemcpyHostToDevice));
         updateMaps();
         graph.Run();
-        FastllmCudaNaiveBatchDSADecode(q, sink, direct, heads, kvHeads, dim, vd, referenceScratch, expected);
-        auto a = Read<uint16_t>(actual), b = Read<uint16_t>(expected);
+        std::vector<uint16_t> b;
+        if (heads == 16) {
+            b.reserve((size_t)batch * heads * vd);
+            // Sub-64-row launches retain the eight-head KV-load path. Compare
+            // the large-batch shared-head graph with that independent fallback.
+            for (int first = 0; first < batch;) {
+                const int count = batch - first < 64 ? batch - first : 32;
+                Data partQuery(BFLOAT16), partOutput;
+                partQuery.FakeFrom(q, (size_t)first * heads * dim * 2);
+                partQuery.Resize({1, count, heads * dim});
+                std::vector<FastllmNaiveDSARow> part(direct.begin() + first, direct.begin() + first + count);
+                FastllmCudaNaiveBatchDSADecode(partQuery, sink, part, heads, kvHeads, dim, vd,
+                                             referenceScratch, partOutput);
+                auto reference = Read<uint16_t>(partOutput);
+                b.insert(b.end(), reference.begin(), reference.end());
+                first += count;
+            }
+        } else {
+            FastllmCudaNaiveBatchDSADecode(q, sink, direct, heads, kvHeads, dim, vd, referenceScratch, expected);
+            b = Read<uint16_t>(expected);
+        }
+        auto a = Read<uint16_t>(actual);
+        if (heads == 16) Require(a == b, "shared-head chunking changed fallback output bits");
         if (contiguousSelection || sharedQueries > 1) Require(a == b, "compact attention changed output bits after rebinding");
         double error = 0, norm = 0;
         for (size_t i = 0; i < a.size(); ++i) {
@@ -574,6 +595,10 @@ int main() {
         if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0)
             return 77;
         FastllmCudaSetDevice(0);
+        for (int batch : {63, 64, 312, 313, 339, 340, 512, 640, 651, 652, 768, 1025})
+            TestRebinding(batch, 257, true, false, false, true, 1, 16);
+        for (int width : {3, 5, 6, 8, 11})
+            TestRebinding(65 * width, 257, true, false, false, true, width, 16);
         for (int requests : {8, 65}) for (int width : {4, 6, 7, 8})
             TestSharedIndexerQueries(requests, width);
         for (int count : {1, 32, 112, 113, 257}) TestCommitSwa(count);
