@@ -174,7 +174,7 @@ void NaiveN05FlashModel::InitSparseKv() {
                 index->Resize({pages, indexPage, 1, IndexerCacheWidth(kvCacheDataType)});
                 index->ToDevice(DataDevice::CUDA, {tpDevices[rank]}, false); index->Allocate(false);
                 measured += index->GetBytes();
-                state->indexSidecars.emplace(managers[layer * 2].get(), index.get());
+                tpIndexerSidecars.emplace(managers[layer * 2].get(), index.get());
                 r->indexers[layer] = std::move(index);
             }
         }
@@ -340,11 +340,11 @@ void NaiveN05FlashModel::AttachSparseKv(const std::vector<std::pair<Data *, Data
 #endif
 }
 
-Data NaiveN05FlashModel::SparseIndexer(int layer, int rank, const Data &key) const {
+Data NaiveN05FlashModel::SeparateIndexer(int layer, int rank, const Data &key) const {
     Data result;
 #ifdef USE_CUDA
     if (!HasLocalIndexer(layer, rank)) return result;
-    auto &storage = *sparseKv->ranks[rank]->indexers[layer];
+    auto &storage = IndexerStorage(layer, rank);
     const int width = storage.dims[3];
     result.FakeFrom(key, 0);
     const int page = storage.dims[1];

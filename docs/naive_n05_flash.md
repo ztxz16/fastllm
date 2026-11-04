@@ -38,10 +38,15 @@ FASTLLM_CUDA_GRAPH=1 ftllm server /path/to/MiMo-V2-DSA \
 未指定 `--max_batch` 时按 512 路预留，不会因显存不足自动下调。
 显式 `--tokens` 超出预算会在启动时报错。
 
-全局层使用分页 KV，Indexer K 按配置与主 K 放在同一页中；滑窗层保留固定长度
+全局层使用分页 KV；滑窗层保留固定长度
 的请求窗口。GPU 前缀缓存共享全局页引用，并在预算内保存滑窗快照，不使用 CPU
 KV 历史缓存。页表和滑窗按分配大小使用独立的池，避免请求结束、恢复及冷启动的
 分配顺序不同造成碎片。运行期间不为这些 KV 调用 `cudaMalloc`。
+`--indexer_tp_storage context_shard` 可同时用于纯显存 KV 和 KVMem：每个 TP rank
+只保存各逻辑页中的一段 Indexer K，独立存储复用主 K 的页号、前缀引用和写时复制。
+纯显存路径中的默认 `replicated` 与 `layer_shard` 仍将本卡的 Indexer K 和主 K 存在同一页中。
+分片计算要求 CUDA SM80+、16×128 的 FP8-query Indexer，页长须能被 TP 数整除；
+支持普通解码、DSpark 验证及 CUDA Graph，未开启 Graph 时复用相同的分页计算路径。
 各 TP rank 在计算和通信前完成申请；池耗尽时返回容量错误，清理受影响请求，
 后续请求仍可处理。解码跨页只更新页表内容，满足复用条件时保留 Graph 和设备表。
 CUDA Graph、采样和临时算子工作区有各自的分配策略，不属于这项 KV 保证。

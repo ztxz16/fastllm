@@ -302,9 +302,13 @@ namespace fastllm {
         std::shared_ptr<SparseKvState> sparseKv;
         void InitSparseKv();
         void AttachSparseKv(const std::vector<std::pair<Data *, Data *>> &roots);
-        Data SparseIndexer(int layer, int rank, const Data &key) const;
+        Data SeparateIndexer(int layer, int rank, const Data &key) const;
+        bool HasSeparateIndexer() const { return sparseKv || !tpIndexerCaches.empty(); }
+        PagedCacheManager &IndexerStorage(int layer, int rank) const {
+            return *tpIndexerSidecars.at(tpPagedCaches[rank][layer * 2].get());
+        }
         void StageSparseKv(int rank, int layer, const Data &key, const Data &value, Data &outKey, Data &outValue);
-        int PackedIndexerWidth() const { return sparseKv ? 0 : IndexerCacheWidth(kvCacheDataType); }
+        int PackedIndexerWidth() const { return HasSeparateIndexer() ? 0 : IndexerCacheWidth(kvCacheDataType); }
         bool InitTensorParallel();
         void PrepareTensorParallel();
         void InitTensorParallelKVPool();
@@ -347,6 +351,8 @@ namespace fastllm {
         // and requests. Request-owned SWA storage only holds the sliding window.
         std::vector<std::pair<Data, Data>> tpSwaPrefillWorkspaces;
         std::vector<std::vector<std::unique_ptr<PagedCacheManager>>> tpPagedCaches;
+        std::vector<std::vector<std::unique_ptr<PagedCacheManager>>> tpIndexerCaches;
+        std::map<PagedCacheManager *, PagedCacheManager *> tpIndexerSidecars;
         bool tpPrepared = false;
         // Fixed at TP preparation so toggling CUDA Graph cannot change live KV
         // layout. Prefill/eager fallback temporarily uses chronological rows.
@@ -398,7 +404,7 @@ namespace fastllm {
             return fp8IndexerCache ? 144 / (type == FP8_E4M3 ? 1 : 2) : indexDim;
         }
         int LocalIndexerCacheWidth(int layer, int rank) const {
-            return !sparseKv && HasLocalIndexer(layer, rank) ? IndexerCacheWidth(kvCacheDataType) : 0;
+            return !HasSeparateIndexer() && HasLocalIndexer(layer, rank) ? IndexerCacheWidth(kvCacheDataType) : 0;
         }
         std::vector<std::vector<Data *>> moeWeights, moeBiases;
     };

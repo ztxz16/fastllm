@@ -56,13 +56,17 @@ class NaiveTensorParallelCliTest(unittest.TestCase):
                 self.configure(options + ([] if saved else ['--indexer_tp_storage', 'layer_shard']),
                                model_type=model, saved=saved)
 
-    def test_context_sharded_indexer_requires_kvmem_and_cuda_tp(self):
+    def test_context_sharded_indexer_with_gpu_kv_or_kvmem(self):
         for saved in (False, True):
-            settings = {'tp': '4', 'indexer_tp_storage': 'context_shard', 'kvmem': '{}'}
-            options = [] if saved else [v for k, value in settings.items() for v in ('--' + k, value)]
-            self.configure(options, saved=settings if saved else None)
-            self.assertEqual(self.model_options['indexer_tp_storage'], 'context_shard')
-        for options, model in [(['--tp', '4'], 'naive_n05_flash'),
+            for kvmem in (False, True):
+                settings = {'tp': '4', 'indexer_tp_storage': 'context_shard'}
+                if kvmem:
+                    settings['kvmem'] = '{}'
+                options = [] if saved else [v for k, value in settings.items() for v in ('--' + k, value)]
+                self.configure(options, saved=settings if saved else None)
+                self.assertEqual(self.model_options['indexer_tp_storage'], 'context_shard')
+                self.assertEqual(self.loaded_model.set_kvmem.call_count, int(kvmem))
+        for options, model in [(['--tp', '1'], 'naive_n05_flash'),
                                (['--tp', '1', '--kvmem', '{}'], 'naive_n05_flash'),
                                (['--tp', '4', '--kvmem', '{}'], 'llama')]:
             with self.subTest(options=options, model=model), self.assertRaisesRegex(ValueError, '[Ii]ndexer'):

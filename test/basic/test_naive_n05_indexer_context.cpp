@@ -310,7 +310,7 @@ static void ContextRope(int ranks, bool scaled) {
     fflush(stdout);
 }
 
-#include "../../src/models/naive_n05_kvmem.h"
+#include "models/naive_n05_flash.h"
 namespace fastllm {
 // Existing friend access exercises the real production copy-on-write path.
 struct NaiveN05PrefixCacheTestAccess : NaiveN05FlashModel {
@@ -318,7 +318,6 @@ struct NaiveN05PrefixCacheTestAccess : NaiveN05FlashModel {
         NaiveN05PrefixCacheTestAccess model;
         model.max_positions = 1024;
         model.tokensLimit = 1024;
-        model.sparseKv = std::make_shared<SparseKvState>();
         constexpr int pages = 8, page = 128, oldLength = 97;
         PagedCacheManager main, index;
         Device(main, type, {pages, page, 1, 192});
@@ -328,7 +327,7 @@ struct NaiveN05PrefixCacheTestAccess : NaiveN05FlashModel {
         Device(index, type, {pages, localPage, 1, width});
         index.pageLen = localPage;
         index.SetMaxPages(pages);
-        model.sparseKv->indexSidecars[&main] = &index;
+        model.tpIndexerSidecars[&main] = &index;
         int old = main.GetUnusedPageIndex(true);
         main.pageRefCount[old]++;
         Data cache(INT32, {pages});
@@ -361,7 +360,7 @@ struct NaiveN05PrefixCacheTestAccess : NaiveN05FlashModel {
         Require(std::equal(initial.data() + old * pageBytes, initial.data() + (old + 1) * pageBytes,
                            actual.data() + old * pageBytes),
                 "copy-on-write changed shared prefix");
-        model.sparseKv->indexSidecars.clear();
+        model.tpIndexerSidecars.clear();
         checks++;
     }
 };

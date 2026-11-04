@@ -1,6 +1,5 @@
 #include "models/naive_n05_flash.h"
 #include "naive_n05_tp.h"
-#include "naive_n05_kvmem.h"
 #include "devices/cuda/naive-n05-cuda.cuh"
 #include "executor.h"
 #include "utils.h"
@@ -366,9 +365,9 @@ void NaiveN05FlashModel::PrepareTensorParallel() {
     tpSwaRingCache = GetFastllmEnv().cudaGraph && FastllmNaiveKVType(kvCacheDataType) &&
         window == 128 && sliding.headDim == 192 && sliding.valueDim == 128 &&
         sliding.heads / ranks < 64;
-    AssertInFastLLM(!indexerContextSharding || (kvMemConfig.enabled && indexFp8 && indexHeads == 16 &&
+    AssertInFastLLM(!indexerContextSharding || (indexFp8 && indexHeads == 16 &&
         indexDim == 128 && indexTopK == 2048 && FastllmCudaNaiveIndexerContextSupported(tpDevices)),
-        "Indexer context_shard requires KVMem, the 16x128 FP8-query Indexer and CUDA SM80+ TP.");
+        "Indexer context_shard requires the 16x128 FP8-query Indexer and CUDA SM80+ TP.");
     tpPrepared = true;
 #endif
 }
@@ -385,11 +384,8 @@ void NaiveN05FlashModel::PrepareTensorParallelMemory() {
     const bool history = saveHistoryChat;
     saveHistoryChat = false;
     struct Restore { bool &value; bool saved; ~Restore() { value = saved; } } restore{saveHistoryChat, history};
-    const bool contextSharded = indexerContextSharding;
-    Restore restoreContext{indexerContextSharding, contextSharded};
-    // Before InitSparseKv there are only temporary chronological caches.
-    // Warm their arithmetic normally, then bind the real context shards below.
-    if (!sparseKv) indexerContextSharding = false;
+    // Before pool allocation RunTarget uses chronological temporary caches.
+    // Keep the requested placement visible when reserving Graph bindings.
     // Balanced prefill caps at 512 MiB. The generic path caps at 256 MiB
     // plus one partial 64-query tile at the configured context limit.
     const size_t scoreBytes = std::max(size_t(512) << 20,
@@ -479,7 +475,7 @@ void NaiveN05FlashModel::PrepareTensorParallelMemory() {
         FastllmCudaNaivePrepareVerifyIndexerScratch(batch * verifyRows,
             (int)std::min<int64_t>(max_positions, ((int64_t)contextLimit + 4095) / 4096 * 4096),
             indexFp8, scratch);
-        if (contextSharded) {
+        if (indexerContextSharding) {
             // Include the largest candidate exchange before sizing the KV pool.
             auto &exchange = tpBatchVerifyStorage->ranks[rank]->storage->buffers.indexContextExchange;
             exchange.dataType = INT32;
@@ -548,7 +544,7 @@ void NaiveN05FlashModel::PrepareTensorParallelServing() {
         if (!FastllmCudaNaiveDecodeGraphSupported()) return;
         auto storage = std::make_shared<TPDecodeState::Storage>();
         storage->maxRows = maxRows;
-        storage->hostCache.resize((size_t)block_cnt * maxRows * (sparseKv ? 8 : 4));
+        storage->hostCache.resize((size_t)block_cnt * maxRows * (HasSeparateIndexer() ? 8 : 4));
         auto allocate = [&](Data &data, DataType type, int elements) {
             data.dataType = type;
             data.Resize({elements});
@@ -616,7 +612,7 @@ void NaiveN05FlashModel::PrepareTensorParallelServing() {
             Data &root = part ? roots.back().second : roots.back().first;
             const int width = cfg.kvHeads * (part ? cfg.valueDim : cfg.headDim) +
                               (!part && !slidingLayers[layer] ? PackedIndexerWidth() : 0);
-            root.kvCacheFp8Indexer = !part && !slidingLayers[layer] && fp8IndexerCache;
+            root.kvCacheFp8Indexer = !HasSeparateIndexer() && !part && !slidingLayers[layer] && fp8IndexerCache;
             root.Resize({1, 2, width});
             root.expansionDims = {1, max_positions, width};
             root.multiDeviceData = true;
@@ -826,17 +822,17 @@ bool NaiveN05FlashModel::PrepareTensorParallelServingDecode(const Data &inputIds
             // device lengths prevent kernels from dereferencing these slots.
             for (int layer = 0; layer < block_cnt; ++layer)
             for (int row = rows; row < storage.maxRows; ++row)
-            for (int part = 0; part < (sparseKv && !slidingLayers[layer] ? 8 : 4); ++part) {
-                auto &pointer = storage.hostCache[(size_t)layer * storage.maxRows * (sparseKv ? 8 : 4) +
-                    row * (sparseKv && !slidingLayers[layer] ? 8 : 4) + part];
+            for (int part = 0; part < (HasSeparateIndexer() && !slidingLayers[layer] ? 8 : 4); ++part) {
+                auto &pointer = storage.hostCache[(size_t)layer * storage.maxRows * (HasSeparateIndexer() ? 8 : 4) +
+                    row * (HasSeparateIndexer() && !slidingLayers[layer] ? 8 : 4) + part];
                 if (pointer) { pointer = nullptr; storage.cacheDirty = true; }
             }
             for (int layer = 0; layer < block_cnt; ++layer)
             for (int row = 0; row < rows; ++row)
             for (int part = 0; part < 2; ++part) {
                 const size_t src = ((size_t)row * block_cnt + layer) * ranks * 2 + rank * 2 + part;
-                const size_t dst = (size_t)layer * storage.maxRows * (sparseKv ? 8 : 4) +
-                    row * (sparseKv && !slidingLayers[layer] ? 8 : 4) + part;
+                const size_t dst = (size_t)layer * storage.maxRows * (HasSeparateIndexer() ? 8 : 4) +
+                    row * (HasSeparateIndexer() && !slidingLayers[layer] ? 8 : 4) + part;
                 if (storage.hostCache[dst] != pointers[src]) {
                     storage.hostCache[dst] = pointers[src];
                     storage.cacheDirty = true;
@@ -845,8 +841,8 @@ bool NaiveN05FlashModel::PrepareTensorParallelServingDecode(const Data &inputIds
                     storage.hostCache[dst + 2] = pageTables[src];
                     storage.cacheDirty = true;
                 }
-                if (sparseKv && !part && !slidingLayers[layer] && HasLocalIndexer(layer, rank)) {
-                    void *index = sparseKv->ranks[rank]->indexers[layer]->cudaData;
+                if (HasSeparateIndexer() && !part && !slidingLayers[layer] && HasLocalIndexer(layer, rank)) {
+                    void *index = IndexerStorage(layer, rank).cudaData;
                     for (auto binding : {std::make_pair(dst + 4, index), std::make_pair(dst + 6, pageTables[src])}) {
                         if (storage.hostCache[binding.first] != binding.second) {
                             storage.hostCache[binding.first] = binding.second;
@@ -990,8 +986,8 @@ bool NaiveN05FlashModel::PrepareTensorParallelDecode(const Data &inputIds,
         full.headDim <= 256 && (full.valueDim == 128 || full.valueDim == 256);
     const size_t slots = (size_t)sequences * block_cnt * ranks * 2;
     auto cacheBinding = [&](int layer, int sequence, int part) -> size_t {
-        return (size_t)layer * sequences * (sparseKv ? 8 : 4) +
-            sequence * (sparseKv && !slidingLayers[layer] ? 8 : 4) + part;
+        return (size_t)layer * sequences * (HasSeparateIndexer() ? 8 : 4) +
+            sequence * (HasSeparateIndexer() && !slidingLayers[layer] ? 8 : 4) + part;
     };
     auto bindCache = [&](TPDecodeState &state) {
         if (!state.dynamicCache) return;
@@ -999,7 +995,7 @@ bool NaiveN05FlashModel::PrepareTensorParallelDecode(const Data &inputIds,
             auto &storage = *state.ranks[rank]->storage;
             FastllmCudaSetDevice(tpDevices[rank]);
             const size_t count = (size_t)block_cnt *
-                std::max(sequences, maxBatch > 0 ? maxBatch : 512) * (kvMemConfig.enabled ? 8 : 4);
+                std::max(sequences, maxBatch > 0 ? maxBatch : 512) * (kvMemConfig.enabled || indexerContextSharding ? 8 : 4);
             if (storage.hostCache.empty()) {
                 storage.hostCache.resize(count, nullptr);
                 storage.cacheTable.dataType = INT32;
@@ -1021,8 +1017,8 @@ bool NaiveN05FlashModel::PrepareTensorParallelDecode(const Data &inputIds,
                     storage.hostCache[slot + 2] = pages;
                     storage.cacheDirty = true;
                 }
-                if (sparseKv && !part && !slidingLayers[layer] && HasLocalIndexer(layer, rank)) {
-                    for (auto binding : {std::make_pair(slot + 4, sparseKv->ranks[rank]->indexers[layer]->cudaData),
+                if (HasSeparateIndexer() && !part && !slidingLayers[layer] && HasLocalIndexer(layer, rank)) {
+                    for (auto binding : {std::make_pair(slot + 4, IndexerStorage(layer, rank).cudaData),
                                          std::make_pair(slot + 6, pages)})
                         if (storage.hostCache[binding.first] != binding.second) {
                             storage.hostCache[binding.first] = binding.second; storage.cacheDirty = true;
@@ -1066,7 +1062,7 @@ bool NaiveN05FlashModel::PrepareTensorParallelDecode(const Data &inputIds,
                             Data &root = part ? value(sequence, layer) : key(sequence, layer);
                             const int width = part ? cfg.kvHeads * cfg.valueDim :
                                 cfg.kvHeads * cfg.headDim + (slidingLayers[layer] ? 0 : PackedIndexerWidth());
-                            const bool fp8Index = !sparseKv && !part && !slidingLayers[layer] && fp8IndexerCache;
+                            const bool fp8Index = !HasSeparateIndexer() && !part && !slidingLayers[layer] && fp8IndexerCache;
                             if (!root.multiDeviceData || root.dataDevice != DataDevice::CUDA ||
                                 !FastllmNaiveCanResizeKVLength(root, required, width) ||
                                 (reuseOnly && (root.isPagedKVCache || root.kvCacheFp8Indexer != fp8Index))) return false;
@@ -1684,7 +1680,7 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
     for (int sequence = 0; sequence < sequences; ++sequence)
     for (int layer = 0; layer < block_cnt; ++layer) {
         for (Data *cache : {&key(sequence, layer), &value(sequence, layer)}) {
-            cache->kvCacheFp8Indexer = !sparseKv && cache == &key(sequence, layer) && !slidingLayers[layer] && fp8IndexerCache;
+            cache->kvCacheFp8Indexer = !HasSeparateIndexer() && cache == &key(sequence, layer) && !slidingLayers[layer] && fp8IndexerCache;
             const int owner = indexerLayerSharding && !slidingLayers[layer]
                 ? tpDevices[IndexerOwnerRank(layer)] : -1;
             for (auto &entry : cache->multiDeviceDatas)

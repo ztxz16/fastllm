@@ -2400,6 +2400,35 @@ if (UNIT_TEST)
                         PASS_REGULAR_EXPRESSION "KVMEM DSPARK PASS")
                 endforeach()
             endforeach()
+            foreach(NAIVE_GPU_CONTEXT_RANKS 2 4 8)
+                foreach(NAIVE_GPU_CONTEXT_BLOCK 3 5 7)
+                    add_test(NAME naive_n05_gpu_context_verify_${NAIVE_GPU_CONTEXT_RANKS}_${NAIVE_GPU_CONTEXT_BLOCK}
+                        COMMAND naive_n05_verify_graph_test ${NAIVE_GPU_CONTEXT_RANKS} gpu_context_draft fp8
+                            ${NAIVE_GPU_CONTEXT_BLOCK} 8192 context_shard)
+                    set_tests_properties(naive_n05_gpu_context_verify_${NAIVE_GPU_CONTEXT_RANKS}_${NAIVE_GPU_CONTEXT_BLOCK}
+                        PROPERTIES LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 300
+                        PASS_REGULAR_EXPRESSION "GPU CONTEXT DSPARK PASS")
+                endforeach()
+            endforeach()
+            foreach(NAIVE_GPU_CONTEXT_KV bf16 fp8)
+                add_test(NAME naive_n05_gpu_context_decode_${NAIVE_GPU_CONTEXT_KV}
+                    COMMAND naive_n05_verify_graph_test 4 gpu_context ${NAIVE_GPU_CONTEXT_KV} fp8)
+                set_tests_properties(naive_n05_gpu_context_decode_${NAIVE_GPU_CONTEXT_KV} PROPERTIES
+                    LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 300
+                    PASS_REGULAR_EXPRESSION "GPU CONTEXT MODEL PASS")
+                add_test(NAME naive_n05_gpu_context_prefix_${NAIVE_GPU_CONTEXT_KV}
+                    COMMAND naive_n05_verify_graph_test 4 draft_prefill_batch ${NAIVE_GPU_CONTEXT_KV} gpu_context)
+                set_tests_properties(naive_n05_gpu_context_prefix_${NAIVE_GPU_CONTEXT_KV} PROPERTIES
+                    LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 600
+                    ENVIRONMENT "FASTLLM_CUDA_SERVING_WARMUP=1" PASS_REGULAR_EXPRESSION "DSPARK PREFIX PASS")
+            endforeach()
+            foreach(NAIVE_GPU_CONTEXT_MODE warmup failbegin failinstantiate)
+                add_test(NAME naive_n05_gpu_context_verify_${NAIVE_GPU_CONTEXT_MODE}
+                    COMMAND naive_n05_verify_graph_test 2 gpu_context_draft fp8 3 8192 context_shard ${NAIVE_GPU_CONTEXT_MODE})
+                set_tests_properties(naive_n05_gpu_context_verify_${NAIVE_GPU_CONTEXT_MODE} PROPERTIES
+                    LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 300
+                    ENVIRONMENT "FASTLLM_CUDA_SERVING_WARMUP=1" PASS_REGULAR_EXPRESSION "GPU CONTEXT DSPARK PASS")
+            endforeach()
             add_test(NAME naive_n05_context_verify_warmup
                 COMMAND naive_n05_verify_graph_test 4 kvmem_draft fp8 3 8192 context_shard warmup)
             set_tests_properties(naive_n05_context_verify_warmup PROPERTIES

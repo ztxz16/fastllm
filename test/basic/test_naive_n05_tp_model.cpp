@@ -3439,7 +3439,8 @@ int main(int argc, char **argv) {
             fixture.RunBatchChecks();
             unsetenv("FASTLLM_DSPARK_TP"); return 0;
         }
-        if (argc > 2 && std::string(argv[2]) == "kvmem_draft") {
+        if (argc > 2 && (std::string(argv[2]) == "kvmem_draft" || std::string(argv[2]) == "gpu_context_draft")) {
+            const bool gpuContext = std::string(argv[2]) == "gpu_context_draft";
             SetCudaEmbedding(true); SetCudaGraph(true);
             setenv("FASTLLM_DSPARK_TP", std::to_string(ranks).c_str(), 1);
             failGraphDevice = 0;
@@ -3455,14 +3456,14 @@ int main(int argc, char **argv) {
                                             enabled && storage == "context_shard");
                 if (storage == "scaled_fp8" || storage == "context_shard") fixture.SetIndexerDataType(FP8_E4M3);
                 if (argc > 3 && std::string(argv[3]) == "fp8") fixture.SetKVCacheDataType(FP8_E4M3);
-                auto result = fixture.SparseDraftChecks(enabled, block, resident, !failVerifyBegin && !failVerifyInstantiate,
+                auto result = fixture.SparseDraftChecks(enabled && !gpuContext, block, resident, !failVerifyBegin && !failVerifyInstantiate,
                     argc > 7 && std::string(argv[7]) == "warmup" ? 4096 : 1024);
                 if (!enabled) reference = std::move(result);
                 else {
                     if (result.size() != reference.size()) throw std::runtime_error("sparse draft trace shape");
                     RequireCloseLogits(result.data(), reference, "sparse draft target/hidden/backbone/head differs");
                     size_t exact = 0; for (size_t i = 0; i < result.size(); ++i) exact += result[i] == reference[i];
-                    std::cout << "KVMEM DSPARK PASS exact=" << exact << "/" << result.size()
+                    std::cout << (gpuContext ? "GPU CONTEXT DSPARK PASS exact=" : "KVMEM DSPARK PASS exact=") << exact << "/" << result.size()
                               << " relative=" << largestLogitRelative << " max_abs=" << largestLogitAbsolute << std::endl;
                 }
             }
@@ -3476,8 +3477,9 @@ int main(int argc, char **argv) {
             SetCudaEmbedding(true); SetCudaGraph(true);
             setenv("FASTLLM_DSPARK_TP", std::to_string(ranks).c_str(), 1);
             Fixture fixture(ranks, false, true, true, true);
-            const bool sparse = argc <= 4 || std::string(argv[4]) != "ordinary";
-            fixture.SetIndexerTPStorage(!sparse, sparse);
+            const bool context = argc > 4 && std::string(argv[4]) == "gpu_context";
+            const bool sparse = !context && (argc <= 4 || std::string(argv[4]) != "ordinary");
+            fixture.SetIndexerTPStorage(!sparse && !context, sparse || context);
             fixture.SetIndexerDataType(FP8_E4M3);
             if (argc > 3 && std::string(argv[3]) == "fp8") fixture.SetKVCacheDataType(FP8_E4M3);
             fixture.DraftPrefixChecks(sparse, true); unsetenv("FASTLLM_DSPARK_TP"); return 0;
@@ -3498,22 +3500,23 @@ int main(int argc, char **argv) {
             fixture.SparsePoolServingChecks();
             return 0;
         }
-        if (argc > 2 && std::string(argv[2]) == "kvmem") {
+        if (argc > 2 && (std::string(argv[2]) == "kvmem" || std::string(argv[2]) == "gpu_context")) {
+            const bool gpuContext = std::string(argv[2]) == "gpu_context";
             SetCudaEmbedding(true); SetCudaGraph(true);
             std::vector<float> reference;
             for (bool enabled : {false, true}) {
                 Fixture fixture(ranks, false, true, true, true);
-                fixture.SetIndexerTPStorage(true);
+                fixture.SetIndexerTPStorage(!(gpuContext && enabled), gpuContext && enabled);
                 if (argc > 3 && std::string(argv[3]) == "fp8") fixture.SetKVCacheDataType(FP8_E4M3);
                 if (argc > 4 && std::string(argv[4]) == "fp8") fixture.SetIndexerDataType(FP8_E4M3);
-                auto result = fixture.SparseKvRun(enabled);
+                auto result = fixture.SparseKvRun(enabled && !gpuContext);
                 if (!enabled) reference = std::move(result);
                 else {
                     if (reference.size() != result.size()) throw std::runtime_error("KVMem logits missing");
                     RequireCloseLogits(result.data(), reference, "KVMem changed model logits");
                     size_t exact = 0;
                     for (size_t i = 0; i < result.size(); ++i) exact += result[i] == reference[i];
-                    std::cout << "KVMEM MODEL PASS ranks=" << ranks << " exact=" << exact << "/" << result.size()
+                    std::cout << (gpuContext ? "GPU CONTEXT MODEL PASS ranks=" : "KVMEM MODEL PASS ranks=") << ranks << " exact=" << exact << "/" << result.size()
                         << " relative=" << largestLogitRelative << " max_abs=" << largestLogitAbsolute << std::endl;
                 }
             }
@@ -3560,7 +3563,8 @@ int main(int argc, char **argv) {
             Fixture fixture(ranks, false, true, true, true);
             if (argc > 3 && std::string(argv[3]) == "fp8") fixture.SetKVCacheDataType(FP8_E4M3);
             if (argc > 4 && std::string(argv[4]) == "fp8") fixture.SetIndexerDataType(FP8_E4M3);
-            if (argc > 5 && std::string(argv[5]) == "layer_shard") fixture.SetIndexerTPStorage(true);
+            if (argc > 5) fixture.SetIndexerTPStorage(std::string(argv[5]) == "layer_shard",
+                std::string(argv[5]) == "context_shard");
             fixture.HistoryServingChecks(true, std::string(argv[2]) == "kvmem_prefix");
             return 0;
         }
