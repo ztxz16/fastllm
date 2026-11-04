@@ -155,7 +155,7 @@ static void Run(int device, int heads, int dim, int rows, int resident, int grou
     printf("PASS GPU=%d heads=%d dim=%d rows=%d resident=%d GPU_KV=%.3f MiB host_KV=%.3f MiB\n",
            device, heads, dim, rows, resident, owner->gpuBytes / 1048576., owner->Stats().hostBytes / 1048576.);
 }
-int main() {
+int main(int argc, char **argv) {
 #if defined(USE_ROCM) || defined(CUDA_NO_TENSOR_CORE)
     puts("FASTLLM_TEST_SKIP_NO_DEVICE: QSA KVMem requires CUDA tensor cores");
     return 0;
@@ -171,6 +171,25 @@ int main() {
         }
         setvbuf(stdout, nullptr, _IONBF, 0);
         SetThreads(2);
+        if (argc == 2 && std::strcmp(argv[1], "--pin-recovery") == 0) {
+            // Each K/V allocation crosses several bounded registrations.
+            // Random sparse selection, eviction, rollback and graph replay
+            // must remain byte-identical to the full device reference.
+            Run(0, 2, 256, 1, 4096, 12, 65536);
+            Run(0, 2, 256, 32, 4096, 12, 65536);
+            puts("PASS exact QSA host/device storage with split pinned backing");
+            return 0;
+        }
+        if (argc == 2 && std::strcmp(argv[1], "--pin-failure") == 0) {
+            KvMemConfig cfg; cfg.enabled=true; cfg.maxTokens=65536; cfg.residentTokens=4096;
+            bool failed=false;
+            try { Qwen4KvMem owner(cfg,FLOAT16,2,256,0); }
+            catch(const std::runtime_error &) { failed=true; }
+            Check(failed, "permanent pin failure was ignored");
+            Check(cudaGetLastError()==cudaSuccess, "failed registration left a stale CUDA error");
+            puts("PASS exact QSA host/device storage allocation failure cleanup");
+            return 0;
+        }
         ModelPolicy();
         for (int device = 0; device < std::min(devices, 2); ++device)
             for (int heads : {1, 2})

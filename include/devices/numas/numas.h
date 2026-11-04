@@ -6,6 +6,7 @@ namespace fastllm {
     struct MachineNumaInfo {
         int numaCnt = 1;
         int threads = -1;
+        std::vector<int> nodeIds; // logical expert shard -> physical NUMA node
         std::vector <std::vector <int> > cpuIds; // { numaId -> {cpuId} }
 
         MachineNumaInfo ();
@@ -21,6 +22,8 @@ namespace fastllm {
         
         NumaConfig (int threads, AliveThreadPool *pool, MachineNumaInfo *machineNumaInfo);
     };
+
+    int GetNumasPhysicalNode(int logicalNode);
 
     void bind_to_cpu(int cpu_id);
     void bind_to_numa_node(int node_id);

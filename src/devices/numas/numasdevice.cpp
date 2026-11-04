@@ -3566,22 +3566,78 @@ namespace fastllm {
                 }
             }
 #endif
-            const bool pinned = std::all_of(arena->pinned.begin(), arena->pinned.end(),
-                                            [](bool value) { return value; });
+            auto allPinned = [](const std::shared_ptr<NumasMoeWeightArena> &owner) {
+                return std::all_of(owner->pinned.begin(), owner->pinned.end(),
+                                   [](bool value) { return value; });
+            };
+            std::vector<std::shared_ptr<NumasMoeWeightArena>> entryArenas(entries.size(), arena);
+            std::vector<size_t> entryOffsets;
+            entryOffsets.reserve(entries.size());
+            for (const Entry &entry : entries) entryOffsets.push_back(entry.offset);
+#ifdef USE_CUDA
+            if (usePinned && !allPinned(arena)) {
+                // A large registration can fail even when smaller registrations
+                // succeed. Split at tensor boundaries: an expert must remain in
+                // one CUDA mapping for its device pointer and DMA source to be
+                // contiguous. Keep the original arena alive until every retry
+                // has copied its bytes; the original source tensors are retired.
+                size_t recovered = 0;
+                std::function<void(size_t, size_t)> retry = [&](size_t begin, size_t end) {
+                    const size_t offset = entries[begin].offset;
+                    const size_t bytes = entries[end - 1].offset +
+                        entries[end - 1].shardBytes - offset;
+                    auto smaller = std::make_shared<NumasMoeWeightArena>(bytes, config->numaCnt);
+                    bool allocated = true;
+                    for (int node = 0; node < config->numaCnt; ++node) {
+                        smaller->nodes[node] = (uint8_t*)allocate_aligned_numa(bytes, node);
+                        if (smaller->nodes[node] == nullptr) { allocated = false; break; }
+                        memcpy(smaller->nodes[node], arena->nodes[node] + offset, bytes);
+                        smaller->pinned[node] = FastllmCudaHostRegister(smaller->nodes[node], bytes);
+                    }
+                    if (allocated && allPinned(smaller)) {
+                        for (size_t i = begin; i < end; ++i) {
+                            entryArenas[i] = smaller;
+                            entryOffsets[i] = entries[i].offset - offset;
+                        }
+                        recovered += end - begin;
+                        return;
+                    }
+                    // Retire partial registrations before trying smaller ranges.
+                    // An unsplittable failure retains the original CPU fallback.
+                    smaller.reset();
+                    if (end - begin > 1) {
+                        const size_t middle = begin + (end - begin) / 2;
+                        retry(begin, middle);
+                        retry(middle, end);
+                    }
+                };
+                if (entries.size() > 1) {
+                    const size_t middle = entries.size() / 2;
+                    retry(0, middle);
+                    retry(middle, entries.size());
+                } else {
+                    retry(0, 1);
+                }
+                printf("NUMA MoE arena registration retry: %zu/%zu weights recovered.\n",
+                       recovered, entries.size());
+            }
+#endif
             {
                 auto &owners = GetNumasMoeWeightArenaOwners();
                 std::lock_guard<std::mutex> guard(owners.mutex);
                 owners.weights.reserve(owners.weights.size() + entries.size());
-                for (const Entry &entry : entries) {
+                for (size_t i = 0; i < entries.size(); ++i) {
+                    const Entry &entry = entries[i];
+                    const auto &owner = entryArenas[i];
                     Data *weight = entry.weight;
                     weight->numasData.resize(config->numaCnt);
-                    owners.weights.emplace(weight, arena);
+                    owners.weights.emplace(weight, owner);
                     for (int node = 0; node < config->numaCnt; ++node) {
-                        weight->numasData[node] = arena->nodes[node] + entry.offset;
+                        weight->numasData[node] = owner->nodes[node] + entryOffsets[i];
                     }
                     weight->numasNVFP4AllScalesFuseMagic = false;
                     weight->expansionBytes = weight->GetBytes();
-                    weight->isPinned = pinned;
+                    weight->isPinned = allPinned(owner);
                 }
             }
             registered = true;

@@ -1499,6 +1499,12 @@ if (UNIT_TEST)
                 ENVIRONMENT "FT_NUMAS=1;FT_THREADS=4;FT_GPU_PREFILL=1;FASTLLM_ACTIVATE_NUMA=ON"
                 LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
         endif()
+        add_executable(numas_allowed_topology_test test/basic/test_numas_allowed_topology.cpp)
+        target_link_libraries(numas_allowed_topology_test PRIVATE fastllm)
+        fastllm_add_checked_test(numas_allowed_topology numas_allowed_topology_test
+            "PASS: inherited NUMA topology" 60)
+        set_tests_properties(numas_allowed_topology PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 60)
+
         add_executable(numas_nvfp4_moe_test test/basic/test_numas_nvfp4_moe.cpp)
         target_link_libraries(numas_nvfp4_moe_test PRIVATE fastllm)
         add_test(NAME numas_nvfp4_moe COMMAND numas_nvfp4_moe_test)
@@ -2556,6 +2562,26 @@ if (UNIT_TEST)
         set_tests_properties(cuda_qwen4_shared_expert PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
 
         if (USE_NUMAS AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+            add_library(cuda_host_register_fault SHARED test/basic/cuda_host_register_fault.cpp)
+            target_include_directories(cuda_host_register_fault PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            target_link_libraries(cuda_host_register_fault PRIVATE ${CMAKE_DL_LIBS})
+            add_executable(cuda_mapped_host_test test/basic/test_cuda_mapped_host.cu)
+            target_include_directories(cuda_mapped_host_test PRIVATE include)
+            set_target_properties(cuda_mapped_host_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON CUDA_RUNTIME_LIBRARY Shared)
+            foreach(mode normal split failure)
+                fastllm_add_checked_test(cuda_mapped_host_${mode} cuda_mapped_host_test "PASS mapped host" 120 --${mode})
+                set_tests_properties(cuda_mapped_host_${mode} PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+            endforeach()
+            set_tests_properties(cuda_mapped_host_split PROPERTIES
+                ENVIRONMENT "LD_PRELOAD=$<TARGET_FILE:cuda_host_register_fault>;FASTLLM_TEST_PIN_MAX_BYTES=16777216")
+            set_tests_properties(cuda_mapped_host_failure PROPERTIES
+                ENVIRONMENT "LD_PRELOAD=$<TARGET_FILE:cuda_host_register_fault>;FASTLLM_TEST_PIN_MAX_BYTES=0")
+            fastllm_add_checked_test(numas_moe_pin_retry numas_moe_batch_register_test "PASS: bounded NUMA arenas" 120)
+            fastllm_add_checked_test(numas_moe_pin_failure numas_moe_batch_register_test "PASS: bounded NUMA arenas" 120 --pin-failure)
+            set_tests_properties(numas_moe_pin_retry PROPERTIES
+                ENVIRONMENT "FT_NUMAS=1;FT_THREADS=4;FT_PINNED_WEIGHT=1;LD_PRELOAD=$<TARGET_FILE:cuda_host_register_fault>;FASTLLM_TEST_PIN_MAX_BYTES=65536" LABELS cuda RUN_SERIAL TRUE)
+            set_tests_properties(numas_moe_pin_failure PROPERTIES
+                ENVIRONMENT "FT_NUMAS=1;FT_THREADS=4;FT_PINNED_WEIGHT=1;LD_PRELOAD=$<TARGET_FILE:cuda_host_register_fault>;FASTLLM_TEST_PIN_MAX_BYTES=0" LABELS cuda RUN_SERIAL TRUE)
             add_executable(numas_cuda_affinity_test test/basic/test_numas_cuda_affinity.cpp)
             target_link_libraries(numas_cuda_affinity_test PRIVATE fastllm)
             add_test(NAME numas_cuda_affinity COMMAND numas_cuda_affinity_test)
@@ -2706,8 +2732,14 @@ if (UNIT_TEST)
 
         add_executable(cuda_shared_weight_upload_test test/basic/test_cuda_shared_weight_upload.cu)
         target_link_libraries(cuda_shared_weight_upload_test PRIVATE fastllm)
-        set_target_properties(cuda_shared_weight_upload_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        set_target_properties(cuda_shared_weight_upload_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON CUDA_RUNTIME_LIBRARY Shared)
         add_test(NAME cuda_shared_weight_upload COMMAND cuda_shared_weight_upload_test)
+        if (TARGET cuda_host_register_fault)
+            fastllm_add_checked_test(cuda_shared_weight_upload_registered cuda_shared_weight_upload_test
+                "ALL_PASS shared auxiliary DMA across registrations" 120 --registered-auxiliary)
+            set_tests_properties(cuda_shared_weight_upload_registered PROPERTIES LABELS cuda RUN_SERIAL TRUE
+                ENVIRONMENT "LD_PRELOAD=$<TARGET_FILE:cuda_host_register_fault>;FASTLLM_TEST_PIN_MAX_BYTES=16777216")
+        endif()
         set_tests_properties(cuda_shared_weight_upload PROPERTIES LABELS "cuda;moe;numa" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
 
         if (FASTLLM_CUDA_SM120_SOURCES)
@@ -2947,9 +2979,19 @@ if (UNIT_TEST)
 
         add_executable(cuda_qwen4_kvmem_test test/basic/test_cuda_qwen4_kvmem.cu)
         target_link_libraries(cuda_qwen4_kvmem_test PRIVATE fastllm)
-        set_target_properties(cuda_qwen4_kvmem_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        set_target_properties(cuda_qwen4_kvmem_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON CUDA_RUNTIME_LIBRARY Shared)
         fastllm_add_checked_test(cuda_qwen4_kvmem cuda_qwen4_kvmem_test "PASS exact QSA host/device storage" 600)
         set_tests_properties(cuda_qwen4_kvmem PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+        if(TARGET cuda_host_register_fault)
+            fastllm_add_checked_test(cuda_qwen4_kvmem_pin_recovery cuda_qwen4_kvmem_test
+                "PASS exact QSA host/device storage with split pinned backing" 180 --pin-recovery)
+            set_tests_properties(cuda_qwen4_kvmem_pin_recovery PROPERTIES LABELS cuda RUN_SERIAL TRUE TIMEOUT 180
+                ENVIRONMENT "LD_PRELOAD=$<TARGET_FILE:cuda_host_register_fault>;FASTLLM_TEST_PIN_MAX_BYTES=16777216")
+            fastllm_add_checked_test(cuda_qwen4_kvmem_pin_failure cuda_qwen4_kvmem_test
+                "PASS exact QSA host/device storage allocation failure cleanup" 60 --pin-failure)
+            set_tests_properties(cuda_qwen4_kvmem_pin_failure PROPERTIES LABELS cuda RUN_SERIAL TRUE TIMEOUT 60
+                ENVIRONMENT "LD_PRELOAD=$<TARGET_FILE:cuda_host_register_fault>;FASTLLM_TEST_PIN_MAX_BYTES=0")
+        endif()
 
         add_executable(cuda_qwen4_confidence_test test/basic/test_cuda_qwen4_confidence.cu)
         target_link_libraries(cuda_qwen4_confidence_test PRIVATE fastllm)
