@@ -6160,9 +6160,12 @@ void FastllmCudaNaiveDraftTPReduce(void *opaque, int rank, fastllm::Data &data) 
         (data.dataType == fastllm::BFLOAT16 || data.dataType == fastllm::FLOAT32) &&
         data.dataDeviceIds == std::vector<int>{group->devices[rank]},
         "Invalid draft TP reduction.");
-    fastllm::AssertInFastLLM(ncclAllReduce(data.cudaData, data.cudaData, data.Count(0),
+    const auto status = ncclAllReduce(data.cudaData, data.cudaData, data.Count(0),
         data.dataType == fastllm::FLOAT32 ? ncclFloat : ncclBfloat16,
-        ncclSum, group->comms[rank], cudaStreamPerThread) == ncclSuccess, "Draft TP reduction failed.");
+        ncclSum, group->comms[rank], cudaStreamPerThread);
+    if (status != ncclSuccess)
+        fastllm::ErrorInFastLLM("Draft TP reduction failed on rank " + std::to_string(rank) +
+            ": " + ncclGetErrorString(status));
 }
 
 #include "naive-n05-indexer-context.cuh"

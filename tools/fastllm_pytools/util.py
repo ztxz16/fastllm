@@ -1023,7 +1023,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--max_batch', type = int, default = -1,  help = '每次最多同时推理的询问数量')
     parser.add_argument('--chunked_prefill_size', type = _integer_or_auto, default = -1, help = '分块 prefill 的切片大小（首块与后续块相同），如8192；auto按混推内存预算选择')
     parser.add_argument('--prefill_batch_tokens', type=int, default=0,
-                        help='prefill 攒批的未缓存 token 目标，0关闭；当前仅支持 Naive 普通 TP GPU 推理；批量总预算至少为 chunked_prefill_size')
+                        help='prefill 攒批的未缓存 token 目标，0关闭；支持 Naive TP GPU 推理及 DSpark；批量总预算至少为 chunked_prefill_size')
     parser.add_argument('--prefill_max_wait_ms', type=int, default=0,
                         help='prefill 攒批最长等待毫秒数，0不等待；需设置 prefill_batch_tokens；等待期间继续 decode')
     parser.add_argument('--prefill_batch_requests', type=int, default=0,

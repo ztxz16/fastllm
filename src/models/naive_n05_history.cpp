@@ -30,6 +30,9 @@ void NaiveN05FlashModel::OnResponseContextCreated(ResponseContext *context) {
     tpCacheEpoch.fetch_add(1, std::memory_order_relaxed);
     RestoreTensorParallelCache(context);
     std::lock_guard<std::mutex> guard(historyMutex);
+    // Register ownership without touching CUDA. Batched prefill initializes
+    // draft state on the inference thread, just like single-request prefill.
+    if (draftEnabled) draftContexts.try_emplace(&context->pastKeyValues);
     if (saveHistoryChat && context->multimodalInput.empty())
         activePrefixes.try_emplace(&context->pastKeyValues.front().first);
 }
@@ -41,6 +44,10 @@ void NaiveN05FlashModel::OnResponseContextRemoved(ResponseContext *context) {
     std::lock_guard<std::mutex> guard(historyMutex);
     activePrefixes.erase(key);
     auto draft = draftContexts.find(&context->pastKeyValues);
+    if (draft != draftContexts.end() && !draft->second) {
+        draftContexts.erase(draft);
+        return;
+    }
     if (draft != draftContexts.end()) {
         const auto &s = *draft->second;
         if (verbose && s.rounds)

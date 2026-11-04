@@ -118,7 +118,11 @@ void NaiveN05FlashModel::InitSparseKv() {
             (full.headDim + full.valueDim) * unit;
         const size_t reserve = totalBytes.at(tpDevices[rank]) * (1.0 - GetGpuMemRatio());
         if (freeBytes.at(tpDevices[rank]) <= reserve || deviceBytes > freeBytes.at(tpDevices[rank]) - reserve)
-            throw std::invalid_argument("MiMo KVMem GPU budget insufficient for hot KV, Indexer, metadata and four SWA prefix checkpoints per request; reduce tokens/max_batch/max_tokens/resident_tokens or increase gpu_mem_ratio");
+            throw std::invalid_argument("MiMo KVMem GPU budget insufficient on device " +
+                std::to_string(tpDevices[rank]) + " (free=" + std::to_string(freeBytes.at(tpDevices[rank]) >> 20) +
+                " MiB, required=" + std::to_string(deviceBytes >> 20) + " MiB, reserve=" +
+                std::to_string(reserve >> 20) + " MiB) for hot KV, Indexer, metadata and four SWA prefix checkpoints per request; "
+                "reduce tokens/max_batch/max_tokens/resident_tokens or increase gpu_mem_ratio");
         FastllmCudaSetDevice(tpDevices[rank]);
         auto r = std::make_unique<SparseKvState::Rank>();
         r->layers.resize(block_cnt); r->indexers.resize(block_cnt); r->windows.resize(block_cnt);

@@ -212,6 +212,11 @@ namespace fastllm {
             double Uniform() { return std::generate_canonical<double, 53>(random); }
         };
         struct TargetWorkspace;
+        std::vector<int> ForwardTargetBatch(int batch, const Data &inputIds,
+            const std::vector<Data *> &attentionMask, const std::vector<Data *> &positionIds,
+            const std::vector<int> &seqLens, std::vector<std::pair<Data *, Data *>> &pastKeyValues,
+            const std::vector<GenerationConfig> &configs, const LastTokensManager &lastTokens,
+            std::vector<std::vector<float> *> *retLogits, TargetCapture *capture = nullptr);
         Data RunTarget(const Data &inputIds, const Data &positions,
                        std::vector<std::pair<Data, Data>> &kv, const GenerationConfig &config,
                        TargetCapture *capture, int tpRank = -1, const Data *embedding = nullptr,

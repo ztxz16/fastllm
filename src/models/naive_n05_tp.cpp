@@ -415,6 +415,36 @@ void NaiveN05FlashModel::PrepareTensorParallelMemory() {
     TargetCapture capture; capture.collectHidden = true; capture.borrowOutputs = true;
     if (!sparseKv) ForwardTensorParallel(ids, pos, cache, config, &capture, &selection);
     cache.clear(); capture.hidden.clear();
+    if (prefillBatchPolicy.targetTokens > 0) {
+        // KVMem executes an admitted prefill group in bounded sub-batches.
+        // Its release policy remains independent of this workspace budget.
+        const int prefillRows = std::min(batch, prefillBatchPolicy.maxRequests > 0
+            ? prefillBatchPolicy.maxRequests : batch);
+        const int prefillTotal = kvMemConfig.enabled ? GetChunkedPrefillSize()
+            : GetBatchedPrefillTokenLimit();
+        if (prefillRows > 1 && prefillTotal >= prefillRows) {
+            std::vector<std::pair<Data, Data>> prefillRoots;
+            prefillRoots.reserve((size_t)prefillRows * block_cnt);
+            for (int i = 0; i < prefillRows * block_cnt; ++i)
+                prefillRoots.emplace_back(Data(kvCacheDataType), Data(kvCacheDataType));
+            std::vector<std::pair<Data *, Data *>> prefillPointers;
+            for (auto &root : prefillRoots) prefillPointers.emplace_back(&root.first, &root.second);
+            std::vector<int> prefillLengths(prefillRows, prefillTotal / prefillRows);
+            std::vector<GenerationConfig> prefillConfigs(prefillRows, config);
+            std::vector<float> prefillPositions;
+            for (int row = 0; row < prefillRows; ++row) {
+                prefillLengths[row] += row < prefillTotal % prefillRows;
+                prefillConfigs[row].input_token_length = prefillLengths[row];
+                for (int j = 0; j < prefillLengths[row]; ++j) prefillPositions.push_back(j);
+            }
+            TargetBatch prefill{prefillPointers, prefillConfigs, prefillLengths, block_cnt};
+            ids.CopyFrom(Data(FLOAT32, {1, prefillTotal}, std::vector<float>(prefillTotal, 1.0f)));
+            pos.CopyFrom(Data(FLOAT32, {1, prefillTotal}, prefillPositions));
+            ForwardTensorParallel(ids, pos, cache, config, &capture, &selection, &prefill);
+            prefillRoots.clear();
+            capture.hidden.clear();
+        }
+    }
     std::vector<std::pair<Data, Data>> roots;
     roots.reserve((size_t)batch * block_cnt);
     for (int i = 0; i < batch * block_cnt; ++i) roots.emplace_back(Data(kvCacheDataType), Data(kvCacheDataType));
@@ -1509,8 +1539,12 @@ Data NaiveN05FlashModel::ForwardSingleGPU(int rank, const Data &inputIds, const 
             candidateResult, batch, selection && (selection->cudaSampling || selection->cudaLogits));
     // Generic operators can move their inputs. Give every worker its own IDs.
     Data localIds(inputIds), localPositions(positions);
-    TargetWorkspace *workspace = batch ? tpBatchWorkspaces.at(rank).get() : capture && capture->verifying
-        ? tpVerifyWorkspaces.at(rank).get() : tpPrefillWorkspaces.at(rank).get();
+    // Single and ragged prefills never overlap. Share their largest tensors;
+    // keep decode/verification scratch separate from these growing buffers.
+    TargetWorkspace *workspace = capture && capture->verifying
+        ? (batch ? tpBatchWorkspaces.at(rank).get() : tpVerifyWorkspaces.at(rank).get())
+        : batch && batch->Decode() ? tpBatchWorkspaces.at(rank).get()
+        : tpPrefillWorkspaces.at(rank).get();
     Data logits = RunTarget(localIds, localPositions, kv, config, capture, rank, embedding, workspace, batch);
     if (candidateResult && !isIntermediateChunkedPrefill) {
         Data partial, top;

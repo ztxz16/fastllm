@@ -519,7 +519,7 @@ int NaiveN05FlashModel::GetKVCacheRetainedTokens(int layer) const {
 }
 
 bool NaiveN05FlashModel::SupportsPrefillBatching() const {
-    return !draftEnabled && tpDevices.size() > 1 && CanUseGPUForward() &&
+    return tpDevices.size() > 1 && CanUseGPUForward() &&
            !GetKVCacheInCPU();
 }
 
@@ -559,10 +559,20 @@ std::vector<int> NaiveN05FlashModel::ForwardBatch(int batch, const Data &inputId
     if (draftEnabled)
         return ForwardDraftBatch(batch, inputIds, positionIds, seqLens, pastKeyValues,
                                  configs, lastTokens, retLogits);
-    AssertInFastLLM(!draftEnabled && tpDevices.size() > 1 && batch > 0 &&
+    return ForwardTargetBatch(batch, inputIds, attentionMask, positionIds, seqLens,
+                              pastKeyValues, configs, lastTokens, retLogits);
+}
+
+std::vector<int> NaiveN05FlashModel::ForwardTargetBatch(int batch, const Data &inputIds,
+        const std::vector<Data *> &attentionMask, const std::vector<Data *> &positionIds,
+        const std::vector<int> &seqLens, std::vector<std::pair<Data *, Data *>> &pastKeyValues,
+        const std::vector<GenerationConfig> &configs, const LastTokensManager &lastTokens,
+        std::vector<std::vector<float> *> *retLogits, TargetCapture *capture) {
+    auto *trace = inference_trace::CurrentForward();
+    AssertInFastLLM(tpDevices.size() > 1 && batch > 0 &&
         (int)seqLens.size() == batch && (int)configs.size() == batch &&
         (int)positionIds.size() == batch && (int)pastKeyValues.size() == batch * block_cnt,
-        "Naive batch forward requires ordinary TP inference and complete request descriptors.");
+        "Naive batch forward requires TP inference and complete request descriptors.");
     TargetBatch requests{pastKeyValues, configs, seqLens, block_cnt};
     std::vector<float> packedPositions;
     packedPositions.reserve(inputIds.Count(0));
@@ -606,7 +616,7 @@ std::vector<int> NaiveN05FlashModel::ForwardBatch(int batch, const Data &inputId
     std::vector<std::pair<Data, Data>> unused;
     if (trace) trace->Mark("input_prepare_ms");
     Data logits = ForwardTensorParallel(inputIds, positions, unused, configs[0],
-                                        nullptr, &selection, &requests);
+                                        capture, &selection, &requests);
     if (!selection.sampledTokens.empty()) return selection.sampledTokens;
     std::vector<int> tokens(batch);
     if (!selection.candidates.dims.empty()) {
@@ -1562,7 +1572,12 @@ Data NaiveN05FlashModel::RunTarget(
                     view(rowAttention, attn, cfg.heads * cfg.valueDim);
                     rowPositions.Resize({1, count});
                     rowPositions.FakeFrom(positions, (size_t)offset * sizeof(float));
-                    auto &part = *buf.sequences[sequence];
+                    // Sequential prefill attention needs one scratch/history
+                    // buffer, regardless of the number of admitted requests.
+                    // Deferred Indexer scoring and decode keep independent rows.
+                    const bool sharedPrefill = !batch->Decode() && !decodeWorkspace &&
+                        !verifying && !batchPrefillIndex;
+                    auto &part = sharedPrefill ? buf : *buf.sequences[sequence];
                     if (decodeWorkspace || (capture && capture->ringVerify)) {
                         part.liveKeys.Resize({count});
                         part.liveKeys.FakeFrom(buf.liveKeys, offset * sizeof(int));
@@ -2070,7 +2085,12 @@ void NaiveN05FlashModel::WarmUp() {
         }
     }
     cache.clear();
+#ifdef USE_CUDA
     PrepareTensorParallelMemory();
+    // Ragged prefill warmup may leave large idle allocator blocks. Return only
+    // those blocks before KVMem sizing; graph-pinned and busy workspaces stay.
+    if (draftEnabled && prefillBatchPolicy.targetTokens > 0)
+        FastllmCudaReleaseIdleCachedBuffers();
     if (kvMemConfig.enabled) {
         InitSparseKv();
         if (draftEnabled) {
@@ -2080,9 +2100,12 @@ void NaiveN05FlashModel::WarmUp() {
             tpBatchVerifyGraphs.clear(); tpBatchVerifyState.reset();
             tpVerifyState.reset(); tpDecodeState.reset();
             PrepareTensorParallelMemory();
+            if (prefillBatchPolicy.targetTokens > 0)
+                FastllmCudaReleaseIdleCachedBuffers();
         }
     } else InitTensorParallelKVPool();
     PrepareTensorParallelServing();
+#endif
 }
 
 void NaiveN05FlashModel::PrepareSwaPrefillWorkspace(int rank, int length) {

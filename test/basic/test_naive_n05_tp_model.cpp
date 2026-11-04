@@ -107,7 +107,7 @@ struct NaiveN05GraphTestAccess {
         if (!inspectDraftPrefixAllocations) return;
         std::lock_guard<std::mutex> historyGuard(model.historyMutex);
         auto it = model.draftContexts.find(&kv);
-        if (it != model.draftContexts.end() && it->second->prefixHidden.cudaData && !it->second->prefixHidden.isFake) {
+        if (it != model.draftContexts.end() && it->second && it->second->prefixHidden.cudaData && !it->second->prefixHidden.isFake) {
             std::lock_guard<std::mutex> guard(draftPrefixAllocationMutex);
             draftPrefixAllocations.insert(it->second->prefixHidden.cudaData);
         }
@@ -282,6 +282,14 @@ class Fixture : public NaiveN05FlashModel {
     bool useRealScheduler = false;
     bool failDecodeAllocation = false;
     bool inspectDraftPrefix = false;
+    int batchedPrefills = 0;
+    std::vector<int> ForwardBatch(int batch, const Data &ids, const std::vector<Data *> &masks,
+            const std::vector<Data *> &positions, const std::vector<int> &lengths,
+            std::vector<std::pair<Data *, Data *>> &kv, const std::vector<GenerationConfig> &configs,
+            const LastTokensManager &tokens = LastTokensManager(), std::vector<std::vector<float> *> *logits = nullptr) override {
+        batchedPrefills += batch > 1 && std::any_of(lengths.begin(), lengths.end(), [](int n) { return n > 1; });
+        return NaiveN05FlashModel::ForwardBatch(batch, ids, masks, positions, lengths, kv, configs, tokens, logits);
+    }
     std::vector<float> observedDraft;
     int Forward(const Data &inputIds, const Data &attentionMask, const Data &positionIds,
                 std::vector<std::pair<Data, Data>> &kv,
@@ -797,7 +805,78 @@ class Fixture : public NaiveN05FlashModel {
                   << " max_abs=" << largestLogitAbsolute << std::endl;
     }
 #endif
-    void DraftPrefixChecks(bool sparse = false) {
+    void DraftPrefillOracle() {
+        SetSaveHistoryChat(false);
+        auto scores = [&](DraftContext &context) {
+            Data hidden = RunDraft(17, context), head = RunDraftHead(hidden), owned(head);
+            ToDataType(owned, FLOAT32); owned.ToDevice(DataDevice::CPU);
+            return std::vector<float>((float *)owned.cpuData, (float *)owned.cpuData + owned.Count(0));
+        };
+        int checks = 0;
+        for (int count : {2, 4, 8, 16, 24}) {
+            std::vector<std::unique_ptr<ResponseContext>> reference(count), actual(count);
+            for (int i = 0; i < count; ++i) for (auto *group : {&reference, &actual}) {
+                auto &ctx = (*group)[i]; ctx.reset(new ResponseContext());
+                ctx->Init(block_cnt, dataType, kvCacheDataType);
+                OnResponseContextCreated(ctx.get());
+            }
+            std::vector<int> past(count, 0);
+            for (int round = 0; round < 3; ++round) {
+                std::vector<float> packed;
+                std::vector<int> lengths(count);
+                std::vector<Data> positions(count);
+                std::vector<Data *> pos;
+                std::vector<GenerationConfig> configs(count);
+                std::vector<std::pair<Data *, Data *>> caches;
+                std::vector<std::vector<float>> expected(count), draftExpected(count), observed(count);
+                std::vector<std::vector<float> *> outputs;
+                for (int i = 0; i < count; ++i) {
+                    // One-token cold prompts, unequal boundaries, and long
+                    // append after a short prefill all share the same batch.
+                    const int choices[] = {1, 31, 257, 1023};
+                    lengths[i] = round == 0 ? choices[i % 4] : round == 1 ? 1 + i % 5 : 129;
+                    if (count == 2 && round == 0) lengths[i] = 1;
+                    auto &config = configs[i];
+                    config.input_token_length = past[i] + lengths[i];
+                    config.output_token_limit = 32; config.output_logits = true;
+                    config.top_k = 0; config.top_p = .95f; config.temperature = 0.7f + .1f * (i % 4);
+                    std::vector<float> ids(lengths[i]), coords(lengths[i]);
+                    for (int j = 0; j < lengths[i]; ++j) {
+                        ids[j] = ((past[i] + j) * 7 + i * 13) % 251; coords[j] = past[i] + j;
+                    }
+                    positions[i].CopyFrom(Data(FLOAT32, {1, lengths[i]}, coords));
+                    Forward(Data(FLOAT32, {1, lengths[i]}, ids), Data(), positions[i], reference[i]->pastKeyValues,
+                        config, LastTokensManager(), &expected[i]);
+                    draftExpected[i] = scores(*draftContexts.at(&reference[i]->pastKeyValues));
+                    packed.insert(packed.end(), ids.begin(), ids.end());
+                    pos.push_back(&positions[i]); outputs.push_back(&observed[i]);
+                    for (auto &layer : actual[i]->pastKeyValues) caches.emplace_back(&layer.first, &layer.second);
+                }
+                ForwardBatch(count, Data(FLOAT32, {1, (int)packed.size()}, packed), {}, pos, lengths,
+                    caches, configs, LastTokensManager(), &outputs);
+                for (int i = 0; i < count; ++i) {
+                    past[i] += lengths[i];
+                    if (observed[i].size() != expected[i].size()) throw std::runtime_error("prefill logits count");
+                    RequireCloseLogits(observed[i].data(), expected[i], "batched prefill target logits");
+                    auto draft = draftContexts.at(&actual[i]->pastKeyValues);
+                    if (!draft || draft->committed != past[i] || !draft->pending.empty())
+                        throw std::runtime_error("batched prefill draft position or pending queue");
+                    auto actualDraft = scores(*draft);
+                    RequireCloseLogits(actualDraft.data(), draftExpected[i], "batched prefill draft logits");
+                    ++checks;
+                }
+            }
+            for (auto *group : {&reference, &actual}) for (auto &ctx : *group) OnResponseContextRemoved(ctx.get());
+        }
+        // Cancellation before the first forward leaves only an ownership entry.
+        ResponseContext cancelled; cancelled.Init(block_cnt, dataType, kvCacheDataType);
+        OnResponseContextCreated(&cancelled); OnResponseContextRemoved(&cancelled);
+        if (draftContexts.count(&cancelled.pastKeyValues)) throw std::runtime_error("cancelled prefill retained draft owner");
+        std::cout << "DSPARK PREFILL ORACLE PASS cases=" << checks
+                  << " max_relative=" << largestLogitRelative << " max_abs=" << largestLogitAbsolute << std::endl;
+    }
+
+    void DraftPrefixChecks(bool sparse = false, bool batching = false) {
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
         inspectDraftPrefixAllocations = true;
 #endif
@@ -806,12 +885,16 @@ class Fixture : public NaiveN05FlashModel {
         draftHeads = 8; draftKvHeads = 2; draftHeadDim = 32; draftWindow = 1024;
         draftConfidenceThreshold = 0; draftTargetLayers = {0, 1};
         AddDraftTestWeights(weight, draftLayers, draftKvHeads, 256, true);
-        maxBatch = 16; SetMaxTokens(131072); SetChunkedPrefillSize(1024);
+        maxBatch = batching ? 48 : 16; SetMaxTokens(131072); SetChunkedPrefillSize(batching ? 8192 : 1024);
+        if (batching && !SetPrefillBatching(4096, 20, 4, 24, 1))
+            throw std::runtime_error("DSpark rejected existing prefill options");
         if (sparse) {
             KvMemConfig cfg; cfg.enabled = true; cfg.maxTokens = 8192; cfg.residentTokens = 8192;
             cfg.prefillTokens = 1024; cfg.hostBytes = 1ULL << 30; ConfigureKvMem(cfg);
         }
-        WarmUp(); useRealScheduler = true; eos_token_id = -1; eos_token_ids.clear();
+        WarmUp();
+        if (batching) DraftPrefillOracle();
+        useRealScheduler = true; eos_token_id = -1; eos_token_ids.clear();
         NaiveN05GraphTestAccess::CheckDraftWarmup(*this);
         auto &prefixPool = NaiveN05GraphTestAccess::DraftPrefixPool(*this);
         if (!prefixPool || prefixPool->draftStorage.size() != size_t(ranks))
@@ -897,7 +980,10 @@ class Fixture : public NaiveN05FlashModel {
         auto batch = [&](const std::vector<std::vector<int>> &prompts, bool sampled = false) {
             std::vector<int> handles;
             for (const auto &tokens : prompts) {
-                GenerationConfig cfg; cfg.top_k = sampled ? 0 : 1; cfg.output_token_limit = 20;
+                GenerationConfig cfg; cfg.top_k = sampled ? 0 : 1;
+                // Different completion lengths repeatedly shrink the TP draft
+                // graph's request tuple while other sampled requests continue.
+                cfg.output_token_limit = sampled ? 48 + (int)(handles.size() % 4) * 17 : 20;
                 cfg.temperature = 1.f; cfg.top_p = .95f;
                 cfg.input_token_length = tokens.size();
                 handles.push_back(LaunchResponseTokens(tokens, cfg));
@@ -906,7 +992,8 @@ class Fixture : public NaiveN05FlashModel {
             for (size_t i = 0; i < handles.size(); ++i) {
                 int token;
                 while ((token = FetchResponseTokens(handles[i])) >= 0) result[i].push_back(token);
-                if (result[i].size() != 20) throw std::runtime_error("speculative prefix batch ended early");
+                if (result[i].size() != (sampled ? 48 + i % 4 * 17 : 20))
+                    throw std::runtime_error("speculative prefix batch ended early");
             }
             return result;
         };
@@ -955,6 +1042,7 @@ class Fixture : public NaiveN05FlashModel {
             if (pagedRestores - before != count) throw std::runtime_error("sampled draft prefix miss");
         }
         ShutdownRuntime();
+        if (batching && !batchedPrefills) throw std::runtime_error("prefill batching was never exercised");
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
         idleDraftContext.reset();
         inspectDraftPrefixAllocations = false;
@@ -3383,6 +3471,16 @@ int main(int argc, char **argv) {
             std::cout << "KVMEM VERIFY GRAPH captures=" << verifyGraphCaptures
                       << " launches=" << verifyGraphLaunches << std::endl;
             unsetenv("FASTLLM_DSPARK_TP"); return 0;
+        }
+        if (argc > 2 && std::string(argv[2]) == "draft_prefill_batch") {
+            SetCudaEmbedding(true); SetCudaGraph(true);
+            setenv("FASTLLM_DSPARK_TP", std::to_string(ranks).c_str(), 1);
+            Fixture fixture(ranks, false, true, true, true);
+            const bool sparse = argc <= 4 || std::string(argv[4]) != "ordinary";
+            fixture.SetIndexerTPStorage(!sparse, sparse);
+            fixture.SetIndexerDataType(FP8_E4M3);
+            if (argc > 3 && std::string(argv[3]) == "fp8") fixture.SetKVCacheDataType(FP8_E4M3);
+            fixture.DraftPrefixChecks(sparse, true); unsetenv("FASTLLM_DSPARK_TP"); return 0;
         }
         if (argc > 2 && std::string(argv[2]) == "kvmem_draft_prefix") {
             SetCudaEmbedding(true); SetCudaGraph(true);

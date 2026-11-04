@@ -2263,20 +2263,125 @@ std::vector<int> NaiveN05FlashModel::ForwardDraftBatch(int batch, const Data &in
     AssertInFastLLM(batch > 0 && (int)seqLens.size() == batch &&
         (int)configs.size() == batch && (int)positionIds.size() == batch &&
         (int)pastKeyValues.size() == batch * block_cnt &&
-        std::all_of(seqLens.begin(), seqLens.end(), [](int n) { return n == 1; }),
-        "DSpark batch expects initialized single-token request descriptors.");
+        std::all_of(seqLens.begin(), seqLens.end(), [](int n) { return n > 0; }),
+        "DSpark batch expects complete nonempty request descriptors.");
     std::vector<std::vector<std::pair<Data, Data>> *> caches(batch, nullptr);
     std::vector<std::shared_ptr<DraftContext>> owners(batch);
     {
         std::lock_guard<std::mutex> guard(historyMutex);
-        for (const auto &entry : draftContexts) {
+        for (auto &entry : draftContexts) {
             if (entry.first->empty()) continue;
             for (int i = 0; i < batch; ++i)
                 if (&entry.first->front().first == pastKeyValues[i * block_cnt].first) {
                     caches[i] = const_cast<std::vector<std::pair<Data, Data>> *>(entry.first);
+                    if (!entry.second) entry.second = CreateDraftContext();
                     owners[i] = entry.second;
                 }
         }
+    }
+    bool prefill = false;
+    for (int i = 0; i < batch; ++i) {
+        AssertInFastLLM(caches[i] && owners[i] && positionIds[i],
+                       "DSpark request has no registered draft context.");
+        for (int layer = 0; layer < block_cnt; ++layer)
+            AssertInFastLLM(pastKeyValues[i * block_cnt + layer].first == &(*caches[i])[layer].first &&
+                pastKeyValues[i * block_cnt + layer].second == &(*caches[i])[layer].second,
+                "DSpark batch mixed request KV descriptors.");
+        prefill |= seqLens[i] != 1 || owners[i]->committed == 0 || owners[i]->kv.empty();
+    }
+    if (prefill) {
+        // Preserve the scheduler's coalescing target while reusing KVMem's
+        // existing bounded prefill workspace. All projections/MoE still batch
+        // within each group; oversized single requests use the normal path.
+        if (kvMemConfig.enabled && batch > 1 && inputIds.Count(0) > (size_t)GetChunkedPrefillSize()) {
+            std::vector<int> tokens;
+            int offset = 0;
+            for (int first = 0; first < batch;) {
+                int end = first + 1, count = seqLens[first];
+                while (end < batch && count + seqLens[end] <= GetChunkedPrefillSize())
+                    count += seqLens[end++];
+                Data input;
+                Split(inputIds, 1, offset, offset + count, input);
+                std::vector<Data *> positions(positionIds.begin() + first, positionIds.begin() + end);
+                std::vector<int> lengths(seqLens.begin() + first, seqLens.begin() + end);
+                std::vector<GenerationConfig> groupConfigs(configs.begin() + first, configs.begin() + end);
+                std::vector<std::pair<Data *, Data *>> groupKV(pastKeyValues.begin() + first * block_cnt,
+                    pastKeyValues.begin() + end * block_cnt);
+                LastTokensManager history;
+                std::vector<std::vector<float> *> outputs;
+                for (int i = first; i < end; ++i) {
+                    history.units.push_back(i < (int)lastTokens.units.size()
+                        ? lastTokens.units[i] : LastTokensUnit(configs[i].last_n));
+                    outputs.push_back(retLogits && i < (int)retLogits->size() ? (*retLogits)[i] : nullptr);
+                }
+                auto result = ForwardDraftBatch(end - first, input, positions, lengths, groupKV,
+                    groupConfigs, history, retLogits ? &outputs : nullptr);
+                tokens.insert(tokens.end(), result.begin(), result.end());
+                offset += count; first = end;
+            }
+            return tokens;
+        }
+
+        if (batch == 1) {
+            LastTokensManager history;
+            history.units.push_back(lastTokens.units.empty()
+                ? LastTokensUnit(configs[0].last_n) : lastTokens.units[0]);
+            return {ForwardDraft(inputIds, *positionIds[0], *caches[0], configs[0],
+                history, retLogits && !retLogits->empty() ? (*retLogits)[0] : nullptr)};
+        }
+        // A one-token cold prompt is also prefill. The scheduler separates
+        // phases; direct callers with queued speculative output retain the
+        // ordinary per-request path instead of overwriting pending state.
+        if (tpDevices.size() <= 1 || std::any_of(owners.begin(), owners.end(),
+                [](const auto &owner) { return !owner->pending.empty(); })) {
+            std::vector<int> tokens(batch);
+            int offset = 0;
+            for (int i = 0; i < batch; offset += seqLens[i++]) {
+                Data input;
+                Split(inputIds, 1, offset, offset + seqLens[i], input);
+                LastTokensManager history;
+                history.units.push_back(i < (int)lastTokens.units.size()
+                    ? lastTokens.units[i] : LastTokensUnit(configs[i].last_n));
+                tokens[i] = ForwardDraft(input, *positionIds[i], *caches[i], configs[i], history,
+                    retLogits && i < (int)retLogits->size() ? (*retLogits)[i] : nullptr);
+            }
+            return tokens;
+        }
+        TargetCapture capture;
+        capture.borrowOutputs = true;
+        capture.collectHidden = false;
+        std::vector<bool> collect(batch);
+        for (int i = 0; i < batch; ++i) {
+            const auto &key = caches[i]->front().first;
+            const int past = key.dims.empty() ? 0 : key.dims[1];
+            AssertInFastLLM(owners[i]->committed == past, "Naive target/draft cache length mismatch.");
+            const int start = std::max(0, configs[i].input_token_length - draftWindow - GetPageLen() + 1);
+            collect[i] = past + seqLens[i] > start;
+            capture.collectHidden |= collect[i];
+        }
+        auto tokens = ForwardTargetBatch(batch, inputIds, {}, positionIds, seqLens,
+            pastKeyValues, configs, lastTokens, retLogits, &capture);
+        int offset = 0;
+        for (int i = 0; i < batch; offset += seqLens[i++]) {
+            if (!collect[i]) {
+                owners[i]->committed += seqLens[i];
+                ClearDraftPrefixHidden(owners[i]->prefixHidden);
+                continue;
+            }
+            // Reuse the bounded single-request commit, including normalized
+            // prefix checkpoints and the generic draft projection fallback.
+            // Views borrow this prefill's features until all commits finish.
+            TargetCapture features;
+            for (int layer : draftTargetLayers) {
+                const Data &source = capture.hidden.at(layer);
+                auto &view = features.hidden[layer];
+                view.FakeFrom(source, (size_t)offset * embed_dim * source.unitSize);
+                view.Resize({1, seqLens[i], embed_dim});
+            }
+            if (i < (int)capture.prefixes.size()) features.prefixes = {capture.prefixes[i]};
+            CommitDraftContext(features, seqLens[i], *owners[i], *caches[i]);
+        }
+        return tokens;
     }
     Data ids(inputIds);
     ids.ToDevice(DataDevice::CPU);
@@ -2284,12 +2389,6 @@ std::vector<int> NaiveN05FlashModel::ForwardDraftBatch(int batch, const Data &in
                    "DSpark batch token count mismatch.");
     std::vector<int> anchors(batch), result(batch);
     for (int i = 0; i < batch; ++i) {
-        AssertInFastLLM(caches[i] && owners[i] && positionIds[i],
-                       "DSpark request has no initialized draft context.");
-        for (int layer = 0; layer < block_cnt; ++layer)
-            AssertInFastLLM(pastKeyValues[i * block_cnt + layer].first == &(*caches[i])[layer].first &&
-                pastKeyValues[i * block_cnt + layer].second == &(*caches[i])[layer].second,
-                "DSpark batch mixed request KV descriptors.");
         anchors[i] = (int)((float *)ids.cpuData)[i];
         if (!owners[i]->pending.empty())
             AssertInFastLLM(anchors[i] == owners[i]->pending.front().first,

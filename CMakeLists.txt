@@ -2368,6 +2368,14 @@ if (UNIT_TEST)
                 set_tests_properties(naive_n05_kvmem_draft_prefix_${NAIVE_SPARSE_DRAFT_KV}
                     PROPERTIES PASS_REGULAR_EXPRESSION "DSPARK PREFIX PASS")
             endforeach()
+            foreach(NAIVE_PREFILL_KV bf16 fp8)
+                add_test(NAME naive_n05_draft_prefill_batch_${NAIVE_PREFILL_KV}
+                    COMMAND naive_n05_verify_graph_test 4 draft_prefill_batch ${NAIVE_PREFILL_KV})
+                set_tests_properties(naive_n05_draft_prefill_batch_${NAIVE_PREFILL_KV} PROPERTIES
+                    LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 600
+                    ENVIRONMENT "FASTLLM_CUDA_SERVING_WARMUP=1"
+                    PASS_REGULAR_EXPRESSION "DSPARK PREFIX PASS")
+            endforeach()
             add_test(NAME naive_n05_kvmem_draft_small_cache COMMAND naive_n05_verify_graph_test 2 kvmem_draft fp8 5 2048)
             add_test(NAME naive_n05_kvmem_draft_block3 COMMAND naive_n05_verify_graph_test 2 kvmem_draft bf16 3 16384)
             add_test(NAME naive_n05_kvmem_draft_block7 COMMAND naive_n05_verify_graph_test 4 kvmem_draft fp8 7 4096)

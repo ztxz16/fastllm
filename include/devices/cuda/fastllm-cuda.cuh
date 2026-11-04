@@ -2760,6 +2760,8 @@ bool FastllmChunkGatedDeltaRuleVarlenPrefillNative(
     bool apply_decay_mask = false);
 
 void FastllmCudaSetDevice(int gpu_id);
+// Release only idle transient CUDA buffers; graph-pinned and busy buffers stay alive.
+void FastllmCudaReleaseIdleCachedBuffers(int device = -1);
 int FastllmCudaGetDevice();
 int FastllmCudaRuntimeArch();
 int GetPointerDeviceId(void *ptr);

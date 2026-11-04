@@ -5370,6 +5370,18 @@ static void FastllmCudaReleaseIdleCachedBuffersForDevice(int id) {
     }
 }
 
+void FastllmCudaReleaseIdleCachedBuffers(int device) {
+    const int previous = FastllmCudaGetDevice();
+    auto release = [&](int id) {
+        auto view = FastllmGetCudaMemPoolView(id);
+        std::lock_guard<std::mutex> lock(*view.lock);
+        FastllmCudaReleaseIdleCachedBuffersForDevice(id);
+    };
+    if (device >= 0) release(device);
+    else for (auto &view : FastllmSnapshotCudaMemPoolViews()) release(view.device);
+    FastllmCudaSetDevice(previous);
+}
+
 static bool FastllmCudaRetryMallocAfterReleasingIdle(
         size_t size, void **ret, int id, const char *file, int line,
         cudaError_t *failureState) {
