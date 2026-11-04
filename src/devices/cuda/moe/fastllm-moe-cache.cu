@@ -396,6 +396,8 @@ struct OffloadGroup {
     bool cpuDecodeReady = false;
     bool allowStreaming = false;
     double budgetFraction = 1.0;
+    std::map<int, uint64_t> deviceBudgets;
+    bool fullyResident = false;
     fastllm::cuda::SharedExpertLayout sharedLayout;
     // Ordinary GGUF kernels receive canonical records restored on the GPU
     // from these borrowed CPU layouts, without a second full host snapshot.
@@ -1328,7 +1330,10 @@ DeviceCache *GetDeviceCache(OffloadGroup &group, bool waitForAdmission = true) {
         cache.prefillOwnerRank = it - group.expertDevices.begin();
         cache.prefillOwnerCount = group.expertDevices.size();
     }
-    const uint64_t budgetBytes = uint64_t(DeviceCacheBudgetBytes(device) * group.budgetFraction);
+    const auto explicitBudget = group.deviceBudgets.find(device);
+    const uint64_t budgetBytes = explicitBudget == group.deviceBudgets.end()
+        ? uint64_t(DeviceCacheBudgetBytes(device) * group.budgetFraction) : explicitBudget->second;
+    if (group.fullyResident && !budgetBytes) return nullptr; // This is not the draft's executing device.
     const bool ppPlacement = group.expertDevices.empty() &&
         std::any_of(group.cacheDevices.begin(), group.cacheDevices.end(), [](int d) { return d >= 0; });
     // Hybrid V4.1 has independent CPU/staging paths for every cache miss.
@@ -1356,6 +1361,7 @@ DeviceCache *GetDeviceCache(OffloadGroup &group, bool waitForAdmission = true) {
 
     size_t freeBytes = 0, totalBytes = 0;
     if (cudaMemGetInfo(&freeBytes, &totalBytes) != cudaSuccess) {
+        fastllm::AssertInFastLLM(!group.fullyResident, "--draft-gpu-resident 1: CUDA memory query failed");
         return nullptr;
     }
     const size_t reserveBytes = std::min(
@@ -1401,6 +1407,8 @@ DeviceCache *GetDeviceCache(OffloadGroup &group, bool waitForAdmission = true) {
         for (size_t slot = 0; slot < slots; ++slot)
             cache.hostSlotOffsets[slot] = slot * group.layout.recordStride;
     }
+    fastllm::AssertInFastLLM(!group.fullyResident || slots == group.totalRecords,
+        "--draft-gpu-resident 1: insufficient free GPU memory for the complete draft expert cache");
     if (!streamOnly && smallHybridCache && slots < minimumSlots) {
         streamOnly = true;
         slots = cache.recordBytes = 0;
@@ -1420,6 +1428,7 @@ DeviceCache *GetDeviceCache(OffloadGroup &group, bool waitForAdmission = true) {
 
     cudaDeviceProp properties;
     if (cudaGetDeviceProperties(&properties, device) != cudaSuccess) {
+        fastllm::AssertInFastLLM(!group.fullyResident, "--draft-gpu-resident 1: CUDA device query failed");
         return nullptr;
     }
     cache.ensureThreads = fastllm::cuda::ExpertCacheThreads(
@@ -1496,6 +1505,7 @@ DeviceCache *GetDeviceCache(OffloadGroup &group, bool waitForAdmission = true) {
         ReleaseDeviceCache(cache);
         cache.attempted = true;
         cache.device = device;
+        fastllm::AssertInFastLLM(!group.fullyResident, "--draft-gpu-resident 1: complete draft cache allocation failed");
         return nullptr;
     }
 
@@ -1515,7 +1525,9 @@ DeviceCache *GetDeviceCache(OffloadGroup &group, bool waitForAdmission = true) {
     // SM75 reaches host-link bandwidth with fewer background restore CTAs.
     // Leave room for the output head and the next token's foreground kernels.
     if (properties.major == 7 && properties.minor == 5) cache.admissionCopyBlocks = 16;
-    if (!ppPlacement) PreloadCompleteNativeCache(group, cache);
+    if (!ppPlacement || group.fullyResident) PreloadCompleteNativeCache(group, cache);
+    fastllm::AssertInFastLLM(!group.fullyResident || cache.completeNative,
+        "--draft-gpu-resident 1: failed to populate the complete draft expert cache");
     cache.ready = true;
 
     std::fprintf(stderr,
@@ -2047,6 +2059,14 @@ bool FastllmCudaGlm5DiskExpert(const fastllm::Data &input, const fastllm::Data &
 bool FastllmCudaPrepareMoeCache(
         const FastllmCudaMoeCacheLayer *layers, int layerCount,
         const std::function<void()> &registerNumaWeights, bool allowStreaming) {
+    return FastllmCudaPrepareMoeCacheWithBudgets(layers, layerCount, registerNumaWeights,
+        allowStreaming, {}, false);
+}
+
+bool FastllmCudaPrepareMoeCacheWithBudgets(
+        const FastllmCudaMoeCacheLayer *layers, int layerCount,
+        const std::function<void()> &registerNumaWeights, bool allowStreaming,
+        const std::map<int, uint64_t> &deviceBudgets, bool fullyResident) {
     if (!FastllmCudaMoeCacheRequested() && !(allowStreaming && registerNumaWeights)) {
         return false;
     }
@@ -2169,9 +2189,15 @@ bool FastllmCudaPrepareMoeCache(
     // Every CUDA fallback and prefill restore explicitly consumes the tag.
     layout.planarMxfp4 = layout.weightType == fastllm::NVFP4_BLOCK_32_E8M0 &&
         bool(registerNumaWeights) &&
-        fastllm::CudaTritonMxfp4GroupedEnabled();
+        (fastllm::CudaTritonMxfp4GroupedEnabled() || (fullyResident && layout.deepSeekV41));
+    if (fullyResident && !layout.planarMxfp4) return false;
+    for (const auto &budget : deviceBudgets)
+        if (budget.first < 0 || budget.first >= FastllmCudaGetDeviceCount() ||
+            budget.second > DeviceCacheBudgetBytes(budget.first)) return false;
     std::unique_ptr<OffloadGroup> group(new OffloadGroup());
     group->layout = layout;
+    group->deviceBudgets = deviceBudgets;
+    group->fullyResident = fullyResident;
     for (int layer = 0; layer < layerCount; ++layer)
         group->cacheDevices.push_back(layers[layer].cacheDevice);
     group->allowStreaming = allowStreaming && registerNumaWeights &&

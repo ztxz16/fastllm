@@ -656,6 +656,18 @@ class AutoConfigTest(unittest.TestCase):
         self.resolve(a)
         self.assertEqual((a.max_batch, a.max_context_length, a.tokens, a.kv_cache_dtype), (4, 8192, 32768, 'fp8_e4m3'))
 
+    def test_forced_draft_residency_preserves_capacity_error_before_disk_fallback(self):
+        self.g.family = 'deepseek_v41'
+        seen = []
+        def reject(trial, *unused, **kw):
+            seen.append(trial.moe_device)
+            raise ValueError('complete draft exceeds device budget')
+        with patch.object(memory, 'plan', side_effect=reject):
+            with self.assertRaisesRegex(ValueError, 'complete draft exceeds device budget'):
+                self.resolve(self.args('--draft-gpu-resident', '1'))
+        self.assertIn('numa', seen)
+        self.assertNotIn('disk', seen)
+
     def test_unequal_expert_layers_use_weighted_pp_before_disk(self):
         self.g.family = 'deepseek_v41'
         self.g.layers = 6

@@ -1983,6 +1983,12 @@ bool FastllmCudaMoeCacheRequested();
 bool FastllmCudaPrepareMoeCache(
         const FastllmCudaMoeCacheLayer *layers, int layerCount,
         const std::function<void()> &registerNumaWeights = {}, bool allowStreaming = false);
+// Explicit subgroup reservations remain inside the model's per-device budget.
+// Fully resident groups fail if their executing device cannot hold every record.
+bool FastllmCudaPrepareMoeCacheWithBudgets(
+        const FastllmCudaMoeCacheLayer *layers, int layerCount,
+        const std::function<void()> &registerNumaWeights, bool allowStreaming,
+        const std::map<int, uint64_t> &deviceBudgets, bool fullyResident);
 bool FastllmCudaCanRunMoeCache(
         fastllm::Data **weights, int weightsBatch);
 

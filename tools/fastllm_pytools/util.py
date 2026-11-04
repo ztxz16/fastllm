@@ -1121,6 +1121,8 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         help = "MTP/DSpark/DFlash draft 模型目录；MTP 也可指定 mtp.safetensors 或 Qwen4 MTP GGUF")
     parser.add_argument("--draft_tokens", type = _positive_int, default = -1,
                         help = "每轮最多使用的 draft token 数；未指定时读取 draft 配置")
+    parser.add_argument("--draft_gpu_resident", "--draft-gpu-resident", type=int, choices=(0, 1), default=None,
+                        help="DeepSeek-V4.1 DSpark 草稿专家显存策略：1 要求全驻留，0 关闭全驻留优先；未指定保持现有策略。支持单卡/PP/TP，需 MXFP4 草稿；--auto 会检查预算，显存不足时报错")
     parser.add_argument("--speculative_num_draft_tokens", "--speculative-num-draft-tokens",
                         dest = "speculative_num_draft_tokens", type = int, default = -1,
                         help = "DFlash/Clover 每轮 block token 数（含 anchor）")
@@ -1215,6 +1217,14 @@ def make_normal_llm_model(args, startup_progress = None):
 
     if getattr(args, "autotune", False):
         args.auto = True
+
+    draft_gpu_resident = getattr(args, "draft_gpu_resident", None)
+    if draft_gpu_resident not in (None, 0, 1):
+        raise ValueError("--draft-gpu-resident must be 0 or 1")
+    # This is model configuration, not a sticky process-wide opt-in.
+    os.environ.pop("FASTLLM_DSPARK_GPU_RESIDENT", None)
+    if draft_gpu_resident is not None:
+        os.environ["FASTLLM_DSPARK_GPU_RESIDENT"] = str(int(draft_gpu_resident))
 
     if getattr(args, "auto", False):
         args._auto_explicit = [name for name in getattr(args, "_auto_explicit", ())
@@ -1803,6 +1813,8 @@ def make_normal_llm_model(args, startup_progress = None):
         prepare_clover(args, config)
     elif speculative_algorithm == "clover":
         raise ValueError("--speculative_algorithm clover requires a Clover checkpoint")
+    if draft_gpu_resident == 1 and (not is_deepseek_v41_model or args.dspark <= 0):
+        raise ValueError("--draft-gpu-resident 1 requires DeepSeek-V4.1 with DSpark enabled")
     automatic_plan = None
     if getattr(args, "autotune", False):
         from ftllm import llm
@@ -2025,6 +2037,14 @@ def make_normal_llm_model(args, startup_progress = None):
         llm.set_cuda_graph(graph_enabled)
     llm.set_moe_device_layers(-1)
     cache_bytes = _memory_size_bytes(getattr(args, "moe_cuda_cache", 0))
+    if draft_gpu_resident == 1:
+        from .hybrid_auto import devices as draft_devices, draft_cache_device
+        draft_cache_device(*draft_devices(args))  # Validate topology before loading weights.
+        if "disk" in str(args.moe_device):
+            raise ValueError("--draft-gpu-resident 1 requires CPU/NUMA or GPU-resident experts; disk expert caches are not supported")
+        if (args.moe_device_layers != 0 and cache_bytes <= 0 and
+                any(kind in str(args.moe_device) for kind in ("cpu", "numa", "disk"))):
+            raise ValueError("--draft-gpu-resident 1 requires a GPU expert cache; use --auto or --moe_cuda_cache")
     if hybrid_auto_plan and "moe_cuda_cache_per_device" in hybrid_auto_plan:
         llm.set_moe_cuda_cache(cache_bytes, hybrid_auto_plan["moe_cuda_cache_per_device"])
     else:

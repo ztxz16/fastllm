@@ -937,6 +937,115 @@ class HybridAutoTest(unittest.TestCase):
         self.assertLess(smaller["chunked_prefill_size"], 1024)
         self.assertGreaterEqual(smaller["moe_cuda_cache"], 16*(24*MiB+256))
 
+    def test_draft_residency_cli_is_opt_in(self):
+        parser = make_normal_parser("test")
+        self.assertIsNone(parser.parse_args([]).draft_gpu_resident)
+        for flag in ("--draft_gpu_resident", "--draft-gpu-resident"):
+            for value in (0, 1):
+                self.assertEqual(parser.parse_args([flag, str(value)]).draft_gpu_resident, value)
+
+    def draft_residency_fixture(self, **changes):
+        g = auto.geometry(self.dspark_metadata(), "fp4", 0, 7)
+        g.runtime["expert_records"] = {0:16*MiB, 4:24*MiB, 5:24*MiB}
+        a = args(auto=True, dspark=7, moe_device_layers=-1, chunked_prefill_size=1024,
+                 tokens=8192, max_context_length=8192, **changes)
+        return a, g, ([4*GiB]*4+[GiB]*2, [MiB]*6, 0, 0, MiB, False), \
+            {3:dict(total=32*GiB, free=32*GiB), 7:dict(total=32*GiB, free=32*GiB)}, \
+            dict(total=128*GiB, available=128*GiB)
+
+    def test_draft_residency_reserves_only_the_final_pp_device(self):
+        a, g, costs, gpu, ram = self.draft_residency_fixture(draft_gpu_resident=1)
+        plan = auto.plan(a, g, costs, "pp", {3:1, 7:1}, gpu, ram, per_device_cache=True)
+        self.assertEqual(plan['draft_gpu_reserved_bytes'], {7:2*GiB+24*MiB})
+        for device in gpu:
+            self.assertLessEqual(plan['gpu_estimated_bytes'][device], plan['gpu_budget_bytes'][device])
+        single = auto.plan(a, g, costs, "pp", {3:1}, gpu, ram)
+        self.assertEqual(single['draft_gpu_reserved_bytes'], {3:2*GiB+24*MiB})
+
+    def test_draft_residency_tp_reserves_the_first_rank_without_replication(self):
+        a, g, costs, gpu, ram = self.draft_residency_fixture(draft_gpu_resident=1)
+        for mapping in ({3:1, 7:1},):
+            with self.subTest(mapping=mapping):
+                plan = auto.plan(a, g, costs, "tp", mapping, gpu, ram)
+                self.assertEqual(plan['draft_gpu_reserved_bytes'], {next(iter(mapping)):2*GiB+24*MiB})
+                for device in mapping:
+                    self.assertLessEqual(plan['gpu_estimated_bytes'][device], plan['gpu_budget_bytes'][device])
+        a.moe_cuda_cache = GiB
+        with self.assertRaisesRegex(ValueError, 'draft-gpu-resident 1.*do not fit'):
+            auto.plan(a, g, costs, "tp", {3:1, 7:1}, gpu, ram)
+
+    def test_draft_residency_rejects_reverse_tp_without_reordering(self):
+        a, g, costs, gpu, ram = self.draft_residency_fixture(draft_gpu_resident=1)
+        mapping = {7:1, 3:1}
+        with self.assertRaisesRegex(ValueError, 'ascending TP CUDA ordinals'):
+            auto.plan(a, g, costs, "tp", mapping, gpu, ram)
+        self.assertEqual(list(mapping), [7, 3])
+        a.draft_gpu_resident = 0
+        self.assertNotIn('draft_gpu_reserved_bytes', auto.plan(a, g, costs, "tp", mapping, gpu, ram))
+
+    def test_draft_residency_reverse_tp_fails_before_weight_loading(self):
+        with tempfile.TemporaryDirectory() as path, patch.dict(os.environ, {}, clear=True):
+            Path(path, 'config.json').write_text(json.dumps(self.dspark_metadata()))
+            runtime = MagicMock()
+            argv = [path, '--dspark', '7', '--device', 'cuda', '--moe_device', 'numa',
+                    '--moe_cuda_cache', '8G', '--threads', '1', '--tokens', '8192',
+                    '--draft-gpu-resident', '1', '--tp', 'cuda:7,3']
+            with patch.dict(sys.modules, {'ftllm':types.SimpleNamespace(llm=runtime)}), redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(ValueError, 'ascending TP CUDA ordinals'):
+                    make_normal_llm_model(make_normal_parser('test').parse_args(argv))
+            runtime.model.assert_not_called()
+
+    def test_draft_residency_tp_defaults_keep_the_existing_plan(self):
+        a, g, costs, gpu, ram = self.draft_residency_fixture()
+        baseline = auto.plan(a, g, costs, "tp", {3:1, 7:1}, gpu, ram)
+        a.draft_gpu_resident = 0
+        self.assertEqual(auto.plan(a, g, costs, "tp", {3:1, 7:1}, gpu, ram), baseline)
+
+    def test_draft_residency_insufficient_explicit_cache_fails_without_changing_defaults(self):
+        a, g, costs, gpu, ram = self.draft_residency_fixture(moe_cuda_cache=GiB)
+        baseline = auto.plan(a, g, costs, "pp", {3:1, 7:1}, gpu, ram)
+        a.draft_gpu_resident = 0
+        self.assertEqual(auto.plan(a, g, costs, "pp", {3:1, 7:1}, gpu, ram), baseline)
+        a.draft_gpu_resident = 1
+        with self.assertRaisesRegex(ValueError, 'draft-gpu-resident 1.*do not fit'):
+            auto.plan(a, g, costs, "pp", {3:1, 7:1}, gpu, ram)
+        self.assertEqual(a.moe_cuda_cache, GiB)
+
+    def test_draft_residency_rejects_disk_experts_and_inactive_draft(self):
+        a, g, costs, gpu, ram = self.draft_residency_fixture(draft_gpu_resident=1)
+        a.moe_device = 'disk'
+        with self.assertRaisesRegex(ValueError, 'disk expert caches'):
+            auto.plan(a, g, costs, "pp", {3:1, 7:1}, gpu, ram)
+        a.moe_device = 'numa'
+        g.dspark_block_size = 0
+        with self.assertRaisesRegex(ValueError, 'DSpark'):
+            auto.plan(a, g, costs, "pp", {3:1, 7:1}, gpu, ram)
+
+    def test_draft_residency_does_not_cache_already_resident_experts_twice(self):
+        a, g, costs, gpu, ram = self.draft_residency_fixture(draft_gpu_resident=1, moe_cuda_cache=0)
+        a.moe_device_layers = 0
+        plan = auto.plan(a, g, costs, "pp", {3:1, 7:1}, gpu, ram, allow_full_gpu=True)
+        self.assertEqual(plan['draft_gpu_reserved_bytes'], {})
+        self.assertEqual(plan['moe_cuda_cache'], 0)
+
+    def test_draft_residency_runtime_switch_does_not_leak_between_models(self):
+        with tempfile.TemporaryDirectory() as path, patch.dict(os.environ, {}, clear=True):
+            Path(path, 'config.json').write_text(json.dumps(self.dspark_metadata()))
+            runtime = MagicMock()
+            runtime.model.side_effect = RuntimeError('test load boundary')
+            for value, tp in ((1, ''), (1, 'cuda:3,7'), (0, ''), (None, '')):
+                argv = [path, '--dspark', '7', '--device', 'cuda', '--moe_device', 'numa',
+                        '--moe_cuda_cache', '8G', '--threads', '1', '--tokens', '8192']
+                if value is not None:
+                    argv += ['--draft-gpu-resident', str(value)]
+                if tp:
+                    argv += ['--tp', tp]
+                with patch.dict(sys.modules, {'ftllm':types.SimpleNamespace(llm=runtime)}), redirect_stdout(io.StringIO()):
+                    with self.assertRaisesRegex(RuntimeError, 'test load boundary'):
+                        make_normal_llm_model(make_normal_parser('test').parse_args(argv))
+                self.assertEqual(os.environ.get('FASTLLM_DSPARK_GPU_RESIDENT'),
+                                 None if value is None else str(value))
+
     def test_v41_capture_disabled_keeps_persistent_prefill_reserve(self):
         g = auto.geometry(self.dspark_metadata(), "fp4", 0, 7)
         g.runtime["expert_records"] = {i: 16 * MiB for i in range(g.layers)}

@@ -99,10 +99,44 @@ namespace fastllm {
             };
             const uint64_t mainBytes = payload(routedWeights), draftBytes = payload(draftWeights);
             double draftFraction = draftBytes ? double(draftBytes) / (mainBytes + draftBytes) : 0;
+            const char *draftResidency = std::getenv("FASTLLM_DSPARK_GPU_RESIDENT");
+            if (draftResidency && std::string(draftResidency) == "1" && draftWeights.empty()) {
+                for (int stage = 0; stage < int(v41DsparkMoeWeights.size()); ++stage)
+                    AssertInFastLLM(!UsesHostMoe(SelectSpecialWeightDevice("mtp." + std::to_string(stage) +
+                        ".ffn.experts.0.gateup.weight", std::max(0, block_cnt - v41DsparkLayers + stage))),
+                        "--draft-gpu-resident 1 requires all host draft stages to support the native expert cache");
+            }
+            const bool fullDraft = draftResidency && std::string(draftResidency) == "1" && draftBytes;
+            const bool automaticDraft = !draftResidency || !*draftResidency;
+            std::map<int, uint64_t> mainBudgets, draftBudgets;
+            int draftDevice = -1;
+            if (fullDraft) {
+                AssertInFastLLM(!tp || std::is_sorted(v41DsparkTpDevices.begin(), v41DsparkTpDevices.end()),
+                    "--draft-gpu-resident 1 requires ascending TP CUDA ordinals; select physical GPU order with CUDA_VISIBLE_DEVICES");
+                AssertInFastLLM(supported && (!tp || !v41DsparkTpDevices.empty()) &&
+                    draftWeights[0][2]->dataType == NVFP4_BLOCK_32_E8M0,
+                    "--draft-gpu-resident 1 requires DeepSeek-V4.1 MXFP4 DSpark experts on CUDA");
+                // DSpark runs its host-backed experts on the TP root, while
+                // PP places the draft after the final target stage.
+                draftDevice = tp ? v41DsparkTpDevices.front() :
+                    stages.empty() ? FastllmCudaGetDevice() : stages.back().device;
+                const uint64_t record = draftWeights[0][2]->GetBytes() + draftWeights[0][3]->GetBytes();
+                const uint64_t reserve = draftBytes + record;
+                AssertInFastLLM(GetMoeCudaCacheDeviceBytes(draftDevice) >= reserve,
+                    "--draft-gpu-resident 1: draft GPU cache budget is too small; use --auto or increase --moe_cuda_cache");
+                for (int device = 0; device < FastllmCudaGetDeviceCount(); ++device) {
+                    draftBudgets[device] = device == draftDevice ? reserve : 0;
+                    mainBudgets[device] = GetMoeCudaCacheDeviceBytes(device) - draftBudgets[device];
+                }
+                // Explicit byte reservations replace payload-proportional sharing.
+                draftFraction = 1.0;
+                printf("[Fastllm] DSpark full GPU residency: device %d, %.3f GiB reserved within the expert cache budget.\n",
+                    draftDevice, reserve / double(1ULL << 30));
+            }
             // On a single GPU, a small native draft group can fit completely
             // inside the existing expert budget. Avoid recurrent CPU misses
             // without increasing the model's total cache allocation.
-            if (!tp && FastllmCudaGetDeviceCount() == 1 && CudaTritonMxfp4GroupedEnabled() && draftBytes &&
+            if (automaticDraft && !tp && FastllmCudaGetDeviceCount() == 1 && CudaTritonMxfp4GroupedEnabled() && draftBytes &&
                 weights[0][2]->dataType == NVFP4_BLOCK_32_E8M0 &&
                 !draftWeights.empty() && draftWeights[0][2]->dataType == NVFP4_BLOCK_32_E8M0) {
                 const uint64_t budget = GetMoeCudaCacheDeviceBytes(0);
@@ -112,7 +146,8 @@ namespace fastllm {
                 if (budget && draftBytes <= budget / 4 && record <= budget / 4 - draftBytes)
                     draftFraction = double(draftBytes + record) / budget;
             }
-            HybridMoeCachePlan cache(HybridMoeMath::DeepSeekV41, swiglu_limit, 1.0 - draftFraction);
+            HybridMoeCachePlan cache(HybridMoeMath::DeepSeekV41, swiglu_limit,
+                fullDraft ? 1.0 : 1.0 - draftFraction);
             for (int layer = 0; layer < block_cnt; ++layer) {
                 const auto device = SelectMoeDeviceForLayer(layer);
                 // GPU-resident layers are not members of the host cache.
@@ -128,21 +163,24 @@ namespace fastllm {
             }
             if (supported && cpuHost) WarmupNumaMoeWeights(true);
             if (!supported || !cache.Prepare(
-                    [this] { WarmupNumaMoeWeights(true); }, streamGGUF)) {
+                    [this] { WarmupNumaMoeWeights(true); }, streamGGUF, mainBudgets, false)) {
                 fprintf(stderr, "[Fastllm] V4.1 expert cache requires host FP8 block128, NVFP4 block32 or supported GGUF experts, "
                     "CUDA shared experts and ordinary math; using the configured backend.\n");
             }
             if (supported && !draftWeights.empty()) {
-                HybridMoeCachePlan draftCache(HybridMoeMath::DeepSeekV41, swiglu_limit, draftFraction);
+                HybridMoeCachePlan draftCache(HybridMoeMath::DeepSeekV41, swiglu_limit,
+                    draftFraction);
                 for (size_t stage = 0; stage < draftWeights.size(); ++stage) {
                     auto &table = draftWeights[stage];
                     table[0] = table[1] = nullptr;
                     draftCache.Add(table, SelectSpecialWeightDevice("mtp." + std::to_string(stage) +
                         ".ffn.experts.0.gateup.weight", std::max(0, block_cnt - v41DsparkLayers + int(stage))),
-                        tpOwners.empty() ? -1 : tpOwners.front());
+                        fullDraft ? draftDevice : tpOwners.empty() ? -1 : tpOwners.front());
                 }
-                if (!draftCache.Prepare([this] { WarmupNumaMoeWeights(true); }))
+                if (!draftCache.Prepare([this] { WarmupNumaMoeWeights(true); }, false, draftBudgets, fullDraft)) {
+                    AssertInFastLLM(!fullDraft, "--draft-gpu-resident 1: complete draft expert cache preparation failed");
                     fprintf(stderr, "[Fastllm] DSpark expert cache unavailable; retaining host fallback.\n");
+                }
             }
         }
         // A complete decode step spans every layer. Admission runs afterward,

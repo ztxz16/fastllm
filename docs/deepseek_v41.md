@@ -568,6 +568,38 @@ ftllm server /models/DeepSeek-V4.1-Flash-1017-IQ2_XXS-00001-of-00004.gguf \
 `--speculative_algorithm off` 会同时关闭草稿加载。auto 计入草稿权重、状态和验证工作区；
 MXFP4 专家无损转换为原生紧凑布局，磁盘主干的草稿专家保持 CPU/NUMA 常驻，计入主存预算。
 
+`--draft-gpu-resident 1` 显式要求 DSpark 的 MXFP4 路由专家完整缓存到草稿运行的 GPU。
+不传此参数保留现有策略；`--draft-gpu-resident 0` 关闭优先全驻留，继续按现有比例分配草稿缓存，
+并不表示强制草稿全部在 CPU 上执行。也支持下划线写法 `--draft_gpu_resident`。
+
+```bash
+ftllm server /models/DeepSeek-V4.1-Flash-1017-IQ2_XXS.gguf \
+  --auto --draft /models/dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf \
+  --draft-gpu-resident 1
+```
+
+支持单 CUDA 设备、PP 或 TP，适用于 GGUF 主模型搭配 MXFP4 DSpark，也适用于原生 MXFP4 草稿；
+此选项不要求 Triton。`--auto` 在原有总显存预算内为完整草稿预留空间，可能减小 prefill chunk
+或调整主模型专家缓存。PP 在最后一个设备、TP 在第一张 TP 卡预留完整草稿；其他卡保留主模型缓存，
+不会为每张 TP 卡复制一份完整草稿。草稿主执行与专家缓存留在 TP 首卡，现有的 TP attention/head 路径继续使用。
+TP 卡号需按升序指定；反序 TP 尚未通过数值校验，此选项会在加载前拒绝反序配置。
+如需指定另一张物理首卡，可调整 `CUDA_VISIBLE_DEVICES` 顺序，再使用 `--tp 2`。
+
+兼容性处理：TP 混合执行开启强制草稿常驻时，custom all-reduce 与目标图回放的组合出现过错误输出，
+当前会保留目标模型的逐算子执行，草稿专家仍完整缓存到 GPU；单卡、PP 和未指定此选项的策略不变。
+显式设置 `FASTLLM_CUDA_CUSTOM_ALLREDUCE=0` 使用 NCCL 时可保留目标图加速。
+这属于正确性回退，图回放差异的底层原因尚未解决，不能保证强制常驻一定更快。
+
+```bash
+ftllm server /models/DeepSeek-V4.1-Flash-1017-IQ2_XXS.gguf \
+  --auto --tp 2 --draft /models/dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf \
+  --draft-gpu-resident 1
+```
+
+当前支持 CPU/NUMA 专家缓存或原本已在 GPU 上的专家，不支持 `--moe_device disk` 的磁盘专家缓存；Engram 仍可放磁盘。
+手动配置需提供足够的 `--moe_cuda_cache`；预算不足、运行时无法完整分配或不支持的配置会报错，
+不会静默退回部分驻留。CPU/NUMA 专家存储仍保留，主存预算不会因此降低。
+
 `--mmproj /models/mmproj-BF16.gguf` 支持 `clip` / `deepseek41v` 视觉模块，也可以和上述草稿一起加载。
 视觉配置从 GGUF 读取，无需 `--ori`；auto 另外预留视觉权重和工作区。
 图像输入还要求主干每层的 `ffn.gate.bias_vl`。部分 GSQ 纯文本导出省略了这些偏置，

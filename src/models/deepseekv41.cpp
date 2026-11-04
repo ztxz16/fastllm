@@ -4634,12 +4634,16 @@ namespace fastllm {
         }
 
         // 排查用：位 0～3 分别回放 pre / post / route / sharedExpert，默认全开。
-        int V41DecodeCudaGraphReplayMask() {
+        int V41DecodeCudaGraphReplayMask(bool residentTpDraft = false) {
             static const int mask = []() -> int {
                 const char *env = std::getenv("FASTLLM_DSV41_CUDA_GRAPH_REPLAY_MASK");
                 return env != nullptr && env[0] != 0 ? atoi(env) : 15;
             }();
-            return mask;
+            // Forced resident TP drafts currently corrupt random verification
+            // under combined custom-collective graph replay. Retain the normal
+            // operator dispatch until that replay path has a numerical fix.
+            // NCCL and the existing placement policy keep their graph paths.
+            return residentTpDraft && FastllmCudaCustomAllReduceEnabled() ? 0 : mask;
         }
 
         // 排查用：让第 N 段的捕获强制失败，验证"就地退回逐算子"这条回退路径
@@ -4828,8 +4832,8 @@ namespace fastllm {
         }
 
         void V41ComposeGraphSegments(DeepSeekV41CudaGraphState &state,
-                                     bool crossLayer, const std::vector<int> &engramLayers) {
-            if (!state.tensorParallel || (V41DecodeCudaGraphReplayMask() & 14) != 14) return;
+                                     bool crossLayer, const std::vector<int> &engramLayers, int replayMask) {
+            if (!state.tensorParallel || (replayMask & 14) != 14) return;
             const int original = FastllmCudaGetDevice();
             for (int first = 1; first + 2 < (int)state.segments.size(); first += 4) {
                 if (!state.segments[first + 2].containsGpuMoe) continue;
@@ -4840,7 +4844,7 @@ namespace fastllm {
                 if (!eligible) continue;
                 int last = first + 2;
                 const int nextLayer = (first + 3) / kV41GraphSegmentsPerLayer;
-                if (crossLayer && (V41DecodeCudaGraphReplayMask() & 1) &&
+                if (crossLayer && (replayMask & 1) &&
                     first + 3 < (int)state.segments.size() &&
                     std::find(engramLayers.begin(), engramLayers.end(), nextLayer) == engramLayers.end() &&
                     !state.segments[first + 3].passthrough &&
@@ -7209,7 +7213,8 @@ namespace fastllm {
                     graphPoolOpen = false;
                 }
                 if (ok) {
-                    V41ComposeGraphSegments(*graphState, !dsparkVerify && !v41DsparkEnabled, engram_layer_ids);
+                    V41ComposeGraphSegments(*graphState, !dsparkVerify && !v41DsparkEnabled, engram_layer_ids,
+                        V41DecodeCudaGraphReplayMask(executionMode == ExecutionMode::Hybrid && tp && V41EnvFlag("FASTLLM_DSPARK_GPU_RESIDENT")));
                     graphState->captured = true;
                     CollectForwardGraphPointers(f, graphState->boundaryPointers);
                     if (V41DecodeCudaGraphVerbose()) {
@@ -7694,7 +7699,9 @@ namespace fastllm {
         const auto &segments = boundedPrefill ? tailSegments : inputSegments;
 #ifdef USE_CUDA
             if (graphReplay) {
-                if ((V41DecodeCudaGraphReplayMask() & (1 << (index % kV41GraphSegmentsPerLayer))) == 0 ||
+                const bool residentTpDraft = executionMode == ExecutionMode::Hybrid && f.tp &&
+                    V41EnvFlag("FASTLLM_DSPARK_GPU_RESIDENT");
+                if ((V41DecodeCudaGraphReplayMask(residentTpDraft) & (1 << (index % kV41GraphSegmentsPerLayer))) == 0 ||
                     (index < (int)graphState->segments.size() &&
                      graphState->segments[index].passthrough)) {
                     body();

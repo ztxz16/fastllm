@@ -45,6 +45,11 @@ void HybridMoeCachePlan::Add(const std::vector<Data *> &weights,
 }
 bool HybridMoeCachePlan::Prepare(const std::function<void()> &registerNumaWeights,
                                  bool allowStreaming) const {
+    return Prepare(registerNumaWeights, allowStreaming, {}, false);
+}
+bool HybridMoeCachePlan::Prepare(const std::function<void()> &registerNumaWeights,
+                                 bool allowStreaming, const std::map<int, uint64_t> &deviceBudgets,
+                                 bool fullyResident) const {
 #if defined(USE_CUDA) && !defined(USE_ROCM)
     if (layers.empty()) return false;
 #ifdef USE_NUMAS
@@ -81,8 +86,8 @@ bool HybridMoeCachePlan::Prepare(const std::function<void()> &registerNumaWeight
     }
     // The backend retains format-dependent snapshot/registration order and
     // publishes a cache only after validation. Failure leaves host fallback intact.
-    if (!FastllmCudaPrepareMoeCache(cacheLayers.data(), static_cast<int>(cacheLayers.size()),
-            registerWeights, allowStreaming)) return false;
+    if (!FastllmCudaPrepareMoeCacheWithBudgets(cacheLayers.data(), static_cast<int>(cacheLayers.size()),
+            registerWeights, allowStreaming, deviceBudgets, fullyResident)) return false;
     return FastllmCudaSetMoeCacheBudgetFraction(const_cast<Data **>(layers.front().weights),
         layers.front().count, budgetFraction);
 #else

@@ -580,6 +580,10 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
         backends.insert(1, "cpu")
     if "moe_device" in explicit and base.moe_device:
         backends = [base.moe_device]
+    elif getattr(base, "draft_gpu_resident", None) == 1:
+        # Disk experts use a separate cache allocator. Do not replace the
+        # useful host/GPU capacity error with an unsupported disk fallback.
+        backends = [backend for backend in backends if backend != "disk"]
     tables = [base.ngram_device] if "ngram_device" in explicit else ["cpu", "disk"]
     table_bytes = sum(t.bytes for t in tensors if memory.is_lookup_table(t.name))
     if "ngram_device" not in explicit and table_bytes > max(4 * memory.GiB, ram["total"] // 10):

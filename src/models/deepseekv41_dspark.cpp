@@ -2296,7 +2296,10 @@ namespace fastllm {
         std::unique_lock<std::mutex> graphLock(v41CudaGraphMutex, std::defer_lock);
         const std::vector<int> graphDevices = v41DsparkTpDevices.empty()
             ? std::vector<int>{FastllmCudaGetDevice()} : v41DsparkTpDevices;
-        residentDraft = v41DsparkTpDevices.empty();
+        // A forced resident TP draft keeps every routed expert on its root.
+        // Capture those local kernels with the existing TP attention/head;
+        // they need neither CPU mailboxes nor the packet-output restriction.
+        residentDraft = v41DsparkTpDevices.empty() || DsEnvFlag("FASTLLM_DSPARK_GPU_RESIDENT");
         if (residentDraft) for (auto &table : v41DsparkMoeWeights)
             residentDraft &= FastllmCudaMoeCacheFullyResident(table.data(), int(table.size()));
         // The draft backbone keeps its host experts on the root even with TP

@@ -578,6 +578,18 @@ def devices(args):
     return "pp", result
 
 
+def draft_cache_device(mode, mapping):
+    """Select the complete draft cache owner within a validated topology."""
+    if mode == "tp":
+        # Reversed TP currently fails native numerical comparisons, including
+        # without full residency. Reject it for this explicit opt-in policy.
+        if list(mapping) != sorted(mapping):
+            raise ValueError("--draft-gpu-resident 1 requires ascending TP CUDA ordinals; "
+                             "select physical GPU order with CUDA_VISIBLE_DEVICES and use --tp 2")
+        return next(iter(mapping))
+    return next(reversed(mapping))
+
+
 def layer_device(layer, layers, mapping):
     cumulative, total = 0, sum(mapping.values())
     for device, weight in mapping.items():
@@ -1174,6 +1186,12 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
          hybrid_cpu_embedding=False, disk_experts=False):
     """Deterministic capacity solver. Explicit fields are never overwritten."""
     experts, dense, common, host, largest, snapshot = costs
+    full_draft = getattr(args, "draft_gpu_resident", None) == 1
+    if full_draft and (model.family != "deepseek_v41" or not model.dspark_block_size or mode not in ("pp", "tp")):
+        raise ValueError("--draft-gpu-resident 1 requires DeepSeek-V4.1 DSpark on CUDA")
+    draft_device = draft_cache_device(mode, mapping) if full_draft else None
+    if full_draft and "disk" in str(args.moe_device):
+        raise ValueError("--draft-gpu-resident 1 requires CPU/NUMA or GPU-resident experts; disk expert caches are not supported")
     context = int(args.max_context_length) if args.max_context_length > 0 else model.context
     tokens = int(args.tokens) if args.tokens > 0 else context
     if context > model.context or tokens <= 0:
@@ -1381,7 +1399,24 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
                     if budget < 16 * (record + 256):
                         budget = 0
                 cache[d] = budget
-            if (cache_auto and model.dspark_block_size and
+            draft_reserve = {}
+            if full_draft:
+                draft_layers = [i for i in range(model.layers, len(experts)) if experts[i]]
+                draft_host = [i for i in draft_layers if expert_layer(i, model) >= resident]
+                # The native draft cache registers the entire host-backed group.
+                if draft_host and len(draft_host) != len(draft_layers):
+                    continue
+                if draft_host:
+                    record = max((model.runtime.get("expert_records", {}).get(i, 0)
+                                  for i in draft_host), default=0)
+                    if not record:
+                        raise ValueError("--draft-gpu-resident 1 requires draft expert record sizes")
+                    # Match ApplyDsparkDevice: TP root, otherwise final PP device.
+                    device = draft_device
+                    draft_reserve[device] = sum(experts[i] for i in draft_host) + record
+                    if cache[device] < draft_reserve[device]:
+                        continue
+            if (not full_draft and cache_auto and model.dspark_block_size and
                     (args.moe_device == "numa" or (args.moe_device == "cpu" and getattr(args, "_host_moe_shared", False))) and
                     any(runtime["graphs"].values())):
                 draft_host = [i for i in range(model.layers, len(experts))
@@ -1446,6 +1481,9 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
                     "auto_gpu_memory_limit": gpu_memory_limit,
                     "auto_host_memory_limit": host_memory_limit,
                     "force_ddr_limit": host_memory_override}
+            if full_draft:
+                candidate["draft_gpu_resident"] = True
+                candidate["draft_gpu_reserved_bytes"] = draft_reserve
             if independent and host_experts:
                 candidate["moe_cuda_cache_per_device"] = cache
             if model.family == "deepseek_v41":
@@ -1470,6 +1508,9 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
             return selected
     if selected is not None:
         return selected
+    if full_draft:
+        raise ValueError("--draft-gpu-resident 1: complete draft experts and requested model settings do not fit the memory budget; "
+                         "omit the flag to keep the existing policy, or adjust explicit cache/context/chunk settings")
     raise ValueError("Hybrid auto: requested context, batch, explicit caches and weights do not fit the measured memory budget; "
                      "reduce an explicit cache/resident allocation, use disk experts, or choose smaller context/chunk explicitly")
 

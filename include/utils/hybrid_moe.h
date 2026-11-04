@@ -33,6 +33,8 @@ public:
              int cacheDevice = -1);
     bool Prepare(const std::function<void()> &registerNumaWeights = {},
                  bool allowStreaming = false) const;
+    bool Prepare(const std::function<void()> &registerNumaWeights, bool allowStreaming,
+                 const std::map<int, uint64_t> &deviceBudgets, bool fullyResident) const;
 private:
     struct Layer { Data *const *weights; int count; int cacheDevice; };
     std::vector<Layer> layers;
