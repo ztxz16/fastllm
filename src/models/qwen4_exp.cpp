@@ -11045,6 +11045,12 @@ namespace fastllm {
         auto &usedDecodeCudaGraph = f.usedDecodeCudaGraph;
         auto &logits = f.logits;
         auto &qsaPreviousLength = f.qsaPreviousLength;
+        // The graph has submitted every expert reader. Retire the mailbox and
+        // plan admissions while its final dense/head work is still running,
+        // before sampling synchronizes the host. The backend keeps eviction
+        // and uploads ordered after all submitted readers on this stream.
+        if (usedDecodeCudaGraph && f.hybridStep && UseFullHybridGraph())
+            f.hybridStep->decodeStep.Finish();
         if (prefill) {
             if (hiddenStates != prefill->hidden) prefill->hidden->CopyFrom(*hiddenStates);
             // Intermediate chunks still feed the draft's shifted prompt KV.
