@@ -105,8 +105,8 @@ bool FastllmCudaMoeGGUFGrouped(const fastllm::Data &input, fastllm::Data &gate,
         deepSeekV41, swigluLimit, nullptr);
 }
 
-size_t fastllm_gguf_mmq::StreamedMoeWorkspaceBytes(int rows, int hidden, int inter, int topk, int capacity, bool nativeV41) {
-    return grouped_moe::StreamedWorkspace(nullptr, rows, hidden, inter, topk, capacity, nativeV41).bytes;
+size_t fastllm_gguf_mmq::StreamedMoeWorkspaceBytes(int rows, int hidden, int inter, int topk, int capacity, bool nativeV41, bool compactScratch) {
+    return grouped_moe::StreamedWorkspace(nullptr, rows, hidden, inter, topk, capacity, nativeV41, compactScratch).bytes;
 }
 
 bool fastllm_gguf_mmq::RunStreamedMoe(StreamedMoePhase phase, const fastllm::Data &input,

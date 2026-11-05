@@ -283,9 +283,12 @@ static bool RunPipelined(const fastllm::Data &input, fastllm::Data &gate,
     const size_t computeOffset = metaOffset + (direct ? metaBytes : pooledMetadata);
     const int allocationCapacity = (direct || workspace.cudaWorkspace)
         ? capacity : rows * topk + 15 * batchExperts;
+    // Borrowed prefill arenas opt into compact scratch; other models retain
+    // their existing workspace contract and activation materialization.
+    const bool compactScratch = workspace.cudaWorkspace && !glm5 && !nativeV41;
     const size_t bytes = Align(computeOffset + StreamedMoeWorkspaceBytes(
-        rows, hidden, inter, topk, allocationCapacity, nativeV41));
-    const size_t gateBytes = nativeV41 ? 0 : size_t(rows) * topk * inter * (input.dataType == fastllm::FLOAT32 ? 4 : 2);
+        rows, hidden, inter, topk, allocationCapacity, nativeV41, compactScratch));
+    const size_t gateBytes = nativeV41 || compactScratch ? 0 : size_t(rows) * topk * inter * (input.dataType == fastllm::FLOAT32 ? 4 : 2);
     // This eager-only workspace persists across layers. Tiny routing-driven
     // growth used to leave each retired hundreds-of-MiB block in the general
     // tensor pool. Own it directly so growth releases the old allocation;
@@ -478,7 +481,8 @@ static bool RunPipelined(const fastllm::Data &input, fastllm::Data &gate,
     CUDA_CHECK(cudaMemcpyAsync(base + metaOffset, metadata.data(), metaBytes, cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaEventRecord(pipeline.metadata, stream));
     CUDA_CHECK(cudaStreamWaitEvent(pipeline.restore, pipeline.metadata, 0));
-    auto run = [&](StreamedMoePhase phase, const StreamedMoeBatch &batch) {
+    auto run = [&](StreamedMoePhase phase, StreamedMoeBatch batch) {
+        batch.compactScratch = compactScratch;
         fastllm::AssertInFastLLM(RunStreamedMoe(phase, input, gate, output, base + computeOffset,
             capacity, hidden, inter, topk, gt, dt, batch,
             reinterpret_cast<const float *>(base + metaOffset + scoreOffset), glm5, swigluLimit,

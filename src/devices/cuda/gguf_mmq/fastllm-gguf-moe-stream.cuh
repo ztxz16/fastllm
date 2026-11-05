@@ -8,10 +8,11 @@ struct StreamedMoeBatch {
     int experts = 0, rows = 0;
     const uint8_t *const *weights = nullptr;
     const int *counts = nullptr, *offsets = nullptr, *tileExperts = nullptr, *routes = nullptr;
+    bool compactScratch = false; // Valid routes replace full partial-output clearing.
     bool diskIQ1M = false; // Ordinary canonical disk gate; other callers retain MMQ policy.
 };
 enum class StreamedMoePhase { Prepare, Compute, Finish };
-size_t StreamedMoeWorkspaceBytes(int rows, int hidden, int inter, int topk, int capacity, bool nativeV41 = false);
+size_t StreamedMoeWorkspaceBytes(int rows, int hidden, int inter, int topk, int capacity, bool nativeV41 = false, bool compactScratch = false);
 bool RunStreamedMoe(StreamedMoePhase phase, const fastllm::Data &input,
     fastllm::Data &gate, fastllm::Data &output, void *workspace, int capacity,
     int hidden, int inter, int topk, int gateType, int downType,
