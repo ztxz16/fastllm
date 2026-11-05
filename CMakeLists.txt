@@ -2627,6 +2627,12 @@ if (UNIT_TEST)
                 ENVIRONMENT "FT_NUMAS=1;FT_THREADS=4"
                 LABELS "cuda;hybrid" RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
 
+            fastllm_add_checked_test(cuda_qwen4_mailbox_cache_overlap
+                cuda_standard_moe_mailbox_test "ALL_PASS" 360 --cache-overlap)
+            set_tests_properties(cuda_qwen4_mailbox_cache_overlap PROPERTIES
+                ENVIRONMENT "FT_NUMAS=1;FT_THREADS=4"
+                LABELS "cuda;hybrid" RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
+
             add_executable(numas_cuda_affinity_test test/basic/test_numas_cuda_affinity.cpp)
             target_link_libraries(numas_cuda_affinity_test PRIVATE fastllm)
             add_test(NAME numas_cuda_affinity COMMAND numas_cuda_affinity_test)

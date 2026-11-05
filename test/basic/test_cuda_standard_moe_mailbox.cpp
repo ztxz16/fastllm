@@ -74,7 +74,7 @@ static std::unique_ptr<Data> Weight(int kind, int rows, int columns, int seed, b
     return w;
 }
 static void Run(int gateKind, int downKind, int hidden = 256, int inter = 128, int passes = 40,
-                bool ownedPp = false, int device = 0, bool qwenTopk10 = false) {
+                bool ownedPp = false, int device = 0, bool qwenTopk10 = false, bool overlapReplay = false) {
     constexpr int experts = 64, layers = 2;
     const int topk = qwenTopk10 ? 10 : 6;
     Cuda(cudaSetDevice(device));
@@ -154,8 +154,8 @@ static void Run(int gateKind, int downKind, int hidden = 256, int inter = 128, i
     // sweep separate so exhaustive placement enumeration remains bounded.
     const std::vector<DataType> types = qwenTopk10 ? std::vector<DataType>{FLOAT16}
                                                  : std::vector<DataType>{FLOAT32, FLOAT16, BFLOAT16};
-    const std::vector<int> rowCounts = qwenTopk10 ? std::vector<int>{1, 2, 3, 4, 9}
-                                               : std::vector<int>{1, 2, 4, 8};
+    const std::vector<int> rowCounts = overlapReplay ? std::vector<int>{1, 3} :
+        qwenTopk10 ? std::vector<int>{1, 2, 3, 4, 9} : std::vector<int>{1, 2, 4, 8};
     for (DataType dtype : types) for (int rows : rowCounts) {
         Data input(dtype, {rows, hidden}), ids[layers], scores[layers], output[layers]; Gpu(input);
         for (int layer = 0; layer < layers; ++layer) {
@@ -211,16 +211,37 @@ static void Run(int gateKind, int downKind, int hidden = 256, int inter = 128, i
                 Cuda(cudaMemcpy(ids[layer].cudaData, route.data(), route.size()*4, cudaMemcpyHostToDevice));
                 Cuda(cudaMemcpy(scores[layer].cudaData, scoresHost.data(), scoresHost.size()*4, cudaMemcpyHostToDevice));
             }
-            scope = FastllmCudaBeginMoeDecode(weights[0].data(),weights[0].size(),topk);
-            Require(scope, "replay policy scope");
-            Require(qwenTopk10 ? managed.Launch() :
-                FastllmCudaLaunchNativeMoeFullGraph(pass%3 ? replay : exec,handles,layers,pass%3==0), "Standard full replay");
-            FastllmCudaEndMoeDecode(scope);
-            for (int layer = 0; layer < layers; ++layer) {
-                actual[layer].resize(rows*hidden);
-                Cuda(cudaMemcpy(actual[layer].data(),output[layer].cudaData,actual[layer].size()*4,cudaMemcpyDeviceToHost));
+            const int replays = overlapReplay ? 3 : 1;
+            Data snapshots[layers];
+            if (overlapReplay) for (auto &snapshot : snapshots) {
+                snapshot.dataType = FLOAT32;
+                snapshot.Resize({replays, rows, hidden}); Gpu(snapshot);
             }
+            for (int replayIndex = 0; replayIndex < replays; ++replayIndex) {
+                scope = FastllmCudaBeginMoeDecode(weights[0].data(),weights[0].size(),topk);
+                Require(scope, "replay policy scope");
+                // Match the model's owner validation with uploads outstanding.
+                // No host readback or eager oracle may drain the upload stream
+                // between these replays; snapshot every output on the device.
+                if (overlapReplay) for (int layer = 0; layer < layers; ++layer)
+                    Require(FastllmCudaNativeMoeGraphOwner(weights[layer].data(),
+                        weights[layer].size(), rows) == scope, "hot replay changed cache owner");
+                Require(qwenTopk10 ? managed.Launch() :
+                    FastllmCudaLaunchNativeMoeFullGraph(pass%3 ? replay : exec,handles,layers,pass%3==0), "Standard full replay");
+                if (overlapReplay) for (int layer = 0; layer < layers; ++layer)
+                    Cuda(cudaMemcpyAsync(static_cast<float *>(snapshots[layer].cudaData) + replayIndex*rows*hidden,
+                        output[layer].cudaData, size_t(rows)*hidden*4, cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+                FastllmCudaEndMoeDecode(scope);
+            }
+            std::vector<float> saved[layers];
             for (int layer = 0; layer < layers; ++layer) {
+                saved[layer].resize(size_t(replays)*rows*hidden);
+                Cuda(cudaMemcpy(saved[layer].data(), overlapReplay ? snapshots[layer].cudaData : output[layer].cudaData,
+                    saved[layer].size()*4, cudaMemcpyDeviceToHost));
+            }
+            for (int replayIndex = 0; replayIndex < replays; ++replayIndex) for (int layer = 0; layer < layers; ++layer) {
+                actual[layer].assign(saved[layer].begin()+replayIndex*rows*hidden,
+                                     saved[layer].begin()+(replayIndex+1)*rows*hidden);
                 // Standard NUMA and CUDA retain different activation rounding.
                 // Build independent existing CPU/GPU expert references using
                 // the actual preceding activation, then require each output row
@@ -293,7 +314,8 @@ int main(int argc, char **argv) {
     try {
         if (!FastllmCudaGetDeviceCount()) return 77;
         SetThreads(4); SetCudaGraph(true);
-        const bool qwenTopk10 = argc > 1 && std::strcmp(argv[1], "--qwen-topk10") == 0;
+        const bool overlapReplay = argc > 1 && std::strcmp(argv[1], "--cache-overlap") == 0;
+        const bool qwenTopk10 = overlapReplay || (argc > 1 && std::strcmp(argv[1], "--qwen-topk10") == 0);
         const bool modelShape = qwenTopk10 || (argc > 1 && std::strcmp(argv[1], "--model-shape") == 0);
         const bool placementPolicy = argc > 1 && std::strcmp(argv[1], "--placement-policy") == 0;
         if (placementPolicy) setenv("FASTLLM_TEST_PLACEMENT_POLICY", "1", 1);
@@ -302,7 +324,7 @@ int main(int argc, char **argv) {
         const int hidden = modelShape ? 2560 : 256, inter = modelShape ? 640 : 128;
         for (int device = 0; device < (ownedPp ? 2 : 1); ++device)
             for (auto pair : {std::pair<int,int>{-1,-1},{22,42},{42,42},{21,20},{18,20}})
-                Run(pair.first,pair.second,hidden,inter,placementPolicy ? 1 : modelShape || ownedPp ? 4 : 40,ownedPp,device,qwenTopk10);
+                Run(pair.first,pair.second,hidden,inter,placementPolicy ? 1 : overlapReplay ? 12 : modelShape || ownedPp ? 4 : 40,ownedPp,device,qwenTopk10,overlapReplay);
         std::puts("ALL_PASS"); return 0;
     } catch (const std::exception &e) { std::fprintf(stderr,"FAIL: %s\n",e.what()); return 1; }
 }

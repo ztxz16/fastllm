@@ -5596,8 +5596,12 @@ void *FastllmCudaNativeMoeGraphOwner(fastllm::Data **weights, int weightsBatch, 
     if (!standard && (!layout.deepSeekV41 ||
         (layout.weightType != fastllm::NVFP4_BLOCK_32_E8M0 &&
          layout.weightType != fastllm::FP8_E4M3_BLOCK_128 && !supportedGGUF))) return nullptr;
-    auto *cache = GetDeviceCache(*group, true);
+    // Preserve the existing readiness fence for non-Qwen models.
+    auto *cache = GetDeviceCache(*group, !standard);
     if (!cache || !NativeMailboxOwnsLayer(*group, *cache, table)) return nullptr;
+    // Qwen's native readers acquire published slots individually. Skip the
+    // all-upload fence only while that protocol owns this cache.
+    if (standard && !CanOverlapNativeAdmissions(*group, *cache)) WaitCacheAdmission(*cache);
     return cache;
 #else
     return nullptr;
