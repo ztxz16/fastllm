@@ -478,7 +478,7 @@ namespace fastllm {
 
         void RecordGpu(int device, int expertCount, double elapsedMs) {
             if (AutotuneRecording()) RecordAutotuneSample("numa_gpu", tuningKey, expertCount, elapsedMs, device);
-            if (device < 0 || expertCount <= 0 || elapsedMs <= 0.0) {
+            if (device < 0 || expertCount <= 0 || !std::isfinite(elapsedMs) || elapsedMs <= 0.0) {
                 return;
             }
             const double sample = elapsedMs / expertCount;
@@ -500,14 +500,27 @@ namespace fastllm {
         }
 
         void RecordCpu(size_t routes, double elapsedMs) {
-            if (routes == 0 || elapsedMs <= 0.0) {
+            if (routes == 0 || !std::isfinite(elapsedMs) || elapsedMs <= 0.0) {
                 return;
             }
             const double sample = elapsedMs / (double)routes;
             std::lock_guard<std::mutex> guard(locker);
+            cpuProbe.ObserveCpu(sample, cpuMsPerRoute);
             cpuMsPerRoute = cpuMsPerRoute <= 0.0 ? sample :
                 cpuMsPerRoute * 0.7 + sample * 0.3;
             cpuSamples++;
+        }
+
+        std::vector<int> SelectCpuProbe(
+                const std::vector<std::vector<std::pair<int, float>>> &expertTasks,
+                Data **weights, int weightsBatch, const std::vector<bool> &residents,
+                int measuredLimit) {
+            std::vector<MoePrefillExpertCost> costs(expertTasks.size(), {0, false});
+            for (int e = 0; e < int(expertTasks.size()); ++e)
+                if (e * 2 < weightsBatch && weights[e * 2])
+                    costs[e] = {int(expertTasks[e].size()), residents[e]};
+            std::lock_guard<std::mutex> guard(locker);
+            return cpuProbe.Select(costs, measuredLimit);
         }
 
         // 用真实层反馈出来的两个系数直接算 makespan 最优的 expertLimit。
@@ -619,6 +632,7 @@ namespace fastllm {
         std::map<int, int> gpuSamples;
         double cpuMsPerRoute = 0.0;
         int cpuSamples = 0;
+        MoePrefillCpuProbe cpuProbe;
     };
 
     static MachineNumaInfo machineNumaInfo;
@@ -10583,6 +10597,7 @@ namespace fastllm {
                     // cost model, or vice versa.
                     (measuredNativePrefill || measuredV41GGUF) ? bs : 0});
             }
+            std::vector<int> cpuProbeExperts;
             // Respect an explicit FT_EXPERT_LIMIT override and skip the dynamic
             // CPU/GPU expert split benchmark in that case.
             if (gpuPrefill && !hasExpertLimitOverride) {
@@ -10601,10 +10616,13 @@ namespace fastllm {
                             expertTasks, weights, weightsBatch, gpuDevices,
                             2, &predictCpuMs, &predictGpuMs, residentByDevice, measuredNativePrefill);
                     if (measuredLimit <= 0 && !measuredNativePrefill) {
-                        // Sample the two smallest nonresident experts on CPU;
-                        // the remaining experts provide simultaneous GPU data.
+                        // Preserve bootstrap placement; only re-probe a measured
+                        // all-GPU prediction that would otherwise lose CPU feedback.
                         measuredLimit = ComputeNumasMoeProbeExpertLimit(
                             expertTasks, weights, weightsBatch, 2, residentExperts);
+                    } else if (!measuredNativePrefill) {
+                        cpuProbeExperts = speedTracker->SelectCpuProbe(
+                            expertTasks, weights, weightsBatch, residentExperts, measuredLimit);
                     }
                     if (profileDetail) {
                         printf(
@@ -10652,6 +10670,10 @@ namespace fastllm {
                 } else {
                     gpuExperts.insert(e);
                 }
+            }
+            for (int e : cpuProbeExperts) {
+                gpuExperts.erase(e);
+                cpuExperts.insert(e);
             }
             uint8_t *cpuOutputPinned = nullptr;
 #ifdef USE_CUDA
