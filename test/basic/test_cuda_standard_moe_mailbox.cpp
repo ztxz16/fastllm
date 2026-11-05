@@ -1,3 +1,4 @@
+#include "utils/hybrid_moe.h"
 #include "fastllm.h"
 #include "models/qwen4_exp.h"
 #include "devices/cuda/fastllm-cuda.cuh"
@@ -177,8 +178,14 @@ static void Run(int gateKind, int downKind, int hidden = 256, int inter = 128, i
                 nullptr, &children[layer]);
             Require(handles[layer] && children[layer], "create Standard mailbox child");
         }
-        Require(FastllmCudaGraphCompose(const_cast<const void *const *>(children), layers, &graph, &exec), "compose Standard mailbox");
-        Require(FastllmCudaCreateNativeMoeReplayGraph(graph, handles, layers, &replay), "strip Standard timing");
+        HybridMoeGraph managed;
+        if (qwenTopk10) {
+            Require(managed.Compose(std::vector<const void *>(children, children + layers),
+                std::vector<void *>(handles, handles + layers)), "compose managed Standard mailbox");
+        } else {
+            Require(FastllmCudaGraphCompose(const_cast<const void *const *>(children), layers, &graph, &exec), "compose Standard mailbox");
+            Require(FastllmCudaCreateNativeMoeReplayGraph(graph, handles, layers, &replay), "strip Standard timing");
+        }
         for (int pass = 0; pass < passes; ++pass) {
             std::vector<float> source(rows*hidden), actual[layers];
             std::vector<int32_t> routes[layers];
@@ -206,7 +213,8 @@ static void Run(int gateKind, int downKind, int hidden = 256, int inter = 128, i
             }
             scope = FastllmCudaBeginMoeDecode(weights[0].data(),weights[0].size(),topk);
             Require(scope, "replay policy scope");
-            Require(FastllmCudaLaunchNativeMoeFullGraph(pass%3 ? replay : exec,handles,layers,pass%3==0), "Standard full replay");
+            Require(qwenTopk10 ? managed.Launch() :
+                FastllmCudaLaunchNativeMoeFullGraph(pass%3 ? replay : exec,handles,layers,pass%3==0), "Standard full replay");
             FastllmCudaEndMoeDecode(scope);
             for (int layer = 0; layer < layers; ++layer) {
                 actual[layer].resize(rows*hidden);
@@ -266,8 +274,13 @@ static void Run(int gateKind, int downKind, int hidden = 256, int inter = 128, i
                 }
             }
         }
-        FastllmCudaGraphExecDestroy(replay); FastllmCudaGraphExecDestroy(exec); FastllmCudaGraphDestroy(graph);
-        for (void *handle : handles) FastllmCudaReleaseNativeMoeFullGraph(handle);
+        if (qwenTopk10) {
+            managed.Reset();
+            Require(!managed && !managed.Launch(), "managed graph reset");
+        } else {
+            FastllmCudaGraphExecDestroy(replay); FastllmCudaGraphExecDestroy(exec); FastllmCudaGraphDestroy(graph);
+            for (void *handle : handles) FastllmCudaReleaseNativeMoeFullGraph(handle);
+        }
     }
     if (native) FastllmCudaReleaseMoeCache(referenceWeights[0].data(), referenceWeights[0].size());
     FastllmCudaReleaseMoeCache(weights[0].data(),weights[0].size()); ClearNumasMoeRuntimeCache();

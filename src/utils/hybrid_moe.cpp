@@ -16,6 +16,42 @@
 
 namespace fastllm {
 #ifdef USE_CUDA
+HybridMoeGraph::~HybridMoeGraph() { Reset(); }
+void HybridMoeGraph::Reset() {
+    const int previous = FastllmCudaGetDevice();
+    if (device >= 0) FastllmCudaSetDevice(device);
+    if (replay) FastllmCudaGraphExecDestroy(replay);
+    if (exec) FastllmCudaGraphExecDestroy(exec);
+    if (graph) FastllmCudaGraphDestroy(graph);
+    for (void *handle : handles) FastllmCudaReleaseNativeMoeFullGraph(handle);
+    handles.clear();
+    graph = exec = replay = nullptr;
+    launches = 0;
+    device = -1;
+    FastllmCudaSetDevice(previous);
+}
+bool HybridMoeGraph::Compose(const std::vector<const void *> &children,
+                            std::vector<void *> ownedHandles) {
+    Reset();
+    device = FastllmCudaGetDevice();
+    handles = std::move(ownedHandles);
+    bool ok = !children.empty() &&
+        FastllmCudaGraphCompose(children.data(), children.size(), &graph, &exec);
+    if (ok && !handles.empty())
+        ok = FastllmCudaCreateNativeMoeReplayGraph(graph, handles.data(), handles.size(), &replay);
+    if (!ok) Reset();
+    return ok;
+}
+bool HybridMoeGraph::Launch() {
+    if (!exec) return false;
+    const bool timed = launches < 8 || launches % 64 == 0;
+    const bool ok = handles.empty() ? FastllmCudaGraphLaunch(exec) :
+        FastllmCudaLaunchNativeMoeFullGraph(timed ? exec : replay,
+            handles.data(), handles.size(), timed);
+    if (ok) ++launches;
+    return ok;
+}
+
 HybridMoeRemoteWorkspace::~HybridMoeRemoteWorkspace() {
     const int original = FastllmCudaGetDevice();
     if (source >= 0) FastllmCudaSyncDevice(source);
