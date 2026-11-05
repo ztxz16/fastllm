@@ -10482,6 +10482,30 @@ namespace fastllm {
             ApplyDeviceMap(this->deviceMap, 1, this->block_cnt);
             DumpTensorIfRequested("input_ids", inputIds);
             DumpTensorIfRequested("position_ids", positionIds);
+            bool repeatedEmbedding = false;
+#ifdef USE_CUDA
+            auto &embeddingWeight = this->weight[languagePrefix + "embed_tokens.weight"];
+            if (UseFullHybridGraph() && allowDecodeCudaGraph && !prefill && !precomputedEmbedding &&
+                inputIds.dims[1] == 1 && inputIds.dataType == FLOAT32 &&
+                GetCudaEmbedding() && !GetLowMemMode() && !embeddingWeight.lockInCPU &&
+                embeddingWeight.dataDevice == CUDA && embeddingWeight.dataType == DATA_GGUF_FORMAT &&
+                !embeddingWeight.multiDeviceData && embeddingWeight.dataDeviceIds.size() == 1 &&
+                embeddingWeight.dataDeviceIds[0] == FastllmCudaGetDevice() &&
+                !embeddingWeight.IsRepacked && embeddingWeight.dims.size() == 2 &&
+                GGUFSupportsCudaEmbedding((ggml_type)embeddingWeight.ggmlType) &&
+                embeddingWeight.dims[1] % ggml_blck_size((ggml_type)embeddingWeight.ggmlType) == 0) {
+                const auto &deviceIds = embeddingWeight.dataDeviceIds;
+                // Match Embedding's device migration of its const input view.
+                const_cast<Data &>(inputIds).ToDevice(CUDA, deviceIds);
+                hiddenStates->dataType = FLOAT32;
+                hiddenStates->Resize({batch, 1, hcCount * embed_dim});
+                hiddenStates->ToDevice(CUDA, deviceIds, false);
+                hiddenStates->Allocate(false);
+                AssertInFastLLM(FastllmCudaGGUFEmbeddingRepeat(inputIds, embeddingWeight, *hiddenStates, hcCount),
+                               "Qwen4 packed embedding repeat failed");
+                repeatedEmbedding = true;
+            }
+#endif
             if (precomputedEmbedding != nullptr) {
                 AssertInFastLLM(
                     precomputedEmbedding->dims ==
@@ -10489,7 +10513,7 @@ namespace fastllm {
                                           this->embed_dim}),
                     "Qwen4-Exp precomputed embedding shape is invalid.");
                 embedding.CopyFrom(*precomputedEmbedding);
-            } else {
+            } else if (!repeatedEmbedding) {
                 std::unique_lock<std::mutex> hostEmbedding;
                 if (prefill && prefill->hostExpertMutex)
                     hostEmbedding = std::unique_lock<std::mutex>(*prefill->hostExpertMutex);
@@ -10498,8 +10522,10 @@ namespace fastllm {
                     this->weight[languagePrefix + "embed_tokens.weight"],
                     embedding);
             }
-            embedding.Reshape({batch, inputIds.dims[1], 1, this->embed_dim});
-            Repeat(embedding, 2, this->hcCount, *hiddenStates);
+            if (!repeatedEmbedding) {
+                embedding.Reshape({batch, inputIds.dims[1], 1, this->embed_dim});
+                Repeat(embedding, 2, this->hcCount, *hiddenStates);
+            }
             hiddenStates->Reshape({batch, inputIds.dims[1],
                                    this->hcCount * this->embed_dim});
             DumpTensorIfRequested("embedding", *hiddenStates);

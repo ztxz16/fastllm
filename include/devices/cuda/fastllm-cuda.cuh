@@ -605,6 +605,9 @@ bool FastllmCudaMLAPagedBatch(const fastllm::Data &qNope, const fastllm::Data &q
         fastllm::Data &output, float softmaxScale);
 
 bool FastllmCudaGGUFEmbedding(const fastllm::Data &input, const fastllm::Data &weight, fastllm::Data &output);
+// Write repeated packed embedding rows to caller-provided FLOAT32 CUDA storage.
+bool FastllmCudaGGUFEmbeddingRepeat(const fastllm::Data &input, const fastllm::Data &weight,
+                                   fastllm::Data &output, int repeats);
 bool FastllmCudaEmbedding(const fastllm::Data &input, const fastllm::Data &weight, fastllm::Data &output);
 bool FastllmCudaEmbeddingDirect(const fastllm::Data &input, const fastllm::Data &weight, fastllm::Data &output);
 bool FastllmCudaAttention(const fastllm::Data &q, const fastllm::Data &k, const fastllm::Data &v,

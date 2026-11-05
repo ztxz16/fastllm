@@ -616,6 +616,15 @@ namespace fastllm {
                 asyncDisk = SelectDeviceFromMap(deviceMap, l + 1, block_cnt) == SelectDeviceFromMap(deviceMap, 1, block_cnt);
         }
 #endif
+        // Embedding may migrate inputIds to CUDA. Keep the original host token
+        // for PLE so ordinary decode does not copy it back from the device.
+        std::vector<int> inputTokens;
+        if (!hostInputTokens && UseFullHybridGraph() && allowDecodeCudaGraph &&
+            inputIds.dims.size() == 2 && inputIds.dims[0] == 1 && inputIds.dims[1] == 1 &&
+            inputIds.dataDevice == DataDevice::CPU && inputIds.dataType == FLOAT32 && inputIds.cpuData) {
+            inputTokens.push_back((int)(reinterpret_cast<const float *>(inputIds.cpuData)[0] + 0.01f));
+            hostInputTokens = &inputTokens;
+        }
         DiskMoeAsyncScope diskAsync(weights, asyncDevice, asyncDisk, autoWarmupRunning.load());
         ForwardState frame(*this, ExecutionMode::Hybrid, batch, inputIds, attentionMask, positionIds, pastKeyValues, generationConfig,
             lastTokens, retLogits, targetMultiHidden, allVerificationTokens, verificationAccepted,

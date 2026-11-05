@@ -1306,10 +1306,10 @@ to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
 // Lookup directly in the checkpoint's packed table. Each warp decodes one
 // 256-element group using the same block arithmetic as dense dequantization.
 // No whole-table expansion or host token round trip is needed during replay.
-template<ggml_type Type>
+template<ggml_type Type, bool Repeat>
 __global__ void FastllmGGUFEmbeddingKernel(const float *ids, const uint8_t *weight,
-        float *output, int vocab, int width, size_t rowBytes) {
-    const float raw = ids[blockIdx.y];
+        float *output, int vocab, int width, size_t rowBytes, int repeats) {
+    const float raw = ids[Repeat ? blockIdx.y / repeats : blockIdx.y];
     const int token = isfinite(raw) && raw >= 0 && raw < vocab ? int(raw) : -1;
     const int group = blockIdx.x * 4 + threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
@@ -1335,20 +1335,30 @@ __global__ void FastllmGGUFEmbeddingKernel(const float *ids, const uint8_t *weig
     }
 }
 
-bool FastllmCudaGGUFEmbedding(const fastllm::Data &input, const fastllm::Data &weight,
-                             fastllm::Data &output) {
+template<bool Repeat>
+static bool LaunchGGUFEmbedding(const fastllm::Data &input, const fastllm::Data &weight,
+                                fastllm::Data &output, int repeats) {
     if (input.dataType != fastllm::FLOAT32 || output.dataType != fastllm::FLOAT32 ||
         weight.dataType != fastllm::DATA_GGUF_FORMAT || weight.IsRepacked ||
         weight.dims.size() != 2 || !fastllm::GGUFSupportsCudaEmbedding((ggml_type)weight.ggmlType)) return false;
     const auto type = (ggml_type)weight.ggmlType;
     const int width = weight.dims[1];
     if (width <= 0 || width % ggml_blck_size(type) || !input.cudaData || !weight.cudaData || !output.cudaData) return false;
-    const dim3 grid((width+1023)/1024, input.Count(0));
+    if constexpr (Repeat) {
+        if (repeats <= 0 || input.Count(0) == 0 || input.Count(0) > 65535 / repeats ||
+            output.GetBytes() < size_t(input.Count(0)) * width * repeats * sizeof(float)) return false;
+        const int device = FastllmCudaGetDevice();
+        for (const auto *data : {&input, &weight, static_cast<const fastllm::Data *>(&output)}) {
+            if (data->dataDevice != fastllm::CUDA || data->multiDeviceData ||
+                data->dataDeviceIds.size() != 1 || data->dataDeviceIds[0] != device) return false;
+        }
+    }
+    const dim3 grid((width+1023)/1024, input.Count(0) * (Repeat ? repeats : 1));
     switch (type) {
 #define EMBEDDING_CASE(name) case GGML_TYPE_##name: \
-        FastllmGGUFEmbeddingKernel<GGML_TYPE_##name><<<grid, 128, 0, cudaStreamPerThread>>>( \
+        FastllmGGUFEmbeddingKernel<GGML_TYPE_##name, Repeat><<<grid, 128, 0, cudaStreamPerThread>>>( \
             (const float *)input.cudaData, (const uint8_t *)weight.cudaData, \
-            (float *)output.cudaData, weight.dims[0], width, ggml_row_size(type, width)); break;
+            (float *)output.cudaData, weight.dims[0], width, ggml_row_size(type, width), repeats); break;
         EMBEDDING_CASE(IQ4_XS)
         EMBEDDING_CASE(IQ4_NL)
         EMBEDDING_CASE(IQ3_XXS)
@@ -1358,4 +1368,16 @@ bool FastllmCudaGGUFEmbedding(const fastllm::Data &input, const fastllm::Data &w
         default: return false;
     }
     return cudaGetLastError() == cudaSuccess;
+}
+
+bool FastllmCudaGGUFEmbedding(const fastllm::Data &input, const fastllm::Data &weight,
+                             fastllm::Data &output) {
+    return LaunchGGUFEmbedding<false>(input, weight, output, 1);
+}
+
+bool FastllmCudaGGUFEmbeddingRepeat(const fastllm::Data &input, const fastllm::Data &weight,
+                                   fastllm::Data &output, int repeats) {
+    // Repeated rows use the identical packed-block decoder. Writing their
+    // final layout directly avoids a temporary embedding and a Repeat kernel.
+    return LaunchGGUFEmbedding<true>(input, weight, output, repeats);
 }
