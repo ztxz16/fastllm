@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstddef>
+#include <functional>
+#include <vector>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -19,6 +21,10 @@ public:
     // A growable pool can reduce a new slab under memory pressure, down to
     // the actual allocation size. Fixed-budget arenas keep the two-arg API.
     CudaWorkspace(int device, size_t bytes, size_t minimumBytes);
+    struct Region { void *data; size_t bytes; };
+    // Borrow immutable-address storage. The release callback restores its
+    // owner only after every allocation and CUDA completion fence retires.
+    CudaWorkspace(int device, std::vector<Region> regions, std::function<void()> release);
     ~CudaWorkspace();
     CudaWorkspace(const CudaWorkspace&) = delete;
     CudaWorkspace &operator=(const CudaWorkspace&) = delete;
@@ -28,10 +34,15 @@ public:
     size_t LiveBytes() const;
     void *Allocate(size_t bytes);
     void Free(void *pointer);
+    void FreeAfterStream(void *pointer, void *stream, bool currentThread = false);
+    bool Borrowed() const { return bool(release); }
 private:
     int device;
     size_t capacity;
     void *base = nullptr;
+    std::function<void()> release;
+    std::vector<std::pair<void *, void *>> pending;
+    void FreeLocked(void *pointer);
     mutable std::mutex mutex;
     std::map<size_t, size_t> available, allocated;
     size_t liveBytes = 0, peakBytes = 0;
@@ -46,6 +57,7 @@ void *AllocateCudaWorkspace(const std::shared_ptr<CudaWorkspace> &workspace, siz
                             bool reportExhaustion);
 bool IsCudaWorkspacePointer(void *pointer);
 bool TryFreeCudaWorkspace(void *pointer);
+bool TryFreeCudaWorkspaceAfterStream(void *pointer, void *stream);
 
 class CudaWorkspaceScope {
 public:

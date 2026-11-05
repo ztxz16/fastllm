@@ -64,6 +64,7 @@ public:
         candidates.resize(groups.size());
         candidatePositions.resize(keys.size(), -1);
         residentPositions.resize(slots.size(), -1);
+        slotAvailable.assign(slots.size(), true);
         SetResidents(slots.data());
     }
 
@@ -80,6 +81,8 @@ public:
             if (key < -1 || key >= int(keys.size()) ||
                 (key >= 0 && (keyPartitions[key] != slotPartitions[s] || keys[key].slot >= 0)))
                 throw std::invalid_argument("invalid MoE residency snapshot");
+            if (!slotAvailable[s] && key >= 0)
+                throw std::invalid_argument("resident in a leased MoE slot");
             slots[s] = key;
             if (key >= 0) keys[key].slot = s;
             InsertResident(s);
@@ -111,6 +114,23 @@ public:
         slots[slot] = -1; keys[key].slot = -1;
         InsertResident(slot); InsertCandidate(key);
         return slot;
+    }
+
+    // Leasing is distinct from eviction: no admission may select this slot
+    // until its payload storage has been returned. Observed heat is retained.
+    void SetSlotAvailable(int slot, bool available) {
+        if (slot < 0 || slot >= int(slots.size()))
+            throw std::invalid_argument("invalid MoE lease slot");
+        if (slotAvailable[slot] == available) return;
+        if (!available) {
+            const int key = slots[slot];
+            if (key >= 0) Evict(key);
+            RemoveResident(slot);
+            slotAvailable[slot] = false;
+        } else {
+            slotAvailable[slot] = true;
+            InsertResident(slot);
+        }
     }
 
     void BeginStep() {
@@ -350,6 +370,7 @@ private:
             [this](int a, int b) { return CandidateBefore(a, b); });
     }
     void InsertResident(int slot) {
+        if (!slotAvailable[slot]) return;
         residents[slotPartitions[slot]].Insert(slot, residentPositions,
             [this](int a, int b) { return ResidentBefore(a, b); });
     }
@@ -383,7 +404,7 @@ private:
     void ApplyAdmission(Admission admission) {
         const int key = admission.key, slot = admission.slot;
         if (key < 0 || key >= int(keys.size()) || slot < 0 || slot >= int(slots.size()) ||
-            keys[key].slot >= 0 || keyPartitions[key] != slotPartitions[slot])
+            keys[key].slot >= 0 || !slotAvailable[slot] || keyPartitions[key] != slotPartitions[slot])
             throw std::invalid_argument("invalid MoE admission");
         const int old = slots[slot];
         RemoveCandidate(key);
@@ -415,6 +436,7 @@ private:
     bool prefill = false, active = false;
     std::vector<Key> keys;
     std::vector<int> slots, keyPartitions, slotPartitions;
+    std::vector<bool> slotAvailable;
     struct Group { int partition; uint64_t bytes; };
     std::vector<Group> groups;
     std::vector<int> keyGroups;

@@ -26,6 +26,7 @@
 #include "devices/moe_frequency_policy.h"
 #include "devices/cuda/fastllm-cuda-moe-policy.h"
 #include "devices/cuda/fastllm-cuda-moe-prefill.h"
+#include "devices/cuda/cudaworkspace.h"
 #ifdef USE_NUMAS
 #include "devices/numas/numasdevice.h"
 #endif
@@ -349,6 +350,8 @@ struct DeviceCache {
     int admissionCopyBlocks = 64;
     bool frequencyActive = false;
     bool frequencyResidencyDirty = true;
+    std::weak_ptr<fastllm::CudaWorkspace> prefillWorkspace;
+    bool prefillWorkspaceReported = false;
     // EP plans from a CPU-owned snapshot while cache admissions run. Pending
     // slots are unavailable until their payload-completion event succeeds.
     std::vector<int32_t> epKeySlots, epSlotKeys;
@@ -1126,6 +1129,7 @@ size_t DeviceMemoryReserveBytes(size_t totalBytes) {
 }
 
 void ReleaseDeviceCache(DeviceCache &cache) {
+    fastllm::AssertInFastLLM(cache.prefillWorkspace.expired(), "releasing an active MoE workspace owner");
     if (cache.device >= 0) {
         cudaSetDevice(cache.device);
     }
@@ -3049,6 +3053,121 @@ static void PrepareFrequencyPolicy(OffloadGroup *group, DeviceCache *cache) {
     }
 }
 
+
+namespace {
+__global__ void InvalidateWorkspaceSlots(int first, int count, int *slotKeys,
+        int *keyToSlot, int *hostKeyToSlot) {
+    int slot = first + blockIdx.x * blockDim.x + threadIdx.x;
+    if (slot >= first + count) return;
+    int key = slotKeys[slot];
+    if (key >= 0) {
+        if (keyToSlot[key] == slot) keyToSlot[key] = -1;
+        if (hostKeyToSlot[key] == slot) hostKeyToSlot[key] = -1;
+    }
+    slotKeys[slot] = -1;
+}
+}
+
+std::shared_ptr<fastllm::CudaWorkspace> FastllmCudaGetMoeWorkspace(const fastllm::Data *gate) {
+    OffloadGroup *group = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(RegistryMutex());
+        auto it = TableRegistry().find(gate);
+        if (it == TableRegistry().end()) return {};
+        group = it->second.group;
+    }
+    std::lock_guard<std::mutex> lock(group->mutex);
+    auto it = group->deviceCaches.find(FastllmCudaGetDevice());
+    return it == group->deviceCaches.end() || !it->second ? nullptr :
+        it->second->prefillWorkspace.lock();
+}
+
+std::shared_ptr<fastllm::CudaWorkspace> FastllmCudaBorrowMoeWorkspace(
+        fastllm::Data **weights, int weightsBatch, size_t bytes) {
+    if (!bytes || FastllmCudaGraphIsCapturingFast()) return {};
+    auto *group = FindHybridGroup(weights, weightsBatch);
+    if (!group || group->fullyResident || group->tensorParallelRequested ||
+        !group->expertDevices.empty()) return {};
+    auto *cache = GetDeviceCache(*group);
+    if (!cache) return {};
+    std::lock_guard<std::mutex> lock(group->mutex);
+    // This initial adapter requires one serialized owner. TP/EP and parallel
+    // prefill/decode must establish their own reader protocol before opting in.
+    if (group->deviceCaches.size() != 1 || cache->frequencyActive ||
+        !cache->prefillWorkspace.expired() || cache->prefillOwnerCount != 1 ||
+        cache->slots < 2 * kMaxTopK || !cache->mappedKeyToSlot) return {};
+    bytes = (bytes + 255) / 256 * 256;
+    // Prefer a contiguous tail from the largest format partition. Splitting a
+    // small loan proportionally can leave no region large enough for an MMQ
+    // ring even when total free bytes suffice. Spill into further partitions
+    // only when necessary; every partition retains its minimum cache.
+    struct Extent { int begin, end; size_t endOffset, available; };
+    std::map<int, Extent> extents;
+    size_t totalAvailable = 0;
+    for (auto span : cache->layerSlots) {
+        if (span.count <= kMaxTopK || extents.count(span.begin)) continue;
+        const int end = span.begin + span.count;
+        const size_t endOffset = (end == cache->slots ? cache->recordBytes : cache->hostSlotOffsets[end]) / 256 * 256;
+        const size_t startOffset = (cache->hostSlotOffsets[span.begin + kMaxTopK] + 255) / 256 * 256;
+        if (endOffset <= startOffset) continue;
+        extents.emplace(span.begin, Extent{span.begin + kMaxTopK, end, endOffset, endOffset - startOffset});
+        totalAvailable += endOffset - startOffset;
+    }
+    if (totalAvailable < bytes) return {};
+    std::vector<fastllm::CudaWorkspace::Region> regions;
+    std::vector<std::pair<int, int>> leased;
+    size_t capacity = 0;
+    int count = 0;
+    std::vector<Extent> ordered;
+    for (const auto &entry : extents) ordered.push_back(entry.second);
+    std::sort(ordered.begin(), ordered.end(), [](const Extent &a, const Extent &b) {
+        return a.available != b.available ? a.available > b.available : a.begin < b.begin;
+    });
+    for (const auto &extent : ordered) {
+        if (capacity >= bytes) break;
+        const size_t wanted = std::min(bytes - capacity, extent.available);
+        int first = extent.end;
+        size_t offset = 0, available = 0;
+        while (first > extent.begin && available < wanted) {
+            --first;
+            offset = (cache->hostSlotOffsets[first] + 255) / 256 * 256;
+            available = extent.endOffset - offset;
+        }
+        if (!available) continue;
+        regions.push_back({cache->records + offset, available});
+        leased.emplace_back(first, extent.end);
+        capacity += available; count += extent.end - first;
+    }
+    if (capacity < bytes) return {};
+    if (cache->admissionDone) checkCudaErrors("MoE workspace upload fence", cudaEventSynchronize(cache->admissionDone));
+    checkCudaErrors("MoE workspace reader fence", cudaStreamSynchronize(cudaStreamPerThread));
+    PrepareFrequencyPolicy(group, cache);
+    // Construct before mutating residency, so allocation failure leaves the
+    // old cache valid. No client can see the arena until invalidation completes.
+    auto workspace = std::make_shared<fastllm::CudaWorkspace>(cache->device,
+        std::move(regions),
+        [group, cache, leased] {
+            std::lock_guard<std::mutex> lock(group->mutex);
+            for (const auto &span : leased) for (int slot = span.first; slot < span.second; ++slot)
+                cache->frequency->SetSlotAvailable(slot, true);
+        });
+    for (const auto &span : leased) {
+        for (int slot = span.first; slot < span.second; ++slot)
+            cache->frequency->SetSlotAvailable(slot, false);
+        const int slots = span.second - span.first;
+        InvalidateWorkspaceSlots<<<(slots + 255) / 256, 256, 0, cudaStreamPerThread>>>(
+            span.first, slots, cache->slotKeys, cache->keyToSlot, cache->mappedKeyToSlot);
+    }
+    checkCudaErrors("MoE workspace invalidate", cudaStreamSynchronize(cudaStreamPerThread));
+    cache->prefillWorkspace = workspace;
+    if (!cache->prefillWorkspaceReported) {
+        std::fprintf(stderr, "[Fastllm] MoE prefill workspace cuda:%d: borrowing %d/%d slots, %.3f GiB; decode capacity unchanged.\n",
+            cache->device, count, cache->slots, capacity / double(size_t(1) << 30));
+        cache->prefillWorkspaceReported = true;
+    }
+    return workspace;
+}
+
 void FastllmCudaPlanMoePrefill(fastllm::Data **weights, int experts,
         const int32_t *indices, const float *scores, int rows, int topk,
         const std::unordered_set<int> &selected, FastllmCudaMoePrefillPlan &plan) {
@@ -4487,6 +4606,7 @@ void *FastllmCudaBeginMoeDecode(fastllm::Data **weights, int weightsBatch, int t
     if (devices) FastllmCudaPrepareMoeExpertCache(weights, weightsBatch, *devices);
     auto *cache = GetDeviceCache(*group, false);
     if (!cache) return nullptr;
+    fastllm::AssertInFastLLM(cache->prefillWorkspace.expired(), "MoE decode started before prefill workspace was returned");
     const bool cooperativeFrequency = group->layout.deepSeekV41 &&
         group->layout.weightType == fastllm::DATA_GGUF_FORMAT && devices && devices->size() > 1;
     if (!group->expertDevices.empty() || cooperativeFrequency) {

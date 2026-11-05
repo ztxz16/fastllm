@@ -11,6 +11,7 @@
 #endif
 #ifdef USE_CUDA
 #include "devices/cuda/fastllm-cuda-native-prefill.h"
+#include "devices/cuda/cudaworkspace.h"
 #endif
 #include "contextconfig.h"
 #include "moe_cache_config.h"
@@ -120,6 +121,13 @@ namespace fastllm {
 
 #ifdef USE_CUDA
         static void *CudaMallocForData(const Data &data, uint64_t bytes) {
+            if (data.cudaWorkspace) {
+                AssertInFastLLM(!data.isModelWeight && !data.isKVCache &&
+                    !data.isFake && !FastllmCudaGraphIsCapturingFast() &&
+                    data.cudaWorkspace->Device() == FastllmCudaGetDevice(),
+                    "CUDA scratch workspace cannot own persistent/captured tensors");
+                return AllocateCudaWorkspace(data.cudaWorkspace, bytes);
+            }
             if (data.isModelWeight && !data.directMemory) {
                 // TP NVFP4 sources are retired after each layer is repacked.
                 bool transientExpert = data.dataType == DataType::NVFP4_BLOCK_16_E4M3_PACKED &&

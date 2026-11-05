@@ -1,3 +1,5 @@
+#include "devices/cuda/fastllm-cuda-moe-prefill.h"
+#include "devices/cuda/cudaworkspace.h"
 #include "utils/hybrid_moe.h"
 #include "fastllm.h"
 #include "models/qwen4_exp.h"
@@ -74,7 +76,8 @@ static std::unique_ptr<Data> Weight(int kind, int rows, int columns, int seed, b
     return w;
 }
 static void Run(int gateKind, int downKind, int hidden = 256, int inter = 128, int passes = 40,
-                bool ownedPp = false, int device = 0, bool qwenTopk10 = false, bool overlapReplay = false) {
+                bool ownedPp = false, int device = 0, bool qwenTopk10 = false, bool overlapReplay = false,
+                bool workspaceReplay = false) {
     constexpr int experts = 64, layers = 2;
     const int topk = qwenTopk10 ? 10 : 6;
     Cuda(cudaSetDevice(device));
@@ -97,7 +100,7 @@ static void Run(int gateKind, int downKind, int hidden = 256, int inter = 128, i
         descriptors[layer] = {weights[layer].data(), int(weights[layer].size()), false, 0, false,
             ownedPp ? (layer < layers ? device : 1-device) : -1, true};
     }
-    SetMoeCudaCacheBytes(32 * ((stride+127)/128*128));
+    SetMoeCudaCacheBytes((workspaceReplay ? 64 : 32) * ((stride+127)/128*128));
     Require(FastllmCudaPrepareMoeCache(descriptors, cacheLayers, [&] { RegisterNumasMoeWeightBatch(registration); }),
             "prepare Qwen shared cache");
     Require(FastllmCudaMoeCacheIsQwen38(weights[0].data(), weights[0].size()), "Qwen cache profile missing");
@@ -218,6 +221,17 @@ static void Run(int gateKind, int downKind, int hidden = 256, int inter = 128, i
                 snapshot.Resize({replays, rows, hidden}); Gpu(snapshot);
             }
             for (int replayIndex = 0; replayIndex < replays; ++replayIndex) {
+                if (workspaceReplay && replayIndex == 1) {
+                    auto arena = FastllmCudaBorrowMoeWorkspace(weights[0].data(), weights[0].size(), stride * 8);
+                    Require(bool(arena), "cache workspace lease failed");
+                    Require(!FastllmCudaBorrowMoeWorkspace(weights[0].data(), weights[0].size(), stride),
+                        "nested workspace lease was accepted");
+                    void *scratch = AllocateCudaWorkspace(arena, arena->Capacity());
+                    Require(scratch, "borrowed cache payload cannot be allocated");
+                    Cuda(cudaMemsetAsync(scratch, 0xff, arena->Capacity(), cudaStreamPerThread));
+                    FastllmCudaFree(scratch);
+                    arena.reset();
+                }
                 scope = FastllmCudaBeginMoeDecode(weights[0].data(),weights[0].size(),topk);
                 Require(scope, "replay policy scope");
                 // Match the model's owner validation with uploads outstanding.
@@ -314,7 +328,8 @@ int main(int argc, char **argv) {
     try {
         if (!FastllmCudaGetDeviceCount()) return 77;
         SetThreads(4); SetCudaGraph(true);
-        const bool overlapReplay = argc > 1 && std::strcmp(argv[1], "--cache-overlap") == 0;
+        const bool workspaceReplay = argc > 1 && std::strcmp(argv[1], "--workspace-replay") == 0;
+        const bool overlapReplay = workspaceReplay || (argc > 1 && std::strcmp(argv[1], "--cache-overlap") == 0);
         const bool qwenTopk10 = overlapReplay || (argc > 1 && std::strcmp(argv[1], "--qwen-topk10") == 0);
         const bool modelShape = qwenTopk10 || (argc > 1 && std::strcmp(argv[1], "--model-shape") == 0);
         const bool placementPolicy = argc > 1 && std::strcmp(argv[1], "--placement-policy") == 0;
@@ -324,7 +339,7 @@ int main(int argc, char **argv) {
         const int hidden = modelShape ? 2560 : 256, inter = modelShape ? 640 : 128;
         for (int device = 0; device < (ownedPp ? 2 : 1); ++device)
             for (auto pair : {std::pair<int,int>{-1,-1},{22,42},{42,42},{21,20},{18,20}})
-                Run(pair.first,pair.second,hidden,inter,placementPolicy ? 1 : overlapReplay ? 12 : modelShape || ownedPp ? 4 : 40,ownedPp,device,qwenTopk10,overlapReplay);
+                Run(pair.first,pair.second,hidden,inter,placementPolicy ? 1 : overlapReplay ? 12 : modelShape || ownedPp ? 4 : 40,ownedPp,device,qwenTopk10,overlapReplay,workspaceReplay);
         std::puts("ALL_PASS"); return 0;
     } catch (const std::exception &e) { std::fprintf(stderr,"FAIL: %s\n",e.what()); return 1; }
 }

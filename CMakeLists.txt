@@ -1878,6 +1878,7 @@ if (UNIT_TEST)
     add_test(NAME context_extension_cpu COMMAND contextExtensionRegression)
     if (USE_CUDA AND NOT USE_ROCM)
         add_executable(multimodal_workspace_test test/basic/test_multimodal_workspace.cpp)
+        target_include_directories(multimodal_workspace_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
         target_link_libraries(multimodal_workspace_test PRIVATE fastllm)
         if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
             # Inject allocation failures in the test, without runtime flags.

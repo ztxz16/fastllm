@@ -842,6 +842,13 @@ void FastllmCudaEventSynchronize(void *event) {
     checkCudaErrors("Error: CUDA error when synchronizing event!", state);
 }
 
+bool FastllmCudaEventComplete(void *event) {
+    const cudaError_t state = cudaEventQuery((cudaEvent_t)event);
+    if (state == cudaErrorNotReady) return false;
+    checkCudaErrors("Error: CUDA error when querying event!", state);
+    return state == cudaSuccess;
+}
+
 float FastllmCudaEventElapsedTime(void *start, void *end) {
     float elapsedMs = 0.0f;
     cudaError_t state = cudaEventElapsedTime(
@@ -5913,9 +5920,7 @@ bool FastllmCudaFreeAfterStream(void *ret, cudaStream_t stream) {
         return true;
     }
     if (fastllm::IsCudaWorkspacePointer(ret)) {
-        cudaError_t state = cudaStreamSynchronize(stream);
-        checkCudaErrors("Error: synchronizing CUDA workspace release", state);
-        return state == cudaSuccess && fastllm::TryFreeCudaWorkspace(ret);
+        return fastllm::TryFreeCudaWorkspaceAfterStream(ret, reinterpret_cast<void *>(stream));
     }
     FastllmCudaGraphCaptureIdentity captureIdentity =
         FastllmCudaGraphCurrentCaptureIdentity();

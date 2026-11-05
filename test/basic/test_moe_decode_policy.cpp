@@ -562,7 +562,36 @@ static void TestDecodeCompletion() {
     Require(p.Allow(4,0,1), "completion policy rejected CPU fallback");
 }
 
+static void TestWorkspaceSlots() {
+    using P = fastllm::MoeFrequencyPolicy;
+    fastllm::MoeCacheConfig config;
+    config.halfLife = 0; config.minHeat = 0; config.replacementMargin = 0;
+    P p({0,0,0,1,1,1}, {0,0,1,1}, 2, config);
+    const int owners[] = {0,1,3,4};
+    p.SetResidents(owners);
+    p.BeginStep(); int hot[] = {1,2,5}; p.Observe(0, hot, 3); p.EndStep();
+    const float heat = p.Score(1);
+    p.SetSlotAvailable(0, false); p.SetSlotAvailable(1, false);
+    Require(p.Slot(0) < 0 && p.Slot(1) < 0 && p.Score(1) == heat,
+        "lease did not evict payload while preserving heat");
+    for (int step = 0; step < 8; ++step) {
+        p.BeginStep(); p.Observe(0, hot, 3);
+        for (auto admission : p.EndStep()) Require(admission.slot >= 2, "decode admitted into leased slot");
+        p.ObservePrefill(0, {10,20,30}, 64);
+        Require(p.SelectPrefill(2, 0, {0,0,1}).slot < 0, "prefill admitted into leased partition");
+    }
+    bool rejected = false;
+    try { p.Admit(0, {2, 0}); } catch (const std::invalid_argument &) { rejected = true; }
+    Require(rejected, "stale admission plan accepted a leased slot");
+    p.SetSlotAvailable(0, true); p.SetSlotAvailable(1, true);
+    auto admission = p.SelectPrefill(2, 0, {0,0,1});
+    Require(admission.slot >= 0 && admission.slot < 2, "returned slots unavailable");
+    p.Admit(0, admission);
+    Require(p.Slot(2) == admission.slot, "returned empty slot was not refilled");
+}
+
 int main() {
+    TestWorkspaceSlots();
     TestDecodeCompletion();
     TestAdmissionPayback();
     TestFrequencyAdmission();
