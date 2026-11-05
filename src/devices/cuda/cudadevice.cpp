@@ -9202,6 +9202,21 @@ namespace fastllm {
             false
 #endif
         };
+#ifndef USE_ROCM
+        // Decode and graph replay never borrow prefill storage.
+        auto prefillWorkspace = input.dims[0] > 32 && !FastllmCudaGraphIsCapturingFast()
+            ? FastllmCudaGetMoeWorkspace(weights[2]) : nullptr;
+        if (prefillWorkspace) {
+            releaseWorkspace.enabled = true;
+            for (Data *data : {&workspace.tempInput, &workspace.tempMiddle,
+                    &workspace.tempSwiglu, &workspace.tempOutput, &workspace.tempFloatMiddle,
+                    &workspace.tempFloatSwiglu, &workspace.tempFloatOutput, &workspace.floatOutput,
+                    &workspace.ggufGate, &workspace.ggufWorkspace}) {
+                if (data->cudaData) ReleasePrefillTemporary(*data);
+                data->cudaWorkspace = prefillWorkspace;
+            }
+        }
+#endif
         Data &tempInput = workspace.tempInput;
         Data &tempMiddle = workspace.tempMiddle;
         Data &tempSwiglu = workspace.tempSwiglu;

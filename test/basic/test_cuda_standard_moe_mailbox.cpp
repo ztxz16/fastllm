@@ -75,9 +75,49 @@ static std::unique_ptr<Data> Weight(int kind, int rows, int columns, int seed, b
     }
     return w;
 }
+static void CheckLargePrefill(std::vector<Data *> &weights, int hidden) {
+    constexpr int rows = 8192, topk = 10;
+    const int experts = weights.size() / 2 - 1;
+    Data gate, scratch, output;
+    for (int ownership : {0, 1, 2}) for (bool skewed : {false, true}) {
+        Data input(FLOAT32, {rows, hidden}); input.Allocate(false);
+        for (int i = 0; i < rows * hidden; ++i)
+            reinterpret_cast<float *>(input.cpuData)[i] = (i % 29 - 14) / 32.f;
+        input.ToDevice(CUDA, {0}, true);
+        std::vector<int32_t> ids(rows * topk);
+        std::vector<float> scores(rows * topk);
+        std::unordered_set<int> selected;
+        for (int row = 0; row < rows; ++row) for (int k = 0; k < topk; ++k) {
+            const int e = skewed ? k % 2 : (row * 7 + k) % experts;
+            ids[row * topk + k] = e;
+            scores[row * topk + k] = (k + 1) / 128.f;
+            if (!ownership || e % 2 == ownership - 1) selected.insert(e + 1);
+        }
+        std::vector<float> expected(size_t(rows) * hidden), actual(expected.size());
+        auto arena = std::make_shared<CudaWorkspace>(0, size_t(512) << 20);
+        for (int variant : {0, 1, 2}) {
+            const int chunk = variant == 2 ? rows : 4096;
+            gate.FreeSpace(); scratch.FreeSpace();
+            gate.cudaWorkspace = scratch.cudaWorkspace = variant ? arena : nullptr;
+            for (int start = 0; start < rows; start += chunk) {
+                Data slice;
+                slice.FakeFrom(input, size_t(start) * hidden * 4); slice.Resize({chunk, hidden});
+                Require(FastllmCudaMergeMOEGGUFHost(slice, gate, scratch, output,
+                    weights.data(), experts, ids.data() + start * topk, scores.data() + start * topk,
+                    topk, selected, true, false, 0, 32), "large prefill silently fell back");
+                Cuda(cudaStreamSynchronize(cudaStreamPerThread));
+                Cuda(cudaMemcpy((variant == 0 ? expected : actual).data() + size_t(start) * hidden,
+                    output.cudaData, size_t(chunk) * hidden * 4, cudaMemcpyDeviceToHost));
+            }
+            if (variant) Require(actual == expected, "compact streamed prefill differs from legacy clearing");
+        }
+        std::printf("LARGE_PREFILL_PASS ownership=%d skew=%d rows=%d routes=%d\n", ownership, int(skewed), rows, rows * topk);
+    }
+}
+
 static void Run(int gateKind, int downKind, int hidden = 256, int inter = 128, int passes = 40,
                 bool ownedPp = false, int device = 0, bool qwenTopk10 = false, bool overlapReplay = false,
-                bool workspaceReplay = false) {
+                bool workspaceReplay = false, bool largePrefill = false) {
     constexpr int experts = 64, layers = 2;
     const int topk = qwenTopk10 ? 10 : 6;
     Cuda(cudaSetDevice(device));
@@ -150,6 +190,7 @@ static void Run(int gateKind, int downKind, int hidden = 256, int inter = 128, i
     }
     if (std::getenv("FASTLLM_TEST_PLACEMENT_POLICY"))
         Qwen4GGUFTestAccess::CheckResidentPrefixPolicy(weights[0], hidden);
+    if (largePrefill && native) CheckLargePrefill(weights[0], hidden);
     double worstL2 = 0;
     int checks = 0;
     // The exact Qwen shape uses its FP16 activation and all verifier widths,
@@ -328,6 +369,7 @@ int main(int argc, char **argv) {
     try {
         if (!FastllmCudaGetDeviceCount()) return 77;
         SetThreads(4); SetCudaGraph(true);
+        const bool largePrefill = argc > 1 && std::strcmp(argv[1], "--large-prefill") == 0;
         const bool workspaceReplay = argc > 1 && std::strcmp(argv[1], "--workspace-replay") == 0;
         const bool overlapReplay = workspaceReplay || (argc > 1 && std::strcmp(argv[1], "--cache-overlap") == 0);
         const bool qwenTopk10 = overlapReplay || (argc > 1 && std::strcmp(argv[1], "--qwen-topk10") == 0);
@@ -336,10 +378,10 @@ int main(int argc, char **argv) {
         if (placementPolicy) setenv("FASTLLM_TEST_PLACEMENT_POLICY", "1", 1);
         const bool ownedPp = argc > 1 && std::strcmp(argv[1], "--owned-pp") == 0;
         Require(!ownedPp || FastllmCudaGetDeviceCount() >= 2, "owned PP test requires two GPUs");
-        const int hidden = modelShape ? 2560 : 256, inter = modelShape ? 640 : 128;
+        const int hidden = modelShape ? 2560 : 256, inter = modelShape ? 640 : largePrefill ? 256 : 128;
         for (int device = 0; device < (ownedPp ? 2 : 1); ++device)
             for (auto pair : {std::pair<int,int>{-1,-1},{22,42},{42,42},{21,20},{18,20}})
-                Run(pair.first,pair.second,hidden,inter,placementPolicy ? 1 : overlapReplay ? 12 : modelShape || ownedPp ? 4 : 40,ownedPp,device,qwenTopk10,overlapReplay,workspaceReplay);
+                Run(pair.first,pair.second,hidden,inter,placementPolicy || largePrefill ? 1 : overlapReplay ? 12 : modelShape || ownedPp ? 4 : 40,ownedPp,device,qwenTopk10,overlapReplay,workspaceReplay,largePrefill);
         std::puts("ALL_PASS"); return 0;
     } catch (const std::exception &e) { std::fprintf(stderr,"FAIL: %s\n",e.what()); return 1; }
 }

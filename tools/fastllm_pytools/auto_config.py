@@ -258,7 +258,8 @@ def latency_score(candidate, model, costs, args, mode, mapping, hardware, peers)
     chunk = candidate["chunked_prefill_size"]
     active_params = model.layers * 3 * model.hidden * model.intermediate * max(model.topk, args.moe_experts)
     prefill = prompt * (2 * active_params + sum(dense) + common) / compute
-    prefill += max(0, host - covered) * math.ceil(prompt / chunk) / (link + cpu_bandwidth)
+    prefill_covered = max(0, covered - candidate.get("prefill_workspace_loan_bytes", 0))
+    prefill += max(0, host - prefill_covered) * math.ceil(prompt / chunk) / (link + cpu_bandwidth)
     prefill += math.ceil(prompt / chunk) * model.layers * 50e-6
     # Long single-request decode dominates this interactive default. Explicit
     # concurrency adds value to TP's parallel compute; it never changes capacity.
@@ -683,7 +684,6 @@ def _resolve_impl(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
     # configuration covered by long-context regressions. Larger devices and
     # concurrent serving retain their previous workspace lifetime policy.
     if (hybrid_defaults and base.max_batch == 1 and len(gpu) == 1 and
-            not any(t.kind.startswith("gguf:") and memory._is_routed_expert(t.name) for t in tensors) and
             next(iter(gpu.values()))["total"] <= 24 * memory.GiB):
         for key in ("FASTLLM_QWEN38_PREFILL_REUSE",):
             hybrid_defaults[key] = "1"
@@ -822,19 +822,24 @@ def _resolve_impl(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
                                     chunk = normal["chunked_prefill_size"]
                                     cache = normal["moe_cuda_cache"]
                                     gain = p["moe_cuda_cache"] - cache
+                                    # A prefill loan is unavailable to expert
+                                    # lookup during the prompt. Do not spend the
+                                    # reclaimed cache on a GPU embedding while
+                                    # that phase remains under memory pressure.
+                                    prefill_cache = max(0, cache - normal.get("prefill_workspace_loan_bytes", 0))
                                     # The independently selected dense-Q8 profile
                                     # still benefits from CPU embedding at 22 GiB,
                                     # even after quantization enlarged its cache.
                                     if (hybrid_defaults and getattr(prepared, "dtype_config", "") and
                                             prepared.max_batch == 1 and
                                             next(iter(gpu.values()))["total"] <= 24 * memory.GiB):
-                                        if (chunk <= 4096 and cache < 8 * memory.GiB and
+                                        if (chunk <= 4096 and prefill_cache < 8 * memory.GiB and
                                                 p["chunked_prefill_size"] >= chunk and gain >= memory.GiB):
                                             return True
                                     if prepared.mtp == 0:
-                                        return (chunk <= 4096 and cache < 4 * memory.GiB and
+                                        return (chunk <= 4096 and prefill_cache < 4 * memory.GiB and
                                                 p["chunked_prefill_size"] >= chunk and gain >= memory.GiB)
-                                    return (chunk <= 2048 and cache < memory.GiB and
+                                    return (chunk <= 2048 and prefill_cache < memory.GiB and
                                             ((p["chunked_prefill_size"] >= 2 * chunk and gain >= 0) or
                                              (chunk >= 1024 and p["chunked_prefill_size"] >= chunk and
                                               gain >= memory.GiB // 2)))

@@ -32,6 +32,7 @@
 #include "fastllm-cuda-mtp.cuh"
 #ifndef USE_ROCM
 #include "devices/cuda/fastllm-cuda-moe-policy.h"
+#include "devices/cuda/fastllm-cuda-moe-prefill.h"
 #include "devices/cuda/fastllm-moe-prefetch.h"
 #endif
 #include "fastllm-multicuda.cuh"
@@ -840,6 +841,12 @@ namespace fastllm {
             cache.isKVCache = true;
             cache.isLinearAttention = linear;
         }
+    }
+
+    static void Qwen4PrefillTemporaries(std::initializer_list<Data *> tensors) {
+#ifdef USE_CUDA
+        BindPrefillTemporaries(tensors);
+#endif
     }
 
     bool Qwen4EndsWith(const std::string &value, const std::string &suffix) {
@@ -3199,6 +3206,7 @@ namespace fastllm {
         const int batch = hyperInput.dims[0], sequence = hyperInput.dims[1];
         const std::string ple = languagePrefix + "layers." + std::to_string(pleLayer) + ".ple.";
         Data key, value, keyNormed, queryNormed;
+        Qwen4PrefillTemporaries({&key, &value, &keyNormed, &queryNormed});
         Linear(embeddingData, this->weight[ple + "key_proj.weight"], Data(), key);
         Linear(embeddingData, this->weight[ple + "value_proj.weight"], Data(), value);
         GroupedRMSNorm(key, this->weight[ple + "norm_key.weight"], keyNormed);
@@ -3286,6 +3294,7 @@ namespace fastllm {
             }
 
             Data gatedData, localNormalized;
+            Qwen4PrefillTemporaries({&gatedData, &localNormalized});
             Data &normalized = normalizedCapture != nullptr
                 ? *normalizedCapture : localNormalized;
             fastllm::Qwen4PLEGate(
@@ -5314,14 +5323,17 @@ namespace fastllm {
         const int sequence = input.dims[1];
         const int previousLength = pastKey.dims.empty() ? 0 : pastKey.dims[1];
         Data typedInput;
+        Qwen4PrefillTemporaries({&typedInput});
         ToDataType(input, typedInput, this->dataType);
         Data qsaMask, qsaIndices;
+        Qwen4PrefillTemporaries({&qsaMask, &qsaIndices});
         BuildQSAMask(stateLayer, attention, typedInput,
                      attentionMask, positionIds,
                      previousLength, qsaDeviceCompatibleMask,
                      state, qsaMask, qsaIndices, qsaRawKeyCapture);
 
         Data qGate, query, key, value, gate;
+        Qwen4PrefillTemporaries({&qGate, &query, &key, &value, &gate});
         Data &qWeight = this->weight[attention + "q_proj.weight"];
         Data &kWeight = this->weight[attention + "k_proj.weight"];
         Data &vWeight = this->weight[attention + "v_proj.weight"];
@@ -5454,6 +5466,7 @@ namespace fastllm {
         }
 
         Data context;
+        Qwen4PrefillTemporaries({&context});
         const int attentionGroup = query.dims[0] / pastKey.dims[0];
         const float attentionScale =
             1.0f / std::sqrt((float)this->head_dim);
@@ -5494,6 +5507,7 @@ namespace fastllm {
                       attentionGroup, attentionScale, 1);
         }
         Data gatedContext;
+        Qwen4PrefillTemporaries({&gatedContext});
         bool fusedOutput = false;
 #ifdef USE_CUDA
         if (context.dataDevice == DataDevice::CUDA) {
@@ -5545,8 +5559,10 @@ namespace fastllm {
         }
 
         Data typedInput;
+        Qwen4PrefillTemporaries({&typedInput});
         ToDataType(input, typedInput, this->dataType);
         Data qkv, z, localBeta, localAlpha;
+        Qwen4PrefillTemporaries({&qkv, &z, &localBeta, &localAlpha});
         // The projection is FP16 but verifier replay consumes FP32. Keep
         // its capture destination separate so repeated graph warmup/capture
         // does not free and change the dtype of a persistent graph output.
@@ -5648,6 +5664,7 @@ namespace fastllm {
         }
 
         Data currentConvolved;
+        Qwen4PrefillTemporaries({&currentConvolved});
         if (fusedDecode) {
             PermuteSelf(qkv, {0, 2, 1});
             fastllm::CausalDepthwiseConv1DDecode(
@@ -5716,6 +5733,7 @@ namespace fastllm {
             }
 #endif
             Data core;
+            Qwen4PrefillTemporaries({&core});
             if (fusedDecode) {
                 fastllm::GatedDeltaRuleDecode(
                     currentConvolved, alpha, beta,
@@ -5744,6 +5762,7 @@ namespace fastllm {
             core.Reshape({-1, this->head_v_dim});
             z.Reshape({-1, this->head_v_dim});
             Data gatedCore;
+            Qwen4PrefillTemporaries({&gatedCore});
             Data *outputCore = &core;
 #ifdef USE_CUDA
             if ((fusedDecode || sequentialGdn) &&
@@ -10223,6 +10242,9 @@ namespace fastllm {
         int endLayer = 0;
         RequestState *requestState = nullptr;
         DiskEmbeddingRowReader::Ticket plePrefetch;
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+        std::unique_ptr<PrefillWorkspaceScope> prefillWorkspace;
+#endif
         Data pleGraphEmbedding;
         Data embedding;
         Data hiddenBuffers[2];
@@ -10404,6 +10426,26 @@ namespace fastllm {
             }
         }
 
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+        if (f.graphMode == ExecutionMode::Hybrid && !prefill && !verificationCapture &&
+            batch == 1 && maxBatch == 1 && !threadTpState && threadTpRank < 0 && deviceMap.size() == 1 &&
+            Qwen4ReusePrefillWorkspace(inputIds.dims[1]) && inputIds.dims[1] >= 256 && !weights.empty()) {
+            ApplyDeviceMap(this->deviceMap, 1, this->block_cnt);
+            const size_t rows = inputIds.dims[1];
+            // Bound residual/layer tensors plus the host-expert workspace.
+            // KV and captured decode/verification buffers never use this arena.
+            const size_t residual = rows * size_t(hcCount) * embed_dim * 8 * 4;
+            const size_t experts = rows * (size_t(hcCount) * embed_dim * 2 +
+                size_t(num_experts_per_tok) * (embed_dim + weights[0][3]->dims[1])) * 4;
+            const size_t bytes = std::max(residual, experts) + (size_t(384) << 20);
+            auto arena = FastllmCudaBorrowMoeWorkspace(weights[0].data(), weights[0].size(), bytes);
+            if (arena) {
+                f.prefillWorkspace.reset(new PrefillWorkspaceScope(std::move(arena)));
+                Qwen4PrefillTemporaries({&f.embedding, &f.hiddenBuffers[0], &f.hiddenBuffers[1],
+                    &f.carriedAttentionNorm, &f.carriedAttentionProjection, &f.finalHyperNorm});
+            }
+        }
+#endif
         firstLayer = prefill ? prefill->firstLayer : 0;
         endLayer = prefill ? prefill->endLayer : block_cnt;
         requestState = prefill ? prefill->state : nullptr;
@@ -10633,6 +10675,10 @@ namespace fastllm {
     }
     int Qwen4ExpModel::BeginForwardLayer(ForwardWorkspace &f, int &layer) {
         f.layerData.emplace();
+        Qwen4PrefillTemporaries({&f.layerData->attentionNorm, &f.layerData->attentionInput,
+            &f.layerData->attentionInjection, &f.layerData->attentionOutput,
+            &f.layerData->mlpNorm, &f.layerData->mlpProjection, &f.layerData->mlpInput,
+            &f.layerData->mlpInjection, &f.layerData->mlpOutput});
         auto &mlpInput = f.layerData->mlpInput;
         auto &mlpInjection = f.layerData->mlpInjection;
         auto &attentionNorm = f.layerData->attentionNorm;
@@ -10765,6 +10811,7 @@ namespace fastllm {
 
             if (layer == this->pleLayer) {
                 Data pleOutput;
+                Qwen4PrefillTemporaries({&pleOutput});
                 if (verificationCapture != nullptr) {
                     verificationCapture->pleInput.CopyFrom(*hiddenStates);
                 }

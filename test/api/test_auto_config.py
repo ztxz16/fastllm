@@ -1276,11 +1276,13 @@ class AutoConfigTest(unittest.TestCase):
 
 class NativeQwenMtpEmbeddingTest(unittest.TestCase):
     """Real 48-layer native layout costs, using the actual capacity solver."""
-    def resolve(self, *, capacity=22, kind="BF16", options=(), environment=None, gguf_routed=False):
+    def resolve(self, *, capacity=22, kind="BF16", options=(), environment=None, gguf_routed=False, workspace_loan=False):
         g = memory.Geometry("qwen4",48,262144,2560,512,10,640,
             [2176 if i%4 == 3 else 0 for i in range(48)]+[2176],
             [0 if i%4 == 3 else 3440640 for i in range(48)]+[0],4,155648,4096,
             streamed_kv=[2048 if i%4 == 3 else 0 for i in range(48)]+[2048])
+        if workspace_loan:
+            g.prefill_retained_width = 2560 * 4 * 8
         dense = [141769216 if i%4 == 3 else 154793408 for i in range(48)]+[181136896]
         dense[1] = 220473048
         costs = ([1887449088]*48+[5033164800],dense,2182388192,103671889922,3355443200,False)
@@ -1361,6 +1363,20 @@ class NativeQwenMtpEmbeddingTest(unittest.TestCase):
         self.assertTrue(cpu.low_gpu_mem)
         self.assertGreaterEqual(candidate["chunked_prefill_size"], baseline["chunked_prefill_size"])
         self.assertGreaterEqual(candidate["moe_cuda_cache"] - baseline["moe_cuda_cache"], GiB)
+
+    def test_prefill_loan_does_not_spend_cache_savings_on_native_embedding(self):
+        gpu, normal = self.resolve(workspace_loan=True, options=("--mtp", "0", "--cuda_embedding"))
+        cpu, hybrid = self.resolve(workspace_loan=True, options=("--mtp", "0"))
+        self.assertTrue(cpu.low_gpu_mem)
+        self.assertGreater(hybrid.get("prefill_workspace_loan_bytes", 0), 0)
+        self.assertGreaterEqual(hybrid["chunked_prefill_size"], normal["chunked_prefill_size"])
+        self.assertGreaterEqual(hybrid["moe_cuda_cache"] - normal["moe_cuda_cache"], GiB)
+
+    def test_resident_mtp_experts_do_not_inflate_cache_loan_minimum(self):
+        _, result = self.resolve(workspace_loan=True, options=("--mtp", "3"))
+        self.assertGreater(result.get("prefill_workspace_loan_bytes", 0), 0)
+        self.assertGreater(result["moe_cuda_cache"], result["prefill_workspace_loan_bytes"])
+        self.assertTrue(any(result["runtime_bytes_per_device"]["graphs"].values()))
 
     def test_phase_reuse_default_is_limited_to_small_single_request_gpu(self):
         _, small = self.resolve()

@@ -179,6 +179,65 @@ class QwenPhasePrefillBudgetTest(unittest.TestCase):
 
 
 
+class PrefillCacheWorkspaceTest(unittest.TestCase):
+    def fixture(self):
+        g, costs, gpu, ram = fixture()
+        g.family, g.activation_width, g.prefill_retained_width = "qwen4", 8192, 2048
+        g.experts = 256
+        costs = ([4 * GiB] * 4, *costs[1:])
+        return g, costs, gpu, ram
+
+    @patch.dict(os.environ, {"FASTLLM_QWEN38_PREFILL_REUSE": "1", "FASTLLM_QWEN38_HYBRID_GRAPH": "1"}, clear=True)
+    def test_discount_moves_only_retained_workspace_into_cache(self):
+        g, costs, gpu, ram = self.fixture()
+        a = args(moe_device_layers=-1)
+        with patch.object(auto, "_prefill_cache_workspace", return_value=(0, 0)):
+            before = auto.plan(a, g, costs, "pp", {0: 1}, gpu, ram)
+        after = auto.plan(a, g, costs, "pp", {0: 1}, gpu, ram)
+        credit = 512 * g.prefill_retained_width * 4
+        self.assertEqual(after["prefill_workspace_shared_bytes"], credit)
+        self.assertEqual(before["workspace_bytes_per_device"] - after["workspace_bytes_per_device"], credit)
+        self.assertEqual(after["moe_cuda_cache"] - before["moe_cuda_cache"], credit)
+        self.assertEqual(after["gpu_estimated_bytes"], before["gpu_estimated_bytes"])
+        self.assertEqual(after["runtime_bytes_per_device"], before["runtime_bytes_per_device"])
+        self.assertEqual(after["host_estimated_bytes"], before["host_estimated_bytes"])
+        self.assertGreater(after["prefill_workspace_loan_bytes"], credit)
+
+    @patch.dict(os.environ, {"FASTLLM_QWEN38_PREFILL_REUSE": "1"}, clear=True)
+    def test_small_cache_cannot_fund_a_loan(self):
+        g, costs, gpu, ram = self.fixture()
+        result = auto.plan(args(moe_device_layers=-1, moe_cuda_cache=64 * MiB),
+                           g, costs, "pp", {0: 1}, gpu, ram)
+        self.assertNotIn("prefill_workspace_shared_bytes", result)
+        self.assertEqual(result["workspace_bytes_per_device"],
+                         auto._workspace_bytes(args(), g, 512, 4096, "pp", 0))
+
+    @patch.dict(os.environ, {"FASTLLM_QWEN38_PREFILL_REUSE": "1"}, clear=True)
+    def test_fully_resident_cache_cannot_fund_a_loan(self):
+        g, costs, gpu, ram = self.fixture()
+        costs = ([GiB] * 4, *costs[1:])
+        result = auto.plan(args(moe_device_layers=-1), g, costs, "pp", {0: 1}, gpu, ram)
+        self.assertNotIn("prefill_workspace_shared_bytes", result)
+
+    @patch.dict(os.environ, {"FASTLLM_QWEN38_PREFILL_REUSE": "1"}, clear=True)
+    def test_unsupported_lifetimes_keep_full_reservation(self):
+        g, *_ = self.fixture()
+        for mode, mapping, resident, changes, rows in (
+                ("tp", {0: 1}, 0, {}, 512),
+                ("pp", {0: 1, 1: 1}, 0, {}, 512),
+                ("pp", {0: 1}, 1, {}, 512),
+                ("pp", {0: 1}, 0, {"max_batch": 2}, 512),
+                ("pp", {0: 1}, 0, {"moe_device": "cpu"}, 512),
+                ("pp", {0: 1}, 0, {}, 128)):
+            self.assertEqual(auto._prefill_cache_workspace(args(**changes), g, rows, mode, mapping, resident), (0, 0))
+        for family in ("deepseek_v41", "glm5", "qwen35"):
+            g.family = family
+            self.assertEqual(auto._prefill_cache_workspace(args(), g, 512, "pp", {0: 1}, 0), (0, 0))
+        g.family = "qwen4"
+        with patch.dict(os.environ, {"FASTLLM_QWEN38_PREFILL_REUSE": "0"}):
+            self.assertEqual(auto._prefill_cache_workspace(args(), g, 512, "pp", {0: 1}, 0), (0, 0))
+
+
 class HostMemoryTest(unittest.TestCase):
     def make_proc(self, directory, fields=None, zoneinfo=None):
         proc = Path(directory) / "proc"

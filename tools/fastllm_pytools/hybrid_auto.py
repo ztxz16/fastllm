@@ -1142,6 +1142,24 @@ def _workspace_bytes(args, model, rows, context, mode, resident, *, gguf_mmq=Tru
             resident_scratch + streamed_scratch + 32 * MiB + dequant)
 
 
+def _prefill_cache_workspace(args, model, rows, mode, mapping, resident):
+    """Explicit eager tensor lifetimes implemented by the Qwen adapter.
+
+    The cache loan itself is backend-owned. Discount only the residual/PLE
+    reservation: attention scores, operator scratch, KV and graph storage
+    keep their independent bounds. The cache must still fit the complete loan.
+    """
+    if (model.family != "qwen4" or rows < 256 or mode != "pp" or len(mapping) != 1 or
+            resident != 0 or args.max_batch != 1 or args.moe_device != "numa" or
+            not model.prefill_retained_width or
+            os.environ.get("FASTLLM_QWEN38_PREFILL_REUSE") != "1"):
+        return 0, 0
+    retained = rows * model.prefill_retained_width * 4
+    experts = rows * (model.prefill_retained_width // 4 +
+                      max(model.topk, args.moe_experts) * (model.hidden + model.intermediate)) * 4
+    return max(retained, experts) + 384 * MiB, retained
+
+
 def _v41_runtime_bytes(args, model, mode, mapping, resident, context, batch, chunk, gpu=None, *, disk_experts=False):
     """Persistent decode graphs and staging coexist with eager prefill workspace.
 
@@ -1409,7 +1427,8 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
     # dispatch over a larger block for every host-backed expert backend.  The
     # capacity solver still rejects 8192 when the GPU workspace cannot hold it.
     chunks = ([8192, 4096, 2048, 1024, 512, 256]
-              if model.family == "deepseek_v41" else
+              if (model.family == "deepseek_v41" or
+                  model.family == "qwen4" and os.environ.get("FASTLLM_QWEN38_PREFILL_REUSE") == "1") else
               [4096, 2048, 1024, 512, 256])
     if args.chunked_prefill_size != "auto":
         chunks = [args.chunked_prefill_size if args.chunked_prefill_size > 0 else model.default_chunk]
@@ -1574,6 +1593,26 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
             gpu_limit = {d: gpu[d]["free"] - math.ceil(gpu[d]["total"] * (1 - candidate_ratio)) for d in mapping}
             if gpu_memory_limit is not None:
                 gpu_limit = {d: min(limit, gpu_memory_limit) for d, limit in gpu_limit.items()}
+            workspace_before_loan = workspace
+            workspace_loan, shared_workspace = _prefill_cache_workspace(
+                args, model, rows, mode, mapping, resident)
+            if workspace_loan:
+                # Preserve each format partition's minimum resident slots and
+                # allow for record/alignment rounding. No discount for a cache
+                # too small to lend the advertised workspace.
+                # Qwen's MTP experts are permanently GPU-resident and never
+                # form a partition in the target's borrowed cache.
+                strides = {math.ceil(size / model.experts) + 256
+                           for size in experts[:model.layers] if size > 0}
+                minimum_cache = workspace_loan + 32 * sum(strides)
+                proposed = (min(gpu_limit[d] - used[d] + shared_workspace for d in mapping)
+                            if cache_auto else args.moe_cuda_cache)
+                if minimum_cache <= proposed < host_experts:
+                    workspace -= shared_workspace
+                    for d in mapping:
+                        used[d] -= shared_workspace
+                else:
+                    workspace_loan = shared_workspace = 0
             remaining = {d: gpu_limit[d] - used[d] for d in mapping}
             independent = per_device_cache and cache_auto and mode == "pp" and args.moe_device != "disk"
             cache = {}
@@ -1635,7 +1674,7 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
             early_cuda = (model.family == "deepseek_v41" and mode == "pp" and
                           "FASTLLM_DSV41_DUMP_DIR" not in os.environ and
                           os.environ.get("FASTLLM_DSV41_REFERENCE_MATH", "0") in ("", "0"))
-            host_workspace = max(staging, workspace) if early_cuda else staging + workspace
+            host_workspace = max(staging, workspace_before_loan) if early_cuda else staging + workspace_before_loan
             host_required = host + host_workspace + GiB + len(mapping) * disk_staging + sum(runtime["host_graphs"].values())
             if args.moe_device == "disk":
                 host_required += eager_host_experts
@@ -1669,6 +1708,10 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
                     "auto_gpu_memory_limit": gpu_memory_limit,
                     "auto_host_memory_limit": host_memory_limit,
                     "force_ddr_limit": host_memory_override}
+            if workspace_loan:
+                candidate["prefill_workspace_loan_bytes"] = workspace_loan
+                candidate["prefill_workspace_shared_bytes"] = shared_workspace
+                candidate["workspace_bytes_before_loan"] = workspace_before_loan
             if full_draft:
                 candidate["draft_gpu_resident"] = True
                 candidate["draft_gpu_reserved_bytes"] = draft_reserve
