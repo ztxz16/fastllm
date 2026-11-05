@@ -5195,6 +5195,83 @@ bool FastllmCudaQwen4ReplayLinearAttentionBatch(
     return cudaGetLastError() == cudaSuccess;
 }
 
+bool FastllmCudaQwen4CausalPrefill(const fastllm::Data &query, const fastllm::Data &key,
+        const fastllm::Data &value, const fastllm::Data &indices,
+        fastllm::Data &output, int groups, float scale, int previousLength,
+        int denseContextLimit) {
+#if defined(USE_ROCM) || defined(CUDA_NO_TENSOR_CORE)
+    return false;
+#else
+    using namespace fastllm;
+    if (query.dataType != FLOAT16 || key.dataType != FLOAT16 || value.dataType != FLOAT16 ||
+        indices.dataType != INT32 || query.dims.size() != 3 || key.dims.size() != 3 ||
+        value.dims != key.dims || indices.dims.size() != 2 || groups <= 0 ||
+        query.dims[0] != key.dims[0] * groups || query.dims[2] != key.dims[2] ||
+        query.dims[1] != indices.dims[0] || query.dims[2] <= 0 || query.dims[2] > 256 ||
+        query.dims[2] % 16 || indices.dims[1] <= 0 || indices.dims[1] > 3072 ||
+        query.dataDevice != CUDA || key.dataDevice != CUDA || value.dataDevice != CUDA ||
+        indices.dataDevice != CUDA || !query.cudaData || !key.cudaData || !value.cudaData ||
+        !indices.cudaData || previousLength < 0 || denseContextLimit <= previousLength ||
+        denseContextLimit > 4096 || key.dims[1] != previousLength + query.dims[1] ||
+        query.strides != std::vector<uint64_t>({uint64_t(query.dims[1]) * query.dims[2],
+            uint64_t(query.dims[2]), 1}) ||
+        indices.strides != std::vector<uint64_t>({uint64_t(indices.dims[1]), 1}) ||
+        FastllmCudaGraphIsCapturingFast()) return false;
+    const int prefix = denseContextLimit - previousLength, rows = query.dims[1];
+    if (prefix < 32 || rows - prefix < 32) return false;
+    const int heads = query.dims[0], dim = query.dims[2], width = indices.dims[1];
+    const int device = FastllmCudaGetDevice();
+    const auto stream = cudaStreamPerThread;
+    auto allocate = [&](Data &data) {
+        data.cudaWorkspace = query.cudaWorkspace;
+        data.dataDevice = CUDA;
+        data.dataDeviceIds = {device};
+        data.Allocate(false);
+    };
+    output.dataType = FLOAT16;
+    output.UpdateUnitSize();
+    output.Resize(query.dims);
+    output.dataDevice = CUDA;
+    output.dataDeviceIds = {device};
+    output.Allocate(false);
+    for (int part = 0; part < 2; ++part) {
+        const int start = part ? prefix : 0, n = part ? rows - prefix : prefix;
+        Data q(FLOAT16, {heads, n, dim}), result(FLOAT16, {heads, n, dim});
+        allocate(q); allocate(result);
+        AssertInFastLLM(cudaMemcpy2DAsync(q.cudaData, size_t(n) * dim * 2,
+            static_cast<const half *>(query.cudaData) + size_t(start) * dim,
+            size_t(rows) * dim * 2, size_t(n) * dim * 2, heads,
+            cudaMemcpyDeviceToDevice, stream) == cudaSuccess, "QSA query slice failed");
+        Data selected(INT32, {n, width}, CUDA,
+            static_cast<int32_t *>(indices.cudaData) + size_t(start) * width);
+        selected.cudaDataBorrowed = true;
+        selected.dataDeviceIds = {device};
+        if (part == 0) {
+            Data prefixIds(INT32, {1, denseContextLimit});
+            prefixIds.Allocate();
+            for (int i = 0; i < denseContextLimit; ++i) ((int32_t *)prefixIds.cpuData)[i] = i;
+            prefixIds.ToDevice(CUDA, std::vector<int>{device});
+            Data k(FLOAT16, {key.dims[0], denseContextLimit, dim}), v(FLOAT16, k.dims);
+            Data mask(FLOAT16, {1, n, denseContextLimit});
+            allocate(k); allocate(v); allocate(mask);
+            // Gather logical KV rows: this also handles paged and host-tiered caches.
+            if (!FastllmCudaQwen4GatherKV(key, value, prefixIds, k, v)) return false;
+            AssertInFastLLM(FastllmCudaQwen4QSABuildMask(selected, q, mask, denseContextLimit),
+                           "QSA prefix mask failed");
+            if (!FastllmCudaHalfAttention(q, k, v, mask, result, groups, scale, 1)) return false;
+        } else if (!FastllmCudaQwen4SparsePrefill(q, key, value, selected, result, groups, scale)) {
+            return false;
+        }
+        AssertInFastLLM(cudaMemcpy2DAsync(static_cast<half *>(output.cudaData) + size_t(start) * dim,
+            size_t(rows) * dim * 2, result.cudaData, size_t(n) * dim * 2,
+            size_t(n) * dim * 2, heads, cudaMemcpyDeviceToDevice, stream) == cudaSuccess,
+            "QSA output slice failed");
+        FastllmCudaSyncCurrentThreadStream();
+    }
+    return true;
+#endif
+}
+
 bool FastllmCudaQwen4SparsePrefill(const fastllm::Data &query, const fastllm::Data &key,
                                    const fastllm::Data &value, const fastllm::Data &indices,
                                    fastllm::Data &output, int groups, float scale) {

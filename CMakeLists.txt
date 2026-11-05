@@ -3034,6 +3034,11 @@ if (UNIT_TEST)
         set_target_properties(cuda_qwen4_kvmem_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON CUDA_RUNTIME_LIBRARY Shared)
         fastllm_add_checked_test(cuda_qwen4_kvmem cuda_qwen4_kvmem_test "PASS exact QSA host/device storage" 600)
         set_tests_properties(cuda_qwen4_kvmem PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+        fastllm_add_checked_test(cuda_qwen4_causal_prefill cuda_qwen4_sparse_prefill_test
+            "CAUSAL_SPLIT" 600 --causal-only)
+        fastllm_add_checked_test(cuda_qwen4_causal_kvmem cuda_qwen4_kvmem_test
+            "PASS causal split with host-tiered KV" 600 --causal-only)
+        set_tests_properties(cuda_qwen4_causal_prefill cuda_qwen4_causal_kvmem PROPERTIES LABELS cuda RUN_SERIAL TRUE)
         if(TARGET cuda_host_register_fault)
             fastllm_add_checked_test(cuda_qwen4_kvmem_pin_recovery cuda_qwen4_kvmem_test
                 "PASS exact QSA host/device storage with split pinned backing" 180 --pin-recovery)

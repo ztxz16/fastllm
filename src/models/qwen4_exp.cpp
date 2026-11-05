@@ -5471,9 +5471,21 @@ namespace fastllm {
         const float attentionScale =
             1.0f / std::sqrt((float)this->head_dim);
         if (!qsaIndices.dims.empty()) {
-            Qwen4SparseAttention(query, pastKey, pastValue,
-                                 qsaIndices, attentionGroup,
-                                 attentionScale, context);
+            bool splitCausalAttention = false;
+#ifdef USE_CUDA
+            if (batch == 1 && qsaDeviceCompatibleMask && query.dataDevice == DataDevice::CUDA) {
+                Qwen4CudaDeviceGuard deviceGuard(query.dataDeviceIds);
+                splitCausalAttention = FastllmCudaQwen4CausalPrefill(
+                    query, pastKey, pastValue, qsaIndices, context, attentionGroup,
+                    attentionScale, previousLength,
+                    std::max(this->indexerBudget, kQwen4SparsePrefillMinContext));
+            }
+#endif
+            if (!splitCausalAttention) {
+                Qwen4SparseAttention(query, pastKey, pastValue,
+                                     qsaIndices, attentionGroup,
+                                     attentionScale, context);
+            }
         } else if (Qwen4IsPagedKV(pastKey) || pastKey.kvMemCache) {
             if (!pastKey.kvMemCache && qsaDeviceCompatibleMask && qsaMask.dims.empty() &&
                 pastKey.pageIndex == pastValue.pageIndex && query.dataType == FLOAT16) {

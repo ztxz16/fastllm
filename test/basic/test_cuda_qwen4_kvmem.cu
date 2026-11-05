@@ -58,7 +58,7 @@ static void Equal(Data &a, Data &b) {
     C(cudaMemcpy(y.data(), b.cudaData, y.size(), cudaMemcpyDeviceToHost));
     Check(x == y, "KVMem differs from full GPU reference");
 }
-static void Run(int device, int heads, int dim, int rows, int resident, int group = 4, int length = 16384) {
+static void Run(int device, int heads, int dim, int rows, int resident, int group = 4, int length = 16384, bool causal = false) {
     FastllmCudaSetDevice(device);
     printf("START gpu=%d heads=%d dim=%d rows=%d length=%d group=%d\n",
            device, heads, dim, rows, length, group);
@@ -90,6 +90,16 @@ static void Run(int device, int heads, int dim, int rows, int resident, int grou
     const float scale = 1.0f / std::sqrt(float(dim));
     std::vector<int> selected(rows * width);
     auto select = [&](int active, int seed) {
+        if (causal) {
+            std::fill(selected.begin(), selected.end(), -1);
+            for (int row = 0; row < rows; ++row) {
+                const int visible = length - rows + row + 1, count = std::min(visible, width);
+                for (int j = 0; j < count; ++j)
+                    selected[size_t(row) * width + j] = int(int64_t(j) * visible / count);
+            }
+            C(cudaMemcpy(ids.cudaData, selected.data(), selected.size() * 4, cudaMemcpyHostToDevice));
+            return;
+        }
         std::mt19937 random(seed);
         for (int row = 0; row < rows; ++row) {
             for (int t = 0; t < width; t += 4) {
@@ -103,6 +113,11 @@ static void Run(int device, int heads, int dim, int rows, int resident, int grou
         C(cudaMemcpy(ids.cudaData, selected.data(), selected.size() * 4, cudaMemcpyHostToDevice));
     };
     auto run = [&](Data &key, Data &value, Data &out, const int *meta = nullptr) {
+        if (causal) {
+            Check(FastllmCudaQwen4CausalPrefill(q, key, value, ids, out, group, scale,
+                                             length - rows, 4096), "causal host KV dispatch");
+            return;
+        }
         Check(rows == 1
             ? FastllmCudaQwen4SparseDecode(q, key, value, ids, out, group, scale, meta)
             : FastllmCudaQwen4SparsePrefill(q, key, value, ids, out, group, scale), "sparse dispatch");
@@ -188,6 +203,12 @@ int main(int argc, char **argv) {
             Check(failed, "permanent pin failure was ignored");
             Check(cudaGetLastError()==cudaSuccess, "failed registration left a stale CUDA error");
             puts("PASS exact QSA host/device storage allocation failure cleanup");
+            return 0;
+        }
+        if (argc == 2 && std::strcmp(argv[1], "--causal-only") == 0) {
+            Run(0, 2, 256, 8192, 1024, 12, 8192, true);
+            Run(0, 2, 128, 6144, 1024, 4, 8192, true);
+            puts("PASS causal split with host-tiered KV and repeated reset");
             return 0;
         }
         ModelPolicy();

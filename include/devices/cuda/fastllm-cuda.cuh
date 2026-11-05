@@ -928,6 +928,14 @@ bool FastllmCudaQwen4SparsePrefill(
     const fastllm::Data &value, const fastllm::Data &indices,
     fastllm::Data &output, int groups, float scale);
 
+// Causal QSA indices are unique per row. Select the attention implementation
+// for the early queries independently of the enclosing projection/MoE batch.
+bool FastllmCudaQwen4CausalPrefill(
+    const fastllm::Data &query, const fastllm::Data &key,
+    const fastllm::Data &value, const fastllm::Data &indices,
+    fastllm::Data &output, int groups, float scale, int previousLength,
+    int denseContextLimit);
+
 bool FastllmCudaQwen4PrepareSparseBatch(
         const fastllm::Data &query, const fastllm::Data &key,
         const fastllm::Data &value, const fastllm::Data &indices,
