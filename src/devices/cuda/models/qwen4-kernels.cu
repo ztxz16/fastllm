@@ -1233,6 +1233,39 @@ namespace {
         }
     }
 
+    // Reuse the three preceding samples and four weights across four tokens.
+    // Arithmetic order and FP32 history match the general convolution kernel.
+    template <typename InputT, typename OutputT>
+    __global__ void CausalDepthwiseConv1DPrefillTiled4Kernel(
+            const InputT *input, const float *weight, const float *state,
+            OutputT *output, int sequence, int channels, int tiles) {
+        const int channel = blockIdx.x * blockDim.x + threadIdx.x;
+        if (channel >= channels) return;
+        const int batch = blockIdx.y / tiles, begin = (blockIdx.y % tiles) * 4;
+        const InputT *x = input + uint64_t(batch) * sequence * channels + channel;
+        const float *history = state + (uint64_t(batch) * channels + channel) * 4;
+        const float *w = weight + uint64_t(channel) * 4;
+        const float w0 = w[0], w1 = w[1], w2 = w[2], w3 = w[3];
+        float a = begin < 3 ? history[begin + 1] : Qwen4CudaToFloat(x[uint64_t(begin - 3) * channels]);
+        float b = begin < 2 ? history[begin + 2] : Qwen4CudaToFloat(x[uint64_t(begin - 2) * channels]);
+        float c = begin < 1 ? history[begin + 3] : Qwen4CudaToFloat(x[uint64_t(begin - 1) * channels]);
+        #pragma unroll
+        for (int offset = 0; offset < 4; ++offset) {
+            const int token = begin + offset;
+            if (token >= sequence) break;
+            const float d = Qwen4CudaToFloat(x[uint64_t(token) * channels]);
+            float value = fastllm::cuda_conv::Accumulate<InputT, false>(0.f, a, w0);
+            value = fastllm::cuda_conv::Accumulate<InputT, false>(value, b, w1);
+            value = fastllm::cuda_conv::Accumulate<InputT, false>(value, c, w2);
+            value = fastllm::cuda_conv::Accumulate<InputT, false>(value, d, w3);
+            // Match the existing promoted denominator and final dtype cast.
+            value = fastllm::cuda_conv::SiluPromoted(value);
+            output[(uint64_t(batch) * sequence + token) * channels + channel] =
+                Qwen4CudaCastFromFloat<OutputT>(value);
+            a = b; b = c; c = d;
+        }
+    }
+
     template <typename T>
     __global__ void CausalDepthwiseConv1DPrefillStateKernel(
             const T *input, float *state, int total, int sequence,
@@ -1271,7 +1304,15 @@ namespace {
             int stateItems, int stateBlocks,
             int sequence, int channels, int kernel, bool silu) {
         constexpr int threads = 256;
-        CausalDepthwiseConv1DPrefillKernel<InputT, OutputT><<<
+        const int tiles = (sequence + 3) / 4;
+        if (kernel == 4 && silu && sequence >= 64 &&
+            uint64_t(input.dims[0]) * tiles <= 65535) {
+            CausalDepthwiseConv1DPrefillTiled4Kernel<InputT, OutputT><<<
+                dim3((channels + threads - 1) / threads, input.dims[0] * tiles), threads, 0, cudaStreamPerThread>>>(
+                    (const InputT *)input.cudaData, (const float *)weight.cudaData,
+                    (const float *)state.cudaData, (OutputT *)output.cudaData,
+                    sequence, channels, tiles);
+        } else CausalDepthwiseConv1DPrefillKernel<InputT, OutputT><<<
             outputBlocks, threads, 0, cudaStreamPerThread>>>(
                 (const InputT*)input.cudaData,
                 (const float*)weight.cudaData,

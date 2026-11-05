@@ -3023,6 +3023,12 @@ if (UNIT_TEST)
         fastllm_add_checked_test(cuda_q6_mmvq cuda_q6_mmvq_test "PASS Q6/Q5 multi-row" 600)
         set_tests_properties(cuda_q6_mmvq PROPERTIES LABELS cuda RUN_SERIAL TRUE)
 
+        add_executable(cuda_causal_prefill_test test/basic/test_cuda_causal_prefill.cu)
+        target_link_libraries(cuda_causal_prefill_test PRIVATE fastllm)
+        set_target_properties(cuda_causal_prefill_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        fastllm_add_checked_test(cuda_causal_prefill cuda_causal_prefill_test "PASS causal prefill convolution" 600)
+        set_tests_properties(cuda_causal_prefill PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+
         add_executable(cuda_qwen4_sparse_prefill_test test/basic/test_cuda_qwen4_sparse_prefill.cu)
         target_link_libraries(cuda_qwen4_sparse_prefill_test PRIVATE fastllm)
         set_target_properties(cuda_qwen4_sparse_prefill_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
