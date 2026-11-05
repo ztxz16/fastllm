@@ -12,6 +12,8 @@
 #include "persistent_worker_group.h"
 #include "utils/hostbufferreclaim.h"
 #include "utils/hybrid_moe.h"
+#include "utils/qwen38_hybrid.h"
+#include "devices/moe_prefill_policy.h"
 #include "utils/autotune.h"
 
 #include <cstdlib>
@@ -543,6 +545,19 @@ namespace fastllm {
             }
             if (unitCost.empty()) {
                 return 0;
+            }
+
+            if (gpuDevices.size() == 1) {
+                std::vector<MoePrefillExpertCost> costs;
+                costs.reserve(expertTasks.size());
+                for (int e = 0; e < int(expertTasks.size()); ++e)
+                    if (e * 2 < weightsBatch && weights[e * 2] && !expertTasks[e].empty())
+                        costs.push_back({int(expertTasks[e].size()),
+                            !nativePrefill && residents[0][e] != 0});
+                const auto split = PredictSingleGpuPrefillSplit(costs, cpuUnit, unitCost[0]);
+                if (outCpuMs) *outCpuMs = split.cpuMs;
+                if (outGpuMs) *outGpuMs = split.gpuMs;
+                return split.limit;
             }
 
             int bestLimit = 0;
@@ -10646,6 +10661,9 @@ namespace fastllm {
             std::vector<std::unique_ptr<Data> > gpuInputAliases;
             std::vector<std::unique_ptr<Data> > gpuOutputPartials;
             std::vector<std::thread> gpuThreads;
+            const bool persistentPrefill = qwen38ForwardActive && gpuPrefill &&
+                cudaInputReplicas.size() == 1 && !gpuExperts.empty();
+            std::function<void()> prefillGpuTask;
             void *cpuOutputStaging = nullptr;
             void *cpuOutputCopyStream = nullptr;
             // 每个 assist worker 的归约落地缓冲（在 root 卡上）与完成事件。
@@ -10793,8 +10811,7 @@ namespace fastllm {
                     // 的 dims，避免与主线程的 CPU 分支并发访问同一个 Data。
                     const size_t workerInputBytes = input.GetBytes();
                     const size_t workerOutputBytes = outputBytes;
-                    gpuThreads.emplace_back(
-                        [&, i, workerDevice,
+                    auto gpuTask = [&, i, workerDevice,
                          workerInputBytes, workerOutputBytes]() {
                         FastllmCudaSetDevice(workerDevice);
                         // 输入搬运：主线程只分配了副本缓冲，这里在本线程的
@@ -10922,54 +10939,81 @@ namespace fastllm {
                                 assistPartialEvents[i] = nullptr;
                             }
                         }
-                    });
+                    };
+                    if (persistentPrefill) prefillGpuTask = std::move(gpuTask);
+                    else gpuThreads.emplace_back(std::move(gpuTask));
                 }
             }
             phaseLap(phasePrepMs);
 #endif
-            waitForCpuInput();
-            if (!gpuPrefill || gpuExperts.empty()) {
-                ensureCpuOutput();
-            }
-            if (!cpuExperts.empty()) {
-#ifdef USE_CUDA
-                if (gpuPrefill && !gpuExperts.empty()) {
-                    cpuOutputPinned = fastllmMoeDataManagerNumas.EnsurePinnedOutput(output.GetBytes());
+            auto runCpuPrefill = [&] {
+                waitForCpuInput();
+                if (!gpuPrefill || gpuExperts.empty()) {
+                    ensureCpuOutput();
                 }
-#endif
-                const auto cpuExpertStart = speedTracker
-                    ? std::chrono::steady_clock::now()
-                    : std::chrono::steady_clock::time_point{};
-                DoNumasMergeMOEOnCPU(
-                    input, output, index, score, weights, biass,
-                    sharedScale, weightsBatch, topk, cpuExperts, fastllmMoeDataManagerNumas,
-                    cpuOutputPinned, swigluLimit, deepSeekV4Mode, activationQuantBlock, quantizeSharedExpert
-                );
-                if (speedTracker) {
-                    size_t cpuRoutes = 0;
-                    for (int expert : cpuExperts) {
-                        cpuRoutes += expertTasks[expert].size();
+                if (!cpuExperts.empty()) {
+#ifdef USE_CUDA
+                    if (gpuPrefill && !gpuExperts.empty()) {
+                        cpuOutputPinned = fastllmMoeDataManagerNumas.EnsurePinnedOutput(output.GetBytes());
                     }
-                    speedTracker->RecordCpu(
-                        cpuRoutes,
-                        std::chrono::duration<double, std::milli>(
-                            std::chrono::steady_clock::now() -
-                            cpuExpertStart).count());
-                }
-#ifdef USE_CUDA
-                // CPU partial 直接写入 pinned buffer，再异步搬到复用的 GPU staging buffer。
-                if (gpuPrefill && !gpuExperts.empty() && cpuOutputPinned != nullptr) {
-                    FastllmCudaSetDevice(gpuId);
-                    size_t outputBytes = output.GetBytes();
-                    cpuOutputStaging = fastllmMoeDataManagerNumas.EnsureGpuOutputStaging(outputBytes, gpuId);
-                    cpuOutputCopyStream = fastllmMoeDataManagerNumas.EnsureGpuOutputCopyStream(gpuId);
-                    FastllmCudaCopyFromPinnedHostToDeviceAsync(
-                        cpuOutputStaging, cpuOutputPinned, outputBytes, cpuOutputCopyStream
-                    );
-                }
 #endif
-            }
-            phaseLap(phaseCpuMs);
+                    const auto cpuExpertStart = speedTracker
+                        ? std::chrono::steady_clock::now()
+                        : std::chrono::steady_clock::time_point{};
+                    DoNumasMergeMOEOnCPU(
+                        input, output, index, score, weights, biass,
+                        sharedScale, weightsBatch, topk, cpuExperts, fastllmMoeDataManagerNumas,
+                        cpuOutputPinned, swigluLimit, deepSeekV4Mode, activationQuantBlock, quantizeSharedExpert
+                    );
+                    if (speedTracker) {
+                        size_t cpuRoutes = 0;
+                        for (int expert : cpuExperts) {
+                            cpuRoutes += expertTasks[expert].size();
+                        }
+                        speedTracker->RecordCpu(
+                            cpuRoutes,
+                            std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() -
+                                cpuExpertStart).count());
+                    }
+#ifdef USE_CUDA
+                    // CPU partial 直接写入 pinned buffer，再异步搬到复用的 GPU staging buffer。
+                    if (gpuPrefill && !gpuExperts.empty() && cpuOutputPinned != nullptr) {
+                        FastllmCudaSetDevice(gpuId);
+                        size_t outputBytes = output.GetBytes();
+                        cpuOutputStaging = fastllmMoeDataManagerNumas.EnsureGpuOutputStaging(outputBytes, gpuId);
+                        cpuOutputCopyStream = fastllmMoeDataManagerNumas.EnsureGpuOutputCopyStream(gpuId);
+                        FastllmCudaCopyFromPinnedHostToDeviceAsync(
+                            cpuOutputStaging, cpuOutputPinned, outputBytes, cpuOutputCopyStream
+                        );
+                    }
+#endif
+                }
+                phaseLap(phaseCpuMs);
+            };
+#ifdef USE_CUDA
+            if (persistentPrefill) {
+                // Keep the NUMA pool and its placement context on the caller.
+                // GPU workers retain their per-thread CUDA streams across layers.
+                static thread_local PersistentWorkerGroup prefillWorkers;
+                std::vector<std::exception_ptr> errors(2);
+                prefillWorkers.RunWithCaller({-1, cudaInputReplicas[0].deviceId}, [&](int rank) {
+                    if (rank == 0) runCpuPrefill();
+                    else {
+                        try { prefillGpuTask(); }
+                        catch (...) {
+                            FastllmCudaSetDevice(cudaInputReplicas[0].deviceId);
+                            FastllmCudaSyncCurrentThreadStream();
+                            throw;
+                        }
+                    }
+                }, errors);
+                // Drain both sides before propagating errors: every task borrows
+                // this layer's input, output and routing metadata.
+                for (const auto &error : errors) if (error) std::rethrow_exception(error);
+            } else
+#endif
+            runCpuPrefill();
 #ifdef USE_CUDA
             if (gpuPrefill && !gpuExperts.empty()) {
                 // CPU jobs have joined, and the remaining operations use only
@@ -10984,7 +11028,7 @@ namespace fastllm {
                 Data gpuOutputAlias(
                     output.dataType, output.dims,
                     DataDevice::CUDA, output.cudaData);
-                const bool pipelineOutput = numasMoePipelineWorkspace >= 0 &&
+                const bool pipelineOutput = (numasMoePipelineWorkspace >= 0 || persistentPrefill) &&
                     gpuOutputPartials.size() == 1;
                 if (cpuOutputStaging != nullptr) {
                     if (pipelineOutput) {

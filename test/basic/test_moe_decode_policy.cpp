@@ -1,5 +1,8 @@
 #include "devices/moe_decode_scheduler.h"
 #include "devices/moe_frequency_policy.h"
+#include "devices/moe_prefill_policy.h"
+#include <random>
+#include <set>
 #include <cmath>
 #include <iostream>
 #include <stdexcept>
@@ -590,7 +593,39 @@ static void TestWorkspaceSlots() {
     Require(p.Slot(2) == admission.slot, "returned empty slot was not refilled");
 }
 
+static void TestPrefillThresholdSearch() {
+    using namespace fastllm;
+    std::mt19937 rng(127);
+    for (int trial = 0; trial < 3000; ++trial) {
+        std::vector<MoePrefillExpertCost> experts(rng() % 513);
+        std::set<int> thresholds{1};
+        for (auto &e : experts) {
+            e = {int(rng() % (trial % 2 ? 8193 : 17)), bool(rng() % 3 == 0)};
+            if (e.routes) thresholds.insert(e.routes + 1);
+        }
+        const double cpuUnit = (rng() % 1000 + 1) / 100000., gpuUnit = (rng() % 1000 + 1) / 1000.;
+        MoePrefillSplit expected;
+        double best = INFINITY;
+        for (int t : thresholds) {
+            double cpuRoutes = 0, gpuMs = 0; bool active = false;
+            for (const auto &e : experts) if (e.routes) {
+                active = true;
+                if (!e.pinned && e.routes < t) cpuRoutes += e.routes;
+                else gpuMs += gpuUnit;
+            }
+            const double cpuMs = cpuRoutes * cpuUnit, cost = std::max(cpuMs, gpuMs);
+            if (active && cost < best) { best = cost; expected = {t, cpuMs, gpuMs}; }
+        }
+        const auto actual = PredictSingleGpuPrefillSplit(experts, cpuUnit, gpuUnit);
+        Require(actual.limit == expected.limit && actual.cpuMs == expected.cpuMs &&
+                actual.gpuMs == expected.gpuMs, "prefill threshold changed placement or predicted cost");
+    }
+    const auto tied = PredictSingleGpuPrefillSplit({{1,false},{1,false}}, 1., 1.);
+    Require(tied.limit == 1, "prefill threshold tie break changed");
+}
+
 int main() {
+    TestPrefillThresholdSearch();
     TestWorkspaceSlots();
     TestDecodeCompletion();
     TestAdmissionPayback();
