@@ -107,6 +107,7 @@ namespace fastllm {
         struct DecodeCudaGraphState;
         struct DecodeGraphExecution;
         struct DecodeGraphPolicy { bool hybridDense = false; bool eligible = false; };
+        bool UseFullHybridGraph() const;
         DecodeGraphPolicy GpuDecodeGraphPolicy() const;
         DecodeGraphPolicy HybridDecodeGraphPolicy(const Data &hiddenStates, bool mtpTargetGraph);
         struct PleStagingState;
@@ -506,7 +507,13 @@ namespace fastllm {
                     RequestState &state, Data &output,
                     const std::vector<int> *hostInputTokens = nullptr,
                     const DiskEmbeddingRowReader::Ticket *prefetched = nullptr,
-                    Data *normalizedCapture = nullptr);
+                    Data *normalizedCapture = nullptr, Data *preparedEmbedding = nullptr);
+        void PreparePLEEmbedding(const Data &hyperInput, const Data &inputIds,
+            RequestState &state, Data &embedding, const std::vector<int> *hostInputTokens,
+            const DiskEmbeddingRowReader::Ticket *prefetched);
+        void RunPLEProjection(Data &embedding, const Data &hyperInput,
+            RequestState &state, Data &output, Data *normalizedCapture = nullptr,
+            bool stableHistory = false);
         bool TryCommitPLEPrefix(RequestState &state, const Data &normalized,
                                 const std::vector<int> &tokens, int count);
         void RunThreadTpPLE(const Data &hyperInput, const Data &inputIds,
@@ -532,6 +539,17 @@ namespace fastllm {
                               RequestState &state, Data &output,
                               Data *qsaRawKeyCapture = nullptr,
                               int decodeReserveTokens = 0);
+#ifdef USE_CUDA
+        // Shared by target decode/verification and the MTP draft. Storage
+        // preparation never commits a token; graph replay owns all GPU work.
+        bool PrepareFullAttentionGraphStorage(int layer, Data &pastKey, Data &pastValue,
+            RequestState &requestState, int sequence, int device,
+            TargetVerificationCapture *verificationCapture, std::vector<uint64_t> &signature);
+        bool RunFullAttentionGraph(int layer, const std::string &attention, const Data &input,
+            Data &pastKey, Data &pastValue, RequestState &requestState,
+            DecodeCudaGraphState *graphState, int device, int sparseWidth, bool dense,
+            bool verification, TargetVerificationCapture *capture, Data &output);
+#endif
         void RunFullAttentionWithPrefix(
                               int stateLayer,
                               const std::string &attentionPrefix,
@@ -603,6 +621,14 @@ namespace fastllm {
             const MtpRuntimeState &source, int cachedLen) const;
         std::shared_ptr<MtpRuntimeState> CloneMtpPrefixState(
             const MtpRuntimeState &source, int cachedLen) const;
+#ifdef USE_CUDA
+        int SampleMtpDraftLogits(MtpRuntimeState &state, const Data &logits,
+            bool deviceSampling, int sampledTokenOffset);
+        bool TryRunMtpDraftFullGraph(MtpRuntimeState &state, const Data &targetHidden,
+            const Data &inputEmbeds, const Data &positions, int segmentKey, bool deviceSampling,
+            Data *sampledTokenIds, Data *sampledTokenValues, int sampledTokenOffset,
+            Data *nextMultiHidden, float *topProbability, int &token);
+#endif
         int RunMtpDraft(MtpRuntimeState &state,
                         const Data &targetHiddenStates,
                         const std::vector<int> &inputTokens,
@@ -742,7 +768,7 @@ namespace fastllm {
             Data &logits,
             Data *targetMultiHidden,
             TargetVerificationCapture *verificationCapture,
-            int graphEndLayer = -1, Data *stageOutput = nullptr);
+            int graphEndLayer = -1, Data *stageOutput = nullptr, Data *pleEmbedding = nullptr);
 
         std::shared_ptr<PrefixSnapshot> FindPrefixSnapshotLocked(
             const std::vector<int> &tokens, int maxCachedLen,

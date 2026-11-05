@@ -1,6 +1,16 @@
 #pragma once
+#include <algorithm>
 #include "qwen4_exp.h"
+#include "utils/hybrid_moe.h"
 namespace fastllm {
+    // Attention work depends on the live context, never the full reserved KV
+    // arena. Coarse geometric widths bound recaptures and temporary memory.
+    inline int Qwen4DenseGraphWidth(int length, int sparseLimit) {
+        int width = 128;
+        while (width < length && width < sparseLimit) width *= 2;
+        return std::min(width, sparseLimit);
+    }
+
     struct Qwen4ExpModel::DecodeCudaGraphState {
         struct Segment {
             bool warmed = false;
@@ -32,6 +42,7 @@ namespace fastllm {
         // CPU experts execute between dense graphs. Each boundary owns stable
         // storage, with dtype and shape established by its eager warmup.
         std::map<int, HybridBoundary> hybridBoundaries;
+        Data pleEmbedding;
         Data hiddenStates[2];
         Data attentionInput;
         Data attentionInjection;
@@ -47,9 +58,9 @@ namespace fastllm {
         int32_t *pinnedDecodeMeta = nullptr;
         std::map<int, Segment> segments;
         struct HybridFullGraph {
-            void *graph = nullptr, *exec = nullptr, *replay = nullptr;
-            std::vector<void *> handles;
-            uint64_t launches = 0;
+#ifdef USE_CUDA
+            HybridMoeGraph graph;
+#endif
             bool disabled = false;
         };
         // Each QSA remainder owns a composition of the existing dense graphs
@@ -66,6 +77,9 @@ namespace fastllm {
         // Verifier lengths alternate as the confidence threshold truncates
         // drafts. Each length owns its graph buffers and rollback captures.
         std::map<int, std::unique_ptr<DecodeCudaGraphState>> verifierLengths;
+        // PLE prefix commit can alternate its two persistent history buffers.
+        // Keep both address variants instead of recapturing every acceptance.
+        std::map<int, std::unique_ptr<DecodeCudaGraphState>> pleHistories;
         TargetVerificationCapture verification;
         // A short request keeps eager attention after crossing the sparse
         // threshold, preserving its original key order and reduction shape.

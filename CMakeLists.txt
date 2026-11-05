@@ -1199,6 +1199,12 @@ if (UNIT_TEST)
             fastllm_add_checked_test(qwen4_remote_moe qwen4_gguf_test
                 "PASS: Qwen4 remote GPU-plan graph" 120 --remote-moe)
             set_tests_properties(qwen4_remote_moe PROPERTIES LABELS "cuda;hybrid;multi-gpu" RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
+            fastllm_add_checked_test(qwen4_ple_graph qwen4_gguf_test
+                "PASS: PLE full graph" 120 --ple-graph)
+            fastllm_add_checked_test(qwen4_attention_graph qwen4_gguf_test
+                "PASS: dense/sparse attention graph math" 120 --attention-graph)
+            set_tests_properties(qwen4_ple_graph qwen4_attention_graph PROPERTIES
+                LABELS "cuda;gguf" RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
             fastllm_add_checked_test(qwen4_graph_slot_reset qwen4_gguf_test
                 "PASS: Qwen4 graph slot resets history" 60 --graph-slot-reset)
             set_tests_properties(qwen4_graph_slot_reset PROPERTIES LABELS "cuda;gguf" RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
