@@ -1428,20 +1428,25 @@ class HybridDispatchPolicyTest(unittest.TestCase):
         for field,value in (("family","deepseek_v41"),("layers",47),("hidden",4096),("intermediate",768),("topk",8)):
             changed=copy.copy(g);object.__setattr__(changed,field,value)
             self.assertEqual(auto._qwen_hybrid_defaults(a,changed,t,gpu,True),{})
-        for hw,numa in (({0:{"capability":120}},True),({0:{"capability":75},1:{"capability":75}},True),(gpu,False)):
+        for hw,numa in (({0:{"capability":120}},True),({0:{"capability":75},1:{"capability":89}},True),(gpu,False)):
             self.assertEqual(auto._qwen_hybrid_defaults(a,g,t,hw,numa),{})
+        dual = auto._qwen_hybrid_defaults(a,g,t,{0:{"capability":75},1:{"capability":75}},True)
+        self.assertEqual(dual["FASTLLM_QWEN38_OWNED_PP"], "1")
+        self.assertEqual(dual["FASTLLM_QWEN38_REMOTE_GRAPH"], "1")
+        self.assertNotIn("FASTLLM_QWEN38_OWNED_PP", auto._qwen_hybrid_defaults(a,g,t,gpu,True))
         for backend in ("cpu","disk"):
             a.moe_device=backend
             self.assertEqual(auto._qwen_hybrid_defaults(a,g,t,gpu,True),{})
 
     def test_next_model_does_not_inherit_automatic_dispatch(self):
-        owned={"FASTLLM_QWEN38_HYBRID_GRAPH":"1","FASTLLM_QWEN38_PREFILL_DEQUANT":"1"}
+        owned={key: "1" for key in auto._QWEN_HYBRID_ENV}
         with patch.dict(auto._AUTO_QWEN_ENV_APPLIED,owned,clear=True), \
              patch.dict(os.environ,dict(owned,FASTLLM_QWEN38_HYBRID_GRAPH="0"),clear=True), \
              patch.object(auto,"_resolve_impl",return_value={}):
             auto.resolve(None,None)
             self.assertEqual(os.environ["FASTLLM_QWEN38_HYBRID_GRAPH"],"0")
-            self.assertNotIn("FASTLLM_QWEN38_PREFILL_DEQUANT",os.environ)
+            for key in owned.keys() - {"FASTLLM_QWEN38_HYBRID_GRAPH"}:
+                self.assertNotIn(key, os.environ)
             self.assertEqual(auto._AUTO_QWEN_ENV_APPLIED,{})
 
     def test_failed_planning_restores_dispatch_environment(self):

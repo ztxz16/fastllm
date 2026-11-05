@@ -529,17 +529,17 @@ def standard_moe_calibration_pair(tensors, model):
 _QWEN_HYBRID_ENV = (
     "FASTLLM_QWEN38_HYBRID_GRAPH", "FASTLLM_QWEN38_PREFILL_DEQUANT",
     "FASTLLM_QWEN38_PREFILL_ARENA", "FASTLLM_QWEN4_VISION_DEVICE",
-    "FASTLLM_QWEN38_PREFILL_REUSE",
+    "FASTLLM_QWEN38_PREFILL_REUSE", "FASTLLM_QWEN38_OWNED_PP", "FASTLLM_QWEN38_REMOTE_GRAPH",
 )
 _AUTO_QWEN_ENV_APPLIED = {}
 
 
 def _qwen_hybrid_defaults(args, model, tensors, hardware, numa):
-    # Restrict automatic dispatch to the model shape and single-GPU SM75
+    # Restrict automatic dispatch to the model shape and one/two-GPU SM75
     # configuration measured by the hybrid regression suite. Other backends
     # retain their existing policies; explicit environment values always win.
-    if (not numa or len(hardware) != 1 or
-            next(iter(hardware.values())).get("capability") != 75 or
+    if (not numa or len(hardware) not in (1, 2) or
+            any(device.get("capability") != 75 for device in hardware.values()) or
             (model.family, model.layers, model.hidden, model.intermediate,
              model.experts, model.topk) != ("qwen4", 48, 2560, 640, 512, 10) or
             args.moe_device in ("cpu", "disk")):
@@ -547,6 +547,8 @@ def _qwen_hybrid_defaults(args, model, tensors, hardware, numa):
     gguf = any(t.kind.startswith("gguf:") and memory._is_routed_expert(t.name)
                for t in tensors)
     defaults = {"FASTLLM_QWEN38_HYBRID_GRAPH": "1"}
+    if len(hardware) == 2:
+        defaults.update(FASTLLM_QWEN38_OWNED_PP="1", FASTLLM_QWEN38_REMOTE_GRAPH="1")
     if (getattr(args, "vision_device", None) is None and
             any(t.name.startswith("model.visual.") for t in tensors)):
         defaults["FASTLLM_QWEN4_VISION_DEVICE"] = "cpu"
