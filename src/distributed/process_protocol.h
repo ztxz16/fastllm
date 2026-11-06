@@ -18,7 +18,8 @@ constexpr uint32_t kVersion = 1;
 constexpr uint32_t kMaxPayload = 1024 * 1024;
 enum class Kind : uint32_t {
     Hello = 1, CreateId, UniqueId, Initialize, Ready,
-    Ping, Pong, Shutdown, Bye, Error, AllReduce, AllReduceResult
+    Ping, Pong, Shutdown, Bye, Error, AllReduce, AllReduceResult,
+    LoadQwen3, ModelLoaded, ReadWeight, WeightData, UnloadQwen3, ModelUnloaded
 };
 struct Message {
     Kind kind;
@@ -29,6 +30,8 @@ struct Message {
 
 void Put32(std::vector<uint8_t> &bytes, uint32_t value);
 uint32_t Get32(const std::vector<uint8_t> &bytes, size_t offset);
+void Put64(std::vector<uint8_t> &bytes, uint64_t value);
+uint64_t Get64(const std::vector<uint8_t> &bytes, size_t offset);
 void Send(int fd, const Message &message, Deadline deadline);
 Message Receive(int fd, Deadline deadline);
 void Validate(const Message &message, Kind kind, uint64_t session, uint64_t sequence);

@@ -170,5 +170,78 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover \
   -s test/distributed -p 'test_qwen3_shard_runner.py' -v
 ```
 
-后续再将该公共读取器接入 worker 加载命令、Qwen3 rank-local 前向、KV 生命周期与统一采样。
+后续继续接入 Qwen3 rank-local 前向、KV 生命周期与统一采样。
 CUDA Graph、自定义 AllReduce、跨请求前缀缓存仍需后续逐项适配。
+
+## Qwen3 多进程 GPU 权重驻留（待服务器验收）
+
+新增 `ProcessGroup::LoadQwen3 / ReadQwen3Weight / UnloadQwen3`。每个 worker
+自行调用原分片读取器，CPU 同时只保留单个源分片和至多 1 MiB 转换缓冲，
+全部权重转换为行主序 FP16 后驻留当前 GPU。BF16 转换在 CPU 上完成，因此
+不要求 V100 原生支持 BF16。CPU 源字节上限与 GPU 权重总字节上限独立；
+在读取 payload/分配 GPU 前检查配额。拒绝 NaN、Inf 和绝对值大于 65504 的值。
+
+这一阶段只提供权重存储，尚未调用正式前向算子；Norm 权重也按 FP16 保存，
+前向接入时仍须验证其数值精度和算子布局。量化、设备迁移、CUDA Graph、
+自定义 AllReduce、KV/前缀缓存均未在此阶段实现。原线程 TP 路径未改变，
+Python `--tp_backend process` 仍保留未实现保护，不得据此宣称模型生成已完成。
+
+生命周期：同一 worker 执行 stream 上同步上传和读回；加载成功后才发布权重。
+重复加载必须先卸载；卸载同步释放，重复卸载安全。加载或 CUDA 失败时不尝试
+继续复用部分权重，由控制面终止并回收整组 worker。正常停止先释放权重再销毁
+通信组。GPU 指针只在对应 worker 内有效，不经控制协议传输。
+
+在**服务器**构建（V100、CUDA 12.6、CUDA 12.6 版 NCCL）：
+
+```bash
+export CUDA_HOME=/usr/local/cuda-12.6
+export CUDACXX="$CUDA_HOME/bin/nvcc"
+export PATH="$CUDA_HOME/bin:$PATH"
+export LD_LIBRARY_PATH="$CUDA_HOME/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export CUDA_VISIBLE_DEVICES=0,1
+
+cmake -S . -B build-process-tp-cu126 \
+  -DUSE_CUDA=ON -DUSE_NUMAS=OFF -DBUILD_PROCESS_TP=ON \
+  -DCMAKE_CUDA_COMPILER="$CUDACXX" -DCUDA_ARCH=70
+cmake --build build-process-tp-cu126 \
+  --target fastllm_tp_worker fastllm_tp_check fastllm_tp_model_check -j 4
+
+# 先确认原通信/生命周期行为未回归。
+python3 test/distributed/run_process_tp.py \
+  --check build-process-tp-cu126/fastllm_tp_check \
+  --worker build-process-tp-cu126/fastllm_tp_worker --devices 0,1 --cuda \
+  --build-cache build-process-tp-cu126/CMakeCache.txt
+
+# 真实 worker 加载小型确定性权重；独立 Python 参考验证全部 GPU 读回字节。
+python3 test/distributed/run_qwen3_device_weights.py \
+  --check build-process-tp-cu126/fastllm_tp_model_check \
+  --worker build-process-tp-cu126/fastllm_tp_worker --devices 0,1 \
+  --build-cache build-process-tp-cu126/CMakeCache.txt
+```
+
+GPU 验收生成 Markdown/CSV/JSON/XLSX 报告、完整命令、原始输出、固定输入及
+GPU 读回文件。逐元素报告最大/平均绝对误差、失败元素数；逐字节验证包含负零。
+重载用例的第二轮使用同形状但数值不同的模型，检查旧权重是否残留；检查器启动
+失败、超时或中断时，stderr 保留失败原因及完整命令。
+用例含 F16/BF16/F32、全部有限 FP16 值、F32 ties-to-even/次正规舍入、1 MiB
+分块边界、配额边界、重复加载、卸载后读、非法读取范围，以及只在最后 rank
+出现的非有限值/溢出。拒绝用例必须同时验证整组 Failed 且 worker 已回收。
+不是性能测试，不报告吞吐或加速比。运行 `--devices 0` 可补单 rank 验证。
+
+真实 Qwen3-1.7B 可通过同一检查程序进行加载/读回冒烟，约额外写入 4.4 GiB；
+该命令本身只检查状态及字节计数，不提供真实模型的独立数值或推理正确性结论：
+
+```bash
+TP_DEVICE_RUN=$(mktemp -d "$PWD/test/distributed/results/qwen3-device-real-XXXXXX")
+build-process-tp-cu126/fastllm_tp_model_check \
+  --worker build-process-tp-cu126/fastllm_tp_worker \
+  --model /home/models/Qwen3-1.7B --devices 0,1 \
+  --output "$TP_DEVICE_RUN/weights" \
+  >"$TP_DEVICE_RUN/report.json" 2>"$TP_DEVICE_RUN/stderr.log"
+```
+
+本地仅允许不触发编译的 Python 回归：
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/distributed -p 'test_*.py'
+```
