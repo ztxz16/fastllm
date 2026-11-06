@@ -637,6 +637,19 @@ agent_tools_args=(--runtime-dir "$runtime_dir" --cache-dir "${cache_dir}/agent-t
 ((offline == 0)) || agent_tools_args+=(--offline)
 "$python_bin" "${PORTABLE_ASSETS_DIR}/fetch_agent_tools.py" "${agent_tools_args[@]}"
 
+log "收集视频后端的 FFmpeg / FFprobe 及动态库"
+mkdir -p "${bundle_dir}/media/bin"
+for tool in ffmpeg ffprobe; do
+    require_command "$tool"
+    install -m 0755 "$(command -v "$tool")" "${bundle_dir}/media/bin/${tool}"
+done
+"$python_bin" "${ROOT_DIR}/desktop/collect_libraries.py" \
+    --root "${bundle_dir}/media" --output "${bundle_dir}/media/lib" \
+    --report "${bundle_dir}/media/LIBRARIES.json" \
+    --copyrights "${bundle_dir}/media/licenses" --no-nss
+# Missing native video files must fail even when runtime smoke tests are skipped.
+"$python_bin" "${PORTABLE_ASSETS_DIR}/video_runtime.py" --bundle-root "$bundle_dir"
+
 mkdir -p "${bundle_dir}/libexec"
 install -m 0755 "${PORTABLE_ASSETS_DIR}/launcher.sh" "${bundle_dir}/ftllm"
 install -m 0755 "${PORTABLE_ASSETS_DIR}/launch.sh" "${bundle_dir}/launch.sh"
@@ -647,6 +660,7 @@ install -m 0755 "${PORTABLE_ASSETS_DIR}/launcher.sh" "${bundle_dir}/ftllm-check"
 install -m 0644 "${PORTABLE_ASSETS_DIR}/activate.sh" "${bundle_dir}/libexec/activate.sh"
 install -m 0755 "${PORTABLE_ASSETS_DIR}/check.py" "${bundle_dir}/libexec/check.py"
 install -m 0644 "${PORTABLE_ASSETS_DIR}/cuda_runtime.py" "${bundle_dir}/libexec/cuda_runtime.py"
+install -m 0644 "${PORTABLE_ASSETS_DIR}/video_runtime.py" "${bundle_dir}/libexec/video_runtime.py"
 install -m 0644 "${PORTABLE_ASSETS_DIR}/env.sh" "${bundle_dir}/env.sh"
 install -m 0644 "${PORTABLE_ASSETS_DIR}/README.md.in" "${bundle_dir}/README.md"
 install -m 0644 "${PORTABLE_ASSETS_DIR}/THIRD-PARTY-NOTICES.md" "${bundle_dir}/THIRD-PARTY-NOTICES.md"

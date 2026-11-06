@@ -107,6 +107,9 @@ class H3Backend:
         explicit = config.server_binary.strip() or os.environ.get("FTLLM_H3_SERVER", "")
         if explicit:
             return os.path.expanduser(explicit)
+        bundled = Path(__file__).resolve().parent / "minimax_h3_server"
+        if bundled.is_file():
+            return str(bundled)
         found = shutil.which("minimax_h3_server")
         if found:
             return found
@@ -124,6 +127,9 @@ class H3Backend:
         command = [self.executable(config), "--model", os.path.expanduser(config.model.strip()),
                    "--host", config.host.strip(), "--port", config.port.strip(),
                    "--devices", devices, "--output", os.path.expanduser(output)]
+        demo = Path(__file__).resolve().parent / "h3_assets/demo.html"
+        if demo.is_file():
+            command.extend(("--demo", str(demo)))
         for flag, value in (("--base-model", config.base_model), ("--api-key", config.api_key)):
             if value.strip():
                 command.extend((flag, os.path.expanduser(value.strip()) if flag == "--base-model" else value.strip()))

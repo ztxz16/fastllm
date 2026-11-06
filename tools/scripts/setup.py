@@ -70,7 +70,7 @@ setup (
         '': ['*.dll', '*.so', '*.dylib', '*.so.*', '*.html', '*.js', '*.mjs', '*.svg', 'build_info.json',
              'fastllm_triton_server.py', 'launcher_assets/*',
              'launcher_assets/locales/*.json', 'webui_assets/*',
-             'ui_plugins/*/*', 'plugin_assets/*']
+             'ui_plugins/*/*', 'plugin_assets/*', 'minimax_h3_server', 'minimax_h3_generate', 'h3_assets/*']
     },
     install_requires=[
         'pyreadline3',

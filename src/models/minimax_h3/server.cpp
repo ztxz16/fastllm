@@ -425,6 +425,15 @@ int main(int argc, char **argv) {
         double gpuMemoryLimit = 0, hostMemoryLimit = 0;
         for (int i = 1; i < argc; ++i) {
             std::string arg = argv[i];
+            if (arg == "--help" || arg == "-h") {
+                std::cout << R"(Usage: minimax_h3_server --model PATH [options]
+  --host ADDRESS --port PORT --output DIRECTORY --api-key KEY
+  --device ID[,ID] --precision bf16|fp32 --vae-precision fp16|bf16|fp32
+  --gpu-memory-limit SIZE --host-memory-limit SIZE
+  --pika PATH --base-model PATH --ffmpeg PATH --demo PATH
+)";
+                return 0;
+            }
             if (i + 1 >= argc)
                 throw std::invalid_argument("missing value for " + arg);
             std::string v = argv[++i];

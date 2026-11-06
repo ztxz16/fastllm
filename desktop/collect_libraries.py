@@ -201,7 +201,8 @@ def collect(args: argparse.Namespace) -> Dict[str, object]:
 
     for soname, optional_path in find_optional_libraries(args.optional).items():
         bundle_library(soname, optional_path)
-    for soname, source in find_nss_libraries().items():
+    nss_libraries = {} if getattr(args, "no_nss", False) else find_nss_libraries()
+    for soname, source in nss_libraries.items():
         bundle_library(soname, source)
         checksum = source.with_suffix(".chk")
         if checksum.is_file():
@@ -279,6 +280,7 @@ def main() -> int:
     parser.add_argument("--copyrights", type=Path, required=True, help="Directory for distro copyright files")
     parser.add_argument("--exclude", action="append", default=[], type=Path, help="Subtree not scanned")
     parser.add_argument("--optional", action="append", default=[], help="Runtime-loaded SONAME to include")
+    parser.add_argument("--no-nss", action="store_true", help="Skip Electron-specific NSS modules for non-browser tools")
     args = parser.parse_args()
     try:
         report = collect(args)

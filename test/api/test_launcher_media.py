@@ -106,6 +106,18 @@ class ServiceTest(unittest.TestCase):
             time.sleep(.05)
         self.fail(str(self.pool.state()) + str(self.pool.logs()))
 
+    def test_bundled_video_backend_is_found_without_path_and_can_be_overridden(self):
+        from fastllm_pytools import service_backends
+        binary = self.directory / "minimax_h3_server"
+        binary.touch()
+        config = SimpleNamespace(server_binary="")
+        with patch.object(service_backends, "__file__", str(self.directory / "service_backends.py")), \
+                patch.dict(os.environ, {"FTLLM_H3_SERVER": ""}), \
+                patch.object(service_backends.shutil, "which", return_value=None):
+            self.assertEqual(service_backends.H3Backend.executable(config), str(binary))
+            config.server_binary = str(self.worker)
+            self.assertEqual(service_backends.H3Backend.executable(config), str(self.worker))
+
     def test_gpu_mask_is_composed_and_auto_configuration_preserves_it(self):
         self.assertEqual(visible_gpu_environment("1,0", {"CUDA_VISIBLE_DEVICES": "6,7"}), {"CUDA_VISIBLE_DEVICES": "7,6"})
         self.assertEqual(visible_gpu_environment("1", {"CUDA_VISIBLE_DEVICES": "GPU-a,GPU-b"}), {"CUDA_VISIBLE_DEVICES": "GPU-b"})

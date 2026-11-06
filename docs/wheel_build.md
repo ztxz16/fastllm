@@ -16,6 +16,11 @@ docker run --rm -v "$PWD:/src" -w /src fastllm-wheel:cu129-u20 \
 日志为 `build-wheel/build.log`。可用 `--output-dir` 指定产物目录，
 用新的 `--build-dir` 做干净构建；默认复用已有构建目录。
 
+发布 wheel 同时包含 MiniMax-H3 / Pika 的 `minimax_h3_server`、`minimax_h3_generate`
+和专用动态库；面板自动查找包内服务。单独使用 wheel 时需要系统提供 FFmpeg / FFprobe。
+绿色包构建环境也需安装这两个工具，打包流程会携带它们及非 glibc 动态库，目标机器无需另装。
+BF16 视频后端编译 SM80 及更新架构；LLM 核心库仍保留原来的全架构支持。
+
 大内存、多核机器可使用 `--cpu-jobs 96 --cuda-jobs 24 --nvcc-threads 4 --split-compile 2`。
 NVCC 内部线程会叠加在 CUDA 并行任务上，普通机器应降低线程数。
 `--nightly` 生成 nightly 包；完整选项见 `bash make_whl.sh --help`。

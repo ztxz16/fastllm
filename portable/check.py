@@ -14,6 +14,7 @@ import sys
 from pathlib import Path
 
 from cuda_runtime import check_cuda_runtime
+from video_runtime import check_video_runtime
 
 
 MIN_GLIBC = (2, 35)
@@ -182,6 +183,12 @@ def main() -> int:
         for soname, path in check_cuda_runtime(bundle_root / "runtime").items():
             ok(f"包内 CUDA 动态库：{soname}（{path}）")
     except (OSError, RuntimeError) as error:
+        fail(str(error))
+
+    try:
+        for name, path in check_video_runtime(bundle_root, run=True).items():
+            ok(f"包内视频后端：{name}（{path}）")
+    except (OSError, RuntimeError, subprocess.SubprocessError) as error:
         fail(str(error))
 
     try:
