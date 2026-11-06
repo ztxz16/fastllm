@@ -3,7 +3,10 @@
 #include "models/basellm.h"
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
+#include <deque>
 #include <iostream>
+#include <thread>
 #ifdef USE_CUDA
 #include "devices/cuda/fastllm-cuda.cuh"
 #endif
@@ -125,6 +128,13 @@ struct PDPending {
     std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
 };
 struct PDRuntime {
+    struct PrefillRequest {
+        std::vector<int> input;
+        std::promise<fastkv::Message> result;
+        std::unique_ptr<ResponseContext> context;
+        bool reserved = false;
+        std::chrono::steady_clock::time_point queued = std::chrono::steady_clock::now();
+    };
     std::unique_ptr<fastkv::Service> service;
     std::string role, identity;
     std::vector<std::string> peers;
@@ -134,7 +144,228 @@ struct PDRuntime {
     size_t tokenCapacity = 0;
     std::unique_ptr<fastkv::Budget> slots, tokens;
     std::unique_ptr<fastkv::PrefixCache> cache;
+    std::mutex prefillMutex, prefillStopMutex;
+    std::condition_variable prefillCV;
+    std::deque<std::shared_ptr<PrefillRequest>> waiting;
+    std::thread prefillThread;
+    int batchRequests = 1, batchTokens = 1, targetRequests = 1, waitMs = 0;
+
+    ~PDRuntime() { StopPrefill(); }
+    void StopPrefill() {
+        std::lock_guard<std::mutex> stoppingLock(prefillStopMutex);
+        {
+            std::lock_guard<std::mutex> lock(prefillMutex);
+            stopping = true;
+        }
+        prefillCV.notify_all();
+        if (prefillThread.joinable()) prefillThread.join();
+    }
+    fastkv::Message Prefill(std::vector<int> input) {
+        auto request = std::make_shared<PrefillRequest>();
+        request->input = std::move(input);
+        auto result = request->result.get_future();
+        {
+            std::lock_guard<std::mutex> lock(prefillMutex);
+            Check(!stopping, "prefill is stopping");
+            waiting.push_back(request);
+        }
+        prefillCV.notify_one();
+        return result.get();
+    }
+    void RunPrefill(basellm &model);
 };
+
+void PDRuntime::RunPrefill(basellm &model) {
+    using Request = std::shared_ptr<PrefillRequest>;
+    std::deque<Request> active;
+    size_t reserved = 0;
+    auto retire = [&](const Request &request) {
+        if (request->reserved) {
+            reserved -= request->input.size();
+            request->reserved = false;
+        }
+        auto context = std::move(request->context);
+        if (context) {
+            context->isAbort = true;
+            model.OnResponseContextRemoved(context.get());
+        }
+    };
+    try {
+        while (true) {
+            std::vector<Request> admitted;
+            {
+                std::unique_lock<std::mutex> lock(prefillMutex);
+                if (active.empty()) {
+                    prefillCV.wait(lock, [&] { return stopping || !waiting.empty(); });
+                    if (!stopping && waitMs > 0) {
+                        const auto deadline = waiting.front()->queued + std::chrono::milliseconds(waitMs);
+                        prefillCV.wait_until(lock, deadline, [&] {
+                            if (stopping || int(waiting.size()) >= targetRequests) return true;
+                            size_t tokens = 0;
+                            for (const auto &r : waiting) tokens += std::min(size_t(chunk), r->input.size());
+                            return tokens >= size_t(batchTokens);
+                        });
+                    }
+                }
+                if (stopping) break;
+                while (!waiting.empty() && int(active.size() + admitted.size()) < batchRequests &&
+                       waiting.front()->input.size() <= tokenCapacity - reserved) {
+                    auto request = waiting.front(); waiting.pop_front();
+                    reserved += request->input.size();
+                    request->reserved = true;
+                    admitted.push_back(std::move(request));
+                }
+            }
+            // Only the model execution lane touches contexts and GPU state.
+            // RPC handlers wait on their independent result; they never hold
+            // forwardLocker while waiting for another request to arrive.
+            std::lock_guard<std::mutex> lock(model.forwardLocker);
+            for (const auto &request : admitted) {
+                try {
+                    fastkv::PrefixCache::Hit hit;
+                    if (cache) hit = cache->Find(identity, request->input, request->input.size());
+                    if (model.verbose) {
+                        const auto stats = cache ? cache->Stats() : fastkv::PrefixCache::Statistics{};
+                        std::cout << "[FastKV PD] prefix_hit=" << hit.tokens << " prompt=" << request->input.size()
+                                  << " cache_entries=" << stats.entries << " cache_bytes=" << stats.bytes
+                                  << " cache_logical_bytes=" << stats.logicalBytes << std::endl;
+                    }
+                    if (hit.state && hit.tokens == request->input.size()) {
+                        retire(request);
+                        request->result.set_value(*hit.state);
+                        continue;
+                    }
+                    request->context.reset(new ResponseContext);
+                    auto &context = *request->context;
+                    context.Init(model.block_cnt, model.dataType, model.kvCacheDataType);
+                    context.allTokens = request->input;
+                    context.inputTokens = request->input.size();
+                    context.generationConfig.top_k = 1;
+                    context.generationConfig.output_token_limit = 1;
+                    context.generationConfig.input_token_length = request->input.size() + 1;
+                    model.OnResponseContextCreated(&context);
+                    if (hit.state) {
+                        context.allTokens.resize(hit.tokens);
+                        context.allTokens.push_back(0); // adapter validates the N-1 boundary
+                        model.ImportPDState(context, *hit.state);
+                        context.preTokens = hit.tokens;
+                        context.allTokens = request->input;
+                    }
+                    active.push_back(request);
+                } catch (...) {
+                    auto error = std::current_exception();
+                    retire(request);
+                    request->result.set_exception(error);
+                }
+            }
+            if (active.empty()) continue;
+
+            std::vector<Request> selected;
+            std::vector<int> lengths;
+            int budget = batchTokens;
+            int remaining = int(std::min(size_t(batchTokens), active.size()));
+            for (const auto &request : active) {
+                if (!remaining) break;
+                const int count = std::min({chunk, budget / remaining,
+                    int(request->input.size()) - request->context->preTokens});
+                selected.push_back(request); lengths.push_back(count); budget -= count;
+                --remaining;
+            }
+            const int batch = selected.size();
+            std::vector<Data> ids(batch), masks(batch), positions(batch);
+            std::vector<Data *> maskRefs, positionRefs;
+            std::vector<std::pair<Data *, Data *>> past;
+            std::vector<GenerationConfig> configs;
+            std::vector<float> packed;
+            if (batch > 1)
+                packed.reserve(batchTokens - budget);
+            for (int i = 0; i < batch; ++i) {
+                auto &context = *selected[i]->context;
+                const int start = context.preTokens, end = start + lengths[i];
+                std::vector<std::vector<float>> input(1);
+                input[0].assign(selected[i]->input.begin() + start, selected[i]->input.begin() + end);
+                model.FillLLMInputs(input, {{"promptLen", end}, {"index", 0}, {"add_special_tokens", 0}},
+                                    ids[i], masks[i], positions[i]);
+                ToDataType(masks[i], model.dataType);
+                // Preserve the model's input builder rather than assuming its
+                // token IDs or positions equal the raw transport payload.
+                ids[i].ToDevice(CPU);
+                Check(ids[i].dataType == FLOAT32 && ids[i].Count(0) == size_t(lengths[i]),
+                      "prefill input builder changed the token count or type");
+                if (batch > 1) {
+                    auto *data = reinterpret_cast<const float *>(ids[i].cpuData);
+                    packed.insert(packed.end(), data, data + lengths[i]);
+                }
+                maskRefs.push_back(&masks[i]); positionRefs.push_back(&positions[i]);
+                configs.push_back(context.generationConfig);
+                for (auto &kv : context.pastKeyValues) past.emplace_back(&kv.first, &kv.second);
+            }
+            struct Intermediate {
+                basellm &model;
+                bool previous;
+                explicit Intermediate(basellm &m) : model(m), previous(m.isIntermediateChunkedPrefill) {
+                    model.isIntermediateChunkedPrefill = true;
+                }
+                ~Intermediate() { model.isIntermediateChunkedPrefill = previous; }
+            } intermediate(model);
+            const auto begin = std::chrono::steady_clock::now();
+            LastTokensManager last(batch, 0);
+            if (batch == 1) {
+                model.Forward(ids[0], masks[0], positions[0], selected[0]->context->pastKeyValues,
+                              configs[0], last, nullptr);
+            } else {
+                Data inputIds(FLOAT32, {1, int(packed.size())}, packed);
+                if (model.use_new_engine) {
+                    if (model.CanUseGPUForward())
+                        model.ForwardGPU(batch, inputIds, maskRefs, positionRefs, lengths, past, configs, last);
+                    else model.ForwardV2(batch, inputIds, maskRefs, positionRefs, lengths, past, configs, last);
+                } else model.ForwardBatch(batch, inputIds, maskRefs, positionRefs, lengths, past, configs, last);
+            }
+            if (model.verbose) {
+                const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
+                std::cout << "[FastKV PD] prefill_batch=" << batch << " tokens=" << batchTokens - budget
+                          << " forward_ms=" << seconds * 1000 << std::endl;
+            }
+            for (int i = 0; i < batch; ++i) {
+                auto request = active.front(); active.pop_front();
+                request->context->preTokens += lengths[i];
+                if (size_t(request->context->preTokens) != request->input.size()) {
+                    active.push_back(request); // round-robin chunks, no long-request monopolization
+                    continue;
+                }
+                try {
+                    auto reply = model.ExportPDState(*request->context);
+                    if (cache) {
+                        try { cache->Publish(identity, request->input, reply); }
+                        catch (const std::exception &error) {
+                            if (model.verbose) std::cerr << "[FastKV PD] prefix not retained: " << error.what() << std::endl;
+                        }
+                    }
+                    retire(request);
+                    request->result.set_value(std::move(reply));
+                } catch (...) {
+                    auto error = std::current_exception();
+                    retire(request);
+                    request->result.set_exception(error);
+                }
+            }
+        }
+        throw std::runtime_error("FastKV PD: prefill cancelled by shutdown");
+    } catch (...) {
+        const auto error = std::current_exception();
+        {
+            std::lock_guard<std::mutex> lock(prefillMutex);
+            stopping = true;
+            for (const auto &request : waiting) request->result.set_exception(error);
+            waiting.clear();
+        }
+        std::lock_guard<std::mutex> lock(model.forwardLocker);
+        for (const auto &request : active) {
+            retire(request);
+            request->result.set_exception(error);
+        }
+    }
+}
 
 std::string basellm::PDLayout() const {
     throw std::invalid_argument("FastKV PD: this model has no state adapter");
@@ -147,7 +378,7 @@ void basellm::ImportPDState(ResponseContext &, const fastkv::Message &) {
 bool basellm::IsPDDecode() const { return pdRuntime && pdRuntime->role == "decode"; }
 void basellm::StopPD() {
     if (pdRuntime) {
-        pdRuntime->stopping = true;
+        pdRuntime->StopPrefill();
         pdRuntime->service->Stop();
     }
 }
@@ -166,6 +397,7 @@ void basellm::ConfigurePD(const json11::Json &config) {
     runtime->tokenCapacity =
         GetMaxTokens() > 0 ? size_t(GetMaxTokens()) : size_t(max_positions) * concurrent;
     fastkv::Options options;
+    options.workers = std::max(4, std::min(concurrent, 16));
     const std::string transport = config["transport"].string_value();
     Check(transport == "tcp" || transport == "rdma" || transport == "auto", "unknown transport");
     options.transport = transport == "rdma"   ? fastkv::Transport::Rdma
@@ -203,85 +435,26 @@ void basellm::ConfigurePD(const json11::Json &config) {
     try {
         if (runtime->role == "prefill") {
             Check(!config["listen"].string_value().empty(), "prefill listen endpoint is required");
+            const bool batching = SupportsPrefillBatching() && canDoBatchForward;
+            runtime->batchRequests = batching ? std::min(concurrent, options.workers) : 1;
+            if (prefillBatchPolicy.maxRequests > 0)
+                runtime->batchRequests = std::min(runtime->batchRequests, prefillBatchPolicy.maxRequests);
+            runtime->batchTokens = batching ? std::max(runtime->chunk, GetBatchedPrefillTokenLimit()) : runtime->chunk;
+            runtime->targetRequests = prefillBatchPolicy.targetRequests > 0 ?
+                std::min(runtime->batchRequests, prefillBatchPolicy.targetRequests) : runtime->batchRequests;
+            runtime->waitMs = batching ? prefillBatchPolicy.maxWaitMs : 0;
+            runtime->prefillThread = std::thread([this, raw = runtime.get()] { raw->RunPrefill(*this); });
             runtime->service->Start(config["listen"].string_value(), [this, raw = runtime.get()](
                                                                          const fastkv::Message &request) {
                 fastkv::Reader reader(request.metadata);
                 Check(reader.U32() == 1 && reader.String() == raw->identity,
                       "incompatible checkpoint or state layout");
-                const auto tokens = reader.Ints(size_t(max_positions));
+                auto tokens = reader.Ints(size_t(max_positions));
                 reader.End();
                 Check(request.buffers.empty() && !tokens.empty() && tokens.size() < size_t(max_positions),
                       "invalid prefill request");
                 Check(tokens.size() <= raw->tokenCapacity, "prompt exceeds the prefill token pool");
-                std::lock_guard<std::mutex> lock(forwardLocker);
-                Check(!raw->stopping, "model is shutting down");
-                fastkv::PrefixCache::Hit hit;
-                if (raw->cache)
-                    hit = raw->cache->Find(raw->identity, tokens, tokens.size());
-                if (hit.state) {
-                    if (verbose)
-                        std::cout << "[FastKV PD] prefix_hit=" << hit.tokens << " prompt=" << tokens.size()
-                                  << std::endl;
-                    if (hit.tokens == tokens.size())
-                        return *hit.state;
-                }
-                ResponseContext context;
-                context.Init(block_cnt, dataType, kvCacheDataType);
-                context.allTokens = tokens;
-                context.inputTokens = tokens.size();
-                context.generationConfig.top_k = 1;
-                context.generationConfig.output_token_limit = 1;
-                context.generationConfig.input_token_length = tokens.size() + 1;
-                OnResponseContextCreated(&context);
-                struct Cleanup {
-                    basellm *model;
-                    ResponseContext *context;
-                    bool intermediate;
-                    ~Cleanup() {
-                        model->isIntermediateChunkedPrefill = intermediate;
-                        context->isAbort = true;
-                        model->OnResponseContextRemoved(context);
-                    }
-                } cleanup{this, &context, isIntermediateChunkedPrefill};
-                isIntermediateChunkedPrefill = true;
-                if (hit.state) {
-                    // Import validates the boundary against N-1. The cached
-                    // prefix has no sampler state; the extra token is a marker
-                    // used only for validation, never fed to the model.
-                    context.allTokens.resize(hit.tokens);
-                    context.allTokens.push_back(0);
-                    ImportPDState(context, *hit.state);
-                    context.preTokens = hit.tokens;
-                    context.allTokens = tokens;
-                }
-                for (size_t start = hit.tokens; start < tokens.size();) {
-                    Check(!raw->stopping, "prefill cancelled by shutdown");
-                    const size_t end = std::min(tokens.size(), start + raw->chunk);
-                    std::vector<std::vector<float>> input(1);
-                    for (size_t i = start; i < end; ++i)
-                        input[0].push_back(tokens[i]);
-                    Data ids, mask, positions;
-                    FillLLMInputs(input, {{"promptLen", int(end)}, {"index", 0}, {"add_special_tokens", 0}},
-                                  ids, mask, positions);
-                    ToDataType(mask, dataType);
-                    LastTokensManager last(1, 0);
-                    Forward(ids, mask, positions, context.pastKeyValues, context.generationConfig, last,
-                            nullptr);
-                    context.preTokens = end;
-                    start = end;
-                }
-                auto reply = ExportPDState(context);
-                if (raw->cache) {
-                    try {
-                        raw->cache->Publish(raw->identity, tokens, reply);
-                    } catch (const std::exception &error) {
-                        // A cache is optional. Pinned entries or an oversized
-                        // object must not fail an otherwise complete handoff.
-                        if (verbose)
-                            std::cerr << "[FastKV PD] prefix not retained: " << error.what() << std::endl;
-                    }
-                }
-                return reply;
+                return raw->Prefill(std::move(tokens));
             });
         }
     } catch (...) {

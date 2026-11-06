@@ -1385,7 +1385,7 @@ class Fixture : public NaiveN05FlashModel {
                  <<" checks="<<checks<<" relative="<<largestLogitRelative<<std::endl;
     }
 
-    void PackedPrefillChecks(bool longPrefill = false) {
+    void PackedPrefillChecks(bool longPrefill = false, bool cacheOnly = false) {
         GenerationConfig config;
         config.output_logits = true;
         config.output_token_limit = 16;
@@ -1412,8 +1412,12 @@ class Fixture : public NaiveN05FlashModel {
         }
         Data input(FLOAT32, {1, (int)ids.size()}, ids);
         std::vector<GenerationConfig> configs(3, config);
-        ForwardBatch(3, input, {}, positionPtrs, lengths, kv, configs, LastTokensManager(), &outputs);
-        for (int b = 0; b < 3; ++b) {
+        isIntermediateChunkedPrefill = cacheOnly;
+        auto tokens = ForwardBatch(3, input, {}, positionPtrs, lengths, kv, configs,
+                                   LastTokensManager(), cacheOnly ? nullptr : &outputs);
+        isIntermediateChunkedPrefill = false;
+        if (tokens.size() != 3) throw std::runtime_error("prefill batch result shape");
+        for (int b = 0; b < 3 && !cacheOnly; ++b) {
             if (actual[b].size() != expected[b].size()) throw std::runtime_error("prefill logits missing");
             RequireCloseLogits(actual[b].data(), expected[b], "packed prefill logits");
         }
@@ -2482,10 +2486,11 @@ int main(int argc, char **argv) {
             { DraftFixture fixture(true); fixture.Run(); }
             return 0;
         }
-        if (argc > 2 && std::string(argv[2]) == "batch_prefill") {
+        if (argc > 2 && (std::string(argv[2]) == "batch_prefill" ||
+                        std::string(argv[2]) == "batch_prefill_nosample")) {
             SetCudaEmbedding(true);
             Fixture fixture(ranks, true, true);
-            fixture.PackedPrefillChecks();
+            fixture.PackedPrefillChecks(false, std::string(argv[2]) == "batch_prefill_nosample");
             return 0;
         }
         if (argc > 2 && std::string(argv[2]) == "batch_prefill_long") {

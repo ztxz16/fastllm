@@ -543,6 +543,7 @@ std::vector<int> NaiveN05FlashModel::ForwardBatch(int batch, const Data &inputId
     if (trace) trace->Mark("input_prepare_ms");
     Data logits = ForwardTensorParallel(inputIds, positions, unused, configs[0],
                                         nullptr, &selection, &requests);
+    if (isIntermediateChunkedPrefill) return std::vector<int>(batch, 0);
     if (!selection.sampledTokens.empty()) return selection.sampledTokens;
     std::vector<int> tokens(batch);
     if (!selection.candidates.dims.empty()) {

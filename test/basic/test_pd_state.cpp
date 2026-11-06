@@ -2,6 +2,8 @@
 #include "models/basellm.h"
 #include "pd.h"
 #include <chrono>
+#include <algorithm>
+#include <future>
 #include <iostream>
 #include <thread>
 
@@ -11,7 +13,7 @@ static void Check(bool ok, const char *message) {
         throw std::runtime_error(message);
 }
 
-class StateModel final : public basellm {
+class StateModel : public basellm {
   public:
     std::atomic<int> forwards{0};
     StateModel() {
@@ -20,6 +22,7 @@ class StateModel final : public basellm {
         use_new_engine = true;
         maxBatch = 2;
     }
+    ~StateModel() override { ShutdownRuntime(); }
     std::string MakeInput(const std::string &, int, const std::string &s) override { return s; }
     std::string MakeHistory(const std::string &, int, const std::string &, const std::string &s) override {
         return s;
@@ -48,6 +51,132 @@ class StateModel final : public basellm {
         reader.End();
     }
 };
+
+class BatchStateModel final : public StateModel {
+  public:
+    std::atomic<int> batches{0}, largest{0}, live{0}, peakTokens{0}, liveTokens{0};
+    std::atomic<bool> fail{false}, entered{false}, hold{false};
+    BatchStateModel() { maxBatch = 4; use_new_engine = false; canDoBatchForward = true; }
+    ~BatchStateModel() override { hold = false; ShutdownRuntime(); }
+    bool SupportsPrefillBatching() const override { return true; }
+    void OnResponseContextCreated(ResponseContext *context) override {
+        ++live;
+        const int tokens = (liveTokens += context->inputTokens);
+        peakTokens = std::max(peakTokens.load(), tokens);
+    }
+    void OnResponseContextRemoved(ResponseContext *context) override {
+        --live; liveTokens -= context->inputTokens;
+    }
+    std::vector<int> ForwardBatch(int batch, const Data &ids, const std::vector<Data *> &,
+            const std::vector<Data *> &positions, const std::vector<int> &lengths,
+            std::vector<std::pair<Data *, Data *>> &kv, const std::vector<GenerationConfig> &,
+            const LastTokensManager &, std::vector<std::vector<float> *> *) override {
+        ++batches; largest = std::max(largest.load(), batch);
+        Check(isIntermediateChunkedPrefill && ids.Count(0) <= 8, "PD batch token budget/sampling flag");
+        entered = true;
+        while (hold) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        if (fail) throw std::runtime_error("injected batch failure");
+        size_t offset = 0;
+        for (int i = 0; i < batch; ++i) {
+            Check(lengths[i] > 0 && lengths[i] <= 2, "per-request chunk bound");
+            auto &state = *kv[i].first;
+            float value = state.dims.empty() ? 0 : ((float *)state.cpuData)[0];
+            for (int j = 0; j < lengths[i]; ++j)
+                value += ((float *)ids.cpuData)[offset++] * (1 + ((float *)positions[i]->cpuData)[j]);
+            state.CopyFrom(Data(FLOAT32, {1}, std::vector<float>{value}));
+        }
+        Check(offset == ids.Count(0), "packed batch lost input tokens");
+        return std::vector<int>(batch, 0);
+    }
+};
+
+static void TestPrefillBatch() {
+    auto endpoint = [] {
+        fastkv::Service port;
+        port.Start("127.0.0.1:0", [](const fastkv::Message &m) { return m; });
+        const auto address = port.Address(); port.Stop(); return address;
+    }();
+    SetMaxTokens(24);
+    BatchStateModel model;
+    Check(model.SetPrefillBatching(8, 50, 4), "configure PD batch policy");
+    model.ConfigurePD(json11::Json::object{{"role", "prefill"}, {"model_id", "test"},
+        {"transport", "tcp"}, {"listen", endpoint}, {"cache_bytes", 65536}, {"chunk_tokens", 2}});
+    fastkv::Options options; options.transport = fastkv::Transport::Tcp; options.workers = 8;
+    fastkv::Service client(options);
+    auto call = [&](const std::vector<int> &tokens) {
+        fastkv::Writer writer;
+        writer.U32(1); writer.String("test:test-recurrent-state-v1"); writer.Ints(tokens);
+        return client.Call(endpoint, {std::move(writer.bytes), {}});
+    };
+    auto verify = [&](const std::vector<int> &tokens, const fastkv::Message &reply) {
+        PDStateReader reader(reply);
+        Check(reader.metadata.U32() == tokens.size(), "batch handoff length");
+        Data state; reader.Tensor(state); reader.End();
+        float expected = 0;
+        for (size_t i = 0; i < tokens.size(); ++i) expected += tokens[i] * (i + 1);
+        Check(((float *)state.cpuData)[0] == expected, "cross-request KV/position contamination");
+    };
+    auto run = [&](const std::vector<std::vector<int>> &inputs) {
+        std::promise<void> go;
+        auto ready = go.get_future().share();
+        std::vector<std::future<fastkv::Message>> calls;
+        for (const auto &input : inputs) calls.push_back(std::async(std::launch::async,
+            [&, input, ready] { ready.wait(); return call(input); }));
+        go.set_value();
+        for (size_t i = 0; i < inputs.size(); ++i) verify(inputs[i], calls[i].get());
+    };
+    const std::vector<std::vector<int>> inputs{{3,4,5}, {7,8,9,10}, {11,12,13,14,15},
+        {17,18,19,20,21,22,23}};
+    run(inputs);
+    Check(model.largest >= 2 && model.batches > 0, "RPC concurrency did not become model batching");
+    Check(model.live == 0 && model.liveTokens == 0 && model.peakTokens <= 24, "prefill state/credit leak");
+    const int batches = model.batches, forwards = model.forwards;
+    run(inputs);
+    Check(model.batches == batches && model.forwards == forwards, "exact prefix hits recomputed");
+    auto extended = inputs;
+    for (auto &input : extended) { input.push_back(29); input.push_back(31); }
+    run(extended);
+    Check(model.peakTokens <= 24 && model.live == 0, "aggregate P token capacity was overbooked");
+
+    // Stop with both active and transport-queued work. Every waiter must be
+    // released and every request-owned state retired before the model dies.
+    model.entered = false; model.hold = true;
+    std::vector<std::future<fastkv::Message>> calls;
+    for (int i = 0; i < 8; ++i) calls.push_back(std::async(std::launch::async,
+        [&, i] { return call(std::vector<int>(7, 101 + i)); }));
+    for (int i = 0; i < 2000 && !model.entered; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    Check(model.entered, "batch worker did not enter held forward");
+    auto stopped = std::async(std::launch::async, [&] { model.StopPD(); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(5)); model.hold = false;
+    Check(stopped.wait_for(std::chrono::seconds(5)) == std::future_status::ready, "shutdown deadlocked");
+    stopped.get();
+    for (auto &result : calls) {
+        Check(result.wait_for(std::chrono::seconds(5)) == std::future_status::ready, "stranded prefill waiter");
+        bool failed = false;
+        try { result.get(); } catch (const std::exception &) { failed = true; }
+        Check(failed, "cancelled prefill succeeded");
+    }
+    Check(model.live == 0 && model.liveTokens == 0, "shutdown leaked P contexts");
+
+    BatchStateModel failing;
+    Check(failing.SetPrefillBatching(8, 50, 4), "configure failing batch policy");
+    failing.fail = true;
+    failing.ConfigurePD(json11::Json::object{{"role", "prefill"}, {"model_id", "test"},
+        {"transport", "tcp"}, {"listen", endpoint}, {"chunk_tokens", 2}});
+    calls.clear();
+    for (int i = 0; i < 4; ++i) calls.push_back(std::async(std::launch::async,
+        [&, i] { return call(std::vector<int>(3, 211 + i)); }));
+    for (auto &result : calls) {
+        Check(result.wait_for(std::chrono::seconds(5)) == std::future_status::ready, "batch error stranded a waiter");
+        bool failed = false;
+        try { result.get(); } catch (const std::exception &) { failed = true; }
+        Check(failed, "batch failure was hidden");
+    }
+    failing.StopPD();
+    Check(failing.live == 0, "batch error leaked P contexts");
+    std::cout << "PASS PD real prefill batching, ragged chunks, prefix reuse, token credits and shutdown\n";
+}
 
 int main() {
     try {
@@ -184,6 +313,7 @@ int main() {
         decode.StopPD();
         mismatch.StopPD();
         prefill.StopPD();
+        TestPrefillBatch();
         std::cout << "PASS PD tensor packing, chunk positions, handoff, rejection "
                      "and cancellation\n";
     } catch (const std::exception &error) {
