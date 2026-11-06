@@ -1229,7 +1229,7 @@ class Fixture : public NaiveN05FlashModel {
             std::vector<std::vector<float>> cold;
             infer(forkPrompts[row], forkSteps, cold);
             for (int step = 0; step < forkSteps; ++step)
-                RequireCloseLogits(forkLogits[row][step].data(), cold[step], "shared prefix concurrent logits");
+                RequireCloseLogits(forkLogits[row][step].data(), cold[step], "shared prefix concurrent logits row=" + std::to_string(row) + " step=" + std::to_string(step));
         }
         // Capture a boundary during decode, then resume its output prefix.
         SetSaveHistoryChat(false); SetSaveHistoryChat(true);
@@ -3439,20 +3439,21 @@ int main(int argc, char **argv) {
         SetDeviceMap({{"cuda:0", 1}});
         FastllmCudaSetDevice(0);
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
-        if (argc > 2 && std::string(argv[2]) == "kvmem_fp4") {
+        if (argc > 2 && (std::string(argv[2]) == "kvmem_fp4" || std::string(argv[2]) == "gpu_fp4")) {
             SetCudaEmbedding(true); SetCudaGraph(true);
             std::vector<float> reference;
-            for (bool graph : {false, true}) {
+            const bool gpu = std::string(argv[2]) == "gpu_fp4";
+            for (int mode = 0; mode < (gpu ? 3 : 2); ++mode) {
                 Fixture fixture(ranks, false, true, true, true);
-                const bool context = argc > 3 && std::string(argv[3]) == "context_shard";
-                fixture.SetIndexerTPStorage(!context, context);
+                const std::string storage = argc > 3 ? argv[3] : "layer_shard";
+                fixture.SetIndexerTPStorage(storage == "layer_shard", storage == "context_shard");
                 fixture.SetKVCacheDataType(FP4_E2M1);
-                fixture.SetIndexerDataType(FP8_E4M3);
-                auto result = fixture.SparseKvRun(true, graph);
-                if (!graph) reference = std::move(result);
+                if (argc <= 4 || std::string(argv[4]) != "auto") fixture.SetIndexerDataType(FP8_E4M3);
+                auto result = fixture.SparseKvRun(!gpu || mode == 0, gpu ? mode == 2 : mode == 1);
+                if (mode == 0) reference = std::move(result);
                 else {
                     if (result.size() != reference.size()) throw std::runtime_error("FP4 logits missing");
-                    RequireCloseLogits(result.data(), reference, "FP4 graph changed model logits");
+                    RequireCloseLogits(result.data(), reference, "FP4 storage/graph changed model logits");
                     std::cout << "FP4 EXECUTION PASS logits=" << result.size()
                               << " relative=" << largestLogitRelative << std::endl;
                 }

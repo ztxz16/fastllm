@@ -1004,9 +1004,9 @@ bool NaiveN05FlashModel::PrepareTensorParallelServingDecode(const Data &inputIds
                     std::is_sorted(serving.bindingOrder.begin(), serving.bindingOrder.end());
                 std::vector<void *> oldTable;
                 for (int layer = 0; layer < block_cnt; ++layer) {
-                    const size_t width = sparseKv && !slidingLayers[layer] ? 8 : 4;
+                    const size_t width = HasSeparateIndexer() && !slidingLayers[layer] ? 8 : 4;
                     auto *table = storage.hostCache.data() +
-                        (size_t)layer * storage.maxRows * (sparseKv ? 8 : 4);
+                        (size_t)layer * storage.maxRows * (HasSeparateIndexer() ? 8 : 4);
                     if (!compact) {
                         // Insertion/permutation can move rows backwards as well
                         // as forwards. Copy validated bindings before overwriting.
@@ -1206,7 +1206,7 @@ bool NaiveN05FlashModel::PrepareTensorParallelDecode(const Data &inputIds,
             auto &storage = *state.ranks[rank]->storage;
             FastllmCudaSetDevice(tpDevices[rank]);
             const size_t count = (size_t)block_cnt *
-                std::max(sequences, maxBatch > 0 ? maxBatch : 512) * (kvMemConfig.enabled || indexerContextSharding ? 8 : 4);
+                std::max(sequences, maxBatch > 0 ? maxBatch : 512) * (HasSeparateIndexer() ? 8 : 4);
             if (storage.hostCache.empty()) {
                 storage.hostCache.resize(count, nullptr);
                 storage.cacheTable.dataType = INT32;
@@ -1904,6 +1904,8 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
     for (int sequence = 0; sequence < sequences; ++sequence) if (!reuseRow(sequence))
     for (int layer = 0; layer < block_cnt; ++layer) {
         for (Data *cache : {&key(sequence, layer), &value(sequence, layer)}) {
+            cache->dataType = LayerKVType(layer);
+            cache->UpdateUnitSize();
             cache->kvCacheFp8Indexer = !HasSeparateIndexer() && cache == &key(sequence, layer) && !slidingLayers[layer] && fp8IndexerCache;
             const int owner = indexerLayerSharding && !slidingLayers[layer]
                 ? tpDevices[IndexerOwnerRank(layer)] : -1;

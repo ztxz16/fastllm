@@ -2433,6 +2433,24 @@ if (UNIT_TEST)
                     LABELS "cuda;multigpu" RUN_SERIAL TRUE TIMEOUT 300 SKIP_RETURN_CODE 77
                     PASS_REGULAR_EXPRESSION "TP GPU PREFIX PASS")
             endforeach()
+            foreach(NAIVE_GPU_FP4_STORAGE replicated layer_shard context_shard)
+                add_test(NAME naive_n05_gpu_fp4_${NAIVE_GPU_FP4_STORAGE}
+                    COMMAND naive_n05_verify_graph_test 4 gpu_fp4 ${NAIVE_GPU_FP4_STORAGE})
+                add_test(NAME naive_n05_gpu_fp4_growth_${NAIVE_GPU_FP4_STORAGE}
+                    COMMAND naive_n05_verify_graph_test 4 serving_page_growth fp4 ${NAIVE_GPU_FP4_STORAGE} fp8)
+                add_test(NAME naive_n05_gpu_fp4_prefix_${NAIVE_GPU_FP4_STORAGE}
+                    COMMAND naive_n05_verify_graph_test 4 history_serving fp4 fp8 ${NAIVE_GPU_FP4_STORAGE})
+                set_tests_properties(naive_n05_gpu_fp4_${NAIVE_GPU_FP4_STORAGE}
+                    naive_n05_gpu_fp4_growth_${NAIVE_GPU_FP4_STORAGE}
+                    naive_n05_gpu_fp4_prefix_${NAIVE_GPU_FP4_STORAGE} PROPERTIES
+                    LABELS "cuda;multigpu" RUN_SERIAL TRUE TIMEOUT 300 SKIP_RETURN_CODE 77
+                    ENVIRONMENT "FASTLLM_CUDA_GRAPH=1")
+            endforeach()
+            add_test(NAME naive_n05_gpu_fp4_auto_indexer
+                COMMAND naive_n05_verify_graph_test 4 gpu_fp4 replicated auto)
+            set_tests_properties(naive_n05_gpu_fp4_auto_indexer PROPERTIES
+                LABELS "cuda;multigpu" RUN_SERIAL TRUE TIMEOUT 300 SKIP_RETURN_CODE 77
+                PASS_REGULAR_EXPRESSION "FP4 EXECUTION PASS")
             foreach(NAIVE_SPARSE_DRAFT_KV bf16 fp8)
                 add_test(NAME naive_n05_kvmem_draft_${NAIVE_SPARSE_DRAFT_KV}
                     COMMAND naive_n05_verify_graph_test 2 kvmem_draft ${NAIVE_SPARSE_DRAFT_KV} 5 16384)

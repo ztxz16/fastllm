@@ -310,7 +310,7 @@ namespace fastllm {
         void InitSparseKv();
         void AttachSparseKv(const std::vector<std::pair<Data *, Data *>> &roots);
         Data SeparateIndexer(int layer, int rank, const Data &key) const;
-        bool HasSeparateIndexer() const { return sparseKv || !tpIndexerCaches.empty(); }
+        bool HasSeparateIndexer() const { return kvCacheDataType == FP4_E2M1 || sparseKv || !tpIndexerCaches.empty(); }
         PagedCacheManager &IndexerStorage(int layer, int rank) const {
             return *tpIndexerSidecars.at(tpPagedCaches[rank][layer * 2].get());
         }

@@ -176,7 +176,7 @@ void NaiveN05FlashModel::AppendCache(Data &cache, Data &input, DataType cacheTyp
         ReserveCache(cache, capacity, width, usePool);
     }
     if (cache.dims.empty()) cache.Resize({1, 0, width});
-    if (cache.isPagedKVCache || cache.dataType == FP8_E4M3 || cache.kvCacheFp8Indexer ||
+    if (cache.isPagedKVCache || cache.dataType == FP8_E4M3 || cache.dataType == FP4_E2M1 || cache.kvCacheFp8Indexer ||
         (sparseKv && cache.cudaDataBorrowed)) {
 #ifdef USE_CUDA
         FastllmCudaNaivePagedWrite(cache, input, oldLength);
@@ -194,7 +194,7 @@ void NaiveN05FlashModel::ReserveCache(Data &cache, int capacity, int width, bool
     auto pool = usePool && cache.dataDevice == DataDevice::CUDA && cache.dataDeviceIds.size() == 1
         ? tpKVPool.find(cache.dataDeviceIds[0]) : tpKVPool.end();
     if (pool != tpKVPool.end()) {
-        AssertInFastLLM(FastllmNaiveKVType(cache.dataType) && !cache.isFake && !cache.cudaDataBorrowed &&
+        AssertInFastLLM(FastllmNaiveAttentionKVType(cache.dataType) && !cache.isFake && !cache.cudaDataBorrowed &&
             (cache.dims.empty() || (cache.dims.size() == 3 && cache.dims[0] == 1 &&
                                    cache.dims[2] == width && cache.dims[1] <= capacity)),
             "Naive KV pool: invalid contiguous cache.");
@@ -673,8 +673,8 @@ Data NaiveN05FlashModel::RunTarget(
     return Data();
 #else
     AssertInFastLLM(dataType == DataType::BFLOAT16 &&
-                    (FastllmNaiveKVType(kvCacheDataType) || (kvCacheDataType == FP4_E2M1 && sparseKv)),
-                    "Naive requires BF16 compute; FP4 DSA KV requires CUDA TP KVMem.");
+                    (FastllmNaiveKVType(kvCacheDataType) || (kvCacheDataType == FP4_E2M1 && !tpPagedCaches.empty())),
+                    "Naive requires BF16 compute; warm up CUDA TP before using FP4 DSA KV.");
     AssertInFastLLM(inputIds.dims.size() == 2 && inputIds.dims[0] == 1 &&
                     (batch || (int)pastKeyValues.size() == block_cnt),
                     "Naive-N0.5 expects one unpadded sequence and a complete KV cache.");
@@ -2076,9 +2076,12 @@ int NaiveN05FlashModel::SampleTarget(
 void NaiveN05FlashModel::WarmUp() {
     const DataType requestedKV = kvCacheDataType;
     if (requestedKV == FP4_E2M1) {
-        AssertInFastLLM(kvMemConfig.enabled && tpDevices.size() > 1 && !draftEnabled,
-                        "Naive FP4 DSA KV requires CUDA TP, --kvmem and no draft.");
-        // The first forward initializes weights before the sparse pool exists.
+        AssertInFastLLM(tpDevices.size() > 1 && !GetKVCacheInCPU() && !draftEnabled,
+                        "Naive FP4 DSA KV requires CUDA TP and no draft.");
+        AssertInFastLLM(full.headDim % 16 == 0 && full.valueDim % 16 == 0 &&
+                        full.headDim <= 256 && full.valueDim <= 256,
+                        "Naive FP4 DSA KV requires block16-aligned head widths <= 256.");
+        // The first forward initializes weights before the final KV pool exists.
         // Its private, discarded caches use the established FP8 bootstrap path.
         kvCacheDataType = FP8_E4M3;
     }
@@ -2166,11 +2169,11 @@ std::shared_ptr<CudaWorkspace> NaiveN05FlashModel::RequestKVPool(int device, siz
 void NaiveN05FlashModel::InitTensorParallelKVPool() {
 #ifdef USE_CUDA
     // Keep CPU/layer-serial execution on its existing cache path. This pool
-    // serves BF16/FP8 TP, independently of GPU generation and CUDA Graph.
+    // serves BF16/FP8/FP4 TP, independently of GPU generation and CUDA Graph.
     // Draft checkpoints distribute normalized inputs across the TP GPUs.
     // Restore rebuilds owner-local or sharded draft KV through AppendDraftContext.
     if (!tpKVPool.empty() || !tpPrepared || tpDevices.size() <= 1 ||
-        GetKVCacheInCPU() || !FastllmNaiveKVType(kvCacheDataType) ||
+        GetKVCacheInCPU() || !FastllmNaiveAttentionKVType(kvCacheDataType) ||
         elementsInKVCachePerToken <= 0) return;
     const double gpuMemRatio = GetGpuMemRatio();
     AssertInFastLLM(std::isfinite(gpuMemRatio) && gpuMemRatio > 0 && gpuMemRatio <= 1,
@@ -2183,7 +2186,8 @@ void NaiveN05FlashModel::InitTensorParallelKVPool() {
         tpSwaPrefillWorkspaces.resize(ranks);
         for (int rank = 0; rank < ranks; ++rank) PrepareSwaPrefillWorkspace(rank, chunk);
     }
-    const int kvBytes = kvCacheDataType == FP8_E4M3 ? 1 : 2;
+    const int kvBytes = AuxiliaryKVType() == FP8_E4M3 ? 1 : 2;
+    const bool separateIndex = kvCacheDataType == FP4_E2M1 || indexerContextSharding;
     int64_t fullBytesPerToken = 0, fixedBytes = 0;
     std::vector<int64_t> rankBytesPerToken(ranks, 0);
     for (int layer = 0; layer < block_cnt; ++layer) {
@@ -2194,10 +2198,15 @@ void NaiveN05FlashModel::InitTensorParallelKVPool() {
                 fixedBytes += (size + 255) / 256 * 256 * batch;
             }
         }
-        else for (int rank = 0; rank < ranks; ++rank)
-            rankBytesPerToken[rank] += (std::max(1, cfg.kvHeads / ranks) *
-                (cfg.headDim + cfg.valueDim) + (indexerContextSharding
-                    ? IndexerCacheWidth(kvCacheDataType) / ranks : LocalIndexerCacheWidth(layer, rank))) * kvBytes;
+        else for (int rank = 0; rank < ranks; ++rank) {
+            const int heads = std::max(1, cfg.kvHeads / ranks);
+            rankBytesPerToken[rank] += GetDataBytes(kvCacheDataType, 1,
+                heads * cfg.headDim + (separateIndex ? 0 : LocalIndexerCacheWidth(layer, rank)));
+            rankBytesPerToken[rank] += GetDataBytes(kvCacheDataType, 1, heads * cfg.valueDim);
+            if (separateIndex && HasLocalIndexer(layer, rank))
+                rankBytesPerToken[rank] += (int64_t)IndexerCacheWidth(AuxiliaryKVType()) * kvBytes /
+                    (indexerContextSharding ? ranks : 1);
+        }
     }
     fullBytesPerToken = *std::max_element(rankBytesPerToken.begin(), rankBytesPerToken.end());
     AssertInFastLLM(fullBytesPerToken > 0, "Naive KV pool requires full-attention layers.");
@@ -2209,9 +2218,9 @@ void NaiveN05FlashModel::InitTensorParallelKVPool() {
             FastllmCudaSetDevice(tpDevices[rank]);
             auto &buf = *tpPrefillWorkspaces.at(rank);
             auto reserve = [&](Data &data) {
-                data.dataType = kvCacheDataType;
+                data.dataType = AuxiliaryKVType();
                 data.UpdateUnitSize();
-                data.Resize({1, capacity, IndexerCacheWidth(kvCacheDataType)});
+                data.Resize({1, capacity, IndexerCacheWidth(AuxiliaryKVType())});
                 data.ToDevice(DataDevice::CUDA, {tpDevices[rank]}, false);
                 data.Allocate(false);
             };
@@ -2275,7 +2284,7 @@ void NaiveN05FlashModel::InitTensorParallelKVPool() {
     const int graphRows = DecodeGraphBatchBuckets(std::min(batch, MaxTPDecodeBatch)).back();
     const int64_t metadataBytes = (int64_t)fullLayers * 2 * batch *
         ((std::min<int64_t>(max_positions, tokens) + pageLen - 1) / pageLen * sizeof(int) + 512) +
-        (int64_t)block_cnt * graphRows * 4 * sizeof(void *) + 512;
+        (int64_t)block_cnt * graphRows * (separateIndex ? 8 : 4) * sizeof(void *) + 512;
     const int pages = (int)((bytes - fixedBytes - metadataBytes) / fullBytesPerToken / pageLen);
     AssertInFastLLM(pages > 0, "Naive KV budget cannot fit paged metadata.");
     tokens = std::min<int64_t>(tokens, (int64_t)pages * pageLen);
@@ -2351,19 +2360,19 @@ void NaiveN05FlashModel::InitTensorParallelKVPool() {
                prefixSlots, prefixBytes / 1048576.0);
     }
     tpPagedCaches.resize(ranks);
-    if (indexerContextSharding) tpIndexerCaches.resize(ranks);
+    if (separateIndex) tpIndexerCaches.resize(ranks);
     for (int rank = 0; rank < ranks; ++rank) {
         FastllmCudaSetDevice(tpDevices[rank]);
         auto &managers = tpPagedCaches[rank];
         managers.resize(block_cnt * 2);
-        if (indexerContextSharding) tpIndexerCaches[rank].resize(block_cnt);
+        if (separateIndex) tpIndexerCaches[rank].resize(block_cnt);
         for (int layer = 0; layer < block_cnt; ++layer) {
             if (slidingLayers[layer]) continue;
             for (int part = 0; part < 2; ++part) {
                 int width = std::max(1, full.kvHeads / ranks) * (part ? full.valueDim : full.headDim) + (!part ? LocalIndexerCacheWidth(layer, rank) : 0);
                 auto manager = std::make_unique<PagedCacheManager>();
                 manager->type = PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE;
-                manager->kvCacheFp8Indexer = !indexerContextSharding && !part && fp8IndexerCache && HasLocalIndexer(layer, rank);
+                manager->kvCacheFp8Indexer = !separateIndex && !part && fp8IndexerCache && HasLocalIndexer(layer, rank);
                 manager->dataType = kvCacheDataType;
                 manager->UpdateUnitSize();
                 manager->dataDevice = DataDevice::CUDA;
@@ -2374,21 +2383,21 @@ void NaiveN05FlashModel::InitTensorParallelKVPool() {
                 if (!manager->cudaData) throw CudaWorkspaceExhausted("Naive physical KV page pool exhausted.");
                 manager->directMemory = true;
                 manager->SetMaxPages(pages);
-                FastllmCudaMemset0(manager->cudaData, (size_t)pageLen * width * kvBytes);
+                FastllmCudaMemset0(manager->cudaData, GetDataBytes(manager->dataType, pageLen, width));
                 managers[layer * 2 + part] = std::move(manager);
             }
-            if (indexerContextSharding) {
+            if (separateIndex && HasLocalIndexer(layer, rank)) {
                 auto index = std::make_unique<PagedCacheManager>();
-                index->pageLen = pageLen / ranks;
+                index->pageLen = indexerContextSharding ? pageLen / ranks : pageLen;
                 index->maxPages = pages;
                 index->kvCacheFp8Indexer = fp8IndexerCache;
-                index->dataType = kvCacheDataType;
+                index->dataType = AuxiliaryKVType();
                 index->UpdateUnitSize();
                 index->dataDevice = DataDevice::CUDA;
                 index->dataDeviceIds = {tpDevices[rank]};
-                index->Resize({pages, index->pageLen, 1, IndexerCacheWidth(kvCacheDataType)});
+                index->Resize({pages, index->pageLen, 1, IndexerCacheWidth(AuxiliaryKVType())});
                 index->cudaData = AllocateCudaWorkspace(tpKVPool.at(tpDevices[rank]), index->GetBytes());
-                if (!index->cudaData) throw CudaWorkspaceExhausted("Naive context Indexer pool exhausted.");
+                if (!index->cudaData) throw CudaWorkspaceExhausted("Naive Indexer pool exhausted.");
                 index->directMemory = true;
                 FastllmCudaMemset0(index->cudaData, (size_t)index->pageLen * index->dims[3] * kvBytes);
                 // Share K's page IDs/refcounts, including prefix forks and rollback.

@@ -30,7 +30,7 @@ FASTLLM_CUDA_GRAPH=1 ftllm server /path/to/MiMo-V2-DSA \
 
 ### 启动时预分配 KV
 
-普通 BF16/FP8 KV 的多卡 TP 路径在预热结束时为每张卡建立固定容量的 KV 池，
+普通 BF16/FP8/FP4 KV 的多卡 TP 路径在预热结束时为每张卡建立固定容量的 KV 池，
 不依赖 Hopper、EP8 或 CUDA Graph，也不需要额外环境变量。`--tokens` 控制全局层
 的总 token 预算；`--max_batch` 控制请求槽位数量，`--chunked_prefill_size` 控制
 各卡共享的滑窗 prefill 工作区。自动容量以 `--gpu_mem_ratio` 指定的整卡显存比例
@@ -47,7 +47,8 @@ KV 历史缓存。页表和滑窗按分配大小使用独立的池，避免请�
 互不共享的输入仍受实际容量限制。余量不足时排队，前缀命中本身不会绕过输出预算。
 `--indexer_tp_storage context_shard` 可同时用于纯显存 KV 和 KVMem：每个 TP rank
 只保存各逻辑页中的一段 Indexer K，独立存储复用主 K 的页号、前缀引用和写时复制。
-纯显存路径中的默认 `replicated` 与 `layer_shard` 仍将本卡的 Indexer K 和主 K 存在同一页中。
+BF16/FP8 纯显存路径中的默认 `replicated` 与 `layer_shard` 将本卡的 Indexer K 和主 K 存在同一页中；
+FP4 主 K 使用独立的 FP8 Indexer 页，三种布局均共享主 K 的物理页号和生命周期。
 分片计算要求 CUDA SM80+、16×128 的 FP8-query Indexer，页长须能被 TP 数整除；
 支持普通解码、DSpark 验证及 CUDA Graph，未开启 Graph 时复用相同的分页计算路径。
 各 TP rank 在计算和通信前完成申请；池耗尽时返回容量错误，清理受影响请求，
@@ -57,28 +58,30 @@ CPU、按层串行、其他 KV 类型、草稿模型及跳过预热的直接调�
 
 ### DSA FP4 KV（实验性）
 
-Naive/MiMo 的 CUDA TP + KVMem 路径可显式设置 `--kv_cache_dtype fp4`，
+Naive/MiMo 的 CUDA TP 路径可显式设置 `--kv_cache_dtype fp4`，不要求启用 KVMem，
 仅将 DSA 主 attention 的 K/V 改成 E2M1 FP4，每 16 个值配一个 E4M3 scale。
 SWA 窗口和前缀快照继续使用 FP8 E4M3，Indexer 继续沿用 FP8 缓存及原来的
 `--indexer_dtype` 选择；该选项不启用或关闭 FP8 Indexer 评分，也不改变模型权重。
-默认配置不变。该组合要求至少两张 TP 卡、BF16 计算、显式 KVMem 预算和启动预热，
+默认配置不变。该组合要求至少两张 TP 卡、BF16 计算和启动预热，
 不支持 draft；不满足条件时启动报错。
 
-在已有 CUDA TP + KVMem 的启动命令或 deploy worker 参数中，将
-`--kv_cache_dtype fp8` 改为 `--kv_cache_dtype fp4` 即可。其余容量、NUMA、
+在已有 CUDA TP 的启动命令或 deploy worker 参数中，将
+`--kv_cache_dtype fp8` 改为 `--kv_cache_dtype fp4` 即可。普通显存模式使用 GPU 分页池；
+需要主机 KV 备份时再显式配置 `--kvmem`。其余容量、NUMA、
 TP/EP、Indexer、请求并发和攒批参数仍由启动配置指定，没有预设模型路径或机器地址。
 支持 `layer_shard` 和 `context_shard` 的 FP8 Indexer 存储，保持原有分片与全局 TopK 合并规则。
 既有 `--kvmem` 主机内存预算会根据 FP4 的实际存储字节重新检查；固定 `--tokens`
 时不会自动扩大上下文容量。
 
 每行布局为 `[width/2 个 packed value 字节][width/16 个 scale 字节]`。
-这是 Naive KVMem 的逐行布局，不可直接套用其他模型的 FP4 整页 planar 布局。
-主机分页池和 GPU 热缓存使用相同布局，换入/换出按完整行复制，不重新量化。
+这是 Naive 的逐行布局，不可直接套用其他模型的 FP4 整页 planar 布局。
+GPU 分页池、KVMem 主机分页池和 GPU 热缓存使用相同布局，换入/换出按完整行复制，不重新量化。
 DSA K/V 的净存储降为 FP8 的 9/16，减少 43.75%；页表、Indexer、SWA、
 前缀快照和工作区开销需另计。
 
-Prefill 将已有 FP4 历史解码到预分配、各层复用的 BF16 工作区；decode 直接读取
-热缓存中的 FP4。CUDA Graph 沿用设备指针表与动态页表，不固化请求地址。
+KVMem prefill 将已有 FP4 历史解码到预分配、各层复用的 BF16 工作区；
+普通显存 prefill 通过分页视图读取 FP4，匹配的算子使用 BF16 staging。decode 直接读取
+GPU 分页池或热缓存中的 FP4。CUDA Graph 沿用设备指针表与动态页表，不固化请求地址。
 满足形状与资源条件时，Hopper 上至少 32 行、16-head GQA、单 KV head、
 QK=192/V=128、TopK=2048 的 FP4 decode 复用 FP8 融合路径的 BF16 Tensor Core
 QK/PV 和全局 softmax；FP4 tile 异步预取到共享内存后解包，不生成全局 score 工作区。
@@ -94,15 +97,18 @@ FP4 block 的 payload 写入和 KVMem 行搬运按实际地址对齐选择向量
 
 回归目标为 `naive_n05_fp4_kv_test` / CTest `naive_n05_fp4_kv`，覆盖独立
 CPU 量化参考、K/V 跨页读写、共享前缀尾页复制、KVMem 热缓存换出与重载、
+2～512 token 的分页 prefill 与显式解量化参考逐位对照、
 稠密/稀疏 DSA 和 CUDA Graph 回放时切换缓存地址、页表及有效 batch；
 RoPE 写入还覆盖 packed QKV、带 scale 的 FP8 Indexer、79～449 路边界和 Graph
 重绑；TP4 回归覆盖两种 Indexer 分片的扩页、请求生命周期与前缀恢复。
+普通显存回归还对照 KVMem FP4 检查 eager/Graph logits，覆盖 replicated、
+layer_shard、context_shard 三种 Indexer 存储、跨页增长和跨请求前缀恢复。
 在启用 `-DUNIT_TEST=ON` 的 CUDA 构建中，GPU 空闲后可运行：
 
 ```bash
 cmake --build build --target naive_n05_fp4_kv_test naive_n05_fp4_vector_test -j2
 cmake --build build --target naive_n05_verify_graph_test -j2
-ctest --test-dir build -R '^naive_n05_(fp4_(kv|vector)|kvmem(_transition|_prefix)?_fp4_.*)$' --output-on-failure
+ctest --test-dir build -R '^naive_n05_(fp4_(kv|vector)|kvmem(_transition|_prefix)?_fp4_.*|gpu_fp4_.*)$' --output-on-failure
 ```
 
 这是实验路径；上述回归检查存储和执行一致性，不代表 FP4 与原模型精度等价。
