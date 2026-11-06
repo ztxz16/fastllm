@@ -736,7 +736,7 @@ curl -N -sS http://127.0.0.1:8000/v1/chat/completions \
 本轮仍不包含连续批处理、CUDA Graph、自定义 AllReduce 或跨请求 Prefix Cache。
 
 
-## 正式入口接入（本轮，待服务器验收）
+## 正式入口接入（服务器验收已通过）
 
 `make_normal_llm_model(args)` 在 `tp_backend=process` 时返回 `ProcessTPModel`，
 常驻一组 C++ worker。`response` / `stream_response` / 已编码请求的 `generate` 使用
@@ -792,4 +792,61 @@ python3 -m ftllm.cli server /home/models/Qwen3-1.7B \
 ```
 
 这里的模块调用与已安装 `ftllm` 命令使用相同的 `ftllm.cli.main`；不添加另一条推理实现。
-本轮只完成四项计划的第 1 项入口接入，服务器通过后再推进 CUDA Graph。
+用户已确认这一步的 84 / 14 / 12 项服务器验收全部 PASS；下一项为以下 Decode CUDA Graph。
+
+
+## Decode CUDA Graph（第 2 项，待服务器验收）
+
+正式模型工厂和 `ftllm chat/run/server/serve --tp_backend process` 增加 `--cuda-graph`。
+默认关闭。开启后 Prefill 仍为 Eager，单 token Decode 捕获 embedding、全部 decoder 层、
+两次/层 NCCL AllReduce、最终 Norm 和分片 lm_head；CPU 采样、控制通信和 logits 读回在图外。
+图路径与 Eager 共用算子、权重布局、FP16 KV、stream 和同步边界，不新增测试专用推理路径。
+
+- 每个请求第一次 Decode 分配固定地址工作区、执行一次 warmup，再捕获并重放。
+  每次更新 GPU token ID、历史长度和绝对 RoPE 位置，重放时从 GPU 读取；不会固定在首步位置。
+  warmup 只覆盖待写入的当前 KV 槽位，不推进有效长度，实际重放后长度仅增加一次。
+- cuBLAS 提供 4 MiB 用户工作区，避免捕获期间临时分配；请求 Graph 工作区上限 256 MiB。
+  它与无状态 Prefill 的临时工作区分离，交错重算不会释放图引用的指针。
+- 请求结束/取消先同步，销毁图，解除 cuBLAS 用户工作区，再释放工作区和 KV。
+  模型权重及 worker 保留。新请求重新捕获；本阶段不跨请求复用图或 KV。
+- 所有 rank 使用统一开关。捕获、实例化、重放或 NCCL 失败均报错并终止整组，不静默回退。
+  `controlOnly + cudaGraph` 拒绝。协调器/worker 控制协议升级为 v2，必须一起重建。
+- 原生 `fastllm_tp_generate` / `fastllm_tp_decode_check` 使用 `--cuda-graph 0|1`；
+  Python 正式入口为无值开关。线程后端的 `FASTLLM_CUDA_GRAPH` 环境变量不控制此进程实现，
+  开启该环境变量时正式进程入口明确拒绝，避免两套设置混用。
+- `ready.json`、每请求原生报告包含 `execution` 与各 rank `graph`；后者记录
+  enabled、active、captures、replays、warmups、eager_decodes、workspace_bytes。
+  结束后 active=false、workspace_bytes=0；计数保留至卸载。开启 Graph 时 eager_decodes 必须为 0。
+  生成 N 个 token 实际需要 N-1 次 Decode，首 token EOS 的请求不必捕获。
+
+服务器双 V100、CUDA 12.6、NCCL 2.22.3，master 合并本轮 sk 后执行：
+
+```bash
+bash test/distributed/run_qwen3_cuda_graph_v100.sh /home/models/Qwen3-1.7B
+```
+
+七组验收：通信/协议/进程清理底座；Eager 常驻回归 84；Graph 合成 Decode 30、真实 Decode 1；Graph 合成常驻 96、
+真实常驻 16；Graph 正式入口 12。逐步比较 Graph TP / Eager TP / Eager 单卡 logits，
+合成模型还有独立 CPU 参考；覆盖源 F16/BF16/F32、bias、KV 复制、位置/容量边界、
+2048 长度、交错 Prefill、卸载重载、请求复用、Graph 后取消恢复及拒绝路径。
+正式入口比较 Token ID/文本、HTTP/SSE 和清理，客户端强制检查实际 Graph 次数。
+所有组输出 JSON/Markdown/CSV/XLSX，失败返回非零并保留部分报告。
+这是功能验收，不测性能，也不宣称加速；每请求捕获有额外开销。
+
+单次正式文本生成（完成上面构建后）：
+
+```bash
+export PYTHONPATH="$PWD/build-process-tp-cu126/process-tp-python${PYTHONPATH:+:$PYTHONPATH}"
+export CUDA_HOME=/usr/local/cuda-12.6
+export LD_LIBRARY_PATH="$CUDA_HOME/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export CUDA_VISIBLE_DEVICES=0,1
+export USE_TORCH=0
+python3 -m ftllm.cli run /home/models/Qwen3-1.7B \
+  --tp_backend process --tp 2 --cuda-graph \
+  --prompt '请用一句话介绍你自己。' --max-new-tokens 32
+```
+
+本地仅执行 Python 回归与静态检查，未编译、未运行 GPU。本阶段服务器通过后，
+下一项才是自定义 AllReduce；跨请求 Prefix Cache 仍在其后。
+捕获设计依据：[NCCL 2.22.3 CUDA Graph](https://docs.nvidia.com/deeplearning/nccl/archives/nccl_2223/user-guide/doc/usage/cudagraph.html)、
+[cuBLAS 12.6.3 CUDA Graph](https://docs.nvidia.com/cuda/archive/12.6.3/cublas/index.html#cuda-graphs-support)。

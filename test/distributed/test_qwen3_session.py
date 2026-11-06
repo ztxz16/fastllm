@@ -1,5 +1,6 @@
 """常驻客户端的纯 Python 协议/生命周期回归；模拟协调器，不编译、不调用 GPU。"""
 
+import atexit
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stderr, redirect_stdout
 import io
@@ -30,10 +31,36 @@ def fixture():
     mode = Path(args["--model"]).name
     channel = socket.socket(fileno=int(args["--session-fd"]))
     cancellation = socket.socket(fileno=int(args["--cancel-fd"]))
-    workers = [dict(rank=i, device=i, pid=os.getpid()+i) for i in range(2)]
+    # 使用真正的第二个 PID，避免 getpid()+1 偶然撞上并行测试的活进程。
+    peer = subprocess.Popen([sys.executable, '-c', 'import sys; sys.stdin.buffer.read()'], stdin=subprocess.PIPE)
+    def close_peer():
+        peer.stdin.close()
+        peer.wait(timeout=5)
+    atexit.register(close_peer)
+    workers = [dict(rank=i, device=i, pid=pid) for i, pid in enumerate((os.getpid(), peer.pid))]
     cache = [EMPTY.copy(), EMPTY.copy()]
+    graph_enabled = args.get("--cuda-graph") == "1"
+    graph = dict(enabled=True, active=False, captures=0, replays=0, warmups=0, eager_decodes=0, workspace_bytes=0)
 
     def send(value):
+        if graph_enabled and value['event'] != 'token' and mode != 'graph_missing':
+            event = value['event']
+            if event == 'result' and value['status'] == 'PASS':
+                decodes = len(value['token_ids']) - 1
+                graph['replays'] += decodes
+                graph['captures'] += int(decodes > 0)
+                graph['warmups'] = graph['captures']
+            state = dict(graph)
+            if event == 'shutdown':
+                state.update(captures=0, replays=0, warmups=0)
+            if event == 'result' and mode == 'graph_fallback':
+                state['eager_decodes'] = 1
+            if event == 'result' and mode == 'graph_leak':
+                state.update(active=True, workspace_bytes=4096, captures=1, warmups=1, replays=1)
+            if event == 'result' and mode == 'graph_stale':
+                state.update(captures=0, replays=0, warmups=0)
+            value['execution'] = 'decode_cuda_graph'
+            value['graph_after_unload' if event == 'shutdown' else 'graph'] = [dict(state), dict(state)]
         data = json.dumps(value, indent=2).encode()
         framed = struct.pack("!I", len(data)) + data
         # 验证读取可以正确组装分段 header/body，多行 JSON 不依赖 stdout。
@@ -78,6 +105,9 @@ def fixture():
                       workers=workers, reusable=True, request=request, token_ids=[request["token_ids"][0]],
                       finish_reason="eos" if request["token_ids"][0] in request.get("eos_token_ids", []) else "length",
                       cache_after_generate=cache)
+        if mode in ('graph_normal', 'graph_stale') and request.get('max_new_tokens', 0) > 0:
+            result['token_ids'] *= request['max_new_tokens']
+            result['steps'] = [dict(token_id=token) for token in result['token_ids']]
         if message.get("stream_tokens"):
             token = request["token_ids"][0]
             token_event = dict(event="token", id=message["id"], index=0, token_id=token)

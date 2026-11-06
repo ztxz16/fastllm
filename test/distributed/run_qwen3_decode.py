@@ -16,6 +16,7 @@ from run_process_tp import ROOT, capture, save_report
 from run_qwen3_prefill import compare_logits, invoke, make_model, report_error, require
 from run_qwen3_shards import decode, encode, save_fixture
 from qwen3_layer_reference import prefill
+from fastllm_pytools.tp_graph import validate_graph
 
 BACKEND = "qwen3_process_decode_cublas_nccl"
 EMPTY = dict(active=False, tokens=0, capacity=0, position_begin=0, device_bytes=0)
@@ -173,6 +174,33 @@ def verify(report, devices, tasks, config):
     require(report["after_unload"] == [EMPTY] * len(devices), "unload left KV allocated")
 
 
+def verify_graph(report, tasks, world, enabled):
+    """按真实任务推导捕获/重放次数，覆盖请求复用、交错 Prefill、卸载与重载。"""
+    require(report.get("execution") == ("decode_cuda_graph" if enabled else "eager"), "wrong execution mode")
+    captures = replays = eager = 0
+    active = False
+    for task, result in zip(tasks, report["results"]):
+        op = task["op"]
+        if op == "decode":
+            if enabled:
+                captures += int(not active)
+                active = True
+                replays += 1
+            else:
+                eager += 1
+        elif op in ("end", "unload"):
+            active = False
+        if op == "unload":
+            captures = replays = eager = 0
+        states = validate_graph(result.get("graph"), world, enabled, clean=not active)
+        for g in states:
+            require((g["captures"], g["warmups"], g["replays"], g["eager_decodes"], g["active"]) ==
+                    (captures, captures, replays, eager, active), task["name"] + ": incorrect graph lifecycle")
+    states = validate_graph(report.get("graph_after_unload"), world, enabled)
+    require(all(not g[k] for g in states for k in ("captures", "replays", "warmups", "eager_decodes")),
+            "unloaded model retained graph counters")
+
+
 def verify_failure(code, report, spec, tasks):
     require(code == 1 and report.get("status") == "FAIL" and report.get("backend") == BACKEND,
             f"exit={code}; {report_error(report)}")
@@ -232,6 +260,7 @@ def main():
     parser.add_argument("--devices", default="0,1")
     parser.add_argument("--build-cache", type=Path, required=True)
     parser.add_argument("--model", type=Path)
+    parser.add_argument("--cuda-graph", action="store_true")
     parser.add_argument("--output", type=Path, default=ROOT / "test/distributed/results")
     args = parser.parse_args()
     devices = [int(part) for part in args.devices.split(",")]
@@ -246,7 +275,8 @@ def main():
         gpu=capture(["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv,noheader"]),
         cuda_visible_devices=os.environ.get("CUDA_VISIBLE_DEVICES"), devices=devices, atol=atol, rtol=rtol,
         model=str(args.model.resolve()) if args.model else "generated", kv_cache="FP16 request-local contiguous",
-        prefix_cache=False, execution="eager", sampling="fixed input IDs; no sampling", eos="no stopping",
+        prefix_cache=False, execution="decode_cuda_graph" if args.cuda_graph else "eager",
+        graph_warmup_per_request=1 if args.cuda_graph else 0, sampling="fixed input IDs; no sampling", eos="no stopping",
         expected_case_count=len(selected), report_title="Qwen3 request KV and decode correctness",
         report_description="逐步 TP/单卡对比，前缀不超过128时对照完整重算；小模型含独立CPU参考。max_context仅在128/129/256/2048检查CPU，其余步仍逐元素比较TP与单卡。非性能或HF端到端验收。")
     rows = []
@@ -278,6 +308,7 @@ def main():
                            decode_steps=spec.get("steps", 3), cycles=spec.get("cycles", 2),
                            output_tokens=0, input_tasks="tasks.json")
                 extra_args = ["--max-logit-elements", str(spec["max_logit_elements"])] if "max_logit_elements" in spec else []
+                extra_args += ["--cuda-graph", "1" if args.cuda_graph else "0"]
                 code, tp = invoke(args.check.resolve(), args.worker.resolve(), model, directory, devices, "tp",
                                   reload_model=reload_model, extra_args=extra_args)
                 row["workers"] = tp.get("workers", [])
@@ -286,6 +317,22 @@ def main():
                 else:
                     require(code == 0, f"TP exit={code}; {report_error(tp)}")
                     verify(tp, devices, tasks, config)
+                    verify_graph(tp, tasks, len(devices), args.cuda_graph)
+                    row["execution"] = tp["execution"]
+                    observed = [g for item in tp["results"] for g in item["graph"]]
+                    row.update(max_graph_captures=max(g['captures'] for g in observed),
+                               max_graph_replays=max(g['replays'] for g in observed),
+                               peak_graph_workspace_bytes=max(g['workspace_bytes'] for g in observed))
+                    if args.cuda_graph:
+                        code, eager = invoke(args.check.resolve(), args.worker.resolve(), model, directory, devices,
+                                             "eager_tp", reload_model=reload_model)
+                        require(code == 0, f"Eager TP exit={code}; {report_error(eager)}")
+                        verify(eager, devices, tasks, config)
+                        verify_graph(eager, tasks, len(devices), False)
+                        for actual, baseline in zip(tp["results"], eager["results"]):
+                            if "logits" in actual:
+                                compare_logits(actual["logits"], baseline["logits"], metrics,
+                                               actual["task"] + " Graph vs Eager TP", atol, rtol)
                     code, single = invoke(args.check.resolve(), args.worker.resolve(), model, directory, devices[:1], "single", reload_model=reload_model)
                     require(code == 0, f"single exit={code}; {report_error(single)}")
                     verify(single, devices[:1], tasks, config)

@@ -26,6 +26,7 @@ class DecodeTests(unittest.TestCase):
 
     def report(self, devices):
         results = []
+        eager_decodes = 0
         for task, state in zip(self.tasks, expectations(self.tasks)):
             result = dict(task=task["name"], op=task["op"],
                 cache=[expected_cache(self.config, state, rank, len(devices)) for rank in range(len(devices))])
@@ -35,8 +36,16 @@ class DecodeTests(unittest.TestCase):
                     self.reference[key] = prefill(self.config, self.tensors, *key)
                 values = self.reference[key][:]
                 result.update(logits=values, argmax=max(range(len(values)), key=values.__getitem__))
+            if task['op'] == 'decode':
+                eager_decodes += 1
+            elif task['op'] == 'unload':
+                eager_decodes = 0
+            result['graph'] = [dict(enabled=False, active=False, captures=0, replays=0, warmups=0,
+                                    eager_decodes=eager_decodes, workspace_bytes=0) for _ in devices]
             results.append(result)
-        return dict(status="PASS", backend=BACKEND, results=results, after_unload=[EMPTY.copy() for _ in devices],
+        return dict(status="PASS", backend=BACKEND, execution="eager",
+            graph_after_unload=[dict(enabled=False, active=False, captures=0, replays=0, warmups=0,
+                                     eager_decodes=0, workspace_bytes=0) for _ in devices], results=results, after_unload=[EMPTY.copy() for _ in devices],
             workers=[dict(rank=i, device=device, pid=100+i, cuda_runtime_version=12060, nccl_version=22203)
                      for i, device in enumerate(devices)])
 
