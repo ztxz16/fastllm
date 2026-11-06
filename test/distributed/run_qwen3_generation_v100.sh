@@ -11,7 +11,7 @@ export LD_LIBRARY_PATH="$CUDA_HOME/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export CUDA_VISIBLE_DEVICES=0,1
 export USE_TORCH=0
 hash -r
-python3 -c 'from transformers import AutoTokenizer'
+python3 -c 'import jinja2; from transformers import AutoTokenizer'
 
 bash test/distributed/run_qwen3_decode_v100.sh "$TP_GENERATION_MODEL_DIR"
 cmake --build build-process-tp-cu126 --target fastllm_tp_generate fastllm_tp_sampling_check -j 4
