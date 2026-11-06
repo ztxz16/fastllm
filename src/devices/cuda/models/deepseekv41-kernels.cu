@@ -2990,6 +2990,12 @@ namespace {
                 min(a.count, (a.position + row % a.seqlen + 1) / a.ratio), a.width};
         }
     }
+    template <bool BATCHED>
+    __device__ bool V41GlobalTopKEligible(const V41TopKGlobalArgs &a, int row, int index) {
+        if constexpr (BATCHED) return true; // decode globals do not use candidates
+        return !a.candidates || (index / a.blockSize < a.blocks &&
+            a.candidates[(size_t)row * a.blocks + index / a.blockSize]);
+    }
     __device__ unsigned V41TopKCoarseKey(float value) {
         const unsigned bits = __half_as_ushort(__float2half_rn(value));
         return ((bits & 0x8000) ? (~bits & 65535) : (bits | 0x8000)) >> 6;
@@ -3014,6 +3020,7 @@ namespace {
         if (tid == 0) nonfinite = 0;
         __syncthreads();
         for (int j = first + tid; j < end; j += 512) {
+            if (!V41GlobalTopKEligible<BATCHED>(a, row, j)) continue;
             const float value = r.scores[j];
             if (!isfinite(value)) atomicOr(&nonfinite, 1u);
             atomicAdd(hist + V41TopKCoarseKey(value), 1u);
@@ -3075,7 +3082,8 @@ namespace {
         int local = 0;
         for (int tile = start; tile < end; tile += 32) {
             const int j = first + tile + lane;
-            const bool keep = tile + lane < length && V41TopKCoarseKey(r.scores[j]) >= threshold;
+            const bool keep = tile + lane < length && V41GlobalTopKEligible<BATCHED>(a, row, j) &&
+                V41TopKCoarseKey(r.scores[j]) >= threshold;
             local += __popc(__ballot_sync(0xffffffffu, keep));
         }
         using Scan = cub::BlockScan<int, 256>;
@@ -3086,7 +3094,7 @@ namespace {
         const size_t base = (size_t)row * w.parts * w.width + w.offsets[(size_t)row * (w.parts + 1) + part];
         for (int tile = start; tile < end; tile += 32) {
             const int j = first + tile + lane;
-            const bool eligible = tile + lane < length;
+            const bool eligible = tile + lane < length && V41GlobalTopKEligible<BATCHED>(a, row, j);
             const float value = eligible ? r.scores[j] : -INFINITY;
             const bool keep = eligible && V41TopKCoarseKey(value) >= threshold;
             const unsigned mask = __ballot_sync(0xffffffffu, keep);
@@ -5752,8 +5760,12 @@ extern "C" bool FastllmCudaDeepSeekV41IndexerTopK(const fastllm::Data &score, co
     // own persistent hierarchical workspaces. Eager scratch is stream ordered.
     if (m > kTopKParallelMinKeys && width <= 512 && bs <= kTopKShardKeys &&
         (int64_t)bsz * seqlen <= 128 && !FastllmCudaGraphIsCapturing()) {
-        const bool globalTopK = !cand && width == 512 && m >= 65536 &&
-            m <= 1024 * kTopKShardKeys && bsz * seqlen <= 8 &&
+        // Prefill rows also benefit from coarse global filtering. Original FP32
+        // scores decide the final exact selection; ties/overflow retain hierarchy.
+        // Keep masked decode/verification unchanged. Wide masked prefill
+        // batches also favor the shard path because of its lower traffic.
+        const bool globalTopK = width == 512 && m >= 65536 &&
+            (!cand || (bsz * seqlen > 8 && bsz * seqlen <= 64)) && m <= 1024 * kTopKShardKeys &&
             V41MmaKernelReady<V41TopKGlobalFinish<false>, 1024>();
         auto layout = V41TopKLayout(nullptr, bsz * seqlen, m, width, bs, globalTopK);
         void *memory = nullptr;
