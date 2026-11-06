@@ -52,7 +52,7 @@ if (-not $Wheel) {
 }
 $Wheel = Full-Path $Wheel
 
-$LauncherBuild = Join-Path $Cache "launcher-build"
+$LauncherBuild = Get-FastllmLauncherBuild $Cache
 Run $CMakePath @("-S", (Join-Path $RepoRoot "portable/windows"), "-B", $LauncherBuild, "-G", "Visual Studio 17 2022", "-A", "x64")
 Run $CMakePath @("--build", $LauncherBuild, "--config", "Release", "--parallel", "$Jobs")
 

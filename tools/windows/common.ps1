@@ -50,6 +50,17 @@ function Get-FastllmRuntimeLock {
     return Get-Content -LiteralPath (Join-Path $RepoRoot "portable/windows/runtime-lock.json") -Raw -Encoding UTF8 | ConvertFrom-Json
 }
 
+function Get-FastllmLauncherBuild([string]$Cache) {
+    # CMake caches an absolute source directory. Share downloads between
+    # checkouts while keeping each checkout's native launcher build separate.
+    $source = (Full-Path "portable/windows").ToLowerInvariant()
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        $key = [BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($source))).Replace("-", "").Substring(0, 12)
+    } finally { $sha.Dispose() }
+    return Join-Path $Cache "launcher-build-$key"
+}
+
 function Get-FastllmAsset([string]$Name, [string]$Cache, [switch]$Offline) {
     $asset = (Get-FastllmRuntimeLock).$Name
     $destination = Join-Path $Cache $asset.filename
