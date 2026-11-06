@@ -13,10 +13,12 @@ inline json11::Json::array GraphState(fastllm::distributed::ProcessGroup &group)
     json11::Json::array states;
     for (const auto &info : group.Qwen3Requests()) {
         const auto &g = info.graph;
+        // json11 的 double 会输出带小数点的数字；计数/字节必须走整数重载，
+        // 否则 Python 解码为 float，启动阶段的严格协议检查就会拒绝。
         states.push_back(json11::Json::object{{"enabled", g.enabled}, {"active", g.active},
-            {"captures", double(g.captures)}, {"replays", double(g.replays)},
-            {"warmups", double(g.warmups)}, {"eager_decodes", double(g.eagerDecodes)},
-            {"workspace_bytes", double(g.workspaceBytes)}});
+            {"captures", static_cast<long long>(g.captures)}, {"replays", static_cast<long long>(g.replays)},
+            {"warmups", static_cast<long long>(g.warmups)}, {"eager_decodes", static_cast<long long>(g.eagerDecodes)},
+            {"workspace_bytes", static_cast<long long>(g.workspaceBytes)}});
     }
     return states;
 }

@@ -18,10 +18,33 @@ class GraphTests(unittest.TestCase):
         self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
 
-    def session(self, mode='graph_normal'):
+    def session(self, mode='graph_normal', enabled=True):
         f = self.fixture
-        return Qwen3ProcessSession(f.binary, f.binary, f.root / mode, '0,1', f.root / (mode + '-graph'),
-                                   timeout=5, cuda_graph=True)
+        return Qwen3ProcessSession(f.binary, f.binary, f.root / mode, '0,1', f.root / (mode + f'-graph-{enabled}'),
+                                   timeout=5, cuda_graph=enabled)
+
+    def test_eager_session_reports_integer_counters_and_reuses_workers(self):
+        with self.session(enabled=False) as session:
+            self.assertEqual(session.ready['execution'], 'eager')
+            for count, expected in ((1, 0), (3, 2), (2, 3)):
+                report = session.generate(dict(self.fixture.request, max_new_tokens=count))
+                for state in report['graph']:
+                    self.assertFalse(state['enabled'])
+                    self.assertEqual(state['eager_decodes'], expected)
+                    self.assertEqual(state['captures'], 0)
+        self.assertEqual(session.shutdown['graph_after_unload'][0]['eager_decodes'], 0)
+
+    def test_float_counters_rejected_on_wire_in_both_modes(self):
+        # 重现原生 double 序列化后成为 JSON 小数的问题，覆盖 Eager 也会读取的启动状态。
+        for enabled in (False, True):
+            for event in ('ready', 'result', 'shutdown'):
+                with self.subTest(enabled=enabled, event=event):
+                    session = self.session('graph_float_' + event, enabled=enabled)
+                    with self.assertRaisesRegex(RuntimeError, 'invalid CUDA Graph diagnostics'):
+                        with session:
+                            session.generate(self.fixture.request)
+                    self.assertEqual(session.state, 'failed')
+                    self.assertFalse(Path(f'/proc/{session._process.pid}').exists())
 
     def test_session_replays_and_cleans_up_each_request(self):
         with self.session() as session:
