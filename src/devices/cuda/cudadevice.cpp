@@ -4556,6 +4556,20 @@ namespace fastllm {
             batch, topk, hidden, inter, experts);
     }
 #else
+    bool TryCudaTritonSmallProjection(const Data &, Data &, Data &, int) {
+        return false;
+    }
+
+    bool CudaTritonMxfp4GroupedEnabled() {
+        return false;
+    }
+
+    bool TryCudaTritonMxfp4Grouped(
+        const Data &, const Data &, const unsigned char *, const int *, const int *,
+        const float *, float *, void *, int, int, int, int, size_t, size_t, float, bool) {
+        return false;
+    }
+
     static bool TryCudaCutlassLinearFp8Block128(
         Data &, Data &, const Data &, Data &, int, int, int) {
         return false;
