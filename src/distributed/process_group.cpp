@@ -9,6 +9,7 @@
 #include <cstring>
 #include <dirent.h>
 #include <fcntl.h>
+#include <filesystem>
 #include <mutex>
 #include <poll.h>
 #include <random>
@@ -87,6 +88,15 @@ uint32_t Get32(const std::vector<uint8_t> &bytes, size_t offset) {
         value |= uint32_t(bytes[offset + i]) << (i * 8);
     }
     return value;
+}
+
+void Put64(std::vector<uint8_t> &bytes, uint64_t value) {
+    Put32(bytes, static_cast<uint32_t>(value));
+    Put32(bytes, static_cast<uint32_t>(value >> 32));
+}
+
+uint64_t Get64(const std::vector<uint8_t> &bytes, size_t offset) {
+    return uint64_t(Get32(bytes, offset)) | (uint64_t(Get32(bytes, offset + 4)) << 32);
 }
 
 void Send(int fd, const Message &message, Deadline deadline) {
@@ -501,6 +511,91 @@ std::vector<float> ProcessGroup::CheckAllReduce() {
             values.push_back(value);
         }
         return values;
+    } catch (const std::exception &e) {
+        impl->Fail(e.what());
+        throw std::runtime_error(impl->error);
+    }
+}
+
+std::vector<ProcessModelInfo> ProcessGroup::LoadQwen3(const std::string &directory,
+        uint64_t maxTensorBytes, uint64_t maxDeviceBytes, int timeoutMs) {
+    if (directory.empty() || directory.find('\0') != std::string::npos ||
+        !maxTensorBytes || !maxDeviceBytes || timeoutMs <= 0) {
+        throw std::invalid_argument("invalid Qwen3 loading options");
+    }
+    const std::string absolute = std::filesystem::absolute(directory).string();
+    if (absolute.size() > kMaxPayload - 16) {
+        throw std::invalid_argument("Qwen3 model path exceeds protocol limit");
+    }
+    std::vector<uint8_t> payload;
+    Put64(payload, maxTensorBytes);
+    Put64(payload, maxDeviceBytes);
+    payload.insert(payload.end(), absolute.begin(), absolute.end());
+
+    std::lock_guard<std::mutex> lock(impl->mutex);
+    if (impl->state != ProcessGroupState::Ready || impl->options.controlOnly) {
+        throw std::runtime_error("Qwen3 loading requires a ready CUDA process TP group");
+    }
+    try {
+        auto replies = impl->Exchange(Kind::LoadQwen3, Kind::ModelLoaded, payload,
+                                      Clock::now() + std::chrono::milliseconds(timeoutMs));
+        std::vector<ProcessModelInfo> results;
+        for (const auto &reply : replies) {
+            if (reply.payload.size() != 20 || !Get32(reply.payload, 0) || !Get64(reply.payload, 4)) {
+                throw std::runtime_error("invalid Qwen3 loading result");
+            }
+            results.push_back({Get32(reply.payload, 0), Get64(reply.payload, 4), Get64(reply.payload, 12)});
+        }
+        return results;
+    } catch (const std::exception &e) {
+        impl->Fail(e.what());
+        throw std::runtime_error(impl->error);
+    }
+}
+
+std::vector<uint8_t> ProcessGroup::ReadQwen3Weight(int rank, uint32_t tensorIndex,
+                                                uint64_t offset, uint32_t bytes) {
+    std::lock_guard<std::mutex> lock(impl->mutex);
+    if (rank < 0 || size_t(rank) >= impl->children.size() || !bytes || bytes > kMaxPayload ||
+        bytes % 2 || offset % 2) {
+        throw std::invalid_argument("invalid Qwen3 readback range");
+    }
+    if (impl->state != ProcessGroupState::Ready || impl->options.controlOnly) {
+        throw std::runtime_error("Qwen3 readback requires a ready CUDA process TP group");
+    }
+    std::vector<uint8_t> payload;
+    Put32(payload, static_cast<uint32_t>(rank));
+    Put32(payload, tensorIndex);
+    Put64(payload, offset);
+    Put32(payload, bytes);
+    try {
+        auto replies = impl->Exchange(Kind::ReadWeight, Kind::WeightData, payload,
+                                      Clock::now() + std::chrono::milliseconds(impl->options.operationTimeoutMs));
+        for (size_t i = 0; i < replies.size(); ++i) {
+            if (replies[i].payload.size() != (i == size_t(rank) ? bytes : 0)) {
+                throw std::runtime_error("invalid Qwen3 readback response size");
+            }
+        }
+        return std::move(replies[rank].payload);
+    } catch (const std::exception &e) {
+        impl->Fail(e.what());
+        throw std::runtime_error(impl->error);
+    }
+}
+
+void ProcessGroup::UnloadQwen3() {
+    std::lock_guard<std::mutex> lock(impl->mutex);
+    if (impl->state != ProcessGroupState::Ready || impl->options.controlOnly) {
+        throw std::runtime_error("Qwen3 unload requires a ready CUDA process TP group");
+    }
+    try {
+        auto replies = impl->Exchange(Kind::UnloadQwen3, Kind::ModelUnloaded, {},
+                                      Clock::now() + std::chrono::milliseconds(impl->options.operationTimeoutMs));
+        for (const auto &reply : replies) {
+            if (!reply.payload.empty()) {
+                throw std::runtime_error("invalid Qwen3 unload response");
+            }
+        }
     } catch (const std::exception &e) {
         impl->Fail(e.what());
         throw std::runtime_error(impl->error);

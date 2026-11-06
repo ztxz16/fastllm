@@ -31,6 +31,12 @@ struct ProcessWorkerInfo {
     std::string deviceName;
 };
 
+struct ProcessModelInfo {
+    uint32_t tensorCount = 0;
+    uint64_t deviceBytes = 0;
+    uint64_t sourceBytesRead = 0;
+};
+
 // Linux 单机控制面。Ready 仅代表 worker/通信就绪，不代表模型已加载。
 class ProcessGroup {
 public:
@@ -62,6 +68,37 @@ public:
      * @return 每个 rank 实际读回的求和值；运行失败抛异常并终止整组。
      */
     std::vector<float> CheckAllReduce();
+
+    /**
+     * 让各 worker 独立读取本 rank 的 Qwen3 权重并以 FP16 驻留 GPU。
+     *
+     * 只加载权重，不执行前向、不创建 KV。重复加载必须先卸载；任一 worker
+     * 失败会终止整组，不能继续使用其他 rank 的部分结果。
+     * @param directory 本机各 worker 可访问的 HF 模型目录，调用时固定为绝对路径。
+     * @param maxTensorBytes 单个源分片的 CPU 缓冲上限，必须大于零。
+     * @param maxDeviceBytes 每个 rank 的 FP16 权重总字节上限，不包含 KV 或 CUDA 上下文。
+     * @param timeoutMs 整组加载截止时间；与短控制消息超时独立。
+     * @return 按 rank 排列的权重计数与实际读取字节；失败抛异常。
+     */
+    std::vector<ProcessModelInfo> LoadQwen3(const std::string &directory,
+        uint64_t maxTensorBytes = 1073741824ULL, uint64_t maxDeviceBytes = 8589934592ULL,
+        int timeoutMs = 300000);
+
+    /**
+     * 从指定 worker 的真实 GPU 权重读回连续字节，用于加载正确性验收。
+     * @param rank 组内 rank。
+     * @param tensorIndex 分片计划中的张量序号。
+     * @param offset FP16 字节偏移，必须按两个字节对齐。
+     * @param bytes 精确读取字节数，必须为正偶数且不超过 1 MiB，不允许越界。
+     * @return 小端 FP16 行主序数据；worker 拒绝或通信失败时终止整组并抛异常。
+     */
+    std::vector<uint8_t> ReadQwen3Weight(int rank, uint32_t tensorIndex, uint64_t offset, uint32_t bytes);
+
+    /**
+     * 同步各 worker 的执行 stream 并释放所有模型权重，可重复调用。
+     * 不销毁 NCCL 组；完成后允许重新加载。失败终止整组并抛异常。
+     */
+    void UnloadQwen3();
 
     /**
      * 停止监控、请求正常退出并回收全部 worker。

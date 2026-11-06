@@ -13,6 +13,7 @@
 #ifdef FASTLLM_PROCESS_TP_CUDA
 #include <cuda_runtime_api.h>
 #include <nccl.h>
+#include "distributed/qwen3_device_weights.h"
 #endif
 
 using namespace fastllm::distributed::protocol;
@@ -33,7 +34,7 @@ void CheckNccl(ncclResult_t result) {
 #endif
 
 /**
- * 持有单个 worker 的 CUDA/NCCL 资源，不创建模型或 KV。
+ * 持有单个 worker 的 CUDA/NCCL 资源及可选 Qwen3 权重，不创建 KV 或执行前向。
  *
  * 失败时由进程退出释放 CUDA 上下文；正常退出必须先同步，再销毁通信组和缓冲。
  * 不在异常析构路径进入可能阻塞的 NCCL 清理，由父进程负责超时终止。
@@ -44,6 +45,7 @@ struct DeviceRuntime {
     cudaStream_t stream = nullptr;
     ncclComm_t comm = nullptr;
     float *buffer = nullptr;
+    std::unique_ptr<fastllm::distributed::Qwen3DeviceWeights> weights;
 #endif
 
     void Bind(int device) {
@@ -113,6 +115,7 @@ struct DeviceRuntime {
     void Shutdown() {
 #ifdef FASTLLM_PROCESS_TP_CUDA
         if (!controlOnly) {
+            UnloadWeights();
             CheckCuda(cudaStreamSynchronize(stream));
             CheckNccl(ncclCommDestroy(comm));
             comm = nullptr;
@@ -120,6 +123,78 @@ struct DeviceRuntime {
             buffer = nullptr;
             CheckCuda(cudaStreamDestroy(stream));
             stream = nullptr;
+        }
+#endif
+    }
+
+    /**
+     * 按控制消息创建本 rank 的 GPU 权重，任何失败交由主循环终止进程。
+     * @param rank 本 worker 的 rank。
+     * @param world TP 进程数。
+     * @param payload 两个 uint64 配额及不含 NUL 的模型路径。
+     * @return 张量数、GPU 字节数、源读取字节数；不是前向就绪标志。
+     */
+    std::vector<uint8_t> LoadWeights(int rank, int world, const std::vector<uint8_t> &payload) {
+        if (controlOnly) {
+            throw std::runtime_error("Qwen3 weights require CUDA");
+        }
+#ifdef FASTLLM_PROCESS_TP_CUDA
+        if (weights) {
+            throw std::runtime_error("Qwen3 weights already loaded; unload first");
+        }
+        if (payload.size() <= 16) {
+            throw std::runtime_error("invalid Qwen3 load payload");
+        }
+        std::string directory(payload.begin() + 16, payload.end());
+        if (directory.find('\0') != std::string::npos) {
+            throw std::runtime_error("invalid Qwen3 path");
+        }
+        fastllm::distributed::Qwen3ShardLoader loader(directory, rank, world);
+        weights = std::make_unique<fastllm::distributed::Qwen3DeviceWeights>(
+            loader, stream, Get64(payload, 0), Get64(payload, 8));
+        std::vector<uint8_t> result;
+        Put32(result, weights->TensorCount());
+        Put64(result, weights->DeviceBytes());
+        Put64(result, weights->SourceBytesRead());
+        return result;
+#else
+        throw std::runtime_error("worker built without CUDA");
+#endif
+    }
+
+    /**
+     * 仅目标 rank 在 worker 执行 stream 上读回 GPU 权重，其他 rank 返回空响应。
+     * @param rank 当前 rank。
+     * @param world 组大小，用于验证目标 rank。
+     * @param payload 目标 rank、张量序号、字节偏移及读取长度。
+     * @return GPU 读回的 FP16 字节；未加载、越界或 CUDA 错误抛异常。
+     */
+    std::vector<uint8_t> ReadWeights(int rank, int world, const std::vector<uint8_t> &payload) {
+        if (controlOnly || payload.size() != 20 || Get32(payload, 0) >= uint32_t(world)) {
+            throw std::runtime_error("invalid Qwen3 read payload/state");
+        }
+#ifdef FASTLLM_PROCESS_TP_CUDA
+        if (!weights) {
+            throw std::runtime_error("Qwen3 weights not loaded");
+        }
+        if (Get32(payload, 0) != uint32_t(rank)) {
+            return {};
+        }
+        return weights->Read(Get32(payload, 4), Get64(payload, 8), Get32(payload, 16));
+#else
+        throw std::runtime_error("worker built without CUDA");
+#endif
+    }
+
+    /** 同步并卸载可选权重，重复调用无副作用；CUDA 失败交由主循环退出回收。 */
+    void UnloadWeights() {
+        if (controlOnly) {
+            throw std::runtime_error("Qwen3 weights require CUDA");
+        }
+#ifdef FASTLLM_PROCESS_TP_CUDA
+        if (weights) {
+            weights->Clear();
+            weights.reset();
         }
 #endif
     }
@@ -219,10 +294,32 @@ int main(int argc, char **argv) {
             sequence = message.sequence;
             Kind response;
             std::vector<uint8_t> payload;
-            if (message.kind != Kind::Initialize && !message.payload.empty()) {
+            if (message.kind != Kind::Initialize && message.kind != Kind::LoadQwen3 &&
+                message.kind != Kind::ReadWeight && !message.payload.empty()) {
                 throw std::runtime_error("unexpected worker command payload");
             }
             switch (message.kind) {
+                case Kind::LoadQwen3:
+                    if (!initialized) {
+                        throw std::runtime_error("LoadQwen3 before Initialize");
+                    }
+                    payload = runtime.LoadWeights(rank, world, message.payload);
+                    response = Kind::ModelLoaded;
+                    break;
+                case Kind::ReadWeight:
+                    if (!initialized) {
+                        throw std::runtime_error("ReadWeight before Initialize");
+                    }
+                    payload = runtime.ReadWeights(rank, world, message.payload);
+                    response = Kind::WeightData;
+                    break;
+                case Kind::UnloadQwen3:
+                    if (!initialized) {
+                        throw std::runtime_error("UnloadQwen3 before Initialize");
+                    }
+                    runtime.UnloadWeights();
+                    response = Kind::ModelUnloaded;
+                    break;
                 case Kind::CreateId:
                     if (rank != 0 || runtime.controlOnly || initialized || idCreated) {
                         throw std::runtime_error("invalid CreateId state");
