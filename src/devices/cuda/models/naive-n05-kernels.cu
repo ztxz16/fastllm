@@ -42,6 +42,9 @@
 // MMA bodies and runtime dispatch already guard the SM80-only instructions.
 #define FASTLLM_NAIVE_DSA_MMA
 #include "naive-n05-dsa-mma.cuh"
+// Batch descriptors and grid-constant parameters require at least SM70.
+// Keep dependent indexer headers under the same guard as their Row/Batch types.
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
 #include "naive-n05-indexer-batch.cuh"
 #include "naive-n05-indexer-staged.cuh"
 #if CUDART_VERSION >= 12040
@@ -51,6 +54,7 @@
 #include "naive-n05-indexer-wide-select.cuh"
 #include "naive-n05-context-merge.cuh"
 #include "naive-n05-context-merge-chunk.cuh"
+#endif
 #endif
 
 namespace {
@@ -923,11 +927,14 @@ struct RopeCacheRow {
     bool separateIndex = false;
     int indexPageLen = 0, indexContextRank = 0;
 };
+// Large launch-argument batches and grid-constant RoPE require SM70.
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
 constexpr int kRopeArgumentBytes = CUDART_VERSION >= 12010 ? 32764 : 4096;
 constexpr int kRopeCacheBatch = std::min(192, (kRopeArgumentBytes - 128) / int(sizeof(RopeCacheRow)));
 struct RopeCacheBatch { RopeCacheRow rows[kRopeCacheBatch]; };
 #include "naive-n05-rope-compact.cuh"
 #include "naive-n05-rope-request.cuh"
+#endif
 
 template <bool Packed>
 __device__ void AppendRopeCacheRow(RopeCacheRow r, int token, int head,
@@ -1005,6 +1012,7 @@ __global__ void RopeAppendCache(RopeCacheRow row, int heads, int kvHeads, int di
         heads, kvHeads, dim, valueDim, indexDim, rotaryDim, theta, valueScale, window, ring);
 }
 
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
 template <bool Packed>
 __global__ void BatchRopeAppendCache(RopeCacheBatch batch, int heads, int kvHeads, int dim,
         int valueDim, int indexDim, int rotaryDim, float theta, BF16 valueScale,
@@ -1012,6 +1020,7 @@ __global__ void BatchRopeAppendCache(RopeCacheBatch batch, int heads, int kvHead
     AppendRopeCacheRow<Packed>(batch.rows[blockIdx.y], 0, blockIdx.x, heads, kvHeads,
         dim, valueDim, indexDim, rotaryDim, theta, valueScale, window, ring);
 }
+#endif
 
 // Same 64-lane FP32 tree and epsilon as LayerNorm(FP32), with BF16 I/O.
 __global__ void IndexerKeyNorm(BF16 *input, const float *weight, const float *bias) {
@@ -2624,6 +2633,9 @@ bool FastllmCudaNaiveBatchRopeAppendCache(fastllm::Data &q, const fastllm::Data 
         const std::vector<FastllmNaiveRopeCacheRow> &rows, const fastllm::Data &liveKeys,
         int heads, int kvHeads, int dim, int valueDim, int rotaryDim, float theta,
         float valueScale, int window, const fastllm::Data *packedQkv, bool ring) {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
+    // Return before touching Q/KV so older GPUs retain the per-request path.
+    if (FastllmCudaRuntimeArch() < 70) return false;
     const int count = rows.size();
     std::vector<RopeCacheRow> descriptors;
     int indexDim = 0;
@@ -2675,6 +2687,9 @@ bool FastllmCudaNaiveBatchRopeAppendCache(fastllm::Data &q, const fastllm::Data 
     }
     CheckLaunch();
     return true;
+#else
+    return false;
+#endif
 }
 
 bool FastllmCudaNaiveBatchQkvRopeAppendCache(const fastllm::Data &input,
@@ -4172,6 +4187,7 @@ template <class Kernel> bool BulkKernelSupported(Kernel kernel, size_t shared, i
 bool PrefetchDSAAttention(const fastllm::Data &query, const float *bias,
         const std::vector<FastllmNaiveDSARow> &rows, int heads, int kvHeads,
         fastllm::Data &output) {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900
     namespace bulk = pipeline_bulk;
     if (FastllmCudaRuntimeArch() != 90 || heads != 16 || kvHeads != 1 || rows.size() < 32)
         return false;
@@ -4225,6 +4241,9 @@ bool PrefetchDSAAttention(const fastllm::Data &query, const float *bias,
             (BF16 *)output.cudaData + (size_t)first * heads * 128, heads, kvHeads);
     }
     return true;
+#else
+    return false;
+#endif
 }
 
 template <int Max, bool Ring>
