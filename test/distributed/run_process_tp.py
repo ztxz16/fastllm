@@ -4,7 +4,6 @@
 import argparse
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 import csv
-import ctypes
 from datetime import datetime, timezone
 import json
 import os
@@ -21,6 +20,9 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "test/nvfp4"))
 from xlsx_report import write_xlsx
 from linux_process import check_pidfd_support, open_pidfd
+
+sys.path.insert(0, str(ROOT / "tools"))
+from tp_process_utils import enable_child_subreaper, wait_case, cleanup_process_group, isolated_process
 
 
 def capture(command, timeout=10):
@@ -70,60 +72,10 @@ def save_report(output, rows, metadata):
     return status
 
 
-def enable_child_subreaper():
-    # 接管协调器退出后的孤儿 worker，避免依赖容器 PID 1 帮助回收僵尸进程。
-    libc = ctypes.CDLL(None, use_errno=True)
-    prctl = libc.prctl
-    prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong]
-    prctl.restype = ctypes.c_int
-    if prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
-        error = ctypes.get_errno()
-        raise OSError(error, "cannot enable child subreaper: " + os.strerror(error))
-
-
-def wait_case(process, timeout):
-    # 保留已退出组长的 wait 状态，直到整组清理完成，防止 PID/PGID 被提前复用。
-    deadline = time.monotonic() + timeout
-    while True:
-        result = os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
-        if result is not None:
-            return result.si_status if result.si_code == os.CLD_EXITED else -result.si_status
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise subprocess.TimeoutExpired(process.args, timeout)
-        time.sleep(min(0.02, remaining))
-
-
-def cleanup_process_group(process, timeout=5):
-    deadline = time.monotonic() + timeout
-    try:
-        # SIGKILL 对 SIGSTOP 中的 worker 同样生效；先杀整组，再回收组长。
-        os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    process.wait(timeout=max(0, deadline - time.monotonic()))
-
-    # 只回收本 case 的进程组，不能使用 waitpid(-1) 抢走其他子进程的状态。
-    while True:
-        try:
-            pid, _ = os.waitpid(-process.pid, os.WNOHANG)
-        except ChildProcessError:
-            return
-        if pid == 0:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise RuntimeError(f"process group {process.pid} cleanup timed out")
-            time.sleep(min(0.02, remaining))
-
-
 @contextmanager
 def case_process(command, **kwargs):
-    enable_child_subreaper()
-    process = subprocess.Popen(command, cwd=ROOT, start_new_session=True, **kwargs)
-    try:
+    with isolated_process(command, cwd=ROOT, **kwargs) as process:
         yield process
-    finally:
-        cleanup_process_group(process)
 
 
 def parse_report(text):
