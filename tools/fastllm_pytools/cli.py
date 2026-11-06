@@ -47,7 +47,7 @@ def args_parser():
     shared_parser = make_normal_parser("fastllm", add_help = False)
 
     # 下载解析器
-    from ftllm.download import make_download_parser
+    from .util import make_download_parser
     download_parser = make_download_parser(add_help = False)
 
     # 打开终端部署向导
@@ -57,11 +57,17 @@ def args_parser():
     # 创建chat子命令（使用共享解析器）
     chat_parser_ = subparsers.add_parser('chat', parents = [shared_parser], help = '聊天模式')
 
+    chat_parser_.add_argument('--prompt', help='单次文本请求（进程TP）')
+    chat_parser_.add_argument('--max-new-tokens', type=int, default=32, help='最大生成token数（进程TP）')
+
     # 创建run子命令（使用相同的共享解析器）
     run_parser_ = subparsers.add_parser('run', parents = [shared_parser], help = '运行模式')
 
+    run_parser_.add_argument('--prompt', help='单次文本请求（进程TP）')
+    run_parser_.add_argument('--max-new-tokens', type=int, default=32, help='最大生成token数（进程TP）')
+
     # 创建benchmark子命令（使用相同的共享解析器）
-    from ftllm.benchmark import add_benchmark_args
+    from .benchmark import add_benchmark_args
     benchmark_parser_ = subparsers.add_parser('benchmark', aliases = ['bench'],
                                               parents = [shared_parser],
                                               help = '性能测试模式')
@@ -76,7 +82,7 @@ def args_parser():
     webui_parser_.add_argument("--think", type = str, default = "false", help = "if <think> lost")
 
     server_parser = shared_parser
-    from ftllm.util import add_server_args
+    from .util import add_server_args
     add_server_args(server_parser)
     server_parser_ = subparsers.add_parser('serve', parents = [server_parser], help = 'api模式')
     serve_parser_ = subparsers.add_parser('server', parents = [server_parser], help = 'api模式')
@@ -99,6 +105,21 @@ def main():
         from . import __version__
         print("ftllm version: " + __version__)
         return
+    if hasattr(args, 'tp_backend'):
+        from .util import load_model_args
+        load_model_args(args)
+        if args.tp_backend == 'process':
+            if args.command in ('chat', 'run'):
+                from .process_tp import run_chat
+                return run_chat(args)
+            if args.command in ('serve', 'server'):
+                from .process_tp import run_server
+                return run_server(args)
+            raise ValueError('process TP currently supports chat/run/server/serve only')
+        if args.tp_backend != 'thread':
+            raise ValueError('tp_backend must be thread or process')
+        if getattr(args, 'prompt', None) is not None or getattr(args, 'max_new_tokens', 32) != 32:
+            raise ValueError('--prompt/--max-new-tokens currently require --tp_backend process')
     # 根据不同的子命令执行不同的操作
     if args.command is None:
         from .tui import FastllmTUI
@@ -118,13 +139,13 @@ def main():
                 return
         save_defaults_to_json(make_normal_parser("fastllm", add_help = False), file)
     elif args.command in ('chat', 'run'):
-        from ftllm.chat import fastllm_chat
+        from .chat import fastllm_chat
         fastllm_chat(args)
     elif args.command in ('benchmark', 'bench'):
-        from ftllm.benchmark import fastllm_benchmark
+        from .benchmark import fastllm_benchmark
         fastllm_benchmark(args)
     elif args.command == "download":
-        from ftllm.download import HFDDownloader
+        from .download import HFDDownloader
         HFDDownloader(args).run()
     elif args.command == 'webui':
         current_path = os.path.dirname(os.path.abspath(__file__))
@@ -154,19 +175,19 @@ def main():
         os.system(cmd)
         return
     elif args.command in ('server', 'serve'):
-        from ftllm.server import fastllm_server
+        from .server import fastllm_server
         fastllm_server(args)
     elif args.command == 'export':
-        from ftllm import llm
+        from . import llm
         if (args.path == '' or args.path is None):
             args.path = args.model
         llm.export_llm_model_fromhf(path = args.path, dtype = args.dtype, moe_dtype = args.moe_dtype, lora = args.lora, output = args.output, dtype_config = args.dtype_config)
     elif args.command == 'collect-env':
-        from ftllm.collect_env import main as collect_env_main
+        from .collect_env import main as collect_env_main
         collect_env_main()
     else:
         print("Invalid command: ", args.command)
         exit(0)
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
