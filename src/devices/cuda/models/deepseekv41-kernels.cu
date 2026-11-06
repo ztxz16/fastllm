@@ -21,6 +21,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 #include "deepseekv41-router.cuh"
+#include "deepseekv41-indexer.cuh"
 #include "deepseekv41-router-tc.cuh"
 #include "devices/cuda/fastllm-fp8-auxiliary.h"
 #include "devices/cuda/fastllm-v41-full-decode.h"
@@ -3003,6 +3004,12 @@ namespace {
                 min(a.count, (a.position + row % a.seqlen + 1) / a.ratio), a.width};
         }
     }
+    template <bool BATCHED>
+    __device__ bool V41GlobalTopKEligible(const V41TopKGlobalArgs &a, int row, int index) {
+        if constexpr (BATCHED) return true; // decode globals do not use candidates
+        return !a.candidates || (index / a.blockSize < a.blocks &&
+            a.candidates[(size_t)row * a.blocks + index / a.blockSize]);
+    }
     __device__ unsigned V41TopKCoarseKey(float value) {
         const unsigned bits = __half_as_ushort(__float2half_rn(value));
         return ((bits & 0x8000) ? (~bits & 65535) : (bits | 0x8000)) >> 6;
@@ -3027,6 +3034,7 @@ namespace {
         if (tid == 0) nonfinite = 0;
         __syncthreads();
         for (int j = first + tid; j < end; j += 512) {
+            if (!V41GlobalTopKEligible<BATCHED>(a, row, j)) continue;
             const float value = r.scores[j];
             if (!isfinite(value)) atomicOr(&nonfinite, 1u);
             atomicAdd(hist + V41TopKCoarseKey(value), 1u);
@@ -3088,7 +3096,8 @@ namespace {
         int local = 0;
         for (int tile = start; tile < end; tile += 32) {
             const int j = first + tile + lane;
-            const bool keep = tile + lane < length && V41TopKCoarseKey(r.scores[j]) >= threshold;
+            const bool keep = tile + lane < length && V41GlobalTopKEligible<BATCHED>(a, row, j) &&
+                V41TopKCoarseKey(r.scores[j]) >= threshold;
             local += __popc(__ballot_sync(0xffffffffu, keep));
         }
         using Scan = cub::BlockScan<int, 256>;
@@ -3099,7 +3108,7 @@ namespace {
         const size_t base = (size_t)row * w.parts * w.width + w.offsets[(size_t)row * (w.parts + 1) + part];
         for (int tile = start; tile < end; tile += 32) {
             const int j = first + tile + lane;
-            const bool eligible = tile + lane < length;
+            const bool eligible = tile + lane < length && V41GlobalTopKEligible<BATCHED>(a, row, j);
             const float value = eligible ? r.scores[j] : -INFINITY;
             const bool keep = eligible && V41TopKCoarseKey(value) >= threshold;
             const unsigned mask = __ballot_sync(0xffffffffu, keep);
@@ -4270,7 +4279,7 @@ namespace {
 #endif
     }
 
-    #include "deepseekv41-sm120-prefill.cuh"
+    #include "deepseekv41-prefill-shared-kv.cuh"
 
     // Check the compiled image as well as hardware. An SM75 PTX image JITed
     // on a newer GPU still contains the #if-disabled MMA body. Resource or
@@ -5646,6 +5655,41 @@ extern "C" bool FastllmCudaDeepSeekV41IndexerScore(const fastllm::Data &q, const
     return V41CheckLaunch("IndexerScore");
 }
 
+extern "C" bool FastllmCudaDeepSeekV41IndexerScoreFp4Query(const fastllm::Data &q,
+        const fastllm::Data &weights, const fastllm::Data &k, int ratio, int startPos,
+        fastllm::Data &output) {
+#ifdef FASTLLM_ENABLE_DSV41_FLASHINFER_SM120
+    const int arch = FastllmCudaRuntimeArch();
+    if ((arch == 120 || arch == 121) && !V41EnvOn("FASTLLM_DSV41_LEGACY_INDEXER") &&
+        !FastllmCudaGraphIsCapturingFast() && V41OnCuda(q) && V41OnCuda(weights) && V41OnCuda(k) &&
+        q.dataType == DataType::BFLOAT16 && q.dims.size() == 4 &&
+        q.dims[0] > 0 && q.dims[0] <= 65535 && q.dims[1] >= 9 && q.dims[1] <= 65535 * 4 &&
+        q.dims[2] == 32 && q.dims[3] == 128 &&
+        weights.dataType == DataType::FLOAT32 && weights.dims == std::vector<int>({q.dims[0], q.dims[1], 32}) &&
+        k.dataType == DataType::INT8 && k.dims.size() == 3 && k.dims[0] == q.dims[0] &&
+        k.dims[1] > 0 && k.dims[2] == 68 && ratio > 0 && startPos >= 0 &&
+        int64_t(startPos) + q.dims[1] < INT_MAX && int64_t(q.dims[0]) * q.dims[1] <= INT_MAX / 128) {
+        // Prepare the throwing allocation before acquiring temporary storage.
+        if (!V41PrepareOutput(output, DataType::FLOAT32, {q.dims[0], q.dims[1], k.dims[1]})) return false;
+        void *scratch = nullptr;
+        const size_t bytes = size_t(q.dims[0]) * q.dims[1] * 32 * 68;
+        const auto allocation = FastllmCudaTryMalloc(&scratch, bytes);
+        if (allocation == FASTLLM_CUDA_TRY_MALLOC_ERROR) return false;
+        if (allocation == FASTLLM_CUDA_TRY_MALLOC_SUCCESS) {
+            const bool ok = fastllm_v41_indexer::Fp4Prefill(q.cudaData,
+                static_cast<const float *>(weights.cudaData), static_cast<const uint8_t *>(k.cudaData),
+                static_cast<float *>(output.cudaData), scratch, q.dims[0], q.dims[1], k.dims[1], ratio, startPos);
+            if (!FastllmCudaFreeAfterCurrentThreadStream(scratch)) {
+                FastllmCudaSyncCurrentThreadStream();
+                FastllmCudaFree(scratch);
+            }
+            return ok;
+        }
+    }
+#endif
+    return FastllmCudaDeepSeekV41IndexerScore(q, weights, k, ratio, startPos, output);
+}
+
 extern "C" bool FastllmCudaDeepSeekV41CandidateBlocks(const fastllm::Data &score, int blockSize, int topkBlocks,
                                                       int ratio, int startPos, fastllm::Data &output) {
     if (!V41OnCuda(score) || score.dims.size() != 3 || score.dataType != DataType::FLOAT32 || blockSize <= 0) {
@@ -5728,8 +5772,12 @@ extern "C" bool FastllmCudaDeepSeekV41IndexerTopK(const fastllm::Data &score, co
     // own persistent hierarchical workspaces. Eager scratch is stream ordered.
     if (m > kTopKParallelMinKeys && width <= 512 && bs <= kTopKShardKeys &&
         (int64_t)bsz * seqlen <= 128 && !FastllmCudaGraphIsCapturing()) {
-        const bool globalTopK = !cand && width == 512 && m >= 65536 &&
-            m <= 1024 * kTopKShardKeys && bsz * seqlen <= 8 &&
+        // Prefill rows also benefit from coarse global filtering. Original FP32
+        // scores decide the final exact selection; ties/overflow retain hierarchy.
+        // Keep masked decode/verification unchanged. Wide masked prefill
+        // batches also favor the shard path because of its lower traffic.
+        const bool globalTopK = width == 512 && m >= 65536 &&
+            (!cand || (bsz * seqlen > 8 && bsz * seqlen <= 64)) && m <= 1024 * kTopKShardKeys &&
             V41MmaKernelReady<V41TopKGlobalFinish<false>, 1024>();
         auto layout = V41TopKLayout(nullptr, bsz * seqlen, m, width, bs, globalTopK);
         void *memory = nullptr;
@@ -6341,12 +6389,13 @@ extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, co
 
     // Reuse the gathered KV across two head groups without changing numerical
     // boundaries. Resource/image checks happen before submission; unsupported
-    // builds and shapes retain the generic MMA path below.
+    // builds and shapes retain the generic MMA path below. The kernel only needs
+    // SM80 BF16 MMA; V41MmaKernelReady also checks the compiled image, thread
+    // limit and opt-in shared memory capacity before enabling it on SM80+.
     if (!legacyAttention && !referenceMath && q.dataType == DataType::BFLOAT16 &&
-        seqlen >= 128 && heads >= 32 && V41IsSm<12, 0>() &&
-        !V41EnvOn("FASTLLM_DSV41_DISABLE_SM120_PREFILL") &&
-        V41MmaKernelReady<V41SparseAttentionSm120PrefillKernel, 512, sizeof(V41Sm120PrefillShared)>()) {
-        V41SparseAttentionSm120PrefillKernel<<<dim3(bsz * seqlen, (heads + 31) / 32), 512, sizeof(V41Sm120PrefillShared)>>>(
+        seqlen >= 128 && heads >= 32 &&
+        V41MmaKernelReady<V41SparseAttentionPrefillSharedKVKernel, 512, sizeof(V41PrefillSharedKV)>()) {
+        V41SparseAttentionPrefillSharedKVKernel<<<dim3(bsz * seqlen, (heads + 31) / 32), 512, sizeof(V41PrefillSharedKV)>>>(
             (const __nv_bfloat16*)q.cudaData, (const __nv_bfloat16*)chunkKV.cudaData,
             hasRing && !ringFp8 ? (const __nv_bfloat16*)ringKV->cudaData : nullptr,
             hasCmp && !cmpFp8 ? (const __nv_bfloat16*)compressedKV->cudaData : nullptr,
@@ -6356,7 +6405,7 @@ extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, co
             (const float*)attnSink.cudaData, seqlen, heads, windowSize, cap, topWidth, startPos,
             softmaxScale, (__nv_bfloat16*)output.cudaData,
             ringMode, ringRowBytes, cmpMode, cmpRowBytes, vecUnpack ? 1 : 0);
-        return V41CheckLaunch("SparseAttentionSm120Prefill");
+        return V41CheckLaunch("SparseAttentionPrefillSharedKV");
     }
     if (FastllmCudaGetThreadError()) return false;
 

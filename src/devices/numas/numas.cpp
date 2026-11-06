@@ -1,3 +1,5 @@
+// Include kernel policy flags before older numaif.h defines policy-name macros.
+#include <linux/mempolicy.h>
 #include "numas.h"
 #include <fstream>
 #include <map>
@@ -90,41 +92,90 @@ namespace fastllm {
         return spreadCpuIds.size() == cpuIds.size() ? spreadCpuIds : cpuIds;
     }
 
-    struct NumaDetector {
-        bool canUseNuma = true;
-
-        NumaDetector () {
-            if (numa_available() != -1) {
-                // Preserve a numactl/taskset mask: the NUMA probe must not
-                // widen the affinity inherited by subsequently created workers.
-                cpu_set_t originalAffinity;
-                if (sched_getaffinity(0, sizeof(originalAffinity), &originalAffinity) != 0) {
-                    canUseNuma = false;
+    namespace {
+        // Snapshot before the shared pool pins its workers. Logical shard ids
+        // must not be confused with physical ids (e.g. numactl --membind=1).
+        struct AllowedNumaTopology {
+            std::vector<int> nodes;
+            std::vector<std::vector<int>> cpus;
+            AllowedNumaTopology() {
+                cpu_set_t affinity;
+                if (sched_getaffinity(0, sizeof(affinity), &affinity) != 0)
+                    throw std::runtime_error("Cannot read inherited CPU affinity");
+                std::vector<int> allowedCpus;
+                for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu)
+                    if (CPU_ISSET(cpu, &affinity)) allowedCpus.push_back(cpu);
+                if (allowedCpus.empty())
+                    throw std::runtime_error("Empty inherited CPU affinity");
+                if (numa_available() < 0) {
+                    nodes.push_back(0);
+                    cpus.push_back(allowedCpus);
                     return;
                 }
-                if (numa_run_on_node(0) == -1) {
-                    std::cerr << "Warning: NUMA node binding failed (non-privileged mode?)" << std::endl;
-                    canUseNuma = false;
+                struct bitmask *allowed = numa_get_mems_allowed();
+                struct bitmask *policyMask = numa_allocate_nodemask();
+                int policy = MPOL_DEFAULT;
+                const bool explicitBind = get_mempolicy(&policy, policyMask->maskp,
+                    policyMask->size, nullptr, 0) == 0 &&
+                    ((policy & ~(MPOL_F_STATIC_NODES | MPOL_F_RELATIVE_NODES)) == MPOL_BIND);
+                int firstMemoryNode = -1;
+                for (int node = 0; node <= numa_max_node(); ++node) {
+                    if (!numa_bitmask_isbitset(numa_all_nodes_ptr, node) ||
+                        (numa_bitmask_weight(allowed) && !numa_bitmask_isbitset(allowed, node)) ||
+                        (explicitBind && !numa_bitmask_isbitset(policyMask, node))) continue;
+                    if (firstMemoryNode < 0) firstMemoryNode = node;
+                    std::vector<int> local;
+                    for (int cpu : allowedCpus)
+                        if (numa_node_of_cpu(cpu) == node) local.push_back(cpu);
+                    if (!local.empty()) {
+                        nodes.push_back(node);
+                        cpus.push_back(std::move(local));
+                    }
                 }
-                if (sched_setaffinity(0, sizeof(originalAffinity), &originalAffinity) != 0) {
-                    throw std::runtime_error("Failed to restore CPU affinity after NUMA probe");
+                numa_free_nodemask(policyMask);
+                numa_free_nodemask(allowed);
+                // A deliberate remote CPU/memory binding still must not widen
+                // the CPU mask or allocate outside the caller's memory policy.
+                if (nodes.empty()) {
+                    if (firstMemoryNode < 0)
+                        throw std::runtime_error("No allowed NUMA memory node");
+                    nodes.push_back(firstMemoryNode);
+                    cpus.push_back(allowedCpus);
                 }
-            } else {
-                canUseNuma = false;
+                const char *value = std::getenv("FT_NUMAS");
+                const int requested = value ? std::atoi(value) : 0;
+                if (requested > 0 && requested < (int)nodes.size()) {
+                    nodes.resize(requested);
+                    cpus.resize(requested);
+                }
             }
+        };
+        const AllowedNumaTopology &GetAllowedNumaTopology() {
+            static const AllowedNumaTopology topology;
+            return topology;
         }
+    }
+
+    int GetNumasPhysicalNode(int logicalNode) {
+        return GetAllowedNumaTopology().nodes.at(logicalNode);
+    }
+
+    struct NumaDetector {
+        // Do not probe by temporarily binding to node 0, or change allocation
+        // provenance after a later worker's affinity/policy failure.
+        const bool canUseNuma = numa_available() >= 0;
     };
     static NumaDetector &GetNumaDetector() {
         static NumaDetector detector;
         return detector;
     }
     bool HostMoeIsUnbound();
-    struct UnboundAllocations {
+    struct PageAlignedAllocations {
         std::mutex mutex;
         std::unordered_map<void *, size_t> mappings;
     };
-    static UnboundAllocations &GetUnboundAllocations() {
-        static auto *allocations = new UnboundAllocations;
+    static PageAlignedAllocations &GetPageAlignedAllocations() {
+        static auto *allocations = new PageAlignedAllocations;
         return *allocations;
     }
     
@@ -144,15 +195,19 @@ namespace fastllm {
         if (numa_node_to_cpus(node_id, node_cpus) != 0) {
             perror("Failed to get NUMA node CPUs");
             numa_free_cpumask(node_cpus);
-            GetNumaDetector().canUseNuma = false;
             return;
         }
 
         cpu_set_t cpuset;
         CPU_ZERO(&cpuset);
     
-        for (unsigned int i = 0; i < node_cpus->size; ++i) {
-            if (numa_bitmask_isbitset(node_cpus, i)) {
+        cpu_set_t inherited;
+        if (sched_getaffinity(0, sizeof(inherited), &inherited) != 0) {
+            numa_free_cpumask(node_cpus);
+            return;
+        }
+        for (unsigned int i = 0; i < node_cpus->size && i < CPU_SETSIZE; ++i) {
+            if (numa_bitmask_isbitset(node_cpus, i) && CPU_ISSET(i, &inherited)) {
                 CPU_SET(i, &cpuset);
             }
         }
@@ -172,7 +227,7 @@ namespace fastllm {
         if (set_mempolicy(policy, mask->maskp, mask->size) == -1) {
             std::cerr << "set_mempolicy failed for node " << node_id 
                     << ": " << errno << " (" << strerror(errno) << ")\n";
-            GetNumaDetector().canUseNuma = false;
+            numa_free_nodemask(mask);
             return;
         }
         numa_free_nodemask(mask);
@@ -209,7 +264,7 @@ namespace fastllm {
             void *ptr = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
             if (ptr == MAP_FAILED) return nullptr;
-            auto &allocations = GetUnboundAllocations();
+            auto &allocations = GetPageAlignedAllocations();
             std::lock_guard<std::mutex> lock(allocations.mutex);
             allocations.mappings.emplace(ptr, bytes);
             return ptr;
@@ -220,7 +275,7 @@ namespace fastllm {
         
         size_t alignment = 64;
         size_t total_size = size + alignment - 1;
-        void* raw_ptr = numa_alloc_onnode(total_size, node);
+        void* raw_ptr = numa_alloc_onnode(total_size, GetNumasPhysicalNode(node));
         if (!raw_ptr) {
             std::cerr << "Failed to allocate " << size << " bytes on NUMA node " << node << std::endl;
 
@@ -232,14 +287,17 @@ namespace fastllm {
             return nullptr;
         }
         
-        uintptr_t addr = reinterpret_cast<uintptr_t>(raw_ptr);
-        uintptr_t aligned_addr = (addr + alignment - 1) & ~(alignment - 1);
-        return reinterpret_cast<void*>(aligned_addr);
+        // libnuma returns a page-aligned mmap. Retain its full length: callers
+        // historically supplied either the payload length or payload + 63.
+        auto &allocations = GetPageAlignedAllocations();
+        std::lock_guard<std::mutex> lock(allocations.mutex);
+        allocations.mappings.emplace(raw_ptr, total_size);
+        return raw_ptr;
     }
 
     void free_aligned_numa(void* aligned_ptr, size_t size) {
         {
-            auto &allocations = GetUnboundAllocations();
+            auto &allocations = GetPageAlignedAllocations();
             std::lock_guard<std::mutex> lock(allocations.mutex);
             auto it = allocations.mappings.find(aligned_ptr);
             if (it != allocations.mappings.end()) {
@@ -287,7 +345,6 @@ namespace fastllm {
             try {
                 // 尝试绑定到NUMA节点
                 try {
-                    bind_to_numa_node(numaId);
                     set_numa_mempolicy(numaId);
                 } catch (const std::exception& e) {
                     std::cerr << "Warning: Failed to bind to NUMA node " << numaId 
@@ -322,106 +379,18 @@ namespace fastllm {
     };
 
     MachineNumaInfo::MachineNumaInfo() {
-        // 检查 NUMA 是否可用
-        if (numa_available() < 0) {
-            // NUMA 不可用，使用默认值
-            numaCnt = 1;
-            threads = 1;
-            cpuIds.resize(1);
-            cpuIds[0].push_back(0);
-            return;
-        }
-        // 获取系统的 NUMA 节点数量
-        int systemNumaNodes = numa_num_configured_nodes();
-        if (systemNumaNodes <= 0) {
-            systemNumaNodes = 1;
-        }
-        // 获取每个 NUMA 节点的物理核心数
-        // 这里我们取第一个 NUMA 节点的核心数作为参考
-        int coresPerNuma = 0;
-        for (int node = 0; node < systemNumaNodes; ++node) {
-            struct bitmask* cpumask = numa_allocate_cpumask();
-            if (numa_node_to_cpus(node, cpumask) == 0) {
-                // 统计该节点上的 CPU 数量
-                int nodeCoreCnt = 0;
-                for (int cpu = 0; cpu < numa_num_configured_cpus(); ++cpu) {
-                    if (numa_bitmask_isbitset(cpumask, cpu)) {
-                        nodeCoreCnt++;
-                    }
-                }
-                if (nodeCoreCnt > coresPerNuma) {
-                    coresPerNuma = nodeCoreCnt;
-                }
-            }
-            numa_free_cpumask(cpumask);
-        }
-        // 如果获取失败，使用默认值
-        if (coresPerNuma <= 0) {
-            coresPerNuma = 1;
-        }
-        // 读取环境变量 FT_NUMAS
-        const char* ftNumas = std::getenv("FT_NUMAS");
-        if (ftNumas != nullptr) {
-            int envNumaCnt = std::atoi(ftNumas);
-            if (envNumaCnt > 0 && envNumaCnt <= systemNumaNodes) {
-                numaCnt = envNumaCnt;
-            } else {
-                numaCnt = systemNumaNodes;
-            }
-        } else {
-            numaCnt = systemNumaNodes;
-        }
-        // 读取环境变量 FT_THREADS
-        const char* ftThreads = std::getenv("FT_THREADS");
-        if (ftThreads != nullptr) {
-            int envThreads = std::atoi(ftThreads);
-            if (envThreads > 0) {
-                threads = envThreads;
-            } else {
-                threads = numaCnt * std::max(1, coresPerNuma / 2 - 2);
-            }
-        } else {
-            if (GetFastllmEnv().numaThreads > 0) {
-                threads = numaCnt * GetFastllmEnv().numaThreads;
-            } else {
-                threads = numaCnt * std::max(1, coresPerNuma / 2 - 2);
-            }
-        }
-
-        // Record the default only; the shared CPU pool is created lazily
-        // after explicit/automatic thread configuration has been applied.
+        const auto &topology = GetAllowedNumaTopology();
+        nodeIds = topology.nodes;
+        cpuIds = topology.cpus;
+        numaCnt = (int)nodeIds.size();
+        int defaultThreads = 0;
+        for (const auto &cpus : cpuIds)
+            defaultThreads += std::max(1, (int)cpus.size() / 2 - 2);
+        const char *ftThreads = std::getenv("FT_THREADS");
+        const int requested = ftThreads ? std::atoi(ftThreads) : 0;
+        threads = requested > 0 ? requested :
+            GetFastllmEnv().numaThreads > 0 ? numaCnt * GetFastllmEnv().numaThreads : defaultThreads;
         SetThreads(threads);
-
-        // 初始化 cpuIds
-        cpuIds.resize(numaCnt);
-        
-        // 收集所有 NUMA 节点的 CPU ID
-        std::vector<std::vector<int>> allNumaCpus(systemNumaNodes);
-        for (int node = 0; node < systemNumaNodes; ++node) {
-            struct bitmask* cpumask = numa_allocate_cpumask();
-            if (numa_node_to_cpus(node, cpumask) == 0) {
-                for (int cpu = 0; cpu < numa_num_configured_cpus(); ++cpu) {
-                    if (numa_bitmask_isbitset(cpumask, cpu)) {
-                        allNumaCpus[node].push_back(cpu);
-                    }
-                }
-            }
-            numa_free_cpumask(cpumask);
-        }
-        // 将 CPU 分配到指定数量的 NUMA 节点
-        if (numaCnt <= systemNumaNodes) {
-            // 直接使用前 numaCnt 个节点的 CPU
-            for (int i = 0; i < numaCnt; ++i) {
-                cpuIds[i] = allNumaCpus[i];
-            }
-        } else {
-            // numaCnt > systemNumaNodes 的情况（理论上不应该发生）
-            // 循环分配
-            for (int i = 0; i < numaCnt; ++i) {
-                int nodeIdx = i % systemNumaNodes;
-                cpuIds[i] = allNumaCpus[nodeIdx];
-            }
-        }
     }
 
     NumaConfig::NumaConfig (int threads, AliveThreadPool *pool, MachineNumaInfo *machineNumaInfo) {
@@ -439,13 +408,13 @@ namespace fastllm {
             if (std::getenv("FASTLLM_NUMAS_DISABLE_LLC_SPREAD") == nullptr) {
                 workerCpuIds = SpreadCpusAcrossLastLevelCaches(workerCpuIds);
             }
-            for (int j = 0; j < per && j < workerCpuIds.size(); j++) {
+            for (int j = 0; j < per; j++) {
                 this->threadIdToNumaDict[threadIdx] = i;
                 this->numaToCpuDict[i].push_back(
-                    std::make_pair(threadIdx++, workerCpuIds[j]));
+                    std::make_pair(threadIdx++, workerCpuIds[j % workerCpuIds.size()]));
                 
                 printf("threadIdx: %d, use cpu %d, bind to numa %d\n",
-                       threadIdx - 1, workerCpuIds[j], i);
+                       threadIdx - 1, workerCpuIds[j % workerCpuIds.size()], machineNumaInfo->nodeIds[i]);
             }
         }
 
@@ -453,7 +422,7 @@ namespace fastllm {
         ops.resize(this->threads);
         for (int i = 0; i < this->numaCnt; i++) {
             for (int j = 0; j < this->numaToCpuDict[i].size(); j++) {
-                ops[this->numaToCpuDict[i][j].first] = new BindCPUOp(this->numaToCpuDict[i][j].second, i);
+                ops[this->numaToCpuDict[i][j].first] = new BindCPUOp(this->numaToCpuDict[i][j].second, machineNumaInfo->nodeIds[i]);
             }
         }
         

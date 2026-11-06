@@ -100,6 +100,9 @@ struct ResidentView {
     size_t workspaceBytes;
 };
 
+template<class View> const void *PreparedQ8Input(const View &) { return nullptr; }
+const void *PreparedQ8Input(const FastllmCudaMoeGGUFCacheView &view) { return view.preparedQ8Input; }
+
 template<class View>
 __device__ __forceinline__ int OriginalRoute(const View &, int route) { return route; }
 __device__ __forceinline__ int OriginalRoute(const FastllmCudaMoeGGUFCacheView &view, int route) {
@@ -128,25 +131,33 @@ __device__ __forceinline__ int NumaType(const FastllmCudaMoeGGUFCacheView &view)
     return IsGate ? view.numaGateType : view.numaDownType;
 }
 
-template<ggml_type Type, int ThreadsPerRow>
+template<ggml_type Type, int ThreadsPerRow, bool ExactWarp = false>
 __device__ __forceinline__ float ProjectionDot(const uint8_t *record,
         int row, size_t rowBytes, int storageType, const block_q8_1 *x,
         int columns, const uint64_t *grid) {
     if constexpr (Type == GGML_TYPE_IQ2_XXS || Type == GGML_TYPE_IQ2_XS ||
                   Type == GGML_TYPE_IQ2_S || Type == GGML_TYPE_IQ3_XXS) {
         if (storageType >= 0 && storageType != Type)
-            return gguf_cache_q8::RowDot<Type, ThreadsPerRow, true>(
+            return gguf_cache_q8::RowDot<Type, ThreadsPerRow, true, ExactWarp>(
                 record + size_t(row/4)*4*rowBytes, x, columns, grid, row%4);
     }
-    return gguf_cache_q8::RowDot<Type, ThreadsPerRow>(
+    return gguf_cache_q8::RowDot<Type, ThreadsPerRow, false, ExactWarp>(
         record + size_t(row)*rowBytes, x, columns, grid);
 }
 
-template<ggml_type Type>
+template<ggml_type Type, int ThreadsPerRow = 32>
 __device__ __forceinline__ float2 ProjectionDotPair(const uint8_t *record,
         int gateRow, int upRow, size_t rowBytes, int storageType,
         const block_q8_1 *x, int columns, const uint64_t *grid) {
     // Keep the packing branch outside the accumulation loop, as in RowDot.
+    if constexpr (ThreadsPerRow == 16) {
+        if (storageType >= 0 && storageType != Type)
+            return gguf_cache_q8::RowDotPairExactWarp16<Type, true>(
+                record + size_t(gateRow/4)*4*rowBytes, record + size_t(upRow/4)*4*rowBytes,
+                x, columns, grid, gateRow%4, upRow%4);
+        return gguf_cache_q8::RowDotPairExactWarp16<Type>(record + size_t(gateRow)*rowBytes,
+            record + size_t(upRow)*rowBytes, x, columns, grid, 0, 0);
+    }
     if (storageType >= 0 && storageType != Type)
         return gguf_cache_q8::RowDotPair<Type, true>(
             record + size_t(gateRow/4)*4*rowBytes, record + size_t(upRow/4)*4*rowBytes,
@@ -193,7 +204,7 @@ __global__ void QuantizeQ8(const T *input, block_q8_1 *output, int columns,
     if (c%32 == 0) q.ds = __floats2half2_rn(scale, sum);
 }
 
-template<ggml_type Type, typename T, bool IsGate, typename View, int ThreadsPerRow = 32>
+template<ggml_type Type, typename T, bool IsGate, typename View, int ThreadsPerRow = 32, bool ExactWarp = false>
 __global__ void Q8Projection(const block_q8_1 *input, T *gate, float *partial,
                             View view, int topk, size_t rowBytes) {
     using F = gguf_cache_q8::Format<Type>;
@@ -218,15 +229,15 @@ __global__ void Q8Projection(const block_q8_1 *input, T *gate, float *partial,
         float up = 0;
         const int upRow = storageType >= 0 ? 2*row+1 : row+view.inter;
         if constexpr (IsGate && (Type == GGML_TYPE_IQ2_S || Type == GGML_TYPE_IQ3_XXS)) {
-            const float2 values = ProjectionDotPair<Type>(record, physicalRow, upRow,
+            const float2 values = ProjectionDotPair<Type, ThreadsPerRow>(record, physicalRow, upRow,
                 rowBytes, storageType, sharedX, columns, grid);
             value = values.x;
             up = values.y;
         } else {
-            value = ProjectionDot<Type, ThreadsPerRow>(record, physicalRow, rowBytes,
+            value = ProjectionDot<Type, ThreadsPerRow, ExactWarp>(record, physicalRow, rowBytes,
                 storageType, sharedX, columns, grid);
             if constexpr (IsGate)
-                up = ProjectionDot<Type, ThreadsPerRow>(record, upRow, rowBytes,
+                up = ProjectionDot<Type, ThreadsPerRow, ExactWarp>(record, upRow, rowBytes,
                     storageType, sharedX, columns, grid);
         }
         if constexpr (IsGate) {
@@ -241,10 +252,35 @@ __global__ void Q8Projection(const block_q8_1 *input, T *gate, float *partial,
     }
 }
 
+template<class View> bool ExactSubwarpEnabled(const View &) { return false; }
+bool ExactSubwarpEnabled(const FastllmCudaMoeGGUFCacheView &view) { return view.exactSubwarp; }
+
+template<ggml_type Type, typename T, typename View>
+void LaunchQ8Gate(const block_q8_1 *input, T *gate, float *partial,
+                  const View &view, int topk, int routes, size_t rowBytes) {
+    if (view.hidden == 2560 && view.inter == 640 && ExactSubwarpEnabled(view)) {
+        Q8Projection<Type, T, true, View, 16, true><<<dim3((view.inter+15)/16, routes), 256,
+            view.hidden/32*sizeof(block_q8_1), cudaStreamPerThread>>>(
+                input, gate, partial, view, topk, rowBytes);
+        return;
+    }
+    Q8Projection<Type, T, true><<<dim3((view.inter+7)/8, routes), 256,
+        view.hidden/32*sizeof(block_q8_1), cudaStreamPerThread>>>(
+            input, gate, partial, view, topk, rowBytes);
+}
+
 template<ggml_type Type, typename T, typename View>
 void LaunchQ8Down(const block_q8_1 *input, T *gate, float *partial,
                   const View &view, int topk, int routes, size_t rowBytes) {
     if constexpr (Type == GGML_TYPE_IQ4_NL || Type == GGML_TYPE_IQ4_XS) {
+        if constexpr (Type == GGML_TYPE_IQ4_NL) {
+            if (view.hidden == 2560 && view.inter == 640 && ExactSubwarpEnabled(view)) {
+                Q8Projection<Type, T, false, View, 8, true><<<dim3((view.hidden+31)/32, routes), 256,
+                    view.inter/32*sizeof(block_q8_1), cudaStreamPerThread>>>(
+                        input, gate, partial, view, topk, rowBytes);
+                return;
+            }
+        }
         if (view.inter <= 1024) {
             Q8Projection<Type, T, false, View, 16><<<dim3((view.hidden+15)/16, routes), 256,
                 view.inter/32*sizeof(block_q8_1), cudaStreamPerThread>>>(
@@ -253,6 +289,12 @@ void LaunchQ8Down(const block_q8_1 *input, T *gate, float *partial,
         }
     }
     if constexpr (Type == GGML_TYPE_Q2_0) {
+        if (view.hidden == 2560 && view.inter == 640 && ExactSubwarpEnabled(view)) {
+            Q8Projection<Type, T, false, View, 8, true><<<dim3((view.hidden+31)/32, routes), 256,
+                view.inter/32*sizeof(block_q8_1), cudaStreamPerThread>>>(
+                    input, gate, partial, view, topk, rowBytes);
+            return;
+        }
         // Eight lanes reproduce the original 32-lane sum for up to sixteen
         // Q8 blocks, and let one CTA cover 32 rather than eight output rows.
         // Select the smaller subgroup for prefill batches. Keep the existing
@@ -384,10 +426,11 @@ bool Compute(const fastllm::Data &input, fastllm::Data &gate, fastllm::Data &out
     const int stages = view.workspace && view.workspaceBytes >= Q8WorkspaceBytes(rows, view.hidden, view.inter, topk)
         ? Q8Stages(view.gateType, view.downType, view.hidden, view.inter, rows) : 0;
     if (!NumaStagesSupported(view, stages)) return false;
-    block_q8_1 *qInput = nullptr, *qGate = nullptr;
+    const block_q8_1 *qInput = nullptr;
+    block_q8_1 *qGate = nullptr;
     float *partial = perExpert;
     if (stages) {
-        qInput = static_cast<block_q8_1 *>(view.workspace);
+        qInput = static_cast<const block_q8_1 *>(PreparedQ8Input(view) ? PreparedQ8Input(view) : view.workspace);
         qGate = reinterpret_cast<block_q8_1 *>(static_cast<uint8_t *>(view.workspace) + Q8Bytes(rows, view.hidden));
         if (!partial)
             partial = reinterpret_cast<float *>(reinterpret_cast<uint8_t *>(qGate) + Q8Bytes(routes, view.inter));
@@ -395,14 +438,13 @@ bool Compute(const fastllm::Data &input, fastllm::Data &gate, fastllm::Data &out
     const auto gateType = static_cast<ggml_type>(view.gateType);
     const auto downType = static_cast<ggml_type>(view.downType);
     if (stages & 1) {
-        if (!q8InputPrepared)
+        if (!q8InputPrepared && !PreparedQ8Input(view))
             QuantizeQ8<<<dim3((view.hidden+255)/256, rows), 256, 0, cudaStreamPerThread>>>(
-                static_cast<const T *>(input.cudaData), qInput, view.hidden);
+                static_cast<const T *>(input.cudaData), static_cast<block_q8_1 *>(view.workspace), view.hidden);
         switch (gateType) {
 #define Q8_GATE(name) case GGML_TYPE_##name: \
-            Q8Projection<GGML_TYPE_##name, T, true><<<dim3((view.inter+7)/8, routes), 256, \
-                view.hidden/32*sizeof(block_q8_1), cudaStreamPerThread>>>(qInput, \
-                static_cast<T *>(gate.cudaData), partial, view, topk, ggml_row_size(gateType, view.hidden)); break;
+            LaunchQ8Gate<GGML_TYPE_##name>(qInput, static_cast<T *>(gate.cudaData), \
+                partial, view, topk, routes, ggml_row_size(gateType, view.hidden)); break;
             GGUF_CACHE_Q8_TYPES(Q8_GATE)
 #undef Q8_GATE
             default: return false;
@@ -586,6 +628,24 @@ size_t FastllmCudaMoeGGUFCacheBatchWorkspaceBytes(int hidden, int inter, int row
     if (rows <= 0 || topk <= 0 || topk > 32 || rows > INT_MAX / topk ||
         !FastllmCudaMoeGGUFCacheWorkspaceBytes(hidden, inter)) return 0;
     return Q8WorkspaceBytes(rows, hidden, inter, topk);
+}
+
+bool FastllmCudaMoeGGUFPrepareQ8Input(const fastllm::Data &input, void *destination, size_t bytes) {
+    if (!destination || input.dataDevice != fastllm::CUDA || !input.cudaData || input.dims.size() != 2 ||
+        input.dims[0] < 1 || input.dims[1] < 1 || input.dims[1] % 32 ||
+        bytes < Q8Bytes(input.dims[0], input.dims[1])) return false;
+    const int rows = input.dims[0], hidden = input.dims[1];
+    auto launch = [&](auto *typed) {
+        QuantizeQ8<<<dim3((hidden+255)/256, rows), 256, 0, cudaStreamPerThread>>>(
+            typed, static_cast<block_q8_1 *>(destination), hidden);
+    };
+    switch (input.dataType) {
+        case fastllm::FLOAT32: launch(static_cast<const float *>(input.cudaData)); break;
+        case fastllm::FLOAT16: launch(static_cast<const half *>(input.cudaData)); break;
+        case fastllm::BFLOAT16: launch(static_cast<const __nv_bfloat16 *>(input.cudaData)); break;
+        default: return false;
+    }
+    return cudaGetLastError() == cudaSuccess;
 }
 
 bool FastllmCudaMoeGGUFCacheQ8Supported(int gateType, int downType, int hidden, int inter) {

@@ -12,6 +12,7 @@
 #include "persistent_worker_group.h"
 #include "utils/hostbufferreclaim.h"
 #include "utils/hybrid_moe.h"
+#include "devices/moe_prefill_policy.h"
 #include "utils/autotune.h"
 
 #include <cstdlib>
@@ -476,7 +477,7 @@ namespace fastllm {
 
         void RecordGpu(int device, int expertCount, double elapsedMs) {
             if (AutotuneRecording()) RecordAutotuneSample("numa_gpu", tuningKey, expertCount, elapsedMs, device);
-            if (device < 0 || expertCount <= 0 || elapsedMs <= 0.0) {
+            if (device < 0 || expertCount <= 0 || !std::isfinite(elapsedMs) || elapsedMs <= 0.0) {
                 return;
             }
             const double sample = elapsedMs / expertCount;
@@ -498,14 +499,27 @@ namespace fastllm {
         }
 
         void RecordCpu(size_t routes, double elapsedMs) {
-            if (routes == 0 || elapsedMs <= 0.0) {
+            if (routes == 0 || !std::isfinite(elapsedMs) || elapsedMs <= 0.0) {
                 return;
             }
             const double sample = elapsedMs / (double)routes;
             std::lock_guard<std::mutex> guard(locker);
+            cpuProbe.ObserveCpu(sample, cpuMsPerRoute);
             cpuMsPerRoute = cpuMsPerRoute <= 0.0 ? sample :
                 cpuMsPerRoute * 0.7 + sample * 0.3;
             cpuSamples++;
+        }
+
+        std::vector<int> SelectCpuProbe(
+                const std::vector<std::vector<std::pair<int, float>>> &expertTasks,
+                Data **weights, int weightsBatch, const std::vector<bool> &residents,
+                int measuredLimit) {
+            std::vector<MoePrefillExpertCost> costs(expertTasks.size(), {0, false});
+            for (int e = 0; e < int(expertTasks.size()); ++e)
+                if (e * 2 < weightsBatch && weights[e * 2])
+                    costs[e] = {int(expertTasks[e].size()), residents[e]};
+            std::lock_guard<std::mutex> guard(locker);
+            return cpuProbe.Select(costs, measuredLimit);
         }
 
         // 用真实层反馈出来的两个系数直接算 makespan 最优的 expertLimit。
@@ -543,6 +557,19 @@ namespace fastllm {
             }
             if (unitCost.empty()) {
                 return 0;
+            }
+
+            if (gpuDevices.size() == 1) {
+                std::vector<MoePrefillExpertCost> costs;
+                costs.reserve(expertTasks.size());
+                for (int e = 0; e < int(expertTasks.size()); ++e)
+                    if (e * 2 < weightsBatch && weights[e * 2] && !expertTasks[e].empty())
+                        costs.push_back({int(expertTasks[e].size()),
+                            !nativePrefill && residents[0][e] != 0});
+                const auto split = PredictSingleGpuPrefillSplit(costs, cpuUnit, unitCost[0]);
+                if (outCpuMs) *outCpuMs = split.cpuMs;
+                if (outGpuMs) *outGpuMs = split.gpuMs;
+                return split.limit;
             }
 
             int bestLimit = 0;
@@ -604,6 +631,7 @@ namespace fastllm {
         std::map<int, int> gpuSamples;
         double cpuMsPerRoute = 0.0;
         int cpuSamples = 0;
+        MoePrefillCpuProbe cpuProbe;
     };
 
     static MachineNumaInfo machineNumaInfo;
@@ -3566,22 +3594,78 @@ namespace fastllm {
                 }
             }
 #endif
-            const bool pinned = std::all_of(arena->pinned.begin(), arena->pinned.end(),
-                                            [](bool value) { return value; });
+            auto allPinned = [](const std::shared_ptr<NumasMoeWeightArena> &owner) {
+                return std::all_of(owner->pinned.begin(), owner->pinned.end(),
+                                   [](bool value) { return value; });
+            };
+            std::vector<std::shared_ptr<NumasMoeWeightArena>> entryArenas(entries.size(), arena);
+            std::vector<size_t> entryOffsets;
+            entryOffsets.reserve(entries.size());
+            for (const Entry &entry : entries) entryOffsets.push_back(entry.offset);
+#ifdef USE_CUDA
+            if (usePinned && !allPinned(arena)) {
+                // A large registration can fail even when smaller registrations
+                // succeed. Split at tensor boundaries: an expert must remain in
+                // one CUDA mapping for its device pointer and DMA source to be
+                // contiguous. Keep the original arena alive until every retry
+                // has copied its bytes; the original source tensors are retired.
+                size_t recovered = 0;
+                std::function<void(size_t, size_t)> retry = [&](size_t begin, size_t end) {
+                    const size_t offset = entries[begin].offset;
+                    const size_t bytes = entries[end - 1].offset +
+                        entries[end - 1].shardBytes - offset;
+                    auto smaller = std::make_shared<NumasMoeWeightArena>(bytes, config->numaCnt);
+                    bool allocated = true;
+                    for (int node = 0; node < config->numaCnt; ++node) {
+                        smaller->nodes[node] = (uint8_t*)allocate_aligned_numa(bytes, node);
+                        if (smaller->nodes[node] == nullptr) { allocated = false; break; }
+                        memcpy(smaller->nodes[node], arena->nodes[node] + offset, bytes);
+                        smaller->pinned[node] = FastllmCudaHostRegister(smaller->nodes[node], bytes);
+                    }
+                    if (allocated && allPinned(smaller)) {
+                        for (size_t i = begin; i < end; ++i) {
+                            entryArenas[i] = smaller;
+                            entryOffsets[i] = entries[i].offset - offset;
+                        }
+                        recovered += end - begin;
+                        return;
+                    }
+                    // Retire partial registrations before trying smaller ranges.
+                    // An unsplittable failure retains the original CPU fallback.
+                    smaller.reset();
+                    if (end - begin > 1) {
+                        const size_t middle = begin + (end - begin) / 2;
+                        retry(begin, middle);
+                        retry(middle, end);
+                    }
+                };
+                if (entries.size() > 1) {
+                    const size_t middle = entries.size() / 2;
+                    retry(0, middle);
+                    retry(middle, entries.size());
+                } else {
+                    retry(0, 1);
+                }
+                printf("NUMA MoE arena registration retry: %zu/%zu weights recovered.\n",
+                       recovered, entries.size());
+            }
+#endif
             {
                 auto &owners = GetNumasMoeWeightArenaOwners();
                 std::lock_guard<std::mutex> guard(owners.mutex);
                 owners.weights.reserve(owners.weights.size() + entries.size());
-                for (const Entry &entry : entries) {
+                for (size_t i = 0; i < entries.size(); ++i) {
+                    const Entry &entry = entries[i];
+                    const auto &owner = entryArenas[i];
                     Data *weight = entry.weight;
                     weight->numasData.resize(config->numaCnt);
-                    owners.weights.emplace(weight, arena);
+                    owners.weights.emplace(weight, owner);
                     for (int node = 0; node < config->numaCnt; ++node) {
-                        weight->numasData[node] = arena->nodes[node] + entry.offset;
+                        weight->numasData[node] = owner->nodes[node] + entryOffsets[i];
                     }
                     weight->numasNVFP4AllScalesFuseMagic = false;
                     weight->expansionBytes = weight->GetBytes();
-                    weight->isPinned = pinned;
+                    weight->isPinned = allPinned(owner);
                 }
             }
             registered = true;
@@ -10458,20 +10542,20 @@ namespace fastllm {
                     if (!FastllmCudaGetMoePrefillResidents(weights, m, view,
                             nativeGlm && (i == 0 || weights[2]->dataType == DATA_GGUF_FORMAT))) continue;
                     if (!view.sharedWeights) {
-                        size_t groupedBytes = 0;
+                        bool groupedSupported = false;
                         if (view.weightType == DATA_GGUF_FORMAT) {
 #ifndef USE_ROCM
-                            if (nativeGlm) groupedBytes = fastllm_gguf_mmq::Glm5GroupedWorkspaceBytes(
-                                view.gateType, view.downType, bs, view.hidden, view.inter, m, topk);
+                            if (nativeGlm) groupedSupported = fastllm_gguf_mmq::Glm5GroupedWorkspaceBytes(
+                                view.gateType, view.downType, bs, view.hidden, view.inter, m, topk) != 0;
                             else if (deepSeekV4Mode && activationQuantBlock == 32)
-                                groupedBytes = FastllmCudaV41GGUFGroupedWorkspaceBytes(
+                                groupedSupported = FastllmCudaV41GGUFStreamedSupported(
                                     view.gateType, view.downType, bs, view.hidden, view.inter, m, topk);
                             else
 #endif
-                            groupedBytes = FastllmCudaMoeGGUFGroupedWorkspaceBytes(view.gateType,
-                                view.downType, bs, view.hidden, view.inter, m, topk);
+                            groupedSupported = FastllmCudaMoeGGUFGroupedWorkspaceBytes(view.gateType,
+                                view.downType, bs, view.hidden, view.inter, m, topk) != 0;
                         }
-                        if (view.weightType == DATA_GGUF_FORMAT ? !groupedBytes : !nativeGlm) continue;
+                        if (view.weightType == DATA_GGUF_FORMAT ? !groupedSupported : !nativeGlm) continue;
                     }
                     cacheOwnerRanks[i] = view.ownerRank;
                     cacheOwnerCounts[i] = view.ownerCount;
@@ -10512,6 +10596,7 @@ namespace fastllm {
                     // cost model, or vice versa.
                     (measuredNativePrefill || measuredV41GGUF) ? bs : 0});
             }
+            std::vector<int> cpuProbeExperts;
             // Respect an explicit FT_EXPERT_LIMIT override and skip the dynamic
             // CPU/GPU expert split benchmark in that case.
             if (gpuPrefill && !hasExpertLimitOverride) {
@@ -10530,10 +10615,13 @@ namespace fastllm {
                             expertTasks, weights, weightsBatch, gpuDevices,
                             2, &predictCpuMs, &predictGpuMs, residentByDevice, measuredNativePrefill);
                     if (measuredLimit <= 0 && !measuredNativePrefill) {
-                        // Sample the two smallest nonresident experts on CPU;
-                        // the remaining experts provide simultaneous GPU data.
+                        // Preserve bootstrap placement; only re-probe a measured
+                        // all-GPU prediction that would otherwise lose CPU feedback.
                         measuredLimit = ComputeNumasMoeProbeExpertLimit(
                             expertTasks, weights, weightsBatch, 2, residentExperts);
+                    } else if (!measuredNativePrefill) {
+                        cpuProbeExperts = speedTracker->SelectCpuProbe(
+                            expertTasks, weights, weightsBatch, residentExperts, measuredLimit);
                     }
                     if (profileDetail) {
                         printf(
@@ -10582,6 +10670,10 @@ namespace fastllm {
                     gpuExperts.insert(e);
                 }
             }
+            for (int e : cpuProbeExperts) {
+                gpuExperts.erase(e);
+                cpuExperts.insert(e);
+            }
             uint8_t *cpuOutputPinned = nullptr;
 #ifdef USE_CUDA
             int gpuId = -1;
@@ -10590,6 +10682,11 @@ namespace fastllm {
             std::vector<std::unique_ptr<Data> > gpuInputAliases;
             std::vector<std::unique_ptr<Data> > gpuOutputPartials;
             std::vector<std::thread> gpuThreads;
+            // Reuse one GPU submitter for any supported single-device host MoE.
+            // The format adapter below retains each model's numerical semantics.
+            const bool persistentPrefill = gpuPrefill &&
+                cudaInputReplicas.size() == 1 && !gpuExperts.empty();
+            std::function<void()> prefillGpuTask;
             void *cpuOutputStaging = nullptr;
             void *cpuOutputCopyStream = nullptr;
             // 每个 assist worker 的归约落地缓冲（在 root 卡上）与完成事件。
@@ -10730,6 +10827,9 @@ namespace fastllm {
                     fflush(stdout);
                 }
 
+                if (persistentPrefill) {
+                    assistPartialEvents[0] = fastllmMoeDataManagerNumas.EnsureAssistPartialReadyEvent(gpuId);
+                }
                 gpuThreads.reserve(gpuWorkerCount);
                 for (int i = 0; i < gpuWorkerCount; i++) {
                     int workerDevice = cudaInputReplicas[i].deviceId;
@@ -10737,8 +10837,7 @@ namespace fastllm {
                     // 的 dims，避免与主线程的 CPU 分支并发访问同一个 Data。
                     const size_t workerInputBytes = input.GetBytes();
                     const size_t workerOutputBytes = outputBytes;
-                    gpuThreads.emplace_back(
-                        [&, i, workerDevice,
+                    auto gpuTask = [&, i, workerDevice,
                          workerInputBytes, workerOutputBytes]() {
                         FastllmCudaSetDevice(workerDevice);
                         // 输入搬运：主线程只分配了副本缓冲，这里在本线程的
@@ -10866,54 +10965,90 @@ namespace fastllm {
                                 assistPartialEvents[i] = nullptr;
                             }
                         }
-                    });
+                        if (persistentPrefill) {
+                            // Native experts may leave the final BF16 cast in
+                            // flight. A finished host task is not GPU completion.
+                            FastllmCudaEventRecordCurrentThread(assistPartialEvents[0]);
+                        }
+                    };
+                    if (persistentPrefill) prefillGpuTask = std::move(gpuTask);
+                    else gpuThreads.emplace_back(std::move(gpuTask));
                 }
             }
             phaseLap(phasePrepMs);
 #endif
-            waitForCpuInput();
-            if (!gpuPrefill || gpuExperts.empty()) {
-                ensureCpuOutput();
-            }
-            if (!cpuExperts.empty()) {
-#ifdef USE_CUDA
-                if (gpuPrefill && !gpuExperts.empty()) {
-                    cpuOutputPinned = fastllmMoeDataManagerNumas.EnsurePinnedOutput(output.GetBytes());
+            auto runCpuPrefill = [&] {
+                waitForCpuInput();
+                if (!gpuPrefill || gpuExperts.empty()) {
+                    ensureCpuOutput();
                 }
-#endif
-                const auto cpuExpertStart = speedTracker
-                    ? std::chrono::steady_clock::now()
-                    : std::chrono::steady_clock::time_point{};
-                DoNumasMergeMOEOnCPU(
-                    input, output, index, score, weights, biass,
-                    sharedScale, weightsBatch, topk, cpuExperts, fastllmMoeDataManagerNumas,
-                    cpuOutputPinned, swigluLimit, deepSeekV4Mode, activationQuantBlock, quantizeSharedExpert
-                );
-                if (speedTracker) {
-                    size_t cpuRoutes = 0;
-                    for (int expert : cpuExperts) {
-                        cpuRoutes += expertTasks[expert].size();
+                if (!cpuExperts.empty()) {
+#ifdef USE_CUDA
+                    if (gpuPrefill && !gpuExperts.empty()) {
+                        cpuOutputPinned = fastllmMoeDataManagerNumas.EnsurePinnedOutput(output.GetBytes());
                     }
-                    speedTracker->RecordCpu(
-                        cpuRoutes,
-                        std::chrono::duration<double, std::milli>(
-                            std::chrono::steady_clock::now() -
-                            cpuExpertStart).count());
-                }
-#ifdef USE_CUDA
-                // CPU partial 直接写入 pinned buffer，再异步搬到复用的 GPU staging buffer。
-                if (gpuPrefill && !gpuExperts.empty() && cpuOutputPinned != nullptr) {
-                    FastllmCudaSetDevice(gpuId);
-                    size_t outputBytes = output.GetBytes();
-                    cpuOutputStaging = fastllmMoeDataManagerNumas.EnsureGpuOutputStaging(outputBytes, gpuId);
-                    cpuOutputCopyStream = fastllmMoeDataManagerNumas.EnsureGpuOutputCopyStream(gpuId);
-                    FastllmCudaCopyFromPinnedHostToDeviceAsync(
-                        cpuOutputStaging, cpuOutputPinned, outputBytes, cpuOutputCopyStream
-                    );
-                }
 #endif
-            }
-            phaseLap(phaseCpuMs);
+                    const auto cpuExpertStart = speedTracker
+                        ? std::chrono::steady_clock::now()
+                        : std::chrono::steady_clock::time_point{};
+                    DoNumasMergeMOEOnCPU(
+                        input, output, index, score, weights, biass,
+                        sharedScale, weightsBatch, topk, cpuExperts, fastllmMoeDataManagerNumas,
+                        cpuOutputPinned, swigluLimit, deepSeekV4Mode, activationQuantBlock, quantizeSharedExpert
+                    );
+                    if (speedTracker) {
+                        size_t cpuRoutes = 0;
+                        for (int expert : cpuExperts) {
+                            cpuRoutes += expertTasks[expert].size();
+                        }
+                        speedTracker->RecordCpu(
+                            cpuRoutes,
+                            std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() -
+                                cpuExpertStart).count());
+                    }
+#ifdef USE_CUDA
+                    // CPU partial 直接写入 pinned buffer，再异步搬到复用的 GPU staging buffer。
+                    if (gpuPrefill && !gpuExperts.empty() && cpuOutputPinned != nullptr) {
+                        FastllmCudaSetDevice(gpuId);
+                        size_t outputBytes = output.GetBytes();
+                        cpuOutputStaging = fastllmMoeDataManagerNumas.EnsureGpuOutputStaging(outputBytes, gpuId);
+                        cpuOutputCopyStream = fastllmMoeDataManagerNumas.EnsureGpuOutputCopyStream(gpuId);
+                        FastllmCudaCopyFromPinnedHostToDeviceAsync(
+                            cpuOutputStaging, cpuOutputPinned, outputBytes, cpuOutputCopyStream
+                        );
+                    }
+#endif
+                }
+                phaseLap(phaseCpuMs);
+            };
+#ifdef USE_CUDA
+            if (persistentPrefill) {
+                // Keep the NUMA pool and its placement context on the caller.
+                // GPU workers retain their per-thread CUDA streams across layers.
+                static thread_local PersistentWorkerGroup prefillWorkers;
+                std::vector<std::exception_ptr> errors(2);
+                prefillWorkers.RunWithCaller({-1, cudaInputReplicas[0].deviceId}, [&](int rank) {
+                    if (rank == 0) runCpuPrefill();
+                    else {
+                        try { prefillGpuTask(); }
+                        catch (...) {
+                            FastllmCudaSetDevice(cudaInputReplicas[0].deviceId);
+                            FastllmCudaSyncCurrentThreadStream();
+                            throw;
+                        }
+                    }
+                }, errors);
+                // Drain both sides before propagating errors: every task borrows
+                // this layer's input, output and routing metadata.
+                for (const auto &error : errors) if (error) {
+                    FastllmCudaSetDevice(cudaInputReplicas[0].deviceId);
+                    FastllmCudaEventSynchronize(assistPartialEvents[0]);
+                    std::rethrow_exception(error);
+                }
+            } else
+#endif
+            runCpuPrefill();
 #ifdef USE_CUDA
             if (gpuPrefill && !gpuExperts.empty()) {
                 // CPU jobs have joined, and the remaining operations use only
@@ -10925,10 +11060,11 @@ namespace fastllm {
                 }
                 phaseLap(phaseJoinMs);
                 FastllmCudaSetDevice(gpuId);
+                if (persistentPrefill) FastllmCudaCurrentThreadStreamWaitEvent(assistPartialEvents[0]);
                 Data gpuOutputAlias(
                     output.dataType, output.dims,
                     DataDevice::CUDA, output.cudaData);
-                const bool pipelineOutput = numasMoePipelineWorkspace >= 0 &&
+                const bool pipelineOutput = (numasMoePipelineWorkspace >= 0 || persistentPrefill) &&
                     gpuOutputPartials.size() == 1;
                 if (cpuOutputStaging != nullptr) {
                     if (pipelineOutput) {

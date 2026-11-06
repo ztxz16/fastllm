@@ -134,12 +134,17 @@ namespace fastllm {
         int acceptedDrafts = -1;      // 采样校验给出接受前缀长度；-1 表示按 greedy token 比较
     };
 
+    struct DeepSeekV41EngramPrefetch;
+
     struct DeepSeekV41RequestState {
         // MLA state is replicated only inside this request's attention TP group.
         int attentionGroup = -1;
         std::vector<std::shared_ptr<DeepSeekV41RequestState>> attentionRanks;
         std::vector<DeepSeekV41LayerCache> layers;
         std::vector<int> engramHistory;   // 每个已处理 token 的压缩 id（图像 token 为 -1）
+        // Known text prompt only; never append speculative tokens to live history.
+        std::vector<int> engramPrompt;
+        std::shared_ptr<DeepSeekV41EngramPrefetch> engramPrefetch;
         int totalLen = 0;
         int restoredLen = 0;              // 由前缀缓存恢复的 token 数（0 表示全新请求）
         // 图文请求：由 OnResponseContextCreated / ForwardMultimodal 记录，首个 prefill 块编码为 imageSpans
@@ -443,7 +448,7 @@ namespace fastllm {
             const Data &positionIds, std::vector<std::pair<Data, Data>> &pastKeyValues,
             const GenerationConfig &generationConfig, const LastTokensManager &lastTokens,
             std::vector<float> *logits, int &outputToken);
-        struct EngramPrefetch;
+        using EngramPrefetch = DeepSeekV41EngramPrefetch;
         struct ForwardWorkspace;
         void RunAttentionParallel(ForwardWorkspace &, int layer);
         void CommitAttentionParallel(DeepSeekV41RequestState &, DeepSeekV41SpecScratch &,

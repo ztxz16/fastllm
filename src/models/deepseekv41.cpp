@@ -1633,9 +1633,10 @@ namespace fastllm {
 
         void V41IndexerScore(const Data &q, const Data &weights, const Data &k, int ratio, int startPos,
                              Data &output) {
+            static const bool disableFakeQuant = V41EnvFlag("FASTLLM_DSV41_DISABLE_FAKE_QUANT");
             V41Executor().Run("DeepSeekV41IndexerScore", {
                 {"q", (Data*)&q}, {"weights", (Data*)&weights}, {"k", (Data*)&k}, {"output", &output}
-            }, {}, {{"compressRatio", ratio}, {"startPos", startPos}});
+            }, {}, {{"compressRatio", ratio}, {"startPos", startPos}, {"fp4Query", !disableFakeQuant}});
         }
 
         void V41CandidateBlocks(const Data &score, int blockSize, int topkBlocks, int ratio, int startPos, Data &output) {
@@ -3333,20 +3334,23 @@ namespace fastllm {
             int startPos = 0;           // 平移后的起点
             int seqlen = 0;
             int offset = 0;             // 在整批里的 token 偏移
+
+            V41EngramSegSnapshot(const std::vector<int> &source, int start, int tokens,
+                                 int maxNgram, int tokenOffset = 0)
+                : seqlen(tokens), offset(tokenOffset) {
+                const int lo = std::max(0, start - maxNgram + 1);
+                const int hi = std::min(int(source.size()), start + tokens);
+                history.assign(source.begin() + lo, source.begin() + std::max(lo, hi));
+                startPos = start - lo;
+            }
         };
 
         std::vector<V41EngramSegSnapshot> V41SnapshotSegments(const std::vector<DeepSeekV41Segment> &segments,
                                                               int maxNgram) {
-            std::vector<V41EngramSegSnapshot> ret(segments.size());
-            for (size_t i = 0; i < segments.size(); i++) {
-                const DeepSeekV41Segment &seg = segments[i];
-                const std::vector<int> &history = seg.state->engramHistory;
-                int lo = std::max(0, seg.startPos - maxNgram + 1);
-                int hi = std::min((int)history.size(), seg.startPos + seg.seqlen);
-                ret[i].history.assign(history.begin() + lo, history.begin() + std::max(lo, hi));
-                ret[i].startPos = seg.startPos - lo;
-                ret[i].seqlen = seg.seqlen;
-                ret[i].offset = seg.offset;
+            std::vector<V41EngramSegSnapshot> ret;
+            ret.reserve(segments.size());
+            for (const auto &seg : segments) {
+                ret.emplace_back(seg.state->engramHistory, seg.startPos, seg.seqlen, maxNgram, seg.offset);
             }
             return ret;
         }
@@ -3429,9 +3433,9 @@ namespace fastllm {
         }
     }
 
-    // Forward-owned: join before snapshots, results or request state can expire.
-    // The immutable history snapshot is reused across this stage's Engram layers.
-    struct DeepSeekV41Model::EngramPrefetch {
+    // Forward/request-owned: join before snapshots or model metadata expire.
+    // At most one future chunk is retained per request.
+    struct DeepSeekV41EngramPrefetch {
         std::thread worker;
         const int endLayer;
         const std::vector<V41EngramSegSnapshot> snapshots;
@@ -3443,7 +3447,11 @@ namespace fastllm {
         std::unique_ptr<Data> gathered;
         std::exception_ptr error;
 
-        EngramPrefetch(int endLayer, std::vector<V41EngramSegSnapshot> snapshots)
+        // Absolute position identifies a future chunk; snapshots also verify its tokens.
+        int startPos = -1;
+        bool lookahead = false;
+
+        DeepSeekV41EngramPrefetch(int endLayer, std::vector<V41EngramSegSnapshot> snapshots)
             : endLayer(endLayer), snapshots(std::move(snapshots)) {}
 
         void Join() {
@@ -3487,7 +3495,7 @@ namespace fastllm {
             });
         }
 
-        ~EngramPrefetch() { Join(); }
+        ~DeepSeekV41EngramPrefetch() { Join(); }
     };
 
     void DeepSeekV41Model::GatherEngramRows(int layer, const std::vector<int64_t> &rows, int tokens,
@@ -3777,6 +3785,32 @@ namespace fastllm {
             }
         }
 
+        // Once the first CPU Engram is consumed, prefetch the next chunk's
+        // first lookup alongside this chunk's later lookup. Starting only after
+        // the last Engram leaves too little lead time for cold disk rows.
+        // One immutable future window per request bounds memory and workers;
+        // live history and verification/rollback semantics remain unchanged.
+        if (tookPrefetched && job->lookahead && segments.size() == 1 && !segments[0].state->engramPrefetch) {
+            auto &state = *segments[0].state;
+            const int nextStart = segments[0].startPos + segments[0].seqlen;
+            const int nextTokens = std::min(std::max(1, GetChunkedPrefillSize()),
+                                           int(state.engramPrompt.size()) - nextStart);
+            if (nextTokens >= V41EngramPrefetchMinTokens) {
+                for (size_t next = 0; next < engram_layer_ids.size() && next < engramTables.size(); ++next) {
+                    if (engram_layer_ids[next] >= job->endLayer) break;
+                    auto table = std::static_pointer_cast<V41EngramTable>(engramTables[next]);
+                    if (!V41CanPrefetchEngramRows(*table)) continue;
+                    std::vector<V41EngramSegSnapshot> snapshots;
+                    snapshots.emplace_back(state.engramPrompt, nextStart, nextTokens, engram_max_ngram_size);
+                    state.engramPrefetch = std::make_shared<EngramPrefetch>(job->endLayer, std::move(snapshots));
+                    state.engramPrefetch->startPos = nextStart;
+                    state.engramPrefetch->Start(int(next), nextTokens, engramMeta,
+                        engram_max_ngram_size, engram_n_heads, table);
+                    break;
+                }
+            }
+        }
+
         // ---- 第二段：查表 + FP8→BF16 ----
         mark = profiling ? V41NowMs() : 0.0;
         Data localGather;
@@ -3851,6 +3885,7 @@ namespace fastllm {
             state.attentionGroup = -1;
             state.layers.clear();
             state.layers.resize(blockCnt);
+            state.engramPrefetch.reset();
             state.engramHistory.clear();
             state.totalLen = 0;
             state.restoredLen = 0;
@@ -3920,6 +3955,16 @@ namespace fastllm {
             }
         }
         RegisterState(key, firstKey, state);
+        state->engramPrefetch.reset();
+        state->engramPrompt.clear();
+        if (context->multimodalInput.empty() && engramMeta.loaded &&
+            V41EnvFlagOn("FASTLLM_DSV41_ENGRAM_PREFETCH")) {
+            state->engramPrompt.reserve(context->allTokens.size());
+            for (int token : context->allTokens) {
+                state->engramPrompt.push_back(token >= 0 && token < int(engramMeta.tokenMap.size()) &&
+                    token != image_token_id ? engramMeta.tokenMap[token] : -1);
+            }
+        }
         // 图文请求：调度器可能只用普通 Forward 逐块 prefill，因此在这里就把多模态输入记到请求状态里，
         // 由第一个 prefill 块编码图像（见 ForwardSegments 的调用方）
         if (!context->multimodalInput.empty()) {
@@ -5128,7 +5173,7 @@ namespace fastllm {
         const LastTokensManager &lastTokens;
         std::vector<std::vector<float>*> *retLogits;
         std::vector<std::pair<Data*, Data*> > &samplingPastKeyValues;
-        std::unique_ptr<EngramPrefetch> engramPrefetch;
+        std::shared_ptr<EngramPrefetch> engramPrefetch;
         std::vector<int> tokenIds;
         int numSegments = 0;
         bool boundedPrefill = false, boundedTailPrepared = false;
@@ -5833,10 +5878,37 @@ namespace fastllm {
                 if (engram_layer_ids[i] < first || engram_layer_ids[i] >= end) continue;
                 auto table = std::static_pointer_cast<V41EngramTable>(engramTables[i]);
                 if (!V41CanPrefetchEngramRows(*table)) continue;
-                f.engramPrefetch.reset(new EngramPrefetch(end,
-                    V41SnapshotSegments(segments, engram_max_ngram_size)));
-                f.engramPrefetch->Start(int(i), seqlen, engramMeta, engram_max_ngram_size,
-                                       engram_n_heads, table);
+                auto snapshots = V41SnapshotSegments(segments, engram_max_ngram_size);
+                // Only scheduled, single-request text prefill knows the next input.
+                // Direct Forward, verification, multimodal and pipeline calls retain
+                // the per-forward fallback and do not predict future token IDs.
+                bool lookahead = segments.size() == 1 && !f.dsparkVerify &&
+                    (!segments[0].spec || (!segments[0].spec->deferWindow && !segments[0].spec->wantAllTokens)) &&
+                    !f.pipeline && !f.prefill && !f.hasImageTokens && !f.inputEmbeds && !f.imageMask;
+                if (lookahead) {
+                    auto &state = *segments[0].state;
+                    auto pending = std::move(state.engramPrefetch);
+                    const int start = segments[0].startPos;
+                    const int lo = start - snapshots[0].startPos;
+                    const int hi = start + seqlen;
+                    lookahead = lo >= 0 && hi <= int(state.engramPrompt.size()) &&
+                        std::equal(snapshots[0].history.begin(), snapshots[0].history.end(),
+                                   state.engramPrompt.begin() + lo);
+                    if (!lookahead) state.engramPrompt.clear();
+                    if (lookahead && pending && pending->startPos == start && pending->total == seqlen &&
+                        pending->engramLayerIndex == int(i) && pending->endLayer == end &&
+                        pending->snapshots.size() == 1 &&
+                        pending->snapshots[0].startPos == snapshots[0].startPos &&
+                        pending->snapshots[0].history == snapshots[0].history) {
+                        f.engramPrefetch = std::move(pending);
+                    }
+                }
+                if (!f.engramPrefetch) {
+                    f.engramPrefetch = std::make_shared<EngramPrefetch>(end, std::move(snapshots));
+                    f.engramPrefetch->Start(int(i), seqlen, engramMeta, engram_max_ngram_size,
+                                           engram_n_heads, table);
+                }
+                f.engramPrefetch->lookahead = lookahead;
                 break;
             }
         }

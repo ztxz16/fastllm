@@ -25,6 +25,7 @@ namespace fastllm {
         if (device >= 0) {
             FastllmCudaSetDevice(device);
         }
+        hybridFullGraphs.clear();
         for (auto &item : segments) {
             Segment &segment = item.second;
             if (segment.exec != nullptr) {
@@ -56,6 +57,7 @@ namespace fastllm {
             FastllmCudaSetDevice(device);
         }
 #endif
+        pleEmbedding.FreeSpace();
         hiddenStates[0].FreeSpace();
         hiddenStates[1].FreeSpace();
         hybridBoundaries.clear();
@@ -109,13 +111,415 @@ namespace fastllm {
 #endif
     }
 
+
+#ifdef USE_CUDA
+    bool Qwen4ExpModel::RunFullAttentionGraph(
+            int layer, const std::string &attention, const Data &input,
+            Data &pastKey, Data &pastValue, RequestState &requestState,
+            DecodeCudaGraphState *graphState, int device, int wholeGraphSparseWidth,
+            bool wholeDenseGraph, bool mtpTargetGraph,
+            TargetVerificationCapture *verificationCapture, Data &output) {
+        const std::string indexer = attention + "indexer.";
+        constexpr int batch = 1;
+        const int sequence = input.dims[1];
+        const int ratio = this->indexerCompressRatio;
+        const int32_t *decodeMeta =
+            reinterpret_cast<const int32_t *>(graphState->decodeMeta.cudaData);
+
+        auto tailKeysIt = requestState.indexerTailKeyTensors.find(layer);
+        auto tailPositionsIt = requestState.indexerTailPositionTensors.find(layer);
+        auto blockCacheIt = requestState.indexerBlockKeyTensors.find(layer);
+        auto scoreWorkspaceIt = graphState->qsaScoreWorkspaces.find(layer);
+        auto selectedWorkspaceIt = graphState->qsaSelectedWorkspaces.find(layer);
+        if (decodeMeta == nullptr || tailKeysIt == requestState.indexerTailKeyTensors.end() ||
+            tailPositionsIt == requestState.indexerTailPositionTensors.end() ||
+            blockCacheIt == requestState.indexerBlockKeyTensors.end() ||
+            scoreWorkspaceIt == graphState->qsaScoreWorkspaces.end() ||
+            selectedWorkspaceIt == graphState->qsaSelectedWorkspaces.end() ||
+            tailKeysIt->second == nullptr || tailPositionsIt->second == nullptr ||
+            blockCacheIt->second == nullptr) {
+            return false;
+        }
+        Data &tailKeys = *tailKeysIt->second;
+        Data &tailPositions = *tailPositionsIt->second;
+        Data &blockCache = *blockCacheIt->second;
+        Data &scoreWorkspace = scoreWorkspaceIt->second;
+        Data &selectedWorkspace = selectedWorkspaceIt->second;
+
+        Data typedInput, projected, indexQuery, currentRawKeys;
+        ToDataType(input, typedInput, this->dataType);
+        const int qsaParallelRegion = (1 << 20) + layer;
+        const bool parallelQsa = mtpTargetGraph;
+        if (parallelQsa) {
+            FastllmCudaGraphMarkParallelFork(qsaParallelRegion);
+        }
+        Linear(typedInput, this->weight[indexer + "index_qk_proj.weight"], Data(), projected);
+        const int queryColumns = this->indexerHeads * this->indexerHeadDim;
+        Split(projected, -1, 0, queryColumns, indexQuery);
+        Split(projected, -1, queryColumns,
+              queryColumns + this->indexerKvHeads * this->indexerHeadDim, currentRawKeys);
+        indexQuery.Reshape({batch, sequence, this->indexerHeads, this->indexerHeadDim});
+        currentRawKeys.Reshape({batch, sequence, this->indexerHeadDim});
+        RMSNorm(indexQuery, this->weight[indexer + "q_layernorm.weight"], this->rms_norm_eps,
+                indexQuery);
+        RopeEncoding(indexQuery, graphState->positionIds, this->rotary_dim, this->rope_base,
+                     1.0f, true);
+
+        Data currentKeysFloat;
+        ToDataType(currentRawKeys, currentKeysFloat, DataType::FLOAT32);
+        currentKeysFloat.Reshape({sequence, this->indexerHeadDim});
+        if (verificationCapture != nullptr) {
+            Data &rawKeyCapture = verificationCapture->qsaRawKeys[layer];
+            if (rawKeyCapture.dataDevice != DataDevice::CUDA ||
+                rawKeyCapture.cudaData == nullptr ||
+                rawKeyCapture.dataType != DataType::FLOAT32 ||
+                rawKeyCapture.dims != currentKeysFloat.dims ||
+                !FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(
+                    rawKeyCapture.cudaData, currentKeysFloat.cudaData,
+                    currentKeysFloat.GetBytes())) {
+                return false;
+            }
+        }
+
+        Data tailKeysFixed, tailPositionsFixed;
+        Qwen4BorrowCudaStorage(tailKeysFixed, tailKeys);
+        Qwen4BorrowCudaStorage(tailPositionsFixed, tailPositions);
+        tailKeysFixed.Resize({ratio, this->indexerHeadDim});
+        tailPositionsFixed.Resize({ratio});
+
+        // Append each graph row in causal order. The graph topology is
+        // fixed; the device-side base length selects the tail slot and
+        // conditionally commits completed groups. Keep all per-row views
+        // and work tensors alive until the QSA/attention join below.
+        const bool fusedCompress = sequence > 0 && sequence <= ratio && ratio == 4 &&
+                                   this->indexerHeadDim == 128 && this->rotary_dim == 64;
+        if (fusedCompress) {
+            // Short draft warmup may not have completed its first QSA group;
+            // eager attention has therefore never uploaded this norm yet.
+            this->weight[indexer + "k_layernorm.weight"].ToDevice(CUDA, std::vector<int>{device});
+            const bool compressed = FastllmCudaQwen4QSAAppendCompress4Graph(
+                currentKeysFloat, graphState->positionIds,
+                this->weight[indexer + "k_layernorm.weight"], this->rope_base, decodeMeta,
+                tailKeys, tailPositions, blockCache, this->rms_norm_eps);
+            if (!compressed) {
+                return false;
+            }
+        } else {
+            std::vector<Data> tokenKeys(sequence);
+            std::vector<Data> tokenPositions(sequence);
+            std::vector<Data> pooledKeys(sequence);
+            std::vector<Data> averagedKeys(sequence);
+            std::vector<Data> normalizedKeys(sequence);
+            std::vector<Data> firstPositions(sequence);
+            std::vector<Data> memberKeys(sequence * std::max(0, ratio - 1));
+            for (int token = 0; token < sequence; token++) {
+                Data &tokenKey = tokenKeys[token];
+                Data &tokenPosition = tokenPositions[token];
+                Split(currentKeysFloat, 0, token, token + 1, tokenKey);
+                Split(graphState->positionIds, 1, token, token + 1, tokenPosition);
+                tokenKey.Reshape({1, this->indexerHeadDim});
+                tokenPosition.Reshape({1});
+                if (!FastllmCudaQwen4QSAAppendGraph(tokenKey, tokenPosition, decodeMeta, token,
+                                                    ratio, tailKeys, tailPositions)) {
+                    return false;
+                }
+                // Preserve the established float32 pooling/RMSNorm/RoPE
+                // arithmetic.
+                Data &pooled = pooledKeys[token];
+                Split(tailKeysFixed, 0, 0, 1, pooled);
+                pooled.Reshape({1, this->indexerHeadDim});
+                for (int member = 1; member < ratio; member++) {
+                    Data &memberKey = memberKeys[token * (ratio - 1) + member - 1];
+                    Split(tailKeysFixed, 0, member, member + 1, memberKey);
+                    memberKey.Reshape({1, this->indexerHeadDim});
+                    AddTo(pooled, memberKey);
+                }
+                Data &averaged = averagedKeys[token];
+                Data &normalized = normalizedKeys[token];
+                Mul(pooled, 1.0f / (float)ratio, averaged);
+                RMSNorm(averaged, this->weight[indexer + "k_layernorm.weight"],
+                        this->rms_norm_eps, normalized);
+                Data &firstPosition = firstPositions[token];
+                Split(tailPositionsFixed, 0, 0, 1, firstPosition);
+                firstPosition.Reshape({1, 1});
+                normalized.Reshape({1, 1, 1, this->indexerHeadDim});
+                RopeEncoding(normalized, firstPosition, this->rotary_dim, this->rope_base, 1.0f,
+                             true);
+                normalized.Reshape({1, this->indexerHeadDim});
+                if (!FastllmCudaQwen4QSACommitGraph(normalized, decodeMeta, token, ratio,
+                                                    blockCache)) {
+                    return false;
+                }
+            }
+        }
+
+        Data qsaIndices(DataType::INT32, {sequence, wholeGraphSparseWidth});
+        if (wholeDenseGraph) {
+            // The graph uses fixed-capacity storage and masks positions
+            // beyond the device-side logical length. Preserve dense key
+            // order; padding must never become a visible zero key.
+            Qwen4BorrowCudaStorage(qsaIndices,
+                                   graphState->denseIndices.at(wholeGraphSparseWidth));
+        } else {
+            qsaIndices.ToDevice(DataDevice::CUDA, std::vector<int>({device}));
+            qsaIndices.Allocate(false);
+        }
+        if (!wholeDenseGraph &&
+            !FastllmCudaQwen4QSASelectGraph(indexQuery, blockCache, decodeMeta, scoreWorkspace,
+                                            selectedWorkspace, qsaIndices, this->indexerHeads,
+                                            this->indexerHeadDim, this->indexerBudget, ratio)) {
+            return false;
+        }
+        if (parallelQsa) {
+            FastllmCudaGraphMarkParallelFirstDone(qsaParallelRegion);
+            FastllmCudaGraphMarkParallelSecondBegin(qsaParallelRegion);
+        }
+
+        Data qGate, query, key, value, gate;
+        const Data *projectionWeights[] = {&this->weight[attention + "q_proj.weight"],
+                                           &this->weight[attention + "k_proj.weight"],
+                                           &this->weight[attention + "v_proj.weight"]};
+        Data *projectionOutputs[] = {&qGate, &key, &value};
+        const bool fusedProjections =
+            (sequence == 1 || qwen4MtpDecodeEquivalentTarget) &&
+            Qwen4TryExactCudaMultiLinear(typedInput, projectionWeights, projectionOutputs, 3);
+        if (!fusedProjections) {
+            Linear(typedInput, this->weight[attention + "q_proj.weight"], Data(), qGate);
+            Linear(typedInput, this->weight[attention + "k_proj.weight"], Data(), key);
+            Linear(typedInput, this->weight[attention + "v_proj.weight"], Data(), value);
+        }
+        qGate.Reshape({batch, sequence, -1, this->head_dim * 2});
+        Split(qGate, -1, 0, this->head_dim, query);
+        Split(qGate, -1, this->head_dim, this->head_dim * 2, gate);
+        gate.Reshape({batch, sequence, -1});
+        key.Reshape({batch, sequence, -1, this->head_dim});
+        value.Reshape({batch, sequence, -1, this->head_dim});
+        RMSNorm(query, this->weight[attention + "q_norm.weight"], this->rms_norm_eps, query);
+        RMSNorm(key, this->weight[attention + "k_norm.weight"], this->rms_norm_eps, key);
+        RopeEncoding(query, graphState->positionIds, this->rotary_dim, this->rope_base, 1.0f,
+                     true);
+        RopeEncoding(key, graphState->positionIds, this->rotary_dim, this->rope_base, 1.0f,
+                     true);
+        PermuteSelf(query, {0, 2, 1, 3});
+        PermuteSelf(key, {0, 2, 1, 3});
+        PermuteSelf(value, {0, 2, 1, 3});
+        query.Reshape({-1, sequence, this->head_dim});
+        key.Reshape({-1, sequence, this->head_dim});
+        value.Reshape({-1, sequence, this->head_dim});
+        if (!FastllmCudaQwen4KVAppendGraph(key, value, decodeMeta, pastKey, pastValue)) {
+            return false;
+        }
+        if (parallelQsa) {
+            FastllmCudaGraphMarkParallelJoin(qsaParallelRegion);
+        }
+
+        Data context;
+        const int attentionGroup = query.dims[0] / pastKey.dims[0];
+        const float attentionScale = 1.0f / std::sqrt((float)this->head_dim);
+        const bool sparseDecode =
+            sequence == 1 && !wholeDenseGraph &&
+            FastllmCudaQwen4SparseDecode(query, pastKey, pastValue, qsaIndices, context,
+                                         attentionGroup, attentionScale, decodeMeta);
+        if (!sparseDecode && sequence == 1 && !wholeDenseGraph) {
+            Data compactKey(key.dataType,
+                            {pastKey.dims[0], wholeGraphSparseWidth, this->head_dim});
+            Data compactValue(value.dataType,
+                              {pastValue.dims[0], wholeGraphSparseWidth, this->head_dim});
+            compactKey.ToDevice(DataDevice::CUDA, std::vector<int>({device}));
+            compactValue.ToDevice(DataDevice::CUDA, std::vector<int>({device}));
+            compactKey.Allocate(false);
+            compactValue.Allocate(false);
+            if (!FastllmCudaQwen4GatherKVGraph(pastKey, pastValue, qsaIndices, decodeMeta,
+                                               compactKey, compactValue)) {
+                return false;
+            }
+            Attention(query, compactKey, compactValue, Data(), context, attentionGroup,
+                      attentionScale, 1);
+        } else if (!sparseDecode) {
+            const int queryHeads = query.dims[0];
+            const int keyHeads = pastKey.dims[0];
+            Data packedQuery(query.dataType, {sequence * queryHeads, 1, this->head_dim});
+            Data compactKey(key.dataType,
+                            {sequence * keyHeads, wholeGraphSparseWidth, this->head_dim});
+            Data compactValue(value.dataType,
+                              {sequence * keyHeads, wholeGraphSparseWidth, this->head_dim});
+            Data paddingMask(query.dataType, {sequence, 1, wholeGraphSparseWidth});
+            Data packedOutput(query.dataType, {sequence * queryHeads, 1, this->head_dim});
+            context.dataType = query.dataType;
+            context.UpdateUnitSize();
+            context.Resize({queryHeads, sequence, this->head_dim});
+            for (Data *workspace :
+                 std::vector<Data *>({&packedQuery, &compactKey, &compactValue, &paddingMask,
+                                      &packedOutput, &context})) {
+                workspace->ToDevice(DataDevice::CUDA, std::vector<int>({device}), false);
+                workspace->Allocate(false);
+            }
+            if (!FastllmCudaQwen4PrepareSparseBatchGraph(
+                    query, pastKey, pastValue, qsaIndices, decodeMeta, sequence, packedQuery,
+                    compactKey, compactValue, paddingMask, 0, sequence)) {
+                return false;
+            }
+            Attention(packedQuery, compactKey, compactValue, paddingMask, packedOutput,
+                      attentionGroup, attentionScale, 1);
+            if (!FastllmCudaQwen4UnpackSparseBatch(packedOutput, context, 0, sequence)) {
+                return false;
+            }
+        }
+        Data gatedContext;
+        const bool fusedOutput = FastllmCudaQwen4AttentionOutput(context, gate, gatedContext);
+        if (!fusedOutput) {
+            PermuteSelf(context, {1, 0, 2});
+            context.Reshape({sequence, batch, -1});
+            PermuteSelf(context, {1, 0, 2});
+            SigmoidMulTo(context, gate);
+        }
+        Linear(fusedOutput ? gatedContext : context, this->weight[attention + "o_proj.weight"],
+               Data(), output);
+        ThreadTpAllReduce(output);
+        return true;
+    }
+
+    bool Qwen4ExpModel::PrepareFullAttentionGraphStorage(
+            int layer, Data &pastKey, Data &pastValue, RequestState &requestState,
+            int graphSequence, int device, TargetVerificationCapture *verificationCapture,
+            std::vector<uint64_t> &fullCacheSignature) {
+        auto appendSignature = [&](const void *pointer, int capacity, uint64_t stride) {
+            fullCacheSignature.push_back((uint64_t)(uintptr_t)pointer);
+            fullCacheSignature.push_back((uint64_t)capacity);
+            fullCacheSignature.push_back(stride);
+        };
+        auto sameCudaDevice = [&](const Data &data) {
+            return data.dataDevice == DataDevice::CUDA && data.cudaData != nullptr &&
+                   (data.dataDeviceIds.empty() || data.dataDeviceIds[0] == device);
+        };
+        auto prepareFixedTail = [&](std::shared_ptr<Data> &cache,
+                                    const std::vector<int> &logicalDims,
+                                    const std::vector<int> &capacityDims) {
+            if (cache == nullptr) {
+                cache = std::make_shared<Data>(DataType::FLOAT32, logicalDims);
+                cache->ToDevice(DataDevice::CUDA, std::vector<int>({device}));
+            }
+            const bool cudaMetadataMatches =
+                cache->dataDevice == DataDevice::CUDA &&
+                (cache->dataDeviceIds.empty() || cache->dataDeviceIds[0] == device);
+            if (!cudaMetadataMatches || cache->dataType != DataType::FLOAT32 ||
+                cache->dims != logicalDims) {
+                return false;
+            }
+            bool needsGrowth =
+                cache->cudaData == nullptr || cache->expansionDims.size() != capacityDims.size();
+            if (!needsGrowth) {
+                for (int axis = 0; axis < (int)capacityDims.size(); axis++) {
+                    if (cache->expansionDims[axis] < capacityDims[axis]) {
+                        needsGrowth = true;
+                        break;
+                    }
+                }
+            }
+            if (needsGrowth) {
+                if (logicalDims[0] == 0) {
+                    // A restored empty tail may own compact storage. There
+                    // are no rows to preserve; avoid the strided copy used
+                    // when growing a nonempty cache.
+                    cache->FreeSpace();
+                }
+                cache->Expansion(capacityDims);
+            }
+            return sameCudaDevice(*cache);
+        };
+
+        if (!sameCudaDevice(pastKey) || !sameCudaDevice(pastValue) ||
+            pastKey.dims.size() != 3 || pastValue.dims != pastKey.dims ||
+            pastKey.dataType != pastValue.dataType || pastKey.dims[0] <= 0 ||
+            pastKey.dims[2] != this->head_dim || pastKey.strides.size() != 3 ||
+            pastValue.strides.size() != 3) {
+            return false;
+        }
+        const int previousLength = pastKey.dims[1];
+
+        Data appendShape(pastKey.dataType,
+                         {pastKey.dims[0], graphSequence, pastKey.dims[2]});
+        const bool geometricGrowth =
+            requestState.geometricCacheGrowthReadyLayers.count(layer) != 0;
+        Qwen4EnsureAppendCapacity(pastKey, appendShape, 1, 128, kQwen4DenseCacheMaxGrowth,
+                                  geometricGrowth);
+        Qwen4EnsureAppendCapacity(pastValue, appendShape, 1, 128, kQwen4DenseCacheMaxGrowth,
+                                  geometricGrowth);
+        if (!sameCudaDevice(pastKey) || !sameCudaDevice(pastValue)) {
+            return false;
+        }
+
+        const int ratio = this->indexerCompressRatio;
+        const int oldTailCount = previousLength % ratio;
+        const int oldBlocks = previousLength / ratio;
+        std::shared_ptr<Data> &tailKeys = requestState.indexerTailKeyTensors[layer];
+        std::shared_ptr<Data> &tailPositions =
+            requestState.indexerTailPositionTensors[layer];
+        std::shared_ptr<Data> &blockCache = requestState.indexerBlockKeyTensors[layer];
+        if (!prepareFixedTail(tailKeys, {oldTailCount, this->indexerHeadDim},
+                              {ratio, this->indexerHeadDim}) ||
+            !prepareFixedTail(tailPositions, {oldTailCount}, {ratio}) ||
+            blockCache == nullptr || !sameCudaDevice(*blockCache) ||
+            blockCache->dataType != DataType::FLOAT32 ||
+            blockCache->dims != std::vector<int>({oldBlocks, this->indexerHeadDim})) {
+            return false;
+        }
+
+        const int kvCapacity =
+            std::min(Qwen4AxisCapacity(pastKey, 1), Qwen4AxisCapacity(pastValue, 1));
+        const int blockCapacity = std::max(oldBlocks, (kvCapacity + ratio - 1) / ratio);
+        if (Qwen4AxisCapacity(*blockCache, 0) < blockCapacity) {
+            blockCache->Expansion({blockCapacity, this->indexerHeadDim});
+        }
+
+        std::vector<float> &rawKeys = requestState.indexerRawKeys[layer];
+        std::vector<float> &positions = requestState.indexerPositions[layer];
+        std::shared_ptr<QsaHostMirrorTransfer> &hostTransfer =
+            GetQsaHostMirror(requestState, layer);
+        hostTransfer->Prepare(rawKeys, positions, previousLength - oldTailCount,
+                              this->indexerHeadDim);
+
+        if (verificationCapture) {
+            Data &rawKeyCapture = verificationCapture->qsaRawKeys[layer];
+            if (!Qwen4PrepareDecodeGraphWorkspace(rawKeyCapture, DataType::FLOAT32,
+                                                  {graphSequence, this->indexerHeadDim},
+                                                  device)) {
+                return false;
+            }
+            // Reservation is not a captured QSA append. Keep the
+            // logical history empty until the whole graph is chosen;
+            // segmented/eager attention appends its own rows.
+            rawKeyCapture.expansionDims = rawKeyCapture.dims;
+            rawKeyCapture.Resize({0, this->indexerHeadDim});
+            appendSignature(rawKeyCapture.cudaData, graphSequence,
+                            rawKeyCapture.strides[0]);
+        }
+
+        appendSignature(pastKey.cudaData, Qwen4AxisCapacity(pastKey, 1),
+                        pastKey.strides[0]);
+        appendSignature(pastValue.cudaData, Qwen4AxisCapacity(pastValue, 1),
+                        pastValue.strides[0]);
+        if (Qwen4IsPagedKV(pastKey)) {
+            appendSignature(pastKey.pagedKVCacheData->cudaData, pastKey.pageLen, 0);
+            appendSignature(pastValue.pagedKVCacheData->cudaData, pastValue.pageLen, 0);
+        }
+        appendSignature(tailKeys->cudaData, Qwen4AxisCapacity(*tailKeys, 0),
+                        tailKeys->strides[0]);
+        appendSignature(tailPositions->cudaData, Qwen4AxisCapacity(*tailPositions, 0),
+                        tailPositions->strides[0]);
+        appendSignature(blockCache->cudaData, Qwen4AxisCapacity(*blockCache, 0),
+                        blockCache->strides[0]);
+        return true;
+    }
+#endif
+
     bool Qwen4ExpModel::TryRunDecodeCudaGraphBackbone(
         ExecutionMode graphMode, int graphStartLayer, bool startBeforeAttention,
         const Data &hiddenStates, const Data &attentionOutput, const Data &attentionInjection,
         const Data &attentionMask, const Data &positionIds, bool qsaDeviceCompatibleMask,
         std::vector<std::pair<Data, Data>> &pastKeyValues, RequestState &requestState, Data &logits,
         Data *targetMultiHidden, TargetVerificationCapture *verificationCapture, int graphEndLayer,
-        Data *stageOutput) {
+        Data *stageOutput, Data *pleEmbedding) {
 #ifndef USE_CUDA
         return false;
 #else
@@ -126,7 +530,7 @@ namespace fastllm {
             graphEndLayer > this->block_cnt ||
             (boundedStage &&
              (!startBeforeAttention || stageOutput == nullptr ||
-              (graphStartLayer < this->pleLayer && graphEndLayer > this->pleLayer)))) {
+              (graphStartLayer < this->pleLayer && graphEndLayer > this->pleLayer && !pleEmbedding)))) {
             return false;
         }
         int firstFullAttentionLayer = this->kvCacheId;
@@ -150,8 +554,8 @@ namespace fastllm {
                                 ? GpuDecodeGraphPolicy()
                                 : HybridDecodeGraphPolicy(hiddenStates, mtpTargetGraph);
         const bool hybridDenseGraph = policy.hybridDense;
-        // Host decisions and NUMA execution cannot be captured in the full
-        // backbone graph, including multi-row MTP verification.
+        // Hybrid policy selects CUDA dense segments plus mailbox graph nodes
+        // for NUMA experts, including multi-row MTP verification.
         if (!GetFastllmEnv().cudaGraph || (boundedStage && !hybridDenseGraph) ||
             (hybridDenseGraph && !startBeforeAttention) || !supportedStart ||
             hiddenStates.dims.size() != 3 || hiddenStates.dims[0] != 1 ||
@@ -227,6 +631,11 @@ namespace fastllm {
             } else {
                 graphState = entry.get();
             }
+            if (pleEmbedding) {
+                auto &variant = graphState->pleHistories[requestState.pleConvHistoryIndex];
+                if (!variant) variant = std::make_unique<DecodeCudaGraphState>();
+                graphState = variant.get();
+            }
             if (mtpTargetGraph) {
                 auto &variant = graphState->verifierLengths[hiddenStates.dims[1]];
                 if (!variant)
@@ -268,45 +677,6 @@ namespace fastllm {
             fullCacheSignature.push_back((uint64_t)capacity);
             fullCacheSignature.push_back(stride);
         };
-        auto sameCudaDevice = [&](const Data &data) {
-            return data.dataDevice == DataDevice::CUDA && data.cudaData != nullptr &&
-                   (data.dataDeviceIds.empty() || data.dataDeviceIds[0] == device);
-        };
-        auto prepareFixedTail = [&](std::shared_ptr<Data> &cache,
-                                    const std::vector<int> &logicalDims,
-                                    const std::vector<int> &capacityDims) {
-            if (cache == nullptr) {
-                cache = std::make_shared<Data>(DataType::FLOAT32, logicalDims);
-                cache->ToDevice(DataDevice::CUDA, std::vector<int>({device}));
-            }
-            const bool cudaMetadataMatches =
-                cache->dataDevice == DataDevice::CUDA &&
-                (cache->dataDeviceIds.empty() || cache->dataDeviceIds[0] == device);
-            if (!cudaMetadataMatches || cache->dataType != DataType::FLOAT32 ||
-                cache->dims != logicalDims) {
-                return false;
-            }
-            bool needsGrowth =
-                cache->cudaData == nullptr || cache->expansionDims.size() != capacityDims.size();
-            if (!needsGrowth) {
-                for (int axis = 0; axis < (int)capacityDims.size(); axis++) {
-                    if (cache->expansionDims[axis] < capacityDims[axis]) {
-                        needsGrowth = true;
-                        break;
-                    }
-                }
-            }
-            if (needsGrowth) {
-                if (logicalDims[0] == 0) {
-                    // A restored empty tail may own compact storage. There
-                    // are no rows to preserve; avoid the strided copy used
-                    // when growing a nonempty cache.
-                    cache->FreeSpace();
-                }
-                cache->Expansion(capacityDims);
-            }
-            return sameCudaDevice(*cache);
-        };
 
         if (wholeGraphReady) {
             for (int layer = fullAttentionCacheStartLayer; layer < graphEndLayer; layer++) {
@@ -316,106 +686,33 @@ namespace fastllm {
                 graphFullLayerCount++;
                 Data &pastKey = pastKeyValues[layer].first;
                 Data &pastValue = pastKeyValues[layer].second;
-                if (!sameCudaDevice(pastKey) || !sameCudaDevice(pastValue) ||
-                    pastKey.dims.size() != 3 || pastValue.dims != pastKey.dims ||
-                    pastKey.dataType != pastValue.dataType || pastKey.dims[0] <= 0 ||
-                    pastKey.dims[2] != this->head_dim || pastKey.strides.size() != 3 ||
-                    pastValue.strides.size() != 3) {
+                if (!PrepareFullAttentionGraphStorage(layer, pastKey, pastValue,
+                        requestState, graphSequence, device, mtpTargetGraph ? verificationCapture : nullptr,
+                        fullCacheSignature)) {
                     wholeGraphReady = false;
                     break;
                 }
                 const int previousLength = pastKey.dims[1];
-                if (decodePreviousLength < 0) {
-                    decodePreviousLength = previousLength;
-                } else if (decodePreviousLength != previousLength) {
+                if (decodePreviousLength >= 0 && decodePreviousLength != previousLength) {
                     wholeGraphReady = false;
                     break;
                 }
-
-                Data appendShape(pastKey.dataType,
-                                 {pastKey.dims[0], graphSequence, pastKey.dims[2]});
-                const bool geometricGrowth =
-                    requestState.geometricCacheGrowthReadyLayers.count(layer) != 0;
-                Qwen4EnsureAppendCapacity(pastKey, appendShape, 1, 128, kQwen4DenseCacheMaxGrowth,
-                                          geometricGrowth);
-                Qwen4EnsureAppendCapacity(pastValue, appendShape, 1, 128, kQwen4DenseCacheMaxGrowth,
-                                          geometricGrowth);
-                if (!sameCudaDevice(pastKey) || !sameCudaDevice(pastValue)) {
-                    wholeGraphReady = false;
-                    break;
-                }
-
-                const int ratio = this->indexerCompressRatio;
-                const int oldTailCount = previousLength % ratio;
-                const int oldBlocks = previousLength / ratio;
-                std::shared_ptr<Data> &tailKeys = requestState.indexerTailKeyTensors[layer];
-                std::shared_ptr<Data> &tailPositions =
-                    requestState.indexerTailPositionTensors[layer];
-                std::shared_ptr<Data> &blockCache = requestState.indexerBlockKeyTensors[layer];
-                if (!prepareFixedTail(tailKeys, {oldTailCount, this->indexerHeadDim},
-                                      {ratio, this->indexerHeadDim}) ||
-                    !prepareFixedTail(tailPositions, {oldTailCount}, {ratio}) ||
-                    blockCache == nullptr || !sameCudaDevice(*blockCache) ||
-                    blockCache->dataType != DataType::FLOAT32 ||
-                    blockCache->dims != std::vector<int>({oldBlocks, this->indexerHeadDim})) {
-                    wholeGraphReady = false;
-                    break;
-                }
-
-                const int kvCapacity =
-                    std::min(Qwen4AxisCapacity(pastKey, 1), Qwen4AxisCapacity(pastValue, 1));
-                const int blockCapacity = std::max(oldBlocks, (kvCapacity + ratio - 1) / ratio);
-                if (Qwen4AxisCapacity(*blockCache, 0) < blockCapacity) {
-                    blockCache->Expansion({blockCapacity, this->indexerHeadDim});
-                }
-
-                std::vector<float> &rawKeys = requestState.indexerRawKeys[layer];
-                std::vector<float> &positions = requestState.indexerPositions[layer];
-                std::shared_ptr<QsaHostMirrorTransfer> &hostTransfer =
-                    GetQsaHostMirror(requestState, layer);
-                hostTransfer->Prepare(rawKeys, positions, previousLength - oldTailCount,
-                                      this->indexerHeadDim);
-
-                if (mtpTargetGraph) {
-                    Data &rawKeyCapture = verificationCapture->qsaRawKeys[layer];
-                    if (!Qwen4PrepareDecodeGraphWorkspace(rawKeyCapture, DataType::FLOAT32,
-                                                          {graphSequence, this->indexerHeadDim},
-                                                          device)) {
-                        wholeGraphReady = false;
-                        break;
-                    }
-                    // Reservation is not a captured QSA append. Keep the
-                    // logical history empty until the whole graph is chosen;
-                    // segmented/eager attention appends its own rows.
-                    rawKeyCapture.expansionDims = rawKeyCapture.dims;
-                    rawKeyCapture.Resize({0, this->indexerHeadDim});
-                    appendSignature(rawKeyCapture.cudaData, graphSequence,
-                                    rawKeyCapture.strides[0]);
-                }
-
-                appendSignature(pastKey.cudaData, Qwen4AxisCapacity(pastKey, 1),
-                                pastKey.strides[0]);
-                appendSignature(pastValue.cudaData, Qwen4AxisCapacity(pastValue, 1),
-                                pastValue.strides[0]);
-                if (Qwen4IsPagedKV(pastKey)) {
-                    appendSignature(pastKey.pagedKVCacheData->cudaData, pastKey.pageLen, 0);
-                    appendSignature(pastValue.pagedKVCacheData->cudaData, pastValue.pageLen, 0);
-                }
-                appendSignature(tailKeys->cudaData, Qwen4AxisCapacity(*tailKeys, 0),
-                                tailKeys->strides[0]);
-                appendSignature(tailPositions->cudaData, Qwen4AxisCapacity(*tailPositions, 0),
-                                tailPositions->strides[0]);
-                appendSignature(blockCache->cudaData, Qwen4AxisCapacity(*blockCache, 0),
-                                blockCache->strides[0]);
+                decodePreviousLength = previousLength;
             }
         }
         const bool linearOnlyStage =
             boundedStage && graphFullLayerCount == 0 && firstFullAttentionLayer == graphEndLayer;
-        const bool wholeDenseGraph = (threadTpRank >= 0 || boundedStage) && !linearOnlyStage &&
+        const bool fullHybrid = hybridDenseGraph && UseFullHybridGraph();
+        const bool wholeDenseGraph = (threadTpRank >= 0 || boundedStage || fullHybrid) && !linearOnlyStage &&
                                      (graphSequence == 1 || mtpTargetGraph) &&
                                      decodePreviousLength < this->indexerBudget;
+        const int denseWidth = !wholeDenseGraph ? 0 : fullHybrid
+            ? Qwen4DenseGraphWidth(decodePreviousLength + graphSequence,
+                                  indexerBudget + indexerCompressRatio - 1)
+            : requestState.denseGraphWidth > 0 ? requestState.denseGraphWidth
+            : Qwen4AxisCapacity(pastKeyValues[fullAttentionCacheStartLayer].first, 1);
         const bool hybridEagerAttention =
-            hybridDenseGraph && (wholeDenseGraph || preserveVerifierAttention);
+            hybridDenseGraph && !fullHybrid && (wholeDenseGraph || preserveVerifierAttention);
         wholeGraphReady =
             wholeGraphReady &&
             (linearOnlyStage || (graphFullLayerCount > 0 &&
@@ -428,6 +725,14 @@ namespace fastllm {
             return false;
         }
 
+        // Dense padding and sparse selection use different kernels/widths.
+        // A request crossing the QSA threshold must invalidate its children.
+        if (fullHybrid) {
+            fullCacheSignature.push_back(wholeDenseGraph);
+            if (wholeDenseGraph)
+                fullCacheSignature.push_back(denseWidth);
+        }
+
         // Keep a request on its original graph topology. Switching a live
         // request from segmented graphs to the whole-backbone graph changes
         // the full-attention execution path at the sparse threshold and can
@@ -435,7 +740,7 @@ namespace fastllm {
         // threshold during generation therefore retain the established
         // segmented path; requests that start at or above it use the whole
         // graph from their first decode token.
-        if (threadTpRank < 0 && !boundedStage && wholeGraphReady && !graphState->segments.empty() &&
+        if (!fullHybrid && threadTpRank < 0 && !boundedStage && wholeGraphReady && !graphState->segments.empty() &&
             !graphState->wholeGraphMode) {
             wholeGraphReady = false;
         }
@@ -456,6 +761,14 @@ namespace fastllm {
                     appendSignature(
                         verificationCapture->runtimeCheckpoint->linearSecond[layer].cudaData, 0, 0);
                 }
+            }
+        }
+        fullCacheSignature.push_back(pleEmbedding != nullptr);
+        if (pleEmbedding) {
+            for (auto &history : requestState.pleConvHistoryTensors) {
+                if (!history || history->dataDevice != CUDA || !history->cudaData ||
+                    history->dataDeviceIds != std::vector<int>{device}) return false;
+                appendSignature(history->cudaData, history->Count(0), requestState.pleConvHistoryIndex);
             }
         }
         const bool resetGraph =
@@ -489,6 +802,10 @@ namespace fastllm {
             (wholeGraphReady &&
              !Qwen4PrepareDecodeGraphTensor(graphState->positionIds, positionIds, device))) {
             return false;
+        }
+        if (pleEmbedding) {
+            pleEmbedding->ToDevice(CUDA, std::vector<int>{device});
+            if (!Qwen4PrepareDecodeGraphTensor(graphState->pleEmbedding, *pleEmbedding, device)) return false;
         }
         if (mtpTargetGraph) {
             // PLE may finish its CPU-offloaded ngram result on a transfer
@@ -526,10 +843,7 @@ namespace fastllm {
             const int selectedBlocks =
                 wholeDenseGraph ? 1 : this->indexerBudget / this->indexerCompressRatio;
             if (wholeDenseGraph) {
-                const int width =
-                    requestState.denseGraphWidth > 0
-                        ? requestState.denseGraphWidth
-                        : Qwen4AxisCapacity(pastKeyValues[fullAttentionCacheStartLayer].first, 1);
+                const int width = denseWidth;
                 Data &indicesData = graphState->denseIndices[width];
                 if (indicesData.cudaData == nullptr) {
                     if (!Qwen4PrepareDecodeGraphWorkspace(indicesData, DataType::INT32,
@@ -613,271 +927,17 @@ namespace fastllm {
                             : 0;
         const int wholeGraphSparseWidth =
             wholeDenseGraph && wholeGraphReady
-                ? (requestState.denseGraphWidth > 0
-                       ? requestState.denseGraphWidth
-                       : Qwen4AxisCapacity(pastKeyValues[fullAttentionCacheStartLayer].first, 1))
+                ? denseWidth
                 : this->indexerBudget +
                       (mtpTargetGraph ? this->indexerCompressRatio - 1 : wholeGraphRemainder);
 
         auto runFullAttentionGraph = [&](int layer, const Data &input, Data &pastKey,
                                          Data &pastValue, Data &output) -> bool {
-            const std::string attention =
-                languagePrefix + "layers." + std::to_string(layer) + ".self_attn.";
-            const std::string indexer = attention + "indexer.";
-            constexpr int batch = 1;
-            const int sequence = graphSequence;
-            const int ratio = this->indexerCompressRatio;
-            const int32_t *decodeMeta =
-                reinterpret_cast<const int32_t *>(graphState->decodeMeta.cudaData);
-
-            auto tailKeysIt = requestState.indexerTailKeyTensors.find(layer);
-            auto tailPositionsIt = requestState.indexerTailPositionTensors.find(layer);
-            auto blockCacheIt = requestState.indexerBlockKeyTensors.find(layer);
-            auto scoreWorkspaceIt = graphState->qsaScoreWorkspaces.find(layer);
-            auto selectedWorkspaceIt = graphState->qsaSelectedWorkspaces.find(layer);
-            if (decodeMeta == nullptr || tailKeysIt == requestState.indexerTailKeyTensors.end() ||
-                tailPositionsIt == requestState.indexerTailPositionTensors.end() ||
-                blockCacheIt == requestState.indexerBlockKeyTensors.end() ||
-                scoreWorkspaceIt == graphState->qsaScoreWorkspaces.end() ||
-                selectedWorkspaceIt == graphState->qsaSelectedWorkspaces.end() ||
-                tailKeysIt->second == nullptr || tailPositionsIt->second == nullptr ||
-                blockCacheIt->second == nullptr) {
-                return false;
-            }
-            Data &tailKeys = *tailKeysIt->second;
-            Data &tailPositions = *tailPositionsIt->second;
-            Data &blockCache = *blockCacheIt->second;
-            Data &scoreWorkspace = scoreWorkspaceIt->second;
-            Data &selectedWorkspace = selectedWorkspaceIt->second;
-
-            Data typedInput, projected, indexQuery, currentRawKeys;
-            ToDataType(input, typedInput, this->dataType);
-            const int qsaParallelRegion = (1 << 20) + layer;
-            const bool parallelQsa = mtpTargetGraph;
-            if (parallelQsa) {
-                FastllmCudaGraphMarkParallelFork(qsaParallelRegion);
-            }
-            Linear(typedInput, this->weight[indexer + "index_qk_proj.weight"], Data(), projected);
-            const int queryColumns = this->indexerHeads * this->indexerHeadDim;
-            Split(projected, -1, 0, queryColumns, indexQuery);
-            Split(projected, -1, queryColumns,
-                  queryColumns + this->indexerKvHeads * this->indexerHeadDim, currentRawKeys);
-            indexQuery.Reshape({batch, sequence, this->indexerHeads, this->indexerHeadDim});
-            currentRawKeys.Reshape({batch, sequence, this->indexerHeadDim});
-            RMSNorm(indexQuery, this->weight[indexer + "q_layernorm.weight"], this->rms_norm_eps,
-                    indexQuery);
-            RopeEncoding(indexQuery, graphState->positionIds, this->rotary_dim, this->rope_base,
-                         1.0f, true);
-
-            Data currentKeysFloat;
-            ToDataType(currentRawKeys, currentKeysFloat, DataType::FLOAT32);
-            currentKeysFloat.Reshape({sequence, this->indexerHeadDim});
-            if (verificationCapture != nullptr) {
-                Data &rawKeyCapture = verificationCapture->qsaRawKeys[layer];
-                if (rawKeyCapture.dataDevice != DataDevice::CUDA ||
-                    rawKeyCapture.cudaData == nullptr ||
-                    rawKeyCapture.dataType != DataType::FLOAT32 ||
-                    rawKeyCapture.dims != currentKeysFloat.dims ||
-                    !FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(
-                        rawKeyCapture.cudaData, currentKeysFloat.cudaData,
-                        currentKeysFloat.GetBytes())) {
-                    return false;
-                }
-            }
-
-            Data tailKeysFixed, tailPositionsFixed;
-            Qwen4BorrowCudaStorage(tailKeysFixed, tailKeys);
-            Qwen4BorrowCudaStorage(tailPositionsFixed, tailPositions);
-            tailKeysFixed.Resize({ratio, this->indexerHeadDim});
-            tailPositionsFixed.Resize({ratio});
-
-            // Append each graph row in causal order. The graph topology is
-            // fixed; the device-side base length selects the tail slot and
-            // conditionally commits completed groups. Keep all per-row views
-            // and work tensors alive until the QSA/attention join below.
-            const bool fusedCompress = sequence > 0 && sequence <= ratio && ratio == 4 &&
-                                       this->indexerHeadDim == 128 && this->rotary_dim == 64;
-            if (fusedCompress) {
-                const bool compressed = FastllmCudaQwen4QSAAppendCompress4Graph(
-                    currentKeysFloat, graphState->positionIds,
-                    this->weight[indexer + "k_layernorm.weight"], this->rope_base, decodeMeta,
-                    tailKeys, tailPositions, blockCache, this->rms_norm_eps);
-                if (!compressed) {
-                    return false;
-                }
-            } else {
-                std::vector<Data> tokenKeys(sequence);
-                std::vector<Data> tokenPositions(sequence);
-                std::vector<Data> pooledKeys(sequence);
-                std::vector<Data> averagedKeys(sequence);
-                std::vector<Data> normalizedKeys(sequence);
-                std::vector<Data> firstPositions(sequence);
-                std::vector<Data> memberKeys(sequence * std::max(0, ratio - 1));
-                for (int token = 0; token < sequence; token++) {
-                    Data &tokenKey = tokenKeys[token];
-                    Data &tokenPosition = tokenPositions[token];
-                    Split(currentKeysFloat, 0, token, token + 1, tokenKey);
-                    Split(graphState->positionIds, 1, token, token + 1, tokenPosition);
-                    tokenKey.Reshape({1, this->indexerHeadDim});
-                    tokenPosition.Reshape({1});
-                    if (!FastllmCudaQwen4QSAAppendGraph(tokenKey, tokenPosition, decodeMeta, token,
-                                                        ratio, tailKeys, tailPositions)) {
-                        return false;
-                    }
-                    // Preserve the established float32 pooling/RMSNorm/RoPE
-                    // arithmetic.
-                    Data &pooled = pooledKeys[token];
-                    Split(tailKeysFixed, 0, 0, 1, pooled);
-                    pooled.Reshape({1, this->indexerHeadDim});
-                    for (int member = 1; member < ratio; member++) {
-                        Data &memberKey = memberKeys[token * (ratio - 1) + member - 1];
-                        Split(tailKeysFixed, 0, member, member + 1, memberKey);
-                        memberKey.Reshape({1, this->indexerHeadDim});
-                        AddTo(pooled, memberKey);
-                    }
-                    Data &averaged = averagedKeys[token];
-                    Data &normalized = normalizedKeys[token];
-                    Mul(pooled, 1.0f / (float)ratio, averaged);
-                    RMSNorm(averaged, this->weight[indexer + "k_layernorm.weight"],
-                            this->rms_norm_eps, normalized);
-                    Data &firstPosition = firstPositions[token];
-                    Split(tailPositionsFixed, 0, 0, 1, firstPosition);
-                    firstPosition.Reshape({1, 1});
-                    normalized.Reshape({1, 1, 1, this->indexerHeadDim});
-                    RopeEncoding(normalized, firstPosition, this->rotary_dim, this->rope_base, 1.0f,
-                                 true);
-                    normalized.Reshape({1, this->indexerHeadDim});
-                    if (!FastllmCudaQwen4QSACommitGraph(normalized, decodeMeta, token, ratio,
-                                                        blockCache)) {
-                        return false;
-                    }
-                }
-            }
-
-            Data qsaIndices(DataType::INT32, {sequence, wholeGraphSparseWidth});
-            if (wholeDenseGraph) {
-                // The graph uses fixed-capacity storage and masks positions
-                // beyond the device-side logical length. Preserve dense key
-                // order; padding must never become a visible zero key.
-                Qwen4BorrowCudaStorage(qsaIndices,
-                                       graphState->denseIndices.at(wholeGraphSparseWidth));
-            } else {
-                qsaIndices.ToDevice(DataDevice::CUDA, std::vector<int>({device}));
-                qsaIndices.Allocate(false);
-            }
-            if (!wholeDenseGraph &&
-                !FastllmCudaQwen4QSASelectGraph(indexQuery, blockCache, decodeMeta, scoreWorkspace,
-                                                selectedWorkspace, qsaIndices, this->indexerHeads,
-                                                this->indexerHeadDim, this->indexerBudget, ratio)) {
-                return false;
-            }
-            if (parallelQsa) {
-                FastllmCudaGraphMarkParallelFirstDone(qsaParallelRegion);
-                FastllmCudaGraphMarkParallelSecondBegin(qsaParallelRegion);
-            }
-
-            Data qGate, query, key, value, gate;
-            const Data *projectionWeights[] = {&this->weight[attention + "q_proj.weight"],
-                                               &this->weight[attention + "k_proj.weight"],
-                                               &this->weight[attention + "v_proj.weight"]};
-            Data *projectionOutputs[] = {&qGate, &key, &value};
-            const bool fusedProjections =
-                (sequence == 1 || qwen4MtpDecodeEquivalentTarget) &&
-                Qwen4TryExactCudaMultiLinear(typedInput, projectionWeights, projectionOutputs, 3);
-            if (!fusedProjections) {
-                Linear(typedInput, this->weight[attention + "q_proj.weight"], Data(), qGate);
-                Linear(typedInput, this->weight[attention + "k_proj.weight"], Data(), key);
-                Linear(typedInput, this->weight[attention + "v_proj.weight"], Data(), value);
-            }
-            qGate.Reshape({batch, sequence, -1, this->head_dim * 2});
-            Split(qGate, -1, 0, this->head_dim, query);
-            Split(qGate, -1, this->head_dim, this->head_dim * 2, gate);
-            gate.Reshape({batch, sequence, -1});
-            key.Reshape({batch, sequence, -1, this->head_dim});
-            value.Reshape({batch, sequence, -1, this->head_dim});
-            RMSNorm(query, this->weight[attention + "q_norm.weight"], this->rms_norm_eps, query);
-            RMSNorm(key, this->weight[attention + "k_norm.weight"], this->rms_norm_eps, key);
-            RopeEncoding(query, graphState->positionIds, this->rotary_dim, this->rope_base, 1.0f,
-                         true);
-            RopeEncoding(key, graphState->positionIds, this->rotary_dim, this->rope_base, 1.0f,
-                         true);
-            PermuteSelf(query, {0, 2, 1, 3});
-            PermuteSelf(key, {0, 2, 1, 3});
-            PermuteSelf(value, {0, 2, 1, 3});
-            query.Reshape({-1, sequence, this->head_dim});
-            key.Reshape({-1, sequence, this->head_dim});
-            value.Reshape({-1, sequence, this->head_dim});
-            if (!FastllmCudaQwen4KVAppendGraph(key, value, decodeMeta, pastKey, pastValue)) {
-                return false;
-            }
-            if (parallelQsa) {
-                FastllmCudaGraphMarkParallelJoin(qsaParallelRegion);
-            }
-
-            Data context;
-            const int attentionGroup = query.dims[0] / pastKey.dims[0];
-            const float attentionScale = 1.0f / std::sqrt((float)this->head_dim);
-            const bool sparseDecode =
-                sequence == 1 && !wholeDenseGraph &&
-                FastllmCudaQwen4SparseDecode(query, pastKey, pastValue, qsaIndices, context,
-                                             attentionGroup, attentionScale, decodeMeta);
-            if (!sparseDecode && sequence == 1 && !wholeDenseGraph) {
-                Data compactKey(key.dataType,
-                                {pastKey.dims[0], wholeGraphSparseWidth, this->head_dim});
-                Data compactValue(value.dataType,
-                                  {pastValue.dims[0], wholeGraphSparseWidth, this->head_dim});
-                compactKey.ToDevice(DataDevice::CUDA, std::vector<int>({device}));
-                compactValue.ToDevice(DataDevice::CUDA, std::vector<int>({device}));
-                compactKey.Allocate(false);
-                compactValue.Allocate(false);
-                if (!FastllmCudaQwen4GatherKVGraph(pastKey, pastValue, qsaIndices, decodeMeta,
-                                                   compactKey, compactValue)) {
-                    return false;
-                }
-                Attention(query, compactKey, compactValue, Data(), context, attentionGroup,
-                          attentionScale, 1);
-            } else if (!sparseDecode) {
-                const int queryHeads = query.dims[0];
-                const int keyHeads = pastKey.dims[0];
-                Data packedQuery(query.dataType, {sequence * queryHeads, 1, this->head_dim});
-                Data compactKey(key.dataType,
-                                {sequence * keyHeads, wholeGraphSparseWidth, this->head_dim});
-                Data compactValue(value.dataType,
-                                  {sequence * keyHeads, wholeGraphSparseWidth, this->head_dim});
-                Data paddingMask(query.dataType, {sequence, 1, wholeGraphSparseWidth});
-                Data packedOutput(query.dataType, {sequence * queryHeads, 1, this->head_dim});
-                context.dataType = query.dataType;
-                context.UpdateUnitSize();
-                context.Resize({queryHeads, sequence, this->head_dim});
-                for (Data *workspace :
-                     std::vector<Data *>({&packedQuery, &compactKey, &compactValue, &paddingMask,
-                                          &packedOutput, &context})) {
-                    workspace->ToDevice(DataDevice::CUDA, std::vector<int>({device}), false);
-                    workspace->Allocate(false);
-                }
-                if (!FastllmCudaQwen4PrepareSparseBatchGraph(
-                        query, pastKey, pastValue, qsaIndices, decodeMeta, sequence, packedQuery,
-                        compactKey, compactValue, paddingMask, 0, sequence)) {
-                    return false;
-                }
-                Attention(packedQuery, compactKey, compactValue, paddingMask, packedOutput,
-                          attentionGroup, attentionScale, 1);
-                if (!FastllmCudaQwen4UnpackSparseBatch(packedOutput, context, 0, sequence)) {
-                    return false;
-                }
-            }
-            Data gatedContext;
-            const bool fusedOutput = FastllmCudaQwen4AttentionOutput(context, gate, gatedContext);
-            if (!fusedOutput) {
-                PermuteSelf(context, {1, 0, 2});
-                context.Reshape({sequence, batch, -1});
-                PermuteSelf(context, {1, 0, 2});
-                SigmoidMulTo(context, gate);
-            }
-            Linear(fusedOutput ? gatedContext : context, this->weight[attention + "o_proj.weight"],
-                   Data(), output);
-            ThreadTpAllReduce(output);
-            return true;
+            return RunFullAttentionGraph(layer,
+                languagePrefix + "layers." + std::to_string(layer) + ".self_attn.",
+                input, pastKey, pastValue, requestState, graphState, device,
+                wholeGraphSparseWidth, wholeDenseGraph, mtpTargetGraph,
+                verificationCapture, output);
         };
 
         int capturesAttempted = 0;
@@ -888,9 +948,14 @@ namespace fastllm {
         // Honor the same startup budget on every rank; serving requests
         // still take the frozen/eager branch before attempting any capture.
         const bool prepareReusableTp = threadTpRank >= 0 && requestState.reusableGraphRequest;
+        // A hybrid backbone has a dense and a shared segment per layer,
+        // plus QSA remainders. One capture per token can outlast an entire
+        // response; allow a full hybrid stage to capture within a few tokens.
+        const bool prepareReusableHybrid = threadTpRank < 0 && hybridDenseGraph &&
+                                           requestState.reusableGraphRequest;
         const int captureBudget = threadTpRank >= 0 && !prepareReusableTp ? 1 :
             (captureBudgetEnv ? std::max(1, std::min(128, std::atoi(captureBudgetEnv)))
-                              : (prepareReusableTp ? 8 : 1));
+                              : (fullHybrid ? 128 : prepareReusableTp || prepareReusableHybrid ? 8 : 1));
         auto runCapturedSegment = [&](int segmentKey, const auto &runBody) {
             DecodeCudaGraphState::Segment &segment = graphState->segments[segmentKey];
             FastllmCudaSetDevice(device);
@@ -917,8 +982,9 @@ namespace fastllm {
                 return;
             }
 
-            // Serving requests only replay the shapes captured by the first
-            // request. An unseen or invalidated shape stays eager thereafter.
+            // Frozen serving strategies only replay their first request's
+            // shapes. Single-device hybrid slots can complete partial captures
+            // across requests; pointer/capacity changes still reset them above.
             if (requestState.decodeGraphsFrozen) {
                 runBody();
                 return;
@@ -1206,6 +1272,10 @@ namespace fastllm {
                 destination.FreeSpace();
                 Qwen4BorrowCudaStorage(destination, source);
             };
+            if (pleEmbedding) {
+                publish(callerVerification->pleInput, verificationCapture->pleInput);
+                publish(callerVerification->pleNormalized, verificationCapture->pleNormalized);
+            }
             for (int layer = graphStartLayer; layer < graphEndLayer; ++layer) {
                 if (this->IsLinearAttentionLayer(layer)) {
                     publish(callerVerification->linearConvInputs[layer],

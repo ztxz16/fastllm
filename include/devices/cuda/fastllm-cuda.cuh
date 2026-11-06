@@ -212,6 +212,7 @@ void FastllmCudaEventDestroy(void *event);
 void FastllmCudaEventRecord(void *event, void *stream = nullptr);
 void FastllmCudaEventRecordCurrentThread(void *event);
 void FastllmCudaEventSynchronize(void *event);
+bool FastllmCudaEventComplete(void *event);
 float FastllmCudaEventElapsedTime(void *start, void *end);
 void FastllmCudaStreamWaitEvent(void *stream, void *event);
 void FastllmCudaCurrentThreadStreamWaitEvent(void *event);
@@ -604,6 +605,10 @@ bool FastllmCudaMLAPagedBatch(const fastllm::Data &qNope, const fastllm::Data &q
         const std::vector<const fastllm::Data*> &physicalTokenIndices,
         fastllm::Data &output, float softmaxScale);
 
+bool FastllmCudaGGUFEmbedding(const fastllm::Data &input, const fastllm::Data &weight, fastllm::Data &output);
+// Write repeated packed embedding rows to caller-provided FLOAT32 CUDA storage.
+bool FastllmCudaGGUFEmbeddingRepeat(const fastllm::Data &input, const fastllm::Data &weight,
+                                   fastllm::Data &output, int repeats);
 bool FastllmCudaEmbedding(const fastllm::Data &input, const fastllm::Data &weight, fastllm::Data &output);
 bool FastllmCudaEmbeddingDirect(const fastllm::Data &input, const fastllm::Data &weight, fastllm::Data &output);
 bool FastllmCudaAttention(const fastllm::Data &q, const fastllm::Data &k, const fastllm::Data &v,
@@ -922,6 +927,14 @@ bool FastllmCudaQwen4SparsePrefill(
     const fastllm::Data &query, const fastllm::Data &key,
     const fastllm::Data &value, const fastllm::Data &indices,
     fastllm::Data &output, int groups, float scale);
+
+// Causal QSA indices are unique per row. Select the attention implementation
+// for the early queries independently of the enclosing projection/MoE batch.
+bool FastllmCudaQwen4CausalPrefill(
+    const fastllm::Data &query, const fastllm::Data &key,
+    const fastllm::Data &value, const fastllm::Data &indices,
+    fastllm::Data &output, int groups, float scale, int previousLength,
+    int denseContextLimit);
 
 bool FastllmCudaQwen4PrepareSparseBatch(
         const fastllm::Data &query, const fastllm::Data &key,
@@ -1966,6 +1979,7 @@ struct FastllmCudaMoeCacheLayer {
     // PP cache placement only; -1 permits every device. Expert-distributed
     // execution supplies its own ownership and does not use this restriction.
     int cacheDevice = -1;
+    bool qwen38FlashNext = false; // Explicit caller profile; Standard arithmetic.
 };
 // One anchor plus up to eight speculative tokens. Larger prefill batches
 // keep using the configured MoE backend.
@@ -1989,6 +2003,7 @@ bool FastllmCudaPrepareMoeCacheWithBudgets(
         const FastllmCudaMoeCacheLayer *layers, int layerCount,
         const std::function<void()> &registerNumaWeights, bool allowStreaming,
         const std::map<int, uint64_t> &deviceBudgets, bool fullyResident);
+bool FastllmCudaMoeCacheIsQwen38(fastllm::Data **weights, int weightsBatch);
 bool FastllmCudaCanRunMoeCache(
         fastllm::Data **weights, int weightsBatch);
 
@@ -2002,6 +2017,7 @@ struct FastllmCudaMoePrefillResidents {
     int gateType = -1, downType = -1, hidden = 0, inter = 0;
     int ownerRank = 0, ownerCount = 1;
     bool nativeGlm = false; // GGUF grouped backend math compatibility
+    bool nativeGGUF = false; // Preserve packed NUMA records; grouped prefill restores its working tiles.
     bool nativeWeights = false; // Directly consumed by existing host-prefill kernels.
     bool sharedWeights = false; // Native or losslessly restored NUMA layout.
 };
@@ -2055,7 +2071,13 @@ struct FastllmCudaMoeGGUFCacheView {
     // the launch bound; only the first *activeRouteCount entries are read or
     // written. Keep this count and the routing arrays alive through replay.
     const int32_t *activeRouteCount = nullptr;
+    // Immutable Q8_1 [rows, hidden] input shared by forked resident/miss
+    // branches. The producer must precede both branches; gate scratch stays
+    // private. Null retains this view's ordinary workspace/input preparation.
+    const void *preparedQ8Input = nullptr;
+    bool exactSubwarp = false; // Qwen verification; other callers retain warp kernels.
 };
+bool FastllmCudaMoeGGUFPrepareQ8Input(const fastllm::Data &input, void *destination, size_t bytes);
 bool FastllmCudaMoeGGUFCacheSupported(int type, int columns);
 bool FastllmCudaMoeGGUFCacheNumaSupported(int gateType, int downType,
     int hidden, int inter, int rows);

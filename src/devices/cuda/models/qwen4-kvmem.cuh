@@ -2,6 +2,7 @@
 // ranking: retain requested hits, then use unrequested slots for missing pages.
 // Overflow reads the host backing directly, never drops an attention token.
 #include "models/qwen4_paged_cache.h"
+#include "devices/cuda/fastllm-cuda-mapped-host.h"
 namespace {
     void Qwen4KvMemCheck(cudaError_t status) {
         if (status != cudaSuccess) throw std::runtime_error(
@@ -90,10 +91,15 @@ namespace fastllm {
         Qwen4KvMemCheck(cudaSetDevice(device));
         try {
             const size_t bytes = size_t(logicalPages) * pageBytes;
-            for (auto p : {&hostKey, &hostValue})
-                Qwen4KvMemCheck(cudaHostAlloc(p, bytes, cudaHostAllocMapped | cudaHostAllocPortable));
-            Qwen4KvMemCheck(cudaHostGetDevicePointer(&mappedKey, hostKey, 0));
-            Qwen4KvMemCheck(cudaHostGetDevicePointer(&mappedValue, hostValue, 0));
+            keyStorage = std::make_unique<cuda::MappedHostBuffer>();
+            valueStorage = std::make_unique<cuda::MappedHostBuffer>();
+            Qwen4KvMemCheck(keyStorage->Allocate(bytes));
+            Qwen4KvMemCheck(valueStorage->Allocate(bytes));
+            hostKey = keyStorage->Host(); mappedKey = keyStorage->Device();
+            hostValue = valueStorage->Host(); mappedValue = valueStorage->Device();
+            if (keyStorage->Registrations() || valueStorage->Registrations())
+                std::fprintf(stderr, "[Fastllm] Qwen4 KV backing uses bounded host registrations: key=%zu value=%zu bytes=%zu.\n",
+                    keyStorage->Registrations(), valueStorage->Registrations(), bytes);
             for (auto p : {&deviceKey, &deviceValue})
                 Qwen4KvMemCheck(cudaMalloc(p, size_t(residentPages) * pageBytes));
             const size_t words = (3 * size_t(logicalPages) + 2 * size_t(residentPages) + 3) & ~size_t(1);
@@ -126,11 +132,20 @@ namespace fastllm {
         if (metadata) cudaFree(metadata);
         if (deviceKey) cudaFree(deviceKey);
         if (deviceValue) cudaFree(deviceValue);
-        if (hostKey) cudaFreeHost(hostKey);
-        if (hostValue) cudaFreeHost(hostValue);
+        keyStorage.reset(); valueStorage.reset();
+        metadata = nullptr; deviceKey = deviceValue = nullptr;
+        hostKey = hostValue = mappedKey = mappedValue = nullptr;
         cudaSetDevice(previous);
     }
     Qwen4KvMem::~Qwen4KvMem() { Release(); }
+
+    bool Qwen4KvMem::StagePrefix(void *key, void *value, int length) const {
+        if (!keyStorage || !valueStorage || !key || !value || length < 0 || length > capacity)
+            return false;
+        const size_t bytes = size_t(length) * pageBytes / pageTokens;
+        return keyStorage->CopyToDeviceAsync(key, hostKey, bytes, cudaStreamPerThread) == cudaSuccess &&
+               valueStorage->CopyToDeviceAsync(value, hostValue, bytes, cudaStreamPerThread) == cudaSuccess;
+    }
 
     void Qwen4KvMem::SetLength(int tokens) {
         if (tokens < 0 || tokens > capacity)

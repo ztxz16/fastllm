@@ -348,6 +348,55 @@ static void Compare(const std::vector<float> &actual, const std::vector<float> &
     }
 }
 
+// Exercise the NUMA entry point, including mixed CPU/GPU experts and
+// back-to-back CUDA consumers. No model-specific dispatch scope is installed.
+static void CheckNumasPrefill(std::vector<Data *> *weights, int tables) {
+    constexpr int topk = 6;
+    const int hidden = weights[0][2]->dims[1];
+    const int experts = int(weights[0].size()) / 2 - 1;
+    int cases = 0;
+    for (int rows : {65, 129, 33, 1, 257, 32, 65}) {
+        Data cpuInput(BFLOAT16, {rows, hidden}), input;
+        Data index(INT32, {rows, topk}), scores(FLOAT32, {rows, topk});
+        cpuInput.Allocate(false); index.Allocate(false); scores.Allocate(false);
+        for (int i = 0; i < rows * hidden; ++i)
+            reinterpret_cast<uint16_t *>(cpuInput.cpuData)[i] =
+                Float32ToBFloat16RNEBits(std::sin(float(i + rows) * .137f) / 32.f);
+        for (int row = 0; row < rows; ++row) for (int k = 0; k < topk; ++k) {
+            // Five frequent experts, plus sparse CPU work in the final rows.
+            reinterpret_cast<int32_t *>(index.cpuData)[row * topk + k] =
+                k < topk - 1 || row + 16 < rows ? k : topk + row % (experts - topk);
+            reinterpret_cast<float *>(scores.cpuData)[row * topk + k] = (k + 1) / 32.f;
+        }
+        input.CopyFrom(cpuInput);
+        input.ToDevice(CUDA, std::vector<int>{0});
+        Data expected[3], actual[3];
+        // Use the same CPU/GPU partition and BF16 rounding in the reference,
+        // with an explicit device barrier after each layer. An all-CPU result
+        // has a different partial-sum rounding boundary in mixed execution.
+        for (int layer = 0; layer < 3; ++layer) {
+            RunNumasMoe(layer ? expected[layer - 1] : input, index, scores,
+                        expected[layer], weights[layer % tables], layer);
+            Check(cudaDeviceSynchronize());
+        }
+        for (int layer = 0; layer < 3; ++layer)
+            RunNumasMoe(layer ? actual[layer - 1] : input, index, scores,
+                        actual[layer], weights[layer % tables], layer);
+        // Defer readback until every dependent layer has consumed its input.
+        for (int layer = 0; layer < 3; ++layer) {
+            expected[layer].ToDevice(CPU);
+            actual[layer].ToDevice(CPU);
+            Require(expected[layer].GetBytes() == actual[layer].GetBytes() &&
+                std::memcmp(expected[layer].cpuData, actual[layer].cpuData, actual[layer].GetBytes()) == 0,
+                "NUMA hybrid prefill chain differs from serialized output bits");
+            ++cases;
+        }
+        // Also drain asynchronous reduction before shape changes / teardown.
+        ClearNumasMoeRuntimeCache();
+    }
+    std::printf("NUMAS_PREFILL_PASS %d layer comparisons, CPU/GPU split, shape changes and chained outputs\n", cases);
+}
+
 static void CheckCompleteNativeGraphs(std::vector<Data *> &weights, int layer) {
     const int hidden = weights[2]->dims[1], experts = weights.size() / 2 - 1;
     const int device = FastllmCudaGetDevice();
@@ -634,7 +683,7 @@ int main(int argc, char **argv) {
         // Exercise GPU prefill deliberately; CPU-oracle inputs below have no
         // CUDA mirror and therefore still run entirely on NUMA.
         setenv("FT_GPU_PREFILL", "1", 1);
-        setenv("FT_EXPERT_LIMIT", "0", 1);
+        setenv("FT_EXPERT_LIMIT", option("--numas-prefill") ? "32" : "0", 1);
         SetThreads(30);
         {
             float *device;
@@ -798,6 +847,13 @@ int main(int argc, char **argv) {
                     owned.push_back(std::move(w));
                 }
             layers[t] = {weights[t].data(), (int)weights[t].size(), true, 10.0f};
+        }
+        if (option("--numas-prefill")) {
+            SetMoeCudaCacheBytes(0);
+            CheckNumasPrefill(weights, tables);
+            for (auto &weight : owned) weight->numasData.clear();
+            for (void *pointer : shards) Check(cudaFreeHost(pointer));
+            return 0;
         }
         const size_t record = ((weights[0][2]->GetBytes() + weights[0][3]->GetBytes() + 127) / 128) * 128;
         if (option("--resident-budget-only")) {

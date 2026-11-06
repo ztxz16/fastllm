@@ -316,6 +316,56 @@ static __global__ void Records(Record layout, void *const *pointers,
     }
 }
 
+// Lossless native transfer, used only when every consumer understands the
+// original NUMA packing. Unlike canonical admission this performs no row
+// permutation or R4 reconstruction. Payload and padding share slot ownership.
+static __global__ void NativeRecords(Record layout, void *const *pointers, uint8_t *destination,
+        const int32_t *experts, const int32_t *slots, const int32_t *count,
+        const uint64_t *slotOffsets, int fixedExpert,
+        const uint8_t *promoted, int promotedExpert) {
+    const int part = blockIdx.z;
+    const auto &w = layout.weights[part];
+    const size_t offset = part ? layout.downOffset : 0;
+    const size_t bytes = size_t(w.rows) * w.rowBytes / layout.shards;
+    const int requests = count ? *count : 1;
+    for (int request = 0; request < requests; ++request) {
+        const int expert = experts ? experts[request] : fixedExpert;
+        const int slot = slots ? slots[request] : 0;
+        if (expert < 0 || slot < 0) continue;
+        auto *record = destination + (slotOffsets ? slotOffsets[slot] : size_t(slot) * layout.stride);
+        for (int node = 0; node < layout.shards; ++node) {
+            const auto *source = promoted && expert == promotedExpert
+                ? promoted + offset + node * bytes
+                : static_cast<const uint8_t *>(pointers[(expert * 2 + part) * layout.shards + node]);
+            auto *out = record + offset + node * bytes;
+            const size_t step = size_t(gridDim.x) * blockDim.x;
+            const size_t lane = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+            if (((reinterpret_cast<uintptr_t>(source) | reinterpret_cast<uintptr_t>(out)) & 15) == 0) {
+                for (size_t i = lane; i < bytes / 16; i += step)
+                    reinterpret_cast<uint4 *>(out)[i] = reinterpret_cast<const uint4 *>(source)[i];
+                for (size_t i = bytes / 16 * 16 + lane; i < bytes; i += step) out[i] = source[i];
+            } else {
+                for (size_t i = lane; i < bytes; i += step) out[i] = source[i];
+            }
+        }
+        if (blockIdx.x == 0) {
+            const size_t end = part ? layout.stride : layout.downOffset;
+            for (size_t i = offset + size_t(w.rows) * w.rowBytes + threadIdx.x; i < end; i += blockDim.x)
+                record[i] = 0;
+        }
+    }
+}
+
+inline cudaError_t CopyNativeRecords(const Record &layout, void *const *pointers,
+        uint8_t *destination, cudaStream_t stream,
+        const int32_t *experts = nullptr, const int32_t *slots = nullptr,
+        const int32_t *count = nullptr, const uint64_t *slotOffsets = nullptr,
+        int fixedExpert = 0, const uint8_t *promoted = nullptr, int promotedExpert = -1) {
+    NativeRecords<<<dim3(48, 1, 2), 256, 0, stream>>>(layout, pointers, destination,
+        experts, slots, count, slotOffsets, fixedExpert, promoted, promotedExpert);
+    return cudaGetLastError();
+}
+
 inline cudaError_t CopyRecords(const Record &layout, void *const *pointers,
         uint8_t *destination, cudaStream_t stream,
         const int32_t *experts = nullptr, const int32_t *slots = nullptr,

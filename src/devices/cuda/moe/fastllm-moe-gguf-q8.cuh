@@ -410,10 +410,59 @@ template<ggml_type Type> struct Format {
         Type == GGML_TYPE_IQ3_S ? 256 : Type == GGML_TYPE_IQ3_XXS ? 128 : 0;
 };
 
-template<ggml_type Type, int ThreadsPerRow = 32, bool Packed = false>
+// A physical lane can own several virtual lanes of the original 32-lane
+// projection. Retain each virtual lane's k += 32 accumulation, then fold the
+// missing shuffle stages in the original order. Merely using k += subgroup
+// changes the reduction tree once the input contains more than 32 Q8 blocks.
+template<ggml_type Type, int ThreadsPerRow, bool Packed>
+__device__ __forceinline__ float RowDotExactWarp(const void *weight, const block_q8_1 *x,
+        int columns, const uint64_t *grid, int packedRow) {
+    static_assert(ThreadsPerRow == 8 || ThreadsPerRow == 16);
+    using F = Format<Type>;
+    constexpr int virtualLanes = 32 / ThreadsPerRow;
+    float sums[virtualLanes]{};
+#pragma unroll
+    for (int lane = 0; lane < virtualLanes; ++lane) {
+        float sum = 0;
+        for (int k = threadIdx.x % ThreadsPerRow + lane * ThreadsPerRow;
+                k < columns / 32; k += 32) {
+            const int b = k/F::parts, part = F::step*(k%F::parts);
+            const auto *xb = x + b*F::parts;
+            if constexpr (Type == GGML_TYPE_IQ2_S) sum += DotS<Packed>(weight, xb, b, part, grid, packedRow);
+            else if constexpr (Type == GGML_TYPE_IQ2_XS) sum += DotXS<Packed>(weight, xb, b, part, grid, packedRow);
+            else if constexpr (Type == GGML_TYPE_IQ2_XXS) sum += DotXXS<Packed>(weight, xb, b, part, grid, packedRow);
+            else if constexpr (Type == GGML_TYPE_IQ1_M) sum += DotIQ1M(weight, xb, b, part, grid);
+            else if constexpr (Type == GGML_TYPE_IQ3_XXS)
+                sum += DotIQ3XXS<Packed>(weight, xb, b, part, reinterpret_cast<const uint32_t *>(grid), packedRow);
+            else if constexpr (Type == GGML_TYPE_IQ3_S)
+                sum += DotIQ3S(weight, xb, b, part, reinterpret_cast<const uint32_t *>(grid));
+            else if constexpr (Type == GGML_TYPE_IQ4_NL || Type == GGML_TYPE_IQ4_XS)
+                sum += DotIQ4<Type>(weight, xb, b, part);
+            else sum += DotQ2(weight, xb, b, part);
+        }
+        sums[lane] = sum;
+    }
+#pragma unroll
+    for (int offset = virtualLanes / 2; offset; offset >>= 1) {
+#pragma unroll
+        for (int lane = 0; lane < offset; ++lane)
+            sums[lane] = __fadd_rn(sums[lane], sums[lane + offset]);
+    }
+    float sum = sums[0];
+    constexpr unsigned lanes = 0xffffffffu >> (32 - ThreadsPerRow);
+    const unsigned mask = lanes << ((threadIdx.x % 32) / ThreadsPerRow * ThreadsPerRow);
+#pragma unroll
+    for (int offset = ThreadsPerRow / 2; offset; offset >>= 1)
+        sum += __shfl_xor_sync(mask, sum, offset, ThreadsPerRow);
+    return sum;
+}
+
+template<ggml_type Type, int ThreadsPerRow = 32, bool Packed = false, bool ExactWarp = false>
 __device__ __forceinline__ float RowDot(const void *weight, const block_q8_1 *x,
                                       int columns, const uint64_t *grid, int packedRow = 0) {
-    static_assert(ThreadsPerRow == 32 || (ThreadsPerRow == 8 && Type == GGML_TYPE_Q2_0) ||
+    if constexpr (ExactWarp)
+        return RowDotExactWarp<Type, ThreadsPerRow, Packed>(weight, x, columns, grid, packedRow);
+    static_assert(ExactWarp || ThreadsPerRow == 32 || (ThreadsPerRow == 8 && Type == GGML_TYPE_Q2_0) ||
         (ThreadsPerRow == 16 && (Type == GGML_TYPE_IQ4_NL || Type == GGML_TYPE_IQ4_XS)));
     using F = Format<Type>;
     float sum = 0;
@@ -453,6 +502,38 @@ __device__ __forceinline__ float RowDot(const void *weight, const block_q8_1 *x,
 
 // Interleave gate/up dots so both rows reuse the activation loads and expose
 // independent integer accumulators. Preserve each row's 32-lane sum order.
+template<ggml_type Type, bool Packed = false>
+__device__ __forceinline__ float2 RowDotPairExactWarp16(const void *gate, const void *up,
+        const block_q8_1 *x, int columns, const uint64_t *grid, int gateRow, int upRow) {
+    static_assert(Type == GGML_TYPE_IQ2_S || Type == GGML_TYPE_IQ3_XXS);
+    float2 sums[2];
+#pragma unroll
+    for (int lane = 0; lane < 2; ++lane) {
+        float2 sum = make_float2(0,0);
+        for (int k = threadIdx.x % 16 + 16*lane; k < columns/32; k += 32) {
+            const int block = k/8, part = 2*(k%8);
+            const auto *xb = x + block*8;
+            if constexpr (Type == GGML_TYPE_IQ2_S) {
+                sum.x += DotS<Packed>(gate, xb, block, part, grid, gateRow);
+                sum.y += DotS<Packed>(up, xb, block, part, grid, upRow);
+            } else {
+                const auto *grid32 = reinterpret_cast<const uint32_t *>(grid);
+                sum.x += DotIQ3XXS<Packed>(gate, xb, block, part, grid32, gateRow);
+                sum.y += DotIQ3XXS<Packed>(up, xb, block, part, grid32, upRow);
+            }
+        }
+        sums[lane] = sum;
+    }
+    float2 sum = make_float2(__fadd_rn(sums[0].x,sums[1].x),__fadd_rn(sums[0].y,sums[1].y));
+    const unsigned mask = 0xffffu << ((threadIdx.x % 32)/16*16);
+#pragma unroll
+    for (int offset = 8; offset; offset >>= 1) {
+        sum.x += __shfl_xor_sync(mask,sum.x,offset,16);
+        sum.y += __shfl_xor_sync(mask,sum.y,offset,16);
+    }
+    return sum;
+}
+
 template<ggml_type Type, bool Packed = false>
 __device__ __forceinline__ float2 RowDotPair(const void *gate, const void *up,
         const block_q8_1 *x, int columns, const uint64_t *grid, int gateRow, int upRow) {

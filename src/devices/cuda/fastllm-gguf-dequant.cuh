@@ -94,7 +94,7 @@ void FastllmGGUFDequantGemm(const T *input, const fastllm::Data &weight,
                           T *output, int n, int m, int k,
                           void *workspace, size_t workspaceBytes,
                           to_t_cuda_t<T> dequant, cublasHandle_t handle,
-                          cudaStream_t stream) {
+                          cudaStream_t stream, bool fp32Accumulation = false) {
     static_assert(std::is_same<T, half>::value ||
                   std::is_same<T, __nv_bfloat16>::value,
                   "GGUF dequant GEMM requires FP16 or BF16");
@@ -102,10 +102,11 @@ void FastllmGGUFDequantGemm(const T *input, const fastllm::Data &weight,
     using Scalar = typename std::conditional<fp16, half, float>::type;
     const Scalar alpha = static_cast<Scalar>(1.0f);
     const Scalar beta = static_cast<Scalar>(0.0f);
+    const float alpha32 = 1.0f, beta32 = 0.0f;
     constexpr cudaDataType_t dataType = fp16 ? CUDA_R_16F : CUDA_R_16BF;
     // Preserve the existing accumulation type; chunking can still change
     // cuBLAS reduction order and therefore is not guaranteed bitwise equal.
-    constexpr cudaDataType_t computeType = fp16 ? CUDA_R_16F : CUDA_R_32F;
+    const cudaDataType_t computeType = fp16 && !fp32Accumulation ? CUDA_R_16F : CUDA_R_32F;
     const char *context = fp16 ? "FP16 GEMM" : "BF16 GEMM";
     const ggml_type type = static_cast<ggml_type>(weight.ggmlType);
     const int chunkRows = FastllmGGUFCalcChunkRows(
@@ -127,8 +128,10 @@ void FastllmGGUFDequantGemm(const T *input, const fastllm::Data &weight,
         // Each token retains the full k-column output stride across chunks.
         const cublasStatus_t status = cublasGemmEx(
                 handle, CUBLAS_OP_T, CUBLAS_OP_N, rows, n, m,
-                &alpha, dequantized, dataType, m, input, dataType, m,
-                &beta, output + offset, dataType, k, computeType,
+                fp32Accumulation ? static_cast<const void *>(&alpha32) : &alpha,
+                dequantized, dataType, m, input, dataType, m,
+                fp32Accumulation ? static_cast<const void *>(&beta32) : &beta,
+                output + offset, dataType, k, computeType,
                 CUBLAS_GEMM_DEFAULT);
         if (status != CUBLAS_STATUS_SUCCESS) {
             throw std::runtime_error(

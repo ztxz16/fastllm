@@ -56,14 +56,43 @@ CudaWorkspace::CudaWorkspace(int device, size_t bytes, size_t minimumBytes)
     }
     FastllmCudaSetDevice(previous);
     if (!base) throw std::runtime_error("Cannot allocate CUDA workspace");
-    available.emplace(0, capacity);
+    available.emplace(reinterpret_cast<std::uintptr_t>(base), capacity);
+}
+
+CudaWorkspace::CudaWorkspace(int device, std::vector<Region> regions,
+                             std::function<void()> release)
+    : device(device), capacity(0), release(std::move(release)) {
+    if (!this->release || regions.empty()) throw std::invalid_argument("invalid borrowed CUDA workspace");
+    for (const auto &region : regions) {
+        const auto address = reinterpret_cast<std::uintptr_t>(region.data);
+        if (!address || address % alignment || !region.bytes || region.bytes % alignment ||
+            region.bytes > std::numeric_limits<size_t>::max() - address)
+            throw std::invalid_argument("unaligned borrowed CUDA workspace");
+        auto next = available.lower_bound(address);
+        if ((next != available.end() && address + region.bytes > next->first) ||
+            (next != available.begin() && std::prev(next)->first + std::prev(next)->second > address))
+            throw std::invalid_argument("overlapping borrowed CUDA workspace");
+        available.emplace(address, region.bytes);
+        capacity += region.bytes;
+    }
 }
 
 CudaWorkspace::~CudaWorkspace() {
     const int previous = FastllmCudaGetDevice();
     FastllmCudaSetDevice(device);
-    ForceDeviceSync();
-    FastllmCudaDirectFree(base);
+    if (release) {
+        if (GetFastllmEnv().printProfile) std::fprintf(stderr,
+            "[Fastllm] Borrowed workspace cuda:%d: peak %.2f MiB / %.2f MiB.\n",
+            device, peakBytes / 1048576.0, capacity / 1048576.0);
+        for (auto &item : pending) {
+            FastllmCudaEventSynchronize(item.second);
+            FastllmCudaEventDestroy(item.second);
+        }
+        release();
+    } else {
+        ForceDeviceSync();
+        FastllmCudaDirectFree(base);
+    }
     FastllmCudaSetDevice(previous);
 }
 
@@ -80,6 +109,24 @@ void *CudaWorkspace::Allocate(size_t bytes) {
     if (bytes > std::numeric_limits<size_t>::max() - alignment + 1) return nullptr;
     bytes = std::max(alignment, (bytes + alignment - 1) / alignment * alignment);
     std::lock_guard<std::mutex> guard(mutex);
+    // Reuse across host/GPU worker streams with device-side dependencies;
+    // do not put a host synchronization on every temporary tensor release.
+    size_t pendingCount = 0;
+    for (auto item : pending) {
+        if (item.first) {
+            FreeLocked(item.first);
+            item.first = nullptr;
+        }
+        if (FastllmCudaEventComplete(item.second)) {
+            FastllmCudaEventDestroy(item.second);
+        } else {
+            // A later allocation may use a different stream and another slice
+            // of this released range. Keep the fence until it completes.
+            FastllmCudaCurrentThreadStreamWaitEvent(item.second);
+            pending[pendingCount++] = item;
+        }
+    }
+    pending.resize(pendingCount);
     auto best = available.end();
     for (auto it = available.begin(); it != available.end(); ++it) {
         if (it->second >= bytes && (best == available.end() || it->second < best->second)) best = it;
@@ -91,12 +138,24 @@ void *CudaWorkspace::Allocate(size_t bytes) {
     if (remaining) available.emplace(offset + bytes, remaining);
     liveBytes += bytes;
     peakBytes = std::max(peakBytes, liveBytes);
-    return static_cast<unsigned char*>(base) + offset;
+    return reinterpret_cast<void *>(offset);
 }
 
 void CudaWorkspace::Free(void *pointer) {
     std::lock_guard<std::mutex> guard(mutex);
-    size_t offset = static_cast<unsigned char*>(pointer) - static_cast<unsigned char*>(base);
+    FreeLocked(pointer);
+}
+
+void CudaWorkspace::FreeAfterStream(void *pointer, void *stream, bool currentThread) {
+    void *event = FastllmCudaEventCreate();
+    if (currentThread) FastllmCudaEventRecordCurrentThread(event);
+    else FastllmCudaEventRecord(event, stream);
+    std::lock_guard<std::mutex> guard(mutex);
+    pending.emplace_back(pointer, event);
+}
+
+void CudaWorkspace::FreeLocked(void *pointer) {
+    size_t offset = reinterpret_cast<std::uintptr_t>(pointer);
     auto live = allocated.find(offset);
     if (live == allocated.end()) throw std::logic_error("Invalid CUDA workspace release");
     size_t bytes = live->second;
@@ -157,7 +216,7 @@ bool IsCudaWorkspacePointer(void *pointer) {
     return owners.allocations.count(pointer) != 0;
 }
 
-bool TryFreeCudaWorkspace(void *pointer) {
+static bool ReleaseWorkspacePointer(void *pointer, void *stream, bool afterStream) {
     if (workspacePointers.load(std::memory_order_acquire) == 0) return false;
     std::shared_ptr<CudaWorkspace> owner;
     {
@@ -169,7 +228,17 @@ bool TryFreeCudaWorkspace(void *pointer) {
         owners.allocations.erase(it);
         workspacePointers.fetch_sub(1, std::memory_order_release);
     }
-    owner->Free(pointer);
+    if (owner->Borrowed()) owner->FreeAfterStream(pointer, stream, !afterStream);
+    else {
+        if (afterStream) FastllmCudaStreamSynchronize(stream);
+        owner->Free(pointer);
+    }
     return true;
+}
+bool TryFreeCudaWorkspace(void *pointer) {
+    return ReleaseWorkspacePointer(pointer, nullptr, false);
+}
+bool TryFreeCudaWorkspaceAfterStream(void *pointer, void *stream) {
+    return ReleaseWorkspacePointer(pointer, stream, true);
 }
 }

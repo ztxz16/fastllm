@@ -1,3 +1,4 @@
+#include "devices/cuda/cudaworkspace.h"
 #include "fastllm-gguf-mmq-common.cuh"
 #include <chrono>
 #include <thread>
@@ -213,6 +214,8 @@ static bool RunPipelined(const fastllm::Data &input, fastllm::Data &gate,
     // V4.1's mixed Q2_0/Q4_K layers have larger records than low-bit gates.
     // Bound both upload rings so they fit the hybrid transport reservation.
     const int batchExperts = nativeV41 ? 8 : Pipeline::experts;
+    const int routeCapacity = disk ? kV41DiskStreamedRoutes : nativeV41 ? kV41StreamedRoutes :
+        glm5 ? INT32_MAX : workspace.cudaWorkspace ? 4096 : 65520;
     size_t metaBytes = 0;
     auto reserve = [&](size_t bytes) { const size_t at = metaBytes; metaBytes += Align(bytes); return at; };
     for (size_t begin = 0; begin < order.size(); begin += batchExperts) {
@@ -227,7 +230,9 @@ static bool RunPipelined(const fastllm::Data &input, fastllm::Data &gate,
             // Split only activations for a heavily routed group. Its weights
             // stay in the same device slots until every slice finishes; neither
             // SSD reads nor H2D copies are repeated by this workspace bound.
-            int remaining = disk ? 2048 : INT32_MAX;
+            // CUDA grid.y is limited to 65535. Keep weights uploaded once,
+            // slicing only skewed route groups when a larger prompt needs it.
+            int remaining = routeCapacity;
             more = false;
             for (size_t j = 0; j < batch.experts.size(); ++j) {
                 const auto &selected = routes[batch.experts[j]];
@@ -255,26 +260,50 @@ static bool RunPipelined(const fastllm::Data &input, fastllm::Data &gate,
     const auto *gu = weights[2 * (order[0] + 1)], *down = weights[2 * (order[0] + 1) + 1];
     const size_t gateWeightBytes = Align(gu->GetBytes());
     const size_t stride = gateWeightBytes + Align(down->GetBytes());
+    // With phase reuse enabled the caller releases this workspace after
+    // every eager MoE. Recycle it through the event-aware tensor pool rather
+    // than synchronizing and cudaFree/cudaMalloc at each layer. The default
+    // persistent path retains direct ownership to bound routing-driven growth.
+    const char *reuse = std::getenv("FASTLLM_QWEN38_PREFILL_REUSE");
+    const bool direct = !workspace.cudaWorkspace && !(FastllmCudaMoeCacheIsQwen38(weights, 4) &&
+                          reuse && std::string(reuse) == "1");
     const bool misses = std::any_of(order.begin(), order.end(), [&](int e) { return !cached(e); });
     // Native EP residents remain R4 in cache. Restore their bounded working
     // group on the GPU, just as for misses, without changing cache ownership.
-    const size_t ringBytes = misses || resident.nativeGlm
+    const size_t ringBytes = !direct || misses || resident.nativeGGUF
         ? Pipeline::groups * batchExperts * stride : 0;
     const size_t rawOffset = 0, canonicalOffset = ringBytes, metaOffset = (disk ? 1 : 2) * ringBytes;
     const size_t descOffset = reserve(2 * order.size() * sizeof(WeightCopy));
     const size_t scoreOffset = reserve(size_t(rows) * topk * sizeof(float));
     const size_t indexOffset = reserve((glm5 || nativeV41) ? size_t(rows) * topk * sizeof(int32_t) : 0);
-    const size_t computeOffset = metaOffset + metaBytes;
-    const size_t bytes = Align(computeOffset + StreamedMoeWorkspaceBytes(rows, hidden, inter, topk, capacity, nativeV41));
-    const size_t gateBytes = nativeV41 ? 0 : size_t(rows) * topk * inter * (input.dataType == fastllm::FLOAT32 ? 4 : 2);
+    // A pooled buffer must not grow a little at each layer and strand every
+    // previous allocation. Bound routing metadata and projection capacity by
+    // the request shape; only ownership changes, logical GEMM routes do not.
+    // Full-chunk route IDs/scores survive all slices. Include their growth
+    // even when projections borrow a pooled/phase workspace.
+    const size_t pooledMetadata = nativeV41
+        ? std::max(2 * size_t(1024 * 1024), Align(size_t(rows) * topk * 16 + size_t(expertCount) * 2048))
+        : 2 * size_t(1024 * 1024);
+    if (!direct && metaBytes > pooledMetadata) return false;
+    const size_t computeOffset = metaOffset + (direct ? metaBytes : pooledMetadata);
+    const int allocationCapacity = nativeV41
+        ? std::min(routeCapacity, (rows * topk + 15 * batchExperts + 15) / 16 * 16)
+        : (direct || workspace.cudaWorkspace)
+        ? capacity : rows * topk + 15 * batchExperts;
+    // Borrowed prefill arenas opt into compact scratch; other models retain
+    // their existing workspace contract and activation materialization.
+    const bool compactScratch = workspace.cudaWorkspace && !glm5 && !nativeV41;
+    const size_t bytes = Align(computeOffset + StreamedMoeWorkspaceBytes(
+        rows, hidden, inter, topk, allocationCapacity, nativeV41, compactScratch));
+    const size_t gateBytes = nativeV41 || compactScratch ? 0 : size_t(rows) * topk * inter * (input.dataType == fastllm::FLOAT32 ? 4 : 2);
     // This eager-only workspace persists across layers. Tiny routing-driven
     // growth used to leave each retired hundreds-of-MiB block in the general
     // tensor pool. Own it directly so growth releases the old allocation;
     // RunPipelined synchronizes every consumer before returning.
     if (workspace.isFake || workspace.cudaDataBorrowed) return false;
     size_t reservedBytes = std::max(bytes, workspace.expansionBytes);
-    if (!workspace.cudaData || workspace.expansionBytes < bytes ||
-        (gateBytes && (!gate.cudaData || gate.expansionBytes < gateBytes)) || !workspace.directMemory) {
+    if (direct && (!workspace.cudaData || workspace.expansionBytes < bytes ||
+        (gateBytes && (!gate.cudaData || gate.expansionBytes < gateBytes)) || workspace.directMemory != direct)) {
         size_t freeBytes = 0, totalBytes = 0;
         CUDA_CHECK(cudaMemGetInfo(&freeBytes, &totalBytes));
         const size_t reusable = (workspace.cudaData ? workspace.expansionBytes : 0) +
@@ -295,9 +324,49 @@ static bool RunPipelined(const fastllm::Data &input, fastllm::Data &gate,
         if (rounded + gateBytes + reserve <= freeBytes + reusable) reservedBytes = rounded;
     }
     if (reservedBytes / 256 > size_t(INT32_MAX)) return false;
-    if (!workspace.directMemory) {
+    if (workspace.directMemory != direct) {
         workspace.FreeSpace();
-        workspace.directMemory = true;
+        workspace.directMemory = direct;
+    }
+    if (!direct && (!workspace.cudaData || workspace.expansionBytes < reservedBytes)) {
+        // Driver free memory excludes ready pooled buffers. Probe the shared
+        // allocator itself before falling back; a capacity miss remains clean
+        // and cannot poison later CUDA Graph captures.
+        constexpr size_t quantum = 16 * size_t(1024 * 1024);
+        reservedBytes = (reservedBytes + quantum - 1) / quantum * quantum;
+        workspace.FreeSpace();
+        workspace.dataType = fastllm::INT8;
+        workspace.UpdateUnitSize();
+        workspace.dataDevice = fastllm::CUDA;
+        workspace.dataDeviceIds = {device};
+        workspace.multiDeviceData = false;
+        workspace.Resize({int(reservedBytes / 256), 256});
+        void *allocation = nullptr;
+        if (workspace.cudaWorkspace) {
+            allocation = fastllm::AllocateCudaWorkspace(workspace.cudaWorkspace, reservedBytes);
+            if (!allocation) return false;
+        } else if (FastllmCudaTryMalloc(&allocation, reservedBytes) != FASTLLM_CUDA_TRY_MALLOC_SUCCESS)
+            return false;
+        workspace.cudaData = allocation;
+        workspace.expansionDims = workspace.dims;
+        workspace.expansionSize = reservedBytes;
+        workspace.expansionBytes = reservedBytes;
+        size_t freeBytes = 0, totalBytes = 0;
+        CUDA_CHECK(cudaMemGetInfo(&freeBytes, &totalBytes));
+        const size_t remainingReserve = 256 * size_t(1024 * 1024) +
+            (gate.cudaData ? 0 : gateBytes);
+        if (!workspace.cudaWorkspace && freeBytes < remainingReserve) {
+            // An eager prefill may leave large, completed attention buffers
+            // idle in the same allocator. Driver free bytes exclude them.
+            // Keep the acquired workspace live while reclaiming only idle,
+            // unpinned, completed blocks, then retain the original margin.
+            FastllmCudaClearBigBufferCurrentDevice();
+            CUDA_CHECK(cudaMemGetInfo(&freeBytes, &totalBytes));
+        }
+        if (!workspace.cudaWorkspace && freeBytes < remainingReserve) {
+            workspace.FreeSpace();
+            return false;
+        }
     }
     AllocateTensor(workspace, fastllm::INT8, {int(reservedBytes / 256), 256}, device);
     if (gateBytes) AllocateTensor(gate, input.dataType, {rows * topk, inter}, device);
@@ -331,21 +400,21 @@ static bool RunPipelined(const fastllm::Data &input, fastllm::Data &gate,
             for (int part = 0; part < 2; ++part) {
                 const auto &w = *weights[2 * (e + 1) + part];
                 const bool hit = cached(e);
-                if (hit && !resident.nativeGlm) { pointers.push_back(resident.weights[2 * e + part]); continue; }
+                if (hit && !resident.nativeGGUF) { pointers.push_back(resident.weights[2 * e + part]); continue; }
                 const size_t offset = ((g % Pipeline::groups) * batchExperts + j) * stride +
                     (part ? gateWeightBytes : 0);
                 auto *admitted = 2 * e + part < int(admission.weights.size())
                     ? static_cast<uint8_t *>(admission.weights[2 * e + part]) : nullptr;
                 const bool restore = (cross && part == 0) || Ordinary(w.ggmlType) != w.ggmlType;
-                auto *destination = !resident.nativeGlm && admitted
+                auto *destination = !resident.nativeGGUF && admitted
                     ? admitted : base + (disk ? 0 : canonicalOffset) + offset;
                 auto *target = restore ? base + rawOffset + offset : destination;
-                if (resident.nativeGlm) {
+                if (resident.nativeGGUF) {
                     target = hit ? const_cast<uint8_t *>(static_cast<const uint8_t *>(resident.weights[2 * e + part]))
                                  : admitted ? admitted : base + rawOffset + offset;
                     if (!restore) destination = target;
                 }
-                const auto *prefetched = !disk && !hit && !resident.nativeGlm && pipeline.prefetch
+                const auto *prefetched = !disk && !hit && !resident.nativeGGUF && pipeline.prefetch
                     ? pipeline.prefetch->Find(weights, w) : nullptr;
                 if (prefetched) {
                     batch.lastPrefetchedGroup = std::max(batch.lastPrefetchedGroup, prefetched->group);
@@ -419,7 +488,8 @@ static bool RunPipelined(const fastllm::Data &input, fastllm::Data &gate,
     CUDA_CHECK(cudaMemcpyAsync(base + metaOffset, metadata.data(), metaBytes, cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaEventRecord(pipeline.metadata, stream));
     CUDA_CHECK(cudaStreamWaitEvent(pipeline.restore, pipeline.metadata, 0));
-    auto run = [&](StreamedMoePhase phase, const StreamedMoeBatch &batch) {
+    auto run = [&](StreamedMoePhase phase, StreamedMoeBatch batch) {
+        batch.compactScratch = compactScratch;
         fastllm::AssertInFastLLM(RunStreamedMoe(phase, input, gate, output, base + computeOffset,
             capacity, hidden, inter, topk, gt, dt, batch,
             reinterpret_cast<const float *>(base + metaOffset + scoreOffset), glm5, swigluLimit,
@@ -544,7 +614,7 @@ bool FastllmCudaPrefetchMoeGGUFHost(fastllm::Data **weights, int expertCount) {
     if (previous == pipeline.prefillOrder.end()) return false;
     FastllmCudaMoePrefillResidents resident;
     FastllmCudaGetMoePrefillResidents(weights, expertCount, resident, false);
-    if (resident.nativeGlm) return false;
+    if (resident.nativeGGUF) return false;
     std::vector<const fastllm::Data *> plan;
     size_t bytes = 0;
     for (int e : previous->second) {
@@ -623,11 +693,12 @@ bool FastllmCudaMergeMOEGGUFHost(const fastllm::Data &input,
     using namespace fastllm_gguf_stream;
     using fastllm_gguf_moe::AllocateTensor;
     if (!weights || !indices || !scores || input.dims.size() != 2 ||
-        input.dims[0] <= 32 || input.dims[0] > 4096 || topk <= 0 || topk > 32 ||
+        input.dims[0] <= 32 || topk <= 0 || topk > 32 ||
         expertCount <= 0 || expertCount > 1024 || experts.empty() || experts.count(0) ||
         input.dataDevice != fastllm::CUDA || !input.cudaData ||
         !fastllm_gguf_moe::IsActivationType(input.dataType)) return false;
     const bool glm5 = deepSeekV4Mode && activationQuantBlock == 128;
+    if (input.dims[0] > 8192 && (!deepSeekV4Mode || activationQuantBlock != 32)) return false;
     // GLM keeps positive Q8_K scales without V4.1's FP8 block-32 conversion.
     if (deepSeekV4Mode && ((activationQuantBlock != 32 && !glm5) ||
         input.dataType != fastllm::BFLOAT16)) return false;
@@ -659,7 +730,7 @@ bool FastllmCudaMergeMOEGGUFHost(const fastllm::Data &input,
     }
     // Native V4.1 Q8_1 arithmetic differs from the Q8_K host path below.
     // Reuse the resident projection kernels, but upload only bounded groups.
-    if (deepSeekV4Mode && !glm5 && FastllmCudaV41GGUFGroupedWorkspaceBytes(
+    if (deepSeekV4Mode && !glm5 && FastllmCudaV41GGUFStreamedSupported(
             gt, dt, rows, hidden, inter, expertCount, topk))
         return RunPipelined(input, gate, workspace, output, weights, expertCount,
             indices, scores, topk, experts, crossSwiglu, gt, dt, inter, false, swigluLimit, true);
@@ -667,9 +738,12 @@ bool FastllmCudaMergeMOEGGUFHost(const fastllm::Data &input,
     // prefill, the existing per-expert GEMM reuses these weights much better.
     // Keep that implementation until a matrix IQ1_M gate kernel is available.
     if (gt == GGML_TYPE_IQ1_M) return false;
+    if (rows > 4096 && (deepSeekV4Mode || !FastllmCudaMoeCacheIsQwen38(weights, 4))) return false;
     const size_t mmqBytes = glm5 ? fastllm_gguf_mmq::Glm5GroupedWorkspaceBytes(
         gt, dt, rows, hidden, inter, expertCount, topk) : FastllmCudaMoeGGUFGroupedWorkspaceBytes(
-        gt, dt, rows, hidden, inter, expertCount, topk, deepSeekV4Mode);
+        // The streamed ordinary path bounds each group's rows independently;
+        // only use the resident helper here to validate types/geometry/ISA.
+        gt, dt, std::min(rows, 4096), hidden, inter, expertCount, topk, deepSeekV4Mode);
     if (!mmqBytes) return false;
     if (!deepSeekV4Mode || glm5) return RunPipelined(input, gate, workspace, output, weights,
         expertCount, indices, scores, topk, experts, crossSwiglu, gt, dt, inter, glm5, swigluLimit);
@@ -777,7 +851,9 @@ static bool MergeMOEGGUFDisk(const fastllm::Data &input,
     using namespace fastllm_gguf_stream;
     if (!weights || !indices || !scores || !source.read || !source.release || !source.staging ||
         input.dataType != (v41 ? fastllm::BFLOAT16 : fastllm::FLOAT32) || input.dataDevice != fastllm::CUDA ||
-        !input.cudaData || input.dims.size() != 2 || expertCount <= 0 || topk <= 0 ||
+        !input.cudaData || input.dims.size() != 2 || expertCount <= 0 || expertCount > 1024 ||
+        topk <= 0 || topk > 32 || input.dims[0] <= 32 ||
+        int64_t(input.dims[0]) * topk > INT32_MAX - 255 ||
         source.residents.size() != size_t(2 * expertCount)) return false;
     std::unordered_set<int> experts;
     for (int r = 0; r < input.dims[0] * topk; ++r) {
@@ -797,11 +873,11 @@ static bool MergeMOEGGUFDisk(const fastllm::Data &input,
     // IQ1_M gate has a disk-only Q8 dot fallback; an IQ1_M down matrix still
     // uses the ordinary expert path. Other backends retain their admission.
     if (!v41 && dt == GGML_TYPE_IQ1_M) return false;
-    const size_t bytes = v41 ? FastllmCudaV41GGUFGroupedWorkspaceBytes(gt, dt,
+    const bool supported = v41 ? FastllmCudaV41GGUFStreamedSupported(gt, dt,
         input.dims[0], input.dims[1], inter, expertCount, topk) :
         FastllmCudaMoeGGUFGroupedWorkspaceBytes(gt, dt, input.dims[0], input.dims[1],
-            inter, expertCount, topk, false);
-    if (!bytes) return false;
+            inter, expertCount, topk, false) != 0;
+    if (!supported) return false;
     fastllm::Data gate;
     return RunPipelined(input, gate, workspace, output, weights, expertCount,
         indices, scores, topk, experts, false, gt, dt, inter, false, swigluLimit, v41, &source);

@@ -88,10 +88,10 @@ def candidates(limit):
 
 
 @functools.lru_cache(maxsize=8)
-def _measure(hidden, intermediate, gguf_type, counts, numa_rows=0, topk=1):
+def _measure(hidden, intermediate, gguf_type, counts, numa_rows=0, topk=1, down_type=None):
     # Keep calibration weights, cache state and worker lifetime isolated from
     # model loading. The parent also enforces a bounded subprocess timeout.
-    request = json.dumps([hidden, intermediate, gguf_type, counts, _BENCHMARK_BUDGET_MS, numa_rows, topk])
+    request = json.dumps([hidden, intermediate, gguf_type, counts, _BENCHMARK_BUDGET_MS, numa_rows, topk, down_type])
     result = subprocess.run([sys.executable, str(Path(__file__).resolve()), '--worker', request],
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                             timeout=_WORKER_TIMEOUT_S, check=True)
@@ -106,27 +106,26 @@ def _measure(hidden, intermediate, gguf_type, counts, numa_rows=0, topk=1):
 
 
 def numa_node_count(root=Path('/sys/devices/system/node')):
-    """Only calibrate a native NUMA layout contained in the inherited affinity."""
+    """Count usable logical shards, including nonzero/sparse physical nodes."""
     try:
         paths = sorted(root.glob('node[0-9]*'), key=lambda p: int(p.name[4:]))
         requested = int(os.environ.get('FT_NUMAS', '0'))
-        paths = paths[:requested] if 0 < requested <= len(paths) else paths
         affinity = os.sched_getaffinity(0)
-        for index, path in enumerate(paths):
-            if path.name != 'node%d' % index:
-                return 0
+        count = 0
+        for path in paths:
             cpus = set()
             for part in (path / 'cpulist').read_text().strip().split(','):
+                if not part:
+                    continue
                 ends = [int(x) for x in part.split('-')]
                 cpus.update(range(ends[0], ends[-1] + 1))
-            if not cpus or not cpus.issubset(affinity):
-                return 0
-        return len(paths)
+            count += bool(cpus & affinity)
+        return min(count, requested) if requested > 0 else count
     except (OSError, ValueError, AttributeError):
         return 0
 
 
-def select_threads(hidden, intermediate, gguf_type, limit, *, numa=False, rows=1, topk=1):
+def select_threads(hidden, intermediate, gguf_type, limit, *, numa=False, rows=1, topk=1, down_type=None):
     nodes = numa_node_count() if numa else 0
     counts = candidates(limit)
     if nodes:
@@ -139,7 +138,9 @@ def select_threads(hidden, intermediate, gguf_type, limit, *, numa=False, rows=1
               'quota_cores': cpu_quota(), 'budget_ms': _BENCHMARK_BUDGET_MS,
               'timeout_s': _WORKER_TIMEOUT_S}
     try:
-        result = (_measure(hidden, intermediate, gguf_type, counts, numa_rows, topk) if numa_rows
+        result = (_measure(hidden, intermediate, gguf_type, counts, numa_rows, topk, down_type)
+                  if numa_rows and down_type is not None else
+                  _measure(hidden, intermediate, gguf_type, counts, numa_rows, topk) if numa_rows
                   else _measure(hidden, intermediate, gguf_type, counts))
         samples = {int(k): float(v) for k, v in result['samples_ms'].items()}
         samples = {k: v for k, v in samples.items() if k in counts and math.isfinite(v) and v > 0}
@@ -164,7 +165,9 @@ def select_threads(hidden, intermediate, gguf_type, limit, *, numa=False, rows=1
 
 def _worker(request):
     import ctypes
-    hidden, intermediate, kind, counts, budget_ms, numa_rows, topk = json.loads(request)
+    values = json.loads(request)
+    hidden, intermediate, kind, counts, budget_ms, numa_rows, topk = values[:7]
+    down_type = values[7] if len(values) > 7 else None
     if numa_rows:
         # CPU-only startup calibration neither uploads nor registers CUDA memory.
         os.environ['FT_PINNED_WEIGHT'] = '0'
@@ -176,11 +179,13 @@ def _worker(request):
     load_started = time.monotonic()
     native = ctypes.CDLL(str(library))
     load_ms = (time.monotonic() - load_started) * 1000
-    run = native.benchmark_cpu_moe_threads if numa_rows else native.benchmark_cpu_linear_threads
-    run.argtypes = [ctypes.c_int] * (5 if numa_rows else 3) + [ctypes.POINTER(ctypes.c_int),
+    standard = numa_rows and down_type is not None
+    run = (native.benchmark_cpu_standard_moe_threads if standard else
+           native.benchmark_cpu_moe_threads if numa_rows else native.benchmark_cpu_linear_threads)
+    run.argtypes = [ctypes.c_int] * (6 if standard else 5 if numa_rows else 3) + [ctypes.POINTER(ctypes.c_int),
                     ctypes.c_int, ctypes.c_int]
     run.restype = ctypes.c_char_p
-    shape = [hidden, intermediate, kind] + ([numa_rows, topk] if numa_rows else [])
+    shape = [hidden, intermediate, kind] + ([down_type] if standard else []) + ([numa_rows, topk] if numa_rows else [])
     raw = run(*shape, (ctypes.c_int * len(counts))(*counts), len(counts), budget_ms)
     if not raw:
         raise RuntimeError('native CPU calibration failed')
