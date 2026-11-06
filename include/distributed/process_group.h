@@ -37,6 +37,8 @@ struct ProcessModelInfo {
     uint64_t sourceBytesRead = 0;
 };
 
+enum class Qwen3LayerStage : uint32_t { Full = 0, Attention = 1, Mlp = 2 };
+
 // Linux 单机控制面。Ready 仅代表 worker/通信就绪，不代表模型已加载。
 class ProcessGroup {
 public:
@@ -99,6 +101,25 @@ public:
      * 不销毁 NCCL 组；完成后允许重新加载。失败终止整组并抛异常。
      */
     void UnloadQwen3();
+
+    /**
+     * 执行已加载模型的单个 Decoder 层，返回所有 rank 的实际输出。
+     *
+     * 单请求完整 causal prefill，无历史 KV；所有 rank 接收相同 hidden states。
+     * 内部 FP16 激活、FP32 GEMM 累加及 NCCL SUM，结果转回 FP32 仅用于控制面传输。
+     * Full 执行 Attention+残差和 MLP+残差；另外两个阶段复用相同生产算子。
+     * @param layer 从零开始的层号。
+     * @param tokens 输入 token 数，范围 1..128。
+     * @param hidden 隐藏维度，必须匹配模型。
+     * @param positionBegin 连续 RoPE 位置起点，最大 1048576，不表示已有 KV。
+     * @param stage 执行阶段。
+     * @param input 行主序 [tokens, hidden] FP32 输入，必须可表示为有限 FP16。
+     * @param timeoutMs 整组计算和读回的截止时间，默认 60 秒。
+     * @return 按 rank 排列的 [tokens, hidden] 输出；请求超过 1 MiB 或无效时拒绝。
+     *         worker 失败终止整组；不执行采样，不创建或更新 KV。
+     */
+    std::vector<std::vector<float>> ForwardQwen3Layer(uint32_t layer, uint32_t tokens, uint32_t hidden,
+        uint32_t positionBegin, Qwen3LayerStage stage, const std::vector<float> &input, int timeoutMs = 60000);
 
     /**
      * 停止监控、请求正常退出并回收全部 worker。

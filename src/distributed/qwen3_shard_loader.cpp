@@ -243,6 +243,43 @@ struct Qwen3ShardLoader::Impl {
 
         plan.rank = rank;
         plan.worldSize = world;
+        plan.hiddenSize = hidden;
+        plan.layerCount = layers;
+        plan.headDim = headDim;
+        plan.queryHeads = qHeads;
+        plan.kvHeads = kvHeads;
+        auto forwardNumber = [&](const std::string &key, float fallback) {
+            if (config[key].is_null()) {
+                return fallback;
+            }
+            double value = config[key].number_value();
+            if (!config[key].is_number() || !std::isfinite(value) || value <= 0 ||
+                value > std::numeric_limits<float>::max() || static_cast<float>(value) <= 0) {
+                plan.forwardUnsupportedReason = "invalid forward config: " + key;
+                return fallback;
+            }
+            return static_cast<float>(value);
+        };
+        plan.rmsNormEps = forwardNumber("rms_norm_eps", 1e-6f);
+        plan.ropeTheta = forwardNumber("rope_theta", 1000000.0f);
+        if ((!config["hidden_act"].is_null() && config["hidden_act"].string_value() != "silu") ||
+            !config["rope_scaling"].is_null() || !config["rope_parameters"].is_null() ||
+            (!config["use_sliding_window"].is_null() &&
+             (!config["use_sliding_window"].is_bool() || config["use_sliding_window"].bool_value())) ||
+            (!config["partial_rotary_factor"].is_null() &&
+             (!config["partial_rotary_factor"].is_number() || config["partial_rotary_factor"].number_value() != 1.0))) {
+            plan.forwardUnsupportedReason = "unsupported forward activation/rope/sliding-window configuration";
+        }
+        if (!config["layer_types"].is_null()) {
+            if (!config["layer_types"].is_array() || config["layer_types"].array_items().size() != layers) {
+                plan.forwardUnsupportedReason = "invalid forward layer_types";
+            }
+            for (const auto &type : config["layer_types"].array_items()) {
+                if (type.string_value() != "full_attention") {
+                    plan.forwardUnsupportedReason = "only full_attention layers are supported";
+                }
+            }
+        }
         auto mlp = Partition(intermediate, rank, world);
         auto vocabulary = Partition(vocab, rank, world);
         Partition(qHeads, rank, world);

@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <climits>
+#include <cmath>
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
@@ -598,6 +599,54 @@ void ProcessGroup::UnloadQwen3() {
         }
     } catch (const std::exception &e) {
         impl->Fail(e.what());
+        throw std::runtime_error(impl->error);
+    }
+}
+
+std::vector<std::vector<float>> ProcessGroup::ForwardQwen3Layer(uint32_t layer, uint32_t tokens,
+        uint32_t hidden, uint32_t positionBegin, Qwen3LayerStage stage, const std::vector<float> &input,
+        int timeoutMs) {
+    if (!tokens || tokens > 128 || !hidden || uint64_t(tokens) * hidden != input.size() ||
+        input.size() > (kMaxPayload - 24) / 4 || positionBegin > 1048576 || uint32_t(stage) > 2 || timeoutMs <= 0) {
+        throw std::invalid_argument("invalid Qwen3 layer request shape/stage/position/timeout");
+    }
+    std::vector<uint8_t> payload;
+    for (uint32_t field : {layer, tokens, hidden, positionBegin, uint32_t(stage), uint32_t(timeoutMs)}) {
+        Put32(payload, field);
+    }
+    for (float value : input) {
+        if (!std::isfinite(value) || std::fabs(value) > 65504) {
+            throw std::invalid_argument("Qwen3 layer input outside finite FP16 range");
+        }
+        uint32_t bits;
+        memcpy(&bits, &value, sizeof(bits));
+        Put32(payload, bits);
+    }
+    std::lock_guard<std::mutex> lock(impl->mutex);
+    if (impl->state != ProcessGroupState::Ready || impl->options.controlOnly) {
+        throw std::runtime_error("Qwen3 forward requires a ready CUDA process TP group");
+    }
+    try {
+        auto replies = impl->Exchange(Kind::ForwardLayer, Kind::LayerOutput, payload,
+                                      Clock::now() + std::chrono::milliseconds(timeoutMs));
+        std::vector<std::vector<float>> results;
+        for (const auto &reply : replies) {
+            if (reply.payload.size() != input.size() * 4) {
+                throw std::runtime_error("invalid Qwen3 layer output length");
+            }
+            std::vector<float> output(input.size());
+            for (size_t i = 0; i < output.size(); ++i) {
+                uint32_t bits = Get32(reply.payload, i * 4);
+                memcpy(&output[i], &bits, sizeof(bits));
+                if (!std::isfinite(output[i])) {
+                    throw std::runtime_error("nonfinite Qwen3 layer output");
+                }
+            }
+            results.push_back(std::move(output));
+        }
+        return results;
+    } catch (const std::exception &error) {
+        impl->Fail(error.what());
         throw std::runtime_error(impl->error);
     }
 }

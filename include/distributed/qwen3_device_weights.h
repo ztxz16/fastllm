@@ -37,6 +37,9 @@ public:
 
     /** @return 指定序号的只读 GPU 张量；越界或设备改变抛异常，Clear 后指针失效。 */
     const Qwen3DeviceTensor &Tensor(uint32_t index) const;
+    /** @return 按名称取得设备权重；缺失返回 nullptr，设备改变抛异常。 */
+    const Qwen3DeviceTensor *Find(const std::string &name) const;
+    const Qwen3ShardPlan &Plan() const { return plan; }
     uint32_t TensorCount() const { return static_cast<uint32_t>(tensors.size()); }
     uint64_t DeviceBytes() const { return deviceBytes; }
     uint64_t SourceBytesRead() const { return sourceBytesRead; }
@@ -60,6 +63,7 @@ private:
     cudaStream_t stream;
     uint64_t deviceBytes = 0, sourceBytesRead = 0;
     std::vector<Qwen3DeviceTensor> tensors;
+    Qwen3ShardPlan plan;
 };
 
 } // namespace distributed

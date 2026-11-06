@@ -14,6 +14,7 @@
 #include <cuda_runtime_api.h>
 #include <nccl.h>
 #include "distributed/qwen3_device_weights.h"
+#include "distributed/qwen3_layer.h"
 #endif
 
 using namespace fastllm::distributed::protocol;
@@ -34,7 +35,7 @@ void CheckNccl(ncclResult_t result) {
 #endif
 
 /**
- * 持有单个 worker 的 CUDA/NCCL 资源及可选 Qwen3 权重，不创建 KV 或执行前向。
+ * 持有单个 worker 的 CUDA/NCCL 资源、可选 Qwen3 权重和单层执行器，不创建 KV。
  *
  * 失败时由进程退出释放 CUDA 上下文；正常退出必须先同步，再销毁通信组和缓冲。
  * 不在异常析构路径进入可能阻塞的 NCCL 清理，由父进程负责超时终止。
@@ -46,6 +47,7 @@ struct DeviceRuntime {
     ncclComm_t comm = nullptr;
     float *buffer = nullptr;
     std::unique_ptr<fastllm::distributed::Qwen3DeviceWeights> weights;
+    std::unique_ptr<fastllm::distributed::Qwen3LayerExecutor> layerExecutor;
 #endif
 
     void Bind(int device) {
@@ -192,10 +194,50 @@ struct DeviceRuntime {
             throw std::runtime_error("Qwen3 weights require CUDA");
         }
 #ifdef FASTLLM_PROCESS_TP_CUDA
+        if (layerExecutor) {
+            layerExecutor->Clear();
+            layerExecutor.reset();
+        }
         if (weights) {
             weights->Clear();
             weights.reset();
         }
+#endif
+    }
+
+    /**
+     * 解码有界单层任务并复用当前权重、stream 和 NCCL 通信组执行。
+     * @param payload 六个 uint32 头字段及行主序 FP32 激活，禁止传递进程指针。
+     * @return 同形状 FP32 输出字节；失败终止 worker，不能复用部分状态。
+     */
+    std::vector<uint8_t> ForwardLayer(const std::vector<uint8_t> &payload) {
+        if (controlOnly || payload.size() < 24 || (payload.size() - 24) % 4 ||
+            !Get32(payload, 20) || Get32(payload, 20) > INT_MAX) {
+            throw std::runtime_error("invalid Qwen3 layer payload/state");
+        }
+#ifdef FASTLLM_PROCESS_TP_CUDA
+        if (!weights) {
+            throw std::runtime_error("Qwen3 weights not loaded");
+        }
+        std::vector<float> input((payload.size() - 24) / 4);
+        for (size_t i = 0; i < input.size(); ++i) {
+            uint32_t bits = Get32(payload, 24 + i * 4);
+            memcpy(&input[i], &bits, sizeof(bits));
+        }
+        if (!layerExecutor) {
+            layerExecutor = std::make_unique<fastllm::distributed::Qwen3LayerExecutor>(*weights, stream, comm);
+        }
+        auto output = layerExecutor->Forward(Get32(payload, 0), Get32(payload, 4), Get32(payload, 8),
+            Get32(payload, 12), static_cast<fastllm::distributed::Qwen3LayerStage>(Get32(payload, 16)), input);
+        std::vector<uint8_t> result;
+        for (float value : output) {
+            uint32_t bits;
+            memcpy(&bits, &value, sizeof(bits));
+            Put32(result, bits);
+        }
+        return result;
+#else
+        throw std::runtime_error("worker built without CUDA");
 #endif
     }
 
@@ -295,10 +337,17 @@ int main(int argc, char **argv) {
             Kind response;
             std::vector<uint8_t> payload;
             if (message.kind != Kind::Initialize && message.kind != Kind::LoadQwen3 &&
-                message.kind != Kind::ReadWeight && !message.payload.empty()) {
+                message.kind != Kind::ReadWeight && message.kind != Kind::ForwardLayer && !message.payload.empty()) {
                 throw std::runtime_error("unexpected worker command payload");
             }
             switch (message.kind) {
+                case Kind::ForwardLayer:
+                    if (!initialized) {
+                        throw std::runtime_error("ForwardLayer before Initialize");
+                    }
+                    payload = runtime.ForwardLayer(message.payload);
+                    response = Kind::LayerOutput;
+                    break;
                 case Kind::LoadQwen3:
                     if (!initialized) {
                         throw std::runtime_error("LoadQwen3 before Initialize");
@@ -360,7 +409,9 @@ int main(int argc, char **argv) {
                 default:
                     throw std::runtime_error("unknown worker command");
             }
-            Send(kWorkerFd, {response, session, sequence, payload}, Clock::now() + std::chrono::seconds(10));
+            auto responseTimeout = message.kind == Kind::ForwardLayer ?
+                std::chrono::milliseconds(Get32(message.payload, 20)) : std::chrono::milliseconds(10000);
+            Send(kWorkerFd, {response, session, sequence, payload}, Clock::now() + responseTimeout);
         }
     } catch (const std::exception &e) {
         if (canReport) {
