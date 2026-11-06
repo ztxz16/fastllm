@@ -5,12 +5,20 @@
 #include <cmath>
 #include <algorithm>
 #include <cstring>
+#include <cstdlib>
 #include <iostream>
 #include <numeric>
 #include <stdexcept>
 
 using namespace fastllm;
 namespace {
+void SetEnv(const char *name, const char *value) {
+#ifdef _WIN32
+    _putenv_s(name, value);
+#else
+    setenv(name, value, 1);
+#endif
+}
 void Check(bool ok, const char *message) {
     if (!ok) throw std::runtime_error(message);
 }
@@ -43,7 +51,7 @@ void Allocate(Data &out, DataType type, const std::vector<int> &dims, int device
     out.Allocate();
 }
 void Indices(Data &out, const std::vector<int> &values, int rows, int device) {
-    out.dataType = INT32;
+    out.dataType = fastllm::INT32;
     out.UpdateUnitSize();
     out.Resize({rows, (int)values.size() / rows});
     out.Allocate();
@@ -438,9 +446,9 @@ struct Qwen4PrefixCacheTestAccess {
 }
 int main() {
     try {
-        setenv("FASTLLM_PREFIX_CACHE", "1", 1);
-        setenv("FASTLLM_PREFIX_CACHE_SNAPSHOT_INTERVAL_PAGES", "1", 1);
-        setenv("FASTLLM_QWEN4_ENABLE_MTP", "0", 1);
+        SetEnv("FASTLLM_PREFIX_CACHE", "1");
+        SetEnv("FASTLLM_PREFIX_CACHE_SNAPSHOT_INTERVAL_PAGES", "1");
+        SetEnv("FASTLLM_QWEN4_ENABLE_MTP", "0");
         auto devices = FastllmCudaGetTotalSizes();
         Check(!devices.empty(), "CUDA device required");
         for (int device = 0; device < std::min(2, (int)devices.size()); ++device) {
