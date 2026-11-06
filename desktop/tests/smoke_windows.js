@@ -133,13 +133,14 @@ async function main() {
         max_batch: "1", enable_thinking: "false",
         host: "127.0.0.1", port: String(modelPort), threads: "4", max_context_length: "2048",
       });
+      // Large quantized models may repack weights during their first load.
       await until(async () => {
         const state = await api("/api/runtime");
         if (["failed", "error", "exited"].includes(state.phase)) {
           throw Object.assign(new Error(JSON.stringify((await api("/api/logs")).entries.slice(-10))), { fatal: true });
         }
         return state.ready;
-      }, 240_000);
+      }, 600_000);
       await cdp.evaluate(`document.querySelector('[data-view-button="webui"]').click()`);
       await until(() => cdp.evaluate(`!document.querySelector('#webui-content').classList.contains('hidden')
         && Boolean(document.querySelector('#webui-content').firstElementChild?.shadowRoot?.querySelector('#newChat'))`), 60_000);
