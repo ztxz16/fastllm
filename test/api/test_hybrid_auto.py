@@ -783,6 +783,16 @@ class HybridAutoTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             auto.plan(a, g, costs, "pp", {0: 1}, gpu, ram)
 
+    def test_pageable_weights_keep_cache_plan_without_full_snapshot(self):
+        g, c, gpu, ram = fixture()
+        plans = []
+        for pinned in ("1", "0"):
+            with patch.dict(os.environ, {"FT_PINNED_WEIGHT": pinned}):
+                plans.append(auto.plan(args(moe_device_layers=-1), g, c, "pp", {0: 1}, gpu, ram))
+        self.assertEqual(plans[0]["host_estimated_bytes"], plans[1]["host_estimated_bytes"])
+        self.assertEqual(plans[0]["moe_cuda_cache"], plans[1]["moe_cuda_cache"])
+        self.assertGreater(plans[1]["moe_cuda_cache"], 0)
+
     def test_snapshot_fallback_counts_a_second_host_copy(self):
         g, c, gpu, ram = fixture()
         p = auto.plan(args(), g, c, "pp", {0: 1}, gpu, ram)

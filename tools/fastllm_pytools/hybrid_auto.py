@@ -1673,6 +1673,12 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
             cuda_cache = max(cache.values())
             # One streamed load group, host input/output staging and tokenizer.
             staging = max(largest, max(experts, default=0))
+            if (host_experts and args.moe_device != "disk" and not snapshot and
+                    os.environ.get("FT_PINNED_WEIGHT", "1").lower() in ("0", "false", "off")):
+                # The load window is retired before graph source staging. Reuse
+                # that allowance; the existing GiB margin covers DMA/control rings.
+                record = math.ceil(max(experts, default=0) / max(1, model.experts) / 256) * 256
+                staging = max(staging, len(mapping) * min(16, model.experts) * record)
             # V4.1 PP projections move to CUDA during loading. Its conversion
             # scratch is retired before allocating request workspace.
             early_cuda = (model.family == "deepseek_v41" and mode == "pp" and
@@ -1684,8 +1690,9 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
                 host_required += eager_host_experts
             if args.moe_device != "disk":
                 host_required += host_experts
-                pinned = os.environ.get("FT_PINNED_WEIGHT", "1").lower() not in ("0", "false", "off")
-                if snapshot or not pinned or (cuda_cache > 0 and args.moe_device == "cpu" and not getattr(args, "_host_moe_shared", False)):
+                # Pageable NUMA experts share the same backing storage as pinned
+                # experts. Only bounded transport staging is duplicated.
+                if snapshot or (cuda_cache > 0 and args.moe_device == "cpu" and not getattr(args, "_host_moe_shared", False)):
                     host_required += host_experts
             if streaming:
                 # Full pinned KV replaces the normal request mirror. Retain
