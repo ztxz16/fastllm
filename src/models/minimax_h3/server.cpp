@@ -1,4 +1,5 @@
 #include "models/minimax_h3/runtime.h"
+#include "models/minimax_h3/model_source.h"
 #include "json11.hpp"
 #include "httplib.h"
 #include <atomic>
@@ -406,7 +407,7 @@ class Service {
 int main(int argc, char **argv) {
     try {
         std::string model, output = "minimax-h3-output", host = "127.0.0.1", key,
-                           demo = "tools/minimax_h3/demo.html", ffmpeg = "ffmpeg", vaePrecision, pika;
+                           demo = "tools/minimax_h3/demo.html", ffmpeg = "ffmpeg", vaePrecision, pika, baseModel;
         int port = 8009;
         std::vector<int> devices{0};
         bool fp32 = false;
@@ -419,6 +420,8 @@ int main(int argc, char **argv) {
                 model = v;
             else if (arg == "--pika")
                 pika = v;
+            else if (arg == "--base-model")
+                baseModel = v;
             else if (arg == "--output")
                 output = v;
             else if (arg == "--host")
@@ -442,8 +445,9 @@ int main(int argc, char **argv) {
             else
                 throw std::invalid_argument("unknown argument " + arg);
         }
-        if (model.empty())
-            throw std::invalid_argument("--model is required");
+        auto source = resolveModelSource(model, baseModel, pika);
+        model = source.baseDirectory;
+        pika = source.pikaDirectory;
         auto videoType = parseVideoPrecision(vaePrecision, fp32);
         Service service(model, output, devices, fp32, videoType, ffmpeg, pika);
         httplib::Server server;

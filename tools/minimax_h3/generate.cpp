@@ -1,4 +1,5 @@
 #include "models/minimax_h3/runtime.h"
+#include "models/minimax_h3/model_source.h"
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -10,7 +11,7 @@ int main(int argc, char **argv) {
     try {
         GenerateOptions options;
         std::string model, output = "minimax-h3.mp4", ffmpeg = "ffmpeg", traceDirectory, initialVideo,
-                           initialAudio, vaePrecision, pika;
+                           initialAudio, vaePrecision, pika, baseModel;
         std::vector<int> devices{0};
         bool fp32 = false, stepsSpecified = false;
         bool widthSpecified = false, heightSpecified = false;
@@ -26,6 +27,8 @@ int main(int argc, char **argv) {
                 model = v;
             else if (arg == "--pika")
                 pika = v;
+            else if (arg == "--base-model")
+                baseModel = v;
             else if (arg == "--prompt")
                 options.prompt = v;
             else if (arg == "--output")
@@ -79,8 +82,9 @@ int main(int argc, char **argv) {
             else
                 throw std::invalid_argument("unknown argument " + arg);
         }
-        if (model.empty())
-            throw std::invalid_argument("--model is required");
+        auto source = resolveModelSource(model, baseModel, pika);
+        model = source.baseDirectory;
+        pika = source.pikaDirectory;
         if (!pika.empty()) {
             if (stepsSpecified && options.steps != 6)
                 throw std::invalid_argument("Pika H3 Flex requires --steps 6");

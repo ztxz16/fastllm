@@ -1,5 +1,6 @@
 #include "models/minimax_h3/runtime.h"
 #include "models/minimax_h3/parallel.h"
+#include "models/minimax_h3/model_source.h"
 #include "json11.hpp"
 #include <cmath>
 #include <fstream>
@@ -11,32 +12,8 @@ namespace {
 void require(bool ok, const std::string &message) {
     if (!ok) throw std::invalid_argument("Pika adapter: " + message);
 }
-json11::Json readManifest(const std::string &path) {
-    std::ifstream file(path, std::ios::binary | std::ios::ate);
-    require(bool(file) && file.tellg() > 0 && file.tellg() <= 65536, "missing or invalid manifest: " + path);
-    std::string bytes(size_t(file.tellg()), '\0'), error;
-    file.seekg(0);
-    file.read(bytes.data(), bytes.size());
-    auto j = json11::Json::parse(bytes, error);
-    require(bool(file) && error.empty() && j.is_object(), "invalid manifest JSON");
-    return j;
-}
 void validate(const std::string &dir, const TransformerConfig &c, bool reference) {
-    auto j = readManifest(dir + "/manifest.json");
-    require(j["format_version"].number_value() == 1 && j["model"].string_value() == "pika-flex" &&
-            j["rank"].number_value() == 128 && j["alpha"].number_value() == 128, "unsupported format/rank/alpha");
-    require(j["task"].string_value() == (reference ? "ref2va" : "fl2va") &&
-            j["trunk"].string_value() == (reference ? "transformer_ref" : "transformer"), "task/trunk mismatch");
-    require(j["numerics_policy"].string_value() == (reference ? "fp32_conditioning_v1" : "bf16_conditioning_v1"),
-            "unsupported conditioning precision");
-    require(j["base"]["repo_id"].string_value() == "MiniMaxAI/MiniMax-H3" &&
-            j["base"]["revision"].string_value() == "42ed227ee7df40d41602854ae760620d6eb651fe", "unsupported base revision");
-    const auto &s = j["sampling"];
-    require(s["method"].string_value() == "renoise" && s["video_shift"].number_value() == 12 &&
-            s["audio_shift"].number_value() == 3 &&
-            s["knots"] == json11::Json::array{1000, 750, 500, 250, 100, 40, 0}, "unsupported sampling schedule");
-    require(j["target_modules"] == json11::Json::array{"to_q", "to_k", "to_v", "to_out.0", "ff.net.0.proj", "ff.net.2"},
-            "unsupported target modules");
+    validatePikaManifest(dir, reference);
     std::ifstream file(dir + "/adapter.safetensors", std::ios::binary | std::ios::ate);
     require(bool(file), "missing adapter.safetensors");
     const auto size = file.tellg();

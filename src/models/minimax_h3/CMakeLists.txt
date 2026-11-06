@@ -1,7 +1,7 @@
 set_directory_properties(PROPERTIES COMPILE_OPTIONS "" COMPILE_DEFINITIONS "" INCLUDE_DIRECTORIES "")
 add_library(fastllm_minimax_h3 SHARED
     ops.cu encode.cu conditioning.cpp transformer.cpp audio.cpp video.cpp
-    text.cpp parallel.cpp pipeline.cpp pika.cpp media.cpp media_input.cpp)
+    text.cpp parallel.cpp pipeline.cpp pika.cpp model_source.cpp media.cpp media_input.cpp)
 target_link_libraries(fastllm_minimax_h3 PUBLIC fastllm_continuous pthread)
 target_include_directories(fastllm_minimax_h3 PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
 target_compile_options(fastllm_minimax_h3 PRIVATE
@@ -18,6 +18,10 @@ target_link_libraries(minimax_h3_server PRIVATE fastllm_minimax_h3)
 set_target_properties(minimax_h3_server PROPERTIES CXX_STANDARD 17 BUILD_RPATH_USE_ORIGIN TRUE)
 if(UNIT_TEST)
     enable_testing()
+    add_executable(minimax_h3_model_source ${PROJECT_SOURCE_DIR}/test/minimax_h3/test_model_source.cpp)
+    target_link_libraries(minimax_h3_model_source PRIVATE fastllm_minimax_h3)
+    set_target_properties(minimax_h3_model_source PROPERTIES CXX_STANDARD 17)
+    add_test(NAME minimax_h3_model_source COMMAND minimax_h3_model_source)
     add_executable(minimax_h3_media ${PROJECT_SOURCE_DIR}/test/minimax_h3/test_media.cpp)
     target_link_libraries(minimax_h3_media PRIVATE fastllm_minimax_h3)
     set_target_properties(minimax_h3_media PROPERTIES CXX_STANDARD 17)
