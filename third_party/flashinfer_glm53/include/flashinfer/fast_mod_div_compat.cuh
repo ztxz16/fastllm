@@ -130,7 +130,7 @@ class fast_mod_div {
           fast_mod_div_compat_detail::divmod_pow2(num_bits + shift_, unsigned_divisor);
       const auto threshold = unsigned_divisor - (unsigned_t{1} << shift_);
       multiplier_ = result.quotient + static_cast<unsigned_t>(result.remainder >= threshold);
-      add_ = static_cast<unsigned>(result.remainder < threshold);
+      add_ = static_cast<unsigned>((result.remainder) < threshold);
     }
   }
 

@@ -319,16 +319,10 @@ if (USE_CUDA)
                     if (NOT FASTLLM_CLC_EXISTING STREQUAL FASTLLM_CLC_FIXED)
                         file(WRITE "${FASTLLM_CLC_OUTPUT}" "${FASTLLM_CLC_FIXED}")
                     endif()
-                    # Limit the override to the translation units that include
-                    # this CCCL instruction header through Thrust/CUB/FlashInfer.
-                    set_property(SOURCE
-                        src/devices/cuda/fastllm-cuda.cu
-                        src/devices/cuda/fastllm-ggml-cuda.cu
-                        src/devices/cuda/attention/fastllm-attention.cu
-                        src/devices/cuda/models/deepseekv4-kernels.cu
-                        src/devices/cuda/models/qwen4-kernels.cu
-                        third_party/turbomind/src/turbomind/kernels/gemm/context.cu
-                        APPEND PROPERTY INCLUDE_DIRECTORIES "${FASTLLM_CUDA_COMPAT_DIR}")
+                    # CUB/Thrust is included transitively by split kernel units
+                    # and optional backends. Cover all users of this one SDK
+                    # header instead of maintaining an incomplete source list.
+                    include_directories(BEFORE "${FASTLLM_CUDA_COMPAT_DIR}")
                     message(STATUS "Windows CUDA cluster launch operand compatibility: ON")
                 endif()
                 break()

@@ -104,7 +104,11 @@ __global__ void __launch_bounds__(Dsv41Bf16Resources::BLOCK_THREADS, 1)
       if (tidx < R::CANDIDATES) sm.valid[tidx] = start + tidx < n ? ix[start + tidx] : -1;
     }
     __syncthreads();
-    auto gather = [&](bool power_of_two) __attribute__((always_inline)) {
+    auto gather = [&](bool power_of_two)
+#ifndef _MSC_VER
+        __attribute__((always_inline))
+#endif
+    {
       for (int task = tidx; task < R::CANDIDATES * R::QK_VECTORS; task += R::BLOCK_THREADS) {
         const int row = task / R::QK_VECTORS, d = task % R::QK_VECTORS * R::VECTOR_ELEMS;
         const int index = sm.valid[row];
