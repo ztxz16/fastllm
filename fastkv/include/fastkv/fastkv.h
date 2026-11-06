@@ -184,8 +184,8 @@ class ObjectStore {
     std::map<std::string, Entry> objects;
 };
 
-// Advisory prefix lookup with authoritative immutable object leases. Hashes
-// only prune candidates; full token equality is checked before a hit is used.
+// Exact-boundary prefix checkpoints with shared immutable payload pages.
+// Hashes only prune candidates; tokens and page bytes are compared before reuse.
 // The caller's namespace includes checkpoint, layout and tenant/media identity.
 class PrefixCache {
   public:
@@ -193,22 +193,21 @@ class PrefixCache {
         size_t tokens = 0;
         std::shared_ptr<const Message> state;
     };
-    explicit PrefixCache(size_t byteLimit, size_t maxEntries = 256, int storageDevice = -1);
+    struct Statistics {
+        uint64_t lookups = 0, hits = 0, inputTokens = 0, hitTokens = 0;
+        size_t entries = 0, bytes = 0, logicalBytes = 0;
+    };
+    // Zero maxEntries uses only the byte budget, including checkpoint metadata.
+    explicit PrefixCache(size_t byteLimit, size_t maxEntries = 0, int storageDevice = -1);
+    ~PrefixCache();
     void Publish(const std::string &nameSpace, const std::vector<int> &tokens, Message state);
     Hit Find(const std::string &nameSpace, const std::vector<int> &tokens, size_t maxTokens);
     size_t BytesUsed() const;
+    Statistics Stats() const;
 
   private:
-    struct Entry {
-        std::string nameSpace, key;
-        size_t tokens;
-        uint64_t hash, accessed;
-    };
-    mutable std::mutex mutex;
-    ObjectStore store;
-    size_t maxEntries;
-    uint64_t clock = 0;
-    std::vector<Entry> entries;
+    struct Impl;
+    std::unique_ptr<Impl> impl;
 };
 
 } // namespace fastkv
