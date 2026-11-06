@@ -345,6 +345,8 @@ head/hidden 等限制沿用单层入口。总词表上限 1048576，每 rank 至
 
 所有报告保存原始完整 logits、固定 token ID、误差统计、GPU/CUDA/NCCL 信息、Git
 提交和构建配置，以及 Markdown/CSV/JSON/XLSX 汇总；失败或中断保留部分结果并非零退出。
+汇总错误只保存有界诊断字段，完整 logits（包括失败前已完成任务）保留在各 case 的
+`tp.stdout.log` / `single.stdout.log`，避免词表向量挤入汇总表格。
 功能检查不含性能计时，warmup=0、iterations=1、repeats=1。
 
 在**服务器**沿用 CUDA 12.6、CUDA 12 版 NCCL 环境执行；首次先运行上节的通信、
@@ -388,3 +390,4 @@ bash test/distributed/run_qwen3_prefill_v100.sh /home/models/Qwen3-1.7B
 ```
 
 该脚本固定 CUDA 12.6、架构 70、逻辑 GPU 0/1，**会触发 C++/CUDA 编译，仅在服务器运行**。
+模型目录可传绝对路径，也可传相对于调用者当前目录的路径。

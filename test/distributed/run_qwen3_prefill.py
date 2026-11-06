@@ -24,6 +24,13 @@ def require(condition, message):
         raise AssertionError(message)
 
 
+def report_error(report):
+    """只摘录有界错误字段；完整 logits 留在原始日志，不写入汇总表格的原因单元格。"""
+    fields = ("status", "backend", "error", "group_failed", "workers_reaped", "shutdown_complete", "cleanup_error")
+    detail = "; ".join(f"{key}={str(report[key])[:512]}" for key in fields if key in report)
+    return detail + "; full report: corresponding .stdout.log"
+
+
 def compare_logits(actual, expected, metrics, label, atol, rtol):
     require(len(actual) == len(expected) and len(actual) > 0, label + ": logits shape mismatch")
     failed, first = 0, None
@@ -97,7 +104,7 @@ def invoke(binary, worker, model, directory, devices, label, scenario="forward",
 
 
 def verify(report, devices, tasks, vocab):
-    require(report.get("status") == "PASS" and report.get("backend") == BACKEND, str(report))
+    require(report.get("status") == "PASS" and report.get("backend") == BACKEND, report_error(report))
     workers = report["workers"]
     require(len(workers) == len(devices) and len({w["pid"] for w in workers}) == len(devices), "worker count/PIDs")
     for rank, worker in enumerate(workers):
@@ -112,8 +119,9 @@ def verify(report, devices, tasks, vocab):
 
 
 def verify_failure(code, report, spec):
-    require(code == 1 and report.get("status") == "FAIL" and report.get("backend") == BACKEND, str(report))
-    require(spec["reason"] in report.get("error", "") and report.get("group_failed") is spec["group_failed"], str(report))
+    require(code == 1 and report.get("status") == "FAIL" and report.get("backend") == BACKEND,
+            f"exit={code}; {report_error(report)}")
+    require(spec["reason"] in report.get("error", "") and report.get("group_failed") is spec["group_failed"], report_error(report))
     require(report.get("shutdown_complete") is True and "cleanup_error" not in report, "prefill cleanup failed")
     if spec["group_failed"]:
         require(report.get("workers_reaped") is True, "failed group left workers")
@@ -189,11 +197,11 @@ def main():
                 if "reason" in spec:
                     verify_failure(code, tp, spec)
                 else:
-                    require(code == 0, str(tp))
+                    require(code == 0, f"TP exit={code}; {report_error(tp)}")
                     verify(tp, devices, tasks, config["vocab_size"])
                     code, single = invoke(args.check.resolve(), args.worker.resolve(), model, directory, devices[:1], "single",
                                           spec.get("scenario", "forward"), reload_model)
-                    require(code == 0, str(single))
+                    require(code == 0, f"single exit={code}; {report_error(single)}")
                     verify(single, devices[:1], tasks, config["vocab_size"])
                     refs = None
                     if tensors is not None:

@@ -98,6 +98,28 @@ class PrefillTests(unittest.TestCase):
             with self.assertRaises(AssertionError):
                 verify(changed, [0, 1], self.tasks, self.config["vocab_size"])
 
+    def test_partial_failure_does_not_copy_large_logits_to_summary(self):
+        report = self.report()
+        report.update(status="FAIL", error="rank 1: late failure")
+        report["results"][0]["logits"] = [0.123456789] * 151936
+        with self.assertRaises(AssertionError) as failure:
+            verify(report, [0, 1], self.tasks, self.config["vocab_size"])
+        message = str(failure.exception)
+        self.assertLess(len(message), 4096)
+        self.assertIn("rank 1: late failure", message)
+        self.assertIn(".stdout.log", message)
+        self.assertNotIn("0.123456789", message)
+
+    def test_success_does_not_format_logits_for_unused_error(self):
+        class NoRepr(list):
+            def __repr__(self):
+                raise AssertionError("logits formatted on success")
+
+        report = self.report()
+        for result in report["results"]:
+            result["logits"] = NoRepr(result["logits"])
+        verify(report, [0, 1], self.tasks, self.config["vocab_size"])
+
     def test_rejection_requires_reason_and_cleanup(self):
         spec = dict(reason="token ID outside vocabulary", group_failed=True)
         report = dict(status="FAIL", backend=BACKEND, error=spec["reason"], group_failed=True,

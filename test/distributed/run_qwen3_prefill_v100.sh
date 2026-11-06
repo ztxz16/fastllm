@@ -2,8 +2,9 @@
 # 仅供双 V100 服务器手动执行：会编译 C++/CUDA，禁止在本地无编译授权时运行。
 set -euo pipefail
 
+# 在切换工作目录之前解析模型路径，相对路径以调用者当前目录为基准。
+TP_PREFILL_MODEL_DIR="$(cd -- "${1:-/home/models/Qwen3-1.7B}" && pwd -P)"
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
-TP_PREFILL_MODEL_DIR="${1:-/home/models/Qwen3-1.7B}"
 TP_PREFILL_BUILD_DIR=build-process-tp-cu126
 if [[ ! -f "$TP_PREFILL_MODEL_DIR/config.json" ]]; then
     echo "模型目录缺少 config.json：$TP_PREFILL_MODEL_DIR" >&2
