@@ -3,16 +3,17 @@
 本目录按阶段提供 Linux 单机进程底座、Qwen3 分片/GPU 权重加载、单层前向，
 以及完整 Prefill、请求 KV/Decode 和文末新增的生成验收。通信底座包括独立 C++ worker、Unix socket、
 NCCL 初始化和标量 SUM 自检、心跳、超时、退出与故障回收。
-**已接入独立 Qwen3 TP 前向与 KV/Decode；生成入口待本轮服务器验收。
-尚未接入服务推理调度、CUDA Graph、自定义 AllReduce 或前缀缓存。**
-`--tp-backend process` / `--tp_backend process` 已加入公共参数入口，但会在模型加载前
-明确报错；默认 `thread` 保持原行为。禁止把底座检查成功当成模型 TP 已实现。
-构建选项 `BUILD_PROCESS_TP` 默认关闭，显式开启后才构建和打包这两个实验程序。
+**Qwen3 稠密模型的多进程 TP 生成和常驻双请求已完成服务器验收。
+本轮接入正式模型工厂及 `ftllm chat/run/server/serve --tp_backend process`，GPU 验收待执行。**
+默认 `thread` 保持原行为；进程后端使用 C++/CUDA + NCCL，只支持未量化稠密 Qwen3。
+CUDA Graph、自定义 AllReduce、跨请求前缀缓存仍未实现。文中各阶段说明是历史边界，
+当前入口及限制以文末“正式入口接入”一节为准。
+构建选项 `BUILD_PROCESS_TP` 默认关闭，显式开启后才构建进程产物。
 
 ## 运行条件
 
 - Linux 5.3+，内核与容器策略允许 `pidfd_open`、`pidfd_send_signal`。
-- Python 3.9+。部分 Conda Python 没有暴露 pidfd 接口，验收器在 Linux x86_64/aarch64
+- 底座脚本 Python 3.9+；模型工厂和 HTTP/SSE 工具需要 Python 3.10+。部分 Conda Python 没有暴露 pidfd 接口，验收器在 Linux x86_64/aarch64
   上通过系统调用提供同等语义；仍需内核和容器允许 pidfd，不退回裸 PID 发信号。
 - 验收器须允许 `prctl(PR_SET_CHILD_SUBREAPER)`，以回收协调器死亡后的孤儿 worker。
 - CUDA/NCCL 检查需要 NVIDIA GPU、CUDA 开发环境及 NCCL 头文件和库。
@@ -330,7 +331,7 @@ SUM，复用单层入口的全部计算与通信逻辑。工作区在请求内�
 本轮仅返回**最后一个输入 token 的完整词表 FP32 logits**，不返回所有 token。
 各卡按已有词表分片计算 logits，协调进程验证分片连续、总长度一致和数值有限后
 按词表序拼接。结果是下一 token 的未归一化分数；不采样，不推进 Decode，不保存 KV。
-原 Python `--tp_backend process` 仍拒绝启动完整生成服务，不能把此入口当成已完成的服务端后端。
+在该历史阶段，Python `--tp_backend process` 仍拒绝启动服务；最新接入状态见文末。
 
 支持未量化 F16/BF16/F32 源权重，GPU 统一 FP16；支持 tied embedding、非均匀
 词表分片及已有 QKV/O/Down bias。序列长度 1..128，position 起点 0..1048576；
@@ -589,7 +590,7 @@ Python 公开客户端为 `tools/qwen3_process_session.py` 中的 `Qwen3ProcessS
 - shutdown/EOF 卸载模型并退出；Python 在正常退出及异常时都使用已有的进程组
   清理工具。客户端超时包含一次请求的控制通信和生成，不是单个 token 的耗时。
   只有整组回收成功后才写入成功退出记录；清理异常和已失败会话不能被汇总为 PASS。
-- 原通用 Python 服务 `--tp_backend process` 仍未开放。下文新增独立 Qwen3 HTTP 入口；
+- 该阶段仅开放独立 Qwen3 HTTP 入口；最新的通用 CLI 接入见文末。
   不宣称多请求并行计算、CUDA Graph、自定义 AllReduce 或跨请求前缀缓存已完成。
 
 服务器一键构建并执行四组检查（已有生成两组、新增常驻两组），再连续回答两条问题：
@@ -631,9 +632,8 @@ python3 tools/qwen3_process_chat.py \
 
 ## Qwen3 HTTP/SSE 服务与协作取消（待服务器验收）
 
-正式入口为 `tools/qwen3_process_server.py`，仅依赖标准库 HTTP 和已有 tokenizer 依赖，
-复用 `Qwen3ProcessSession` / `GenerateQwen3`。这是独立的受限聊天入口；通用
-`ftllm server --tp_backend process` 的拒绝保护仍保留，不能混用这两个入口。
+该阶段入口为 `tools/qwen3_process_server.py`，仅依赖标准库 HTTP 和 tokenizer。
+本轮已将其实现移入 FastLLM 包，旧脚本保留兼容转发；通用 CLI 接入见文末。
 
 - 模型/两 rank 权重加载一次；一个消费线程执行 FIFO 队列，每次只有一个活动请求。
   `--queue-size` 是等待槽数，默认 8，满时 HTTP 429；重复的活动 `X-Request-ID` 返回 409。
@@ -734,3 +734,62 @@ curl -N -sS http://127.0.0.1:8000/v1/chat/completions \
 ```
 
 本轮仍不包含连续批处理、CUDA Graph、自定义 AllReduce 或跨请求 Prefix Cache。
+
+
+## 正式入口接入（本轮，待服务器验收）
+
+`make_normal_llm_model(args)` 在 `tp_backend=process` 时返回 `ProcessTPModel`，
+常驻一组 C++ worker。`response` / `stream_response` / 已编码请求的 `generate` 使用
+同一原生 `GenerateQwen3`，采样、Decode 循环、GPU 算子和 NCCL 均没有移到 Python。
+请通过上下文管理器或 `close()` / `release_memory()` 显式释放模型。
+提前关闭流式迭代器会取消请求、排空原生结果、清理 KV；关闭模型会取消在途请求并回收进程。
+
+正式 CLI 已支持 `ftllm chat/run/server/serve ... --tp_backend process --tp 2`。
+`chat/run` 支持 `--prompt` 单次输出以及交互历史、`clear`、`stop`、EOF；历史每次重新编码，
+不截断、不复用跨请求 KV。`server/serve` 使用同一个模型工厂和已有的受限 HTTP/SSE 实现，
+不是线程后端的完整 FastAPI 服务：仅文本 chat completions、models、health、取消接口，
+不支持 Responses、Anthropic、工具、多模态、嵌入或 API Key。设置不支持的参数会在加载前失败。
+`llm.model(...)`、异步 handle API、webui/export/benchmark 尚不属于这个进程后端适配接口。
+
+- 仅 Linux + NVIDIA CUDA，本轮验收模型为官方未量化 `Qwen/Qwen3-1.7B`。
+  源权重 F16/BF16/F32 由既有读取器转换为 FP16，KV 也是 FP16；不支持 BF16 计算或量化权重。
+- Prompt（含模板及历史）1..128 token，`prompt + max_new_tokens - 1 <= 2048`。
+  单活动请求，HTTP 有界排队，无连续批处理。文本生成默认关闭 thinking，最大输出默认 32。
+- `--tp 2` 表示可见设备中的前两张卡；`--tp 0,1` 为逻辑编号；`--tp 0` 为单卡 0。
+  `--tp auto` 要求显式设置 `CUDA_VISIBLE_DEVICES`。不做卡数静默裁剪，不接受线程 TP 的比例配置。
+- 已有 `--dtype auto/float16`、`--atype auto/float16`、`--kv_cache_dtype auto/float16` 可用。
+  不支持的显式选项（如 `--api_key`、量化、paged KV、prefix cache、LoRA）明确拒绝。
+- 默认从 Python 包目录或 PATH 查找原生程序，也可传 `--tp-binary` / `--tp-worker`。
+  不自动编译或下载模型。标准 wheel 也包含进程公共模块，并在开启构建时打包生成协调器。
+- `fastllm_process_tp_package` 仅构建进程产物并生成 `build-process-tp-cu126/process-tp-python/ftllm`，
+  不要求编译完整旧线程后端。该目录是用于服务器验收的进程专用包，不含线程后端共享库。
+
+服务器（双 V100，CUDA 12.6，master 已合并 sk）执行：
+
+```bash
+bash test/distributed/run_qwen3_entrypoint_v100.sh /home/models/Qwen3-1.7B
+```
+
+预计三组 PASS：合成模型常驻/取消/流式 84 项、真实模型对应 14 项、正式入口 12 项。
+最后一组实际启动 `python3 -m ftllm.cli` 子进程，验证模型工厂复用、非流式/流式文本、
+非法输入后的恢复、HTTP/SSE、SIGTERM 清理，以及不支持 API Key 时必须拒绝启动。
+与原生入口统一 Prompt ID、采样/EOS、FP16 KV、Eager 和空前缀缓存，并比较实际 Token ID、
+文本、finish reason、usage 及 worker 身份；底层数学回归由前两组承担。
+报告包含 JSON/Markdown/CSV/XLSX，失败保留部分结果并返回非零。
+
+一键验收成功后，手动运行正式 CLI（使用本次构建出的包，不依赖旧版已安装 ftllm）：
+
+```bash
+export PYTHONPATH="$PWD/build-process-tp-cu126/process-tp-python${PYTHONPATH:+:$PYTHONPATH}"
+export CUDA_HOME=/usr/local/cuda-12.6
+export LD_LIBRARY_PATH="$CUDA_HOME/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export CUDA_VISIBLE_DEVICES=0,1
+export USE_TORCH=0
+python3 -m ftllm.cli run /home/models/Qwen3-1.7B \
+  --tp_backend process --tp 2 --prompt '请用一句话介绍你自己。' --max-new-tokens 32
+python3 -m ftllm.cli server /home/models/Qwen3-1.7B \
+  --tp_backend process --tp 2 --host 127.0.0.1 --port 8000 --model_name qwen3
+```
+
+这里的模块调用与已安装 `ftllm` 命令使用相同的 `ftllm.cli.main`；不添加另一条推理实现。
+本轮只完成四项计划的第 1 项入口接入，服务器通过后再推进 CUDA Graph。

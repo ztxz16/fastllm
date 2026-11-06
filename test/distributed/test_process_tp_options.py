@@ -28,18 +28,18 @@ class ProcessTPOptionsTest(unittest.TestCase):
 
     def test_process_fails_before_model_lookup_or_download(self):
         args = self.parser.parse_args(["nonexistent/model", "--tp", "2", "--tp-backend", "process"])
-        with self.assertRaisesRegex(NotImplementedError, "No model has been loaded"):
+        with self.assertRaisesRegex(ValueError, "local HF Qwen3"):
             make_normal_llm_model(args)
 
     def test_process_without_tp_cannot_fall_back(self):
         args = self.parser.parse_args(["missing-model", "--tp-backend", "process"])
-        with self.assertRaises(NotImplementedError):
+        with self.assertRaisesRegex(ValueError, "requires --tp"):
             make_normal_llm_model(args)
 
     def test_json_cannot_bypass_backend_validation(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.json"
-            for backend, error in (("process", NotImplementedError), ("invalid", ValueError)):
+            for backend, error in (("process", ValueError), ("invalid", ValueError)):
                 with self.subTest(backend=backend):
                     path.write_text(json.dumps({"model": "missing-model", "tp_backend": backend}), encoding="utf-8")
                     args = self.parser.parse_args([str(path)])
