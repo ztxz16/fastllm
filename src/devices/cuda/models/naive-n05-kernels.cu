@@ -47,7 +47,7 @@
 // MMA bodies and runtime dispatch already guard the SM80-only instructions.
 #define FASTLLM_NAIVE_DSA_MMA
 #include "naive-n05-dsa-mma.cuh"
-#include "naive-n05-indexer-batch.cuh"
+#ifdef FASTLLM_NAIVE_BATCH_INDEXER
 #include "naive-n05-indexer-staged.cuh"
 #if CUDART_VERSION >= 12040
 #include "naive-n05-indexer-compact.cuh"
@@ -56,6 +56,7 @@
 #include "naive-n05-indexer-wide-select.cuh"
 #include "naive-n05-context-merge.cuh"
 #include "naive-n05-context-merge-chunk.cuh"
+#endif
 #endif
 
 namespace {
@@ -1015,7 +1016,9 @@ constexpr int kRopeArgumentBytes = CUDART_VERSION >= 12010 ? 32764 : 4096;
 constexpr int kRopeCacheBatch = std::min(192, (kRopeArgumentBytes - 128) / int(sizeof(RopeCacheRow)));
 struct RopeCacheBatch { RopeCacheRow rows[kRopeCacheBatch]; };
 #include "naive-n05-rope-compact.cuh"
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
 #include "naive-n05-rope-request.cuh"
+#endif
 
 template <bool Packed>
 __device__ void AppendRopeCacheRow(RopeCacheRow r, int token, int head,
@@ -1094,6 +1097,7 @@ __global__ void RopeAppendCache(RopeCacheRow row, int heads, int kvHeads, int di
         heads, kvHeads, dim, valueDim, indexDim, rotaryDim, theta, valueScale, window, ring);
 }
 
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
 template <bool Packed>
 __global__ void BatchRopeAppendCache(RopeCacheBatch batch, int heads, int kvHeads, int dim,
         int valueDim, int indexDim, int rotaryDim, float theta, BF16 valueScale,
@@ -1111,6 +1115,8 @@ __global__ void VerifyRopeAppendCache(const __grid_constant__ VerifyRopeBatch ba
         0, blockIdx.x, heads, kvHeads, dim, valueDim, 0, rotaryDim, theta,
         valueScale, kSwaWindow, false);
 }
+#endif
+
 #endif
 
 // Same 64-lane FP32 tree and epsilon as LayerNorm(FP32), with BF16 I/O.
@@ -2435,26 +2441,38 @@ static_assert(sizeof(DraftBatch) < 3900, "Draft descriptors exceed generic CUDA 
 // Capture descriptors by value in a small upload node. Unlike a captured H2D
 // copy this never retains a pointer to a temporary host vector. The consuming
 // kernel sees one device array, independent of the kernel argument limit.
-template<class Row> struct DescriptorChunk {
-    static constexpr int count = std::min(256, (CUDART_VERSION >= 12010 ? 32000 : 3900) / int(sizeof(Row)));
+template<class Row, int Bytes> struct DescriptorChunk {
+    static constexpr int count = std::min(256, Bytes / int(sizeof(Row)));
     Row rows[count];
 };
-template<class Row>
-__global__ void UploadDescriptors(DescriptorChunk<Row> chunk, Row *out, int count) {
+template<class Row, int Bytes>
+__global__ void UploadDescriptors(DescriptorChunk<Row, Bytes> chunk, Row *out, int count) {
     if (threadIdx.x < count) out[threadIdx.x] = chunk.rows[threadIdx.x];
+}
+template<class Row, int Bytes>
+void UploadDescriptorChunks(const std::vector<Row> &rows, Row *out) {
+    using Chunk = DescriptorChunk<Row, Bytes>;
+    for (size_t first = 0; first < rows.size(); first += Chunk::count) {
+        const int count = std::min<size_t>(Chunk::count, rows.size() - first);
+        Chunk chunk{};
+        std::copy_n(rows.begin() + first, count, chunk.rows);
+        UploadDescriptors<<<1, 256, 0, cudaStreamPerThread>>>(chunk, out + first, count);
+    }
 }
 template<class Row>
 const Row *DeviceDescriptors(const std::vector<Row> &rows, fastllm::Data &storage) {
     Output(storage, fastllm::INT32, {int((rows.size() * sizeof(Row) + 3) / 4)});
     auto *out = (Row *)storage.cudaData;
-    for (size_t first = 0; first < rows.size(); first += DescriptorChunk<Row>::count) {
-        const int count = std::min<size_t>(DescriptorChunk<Row>::count, rows.size() - first);
-        DescriptorChunk<Row> chunk{};
-        std::copy_n(rows.begin() + first, count, chunk.rows);
-        UploadDescriptors<<<1, 256, 0, cudaStreamPerThread>>>(chunk, out + first, count);
+#if CUDART_VERSION >= 12010 && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700)
+    if (FastllmCudaRuntimeArch() >= 70) {
+        UploadDescriptorChunks<Row, 32000>(rows, out);
+        return out;
     }
+#endif
+    UploadDescriptorChunks<Row, 3900>(rows, out);
     return out;
 }
+
 bool DescriptorWorkspaceAliases(const fastllm::Data *workspace, const fastllm::Data &data) {
     return workspace && (workspace->isFake || workspace->multiDeviceData ||
         workspace == &data || (workspace->cudaData && workspace->cudaData == data.cudaData));
@@ -3217,6 +3235,17 @@ bool FastllmCudaNaiveBatchRopeAppendCache(fastllm::Data &q, const fastllm::Data 
     if (!PrepareBatchRopeCache(q, k, v, positions, rows, liveKeys, heads, kvHeads,
             dim, valueDim, rotaryDim, theta, valueScale, window, packedQkv, ring,
             descriptors, indexDim)) return false;
+    // SM60 retains the same per-row math without the SM70 large-argument ABI.
+    if (FastllmCudaRuntimeArch() < 70) {
+        auto kernel = packedQkv ? RopeAppendCache<true> : RopeAppendCache<false>;
+        for (const auto &descriptor : descriptors)
+            kernel<<<heads + 2 * kvHeads + (indexDim != 0), 128>>>(descriptor,
+                heads, kvHeads, dim, valueDim, indexDim, rotaryDim, theta,
+                __float2bfloat16_rn(valueScale), window, ring);
+        CheckLaunch();
+        return true;
+    }
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
     const bool staged = std::any_of(rows.begin(), rows.end(),
         [](const FastllmNaiveRopeCacheRow &r) { return r.verifyOffset >= 0 || r.cacheOffset >= 0; });
 #if CUDART_VERSION >= 12010
@@ -3281,6 +3310,9 @@ bool FastllmCudaNaiveBatchRopeAppendCache(fastllm::Data &q, const fastllm::Data 
     }
     CheckLaunch();
     return true;
+#else
+    return false;
+#endif
 }
 
 bool FastllmCudaNaiveBatchQkvRopeAppendCache(const fastllm::Data &input,
@@ -5146,6 +5178,7 @@ template <class Kernel> bool BulkKernelSupported(Kernel kernel, size_t shared, i
 bool PrefetchDSAAttention(const fastllm::Data &query, const float *bias,
         const std::vector<FastllmNaiveDSARow> &rows, int heads, int kvHeads,
         fastllm::Data &output) {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
     namespace bulk = pipeline_bulk;
     if (FastllmCudaRuntimeArch() != 90 || heads != 16 || kvHeads != 1 || rows.size() < 32)
         return false;
@@ -5227,6 +5260,9 @@ bool PrefetchDSAAttention(const fastllm::Data &query, const float *bias,
             (BF16 *)output.cudaData + (size_t)first * heads * 128, heads, kvHeads);
     }
     return true;
+#else
+    return false;
+#endif
 }
 
 #if CUDART_VERSION >= 12010
@@ -5245,6 +5281,7 @@ bool CompactAttentionSupported(const std::vector<FastllmNaiveDSARow> &rows) {
 
 bool VerifySwaQueryReuse(const fastllm::Data &query, const float *bias,
         const std::vector<FastllmNaiveDSARow> &rows, int heads, int kvHeads, fastllm::Data &output) {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
     namespace swa = naive_prefill_mma;
     if (rows.empty() || rows.front().verifyOffset < 0) return false;
     const bool fp8 = rows.front().fp8;
@@ -5281,6 +5318,9 @@ bool VerifySwaQueryReuse(const fastllm::Data &query, const float *bias,
             (const BF16 *)query.cudaData, descriptors, bias, (BF16 *)output.cudaData, heads, kvHeads);
     }
     return true;
+#else
+    return false;
+#endif
 }
 
 template <int Max, bool Ring>

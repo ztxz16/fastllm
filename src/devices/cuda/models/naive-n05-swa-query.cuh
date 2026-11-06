@@ -127,6 +127,8 @@ struct SwaRingKV {
         return logical >= prefix ? 128 + logical - prefix : logical & 127;
     }
 };
+// The large descriptor argument and grid-constant ABI require SM70.
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
 template <int Queries, bool FP8>
 __global__ __launch_bounds__(256) void SwaVerifyQueries(const BF *q,
 #if CUDART_VERSION >= 12010
@@ -184,4 +186,5 @@ __global__ __launch_bounds__(256) void SwaVerifyQueries(const BF *q,
     SwaQueryValues(s, offsets, out, group.first, group.count, heads, head, w, l, lengths);
 #endif
 }
+#endif
 } // namespace naive_prefill_mma
