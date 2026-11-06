@@ -44,11 +44,25 @@ def fixture():
     custom_enabled = args.get('--custom-allreduce') == '1'
     ar = dict(enabled=custom_enabled, active=custom_enabled, custom_calls=0, nccl_calls=0,
               workspace_bytes=2*1024*1024+4 if custom_enabled else 388)
+    prefix_enabled = args.get('--prefix-cache') == '1'
+    prefix = dict(enabled=prefix_enabled, entries=0, device_bytes=0, lookups=0, hits=0,
+                  reused_tokens=0, last_reused_tokens=0, last_computed_tokens=0, evictions=0, clears=0)
+    saved_prompt = []
 
     def send(value):
+        nonlocal saved_prompt
         if value['event'] != 'token' and mode != 'graph_missing':
             event = value['event']
             if event == 'result' and value['status'] == 'PASS':
+                if prefix_enabled:
+                    ids = value['request']['token_ids']
+                    reused = 0
+                    while reused < min(len(saved_prompt), len(ids)-1) and saved_prompt[reused] == ids[reused]:
+                        reused += 1
+                    prefix.update(entries=1, device_bytes=16*len(ids), lookups=prefix['lookups']+1,
+                                  hits=prefix['hits']+int(reused > 0), reused_tokens=prefix['reused_tokens']+reused,
+                                  last_reused_tokens=reused, last_computed_tokens=len(ids)-reused)
+                    saved_prompt = ids[:]
                 decodes = len(value['token_ids']) - 1
                 ar['custom_calls' if custom_enabled else 'nccl_calls'] += 2 * (1 + decodes + int(graph_enabled and decodes > 0))
                 if graph_enabled:
@@ -58,6 +72,16 @@ def fixture():
                 else:
                     graph['eager_decodes'] += decodes
             state = dict(graph)
+            if mode != 'prefix_missing':
+                state['prefix_cache'] = dict(prefix)
+                if event == 'shutdown' and mode != 'prefix_leak':
+                    state['prefix_cache'] = {key: (prefix_enabled if key == 'enabled' else 0) for key in prefix}
+                if mode == 'prefix_float_' + event:
+                    state['prefix_cache']['hits'] = float(state['prefix_cache']['hits'])
+                if mode == 'prefix_fallback':
+                    state['prefix_cache']['enabled'] = False
+                if mode == 'prefix_stale' and event == 'result':
+                    state['prefix_cache'].update(lookups=0, hits=0, reused_tokens=0)
             if mode != 'ar_missing':
                 state['allreduce'] = dict(ar)
                 if mode == 'ar_float_' + event:
@@ -108,6 +132,11 @@ def fixture():
             send(dict(event="shutdown", id=message["id"], status="PASS", shutdown_complete=True,
                       cache_after_unload=cache))
             return
+        if message['op'] == 'clear_prefix_cache':
+            saved_prompt = []
+            prefix.update(entries=0, device_bytes=0, clears=prefix['clears'] + int(prefix_enabled))
+            send(dict(event='prefix_cache_cleared', id=message['id'], status='PASS', cache=cache))
+            continue
         request = message["request"]
         if mode == "timeout":
             child = subprocess.Popen([sys.executable, "-c", "import signal; signal.raise_signal(signal.SIGSTOP)"])
@@ -125,7 +154,7 @@ def fixture():
                       workers=workers, reusable=True, request=request, token_ids=[request["token_ids"][0]],
                       finish_reason="eos" if request["token_ids"][0] in request.get("eos_token_ids", []) else "length",
                       cache_after_generate=cache)
-        if (mode in ('graph_normal', 'graph_stale') or mode.startswith('ar_')) and request.get('max_new_tokens', 0) > 0:
+        if (mode in ('graph_normal', 'graph_stale') or mode.startswith(('ar_', 'prefix_'))) and request.get('max_new_tokens', 0) > 0:
             result['token_ids'] *= request['max_new_tokens']
             result['steps'] = [dict(token_id=token) for token in result['token_ids']]
         if message.get("stream_tokens"):

@@ -3,11 +3,11 @@
 本目录按阶段提供 Linux 单机进程底座、Qwen3 分片/GPU 权重加载、单层前向，
 以及完整 Prefill、请求 KV/Decode 和文末新增的生成验收。通信底座包括独立 C++ worker、Unix socket、
 NCCL 初始化和标量 SUM 自检、心跳、超时、退出与故障回收。
-**Qwen3 稠密模型的多进程 TP 生成、常驻请求、正式模型工厂和 Decode CUDA Graph
-已完成用户服务器验收。本轮新增双卡 CUDA IPC 自定义 AllReduce，GPU 验收待执行。**
+**Qwen3 稠密模型的多进程 TP 生成、常驻请求、正式模型工厂、Decode CUDA Graph
+和双卡 CUDA IPC 自定义 AllReduce 已完成用户服务器验收。本轮新增跨请求前缀缓存，GPU 验收待执行。**
 默认 `thread` 保持原行为；进程后端使用 C++/CUDA + NCCL，只支持未量化稠密 Qwen3。
-跨请求前缀缓存仍未实现。文中各阶段说明是历史边界，
-当前入口及限制以文末“正式入口接入”“Decode CUDA Graph”和“自定义 AllReduce”各节为准。
+文中各阶段说明是历史边界，当前入口及限制以文末“正式入口接入”“Decode CUDA Graph”、
+“自定义 AllReduce”和“跨请求前缀缓存”各节为准。
 构建选项 `BUILD_PROCESS_TP` 默认关闭，显式开启后才构建进程产物。
 
 ## 运行条件
@@ -746,7 +746,7 @@ curl -N -sS http://127.0.0.1:8000/v1/chat/completions \
 
 正式 CLI 已支持 `ftllm chat/run/server/serve ... --tp_backend process --tp 2`。
 `chat/run` 支持 `--prompt` 单次输出以及交互历史、`clear`、`stop`、EOF；历史每次重新编码，
-不截断、不复用跨请求 KV。`server/serve` 使用同一个模型工厂和已有的受限 HTTP/SSE 实现，
+不截断；跨请求 KV 复用需显式开启文末的前缀缓存。`server/serve` 使用同一个模型工厂和已有的受限 HTTP/SSE 实现，
 不是线程后端的完整 FastAPI 服务：仅文本 chat completions、models、health、取消接口，
 不支持 Responses、Anthropic、工具、多模态、嵌入或 API Key。设置不支持的参数会在加载前失败。
 `llm.model(...)`、异步 handle API、webui/export/benchmark 尚不属于这个进程后端适配接口。
@@ -758,7 +758,7 @@ curl -N -sS http://127.0.0.1:8000/v1/chat/completions \
 - `--tp 2` 表示可见设备中的前两张卡；`--tp 0,1` 为逻辑编号；`--tp 0` 为单卡 0。
   `--tp auto` 要求显式设置 `CUDA_VISIBLE_DEVICES`。不做卡数静默裁剪，不接受线程 TP 的比例配置。
 - 已有 `--dtype auto/float16`、`--atype auto/float16`、`--kv_cache_dtype auto/float16` 可用。
-  不支持的显式选项（如 `--api_key`、量化、paged KV、prefix cache、LoRA）明确拒绝。
+  不支持的显式选项（如 `--api_key`、量化、paged KV、LoRA）明确拒绝。
 - 默认从 Python 包目录或 PATH 查找原生程序，也可传 `--tp-binary` / `--tp-worker`。
   不自动编译或下载模型。标准 wheel 也包含进程公共模块，并在开启构建时打包生成协调器。
 - `fastllm_process_tp_package` 仅构建进程产物并生成 `build-process-tp-cu126/process-tp-python/ftllm`，
@@ -851,7 +851,7 @@ python3 -m ftllm.cli run /home/models/Qwen3-1.7B \
 捕获设计依据：[NCCL 2.22.3 CUDA Graph](https://docs.nvidia.com/deeplearning/nccl/archives/nccl_2223/user-guide/doc/usage/cudagraph.html)、
 [cuBLAS 12.6.3 CUDA Graph](https://docs.nvidia.com/cuda/archive/12.6.3/cublas/index.html#cuda-graphs-support)。
 
-## 自定义 AllReduce（第 3 项，待服务器验收）
+## 自定义 AllReduce（第 3 项，服务器验收已通过）
 
 正式工厂/CLI 增加 `--custom-allreduce`，可以与 `--cuda-graph` 组合。
 默认仍使用 NCCL。当前自定义路径限定单机双进程、两张 SM70+ GPU（各至少 16 SM），
@@ -875,7 +875,7 @@ NCCL 模式保留原来的卡数范围。此处未扩展为多机或 4/8 卡自�
   模型重载、交错无状态 Prefill 和新请求共用该生命周期。
 - 原生 `fastllm_tp_generate`、`fastllm_tp_decode_check`、`fastllm_tp_check` 接受 `--custom-allreduce 0|1`。
   正式 Python CLI 为无值开关。旧线程环境变量 `FASTLLM_CUDA_CUSTOM_ALLREDUCE` 不控制本实现。
-  控制协议 v3，新旧 worker/协调器混用明确拒绝；本轮脚本会一起重建所需产物。
+  该阶段控制协议 v3；前缀缓存阶段升级为 v4。新旧 worker/协调器混用明确拒绝，脚本一起重建所需产物。
 - 每个 rank 的 `graph` 诊断新增 `allreduce`：enabled、active、custom_calls、nccl_calls、workspace_bytes。
   即使 Eager 也有这份诊断。custom_calls/nccl_calls 来自 GPU，包含 Graph warmup/replay 的实际操作，
   不包含 IPC 引导或关闭屏障；模型卸载不清零，组重建才清零。active 表示 IPC 映射，不是请求活动状态。
@@ -901,7 +901,7 @@ bash test/distributed/run_qwen3_custom_allreduce_v100.sh /home/models/Qwen3-1.7B
 报告目录不覆盖历史结果，输出 JSON/Markdown/CSV/XLSX；任一组失败返回非零。
 原始逐任务计数保存在各用例 JSON，数值报告包含最大/平均绝对误差、失败元素数。
 这是功能验收，尚无延迟/吞吐基准，不能据此宣称快于 NCCL。
-本地只做纯 Python 回归和静态 review，未编译或运行 GPU。服务器全部通过后，再进行跨请求 Prefix Cache。
+本地只做纯 Python 回归和静态 review，未编译或运行 GPU。用户已确认十四组服务器验收全部 PASS。
 
 单次正式入口（上面脚本完成构建，并使用上一节 CUDA/PYTHONPATH 环境后）：
 
@@ -913,3 +913,77 @@ python3 -m ftllm.cli run /home/models/Qwen3-1.7B \
 
 设计依据：[CUDA 12.6.3 IPC](https://docs.nvidia.com/cuda/archive/12.6.3/cuda-c-programming-guide/index.html#interprocess-communication)、
 [PTX 系统作用域内存序](https://docs.nvidia.com/cuda/parallel-thread-execution/#memory-consistency-model)。
+
+## 跨请求前缀缓存（第 4 项，待服务器验收）
+
+正式工厂/CLI 使用 `--prefix-cache true`，默认关闭；可以同时开启 `--cuda-graph --custom-allreduce`。
+原生生成/Decode 检查器使用 `--prefix-cache 0|1`，Python `Qwen3ProcessSession` 使用布尔参数 `prefix_cache`。
+前缀匹配、LRU、KV 复制/释放和后缀计算均在 C++/CUDA worker，Python 只传参并检查实际执行证据。
+旧线程环境变量 `FASTLLM_PREFIX_CACHE` 及分页快照参数不控制此实现，显式使用会被拒绝。
+
+- 模型执行器内按 token ID 的最长公共前缀匹配，同时要求相同 RoPE 起点。
+  模型、rank、FP16 KV 布局由执行器生命周期隔离；卸载/重载清空，不能复用旧模型快照。
+- 完全相同、扩展、缩短或部分相同的 Prompt 都可命中，但至少重算最后一个 token 取得 logits。
+  单 token Prompt 不复用。无状态 `PrefillQwen3` 不读写跨请求缓存。
+- 成功 Prefill 后复制全部 Prompt 的各层 FP16 KV，生成的 Decode token 不写入快照。
+  快照不可变，命中后拷贝到独立请求 KV；Graph 仍只绑定本请求的 KV/工作区。
+  请求结束释放请求 KV/Graph，保留快照；清快照不改变活动请求 KV/Graph。
+- 最多 8 条 LRU 记录；采用全局 KV 头数计算 64 MiB 的保守预算，确保各 rank 淘汰决策一致。
+  实际单卡占用不超过该预算，TP 分片可能让实际占用更低。单条超过预算就不插入，下一次仍全量计算。
+  内存不足或 CUDA/NCCL 失败终止整组，不单 rank 降级。进入后缀计算前通过 NCCL 核对各 rank 复用长度。
+- 取消发生在 Prefill 完成之后时，已完成的 Prompt 快照保留；取消前生成的 token 不会成为新快照。
+  未执行 Prefill 的取消/非法长度不会改变缓存。非法 token ID 仍先验证，不能因命中跳过检查。
+- 正式模型 `model.clear_prefix_cache()` 或会话同名方法等待当前请求完成后清空快照，权重继续驻留。
+  原生 `ProcessGroup::ClearQwen3PrefixCache()` 也支持活动请求期间清理，因快照与请求内存互不别名。
+  正常模型关闭释放快照、请求资源及权重；worker 失败由整组进程回收 CUDA 上下文。
+- 每 rank 的 `graph` 诊断新增 `prefix_cache`：enabled、entries、device_bytes、lookups、hits、
+  reused_tokens、last_reused_tokens、last_computed_tokens、evictions、clears。计数是整数；
+  显式清缓存只增加 clears 并清空资源，不清零历史计数；卸载模型全部清零。
+  各卡 KV 头数可以不同，因此资源字节不强制相等，匹配/淘汰/执行长度必须一致。
+- 原限制保持：未量化稠密 Qwen3，FP16 计算/KV，Prompt 最长 128 token，总请求容量最多 2048，
+  单活动请求；没有分页缓存、跨模型/跨进程组共享或连续批处理。命中只减少 Prefill 后缀工作量，
+  复制及一致性检查有开销；尚未做吞吐/延迟基准，不据此宣称加速比。
+
+控制协议升级 **v4**，请一起重建 coordinator、worker、检查器及正式 Python 包。
+在远端 master 合并 sk 后，仅在服务器执行：
+
+```bash
+(
+set -euo pipefail
+cd /home/project/vllm_fastllm
+git fetch origin
+git switch master
+git pull --ff-only origin master
+bash test/distributed/run_qwen3_prefix_cache_v100.sh /home/models/Qwen3-1.7B
+)
+```
+
+脚本沿用 CUDA 12.6 / SM70 / 双 V100，先重建并跑原十四组，再跑十一组新增验收，总计 **25 组**：
+
+1. Eager/Graph × NCCL/自定义规约四种组合，每种各跑合成 10 项、真实模型 1 项，共八组。
+   覆盖 F16/BF16/F32 源权重、bias、tied embedding、KV 头复制和不均匀分片；逐步对照
+   关闭前缀缓存的 NCCL Eager TP、单卡，以及六种普通合成配置的独立 CPU 数学参考。
+   验证冷/完全/部分/更短/扩展命中、不同 RoPE 起点、8 条 LRU 淘汰、活动 Graph 中清理、
+   无状态 Prefill 交错、1/128 token 边界、模型重载隔离及缓存驻留时非法后缀导致整组回收。
+   三个较大合成配置另验 64 MiB 保守预算下/上/超界、单条超预算不插入，以及命中后规约从
+   大消息 NCCL 转入小消息自定义路径；这三项用 NCCL TP/单卡数值参考，不执行昂贵 CPU 重算。
+2. 前缀缓存 + Graph + 自定义规约的合成常驻会话 96 项、真实模型 16 项，共两组；含拒绝、EOS、
+   采样、流式、提前取消和 Graph 运行后取消恢复，检查真实 logits 和 Token ID。
+3. 同样组合的正式工厂/CLI/HTTP/SSE 13 项，包含实际前缀命中、公开清缓存接口和清理后冷启动。
+
+每组唯一结果目录在 `test/distributed/results`，包含 JSON/Markdown/CSV/XLSX。
+报告记录最大/平均绝对误差、失败元素、完整命令、GPU/CUDA/架构/Git、逐任务复用长度和显存字节；
+功能测试 warmup/iterations/repeats 为 0/1/1（Graph 另有每请求一次内部 warmup），不包含性能计时。
+任何失败返回非零且保留已经完成的报告。本地只做纯 Python/静态检查，未编译、未运行 GPU。
+
+服务器脚本完成构建后，正式入口示例：
+
+```bash
+export CUDA_HOME=/usr/local/cuda-12.6
+export LD_LIBRARY_PATH="$CUDA_HOME/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export CUDA_VISIBLE_DEVICES=0,1 USE_TORCH=0
+export PYTHONPATH="$PWD/build-process-tp-cu126/process-tp-python${PYTHONPATH:+:$PYTHONPATH}"
+python3 -m ftllm.cli chat /home/models/Qwen3-1.7B \
+  --tp_backend process --tp 2 --prefix-cache true --cuda-graph --custom-allreduce \
+  --max-new-tokens 32
+```
