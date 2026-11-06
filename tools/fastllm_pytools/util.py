@@ -501,7 +501,13 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--device', type = str, help = '使用的设备')
     parser.add_argument('--tp', type = str, default = "", help = '张量并行设备；裸数字X表示使用前X张卡，0表示0号卡，也可写 0,1 或 auto')
     parser.add_argument('--tp_backend', '--tp-backend', choices = ['thread', 'process'], default = 'thread',
-                        help = 'TP后端；默认thread。process目前只有进程底座，尚未接入模型推理')
+                        help = 'TP后端；默认thread。process支持Linux CUDA上的稠密Qwen3 FP16推理')
+    parser.add_argument('--tp-binary', default='', help='进程TP协调器路径；默认从包目录或PATH查找')
+    parser.add_argument('--tp-worker', default='', help='进程TP worker路径；默认从包目录或PATH查找')
+    parser.add_argument('--tp-output', default='process-tp-results', help='进程TP日志根目录，每次创建独立子目录')
+    parser.add_argument('--tp-timeout', type=float, default=180, help='进程TP启动/单次请求超时秒数')
+    parser.add_argument('--tp-request-timeout', type=float, default=120, help='进程TP HTTP排队及生成总超时秒数')
+    parser.add_argument('--tp-queue-size', type=int, default=8, help='进程TP HTTP最大等待请求数')
     parser.add_argument('--moe_device', type = str, default = "", help = 'moe使用的设备')
     parser.add_argument('--moe_device_layers', type = int, default = -1, help = '后面多少层moe使用moe_device，-1表示全部moe层使用moe_device')
     parser.add_argument('--moe_experts', type = int, default = -1, help = 'moe使用的专家数')
@@ -593,25 +599,36 @@ def expand_cudapp_device(device_str):
         weights = [1] * n
     return str({f'cuda:{i}': w for i, w in enumerate(weights)})
 
-def make_normal_llm_model(args, startup_progress = None):
-    if startup_progress is not None:
-        startup_progress.progress("initializing", 0, 1)
+def load_model_args(args):
+    """在后端选择前展开配置文件，确保 CLI 和模型工厂选择同一个后端。"""
+    if getattr(args, '_model_config_loaded', False):
+        return
     if (args.model and args.model != ''):
         if (args.model.endswith(".json") and os.path.exists(args.model)):
             with open(args.model, "r", encoding = "utf-8") as file:
                 args_config = json.load(file)
+                if not isinstance(args_config, dict) or any(key.startswith('_') for key in args_config):
+                    raise ValueError('model options must be a JSON object without private keys')
+                if set(args_config) & {'command', 'version'}:
+                    raise ValueError('model options cannot override the CLI command or version flag')
                 for it in args_config.keys():
                     if (it == "FASTLLM_ACTIVATE_NUMA" or it == "FASTLLM_NUMA_THREADS"):
                         os.environ[it] = str(args_config[it])
                     setattr(args, it, args_config[it])
+                args._model_config_loaded = True
+
+
+def make_normal_llm_model(args, startup_progress = None):
+    if startup_progress is not None:
+        startup_progress.progress("initializing", 0, 1)
+    load_model_args(args)
 
     tp_backend = getattr(args, "tp_backend", "thread")
     if tp_backend not in ("thread", "process"):
         raise ValueError("tp_backend must be thread or process")
     if tp_backend == "process":
-        raise NotImplementedError(
-            "process TP inference is not connected yet; use fastllm_tp_check to validate "
-            "worker lifecycle/NCCL. No model has been loaded and no thread fallback was selected.")
+        from .process_tp import ProcessTPModel
+        return ProcessTPModel(args)
 
     user_set_device = bool(args.device and args.device != "")
     user_set_moe_device = bool(args.moe_device and args.moe_device != "")
