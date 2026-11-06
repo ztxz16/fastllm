@@ -88,7 +88,8 @@ def forward(config, tensors, task):
                           for key in range(token + 1)]
                 maximum = max(scores)
                 exp = [math.exp(score - maximum) for score in scores]
-                probabilities = [value / sum(exp) for value in exp]
+                total = sum(exp)
+                probabilities = [value / total for value in exp]
                 row += [half(math.fsum(probabilities[key] * v[key][kv][dim] for key in range(token + 1)))
                         for dim in range(d)]
             context.append(row)

@@ -26,7 +26,7 @@ def require(condition, message):
 
 def report_error(report):
     """只摘录有界错误字段；完整 logits 留在原始日志，不写入汇总表格的原因单元格。"""
-    fields = ("status", "backend", "error", "group_failed", "workers_reaped", "shutdown_complete", "cleanup_error")
+    fields = ("status", "backend", "error", "group_failed", "workers_reaped", "shutdown_complete", "cleanup_error", "current_task")
     detail = "; ".join(f"{key}={str(report[key])[:512]}" for key in fields if key in report)
     return detail + "; full report: corresponding .stdout.log"
 
@@ -87,11 +87,12 @@ def prepare_reload(directory, config, tensors, tasks):
     return reload_dir, updated
 
 
-def invoke(binary, worker, model, directory, devices, label, scenario="forward", reload_model=None):
+def invoke(binary, worker, model, directory, devices, label, scenario="forward", reload_model=None, extra_args=()):
     command = [str(binary), "--worker", str(worker), "--model", str(model),
         "--tasks", str(directory / "tasks.json"), "--devices", ",".join(map(str, devices)), "--case", scenario]
     if reload_model is not None:
         command += ["--reload-model", str(reload_model)]
+    command.extend(extra_args)
     (directory / f"{label}.command.txt").write_text(shlex.join(command) + "\n")
     with (directory / f"{label}.stdout.log").open("wb") as stdout, (directory / f"{label}.stderr.log").open("wb") as stderr:
         try:

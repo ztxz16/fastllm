@@ -313,7 +313,12 @@ hidden, position_begin, stage, input`，其中 input 为行主序 FP32 数组，
 0/1/2。可指向真实模型做单层冒烟，但本轮默认验收使用小型完整模型，不能替代
 Qwen3-1.7B 全模型 logits/生成验证。
 
-## Qwen3 完整 Prefill（待服务器验收）
+## Qwen3 完整 Prefill
+
+2026-11-06 用户反馈双 V100、CUDA 12.6 上五组验收全部 PASS；完整 Prefill 报告为
+`20261106T092424Z_prefill_1e980cbd`（小模型）和
+`20261106T092512Z_prefill_b21e42fb`（真实 Qwen3-1.7B）。这些结果来自下述 Decode
+改动之前，更新代码后仍需回归；不代表新 KV/Decode 功能已通过 GPU 验收。
 
 `ProcessGroup::PrefillQwen3` 接收单请求 token ID，执行 Embedding → 全部 Decoder
 层 → 最终 RMSNorm → 分片 lm_head。Embedding 为每卡复制，隐藏状态为 FP16，
@@ -391,3 +396,86 @@ bash test/distributed/run_qwen3_prefill_v100.sh /home/models/Qwen3-1.7B
 
 该脚本固定 CUDA 12.6、架构 70、逻辑 GPU 0/1，**会触发 C++/CUDA 编译，仅在服务器运行**。
 模型目录可传绝对路径，也可传相对于调用者当前目录的路径。
+
+## 请求内 KV Cache 与逐 token Decode（待服务器验收）
+
+新增公开入口 `BeginQwen3Request`、`DecodeQwen3`、`EndQwen3Request` 和
+`Qwen3Requests`。每个进程组只允许一个活动请求，所有 rank 使用同一 Prompt 和
+后续 token ID。Begin 执行 Prefill 并保留各层旋转后的 K 和原始 V；Decode 每次
+只计算新 token，Attention 读取历史 KV，成功同步后才增加有效长度。任一 worker
+失败会终止整组，不能复用部分更新的缓存。
+
+GPU 缓存为每层 FP16 `[capacity, 2, local_kv_heads, head_dim]`，第二维依次为 K、V。
+KV 按现有 Attention 分片保存，TP 大于 KV 头数时对应 KV 头复制。分配字节为
+`layers * capacity * 2 * local_kv_heads * head_dim * sizeof(FP16)`，每 rank 上限
+256 MiB，独立于 256 MiB 临时工作区。缓存跨前向调用存活，临时工作区仍每次释放；
+End 同步并释放 KV，可以重复调用；卸载模型和正常 Stop 也释放 KV。
+
+本轮边界：
+
+- Prompt 长度 1..128；请求总容量 1..2048，包含 Prompt 和后续送入的 token。
+- `positionBegin + capacity - 1 <= 1048576`；Decode 的位置由已缓存长度自动推进。
+- 返回最后输入 token 对应的完整 FP32 词表 logits；调用者选择下一个输入 token。
+  不含 tokenizer、采样、EOS 停止、连续批处理或完整聊天服务。
+- 单个活动请求，无分页和跨请求前缀共享；Eager + NCCL，CUDA Graph、自定义
+  AllReduce 和前缀缓存仍是后续必需适配项目，本轮未实现。
+- 无状态 `PrefillQwen3` 保持原语义，可在请求活动时用于完整前缀重算，不读写请求 KV。
+- Python 服务端 `--tp_backend process` 仍未开放，不能把检查器当作完整服务后端。
+
+默认数值验收包含 30 个 case：F16/BF16/F32 源权重（GPU 均为 FP16）、bias、
+tied embedding、KV 头复制、128 维头、位置上限、容量边界、不同 Prompt、重复
+请求、活动请求卸载、变更权重后的重载、无请求 Decode、重复 Begin、无效 ID、
+容量耗尽、KV 配额超限和报告容量超限。所有正例均逐步对比单卡与双卡完整 logits，前缀不超过
+128 时还通过公开无状态 Prefill 入口重算；小模型对照独立未分片 CPU 数学参考。
+最大上下文用例从 128 个 ID=14 的 Prompt token 继续送入 1920 个 ID=16，达到
+2048；固定的小模型已检查该输入能识别丢弃早期 128 个 KV 的错误。所有步
+比较 TP/单卡，CPU 重算选取有效长度 128、129、256、2048。该 case 包含较多
+同步调用和 Python 参考计算，属于正确性测试，不用于测速。
+
+每步还检查每个 rank 的实际 KV 分配字节、有效长度、容量、RoPE 起点，验证
+无状态重算不会破坏缓存，以及 End/Unload 后全零。重复请求输出须精确一致。
+小模型逐元素容差为 `0.008 + 0.008*abs(reference)`；真实模型模式为
+`0.05 + 0.01*abs(single)`，固定相同 token ID（5 个 Prompt + 3 步 Decode，
+重复两轮），不比较自行采样得到的不同文本。真实模型没有独立 HF 对照，因此
+仍不能排除所有共同实现错误，也不代表吞吐、延迟或正式生成服务已验收。
+
+验收报告包含 JSON、Markdown、CSV、XLSX，JSON 和原始 stdout 保留完整精度；
+记录实际 GPU/CUDA/NCCL、编译架构、Git、完整命令、固定 ID、cache/执行模式。
+原始逐步 logits 与 KV 状态在 `tp.stdout.log`、`single.stdout.log`；独立 CPU
+参考在 `reference.json`，数值比较失败或中断时仍保存已算出的参考值。
+检查器累计最多保存 8388608 个 logit 元素，可用 `--max-logit-elements` 降低上限；
+超过时返回失败、保留已完成步骤并清理 worker，避免长序列的大词表报告撑爆主机内存。
+这仅限制验收报告，不限制正式公开 Decode 接口。失败记录具体操作、形状和原因，
+保留部分报告并非零退出。
+
+纯 Python 判定回归，不触发编译：
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/distributed -p 'test_*.py'
+```
+
+**双 V100 服务器**一键编译、回归之前的五组测试，再运行小模型和真实模型 Decode：
+
+```bash
+bash test/distributed/run_qwen3_decode_v100.sh /home/models/Qwen3-1.7B
+```
+
+脚本使用 CUDA 12.6、架构 70、逻辑 GPU 0/1，**会触发编译，禁止在本地无授权运行**。
+成功时打印七个 PASS 目录及“七组验收均通过”。仅单独运行新验收时，在服务器
+完成对应构建后执行：
+
+```bash
+cmake --build build-process-tp-cu126 \
+  --target fastllm_tp_worker fastllm_tp_decode_check -j 4
+
+python3 test/distributed/run_qwen3_decode.py \
+  --check build-process-tp-cu126/fastllm_tp_decode_check \
+  --worker build-process-tp-cu126/fastllm_tp_worker \
+  --devices 0,1 --build-cache build-process-tp-cu126/CMakeCache.txt
+
+python3 test/distributed/run_qwen3_decode.py \
+  --check build-process-tp-cu126/fastllm_tp_decode_check \
+  --worker build-process-tp-cu126/fastllm_tp_worker \
+  --devices 0,1 --build-cache build-process-tp-cu126/CMakeCache.txt \
+  --model /home/models/Qwen3-1.7B
+```
