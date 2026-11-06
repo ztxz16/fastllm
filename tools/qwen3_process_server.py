@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Qwen3 多进程 TP HTTP 入口：有界 FIFO、非流式聊天、协作取消；默认仅监听本机。"""
+"""Qwen3 多进程 TP HTTP 入口：有界 FIFO、SSE/非流式聊天、协作取消；默认仅监听本机。"""
 
 import argparse
 from collections import deque
@@ -10,6 +10,7 @@ import json
 import math
 import os
 from pathlib import Path
+import queue
 import re
 import select
 import shlex
@@ -21,7 +22,7 @@ import time
 import uuid
 
 from qwen3_process_chat import ROOT, prepare_request
-from qwen3_process_session import BACKEND, GenerationCancelled, GenerationRejected, Qwen3ProcessSession
+from qwen3_process_session import BACKEND, GenerationCancelled, GenerationObserverError, GenerationRejected, Qwen3ProcessSession
 
 
 class HTTPError(ValueError):
@@ -35,16 +36,21 @@ def error_body(message):
 
 
 def validate_payload(payload, model_name):
-    """只接受明确支持的聊天语义；未知参数、工具、多模态和流式均显式拒绝。"""
+    """只接受明确支持的聊天语义；未知参数、工具和多模态均显式拒绝。"""
     if not isinstance(payload, dict):
         raise HTTPError(400, "request must be a JSON object")
-    fields = {"model", "messages", "max_tokens", "temperature", "top_p", "top_k", "seed", "stream"}
+    fields = {"model", "messages", "max_tokens", "temperature", "top_p", "top_k", "seed", "stream", "stream_options"}
     if set(payload) - fields:
         raise HTTPError(400, "unsupported fields: " + ", ".join(sorted(set(payload) - fields)))
     if payload.get("model") != model_name:
         raise HTTPError(404, "unknown model")
-    if type(payload.get("stream", False)) is not bool or payload.get("stream", False):
-        raise HTTPError(400, "only stream=false is supported")
+    if type(payload.get("stream", False)) is not bool:
+        raise HTTPError(400, "stream must be boolean")
+    if "stream_options" in payload:
+        options = payload["stream_options"]
+        if (not payload.get("stream") or not isinstance(options, dict) or
+                set(options) - {"include_usage"} or type(options.get("include_usage", False)) is not bool):
+            raise HTTPError(400, "stream_options only supports include_usage:boolean with stream=true")
     messages = payload.get("messages")
     if not isinstance(messages, list) or not messages or len(messages) > 64:
         raise HTTPError(400, "messages must contain 1..64 text messages")
@@ -92,6 +98,31 @@ class Job:
     status: int = 0
     response: dict = field(default_factory=dict)
     native_id: int | None = None
+    created: int = field(default_factory=lambda: int(time.time()))
+    events: queue.Queue = field(default_factory=lambda: queue.Queue(maxsize=64))
+
+
+class IncrementalTextDecoder:
+    """复用同一 tokenizer；保留 UTF-8 未完成字节产生的尾部替换字符，禁止修改已发送前缀。"""
+
+    def __init__(self, tokenizer):
+        self.tokenizer, self.ids, self.text = tokenizer, [], ""
+
+    def push(self, token):
+        self.ids.append(token)
+        return self._decode(final=False)
+
+    def finish(self):
+        return self._decode(final=True)
+
+    def _decode(self, final):
+        text = self.tokenizer.decode(self.ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+        if not final:
+            text = text.rstrip("\ufffd")
+        if not text.startswith(self.text):
+            raise ValueError("tokenizer changed an already emitted text prefix")
+        delta, self.text = text[len(self.text):], text
+        return delta
 
 
 class ChatService:
@@ -103,6 +134,8 @@ class ChatService:
             raise ValueError("queue_size and request_timeout must be positive")
         if session.ready.get("cancellation") != "request_id_datagram":
             raise ValueError("native cancellation support required; rebuild fastllm_tp_generate")
+        if session.ready.get("token_events") is not True:
+            raise ValueError("native token events required; rebuild fastllm_tp_generate")
         self.session, self.tokenizer = session, tokenizer
         self.model, self.model_name, self.output = Path(model), model_name, Path(output)
         self.queue_size, self.request_timeout = queue_size, request_timeout
@@ -146,10 +179,10 @@ class ChatService:
         self._jobs.pop(job.id, None)
         job.done.set()
 
-    def cancel(self, request_id, status=499, reason="request cancelled"):
+    def cancel(self, request_id, status=499, reason="request cancelled", *, expected_job=None):
         with self._condition:
             job = self._jobs.get(request_id)
-            if job is None:
+            if job is None or (expected_job is not None and job is not expected_job):
                 return False
             if not job.cancel.is_set():
                 job.cancel_status, job.cancel_reason = status, reason
@@ -167,6 +200,15 @@ class ChatService:
                         queued_request_ids=[job.id for job in self._queue], queue_capacity=self.queue_size,
                         workers=self.session.ready["workers"], model_load_count=1)
 
+    def _emit(self, job, text):
+        # 回调不能阻塞原生事件读取；慢客户端取消当前请求并继续读取原生取消确认。
+        if not text or job.cancel.is_set():
+            return
+        try:
+            job.events.put_nowait(text)
+        except queue.Full:
+            self.cancel(job.id, 503, "stream consumer too slow", expected_job=job)
+
     def _generate(self, job):
         payload = job.payload
         request = prepare_request(self.model, self.tokenizer, None, messages=payload["messages"],
@@ -176,19 +218,31 @@ class ChatService:
             raise HTTPError(job.cancel_status if job.cancel.is_set() else 504,
                             job.cancel_reason if job.cancel.is_set() else "request deadline exceeded")
         timer = threading.Timer(max(0, job.deadline - time.monotonic()), self.cancel,
-                                args=(job.id, 504, "request deadline exceeded"))
+                                args=(job.id, 504, "request deadline exceeded"), kwargs=dict(expected_job=job))
+        decoder = IncrementalTextDecoder(self.tokenizer) if payload.get("stream") else None
         timer.start()
         try:
-            report = self.session.generate(request, cancel_event=job.cancel)
+            report = self.session.generate(request, cancel_event=job.cancel,
+                on_token=(lambda token: self._emit(job, decoder.push(token))) if decoder else None)
             job.native_id = report["id"]
-        except GenerationRejected as error:
+        except (GenerationRejected, GenerationObserverError) as error:
             job.native_id = error.report["id"]
             raise
         finally:
             timer.cancel()
             timer.join()
-        text = self.tokenizer.decode(report["token_ids"], skip_special_tokens=True)
-        return dict(id="chatcmpl-" + job.id, object="chat.completion", created=int(time.time()), model=self.model_name,
+        if decoder:
+            try:
+                self._emit(job, decoder.finish())
+            except ValueError as error:
+                raise HTTPError(500, f"final text decoding failed: {error}") from error
+            text = decoder.text
+            if job.cancel.is_set():
+                # 取消期间可能丢弃过增量；即使原生恰好已完成，也不能发送成功 DONE。
+                raise HTTPError(job.cancel_status, job.cancel_reason)
+        else:
+            text = self.tokenizer.decode(report["token_ids"], skip_special_tokens=True, clean_up_tokenization_spaces=False)
+        return dict(id="chatcmpl-" + job.id, object="chat.completion", created=job.created, model=self.model_name,
                     choices=[dict(index=0, message=dict(role="assistant", content=text),
                                   finish_reason="stop" if report["finish_reason"] == "eos" else "length")],
                     usage=dict(prompt_tokens=len(request["token_ids"]), completion_tokens=len(report["token_ids"]),
@@ -211,6 +265,8 @@ class ChatService:
                     response, status = self._generate(job), 200
                 except GenerationCancelled:
                     status, response = job.cancel_status, error_body(job.cancel_reason)
+                except GenerationObserverError as error:
+                    status, response = 500, error_body(error)
                 except HTTPError as error:
                     status, response = error.status, error_body(error)
                 except (GenerationRejected, ValueError) as error:
@@ -283,6 +339,71 @@ class ChatHandler(BaseHTTPRequestHandler):
         self.connection.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT)
         return True
 
+    def _sse_data(self, value):
+        data = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, allow_nan=False)
+        self.wfile.write(("data: " + data + "\n\n").encode("utf-8"))
+        self.wfile.flush()
+
+    def _stream_reply(self, service, job):
+        """逐条发送增量；成功结束必须等原生结果/KV 清理和审计落盘，错误流没有 DONE。"""
+        started = False
+        heartbeat = time.monotonic()
+
+        def chunk(delta, finish=None):
+            return dict(id="chatcmpl-" + job.id, object="chat.completion.chunk", created=job.created,
+                        model=service.model_name, choices=[dict(index=0, delta=delta, finish_reason=finish)])
+
+        def start():
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("X-Accel-Buffering", "no")
+            self.send_header("Connection", "close")
+            self.send_header("X-Request-ID", job.id)
+            self.end_headers()
+            self._sse_data(chunk(dict(role="assistant", content="")))
+
+        while True:
+            if self._disconnected():
+                service.cancel(job.id, 499, "client disconnected", expected_job=job)
+                return
+            if time.monotonic() >= job.deadline and not job.done.is_set():
+                service.cancel(job.id, 504, "request deadline exceeded", expected_job=job)
+            try:
+                text = job.events.get(timeout=0.05)
+            except queue.Empty:
+                if job.done.is_set():
+                    # done 可能在 get 超时与检查之间置位；必须再排空最后一个文本增量。
+                    try:
+                        text = job.events.get_nowait()
+                    except queue.Empty:
+                        break
+                else:
+                    if started and time.monotonic() - heartbeat >= 1:
+                        self.wfile.write(b": keep-alive\n\n")
+                        self.wfile.flush()
+                        heartbeat = time.monotonic()
+                    continue
+            if not started:
+                start()
+                started = True
+            self._sse_data(chunk(dict(content=text)))
+
+        if job.status != 200:
+            if started:
+                self._sse_data(dict(error=dict(job.response["error"], code=job.status)))
+            else:
+                self._reply(job.status, job.response, job.id)
+            return
+        if not started:
+            start()
+        self._sse_data(chunk({}, job.response["choices"][0]["finish_reason"]))
+        if job.payload.get("stream_options", {}).get("include_usage", False):
+            usage = chunk({})
+            usage.update(choices=[], usage=job.response["usage"])
+            self._sse_data(usage)
+        self._sse_data("[DONE]")
+
     def _dispatch(self):
         service = self.server.service
         if self.command == "GET" and self.path == "/health":
@@ -324,16 +445,18 @@ class ChatHandler(BaseHTTPRequestHandler):
         request_id = self.headers.get("X-Request-ID")
         job = service.submit(payload, request_id)
         try:
+            if payload.get("stream"):
+                return self._stream_reply(service, job)
             while not job.done.wait(0.05):
                 if self._disconnected():
-                    service.cancel(job.id, 499, "client disconnected")
+                    service.cancel(job.id, 499, "client disconnected", expected_job=job)
                     return
                 if time.monotonic() >= job.deadline:
-                    service.cancel(job.id, 504, "request deadline exceeded")
+                    service.cancel(job.id, 504, "request deadline exceeded", expected_job=job)
             self._reply(job.status, job.response, job.id)
         finally:
             if not job.done.is_set():
-                service.cancel(job.id, 499, "client disconnected")
+                service.cancel(job.id, 499, "client disconnected", expected_job=job)
 
     def handle_one_request(self):
         try:

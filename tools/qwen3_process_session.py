@@ -30,6 +30,14 @@ class GenerationCancelled(GenerationRejected):
     """当前请求已在计算边界取消并释放 KV，模型和 worker 继续驻留。"""
 
 
+class GenerationObserverError(RuntimeError):
+    """Token 回调失败；已取消并读完原生结果，确认 KV 为空后保留会话。"""
+
+    def __init__(self, report, error):
+        self.report = report
+        super().__init__(f"token observer failed: {type(error).__name__}: {error}")
+
+
 class Qwen3ProcessSession:
     """同步会话；线程调用串行化，超时或协议错误后整组回收，不自动重试请求。"""
 
@@ -50,6 +58,7 @@ class Qwen3ProcessSession:
         self._next_id = 1
         self._cancel_event = None
         self._cancel_sent = False
+        self._observer_error = None
 
     def _receive(self, size, deadline):
         chunks = bytearray()
@@ -68,7 +77,8 @@ class Qwen3ProcessSession:
         return chunks
 
     def _send_cancel(self):
-        if self._cancel_event is not None and self._cancel_event.is_set() and not self._cancel_sent:
+        requested = self._observer_error is not None or (self._cancel_event is not None and self._cancel_event.is_set())
+        if requested and not self._cancel_sent:
             self._cancel_socket.send(struct.pack("!I", self._next_id))
             self._cancel_sent = True
 
@@ -81,7 +91,7 @@ class Qwen3ProcessSession:
             raise RuntimeError("session response must be object")
         return result
 
-    def _exchange(self, message):
+    def _exchange(self, message, on_event=None):
         data = json.dumps(message, ensure_ascii=False, allow_nan=False).encode("utf-8")
         if len(data) > 1024 * 1024:
             raise ValueError("session request exceeds 1 MiB")
@@ -89,9 +99,15 @@ class Qwen3ProcessSession:
         self._send_cancel()
         self._socket.settimeout(self.timeout)
         self._socket.sendall(struct.pack("!I", len(data)) + data)
-        result = self._read(deadline)
-        if type(result.get("id")) is not int or result["id"] != message["id"]:
-            raise RuntimeError("session response ID mismatch")
+        while True:
+            result = self._read(deadline)
+            if type(result.get("id")) is not int or result["id"] != message["id"]:
+                raise RuntimeError("session response ID mismatch")
+            if result.get("event") != "token":
+                break
+            if on_event is None:
+                raise RuntimeError("unexpected token event")
+            on_event(result)
         self._next_id += 1
         return result
 
@@ -158,7 +174,8 @@ class Qwen3ProcessSession:
                 self._dispose("failed")
                 raise
 
-    def generate(self, request, *, cancel_event=None):
+    def generate(self, request, *, cancel_event=None, on_token=None):
+        """同步生成；on_token 必须快速返回，回调异常会取消并排空结果后保留已清理的会话。"""
         if not self._lock.acquire(timeout=self.timeout):
             raise TimeoutError("session busy: waiting for previous request timed out")
         try:
@@ -166,16 +183,38 @@ class Qwen3ProcessSession:
                 raise RuntimeError(f"session is {self.state}")
             if cancel_event is not None and self.ready.get("cancellation") != "request_id_datagram":
                 raise RuntimeError("native session does not support cancellation; rebuild fastllm_tp_generate")
+            if on_token is not None and (not callable(on_token) or self.ready.get("token_events") is not True or
+                                        self.ready.get("cancellation") != "request_id_datagram"):
+                raise ValueError("token callback requires native token events and cancellation support")
             # 先检查本地序列化；尚未提交的非法输入不能破坏正在复用的会话。
             request = json.loads(json.dumps(request, allow_nan=False))
             message = dict(id=self._next_id, op="generate", request=request)
+            if on_token is not None:
+                message["stream_tokens"] = True
             if len(json.dumps(message, ensure_ascii=False).encode("utf-8")) > 1024 * 1024:
                 raise ValueError("session request exceeds 1 MiB")
             path = self.output / f"request-{self._next_id:06d}"
             path.with_suffix(".json").write_text(json.dumps(request, ensure_ascii=False, indent=2))
+            tokens = []
+
+            def on_event(event):
+                token = event.get("token_id")
+                if (type(event.get("index")) is not int or event["index"] != len(tokens) or
+                        type(token) is not int or not 0 <= token <= 4294967295 or
+                        len(tokens) >= request.get("max_new_tokens", 32) or len(tokens) >= 2048 or
+                        (tokens and tokens[-1] in request.get("eos_token_ids", []))):
+                    raise RuntimeError("invalid or out-of-order token event")
+                tokens.append(token)
+                if self._observer_error is None:
+                    try:
+                        on_token(token)
+                    except Exception as error:
+                        self._observer_error = error
+                        self._send_cancel()
+
             try:
                 self._cancel_event, self._cancel_sent = cancel_event, False
-                result = self._exchange(message)
+                result = self._exchange(message, on_event if on_token is not None else None)
                 path.with_suffix(".response.json").write_text(json.dumps(result, ensure_ascii=False, indent=2))
                 if (result.get("event") != "result" or result.get("backend") != BACKEND or
                     result.get("workers") != self._workers or result.get("reusable") is not True):
@@ -197,9 +236,16 @@ class Qwen3ProcessSession:
                         raise RuntimeError("invalid session stopping condition")
                 else:
                     raise RuntimeError("invalid session result status")
+                if on_token is not None:
+                    expected = result.get("token_ids") if result["status"] == "PASS" else [step["token_id"] for step in result.get("steps", [])]
+                    if (not isinstance(expected, list) or any(type(token) is not int for token in expected) or
+                            tokens != expected):
+                        raise RuntimeError("token events do not match final result")
             except BaseException:
                 self._dispose("failed")
                 raise
+            if self._observer_error is not None:
+                raise GenerationObserverError(result, self._observer_error) from self._observer_error
             if result["status"] == "FAIL":
                 if result.get("cancelled") is True:
                     raise GenerationCancelled(result)
@@ -207,6 +253,7 @@ class Qwen3ProcessSession:
             return result
         finally:
             self._cancel_event = None
+            self._observer_error = None
             self._lock.release()
 
     def close(self):
