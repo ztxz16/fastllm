@@ -829,7 +829,8 @@ endif()
 
 if (FASTLLM_DSV41_FLASHINFER_ENABLED)
     add_library(fastllm_dsv41_flashinfer_sm120 OBJECT
-        src/devices/cuda/models/deepseekv41-flashinfer-sm120.cu)
+        src/devices/cuda/models/deepseekv41-flashinfer-sm120.cu
+        src/devices/cuda/models/deepseekv41-indexer-sm120.cu)
     set_target_properties(fastllm_dsv41_flashinfer_sm120 PROPERTIES
         CUDA_ARCHITECTURES OFF POSITION_INDEPENDENT_CODE ON)
     target_compile_options(fastllm_dsv41_flashinfer_sm120 PRIVATE
@@ -1926,6 +1927,12 @@ if (UNIT_TEST)
         target_link_libraries(deepseek_v41_cache_readers_test PRIVATE fastllm)
         add_test(NAME deepseek_v41_cache_readers COMMAND deepseek_v41_cache_readers_test)
         set_tests_properties(deepseek_v41_cache_readers PROPERTIES
+                             LABELS cuda TIMEOUT 120 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+        add_executable(deepseek_v41_indexer_fp4_test test/basic/test_deepseek_v41_indexer_fp4.cpp)
+        target_include_directories(deepseek_v41_indexer_fp4_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        target_link_libraries(deepseek_v41_indexer_fp4_test PRIVATE fastllm)
+        add_test(NAME deepseek_v41_indexer_fp4 COMMAND deepseek_v41_indexer_fp4_test)
+        set_tests_properties(deepseek_v41_indexer_fp4 PROPERTIES
                              LABELS cuda TIMEOUT 120 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
         add_executable(deepseek_v41_topk_test test/basic/test_deepseek_v41_topk.cpp)
         target_include_directories(deepseek_v41_topk_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})

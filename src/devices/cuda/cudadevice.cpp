@@ -1,4 +1,5 @@
 #include "utils/qwen38_hybrid.h"
+#include "models/deepseekv41-indexer.cuh"
 #include "devices/cuda/fastllm-prefill-workspace.h"
 #include "gguf.h"
 #include "devices/cuda/fastllm-cuda-v41-gguf.h"
@@ -7187,7 +7188,10 @@ namespace fastllm {
                                             const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         int ratio = intParams.find("compressRatio") == intParams.end() ? 0 : intParams.find("compressRatio")->second;
         int startPos = intParams.find("startPos") == intParams.end() ? 0 : intParams.find("startPos")->second;
-        if (!FastllmCudaDeepSeekV41IndexerScore(*(datas.find("q")->second), *(datas.find("weights")->second),
+        const auto fp4 = intParams.find("fp4Query");
+        const auto score = fp4 != intParams.end() && fp4->second
+            ? FastllmCudaDeepSeekV41IndexerScoreFp4Query : FastllmCudaDeepSeekV41IndexerScore;
+        if (!score(*(datas.find("q")->second), *(datas.find("weights")->second),
                                                 *(datas.find("k")->second), ratio, startPos,
                                                 *(datas.find("output")->second))) {
             ErrorInFastLLM("DeepSeekV41IndexerScore CUDA error: kernel rejected input.\n");

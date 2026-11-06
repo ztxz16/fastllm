@@ -21,6 +21,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 #include "deepseekv41-router.cuh"
+#include "deepseekv41-indexer.cuh"
 #include "deepseekv41-router-tc.cuh"
 #include "devices/cuda/fastllm-fp8-auxiliary.h"
 #include "devices/cuda/fastllm-v41-full-decode.h"
@@ -5632,6 +5633,41 @@ extern "C" bool FastllmCudaDeepSeekV41IndexerScore(const fastllm::Data &q, const
             seqlen, heads, dim, m, (float*)output.cudaData);
     }
     return V41CheckLaunch("IndexerScore");
+}
+
+extern "C" bool FastllmCudaDeepSeekV41IndexerScoreFp4Query(const fastllm::Data &q,
+        const fastllm::Data &weights, const fastllm::Data &k, int ratio, int startPos,
+        fastllm::Data &output) {
+#ifdef FASTLLM_ENABLE_DSV41_FLASHINFER_SM120
+    const int arch = FastllmCudaRuntimeArch();
+    if ((arch == 120 || arch == 121) && !V41EnvOn("FASTLLM_DSV41_LEGACY_INDEXER") &&
+        !FastllmCudaGraphIsCapturingFast() && V41OnCuda(q) && V41OnCuda(weights) && V41OnCuda(k) &&
+        q.dataType == DataType::BFLOAT16 && q.dims.size() == 4 &&
+        q.dims[0] > 0 && q.dims[0] <= 65535 && q.dims[1] >= 9 && q.dims[1] <= 65535 * 4 &&
+        q.dims[2] == 32 && q.dims[3] == 128 &&
+        weights.dataType == DataType::FLOAT32 && weights.dims == std::vector<int>({q.dims[0], q.dims[1], 32}) &&
+        k.dataType == DataType::INT8 && k.dims.size() == 3 && k.dims[0] == q.dims[0] &&
+        k.dims[1] > 0 && k.dims[2] == 68 && ratio > 0 && startPos >= 0 &&
+        int64_t(startPos) + q.dims[1] < INT_MAX && int64_t(q.dims[0]) * q.dims[1] <= INT_MAX / 128) {
+        // Prepare the throwing allocation before acquiring temporary storage.
+        if (!V41PrepareOutput(output, DataType::FLOAT32, {q.dims[0], q.dims[1], k.dims[1]})) return false;
+        void *scratch = nullptr;
+        const size_t bytes = size_t(q.dims[0]) * q.dims[1] * 32 * 68;
+        const auto allocation = FastllmCudaTryMalloc(&scratch, bytes);
+        if (allocation == FASTLLM_CUDA_TRY_MALLOC_ERROR) return false;
+        if (allocation == FASTLLM_CUDA_TRY_MALLOC_SUCCESS) {
+            const bool ok = fastllm_v41_indexer::Fp4Prefill(q.cudaData,
+                static_cast<const float *>(weights.cudaData), static_cast<const uint8_t *>(k.cudaData),
+                static_cast<float *>(output.cudaData), scratch, q.dims[0], q.dims[1], k.dims[1], ratio, startPos);
+            if (!FastllmCudaFreeAfterCurrentThreadStream(scratch)) {
+                FastllmCudaSyncCurrentThreadStream();
+                FastllmCudaFree(scratch);
+            }
+            return ok;
+        }
+    }
+#endif
+    return FastllmCudaDeepSeekV41IndexerScore(q, weights, k, ratio, startPos, output);
 }
 
 extern "C" bool FastllmCudaDeepSeekV41CandidateBlocks(const fastllm::Data &score, int blockSize, int topkBlocks,

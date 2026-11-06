@@ -1612,9 +1612,10 @@ namespace fastllm {
 
         void V41IndexerScore(const Data &q, const Data &weights, const Data &k, int ratio, int startPos,
                              Data &output) {
+            static const bool disableFakeQuant = V41EnvFlag("FASTLLM_DSV41_DISABLE_FAKE_QUANT");
             V41Executor().Run("DeepSeekV41IndexerScore", {
                 {"q", (Data*)&q}, {"weights", (Data*)&weights}, {"k", (Data*)&k}, {"output", &output}
-            }, {}, {{"compressRatio", ratio}, {"startPos", startPos}});
+            }, {}, {{"compressRatio", ratio}, {"startPos", startPos}, {"fp4Query", !disableFakeQuant}});
         }
 
         void V41CandidateBlocks(const Data &score, int blockSize, int topkBlocks, int ratio, int startPos, Data &output) {
