@@ -125,7 +125,7 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(self.call()[0], 200)
 
     def test_payload_rejections_do_not_reach_gpu(self):
-        for extra, expected in ((dict(model="wrong"), 404), (dict(stream=True), 400), (dict(tools=[]), 400),
+        for extra, expected in ((dict(model="wrong"), 404), (dict(stream="true"), 400), (dict(tools=[]), 400),
                                 (dict(max_tokens=0), 400), (dict(max_tokens=True), 400),
                                 (dict(top_p=float("nan")), 400), (dict(temperature=-1), 400), (dict(top_p=10**400), 400),
                                 (dict(messages=[]), 400), (dict(messages=[dict(role="user", content=[])]), 400)):

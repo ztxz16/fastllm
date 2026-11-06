@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 双 V100 服务器：回归常驻会话（含新增原生取消），再验证真实 HTTP 输出和生命周期。
+# 双 V100 服务器：回归常驻会话（含新增原生取消），再验证真实 HTTP/SSE 输出和生命周期。
 set -euo pipefail
 TP_HTTP_MODEL_DIR="$(cd -- "${1:-/home/models/Qwen3-1.7B}" && pwd -P)"
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
@@ -26,4 +26,4 @@ python3 test/distributed/run_qwen3_session.py "${TP_HTTP_ARGS[@]}" \
 python3 test/distributed/run_qwen3_session.py "${TP_HTTP_ARGS[@]}" \
   --decode-check build-process-tp-cu126/fastllm_tp_decode_check --model "$TP_HTTP_MODEL_DIR"
 python3 test/distributed/run_qwen3_http.py "${TP_HTTP_ARGS[@]}" --model "$TP_HTTP_MODEL_DIR"
-echo "三组验收完成：合成/真实模型常驻与取消、HTTP 服务。报告目录见 PASS 输出。"
+echo "三组验收完成：合成/真实模型常驻与取消/流式对照、HTTP/SSE 服务。报告目录见 PASS 输出。"

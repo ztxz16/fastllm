@@ -56,7 +56,7 @@ def main():
         git_status=capture(["git", "status", "--short"]), seed=123, warmup=0, iterations=1, repeats=1,
         gpu=capture(["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv,noheader"]),
         cuda_visible_devices=os.environ.get("CUDA_VISIBLE_DEVICES"), devices=devices,
-        expected_case_count=len(specs)*12, execution="eager", prefix_cache=False, kv_cache="FP16 request-local",
+        expected_case_count=len(specs)*14, execution="eager", prefix_cache=False, kv_cache="FP16 request-local",
         report_title="Qwen3 persistent session correctness",
         report_description="同一常驻进程组串行处理请求；小模型对照CPU，真实模型逐步单卡重放。非性能测试。")
     rows = []
@@ -76,7 +76,8 @@ def main():
                      ("A_after_reject", base),
                      ("eos_first", None), ("seeded", dict(base, temperature=0.8, top_k=5, top_p=0.9)),
                      ("seeded_repeat", dict(base, temperature=0.8, top_k=5, top_p=0.9)),
-                     ("cancel_before_begin", base), ("A_after_cancel", base)]
+                     ("cancel_before_begin", base), ("A_after_cancel", base),
+                     ("stream_A", base), ("stream_seeded", dict(base, temperature=0.8, top_k=5, top_p=0.9))]
             previous = {}
             with Qwen3ProcessSession(args.generate, args.worker, model, args.devices, directory / "session", trace=True) as session:
                 for task_name, request in tasks:
@@ -111,8 +112,14 @@ def main():
                             else:
                                 raise AssertionError("invalid request accepted")
                         else:
-                            report = session.generate(request)
+                            streamed = []
+                            report = session.generate(request, on_token=streamed.append if task_name.startswith("stream_") else None)
                             verify_output(report, request, vocab)
+                            if task_name.startswith("stream_"):
+                                require(streamed == report["token_ids"], "streamed Token IDs differ from final result")
+                                original = "A" if task_name == "stream_A" else "seeded"
+                                require(streamed == previous[original]["token_ids"], "stream changed sampling result")
+                                (path / "token_events.json").write_text(json.dumps(streamed))
                             if task_name == "eos_first":
                                 require(len(report["token_ids"]) == 1 and report["finish_reason"] == "eos",
                                         "first EOS did not stop generation")

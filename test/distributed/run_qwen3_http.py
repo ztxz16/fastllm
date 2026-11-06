@@ -36,6 +36,82 @@ def call(address, method, path, payload=None, request_id=None):
         connection.close()
 
 
+
+def read_event(response):
+    """读取正式 SSE 帧；有界保留每帧，识别意外截断而非接受半个 JSON。"""
+    data = []
+    while True:
+        line = response.readline(262144)
+        if not line:
+            require(not data, "truncated SSE event")
+            return None
+        require(line.endswith(b"\n"), "SSE line too long or truncated")
+        if line == b"\n" and data:
+            text = "\n".join(data)
+            return text if text == "[DONE]" else json.loads(text)
+        if line.startswith(b"data: "):
+            data.append(line[6:].decode("utf-8").rstrip("\n"))
+
+
+def stream_call(address, payload, request_id, output, on_content=None):
+    connection = http.client.HTTPConnection(*address, timeout=240)
+    events, response, status = [], None, None
+    try:
+        connection.request("POST", "/v1/chat/completions", json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                           {"Content-Type": "application/json", "X-Request-ID": request_id})
+        response = connection.getresponse()
+        status = response.status
+        if status != 200:
+            return status, json.loads(response.read())
+        require("text/event-stream" in response.getheader("Content-Type", ""), "missing SSE content type")
+        while True:
+            event = read_event(response)
+            if event is None:
+                break
+            events.append(event)
+            if on_content and isinstance(event, dict) and event.get("choices") and event["choices"][0]["delta"].get("content"):
+                callback, on_content = on_content, None
+                if callback() == "disconnect":
+                    break
+        return status, events
+    finally:
+        if response is not None:
+            response.close()
+        connection.close()
+        (output / f"{request_id}.sse.json").write_text(json.dumps(dict(status=status, events=events), ensure_ascii=False, indent=2))
+
+
+def verify_stream(output, request_id, result, reference, tokenizer, workers, include_usage):
+    status, events = result
+    require(status == 200 and events and events[-1] == "[DONE]" and events.count("[DONE]") == 1, "missing/duplicate DONE")
+    chunks = events[:-1]
+    require(all(isinstance(e, dict) and "error" not in e and e.get("object") == "chat.completion.chunk" for e in chunks),
+            "invalid success SSE event")
+    require({e["id"] for e in chunks} == {"chatcmpl-" + request_id} and len({e["created"] for e in chunks}) == 1 and
+            {e["model"] for e in chunks} == {"qwen3"}, "SSE identity changed")
+    choices = [e["choices"][0] for e in chunks if e["choices"]]
+    require(choices[0]["delta"].get("role") == "assistant", "missing role chunk")
+    require(all(e["index"] == 0 and e["finish_reason"] is None for e in choices[:-1]), "premature stream finish")
+    final = audit(output, request_id)["response"]
+    text = "".join(e["delta"].get("content", "") for e in choices)
+    require(text == final["choices"][0]["message"]["content"], "SSE text differs from full generation")
+    require(choices[-1]["delta"] == {} and choices[-1]["finish_reason"] == final["choices"][0]["finish_reason"], "SSE finish mismatch")
+    usage = [e["usage"] for e in chunks if not e["choices"]]
+    require(usage == ([final["usage"]] if include_usage else []), "SSE usage mismatch")
+    return verify_completion(output, request_id, (200, final), reference, tokenizer, workers)
+
+
+def verify_stream_error(result, code):
+    status, events = result
+    if status == code:
+        require("error" in events, "missing HTTP error")
+        return
+    require(status == 200 and events and isinstance(events[-1], dict) and events[-1].get("error", {}).get("code") == code,
+            f"wrong stream error: {status}, {events}")
+    require("[DONE]" not in events and not any(e.get("choices") and e["choices"][0]["finish_reason"] for e in events),
+            "failed stream reported success")
+
+
 def wait_for(predicate, timeout=30):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -77,7 +153,8 @@ def verify_completion(output, request_id, result, reference, tokenizer, workers)
         error.metrics = metrics
         raise error
     choice = body["choices"][0]
-    require(choice["message"] == dict(role="assistant", content=tokenizer.decode(expected, skip_special_tokens=True)),
+    require(choice["message"] == dict(role="assistant", content=tokenizer.decode(expected, skip_special_tokens=True,
+                                                                               clean_up_tokenization_spaces=False)),
             "decoded text mismatch")
     require(choice["finish_reason"] == ("stop" if reference["finish_reason"] == "eos" else "length"), "finish reason mismatch")
     prompt = len(reference["request"]["token_ids"])
@@ -108,7 +185,7 @@ def main():
         git_status=capture(["git", "status", "--short"]), seed=0, warmup=0, iterations=1, repeats=1,
         gpu=capture(["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv,noheader"]),
         cuda_visible_devices=os.environ.get("CUDA_VISIBLE_DEVICES"), devices=args.devices,
-        expected_case_count=11, execution="eager", prefix_cache=False, kv_cache="FP16 request-local",
+        expected_case_count=17, execution="eager", prefix_cache=False, kv_cache="FP16 request-local",
         report_title="Qwen3 HTTP correctness", report_description="通过正式 HTTP/会话入口验证。误差字段为输出 Token ID 的精确一致性；不代表性能。")
     rows = []
     service = server = http_thread = None
@@ -166,7 +243,7 @@ def main():
 
                 def rejects():
                     before = len(list((output / "session").glob("request-*.response.json")))
-                    for payload, status in ((dict(payloads["A"], stream=True), 400), (dict(payloads["A"], tools=[]), 400),
+                    for payload, status in ((dict(payloads["A"], stream="true"), 400), (dict(payloads["A"], tools=[]), 400),
                                             (dict(payloads["A"], max_tokens=0), 400), (dict(payloads["A"], model="wrong"), 404)):
                         actual, body = call(address, "POST", "/v1/chat/completions", payload)
                         require(actual == status and "error" in body, "unsupported request was accepted")
@@ -222,6 +299,39 @@ def main():
                         finally:
                             service.request_timeout = 120
                     case("deadline", timeout)
+                for name, base, include_usage in (("stream_A", "A", True), ("stream_B", "B", False)):
+                    payload = dict(payloads[base], stream=True, stream_options=dict(include_usage=include_usage))
+                    case(name, lambda name=name, base=base, payload=payload, include_usage=include_usage: verify_stream(
+                        output, name, stream_call(address, payload, name, output), references[base], tokenizer, workers, include_usage))
+
+                def stream_cancel():
+                    def cancel():
+                        require(health()["active_request_id"] == "stream-cancel", "generation finished before streaming content")
+                        require(call(address, "DELETE", "/v1/requests/stream-cancel")[0] == 202, "stream cancellation rejected")
+                    result = stream_call(address, dict(long_payload, stream=True), "stream-cancel", output, cancel)
+                    verify_stream_error(result, 499)
+                    return verify_cancelled(output, "stream-cancel", workers)
+                case("stream_cancel", stream_cancel)
+
+                def stream_disconnect():
+                    stream_call(address, dict(long_payload, stream=True), "stream-disconnect", output, lambda: "disconnect")
+                    wait_for(lambda: health()["active_request_id"] is None)
+                    require(audit(output, "stream-disconnect")["status"] == 499, "SSE disconnect was ignored")
+                    return verify_cancelled(output, "stream-disconnect", workers)
+                case("stream_disconnect", stream_disconnect)
+
+                def stream_timeout():
+                    service.request_timeout = 0.5
+                    try:
+                        result = stream_call(address, dict(long_payload, stream=True), "stream-timeout", output)
+                        verify_stream_error(result, 504)
+                        return verify_cancelled(output, "stream-timeout", workers)
+                    finally:
+                        service.request_timeout = 120
+                case("stream_timeout", stream_timeout)
+                case("stream_recovery", lambda: verify_stream(output, "stream-recovery",
+                    stream_call(address, dict(payloads["A"], stream=True), "stream-recovery", output),
+                    references["A"], tokenizer, workers, False))
                 case("recovery", lambda: verify_completion(output, "recovery",
                     call(address, "POST", "/v1/chat/completions", payloads["A"], "recovery"), references["A"], tokenizer, workers))
 

@@ -583,7 +583,7 @@ Python 公开客户端为 `tools/qwen3_process_session.py` 中的 `Qwen3ProcessS
   请求最多 1 MiB，响应最多 512 MiB；trace 仍限制累计 8M logits 元素。
 - ready 消息确认模型已加载；generate 的 id 从 1 连续递增，响应包含原请求、
   worker 身份、输出 ID、结束原因和 KV 状态。客户端串行化并发调用；FIFO 排队由下文
-  HTTP 服务负责。新增 cancel_event 通过独立数据报按请求 ID 取消；尚无连续批处理或 token 流。
+  HTTP 服务负责。cancel_event 通过独立数据报按请求 ID 取消；on_token 支持逐 Token 回调，尚无连续批处理。
 - 参数拒绝且确认 KV 为空时允许继续；worker 失败、超时、协议错乱或资源异常
   终止并回收整组，后续调用失败，不会自动重试或切换线程后端。
 - shutdown/EOF 卸载模型并退出；Python 在正常退出及异常时都使用已有的进程组
@@ -626,10 +626,10 @@ python3 tools/qwen3_process_chat.py \
 - 常驻：`20261106T112946Z_session_ab3de6f2`、`20261106T112954Z_session_15c54f1f`。
 - 文本：`text-session/20261106T113158Z_069d4baf`，两请求分别 17/38 token，均 EOS，failed=0。
 
-此次新加“Prefill 前取消 → 同一 worker 再次生成 A”，常驻验收变为每模型 12 项；
+取消扩展加入“Prefill 前取消 → 同一 worker 再次生成 A”；本次再加入流式贪心/采样对照，常驻验收变为每模型 14 项；
 上面的历史结果不能代替新增取消功能的服务器验收。
 
-## Qwen3 HTTP 服务与协作取消（待服务器验收）
+## Qwen3 HTTP/SSE 服务与协作取消（待服务器验收）
 
 正式入口为 `tools/qwen3_process_server.py`，仅依赖标准库 HTTP 和已有 tokenizer 依赖，
 复用 `Qwen3ProcessSession` / `GenerateQwen3`。这是独立的受限聊天入口；通用
@@ -639,18 +639,19 @@ python3 tools/qwen3_process_chat.py \
   `--queue-size` 是等待槽数，默认 8，满时 HTTP 429；重复的活动 `X-Request-ID` 返回 409。
 - `GET /health` 提供就绪、活动 ID、等待 ID、worker 身份；`GET /v1/models` 返回模型名。
 - `POST /v1/chat/completions` 接受 `model`、`messages`、`max_tokens`、`temperature`、
-  `top_p`、`top_k`、`seed`、`stream=false`。模型默认名 `qwen3`；采样默认贪心，关闭 thinking。
+  `top_p`、`top_k`、`seed`、`stream`，以及流式专用 `stream_options.include_usage`。模型默认名 `qwen3`；采样默认贪心，关闭 thinking。
   文本 messages 可以带首条 system，然后 user/assistant 交替且以 user 结束；完整历史
   每次通过同一聊天模板编码，不自动保存服务端对话历史。
 - Prompt 含模板及历史仍限制 1..128 token；`prompt+max_tokens-1<=2048`。超限拒绝，
-  不静默截断。请求体上限 64 KiB；未知字段、工具、多模态、流式、chunked 请求均拒绝。
+  不静默截断。请求体上限 64 KiB；未知字段、工具、多模态、chunked 请求均拒绝。
   每次响应后关闭连接；不支持 HTTP 请求流水化。连接线程总数也有上限。
 - 原生 `--cancel-fd` 为独立 SOCK_DGRAM 通道，网络字节序 uint32 对应 session 请求 ID。
   在 Prefill 前、Prefill 返回后及 Decode token 边界检查；不会强行中断 CUDA/NCCL。
   取消后调用正式 End 路径释放请求 KV，检查为空后才确认 reusable；迟到取消不能误伤下一请求。
 - 客户端断连、请求超时、`DELETE /v1/requests/{X-Request-ID}` 都触发同一取消路径。
   排队任务直接移除，活动任务等待原生取消确认。DELETE 的 202 仅代表已提交取消，
-  不是 GPU 已停；请求如已在原生完成则完成结果优先。显式取消响应 499，超时响应 504。
+  不是 GPU 已停；非流式请求如已在原生完成则完成结果优先。流式取消期间可能丢弃增量，
+  即使原生同时完成也不会报告成功。显式取消状态 499，超时状态 504；流开始后的错误见下文。
 - `--request-timeout` 默认 120 秒，包含排队和生成；取消确认可能等待当前 GPU 步骤。
   `--session-timeout` 默认 180 秒，原生故障/无法响应时回收整组并将服务标记不可用，
   不自动重试、不重载模型、不 fallback。取消并清理成功后后续请求才继续。
@@ -658,16 +659,18 @@ python3 tools/qwen3_process_chat.py \
 - 默认监听 `127.0.0.1`，无认证和 TLS；定位是本机/SSH 隧道验证入口。日志目录包含
   `ready.json`、每请求 `http-*.json`、原生 session 日志/请求/输出及最终退出记录；目录唯一。
 
-双 V100 服务器一键编译和验收（新取消会影响原生成入口，故重跑常驻数值对照）：
+双 V100 服务器一键编译和验收（流式复用原生成入口，故同时回归常驻数值对照）：
 
 ```bash
 bash test/distributed/run_qwen3_http_v100.sh /home/models/Qwen3-1.7B
 ```
 
-共三组：合成模型常驻+取消 72 项、真实 Qwen3 常驻+取消 12 项、真实 HTTP 服务 11 项。
+共三组：合成模型常驻/取消/Token 流 84 项、真实 Qwen3 常驻/取消/Token 流 14 项、真实 HTTP/SSE 服务 17 项。
 前两组沿用 CPU / 单卡 logits 对照；HTTP 使用正式 HTTP 类和同一会话后端，比较与
 相同 Prompt ID、FP16 KV、EOS/采样参数、Eager 模式单次入口的精确 Token ID、文本、
 用量和结束原因。还验证有界队列、排队/活动取消、断连、超时、复用与退出。
+SSE 验证逐段文本拼接、角色/结束帧、可选 usage、唯一 DONE、流中取消/断连/超时及恢复；
+原生 Token 回调在贪心和固定 seed 采样两种配置下必须与非流式结果精确一致。
 HTTP 的误差字段指 Token ID 精确一致性，不是 logits 误差；生命周期用例为 n/a。
 任何失败或少执行用例都返回非零，保留 JSON/Markdown/CSV/XLSX 和原始报告。
 这些检查不构成性能结论，也不代替独立框架的模型质量对照。
@@ -698,4 +701,36 @@ curl -sS http://127.0.0.1:8000/v1/chat/completions \
 curl -sS -X DELETE http://127.0.0.1:8000/v1/requests/demo-1
 ```
 
-本轮仍不包含 SSE 流式输出、连续批处理、CUDA Graph、自定义 AllReduce 或跨请求 Prefix Cache。
+## SSE 流式语义（待服务器验收）
+
+`stream=true` 使用与非流式相同的模板、采样、GPU 后端和 KV 生命周期；原生每采样出
+一个 Token，立即通过会话 socket 发送独立事件（请求 ID、连续 index、整数 Token ID）。
+客户端逐条校验，最终还会核对完整 Token ID 列表；乱序、缺失、多余或不匹配的事件会使整组失败。
+ready 中的 token_events 能力必须为 true；Python 服务拒绝未重新编译的旧协调器。
+
+- HTTP 返回 `text/event-stream`：角色帧 → 文本增量 → finish_reason 帧 → 可选 usage 帧 → `[DONE]`。
+  `stream_options: {"include_usage": true}` 才发送独立 usage 帧，其 choices 为空。
+- Tokenizer 在同一个消费线程执行，流式与非流式均显式关闭空格清理。
+  UTF-8 未完整时产生的尾部替换字符暂缓输出，结束时保留真正的替换字符；已经发送的文本
+  前缀不能被修改。不满足前缀稳定约束的自定义 tokenizer 会明确报错，不输出拼接错误的文本。
+- 只有原生最终结果通过、请求 KV 确认释放、HTTP 审计落盘之后，才能发送成功结束帧和 DONE。
+  首个内容之前的输入错误仍返回普通 HTTP 错误 JSON；已经发送 SSE 响应头之后，错误以
+  `data: {"error":{"message":...,"type":"request_error","code":...}}` 返回并关闭连接。
+  失败流没有成功 finish_reason、usage 或 DONE；客户端不能把 EOF 当成成功。
+- 每请求最多缓冲 64 条文本增量，回调不阻塞原生接收线程；队列满时取消当前请求并返回
+  503 错误。客户端断开则取消当前请求；同一模型继续服务后续请求。响应写入也有 socket 超时。
+- 回调异常先发取消，再读完当前原生结果并验证 KV 清理，最后抛 GenerationObserverError；
+  这样单请求解码失败不会错位消费下一请求的消息。协议错误仍回收整组。
+- 旧 HTTP 连接/定时器的内部取消同时匹配 Job 身份，避免已完成 ID 被复用后误取消新请求。
+- 验收生成的 `*.sse.json` 保存收到的事件；会话检查保存 `token_events.json`，所有报告
+  仍包含 JSON、Markdown、CSV、XLSX。功能检查不是性能测速。
+
+按上文启动服务后，在另一个服务器终端运行（`-N` 关闭 curl 自身的输出缓冲）：
+
+```bash
+curl -N -sS http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' -H 'X-Request-ID: stream-demo-1' \
+  -d '{"model":"qwen3","messages":[{"role":"user","content":"请用一句话介绍你自己。"}],"max_tokens":64,"stream":true,"stream_options":{"include_usage":true}}'
+```
+
+本轮仍不包含连续批处理、CUDA Graph、自定义 AllReduce 或跨请求 Prefix Cache。

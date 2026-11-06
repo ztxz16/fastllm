@@ -18,7 +18,7 @@ import unittest
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
-from qwen3_process_session import BACKEND, EMPTY, GenerationCancelled, GenerationRejected, Qwen3ProcessSession
+from qwen3_process_session import BACKEND, EMPTY, GenerationCancelled, GenerationObserverError, GenerationRejected, Qwen3ProcessSession
 import qwen3_process_chat as chat
 import run_qwen3_session as runner
 from run_qwen3_prefill import make_model
@@ -51,7 +51,7 @@ def fixture():
 
     print("NCCL INFO simulated noisy stdout", flush=True)
     send(dict(event="ready", status="PASS", protocol=1, backend=BACKEND,
-              model_load_count=1, workers=workers, cache=cache, cancellation="request_id_datagram"))
+              model_load_count=1, workers=workers, cache=cache, cancellation="request_id_datagram", token_events=True))
     while True:
         try:
             message = json.loads(read(struct.unpack("!I", read(4))[0]))
@@ -76,7 +76,33 @@ def fixture():
             return
         result = dict(event="result", id=message["id"], status="PASS", backend=BACKEND,
                       workers=workers, reusable=True, request=request, token_ids=[request["token_ids"][0]],
-                      finish_reason="length", cache_after_generate=cache)
+                      finish_reason="eos" if request["token_ids"][0] in request.get("eos_token_ids", []) else "length",
+                      cache_after_generate=cache)
+        if message.get("stream_tokens"):
+            token = request["token_ids"][0]
+            token_event = dict(event="token", id=message["id"], index=0, token_id=token)
+            if mode == "stream_bad_index":
+                token_event["index"] = 1
+            if mode == "stream_bad_id":
+                token_event["id"] += 1
+            if mode == "stream_bad_token":
+                token_event["token_id"] = 1.0
+            if mode != "stream_missing":
+                send(token_event)
+            result["steps"] = [dict(token_id=token)]
+            if mode == "stream_mismatch":
+                result["token_ids"] = [token+1]
+            if mode == "stream_error_float":
+                result.update(status="FAIL", steps=[dict(token_id=float(token))], cache_after_error=cache)
+            if mode in ("stream_burst", "stream_eos"):
+                count = request.get("max_new_tokens", 1)
+                if mode == "stream_eos":
+                    count = 1
+                    result["finish_reason"] = "eos"
+                for index in range(1, count):
+                    send(dict(event="token", id=message["id"], index=index, token_id=token))
+                result["token_ids"] = [token]*count
+                result["steps"] = [dict(token_id=token)]*count
         if mode == "cancel" and request.get("max_new_tokens", 1) > 1:
             while True:
                 if select.select([cancellation], [], [], 5)[0]:
@@ -173,6 +199,35 @@ class SessionTests(unittest.TestCase):
             finally:
                 timer.cancel()
                 timer.join()
+
+    def test_stream_callback_arrives_before_result_and_can_cancel(self):
+        import threading
+        event, tokens = threading.Event(), []
+        with self.session("cancel") as session:
+            def callback(token):
+                self.assertFalse((session.output / "request-000001.response.json").exists())
+                tokens.append(token)
+                event.set()
+            with self.assertRaises(GenerationCancelled):
+                session.generate(dict(self.request, max_new_tokens=16), cancel_event=event, on_token=callback)
+            self.assertEqual(tokens, [1])
+            self.assertEqual(session.generate(self.request)["token_ids"], [1])
+
+    def test_callback_failure_cancels_and_drains_without_losing_session(self):
+        with self.session("cancel") as session:
+            def fail(token):
+                raise ValueError("decoder failed")
+            with self.assertRaisesRegex(GenerationObserverError, "decoder failed"):
+                session.generate(dict(self.request, max_new_tokens=16), on_token=fail)
+            self.assertEqual(session.state, "ready")
+            self.assertEqual(session.generate(self.request)["id"], 2)
+
+    def test_stream_protocol_corruption_fails_closed(self):
+        for mode in ("stream_bad_index", "stream_bad_id", "stream_bad_token", "stream_missing", "stream_mismatch", "stream_error_float"):
+            with self.subTest(mode=mode), self.session(mode) as session:
+                with self.assertRaises(RuntimeError):
+                    session.generate(self.request, on_token=lambda token: None)
+                self.assertEqual(session.state, "failed")
 
     def test_invalid_local_request_does_not_poison_session(self):
         with self.session() as session:
