@@ -95,6 +95,9 @@ void DeepSeekV41Model::ImportPDState(ResponseContext &context, const fastkv::Mes
             reader.Tensor(layer.windowKV);
     }
     reader.End();
+#ifdef USE_CUDA
+    PrepareAttentionState(state);
+#endif
     V41UpdateStubKV(context.pastKeyValues[0].first, context.pastKeyValues[0].second, state->totalLen);
     std::lock_guard<std::mutex> lock(v41StateMutex);
     RegisterState(&context.pastKeyValues, &context.pastKeyValues[0].first, state);

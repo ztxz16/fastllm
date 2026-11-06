@@ -12,23 +12,80 @@ struct DeepSeekV41Model::AttentionParallel {
         return *transfer;
     }
     explicit AttentionParallel(parallel::Topology topology) : runtime(std::move(topology)) {}
-    int Place(const std::shared_ptr<DeepSeekV41RequestState> &state) {
+    // Use the same persistent owner and stream for imported/prefix KV and
+    // eager prefill. A restored request must be ready before graph selection;
+    // running a model token is neither necessary nor safe for admission.
+    std::shared_ptr<DeepSeekV41RequestState> &LocalState(
+            const std::shared_ptr<DeepSeekV41RequestState> &state, int rank, int device) {
+        auto &local = state->attentionRanks.at(runtime.Layout().AttentionRank(rank));
+        if (local) return local;
+        auto restored = std::make_shared<DeepSeekV41RequestState>();
+        restored->layers.resize(models[rank]->block_cnt);
+        restored->totalLen = state->totalLen;
+        if (state->totalLen) {
+            for (int layer = 0; layer < models[rank]->block_cnt; ++layer) {
+                const auto &source = state->layers.at(layer);
+                auto &dest = restored->layers[layer];
+                dest.totalLen = source.totalLen;
+                dest.compressedBlocks = source.compressedBlocks;
+                dest.rawTail = source.rawTail;
+                auto restore = [&](Data &target, const Data &value) {
+                    V41RestoreTensor(target, value);
+                    if (!target.dims.empty() && target.Count(0))
+                        target.ToDevice(CUDA, std::vector<int>{device});
+                };
+                restore(dest.windowKV, source.windowKV);
+                restore(dest.compressedKV, source.compressedKV);
+                restore(dest.indexK, source.indexK);
+                restore(dest.rawTailKV, source.rawTailKV);
+                restore(dest.rawTailScore, source.rawTailScore);
+            }
+        }
+        local = std::move(restored);
+        return local;
+    }
+    int Place(const std::shared_ptr<DeepSeekV41RequestState> &state, int maxPerGroup = 0) {
         if (state->attentionGroup >= 0) return state->attentionGroup;
         const int groups = runtime.Layout().attentionDP;
         std::vector<uint64_t> loads(groups, 0);
+        std::vector<int> counts(groups, 0);
         for (auto it = requests.begin(); it != requests.end();) {
             auto request = it->lock();
             if (request && request->attentionGroup >= 0) {
                 loads.at(request->attentionGroup) += uint64_t(request->totalLen) + 1;
+                ++counts[request->attentionGroup];
                 ++it;
             } else it = requests.erase(it);
         }
-        state->attentionGroup = std::min_element(loads.begin(), loads.end()) - loads.begin();
+        // Context-length balancing alone can pack many short requests into
+        // one group, exceeding the warmed local graph's row capacity. Prefer
+        // groups within the serving row budget, then balance their KV load.
+        int owner = 0;
+        for (int group = 1; group < groups; ++group) {
+            const bool full = maxPerGroup > 0 && counts[group] >= maxPerGroup;
+            const bool ownerFull = maxPerGroup > 0 && counts[owner] >= maxPerGroup;
+            if (full != ownerFull ? !full : loads[group] < loads[owner]) owner = group;
+        }
+        state->attentionGroup = owner;
         state->attentionRanks.resize(runtime.Layout().attentionTP);
         requests.push_back(state);
         return state->attentionGroup;
     }
 };
+
+void DeepSeekV41Model::PrepareAttentionState(const std::shared_ptr<DeepSeekV41RequestState> &state) {
+    if (v41AttentionDP <= 1) return;
+    PrepareAttentionParallel();
+    auto &parallel = *v41AttentionParallel;
+    const int owner = parallel.Place(state, v41CudaGraphWarmingUp ? 0 :
+        (std::max(1, maxBatch) + v41AttentionDP - 1) / v41AttentionDP);
+    if (std::all_of(state->attentionRanks.begin(), state->attentionRanks.end(),
+            [](const auto &rank) { return bool(rank); })) return;
+    parallel.runtime.Run([&](int rank, int device) {
+        if (parallel.runtime.Layout().AttentionOwner(rank) == owner)
+            parallel.LocalState(state, rank, device);
+    });
+}
 
 // Called before worker dispatch and also when a full graph bypasses the frame.
 static void V41PrepareAttentionSpec(DeepSeekV41SpecScratch &parent, int tp, int layers) {
@@ -62,7 +119,9 @@ struct DeepSeekV41Model::AttentionParallelFrame {
     static parallel::RowPartition Partition(AttentionParallel &parallel, ForwardWorkspace &parent) {
         std::vector<int> owners;
         for (const auto &seg : parent.boundedPrefill ? parent.tailSegments : parent.inputSegments) {
-            int group = parallel.Place(seg.state);
+            int group = parallel.Place(seg.state, parent.model.v41CudaGraphWarmingUp ? 0 :
+                (std::max(1, parent.model.maxBatch) + parent.model.v41AttentionDP - 1) /
+                    parent.model.v41AttentionDP);
             owners.insert(owners.end(), seg.seqlen, group);
         }
         return parallel::RowPartition(parallel.runtime.Layout().attentionDP, owners);
@@ -87,28 +146,7 @@ struct DeepSeekV41Model::AttentionParallelFrame {
             for (int i = 0; i < parent.numSegments; ++i) {
                 const auto &seg = parent.inputSegments[i];
                 if (seg.state->attentionGroup != topology.AttentionOwner(rank)) continue;
-                auto &local = seg.state->attentionRanks[topology.AttentionRank(rank)];
-                if (!local) {
-                    local = std::make_shared<DeepSeekV41RequestState>();
-                    local->layers.resize(model.block_cnt);
-                    local->totalLen = seg.state->totalLen;
-                    if (local->totalLen) {
-                        // Prefix restore is a logical CPU snapshot, independent
-                        // of the group selected for this new request.
-                        for (int layer = 0; layer < model.block_cnt; ++layer) {
-                            const auto &source = seg.state->layers.at(layer);
-                            auto &dest = local->layers[layer];
-                            dest.totalLen = source.totalLen;
-                            dest.compressedBlocks = source.compressedBlocks;
-                            dest.rawTail = source.rawTail;
-                            V41RestoreTensor(dest.windowKV, source.windowKV);
-                            V41RestoreTensor(dest.compressedKV, source.compressedKV);
-                            V41RestoreTensor(dest.indexK, source.indexK);
-                            V41RestoreTensor(dest.rawTailKV, source.rawTailKV);
-                            V41RestoreTensor(dest.rawTailScore, source.rawTailScore);
-                        }
-                    }
-                }
+                auto &local = parallel.LocalState(seg.state, rank, device);
                 AssertInFastLLM(local->totalLen == seg.startPos, "Attention DP request position mismatch");
                 DeepSeekV41Segment segment = seg;
                 segment.state = local; segment.offset = offset;

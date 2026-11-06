@@ -1777,7 +1777,18 @@ namespace fastllm {
             std::vector<std::pair<Data*, Data*> > &samplingPastKeyValues,
             bool allowSpeculate) {
         const int numSegments = (int)segments.size();
-        if (!v41DsparkEnabled) {
+        if (!v41DsparkEnabled || numSegments > 1) {
+            // Batched verification is not implemented. Do not produce proposals
+            // that the next batch cannot consume, or capture draft features that
+            // would prevent ordinary decode from replaying its full graph.
+            // ForwardBatch has already drained accepted pending tokens. Drop the
+            // remaining draft state: after returning to a single request its
+            // window must start at the new target position, as on a cache hit.
+            if (v41DsparkEnabled) for (auto &seg : segments) {
+                AssertInFastLLM(!seg.state->dspark || seg.state->dspark->pending.empty(),
+                    "DeepSeekV41 DSpark: drain accepted tokens before a batched forward.");
+                seg.state->dspark.reset();
+            }
             std::vector<int> plain = ForwardSegments(segments, inputIds, inputEmbeds, imageMask,
                                                      generationConfigs, lastTokens, retLogits,
                                                      samplingPastKeyValues);
@@ -1887,7 +1898,7 @@ namespace fastllm {
                 continue;
             }
             // prefill 分块的中间结果不是真正的下一个 token，这时只更新滑窗、不生成候选
-            const int anchor = !isIntermediateChunkedPrefill && textOnly &&
+            const int anchor = allowSpeculate && !isIntermediateChunkedPrefill && textOnly &&
                 segments[i].seqlen == 1 && (int)ret.size() > i ? ret[i] : -1;
             DsparkDebugDumpState(*segments[i].state, "plain");
             DsparkAdvance(*segments[i].state, scratches[i], segments[i].startPos,
@@ -2383,7 +2394,7 @@ namespace fastllm {
             // upload this small draft activation before capture/replay; the
             // backbone and Markov head can still use the same complete graph.
             if (graphEligible && embedded.dataDevice == DataDevice::CPU)
-                embedded.ToDevice(DataDevice::CUDA, {graphDevices.front()});
+                embedded.ToDevice(DataDevice::CUDA, std::vector<int>{graphDevices.front()});
         }
         std::vector<void*> cachePointers;
         for (auto &layer : dspark.layers) cachePointers.push_back(layer.windowKV.cudaData);

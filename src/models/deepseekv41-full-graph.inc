@@ -127,6 +127,9 @@ struct V41FullGraph {
     std::unique_ptr<parallel::CudaRowTransfer> rowTransfer;
     std::vector<std::shared_ptr<DeepSeekV41CudaGraphState>> attentionStates;
     std::vector<std::shared_ptr<V41FullGraph>> attentionGraphs;
+    // Private warmup requests supply independent KV for padding. They never
+    // enter the scheduler or prefix cache and never alias a serving request.
+    std::vector<DeepSeekV41Segment> padding;
     std::vector<void *> moeHandles;
     std::vector<std::vector<void *>> rankMoeHandles;
     std::vector<void *> rankUntimedExecs;
@@ -458,12 +461,13 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
     const bool hybrid = executionMode == ExecutionMode::Hybrid &&
         (verifying || (batch == 1 && !v41DsparkEnabled)) && FastllmCudaMoeCacheRequested();
     // Decode rows are independent requests, including packed FP4/FP8 KV.
-    // Use the dynamic kernel's batch bound; verification keeps its causal
-    // chunk bound, and DP retains the previously validated local-row budget.
+    // Use the dynamic kernel's batch bound; verification retains its causal
+    // chunk bound. Each attention group is bounded by the same decode limit.
     const int batchLimit = verifying ? (hybrid ? 32 : 8) :
-        distributedAttention ? 16 * v41AttentionDP : attentionOnly ? 16 : FastllmV41FullDecodeMaxBatch;
+        FastllmV41FullDecodeMaxBatch;
     if (batch < 1 || batch > batchLimit || (!hybrid && executionMode != ExecutionMode::Gpu) ||
-        (!verifying && v41DsparkEnabled) ||
+        (!verifying && std::any_of(segments.begin(), segments.end(),
+            [](const DeepSeekV41Segment &seg) { return seg.spec != nullptr; })) ||
         (!hybrid && !distributedAttention && !attentionOnly && verifying &&
             (kvCacheDataType == DataType::FP4_E2M1 || kvCacheDataType == DataType::FP8_E4M3)) ||
         (!verifying && !v41CudaGraphWarmingUp) || head_dim_full != 512 || hc_mult != 4 || index_head_dim != 128)
@@ -550,6 +554,17 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
         g->rowTransfer.reset(new parallel::CudaRowTransfer(runtime, rows));
         g->rowTransfer->Reserve(size_t(embed_dim) * sizeof(uint16_t) +
             size_t(2 * hc_mult + hc_mult * hc_mult) * sizeof(float));
+        if (!verifying) {
+            g->padding = segments;
+            // Retained scratch must not count as live KV load when placing
+            // subsequent warmup batches or real requests on attention groups.
+            auto &requests = parallel.requests;
+            requests.erase(std::remove_if(requests.begin(), requests.end(), [&](const auto &weak) {
+                const auto request = weak.lock();
+                return !request || std::any_of(segments.begin(), segments.end(),
+                    [&](const auto &s) { return s.state == request; });
+            }), requests.end());
+        }
     }
 #ifdef USE_NUMAS
     if (hybrid && !weights.empty() && weights[0].size() > 2 && weights[0][2]) {
@@ -1191,12 +1206,111 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
     FastllmCudaSetDevice(original);
 }
 
+bool DeepSeekV41Model::TryPaddedDecode(const std::vector<DeepSeekV41Segment> &segments, const Data &ids,
+        const std::vector<GenerationConfig> &configs, const LastTokensManager &last,
+        std::vector<std::vector<float>*> *logits, std::vector<std::pair<Data*, Data*>> &past,
+        std::vector<int> &result) {
+    if (executionMode != ExecutionMode::Gpu || v41AttentionDP <= 1 || v41CudaGraphWarmingUp ||
+        !GetFastllmEnv().cudaGraph || segments.size() <= 8) return false;
+    // Small batches use a separate arithmetic regime also shared by DSpark.
+    // Keep their existing path rather than padding across that boundary.
+    std::vector<int> counts(v41AttentionDP, 0);
+    for (const auto &s : segments) {
+        if (!s.state || s.spec || s.seqlen != 1 || s.startPos < 1 ||
+            s.state->attentionGroup < 0 || s.state->attentionGroup >= v41AttentionDP) return false;
+        ++counts[s.state->attentionGroup];
+    }
+    std::shared_ptr<V41FullGraph> graph;
+    for (auto &slot : v41CudaGraphSlots) {
+        if (slot.first < int(segments.size())) continue;
+        auto state = V41GetCudaGraphState(slot.second);
+        if (!state->captured || state->disabled || !state->fullDecode) continue;
+        auto g = std::static_pointer_cast<V41FullGraph>(state->fullDecode);
+        if (!g->attentionRuntime || g->verifying || g->padding.size() != size_t(g->batch)) continue;
+        bool fits = true;
+        for (int group = 0; group < v41AttentionDP; ++group) {
+            const auto &local = g->attentionGraphs[group * g->attentionRuntime->Layout().attentionTP];
+            fits &= counts[group] <= (local ? local->batch : 0);
+        }
+        if (!fits) continue;
+        // An exact layout already takes the ordinary full-graph path.
+        if (g->batch == int(segments.size())) return false;
+        graph = std::move(g);
+        break;
+    }
+    if (!graph) return false;
+    auto padded = segments;
+    std::vector<int> used(v41AttentionDP, 0);
+    for (const auto &s : graph->padding) {
+        const int group = s.state->attentionGroup;
+        if (used[group]++ < counts[group]) continue;
+        auto dummy = s;
+        dummy.startPos = dummy.state->totalLen;
+        dummy.offset = padded.size(); dummy.seqlen = 1; dummy.spec = nullptr;
+        padded.push_back(std::move(dummy));
+    }
+    if (padded.size() != size_t(graph->batch)) return false;
+    // Rewind only private scratch metadata. Kernels may overwrite its next KV
+    // position; no real request ever reads these values. Bound scratch context
+    // and allocation across arbitrarily many replays, including eager fallback.
+    struct Rewind {
+        struct State { DeepSeekV41RequestState *p; int length; size_t history; };
+        struct Layer { DeepSeekV41LayerCache *p; int length, blocks, tail; };
+        std::vector<State> states;
+        std::vector<Layer> layers;
+        std::vector<std::pair<Data*, int>> rows;
+        void Save(DeepSeekV41RequestState &s) {
+            states.push_back({&s, s.totalLen, s.engramHistory.size()});
+            for (auto &c : s.layers) {
+                layers.push_back({&c, c.totalLen, c.compressedBlocks, c.rawTail});
+                for (Data *d : {&c.compressedKV, &c.indexK, &c.rawTailKV, &c.rawTailScore}) {
+                    if (d->dims.size() == 3) rows.emplace_back(d, d->dims[1]);
+                    for (auto &replica : d->multiDeviceDatas)
+                        if (replica.second->dims.size() == 3) rows.emplace_back(replica.second, replica.second->dims[1]);
+                }
+            }
+            for (auto &rank : s.attentionRanks) if (rank) Save(*rank);
+        }
+        ~Rewind() {
+            for (auto &s : states) { s.p->totalLen = s.length; s.p->engramHistory.resize(s.history); }
+            for (auto &c : layers) { c.p->totalLen = c.length; c.p->compressedBlocks = c.blocks; c.p->rawTail = c.tail; }
+            for (auto &entry : rows) if (entry.first->dims.size() == 3 && entry.first->dims[1] != entry.second) {
+                auto dims = entry.first->dims; dims[1] = entry.second; entry.first->Resize(dims);
+            }
+        }
+    } rewind;
+    for (size_t i = segments.size(); i < padded.size(); ++i) rewind.Save(*padded[i].state);
+    Data host; host.CopyFrom(ids); host.ToDevice(CPU);
+    const auto *values = reinterpret_cast<const float *>(host.cpuData);
+    std::vector<float> tokens(values, values + ids.Count(0));
+    tokens.resize(padded.size(), 1.f);
+    Data paddedIds(FLOAT32, {1, int(tokens.size())}, tokens);
+    auto paddedConfigs = configs;
+    paddedConfigs.resize(padded.size());
+    for (size_t i = configs.size(); i < padded.size(); ++i) {
+        paddedConfigs[i].do_sample = false; paddedConfigs[i].top_k = 1;
+    }
+    auto paddedLast = last;
+    paddedLast.units.resize(padded.size());
+    auto paddedLogits = logits ? *logits : std::vector<std::vector<float>*>();
+    paddedLogits.resize(padded.size(), nullptr);
+    std::vector<Data> storage((padded.size() - segments.size()) * block_cnt * 2);
+    auto paddedPast = past;
+    for (size_t i = 0; i < storage.size(); i += 2) paddedPast.emplace_back(&storage[i], &storage[i+1]);
+    result = ForwardGpu(padded, paddedIds, nullptr, nullptr, paddedConfigs, paddedLast,
+        logits ? &paddedLogits : nullptr, paddedPast);
+    result.resize(segments.size());
+    return true;
+}
+
 bool DeepSeekV41Model::TryFullDecodeGraph(ForwardWorkspace &f, bool inputsPrepared) {
     // Verification warmup uses the same composition/replay path as requests.
     // Ordinary decode still builds its full graph explicitly after warmup.
     // A graph captured for ordinary decode has no DSpark target features.
     // Keep plain DSpark steps on their feature-producing segmented path.
-    if ((v41DsparkEnabled && !f.dsparkVerify) || !f.graphReplay || !f.graphState ||
+    if ((!f.dsparkVerify && std::any_of(f.inputSegments.begin(), f.inputSegments.end(),
+            [](const DeepSeekV41Segment &seg) { return seg.spec != nullptr; })) ||
+        !f.graphReplay || !f.graphState ||
         (v41CudaGraphWarmingUp && !f.dsparkVerify) ||
         (f.quantKV && executionMode != ExecutionMode::Hybrid && f.dsparkVerify && v41AttentionDP == 1) ||
         f.hasImageTokens || f.inputEmbeds)

@@ -314,6 +314,7 @@ namespace fastllm {
         int v41AttentionRank = -1;
         int v41AttentionLogicalRows = 0;
         void PrepareAttentionParallel();
+        void PrepareAttentionState(const std::shared_ptr<DeepSeekV41RequestState> &state);
         ExecutionMode executionMode = ExecutionMode::Cpu;
         bool v41MoeCudaGraphCompatible = true;
         void InitExecutionMode();
@@ -453,6 +454,10 @@ namespace fastllm {
         bool TryFullDecodeGraph(ForwardWorkspace &, bool inputsPrepared);
         void BuildFullDecodeGraph(int batch, const std::vector<DeepSeekV41Segment> &segments,
                                   int firstLayer = -1, int endLayer = -1);
+        bool TryPaddedDecode(const std::vector<DeepSeekV41Segment> &segments, const Data &ids,
+                const std::vector<GenerationConfig> &configs, const LastTokensManager &last,
+                std::vector<std::vector<float>*> *logits,
+                std::vector<std::pair<Data*, Data*>> &past, std::vector<int> &result);
 #endif
         void TrimForwardPrefill(ForwardWorkspace &, int layer, bool inputsTrimmed = false);
         void BeginForwardLayer(ForwardWorkspace &, int layer);

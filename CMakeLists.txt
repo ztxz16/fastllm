@@ -3222,6 +3222,13 @@ if (UNIT_TEST)
         add_executable(deepseekV41AttentionParallelRegression test/ops/deepseekV41AttentionParallelRegression.cpp)
         target_link_libraries(deepseekV41AttentionParallelRegression fastllm)
         target_include_directories(deepseekV41AttentionParallelRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        if(UNIX)
+            # Requires the TP fixture and eight otherwise idle GPUs; arguments
+            # select DP topology, KV dtype, batch size and admission layout.
+            add_executable(deepseekV41DsparkBatchRegression test/basic/test_deepseek_v41_dspark_batch.cpp)
+            target_link_libraries(deepseekV41DsparkBatchRegression PRIVATE fastllm_tools fastkv ${CMAKE_DL_LIBS})
+            target_include_directories(deepseekV41DsparkBatchRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        endif()
         target_link_libraries(parallelRuntimeRegression fastllm)
         add_test(NAME parallelRuntime COMMAND parallelRuntimeRegression)
         set_tests_properties(parallelRuntime PROPERTIES LABELS "cuda;multigpu" TIMEOUT 240 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)

@@ -4444,7 +4444,7 @@ namespace fastllm {
                         "DeepSeekV41Model::ForwardBatch: inputIds length does not match seqLens.");
 
         // ---- DSpark：已经校验通过的 token 直接出队，这些请求不参与本次前向 ----
-        // （批量前向里不做投机，但仍然要采集 main hidden，让草稿侧的滑窗跟上目标缓存）
+        // 批量普通前向不生成草稿；返回单请求时从新的目标位置重建草稿窗口。
         std::vector<int> pendingRet(batch, -1);
         std::vector<char> isPending(batch, 0);
         int pendingCount = 0;
@@ -6010,7 +6010,7 @@ namespace fastllm {
         // partially captured graphs keep the conservative caller-stream order.
         f.workerOrderedGraphReplay = graphReplay && tp && f.tpAttention &&
             V41DecodeCudaGraphReplayMask() == 15 &&
-            executionMode == ExecutionMode::Gpu && !v41DsparkEnabled &&
+            executionMode == ExecutionMode::Gpu &&
             !f.quantKV && cudaRouteCapturable &&
             std::all_of(f.inputSegments.begin(), f.inputSegments.end(),
                 [](const DeepSeekV41Segment &seg) {
@@ -7691,7 +7691,13 @@ namespace fastllm {
                     graphPoolOpen = false;
                 }
                 if (ok) {
-                    V41ComposeGraphSegments(*graphState, !dsparkVerify && !v41DsparkEnabled, engram_layer_ids,
+                    // The batch-one slot is also used by DSpark's first plain
+                    // step, which captures features between layers. Keep those
+                    // boundaries even when warmup itself has no scratch.
+                    const bool crossLayer = !dsparkVerify && (!v41DsparkEnabled || f.numSegments > 1) &&
+                        std::none_of(f.inputSegments.begin(), f.inputSegments.end(),
+                            [](const DeepSeekV41Segment &seg) { return seg.spec != nullptr; });
+                    V41ComposeGraphSegments(*graphState, crossLayer, engram_layer_ids,
                         V41DecodeCudaGraphReplayMask(executionMode == ExecutionMode::Hybrid && f.tp && V41EnvFlag("FASTLLM_DSPARK_GPU_RESIDENT")));
                     graphState->captured = true;
                     CollectForwardGraphPointers(f, graphState->boundaryPointers);
@@ -7924,6 +7930,18 @@ namespace fastllm {
                                                        const LastTokensManager &lastTokens,
                                                        std::vector<std::vector<float>*> *retLogits,
                                                        std::vector<std::pair<Data*, Data*> > &samplingPastKeyValues) {
+#ifdef USE_CUDA
+        // Prefix restoration shares PD admission's owner-local materialization.
+        // Do this before padding/graph lookup, without advancing any request.
+        if (v41AttentionDP > 1)
+            for (const auto &segment : inputSegments)
+                if (segment.state && segment.startPos > 0)
+                    PrepareAttentionState(segment.state);
+        std::vector<int> paddedResult;
+        if (!inputEmbeds && !imageMask && TryPaddedDecode(inputSegments, inputIds,
+                generationConfigsIn, lastTokens, retLogits, samplingPastKeyValues, paddedResult))
+            return paddedResult;
+#endif
         if (executionMode == ExecutionMode::Gpu) return ForwardGpu(inputSegments, inputIds, inputEmbeds, imageMask, generationConfigsIn, lastTokens, retLogits, samplingPastKeyValues);
         return ForwardHybrid(inputSegments, inputIds, inputEmbeds, imageMask, generationConfigsIn, lastTokens, retLogits, samplingPastKeyValues);
     }
@@ -8015,7 +8033,11 @@ namespace fastllm {
             // Capture common decode sizes before accepting requests. Unknown
             // batch sizes and invalidated graphs fall back to eager execution.
             std::vector<int> batches;
-            const int limit = std::max(1, this->maxBatch);
+            int limit = std::max(1, this->maxBatch);
+            // DP ownership follows KV load, so a real batch can have more
+            // than its average number of rows on one attention group.
+            if (v41AttentionDP > 1 && limit > 1)
+                limit = std::max(limit, std::min(FastllmV41FullDecodeMaxBatch, limit * 2));
             for (int batch = 1; batch <= limit; batch *= 2) {
                 batches.push_back(batch);
                 if (batch > limit / 2) break;
