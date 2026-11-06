@@ -469,6 +469,36 @@ code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospac
 .save-state.failed { background: var(--danger-soft); color: var(--danger); }
 
 .simple-profile { width: min(100%, 760px); }
+.video-profile .configuration-mode-section,
+.video-profile #automatic-resource-limits,
+.video-profile #vision-module,
+.video-profile #profile-parameters,
+.video-profile [data-inference-setting],
+.video-profile #server-model-name-field,
+.video-profile #server-hide-input-field { display: none !important; }
+.service-selector-label { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+.service-selector-label select { max-width: 240px; min-width: 100px; }
+.service-selector-label select, .studio-toolbar select {
+  min-height: 32px; padding: 5px 9px; border: 1px solid var(--line);
+  border-radius: 7px; background: var(--surface); color: var(--ink);
+}
+.studio-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; padding: 12px 16px; border-bottom: 1px solid var(--line); }
+.studio-toolbar select { max-width: 260px; }
+.studio-toolbar .selected { outline: 2px solid var(--primary); }
+.video-studio { overflow: auto; padding: 24px; flex: 1; }
+.video-studio form { max-width: 860px; margin: 0 auto; }
+.video-studio form > p { margin: 8px 0 20px; color: var(--muted); line-height: 1.6; }
+.video-studio form > .video-job-actions { margin-top: 16px; }
+.gpu-choices { display: flex; flex-wrap: wrap; gap: 8px 16px; }
+.gpu-choices label { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; }
+.video-studio textarea { min-height: 100px; resize: vertical; }
+.video-jobs { max-width: 860px; margin: 24px auto; display: grid; gap: 16px; }
+.video-job { border: 1px solid var(--line); border-radius: 12px; padding: 16px; display: grid; gap: 10px; background: var(--surface); }
+.video-job video { width: 100%; max-height: 480px; border-radius: 8px; background: #111; }
+.video-job progress { width: 100%; }
+.video-job-actions { display: flex; gap: 12px; align-items: center; }
+.video-job p { white-space: pre-wrap; overflow-wrap: anywhere; }
+#api-contract { width: 100%; font-family: monospace; resize: vertical; }
 .runtime-auto-profile .editor-navigation,
 .runtime-auto-profile #editor-speculative,
 .runtime-auto-profile #editor-hybrid,
@@ -838,7 +868,8 @@ code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospac
   .service-status { display: contents; }
   .topbar-status { grid-column: 1; grid-row: 1; }
   .topbar-actions { grid-column: 2; grid-row: 1; }
-  .inference-status-bar { grid-column: 1 / -1; grid-row: 2; justify-self: end; max-width: 100%; flex-wrap: wrap; justify-content: flex-end; padding-left: 0; border-left: 0; }
+  .service-selector-label { grid-column: 1 / -1; grid-row: 2; }
+  .inference-status-bar { grid-column: 1 / -1; grid-row: 3; justify-self: end; max-width: 100%; flex-wrap: wrap; justify-content: flex-end; padding-left: 0; border-left: 0; }
 }
 
 @media (max-width: 1100px) {
@@ -869,6 +900,15 @@ code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospac
   .launcher-address-list { justify-content: flex-start; }
 }
 @media (max-width: 680px) {
+  .webui-active .page-scroll { overflow-y: auto; }
+  #view-webui.active { flex-shrink: 0; }
+  .webui-content { flex: 1 0 360px; min-height: 360px; }
+  .studio-toolbar, .agent-runtime-card { flex-shrink: 0; }
+  .studio-toolbar { padding: 8px 12px; gap: 8px; }
+  .studio-toolbar label { display: flex; gap: 6px; align-items: center; min-width: 0; }
+  .studio-toolbar select { max-width: 200px; min-width: 0; }
+  .service-selector-label select { flex: 1; max-width: none; min-width: 0; }
+  .video-studio { padding: 16px; }
   .app-shell { grid-template-columns: 1fr; grid-template-rows: auto minmax(0, 1fr); }
   .sidebar { padding: 12px 16px 9px; border-right: 0; border-bottom: 1px solid var(--line); }
   .brand { padding: 0; gap: 8px; }

@@ -2,9 +2,9 @@
 #include "utils.h"
 #include "devices/cuda/fastllm-cuda.cuh"
 #include <cuda_runtime.h>
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <stdexcept>
@@ -63,40 +63,46 @@ struct Case {
             indices.ToDevice(CUDA, std::vector<int>{FastllmCudaGetDevice()});
         }
     }
-    void Run() {
-        Check(FastllmCudaDeepSeekV41SparseAttention(q, chunk,
+    void Run(Data &query, Data &sinks, Data &result) {
+        Check(FastllmCudaDeepSeekV41SparseAttention(query, chunk,
             start && window ? (ringMode ? &packedRing : &ring) : nullptr,
             width ? (cmpMode ? &packedCmp : &cmp) : nullptr, width ? &indices : nullptr,
-            sink, window, start, 1.f / std::sqrt(512.f), output), "attention dispatch");
+            sinks, window, start, 1.f / std::sqrt(512.f), result), "attention dispatch");
     }
+    void Run() { Run(q, sink, output); }
     std::vector<uint8_t> Reference() {
-        setenv("FASTLLM_DSV41_DISABLE_SM120_PREFILL", "1", 1); Run();
-        auto bytes = Bytes(output); unsetenv("FASTLLM_DSV41_DISABLE_SM120_PREFILL"); return bytes;
+        // Heads are independent. Groups of at most 16 select the original
+        // generic kernel without a production environment switch.
+        const auto query = Bytes(q), sinks = Bytes(sink);
+        const size_t rows = size_t(q.dims[0]) * tokens;
+        const size_t queryBytes = size_t(q.unitSize) * 512;
+        constexpr size_t outputBytes = sizeof(uint16_t) * 512;
+        std::vector<uint8_t> expected(rows * heads * outputBytes);
+        for (int first = 0; first < heads; first += 16) {
+            const int count = std::min(16, heads - first);
+            Data partQuery(q.dataType, {q.dims[0], tokens, count, 512});
+            Data partSink(FLOAT32, {count}), partOutput;
+            partQuery.Allocate(); partSink.Allocate();
+            for (size_t row = 0; row < rows; ++row)
+                memcpy(partQuery.cpuData + row * count * queryBytes,
+                       query.data() + (row * heads + first) * queryBytes, count * queryBytes);
+            memcpy(partSink.cpuData, sinks.data() + first * sizeof(float), count * sizeof(float));
+            partQuery.ToDevice(CUDA, std::vector<int>{FastllmCudaGetDevice()});
+            partSink.ToDevice(CUDA, std::vector<int>{FastllmCudaGetDevice()});
+            Run(partQuery, partSink, partOutput);
+            const auto bytes = Bytes(partOutput);
+            for (size_t row = 0; row < rows; ++row)
+                memcpy(expected.data() + (row * heads + first) * outputBytes,
+                       bytes.data() + row * count * outputBytes, count * outputBytes);
+        }
+        return expected;
     }
 };
 
-
-static void Bench(int rows, int width, int mode) {
-    Case c(64,128,16384,width,1,mode,7,BFLOAT16,rows);
-    auto expected = c.Reference(); c.Run(); Equal(expected, c.output, "production chunk");
-    cudaEvent_t begin,end; Cuda(cudaEventCreate(&begin)); Cuda(cudaEventCreate(&end));
-    for (int path=0;path<2;++path) {
-        setenv("FASTLLM_DSV41_DISABLE_SM120_PREFILL",path ? "0" : "1",1);
-        float total=0;
-        for (int j=0;j<8;++j) {
-            Cuda(cudaEventRecord(begin,cudaStreamPerThread)); c.Run();
-            Cuda(cudaEventRecord(end,cudaStreamPerThread)); Cuda(cudaEventSynchronize(end));
-            float ms; Cuda(cudaEventElapsedTime(&ms,begin,end)); if(j>=2)total+=ms;
-        }
-        printf("BENCH rows=%d top=%d format=%d path=%s ms=%.6f\n",rows,width,mode,path?"sm120":"original",total/6);
-    }
-    Cuda(cudaEventDestroy(begin)); Cuda(cudaEventDestroy(end));
-    unsetenv("FASTLLM_DSV41_DISABLE_SM120_PREFILL");
-}
 int main(int argc,char **argv) {
     try {
         if (FastllmCudaGetDeviceCount()==0) return 77;
-        FastllmCudaSetDevice(0); if(FastllmCudaRuntimeArch()!=120) return 77;
+        FastllmCudaSetDevice(0); if(FastllmCudaRuntimeArch()<80) return 77;
         if (argc > 1 && std::string(argv[1]) == "--sanitize") {
             for (int format : {0, 3}) {
                 Case c(32,128,127,65,format,format,17,BFLOAT16,128);
@@ -140,7 +146,6 @@ int main(int argc,char **argv) {
         Case fp32(32,128,127,65,1,3,23,FLOAT32,128);
         expected=fp32.Reference(); fp32.Run(); Equal(expected,fp32.output,"FP32 fallback"); ++checks;
         printf("PASS %d attention cases, bitwise parity, causal mutation and graph replay\n",checks);
-        if(argc>1 && std::string(argv[1])=="--bench") for(int rows:{128,16384}) for(int width:{0,1024}) Bench(rows,width,3);
         return 0;
     }catch(const std::exception &e){fprintf(stderr,"FAIL: %s\n",e.what());return 1;}
 }

@@ -3,6 +3,7 @@
 #include "fastllm.h"
 #include <functional>
 #include <map>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -10,7 +11,47 @@
 namespace fastllm {
 // Numerical semantics belong to the expert layout, not to the storage tier.
 // Keep score placement, projection rounding and activation quantization distinct.
-enum class HybridMoeMath { Standard, Glm5, DeepSeekV41 };
+enum class HybridMoeMath { Standard, Glm5, DeepSeekV41, Qwen38FlashNext };
+
+#ifdef USE_CUDA
+// Own a composition of CUDA segments and optional host-expert mailbox
+// children. The same lifecycle/timing policy serves decode and draft graphs.
+// Child source graphs and their captured tensor storage outlive this object.
+class HybridMoeGraph {
+public:
+    HybridMoeGraph() = default;
+    HybridMoeGraph(const HybridMoeGraph &) = delete;
+    HybridMoeGraph &operator=(const HybridMoeGraph &) = delete;
+    ~HybridMoeGraph();
+    void Reset();
+    // Takes ownership of handles even on failure.
+    bool Compose(const std::vector<const void *> &children, std::vector<void *> handles);
+    bool Launch();
+    explicit operator bool() const { return exec != nullptr; }
+private:
+    int device = -1;
+    void *graph = nullptr, *exec = nullptr, *replay = nullptr;
+    std::vector<void *> handles;
+    uint64_t launches = 0;
+};
+
+// A graph owns both ends of a remote resident-expert transfer. Model-specific
+// arithmetic receives these persistent tensors; transport never migrates the
+// dense stage's captured input or changes the expert weight owner.
+struct HybridMoeRemoteWorkspace {
+    int source = -1, device = -1;
+    void *ready = nullptr, *done = nullptr;
+    Data input, index, score, output;
+    Data w1, w2, w3, tempInput, tempOutput, inputTemp, outputTemp;
+    HybridMoeRemoteWorkspace() = default;
+    HybridMoeRemoteWorkspace(const HybridMoeRemoteWorkspace &) = delete;
+    HybridMoeRemoteWorkspace &operator=(const HybridMoeRemoteWorkspace &) = delete;
+    ~HybridMoeRemoteWorkspace();
+};
+void RunRemoteHybridMoe(HybridMoeRemoteWorkspace &workspace,
+    const Data &input, const Data &index, const Data &score, Data &output, int device,
+    const std::function<void(HybridMoeRemoteWorkspace &)> &compute);
+#endif
 
 // Both placements use the same kernels and cache policy in NUMA-enabled builds.
 bool IsSharedHostMoeDevice(const std::string &device);
@@ -32,6 +73,8 @@ public:
              int cacheDevice = -1);
     bool Prepare(const std::function<void()> &registerNumaWeights = {},
                  bool allowStreaming = false) const;
+    bool Prepare(const std::function<void()> &registerNumaWeights, bool allowStreaming,
+                 const std::map<int, uint64_t> &deviceBudgets, bool fullyResident) const;
 private:
     struct Layer { Data *const *weights; int count; int cacheDevice; };
     std::vector<Layer> layers;
@@ -41,16 +84,37 @@ private:
     bool allNuma = true, allCpu = true;
 };
 
+// Packed native BF16 experts share the NUMA workers and generic cache /
+// whole-expert scheduling policies. The caller retains immutable CPU weights
+// and serializes Run calls. Construction registers host shards before requests.
+class HybridMoeBF16 {
+public:
+    HybridMoeBF16(const std::vector<std::pair<Data *, Data *>> &layers, int device);
+    ~HybridMoeBF16();
+    struct Stats { uint64_t cpuRoutes = 0, gpuRoutes = 0, cacheHits = 0, uploads = 0; };
+    Stats GetStats() const;
+    // Set before a serialized forward; prefill does not create decode heat.
+    void SetPrefill(bool prefill);
+    // The callback may submit GPU work while NUMA workers are active; it must
+    // not submit CPU work to the shared host MoE pool.
+    void Run(const Data &input, const Data &index, const Data &score,
+             Data &output, int layer, const std::function<void()> &launchParallel = {});
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl;
+};
+
 // One complete target token/verification step owns one policy scope. Cache
 // admission must finish outside captured GPU segments, including on exceptions.
 // Weight-table pointers remain cache keys; this class never copies the tables.
 class HybridMoeDecodeStep {
 public:
-    HybridMoeDecodeStep() = default;
+    // Concurrent TP ranks own disjoint caches and finish only their owner.
+    explicit HybridMoeDecodeStep(bool deviceLocal = false) : deviceLocal(deviceLocal) {}
     HybridMoeDecodeStep(const HybridMoeDecodeStep &) = delete;
     HybridMoeDecodeStep &operator=(const HybridMoeDecodeStep &) = delete;
     HybridMoeDecodeStep(HybridMoeDecodeStep &&other) noexcept
-        : policy(std::exchange(other.policy, nullptr)) {}
+        : policy(std::exchange(other.policy, nullptr)), deviceLocal(other.deviceLocal) {}
     ~HybridMoeDecodeStep();
     void Begin(Data **weights, int count, int topk,
                const std::vector<int> *devices = nullptr);
@@ -60,6 +124,7 @@ public:
     explicit operator bool() const { return policy != nullptr; }
 private:
     void *policy = nullptr;
+    bool deviceLocal = false;
 };
 
 // One policy per cache-owning device, started lazily when its first MoE layer

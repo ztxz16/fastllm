@@ -549,6 +549,15 @@ fastllm_lib.launch_response_llm_model.argtypes = [ctypes.c_int, ctypes.c_int, ct
                                                   ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
 fastllm_lib.launch_response_llm_model.restype = ctypes.c_int
 
+if hasattr(fastllm_lib, "launch_response_clover_llm_model"):
+    fastllm_lib.launch_response_clover_llm_model.argtypes = [
+        ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.c_char_p]
+    fastllm_lib.launch_response_clover_llm_model.restype = ctypes.c_int
+    fastllm_lib.configure_clover_llm_model.argtypes = [ctypes.c_int, ctypes.c_char_p]
+    fastllm_lib.configure_clover_llm_model.restype = ctypes.c_bool
+    fastllm_lib.get_clover_error.argtypes = []
+    fastllm_lib.get_clover_error.restype = ctypes.c_char_p
+
 fastllm_lib.launch_response_llm_model_multimodal.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
                                                             ctypes.c_char_p, ctypes.c_void_p, 
                                                             ctypes.c_int, ctypes.c_int, ctypes.c_bool, ctypes.c_float, ctypes.c_int,
@@ -1844,13 +1853,23 @@ class model:
             if key in self.default_generation_config
         })
 
+        if model_type == "clover_moe":
+            self.default_generation_config.update(
+                do_sample=False, top_p=1.0, top_k=0,
+                repetition_penalty=1.05, presence_penalty=0.9, frequency_penalty=0.0)
+
         # 统一尝试加载 generation_config.json
         if config_base_path:
             generation_config_path = os.path.join(config_base_path, "generation_config.json")
             if os.path.isfile(generation_config_path):
                 with open(generation_config_path, "r", encoding="utf-8") as f:
                     gen_cfg = json.load(f)
-                    if gen_cfg.get('do_sample', False):
+                    if model_type == "clover_moe":
+                        self._clover_generation_config = gen_cfg
+                        for key in self.default_generation_config:
+                            if key in gen_cfg and gen_cfg[key] is not None:
+                                self.default_generation_config[key] = gen_cfg[key]
+                    elif gen_cfg.get('do_sample', False):
                         for key in ["repetition_penalty", "top_p", "top_k", "temperature"]:
                             if key in gen_cfg:
                                 self.default_generation_config[key] = gen_cfg[key]
@@ -2866,16 +2885,61 @@ class model:
             print("add_cache failed: need hf_tokenizer.")
             exit(0)
     
+    def _is_clover(self):
+        return (getattr(self, "config", None) or {}).get("model_type") == "clover_moe"
+
+    def configure_clover(self, **options):
+        if not self._is_clover():
+            raise ValueError("Clover generation options require a Clover model")
+        if not hasattr(fastllm_lib, "configure_clover_llm_model"):
+            raise RuntimeError("Rebuild FastLLM with native Clover support")
+        if not fastllm_lib.configure_clover_llm_model(
+                self.model, json.dumps(options, allow_nan=False).encode()):
+            raise ValueError(fastllm_lib.get_clover_error().decode())
+
+    def _launch_clover(self, tokens, max_length, min_length, do_sample, top_p,
+                       top_k, temperature, repeat_penalty, stop_token_ids, options):
+        if not hasattr(fastllm_lib, "launch_response_clover_llm_model"):
+            raise RuntimeError("Rebuild FastLLM with native Clover support")
+        config = dict(getattr(self, "_clover_generation_config", {}))
+        config.update(options or {})
+        config.update(max_new_tokens=max_length, min_new_tokens=min_length,
+                      do_sample=do_sample, top_p=top_p, top_k=top_k,
+                      temperature=temperature, repetition_penalty=repeat_penalty,
+                      stop_token_ids=list(stop_token_ids or []))
+        handle = fastllm_lib.launch_response_clover_llm_model(
+            self.model, len(tokens), (ctypes.c_int * len(tokens))(*tokens),
+            json.dumps(config, allow_nan=False).encode())
+        if handle < 0:
+            raise ValueError(fastllm_lib.get_clover_error().decode())
+        return handle
+
     def launch_stream_response(self,
                         query: Union[str, List[Dict[str, str]]],
                         history: List[Tuple[str, str]] = None,
-                        max_length: int = 8192, min_length: int = 0, do_sample = True, 
-                        top_p = 0.8, top_k = 1, temperature = 1.0, repeat_penalty = 1.0,
+                        max_length: int = 8192, min_length: int = 0, do_sample = None,
+                        top_p = None, top_k = None, temperature = None, repeat_penalty = None,
                         one_by_one = True, stop_token_ids: List[int] = None, add_generation_prompt = True, 
                         images: List = None, videos: List = None, tools: List = None, enable_thinking = None,
                         thinking_effort = None, tool_choice = None,
                         chat_template_kwargs = None,
-                        tool_call_constraint: Optional[Dict[str, Any]] = None):
+                        tool_call_constraint: Optional[Dict[str, Any]] = None,
+                        clover_options: Optional[Dict[str, Any]] = None):
+        is_clover = self._is_clover()
+        sampling_defaults = (self.default_generation_config if is_clover else
+                             dict(do_sample=True, top_p=0.8, top_k=1, temperature=1.0, repetition_penalty=1.0))
+        if do_sample is None:
+            do_sample = sampling_defaults.get("do_sample", False)
+        if top_p is None:
+            top_p = sampling_defaults["top_p"]
+        if top_k is None:
+            top_k = sampling_defaults["top_k"]
+        if temperature is None:
+            temperature = sampling_defaults["temperature"]
+        if repeat_penalty is None:
+            repeat_penalty = sampling_defaults["repetition_penalty"]
+        if is_clover and (images or videos or tool_call_constraint):
+            raise ValueError("Clover currently supports text generation without constrained sampling")
         if enable_thinking is None:
             enable_thinking = self.enable_thinking
         pending_text_input_token_cache = getattr(
@@ -3161,9 +3225,13 @@ class model:
                 #print("input", input[:100])
 
             stop_token_len, stop_token_list = self.stop_token_ctypes(stop_token_ids)
-            handle = fastllm_lib.launch_response_llm_model(self.model, len(input), (ctypes.c_int * len(input))(*input),
-                                                        max_length, min_length, do_sample, top_p, top_k, temperature, repeat_penalty,
-                                                        False, stop_token_len, stop_token_list)
+            if is_clover:
+                handle = self._launch_clover(input, max_length, min_length, do_sample, top_p,
+                    top_k, temperature, repeat_penalty, stop_token_ids, clover_options)
+            else:
+                handle = fastllm_lib.launch_response_llm_model(self.model, len(input), (ctypes.c_int * len(input))(*input),
+                                                            max_length, min_length, do_sample, top_p, top_k, temperature, repeat_penalty,
+                                                            False, stop_token_len, stop_token_list)
             if (self.save_history):
                 if can_reuse_token_count:
                     # Native KV history is independent of this Python text
@@ -3190,6 +3258,10 @@ class model:
             else:
                 prompt = query if self.direct_query else self.get_prompt(query, history)
             stop_token_len, stop_token_list = self.stop_token_ctypes(stop_token_ids)
+            if is_clover:
+                input = self.tokenizer_encode_string(prompt)
+                return self._launch_clover(input, max_length, min_length, do_sample, top_p,
+                    top_k, temperature, repeat_penalty, stop_token_ids, clover_options)
             if (self.save_history):
                 input = self.tokenizer_cache.tokenize_with_cache(self, prompt)
                 handle = fastllm_lib.launch_response_llm_model(self.model, len(input), (ctypes.c_int * len(input))(*input),
@@ -3248,6 +3320,8 @@ class model:
                 if (cur <= -1):
                     if (cur == -2):
                         self._raise_prompt_too_long(handle)
+                    if cur == -3:
+                        raise RuntimeError("Native model generation failed; see server log for details")
                     break
                 tokens.append(cur)
                 ret = tokenizer.decode(tokens)
@@ -3269,6 +3343,8 @@ class model:
                 token = fastllm_lib.fetch_response_llm_model(self.model, handle)
                 if token == -2:
                     self._raise_prompt_too_long(handle)
+                if token == -3:
+                    raise RuntimeError("Native model generation failed; see server log for details")
                 if (self.save_history and handle in self.current_tokenizer_cache):
                     if (token <= -1):
                         try:
@@ -3348,6 +3424,8 @@ class model:
                 if count <= -1:
                     if count == -2:
                         self._raise_prompt_too_long(handle)
+                    if count == -3:
+                        raise RuntimeError("Native model generation failed; see server log for details")
                     if (self.save_history):
                         try:
                             cur = self.current_tokenizer_cache.pop(handle)
@@ -3390,6 +3468,8 @@ class model:
                 if count <= -1:
                     if count == -2:
                         self._raise_prompt_too_long(handle)
+                    if count == -3:
+                        raise RuntimeError("Native model generation failed; see server log for details")
                     if (self.save_history and
                             handle in self.current_tokenizer_cache):
                         try:
@@ -3539,6 +3619,8 @@ class model:
         fastllm_lib.set_save_history(self.model, save)
 
     def set_atype(self, atype: str):
+        if self._is_clover() and atype not in ("bf16", "bfloat16", "fp16", "float16"):
+            raise ValueError("Clover activations must be BF16 or FP16")
         if getattr(self, "kvmem_enabled", False):
             raise ValueError("Set compute dtype before configuring KVMem")
         fastllm_lib.set_model_atype(self.model, str(atype).encode())
@@ -3547,6 +3629,8 @@ class model:
         fastllm_lib.set_model_moe_atype(self.model, str(moe_atype).encode())
 
     def set_kv_cache_dtype(self, kv_cache_dtype: str):
+        if self._is_clover() and kv_cache_dtype not in ("bf16", "bfloat16", "fp16", "float16"):
+            raise ValueError("Clover attention KV must be BF16 or FP16")
         if getattr(self, "kvmem_enabled", False):
             raise ValueError("Set KV dtype before configuring KVMem")
         fastllm_lib.set_model_kv_cache_dtype(self.model, str(kv_cache_dtype).encode())

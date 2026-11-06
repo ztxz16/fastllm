@@ -227,13 +227,17 @@ def checkpoint_files(path):
     files = [root]
     if root.suffix == ".gguf":
         from .gguf_metadata import read_gguf_metadata
-        metadata = read_gguf_metadata(root, {"split.count", "deepseek41.engram.present", "deepseek41.engram.file"})
+        metadata = read_gguf_metadata(root, {"split.count", "deepseek41.engram.present", "deepseek41.engram.file",
+                                             "general.architecture", "deepseek41.ple.layers"})
         count = int(metadata.get("split.count", 1))
         if count > 1:
             match = re.fullmatch(r"(.*)-\d{5}-of-(\d{5})\.gguf", root.name)
             if not match or int(match[2]) != count:
                 raise ValueError("autotune cannot resolve GGUF shards")
             files = [root.with_name("%s-%05d-of-%05d.gguf" % (match[1], i + 1, count)) for i in range(count)]
+            if (not files[-1].exists() and metadata.get("general.architecture") == "deepseek41" and
+                    "deepseek41.ple.layers" in metadata):
+                files[-1] = root.with_name("DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf")
         if metadata.get("deepseek41.engram.present"):
             name = metadata["deepseek41.engram.file"]
             if not name or name in (".", "..") or "/" in name or "\\" in name:

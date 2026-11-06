@@ -387,8 +387,9 @@ struct StreamedWorkspace {
     block_q8_1 *input;
     block_q8_1_mmq *quantized;
     float *products, *routes;
+    uint8_t *valid = nullptr;
     size_t bytes;
-    StreamedWorkspace(void *base, int rows, int hidden, int inter, int topk, int capacity, bool nativeV41 = false) {
+    StreamedWorkspace(void *base, int rows, int hidden, int inter, int topk, int capacity, bool nativeV41 = false, bool compactScratch = false) {
         size_t used = 0;
         auto take = [&](size_t n) -> void * {
             void *p = base ? static_cast<char *>(base) + used : nullptr;
@@ -405,6 +406,7 @@ struct StreamedWorkspace {
         // Native V4.1 rounds every down projection to BF16 before reduction.
         routes = static_cast<float *>(take(size_t(rows) * topk * hidden *
             (nativeV41 ? sizeof(__nv_bfloat16) : sizeof(float))));
+        if (compactScratch) valid = static_cast<uint8_t *>(take(size_t(rows) * topk));
         bytes = used;
     }
 };
@@ -449,7 +451,7 @@ __global__ void ActivateQuantizeStreamed(const float *products,
         const float g = mmq_io<T>::to_float(mmq_io<T>::from_float(products[size_t(row) * 2 * inter + col]));
         const float u = mmq_io<T>::to_float(mmq_io<T>::from_float(products[size_t(row) * 2 * inter + inter + col]));
         value = mmq_io<T>::from_float(g / (1 + expf(-g)) * u);
-        gate[size_t(route) * inter + col] = value;
+        if (gate) gate[size_t(route) * inter + col] = value;
     }
     const float x = mmq_io<T>::to_float(value);
     float maximum = fabsf(x);
@@ -461,25 +463,33 @@ __global__ void ActivateQuantizeStreamed(const float *products,
     if (col % 32 == 0) q.d4[(col % 128) / 32] = __half2float(__float2half_rn(scale));
 }
 
-template<class T>
+template<class T, bool Compact = false>
 __global__ void ScatterStreamed(const float *products, float *output,
-        const int *routes, int rows, int hidden) {
+        const int *routes, int rows, int hidden, uint8_t *valid = nullptr) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= rows * hidden) return;
     const int route = routes[i / hidden];
-    if (route >= 0) output[size_t(route) * hidden + i % hidden] =
-        mmq_io<T>::to_float(mmq_io<T>::from_float(products[i]));
+    if (route >= 0) {
+        output[size_t(route) * hidden + i % hidden] =
+            mmq_io<T>::to_float(mmq_io<T>::from_float(products[i]));
+        // Each top-k slot has exactly one producer; the final reduction follows
+        // all groups on this stream, including slices of heavily routed experts.
+        if constexpr (Compact) {
+            if (i % hidden == 0) valid[route] = 1;
+        }
+    }
 }
 
-template<class T>
+template<class T, bool Compact>
 __global__ void ReduceStreamed(const float *products, T *output,
-        const float *scores, int rows, int hidden, int topk) {
+        const float *scores, int rows, int hidden, int topk, const uint8_t *valid) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= rows * hidden) return;
     float sum = 0;
     for (int k = 0; k < topk; ++k) {
         const int route = (i / hidden) * topk + k;
-        sum += products[size_t(route) * hidden + i % hidden] * scores[route];
+        const float value = !Compact || valid[route] ? products[size_t(route) * hidden + i % hidden] : 0.f;
+        sum += value * scores[route];
     }
     output[i] = mmq_io<T>::from_float(sum);
 }
@@ -499,13 +509,18 @@ static bool RunStreamed(StreamedMoePhase phase, const T *input, T *gate, T *outp
             capacity, rows, hidden, inter, topk, gt, dt, batch, scores, indices, swigluLimit);
     }
     const auto stream = cudaStreamPerThread;
-    StreamedWorkspace s(workspace, rows, hidden, inter, topk, capacity);
+    StreamedWorkspace s(workspace, rows, hidden, inter, topk, capacity, false, batch.compactScratch);
+    if (batch.compactScratch) gate = nullptr; // Activated values are consumed directly by quantization.
     if (phase == StreamedMoePhase::Prepare) {
-        CUDA_CHECK(cudaMemsetAsync(s.routes, 0, size_t(rows) * topk * hidden * sizeof(float), stream));
-        CUDA_CHECK(cudaMemsetAsync(gate, 0, size_t(rows) * topk * inter * sizeof(T), stream));
+        if (s.valid) CUDA_CHECK(cudaMemsetAsync(s.valid, 0, size_t(rows) * topk, stream));
+        else CUDA_CHECK(cudaMemsetAsync(s.routes, 0, size_t(rows) * topk * hidden * sizeof(float), stream));
+        if (gate) CUDA_CHECK(cudaMemsetAsync(gate, 0, size_t(rows) * topk * inter * sizeof(T), stream));
         quantize_mmvq_q8_1<<<dim3((hidden + 255) / 256, rows), 256, 0, stream>>>(input, s.input, hidden);
     } else if (phase == StreamedMoePhase::Finish) {
-        ReduceStreamed<<<(rows * hidden + 255) / 256, 256, 0, stream>>>(s.routes, output, scores, rows, hidden, topk);
+        if (batch.compactScratch)
+            ReduceStreamed<T, true><<<(rows * hidden + 255) / 256, 256, 0, stream>>>(s.routes, output, scores, rows, hidden, topk, s.valid);
+        else
+            ReduceStreamed<T, false><<<(rows * hidden + 255) / 256, 256, 0, stream>>>(s.routes, output, scores, rows, hidden, topk, nullptr);
     } else {
         Workspace w(nullptr, rows, hidden, inter, batch.experts, topk);
         w.capacity = capacity; w.activeRows = batch.rows;
@@ -524,8 +539,12 @@ static bool RunStreamed(StreamedMoePhase phase, const T *input, T *gate, T *outp
         ActivateQuantizeStreamed<<<dim3((inter + 255) / 256, batch.rows), 256, 0, stream>>>(
             s.products, s.quantized, gate, batch.routes, inter, capacity);
         Matrix(dt, batch.weights, 1, w, batch.experts, inter, hidden, stream);
-        ScatterStreamed<T><<<(batch.rows * hidden + 255) / 256, 256, 0, stream>>>(
-            s.products, s.routes, batch.routes, batch.rows, hidden);
+        if (batch.compactScratch)
+            ScatterStreamed<T, true><<<(batch.rows * hidden + 255) / 256, 256, 0, stream>>>(
+                s.products, s.routes, batch.routes, batch.rows, hidden, s.valid);
+        else
+            ScatterStreamed<T><<<(batch.rows * hidden + 255) / 256, 256, 0, stream>>>(
+                s.products, s.routes, batch.routes, batch.rows, hidden);
     }
     return cudaGetLastError() == cudaSuccess;
 }

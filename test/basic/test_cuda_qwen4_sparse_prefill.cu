@@ -49,6 +49,43 @@ template <class F> static float Time(F f, int n) {
     C(cudaEventDestroy(b));
     return ms / n;
 }
+static void CausalSplit(int previous, int rows, int dim = 64, int width = 129) {
+    const int length = previous + rows, heads = 6, kvHeads = 2;
+    Data q(FLOAT16, {heads, rows, dim}), k(FLOAT16, {kvHeads, length, dim}),
+        v(FLOAT16, k.dims), ids(INT32, {rows, width});
+    for (Data *p : {&q, &k, &v, &ids}) GPU(*p);
+    Fill(q, 123); Fill(k, 127); Fill(v, 131);
+    std::vector<int32_t> selected(size_t(rows) * width, -1);
+    for (int row = 0; row < rows; ++row) {
+        const int visible = previous + row + 1, count = std::min(visible, width);
+        // Unique, noncontiguous positions with causal padding, like QSA selection.
+        for (int j = 0; j < count; ++j)
+            selected[size_t(row) * width + j] = int(int64_t(j) * visible / count);
+    }
+    C(cudaMemcpy(ids.cudaData, selected.data(), selected.size() * 4, cudaMemcpyHostToDevice));
+    Data reference(FLOAT16, q.dims), actual(FLOAT16, q.dims);
+    GPU(reference); GPU(actual);
+    const float scale = 1 / std::sqrt(float(dim));
+    Check(FastllmCudaQwen4SparsePrefill(q, k, v, ids, reference, heads / kvHeads, scale),
+          "causal sparse reference dispatch");
+    Check(FastllmCudaQwen4CausalPrefill(q, k, v, ids, actual, heads / kvHeads, scale, previous, 4096),
+          "causal split dispatch");
+    std::vector<half> a(q.Count(0)), b(a.size());
+    C(cudaMemcpy(a.data(), reference.cudaData, a.size() * 2, cudaMemcpyDeviceToHost));
+    C(cudaMemcpy(b.data(), actual.cudaData, b.size() * 2, cudaMemcpyDeviceToHost));
+    float maximum = 0; double error = 0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        const float x = __half2float(a[i]), y = __half2float(b[i]), e = std::abs(x-y);
+        maximum = std::max(maximum, e); error += double(e) * e;
+        Check(std::isfinite(y) && e < .002f + .002f * std::abs(x), "causal split numerical mismatch");
+    }
+    Data untouched(FLOAT16, q.dims);
+    Check(!FastllmCudaQwen4CausalPrefill(q, k, v, ids, untouched, heads / kvHeads,
+        scale, previous + 1, 4096) && !untouched.cudaData, "inconsistent prefix accepted");
+    printf("CAUSAL_SPLIT previous=%d rows=%d max=%g rmse=%g PASS\n", previous, rows,
+           maximum, std::sqrt(error/a.size()));
+}
+
 static void Sparse(int rows, int kh, int group, int dim, int width, int length, int rounds, bool decode = false) {
     int qh = kh * group;
     Data q(FLOAT16, {qh, rows, dim}), k(FLOAT16), v(FLOAT16), ids(INT32, {rows, width});
@@ -351,7 +388,7 @@ static void Mix(int rows, int channels) {
     float before = Time(old, 50), after = Time(now, 50);
     printf(" before_ms=%.5f after_ms=%.5f speedup=%.3f PASS\n", before, after, before / after);
 }
-int main() {
+int main(int argc, char **argv) {
 #if defined(USE_ROCM) || defined(CUDA_NO_TENSOR_CORE)
     puts("FASTLLM_TEST_SKIP_NO_DEVICE: indexed sparse prefill needs CUDA tensor cores");
     return 0;
@@ -367,6 +404,12 @@ int main() {
         }
         FastllmCudaSetDevice(0);
         SetThreads(2);
+        if (argc > 1 && std::string(argv[1]) == "--causal-only") {
+            CausalSplit(0, 8192);
+            CausalSplit(1024, 4097);
+            CausalSplit(0, 8192, 256, 2051);
+            return 0;
+        }
         for (int n : {1, 8, 128, 2048})
             for (int c : {513, 2560})
                 Mix(n, c);

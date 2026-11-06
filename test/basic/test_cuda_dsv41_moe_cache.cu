@@ -2,12 +2,16 @@
 #include "executor.h"
 #include "utils.h"
 #include "fastllm-cuda.cuh"
+#include "devices/cuda/fastllm-v41-full-decode.h"
+#include <thread>
+#include <chrono>
 #include "devices/cuda/fastllm-cuda-moe-policy.h"
 #include "devices/cuda/fastllm-cuda-moe-cache-stats.h"
 #include "moe_cache_config.h"
 #include "devices/numas/numasdevice.h"
 #include "devices/numas/numas.h"
 #include "../../src/devices/cuda/moe/fastllm-moe-deepseekv41-cache.cuh"
+#include "../../src/devices/cuda/moe/fastllm-moe-cache-publication.cuh"
 #include <cuda_bf16.h>
 #include "cuda_moe_prefill_test.h"
 #include <cuda_fp8.h>
@@ -34,6 +38,76 @@ static void Require(bool value, const char *message) {
 static void Check(cudaError_t state) {
     Require(state == cudaSuccess, cudaGetErrorString(state));
 }
+__global__ void CheckNativeRoutePlan(int *slots, int topk) {
+    const int mask = blockIdx.x, selected = blockIdx.y, route = threadIdx.x;
+    if (route < topk) slots[(mask * (topk + 1) + selected) * topk + route] =
+        fastllm::cuda::dsv41_cache::NativeStagedSlot(mask, route, selected);
+}
+static void TestNativeRoutePlan() {
+    size_t comparisons = 0;
+    for (int topk : {1, 6, 16}) {
+        const int masks = 1 << topk;
+        const size_t count = size_t(masks) * (topk + 1) * topk;
+        int *device = nullptr;
+        Check(cudaMalloc(&device, count * sizeof(int)));
+        CheckNativeRoutePlan<<<dim3(masks, topk + 1), 32>>>(device, topk);
+        std::vector<int> actual(count);
+        Check(cudaMemcpy(actual.data(), device, count * sizeof(int), cudaMemcpyDeviceToHost));
+        for (int mask = 0; mask < masks; ++mask) for (int staged = 0; staged <= topk; ++staged) {
+            int next = 0;
+            for (int route = 0; route < topk; ++route) {
+                int expected = -1;
+                if (!(mask & (1 << route))) { if (next < staged) expected = next; ++next; }
+                Require(actual[(size_t(mask) * (topk + 1) + staged) * topk + route] == expected,
+                    "GPU route plan differs from CPU stable miss prefix");
+                ++comparisons;
+            }
+        }
+        Check(cudaFree(device));
+    }
+    std::printf("NATIVE_PLAN_PASS %zu exact comparisons, every residency mask at topk 1/6/16\n", comparisons);
+}
+static void TestHostCopyPublication() {
+    constexpr size_t bytes = 12288;
+    void *host[2]{}, *graphs[2]{}, *dst[2]{}, *composed = nullptr, *exec = nullptr;
+    std::atomic<unsigned> *ready[2]{};
+    for (int i = 0; i < 2; ++i) {
+        Check(cudaMalloc(&dst[i], bytes));
+        Require(FastllmCudaV41CreateHostCopy(dst[i], bytes, &host[i], &ready[i], &graphs[i]),
+            "Engram publication graph creation");
+    }
+    Require(FastllmCudaGraphCompose(const_cast<const void *const *>(graphs), 2, &composed, &exec),
+        "Engram publication graph composition");
+    std::vector<unsigned char> actual(bytes), expected[2];
+    for (int replay = 0; replay < 64; ++replay) {
+        for (int i = 0; i < 2; ++i) {
+            expected[i].resize(bytes);
+            for (size_t j = 0; j < bytes; ++j) expected[i][j] = (replay * 19 + i * 7 + j * 13) & 255;
+            ready[i]->store(0u, std::memory_order_release);
+        }
+        Require(FastllmCudaGraphLaunch(exec), "Engram publication replay");
+        std::thread producer([&] {
+            // Reverse publication order too, and delay until after launch.
+            for (int j = 0; j < 2; ++j) {
+                const int i = (j + replay) % 2;
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
+                std::memcpy(host[i], expected[i].data(), bytes);
+                ready[i]->store(1u, std::memory_order_release);
+            }
+        });
+        Check(cudaStreamSynchronize(cudaStreamPerThread));
+        producer.join();
+        for (int i = 0; i < 2; ++i) {
+            Check(cudaMemcpy(actual.data(), dst[i], bytes, cudaMemcpyDeviceToHost));
+            Require(actual == expected[i], "Engram graph consumed stale/partial rows");
+        }
+    }
+    FastllmCudaGraphExecDestroy(exec); FastllmCudaGraphDestroy(composed);
+    for (int i = 0; i < 2; ++i) {
+        FastllmCudaGraphDestroy(graphs[i]); FastllmCudaHostFree(ready[i]); Check(cudaFree(dst[i]));
+    }
+    std::printf("ENGRAM_HANDOFF_PASS 128 delayed/reordered publication copies, byte exact\n");
+}
 static float Bf(float x) {
     return RoundFloat32ToBFloat16RNE(x);
 }
@@ -47,6 +121,170 @@ __global__ void CheckFP4Pair(float *output) {
     output[2 * i] = pair.x;
     output[2 * i + 1] = pair.y;
 }
+__global__ void CheckDotGateUp(const __nv_bfloat16 *input, const uint8_t *weights,
+        float *output, int columns) {
+    const int row = blockIdx.x * 32 + threadIdx.x / 16;
+    const size_t pitch = size_t(columns / 32) * 17;
+    const auto *gate = weights + 2 * row * pitch, *up = gate + pitch;
+    const float2 pair = fastllm::cuda::dsv41_cache::DotGateUp(input, gate, up, columns);
+    const float g = fastllm::cuda::dsv41_cache::Dot(input, gate, columns);
+    const float u = fastllm::cuda::dsv41_cache::Dot(input, up, columns);
+    if ((threadIdx.x & 15) == 0) {
+        output[4 * row] = pair.x; output[4 * row + 1] = pair.y;
+        output[4 * row + 2] = g; output[4 * row + 3] = u;
+    }
+}
+static void TestDotGateUp() {
+    constexpr int rows = 128;
+    std::mt19937 rng(127);
+    for (int columns : {32, 256, 2304, 5120}) {
+        const size_t pitch = size_t(columns / 32) * 17;
+        std::vector<uint8_t> weights(2 * rows * pitch);
+        std::vector<uint16_t> input(columns);
+        for (auto &v : input) v = Float32ToBFloat16RNEBits((int(rng() % 2001) - 1000) / 128.f);
+        for (int row = 0; row < 2 * rows; ++row) for (int block = 0; block < columns / 32; ++block) {
+            auto *w = weights.data() + row * pitch + block * 17;
+            for (int i = 0; i < 16; ++i) w[i] = row < 2 ? 0x80 : rng() % 256;
+            w[16] = row < 8 ? (row < 4 ? 0 : row < 6 ? 254 : 255) : 112 + rng() % 22;
+        }
+        uint8_t *deviceWeights; __nv_bfloat16 *deviceInput; float *deviceOutput;
+        Check(cudaMalloc(&deviceWeights, weights.size()));
+        Check(cudaMalloc(&deviceInput, input.size() * 2));
+        Check(cudaMalloc(&deviceOutput, rows * 4 * sizeof(float)));
+        Check(cudaMemcpy(deviceWeights, weights.data(), weights.size(), cudaMemcpyHostToDevice));
+        Check(cudaMemcpy(deviceInput, input.data(), input.size() * 2, cudaMemcpyHostToDevice));
+        CheckDotGateUp<<<rows / 32, 512>>>(deviceInput, deviceWeights, deviceOutput, columns);
+        std::vector<float> values(rows * 4);
+        Check(cudaMemcpy(values.data(), deviceOutput, values.size() * sizeof(float), cudaMemcpyDeviceToHost));
+        for (int row = 0; row < rows; ++row) for (int part = 0; part < 2; ++part) {
+            const float &a = values[4 * row + part], &b = values[4 * row + part + 2];
+            Require((std::isnan(a) && std::isnan(b)) || std::memcmp(&a, &b, sizeof(float)) == 0,
+                "paired dot changed independent accumulation bits");
+        }
+        Check(cudaFree(deviceOutput)); Check(cudaFree(deviceInput)); Check(cudaFree(deviceWeights));
+    }
+    std::printf("DOT_GATE_UP_PASS 512 projection pairs: finite bits and NaN cases\n");
+}
+
+// Replay the tiled resident path with changing routes; the ordinary path is
+// the numerical reference, including absent slots and block-32 FP8 rounding.
+static void TestResidentGate() {
+    constexpr int topk = 6, inter = 96;
+    size_t cases = 0;
+    for (int hidden : {256, 768, 5120}) {
+        const size_t stride = size_t(hidden / 32) * 17 * inter * 2;
+        std::vector<uint8_t> weights(topk * stride);
+        std::vector<__nv_bfloat16> input(hidden), reference(topk * inter), actual(topk * inter);
+        uint8_t *dw; __nv_bfloat16 *dx, *da, *db; int32_t *ds; float *dr;
+        Check(cudaMalloc(&dw, weights.size())); Check(cudaMalloc(&dx, hidden * sizeof(*dx)));
+        Check(cudaMalloc(&da, reference.size() * sizeof(*da))); Check(cudaMalloc(&db, actual.size() * sizeof(*db)));
+        Check(cudaMalloc(&ds, topk * sizeof(*ds))); Check(cudaMalloc(&dr, topk * sizeof(*dr)));
+        const float scores[topk] = {0.0f, -0.125f, 0.3f, 0.9f, 1.0f, -0.5f};
+        Check(cudaMemcpy(dr, scores, sizeof(scores), cudaMemcpyHostToDevice));
+        cudaStream_t stream; cudaGraph_t graph; cudaGraphExec_t exec;
+        Check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        Check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+        fastllm::cuda::dsv41_cache::Gate<<<dim3(inter / 32, topk), 512, 0, stream>>>(
+            dx, ds, dw, dr, da, hidden, inter, stride, 10.0f);
+        fastllm::cuda::dsv41_cache::GateResident<<<dim3(inter / 32, topk), 512, 0, stream>>>(
+            dx, ds, dw, dr, db, hidden, inter, stride, 10.0f);
+        Check(cudaStreamEndCapture(stream, &graph));
+        Check(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+        for (int seed = 0; seed < 4; ++seed) {
+            std::mt19937 rng(100 + seed);
+            for (auto &v : input) v = __float2bfloat16_rn((int(rng() % 4096) - 2048) / 4096.0f);
+            for (size_t n = 0; n < weights.size(); n += 17) {
+                for (int b = 0; b < 16; ++b) weights[n + b] = uint8_t(rng());
+                const uint8_t edges[] = {0, 1, 117, 126, 254, 255};
+                weights[n + 16] = seed == 3 ? edges[n / stride] : uint8_t(117 + rng() % 10);
+            }
+            Check(cudaMemcpy(dw, weights.data(), weights.size(), cudaMemcpyHostToDevice));
+            Check(cudaMemcpy(dx, input.data(), input.size() * sizeof(*dx), cudaMemcpyHostToDevice));
+            for (int mask = 0; mask < 64; ++mask) {
+                int32_t slots[topk];
+                for (int r = 0; r < topk; ++r) slots[r] = mask & (1 << r) ? topk - r - 1 : -1;
+                Check(cudaMemcpyAsync(ds, slots, sizeof(slots), cudaMemcpyHostToDevice, stream));
+                Check(cudaMemsetAsync(da, 0x3f, reference.size() * sizeof(*da), stream));
+                Check(cudaMemsetAsync(db, 0x3f, actual.size() * sizeof(*db), stream));
+                Check(cudaGraphLaunch(exec, stream)); Check(cudaStreamSynchronize(stream));
+                Check(cudaMemcpy(reference.data(), da, reference.size() * sizeof(*da), cudaMemcpyDeviceToHost));
+                Check(cudaMemcpy(actual.data(), db, actual.size() * sizeof(*db), cudaMemcpyDeviceToHost));
+                for (size_t n = 0; n < reference.size(); ++n)
+                    Require(std::memcmp(&reference[n], &actual[n], sizeof(*da)) == 0 ||
+                        (std::isnan(__bfloat162float(reference[n])) && std::isnan(__bfloat162float(actual[n]))),
+                        "resident gate changed BF16/FP8 rounding or stale route output");
+                ++cases;
+            }
+        }
+        Check(cudaGraphExecDestroy(exec)); Check(cudaGraphDestroy(graph)); Check(cudaStreamDestroy(stream));
+        for (void *p : {static_cast<void *>(dw), static_cast<void *>(dx), static_cast<void *>(da),
+                static_cast<void *>(db), static_cast<void *>(ds), static_cast<void *>(dr)}) Check(cudaFree(p));
+    }
+    std::printf("RESIDENT_GATE_PASS %zu graph replays: route masks, partial tiles and scale edges\n", cases);
+}
+
+#if !defined(USE_ROCM) && CUDART_VERSION >= 11070
+__global__ void CheckAdmissionReader(const int32_t *keys, const int32_t *slotKeys,
+        const int *payload, unsigned long long *counts, int key, int expected,
+        int requiredResident, int size) {
+    for (int repeat = 0; repeat < 8; ++repeat) {
+        const int slot = fastllm::cuda::moe_admission::LoadAdmission(keys + key);
+        if (slot < 0) {
+            atomicAdd(counts + 1, 1ULL);
+            if (requiredResident == 1) atomicAdd(counts + 2, 1ULL);
+            continue;
+        }
+        if (requiredResident == 0 || slotKeys[slot] != key) atomicAdd(counts + 2, 1ULL);
+        for (int i = threadIdx.x + blockIdx.x * blockDim.x; i < size; i += blockDim.x * gridDim.x)
+            if (payload[i] != expected) atomicAdd(counts + 2, 1ULL);
+        atomicAdd(counts, 1ULL);
+    }
+}
+static void TestCachePublication() {
+    namespace admission = fastllm::cuda::moe_admission;
+    constexpr int size = 1 << 18;
+    int32_t *keys, *slotKeys, *changes; int *payload;
+    unsigned long long *used, *step, *counts;
+    Check(cudaMalloc(&keys, 2 * sizeof(int32_t))); Check(cudaMalloc(&slotKeys, sizeof(int32_t)));
+    Check(cudaMalloc(&changes, 2 * sizeof(int32_t))); Check(cudaMalloc(&payload, size * sizeof(int)));
+    Check(cudaMalloc(&used, sizeof(*used))); Check(cudaMalloc(&step, sizeof(*step)));
+    Check(cudaMalloc(&counts, 3 * sizeof(*counts)));
+    Check(cudaMemset(step, 0, sizeof(*step))); Check(cudaMemset(counts, 0, 3 * sizeof(*counts)));
+    cudaStream_t reader, writer; cudaEvent_t evicted;
+    Check(cudaStreamCreateWithFlags(&reader, cudaStreamNonBlocking));
+    Check(cudaStreamCreateWithFlags(&writer, cudaStreamNonBlocking));
+    Check(cudaEventCreateWithFlags(&evicted, cudaEventDisableTiming));
+    for (int repeat = 0; repeat < 128; ++repeat) {
+        const int32_t init[2] = {0, -1}, zero = 0, change[2] = {1, 0};
+        Check(cudaMemcpy(keys, init, sizeof(init), cudaMemcpyHostToDevice));
+        Check(cudaMemcpy(slotKeys, &zero, sizeof(zero), cudaMemcpyHostToDevice));
+        Check(cudaMemcpy(changes, change, sizeof(change), cudaMemcpyHostToDevice));
+        Check(cudaMemset(payload, 0x11, size * sizeof(int)));
+        CheckAdmissionReader<<<8, 128, 0, reader>>>(keys, slotKeys, payload, counts, 0, 0x11111111, 1, size);
+        admission::InvalidateCacheAdmissions<<<1, 32, 0, reader>>>(keys, slotKeys, nullptr, changes, 1);
+        // Both old and new keys must miss until the writer is allowed to run.
+        CheckAdmissionReader<<<1, 32, 0, reader>>>(keys, slotKeys, payload, counts, 0, 0, 0, size);
+        CheckAdmissionReader<<<1, 32, 0, reader>>>(keys, slotKeys, payload, counts, 1, 0, 0, size);
+        Check(cudaEventRecord(evicted, reader)); Check(cudaStreamWaitEvent(writer, evicted, 0));
+        Check(cudaMemsetAsync(payload, 0x22, size * sizeof(int), writer));
+        admission::PublishCacheAdmissions<<<1, 32, 0, writer>>>(keys, slotKeys, nullptr, used, step, changes, 1, true);
+        CheckAdmissionReader<<<8, 128, 0, reader>>>(keys, slotKeys, payload, counts, 1, 0x22222222, -1, size);
+        Check(cudaStreamSynchronize(writer));
+        CheckAdmissionReader<<<8, 128, 0, reader>>>(keys, slotKeys, payload, counts, 1, 0x22222222, 1, size);
+        Check(cudaStreamSynchronize(reader));
+    }
+    unsigned long long result[3];
+    Check(cudaMemcpy(result, counts, sizeof(result), cudaMemcpyDeviceToHost));
+    Require(result[0] && result[1] && !result[2], "cache publication exposed stale/partial payload");
+    Check(cudaEventDestroy(evicted)); Check(cudaStreamDestroy(reader)); Check(cudaStreamDestroy(writer));
+    for (void *p : {static_cast<void *>(keys), static_cast<void *>(slotKeys), static_cast<void *>(changes),
+            static_cast<void *>(payload), static_cast<void *>(used), static_cast<void *>(step), static_cast<void *>(counts)})
+        Check(cudaFree(p));
+    std::printf("CACHE_PUBLICATION_PASS 128 replacements, resident=%llu pending=%llu errors=%llu\n",
+        result[0], result[1], result[2]);
+}
+#endif
+
 static void Quant(std::vector<float> &v, int blockSize = 32) {
     for (size_t start = 0; start < v.size(); start += blockSize) {
         float maximum = 1e-4f;
@@ -69,9 +307,9 @@ static void Quant(std::vector<float> &v, int blockSize = 32) {
         }
     }
 }
-static void Gpu(Data &d) {
+static void Gpu(Data &d, int device = 0) {
     d.dataDevice = DataDevice::CUDA;
-    d.dataDeviceIds = {0};
+    d.dataDeviceIds = {device};
     d.Allocate(false);
 }
 static void RunNumasMoe(Data &input, Data &index, Data &scores, Data &output, std::vector<Data *> &weights, int layer) {
@@ -108,6 +346,169 @@ static void Compare(const std::vector<float> &actual, const std::vector<float> &
         std::fprintf(stderr, "%s relative L2 %.8f\n", label, std::sqrt(error / norm));
         throw std::runtime_error(label);
     }
+}
+
+// Exercise the NUMA entry point, including mixed CPU/GPU experts and
+// back-to-back CUDA consumers. No model-specific dispatch scope is installed.
+static void CheckNumasPrefill(std::vector<Data *> *weights, int tables) {
+    constexpr int topk = 6;
+    const int hidden = weights[0][2]->dims[1];
+    const int experts = int(weights[0].size()) / 2 - 1;
+    int cases = 0;
+    for (int rows : {65, 129, 33, 1, 257, 32, 65}) {
+        Data cpuInput(BFLOAT16, {rows, hidden}), input;
+        Data index(INT32, {rows, topk}), scores(FLOAT32, {rows, topk});
+        cpuInput.Allocate(false); index.Allocate(false); scores.Allocate(false);
+        for (int i = 0; i < rows * hidden; ++i)
+            reinterpret_cast<uint16_t *>(cpuInput.cpuData)[i] =
+                Float32ToBFloat16RNEBits(std::sin(float(i + rows) * .137f) / 32.f);
+        for (int row = 0; row < rows; ++row) for (int k = 0; k < topk; ++k) {
+            // Five frequent experts, plus sparse CPU work in the final rows.
+            reinterpret_cast<int32_t *>(index.cpuData)[row * topk + k] =
+                k < topk - 1 || row + 16 < rows ? k : topk + row % (experts - topk);
+            reinterpret_cast<float *>(scores.cpuData)[row * topk + k] = (k + 1) / 32.f;
+        }
+        input.CopyFrom(cpuInput);
+        input.ToDevice(CUDA, std::vector<int>{0});
+        Data expected[3], actual[3];
+        // Use the same CPU/GPU partition and BF16 rounding in the reference,
+        // with an explicit device barrier after each layer. An all-CPU result
+        // has a different partial-sum rounding boundary in mixed execution.
+        for (int layer = 0; layer < 3; ++layer) {
+            RunNumasMoe(layer ? expected[layer - 1] : input, index, scores,
+                        expected[layer], weights[layer % tables], layer);
+            Check(cudaDeviceSynchronize());
+        }
+        for (int layer = 0; layer < 3; ++layer)
+            RunNumasMoe(layer ? actual[layer - 1] : input, index, scores,
+                        actual[layer], weights[layer % tables], layer);
+        // Defer readback until every dependent layer has consumed its input.
+        for (int layer = 0; layer < 3; ++layer) {
+            expected[layer].ToDevice(CPU);
+            actual[layer].ToDevice(CPU);
+            Require(expected[layer].GetBytes() == actual[layer].GetBytes() &&
+                std::memcmp(expected[layer].cpuData, actual[layer].cpuData, actual[layer].GetBytes()) == 0,
+                "NUMA hybrid prefill chain differs from serialized output bits");
+            ++cases;
+        }
+        // Also drain asynchronous reduction before shape changes / teardown.
+        ClearNumasMoeRuntimeCache();
+    }
+    std::printf("NUMAS_PREFILL_PASS %d layer comparisons, CPU/GPU split, shape changes and chained outputs\n", cases);
+}
+
+static void CheckCompleteNativeGraphs(std::vector<Data *> &weights, int layer) {
+    const int hidden = weights[2]->dims[1], experts = weights.size() / 2 - 1;
+    const int device = FastllmCudaGetDevice();
+    Require(FastllmCudaMoeCacheFullyResident(weights.data(), weights.size()), "complete cache not recognized");
+    int checks = 0;
+    for (int rows : {1, 2, 3, 5, 7, 8, 9, 16, 31, 32}) for (int topk : {1, 3, 6, 16}) {
+        Data input(BFLOAT16, {rows, hidden}), ids(INT32, {rows, topk}), scores(FLOAT32, {rows, topk}), output;
+        Gpu(input, device); Gpu(ids, device); Gpu(scores, device);
+        std::vector<uint16_t> x(rows * hidden), expected(x.size()), actual(x.size());
+        std::vector<int> selected(rows * topk), cpu(selected.size(), -1);
+        std::vector<float> scales(selected.size());
+        auto update = [&](int pass) {
+            for (size_t i = 0; i < x.size(); ++i) x[i] = Float32ToBFloat16RNEBits(float(int((i * 7 + pass * 13) % 47) - 23) / 32);
+            for (size_t i = 0; i < selected.size(); ++i) {
+                selected[i] = (i * 3 + pass * 7) % experts;
+                scales[i] = (i + pass) % 5 == 0 ? 0 : .125f + (i % 3) * .0625f;
+            }
+            Check(cudaMemcpy(input.cudaData, x.data(), x.size() * 2, cudaMemcpyHostToDevice));
+            Check(cudaMemcpy(ids.cudaData, selected.data(), selected.size() * 4, cudaMemcpyHostToDevice));
+            Check(cudaMemcpy(scores.cudaData, scales.data(), scales.size() * 4, cudaMemcpyHostToDevice));
+        };
+        auto run = [&] { return FastllmCudaMergeMOEHybrid(input, ids, scores, output,
+            weights.data(), weights.size(), layer); };
+        update(0); Require(run(), "complete cache warmup rejected"); Check(cudaDeviceSynchronize());
+        Require(FastllmCudaGraphPrepareCaptureDevice() && FastllmCudaGraphMemoryPoolBegin(), "complete capture pool");
+        Check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+        Require(run(), "complete cache capture rejected");
+        cudaGraph_t graph; cudaGraphExec_t exec;
+        Check(cudaStreamEndCapture(cudaStreamPerThread, &graph));
+        std::vector<void *> reserved;
+        Require(FastllmCudaGraphMemoryPoolEnd(reserved), "complete capture pool end");
+        Check(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+        for (int pass = 0; pass < 3; ++pass) {
+            update(pass);
+            NumasMoeVerifyExperts(x.data(), expected.data(), rows, weights.data(), weights.size(),
+                selected.data(), cpu.data(), scales.data(), topk, layer, 10, false);
+            Check(cudaGraphLaunch(exec, cudaStreamPerThread));
+            Check(cudaMemcpy(actual.data(), output.cudaData, actual.size() * 2, cudaMemcpyDeviceToHost));
+            std::vector<float> a(actual.size()), e(expected.size());
+            for (size_t i = 0; i < a.size(); ++i) {
+                a[i] = __bfloat162float(*reinterpret_cast<__nv_bfloat16 *>(&actual[i]));
+                e[i] = __bfloat162float(*reinterpret_cast<__nv_bfloat16 *>(&expected[i]));
+            }
+            Compare(a, e, "complete cache graph/NUMA oracle mismatch"); ++checks;
+        }
+        cudaGraphExecDestroy(exec); cudaGraphDestroy(graph); FastllmCudaGraphMemoryPoolRelease(reserved);
+    }
+    std::printf("COMPLETE_NATIVE_GRAPH_PASS %d replays, rows 1..32, topk 1/3/6/16\n", checks);
+}
+
+static void CheckVerifierMailbox(std::vector<Data *> *weights) {
+    const int hidden=weights[0][2]->dims[1], experts=weights[0].size()/2-1, topk=6;
+    int checks=0;
+    for (int rows : {2,3,5,6,8,9,16,32}) {
+        Data input(BFLOAT16,{rows,hidden}), ids[2], scores[2], output[2]; Gpu(input);
+        for(int l=0;l<2;++l){ids[l].dataType=INT32;ids[l].Resize({rows,topk});Gpu(ids[l]);
+            scores[l].dataType=FLOAT32;scores[l].Resize({rows,topk});Gpu(scores[l]);
+            output[l].dataType=BFLOAT16;output[l].Resize({rows,hidden});Gpu(output[l]);}
+        void *handles[2]{}, *children[2]{}, *graph=nullptr,*exec=nullptr,*untimed=nullptr;
+        cudaGraph_t shared;cudaGraphNode_t empty;Check(cudaGraphCreate(&shared,0));
+        Check(cudaGraphAddEmptyNode(&empty,shared,nullptr,0));
+        void *scope=FastllmCudaBeginMoeDecode(weights[0].data(),weights[0].size(),topk);
+        Require(scope,"verifier mailbox initial scope");FastllmCudaEndMoeDecode(scope);
+        // Invalid views must be rejected before capturing a device access.
+        auto rejected = [&](Data &destination) {
+            void *child = nullptr;
+            Require(!FastllmCudaCreateNativeMoeFullGraph(input, ids[0], scores[0], destination,
+                weights[0].data(), weights[0].size(), 0, shared, &child) && !child,
+                "invalid verifier mailbox view accepted");
+        };
+        for (Data *view : {&input, &ids[0], &scores[0]}) {
+            ++view->strides[0]; rejected(output[0]); --view->strides[0];
+            const auto devices = view->dataDeviceIds;
+            view->dataDeviceIds = {1}; rejected(output[0]); view->dataDeviceIds = devices;
+            view->multiDeviceData = true; rejected(output[0]); view->multiDeviceData = false;
+        }
+        input.Resize({rows, hidden - 32}); rejected(output[0]); input.Resize({rows, hidden});
+        rejected(input); rejected(ids[0]); rejected(scores[0]);
+        for(int l=0;l<2;++l){
+            handles[l]=FastllmCudaCreateNativeMoeFullGraph(l?output[0]:input,ids[l],scores[l],output[l],
+                weights[l].data(),weights[l].size(),l,shared,&children[l]);
+            Require(handles[l]&&children[l],"verifier mailbox creation");}
+        Check(cudaGraphDestroy(shared));
+        Require(FastllmCudaGraphCompose(const_cast<const void *const *>(children),2,&graph,&exec),"verifier compose");
+        Require(FastllmCudaCreateNativeMoeReplayGraph(graph,handles,2,&untimed),"verifier untimed compose");
+        for(int pass=0;pass<24;++pass){
+            std::vector<uint16_t> reference(rows*hidden),result(reference.size());
+            std::vector<float> expected[2];
+            for(size_t i=0;i<reference.size();++i)reference[i]=Float32ToBFloat16RNEBits(float(int((i*7+pass*13)%61)-30)/32);
+            Check(cudaMemcpy(input.cudaData,reference.data(),reference.size()*2,cudaMemcpyHostToDevice));
+            for(int l=0;l<2;++l){
+                std::vector<int32_t> selected(rows*topk),none(selected.size(),-1);
+                std::vector<float> scale(selected.size());
+                for(size_t i=0;i<selected.size();++i){selected[i]=(pass*7+l*3+(i%topk)*5+i/topk)%experts;scale[i]=i%5==0?0.f:float(i%4+1)/32;}
+                if(pass%3==1)for(int row=0;row<rows;++row)selected[row*topk+1]=selected[row*topk+2];
+                NumasMoeVerifyExperts(reference.data(),result.data(),rows,weights[l].data(),weights[l].size(),
+                    selected.data(),none.data(),scale.data(),topk,l,10,false);
+                reference=result;expected[l].resize(reference.size());
+                for(size_t i=0;i<reference.size();++i)expected[l][i]=__bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&reference[i]));
+                Check(cudaMemcpy(ids[l].cudaData,selected.data(),selected.size()*4,cudaMemcpyHostToDevice));
+                Check(cudaMemcpy(scores[l].cudaData,scale.data(),scale.size()*4,cudaMemcpyHostToDevice));
+            }
+            scope=FastllmCudaBeginMoeDecode(weights[0].data(),weights[0].size(),topk);Require(scope,"verifier scope");
+            Require(FastllmCudaLaunchNativeMoeFullGraph(pass%3==0?exec:untimed,handles,2,pass%3==0),"verifier launch");
+            FastllmCudaEndMoeDecode(scope);
+            for(int l=0;l<2;++l){Check(cudaMemcpy(result.data(),output[l].cudaData,result.size()*2,cudaMemcpyDeviceToHost));
+                std::vector<float> actual(result.size());for(size_t i=0;i<result.size();++i)actual[i]=__bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&result[i]));
+                Compare(actual,expected[l],"verifier mailbox/NUMA oracle mismatch");++checks;}
+        }
+        FastllmCudaGraphExecDestroy(untimed);FastllmCudaGraphExecDestroy(exec);FastllmCudaGraphDestroy(graph);
+    }
+    std::printf("VERIFY_MAILBOX_GRAPH_PASS %d dependent layer checks; rows 2/3/5/6/8/9/16/32\n",checks);
 }
 
 // A cache concentrated on one GPU must not disable the other prefill worker.
@@ -192,6 +593,76 @@ static void CheckResidentAssist(std::vector<Data *> &weights) {
     }
 }
 
+// PP changes cache ownership, not expert arithmetic. Both devices are live
+// before capture, and a graph must reject any layer owned by the other stage.
+static void CheckPipelineMailbox(std::vector<Data *> *weights) {
+    const int hidden = weights[0][2]->dims[1], topk = 6;
+    const int experts = weights[0].size() / 2 - 1;
+    FastllmCudaReleaseMoeCache(weights[0].data(), weights[0].size());
+    FastllmCudaMoeCacheLayer layers[2];
+    for (int d = 0; d < 2; ++d)
+        layers[d] = {weights[d].data(), int(weights[d].size()), true, 10.f, false, d};
+    Require(FastllmCudaPrepareMoeCache(layers, 2, [] {}), "PP cache preparation");
+    for (int d = 0; d < 2; ++d) {
+        Check(cudaSetDevice(d));
+        void *scope = FastllmCudaBeginMoeDecode(weights[d].data(), weights[d].size(), topk);
+        Require(scope, "PP initial scope"); FastllmCudaEndMoeDecode(scope);
+    }
+    int checks = 0;
+    for (int rows : {1, 2, 6, 9, 32}) for (int device : {0, 1, 0}) {
+        Check(cudaSetDevice(device));
+        Data input(BFLOAT16, {rows, hidden}), ids(INT32, {rows, topk});
+        Data scores(FLOAT32, {rows, topk}), output(BFLOAT16, {rows, hidden});
+        for (auto *p : {&input, &ids, &scores, &output}) {
+            p->dataDevice = DataDevice::CUDA; p->dataDeviceIds = {device}; p->Allocate(false);
+        }
+        cudaGraph_t shared; cudaGraphNode_t empty;
+        Check(cudaGraphCreate(&shared, 0)); Check(cudaGraphAddEmptyNode(&empty, shared, nullptr, 0));
+        void *child = nullptr;
+        Require(!FastllmCudaCreateNativeMoeFullGraph(input, ids, scores, output,
+            weights[1-device].data(), weights[1-device].size(), 1-device, shared, &child) && !child,
+            "PP graph accepted another stage's cache");
+        void *handle = FastllmCudaCreateNativeMoeFullGraph(input, ids, scores, output,
+            weights[device].data(), weights[device].size(), device, shared, &child);
+        Require(handle && child, "PP owned graph creation");
+        Check(cudaGraphDestroy(shared));
+        void *graph = nullptr, *exec = nullptr, *untimed = nullptr;
+        Require(FastllmCudaGraphCompose(const_cast<const void *const *>(&child), 1, &graph, &exec), "PP compose");
+        Require(FastllmCudaCreateNativeMoeReplayGraph(graph, &handle, 1, &untimed), "PP untimed compose");
+        for (int pass = 0; pass < 16; ++pass) {
+            std::vector<uint16_t> x(rows * hidden), reference(x.size()), actual(x.size());
+            std::vector<int32_t> selected(rows * topk), none(selected.size(), -1);
+            std::vector<float> scale(selected.size());
+            for (size_t i = 0; i < x.size(); ++i)
+                x[i] = Float32ToBFloat16RNEBits(float(int((i * 7 + pass * 13) % 61) - 30) / 32);
+            for (size_t i = 0; i < selected.size(); ++i) {
+                selected[i] = (pass * 7 + device * 3 + (i % topk) * 5 + i / topk) % experts;
+                scale[i] = i % 5 == 0 ? 0.f : float(i % 4 + 1) / 32;
+            }
+            if (pass % 3 == 1) for (int row = 0; row < rows; ++row) selected[row * topk + 1] = selected[row * topk + 2];
+            NumasMoeVerifyExperts(x.data(), reference.data(), rows, weights[device].data(), weights[device].size(),
+                selected.data(), none.data(), scale.data(), topk, device, 10, false);
+            Check(cudaMemcpy(input.cudaData, x.data(), x.size() * 2, cudaMemcpyHostToDevice));
+            Check(cudaMemcpy(ids.cudaData, selected.data(), selected.size() * 4, cudaMemcpyHostToDevice));
+            Check(cudaMemcpy(scores.cudaData, scale.data(), scale.size() * 4, cudaMemcpyHostToDevice));
+            void *scope = FastllmCudaBeginMoeDecode(weights[device].data(), weights[device].size(), topk);
+            Require(scope, "PP replay scope");
+            Require(FastllmCudaLaunchNativeMoeFullGraph(pass % 3 ? untimed : exec, &handle, 1, pass % 3 == 0), "PP replay");
+            FastllmCudaEndMoeDecode(scope);
+            Check(cudaMemcpy(actual.data(), output.cudaData, actual.size() * 2, cudaMemcpyDeviceToHost));
+            std::vector<float> a(x.size()), b(x.size());
+            for (size_t i = 0; i < x.size(); ++i) {
+                a[i] = __bfloat162float(*reinterpret_cast<__nv_bfloat16 *>(&actual[i]));
+                b[i] = __bfloat162float(*reinterpret_cast<__nv_bfloat16 *>(&reference[i]));
+            }
+            Compare(a, b, "PP mailbox / NUMA oracle mismatch"); ++checks;
+        }
+        FastllmCudaGraphExecDestroy(untimed); FastllmCudaGraphExecDestroy(exec); FastllmCudaGraphDestroy(graph);
+    }
+    Check(cudaSetDevice(0));
+    std::printf("PP_MAILBOX_GRAPH_PASS %d checks; rows 1/2/6/9/32, devices 0/1/0\n", checks);
+}
+
 int main(int argc, char **argv) {
     try {
         Require(prctl(PR_SET_DUMPABLE, 0) == 0, "disable test core dumps");
@@ -200,17 +671,22 @@ int main(int argc, char **argv) {
             return false;
         };
         const bool dual = option("--dual"), fp8 = option("--fp8");
+        const bool pageable = option("--pageable");
+        if (pageable) setenv("FT_PINNED_WEIGHT", "0", 1);
+        auto freeShard = [&](void *p) { if (pageable) free(p); else Check(cudaFreeHost(p)); };
+        if (option("--mailbox")) SetCudaGraph(true);
         std::printf("V4.1 cache weights: %s\n", fp8 ? "FP8 block128" : "NVFP4 block32");
         int devices = 0;
         Check(cudaGetDeviceCount(&devices));
-        Require(!dual || devices >= 2, "--dual requires two CUDA devices");
+        if (option("--resident-budget-only") && devices < 2) return 77;
+        Require((!dual && !option("--pp-fullgraph")) || devices >= 2, "--dual requires two CUDA devices");
         unsetenv("FASTLLM_MOE_CUDA_CACHE_BYTES_0");
         unsetenv("FASTLLM_MOE_CUDA_CACHE_BYTES_1");
         unsetenv("FASTLLM_DSV41_MOE_CACHE_MODE");
         // Exercise GPU prefill deliberately; CPU-oracle inputs below have no
         // CUDA mirror and therefore still run entirely on NUMA.
         setenv("FT_GPU_PREFILL", "1", 1);
-        setenv("FT_EXPERT_LIMIT", "0", 1);
+        setenv("FT_EXPERT_LIMIT", option("--numas-prefill") ? "32" : "0", 1);
         SetThreads(30);
         {
             float *device;
@@ -256,6 +732,7 @@ int main(int argc, char **argv) {
             }
             std::printf("FP4_PAIR_PASS pairs=%d values=%d\n", pairs, 2 * pairs);
         }
+        if (!fp8) { TestDotGateUp(); TestResidentGate(); }
         // Preserve the existing V4 block-128 helper while extending V4.1.
         for (int block : {32, 128})
             for (bool quantize : {false, true}) {
@@ -358,7 +835,8 @@ int main(int argc, char **argv) {
                     }
                     for (int node = 0; node < nodes; ++node) {
                         void *ptr = nullptr;
-                        Check(cudaHostAlloc(&ptr, rows / nodes * pitch, cudaHostAllocMapped | cudaHostAllocPortable));
+                        if (pageable) Require(posix_memalign(&ptr, 64, rows / nodes * pitch) == 0, "pageable shard allocation");
+                        else Check(cudaHostAlloc(&ptr, rows / nodes * pitch, cudaHostAllocMapped | cudaHostAllocPortable));
                         for (int r = 0; r < rows / nodes; ++r) {
                             const int physical = node * (rows / nodes) + r;
                             const int logical = part ? physical : physical / 2 + (physical & 1) * inter;
@@ -367,22 +845,76 @@ int main(int argc, char **argv) {
                         shards.push_back(ptr);
                         w->numasData.push_back((uint8_t *)ptr);
                     }
-                    w->isPinned = true;
+                    w->isPinned = !pageable;
                     w->isModelWeight = true;
                     weights[t][2 * (e + 1) + part] = w.get();
                     owned.push_back(std::move(w));
                 }
             layers[t] = {weights[t].data(), (int)weights[t].size(), true, 10.0f};
         }
+        if (option("--numas-prefill")) {
+            SetMoeCudaCacheBytes(0);
+            CheckNumasPrefill(weights, tables);
+            for (auto &weight : owned) weight->numasData.clear();
+            for (void *pointer : shards) freeShard(pointer);
+            return 0;
+        }
         const size_t record = ((weights[0][2]->GetBytes() + weights[0][3]->GetBytes() + 127) / 128) * 128;
+        if (option("--resident-budget-only")) {
+            Require(!fp8, "resident budget requires MXFP4 experts");
+            setenv("FASTLLM_CUDA_TRITON", "0", 1);
+            setenv("FASTLLM_CUDA_TRITON_MXFP4_GROUPED", "0", 1);
+            const uint64_t payload = record * experts * tables;
+            SetMoeCudaCacheBytes(payload + record);
+            Require(!FastllmCudaPrepareMoeCacheWithBudgets(layers, tables, [] {}, false,
+                {{0, payload + 2 * record}}, true), "subgroup exceeded model cache budget");
+            Require(!FastllmCudaPrepareMoeCacheWithBudgets(layers, tables, [] {}, false,
+                {{devices, payload}}, true), "invalid CUDA ordinal accepted");
+            setenv("FASTLLM_MOE_CUDA_CACHE_BYTES_0", "0", 1);
+            Require(!FastllmCudaPrepareMoeCacheWithBudgets(layers, tables, [] {}, false,
+                {{0, payload}}, true), "explicit device limit ignored");
+            unsetenv("FASTLLM_MOE_CUDA_CACHE_BYTES_0");
+            // Swap the owner to cover TP-root and PP-tail placement. A second
+            // visible device must not allocate a duplicate draft cache.
+            for (int owner : {0, 1}) {
+                for (auto &layer : layers) layer.cacheDevice = owner;
+                Require(FastllmCudaPrepareMoeCacheWithBudgets(layers, tables, [] {}, false,
+                    {{owner, payload}, {1-owner, 0}}, true), "explicit resident preparation");
+                Check(cudaSetDevice(1-owner));
+                Require(!FastllmCudaMoeCacheFullyResident(weights[0].data(), weights[0].size()),
+                    "draft cache duplicated on non-owner");
+                Check(cudaSetDevice(owner));
+                for (int t = 0; t < tables; ++t) {
+                    FastllmCudaMoePrefillResidents resident;
+                    Require(FastllmCudaGetMoePrefillResidents(weights[t].data(), experts, resident, true),
+                        "resident owner snapshot");
+                    Require(resident.weights.size() == 2 * experts &&
+                        std::all_of(resident.weights.begin(), resident.weights.end(), [](const void *w) { return w; }),
+                        "resident cache did not preload every expert");
+                }
+                CheckCompleteNativeGraphs(weights[0], 0);
+                FastllmCudaReleaseMoeCache(weights[0].data(), weights[0].size());
+            }
+            Check(cudaSetDevice(0));
+            ClearNumasMoeRuntimeCache();
+            for (auto &weight : owned) weight->numasData.clear();
+            for (void *pointer : shards) freeShard(pointer);
+            SetMoeCudaCacheBytes(0);
+            std::printf("RESIDENT_DEVICE_BUDGET_PASS: owners 0/1, no duplicate cache, 240 graph/NUMA comparisons\n");
+            return 0;
+        }
         SetMoeCudaCacheBytes(0);
         Require(!FastllmCudaPrepareMoeCache(layers, tables, [] {}), "disabled cache accepted");
         SetMoeCudaCacheBytes(record);
-        Require(!FastllmCudaPrepareMoeCache(layers, tables, [] {}), "undersized cache accepted");
+        // Hybrid decode admits small resident caches; its staged misses have
+        // separate workspace. Registration no longer requires sixteen slots.
+        Require(FastllmCudaPrepareMoeCache(layers, tables, [] {}), "single-slot hybrid registration rejected");
+        FastllmCudaReleaseMoeCache(weights[0].data(), weights[0].size());
         SetMoeCudaCacheBytes(record * 16);
         Require(!FastllmCudaPrepareMoeCache(layers, tables), "unowned NUMA cache accepted");
-        // A disabled, undersized, malformed or overflowing device override
-        // must leave that device on its configured fallback backend.
+        // Pure GPU execution cannot use hybrid's zero-resident streaming
+        // fallback. Invalid overrides must reject that mode on this device.
+        setenv("FASTLLM_DSV41_MOE_CACHE_MODE", "gpu", 1);
         for (const char *value : {"0", "1", "-1", "1g", "bad", "18446744073709551616"}) {
             setenv("FASTLLM_MOE_CUDA_CACHE_BYTES_0", value, 1);
             Require(FastllmCudaPrepareMoeCache(layers, tables, [] {}), "host preparation rejected device override");
@@ -395,6 +927,7 @@ int main(int argc, char **argv) {
             FastllmCudaReleaseMoeCache(weights[0].data(), weights[0].size());
         }
         unsetenv("FASTLLM_MOE_CUDA_CACHE_BYTES_0");
+        unsetenv("FASTLLM_DSV41_MOE_CACHE_MODE");
         if (dual) {
             // Different capacities must remain independent across devices.
             const auto first = std::to_string(record * 24), second = std::to_string(record * 16);
@@ -404,11 +937,43 @@ int main(int argc, char **argv) {
         Require(FastllmCudaPrepareMoeCache(layers, tables, [] {}), "V4.1 cache preparation failed");
         Require(FastllmCudaCanRunMoeHybrid(weights[0].data(), weights[0].size()), "V4.1 hybrid unavailable");
         Require(!FastllmCudaCanRunMoeCache(weights[0].data(), weights[0].size()), "generic math accepted V4.1");
+        if (option("--full-resident")) {
+            Require(!fp8 && !dual, "full-resident test uses single-GPU native MXFP4");
+            FastllmCudaReleaseMoeCache(weights[0].data(), weights[0].size());
+            SetMoeCudaCacheBytes(record * experts * tables);
+            Require(FastllmCudaPrepareMoeCache(layers, tables, [] {}), "full-resident preparation");
+            const float magnitudes[8] = {0, .5f, 1, 1.5f, 2, 3, 4, 6};
+            size_t checked = 0;
+            for (int t = 0; t < tables; ++t) {
+                FastllmCudaMoePrefillResidents resident;
+                Require(FastllmCudaGetMoePrefillResidents(weights[t].data(), experts, resident, true),
+                    "full-resident snapshot");
+                for (int e = 0; e < experts; ++e) for (int part = 0; part < 2; ++part) {
+                    Require(resident.weights[2 * e + part] != nullptr, "initial expert missing");
+                    const int nr = part ? hidden : 2 * inter, nc = part ? inter : hidden;
+                    std::vector<uint8_t> packed(size_t(nr) * (nc / 32) * 17);
+                    Check(cudaMemcpy(packed.data(), resident.weights[2 * e + part], packed.size(), cudaMemcpyDeviceToHost));
+                    for (int row = 0; row < nr; ++row) for (int c = 0; c < nc; ++c) {
+                        const int code = (packed[size_t(row) * (nc / 2) + c / 2] >> (4 * (c % 2))) & 15;
+                        const int exponent = packed[size_t(nr) * (nc / 2) + size_t(row) * (nc / 32) + c / 32];
+                        const float value = Bf(std::ldexp((code & 8 ? -1 : 1) * magnitudes[code & 7], exponent - 127));
+                        const float expected = Bf(dense[t][2 * e + part][size_t(row) * nc + c]);
+                        Require(std::memcmp(&value, &expected, sizeof(float)) == 0, "full-resident payload mismatch");
+                        ++checked;
+                    }
+                }
+            }
+            std::printf("FULL_RESIDENT_PASS %zu exact values, %d initial expert mappings\n", checked, tables * experts);
+            CheckCompleteNativeGraphs(weights[0], 0);
+            FastllmCudaReleaseMoeCache(weights[0].data(), weights[0].size());
+            SetMoeCudaCacheBytes(record * 16);
+            Require(FastllmCudaPrepareMoeCache(layers, tables, [] {}), "restore partial cache");
+        }
         if (option("--prefill")) {
             if (dual) CheckResidentAssist(weights[0]);
             fastllm_prefill_test::Run(layers, weights, tables, true, 32);
             FastllmCudaReleaseMoeCache(weights[0].data(), weights[0].size());
-            for (void *pointer : shards) Check(cudaFreeHost(pointer));
+            for (void *pointer : shards) freeShard(pointer);
             return 0;
         }
 
@@ -864,6 +1429,133 @@ int main(int argc, char **argv) {
             }
         }
         std::printf("VERIFY_PASS %d multirow CPU/GPU oracle checks\n", verifyChecks);
+        if ((option("--fullgraph") || (option("--mailbox") && !fp8)) && !dual) {
+            // Two GPU-dependent layers in one scope. Inputs, routes and scores
+            // change between replays, while pointer tables go out of scope as
+            // soon as submission returns. Compare every layer to NUMA arithmetic.
+            Check(cudaSetDevice(0));
+            Data chainInput(BFLOAT16, {1, hidden}), chainOut[2];
+            Data chainIds[2], chainScores[2];
+            Gpu(chainInput);
+            for (int l = 0; l < 2; ++l) {
+                chainIds[l].dataType = INT32; chainIds[l].Resize({1, topk}); Gpu(chainIds[l]);
+                chainScores[l].dataType = FLOAT32; chainScores[l].Resize({1, topk}); Gpu(chainScores[l]);
+                chainOut[l].dataType = BFLOAT16; chainOut[l].Resize({1, hidden}); Gpu(chainOut[l]);
+            }
+            const bool full = option("--fullgraph");
+            if (full) {
+                TestNativeRoutePlan(); TestHostCopyPublication();
+#if !defined(USE_ROCM) && CUDART_VERSION >= 11070
+                TestCachePublication();
+#endif
+            }
+            void *handles[2]{}, *graphs[2]{}, *composed = nullptr, *exec = nullptr, *untimed = nullptr;
+            if (full) {
+                FastllmCudaReleaseMoeCache(weights[0].data(), weights[0].size());
+                Require(FastllmCudaPrepareMoeCache(layers, tables, [] {}), "full graph cache preparation");
+                void *step = FastllmCudaBeginMoeDecode(weights[0].data(), weights[0].size(), topk);
+                Require(step != nullptr, "full graph initial scope");
+                FastllmCudaEndMoeDecode(step);
+                cudaGraph_t shared; cudaGraphNode_t empty;
+                Check(cudaGraphCreate(&shared, 0));
+                Check(cudaGraphAddEmptyNode(&empty, shared, nullptr, 0));
+                setenv("FASTLLM_DSV41_MOE_CACHE_MODE", "gpu", 1);
+                void *rejectedGraph = nullptr;
+                Require(!FastllmCudaCreateNativeMoeFullGraph(chainInput, chainIds[0], chainScores[0],
+                    chainOut[0], weights[0].data(), weights[0].size(), 0, shared, &rejectedGraph) && !rejectedGraph,
+                    "pure GPU mode silently entered the CPU mailbox");
+                unsetenv("FASTLLM_DSV41_MOE_CACHE_MODE");
+                for (int l = 0; l < 2; ++l) {
+                    handles[l] = FastllmCudaCreateNativeMoeFullGraph(l ? chainOut[0] : chainInput,
+                        chainIds[l], chainScores[l], chainOut[l], weights[l].data(), weights[l].size(),
+                        l, shared, &graphs[l]);
+                    Require(handles[l] && graphs[l], "full graph creation rejected");
+                }
+                Check(cudaGraphDestroy(shared));
+                Require(FastllmCudaGraphCompose(const_cast<const void *const *>(graphs), 2, &composed, &exec),
+                    "full graph composition rejected");
+                Require(FastllmCudaCreateNativeMoeReplayGraph(composed, handles, 2, &untimed),
+                    "untimed full graph creation rejected");
+            }
+            std::vector<int32_t> none(topk, -1);
+            const int chainReplays = option("--stress") ? 256 : 24;
+            int rejectedLaunches = 0;
+            for (int repeat = 0; repeat < chainReplays; ++repeat) {
+                std::vector<float> reference(hidden), partial(topk * hidden);
+                std::vector<uint16_t> start(hidden), result(hidden);
+                std::vector<float> expected[2];
+                for (int c = 0; c < hidden; ++c) {
+                    reference[c] = Bf((int(rng() % 61) - 30) / 32.f);
+                    start[c] = Float32ToBFloat16RNEBits(reference[c]);
+                }
+                Check(cudaMemcpy(chainInput.cudaData, start.data(), hidden * 2, cudaMemcpyHostToDevice));
+                for (int l = 0; l < 2; ++l) {
+                    std::vector<int32_t> ids(topk), order(topk);
+                    std::vector<float> scores(topk);
+                    for (int j = 0; j < topk; ++j) {
+                        ids[j] = (repeat * 7 + l * 3 + j * 5) % experts;
+                        scores[j] = j == 0 ? 0.f : (j + repeat % 3 + 1) / 32.f;
+                    }
+                    if (repeat % 3 == 1) ids[1] = ids[2];
+                    NumasMoeDecodeExperts(reference.data(), partial.data(), weights[l].data(),
+                        ids.data(), none.data(), topk, l, scores.data(), 10, 32);
+                    std::iota(order.begin(), order.end(), 0);
+                    std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return ids[a] < ids[b]; });
+                    std::fill(reference.begin(), reference.end(), 0.f);
+                    for (int j : order) for (int c = 0; c < hidden; ++c) reference[c] += partial[j * hidden + c];
+                    for (auto &v : reference) v = Bf(v);
+                    expected[l] = reference;
+                    Check(cudaMemcpy(chainIds[l].cudaData, ids.data(), topk * 4, cudaMemcpyHostToDevice));
+                    Check(cudaMemcpy(chainScores[l].cudaData, scores.data(), topk * 4, cudaMemcpyHostToDevice));
+                }
+                void *step = FastllmCudaBeginMoeDecode(weights[0].data(), weights[0].size(), topk);
+                Require(step != nullptr, "mailbox chain scope rejected");
+                int callbacks = 0;
+                if (full) {
+                    // A rejected CUDA launch must drain immediately and
+                    // leave the next valid replay usable, with no waiter
+                    // polling for a publication that will never arrive.
+                    if (repeat % 12 == 0) {
+                        ++rejectedLaunches;
+                        const auto start = std::chrono::steady_clock::now();
+                        Require(!FastllmCudaLaunchNativeMoeFullGraph(nullptr, handles, 2),
+                            "null full graph launch unexpectedly succeeded");
+                        FastllmCudaClearThreadError(); FastllmCudaClearGraphError();
+                        FastllmCudaWaitMoeDecodeCpu(step);
+                        Require(std::chrono::steady_clock::now() - start < std::chrono::seconds(5),
+                            "failed launch stranded the CPU dispatcher");
+                    }
+                    Require(FastllmCudaLaunchNativeMoeFullGraph(repeat % 3 == 0 ? exec : untimed,
+                        handles, 2, repeat % 3 == 0), "full graph replay failed");
+                    callbacks = 2;
+                } else for (int l = 0; l < 2; ++l) {
+                    auto temporaryWeights = weights[l];
+                    Require(FastllmCudaMergeMOEHybrid(l ? chainOut[0] : chainInput,
+                        chainIds[l], chainScores[l], chainOut[l], temporaryWeights.data(), temporaryWeights.size(), l,
+                        [&] { ++callbacks; }), "mailbox chain rejected");
+                }
+                FastllmCudaEndMoeDecode(step);
+                Require(callbacks == 2, "mailbox chain callback count");
+                for (int l = 0; l < 2; ++l) {
+                    Check(cudaMemcpy(result.data(), chainOut[l].cudaData, hidden * 2, cudaMemcpyDeviceToHost));
+                    std::vector<float> actual(hidden);
+                    for (int c = 0; c < hidden; ++c) {
+                        const uint32_t bits = uint32_t(result[c]) << 16;
+                        memcpy(&actual[c], &bits, 4);
+                    }
+                    Compare(actual, expected[l], "mailbox dependent layers / NUMA mismatch");
+                }
+            }
+            if (full) std::printf("FULL_GRAPH_REJECTED_LAUNCH_PASS %d rejected launches followed by valid replays\n", rejectedLaunches);
+            // Finish must also protect the common CPU pool at Engram boundaries.
+            if (untimed) FastllmCudaGraphExecDestroy(untimed);
+            if (exec) FastllmCudaGraphExecDestroy(exec);
+            if (composed) FastllmCudaGraphDestroy(composed);
+            std::printf("%s_CHAIN_PASS %d replays, %d dependent layer comparisons\n", full ? "FULL_GRAPH" : "MAILBOX", chainReplays, 2 * chainReplays);
+        }
+
+        if (option("--verify-mailbox") && !dual) CheckVerifierMailbox(weights);
+        if (option("--pp-fullgraph")) CheckPipelineMailbox(weights);
         unsetenv("FASTLLM_DSV41_MOE_CACHE_PREFETCH");
         unsetenv("FASTLLM_DSV41_MOE_CACHE_GPU_EXPERTS");
         unsetenv("FASTLLM_DSV41_MOE_CACHE_MODE");
@@ -872,8 +1564,7 @@ int main(int argc, char **argv) {
         ClearNumasMoeRuntimeCache();
         for (auto &w : owned)
             w->numasData.clear();
-        for (void *p : shards)
-            Check(cudaFreeHost(p));
+        for (void *p : shards) freeShard(p);
         SetMoeCudaCacheBytes(0);
         unsetenv("FASTLLM_MOE_CUDA_CACHE_BYTES_0");
         unsetenv("FASTLLM_MOE_CUDA_CACHE_BYTES_1");

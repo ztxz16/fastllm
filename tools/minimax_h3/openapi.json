@@ -1,0 +1,500 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "FastLLM MiniMax-H3 / Pika H3 Flex native API",
+    "version": "0.3.0",
+    "description": "Asynchronous video and stereo audio generation: text, first/last keyframes, or ordered image/video/audio references. Media uses multipart uploads; keyframes and references are mutually exclusive."
+  },
+  "security": [
+    {
+      "bearerAuth": []
+    }
+  ],
+  "paths": {
+    "/v1/models": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "loading",
+                        "ready",
+                        "failed"
+                      ]
+                    },
+                    "error": {
+                      "type": "string"
+                    },
+                    "precision": {
+                      "type": "string",
+                      "enum": [
+                        "bf16",
+                        "fp32"
+                      ]
+                    },
+                    "vae_precision": {
+                      "type": "string",
+                      "enum": [
+                        "fp16",
+                        "bf16",
+                        "fp32"
+                      ]
+                    },
+                    "tensor_parallel_size": {
+                      "type": "integer",
+                      "minimum": 1
+                    },
+                    "devices": {
+                      "type": "array",
+                      "minItems": 1,
+                      "uniqueItems": true,
+                      "items": {"type": "integer", "minimum": 0}
+                    },
+                    "model": {
+                      "type": "string",
+                      "enum": ["minimax-h3", "pika-h3-flex"]
+                    },
+                    "default_inference_steps": {
+                      "type": "integer"
+                    },
+                    "conditioning": {
+                      "type": "boolean"
+                    },
+                    "reference_model_available": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": [
+                    "status",
+                    "error",
+                    "precision",
+                    "vae_precision"
+                  ]
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Unavailable"
+          }
+        }
+      }
+    },
+    "/v1/videos": {
+      "post": {
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VideoRequest"
+              }
+            },
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/VideoMultipartRequest"
+              },
+              "encoding": {
+                "reference": {
+                  "style": "form",
+                  "explode": true,
+                  "contentType": "image/png, image/jpeg, video/mp4, video/webm, audio/wav, audio/mpeg, audio/flac, audio/ogg"
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Video"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid input"
+          },
+          "429": {
+            "description": "Queue/history full"
+          }
+        }
+      },
+      "get": {
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Video"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/videos/{video_id}": {
+      "parameters": [
+        {
+          "name": "video_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "get": {
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Video"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown video"
+          }
+        }
+      },
+      "delete": {
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Video still running"
+          }
+        }
+      }
+    },
+    "/v1/videos/{video_id}/content": {
+      "parameters": [
+        {
+          "name": "video_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "get": {
+        "responses": {
+          "200": {
+            "description": "H.264 video with AAC stereo audio",
+            "content": {
+              "video/mp4": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Video not completed"
+          }
+        }
+      }
+    },
+    "/v1/videos/{video_id}/cancel": {
+      "parameters": [
+        {
+          "name": "video_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "post": {
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Video"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer"
+      }
+    },
+    "schemas": {
+      "Video": {
+        "type": "object",
+        "required": [
+          "id",
+          "object",
+          "status",
+          "progress"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "object": {
+            "const": "video"
+          },
+          "status": {
+            "enum": [
+              "queued",
+              "in_progress",
+              "completed",
+              "failed",
+              "cancelled"
+            ]
+          },
+          "progress": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100
+          },
+          "frames": {
+            "type": "integer"
+          },
+          "fps": {
+            "const": 24
+          },
+          "size": {
+            "type": "string"
+          },
+          "seconds": {
+            "type": "string"
+          },
+          "error": {
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "t2va",
+              "first_frame",
+              "last_frame",
+              "first_last",
+              "ref2va"
+            ]
+          },
+          "reference_count": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 12
+          },
+          "num_inference_steps": {
+            "type": "integer",
+            "minimum": 2,
+            "maximum": 100,
+            "description": "H3: 2..100 grid points, default 50. Pika: exactly 6 evaluations, default 6."
+          }
+        }
+      },
+      "VideoRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "prompt"
+        ],
+        "properties": {
+          "model": {
+            "enum": ["minimax-h3", "pika-h3-flex"],
+            "description": "Must match the model selected when starting the server; omitted uses that model."
+          },
+          "prompt": {
+            "type": "string",
+            "minLength": 1
+          },
+          "size": {
+            "type": "string",
+            "description": "Default 768x448 for H3, 832x480 for Pika.",
+            "pattern": "^[0-9]+x[0-9]+$"
+          },
+          "seconds": {
+            "type": [
+              "string",
+              "number"
+            ],
+            "description": "5..15 seconds, rounded up to 17*n+5 frames; resulting frames must not exceed 345."
+          },
+          "frames": {
+            "type": "integer",
+            "minimum": 120,
+            "maximum": 345,
+            "description": "Alternative to seconds; rounded up to 17*n+5."
+          },
+          "seed": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 2147483647
+          },
+          "num_inference_steps": {
+            "type": "integer",
+            "minimum": 2,
+            "maximum": 100,
+            "description": "H3: 2..100 grid points, default 50. Pika: exactly 6 evaluations, default 6."
+          },
+          "reference_image_short_edge": {
+            "type": "integer",
+            "minimum": 64,
+            "maximum": 2048,
+            "multipleOf": 32,
+            "description": "Ref2VA image reference short edge. H3 defaults to 2048. Pika defaults to 1024 when the output short edge is at most 544, otherwise 2048."
+          },
+          "reference_video_short_edge": {
+            "type": "integer",
+            "minimum": 64,
+            "maximum": 768,
+            "multipleOf": 32,
+            "description": "Reference video short edge before the native area cap. H3 defaults to 768. Pika defaults to 480, 544 or 768 according to the output short edge."
+          }
+        }
+      },
+      "VideoMultipartRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "prompt"
+        ],
+        "properties": {
+          "model": {
+            "enum": ["minimax-h3", "pika-h3-flex"],
+            "description": "Must match the model selected when starting the server; omitted uses that model."
+          },
+          "prompt": {
+            "type": "string",
+            "minLength": 1
+          },
+          "size": {
+            "type": "string",
+            "description": "Default 768x448 for H3, 832x480 for Pika.",
+            "pattern": "^[0-9]+x[0-9]+$"
+          },
+          "seconds": {
+            "type": [
+              "string",
+              "number"
+            ],
+            "description": "5..15 seconds, rounded up to 17*n+5 frames; resulting frames must not exceed 345."
+          },
+          "frames": {
+            "type": "integer",
+            "minimum": 120,
+            "maximum": 345,
+            "description": "Alternative to seconds; rounded up to 17*n+5."
+          },
+          "seed": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 2147483647
+          },
+          "num_inference_steps": {
+            "type": "integer",
+            "minimum": 2,
+            "maximum": 100,
+            "description": "H3: 2..100 grid points, default 50. Pika: exactly 6 evaluations, default 6."
+          },
+          "reference_image_short_edge": {
+            "type": "integer",
+            "minimum": 64,
+            "maximum": 2048,
+            "multipleOf": 32,
+            "description": "Ref2VA image reference short edge. H3 defaults to 2048. Pika defaults to 1024 when the output short edge is at most 544, otherwise 2048."
+          },
+          "input_reference": {
+            "type": "string",
+            "format": "binary",
+            "description": "First-frame PNG/JPEG. Alias: first_frame."
+          },
+          "first_frame": {
+            "type": "string",
+            "format": "binary",
+            "description": "Alias of input_reference; specify only one."
+          },
+          "last_frame": {
+            "type": "string",
+            "format": "binary",
+            "description": "Last-frame PNG/JPEG; may be used alone or with input_reference."
+          },
+          "reference": {
+            "type": "array",
+            "maxItems": 12,
+            "items": {
+              "type": "string",
+              "format": "binary"
+            },
+            "description": "Repeated reference parts, in request order. Set each Content-Type to image/*, video/* or audio/*. Up to 9 images, 3 videos and 3 audio clips; clips are 2..15s, video/audio each total <=15s; audio requires an image/video. Each part <=128 MiB, request <=256 MiB."
+          },
+          "reference_video_short_edge": {
+            "type": "integer",
+            "minimum": 64,
+            "maximum": 768,
+            "multipleOf": 32,
+            "description": "Reference video short edge before the native area cap. H3 defaults to 768. Pika defaults to 480, 544 or 768 according to the output short edge."
+          }
+        }
+      }
+    }
+  }
+}

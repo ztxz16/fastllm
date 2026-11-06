@@ -129,9 +129,14 @@ namespace fastllm {
         int acceptedDrafts = -1;      // 采样校验给出接受前缀长度；-1 表示按 greedy token 比较
     };
 
+    struct DeepSeekV41EngramPrefetch;
+
     struct DeepSeekV41RequestState {
         std::vector<DeepSeekV41LayerCache> layers;
         std::vector<int> engramHistory;   // 每个已处理 token 的压缩 id（图像 token 为 -1）
+        // Known text prompt only; never append speculative tokens to live history.
+        std::vector<int> engramPrompt;
+        std::shared_ptr<DeepSeekV41EngramPrefetch> engramPrefetch;
         int totalLen = 0;
         int restoredLen = 0;              // 由前缀缓存恢复的 token 数（0 表示全新请求）
         // 图文请求：由 OnResponseContextCreated / ForwardMultimodal 记录，首个 prefill 块编码为 imageSpans
@@ -214,7 +219,7 @@ namespace fastllm {
         // Reuse prefill scratch through decode. The existing pool bounds idle
         // storage per device and reclaims it on allocation pressure.
         bool RetainCudaWorkspace() const override {
-            return executionMode == ExecutionMode::Gpu;
+            return executionMode == ExecutionMode::Gpu || executionMode == ExecutionMode::Hybrid;
         }
 
         // V4.1 的 mtp.* 由本类自行解析（结构与 DeepSeek-V4 Flash 的内置 DSpark 不同）
@@ -296,11 +301,12 @@ namespace fastllm {
         ExecutionMode executionMode = ExecutionMode::Cpu;
         bool v41MoeCudaGraphCompatible = true;
         void InitExecutionMode();
-        void BeginHybridMoeStep(HybridMoeDecodeStep &, bool tp, bool single, int seqlen);
+        void BeginHybridMoeStep(HybridMoeDecodeStep &, bool tp, bool single, int seqlen, int firstLayer = -1, int endLayer = -1);
         bool RunGpuMoe(DeepSeekV41MoeContext &);
         bool RunHybridMoe(DeepSeekV41MoeContext &, HybridMoeDecodeStep *);
         bool moeExpertCacheAttempted = false;
         std::vector<int> hybridMoeDevices;
+        bool hybridMoeStageOwned = false;
         // Source FP8/FP4 linears still require block-32 FP8 activations after
         // their weights have been decoded into the requested storage dtype.
         std::set<std::string> quantizedLinearNames;
@@ -375,6 +381,7 @@ namespace fastllm {
         // 捕获和回放共用互斥量，抢不到锁的前向退回逐算子。
         std::mutex v41CudaGraphMutex;
         std::map<int, std::shared_ptr<void>> v41CudaGraphSlots;
+        std::mutex v41PpDecodeMutex;
         bool v41CudaGraphWarmingUp = false;
         // One bounded eager verifier workspace, protected by v41CudaGraphMutex.
         // No graph captures these buffers, so candidate counts can share them.
@@ -411,20 +418,22 @@ namespace fastllm {
         // inputEmbeds 非空时直接作为嵌入（[1, tokens, dim]，供视觉输入使用）；
         // imageMask 非空时标记每个 token 是否为图像 token（Engram 历史置 -1，路由改用 gate.bias_vl）。
         struct HybridPrefillStage;
+        struct HybridDecodeStage;
         void PrepareForwardWeights();
         void PrepareHybridPrefill();
         bool TryForwardHybridChunkedPrefill(const Data &inputIds, const Data &attentionMask,
             const Data &positionIds, std::vector<std::pair<Data, Data>> &pastKeyValues,
             const GenerationConfig &generationConfig, const LastTokensManager &lastTokens,
             std::vector<float> *logits, int &outputToken);
-        struct EngramPrefetch;
+        using EngramPrefetch = DeepSeekV41EngramPrefetch;
         struct ForwardWorkspace;
         struct ForwardState;
         void PrepareForward(ForwardWorkspace &);
         void PrepareForwardInputs(ForwardWorkspace &);
 #ifdef USE_CUDA
         bool TryFullDecodeGraph(ForwardWorkspace &, bool inputsPrepared);
-        void BuildFullDecodeGraph(int batch, const std::vector<DeepSeekV41Segment> &segments);
+        void BuildFullDecodeGraph(int batch, const std::vector<DeepSeekV41Segment> &segments,
+                                  int firstLayer = -1, int endLayer = -1);
 #endif
         void BeginForwardLayer(ForwardWorkspace &, int layer);
         void EndForwardLayer(ForwardWorkspace &, int layer);
@@ -512,7 +521,7 @@ namespace fastllm {
         std::atomic<long long> v41DsparkVerifyRounds{0};
 
         void InitDsparkParams();
-        void ApplyDsparkDevice();
+        void ApplyDsparkDevice(bool targetComplete = false);
         void DsparkEmbedInput(const Data &inputIds, Data &hiddenStates);
         void DsparkProjectHead(Data &input, Data &output, bool persistent = false);
         bool DsparkPrepareQkv(int stage, const Data &input, Data &inputQuant,

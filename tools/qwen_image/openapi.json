@@ -1,0 +1,502 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "FastLLM Qwen-Image-2.1",
+    "version": "0.1.0",
+    "description": "Native C++/CUDA backend. FP32 inference. Optional Bearer authentication. One GPU worker, queue capacity 4. No remote URL fetching, masks, CFG, or batch n>1."
+  },
+  "servers": [
+    {
+      "url": "/"
+    }
+  ],
+  "security": [
+    {
+      "BearerAuth": []
+    }
+  ],
+  "paths": {
+    "/health": {
+      "get": {
+        "security": [],
+        "summary": "Read model initialization status",
+        "responses": {
+          "200": {
+            "description": "ready"
+          },
+          "503": {
+            "description": "loading or failed"
+          }
+        }
+      }
+    },
+    "/v1/models": {
+      "get": {
+        "summary": "List local models",
+        "responses": {
+          "200": {
+            "description": "OpenAI-style model list"
+          }
+        }
+      }
+    },
+    "/v1/images/generations": {
+      "post": {
+        "summary": "Generate one image synchronously",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GenerationRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenerationResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/v1/images/edits": {
+      "post": {
+        "summary": "Edit using one or more reference PNG images",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/EditRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenerationResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/v1/images/jobs": {
+      "post": {
+        "summary": "Submit generation or reference-image editing asynchronously",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GenerationRequest"
+              }
+            },
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/EditRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Job"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/v1/images/jobs/{id}": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "pattern": "^image_[0-9]+_[0-9]+$"
+          }
+        }
+      ],
+      "get": {
+        "summary": "Poll progress; the latest 128 jobs are retained in memory",
+        "responses": {
+          "200": {
+            "description": "Job status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Job"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/v1/images/jobs/{id}/cancel": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "pattern": "^image_[0-9]+_[0-9]+$"
+          }
+        }
+      ],
+      "post": {
+        "summary": "Request cancellation at the next pipeline stage or sampling step",
+        "responses": {
+          "200": {
+            "description": "Current job status"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/v1/images/files/{id}.png": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "pattern": "^image_[0-9]+_[0-9]+$"
+          }
+        }
+      ],
+      "get": {
+        "summary": "Download result; files persist in the configured output directory",
+        "responses": {
+          "200": {
+            "description": "RGBA PNG",
+            "content": {
+              "image/png": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "BearerAuth": {
+        "type": "http",
+        "scheme": "bearer"
+      }
+    },
+    "schemas": {
+      "GenerationRequest": {
+        "type": "object",
+        "required": [
+          "prompt"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "model": {
+            "type": "string",
+            "enum": [
+              "qwen-image-2.1"
+            ],
+            "default": "qwen-image-2.1"
+          },
+          "prompt": {
+            "type": "string",
+            "minLength": 1
+          },
+          "size": {
+            "type": "string",
+            "default": "1024x1024",
+            "description": "WIDTHxHEIGHT; each dimension 64..2048 and divisible by 32"
+          },
+          "n": {
+            "type": "integer",
+            "default": 1,
+            "minimum": 1,
+            "maximum": 1
+          },
+          "response_format": {
+            "type": "string",
+            "enum": [
+              "url",
+              "b64_json"
+            ],
+            "default": "url"
+          },
+          "seed": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 2147483647,
+            "description": "Omit for a random seed. Reproducible within this native backend; PRNG differs from PyTorch."
+          },
+          "num_inference_steps": {
+            "type": "integer",
+            "default": 40,
+            "minimum": 2,
+            "maximum": 100
+          },
+          "reference_resolution": {
+            "type": "integer",
+            "default": 1024,
+            "minimum": 256,
+            "maximum": 1024,
+            "description": "Reference resize area is this value squared; divisible by 32. Each resized image must contain >=65536 pixels."
+          }
+        }
+      },
+      "EditRequest": {
+        "type": "object",
+        "required": [
+          "prompt",
+          "image[]"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "model": {
+            "type": "string",
+            "enum": [
+              "qwen-image-2.1"
+            ],
+            "default": "qwen-image-2.1"
+          },
+          "prompt": {
+            "type": "string",
+            "minLength": 1
+          },
+          "size": {
+            "type": "string",
+            "default": "1024x1024",
+            "description": "WIDTHxHEIGHT; each dimension 64..2048 and divisible by 32"
+          },
+          "n": {
+            "type": "integer",
+            "default": 1,
+            "minimum": 1,
+            "maximum": 1
+          },
+          "response_format": {
+            "type": "string",
+            "enum": [
+              "url",
+              "b64_json"
+            ],
+            "default": "url"
+          },
+          "seed": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 2147483647,
+            "description": "Omit for a random seed. Reproducible within this native backend; PRNG differs from PyTorch."
+          },
+          "num_inference_steps": {
+            "type": "integer",
+            "default": 40,
+            "minimum": 2,
+            "maximum": 100
+          },
+          "reference_resolution": {
+            "type": "integer",
+            "default": 1024,
+            "minimum": 256,
+            "maximum": 1024,
+            "description": "Reference resize area is this value squared; divisible by 32. Each resized image must contain >=65536 pixels."
+          },
+          "image[]": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 10,
+            "items": {
+              "type": "string",
+              "format": "binary"
+            },
+            "description": "8-bit non-interlaced PNG. A single image field is also accepted. Combined input <=16 megapixels and HTTP body <=20 MiB."
+          }
+        }
+      },
+      "GenerationResponse": {
+        "type": "object",
+        "required": [
+          "created",
+          "data",
+          "seed"
+        ],
+        "properties": {
+          "created": {
+            "type": "number"
+          },
+          "seed": {
+            "type": "integer"
+          },
+          "data": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "url": {
+                  "type": "string",
+                  "format": "uri"
+                },
+                "b64_json": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      },
+      "Job": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "queued",
+              "in_progress",
+              "completed",
+              "failed",
+              "cancelled"
+            ]
+          },
+          "stage": {
+            "type": "string"
+          },
+          "step": {
+            "type": "integer"
+          },
+          "total_steps": {
+            "type": "integer"
+          },
+          "seed": {
+            "type": "integer"
+          },
+          "created": {
+            "type": "number"
+          },
+          "url": {
+            "type": "string",
+            "nullable": true
+          },
+          "error": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "properties": {
+          "error": {
+            "type": "object",
+            "properties": {
+              "message": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string"
+              },
+              "code": {
+                "type": "integer"
+              }
+            }
+          }
+        }
+      }
+    },
+    "responses": {
+      "Error": {
+        "description": "Structured error",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      }
+    }
+  }
+}

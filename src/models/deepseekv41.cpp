@@ -13,8 +13,14 @@
 #include "deepseekv41_execution.h"
 #ifdef USE_CUDA
 #include "devices/cuda/fastllm-v41-full-decode.h"
+#include "devices/cuda/fastllm-cuda-graph-workspace.h"
 #endif
 #include "utils/hybrid_moe.h"
+#include "utils/hybrid_parallel.h"
+#if defined(USE_NUMAS) && defined(__linux__)
+#include "devices/numas/numasdevice.h"
+#include <sched.h>
+#endif
 #include <optional>
 
 #include "baseblock.h"
@@ -40,6 +46,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cmath>
 #include <climits>
 #include <cstdio>
@@ -53,6 +60,7 @@
 #include <set>
 #include <sstream>
 #include <thread>
+#include <utility>
 
 #if !defined(_WIN32) && !defined(_WIN64)
 #include <fcntl.h>
@@ -507,15 +515,19 @@ namespace fastllm {
                 // Reuse capacity when the logical Top-K/candidate width changes.
                 uint64_t required = 1;
                 for (int dim : dims) required *= dim;
+                // Generic TP operators may publish only the root device ID.
+                // The replica map/local placements remain authoritative; rebuilding
+                // valid replicas here would invalidate captured router operands.
                 bool reuse = dst.multiDeviceData && dst.IsTensorParallelReplicated() &&
                     !dst.isFake && dst.dataType == type &&
-                    dst.dataDeviceIds == tpDevices && dst.multiDeviceDatas.size() == tpDevices.size();
+                    dst.multiDeviceDatas.size() == tpDevices.size();
                 if (reuse) {
                     for (int device : tpDevices) {
                         auto it = dst.multiDeviceDatas.find(device);
                         if (it == dst.multiDeviceDatas.end() || !it->second ||
                             !it->second->cudaData || it->second->isFake ||
                             it->second->dataDevice != DataDevice::CUDA ||
+                            it->second->dataDeviceIds.size() != 1 || it->second->dataDeviceIds[0] != device ||
                             it->second->dataType != type || it->second->expansionSize < required) {
                             reuse = false;
                             break;
@@ -1600,9 +1612,10 @@ namespace fastllm {
 
         void V41IndexerScore(const Data &q, const Data &weights, const Data &k, int ratio, int startPos,
                              Data &output) {
+            static const bool disableFakeQuant = V41EnvFlag("FASTLLM_DSV41_DISABLE_FAKE_QUANT");
             V41Executor().Run("DeepSeekV41IndexerScore", {
                 {"q", (Data*)&q}, {"weights", (Data*)&weights}, {"k", (Data*)&k}, {"output", &output}
-            }, {}, {{"compressRatio", ratio}, {"startPos", startPos}});
+            }, {}, {{"compressRatio", ratio}, {"startPos", startPos}, {"fp4Query", !disableFakeQuant}});
         }
 
         void V41CandidateBlocks(const Data &score, int blockSize, int topkBlocks, int ratio, int startPos, Data &output) {
@@ -2361,12 +2374,17 @@ namespace fastllm {
     DeepSeekV41Model::~DeepSeekV41Model() {
         ShutdownRuntime();
         DsparkReportStats();
-        ReleaseMoeCudaCache(weights);
-        ReleaseMoeCudaCache(v41DsparkMoeWeights);
+        // Request-owned draft children borrow their MoE cache owner. Retire
+        // those graphs before releasing the caches, including both state keys.
         {
             std::lock_guard<std::mutex> guard(v41StateMutex);
             v41States.clear();
+            v41StatesByFirstKey.clear();
+            v41PendingRestoredState.reset();
         }
+        v41CudaGraphSlots.clear();
+        ReleaseMoeCudaCache(weights);
+        ReleaseMoeCudaCache(v41DsparkMoeWeights);
         engramTables.clear();
     }
 
@@ -2558,12 +2576,6 @@ namespace fastllm {
         executionMode = ResolveExecutionMode(requested, placements);
         printf("[Fastllm] FASTLLM_EXECUTION_MODE=%s -> %s (DeepSeek-V4.1)\n",
                NormalizeExecutionMode(requested ? requested : "auto").c_str(), ExecutionModeName(executionMode));
-        if (!v41MoeCudaGraphCompatible) {
-            // Disk experts load/release temporary weights during a forward.
-            // They do not satisfy the persistent graph workspace contract.
-            // Engram disk lookups are independent and remain graph-compatible.
-            printf("[Fastllm] DeepSeek-V4.1: CUDA Graph bypassed for disk expert weights; using eager execution.\n");
-        }
         fflush(stdout);
     }
 
@@ -2735,6 +2747,26 @@ namespace fastllm {
         // FASTLLM_DSV41_ENGRAM_WKV_FP8=0 可退回解量化。
         static const bool wkvFp8 = V41EnvFlagOn("FASTLLM_DSV41_ENGRAM_WKV_FP8") && !V41EnvFlag("FASTLLM_DSV41_REFERENCE_MATH");
         std::set<std::string> tensorNameSet(tensorNames.begin(), tensorNames.end());
+        // Hybrid single-GPU and serial PP keep complete projections on their
+        // layer owner. TP/full-GPU and reference math retain their current layouts.
+        bool compactProjections = false;
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+        compactProjections = executionMode == ExecutionMode::Hybrid &&
+            V41DeviceMapUsesCuda(deviceMap) && !V41DeviceMapUsesMultiCuda(deviceMap) &&
+            FastllmCudaRuntimeArch() >= 80 &&
+            !V41ReferenceMathEnabled() && std::getenv("FASTLLM_DSV41_DUMP_DIR") == nullptr;
+#endif
+        auto compactCheckpoint = [&](const std::string &name, bool head) {
+            auto dir = weight.dicts.find("model_directory");
+            if (!compactProjections || dir == weight.dicts.end()) return false;
+            V41SafeTensorInfo source, scale;
+            if (!V41FindSafeTensor(dir->second, name, source) || source.shape.size() != 2) return false;
+            if (head) return source.dtype == "BF16";
+            const std::string scaleName = name.substr(0, name.size() - strlen("weight")) + "scale";
+            return source.dtype == "F8_E4M3" && V41FindSafeTensor(dir->second, scaleName, scale) &&
+                (scale.dtype == "F8_E8M0" || scale.dtype == "U8") && scale.shape.size() == 2 &&
+                source.shape[0] == scale.shape[0] * 32 && source.shape[1] == scale.shape[1] * 32;
+        };
         auto markQuantizedLinear = [&](const std::string &name) {
             quantizedLinearNames.insert(name);
             if (V41EndsWith(name, ".w1.weight")) {
@@ -2812,7 +2844,9 @@ namespace fastllm {
             if (name == "head.weight" && !quantizedLinearNames.count(name)) {
                 // The original ParallelHead promotes the BF16 checkpoint
                 // weight to FP32 and returns FP32 logits without BF16 rounding.
-                result[name].push_back({name, DataType::FLOAT32});
+                // BF16 checkpoint values are retained exactly; only storage
+                // shrinks. The head still accumulates and emits FP32 logits.
+                result[name].push_back({name, compactCheckpoint(name, true) ? DataType::BFLOAT16 : DataType::FLOAT32});
                 continue;
             }
             if (V41EndsWith(name, ".attn.wkv.weight") && quantizedLinearNames.count(name)) {
@@ -2824,7 +2858,7 @@ namespace fastllm {
             if (V41EndsWith(name, ".attn.wo_a.weight")) {
                 // The original converter dequantizes this grouped projection
                 // to BF16, while retaining its explicit activation quantizer.
-                result[name].push_back({name, DataType::BFLOAT16});
+                result[name].push_back({name, compactCheckpoint(name, false) ? DataType::FP8_E4M3 : DataType::BFLOAT16});
                 continue;
             }
             // 磁盘表复用通用惰性加载；常驻表保留紧凑 UE8M0 scale，避免展开整张 scale 表。
@@ -3054,6 +3088,21 @@ namespace fastllm {
 
     void DeepSeekV41Model::OnModelWeightsLoaded() {
         if (V41HasKey(this->weight, "gguf_architecture")) LoadEngramMeta();
+        if (V41HasKey(this->weight, "gguf_architecture") && V41HasKey(this->weight, "ple.layers")) {
+            // Upstream GGUF exports the exact FP32 product of the old BF16
+            // q/k parameters. Keep the existing kernels' q*k expression by
+            // using the imported product as q and a neutral k.
+            for (int layer : engram_layer_ids) {
+                const std::string prefix = "layers." + std::to_string(layer) + ".engram.";
+                auto q = weight.weight.find(prefix + "q_weight");
+                AssertInFastLLM(q != weight.weight.end() && q->second.dataType == FLOAT32 &&
+                    q->second.Count(0) == (uint64_t)hc_mult * embed_dim,
+                    "DeepSeekV41: invalid upstream Engram gate.");
+                if (!weight.weight.count(prefix + "k_weight"))
+                    weight[prefix + "k_weight"].CopyFrom(Data(FLOAT32, q->second.dims,
+                        std::vector<float>(q->second.Count(0), 1.0f)));
+            }
+        }
         v41TargetHeadWeights.reset();
         v41DsparkAttentionWeights.clear();
         if (engram_layer_ids.empty()) {
@@ -3236,20 +3285,23 @@ namespace fastllm {
             int startPos = 0;           // 平移后的起点
             int seqlen = 0;
             int offset = 0;             // 在整批里的 token 偏移
+
+            V41EngramSegSnapshot(const std::vector<int> &source, int start, int tokens,
+                                 int maxNgram, int tokenOffset = 0)
+                : seqlen(tokens), offset(tokenOffset) {
+                const int lo = std::max(0, start - maxNgram + 1);
+                const int hi = std::min(int(source.size()), start + tokens);
+                history.assign(source.begin() + lo, source.begin() + std::max(lo, hi));
+                startPos = start - lo;
+            }
         };
 
         std::vector<V41EngramSegSnapshot> V41SnapshotSegments(const std::vector<DeepSeekV41Segment> &segments,
                                                               int maxNgram) {
-            std::vector<V41EngramSegSnapshot> ret(segments.size());
-            for (size_t i = 0; i < segments.size(); i++) {
-                const DeepSeekV41Segment &seg = segments[i];
-                const std::vector<int> &history = seg.state->engramHistory;
-                int lo = std::max(0, seg.startPos - maxNgram + 1);
-                int hi = std::min((int)history.size(), seg.startPos + seg.seqlen);
-                ret[i].history.assign(history.begin() + lo, history.begin() + std::max(lo, hi));
-                ret[i].startPos = seg.startPos - lo;
-                ret[i].seqlen = seg.seqlen;
-                ret[i].offset = seg.offset;
+            std::vector<V41EngramSegSnapshot> ret;
+            ret.reserve(segments.size());
+            for (const auto &seg : segments) {
+                ret.emplace_back(seg.state->engramHistory, seg.startPos, seg.seqlen, maxNgram, seg.offset);
             }
             return ret;
         }
@@ -3332,9 +3384,9 @@ namespace fastllm {
         }
     }
 
-    // Forward-owned: join before snapshots, results or request state can expire.
-    // The immutable history snapshot is reused across this stage's Engram layers.
-    struct DeepSeekV41Model::EngramPrefetch {
+    // Forward/request-owned: join before snapshots or model metadata expire.
+    // At most one future chunk is retained per request.
+    struct DeepSeekV41EngramPrefetch {
         std::thread worker;
         const int endLayer;
         const std::vector<V41EngramSegSnapshot> snapshots;
@@ -3346,7 +3398,11 @@ namespace fastllm {
         std::unique_ptr<Data> gathered;
         std::exception_ptr error;
 
-        EngramPrefetch(int endLayer, std::vector<V41EngramSegSnapshot> snapshots)
+        // Absolute position identifies a future chunk; snapshots also verify its tokens.
+        int startPos = -1;
+        bool lookahead = false;
+
+        DeepSeekV41EngramPrefetch(int endLayer, std::vector<V41EngramSegSnapshot> snapshots)
             : endLayer(endLayer), snapshots(std::move(snapshots)) {}
 
         void Join() {
@@ -3390,7 +3446,7 @@ namespace fastllm {
             });
         }
 
-        ~EngramPrefetch() { Join(); }
+        ~DeepSeekV41EngramPrefetch() { Join(); }
     };
 
     void DeepSeekV41Model::GatherEngramRows(int layer, const std::vector<int64_t> &rows, int tokens,
@@ -3516,8 +3572,27 @@ namespace fastllm {
     }
 
     bool DeepSeekV41Model::TryBFloat16HeadLinear(Data &input, Data &output) {
-#ifdef USE_CUDA
         Data &headWeight = weight["head.weight"];
+        if (!quantizedLinearNames.count("head.weight") && !input.multiDeviceData &&
+            !headWeight.multiDeviceData && !output.multiDeviceData &&
+            (input.dataType == DataType::BFLOAT16 || input.dataType == DataType::FLOAT32) &&
+            headWeight.dataType == DataType::BFLOAT16 && headWeight.dims.size() == 2 &&
+            !input.dims.empty() && input.dims.back() == headWeight.dims[1] &&
+            &input != &output && &headWeight != &output) {
+#ifdef USE_CUDA
+            if (!V41ReferenceMathEnabled() && input.dataType == DataType::BFLOAT16 &&
+                FastllmCudaBFloat16LinearFloat32(input, headWeight, output)) return true;
+#endif
+            // Keep FP32 accumulation and logits on every compact-head fallback,
+            // including CPU execution and draft projections. Do not retain the
+            // expanded weight in the model or reduce FP32 inputs to BF16.
+            Data floatInput, floatWeight;
+            ToDataType(input, floatInput, DataType::FLOAT32);
+            ToDataType(headWeight, floatWeight, DataType::FLOAT32);
+            Linear(floatInput, floatWeight, *GetEmptyData(), output);
+            return true;
+        }
+#ifdef USE_CUDA
         if (executionMode != ExecutionMode::Gpu || V41EnvFlag("FASTLLM_DSV41_REFERENCE_MATH") ||
             input.dataType != DataType::BFLOAT16 || !input.multiDeviceData ||
             !input.IsTensorParallelReplicated() || input.dims.empty() || &input == &output ||
@@ -3661,6 +3736,32 @@ namespace fastllm {
             }
         }
 
+        // Once the first CPU Engram is consumed, prefetch the next chunk's
+        // first lookup alongside this chunk's later lookup. Starting only after
+        // the last Engram leaves too little lead time for cold disk rows.
+        // One immutable future window per request bounds memory and workers;
+        // live history and verification/rollback semantics remain unchanged.
+        if (tookPrefetched && job->lookahead && segments.size() == 1 && !segments[0].state->engramPrefetch) {
+            auto &state = *segments[0].state;
+            const int nextStart = segments[0].startPos + segments[0].seqlen;
+            const int nextTokens = std::min(std::max(1, GetChunkedPrefillSize()),
+                                           int(state.engramPrompt.size()) - nextStart);
+            if (nextTokens >= V41EngramPrefetchMinTokens) {
+                for (size_t next = 0; next < engram_layer_ids.size() && next < engramTables.size(); ++next) {
+                    if (engram_layer_ids[next] >= job->endLayer) break;
+                    auto table = std::static_pointer_cast<V41EngramTable>(engramTables[next]);
+                    if (!V41CanPrefetchEngramRows(*table)) continue;
+                    std::vector<V41EngramSegSnapshot> snapshots;
+                    snapshots.emplace_back(state.engramPrompt, nextStart, nextTokens, engram_max_ngram_size);
+                    state.engramPrefetch = std::make_shared<EngramPrefetch>(job->endLayer, std::move(snapshots));
+                    state.engramPrefetch->startPos = nextStart;
+                    state.engramPrefetch->Start(int(next), nextTokens, engramMeta,
+                        engram_max_ngram_size, engram_n_heads, table);
+                    break;
+                }
+            }
+        }
+
         // ---- 第二段：查表 + FP8→BF16 ----
         mark = profiling ? V41NowMs() : 0.0;
         Data localGather;
@@ -3733,6 +3834,7 @@ namespace fastllm {
         void V41ResetState(DeepSeekV41RequestState &state, int blockCnt) {
             state.layers.clear();
             state.layers.resize(blockCnt);
+            state.engramPrefetch.reset();
             state.engramHistory.clear();
             state.totalLen = 0;
             state.restoredLen = 0;
@@ -3802,6 +3904,16 @@ namespace fastllm {
             }
         }
         RegisterState(key, firstKey, state);
+        state->engramPrefetch.reset();
+        state->engramPrompt.clear();
+        if (context->multimodalInput.empty() && engramMeta.loaded &&
+            V41EnvFlagOn("FASTLLM_DSV41_ENGRAM_PREFETCH")) {
+            state->engramPrompt.reserve(context->allTokens.size());
+            for (int token : context->allTokens) {
+                state->engramPrompt.push_back(token >= 0 && token < int(engramMeta.tokenMap.size()) &&
+                    token != image_token_id ? engramMeta.tokenMap[token] : -1);
+            }
+        }
         // 图文请求：调度器可能只用普通 Forward 逐块 prefill，因此在这里就把多模态输入记到请求状态里，
         // 由第一个 prefill 块编码图像（见 ForwardSegments 的调用方）
         if (!context->multimodalInput.empty()) {
@@ -4550,7 +4662,7 @@ namespace fastllm {
         int composedLast = -1;
         std::vector<int> qDims, kvDims, qIdxDims;
         std::vector<int> ffnDims, ffnInputDims, expertIndexDims, expertScoreDims;
-        std::vector<void *> kvOutputs;
+        std::vector<void *> kvOutputs, rawKVOutputs, rawScoreOutputs;
         bool swapHidden = false;
         bool ffnInputQuantizedReady = false;
     };
@@ -4583,33 +4695,6 @@ namespace fastllm {
                 return v > 0 ? v : 2;
             }();
             return rounds;
-        }
-
-        // 排查用：位 0～3 分别回放 pre / post / route / sharedExpert，默认全开。
-        int V41DecodeCudaGraphReplayMask() {
-            static const int mask = []() -> int {
-                const char *env = std::getenv("FASTLLM_DSV41_CUDA_GRAPH_REPLAY_MASK");
-                return env != nullptr && env[0] != 0 ? atoi(env) : 15;
-            }();
-            return mask;
-        }
-
-        // 排查用：让第 N 段的捕获强制失败，验证"就地退回逐算子"这条回退路径
-        int V41DecodeCudaGraphFailAt() {
-            static const int at = []() -> int {
-                const char *env = std::getenv("FASTLLM_DSV41_CUDA_GRAPH_FAIL_AT");
-                return env != nullptr && env[0] != '\0' ? atoi(env) : -1;
-            }();
-            return at;
-        }
-
-        // 排查用：每 N 次回放模拟地址失效；普通 decode 退回 eager，verify 可重新捕获
-        int V41DecodeCudaGraphInvalidateEvery() {
-            static const int n = []() -> int {
-                const char *env = std::getenv("FASTLLM_DSV41_CUDA_GRAPH_INVALIDATE_EVERY");
-                return env != nullptr && env[0] != '\0' ? atoi(env) : 0;
-            }();
-            return n;
         }
 
         bool V41DecodeCudaGraphVerbose() {
@@ -4647,6 +4732,7 @@ namespace fastllm {
             std::vector<DeepSeekV41GraphDeviceState> deviceStates;
             std::vector<DeepSeekV41GraphSegment> segments;
             std::vector<void*> reservedPointers;
+            std::vector<size_t> captureAllocations;
             // 捕获时工作区里各边界张量的设备地址。回放前逐一核对，任何一个搬了家
             // 都说明图里烤死的地址已经失效，销毁重捕获；反复失效就彻底关掉。
             std::vector<const void*> boundaryPointers;
@@ -4663,11 +4749,36 @@ namespace fastllm {
 
             std::shared_ptr<void> fullDecode;
             bool fullVerifyAttempted = false;
+            void *sharedStream = nullptr, *sharedReady = nullptr, *sharedDone = nullptr;
+            void *stageReady = nullptr;
+            bool sharedPending = false;
+
+            void JoinShared() {
+                if (!sharedPending) return;
+                FastllmCudaCurrentThreadStreamWaitEvent(sharedDone);
+                sharedPending = false;
+            }
 
             void DestroyCapturedGraph() {
+                const int oriDevice = FastllmCudaGetDevice();
+                if (sharedStream) {
+                    FastllmCudaSetDevice(devices[0]);
+                    FastllmCudaStreamSynchronize(sharedStream);
+                    FastllmCudaStreamDestroy(sharedStream);
+                    FastllmCudaEventDestroy(sharedReady);
+                    FastllmCudaEventDestroy(sharedDone);
+                    sharedStream = sharedReady = sharedDone = nullptr;
+                    sharedPending = false;
+                    FastllmCudaSetDevice(oriDevice);
+                }
+                if (stageReady) {
+                    FastllmCudaSetDevice(devices.front());
+                    FastllmCudaSyncDevice(devices.front());
+                    FastllmCudaEventDestroy(stageReady); stageReady = nullptr;
+                    FastllmCudaSetDevice(oriDevice);
+                }
                 fullDecode.reset();
                 fullVerifyAttempted = false;
-                const int oriDevice = FastllmCudaGetDevice();
                 for (auto &segment : segments) {
                     for (size_t i = 0; i < segment.composedExecs.size(); ++i) {
                         FastllmCudaSetDevice(deviceStates[i].device);
@@ -4699,6 +4810,7 @@ namespace fastllm {
                 replaying = false;
                 captureFailed = false;
                 warmupRounds = 0;
+                captureAllocations.clear();
             }
 
             void ResetWorkspace() {
@@ -4754,7 +4866,7 @@ namespace fastllm {
 
         void V41ComposeGraphSegments(DeepSeekV41CudaGraphState &state,
                                      bool crossLayer, const std::vector<int> &engramLayers) {
-            if (!state.tensorParallel || (V41DecodeCudaGraphReplayMask() & 14) != 14) return;
+            if (!state.tensorParallel) return;
             const int original = FastllmCudaGetDevice();
             for (int first = 1; first + 2 < (int)state.segments.size(); first += 4) {
                 if (!state.segments[first + 2].containsGpuMoe) continue;
@@ -4765,7 +4877,7 @@ namespace fastllm {
                 if (!eligible) continue;
                 int last = first + 2;
                 const int nextLayer = (first + 3) / kV41GraphSegmentsPerLayer;
-                if (crossLayer && (V41DecodeCudaGraphReplayMask() & 1) &&
+                if (crossLayer &&
                     first + 3 < (int)state.segments.size() &&
                     std::find(engramLayers.begin(), engramLayers.end(), nextLayer) == engramLayers.end() &&
                     !state.segments[first + 3].passthrough &&
@@ -4986,6 +5098,7 @@ namespace fastllm {
     struct DeepSeekV41Model::ForwardWorkspace {
         DeepSeekV41Model &model;
         HybridPrefillStage *prefill = nullptr;
+        HybridDecodeStage *pipeline = nullptr;
         const std::vector<DeepSeekV41Segment> &inputSegments;
         const Data &inputIds;
         const Data *inputEmbeds;
@@ -4994,7 +5107,7 @@ namespace fastllm {
         const LastTokensManager &lastTokens;
         std::vector<std::vector<float>*> *retLogits;
         std::vector<std::pair<Data*, Data*> > &samplingPastKeyValues;
-        std::unique_ptr<EngramPrefetch> engramPrefetch;
+        std::shared_ptr<EngramPrefetch> engramPrefetch;
         std::vector<int> tokenIds;
         int numSegments = 0;
         bool boundedPrefill = false;
@@ -5042,6 +5155,9 @@ namespace fastllm {
         std::vector<int> ffnDims;
         bool combineFfnPostDispatch = false;
         bool captureGpuMoeTogether = false;
+        // True only while the current layer is using the validated resident
+        // MoE graph; ordinary hybrid layers retain their shared-expert path.
+        bool residentMoeGraph = false;
         int endedLayerInGraph = -1;
 #ifdef USE_CUDA
         std::shared_ptr<DeepSeekV41CudaGraphState> graphState;
@@ -5050,6 +5166,7 @@ namespace fastllm {
         bool graphCapture = false;
         Data *fullGraphHead = nullptr, *fullGraphLogits = nullptr;
         bool graphPoolOpen = false;
+        std::unique_ptr<FastllmCudaAllocationRecorder> allocationRecorder;
         bool workerOrderedGraphReplay = false;
         bool decodeQkvViewsPrepared = false;
         bool decodeOutputViewsPrepared = false;
@@ -5072,9 +5189,10 @@ namespace fastllm {
                                                        const std::vector<GenerationConfig> &generationConfigsIn,
                                                        const LastTokensManager &lastTokens,
                                                        std::vector<std::vector<float>*> *retLogits,
-                                                       std::vector<std::pair<Data*, Data*> > &samplingPastKeyValues, HybridPrefillStage *prefill)
+                                                       std::vector<std::pair<Data*, Data*> > &samplingPastKeyValues, HybridPrefillStage *prefill, HybridDecodeStage *pipeline)
         : work(new ForwardWorkspace(model, inputSegments, inputIds, inputEmbeds, imageMask, generationConfigsIn, lastTokens, retLogits, samplingPastKeyValues)) {
         work->prefill = prefill;
+        work->pipeline = pipeline;
         model.PrepareForward(*work);
     }
     DeepSeekV41Model::ForwardState::~ForwardState() = default;
@@ -5089,7 +5207,8 @@ namespace fastllm {
     int DeepSeekV41Model::ForwardState::Layers() const {
         const int end = work->inputSegments[0].prefillCacheOnly ?
             work->model.decoderSwaTailLayer : work->model.block_cnt;
-        return work->prefill ? std::min(end, work->prefill->endLayer) : end;
+        return work->pipeline ? work->pipeline->endLayer :
+            work->prefill ? std::min(end, work->prefill->endLayer) : end;
     }
     void DeepSeekV41Model::ForwardState::BeginLayer(int layer) { work->model.BeginForwardLayer(*work, layer); }
     void DeepSeekV41Model::ForwardState::EndLayer(int layer) {
@@ -5098,7 +5217,9 @@ namespace fastllm {
     void DeepSeekV41Model::ForwardState::BeginHybridStep() {
         if (work->model.executionMode == ExecutionMode::Hybrid) {
             work->moeStep.emplace();
-            work->model.BeginHybridMoeStep(*work->moeStep, work->tp, work->single, work->seqlen);
+            work->model.BeginHybridMoeStep(*work->moeStep, work->tp, work->single, work->seqlen,
+                work->pipeline ? work->pipeline->firstLayer : -1,
+                work->pipeline ? work->pipeline->endLayer : -1);
         }
     }
     void DeepSeekV41Model::ForwardState::GpuExperts(int layer) {
@@ -5168,6 +5289,102 @@ namespace fastllm {
     }
     void DeepSeekV41Model::ForwardState::HybridExperts(int layer) {
         auto ctx=work->model.MakeForwardMoeContext(*work, layer);
+        work->residentMoeGraph = false;
+#ifdef USE_CUDA
+        // Keep the hybrid backend's FP32 sum/shared rounding unchanged. Only
+        // remove host route staging once the resident CUDA backend is ready.
+        const auto moeDevice = work->model.SelectMoeDeviceForLayer(layer);
+        const auto mainDevice = SelectDeviceFromMap(work->model.deviceMap, layer + 1,
+                                                   work->model.block_cnt);
+        const bool residentPlacement = work->tp
+            ? V41DeviceSpecUsesType(moeDevice, "multicuda") && moeDevice == mainDevice
+            : V41DeviceSpecUsesType(moeDevice, "cuda") && V41DeviceSpecUsesType(mainDevice, "cuda");
+        const auto residentType = ctx.moeWeights.size() > 2 && ctx.moeWeights[2] ?
+            ctx.moeWeights[2]->dataType : DataType::FLOAT32;
+        const bool residentFormat = residentType == DataType::DATA_GGUF_FORMAT ||
+            residentType == DataType::NVFP4 || residentType == DataType::NVFP4_BLOCK_32_E8M0;
+        ctx.residentGraph = work->graphActive && work->cudaRouteCapturable && residentPlacement &&
+            residentFormat && work->ws->ffnInput.dataType == DataType::BFLOAT16 && ctx.moeWeights.size() > 2;
+        if (ctx.residentGraph && work->tp) {
+            // Expert-parallel ranks own disjoint expert tables. Validate each
+            // rank's persistent backend before capturing the shared/routed sum.
+            for (int device : work->tpDevices) {
+                const Data *key = nullptr;
+                for (size_t slot = 2; slot < ctx.moeWeights.size(); slot += 2) {
+                    if (!ctx.moeWeights[slot]) continue;
+                    auto it = ctx.moeWeights[slot]->multiDeviceDatas.find(device);
+                    if (it != ctx.moeWeights[slot]->multiDeviceDatas.end() && it->second) {
+                        key = it->second;
+                        break;
+                    }
+                }
+                ctx.residentGraph &= FastllmCudaV41MoeGraphReady(
+                    key, work->seqlen, work->model.num_experts_per_tok);
+            }
+        } else if (ctx.residentGraph) {
+            ctx.residentGraph = FastllmCudaV41MoeGraphReady(
+                ctx.moeWeights[2], work->seqlen, work->model.num_experts_per_tok);
+        }
+        const int residentIndex = kV41GraphSegmentsPerLayer * layer + 3;
+        if (work->graphReplay) {
+            const bool captured = work->graphState->segments[residentIndex].containsGpuMoe;
+            if (captured && !ctx.residentGraph) work->model.GiveUpForwardGraph(*work, "resident MoE buffers");
+            if (!captured) ctx.residentGraph = false;
+        }
+        if (ctx.residentGraph) {
+            work->residentMoeGraph = true;
+            work->captureGpuMoeTogether = true;
+            work->model.RunForwardGraphSegment(*work, [&] {
+                work->combineFfnPostDispatch = work->model.RunHybridMoe(ctx, nullptr);
+                work->model.EndForwardLayer(*work, layer);
+            }, residentIndex, true,
+            [](DeepSeekV41GraphSegmentMeta &meta) { meta.containsGpuMoe = true; },
+            [&](const DeepSeekV41GraphSegmentMeta &) {
+                (work->tp ? work->ws->residentFfnOut : work->ws->ffnOut).Reshape(work->ffnDims);
+                std::swap(work->curHidden, work->nextHidden);
+                work->preMixPtr = &work->ws->ffnPre;
+            });
+            work->endedLayerInGraph = layer;
+            work->captureGpuMoeTogether = false;
+            return;
+        }
+        // Only replay an established, independent shared-expert graph. Eager,
+        // capture, TP and diagnostic paths retain their existing ordering.
+        const int sharedIndex = kV41GraphSegmentsPerLayer * layer + 3;
+        if (work->graphReplay && !work->tp && work->single &&
+            work->seqlen == 1 && !work->dsparkVerify && !work->dumpDebug &&
+            ctx.hasSharedExpertOut && work->moeStep && *work->moeStep &&
+            ctx.moeWeights.size() > 2 && ctx.moeWeights[2] &&
+            ctx.moeWeights[2]->dataType == NVFP4_BLOCK_32_E8M0 &&
+            !V41EnvFlag("FASTLLM_DSV41_DISABLE_SHARED_OVERLAP") &&
+            !V41EnvFlag("FASTLLM_DSV41_REFERENCE_MATH") &&
+            sharedIndex < (int)work->graphState->segments.size()) {
+            const auto &segment = work->graphState->segments[sharedIndex];
+            if (!segment.passthrough && segment.execs.size() == 1 && segment.execs[0]) {
+                ctx.runSharedSegment = [&, sharedIndex] {
+                    auto &state = *work->graphState;
+                    if (!state.sharedStream) {
+                        state.sharedStream = FastllmCudaStreamCreate();
+                        state.sharedReady = FastllmCudaEventCreate();
+                        state.sharedDone = FastllmCudaEventCreate();
+                    }
+                    // The input producer precedes ready. Routed experts use
+                    // separate scratch; join sharedDone before either output
+                    // is consumed or the shared scratch can be reused.
+                    FastllmCudaEventRecordCurrentThread(state.sharedReady);
+                    FastllmCudaStreamWaitEvent(state.sharedStream, state.sharedReady);
+                    if (FastllmCudaGraphLaunchOnStream(state.segments[sharedIndex].execs[0], state.sharedStream)) {
+                        FastllmCudaEventRecord(state.sharedDone, state.sharedStream);
+                        state.sharedPending = true;
+                        return;
+                    }
+                    work->model.GiveUpForwardGraph(*work, "shared expert stream");
+                    work->model.RunForwardSharedExpert(*work, layer);
+                };
+                ctx.joinSharedSegment = [&] { work->graphState->JoinShared(); };
+            }
+        }
+#endif
         work->combineFfnPostDispatch=work->model.RunHybridMoe(ctx, work->moeStep ? &*work->moeStep : nullptr);
     }
     std::vector<int> DeepSeekV41Model::ForwardState::Finish() { return work->model.FinishForward(*work); }
@@ -5270,7 +5487,10 @@ namespace fastllm {
         // 按 query head 切分，wo_b 按列切并 all-reduce，共享专家保持复制。
         // FastllmGetMulticudaDeviceAndRatio 读的是 ApplyDeviceMap 设置的全局设备表，
         // 首次前向前必须先应用一次主 device map，否则拿到的是空列表。
-        ApplyDeviceMap(this->deviceMap, f.prefill ? f.prefill->firstLayer + 1 : 1, block_cnt);
+        ApplyDeviceMap(this->deviceMap, f.pipeline ? f.pipeline->firstLayer + 1 : f.prefill ? f.prefill->firstLayer + 1 : 1, block_cnt);
+#ifdef USE_CUDA
+        if (f.pipeline) FastllmCudaSetDevice(f.pipeline->device);
+#endif
         tpDevices = V41TpDevices(this->deviceMap);
         tp = !tpDevices.empty();
         // 与 InitParams 使用相同的 head/o_group 对齐条件；kernel 内部处理尾部 head。
@@ -5315,20 +5535,22 @@ namespace fastllm {
             std::getenv("FASTLLM_DSV41_DUMP_DIR") == nullptr &&
             !GetFastllmEnv().cudaSync && !GetFastllmEnv().printProfile &&
             (this->deviceMap.empty() || V41DeviceMapUsesCuda(this->deviceMap)) &&
-            // 按层切分不支持分段图；仅允许单卡或 multicuda 张量并行。
-            (V41DeviceMapUsesMultiCuda(this->deviceMap) ||
+            // PP enters only with a validated, device-local stage workspace.
+            (f.pipeline || V41DeviceMapUsesMultiCuda(this->deviceMap) ||
              V41DeviceMapCudaDeviceCount(this->deviceMap) <= 1) &&
             !V41EnvFlag("FASTLLM_DSV41_REFERENCE_MATH") && GetFastllmEnv().cudaGraph) {
-            graphLock = std::unique_lock<std::mutex>(v41CudaGraphMutex, std::try_to_lock);
+            graphLock = f.pipeline ? std::unique_lock<std::mutex>(v41CudaGraphMutex) :
+                std::unique_lock<std::mutex>(v41CudaGraphMutex, std::try_to_lock);
             if (graphLock.owns_lock()) {
                 // Verification and independent requests have different host metadata.
-                const int graphKey = verifyGraph ? -seqlen : seqlen;
+                const int graphKey = f.pipeline ? V41PipelineGraphKey(f.pipeline->firstLayer, seqlen) :
+                    verifyGraph ? -seqlen : seqlen;
                 auto found = v41CudaGraphSlots.find(graphKey);
                 if (v41CudaGraphWarmingUp || verifyGraph || found != v41CudaGraphSlots.end()) {
                     graphState = V41GetCudaGraphState(v41CudaGraphSlots[graphKey]);
                 }
             }
-            if (!graphState || graphState->disabled) {
+            if (!graphState || (graphState->disabled && !f.pipeline)) {
                 graphState.reset();
             } else {
                 // 设备布局 / dtype 变化时丢弃旧图（图里烤死了每张卡上的权重地址）
@@ -5340,6 +5562,8 @@ namespace fastllm {
                 for (int device : tpDevices) {
                     signature += std::to_string(device) + ",";
                 }
+                if (f.pipeline) signature += "pp:" + std::to_string(f.pipeline->firstLayer) + ":" +
+                    std::to_string(f.pipeline->endLayer) + ":" + std::to_string(f.pipeline->device);
                 if (graphState->signature != signature) {
                     graphState->DestroyCapturedGraph();
                     graphState->ResetWorkspace();
@@ -5374,11 +5598,12 @@ namespace fastllm {
                     graphState->PrepareDevices(graphDevices, tp);
                     ws = graphState->workspace.get();
                     graphActive = true;
-                    if (graphState->captured &&
+                    if (!graphState->disabled && graphState->captured &&
                         (int)graphState->segments.size() == kV41GraphSegmentsPerLayer * block_cnt) {
                         graphReplay = true;
-                    } else if ((v41CudaGraphWarmingUp || verifyGraph) &&
-                               graphState->warmupRounds >= V41DecodeCudaGraphWarmupRounds()) {
+                    } else if (!graphState->disabled && (v41CudaGraphWarmingUp || verifyGraph) &&
+                               graphState->warmupRounds >= std::max(graphState->devices.size() == 1 ? 2 : 1,
+                                                                  V41DecodeCudaGraphWarmupRounds())) {
                         graphCapture = true;
                     }
                 }
@@ -5413,12 +5638,20 @@ namespace fastllm {
             tp && (executionMode == ExecutionMode::Gpu || (single && seqlen == 1) ||
                    graphActive || tpVerifyWorkspaceActive), tpDevices));
         graphPoolOpen = false;
+        if (graphActive && !graphCapture && !graphReplay && graphState->devices.size() == 1 &&
+            graphState->warmupRounds > 0) {
+            // Persistent weights are ready after the first warmup. Reserve the
+            // complete transient allocation sequence before graph capture.
+            graphState->captureAllocations.clear();
+            f.allocationRecorder.reset(new FastllmCudaAllocationRecorder(&graphState->captureAllocations));
+        }
         if (graphCapture) {
             const int oriDevice = FastllmCudaGetDevice();
             for (int device : graphState->devices) {
                 FastllmCudaSyncDevice(device);
             }
-            bool prepared = true;
+            bool prepared = graphState->devices.size() != 1 ||
+                FastllmCudaReserveGraphWorkspace(graphState->captureAllocations);
             for (int device : graphState->devices) {
                 FastllmCudaSetDevice(device);
                 if (!FastllmCudaGraphPrepareCaptureDevice()) {
@@ -5437,6 +5670,7 @@ namespace fastllm {
             } else {
                 graphPoolOpen = true;
                 graphState->segments.clear();
+                if (f.pipeline) graphState->segments.resize(f.pipeline->firstLayer * kV41GraphSegmentsPerLayer);
                 graphState->captureFailed = false;
             }
         }
@@ -5446,7 +5680,7 @@ namespace fastllm {
         f.tokenIds = V41ReadTokenIds(inputIds);
         const auto &tokenIds = f.tokenIds;
         AssertInFastLLM((int)tokenIds.size() == total, "DeepSeekV41Model::ForwardSegments: inputIds length mismatch.");
-        if (!engram_layer_ids.empty()) {
+        if (!engram_layer_ids.empty() && (!f.pipeline || f.pipeline->firstLayer == 0)) {
             for (auto &seg : segments) {
                 AssertInFastLLM((int)seg.state->engramHistory.size() == seg.startPos,
                                 "DeepSeekV41: engram history is out of sync with the cache.");
@@ -5504,6 +5738,16 @@ namespace fastllm {
                     biass[layer].push_back(nullptr);
                 }
             }
+#if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
+            if (!v41MoeCudaGraphCompatible && executionMode == ExecutionMode::Hybrid) {
+                // Disk I/O stays outside capture. Supported canonical GGUF and
+                // native FP4 layers use fixed-address mailboxes in the graph.
+                v41MoeCudaGraphCompatible = true;
+                for (int layer = 0; layer < block_cnt; ++layer)
+                    if (V41DeviceSpecUsesType(SelectMoeDeviceForLayer(layer), "disk"))
+                        v41MoeCudaGraphCompatible &= DiskMoeV41Graph::Supports(weights[layer]);
+            }
+#endif
         }
 
     }
@@ -5543,16 +5787,43 @@ namespace fastllm {
         // before embedding/layer 0, rather than waiting until Engram layer 1.
         // A pipeline stage only prefetches layers that it will consume.
         if (seqlen >= V41EngramPrefetchMinTokens && V41EnvFlagOn("FASTLLM_DSV41_ENGRAM_PREFETCH")) {
-            const int first = f.prefill ? f.prefill->firstLayer : 0;
-            const int end = f.prefill ? f.prefill->endLayer : block_cnt;
+            const int first = f.pipeline ? f.pipeline->firstLayer : f.prefill ? f.prefill->firstLayer : 0;
+            const int end = f.pipeline ? f.pipeline->endLayer : f.prefill ? f.prefill->endLayer : block_cnt;
             for (size_t i = 0; i < engram_layer_ids.size() && i < engramTables.size(); ++i) {
                 if (engram_layer_ids[i] < first || engram_layer_ids[i] >= end) continue;
                 auto table = std::static_pointer_cast<V41EngramTable>(engramTables[i]);
                 if (!V41CanPrefetchEngramRows(*table)) continue;
-                f.engramPrefetch.reset(new EngramPrefetch(end,
-                    V41SnapshotSegments(segments, engram_max_ngram_size)));
-                f.engramPrefetch->Start(int(i), seqlen, engramMeta, engram_max_ngram_size,
-                                       engram_n_heads, table);
+                auto snapshots = V41SnapshotSegments(segments, engram_max_ngram_size);
+                // Only scheduled, single-request text prefill knows the next input.
+                // Direct Forward, verification, multimodal and pipeline calls retain
+                // the per-forward fallback and do not predict future token IDs.
+                bool lookahead = segments.size() == 1 && !f.dsparkVerify &&
+                    (!segments[0].spec || (!segments[0].spec->deferWindow && !segments[0].spec->wantAllTokens)) &&
+                    !f.pipeline && !f.prefill && !f.hasImageTokens && !f.inputEmbeds && !f.imageMask;
+                if (lookahead) {
+                    auto &state = *segments[0].state;
+                    auto pending = std::move(state.engramPrefetch);
+                    const int start = segments[0].startPos;
+                    const int lo = start - snapshots[0].startPos;
+                    const int hi = start + seqlen;
+                    lookahead = lo >= 0 && hi <= int(state.engramPrompt.size()) &&
+                        std::equal(snapshots[0].history.begin(), snapshots[0].history.end(),
+                                   state.engramPrompt.begin() + lo);
+                    if (!lookahead) state.engramPrompt.clear();
+                    if (lookahead && pending && pending->startPos == start && pending->total == seqlen &&
+                        pending->engramLayerIndex == int(i) && pending->endLayer == end &&
+                        pending->snapshots.size() == 1 &&
+                        pending->snapshots[0].startPos == snapshots[0].startPos &&
+                        pending->snapshots[0].history == snapshots[0].history) {
+                        f.engramPrefetch = std::move(pending);
+                    }
+                }
+                if (!f.engramPrefetch) {
+                    f.engramPrefetch = std::make_shared<EngramPrefetch>(end, std::move(snapshots));
+                    f.engramPrefetch->Start(int(i), seqlen, engramMeta, engram_max_ngram_size,
+                                           engram_n_heads, table);
+                }
+                f.engramPrefetch->lookahead = lookahead;
                 break;
             }
         }
@@ -5561,7 +5832,21 @@ namespace fastllm {
         // 图模式下这些张量来自常驻工作区，地址必须在两次 decode 之间保持不变。
         Data &hiddenStates = ws->hiddenStates;
         Data &hiddenTemp = ws->hiddenTemp;
-        if (f.prefill && f.prefill->firstLayer > 0) {
+        if (f.pipeline && f.pipeline->previous) {
+#ifdef USE_CUDA
+            auto &source = *f.pipeline->previous;
+            FastllmCudaSetDevice(f.pipeline->device);
+            FastllmCudaCurrentThreadStreamWaitEvent(source.ready);
+            auto receive = [&](Data &dst, const Data &src) {
+                dst.dataType = src.dataType; dst.UpdateUnitSize(); dst.Resize(src.dims);
+                dst.ToDevice(CUDA, {f.pipeline->device}, false); dst.Allocate();
+                AssertInFastLLM(FastllmCudaMemcpyPeerAsyncCurrentThread(f.pipeline->device,
+                    dst.cudaData, source.device, src.cudaData, src.GetBytes()), "PP decode handoff failed");
+            };
+            receive(hiddenStates, source.hidden);
+            receive(ws->preMix, source.pre);
+#endif
+        } else if (f.prefill && f.prefill->firstLayer > 0) {
             Data view;
             view.FakeFrom(*f.prefill->payload, 0);
             view.Resize({1, seqlen, hc_mult, dim});
@@ -5605,7 +5890,9 @@ namespace fastllm {
         Data &preMix = ws->preMix;
         // 内容是常量 one-hot，长度没变就不重建：CopyFrom 会先把它搬回 CPU 再搬上卡，
         // 每次换一个设备地址，图就废了。
-        if (f.prefill && f.prefill->firstLayer > 0) {
+        if (f.pipeline && f.pipeline->previous) {
+            // Received with hiddenStates; preserve the preceding stage's HC pre.
+        } else if (f.prefill && f.prefill->firstLayer > 0) {
             Data view;
             view.FakeFrom(*f.prefill->payload, uint64_t(seqlen) * hc_mult * dim * 2);
             view.dataType = FLOAT32;
@@ -5656,16 +5943,13 @@ namespace fastllm {
         if (graphReplay) {
             std::vector<const void*> current;
             CollectForwardGraphPointers(f, current);
-            const int invalidateEvery = V41DecodeCudaGraphInvalidateEvery();
             ++graphState->replayCount;
-            const bool forceInvalidate = invalidateEvery > 0 &&
-                                         graphState->replayCount % invalidateEvery == 0;
-            if (forceInvalidate || current != graphState->boundaryPointers) {
+            if (current != graphState->boundaryPointers) {
                 graphState->DestroyCapturedGraph();
                 graphState->recaptureCount++;
                 graphReplay = false;
                 if ((!v41CudaGraphWarmingUp && !f.dsparkVerify) ||
-                    (graphState->recaptureCount > 3 && !forceInvalidate)) {
+                    graphState->recaptureCount > 3) {
                     graphState->disabled = true;
                 }
                 if (V41DecodeCudaGraphVerbose()) {
@@ -5684,17 +5968,14 @@ namespace fastllm {
 
         // Both native CUDA score transformation and TopK iterate over the
         // expert dimension; 384 experts do not require a host round-trip.
-        cudaRouteCapturable =
-            V41EnvFlag("FASTLLM_DSV41_CUDA_GRAPH_FORCE_ROUTE_CAPTURE") ||
-            (!hasImageTokens && num_experts > 0 && num_experts_per_tok <= 50 &&
-             !V41EnvFlag("FASTLLM_DSV41_DISABLE_CUDA_ROUTE"));
+        cudaRouteCapturable = !hasImageTokens && num_experts > 0 && num_experts_per_tok <= 50 &&
+            !V41EnvFlag("FASTLLM_DSV41_DISABLE_CUDA_ROUTE");
 
 #ifdef USE_CUDA
         // Only the fully GPU, ordinary decode path has worker-only graph
         // boundaries. CPU experts, speculative feature copies, packed KV and
         // partially captured graphs keep the conservative caller-stream order.
         f.workerOrderedGraphReplay = graphReplay && tp && f.tpAttention &&
-            V41DecodeCudaGraphReplayMask() == 15 &&
             executionMode == ExecutionMode::Gpu && !v41DsparkEnabled &&
             !f.quantKV && cudaRouteCapturable &&
             std::all_of(f.inputSegments.begin(), f.inputSegments.end(),
@@ -6054,12 +6335,16 @@ namespace fastllm {
 #ifdef USE_CUDA
                     // Later layers may replace this workspace allocation.
                     // Graph kernels retain the output address captured here.
-                    meta.kvOutputs.clear();
-                    if (tp) {
-                        for (int device : tpDevices)
-                            meta.kvOutputs.push_back(kv.multiDeviceDatas.at(device)->cudaData);
-                    } else {
-                        meta.kvOutputs.push_back(kv.cudaData);
+                    auto remember = [&](Data &data, std::vector<void *> &pointers) {
+                        pointers.clear();
+                        if (tp) for (int device : tpDevices)
+                            pointers.push_back(data.multiDeviceDatas.at(device)->cudaData);
+                        else pointers.push_back(data.cudaData);
+                    };
+                    remember(kv, meta.kvOutputs);
+                    if (ratio > 0 && isKvSource[layer]) {
+                        remember(rawKVAll, meta.rawKVOutputs);
+                        if (ratio > 1) remember(rawScoreAll, meta.rawScoreOutputs);
                     }
 #endif
                     meta.qIdxDims = qIdxAll.dims;
@@ -6072,22 +6357,24 @@ namespace fastllm {
                         kv.Reshape(meta.kvDims);
                     }
 #ifdef USE_CUDA
-                    if (tp) {
-                        bool moved = false;
-                        if (meta.kvOutputs.size() == tpDevices.size()) {
+                    auto restoreOutput = [&](Data &data, const std::vector<void *> &pointers) {
+                        if (pointers.empty()) return;
+                        if (tp) {
+                            bool moved = false;
                             for (size_t rank = 0; rank < tpDevices.size(); ++rank)
-                                moved |= kv.multiDeviceDatas.at(tpDevices[rank])->cudaData != meta.kvOutputs[rank];
-                        }
-                        if (moved) {
-                            MultiCudaRunDeviceCallbacks(tpDevices, [&](int rank, int device) {
-                                Data &local = *kv.multiDeviceDatas.at(device);
-                                if (local.cudaData != meta.kvOutputs[rank])
-                                    FastllmCudaCopyFromDeviceToDevice(local.cudaData, meta.kvOutputs[rank], local.GetBytes());
+                                moved |= data.multiDeviceDatas.at(tpDevices[rank])->cudaData != pointers.at(rank);
+                            if (moved) MultiCudaRunDeviceCallbacks(tpDevices, [&](int rank, int device) {
+                                Data &local = *data.multiDeviceDatas.at(device);
+                                if (local.cudaData != pointers[rank])
+                                    FastllmCudaCopyFromDeviceToDevice(local.cudaData, pointers[rank], local.GetBytes());
                             });
+                        } else if (data.cudaData != pointers[0]) {
+                            FastllmCudaCopyFromDeviceToDevice(data.cudaData, pointers[0], data.GetBytes());
                         }
-                    } else if (meta.kvOutputs.size() == 1 && kv.cudaData != meta.kvOutputs[0]) {
-                        FastllmCudaCopyFromDeviceToDevice(kv.cudaData, meta.kvOutputs[0], kv.GetBytes());
-                    }
+                    };
+                    restoreOutput(kv, meta.kvOutputs);
+                    restoreOutput(rawKVAll, meta.rawKVOutputs);
+                    restoreOutput(rawScoreAll, meta.rawScoreOutputs);
 #endif
                     if (!meta.qIdxDims.empty() && qIdxAll.dims != meta.qIdxDims) {
                         qIdxAll.Reshape(meta.qIdxDims);
@@ -6601,12 +6888,18 @@ namespace fastllm {
 #endif
 #if defined(USE_CUDA) && defined(FASTLLM_ENABLE_CUTLASS_MXFP8_SM120)
             // V4.1's inverse-RoPE output is already quantized in blocks of 32.
-            // Its loader preserves WoA as BF16: the fast path verifies an exact
-            // FP8 reconstruction once, otherwise retaining the BF16 fallback.
+            // Compact weights use checkpoint FP8 bytes directly. Other layouts
+            // still verify an exact reconstruction of their BF16 weights.
             if (!referenceWoA && !tp && !V41ReferenceMathEnabled() &&
                 !V41EnvFlag("FASTLLM_DSV41_DISABLE_FAKE_QUANT") &&
                 quantizedLinearNames.count(pre + ".attn.wo_a.weight"))
                 referenceWoA = FastllmCudaTryMxfp8WoA(*attnOutAll,
+                    weight[pre + ".attn.wo_a.weight"], o_groups, o_lora_rank, woAOut);
+#endif
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+            if (!referenceWoA && !tp && !V41ReferenceMathEnabled() &&
+                weight[pre + ".attn.wo_a.weight"].dataType == DataType::FP8_E4M3)
+                referenceWoA = FastllmCudaDeepSeekV41CompactWoA(*attnOutAll,
                     weight[pre + ".attn.wo_a.weight"], o_groups, o_lora_rank, woAOut);
 #endif
             if (!referenceWoA) DeepSeekV4WoA(*attnOutAll, weight[pre + ".attn.wo_a.weight"], o_groups, o_lora_rank, woAOut);
@@ -6833,7 +7126,9 @@ namespace fastllm {
         auto &ffnPost = ws->ffnPost;
         auto &ffnComb = ws->ffnComb;
         auto &ffnInput = ws->ffnInput;
-        auto &ffnOut = ws->ffnOut;
+        auto &ffnOut = executionMode == ExecutionMode::Hybrid && f.tp &&
+            V41DeviceSpecUsesType(SelectMoeDeviceForLayer(layer), "multicuda")
+            ? ws->residentFfnOut : ws->ffnOut;
         auto &expertIndex = ws->expertIndex;
         auto &expertScore = ws->expertScore;
         auto &sharedExpertOut = ws->sharedExpertOut;
@@ -6932,7 +7227,10 @@ namespace fastllm {
             }
             return acc;
         };
-        if (moeStep) moeStep->Finish();
+        if (moeStep && f.pipeline) {
+            f.pipeline->step = std::make_unique<HybridMoeDecodeStep>(std::move(*moeStep));
+            moeStep.reset();
+        } else if (moeStep) moeStep->Finish();
 #ifdef USE_CUDA
         if (f.prefill && !f.prefill->sampleOutput) {
             auto &payload = *f.prefill->payload;
@@ -6958,6 +7256,8 @@ namespace fastllm {
         // ---- 收尾：结束捕获 / 累计预热轮次 ----
         if (graphState) {
             if (graphCapture) {
+                if (f.pipeline && graphState->segments.size() == size_t(f.pipeline->endLayer * 4))
+                    graphState->segments.resize(block_cnt * 4);
                 bool ok = !graphState->captureFailed &&
                           (int)graphState->segments.size() == kV41GraphSegmentsPerLayer * block_cnt &&
                           !FastllmCudaGetThreadError() && !FastllmCudaGetGraphError();
@@ -6987,6 +7287,20 @@ namespace fastllm {
                 graphState->warmupRounds++;
             }
         }
+        if (f.pipeline && f.pipeline->endLayer < block_cnt) {
+            // Graph-owned operands remain valid after this ForwardWorkspace.
+            // A disabled graph retains its workspace for the same ownership rule.
+            AssertInFastLLM(f.ws != &f.localWorkspace && f.graphState,
+                            "PP decode requires persistent stage workspace");
+            f.pipeline->hidden.FakeFrom(*curHidden, 0);
+            f.pipeline->hidden.Resize(curHidden->dims);
+            f.pipeline->pre.FakeFrom(*preMixPtr, 0);
+            f.pipeline->pre.Resize(preMixPtr->dims);
+            if (!graphState->stageReady) graphState->stageReady = FastllmCudaEventCreate();
+            f.pipeline->ready = graphState->stageReady;
+            FastllmCudaEventRecordCurrentThread(f.pipeline->ready);
+            return {-1};
+        }
 #endif
 
         // ---- DSpark 校验片段：计算每个位置的目标 logits ----
@@ -7015,19 +7329,19 @@ namespace fastllm {
                 DsparkMaskToolLogits(*verifyLogits, sampling, segments[0].spec->draftTokens);
                 TopK(*verifyLogits, topk, 1);
                 topk.ToDevice(DataDevice::CPU);
-#ifdef USE_CUDA
-                // Full verification joins every rank's completion event onto
-                // this stream. The blocking readback has drained that join,
-                // so frame teardown needs no second device-wide barrier.
-                if (f.fullGraphLogits && f.tpDecodeDispatch && !FastllmCudaGetThreadError())
-                    f.tpDecodeDispatch->MarkDeviceWorkComplete();
-#endif
                 const int stride = topk.dims[topk.dims.size() - 1];
                 const float *topkData = (const float*)topk.cpuData;
                 for (int i = 0; i < seqlen; i++) {
                     segments[0].spec->tokens[i] = (int)(topkData[(uint64_t)i * stride] + 1e-3);
                 }
             }
+#ifdef USE_CUDA
+            // Both samplers finish with a blocking result readback. Full
+            // verification joins every rank onto that stream before sampling,
+            // so teardown needs no second device-wide barrier.
+            if (f.fullGraphLogits && f.tpDecodeDispatch && !FastllmCudaGetThreadError())
+                f.tpDecodeDispatch->MarkDeviceWorkComplete();
+#endif
             for (auto &seg : segments) {
                 seg.state->totalLen += seg.seqlen;
             }
@@ -7085,7 +7399,8 @@ namespace fastllm {
             preserveHeadLogits = true;
         }
 #endif
-        if (!precomputedHeadLogits && weight["head.weight"].dataType == DataType::FLOAT32) {
+        if (!precomputedHeadLogits && (weight["head.weight"].dataType == DataType::FLOAT32 ||
+            (weight["head.weight"].dataType == DataType::BFLOAT16 && !quantizedLinearNames.count("head.weight")))) {
             V41RMSNormBF16(headInput, weight["norm.weight"], rms_norm_eps, referenceHeadNorm);
             if (!TryBFloat16HeadLinear(referenceHeadNorm, referenceHeadLogits)) {
                 ToDataType(referenceHeadNorm, DataType::FLOAT32);
@@ -7161,7 +7476,9 @@ namespace fastllm {
 #ifdef USE_CUDA
                 // Verification owns matching gate/up intermediate channels.
                 // Down emits FP32 partials to merge into the routed reduction.
-                if (f.captureGpuMoeTogether && f.tp && f.single && f.dsparkVerify &&
+                // Only RunGpuMoe consumes deferred shared-expert partitions.
+                // Hybrid resident capture retains the replicated shared sum.
+                if (!f.residentMoeGraph && f.captureGpuMoeTogether && f.tp && f.single && f.dsparkVerify &&
                     seqlen >= 2 && seqlen <= 8 && !f.dumpDebug &&
                     !V41EnvFlag("FASTLLM_DSV41_REFERENCE_MATH") &&
                     quantizedLinearNames.count(pre + ".ffn.shared_experts.gateup.weight") &&
@@ -7213,7 +7530,7 @@ namespace fastllm {
                 Swiglu(ww3, ww1);
 #endif
 #ifdef USE_CUDA
-                if (sharedQuantized && f.captureGpuMoeTogether && f.tp && f.single &&
+                if (!f.residentMoeGraph && sharedQuantized && f.captureGpuMoeTogether && f.tp && f.single &&
                     (seqlen == 1 || (f.dsparkVerify && seqlen >= 2 && seqlen <= 8)) && !f.dumpDebug &&
                     quantizedLinearNames.count(pre + ".ffn.experts.0.w1.weight")) {
                     std::string main = SelectDeviceFromMap(deviceMap, layer + 1, block_cnt);
@@ -7369,7 +7686,7 @@ namespace fastllm {
                 &x, &attnInput, &qr, &qNorm, &q, &kv, &attnOut, &woAOut, &attnProj,
                 &rawKVAll, &rawScoreAll, &qIdxAll, &idxWeightsAll,
                 &ffnInput, &ws->ffnInputQuantized, &expertIndex, &expertScore, &ws->sharedExpertOut,
-                &ws->ffnOut, &ws->w1, &ws->w2, &ws->w3};
+                &ws->ffnOut, &ws->residentFfnOut, &ws->w1, &ws->w2, &ws->w3};
             for (const auto &entry : ws->reductionBuffers) tensors.push_back(&entry.second);
             for (const Data *data : tensors) {
                 out.push_back(data->cudaData);
@@ -7421,65 +7738,60 @@ namespace fastllm {
                 data->strides.clear();
             }
     }
-    void DeepSeekV41Model::RunForwardGraphSegment(ForwardWorkspace &f, const std::function<void()> &body, int index, bool capturable, const std::function<void(DeepSeekV41GraphSegmentMeta&)> &record, const std::function<void(const DeepSeekV41GraphSegmentMeta&)> &restore) {
-        auto &inputSegments = f.inputSegments;
-        auto &boundedPrefill = f.boundedPrefill;
-        auto &tailSegments = f.tailSegments;
+    void DeepSeekV41Model::RunForwardGraphSegment(
+            ForwardWorkspace &f, const std::function<void()> &body, int index, bool capturable,
+            const std::function<void(DeepSeekV41GraphSegmentMeta&)> &record,
+            const std::function<void(const DeepSeekV41GraphSegmentMeta&)> &restore) {
 #ifdef USE_CUDA
         auto &graphState = f.graphState;
         auto &graphReplay = f.graphReplay;
         auto &graphCapture = f.graphCapture;
         auto &graphPoolOpen = f.graphPoolOpen;
-#endif
-        const auto &segments = boundedPrefill ? tailSegments : inputSegments;
-#ifdef USE_CUDA
-            if (graphReplay) {
-                if ((V41DecodeCudaGraphReplayMask() & (1 << (index % kV41GraphSegmentsPerLayer))) == 0 ||
-                    (index < (int)graphState->segments.size() &&
-                     graphState->segments[index].passthrough)) {
-                    body();
-                    return;
-                }
-                if (index < (int)graphState->segments.size() &&
-                    V41LaunchGraphSegment(*graphState, index, f.workerOrderedGraphReplay)) {
-                    restore(graphState->segments[index]);
-                    return;
-                }
-                GiveUpForwardGraph(f, "replay");
+        if (graphReplay) {
+            if (index < (int)graphState->segments.size() &&
+                graphState->segments[index].passthrough) {
                 body();
                 return;
             }
-            if (graphCapture) {
-                if (!capturable) {
-                    // 占位段：逐算子跑，但要占住段号，回放时也走同一条路
-                    body();
-                    DeepSeekV41GraphSegment placeholder;
-                    placeholder.passthrough = true;
-                    graphState->segments.push_back(placeholder);
-                    record(graphState->segments.back());
-                    return;
-                }
-                if (index != V41DecodeCudaGraphFailAt() &&
-                    V41CaptureGraphSegment(*graphState, body)) {
-                    record(graphState->segments.back());
-                    return;
-                }
-                if (graphPoolOpen) {
-                    FastllmCudaGraphMemoryPoolAbort();
-                    graphPoolOpen = false;
-                }
-                GiveUpForwardGraph(f, "capture");
-                // 捕获时没有真正执行任何 kernel，输入也没被改动，直接逐算子重跑一遍。
-                body();
+            if (index < (int)graphState->segments.size() &&
+                V41LaunchGraphSegment(*graphState, index, f.workerOrderedGraphReplay)) {
+                restore(graphState->segments[index]);
                 return;
             }
-#else
-            (void)index;
-            (void)capturable;
-            (void)record;
-            (void)restore;
-#endif
+            GiveUpForwardGraph(f, "replay");
             body();
+            return;
+        }
+        if (graphCapture) {
+            if (!capturable) {
+                // 占位段：逐算子跑，但要占住段号，回放时也走同一条路
+                body();
+                DeepSeekV41GraphSegment placeholder;
+                placeholder.passthrough = true;
+                graphState->segments.push_back(placeholder);
+                record(graphState->segments.back());
+                return;
+            }
+            if (V41CaptureGraphSegment(*graphState, body)) {
+                record(graphState->segments.back());
+                return;
+            }
+            if (graphPoolOpen) {
+                FastllmCudaGraphMemoryPoolAbort();
+                graphPoolOpen = false;
+            }
+            GiveUpForwardGraph(f, "capture");
+            // 捕获时没有真正执行任何 kernel，输入也没被改动，直接逐算子重跑一遍。
+            body();
+            return;
+        }
+#else
+        (void)index;
+        (void)capturable;
+        (void)record;
+        (void)restore;
+#endif
+        body();
     }
     std::vector<int> DeepSeekV41Model::ForwardSegments(const std::vector<DeepSeekV41Segment> &inputSegments,
                                                        const Data &inputIds,

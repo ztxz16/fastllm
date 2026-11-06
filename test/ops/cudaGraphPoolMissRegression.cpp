@@ -287,6 +287,71 @@ bool RunPinnedWorkspaceOomRegression() {
     return passed;
 }
 
+bool RunCrossDeviceCapturePoolRegression(int deviceCount) {
+    if (deviceCount < 2) {
+        std::cout << "cross-device capture pool: SKIP (requires two GPUs)\n";
+        return true;
+    }
+    for (int source : {0, 1}) for (int rows : {1, 7, 32}) {
+        const int remote = 1 - source;
+        const size_t bytes = rows * 5120 * sizeof(unsigned short);
+        std::vector<unsigned char> input(bytes), output(bytes);
+        void *local = nullptr, *result = nullptr;
+        FastllmCudaSetDevice(source);
+        if (cudaMalloc(&local, bytes) != cudaSuccess ||
+            cudaMalloc(&result, bytes) != cudaSuccess) return false;
+        void *ready = FastllmCudaEventCreate();
+        FastllmCudaSetDevice(remote);
+        void *done = FastllmCudaEventCreate();
+        void *scratch = FastllmCudaMalloc(bytes);
+        if (!scratch) return false;
+        FastllmCudaFree(scratch);
+        if (!FastllmCudaGraphPrepareCaptureDevice()) return false;
+        FastllmCudaSetDevice(source);
+        if (FastllmCudaGraphJoinCapture() || !FastllmCudaGraphMemoryPoolBegin() ||
+                !FastllmCudaGraphBeginCapture()) return false;
+        FastllmCudaEventRecordCurrentThread(ready);
+        FastllmCudaSetDevice(remote);
+        FastllmCudaCurrentThreadStreamWaitEvent(ready);
+        if (!FastllmCudaGraphJoinCapture()) return false;
+        scratch = FastllmCudaMalloc(bytes);
+        if (!scratch || !FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(scratch, local, bytes) ||
+                !FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(result, scratch, bytes)) return false;
+        FastllmCudaFree(scratch);
+        FastllmCudaEventRecordCurrentThread(done);
+        FastllmCudaSetDevice(source);
+        FastllmCudaCurrentThreadStreamWaitEvent(done);
+        void *graph = nullptr, *exec = nullptr;
+        std::vector<void *> pins;
+        if (!FastllmCudaGraphEndCapture(&graph) || !FastllmCudaGraphMemoryPoolEnd(pins) ||
+                std::find(pins.begin(), pins.end(), scratch) == pins.end() ||
+                !FastllmCudaGraphInstantiate(graph, &exec)) return false;
+        for (int step = 0; step < 20; ++step) {
+            // Pressure on the remote pool must not reuse the captured address.
+            FastllmCudaSetDevice(remote);
+            void *other = FastllmCudaMalloc(bytes);
+            if (!other || other == scratch || cudaMemset(other, 0x5a, bytes) != cudaSuccess) return false;
+            FastllmCudaFree(other);
+            FastllmCudaSetDevice(source);
+            for (size_t i = 0; i < bytes; ++i) input[i] = (i + 13 * step) % 251;
+            if (cudaMemcpy(local, input.data(), bytes, cudaMemcpyHostToDevice) != cudaSuccess ||
+                    !FastllmCudaGraphLaunch(exec) ||
+                    cudaStreamSynchronize(cudaStreamPerThread) != cudaSuccess ||
+                    cudaMemcpy(output.data(), result, bytes, cudaMemcpyDeviceToHost) != cudaSuccess ||
+                    input != output) return false;
+        }
+        FastllmCudaGraphExecDestroy(exec);
+        FastllmCudaGraphDestroy(graph);
+        FastllmCudaGraphMemoryPoolRelease(pins);
+        FastllmCudaEventDestroy(ready);
+        FastllmCudaEventDestroy(done);
+        cudaFree(local); cudaFree(result);
+    }
+    FastllmCudaSetDevice(0);
+    std::cout << "cross-device capture pool: PASS (120 dynamic replays, two directions, pinned scratch)\n";
+    return true;
+}
+
 }  // namespace
 
 int main() {
@@ -457,6 +522,7 @@ int main() {
     if (!RunPinnedWorkspaceOomRegression()) {
         return 22;
     }
+    if (!RunCrossDeviceCapturePoolRegression(deviceCount)) return 24;
 
     size_t freeBytes = 0, totalBytes = 0;
     if (cudaMemGetInfo(&freeBytes, &totalBytes) != cudaSuccess ||

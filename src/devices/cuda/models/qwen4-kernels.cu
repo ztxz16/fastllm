@@ -1,3 +1,4 @@
+#include "devices/cuda/fastllm-cuda-conv.cuh"
 #include "fastllm-cuda.cuh"
 #include "devices/cuda/fastllm-cuda-hybrid-dsa.h"
 #include "fastllm-cuda-rope.cuh"
@@ -1199,11 +1200,7 @@ namespace {
         stateRow[kernel - 1] =
             Qwen4CudaLoadActivation(input, inputType, item);
         const float *weightRow = weight + (uint64_t)channel * kernel;
-        float value = 0.0f;
-        #pragma unroll
-        for (int tap = 0; tap < kernel; tap++) {
-            value += stateRow[tap] * weightRow[tap];
-        }
+        float value = fastllm::cuda_conv::Dot<float, float, false>(stateRow, weightRow, kernel);
         if (silu) {
             value = value / (1.0 + expf(-value));
         }
@@ -1225,21 +1222,47 @@ namespace {
             const float *weightRow = weight + (uint64_t)channel * kernel;
             const float *stateRow = state +
                 ((uint64_t)batch * channels + channel) * kernel;
-            float value = 0.0f;
-            for (int tap = 0; tap < kernel; tap++) {
-                const int sourceToken = token - kernel + 1 + tap;
-                const float sample = sourceToken >= 0
-                    ? Qwen4CudaToFloat(input[
-                          ((uint64_t)batch * sequence + sourceToken) *
-                              channels + channel])
-                    : stateRow[kernel + sourceToken];
-                value += sample * weightRow[tap];
-            }
+            float value = fastllm::cuda_conv::At<T, float, float, false>(
+                input + (uint64_t)batch * sequence * channels + channel,
+                stateRow, weightRow, token, channels, kernel, kernel);
             if (silu) {
                 // Keep bitwise parity with FastllmSiluKernel(float).
                 value = value / (1.0 + expf(-value));
             }
             output[item] = Qwen4CudaCastFromFloat<OutputT>(value);
+        }
+    }
+
+    // Reuse the three preceding samples and four weights across four tokens.
+    // Arithmetic order and FP32 history match the general convolution kernel.
+    template <typename InputT, typename OutputT>
+    __global__ void CausalDepthwiseConv1DPrefillTiled4Kernel(
+            const InputT *input, const float *weight, const float *state,
+            OutputT *output, int sequence, int channels, int tiles) {
+        const int channel = blockIdx.x * blockDim.x + threadIdx.x;
+        if (channel >= channels) return;
+        const int batch = blockIdx.y / tiles, begin = (blockIdx.y % tiles) * 4;
+        const InputT *x = input + uint64_t(batch) * sequence * channels + channel;
+        const float *history = state + (uint64_t(batch) * channels + channel) * 4;
+        const float *w = weight + uint64_t(channel) * 4;
+        const float w0 = w[0], w1 = w[1], w2 = w[2], w3 = w[3];
+        float a = begin < 3 ? history[begin + 1] : Qwen4CudaToFloat(x[uint64_t(begin - 3) * channels]);
+        float b = begin < 2 ? history[begin + 2] : Qwen4CudaToFloat(x[uint64_t(begin - 2) * channels]);
+        float c = begin < 1 ? history[begin + 3] : Qwen4CudaToFloat(x[uint64_t(begin - 1) * channels]);
+        #pragma unroll
+        for (int offset = 0; offset < 4; ++offset) {
+            const int token = begin + offset;
+            if (token >= sequence) break;
+            const float d = Qwen4CudaToFloat(x[uint64_t(token) * channels]);
+            float value = fastllm::cuda_conv::Accumulate<InputT, false>(0.f, a, w0);
+            value = fastllm::cuda_conv::Accumulate<InputT, false>(value, b, w1);
+            value = fastllm::cuda_conv::Accumulate<InputT, false>(value, c, w2);
+            value = fastllm::cuda_conv::Accumulate<InputT, false>(value, d, w3);
+            // Match the existing promoted denominator and final dtype cast.
+            value = fastllm::cuda_conv::SiluPromoted(value);
+            output[(uint64_t(batch) * sequence + token) * channels + channel] =
+                Qwen4CudaCastFromFloat<OutputT>(value);
+            a = b; b = c; c = d;
         }
     }
 
@@ -1281,7 +1304,15 @@ namespace {
             int stateItems, int stateBlocks,
             int sequence, int channels, int kernel, bool silu) {
         constexpr int threads = 256;
-        CausalDepthwiseConv1DPrefillKernel<InputT, OutputT><<<
+        const int tiles = (sequence + 3) / 4;
+        if (kernel == 4 && silu && sequence >= 64 &&
+            uint64_t(input.dims[0]) * tiles <= 65535) {
+            CausalDepthwiseConv1DPrefillTiled4Kernel<InputT, OutputT><<<
+                dim3((channels + threads - 1) / threads, input.dims[0] * tiles), threads, 0, cudaStreamPerThread>>>(
+                    (const InputT *)input.cudaData, (const float *)weight.cudaData,
+                    (const float *)state.cudaData, (OutputT *)output.cudaData,
+                    sequence, channels, tiles);
+        } else CausalDepthwiseConv1DPrefillKernel<InputT, OutputT><<<
             outputBlocks, threads, 0, cudaStreamPerThread>>>(
                 (const InputT*)input.cudaData,
                 (const float*)weight.cudaData,
@@ -5205,6 +5236,83 @@ bool FastllmCudaQwen4ReplayLinearAttentionBatch(
     return cudaGetLastError() == cudaSuccess;
 }
 
+bool FastllmCudaQwen4CausalPrefill(const fastllm::Data &query, const fastllm::Data &key,
+        const fastllm::Data &value, const fastllm::Data &indices,
+        fastllm::Data &output, int groups, float scale, int previousLength,
+        int denseContextLimit) {
+#if defined(USE_ROCM) || defined(CUDA_NO_TENSOR_CORE)
+    return false;
+#else
+    using namespace fastllm;
+    if (query.dataType != FLOAT16 || key.dataType != FLOAT16 || value.dataType != FLOAT16 ||
+        indices.dataType != INT32 || query.dims.size() != 3 || key.dims.size() != 3 ||
+        value.dims != key.dims || indices.dims.size() != 2 || groups <= 0 ||
+        query.dims[0] != key.dims[0] * groups || query.dims[2] != key.dims[2] ||
+        query.dims[1] != indices.dims[0] || query.dims[2] <= 0 || query.dims[2] > 256 ||
+        query.dims[2] % 16 || indices.dims[1] <= 0 || indices.dims[1] > 3072 ||
+        query.dataDevice != CUDA || key.dataDevice != CUDA || value.dataDevice != CUDA ||
+        indices.dataDevice != CUDA || !query.cudaData || !key.cudaData || !value.cudaData ||
+        !indices.cudaData || previousLength < 0 || denseContextLimit <= previousLength ||
+        denseContextLimit > 4096 || key.dims[1] != previousLength + query.dims[1] ||
+        query.strides != std::vector<uint64_t>({uint64_t(query.dims[1]) * query.dims[2],
+            uint64_t(query.dims[2]), 1}) ||
+        indices.strides != std::vector<uint64_t>({uint64_t(indices.dims[1]), 1}) ||
+        FastllmCudaGraphIsCapturingFast()) return false;
+    const int prefix = denseContextLimit - previousLength, rows = query.dims[1];
+    if (prefix < 32 || rows - prefix < 32) return false;
+    const int heads = query.dims[0], dim = query.dims[2], width = indices.dims[1];
+    const int device = FastllmCudaGetDevice();
+    const auto stream = cudaStreamPerThread;
+    auto allocate = [&](Data &data) {
+        data.cudaWorkspace = query.cudaWorkspace;
+        data.dataDevice = CUDA;
+        data.dataDeviceIds = {device};
+        data.Allocate(false);
+    };
+    output.dataType = FLOAT16;
+    output.UpdateUnitSize();
+    output.Resize(query.dims);
+    output.dataDevice = CUDA;
+    output.dataDeviceIds = {device};
+    output.Allocate(false);
+    for (int part = 0; part < 2; ++part) {
+        const int start = part ? prefix : 0, n = part ? rows - prefix : prefix;
+        Data q(FLOAT16, {heads, n, dim}), result(FLOAT16, {heads, n, dim});
+        allocate(q); allocate(result);
+        AssertInFastLLM(cudaMemcpy2DAsync(q.cudaData, size_t(n) * dim * 2,
+            static_cast<const half *>(query.cudaData) + size_t(start) * dim,
+            size_t(rows) * dim * 2, size_t(n) * dim * 2, heads,
+            cudaMemcpyDeviceToDevice, stream) == cudaSuccess, "QSA query slice failed");
+        Data selected(INT32, {n, width}, CUDA,
+            static_cast<int32_t *>(indices.cudaData) + size_t(start) * width);
+        selected.cudaDataBorrowed = true;
+        selected.dataDeviceIds = {device};
+        if (part == 0) {
+            Data prefixIds(INT32, {1, denseContextLimit});
+            prefixIds.Allocate();
+            for (int i = 0; i < denseContextLimit; ++i) ((int32_t *)prefixIds.cpuData)[i] = i;
+            prefixIds.ToDevice(CUDA, std::vector<int>{device});
+            Data k(FLOAT16, {key.dims[0], denseContextLimit, dim}), v(FLOAT16, k.dims);
+            Data mask(FLOAT16, {1, n, denseContextLimit});
+            allocate(k); allocate(v); allocate(mask);
+            // Gather logical KV rows: this also handles paged and host-tiered caches.
+            if (!FastllmCudaQwen4GatherKV(key, value, prefixIds, k, v)) return false;
+            AssertInFastLLM(FastllmCudaQwen4QSABuildMask(selected, q, mask, denseContextLimit),
+                           "QSA prefix mask failed");
+            if (!FastllmCudaHalfAttention(q, k, v, mask, result, groups, scale, 1)) return false;
+        } else if (!FastllmCudaQwen4SparsePrefill(q, key, value, selected, result, groups, scale)) {
+            return false;
+        }
+        AssertInFastLLM(cudaMemcpy2DAsync(static_cast<half *>(output.cudaData) + size_t(start) * dim,
+            size_t(rows) * dim * 2, result.cudaData, size_t(n) * dim * 2,
+            size_t(n) * dim * 2, heads, cudaMemcpyDeviceToDevice, stream) == cudaSuccess,
+            "QSA output slice failed");
+        FastllmCudaSyncCurrentThreadStream();
+    }
+    return true;
+#endif
+}
+
 bool FastllmCudaQwen4SparsePrefill(const fastllm::Data &query, const fastllm::Data &key,
                                    const fastllm::Data &value, const fastllm::Data &indices,
                                    fastllm::Data &output, int groups, float scale) {
@@ -5266,11 +5374,7 @@ bool FastllmCudaQwen4SparsePrefill(const fastllm::Data &query, const fastllm::Da
             tensor->dataDeviceIds = {device};
             tensor->Allocate(false);
         }
-        const uint64_t layerBytes = uint64_t(key.dims[0]) * key.dims[1] * dim * sizeof(half);
-        AssertInFastLLM(cudaMemcpyAsync(stagedKey.cudaData, tiered->hostKey, layerBytes,
-            cudaMemcpyHostToDevice, cudaStreamPerThread) == cudaSuccess &&
-            cudaMemcpyAsync(stagedValue.cudaData, tiered->hostValue, layerBytes,
-            cudaMemcpyHostToDevice, cudaStreamPerThread) == cudaSuccess,
+        AssertInFastLLM(tiered->StagePrefix(stagedKey.cudaData, stagedValue.cudaData, key.dims[1]),
             "Qwen4 KVMem prefill staging failed.");
     }
     output.Resize(query.dims);

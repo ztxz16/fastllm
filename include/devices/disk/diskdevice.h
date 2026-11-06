@@ -116,6 +116,20 @@ namespace fastllm {
                            Data &output, const std::function<void()> &sharedExpert = {});
     };
 
+    // Fixed-address V4.1 GGUF/native FP4 disk children owned by one CUDA stage.
+    // Launch leases cache records until the containing graph has retired.
+    class DiskMoeV41Graph {
+        struct Impl;
+        std::unique_ptr<Impl> impl;
+    public:
+        DiskMoeV41Graph();
+        ~DiskMoeV41Graph();
+        static bool Supports(const std::vector<Data *> &weights);
+        void *Add(const Data &input, const Data &index, const Data &score, Data &output,
+                  const std::vector<Data *> &weights, float limit);
+        bool Launch(const std::function<bool()> &launch);
+    };
+
     class DiskDevice : BaseDevice {
     public:
         DiskDevice();

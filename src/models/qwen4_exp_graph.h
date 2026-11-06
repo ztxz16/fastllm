@@ -1,6 +1,16 @@
 #pragma once
+#include <algorithm>
 #include "qwen4_exp.h"
+#include "utils/hybrid_moe.h"
 namespace fastllm {
+    // Attention work depends on the live context, never the full reserved KV
+    // arena. Coarse geometric widths bound recaptures and temporary memory.
+    inline int Qwen4DenseGraphWidth(int length, int sparseLimit) {
+        int width = 128;
+        while (width < length && width < sparseLimit) width *= 2;
+        return std::min(width, sparseLimit);
+    }
+
     struct Qwen4ExpModel::DecodeCudaGraphState {
         struct Segment {
             bool warmed = false;
@@ -32,10 +42,12 @@ namespace fastllm {
             Data attentionInput;
             Data attentionInjection;
             Data attentionOutput;
+            bool remoteGraphReported = false;
         };
         // CPU experts execute between dense graphs. Each boundary owns stable
         // storage, with dtype and shape established by its eager warmup.
         std::map<int, HybridBoundary> hybridBoundaries;
+        Data pleEmbedding;
         Data hiddenStates[2];
         Data attentionInput;
         Data attentionInjection;
@@ -50,6 +62,16 @@ namespace fastllm {
         std::map<int, Data> qsaTailPositionSnapshots;
         int32_t *pinnedDecodeMeta = nullptr;
         std::map<int, Segment> segments;
+        struct HybridFullGraph {
+#ifdef USE_CUDA
+            HybridMoeGraph graph;
+#endif
+            bool disabled = false;
+        };
+        // Each QSA remainder owns a composition of the existing dense graphs
+        // and shared-backend MoE children; their source storage stays alive.
+        std::map<int, HybridFullGraph> hybridFullGraphs;
+
 
         // Layer 0 has no growing full-attention cache. Keep its TP graph
         // through backbone recaptures, but release it with the request slot.
@@ -60,6 +82,9 @@ namespace fastllm {
         // Verifier lengths alternate as the confidence threshold truncates
         // drafts. Each length owns its graph buffers and rollback captures.
         std::map<int, std::unique_ptr<DecodeCudaGraphState>> verifierLengths;
+        // PLE prefix commit can alternate its two persistent history buffers.
+        // Keep both address variants instead of recapturing every acceptance.
+        std::map<int, std::unique_ptr<DecodeCudaGraphState>> pleHistories;
         TargetVerificationCapture verification;
         // A short request keeps eager attention after crossing the sparse
         // threshold, preserving its original key order and reduction shape.
@@ -93,6 +118,7 @@ namespace fastllm {
         void RunGpuWholeBody();
         void PrepareHybridMask();
         void RunHybrid();
+        bool TryRunHybridFull();
         void RunHybridDenseBody(int layer);
         void RunHybridDensePrefix(int layer, Data &input, Data &injection);
         void RunHybridDenseSuffix(int layer, const Data &output, const Data &injection);

@@ -167,6 +167,14 @@ namespace fastllm {
         const int32_t *gpuIndices, const float *scores, int topk, int layer,
         const std::function<void()> &submitGpu, double *cpuElapsedUs);
 
+    // Native BF16 grouped experts: BF16 gate/up and activation, FP32 down
+    // accumulation, then score and BF16 rounding. Whole experts are assigned
+    // to one device for all rows; returns weighted per-route FP32 values.
+    void NumasMoeBF16Experts(const uint16_t *input, float *output, int rows,
+        Data **weights, int weightsBatch, const int32_t *indices,
+        const int32_t *gpuIndices, const float *scores, int topk, int layer,
+        const std::function<void()> &submitGpu = {});
+
     // V4.1 verifier: keep all rows for a CPU expert in one grouped GEMM.
     // perRoute returns BF16-rounded FP32 expert outputs at [row, route, hidden];
     // otherwise all routes must be on CPU and output is the usual BF16 sum.

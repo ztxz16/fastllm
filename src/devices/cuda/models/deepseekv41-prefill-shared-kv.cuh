@@ -4,7 +4,7 @@
 // registers, then staged through the same shared memory as the score tile.
 // Keep the existing two QK accumulators, 64-slot softmax (including holes),
 // BF16 probabilities, PV accumulation order and final attention sink.
-struct V41Sm120PrefillShared {
+struct V41PrefillSharedKV {
     __nv_bfloat16 kv[64][520];
     union {
         __nv_bfloat16 q[32][264];
@@ -16,7 +16,7 @@ struct V41Sm120PrefillShared {
 };
 
 __global__ void __launch_bounds__(512)
-V41SparseAttentionSm120PrefillKernel(
+V41SparseAttentionPrefillSharedKVKernel(
         const __nv_bfloat16 *q, const __nv_bfloat16 *chunk,
         const __nv_bfloat16 *ring, const __nv_bfloat16 *compressed,
         const uint8_t *ring8, const uint8_t *compressed8,
@@ -25,8 +25,8 @@ V41SparseAttentionSm120PrefillKernel(
         __nv_bfloat16 *output, int ringMode, int ringBytes,
         int cmpMode, int cmpBytes, int vecUnpack) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-    extern __shared__ char v41Sm120PrefillRaw[];
-    auto &sh = *reinterpret_cast<V41Sm120PrefillShared *>(v41Sm120PrefillRaw);
+    extern __shared__ char v41PrefillSharedKVRaw[];
+    auto &sh = *reinterpret_cast<V41PrefillSharedKV *>(v41PrefillSharedKVRaw);
     const int token = blockIdx.x, batch = token / rows, pos = start + token % rows;
     const int h0 = blockIdx.y * 32, tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
     constexpr int Warps = 16, Threads = Warps * 32, QueryItems = 1024 / Threads;

@@ -2,6 +2,8 @@
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/numas/numas.h"
 #include "devices/numas/numasdevice.h"
+#include "utils/hybrid_moe.h"
+#include <dirent.h>
 #include <sched.h>
 #include <cstdio>
 #include <cstdlib>
@@ -23,6 +25,18 @@ static std::pair<int, int> Core(int cpu) {
     std::ifstream package(path + "physical_package_id"), core(path + "core_id");
     Require(bool(package >> result.first) && bool(core >> result.second), "read CPU topology");
     return result;
+}
+
+static std::set<int> ThreadIds() {
+    DIR *directory = opendir("/proc/self/task");
+    Require(directory != nullptr, "list process threads");
+    std::set<int> ids;
+    while (auto *entry = readdir(directory)) {
+        int id = std::atoi(entry->d_name);
+        if (id > 0) ids.insert(id);
+    }
+    closedir(directory);
+    return ids;
 }
 
 int main() {
@@ -94,6 +108,41 @@ int main() {
         cpu_set_t after;
         Require(sched_getaffinity(0, sizeof(after), &after) == 0 && CPU_EQUAL(&after, &original),
                 "planning changed the submitting thread's affinity");
+        // A disk graph can lazily create unbound compute workers from a
+        // coordinator pinned to one core. Preserve the outer process mask.
+        std::exception_ptr failure;
+        int firstCpu = 0;
+        while (firstCpu < CPU_SETSIZE && !CPU_ISSET(firstCpu, &original)) ++firstCpu;
+        Require(firstCpu < CPU_SETSIZE, "empty process CPU set");
+        cpu_set_t scheduler; CPU_ZERO(&scheduler); CPU_SET(firstCpu, &scheduler);
+        Require(sched_setaffinity(0, sizeof(scheduler), &scheduler) == 0, "pin scheduler");
+        std::thread coordinator([&] {
+            try {
+                int cpu = 0;
+                while (cpu < CPU_SETSIZE && !CPU_ISSET(cpu, &original)) ++cpu;
+                Require(cpu < CPU_SETSIZE, "empty process mask");
+                cpu_set_t single; CPU_ZERO(&single); CPU_SET(cpu, &single);
+                Require(sched_setaffinity(0, sizeof(single), &single) == 0, "pin coordinator");
+                auto before = ThreadIds();
+                HostMoePlacementScope placement(true);
+                const int workers = GetNumaConfig()->threads;
+                int checked = 0;
+                for (int tid : ThreadIds()) if (!before.count(tid)) {
+                    cpu_set_t mask;
+                    Require(sched_getaffinity(tid, sizeof(mask), &mask) == 0, "read compute worker mask");
+                    Require(CPU_EQUAL(&mask, &original), "compute worker inherited coordinator mask");
+                    ++checked;
+                }
+                Require(checked == workers, "unbound worker pool was not exercised");
+                cpu_set_t mask;
+                Require(sched_getaffinity(0, sizeof(mask), &mask) == 0 && CPU_EQUAL(&mask, &single),
+                    "compute pool changed coordinator affinity");
+                std::printf("PASS unbound workers=%d preserve process affinity\n", checked);
+            } catch (...) { failure = std::current_exception(); }
+        });
+        coordinator.join();
+        Require(sched_setaffinity(0, sizeof(original), &original) == 0, "restore scheduler");
+        if (failure) std::rethrow_exception(failure);
         std::puts("ALL_PASS");
         return 0;
     } catch (const std::exception &error) {

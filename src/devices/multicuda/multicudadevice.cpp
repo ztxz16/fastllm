@@ -6,6 +6,7 @@
 #include "devices/cuda/cudadevice.h"
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/cuda/fastllm-cuda-linear-output.h"
+#include "devices/cuda/fastllm-draft-head.cuh"
 #include "devices/cuda/fastllm-cuda-dspark.h"
 #include "devices/cuda/fastllm-cuda-nvfp4-fused.h"
 #include "devices/cuda/fastllm-cuda-v41-gguf.h"
@@ -19,6 +20,7 @@
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -26,6 +28,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <set>
 #include <thread>
 #include <tuple>
@@ -609,10 +612,18 @@ namespace fastllm {
             return;
         }
 
-        // The caller (normally the scheduler thread) and the dedicated workers may use
-        // distinct internal streams.  Complete the producer side of the cross-thread handoff
-        // before workers consume pointers created by the caller's CUDA work.
+        // The caller and workers use distinct per-thread streams. A synchronous
+        // dispatch (e.g. output-gather after an async TP scope) must finish caller
+        // producers on every participating CUDA device, not just the current one.
+        // Waiting on workers after Run() cannot repair an earlier stale-input read.
+        const int producerDevice = FastllmCudaGetDevice();
         ForceDeviceSync();
+        for (int device : opDevices) {
+            if (device != producerDevice && IsDedicatedWorkerCudaDevice(device)) {
+                FastllmCudaSyncDevice(device);
+            }
+        }
+        FastllmCudaSetDevice(producerDevice);
         if (SubmitMultiCudaDeviceOps(opDevices, ops, workers, targetIds)) {
             WaitMultiCudaDeviceOps(workers, targetIds);
             return;
@@ -4111,7 +4122,8 @@ namespace fastllm {
         DataType type = DataType::FLOAT32;
         DivisionScheme ranges;
         int rows = 0, vocab = 0, width = 0;
-        struct Rank { Data input, output, packet, gathered, compactWeight; };
+        bool compact = false;
+        struct Rank { Data input, output, linearOutput, packet, gathered, compactWeight; };
         std::vector<std::unique_ptr<Rank>> ranks;
         Data result;
         void *ready = nullptr;
@@ -4128,9 +4140,14 @@ namespace fastllm {
         const Data *embed = nullptr, *head = nullptr;
         void *embedPointer = nullptr, *headPointer = nullptr;
         int rows = 0, vocab = 0;
+        bool sampling = false;
         std::vector<int> devices;
         DivisionScheme ranges;
-        struct Rank { Data embed, head, tokens, keys; int start = 0, count = 0; };
+        struct Rank {
+            Data embed, head, tokens, keys, partials, statistics, counter;
+            unsigned long long seed = 0;
+            int start = 0, count = 0;
+        };
         std::vector<std::unique_ptr<Rank>> ranks;
     };
 
@@ -4153,6 +4170,14 @@ namespace fastllm {
             request.tokens.strides[0] != 1 ||
             request.tokens.dims != std::vector<int>{rows + 1} || request.tokens.multiDeviceData ||
             !request.tokens.cudaData || GetPointerDeviceId(request.tokens.cudaData) != root) return nullptr;
+        if (request.proposalProbs) {
+            const auto &probs = *request.proposalProbs;
+            if (!std::isfinite(request.temperature) || request.temperature <= 0 ||
+                probs.dataType != DataType::FLOAT32 || probs.dataDevice != DataDevice::CUDA ||
+                probs.multiDeviceData || !probs.cudaData || GetPointerDeviceId(probs.cudaData) != root ||
+                probs.dims != std::vector<int>{rows, vocab} || probs.strides.size() != 2 ||
+                probs.strides[0] != vocab || probs.strides[1] != 1) return nullptr;
+        }
         for (int device : projection.devices) {
             const auto &ranges = projection.ranges.at(device);
             if (ranges.size() != 1 || ranges[0].first < 0 || ranges[0].second > vocab ||
@@ -4161,6 +4186,7 @@ namespace fastllm {
         auto state = std::static_pointer_cast<MultiCudaDsparkMarkovWorkspace>(request.workspace);
         if (state && (state->embed != &embed || state->head != &head || state->embedPointer != embed.cudaData ||
             state->headPointer != head.cudaData || state->rows != rows || state->vocab != vocab ||
+            state->sampling != (request.proposalProbs != nullptr) ||
             state->devices != projection.devices || state->ranges != projection.ranges)) return nullptr;
         auto allocate = [&](Data &data, DataType type, const std::vector<int> &dims, int device) {
             data.dataType = type; data.UpdateUnitSize(); data.Resize(dims);
@@ -4182,6 +4208,7 @@ namespace fastllm {
             state = std::make_shared<MultiCudaDsparkMarkovWorkspace>();
             state->embed = &embed; state->head = &head; state->embedPointer = embed.cudaData;
             state->headPointer = head.cudaData; state->rows = rows; state->vocab = vocab;
+            state->sampling = request.proposalProbs != nullptr;
             state->devices = projection.devices; state->ranges = projection.ranges;
             FastllmCudaSetDevice(root); FastllmCudaSyncCurrentThreadStream();
             for (int device : projection.devices) {
@@ -4198,7 +4225,14 @@ namespace fastllm {
                         rowBytes, rowBytes, embed.dims[0], device, root);
                 }
                 allocate(rank->head, DataType::BFLOAT16, {rank->count, 256}, device);
-                allocate(rank->keys, DataType::INT8, {rows * (int)sizeof(unsigned long long)}, device);
+                if (state->sampling) {
+                    static thread_local std::mt19937_64 rng(std::random_device{}());
+                    rank->seed = rng();
+                    allocate(rank->partials, DataType::FLOAT32, {(rank->count + 63) / 64, 4}, device);
+                    allocate(rank->statistics, DataType::FLOAT32, {(int)projection.devices.size(), 4}, device);
+                    allocate(rank->counter, DataType::INT8, {(int)sizeof(unsigned long long)}, device);
+                    FastllmCudaMemset0(rank->counter.cudaData, rank->counter.GetBytes());
+                } else allocate(rank->keys, DataType::INT8, {rows * (int)sizeof(unsigned long long)}, device);
                 FastllmCudaMemcpy2DDeviceToDeviceAuto(rank->head.cudaData, rowBytes,
                     (const char*)head.cudaData + (size_t)rank->start * rowBytes,
                     rowBytes, rowBytes, rank->count, device, root);
@@ -4213,12 +4247,12 @@ namespace fastllm {
 
     bool MultiCudaLinearOutputGatherPersistent(Data &input, Data &weight, Data &output,
                                                std::shared_ptr<void> &workspace,
-                                               MultiCudaDsparkMarkovRequest *markov) {
+                                               MultiCudaDsparkMarkovRequest *markov, bool draftFp8) {
         if (markov) markov->completed = false;
         if (input.multiDeviceData || input.dataDevice != DataDevice::CUDA || !input.cudaData ||
             input.dims.empty() || weight.dims.size() != 2 || input.dims.back() != weight.dims[1] ||
             (input.dataType != DataType::FLOAT32 && input.dataType != DataType::BFLOAT16) ||
-            weight.dataType != DataType::FLOAT32 ||
+            (weight.dataType != DataType::FLOAT32 && weight.dataType != DataType::DATA_GGUF_FORMAT) ||
             MultiCudaEnvFlagEnabled("FASTLLM_DISABLE_NCCL")) return false;
         std::vector<int> devices; std::map<int, int> ratios;
         FastllmGetMulticudaDeviceAndRatio(devices, ratios, true);
@@ -4245,7 +4279,7 @@ namespace fastllm {
                 data.dataDevice = DataDevice::CUDA; data.dataDeviceIds = {device};
                 FastllmCudaSetDevice(device); data.Allocate(false);
             };
-            bool compact = input.dataType == DataType::BFLOAT16;
+            bool compact = input.dataType == DataType::BFLOAT16 && weight.dataType == DataType::FLOAT32;
             for (int device : devices) {
                 auto rank = std::make_unique<MultiCudaOutputGatherWorkspace::Rank>();
                 FastllmCudaSetDevice(device);
@@ -4255,13 +4289,16 @@ namespace fastllm {
             }
             // Remember an unsupported checkpoint in the same workspace so the
             // ordinary FP32 fallback does not retry a weight scan every token.
-            if (!compact) state->type = DataType::FLOAT32;
+            state->compact = compact;
+            if (!compact && weight.dataType != DataType::DATA_GGUF_FORMAT) state->type = DataType::FLOAT32;
             for (size_t index = 0; index < devices.size(); ++index) {
                 const int device = devices[index];
                 auto &rank = state->ranks[index];
                 if (!compact) rank->compactWeight.FreeSpace();
                 allocate(rank->input, input.dims, device, state->type);
                 allocate(rank->output, {state->rows, weight.multiDeviceDatas.at(device)->dims[0]}, device);
+                if (!compact && state->type == DataType::BFLOAT16)
+                    allocate(rank->linearOutput, rank->output.dims, device, state->type);
                 allocate(rank->packet, {state->rows, state->width}, device);
                 allocate(rank->gathered, {(int)devices.size(), state->rows, state->width}, device);
                 FastllmCudaMemset0(rank->packet.cudaData, rank->packet.GetBytes());
@@ -4280,17 +4317,50 @@ namespace fastllm {
             if (device == root) FastllmCudaCurrentThreadStreamWaitEvent(state->ready);
             FastllmNcclBroadcastFrom(input.cudaData, rank.input.cudaData, input.Count(0), input.dataType, root, device);
             Data &localWeight = *weight.multiDeviceDatas.at(device);
-            if (state->type == DataType::BFLOAT16) {
-                AssertInFastLLM(FastllmCudaBFloat16LinearFloat32(rank.input, rank.compactWeight, rank.output),
-                                "MultiCuda BF16 projection with FP32 output failed.");
+            if (state->compact) {
+                bool projected = false;
+#ifdef FASTLLM_ENABLE_CUTLASS_MXFP8_SM120
+                // Approximation is requested only by the draft caller. Target
+                // verification retains the original compact BF16 projection.
+                if (draftFp8) projected = FastllmCudaTryFp8DraftHead(
+                    rank.input, rank.compactWeight, rank.output);
+#endif
+                AssertInFastLLM(projected || FastllmCudaBFloat16LinearFloat32(
+                    rank.input, rank.compactWeight, rank.output),
+                    "MultiCuda BF16 projection with FP32 output failed.");
+            } else if (state->type == DataType::BFLOAT16) {
+                // Preserve the ordinary GGUF linear's activation/output dtype
+                // before gathering FP32 logits into the persistent buffer.
+                DoCudaLinear(rank.input, localWeight, *GetEmptyData(), rank.linearOutput);
+                FastllmBF16ToFloat(rank.linearOutput.cudaData, rank.output.cudaData, rank.linearOutput.Count(0));
             } else DoCudaLinear(rank.input, localWeight, *GetEmptyData(), rank.output);
             if (markovState) {
                 auto &chain = *markovState->ranks[index];
                 const void *embed = device == root ? markov->embed.cudaData : chain.embed.cudaData;
                 int *tokens = device == root ? (int*)markov->tokens.cudaData : (int*)chain.tokens.cudaData;
                 FastllmNcclBroadcastFrom(markov->tokens.cudaData, tokens, 1, DataType::INT32, root, device);
-                FastllmCudaMemset0(chain.keys.cudaData, chain.keys.GetBytes());
+                if (!markovState->sampling) FastllmCudaMemset0(chain.keys.cudaData, chain.keys.GetBytes());
                 for (int step = 0; step < state->rows; ++step) {
+                    if (markovState->sampling) {
+                        auto *statistics = (FastllmDsparkSamplePartial*)chain.statistics.cudaData;
+                        AssertInFastLLM(FastllmCudaDsparkMarkovShardSample((float*)rank.output.cudaData,
+                            embed, chain.head.cudaData, tokens, (float*)rank.packet.cudaData,
+                            device == root ? (float*)markov->outEmbeds.cudaData : nullptr,
+                            (FastllmDsparkSamplePartial*)chain.partials.cudaData, statistics + index,
+                            chain.seed, (unsigned long long*)chain.counter.cudaData,
+                            step, chain.start, chain.count, state->width, markov->temperature),
+                            "Markov shard sampling failed.");
+                        // Only 16 bytes per rank and step. Retain NCCL for
+                        // unsupported P2P topologies and uncalibrated devices.
+                        const int elements = (int)devices.size() * 4;
+                        AssertInFastLLM(FastllmCudaCustomAllGatherRows(statistics, elements, elements,
+                            DataType::FLOAT32, device) || FastllmNcclAllGather(statistics + index,
+                            statistics, 4, DataType::FLOAT32, device), "Markov statistics gather failed.");
+                        AssertInFastLLM(FastllmCudaDsparkMarkovShardNormalize((float*)rank.packet.cudaData,
+                            statistics, tokens, (int)devices.size(), step, chain.count,
+                            state->width, markov->temperature), "Markov shard normalization failed.");
+                        continue;
+                    }
                     auto *keys = (unsigned long long*)chain.keys.cudaData;
                     AssertInFastLLM(FastllmCudaDsparkMarkovShardScore((float*)rank.output.cudaData,
                         embed, chain.head.cudaData, tokens, keys,
@@ -4301,10 +4371,10 @@ namespace fastllm {
                         device == root ? (float*)markov->outEmbeds.cudaData : nullptr, step),
                         "Markov shard finish failed.");
                 }
-                return;
+                if (!markovState->sampling) return;
             }
             const size_t stride = (size_t)state->width * sizeof(float);
-            AssertInFastLLM(FastllmCudaMemcpy2DDeviceToDeviceAsyncCurrentThread(rank.packet.cudaData, stride,
+            if (!markovState) AssertInFastLLM(FastllmCudaMemcpy2DDeviceToDeviceAsyncCurrentThread(rank.packet.cudaData, stride,
                 rank.output.cudaData, localWeight.dims[0] * sizeof(float), localWeight.dims[0] * sizeof(float),
                 state->rows), "MultiCuda persistent linear packing failed.");
             AssertInFastLLM(FastllmNcclAllGather(rank.packet.cudaData, rank.gathered.cudaData,
@@ -4316,7 +4386,8 @@ namespace fastllm {
                         const int length = range.second - range.first;
                         const char *source = (const char*)rank.gathered.cudaData +
                             other * state->rows * stride + offset * sizeof(float);
-                        char *destination = (char*)state->result.cudaData + range.first * sizeof(float);
+                        char *destination = (char*)(markovState ? markov->proposalProbs->cudaData :
+                            state->result.cudaData) + range.first * sizeof(float);
                         AssertInFastLLM(FastllmCudaMemcpy2DDeviceToDeviceAsyncCurrentThread(destination,
                             state->vocab * sizeof(float), source, stride, length * sizeof(float), state->rows),
                             "MultiCuda persistent linear unpacking failed.");
@@ -7176,6 +7247,17 @@ auto st = std::chrono::system_clock::now();
                 expertOwnerRank(expertOwnerRank), expertOwnerCount(expertOwnerCount),
                 gateType(MoeGateSwiglu) {}
 
+        bool RunNative(const Data &routedInput, const MultiCudaEpLocalExpertTable &table,
+                       const int32_t *ids, const float *scores, int topk) {
+            if (!deepSeekV41 || FastllmCudaRuntimeArch() != 75) return false;
+            Data routeIndex(INT32, {routedInput.dims[0], topk}, CUDA, const_cast<int32_t *>(ids));
+            Data routeScore(FLOAT32, routeIndex.dims, CUDA, const_cast<float *>(scores));
+            routeIndex.cudaDataBorrowed = routeScore.cudaDataBorrowed = true;
+            routeIndex.dataDeviceIds = routeScore.dataDeviceIds = {deviceId};
+            return FastllmCudaMergeMOEV41NativeResident(routedInput, *output,
+                const_cast<Data **>(table.globalWeights.data()), wBatch, routeIndex, routeScore, swigluLimit);
+        }
+
         bool RunMarlin(const Data &routedInput, Data **localWeights, int localCount,
                        const int32_t *indices, const float *scores, int topk) {
             if (joinOutput && FastllmCudaV41MarlinExpertParallelShared(
@@ -7348,6 +7430,7 @@ auto st = std::chrono::system_clock::now();
                         expertOwnerRank, expertOwnerCount, swigluLimit);
                 }
 #endif
+                if (!ok) ok = RunNative(packetInput, *localExpertTable, gpuRouteIndex, gpuRouteScore, topk);
                 if (!ok && useVllmMarlin) {
                     ok = RunMarlin(packetInput, localExpertTable->localWeights.data(),
                         (int)localExpertTable->localWeights.size(), gpuRouteIndex, gpuRouteScore, topk);
@@ -7484,7 +7567,8 @@ auto st = std::chrono::system_clock::now();
                 (useVllmMarlin || batchOneDecode)) {
                 broadcastInput();
                 int topk = deviceIndex->dims[1];
-                bool deepGemmOk = false;
+                bool deepGemmOk = RunNative(*input, *localExpertTable,
+                    (const int32_t *)deviceIndex->cudaData, (const float *)deviceScore->cudaData, topk);
 #ifdef FASTLLM_ENABLE_DSV4_MOE_DEEPGEMM_SM120
                 if (!deepSeekV41 && MultiCudaDsv4DeepGemmMoeEnabled() &&
                     input->dataType == DataType::BFLOAT16) {

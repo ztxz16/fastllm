@@ -23,6 +23,7 @@ import {
   renderAgentRuntime, refreshAgentRuntime, installAgentRuntime, renderWebUIAvailability,
   openEmbeddedWebUI
 } from "../ui_plugins/studio/launcher.js";
+import {openVideoService} from "../ui_plugins/studio/video.js";
 
 import {
   mountPluginHost
@@ -124,7 +125,7 @@ document.addEventListener("DOMContentLoaded", initialize);
 async function request(path, options = {}) {
   const headers = new Headers(options.headers || {});
   headers.set("X-FTLLM-Launcher-Token", controlToken);
-  if (options.body && !headers.has("Content-Type")) {
+  if (options.body && !(options.body instanceof FormData) && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
   }
   const response = await fetch(path, { ...options, headers });
@@ -139,7 +140,7 @@ async function request(path, options = {}) {
     }
   }
   if (!response.ok) {
-    throw new Error(localizeServerText(payload.error) || t("Request failed (HTTP {status}).", { status: response.status }));
+    throw new Error(localizeServerText(payload.error?.message || payload.error || payload.detail) || t("Request failed (HTTP {status}).", { status: response.status }));
   }
   return payload;
 }
@@ -739,6 +740,23 @@ async function refreshRuntime() {
 
 function renderRuntime() {
   const runtime = state.runtime || { phase: "stopped", message: "Model has not been started" };
+  const selector = document.getElementById("service-selector");
+  const services = runtime.services || (runtime.sessionId ? [runtime] : []);
+  const signature = JSON.stringify([state.locale, services.map(item => [item.sessionId, item.phase, item.profileName])]);
+  if (selector.dataset.signature !== signature) {
+    selector.replaceChildren(...services.map(item => {
+      const option = document.createElement("option"); option.value = item.sessionId;
+      option.textContent = `${item.profileName || item.modelName} · ${item.kind || "llm"} · ${t(item.phase)}`;
+      return option;
+    }));
+    selector.dataset.signature = signature;
+  }
+  selector.value = runtime.sessionId || "";
+  selector.disabled = !services.length;
+  selector.onchange = async () => {
+    try { state.runtime = await request(`/api/services/${selector.value}/select`, {method: "POST"}); renderRuntime(); }
+    catch (error) { showToast(friendlyError(error), "error"); }
+  };
   const phase = runtime.phase || "stopped";
   const isWebui = runtime.command === "webui";
   const titles = {
@@ -758,7 +776,7 @@ function renderRuntime() {
   elements.openApiInfo.disabled = !runtime.ready || isWebui;
   if (elements.apiInfoDialog.open && (!runtime.ready || isWebui
       || elements.apiInfoDialog.dataset.sessionId !== runtime.sessionId)) elements.apiInfoDialog.close();
-  elements.openEndpoint.textContent = isWebui ? t("Open WebUI") : t("Open API documentation");
+  elements.openEndpoint.textContent = runtime.kind === "video" ? t("Video demo") : isWebui ? t("Open WebUI") : t("Open API documentation");
   renderInferenceSpeed();
   renderContextWindow();
   renderWebUIAvailability();
@@ -770,7 +788,7 @@ function renderRuntime() {
 
 function renderInferenceSpeed() {
   const runtime = state.runtime || {};
-  const visible = runtime.command === "server" && runtime.phase === "running" && runtime.ready;
+  const visible = runtime.kind !== "video" && runtime.command === "server" && runtime.phase === "running" && runtime.ready;
   elements.inferenceStatusBar.classList.toggle("hidden", !visible);
   if (!visible || state.inferenceSpeedSession !== runtime.sessionId) {
     state.inferenceSpeedSamples = {};
@@ -817,7 +835,8 @@ function renderContextWindow() {
 }
 
 function updateActionAvailability() {
-  const active = runtimeIsActive(state.runtime);
+  const active = (state.runtime?.services || [state.runtime]).some(service => runtimeIsActive(service)
+    && service.endpoint?.endsWith(`:${collectForm().port}`));
   const invalid = Boolean(state.preview?.errors?.length);
   const automaticBusy = state.automaticConfigStatus?.phase === "loading" || (
     state.automaticConfigPending
@@ -827,7 +846,9 @@ function updateActionAvailability() {
   const missingModel = isSimpleNewProfile() && !String(collectForm().model || "").trim();
   elements.startRuntime.disabled = active || invalid || automaticBusy || missingModel;
   elements.saveProfile.disabled = automaticBusy || missingModel;
-  const hint = active
+  const editingRunningProfile = state.currentIndex !== null && (state.runtime?.services || [state.runtime]).some(service =>
+    runtimeIsActive(service) && service.profileName === state.profiles[state.currentIndex]?.name);
+  const hint = active || editingRunningProfile
     ? t("A service is running. Saved changes apply on the next model start.")
     : invalid ? t("Fix the highlighted fields before starting. You can still save an unfinished profile.")
     : automaticBusy ? t("Wait for automatic configuration to finish.")
@@ -849,6 +870,11 @@ function basename(value) {
 
 function openEndpoint() {
   if (!state.runtime?.endpoint || !state.runtime.ready) return;
+  if (state.runtime.kind === "video") {
+    openVideoService(state.runtime.sessionId);
+    switchView("webui");
+    return;
+  }
   const endpoint = state.runtime.endpoint.replace(/\/$/, "");
   const url = state.runtime.command === "webui" ? endpoint : `${endpoint}/docs`;
   window.open(url, "_blank", "noopener,noreferrer");
@@ -862,6 +888,10 @@ async function openApiInfo() {
     elements.apiInfoUrl.value = info.baseUrl;
     elements.apiInfoModel.value = info.model;
     elements.apiInfoKey.value = info.apiKey;
+    const contract = document.getElementById("api-contract");
+    document.getElementById("api-contract-field").classList.toggle("hidden", info.kind !== "video");
+    contract.value = info.kind === "video" ? [info.create, info.status, info.content, info.cancel,
+      "", JSON.stringify(info.request, null, 2), "", t("Create a job, poll until completed, then download its content.")].join("\n") : "";
     elements.apiInfoKey.placeholder = t("No API Key required");
     elements.apiInfoKey.type = "password";
     elements.apiInfoReveal.textContent = t("Show API Key");
@@ -874,7 +904,7 @@ async function openApiInfo() {
 }
 
 async function copyApiInfo() {
-  const text = `Base URL: ${elements.apiInfoUrl.value}\nModel: ${elements.apiInfoModel.value}\nAPI Key: ${elements.apiInfoKey.value || t("No API Key required")}`;
+  const text = `Base URL: ${elements.apiInfoUrl.value}\nModel: ${elements.apiInfoModel.value}\nAPI Key: ${elements.apiInfoKey.value || t("No API Key required")}\n${document.getElementById("api-contract").value}`;
   try {
     if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(text);
     else {

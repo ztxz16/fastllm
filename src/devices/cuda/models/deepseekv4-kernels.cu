@@ -2,6 +2,7 @@
 #include "fastllm-cuda.cuh"
 #include "../fastllm-hybrid-prefill.cuh"
 #include "fastllm.h"
+#include "deepseekv41-compact-woa.cuh"
 
 #include <algorithm>
 #include <cfloat>
@@ -6157,7 +6158,15 @@ bool DeepSeekV4LaunchWoAGemm(const fastllm::Data &o, const fastllm::Data &woA,
     int groupDim = headsPerGroup * headDim;
     int fullDim = heads * headDim;
     float alpha = 1.0f, beta = 0.0f;
+#if !defined(USE_ROCM) && CUBLAS_VERSION >= 11000
+    // FP32 compute alone still permits BF16 split reductions in cuBLAS.
+    // Keep Tensor Cores, but preserve FP32 intermediates for the small BF16
+    // verification path. Single-token decode and FP8 weights never enter it.
+    auto handle = bf16Verify ? getFastllmCublasFp32ReductionHandle() : getFastllmCublasHandle();
+    if (!handle) return false;
+#else
     auto handle = getFastllmCublasHandle();
+#endif
 
     if (o.dataType == fastllm::DataType::BFLOAT16 && woA.dataType == fastllm::DataType::BFLOAT16) {
         bool complete = true;
@@ -10216,6 +10225,61 @@ extern "C" bool FastllmCudaDeepSeekV4SparseAttentionDecodeCachedBatch(
     return ok;
 }
 
+extern "C" bool FastllmCudaDeepSeekV41CompactWoA(const fastllm::Data &input,
+        const fastllm::Data &weight, int groups, int rank, fastllm::Data &output) {
+    using namespace fastllm;
+    if (&input == &output || &weight == &output || input.multiDeviceData || weight.multiDeviceData ||
+        output.multiDeviceData || input.dataType != BFLOAT16 || weight.dataType != FP8_E4M3 ||
+        input.dataDevice != CUDA || weight.dataDevice != CUDA || !input.cudaData || !weight.cudaData ||
+        input.dataDeviceIds != weight.dataDeviceIds ||
+        input.dataDeviceIds != std::vector<int>{FastllmCudaGetDevice()} ||
+        (output.cudaData && (output.cudaData == input.cudaData || output.cudaData == weight.cudaData)) ||
+        input.dims.size() != 4 || weight.dims.size() != 2 ||
+        groups <= 0 || rank <= 0 || input.dims[2] % groups || weight.blockK != 32 || weight.blockM != 32 ||
+        FastllmCudaRuntimeArch() < 80) return false;
+    const int64_t tokens64 = int64_t(input.dims[0]) * input.dims[1];
+    const int64_t hidden64 = int64_t(input.dims[2] / groups) * input.dims[3];
+    if (tokens64 <= 0 || tokens64 > INT_MAX || hidden64 <= 0 || hidden64 > INT_MAX ||
+        hidden64 % 32 || rank % 32 || int64_t(groups) * rank > INT_MAX ||
+        weight.dims != std::vector<int>{groups * rank, int(hidden64)} ||
+        weight.scales.size() != size_t(groups * rank / 32) * (hidden64 / 32)) return false;
+    const int tokens = tokens64, hidden = hidden64;
+    Data &mutableWeight = const_cast<Data &>(weight);
+    Data emptyBias;
+    FastllmCudaFP8E4M3EnsureScalesAndBiasOnDevice(mutableWeight, emptyBias, groups * rank);
+    if (weight.extraCudaData.empty() || !weight.extraCudaData[0]) return false;
+    const float *scales = static_cast<const float *>(weight.extraCudaData[0]);
+    if (!DeepSeekV4PrepareCudaOutput(output, BFLOAT16, {input.dims[0], input.dims[1], groups * rank})) return false;
+    if (tokens == 1) {
+        fastllm::cuda::v41_compact::Decode<<<dim3((rank + 7) / 8, groups, tokens), 256, 0, cudaStreamPerThread>>>(
+            static_cast<const __nv_bfloat16 *>(input.cudaData), static_cast<const uint8_t *>(weight.cudaData),
+            scales, static_cast<__nv_bfloat16 *>(output.cudaData), groups, rank, hidden);
+        return cudaGetLastError() == cudaSuccess;
+    }
+    if (fastllm::TryCudaTritonSmallProjection(input, mutableWeight, output, groups)) return true;
+    // Runtime SM alone is insufficient: a lower-architecture PTX build can
+    // run on newer GPUs while its WMMA kernel body was compiled out.
+#if !defined(USE_ROCM) && !defined(CUDA_NO_TENSOR_CORE)
+    cudaFuncAttributes multiRowAttributes = {};
+    if (tokens <= 16 &&
+        cudaFuncGetAttributes(&multiRowAttributes, fastllm::cuda::v41_compact::MultiRows) == cudaSuccess &&
+        multiRowAttributes.ptxVersion >= 80) {
+        fastllm::cuda::v41_compact::MultiRows<<<dim3((rank + 15) / 16, groups), 128, 0, cudaStreamPerThread>>>(
+            static_cast<const __nv_bfloat16 *>(input.cudaData), static_cast<const uint8_t *>(weight.cudaData),
+            scales, static_cast<__nv_bfloat16 *>(output.cudaData), tokens, groups, rank, hidden);
+        return cudaGetLastError() == cudaSuccess;
+    }
+#endif
+    // Unsupported prefill shapes/backends recover BF16 in one temporary buffer;
+    // never retain a full expanded weight for every layer.
+    Data restored(BFLOAT16, weight.dims);
+    restored.dataDevice = CUDA; restored.dataDeviceIds = weight.dataDeviceIds; restored.Allocate(false);
+    fastllm::cuda::v41_compact::Restore<<<(weight.Count(0) + 255) / 256, 256, 0, cudaStreamPerThread>>>(
+        static_cast<const uint8_t *>(weight.cudaData), scales,
+        static_cast<__nv_bfloat16 *>(restored.cudaData), weight.dims[0], hidden);
+    return cudaGetLastError() == cudaSuccess && FastllmCudaDeepSeekV4WoA(input, restored, groups, rank, output, false);
+}
+
 extern "C" bool FastllmCudaDeepSeekV4WoA(const fastllm::Data &o, const fastllm::Data &woA,
                                          int groups, int oRank, fastllm::Data &output,
                                          bool allowTriton) {
@@ -10269,6 +10333,11 @@ extern "C" bool FastllmCudaDeepSeekV4WoA(const fastllm::Data &o, const fastllm::
     }
 
     fastllm::Data &mutableWoA = const_cast<fastllm::Data&>(woA);
+    // Preserve the FP8 path's existing activation quantization. Small grouped
+    // matrices can reuse each restored weight tile across several token rows.
+    if (allowTriton && (woA.dataType == fastllm::DataType::BFLOAT16 ||
+                       woA.dataType == fastllm::DataType::FP8_E4M3) &&
+        fastllm::TryCudaTritonSmallProjection(*projectionInput, mutableWoA, output, groups)) return true;
     if (allowTriton && fastllm::FastllmCudaTryTritonDeepSeekV4WoA(
             *projectionInput, mutableWoA, groups, oRank, output)) {
         DeviceSync();

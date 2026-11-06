@@ -3879,6 +3879,7 @@ namespace fastllm {
                         if (err == ResponseContextErrorPromptTooLong) {
                             return -2;
                         }
+                        if (err == ResponseContextErrorRuntime) return -3;
                         return -1;
                     }
                 }
@@ -3925,7 +3926,8 @@ namespace fastllm {
                 RemoveResponseContext(handleId);
                 dictLocker.unlock();
                 dictCV.notify_one();
-                return err == ResponseContextErrorPromptTooLong ? -2 : -1;
+                return err == ResponseContextErrorPromptTooLong ? -2 :
+                       err == ResponseContextErrorRuntime ? -3 : -1;
             }
             // The async Python server used to pair CanFetchResponse() with a
             // zero-sleep polling loop here.  During a long CUDA graph replay

@@ -47,6 +47,60 @@ void showError(cudaError_t result, char const* const message, const char* const 
 #include "fastllm-hip.h"
 #endif
 
+#if !defined(USE_ROCM)
+// CUDA 13 adds edge metadata to the capture dependency APIs. These callers
+// use ordinary full dependencies, so no edge metadata is needed.
+#if CUDART_VERSION >= 11030
+inline cudaError_t FastllmCudaStreamGetCaptureDependencies(cudaStream_t stream,
+        cudaStreamCaptureStatus *status, cudaGraph_t *graph,
+        const cudaGraphNode_t **dependencies, size_t *count) {
+#if CUDART_VERSION >= 13000
+    return cudaStreamGetCaptureInfo(stream, status, nullptr, graph, dependencies, nullptr, count);
+#elif CUDART_VERSION >= 12000
+    return cudaStreamGetCaptureInfo(stream, status, nullptr, graph, dependencies, count);
+#else
+    return cudaStreamGetCaptureInfo_v2(stream, status, nullptr, graph, dependencies, count);
+#endif
+}
+
+inline cudaError_t FastllmCudaStreamUpdateCaptureDependencies(cudaStream_t stream,
+        cudaGraphNode_t *dependencies, size_t count, unsigned int flags) {
+#if CUDART_VERSION >= 13000
+    return cudaStreamUpdateCaptureDependencies(stream, dependencies, nullptr, count, flags);
+#else
+    return cudaStreamUpdateCaptureDependencies(stream, dependencies, count, flags);
+#endif
+}
+#endif
+
+inline cudaError_t FastllmCudaGraphNodeGetDependencies(cudaGraphNode_t node,
+        cudaGraphNode_t *dependencies, size_t *count) {
+#if CUDART_VERSION >= 13000
+    return cudaGraphNodeGetDependencies(node, dependencies, nullptr, count);
+#else
+    return cudaGraphNodeGetDependencies(node, dependencies, count);
+#endif
+}
+
+inline cudaError_t FastllmCudaGraphNodeGetDependentNodes(cudaGraphNode_t node,
+        cudaGraphNode_t *dependents, size_t *count) {
+#if CUDART_VERSION >= 13000
+    return cudaGraphNodeGetDependentNodes(node, dependents, nullptr, count);
+#else
+    return cudaGraphNodeGetDependentNodes(node, dependents, count);
+#endif
+}
+
+inline cudaError_t FastllmCudaGraphAddDependencies(cudaGraph_t graph,
+        const cudaGraphNode_t *from, const cudaGraphNode_t *to, size_t count) {
+#if CUDART_VERSION >= 13000
+    return cudaGraphAddDependencies(graph, from, to, nullptr, count);
+#else
+    return cudaGraphAddDependencies(graph, from, to, count);
+#endif
+}
+#endif
+
 #define CUDA_MAX(a, b) ((a) > (b) ? (a) : (b))
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 // support tensor core
@@ -135,6 +189,9 @@ void *FastllmCudaPrepareOutput(fastllm::Data &output);
 void FastllmCudaFinishInput(const fastllm::Data &input, void *data);
 void FastllmCudaFinishOutput(fastllm::Data &output, void *data);
 cublasHandle_t getFastllmCublasHandle();
+// Separate, immutable precision mode for BF16 output with FP32 reductions.
+// Returns null if unsupported or first requested during graph capture.
+cublasHandle_t getFastllmCublasFp32ReductionHandle();
 
 void FastllmCudaPickInput(uint8_t *input, uint8_t *partInput, int rows, int cols, int *cudaIndex);
 void FastllmCudaPickOutputFloat(float *partOutput, float *output, int rows, int cols, int *index, float *scales);
@@ -155,11 +212,15 @@ void FastllmCudaEventDestroy(void *event);
 void FastllmCudaEventRecord(void *event, void *stream = nullptr);
 void FastllmCudaEventRecordCurrentThread(void *event);
 void FastllmCudaEventSynchronize(void *event);
+bool FastllmCudaEventComplete(void *event);
 float FastllmCudaEventElapsedTime(void *start, void *end);
 void FastllmCudaStreamWaitEvent(void *stream, void *event);
 void FastllmCudaCurrentThreadStreamWaitEvent(void *event);
 
 bool FastllmCudaGraphBeginCapture();
+// Register a stream joined to an existing capture by a cross-device event.
+// Its temporary allocations must be retained by the same graph memory pool.
+bool FastllmCudaGraphJoinCapture();
 // Resolve per-device process-lifetime graph sentinels before any stream in a
 // multi-GPU capture has begun. Calling cudaMalloc after the first rank starts
 // capture invalidates that rank even when the allocation targets another GPU.
@@ -176,6 +237,7 @@ bool FastllmCudaTensorParallelGreedyGatherGraphCreate(
         size_t rankBytes, size_t scoreBase, size_t totalBytes,
         void **exec);
 bool FastllmCudaGraphLaunch(void *exec);
+bool FastllmCudaGraphLaunchOnStream(void *exec, void *stream);
 void FastllmCudaGraphDestroy(void *graph);
 // 清掉当前线程粘着的 CUDA 运行时错误（捕获失败后回退到逐算子之前必须调用）
 void FastllmCudaClearLastError();
@@ -247,6 +309,7 @@ inline int FastllmCudaGraphOptimizeParallelRegions(void *graph) {
 // 内存池块保留到 Graph 销毁。Begin/End 之间允许正常复用，以保持逐层 workspace
 // 的峰值而不是把整步所有临时张量累加起来。
 bool FastllmCudaGraphMemoryPoolBegin();
+bool FastllmCudaGraphMemoryPoolActive();
 bool FastllmCudaGraphMemoryPoolEnd(std::vector<void*> &reservedPointers);
 void FastllmCudaGraphMemoryPoolAbort();
 void FastllmCudaGraphMemoryPoolRelease(const std::vector<void*> &reservedPointers);
@@ -542,6 +605,10 @@ bool FastllmCudaMLAPagedBatch(const fastllm::Data &qNope, const fastllm::Data &q
         const std::vector<const fastllm::Data*> &physicalTokenIndices,
         fastllm::Data &output, float softmaxScale);
 
+bool FastllmCudaGGUFEmbedding(const fastllm::Data &input, const fastllm::Data &weight, fastllm::Data &output);
+// Write repeated packed embedding rows to caller-provided FLOAT32 CUDA storage.
+bool FastllmCudaGGUFEmbeddingRepeat(const fastllm::Data &input, const fastllm::Data &weight,
+                                   fastllm::Data &output, int repeats);
 bool FastllmCudaEmbedding(const fastllm::Data &input, const fastllm::Data &weight, fastllm::Data &output);
 bool FastllmCudaEmbeddingDirect(const fastllm::Data &input, const fastllm::Data &weight, fastllm::Data &output);
 bool FastllmCudaAttention(const fastllm::Data &q, const fastllm::Data &k, const fastllm::Data &v,
@@ -860,6 +927,14 @@ bool FastllmCudaQwen4SparsePrefill(
     const fastllm::Data &query, const fastllm::Data &key,
     const fastllm::Data &value, const fastllm::Data &indices,
     fastllm::Data &output, int groups, float scale);
+
+// Causal QSA indices are unique per row. Select the attention implementation
+// for the early queries independently of the enclosing projection/MoE batch.
+bool FastllmCudaQwen4CausalPrefill(
+    const fastllm::Data &query, const fastllm::Data &key,
+    const fastllm::Data &value, const fastllm::Data &indices,
+    fastllm::Data &output, int groups, float scale, int previousLength,
+    int denseContextLimit);
 
 bool FastllmCudaQwen4PrepareSparseBatch(
         const fastllm::Data &query, const fastllm::Data &key,
@@ -1335,6 +1410,8 @@ bool FastllmCudaDeepSeekV4SparseAttentionPrefill(const fastllm::Data &q, const f
                                                  int prefixLen = 0,
                                                  bool nonCausalBlock = false,
                                                  const int32_t *decodeMeta = nullptr);
+bool FastllmCudaDeepSeekV41CompactWoA(const fastllm::Data &input, const fastllm::Data &weight,
+                                     int groups, int rank, fastllm::Data &output);
 bool FastllmCudaDeepSeekV4WoA(const fastllm::Data &o, const fastllm::Data &woA,
                               int groups, int oRank, fastllm::Data &output,
                               bool allowTriton = true);
@@ -1654,6 +1731,11 @@ bool FastllmCudaTopKTopPSampling(float *logits, float *temperatures,
 bool FastllmCudaMtpSampleDraft(float *logits, float *proposalProbs,
                               const float *temperatures, const int *topKs,
                               const float *topPs, int *output, int batch, int vocabSize);
+// Graph-safe single-row sampler. Output/proposal are device buffers; workspace
+// owns stable scratch and a device RNG counter for the lifetime of the graph.
+bool FastllmCudaMtpSampleDraftDevice(float *logits, float *proposalProbs,
+    float temperature, int topK, float topP, int *output, int vocabSize,
+    fastllm::Data &workspace);
 bool FastllmCudaMtpRejectionSampling(float *logits, float *proposalProbs,
                                     const float *temperatures, const int *topKs,
                                     const float *topPs, const int *draftTokenIds,
@@ -1804,6 +1886,9 @@ bool FastllmCudaDFlashAppendKVForGraph(
                           const fastllm::Data &cachedTokens);
 bool FastllmCudaHalfPagedAttention(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v, fastllm::Data &output, int group, float scale, bool inited = false);
 bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches, fastllm::Data &vCaches, fastllm::Data &qSizes, fastllm::Data &pageSizes, fastllm::Data &pageIndexs, fastllm::Data &lastPageLens, fastllm::Data &output, int group, float scale, int attentionType, bool inited = false, bool sync = true, bool enableCudaGraph = false, int flashInferCudaGraph = -1, int windowLeft = -1);
+// Contiguous FP16 [n,m] x [k,m]^T, FP32 accumulation, FP16 output.
+// Explicit opt-in for models whose routing requires FP32 reductions.
+bool FastllmCudaHalfMatMulFloat16Fp32(const void *input, const void *weight, void *output, int n, int m, int k);
 bool FastllmCudaHalfMatMulFloat16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k, bool addTo = false);
 // Runs up to four independent no-bias FP16 linears that share the same one-to-
 // eight-row input. Each output row keeps the native compensated reduction
@@ -1902,6 +1987,7 @@ struct FastllmCudaMoeCacheLayer {
     // PP cache placement only; -1 permits every device. Expert-distributed
     // execution supplies its own ownership and does not use this restriction.
     int cacheDevice = -1;
+    bool qwen38FlashNext = false; // Explicit caller profile; Standard arithmetic.
 };
 // One anchor plus up to eight speculative tokens. Larger prefill batches
 // keep using the configured MoE backend.
@@ -1920,6 +2006,13 @@ bool FastllmCudaMoeCacheRequested();
 bool FastllmCudaPrepareMoeCache(
         const FastllmCudaMoeCacheLayer *layers, int layerCount,
         const std::function<void()> &registerNumaWeights = {}, bool allowStreaming = false);
+// Explicit subgroup reservations remain inside the model's per-device budget.
+// Fully resident groups fail if their executing device cannot hold every record.
+bool FastllmCudaPrepareMoeCacheWithBudgets(
+        const FastllmCudaMoeCacheLayer *layers, int layerCount,
+        const std::function<void()> &registerNumaWeights, bool allowStreaming,
+        const std::map<int, uint64_t> &deviceBudgets, bool fullyResident);
+bool FastllmCudaMoeCacheIsQwen38(fastllm::Data **weights, int weightsBatch);
 bool FastllmCudaCanRunMoeCache(
         fastllm::Data **weights, int weightsBatch);
 
@@ -1933,6 +2026,7 @@ struct FastllmCudaMoePrefillResidents {
     int gateType = -1, downType = -1, hidden = 0, inter = 0;
     int ownerRank = 0, ownerCount = 1;
     bool nativeGlm = false; // GGUF grouped backend math compatibility
+    bool nativeGGUF = false; // Preserve packed NUMA records; grouped prefill restores its working tiles.
     bool nativeWeights = false; // Directly consumed by existing host-prefill kernels.
     bool sharedWeights = false; // Native or losslessly restored NUMA layout.
 };
@@ -1986,7 +2080,13 @@ struct FastllmCudaMoeGGUFCacheView {
     // the launch bound; only the first *activeRouteCount entries are read or
     // written. Keep this count and the routing arrays alive through replay.
     const int32_t *activeRouteCount = nullptr;
+    // Immutable Q8_1 [rows, hidden] input shared by forked resident/miss
+    // branches. The producer must precede both branches; gate scratch stays
+    // private. Null retains this view's ordinary workspace/input preparation.
+    const void *preparedQ8Input = nullptr;
+    bool exactSubwarp = false; // Qwen verification; other callers retain warp kernels.
 };
+bool FastllmCudaMoeGGUFPrepareQ8Input(const fastllm::Data &input, void *destination, size_t bytes);
 bool FastllmCudaMoeGGUFCacheSupported(int type, int columns);
 bool FastllmCudaMoeGGUFCacheNumaSupported(int gateType, int downType,
     int hidden, int inter, int rows);
@@ -2084,6 +2184,7 @@ bool FastllmCudaMergeMOEGGUFHost(const fastllm::Data &input,
 // Eager single-token decode: generic FP32 or explicitly registered V4.1
 // BF16 math. Adapters execute disjoint CPU/CUDA subsets with shared scheduling.
 bool FastllmCudaCanRunMoeHybrid(fastllm::Data **weights, int weightsBatch);
+bool FastllmCudaMoeCacheFullyResident(fastllm::Data **weights, int weightsBatch);
 // Optional single-token callback runs once after routing copies, never on
 // rejection. It must not reenter the cache or alter its tensor allocations.
 bool FastllmCudaMergeMOEHybrid(const fastllm::Data &input,
@@ -2735,5 +2836,46 @@ struct FastllmCudaDiskMxfp4Scope {
     FastllmCudaDiskMxfp4Scope(const FastllmCudaDiskMxfp4Scope &) = delete;
     FastllmCudaDiskMxfp4Scope &operator=(const FastllmCudaDiskMxfp4Scope &) = delete;
 };
+
+
+namespace fastllm {
+bool TryCudaTritonSmallProjection(const Data &input, Data &weight, Data &output, int groups = 1);
+}
+extern "C" bool FastllmCudaTritonSmallProjection(const char *cubin, const char *name, int shared,
+    const fastllm::Data &input, const fastllm::Data &weight, fastllm::Data &output,
+    int rows, int groups, int columns, int blockN);
+
+// Sorted original MXFP4 expert slots, at most eight routes per slot.
+namespace fastllm {
+bool CudaTritonMxfp4GroupedEnabled();
+bool TryCudaTritonMxfp4Grouped(const Data &input, Data &activation,
+    const unsigned char *records, const int *slots, const int *routes,
+    const float *scores, float *output, void *scratch, int count,
+    int hidden, int inter, int topk, size_t stride, size_t down, float limit, bool planar = false);
+}
+extern "C" bool FastllmCudaTritonMxfp4Grouped(
+    const char *const *cubins, const char *const *names, const int *shared,
+    const fastllm::Data &input, fastllm::Data &activation,
+    const unsigned char *records, const int *slots, const int *routes,
+    const float *scores, float *output, void *scratch, int count, bool planar = false);
+
+// Return the owning cache only when a complete layer can use a native child
+// at the requested row count. Equal non-null owners can share one launch.
+void *FastllmCudaNativeMoeGraphOwner(fastllm::Data **weights, int count, int rows);
+bool FastllmCudaGraphAppendChild(const void *child);
+// Release only after all parent graphs and executables referencing this child.
+void FastllmCudaReleaseNativeMoeFullGraph(void *handle);
+
+// Native single-GPU NUMA MoE child graph. The model keeps the source buffers
+// and weight objects alive; the cache owns the returned handle and graph.
+void *FastllmCudaCreateNativeMoeFullGraph(const fastllm::Data &input, const fastllm::Data &index,
+    const fastllm::Data &score, fastllm::Data &output, fastllm::Data **weights, int weightsBatch,
+    int layer, const void *sharedGraph, void **graph);
+// Handles must follow the composed graph's sequential layer order. The
+// exec must contain exactly these children; timed must match that exec.
+// Queue ownership and CUDA launch are atomic with respect to the CPU
+// dispatcher: a rejected launch leaves no pending CPU requests.
+bool FastllmCudaLaunchNativeMoeFullGraph(void *exec, void *const *handles, int count, bool timed = true);
+bool FastllmCudaCreateNativeMoeReplayGraph(void *graph, void *const *handles, int count, void **exec);
 
 #endif // FASTLLM_CUDA_CUH

@@ -139,8 +139,10 @@ std::unique_ptr<FastllmCudaDiskMoeAsync> FastllmCudaDiskMoeAsync::Create(
     if(layers.empty())return {};
     cudaDeviceProp prop{};
     if(cudaGetDeviceProperties(&prop,device)!=cudaSuccess || !prop.canMapHostMemory || !prop.unifiedAddressing)return {};
+    int clockRate=0;
+    if(cudaDeviceGetAttribute(&clockRate,cudaDevAttrClockRate,device)!=cudaSuccess || clockRate<=0)return {};
     auto p=std::make_unique<Impl>();p->device=device;
-    p->timeoutCycles=static_cast<unsigned long long>(prop.clockRate)*1000*10;p->layers=layers;p->hidden=layers[0].hidden;p->maxInter=0;
+    p->timeoutCycles=static_cast<unsigned long long>(clockRate)*1000*10;p->layers=layers;p->hidden=layers[0].hidden;p->maxInter=0;
     int experts=0;
     for(const auto &l:layers){
         if(l.hidden!=p->hidden || l.hidden<=0 || l.inter<=0 || l.experts<=0 ||
@@ -222,4 +224,6 @@ bool FastllmCudaDiskMoeAsync::Run(int layer,const fastllm::Data &input,const fas
     fastllm::AssertInFastLLM(ok,"Disk asynchronous GGUF launch failed.\n");
     return true;
 }
+
+#include "fastllm-disk-v41-graph.cuh"
 #endif

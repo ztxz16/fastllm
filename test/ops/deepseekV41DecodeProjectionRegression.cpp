@@ -75,6 +75,46 @@ static int CheckMixNorm() {
                 Require(Bits(out[0]) == Bits(out[1]),
                         "fused quantization changed the router/host expert input");
                 ++cases;
+                if (batch == 1 && dim == 5120) for (bool quantize : {false, true}) {
+                    Require(FastllmCudaGraphPrepareCaptureDevice(), "mHC capture preparation failed");
+                    void *graph = nullptr, *exec = nullptr;
+                    Require(FastllmCudaGraphBeginCapture(), "mHC capture begin failed");
+                    Require(FastllmCudaDeepSeekV41HcMixPreNorm(input, previousPre, fn, scale, base, weight,
+                        20, 1e-6f, 1e-6f, pre[1], post[1], comb[1], out[1],
+                        quantize ? &quantFusedOut : nullptr), "mHC capture rejected");
+                    Require(FastllmCudaGraphEndCapture(&graph) && FastllmCudaGraphInstantiate(graph, &exec),
+                        "mHC graph instantiation failed");
+                    // Keep captured addresses stable while changing both the
+                    // activation and the previous sublayer's pre coefficients.
+                    for (int replay = 0; replay < 8; ++replay) {
+                        Data nextInput, nextPre;
+                        Fill(nextInput, input.dims, DataType::BFLOAT16, 101 + replay,
+                             replay % 2 ? amplitude : 1e-3f);
+                        Fill(nextPre, previousPre.dims, DataType::FLOAT32, 151 + replay, 1.0f);
+                        Check(cudaMemcpyAsync(input.cudaData, nextInput.cudaData, input.GetBytes(),
+                                              cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+                        Check(cudaMemcpyAsync(previousPre.cudaData, nextPre.cudaData, previousPre.GetBytes(),
+                                              cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+                        for (Data *target : {&pre[1], &post[1], &comb[1], &out[1], &quantFusedOut})
+                            Check(cudaMemsetAsync(target->cudaData, 0xff, target->GetBytes(), cudaStreamPerThread));
+                        Require(FastllmCudaGraphLaunch(exec), "mHC graph replay failed");
+                        Require(FastllmCudaDeepSeekV41HcMix(input, fn, scale, base, 4, 20, 1e-6f, 1e-6f,
+                            pre[0], post[0], comb[0]), "mHC replay mix reference rejected");
+                        Require(FastllmCudaDeepSeekV41HcPreNorm(input, previousPre, weight, 1e-6f, out[0]),
+                            "mHC replay norm reference rejected");
+                        Require(Bits(pre[0]) == Bits(pre[1]) && Bits(post[0]) == Bits(post[1]) &&
+                            Bits(comb[0]) == Bits(comb[1]) && Bits(out[0]) == Bits(out[1]),
+                            "mHC replay changed coefficients or consumed stale previousPre");
+                        if (quantize) {
+                            Require(FastllmCudaDeepSeekV41QuantizeActivation(out[0], quantReference),
+                                "mHC replay quantization reference rejected");
+                            Require(Bits(quantReference) == Bits(quantFusedOut), "mHC replay changed FP8 rounding");
+                        }
+                        ++cases;
+                    }
+                    FastllmCudaGraphExecDestroy(exec);
+                    FastllmCudaGraphDestroy(graph);
+                }
             }
         }
     }
@@ -135,10 +175,12 @@ static int CheckHcDecodeDots() {
 static int CheckRouter() {
     int cases = 0;
     for (int dim : {64, 513, 5120}) for (int experts : {64, 384, 1024})
-    for (int batch : {1, 2, 3, 4, 5, 6, 7, 8}) for (float temperature : {1.0f, 0.7f, 2.0f}) {
+    for (int batch : {1, 2, 3, 4, 5, 6, 7, 8}) for (float temperature : {1.0f, 0.7f, 2.0f})
+    for (int compact = 0; compact < (batch == 1 ? 2 : 1); ++compact) {
         Data input, weight, cast, reference, actual;
         Fill(input, {batch, dim}, DataType::BFLOAT16, 1, 0.8f);
-        Fill(weight, {experts, dim}, DataType::FLOAT32, 2, 0.15f);
+        Fill(weight, {experts, dim}, compact ? DataType::BFLOAT16 : DataType::FLOAT32, 2, 0.15f);
+        if (compact) ToDataType(weight, DataType::FLOAT32);
         ToDataType(input, cast, DataType::FLOAT32);
         Linear(cast, weight, Data(), reference);
         if (std::fabs(temperature - 1.0f) > 1e-6f) Mul(reference, 1.0f / temperature, reference);
@@ -146,6 +188,37 @@ static int CheckRouter() {
         Require(FastllmCudaV41RouterScores(input, weight, temperature, actual), "router rejected");
         Require(Bits(reference) == Bits(actual), "router score changed bits");
         ++cases;
+        if (batch == 1 && dim == 5120 && experts == 384 && temperature == 1.0f) {
+            for (bool prepared : {false, true}) {
+                Data freshWeight;
+                freshWeight.CopyFrom(weight);
+                Data &capturedWeight = prepared ? weight : freshWeight;
+                Require(FastllmCudaGraphPrepareCaptureDevice(), "router capture preparation failed");
+                void *graph = nullptr, *exec = nullptr;
+                Require(FastllmCudaGraphBeginCapture(), "router capture begin failed");
+                // A fresh weight must fall back without allocating its compact
+                // auxiliary inside capture; a prepared exact weight may use it.
+                Require(FastllmCudaV41RouterScores(input, capturedWeight, temperature, actual),
+                    "router capture rejected");
+                Require(FastllmCudaGraphEndCapture(&graph) && FastllmCudaGraphInstantiate(graph, &exec),
+                    "router graph instantiation failed");
+                for (int replay = 0; replay < 8; ++replay) {
+                    Data nextInput;
+                    Fill(nextInput, input.dims, DataType::BFLOAT16, 201 + replay, 0.8f);
+                    Check(cudaMemcpyAsync(input.cudaData, nextInput.cudaData, input.GetBytes(),
+                                          cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+                    Check(cudaMemsetAsync(actual.cudaData, 0xff, actual.GetBytes(), cudaStreamPerThread));
+                    Require(FastllmCudaGraphLaunch(exec), "router graph replay failed");
+                    ToDataType(input, cast, DataType::FLOAT32);
+                    Linear(cast, weight, Data(), reference);
+                    Require(FastllmCudaDeepSeekV4RouteScoreTransform(reference, 2), "router replay reference failed");
+                    Require(Bits(actual) == Bits(reference), "router replay changed scores or left stale rows");
+                    ++cases;
+                }
+                FastllmCudaGraphExecDestroy(exec);
+                FastllmCudaGraphDestroy(graph);
+            }
+        }
     }
     Data input, weight, sentinel;
     Fill(input, {9, 64}, DataType::BFLOAT16, 1, 1.0f);

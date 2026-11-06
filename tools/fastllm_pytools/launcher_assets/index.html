@@ -111,6 +111,7 @@
         <header class="topbar">
           <div class="workspace-breadcrumb"><span class="management-label">模型管理</span><span aria-hidden="true">/</span><strong id="current-view-title">启动服务</strong></div>
           <div class="service-controls">
+          <label class="service-selector-label"><span>当前服务</span><select id="service-selector" aria-label="当前服务"></select></label>
           <div class="service-status">
           <div class="topbar-status">
             <span id="status-dot" class="status-dot stopped"></span>
@@ -173,6 +174,7 @@
       <label class="field"><span>Base URL</span><input id="api-info-url" type="text" readonly></label>
       <label class="field"><span>模型名称</span><input id="api-info-model" type="text" readonly></label>
       <label class="field"><span>API Key</span><input id="api-info-key" type="password" readonly autocomplete="off"></label>
+      <label id="api-contract-field" class="field hidden"><span>生成 API · 创建 / 查询 / 下载 / 取消</span><textarea id="api-contract" rows="9" readonly spellcheck="false"></textarea></label>
       <div class="automatic-config-dialog-actions">
         <button id="api-info-reveal" class="secondary-button" type="button" aria-pressed="false">显示 API Key</button>
         <button id="api-info-copy" class="primary-button" type="button">复制 API 信息</button>

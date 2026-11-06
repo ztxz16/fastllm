@@ -2288,6 +2288,14 @@ bool FastllmCudaHalfMatMulFloat16WithRouterSpecialization(
         allowRouterSpecialization, FASTLLM_CUDA_LINEAR_FP16_PATH_AUTO);
 }
 
+bool FastllmCudaHalfMatMulFloat16Fp32(const void *input, const void *weight, void *output, int n, int m, int k) {
+    if (!input || !weight || !output || n <= 0 || m <= 0 || k <= 0) return false;
+    const float alpha = 1.f, beta = 0.f;
+    return cublasGemmEx(getFastllmCublasHandle(), CUBLAS_OP_T, CUBLAS_OP_N,
+        k, n, m, &alpha, weight, CUDA_R_16F, m, input, CUDA_R_16F, m,
+        &beta, output, CUDA_R_16F, k, CUDA_R_32F, CUBLAS_GEMM_DEFAULT) == CUBLAS_STATUS_SUCCESS;
+}
+
 bool FastllmCudaHalfMatMulFloat16(const fastllm::Data &input, fastllm::Data &weight,
                                  const fastllm::Data &bias, fastllm::Data &output,
                                  int n, int m, int k, bool addTo) {

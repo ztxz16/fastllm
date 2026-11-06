@@ -185,7 +185,7 @@ __global__ void FinishDraftKernel(const Partial *partials, float *lse, int *outp
         if (row == 0) ++*counter;
     }
 }
-template<bool Indirect = false>
+template<bool Indirect = false, bool Probability = false>
 __global__ void AcceptKernel(const float *p, const float *logits, const float *lse,
         const int *draftIds, int *result, int drafts, int vocab, int batch,
         unsigned long long seed, const unsigned long long *counter,
@@ -199,7 +199,7 @@ __global__ void AcceptKernel(const float *p, const float *logits, const float *l
         ids = proposals[b].tokens;
     } else {
         qLogits = logits + (size_t)b * drafts * vocab;
-        qLse = lse + b * drafts; ids = draftIds + b * drafts;
+        qLse = Probability ? nullptr : lse + b * drafts; ids = draftIds + b * drafts;
     }
     for (int i = 0; i <= drafts; ++i) result[offset + i] = -1;
     curandStatePhilox4_32_10_t rng;
@@ -209,17 +209,23 @@ __global__ void AcceptKernel(const float *p, const float *logits, const float *l
         int token = ids[i];
         if (token < 0 || token >= vocab) break;
         float target = p[(size_t)(offset + i) * vocab + token];
-        float logq = qLogits[(size_t)i * vocab + token] - qLse[i];
-        float logp = logf(target);
-        float logu = logf(Uniform(curand(&rng)));
-        // Subtract first: adding a tiny log(u) to a large negative log(q)
-        // can round back to log(q), spuriously rejecting p == q.
-        if (!(target > 0 && (logp >= logq || logu < logp - logq))) break;
+        if constexpr (Probability) {
+            float proposal = qLogits[(size_t)i * vocab + token];
+            float u = Uniform(curand(&rng));
+            if (!(target > 0 && (target >= proposal || u * proposal < target))) break;
+        } else {
+            float logq = qLogits[(size_t)i * vocab + token] - qLse[i];
+            float logp = logf(target);
+            float logu = logf(Uniform(curand(&rng)));
+            // Subtract first: adding a tiny log(u) to a large negative log(q)
+            // can round back to log(q), spuriously rejecting p == q.
+            if (!(target > 0 && (logp >= logq || logu < logp - logq))) break;
+        }
         result[offset + i] = token; ++accepted;
     }
     result[batch * (drafts + 1) + b] = accepted;
 }
-template<bool Indirect = false>
+template<bool Indirect = false, bool Probability = false>
 __global__ void ResidualKernel(const float *p, const float *logits, const float *lse,
         const int *result, Partial *partials, int drafts, int vocab, int batch,
         int blocks, unsigned long long seed, const unsigned long long *counter,
@@ -236,7 +242,7 @@ __global__ void ResidualKernel(const float *p, const float *logits, const float 
             normalizer = proposals[b].logsumexp[accepted];
         } else {
             proposal = logits + (size_t)(b * drafts + accepted) * vocab;
-            normalizer = lse[b * drafts + accepted];
+            if constexpr (!Probability) normalizer = lse[b * drafts + accepted];
         }
     }
     curandStatePhilox4_32_10_t rng;
@@ -251,9 +257,12 @@ __global__ void ResidualKernel(const float *p, const float *logits, const float 
         if (token < vocab) {
             float logp = logf(target[token]), score = logp;
             if (!bonus) {
-                float delta = proposal[token] - normalizer - logp;
-                // expm1 retains small positive residuals when p and q are close.
-                score = delta < 0 ? logp + logf(-expm1f(delta)) : -INFINITY;
+                if constexpr (Probability) score = logf(fmaxf(target[token] - proposal[token], 0.0f));
+                else {
+                    float delta = proposal[token] - normalizer - logp;
+                    // expm1 retains small positive residuals when p and q are close.
+                    score = delta < 0 ? logp + logf(-expm1f(delta)) : -INFINITY;
+                }
             }
             score += Gumbel(randoms[i]);
             if (Better(score, token, local.best, local.token)) {
@@ -299,17 +308,18 @@ bool FastllmCudaMtpSampleDraftLogits(const float *logits, float *saved, float *l
     return cudaGetLastError() == cudaSuccess;
 }
 
-bool FastllmCudaMtpRejectionFromProbs(const float *p, const float *logits,
+template<bool Probability>
+static bool FastllmMtpReject(const float *p, const float *logits,
         const float *lse, const int *draftIds, int *output, int *accepted,
         int batch, int drafts, int vocab) {
-    if (!p || !logits || !lse || !draftIds || !output || !accepted ||
+    if (!p || !logits || (!Probability && !lse) || !draftIds || !output || !accepted ||
         batch <= 0 || drafts <= 0 || drafts > 8 || vocab <= 0) return false;
     auto &ws = GetWorkspace();
     int blocks = (vocab + Tile - 1) / Tile, count = batch * (drafts + 2);
     if (!ws.Prepare((size_t)batch * blocks, count)) return false;
-    AcceptKernel<false><<<batch, 32, 0, cudaStreamPerThread>>>(p, logits, lse, draftIds,
+    AcceptKernel<false, Probability><<<batch, 32, 0, cudaStreamPerThread>>>(p, logits, lse, draftIds,
         ws.results, drafts, vocab, batch, ws.seed, ws.counter);
-    ResidualKernel<false><<<dim3(blocks, batch), Threads, 0, cudaStreamPerThread>>>(
+    ResidualKernel<false, Probability><<<dim3(blocks, batch), Threads, 0, cudaStreamPerThread>>>(
         p, logits, lse, ws.results, ws.partials, drafts, vocab, batch, blocks, ws.seed, ws.counter);
     FinishResidualKernel<<<batch, Threads, 0, cudaStreamPerThread>>>(
         ws.partials, ws.results, drafts, batch, blocks, ws.counter);
@@ -319,10 +329,23 @@ bool FastllmCudaMtpRejectionFromProbs(const float *p, const float *logits,
         return false;
     std::copy_n(ws.hostResults, batch * (drafts + 1), output);
     std::copy_n(ws.hostResults + batch * (drafts + 1), batch, accepted);
-    for (int b = 0; b < batch; ++b)
+    for (int b = 0; b < batch; ++b) {
+        if (accepted[b] < 0 || accepted[b] > drafts) return false;
         for (int i = 0; i <= accepted[b]; ++i)
             if (output[b * (drafts + 1) + i] < 0 || output[b * (drafts + 1) + i] >= vocab) return false;
+    }
     return true;
+}
+
+bool FastllmCudaMtpRejectionFromProbs(const float *p, const float *logits,
+        const float *lse, const int *draftIds, int *output, int *accepted,
+        int batch, int drafts, int vocab) {
+    return FastllmMtpReject<false>(p, logits, lse, draftIds, output, accepted, batch, drafts, vocab);
+}
+
+bool FastllmCudaMtpRejectionFromProbabilities(const float *p, const float *q,
+        const int *draftIds, int *output, int *accepted, int batch, int drafts, int vocab) {
+    return FastllmMtpReject<true>(p, q, nullptr, draftIds, output, accepted, batch, drafts, vocab);
 }
 
 bool FastllmCudaMtpSampleDraftLogitsBatch(const float *logits,

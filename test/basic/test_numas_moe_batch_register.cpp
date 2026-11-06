@@ -138,6 +138,8 @@ int main(int argc, char **argv) {
             std::puts("PASS: bounded NUMA arenas across chunk boundaries");
             return 0;
         }
+        const bool expectPinned = NumasMoeWeightsArePinned() &&
+            !(argc == 2 && std::string(argv[1]) == "--pin-failure");
         SetThreads(4);
         const int nodes = GetNumasMoeShardCount();
         std::vector<std::unique_ptr<Data>> reference, batched;
@@ -165,7 +167,7 @@ int main(int argc, char **argv) {
                 Check(std::memcmp(a.numasData[node], b.numasData[node], shardBytes) == 0,
                       "batch changed interleaved/repacked expert bytes");
 #ifdef USE_CUDA
-                if (NumasMoeWeightsArePinned()) {
+                if (expectPinned) {
                     Check(b.isPinned, "batch unexpectedly lost pinned status");
                     cudaPointerAttributes attrs{};
                     Check(cudaPointerGetAttributes(&attrs, b.numasData[node]) == cudaSuccess &&
@@ -194,14 +196,14 @@ int main(int argc, char **argv) {
         Check(std::memcmp(survivor, reference.back()->numasData[0], lastBytes) == 0,
               "destroying an arena peer invalidated a live weight");
 #ifdef USE_CUDA
-        if (NumasMoeWeightsArePinned()) {
+        if (expectPinned) {
             unsigned int flags = 0;
             Check(cudaHostGetFlags(&flags, survivor) == cudaSuccess, "arena unregistered before last owner");
         }
 #endif
         batched.back().reset();
 #ifdef USE_CUDA
-        if (NumasMoeWeightsArePinned()) {
+        if (expectPinned) {
             unsigned int flags = 0;
             Check(cudaHostGetFlags(&flags, survivor) != cudaSuccess, "arena still registered after last owner");
             cudaGetLastError();

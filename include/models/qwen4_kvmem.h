@@ -5,6 +5,7 @@
 
 namespace fastllm {
 #ifdef USE_CUDA
+namespace cuda { class MappedHostBuffer; }
 // Exact QSA storage: logical positions never change. The complete KV is backed
 // by pinned host memory; the device cache contains a bounded subset of pages.
 // All selection and refill operations use the current CUDA stream, including
@@ -19,6 +20,9 @@ public:
 
     void Attach(Data &key, Data &value, const std::shared_ptr<Qwen4KvMem> &owner);
     void Reset();
+    // Copy the token-major prefix on the current stream, respecting host
+    // registration boundaries when the backing allocation was split.
+    bool StagePrefix(void *key, void *value, int length) const;
     void Prepare(const Data &indices, int rowStart, int rows, int length,
                  const int32_t *decodeMeta = nullptr, int appended = 1);
     bool HasResidentPrefix(int length) const { return prefixResident && length <= resident; }
@@ -38,6 +42,7 @@ public:
     size_t gpuBytes = 0;
 
 private:
+    std::unique_ptr<cuda::MappedHostBuffer> keyStorage, valueStorage;
     void InitializeSlots();
     void Release() noexcept;
     int device, logicalPages, residentPages;

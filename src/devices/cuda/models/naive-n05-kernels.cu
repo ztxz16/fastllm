@@ -1,3 +1,4 @@
+#include "devices/cuda/fastllm-cuda-norm.cuh"
 #include "devices/cuda/naive-n05-cuda.cuh"
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "utils.h"
@@ -3507,61 +3508,6 @@ void FastllmCudaNaiveAttention(const fastllm::Data &query, const fastllm::Data &
 }
 
 namespace {
-// Preserve AddTo's BF16 residual rounding and KimiK3RMSNorm's two BF16
-// rounding steps, including the same 256-thread reduction tree.
-template <int Channels = 0>
-__global__ void AddDecodeRMSNorm(BF16 *hidden, const BF16 *branch,
-        const float *weight, BF16 *output, int channels, float eps) {
-    if constexpr (Channels) channels = Channels;
-    hidden += (size_t)blockIdx.x * channels;
-    branch += (size_t)blockIdx.x * channels;
-    output += (size_t)blockIdx.x * channels;
-    __shared__ float sums[8];
-    float cached[Channels ? Channels / 256 : 1];
-    float affine[Channels ? Channels / 256 : 1];
-    float partial = 0;
-    if constexpr (Channels) {
-        // Load the entire row before reduction, as the eager 4096-wide kernel
-        // does. Loading affine weights after the reduction serializes memory
-        // latency on this one-CTA decode workload.
-        #pragma unroll
-        for (int part = 0; part < Channels / 256; ++part) {
-            int c = threadIdx.x + part * 256;
-            cached[part] = RoundBF16((float)hidden[c] + (float)branch[c]);
-            affine[part] = weight[c];
-        }
-        #pragma unroll
-        for (int part = 0; part < Channels / 256; ++part) {
-            hidden[threadIdx.x + part * 256] = __float2bfloat16(cached[part]);
-            partial += cached[part] * cached[part];
-        }
-    } else {
-        for (int c = threadIdx.x; c < channels; c += 256) {
-            float value = RoundBF16((float)hidden[c] + (float)branch[c]);
-            hidden[c] = __float2bfloat16(value);
-            partial += value * value;
-        }
-    }
-    partial = WarpSum(partial);
-    if (threadIdx.x % 32 == 0) sums[threadIdx.x / 32] = partial;
-    __syncthreads();
-    if (threadIdx.x < 32) {
-        float total = WarpSum(threadIdx.x < 8 ? sums[threadIdx.x] : 0);
-        if (threadIdx.x == 0) sums[0] = total;
-    }
-    __syncthreads();
-    float scale = rsqrtf(sums[0] / channels + eps);
-    if constexpr (Channels) {
-        #pragma unroll
-        for (int part = 0; part < Channels / 256; ++part)
-            output[threadIdx.x + part * 256] =
-                __float2bfloat16(RoundBF16(cached[part] * scale) * affine[part]);
-    } else {
-        for (int c = threadIdx.x; c < channels; c += 256)
-            output[c] = __float2bfloat16(RoundBF16((float)hidden[c] * scale) * weight[c]);
-    }
-}
-
 __global__ void DraftInput(const float *id, const BF16 *embedding, const BF16 *mask,
         const int *length, BF16 *hidden, float *positions, int channels) {
     int row = blockIdx.y, column = blockIdx.x * blockDim.x + threadIdx.x;
@@ -3676,9 +3622,11 @@ void FastllmCudaNaiveAddDecodeRMSNorm(fastllm::Data &hidden,
         float eps, fastllm::Data &output) {
     Output(output, fastllm::BFLOAT16, hidden.dims);
     int channels = hidden.dims.back();
-    auto kernel = channels == 4096 ? AddDecodeRMSNorm<4096> : AddDecodeRMSNorm<>;
+    auto kernel = channels == 4096
+        ? fastllm::cuda_norm::AddRMSNorm<BF16, 4096, true, false>
+        : fastllm::cuda_norm::AddRMSNorm<BF16, 0, true, false>;
     kernel<<<hidden.Count(0) / channels, 256>>>((BF16 *)hidden.cudaData, (const BF16 *)branch.cudaData,
-        (const float *)weight.cudaData, (BF16 *)output.cudaData, channels, eps);
+        (const float *)weight.cudaData, (BF16 *)output.cudaData, channels, eps, false);
     CheckLaunch();
 }
 

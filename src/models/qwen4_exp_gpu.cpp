@@ -2,6 +2,8 @@
 #include "qwen4_exp_execution.h"
 #include "baseblock.h"
 #include "utils.h"
+#include "utils/hybrid_moe.h"
+#include <cstdlib>
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
 #endif
@@ -53,6 +55,35 @@ namespace fastllm {
         if (!prepared) SelectMoEExperts(routerLogits, index, score);
         const auto moeDevice = SelectSpecialWeightDevice(mlp + "experts.0.gateup_proj.weight", deviceLayer);
         const auto outputDevice = SelectDeviceFromMap(deviceMap, deviceLayer + 1, block_cnt);
+        // Resident expert layers use the GPU plan even in a hybrid backbone.
+        // Keep prepared routing tensors on the dense GPU: migrating them in
+        // the ordinary eager path invalidates the next dense graph capture.
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+        const char *remoteGraph = std::getenv("FASTLLM_QWEN38_REMOTE_GRAPH");
+        if (prepared && remoteGraph && std::string(remoteGraph) == "1" && threadTpRank < 0 &&
+            flattened.dataDevice == CUDA && flattened.dataDeviceIds.size() == 1 &&
+            moeWeights.size() > 2 && moeWeights[2] && moeWeights[2]->dataDevice == CUDA &&
+            moeWeights[2]->dataDeviceIds.size() == 1 &&
+            moeWeights[2]->dataDeviceIds.front() != flattened.dataDeviceIds.front()) {
+            if (!prepared->remote) prepared->remote = std::make_shared<HybridMoeRemoteWorkspace>();
+            const int owner = moeWeights[2]->dataDeviceIds.front();
+            RunRemoteHybridMoe(*prepared->remote, flattened, index, score, output, owner,
+                [&](HybridMoeRemoteWorkspace &remote) {
+                    ApplyDeviceMap({{"cuda:" + std::to_string(owner), 1}}, 1, 1);
+                    MergeMOE(remote.input, remote.index, remote.score, moeWeights, moeBiass,
+                        remote.w1, remote.w2, remote.w3, remote.tempInput, remote.tempOutput,
+                        1.0f, remote.output, deviceLayer);
+                });
+            FastllmCudaGraphMarkParallelJoin(deviceLayer);
+            output.Reshape(input.dims);
+            sharedOutput.Reshape(input.dims);
+            ApplyDeviceMap(deviceMap, deviceLayer + 1, block_cnt);
+            if (sharedOutput.dataType != output.dataType) ToDataType(sharedOutput, output.dataType);
+            AddTo(output, sharedOutput);
+            if (reduceOutput) ThreadTpAllReduce(output);
+            return;
+        }
+#endif
         const bool direct = moeDevice == outputDevice;
         Data transferredInput;
         Data &expertInput = executionMode == ExecutionMode::Hybrid && !direct ? transferredInput : flattened;

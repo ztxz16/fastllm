@@ -4,11 +4,36 @@
 #include "executor.h"
 #include "utils/utils.h"
 
+#include <cuda_runtime_api.h>
+#include <atomic>
+#include <chrono>
 #include <iostream>
+#include <array>
+#include <exception>
+#include <limits>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 using namespace fastllm;
+
+#ifdef FASTLLM_TEST_WRAP_WORKSPACE
+namespace {
+size_t allocationLimit = 0;
+bool allocationError = false;
+int allocationCalls = 0;
+}
+extern "C" FastllmCudaTryMallocResult __real_FastllmCudaTryDirectMalloc(void **pointer, size_t bytes);
+extern "C" FastllmCudaTryMallocResult __wrap_FastllmCudaTryDirectMalloc(void **pointer, size_t bytes) {
+    if (allocationLimit || allocationError) {
+        ++allocationCalls;
+        *pointer = nullptr;
+        if (allocationError) return FASTLLM_CUDA_TRY_MALLOC_ERROR;
+        if (bytes > allocationLimit) return FASTLLM_CUDA_TRY_MALLOC_CAPACITY_FAILURE;
+    }
+    return __real_FastllmCudaTryDirectMalloc(pointer, bytes);
+}
+#endif
 
 namespace {
 void Require(bool value, const char *message) {
@@ -63,6 +88,176 @@ void CheckArena() {
     void *normal = FastllmCudaMalloc(4096);
     Require(normal && !IsCudaWorkspacePointer(normal), "scope leaked into ordinary CUDA allocations");
     FastllmCudaFree(normal);
+}
+
+void CheckBorrowedArena() {
+    constexpr size_t bytes = 4 << 20;
+    void *base = FastllmCudaDirectMalloc(bytes + 512);
+    bool returned = false;
+    auto arena = std::make_shared<CudaWorkspace>(0,
+        std::vector<CudaWorkspace::Region>{{static_cast<char *>(base) + 256, bytes}},
+        [&] { returned = true; });
+    std::weak_ptr<CudaWorkspace> weak = arena;
+    std::thread worker([&] {
+        FastllmCudaSetDevice(0);
+        Data scratch(INT8, {int(bytes)});
+        scratch.cudaWorkspace = arena;
+        scratch.ToDevice(CUDA, {0}, false);
+        scratch.Allocate(false);
+        Require(IsCudaWorkspacePointer(scratch.cudaData), "explicit tensor arena was ignored");
+        FastllmCudaMemset0(scratch.cudaData, bytes);
+        // Destruction publishes a GPU fence, not a host-side stream wait.
+    });
+    worker.join();
+    void *again = AllocateCudaWorkspace(arena, bytes);
+    Require(again == static_cast<char *>(base) + 256, "borrowed range not reused across streams");
+    std::vector<unsigned char> values(bytes, 1);
+    FastllmCudaCopyFromDeviceToHost(values.data(), again, bytes);
+    Require(std::all_of(values.begin(), values.end(), [](unsigned char x) { return x == 0; }),
+        "borrowed range reused before previous stream completed");
+    arena.reset();
+    Require(!weak.expired() && !returned, "owner returned with a live allocation");
+    FastllmCudaFree(again);
+    Require(weak.expired() && returned, "borrowed owner leaked after release");
+    // Disjoint format partitions cannot satisfy one allocation across a gap.
+    returned = false;
+    arena = std::make_shared<CudaWorkspace>(0,
+        std::vector<CudaWorkspace::Region>{
+            {static_cast<char *>(base) + 256, bytes / 4},
+            {static_cast<char *>(base) + bytes / 2 + 256, bytes / 4}},
+        [&] { returned = true; });
+    Require(!AllocateCudaWorkspace(arena, bytes / 2, false),
+        "borrowed allocation crossed a partition gap");
+    void *left = AllocateCudaWorkspace(arena, bytes / 4);
+    void *right = AllocateCudaWorkspace(arena, bytes / 4);
+    Require(left == static_cast<char *>(base) + 256 &&
+            right == static_cast<char *>(base) + bytes / 2 + 256,
+        "borrowed partition ranges overlap or moved");
+    FastllmCudaFree(left); FastllmCudaFree(right);
+    arena.reset();
+    Require(returned, "partitioned workspace did not return its owner");
+    // The allocator must not cudaFree a borrowed address or its parent.
+    FastllmCudaMemset0(base, bytes + 512);
+    FastllmCudaDirectFree(base);
+}
+
+// One release may be split between two subsequent allocating streams. Each
+// must wait for the original writer, even after the first slice was reused.
+void CheckBorrowedArenaSplitStreams() {
+    constexpr size_t bytes = 512;
+    void *base = FastllmCudaDirectMalloc(bytes);
+    auto arena = std::make_shared<CudaWorkspace>(0,
+        std::vector<CudaWorkspace::Region>{{base, bytes}}, [] {});
+    void *original = arena->Allocate(bytes);
+    void *writer = FastllmCudaStreamCreate();
+    std::atomic<bool> release{false};
+    Require(cudaLaunchHostFunc(static_cast<cudaStream_t>(writer), [](void *p) {
+        auto &ready = *static_cast<std::atomic<bool> *>(p);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!ready.load() && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::yield();
+    }, &release) == cudaSuccess, "cannot delay workspace writer");
+    Require(cudaMemsetAsync(original, 0x11, bytes, static_cast<cudaStream_t>(writer)) == cudaSuccess,
+            "cannot queue workspace write");
+    arena->FreeAfterStream(original, writer);
+    void *left = arena->Allocate(bytes / 2), *right = nullptr;
+    void *done = FastllmCudaEventCreate();
+    std::thread consumer([&] {
+        FastllmCudaSetDevice(0);
+        right = arena->Allocate(bytes / 2);
+        if (right) cudaMemsetAsync(right, 0x22, bytes / 2, cudaStreamPerThread);
+        FastllmCudaEventRecordCurrentThread(done);
+    });
+    consumer.join();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+    bool premature = false;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (cudaEventQuery(static_cast<cudaEvent_t>(done)) == cudaSuccess) {
+            premature = true;
+            break;
+        }
+        std::this_thread::yield();
+    }
+    release.store(true);
+    FastllmCudaStreamSynchronize(writer);
+    FastllmCudaEventSynchronize(done);
+    FastllmCudaSyncCurrentThreadStream();
+    std::vector<unsigned char> values(bytes);
+    FastllmCudaCopyFromDeviceToHost(values.data(), base, bytes);
+    arena->Free(left); arena->Free(right); arena.reset();
+    FastllmCudaEventDestroy(done); FastllmCudaStreamDestroy(writer);
+    FastllmCudaDirectFree(base);
+    Require(!premature, "second allocating stream skipped the original release fence");
+    Require(std::all_of(values.begin(), values.begin() + bytes / 2, [](unsigned char x) { return x == 0x11; }) &&
+            std::all_of(values.begin() + bytes / 2, values.end(), [](unsigned char x) { return x == 0x22; }),
+            "split workspace slices raced with their previous writer");
+}
+
+void CheckArenaFallback() {
+    for (size_t minimum : {size_t(4097), std::numeric_limits<size_t>::max()}) {
+        bool rejected = false;
+        try { CudaWorkspace invalid(0, 4096, minimum); }
+        catch (const std::invalid_argument &) { rejected = true; }
+        Require(rejected, "invalid arena minimum accepted");
+    }
+#ifdef FASTLLM_TEST_WRAP_WORKSPACE
+    struct Restore {
+        int device = FastllmCudaGetDevice();
+        ~Restore() { allocationLimit = 0; allocationError = false; FastllmCudaSetDevice(device); }
+    } restore;
+    const int previous = FastllmCudaGetDeviceCount() > 1 ? 1 : 0;
+    FastllmCudaSetDevice(previous);
+    allocationLimit = 4096;
+    {
+        auto arena = std::make_shared<CudaWorkspace>(0, 16384, 2048);
+        Require(arena->Capacity() >= 2048 && arena->Capacity() <= allocationLimit,
+                "arena did not shrink within requested bounds");
+        Require(FastllmCudaGetDevice() == previous, "arena allocation changed current device");
+        void *pointer = AllocateCudaWorkspace(arena, 2048);
+        Require(pointer && TryFreeCudaWorkspace(pointer), "shrunken arena is unusable");
+    }
+    allocationLimit = 1024;
+    bool exhausted = false;
+    try { CudaWorkspace arena(0, 16384, 2048); }
+    catch (const std::runtime_error &) { exhausted = true; }
+    Require(exhausted && FastllmCudaGetDevice() == previous && !FastllmCudaGetThreadError(),
+            "arena exhaustion changed device or poisoned CUDA state");
+    allocationError = true;
+    allocationCalls = 0;
+    bool failed = false;
+    try { CudaWorkspace arena(0, 16384, 2048); }
+    catch (const std::runtime_error &) { failed = true; }
+    Require(failed && allocationCalls == 1 && FastllmCudaGetDevice() == previous,
+            "non-capacity allocation error was retried or changed device");
+#endif
+}
+
+void CheckConcurrentArena() {
+    auto arena = std::make_shared<CudaWorkspace>(0, 2 << 20);
+    std::array<std::vector<void *>, 8> blocks;
+    auto parallel = [&](const auto &task) {
+        std::array<std::exception_ptr, 8> errors;
+        std::vector<std::thread> threads;
+        for (int rank = 0; rank < 8; ++rank) threads.emplace_back([&, rank] {
+            try { task(rank); } catch (...) { errors[rank] = std::current_exception(); }
+        });
+        for (auto &thread : threads) thread.join();
+        for (auto error : errors) if (error) std::rethrow_exception(error);
+    };
+    parallel([&](int rank) {
+        for (int i = 0; i < 1024; ++i) {
+            auto *pointer = AllocateCudaWorkspace(arena, 256, false);
+            Require(pointer && IsCudaWorkspacePointer(pointer), "concurrent arena allocation failed");
+            blocks[rank].push_back(pointer);
+        }
+    });
+    Require(arena->LiveBytes() == arena->Capacity(), "concurrent arena accounting mismatch");
+    Require(!AllocateCudaWorkspace(arena, 256, false), "full arena allocation must fail");
+    parallel([&](int rank) {
+        for (auto *pointer : blocks[(rank + 1) % 8])
+            Require(TryFreeCudaWorkspace(pointer), "cross-thread release lost arena ownership");
+    });
+    Require(arena->LiveBytes() == 0, "concurrent arena release leaked storage");
 }
 
 class TestModel : public Qwen3_5Model {
@@ -153,6 +348,10 @@ int main() {
     SetThreads(4);
     try {
         CheckArena();
+        CheckBorrowedArena();
+        CheckBorrowedArenaSplitStreams();
+        CheckArenaFallback();
+        CheckConcurrentArena();
         for (bool cudaEmbedding : {false, true}) {
             for (DataType dtype : {FLOAT32, FLOAT16, BFLOAT16}) CheckCpuStaging(cudaEmbedding, dtype);
         }

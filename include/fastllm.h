@@ -34,6 +34,7 @@
 namespace fastllm {
     struct RopeConfig;
     class Data;
+    class CudaWorkspace;
 
     class FastllmEnv {
     public:
@@ -535,6 +536,9 @@ namespace fastllm {
         uint8_t *cpuData = nullptr; // 数据指针
 
 	    void *cudaData = nullptr;
+        // Optional eager scratch owner; model weights, KV and graph buffers
+        // must never opt in. Allocation slices retain this owner independently.
+        std::shared_ptr<CudaWorkspace> cudaWorkspace;
         bool cudaDataBorrowed = false; // cudaData points into another owner and should not be freed directly
         // Set only when this object owns entries in the DeepSeek-V4 CUDA
         // route-table registry, so ordinary temporary tensors can skip the

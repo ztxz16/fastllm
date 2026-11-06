@@ -71,8 +71,8 @@ def prepare(directory, hc_mult=4, expert_cache=False, fp8_dense=False,
                 value = (tensor.float().repeat(1, copies) / copies).to(tensor.dtype)
         weights[name] = value.contiguous()
     if expert_cache:
-        # At least 16 records are required by the cache. Duplicate the two
-        # fixture experts, then store block-32 E2M1 weights and UE8M0 scales.
+        # Duplicate the two fixture experts, then store block-32 E2M1
+        # weights and UE8M0 scales for resident and staged execution.
         values = torch.tensor([0., .5, 1., 1.5, 2., 3., 4., 6.])
         for name, tensor in list(weights.items()):
             if '.ffn.gate.' in name:
@@ -113,6 +113,10 @@ def main():
     backend.add_argument('--expert-cache', action='store_true')
     backend.add_argument('--gpu-experts', action='store_true')
     backend.add_argument('--disk-experts', action='store_true')
+    parser.add_argument('--moe-device-layers', type=int, default=-1,
+                        help='place only the last N layers on the host backend; keep the prefix on GPU')
+    parser.add_argument('--cache-bytes', type=int, default=0,
+                        help='exercise tiny/zero-resident hybrid caches, e.g. 65536')
     parser.add_argument('--ngram-device', choices=('cpu', 'disk', 'cuda'), default='cpu')
     parser.add_argument('--fp8-dense', action='store_true',
                         help='exercise block-32 FP8 weights and persistent activation quantization buffers')
@@ -121,6 +125,9 @@ def main():
     parser.add_argument('--full-verify', action='store_true',
                         help='require full target verification graphs with native FP4 experts and GPU Engram')
     args = parser.parse_args()
+    if args.disk_experts:
+        # Exercise the supported native FP4 disk mailbox, retaining FP8 boundaries.
+        args.fp8_dense = True
     if args.full_verify:
         if args.expert_cache or args.disk_experts or args.eager_only or args.hc_mult != 4 or args.tp_size == 1:
             parser.error('--full-verify requires GPU experts, hc-mult=4 and TP >= 2')
@@ -128,12 +135,16 @@ def main():
         args.ngram_device = 'cuda'
     with tempfile.TemporaryDirectory(prefix='v41-tp-graph-') as path:
         directory = Path(path)
-        prepare(directory, args.hc_mult, args.expert_cache or args.full_verify, args.fp8_dense,
+        prepare(directory, args.hc_mult, args.expert_cache or args.full_verify or args.disk_experts, args.fp8_dense,
                 expert_count=2 * args.tp_size if args.full_verify else 4)
         env = dict(os.environ, FASTLLM_SKIP_WARMUP='1', FASTLLM_DSV41_REFERENCE_MATH='0',
                    FASTLLM_DSV41_DISABLE_FAKE_QUANT='0' if args.fp8_dense else '1',
                    FASTLLM_DSV41_CUDA_GRAPH_DEBUG='1')
         command = [args.binary, str(directory), '--tp-size', str(args.tp_size)] + (['--expert-cache'] if args.expert_cache else [])
+        if args.moe_device_layers >= 0:
+            command += ['--moe-device-layers', str(args.moe_device_layers)]
+        if args.cache_bytes:
+            command += ['--cache-bytes', str(args.cache_bytes)]
         if args.gpu_experts:
             command.append('--gpu-experts')
         if args.disk_experts:
@@ -155,23 +166,21 @@ def main():
             raise SystemExit(77)
         result.check_returncode()
         assert 'PASS: eager verification 1..8, features and rollback match across requests' in result.stdout
-        if args.eager_only or args.disk_experts:
+        if args.eager_only:
             assert 'decode CUDA graph captured:' not in result.stdout
-            if args.disk_experts:
-                assert 'CUDA Graph bypassed for disk expert weights' in result.stdout
-                if not args.eager_only:
-                    assert 'PASS: disk experts preserve eager results with CUDA Graph requested' in result.stdout
         else:
             assert 'PASS: DSpark graph shapes 1..8, main features and rollback match across requests' in result.stdout
             assert 'decode CUDA graph captured:' in result.stdout, 'graph was not exercised'
             for tokens in range(1, 9):
                 assert re.search(r'graph captured:.*tokens=%d\b' % tokens, result.stdout), 'missing graph shape %d' % tokens
                 assert 'graph replay: tokens=%d' % tokens in result.stdout, 'shape %d never replayed' % tokens
-        if args.full_verify:
+        if args.full_verify or args.expert_cache or args.disk_experts:
             for tokens in range(2, 9):
                 assert f'full verify graph ready: tokens={tokens},' in result.stdout
+        if not args.eager_only and args.moe_device_layers >= 0:
+            assert 'full decode graph ready:' in result.stdout, 'resident/host decode was not composed'
         assert 'giving up' not in result.stdout and 'graph disabled' not in result.stdout
-        if args.expert_cache:
+        if args.expert_cache and args.tp_size == 1:
             assert re.search(r'V4.1 verify cache:.* [1-9]\d* GPU routes', result.stdout), 'verify never used GPU experts'
 
 

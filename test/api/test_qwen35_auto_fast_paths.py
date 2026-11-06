@@ -408,6 +408,29 @@ class NvidiaCudaPlatformDetectionTest(unittest.TestCase):
             self.assertTrue(_is_nvidia_cuda_platform())
             vendor_tool.assert_not_called()
 
+    def test_nvidia_gpu_with_cirrus_display_is_detected(self):
+        def fake_open(path, *args, **kwargs):
+            device = os.path.basename(os.path.dirname(str(path)))
+            if str(path).endswith("/vendor"):
+                vendor = "0x10de" if device == "nvidia" else "0x1013"
+                return io.StringIO(vendor + "\n")
+            if str(path).endswith("/class"):
+                return io.StringIO("0x030000\n")
+            raise FileNotFoundError(path)
+
+        with patch(
+                "fastllm_pytools.util._uses_non_nvidia_cuda_compatible_build",
+                return_value=False), patch(
+                "fastllm_pytools.util.glob.glob",
+                return_value=[
+                    "/sys/bus/pci/devices/nvidia",
+                    "/sys/bus/pci/devices/bmc",
+                ]), patch(
+                "builtins.open", side_effect=fake_open), patch(
+                "fastllm_pytools.util.subprocess.run") as vendor_tool:
+            self.assertTrue(_is_nvidia_cuda_platform())
+            vendor_tool.assert_not_called()
+
     def test_mixed_compute_gpu_vendors_are_not_treated_as_nvidia(self):
         def fake_open(path, *args, **kwargs):
             device = os.path.basename(os.path.dirname(str(path)))

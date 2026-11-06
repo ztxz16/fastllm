@@ -1,4 +1,10 @@
 #include "utils/hybrid_moe.h"
+#include "utils.h"
+#ifdef USE_CUDA
+#include "devices/cuda/fastllm-cuda.cuh"
+#include "devices/cuda/fastllm-cuda-graph-workspace.h"
+#include "devices/multicuda/fastllm-multicuda.cuh"
+#endif
 #ifdef USE_NUMAS
 #include "devices/numas/numasdevice.h"
 #endif
@@ -9,6 +15,111 @@
 #endif
 
 namespace fastllm {
+#ifdef USE_CUDA
+HybridMoeGraph::~HybridMoeGraph() { Reset(); }
+void HybridMoeGraph::Reset() {
+    const int previous = FastllmCudaGetDevice();
+    if (device >= 0) FastllmCudaSetDevice(device);
+    if (replay) FastllmCudaGraphExecDestroy(replay);
+    if (exec) FastllmCudaGraphExecDestroy(exec);
+    if (graph) FastllmCudaGraphDestroy(graph);
+    for (void *handle : handles) FastllmCudaReleaseNativeMoeFullGraph(handle);
+    handles.clear();
+    graph = exec = replay = nullptr;
+    launches = 0;
+    device = -1;
+    FastllmCudaSetDevice(previous);
+}
+bool HybridMoeGraph::Compose(const std::vector<const void *> &children,
+                            std::vector<void *> ownedHandles) {
+    Reset();
+    device = FastllmCudaGetDevice();
+    handles = std::move(ownedHandles);
+    bool ok = !children.empty() &&
+        FastllmCudaGraphCompose(children.data(), children.size(), &graph, &exec);
+    if (ok && !handles.empty())
+        ok = FastllmCudaCreateNativeMoeReplayGraph(graph, handles.data(), handles.size(), &replay);
+    if (!ok) Reset();
+    return ok;
+}
+bool HybridMoeGraph::Launch() {
+    if (!exec) return false;
+    const bool timed = launches < 8 || launches % 64 == 0;
+    const bool ok = handles.empty() ? FastllmCudaGraphLaunch(exec) :
+        FastllmCudaLaunchNativeMoeFullGraph(timed ? exec : replay,
+            handles.data(), handles.size(), timed);
+    if (ok) ++launches;
+    return ok;
+}
+
+HybridMoeRemoteWorkspace::~HybridMoeRemoteWorkspace() {
+    const int original = FastllmCudaGetDevice();
+    if (source >= 0) FastllmCudaSyncDevice(source);
+    if (device >= 0) FastllmCudaSyncDevice(device);
+    if (ready) FastllmCudaEventDestroy(ready);
+    if (done) FastllmCudaEventDestroy(done);
+    FastllmCudaSetDevice(original);
+}
+
+void RunRemoteHybridMoe(HybridMoeRemoteWorkspace &remote,
+    const Data &input, const Data &index, const Data &score, Data &output, int device,
+    const std::function<void(HybridMoeRemoteWorkspace &)> &compute) {
+    AssertInFastLLM(input.dataDevice == CUDA && input.dataDeviceIds.size() == 1 &&
+        index.dataDevice == CUDA && score.dataDevice == CUDA &&
+        index.dataDeviceIds == input.dataDeviceIds && score.dataDeviceIds == input.dataDeviceIds &&
+        input.cudaData && index.cudaData && score.cudaData && device >= 0 &&
+        device != input.dataDeviceIds.front(), "Invalid remote resident MoE placement.");
+    const int source = input.dataDeviceIds.front();
+    FastllmCudaSetDevice(source);
+    const bool capturing = FastllmCudaGraphIsCapturingFast();
+    if (!remote.ready) {
+        AssertInFastLLM(!capturing, "Remote MoE must warm up before graph capture.");
+        remote.source = source; remote.device = device;
+        remote.ready = FastllmCudaEventCreate();
+        FastllmCudaSetDevice(device);
+        remote.done = FastllmCudaEventCreate();
+        AssertInFastLLM(FastllmCudaGraphPrepareCaptureDevice(), "Remote MoE capture preparation failed.");
+    }
+    AssertInFastLLM(remote.source == source && remote.device == device,
+        "Remote MoE graph owner changed.");
+    auto allocate = [](Data &dst, DataType type, const std::vector<int> &dims, int owner) {
+        if (dst.dataDevice != CUDA || dst.dataDeviceIds != std::vector<int>{owner} || dst.dataType != type) {
+            dst.FreeSpace(); dst.dataType = type; dst.UpdateUnitSize();
+            dst.dataDevice = CUDA; dst.dataDeviceIds = {owner};
+        }
+        dst.Resize(dims); dst.Allocate(false);
+    };
+    auto copy = [](Data &dst, const Data &src) {
+        AssertInFastLLM(FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(
+            dst.cudaData, src.cudaData, src.GetBytes()), "Remote MoE async transfer failed.");
+    };
+    FastllmCudaSetDevice(device);
+    allocate(remote.input, input.dataType, input.dims, device);
+    allocate(remote.index, index.dataType, index.dims, device);
+    allocate(remote.score, score.dataType, score.dims, device);
+    FastllmCudaSetDevice(source);
+    copy(remote.input, input); copy(remote.index, index); copy(remote.score, score);
+    FastllmCudaEventRecordCurrentThread(remote.ready);
+    FastllmCudaSetDevice(device);
+    FastllmCudaCurrentThreadStreamWaitEvent(remote.ready);
+    if (capturing) AssertInFastLLM(FastllmCudaGraphJoinCapture(), "Remote MoE capture join failed.");
+    std::vector<size_t> allocations;
+    {
+        FastllmCudaAllocationRecorder recorder(capturing ? nullptr : &allocations);
+        compute(remote);
+    }
+    FastllmCudaEventRecordCurrentThread(remote.done);
+    if (!capturing) {
+        FastllmCudaEventSynchronize(remote.done);
+        AssertInFastLLM(FastllmCudaReserveGraphWorkspace(allocations), "Remote MoE scratch reservation failed.");
+    }
+    FastllmCudaSetDevice(source);
+    FastllmCudaCurrentThreadStreamWaitEvent(remote.done);
+    allocate(output, remote.output.dataType, remote.output.dims, source);
+    copy(output, remote.output);
+}
+#endif
+
 bool IsSharedHostMoeDevice(const std::string &device) {
     if (device == "numa" || device.rfind("numa:", 0) == 0) return true;
 #ifdef USE_NUMAS
@@ -45,6 +156,11 @@ void HybridMoeCachePlan::Add(const std::vector<Data *> &weights,
 }
 bool HybridMoeCachePlan::Prepare(const std::function<void()> &registerNumaWeights,
                                  bool allowStreaming) const {
+    return Prepare(registerNumaWeights, allowStreaming, {}, false);
+}
+bool HybridMoeCachePlan::Prepare(const std::function<void()> &registerNumaWeights,
+                                 bool allowStreaming, const std::map<int, uint64_t> &deviceBudgets,
+                                 bool fullyResident) const {
 #if defined(USE_CUDA) && !defined(USE_ROCM)
     if (layers.empty()) return false;
 #ifdef USE_NUMAS
@@ -77,12 +193,12 @@ bool HybridMoeCachePlan::Prepare(const std::function<void()> &registerNumaWeight
     for (const auto &layer : layers) {
         cacheLayers.push_back({layer.weights, layer.count,
             math == HybridMoeMath::DeepSeekV41, swigluLimit, math == HybridMoeMath::Glm5,
-            layer.cacheDevice});
+            layer.cacheDevice, math == HybridMoeMath::Qwen38FlashNext});
     }
     // The backend retains format-dependent snapshot/registration order and
     // publishes a cache only after validation. Failure leaves host fallback intact.
-    if (!FastllmCudaPrepareMoeCache(cacheLayers.data(), static_cast<int>(cacheLayers.size()),
-            registerWeights, allowStreaming)) return false;
+    if (!FastllmCudaPrepareMoeCacheWithBudgets(cacheLayers.data(), static_cast<int>(cacheLayers.size()),
+            registerWeights, allowStreaming, deviceBudgets, fullyResident)) return false;
     return FastllmCudaSetMoeCacheBudgetFraction(const_cast<Data **>(layers.front().weights),
         layers.front().count, budgetFraction);
 #else
@@ -108,7 +224,8 @@ void HybridMoeDecodeStep::Finish() {
 #if defined(USE_CUDA) && !defined(USE_ROCM)
     void *current = policy;
     policy = nullptr;
-    FastllmCudaEndMoeDecode(current);
+    if (deviceLocal) FastllmCudaEndMoeDecodeOnDevice(current);
+    else FastllmCudaEndMoeDecode(current);
 #endif
 }
 HybridMoeDecodeGroup::~HybridMoeDecodeGroup() {

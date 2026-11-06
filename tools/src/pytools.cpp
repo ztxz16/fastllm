@@ -4,6 +4,7 @@
 
 #include "model.h"
 #include "models/naive_n05_flash.h"
+#include "models/clover.h"
 #include "devices/disk/diskdevice.h"
 #include "moe_cache_config.h"
 #include "utils/autotune.h"
@@ -46,6 +47,7 @@ struct FASTLLM_PYTOOLS_INIT {
 
 static thread_local std::string fastllmPytoolsWarmupError;
 static thread_local std::string fastllmPytoolsContextResult;
+static thread_local std::string fastllmPytoolsCloverError;
 
 extern "C" {
     DLL_EXPORT bool start_autotune_recording(const char *path) {
@@ -102,6 +104,42 @@ extern "C" {
             result = BenchmarkCpuLinearThreads(hidden, intermediate, kind, counts, count, budgetMs);
             return result.c_str();
         } catch (...) { return nullptr; }
+    }
+
+    DLL_EXPORT const char *benchmark_cpu_moe_threads(int hidden, int intermediate, int kind,
+            int rows, int topk, const int *counts, int count, int budgetMs) {
+#ifdef USE_NUMAS
+        static thread_local std::string result;
+        try {
+            if (!counts || count < 1 || count > 8 || hidden < 256 || hidden > 8192 ||
+                    intermediate < 256 || intermediate > 4096 || rows < 1 || rows > 32 ||
+                    topk < 1 || topk > 16 || budgetMs < 1 || budgetMs > 1000) return nullptr;
+            for (int i = 0; i < count; ++i)
+                if (counts[i] < 1 || counts[i] > 128) return nullptr;
+            result = BenchmarkCpuMoeThreads(hidden, intermediate, kind, rows, topk, counts, count, budgetMs);
+            return result.c_str();
+        } catch (...) { return nullptr; }
+#else
+        return nullptr;
+#endif
+    }
+
+    DLL_EXPORT const char *benchmark_cpu_standard_moe_threads(int hidden, int intermediate, int kind, int downKind,
+            int rows, int topk, const int *counts, int count, int budgetMs) {
+#ifdef USE_NUMAS
+        static thread_local std::string result;
+        try {
+            if (!counts || count < 1 || count > 8 || hidden < 256 || hidden > 8192 ||
+                    intermediate < 256 || intermediate > 4096 || rows < 1 || rows > 32 ||
+                    topk < 1 || topk > 16 || budgetMs < 1 || budgetMs > 1000) return nullptr;
+            for (int i = 0; i < count; ++i)
+                if (counts[i] < 1 || counts[i] > 128) return nullptr;
+            result = BenchmarkCpuMoeThreads(hidden, intermediate, kind, rows, topk, counts, count, budgetMs, true, downKind);
+            return result.c_str();
+        } catch (...) { return nullptr; }
+#else
+        return nullptr;
+#endif
     }
 
     DLL_EXPORT void set_cpu_low_mem(bool low) {
@@ -1011,6 +1049,37 @@ extern "C" {
         int ret = model->FetchResponseTokens(handleId);
         std::string s = (ret == -1 ? "<flmeos>" : model->weight.tokenizer.DecodeTokens(std::vector <int> {ret}));
         return string_to_chars(s);
+    }
+
+    DLL_EXPORT const char *get_clover_error() {
+        return fastllmPytoolsCloverError.c_str();
+    }
+
+    DLL_EXPORT bool configure_clover_llm_model(int modelId, const char *options) {
+        try {
+            auto *model = dynamic_cast<fastllm::CloverModel *>(models.GetModel(modelId));
+            if (!model || !options) throw std::invalid_argument("Clover model/options required");
+            std::string error;
+            auto config = json11::Json::parse(options, error);
+            if (!error.empty()) throw std::invalid_argument(error);
+            model->ConfigureClover(config);
+            fastllmPytoolsCloverError.clear();
+            return true;
+        } catch (const std::exception &e) { fastllmPytoolsCloverError = e.what(); return false; }
+    }
+
+    DLL_EXPORT int launch_response_clover_llm_model(int modelId, int len, const int *values, const char *options) {
+        try {
+            auto *model = dynamic_cast<fastllm::CloverModel *>(models.GetModel(modelId));
+            if (!model || !options || !values || len <= 0)
+                throw std::invalid_argument("Clover model, nonempty prompt and options required");
+            std::string error;
+            auto config = json11::Json::parse(options, error);
+            if (!error.empty()) throw std::invalid_argument(error);
+            int handle = model->LaunchClover(std::vector<int>(values, values + len), config);
+            fastllmPytoolsCloverError.clear();
+            return handle;
+        } catch (const std::exception &e) { fastllmPytoolsCloverError = e.what(); return -1; }
     }
 
     DLL_EXPORT int launch_response_llm_model(int modelId, int len, int *values,

@@ -8,12 +8,16 @@ namespace fastllm_prefill {
 // Cache storage may use [gate, up] rows while the host operator consumes
 // interleaved pairs. No dequantization or projection arithmetic is changed.
 __global__ void RestorePackedRows(const uint8_t *source, uint8_t *output,
-                                 int rows, size_t pitch, bool cross) {
+                                 int rows, size_t pitch, bool cross, bool block32Planar = false) {
     for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
          i < size_t(rows) * pitch; i += size_t(gridDim.x) * blockDim.x) {
         const int row = i / pitch;
         const int original = cross ? row / 2 + (row % 2) * (rows / 2) : row;
-        output[i] = source[size_t(original) * pitch + i % pitch];
+        const size_t canonical = size_t(original) * pitch + i % pitch;
+        const size_t block = canonical / 17, byte = canonical % 17;
+        const size_t address = block32Planar ?
+            (byte < 16 ? block * 16 + byte : size_t(rows) * (pitch / 17) * 16 + block) : canonical;
+        output[i] = source[address];
     }
 }
 

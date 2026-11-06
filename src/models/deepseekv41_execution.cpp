@@ -132,6 +132,10 @@ namespace fastllm {
 
             void V41ReplicaToCpu(Data &dst, const Data &src, const std::vector<int> &tpDevices) {
     #ifdef USE_CUDA
+                // A mixed placement can reuse GPU route staging as a host
+                // destination. Drop its stale replicas before copying the
+                // current producer into the CPU tensor.
+                if (&dst != &src && dst.multiDeviceData) V41ResetMultiDevice(dst);
                 // Preserve prefill's allocation / staging behavior. In particular,
                 // retaining its large CPU buffers changes dynamic expert staging.
                 // The optimization targets one activation vector during decode.
