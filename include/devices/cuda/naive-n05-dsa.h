@@ -11,6 +11,7 @@ struct FastllmNaiveDSARow {
     const int *keyPages = nullptr, *valuePages = nullptr;
     int pageLen = 0, poolTokens = 0;
     bool fp8 = false;
+    bool fp4 = false;
     // For SWA verification, candidates occupy slots 128 + offset while the
     // committed prefix stays in the ring. Ordinary decode uses -1.
     int verifyOffset = -1;

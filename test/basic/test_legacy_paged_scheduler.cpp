@@ -200,6 +200,34 @@ void CompletePagesOnly() {
     Check(pages.size() == 1, "recorder lost a complete page");
 }
 
+void OverlappingPageViews() {
+    PagedCacheManager pools[2];
+    for (auto &pool : pools) { pool.pageLen = 128; pool.SetMaxPages(64); }
+    std::vector<int> first{9, 2, 4, 7, 12}, second{9, 1}, held{9};
+    pools[0].Pick(first); pools[1].Pick(second); pools[0].Pick(held);
+    {
+        ResponseContext context;
+        context.pastKeyValues.resize(1);
+        auto configure = [&](Data &view, int pool, std::vector<int> pages) {
+            view.isPagedKVCache = true; view.pagedKVCacheData = &pools[pool];
+            view.pageLen = view.lastPageLen = 128; view.pageIndex = std::move(pages);
+        };
+        auto &root = context.pastKeyValues[0].first;
+        configure(root, 0, {9, 2, 9, 4}); root.multiDeviceData = true;
+        for (int rank = 0; rank < 3; ++rank) root.multiDeviceDatas[rank] = new Data();
+        configure(*root.multiDeviceDatas[0], 0, {4, 7, 2});
+        configure(*root.multiDeviceDatas[1], 1, {9, 1, 9});
+        configure(*root.multiDeviceDatas[2], 0, {7, 12});
+    }
+    Check(pools[0].pageRefCount[9] == 1, "root/local aliases released another request's page");
+    for (int page : {2, 4, 7, 12}) Check(pools[0].pageRefCount[page] == 0, "overlap leaked a page");
+    Check(pools[1].pageRefCount[9] == 0 && pools[1].pageRefCount[1] == 0, "different pools were deduplicated together");
+    Check(std::vector<int>(pools[0].freePages.end()-4,pools[0].freePages.end()) == std::vector<int>({2,4,7,12}),
+          "page release order changed");
+    pools[0].ReleasePageIndices(held);
+    Check(pools[0].FreePageCount() == 64 && pools[1].FreePageCount() == 64, "page pool partition changed");
+}
+
 void Single(CacheView view, int capacity, int pageSize, int prompt, int output, int expected) {
     SchedulerModel model(view, capacity, pageSize);
     const int actual = Drain(model, {Launch(model, prompt, output)})[0];
@@ -260,6 +288,7 @@ int main() {
         SetDeviceMap({{"cpu", 1}});
         SetMaxTokens(0);
         CompletePagesOnly();
+        OverlappingPageViews();
         SharedPoolPressure();
         for (auto view : {CacheView::Contiguous, CacheView::Paged, CacheView::TensorParallel}) {
             Single(view, 500, 128, 256, 244, 244);

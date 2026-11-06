@@ -79,6 +79,21 @@ extern "C" bool FastllmCudaGraphInstantiate(void *graph, void **exec) {
 }
 #endif
 using namespace fastllm;
+#ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+namespace fastllm {
+struct NaiveN05PrefixCacheTestAccess {
+    static void InvalidateAll(NaiveN05FlashModel &model) { model.InvalidateTensorParallelCache(); }
+    static int RetainedRows(NaiveN05FlashModel &model,
+            std::vector<std::pair<Data *, Data *>> &kv,
+            const std::vector<GenerationConfig> &configs, const std::vector<int> &lengths) {
+        NaiveN05FlashModel::TargetBatch batch{kv, configs, lengths, model.block_cnt};
+        model.ReorderTensorParallelServingCache(&batch);
+        auto retained = model.ReusableTensorParallelServingRows(&batch, false);
+        return std::count(retained.begin(), retained.end(), 1);
+    }
+};
+}
+#endif
 namespace fastllm {
 struct NaiveN05GraphTestAccess {
     static auto &DraftPrefixPool(NaiveN05FlashModel &model) { return model.prefixPool; }
@@ -573,7 +588,7 @@ class Fixture : public NaiveN05FlashModel {
         }
         return result;
     }
-    std::vector<float> SparseKvRun(bool enabled) {
+    std::vector<float> SparseKvRun(bool enabled, bool useDecodeGraph = true) {
         maxBatch = 4; SetMaxTokens(16384); SetChunkedPrefillSize(1024);
         if (enabled) {
             SetMaxTokens(13312); // Less than 4 * 4096, enough for the actual mixed histories.
@@ -626,7 +641,7 @@ class Fixture : public NaiveN05FlashModel {
                     for (auto &layer : requests[owner]) caches.emplace_back(&layer.first, &layer.second);
                     ++past[owner];
                 }
-                const bool graph = step % 3 != 0;
+                const bool graph = useDecodeGraph && step % 3 != 0;
                 SetCudaGraph(graph);
                 const int launches = verifyGraphLaunches;
                 ForwardBatch(count, Data(FLOAT32, {1, count}, ids), {}, pos, std::vector<int>(count, 1), caches,
@@ -1553,13 +1568,19 @@ class Fixture : public NaiveN05FlashModel {
                   << " eager=" << eager << " serving_captures=" << verifyGraphCaptures - captures
                   << " relative_max=" << largestLogitRelative << std::endl;
     }
-    void ServingPageGrowthChecks() {
-        maxBatch = 8; SetMaxTokens(131072); SetChunkedPrefillSize(4096); WarmUp();
+    void ServingPageGrowthChecks(bool sparse = false) {
+        maxBatch = 8; SetMaxTokens(131072); SetChunkedPrefillSize(4096);
+        if (sparse) {
+            KvMemConfig cfg; cfg.enabled = true; cfg.maxTokens = 7937;
+            cfg.residentTokens = 2048; cfg.prefillTokens = 4096; cfg.hostBytes = 1ULL << 30;
+            ConfigureKvMem(cfg);
+        }
+        WarmUp();
         const int captures = verifyGraphCaptures;
         std::vector<float> reference;
         std::exception_ptr error;
         std::atomic<bool> ready{false};
-        int growthSteps = 0;
+        int growthSteps = 0, retainedAfterPrefill = 0;
         // Exercise the owned-thread fast path, with identical teacher-forced
         // tokens and graph shapes. Invalidating every reference step retains
         // the full validation/allocation path as an exact numerical oracle.
@@ -1567,75 +1588,95 @@ class Fixture : public NaiveN05FlashModel {
             while (!ready.load()) std::this_thread::yield();
             try {
                 for (bool forceValidation : {true, false}) {
-                    std::vector<std::vector<std::pair<Data, Data>>> cache(8);
-                    ResponseContext invalidation;
-                    invalidation.Init(block_cnt, dataType, kvCacheDataType);
+                    std::vector<std::unique_ptr<ResponseContext>> contexts(8);
                     GenerationConfig config;
                     config.top_k = 1; config.repeat_penalty = 1; config.output_logits = true;
                     config.output_token_limit = 256;
                     std::vector<int> past(8);
-                    for (int row = 0; row < 8; ++row) {
+                    auto prefill = [&](int row) {
+                        contexts[row].reset(new ResponseContext());
+                        contexts[row]->Init(block_cnt, dataType, kvCacheDataType);
+                        OnResponseContextCreated(contexts[row].get());
+                        auto &cache = contexts[row]->pastKeyValues;
                         past[row] = 3072 + row * 17;
                         std::vector<float> ids(past[row]), positions(past[row]);
                         for (int i = 0; i < past[row]; ++i) { ids[i] = (i * 3 + row) % 251; positions[i] = i; }
-                        for (int i = 0; i < block_cnt; ++i)
-                            cache[row].emplace_back(Data(kvCacheDataType), Data(kvCacheDataType));
                         Forward(Data(FLOAT32, {1, past[row]}, ids), Data(),
-                            Data(FLOAT32, {1, past[row]}, positions), cache[row], config);
-                    }
+                            Data(FLOAT32, {1, past[row]}, positions), cache, config);
+                    };
+                    for (int row = 0; row < 5; ++row) prefill(row);
                     size_t offset = 0;
                     for (int step = 0; step < 256; ++step) {
-                        std::vector<float> ids(8);
-                        std::vector<Data> positions(8);
+                        if (step == 16) for (int row = 5; row < 8; ++row) prefill(row);
+                        if (step == 64) {
+                            OnResponseContextRemoved(contexts[2].get());
+                            contexts[2].reset();
+                        }
+                        if (step == 96) prefill(2);
+                        std::vector<int> order;
+                        for (int row = 0; row < 8; ++row) if (contexts[row]) order.push_back(row);
+                        if (step & 1) std::reverse(order.begin(), order.end());
+                        const int count = order.size();
+                        std::vector<float> ids(count);
+                        std::vector<Data> positions(count);
                         std::vector<Data *> pos;
                         std::vector<std::pair<Data *, Data *>> kv;
-                        std::vector<std::vector<float>> logits(8);
+                        std::vector<std::vector<float>> logits(count);
                         std::vector<std::vector<float> *> output;
-                        std::vector<GenerationConfig> configs(8, config);
-                        std::vector<int> lengths(8, 1);
-                        for (int row = 0; row < 8; ++row) {
-                            ids[row] = (past[row] * 3 + row) % 251;
-                            positions[row].CopyFrom(Data(FLOAT32, {1, 1}, {(float)past[row]}));
+                        std::vector<GenerationConfig> configs(count, config);
+                        std::vector<int> lengths(count, 1);
+                        for (int row = 0; row < count; ++row) {
+                            const int sequence = order[row];
+                            ids[row] = (past[sequence] * 3 + sequence) % 251;
+                            positions[row].CopyFrom(Data(FLOAT32, {1, 1}, {(float)past[sequence]}));
                             pos.push_back(&positions[row]); output.push_back(&logits[row]);
-                            for (auto &layer : cache[row]) kv.emplace_back(&layer.first, &layer.second);
+                            for (auto &layer : contexts[sequence]->pastKeyValues) kv.emplace_back(&layer.first, &layer.second);
                         }
-                        if (forceValidation) OnResponseContextCreated(&invalidation);
+                        if (forceValidation) NaiveN05PrefixCacheTestAccess::InvalidateAll(*this);
                         else {
                             bool growing = false;
-                            for (int row = 0; row < 8; ++row) {
-                                const auto &local = *cache[row][0].first.multiDeviceDatas.begin()->second;
+                            for (int row : order) {
+                                const auto &local = *contexts[row]->pastKeyValues[0].first.multiDeviceDatas.begin()->second;
                                 growing |= past[row] >= (int)local.pageIndex.size() * local.pageLen;
                             }
                             growthSteps += growing;
                         }
-                        ForwardBatch(8, Data(FLOAT32, {1, 8}, ids), {}, pos, lengths, kv,
+                        if (!forceValidation && (step == 16 || step == 96)) {
+                            int retained = NaiveN05PrefixCacheTestAccess::RetainedRows(*this, kv, configs, lengths);
+                            const int expected = step == 16 ? 5 : 7;
+                            if (retained != expected) throw std::runtime_error("prefill invalidated surviving decode rows");
+                            retainedAfterPrefill += retained;
+                        }
+                        ForwardBatch(count, Data(FLOAT32, {1, count}, ids), {}, pos, lengths, kv,
                                      configs, LastTokensManager(), &output);
-                        for (int row = 0; row < 8; ++row) {
+                        for (int row = 0; row < count; ++row) {
+                            const int sequence = order[row];
                             if (forceValidation) reference.insert(reference.end(), logits[row].begin(), logits[row].end());
                             else for (float value : logits[row])
                                 if (value != reference.at(offset++))
                                     throw std::runtime_error("paged growth changed logits");
-                            ++past[row];
+                            ++past[sequence];
                             for (int layer = 0; layer < block_cnt; ++layer)
-                            for (Data *root : {&cache[row][layer].first, &cache[row][layer].second})
+                            for (Data *root : {&contexts[sequence]->pastKeyValues[layer].first, &contexts[sequence]->pastKeyValues[layer].second})
                             for (auto &entry : root->multiDeviceDatas) {
                                 const auto &local = *entry.second;
                                 if (local.isPagedKVCache &&
-                                    (local.dims[1] != past[row] || local.lastPageLen != (past[row] - 1) % local.pageLen + 1))
+                                    (local.dims[1] != past[sequence] || local.lastPageLen != (past[sequence] - 1) % local.pageLen + 1))
                                     throw std::runtime_error("paged growth metadata mismatch");
                             }
                         }
                     }
+                    for (auto &context : contexts) if (context) OnResponseContextRemoved(context.get());
                 }
             } catch (...) { error = std::current_exception(); }
         });
         ready.store(true);
         mainLoop->join(); delete mainLoop; mainLoop = nullptr;
         if (error) std::rethrow_exception(error);
-        if (growthSteps < 8 || verifyGraphCaptures != captures)
+        if (growthSteps < 8 || retainedAfterPrefill != 12 || verifyGraphCaptures != captures)
             throw std::runtime_error("paged growth coverage or graph capture changed");
         std::cout << "SERVING PAGE GROWTH PASS exact_logits=" << reference.size()
-                  << " growth_steps=" << growthSteps << " serving_captures=0" << std::endl;
+                  << " retained_after_prefill=" << retainedAfterPrefill << " growth_steps=" << growthSteps << " serving_captures=0" << std::endl;
     }
     std::vector<float> IndexerStorageRun(bool sharded, bool graph) {
         SetIndexerTPStorage(sharded);
@@ -3398,6 +3439,26 @@ int main(int argc, char **argv) {
         SetDeviceMap({{"cuda:0", 1}});
         FastllmCudaSetDevice(0);
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+        if (argc > 2 && std::string(argv[2]) == "kvmem_fp4") {
+            SetCudaEmbedding(true); SetCudaGraph(true);
+            std::vector<float> reference;
+            for (bool graph : {false, true}) {
+                Fixture fixture(ranks, false, true, true, true);
+                const bool context = argc > 3 && std::string(argv[3]) == "context_shard";
+                fixture.SetIndexerTPStorage(!context, context);
+                fixture.SetKVCacheDataType(FP4_E2M1);
+                fixture.SetIndexerDataType(FP8_E4M3);
+                auto result = fixture.SparseKvRun(true, graph);
+                if (!graph) reference = std::move(result);
+                else {
+                    if (result.size() != reference.size()) throw std::runtime_error("FP4 logits missing");
+                    RequireCloseLogits(result.data(), reference, "FP4 graph changed model logits");
+                    std::cout << "FP4 EXECUTION PASS logits=" << result.size()
+                              << " relative=" << largestLogitRelative << std::endl;
+                }
+            }
+            return 0;
+        }
         if (argc > 2 && std::string(argv[2]) == "draft_prefill_tail") {
             SetCudaEmbedding(true); SetCudaGraph(true);
             DraftFixture fixture(true, 2, 0, 5); fixture.PrefillCommitChecks(); return 0;
@@ -3562,12 +3623,15 @@ int main(int argc, char **argv) {
             }
             return 0;
         }
-        if (argc > 2 && std::string(argv[2]) == "serving_page_growth") {
+        if (argc > 2 && (std::string(argv[2]) == "serving_page_growth" || std::string(argv[2]) == "serving_kvmem_transition")) {
             SetCudaEmbedding(true); SetCudaGraph(true);
             Fixture fixture(ranks, false, true, true, true);
             if (argc > 3 && std::string(argv[3]) == "fp8") fixture.SetKVCacheDataType(FP8_E4M3);
+            if (argc > 3 && std::string(argv[3]) == "fp4") fixture.SetKVCacheDataType(FP4_E2M1);
             if (argc > 4 && std::string(argv[4]) == "layer_shard") fixture.SetIndexerTPStorage(true);
-            fixture.ServingPageGrowthChecks();
+            if (argc > 4 && std::string(argv[4]) == "context_shard") fixture.SetIndexerTPStorage(false, true);
+            if (argc > 5 && std::string(argv[5]) == "fp8") fixture.SetIndexerDataType(FP8_E4M3);
+            fixture.ServingPageGrowthChecks(std::string(argv[2]) == "serving_kvmem_transition");
             return 0;
         }
         if (argc > 2 && std::string(argv[2]) == "cuda_sampling") {
@@ -3580,6 +3644,7 @@ int main(int argc, char **argv) {
             SetCudaEmbedding(true); SetCudaGraph(true);
             Fixture fixture(ranks, false, true, true, true);
             if (argc > 3 && std::string(argv[3]) == "fp8") fixture.SetKVCacheDataType(FP8_E4M3);
+            if (argc > 3 && std::string(argv[3]) == "fp4") fixture.SetKVCacheDataType(FP4_E2M1);
             if (argc > 4 && std::string(argv[4]) == "fp8") fixture.SetIndexerDataType(FP8_E4M3);
             if (argc > 5) fixture.SetIndexerTPStorage(std::string(argv[5]) == "layer_shard",
                 std::string(argv[5]) == "context_shard");

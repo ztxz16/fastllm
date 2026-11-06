@@ -24,6 +24,7 @@ namespace fastllm {
         ~NaiveN05FlashModel() override;
         void InitParams() override;
         void SetIndexerDataType(DataType dataType) override;
+        void SetKVCacheDataType(DataType dataType) override;
         void SetIndexerTPStorage(bool shardByLayer, bool shardByContext = false);
         std::map<std::string, std::vector<std::pair<std::string, DataType>>>
         GetTensorMap(const std::vector<std::string> &names) override;
@@ -138,6 +139,7 @@ namespace fastllm {
             int slot = -1, length = 0;
             bool draftReady = false;
             std::vector<int> tokens;
+            uint64_t tokenHash = 0; // Immutable with tokens after publication.
             // Observe the resident full-prefix endpoint without pinning KV.
             // Generation checks prevent a recycled physical page from reviving
             // a stale window checkpoint.
@@ -227,10 +229,10 @@ namespace fastllm {
                        TargetWorkspace *workspace = nullptr, const TargetBatch *batch = nullptr);
         int CacheReserveCapacity(const GenerationConfig &config) const;
         void AppendCache(Data &cache, Data &input, DataType cacheType, int reserveCapacity = 0, bool usePool = true);
-        void ReserveCache(Data &cache, int capacity, int width, bool usePool = true);
+        void ReserveCache(Data &cache, int capacity, int width, bool usePool = true, const Data *requestKey = nullptr);
         bool PreparePagedCache(Data &cache, PagedCacheManager &manager, int end);
         bool PreparePagedCache(Data &cache, PagedCacheManager &manager, int end,
-                               std::vector<Data *> *pendingPageTables);
+                               std::vector<Data *> *pendingPageTables, const Data *requestKey = nullptr);
         void UploadPagedCacheTables(const std::vector<Data *> &pendingPageTables);
         static void TrimCache(Data &cache, int length);
         int SampleTarget(Data &logits, std::vector<std::pair<Data, Data>> &kv,
@@ -295,6 +297,7 @@ namespace fastllm {
 
     private:
         friend struct NaiveN05PrefixCacheTestAccess;
+        friend struct NaiveN05FP4KVTestAccess;
         friend struct NaiveN05GraphTestAccess;
         // Only request lifecycle callbacks (serialized by dictLocker) own this
         // single idle allocation set. No token contents are reused.
@@ -312,7 +315,10 @@ namespace fastllm {
             return *tpIndexerSidecars.at(tpPagedCaches[rank][layer * 2].get());
         }
         void StageSparseKv(int rank, int layer, const Data &key, const Data &value, Data &outKey, Data &outValue);
-        int PackedIndexerWidth() const { return HasSeparateIndexer() ? 0 : IndexerCacheWidth(kvCacheDataType); }
+        // FP4 is limited to DSA K/V. SWA and the independent Indexer retain FP8.
+        DataType AuxiliaryKVType() const { return kvCacheDataType == FP4_E2M1 ? FP8_E4M3 : kvCacheDataType; }
+        DataType LayerKVType(int layer) const { return slidingLayers[layer] ? AuxiliaryKVType() : kvCacheDataType; }
+        int PackedIndexerWidth() const { return HasSeparateIndexer() ? 0 : IndexerCacheWidth(AuxiliaryKVType()); }
         bool InitTensorParallel();
         void PrepareTensorParallel();
         void InitTensorParallelKVPool();
@@ -326,7 +332,16 @@ namespace fastllm {
         struct TPServingState;
         std::shared_ptr<TPServingState> tpServingState;
         std::atomic<uint64_t> tpCacheEpoch{0};
+        // A fresh identity protects both request lifetime and owned KV layout.
+        // Unknown/global changes still invalidate every plan through tpCacheEpoch.
+        mutable std::mutex tpRequestMutex;
+        std::unordered_map<const Data *, uint64_t> tpRequestIds;
+        uint64_t tpNextRequestId = 0;
+        void InvalidateTensorParallelCache(const Data *requestKey = nullptr);
         bool CanReuseTensorParallelServingCache(const TargetBatch *batch, bool checkCapacity = true) const;
+        std::vector<unsigned char> ReusableTensorParallelServingRows(const TargetBatch *batch,
+                                                                    bool checkCapacity = true) const;
+        void ReorderTensorParallelServingCache(const TargetBatch *batch);
         void PrepareTensorParallelServing();
         bool PrepareTensorParallelServingDecode(const Data &inputIds,
             const LogitsSelection &selection, std::vector<int *> &cacheLengths,
@@ -408,7 +423,7 @@ namespace fastllm {
             return fp8IndexerCache ? 144 / (type == FP8_E4M3 ? 1 : 2) : indexDim;
         }
         int LocalIndexerCacheWidth(int layer, int rank) const {
-            return !HasSeparateIndexer() && HasLocalIndexer(layer, rank) ? IndexerCacheWidth(kvCacheDataType) : 0;
+            return !HasSeparateIndexer() && HasLocalIndexer(layer, rank) ? IndexerCacheWidth(AuxiliaryKVType()) : 0;
         }
         std::vector<std::vector<Data *>> moeWeights, moeBiases;
     };

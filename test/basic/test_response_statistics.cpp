@@ -43,6 +43,21 @@ public:
         RemoveResponseContext(handle);
         dictCV.notify_all();
     }
+
+    void ReplaceWaiting(int handle, bool notify = true) {
+        std::lock_guard<std::mutex> lock(dictLocker);
+        const auto generation = responseContextDict.GetHandle(handle)->generation;
+        RemoveResponseContext(handle);
+        // Force handle wraparound to exercise the generation guard even though
+        // ordinary allocation avoids immediate reuse.
+        responseContextDict.nextHandle = handle;
+        Check(responseContextDict.CreateHandle() == handle, "waiting handle not reused");
+        auto *context = responseContextDict.GetHandle(handle);
+        Check(context->generation != generation, "request generation not advanced");
+        context->resultTokenQueue.push(321);
+        context->isEnding = true;
+        if (notify) dictCV.notify_all();
+    }
 };
 
 int main() {
@@ -139,7 +154,42 @@ int main() {
             waiter.join();
         wake.RemoveResponseContext(wakeHandle);
         Check(notified == 2, "new requests must wake the scheduler as well as token consumers");
-        std::cout << "Response statistics and cancellation tests passed (1000 request transitions)\n";
+        for (int api = 0; api < 3; ++api) {
+            handle = model.Create(100, 80, 0, false);
+            auto fetch = [&] {
+                std::vector<float> logits;
+                if (api == 0) return model.FetchResponseTokens(handle);
+                if (api == 1) return model.FetchResponseLogits(handle, logits);
+                return model.FetchResponseTokensBatch(handle, tokens, 64, statistics);
+            };
+            auto waiter = std::async(std::launch::async, fetch);
+            Check(waiter.wait_for(std::chrono::milliseconds(50)) == std::future_status::timeout,
+                  "empty request did not block");
+            model.ReplaceWaiting(handle);
+            Check(waiter.get() == -1, "old consumer followed reused handle");
+            Check(model.FetchResponseTokens(handle) == 321,
+                  "old consumer drained replacement output");
+            Check(model.FetchResponseTokens(handle) == -1, "replacement did not terminate");
+
+            handle = model.Create(100, 80, 0, false);
+            waiter = std::async(std::launch::async, fetch);
+            Check(waiter.wait_for(std::chrono::milliseconds(50)) == std::future_status::timeout,
+                  "terminal wake test did not block");
+            model.Finish(handle);
+            Check(waiter.get() == -1, "finished request did not wake consumer");
+        }
+        // Generation validation also applies to the keepalive timeout path.
+        handle = model.Create(100, 80, 0, false);
+        waiting = std::async(std::launch::async, [&] {
+            return model.FetchResponseTokensBatch(handle, tokens, 64, statistics);
+        });
+        Check(waiting.wait_for(std::chrono::milliseconds(50)) == std::future_status::timeout,
+              "keepalive reuse test did not block");
+        model.ReplaceWaiting(handle, false);
+        Check(waiting.get() == -1, "keepalive timeout hid a recycled request");
+        Check(model.FetchResponseTokens(handle) == 321, "keepalive consumed replacement output");
+        Check(model.FetchResponseTokens(handle) == -1, "keepalive replacement did not terminate");
+        std::cout << "Response statistics tests passed (1000 request transitions, cancellation and forced handle reuse)\n";
     } catch (const std::exception &error) {
         std::cerr << error.what() << '\n';
         return 1;

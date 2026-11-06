@@ -55,6 +55,59 @@ KV 历史缓存。页表和滑窗按分配大小使用独立的池，避免请�
 CUDA Graph、采样和临时算子工作区有各自的分配策略，不属于这项 KV 保证。
 CPU、按层串行、其他 KV 类型、草稿模型及跳过预热的直接调用保留原路径。
 
+### DSA FP4 KV（实验性）
+
+Naive/MiMo 的 CUDA TP + KVMem 路径可显式设置 `--kv_cache_dtype fp4`，
+仅将 DSA 主 attention 的 K/V 改成 E2M1 FP4，每 16 个值配一个 E4M3 scale。
+SWA 窗口和前缀快照继续使用 FP8 E4M3，Indexer 继续沿用 FP8 缓存及原来的
+`--indexer_dtype` 选择；该选项不启用或关闭 FP8 Indexer 评分，也不改变模型权重。
+默认配置不变。该组合要求至少两张 TP 卡、BF16 计算、显式 KVMem 预算和启动预热，
+不支持 draft；不满足条件时启动报错。
+
+在已有 CUDA TP + KVMem 的启动命令或 deploy worker 参数中，将
+`--kv_cache_dtype fp8` 改为 `--kv_cache_dtype fp4` 即可。其余容量、NUMA、
+TP/EP、Indexer、请求并发和攒批参数仍由启动配置指定，没有预设模型路径或机器地址。
+支持 `layer_shard` 和 `context_shard` 的 FP8 Indexer 存储，保持原有分片与全局 TopK 合并规则。
+既有 `--kvmem` 主机内存预算会根据 FP4 的实际存储字节重新检查；固定 `--tokens`
+时不会自动扩大上下文容量。
+
+每行布局为 `[width/2 个 packed value 字节][width/16 个 scale 字节]`。
+这是 Naive KVMem 的逐行布局，不可直接套用其他模型的 FP4 整页 planar 布局。
+主机分页池和 GPU 热缓存使用相同布局，换入/换出按完整行复制，不重新量化。
+DSA K/V 的净存储降为 FP8 的 9/16，减少 43.75%；页表、Indexer、SWA、
+前缀快照和工作区开销需另计。
+
+Prefill 将已有 FP4 历史解码到预分配、各层复用的 BF16 工作区；decode 直接读取
+热缓存中的 FP4。CUDA Graph 沿用设备指针表与动态页表，不固化请求地址。
+满足形状与资源条件时，Hopper 上至少 32 行、16-head GQA、单 KV head、
+QK=192/V=128、TopK=2048 的 FP4 decode 复用 FP8 融合路径的 BF16 Tensor Core
+QK/PV 和全局 softmax；FP4 tile 异步预取到共享内存后解包，不生成全局 score 工作区。
+缓存仍保存 FP4，并非使用原生 FP4 Tensor Core 指令；MMA 累加顺序可能与标量路径
+产生合理的数值差异，不要求逐位一致。每个 tile 由 16 个 head 共享，紧凑参数表保留
+Graph 重绑和动态页表；资源不足时回退到 8-head 共享或原有标量路径。
+其他形状保留原路径；不使用要求 BF16/FP8 原始布局的 TMA 路径。
+FP4 解包使用向量读取，prefill 的 BF16 工作区可复用 Hopper 分块注意力，
+减少重复解包与全局 FP32 score 工作区。
+FP4 block 的 payload 写入和 KVMem 行搬运按实际地址对齐选择向量宽度，
+非对齐视图保留较窄或逐字节回退。Hopper 的匹配 decode 形状还复用单请求内
+的 RoPE 角度，融合 DSA KV 量化及 Indexer 写入；量化和 BF16 舍入规则保持不变。
+
+回归目标为 `naive_n05_fp4_kv_test` / CTest `naive_n05_fp4_kv`，覆盖独立
+CPU 量化参考、K/V 跨页读写、共享前缀尾页复制、KVMem 热缓存换出与重载、
+稠密/稀疏 DSA 和 CUDA Graph 回放时切换缓存地址、页表及有效 batch；
+RoPE 写入还覆盖 packed QKV、带 scale 的 FP8 Indexer、79～449 路边界和 Graph
+重绑；TP4 回归覆盖两种 Indexer 分片的扩页、请求生命周期与前缀恢复。
+在启用 `-DUNIT_TEST=ON` 的 CUDA 构建中，GPU 空闲后可运行：
+
+```bash
+cmake --build build --target naive_n05_fp4_kv_test naive_n05_fp4_vector_test -j2
+cmake --build build --target naive_n05_verify_graph_test -j2
+ctest --test-dir build -R '^naive_n05_(fp4_(kv|vector)|kvmem(_transition|_prefix)?_fp4_.*)$' --output-on-failure
+```
+
+这是实验路径；上述回归检查存储和执行一致性，不代表 FP4 与原模型精度等价。
+使用目标模型前仍需检查长上下文 logits、任务准确率和端到端速度。
+
 ### Indexer 按层分卡存储
 
 多卡 CUDA TP 可加 `--indexer_tp_storage layer_shard`，将 DSA 层按顺序轮流

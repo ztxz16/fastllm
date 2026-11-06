@@ -109,6 +109,17 @@ namespace {
 #endif
 }
 
+void NaiveN05FlashModel::SetKVCacheDataType(DataType type) {
+    if (type == FP4_E2M1 || kvCacheDataType == FP4_E2M1)
+        AssertInFastLLM(!mainLoop && !tpPrepared && !sparseKv && !kvMemLocked && !autoWarmupRunning.load(),
+                        "Set Naive FP4 KV dtype before warmup or inference.");
+    if (type == FP4_E2M1) {
+        // ConfigureKvMem/WarmUp validate TP and storage budgets before allocation.
+        kvCacheDataType = type;
+        useCustomKVCacheDataType = true;
+    } else basellm::SetKVCacheDataType(type);
+}
+
 void NaiveN05FlashModel::SetIndexerDataType(DataType type) {
     AssertInFastLLM(type == DATA_AUTO_NONE || type == FP8_E4M3,
                     "Naive --indexer_dtype supports auto or fp8.");
@@ -176,9 +187,9 @@ void NaiveN05FlashModel::AppendCache(Data &cache, Data &input, DataType cacheTyp
     cache.isKVCache = true;
 }
 
-void NaiveN05FlashModel::ReserveCache(Data &cache, int capacity, int width, bool usePool) {
+void NaiveN05FlashModel::ReserveCache(Data &cache, int capacity, int width, bool usePool, const Data *requestKey) {
     if (cache.expansionDims.size() == 3 && cache.expansionDims[1] >= capacity) return;
-    tpCacheEpoch.fetch_add(1, std::memory_order_relaxed);
+    InvalidateTensorParallelCache(requestKey);
 #ifdef USE_CUDA
     auto pool = usePool && cache.dataDevice == DataDevice::CUDA && cache.dataDeviceIds.size() == 1
         ? tpKVPool.find(cache.dataDeviceIds[0]) : tpKVPool.end();
@@ -270,7 +281,7 @@ bool NaiveN05FlashModel::PreparePagedCache(Data &cache, PagedCacheManager &manag
 }
 
 bool NaiveN05FlashModel::PreparePagedCache(Data &cache, PagedCacheManager &manager, int end,
-                                         std::vector<Data *> *pendingPageTables) {
+                                         std::vector<Data *> *pendingPageTables, const Data *requestKey) {
 #ifdef USE_CUDA
     const int width = manager.dims[3], capacity = std::min(max_positions,
         std::min(tokensLimit > 0 ? tokensLimit : INT_MAX, manager.maxPages * manager.pageLen));
@@ -313,7 +324,7 @@ bool NaiveN05FlashModel::PreparePagedCache(Data &cache, PagedCacheManager &manag
     if (copyTail) {
         int last = (previous - 1) / cache.pageLen;
         int old = cache.pageIndex[last], page = manager.GetUnusedPageIndex(true);
-        size_t bytes = (size_t)cache.pageLen * width * manager.unitSize;
+        size_t bytes = GetDataBytes(manager.dataType, cache.pageLen, width);
         FastllmCudaCopyFromDeviceToDevice((uint8_t *)manager.cudaData + page * bytes,
             (uint8_t *)manager.cudaData + old * bytes, bytes);
         auto sidecar = tpIndexerSidecars.find(&manager);
@@ -336,7 +347,7 @@ bool NaiveN05FlashModel::PreparePagedCache(Data &cache, PagedCacheManager &manag
             pendingPageTables->push_back(&cache);
         else
             FastllmCudaCopyFromHostToDevice(cache.cudaData, cache.pageIndex.data(), cache.pageIndex.size() * sizeof(int));
-        tpCacheEpoch.fetch_add(1, std::memory_order_relaxed);
+        InvalidateTensorParallelCache(requestKey);
     }
     cache.lastPageLen = previous ? (previous - 1) % cache.pageLen + 1 : 0;
     return changed;
@@ -661,8 +672,9 @@ Data NaiveN05FlashModel::RunTarget(
     ErrorInFastLLM("Naive-N0.5 currently requires the CUDA backend for attention.");
     return Data();
 #else
-    AssertInFastLLM(dataType == DataType::BFLOAT16 && FastllmNaiveKVType(kvCacheDataType),
-                    "Naive-N0.5 requires BF16 activations and BF16 or FP8 E4M3 KV cache.");
+    AssertInFastLLM(dataType == DataType::BFLOAT16 &&
+                    (FastllmNaiveKVType(kvCacheDataType) || (kvCacheDataType == FP4_E2M1 && sparseKv)),
+                    "Naive requires BF16 compute; FP4 DSA KV requires CUDA TP KVMem.");
     AssertInFastLLM(inputIds.dims.size() == 2 && inputIds.dims[0] == 1 &&
                     (batch || (int)pastKeyValues.size() == block_cnt),
                     "Naive-N0.5 expects one unpadded sequence and a complete KV cache.");
@@ -1221,7 +1233,7 @@ Data NaiveN05FlashModel::RunTarget(
                             decodeWorkspace ? &buf.liveKeys : nullptr, tpRank, tpDevices.size());
                     else if (decodeWorkspace)
                         FastllmCudaNaivePagedWrite(scoringKey, *input, 0, &buf.liveKeys);
-                    else AppendCache(scoringKey, *input, kvCacheDataType, 0);
+                    else AppendCache(scoringKey, *input, AuxiliaryKVType(), 0);
                 }
                 Data noIndexKey, noLiveKeys;
                 bool fusedCache = batchRopePrepared || ((decodeWorkspace || ringVerify || (!tensorParallel && length <= 8 && localPast > 0)) &&
@@ -1261,8 +1273,8 @@ Data NaiveN05FlashModel::RunTarget(
                             pastValue.Resize({1, localPast + length, pastValue.dims[2]});
                         }
                     } else {
-                        AppendCache(pastKey, *cacheInput, kvCacheDataType, layerCapacity);
-                        AppendCache(pastValue, v, kvCacheDataType, layerCapacity);
+                        AppendCache(pastKey, *cacheInput, LayerKVType(layer), layerCapacity);
+                        AppendCache(pastValue, v, LayerKVType(layer), layerCapacity);
                     }
                 }
                 if (!slidingLayers[layer] && (decodeWorkspace ? buf.capacity : pastKey.dims[1]) > indexTopK) {
@@ -1466,6 +1478,7 @@ Data NaiveN05FlashModel::RunTarget(
             if (batchedDSA) {
                 FastllmNaiveDSARow row;
                 row.fp8 = pastKey.dataType == FP8_E4M3;
+                row.fp4 = pastKey.dataType == FP4_E2M1;
                 row.tensorMaps = layerMaps ? layerMaps + (size_t)sequence * FastllmNaiveDSAMapBytes : nullptr;
                 row.cache = layerCache ? layerCache + sequence * cacheStride : nullptr;
                 row.key = pastKey.isPagedKVCache ? pastKey.pagedKVCacheData->cudaData : pastKey.cudaData;
@@ -2061,6 +2074,18 @@ int NaiveN05FlashModel::SampleTarget(
 }
 
 void NaiveN05FlashModel::WarmUp() {
+    const DataType requestedKV = kvCacheDataType;
+    if (requestedKV == FP4_E2M1) {
+        AssertInFastLLM(kvMemConfig.enabled && tpDevices.size() > 1 && !draftEnabled,
+                        "Naive FP4 DSA KV requires CUDA TP, --kvmem and no draft.");
+        // The first forward initializes weights before the sparse pool exists.
+        // Its private, discarded caches use the established FP8 bootstrap path.
+        kvCacheDataType = FP8_E4M3;
+    }
+    struct RestoreKVType {
+        DataType &current; DataType requested;
+        ~RestoreKVType() { current = requested; }
+    } restoreKV{kvCacheDataType, requestedKV};
     Data ids(DataType::FLOAT32, {1, 1}, {1.0f});
     Data positions(DataType::FLOAT32, {1, 1}, {0.0f});
     std::vector<std::pair<Data, Data>> cache;
@@ -2092,6 +2117,7 @@ void NaiveN05FlashModel::WarmUp() {
     // those blocks before KVMem sizing; graph-pinned and busy workspaces stay.
     if (draftEnabled && prefillBatchPolicy.targetTokens > 0)
         FastllmCudaReleaseIdleCachedBuffers();
+    kvCacheDataType = requestedKV;
     if (kvMemConfig.enabled) {
         InitSparseKv();
         if (draftEnabled) {
@@ -2121,7 +2147,7 @@ void NaiveN05FlashModel::PrepareSwaPrefillWorkspace(int rank, int length) {
         // Forward callers may supply larger inputs; only scratch grows then.
         data.FreeSpace();
         data.dims.clear();
-        data.dataType = kvCacheDataType;
+        data.dataType = AuxiliaryKVType();
         data.UpdateUnitSize();
         data.dataDevice = DataDevice::CUDA;
         data.dataDeviceIds = {tpDevices[rank]};

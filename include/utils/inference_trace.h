@@ -6,10 +6,14 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <charconv>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <cstring>
+#include <limits>
+#include <ctime>
 #include <iomanip>
 #include <locale>
 #include <memory>
@@ -17,6 +21,7 @@
 #include <numeric>
 #include <sstream>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 #ifdef _WIN32
@@ -46,6 +51,24 @@ inline double Rate(long long tokens, double milliseconds) {
     return milliseconds > 0 ? tokens * 1000.0 / milliseconds : 0;
 }
 template <typename T> inline void Array(std::ostream &out, const std::vector<T> &values) {
+    // Trace handles and token lengths are decimal ints. Keep the stream's
+    // existing formatting for other types, including characters and booleans.
+    if constexpr (std::is_same<T, int>::value) {
+        char buffer[4096];
+        char *end = buffer;
+        *end++ = '[';
+        for (size_t i = 0; i < values.size(); ++i) {
+            if (buffer + sizeof(buffer) - end < 32) {
+                out.write(buffer, end - buffer);
+                end = buffer;
+            }
+            if (i) *end++ = ',';
+            end = std::to_chars(end, buffer + sizeof(buffer), values[i]).ptr;
+        }
+        *end++ = ']';
+        out.write(buffer, end - buffer);
+        return;
+    }
     out << '[';
     for (size_t i = 0; i < values.size(); ++i) {
         if (i) out << ',';
@@ -94,6 +117,118 @@ public:
 inline Sink &Output() { static Sink sink; return sink; }
 inline bool Enabled() { return Output().Enabled(); }
 
+// Sampled host diagnostics use only the scheduler thread. Nested spans are
+// inclusive wall times (not additive); region CPU time helps identify host
+// descheduling / blocking. No CUDA calls or synchronization are introduced.
+inline unsigned DetailInterval() {
+    static const unsigned interval = [] {
+        const char *value = std::getenv("FASTLLM_INFERENCE_TRACE_DETAIL_EVERY");
+        if (!value || !*value) return 0u;
+        unsigned parsed = 0;
+        auto result = std::from_chars(value, value + std::strlen(value), parsed);
+        return result.ec == std::errc() && *result.ptr == '\0' ? parsed : 0u;
+    }();
+    return interval;
+}
+inline double ThreadCpuMilliseconds() {
+#if defined(CLOCK_THREAD_CPUTIME_ID)
+    timespec ts;
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) == 0)
+        return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+#endif
+    return -1;
+}
+struct HostDetail {
+    struct Metric {
+        const char *region, *name;
+        double wallMs = 0, cpuMs = 0;
+        unsigned long long calls = 0, count = 0;
+        bool cpuAvailable = false;
+    };
+    // Fixed storage keeps diagnostic probes from allocating per request/page.
+    Metric metrics[128];
+    size_t used = 0;
+    unsigned long long dropped = 0;
+    const char *region = "other";
+    Metric *Get(const char *name) {
+        for (size_t i = 0; i < used; ++i)
+            if (!std::strcmp(metrics[i].region, region) && !std::strcmp(metrics[i].name, name))
+                return &metrics[i];
+        if (used == 128) { ++dropped; return nullptr; }
+        auto *metric = &metrics[used++];
+        metric->region = region; metric->name = name;
+        return metric;
+    }
+    void Count(const char *name, unsigned long long value = 1) {
+        if (auto *metric = Get(name)) metric->count += value;
+    }
+    void Write(std::ostream &out) const {
+        out << ",\"host_detail\":{\"sample_every\":" << DetailInterval()
+            << ",\"dropped_metrics\":" << dropped << ",\"metrics\":[";
+        for (size_t i = 0; i < used; ++i) {
+            if (i) out << ',';
+            const auto &m = metrics[i];
+            out << "{\"region\":\"" << m.region << "\",\"name\":\"" << m.name
+                << "\",\"wall_ms\":" << m.wallMs << ",\"calls\":" << m.calls
+                << ",\"count\":" << m.count;
+            if (m.cpuAvailable) out << ",\"thread_cpu_ms\":" << m.cpuMs;
+            out << '}';
+        }
+        out << "]}";
+    }
+};
+inline HostDetail *&CurrentDetail() { static thread_local HostDetail *value = nullptr; return value; }
+class DetailSpan {
+    HostDetail *detail;
+    HostDetail::Metric *metric = nullptr;
+    Clock::time_point start;
+public:
+    explicit DetailSpan(const char *name, HostDetail *record = CurrentDetail()) : detail(record) {
+        if (detail) { metric = detail->Get(name); start = Clock::now(); }
+    }
+    DetailSpan(const DetailSpan &) = delete;
+    DetailSpan &operator=(const DetailSpan &) = delete;
+    void Stop() {
+        if (metric) { metric->wallMs += Milliseconds(start, Clock::now()); ++metric->calls; metric = nullptr; }
+    }
+    void Next(const char *name) {
+        if (!detail) return;
+        auto now = Clock::now();
+        if (metric) { metric->wallMs += Milliseconds(start, now); ++metric->calls; }
+        metric = detail->Get(name); start = now;
+    }
+    ~DetailSpan() { Stop(); }
+};
+class DetailRegion {
+    HostDetail *detail = CurrentDetail();
+    const char *previous = nullptr;
+    HostDetail::Metric *metric = nullptr;
+    Clock::time_point start;
+    double cpuStart = -1;
+public:
+    explicit DetailRegion(const char *name) {
+        if (!detail) return;
+        previous = detail->region; detail->region = name;
+        metric = detail->Get("total");
+        cpuStart = ThreadCpuMilliseconds(); start = Clock::now();
+    }
+    DetailRegion(const DetailRegion &) = delete;
+    DetailRegion &operator=(const DetailRegion &) = delete;
+    void Stop() {
+        if (!detail) return;
+        auto end = Clock::now();
+        double cpuEnd = ThreadCpuMilliseconds();
+        if (metric) {
+            metric->wallMs += Milliseconds(start, end); ++metric->calls;
+            if (cpuStart >= 0 && cpuEnd >= cpuStart) {
+                metric->cpuAvailable = true; metric->cpuMs += cpuEnd - cpuStart;
+            }
+        }
+        detail->region = previous; detail = nullptr;
+    }
+    ~DetailRegion() { Stop(); }
+};
+
 class Step;
 class Forward;
 inline Step *&CurrentStep() { static thread_local Step *value = nullptr; return value; }
@@ -122,6 +257,8 @@ public:
 
 class Step : public Stages {
     Step *previous;
+    HostDetail *previousDetail;
+    std::unique_ptr<HostDetail> detail;
 public:
     unsigned long long id;
     const char *phase = "unknown";
@@ -133,11 +270,15 @@ public:
     double forwardMs = 0, forwardEmitMs = 0;
     int forwards = 0;
     bool submitted = false, failed = false;
-    explicit Step() : previous(CurrentStep()), id(++Output().stepIds), timestampNs(UnixNanoseconds()) {
+    explicit Step() : previous(CurrentStep()), previousDetail(CurrentDetail()),
+        id(++Output().stepIds), timestampNs(UnixNanoseconds()) {
+        if (DetailInterval() && id % DetailInterval() == 0) detail.reset(new HostDetail());
+        CurrentDetail() = detail.get();
         CurrentStep() = this;
     }
     ~Step() {
         CurrentStep() = previous;
+        CurrentDetail() = previousDetail;
         if (!submitted) return;
         try {
             auto end = Clock::now();
@@ -168,6 +309,7 @@ public:
                     << ",\"new_tokens\":" << prefillCandidateTokens
                     << ",\"active_decode\":" << activeDecode << "},";
             WriteStages(out);
+            if (detail) detail->Write(out);
             out << "}\n";
             Output().Emit(out.str());
             PreviousStepEmitMs() = Milliseconds(end, Clock::now());

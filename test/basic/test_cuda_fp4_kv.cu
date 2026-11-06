@@ -87,6 +87,51 @@ static uint8_t EncodeReference(float value) {
     return best | (std::signbit(value) ? 8 : 0);
 }
 
+
+template <typename T>
+__global__ void StoreAlignedBlocks(uint8_t *cache, const T *input, int blocks, int width) {
+    const int block = blockIdx.x * blockDim.x + threadIdx.x;
+    if (block < blocks) FastllmWriteFP4KVBlock(cache, input + block * 16, block * 16, width);
+}
+
+template <typename T>
+static void RunStoreAlignmentCase() {
+    using namespace fastllm;
+    constexpr int elements = 1536;
+    std::vector<T> input(elements);
+    for (int i = 0; i < elements; ++i) {
+        const float scale = i / 16 % 5 == 0 ? 0.f : std::ldexp(1.f, i / 16 % 13 - 8);
+        input[i] = T(std::sin(float(i) * 0.17f) * scale);
+    }
+    Data source(FLOAT32, {int(elements * sizeof(T) / 4)}), cache(FLOAT32, {elements});
+    AllocateGpu(source); AllocateGpu(cache);
+    Check(cudaMemcpy(source.cudaData, input.data(), elements * sizeof(T), cudaMemcpyHostToDevice));
+    for (int width : {16, 32, 128, 192, 256, 384}) {
+        const int pageBytes = width / 16 * 9;
+        for (int alignment : {0, 1, 2, 3, 4, 7}) {
+            const int begin = 8 + alignment;
+            std::vector<uint8_t> expected(cache.GetBytes(), 0xa5), actual(cache.GetBytes());
+            for (int offset = 0; offset < elements; offset += 16) {
+                float amax = 0;
+                for (int i = 0; i < 16; ++i) amax = std::max(amax, std::fabs(float(input[offset + i])));
+                const __nv_fp8_e4m3 sf(amax / 6);
+                const float inv = float(sf) > 0 ? 1.f / float(sf) : 0.f;
+                const int page = begin + offset / width * pageBytes, column = offset % width;
+                expected[page + width / 2 + column / 16] = sf.__x;
+                for (int i = 0; i < 8; ++i) expected[page + column / 2 + i] =
+                    EncodeReference(float(input[offset + 2 * i]) * inv) |
+                    (EncodeReference(float(input[offset + 2 * i + 1]) * inv) << 4);
+            }
+            Check(cudaMemset(cache.cudaData, 0xa5, cache.GetBytes()));
+            StoreAlignedBlocks<<<1, 128>>>((uint8_t *)cache.cudaData + begin, (const T *)source.cudaData,
+                elements / 16, width);
+            Check(cudaDeviceSynchronize());
+            Check(cudaMemcpy(actual.data(), cache.cudaData, actual.size(), cudaMemcpyDeviceToHost));
+            Require(actual == expected, "FP4 aligned/unaligned writes or guard bytes differ from CPU reference");
+        }
+    }
+}
+
 // The shared dispatch must preserve the existing non-FP4 storage formats too.
 template <typename SrcT, typename DstT>
 static void RunCopyCase(fastllm::DataType srcType, fastllm::DataType dstType) {
@@ -576,6 +621,9 @@ int main() {
         empty.ToDevice(fastllm::DataDevice::CUDA);
         Require(empty.cudaData == nullptr, "empty FP4 cache allocated CUDA storage");
         RunVectorDecodeCase();
+        RunStoreAlignmentCase<float>();
+        RunStoreAlignmentCase<half>();
+        RunStoreAlignmentCase<__nv_bfloat16>();
         RunCopyFormats<float>(fastllm::DataType::FLOAT32);
         RunCopyFormats<half>(fastllm::DataType::FLOAT16);
         RunCopyFormats<__nv_bfloat16>(fastllm::DataType::BFLOAT16);

@@ -1,6 +1,7 @@
 #include "naive_n05_kvmem.h"
 #include "naive_n05_tp.h"
 #include "utils/decode_graph.h"
+#include "utils/inference_trace.h"
 #include <climits>
 #include <stdexcept>
 #ifdef USE_CUDA
@@ -17,12 +18,17 @@ void NaiveN05FlashModel::ConfigureKvMem(const KvMemConfig &config) {
     throw std::invalid_argument("MiMo KVMem requires CUDA");
 #else
     if (tpDevices.size() < 2 || GetKVCacheInCPU() || dataType != BFLOAT16 ||
-        !FastllmNaiveKVType(kvCacheDataType) || maxBatch < 1 || maxBatch > MaxTPDecodeBatch)
-        throw std::invalid_argument("MiMo KVMem requires CUDA TP, BF16 compute, BF16/FP8 KV, explicit max_batch in [1,512]");
+        !FastllmNaiveAttentionKVType(kvCacheDataType) || maxBatch < 1 || maxBatch > MaxTPDecodeBatch)
+        throw std::invalid_argument("MiMo KVMem requires CUDA TP, BF16 compute, BF16/FP8/FP4 DSA KV, explicit max_batch in [1,512]");
+    if (draftEnabled && kvCacheDataType == FP4_E2M1)
+        throw std::invalid_argument("MiMo FP4 DSA KV does not support draft decoding");
     if (config.maxTokens < 2 || config.maxTokens > max_positions ||
         config.residentTokens < indexTopK || config.residentTokens > config.maxTokens ||
         config.prefillTokens < 1 || !config.hostBytes || GetFastllmEnv().skipWarmup)
         throw std::invalid_argument("MiMo KVMem requires valid logical/resident/prefill budgets and startup warmup");
+    if (kvCacheDataType == FP4_E2M1 &&
+        (full.headDim % 16 || full.valueDim % 16 || full.headDim > 256 || full.valueDim > 256))
+        throw std::invalid_argument("MiMo FP4 DSA KV requires block16-aligned head widths <= 256");
     const int owners = DecodeGraphBatchBuckets(maxBatch).back();
     const int page = GetPageLen();
     const uint64_t perRequest = (uint64_t(config.maxTokens) + page - 1) / page * page;
@@ -31,7 +37,7 @@ void NaiveN05FlashModel::ConfigureKvMem(const KvMemConfig &config) {
         ? uint64_t(GetMaxTokens() / page) * page : uint64_t(owners) * perRequest;
     const uint64_t bytes = tokens * std::count(slidingLayers.begin(), slidingLayers.end(), 0) *
         tpDevices.size() * std::max(1, full.kvHeads / (int)tpDevices.size()) *
-        (full.headDim + full.valueDim) * (kvCacheDataType == FP8_E4M3 ? 1 : 2);
+        GetDataBytes(kvCacheDataType, 1, full.headDim + full.valueDim);
     if (tokens < perRequest || tokens < uint64_t(owners) * page || tokens > INT_MAX || bytes > config.hostBytes)
         throw std::invalid_argument("MiMo KVMem token pool must fit one max_tokens request, one page per graph slot, and the host budget");
     kvMemConfig = config;
@@ -52,8 +58,20 @@ NaiveN05FlashModel::SparseKvState::~SparseKvState() {
 void NaiveN05FlashModel::OnResponseContextFinished(ResponseContext *context) {
     if (!sparseKv || !context->isEnding || context->pastKeyValues.empty() ||
         !context->pastKeyValues.front().first.kvStorageOwner) return;
+    auto *detail = inference_trace::CurrentDetail();
+    if (detail) detail->Count("finish.layers", context->pastKeyValues.size());
+    inference_trace::DetailSpan finishTrace("finish.request_id_lock", detail);
+    {
+        std::lock_guard<std::mutex> guard(tpRequestMutex);
+        tpRequestIds.erase(&context->pastKeyValues.front().first);
+    }
+    finishTrace.Next("finish.detach_descriptors");
     // Retain the lease until all borrowed descriptors are detached. Forward
     // completion already synchronized the rank streams before publication.
+    std::vector<Data *> leaves;
+    for (auto &pair : context->pastKeyValues) for (Data *root : {&pair.first, &pair.second})
+        for (auto &entry : root->multiDeviceDatas) leaves.push_back(entry.second);
+    pagedCacheExecutor.ReleaseReferences(leaves, GetThreads());
     auto lease = std::move(context->pastKeyValues.front().first.kvStorageOwner);
     for (auto &pair : context->pastKeyValues) for (Data *root : {&pair.first, &pair.second}) {
         // The root only mirrors rank zero after generic prefix restoration.
@@ -63,7 +81,7 @@ void NaiveN05FlashModel::OnResponseContextFinished(ResponseContext *context) {
         root->dims.clear(); root->expansionDims.clear(); root->strides.clear();
         root->expansionSize = root->expansionBytes = 0;
     }
-    tpCacheEpoch.fetch_add(1, std::memory_order_relaxed);
+    finishTrace.Next("finish.release_lease");
 }
 
 void NaiveN05FlashModel::InitSparseKv() {
@@ -74,7 +92,9 @@ void NaiveN05FlashModel::InitSparseKv() {
     const int queries = std::min(kvMemConfig.residentTokens / indexTopK, draftEnabled ? std::min(8, draftBlock + 1) : 1);
     const int indexPage = indexerContextSharding ? page / ranks : page;
     const int tokens = (kvMemConfig.maxTokens + page - 1) / page * page;
-    const int pages = tokensLimit / page, unit = kvCacheDataType == FP8_E4M3 ? 1 : 2;
+    const int pages = tokensLimit / page, unit = AuxiliaryKVType() == FP8_E4M3 ? 1 : 2;
+    const DataType stagingType = kvCacheDataType == FP4_E2M1 ? BFLOAT16 : kvCacheDataType;
+    const int stagingUnit = stagingType == BFLOAT16 ? 2 : 1;
     auto state = std::make_shared<SparseKvState>();
     state->requests = owners; state->tokens = tokens; state->devices = tpDevices;
     const auto freeBytes = FastllmCudaGetFreeSizes(), totalBytes = FastllmCudaGetTotalSizes();
@@ -102,7 +122,8 @@ void NaiveN05FlashModel::InitSparseKv() {
             size_t(PrefixPool::DraftShardSlots(prefixSlots, rank, ranks)) * prefixes->draftSlotBytes;
         for (int layer = 0; layer < block_cnt; ++layer) {
             const auto &cfg = slidingLayers[layer] ? sliding : full;
-            const size_t width = std::max(1, cfg.kvHeads / ranks) * (cfg.headDim + cfg.valueDim) * unit;
+            const size_t width = GetDataBytes(LayerKVType(layer), 1,
+                std::max(1, cfg.kvHeads / ranks) * (cfg.headDim + cfg.valueDim));
             if (slidingLayers[layer]) deviceBytes += size_t(owners) * windowCapacity * width;
             else {
                 // Sparse storage: hot KV, bidirectional maps, eviction workspace,
@@ -111,11 +132,11 @@ void NaiveN05FlashModel::InitSparseKv() {
                     tokens * 4ULL + ((tokens / page + 3) / 4 * 4) * 8ULL +
                     queries * (indexTopK * 8ULL + 44) + 128);
                 if (HasLocalIndexer(layer, rank))
-                    deviceBytes += size_t(pages) * indexPage * IndexerCacheWidth(kvCacheDataType) * unit;
+                    deviceBytes += size_t(pages) * indexPage * IndexerCacheWidth(AuxiliaryKVType()) * unit;
             }
         }
         deviceBytes += size_t(tokens) * std::max(1, full.kvHeads / ranks) *
-            (full.headDim + full.valueDim) * unit;
+            (full.headDim + full.valueDim) * stagingUnit;
         const size_t reserve = totalBytes.at(tpDevices[rank]) * (1.0 - GetGpuMemRatio());
         if (freeBytes.at(tpDevices[rank]) <= reserve || deviceBytes > freeBytes.at(tpDevices[rank]) - reserve)
             throw std::invalid_argument("MiMo KVMem GPU budget insufficient on device " +
@@ -129,7 +150,7 @@ void NaiveN05FlashModel::InitSparseKv() {
         auto &managers = tpPagedCaches[rank];
         managers.resize(block_cnt * 2);
         auto allocate = [&](Data &data, int count, int width) {
-            data.dataType = kvCacheDataType; data.UpdateUnitSize();
+            data.dataType = AuxiliaryKVType(); data.UpdateUnitSize();
             data.Resize({owners, count, width});
             data.ToDevice(DataDevice::CUDA, {tpDevices[rank]}, false);
             data.Allocate(false);
@@ -149,7 +170,8 @@ void NaiveN05FlashModel::InitSparseKv() {
             sc.maxTokens = tokens; sc.pageLen = page;
             sc.totalTokens = tokensLimit;
             sc.residentTokens = kvMemConfig.residentTokens; sc.maxSelected = indexTopK;
-            sc.keyRowBytes = heads * cfg.headDim * unit; sc.valueRowBytes = heads * cfg.valueDim * unit;
+            sc.keyRowBytes = GetDataBytes(kvCacheDataType, 1, heads * cfg.headDim);
+            sc.valueRowBytes = GetDataBytes(kvCacheDataType, 1, heads * cfg.valueDim);
             sc.hostBudgetBytes = size_t(tokensLimit) * (sc.keyRowBytes + sc.valueRowBytes);
             r->layers[layer] = std::make_unique<KvMemSparseCache>(sc);
             hostBytes += r->layers[layer]->HostBytes();
@@ -170,8 +192,8 @@ void NaiveN05FlashModel::InitSparseKv() {
                 auto index = std::make_unique<PagedCacheManager>();
                 index->pageLen = indexPage; index->maxPages = pages;
                 index->kvCacheFp8Indexer = fp8IndexerCache;
-                index->dataType = kvCacheDataType; index->UpdateUnitSize();
-                index->Resize({pages, indexPage, 1, IndexerCacheWidth(kvCacheDataType)});
+                index->dataType = AuxiliaryKVType(); index->UpdateUnitSize();
+                index->Resize({pages, indexPage, 1, IndexerCacheWidth(AuxiliaryKVType())});
                 index->ToDevice(DataDevice::CUDA, {tpDevices[rank]}, false); index->Allocate(false);
                 measured += index->GetBytes();
                 tpIndexerSidecars.emplace(managers[layer * 2].get(), index.get());
@@ -180,7 +202,7 @@ void NaiveN05FlashModel::InitSparseKv() {
         }
         for (int part = 0; part < 2; ++part) {
             Data &data = part ? r->stageValue : r->stageKey;
-            data.dataType = kvCacheDataType; data.UpdateUnitSize();
+            data.dataType = stagingType; data.UpdateUnitSize();
             data.Resize({1, tokens, std::max(1, full.kvHeads / ranks) * (part ? full.valueDim : full.headDim)});
             data.ToDevice(DataDevice::CUDA, {tpDevices[rank]}, false); data.Allocate(false);
             measured += data.GetBytes();
@@ -232,6 +254,7 @@ void NaiveN05FlashModel::AttachSparseKv(const std::vector<std::pair<Data *, Data
     if (!sparseKv) return;
     auto lease = std::static_pointer_cast<SparseKvState::Lease>(roots.front().first->kvStorageOwner);
     if (lease) return;
+    InvalidateTensorParallelCache(roots.front().first);
     {
         lease = std::make_shared<SparseKvState::Lease>();
         lease->storage = sparseKv;
@@ -255,7 +278,7 @@ void NaiveN05FlashModel::AttachSparseKv(const std::vector<std::pair<Data *, Data
         root->multiDeviceData = true; root->dataDevice = DataDevice::CUDA;
         root->dataDeviceIds = tpDevices; root->isKVCache = true;
         for (int device : tpDevices)
-            if (!root->multiDeviceDatas.count(device)) root->multiDeviceDatas[device] = new Data(kvCacheDataType);
+            if (!root->multiDeviceDatas.count(device)) root->multiDeviceDatas[device] = new Data(LayerKVType(layer));
     }
     std::vector<std::exception_ptr> errors(ranks);
     tpWorkers.Run(tpDevices, [&](int rank) {
@@ -275,7 +298,7 @@ void NaiveN05FlashModel::AttachSparseKv(const std::vector<std::pair<Data *, Data
                     // Restored full pages already carry references. Preserve them.
                     if (!local.isPagedKVCache) local.FreeSpace();
                     local.isFake = false;
-                    local.dataType = kvCacheDataType; local.UpdateUnitSize();
+                    local.dataType = LayerKVType(layer); local.UpdateUnitSize();
                     local.dataDevice = DataDevice::CUDA; local.dataDeviceIds = {tpDevices[rank]};
                     local.expansionDims = {1, capacity, width};
                     local.strides = {size_t(capacity) * width, (size_t)width, 1};
@@ -304,7 +327,7 @@ void NaiveN05FlashModel::AttachSparseKv(const std::vector<std::pair<Data *, Data
                             local.Resize({1, 0, width});
                             PreparePagedCache(local, *local.pagedKVCacheData, past + 1);
                             for (int page : local.pageIndex) {
-                                size_t bytes = size_t(local.pageLen) * width * local.unitSize;
+                                size_t bytes = GetDataBytes(local.dataType, local.pageLen, width);
                                 cudaMemsetAsync((char *)local.pagedKVCacheData->cudaData + page * bytes, 0, bytes, cudaStreamPerThread);
                                 if (!part && r.indexers[layer]) {
                                     auto &index = *r.indexers[layer];
@@ -330,13 +353,13 @@ void NaiveN05FlashModel::AttachSparseKv(const std::vector<std::pair<Data *, Data
             const int past = slidingLayers[layer] && snapshot
                 ? std::min(snapshot->length, window - 1) : (root.dims.empty() ? 0 : root.dims[1]);
             const int width = cfg.kvHeads * (part ? cfg.valueDim : cfg.headDim);
+            root.dataType = LayerKVType(layer); root.UpdateUnitSize();
             root.kvCacheFp8Indexer = false;
             root.expansionDims = {1, slidingLayers[layer] ? windowCapacity : kvMemConfig.maxTokens, width};
             root.strides = {size_t(root.expansionDims[1]) * width, (size_t)width, 1};
             root.Resize({1, past, width});
         }
     }
-    tpCacheEpoch.fetch_add(1, std::memory_order_relaxed);
 #endif
 }
 
@@ -347,6 +370,7 @@ Data NaiveN05FlashModel::SeparateIndexer(int layer, int rank, const Data &key) c
     auto &storage = IndexerStorage(layer, rank);
     const int width = storage.dims[3];
     result.FakeFrom(key, 0);
+    result.dataType = storage.dataType; result.UpdateUnitSize();
     const int page = storage.dims[1];
     const int length = indexerContextSharding
         ? (key.dims[1] / key.pageLen) * page + std::clamp(key.dims[1] % key.pageLen - rank * page, 0, page)
@@ -370,7 +394,12 @@ void NaiveN05FlashModel::StageSparseKv(int rank, int layer, const Data &key, con
     auto &r = *sparseKv->ranks[rank];
     outKey.Resize(key.dims); outKey.FakeFrom(r.stageKey, 0);
     outValue.Resize(value.dims); outValue.FakeFrom(r.stageValue, 0);
-    r.layers[layer]->Gather((const int *)key.cudaData, (const int *)value.cudaData, key.dims[1],
+    if (key.dataType == FP4_E2M1) {
+        // Decode once per prefill into the existing bounded BF16 workspace.
+        // Both prefill and hot-cache decode consume the same quantized values.
+        FastllmCudaNaiveReadCache({{&key, outKey.cudaData, 0, key.dims[1]},
+                                  {&value, outValue.cudaData, 0, value.dims[1]}});
+    } else r.layers[layer]->Gather((const int *)key.cudaData, (const int *)value.cudaData, key.dims[1],
         outKey.cudaData, outValue.cudaData, cudaStreamPerThread);
 #endif
 }

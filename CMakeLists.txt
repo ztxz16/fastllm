@@ -1373,6 +1373,16 @@ if (UNIT_TEST)
     target_link_libraries(paged_cache_lru_test PRIVATE fastllm)
     add_test(NAME paged_cache_lru COMMAND paged_cache_lru_test)
 
+    add_executable(paged_cache_batch_test test/basic/test_paged_cache_batch.cpp)
+    target_link_libraries(paged_cache_batch_test PRIVATE fastllm)
+    add_test(NAME paged_cache_batch COMMAND paged_cache_batch_test)
+    set_tests_properties(paged_cache_batch PROPERTIES TIMEOUT 30)
+
+    add_executable(paged_prefix_preview_test test/basic/test_paged_prefix_preview.cpp)
+    target_link_libraries(paged_prefix_preview_test PRIVATE fastllm)
+    add_test(NAME paged_prefix_preview COMMAND paged_prefix_preview_test)
+    set_tests_properties(paged_prefix_preview PROPERTIES TIMEOUT 30)
+
     add_executable(multimodal_history_cache_test test/basic/test_multimodal_history_cache.cpp)
     target_link_libraries(multimodal_history_cache_test PRIVATE fastllm)
     add_test(NAME multimodal_history_cache COMMAND multimodal_history_cache_test)
@@ -2318,6 +2328,12 @@ if (UNIT_TEST)
         set_tests_properties(naive_n05_prefix_cache PROPERTIES TIMEOUT 60
             PASS_REGULAR_EXPRESSION "PREFIX CACHE PASS")
 
+        add_executable(naive_n05_serving_metadata_test test/basic/test_naive_n05_serving_metadata.cpp)
+        target_link_libraries(naive_n05_serving_metadata_test PRIVATE fastllm_tools)
+        target_include_directories(naive_n05_serving_metadata_test PRIVATE src/models ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        fastllm_add_checked_test(naive_n05_serving_metadata naive_n05_serving_metadata_test "SERVING METADATA PASS" 120)
+        set_tests_properties(naive_n05_serving_metadata PROPERTIES ENVIRONMENT "FASTLLM_CUDA_GRAPH=1")
+
         add_executable(naive_n05_tp_model_test test/basic/test_naive_n05_tp_model.cpp)
         target_link_libraries(naive_n05_tp_model_test PRIVATE fastllm)
         target_include_directories(naive_n05_tp_model_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
@@ -2388,10 +2404,33 @@ if (UNIT_TEST)
                 set_tests_properties(naive_n05_kvmem_${NAIVE_SPARSE_KV_TYPE}
                     PROPERTIES LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240
                     PASS_REGULAR_EXPRESSION "KVMEM MODEL PASS")
+                add_test(NAME naive_n05_kvmem_transition_${NAIVE_SPARSE_KV_TYPE}
+                    COMMAND naive_n05_verify_graph_test 4 serving_kvmem_transition ${NAIVE_SPARSE_KV_TYPE} context_shard fp8)
+                set_tests_properties(naive_n05_kvmem_transition_${NAIVE_SPARSE_KV_TYPE} PROPERTIES
+                    LABELS cuda RUN_SERIAL TRUE TIMEOUT 120 SKIP_RETURN_CODE 77
+                    PASS_REGULAR_EXPRESSION "SERVING PAGE GROWTH PASS"
+                    ENVIRONMENT "FASTLLM_CUDA_GRAPH=1")
                 add_test(NAME naive_n05_kvmem_prefix_${NAIVE_SPARSE_KV_TYPE}
                     COMMAND naive_n05_verify_graph_test 4 kvmem_prefix ${NAIVE_SPARSE_KV_TYPE} fp8 layer_shard)
                 set_tests_properties(naive_n05_kvmem_prefix_${NAIVE_SPARSE_KV_TYPE}
                     PROPERTIES LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 300
+                    PASS_REGULAR_EXPRESSION "TP GPU PREFIX PASS")
+            endforeach()
+            foreach(NAIVE_FP4_INDEXER_STORAGE layer_shard context_shard)
+                add_test(NAME naive_n05_kvmem_fp4_${NAIVE_FP4_INDEXER_STORAGE}
+                    COMMAND naive_n05_verify_graph_test 4 kvmem_fp4 ${NAIVE_FP4_INDEXER_STORAGE})
+                set_tests_properties(naive_n05_kvmem_fp4_${NAIVE_FP4_INDEXER_STORAGE} PROPERTIES
+                    LABELS "cuda;multigpu" RUN_SERIAL TRUE TIMEOUT 180 SKIP_RETURN_CODE 77
+                    PASS_REGULAR_EXPRESSION "FP4 EXECUTION PASS")
+                add_test(NAME naive_n05_kvmem_transition_fp4_${NAIVE_FP4_INDEXER_STORAGE}
+                    COMMAND naive_n05_verify_graph_test 4 serving_kvmem_transition fp4 ${NAIVE_FP4_INDEXER_STORAGE} fp8)
+                set_tests_properties(naive_n05_kvmem_transition_fp4_${NAIVE_FP4_INDEXER_STORAGE} PROPERTIES
+                    LABELS "cuda;multigpu" RUN_SERIAL TRUE TIMEOUT 180 SKIP_RETURN_CODE 77
+                    PASS_REGULAR_EXPRESSION "SERVING PAGE GROWTH PASS" ENVIRONMENT "FASTLLM_CUDA_GRAPH=1")
+                add_test(NAME naive_n05_kvmem_prefix_fp4_${NAIVE_FP4_INDEXER_STORAGE}
+                    COMMAND naive_n05_verify_graph_test 4 kvmem_prefix fp4 fp8 ${NAIVE_FP4_INDEXER_STORAGE})
+                set_tests_properties(naive_n05_kvmem_prefix_fp4_${NAIVE_FP4_INDEXER_STORAGE} PROPERTIES
+                    LABELS "cuda;multigpu" RUN_SERIAL TRUE TIMEOUT 300 SKIP_RETURN_CODE 77
                     PASS_REGULAR_EXPRESSION "TP GPU PREFIX PASS")
             endforeach()
             foreach(NAIVE_SPARSE_DRAFT_KV bf16 fp8)
@@ -2805,6 +2844,18 @@ if (UNIT_TEST)
         add_test(NAME naive_n05_dsa_batch COMMAND naive_n05_dsa_batch_test)
         set_tests_properties(naive_n05_dsa_batch PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
             PASS_REGULAR_EXPRESSION "BATCH DSA PASS")
+
+        add_executable(naive_n05_fp4_vector_test test/basic/test_naive_n05_fp4_vector.cu)
+        target_link_libraries(naive_n05_fp4_vector_test PRIVATE fastllm)
+        set_target_properties(naive_n05_fp4_vector_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        add_test(NAME naive_n05_fp4_vector COMMAND naive_n05_fp4_vector_test)
+        set_tests_properties(naive_n05_fp4_vector PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 60)
+        add_executable(naive_n05_fp4_kv_test test/basic/test_naive_n05_fp4_kv.cpp)
+        target_link_libraries(naive_n05_fp4_kv_test PRIVATE fastllm)
+        target_include_directories(naive_n05_fp4_kv_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        add_test(NAME naive_n05_fp4_kv COMMAND naive_n05_fp4_kv_test)
+        set_tests_properties(naive_n05_fp4_kv PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
+            PASS_REGULAR_EXPRESSION "ALL FP4 DSA CHECKS PASSED")
 
         add_executable(naive_n05_fp8_kv_test test/basic/test_naive_n05_fp8_kv.cpp)
         target_link_libraries(naive_n05_fp8_kv_test PRIVATE fastllm)

@@ -2,14 +2,54 @@
 #include <cassert>
 #include <stdexcept>
 #include <thread>
+#include <limits>
 
 using namespace fastllm::inference_trace;
 
+template <typename T> static void CheckArray(const std::vector<T> &values) {
+    std::ostringstream expected, actual;
+    expected << '[';
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (i) expected << ',';
+        expected << values[i];
+    }
+    expected << ']';
+    Array(actual, values);
+    if (actual.str() != expected.str()) throw std::runtime_error("trace array format changed");
+}
+
 int main() {
+    CheckArray<int>({});
+    CheckArray<int>({0, -1, std::numeric_limits<int>::min(), std::numeric_limits<int>::max()});
+    CheckArray<uint64_t>({0, std::numeric_limits<uint64_t>::max()});
+    CheckArray<char>({'a', 'b'});
+    CheckArray<bool>({false, true});
+    CheckArray<float>({-1.25f, 0.f, 1.5f});
+    std::vector<int> longArray(4096);
+    for (size_t i = 0; i < longArray.size(); ++i) longArray[i] = int(i) * 137 - 200000;
+    CheckArray(longArray);
+    // Inactive probes must be safe even without a trace sink / current step.
+    { DetailRegion region("inactive"); DetailSpan span("inactive"); span.Next("inactive2"); }
+    assert(CurrentDetail() == nullptr);
     if (!Enabled()) return 0;
     {
         Step step;
         step.phase = "prefill";
+        {
+            DetailRegion region("fixture");
+            DetailSpan span("outer");
+            if (auto *detail = CurrentDetail()) {
+                detail->Count("requests", 3);
+                {
+                    DetailRegion nested("nested");
+                    DetailSpan child("child");
+                    detail->Count("requests", 2);
+                }
+                assert(std::string(detail->region) == "fixture");
+                std::thread worker([] { assert(CurrentDetail() == nullptr); });
+                worker.join();
+            }
+        }
         step.handles = {9};
         step.lengths = {24};
         step.contextBefore = {100};
@@ -22,7 +62,7 @@ int main() {
         }
         step.Mark("forward_dispatch_ms");
     }
-    assert(CurrentStep() == nullptr && CurrentForward() == nullptr);
+    assert(CurrentStep() == nullptr && CurrentForward() == nullptr && CurrentDetail() == nullptr);
     {
         Step step;
         step.phase = "decode";
@@ -53,5 +93,5 @@ int main() {
             step.failed = true;
         }
     }
-    assert(CurrentStep() == nullptr && CurrentForward() == nullptr);
+    assert(CurrentStep() == nullptr && CurrentForward() == nullptr && CurrentDetail() == nullptr);
 }

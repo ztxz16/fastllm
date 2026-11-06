@@ -6,11 +6,19 @@ inline bool FastllmNaiveKVType(fastllm::DataType type) {
     return type == fastllm::BFLOAT16 || type == fastllm::FP8_E4M3;
 }
 
-// Expanded BF16/FP8 KV caches keep physical strides/capacity when logical length
+// Attention K/V can additionally use row-packed FP4. Indexer/SWA callers
+// deliberately keep using FastllmNaiveKVType.
+inline bool FastllmNaiveAttentionKVType(fastllm::DataType type) {
+    return FastllmNaiveKVType(type) || type == fastllm::FP4_E2M1;
+}
+
+// Supported row-packed KV caches keep physical strides/capacity when logical length
 // changes. Other layouts retain Data::Resize and its layout invalidation rules.
 inline bool FastllmNaiveCanResizeKVLength(const fastllm::Data &cache, int length, int width) {
-    return length >= 0 && FastllmNaiveKVType(cache.dataType) && !cache.cudaNativeNvfp4Layout &&
-        cache.tpLayout == fastllm::TP_LAYOUT_NONE && cache.unitSize == (cache.dataType == fastllm::FP8_E4M3 ? 1 : 2) && cache.unitSizeDiv == 1 &&
+    return length >= 0 && FastllmNaiveAttentionKVType(cache.dataType) && !cache.cudaNativeNvfp4Layout &&
+        cache.tpLayout == fastllm::TP_LAYOUT_NONE && (cache.dataType == fastllm::FP4_E2M1
+            ? (width % 16 == 0 && cache.unitSize == 9 && cache.unitSizeDiv == 16)
+            : (cache.unitSize == (cache.dataType == fastllm::FP8_E4M3 ? 1 : 2) && cache.unitSizeDiv == 1)) &&
         cache.dims.size() == 3 && cache.dims[0] == 1 && cache.dims[2] == width &&
         cache.expansionDims.size() == 3 && cache.expansionDims[0] == 1 &&
         cache.expansionDims[1] >= length && cache.expansionDims[2] == width;

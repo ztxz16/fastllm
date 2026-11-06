@@ -215,9 +215,20 @@ __global__ void PlanResidentCount(Storage s, const int *requests, const int *len
 // One warp copies one opaque token row. No host staging, token rounding,
 // page overfetch, or architecture-specific instructions are required.
 __device__ void CopyRow(unsigned char *dst, const unsigned char *src, size_t bytes, int lane) {
-    if (bytes % 16 == 0) {
+    const uintptr_t alignment = reinterpret_cast<uintptr_t>(dst) |
+        reinterpret_cast<uintptr_t>(src) | bytes;
+    if ((alignment & 15) == 0) {
         for (size_t i = lane; i < bytes / 16; i += 32)
             reinterpret_cast<uint4 *>(dst)[i] = reinterpret_cast<const uint4 *>(src)[i];
+    } else if ((alignment & 7) == 0) {
+        for (size_t i = lane; i < bytes / 8; i += 32)
+            reinterpret_cast<uint2 *>(dst)[i] = reinterpret_cast<const uint2 *>(src)[i];
+    } else if ((alignment & 3) == 0) {
+        for (size_t i = lane; i < bytes / 4; i += 32)
+            reinterpret_cast<unsigned *>(dst)[i] = reinterpret_cast<const unsigned *>(src)[i];
+    } else if ((alignment & 1) == 0) {
+        for (size_t i = lane; i < bytes / 2; i += 32)
+            reinterpret_cast<unsigned short *>(dst)[i] = reinterpret_cast<const unsigned short *>(src)[i];
     } else {
         for (size_t i = lane; i < bytes; i += 32) dst[i] = src[i];
     }
