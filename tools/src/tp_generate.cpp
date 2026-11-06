@@ -69,10 +69,12 @@ Json::array EmptyCache(ProcessGroup &group) {
  * @param trace 是否记录有界 FP32 [vocab] logits。
  * @param report 写入实际输出和缓存状态，失败时保留已完成步骤。
  * @param cancelled 可选取消探针，沿用正式生成接口的同步边界和 KV 清理。
+ * @param onToken 可选同步 Token 通知，仅发送已采样的 ID；异常沿用 KV 清理路径。
  * @return 正常返回表示生成及 KV 释放成功；非法输入或执行失败抛异常。
  */
 void Generate(ProcessGroup &group, const Json &request, bool trace, Json::object &report,
-              const std::function<bool()> &cancelled = {}) {
+              const std::function<bool()> &cancelled = {},
+              const std::function<void(uint32_t)> &onToken = {}) {
     if (!request.is_object()) throw std::runtime_error("generation request must be object");
     const std::set<std::string> fields{"token_ids", "max_new_tokens", "temperature", "top_k", "top_p", "seed", "eos_token_ids"};
     for (const auto &item : request.object_items()) {
@@ -106,6 +108,7 @@ void Generate(ProcessGroup &group, const Json &request, bool trace, Json::object
                 recorded += logits.size();
             }
             steps.push_back(std::move(step));
+            if (onToken) onToken(token);
         }, cancelled);
         Json::array ids;
         for (auto token : result.tokenIds) ids.push_back(static_cast<long long>(token));
@@ -263,6 +266,7 @@ void Serve(ProcessGroup &group, SessionSocket &socket, bool trace, Json::object 
     ready["model_load_count"] = 1;
     ready["cache"] = EmptyCache(group);
     ready["cancellation"] = cancellation ? "request_id_datagram" : "none";
+    ready["token_events"] = true;
     socket.Write(ready);
     uint64_t expected = 1;
     bool shutdown = false;
@@ -272,12 +276,17 @@ void Serve(ProcessGroup &group, SessionSocket &socket, bool trace, Json::object 
         if (id != expected++) throw std::runtime_error("out-of-order session request id");
         const auto op = message["op"].string_value();
         const std::set<std::string> fields = op == "generate" ?
-            std::set<std::string>{"id", "op", "request"} : std::set<std::string>{"id", "op"};
+            std::set<std::string>{"id", "op", "request", "stream_tokens"} : std::set<std::string>{"id", "op"};
         for (const auto &item : message.object_items()) {
             if (!fields.count(item.first)) throw std::runtime_error("unknown session field");
         }
         if (op == "shutdown") { shutdown = true; break; }
         if (op != "generate") throw std::runtime_error("unknown session operation");
+        if (message.object_items().count("stream_tokens") && !message["stream_tokens"].is_bool()) {
+            throw std::runtime_error("stream_tokens must be boolean");
+        }
+        bool streamTokens = message["stream_tokens"].bool_value();
+        uint32_t tokenIndex = 0;
 
         Json::object result{{"event", "result"}, {"id", static_cast<long long>(id)},
             {"status", "FAIL"}, {"backend", report["backend"]}, {"workers", report["workers"]}};
@@ -285,6 +294,11 @@ void Serve(ProcessGroup &group, SessionSocket &socket, bool trace, Json::object 
             Generate(group, message["request"], trace, result, [&]() {
                 if (socket.Disconnected()) throw std::runtime_error("session client disconnected");
                 return cancellation && cancellation->Requested(id);
+            }, [&](uint32_t token) {
+                if (streamTokens) {
+                    socket.Write(Json::object{{"event", "token"}, {"id", static_cast<long long>(id)},
+                        {"index", static_cast<long long>(tokenIndex++)}, {"token_id", static_cast<long long>(token)}});
+                }
             });
             result["status"] = "PASS";
             result["reusable"] = true;
