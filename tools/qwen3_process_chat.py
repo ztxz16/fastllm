@@ -140,7 +140,9 @@ def main():
         ids = report["token_ids"]
         if (not isinstance(ids, list) or not 1 <= len(ids) <= request["max_new_tokens"] or
             any(type(token) is not int or token < 0 for token in ids)):
-            raise RuntimeError("invalid generated token IDs")
+            detail = repr(ids)[:256]
+            types = [type(token).__name__ for token in ids[:8]] if isinstance(ids, list) else type(ids).__name__
+            raise RuntimeError(f"invalid generated token IDs: values={detail}, types={types}")
         text = tokenizer.decode(ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
         result.update(status="PASS", text=text, native=report)
         print(text)
