@@ -1,9 +1,10 @@
 # 多进程 TP 底座验收
 
 本目录按阶段提供 Linux 单机进程底座、Qwen3 分片/GPU 权重加载、单层前向，
-以及文末新增的完整 Prefill 验收。通信底座包括独立 C++ worker、Unix socket、
+以及完整 Prefill、请求 KV/Decode 和文末新增的生成验收。通信底座包括独立 C++ worker、Unix socket、
 NCCL 初始化和标量 SUM 自检、心跳、超时、退出与故障回收。
-**尚未接入 KV/Decode、推理调度、CUDA Graph、自定义 AllReduce 或前缀缓存。**
+**已接入独立 Qwen3 TP 前向与 KV/Decode；生成入口待本轮服务器验收。
+尚未接入服务推理调度、CUDA Graph、自定义 AllReduce 或前缀缓存。**
 `--tp-backend process` / `--tp_backend process` 已加入公共参数入口，但会在模型加载前
 明确报错；默认 `thread` 保持原行为。禁止把底座检查成功当成模型 TP 已实现。
 构建选项 `BUILD_PROCESS_TP` 默认关闭，显式开启后才构建和打包这两个实验程序。
@@ -397,7 +398,15 @@ bash test/distributed/run_qwen3_prefill_v100.sh /home/models/Qwen3-1.7B
 该脚本固定 CUDA 12.6、架构 70、逻辑 GPU 0/1，**会触发 C++/CUDA 编译，仅在服务器运行**。
 模型目录可传绝对路径，也可传相对于调用者当前目录的路径。
 
-## 请求内 KV Cache 与逐 token Decode（待服务器验收）
+## 请求内 KV Cache 与逐 token Decode
+
+2026-11-06 用户回传双 V100、CUDA 12.6 的七组 PASS 日志。前五组为
+`20261106T100805Z_0311b33e`、`20261106T100835Z_device_weights_5b466a58`、
+`20261106T100859Z_layer_2ac7efb3`、`20261106T100938Z_prefill_aae18589`、
+`20261106T101019Z_prefill_2b546b24`；新增 Decode 为
+`20261106T101047Z_decode_f46b3b89`（小模型）和
+`20261106T101153Z_decode_af11a7f8`（真实模型）。这是用户提供的服务器结果，
+本地未运行 CUDA；不代表下述新增生成入口已经通过 GPU 验收。
 
 新增公开入口 `BeginQwen3Request`、`DecodeQwen3`、`EndQwen3Request` 和
 `Qwen3Requests`。每个进程组只允许一个活动请求，所有 rank 使用同一 Prompt 和
@@ -479,3 +488,79 @@ python3 test/distributed/run_qwen3_decode.py \
   --devices 0,1 --build-cache build-process-tp-cu126/CMakeCache.txt \
   --model /home/models/Qwen3-1.7B
 ```
+
+## 文本入口与协调器生成循环（待服务器验收）
+
+本轮新增独立 `fastllm_tp_generate` 程序和 `tools/qwen3_process_chat.py` 文本前端。
+正式公开接口为 `GenerateQwen3`，直接复用 `BeginQwen3Request`、`DecodeQwen3` 和
+`EndQwen3Request`；没有第二套前向或 KV 实现。文本前端仅用本地 Transformers
+AutoTokenizer 分词和解码，不加载 PyTorch 模型；worker 各自加载权重。
+原有 Python 服务的 `--tp_backend process` 仍未开放。
+
+行为和边界：
+
+- 模型限已有稠密 Qwen3；源 F16/BF16/F32 统一按既有 FP16 GPU 路径执行。
+- 使用模型自带聊天模板，默认 `enable_thinking=False`。`--thinking` 显式打开；
+  `--raw` 跳过模板。模板展开后的 Prompt 仍限 1..128 token，超长报错，不截断。
+- 协调器只采样一次并向所有 rank 发送同一 token。temperature=0 为贪心，
+  同分取最小 token ID；正温度按 temperature → top-k → top-p → 重归一化采样。
+  top-k=0 不截断，top-p=1 不截断；默认 seed=0，使用明确的 53-bit mt19937_64 随机数。
+- 默认只沿用模型 EOS 配置：优先 generation_config 的 eos_token_id，缺省用
+  config，再合并 tokenizer.eos_token_id。不自动沿用 generation_config 的采样参数。
+  `--eos-token-id` 可重复指定覆盖值；`--ignore-eos` 明确关闭 EOS 停止。
+- 输出 ID 包含实际采样出的 EOS，显示文本会跳过特殊 token；停止原因区分 eos/length。
+  最后一个输出不再送入 Decode，所需容量为 `Prompt + max_new_tokens - 1 <= 2048`。
+  默认最多输出 32 token；公开接口拒绝覆盖已有活动请求。
+- 一次调用一个请求，文本在结束后完整显示；不支持流式 HTTP、多请求调度或跨请求缓存。
+  无 CUDA Graph、自定义 AllReduce、重复惩罚、min-p 和 stop-string。
+- 默认不存储历史 logits；原生 `--trace-logits 1` 用于诊断，累计最多 8388608 个元素。
+  诊断只观察正式生成结果，不改变采样、权重布局、CUDA stream 或同步策略。
+  EOS/长度结束释放 KV，异常也尝试释放；worker 失败仍整组终止。
+- 文本入口和验收器共用 Linux subreaper/进程组清理：超时或中断回收协调器与孤儿
+  worker，清理前保留组长 PID，避免 PID/PGID 复用；不依赖容器 PID 1。
+  文本输出失败也返回非零，并在 response.json 中记录 FAIL，不会误报成功。
+
+验收使用同一个生成程序。小模型套件包含 24 个原生采样黄金边界检查和 17 个生成
+case：源 dtype、bias、tied embedding、KV 复制、长度 1、Prompt 长度 128、首个 EOS、
+固定 seed、top-k=1、无效长度/采样参数/EOS。每步沿实际输出 token 序列在单卡重放，
+统一 Prompt 和后续 ID；小模型再和独立 CPU 完整前缀计算逐元素比较。单卡使用相同
+FP16 KV 类型、Eager、无 prefix cache，不能让两个后端各自采样不同前缀后比较 logits。
+真实模型套件包含采样检查和固定 Prompt ID 的真实自回归生成/单卡重放。
+同 seed 重复采样要求输出 ID 完全一致；不要求不同 TP 数下随机输出文本逐字相同。
+报告保存 JSON、Markdown、CSV、XLSX、原始 logits、生成 ID、EOS/采样配置和 CPU 参考。
+真实文本示例另走 AutoTokenizer 全链路，输出 `response.json` 和原生进程日志；
+它只验证路径完成，不自动判定回答质量，不替代独立 HF 端到端对照或性能测试。
+
+服务器安装分词依赖（仅需 tokenizer，不需安装 torch），并沿用 CUDA 12.6/NCCL 环境：
+
+```bash
+python3 -m pip install transformers
+bash test/distributed/run_qwen3_generation_v100.sh /home/models/Qwen3-1.7B
+```
+
+脚本会重编译、回归之前七组验收、执行新增两组验收，然后运行真实中文问答。
+共九个 `PASS` 目录；文本结果另在 `test/distributed/results/text-generation/` 的唯一子目录。
+本地只允许 Python/文本检查，不能执行该编译脚本。
+
+只运行问答时（服务器已构建 `fastllm_tp_generate` 和更新后的 worker）：
+
+```bash
+export CUDA_VISIBLE_DEVICES=0,1
+python3 tools/qwen3_process_chat.py \
+  --model /home/models/Qwen3-1.7B \
+  --prompt '请用一句话介绍你自己。' \
+  --max-new-tokens 64
+
+# 随机采样；默认关闭 thinking，避免短输出预算全部用于思考。
+python3 tools/qwen3_process_chat.py \
+  --model /home/models/Qwen3-1.7B \
+  --prompt '给一只橘猫起一个名字。' \
+  --temperature 0.7 --top-k 20 --top-p 0.9 --seed 123 \
+  --max-new-tokens 32
+```
+
+原生接口接受 `--request` JSON 文件，字段为 `token_ids`、`max_new_tokens`、
+`temperature`、`top_k`、`top_p`、`seed` 和 `eos_token_ids`。默认值与上文相同；
+只有 `token_ids` 必填。原生程序不读取 tokenizer/EOS 配置，省略 EOS 数组即仅按
+长度停止，文本前端会显式传入解析后的 EOS 配置。成功 stdout 是最终 JSON，
+可能带 NCCL 前置日志；任何失败返回非零，保留部分 steps 和清理状态。
