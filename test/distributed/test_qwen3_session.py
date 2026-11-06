@@ -40,26 +40,32 @@ def fixture():
     workers = [dict(rank=i, device=i, pid=pid) for i, pid in enumerate((os.getpid(), peer.pid))]
     cache = [EMPTY.copy(), EMPTY.copy()]
     graph_enabled = args.get("--cuda-graph") == "1"
-    graph = dict(enabled=True, active=False, captures=0, replays=0, warmups=0, eager_decodes=0, workspace_bytes=0)
+    graph = dict(enabled=graph_enabled, active=False, captures=0, replays=0, warmups=0, eager_decodes=0, workspace_bytes=0)
 
     def send(value):
-        if graph_enabled and value['event'] != 'token' and mode != 'graph_missing':
+        if value['event'] != 'token' and mode != 'graph_missing':
             event = value['event']
             if event == 'result' and value['status'] == 'PASS':
                 decodes = len(value['token_ids']) - 1
-                graph['replays'] += decodes
-                graph['captures'] += int(decodes > 0)
-                graph['warmups'] = graph['captures']
+                if graph_enabled:
+                    graph['replays'] += decodes
+                    graph['captures'] += int(decodes > 0)
+                    graph['warmups'] = graph['captures']
+                else:
+                    graph['eager_decodes'] += decodes
             state = dict(graph)
             if event == 'shutdown':
-                state.update(captures=0, replays=0, warmups=0)
+                state.update(captures=0, replays=0, warmups=0, eager_decodes=0)
             if event == 'result' and mode == 'graph_fallback':
                 state['eager_decodes'] = 1
             if event == 'result' and mode == 'graph_leak':
                 state.update(active=True, workspace_bytes=4096, captures=1, warmups=1, replays=1)
             if event == 'result' and mode == 'graph_stale':
                 state.update(captures=0, replays=0, warmups=0)
-            value['execution'] = 'decode_cuda_graph'
+            if mode == 'graph_float_' + event:
+                for key in ('captures', 'replays', 'warmups', 'eager_decodes', 'workspace_bytes'):
+                    state[key] = float(state[key])
+            value['execution'] = 'decode_cuda_graph' if graph_enabled else 'eager'
             value['graph_after_unload' if event == 'shutdown' else 'graph'] = [dict(state), dict(state)]
         data = json.dumps(value, indent=2).encode()
         framed = struct.pack("!I", len(data)) + data
