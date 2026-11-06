@@ -41,12 +41,16 @@ def fixture():
     cache = [EMPTY.copy(), EMPTY.copy()]
     graph_enabled = args.get("--cuda-graph") == "1"
     graph = dict(enabled=graph_enabled, active=False, captures=0, replays=0, warmups=0, eager_decodes=0, workspace_bytes=0)
+    custom_enabled = args.get('--custom-allreduce') == '1'
+    ar = dict(enabled=custom_enabled, active=custom_enabled, custom_calls=0, nccl_calls=0,
+              workspace_bytes=2*1024*1024+4 if custom_enabled else 388)
 
     def send(value):
         if value['event'] != 'token' and mode != 'graph_missing':
             event = value['event']
             if event == 'result' and value['status'] == 'PASS':
                 decodes = len(value['token_ids']) - 1
+                ar['custom_calls' if custom_enabled else 'nccl_calls'] += 2 * (1 + decodes + int(graph_enabled and decodes > 0))
                 if graph_enabled:
                     graph['replays'] += decodes
                     graph['captures'] += int(decodes > 0)
@@ -54,6 +58,16 @@ def fixture():
                 else:
                     graph['eager_decodes'] += decodes
             state = dict(graph)
+            if mode != 'ar_missing':
+                state['allreduce'] = dict(ar)
+                if mode == 'ar_float_' + event:
+                    state['allreduce']['custom_calls'] = float(ar['custom_calls'])
+                if mode == 'ar_fallback':
+                    state['allreduce'].update(enabled=False, active=False)
+                if mode == 'ar_stale' and event == 'result':
+                    state['allreduce']['custom_calls'] = 0
+                if mode == 'ar_reset' and event == 'shutdown':
+                    state['allreduce']['custom_calls'] = 0
             if event == 'shutdown':
                 state.update(captures=0, replays=0, warmups=0, eager_decodes=0)
             if event == 'result' and mode == 'graph_fallback':
@@ -111,7 +125,7 @@ def fixture():
                       workers=workers, reusable=True, request=request, token_ids=[request["token_ids"][0]],
                       finish_reason="eos" if request["token_ids"][0] in request.get("eos_token_ids", []) else "length",
                       cache_after_generate=cache)
-        if mode in ('graph_normal', 'graph_stale') and request.get('max_new_tokens', 0) > 0:
+        if (mode in ('graph_normal', 'graph_stale') or mode.startswith('ar_')) and request.get('max_new_tokens', 0) > 0:
             result['token_ids'] *= request['max_new_tokens']
             result['steps'] = [dict(token_id=token) for token in result['token_ids']]
         if message.get("stream_tokens"):

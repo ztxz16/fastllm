@@ -3,11 +3,11 @@
 本目录按阶段提供 Linux 单机进程底座、Qwen3 分片/GPU 权重加载、单层前向，
 以及完整 Prefill、请求 KV/Decode 和文末新增的生成验收。通信底座包括独立 C++ worker、Unix socket、
 NCCL 初始化和标量 SUM 自检、心跳、超时、退出与故障回收。
-**Qwen3 稠密模型的多进程 TP 生成和常驻双请求已完成服务器验收。
-本轮接入正式模型工厂及 `ftllm chat/run/server/serve --tp_backend process`，GPU 验收待执行。**
+**Qwen3 稠密模型的多进程 TP 生成、常驻请求、正式模型工厂和 Decode CUDA Graph
+已完成用户服务器验收。本轮新增双卡 CUDA IPC 自定义 AllReduce，GPU 验收待执行。**
 默认 `thread` 保持原行为；进程后端使用 C++/CUDA + NCCL，只支持未量化稠密 Qwen3。
-CUDA Graph、自定义 AllReduce、跨请求前缀缓存仍未实现。文中各阶段说明是历史边界，
-当前入口及限制以文末“正式入口接入”一节为准。
+跨请求前缀缓存仍未实现。文中各阶段说明是历史边界，
+当前入口及限制以文末“正式入口接入”“Decode CUDA Graph”和“自定义 AllReduce”各节为准。
 构建选项 `BUILD_PROCESS_TP` 默认关闭，显式开启后才构建进程产物。
 
 ## 运行条件
@@ -795,7 +795,7 @@ python3 -m ftllm.cli server /home/models/Qwen3-1.7B \
 用户已确认这一步的 84 / 14 / 12 项服务器验收全部 PASS；下一项为以下 Decode CUDA Graph。
 
 
-## Decode CUDA Graph（第 2 项，待服务器验收）
+## Decode CUDA Graph（第 2 项，用户服务器验收已通过）
 
 正式模型工厂和 `ftllm chat/run/server/serve --tp_backend process` 增加 `--cuda-graph`。
 默认关闭。开启后 Prefill 仍为 Eager，单 token Decode 捕获 embedding、全部 decoder 层、
@@ -810,7 +810,7 @@ python3 -m ftllm.cli server /home/models/Qwen3-1.7B \
 - 请求结束/取消先同步，销毁图，解除 cuBLAS 用户工作区，再释放工作区和 KV。
   模型权重及 worker 保留。新请求重新捕获；本阶段不跨请求复用图或 KV。
 - 所有 rank 使用统一开关。捕获、实例化、重放或 NCCL 失败均报错并终止整组，不静默回退。
-  `controlOnly + cudaGraph` 拒绝。协调器/worker 控制协议升级为 v2，必须一起重建。
+  `controlOnly + cudaGraph` 拒绝。该阶段协议为 v2；后续自定义规约升级为 v3，协调器/worker 必须一起重建。
 - 原生 `fastllm_tp_generate` / `fastllm_tp_decode_check` 使用 `--cuda-graph 0|1`；
   Python 正式入口为无值开关。线程后端的 `FASTLLM_CUDA_GRAPH` 环境变量不控制此进程实现，
   开启该环境变量时正式进程入口明确拒绝，避免两套设置混用。
@@ -846,7 +846,70 @@ python3 -m ftllm.cli run /home/models/Qwen3-1.7B \
   --prompt '请用一句话介绍你自己。' --max-new-tokens 32
 ```
 
-本地仅执行 Python 回归与静态检查，未编译、未运行 GPU。本阶段服务器通过后，
-下一项才是自定义 AllReduce；跨请求 Prefix Cache 仍在其后。
+用户已提供七组 PASS（2026-11-06 14:55—15:01 UTC，末组 `20261106T150149Z_entry_236769fc`）。
+本地未编译、未运行 GPU；下一项自定义 AllReduce 见下节，跨请求 Prefix Cache 在其后。
 捕获设计依据：[NCCL 2.22.3 CUDA Graph](https://docs.nvidia.com/deeplearning/nccl/archives/nccl_2223/user-guide/doc/usage/cudagraph.html)、
 [cuBLAS 12.6.3 CUDA Graph](https://docs.nvidia.com/cuda/archive/12.6.3/cublas/index.html#cuda-graphs-support)。
+
+## 自定义 AllReduce（第 3 项，待服务器验收）
+
+正式工厂/CLI 增加 `--custom-allreduce`，可以与 `--cuda-graph` 组合。
+默认仍使用 NCCL。当前自定义路径限定单机双进程、两张 SM70+ GPU（各至少 16 SM），
+要求双方设备可见、双向 P2P、原生跨卡原子能力；能力不足或 IPC 打开失败直接终止整组。
+NCCL 模式保留原来的卡数范围。此处未扩展为多机或 4/8 卡自定义规约。
+
+- C++/CUDA `ProcessAllReduce::Sum` 接入每层 Attention 输出、MLP 输出的 FP32 规约。
+  数据连续，FP32 输入/输出，SUM；并不提供 BF16/FP16 的自定义规约核。
+  源模型权重 F16/BF16/F32 仍使用既有 FP16 计算路径，层内规约是 FP32。
+- 每卡独占一块 2 MiB IPC 分配（信号和 payload），另有 4 字节关闭屏障缓冲。
+  NCCL 只在启动交换 IPC 句柄/UUID、较大消息和关闭屏障中使用。
+  不能在进程间直接传裸指针；导入后的地址由各进程自己取得。
+- `count <= 65536`（含边界，最多 256 KiB）使用固定 staging copy 加一阶段 peer-read kernel；
+  更大消息明确使用 NCCL。这个容量阈值不声称是实测性能最优阈值。
+  Prefill/Decode 都按同一消息大小规则选择；不是所有 Prefill 都必然使用 NCCL。
+- 系统作用域 acquire/release 握手；固定 16 blocks，各自维护 GPU 序号。
+  写入下一轮 payload 前，必须等所有 block 的对端读取结束。
+  Graph 记录 copy/kernel 节点，序号在 GPU 随实际执行推进，捕获本身不增加规约次数。
+- IPC 属于通信组：请求结束释放 KV/Graph，卸载模型保留 IPC；组关闭先完成所有 stream，
+  关闭对端映射，再经过集体屏障释放所有者分配。失败不做单 rank 重试，沿用整组终止/回收。
+  模型重载、交错无状态 Prefill 和新请求共用该生命周期。
+- 原生 `fastllm_tp_generate`、`fastllm_tp_decode_check`、`fastllm_tp_check` 接受 `--custom-allreduce 0|1`。
+  正式 Python CLI 为无值开关。旧线程环境变量 `FASTLLM_CUDA_CUSTOM_ALLREDUCE` 不控制本实现。
+  控制协议 v3，新旧 worker/协调器混用明确拒绝；本轮脚本会一起重建所需产物。
+- 每个 rank 的 `graph` 诊断新增 `allreduce`：enabled、active、custom_calls、nccl_calls、workspace_bytes。
+  即使 Eager 也有这份诊断。custom_calls/nccl_calls 来自 GPU，包含 Graph warmup/replay 的实际操作，
+  不包含 IPC 引导或关闭屏障；模型卸载不清零，组重建才清零。active 表示 IPC 映射，不是请求活动状态。
+  为兼容既有客户端，模型报告的 `backend` 标识保持不变，规约路径以该诊断的实际计数为准。
+
+服务器 master 合并 sk 后执行：
+
+```bash
+bash test/distributed/run_qwen3_custom_allreduce_v100.sh /home/models/Qwen3-1.7B
+```
+
+该脚本重建所需原生产物和正式包，先跑原 NCCL 七组，再跑自定义规约七组：
+
+1. 通信底座：27 次变长 FP32 数值检查，覆盖 1/31/255/256/4095/4096/65535/65536/65537 元素，
+   验证实际 custom/NCCL 次数；非法输入、TP=1 拒绝、重启、崩溃、停顿、对端退出后的整组回收。
+2. Eager 合成 Decode 30 项；逐步对照 NCCL TP、单卡和独立 CPU 参考。
+3. Graph 合成 Decode 30 项；严格校验每层两次规约及 warmup、replay 的实际次数。
+4. Graph 真实模型 Decode 1 项。
+5. Graph 合成常驻会话 96 项，包含流式、请求复用、取消恢复。
+6. Graph 真实模型常驻会话 16 项。
+7. Graph 正式工厂/CLI/HTTP/SSE 12 项，与 NCCL 基线对照 Token ID 和文本。
+
+报告目录不覆盖历史结果，输出 JSON/Markdown/CSV/XLSX；任一组失败返回非零。
+原始逐任务计数保存在各用例 JSON，数值报告包含最大/平均绝对误差、失败元素数。
+这是功能验收，尚无延迟/吞吐基准，不能据此宣称快于 NCCL。
+本地只做纯 Python 回归和静态 review，未编译或运行 GPU。服务器全部通过后，再进行跨请求 Prefix Cache。
+
+单次正式入口（上面脚本完成构建，并使用上一节 CUDA/PYTHONPATH 环境后）：
+
+```bash
+python3 -m ftllm.cli run /home/models/Qwen3-1.7B \
+  --tp_backend process --tp 2 --cuda-graph --custom-allreduce \
+  --prompt '请用一句话介绍你自己。' --max-new-tokens 32
+```
+
+设计依据：[CUDA 12.6.3 IPC](https://docs.nvidia.com/cuda/archive/12.6.3/cuda-c-programming-guide/index.html#interprocess-communication)、
+[PTX 系统作用域内存序](https://docs.nvidia.com/cuda/parallel-thread-execution/#memory-consistency-model)。

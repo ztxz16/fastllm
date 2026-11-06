@@ -2,6 +2,7 @@
 #define FASTLLM_DISTRIBUTED_QWEN3_LAYER_H
 
 #include "distributed/process_group.h"
+#include "distributed/process_allreduce.h"
 #include "distributed/qwen3_device_weights.h"
 #include <nccl.h>
 
@@ -15,9 +16,10 @@ public:
      * @param weights 已上传的 rank-local FP16 权重，必须比执行器存活更久。
      * @param stream worker 执行 stream；全部算子与 NCCL 使用此 stream。
      * @param comm 已初始化的 TP 通信组。
+     * @param allReduce 与执行器共享 stream 的规约器；须晚于全部请求图释放。
      * @param cudaGraph true 时单 token Decode 使用严格 CUDA Graph；Prefill 保持 Eager。
      */
-    Qwen3LayerExecutor(const Qwen3DeviceWeights &weights, cudaStream_t stream, ncclComm_t comm, bool cudaGraph = false);
+    Qwen3LayerExecutor(const Qwen3DeviceWeights &weights, cudaStream_t stream, ncclComm_t comm, ProcessAllReduce &allReduce, bool cudaGraph = false);
     ~Qwen3LayerExecutor();
     Qwen3LayerExecutor(const Qwen3LayerExecutor&) = delete;
     Qwen3LayerExecutor &operator=(const Qwen3LayerExecutor&) = delete;
@@ -25,7 +27,7 @@ public:
     /**
      * 执行单请求无历史 KV 的 causal prefill，并同步读回输出。
      *
-     * FP16 激活与权重，FP32 累加/规约；Attention 和 MLP 分别执行一次 NCCL SUM。
+     * FP16 激活与权重，FP32 累加/规约；Attention 和 MLP 分别调用一次生产 Sum。
      * 临时缓冲总上限 256 MiB，每次成功调用后释放；失败后必须终止 worker。
      * 不含 embedding、最终 Norm、lm_head 或采样；独立阶段与 Full 共用全部算子。
      * @param layer 模型层号。

@@ -1,5 +1,6 @@
 #include "distributed/process_group.h"
 #include "json11.hpp"
+#include "tp_graph_report.h"
 
 #include <algorithm>
 #include <chrono>
@@ -75,8 +76,17 @@ void Run(ProcessGroupOptions options, const std::string &caseName, json11::Json:
         group.Stop();
         return;
     }
+    if (caseName == "custom_invalid_world") {
+        options.customAllReduce = true;
+        options.devices.resize(1);
+        bool rejected = false;
+        try { group.Start(options); } catch (const std::invalid_argument &) { rejected = true; }
+        Require(rejected && group.Workers().empty(), "custom AllReduce accepted TP=1");
+        return;
+    }
     Require(caseName == "smoke" || caseName == "pid1" || caseName == "restart" || caseName == "crash" ||
-            caseName == "stall" || caseName == "hold", "unknown case: " + caseName);
+            caseName == "stall" || caseName == "hold" || caseName == "allreduce_boundaries" ||
+            caseName == "collective_crash", "unknown case: " + caseName);
     if (caseName == "pid1") {
         Require(getpid() == 1, "pid1 case must run as the PID namespace init process");
     }
@@ -111,7 +121,15 @@ void Run(ProcessGroupOptions options, const std::string &caseName, json11::Json:
             }
             throw std::runtime_error("hold group failed: " + group.LastError());
         }
-        if (caseName == "crash" || caseName == "stall") {
+        if (caseName == "collective_crash") {
+            Require(!options.controlOnly, "collective_crash needs CUDA");
+            Require(kill(workers.back().pid, SIGKILL) == 0, "could not kill peer");
+            bool rejected = false;
+            try { group.CheckAllReduce(4096, 3); } catch (const std::exception &) { rejected = true; }
+            Require(rejected && group.State() == ProcessGroupState::Failed && group.Workers().empty(),
+                    "collective failure left peers spinning");
+            report["observed_error"] = group.LastError();
+        } else if (caseName == "crash" || caseName == "stall") {
             Require(kill(workers.back().pid, caseName == "crash" ? SIGKILL : SIGSTOP) == 0,
                     "could not inject worker failure");
             auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(
@@ -126,6 +144,56 @@ void Run(ProcessGroupOptions options, const std::string &caseName, json11::Json:
             bool rejected = false;
             try { group.Ping(); } catch (const std::exception &) { rejected = true; }
             Require(rejected, "failed group accepted a command");
+        } else if (caseName == "allreduce_boundaries") {
+            Require(!options.controlOnly, "AllReduce boundaries need CUDA");
+            double maximum = 0, sum = 0;
+            long long elements = 0, failures = 0;
+            uint64_t custom = 0, nccl = 0;
+            json11::Json::array checks;
+            for (uint32_t salt : {1U, 19U, 2U}) {
+                for (uint32_t count : {1U, 31U, 255U, 256U, 4095U, 4096U, 65535U, 65536U, 65537U}) {
+                    auto actual = group.CheckAllReduce(count, salt);
+                    Require(actual.size() == workers.size() * count, "wrong AllReduce result shape");
+                    double localMax = 0, localSum = 0;
+                    long long localFailed = 0;
+                    for (size_t i = 0; i < actual.size(); ++i) {
+                        double expected = workers.size() * (workers.size() + 1) / 2.0 *
+                                          (1.0 + ((i % count) % 257) * 0.125 + salt * 0.25);
+                        double error = std::isfinite(actual[i]) ? std::abs(actual[i] - expected) : expected + 1;
+                        localMax = std::max(localMax, error);
+                        localSum += error;
+                        localFailed += error != 0;
+                    }
+                    maximum = std::max(maximum, localMax);
+                    sum += localSum;
+                    failures += localFailed;
+                    elements += actual.size();
+                    bool selected = options.customAllReduce && count <= 65536;
+                    selected ? ++custom : ++nccl;
+                    checks.push_back(json11::Json::object{{"elements", int(count)}, {"salt", int(salt)},
+                        {"path", selected ? "cuda_ipc_fp32_tp2" : "nccl"}, {"max_abs_error", localMax},
+                        {"mean_abs_error", localSum / actual.size()}, {"failed_elements", localFailed}});
+                    report["checks"] = checks;
+                    report["max_abs_error"] = maximum;
+                    report["mean_abs_error"] = sum / elements;
+                    report["failed_elements"] = failures;
+                    Require(!localFailed, "AllReduce output mismatch at count=" + std::to_string(count));
+                    auto states = group.Qwen3Requests();
+                    report["custom_calls"] = static_cast<long long>(states.front().allReduce.customCalls);
+                    report["nccl_calls"] = static_cast<long long>(states.front().allReduce.ncclCalls);
+                    for (const auto &state : states) {
+                        Require(state.allReduce.customCalls == custom && state.allReduce.ncclCalls == nccl,
+                                "AllReduce path mismatch at count=" + std::to_string(count));
+                    }
+                }
+            }
+            for (auto count : {0U, 131073U}) {
+                bool rejected = false;
+                try { group.CheckAllReduce(count); } catch (const std::invalid_argument &) { rejected = true; }
+                Require(rejected && group.State() == ProcessGroupState::Ready, "invalid shape poisoned group");
+            }
+            report["shape"] = "FP32[count], 27 varying-message collectives, including 65536 boundary";
+            report["graph"] = GraphState(group);
         } else if (!options.controlOnly) {
             auto values = group.CheckAllReduce();
             double expected = double(workers.size()) * (workers.size() + 1) / 2;
@@ -148,7 +216,7 @@ void Run(ProcessGroupOptions options, const std::string &caseName, json11::Json:
         }
         group.Stop();
         Require(group.State() == ProcessGroupState::Stopped && group.Workers().empty(), "Stop left workers");
-        if (caseName != "crash" && caseName != "stall") {
+        if (caseName != "crash" && caseName != "stall" && caseName != "collective_crash") {
             Require(group.LastError().empty(), "graceful shutdown failed: " + group.LastError());
         }
         group.Stop();
@@ -186,12 +254,15 @@ int main(int argc, char **argv) {
                 options.startupTimeoutMs = ParseInt(value);
             } else if (key == "--operation-timeout-ms") {
                 options.operationTimeoutMs = ParseInt(value);
+            } else if (key == "--custom-allreduce") {
+                options.customAllReduce = ParseCustomAllReduce(value);
             } else {
                 throw std::runtime_error("unknown argument: " + key);
             }
         }
         report["case"] = caseName;
-        report["backend"] = options.controlOnly ? "process/control-only" : "process/NCCL";
+        report["backend"] = options.controlOnly ? "process/control-only" :
+            options.customAllReduce ? "process/custom-ipc+NCCL-large" : "process/NCCL";
         Run(options, caseName, report);
         report["status"] = "PASS";
     } catch (const std::exception &e) {

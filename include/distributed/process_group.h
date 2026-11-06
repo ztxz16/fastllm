@@ -22,6 +22,7 @@ struct ProcessGroupOptions {
     int heartbeatIntervalMs = 1000;
     // 组内全部 worker 使用相同 Decode Graph 模式；不支持与 controlOnly 组合。
     bool cudaGraph = false;
+    bool customAllReduce = false; // 严格要求双卡 P2P；大消息显式走 NCCL。
 };
 
 struct ProcessWorkerInfo {
@@ -45,11 +46,18 @@ struct Qwen3GraphInfo {
     uint64_t captures = 0, replays = 0, warmups = 0, eagerDecodes = 0, workspaceBytes = 0;
 };
 
+/** 通信组生命周期的 GPU 执行计数；模型卸载不释放 IPC 或清零。 */
+struct ProcessAllReduceInfo {
+    bool enabled = false, active = false;
+    uint64_t customCalls = 0, ncclCalls = 0, workspaceBytes = 0;
+};
+
 struct Qwen3RequestInfo {
     bool active = false;
     uint32_t tokens = 0, capacity = 0, positionBegin = 0;
     uint64_t deviceBytes = 0;
     Qwen3GraphInfo graph;
+    ProcessAllReduceInfo allReduce;
 };
 
 enum class Qwen3LayerStage : uint32_t { Full = 0, Attention = 1, Mlp = 2 };
@@ -79,12 +87,14 @@ public:
     void Ping();
 
     /**
-     * 执行通信自检，每个 rank 提交 FP32 标量 rank+1 并进行 NCCL SUM。
+     * 执行通信自检，经生产 Sum 路径规约 FP32[count]，按 rank 拼接读回。
      *
      * 此接口用于底座验收，不替代模型推理或性能测试；不支持 controlOnly。
-     * @return 每个 rank 实际读回的求和值；运行失败抛异常并终止整组。
+     * @param count 元素数 1..131072；默认标量保持 rank+1 的输入。
+     * @param salt 固定输入偏移 0..1024，输入为 (rank+1)*(1+(i%257)/8+salt/4)。
+     * @return 各 rank 的 count 个求和值；运行失败抛异常并终止整组。
      */
-    std::vector<float> CheckAllReduce();
+    std::vector<float> CheckAllReduce(uint32_t count = 1, uint32_t salt = 0);
 
     /**
      * 让各 worker 独立读取本 rank 的 Qwen3 权重并以 FP16 驻留 GPU。

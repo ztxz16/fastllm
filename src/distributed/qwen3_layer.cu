@@ -214,6 +214,7 @@ struct Qwen3LayerExecutor::Impl {
     const Qwen3DeviceWeights &weights;
     cudaStream_t stream;
     ncclComm_t comm;
+    ProcessAllReduce &allReduce;
     cublasHandle_t blas = nullptr;
     std::vector<void*> buffers;
     size_t allocated = 0;
@@ -340,7 +341,7 @@ struct Qwen3LayerExecutor::Impl {
                 Bias<<<(t*h+255)/256,256,0,r.stream>>>(partial, bias, t*h, h);
             }
             Cuda(cudaGetLastError());
-            Nccl(ncclAllReduce(partial, partial, size_t(t) * h, ncclFloat, ncclSum, r.comm, r.stream));
+            r.allReduce.Sum(partial, size_t(t) * h);
             Residual<<<(t*h+255)/256,256,0,r.stream>>>(x, partial, t*h);
         }
         if (mlp) {
@@ -352,7 +353,7 @@ struct Qwen3LayerExecutor::Impl {
                 Bias<<<(t*h+255)/256,256,0,r.stream>>>(partial, bias, t*h, h);
             }
             Cuda(cudaGetLastError());
-            Nccl(ncclAllReduce(partial, partial, size_t(t) * h, ncclFloat, ncclSum, r.comm, r.stream));
+            r.allReduce.Sum(partial, size_t(t) * h);
             Residual<<<(t*h+255)/256,256,0,r.stream>>>(x, partial, t*h);
         }
         Cuda(cudaGetLastError());
@@ -433,8 +434,8 @@ struct Qwen3LayerExecutor::Impl {
     }
 };
 
-Qwen3LayerExecutor::Qwen3LayerExecutor(const Qwen3DeviceWeights &weights, cudaStream_t stream, ncclComm_t comm, bool cudaGraph)
-    : impl(new Impl{weights, stream, comm}) {
+Qwen3LayerExecutor::Qwen3LayerExecutor(const Qwen3DeviceWeights &weights, cudaStream_t stream, ncclComm_t comm, ProcessAllReduce &allReduce, bool cudaGraph)
+    : impl(new Impl{weights, stream, comm, allReduce}) {
     if (!stream || !comm) {
         throw std::runtime_error("Qwen3 layer requires initialized stream/NCCL");
     }

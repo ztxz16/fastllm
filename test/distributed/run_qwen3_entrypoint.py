@@ -39,6 +39,7 @@ def main():
     for name in ('generate', 'worker', 'model', 'build-cache', 'package-root'):
         parser.add_argument('--' + name, type=Path, required=True)
     parser.add_argument('--cuda-graph', action='store_true')
+    parser.add_argument('--custom-allreduce', action='store_true')
     parser.add_argument('--devices', default='0,1')
     parser.add_argument('--output', type=Path, default=ROOT / 'test/distributed/results')
     args = parser.parse_args()
@@ -50,7 +51,7 @@ def main():
         cuda=capture(['nvcc', '--version']),
         cuda_visible_devices=os.environ.get('CUDA_VISIBLE_DEVICES'), devices=args.devices,
         expected_case_count=12, execution='decode_cuda_graph' if args.cuda_graph else 'eager',
-        graph_warmup_per_request=1 if args.cuda_graph else 0, prefix_cache=False, kv_cache='FP16 request-local',
+        custom_allreduce=args.custom_allreduce, graph_warmup_per_request=1 if args.cuda_graph else 0, prefix_cache=False, kv_cache='FP16 request-local',
         report_title='FastLLM process TP public entrypoint',
         report_description='正式工厂/CLI 与原生生成的 Token ID 精确对照；不代表性能或独立数学精度验证。')
     rows = []
@@ -95,6 +96,8 @@ def main():
         common = [str(args.model.resolve()), '--tp_backend', 'process', '--tp', args.devices]
         if args.cuda_graph:
             common += ['--cuda-graph']
+        if args.custom_allreduce:
+            common += ['--custom-allreduce']
         # 包目录自动发现产物，故意不传显式 binary/worker，验证正式打包布局。
         model = make_normal_llm_model(make_normal_parser('accept').parse_args(common + ['--tp-output', str(output / 'factory')]))
         try:
@@ -106,7 +109,12 @@ def main():
                 path = model.output / 'session' / f'request-{model.session._next_id-1:06d}.response.json'
                 report = json.loads(path.read_text())
                 require(report['workers'] == workers and model.ready['model_load_count'] == 1, 'model was reloaded')
-                return verify_native(report, reference)
+                metrics = verify_native(report, reference)
+                if args.custom_allreduce:
+                    ar = report['graph'][0]['allreduce']
+                    metrics.update(backend='qwen3_process/custom-ipc-fp32-tp2+nccl-large',
+                                   custom_calls=ar['custom_calls'], nccl_calls=ar['nccl_calls'])
+                return metrics
             case('factory_response', check_text)
             case('factory_stream_reuse', lambda: check_text(True))
 

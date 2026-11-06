@@ -13,7 +13,7 @@ import threading
 import time
 
 from .tp_process_utils import isolated_process, wait_case
-from .tp_graph import validate_graph
+from .tp_graph import validate_graph, validate_allreduce
 
 BACKEND = "qwen3_process_generate_cublas_nccl"
 EMPTY = dict(active=False, tokens=0, capacity=0, device_bytes=0)
@@ -42,7 +42,7 @@ class GenerationObserverError(RuntimeError):
 class Qwen3ProcessSession:
     """同步会话；线程调用串行化，超时或协议错误后整组回收，不自动重试请求。"""
 
-    def __init__(self, binary, worker, model, devices, output, *, timeout=1800, trace=False, cuda_graph=False):
+    def __init__(self, binary, worker, model, devices, output, *, timeout=1800, trace=False, cuda_graph=False, custom_allreduce=False):
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("session timeout must be finite and positive")
         device_ids = [int(value) for value in devices.split(",")]
@@ -53,6 +53,9 @@ class Qwen3ProcessSession:
         self.output = Path(output).resolve()
         if type(cuda_graph) is not bool:
             raise ValueError("cuda_graph must be boolean")
+        if type(custom_allreduce) is not bool or (custom_allreduce and len(device_ids) != 2):
+            raise ValueError("custom_allreduce requires a boolean and TP=2")
+        self.custom_allreduce = custom_allreduce
         self.cuda_graph = cuda_graph
         self._graph_state = None
         self.timeout, self.trace = timeout, trace
@@ -122,12 +125,17 @@ class Qwen3ProcessSession:
 
     def _check_graph(self, report, *, reset=False, decodes=None):
         key = "graph_after_unload" if reset else "graph"
-        if not self.cuda_graph and key not in report:
+        if not self.cuda_graph and not self.custom_allreduce and key not in report:
             return  # Eager 客户端兼容旧原生报告；Graph 必须具有执行证据。
         expected = "decode_cuda_graph" if self.cuda_graph else "eager"
         if report.get("execution") != expected:
             raise RuntimeError("CUDA Graph execution mode mismatch")
         states = validate_graph(report.get(key), len(self.devices), self.cuda_graph)
+        if self.custom_allreduce or any('allreduce' in state for state in states):
+            ar = validate_allreduce(states, len(self.devices), self.custom_allreduce, previous=self._graph_state,
+                                    require_progress=self.custom_allreduce and decodes is not None and decodes > 0)
+            if self._graph_state is None and (ar[0]['custom_calls'] or ar[0]['nccl_calls']):
+                raise RuntimeError('AllReduce counters not zero at startup')
         counts = ('captures', 'replays', 'warmups', 'eager_decodes')
         if reset or self._graph_state is None:
             if any(states[0][key] for key in counts):
@@ -176,6 +184,8 @@ class Qwen3ProcessSession:
                            "--trace-logits", "1" if self.trace else "0", "--cancel-fd", str(cancel_child.fileno())]
                 if self.cuda_graph:
                     command += ["--cuda-graph", "1"]
+                if self.custom_allreduce:
+                    command += ["--custom-allreduce", "1"]
                 (self.output / "command.txt").write_text(shlex.join(command) + "\n")
                 stdout = self._stack.enter_context((self.output / "native.stdout.log").open("wb"))
                 stderr = self._stack.enter_context((self.output / "native.stderr.log").open("wb"))

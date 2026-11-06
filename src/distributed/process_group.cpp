@@ -353,21 +353,27 @@ struct ProcessGroup::Impl {
             std::vector<Qwen3RequestInfo> result;
             for (const auto &reply : replies) {
                 const auto &bytes = reply.payload;
-                if (bytes.size() != 72 || Get32(bytes, 0) > 1 ||
-                    Get32(bytes, 24) > 1 || Get32(bytes, 28) > 1) {
+                if (bytes.size() != 104 || Get32(bytes, 0) > 1 ||
+                    Get32(bytes, 24) > 1 || Get32(bytes, 28) > 1 ||
+                    Get32(bytes, 72) > 1 || Get32(bytes, 76) > 1) {
                     throw std::runtime_error("invalid Qwen3 request state header");
                 }
                 Qwen3RequestInfo info{Get32(bytes, 0) != 0, Get32(bytes, 4), Get32(bytes, 8),
                                       Get32(bytes, 12), Get64(bytes, 16)};
                 info.graph = {Get32(bytes, 24) != 0, Get32(bytes, 28) != 0,
                     Get64(bytes, 32), Get64(bytes, 40), Get64(bytes, 48), Get64(bytes, 56), Get64(bytes, 64)};
+                info.allReduce = {Get32(bytes, 72) != 0, Get32(bytes, 76) != 0,
+                    Get64(bytes, 80), Get64(bytes, 88), Get64(bytes, 96)};
+                const auto &ar = info.allReduce;
                 const auto &g = info.graph;
                 bool invalid = info.active ?
                     (end || !info.tokens || info.tokens > info.capacity || info.capacity > 2048 ||
                      info.positionBegin > 1048576 || info.capacity - 1 > 1048576 - info.positionBegin ||
                      !info.deviceBytes || info.deviceBytes > 256ULL * 1024 * 1024) :
                     (info.tokens || info.capacity || info.positionBegin || info.deviceBytes);
-                invalid = invalid || g.enabled != options.cudaGraph ||
+                invalid = invalid || ar.enabled != options.customAllReduce || ar.active != ar.enabled ||
+                    !ar.workspaceBytes || ar.workspaceBytes > 3ULL * 1024 * 1024 ||
+                    (!ar.enabled && ar.customCalls) || g.enabled != options.cudaGraph ||
                     g.captures != g.warmups || g.replays < g.captures ||
                     g.active != (g.workspaceBytes != 0) || g.workspaceBytes > 256ULL * 1024 * 1024 ||
                     (g.active && (!info.active || !g.captures)) ||
@@ -378,7 +384,9 @@ struct ProcessGroup::Impl {
                               info.capacity != first.capacity || info.positionBegin != first.positionBegin ||
                               g.active != first.graph.active || g.captures != first.graph.captures ||
                               g.replays != first.graph.replays || g.warmups != first.graph.warmups ||
-                              g.eagerDecodes != first.graph.eagerDecodes;
+                              g.eagerDecodes != first.graph.eagerDecodes ||
+                              ar.customCalls != first.allReduce.customCalls || ar.ncclCalls != first.allReduce.ncclCalls ||
+                              ar.workspaceBytes != first.allReduce.workspaceBytes;
                 }
                 if (invalid) {
                     throw std::runtime_error("invalid/inconsistent Qwen3 request state");
@@ -413,7 +421,8 @@ struct ProcessGroup::Impl {
             "--rank", std::to_string(rank), "--world-size", std::to_string(options.devices.size()),
             "--device", std::to_string(options.devices[rank]), "--session", std::to_string(session),
             "--parent-pid", std::to_string(getpid()), "--control-only", options.controlOnly ? "1" : "0",
-            "--cuda-graph", options.cudaGraph ? "1" : "0"};
+            "--cuda-graph", options.cudaGraph ? "1" : "0",
+            "--custom-allreduce", options.customAllReduce ? "1" : "0"};
         std::vector<char*> argv;
         for (auto &arg : args) {
             argv.push_back(&arg[0]);
@@ -508,7 +517,8 @@ void ProcessGroup::Start(const ProcessGroupOptions &options) {
         unique.size() != options.devices.size() || *unique.begin() < 0 ||
         options.startupTimeoutMs <= 0 || options.operationTimeoutMs <= 0 ||
         options.shutdownTimeoutMs <= 0 || options.heartbeatIntervalMs <= 0 ||
-        (options.controlOnly && options.cudaGraph)) {
+        (options.controlOnly && (options.cudaGraph || options.customAllReduce)) ||
+        (options.customAllReduce && options.devices.size() != 2)) {
         throw std::invalid_argument("invalid process TP worker path, devices or timeout");
     }
     impl->options = options;
@@ -589,24 +599,30 @@ void ProcessGroup::Ping() {
     }
 }
 
-std::vector<float> ProcessGroup::CheckAllReduce() {
+std::vector<float> ProcessGroup::CheckAllReduce(uint32_t count, uint32_t salt) {
+    if (!count || count > 131072 || salt > 1024) throw std::invalid_argument("invalid AllReduce check shape/salt");
     std::lock_guard<std::mutex> lock(impl->mutex);
     if (impl->state != ProcessGroupState::Ready || impl->options.controlOnly) {
         throw std::runtime_error("NCCL check requires a ready CUDA process TP group");
     }
     try {
-        auto replies = impl->Exchange(Kind::AllReduce, Kind::AllReduceResult, {},
+        std::vector<uint8_t> payload;
+        Put32(payload, count);
+        Put32(payload, salt);
+        auto replies = impl->Exchange(Kind::AllReduce, Kind::AllReduceResult, payload,
                                       Clock::now() + std::chrono::milliseconds(impl->options.operationTimeoutMs));
         std::vector<float> values;
         for (auto &reply : replies) {
-            if (reply.payload.size() != 4) {
+            if (reply.payload.size() != size_t(count) * 4) {
                 throw std::runtime_error("invalid NCCL check result size");
             }
-            uint32_t bits = Get32(reply.payload, 0);
-            float value;
-            static_assert(sizeof(value) == sizeof(bits), "FP32 required");
-            memcpy(&value, &bits, sizeof(value));
-            values.push_back(value);
+            for (uint32_t i = 0; i < count; ++i) {
+                uint32_t bits = Get32(reply.payload, size_t(i) * 4);
+                float value;
+                static_assert(sizeof(value) == sizeof(bits), "FP32 required");
+                memcpy(&value, &bits, sizeof(value));
+                values.push_back(value);
+            }
         }
         return values;
     } catch (const std::exception &e) {

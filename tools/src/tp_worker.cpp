@@ -15,6 +15,7 @@
 #include <nccl.h>
 #include "distributed/qwen3_device_weights.h"
 #include "distributed/qwen3_layer.h"
+#include "distributed/process_allreduce.h"
 #endif
 
 using namespace fastllm::distributed::protocol;
@@ -43,10 +44,11 @@ void CheckNccl(ncclResult_t result) {
 struct DeviceRuntime {
     bool controlOnly;
     bool cudaGraph;
+    bool customAllReduce;
 #ifdef FASTLLM_PROCESS_TP_CUDA
     cudaStream_t stream = nullptr;
     ncclComm_t comm = nullptr;
-    float *buffer = nullptr;
+    std::unique_ptr<fastllm::distributed::ProcessAllReduce> allReduce;
     std::unique_ptr<fastllm::distributed::Qwen3DeviceWeights> weights;
     std::unique_ptr<fastllm::distributed::Qwen3LayerExecutor> layerExecutor;
 #endif
@@ -58,7 +60,6 @@ struct DeviceRuntime {
 #ifdef FASTLLM_PROCESS_TP_CUDA
         CheckCuda(cudaSetDevice(device));
         CheckCuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-        CheckCuda(cudaMalloc(reinterpret_cast<void**>(&buffer), sizeof(float)));
 #else
         throw std::runtime_error("worker built without CUDA/NCCL; use control-only for transport checks");
 #endif
@@ -89,26 +90,34 @@ struct DeviceRuntime {
         ncclUniqueId id;
         memcpy(&id, payload.data(), sizeof(id));
         CheckNccl(ncclCommInitRank(&comm, world, id, rank));
+        allReduce = std::make_unique<fastllm::distributed::ProcessAllReduce>(stream, comm, customAllReduce);
 #endif
     }
 
-    std::vector<uint8_t> AllReduce(int rank) {
-        if (controlOnly) {
-            throw std::runtime_error("control-only worker cannot run AllReduce");
+    /** 固定输入通信自检，复用正式 Sum、stream 和后端选择；不绕过同步及失败处理。 */
+    std::vector<uint8_t> AllReduce(int rank, const std::vector<uint8_t> &payload) {
+        if (controlOnly || payload.size() != 8 || !Get32(payload, 0) ||
+            Get32(payload, 0) > 131072 || Get32(payload, 4) > 1024) {
+            throw std::runtime_error("invalid AllReduce check payload/state");
         }
 #ifdef FASTLLM_PROCESS_TP_CUDA
-        float value = static_cast<float>(rank + 1);
-        CheckCuda(cudaMemcpyAsync(buffer, &value, sizeof(value), cudaMemcpyHostToDevice, stream));
-        CheckNccl(ncclAllReduce(buffer, buffer, 1, ncclFloat, ncclSum, comm, stream));
-        CheckCuda(cudaMemcpyAsync(&value, buffer, sizeof(value), cudaMemcpyDeviceToHost, stream));
+        const auto count = Get32(payload, 0), salt = Get32(payload, 4);
+        std::vector<float> values(count);
+        for (uint32_t i = 0; i < count; ++i) values[i] = (rank + 1) * (1.0f + (i % 257) * 0.125f + salt * 0.25f);
+        float *data = nullptr;
+        CheckCuda(cudaMalloc(reinterpret_cast<void**>(&data), values.size() * sizeof(float)));
+        CheckCuda(cudaMemcpyAsync(data, values.data(), values.size() * sizeof(float), cudaMemcpyHostToDevice, stream));
+        allReduce->Sum(data, count);
+        CheckCuda(cudaMemcpyAsync(values.data(), data, values.size() * sizeof(float), cudaMemcpyDeviceToHost, stream));
         CheckCuda(cudaStreamSynchronize(stream));
-        ncclResult_t asynchronous;
-        CheckNccl(ncclCommGetAsyncError(comm, &asynchronous));
-        CheckNccl(asynchronous);
-        uint32_t bits;
-        memcpy(&bits, &value, sizeof(bits));
+        CheckCuda(cudaFree(data));
+        CheckHealth();
         std::vector<uint8_t> result;
-        Put32(result, bits);
+        for (float value : values) {
+            uint32_t bits;
+            memcpy(&bits, &value, sizeof(bits));
+            Put32(result, bits);
+        }
         return result;
 #else
         throw std::runtime_error("NCCL unavailable");
@@ -120,10 +129,10 @@ struct DeviceRuntime {
         if (!controlOnly) {
             UnloadWeights();
             CheckCuda(cudaStreamSynchronize(stream));
+            allReduce->Close();
+            allReduce.reset();
             CheckNccl(ncclCommDestroy(comm));
             comm = nullptr;
-            CheckCuda(cudaFree(buffer));
-            buffer = nullptr;
             CheckCuda(cudaStreamDestroy(stream));
             stream = nullptr;
         }
@@ -226,7 +235,7 @@ struct DeviceRuntime {
             memcpy(&input[i], &bits, sizeof(bits));
         }
         if (!layerExecutor) {
-            layerExecutor = std::make_unique<fastllm::distributed::Qwen3LayerExecutor>(*weights, stream, comm, cudaGraph);
+            layerExecutor = std::make_unique<fastllm::distributed::Qwen3LayerExecutor>(*weights, stream, comm, *allReduce, cudaGraph);
         }
         auto output = layerExecutor->Forward(Get32(payload, 0), Get32(payload, 4), Get32(payload, 8),
             Get32(payload, 12), static_cast<fastllm::distributed::Qwen3LayerStage>(Get32(payload, 16)), input);
@@ -265,7 +274,7 @@ struct DeviceRuntime {
             ids.push_back(Get32(payload, offset));
         }
         if (!layerExecutor) {
-            layerExecutor = std::make_unique<fastllm::distributed::Qwen3LayerExecutor>(*weights, stream, comm, cudaGraph);
+            layerExecutor = std::make_unique<fastllm::distributed::Qwen3LayerExecutor>(*weights, stream, comm, *allReduce, cudaGraph);
         }
         auto logits = decode ? layerExecutor->Decode(Get32(payload, 0)) :
             begin ? layerExecutor->BeginRequest(ids, Get32(payload, 8), Get32(payload, 0)) :
@@ -309,6 +318,12 @@ struct DeviceRuntime {
         Put64(result, info.graph.warmups);
         Put64(result, info.graph.eagerDecodes);
         Put64(result, info.graph.workspaceBytes);
+        auto ar = allReduce->Info();
+        Put32(result, ar.enabled);
+        Put32(result, ar.active);
+        Put64(result, ar.customCalls);
+        Put64(result, ar.ncclCalls);
+        Put64(result, ar.workspaceBytes);
         return result;
 #else
         throw std::runtime_error("worker built without CUDA");
@@ -345,10 +360,11 @@ int main(int argc, char **argv) {
                 throw std::runtime_error("invalid/duplicate worker arguments");
             }
         }
-        if (args.size() != 8 || args.at("--control-fd") != uint64_t(kWorkerFd) ||
+        if (args.size() != 9 || args.at("--control-fd") != uint64_t(kWorkerFd) ||
             args.at("--world-size") == 0 || args.at("--world-size") > 1024 ||
             args.at("--rank") >= args.at("--world-size") || args.at("--device") > INT_MAX ||
-            args.at("--control-only") > 1 || args.at("--cuda-graph") > 1 ||
+            args.at("--control-only") > 1 || args.at("--cuda-graph") > 1 || args.at("--custom-allreduce") > 1 ||
+            (args.at("--custom-allreduce") && (args.at("--world-size") != 2 || args.at("--control-only"))) ||
             (args.at("--control-only") && args.at("--cuda-graph")) || args.at("--parent-pid") == 0 ||
             args.at("--parent-pid") > INT_MAX || args.at("--session") == 0) {
             throw std::runtime_error("invalid worker identity");
@@ -374,7 +390,8 @@ int main(int argc, char **argv) {
         int rank = static_cast<int>(args.at("--rank"));
         int world = static_cast<int>(args.at("--world-size"));
         int device = static_cast<int>(args.at("--device"));
-        DeviceRuntime runtime{args.at("--control-only") != 0, args.at("--cuda-graph") != 0};
+        DeviceRuntime runtime{args.at("--control-only") != 0, args.at("--cuda-graph") != 0,
+                              args.at("--custom-allreduce") != 0};
         runtime.Bind(device);
 
         std::vector<uint8_t> hello;
@@ -414,7 +431,7 @@ int main(int argc, char **argv) {
             if (message.kind != Kind::Initialize && message.kind != Kind::LoadQwen3 &&
                 message.kind != Kind::ReadWeight && message.kind != Kind::ForwardLayer &&
                 message.kind != Kind::PrefillQwen3 && message.kind != Kind::BeginQwen3Request &&
-                message.kind != Kind::DecodeQwen3 && !message.payload.empty()) {
+                message.kind != Kind::DecodeQwen3 && message.kind != Kind::AllReduce && !message.payload.empty()) {
                 throw std::runtime_error("unexpected worker command payload");
             }
             switch (message.kind) {
@@ -490,7 +507,7 @@ int main(int argc, char **argv) {
                     if (!initialized) {
                         throw std::runtime_error("AllReduce before Initialize");
                     }
-                    payload = runtime.AllReduce(rank);
+                    payload = runtime.AllReduce(rank, message.payload);
                     response = Kind::AllReduceResult;
                     break;
                 case Kind::Shutdown:
