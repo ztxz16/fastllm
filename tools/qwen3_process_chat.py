@@ -37,7 +37,8 @@ def validate_request(request, vocab):
 
 
 def prepare_request(model, tokenizer, prompt, *, raw=False, thinking=False, max_new_tokens=32,
-                    temperature=0.0, top_k=0, top_p=1.0, seed=0, eos_ids=None, ignore_eos=False):
+                    temperature=0.0, top_k=0, top_p=1.0, seed=0, eos_ids=None, ignore_eos=False,
+                    messages=None):
     """复用本地模型的聊天模板和 EOS 配置，保存实际送入模型的完整 token ID。"""
     config = json.loads((model / "config.json").read_text())
     if config.get("model_type") != "qwen3":
@@ -52,7 +53,8 @@ def prepare_request(model, tokenizer, prompt, *, raw=False, thinking=False, max_
             else:
                 raise ValueError("model has no chat template; use --raw only for raw completion")
         # 显式返回 token 列表，避免新版默认 BatchEncoding 被 list() 转成字段名。
-        ids = tokenizer.apply_chat_template([dict(role="user", content=prompt)], tokenize=True, return_dict=False,
+        ids = tokenizer.apply_chat_template(messages if messages is not None else [dict(role="user", content=prompt)],
+            tokenize=True, return_dict=False,
             add_generation_prompt=True, enable_thinking=thinking)
 
     eos = []

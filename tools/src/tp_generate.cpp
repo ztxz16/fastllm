@@ -68,9 +68,11 @@ Json::array EmptyCache(ProcessGroup &group) {
  * @param request JSON 对象，token_ids 为一维无符号整数数组。
  * @param trace 是否记录有界 FP32 [vocab] logits。
  * @param report 写入实际输出和缓存状态，失败时保留已完成步骤。
+ * @param cancelled 可选取消探针，沿用正式生成接口的同步边界和 KV 清理。
  * @return 正常返回表示生成及 KV 释放成功；非法输入或执行失败抛异常。
  */
-void Generate(ProcessGroup &group, const Json &request, bool trace, Json::object &report) {
+void Generate(ProcessGroup &group, const Json &request, bool trace, Json::object &report,
+              const std::function<bool()> &cancelled = {}) {
     if (!request.is_object()) throw std::runtime_error("generation request must be object");
     const std::set<std::string> fields{"token_ids", "max_new_tokens", "temperature", "top_k", "top_p", "seed", "eos_token_ids"};
     for (const auto &item : request.object_items()) {
@@ -104,7 +106,7 @@ void Generate(ProcessGroup &group, const Json &request, bool trace, Json::object
                 recorded += logits.size();
             }
             steps.push_back(std::move(step));
-        });
+        }, cancelled);
         Json::array ids;
         for (auto token : result.tokenIds) ids.push_back(static_cast<long long>(token));
         report["token_ids"] = std::move(ids);
@@ -138,6 +140,17 @@ public:
         fd = candidate;
     }
     ~SessionSocket() { if (fd >= 0) close(fd); }
+
+    /** 非阻塞检查控制端是否退出；不消费下一条消息，也不改变 socket 阻塞模式。 */
+    bool Disconnected() const {
+        char byte;
+        ssize_t count;
+        do { count = recv(fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT); } while (count < 0 && errno == EINTR);
+        if (count < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+            throw std::runtime_error("session connection check failed");
+        }
+        return count == 0;
+    }
 
     /** 精确读取指定字节数；仅帧头起始处允许干净 EOF，其余断连均拒绝。 */
     bool ReadBytes(char *buffer, size_t size, bool allowEof = false) {
@@ -190,20 +203,66 @@ public:
 };
 
 /**
+ * 独立数据报取消通道；消息只携带网络字节序 uint32 请求 ID。
+ * 旧请求的迟到取消直接丢弃，不能取消下一请求；消息格式错误使整组失败。
+ */
+class SessionCancellation {
+    int fd = -1;
+    bool valid = true;
+public:
+    /** 接管父进程传入的 datagram socket，禁止 worker 继承。 */
+    explicit SessionCancellation(const std::string &value) {
+        if (value.empty() || value.find_first_not_of("0123456789") != std::string::npos) {
+            throw std::runtime_error("invalid cancellation fd");
+        }
+        int candidate = std::stoi(value), type = 0;
+        socklen_t size = sizeof(type);
+        if (candidate < 3 || getsockopt(candidate, SOL_SOCKET, SO_TYPE, &type, &size) != 0 ||
+            type != SOCK_DGRAM || fcntl(candidate, F_SETFD, FD_CLOEXEC) != 0) {
+            throw std::runtime_error("cancellation fd must be a datagram socket");
+        }
+        fd = candidate;
+    }
+    ~SessionCancellation() { if (fd >= 0) close(fd); }
+
+    /** 协议损坏后不可继续复用会话。 */
+    bool Valid() const { return valid; }
+
+    /** 消费已到达的取消 ID；只有当前 ID 命中时返回 true，未来 ID 属于协议错误。 */
+    bool Requested(uint32_t id) {
+        bool cancelled = false;
+        for (;;) {
+            uint32_t message = 0;
+            ssize_t count = recv(fd, &message, sizeof(message), MSG_DONTWAIT | MSG_TRUNC);
+            if (count < 0 && errno == EINTR) continue;
+            if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return cancelled;
+            if (count != static_cast<ssize_t>(sizeof(message)) || ntohl(message) > id || ntohl(message) == 0) {
+                valid = false;
+                throw std::runtime_error("invalid cancellation message");
+            }
+            cancelled = cancelled || ntohl(message) == id;
+        }
+    }
+};
+
+/**
  * 在同一进程组串行处理多次生成；权重只加载一次，每次生成独立释放 KV。
  * @param group 已加载模型的进程组；退出时卸载并停止。
  * @param socket 独立控制通道，id 必须从 1 开始连续递增。
  * @param trace 是否记录与单请求入口相同的 logits。
  * @param report 会话启动信息与最终清理状态。
+ * @param cancellation 可选取消通道；不与控制帧混用，迟到取消按请求 ID 隔离。
  * @return 正常返回表示 EOF 或 shutdown 已完成清理；致命错误抛异常并交由 main 回收。
  */
-void Serve(ProcessGroup &group, SessionSocket &socket, bool trace, Json::object &report) {
+void Serve(ProcessGroup &group, SessionSocket &socket, bool trace, Json::object &report,
+           SessionCancellation *cancellation) {
     auto ready = report;
     ready["event"] = "ready";
     ready["protocol"] = 1;
     ready["status"] = "PASS";
     ready["model_load_count"] = 1;
     ready["cache"] = EmptyCache(group);
+    ready["cancellation"] = cancellation ? "request_id_datagram" : "none";
     socket.Write(ready);
     uint64_t expected = 1;
     bool shutdown = false;
@@ -223,13 +282,17 @@ void Serve(ProcessGroup &group, SessionSocket &socket, bool trace, Json::object 
         Json::object result{{"event", "result"}, {"id", static_cast<long long>(id)},
             {"status", "FAIL"}, {"backend", report["backend"]}, {"workers", report["workers"]}};
         try {
-            Generate(group, message["request"], trace, result);
+            Generate(group, message["request"], trace, result, [&]() {
+                if (socket.Disconnected()) throw std::runtime_error("session client disconnected");
+                return cancellation && cancellation->Requested(id);
+            });
             result["status"] = "PASS";
             result["reusable"] = true;
         } catch (const std::exception &error) {
             result["error"] = error.what();
+            if (dynamic_cast<const Qwen3GenerationCancelled*>(&error)) result["cancelled"] = true;
             bool reusable = false;
-            if (group.State() == ProcessGroupState::Ready) {
+            if (group.State() == ProcessGroupState::Ready && (!cancellation || cancellation->Valid())) {
                 try {
                     result["cache_after_error"] = EmptyCache(group);
                     reusable = true;
@@ -270,12 +333,14 @@ int main(int argc, char **argv) {
     ProcessGroup group;
     Json::object report{{"status", "FAIL"}, {"backend", "qwen3_process_generate_cublas_nccl"}};
     std::unique_ptr<SessionSocket> session;
+    std::unique_ptr<SessionCancellation> cancellation;
     try {
         std::map<std::string, std::string> args;
         for (int i = 1; i < argc; i += 2) {
             const std::string key = argv[i];
             if (i + 1 == argc || (key != "--worker" && key != "--model" && key != "--request" &&
-                key != "--devices" && key != "--trace-logits" && key != "--session-fd") || !args.emplace(key, argv[i+1]).second) {
+                key != "--devices" && key != "--trace-logits" && key != "--session-fd" &&
+                key != "--cancel-fd") || !args.emplace(key, argv[i+1]).second) {
                 throw std::runtime_error("invalid/duplicate generation argument");
             }
         }
@@ -288,6 +353,10 @@ int main(int argc, char **argv) {
         }
         if (args.count("--request") == args.count("--session-fd")) {
             throw std::runtime_error("specify exactly one of --request or --session-fd");
+        }
+        if (args.count("--cancel-fd")) {
+            if (!args.count("--session-fd")) throw std::runtime_error("cancel-fd requires session-fd");
+            cancellation.reset(new SessionCancellation(args.at("--cancel-fd")));
         }
         Json request;
         if (args.count("--session-fd")) {
@@ -326,7 +395,7 @@ int main(int argc, char **argv) {
         report["workers"] = workers;
         group.LoadQwen3(fs::absolute(args.at("--model")).string());
         if (session) {
-            Serve(group, *session, trace, report);
+            Serve(group, *session, trace, report, cancellation.get());
         } else {
             Generate(group, request, trace, report);
             group.UnloadQwen3();

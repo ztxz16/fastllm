@@ -3,6 +3,7 @@
 
 #include "distributed/process_group.h"
 #include <functional>
+#include <stdexcept>
 
 namespace fastllm {
 namespace distributed {
@@ -20,6 +21,11 @@ struct Qwen3GenerationResult {
     // 包含实际采样出的 EOS；最后一个输出 token 不再送入 Decode。
     std::vector<uint32_t> tokenIds;
     std::string finishReason;
+};
+
+class Qwen3GenerationCancelled : public std::runtime_error {
+public:
+    Qwen3GenerationCancelled() : std::runtime_error("Qwen3 generation cancelled") {}
 };
 
 /**
@@ -46,11 +52,14 @@ uint32_t SampleQwen3(const std::vector<float> &logits,
  * @param options 长度必须为正；EOS ID 必须落在模型词表内。
  * @param observer 可选同步观察回调，收到实际选中的 ID 和对应完整 logits；
  *                 引用仅在调用期间有效，异常将中止生成并尝试释放请求。
+ * @param cancelled 可选非阻塞取消探针；在 Prefill 前和逐 token 边界检查，
+ *                  不打断执行中的 CUDA/NCCL 操作；取消抛 Qwen3GenerationCancelled。
  * @return 输出 ID 和 eos/length 原因；失败抛异常，worker 失败沿用整组失败语义。
  */
 Qwen3GenerationResult GenerateQwen3(ProcessGroup &group, const std::vector<uint32_t> &prompt,
     const Qwen3GenerationOptions &options,
-    const std::function<void(uint32_t, const std::vector<float>&)> &observer = {});
+    const std::function<void(uint32_t, const std::vector<float>&)> &observer = {},
+    const std::function<bool()> &cancelled = {});
 
 } // namespace distributed
 } // namespace fastllm
