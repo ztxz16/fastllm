@@ -502,6 +502,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--tp', type = str, default = "", help = '张量并行设备；裸数字X表示使用前X张卡，0表示0号卡，也可写 0,1 或 auto')
     parser.add_argument('--tp_backend', '--tp-backend', choices = ['thread', 'process'], default = 'thread',
                         help = 'TP后端；默认thread。process支持Linux CUDA上的稠密Qwen3 FP16推理')
+    parser.add_argument('--custom-allreduce', action='store_true', help='process TP2 CUDA IPC FP32 AllReduce')
     parser.add_argument('--cuda-graph', action='store_true', help='进程TP使用Decode CUDA Graph；失败直接报错')
     parser.add_argument('--tp-binary', default='', help='进程TP协调器路径；默认从包目录或PATH查找')
     parser.add_argument('--tp-worker', default='', help='进程TP worker路径；默认从包目录或PATH查找')
@@ -631,6 +632,8 @@ def make_normal_llm_model(args, startup_progress = None):
         from .process_tp import ProcessTPModel
         return ProcessTPModel(args)
 
+    if getattr(args, "custom_allreduce", False):
+        raise ValueError("--custom-allreduce requires --tp_backend process")
     if getattr(args, "cuda_graph", False):
         raise ValueError("--cuda-graph requires --tp_backend process; thread mode uses its existing configuration")
 

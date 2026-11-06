@@ -69,7 +69,7 @@ def validate_options(args):
     add_server_args(parser)
     defaults = vars(parser.parse_args([]))
     allowed = {'model', 'path', 'tp', 'tp_backend', 'tp_binary', 'tp_worker', 'tp_output', 'tp_timeout',
-               'tp_request_timeout', 'tp_queue_size', 'host', 'port', 'model_name', 'cuda_graph'}
+               'tp_request_timeout', 'tp_queue_size', 'host', 'port', 'model_name', 'cuda_graph', 'custom_allreduce'}
     compatible = {'dtype': ('auto', 'float16'), 'atype': ('auto', 'float16'),
                   'kv_cache_dtype': ('auto', 'float16'), 'kv_cache_layout': ('auto', 'continuous'),
                   'device': (None, ''), 'FASTLLM_ACTIVATE_NUMA': ('OFF',), 'FASTLLM_NUMA_THREADS': (27,),
@@ -90,7 +90,11 @@ def validate_options(args):
         if os.environ.get(key, '').strip().lower() not in ('', '0', 'false', 'off'):
             if key == 'FASTLLM_CUDA_GRAPH':
                 raise ValueError('process TP rejects FASTLLM_CUDA_GRAPH; use --cuda-graph for Decode Graph')
+            if key == 'FASTLLM_CUDA_CUSTOM_ALLREDUCE':
+                raise ValueError('process TP rejects FASTLLM_CUDA_CUSTOM_ALLREDUCE; use --custom-allreduce')
             raise ValueError(f'process TP does not support {key} yet')
+    if type(getattr(args, 'custom_allreduce', False)) is not bool:
+        raise ValueError('custom_allreduce must be boolean')
     if type(getattr(args, 'cuda_graph', False)) is not bool:
         raise ValueError('cuda_graph must be boolean')
     if not sys.platform.startswith('linux'):
@@ -142,7 +146,8 @@ class ProcessTPModel:
         self._closing = False
         self.session = Qwen3ProcessSession(binary, worker, self.model_path, self.devices,
                                           self.output / 'session', timeout=getattr(args, 'tp_timeout', 180),
-                                          cuda_graph=getattr(args, 'cuda_graph', False))
+                                          cuda_graph=getattr(args, 'cuda_graph', False),
+                                          custom_allreduce=getattr(args, 'custom_allreduce', False))
         self.session.__enter__()
         args.path = str(self.model_path)
 

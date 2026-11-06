@@ -54,7 +54,7 @@ int main(int argc, char **argv) {
             std::string key = argv[i];
             if (i + 1 == argc || (key != "--worker" && key != "--model" && key != "--tasks" &&
                 key != "--devices" && key != "--case" && key != "--reload-model" &&
-                key != "--max-logit-elements" && key != "--cuda-graph") || !args.emplace(key, argv[i + 1]).second) {
+                key != "--max-logit-elements" && key != "--cuda-graph" && key != "--custom-allreduce") || !args.emplace(key, argv[i + 1]).second) {
                 throw std::runtime_error("invalid/duplicate decode checker argument");
             }
         }
@@ -71,6 +71,7 @@ int main(int argc, char **argv) {
         }
         ProcessGroupOptions options;
         options.cudaGraph = args.count("--cuda-graph") && ParseCudaGraph(args.at("--cuda-graph"));
+        options.customAllReduce = args.count("--custom-allreduce") && ParseCustomAllReduce(args.at("--custom-allreduce"));
         report["execution"] = options.cudaGraph ? "decode_cuda_graph" : "eager";
         options.workerPath = fs::absolute(args.at("--worker")).string();
         options.operationTimeoutMs = options.shutdownTimeoutMs = 30000;

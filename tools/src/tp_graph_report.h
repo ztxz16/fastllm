@@ -18,7 +18,11 @@ inline json11::Json::array GraphState(fastllm::distributed::ProcessGroup &group)
         states.push_back(json11::Json::object{{"enabled", g.enabled}, {"active", g.active},
             {"captures", static_cast<long long>(g.captures)}, {"replays", static_cast<long long>(g.replays)},
             {"warmups", static_cast<long long>(g.warmups)}, {"eager_decodes", static_cast<long long>(g.eagerDecodes)},
-            {"workspace_bytes", static_cast<long long>(g.workspaceBytes)}});
+            {"workspace_bytes", static_cast<long long>(g.workspaceBytes)},
+            {"allreduce", json11::Json::object{{"enabled", info.allReduce.enabled}, {"active", info.allReduce.active},
+                {"custom_calls", static_cast<long long>(info.allReduce.customCalls)},
+                {"nccl_calls", static_cast<long long>(info.allReduce.ncclCalls)},
+                {"workspace_bytes", static_cast<long long>(info.allReduce.workspaceBytes)}}}});
     }
     return states;
 }
@@ -30,5 +34,11 @@ inline json11::Json::array GraphState(fastllm::distributed::ProcessGroup &group)
  */
 inline bool ParseCudaGraph(const std::string &value) {
     if (value != "0" && value != "1") throw std::invalid_argument("cuda-graph must be 0 or 1");
+    return value == "1";
+}
+
+/** 严格解析自定义规约开关；不能把其他字符串静默解释为关闭。 */
+inline bool ParseCustomAllReduce(const std::string &value) {
+    if (value != "0" && value != "1") throw std::invalid_argument("custom-allreduce must be 0 or 1");
     return value == "1";
 }
