@@ -572,7 +572,7 @@ python3 tools/qwen3_process_chat.py \
 长度停止，文本前端会显式传入解析后的 EOS 配置。成功 stdout 是最终 JSON，
 可能带 NCCL 前置日志；任何失败返回非零，保留部分 steps 和清理状态。
 
-## 常驻模型与连续请求（待服务器验收）
+## 常驻模型与连续请求（基础已服务器验收，取消扩展待验收）
 
 `fastllm_tp_generate --session-fd FD` 接受父进程传入的独立 stream socket；
 Python 公开客户端为 `tools/qwen3_process_session.py` 中的 `Qwen3ProcessSession`。
@@ -582,15 +582,15 @@ Python 公开客户端为 `tools/qwen3_process_session.py` 中的 `Qwen3ProcessS
 - 控制消息为网络字节序 uint32 长度 + UTF-8 JSON；与 stdout/stderr 日志隔离。
   请求最多 1 MiB，响应最多 512 MiB；trace 仍限制累计 8M logits 元素。
 - ready 消息确认模型已加载；generate 的 id 从 1 连续递增，响应包含原请求、
-  worker 身份、输出 ID、结束原因和 KV 状态。客户端串行化并发调用；尚无 FIFO
-  调度保证、连续批处理、异步 token 流或单请求主动取消。
+  worker 身份、输出 ID、结束原因和 KV 状态。客户端串行化并发调用；FIFO 排队由下文
+  HTTP 服务负责。新增 cancel_event 通过独立数据报按请求 ID 取消；尚无连续批处理或 token 流。
 - 参数拒绝且确认 KV 为空时允许继续；worker 失败、超时、协议错乱或资源异常
   终止并回收整组，后续调用失败，不会自动重试或切换线程后端。
 - shutdown/EOF 卸载模型并退出；Python 在正常退出及异常时都使用已有的进程组
   清理工具。客户端超时包含一次请求的控制通信和生成，不是单个 token 的耗时。
   只有整组回收成功后才写入成功退出记录；清理异常和已失败会话不能被汇总为 PASS。
-- 原通用 Python 服务 `--tp_backend process` 仍未开放；本轮是服务接入前的常驻
-  后端基础，不宣称 HTTP、多请求并行计算、CUDA Graph 或自定义 AllReduce 已完成。
+- 原通用 Python 服务 `--tp_backend process` 仍未开放。下文新增独立 Qwen3 HTTP 入口；
+  不宣称多请求并行计算、CUDA Graph、自定义 AllReduce 或跨请求前缀缓存已完成。
 
 服务器一键构建并执行四组检查（已有生成两组、新增常驻两组），再连续回答两条问题：
 
@@ -618,3 +618,84 @@ python3 tools/qwen3_process_chat.py \
 每行独立提问，Ctrl-D 退出；每条原始问题和回答保存到 `text-NNNNNN.json`。
 某条输入非法时显示错误并继续接受下一条；只要出现过失败，最终退出码就是非零。
 `session/ready.json`、逐请求结果、`shutdown.json` 记录权重驻留与清理情况。
+
+
+2026-11-06，用户在双 V100 服务器完成原常驻版验收：
+
+- 生成：`20261106T112843Z_generation_a2674039`、`20261106T112920Z_generation_716ee10e`。
+- 常驻：`20261106T112946Z_session_ab3de6f2`、`20261106T112954Z_session_15c54f1f`。
+- 文本：`text-session/20261106T113158Z_069d4baf`，两请求分别 17/38 token，均 EOS，failed=0。
+
+此次新加“Prefill 前取消 → 同一 worker 再次生成 A”，常驻验收变为每模型 12 项；
+上面的历史结果不能代替新增取消功能的服务器验收。
+
+## Qwen3 HTTP 服务与协作取消（待服务器验收）
+
+正式入口为 `tools/qwen3_process_server.py`，仅依赖标准库 HTTP 和已有 tokenizer 依赖，
+复用 `Qwen3ProcessSession` / `GenerateQwen3`。这是独立的受限聊天入口；通用
+`ftllm server --tp_backend process` 的拒绝保护仍保留，不能混用这两个入口。
+
+- 模型/两 rank 权重加载一次；一个消费线程执行 FIFO 队列，每次只有一个活动请求。
+  `--queue-size` 是等待槽数，默认 8，满时 HTTP 429；重复的活动 `X-Request-ID` 返回 409。
+- `GET /health` 提供就绪、活动 ID、等待 ID、worker 身份；`GET /v1/models` 返回模型名。
+- `POST /v1/chat/completions` 接受 `model`、`messages`、`max_tokens`、`temperature`、
+  `top_p`、`top_k`、`seed`、`stream=false`。模型默认名 `qwen3`；采样默认贪心，关闭 thinking。
+  文本 messages 可以带首条 system，然后 user/assistant 交替且以 user 结束；完整历史
+  每次通过同一聊天模板编码，不自动保存服务端对话历史。
+- Prompt 含模板及历史仍限制 1..128 token；`prompt+max_tokens-1<=2048`。超限拒绝，
+  不静默截断。请求体上限 64 KiB；未知字段、工具、多模态、流式、chunked 请求均拒绝。
+  每次响应后关闭连接；不支持 HTTP 请求流水化。连接线程总数也有上限。
+- 原生 `--cancel-fd` 为独立 SOCK_DGRAM 通道，网络字节序 uint32 对应 session 请求 ID。
+  在 Prefill 前、Prefill 返回后及 Decode token 边界检查；不会强行中断 CUDA/NCCL。
+  取消后调用正式 End 路径释放请求 KV，检查为空后才确认 reusable；迟到取消不能误伤下一请求。
+- 客户端断连、请求超时、`DELETE /v1/requests/{X-Request-ID}` 都触发同一取消路径。
+  排队任务直接移除，活动任务等待原生取消确认。DELETE 的 202 仅代表已提交取消，
+  不是 GPU 已停；请求如已在原生完成则完成结果优先。显式取消响应 499，超时响应 504。
+- `--request-timeout` 默认 120 秒，包含排队和生成；取消确认可能等待当前 GPU 步骤。
+  `--session-timeout` 默认 180 秒，原生故障/无法响应时回收整组并将服务标记不可用，
+  不自动重试、不重载模型、不 fallback。取消并清理成功后后续请求才继续。
+- SIGINT/SIGTERM 停止接收新请求、取消排队与活动任务、卸载/回收进程组；成功才写 shutdown.json。
+- 默认监听 `127.0.0.1`，无认证和 TLS；定位是本机/SSH 隧道验证入口。日志目录包含
+  `ready.json`、每请求 `http-*.json`、原生 session 日志/请求/输出及最终退出记录；目录唯一。
+
+双 V100 服务器一键编译和验收（新取消会影响原生成入口，故重跑常驻数值对照）：
+
+```bash
+bash test/distributed/run_qwen3_http_v100.sh /home/models/Qwen3-1.7B
+```
+
+共三组：合成模型常驻+取消 72 项、真实 Qwen3 常驻+取消 12 项、真实 HTTP 服务 11 项。
+前两组沿用 CPU / 单卡 logits 对照；HTTP 使用正式 HTTP 类和同一会话后端，比较与
+相同 Prompt ID、FP16 KV、EOS/采样参数、Eager 模式单次入口的精确 Token ID、文本、
+用量和结束原因。还验证有界队列、排队/活动取消、断连、超时、复用与退出。
+HTTP 的误差字段指 Token ID 精确一致性，不是 logits 误差；生命周期用例为 n/a。
+任何失败或少执行用例都返回非零，保留 JSON/Markdown/CSV/XLSX 和原始报告。
+这些检查不构成性能结论，也不代替独立框架的模型质量对照。
+
+验收后启动服务（前台运行，Ctrl-C 退出）：
+
+```bash
+export CUDA_HOME=/usr/local/cuda-12.6
+export LD_LIBRARY_PATH="$CUDA_HOME/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export CUDA_VISIBLE_DEVICES=0,1
+export USE_TORCH=0
+python3 tools/qwen3_process_server.py --model /home/models/Qwen3-1.7B \
+  --host 127.0.0.1 --port 8000 --queue-size 8
+```
+
+另一个服务器终端发送请求：
+
+```bash
+curl -sS http://127.0.0.1:8000/health
+curl -sS http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' -H 'X-Request-ID: demo-1' \
+  -d '{"model":"qwen3","messages":[{"role":"user","content":"请用一句话介绍你自己。"}],"max_tokens":64,"stream":false}'
+```
+
+需要取消尚未结束的 demo-1 时，在第三个终端执行：
+
+```bash
+curl -sS -X DELETE http://127.0.0.1:8000/v1/requests/demo-1
+```
+
+本轮仍不包含 SSE 流式输出、连续批处理、CUDA Graph、自定义 AllReduce 或跨请求 Prefix Cache。
