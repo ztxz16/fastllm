@@ -17,11 +17,13 @@
 
 ## CUDA Graph 与生命周期
 
-对象必须在捕获前创建，存活到所有 graph executable 销毁之后。`Write`、`Resolve` 没有动态分配、主机回调或设备到主机的元数据读取；设备数组内容可在每次回放前更新。长度、TopK、请求顺序和命中率变化不需要重新捕获。`maxBatch` 包括补齐行，可以大于 `maxRequests`，例如 220 个请求使用 224 行 Graph，补齐行传 `request=-1`。
+对象必须在捕获前创建，存活到所有 graph executable 销毁之后。`Write`、`Resolve`、`ResolveQueries` 没有动态分配、主机回调或设备到主机的元数据读取；设备数组内容可在每次回放前更新。长度、TopK、请求顺序和命中率变化不需要重新捕获。`maxBatch` 包括补齐行，可以大于 `maxRequests`，例如 220 个请求使用 224 行 Graph，补齐行传 `request=-1`。
 
 所有调用由指定 CUDA stream 排序。不能同时在不同 stream/Graph 上访问同一个对象：输出和工作区共享，每个 owner 的槽位状态也共享。请求回收时在同一 stream 调用 `Reset(owner, stream)`，完成后再填入新请求的 DDR 数据。Reset 保持地址不变，旧 Graph 可以继续使用。DDR 长度以内的 KV 必须已经由调用方初始化，不能在 GPU 访问期间直接改写主机数据。
 
-一次 `Resolve` 中每个非负 owner 只能出现一次。多个 query 共享请求时，应由调用方先分批或构建并集；本接口没有隐含的 prefill 合并策略。`maxSelected <= residentTokens`，保证最坏情况下全部选中行都能同时驻留。当前没有容量不足时直接读 DDR 的注意力回退。
+一次 resolve 中每个非负 owner 最多出现 `maxQueries` 次（默认 1）。多个 query 共享请求时先保护它们选中行的并集，每个缺失行只搬运一次，保留每个 query 的独立因果长度、TopK 顺序与重复项。必须满足 `maxQueries × maxSelected <= residentTokens`，保证最坏情况下并集能够驻留；更多 query 由调用方分组，每组完成 attention 后才能复用热缓存。
+
+`ResolveQueries` 接收主机描述符并按值捕获，描述符指向的设备地址表、长度与 TopK 可在 Graph 回放前更新。直接写入映射 DDR 的验证路径传 `appendedRows=true`，使最早新 query 位置之后的旧热副本失效，避免读取上一轮被拒绝候选的 KV。多 token prefill 写入前使用 `InvalidateTail`；改写整个请求或替换任意历史页时仍须 `Reset`。
 
 负索引和超出当前有效长度的 TopK 项被映射为 `-1`。错误的 owner、长度、有效项数或写入位置会设置 sticky `DeviceErrors()`，无效的 resolve 行输出长度为零。调用方应在批次完成后的错误检查中读取该值，不能将错误批次作为有效推理结果。统计读取同样由调用方显式完成，不在回放关键路径同步。
 
@@ -34,7 +36,7 @@
 - GPU 历史位置到槽位表：`R × L × 4` 字节。
 - GPU 槽位表：`R × C × 4` 字节。
 - 分页模式额外需要 K/V 页表：`R × round_up(L / pageLen, 4) × 8` 字节，保证各请求页表的 16 字节对齐。
-- 批次工作区主要为 `B × (2C + 2K) × 4` 字节，另有地址、计数器和统计。
+- 多 query 工作区主要为 `R × (2C + maxQueries × K) × 4 + B × K × 4` 字节，单 query 模式保留按 batch 分配的工作区；另有地址、计数器和统计。
 
 `HostBytes()` 和 `DeviceBytes()` 返回对象申请的实际字节数，不含 CUDA context、Graph 对象、Indexer 或注意力自身的工作区。逻辑位置表占用随上下文增长，但每步命中和淘汰工作只扫描 TopK 与常驻槽，不扫描完整历史。
 
@@ -65,15 +67,15 @@ BUILD/cuda_kvmem_sparse_test --benchmark
 --kvmem '{"max_tokens":66048,"resident_tokens":16384,"prefill_tokens":8192,"host_mib":65536}'
 ```
 
-本适配器保留 DSA 的完整 Indexer 历史与原始 TopK；`sink_tokens`、`recent_tokens`、`retrieval_tokens` 和 `retrieval_interval` 不参与 DSA 选择。主 KV 使用 pinned DDR，Indexer 单独放在 GPU，继续遵循 `--indexer_dtype` 与 `--indexer_tp_storage`。SWA 保留 GPU 环形窗口。支持 BF16/FP8 KV、多请求解码、攒 prefill 和已有 CUDA Graph 档位。支持前缀复用，暂不支持草稿模型。
+本适配器保留 DSA 的完整 Indexer 历史与原始 TopK；`sink_tokens`、`recent_tokens`、`retrieval_tokens` 和 `retrieval_interval` 不参与 DSA 选择。主 KV 使用 pinned DDR，Indexer 单独放在 GPU，继续遵循 `--indexer_dtype` 与 `--indexer_tp_storage`。SWA 保留 GPU 环形窗口。支持 BF16/FP8 KV、多请求解码、攒 prefill 和已有 CUDA Graph 档位。支持 DSpark 和前缀复用，草稿 KV 保持在 GPU。验证的 query 按请求合并选中行，热缓存不足以容纳所有 query 的最坏并集时，使用现有批量 DSA 算子分组执行；分组仍保留跨请求并行。DSpark5 的 6 行验证、TopK 2048 在 16K 热缓存中可一次完成，不要求固定的并发数或草稿长度。
 
-`max_tokens` 是每个请求的输入加输出长度上限。已有 `--tokens` 参数可以独立限制总物理池，向下取整到完整页；不指定时，仍按最大 Graph 档位乘以页对齐的 `max_tokens` 预分配。DDR 主 KV 和 GPU Indexer 按总池分配，热缓存按最大 Graph 档位分配；逻辑位置表、页表和单层 staging 仍需覆盖单请求最大长度。`resident_tokens` 是每层、每请求的主 KV 热缓存，必须至少容纳全部 TopK。`host_mib` 是所有 TP rank、全部 DSA 层合计的主 KV 预算。GPU 容量检查另外计入热 KV、完整 Indexer、映射表、页表、SWA 检查点和 staging；运行时工作区由 `--gpu_mem_ratio` 的保留空间覆盖。
+`max_tokens` 是每个请求的输入加输出长度上限。已有 `--tokens` 参数可以独立限制总物理池，向下取整到完整页；不指定时，仍按最大 Graph 档位乘以页对齐的 `max_tokens` 预分配。DDR 主 KV 和 GPU Indexer 按总池分配，热缓存按最大 Graph 档位分配；逻辑位置表、页表和单层 staging 仍需覆盖单请求最大长度。`resident_tokens` 是每层、每请求的主 KV 热缓存，必须至少容纳全部 TopK。`host_mib` 是所有 TP rank、全部 DSA 层合计的主 KV 预算。GPU 容量检查另外计入热 KV、完整 Indexer、映射表、页表、SWA/草稿检查点和 staging。启用服务预热时，先预留 prefill、验证与草稿工作区，再按剩余显存检查 KVMem；热缓存建立后重新准备其验证 Graph 绑定。
 
 例如 `--max_batch 400 --tokens 52428800 --max_context_length 200000 --kvmem '{"max_tokens":200000,"resident_tokens":16384,"prefill_tokens":8192,"host_mib":921600}'` 允许每请求达到 20 万 token，但共享 52,428,800 token 的物理池，不为每路分别预留 20 万。
 
 调度按物理页引用计费，共享前缀不重复占用预算。接纳请求时预留其输入与剩余输出所需的页，输出未设上限时预留到单请求上下文上限；这会使实际可接纳并发受输出预算影响。预算不足的请求排队，并释放暂时恢复的前缀引用，让活动解码继续执行。历史树中没有活动引用的页仍可由通用页分配器淘汰。此预留只记账，不提前写入 KV 或增加已预分配的总池。
 
-主 KV 由通用 `PagedCacheManager` 管理 DDR 全局页，GPU Indexer 使用同一组 K 页号。完成的请求可以留下页树引用和有上限的 GPU SWA 检查点；多个请求命中相同前缀时共享历史页。共享尾页若需要写入，先复制主 KV 及对应 Indexer 页，再独立追加。前缀淘汰只回收没有活动引用的历史页，SWA 检查点失效时重新 prefill。
+主 KV 由通用 `PagedCacheManager` 管理 DDR 全局页，GPU Indexer 使用同一组 K 页号。完成的请求可以留下页树引用和有上限的 GPU SWA 和草稿 hidden 检查点；多个请求命中相同前缀时共享历史页。共享尾页若需要写入，先复制主 KV 及对应 Indexer 页，再独立追加。前缀淘汰只回收没有活动引用的历史页，SWA 检查点失效时重新 prefill。
 
 等待调度的命中请求只保留共享页引用与 SWA 检查点，不占热槽。每个请求在首次 forward 时领取私有热缓存/SWA 槽位，完成后归还；历史页的生命周期与热槽独立。新请求复用槽位前在所属 GPU worker stream 上重置映射。Graph 的固定地址表同时绑定主 KV 与独立 Indexer，解码时使用动态有效长度和 TopK，换请求或改变顺序不修改 Graph。未覆盖的形状仍走正确的 eager 路径。
 
@@ -85,7 +87,7 @@ Prefill 的多个 query 不能简单共用一个解码 TopK 热缓存。本适�
 ctest --test-dir BUILD -R '^naive_n05_kvmem_' --output-on-failure
 ```
 
-回归覆盖同 TP 配置的开关 logits、BF16/FP8 KV、独立缩放 FP8 Indexer、短上下文、超出热缓存容量的 TopK、Graph/eager 切换、请求顺序变化、槽位复用及混合长度 batched prefill。`naive_n05_kvmem_prefix_*` 还覆盖重复输入、并发共享前缀分叉、排队请求超过热槽数、页/SWA 淘汰回退、恢复错误隔离和不重捕获 Graph。
+回归覆盖同 TP 配置的开关 logits、BF16/FP8 KV、独立缩放 FP8 Indexer、短上下文、超出热缓存容量的 TopK、Graph/eager 切换、请求顺序变化、槽位复用及混合长度 batched prefill。`naive_n05_kvmem_draft*` 覆盖 DSpark3/5/7、TP2/4/8、验证 Graph、部分/全部拒绝后的覆盖、低热缓存分组、草稿输出与前缀恢复。`naive_n05_kvmem_prefix_*` 还覆盖重复输入、并发共享前缀分叉、排队请求超过热槽数、页/SWA 淘汰回退、恢复错误隔离和不重捕获 Graph。
 
 ### Indexer 上下文分片
 
@@ -94,7 +96,11 @@ K 缓存按上下文分到所有 TP rank，decode 各卡评分并选择本地 To
 合并精确全局 TopK。分数相同时仍按原始 token 位置排序，保留 FP8 评分精度和
 量化方式。持久 Indexer 缓存总量不增加；prefill 临时重组当前请求的历史，
 顺序执行时复用一个工作区，合批 prefill 至多保留八份历史，并沿用原有评分工作区预算。
-分页、前缀共享和写时复制沿用主 KV 的页表。
+分页、前缀共享和写时复制沿用主 KV 的页表。DSpark 验证将各请求的因果 query 合批，
+直接在各卡本地历史上评分，只交换候选并合并每个 query 的全局 TopK，不重组完整历史。
+`context_shard`、`replicated` 和 `layer_shard` 均支持验证 Graph；捕获失败保留 eager 回退。
+验证工作区与最大候选交换区在服务预热期间、计算 KV 容量之前预留。请求页表、有效长度
+和候选内容通过设备数据更新，缩短的验证块和不同请求组合按现有形状缓存规则处理。
 
 此模式要求 `--kvmem`、至少两张 SM80+ CUDA GPU、页长可被 TP 卡数整除，
 以及 16×128 FP8-query Indexer、TopK=2048。默认仍为 `replicated`；
@@ -104,6 +110,8 @@ K 缓存按上下文分到所有 TP rank，decode 各卡评分并选择本地 To
 回归测试 `naive_n05_indexer_context` 不加载模型，在单 GPU 上模拟 TP2/4/8 的独立
 页表，逐字节比较缓存与评分，逐项比较稳定 TopK；也覆盖 CUDA Graph 的长度和
 缓存地址变化、分页边界、前缀写时复制，以及 16/32/64 等常用 batch 和大批次描述分组边界。
+多 query 检查覆盖不等长验证块及 3,072 行；`naive_n05_context_verify_*` 覆盖 TP2/4/8、
+DSpark3/5/7、拒绝后覆盖、Graph 回放、长 prefill 预热以及捕获失败回退。
 
 ```bash
 cmake --build build --target naive_n05_indexer_context_test

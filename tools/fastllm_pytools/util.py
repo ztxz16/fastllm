@@ -1014,7 +1014,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--indexer_dtype', choices=['auto', 'fp8', 'fp8_e4m3'], default='auto',
                         help='Naive DSA Indexer 类型；fp8 独立量化 Indexer Q/K 并压缩 K 缓存，auto 保持模型默认路径')
     parser.add_argument('--indexer_tp_storage', choices=['replicated', 'layer_shard', 'context_shard'], default='replicated',
-                        help='Naive DSA TP Indexer 存储；layer_shard 将各层权重和 K 缓存轮流放到一张卡，广播 TopK，降低显存占用；context_shard 在 KVMem 下按上下文分片并合并全局 TopK；默认各卡复制')
+                        help='Naive DSA TP Indexer 存储；layer_shard 将各层权重和 K 缓存轮流放到一张卡，广播 TopK，降低显存占用；context_shard 按上下文分片并合并全局 TopK，支持纯显存 KV 和 KVMem；默认各卡复制')
     parser.add_argument('--kv_cache_dtype', type = str, default = "auto", help = 'KV Cache类型，可使用auto、float16、bfloat16、fp8_e4m3（含 Naive N0.5 CUDA）或fp4（Qwen3.5 CUDA 与 DeepSeek-V4.1）')
     parser.add_argument('--cuda_embedding', action = 'store_true', help = '在cuda上进行embedding')
     parser.add_argument('--kvmem', type=str, default=None,
@@ -1023,7 +1023,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--max_batch', type = int, default = -1,  help = '每次最多同时推理的询问数量')
     parser.add_argument('--chunked_prefill_size', type = _integer_or_auto, default = -1, help = '分块 prefill 的切片大小（首块与后续块相同），如8192；auto按混推内存预算选择')
     parser.add_argument('--prefill_batch_tokens', type=int, default=0,
-                        help='prefill 攒批的未缓存 token 目标，0关闭；当前仅支持 Naive 普通 TP GPU 推理；批量总预算至少为 chunked_prefill_size')
+                        help='prefill 攒批的未缓存 token 目标，0关闭；支持 Naive TP GPU 推理及 DSpark；批量总预算至少为 chunked_prefill_size')
     parser.add_argument('--prefill_max_wait_ms', type=int, default=0,
                         help='prefill 攒批最长等待毫秒数，0不等待；需设置 prefill_batch_tokens；等待期间继续 decode')
     parser.add_argument('--prefill_batch_requests', type=int, default=0,
@@ -1115,7 +1115,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         type = int, choices = [0, 1], default = None,
                         help = "Qwen3.5 系列多卡 MTP 的 FP8 draft 输出头；1 开启，0 复用原输出头以节省显存；未指定时沿用 FASTLLM_MTP_FP8_DRAFT_HEAD（默认开启）")
     parser.add_argument("--dspark", type = int, default = 0,
-                        help = "启用模型内置 DSpark，并指定每轮 draft token 数；例如 --dspark 7")
+                        help = "启用 DSpark 并指定每轮候选数；外置草稿配合 --draft 使用，保留 checkpoint 的训练 block size")
     parser.add_argument("--speculative_algorithm", "--speculative-algorithm",
                         dest = "speculative_algorithm", type = str, default = "",
                         help = "投机解码算法；off 关闭，或选择 mtp、dspark、dflash、clover")
@@ -1124,7 +1124,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         dest = "speculative_draft_model_path", type = str, default = "",
                         help = "MTP/DSpark/DFlash draft 模型目录；MTP 也可指定 mtp.safetensors 或 Qwen4 MTP GGUF")
     parser.add_argument("--draft_tokens", type = _positive_int, default = -1,
-                        help = "每轮最多使用的 draft token 数；未指定时读取 draft 配置")
+                        help = "每轮最多使用的 draft token 数；未指定时读取 draft 配置；外置 DSpark 仍计算完整训练 block，只截取候选前缀")
     parser.add_argument("--draft_gpu_resident", "--draft-gpu-resident", type=int, choices=(0, 1), default=None,
                         help="DeepSeek-V4.1 DSpark 草稿专家显存策略：1 要求全驻留，0 关闭全驻留优先；未指定保持现有策略。支持单卡/PP/TP，需 MXFP4 草稿；--auto 会检查预算，显存不足时报错")
     parser.add_argument("--speculative_num_draft_tokens", "--speculative-num-draft-tokens",
@@ -1132,10 +1132,10 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         help = "DFlash/Clover 每轮 block token 数（含 anchor）")
     parser.add_argument("--speculative_dspark_block_size", "--speculative-dspark-block-size",
                         dest = "speculative_dspark_block_size", type = int, default = -1,
-                        help = "DSpark block size；默认读取 draft config")
+                        help = "外置 DSpark 的训练 block size 校验值；必须与 draft config 一致，候选数使用 --draft_tokens")
     parser.add_argument("--speculative_dspark_confidence_threshold", "--speculative-dspark-confidence-threshold",
                         dest = "speculative_dspark_confidence_threshold", type = float, default = 0.5,
-                        help = "DSpark confidence 前缀阈值，范围 [0,1]；0 表示固定验证完整 block")
+                        help = "DSpark confidence 前缀阈值，范围 [0,1]；0 表示不按置信度提前截短候选")
     parser.add_argument("--triton", action = "store_true", help = "启用Triton CUDA算子")
     
     parser.add_argument('--custom', type = str, default = "", help = '指定描述自定义模型的python文件')
@@ -1465,22 +1465,26 @@ def make_normal_llm_model(args, startup_progress = None):
         configured_block = int(draft_config.get("block_size", 0))
         requested_block = int(
             getattr(args, "speculative_dspark_block_size", -1))
-        if dspark_tokens > 0:
-            requested_block = dspark_tokens
         if requested_block > 0 and requested_block != configured_block:
             raise ValueError(
                 "FastLLM currently requires the DSpark runtime block size "
                 "to match the checkpoint (requested=%d, checkpoint=%d)" %
                 (requested_block, configured_block))
+        if draft_tokens > 0 and dspark_tokens > 0 and draft_tokens != dspark_tokens:
+            raise ValueError("--draft_tokens and --dspark specify different token counts")
+        # Candidate count is independent of the noncausal draft backbone block.
+        # Preserve the checkpoint block even when verifying only its prefix.
+        draft_tokens = draft_tokens if draft_tokens > 0 else dspark_tokens or -1
         if (draft_tokens > 0 and
                 not 1 <= draft_tokens <= configured_block):
             raise ValueError(
-                "DSpark --draft_tokens must be in [1, checkpoint block_size] "
+                "DSpark --draft_tokens/--dspark must be in [1, checkpoint block_size] "
                 "(requested=%d, checkpoint block_size=%d)" %
                 (draft_tokens, configured_block))
         os.environ["FASTLLM_DSPARK_MODEL_PATH"] = speculative_draft_path
         if draft_tokens > 0:
             os.environ["FASTLLM_DSPARK_TOKENS"] = str(draft_tokens)
+            args.draft_tokens = draft_tokens
         confidence_threshold = float(getattr(
             args, "speculative_dspark_confidence_threshold", 0.5))
         if not 0.0 <= confidence_threshold <= 1.0:
@@ -2003,8 +2007,6 @@ def make_normal_llm_model(args, startup_progress = None):
             raise ValueError(f"Indexer {indexer_storage} storage currently supports Naive DSA models only")
         if _thread_tp_cuda_device_count(tp_arg or os.environ.get("FASTLLM_TP", "")) < 2:
             raise ValueError(f"Indexer {indexer_storage} storage requires --tp with at least two CUDA devices")
-    if indexer_storage == "context_shard" and not getattr(args, "kvmem", None):
-        raise ValueError("Indexer context_shard storage requires --kvmem")
     if (tp_arg != ""):
         os.environ["FASTLLM_TP"] = tp_arg
         if (_uses_thread_tp(tp_arg)):

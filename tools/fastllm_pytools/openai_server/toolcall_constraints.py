@@ -69,6 +69,21 @@ def compile_tool_call_constraint(
             _build_deepseek_dsml_parameter_name_constraint(
                 descriptor_dict, tags))
         name_grammar = _build_deepseek_dsml_name_grammar(descriptor_dict, tags)
+    elif constraint_type in {"naive_n05_tool_call", "naive_n05_flash_tool_call"}:
+        names = list(descriptor_dict.get("allowed_tool_names") or [])
+        requested_parameters = _normalize_parameter_names(descriptor_dict.get("parameter_names") or {})
+        parameters = {name: requested_parameters.get(name, []) for name in names}
+        for name in names + [key for keys in parameters.values() for key in keys]:
+            if not name or name != name.strip(" \t\r\n") or "<" in name or ">" in name:
+                raise ValueError("MiMo grammar requires representable tool/parameter names")
+        structural_tag = {
+            "type": "structural_tag", "format": "mimo_xml",
+            "allowed_names": names, "parameter_names_by_tool": parameters,
+            "requires_tool_call": bool(descriptor_dict.get("requires_tool_call")),
+            "max_tool_calls": 1 if descriptor_dict.get("parallel_tool_calls") is False else None,
+        }
+        notes = ["native MiMo closed tool structure and names",
+                 "raw argument values remain parser/schema-validated"]
     elif constraint_type == "dots_xml":
         structural_tag = _build_dots_structural_tag(descriptor_dict)
         name_constraint = _build_dots_name_constraint(descriptor_dict)

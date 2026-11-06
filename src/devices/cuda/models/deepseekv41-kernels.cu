@@ -41,9 +41,13 @@ SOFTWARE.
 #include "deepseekv41-reference.cuh"
 #ifndef USE_ROCM
 #include "deepseekv41-flashinfer.cuh"
+// FlashInfer synchronization primitives require SM70 or newer.
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
+#define FASTLLM_V41_FP16_ATTENTION
 #include "attention/default_prefill_params.cuh"
 #include "attention/prefill.cuh"
 #include "attention/variants.cuh"
+#endif
 #endif
 #include "fastllm.h"
 
@@ -6238,7 +6242,7 @@ extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, co
     }
 #endif
 
-#ifndef USE_ROCM
+#ifdef FASTLLM_V41_FP16_ATTENTION
     // FP16 Tensor Cores are available on SM75 even though native BF16 MMA is
     // not. Use the same gathered-KV backend for eager chunks and full graphs.
     if (!legacyAttention && !referenceMath && FastllmV41FlashInferEnabled() && V41IsSm75() &&
@@ -6909,7 +6913,7 @@ struct V41FullDecodePlan {
 #ifdef FASTLLM_ENABLE_DSV41_FLASHINFER_SM120
     void *flashInfer = nullptr;
 #endif
-#ifndef USE_ROCM
+#ifdef FASTLLM_V41_FP16_ATTENTION
     std::shared_ptr<void> fp16Workspace;
     size_t fp16WorkspaceBytes = 0;
 #endif
@@ -7289,7 +7293,7 @@ void *FastllmCudaV41CreateFullDecode(const FastllmV41FullDecodeConfig &c,
         ok = ok && cudaHostAlloc(reinterpret_cast<void **>(&p->host), (size_t)c.batch * sizeof(*p->host), cudaHostAllocDefault) == cudaSuccess &&
              cudaEventCreateWithFlags(&p->copied, cudaEventDisableTiming) == cudaSuccess;
     if (!ok) { cudaGetLastError(); return nullptr; }
-#ifndef USE_ROCM
+#ifdef FASTLLM_V41_FP16_ATTENTION
     if (V41IsSm75() && FastllmV41FlashInferEnabled() && v41_fp16_attention::Ready()) {
         p->fp16WorkspaceBytes = v41_fp16_attention::Bytes(c.batch, c.heads, c.window + (c.ratio ? c.topK : 0));
         void *storage = nullptr;
@@ -7310,7 +7314,7 @@ void *FastllmCudaV41CreateFullDecode(const FastllmV41FullDecodeConfig &c,
 void FastllmCudaV41DestroyFullDecode(void *plan) { delete static_cast<V41FullDecodePlan *>(plan); }
 bool FastllmCudaV41ShareAttentionWorkspace(void *handle, void *source) {
     auto *p = static_cast<V41FullDecodePlan *>(handle), *q = static_cast<V41FullDecodePlan *>(source);
-#ifndef USE_ROCM
+#ifdef FASTLLM_V41_FP16_ATTENTION
     if (p && q && p->device == q->device && p->fp16Workspace && q->fp16Workspace &&
         p->fp16WorkspaceBytes <= q->fp16WorkspaceBytes) {
         p->fp16Workspace = q->fp16Workspace;
@@ -7502,7 +7506,7 @@ bool FastllmCudaV41FinishFullDecode(void *handle) {
         }
     }
     const int *fallbackRows = nullptr;
-#ifndef USE_ROCM
+#ifdef FASTLLM_V41_FP16_ATTENTION
     if (p->fp16Workspace) {
         const int keys = c.window + (c.ratio ? c.topK : 0);
         if (!v41_fp16_attention::Run(p->attention, p->fp16Workspace.get(), c.batch, c.heads,

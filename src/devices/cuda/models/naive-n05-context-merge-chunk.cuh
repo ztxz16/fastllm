@@ -4,6 +4,25 @@ using namespace naive_indexer_batch;
 using Key = unsigned long long;
 constexpr int K = naive_topk::kTopK;
 
+struct CompactRow { const int *live; int *indices; };
+constexpr int CompactLimit = (ArgumentBytes - 160) / sizeof(CompactRow);
+struct CompactBatch {
+    CompactRow rows[CompactLimit];
+    const unsigned *merged;
+    int total, first, page;
+};
+static_assert(sizeof(CompactBatch) + 128 <= ArgumentBytes);
+__device__ __forceinline__ Row MergeRow(const Batch &batch, int index) {
+    return batch.rows[index];
+}
+__device__ __forceinline__ Row MergeRow(const CompactBatch &batch, int index) {
+    Row row{};
+    row.live = batch.rows[index].live; row.indices = batch.rows[index].indices;
+    row.merged = batch.merged; row.mergedRows = batch.total; row.mergedRow = batch.first + index;
+    row.cpRanks = 4; row.contextPageLen = batch.page;
+    return row;
+}
+
 // Each worker finds one output interval, then performs an ordinary sorted
 // merge. Keys retain both ordered score bits and inverse logical positions.
 template<int Items, bool Final>
@@ -37,10 +56,10 @@ __device__ __forceinline__ void MergeInterval(
     }
 }
 
-template<int Threads, int Items>
-__global__ __launch_bounds__(Threads) void MergeFourChunked(Batch batch) {
+template<int Threads, int Items, class Rows = Batch>
+__global__ __launch_bounds__(Threads) void MergeFourChunked(Rows batch) {
     static_assert(K % Items == 0);
-    const Row &row = batch.rows[blockIdx.x];
+    const Row row = MergeRow(batch, blockIdx.x);
     extern __shared__ __align__(16) Key storage[];
     Key *pairs = storage + 4 * K;
     int count[4];

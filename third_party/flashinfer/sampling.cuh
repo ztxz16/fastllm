@@ -1690,9 +1690,11 @@ struct RenormTempStorage {
 template <uint32_t BLOCK_THREADS, BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE,
           typename DType>
 __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void TopPRenormProbKernel(
-    DType* probs, DType* renormed_prob, float* top_p_arr, float top_p_val, uint32_t d) {
+    DType* probs, DType* renormed_prob, float* top_p_arr, float top_p_val, uint32_t d, const float2* cuts) {
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
   const uint32_t row_idx = bx;
+  // A positive cutoff means an exact sparse shortcut already wrote this row.
+  if (cuts && cuts[bx].x > 0) return;
   float p = top_p_arr == nullptr ? top_p_val : top_p_arr[bx];
 
   extern __shared__ __align__(alignof(RenormTempStorage<BLOCK_THREADS, REDUCE_ALGO>))
@@ -1864,7 +1866,7 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void TopPRenormProbK
 template <typename DType>
 cudaError_t TopPRenormProb(DType* probs, DType* renormed_prob, float* top_p_arr,
                            uint32_t batch_size, float top_p_val, uint32_t d,
-                           cudaStream_t stream = 0) {
+                           cudaStream_t stream = 0, const float2* cuts = nullptr) {
   const uint32_t vec_size = std::gcd(16 / sizeof(DType), d);
 
   auto compute_capacity = GetCudaComputeCapability();
@@ -1872,7 +1874,7 @@ cudaError_t TopPRenormProb(DType* probs, DType* renormed_prob, float* top_p_arr,
     const uint32_t smem_size = sizeof(RenormTempStorage<BLOCK_THREADS, REDUCE_ALGO>);
     dim3 nblks(batch_size);
     dim3 nthrs(BLOCK_THREADS);
-    void* args[] = {&probs, &renormed_prob, &top_p_arr, &top_p_val, &d};
+    void* args[] = {&probs, &renormed_prob, &top_p_arr, &top_p_val, &d, &cuts};
     DISPATCH_16B_VEC_SIZE(DType, vec_size, VEC_SIZE, {
       auto kernel = TopPRenormProbKernel<BLOCK_THREADS, REDUCE_ALGO, VEC_SIZE, DType>;
       FLASHINFER_CUDA_CALL(

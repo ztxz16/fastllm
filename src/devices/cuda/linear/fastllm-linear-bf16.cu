@@ -18,6 +18,9 @@ FastllmCudaLinearGraphScope::FastllmCudaLinearGraphScope(std::shared_ptr<void> &
     auto &current = fastllm_bf16_lt::SerialGraphWorkspace();
     previous = std::move(current);
     current = std::static_pointer_cast<fastllm_bf16_lt::Workspace>(workspace);
+    // Warmup can use eager Lt even if the graph lease pool is full. Capturing
+    // a different GEMV/GEMM fallback would then change its reduction order.
+    if (!current && FastllmCudaGraphIsCapturingFast()) FastllmCudaSetThreadError();
 }
 
 FastllmCudaLinearGraphScope::~FastllmCudaLinearGraphScope() {
@@ -155,36 +158,43 @@ __global__ void FastllmGemvBf16Bf16Kernel2MultiRow(__nv_bfloat16 *A, __nv_bfloat
     __syncthreads();
 }
 
-// At K=256 the vectorized GEMV has only one active warp per output. Pack
-// eight outputs into a CTA while preserving its per-lane products and
-// compensated reduction tree. No vocabulary size or GPU model is assumed.
+// At K=256, one warp computes each dot with the original compensated
+// reduction. Tiling output rows reuses its input vector without changing
+// the per-lane products or BF16 rounding.
+template <int RowsPerWarp = 1>
 __global__ void FastllmGemvBf16SmallK(const __nv_bfloat16 *input,
         const __nv_bfloat16 *weight, __nv_bfloat16 *output,
         const __nv_bfloat16 *bias, int outputs) {
     const int lane = threadIdx.x & 31;
-    const int row = blockIdx.x * 8 + threadIdx.x / 32;
-    if (row >= outputs) return;
-    union_bf16_8 a, b;
+    const int first = (blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32) * RowsPerWarp;
+    if (first >= outputs) return;
+    union_bf16_8 a, b[RowsPerWarp];
     a.in = *reinterpret_cast<const uint4 *>(input + lane * 8);
-    b.in = *reinterpret_cast<const uint4 *>(weight + (size_t)row * 256 + lane * 8);
-    float value = 0.0f;
-#pragma unroll
-    for (int i = 0; i < 8; ++i)
-        value += __bfloat162float(a.out[i]) * __bfloat162float(b.out[i]);
-    float correction = 0.0f;
-#pragma unroll
-    for (int step = 16; step; step >>= 1) {
-        float peer = __shfl_down_sync(0xffffffffu, value, step);
-        if (lane < step) {
-            float other = peer - correction;
-            float sum = value + other;
-            correction = (sum - value) - other;
-            value = sum;
+    #pragma unroll
+    for (int r = 0; r < RowsPerWarp; ++r)
+        if (first + r < outputs)
+            b[r].in = *reinterpret_cast<const uint4 *>(weight + (size_t)(first + r) * 256 + lane * 8);
+    #pragma unroll
+    for (int r = 0; r < RowsPerWarp; ++r) if (first + r < outputs) {
+        float value = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 8; ++i)
+            value += __bfloat162float(a.out[i]) * __bfloat162float(b[r].out[i]);
+        float correction = 0.0f;
+        #pragma unroll
+        for (int step = 16; step; step >>= 1) {
+            float peer = __shfl_down_sync(0xffffffffu, value, step);
+            if (lane < step) {
+                float other = peer - correction;
+                float sum = value + other;
+                correction = (sum - value) - other;
+                value = sum;
+            }
         }
-    }
-    if (lane == 0) {
-        if (bias) value += __bfloat162float(bias[row]);
-        output[row] = __float2bfloat16_rn(value);
+        if (lane == 0) {
+            if (bias) value += __bfloat162float(bias[first + r]);
+            output[first + r] = __float2bfloat16_rn(value);
+        }
     }
 }
 
@@ -693,7 +703,10 @@ template <int THREADS>
 static void LaunchFastllmGemmBf16Bf16SmallBatch(__nv_bfloat16 *input, __nv_bfloat16 *weight, __nv_bfloat16 *output, __nv_bfloat16 *bias, int n, int m, int k) {
     // PART=2..8 reuses the weights without changing the per-row reduction.
     if (n == 1 && m == 256) {
-        FastllmGemvBf16SmallK<<<(k + 7) / 8, 256>>>(input, weight, output, bias, k);
+        if (k >= 16384 && FastllmCudaRuntimeArch() == 90)
+            FastllmGemvBf16SmallK<4><<<(k + 15) / 16, 128>>>(input, weight, output, bias, k);
+        else
+            FastllmGemvBf16SmallK<><<<(k + 7) / 8, 256>>>(input, weight, output, bias, k);
     } else if (n == 1) {
         FastllmGemvBf16Bf16Kernel2MultiRow<THREADS, 1> <<<k, THREADS>>>(input, weight, output, bias, m, k);
     } else if (n == 2) {

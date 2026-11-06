@@ -6,6 +6,24 @@ inline bool FastllmNaiveKVType(fastllm::DataType type) {
     return type == fastllm::BFLOAT16 || type == fastllm::FP8_E4M3;
 }
 
+// Expanded BF16/FP8 KV caches keep physical strides/capacity when logical length
+// changes. Other layouts retain Data::Resize and its layout invalidation rules.
+inline bool FastllmNaiveCanResizeKVLength(const fastllm::Data &cache, int length, int width) {
+    return length >= 0 && FastllmNaiveKVType(cache.dataType) && !cache.cudaNativeNvfp4Layout &&
+        cache.tpLayout == fastllm::TP_LAYOUT_NONE && cache.unitSize == (cache.dataType == fastllm::FP8_E4M3 ? 1 : 2) && cache.unitSizeDiv == 1 &&
+        cache.dims.size() == 3 && cache.dims[0] == 1 && cache.dims[2] == width &&
+        cache.expansionDims.size() == 3 && cache.expansionDims[0] == 1 &&
+        cache.expansionDims[1] >= length && cache.expansionDims[2] == width;
+}
+
+inline void FastllmNaiveResizeKVLength(fastllm::Data &cache, int length, int width) {
+    if (FastllmNaiveCanResizeKVLength(cache, length, width)) {
+        cache.dims[1] = length;
+    } else {
+        cache.Resize({1, length, width});
+    }
+}
+
 // Match the full-vocabulary CUDA Top1's 256-lane reduction order on ties.
 // Global IDs are essential: shards need not start at a multiple of 256.
 #ifdef __CUDACC__
@@ -73,6 +91,22 @@ bool FastllmCudaNaiveDraftQKV(const fastllm::Data &raw,
     const fastllm::Data &positions, const fastllm::Data &liveKeys,
     fastllm::Data &key, fastllm::Data &value, fastllm::Data &query,
     int heads, int kvHeads, int dim, int window, float eps, float theta);
+// One independent draft cache/length/position binding per request. Equal-size
+// draft blocks are packed along the token axis; request count is unbounded and
+// internally chunked to CUDA's portable kernel-argument limit.
+struct FastllmNaiveDraftRow {
+    fastllm::Data *key, *value;
+    const fastllm::Data *positions, *liveKeys;
+    bool shortAttention = false;
+};
+bool FastllmCudaNaiveBatchDraftQKV(const fastllm::Data &raw,
+    const fastllm::Data &qNorm, const fastllm::Data &kNorm,
+    const std::vector<FastllmNaiveDraftRow> &requests, fastllm::Data &query,
+    int heads, int kvHeads, int dim, int window, float eps, float theta,
+    fastllm::Data *descriptorsWorkspace = nullptr);
+bool FastllmCudaNaiveBatchDraftAttention(const fastllm::Data &query,
+    const std::vector<FastllmNaiveDraftRow> &requests,
+    int heads, int kvHeads, int dim, int window, fastllm::Data &scores, fastllm::Data &output);
 // Unlike generic SwiGLU, round SiLU to BF16 before multiplication, matching
 // the draft's separate Silu + MulTo operations.
 void FastllmCudaNaiveDraftSwiGLU(const fastllm::Data &gateUp, fastllm::Data &output);
@@ -108,7 +142,7 @@ bool FastllmCudaNaiveRopeAppendCache(fastllm::Data &q, const fastllm::Data &k,
     const fastllm::Data &positions, fastllm::Data &key, fastllm::Data &value,
     const fastllm::Data &liveKeys, int heads, int kvHeads, int dim, int valueDim,
     int rotaryDim, float theta, float valueScale, int window,
-    const fastllm::Data *packedQkv = nullptr, bool ring = false);
+    const fastllm::Data *packedQkv = nullptr, bool ring = false, bool ringVerify = false);
 // One decode token per independent cache. Descriptors are captured as kernel
 // arguments; optional device indirection updates KV bindings without recapture.
 struct FastllmNaiveRopeCacheRow {
@@ -117,6 +151,8 @@ struct FastllmNaiveRopeCacheRow {
     const void *const *cache = nullptr;
     const fastllm::Data *indexCache = nullptr; // Separate GPU Indexer: cache[2] contiguous, cache[4] paged.
     int indexerContextRank = 0;
+    int cacheOffset = -1; // Eager contiguous verification, independent of device length.
+    int verifyOffset = -1; // Candidate slot after a retained 128-token SWA ring.
 };
 bool FastllmCudaNaiveBatchRopeAppendCache(fastllm::Data &q, const fastllm::Data &k,
     const fastllm::Data &v, const fastllm::Data &positions,
@@ -136,6 +172,21 @@ bool FastllmCudaNaiveBatchQkvRopeAppendCache(const fastllm::Data &input,
 // Uses shared memory only, preserves allocations and host dimensions.
 void FastllmCudaNaiveSwaCacheLayout(fastllm::Data &key, fastllm::Data &value,
     int past, bool toRing);
+// Accept rows staged at [128, 128+count), preserving rejected history bitwise.
+struct FastllmNaiveCacheCommit {
+    fastllm::Data *key, *value;
+    int past, count;
+};
+void FastllmCudaNaiveBatchCommitSwaVerify(const std::vector<FastllmNaiveCacheCommit> &caches);
+struct FastllmNaiveDraftKVUpdate {
+    const fastllm::Data *raw, *norm;
+    fastllm::Data *key, *value;
+    int start;
+};
+bool FastllmCudaNaiveBatchDraftKV(const std::vector<FastllmNaiveDraftKVUpdate> &updates,
+    int heads, int dim, int window, int reserve, float eps, float theta);
+void FastllmCudaNaiveCommitSwaVerify(fastllm::Data &key, fastllm::Data &value,
+    int past, int count);
 // Keep the allocation and logical row order when retaining a sliding suffix.
 void FastllmCudaNaiveTrimCache(fastllm::Data &key, fastllm::Data &value, int keep);
 // Exact descending score / ascending position order for each query row.
@@ -157,7 +208,7 @@ bool FastllmCudaNaiveIndexerKeyNorm(fastllm::Data &input,
 // Output is [front, back] for one rank. Unsupported layouts return false untouched.
 bool FastllmCudaNaiveBalancedIndexer(const fastllm::Data &query, const fastllm::Data &weights,
     const fastllm::Data &keys, int past, int rank, int ranks,
-    bool fp8Query, bool peerKeys, fastllm::Data &indices);
+    bool fp8Query, bool peerKeys, fastllm::Data &indices, fastllm::Data *scoreScratch = nullptr);
 // All items use the same rank/layout, but query and context lengths may differ.
 // At most eight requests and 512 MiB of scores; rejection leaves outputs untouched.
 struct FastllmNaivePrefillIndexerItem {
@@ -166,13 +217,13 @@ struct FastllmNaivePrefillIndexerItem {
     int past;
 };
 bool FastllmCudaNaiveBatchBalancedIndexer(const std::vector<FastllmNaivePrefillIndexerItem> &items,
-    int rank, int ranks, bool fp8Query, bool peerKeys);
+    int rank, int ranks, bool fp8Query, bool peerKeys, fastllm::Data *scoreScratch = nullptr);
 
 void FastllmCudaNaiveIndexer(const fastllm::Data &query,
                             const fastllm::Data &weights,
                             const fastllm::Data &packedKeys,
                             int heads, int dim, int queryStart, int topK,
-                            bool fp8Query, fastllm::Data &indices, bool peerKeys = false);
+                            bool fp8Query, fastllm::Data &indices, bool peerKeys = false, fastllm::Data *scoreScratch = nullptr);
 // Restore front/back-paired query shards after AllGather, in the same allocation.
 void FastllmCudaNaiveRestoreIndexerRows(fastllm::Data &indices, int ranks);
 // Consume front/back-paired Indexer rows directly. False leaves all inputs
@@ -223,7 +274,11 @@ struct FastllmNaiveSWARow {
     const void *key, *value;
     const void *const *cache = nullptr;
     bool fp8 = false;
+    bool ring = true;
+    int length = 0; // Eager causal length when no device length array is supplied.
+    int verifyOffset = -1; // Staged candidate offset, or -1 for ordinary decode.
 };
+void FastllmCudaNaiveVerifyLengths(const fastllm::Data &positions, fastllm::Data &lengths);
 void FastllmCudaNaiveBatchSWADecode(const fastllm::Data &query,
     const fastllm::Data &sink, const std::vector<FastllmNaiveSWARow> &rows,
     const fastllm::Data &liveKeys, int heads, int kvHeads,
@@ -257,6 +312,29 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
     const fastllm::Data &weights, const fastllm::Data &liveKeys,
     const std::vector<FastllmNaiveIndexerRow> &rows, bool fp8Query,
     int contextRank = 0, int contextRanks = 1, fastllm::Data *exchange = nullptr, int contextPageLen = 0);
+// Causal blocks from independent requests share the normal decode Indexer.
+// Query offsets address the packed Q/weight/position rows; output stays private.
+struct FastllmNaiveVerifyIndexerItem {
+    const fastllm::Data *key;
+    fastllm::Data *indices;
+    int offset, rows, past;
+    // A nonzero capacity uses caller-owned dynamic live lengths during replay.
+    int capacity = 0;
+    const void *const *cache = nullptr;
+};
+void FastllmCudaNaivePrepareVerifyIndexerScratch(int rows, int capacity, bool fp8Query,
+    FastllmNaiveDecodeScratch &scratch);
+bool FastllmCudaNaiveBatchVerifyIndexer(const fastllm::Data &query,
+    const fastllm::Data &weights,
+    const std::vector<FastllmNaiveVerifyIndexerItem> &items, bool fp8Query,
+    FastllmNaiveDecodeScratch &scratch, fastllm::Data &liveKeys,
+    int contextRank = 0, int contextRanks = 1, fastllm::Data *exchange = nullptr,
+    int contextPageLen = 0);
+// Complete the same causal rows after exchanging their local TopK candidates.
+void FastllmCudaNaiveMergeVerifyIndexer(
+    const std::vector<FastllmNaiveVerifyIndexerItem> &items,
+    FastllmNaiveDecodeScratch &scratch, const fastllm::Data &liveKeys,
+    const fastllm::Data &exchange, int contextRanks, int contextPageLen);
 // Collective dispatch must agree across the entire TP group, including mixed GPUs.
 bool FastllmCudaNaiveIndexerContextSupported(const std::vector<int> &devices);
 // Merge rank-major (score bits, logical position) pairs after an all-gather.
@@ -279,7 +357,7 @@ void FastllmCudaNaiveDecodeAttention(const fastllm::Data &query,
 // Fixed-shape verification graphs keep one live prefix length per query.
 void FastllmCudaNaiveAppendVerifyCache(fastllm::Data &key, fastllm::Data &value,
     const fastllm::Data &newKey, const fastllm::Data &newValue,
-    const fastllm::Data &liveKeys, int window);
+    const fastllm::Data &liveKeys, int window, bool ringVerify = false);
 void FastllmCudaNaiveGraphVerifyIndexer(const fastllm::Data &query,
     const fastllm::Data &weights, const fastllm::Data &packedKeys,
     const fastllm::Data &liveKeys, int capacity, bool fp8Query,
@@ -289,7 +367,7 @@ void FastllmCudaNaiveGraphVerifyAttention(const fastllm::Data &query,
     const fastllm::Data &indices, const fastllm::Data &sink,
     const fastllm::Data &liveKeys, int capacity, int heads, int kvHeads,
     int dim, int valueDim, int window,
-    FastllmNaiveDecodeScratch &scratch, fastllm::Data &output);
+    FastllmNaiveDecodeScratch &scratch, fastllm::Data &output, bool ringVerify = false);
 
 // Fixed draft inputs and attention read the live absolute prefix on the GPU.
 void FastllmCudaNaiveDraftInput(const fastllm::Data &id, const fastllm::Data &embedding,
@@ -307,6 +385,13 @@ void FastllmCudaNaiveDraftEmbedding(const fastllm::Data &ids, int step,
 void FastllmCudaNaiveDraftArgmax(const fastllm::Data &base,
     const fastllm::Data &bias, int step, fastllm::Data &partial,
     fastllm::Data &ids);
+// One BF16 base/bias row and independent vocabulary mask per request.
+void FastllmCudaNaiveBatchDraftSamplingLogits(const fastllm::Data &base,
+    const fastllm::Data &bias, const fastllm::Data &mask, fastllm::Data &output,
+    int step = 0, int steps = 1);
+// Merge one BF16 draft row and bias with BF16 rounding, then apply its token mask.
+void FastllmCudaNaiveDraftSamplingLogits(const fastllm::Data &base,
+    const fastllm::Data &bias, const fastllm::Data &mask, int step, fastllm::Data &output);
 // Join leading rows of dense, equal-width BF16 features on the current GPU.
 // Unsupported layouts return false before modifying output.
 bool FastllmCudaNaiveDraftConcat(const std::vector<const fastllm::Data *> &inputs,

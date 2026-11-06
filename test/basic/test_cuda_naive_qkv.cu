@@ -122,12 +122,83 @@ struct Case {
             8, 1, 192, 128, 64, ring ? 10000.f : 10000000.f, .707f, ring ? 128 : 0, &packed, ring), "RoPE failed");
     }
 };
+void VerifyBatch(int requests, int mode, DataType type) {
+    constexpr int heads = 8, dim = 192, vd = 128, width = 1856;
+    const int rows = 6, total = requests * rows, capacity = mode == 2 ? 136 : 512;
+    Data q(BFLOAT16), k(BFLOAT16), v(BFLOAT16), packed(BFLOAT16), index(BFLOAT16);
+    Data positions(FLOAT32), live(INT32);
+    Init(q, {1, total, heads * dim}); Init(k, {1, total, dim}); Init(v, {1, total, vd});
+    Init(packed, {1, total, width}); Init(index, {1, total, 128});
+    Init(positions, {1, total}); Init(live, {total});
+    Fill(packed, 713); Fill(index, 19);
+    std::vector<float> pos(total); std::vector<int> lengths(total);
+    std::vector<std::unique_ptr<Data>> keys, values, indices;
+    std::vector<FastllmNaiveRopeCacheRow> descriptors;
+    auto view = [](Data &x, const Data &src, int offset, int count) {
+        auto dims = src.dims; dims[1] = count; x.Resize(dims);
+        x.FakeFrom(src, (size_t)offset * src.dims.back() * src.unitSize);
+    };
+    for (int b = 0; b < requests; ++b) {
+        const int past = mode == 2 ? 4090 + b : 111 + b % 9;
+        keys.emplace_back(new Data(type)); values.emplace_back(new Data(type));
+        Init(*keys.back(), {1, capacity, mode ? dim : dim + 128});
+        Init(*values.back(), {1, capacity, vd});
+        keys.back()->expansionDims = keys.back()->dims; values.back()->expansionDims = values.back()->dims;
+        keys.back()->Resize({1, mode == 2 ? 127 : past, mode ? dim : dim + 128});
+        values.back()->Resize({1, mode == 2 ? 127 : past, vd});
+        for (int r = 0; r < rows; ++r) {
+            int n = b * rows + r; pos[n] = past + r; lengths[n] = past + r + 1;
+            indices.emplace_back(new Data()); view(*indices.back(), index, n, 1);
+            FastllmNaiveRopeCacheRow item{keys.back().get(), values.back().get(), mode ? nullptr : indices.back().get()};
+            if (mode == 1) item.cacheOffset = past + r;
+            if (mode == 2) item.verifyOffset = r;
+            descriptors.push_back(item);
+        }
+    }
+    Check(cudaMemcpy(positions.cudaData, pos.data(), total * sizeof(float), cudaMemcpyHostToDevice));
+    Check(cudaMemcpy(live.cudaData, lengths.data(), total * sizeof(int), cudaMemcpyHostToDevice));
+    auto reset = [&]() {
+        for (auto *set : {&keys, &values}) for (auto &x : *set)
+            Check(cudaMemset(x->cudaData, 0x3d, (size_t)capacity * x->dims.back() * x->unitSize));
+        Check(cudaMemset(q.cudaData, 0x3d, q.GetBytes()));
+    };
+    auto result = [&]() {
+        std::vector<std::vector<uint8_t>> out{Read(q)};
+        for (auto *set : {&keys, &values}) for (auto &x : *set) {
+            out.emplace_back((size_t)capacity * x->dims.back() * x->unitSize);
+            Check(cudaMemcpy(out.back().data(), x->cudaData, out.back().size(), cudaMemcpyDeviceToHost));
+        }
+        return out;
+    };
+    reset();
+    Require(FastllmCudaNaiveBatchRopeAppendCache(q, k, v, positions, descriptors, live,
+        heads, 1, dim, vd, 64, 10000, .707f, mode ? 128 : 0, &packed), "verification batch rejected");
+    auto actual = result(); reset();
+    for (int b = 0; b < requests; ++b) {
+        Data rq, rk, rv, rp, ri, raw, lengthsView;
+        view(rq, q, b * rows, rows); view(rk, k, b * rows, rows); view(rv, v, b * rows, rows);
+        view(raw, packed, b * rows, rows); if (!mode) view(ri, index, b * rows, rows);
+        rp.Resize({1, rows}); rp.FakeFrom(positions, b * rows * sizeof(float));
+        if (mode == 2) { lengthsView.Resize({1}); lengthsView.FakeFrom(live, b * rows * sizeof(int)); }
+        Require(FastllmCudaNaiveRopeAppendCache(rq, rk, rv, ri, rp, *keys[b], *values[b], lengthsView,
+            heads, 1, dim, vd, 64, 10000, .707f, mode ? 128 : 0, &raw, false, mode == 2), "verification reference rejected");
+    }
+    Require(actual == result(), "batched verification RoPE/cache differs from independent requests");
+    reset(); auto before = result();
+    descriptors.back().verifyOffset = 8;
+    Require(!FastllmCudaNaiveBatchRopeAppendCache(q, k, v, positions, descriptors, live,
+        heads, 1, dim, vd, 64, 10000, .707f, mode ? 128 : 0, &packed), "invalid final descriptor accepted");
+    Require(before == result(), "failed preflight changed earlier request");
+}
+
 }
 int main() {
     try {
         int devices = 0;
         if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices) return 77;
         Check(cudaSetDevice(0));
+        for (auto type : {BFLOAT16, FP8_E4M3})
+            for (int mode : {0, 1, 2}) for (int batch : {2, 8, 40}) VerifyBatch(batch, mode, type);
         if (FastllmCudaRuntimeArch() != 90) { puts("SKIP: requires SM90 fusion build"); return 77; }
         Data weight(BFLOAT16), scratch(BFLOAT16);
         Init(weight, {1856, 4096}); Fill(weight, 191);

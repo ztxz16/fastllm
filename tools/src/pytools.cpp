@@ -3,6 +3,7 @@
 //
 
 #include "model.h"
+#include "models/mimo_tool_grammar.h"
 #include "models/naive_n05_flash.h"
 #include "models/clover.h"
 #include "parallel/model.h"
@@ -443,6 +444,20 @@ extern "C" {
         auto root = json11::Json::parse(payload, error);
         if (!error.empty() || root.is_null()) {
             return false;
+        }
+        const auto &structure = root["structural_tag"];
+        if (structure["format"].string_value() == "mimo_xml") {
+            auto names = read_string_array(structure["allowed_names"]);
+            auto parameters = read_string_array_map(structure["parameter_names_by_tool"]);
+            std::map<std::string, std::vector<std::string>> tools;
+            for (const auto &name : names) tools[name] = parameters[name];
+            try {
+                config.tool_call_grammar = std::make_shared<fastllm::MimoToolGrammar>(tools,
+                    structure["requires_tool_call"].bool_value(), structure["max_tool_calls"].int_value() == 1);
+            } catch (const std::exception &) { return false; }
+            config.tool_call_grammar_state = 0;
+            config.tool_call_token_mask.reset();
+            return true;
         }
         json11::Json contentSampling = root["content_sampling"];
         if (contentSampling.is_object() &&

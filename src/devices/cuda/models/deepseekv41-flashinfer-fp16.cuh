@@ -1,7 +1,7 @@
 // Included inside deepseekv41-kernels.cu after the dynamic attention descriptor.
 // FlashInfer's FP16 prefill primitive also handles a single sparse query after
 // gathering its selected KV rows. No host planning or allocation occurs on replay.
-#ifndef USE_ROCM
+#ifdef FASTLLM_V41_FP16_ATTENTION
 namespace v41_fp16_attention {
 using BaseParams = flashinfer::SinglePrefillParams<half, half, half>;
 struct Params : BaseParams { const uint8_t *valid = nullptr; };

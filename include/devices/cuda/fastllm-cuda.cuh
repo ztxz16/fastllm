@@ -1726,6 +1726,23 @@ bool FastllmCudaTopKTopPSampling(float *logits, float *temperatures,
                                   int *topKArr, float *topPArr,
                                   int *output,
                                   int batch, int vocabSize);
+// Request-owned sampling workspace for CUDA Graph capture. Parameters are fixed
+// at creation; SetSeed runs outside capture before every execution. Run only
+// enqueues device work and writes both the actual q distribution and sampled ID.
+void *FastllmCudaMtpCreateDraftSampler(int vocab, float temperature, int topK, float topP);
+void *FastllmCudaMtpCreateDraftSamplerBatch(int rows, int vocab,
+    const float *temperatures, const int *topKs, const float *topPs);
+// Per-row persistent workspace; offset separates successive draws in one graph.
+bool FastllmCudaMtpDraftSamplerRunBatch(void *sampler, float *logits, float *proposalProbs,
+    float *deviceTokens, uint64_t offset);
+// Change the active rows/parameters within the creation-time capacity. No allocation.
+// Call before capture/replay; graph owners must preserve their captured filtering branch.
+bool FastllmCudaMtpDraftSamplerSetParameters(void *sampler, int rows,
+    const float *temperatures, const int *topKs, const float *topPs);
+void FastllmCudaMtpDestroyDraftSampler(void *sampler);
+bool FastllmCudaMtpDraftSamplerSetSeed(void *sampler);
+bool FastllmCudaMtpDraftSamplerRun(void *sampler, float *logits, float *proposalProbs,
+                                 float *deviceToken);
 // proposalProbs is a persistent CUDA buffer; other arrays except logits are host arrays.
 // Draft sampling and verification intersect top-k/top-p on the original softmax.
 bool FastllmCudaMtpSampleDraft(float *logits, float *proposalProbs,
@@ -2745,6 +2762,8 @@ bool FastllmChunkGatedDeltaRuleVarlenPrefillNative(
     bool apply_decay_mask = false);
 
 void FastllmCudaSetDevice(int gpu_id);
+// Release only idle transient CUDA buffers; graph-pinned and busy buffers stay alive.
+void FastllmCudaReleaseIdleCachedBuffers(int device = -1);
 int FastllmCudaGetDevice();
 int FastllmCudaRuntimeArch();
 int GetPointerDeviceId(void *ptr);
@@ -2863,5 +2882,8 @@ void *FastllmCudaCreateNativeMoeFullGraph(const fastllm::Data &input, const fast
 // dispatcher: a rejected launch leaves no pending CPU requests.
 bool FastllmCudaLaunchNativeMoeFullGraph(void *exec, void *const *handles, int count, bool timed = true);
 bool FastllmCudaCreateNativeMoeReplayGraph(void *graph, void *const *handles, int count, void **exec);
+
+// Host bitset, applied before temperature/top-k/top-p on the calling stream.
+void FastllmCudaApplyTokenMask(float *logits, const uint32_t *mask, int vocab);
 
 #endif // FASTLLM_CUDA_CUH

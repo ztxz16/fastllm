@@ -1853,6 +1853,34 @@ class FastLLmCompletion:
           content = parsed.content,
       )
 
+  def _order_tool_results(
+      self, conversation: List[ConversationMessage],
+  ) -> List[ConversationMessage]:
+      # Parallel tools may finish out of order. Templates which omit call IDs
+      # associate a complete result group with the preceding call order.
+      messages: List[ConversationMessage] = []
+      cursor = 0
+      while cursor < len(conversation):
+          message = conversation[cursor]
+          messages.append(message)
+          cursor += 1
+          if message.role != "assistant" or not message.tool_calls:
+              continue
+          end = cursor
+          while end < len(conversation) and conversation[end].role == "tool":
+              end += 1
+          results = conversation[cursor:end]
+          call_ids = [call.get("id") for call in message.tool_calls]
+          result_ids = [result.tool_call_id for result in results]
+          if (all(call_ids) and len(set(call_ids)) == len(call_ids)
+                  and len(result_ids) == len(call_ids)
+                  and set(result_ids) == set(call_ids)):
+              order = {call_id: index for index, call_id in enumerate(call_ids)}
+              results = sorted(results, key=lambda result: order[result.tool_call_id])
+          messages.extend(results)
+          cursor = end
+      return messages
+
   def _normalize_system_messages(
       self, conversation: List[ConversationMessage],
   ) -> List[ConversationMessage]:
@@ -3051,7 +3079,8 @@ class FastLLmCompletion:
               conversation.extend(messages)
               media.extend(message_media)
 
-          conversation = self._normalize_system_messages(conversation)
+          conversation = self._order_tool_results(
+              self._normalize_system_messages(conversation))
           if len(conversation) == 0:
               raise Exception("Empty msg")
 
@@ -3246,7 +3275,8 @@ class FastLLmCompletion:
               for message in conversation:
                   if message.role == "developer":
                       message.role = "system"
-              conversation = self._normalize_system_messages(conversation)
+              conversation = self._order_tool_results(
+                  self._normalize_system_messages(conversation))
 
           if len(conversation) == 0:
             raise Exception("Empty msg")

@@ -25,7 +25,9 @@ struct Storage {
     int *tokenSlots, *slotTokens, *cursor;
     int *protectedSlots, *misses, *available, *missCounts;
     int *indices, *lengths;
-    int *boundRequests;
+    int *boundRequests, *queryLengths, *queryCounts;
+    const int **querySelections;
+    int *groupHeads, *groupCounts, *nextRows;
     int *keyPages = nullptr, *valuePages = nullptr;
     int pagesPerRequest = 0;
     const void **pointers;
@@ -36,6 +38,15 @@ struct Storage {
 // Block-local compaction, reused at barriers by a single request CTA. Work is
 // proportional to selected + resident rows, not the historical context length.
 using Scan = cub::BlockScan<int, 256>;
+__host__ __device__ int FindOwner(const Storage &s, const void *key) {
+    const uintptr_t address = reinterpret_cast<uintptr_t>(key);
+    const uintptr_t base = reinterpret_cast<uintptr_t>(s.cfg.pageLen ? (void *)s.keyPages : (void *)s.hostK);
+    const size_t span = s.cfg.pageLen ? size_t(s.pagesPerRequest) * sizeof(int)
+        : size_t(s.cfg.maxTokens) * s.cfg.keyRowBytes;
+    if (address < base || (address - base) % span || (address - base) / span >= size_t(s.cfg.maxRequests))
+        return -1;
+    return (address - base) / span;
+}
 __global__ void BindRequests(Storage s, const void *const *keys, int stride,
                              const int *lengths, int batch) {
     const int b = blockIdx.x * blockDim.x + threadIdx.x;
@@ -45,16 +56,8 @@ __global__ void BindRequests(Storage s, const void *const *keys, int stride,
         if (lengths[b] < 0) atomicOr(s.errors, 2u);
         return;
     }
-    const uintptr_t address = reinterpret_cast<uintptr_t>(keys[size_t(b) * stride]);
-    const uintptr_t base = reinterpret_cast<uintptr_t>(s.cfg.pageLen ? (void *)s.keyPages : (void *)s.hostK);
-    const size_t span = s.cfg.pageLen ? size_t(s.pagesPerRequest) * sizeof(int)
-        : size_t(s.cfg.maxTokens) * s.cfg.keyRowBytes;
-    if (address < base || (address - base) % span ||
-        (address - base) / span >= size_t(s.cfg.maxRequests)) {
-        atomicOr(s.errors, 1u);
-        return;
-    }
-    s.boundRequests[b] = (address - base) / span;
+    s.boundRequests[b] = FindOwner(s, keys[size_t(b) * stride]);
+    if (s.boundRequests[b] < 0) atomicOr(s.errors, 1u);
 }
 __device__ void Enqueue(bool take, int item, int *queue, int &total, Scan::TempStorage &tmp) {
     int offset, count;
@@ -65,91 +68,144 @@ __device__ void Enqueue(bool take, int item, int *queue, int &total, Scan::TempS
     __syncthreads();
 }
 
+constexpr int kQueryDescriptors = 64;
+struct QueryDescriptors { KvMemSparseQuery rows[kQueryDescriptors]; };
+static_assert(sizeof(QueryDescriptors) + sizeof(Storage) + 64 < 4096, "sparse query argument limit");
+__global__ void UploadQueries(Storage s, QueryDescriptors queries, int first, int count) {
+    const int i = threadIdx.x;
+    if (i >= count) return;
+    const auto &q = queries.rows[i];
+    const int row = first + i, length = q.length ? *q.length : q.tokens;
+    s.queryLengths[row] = length; s.queryCounts[row] = q.count;
+    s.querySelections[row] = q.selected;
+    s.boundRequests[row] = length > 0 ? FindOwner(s, q.keyBinding ? *q.keyBinding : q.key) : -1;
+    if (length > 0 && s.boundRequests[row] < 0) atomicOr(s.errors, 1u);
+    if (length < 0) atomicOr(s.errors, 2u);
+}
+__global__ void InitQueryGroups(Storage s, int batch) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < s.cfg.maxRequests) {
+        s.groupHeads[i] = -1; s.groupCounts[i] = 0; s.missCounts[i] = 0;
+    }
+    if (i < batch) {
+        s.lengths[i] = 0; s.pointers[2 * i] = s.key; s.pointers[2 * i + 1] = s.value;
+    }
+    for (size_t n = i; n < size_t(batch) * s.cfg.maxSelected; n += size_t(gridDim.x) * blockDim.x)
+        s.indices[n] = -1;
+}
+__global__ void LinkQueryGroups(Storage s, const int *requests, int batch) {
+    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= batch || requests[row] < 0) return;
+    const int owner = requests[row];
+    if (owner >= s.cfg.maxRequests) { atomicOr(s.errors, 1u); return; }
+    s.nextRows[row] = atomicExch(s.groupHeads + owner, row);
+    atomicAdd(s.groupCounts + owner, 1);
+}
+__device__ void InvalidateResidentTail(Storage s, int request, int first) {
+    int *tokens = s.slotTokens + size_t(request) * s.cfg.residentTokens;
+    int *map = s.tokenSlots + size_t(request) * s.cfg.maxTokens;
+    for (int slot = threadIdx.x; slot < s.cfg.residentTokens; slot += blockDim.x) {
+        const int token = tokens[slot];
+        if (token >= first) {
+            tokens[slot] = -1; map[token] = -1;
+            atomicAdd(&s.stats[request].evictions, 1ULL);
+        }
+    }
+    __syncthreads();
+}
+__global__ void InvalidateTailKernel(Storage s, int request, int first) {
+    InvalidateResidentTail(s, request, first);
+}
+
+template<bool Grouped>
 __global__ void PlanResidentCount(Storage s, const int *requests, const int *lengths,
-                     const int *selected, const int *counts, const int *const *selectedRows) {
-    const int b = blockIdx.x, t = threadIdx.x, request = requests[b];
+        const int *selected, const int *counts, const int *const *selectedRows, bool appendedRows) {
+    const int b = blockIdx.x, t = threadIdx.x;
+    const int request = Grouped ? b : requests[b];
     const int capacity = s.cfg.residentTokens, width = s.cfg.maxSelected;
-    int *out = s.indices + size_t(b) * width;
-    const int *selection = selectedRows ? selectedRows[b] : selected ? selected + size_t(b) * width : nullptr;
-    for (size_t i = t; i < size_t(width); i += blockDim.x) out[i] = -1;
-    if (!t) {
-        s.lengths[b] = 0;
-        s.pointers[2 * b] = s.key;
-        s.pointers[2 * b + 1] = s.value;
-        s.missCounts[b] = 0;
+    const int first = Grouped ? s.groupHeads[b] : b;
+    if (!Grouped) {
+        for (int i = t; i < width; i += blockDim.x) s.indices[size_t(b) * width + i] = -1;
+        if (!t) {
+            s.lengths[b] = 0; s.pointers[2 * b] = s.key; s.pointers[2 * b + 1] = s.value;
+            s.missCounts[b] = 0;
+        }
     }
-    if (request < 0) return;
-    if (request >= s.cfg.maxRequests) {
-        if (!t) atomicOr(s.errors, 1u);
-        return;
+    if (first < 0 || request < 0) return;
+    if (request >= s.cfg.maxRequests || (Grouped && s.groupCounts[b] > s.cfg.maxQueries)) {
+        if (!t) atomicOr(s.errors, 1u); return;
     }
-    const int length = lengths[b], count = counts ? counts[b] : width;
-    if (length < 0 || length > s.cfg.maxTokens || count < 0 || count > width) {
-        if (!t) atomicOr(s.errors, 2u);
-        return;
+    int appendStart = s.cfg.maxTokens;
+    for (int row = first; row >= 0; row = Grouped ? s.nextRows[row] : -1) {
+        const int length = lengths[row], count = counts ? counts[row] : width;
+        if (length < 0 || length > s.cfg.maxTokens || count < 0 || count > width) {
+            if (!t) atomicOr(s.errors, 2u); return;
+        }
+        if (length) appendStart = min(appendStart, length - 1);
     }
+    // Direct mapped-host append overwrites rejected candidates. Drop their hot
+    // copies before protecting hits, so every subsequent read observes new KV.
+    if (appendedRows) InvalidateResidentTail(s, request, appendStart);
     int *map = s.tokenSlots + size_t(request) * s.cfg.maxTokens;
     int *tokens = s.slotTokens + size_t(request) * capacity;
     int *protect = s.protectedSlots + size_t(b) * capacity;
-    int *misses = s.misses + size_t(b) * width;
+    int *misses = s.misses + size_t(b) * width * (Grouped ? s.cfg.maxQueries : 1);
     int *available = s.available + size_t(b) * capacity;
     const int start = s.cursor[request];
     __shared__ Scan::TempStorage tmp;
     __shared__ int nmiss, navailable, nhit, nevicted;
     if (!t) nmiss = navailable = nhit = nevicted = 0;
-    for (size_t i = t; i < size_t(capacity); i += blockDim.x) protect[i] = 0;
+    for (int i = t; i < capacity; i += blockDim.x) protect[i] = 0;
     __syncthreads();
-    for (size_t first = 0; first < size_t(count); first += blockDim.x) {
-        const size_t i = first + t;
-        const int token = i < size_t(count) ? (selection ? selection[i] : int(i)) : -1;
-        int slot = -3;
-        if (token >= 0 && token < length) {
-            // -2 reserves a unique miss, including duplicate TopK entries.
-            slot = atomicCAS(map + token, -1, -2);
-            if (slot >= 0 && !atomicExch(protect + slot, 1)) atomicAdd(&nhit, 1);
+    for (int row = first; row >= 0; row = Grouped ? s.nextRows[row] : -1) {
+        const int *selection = selectedRows ? selectedRows[row] : selected ? selected + size_t(row) * width : nullptr;
+        const int count = counts ? counts[row] : width;
+        for (int begin = 0; begin < count; begin += blockDim.x) {
+            const int i = begin + t;
+            const int token = i < count ? (selection ? selection[i] : i) : -1;
+            int slot = -3;
+            if (token >= 0 && token < lengths[row]) {
+                slot = atomicCAS(map + token, -1, -2);
+                if (slot >= 0 && !atomicExch(protect + slot, 1)) atomicAdd(&nhit, 1);
+            }
+            Enqueue(slot == -1, token, misses, nmiss, tmp);
         }
-        Enqueue(slot == -1, token, misses, nmiss, tmp);
     }
-    // Complete hit protection before examining any victim. Empty slots are
-    // consumed first; otherwise a rotating order avoids repeatedly evicting
-    // the same low-numbered slots. Selected hits can never be victims.
-    // Each unique insertion increments misses; each removed resident row
-    // increments evictions. Create/Reset clear both counters and the map.
-    // Their unsigned difference is therefore the exact current occupancy,
-    // even across counter wrap. DeviceStats exposes a read-only pointer.
-    const bool full = nmiss &&
-        s.stats[request].misses - s.stats[request].evictions ==
-            static_cast<unsigned long long>(capacity);
+    // maxQueries * maxSelected <= capacity bounds the union even if every
+    // query is disjoint. Protected hits can never be evicted by a sibling query.
+    const bool full = nmiss && s.stats[request].misses - s.stats[request].evictions ==
+        static_cast<unsigned long long>(capacity);
     for (int pass = full ? 1 : 0; pass < 2 && navailable < nmiss; ++pass) {
-        for (size_t first = 0; first < size_t(capacity) && navailable < nmiss; first += blockDim.x) {
-            const size_t i = first + t;
-            const size_t sum = size_t(start) + i;
-            const int slot = int(sum >= size_t(capacity) ? sum - capacity : sum);
-            const bool take = i < size_t(capacity) && !protect[slot] &&
+        for (int begin = 0; begin < capacity && navailable < nmiss; begin += blockDim.x) {
+            const int i = begin + t, sum = start + i;
+            const int slot = sum >= capacity ? sum - capacity : sum;
+            const bool take = i < capacity && !protect[slot] &&
                 (pass == 0 ? tokens[slot] < 0 : tokens[slot] >= 0);
             Enqueue(take, slot, available, navailable, tmp);
         }
     }
-    for (size_t i = t; i < size_t(nmiss); i += blockDim.x) {
+    for (int i = t; i < nmiss; i += blockDim.x) {
         const int slot = available[i], token = misses[i], old = tokens[slot];
         if (old >= 0) { map[old] = -1; atomicAdd(&nevicted, 1); }
-        tokens[slot] = token;
-        map[token] = slot;
+        tokens[slot] = token; map[token] = slot;
     }
     __syncthreads();
-    for (size_t i = t; i < size_t(count); i += blockDim.x) {
-        const int token = selection ? selection[i] : int(i);
-        if (token >= 0 && token < length) out[i] = map[token];
+    for (int row = first; row >= 0; row = Grouped ? s.nextRows[row] : -1) {
+        const int *selection = selectedRows ? selectedRows[row] : selected ? selected + size_t(row) * width : nullptr;
+        const int count = counts ? counts[row] : width;
+        for (int i = t; i < count; i += blockDim.x) {
+            const int token = selection ? selection[i] : i;
+            if (token >= 0 && token < lengths[row]) s.indices[size_t(row) * width + i] = map[token];
+        }
+        if (!t) {
+            s.lengths[row] = lengths[row] ? capacity : 0;
+            s.pointers[2 * row] = s.key + size_t(request) * capacity * s.cfg.keyRowBytes;
+            s.pointers[2 * row + 1] = s.value + size_t(request) * capacity * s.cfg.valueRowBytes;
+        }
     }
     if (!t) {
         s.missCounts[b] = nmiss;
-        s.lengths[b] = length ? capacity : 0;
-        s.pointers[2 * b] = s.key + size_t(request) * capacity * s.cfg.keyRowBytes;
-        s.pointers[2 * b + 1] = s.value + size_t(request) * capacity * s.cfg.valueRowBytes;
-        if (nmiss) {
-            const int next = available[nmiss - 1] + 1;
-            s.cursor[request] = next == capacity ? 0 : next;
-        }
+        if (nmiss) { const int next = available[nmiss - 1] + 1; s.cursor[request] = next == capacity ? 0 : next; }
         auto &stats = s.stats[request];
         stats.hits += nhit; stats.misses += nmiss; stats.evictions += nevicted;
         stats.copiedBytes += size_t(nmiss) * (s.cfg.keyRowBytes + s.cfg.valueRowBytes);
@@ -170,13 +226,13 @@ __device__ size_t HistoryRow(Storage s, const int *pages, int request, int token
     return pages ? size_t(pages[size_t(request) * s.pagesPerRequest + token / s.cfg.pageLen]) *
         s.cfg.pageLen + token % s.cfg.pageLen : size_t(request) * s.cfg.maxTokens + token;
 }
-template<int Threads>
+template<int Threads, bool Grouped>
 __global__ void Refill(Storage s, const int *requests) {
-    const int b = blockIdx.y, request = requests[b], lane = threadIdx.x % 32;
+    const int b = blockIdx.y, request = Grouped ? b : requests[b], lane = threadIdx.x % 32;
     const int count = s.missCounts[b];
     constexpr int warps = Threads / 32;
     for (size_t i = blockIdx.x * warps + threadIdx.x / 32; i < size_t(count); i += gridDim.x * warps) {
-        const int token = s.misses[size_t(b) * s.cfg.maxSelected + i];
+        const int token = s.misses[size_t(b) * s.cfg.maxSelected * (Grouped ? s.cfg.maxQueries : 1) + i];
         const int slot = s.available[size_t(b) * s.cfg.residentTokens + i];
         const size_t srcK = HistoryRow(s, s.keyPages, request, token);
         const size_t srcV = HistoryRow(s, s.valuePages, request, token);
@@ -263,7 +319,7 @@ struct KvMemSparseCache::Impl {
 KvMemSparseCache::KvMemSparseCache(const KvMemSparseConfig &c) : impl(new Impl) {
     if (c.maxRequests <= 0 || c.maxBatch <= 0 || c.maxBatch > 65535 || c.maxTokens <= 0 ||
         c.residentTokens <= 0 || c.residentTokens > c.maxTokens || c.maxSelected <= 0 ||
-        c.maxSelected > c.residentTokens || !c.keyRowBytes || !c.valueRowBytes ||
+        c.maxQueries < 1 || int64_t(c.maxSelected) * c.maxQueries > c.residentTokens || !c.keyRowBytes || !c.valueRowBytes ||
         c.keyRowBytes > std::numeric_limits<size_t>::max() - c.valueRowBytes ||
         c.pageLen < 0 || (c.pageLen && (c.maxTokens % c.pageLen || c.maxTokens / c.pageLen > INT_MAX - 3)) ||
         c.totalTokens < 0 || (c.totalTokens && (!c.pageLen || c.totalTokens % c.pageLen ||
@@ -297,12 +353,17 @@ KvMemSparseCache::KvMemSparseCache(const KvMemSparseConfig &c) : impl(new Impl) 
         Check(cudaMemset(s.valuePages, 0, size_t(c.maxRequests) * s.pagesPerRequest * sizeof(int)));
     }
     p.Allocate(s.cursor, c.maxRequests);
-    p.Allocate(s.protectedSlots, Product(c.maxBatch, c.residentTokens));
-    p.Allocate(s.available, Product(c.maxBatch, c.residentTokens));
-    p.Allocate(s.misses, Product(c.maxBatch, c.maxSelected));
+    const size_t groups = c.maxQueries > 1 ? c.maxRequests : std::max(c.maxBatch, c.maxRequests);
+    p.Allocate(s.protectedSlots, Product(groups, c.residentTokens));
+    p.Allocate(s.available, Product(groups, c.residentTokens));
+    p.Allocate(s.misses, Product(std::max(size_t(c.maxBatch), Product(c.maxRequests, c.maxQueries)), c.maxSelected));
     p.Allocate(s.indices, Product(c.maxBatch, c.maxSelected));
     p.Allocate(s.boundRequests, c.maxBatch);
-    p.Allocate(s.missCounts, c.maxBatch); p.Allocate(s.lengths, c.maxBatch);
+    p.Allocate(s.queryLengths, c.maxBatch); p.Allocate(s.queryCounts, c.maxBatch);
+    p.Allocate(s.querySelections, c.maxBatch);
+    p.Allocate(s.groupHeads, c.maxRequests); p.Allocate(s.groupCounts, c.maxRequests);
+    p.Allocate(s.nextRows, c.maxBatch);
+    p.Allocate(s.missCounts, groups); p.Allocate(s.lengths, c.maxBatch);
     p.Allocate(s.pointers, Product(c.maxBatch, 2));
     p.Allocate(s.stats, c.maxRequests); p.Allocate(s.errors, 1);
     Check(cudaMemset(s.tokenSlots, 0xff, logicalRows * sizeof(int)));
@@ -370,27 +431,71 @@ void KvMemSparseCache::Write(const int *requests, const int *positions, const vo
         static_cast<const unsigned char *>(values), rows);
     Check(cudaGetLastError());
 }
+namespace {
+template<bool Grouped>
+void LaunchResolve(Storage s, const int *requests, const int *lengths, const int *selected,
+        const int *counts, int batch, cudaStream_t stream, const int *const *selectedRows,
+        int multiprocessors, bool wideRefill, bool appendedRows) {
+    const int groups = Grouped ? s.cfg.maxRequests : batch;
+    if (Grouped) {
+        InitQueryGroups<<<(std::max(batch, groups) + 255) / 256, 256, 0, stream>>>(s, batch);
+        LinkQueryGroups<<<(batch + 255) / 256, 256, 0, stream>>>(s, requests, batch);
+    }
+    PlanResidentCount<Grouped><<<groups, 256, 0, stream>>>(s, requests, lengths, selected, counts, selectedRows, appendedRows);
+    Check(cudaGetLastError());
+    const int selectedCapacity = s.cfg.maxSelected * (Grouped ? s.cfg.maxQueries : 1);
+    if (wideRefill && groups >= 64 && selectedCapacity >= 256) {
+        // Keep two independent CTAs per owner in large batches. The strided
+        // copy partitions each miss queue without extra storage or transfers.
+        const int blocks = std::min({128, (selectedCapacity - 1) / 32 + 1,
+                                    std::max(2, (multiprocessors * 2 + groups - 1) / groups)});
+        Refill<1024, Grouped><<<dim3(blocks, groups), 1024, 0, stream>>>(s, requests);
+    } else {
+        const int blocks = std::min({128, (selectedCapacity - 1) / 8 + 1,
+                                    (multiprocessors * 4 + groups - 1) / groups});
+        Refill<256, Grouped><<<dim3(blocks, groups), 256, 0, stream>>>(s, requests);
+    }
+    Check(cudaGetLastError());
+}
+}
 void KvMemSparseCache::Resolve(const int *requests, const int *lengths, const int *selected,
                              const int *counts, int batch, cudaStream_t stream, const int *const *selectedRows) {
     impl->OnDevice();
     if (batch < 0 || batch > impl->s.cfg.maxBatch || (batch && (!requests || !lengths)))
         throw std::invalid_argument("KVMem sparse: invalid resolve inputs");
     if (!batch) return;
-    PlanResidentCount<<<batch, 256, 0, stream>>>(impl->s, requests, lengths, selected, counts, selectedRows);
-    Check(cudaGetLastError());
-    // Bound launch overhead for all-hit or heavily padded graphs, while large
-    // misses loop within resident warps instead of creating one CTA per token.
-    if (impl->wideRefillSupported && batch >= 64 && impl->s.cfg.maxSelected >= 256) {
-        // More outstanding mapped-host reads per request on Hopper. Keep the
-        // original launch for small batches, short selections and other GPUs.
-        const int blocks = std::min({128, (impl->s.cfg.maxSelected - 1) / 32 + 1,
-                                     (impl->multiprocessors * 2 + batch - 1) / batch});
-        Refill<1024><<<dim3(blocks, batch), 1024, 0, stream>>>(impl->s, requests);
-    } else {
-        const int blocks = std::min({128, (impl->s.cfg.maxSelected - 1) / 8 + 1,
-                                     (impl->multiprocessors * 4 + batch - 1) / batch});
-        Refill<256><<<dim3(blocks, batch), 256, 0, stream>>>(impl->s, requests);
+    if (impl->s.cfg.maxQueries > 1)
+        LaunchResolve<true>(impl->s, requests, lengths, selected, counts, batch, stream, selectedRows,
+                            impl->multiprocessors, impl->wideRefillSupported, false);
+    else LaunchResolve<false>(impl->s, requests, lengths, selected, counts, batch, stream, selectedRows,
+                              impl->multiprocessors, impl->wideRefillSupported, false);
+}
+void KvMemSparseCache::ResolveQueries(const KvMemSparseQuery *queries, int batch, cudaStream_t stream,
+                                     bool appendedRows) {
+    impl->OnDevice();
+    if (batch < 0 || batch > impl->s.cfg.maxBatch || (batch && !queries))
+        throw std::invalid_argument("KVMem sparse: invalid query descriptors");
+    if (!batch) return;
+    for (int first = 0; first < batch; first += kQueryDescriptors) {
+        QueryDescriptors descriptors{};
+        const int count = std::min(kQueryDescriptors, batch - first);
+        std::copy(queries + first, queries + first + count, descriptors.rows);
+        UploadQueries<<<1, kQueryDescriptors, 0, stream>>>(impl->s, descriptors, first, count);
     }
+    auto &s = impl->s;
+    if (s.cfg.maxQueries > 1)
+        LaunchResolve<true>(s, s.boundRequests, s.queryLengths, nullptr, s.queryCounts, batch, stream,
+                            s.querySelections, impl->multiprocessors, impl->wideRefillSupported, appendedRows);
+    else LaunchResolve<false>(s, s.boundRequests, s.queryLengths, nullptr, s.queryCounts, batch, stream,
+                              s.querySelections, impl->multiprocessors, impl->wideRefillSupported, appendedRows);
+}
+void KvMemSparseCache::InvalidateTail(const void *key, int first, cudaStream_t stream) {
+    impl->OnDevice();
+    const auto &s = impl->s;
+    const int owner = FindOwner(s, key);
+    if (first < 0 || first > s.cfg.maxTokens || owner < 0)
+        throw std::invalid_argument("KVMem sparse: invalid suffix invalidation");
+    InvalidateTailKernel<<<1, 256, 0, stream>>>(s, owner, first);
     Check(cudaGetLastError());
 }
 void KvMemSparseCache::ResolveFromPointers(const void *const *keys, int pointerStride,

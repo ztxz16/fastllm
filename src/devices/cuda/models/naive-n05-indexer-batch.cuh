@@ -157,8 +157,9 @@ __device__ __forceinline__ void MmaFp8(float (&c)[4], const uint32_t (&a)[4], co
 // K occupies the MMA row dimension: each warp produces sixteen key scores.
 // Cache the reused Q in L1, while streaming K directly to shared memory.
 // The caller guarantees 16-byte alignment and retains Scores as the fallback.
-template<bool FP8, bool NativeFp8 = false>
+template<bool FP8, bool NativeFp8 = false, int Queries = 1>
 __global__ void HopperScores(const BF16 *weights, Batch batch) {
+    static_assert(Queries > 0 && Queries <= 2, "Invalid query tile.");
     static_assert(!NativeFp8 || FP8, "Native FP8 MMA requires FP8 keys.");
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     // Older-toolkit builds and older PTX images retain the BF16 MMA path,
@@ -170,29 +171,37 @@ __global__ void HopperScores(const BF16 *weights, Batch batch) {
 #endif
     using namespace naive_dsa_mma;
     constexpr int Threads = 128;
-    Row r = batch.rows[blockIdx.y];
+    Row r = batch.rows[blockIdx.y * Queries];
     r.key.Bind(r.cache);
-    const int begin = r.Begin(), n = begin + r.Count();
+    const int begin = r.Begin();
+    int n = begin + r.Count();
+#pragma unroll
+    for (int q = 1; q < Queries; ++q)
+        n = max(n, begin + batch.rows[blockIdx.y * Queries + q].Count());
     const int tileStride = (int)gridDim.x * kKeys;
     if (begin + blockIdx.x * kKeys >= n) return;
     using Tile = std::conditional_t<UseNativeFp8, unsigned char, BF16>;
     constexpr int Padding = UseNativeFp8 ? 16 : 8, Step = UseNativeFp8 ? 32 : 16;
-    __shared__ __align__(16) Tile qs[kHeads][kIndexerDim + Padding], ks[kKeys][kIndexerDim + Padding];
-    __shared__ float scales[kHeads], weightsF[kHeads];
+    __shared__ __align__(16) Tile qs[Queries][kHeads][kIndexerDim + Padding], ks[kKeys][kIndexerDim + Padding];
+    __shared__ float scales[Queries][kHeads], weightsF[Queries][kHeads];
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+#pragma unroll
+    for (int q = 0; q < Queries; ++q) {
+        const Row query = batch.rows[blockIdx.y * Queries + q];
     if constexpr (UseNativeFp8) {
         // Quantize already stores exact E4M3 values in BF16. Repacking those
         // values adds no quantization; keep their original FP32 scales below.
         for (int i = t; i < kHeads * kIndexerDim; i += Threads)
-            qs[i / kIndexerDim][i % kIndexerDim] =
-                __nv_cvt_float_to_fp8((float)r.query[i], __NV_SATFINITE, __NV_E4M3);
+            qs[q][i / kIndexerDim][i % kIndexerDim] =
+                __nv_cvt_float_to_fp8((float)query.query[i], __NV_SATFINITE, __NV_E4M3);
     } else for (int i = t; i < kHeads * (kIndexerDim / 8); i += Threads) {
         int h = i / (kIndexerDim / 8), d = i % (kIndexerDim / 8) * 8;
-        LoadScoreVector<true>(&qs[h][d], r.query + h * kIndexerDim + d, true);
+        LoadScoreVector<true>(&qs[q][h][d], query.query + h * kIndexerDim + d, true);
     }
     if (t < kHeads) {
-        scales[t] = r.scale[t];
-        weightsF[t] = (float)weights[r.sequence * kHeads + t];
+        scales[q][t] = query.scale[t];
+        weightsF[q][t] = (float)weights[query.sequence * kHeads + t];
+    }
     }
     asm volatile("cp.async.commit_group; cp.async.wait_group 0;" ::: "memory");
     __syncthreads();
@@ -235,32 +244,42 @@ __global__ void HopperScores(const BF16 *weights, Batch batch) {
         if constexpr (!FP8 || UseNativeFp8)
             asm volatile("cp.async.commit_group;\ncp.async.wait_group 0;" ::: "memory");
         __syncthreads();
-        float dot[2][4] = {};
+        // Load each shared K fragment once for the complete query tile.
+        // Every query retains its original ordered MMA accumulation.
+        float dots[Queries][2][4] = {};
 #pragma unroll
         for (int d = 0; d < kIndexerDim; d += Step) {
             uint32_t a[4];
             Load4(a, &ks[warp * 16 + (lane & 7) + ((lane >> 3) & 1) * 8][d + (lane >> 4) * (Step / 2)]);
 #pragma unroll
-            for (int group = 0; group < 2; ++group) {
-                uint32_t b[2];
-                Load2(b, &qs[group * 8 + (lane & 7)][d + ((lane >> 3) & 1) * (Step / 2)]);
-                if constexpr (UseNativeFp8) MmaFp8(dot[group], a, b);
-                else Mma(dot[group], a, b);
+            for (int q = 0; q < Queries; ++q) {
+#pragma unroll
+                for (int group = 0; group < 2; ++group) {
+                    uint32_t b[2];
+                    Load2(b, &qs[q][group * 8 + (lane & 7)][d + ((lane >> 3) & 1) * (Step / 2)]);
+                    if constexpr (UseNativeFp8) MmaFp8(dots[q][group], a, b);
+                    else Mma(dots[q][group], a, b);
+                }
             }
         }
+#pragma unroll
+        for (int q = 0; q < Queries; ++q) {
+            const Row query = batch.rows[blockIdx.y * Queries + q];
+            const int queryEnd = begin + query.Count();
+            auto &dot = dots[q];
         // Each lane scales only its own head values, before exchanging them.
 #pragma unroll
         for (int group = 0; group < 2; ++group)
 #pragma unroll
             for (int i = 0; i < 4; ++i)
-                dot[group][i] = fmaxf(dot[group][i] * scales[group * 8 + (lane & 3) * 2 + i % 2], 0.f);
+                dot[group][i] = fmaxf(dot[group][i] * scales[q][group * 8 + (lane & 3) * 2 + i % 2], 0.f);
 #pragma unroll
         for (int half = 0; half < 2; ++half) {
             float sum = 0.f;
 #pragma unroll
             for (int group = 0; group < 2; ++group) {
                 const int h = group * 8 + (lane & 3) * 2;
-                float w0 = weightsF[h], w1 = weightsF[h + 1];
+                float w0 = weightsF[q][h], w1 = weightsF[q][h + 1];
                 // Pass the accumulator through each pair of heads in ascending
                 // order. This halves the shuffles without reassociating the sum.
 #pragma unroll
@@ -271,7 +290,8 @@ __global__ void HopperScores(const BF16 *weights, Batch batch) {
                 }
             }
             int key = first + warp * 16 + (lane >> 2) + half * 8;
-            if ((lane & 3) == 0 && key < n) r.scores[key - begin] = naive_topk::OrderedScoreBits(sum * r.key.IndexScale(key, r.stride));
+            if ((lane & 3) == 0 && key < queryEnd) query.scores[key - begin] = naive_topk::OrderedScoreBits(sum * r.key.IndexScale(key, r.stride));
+        }
         }
         // Do not let the next tile overwrite shared K while another warp is
         // still finishing the current MMA result.
@@ -283,13 +303,13 @@ __global__ void HopperScores(const BF16 *weights, Batch batch) {
 // A request owns one CTA instead of a cooperative grid. Independent requests
 // fill the GPU together. Refine a radix threshold until at most 4096 candidates
 // remain, then compact in position order for the existing stable block sort.
-template<bool Merge = false>
-__global__ void Select(Batch batch) {
+template<bool Merge = false, int Capacity = naive_topk::kCapacity>
+__device__ void SelectRow(const Row &row) {
     using namespace naive_topk;
-    const Row &row = batch.rows[blockIdx.x];
-    const int mergeWidth = row.MergeWidth();
+    static_assert(Capacity >= kTopK && Capacity <= kCapacity);
     auto *out = &row.workspace->candidates;
     auto *state = &row.workspace->state;
+    const int mergeWidth = row.MergeWidth();
     const int t = threadIdx.x, lane = t & 31, n = row.Count();
     using Scan = cub::BlockScan<int, kThreads>;
     __shared__ typename Scan::TempStorage scan;
@@ -344,14 +364,14 @@ __global__ void Select(Batch batch) {
         rank = state->rank;
         candidates = state->candidates;
         mask |= (kBuckets - 1u) << shift;
-        if (candidates <= kCapacity || shift == 0 || prefix == state->maximum) break;
+        if (candidates <= Capacity || shift == 0 || prefix == state->maximum) break;
     }
     int offset = 0, tiesBefore = 0;
     for (int base = 0; base < n; base += kThreads) {
         int i = base + t;
         unsigned bits = i < n ? row.Score<Merge>(i, mergeWidth) : 0;
         bool take = i < n && bits >= prefix;
-        if (candidates > kCapacity) {
+        if (candidates > Capacity) {
             int equal = i < n && bits == prefix, before, total;
             Scan(scan).ExclusiveSum(equal, before, total);
             __syncthreads();
@@ -369,6 +389,8 @@ __global__ void Select(Batch batch) {
     }
     if (t == 0) state->selected = offset;
 }
+template<bool Merge = false>
+__global__ void Select(Batch batch) { SelectRow<Merge>(batch.rows[blockIdx.x]); }
 // Multi-CTA radix selection. Kernel boundaries provide the grid barriers, so
 // independent rows do not need one cooperative launch per request. All partial
 // histograms, counts and candidates reuse the existing TopK workspace.

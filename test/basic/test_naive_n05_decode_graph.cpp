@@ -195,7 +195,7 @@ static void TestResidualNorm(int channels, int rows = 1) {
         ++checks;
     }
 }
-static void TestVerifyGraph(int window, int capacity, const std::vector<int> &prefixes, bool fp8, int rows = 8, int heads = 8) {
+static void TestVerifyGraph(int window, int capacity, const std::vector<int> &prefixes, bool fp8, int rows = 8, int heads = 8, int scorePattern = 0) {
     const int dim = 192, vd = 128;
     const int kc = dim + (window ? 0 : 128), storage = (window ? window + rows : capacity) + 1;
     Data q(BFLOAT16), iq(BFLOAT16), iw(BFLOAT16), key(BFLOAT16), value(BFLOAT16);
@@ -213,6 +213,14 @@ static void TestVerifyGraph(int window, int capacity, const std::vector<int> &pr
     for (int row = 0; row < rows; ++row)
         ((int *)live.cpuData)[row] = prefixes[0] + row + 1;
     live.ToDevice(DataDevice::CUDA, {0}, true);
+    if (scorePattern == 1) Cuda(cudaMemset(iw.cudaData, 0, iw.GetBytes()));
+    if (scorePattern == 2) {
+        // More than TopK equal scores exercise stable compaction across CTAs.
+        auto repeated = Read<uint16_t>(key);
+        for (int row = 4; row < storage; ++row)
+            std::copy_n(repeated.data() + (row % 4) * kc, kc, repeated.data() + (size_t)row * kc);
+        Cuda(cudaMemcpy(key.cudaData, repeated.data(), key.GetBytes(), cudaMemcpyHostToDevice));
+    }
     auto originalK = Read<uint16_t>(key), originalV = Read<uint16_t>(value);
     auto newK = Read<uint16_t>(nk), newV = Read<uint16_t>(nv);
     FastllmNaiveDecodeScratch scratch;
@@ -309,8 +317,78 @@ static void TestVerifyIndexerView(int rows, int past, bool fp8) {
         ++checks;
     }
 }
-static void TestDraftAttention(int dim, int rows, int window, bool shortAttention) {
-    const int heads = 8, kvHeads = 2, storage = window + rows;
+// Independent causal blocks, mixed lengths and descriptor chunking must agree
+// with the original one-query Indexer, including output-view canaries.
+static void TestBatchVerifyIndexer(int requests, bool fp8, int width = 0, bool uniform = false) {
+    int total = 0;
+    std::vector<int> offsets, widths, past;
+    for (int i = 0; i < requests; ++i) {
+        offsets.push_back(total);
+        widths.push_back(width ? width : 1 + i % 8);
+        past.push_back(i == 0 ? 32765 : i % 3 == 0 ? 127 : i % 3 == 1 ? 2045 : 4097);
+        total += widths.back();
+    }
+    Data q(BFLOAT16), w(BFLOAT16), live;
+    Upload(q, {1, total, 2048}, 871);
+    Upload(w, {1, total, 16}, 872);
+    if (uniform) FastllmCudaMemset0(w.cudaData, w.GetBytes());
+    std::vector<Data> keys(requests, Data(BFLOAT16)), storage(requests, Data(INT32)), outputs(requests);
+    std::vector<FastllmNaiveVerifyIndexerItem> items;
+    for (int i = 0; i < requests; ++i) {
+        Upload(keys[i], {1, past[i] + widths[i], 320}, 873 + i);
+        storage[i].Resize({widths[i] * 2048 + 32}); storage[i].Allocate();
+        std::fill((int *)storage[i].cpuData, (int *)storage[i].cpuData + storage[i].Count(0), 0x12345678);
+        storage[i].ToDevice(DataDevice::CUDA, {0}, true);
+        outputs[i].Resize({widths[i], 2048}); outputs[i].FakeFrom(storage[i], 0);
+        items.push_back({&keys[i], &outputs[i], offsets[i], widths[i], past[i]});
+    }
+    FastllmNaiveDecodeScratch scratch;
+    Require(FastllmCudaNaiveBatchVerifyIndexer(q, w, items, fp8, scratch, live), "batch verification Indexer unavailable");
+    for (int i = 0; i < requests; ++i) {
+        auto got = Read<int>(storage[i]);
+        Require(std::all_of(got.begin() + widths[i] * 2048, got.end(),
+            [](int v) { return v == 0x12345678; }), "batched Indexer output canary overwritten");
+        for (int row = 0; row < widths[i]; ++row) {
+            Data qr(BFLOAT16, {1, 1, 2048}), wr(BFLOAT16, {1, 1, 16});
+            Data kr(BFLOAT16, {1, past[i] + row + 1, 320}), expected;
+            qr.FakeFrom(q, (size_t)(offsets[i] + row) * 2048 * 2);
+            wr.FakeFrom(w, (size_t)(offsets[i] + row) * 16 * 2);
+            kr.FakeFrom(keys[i], 0);
+            FastllmCudaNaiveIndexer(qr, wr, kr, 16, 128, past[i] + row, 2048, fp8, expected);
+            auto ref = Read<int>(expected);
+            Require(std::equal(ref.begin(), ref.end(), got.begin() + row * 2048),
+                "batched verification Indexer differs from independent causal row");
+            ++checks;
+        }
+    }
+    std::printf("BATCH VERIFY INDEXER PASS requests=%d rows=%d fp8_query=%d\n", requests, total, fp8);
+}
+
+// Normalizing a chunk must match the same rows in a full batch, including
+// in-place output. The large batch exercises the general reduction kernel.
+static void TestRMSNormChunks() {
+    Data input(BFLOAT16), weight(FLOAT32), reference(BFLOAT16);
+    Upload(input, {257, 4096}, 711);
+    Upload(weight, {4096}, 712);
+    Upload(reference, input.dims, 0);
+    Require(FastllmCudaKimiK3RMSNorm(input, weight, reference, 1e-5f), "batch norm");
+    auto expected = Read<uint16_t>(reference);
+    for (int rows : {1, 2, 7, 8, 31, 128}) {
+        Data chunk(BFLOAT16), output(BFLOAT16);
+        Upload(chunk, {rows, 4096}, 711);
+        Upload(output, chunk.dims, 0);
+        Require(FastllmCudaKimiK3RMSNorm(chunk, weight, output, 1e-5f), "chunk norm");
+        auto actual = Read<uint16_t>(output);
+        Require(std::equal(actual.begin(), actual.end(), expected.begin()), "chunk norm differs");
+        Require(FastllmCudaKimiK3RMSNorm(chunk, weight, chunk, 1e-5f), "in-place chunk norm");
+        Require(Read<uint16_t>(chunk) == actual, "in-place norm differs");
+        ++checks;
+    }
+}
+
+static void TestDraftAttention(int dim, int rows, int window, bool shortAttention,
+                               int heads = 8, int kvHeads = 2) {
+    const int storage = window + rows;
     Data q(BFLOAT16), key(BFLOAT16), value(BFLOAT16), nk(BFLOAT16), nv(BFLOAT16);
     Data live(INT32), scores, actual;
     Upload(q, {1, rows, heads * dim}, 101);
@@ -530,7 +608,7 @@ static void TestRouterBatch(int batch, int pattern) {
         Cuda(cudaMemcpy(weight.cudaData, values.data(), weight.GetBytes(), cudaMemcpyHostToDevice));
     }
     int previous = FastllmCudaGetLinearExactBatchThreshold();
-    FastllmCudaSetLinearExactBatchThreshold(9);
+    FastllmCudaSetLinearExactBatchThreshold(batch + 1);
     Graph graph;
     graph.Capture([&]() {
         Require(FastllmCudaNaiveRouterSigmoid(input, weight, actual), "batch router unsupported");
@@ -591,6 +669,10 @@ int main() {
         if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0)
             return 77;
         FastllmCudaSetDevice(0);
+        for (int requests : {2, 70}) for (bool fp8 : {false, true}) TestBatchVerifyIndexer(requests, fp8);
+        for (int requests : {1, 3, 128}) for (int width : {3, 4, 6, 8})
+            TestBatchVerifyIndexer(requests, true, width);
+        TestBatchVerifyIndexer(128, true, 6, true);
         for (int rows : {1, 2, 3, 4, 8, 33}) TestIndexerKeyNorm(rows);
         if (!FastllmCudaNaiveDecodeGraphSupported())
             return 77;
@@ -600,7 +682,7 @@ int main() {
             TestPaddedAttention(batch, 8, 192, 128, sparse, fp8);
             TestPaddedAttention(batch, 2, 64, 256, sparse, fp8);
         }
-        for (int batch = 1; batch <= 8; ++batch)
+        for (int batch : {1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 16, 24, 32, 48, 64, 128})
             for (int pattern = 0; pattern < 3; ++pattern) TestRouterBatch(batch, pattern);
         for (int batch : {1, 2, 3, 4, 17})
             for (int heads : {4, 8, 16})
@@ -635,6 +717,12 @@ int main() {
         }
         TestVerifyGraph(0, 256, {3, 120, 127, 248, 7}, true);
         TestVerifyGraph(0, 2047, {256, 511, 2039, 257}, true);
+        // Multiple queries must keep separate causal lengths even when the
+        // shared cache contains all candidates, including after length rollback.
+        for (int rows : {2, 7, 8})
+            for (int capacity : {512, 1024})
+                TestVerifyGraph(0, capacity, {1, 255, capacity - rows, 63}, true, rows);
+
         for (int w : {8, 128})
             TestVerifyGraph(w, 256, {3, 120, 127, 128, 32768, 7}, true);
         for (bool fp8 : {false, true})
@@ -647,9 +735,16 @@ int main() {
                 TestVerifyGraph(0, 32776, {2048, 32768, 2049}, fp8, rows);
         for (int heads : {4, 12, 16})
             TestVerifyGraph(0, 4096, {2048, 4088, 2049}, true, 8, heads);
+        for (bool fp8 : {false, true})
+            for (int pattern : {1, 2})
+                for (int capacity : {4096, 32776})
+                    TestVerifyGraph(0, capacity, {2048, capacity - 8, 2050}, fp8, 8, 8, pattern);
         for (int dim : {32, 128, 256}) for (int rows : {2, 7, 8})
             for (bool shortAttention : {false, true})
                 TestDraftAttention(dim, rows, 1024, shortAttention);
+        TestDraftAttention(128, 7, 1024, false, 32, 4);
+        TestDraftAttention(128, 31, 1024, false, 32, 4);
+        TestRMSNormChunks();
         printf("DECODE GRAPH PASS checks=%d\n", checks);
         return 0;
     } catch (const std::exception &e) {

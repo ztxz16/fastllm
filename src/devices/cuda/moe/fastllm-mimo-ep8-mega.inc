@@ -70,7 +70,7 @@ std::shared_ptr<FastllmCudaMimoEp8Mega> FastllmCudaCreateMimoEp8Mega(
     // Dedicated control storage must survive attention/cuBLAS calls. Sharing
     // the old transient scratch would race remote dispatch writes against a
     // later rank's memset. Bound it; retain no duplicate/repacked FP8 weights.
-    AssertInFastLLM(bytes > 0 && bytes <= 96 * 1024 * 1024,
+    AssertInFastLLM(bytes > 0 && bytes <= 512 * 1024 * 1024,
                    "MiMo EP symmetric workspace exceeds its memory budget.");
     auto state = std::make_shared<FastllmCudaMimoEp8Mega>();
     state->devices = devices;
@@ -118,7 +118,8 @@ std::shared_ptr<FastllmCudaMimoEp8Mega> FastllmCudaCreateMimoEp8Mega(
             AssertInFastLLM(rank.layers[l] != nullptr, fastllm_ep8_mega_moe_error());
         }
         printf("MIMO_EP_MEGA ranks=%d gpu=%d experts=%d inter=2048 W8A8 workspace=%zu max_rows=%d Graph-ready backend=builtin\n",
-               (int)devices.size(), devices[r], (int)(256 / devices.size()), bytes, fastllm_ep8_mega_moe_max_rows());
+               (int)devices.size(), devices[r], (int)(256 / devices.size()), bytes,
+               fastllm_ep8_mega_moe_decode_capacity(4096, (int)devices.size()));
     }
     FastllmCudaSetDevice(previous);
     return state;
@@ -206,7 +207,8 @@ bool FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int rank, int laye
     output.Allocate(false);
     void *handle = state.ranks.at(rank)->layers.at(layer);
     AssertInFastLLM(handle != nullptr, "Missing MiMo EP layer handle.");
-    int capacity = fastllm_ep8_mega_moe_max_rows();
+    int capacity = total % ranks == 0 ? fastllm_ep8_mega_moe_decode_capacity(total, ranks)
+                                     : fastllm_ep8_mega_moe_max_rows();
     const void *prefillPeers[8]{};
     // Eligibility uses the common input shape so every rank participates even
     // when one local buffer is unavailable. Router FP32 input is dead here;
@@ -250,7 +252,7 @@ bool FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int rank, int laye
         const int32_t *idx = (const int32_t *)index.cudaData + routeStart * 8;
         const float *scores = (const float *)score.cudaData + routeStart * 8;
         const int ok = !prefillPeers[0] ?
-            fastllm_ep8_mega_moe_run_masked(handle, x, y, idx, scores, rows, liveKeys ? liveKeys + start : nullptr) :
+            fastllm_ep8_mega_moe_run_batched(handle, x, y, idx, scores, rows, capacity, liveKeys ? liveKeys + start : nullptr) :
             fastllm_ep8_mega_moe_run_prefill(handle, prefillPeers, x, y, idx, scores, rows);
         if (!ok)
             throw std::runtime_error(std::string("MiMo EP launch failed: ") + fastllm_ep8_mega_moe_error());
@@ -291,7 +293,7 @@ bool FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int rank, int laye
                 total * 4096, 4096, BFLOAT16, state.devices[rank]))
             return false;
         // Each rank has written its slice in-place. NCCL records the exchange
-        // on the same stream, retaining the existing 64-row MoE workspace.
+        // on the same stream, using the persistent bounded MoE workspace.
         AssertInFastLLM(FastllmNcclAllGather(
             (const uint16_t *)output.cudaData + (size_t)begin * 4096,
             output.cudaData, shard * 4096, BFLOAT16, state.devices[rank]),

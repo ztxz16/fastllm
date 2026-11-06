@@ -1877,47 +1877,14 @@ bool LaunchCustomArPairAdd(CustomArState &state,
     return true;
 }
 
-bool RunCustomArCandidate(void *data, void *dest, int count,
-                          int dataType, int deviceId,
-                          bool requireEnabledPath = false, int rowElements = 0,
-                          int hostSpinMicroseconds = 0) {
-    if (count <= 0 || rowElements < 0 || (rowElements && count % rowElements)) {
-        return false;
-    }
-    // The kernels access data/dest as 16-byte aligned packets; a misaligned or
-    // null view would fault on the device (cudaErrorMisalignedAddress, Xid
-    // 13).  Whether *this* rank's pointers are usable is local information and
-    // must not be decided here: a rank that returned early would leave its
-    // peers waiting in the rendezvous (or in the device barrier) forever.
-    // Record the flag and let the collective rendezvous below drop every rank
-    // to NCCL together.
-    const bool localEligible = data != nullptr && dest != nullptr &&
-        (((uintptr_t)data | (uintptr_t)dest) & 15u) == 0;
-    size_t typeBytes = CustomArTypeBytes(dataType);
-    size_t bytes = (size_t)count * typeBytes;
-    if (typeBytes == 0 || bytes == 0 || bytes > CustomArMaxBytes() ||
-        bytes % 16 != 0) {
-        return false;
-    }
-
-    CustomArState &state = GetCustomArState();
-    int rank = -1;
-    CustomArCallLease lease;
-    // Both custom kernels sum ranks 0..N-1 in FP32 and round once.
-    // Keep that arithmetic when a verification block crosses the automatic
-    // message-size threshold; otherwise switching to NCCL changes logits.
-    const size_t policyBytes = rowElements ? (size_t)rowElements * typeBytes : bytes;
-    if (policyBytes % 16 != 0) return false;
-    if (!lease.Acquire(state, policyBytes, dataType, deviceId,
-                       requireEnabledPath, rank)) {
-        return false;
-    }
-
-    CustomArRankData *rankData = nullptr;
-    if (!FindOrRegisterCustomArPointers(state, rank, data, count,
-                                        dataType, localEligible, rankData, hostSpinMicroseconds)) {
-        return false;
-    }
+// Registration/eligibility is complete before this function enqueues work.
+// Keep one-row and batched reductions on the same rank-ordered arithmetic.
+bool LaunchRegisteredCustomAr(CustomArState &state, CustomArRankData *rankData,
+                              void *data, void *dest, int count, int dataType,
+                              int deviceId, int rank, int rowElements) {
+    const size_t bytes = (size_t)count * CustomArTypeBytes(dataType);
+    const size_t policyBytes = rowElements
+        ? (size_t)rowElements * CustomArTypeBytes(dataType) : bytes;
     if ((dataType == fastllm::DataType::BFLOAT16 || dataType == fastllm::DataType::FLOAT32) &&
         state.taggedPeer && state.taggedPeer->CanUse(count)) {
         const bool launched = state.taggedPeer->Launch(
@@ -1981,6 +1948,51 @@ bool RunCustomArCandidate(void *data, void *dest, int count,
         }
     }
     return true;
+}
+
+bool RunCustomArCandidate(void *data, void *dest, int count,
+                          int dataType, int deviceId,
+                          bool requireEnabledPath = false, int rowElements = 0,
+                          int hostSpinMicroseconds = 0) {
+    if (count <= 0 || rowElements < 0 || (rowElements && count % rowElements)) {
+        return false;
+    }
+    // The kernels access data/dest as 16-byte aligned packets; a misaligned or
+    // null view would fault on the device (cudaErrorMisalignedAddress, Xid
+    // 13).  Whether *this* rank's pointers are usable is local information and
+    // must not be decided here: a rank that returned early would leave its
+    // peers waiting in the rendezvous (or in the device barrier) forever.
+    // Record the flag and let the collective rendezvous below drop every rank
+    // to NCCL together.
+    const bool localEligible = data != nullptr && dest != nullptr &&
+        (((uintptr_t)data | (uintptr_t)dest) & 15u) == 0;
+    size_t typeBytes = CustomArTypeBytes(dataType);
+    size_t bytes = (size_t)count * typeBytes;
+    if (typeBytes == 0 || bytes == 0 || bytes > CustomArMaxBytes() ||
+        bytes % 16 != 0) {
+        return false;
+    }
+
+    CustomArState &state = GetCustomArState();
+    int rank = -1;
+    CustomArCallLease lease;
+    // Both custom kernels sum ranks 0..N-1 in FP32 and round once.
+    // Keep that arithmetic when a verification block crosses the automatic
+    // message-size threshold; otherwise switching to NCCL changes logits.
+    const size_t policyBytes = rowElements ? (size_t)rowElements * typeBytes : bytes;
+    if (policyBytes % 16 != 0) return false;
+    if (!lease.Acquire(state, policyBytes, dataType, deviceId,
+                       requireEnabledPath, rank)) {
+        return false;
+    }
+
+    CustomArRankData *rankData = nullptr;
+    if (!FindOrRegisterCustomArPointers(state, rank, data, count,
+                                        dataType, localEligible, rankData, hostSpinMicroseconds)) {
+        return false;
+    }
+    return LaunchRegisteredCustomAr(state, rankData, data, dest, count,
+                                    dataType, deviceId, rank, rowElements);
 }
 
 bool RunCustomArPairAddCandidate(void *first, void *second, void *dest,
@@ -3022,8 +3034,47 @@ bool FastllmCudaCustomAllReduceWithSpin(void *data, void *dest, int count,
 
 bool FastllmCudaCustomAllReduceRows(void *data, void *dest, int count,
                                     int rowElements, int dataType, int deviceId) {
-    if (rowElements <= 0) return false;
-    return RunCustomArCandidate(data, dest, count, dataType, deviceId, true, rowElements);
+    if (count <= 0 || rowElements <= 0 || count % rowElements) return false;
+    const size_t typeBytes = CustomArTypeBytes(dataType);
+    const size_t bytes = (size_t)count * typeBytes;
+    if (bytes <= CustomArMaxBytes())
+        return RunCustomArCandidate(data, dest, count, dataType, deviceId, true, rowElements);
+    const size_t rowBytes = (size_t)rowElements * typeBytes;
+    if (!typeBytes || rowBytes > CustomArMaxBytes() || rowBytes % 16) return false;
+    const int chunkElements = (CustomArMaxBytes() / rowBytes) * rowElements;
+    CustomArState &state = GetCustomArState();
+    CustomArCallLease lease;
+    int rank = -1;
+    if (!lease.Acquire(state, rowBytes, dataType, deviceId, true, rank)) return false;
+    const bool eligible = data && dest &&
+        (((uintptr_t)data | (uintptr_t)dest) & 15u) == 0;
+    auto at = [typeBytes](void *pointer, int offset) -> void * {
+        return pointer ? (uint8_t *)pointer + (size_t)offset * typeBytes : nullptr;
+    };
+    // Register every chunk before launching any of them. A cold Graph tuple or
+    // one misaligned rank must reject the whole operation without modifying an
+    // in-place input that the caller may subsequently reduce through fallback.
+    std::vector<CustomArRankData *> pointers;
+    for (int offset = 0; offset < count;) {
+        const int size = std::min(chunkElements, count - offset);
+        CustomArRankData *registered = nullptr;
+        if (!FindOrRegisterCustomArPointers(state, rank, at(data, offset), size,
+                                            dataType, eligible, registered)) return false;
+        pointers.push_back(registered);
+        offset += size;
+    }
+    size_t chunk = 0;
+    for (int offset = 0; offset < count;) {
+        const int size = std::min(chunkElements, count - offset);
+        if (!LaunchRegisteredCustomAr(state, pointers[chunk++], at(data, offset),
+                at(dest, offset), size, dataType, deviceId, rank, rowElements)) {
+            // A CUDA launch error is not a recoverable eligibility miss: earlier
+            // chunks may already have written their reductions back in place.
+            throw std::runtime_error("chunked custom all-reduce launch failed");
+        }
+        offset += size;
+    }
+    return true;
 }
 
 bool FastllmCudaCustomAllReduceAddRMSNorm(void *data, void *residual,
@@ -3237,8 +3288,11 @@ bool FastllmCudaCustomAllGatherAddRMSNorm(void *data, void *residual,
         const float *weight, void *output, int count, int channels,
         float eps, int dataType, int deviceId) {
 #if defined(CUDART_VERSION) && CUDART_VERSION >= 12000
+    // This path reads the owner shards directly and writes the residual;
+    // unlike AllReduce it does not use the bounded in-place scratch buffer.
+    // Its collective grid is capped below and loops over larger row batches.
     if (dataType != fastllm::BFLOAT16 || channels != 4096 || count <= 0 ||
-        count % channels || (size_t)count * 2 > CustomArMaxBytes() ||
+        count % channels ||
         !std::isfinite(eps) || eps <= 0) return false;
     CustomArState &state = GetCustomArState();
     CustomArCallLease lease;

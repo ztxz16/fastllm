@@ -188,6 +188,7 @@ struct CacheOps : NaiveN05FlashModel {
     using NaiveN05FlashModel::CacheReserveCapacity;
 };
 static void TestCache() {
+    CacheOps model;
     for (auto dims : {std::pair<int,int>{1536,1024}, {8,16}, {200,56}, {7,13}}) {
         Data key(BFLOAT16), value(BFLOAT16);
         std::vector<uint16_t> refK, refV;
@@ -200,7 +201,7 @@ static void TestCache() {
             if (refK.size() > 127u * dims.first) refK.erase(refK.begin(), refK.end() - 127 * dims.first);
             if (refV.size() > 127u * dims.second) refV.erase(refV.begin(), refV.end() - 127 * dims.second);
             void *oldK = key.cudaData, *oldV = value.cudaData;
-            CacheOps::AppendCache(key,k); CacheOps::AppendCache(value,v);
+            model.AppendCache(key,k, BFLOAT16); model.AppendCache(value,v, BFLOAT16);
             if (step && n == 1) Require(key.cudaData == oldK && value.cudaData == oldV, "single-token append reallocated retained capacity");
             auto kd = key.expansionDims, vd = value.expansionDims;
             auto kp = key.cudaData, vp = value.cudaData;
@@ -217,8 +218,8 @@ static void TestCache() {
 // Cover overlapping moves, the tiled/serial boundary, and non-vector rows.
 static void TestCacheEdges() {
     for (auto dims : {std::pair<int, int>{1536, 1024}, {7, 13}, {8, 16}, {200, 56}, {512, 512}})
-    for (int keep : {0, 1, 127, 128, 129, 511, 1023}) for (int drop : {1, 7, 128, 513}) {
-        if (quick && (keep < 127 || keep > 129 || drop != 1)) continue;
+    for (int keep : {0, 1, 127, 128, 129, 511, 1023, 1024, 1025}) for (int drop : {1, 7, 128, 513}) {
+        if (quick && ((keep < 127 || (keep > 129 && keep < 1023)) || drop != 1)) continue;
         Data key(BFLOAT16), value(BFLOAT16);
         Upload(key, {1, keep + drop, dims.first}, 817);
         Upload(value, {1, keep + drop, dims.second}, 819);
@@ -272,7 +273,7 @@ static void TestCacheReservation() {
             const int rows = done < prompt ? std::min(512, prompt - done) : 1;
             Data current(BFLOAT16); Upload(current, {1, rows, width}, seed++);
             auto values = Read<uint16_t>(current);reference.insert(reference.end(), values.begin(), values.end());
-            CacheOps::AppendCache(cache, current, reserve);
+            model.AppendCache(cache, current, BFLOAT16, reserve);
             if (address) Require(cache.cudaData == address, "reserved global cache grew inside request horizon");
             address = cache.cudaData;done += rows;
             Require(cache.dims == std::vector<int>({1,done,width}), "physical reservation changed logical KV length");
@@ -288,10 +289,10 @@ static void TestCacheReservation() {
         Upload(prefix,{1,129,16},701);Upload(input,{1,257,16},702);
         auto reference=Read<uint16_t>(prefix), tail=Read<uint16_t>(input);
         reference.insert(reference.end(),tail.begin(),tail.end());
-        CacheOps::AppendCache(cache,prefix);
-        CacheOps::AppendCache(cache,input,1024);
+        model.AppendCache(cache,prefix, BFLOAT16);
+        model.AppendCache(cache,input, BFLOAT16,1024);
         auto address=cache.cudaData;
-        CacheOps::AppendCache(cache,input,0);
+        model.AppendCache(cache,input, BFLOAT16,0);
         reference.insert(reference.end(),tail.begin(),tail.end());
         Require(cache.cudaData==address && cache.dims[1]==643 && Read<uint16_t>(cache)==reference,
                 "restored-prefix reservation lost cache contents or shrank capacity");
@@ -306,7 +307,7 @@ static void TestCacheReservation() {
             int rows=step<3?512:step==3?471:1;
             Data k(BFLOAT16),v(BFLOAT16);Upload(k,{1,rows,1536},900+step);Upload(v,{1,rows,1024},1000+step);
             auto kr=Read<uint16_t>(k),vr=Read<uint16_t>(v);refK.insert(refK.end(),kr.begin(),kr.end());refV.insert(refV.end(),vr.begin(),vr.end());
-            CacheOps::AppendCache(key,k,127+rows);CacheOps::AppendCache(value,v,127+rows);
+            model.AppendCache(key,k, BFLOAT16,127+rows);model.AppendCache(value,v, BFLOAT16,127+rows);
             if(kp)Require(key.cudaData==kp && value.cudaData==vp,"sliding reservation reallocated between chunks");
             kp=key.cudaData;vp=value.cudaData;
             Require(key.expansionDims[1]==640 && value.expansionDims[1]==640,"sliding reservation grew to full context");
@@ -854,8 +855,9 @@ static void TestDecodeGraphs() {
         }
         cudaGraphExecDestroy(graph);
     }
-    for (auto dims : {std::pair<int, int>{1536, 1024}, {7, 13}}) {
-        constexpr int keep = 127, drop = 1;
+    for (auto dims : {std::pair<int, int>{1536, 1024}, {512, 512}, {7, 13}})
+    for (int keep : {127, 129, 1023, 1024, 1025}) {
+        constexpr int drop = 1;
         Data k(BFLOAT16), v(BFLOAT16);
         Upload(k, {1, keep + drop, dims.first}, 733);
         Upload(v, {1, keep + drop, dims.second}, 739);
