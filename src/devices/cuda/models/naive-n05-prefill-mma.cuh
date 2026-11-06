@@ -37,7 +37,7 @@ __device__ inline void Load(BF (*dst)[Pitch], int *selected, FastllmNaiveKV kv,
     for (int i = t; i < Tile * (Width / 8); i += Threads) {
         int key = selected[i / (Width / 8)], d = i % (Width / 8) * 8;
         naive_dsa_decode::Copy<true>(&dst[i / (Width / 8)][d],
-            FastllmNaiveKVRow(kv.base, kv.fp8) + ((size_t)max(0, key) * stride + kv.offset + head * Width + d), key >= 0);
+            kv.RowAtPhysicalIndex(max(0, key), stride) + head * Width + d, key >= 0);
     }
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     asm volatile("cp.async.commit_group;" ::: "memory");

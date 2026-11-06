@@ -362,6 +362,31 @@ void DSA(int batch, int length, bool sparse, int heads, bool withSink = false, b
         }
     }
 }
+void PrefillChunks() {
+    // Ordinary GPU KV reaches paged PV and gathered MMA directly; KVMem
+    // prefill stages BF16 and cannot detect a lost FP4 row/scale descriptor.
+    for (int heads : {8, 16}) for (int queries : {2, 32, 128, 512}) for (bool sparse : {false, true}) {
+        const int length = sparse ? 4097 : 707;
+        Cache k(length, 192, 811), v(length, 128, 821);
+        Data q(BFLOAT16), indices(INT32), a, b, sink;
+        Allocate(q, {1, queries, heads * 192});
+        Upload(q, Input(queries * heads * 192, 823));
+        if (sparse) {
+            Allocate(indices, {queries, 2048});
+            std::vector<int> selected(queries * 2048);
+            for (size_t i = 0; i < selected.size(); ++i)
+                selected[i] = i % 17 == 0 ? -1 : i % 29 == 0 ? length + 1 : int(i * 37 % length);
+            Cuda(cudaMemcpy(indices.cudaData, selected.data(), selected.size() * 4, cudaMemcpyHostToDevice));
+        }
+        FastllmCudaNaiveAttention(q, k.view, v.view, indices, sink, heads, 1, 192, 128,
+            length - queries, 0, a, true);
+        FastllmCudaNaiveAttention(q, k.dense, v.dense, indices, sink, heads, 1, 192, 128,
+            length - queries, 0, b, true);
+        Near(a, b);
+        Require(Read<uint16_t>(a) == Read<uint16_t>(b), "FP4 prefill chunk changed dequantized reference bits");
+    }
+    std::puts("FP4 PREFILL CHUNKS PASS");
+}
 void Prefill() {
     constexpr int length = 8192, queries = 2048, heads = 16;
     Cache k(length, 192, 701), v(length, 128, 709);
@@ -662,6 +687,7 @@ int main() {
         FastllmCudaSetDevice(0);
         LengthMetadata();
         ReadWrite();
+        PrefillChunks();
         Prefill();
         PrefixCopy();
         RopeGraph();

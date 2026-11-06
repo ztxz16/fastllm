@@ -189,8 +189,7 @@ struct FastllmNaiveKV {
         }
         return row;
     }
-    __device__ __forceinline__ FastllmNaiveKVRow Row(int row, int stride) const {
-        row = PhysicalRow(row);
+    __device__ __forceinline__ FastllmNaiveKVRow RowAtPhysicalIndex(int row, int stride) const {
         if (fp4) {
             // Naive sparse KV copies opaque rows, including their scales.
             // Each row is [stride/2 packed bytes][stride/16 E4M3 scales].
@@ -198,6 +197,9 @@ struct FastllmNaiveKV {
             return {packed, false, packed + stride / 2, offset};
         }
         return FastllmNaiveKVRow(base, fp8) + ((size_t)row * stride + offset);
+    }
+    __device__ __forceinline__ FastllmNaiveKVRow Row(int row, int stride) const {
+        return RowAtPhysicalIndex(PhysicalRow(row), stride);
     }
     __device__ __forceinline__ FastllmNaiveKVRow IndexRow(int row, int stride) const {
         auto start = Row(row, stride);

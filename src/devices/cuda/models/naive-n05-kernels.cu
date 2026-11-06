@@ -1739,7 +1739,7 @@ __device__ void AttentionValuesPrefillBody(const float *prob, FastllmNaiveKV v, 
             }
             if (valid) {
                 FastllmNaiveKVRow row;
-                if constexpr (Paged) row = FastllmNaiveKVRow(v.base, v.fp8) + (size_t)key * kvHeads * dim + v.offset;
+                if constexpr (Paged) row = v.RowAtPhysicalIndex(key, kvHeads * dim);
                 else row = v.Row(key, kvHeads * dim);
                 uint2 bits = (row + kvHead * dim + d).Load4();
                 unsigned words[2] = {bits.x, bits.y};
