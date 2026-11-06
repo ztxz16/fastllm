@@ -1,5 +1,6 @@
 #include "gguf.h"
 #include "executor.h"
+#include <climits>
 
 namespace fastllm {
     static std::vector<GGUFWeightReplaceRule> DeepSeekV41GGUFWeightRules(bool draft = false) {
@@ -25,6 +26,11 @@ namespace fastllm {
             add(R"(blk\.(\d+)\.engram_embd\.weight)", layer + "engram.embed.weight");
             add(R"(blk\.(\d+)\.engram_(q|k)\.weight)", layer + "engram.$2_weight", Rule::GGUFWeightReplaceForceFP32);
             add(R"(blk\.(\d+)\.engram_wkv\.weight)", layer + "engram.wkv.weight");
+            add(R"(blk\.(\d+)\.engram_kv\.weight)", layer + "engram.wkv.weight");
+            // The upstream layout stores q*k in FP32. A unit k parameter is
+            // installed after loading, preserving the existing CPU/TP/graph math.
+            add(R"(blk\.(\d+)\.engram_gate\.weight)", layer + "engram.q_weight", Rule::GGUFWeightReplaceForceFP32);
+            add(R"(per_layer_token_embd\.weight)", "engram_combined.weight");
         }
         add(R"(blk\.(\d+)\.(attn_norm|ffn_norm)\.weight)", layer + "$2.weight");
         add(R"(blk\.(\d+)\.(hc_(?:attn|ffn)_(?:base|fn|scale))\.weight)", layer + "$2");
@@ -53,6 +59,161 @@ namespace fastllm {
                 Rule::GGUFWeightReplacePacked);
         }
         return rules;
+    }
+
+    void LoadDeepSeekV41UpstreamGGUFConfig(basellm *model, const json11::Json &params) {
+        if (params["deepseek41.ple.layers"].is_null()) return;
+        const auto require = [](bool ok, const std::string &message) {
+            AssertInFastLLM(ok, "DeepSeek V4.1 upstream GGUF: " + message);
+        };
+        const auto alias = [&](const std::string &key, const std::string &source) {
+            const auto &value = params["deepseek41." + source];
+            require(!value.is_null(), "missing metadata " + source);
+            const std::string text = value.is_string() ? value.string_value() : value.dump();
+            const auto old = model->weight.dicts.find(key);
+            require(old == model->weight.dicts.end() || old->second == text,
+                    "conflicting metadata for " + key);
+            model->weight.AddDict(key, text);
+        };
+        for (const auto &pair : std::vector<std::pair<std::string, std::string>>{
+                 {"kv_source_layer_ids", "attention.kv_source_layers"},
+                 {"index_source_layer_ids", "attention.indexer.source_layers"},
+                 {"candidate_source_layer_id", "attention.indexer.candidate_source_layer"},
+                 {"candidate_topk_blocks", "attention.indexer.candidate_top_k_blocks"},
+                 {"candidate_block_size", "attention.indexer.candidate_block_size"},
+                 {"engram_layer_ids", "ple.layers"}, {"engram_max_ngram_size", "ple.ngram_size"},
+                 {"engram_n_heads", "ple.heads_per_ngram"},
+                 {"engram_head_dim", "embedding_length_per_layer_input"},
+                 {"engram_pad_token_id", "engram.pad_token_id"}}) alias(pair.first, pair.second);
+        require(params["deepseek41.expert_gating_func"].int_value() == 4,
+                "requires sqrtsoftplus expert gating");
+        model->weight.AddDict("scoring_func", "sqrtsoftplus");
+
+        const auto integers = [&](const std::string &key) {
+            const auto &array = params["deepseek41." + key];
+            require(array.is_array(), "missing integer array " + key);
+            std::vector<int64_t> result;
+            for (const auto &item : array.array_items()) {
+                // GGUF U64/I64 values use JsonLL. Do not round hash constants
+                // through number_value() or through a serialized double.
+                int64_t value = item.ll_value();
+                if (value == 0 && item.number_value() >= 0 && item.number_value() <= INT_MAX)
+                    value = item.int_value();
+                require(item.is_number() && value >= 0 && item.dump() == std::to_string(value),
+                        "invalid integer in " + key);
+                result.push_back(value);
+            }
+            return result;
+        };
+        const auto layers = integers("ple.layers");
+        const int ngram = params["deepseek41.ple.ngram_size"].int_value();
+        const int heads = params["deepseek41.ple.heads_per_ngram"].int_value();
+        require(!layers.empty() && ngram > 1 && heads > 0 && (int64_t)(ngram - 1) * heads <= INT_MAX,
+                "invalid PLE dimensions");
+        const size_t cols = (ngram - 1) * heads;
+        const auto primes = integers("ple.head_vocab_sizes");
+        auto offsets = integers("ple.head_offsets");
+        const auto multipliers = integers("ple.layer_multipliers");
+        const auto tokens = integers("engram.token_map");
+        require(primes.size() == layers.size() * cols && offsets.size() == primes.size() &&
+                multipliers.size() == layers.size() * ngram && !tokens.empty(), "incomplete Engram layout");
+        json11::Json::array rows;
+        int64_t total = 0;
+        for (size_t layer = 0; layer < layers.size(); ++layer) {
+            const int64_t base = total;
+            require(layers[layer] < params["deepseek41.block_count"].int_value() &&
+                    (layer == 0 || layers[layer] > layers[layer - 1]), "invalid PLE layer ids");
+            for (size_t j = layer * cols; j < (layer + 1) * cols; ++j) {
+                require(primes[j] > 0 && primes[j] <= INT_MAX && offsets[j] == total,
+                        "invalid PLE head ranges");
+                offsets[j] -= base; // Runtime lookup tables have layer-local rows.
+                total += primes[j];
+            }
+            require(total - base <= INT_MAX, "Engram layer exceeds supported row count");
+            rows.emplace_back((long long)(total - base));
+        }
+        for (auto value : multipliers) require(value > 0 && value % 2 == 1, "invalid Engram hash multiplier");
+        for (auto value : tokens) require(value < INT_MAX, "invalid Engram token map");
+        const int64_t vocab = *std::max_element(tokens.begin(), tokens.end()) + 1;
+        model->weight.AddDict("engram_num_embeddings", json11::Json(rows).dump());
+        model->weight.AddDict("engram_compressed_vocab_size", std::to_string(vocab));
+
+        const auto install = [&](const std::string &name, const std::vector<int64_t> &values, ggml_type kind) {
+            require(!model->weight.weight.count(name), "duplicate Engram constant " + name);
+            Data &data = model->weight[name];
+            data.dataType = DATA_GGUF_FORMAT;
+            data.isGGUFData = true;
+            data.ggmlType = kind;
+            data.dims = {(int)values.size()};
+            auto *tensor = new ggml_tensor();
+            data.ggmlTensor = tensor;
+            tensor->type = kind;
+            tensor->dims = data.dims;
+            tensor->ne[0] = values.size();
+            tensor->nb[0] = kind == GGML_TYPE_I32 ? sizeof(int32_t) : sizeof(int64_t);
+            for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+                tensor->ne[i] = 1;
+                tensor->nb[i] = tensor->nb[0] * values.size();
+            }
+            data.expansionBytes = ggml_nbytes(tensor);
+            data.cpuData = new uint8_t[data.expansionBytes];
+            if (kind == GGML_TYPE_I32) {
+                for (size_t i = 0; i < values.size(); ++i) ((int32_t*)data.cpuData)[i] = (int32_t)values[i];
+            } else memcpy(data.cpuData, values.data(), data.expansionBytes);
+        };
+        install("engram_token_map.weight", tokens, GGML_TYPE_I32);
+        install("engram_primes.weight", primes, GGML_TYPE_I64);
+        install("engram_offsets.weight", offsets, GGML_TYPE_I64);
+        install("engram_multipliers.weight", multipliers, GGML_TYPE_I64);
+    }
+
+    void PrepareDeepSeekV41UpstreamGGUFTasks(basellm *model, const json11::Json &params,
+                                            std::vector<ReadGGUFTask> &tasks) {
+        if (params["deepseek41.ple.layers"].is_null()) return;
+        const auto &layers = params["deepseek41.ple.layers"].array_items();
+        const auto &sizes = params["deepseek41.ple.head_vocab_sizes"].array_items();
+        const size_t cols = sizes.size() / layers.size(); // Validated by config import.
+        for (const auto &layer : layers) {
+            const std::string prefix = "layers." + std::to_string(layer.int_value()) + ".engram.";
+            int gates = 0;
+            for (const auto &task : tasks) {
+                AssertInFastLLM(task.name != prefix + "k_weight",
+                    "DeepSeek V4.1 upstream GGUF: mixed legacy and fused Engram gates.");
+                if (task.name == prefix + "q_weight") {
+                    AssertInFastLLM(task.tensor.name == "blk." + std::to_string(layer.int_value()) + ".engram_gate.weight",
+                        "DeepSeek V4.1 upstream GGUF: missing fused Engram gate.");
+                    ++gates;
+                }
+            }
+            AssertInFastLLM(gates == 1, "DeepSeek V4.1 upstream GGUF: missing or duplicate fused Engram gate.");
+        }
+        std::vector<ReadGGUFTask> normalized;
+        bool found = false;
+        for (const auto &task : tasks) {
+            if (task.name != "engram_combined.weight") { normalized.push_back(task); continue; }
+            AssertInFastLLM(!found && task.tensor.type == GGML_TYPE_IQ4_NL && task.tensor.dims.size() == 2 &&
+                task.tensor.ne[0] == params["deepseek41.embedding_length_per_layer_input"].int_value(),
+                "DeepSeek V4.1 upstream GGUF: invalid combined Engram table.");
+            found = true;
+            int64_t row = 0;
+            for (size_t i = 0; i < layers.size(); ++i) {
+                int64_t count = 0;
+                for (size_t j = i * cols; j < (i + 1) * cols; ++j) count += sizes[j].int_value();
+                auto part = task;
+                part.name = "layers." + std::to_string(layers[i].int_value()) + ".engram.embed.weight";
+                part.tensor.dims[0] = (int)count;
+                part.tensor.ne[1] = count;
+                for (int d = 2; d < GGML_MAX_DIMS; ++d)
+                    part.tensor.nb[d] = part.tensor.nb[1] * count;
+                part.offset += row * task.tensor.nb[1];
+                row += count;
+                normalized.push_back(part);
+                model->ngramWeights.insert(part.name);
+            }
+            AssertInFastLLM(row == task.tensor.ne[1], "DeepSeek V4.1 upstream GGUF: Engram table row mismatch.");
+        }
+        AssertInFastLLM(found, "DeepSeek V4.1 upstream GGUF: missing combined Engram table (last shard).");
+        tasks.swap(normalized);
     }
 
     static std::vector<GGUFWeightReplaceRule> DeepSeekV41VisionGGUFWeightRules() {

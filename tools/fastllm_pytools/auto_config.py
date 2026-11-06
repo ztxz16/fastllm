@@ -258,7 +258,8 @@ def latency_score(candidate, model, costs, args, mode, mapping, hardware, peers)
     chunk = candidate["chunked_prefill_size"]
     active_params = model.layers * 3 * model.hidden * model.intermediate * max(model.topk, args.moe_experts)
     prefill = prompt * (2 * active_params + sum(dense) + common) / compute
-    prefill += max(0, host - covered) * math.ceil(prompt / chunk) / (link + cpu_bandwidth)
+    prefill_covered = max(0, covered - candidate.get("prefill_workspace_loan_bytes", 0))
+    prefill += max(0, host - prefill_covered) * math.ceil(prompt / chunk) / (link + cpu_bandwidth)
     prefill += math.ceil(prompt / chunk) * model.layers * 50e-6
     # Long single-request decode dominates this interactive default. Explicit
     # concurrency adds value to TP's parallel compute; it never changes capacity.
@@ -277,7 +278,7 @@ def _deepseek_priority(candidate, model, backend=None):
     # solver accounts for route skew, pinned staging and the full context.
     streamed_disk = ((backend or candidate.get("moe_device")) == "disk" and
                      model.disk_prefill.get("streamed_mmq", False) and
-                     32 < chunk <= 4096 and
+                     chunk > 32 and
                      candidate.get("expert_transport_bytes_per_device", 0) > 0)
     # Once these targets are met, compare predicted latency. An unbounded
     # chunk preference otherwise discards a faster fully resident GPU plan
@@ -490,7 +491,98 @@ def _resolve_dense_qwen35(args, base, explicit, metadata, tensors, model, info, 
     return result
 
 
+def standard_moe_calibration_pair(tensors, model):
+    """Select an actual Gate/Up + Down format pair; never pad model dimensions."""
+    by_name = {t.name: t for t in tensors}
+    pairs = {}
+    supported = {2, 6, 8, 10, 11, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22, 23, 29, 42}
+    for gate in tensors:
+        if gate.name.endswith('.ffn_gate_exps.weight'):
+            prefix = gate.name[:-len('ffn_gate_exps.weight')]
+            up = by_name.get(prefix + 'ffn_up_exps.weight')
+            down = by_name.get(prefix + 'ffn_down_exps.weight')
+            if not up or not down or up.kind != gate.kind or not gate.kind.startswith('gguf:') or not down.kind.startswith('gguf:'):
+                continue
+            pair = (int(gate.kind[5:]), int(down.kind[5:]))
+            if not all(k in supported for k in pair):
+                continue
+            if (gate.shape[-1] != model.hidden or down.shape[-1] != model.intermediate or
+                    up.shape != gate.shape):
+                continue
+            pairs[pair] = pairs.get(pair, 0) + gate.bytes + up.bytes + down.bytes
+    if pairs:
+        return max(pairs, key=pairs.get)
+    # Native NVFP4 E4M3 has a separate host arithmetic/packing adapter.
+    nvfp4 = set()
+    for weight in tensors:
+        if (weight.kind not in ('U8', 'I8') or not weight.name.endswith('.weight') or
+                not memory._is_routed_expert(weight.name) or len(weight.shape) < 2):
+            continue
+        prefix = weight.name[:-len('.weight')]
+        scale = next((by_name[n] for n in (weight.name + '_scale_inv', weight.name + '_scale',
+                     prefix + '.scale_inv', prefix + '.scale') if n in by_name), None)
+        if (scale and scale.kind == 'F8_E4M3' and len(scale.shape) == len(weight.shape) and
+                scale.shape[:-1] == weight.shape[:-1] and scale.shape[-1] * 8 == weight.shape[-1]):
+            nvfp4.add(weight.shape[-1] * 2)
+    return (-1, -1) if {model.hidden, model.intermediate} <= nvfp4 else None
+
+
+_QWEN_HYBRID_ENV = (
+    "FASTLLM_QWEN38_HYBRID_GRAPH", "FASTLLM_QWEN38_PREFILL_DEQUANT",
+    "FASTLLM_QWEN38_PREFILL_ARENA", "FASTLLM_QWEN4_VISION_DEVICE",
+    "FASTLLM_QWEN38_PREFILL_REUSE", "FASTLLM_QWEN38_OWNED_PP", "FASTLLM_QWEN38_REMOTE_GRAPH",
+)
+_AUTO_QWEN_ENV_APPLIED = {}
+
+
+def _qwen_hybrid_defaults(args, model, tensors, hardware, numa):
+    # Restrict automatic dispatch to the model shape and one/two-GPU SM75
+    # configuration measured by the hybrid regression suite. Other backends
+    # retain their existing policies; explicit environment values always win.
+    if (not numa or len(hardware) not in (1, 2) or
+            any(device.get("capability") != 75 for device in hardware.values()) or
+            (model.family, model.layers, model.hidden, model.intermediate,
+             model.experts, model.topk) != ("qwen4", 48, 2560, 640, 512, 10) or
+            args.moe_device in ("cpu", "disk")):
+        return {}
+    gguf = any(t.kind.startswith("gguf:") and memory._is_routed_expert(t.name)
+               for t in tensors)
+    defaults = {"FASTLLM_QWEN38_HYBRID_GRAPH": "1"}
+    if len(hardware) == 2:
+        defaults.update(FASTLLM_QWEN38_OWNED_PP="1", FASTLLM_QWEN38_REMOTE_GRAPH="1")
+    if (getattr(args, "vision_device", None) is None and
+            any(t.name.startswith("model.visual.") for t in tensors)):
+        defaults["FASTLLM_QWEN4_VISION_DEVICE"] = "cpu"
+    if memory._qwen_q8_rules(args):
+        defaults["FASTLLM_QWEN38_PREFILL_DEQUANT"] = "1"
+    if gguf:
+        defaults["FASTLLM_QWEN38_PREFILL_DEQUANT"] = "1"
+    return defaults
+
+
 def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
+    # Capacity planning reads the same dispatch switches as execution. Roll
+    # back automatic switches if planning fails, so retrying another model
+    # cannot inherit an incomplete configuration.
+    previous = {key: os.environ.get(key) for key in _QWEN_HYBRID_ENV}
+    owned = dict(_AUTO_QWEN_ENV_APPLIED)
+    for key, value in owned.items():
+        if os.environ.get(key) == value:
+            os.environ.pop(key)
+    _AUTO_QWEN_ENV_APPLIED.clear()
+    try:
+        return _resolve_impl(args, query_gpu, hardware=hardware, ram=ram, use_numa=use_numa)
+    except BaseException:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        _AUTO_QWEN_ENV_APPLIED.update(owned)
+        raise
+
+
+def _resolve_impl(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
     """Resolve one --auto invocation transactionally, before model allocation."""
     config_path = Path(args.path) / "config.json"
     if config_path.is_file():
@@ -520,6 +612,15 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
         raise ValueError("--auto requires positive CPU threads")
     metadata, tensors, model = memory.model_inputs(base)
     apply_model_defaults(base, metadata)
+    if hardware is None:
+        hardware = cuda_hardware()
+    info, peers = hardware
+    numa = env.use_numas if use_numa is None else use_numa
+    hybrid_defaults = _qwen_hybrid_defaults(base, model, tensors, info, numa)
+    for key, value in hybrid_defaults.items():
+        if key not in os.environ:
+            os.environ[key] = value
+            _AUTO_QWEN_ENV_APPLIED[key] = value
     if (("threads" not in explicit or args.threads == -1) and
             "FT_THREADS" not in os.environ and "FASTLLM_NUMA_THREADS" not in os.environ and
             model.hidden >= 1024 and model.intermediate >= 256):
@@ -529,13 +630,21 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
             if memory._is_routed_expert(tensor.name):
                 kinds[tensor.kind] = kinds.get(tensor.kind, 0) + tensor.bytes
         dominant = max(kinds, key=kinds.get, default="")
-        numa_calibration = (model.family == "deepseek_v41" and
-                            (env.use_numas if use_numa is None else use_numa) and
-                            base.moe_device not in ("cpu", "disk") and
+        use_numa_calibration = ((env.use_numas if use_numa is None else use_numa) and
+                                base.moe_device not in ("cpu", "disk"))
+        numa_calibration = (use_numa_calibration and model.family == "deepseek_v41" and
                             dominant in ("gguf:12", "gguf:16", "gguf:17", "gguf:29"))
-        kind = int(dominant[5:]) if numa_calibration else (16 if 'gguf:16' in kinds else 12)
+        # Standard calibration uses the actual quantization pair and exact
+        # matrix dimensions. The scoped Qwen policy enables it before this
+        # selection; a generic padded Q4_K GEMV undersizes the hybrid pool.
+        # Other model/hardware policies retain their original calibration.
+        pair = (standard_moe_calibration_pair(tensors, model)
+                if use_numa_calibration and hybrid_defaults else None)
+        kind = pair[0] if pair else int(dominant[5:]) if numa_calibration else (16 if 'gguf:16' in kinds else 12)
         workload = ({"numa": True, "rows": max(1, base.max_batch) * (max(base.mtp, base.dspark) + 1),
-                     "topk": model.topk} if numa_calibration else {})
+                     "topk": model.topk} if numa_calibration or pair else {})
+        if pair:
+            workload['down_type'] = pair[1]
         base.threads, base._cpu_thread_benchmark = select_threads(
             model.hidden, model.intermediate, kind, base.threads, **workload)
     # Dense Qwen3's graph warmup currently hits stream-capture-unsupported
@@ -548,6 +657,11 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
             any(t.kind.startswith("gguf:") and memory._is_routed_expert(t.name) for t in tensors)):
         # Thousands of standalone GGUF expert allocations waste CUDA pages.
         # Reuse the existing persistent weight slabs; explicit zero still wins.
+        base.cuda_slab = 64
+    if hybrid_defaults and "cuda_slab" not in explicit:
+        # Native Qwen also retains 1,024 BF16 draft expert allocations.
+        # Use the shared weight allocator before capacity planning, just as
+        # GGUF does; explicit zero remains an opt-out with page overhead.
         base.cuda_slab = 64
     if base.max_batch <= 0:
         base.max_batch = 1
@@ -565,12 +679,26 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
     # Re-evaluate geometry with the selected defaults (explicit precisions win).
     kv_dtype = base.atype if base.kv_cache_dtype == "auto" and base.atype != "auto" else base.kv_cache_dtype
     model = memory.geometry(metadata, kv_dtype, base.mtp, base.dspark)
-    if hardware is None:
-        hardware = cuda_hardware()
-    info, peers = hardware
     gpu = {d: dict(query_gpu(d), capability=info[d].get("capability", 0)) for d in info}
+    # Release phase scratch only in the bounded single-NUMA, single-request
+    # configuration covered by long-context regressions. Larger devices and
+    # concurrent serving retain their previous workspace lifetime policy.
+    if (hybrid_defaults and base.max_batch == 1 and len(gpu) == 1 and
+            next(iter(gpu.values()))["total"] <= 24 * memory.GiB):
+        for key in ("FASTLLM_QWEN38_PREFILL_REUSE",):
+            hybrid_defaults[key] = "1"
+            if key not in os.environ:
+                os.environ[key] = "1"
+                _AUTO_QWEN_ENV_APPLIED[key] = "1"
+    if (hybrid_defaults and base.max_batch == 1 and len(gpu) == 1 and
+            getattr(base, "dtype_config", "") and
+            next(iter(gpu.values()))["total"] <= 24 * memory.GiB):
+        key = "FASTLLM_QWEN38_PREFILL_ARENA"
+        hybrid_defaults[key] = "1"
+        if key not in os.environ:
+            os.environ[key] = "1"
+            _AUTO_QWEN_ENV_APPLIED[key] = "1"
     ram = ram if ram is not None else memory.host_memory()
-    numa = env.use_numas if use_numa is None else use_numa
     base._host_moe_shared = numa
     if model.family == "qwen35":
         return _resolve_dense_qwen35(args, base, explicit, metadata, tensors, model,
@@ -580,6 +708,10 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
         backends.insert(1, "cpu")
     if "moe_device" in explicit and base.moe_device:
         backends = [base.moe_device]
+    elif getattr(base, "draft_gpu_resident", None) == 1:
+        # Disk experts use a separate cache allocator. Do not replace the
+        # useful host/GPU capacity error with an unsupported disk fallback.
+        backends = [backend for backend in backends if backend != "disk"]
     tables = [base.ngram_device] if "ngram_device" in explicit else ["cpu", "disk"]
     table_bytes = sum(t.bytes for t in tensors if memory.is_lookup_table(t.name))
     if "ngram_device" not in explicit and table_bytes > max(4 * memory.GiB, ram["total"] // 10):
@@ -643,8 +775,19 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
                             priority = (_deepseek_priority(p, model, backend) if model.family == "deepseek_v41"
                                         else (0, 0, 0))
                             return (priority, placement, -score, -p["host_estimated_bytes"], -p["resident_layers"])
+                        # Native embeddings are much larger than packed GGUF
+                        # embeddings. On a constrained hybrid GPU, CPU lookup
+                        # can preserve prefill capacity and enlarge the expert
+                        # cache without changing the table's representation.
+                        native_hybrid_embedding = (
+                            bool(hybrid_defaults) and
+                            mode == "pp" and len(mapping) == 1 and backend != "disk" and
+                            prepared.moe_cuda_cache == "auto" and
+                            any((t.name in ("token_embd.weight", "embed.weight") or
+                                 t.name.endswith("embed_tokens.weight")) and
+                                t.kind in ("F16", "BF16", "F32") for t in tensors))
                         variants = [prepared]
-                        if (model.family == "deepseek_v41" and
+                        if ((model.family == "deepseek_v41" or native_hybrid_embedding) and
                                 not prepared.low_gpu_mem and not {"cuda_embedding", "low_gpu_mem"} & explicit):
                             low = copy.copy(prepared)
                             low.low_gpu_mem, low.cuda_embedding = True, False
@@ -667,9 +810,44 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
                             planned.append((p, variant, low_preference))
                         if not planned:
                             raise ValueError(rejection)
+                        if native_hybrid_embedding and len(planned) > 1:
+                            normal = next((p for p, v, _ in planned if not v.low_gpu_mem), None)
+                            if normal is not None:
+                                # Only prefer CPU lookup under measured memory
+                                # pressure. Never shrink the prefill chunk, and
+                                # preserve explicit small-chunk configurations.
+                                def relieves_pressure(p):
+                                    if normal["resident_layers"] >= model.layers:
+                                        return False
+                                    chunk = normal["chunked_prefill_size"]
+                                    cache = normal["moe_cuda_cache"]
+                                    gain = p["moe_cuda_cache"] - cache
+                                    # A prefill loan is unavailable to expert
+                                    # lookup during the prompt. Do not spend the
+                                    # reclaimed cache on a GPU embedding while
+                                    # that phase remains under memory pressure.
+                                    prefill_cache = max(0, cache - normal.get("prefill_workspace_loan_bytes", 0))
+                                    # The independently selected dense-Q8 profile
+                                    # still benefits from CPU embedding at 22 GiB,
+                                    # even after quantization enlarged its cache.
+                                    if (hybrid_defaults and getattr(prepared, "dtype_config", "") and
+                                            prepared.max_batch == 1 and
+                                            next(iter(gpu.values()))["total"] <= 24 * memory.GiB):
+                                        if (chunk <= 4096 and prefill_cache < 8 * memory.GiB and
+                                                p["chunked_prefill_size"] >= chunk and gain >= memory.GiB):
+                                            return True
+                                    if prepared.mtp == 0:
+                                        return (chunk <= 4096 and prefill_cache < 4 * memory.GiB and
+                                                p["chunked_prefill_size"] >= chunk and gain >= memory.GiB)
+                                    return (chunk <= 2048 and prefill_cache < memory.GiB and
+                                            ((p["chunked_prefill_size"] >= 2 * chunk and gain >= 0) or
+                                             (chunk >= 1024 and p["chunked_prefill_size"] >= chunk and
+                                              gain >= memory.GiB // 2)))
+                                planned = [item for item in planned if not item[1].low_gpu_mem or
+                                           relieves_pressure(item[0])]
                         result, prepared, _ = max(planned, key=lambda item: (
                             rank(item[0])[0], item[2], rank(item[0])[1:]))
-                        if prepared.low_gpu_mem and model.family == "deepseek_v41":
+                        if prepared.low_gpu_mem and (model.family == "deepseek_v41" or native_hybrid_embedding):
                             result["low_gpu_mem"] = True
                             notes.append("Hybrid uses CPU embedding to leave GPU memory for prefill and experts")
                     except ValueError as error:
@@ -749,7 +927,7 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
                "atype", "kv_cache_dtype", "max_context_length", "tokens", "max_batch", "kvmem",
                "low_gpu_mem", "cuda_embedding", "cache_history", "prefix_cache",
                "dspark", "speculative_algorithm", "fast_prefill", "gpu_mem_ratio")
-    if model.family == "deepseek_v41":
+    if model.family == "deepseek_v41" or hybrid_defaults:
         changed += ("cuda_slab",)
         result["cuda_slab"] = chosen.cuda_slab
     result["automatic"] = {"policy": "interactive-4k-input-512-output", "topology_candidates": len(choices),
@@ -760,6 +938,9 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
             "then predicted latency; automatic topology uses single GPU or PP; "
             "TP requires explicit opt-in; estimated latency"
         )
+    if hybrid_defaults:
+        result["automatic"]["hybrid_optimizations"] = {
+            key: os.environ[key] for key in hybrid_defaults}
     result["automatic"]["kv_streaming"] = "kvmem" in result
     result["automatic"]["cuda_graph"] = graph_enabled
     result["automatic"]["dspark"] = chosen.dspark

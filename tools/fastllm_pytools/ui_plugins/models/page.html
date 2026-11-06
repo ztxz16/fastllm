@@ -61,6 +61,10 @@
                 </div>
                 <section class="model-selection-section" aria-labelledby="model-selection-title">
                   <div class="setup-section-heading"><span aria-hidden="true">01</span><h3 id="model-selection-title">文件选择</h3></div>
+                  <label class="field"><span>模型类型 / 后端</span><select data-field="backend" id="model-backend">
+                    <option value="llm">LLM · FastLLM</option>
+                    <option value="minimax_h3">视频 · MiniMax H3 / Pika H3</option>
+                  </select></label>
                   <div class="field model-path-field">
                     <label class="visually-hidden" for="model-path">模型路径</label>
                     <div class="path-input-with-button">
@@ -68,6 +72,13 @@
                       <button id="choose-model-folder" class="folder-picker-button" type="button"><span class="folder-button-icon" aria-hidden="true"></span>浏览文件或文件夹</button>
                     </div>
                     <small>选择运行 Launcher 的机器上的模型文件夹、GGUF 或 FastLLM 模型文件。</small>
+                  </div>
+                  <div id="video-backend-fields" class="form-grid two-columns hidden">
+                    <label class="field"><span>H3 服务可执行文件</span><input data-field="server_binary" data-path-input type="text" placeholder="/path/to/minimax_h3_server"><small>留空时从 PATH、FTLLM_H3_SERVER 或源码 build 目录查找。</small></label>
+                    <label class="field"><span>MiniMax H3 基座目录（Pika 可选）</span><input data-field="base_model" data-path-input type="text" placeholder="/path/to/MiniMax-H3"><small>自动识别 Pika；基座放在相邻 MiniMax-H3 目录时可留空。</small></label>
+                    <label class="field span-2"><span>视频输出目录（可选）</span><input data-field="output_dir" data-path-input type="text" placeholder="~/.local/share/fastllm/videos/端口"></label>
+                    <label class="field span-2"><span>每卡显存预算（GiB，可选）</span><input data-field="video_gpu_memory_limit" type="number" min="0" step="any" placeholder="0"><small>留空或 0 保留原有速度；预算充足时权重驻留，较小时逐层加载。启动时预留显存。</small></label>
+                    <label class="field span-2"><span>主机内存预算（GiB，可选）</span><input data-field="video_host_memory_limit" type="number" min="0" step="any" placeholder="0"><small>留空或 0 使用默认缓存；2 表示从磁盘分块读取，较大预算用于缓存权重。另需为系统和媒体处理留出内存。</small></label>
                   </div>
                 </section>
 
@@ -97,6 +108,11 @@
                       <span>服务端口 <b>*</b></span>
                       <input data-field="port" type="number" min="1" max="65535" inputmode="numeric">
                     </label>
+                    <label class="field span-2"><span>限制可用 GPU（可选）</span>
+                      <input data-field="visible_gpus" type="text" placeholder="例如 0 或 1,2，支持 GPU UUID" spellcheck="false">
+                      <small>填写 Launcher 可见的卡号或 UUID，以逗号分隔。模型内部重新编号为 0、1…；视频使用所选全部卡进行并行推理。留空时继承可见范围，视频默认使用第 0 张卡。</small>
+                    </label>
+                    <div id="gpu-choices" class="gpu-choices span-2" role="group" aria-label="可用 GPU"></div>
                     <label class="field" data-inference-setting>
                       <span>KV Cache 类型</span>
                       <select data-field="kv_cache_dtype">

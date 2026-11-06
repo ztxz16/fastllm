@@ -380,11 +380,11 @@ def _redacted_command(
 ) -> str:
     safe_argv = list(argv)
     for index, value in enumerate(safe_argv):
-        if value == "--api_key":
+        if value in ("--api_key", "--api-key"):
             if index + 1 < len(safe_argv):
                 safe_argv[index + 1] = "••••••••"
-        elif value.startswith("--api_key="):
-            safe_argv[index] = "--api_key=••••••••"
+        elif value.startswith(("--api_key=", "--api-key=")):
+            safe_argv[index] = value.split("=", 1)[0] + "=••••••••"
     environment = []
     for name, value in environment_overrides.items():
         shown = "••••••••" if SENSITIVE_ENV_PATTERN.search(name) else value
@@ -500,6 +500,7 @@ class LauncherRuntime:
         self._last_progress_stage = ""
         self._shutdown_callback = None
         self._agent_installer = AgentRuntimeInstaller(self._enable_installed_agent)
+        self.media_services = None
 
     def _plugin_enabled_changed(self, plugin_id):
         if plugin_id in {"harness", "opencode", "codex", "claude"}:
@@ -543,7 +544,7 @@ class LauncherRuntime:
     def embedded_webui(self, session_id: str, launcher_host: str):
         """Reuse the standalone WebUI with an immutable active-service client."""
         with self._lock:
-            if (self._state["command"] != "server" or not self._state["ready"]
+            if (self._state.get("kind", "llm") != "llm" or self._state["command"] != "server" or not self._state["ready"]
                     or self._state["phase"] != "running" or self._process is None
                     or self._process.poll() is not None):
                 raise LauncherError("Start an API Server before opening WebUI.")
@@ -561,6 +562,7 @@ class LauncherRuntime:
             args.agent_runtime = "auto"
             args.embedded = True
             args.ui_plugin_registry = self.plugins
+            args.media_services = self.media_services
             args.allow_remote_workspace_agent = self._allow_remote_workspace_agent
             args.disable_workspace_agent = self._disable_workspace_agent
             if self._agent_workspace_root:
@@ -582,7 +584,10 @@ class LauncherRuntime:
                     or self._state["phase"] != "running" or self._process is None
                     or self._process.poll() is not None):
                 raise LauncherError("Start an API Server before viewing API information.")
-            return {"sessionId": self._state["sessionId"],
+            from .service_backends import BACKENDS
+            backend = BACKENDS[self._state.get("backend", "llm")]
+            contract = backend.api_contract(self._state) if backend.kind != "llm" else {}
+            return {**contract, "sessionId": self._state["sessionId"],
                     "baseUrl": self._state["endpoint"].rstrip("/") + "/v1",
                     "model": self._state["modelName"], "apiKey": self._service_api_key}
 
@@ -594,6 +599,8 @@ class LauncherRuntime:
         with self._lock:
             if not self.plugins.get(agent_id)["enabled"]:
                 raise LauncherError(f"{name} is disabled. Enable it in Customize interface first.")
+            if self._state.get("kind", "llm") != "llm":
+                raise LauncherError(f"Select an LLM service before opening {name}.")
             if (self._state["command"] != "server" or not self._state["ready"]
                     or self._state["phase"] != "running" or self._process is None
                     or self._process.poll() is not None):
@@ -952,16 +959,18 @@ class LauncherRuntime:
 
     def start(self, payload: Any) -> Dict[str, Any]:
         config = _coerce_config(payload)
+        from .service_backends import get_backend
         errors = validate_config(config)
         if errors:
             raise LauncherError("\n".join(errors))
+        backend = get_backend(config)
         port_host = (
             "127.0.0.1" if config.command == "webui" else config.host.strip()
         )
         argv = build_fastllm_argv(config)
         api_key = config.api_key.strip()
         for index, value in enumerate(argv):
-            if value == "--api_key" and index + 1 < len(argv):
+            if value in ("--api_key", "--api-key") and index + 1 < len(argv):
                 api_key = argv[index + 1]
             elif value.startswith("--api_key="):
                 api_key = value.split("=", 1)[1]
@@ -970,7 +979,7 @@ class LauncherRuntime:
         display_command = _redacted_command(argv, environment_overrides)
         endpoint = _display_endpoint(config)
         argv = list(argv)
-        if config.command == "server" and "--startup-progress" not in argv:
+        if backend.kind == "llm" and config.command == "server" and "--startup-progress" not in argv:
             argv.extend(["--startup-progress", "ndjson"])
         if argv[0] == "ftllm":
             argv = [sys.executable, "-m", f"{__package__}.cli"] + argv[1:]
@@ -1000,6 +1009,10 @@ class LauncherRuntime:
             self._state.update({
                 "phase": "starting",
                 "command": config.command,
+                "backend": backend.id,
+                "kind": backend.kind,
+                "capabilities": list(backend.capabilities),
+                "visibleGpus": config.visible_gpus,
                 "pid": None,
                 "ready": False,
                 "model": os.path.expanduser(config.model.strip()),
@@ -1180,6 +1193,10 @@ class LauncherRuntime:
         if api_key and command == "server":
             headers["Authorization"] = f"Bearer {api_key}"
         path = "/v1/models" if command == "server" else "/_stcore/health"
+        from .service_backends import BACKENDS
+        backend = BACKENDS[self._state.get("backend", "llm")]
+        if backend.kind != "llm":
+            path = backend.health_path
         url = endpoint.rstrip("/") + path
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         while process.poll() is None:
@@ -2036,7 +2053,8 @@ def create_launcher_app(
         if request.url.path.startswith("/api/"):
             content_length = request.headers.get("content-length", "0")
             try:
-                if int(content_length or "0") > REQUEST_BODY_LIMIT:
+                limit = 32 * 1024 * 1024 if request.url.path.startswith("/api/media/") else REQUEST_BODY_LIMIT
+                if int(content_length or "0") > limit:
                     return JSONResponse(
                         {"error": "Request body is too large."}, status_code=413
                     )
@@ -2204,10 +2222,26 @@ def create_launcher_app(
         model_path = str(payload.get("model") or "")[:4096]
         name = str(payload.get("name") or "")[:512]
         config_mode = str(payload.get("config_mode") or "custom")
+        hardware = None
+        if payload.get("visible_gpus"):
+            from .service_backends import visible_gpu_environment
+            try:
+                visible_gpu_environment(str(payload["visible_gpus"]))
+                hardware = await run_in_threadpool(detect_hardware, model_path)
+                selected = []
+                for identifier in str(payload["visible_gpus"]).split(","):
+                    matches = [gpu for gpu in hardware["gpus"] if str(gpu["index"]) == identifier.strip()
+                               or gpu.get("uuid") == identifier.strip()]
+                    if len(matches) != 1 or matches[0] in selected:
+                        raise ValueError("所选 GPU 不存在或重复。")
+                    selected.append(matches[0])
+                hardware["gpus"] = [dict(gpu, index=str(index)) for index, gpu in enumerate(selected)]
+            except ValueError as error:
+                raise LauncherError(str(error)) from error
         return await run_in_threadpool(
             recommend_launch_config,
             model_path,
-            None,
+            hardware,
             name,
             config_mode,
             payload.get("enable_speculative_decoding") is True,
@@ -2263,6 +2297,10 @@ def create_launcher_app(
         await webui_app(scope, receive, send)
 
     app.mount("/webui/{session_id}", embedded_webui, name="embedded-webui")
+
+    from .launcher_services import LauncherServicePool, install_service_routes
+    if isinstance(runtime, LauncherServicePool):
+        install_service_routes(app, runtime)
 
     @app.post("/api/download/preview")
     async def preview_download(request: Request):
@@ -2536,6 +2574,8 @@ def fastllm_launcher(args) -> int:
         disable_workspace_agent=bool(getattr(args, "disable_workspace_agent", False)),
         plugins_dir=getattr(args, "plugins_dir", ""),
     )
+    from .launcher_services import LauncherServicePool
+    runtime = LauncherServicePool(runtime)
     launcher_addresses = _launcher_access_addresses(host, port)
     try:
         app = create_launcher_app(runtime, control_token, launcher_addresses, launcher_host=host)

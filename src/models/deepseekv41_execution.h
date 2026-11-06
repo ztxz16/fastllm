@@ -24,6 +24,8 @@ namespace fastllm {
         Data attnPre, attnPost, attnComb, ffnPre, ffnPost, ffnComb;
         Data x, attnInput, qr, qNorm, q, kv, attnOut, woAOut, attnProj;
         Data attnInputFloat, rawKVAll, rawScoreAll, qIdxAll, idxWeights, idxWeightsAll;
+        // Resident FP32 and host BF16 outputs need distinct graph-stable storage.
+        Data residentFfnOut;
         Data ffnInput, ffnOut, gateInput, gateLogits, expertIndex, expertScore;
         Data sharedGateup, sharedSwiglu, sharedExpertOut;
         V41SharedExpertPartition sharedExpertPartition = V41SharedExpertPartition::Replicated;

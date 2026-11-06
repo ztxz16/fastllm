@@ -79,6 +79,31 @@ static void RunFp16AttentionRegression() {
         }
         std::cout << "attention heads="<<heads<<" rows="<<tokens<<" mode="<<mode<<" worst_l2="<<worstAttentionL2<<std::endl;
     }
+    // Short/non-divisible live lists leave some of the eight partitions
+    // empty. Exercise those graph paths without padding the index capacity.
+    for (int window : {1, 8, 9, 17})
+    for (int width : {1, 3, 7, 16, 64})
+    for (int position : {0, 7, 128}) {
+        Data q, kv, ring, cmp, indices, sink, actual, expected;
+        Fill(q, {1, 3, 17, 512}, 1); Fill(kv, {1, 3, 512}, 2);
+        Fill(ring, {1, window, 512}, 3); Fill(cmp, {1, 64, 512}, 4);
+        Fill(indices, {1, 3, width}, 5, INT32); Fill(sink, {17}, 6, FLOAT32);
+        std::vector<int> ids(3 * width);
+        for (size_t i = 0; i < ids.size(); ++i) ids[i] = i % 3 ? i % 64 : -1;
+        Cuda(cudaMemcpy(indices.cudaData, ids.data(), ids.size() * sizeof(int), cudaMemcpyHostToDevice));
+        auto run = [&](Data &out) {
+            Check(FastllmCudaDeepSeekV41SparseAttention(q, kv, &ring, &cmp, &indices,
+                sink, window, position, 1 / std::sqrt(512.f), out), "short FP16 attention");
+        };
+        setenv("FASTLLM_DSV41_FLASHINFER", "0", 1); run(expected);
+        setenv("FASTLLM_DSV41_FLASHINFER", "1", 1); run(actual);
+        AttentionEqual(actual, expected, "short attention eager");
+        AttentionGraph graph([&] { run(actual); });
+        Check(graph.UsesFp16(), "short FP16 Tensor Core kernel missing");
+        for (int replay = 0; replay < 3; ++replay) {
+            graph.Launch(); AttentionEqual(actual, expected, "short attention graph"); ++checks;
+        }
+    }
     // A BF16 value outside FP16's finite range must use the original math
     // within the captured graph, rather than becoming an infinity.
     Data q,kv,sink,actual,expected;

@@ -129,9 +129,14 @@ namespace fastllm {
         int acceptedDrafts = -1;      // 采样校验给出接受前缀长度；-1 表示按 greedy token 比较
     };
 
+    struct DeepSeekV41EngramPrefetch;
+
     struct DeepSeekV41RequestState {
         std::vector<DeepSeekV41LayerCache> layers;
         std::vector<int> engramHistory;   // 每个已处理 token 的压缩 id（图像 token 为 -1）
+        // Known text prompt only; never append speculative tokens to live history.
+        std::vector<int> engramPrompt;
+        std::shared_ptr<DeepSeekV41EngramPrefetch> engramPrefetch;
         int totalLen = 0;
         int restoredLen = 0;              // 由前缀缓存恢复的 token 数（0 表示全新请求）
         // 图文请求：由 OnResponseContextCreated / ForwardMultimodal 记录，首个 prefill 块编码为 imageSpans
@@ -420,7 +425,7 @@ namespace fastllm {
             const Data &positionIds, std::vector<std::pair<Data, Data>> &pastKeyValues,
             const GenerationConfig &generationConfig, const LastTokensManager &lastTokens,
             std::vector<float> *logits, int &outputToken);
-        struct EngramPrefetch;
+        using EngramPrefetch = DeepSeekV41EngramPrefetch;
         struct ForwardWorkspace;
         struct ForwardState;
         void PrepareForward(ForwardWorkspace &);
@@ -516,7 +521,7 @@ namespace fastllm {
         std::atomic<long long> v41DsparkVerifyRounds{0};
 
         void InitDsparkParams();
-        void ApplyDsparkDevice();
+        void ApplyDsparkDevice(bool targetComplete = false);
         void DsparkEmbedInput(const Data &inputIds, Data &hiddenStates);
         void DsparkProjectHead(Data &input, Data &output, bool persistent = false);
         bool DsparkPrepareQkv(int stage, const Data &input, Data &inputQuant,

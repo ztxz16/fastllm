@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import re
 import sys
 import subprocess
 import glob
@@ -162,11 +163,11 @@ def _is_nvidia_cuda_platform() -> bool:
             if device_class.startswith("0x03") and vendor == "0x10de":
                 has_nvidia_display_controller = True
         if accelerator_vendors:
-            # Server boards commonly expose an ASPEED or Matrox BMC as a VGA
-            # controller alongside the compute GPUs.  They are display-only
-            # management devices and must not make an NVIDIA host look mixed.
-            bmc_display_vendors = {"0x1a03", "0x102b"}
-            compute_vendors = accelerator_vendors - bmc_display_vendors
+            # Server boards and VMs may expose ASPEED, Matrox or Cirrus VGA
+            # alongside the compute GPUs. These display-only adapters must
+            # not make an NVIDIA host look mixed.
+            display_only_vendors = {"0x1a03", "0x102b", "0x1013"}
+            compute_vendors = accelerator_vendors - display_only_vendors
             return (has_nvidia_display_controller and
                     compute_vendors == {"0x10de"})
     except Exception:
@@ -573,6 +574,8 @@ def apply_image_embedding_cache_env(args):
 
 def apply_vision_device_env(args):
     device = getattr(args, "vision_device", None)
+    if device is not None:
+        os.environ["FASTLLM_QWEN4_VISION_DEVICE"] = _vision_device(device)
     if device is None:
         device = os.environ.get("FASTLLM_QWEN35_VISION_DEVICE", "auto")
     os.environ["FASTLLM_QWEN35_VISION_DEVICE"] = _vision_device(device)
@@ -857,6 +860,54 @@ def _configure_sm89_fp8_linear_triton(args) -> str:
     )
     return detected
 
+def _configure_sm120_mxfp4_grouped_triton(args, config) -> str:
+    """Select the measured single-GPU DSpark backend without enabling other ops."""
+    auto_env_name = "FASTLLM_CUDA_TRITON_MXFP4_GROUPED_AUTO"
+    # This flag belongs to model selection, not to the user's environment.
+    # Re-evaluate it when a process loads a subsequent model.
+    os.environ.pop(auto_env_name, None)
+    if (not getattr(args, "auto", False) or
+            not 1 <= getattr(args, "dspark", 0) <= 7 or
+            getattr(args, "max_batch", 0) != 1 or
+            _uses_thread_tp(getattr(args, "tp", "")) or
+            getattr(args, "moe_cuda_cache", 0) <= 0 or
+            str(getattr(args, "moe_device", "")).lower() not in ("cpu", "numa") or
+            str(getattr(args, "path", "")).lower().endswith(".gguf")):
+        return ""
+    if ("FASTLLM_CUDA_TRITON" in os.environ or
+            "FASTLLM_CUDA_TRITON_MXFP4_GROUPED" in os.environ):
+        return ""
+    text = config.get("text_config", config)
+    quant = config.get("quantization_config", {})
+    if not isinstance(text, dict) or not isinstance(quant, dict):
+        return ""
+    if (config.get("model_type") != "deepseek_v41" or
+            text.get("hidden_size") != 5120 or
+            text.get("moe_intermediate_size") != 2304 or
+            text.get("num_experts_per_tok") != 6 or
+            text.get("dspark_num_experts_per_tok") != 3 or
+            text.get("swiglu_limit") != 10.0 or
+            quant.get("expert_dtype") != "fp4" or
+            quant.get("scale_fmt") != "ue8m0" or
+            quant.get("weight_block_size") != [32, 32]):
+        return ""
+    device = str(getattr(args, "device", "")).strip().lower()
+    if not re.fullmatch(r"cuda:\d+", device) or not _is_nvidia_cuda_platform():
+        return ""
+    device_id = int(device.split(":", 1)[1])
+    if _nvidia_cuda_compute_capabilities([device_id]).get(device_id) != 120:
+        return ""
+    detected = _find_triton_python()
+    if not detected:
+        print("[Fastllm] SM120 MXFP4 grouped MoE: Triton is unavailable; "
+              "built-in CUDA will be used.", flush=True)
+        return ""
+    os.environ["FASTLLM_CUDA_TRITON_PYTHON"] = detected
+    os.environ[auto_env_name] = "1"
+    print("[Fastllm] SM120 MXFP4 grouped MoE enabled automatically for DSpark "
+          "with the current Python environment: %s" % detected, flush=True)
+    return detected
+
 def _is_naive_n05_family(config) -> bool:
     if config.get("model_type") == "naive_n05_flash":
         return True
@@ -989,7 +1040,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--device', type = str, help = '使用的设备')
     parser.add_argument('--vision_device', '--vision-device', dest = 'vision_device',
                         type = _vision_device, default = None,
-                        help = 'Qwen3.5 视觉编码器设备: auto/cpu/cuda/cuda:N；默认auto，CUDA视觉随普通TP设备与比例，多卡时cuda:N不单独覆盖')
+                        help = 'Qwen3.5/Qwen4 视觉编码器设备: auto/cpu/cuda/cuda:N；Qwen3.5 CUDA视觉随普通TP设备与比例，多卡时cuda:N不单独覆盖')
     parser.add_argument('--multimodal', action = 'store_true',
                         help = 'Qwen3.5/Qwen3.8启动时加载视觉权重并预分配工作区，再分配KV cache；按processor的图片/视频像素上限预热')
     parser.add_argument('--tp', type = str, default = "", help = '线程级张量并行设备；裸数字X表示使用前X张卡，0表示0号卡，也可写 0,1 或 auto')
@@ -1072,6 +1123,8 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         help = "MTP/DSpark/DFlash draft 模型目录；MTP 也可指定 mtp.safetensors 或 Qwen4 MTP GGUF")
     parser.add_argument("--draft_tokens", type = _positive_int, default = -1,
                         help = "每轮最多使用的 draft token 数；未指定时读取 draft 配置")
+    parser.add_argument("--draft_gpu_resident", "--draft-gpu-resident", type=int, choices=(0, 1), default=None,
+                        help="DeepSeek-V4.1 DSpark 草稿专家显存策略：1 要求全驻留，0 关闭全驻留优先；未指定保持现有策略。支持单卡/PP/TP，需 MXFP4 草稿；--auto 会检查预算，显存不足时报错")
     parser.add_argument("--speculative_num_draft_tokens", "--speculative-num-draft-tokens",
                         dest = "speculative_num_draft_tokens", type = int, default = -1,
                         help = "DFlash/Clover 每轮 block token 数（含 anchor）")
@@ -1166,6 +1219,14 @@ def make_normal_llm_model(args, startup_progress = None):
 
     if getattr(args, "autotune", False):
         args.auto = True
+
+    draft_gpu_resident = getattr(args, "draft_gpu_resident", None)
+    if draft_gpu_resident not in (None, 0, 1):
+        raise ValueError("--draft-gpu-resident must be 0 or 1")
+    # This is model configuration, not a sticky process-wide opt-in.
+    os.environ.pop("FASTLLM_DSPARK_GPU_RESIDENT", None)
+    if draft_gpu_resident is not None:
+        os.environ["FASTLLM_DSPARK_GPU_RESIDENT"] = str(int(draft_gpu_resident))
 
     if getattr(args, "auto", False):
         args._auto_explicit = [name for name in getattr(args, "_auto_explicit", ())
@@ -1466,9 +1527,12 @@ def make_normal_llm_model(args, startup_progress = None):
     if (not(os.path.exists(config_path)) and args.ori != "" and os.path.exists(os.path.join(args.ori, "config.json"))):
         config_path = os.path.join(args.ori, "config.json")
     gguf_config = None
-    if (not os.path.exists(config_path) and os.path.isfile(args.path) and
-            args.path.lower().endswith(".gguf")):
-        gguf_config = get_gguf_model_config(args.path)
+    if os.path.isfile(args.path) and args.path.lower().endswith(".gguf"):
+        # --ori may describe HF DSpark weights that are absent from the GGUF.
+        # V4.1 startup defaults must follow the actual backbone metadata.
+        if (not os.path.exists(config_path) or
+                read_gguf_metadata(args.path, {"general.architecture"}).get("general.architecture") == "deepseek41"):
+            gguf_config = get_gguf_model_config(args.path)
     is_moe_model = False
     is_thread_tp_moe_model = False
     is_multicuda_tp_model = False
@@ -1754,6 +1818,8 @@ def make_normal_llm_model(args, startup_progress = None):
         prepare_clover(args, config)
     elif speculative_algorithm == "clover":
         raise ValueError("--speculative_algorithm clover requires a Clover checkpoint")
+    if draft_gpu_resident == 1 and (not is_deepseek_v41_model or args.dspark <= 0):
+        raise ValueError("--draft-gpu-resident 1 requires DeepSeek-V4.1 with DSpark enabled")
     automatic_plan = None
     if getattr(args, "autotune", False):
         from ftllm import llm
@@ -1844,12 +1910,12 @@ def make_normal_llm_model(args, startup_progress = None):
         # expert tensors.
         args.cuda_slab = 225
     elif (is_qwen38_flash_next_model and cuda_slab_auto and
-            gguf_config is not None and _uses_cuda_device(args.device) and
+            _uses_cuda_device(args.device) and
             args.moe_device_layers < 0 and
             str(args.moe_device).strip().lower() in ("cpu", "numa", "disk")):
         # Host-offloaded experts have their own cache arena. Pack the persistent
-        # dense GPU weights instead: their many 6.25 MiB and smaller allocations
-        # otherwise waste hundreds of MiB at the CUDA allocation granularity.
+        # dense GPU weights and native BF16 draft experts instead: their many
+        # small allocations otherwise waste CUDA allocation pages.
         # A 64 MiB slab retains 256-byte alignment and the existing compute paths.
         args.cuda_slab = 64
     if (is_glm5_next_model and gguf_config is not None and cuda_slab_auto and
@@ -1859,6 +1925,8 @@ def make_normal_llm_model(args, startup_progress = None):
         # Pack them into the existing weight slabs instead of paying CUDA's
         # allocation granularity for each shard. Explicit --cuda_slab wins.
         args.cuda_slab = 64
+    if is_qwen38_flash_next_model and hybrid_auto_plan is not None:
+        hybrid_auto_plan["cuda_slab"] = args.cuda_slab
     if ((args.device and args.device.find("numa") != -1) or args.moe_device.find("numa") != -1 or
         (args.device and args.device.find("tfacc") != -1) or args.moe_device.find("tfacc") != -1):
         os.environ["FASTLLM_ACTIVATE_NUMA"] = "ON"
@@ -1964,6 +2032,8 @@ def make_normal_llm_model(args, startup_progress = None):
         # placements, after TP fallback. Keep auto intact for subsequent models.
         os.environ.setdefault("FASTLLM_EXECUTION_MODE", "auto")
     _configure_sm89_fp8_linear_triton(args)
+    _configure_sm120_mxfp4_grouped_triton(
+        args, config if is_deepseek_v41_model else {})
     _configure_qwen35_auto_fast_paths(args, is_qwen35_model, mtp)
     os.environ["FASTLLM_DSV41_DECODER_SWA_BOUNDED_REPLAY"] = (
         "1" if _arg_enabled(getattr(args, "fast_prefill", False)) else "0")
@@ -1974,6 +2044,14 @@ def make_normal_llm_model(args, startup_progress = None):
         llm.set_cuda_graph(graph_enabled)
     llm.set_moe_device_layers(-1)
     cache_bytes = _memory_size_bytes(getattr(args, "moe_cuda_cache", 0))
+    if draft_gpu_resident == 1:
+        from .hybrid_auto import devices as draft_devices, draft_cache_device
+        draft_cache_device(*draft_devices(args))  # Validate topology before loading weights.
+        if "disk" in str(args.moe_device):
+            raise ValueError("--draft-gpu-resident 1 requires CPU/NUMA or GPU-resident experts; disk expert caches are not supported")
+        if (args.moe_device_layers != 0 and cache_bytes <= 0 and
+                any(kind in str(args.moe_device) for kind in ("cpu", "numa", "disk"))):
+            raise ValueError("--draft-gpu-resident 1 requires a GPU expert cache; use --auto or --moe_cuda_cache")
     if hybrid_auto_plan and "moe_cuda_cache_per_device" in hybrid_auto_plan:
         llm.set_moe_cuda_cache(cache_bytes, hybrid_auto_plan["moe_cuda_cache_per_device"])
     else:

@@ -135,10 +135,11 @@ __device__ inline void StoreGate(float2 pair, float score, __nv_bfloat16 *activa
             __float2bfloat16_rn(float(__nv_fp8_e4m3(q)) * scale);
     }
 }
-template <bool Batched = false>
+template <bool Batched = false, bool Disk = false>
 __global__ void Gate(const __nv_bfloat16 *input, const int32_t *slots, const uint8_t *records, const float *scores,
                      __nv_bfloat16 *activation, int hidden, int inter, size_t stride, float limit, int topk = 1,
-                     const int32_t *routeMap = nullptr, bool planar = false) {
+                     const int32_t *routeMap = nullptr, bool planar = false,
+                     const uint8_t *const *recordPointers = nullptr) {
     const int selected = blockIdx.y, route = routeMap ? routeMap[selected] : selected;
     const int slot = slots[selected];
     if constexpr (Batched)
@@ -147,13 +148,14 @@ __global__ void Gate(const __nv_bfloat16 *input, const int32_t *slots, const uin
         return;
     const int column = blockIdx.x * 32 + threadIdx.x / 16;
     const size_t pitch = size_t(hidden / 32) * 17;
-    const uint8_t *record = records + size_t(slot) * stride;
+    const uint8_t *record = Disk ? recordPointers[slot] : records + size_t(slot) * stride;
     const size_t qpitch = hidden / 2, spitch = hidden / 32;
     const uint8_t *scales = record + size_t(2 * inter) * qpitch;
     const float2 pair = planar ? DotGateUp<true>(input, record + column * qpitch,
         record + (column + inter) * qpitch, hidden, scales + column * spitch,
         scales + (column + inter) * spitch) :
-        DotGateUp(input, record + column * pitch, record + (column + inter) * pitch, hidden);
+        DotGateUp(input, record + (Disk ? 2*column : column) * pitch,
+            record + (Disk ? 2*column+1 : column+inter) * pitch, hidden);
     StoreGate(pair, scores[route], activation, route, inter, limit);
 }
 // Coalesced weight staging avoids repeatedly fetching small fragments of
@@ -269,16 +271,18 @@ static __global__ void GateResident(const __nv_bfloat16 *input, const int32_t *s
         Planar ? scale + size_t(inter) * (hidden / 32) : nullptr);
     StoreGate(pair, scores[route], activation, route, inter, limit);
 }
+template<bool Indirect = false>
 static __global__ void Down(const __nv_bfloat16 *activation, const int32_t *slots, const uint8_t *records,
                             float *output, int hidden, int inter, size_t stride, size_t downOffset,
-                            const int32_t *routeMap = nullptr, bool planar = false) {
+                            const int32_t *routeMap = nullptr, bool planar = false,
+                            const uint8_t *const *recordPointers = nullptr) {
     const int selected = blockIdx.y, route = routeMap ? routeMap[selected] : selected;
     const int slot = slots[selected];
     if (slot < 0)
         return;
     const int column = blockIdx.x * 8 + threadIdx.x / 16;
-    const uint8_t *weight = records + size_t(slot) * stride + downOffset + size_t(column) * (inter / 32) * 17;
-    const uint8_t *matrix = records + size_t(slot) * stride + downOffset;
+    const uint8_t *matrix = (Indirect ? recordPointers[slot] : records + size_t(slot) * stride) + downOffset;
+    const uint8_t *weight = matrix + size_t(column) * (inter / 32) * 17;
     const float value = planar ? Dot<true>(activation + route * inter,
         matrix + size_t(column) * (inter / 2), inter,
         matrix + size_t(hidden) * (inter / 2) + size_t(column) * (inter / 32)) :

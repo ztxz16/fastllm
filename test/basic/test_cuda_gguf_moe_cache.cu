@@ -410,6 +410,7 @@ template<class T> static void RunReusedInput(ggml_type type, fastllm::DataType d
     const size_t stride = downOffset + down->GetBytes();
     const size_t workspaceBytes = FastllmCudaMoeGGUFCacheWorkspaceBytes(hidden, inter);
     Data records(INT8, {int(experts * stride)}), workspace(INT8, {int(workspaceBytes)});
+    Data sharedInput(INT8, {int(workspaceBytes)}); Gpu(sharedInput);
     Data input(dtype, {1, hidden}), gate(dtype, {experts, inter}), output(dtype, {1, hidden});
     Data slots(INT32, {experts}), scores(FLOAT32, {experts}), partial(FLOAT32, {experts, hidden});
     for (auto *d : {&records, &workspace, &input, &gate, &output, &slots, &scores, &partial}) Gpu(*d);
@@ -449,10 +450,125 @@ template<class T> static void RunReusedInput(ggml_type type, fastllm::DataType d
             for (float v : values) Require(std::isfinite(v), "reused Q8 input produced nonfinite output");
         }
         Require(actual == reference, "Q8 input reuse changed expert arithmetic");
+        Require(FastllmCudaMoeGGUFPrepareQ8Input(input, sharedInput.cudaData, sharedInput.GetBytes()),
+            "shared Q8 input preparation failed");
+        for (int e = 0; e < experts; ++e) {
+            // Each consumer has no usable local Q8 prefix. Only the separate,
+            // immutable producer allocation can yield the independent result.
+            Cuda(cudaMemsetAsync(workspace.cudaData, 0xff, workspaceBytes, cudaStreamPerThread));
+            FastllmCudaMoeGGUFCacheView view{
+                static_cast<uint8_t *>(records.cudaData), static_cast<int32_t *>(slots.cudaData)+e,
+                stride, downOffset, type, GGML_TYPE_IQ4_NL, hidden, inter, workspace.cudaData, workspaceBytes};
+            view.preparedQ8Input = sharedInput.cudaData;
+            Require(FastllmCudaMoeGGUFCacheCompute(input, gate, output, view,
+                static_cast<float *>(scores.cudaData)+e, 1,
+                static_cast<float *>(partial.cudaData)+e*hidden), "shared Q8 input consumer failed");
+        }
+        Cuda(cudaMemcpy(actual.data(), partial.cudaData, actual.size()*sizeof(float), cudaMemcpyDeviceToHost));
+        Require(actual == reference, "shared external Q8 input changed expert arithmetic");
         Require(previous.empty() || actual != previous, "Q8 input reuse retained a previous token");
         previous = actual;
     }
     std::printf("PASS reused Q8 input type=%d dtype=%d: exact results, changed tokens, independent scratch\n", type, dtype);
+}
+
+// Compare against the original 32-lane projection, including the intermediate
+// SwiGLU activation. Replay changing routes and tokens through a captured graph
+// so stale partials, packed layouts and launch-time dispatch are all exercised.
+template<class T> static void RunSubwarp(ggml_type type, ggml_type downType,
+                                       fastllm::DataType dtype, int rows, bool numa, bool benchmark = false) {
+    using namespace fastllm;
+    constexpr int hidden = 2560, inter = 640, experts = 3, topk = 10;
+    const int routes = rows * topk;
+    const size_t gateBytes = 2 * inter * ggml_row_size(type, hidden);
+    const size_t offset = (gateBytes + 15) / 16 * 16;
+    const size_t stride = offset + hidden * ggml_row_size(downType, inter);
+    const size_t bytes = FastllmCudaMoeGGUFCacheBatchWorkspaceBytes(hidden, inter, rows, topk);
+    Data records(INT8, {int(experts*stride)}), workspace(INT8, {int(bytes)});
+    Data input(dtype, {rows,hidden}), gate(dtype, {routes,inter}), output(dtype, {rows,hidden});
+    Data slots(INT32, {routes}), scores(FLOAT32, {routes}), partial(FLOAT32, {routes,hidden});
+    for (auto *v : {&records,&workspace,&input,&gate,&output,&slots,&scores,&partial}) Gpu(*v);
+    int numaGate = -1, numaDown = -1;
+    for (int e = 0; e < experts; ++e) {
+        auto g = Weight(type, 2*inter, hidden, 11*e+1, true);
+        auto d = Weight(downType, hidden, inter, 11*e+2, true);
+        if (numa) {
+            const size_t rowBytes = g->GetBytes()/(2*inter);
+            const std::vector<uint8_t> canonical(g->cpuData, g->cpuData+g->GetBytes());
+            for (int r = 0; r < 2*inter; ++r)
+                std::memcpy(g->cpuData+r*rowBytes, canonical.data()+(r/2+(r%2)*inter)*rowBytes, rowBytes);
+            g->Repack(); d->Repack(); numaGate = g->ggmlType; numaDown = d->ggmlType;
+        }
+        Cuda(cudaMemcpy(static_cast<uint8_t *>(records.cudaData)+e*stride, g->cpuData, g->GetBytes(), cudaMemcpyHostToDevice));
+        Cuda(cudaMemcpy(static_cast<uint8_t *>(records.cudaData)+e*stride+offset, d->cpuData, d->GetBytes(), cudaMemcpyHostToDevice));
+    }
+    FastllmCudaMoeGGUFCacheView view{static_cast<uint8_t *>(records.cudaData),
+        static_cast<int32_t *>(slots.cudaData),stride,offset,type,downType,hidden,inter,
+        workspace.cudaData,bytes};
+    view.numaGateType = numaGate; view.numaDownType = numaDown;
+    std::vector<T> x(rows*hidden), referenceGate(routes*inter), actualGate(referenceGate.size());
+    std::vector<float> weights(routes, 1.f), reference(routes*hidden), actual(reference.size());
+    std::vector<int32_t> route(routes);
+    Cuda(cudaMemcpy(scores.cudaData, weights.data(), routes*sizeof(float), cudaMemcpyHostToDevice));
+    auto compute = [&] {
+        Require(FastllmCudaMoeGGUFCacheCompute(input,gate,output,view,
+            static_cast<float *>(scores.cudaData),topk,static_cast<float *>(partial.cudaData)),
+            "subwarp projection rejected");
+    };
+    cudaGraph_t graph = nullptr; cudaGraphExec_t exec = nullptr;
+    for (int pass = 0; pass < 3; ++pass) {
+        for (size_t i = 0; i < x.size(); ++i)
+            x[i] = Cast<T>(i%hidden < 32 ? 0 : .03f*std::sin(i*.731f+pass*1.17f));
+        for (int r = 0; r < routes; ++r) route[r] = (r+pass)%5 == 0 ? -1 : (r+pass)%experts;
+        Cuda(cudaMemcpy(input.cudaData,x.data(),x.size()*sizeof(T),cudaMemcpyHostToDevice));
+        Cuda(cudaMemcpy(slots.cudaData,route.data(),routes*sizeof(int32_t),cudaMemcpyHostToDevice));
+        view.exactSubwarp = false; compute();
+        Cuda(cudaMemcpy(reference.data(),partial.cudaData,reference.size()*sizeof(float),cudaMemcpyDeviceToHost));
+        Cuda(cudaMemcpy(referenceGate.data(),gate.cudaData,referenceGate.size()*sizeof(T),cudaMemcpyDeviceToHost));
+        view.exactSubwarp = true;
+        if (!exec) {
+            compute(); Cuda(cudaStreamSynchronize(cudaStreamPerThread));
+            Cuda(cudaStreamBeginCapture(cudaStreamPerThread,cudaStreamCaptureModeThreadLocal));
+            compute(); Cuda(cudaStreamEndCapture(cudaStreamPerThread,&graph));
+            Cuda(cudaGraphInstantiate(&exec,graph,nullptr,nullptr,0));
+        }
+        Cuda(cudaMemsetAsync(gate.cudaData,0xff,gate.GetBytes(),cudaStreamPerThread));
+        Cuda(cudaMemsetAsync(partial.cudaData,0xff,partial.GetBytes(),cudaStreamPerThread));
+        Cuda(cudaGraphLaunch(exec,cudaStreamPerThread));
+        Cuda(cudaMemcpy(actual.data(),partial.cudaData,actual.size()*sizeof(float),cudaMemcpyDeviceToHost));
+        Cuda(cudaMemcpy(actualGate.data(),gate.cudaData,actualGate.size()*sizeof(T),cudaMemcpyDeviceToHost));
+        for (float v : actual) Require(std::isfinite(v),"subwarp produced nonfinite output");
+        Require(std::memcmp(actualGate.data(),referenceGate.data(),actualGate.size()*sizeof(T)) == 0,
+            "subwarp changed gate/up arithmetic");
+        Require(std::memcmp(actual.data(),reference.data(),actual.size()*sizeof(float)) == 0,
+            "subwarp changed down arithmetic");
+    }
+    Cuda(cudaGraphExecDestroy(exec)); Cuda(cudaGraphDestroy(graph));
+    std::printf("PASS exact subwarp gate=%d down=%d dtype=%d rows=%d numa=%d graph replay\n",
+        type,downType,dtype,rows,int(numa));
+    if (benchmark) {
+        // Compare identical cached experts without host-launch overhead or an
+        // adaptive CPU/GPU split. Each graph contains the same 32 MoE calls.
+        constexpr int unroll = 32, repeats = 20;
+        cudaEvent_t begin, end; Cuda(cudaEventCreate(&begin)); Cuda(cudaEventCreate(&end));
+        for (const char *mode : {"0", "1"}) {
+            view.exactSubwarp = std::strcmp(mode, "1") == 0; compute();
+            Cuda(cudaStreamSynchronize(cudaStreamPerThread));
+            Cuda(cudaStreamBeginCapture(cudaStreamPerThread,cudaStreamCaptureModeThreadLocal));
+            for (int i = 0; i < unroll; ++i) compute();
+            Cuda(cudaStreamEndCapture(cudaStreamPerThread,&graph));
+            Cuda(cudaGraphInstantiate(&exec,graph,nullptr,nullptr,0));
+            Cuda(cudaGraphLaunch(exec,cudaStreamPerThread));
+            Cuda(cudaEventRecord(begin,cudaStreamPerThread));
+            for (int i = 0; i < repeats; ++i) Cuda(cudaGraphLaunch(exec,cudaStreamPerThread));
+            Cuda(cudaEventRecord(end,cudaStreamPerThread)); Cuda(cudaEventSynchronize(end));
+            float ms; Cuda(cudaEventElapsedTime(&ms,begin,end));
+            std::printf("BENCH subwarp gate=%d down=%d rows=%d numa=%d mode=%s us=%.4f\n",
+                type,downType,rows,int(numa),mode,ms*1000/(unroll*repeats));
+            Cuda(cudaGraphExecDestroy(exec)); Cuda(cudaGraphDestroy(graph));
+        }
+        Cuda(cudaEventDestroy(begin)); Cuda(cudaEventDestroy(end));
+    }
 }
 
 template<class T> static void RunSplitUpload(ggml_type type, fastllm::DataType dtype, bool numa) {
@@ -851,7 +967,7 @@ template<class T> static void RunTPShards(ggml_type type, fastllm::DataType dtyp
 
 // Cached rows are deliberately removed from the host snapshot after admission:
 // matching the independent oracle then proves prefill borrowed resident bytes.
-static void RunPrefillCached(int device) {
+static void RunPrefillCached(int device, bool native = false) {
     using namespace fastllm;
     Cuda(cudaSetDevice(device));
     constexpr int experts = 48, hidden = 256, inter = 320, topk = 3, rows = 65;
@@ -866,8 +982,17 @@ static void RunPrefillCached(int device) {
     }
     const size_t stride = (weights[2]->GetBytes()+weights[3]->GetBytes()+127)/128*128;
     SetMoeCudaCacheBytes(32*stride);
-    FastllmCudaMoeCacheLayer layer{weights.data(), int(weights.size())};
-    Require(FastllmCudaPrepareMoeCache(&layer, 1), "prefill cache snapshot failed");
+    FastllmCudaMoeCacheLayer layer{weights.data(), int(weights.size()), false, 0, false, -1, native};
+    bool prepared = false;
+#ifdef USE_NUMAS
+    if (native) prepared = FastllmCudaPrepareMoeCache(&layer, 1, [&] {
+        for (size_t i = 2; i < weights.size(); ++i)
+            RegisterNumas(weights[i], i%2 ? "linear" : "linearSwiglu");
+    });
+    else
+#endif
+        prepared = FastllmCudaPrepareMoeCache(&layer, 1);
+    Require(prepared, "prefill cache snapshot failed");
     Data input(FLOAT32,{rows,hidden}), ids(INT32,{1,topk}), scores(FLOAT32,{rows,topk}), gate, scratch, output;
     Gpu(input); Gpu(ids); Gpu(scores);
     std::vector<float> x(rows*hidden), scale(rows*topk,.25f);
@@ -882,11 +1007,15 @@ static void RunPrefillCached(int device) {
     Cuda(cudaStreamSynchronize(cudaStreamPerThread));
     FastllmCudaMoePrefillResidents resident;
     Require(FastllmCudaGetMoePrefillResidents(weights.data(),experts,resident), "prefill resident snapshot failed");
+    Require(resident.nativeGGUF == native, "prefill cache format differs from requested fixture");
     Require(resident.weights[0] && resident.weights[4] && resident.weights[8] && !resident.weights[12],
         "prefill resident map differs from admitted experts");
     auto eraseHost = [&](int e) {
-        for (int part = 0; part < 2; ++part)
-            std::memset(weights[2*(e+1)+part]->cpuData,0,weights[2*(e+1)+part]->GetBytes());
+        for (int part = 0; part < 2; ++part) {
+            auto &w = *weights[2*(e+1)+part];
+            if (!native) std::memset(w.cpuData, 0, w.GetBytes());
+            else for (auto *shard : w.numasData) std::memset(shard, 0, w.GetBytes()/w.numasData.size());
+        }
     };
     for (int e : warmIds) eraseHost(e);
     std::vector<int32_t> routes(rows*topk);
@@ -894,7 +1023,7 @@ static void RunPrefillCached(int device) {
     uint64_t before[5]{},after[5]{};
     Require(fastllm_moe_cuda_cache_stats(device,before,false), "cache counters missing");
     Require(FastllmCudaMergeMOEGGUFHost(input,gate,scratch,output,weights.data(),experts,
-        routes.data(),scale.data(),topk,{1,3,5,7},false), "cached prefill rejected");
+        routes.data(),scale.data(),topk,{1,3,5,7},native), "cached prefill rejected");
     std::vector<float> actual(rows*hidden),actualGate(rows*topk*inter);
     auto check = [&] {
         Cuda(cudaMemcpy(actual.data(),output.cudaData,actual.size()*4,cudaMemcpyDeviceToHost));
@@ -909,13 +1038,13 @@ static void RunPrefillCached(int device) {
         "prefill miss was not retained in cache");
     eraseHost(6);
     Require(FastllmCudaMergeMOEGGUFHost(input,gate,scratch,output,weights.data(),experts,
-        routes.data(),scale.data(),topk,{1,3,5,7},false), "prefill cache reuse rejected");
+        routes.data(),scale.data(),topk,{1,3,5,7},native), "prefill cache reuse rejected");
     check();
     std::unordered_set<int> all;
     for (int e = 0; e < experts; ++e) all.insert(e + 1);
     for (int i = 0; i < rows*topk; ++i) routes[i] = i % experts;
     Require(FastllmCudaMergeMOEGGUFHost(input,gate,scratch,output,weights.data(),experts,
-        routes.data(),scale.data(),topk,all,false), "bulk cached prefill rejected");
+        routes.data(),scale.data(),topk,all,native), "bulk cached prefill rejected");
     Require(FastllmCudaGetMoePrefillResidents(weights.data(),experts,resident), "bulk cache disappeared");
     int filled = 0;
     for (int e = 0; e < experts; ++e) if (resident.weights[2*e]) {
@@ -924,10 +1053,16 @@ static void RunPrefillCached(int device) {
     }
     Require(filled == 32, "prefill did not fill empty slots beyond decode admission budget");
     Require(FastllmCudaMergeMOEGGUFHost(input,gate,scratch,output,weights.data(),experts,
-        routes.data(),scale.data(),topk,all,false), "bulk cache reuse rejected");
+        routes.data(),scale.data(),topk,all,native), "bulk cache reuse rejected");
     check();
     FastllmCudaReleaseMoeCache(weights.data(),weights.size()); SetMoeCudaCacheBytes(0);
     Require(!FastllmCudaGetMoePrefillResidents(weights.data(),experts,resident), "released prefill pointers survived");
+#ifdef USE_NUMAS
+    if (native) {
+        ClearNumasMoeRuntimeCache();
+        for (const auto &w : owned) ReleaseNumasMoeWeightArena(w.get());
+    }
+#endif
     std::printf("PASS cached prefill device=%d: resident+miss, bulk fill/reuse, CPU oracle, release\n",device);
 }
 
@@ -1171,6 +1306,38 @@ static void RunSharedGGUFRecords() {
                     Require(false, "shared GGUF restoration changed packed bytes");
                 }
             }
+            // Native admission must preserve every packed byte independently
+            // of the GEMV implementation. Exercise dynamic counts and slot
+            // permutations on replay, including empty and D2D-promoted requests.
+            Cuda(cudaMemcpy(promoted, host, layout.stride, cudaMemcpyHostToDevice));
+            cudaGraph_t nativeGraph = nullptr;
+            cudaGraphExec_t nativeExec = nullptr;
+            Cuda(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+            Cuda(CopyNativeRecords(layout, pointers, output, cudaStreamPerThread,
+                ids, ids+experts, ids+2*experts, slotOffsets, 0, promoted, 0));
+            Cuda(cudaStreamEndCapture(cudaStreamPerThread, &nativeGraph));
+            Cuda(cudaGraphInstantiate(&nativeExec, nativeGraph, nullptr, nullptr, 0));
+            for (int replay = 0; replay < 4; ++replay) {
+                std::fill(expected.begin(), expected.end(), 0xa5);
+                metadata[6] = replay;
+                for (int i = 0; i < experts; ++i) metadata[i] = (i+replay)%experts;
+                Cuda(cudaMemcpy(ids, metadata, sizeof(metadata), cudaMemcpyHostToDevice));
+                Cuda(cudaMemset(output, 0xa5, outputBytes));
+                for (int i = 0; i < metadata[6]; ++i) {
+                    auto *record = expected.data()+offsets[metadata[experts+i]];
+                    std::fill_n(record, layout.stride, 0);
+                    for (int part = 0; part < 2; ++part) {
+                        const size_t offset = part ? layout.downOffset : 0;
+                        const auto &w = layout.weights[part];
+                        std::memcpy(record+offset, host+metadata[i]*layout.stride+offset,
+                            size_t(w.rows)*w.rowBytes);
+                    }
+                }
+                Cuda(cudaGraphLaunch(nativeExec, cudaStreamPerThread));
+                Cuda(cudaMemcpy(actual.data(), output, outputBytes, cudaMemcpyDeviceToHost));
+                Require(actual == expected, "native GGUF graph transfer changed payload or padding");
+            }
+            Cuda(cudaGraphExecDestroy(nativeExec)); Cuda(cudaGraphDestroy(nativeGraph));
             Cuda(cudaFree(pointers)); Cuda(cudaFree(ids)); Cuda(cudaFree(slotOffsets));
             Cuda(cudaFree(output)); Cuda(cudaFree(promoted)); Cuda(cudaFree(uploaded)); Cuda(cudaFreeHost(host));
         }
@@ -1488,9 +1655,16 @@ static void RunHybrid(ggml_type format, int rows, bool single = false, bool freq
                                 actual[rank][c] <= upper[c]+tol, "frequency admission corrupted a route");
                         }
                     }
-                } else if (single) accepted[rank] = FastllmCudaMergeMOEHybrid(input[rank], ids, scores, output[rank],
-                    table.data(), table.size(), layer, parallel);
-                else {
+                } else if (single) {
+                    // A zero-slot cache uses temporary GPU staging under an
+                    // explicit decode scope, as the model does. Without this
+                    // scope the legacy demand-fill entry point must reject it.
+                    void *scope = noCache ? FastllmCudaBeginMoeDecode(table.data(), table.size(), topk) : nullptr;
+                    Require(!noCache || scope, "zero-cache verifier scope unavailable");
+                    accepted[rank] = FastllmCudaMergeMOEHybrid(input[rank], ids, scores, output[rank],
+                        table.data(), table.size(), layer, parallel);
+                    if (scope) FastllmCudaEndMoeDecode(scope);
+                } else {
                     cudaGraph_t readGraph = nullptr;
                     cudaGraphExec_t readExec = nullptr;
                     bool preparedReadback = false;
@@ -1629,6 +1803,34 @@ int main(int argc, char **argv) {
     try {
         int count = 0; Cuda(cudaGetDeviceCount(&count)); if (!count) { std::puts("SKIP: no CUDA device"); return 0; }
         Cuda(cudaSetDevice(0));
+        if (argc > 1 && std::strcmp(argv[1], "--subwarp-bench") == 0) {
+            for (auto pair : {std::make_pair(GGML_TYPE_IQ3_S,GGML_TYPE_Q2_0),
+                              std::make_pair(GGML_TYPE_IQ2_S,GGML_TYPE_Q2_0),
+                              std::make_pair(GGML_TYPE_IQ3_XXS,GGML_TYPE_IQ4_NL),
+                              std::make_pair(GGML_TYPE_IQ2_XS,GGML_TYPE_IQ4_NL),
+                              std::make_pair(GGML_TYPE_Q2_0,GGML_TYPE_Q2_0),
+                              std::make_pair(GGML_TYPE_IQ2_S,GGML_TYPE_IQ4_NL)})
+                for (bool numa : {false,true}) for (int rows : {1,4})
+                    RunSubwarp<half>(pair.first,pair.second,fastllm::FLOAT16,rows,numa,true);
+            std::puts("PASS: exact subwarp microbenchmark"); return 0;
+        }
+        if (argc > 1 && std::strcmp(argv[1], "--subwarp") == 0) {
+            for (auto pair : {std::make_pair(GGML_TYPE_IQ3_S,GGML_TYPE_Q2_0),
+                              std::make_pair(GGML_TYPE_Q2_0,GGML_TYPE_Q2_0),
+                              std::make_pair(GGML_TYPE_IQ3_XXS,GGML_TYPE_IQ4_NL),
+                              std::make_pair(GGML_TYPE_IQ2_XS,GGML_TYPE_IQ4_NL),
+                              std::make_pair(GGML_TYPE_IQ2_S,GGML_TYPE_Q2_0),
+                              std::make_pair(GGML_TYPE_IQ2_XXS,GGML_TYPE_Q2_0),
+                              std::make_pair(GGML_TYPE_IQ1_M,GGML_TYPE_Q2_0),
+                              std::make_pair(GGML_TYPE_IQ4_NL,GGML_TYPE_Q2_0),
+                              std::make_pair(GGML_TYPE_IQ4_XS,GGML_TYPE_Q2_0)})
+                for (bool numa : {false,true}) for (int rows : {1,4,9}) {
+                    RunSubwarp<float>(pair.first,pair.second,fastllm::FLOAT32,rows,numa);
+                    RunSubwarp<half>(pair.first,pair.second,fastllm::FLOAT16,rows,numa);
+                    RunSubwarp<__nv_bfloat16>(pair.first,pair.second,fastllm::BFLOAT16,rows,numa);
+                }
+            std::puts("PASS: exact subwarp, old-kernel oracle and changing graph inputs"); return 0;
+        }
         if (argc > 1 && std::strcmp(argv[1], "--split-upload") == 0) {
             for (auto type : {GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_F16})
                 for (bool numa : {false,true}) {
@@ -1687,6 +1889,11 @@ int main(int argc, char **argv) {
             std::puts("PASS: GGUF input quantization reuse"); return 0;
         }
 #ifdef USE_NUMAS
+        if (argc > 1 && std::strcmp(argv[1], "--host-native-cache") == 0) {
+            fastllm::SetThreads(4);
+            RunPrefillCached(0, true);
+            std::puts("PASS: native cached GGUF prefill, independent CPU oracle and cache reuse"); return 0;
+        }
         if (argc > 1 && std::strcmp(argv[1], "--shared-weights") == 0) {
             RunSharedGGUFRecords();
             std::puts("PASS: shared GGUF weights preserve canonical bytes"); return 0;

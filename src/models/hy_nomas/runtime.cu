@@ -47,7 +47,7 @@ uint64_t allocationThread() {
 struct MemoryPool {
     cudaMemPool_t handle = nullptr;
     int device;
-    size_t cacheLimit=0,cachedBytes=0;
+    size_t cacheLimit=0,cachedBytes=0,maxBytes=0;
     std::mutex cacheMutex;
     using FreeBlocks=std::map<size_t,std::vector<void *>>;
     std::unordered_map<uint64_t,FreeBlocks> freeBlocks;
@@ -87,11 +87,19 @@ struct MemoryPool {
             for(void *p:size.second) cudaFree(p);
         freeBlocks.clear();cachedBytes=0;
     }
-    explicit MemoryPool(int device, uint64_t retained=2ULL*1024*1024*1024):device(device) {
+    // Keep older CUDA toolkits buildable when the optional limit is unused.
+    template<class Props> static auto limit(Props &props,size_t bytes,int)
+        -> decltype(props.maxSize=bytes,void()) { props.maxSize=bytes; }
+    template<class Props> static void limit(Props &,size_t bytes,long) {
+        if(bytes) throw std::runtime_error("this CUDA toolkit does not support bounded memory pools");
+    }
+    explicit MemoryPool(int device, uint64_t retained=2ULL*1024*1024*1024,size_t maximum=0)
+        :device(device),maxBytes(maximum) {
         cudaMemPoolProps props{};
         props.allocType = cudaMemAllocationTypePinned;
         props.location.type = cudaMemLocationTypeDevice;
         props.location.id = device;
+        limit(props,maximum,0);
         check(cudaMemPoolCreate(&handle, &props));
         auto status = cudaMemPoolSetAttribute(handle, cudaMemPoolAttrReleaseThreshold, &retained);
         if (status != cudaSuccess) {
@@ -123,7 +131,17 @@ std::shared_ptr<void> allocate(size_t bytes) {
     int device; check(cudaGetDevice(&device));
     auto pool = memoryPool(device);
     void *p = pool->reuse(bytes);
-    if(!p) check(cudaMallocFromPoolAsync(&p,bytes,pool->handle,cudaStreamPerThread));
+    if(!p) {
+        auto status=cudaMallocFromPoolAsync(&p,bytes,pool->handle,cudaStreamPerThread);
+        if(status==cudaErrorMemoryAllocation && pool->maxBytes) {
+            cudaGetLastError();
+            throw std::runtime_error("GPU memory budget exhausted (tensor pool limit " +
+                std::to_string(pool->maxBytes/(1024*1024)) + " MiB, requested " +
+                std::to_string((bytes+1024*1024-1)/(1024*1024)) +
+                " MiB). Increase --gpu-memory-limit or reduce video/reference size or duration.");
+        }
+        check(status);
+    }
     auto owner=allocationThread();
     return {p, [device,pool,bytes,owner](void *x) {
         int previous = device; cudaGetDevice(&previous);
@@ -438,8 +456,25 @@ template<class T> __global__ void textRopeKernel(const T *x,T *y,size_t n,int co
 }
 }
 
-TensorPool::TensorPool(int device,size_t cacheBytes):pool_(std::make_shared<MemoryPool>(device,UINT64_MAX)) {
-    std::static_pointer_cast<MemoryPool>(pool_)->cacheLimit=cacheBytes;
+TensorPool::TensorPool(int device,size_t cacheBytes,size_t maxBytes,bool reserve)
+    :pool_(std::make_shared<MemoryPool>(device,maxBytes && !reserve?0:UINT64_MAX,maxBytes)) {
+    require(!maxBytes || cacheBytes<=maxBytes,"tensor cache exceeds memory pool limit");
+    auto pool=std::static_pointer_cast<MemoryPool>(pool_);
+    pool->cacheLimit=cacheBytes;
+    if(reserve) {
+        require(maxBytes>0,"a GPU reservation requires a memory limit");
+        int previous=0;check(cudaGetDevice(&previous));check(cudaSetDevice(device));
+        void *p=nullptr;
+        auto status=cudaMallocFromPoolAsync(&p,maxBytes,pool->handle,cudaStreamPerThread);
+        if(status==cudaSuccess) status=cudaFreeAsync(p,cudaStreamPerThread);
+        if(status==cudaSuccess) status=cudaStreamSynchronize(cudaStreamPerThread);
+        cudaSetDevice(previous);
+        if(status!=cudaSuccess) {
+            cudaGetLastError();
+            throw std::runtime_error("cannot reserve GPU tensor pool of "+std::to_string(maxBytes/(1024*1024))+
+                " MiB on device "+std::to_string(device)+": "+cudaGetErrorString(status));
+        }
+    }
 }
 TensorPool::Scope::Scope(const TensorPool &pool):previous_(activePool) {
     auto next=std::static_pointer_cast<MemoryPool>(pool.pool_);
@@ -987,6 +1022,14 @@ Tensor Runtime::attentionScaled(const Tensor &q,const Tensor &k,const Tensor &v,
 }
 void Runtime::synchronize() { check(cudaDeviceSynchronize()); }
 
+bool HostMemoryBudget::acquire(size_t bytes) {
+    size_t current=used_.load();
+    while(bytes<=limit_-current) {
+        if(used_.compare_exchange_weak(current,current+bytes)) return true;
+    }
+    return false;
+}
+
 struct Weights::Impl {
     struct HostCache {
         struct Buffer { std::shared_ptr<void> data; bool pinned; };
@@ -1041,6 +1084,8 @@ struct Weights::Impl {
     std::unordered_map<std::string,HostWeight> offloaded;
     std::shared_ptr<PackedCache> packed;
     std::shared_ptr<HostCache> host;
+    std::shared_ptr<HostMemoryBudget> hostBudget;
+    size_t hostCacheLimit=0;
     std::string directory,checkpoint;
     std::unordered_map<std::string,std::unique_ptr<Weights>> shards;
     void checkCacheSource(const Impl &source) const {
@@ -1113,6 +1158,8 @@ const Tensor &Weights::get(const std::string &name) {
             shard.reset(new Weights(i.rt,i.directory+"/"+file));
             shard->impl_->packed=i.packed;
             shard->impl_->host=i.host;
+            shard->impl_->hostBudget=i.hostBudget;
+            if(i.hostBudget) shard->impl_->mapping.reset();
             shard->impl_->partitions=i.partitions;
         }
         return shard->get(name);
@@ -1155,6 +1202,59 @@ const Tensor &Weights::get(const std::string &name) {
             source=cached->second.data.get(); pinned=cached->second.pinned;
         }
     }
+    if(!raw.data && !source && i.hostBudget) {
+        // Quota mode never faults an entire checkpoint into this process's RSS.
+        // Read only this rank's slice, in bounded chunks, directly into either
+        // its accounted cache allocation or the GPU upload staging buffer.
+        const size_t scalarBytes=dtype=="F32"?4:2;
+        auto readSlice=[&](uint8_t *dst,size_t offset,size_t count) {
+            while(count) {
+                size_t sourceOffset=offset,run=count;
+                if(sliced) {
+                    const auto &p=partition->second;
+                    size_t span=size_t(partWidth)*scalarBytes*(axis==0?originalCols:1);
+                    size_t group=offset/span,inside=offset%span;
+                    if(axis==0) sourceOffset=(group*groupWidth+p.rank*partWidth)*originalCols*scalarBytes+inside;
+                    else sourceOffset=((group/p.groups)*originalCols+(group%p.groups)*groupWidth+p.rank*partWidth)*scalarBytes+inside;
+                    run=std::min(run,span-inside);
+                }
+                i.file.clear();i.file.seekg(i.base+uint64_t(a)+sourceOffset);
+                i.file.read(reinterpret_cast<char *>(dst),run);
+                require(bool(i.file),"truncated weight");
+                dst+=run;offset+=run;count-=run;
+            }
+        };
+        std::shared_ptr<void> storage;
+        if(i.host && weightBytes<=i.host->budget-i.host->bytes && i.hostBudget->acquire(weightBytes)) {
+            auto quota=i.hostBudget;
+            // The deleter owns the quota even if reading or cache insertion fails.
+            void *p=nullptr;
+            auto status=cudaHostAlloc(&p,weightBytes,cudaHostAllocPortable);
+            pinned=status==cudaSuccess;
+            if(status==cudaErrorInvalidValue) { cudaGetLastError();p=std::malloc(weightBytes); }
+            else if(status==cudaErrorMemoryAllocation) { cudaGetLastError();p=nullptr; }
+            else if(status!=cudaSuccess) { quota->release(weightBytes);check(status); }
+            if(p) storage={p,[quota,weightBytes,pinned](void *x) {
+                if(pinned) cudaFreeHost(x);else std::free(x);
+                quota->release(weightBytes);
+            }};
+            else quota->release(weightBytes);
+        }
+        if(storage) {
+            readSlice(static_cast<uint8_t *>(storage.get()),0,weightBytes);
+            source=storage.get();
+            i.host->tensors.emplace(name,Impl::HostCache::Buffer{std::move(storage),pinned});
+            i.host->bytes+=weightBytes;
+        } else {
+            raw=Tensor(rows,cols,dtype=="F32"?DType::FP32:DType::BF16);
+            buffer.resize(std::min(weightBytes,size_t(16)<<20));
+            for(size_t offset=0;offset<weightBytes;offset+=buffer.size()) {
+                size_t count=std::min(buffer.size(),weightBytes-offset);
+                readSlice(buffer.data(),offset,count);
+                copy(reinterpret_cast<uint8_t *>(raw.data)+offset,buffer.data(),count,cudaMemcpyHostToDevice);
+            }
+        }
+    }
     if(!raw.data && !source && i.mapping) source=static_cast<const uint8_t *>(i.mapping.get())+i.base+uint64_t(a);
     else if(!raw.data && !source) {
         buffer.resize(uint64_t(z-a)); i.file.clear(); i.file.seekg(i.base+uint64_t(a));
@@ -1162,7 +1262,7 @@ const Tensor &Weights::get(const std::string &name) {
         source=buffer.data();
     }
     std::vector<uint8_t> partitionBytes;
-    if(source && sliced && !(i.host && i.host->tensors.count(name))) {
+    if(source && sliced && !i.hostBudget && !(i.host && i.host->tensors.count(name))) {
         const auto &p=partition->second;
         const size_t scalarBytes=dtype=="F32"?4:2;
         partitionBytes.resize(weightBytes);
@@ -1180,7 +1280,7 @@ const Tensor &Weights::get(const std::string &name) {
         }
         source=partitionBytes.data();
     }
-    if(source && i.host && !i.host->tensors.count(name) && weightBytes<=i.host->budget-i.host->bytes) {
+    if(source && !i.hostBudget && i.host && !i.host->tensors.count(name) && weightBytes<=i.host->budget-i.host->bytes) {
         void *p=nullptr;
         auto status=cudaHostAlloc(&p,weightBytes,cudaHostAllocPortable);
         pinned=status==cudaSuccess;
@@ -1212,10 +1312,10 @@ const Tensor &Weights::get(const std::string &name) {
         // inference stream ordering without a host barrier for every weight.
         if(pinned) i.host->upload(raw.data,source,raw.bytes());
         else copy(raw.data,source,raw.bytes(),cudaMemcpyHostToDevice);
-        if(i.packed && dtype=="BF16" && raw.bytes()<=i.packed->budget-i.packed->bytes) {
-            i.packed->tensors.emplace(name,raw);
-            i.packed->bytes+=raw.bytes();
-        }
+    }
+    if(i.packed && dtype=="BF16" && !i.packed->tensors.count(name) && raw.bytes()<=i.packed->budget-i.packed->bytes) {
+        i.packed->tensors.emplace(name,raw);
+        i.packed->bytes+=raw.bytes();
     }
     auto value=i.rt.cast(raw,i.rt.dtype());
     return i.cache.emplace(name,std::move(value)).first->second;
@@ -1254,12 +1354,17 @@ void Weights::offload() {
 }
 void Weights::enableHostCache(size_t maxBytes) {
     auto &i=*impl_;
+    i.hostCacheLimit=maxBytes;
     i.host.reset();
+    if(i.hostBudget && maxBytes) {
+        i.host=std::make_shared<Impl::HostCache>();
+        i.host->budget=std::min(maxBytes,i.hostBudget->limit());
+    }
     // Leave most host RAM available to concurrent services and the file cache.
     // If the platform cannot report available RAM, retain the existing upload path.
     std::ifstream memory("/proc/meminfo");
     std::string line;
-    while(maxBytes && std::getline(memory,line)) {
+    while(!i.hostBudget && maxBytes && std::getline(memory,line)) {
         if(line.compare(0,13,"MemAvailable:")!=0) continue;
         size_t available=std::stoull(line.substr(13))*1024;
         i.host=std::make_shared<Impl::HostCache>();
@@ -1268,16 +1373,41 @@ void Weights::enableHostCache(size_t maxBytes) {
     }
     for(auto &shard:i.shards) shard.second->impl_->host=i.host;
 }
+void Weights::setHostMemoryBudget(const std::shared_ptr<HostMemoryBudget> &budget) {
+    auto &i=*impl_;
+    if(i.hostBudget==budget) return;
+    i.hostBudget=budget;
+    if(budget) i.mapping.reset();
+    enableHostCache(i.hostCacheLimit);
+    for(auto &shard:i.shards) {
+        shard.second->setHostMemoryBudget(budget);
+        shard.second->impl_->host=i.host;
+    }
+}
 void Weights::shareHostCache(const Weights &source) {
     impl_->checkCacheSource(*source.impl_);
     impl_->host=source.impl_->host;
-    for(auto &shard:impl_->shards) shard.second->impl_->host=impl_->host;
+    impl_->hostBudget=source.impl_->hostBudget;
+    if(impl_->hostBudget) impl_->mapping.reset();
+    for(auto &shard:impl_->shards) {
+        shard.second->impl_->host=impl_->host;
+        shard.second->impl_->hostBudget=impl_->hostBudget;
+        if(impl_->hostBudget) shard.second->impl_->mapping.reset();
+    }
 }
 void Weights::enablePackedCache(size_t reserveBytes) {
     auto &i=*impl_;
     if(i.packed) return;
     i.rt.activate();
     size_t available=0,total=0; check(cudaMemGetInfo(&available,&total));
+    if(activePool && activePool->maxBytes) {
+        int device=0;check(cudaGetDevice(&device));
+        if(activePool->device==device) {
+            uint64_t used=0;
+            check(cudaMemPoolGetAttribute(activePool->handle,cudaMemPoolAttrUsedMemCurrent,&used));
+            available=activePool->maxBytes>used?activePool->maxBytes-used:0;
+        }
+    }
     if(available<=reserveBytes) return;
     i.packed=std::make_shared<Impl::PackedCache>();
     i.packed->budget=std::min(available/2,available-reserveBytes);

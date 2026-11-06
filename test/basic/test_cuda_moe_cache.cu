@@ -651,7 +651,8 @@ static void CompareNumaCache(fastllm::DataType dtype, int nodes, int batch,
                 w.FreeSpace();
                 w.dataType = usePlanar ? fastllm::DataType::NVFP4_BLOCK_16_PLANAR
                                     : storageType;
-                w.isPinned = true;
+                w.isPinned = !std::getenv("FT_PINNED_WEIGHT") ||
+                    std::strcmp(std::getenv("FT_PINNED_WEIGHT"), "0") != 0;
                 w.UpdateUnitSize();
             }
         };
@@ -681,10 +682,8 @@ static void CompareNumaCache(fastllm::DataType dtype, int nodes, int batch,
         } else {
             Require(!FastllmCudaPrepareMoeCache(layers[2], tables, [&] {
                 registerWeights();
-                if (weightType == fastllm::DataType::NVFP4_BLOCK_16_E4M3)
-                    owned[2][0]->isPinned = false;
-                else owned[2][0]->numasData[0] = nullptr;
-            }), "unpinned NUMA source accepted");
+                owned[2][0]->numasData[0] = nullptr;
+            }), "invalid NUMA source accepted");
             for (int table = 0; table < tables; ++table)
                 Require(!FastllmCudaCanRunMoeCache(weights[2][table].data(), 2 * (experts + 1)),
                         "invalid NUMA source published a cache");

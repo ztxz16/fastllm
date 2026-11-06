@@ -56,6 +56,7 @@ using CustomArFlag = uint32_t;
 
 enum class CustomArEnableMode {
     Disabled,
+    Preferred,
     Auto,
     Forced,
 };
@@ -64,7 +65,7 @@ CustomArEnableMode CustomArModeFromEnv() {
     static const CustomArEnableMode mode = []() {
         const char *env = std::getenv("FASTLLM_CUDA_CUSTOM_ALLREDUCE");
         if (env == nullptr || env[0] == '\0') {
-            return CustomArEnableMode::Auto;
+            return CustomArEnableMode::Preferred;
         }
         std::string value(env);
         std::transform(value.begin(), value.end(), value.begin(),
@@ -75,6 +76,9 @@ CustomArEnableMode CustomArModeFromEnv() {
         }
         if (value == "auto") {
             return CustomArEnableMode::Auto;
+        }
+        if (value == "prefer") {
+            return CustomArEnableMode::Preferred;
         }
         return CustomArEnableMode::Disabled;
     }();
@@ -145,9 +149,9 @@ void LogCustomArDisabledOnce() {
     std::call_once(once, []() {
         std::fprintf(stderr,
                      "[Fastllm] graph-safe custom all-reduce is disabled; "
-                     "unset FASTLLM_CUDA_CUSTOM_ALLREDUCE or set it to auto "
-                     "to benchmark the current 2/4/6/8-GPU path, or set it "
-                     "to 1 to force-enable.\n");
+                     "unset FASTLLM_CUDA_CUSTOM_ALLREDUCE or set it to prefer "
+                     "to use validated custom paths, set it to auto to "
+                     "benchmark against NCCL, or to 1 to force-enable.\n");
         std::fflush(stderr);
     });
 }
@@ -2407,9 +2411,9 @@ bool CheckCustomArCorrectnessTyped(const CustomArState &state,
             float expectedRounded = CustomArHostToFloat<T>(
                 CustomArHostFromFloat<T>(expected[index]));
             float actual = CustomArHostToFloat<T>(host[index]);
-            if (std::fabs(actual - expectedRounded) > 0.001f) {
+            if (!std::isfinite(actual) || std::fabs(actual - expectedRounded) > 0.001f) {
                 std::fprintf(stderr,
-                             "[Fastllm] custom all-reduce auto-test "
+                             "[Fastllm] custom all-reduce self-test "
                              "mismatch on GPU %d at element %d: expected "
                              "%.6f, got %.6f.\n",
                              state.devices[rank], index,
@@ -2567,7 +2571,7 @@ bool BenchmarkCustomArPath(const CustomArState &state,
         customUs > 0.0f && ncclUs > 0.0f;
 }
 
-uint32_t AutoTuneCustomAr(CustomArState &state) {
+uint32_t SelectCustomArPaths(CustomArState &state, bool benchmarkPerformance) {
     struct ScopedNcclForceSync {
         bool previous = FastllmCudaGetNcclForceSync();
         ScopedNcclForceSync() {
@@ -2606,7 +2610,7 @@ uint32_t AutoTuneCustomAr(CustomArState &state) {
         CustomArBenchBuffers buffers;
         if (!AllocateCustomArBenchBuffers(state.devices, path.bytes, buffers)) {
             std::fprintf(stderr,
-                         "[Fastllm] custom all-reduce auto-test could not "
+                         "[Fastllm] custom all-reduce self-test could not "
                          "allocate the %s %s-message buffers; keeping NCCL "
                          "for that path.\n",
                          path.typeName, path.sizeName);
@@ -2616,17 +2620,26 @@ uint32_t AutoTuneCustomAr(CustomArState &state) {
             state, buffers, path.bytes, path.dataType);
         float customUs = 0.0f;
         float ncclUs = 0.0f;
-        bool benchmarkOk = correctnessOk && BenchmarkCustomArPath(
-            state, buffers, path.bytes, path.dataType,
-            useCudaGraph, customUs, ncclUs);
+        bool benchmarkOk = correctnessOk && (!benchmarkPerformance ||
+            BenchmarkCustomArPath(state, buffers, path.bytes, path.dataType,
+                                  useCudaGraph, customUs, ncclUs));
         FreeCustomArBenchBuffers(state.devices, buffers);
 
         if (!correctnessOk) {
             std::fprintf(stderr,
-                         "[Fastllm] custom all-reduce auto-test failed "
+                         "[Fastllm] custom all-reduce self-test failed "
                          "correctness for the %s %s-message path; using "
                          "NCCL.\n",
                          path.typeName, path.sizeName);
+            continue;
+        }
+        if (!benchmarkPerformance) {
+            enabledPaths |= path.bit;
+            std::fprintf(stderr,
+                         "[Fastllm] custom all-reduce self-test: %zu GPUs, "
+                         "%s %s %zu KiB: correctness passed -> custom preferred.\n",
+                         state.devices.size(), path.typeName, path.sizeName,
+                         (size_t)(path.bytes / 1024ULL));
             continue;
         }
         if (!benchmarkOk) {
@@ -2930,7 +2943,7 @@ bool FastllmCudaCustomAllReduceInit(const std::vector<int> &devices) {
     }
     state.initialized = true;
     state.enabledPaths.store(kCustomArAllPaths, std::memory_order_release);
-    // Keep the public path disabled while auto mode exercises the private
+    // Keep the public path disabled while selection exercises the private
     // candidate. Concurrent callers safely retain NCCL until selection ends.
     state.runtimeEnabled.store(false, std::memory_order_release);
     const bool pushAvailable = state.pushAvailable;
@@ -2957,7 +2970,7 @@ bool FastllmCudaCustomAllReduceInit(const std::vector<int> &devices) {
         return valid && enabledPaths != 0;
     };
 
-    if (!autoMode) {
+    if (mode == CustomArEnableMode::Forced) {
         bool enabled = publishPolicy(kCustomArAllPaths);
         if (!enabled) {
             return false;
@@ -2972,23 +2985,24 @@ bool FastllmCudaCustomAllReduceInit(const std::vector<int> &devices) {
         return true;
     }
 
-    uint32_t enabledPaths = AutoTuneCustomAr(state);
+    uint32_t enabledPaths = SelectCustomArPaths(state, autoMode);
     bool enabled = publishPolicy(enabledPaths);
     if (!policyPublished) {
         return false;
     }
     if (enabledPaths == 0) {
         std::fprintf(stderr,
-                     "[Fastllm] custom all-reduce auto mode retained NCCL "
-                     "for every tested path.\n");
+                     "[Fastllm] custom all-reduce %s mode retained NCCL "
+                     "for every tested path.\n", autoMode ? "auto" : "prefer");
     } else {
         int selectedPathCount = 0;
         for (uint32_t bit = 1; bit <= kCustomArFloatLargePath; bit <<= 1) {
             selectedPathCount += (enabledPaths & bit) != 0 ? 1 : 0;
         }
         std::fprintf(stderr,
-                     "[Fastllm] custom all-reduce auto-enabled for %zu GPUs "
+                     "[Fastllm] custom all-reduce %s for %zu GPUs "
                      "(%d of 6 dtype/message paths).\n",
+                     autoMode ? "auto-selected" : "preferred",
                      devices.size(), selectedPathCount);
     }
     std::fflush(stderr);

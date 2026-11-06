@@ -1,6 +1,6 @@
 #pragma once
-
 #include "fastllm-cuda-record-copy.cuh"
+#include "fastllm-cuda-mapped-host.h"
 
 namespace fastllm {
 namespace cuda {
@@ -66,8 +66,17 @@ struct SharedExpertLayout {
         uint64_t payload = 0, source = 0;
         for (int part = 0; part < 2; ++part) {
             auto &view = weights[part];
-            const uint64_t shardBytes = uint64_t(view.sourceOffset) +
-                uint64_t(view.rowsPerShard / view.tileRows) * view.tileStride;
+            // sourceOffset can be a prefix inside every row (e.g. NVFP4's
+            // row-global FP32 scale). It is already included in tileStride;
+            // adding it after the final tile would read past the registered
+            // NUMA allocation. Preserve full tiles, or an external prefix if
+            // the final referenced payload actually extends beyond them.
+            const uint64_t tiles = view.rowsPerShard / view.tileRows;
+            const uint64_t finalPayload = uint64_t(view.sourceOffset) +
+                (tiles - 1) * view.tileStride + uint64_t(view.tileRows - 1) * view.rowStride +
+                uint64_t((view.rowBytes - 1) / view.blockBytes) * view.blockStride +
+                (view.rowBytes - 1) % view.blockBytes + 1;
+            const uint64_t shardBytes = std::max(tiles * view.tileStride, finalPayload);
             if (shardBytes > UINT32_MAX / shards) return false;
             view.groupRows = view.rows / view.rowGroups;
             view.shardBytes = shardBytes;
@@ -408,13 +417,16 @@ inline bool CopySharedExpertRecord(const SharedExpertLayout &layout, void *const
 // Upload each pinned NUMA shard contiguously, then restore the canonical
 // record entirely in VRAM. Reuse staging only on this stream after the gather;
 // the caller publishes cache residency after both operations have completed.
-// Layouts with separate auxiliary metadata retain their existing adapter.
+// Auxiliary metadata (for example original NVFP4 E4M3 scales) is uploaded
+// separately and retains the same byte spans as the mapped-memory adapter.
 inline bool UploadSharedExpertRecord(const SharedExpertLayout &layout,
         void *const *hostPointers, uint8_t *staging, size_t stagingBytes,
-        uint8_t *destination, cudaStream_t stream) {
-    const size_t bytes = size_t(layout.sourceBytes[0]) + layout.sourceBytes[1];
+        uint8_t *destination, cudaStream_t stream, const uint8_t *hostAuxiliary = nullptr,
+        const MappedHostBuffer *auxiliaryOwner = nullptr, bool pinned = true) {
+    const size_t payload = size_t(layout.sourceBytes[0]) + layout.sourceBytes[1];
+    const size_t bytes = payload + layout.auxiliaryBytes;
     if (!hostPointers || !staging || !destination || staging == destination ||
-        layout.auxiliaryBytes || !bytes || stagingBytes < bytes) return false;
+        (layout.auxiliaryBytes && !hostAuxiliary) || !bytes || stagingBytes < bytes) return false;
     for (int part = 0; part < 2; ++part) {
         const auto &view = layout.weights[part];
         if (!view.Valid(layout.shards, layout.recordBytes) || !view.shardBytes ||
@@ -426,13 +438,21 @@ inline bool UploadSharedExpertRecord(const SharedExpertLayout &layout,
     for (int part = 0; part < 2; ++part) {
         const size_t shardBytes = layout.weights[part].shardBytes;
         for (unsigned shard = 0; shard < layout.shards; ++shard) {
-            if (cudaMemcpyAsync(staging + offset, hostPointers[part * layout.shards + shard],
-                    shardBytes, cudaMemcpyHostToDevice, stream) != cudaSuccess) return false;
+            if (UploadImmutableHostWeight(staging + offset, hostPointers[part * layout.shards + shard],
+                    shardBytes, pinned, stream) != cudaSuccess) return false;
             offset += shardBytes;
         }
     }
+    if (layout.auxiliaryBytes) {
+        const auto state = auxiliaryOwner ? auxiliaryOwner->CopyToDeviceAsync(
+            staging + payload, hostAuxiliary, layout.auxiliaryBytes, stream) :
+            cudaMemcpyAsync(staging + payload, hostAuxiliary, layout.auxiliaryBytes,
+                            cudaMemcpyHostToDevice, stream);
+        if (state != cudaSuccess) return false;
+    }
     return CopySharedExpertRecord(layout, nullptr, staging,
-        staging + layout.sourceBytes[0], nullptr, destination, stream);
+        staging + layout.sourceBytes[0], layout.auxiliaryBytes ? staging + payload : nullptr,
+        destination, stream);
 }
 
 // Prepare() validates layouts and derives source extents once when binding the

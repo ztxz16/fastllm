@@ -54,6 +54,7 @@
 #endif
 
 #include <algorithm>
+#include "devices/disk/diskdevice.h"
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -96,12 +97,14 @@ namespace fastllm {
         std::vector<RoutedExpertWorkspace> routedExperts;
         std::vector<void *> moeHandles;
         bool hybridExperts = false;
+        std::unique_ptr<DiskMoeV41Graph> diskExperts;
         // Resolve immutable packed weights during warmup and keep them alive
         // until ClearGraphs has destroyed every graph referencing them.
         std::map<int, Data> packedQkvWeights;
         std::map<int, std::shared_ptr<void>> attentionTp;
 #ifdef USE_CUDA
         std::vector<void*> graphs, execs, starts, ends, reserved;
+        void *replayReady = nullptr;
         void ClearGraphs() {
             const int original = FastllmCudaGetDevice();
             for (size_t i = 0; i < devices.size(); ++i) {
@@ -114,12 +117,18 @@ namespace fastllm {
                 if (i < starts.size() && starts[i]) FastllmCudaEventDestroy(starts[i]);
                 if (i < ends.size() && ends[i]) FastllmCudaEventDestroy(ends[i]);
             }
+            if (replayReady) {
+                FastllmCudaSetDevice(devices.front());
+                FastllmCudaEventDestroy(replayReady);
+                replayReady = nullptr;
+            }
             // Parent executables must die before their native child buffers.
             for (size_t i = 0; i < routedExperts.size(); ++i) {
                 FastllmCudaSetDevice(devices.front());
                 if (routedExperts[i].exec) FastllmCudaGraphExecDestroy(routedExperts[i].exec);
                 if (i < moeHandles.size()) FastllmCudaReleaseNativeMoeFullGraph(moeHandles[i]);
             }
+            diskExperts.reset();
             routedExperts.clear(); moeHandles.clear();
             FastllmCudaGraphMemoryPoolRelease(reserved);
             graphs.clear(); execs.clear(); starts.clear(); ends.clear(); reserved.clear();
@@ -136,17 +145,39 @@ namespace fastllm {
         bool DsRunDraftGraph(DeepSeekV41DsparkWorkspace &state, const std::function<void()> &body) {
             const int root = state.devices.front();
             auto launch = [&]() {
-                if (state.parallelAttention) {
-                    AssertInFastLLM(MultiCudaLaunchGraphs(state.devices, state.execs),
+                if (state.devices.size() > 1) {
+                    const auto replay = [&] {
+                        std::vector<int> ok(state.devices.size(), 0);
+                        FastllmCudaSetDevice(root);
+                        if (!state.replayReady) state.replayReady = FastllmCudaEventCreate();
+                        // The caller has updated draft context and input metadata.
+                        // Join that producer before replay, then drain only the
+                        // graph streams, leaving target cache admissions running.
+                        FastllmCudaEventRecordCurrentThread(state.replayReady);
+                        auto runRank = [&](int rank, int) {
+                            FastllmCudaCurrentThreadStreamWaitEvent(state.replayReady);
+                            ok[rank] = rank == 0 && !state.moeHandles.empty()
+                                ? FastllmCudaLaunchNativeMoeFullGraph(state.execs[rank],
+                                    state.moeHandles.data(), int(state.moeHandles.size()))
+                                : FastllmCudaGraphLaunch(state.execs[rank]);
+                        };
+                        const bool queued = MultiCudaRunDeviceCallbacksEnqueueOnly(state.devices, runRank);
+                        const bool dispatched = queued
+                            ? MultiCudaSynchronizeDeviceCallbacks(state.devices)
+                            : MultiCudaRunDeviceCallbacks(state.devices, runRank);
+                        return dispatched && std::all_of(ok.begin(), ok.end(), [](int v) { return v != 0; });
+                    };
+                    AssertInFastLLM(state.diskExperts ? state.diskExperts->Launch(replay) : replay(),
                                     "DeepSeekV41 DSpark graph launch failed.");
                 } else {
-                    for (size_t i = 0; i < state.devices.size(); ++i) {
-                        FastllmCudaSetDevice(state.devices[i]);
-                        const bool ok = state.moeHandles.empty() ? FastllmCudaGraphLaunch(state.execs[i]) :
-                            FastllmCudaLaunchNativeMoeFullGraph(state.execs[i], state.moeHandles.data(),
+                    FastllmCudaSetDevice(root);
+                    const auto replay = [&] {
+                        return state.moeHandles.empty() ? FastllmCudaGraphLaunch(state.execs.front()) :
+                            FastllmCudaLaunchNativeMoeFullGraph(state.execs.front(), state.moeHandles.data(),
                                                               int(state.moeHandles.size()));
-                        AssertInFastLLM(ok, "DeepSeekV41 DSpark graph launch failed.");
-                    }
+                    };
+                    AssertInFastLLM(state.diskExperts ? state.diskExperts->Launch(replay) : replay(),
+                                    "DeepSeekV41 DSpark graph launch failed.");
                 }
                 FastllmCudaSetDevice(root);
             };
@@ -156,14 +187,16 @@ namespace fastllm {
             if (state.disabled) return true; // Warmup already produced valid eager outputs.
             const int count = state.devices.size();
             std::vector<size_t> allocations;
-            if (count == 1) {
-                // Resolve persistent weights first, then record only transient
-                // work. Eager reuse alone does not provision every graph buffer.
+            {
+                // The backbone remains root-owned with TP attention/head too.
+                // Record its temporary allocations after persistent weights are
+                // ready: eager reuse does not provision every captured address.
                 FastllmCudaAllocationRecorder record(&allocations);
                 body();
             }
             if (state.disabled) return true;
-            if (count == 1) {
+            {
+                FastllmCudaSetDevice(root);
                 FastllmCudaSyncDevice(root);
                 if (!FastllmCudaReserveGraphWorkspace(allocations)) {
                     state.disabled = true;
@@ -1281,7 +1314,7 @@ namespace fastllm {
         fflush(stdout);
     }
 
-    void DeepSeekV41Model::ApplyDsparkDevice() {
+    void DeepSeekV41Model::ApplyDsparkDevice(bool targetComplete) {
         if (v41DsparkTpDevices.empty()) {
             ApplyDeviceMap(this->deviceMap, block_cnt, block_cnt);
             return;
@@ -1291,10 +1324,7 @@ namespace fastllm {
         // Leave the CUDA executor's device list empty: TP worker kernels use
         // their own current device when moving rank-local weights to CUDA.
 #ifdef USE_CUDA
-        if (DsExecutor().GetFirstDeviceType() == "multicuda" && !dsparkCapturing) {
-            // The draft path only consumes buffers owned by the first rank.
-            // Waiting for every TP rank here would serialize the draft with
-            // target work that is still draining on the other GPUs.
+        if (DsExecutor().GetFirstDeviceType() == "multicuda" && !dsparkCapturing && !targetComplete) {
             FastllmCudaSyncDevice(v41DsparkTpDevices.front());
         }
 #endif
@@ -2045,7 +2075,10 @@ namespace fastllm {
         }
 
         const double advanceStart = DsTick();
-        ApplyDsparkDevice();
+        // Full verification joins every rank before sampling, and prefix
+        // commit joins its worker streams before returning. The target's
+        // hidden states are ready; do not also wait for cache admissions.
+        ApplyDsparkDevice(bool(scratch.commitKV));
 
         // 1) main_x = main_norm(main_proj(cat(mean_hc(h_37), mean_hc(h_38), mean_hc(h_39))))
         Data combined, tmp;
@@ -2256,20 +2289,23 @@ namespace fastllm {
         Data &markovHeadWeight = weight[last + ".markov_head.head.weight"];
         Data eagerHeadHidden, eagerNormed, eagerMarkov;
         DeepSeekV41DsparkWorkspace *graphState = nullptr;
-        bool residentDraft = false, hybridDraft = false;
+        bool residentDraft = false, hybridDraft = false, diskDraft = false;
 #ifdef USE_CUDA
         // Device-resident experts can capture on one GPU as well as TP.
         // Partial windows use uploaded indices keyed by their gather width.
         std::unique_lock<std::mutex> graphLock(v41CudaGraphMutex, std::defer_lock);
         const std::vector<int> graphDevices = v41DsparkTpDevices.empty()
             ? std::vector<int>{FastllmCudaGetDevice()} : v41DsparkTpDevices;
-        residentDraft = v41DsparkTpDevices.empty();
+        // A forced resident TP draft keeps every routed expert on its root.
+        // Capture those local kernels with the existing TP attention/head;
+        // they need neither CPU mailboxes nor the packet-output restriction.
+        residentDraft = v41DsparkTpDevices.empty() || DsEnvFlag("FASTLLM_DSPARK_GPU_RESIDENT");
         if (residentDraft) for (auto &table : v41DsparkMoeWeights)
             residentDraft &= FastllmCudaMoeCacheFullyResident(table.data(), int(table.size()));
-        // Each native child must belong to the same serial cache owner. TP/EP
-        // continues through its persistent packet path; unsupported layouts
-        // stay eager. Do not reinterpret a partial cache as full residency.
-        if (!residentDraft && v41DsparkTpDevices.empty() && DsDraftGraphEnabled() && GetCudaSharedExpert()) {
+        // The draft backbone keeps its host experts on the root even with TP
+        // attention/head. EP keeps its persistent packet path; native children
+        // must all belong to that same root cache owner.
+        if (!residentDraft && DsDraftGraphEnabled() && GetCudaSharedExpert()) {
             void *owner = nullptr;
             hybridDraft = !v41DsparkMoeWeights.empty();
             for (auto &table : v41DsparkMoeWeights) {
@@ -2277,6 +2313,15 @@ namespace fastllm {
                 hybridDraft &= next && (!owner || owner == next);
                 owner = next;
             }
+        }
+        // Native disk drafts own a serial mailbox worker independently of
+        // target verification. Add every child during eager warmup, then start
+        // that worker only when the complete draft graph is replayed.
+        if (!residentDraft && !hybridDraft &&
+                block <= 32 && DsDraftGraphEnabled() && GetCudaSharedExpert()) {
+            diskDraft = !v41DsparkMoeWeights.empty();
+            for (const auto &table : v41DsparkMoeWeights)
+                diskDraft &= DiskMoeV41Graph::Supports(table);
         }
         const int vocab = weight["head.weight"].dims[0];
         const bool fusedMarkovAllowed = !config.tool_call_name_constraint_enabled &&
@@ -2306,8 +2351,7 @@ namespace fastllm {
              markovEmbedWeight.dataType == DataType::FLOAT16 || markovEmbedWeight.dataType == DataType::FLOAT32);
         const bool graphEligible = graphMarkov && DsDraftGraphEnabled() &&
             fusedMarkovAllowed && (!randomDraft || sampledMarkov) &&
-            v41MoeCudaGraphCompatible &&
-            (residentDraft || hybridDraft || v41DsparkTpDevices.size() > 1) &&
+            (residentDraft || hybridDraft || diskDraft || v41DsparkTpDevices.size() > 1) &&
             !DsEnvFlag("FASTLLM_DSV41_DISABLE_CUDA_ROUTE") && !DsEnvFlag("FASTLLM_DISABLE_NCCL");
         if (graphEligible && randomDraft) prepareProposalProbs(FastllmCudaGetDevice(), vocab);
         const Data &embedding = weight["embed.weight"];
@@ -2318,7 +2362,14 @@ namespace fastllm {
             embedding.strides.size() == 2 && embedding.strides[0] == dim && embedding.strides[1] == 1 &&
             anchorToken >= 0 && anchorToken < embedding.dims[0] &&
             v41DsparkNoiseTokenId >= 0 && v41DsparkNoiseTokenId < embedding.dims[0];
-        if (!deviceInputs) prepareInputs();
+        if (!deviceInputs) {
+            prepareInputs();
+            // Low-memory placement keeps embedding weights on the CPU. Only
+            // upload this small draft activation before capture/replay; the
+            // backbone and Markov head can still use the same complete graph.
+            if (graphEligible && embedded.dataDevice == DataDevice::CPU)
+                embedded.ToDevice(DataDevice::CUDA, {graphDevices.front()});
+        }
         std::vector<void*> cachePointers;
         for (auto &layer : dspark.layers) cachePointers.push_back(layer.windowKV.cudaData);
         if (deviceInputs) cachePointers.push_back(embedding.cudaData);
@@ -2336,7 +2387,8 @@ namespace fastllm {
                 auto &w = *dspark.workspace;
                 w.devices = graphDevices; w.block = block; w.width = width;
                 w.hybridExperts = hybridDraft;
-                if (hybridDraft) w.parallelExperts = false;
+                if (diskDraft) w.diskExperts = std::make_unique<DiskMoeV41Graph>();
+                if (hybridDraft || diskDraft) w.parallelExperts = false;
                 w.deviceInputs = deviceInputs;
                 w.sampledMarkov = sampledMarkov; w.temperature = config.temperature;
                 w.topK = config.top_k; w.topP = config.top_p;
@@ -2375,7 +2427,8 @@ namespace fastllm {
         HybridMoeDecodeStep draftStep;
         // Eager and captured drafts use the same frequency/staging policy.
         // Keep the scope through all draft layers and close it after sampling.
-        if (v41DsparkTpDevices.empty() && !v41DsparkMoeWeights.empty()) {
+        if (!v41DsparkMoeWeights.empty() &&
+                (v41DsparkTpDevices.empty() || (graphState && graphState->hybridExperts))) {
             auto &table = v41DsparkMoeWeights.front();
             draftStep.Begin(table.data(), int(table.size()), v41DsparkTopk);
         }
@@ -2608,8 +2661,29 @@ namespace fastllm {
                         SelectSpecialWeightDevice(pre + ".ffn.experts.0.gateup.weight", layerId));
                     bool hybrid = false;
 #if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
-                    if (graphState && graphState->hybridExperts && !hasSharedExpertOut)
+                    if (graphState && (graphState->hybridExperts || graphState->diskExperts) && !hasSharedExpertOut)
                         graphState->disabled = true;
+                    if (graphState && graphState->diskExperts && hasSharedExpertOut) {
+                        auto &state = *graphState;
+                        state.routedExperts.resize(v41DsparkLayers);
+                        auto &routed = state.routedExperts[stage];
+                        routed.input.CopyFrom(ffnInput);
+                        routed.index.CopyFrom(expertIndex);
+                        routed.score.CopyFrom(expertScore);
+                        if (!routed.graph && !dsparkCapturing) {
+                            routed.graph = state.diskExperts->Add(routed.input, routed.index, routed.score,
+                                routed.output, moeWeights, swiglu_limit);
+                            if (!routed.graph) state.disabled = true;
+                        }
+                        if (dsparkCapturing && !state.disabled) {
+                            AssertInFastLLM(FastllmCudaGraphAppendChild(routed.graph),
+                                           "DeepSeekV41 DSpark disk MoE graph failed.");
+                            ffnOut.CopyFrom(routed.output);
+                            hybrid = true;
+                        }
+                        // Eager warmups use MergeMOE below. A partial draft
+                        // must not launch a worker that expects later layers.
+                    }
                     if (graphState && graphState->hybridExperts && hasSharedExpertOut) {
                         auto &state = *graphState;
                         state.routedExperts.resize(v41DsparkLayers);
@@ -2651,7 +2725,7 @@ namespace fastllm {
                                   quantizedLinearNames.count(pre + ".ffn.experts.0.w1.weight") ? 32 : 128,
                                   quantizedLinearNames.count(pre + ".ffn.shared_experts.w1.weight") != 0);
                     // Only the persistent packet path supplies graph-safe EP buffers.
-                    if (graphState && !residentDraft && !graphState->hybridExperts && !ffnOut.cudaDataBorrowed) graphState->disabled = true;
+                    if (graphState && !residentDraft && !graphState->hybridExperts && !graphState->diskExperts && !ffnOut.cudaDataBorrowed) graphState->disabled = true;
                     ApplyDsparkDevice();
                     if (hasSharedExpertOut) {
 #ifdef USE_CUDA
@@ -2699,7 +2773,7 @@ namespace fastllm {
                     request.temperature = config.temperature;
                 }
                 headProjected = MultiCudaLinearOutputGatherPersistent(normed, weight["head.weight"], logits,
-                    v41DsparkHeadWorkspace, &request);
+                    v41DsparkHeadWorkspace, &request, true);
                 shardedMarkov = request.completed;
             }
 #endif

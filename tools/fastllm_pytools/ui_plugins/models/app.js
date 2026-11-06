@@ -5,6 +5,27 @@ import {
 } from "../../assets/app.js";
 
 let profileRenderSignature = "";
+let gpuInventoryPromise;
+function renderGpuChoices() {
+  gpuInventoryPromise ||= request("/api/hardware").catch(() => ({gpus: []}));
+  gpuInventoryPromise.then(report => {
+    const root = document.getElementById("gpu-choices");
+    const input = elements.launchForm.querySelector('[data-field="visible_gpus"]');
+    const selected = input.value.split(",").map(value => value.trim());
+    root.replaceChildren(...(report.gpus || []).map(gpu => {
+      const label = document.createElement("label"), checkbox = document.createElement("input");
+      checkbox.type = "checkbox"; checkbox.value = String(gpu.index);
+      checkbox.checked = selected.includes(checkbox.value) || selected.includes(gpu.uuid);
+      checkbox.onchange = () => {
+        input.value = [...root.querySelectorAll("input:checked")].map(node => node.value).join(",");
+        input.dispatchEvent(new Event("change", {bubbles: true}));
+      };
+      const text = document.createElement("span");
+      text.textContent = `GPU ${gpu.index} · ${gpu.name}`;
+      label.append(checkbox, text); return label;
+    }));
+  });
+}
 let folderPickerTarget = null, folderPickerDirectoriesOnly = false, folderPickerFileExtension = "";
 const AUTOMATIC_CONFIGURATION_DEFAULTS = Object.freeze({
   device: "auto",
@@ -73,6 +94,7 @@ function fillForm(config) {
   state.dirty = false;
   renderSaveState();
   updateConditionalFields();
+  renderGpuChoices();
 }
 
 function collectForm() {
@@ -87,7 +109,7 @@ function collectForm() {
 }
 
 function isSimpleNewProfile() {
-  return state.currentIndex === null && collectForm().config_mode !== "custom";
+  return (collectForm().backend || "llm") === "llm" && state.currentIndex === null && collectForm().config_mode !== "custom";
 }
 
 function renderProfilePresentation() {
@@ -113,6 +135,10 @@ function renderProfilePresentation() {
     ? t("Choose a model and configuration mode, then save or start your service.")
     : t("Edit all settings, or click Automatic configuration to choose a mode.");
   elements.configurationModeDescription.textContent = configurationModeDescription(mode);
+  const video = config.backend === "minimax_h3";
+  elements.launchForm.classList.toggle("video-profile", video);
+  document.getElementById("video-backend-fields").classList.toggle("hidden", !video);
+  if (video) elements.profileEditorDescription.textContent = t("Start a video API alongside your chat models. Pika is detected automatically.");
 }
 
 function configurationModeDescription(mode) {
@@ -181,6 +207,12 @@ function handleConfigurationModeChange() {
 function handleFormChange(event) {
   if (!event.target.matches("[data-field]")) return;
   const changedField = event.target.dataset.field;
+  if (changedField === "visible_gpus") renderGpuChoices();
+  if (changedField === "backend") {
+    cancelPendingAutomaticConfiguration();
+    state.automaticConfigStatus = {phase: "idle"};
+    elements.launchForm.querySelector('[data-field="command"]').value = "server";
+  }
   if (changedField === "speculative_algorithm" && event.target.value === "off") {
     for (const [field, value] of Object.entries({ mtp: "0", draft_tokens: "auto", speculative_draft_model_path: "" })) {
       elements.launchForm.querySelector(`[data-field="${field}"]`).value = value;
@@ -335,6 +367,7 @@ function prepareAutomaticConfigurationForNewProfile() {
 }
 
 function scheduleAutomaticConfiguration(delay = 650) {
+  if (collectForm().backend !== "llm") return;
   if (collectForm().config_mode === "auto") return;
   window.clearTimeout(state.automaticConfigTimer);
   state.automaticConfigRequestId += 1;
@@ -388,6 +421,7 @@ async function configureProfileAutomatically({ automatic = false, selection = nu
     const recommendation = await request("/api/recommend", {
       method: "POST",
       body: JSON.stringify({
+        visible_gpus: current.visible_gpus,
         model, name: current.name || current.model_name || "", config_mode: requested.config_mode,
         enable_speculative_decoding: requested.enable_speculative_decoding
       })
@@ -664,7 +698,8 @@ function renderProfiles() {
     ]),
     active,
     runningIndex,
-    state.runtime?.phase || "stopped"
+    state.runtime?.phase || "stopped",
+    state.runtime?.services?.map(service => [service.sessionId, service.phase])
   ]);
   if (signature === profileRenderSignature) {
     updateProfileRuntime();
@@ -706,7 +741,10 @@ function renderProfiles() {
   profiles.forEach(({ profile, index }) => {
     const item = document.createElement("article");
     item.className = "profile-item";
-    const running = index === runningIndex;
+    const service = (state.runtime?.services || [state.runtime]).find(service => runtimeIsActive(service)
+      && service.model === profile.model && service.endpoint?.endsWith(`:${profile.port}`)
+      && (service.backend || "llm") === (profile.backend || "llm"));
+    const running = Boolean(service);
     item.classList.toggle("running", running);
 
     const avatar = document.createElement("span");
@@ -735,7 +773,7 @@ function renderProfiles() {
     const actions = document.createElement("div");
     actions.className = "project-actions";
     const start = profileActionButton("start", index, t("Start"), "start");
-    start.disabled = active;
+    start.disabled = running;
     if (running) {
       const phaseLabels = {
         starting: t("Starting"),
@@ -743,12 +781,24 @@ function renderProfiles() {
         stopping: t("Stopping")
       };
       const status = document.createElement("span");
-      status.className = `profile-live-status ${state.runtime?.phase || "running"}`;
-      status.textContent = phaseLabels[state.runtime?.phase] || t("Running");
+      status.className = `profile-live-status ${service.phase || "running"}`;
+      status.textContent = phaseLabels[service.phase] || t("Running");
       titleRow.append(status);
-      start.textContent = phaseLabels[state.runtime?.phase] || t("Running");
+      start.textContent = phaseLabels[service.phase] || t("Running");
     }
-    if (active && !running) start.title = t("Stop the running service before starting another item.");
+    if (running) {
+      for (const [action, label] of [["select", t("Manage")], ["stop", t("Stop")]]) {
+        const button = document.createElement("button");
+        button.type = "button"; button.className = "project-action"; button.textContent = label;
+        button.addEventListener("click", async () => {
+          try {
+            state.runtime = await request(`/api/services/${service.sessionId}/${action}`, {method: "POST"});
+            renderRuntime();
+          } catch (error) { showToast(friendlyError(error), "error"); }
+        });
+        actions.append(button);
+      }
+    }
     actions.append(
       start,
       profileActionButton("edit", index, t("Edit"), "edit"),
@@ -756,7 +806,7 @@ function renderProfiles() {
     );
     item.append(avatar, copy, actions);
 
-    if (running) item.append(renderProfileRuntime());
+    if (running && service.sessionId === state.runtime?.sessionId) item.append(renderProfileRuntime());
     elements.profileList.append(item);
   });
 }
@@ -772,6 +822,8 @@ function profileActionButton(action, index, label, variant = "") {
 }
 
 function profileDeviceLabel(profile) {
+  if (profile.visible_gpus) return `GPU ${profile.visible_gpus}`;
+  if (profile.backend === "minimax_h3") return t("Video generation");
   if (profile.config_mode === "auto") return t("Automatic configuration");
   const devices = {
     auto: t("Auto device"),

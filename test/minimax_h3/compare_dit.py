@@ -17,6 +17,7 @@ assert torch.cuda.device_count() == 1, "Expose only the permitted GPU"
 p = argparse.ArgumentParser()
 p.add_argument("--model", default="/model/transformer")
 p.add_argument("--library", required=True)
+p.add_argument("--pika-adapter", help="Native Pika task directory, e.g. /pika/fl2va")
 p.add_argument("--output", required=True)
 p.add_argument("--precision", choices=["bf16", "fp32"], default="bf16")
 p.add_argument(
@@ -51,6 +52,21 @@ def load(module, prefix):
             state[name] = f.get_tensor(key).to(device="cuda", dtype=target)
     module.load_state_dict(state, assign=True)
 
+
+if a.pika_adapter:
+    assert not fp32, "Pika release requires BF16"
+    # PEFT's unmerged alpha/rank=1 path, expressed independently with torch ops.
+    # External hook tensors survive the streamed base modules' to_empty(meta).
+    with safe_open(str(Path(a.pika_adapter) / "adapter.safetensors"), framework="pt", device="cpu") as adapter:
+        for name, module in model.named_modules():
+            key = name + ".lora_A.default.weight"
+            if key not in adapter.keys():
+                continue
+            wa = adapter.get_tensor(key).to(device="cuda", dtype=torch.bfloat16)
+            wb = adapter.get_tensor(name + ".lora_B.default.weight").to(device="cuda", dtype=torch.bfloat16)
+            def lora_hook(m, inputs, output, wa=wa, wb=wb):
+                return output + torch.nn.functional.linear(torch.nn.functional.linear(inputs[0], wa), wb)
+            module.register_forward_hook(lora_hook)
 
 values = {}
 block_inputs = {}
@@ -124,13 +140,16 @@ lib = ctypes.CDLL(a.library)
 fp = ctypes.POINTER(ctypes.c_float)
 ip = ctypes.POINTER(ctypes.c_int)
 lib.h3_error.restype = ctypes.c_char_p
-lib.h3_transformer.argtypes = (
+forward = lib.h3_pika_transformer if a.pika_adapter else lib.h3_transformer
+forward.argtypes = (
     [ctypes.c_char_p] + [ctypes.c_int] * 4 + [fp] * 4 + [ip, fp, ctypes.c_char_p, fp, fp, ctypes.c_int]
 )
+if a.pika_adapter:
+    forward.argtypes += [ctypes.c_char_p, ctypes.c_int]
 v = np.empty_like(refs["video"])
 audio = np.empty_like(refs["audio"])
 args = [t.ctypes.data_as(ip if i == 4 else fp) for i, t in enumerate(inputs)]
-if lib.h3_transformer(
+if forward(
     str(root).encode(),
     nt,
     na,
@@ -141,6 +160,7 @@ if lib.h3_transformer(
     v.ctypes.data_as(fp),
     audio.ctypes.data_as(fp),
     fp32,
+    *([str(a.pika_adapter).encode(), int(root.name == "transformer_ref")] if a.pika_adapter else []),
 ):
     raise RuntimeError(lib.h3_error().decode())
 report = {}
@@ -180,6 +200,10 @@ if a.isolated_blocks:
     handle = lib.h3_create(str(root).encode(), int(fp32))
     if not handle:
         raise RuntimeError(lib.h3_error().decode())
+    if a.pika_adapter:
+        lib.h3_pika_load.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+        if lib.h3_pika_load(handle, str(a.pika_adapter).encode(), int(root.name == "transformer_ref")):
+            raise RuntimeError(lib.h3_error().decode())
     mod_indices = inputs[4] * 3 + np.array([1] * nt + [2] * na + [0] * nv, dtype=np.int32)
     isolated = {}
     try:

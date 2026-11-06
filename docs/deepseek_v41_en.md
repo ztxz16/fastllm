@@ -20,9 +20,17 @@ ftllm server /path/to/model-00001-of-00002.gguf --auto \
   --model_name deepseek-v4.1-flash --host 0.0.0.0 --port 8080
 ```
 
-Replace the example filename with the actual path. Keep the GGUF-referenced Engram file beside the backbone, with the filename and source matching its metadata. Multiple quantizations can link to one matching Engram file. HF models need their own Engram weights and configuration. `--ngram_device disk` controls on-demand table reads independently of the expert backend.
+Replace the example filename with the actual path. Both the earlier four-shard backbone plus separate Engram layout and the upstream llama.cpp six-shard layout are detected automatically. Existing models do not need conversion or a format flag.
+
+With `--ori`, startup defaults still follow the actual GGUF weights. Draft layers listed in the original HF configuration do not enable DSpark when those weights are absent from the GGUF.
+
+For the old layout, keep the Engram filename and source consistent with the backbone metadata. For ISTA's six-shard layout, keep shards 1–5 and `DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf` in the same directory. The shared file is shard 6; its original name or a `...-00006-of-00006.gguf` link is accepted. The old and new Engram headers differ, so retain matching files for each layout. Quantizations using the same layout can share a matching Engram file. HF models need their own Engram weights and configuration. `--ngram_device disk` controls on-demand table reads independently of the expert backend.
 
 Automatic defaults are one request, up to a 1M-token native window, FP4 KV, and fast prefill. Embedded DSpark weights enable DSpark 5 by default; GGUF files without those weights do not. Check `[auto]` for the selected devices, chunks, and caches. The planner prioritizes avoiding disk experts when GPU and host memory can hold them; Engram may still use disk independently.
+
+On SM120, `--auto` selects MXFP4 grouped MoE for single-GPU, single-request native HF FP4 models with DSpark 1–7, a CPU/NUMA expert cache, and Triton available in the current Python environment. Supported model dimensions are hidden 5120, MoE intermediate 2304, target top-6, draft top-3, SwiGLU limit 10, and block-32 UE8M0 expert weights. Only this operator is enabled automatically. SM121 retains manual `--triton` opt-in.
+
+Startup reports `SM120 MXFP4 grouped MoE enabled automatically`. With one visible GPU and sufficient space within the existing expert-cache budget, the cache policy prioritizes full draft residency. Unsupported inputs or compilation/loading failures fall back to built-in CUDA. Set `FASTLLM_CUDA_TRITON_MXFP4_GROUPED=0` to disable this operator, or `FASTLLM_CUDA_TRITON=0` to disable Triton automatic selection. Explicit environment settings take precedence.
 
 ## Common adjustments
 
@@ -37,12 +45,33 @@ Append only the options you need:
 | Prefill chunks and CPU threads | `--chunked_prefill_size 4096 --threads 32` |
 | Disable speculative decoding | `--speculative_algorithm off` |
 | Use 5 embedded DSpark drafts | `--dspark 5`; requires matching draft weights |
+| Require the complete DSpark expert cache on GPU | `--draft-gpu-resident 1`; `0` disables the full-residency preference; omit to retain existing policy |
 | DSpark confidence threshold | `--speculative_dspark_confidence_threshold 0.5`; `0` disables the threshold |
 | Enable / disable fast prefill | `--fast_prefill` / `--no_fast_prefill` |
 
 `--force_ddr_limit` replaces the final detected host-memory budget, including automatic reserves. Do not combine it with `--auto_host_memory_limit`; it is a planning setting, not an OS memory limit.
 
 Remove explicit settings to restore automatic selection. Resource limits constrain the plan, not actual process allocations, GPU architecture, or compute performance. See the [`--auto` guide](auto_en.md) for detailed effects and Launcher controls.
+
+## Explicit draft GPU residency
+
+For a GGUF backbone and matching MXFP4 DSpark experts:
+
+```sh
+ftllm server /path/to/model-IQ2_XXS-00001-of-00004.gguf --auto \
+  --draft /path/to/dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf \
+  --draft-gpu-resident 1
+```
+
+The option supports DeepSeek-V4.1 MXFP4 drafts on a single CUDA device, PP, or TP; it does not require Triton. Auto reserves the entire draft expert cache within the existing GPU budget: the final device for PP, or the first TP device. Other devices retain their target-model cache budget; the complete draft is not replicated on every TP device. The draft's existing TP attention/head path remains available. Auto may choose a smaller prefill chunk or reduce the target model's cache. CPU/NUMA expert storage remains allocated. Already GPU-resident draft weights are not cached twice. Add `--tp 2` to the command above for two-device TP.
+
+TP CUDA ordinals must be ascending: reversed TP has not passed numerical validation and this option rejects it before loading weights. To choose a different physical root, reorder `CUDA_VISIBLE_DEVICES` and use `--tp 2`.
+
+Forced-resident hybrid TP supports custom all-reduce together with target CUDA Graph replay. `FASTLLM_CUDA_CUSTOM_ALLREDUCE=0` selects NCCL. Full draft residency consumes some of the target expert cache budget; performance depends on available VRAM, cache hit rates, and draft acceptance, so it is not guaranteed to improve speed.
+
+CPU/NUMA expert caches and already GPU-resident experts are supported. Disk expert caches (`--moe_device disk`) are not supported by this option; Engram may still use disk independently.
+
+Omitting the option preserves the existing policy. `--draft-gpu-resident 0` uses proportional cache sharing instead of prioritizing full residency; it does not force CPU-only draft execution. The underscore alias `--draft_gpu_resident` also works. Manual configurations need sufficient `--moe_cuda_cache`. Insufficient budget, allocation failure, and unsupported configurations produce an error rather than silently accepting partial residency.
 
 ## Fast prefill
 

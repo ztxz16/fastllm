@@ -55,19 +55,20 @@ static std::vector<int> Reference(const std::vector<float> &scores,
     return expected;
 }
 
-int main() {
+int main(int argc, char **argv) {
     try {
         int devices = 0;
         if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) return 77;
         FastllmCudaSetDevice(0);
         unsetenv("FASTLLM_DSV41_LEGACY_TOPK");
         std::mt19937 random(1627);
+        const bool bench = argc == 2 && std::strcmp(argv[1], "--bench") == 0;
         int cases = 0;
-        for (int count : {1, 31, 127, 512, 513, 2048, 8192, 32769, 65537}) {
-            for (int sequence : {1, 3}) {
-                for (int pattern : {0, 1, 2, 3}) {
-                    for (int maskMode : {0, 1, 2, 3}) {
-                        for (int blockSize : {8, 7}) {
+        for (int count : bench ? std::vector<int>{492309} : std::vector<int>{1, 31, 127, 512, 513, 2048, 8192, 32769, 65537}) {
+            for (int sequence : bench ? std::vector<int>{32, 64, 128} : std::vector<int>{1, 3, 9, 65}) {
+                for (int pattern : bench ? std::vector<int>{0} : std::vector<int>{0, 1, 2, 3}) {
+                    for (int maskMode : bench ? std::vector<int>{0, 2} : std::vector<int>{0, 1, 2, 3}) {
+                        for (int blockSize : bench ? std::vector<int>{8} : std::vector<int>{8, 7}) {
                             const int ratio = 2;
                             const int start = pattern == 3 ? 3 : std::max(0, count * ratio - 4);
                             const int width = std::min(512, count);
@@ -98,6 +99,27 @@ int main() {
                                   cudaMemcpyDeviceToHost) == cudaSuccess, "output download failed");
                             Check(actual == expected, "Top-K differs from independent CPU reference");
                             ++cases;
+                            if (bench) {
+                                cudaEvent_t begin, end;
+                                cudaEventCreate(&begin);
+                                cudaEventCreate(&end);
+                                float total = 0;
+                                for (int run = 0; run < 12; ++run) {
+                                    cudaEventRecord(begin, cudaStreamPerThread);
+                                    Check(FastllmCudaDeepSeekV41IndexerTopK(score, maskMode ? &mask : nullptr,
+                                        512, ratio, start, blockSize, output), "benchmark Top-K");
+                                    cudaEventRecord(end, cudaStreamPerThread);
+                                    cudaEventSynchronize(end);
+                                    float ms;
+                                    cudaEventElapsedTime(&ms, begin, end);
+                                    if (run >= 2) total += ms;
+                                }
+                                std::printf("TOPK_BENCH tokens=%d count=%d mask=%d ms=%f\n",
+                                            sequence, count, maskMode, total / 10);
+                                std::fflush(stdout);
+                                cudaEventDestroy(begin);
+                                cudaEventDestroy(end);
+                            }
                         }
                     }
                 }

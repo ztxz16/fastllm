@@ -4,7 +4,14 @@
 #include <memory>
 #include <unordered_set>
 
-namespace fastllm { class Data; }
+namespace fastllm { class Data; class CudaWorkspace; }
+
+// A serialized eager prefill may temporarily borrow empty/evictable cache
+// payload slots. Addresses and graph mapping tables remain stable. Call only
+// between complete decode steps; release all scratch before the next decode.
+std::shared_ptr<fastllm::CudaWorkspace> FastllmCudaBorrowMoeWorkspace(
+    fastllm::Data **weights, int weightsBatch, size_t bytes);
+std::shared_ptr<fastllm::CudaWorkspace> FastllmCudaGetMoeWorkspace(const fastllm::Data *gate);
 
 // Shared weight transport for host-expert prefill. The caller retains its
 // original projection, activation and reduction arithmetic. Resident records

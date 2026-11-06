@@ -1,3 +1,7 @@
+#include "utils/qwen38_hybrid.h"
+#include "models/deepseekv41-indexer.cuh"
+#include "devices/cuda/fastllm-prefill-workspace.h"
+#include "gguf.h"
 #include "devices/cuda/fastllm-cuda-v41-gguf.h"
 #include "devices/cuda/fastllm-cuda-gguf-projections.h"
 #include "devices/cuda/fastllm-cuda-gguf-linear-add.h"
@@ -1317,13 +1321,19 @@ namespace fastllm {
     }
 
     bool CudaTritonMxfp4GroupedEnabled() {
-        if (!CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON"))
-            return false;
+        const char *global = std::getenv("FASTLLM_CUDA_TRITON");
         const char *flag = std::getenv("FASTLLM_CUDA_TRITON_MXFP4_GROUPED");
+        const bool globalEnabled = CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON");
+        if (global && global[0] && !globalEnabled)
+            return false;
         if (flag && flag[0] && !CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON_MXFP4_GROUPED"))
             return false;
+        const bool explicitlyEnabled = globalEnabled || (flag && flag[0]);
+        if (!explicitlyEnabled && !CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON_MXFP4_GROUPED_AUTO"))
+            return false;
         const int arch = CudaTritonRuntimeArch();
-        return arch == 120 || arch == 121;
+        // SM121 retains manual opt-in; the automatic policy was measured on SM120.
+        return arch == 120 || (arch == 121 && explicitlyEnabled);
     }
 
     bool TryCudaTritonMxfp4Grouped(const Data &input, Data &activation, const unsigned char *records,
@@ -6303,8 +6313,12 @@ namespace fastllm {
     }
 
     bool CudaEmbedding::CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams) {
-        if (GetLowMemMode() || !GetCudaEmbedding() || datas.at("weight")->lockInCPU ||
-            datas.at("weight")->dataType == DataType::DATA_GGUF_FORMAT) {
+        const Data &weight = *datas.at("weight");
+        if (GetLowMemMode() || !GetCudaEmbedding() || weight.lockInCPU ||
+            (weight.dataType == DataType::DATA_GGUF_FORMAT &&
+             (!qwen38ForwardActive || weight.IsRepacked || weight.dims.size() != 2 ||
+              !GGUFSupportsCudaEmbedding((ggml_type)weight.ggmlType) ||
+              weight.dims[1] % ggml_blck_size((ggml_type)weight.ggmlType)))) {
             return false;
         }
         Data &input = *(datas.find("input")->second);
@@ -7174,7 +7188,10 @@ namespace fastllm {
                                             const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         int ratio = intParams.find("compressRatio") == intParams.end() ? 0 : intParams.find("compressRatio")->second;
         int startPos = intParams.find("startPos") == intParams.end() ? 0 : intParams.find("startPos")->second;
-        if (!FastllmCudaDeepSeekV41IndexerScore(*(datas.find("q")->second), *(datas.find("weights")->second),
+        const auto fp4 = intParams.find("fp4Query");
+        const auto score = fp4 != intParams.end() && fp4->second
+            ? FastllmCudaDeepSeekV41IndexerScoreFp4Query : FastllmCudaDeepSeekV41IndexerScore;
+        if (!score(*(datas.find("q")->second), *(datas.find("weights")->second),
                                                 *(datas.find("k")->second), ratio, startPos,
                                                 *(datas.find("output")->second))) {
             ErrorInFastLLM("DeepSeekV41IndexerScore CUDA error: kernel rejected input.\n");
@@ -9158,6 +9175,52 @@ namespace fastllm {
         CudaMergeMoeFromCpuWorkspace &workspace =
             GetCudaMergeMoeFromCpuWorkspace(curDeviceId);
         std::lock_guard<std::mutex> workspaceGuard(workspace.mutex);
+        // Keep release under the workspace lock, including early grouped-MMQ
+        // returns. Every transient belongs to this eager invocation; no
+        // captured decode storage, output tensor or weight alias is released.
+        struct ReleaseWorkspace {
+            CudaMergeMoeFromCpuWorkspace &work;
+            bool enabled;
+            ~ReleaseWorkspace() {
+                if (!enabled) return;
+                for (Data *data : {&work.tempInput, &work.tempMiddle,
+                        &work.tempSwiglu, &work.tempOutput, &work.tempFloatMiddle,
+                        &work.tempFloatSwiglu, &work.tempFloatOutput, &work.floatOutput})
+                    ReleasePrefillTemporary(*data);
+#ifndef USE_ROCM
+                ReleasePrefillTemporary(work.ggufGate);
+                ReleasePrefillTemporary(work.ggufWorkspace);
+#endif
+#ifdef FASTLLM_ENABLE_DSV41_MXFP4_SM120
+                ReleasePrefillTemporary(work.mxfp4Scratch);
+#endif
+            }
+        } releaseWorkspace {workspace,
+#ifndef USE_ROCM
+            input.dims[0] >= 32 &&
+            FastllmCudaMoeCacheIsQwen38(weights, 4) &&
+            std::getenv("FASTLLM_QWEN38_PREFILL_REUSE") &&
+            std::string(std::getenv("FASTLLM_QWEN38_PREFILL_REUSE")) == "1" &&
+            !FastllmCudaGraphIsCapturingFast()
+#else
+            false
+#endif
+        };
+#ifndef USE_ROCM
+        // Decode and graph replay never borrow prefill storage.
+        auto prefillWorkspace = input.dims[0] > 32 && !FastllmCudaGraphIsCapturingFast()
+            ? FastllmCudaGetMoeWorkspace(weights[2]) : nullptr;
+        if (prefillWorkspace) {
+            releaseWorkspace.enabled = true;
+            for (Data *data : {&workspace.tempInput, &workspace.tempMiddle,
+                    &workspace.tempSwiglu, &workspace.tempOutput, &workspace.tempFloatMiddle,
+                    &workspace.tempFloatSwiglu, &workspace.tempFloatOutput, &workspace.floatOutput,
+                    &workspace.ggufGate, &workspace.ggufWorkspace}) {
+                if (data->cudaData) ReleasePrefillTemporary(*data);
+                data->cudaWorkspace = prefillWorkspace;
+            }
+        }
+#endif
         Data &tempInput = workspace.tempInput;
         Data &tempMiddle = workspace.tempMiddle;
         Data &tempSwiglu = workspace.tempSwiglu;

@@ -12,7 +12,8 @@ static void Require(bool ok, const char *message) {
     if (!ok) throw std::runtime_error(message);
 }
 
-static void Run(unsigned hidden, unsigned inter, unsigned shards, bool planar, unsigned sourceSkew = 0) {
+static void Run(unsigned hidden, unsigned inter, unsigned shards, bool planar,
+                unsigned sourceSkew = 0, bool auxiliary = false, bool packed = false, bool registered = false) {
     using namespace fastllm::cuda;
     SharedExpertLayout layout;
     layout.shards = shards;
@@ -20,12 +21,46 @@ static void Run(unsigned hidden, unsigned inter, unsigned shards, bool planar, u
     layout.weights[1] = SharedWeightView::Rows(hidden, inter / 32 * 17, shards);
     layout.weights[1].destinationOffset = 2 * inter * layout.weights[0].rowBytes;
     layout.recordBytes = layout.weights[1].destinationOffset + hidden * layout.weights[1].rowBytes;
+    if (packed) {
+        for (unsigned part = 0; part < 2; ++part) {
+            auto &view = layout.weights[part];
+            const unsigned columns = part ? inter : hidden;
+            view.rowBytes = columns / 2;
+            view.rowStride = view.tileStride = (4 + (columns / 16) * 9 + 3) & ~3u;
+            view.sourceOffset = 4; view.blockBytes = 8; view.blockStride = 9;
+        }
+        layout.weights[1].destinationOffset = 2 * inter * layout.weights[0].rowBytes;
+        layout.recordBytes = layout.weights[1].destinationOffset + hidden * layout.weights[1].rowBytes;
+    }
+    if (auxiliary) {
+        layout.auxiliaryBytes = 64;
+        layout.auxiliary[0] = {0, layout.recordBytes, 16};
+        layout.auxiliary[1] = {16, layout.recordBytes + 16, 32};
+        layout.auxiliary[2] = {48, layout.recordBytes + 48, 16};
+        layout.recordBytes += 64;
+    }
     for (auto &view : layout.weights) view.block32Planar = planar;
     Require(layout.Prepare(), "layout rejected");
-    const size_t bytes = size_t(layout.sourceBytes[0]) + layout.sourceBytes[1];
+    if (packed) for (const auto &view : layout.weights)
+        Require(view.shardBytes == view.rowsPerShard * view.rowStride, "row prefix extended NUMA shard");
+    const size_t bytes = size_t(layout.sourceBytes[0]) + layout.sourceBytes[1] + layout.auxiliaryBytes;
     constexpr unsigned records = 2, guard = 32;
     const size_t stride = size_t(layout.recordBytes) + 2 * guard;
     std::vector<void *> host(records * 2 * shards), mapped(host.size()), owners(host.size());
+    uint8_t *hostAuxiliary = nullptr, *mappedAuxiliary = nullptr;
+    MappedHostBuffer auxiliaryOwner;
+    if (auxiliary) {
+        if (registered) {
+            Check(auxiliaryOwner.Allocate((size_t(32) << 20) + records * layout.auxiliaryBytes));
+            Require(auxiliaryOwner.Registrations() >= 3, "auxiliary split registration not exercised");
+            const size_t offset = (size_t(16) << 20) - layout.auxiliaryBytes / 2;
+            hostAuxiliary = static_cast<uint8_t *>(auxiliaryOwner.Host()) + offset;
+            mappedAuxiliary = static_cast<uint8_t *>(auxiliaryOwner.Device()) + offset;
+        } else {
+            Check(cudaHostAlloc(&hostAuxiliary, records * layout.auxiliaryBytes, cudaHostAllocMapped));
+            Check(cudaHostGetDevicePointer(&mappedAuxiliary, hostAuxiliary, 0));
+        }
+    }
     for (unsigned i = 0; i < host.size(); ++i) {
         Check(cudaHostAlloc(&owners[i], layout.weights[(i / shards) % 2].shardBytes + sourceSkew, cudaHostAllocMapped));
         Check(cudaHostGetDevicePointer(&mapped[i], owners[i], 0));
@@ -41,10 +76,12 @@ static void Run(unsigned hidden, unsigned inter, unsigned shards, bool planar, u
     Check(cudaMalloc(&legacy, records * layout.recordBytes));
     cudaStream_t stream;
     Check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-    Require(!UploadSharedExpertRecord(layout, host.data(), scratch, bytes - 1, actual + guard, stream),
+    Require(!UploadSharedExpertRecord(layout, host.data(), scratch, bytes - 1, actual + guard, stream, hostAuxiliary),
         "short staging accepted");
-    Require(!UploadSharedExpertRecord(layout, host.data(), scratch, bytes, scratch, stream),
+    Require(!UploadSharedExpertRecord(layout, host.data(), scratch, bytes, scratch, stream, hostAuxiliary),
         "aliased staging accepted");
+    if (auxiliary) Require(!UploadSharedExpertRecord(layout, host.data(), scratch, bytes, actual + guard, stream),
+        "missing auxiliary metadata accepted");
     cudaGraph_t graph;
     cudaGraphExec_t exec;
     Check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
@@ -52,7 +89,9 @@ static void Run(unsigned hidden, unsigned inter, unsigned shards, bool planar, u
     // survive, detecting an overwrite before the preceding gather finishes.
     for (unsigned record = 0; record < records; ++record)
         Require(UploadSharedExpertRecord(layout, host.data() + record * 2 * shards,
-            scratch, bytes, actual + record * stride + guard, stream), "upload rejected");
+            scratch, bytes, actual + record * stride + guard, stream,
+            auxiliary ? hostAuxiliary + record * layout.auxiliaryBytes : nullptr,
+            registered ? &auxiliaryOwner : nullptr), "upload rejected");
     Check(cudaStreamEndCapture(stream, &graph));
     Check(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
     for (unsigned pass = 0; pass < 3; ++pass) {
@@ -63,25 +102,32 @@ static void Run(unsigned hidden, unsigned inter, unsigned shards, bool planar, u
         // Independent CPU oracle maps canonical gate/up rows to interleaved
         // NUMA rows; all packed codes and scale bytes must remain identical.
         for (unsigned record = 0; record < records; ++record) {
+            if (auxiliary) {
+                for (unsigned byte = 0; byte < layout.auxiliaryBytes; ++byte)
+                    hostAuxiliary[record * layout.auxiliaryBytes + byte] = (byte * 7 + record * 41 + pass * 19) & 255;
+                std::memcpy(expected.data() + (record + 1) * layout.recordBytes - layout.auxiliaryBytes,
+                    hostAuxiliary + record * layout.auxiliaryBytes, layout.auxiliaryBytes);
+            }
             for (unsigned part = 0; part < 2; ++part) {
                 const auto &v = layout.weights[part];
                 for (unsigned row = 0; row < v.rows; ++row) {
                     const unsigned physical = part == 0 ? 2 * (row % inter) + row / inter : row;
                     const unsigned node = physical / v.rowsPerShard, local = physical % v.rowsPerShard;
-                    const auto *source = static_cast<uint8_t *>(host[(record * 2 + part) * shards + node]) + size_t(local) * v.rowBytes;
+                    const auto *source = static_cast<uint8_t *>(host[(record * 2 + part) * shards + node]) + size_t(local) * v.rowStride + v.sourceOffset;
                     auto *destination = expected.data() + record * layout.recordBytes + v.destinationOffset;
                     for (unsigned byte = 0; byte < v.rowBytes; ++byte) {
                         const size_t canonical = size_t(row) * v.rowBytes + byte;
                         const size_t block = canonical / 17, within = canonical % 17;
                         const size_t offset = planar ? (within < 16 ? block * 16 + within :
                             size_t(v.rows) * (v.rowBytes / 17) * 16 + block) : canonical;
-                        destination[offset] = source[byte];
+                        destination[offset] = source[(byte / v.blockBytes) * v.blockStride + byte % v.blockBytes];
                     }
                 }
             }
             for (int stage : {0, 1})
                 Require(CopySharedExpertRecord(layout, devicePointers + record * 2 * shards,
-                    nullptr, nullptr, nullptr, legacy + record * layout.recordBytes, stream, stage), "staged copy rejected");
+                    nullptr, nullptr, auxiliary ? mappedAuxiliary + record * layout.auxiliaryBytes : nullptr,
+                    legacy + record * layout.recordBytes, stream, stage), "staged copy rejected");
         }
         Check(cudaMemsetAsync(actual, 0xa5, output.size(), stream));
         Check(cudaGraphLaunch(exec, stream));
@@ -103,7 +149,7 @@ static void Run(unsigned hidden, unsigned inter, unsigned shards, bool planar, u
         cudaGraph_t batchGraph;
         cudaGraphExec_t batchExec;
         Check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
-        Require(CopySharedExpertRecords(layout, devicePointers, nullptr, legacy,
+        Require(CopySharedExpertRecords(layout, devicePointers, mappedAuxiliary, legacy,
             ids, ids + 2, ids + 4, records, {32, 256}, stream), "batch copy rejected");
         Check(cudaStreamEndCapture(stream, &batchGraph));
         Check(cudaGraphInstantiate(&batchExec, batchGraph, nullptr, nullptr, 0));
@@ -125,21 +171,31 @@ static void Run(unsigned hidden, unsigned inter, unsigned shards, bool planar, u
     cudaGraphExecDestroy(exec); cudaGraphDestroy(graph); cudaStreamDestroy(stream);
     cudaFree(devicePointers); cudaFree(scratch); cudaFree(actual); cudaFree(legacy);
     for (auto p : owners) cudaFreeHost(p);
-    std::printf("PASS shared upload hidden=%u inter=%u shards=%u skew=%u bytes=%u staged and dynamic batch graphs\n",
-        hidden, inter, shards, sourceSkew, layout.recordBytes);
+    if (hostAuxiliary && !registered) cudaFreeHost(hostAuxiliary);
+    std::printf("PASS shared upload hidden=%u inter=%u shards=%u skew=%u auxiliary=%u bytes=%u staged and dynamic batch graphs\n",
+        hidden, inter, shards, sourceSkew, layout.auxiliaryBytes, layout.recordBytes);
 }
 
 int main(int argc, char **argv) {
     const bool planar = argc > 1 && std::string(argv[1]) == "--planar";
+    const bool registered = argc > 1 && std::string(argv[1]) == "--registered-auxiliary";
+    const bool auxiliary = registered || (argc > 1 && std::string(argv[1]) == "--auxiliary");
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices) return 77;
     try {
-        for (unsigned shards : {1u, 2u, 4u, 8u}) {
-            Run(96, 96, shards, planar);
-            Run(128, 128, shards, planar);
-            Run(512, 256, shards, planar);
-            Run(5120, 2304, shards, planar);
+        if (registered) {
+            for (unsigned shards : {1u, 2u, 4u, 8u}) Run(2560, 640, shards, false, 0, true, true, true);
+            std::puts("ALL_PASS shared auxiliary DMA across registrations");
+            return 0;
         }
+        for (unsigned shards : {1u, 2u, 4u, 8u}) {
+            Run(96, 96, shards, planar, 0, auxiliary);
+            Run(128, 128, shards, planar, 0, auxiliary);
+            Run(512, 256, shards, planar, 0, auxiliary);
+            Run(5120, 2304, shards, planar, 0, auxiliary);
+        }
+        if (auxiliary) for (unsigned shards : {1u, 2u, 4u, 8u})
+            Run(2560, 640, shards, false, 0, true, true);
         if (planar) for (unsigned skew : {1u, 2u, 3u}) Run(128, 96, 2, true, skew);
         std::puts("ALL_PASS shared expert DMA upload");
         return 0;

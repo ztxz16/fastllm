@@ -139,9 +139,16 @@ class AutoConfigTest(unittest.TestCase):
         self.assertGreater(auto._deepseek_priority(large, self.g, 'disk'),
                            auto._deepseek_priority(small, self.g, 'disk'))
         prompt = dict(large, chunked_prefill_size=4096, moe_cuda_cache=GiB//2)
+        # Bounded internal route slices keep large outer chunks streamed;
+        # the interactive soft target itself remains 4K.
+        self.assertEqual(auto._deepseek_priority(dict(prompt, chunked_prefill_size=8192), self.g, 'disk'),
+                         auto._deepseek_priority(prompt, self.g, 'disk'))
         self.assertGreater(auto._deepseek_priority(prompt, self.g, 'disk'),
                            auto._deepseek_priority(large, self.g, 'disk'))
-        fallback = dict(prompt, chunked_prefill_size=8192, moe_cuda_cache=3*GiB)
+        larger = dict(prompt, chunked_prefill_size=8192, moe_cuda_cache=3*GiB)
+        self.assertGreater(auto._deepseek_priority(larger, self.g, 'disk'),
+                           auto._deepseek_priority(prompt, self.g, 'disk'))
+        fallback = dict(larger, expert_transport_bytes_per_device=0)
         self.assertGreater(auto._deepseek_priority(prompt, self.g, 'disk'),
                            auto._deepseek_priority(fallback, self.g, 'disk'))
         # Concurrent decode does not multiply V4.1's streamed prefill rows.
@@ -489,6 +496,35 @@ class AutoConfigTest(unittest.TestCase):
             else:
                 calibrate.assert_called_once_with(5120, 2304, 16, 64)
 
+    def test_qwen_calibration_retains_mixed_gate_down_formats_and_real_shape(self):
+        from fastllm_pytools import cpu_tuning
+        self.g.hidden, self.g.intermediate, self.g.topk = 2560, 640, 10
+        tensors = [memory.Tensor('blk.0.ffn_gate_exps.weight', (512, 640, 2560), 100, 'gguf:22'),
+                   memory.Tensor('blk.0.ffn_up_exps.weight', (512, 640, 2560), 100, 'gguf:22'),
+                   memory.Tensor('blk.0.ffn_down_exps.weight', (512, 2560, 640), 70, 'gguf:42')]
+        self.assertEqual(auto.standard_moe_calibration_pair(tensors, self.g), (22, 42))
+        # A matching arithmetic shape alone must not change an unmeasured
+        # model/hardware profile's calibration dispatch.
+        for drafts in (0, 3):
+            args = self.args('--mtp', str(drafts))
+            with patch.object(memory, 'model_inputs', return_value=({}, tensors, self.g)), \
+                    patch.object(auto, 'cpu_threads', return_value=60), \
+                    patch.dict(os.environ, {}, clear=True), \
+                    patch.object(cpu_tuning, 'select_threads', side_effect=RuntimeError('dispatch')) as calibrate:
+                with self.assertRaisesRegex(RuntimeError, 'dispatch'):
+                    auto.resolve(args, self.gpu.__getitem__, hardware=self.hardware, ram=self.ram, use_numa=True)
+            calibrate.assert_called_once_with(2560, 640, 12, 60)
+
+    def test_native_nvfp4_calibration_requires_both_valid_e4m3_scale_shapes(self):
+        self.g.hidden, self.g.intermediate = 2560, 640
+        tensors = []
+        for part, rows, columns in (('gate', 640, 2560), ('down', 2560, 640)):
+            name = 'model.layers.0.mlp.experts.0.' + part + '_proj.weight'
+            tensors.extend([memory.Tensor(name, (rows, columns//2), rows*columns//2, 'U8'),
+                            memory.Tensor(name + '_scale', (rows, columns//16), rows*columns//16, 'F8_E4M3')])
+        self.assertEqual(auto.standard_moe_calibration_pair(tensors, self.g), (-1, -1))
+        self.assertIsNone(auto.standard_moe_calibration_pair(tensors[:-1], self.g))
+
     def test_auto_threads_record_linear_calibration(self):
         from fastllm_pytools import cpu_tuning
         self.g.hidden, self.g.intermediate = 2048, 1024
@@ -655,6 +691,18 @@ class AutoConfigTest(unittest.TestCase):
         a = self.args('--max_batch', '4', '--max_context_length', '8192', '--kv_cache_dtype', 'fp8_e4m3')
         self.resolve(a)
         self.assertEqual((a.max_batch, a.max_context_length, a.tokens, a.kv_cache_dtype), (4, 8192, 32768, 'fp8_e4m3'))
+
+    def test_forced_draft_residency_preserves_capacity_error_before_disk_fallback(self):
+        self.g.family = 'deepseek_v41'
+        seen = []
+        def reject(trial, *unused, **kw):
+            seen.append(trial.moe_device)
+            raise ValueError('complete draft exceeds device budget')
+        with patch.object(memory, 'plan', side_effect=reject):
+            with self.assertRaisesRegex(ValueError, 'complete draft exceeds device budget'):
+                self.resolve(self.args('--draft-gpu-resident', '1'))
+        self.assertIn('numa', seen)
+        self.assertNotIn('disk', seen)
 
     def test_unequal_expert_layers_use_weighted_pp_before_disk(self):
         self.g.family = 'deepseek_v41'
@@ -1229,6 +1277,212 @@ class AutoConfigTest(unittest.TestCase):
             runtime.set_cuda_graph.assert_called_once_with(graph)
             runtime.set_moe_cuda_cache.assert_called_once_with(0)
             self.assertEqual(model.hybrid_auto_plan['automatic']['cuda_graph'], graph)
+
+
+
+
+class NativeQwenMtpEmbeddingTest(unittest.TestCase):
+    """Real 48-layer native layout costs, using the actual capacity solver."""
+    def resolve(self, *, capacity=22, kind="BF16", options=(), environment=None, gguf_routed=False, workspace_loan=False):
+        g = memory.Geometry("qwen4",48,262144,2560,512,10,640,
+            [2176 if i%4 == 3 else 0 for i in range(48)]+[2176],
+            [0 if i%4 == 3 else 3440640 for i in range(48)]+[0],4,155648,4096,
+            streamed_kv=[2048 if i%4 == 3 else 0 for i in range(48)]+[2048])
+        if workspace_loan:
+            g.prefill_retained_width = 2560 * 4 * 8
+        dense = [141769216 if i%4 == 3 else 154793408 for i in range(48)]+[181136896]
+        dense[1] = 220473048
+        costs = ([1887449088]*48+[5033164800],dense,2182388192,103671889922,3355443200,False)
+        embedding = memory.Tensor("model.language_model.embed_tokens.weight",(248320,2560),1271398400,kind)
+        def weight_costs(tensors, model, args):
+            result = list(costs)
+            if args.cuda_embedding and not args.low_gpu_mem: result[2] += embedding.bytes
+            return tuple(result)
+        tensors = [embedding]
+        if gguf_routed:
+            tensors.extend([
+                memory.Tensor("blk.0.ffn_gate_exps.weight",(512,640,2560),1,"gguf:21"),
+                memory.Tensor("blk.0.ffn_up_exps.weight",(512,640,2560),1,"gguf:21"),
+                memory.Tensor("blk.0.ffn_down_exps.weight",(512,2560,640),1,"gguf:20")])
+        gpu = {0:dict(total=capacity*GiB,free=capacity*GiB-256*(1<<20))}
+        info = {0:dict(sm=40,clock_khz=1500000,memory_bandwidth=400e9,link_bandwidth=12e9,capability=75)}
+        args = make_normal_parser("test").parse_args([
+            "native-model","--auto","--device","cuda:0","--threads","60","--mtp","1",*options])
+        with patch.object(memory,"model_inputs",return_value=({},tensors,g)), \
+             patch.object(memory,"geometry",return_value=g), \
+             patch.object(memory,"weight_costs",side_effect=weight_costs), \
+             patch("fastllm_pytools.util._cuda_device_count",return_value=1), \
+             patch.dict(os.environ,environment or {},clear=True), redirect_stdout(io.StringIO()):
+            result = auto.resolve(args,gpu.__getitem__,hardware=(info,{(0,0):True}),
+                                  ram=dict(total=1024*GiB,available=900*GiB),use_numa=True)
+        for device, used in result["gpu_estimated_bytes"].items():
+            self.assertLessEqual(used,result["gpu_budget_bytes"][device])
+        self.assertLessEqual(result["host_estimated_bytes"],result["host_budget_bytes"])
+        return args,result
+
+    def test_qwen_vision_policy_respects_explicit_device_and_model_scope(self):
+        from types import SimpleNamespace
+        args = make_normal_parser("test").parse_args([])
+        model = SimpleNamespace(family="qwen4", layers=48, hidden=2560, intermediate=640, experts=512, topk=10)
+        tensors = [memory.Tensor("model.visual.blocks.0.attn.qkv.weight", (24,8),384,"F16")]
+        hardware = {0: {"capability":75}}
+        self.assertEqual(auto._qwen_hybrid_defaults(args,model,tensors,hardware,True)["FASTLLM_QWEN4_VISION_DEVICE"], "cpu")
+        for device in ("auto", "cpu", "cuda", "cuda:0"):
+            args.vision_device = device
+            self.assertNotIn("FASTLLM_QWEN4_VISION_DEVICE", auto._qwen_hybrid_defaults(args,model,tensors,hardware,True))
+        args.vision_device = None
+        self.assertNotIn("FASTLLM_QWEN4_VISION_DEVICE", auto._qwen_hybrid_defaults(args,model,[],hardware,True))
+        self.assertEqual(auto._qwen_hybrid_defaults(args,model,tensors,{0:{"capability":89}},True), {})
+
+    def test_independent_q8_defaults_and_explicit_choices(self):
+        config = json.dumps([dict(key=r"^lm_head\.weight$", dtype="ggml_q8_0")])
+        for mtp in ("0", "1"):
+            args, plan = self.resolve(options=("--dtype_config", config, "--mtp", mtp))
+            policy = plan["automatic"]["hybrid_optimizations"]
+            self.assertTrue(args.low_gpu_mem)
+            self.assertEqual(policy["FASTLLM_QWEN38_PREFILL_DEQUANT"], "1")
+            self.assertEqual(policy["FASTLLM_QWEN38_PREFILL_ARENA"], "1")
+            gpu, _ = self.resolve(options=("--dtype_config", config, "--mtp", mtp, "--cuda_embedding"))
+            self.assertFalse(gpu.low_gpu_mem)
+        _, original = self.resolve()
+        self.assertNotIn("FASTLLM_QWEN38_PREFILL_DEQUANT", original["automatic"]["hybrid_optimizations"])
+        self.assertNotIn("FASTLLM_QWEN38_PREFILL_ARENA", original["automatic"]["hybrid_optimizations"])
+        _, large = self.resolve(capacity=48, options=("--dtype_config", config))
+        self.assertNotIn("FASTLLM_QWEN38_PREFILL_ARENA", large["automatic"]["hybrid_optimizations"])
+        off = {key:"0" for key in ("FASTLLM_QWEN38_PREFILL_DEQUANT", "FASTLLM_QWEN38_PREFILL_ARENA")}
+        _, explicit = self.resolve(options=("--dtype_config", config), environment=off)
+        for key, value in off.items():
+            self.assertEqual(explicit["automatic"]["hybrid_optimizations"][key], value)
+
+    def test_native_mtp_pressure_improves_chunk_and_preserves_cache(self):
+        gpu, baseline = self.resolve(options=("--cuda_embedding",))
+        cpu, candidate = self.resolve()
+        self.assertFalse(gpu.low_gpu_mem)
+        self.assertTrue(cpu.low_gpu_mem)
+        self.assertFalse(cpu.cuda_embedding)
+        self.assertGreaterEqual(candidate["chunked_prefill_size"],2*baseline["chunked_prefill_size"])
+        self.assertGreater(candidate["moe_cuda_cache"],baseline["moe_cuda_cache"])
+        self.assertTrue(candidate["automatic"]["low_gpu_mem"])
+
+    def test_native_ordinary_pressure_uses_cpu_embedding_without_shrinking_chunk(self):
+        gpu, baseline = self.resolve(options=("--mtp", "0", "--cuda_embedding"))
+        cpu, candidate = self.resolve(options=("--mtp", "0"))
+        self.assertTrue(cpu.low_gpu_mem)
+        self.assertGreaterEqual(candidate["chunked_prefill_size"], baseline["chunked_prefill_size"])
+        self.assertGreaterEqual(candidate["moe_cuda_cache"] - baseline["moe_cuda_cache"], GiB)
+
+    def test_prefill_loan_does_not_spend_cache_savings_on_native_embedding(self):
+        gpu, normal = self.resolve(workspace_loan=True, options=("--mtp", "0", "--cuda_embedding"))
+        cpu, hybrid = self.resolve(workspace_loan=True, options=("--mtp", "0"))
+        self.assertTrue(cpu.low_gpu_mem)
+        self.assertGreater(hybrid.get("prefill_workspace_loan_bytes", 0), 0)
+        self.assertGreaterEqual(hybrid["chunked_prefill_size"], normal["chunked_prefill_size"])
+        self.assertGreaterEqual(hybrid["moe_cuda_cache"] - normal["moe_cuda_cache"], GiB)
+
+    def test_resident_mtp_experts_do_not_inflate_cache_loan_minimum(self):
+        _, result = self.resolve(workspace_loan=True, options=("--mtp", "3"))
+        self.assertGreater(result.get("prefill_workspace_loan_bytes", 0), 0)
+        self.assertGreater(result["moe_cuda_cache"], result["prefill_workspace_loan_bytes"])
+        self.assertTrue(any(result["runtime_bytes_per_device"]["graphs"].values()))
+
+    def test_phase_reuse_default_is_limited_to_small_single_request_gpu(self):
+        _, small = self.resolve()
+        _, large = self.resolve(capacity=48)
+        _, batch = self.resolve(options=("--max_batch", "2", "--max_context_length", "8192"))
+        for key in ("FASTLLM_QWEN38_PREFILL_REUSE",):
+            self.assertEqual(small["automatic"]["hybrid_optimizations"][key], "1")
+            self.assertNotIn(key, large["automatic"]["hybrid_optimizations"])
+            self.assertNotIn(key, batch["automatic"]["hybrid_optimizations"])
+
+    def test_qwen_hybrid_weight_slab_preserves_explicit_override(self):
+        for flags, expected in [((),64), (("--cuda_slab","0"),0), (("--cuda_slab","32"),32)]:
+            with self.subTest(flags=flags):
+                args, plan = self.resolve(capacity=24, options=flags)
+                self.assertEqual(args.cuda_slab, expected)
+                self.assertEqual(plan["cuda_slab"], expected)
+        _, slabs = self.resolve(capacity=24)
+        _, direct = self.resolve(capacity=24, options=("--cuda_slab", "0"))
+        self.assertLessEqual(direct["chunked_prefill_size"], slabs["chunked_prefill_size"])
+
+    def test_native_embedding_policy_preserves_explicit_and_unconstrained_choices(self):
+        for settings in (dict(capacity=48),dict(kind="gguf:23"),
+                         dict(options=("--cuda_embedding",)),
+                         dict(options=("--chunked_prefill_size","256"))):
+            with self.subTest(settings=settings):
+                args,_ = self.resolve(**settings)
+                self.assertFalse(args.low_gpu_mem)
+        args,_ = self.resolve(options=("--low_gpu_mem",))
+        self.assertTrue(args.low_gpu_mem)
+
+
+
+    def test_auto_thread_selection_uses_actual_pair_before_planning(self):
+        from fastllm_pytools import cpu_tuning
+        with patch.object(cpu_tuning,"select_threads",return_value=(32,{"selected":32,"method":"numa-moe"})) as select:
+            args, result = self.resolve(kind="gguf:23",gguf_routed=True,options=("--threads","-1"))
+            self.assertEqual(args.threads,32)
+            self.assertEqual(select.call_args.args[:3],(2560,640,21))
+            self.assertEqual(select.call_args.kwargs,{"numa":True,"rows":2,"topk":10,"down_type":20})
+            self.assertEqual(result["automatic"]["cpu_thread_benchmark"]["method"],"numa-moe")
+        with patch.object(cpu_tuning,"select_threads") as select:
+            self.resolve(kind="gguf:23",gguf_routed=True,options=("--threads","7"))
+            select.assert_not_called()
+
+    def test_hybrid_dispatch_respects_explicit_off_and_budgets_gemm(self):
+        _, candidate = self.resolve(kind="gguf:23",gguf_routed=True)
+        effective = candidate["automatic"]["hybrid_optimizations"]
+        self.assertEqual(effective["FASTLLM_QWEN38_HYBRID_GRAPH"],"1")
+        off = {key:"0" for key in auto._QWEN_HYBRID_ENV}
+        _, baseline = self.resolve(kind="gguf:23",gguf_routed=True,environment=off)
+        self.assertTrue(all(value == "0" for value in baseline["automatic"]["hybrid_optimizations"].values()))
+        self.assertEqual(candidate["chunked_prefill_size"],baseline["chunked_prefill_size"])
+        self.assertEqual(candidate["workspace_bytes_per_device"]-baseline["workspace_bytes_per_device"],96*(1<<20))
+        self.assertLess(candidate["moe_cuda_cache"],baseline["moe_cuda_cache"])
+        _, decode = self.resolve(kind="gguf:23",gguf_routed=True,options=("--mtp","0"))
+
+
+class HybridDispatchPolicyTest(unittest.TestCase):
+    def test_unmeasured_backends_and_shapes_keep_existing_policy(self):
+        g=memory.Geometry("qwen4",48,262144,2560,512,10,640,[0]*48,[0]*48,4,155648,4096)
+        a=types.SimpleNamespace(moe_device="numa",mtp=3)
+        t=[memory.Tensor("blk.0.ffn_gate_exps.weight",(512,640,2560),1,"gguf:21")]
+        gpu={0:{"capability":75}}
+        self.assertTrue(auto._qwen_hybrid_defaults(a,g,t,gpu,True))
+        for field,value in (("family","deepseek_v41"),("layers",47),("hidden",4096),("intermediate",768),("topk",8)):
+            changed=copy.copy(g);object.__setattr__(changed,field,value)
+            self.assertEqual(auto._qwen_hybrid_defaults(a,changed,t,gpu,True),{})
+        for hw,numa in (({0:{"capability":120}},True),({0:{"capability":75},1:{"capability":89}},True),(gpu,False)):
+            self.assertEqual(auto._qwen_hybrid_defaults(a,g,t,hw,numa),{})
+        dual = auto._qwen_hybrid_defaults(a,g,t,{0:{"capability":75},1:{"capability":75}},True)
+        self.assertEqual(dual["FASTLLM_QWEN38_OWNED_PP"], "1")
+        self.assertEqual(dual["FASTLLM_QWEN38_REMOTE_GRAPH"], "1")
+        self.assertNotIn("FASTLLM_QWEN38_OWNED_PP", auto._qwen_hybrid_defaults(a,g,t,gpu,True))
+        for backend in ("cpu","disk"):
+            a.moe_device=backend
+            self.assertEqual(auto._qwen_hybrid_defaults(a,g,t,gpu,True),{})
+
+    def test_next_model_does_not_inherit_automatic_dispatch(self):
+        owned={key: "1" for key in auto._QWEN_HYBRID_ENV}
+        with patch.dict(auto._AUTO_QWEN_ENV_APPLIED,owned,clear=True), \
+             patch.dict(os.environ,dict(owned,FASTLLM_QWEN38_HYBRID_GRAPH="0"),clear=True), \
+             patch.object(auto,"_resolve_impl",return_value={}):
+            auto.resolve(None,None)
+            self.assertEqual(os.environ["FASTLLM_QWEN38_HYBRID_GRAPH"],"0")
+            for key in owned.keys() - {"FASTLLM_QWEN38_HYBRID_GRAPH"}:
+                self.assertNotIn(key, os.environ)
+            self.assertEqual(auto._AUTO_QWEN_ENV_APPLIED,{})
+
+    def test_failed_planning_restores_dispatch_environment(self):
+        def failed(*args,**kwargs):
+            os.environ["FASTLLM_QWEN38_HYBRID_GRAPH"]="1"
+            os.environ["FASTLLM_QWEN38_PREFILL_DEQUANT"]="1"
+            raise ValueError("capacity")
+        with patch.dict(os.environ,{"FASTLLM_QWEN38_HYBRID_GRAPH":"0"},clear=True), \
+             patch.object(auto,"_resolve_impl",side_effect=failed):
+            with self.assertRaisesRegex(ValueError,"capacity"):
+                auto.resolve(None,None)
+            self.assertEqual(os.environ["FASTLLM_QWEN38_HYBRID_GRAPH"],"0")
+            self.assertNotIn("FASTLLM_QWEN38_PREFILL_DEQUANT",os.environ)
 
 
 if __name__ == '__main__':

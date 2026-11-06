@@ -59,6 +59,135 @@ MiniMax-H3/
 
 加载本地 safetensors / JSON 文件，无联网下载、转换脚本或额外权重副本。
 
+## Pika H3 Flex
+
+Pika 复用指定版本的 H3 基座（`42ed227ee7df40d41602854ae760620d6eb651fe`）。
+另下载官方 `Pika-Labs/Pika-H3-Flex` 的 `fl2va/` 与 `ref2va/`，每个目录须包含
+`manifest.json` 和原生 FP32 `adapter.safetensors`。两套增量合计约 5.15 GiB。
+不需要转换或复制基座；ComfyUI 格式的适配器不适用于此入口。
+
+```bash
+CUDA_VISIBLE_DEVICES=7 build-h3/src/models/minimax_h3/minimax_h3_generate \
+  --model /workspace2/hfmodels/Pika-H3-Flex \
+  --prompt 'A small orange cat plays a piano. Soft piano music fills the room.' \
+  --width 832 --height 480 --frames 124 --seed 42 \
+  --device 0 --output pika.mp4
+```
+
+CLI 和 HTTP 服务根据模型目录中的 `fl2va/manifest.json`、`ref2va/manifest.json`
+自动识别 Pika；不依赖目录名。识别后启用六次 DiT 前向，显式 `--steps` 只接受 `6`。
+文字／首尾帧模式加载 FL2VA，参考素材模式加载 Ref2VA。HTTP 模型名为
+`pika-h3-flex`，`num_inference_steps` 默认且只允许 6，Demo 自动识别。
+Pika CLI/HTTP 默认输出 832×480；参考图像短边随输出档位取 1024 或 2048，
+参考视频短边取 480、544 或 768，显式参考尺寸参数仍优先。
+
+Pika 发布的是适配器，仍需本地 MiniMax-H3 基座。默认依次查找模型目录中的
+`base_model` 目录或软链接、模型目录自身的基座组件、同级 `MiniMax-H3` 目录。
+若基座放在其他位置，使用 `--model PIKA --base-model BASE` 显式指定；显式路径优先，
+缺失或损坏的基座会报错，不会自动下载或退回原版模型。原来的
+`--model BASE --pika PIKA` 写法继续兼容，但不与 `--base-model` 混用。
+C++ 可调用 `resolveModelSource`（`models/minimax_h3/model_source.h`）取得基座与适配器路径，
+以基座构造 Pipeline，再执行 `pipeline.loadPika(adapterRoot)`，并设置 `GenerateOptions.steps = 6`。
+
+实现保留独立 LoRA 分支：FP32 文件加载为 BF16，两个低秩 GEMM 和基座结果相加时
+遵循 BF16 舍入；没有离线合并权重。使用 `[1000,750,500,250,100,40,0]` 网格、
+视频 shift=12／音频 shift=3，每步先计算 `x0 = x + sigma * velocity`，再用新噪声
+形成下一步输入；最后一步直接返回 x0。FL2VA 条件潜变量在加噪前舍入到 BF16，
+Ref2VA 保留 FP32。初始噪声、重新加噪、条件增强分别使用独立的随机数流。
+
+当前 Pika 路径支持 BF16 主干，已验证单卡和双卡；拒绝 FP32 主干配置。双卡使用
+`--devices 0,1` 并需要 NCCL，设备限制与下文的 H3 张量并行相同。例如：
+
+```bash
+CUDA_VISIBLE_DEVICES=6,7 build-h3/src/models/minimax_h3/minimax_h3_generate \
+  --model /workspace2/hfmodels/Pika-H3-Flex --devices 0,1 \
+  --prompt 'A small orange cat plays a piano. Soft piano music fills the room.' \
+  --width 832 --height 480 --frames 124 --seed 42 --output pika-tp2.mp4
+```
+
+LoRA 随基座投影切分：列并行复制 A、切分 B；行并行切分 A、复制 B。FFN up/gate
+分别切分。Pika 行投影的基座分支和 LoRA A 分支都先以 FP32 跨卡求和，再舍入至 BF16，
+两分支结果最后相加；该精度规则不受调用方的 H3 行归并策略影响。文本编码和视频 VAE
+继续使用现有 H3 并行路径，六步采样在 rank 0 执行，FL2VA/Ref2VA 可在请求间切换。
+
+图像尺寸、参考素材及帧数限制沿用下文的 H3 接口。种子在本实现内可复现，C++ 随机数序列与官方
+PyTorch CUDA 序列不同，同一个 seed 不承诺产生相同视频。`--model` 指向原版 H3 目录时，
+继续使用原采样器和默认参数。数值验证与生成实测见 [VALIDATION.md](VALIDATION.md)。
+
+## 显存、内存预算与磁盘加载
+
+CLI 与 HTTP 服务均支持以下可选参数，生成请求不能修改进程预算：
+
+| 参数 | 含义 |
+| --- | --- |
+| `--gpu-memory-limit GIB` | 每张 GPU 的预算；`0`／省略保留原有策略，非零须大于 1 |
+| `--host-memory-limit GIB` | 整个服务共享的主机内存预算；`0`／省略保留原有缓存策略，非零至少为 2 |
+
+```bash
+build-h3/src/models/minimax_h3/minimax_h3_generate \
+  --model /path/to/Pika-H3-Flex --base-model /path/to/MiniMax-H3 \
+  --prompt 'A small orange cat walks through a sunny garden.' \
+  --width 832 --height 480 --frames 124 \
+  --gpu-memory-limit 4 --host-memory-limit 2 --output cat.mp4
+
+# 双卡：每卡各有 4 GiB 预算，所有组件和 TP rank 共享一份 CPU 缓存预算。
+build-h3/src/models/minimax_h3/minimax_h3_server \
+  --model /path/to/Pika-H3-Flex --base-model /path/to/MiniMax-H3 \
+  --devices 0,1 --gpu-memory-limit 4 --host-memory-limit 4 --port 8009
+```
+
+`ftllm launch` 的视频启动项提供「每卡显存预算」和「主机内存预算」。`/health` 返回
+`gpu_memory_limit_gib`、`host_memory_limit_gib`、`gpu_memory_reserved` 和 `layer_streaming`。
+C++ 调用方在首次生成前调用 `pipeline.setGpuMemoryLimit(4)` 和 `pipeline.setHostMemoryLimit(2)`。
+
+**默认模式不改变原来的驻留、预取、精度和计算路径。** 显式 GPU 预算较充足时也保留原有
+执行方式：当前 BF16 主干／非 FP32 视频 VAE 的保守阈值为单卡 60 GiB、TP 每卡 48 GiB。
+较小预算才逐层换入文本、DiT、Pika LoRA 和视频 VAE，关闭双层预取及额外的 GPU 权重缓存。
+单独限制主机内存不会开启 GPU 逐层换入。精度、采样步数和分辨率不会自动改变。
+
+显式 GPU 预算使用独立 CUDA 内存池，上限为 `预算 − 1 GiB`，包括权重、dtype 转换、
+激活和注意力工作区。启动时实际申请整个池，再回收为池内可复用空间，并保留物理页；
+层间切换、请求结束及同步时不把这部分显存还给其他进程。预留失败在服务就绪前报错。
+另外的 1 GiB 是 CUDA 上下文、cuBLAS/NCCL、池外运行时的开销余量，并非额外可用的权重空间。
+显存池需要工具链／驱动支持 `cudaMemPoolProps::maxSize`，已在 CUDA 13.0 验证；旧工具链
+仍可运行默认模式。物理上限与回收阈值的区别见
+[CUDA 内存池 API](https://docs.nvidia.com/cuda/cuda-runtime-api/cuda_runtime_api/group__CUDART__MEMORY__POOLS.html)。
+
+显式主机内存预算中，`预算 − 2 GiB` 是所有组件、分片和 TP rank **合计**的权重缓存上限，
+优先使用锁页内存；分配失败或配额用尽则直接读文件。`2` 表示零权重缓存。
+未缓存的权重按最多 16 MiB 的缓冲区读取并上传，TP 只读本 rank 的切片，既不映射整份模型，
+也不建立整层 CPU 临时副本；无需转换或另存模型。操作系统可自行缓存、回收文件页。
+缓存很小时，速度依赖磁盘、文件页缓存和 PCIe 带宽。
+
+这些是**模型内存管理预算，不是 OS/cgroup 对整个进程的硬隔离**：主机的 2 GiB 是运行时、
+分块上传和媒体处理的余量，第三方库、FFmpeg、超长参考素材及 C++ 调用者保留的完整 RGB
+输出不属于权重配额。GPU 的库开销也随驱动和设备变化。部署时应给系统和其他服务留下余量。
+低显存文件输出只保留当前时间块，不在 GPU 上保存整段 FP32 视频。
+预算不足会明确报错，提示提高预算或降低输入尺寸／时长；HTTP worker 可继续处理后续请求。
+
+### 最低显存如何计算
+
+以下按实际 H3／Pika 权重形状、BF16 主干、FP16 视频 VAE 计算，不包含量化：
+
+| 部分 | 单块权重占用 | 处理方式 |
+| --- | ---: | --- |
+| 文本编码器词嵌入 | 1483.75 MiB | 使用后释放；这是文本阶段最大的单块 |
+| 文本编码器一层 | 约 930 MiB | 逐层模式关闭双层预取和 GPU 权重缓存 |
+| DiT 一层 | 约 735 MiB | AdaLN 已预计算并释放；50 层只驻留当前层 |
+| Pika 一层 LoRA | 25.375 MiB | 随主干层一起释放 |
+| 视频 VAE 解码一层 | 约 128 MiB | 逐层释放，包括打包的 QKV |
+
+DiT 主矩阵按 `2 × (4HA + 3HF)` 字节计算：`H=5376`、`A=56×128=7168`、
+`F=14336`，结果为 735 MiB，另有少量归一化参数。
+实际峰值还必须加上活跃张量、预计算的时间调制表、加载时的 dtype 转换和内存池碎片。
+默认 832×480、124 帧的潜空间有 `37×15×26=14430` 个视频 token，另加音频和文本 token。
+以 128 个文本 token 估算，打包序列约 14972 行，仅 Q/K 归一化时的输入和 Q/K/V 临时量
+就约 `2×N×(2H+5A)=1.30 GiB`，因此单层权重的 760 MiB 不能代表最低显存。
+
+各阶段串行，估算应取文本、DiT、VAE 的**阶段峰值最大值**，再加 CUDA／库开销，
+不必把三个完整模型相加。高分辨率、长视频、长提示词、多参考素材以及 H3 更多步数的调制表
+都会提高峰值。实测值与适用范围见 [VALIDATION.md](VALIDATION.md)。
+
 ## 命令行
 
 ```bash

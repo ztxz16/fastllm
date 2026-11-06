@@ -1,5 +1,8 @@
 #include "devices/moe_decode_scheduler.h"
 #include "devices/moe_frequency_policy.h"
+#include "devices/moe_prefill_policy.h"
+#include <random>
+#include <set>
 #include <cmath>
 #include <iostream>
 #include <stdexcept>
@@ -562,7 +565,154 @@ static void TestDecodeCompletion() {
     Require(p.Allow(4,0,1), "completion policy rejected CPU fallback");
 }
 
+static void TestWorkspaceSlots() {
+    using P = fastllm::MoeFrequencyPolicy;
+    fastllm::MoeCacheConfig config;
+    config.halfLife = 0; config.minHeat = 0; config.replacementMargin = 0;
+    P p({0,0,0,1,1,1}, {0,0,1,1}, 2, config);
+    const int owners[] = {0,1,3,4};
+    p.SetResidents(owners);
+    p.BeginStep(); int hot[] = {1,2,5}; p.Observe(0, hot, 3); p.EndStep();
+    const float heat = p.Score(1);
+    p.SetSlotAvailable(0, false); p.SetSlotAvailable(1, false);
+    Require(p.Slot(0) < 0 && p.Slot(1) < 0 && p.Score(1) == heat,
+        "lease did not evict payload while preserving heat");
+    for (int step = 0; step < 8; ++step) {
+        p.BeginStep(); p.Observe(0, hot, 3);
+        for (auto admission : p.EndStep()) Require(admission.slot >= 2, "decode admitted into leased slot");
+        p.ObservePrefill(0, {10,20,30}, 64);
+        Require(p.SelectPrefill(2, 0, {0,0,1}).slot < 0, "prefill admitted into leased partition");
+    }
+    bool rejected = false;
+    try { p.Admit(0, {2, 0}); } catch (const std::invalid_argument &) { rejected = true; }
+    Require(rejected, "stale admission plan accepted a leased slot");
+    p.SetSlotAvailable(0, true); p.SetSlotAvailable(1, true);
+    auto admission = p.SelectPrefill(2, 0, {0,0,1});
+    Require(admission.slot >= 0 && admission.slot < 2, "returned slots unavailable");
+    p.Admit(0, admission);
+    Require(p.Slot(2) == admission.slot, "returned empty slot was not refilled");
+}
+
+static void TestPrefillThresholdSearch() {
+    using namespace fastllm;
+    std::mt19937 rng(127);
+    for (int trial = 0; trial < 3000; ++trial) {
+        std::vector<MoePrefillExpertCost> experts(rng() % 513);
+        std::set<int> thresholds{1};
+        for (auto &e : experts) {
+            e = {int(rng() % (trial % 2 ? 8193 : 17)), bool(rng() % 3 == 0)};
+            if (e.routes) thresholds.insert(e.routes + 1);
+        }
+        const double cpuUnit = (rng() % 1000 + 1) / 100000., gpuUnit = (rng() % 1000 + 1) / 1000.;
+        MoePrefillSplit expected;
+        double best = INFINITY;
+        for (int t : thresholds) {
+            double cpuRoutes = 0, gpuMs = 0; bool active = false;
+            for (const auto &e : experts) if (e.routes) {
+                active = true;
+                if (!e.pinned && e.routes < t) cpuRoutes += e.routes;
+                else gpuMs += gpuUnit;
+            }
+            const double cpuMs = cpuRoutes * cpuUnit, cost = std::max(cpuMs, gpuMs);
+            if (active && cost < best) { best = cost; expected = {t, cpuMs, gpuMs}; }
+        }
+        const auto actual = PredictSingleGpuPrefillSplit(experts, cpuUnit, gpuUnit);
+        Require(actual.limit == expected.limit && actual.cpuMs == expected.cpuMs &&
+                actual.gpuMs == expected.gpuMs, "prefill threshold changed placement or predicted cost");
+    }
+    const auto tied = PredictSingleGpuPrefillSplit({{1,false},{1,false}}, 1., 1.);
+    Require(tied.limit == 1, "prefill threshold tie break changed");
+}
+
+static void TestPrefillCpuFeedback() {
+    using namespace fastllm;
+    // Tied route counts used to turn a two-expert probe into a whole group.
+    MoePrefillCpuProbe tiedProbe;
+    std::vector<MoePrefillExpertCost> tied(128, {1, false});
+    tied[0].pinned = true;
+    const auto picked = tiedProbe.Select(tied, 0);
+    Require(picked == std::vector<int>({1, 2}), "CPU probe exceeded expert budget or moved a resident");
+    MoePrefillCpuProbe small;
+    Require(small.Select({{0,false},{20,false}}, 0).empty(), "CPU probe left no GPU work");
+    Require(small.Select({{20,true},{20,true}}, 0).empty(), "CPU probe moved pinned experts");
+    Require(small.Select({{20,false},{20,false}}, 0) == std::vector<int>({0}),
+            "small-layer probe must retain a GPU sample");
+    MoePrefillCpuProbe budget;
+    std::vector<MoePrefillExpertCost> expensive(32, {1, true});
+    expensive[0] = {5,false}; expensive[1] = {6,false};
+    Require(budget.Select(expensive, 1) == std::vector<int>({0}), "CPU route budget was ignored");
+
+    std::mt19937 rng(319);
+    for (int trial = 0; trial < 3000; ++trial) {
+        MoePrefillCpuProbe probe;
+        std::vector<MoePrefillExpertCost> random(rng() % 513);
+        int active = 0, minimum = INT32_MAX;
+        int64_t total = 0, selectedRoutes = 0;
+        for (auto &e : random) {
+            e = {int(rng() % 8193), bool(rng() % 3 == 0)};
+            if (e.routes > 0) {
+                ++active; total += e.routes;
+                if (!e.pinned) minimum = std::min(minimum, e.routes);
+            }
+        }
+        auto selected = probe.Select(random, trial % 2);
+        Require(selected.size() <= 2 && (selected.empty() || int(selected.size()) < active),
+                "random probe exceeded expert budget or starved GPU");
+        std::set<int> unique;
+        for (int e : selected) {
+            Require(e >= 0 && e < int(random.size()) && random[e].routes > 0 && !random[e].pinned,
+                    "random probe selected an invalid, inactive or resident expert");
+            Require(unique.insert(e).second, "random probe repeated an expert");
+            selectedRoutes += random[e].routes;
+        }
+        Require(selectedRoutes <= std::max<int64_t>(total / 16, minimum),
+                "random probe exceeded route budget");
+    }
+
+    // Replay the observed cold estimates, then steady-state samples. Without
+    // re-probing, the valid all-GPU result never obtains another CPU sample.
+    MoePrefillCpuProbe recovery;
+    std::vector<MoePrefillExpertCost> experts(64, {500, false});
+    for (int e = 0; e < 16; ++e) experts[e].routes = 17;
+    double estimate = 0;
+    int samples = 0, recovered = -1;
+    for (int call = 0; call < 48; ++call) {
+        const int limit = samples < 2 ? 0 : PredictSingleGpuPrefillSplit(experts, estimate, .8).limit;
+        if (samples == 2) Require(limit == 1, "cold samples did not reproduce all-GPU lock-in");
+        if (limit > 1) { recovered = call; break; }
+        const auto probe = recovery.Select(experts, limit);
+        if (probe.empty()) continue;
+        const double sample = samples == 0 ? 44.701436 / 11 : samples == 1 ? 48.506518 / 34 : .1;
+        recovery.ObserveCpu(sample, estimate);
+        estimate = samples++ ? estimate * .7 + sample * .3 : sample;
+    }
+    Require(recovered >= 0 && recovered < 24, "cold CPU costs permanently trapped all work on GPU");
+
+    // A genuinely slow CPU receives bounded, exponentially spaced trials;
+    // periodic probes still recover if its speed changes much later.
+    MoePrefillCpuProbe slow;
+    int probes = 0, late = 0;
+    for (int call = 0; call < 512; ++call) {
+        const auto probe = slow.Select(experts, 1);
+        if (probe.empty()) continue;
+        ++probes; if (call >= 256) ++late;
+        slow.ObserveCpu(10, 10);
+    }
+    Require(probes <= 15 && late == 4, "slow CPU probing failed to back off or stopped forever");
+    slow.ObserveCpu(.1, 10);
+    Require(!slow.Select(experts, 1).empty(), "improved CPU sample did not restart rapid calibration");
+    Require(slow.Select(experts, 18).empty(), "normal measured placement was overridden");
+    // Invalid samples must not reset backoff.
+    slow.ObserveCpu(NAN, 10); slow.ObserveCpu(INFINITY, 10); slow.ObserveCpu(0, 10);
+    for (int i = 0; i < 8; ++i)
+        Require(slow.Select(experts, 1).empty(), "fresh normal CPU samples were immediately re-probed");
+    Require(!slow.Select(experts, 1).empty(), "CPU feedback did not resume after cooldown");
+}
+
 int main() {
+    TestPrefillCpuFeedback();
+    TestPrefillThresholdSearch();
+    TestWorkspaceSlots();
     TestDecodeCompletion();
     TestAdmissionPayback();
     TestFrequencyAdmission();

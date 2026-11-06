@@ -50,6 +50,8 @@ class Runtime : public nomas::Runtime {
     Tensor poolAudioHeads(const Tensor &, int heads, int dimensions);
     Tensor affine(const Tensor &, float scale, float bias = 0, bool clamp = false);
     Tensor step(const Tensor &sample, const Tensor &velocity, float timestep, float sigma, float nextSigma);
+    Tensor renoise(const Tensor &sample, const Tensor &velocity, const Tensor &noise,
+                   float sigma, float nextSigma);
 };
 
 struct TransformerConfig {
@@ -69,6 +71,10 @@ class Transformer {
   public:
     Transformer(Runtime &, Runtime &fp32, const std::string &directory, nomas::ParallelContext = {});
     const TransformerConfig &config() const { return config_; }
+    void setLowMemory(bool enabled);
+    void setHostMemoryBudget(const std::shared_ptr<nomas::HostMemoryBudget> &);
+    // Native Pika release: BF16 LoRA branches, without merging into base weights.
+    void loadPikaAdapter(const std::string &directory, bool reference);
     Tensor timeEmbedding(const std::vector<float> &times);
     // input is SiLU(temb), rounded to the main runtime's dtype after activation.
     Tensor projectModulation(int layer, const Tensor &input);
@@ -82,22 +88,29 @@ class Transformer {
     void unload();
 
   private:
+    Tensor linear(const Tensor &, const std::string &);
+    Tensor rowLinear(const Tensor &, const std::string &);
     Tensor attention(const Tensor &, const std::string &, const Tensor *cos = nullptr,
                      const Tensor *sin = nullptr, Trace trace = {});
     Tensor feedForward(const Tensor &, const std::string &);
     Tensor refine(const Tensor &);
     Runtime &rt_, &fp32_;
     Weights weights_, fullWeights_;
+    std::unique_ptr<Weights> lora_;
+    std::string loraDirectory_;
     TransformerConfig config_;
     nomas::ParallelContext parallel_;
     std::vector<Tensor> modulation_;
     Tensor outputModulation_;
     std::vector<std::vector<float>> plans_;
+    bool lowMemory_ = false, hostCacheEnabled_ = false;
+    std::shared_ptr<nomas::HostMemoryBudget> hostBudget_;
 };
 std::string componentWeights(const std::string &directory);
 class AudioVAE {
   public:
     AudioVAE(Runtime &, const std::string &directory);
+    void setHostMemoryBudget(const std::shared_ptr<nomas::HostMemoryBudget> &b) { weights_.setHostMemoryBudget(b); }
     // One mono channel at a time: [latent frames,32] -> [samples,1].
     Tensor decode(const Tensor &, Trace trace = {});
     // Mono 32 kHz PCM -> posterior mean [ceil(samples/800),32].
@@ -141,6 +154,9 @@ class TextEncoder {
     TextEncoder(Runtime &, const std::string &directory, nomas::ParallelContext = {});
     Tensor encode(const std::vector<int> &, Trace trace = {});
     Tensor encodeVisual(const std::vector<int> &, const std::vector<VisionInput> &, Trace trace = {});
+    void setLowMemory(bool enabled) { lowMemory_ = enabled; }
+    void setMemoryPool(const std::shared_ptr<nomas::TensorPool> &p) { memoryPool_ = p; }
+    void setHostMemoryBudget(const std::shared_ptr<nomas::HostMemoryBudget> &);
     void unload(bool keepPackedCache = false) {
         weights_.clear(keepPackedCache);
         if (prefetchedWeights_)
@@ -152,12 +168,18 @@ class TextEncoder {
     Weights weights_;
     std::unique_ptr<Weights> prefetchedWeights_;
     bool hostCacheWarm_ = false;
+    std::shared_ptr<nomas::TensorPool> memoryPool_;
+    bool lowMemory_ = false;
     nomas::ParallelContext parallel_;
 };
 class VideoVAE {
   public:
     using TileRunner = std::function<std::vector<Tensor>(size_t, const std::function<Tensor(VideoVAE &,size_t)> &)>;
     VideoVAE(Runtime &compute, Runtime &fp32, const std::string &directory);
+    void setLowMemory(bool enabled);
+    void setHostMemoryBudget(const std::shared_ptr<nomas::HostMemoryBudget> &b) {
+        weights_.setHostMemoryBudget(b); fullWeights_.setHostMemoryBudget(b);
+    }
     // Optional independent-tile executor; each worker owns a separate VAE cache.
     void setTileRunner(TileRunner run, size_t workers = 1) {
         tileRunner_ = std::move(run);
@@ -191,8 +213,11 @@ class VideoVAE {
     Tensor zero_;
     TileRunner tileRunner_;
     size_t tileWorkers_ = 1;
+    bool lowMemory_ = false;
 };
 DType parseVideoPrecision(const std::string &name, bool fp32 = false);
+double parseGpuMemoryLimit(const std::string &gib);
+double parseHostMemoryLimit(const std::string &gib);
 const char *precisionName(DType);
 using Progress = std::function<void(const std::string &, int, int)>;
 struct GenerateOptions {
@@ -231,6 +256,7 @@ struct ReferenceGeometry {
 PackedLayout referenceLayout(const std::vector<int> &textTags, int frames, int height, int width,
                              int audioFrames, const std::vector<ReferenceGeometry> &);
 std::vector<float> sigmaSchedule(int steps, float shift);
+std::vector<float> pikaSigmaSchedule(float shift);
 class ParallelModel;
 class Pipeline {
   public:
@@ -240,6 +266,17 @@ class Pipeline {
     Pipeline(const std::string &directory, const std::vector<int> &devices, bool fp32, DType videoPrecision,
              nomas::RowReduction ditReduction);
     ~Pipeline();
+    // Per-device GiB target. Reserves 1 GiB for CUDA/cuBLAS/NCCL outside the
+    // bounded tensor pool. Small budgets stream weights layer by layer.
+    // Configure before generation; zero preserves the default resident path.
+    void setGpuMemoryLimit(double gib);
+    // Shared CPU weight-cache budget plus 2 GiB host working allowance.
+    // 2 GiB selects disk-only weights; zero keeps the existing host policy.
+    void setHostMemoryLimit(double gib);
+    bool layerStreaming() const { return lowMemory_; }
+    // Directory contains fl2va/ and ref2va/ manifests and adapter.safetensors.
+    // BF16 trunk; adapters follow the base model's tensor partitions.
+    void loadPika(const std::string &directory);
     Generation generate(const GenerateOptions &, Progress progress = {}, Trace trace = {},
                         const std::vector<float> *initialVideo = nullptr,
                         const std::vector<float> *initialAudio = nullptr);
@@ -258,10 +295,14 @@ class Pipeline {
     Transformer transformer_;
     std::unique_ptr<Transformer> referenceTransformer_;
     std::string directory_;
+    std::string pikaDirectory_;
     VideoVAE video_;
     AudioVAE audio_;
     std::vector<float> videoMean_, videoStd_, audioMean_, audioStd_;
     bool retainWeights_ = false;
+    bool lowMemory_ = false;
+    std::shared_ptr<nomas::TensorPool> memoryPool_;
+    std::shared_ptr<nomas::HostMemoryBudget> hostBudget_;
     std::unique_ptr<ParallelModel> parallel_;
 };
 // FFmpeg is only a media encoder; model inference remains entirely C++/CUDA.

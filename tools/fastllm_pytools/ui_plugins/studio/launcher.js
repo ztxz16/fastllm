@@ -1,21 +1,24 @@
 import {
   state, elements, request, t, localizeServerText, showToast, friendlyError
 } from "../../assets/app.js";
+import {chatRuntime, renderStudioMedia} from "./video.js";
 
 let webuiModulePromise;
 let webuiModuleRetries = 0;
 let webuiModuleLoaded = false;
 const WEBUI_LOAD_TIMEOUT_MS = 30000;
 function webuiIsReady() {
-  return state.runtime?.command === "server" && state.runtime?.phase === "running"
-    && state.runtime?.ready && Boolean(state.runtime?.sessionId);
+  const runtime = chatRuntime();
+  return runtime?.command === "server" && runtime?.phase === "running"
+    && runtime?.ready && Boolean(runtime?.sessionId);
 }
 
 function renderAgentRuntime() {
   const runtime = state.agentRuntime || {phase: "checking"};
   const phase = runtime.phase;
   const busy = state.agentRuntimeRequest || ["checking", "unchecked", "installing"].includes(phase);
-  elements.agentRuntimeCard.classList.toggle("hidden", phase === "ready");
+  elements.agentRuntimeCard.classList.toggle("hidden", phase === "ready"
+    || !document.getElementById("video-studio").classList.contains("hidden"));
   elements.installAgentRuntime.disabled = busy || runtime.supported === false;
   elements.installAgentRuntime.textContent = t(phase === "installing" ? "Installing…"
     : phase === "failed" ? "Retry installation" : "Install Agent dependencies");
@@ -71,9 +74,12 @@ async function installAgentRuntime() {
 }
 
 function renderWebUIAvailability() {
+  const studio = renderStudioMedia(renderWebUIAvailability);
+  const runtime = chatRuntime();
   const ready = webuiIsReady();
-  elements.openWebui.disabled = !ready;
-  if ((!ready || state.webuiSessionId !== state.runtime?.sessionId)
+  elements.openWebui.disabled = !studio.ready;
+  elements.agentRuntimeCard.classList.toggle("hidden", studio.videoMode || state.agentRuntime?.phase === "ready");
+  if ((!ready || state.webuiSessionId !== runtime?.sessionId)
       && (state.webuiSessionId || state.webuiLoading)) {
     state.webuiRequestId += 1;
     clearWebUILoad();
@@ -82,14 +88,14 @@ function renderWebUIAvailability() {
     state.webuiError = "";
     destroyWebUI();
   }
-  const loaded = ready && state.webuiSessionId === state.runtime.sessionId
+  const loaded = ready && state.webuiSessionId === runtime.sessionId
     && !state.webuiLoading && !state.webuiError;
-  elements.webuiContent.classList.toggle("hidden", !loaded);
-  elements.webuiPlaceholder.classList.toggle("hidden", loaded);
+  elements.webuiContent.classList.toggle("hidden", !loaded || studio.videoMode);
+  elements.webuiPlaceholder.classList.toggle("hidden", loaded || studio.videoMode);
   elements.webuiRetry.classList.toggle("hidden", !ready || !state.webuiError);
   elements.webuiStatus.textContent = state.webuiError ? localizeServerText(state.webuiError)
     : ready ? t("Opening WebUI…") : t("Start an API Server before opening WebUI.");
-  if (state.currentView === "webui" && ready && !state.webuiLoading && !state.webuiSessionId && !state.webuiError) {
+  if (state.currentView === "webui" && !studio.videoMode && ready && !state.webuiLoading && !state.webuiSessionId && !state.webuiError) {
     openEmbeddedWebUI();
   }
 }
@@ -125,7 +131,7 @@ function failWebUILoad(requestId, message = "Unable to load WebUI. Try reopening
 
 async function openEmbeddedWebUI() {
   if (!webuiIsReady() || state.webuiLoading) return;
-  const sessionId = state.runtime.sessionId;
+  const sessionId = chatRuntime().sessionId;
   const requestId = ++state.webuiRequestId;
   state.webuiSessionId = sessionId;
   state.webuiLoading = true;
@@ -141,7 +147,7 @@ async function openEmbeddedWebUI() {
     const result = await request("/api/webui/open", {
       method: "POST", body: JSON.stringify({ sessionId }), signal: controller.signal
     });
-    if (requestId !== state.webuiRequestId || sessionId !== state.runtime?.sessionId) return;
+    if (requestId !== state.webuiRequestId || sessionId !== chatRuntime()?.sessionId) return;
     if (!webuiModulePromise) {
       const suffix = webuiModuleRetries ? `?retry=${webuiModuleRetries}` : "";
       const pending = import(`/assets/webui/app.js${suffix}`).then(module => {
@@ -166,7 +172,7 @@ async function openEmbeddedWebUI() {
       iconUrl: "/assets/launcher-icon.png", signal: controller.signal,
       onInstallRuntime: installAgentRuntime
     });
-    if (requestId !== state.webuiRequestId || sessionId !== state.runtime?.sessionId) {
+    if (requestId !== state.webuiRequestId || sessionId !== chatRuntime()?.sessionId) {
       component.destroy();
       return;
     }

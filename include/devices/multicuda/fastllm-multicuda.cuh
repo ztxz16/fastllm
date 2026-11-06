@@ -28,12 +28,13 @@ uint64_t FastllmGetNcclGeneration();
 // and can also be used by graph-safe peer signaling with NCCL collectives.
 bool FastllmCudaPeerAccessInit(const std::vector<int>& devices);
 // Graph-safe small-tensor all-reduce backed by direct peer reads and a GPU-side
-// barrier. With FASTLLM_CUDA_CUSTOM_ALLREDUCE unset or set to "auto", it is
-// correctness-tested and benchmarked against NCCL on the active eager or CUDA
-// Graph path. FP16/BF16/FP32 and small/large messages are selected independently
-// for supported 2/4/6/8-GPU groups. Set the variable to 1 to
-// force-enable every supported path, or 0 to force-disable it. Unsupported or
-// disabled tensors return false so NCCL remains the fallback.
+// barrier. With FASTLLM_CUDA_CUSTOM_ALLREDUCE unset, empty or "prefer", use
+// every supported path that passes its startup correctness test. FP16/BF16/FP32
+// and small/large messages are validated independently for 2/4/6/8-GPU groups.
+// "auto" additionally benchmarks against NCCL on the active eager/CUDA Graph
+// path and selects custom only with >=3% speedup. 1 force-enables supported
+// paths without the startup tests; 0 disables custom. Unsupported, disabled,
+// or capture-registration-missing calls return false so NCCL remains the fallback.
 bool FastllmCudaCustomAllReduceEnabled();
 bool FastllmCudaCustomAllReduceCanRun(int count, int dataType, int deviceId);
 bool FastllmCudaCustomAllReduceInit(const std::vector<int>& devices);
@@ -183,7 +184,7 @@ namespace fastllm {
     };
     bool MultiCudaLinearOutputGatherPersistent(Data &input, Data &weight, Data &output,
                                                std::shared_ptr<void> &workspace,
-                                               MultiCudaDsparkMarkovRequest *markov = nullptr);
+                                               MultiCudaDsparkMarkovRequest *markov = nullptr, bool draftFp8 = false);
     bool MultiCudaLinearRow(Data &input, Data &weight, Data &bias, Data &output);
     bool MultiCudaLinearColumn(Data &input, Data &weight, Data &bias, Data &output);
     struct MultiCudaAsyncMLPHandle;

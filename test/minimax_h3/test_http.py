@@ -17,6 +17,7 @@ p.add_argument("--base", default="http://127.0.0.1:8009")
 p.add_argument("--key", default="test-h3")
 p.add_argument("--tp-size", type=int, default=1)
 p.add_argument("--output", required=True)
+p.add_argument("--model-name", choices=["minimax-h3", "pika-h3-flex"], default="minimax-h3")
 a = p.parse_args()
 out = Path(a.output)
 out.mkdir(parents=True, exist_ok=True)
@@ -58,14 +59,14 @@ assert obj("GET", "/health").get("tensor_parallel_size", 1) == a.tp_size
 assert request("GET", "/demo", auth=False)[0] == 200
 assert obj("GET", "/openapi.json", auth=False)["openapi"] == "3.1.0"
 obj("GET", "/v1/models", auth=False, expected=401)
-assert obj("GET", "/v1/models")["data"][0]["id"] == "minimax-h3"
+assert obj("GET", "/v1/models")["data"][0]["id"] == a.model_name
 valid = {
-    "model": "minimax-h3",
+    "model": a.model_name,
     "prompt": "A cat plays piano.",
     "size": "64x64",
     "seconds": "5",
     "seed": 42,
-    "num_inference_steps": 2,
+    "num_inference_steps": 6 if a.model_name == "pika-h3-flex" else 2,
 }
 for change in [
     {"size": "65x64"},
@@ -80,9 +81,20 @@ for change in [
     {"seconds": True},
 ]:
     obj("POST", "/v1/videos", {**valid, **change}, expected=400)
+if a.model_name == "pika-h3-flex":
+    obj("POST", "/v1/videos", {**valid, "num_inference_steps": 5}, expected=400)
+    obj("POST", "/v1/videos", {**valid, "num_inference_steps": 7}, expected=400)
 obj("POST", "/v1/videos", raw=b"{", content_type="application/json", expected=400)
 obj("GET", "/v1/videos/video_0_0", expected=404)
-jobs = [obj("POST", "/v1/videos", {**valid, "num_inference_steps": 4}, expected=202)]
+first = {**valid, "num_inference_steps": 4}
+if a.model_name == "pika-h3-flex":
+    # Exercise server-selected model and its fixed six-step default.
+    first.pop("model")
+    first.pop("num_inference_steps")
+jobs = [obj("POST", "/v1/videos", first, expected=202)]
+assert jobs[0]["model"] == a.model_name
+if a.model_name == "pika-h3-flex":
+    assert jobs[0]["num_inference_steps"] == 6
 jobs += [obj("POST", "/v1/videos", valid, expected=202) for _ in range(3)]
 obj("POST", "/v1/videos", valid, expected=429)
 obj("DELETE", "/v1/videos/" + jobs[0]["id"], expected=409)

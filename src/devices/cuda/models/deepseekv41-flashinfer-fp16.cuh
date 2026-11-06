@@ -106,7 +106,8 @@ __global__ void Gather(const V41AttentionDescriptor *items, Workspace w, int hea
             atomicExch(w.fallback + row, 1);
     }
 }
-__global__ __launch_bounds__(64) void Compute(Params p, Workspace w, int keys) {
+__global__ __launch_bounds__(64) void Compute(Params p, Workspace w, int keys,
+        const V41AttentionDescriptor *items, int window) {
     const int row = blockIdx.z;
     if (w.fallback[row]) return;
     p.q = w.q + size_t(row) * p.num_qo_heads * 512;
@@ -114,6 +115,19 @@ __global__ __launch_bounds__(64) void Compute(Params p, Workspace w, int keys) {
     p.o = w.partial + size_t(row) * splits * p.num_qo_heads * 512;
     p.lse = w.lse + size_t(row) * splits * p.num_qo_heads;
     p.valid = w.valid + size_t(row) * keys;
+    // Partition the live index list, not its reserved capacity. Eager chunks
+    // and full graphs can reserve different widths for the same query; their
+    // FP16 partial outputs must use the same partition boundaries.
+    p.kv_len = window + (items[row].indices ? items[row].topWidth : 0);
+    // A short list need not populate all eight partitions. Do not pass an
+    // empty trailing partition to FlashInfer's unsigned chunk arithmetic.
+    const int partitionSize = (p.kv_len + splits - 1) / splits;
+    if (int(blockIdx.y) * partitionSize >= p.kv_len) {
+        const int head = blockIdx.x * 16 + threadIdx.x + 32 * threadIdx.z;
+        if (threadIdx.x + 32 * threadIdx.z < 16 && head < p.num_qo_heads)
+            p.lse[size_t(blockIdx.y) * p.num_qo_heads + head] = -CUDART_INF_F;
+        return;
+    }
     extern __shared__ uint8_t smem[];
     flashinfer::SinglePrefillWithKVCacheDevice<Traits>(p,
         *reinterpret_cast<Traits::SharedStorageSingle *>(smem), threadIdx,
@@ -166,7 +180,7 @@ bool Run(const V41AttentionDescriptor *items, void *data, int rows, int heads,
         heads, 1, 1, keys, heads * 512, 512, 512, 512, 512, -1, 0.f, scale, 1.f, 10000.f);
     p.partition_kv = true;
     Compute<<<dim3((heads + 15) / 16, splits, rows), dim3(32, 1, 2),
-        sizeof(Traits::SharedStorageSingle), cudaStreamPerThread>>>(p, w, keys);
+        sizeof(Traits::SharedStorageSingle), cudaStreamPerThread>>>(p, w, keys, items, window);
     Merge<<<dim3(heads, rows), 128, 0, cudaStreamPerThread>>>(items, w, sink, heads);
     return V41CheckLaunch("FlashInferFP16Attention");
 }
@@ -187,8 +201,7 @@ __global__ void Descriptors(V41AttentionDescriptor d, V41AttentionDescriptor *it
 bool Chunk(V41AttentionDescriptor d, int batch, int tokens, int heads, int window,
            float scale, const float *sink) {
     const int rows = batch * tokens;
-    // Keep the partition shape identical to a full graph at short contexts.
-    const int keys = window + (d.indices ? std::max(512, d.topWidth) : 0);
+    const int keys = window + (d.indices ? d.topWidth : 0);
     const size_t scratchBytes = (Bytes(rows, heads, keys) + 255) & ~size_t(255);
     void *allocation = nullptr;
     if (FastllmCudaTryMalloc(&allocation, scratchBytes + size_t(rows) * sizeof(d)) !=

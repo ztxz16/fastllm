@@ -197,11 +197,63 @@ for _key in ("kv_source_layer_ids", "index_source_layer_ids", "engram_head_dim",
              "engram_max_ngram_size", "engram_vocab_size", "engram_compressed_vocab_size", "engram_pad_token_id"):
     _V41_GGUF_ALIASES[_key] = _key
 
+_V41_UPSTREAM_ALIASES = {
+    "kv_source_layer_ids": "attention.kv_source_layers",
+    "index_source_layer_ids": "attention.indexer.source_layers",
+    "candidate_source_layer_id": "attention.indexer.candidate_source_layer",
+    "candidate_topk_blocks": "attention.indexer.candidate_top_k_blocks",
+    "candidate_block_size": "attention.indexer.candidate_block_size",
+    "engram_layer_ids": "ple.layers", "engram_max_ngram_size": "ple.ngram_size",
+    "engram_n_heads": "ple.heads_per_ngram", "engram_head_dim": "embedding_length_per_layer_input",
+    "engram_pad_token_id": "engram.pad_token_id",
+}
+
 
 def deepseek_v41_config(metadata):
     """Shared discovery/planning translation; absent draft weights stay disabled."""
     config = {key: metadata["deepseek41." + source] for key, source in _V41_GGUF_ALIASES.items()
               if "deepseek41." + source in metadata}
+    for key, source in _V41_UPSTREAM_ALIASES.items():
+        if "deepseek41." + source in metadata:
+            value = metadata["deepseek41." + source]
+            if key in config and config[key] != value:
+                raise ValueError("DeepSeek V4.1 GGUF has conflicting metadata for " + key)
+            config[key] = value
+    if "deepseek41.ple.layers" in metadata:
+        layers = config["engram_layer_ids"]
+        ngram = config.get("engram_max_ngram_size", 0)
+        heads = config.get("engram_n_heads", 0)
+        if (ngram <= 1 or heads <= 0 or not layers or
+                any(not isinstance(v, int) or not 0 <= v < config.get("num_hidden_layers", 0) for v in layers) or
+                any(a >= b for a, b in zip(layers, layers[1:]))):
+            raise ValueError("DeepSeek V4.1 GGUF has invalid PLE dimensions or layer ids")
+        cols = (ngram - 1) * heads
+        sizes = metadata.get("deepseek41.ple.head_vocab_sizes", [])
+        offsets = metadata.get("deepseek41.ple.head_offsets", [])
+        multipliers = metadata.get("deepseek41.ple.layer_multipliers", [])
+        if (len(sizes) != len(layers) * cols or
+                len(offsets) != len(sizes) or
+                len(multipliers) != len(layers) * ngram):
+            raise ValueError("DeepSeek V4.1 GGUF has an incomplete PLE layout")
+        total = 0
+        for size, offset in zip(sizes, offsets):
+            if not isinstance(size, int) or not 0 < size <= 2**31 - 1 or offset != total:
+                raise ValueError("DeepSeek V4.1 GGUF has invalid PLE head ranges")
+            total += size
+        if any(not isinstance(v, int) or v <= 0 or v % 2 == 0 or v >= 2**63 for v in multipliers):
+            raise ValueError("DeepSeek V4.1 GGUF has invalid Engram hash multipliers")
+        config["engram_num_embeddings"] = [sum(sizes[i:i + cols]) for i in range(0, len(sizes), cols)]
+        if any(rows > 2**31 - 1 for rows in config["engram_num_embeddings"]):
+            raise ValueError("DeepSeek V4.1 GGUF Engram layer exceeds supported row count")
+        token_map = metadata.get("deepseek41.engram.token_map", [])
+        if not token_map or any(not isinstance(v, int) or not 0 <= v < 2**31 - 1 for v in token_map):
+            raise ValueError("DeepSeek V4.1 GGUF has an invalid Engram token map")
+        config["engram_compressed_vocab_size"] = max(token_map) + 1
+        if not 0 <= config.get("engram_pad_token_id", -1) < len(token_map):
+            raise ValueError("DeepSeek V4.1 GGUF has an invalid Engram pad token")
+        if metadata.get("deepseek41.expert_gating_func") != 4:
+            raise ValueError("DeepSeek V4.1 GGUF requires sqrtsoftplus expert gating")
+        config["scoring_func"] = "sqrtsoftplus"
     config.update(model_type="deepseek_v41", architectures=["DeepseekV41ForCausalLM"],
                   gguf_architecture="deepseek41", num_nextn_predict_layers=0)
     config["rope_scaling"] = {target: metadata["deepseek41.rope.scaling." + source]
@@ -236,6 +288,10 @@ def _get_gguf_model_config_cached(path, _file_size, _mtime_ns):
         config["architectures"] = [architecture]
     if gguf_arch == "deepseek41":
         keys = {"deepseek41." + value for value in _V41_GGUF_ALIASES.values()}
+        keys.update("deepseek41." + value for value in _V41_UPSTREAM_ALIASES.values())
+        keys.update("deepseek41." + value for value in (
+            "ple.head_vocab_sizes", "ple.head_offsets", "ple.layer_multipliers",
+            "engram.token_map", "expert_gating_func"))
         keys.update("deepseek41.rope.scaling." + name for name in
                     ("type", "factor", "original_context_length", "yarn_beta_fast", "yarn_beta_slow"))
         config.update(deepseek_v41_config(read_gguf_metadata(path, keys)))

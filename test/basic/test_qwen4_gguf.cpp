@@ -1,11 +1,16 @@
+#include "utils/qwen38_hybrid.h"
+#include "../../src/models/qwen4_exp_graph.h"
+#include "../../src/models/qwen4_exp_execution.h"
 #include "model.h"
 #include "models/qwen4_exp.h"
 #include "executor.h"
+#include "utils.h"
 #include "devices/disk/diskdevice.h"
 #include "gguf.h"
 #include "json11.hpp"
 #ifdef USE_CUDA
 #include "devices/cuda/fastllm-cuda.cuh"
+#include "devices/cuda/fastllm-cuda-graph-workspace.h"
 #endif
 
 #include <algorithm>
@@ -247,6 +252,7 @@ void TestFloatImport(const std::string &directory) {
 }
 
 void TestEmbeddingImport(const Fixture &fixture) {
+    Qwen38ForwardScope qwenDispatch;
     const std::string name = "model.language_model.embed_tokens.weight";
     // Compare against the previous full-table FP32 import, including repeated
     // indices, the last vocabulary row, and FP16 token IDs/output conversion.
@@ -258,9 +264,8 @@ void TestEmbeddingImport(const Fixture &fixture) {
             return t.name == name;
         });
         Check(task != tasks.end(), "missing embedding import task");
-        Check(task->replaceType == (cudaEmbedding
-              ? GGUFWeightReplaceRule::GGUFWeightReplaceForceFP32
-              : GGUFWeightReplaceRule::GGUFWeightReplaceDirect), "embedding placement policy");
+        Check(task->replaceType == GGUFWeightReplaceRule::GGUFWeightReplaceDirect,
+              "embedding placement policy");
         // Match the loader's AddEmptyWeight placeholder before direct import.
         Data weight(FLOAT32, {1}), reference(FLOAT32, {1});
         WeightImportGGUFTensor(&weight, &task->tensor, task->fileName, task->offset, task->replaceType);
@@ -293,6 +298,248 @@ void TestEmbeddingImport(const Fixture &fixture) {
 }
 namespace fastllm {
 struct Qwen4GGUFTestAccess {
+    static void CheckVisionCpuActivationType() {
+        ApplyDeviceMap({{"cpu", 1}}, 1, 1);
+        setenv("FASTLLM_QWEN4_VISION_DEVICE", "cpu", 1);
+        std::vector<float> reference;
+        for (DataType type : {FLOAT32, FLOAT16, BFLOAT16}) {
+            Qwen4ExpModel m;
+            m.dataType = type;
+            m.deviceMap = {{"cpu", 1}};
+            m.visionDepth = 1; m.visionHiddenSize = 8;
+            m.visionNumHeads = 2; m.visionHeadDim = 4;
+            m.visionIntermediateSize = 12; m.visionOutHiddenSize = 8;
+            m.visionNumPositionEmbeddings = 4; m.visionNumGridPerSide = 2;
+            m.visionPatchSize = 2; m.visionTemporalPatchSize = 2;
+            m.visionSpatialMergeSize = 2;
+            m.visionImageMean = {0.5f, 0.5f, 0.5f};
+            m.visionImageStd = {0.5f, 0.5f, 0.5f};
+            auto put = [&](const std::string &name, std::vector<int> dims, bool norm = false) {
+                int count = 1; for (int dim : dims) count *= dim;
+                std::vector<float> values(count);
+                for (int i = 0; i < count; ++i)
+                    values[i] = norm ? 1.0f : 0.02f * std::sin(float(i + 1));
+                Data value(FLOAT32, dims, values);
+                if (dims.size() > 1) ToDataType(value, FLOAT16);
+                m.weight.weight["model.visual." + name].CopyFrom(value);
+            };
+            auto linear = [&](const std::string &name, int out, int in) {
+                put(name + ".weight", {out, in}); put(name + ".bias", {out});
+            };
+            auto norm = [&](const std::string &name, int dim) {
+                put(name + ".weight", {dim}, true); put(name + ".bias", {dim});
+            };
+            linear("patch_embed.proj", 8, 24);
+            put("pos_embed.weight", {4, 8});
+            norm("blocks.0.norm1", 8); norm("blocks.0.norm2", 8);
+            linear("blocks.0.attn.qkv", 24, 8); linear("blocks.0.attn.proj", 8, 8);
+            linear("blocks.0.mlp.linear_fc1", 12, 8); linear("blocks.0.mlp.linear_fc2", 8, 12);
+            norm("merger.norm", 8);
+            linear("merger.linear_fc1", 32, 32); linear("merger.linear_fc2", 8, 32);
+            std::vector<float> pixels(4 * 4 * 3);
+            for (size_t i = 0; i < pixels.size(); ++i) pixels[i] = float((i * 31) % 256);
+            Data raw(FLOAT32, {4, 4, 3}, pixels), grid(FLOAT32, {1, 3}, {1, 2, 2}), output;
+            std::vector<std::vector<int>> grids;
+            m.EncodeVisualItems({&raw}, &grid, false, output, grids);
+            Check(output.dataType == FLOAT32 && output.dims == std::vector<int>({1, 1, 8}), "CPU vision output shape");
+            const float *data = reinterpret_cast<const float *>(output.cpuData);
+            std::vector<float> values(data, data + 8);
+            for (float value : values) Check(std::isfinite(value), "CPU vision nonfinite output");
+            if (reference.empty()) reference = values;
+            else Check(reference == values, "CPU vision must not depend on language activation dtype");
+            Data replay;
+            m.EncodeVisualItems({&raw}, &grid, false, replay, grids);
+            Check(std::memcmp(output.cpuData, replay.cpuData, 8 * sizeof(float)) == 0,
+                  "CPU vision replay must be deterministic");
+            for (auto &entry : m.weight.weight) Check(entry.second.dataDevice == DataDevice::CPU, "CPU vision moved a weight to GPU");
+        }
+        unsetenv("FASTLLM_QWEN4_VISION_DEVICE");
+        std::cout << "CPU vision activation regression passed" << std::endl;
+    }
+    static void CheckRemoteMoeDispatch() {
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+        setenv("FASTLLM_QWEN38_REMOTE_GRAPH", "1", 1);
+        SetCudaGraph(true);
+        for (int source : {0, 1}) for (DataType type : {FLOAT32, FLOAT16})
+        for (int rows : {1, 4, 8}) for (int format : {-1, int(GGML_TYPE_IQ2_XS), int(GGML_TYPE_Q2_0),
+                                                     int(GGML_TYPE_IQ3_XXS), int(GGML_TYPE_IQ3_S)}) {
+            const int owner = 1 - source, hidden = 256, intermediate = 256, experts = 4;
+            const std::string dense = "cuda:" + std::to_string(source);
+            const std::string remote = "cuda:" + std::to_string(owner);
+            SetDeviceMap({{dense, 1}}); SetMoeDeviceMap({{remote, 1}});
+            Qwen4ExpModel model;
+            model.block_cnt = 1; model.executionMode = ExecutionMode::Hybrid;
+            model.deviceMap = {{dense, 1}}; model.moeDeviceMap = {{remote, 1}};
+            std::vector<std::unique_ptr<Data>> storage(2 * experts);
+            std::vector<Data *> weights(2 + 2 * experts, nullptr), bias(weights.size(), nullptr);
+            for (int expert = 0; expert < experts; ++expert) for (int projection = 0; projection < 2; ++projection) {
+                const std::vector<int> dims = projection ? std::vector<int>{hidden, intermediate}
+                                                        : std::vector<int>{2 * intermediate, hidden};
+                auto &weight = storage[2 * expert + projection];
+                if (format < 0) {
+                    weight.reset(new Data(NVFP4_BLOCK_16_E4M3, dims));
+                    weight->blockK = 1; weight->blockM = 16; weight->Allocate();
+                    std::memset(weight->cpuData, 0, weight->GetBytes());
+                    const size_t packed = GetNVFP4WeightBytes(dims[0], dims[1]);
+                    std::memset(weight->cpuData + packed, 0x38, size_t(dims[0]) * dims[1] / 16);
+                    for (int row = 0; row < dims[0]; ++row) {
+                        const int col = (row * 17 + expert * 7) % dims[1];
+                        weight->cpuData[size_t(row) * dims[1] / 2 + col / 2] = (row % 3 ? 2 : 10) << ((col & 1) * 4);
+                    }
+                    weight->scales = projection ? std::vector<float>{.125f} : std::vector<float>{.5f, .25f};
+                } else {
+                    const auto quant = static_cast<ggml_type>(format);
+                    weight.reset(new Data(DATA_GGUF_FORMAT, quant, dims)); weight->Allocate();
+                    unsigned random = expert * 17 + projection + 937;
+                    for (size_t i = 0; i < weight->GetBytes(); ++i) {
+                        random = random * 1664525u + 1013904223u; weight->cpuData[i] = random >> 24;
+                    }
+                    const uint16_t scale = float_to_half(1.f / 256);
+                    for (size_t i = 0; i < weight->GetBytes(); i += ggml_type_size(quant))
+                        std::memcpy(weight->cpuData + i, &scale, sizeof(scale));
+                }
+                weight->directMemory = true;
+                weight->ToDevice(CUDA, std::vector<int>{owner});
+                weights[2 + 2 * expert + projection] = weight.get();
+            }
+            Qwen4ExpModel::MoEExecutionPlan plan{ExecutionMode::Gpu, 0,
+                "model.layers.0.mlp.", &weights, &bias};
+            Qwen4ExpModel::MoEPrepared prepared;
+            Data input(type, {1, rows, hidden}, std::vector<float>(rows * hidden, 0.125f)), output;
+            input.ToDevice(CUDA, std::vector<int>{source});
+            prepared.index.dataType = INT32; prepared.index.Resize({rows, 2});
+            prepared.index.ToDevice(CUDA, std::vector<int>{source}, false); prepared.index.Allocate(false);
+            prepared.score.CopyFrom(Data(FLOAT32, {rows, 2}, std::vector<float>(2 * rows, 0.5f)));
+            prepared.score.ToDevice(CUDA, std::vector<int>{source});
+            prepared.result.sharedOutput.CopyFrom(Data(type, {1, rows, hidden}, std::vector<float>(rows * hidden, 0.25f)));
+            prepared.result.sharedOutput.ToDevice(CUDA, std::vector<int>{source});
+            std::vector<int> indices(rows * 2);
+            FastllmCudaCopyFromHostToDevice(prepared.index.cudaData, indices.data(), indices.size() * sizeof(int));
+            auto run = [&] {
+                ApplyDeviceMap(model.deviceMap, 1, 1);
+                model.RunMoE(plan, input, output, false, nullptr, &prepared, [] {});
+            };
+            const void *inputPointer = input.cudaData, *indexPointer = prepared.index.cudaData,
+                       *scorePointer = prepared.score.cudaData;
+            run(); FastllmCudaSyncCurrentThreadStream();
+            Check(prepared.remote != nullptr, "resident GPU plan bypassed remote hybrid workspace");
+            void *graph = nullptr, *exec = nullptr; std::vector<void *> pins;
+            Check(FastllmCudaGraphPrepareCaptureDevice() && FastllmCudaGraphMemoryPoolBegin() &&
+                  FastllmCudaGraphBeginCapture(), "remote model capture begin");
+            run();
+            Check(FastllmCudaGraphEndCapture(&graph) && graph && FastllmCudaGraphMemoryPoolEnd(pins) &&
+                  FastllmCudaGraphInstantiate(graph, &exec), "remote model capture finish");
+            std::vector<unsigned char> expected(output.GetBytes()), actual(expected.size());
+            for (int pass = 0; pass < 16; ++pass) {
+                std::vector<float> values(rows * hidden);
+                for (size_t i = 0; i < values.size(); ++i)
+                    values[i] = float(int((i * 13 + pass * 3) % 53) - 26) / 32;
+                Data changed(type, input.dims, values);
+                FastllmCudaCopyFromHostToDevice(input.cudaData, changed.cpuData, changed.GetBytes());
+                for (size_t i = 0; i < indices.size(); ++i) indices[i] = (i + pass) % experts;
+                FastllmCudaCopyFromHostToDevice(prepared.index.cudaData, indices.data(), indices.size() * sizeof(int));
+                run(); FastllmCudaSyncCurrentThreadStream();
+                FastllmCudaCopyFromDeviceToHost(expected.data(), output.cudaData, expected.size());
+                Check(FastllmCudaGraphLaunch(exec), "remote model replay");
+                FastllmCudaSyncCurrentThreadStream();
+                FastllmCudaCopyFromDeviceToHost(actual.data(), output.cudaData, actual.size());
+                Check(expected == actual, "remote model graph differs from eager execution");
+                Check(input.cudaData == inputPointer && prepared.index.cudaData == indexPointer &&
+                      prepared.score.cudaData == scorePointer && input.dataDeviceIds == std::vector<int>{source} &&
+                      prepared.index.dataDeviceIds == input.dataDeviceIds && prepared.score.dataDeviceIds == input.dataDeviceIds,
+                      "remote model migrated dense graph routing buffers");
+            }
+            FastllmCudaGraphExecDestroy(exec); FastllmCudaGraphDestroy(graph);
+            FastllmCudaGraphMemoryPoolRelease(pins);
+            std::printf("PASS: Qwen4 remote GPU-plan graph source=%d type=%d rows=%d format=%d 16 exact replays\n", source, int(type), rows, format);
+        }
+#endif
+    }
+
+    static void CheckFullAttentionGraph() {
+#ifdef USE_CUDA
+        SetDeviceMap({{"cuda:0", 1}});
+        SetKVCacheInCPU(false);
+        FastllmCudaSetDevice(0);
+        static_cast<Executor *>(GetExecutor())->SetFirstDevice("cuda");
+        Qwen4ExpModel m;
+        m.dataType = FLOAT16; m.embed_dim = 16;
+        m.head_dim = 256; m.rotary_dim = 64; m.num_attention_heads = 2; m.num_key_value_heads = 1;
+        m.indexerHeads = 2; m.indexerKvHeads = 1; m.indexerHeadDim = 128;
+        m.indexerCompressRatio = 4; m.indexerBudget = 128;
+        m.executionMode = ExecutionMode::Hybrid;
+        const std::string prefix = "mtp.layers.0.self_attn.";
+        auto weight = [&](const std::string &name, std::vector<int> shape, bool norm) {
+            size_t size = 1; for (int n : shape) size *= n;
+            std::vector<float> values(size);
+            for (size_t i = 0; i < size; ++i) values[i] = norm ? 1.f : (int((i * 37 + name.size()) % 101) - 50) / 256.f;
+            m.weight.weight[prefix + name].CopyFrom(Data(norm ? FLOAT32 : FLOAT16, shape, values));
+        };
+        weight("q_proj.weight", {1024,16}, false); weight("k_proj.weight", {256,16}, false);
+        weight("v_proj.weight", {256,16}, false); weight("o_proj.weight", {16,512}, false);
+        weight("q_norm.weight", {256}, true); weight("k_norm.weight", {256}, true);
+        weight("indexer.index_qk_proj.weight", {384,16}, false);
+        weight("indexer.q_layernorm.weight", {128}, true); weight("indexer.k_layernorm.weight", {128}, true);
+        m.qsaKeyNormValues[0] = std::vector<float>(128, 1);
+        auto inputs = [&](int begin, int rows, Data &input, Data &pos) {
+            std::vector<float> values(rows * 16), positions(rows);
+            for (size_t i=0;i<values.size();++i) values[i]=(int((i*13+begin)%79)-39)/64.f;
+            for (int i=0;i<rows;++i) positions[i]=begin+i;
+            input.CopyFrom(Data(FLOAT16,{1,rows,16},values)); pos.CopyFrom(Data(FLOAT32,{1,rows},positions));
+            input.ToDevice(CUDA, std::vector<int>{0}); pos.ToDevice(CUDA, std::vector<int>{0});
+        };
+        double worst = 0;
+        for (int previous : {31, 127, 128, 129}) for (int rows : {1, 2, 3, 4}) {
+            Qwen4ExpModel::RequestState reference, candidate;
+            Qwen4ExpModel::DecodeCudaGraphState graph;
+            graph.device = 0;
+            Data refKey(FLOAT16), refValue(FLOAT16), key(FLOAT16), value(FLOAT16), input, pos, ignored;
+            inputs(0, previous, input, pos);
+            Data mask = Qwen4BuildCausalMask(0, previous);
+            m.RunFullAttentionWithPrefix(0,prefix,input,mask,pos,true,refKey,refValue,reference,ignored);
+            m.RunFullAttentionWithPrefix(0,prefix,input,mask,pos,true,key,value,candidate,ignored);
+            // Deliberately reserve far beyond the live history: attention
+            // padding must be bounded independently from the KV allocation.
+            Data append(FLOAT16, {1, rows, 256});
+            Qwen4EnsureAppendCapacity(key,append,1,128,kQwen4DenseCacheMaxGrowth,true,8192);
+            Qwen4EnsureAppendCapacity(value,append,1,128,kQwen4DenseCacheMaxGrowth,true,8192);
+            inputs(previous,rows,input,pos);
+            mask.CopyFrom(Qwen4BuildCausalMask(previous,rows));
+            Data expected, actual;
+            m.RunFullAttentionWithPrefix(0,prefix,input,mask,pos,true,refKey,refValue,reference,expected);
+            std::vector<uint64_t> signature;
+            Check(m.PrepareFullAttentionGraphStorage(0,key,value,candidate,rows,0,nullptr,signature), "attention graph storage");
+            Qwen4PrepareDecodeGraphTensor(graph.positionIds,pos,0);
+            Qwen4PrepareDecodeGraphWorkspace(graph.decodeMeta,INT32,{1},0);
+            FastllmCudaCopyFromHostToDevice(graph.decodeMeta.cudaData,&previous,sizeof(int));
+            const bool dense = previous < m.indexerBudget;
+            const int width = dense ? Qwen4DenseGraphWidth(previous+rows,131) : 131;
+            int blocks=Qwen4AxisCapacity(*candidate.indexerBlockKeyTensors[0],0);
+            Qwen4PrepareDecodeGraphWorkspace(graph.qsaScoreWorkspaces[0],FLOAT32,{rows,blocks},0);
+            Qwen4PrepareDecodeGraphWorkspace(graph.qsaSelectedWorkspaces[0],INT32,{rows,dense?1:32},0);
+            if (dense) {
+                auto &indices=graph.denseIndices[width];
+                Qwen4PrepareDecodeGraphWorkspace(indices,INT32,{rows,width},0);
+                std::vector<int> values(rows*width);
+                for(size_t i=0;i<values.size();++i) values[i]=i%width;
+                FastllmCudaCopyFromHostToDevice(indices.cudaData,values.data(),values.size()*sizeof(int));
+            }
+            Check(m.RunFullAttentionGraph(0,prefix,input,key,value,candidate,&graph,0,width,dense,false,nullptr,actual), "attention graph body");
+            ToDataType(expected,FLOAT32); ToDataType(actual,FLOAT32);
+            expected.ToDevice(CPU); actual.ToDevice(CPU);
+            double error=0,norm=0;
+            for(uint64_t i=0;i<expected.Count(0);++i) {
+                float a=((float*)expected.cpuData)[i],b=((float*)actual.cpuData)[i];
+                Check(std::isfinite(b),"attention graph nonfinite output");
+                error+=(a-b)*(a-b); norm+=a*a;
+            }
+            const double relative=std::sqrt(error/std::max(norm,1e-20)); worst=std::max(worst,relative);
+            std::cout<<"attention previous="<<previous<<" rows="<<rows<<" relative_L2="<<relative<<"\n";
+            Check(relative<.005,"graph attention differs from eager");
+        }
+        std::cout<<"PASS: dense/sparse attention graph math, all verifier widths, oversized KV; worst_L2="<<worst<<"\n";
+#endif
+    }
     static void CheckQsaCausalMask() {
 #ifdef USE_CUDA
         SetDeviceMap({{"cuda:0", 1}});
@@ -357,9 +604,52 @@ struct Qwen4GGUFTestAccess {
         std::cout << "PASS: Qwen4 explicit and implicit causal QSA masks match\n";
 #endif
     }
-    static void CheckGraphSlotReset(int targetDevice = 0, int draftDevice = 0) {
+    static void ConfigureFullGraphModel(Qwen4ExpModel &model) {
+        model.executionMode = ExecutionMode::Hybrid;
+        model.block_cnt = 48;
+        model.embed_dim = 2560;
+        model.num_experts = 512;
+        model.num_experts_per_tok = 10;
+        model.hcCount = 4;
+        model.indexerCompressRatio = 4;
+        model.indexerHeadDim = 128;
+    }
+    static void CheckFullGraphPolicy() {
+#if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
+        Qwen4ExpModel model;
+        ConfigureFullGraphModel(model);
+        SetCudaGraph(true);
+        setenv("FASTLLM_QWEN38_HYBRID_GRAPH", "1", 1);
+        Check(model.UseFullHybridGraph(), "Qwen3.8 full graph policy disabled");
+        for (int *field : {&model.block_cnt, &model.embed_dim, &model.num_experts,
+                          &model.num_experts_per_tok, &model.hcCount,
+                          &model.indexerCompressRatio, &model.indexerHeadDim}) {
+            const int value = *field;
+            ++*field;
+            Check(!model.UseFullHybridGraph(), "full graph enabled for another architecture");
+            *field = value;
+        }
+        model.executionMode = ExecutionMode::Gpu;
+        Check(!model.UseFullHybridGraph(), "full hybrid graph changed the GPU policy");
+        model.executionMode = ExecutionMode::Hybrid;
+        model.threadTpRank = 0;
+        Check(!model.UseFullHybridGraph(), "full hybrid graph changed the TP policy");
+        model.threadTpRank = -1;
+        SetCudaGraph(false);
+        Check(!model.UseFullHybridGraph(), "full graph ignored global graph disable");
+        SetCudaGraph(true);
+        setenv("FASTLLM_QWEN38_HYBRID_GRAPH", "0", 1);
+        Check(!model.UseFullHybridGraph(), "full graph ignored explicit disable");
+        unsetenv("FASTLLM_QWEN38_HYBRID_GRAPH");
+        Check(!model.UseFullHybridGraph(), "full graph enabled without opt-in");
+        setenv("FASTLLM_QWEN38_HYBRID_GRAPH", "1", 1);
+#endif
+    }
+    static void CheckGraphSlotReset(int targetDevice = 0, int draftDevice = 0,
+                                    bool fullGraph = false) {
 #ifdef USE_CUDA
         Qwen4ExpModel model;
+        if (fullGraph) ConfigureFullGraphModel(model);
         Qwen4ExpModel::RequestState state;
         state.previousToken1 = 17;
         state.previousToken2 = 23;
@@ -379,6 +669,11 @@ struct Qwen4GGUFTestAccess {
             value->expansionDims = value->dims;
             return value;
         };
+        state.pleConvHistoryTensors[0] = tensor({3, 8});
+        state.pleConvHistoryTensors[1] = tensor({3, 8});
+        void *pleHistory[] = {state.pleConvHistoryTensors[0]->cudaData,
+                              state.pleConvHistoryTensors[1]->cudaData};
+        state.pleConvHistoryIndex = 1;
         state.indexerTailKeyTensors[1] = tensor({4, 8});
         state.indexerTailPositionTensors[1] = tensor({4});
         state.indexerBlockKeyTensors[1] = tensor({16, 8});
@@ -416,6 +711,23 @@ struct Qwen4GGUFTestAccess {
                   state.geometricCacheGrowthReadyLayers.empty() &&
                   !state.mtpDisabled && !state.hasMultimodalInput,
                   "graph slot retained request history");
+            Check(state.pleConvHistoryIndex == 0, "graph slot retained active PLE history index");
+            for (int index = 0; index < 2; ++index) {
+                const auto &history = state.pleConvHistoryTensors[index];
+                if (!model.UseFullHybridGraph()) {
+                    Check(!history, "legacy graph policy retained PLE history storage");
+                    continue;
+                }
+                Check(history && history->cudaData == pleHistory[index] &&
+                    history->dataDeviceIds == std::vector<int>{targetDevice},
+                    "graph slot moved captured PLE history storage");
+                std::vector<float> values(history->Count(0), -1);
+                FastllmCudaCopyFromDeviceToHost(values.data(), history->cudaData, history->GetBytes());
+                Check(std::all_of(values.begin(), values.end(), [](float v) { return v == 0; }),
+                    "graph slot leaked previous request PLE history");
+                std::fill(values.begin(), values.end(), 13);
+                FastllmCudaCopyFromHostToDevice(history->cudaData, values.data(), history->GetBytes());
+            }
             Check(state.indexerTailKeyTensors[1]->cudaData == tail &&
                   state.indexerTailPositionTensors[1]->cudaData == positions &&
                   state.indexerBlockKeyTensors[1]->cudaData == blocks &&
@@ -435,14 +747,16 @@ struct Qwen4GGUFTestAccess {
         std::cout << "PASS: Qwen4 graph slot resets history and preserves captured storage\n";
 #endif
     }
-    static void CheckGraphSlotOwnership(int secondDevice) {
+    static void CheckGraphSlotOwnership(int secondDevice, bool hybrid = false, bool fullGraph = false) {
 #ifdef USE_CUDA
         Qwen4ExpModel model;
-        model.block_cnt = 2;
-        model.linearLayers = {true, true};
+        if (fullGraph) ConfigureFullGraphModel(model);
+        else model.block_cnt = 2;
+        model.executionMode = hybrid ? ExecutionMode::Hybrid : ExecutionMode::Gpu;
+        model.linearLayers.assign(model.block_cnt, true);
         model.servingCache = std::make_shared<Qwen4ExpModel::ServingCache>();
-        model.servingCache->layers.resize(2);
-        for (int layer = 0; layer < 2; ++layer) {
+        model.servingCache->layers.resize(model.block_cnt);
+        for (int layer = 0; layer < model.block_cnt; ++layer) {
             const int device = layer == 0 ? 0 : secondDevice;
             for (auto *pool : {&model.servingCache->layers[layer].first,
                               &model.servingCache->layers[layer].second}) {
@@ -463,17 +777,28 @@ struct Qwen4GGUFTestAccess {
             }
         }
         const Data *slotKey = nullptr;
-        for (int request = 0; request < 2; ++request) {
-            std::vector<std::pair<Data, Data>> cache(2);
+        // A one-output request runs only prefill and captures no decode shape.
+        // Subsequent hybrid requests must still be able to capture, while the
+        // same KV storage and MTP checkpoint owners survive every boundary.
+        for (int request = 0; request < 4; ++request) {
+            std::vector<std::pair<Data, Data>> cache(model.block_cnt);
             const Data *rootKey = &cache.front().first;
             model.requestStates[rootKey].reusableGraphRequest = true;
-            for (int phase = 0; phase < 2; ++phase) {
+            for (int phase = 0; phase < (request == 0 ? 1 : 2); ++phase) {
                 Check(model.WithDecodeServingCache(cache, [&](auto &owned) {
                     const Data *key = &owned.front().first;
                     if (!slotKey) slotKey = key;
                     Check(key == slotKey && key != rootKey,
                           "prefill, decode and repeated requests changed slot ownership");
                     auto &state = model.requestStates[key];
+                    const bool expectedFrozen = request > 0 &&
+                        (!hybrid || (secondDevice != 0 && !model.UseFullHybridGraph()));
+                    Check(state.decodeGraphsFrozen == expectedFrozen,
+                          "reused hybrid slot cannot finish capture after a short request");
+                    if (state.mtpState)
+                        Check(state.mtpState->attentionState.decodeGraphsFrozen == expectedFrozen,
+                              "draft capture policy diverged from its reused target slot");
+                    else state.mtpState = std::make_shared<Qwen4ExpModel::MtpRuntimeState>();
                     Check(state.processedTokens == (phase == 0 ? std::vector<int>{} :
                                                                 std::vector<int>{17}),
                           "prefill history was lost or leaked into the next request");
@@ -557,6 +882,82 @@ struct Qwen4GGUFTestAccess {
         unsetenv("FASTLLM_MTP_DRAFT_VOCAB");
         unlink(path.c_str());
         std::cout << "PASS: draft vocabulary format=" << type << " preserves target bytes/logits and rejects invalid ids\n";
+#endif
+    }
+    static void CheckPleGraph(Qwen4ExpModel &m) {
+#ifdef USE_CUDA
+        FastllmCudaSetDevice(0);
+        static_cast<Executor *>(GetExecutor())->SetFirstDevice("cuda");
+        const int channels = m.hcCount * m.embed_dim;
+        auto same = [](const Data &expected, const Data &actual, const char *message) {
+            Data a, b; a.CopyFrom(expected); b.CopyFrom(actual);
+            a.ToDevice(CPU); b.ToDevice(CPU);
+            Check(a.dims == b.dims && a.dataType == b.dataType &&
+                !std::memcmp(a.cpuData, b.cpuData, a.GetBytes()), message);
+        };
+        for (int rows : {1, 2, 3, 4}) {
+            Qwen4ExpModel::RequestState reference, candidate;
+            Data hidden(FLOAT32, {1, rows, channels}), staged, expected, actual, expectedNorm, actualNorm;
+            hidden.ToDevice(CUDA, std::vector<int>{0}); hidden.Allocate(false);
+            auto prepare = [&](int step) {
+                std::vector<int> tokens(rows);
+                for (int i = 0; i < rows; ++i) tokens[i] = (step + i) % 10;
+                std::vector<float> ids(tokens.begin(), tokens.end()), values(rows * channels);
+                for (size_t i = 0; i < values.size(); ++i) values[i] = (int((i + step * 17) % 37) - 18) * .02f;
+                Data newHidden(FLOAT32, {1, rows, channels}, values);
+                FastllmCudaCopyFromHostToDevice(hidden.cudaData, newHidden.cpuData, newHidden.GetBytes());
+                Data input(FLOAT32, {1, rows}, ids), embedding;
+                m.RunPLE(hidden, input, reference, expected, &tokens, nullptr, &expectedNorm);
+                m.PreparePLEEmbedding(hidden, input, candidate, embedding, &tokens, nullptr);
+                if (!staged.cudaData) { staged.CopyFrom(embedding); staged.ToDevice(CUDA, std::vector<int>{0}); }
+                else FastllmCudaCopyFromHostToDevice(staged.cudaData, embedding.cpuData, embedding.GetBytes());
+            };
+            auto compute = [&] { m.RunPLEProjection(staged, hidden, candidate, actual, &actualNorm, true); };
+            prepare(0);
+            std::vector<size_t> allocations;
+            { FastllmCudaAllocationRecorder record(&allocations); compute(); }
+            ForceDeviceSync();
+            same(expected, actual, "PLE graph warmup output differs");
+            void *graph = nullptr, *exec = nullptr;
+            std::vector<void *> reserved;
+            Check(FastllmCudaGraphPrepareCaptureDevice() && FastllmCudaReserveGraphWorkspace(allocations) &&
+                FastllmCudaGraphMemoryPoolBegin() && FastllmCudaGraphBeginCapture(), "PLE capture begin");
+            compute();
+            Check(FastllmCudaGraphEndCapture(&graph) && graph && FastllmCudaGraphMemoryPoolEnd(reserved) &&
+                FastllmCudaGraphInstantiate(graph, &exec), "PLE capture end");
+            Data savedReference, savedCandidate;
+            std::vector<int> savedTokens;
+            int saved1 = 0, saved2 = 0;
+            for (int step = 1; step <= 16; ++step) {
+                if (step == 6) {
+                    savedReference.CopyFrom(*reference.pleConvHistoryTensors[reference.pleConvHistoryIndex]);
+                    savedCandidate.CopyFrom(*candidate.pleConvHistoryTensors[candidate.pleConvHistoryIndex]);
+                    savedTokens = candidate.processedTokens;
+                    saved1 = candidate.previousToken1; saved2 = candidate.previousToken2;
+                }
+                if (step == 9) {
+                    reference.pleConvHistoryTensors[reference.pleConvHistoryIndex]->CopyFrom(savedReference);
+                    candidate.pleConvHistoryTensors[candidate.pleConvHistoryIndex]->CopyFrom(savedCandidate);
+                    for (auto *state : {&reference, &candidate}) {
+                        state->processedTokens = savedTokens;
+                        state->previousToken1 = saved1; state->previousToken2 = saved2;
+                    }
+                }
+                prepare(step);
+                Check(FastllmCudaGraphLaunch(exec), "PLE graph replay");
+                ForceDeviceSync();
+                same(expected, actual, "PLE replay changed output");
+                same(expectedNorm, actualNorm, "PLE replay changed verification rows");
+                same(*reference.pleConvHistoryTensors[reference.pleConvHistoryIndex],
+                     *candidate.pleConvHistoryTensors[candidate.pleConvHistoryIndex], "PLE replay changed history");
+                Check(reference.processedTokens == candidate.processedTokens &&
+                    reference.previousToken1 == candidate.previousToken1 &&
+                    reference.previousToken2 == candidate.previousToken2, "PLE graph duplicated token history");
+            }
+            FastllmCudaGraphExecDestroy(exec); FastllmCudaGraphDestroy(graph);
+            FastllmCudaGraphMemoryPoolRelease(reserved);
+        }
+        std::cout << "PASS: PLE full graph rows=1,2,3,4, EOS, rollback, verification and history are bit-exact\n";
 #endif
     }
     static void CheckPlePrefetch(Qwen4ExpModel &m) {
@@ -1001,11 +1402,106 @@ static void TestDirectMergeFormats() {
     std::cout << "PASS: direct merge formats, disk fallback and parallel read failure\n";
 }
 
+
+static void TestCudaPackedEmbedding() {
+#ifdef USE_CUDA
+    FastllmCudaSetDevice(0);
+    SetCudaEmbedding(true);
+    auto &executor = *static_cast<Executor *>(GetExecutor());
+    size_t checked = 0;
+    for (auto type : {GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_Q3_K}) {
+        for (int width : {256, 768, 2560}) {
+            const int vocab = 37;
+            const size_t rowBytes = ggml_row_size(type, width), blockBytes = ggml_type_size(type);
+            Tensor table{"token_embd.weight", {vocab, width}, type, Bytes(vocab * rowBytes)};
+            for (size_t i = 0; i < table.bytes.size(); ++i) table.bytes[i] = (i*73 + i/7 + 19) % 256;
+            for (size_t b = 0; b < table.bytes.size()/blockBytes; ++b) {
+                auto *block = table.bytes.data() + b * blockBytes;
+                const uint16_t scale = float_to_half(float(int(b % 29) - 14) / 4096);
+                if (type == GGML_TYPE_Q3_K) reinterpret_cast<block_q3_K *>(block)->d = scale;
+                else std::memcpy(block, &scale, sizeof(scale));
+            }
+            const std::string path = "/tmp/fastllm-embedding-" + std::to_string(getpid()) + ".gguf";
+            Write(path, {{"general.architecture", "qwen4exp"}}, {table});
+            std::vector<ReadGGUFTask> tasks;
+            AppendGGUFTasks("qwen4_exp", path, tasks);
+            Check(tasks.size() == 1 && tasks[0].replaceType == GGUFWeightReplaceRule::GGUFWeightReplaceDirect,
+                  "packed GPU embedding import policy");
+            Data weight(FLOAT32, {1}), reference(FLOAT32, {1});
+            auto &task = tasks[0];
+            WeightImportGGUFTensor(&weight, &task.tensor, task.fileName, task.offset, task.replaceType);
+            WeightImportGGUFTensor(&reference, &task.tensor, task.fileName, task.offset,
+                                  GGUFWeightReplaceRule::GGUFWeightReplaceForceFP32);
+            unlink(path.c_str());
+            Check(weight.GetBytes() == table.bytes.size(), "GPU embedding expanded at import");
+            weight.ToDevice(DataDevice::CUDA, std::vector<int>{0});
+            for (int rows : {1, 4, 4096}) {
+                std::vector<float> ids(rows);
+                for (int i = 0; i < rows; ++i) ids[i] = (i*17 + vocab-1) % vocab;
+                Data input(FLOAT32, {1, rows}, ids), actual, expected;
+                DataDict dense{{"input", &input}, {"weight", &reference}, {"output", &expected}};
+                executor.RunOnDevice("cpu", "Embedding", dense, {}, {});
+                input.ToDevice(DataDevice::CUDA, std::vector<int>{0});
+                actual.dataType = FLOAT32; actual.Resize({1, rows, width});
+                actual.ToDevice(DataDevice::CUDA, std::vector<int>{0}); actual.Allocate();
+                Check(FastllmCudaGGUFEmbedding(input, weight, actual), "packed CUDA embedding dispatch");
+                ForceDeviceSync();
+                Data host(actual); host.ToDevice(DataDevice::CPU);
+                if (std::memcmp(host.cpuData, expected.cpuData, expected.GetBytes()) != 0) {
+                    const float *a = (float *)host.cpuData, *e = (float *)expected.cpuData;
+                    double maximum = 0; size_t mismatches = 0;
+                    for (size_t i = 0; i < expected.Count(0); ++i) {
+                        maximum = std::max(maximum, double(std::abs(a[i]-e[i])));
+                        mismatches += a[i] != e[i];
+                    }
+                    std::cerr << "embedding mismatch type=" << int(type) << " width=" << width
+                              << " rows=" << rows << " count=" << mismatches << " max=" << maximum << "\n";
+                    Check(false, "packed CUDA embedding differs from CPU FP32 import");
+                }
+                // Replay with a changed token buffer catches accidental host IDs
+                // or captured pointers to a temporary row-dequantization buffer.
+                void *graph = nullptr, *exec = nullptr;
+                Check(FastllmCudaGraphBeginCapture(), "embedding begin capture");
+                Check(FastllmCudaGGUFEmbedding(input, weight, actual), "embedding captured dispatch");
+                Check(FastllmCudaGraphEndCapture(&graph) && FastllmCudaGraphInstantiate(graph, &exec), "embedding instantiate");
+                for (float &id : ids) id = int(id + 9) % vocab;
+                FastllmCudaCopyFromHostToDevice(input.cudaData, ids.data(), ids.size()*sizeof(float));
+                Check(FastllmCudaGraphLaunch(exec), "embedding graph replay");
+                ForceDeviceSync();
+                Data replay(actual); replay.ToDevice(DataDevice::CPU);
+                const float *ref = (const float *)reference.cpuData;
+                for (int i = 0; i < rows; ++i)
+                    Check(std::memcmp(replay.cpuData + size_t(i)*width*4, ref+size_t(ids[i])*width, width*4) == 0,
+                          "packed CUDA embedding replay mismatch");
+                FastllmCudaGraphExecDestroy(exec); FastllmCudaGraphDestroy(graph);
+                checked += size_t(rows)*width*2;
+            }
+        }
+    }
+    std::cout << "PASS: packed CUDA embedding and graph replay match CPU FP32 import exactly: "
+              << checked << " elements\n";
+#endif
+}
+
 int main(int argc, char **argv) {
     try {
         SetThreads(2); SetDeviceMap({{"cpu", 1}}); SetMoeDeviceMap({{"cpu", 1}});
         SetCudaEmbedding(false);
         SetMoeCudaCacheBytes(0); setenv("FASTLLM_QWEN4_ENABLE_MTP", "0", 1);
+        if (argc == 2 && std::string(argv[1]) == "--vision-cpu") {
+            Qwen4GGUFTestAccess::CheckVisionCpuActivationType(); return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "--packed-embedding") {
+            TestCudaPackedEmbedding(); return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "--attention-graph") {
+#ifdef USE_CUDA
+            if (FastllmCudaGetDeviceCount() < 1) return 77;
+            Qwen4GGUFTestAccess::CheckFullAttentionGraph(); return 0;
+#else
+            return 77;
+#endif
+        }
         if (argc == 2 && std::string(argv[1]) == "--qsa-causal-mask") {
 #ifdef USE_CUDA
             if (FastllmCudaGetDeviceCount() < 1) return 77;
@@ -1016,16 +1512,31 @@ int main(int argc, char **argv) {
             return 77;
 #endif
         }
+        if (argc == 2 && std::string(argv[1]) == "--remote-moe") {
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+            if (FastllmCudaGetDeviceCount() < 2) return 77;
+            Qwen4GGUFTestAccess::CheckRemoteMoeDispatch();
+            return 0;
+#else
+            return 77;
+#endif
+        }
         if (argc == 2 && std::string(argv[1]) == "--graph-slot-reset") {
 #ifdef USE_CUDA
             if (FastllmCudaGetDeviceCount() < 1) return 77;
             FastllmCudaSetDevice(0);
+            Qwen4GGUFTestAccess::CheckFullGraphPolicy();
             Qwen4GGUFTestAccess::CheckGraphSlotReset();
+            Qwen4GGUFTestAccess::CheckGraphSlotReset(0, 0, true);
+            Qwen4GGUFTestAccess::CheckGraphSlotOwnership(0, true, true);
             Qwen4GGUFTestAccess::CheckGraphSlotOwnership(0);
+            Qwen4GGUFTestAccess::CheckGraphSlotOwnership(0, true);
             if (FastllmCudaGetDeviceCount() >= 2) {
                 Qwen4GGUFTestAccess::CheckGraphSlotOwnership(1);
-                Qwen4GGUFTestAccess::CheckGraphSlotReset(0, 1);
-                Qwen4GGUFTestAccess::CheckGraphSlotReset(1, 0);
+                Qwen4GGUFTestAccess::CheckGraphSlotOwnership(1, true);
+                Qwen4GGUFTestAccess::CheckGraphSlotOwnership(1, true, true);
+                Qwen4GGUFTestAccess::CheckGraphSlotReset(0, 1, true);
+                Qwen4GGUFTestAccess::CheckGraphSlotReset(1, 0, true);
             }
             return 0;
 #else
@@ -1044,6 +1555,22 @@ int main(int argc, char **argv) {
             Qwen4GGUFTestAccess::CheckDraftVocabulary(fixture.directory, GGML_TYPE_Q8_0);
             Qwen4GGUFTestAccess::CheckDraftVocabulary(fixture.directory, GGML_TYPE_Q6_K);
             return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "--ple-graph") {
+#ifdef USE_CUDA
+            if (FastllmCudaGetDeviceCount() < 1) return 77;
+            Fixture fixture;
+            SetNgramDevice("disk");
+            auto base = CreateLLMModelFromGGUFFile(fixture.files[0], "");
+            auto *model = dynamic_cast<Qwen4ExpModel *>(base.get());
+            Check(model, "PLE graph fixture model");
+            Qwen4GGUFTestAccess::Prepare(*model);
+            Qwen4GGUFTestAccess::CheckPlePrefetch(*model);
+            Qwen4GGUFTestAccess::CheckPleGraph(*model);
+            return 0;
+#else
+            return 77;
+#endif
         }
         TestConcurrentExpertMerges();
         TestDirectMergeFormats();

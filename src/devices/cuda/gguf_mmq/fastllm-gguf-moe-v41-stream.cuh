@@ -60,11 +60,19 @@ static bool RunNativeV41Streamed(StreamedMoePhase phase, const __nv_bfloat16 *in
         int rows, int hidden, int inter, int topk, int gt, int dt,
         const StreamedMoeBatch &batch, const float *scores, const int *indices, float limit) {
     const auto stream = cudaStreamPerThread;
+    if (capacity <= 0 || capacity > kV41StreamedRoutes || capacity % kTile ||
+        (phase == StreamedMoePhase::Compute &&
+         (batch.rows <= 0 || batch.rows > capacity || batch.rows % kTile))) return false;
     StreamedWorkspace s(workspace, rows, hidden, inter, topk, capacity, true);
     auto *partials = reinterpret_cast<__nv_bfloat16 *>(s.routes);
     if (phase == StreamedMoePhase::Prepare) {
         CUDA_CHECK(cudaMemsetAsync(partials, 0, size_t(rows) * topk * hidden * sizeof(__nv_bfloat16), stream));
-        QuantizeNativeV41Streamed<<<dim3(hidden / 256, rows), 256, 0, stream>>>(input, s.input, hidden);
+        // The outer chunk may exceed grid.y. Quantize each row exactly once
+        // without changing block-32 FP8/Q8_1 rounding or reuploading weights.
+        for (int first = 0; first < rows; first += 65535) {
+            QuantizeNativeV41Streamed<<<dim3(hidden / 256, std::min(rows - first, 65535)), 256, 0, stream>>>(
+                input + size_t(first) * hidden, s.input + size_t(first) * (hidden / 32), hidden);
+        }
     } else if (phase == StreamedMoePhase::Finish) {
         ReduceV41<<<(rows * hidden + 255) / 256, 256, 0, stream>>>(
             partials, output, nullptr, indices, rows, hidden, topk);

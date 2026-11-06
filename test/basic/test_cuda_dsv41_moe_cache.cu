@@ -307,9 +307,9 @@ static void Quant(std::vector<float> &v, int blockSize = 32) {
         }
     }
 }
-static void Gpu(Data &d) {
+static void Gpu(Data &d, int device = 0) {
     d.dataDevice = DataDevice::CUDA;
-    d.dataDeviceIds = {0};
+    d.dataDeviceIds = {device};
     d.Allocate(false);
 }
 static void RunNumasMoe(Data &input, Data &index, Data &scores, Data &output, std::vector<Data *> &weights, int layer) {
@@ -348,13 +348,63 @@ static void Compare(const std::vector<float> &actual, const std::vector<float> &
     }
 }
 
+// Exercise the NUMA entry point, including mixed CPU/GPU experts and
+// back-to-back CUDA consumers. No model-specific dispatch scope is installed.
+static void CheckNumasPrefill(std::vector<Data *> *weights, int tables) {
+    constexpr int topk = 6;
+    const int hidden = weights[0][2]->dims[1];
+    const int experts = int(weights[0].size()) / 2 - 1;
+    int cases = 0;
+    for (int rows : {65, 129, 33, 1, 257, 32, 65}) {
+        Data cpuInput(BFLOAT16, {rows, hidden}), input;
+        Data index(INT32, {rows, topk}), scores(FLOAT32, {rows, topk});
+        cpuInput.Allocate(false); index.Allocate(false); scores.Allocate(false);
+        for (int i = 0; i < rows * hidden; ++i)
+            reinterpret_cast<uint16_t *>(cpuInput.cpuData)[i] =
+                Float32ToBFloat16RNEBits(std::sin(float(i + rows) * .137f) / 32.f);
+        for (int row = 0; row < rows; ++row) for (int k = 0; k < topk; ++k) {
+            // Five frequent experts, plus sparse CPU work in the final rows.
+            reinterpret_cast<int32_t *>(index.cpuData)[row * topk + k] =
+                k < topk - 1 || row + 16 < rows ? k : topk + row % (experts - topk);
+            reinterpret_cast<float *>(scores.cpuData)[row * topk + k] = (k + 1) / 32.f;
+        }
+        input.CopyFrom(cpuInput);
+        input.ToDevice(CUDA, std::vector<int>{0});
+        Data expected[3], actual[3];
+        // Use the same CPU/GPU partition and BF16 rounding in the reference,
+        // with an explicit device barrier after each layer. An all-CPU result
+        // has a different partial-sum rounding boundary in mixed execution.
+        for (int layer = 0; layer < 3; ++layer) {
+            RunNumasMoe(layer ? expected[layer - 1] : input, index, scores,
+                        expected[layer], weights[layer % tables], layer);
+            Check(cudaDeviceSynchronize());
+        }
+        for (int layer = 0; layer < 3; ++layer)
+            RunNumasMoe(layer ? actual[layer - 1] : input, index, scores,
+                        actual[layer], weights[layer % tables], layer);
+        // Defer readback until every dependent layer has consumed its input.
+        for (int layer = 0; layer < 3; ++layer) {
+            expected[layer].ToDevice(CPU);
+            actual[layer].ToDevice(CPU);
+            Require(expected[layer].GetBytes() == actual[layer].GetBytes() &&
+                std::memcmp(expected[layer].cpuData, actual[layer].cpuData, actual[layer].GetBytes()) == 0,
+                "NUMA hybrid prefill chain differs from serialized output bits");
+            ++cases;
+        }
+        // Also drain asynchronous reduction before shape changes / teardown.
+        ClearNumasMoeRuntimeCache();
+    }
+    std::printf("NUMAS_PREFILL_PASS %d layer comparisons, CPU/GPU split, shape changes and chained outputs\n", cases);
+}
+
 static void CheckCompleteNativeGraphs(std::vector<Data *> &weights, int layer) {
     const int hidden = weights[2]->dims[1], experts = weights.size() / 2 - 1;
+    const int device = FastllmCudaGetDevice();
     Require(FastllmCudaMoeCacheFullyResident(weights.data(), weights.size()), "complete cache not recognized");
     int checks = 0;
     for (int rows : {1, 2, 3, 5, 7, 8, 9, 16, 31, 32}) for (int topk : {1, 3, 6, 16}) {
         Data input(BFLOAT16, {rows, hidden}), ids(INT32, {rows, topk}), scores(FLOAT32, {rows, topk}), output;
-        Gpu(input); Gpu(ids); Gpu(scores);
+        Gpu(input, device); Gpu(ids, device); Gpu(scores, device);
         std::vector<uint16_t> x(rows * hidden), expected(x.size()), actual(x.size());
         std::vector<int> selected(rows * topk), cpu(selected.size(), -1);
         std::vector<float> scales(selected.size());
@@ -621,10 +671,14 @@ int main(int argc, char **argv) {
             return false;
         };
         const bool dual = option("--dual"), fp8 = option("--fp8");
+        const bool pageable = option("--pageable");
+        if (pageable) setenv("FT_PINNED_WEIGHT", "0", 1);
+        auto freeShard = [&](void *p) { if (pageable) free(p); else Check(cudaFreeHost(p)); };
         if (option("--mailbox")) SetCudaGraph(true);
         std::printf("V4.1 cache weights: %s\n", fp8 ? "FP8 block128" : "NVFP4 block32");
         int devices = 0;
         Check(cudaGetDeviceCount(&devices));
+        if (option("--resident-budget-only") && devices < 2) return 77;
         Require((!dual && !option("--pp-fullgraph")) || devices >= 2, "--dual requires two CUDA devices");
         unsetenv("FASTLLM_MOE_CUDA_CACHE_BYTES_0");
         unsetenv("FASTLLM_MOE_CUDA_CACHE_BYTES_1");
@@ -632,7 +686,7 @@ int main(int argc, char **argv) {
         // Exercise GPU prefill deliberately; CPU-oracle inputs below have no
         // CUDA mirror and therefore still run entirely on NUMA.
         setenv("FT_GPU_PREFILL", "1", 1);
-        setenv("FT_EXPERT_LIMIT", "0", 1);
+        setenv("FT_EXPERT_LIMIT", option("--numas-prefill") ? "32" : "0", 1);
         SetThreads(30);
         {
             float *device;
@@ -781,7 +835,8 @@ int main(int argc, char **argv) {
                     }
                     for (int node = 0; node < nodes; ++node) {
                         void *ptr = nullptr;
-                        Check(cudaHostAlloc(&ptr, rows / nodes * pitch, cudaHostAllocMapped | cudaHostAllocPortable));
+                        if (pageable) Require(posix_memalign(&ptr, 64, rows / nodes * pitch) == 0, "pageable shard allocation");
+                        else Check(cudaHostAlloc(&ptr, rows / nodes * pitch, cudaHostAllocMapped | cudaHostAllocPortable));
                         for (int r = 0; r < rows / nodes; ++r) {
                             const int physical = node * (rows / nodes) + r;
                             const int logical = part ? physical : physical / 2 + (physical & 1) * inter;
@@ -790,22 +845,76 @@ int main(int argc, char **argv) {
                         shards.push_back(ptr);
                         w->numasData.push_back((uint8_t *)ptr);
                     }
-                    w->isPinned = true;
+                    w->isPinned = !pageable;
                     w->isModelWeight = true;
                     weights[t][2 * (e + 1) + part] = w.get();
                     owned.push_back(std::move(w));
                 }
             layers[t] = {weights[t].data(), (int)weights[t].size(), true, 10.0f};
         }
+        if (option("--numas-prefill")) {
+            SetMoeCudaCacheBytes(0);
+            CheckNumasPrefill(weights, tables);
+            for (auto &weight : owned) weight->numasData.clear();
+            for (void *pointer : shards) freeShard(pointer);
+            return 0;
+        }
         const size_t record = ((weights[0][2]->GetBytes() + weights[0][3]->GetBytes() + 127) / 128) * 128;
+        if (option("--resident-budget-only")) {
+            Require(!fp8, "resident budget requires MXFP4 experts");
+            setenv("FASTLLM_CUDA_TRITON", "0", 1);
+            setenv("FASTLLM_CUDA_TRITON_MXFP4_GROUPED", "0", 1);
+            const uint64_t payload = record * experts * tables;
+            SetMoeCudaCacheBytes(payload + record);
+            Require(!FastllmCudaPrepareMoeCacheWithBudgets(layers, tables, [] {}, false,
+                {{0, payload + 2 * record}}, true), "subgroup exceeded model cache budget");
+            Require(!FastllmCudaPrepareMoeCacheWithBudgets(layers, tables, [] {}, false,
+                {{devices, payload}}, true), "invalid CUDA ordinal accepted");
+            setenv("FASTLLM_MOE_CUDA_CACHE_BYTES_0", "0", 1);
+            Require(!FastllmCudaPrepareMoeCacheWithBudgets(layers, tables, [] {}, false,
+                {{0, payload}}, true), "explicit device limit ignored");
+            unsetenv("FASTLLM_MOE_CUDA_CACHE_BYTES_0");
+            // Swap the owner to cover TP-root and PP-tail placement. A second
+            // visible device must not allocate a duplicate draft cache.
+            for (int owner : {0, 1}) {
+                for (auto &layer : layers) layer.cacheDevice = owner;
+                Require(FastllmCudaPrepareMoeCacheWithBudgets(layers, tables, [] {}, false,
+                    {{owner, payload}, {1-owner, 0}}, true), "explicit resident preparation");
+                Check(cudaSetDevice(1-owner));
+                Require(!FastllmCudaMoeCacheFullyResident(weights[0].data(), weights[0].size()),
+                    "draft cache duplicated on non-owner");
+                Check(cudaSetDevice(owner));
+                for (int t = 0; t < tables; ++t) {
+                    FastllmCudaMoePrefillResidents resident;
+                    Require(FastllmCudaGetMoePrefillResidents(weights[t].data(), experts, resident, true),
+                        "resident owner snapshot");
+                    Require(resident.weights.size() == 2 * experts &&
+                        std::all_of(resident.weights.begin(), resident.weights.end(), [](const void *w) { return w; }),
+                        "resident cache did not preload every expert");
+                }
+                CheckCompleteNativeGraphs(weights[0], 0);
+                FastllmCudaReleaseMoeCache(weights[0].data(), weights[0].size());
+            }
+            Check(cudaSetDevice(0));
+            ClearNumasMoeRuntimeCache();
+            for (auto &weight : owned) weight->numasData.clear();
+            for (void *pointer : shards) freeShard(pointer);
+            SetMoeCudaCacheBytes(0);
+            std::printf("RESIDENT_DEVICE_BUDGET_PASS: owners 0/1, no duplicate cache, 240 graph/NUMA comparisons\n");
+            return 0;
+        }
         SetMoeCudaCacheBytes(0);
         Require(!FastllmCudaPrepareMoeCache(layers, tables, [] {}), "disabled cache accepted");
         SetMoeCudaCacheBytes(record);
-        Require(!FastllmCudaPrepareMoeCache(layers, tables, [] {}), "undersized cache accepted");
+        // Hybrid decode admits small resident caches; its staged misses have
+        // separate workspace. Registration no longer requires sixteen slots.
+        Require(FastllmCudaPrepareMoeCache(layers, tables, [] {}), "single-slot hybrid registration rejected");
+        FastllmCudaReleaseMoeCache(weights[0].data(), weights[0].size());
         SetMoeCudaCacheBytes(record * 16);
         Require(!FastllmCudaPrepareMoeCache(layers, tables), "unowned NUMA cache accepted");
-        // A disabled, undersized, malformed or overflowing device override
-        // must leave that device on its configured fallback backend.
+        // Pure GPU execution cannot use hybrid's zero-resident streaming
+        // fallback. Invalid overrides must reject that mode on this device.
+        setenv("FASTLLM_DSV41_MOE_CACHE_MODE", "gpu", 1);
         for (const char *value : {"0", "1", "-1", "1g", "bad", "18446744073709551616"}) {
             setenv("FASTLLM_MOE_CUDA_CACHE_BYTES_0", value, 1);
             Require(FastllmCudaPrepareMoeCache(layers, tables, [] {}), "host preparation rejected device override");
@@ -818,6 +927,7 @@ int main(int argc, char **argv) {
             FastllmCudaReleaseMoeCache(weights[0].data(), weights[0].size());
         }
         unsetenv("FASTLLM_MOE_CUDA_CACHE_BYTES_0");
+        unsetenv("FASTLLM_DSV41_MOE_CACHE_MODE");
         if (dual) {
             // Different capacities must remain independent across devices.
             const auto first = std::to_string(record * 24), second = std::to_string(record * 16);
@@ -863,7 +973,7 @@ int main(int argc, char **argv) {
             if (dual) CheckResidentAssist(weights[0]);
             fastllm_prefill_test::Run(layers, weights, tables, true, 32);
             FastllmCudaReleaseMoeCache(weights[0].data(), weights[0].size());
-            for (void *pointer : shards) Check(cudaFreeHost(pointer));
+            for (void *pointer : shards) freeShard(pointer);
             return 0;
         }
 
@@ -1454,8 +1564,7 @@ int main(int argc, char **argv) {
         ClearNumasMoeRuntimeCache();
         for (auto &w : owned)
             w->numasData.clear();
-        for (void *p : shards)
-            Check(cudaFreeHost(p));
+        for (void *p : shards) freeShard(p);
         SetMoeCudaCacheBytes(0);
         unsetenv("FASTLLM_MOE_CUDA_CACHE_BYTES_0");
         unsetenv("FASTLLM_MOE_CUDA_CACHE_BYTES_1");

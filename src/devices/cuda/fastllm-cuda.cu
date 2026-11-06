@@ -842,6 +842,13 @@ void FastllmCudaEventSynchronize(void *event) {
     checkCudaErrors("Error: CUDA error when synchronizing event!", state);
 }
 
+bool FastllmCudaEventComplete(void *event) {
+    const cudaError_t state = cudaEventQuery((cudaEvent_t)event);
+    if (state == cudaErrorNotReady) return false;
+    checkCudaErrors("Error: CUDA error when querying event!", state);
+    return state == cudaSuccess;
+}
+
 float FastllmCudaEventElapsedTime(void *start, void *end) {
     float elapsedMs = 0.0f;
     cudaError_t state = cudaEventElapsedTime(
@@ -5913,9 +5920,7 @@ bool FastllmCudaFreeAfterStream(void *ret, cudaStream_t stream) {
         return true;
     }
     if (fastllm::IsCudaWorkspacePointer(ret)) {
-        cudaError_t state = cudaStreamSynchronize(stream);
-        checkCudaErrors("Error: synchronizing CUDA workspace release", state);
-        return state == cudaSuccess && fastllm::TryFreeCudaWorkspace(ret);
+        return fastllm::TryFreeCudaWorkspaceAfterStream(ret, reinterpret_cast<void *>(stream));
     }
     FastllmCudaGraphCaptureIdentity captureIdentity =
         FastllmCudaGraphCurrentCaptureIdentity();
@@ -6585,13 +6590,23 @@ void FastllmCudaMemcpyBetweenDevices(int dstId, void *dst, int srcId, void *src,
         cudaSetDevice(oriId);
         return;
     }
-    const char *failedStage = "cudaMemcpyPeer";
+    const char *failedStage = "cudaMemcpyPeerAsync";
     if (canPeerAccess) {
-        state = cudaMemcpyPeer(dst, dstId, src, srcId, size);
+        // Keep the synchronous handoff, but use an explicit stream for the
+        // transfer. The synchronous peer API can fail inside the driver after
+        // PP graph capture. Wait for producers on both devices before copying;
+        // consumers on any thread may read the destination when we return.
+        state = cudaSetDevice(srcId);
+        if (state == cudaSuccess) state = cudaDeviceSynchronize();
+        if (state == cudaSuccess) state = cudaSetDevice(dstId);
+        if (state == cudaSuccess) state = cudaDeviceSynchronize();
         if (state == cudaSuccess) {
-            FastllmCudaSetDevice(dstId);
-            DeviceSync();
-            FastllmCudaSetDevice(oriId);
+            state = cudaMemcpyPeerAsync(dst, dstId, src, srcId, size,
+                                        cudaStreamPerThread);
+        }
+        if (state == cudaSuccess) state = cudaStreamSynchronize(cudaStreamPerThread);
+        cudaSetDevice(oriId);
+        if (state == cudaSuccess) {
             return;
         }
         cudaGetLastError();
@@ -13546,6 +13561,12 @@ bool FastllmHalfToBF16(void *a, void *b, int len) {
 }
 
 bool FastllmCudaEmbedding(const fastllm::Data &input, const fastllm::Data &weight,fastllm::Data &output) {
+    if (weight.dataType == fastllm::DATA_GGUF_FORMAT) {
+        const bool ok = FastllmCudaGGUFEmbedding(input, weight, output);
+        fastllm::AssertInFastLLM(ok, "Unsupported packed CUDA embedding.\n");
+        DeviceSync();
+        return ok;
+    }
     int vocabSize = weight.dims[0], embSize = weight.dims[1];
     uint64_t inputLen = input.Count(0);
 

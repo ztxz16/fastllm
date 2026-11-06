@@ -187,9 +187,67 @@ static void TestNativePrefetch() {
     std::printf("ALL PASS native prefetch cases=%d values=%zu bitwise=1\n", cases, checked);
 }
 
+// The future window must hash identically to committed history, including
+// padding, dead-token boundaries and a final partial chunk. Request creation
+// must snapshot the prompt without committing any of it to live history.
+static void TestPromptWindows() {
+    struct WindowProbe : DeepSeekV41Model {
+        using DeepSeekV41Model::ComputeEngramHashes;
+        using DeepSeekV41Model::GetOrCreateState;
+        void Prepare() {
+            engramMeta.loaded = true;
+            engramMeta.padCompressedId = 2;
+            engramMeta.tokenMap = {10,11,12,13,14,15,16};
+            engram_max_ngram_size = 4; engram_n_heads = 2;
+            engramMeta.multipliers = {{17, 151, 1637, 104729}};
+            engramMeta.primes = {{101,103,107,109,113,127}};
+            engramMeta.offsets = {{0,101,204,311,420,533}};
+        }
+    } model;
+    model.Prepare();
+    setenv("FASTLLM_DSV41_ENGRAM_PREFETCH", "1", 1);
+    ResponseContext context;
+    context.allTokens.resize(1031);
+    for (size_t i = 0; i < context.allTokens.size(); ++i)
+        context.allTokens[i] = i % 79 == 0 ? -1 : i % 7;
+    model.OnResponseContextCreated(&context);
+    auto state = model.GetOrCreateState(context.pastKeyValues, false);
+    Check(state->engramHistory.empty() && state->totalLen == 0, "lookahead committed future history");
+    Check(state->engramPrompt.size() == context.allTokens.size(), "prompt snapshot missing");
+    std::vector<int64_t> expected;
+    model.ComputeEngramHashes(0, state->engramPrompt, 0, state->engramPrompt.size(), expected);
+    for (int chunk : {1,3,128,257}) {
+        std::vector<int64_t> actual;
+        for (int start = 0; start < int(state->engramPrompt.size()); start += chunk) {
+            int count = std::min(chunk, int(state->engramPrompt.size()) - start);
+            int lo = std::max(0, start - 3);
+            std::vector<int> snapshot(state->engramPrompt.begin() + lo,
+                                      state->engramPrompt.begin() + start + count);
+            std::vector<int64_t> rows;
+            model.ComputeEngramHashes(0, snapshot, start - lo, count, rows);
+            actual.insert(actual.end(), rows.begin(), rows.end());
+        }
+        Check(actual == expected, "future-window hashes differ from full committed prompt");
+    }
+    const auto prompt = state->engramPrompt;
+    state->engramHistory = {10}; state->totalLen = 1;
+    model.GetOrCreateState(context.pastKeyValues, true);
+    Check(state->engramHistory.empty() && state->engramPrompt == prompt, "initial reset lost prompt plan");
+    std::weak_ptr<DeepSeekV41RequestState> lifetime = state;
+    state.reset(); model.OnResponseContextRemoved(&context);
+    Check(lifetime.expired(), "removed request retains lookahead state");
+    setenv("FASTLLM_DSV41_ENGRAM_PREFETCH", "0", 1);
+    model.OnResponseContextCreated(&context);
+    Check(model.GetOrCreateState(context.pastKeyValues, false)->engramPrompt.empty(), "prefetch-off retained prompt");
+    model.OnResponseContextRemoved(&context);
+    unsetenv("FASTLLM_DSV41_ENGRAM_PREFETCH");
+    std::puts("PASS Engram future-window hashes, request reset/removal and prefetch-off");
+}
+
 int main() {
     try {
         SetThreads(4);
+        TestPromptWindows();
         TestNativePrefetch();
         TestIQ4NL();
         const FP8E4M3ToFP32Manager fp8;
