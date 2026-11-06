@@ -50,6 +50,7 @@ Qwen3DeviceWeights::Qwen3DeviceWeights(const Qwen3ShardLoader &loader, cudaStrea
     }
     CheckCuda(cudaGetDevice(&device));
     const auto &plan = loader.Plan();
+    this->plan = plan;
     if (plan.tensors.empty() || plan.tensors.size() > std::numeric_limits<uint32_t>::max()) {
         throw std::runtime_error("invalid Qwen3 tensor count");
     }
@@ -131,6 +132,16 @@ std::vector<uint8_t> Qwen3DeviceWeights::Read(uint32_t index, uint64_t offset, u
                               bytes, cudaMemcpyDeviceToHost, stream));
     CheckCuda(cudaStreamSynchronize(stream));
     return result;
+}
+
+const Qwen3DeviceTensor *Qwen3DeviceWeights::Find(const std::string &name) const {
+    CheckDevice();
+    for (const auto &tensor : tensors) {
+        if (tensor.name == name) {
+            return &tensor;
+        }
+    }
+    return nullptr;
 }
 
 void Qwen3DeviceWeights::Clear() {

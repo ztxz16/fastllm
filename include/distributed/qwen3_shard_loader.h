@@ -26,6 +26,11 @@ struct ShardTensorPlan {
 
 struct Qwen3ShardPlan {
     int rank = 0, worldSize = 1;
+    uint64_t hiddenSize = 0, layerCount = 0, headDim = 0;
+    uint64_t queryHeads = 0, kvHeads = 0;
+    float rmsNormEps = 1e-6f, ropeTheta = 1000000.0f;
+    // 仅限制当前前向；权重读取仍可用于尚未接入的配置。
+    std::string forwardUnsupportedReason;
     uint64_t queryHeadBegin = 0, queryHeadCount = 0;
     uint64_t kvHeadBegin = 0, kvHeadCount = 0;
     uint64_t intermediateBegin = 0, intermediateCount = 0;

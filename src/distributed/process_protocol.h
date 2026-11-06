@@ -19,7 +19,8 @@ constexpr uint32_t kMaxPayload = 1024 * 1024;
 enum class Kind : uint32_t {
     Hello = 1, CreateId, UniqueId, Initialize, Ready,
     Ping, Pong, Shutdown, Bye, Error, AllReduce, AllReduceResult,
-    LoadQwen3, ModelLoaded, ReadWeight, WeightData, UnloadQwen3, ModelUnloaded
+    LoadQwen3, ModelLoaded, ReadWeight, WeightData, UnloadQwen3, ModelUnloaded,
+    ForwardLayer, LayerOutput
 };
 struct Message {
     Kind kind;
