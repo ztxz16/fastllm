@@ -4265,7 +4265,7 @@ namespace {
 #endif
     }
 
-    #include "deepseekv41-sm120-prefill.cuh"
+    #include "deepseekv41-prefill-shared-kv.cuh"
 
     // Check the compiled image as well as hardware. An SM75 PTX image JITed
     // on a newer GPU still contains the #if-disabled MMA body. Resource or
@@ -6377,12 +6377,13 @@ extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, co
 
     // Reuse the gathered KV across two head groups without changing numerical
     // boundaries. Resource/image checks happen before submission; unsupported
-    // builds and shapes retain the generic MMA path below.
+    // builds and shapes retain the generic MMA path below. The kernel only needs
+    // SM80 BF16 MMA; V41MmaKernelReady also checks the compiled image, thread
+    // limit and opt-in shared memory capacity before enabling it on SM80+.
     if (!legacyAttention && !referenceMath && q.dataType == DataType::BFLOAT16 &&
-        seqlen >= 128 && heads >= 32 && V41IsSm<12, 0>() &&
-        !V41EnvOn("FASTLLM_DSV41_DISABLE_SM120_PREFILL") &&
-        V41MmaKernelReady<V41SparseAttentionSm120PrefillKernel, 512, sizeof(V41Sm120PrefillShared)>()) {
-        V41SparseAttentionSm120PrefillKernel<<<dim3(bsz * seqlen, (heads + 31) / 32), 512, sizeof(V41Sm120PrefillShared)>>>(
+        seqlen >= 128 && heads >= 32 &&
+        V41MmaKernelReady<V41SparseAttentionPrefillSharedKVKernel, 512, sizeof(V41PrefillSharedKV)>()) {
+        V41SparseAttentionPrefillSharedKVKernel<<<dim3(bsz * seqlen, (heads + 31) / 32), 512, sizeof(V41PrefillSharedKV)>>>(
             (const __nv_bfloat16*)q.cudaData, (const __nv_bfloat16*)chunkKV.cudaData,
             hasRing && !ringFp8 ? (const __nv_bfloat16*)ringKV->cudaData : nullptr,
             hasCmp && !cmpFp8 ? (const __nv_bfloat16*)compressedKV->cudaData : nullptr,
@@ -6392,7 +6393,7 @@ extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, co
             (const float*)attnSink.cudaData, seqlen, heads, windowSize, cap, topWidth, startPos,
             softmaxScale, (__nv_bfloat16*)output.cudaData,
             ringMode, ringRowBytes, cmpMode, cmpRowBytes, vecUnpack ? 1 : 0);
-        return V41CheckLaunch("SparseAttentionSm120Prefill");
+        return V41CheckLaunch("SparseAttentionPrefillSharedKV");
     }
     if (FastllmCudaGetThreadError()) return false;
 
