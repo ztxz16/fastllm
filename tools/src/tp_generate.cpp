@@ -134,7 +134,8 @@ int main(int argc, char **argv) {
         group.LoadQwen3(fs::absolute(args.at("--model")).string());
         uint64_t recorded = 0;
         auto result = GenerateQwen3(group, prompt, sampling, [&](uint32_t token, const std::vector<float> &logits) {
-            Json::object step{{"token_id", double(token)}};
+            // JSON 的离散 ID 必须走整数序列化；double 会写成小数并被 Python 读为 float。
+            Json::object step{{"token_id", static_cast<long long>(token)}};
             if (trace) {
                 if (logits.size() > 8388608ULL - recorded) {
                     throw std::runtime_error("generation trace exceeds 8M logit elements");
@@ -148,7 +149,7 @@ int main(int argc, char **argv) {
             steps.push_back(std::move(step));
         });
         Json::array ids;
-        for (auto token : result.tokenIds) ids.push_back(double(token));
+        for (auto token : result.tokenIds) ids.push_back(static_cast<long long>(token));
         report["token_ids"] = std::move(ids);
         report["finish_reason"] = result.finishReason;
         report["cache_after_generate"] = EmptyCache(group);

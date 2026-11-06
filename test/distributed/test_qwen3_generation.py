@@ -134,6 +134,30 @@ class GenerationTests(unittest.TestCase):
             with self.assertRaises(AssertionError):
                 verify_generation(report, self.request, [0, 1], 17)
 
+    def test_json_token_ids_require_integers_with_diagnostic(self):
+        # 复现 C++ double 序列化的 JSON，而非在判定里将小数强转 int 掩盖错误。
+        report = json.loads(json.dumps(self.make_report()))
+        verify_generation(report, self.request, [0, 1], 17)
+        for field in ("token_ids", "steps"):
+            for invalid in (1.0, 1.5, True, "1", -1, 17):
+                broken = copy.deepcopy(report)
+                if field == "token_ids":
+                    broken["token_ids"][0] = invalid
+                else:
+                    broken["steps"][0]["token_id"] = invalid
+                broken = json.loads(json.dumps(broken))
+                with self.subTest(field=field, invalid=invalid), self.assertRaisesRegex(
+                        AssertionError, r"invalid generated ID at step=0: .*vocab=17"):
+                    verify_generation(broken, self.request, [0, 1], 17)
+
+        # Python 中 True == 1、1.0 == 1；逐步 trace 也必须拒绝这些类型。
+        broken = copy.deepcopy(report)
+        broken["token_ids"][0] = 1
+        for invalid in (True, 1.0):
+            broken["steps"][0]["token_id"] = invalid
+            with self.assertRaisesRegex(AssertionError, "invalid generated ID"):
+                verify_generation(broken, self.request, [0, 1], 17)
+
     def test_generation_cannot_continue_after_eos(self):
         report = self.make_report()
         request = dict(self.request, eos_token_ids=[report["token_ids"][0]])

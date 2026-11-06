@@ -52,7 +52,10 @@ def verify_generation(report, request, devices, vocab):
     require(1 <= len(ids) <= request["max_new_tokens"] and len(steps) == len(ids), "generation count mismatch")
     eos = request["eos_token_ids"]
     for index, (token, step) in enumerate(zip(ids, steps)):
-        require(type(token) is int and 0 <= token < vocab and step["token_id"] == token, "invalid generated ID")
+        step_token = step.get("token_id")
+        require(type(token) is int and 0 <= token < vocab and type(step_token) is int and step_token == token,
+                f"invalid generated ID at step={index}: token={token!r} ({type(token).__name__}), "
+                f"step_token={step_token!r} ({type(step_token).__name__}), vocab={vocab}")
         require(len(step["logits"]) == vocab and token in candidates(step["logits"], request), "incorrect sampled token")
         require(index == len(ids)-1 or token not in eos, "generation continued after EOS")
     expected_reason = "eos" if ids[-1] in eos else "length"
