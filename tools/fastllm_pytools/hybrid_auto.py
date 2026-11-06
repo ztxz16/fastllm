@@ -116,12 +116,21 @@ def inventory(path):
             if not match or int(match[2]) != count:
                 raise ValueError("Hybrid auto: cannot resolve GGUF shards")
             tensors = []
+            first_metadata = None
             for i in range(count):
                 shard = path.with_name("%s-%05d-of-%05d.gguf" % (match[1], i + 1, count))
+                if (i == count - 1 and not shard.exists() and first_metadata is not None and
+                        first_metadata.get("general.architecture") == "deepseek41" and
+                        "deepseek41.ple.layers" in first_metadata):
+                    # ISTA publishes the last shard once, shared by its builds.
+                    shard = path.parent / "DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf"
                 md, part = (metadata, first) if shard == path else _gguf_header(shard)
                 if int(md.get("split.no", -1)) != i or int(md.get("split.count", 0)) != count:
                     raise ValueError("Hybrid auto: inconsistent GGUF shards")
+                if i == 0:
+                    first_metadata = md
                 tensors.extend(part)
+            metadata = first_metadata
             if len(tensors) != int(metadata.get("split.tensors.count", len(tensors))):
                 raise ValueError("Hybrid auto: incomplete GGUF tensor directory")
     else:
@@ -451,6 +460,9 @@ def geometry(metadata, kv_dtype, mtp, dspark=0):
         if mtp:
             raise ValueError("Hybrid auto: DeepSeek-V4.1 uses DSpark, not MTP")
         dim, idxdim = int(get("head_dim", "")), int(get("index_head_dim", ""))
+        for key in ("compress_ratios", "kv_source_layer_ids", "index_source_layer_ids"):
+            if key not in config:
+                raise ValueError("Auto: DeepSeek-V4.1 configuration is missing " + key)
         ratios = config["compress_ratios"]
         def row(dim, index=False):
             if kv_dtype == "fp4":
@@ -676,6 +688,9 @@ def _deepseek_v41_weight_sizes(tensors, args):
                 # mmproj linears import as FP16, parameters as FP32. Quantized
                 # projector variants must reserve the converted allocation.
                 sizes[name] = max(tensor.bytes, math.prod(tensor.shape) * (2 if len(tensor.shape) > 1 else 4))
+            elif name.endswith(".engram_gate.weight"):
+                # The loader keeps the fused FP32 gate and creates a unit k.
+                sizes[name] = math.prod(tensor.shape) * 8
             elif name.endswith((".ffn_gate_inp.weight", ".attn_compressor_kv.weight",
                               ".attn_compressor_gate.weight", ".engram_q.weight", ".engram_k.weight")):
                 sizes[name] = math.prod(tensor.shape) * 4
@@ -1531,6 +1546,16 @@ def validate_options(args):
 def model_inputs(args):
     metadata, tensors = inventory(args.path)
     if metadata.get("general.architecture") == "deepseek41":
+        if "deepseek41.ple.layers" in metadata:
+            # Upstream metadata replaces the four integer tensors. The native
+            # loader materializes the same small host arrays for both layouts.
+            for suffix, key, size, kind in (
+                    ("token_map", "engram.token_map", 4, 26),
+                    ("primes", "ple.head_vocab_sizes", 8, 27),
+                    ("offsets", "ple.head_offsets", 8, 27),
+                    ("multipliers", "ple.layer_multipliers", 8, 27)):
+                count = len(metadata.get("deepseek41." + key, []))
+                tensors.append(Tensor("engram_%s.weight" % suffix, (count,), count * size, "gguf:%d" % kind))
         metadata = gguf.deepseek_v41_config(metadata)
     draft = getattr(args, "speculative_draft_model_path", "")
     deepseek_draft = draft and metadata.get("gguf_architecture") == "deepseek41"

@@ -126,5 +126,5 @@ Naive 部署使用 [Naive 模板](../example/pd/naive_n05.json)，两端保持�
 - 独立组件：按 [Fast KV Manager](../fastkv/README.md) 运行 CTest，覆盖协议边界、缓存不可变性、读取 lease、淘汰、增长、分支、并发与 TCP 传输。
 - 通用 PD 调度：启用 `UNIT_TEST` 后运行 `pd_state_test`，覆盖变长合批、前缀恢复、额度、异常和停止时的上下文释放。
 - DeepSeek：`deepseekV41DsparkBatchRegression TP_FIXTURE_DIR 4 fp4 64 balanced`，fixture 由 `test/basic/test_deepseek_v41_tp_graph.py` 的 `prepare()` 生成。测试通过独立 eager 结果与实际 CUDA launch 次数检查不规则批量、PD 导入、私有补齐行和从 batch 回到单请求；需要 8 张空闲 CUDA GPU，不作为无条件 CTest。
-- Naive：`naive_n05_tp_model_test 2 batch_prefill_nosample`，检查不采样的批量 prefill 后 decode 结果。
+- Naive：`naive_n05_verify_graph_test 2 batch_prefill_nosample`，检查不采样的批量 prefill 后 decode 结果。该入口需要 `FASTLLM_TEST_VERIFY_GRAPH_HOOKS`，普通 `naive_n05_tp_model_test` 不包含此模式。
 - 部署控制：`python -m unittest discover -s test -p test_pd_router.py`，检查参数生成和 P 依赖健康检查；两份示例另用 `ftllm router render --config example/pd/<模板>.json` 验证。

@@ -3355,6 +3355,7 @@ namespace fastllm {
                 std::all_of(limits.begin(), limits.end(), [&](const json11::Json &x) { return x == limits[0]; }),
                 "DeepSeek V4.1 GGUF requires a uniform SwiGLU clamp.");
             AddGGUFDictIfMissing(model, "swiglu_limit", GGUFJsonToDictValue(limits[0]));
+            LoadDeepSeekV41UpstreamGGUFConfig(model, params);
         }
 
         if (model->model_struct == "qwen4_exp") {
@@ -4009,14 +4010,30 @@ namespace fastllm {
         std::vector <std::string> ggufFileNames = GenerateGGUFFileList(fileName);
         AssertInFastLLM(ggufFileNames.size() > 0, "0 gguf file found!");
 
-        printf("Load model from files:\n");
-        for (auto &s : ggufFileNames) {
-            printf("%s\n", s.c_str());
-        }
         json11::Json config;
         ReadGGUFMetaData(ggufFileNames[0], config);
         json11::Json params = config["params"];
         std::string arch = params["general.architecture"].string_value();        
+        if (arch == "deepseek41" && !params["deepseek41.ple.layers"].is_null() &&
+            ggufFileNames.size() > 1 && !FileExists(ggufFileNames.back())) {
+            // ISTA distributes the final Engram shard under a shared filename.
+            // Accept it without requiring users to create a per-build symlink.
+            const std::string shared = ParentDirectoryWithSlash(ggufFileNames[0]) +
+                "DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf";
+            if (FileExists(shared)) {
+                json11::Json last;
+                ReadGGUFMetaData(shared, last);
+                AssertInFastLLM(last["params"]["split.no"].int_value() == (int)ggufFileNames.size() - 1 &&
+                    last["params"]["split.count"].int_value() == (int)ggufFileNames.size() &&
+                    last["params"]["split.tensors.count"] == params["split.tensors.count"],
+                    "DeepSeek V4.1 upstream GGUF: shared Engram is not the matching final shard.");
+                ggufFileNames.back() = shared;
+            }
+        }
+        printf("Load model from files:\n");
+        for (const auto &s : ggufFileNames) {
+            printf("%s\n", s.c_str());
+        }
 
         std::unique_ptr<basellm> modelOwner;
         basellm *model = nullptr;
@@ -4042,6 +4059,11 @@ namespace fastllm {
             model = CreateModelWithType(modelType);
             modelOwner.reset(model);
             AddDictRecursion(model, "", config);
+            if (model->model_struct == "deepseek_v41") {
+                // --ori supplies HF configuration and tokenizer files, but
+                // Engram layout and constants still come from the GGUF.
+                LoadGGUFModelConfig(params, params["general.architecture"].string_value(), model);
+            }
             // 设置eos_token_id
             if (config["eos_token_id"].is_null()) {
                 auto tokenizer = json11::Json::parse(ReadAllFile(path + "tokenizer.json"), error);
@@ -4294,6 +4316,8 @@ namespace fastllm {
                 if (task.name.find(".engram.embed.") != std::string::npos)
                     model->ngramWeights.insert(task.name);
         }
+        if (arch == "deepseek_v41")
+            PrepareDeepSeekV41UpstreamGGUFTasks(model, params, readGGUFTasks);
         if (!mmprojPath.empty() && arch != "deepseek_v41") {
             AssertInFastLLM(
                 model->model_struct == "qwen3_5",

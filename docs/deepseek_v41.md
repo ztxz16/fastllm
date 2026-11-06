@@ -23,7 +23,11 @@ ftllm server /path/to/model-00001-of-00002.gguf --auto \
   --model_name deepseek-v4.1-flash --host 0.0.0.0 --port 8080
 ```
 
-示例文件名需替换为实际路径。GGUF 所引用的 Engram 文件必须放在主模型旁边，文件名和来源需与元数据一致；多个量化版本可以链接到同一份匹配的 Engram 文件。HF 模型保留自己的 Engram 权重与配置。`--ngram_device disk` 控制 Engram 按需读取，与专家是否使用磁盘后端分别设置。
+示例文件名需替换为实际路径。支持早期四分片加独立 Engram 的布局，以及 llama.cpp 主线使用的六分片布局，加载时自动识别，无需转换旧模型或增加格式开关。
+
+保留 `--ori` 时，仍按 GGUF 实际权重选择启动默认值，不会因原始 HF 配置包含草稿层而误开启 DSpark。
+
+旧布局的 Engram 文件名和来源需与主干元数据一致。ISTA 六分片新版需保留主干的第 1–5 分片，以及同目录的 `DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf`；该文件作为第 6 分片，既可使用原名，也可建立 `...-00006-of-00006.gguf` 链接。新旧布局的 Engram 文件头不同，应分别保留匹配的文件。多个相同布局的量化版本可以共享一份匹配的 Engram 文件。HF 模型保留自己的 Engram 权重与配置。`--ngram_device disk` 控制 Engram 按需读取，与专家是否使用磁盘后端分别设置。
 
 自动模式默认单请求、最多 1M 原生窗口、FP4 KV 和快速 Prefill。带内置 DSpark 权重时默认使用 DSpark 5；没有草稿权重的 GGUF 不会自动开启。设备、chunk 和专家缓存以 `[auto]` 日志为准。显卡和主存能容纳专家时优先避免磁盘专家，Engram 仍可独立使用磁盘。
 
@@ -365,7 +369,7 @@ FASTLLM_CUDA_GRAPH=1 ftllm server /path/to/DeepSeek-V4.1-Flash \
 
 其他已预热的 batch、CPU Engram 或混合专家模式使用可捕获的分段图，其动态操作保留在图外。普通多 token prefill、按层分卡及带同步 profiling/dump 的路径使用 eager。工作区由模型持有，不能并发取得锁时走 eager；设备、精度或权重布局变化后重新校验，捕获失败时各 TP rank 一致回退。按层部署应保持 Graph 关闭，避免 CUDA embedding 放置影响跨卡访问。
 
-排查参数包括 `FASTLLM_DSV41_CUDA_GRAPH_WARMUP`（默认 2）和 `FASTLLM_DSV41_CUDA_GRAPH_DEBUG`。故障注入和回放掩码仅供回归测试使用，不应作为部署调优配置。
+排查参数包括 `FASTLLM_DSV41_CUDA_GRAPH_WARMUP`（默认 2）和 `FASTLLM_DSV41_CUDA_GRAPH_DEBUG`。
 
 ## 按层切分
 
@@ -587,10 +591,9 @@ ftllm server /models/DeepSeek-V4.1-Flash-1017-IQ2_XXS.gguf \
 TP 卡号需按升序指定；反序 TP 尚未通过数值校验，此选项会在加载前拒绝反序配置。
 如需指定另一张物理首卡，可调整 `CUDA_VISIBLE_DEVICES` 顺序，再使用 `--tp 2`。
 
-兼容性处理：TP 混合执行开启强制草稿常驻时，custom all-reduce 与目标图回放的组合出现过错误输出，
-当前会保留目标模型的逐算子执行，草稿专家仍完整缓存到 GPU；单卡、PP 和未指定此选项的策略不变。
-显式设置 `FASTLLM_CUDA_CUSTOM_ALLREDUCE=0` 使用 NCCL 时可保留目标图加速。
-这属于正确性回退，图回放差异的底层原因尚未解决，不能保证强制常驻一定更快。
+TP 混合执行下，强制草稿常驻可与 custom all-reduce 和目标 CUDA Graph 一起使用。
+仍可通过 `FASTLLM_CUDA_CUSTOM_ALLREDUCE=0` 选择 NCCL。常驻草稿会占用主模型专家缓存预算，
+实际速度取决于显存容量、缓存命中率和草稿接受率，不保证强制常驻一定更快。
 
 ```bash
 ftllm server /models/DeepSeek-V4.1-Flash-1017-IQ2_XXS.gguf \
