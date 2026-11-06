@@ -364,6 +364,7 @@ struct TritonMoeFp8ExpertTable {
     float *fusedGateScales = nullptr;
     float *fusedUpScales = nullptr;
     bool packedInited = false;
+    bool packedBlock128 = false;
     uint8_t *packedGateWeights = nullptr;
     float *packedGateScales = nullptr;
     uint8_t *packedDownWeights = nullptr;
@@ -1074,35 +1075,183 @@ static bool GetTritonMoeFp8ExpertTable(
     return true;
 }
 
+/**
+ * 将FastLLM交错Block128专家权重整理为Triton grouped MoE连续权重缓存。
+ *
+ * 每个权重逻辑行为FP8值，每128个值后紧跟一个FP32 scale。这里只按expert
+ * 顺序拼接原布局，不拆分scale，也不释放源权重；后续kernel直接按交错布局
+ * 读取。任一专家类型、形状或设备指针不满足约束时返回false，由正式主流程
+ * 回退已有CUDA实现。
+ *
+ * @param weights       FastLLM专家权重数组，第0对为可选shared expert。
+ * @param weightsBatch  数组元素数量，必须为2 * (expert数量 + 1)。
+ * @param hidden        输入及输出隐藏维度，必须按128对齐。
+ * @param inter         专家中间维度，必须按128对齐。
+ * @param table         返回可供Triton grouped MoE消费的连续缓存。
+ * @return true表示缓存已存在或成功建立；false表示布局不受支持或复制失败。
+ */
+static bool GetTritonMoeFp8Block128ExpertTable(
+    fastllm::Data **weights, int weightsBatch, int hidden, int inter,
+    TritonMoeFp8ExpertTable *&table) {
+    table = nullptr;
+    if (weights == nullptr || weightsBatch < 4 || (weightsBatch & 1) ||
+        hidden <= 0 || inter <= 0 || (hidden % 128) != 0 ||
+        (inter % 128) != 0) {
+        return false;
+    }
+    int experts = weightsBatch / 2 - 1;
+    if (experts <= 0 || weights[2] == nullptr) {
+        return false;
+    }
+
+    int deviceId = FastllmCudaGetDevice();
+    auto key = std::make_pair(deviceId, (const void*)weights[2]);
+    std::lock_guard<std::mutex> guard(g_tritonMoeFp8TableMutex);
+    TritonMoeFp8ExpertTable &cached = g_tritonMoeFp8ExpertTables[key];
+    if (cached.inited) {
+        if (!cached.packedBlock128 || !cached.packedInited ||
+            cached.experts != experts || cached.hidden != hidden ||
+            cached.inter != inter) {
+            return false;
+        }
+        table = &cached;
+        return true;
+    }
+
+    const size_t gatePerRow = (size_t)hidden + (size_t)(hidden / 128) * sizeof(float);
+    const size_t downPerRow = (size_t)inter + (size_t)(inter / 128) * sizeof(float);
+    const size_t gateBytes = (size_t)inter * 2 * gatePerRow;
+    const size_t downBytes = (size_t)hidden * downPerRow;
+    for (int expert = 0; expert < experts; ++expert) {
+        int index = (expert + 1) * 2;
+        fastllm::Data *gateup = weights[index];
+        fastllm::Data *down = weights[index + 1];
+        if (gateup == nullptr || down == nullptr ||
+            gateup->dataType != fastllm::DataType::FP8_E4M3_BLOCK_128 ||
+            down->dataType != fastllm::DataType::FP8_E4M3_BLOCK_128 ||
+            gateup->dims.size() != 2 || down->dims.size() != 2 ||
+            gateup->dims[0] != inter * 2 || gateup->dims[1] != hidden ||
+            down->dims[0] != hidden || down->dims[1] != inter ||
+            gateup->cudaData == nullptr || down->cudaData == nullptr) {
+            return false;
+        }
+    }
+
+    cached.packedGateWeights =
+        (uint8_t*)FastllmCudaMalloc((size_t)experts * gateBytes);
+    cached.packedDownWeights =
+        (uint8_t*)FastllmCudaMalloc((size_t)experts * downBytes);
+    if (cached.packedGateWeights == nullptr ||
+        cached.packedDownWeights == nullptr) {
+        FreeTritonScratchPtr(cached.packedGateWeights);
+        FreeTritonScratchPtr(cached.packedDownWeights);
+        return false;
+    }
+
+    for (int expert = 0; expert < experts; ++expert) {
+        int index = (expert + 1) * 2;
+        fastllm::Data *gateup = weights[index];
+        fastllm::Data *down = weights[index + 1];
+
+        cudaError_t state = cudaMemcpyAsync(
+            cached.packedGateWeights + (size_t)expert * gateBytes,
+            gateup->cudaData, gateBytes, cudaMemcpyDeviceToDevice,
+            cudaStreamPerThread);
+        if (state != cudaSuccess) {
+            checkCudaErrors(
+                "Error: CUDA error when packing Block128 MoE gate weights!",
+                state);
+            FreeTritonScratchPtr(cached.packedGateWeights);
+            FreeTritonScratchPtr(cached.packedDownWeights);
+            return false;
+        }
+        state = cudaMemcpyAsync(
+            cached.packedDownWeights + (size_t)expert * downBytes,
+            down->cudaData, downBytes, cudaMemcpyDeviceToDevice,
+            cudaStreamPerThread);
+        if (state != cudaSuccess) {
+            checkCudaErrors(
+                "Error: CUDA error when packing Block128 MoE down weights!",
+                state);
+            FreeTritonScratchPtr(cached.packedGateWeights);
+            FreeTritonScratchPtr(cached.packedDownWeights);
+            return false;
+        }
+    }
+
+    cached.inited = true;
+    cached.packedInited = true;
+    cached.packedBlock128 = true;
+    cached.experts = experts;
+    cached.hidden = hidden;
+    cached.inter = inter;
+    cached.gateBlockM = 128;
+    cached.gateBlockK = 128;
+    cached.downBlockM = 128;
+    cached.downBlockK = 128;
+    table = &cached;
+    return true;
+}
+
+/**
+ * 将3D FusedMOE权重绑定为Triton grouped MoE专家表。
+ *
+ * 普通FP8权重继续使用独立scale；Block128权重直接保留每行交错存储的
+ * FP8值与FP32 scale，并标记为packed布局。函数不取得源权重所有权，目标
+ * kernel不可用时仍可由原CUDA FusedMOE读取同一权重完成fallback。
+ *
+ * @param gate       gate权重，逻辑形状为[experts, inter, hidden]。
+ * @param up         up权重，逻辑形状为[experts, inter, hidden]。
+ * @param down       down权重，逻辑形状为[experts, hidden, inter]。
+ * @param experts    专家数量。
+ * @param hidden     隐藏维度；Block128布局要求按128对齐。
+ * @param inter      专家中间维度；Block128布局要求按128对齐。
+ * @param table      返回与源权重生命周期绑定的专家表。
+ * @return true表示布局及形状有效；false表示应回退原CUDA实现。
+ */
 static bool GetTritonMoeFp8FusedExpertTable(
     fastllm::Data &gate, fastllm::Data &up, fastllm::Data &down,
     int experts, int hidden, int inter, TritonMoeFp8ExpertTable *&table) {
     table = nullptr;
+    bool packedBlock128 =
+        gate.dataType == fastllm::DataType::FP8_E4M3_BLOCK_128 &&
+        up.dataType == fastllm::DataType::FP8_E4M3_BLOCK_128 &&
+        down.dataType == fastllm::DataType::FP8_E4M3_BLOCK_128;
+    bool separateScales =
+        gate.dataType == fastllm::DataType::FP8_E4M3 &&
+        up.dataType == fastllm::DataType::FP8_E4M3 &&
+        down.dataType == fastllm::DataType::FP8_E4M3;
     if (experts <= 0 || hidden <= 0 || inter <= 0 ||
         gate.dataDevice != fastllm::DataDevice::CUDA ||
         up.dataDevice != fastllm::DataDevice::CUDA ||
         down.dataDevice != fastllm::DataDevice::CUDA ||
-        gate.dataType != fastllm::DataType::FP8_E4M3 ||
-        up.dataType != fastllm::DataType::FP8_E4M3 ||
-        down.dataType != fastllm::DataType::FP8_E4M3 ||
+        (!packedBlock128 && !separateScales) ||
+        (packedBlock128 && ((hidden % 128) != 0 || (inter % 128) != 0)) ||
         gate.cudaData == nullptr || up.cudaData == nullptr || down.cudaData == nullptr ||
-        gate.extraCudaData.empty() || up.extraCudaData.empty() || down.extraCudaData.empty() ||
+        (separateScales &&
+         (gate.extraCudaData.empty() || up.extraCudaData.empty() || down.extraCudaData.empty())) ||
         gate.dims.size() != 3 || up.dims.size() != 3 || down.dims.size() != 3 ||
         gate.dims[0] != experts || gate.dims[1] != inter || gate.dims[2] != hidden ||
         up.dims[0] != experts || up.dims[1] != inter || up.dims[2] != hidden ||
         down.dims[0] != experts || down.dims[1] != hidden || down.dims[2] != inter ||
-        gate.blockM <= 0 || gate.blockK <= 0 || down.blockM <= 0 || down.blockK <= 0 ||
-        up.blockM != gate.blockM || up.blockK != gate.blockK) {
+        (separateScales &&
+         (gate.blockM <= 0 || gate.blockK <= 0 || down.blockM <= 0 || down.blockK <= 0 ||
+          up.blockM != gate.blockM || up.blockK != gate.blockK))) {
         return false;
     }
+    int gateBlockM = packedBlock128 ? 128 : gate.blockM;
+    int gateBlockK = packedBlock128 ? 128 : gate.blockK;
+    int downBlockM = packedBlock128 ? 128 : down.blockM;
+    int downBlockK = packedBlock128 ? 128 : down.blockK;
     int deviceId = FastllmCudaGetDevice();
     auto key = std::make_tuple(deviceId, (const void*)gate.cudaData, (const void*)up.cudaData, (const void*)down.cudaData);
     std::lock_guard<std::mutex> guard(g_tritonMoeFp8FusedTableMutex);
     TritonMoeFp8ExpertTable &cached = g_tritonMoeFp8FusedTables[key];
     if (cached.inited) {
         if (cached.experts != experts || cached.hidden != hidden || cached.inter != inter ||
-            cached.gateBlockM != gate.blockM || cached.gateBlockK != gate.blockK ||
-            cached.downBlockM != down.blockM || cached.downBlockK != down.blockK) {
+            cached.packedBlock128 != packedBlock128 ||
+            cached.gateBlockM != gateBlockM || cached.gateBlockK != gateBlockK ||
+            cached.downBlockM != downBlockM || cached.downBlockK != downBlockK) {
             return false;
         }
         table = &cached;
@@ -1113,17 +1262,19 @@ static bool GetTritonMoeFp8FusedExpertTable(
     cached.experts = experts;
     cached.hidden = hidden;
     cached.inter = inter;
-    cached.gateBlockM = gate.blockM;
-    cached.gateBlockK = gate.blockK;
-    cached.downBlockM = down.blockM;
-    cached.downBlockK = down.blockK;
+    cached.gateBlockM = gateBlockM;
+    cached.gateBlockK = gateBlockK;
+    cached.downBlockM = downBlockM;
+    cached.downBlockK = downBlockK;
     cached.fusedSeparateGateUp = true;
     cached.fusedGateWeights = (uint8_t*)gate.cudaData;
     cached.fusedUpWeights = (uint8_t*)up.cudaData;
-    cached.fusedGateScales = (float*)gate.extraCudaData[0];
-    cached.fusedUpScales = (float*)up.extraCudaData[0];
+    cached.fusedGateScales = separateScales ? (float*)gate.extraCudaData[0] : nullptr;
+    cached.fusedUpScales = separateScales ? (float*)up.extraCudaData[0] : nullptr;
     cached.packedDownWeights = (uint8_t*)down.cudaData;
-    cached.packedDownScales = (float*)down.extraCudaData[0];
+    cached.packedDownScales = separateScales ? (float*)down.extraCudaData[0] : nullptr;
+    cached.packedInited = packedBlock128;
+    cached.packedBlock128 = packedBlock128;
     table = &cached;
     return true;
 }
@@ -1156,11 +1307,19 @@ extern "C" int FastllmCudaRuntimeArch() {
     if (cudaGetDevice(&device) != cudaSuccess) {
         return 0;
     }
+    // 计算能力是稳定设备属性；同一CPU线程固定使用当前GPU时直接复用。
+    static thread_local int cachedDevice = -1;
+    static thread_local int cachedArch = 0;
+    if (cachedDevice == device) {
+        return cachedArch;
+    }
     cudaDeviceProp prop;
     if (cudaGetDeviceProperties(&prop, device) != cudaSuccess) {
         return 0;
     }
-    return prop.major * 10 + prop.minor;
+    cachedDevice = device;
+    cachedArch = prop.major * 10 + prop.minor;
+    return cachedArch;
 }
 
 extern "C" bool FastllmCudaTritonLinearFP8E4M3Block128(
@@ -1641,7 +1800,15 @@ static bool LaunchTritonMergeMOEFP8E4M3Table(
         table->gateBlockK != groupBlockN || table->downBlockK != groupBlockN) {
         return false;
     }
-    if (table->fusedSeparateGateUp) {
+    if (table->packedBlock128) {
+        if (!table->packedInited ||
+            (table->fusedSeparateGateUp &&
+             (table->fusedGateWeights == nullptr || table->fusedUpWeights == nullptr)) ||
+            (!table->fusedSeparateGateUp && table->packedGateWeights == nullptr) ||
+            table->packedDownWeights == nullptr) {
+            return false;
+        }
+    } else if (table->fusedSeparateGateUp) {
         if (table->fusedGateWeights == nullptr || table->fusedUpWeights == nullptr ||
             table->fusedGateScales == nullptr || table->fusedUpScales == nullptr ||
             table->packedDownWeights == nullptr || table->packedDownScales == nullptr) {
@@ -1728,11 +1895,13 @@ static bool LaunchTritonMergeMOEFP8E4M3Table(
     CUdeviceptr gateWeightPtrs = (CUdeviceptr)(table->fusedSeparateGateUp ?
         table->fusedGateWeights : table->packedGateWeights);
     CUdeviceptr upWeightPtrs = (CUdeviceptr)table->fusedUpWeights;
-    CUdeviceptr gateScalePtrs = (CUdeviceptr)(table->fusedSeparateGateUp ?
-        table->fusedGateScales : table->packedGateScales);
+    CUdeviceptr gateScalePtrs = table->packedBlock128 ? 0 :
+        (CUdeviceptr)(table->fusedSeparateGateUp ?
+            table->fusedGateScales : table->packedGateScales);
     CUdeviceptr upScalePtrs = (CUdeviceptr)table->fusedUpScales;
     CUdeviceptr downWeightPtrs = (CUdeviceptr)table->packedDownWeights;
-    CUdeviceptr downScalePtrs = (CUdeviceptr)table->packedDownScales;
+    CUdeviceptr downScalePtrs = table->packedBlock128 ? 0 :
+        (CUdeviceptr)table->packedDownScales;
     CUdeviceptr outputPtr = (CUdeviceptr)outputData;
     int32_t batchArg = batch;
     int32_t topkArg = topk;
@@ -3037,6 +3206,35 @@ extern "C" bool FastllmCudaTritonMergeMOEFP8E4M3Indexed(
         {batch, hidden}, table);
 }
 
+/**
+ * 使用交错Block128专家权重执行Triton MergeMOE。
+ *
+ * @param weights FastLLM独立专家权重数组，第0对保留给shared expert。
+ * @param indices CUDA端路由expert索引，形状为[batch, topk]。
+ * @param scores CUDA端路由权重，形状为[batch, topk]。
+ * @return true表示专家表准备及全部kernel提交成功；false表示调用方应回退。
+ */
+extern "C" bool FastllmCudaTritonMergeMOEFP8E4M3Block128Indexed(
+    const char *const *cubinPaths, const char *const *kernelNames,
+    const int *numWarps, const int *shared,
+    int routeBlockT, int maxExperts, int groupBlockM, int groupBlockN,
+    int groupBlockK, int groupSizeM, const fastllm::Data &input,
+    fastllm::Data &w1, fastllm::Data &output, fastllm::Data **weights,
+    int weightsBatch, const int32_t *indices, const float *scores,
+    int batch, int topk, int hidden, int inter) {
+    (void)w1;
+    TritonMoeFp8ExpertTable *table = nullptr;
+    if (!GetTritonMoeFp8Block128ExpertTable(
+            weights, weightsBatch, hidden, inter, table)) {
+        return false;
+    }
+    return LaunchTritonMergeMOEFP8E4M3Table(
+        cubinPaths, kernelNames, numWarps, shared,
+        routeBlockT, maxExperts, groupBlockM, groupBlockN, groupBlockK,
+        groupSizeM, input, output, indices, scores, batch, topk, hidden, inter,
+        {batch, hidden}, table);
+}
+
 extern "C" bool FastllmCudaTritonFusedMOEFP8E4M3(
     const char *const *cubinPaths, const char *const *kernelNames,
     const int *numWarps, const int *shared,
@@ -3063,4 +3261,28 @@ extern "C" bool FastllmCudaTritonFusedMOEFP8E4M3(
         routeBlockT, maxExperts, groupBlockM, groupBlockN, groupBlockK, groupSizeM,
         input, output, (const int32_t*)index.cudaData, (const float*)score.cudaData,
         batch, topk, hidden, inter, input.dims, table);
+}
+
+/**
+ * 使用3D交错Block128 gate/up/down权重执行Triton FusedMOE。
+ *
+ * @param gate gate权重，逻辑形状为[experts, inter, hidden]。
+ * @param up up权重，逻辑形状为[experts, inter, hidden]。
+ * @param down down权重，逻辑形状为[experts, hidden, inter]。
+ * @return true表示全部kernel提交成功；false表示调用方应回退原CUDA实现。
+ */
+extern "C" bool FastllmCudaTritonFusedMOEFP8E4M3Block128(
+    const char *const *cubinPaths, const char *const *kernelNames,
+    const int *numWarps, const int *shared,
+    int routeBlockT, int maxExperts, int groupBlockM, int groupBlockN,
+    int groupBlockK, int groupSizeM, const fastllm::Data &input,
+    fastllm::Data &gate, fastllm::Data &up, fastllm::Data &down,
+    const fastllm::Data &index, const fastllm::Data &score,
+    fastllm::Data &w1, fastllm::Data &output,
+    int batch, int topk, int hidden, int inter, int experts) {
+    return FastllmCudaTritonFusedMOEFP8E4M3(
+        cubinPaths, kernelNames, numWarps, shared,
+        routeBlockT, maxExperts, groupBlockM, groupBlockN, groupBlockK,
+        groupSizeM, input, gate, up, down, index, score, w1, output,
+        batch, topk, hidden, inter, experts);
 }

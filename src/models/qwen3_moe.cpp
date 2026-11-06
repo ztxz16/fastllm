@@ -9,6 +9,8 @@
 #include "executor.h"
 
 #include <sstream>
+#include <chrono>
+#include <cstdio>
 
 #include <unordered_map>
 
@@ -927,6 +929,228 @@ namespace fastllm {
             return GetFastllmEnv().cudaGraph;
         }
 
+        /**
+         * 判断是否开启Qwen3-MOE CUDA Graph生命周期诊断。
+         *
+         * 该开关只控制状态日志，不改变Graph选择、捕获、回放或回退语义。
+         * 正式性能测试应保持关闭，避免日志输出干扰主线程调度。
+         *
+         * @return 环境变量FASTLLM_CUDA_GRAPH_TRACE为真值时返回true。
+         */
+        static bool Qwen3MoeCudaGraphTraceEnabled() {
+            const char *env = std::getenv("FASTLLM_CUDA_GRAPH_TRACE");
+            return env != nullptr && Qwen3MoeIsTrueString(env);
+        }
+
+        /**
+         * 判断是否开启Qwen3-MOE CUDA Graph入口的CPU分段耗时诊断。
+         *
+         * 该诊断仅使用CPU单调时钟，不插入CUDA同步，因此graph_launch_us只表示
+         * cudaGraphLaunch在CPU侧的提交耗时，不代表GPU执行完成时间。开关默认
+         * 关闭，避免逐token计时和日志输出影响正式性能。
+         *
+         * @return 环境变量FASTLLM_CUDA_GRAPH_CPU_TRACE为真值时返回true。
+         */
+        static bool Qwen3MoeCudaGraphCpuTraceEnabled() {
+            const char *env = std::getenv("FASTLLM_CUDA_GRAPH_CPU_TRACE");
+            return env != nullptr && Qwen3MoeIsTrueString(env);
+        }
+
+        /**
+         * 收集一次单GPU CUDA Graph尝试过程中的CPU分段耗时。
+         *
+         * 各阶段通过Mark按调用顺序记录；析构时合并为单行输出，降低多次
+         * fprintf造成的阶段间干扰。计时覆盖入口拒绝、warmup、capture、首次
+         * launch和正式replay，path字段用于区分本次实际执行分支。
+         */
+        class Qwen3MoeCudaGraphCpuTrace {
+        public:
+            Qwen3MoeCudaGraphCpuTrace(int gpuId, int batch)
+                    : enabled(Qwen3MoeCudaGraphCpuTraceEnabled()),
+                      gpuId(gpuId), batch(batch), path("incomplete") {
+                if (enabled) {
+                    begin = last = Clock::now();
+                }
+            }
+
+            ~Qwen3MoeCudaGraphCpuTrace() {
+                if (!enabled) {
+                    return;
+                }
+                const auto end = Clock::now();
+                std::ostringstream line;
+                line << "[fastllm][qwen3-moe][cuda-graph-cpu]"
+                     << " gpu=" << gpuId
+                     << " batch=" << batch
+                     << " path=" << path;
+                for (const auto &stage : stages) {
+                    line << " " << stage.first << "_us=" << stage.second;
+                }
+                line << " total_us=" << ToMicroseconds(end - begin) << "\n";
+                const std::string text = line.str();
+                std::fwrite(text.data(), 1, text.size(), stderr);
+            }
+
+            void Mark(const char *stage) {
+                if (!enabled) {
+                    return;
+                }
+                const auto now = Clock::now();
+                stages.emplace_back(stage, ToMicroseconds(now - last));
+                last = now;
+            }
+
+            void SetPath(const char *value) {
+                if (enabled) {
+                    path = value;
+                }
+            }
+
+            bool Enabled() const {
+                return enabled;
+            }
+
+        private:
+            using Clock = std::chrono::steady_clock;
+
+            template <typename Duration>
+            static long long ToMicroseconds(const Duration &duration) {
+                return std::chrono::duration_cast<std::chrono::microseconds>(duration).count();
+            }
+
+            bool enabled;
+            int gpuId;
+            int batch;
+            const char *path;
+            Clock::time_point begin;
+            Clock::time_point last;
+            std::vector<std::pair<const char*, long long> > stages;
+        };
+
+        /**
+         * 判断是否开启Qwen3-MOE ForwardGPU的CPU分段耗时诊断。
+         *
+         * 该开关只增加CPU单调时钟记录和单行日志，不改变模型计算、采样、
+         * 同步或后端选择。正式性能测试应保持关闭。
+         *
+         * @return 环境变量FASTLLM_QWEN3_MOE_FORWARD_CPU_TRACE为真值时返回true。
+         */
+        static bool Qwen3MoeForwardCpuTraceEnabled() {
+            const char *env = std::getenv("FASTLLM_QWEN3_MOE_FORWARD_CPU_TRACE");
+            return env != nullptr && Qwen3MoeIsTrueString(env);
+        }
+
+        /**
+         * 收集一次Qwen3-MOE ForwardGPU的CPU分段耗时。
+         *
+         * entry_prepare、input_prepare、weight_prepare、embedding_prepare和
+         * kv_cache_prepare依次覆盖入口检查、输入构造、权重状态、Embedding及
+         * KV元数据准备；model_forward覆盖单卡或多卡模型计算；采样阶段分别
+         * 覆盖采样输入准备与取回Token。return_cleanup记录最后一个Mark到函数
+         * 局部对象析构结束的耗时，用于定位返回路径中原先未归类的清理开销。
+         */
+        class Qwen3MoeForwardCpuTrace {
+        public:
+            explicit Qwen3MoeForwardCpuTrace(int batch)
+                    : enabled(Qwen3MoeForwardCpuTraceEnabled()),
+                      batch(batch), workload("unknown"), path("incomplete") {
+                if (enabled) {
+                    begin = last = Clock::now();
+                }
+            }
+
+            ~Qwen3MoeForwardCpuTrace() {
+                if (!enabled) {
+                    return;
+                }
+                const auto end = Clock::now();
+                std::ostringstream line;
+                line << "[fastllm][qwen3-moe][forward-cpu]"
+                     << " batch=" << batch
+                     << " workload=" << workload
+                     << " path=" << path;
+                for (const auto &stage : stages) {
+                    line << " " << stage.first << "_us=" << stage.second;
+                }
+                line << " return_cleanup_us=" << ToMicroseconds(end - last);
+                line << " total_us=" << ToMicroseconds(end - begin) << "\n";
+                const std::string text = line.str();
+                std::fwrite(text.data(), 1, text.size(), stderr);
+            }
+
+            void Mark(const char *stage) {
+                if (!enabled) {
+                    return;
+                }
+                const auto now = Clock::now();
+                stages.emplace_back(stage, ToMicroseconds(now - last));
+                last = now;
+            }
+
+            void SetPath(const char *value) {
+                if (enabled) {
+                    path = value;
+                }
+            }
+
+            void SetWorkload(const char *value) {
+                if (enabled) {
+                    workload = value;
+                }
+            }
+
+        private:
+            using Clock = std::chrono::steady_clock;
+
+            template <typename Duration>
+            static long long ToMicroseconds(const Duration &duration) {
+                return std::chrono::duration_cast<std::chrono::microseconds>(duration).count();
+            }
+
+            bool enabled;
+            int batch;
+            const char *workload;
+            const char *path;
+            Clock::time_point begin;
+            Clock::time_point last;
+            std::vector<std::pair<const char*, long long> > stages;
+        };
+
+        /**
+         * 输出一次Qwen3-MOE CUDA Graph状态变化。
+         *
+         * 相同模型、GPU、batch、事件和明细只输出一次，避免decode循环重复打印
+         * 干扰诊断结果。该函数仅用于定位Graph入口拒绝、签名重建以及首次捕获
+         * 和回放，不承担错误处理或后端选择职责。
+         *
+         * @param model   当前Qwen3-MOE模型，用于区分不同模型实例。
+         * @param gpuId   Graph所属CUDA设备编号。
+         * @param batch   Graph对应的decode batch。
+         * @param event   状态事件名称，例如reject、signature、capture或replay。
+         * @param detail  事件的具体原因或状态说明。
+         */
+        static void Qwen3MoeTraceCudaGraphOnce(
+                const Qwen3MOEModel *model, int gpuId, int batch,
+                const std::string &event, const std::string &detail) {
+            if (!Qwen3MoeCudaGraphTraceEnabled()) {
+                return;
+            }
+            static std::mutex traceMutex;
+            static std::set<std::string> emitted;
+            std::ostringstream key;
+            key << model << ":" << gpuId << ":" << batch << ":"
+                << event << ":" << detail;
+            {
+                std::lock_guard<std::mutex> guard(traceMutex);
+                if (!emitted.insert(key.str()).second) {
+                    return;
+                }
+            }
+            std::fprintf(stderr,
+                         "[fastllm][qwen3-moe][cuda-graph] event=%s gpu=%d batch=%d detail=%s\n",
+                         event.c_str(), gpuId, batch, detail.c_str());
+        }
+
         static bool Qwen3MoeNeedRepeatPenalty(const GenerationConfig &config) {
             float diff = config.repeat_penalty - 1.0f;
             return diff > 1e-6f || diff < -1e-6f;
@@ -1483,6 +1707,11 @@ namespace fastllm {
         struct Qwen3MoeCudaGraphDecodeState {
             std::mutex mutex;
             std::string signature;
+            // indexed MoE布局只与模型权重和当前GPU有关。缓存检查结果，避免
+            // 每个decode token重复遍历全部层和全部expert权重。
+            bool indexedMoeLayoutChecked = false;
+            bool indexedMoeLayoutSupported = false;
+            std::string indexedMoeLayoutFailure;
             bool warmed = false;
             bool captured = false;
             bool disabled = false;
@@ -1671,7 +1900,14 @@ namespace fastllm {
             }
         }
 
-        static void Qwen3MoePrepareGraphCudaTensor(Data &dst, const Data &src, int device) {
+        /**
+         * 保证CUDA Graph固定张量具有与源张量一致的存储，但不复制内容。
+         *
+         * @param dst     Graph生命周期内复用的目标张量。
+         * @param src     提供形状、类型和设备信息的CUDA源张量。
+         * @param device  目标CUDA设备编号。
+         */
+        static void Qwen3MoeEnsureGraphCudaTensor(Data &dst, const Data &src, int device) {
             AssertInFastLLM(src.dataDevice == DataDevice::CUDA && src.cudaData != nullptr,
                             "Qwen3-MOE CUDA graph requires CUDA source tensor.\n");
             FastllmCudaSetDevice(device);
@@ -1702,6 +1938,10 @@ namespace fastllm {
                 dst.Resize(src.dims);
             }
             dst.Allocate(false);
+        }
+
+        static void Qwen3MoePrepareGraphCudaTensor(Data &dst, const Data &src, int device) {
+            Qwen3MoeEnsureGraphCudaTensor(dst, src, device);
             FastllmCudaCopyFromDeviceToDevice(dst.cudaData, src.cudaData, src.GetBytes());
         }
 
@@ -1873,23 +2113,47 @@ namespace fastllm {
             return lastRet;
         }
 
+        /**
+         * 检查当前GPU上的indexed MoE权重能否进入Qwen3-MOE CUDA Graph。
+         *
+         * FP8和Legacy NVFP4路径要求原始CUDA权重仍然存在；NVFP4_BLOCK_16
+         * 原生W4A4路径则以CUTLASS重排cache为实际设备表示，原始cudaData
+         * 可能已按生命周期设计释放，因此通过预重排接口验证或补建cache，
+         * 不能把cudaData为空误判为不支持。失败原因返回到调用方用于诊断。
+         *
+         * @param deviceWeights 各GPU、各层的routed expert权重表。
+         * @param device        当前CUDA设备号。
+         * @param blockCnt      Transformer层数。
+         * @param hidden        模型hidden维度。
+         * @param moeAtype      MoE计算激活类型，必须为FP16或BF16。
+         * @param failureReason 可选的失败原因输出。
+         * @return true表示所有有效expert权重均具备图捕获所需的设备表示。
+         */
         static bool Qwen3MoeCanGraphIndexedMoe(
                 const std::unordered_map<int, std::vector<std::vector<Data*> > > &deviceWeights,
                 int device,
                 int blockCnt,
                 int hidden,
-                DataType moeAtype) {
-            if (moeAtype != DataType::FLOAT16 && moeAtype != DataType::BFLOAT16) {
+                DataType moeAtype,
+                std::string *failureReason) {
+            auto reject = [&](const std::string &reason) -> bool {
+                if (failureReason != nullptr) {
+                    *failureReason = reason;
+                }
                 return false;
+            };
+            if (moeAtype != DataType::FLOAT16 && moeAtype != DataType::BFLOAT16) {
+                return reject("MoE activation is not FP16/BF16");
             }
             auto deviceIt = deviceWeights.find(device);
             if (deviceIt == deviceWeights.end() || (int)deviceIt->second.size() < blockCnt) {
-                return false;
+                return reject("missing device weight table");
             }
             for (int i = 0; i < blockCnt; i++) {
                 const std::vector<Data*> &layerWeights = deviceIt->second[i];
                 if ((int)layerWeights.size() < 4 || layerWeights[0] != nullptr) {
-                    return false;
+                    return reject("layer " + std::to_string(i) +
+                                  " uses an unsupported weight layout");
                 }
 
                 bool hasShard = false;
@@ -1902,26 +2166,78 @@ namespace fastllm {
                     if (gateup == nullptr || down == nullptr ||
                         gateup->dataDevice != DataDevice::CUDA ||
                         down->dataDevice != DataDevice::CUDA ||
-                        gateup->cudaData == nullptr || down->cudaData == nullptr ||
                         gateup->dataType != down->dataType ||
                         gateup->dims.size() != 2 || down->dims.size() != 2 ||
                         gateup->dims[1] != hidden ||
                         down->dims[0] != hidden ||
                         gateup->dims[0] != down->dims[1] * 2) {
-                        return false;
+                        return reject("layer " + std::to_string(i) + " expert " +
+                                      std::to_string((j - 2) / 2) +
+                                      " has invalid tensors");
                     }
                     bool supportedWeight =
                         gateup->dataType == DataType::FP8_E4M3 ||
                         gateup->dataType == DataType::FP8_E4M3_BLOCK_128 ||
                         Qwen3MoeIsNVFP4WeightType(gateup->dataType);
                     if (!supportedWeight) {
-                        return false;
+                        return reject("layer " + std::to_string(i) + " expert " +
+                                      std::to_string((j - 2) / 2) +
+                                      " has an unsupported weight type");
+                    }
+
+                    if (gateup->dataType == DataType::NVFP4_BLOCK_16) {
+                        // W4A4正式表示是CUTLASS cache。这里在图捕获之前验证
+                        // cache；cache缺失时允许从host/mmap补建，不能依赖已释放
+                        // 的原始cudaData。
+                        const auto gateupBackend =
+                            FastllmCudaGetNvfp4W4A4BackendState(*gateup, device);
+                        const auto downBackend =
+                            FastllmCudaGetNvfp4W4A4BackendState(*down, device);
+                        const auto mayUseCutlass = [](FastllmCudaNvfp4BackendState state) {
+                            return state == FastllmCudaNvfp4BackendState::Uninitialized ||
+                                   state == FastllmCudaNvfp4BackendState::Prepared ||
+                                   state == FastllmCudaNvfp4BackendState::CutlassW4A4;
+                        };
+                        if (!mayUseCutlass(gateupBackend) ||
+                            !mayUseCutlass(downBackend)) {
+                            return reject("layer " + std::to_string(i) + " expert " +
+                                          std::to_string((j - 2) / 2) +
+                                          " does not use the CUTLASS W4A4 backend");
+                        }
+                        const uint8_t *gateupPacked = nullptr;
+                        const uint8_t *gateupScales = nullptr;
+                        const float *gateupAlpha = nullptr;
+                        const uint8_t *downPacked = nullptr;
+                        const uint8_t *downScales = nullptr;
+                        const float *downAlpha = nullptr;
+                        bool gateupReady = FastllmCudaPrepareNvfp4W4A4Weight(
+                            *gateup, gateup->dims[1], gateup->dims[0],
+                            &gateupPacked, &gateupScales, &gateupAlpha);
+                        bool downReady = FastllmCudaPrepareNvfp4W4A4Weight(
+                            *down, down->dims[1], down->dims[0],
+                            &downPacked, &downScales, &downAlpha);
+                        if (!gateupReady || !downReady || gateupPacked == nullptr ||
+                            gateupScales == nullptr || gateupAlpha == nullptr ||
+                            downPacked == nullptr || downScales == nullptr ||
+                            downAlpha == nullptr) {
+                            return reject("layer " + std::to_string(i) + " expert " +
+                                          std::to_string((j - 2) / 2) +
+                                          " has no usable CUTLASS weight cache");
+                        }
+                    } else if (gateup->cudaData == nullptr || down->cudaData == nullptr) {
+                        return reject("layer " + std::to_string(i) + " expert " +
+                                      std::to_string((j - 2) / 2) +
+                                      " has no original CUDA weight");
                     }
                     hasShard = true;
                 }
                 if (!hasShard) {
-                    return false;
+                    return reject("layer " + std::to_string(i) +
+                                  " has no local expert shard");
                 }
+            }
+            if (failureReason != nullptr) {
+                failureReason->clear();
             }
             return true;
         }
@@ -2957,7 +3273,10 @@ namespace fastllm {
 #ifndef USE_CUDA
         return false;
 #else
-        auto rejectGraph = [](const std::string &) -> bool {
+        Qwen3MoeCudaGraphCpuTrace cpuTrace(gpuId, batch);
+        auto rejectGraph = [&](const std::string &reason) -> bool {
+            cpuTrace.SetPath("reject");
+            Qwen3MoeTraceCudaGraphOnce(this, gpuId, batch, "reject", reason);
             return false;
         };
         if (!Qwen3MoeCudaGraphEnabled()) {
@@ -2982,6 +3301,7 @@ namespace fastllm {
         if (!Qwen3MoeModelMoeLayersAllowCudaOnly(this)) {
             return rejectGraph("mapped non-cuda moe");
         }
+        cpuTrace.Mark("eligibility");
 
         int graphParticipants = tensorParallel ? std::max(2, (int)ratios.size()) : 1;
         auto syncGraphPeers = [&](bool ok = true) {
@@ -3002,12 +3322,26 @@ namespace fastllm {
                 graphHidden = normIt->second.dims[0];
             }
         }
-        bool indexedMoeOk = Qwen3MoeCanGraphIndexedMoe(moeWeightsByDevice, gpuId, block_cnt,
-                                                       graphHidden, threadTpMoeAtype);
+        Qwen3MoeCudaGraphDecodeState &state =
+            GetQwen3MoeCudaGraphDecodeState(this, gpuId, batch);
+        std::unique_lock<std::mutex> graphLock(state.mutex);
+        cpuTrace.Mark("state_lock");
+        if (!state.indexedMoeLayoutChecked) {
+            FastllmCudaSetDevice(gpuId);
+            state.indexedMoeLayoutSupported = Qwen3MoeCanGraphIndexedMoe(
+                moeWeightsByDevice, gpuId, block_cnt, graphHidden,
+                threadTpMoeAtype, &state.indexedMoeLayoutFailure);
+            state.indexedMoeLayoutChecked = true;
+        }
+        bool indexedMoeOk = state.indexedMoeLayoutSupported;
         bool fusedMoeOk = moeFusedWeightsPrepared;
         if (!syncGraphPeers(indexedMoeOk || fusedMoeOk)) {
-            return rejectGraph("unsupported moe layout");
+            std::string reason = indexedMoeOk || state.indexedMoeLayoutFailure.empty()
+                ? "unsupported moe layout on a peer GPU"
+                : "unsupported moe layout: " + state.indexedMoeLayoutFailure;
+            return rejectGraph(reason);
         }
+        cpuTrace.Mark("moe_layout");
 
         auto requireLocal = [&](Data &data, const std::string &name) -> Data* {
             auto it = data.multiDeviceDatas.find(gpuId);
@@ -3032,63 +3366,121 @@ namespace fastllm {
             localPositionIds->dims.empty() || localPositionIds->Count(0) != (uint64_t)batch) {
             return rejectGraph("input/position dims mismatch");
         }
+        cpuTrace.Mark("input_localize");
 
         int currentTokens = 0;
-        for (int i = 0; i < block_cnt; i++) {
-            Data *firstBatchKey = pastKeyValues[i].first;
-            Data *firstBatchValue = pastKeyValues[i].second;
-            if (firstBatchKey == nullptr || firstBatchValue == nullptr ||
-                firstBatchKey->pagedKVCacheData == nullptr ||
-                firstBatchValue->pagedKVCacheData == nullptr) {
-                return rejectGraph("kv cache is not paged");
-            }
-            for (int b = 0; b < batch; b++) {
-                Data *pastKey = pastKeyValues[b * block_cnt + i].first;
-                Data *pastValue = pastKeyValues[b * block_cnt + i].second;
-                if (pastKey == nullptr || pastValue == nullptr) {
-                    return rejectGraph("null kv cache");
-                }
-                if (pastKey->pagedKVCacheData == nullptr || pastValue->pagedKVCacheData == nullptr ||
-                    pastKey->pagedKVCacheData != firstBatchKey->pagedKVCacheData ||
-                    pastValue->pagedKVCacheData != firstBatchValue->pagedKVCacheData) {
+        if (cpuTrace.Enabled()) {
+            // 诊断开启时才拆成两次遍历；默认关闭时仍执行原始单循环，避免
+            // 为正式推理增加额外的KV元数据访问。
+            for (int i = 0; i < block_cnt; i++) {
+                Data *firstBatchKey = pastKeyValues[i].first;
+                Data *firstBatchValue = pastKeyValues[i].second;
+                if (firstBatchKey == nullptr || firstBatchValue == nullptr ||
+                    firstBatchKey->pagedKVCacheData == nullptr ||
+                    firstBatchValue->pagedKVCacheData == nullptr) {
                     return rejectGraph("kv cache is not paged");
                 }
-                if (pastKey->pageIndex.empty() || pastValue->pageIndex.empty()) {
-                    return rejectGraph("empty kv page index");
+                for (int b = 0; b < batch; b++) {
+                    Data *pastKey = pastKeyValues[b * block_cnt + i].first;
+                    Data *pastValue = pastKeyValues[b * block_cnt + i].second;
+                    if (pastKey == nullptr || pastValue == nullptr) {
+                        return rejectGraph("null kv cache");
+                    }
+                    if (pastKey->pagedKVCacheData == nullptr || pastValue->pagedKVCacheData == nullptr ||
+                        pastKey->pagedKVCacheData != firstBatchKey->pagedKVCacheData ||
+                        pastValue->pagedKVCacheData != firstBatchValue->pagedKVCacheData) {
+                        return rejectGraph("kv cache is not paged");
+                    }
+                    if (pastKey->dataDevice != DataDevice::CUDA || pastValue->dataDevice != DataDevice::CUDA) {
+                        return rejectGraph("kv cache not on cuda");
+                    }
+                    if (pastKey->dataType == DataType::FP8_E4M3 || pastValue->dataType == DataType::FP8_E4M3) {
+                        return rejectGraph("fp8 kv cache");
+                    }
+                    if (pastKey->pageLen <= 0 || pastKey->pageLen != pastValue->pageLen) {
+                        return rejectGraph("unaligned kv cache metadata");
+                    }
                 }
-                if (pastKey->dataDevice != DataDevice::CUDA || pastValue->dataDevice != DataDevice::CUDA) {
-                    return rejectGraph("kv cache not on cuda");
+            }
+            cpuTrace.Mark("kv_static_validate");
+
+            for (int i = 0; i < block_cnt; i++) {
+                for (int b = 0; b < batch; b++) {
+                    Data *pastKey = pastKeyValues[b * block_cnt + i].first;
+                    Data *pastValue = pastKeyValues[b * block_cnt + i].second;
+                    if (pastKey->pageIndex.empty() || pastValue->pageIndex.empty()) {
+                        return rejectGraph("empty kv page index");
+                    }
+                    if (pastKey->pageIndex.size() != pastValue->pageIndex.size() ||
+                        pastKey->lastPageLen != pastValue->lastPageLen) {
+                        return rejectGraph("unaligned kv cache metadata");
+                    }
+                    int layerTokens = ((int)pastKey->pageIndex.size() - 1) * pastKey->pageLen + pastKey->lastPageLen;
+                    currentTokens = std::max(currentTokens, layerTokens);
                 }
-                if (pastKey->dataType == DataType::FP8_E4M3 || pastValue->dataType == DataType::FP8_E4M3) {
-                    return rejectGraph("fp8 kv cache");
+            }
+            cpuTrace.Mark("kv_dynamic_validate");
+        } else {
+            for (int i = 0; i < block_cnt; i++) {
+                Data *firstBatchKey = pastKeyValues[i].first;
+                Data *firstBatchValue = pastKeyValues[i].second;
+                if (firstBatchKey == nullptr || firstBatchValue == nullptr ||
+                    firstBatchKey->pagedKVCacheData == nullptr ||
+                    firstBatchValue->pagedKVCacheData == nullptr) {
+                    return rejectGraph("kv cache is not paged");
                 }
-                if (pastKey->pageLen <= 0 || pastKey->pageLen != pastValue->pageLen ||
-                    pastKey->pageIndex.size() != pastValue->pageIndex.size() ||
-                    pastKey->lastPageLen != pastValue->lastPageLen) {
-                    return rejectGraph("unaligned kv cache metadata");
+                for (int b = 0; b < batch; b++) {
+                    Data *pastKey = pastKeyValues[b * block_cnt + i].first;
+                    Data *pastValue = pastKeyValues[b * block_cnt + i].second;
+                    if (pastKey == nullptr || pastValue == nullptr) {
+                        return rejectGraph("null kv cache");
+                    }
+                    if (pastKey->pagedKVCacheData == nullptr || pastValue->pagedKVCacheData == nullptr ||
+                        pastKey->pagedKVCacheData != firstBatchKey->pagedKVCacheData ||
+                        pastValue->pagedKVCacheData != firstBatchValue->pagedKVCacheData) {
+                        return rejectGraph("kv cache is not paged");
+                    }
+                    if (pastKey->pageIndex.empty() || pastValue->pageIndex.empty()) {
+                        return rejectGraph("empty kv page index");
+                    }
+                    if (pastKey->dataDevice != DataDevice::CUDA || pastValue->dataDevice != DataDevice::CUDA) {
+                        return rejectGraph("kv cache not on cuda");
+                    }
+                    if (pastKey->dataType == DataType::FP8_E4M3 || pastValue->dataType == DataType::FP8_E4M3) {
+                        return rejectGraph("fp8 kv cache");
+                    }
+                    if (pastKey->pageLen <= 0 || pastKey->pageLen != pastValue->pageLen ||
+                        pastKey->pageIndex.size() != pastValue->pageIndex.size() ||
+                        pastKey->lastPageLen != pastValue->lastPageLen) {
+                        return rejectGraph("unaligned kv cache metadata");
+                    }
+                    int layerTokens = ((int)pastKey->pageIndex.size() - 1) * pastKey->pageLen + pastKey->lastPageLen;
+                    currentTokens = std::max(currentTokens, layerTokens);
                 }
-                int layerTokens = ((int)pastKey->pageIndex.size() - 1) * pastKey->pageLen + pastKey->lastPageLen;
-                currentTokens = std::max(currentTokens, layerTokens);
             }
         }
         if (rope_type == RoPEType::DYMAMIC_NTK && currentTokens + 1 >= max_positions) {
             return rejectGraph("dynamic ntk beyond max position");
         }
 
-        Qwen3MoeCudaGraphDecodeState &state = GetQwen3MoeCudaGraphDecodeState(this, gpuId, batch);
-        std::unique_lock<std::mutex> graphLock(state.mutex);
         if (Qwen3MoeCudaGraphIsDisabled(this)) {
+            Qwen3MoeTraceCudaGraphOnce(this, gpuId, batch, "reject",
+                                       "model graph state disabled");
             return false;
         }
         if (!syncGraphPeers(!state.disabled)) {
             if (state.disabled) {
                 Qwen3MoeDisableCudaGraph(this);
             }
+            Qwen3MoeTraceCudaGraphOnce(this, gpuId, batch, "reject",
+                                       "device graph state disabled");
             return false;
         }
+        cpuTrace.Mark("graph_state");
         FastllmCudaSetDevice(gpuId);
         Qwen3MoePrepareGraphCudaTensor(state.inputIds, *localInputIds, gpuId);
         Qwen3MoePrepareGraphCudaTensor(state.positionIds, *localPositionIds, gpuId);
+        cpuTrace.Mark("input_prepare");
 
         PagedCacheManager *graphPagedManager = pastKeyValues[0].first->pagedKVCacheData;
         int graphMaxPagesPerRequest = graphPagedManager != nullptr ? graphPagedManager->maxPages : 0;
@@ -3191,6 +3583,7 @@ namespace fastllm {
                 graphPlanPageSizesHost[b] + graphPlanPagesPerRequest;
         }
         int pageIndexCapacity = batch * graphPlanPagesPerRequest;
+        cpuTrace.Mark("kv_meta_build");
 
         std::ostringstream signature;
         signature << "gpu=" << gpuId
@@ -3220,9 +3613,17 @@ namespace fastllm {
         std::string newSignature = signature.str();
         bool signatureChanged = state.signature != newSignature;
         if (signatureChanged) {
+            std::ostringstream detail;
+            detail << "old=" << std::hash<std::string>{}(state.signature)
+                   << " new=" << std::hash<std::string>{}(newSignature)
+                   << " pages=" << pageIndexCapacity
+                   << " warmed=" << (state.warmed ? 1 : 0)
+                   << " captured=" << (state.captured ? 1 : 0);
+            Qwen3MoeTraceCudaGraphOnce(this, gpuId, batch, "signature", detail.str());
             Qwen3MoeDestroyCudaGraph(state);
             state.signature = newSignature;
         }
+        cpuTrace.Mark("signature");
 
         bool graphMetaMissing =
             state.metaBuffers.insertIndexs.cudaData == nullptr ||
@@ -3271,6 +3672,7 @@ namespace fastllm {
             state.lastDecodePageLensHost = lastPageLensHost;
             state.lastPastKeyHosts = currentPastKeyHosts;
         }
+        cpuTrace.Mark("meta_update");
 
         auto runGraphBodyWithBuffers = [&](Qwen3MoeForwardSingleBuffers &workBuf,
                                            Qwen3MoeForwardSingleBuffers &metaBuf) {
@@ -3470,7 +3872,11 @@ namespace fastllm {
         };
 
         auto finishWithLogits = [&]() {
-            Qwen3MoePrepareGraphCudaTensor(logits, state.logits, gpuId);
+            Qwen3MoeEnsureGraphCudaTensor(logits, state.logits, gpuId);
+            cpuTrace.Mark("logits_prepare");
+            FastllmCudaCopyFromDeviceToDevice(logits.cudaData, state.logits.cudaData,
+                                              state.logits.GetBytes());
+            cpuTrace.Mark("logits_copy");
         };
 
         auto runWithoutGraph = [&]() -> bool {
@@ -3485,18 +3891,27 @@ namespace fastllm {
             if (!syncGraphPeers()) {
                 return false;
             }
+            cpuTrace.Mark("replay_peer_sync");
             bool launchOk = FastllmCudaGraphLaunch(state.exec);
+            cpuTrace.Mark("graph_launch");
             if (Qwen3MoeSyncCudaGraphStage(this, state, graphParticipants,
                                            "replay", gpuId, launchOk)) {
+                cpuTrace.Mark("replay_status");
+                Qwen3MoeTraceCudaGraphOnce(this, gpuId, batch, "replay", "success");
                 finishWithLogits();
+                cpuTrace.SetPath("replay");
                 return true;
             }
+            cpuTrace.Mark("replay_status");
             runWithoutGraph();
+            cpuTrace.Mark("fallback_body");
+            cpuTrace.SetPath("replay_fallback");
             return true;
         }
 
         if (!state.warmed) {
             bool usedUnsafeMoeFallback = runWithoutGraph();
+            cpuTrace.Mark("warmup_body");
             if (!syncGraphPeers(!usedUnsafeMoeFallback)) {
                 if (usedUnsafeMoeFallback) {
                     printf("Warning: Qwen3-MOE CUDA graph disabled on gpu %d because MergeMOE used CPU expert routing fallback during warmup.\n",
@@ -3504,9 +3919,13 @@ namespace fastllm {
                     fflush(stdout);
                 }
                 Qwen3MoeDisableCudaGraphState(this, state);
+                cpuTrace.SetPath("warmup_reject");
                 return true;
             }
+            cpuTrace.Mark("warmup_peer_sync");
             state.warmed = true;
+            Qwen3MoeTraceCudaGraphOnce(this, gpuId, batch, "warmup", "success");
+            cpuTrace.SetPath("warmup");
             return true;
         }
 
@@ -3514,17 +3933,22 @@ namespace fastllm {
         if (!syncGraphPeers()) {
             return false;
         }
+        cpuTrace.Mark("capture_peer_sync");
         bool beginOk = FastllmCudaGraphBeginCapture();
+        cpuTrace.Mark("capture_begin");
         if (!Qwen3MoeSyncCudaGraphStage(this, state, graphParticipants,
                                         "begin capture", gpuId, beginOk)) {
             if (beginOk) {
                 Qwen3MoeAbortCudaGraphCapture();
             }
             runWithoutGraph();
+            cpuTrace.Mark("fallback_body");
+            cpuTrace.SetPath("capture_begin_fallback");
             return true;
         }
         FastllmCudaMergeMOEClearGraphUnsafeFallbackFlag();
         runGraphBody();
+        cpuTrace.Mark("capture_body");
         bool usedUnsafeMoeFallback = FastllmCudaMergeMOEUsedGraphUnsafeFallback();
         if (!syncGraphPeers(!usedUnsafeMoeFallback)) {
             if (usedUnsafeMoeFallback) {
@@ -3535,22 +3959,28 @@ namespace fastllm {
             Qwen3MoeAbortCudaGraphCapture();
             Qwen3MoeDisableCudaGraphState(this, state);
             runWithoutGraph();
+            cpuTrace.Mark("fallback_body");
+            cpuTrace.SetPath("capture_moe_fallback");
             return true;
         }
         syncGraphPeers();
         bool endOk = FastllmCudaGraphEndCapture(&capturedGraph) && capturedGraph != nullptr;
+        cpuTrace.Mark("capture_end");
         if (!Qwen3MoeSyncCudaGraphStage(this, state, graphParticipants,
                                         "end capture", gpuId, endOk)) {
             if (capturedGraph != nullptr) {
                 FastllmCudaGraphDestroy(capturedGraph);
             }
             runWithoutGraph();
+            cpuTrace.Mark("fallback_body");
+            cpuTrace.SetPath("capture_end_fallback");
             return true;
         }
 
         void *capturedExec = nullptr;
         bool instantiateOk = FastllmCudaGraphInstantiate(capturedGraph, &capturedExec) &&
                              capturedExec != nullptr;
+        cpuTrace.Mark("instantiate");
         if (!Qwen3MoeSyncCudaGraphStage(this, state, graphParticipants,
                                         "instantiate", gpuId, instantiateOk)) {
             if (capturedExec != nullptr) {
@@ -3558,22 +3988,32 @@ namespace fastllm {
             }
             FastllmCudaGraphDestroy(capturedGraph);
             runWithoutGraph();
+            cpuTrace.Mark("fallback_body");
+            cpuTrace.SetPath("instantiate_fallback");
             return true;
         }
 
         state.graph = capturedGraph;
         state.exec = capturedExec;
         state.captured = true;
+        Qwen3MoeTraceCudaGraphOnce(this, gpuId, batch, "capture", "success");
         if (!syncGraphPeers()) {
             return false;
         }
+        cpuTrace.Mark("first_launch_peer_sync");
         bool firstLaunchOk = FastllmCudaGraphLaunch(state.exec);
+        cpuTrace.Mark("first_launch");
         if (!Qwen3MoeSyncCudaGraphStage(this, state, graphParticipants,
                                         "first launch", gpuId, firstLaunchOk)) {
             runWithoutGraph();
+            cpuTrace.Mark("fallback_body");
+            cpuTrace.SetPath("first_launch_fallback");
             return true;
         }
+        cpuTrace.Mark("first_launch_status");
+        Qwen3MoeTraceCudaGraphOnce(this, gpuId, batch, "first-launch", "success");
         finishWithLogits();
+        cpuTrace.SetPath("first_launch");
         return true;
 #endif
     }
@@ -3623,6 +4063,9 @@ namespace fastllm {
             Data localHiddenStates;
             Data *hiddenStatesPtr = nullptr;
             if (precomputedHiddenStates != nullptr) {
+                Qwen3MoeTraceCudaGraphOnce(
+                    this, gpuId, batch, "bypass",
+                    "precomputed CPU embedding hidden states");
                 hiddenStatesPtr = requireLocal(*precomputedHiddenStates, "precomputedHiddenStates");
             } else {
                 if (ForwardSingleGPUDecodeGraph(gpuId, ratios, batch, inputIds, positionIds,
@@ -3877,6 +4320,7 @@ namespace fastllm {
         return ForwardV2(batch, inputIds, attentionMask, positionIds, seqLens,
                          pastKeyValues, generationConfigs, lastTokens, retLogits);
 #else
+        Qwen3MoeForwardCpuTrace forwardCpuTrace(batch);
         std::vector<int> devices;
         std::map<int, int> ratios;
         if (!CanUseGPUForward() ||
@@ -3920,6 +4364,8 @@ namespace fastllm {
             all1 &= (seqLens[i] == 1);
         }
         bool isPrefill = !all1;
+        forwardCpuTrace.SetWorkload(isPrefill ? "prefill" : "decode");
+        forwardCpuTrace.Mark("entry_prepare");
 
         Data allPositionIds;
         if (all1 && positionIds[0]->dataType == DataType::FLOAT32) {
@@ -3947,6 +4393,7 @@ namespace fastllm {
             PrepareMultiCudaReplicatedData(gpuInputIds, devices, true);
             PrepareMultiCudaReplicatedData(allPositionIds, devices, true);
         }
+        forwardCpuTrace.Mark("input_prepare");
 
         std::vector<DivisionScheme> localKvHeadSchemes;
         DivisionScheme localLmHeadScheme;
@@ -4237,6 +4684,7 @@ namespace fastllm {
             }
             localLmHeadScheme[devices[0]].push_back({0, lmHead.dims[0]});
         }
+        forwardCpuTrace.Mark("weight_prepare");
 
         if (tensorParallel && !useCpuEmbedding) {
             PrepareMultiCudaReplicatedData(weight["model.embed_tokens.weight"], devices, true);
@@ -4251,6 +4699,7 @@ namespace fastllm {
             PrepareQwen3MoeCpuEmbeddingHiddenStates(cpuEmbeddingHiddenStates, devices, threadTpWorkerGroup);
             precomputedHiddenStates = &cpuEmbeddingHiddenStates;
         }
+        forwardCpuTrace.Mark("embedding_prepare");
         std::vector<std::vector<std::pair<Data*, Data*> > > localPastKeyValues;
         if (tensorParallel) {
             localPastKeyValues.resize(devices.size());
@@ -4280,6 +4729,7 @@ namespace fastllm {
             }
         }
 
+        forwardCpuTrace.Mark("kv_cache_prepare");
         std::vector<std::exception_ptr> errors(devices.size());
         std::vector<Data> localLogits(devices.size());
         if (devices.size() == 1) {
@@ -4306,6 +4756,7 @@ namespace fastllm {
                 }
             }
         }
+        forwardCpuTrace.Mark("model_forward");
 
         if (tensorParallel) {
             auto validLocalMeta = [](Data *data) {
@@ -4345,6 +4796,7 @@ namespace fastllm {
                 }
             }
         }
+        forwardCpuTrace.Mark("post_forward");
 
         int vocabSize = lmHead.dims[0];
         bool allSimpleCudaSampling = true;
@@ -4361,9 +4813,12 @@ namespace fastllm {
             SetCurrentThreadExecutor(&samplingExecutor);
             ResetLogitsOfEOS(batch, &fullCudaLogits, pastKeyValues, generationConfigs);
             SetCurrentThreadExecutor(oldExecutor);
+            forwardCpuTrace.Mark("sampling_prepare");
             std::vector<int> lastRet = Qwen3MoeSampleFromRootCudaLogits(devices[0], fullCudaLogits, batch,
                                                                          cudaSamplingTopK, allSimpleCudaSampling,
                                                                          generationConfigs);
+            forwardCpuTrace.Mark("sampling");
+            forwardCpuTrace.SetPath("cuda_sampling");
             return lastRet;
         }
 
@@ -4401,6 +4856,7 @@ namespace fastllm {
         }
 
         ResetLogitsOfEOS(batch, &fullLogits, pastKeyValues, generationConfigs);
+        forwardCpuTrace.Mark("sampling_prepare");
 
         std::vector<int> lastRet;
         LastTokensUnit emptyLastTokens;
@@ -4416,6 +4872,8 @@ namespace fastllm {
                 lastTokens.units[b] : emptyLastTokens;
             lastRet.push_back(LLMSampling(fullLogits, b, generationConfigs[b], unit));
         }
+        forwardCpuTrace.Mark("sampling");
+        forwardCpuTrace.SetPath("cpu_sampling");
         return lastRet;
 #endif
     }

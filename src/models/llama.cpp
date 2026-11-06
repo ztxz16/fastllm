@@ -46,6 +46,7 @@ namespace fastllm {
     LlamaModel::LlamaModel() {
         this->model_struct = "llama";
         this->model_type = "llama";
+        this->use_new_engine = GetKVCacheLayout() == "paged";
 
         // 默认使用 llama3 的提示词和instruction
         this->pre_prompt="<|begin_of_text|><|start_header_id|>system<|end_header_id|>\nYou are a helpful assistant.<|eot_id|>";
@@ -151,13 +152,52 @@ namespace fastllm {
                             std::vector <float> *retLogits) {
         std::vector <std::vector <float>*> batchLogits;
         batchLogits.push_back(retLogits);
-        return ForwardBatch(1, inputIds, attentionMask, positionIds, pastKeyValues, generationConfig, lastTokens, &batchLogits)[0];
+        return ForwardSingleWithRequestCaches(
+            inputIds, attentionMask, positionIds, pastKeyValues,
+            generationConfig, lastTokens, &batchLogits)[0];
+    }
+
+    std::vector<int> LlamaModel::ForwardSingleWithRequestCaches(
+            const Data &inputIds,
+            const Data &attentionMask,
+            const Data &positionIds,
+            std::vector<std::pair<Data, Data>> &pastKeyValues,
+            const GenerationConfig &generationConfig,
+            const LastTokensManager &lastTokens,
+            std::vector<std::vector<float>*> *retLogits) {
+        std::vector<Data*> attentionMasks = {
+            attentionMask.dims.empty() ? nullptr : (Data*)&attentionMask};
+        std::vector<Data*> positionIdsBatch = {(Data*)&positionIds};
+        std::vector<int> seqLens = {inputIds.dims[1]};
+        std::vector<std::pair<Data*, Data*>> cachePointers;
+        cachePointers.reserve(pastKeyValues.size());
+        for (auto &cache : pastKeyValues) {
+            cachePointers.push_back({&cache.first, &cache.second});
+        }
+        std::vector<GenerationConfig> generationConfigs = {generationConfig};
+
+        return ForwardBatch(1, inputIds, attentionMasks, positionIdsBatch,
+                            seqLens, cachePointers, generationConfigs,
+                            lastTokens, retLogits);
     }
 
     std::vector <int> LlamaModel::ForwardBatch(int batch, const fastllm::Data &inputIds, const fastllm::Data &attentionMask,
                             const fastllm::Data &positionIds, std::vector<std::pair<Data, Data>> &pastKeyValues,
                             const GenerationConfig &generationConfig, const LastTokensManager &lastTokens,
                             std::vector <std::vector <float>*> *retLogits) {
+        if (batch == 1) {
+            return ForwardSingleWithRequestCaches(
+                inputIds, attentionMask, positionIds, pastKeyValues,
+                generationConfig, lastTokens, retLogits);
+        }
+
+        ModelAttentionCapabilities legacyCapabilities = GetModelAttentionCapabilities();
+        legacyCapabilities.modelName += " legacy-batch";
+        legacyCapabilities.supportsPaged = false;
+        AttentionExecutor::Create(legacyCapabilities, batch, inputIds.dims[1] > 1,
+                                  this->weight.dicts["use_alibi"] == "1",
+                                  GetKVCacheInCPU());
+
         Data alibiData;
         if (this->weight.dicts["use_alibi"] == "1") {
             std::vector<float> alibi = GetInterleave(num_attention_heads);
@@ -411,6 +451,8 @@ namespace fastllm {
                     lastRet.push_back(LLMSampling(logits, base, generationConfig, lastTokens.units[b]));
                 }
             }
+
+            TraceSamplingTop1IfEnabled(logits, lastRet);
         }
         if (sinDataPtr != &sinData)
             delete sinDataPtr;
@@ -444,6 +486,8 @@ namespace fastllm {
         Data w1, w2, w3, curInput, curOutput;
         Data* sinDataPtr = &sinData;
         Data* cosDataPtr = &cosData;
+        Data qSizes, pageSizes, pageIndexs, lastPageLens;
+        Data insertIndexs, insertPositions;
         std::vector <Data> curContextLayer;
         curContextLayer.resize(batch);
         std::vector <Data> curKs, curVs, curQs;
@@ -461,12 +505,22 @@ namespace fastllm {
         attns.resize(batch);
         masks.resize(batch);
         contexts.resize(batch);
+        std::vector <Data*> batchPastKeys(batch);
+        std::vector <Data*> batchPastValues(batch);
         Data allPositionIds;
 
         bool all1 = true;
         for (int i = 0; i < batch; i++) {
             all1 &= (seqLens[i] == 1);
         }
+        const AttentionExecutor attentionExecutor = AttentionExecutor::Create(
+            GetModelAttentionCapabilities(), batch, !all1,
+            !alibiData.dims.empty(), GetKVCacheInCPU());
+        const bool isPrefill = attentionExecutor.IsPrefill();
+        const bool usePagedKVCache = attentionExecutor.UsesPagedKVCache();
+        bool generatedBatchDecodeParams = false;
+        bool generatedAppendPagedCacheBatchParams = false;
+
         if (all1 && positionIds[0]->dataType == DataType::FLOAT32) {
             std::vector <float> vPositionIds;            
             for (int b = 0; b < batch; b++) {
@@ -475,7 +529,10 @@ namespace fastllm {
             allPositionIds.CopyFrom(Data(DataType::FLOAT32, {1, seqLen}, vPositionIds));
         } else {
             allPositionIds.CopyFrom(*(Data*)positionIds[0]);
-            allPositionIds.Expansion({1, seqLen});
+            const std::vector<int> positionExpansionDims = {1, seqLen};
+            if (allPositionIds.dims != positionExpansionDims) {
+                allPositionIds.Expansion(positionExpansionDims);
+            }
             for (int i = 1; i < batch; i++) {
                 CatDirect(allPositionIds, *(Data*)positionIds[i], 1);
             }
@@ -487,6 +544,8 @@ namespace fastllm {
         int seqlen = hiddenStates.dims[1];
         for (int i = 0; i < block_cnt; i++) {
             ApplyDeviceMap(this->deviceMap, i + 1, block_cnt);
+            Data attenOutput(this->dataType);
+
             RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".input_layernorm.weight"],
                     rms_norm_eps, attenInput);
             std::string qWeightName = "model.layers." + std::to_string(i) + ".self_attn.q_proj.weight";
@@ -504,7 +563,44 @@ namespace fastllm {
             // 1.1 Get q, k, v
             int bsz = attenInput.dims[0], seqlen = attenInput.dims[1];
 
-            if (weight.weight.find(mergeQkvWeightName) != weight.weight.end()
+            if (usePagedKVCache) {
+                const bool hasMergeQkv =
+                    weight.weight.find(mergeQkvWeightName) != weight.weight.end();
+                Data *mergeW = hasMergeQkv ? &weight[mergeQkvWeightName] : GetEmptyData();
+                Data *mergeB = hasMergeQkv ? &weight[mergeQkvBiasName] : GetEmptyData();
+                Data *qW = hasMergeQkv ? GetEmptyData() : &weight[qWeightName];
+                Data *kW = hasMergeQkv ? GetEmptyData() : &weight[kWeightName];
+                Data *vW = hasMergeQkv ? GetEmptyData() : &weight[vWeightName];
+                Data *qB = !hasMergeQkv && weight.weight.find(qBiasName) != weight.weight.end()
+                    ? &weight[qBiasName] : GetEmptyData();
+                Data *kB = !hasMergeQkv && weight.weight.find(kBiasName) != weight.weight.end()
+                    ? &weight[kBiasName] : GetEmptyData();
+                Data *vB = !hasMergeQkv && weight.weight.find(vBiasName) != weight.weight.end()
+                    ? &weight[vBiasName] : GetEmptyData();
+                Data *oB = weight.weight.find(oBiasName) != weight.weight.end()
+                    ? &weight[oBiasName] : GetEmptyData();
+
+                AttentionPagedBlock(
+                    &attenInput,
+                    mergeW, mergeB,
+                    qW, qB, kW, kB, vW, vB,
+                    GetEmptyData(), GetEmptyData(),
+                    GetEmptyData(), GetEmptyData(),
+                    &weight[oWeightName], oB,
+                    &allPositionIds,
+                    &pastKeyValues, &batchPastKeys, &batchPastValues,
+                    &qkv, &q, &attenOutput, &attenLastOutput,
+                    &insertIndexs, &insertPositions,
+                    &qSizes, &pageSizes, &pageIndexs, &lastPageLens,
+                    &generatedAppendPagedCacheBatchParams,
+                    &generatedBatchDecodeParams,
+                    batch, block_cnt, i, seqLens,
+                    num_attention_heads, num_key_value_heads, head_dim,
+                    rotary_dim, rms_norm_eps,
+                    rope_base, rope_factor, max_positions, rope_type,
+                    false, isPrefill, &hiddenStates,
+                    false, false);
+            } else if (weight.weight.find(mergeQkvWeightName) != weight.weight.end()
                 && CanRunMergeAttention()
                 && true) {
                 // MLP(attenInput, weight[swigluWeightName], Data(), weight[downWeightName], Data(), k);
@@ -618,7 +714,6 @@ namespace fastllm {
                     fastllm::LlamaRotatePosition2D(k, allPositionIds, *sinDataPtr, *cosDataPtr, rotary_dim);
                 }
 
-                Data attenOutput = Data(this->dataType);
                 int total = 0;
 
                 if (false) {
@@ -790,7 +885,9 @@ namespace fastllm {
         std::vector <Data> curLogits;
         curLogits.resize(batch);
 
-        if (batch > 1 && !all1) {
+        // Prefill只需要每个请求最后一个Token的logits。单请求也必须先收缩
+        // sequence维，否则后续SplitBatch会把sequence长度误当成batch数量。
+        if (!all1) {
             int total = 0;
             std::vector <Data> lastTokens;
             std::vector <Data*> lastTokenPointers;
@@ -880,11 +977,29 @@ namespace fastllm {
                 }
             }
         }
+
+        TraceSamplingTop1IfEnabled(logits, lastRet);
+
         if (sinDataPtr != &sinData)
             delete sinDataPtr;
         if (cosDataPtr != &cosData)
             delete cosDataPtr;
         return lastRet;
+    }
+
+    std::vector<int> LlamaModel::ForwardV2(
+            int batch,
+            const Data &inputIds,
+            const std::vector<Data*> &attentionMask,
+            const std::vector<Data*> &positionIds,
+            const std::vector<int> &seqLens,
+            std::vector<std::pair<Data*, Data*>> &pastKeyValues,
+            const std::vector<GenerationConfig> &generationConfigs,
+            const LastTokensManager &lastTokens,
+            std::vector<std::vector<float>*> *logits) {
+        return ForwardBatch(batch, inputIds, attentionMask, positionIds,
+                            seqLens, pastKeyValues, generationConfigs,
+                            lastTokens, logits);
     }
 
     bool LlamaModel::NeedAttentionMask(int qlen, int klen) {
@@ -893,6 +1008,13 @@ namespace fastllm {
             return false;
         }
         return true;
+    }
+
+    ModelAttentionCapabilities LlamaModel::GetModelAttentionCapabilities() const {
+        const std::string name = model_type.empty() ? "llama" : model_type;
+        const bool isStandardLlama = name == "llama";
+        return {name, ModelKVCacheLayout::CONTINUOUS,
+                true, isStandardLlama, false, false};
     }
 
     void LlamaModel::FillLLMInputsBatch(std::vector<std::vector<float>> &inputTokens,

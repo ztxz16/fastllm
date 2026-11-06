@@ -694,15 +694,13 @@ namespace fastllm {
         }
 
         static bool Qwen3CudaShouldTryCutlassSwigluLinearAdd(int tokens) {
-            int minBatch = Qwen3CudaEnvInt("FASTLLM_CUDA_CUTLASS_LINEAR_FP8_MIN_BATCH", 8);
-            return tokens >= minBatch;
+            return tokens > 0;
         }
 
         static bool Qwen3CudaCanUseSwigluLinearAdd(
                 const Data &input, const Data &gateUp, const Data &down,
                 const Data &downBias, const Data &hiddenStates, bool tensorParallel) {
-            if (tensorParallel ||
-                !Qwen3CudaEnvDefaultEnabled("FASTLLM_CUDA_CUTLASS_LINEAR_FP8_SWIGLU_QUANT")) {
+            if (tensorParallel) {
                 return false;
             }
             if (input.dims.empty() || gateUp.dims.size() != 2 || down.dims.size() != 2 ||
@@ -715,6 +713,22 @@ namespace fastllm {
             int inter = down.dims[1];
             int hidden = hiddenStates.dims.back();
             int n = input.Count(0) / input.dims.back();
+            const bool isNvfp4 = down.dataType == DataType::NVFP4_BLOCK_16 &&
+                                 down.blockM == 16;
+            if (isNvfp4) {
+                return Qwen3CudaEnvDefaultEnabled("FASTLLM_CUDA_NVFP4_SWIGLU_QUANT") &&
+                       n > 0 &&
+                       (input.dataType == DataType::FLOAT16 || input.dataType == DataType::BFLOAT16) &&
+                       hiddenStates.dataType == input.dataType &&
+                       gateUp.dims[0] == inter * 2 && down.dims[0] == hidden &&
+                       (inter % 16) == 0 &&
+                       (downBias.dims.empty() ||
+                        (downBias.dataType == DataType::FLOAT32 &&
+                         downBias.Count(0) == (uint64_t)hidden));
+            }
+            if (!Qwen3CudaEnvDefaultEnabled("FASTLLM_CUDA_CUTLASS_LINEAR_FP8_SWIGLU_QUANT")) {
+                return false;
+            }
             int minBatch = Qwen3CudaEnvInt("FASTLLM_CUDA_CUTLASS_LINEAR_FP8_MIN_BATCH", 8);
             if (n < minBatch) {
                 return false;
@@ -747,8 +761,12 @@ namespace fastllm {
             int n = gateUpResult.Count(0) / gateUpResult.dims.back();
             int m = gateUpResult.dims.back() / 2;
             int k = down.dims[0];
-            if (!FastllmCudaCutlassLinearFP8E4M3Block128FromSwiglu(
-                    gateUpResult, down, downBias, middle, n, m, k)) {
+            bool fused = down.dataType == DataType::NVFP4_BLOCK_16
+                ? FastllmCudaCutlassNvfp4W4A4FromSwiglu(
+                      gateUpResult, down, downBias, middle, n, m, k)
+                : FastllmCudaCutlassLinearFP8E4M3Block128FromSwiglu(
+                      gateUpResult, down, downBias, middle, n, m, k);
+            if (!fused) {
                 Qwen3CudaSwiglu(runner, gateUpResult, swigluResult);
                 Qwen3CudaLinearAddBlock(runner, &swigluResult, &down, &downBias, &middle, &hiddenStates);
                 return true;

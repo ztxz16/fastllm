@@ -669,11 +669,19 @@ static void SetLocalQKVPackMeta(fastllm::Data *local, const fastllm::Data &weigh
 static void InitMultiCudaLocalTensorMeta(const fastllm::Data &src, fastllm::Data &dst) {
     dst.name = src.name;
     dst.isModelWeight = src.isModelWeight;
+    dst.weightType = src.weightType;
+    dst.linearQuantScheme = src.linearQuantScheme;
+    dst.w8a8InputDynamic = src.w8a8InputDynamic;
+    dst.w8a8InputSymmetric = src.w8a8InputSymmetric;
+    dst.w8a8InputScale = src.w8a8InputScale;
+    dst.w8a8InputZeroPoint = src.w8a8InputZeroPoint;
     dst.directMemory = src.directMemory;
     dst.group = src.group;
     dst.groupCnt = src.groupCnt;
     dst.blockK = src.blockK;
     dst.blockM = src.blockM;
+    dst.nvfp4GroupScales = src.nvfp4GroupScales;
+    dst.nvfp4GlobalScale = src.nvfp4GlobalScale;
     // NVFP4_BLOCK_16 stores its block scales inline.  Its scales vector only
     // carries the tensor-level dequant multipliers needed when preparing the
     // Marlin layout, so every tensor-parallel shard must retain that metadata.
@@ -1540,6 +1548,44 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
     if (cudaBiasData != nullptr) {
         FastllmCudaFree(cudaBiasData);
         cudaBiasData = nullptr;
+    }
+
+    if (weight.dataType == fastllm::DataType::NVFP4_BLOCK_16 &&
+        weight.blockM == 16 && weight.dims.size() == 2 && m % 16 == 0 &&
+        weight.nvfp4GroupScales.size() == (size_t)k * (m / 16)) {
+        const size_t sourceGroups = (size_t)m / 16;
+        for (int deviceId : multiCudaCurrentDevices) {
+            auto *local = weight.multiDeviceDatas[deviceId];
+            auto &div = divisionScheme[deviceId];
+            local->nvfp4GlobalScale = weight.nvfp4GlobalScale;
+            local->nvfp4GroupScales.clear();
+            if (splitAxis == 0) {
+                local->nvfp4GroupScales.reserve((size_t)local->dims[0] * sourceGroups);
+                for (auto &range : div) {
+                    const uint8_t *begin = weight.nvfp4GroupScales.data() +
+                                           (size_t)range.first * sourceGroups;
+                    const uint8_t *end = weight.nvfp4GroupScales.data() +
+                                         (size_t)range.second * sourceGroups;
+                    local->nvfp4GroupScales.insert(local->nvfp4GroupScales.end(), begin, end);
+                }
+            } else {
+                const size_t localGroups = (size_t)local->dims[1] / 16;
+                local->nvfp4GroupScales.resize((size_t)k * localGroups);
+                for (int row = 0; row < k; ++row) {
+                    size_t dstGroup = 0;
+                    for (auto &range : div) {
+                        fastllm::AssertInFastLLM(range.first % 16 == 0 && range.second % 16 == 0,
+                                                 "NVFP4 scale split should align to 16.\n");
+                        size_t firstGroup = (size_t)range.first / 16;
+                        size_t groupCount = (size_t)(range.second - range.first) / 16;
+                        memcpy(local->nvfp4GroupScales.data() + (size_t)row * localGroups + dstGroup,
+                               weight.nvfp4GroupScales.data() + (size_t)row * sourceGroups + firstGroup,
+                               groupCount);
+                        dstGroup += groupCount;
+                    }
+                }
+            }
+        }
     }
 
     if (weight.dataType == fastllm::DataType::FP8_E4M3) {

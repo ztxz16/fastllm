@@ -146,6 +146,12 @@ def build_parser():
         action="store_true",
         help="跳过预热请求",
     )
+    parser.add_argument(
+        "--result-json",
+        type=str,
+        default="",
+        help="将结构化性能结果写入JSON文件",
+    )
     return parser
 
 
@@ -236,6 +242,7 @@ def run_stream_request(base_url, model_name, api_key, prompt_text, max_tokens, r
     payload = {
         "model": model_name,
         "max_tokens": max_tokens,
+        "temperature": 0,
         "stream": True,
         "messages": [
             {"role": "user", "content": prompt_text},
@@ -633,7 +640,11 @@ def main():
     args = parser.parse_args()
 
     if args.config:
-        run_batch_benchmark(args)
+        result = run_batch_benchmark(args)
+        if args.result_json:
+            Path(args.result_json).parent.mkdir(parents=True, exist_ok=True)
+            with open(args.result_json, "w", encoding="utf-8") as handle:
+                json.dump(result, handle, ensure_ascii=False, indent=2)
         return
 
     if not args.model and not args.path:
@@ -643,7 +654,11 @@ def main():
         args.max_batch = args.batch_size
 
     args.name = "single"
-    run_single_benchmark(args)
+    result = run_single_benchmark(args)
+    if args.result_json:
+        Path(args.result_json).parent.mkdir(parents=True, exist_ok=True)
+        with open(args.result_json, "w", encoding="utf-8") as handle:
+            json.dump(result, handle, ensure_ascii=False, indent=2)
 
 
 if __name__ == "__main__":

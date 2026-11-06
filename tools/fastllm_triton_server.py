@@ -1976,6 +1976,7 @@ if triton is not None:
         GROUP_SIZE_M: tl.constexpr,
         top_k: tl.constexpr,
         compute_type: tl.constexpr,
+        packed_block128: tl.constexpr,
     ):
         pid = tl.program_id(axis=0)
         num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
@@ -2020,24 +2021,32 @@ if triton is not None:
         a_ptrs = a_ptr + (
             offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
         )
-        gate_base = gate_ptr + off_experts * stride_be
-        up_base = up_ptr + off_experts * stride_be
-        gate_scale_base = gate_scale_ptr + off_experts * stride_bse
-        up_scale_base = up_scale_ptr + off_experts * stride_bse
-        gate_ptrs = (
-            gate_base
-            + offs_k[:, None] * stride_bk
-            + local_bn[None, :] * stride_bn
-        )
-        up_ptrs = (
-            up_base
-            + offs_k[:, None] * stride_bk
-            + local_bn[None, :] * stride_bn
-        )
+        if packed_block128:
+            packed_row = K + tl.cdiv(K, group_k) * 4
+            gate_base = gate_ptr + off_experts * INTER * packed_row
+            up_base = up_ptr + off_experts * INTER * packed_row
+            gate_ptrs = gate_base + local_bn[None, :] * packed_row + offs_k[:, None]
+            up_ptrs = up_base + local_bn[None, :] * packed_row + offs_k[:, None]
+        else:
+            gate_base = gate_ptr + off_experts * stride_be
+            up_base = up_ptr + off_experts * stride_be
+            gate_scale_base = gate_scale_ptr + off_experts * stride_bse
+            up_scale_base = up_scale_ptr + off_experts * stride_bse
+            gate_ptrs = (
+                gate_base
+                + offs_k[:, None] * stride_bk
+                + local_bn[None, :] * stride_bn
+            )
+            up_ptrs = (
+                up_base
+                + offs_k[:, None] * stride_bk
+                + local_bn[None, :] * stride_bn
+            )
         a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
-        offs_bsn = local_bn // group_n
-        gate_scale_ptrs = gate_scale_base + offs_bsn * stride_bsn
-        up_scale_ptrs = up_scale_base + offs_bsn * stride_bsn
+        if not packed_block128:
+            offs_bsn = local_bn // group_n
+            gate_scale_ptrs = gate_scale_base + offs_bsn * stride_bsn
+            up_scale_ptrs = up_scale_base + offs_bsn * stride_bsn
 
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
         for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
@@ -2057,21 +2066,41 @@ if triton is not None:
                 mask=token_mask,
                 other=0.0,
             )
-            gate_b_scale = tl.load(
-                gate_scale_ptrs + offs_ks * stride_bsk,
-                mask=local_bn < INTER,
-                other=0.0,
-            )
-            up_b_scale = tl.load(
-                up_scale_ptrs + offs_ks * stride_bsk,
-                mask=local_bn < INTER,
-                other=0.0,
-            )
+            if packed_block128:
+                gate_scale_ptrs = (
+                    gate_base
+                    + local_bn * packed_row
+                    + offs_ks * (group_k + 4)
+                    + group_k
+                ).to(tl.pointer_type(tl.float32))
+                up_scale_ptrs = (
+                    up_base
+                    + local_bn * packed_row
+                    + offs_ks * (group_k + 4)
+                    + group_k
+                ).to(tl.pointer_type(tl.float32))
+                gate_b_scale = tl.load(gate_scale_ptrs, mask=local_bn < INTER, other=0.0)
+                up_b_scale = tl.load(up_scale_ptrs, mask=local_bn < INTER, other=0.0)
+            else:
+                gate_b_scale = tl.load(
+                    gate_scale_ptrs + offs_ks * stride_bsk,
+                    mask=local_bn < INTER,
+                    other=0.0,
+                )
+                up_b_scale = tl.load(
+                    up_scale_ptrs + offs_ks * stride_bsk,
+                    mask=local_bn < INTER,
+                    other=0.0,
+                )
             b_scale = tl.where(is_up, up_b_scale, gate_b_scale)
             accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
             a_ptrs += BLOCK_SIZE_K * stride_ak
-            gate_ptrs += BLOCK_SIZE_K * stride_bk
-            up_ptrs += BLOCK_SIZE_K * stride_bk
+            if packed_block128:
+                gate_ptrs += BLOCK_SIZE_K + 4
+                up_ptrs += BLOCK_SIZE_K + 4
+            else:
+                gate_ptrs += BLOCK_SIZE_K * stride_bk
+                up_ptrs += BLOCK_SIZE_K * stride_bk
 
         accumulator = accumulator.to(compute_type)
 
@@ -2147,6 +2176,7 @@ if triton is not None:
         use_int8_w8a16: tl.constexpr,
         per_channel_quant: tl.constexpr,
         HAS_BIAS: tl.constexpr,
+        packed_block128: tl.constexpr,
     ):
         pid = tl.program_id(axis=0)
         num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
@@ -2193,13 +2223,18 @@ if triton is not None:
         a_ptrs = a_ptr + (
             offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
         )
-        b_base = b_ptr + off_experts * stride_be
-        b_scale_base = b_scale_ptr + off_experts * stride_bse
-        b_ptrs = (
-            b_base
-            + offs_k[:, None] * stride_bk
-            + offs_bn[None, :] * stride_bn
-        )
+        if packed_block128:
+            packed_row = K + tl.cdiv(K, group_k) * 4
+            b_base = b_ptr + off_experts * N * packed_row
+            b_ptrs = b_base + offs_bn[None, :] * packed_row + offs_k[:, None]
+        else:
+            b_base = b_ptr + off_experts * stride_be
+            b_scale_base = b_scale_ptr + off_experts * stride_bse
+            b_ptrs = (
+                b_base
+                + offs_k[:, None] * stride_bk
+                + offs_bn[None, :] * stride_bn
+            )
 
         if use_int8_w8a16:
             b_scale_ptrs = b_scale_base + offs_bn[None, :] * stride_bsn
@@ -2208,8 +2243,9 @@ if triton is not None:
         if use_fp8_w8a8 or use_int8_w8a8:
             if group_k > 0 and group_n > 0:
                 a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
-                offs_bsn = offs_bn // group_n
-                b_scale_ptrs = b_scale_base + offs_bsn * stride_bsn
+                if not packed_block128:
+                    offs_bsn = offs_bn // group_n
+                    b_scale_ptrs = b_scale_base + offs_bsn * stride_bsn
             elif per_channel_quant:
                 b_scale_ptrs = b_scale_base + offs_bn[None, :] * stride_bsn
                 b_scale = tl.load(b_scale_ptrs)
@@ -2242,7 +2278,16 @@ if triton is not None:
                         mask=token_mask,
                         other=0.0,
                     )
-                    b_scale = tl.load(b_scale_ptrs + offs_ks * stride_bsk)
+                    if packed_block128:
+                        packed_scale_ptrs = (
+                            b_base
+                            + offs_bn * packed_row
+                            + offs_ks * (group_k + 4)
+                            + group_k
+                        ).to(tl.pointer_type(tl.float32))
+                        b_scale = tl.load(packed_scale_ptrs)
+                    else:
+                        b_scale = tl.load(b_scale_ptrs + offs_ks * stride_bsk)
                     accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
                 else:
                     if use_fp8_w8a8:
@@ -2252,7 +2297,10 @@ if triton is not None:
             else:
                 accumulator += tl.dot(a, b)
             a_ptrs += BLOCK_SIZE_K * stride_ak
-            b_ptrs += BLOCK_SIZE_K * stride_bk
+            if packed_block128:
+                b_ptrs += BLOCK_SIZE_K + 4
+            else:
+                b_ptrs += BLOCK_SIZE_K * stride_bk
 
         if use_int8_w8a16:
             accumulator = accumulator * b_scale
@@ -2647,6 +2695,9 @@ def merge_moe_fp8_cache_paths(payload):
     input_dtype = require_dtype(payload, "input_dtype")
     if input_dtype not in {"fp16", "bf16"}:
         raise ValueError("input_dtype must be fp16 or bf16")
+    weight_layout = str(payload.get("weight_layout") or "separate").strip().lower()
+    if weight_layout not in {"separate", "block128"}:
+        raise ValueError("merge_moe_fp8 weight_layout must be separate or block128")
     route_block_t = require_int(payload, "route_block_t", 1024)
     max_experts = require_int(payload, "max_experts", 256)
     topk = require_int(payload, "topk", 8)
@@ -2663,7 +2714,7 @@ def merge_moe_fp8_cache_paths(payload):
     num_stages = require_int(payload, "num_stages", 3)
     cache_dir = Path(payload.get("cache_dir") or default_cache_dir()).expanduser()
     name = (
-        f"merge_moe_fp8_v34_{input_dtype}_sm{arch}"
+        f"merge_moe_fp8_v35_{weight_layout}_{input_dtype}_sm{arch}"
         f"_rt{route_block_t}_me{max_experts}_tk{topk}"
         f"_h{hidden}_i{inter}"
         f"_gm{group_block_m}_gn{group_block_n}_gk{group_block_k}"
@@ -3793,6 +3844,9 @@ def compile_merge_moe_fp8(payload):
     input_dtype = require_dtype(payload, "input_dtype")
     if input_dtype not in {"fp16", "bf16"}:
         raise ValueError("input_dtype must be fp16 or bf16")
+    weight_layout = str(payload.get("weight_layout") or "separate").strip().lower()
+    if weight_layout not in {"separate", "block128"}:
+        raise ValueError("merge_moe_fp8 weight_layout must be separate or block128")
     arch = require_int(payload, "arch")
     route_block_t = require_int(payload, "route_block_t", 1024)
     max_experts = require_int(payload, "max_experts", 256)
@@ -3805,6 +3859,10 @@ def compile_merge_moe_fp8(payload):
     inter = int(payload.get("inter", 0) or 0)
     if group_block_n != group_block_k:
         raise ValueError("group_block_n and group_block_k must match for W8A8 FP8 MoE")
+    if weight_layout == "block128" and (
+        group_block_n != 128 or group_block_k != 128
+    ):
+        raise ValueError("Block128 FP8 MoE requires 128x128 scale groups")
     if hidden <= 0 or inter <= 0:
         raise ValueError("hidden and inter are required for merge_moe_fp8 kernels")
     route_num_warps = require_int(payload, "route_num_warps", 4)
@@ -4012,6 +4070,7 @@ def compile_merge_moe_fp8(payload):
         "use_int8_w8a16": "constexpr",
         "per_channel_quant": "constexpr",
         "HAS_BIAS": "constexpr",
+        "packed_block128": "constexpr",
     }
     gateup_constexprs = {
         "N": inter * 2,
@@ -4046,6 +4105,7 @@ def compile_merge_moe_fp8(payload):
         "use_int8_w8a16": False,
         "per_channel_quant": False,
         "HAS_BIAS": False,
+        "packed_block128": weight_layout == "block128",
     }
     gateup_ccinfo = _compile_cubin(
         fastllm_merge_moe_fp8_fused_matmul_kernel,
@@ -4093,6 +4153,7 @@ def compile_merge_moe_fp8(payload):
         "GROUP_SIZE_M": "constexpr",
         "top_k": "constexpr",
         "compute_type": "constexpr",
+        "packed_block128": "constexpr",
     }
     fused_gateup_constexprs = {
         "N": inter * 2,
@@ -4118,6 +4179,7 @@ def compile_merge_moe_fp8(payload):
         "group_k": group_block_k,
         "top_k": topk,
         "compute_type": compute_type,
+        "packed_block128": weight_layout == "block128",
     }
     fused_gateup_ccinfo = _compile_cubin(
         fastllm_merge_moe_fp8_fused_gateup_matmul_kernel,
@@ -4197,6 +4259,7 @@ def compile_merge_moe_fp8(payload):
         "use_int8_w8a16": "constexpr",
         "per_channel_quant": "constexpr",
         "HAS_BIAS": "constexpr",
+        "packed_block128": "constexpr",
     }
     down_constexprs = {
         "N": hidden,
@@ -4231,6 +4294,7 @@ def compile_merge_moe_fp8(payload):
         "use_int8_w8a16": False,
         "per_channel_quant": False,
         "HAS_BIAS": False,
+        "packed_block128": weight_layout == "block128",
     }
     down_ccinfo = _compile_cubin(
         fastllm_merge_moe_fp8_fused_matmul_kernel,
@@ -4301,6 +4365,7 @@ def compile_merge_moe_fp8(payload):
         "num_stages": num_stages,
         "arch": arch,
         "input_dtype": input_dtype,
+        "weight_layout": weight_layout,
     }
     meta_path.write_text(json.dumps(meta, sort_keys=True))
     return meta

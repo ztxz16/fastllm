@@ -84,6 +84,11 @@ namespace fastllm {
                                           {"<|execute_start|>", 73443}, {"<|execute_end|>", 73444}, {"<|fim_prefix|>", 73445}, {"<|fim_middle|>", 73446}, {"<|fim_suffix|>", 73447}});
     }
 
+    ModelAttentionCapabilities MiniCpm3Model::GetModelAttentionCapabilities() const {
+        return {"minicpm3", ModelKVCacheLayout::CONTINUOUS,
+                true, false, false, false};
+    }
+
     int MiniCpm3Model::Forward(const fastllm::Data &inputIds, const fastllm::Data &attentionMask,
                             const fastllm::Data &positionIds, std::vector<std::pair<Data, Data>> &pastKeyValues,
                             const GenerationConfig &generationConfig, const LastTokensManager &lastTokens,

@@ -31,15 +31,22 @@ namespace fastllm {
         }
 
         bool ShouldTrySwigluLinearAdd(Data *input, Data *gateUp, Data *down, Data *output) {
-            if (!EnvDefaultEnabled("FASTLLM_CUDA_CUTLASS_LINEAR_FP8_SWIGLU_QUANT")) {
-                return false;
-            }
             if (input == nullptr || gateUp == nullptr || down == nullptr || output == nullptr ||
                 input->dims.empty() || gateUp->dims.size() != 2 || down->dims.size() != 2 ||
                 output->dims.empty() || input->dims.back() <= 0) {
                 return false;
             }
             int tokens = (int)(input->Count(0) / input->dims.back());
+            const bool isNvfp4 = down->dataType == DataType::NVFP4_BLOCK_16 &&
+                                 down->blockM == 16;
+            if (isNvfp4) {
+                return EnvDefaultEnabled("FASTLLM_CUDA_NVFP4_SWIGLU_QUANT") && tokens > 0 &&
+                       (input->dataType == DataType::FLOAT16 || input->dataType == DataType::BFLOAT16) &&
+                       output->dataType == input->dataType;
+            }
+            if (!EnvDefaultEnabled("FASTLLM_CUDA_CUTLASS_LINEAR_FP8_SWIGLU_QUANT")) {
+                return false;
+            }
             int minBatch = EnvInt("FASTLLM_CUDA_CUTLASS_LINEAR_FP8_MIN_BATCH", 8);
             if (tokens < minBatch) {
                 return false;

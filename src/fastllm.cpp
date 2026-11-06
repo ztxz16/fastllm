@@ -13,9 +13,15 @@
 #include <cmath>
 #include <cfloat>
 #include <climits>
+#include <cstdio>
 #include <thread>
+#include <atomic>
 #include <algorithm>
 #include <queue>
+
+#if defined(USE_CUDA) && (defined(__linux__) || defined(__APPLE__))
+#include <execinfo.h>
+#endif
 
 #ifdef USE_MMAP
 #include <sys/mman.h>
@@ -108,7 +114,13 @@ namespace fastllm {
             if (data.isModelWeight && !data.directMemory) {
                 return FastllmCudaMallocModelWeight(bytes, data.name);
             }
-            return data.directMemory ? FastllmCudaDirectMalloc(bytes) : FastllmCudaMalloc(bytes);
+            if (data.directMemory) {
+                return FastllmCudaDirectMalloc(bytes);
+            }
+            return FastllmCudaMallocWithDataTag(
+                bytes, &data, (int)data.dataType, data.dims.data(),
+                (int)data.dims.size(), data.isFake, data.isKVCache,
+                __FILE__, __LINE__);
         }
 
         static bool CheckCudaMallocForData(const Data &data, void *&ptr,
@@ -289,6 +301,11 @@ namespace fastllm {
     static bool enableAMX = false;
     static int maxTokens = -1;
     static int defaultPageLen = 128;
+    static std::string kvCacheLayout = "auto";
+    static std::string attentionBackend = "auto";
+    static bool attentionBackendStrict = false;
+    static bool attentionBackendTrace = false;
+    static std::mutex attentionBackendConfigMutex;
     static float gpuMemRatio = 0.9f;
     static Data emptyData;
 
@@ -513,6 +530,93 @@ namespace fastllm {
         return defaultPageLen;
     }
 
+    /**
+     * 设置支持双KV布局模型使用的Cache布局。
+     *
+     * 该配置只决定模型构造连续Cache还是分页Cache，不决定分页Attention的
+     * 具体实现。auto保留各模型原有布局；显式布局不受Attention Backend
+     * fallback影响。配置应在模型加载前完成。
+     *
+     * @param layout auto、continuous或paged。
+     */
+    void SetKVCacheLayout(const std::string &layout) {
+        const std::string normalized = layout.empty() ? "auto" : layout;
+        AssertInFastLLM(normalized == "auto" || normalized == "continuous" ||
+                        normalized == "paged",
+                        "KV Cache layout should be auto, continuous or paged.\n");
+
+        std::lock_guard<std::mutex> guard(attentionBackendConfigMutex);
+        kvCacheLayout = normalized;
+    }
+
+    std::string GetKVCacheLayout() {
+        std::lock_guard<std::mutex> guard(attentionBackendConfigMutex);
+        return kvCacheLayout;
+    }
+
+    /**
+     * 输出模型首次确定的KV Cache布局，供正式路径测试确认。
+     *
+     * 相同模型、请求布局和实际布局在进程内只记录一次，避免逐层、逐Token
+     * 打印影响性能。
+     *
+     * @param model 模型族名称。
+     * @param actual continuous或paged。
+     */
+    void TraceKVCacheLayout(const std::string &model, const std::string &actual) {
+        if (!GetAttentionBackendTrace()) {
+            return;
+        }
+
+        static std::mutex traceMutex;
+        static std::set<std::tuple<std::string, std::string, std::string>> traced;
+        const std::string requested = GetKVCacheLayout();
+        std::lock_guard<std::mutex> guard(traceMutex);
+        if (traced.emplace(model, requested, actual).second) {
+            printf("[fastllm][kv-cache] model=%s requested=%s actual=%s\n",
+                   model.c_str(), requested.c_str(), actual.c_str());
+            fflush(stdout);
+        }
+    }
+
+    /**
+     * 设置进程级Attention Backend选择。
+     *
+     * 配置应在模型加载前完成，正式推理期间不得修改。空字符串按auto处理，
+     * Backend名称由设备侧注册表解释。
+     *
+     * @param backend Backend名称或auto。
+     */
+    void SetAttentionBackend(const std::string &backend) {
+        std::lock_guard<std::mutex> guard(attentionBackendConfigMutex);
+        attentionBackend = backend.empty() ? "auto" : backend;
+    }
+
+    std::string GetAttentionBackend() {
+        std::lock_guard<std::mutex> guard(attentionBackendConfigMutex);
+        return attentionBackend;
+    }
+
+    void SetAttentionBackendStrict(bool strict) {
+        std::lock_guard<std::mutex> guard(attentionBackendConfigMutex);
+        attentionBackendStrict = strict;
+    }
+
+    bool GetAttentionBackendStrict() {
+        std::lock_guard<std::mutex> guard(attentionBackendConfigMutex);
+        return attentionBackendStrict;
+    }
+
+    void SetAttentionBackendTrace(bool trace) {
+        std::lock_guard<std::mutex> guard(attentionBackendConfigMutex);
+        attentionBackendTrace = trace;
+    }
+
+    bool GetAttentionBackendTrace() {
+        std::lock_guard<std::mutex> guard(attentionBackendConfigMutex);
+        return attentionBackendTrace;
+    }
+
     void SetGpuMemRatio(float ratio) {
         gpuMemRatio = ratio;
     }
@@ -541,6 +645,7 @@ namespace fastllm {
         {DataType::NVFP4_BLOCK_16_E8M0, {"nvfp4_block_16_e8m0"}},
         {DataType::INT4_GROUP32, {"int4_group32"}},
         {DataType::INT4_W4A8, {"int4_w4a8"}},
+        {DataType::INT8_W8A8, {"int8_w8a8"}},
         {DataType::NVFP4_BLOCK_32_E8M0, {"nvfp4_block_32_e8m0"}},
         {DataType::INF_INT8_PERCHANNEL, {"inf_int8_perchannel"}}, {DataType::INF_INT8_GROUP128, {"inf_int8_group128"}},
         {DataType::INF_INT8_GROUP32, {"inf_int8_group32"}},
@@ -617,7 +722,7 @@ namespace fastllm {
                    type == DataType::INT4_W4A8 ||
                    type == DataType::NVFP4) {
             return type == DataType::NVFP4 ? GetNVFP4WeightBytes(rows, columns) : rows * (columns / 2);
-        } else if (type == DataType::INT8) {
+        } else if (type == DataType::INT8 || type == DataType::INT8_W8A8) {
             return rows * columns;
         } else if (type == DataType::FP8_E4M3_BLOCK_128) {
             // columns * [fp8] + ((columns - 1) / 128 + 1) * [float]
@@ -939,13 +1044,82 @@ namespace fastllm {
         CopyFrom(ori);
     }
 
+#ifdef USE_CUDA
+    /**
+     * 输出分页路径中空CUDA源张量的深拷贝现场。
+     *
+     * 该诊断仅在FASTLLM_CUDA_PAGED_DEBUG启用时由Data::CopyFrom调用，最多
+     * 输出前8个现场，避免同一错误在多层K/V Cache中级联刷屏。函数只读取
+     * 张量元数据和主机调用栈，不读取设备内存，也不改变原有失败语义。
+     *
+     * @param dst   已为深拷贝分配目标空间的Data对象。
+     * @param src   cudaData为空但逻辑字节数非零的源Data对象。
+     * @param bytes 本次深拷贝准备传输的字节数。
+     */
+    static void PrintPagedNullCudaCopySource(
+            const Data &dst, const Data &src, size_t bytes) {
+        static std::atomic<int> loggedCount(0);
+        int logIndex = loggedCount.fetch_add(1, std::memory_order_relaxed);
+        if (logIndex >= 8) {
+            return;
+        }
+
+        std::string shape = "[";
+        for (size_t i = 0; i < src.dims.size(); i++) {
+            if (i > 0) {
+                shape += ",";
+            }
+            shape += std::to_string(src.dims[i]);
+        }
+        shape += "]";
+
+        fprintf(stderr,
+                "[fastllm][paged-debug] NULL_COPY_SOURCE index=%d "
+                "src_object=%p dst_object=%p src_cuda=%p dst_cuda=%p "
+                "bytes=%zu name=%s dtype=%s shape=%s data_device=%d "
+                "is_fake=%d direct_memory=%d borrowed=%d expansion_bytes=%llu\n",
+                logIndex, (const void*)&src, (const void*)&dst,
+                src.cudaData, dst.cudaData, bytes,
+                src.name.empty() ? "<unnamed>" : src.name.c_str(),
+                GetDataTypeName(src.dataType).c_str(), shape.c_str(),
+                (int)src.dataDevice, (int)src.isFake, (int)src.directMemory,
+                (int)src.cudaDataBorrowed,
+                (unsigned long long)src.expansionBytes);
+#if defined(__linux__) || defined(__APPLE__)
+        const int maxFrames = 32;
+        void *frames[maxFrames];
+        int frameCount = backtrace(frames, maxFrames);
+        char **symbols = backtrace_symbols(frames, frameCount);
+        if (symbols != nullptr) {
+            int end = std::min(frameCount, 20);
+            for (int i = 1; i < end; i++) {
+                fprintf(stderr, "  copy_stack#%d %s\n", i - 1, symbols[i]);
+            }
+            free(symbols);
+        }
+#else
+        fprintf(stderr, "  copy stack is unavailable on this platform.\n");
+#endif
+        fflush(stderr);
+    }
+#endif
+
     void Data::FakeFrom(const Data &ori, size_t offset) {
 #ifdef USE_CUDA
+        FastllmCudaReleaseNvfp4W4A4Cache(this);
+        FastllmCudaReleaseFp8W8A8BackendState(this);
+        FastllmCudaReleaseNvfp4MarlinCache(this);
+        FastllmCudaReleaseMacheteCache(this);
         if (!this->w4a8CudaCaches.empty()) {
             FastllmCudaReleaseW4A8WeightCache(*this);
         }
 #endif
         this->dataType = ori.dataType;
+        this->linearQuantScheme = ori.linearQuantScheme;
+        this->w8a8InputDynamic = ori.w8a8InputDynamic;
+        this->w8a8InputSymmetric = ori.w8a8InputSymmetric;
+        this->w8a8InputScale = ori.w8a8InputScale;
+        this->w8a8InputZeroPoint = ori.w8a8InputZeroPoint;
         this->UpdateUnitSize();
         this->isFake = true;
         this->dataDevice = ori.dataDevice;
@@ -963,12 +1137,23 @@ namespace fastllm {
 
     void Data::CopyFrom(const Data &ori) {
 #ifdef USE_CUDA
+        if (this != &ori) {
+            FastllmCudaReleaseNvfp4W4A4Cache(this);
+            FastllmCudaReleaseFp8W8A8BackendState(this);
+            FastllmCudaReleaseNvfp4MarlinCache(this);
+            FastllmCudaReleaseMacheteCache(this);
+        }
         if (this != &ori && !this->w4a8CudaCaches.empty()) {
             FastllmCudaReleaseW4A8WeightCache(*this);
         }
 #endif
         this->ToDevice(ori.dataDevice);
         this->name = ori.name;
+        this->linearQuantScheme = ori.linearQuantScheme;
+        this->w8a8InputDynamic = ori.w8a8InputDynamic;
+        this->w8a8InputSymmetric = ori.w8a8InputSymmetric;
+        this->w8a8InputScale = ori.w8a8InputScale;
+        this->w8a8InputZeroPoint = ori.w8a8InputZeroPoint;
         this->isKVCache = ori.isKVCache;
         this->isLinearAttention = ori.isLinearAttention;
         this->isLinearAttentionTransposed = ori.isLinearAttentionTransposed;
@@ -984,6 +1169,20 @@ namespace fastllm {
         this->tpKVHeads = ori.tpKVHeads;
         this->tpHeadDim = ori.tpHeadDim;
         this->tpSplitUnit = ori.tpSplitUnit;
+        this->nvfp4GroupScales = ori.nvfp4GroupScales;
+        this->nvfp4GlobalScale = ori.nvfp4GlobalScale;
+        // W4A16/W8A16的深拷贝必须保留量化语义，但不复制任何设备预打包缓存。
+        if (ori.dataType == DataType::INT8 || ori.dataType == DataType::INT4_GROUP ||
+            ori.dataType == DataType::INT4_NOZERO) {
+            this->group = ori.group;
+            this->groupCnt = ori.groupCnt;
+            this->perChannelAxis = ori.perChannelAxis;
+            this->scales = ori.scales;
+            this->mins = ori.mins;
+            this->zeros = ori.zeros;
+            this->perChannelsConfigs = ori.perChannelsConfigs;
+            this->halfScales = ori.halfScales;
+        }
         if (ori.dataType == DataType::INT4_W4A8) {
             this->group = ori.group;
             this->groupCnt = ori.groupCnt;
@@ -1043,7 +1242,12 @@ namespace fastllm {
             std::memcpy(this->cpuData, ori.cpuData, this->GetBytes());
         } else if (this->dataDevice == DataDevice::CUDA) {
 #ifdef USE_CUDA
-            FastllmCudaCopyFromDeviceToDevice(this->cudaData, ori.cudaData, this->GetBytes());
+            size_t copyBytes = this->GetBytes();
+            if (copyBytes > 0 && ori.cudaData == nullptr &&
+                    FastllmCudaPagedDebugEnabled()) {
+                PrintPagedNullCudaCopySource(*this, ori, copyBytes);
+            }
+            FastllmCudaCopyFromDeviceToDevice(this->cudaData, ori.cudaData, copyBytes);
 #endif
         }
     }
@@ -1426,6 +1630,8 @@ namespace fastllm {
             int groupCnt, int blockK, int blockM) {
         auto &data = *this;
         data.weightType = weightType;
+        data.nvfp4GroupScales.clear();
+        data.nvfp4GlobalScale = 1.0f;
         if (dataType == oriDataType &&
             (dataType == DataType::NVFP4 || dataType == DataType::NVFP4_BLOCK_16 ||
              dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
@@ -1464,7 +1670,14 @@ namespace fastllm {
             if (oriData != nullptr) {
                 memcpy(data.cpuData, oriData, data.GetBytes());
             } 
-            if (dataType == DataType::INT4_GROUP) {
+            if (dataType == DataType::INT8_W8A8) {
+                AssertInFastLLM(this->dims.size() == 2 && oriScales != nullptr,
+                                "INT8_W8A8 requires 2D signed weights and channel scales.\n");
+                this->perChannelAxis = 0;
+                this->mins.clear();
+                this->zeros.clear();
+                this->scales.assign(oriScales, oriScales + this->dims[0]);
+            } else if (dataType == DataType::INT4_GROUP) {
                 int k = this->dims[0], m = this->dims[1], group = (m - 1) / groupCnt + 1;
                 this->group = group;
                 this->groupCnt = groupCnt;
@@ -1720,7 +1933,8 @@ namespace fastllm {
                 this->dataType == DataType::FLOAT16) {
             this->unitSize = 2;
             this->unitSizeDiv = 1;
-        } else if (this->dataType == DataType::INT8 || this->dataType == DataType::FP8_E4M3 ||
+        } else if (this->dataType == DataType::INT8 || this->dataType == DataType::INT8_W8A8 ||
+                   this->dataType == DataType::FP8_E4M3 ||
                    this->dataType == DataType::FP8_E4M3_PERCHANNEL) {
             this->unitSize = 1;
             this->unitSizeDiv = 1;
@@ -2059,6 +2273,10 @@ namespace fastllm {
 
     void Data::FreeSpace() {
 #ifdef USE_CUDA
+        FastllmCudaReleaseNvfp4W4A4Cache(this);
+        FastllmCudaReleaseFp8W8A8BackendState(this);
+        FastllmCudaReleaseNvfp4MarlinCache(this);
+        FastllmCudaReleaseMacheteCache(this);
         if (!this->w4a8CudaCaches.empty()) {
             FastllmCudaReleaseW4A8WeightCache(*this);
         }
@@ -2088,6 +2306,90 @@ namespace fastllm {
             this->cudaData = nullptr;
             this->cudaDataBorrowed = false;
         }
+#endif
+    }
+
+    bool Data::ReleaseCudaDataForRepackedWeight() {
+#ifdef USE_CUDA
+        if (this->dataDevice != DataDevice::CUDA || this->cudaData == nullptr) {
+            return true;
+        }
+        if (this->cudaDataBorrowed || this->multiDeviceData) {
+            return false;
+        }
+        if (this->cpuData == nullptr && this->numasData.empty()) {
+            // 固定后端和跨GPU重建都依赖可恢复的host/mmap源。没有源时不能
+            // 丢弃唯一的原始表示。
+            return false;
+        }
+        // warmup成功后，重排权重成为持久表示。普通内存池释放只会把原始
+        // 分配标记为空闲，大模型逐层重排时仍可能耗尽物理显存，因此这里
+        // 立即从池中真正移除这份一次性原始分配。
+        FastllmCudaForceFree(this->cudaData);
+        this->cudaData = nullptr;
+        this->cudaDataBorrowed = false;
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    bool Data::RestoreCudaDataForRepackedWeight() {
+#ifdef USE_CUDA
+        int device = this->dataDeviceIds.empty()
+            ? FastllmCudaGetDevice() : this->dataDeviceIds[0];
+        return this->RestoreCudaDataForRepackedWeight(device);
+#else
+        return false;
+#endif
+    }
+
+    bool Data::RestoreCudaDataForRepackedWeight(int targetDevice) {
+#ifdef USE_CUDA
+        if (this->cudaData != nullptr) {
+            return true;
+        }
+        if (this->dataDevice != DataDevice::CUDA || this->cudaDataBorrowed ||
+            this->multiDeviceData || this->expansionBytes == 0) {
+            return false;
+        }
+        if (this->cpuData == nullptr && this->numasData.empty()) {
+            return false;
+        }
+        FastllmCudaSetDevice(targetDevice);
+        this->cudaData = CudaMallocForData(*this, this->expansionBytes);
+        this->cudaDataBorrowed = false;
+        if (this->cudaData == nullptr) {
+            return false;
+        }
+        if (this->cpuData != nullptr) {
+            FastllmCudaCopyFromHostToDevice(
+                this->cudaData, this->cpuData, this->expansionBytes);
+            return true;
+        }
+        if (this->dims.size() != 2 || this->numasData.empty()) {
+            CudaFreeForData(*this, this->cudaData);
+            this->cudaData = nullptr;
+            return false;
+        }
+        const int numaCnt = this->numasData.size();
+        const int rows = this->dims[0];
+        if (rows % numaCnt != 0) {
+            CudaFreeForData(*this, this->cudaData);
+            this->cudaData = nullptr;
+            return false;
+        }
+        const int rowsPerNuma = rows / numaCnt;
+        const size_t bytesPerRow = GetDataBytes(this->dataType, 1, this->dims[1]);
+        for (int i = 0; i < numaCnt; ++i) {
+            FastllmCudaCopyFromHostToDevice(
+                (uint8_t *)this->cudaData + (size_t)i * rowsPerNuma * bytesPerRow,
+                this->numasData[i], (size_t)rowsPerNuma * bytesPerRow);
+        }
+        return true;
+#else
+        (void)targetDevice;
+        return false;
 #endif
     }
 
@@ -2174,6 +2476,11 @@ namespace fastllm {
             }
         }
 
+        // 目标尺寸未增长时无需重分配，同时避免后续以-1访问dims和strides。
+        if (axis == -1) {
+            return;
+        }
+
         uint64_t oldBytes = GetBytes();
         int input1Stride = this->Count(axis);
 
@@ -2223,6 +2530,10 @@ namespace fastllm {
 
     Data::~Data() {
 #ifdef USE_CUDA
+        FastllmCudaReleaseNvfp4W4A4Cache(this);
+        FastllmCudaReleaseFp8W8A8BackendState(this);
+        FastllmCudaReleaseNvfp4MarlinCache(this);
+        FastllmCudaReleaseMacheteCache(this);
         if (!this->w4a8CudaCaches.empty()) {
             FastllmCudaReleaseW4A8WeightCache(*this);
         }
@@ -2615,6 +2926,54 @@ namespace fastllm {
         }
 
 #ifdef USE_CUDA
+        if (this->dataDevice == DataDevice::CUDA && this->cudaData == nullptr &&
+            this->dataType == DataType::NVFP4_BLOCK_16 &&
+            (this->linearQuantScheme == LinearQuantScheme::NVFP4_W4A4 ||
+             this->linearQuantScheme == LinearQuantScheme::NVFP4_W4A16 ||
+             this->linearQuantScheme == LinearQuantScheme::LEGACY_AUTO) &&
+            device == DataDevice::CUDA && copyData) {
+            const int sourceDevice = this->dataDeviceIds.empty()
+                ? FastllmCudaGetDevice() : this->dataDeviceIds[0];
+            const int destDevice = deviceIds.empty()
+                ? FastllmCudaGetDevice() : deviceIds[0];
+            if (sourceDevice != destDevice) {
+                // 重排cache属于具体GPU。先销毁旧GPU的后端状态，再把保留的
+                // host/mmap源直接上传到目标GPU；首次Linear会在目标GPU完成
+                // warmup、重排并重新释放这份临时原始权重。
+                FastllmCudaReleaseNvfp4W4A4Cache(this);
+                FastllmCudaReleaseFp8W8A8BackendState(this);
+                FastllmCudaReleaseNvfp4MarlinCache(this);
+                FastllmCudaReleaseMacheteCache(this);
+                if (!this->RestoreCudaDataForRepackedWeight(destDevice)) {
+                    ErrorInFastLLM(
+                        "ToDevice Error: cannot restore NVFP4 weight directly "
+                        "on the destination CUDA device.\n");
+                }
+                this->dataDeviceIds = deviceIds.empty()
+                    ? std::vector<int>({destDevice}) : deviceIds;
+                this->dataDevice = device;
+                // W4A4立即构建目标GPU的CUTLASS表示；W4A16保留这份临时
+                // 原始权重，首次Linear由Marlin完成重排并随即释放。
+                if (this->linearQuantScheme != LinearQuantScheme::NVFP4_W4A16) {
+                    FastllmCudaTryPrepackNvfp4W4A4Weight(*this);
+                }
+                return;
+            }
+        }
+        if (this->dataDevice == DataDevice::CUDA && this->cudaData == nullptr &&
+            this->dataType == DataType::NVFP4_BLOCK_16 &&
+            (this->linearQuantScheme == LinearQuantScheme::NVFP4_W4A4 ||
+             this->linearQuantScheme == LinearQuantScheme::NVFP4_W4A16 ||
+             this->linearQuantScheme == LinearQuantScheme::LEGACY_AUTO) &&
+            !this->RestoreCudaDataForRepackedWeight()) {
+            ErrorInFastLLM(
+                "ToDevice Error: cannot restore the original NVFP4 weight "
+                "after releasing its repacked CUDA source.\n");
+        }
+        FastllmCudaReleaseNvfp4W4A4Cache(this);
+        FastllmCudaReleaseFp8W8A8BackendState(this);
+        FastllmCudaReleaseNvfp4MarlinCache(this);
+        FastllmCudaReleaseMacheteCache(this);
         if (!this->w4a8CudaCaches.empty()) {
             FastllmCudaReleaseW4A8WeightCache(*this);
         }
@@ -2676,12 +3035,15 @@ namespace fastllm {
                         if (ownedCpuDataCopy) {
                             delete[] cpuData;
                         }
-                        if ((this->isModelWeight || this->isKVCache) && this->mapFile == nullptr) {
+                        if ((this->isModelWeight || this->isKVCache) &&
+                            this->mapFile == nullptr &&
+                            this->dataType != DataType::NVFP4_BLOCK_16) {
                             delete[] this->cpuData;
                             this->cpuData = nullptr;
                         }
 #else
-                        if (this->isModelWeight || this->isKVCache) {
+                        if ((this->isModelWeight || this->isKVCache) &&
+                            this->dataType != DataType::NVFP4_BLOCK_16) {
                             delete[] this->cpuData;
                             this->cpuData = nullptr;
                         }
@@ -2699,7 +3061,7 @@ namespace fastllm {
                     if (this->cpuData == nullptr) {
                         this->cpuData = new uint8_t[expansionBytes];
                     }
-                    if (copyData) {
+                    if (copyData && this->cudaData != nullptr) {
                         FastllmCudaCopyFromDeviceToHost(this->cpuData, this->cudaData, expansionBytes);
                     }
 
@@ -2744,6 +3106,38 @@ namespace fastllm {
             this->dataDeviceIds = deviceIds;
         };
         this->dataDevice = device;
+#ifdef USE_CUDA
+        if (device == DataDevice::CUDA && copyData &&
+            this->dataType == DataType::NVFP4_BLOCK_16 &&
+            (this->linearQuantScheme == LinearQuantScheme::NVFP4_W4A4 ||
+             this->linearQuantScheme == LinearQuantScheme::LEGACY_AUTO) &&
+            this->cudaData != nullptr) {
+            // NVFP4权重逐个上传、逐个重排、逐个释放原始CUDA表示。
+            // 因此显存峰值只包含当前权重的双份表示，而不是整模型的
+            // 原始权重与全部CUTLASS权重同时驻留。
+            FastllmCudaTryPrepackNvfp4W4A4Weight(*this);
+        }
+        if (device == DataDevice::CUDA && copyData &&
+            this->dataType == DataType::FP8_E4M3 &&
+            (this->linearQuantScheme == LinearQuantScheme::FP8_W8A8 ||
+             this->linearQuantScheme == LinearQuantScheme::LEGACY_AUTO) &&
+            this->weightType == WeightType::LINEAR &&
+            this->cudaData != nullptr) {
+            // 标准FP8已经是CUTLASS权重格式，不创建第二份权重；上传阶段
+            // 只记录Prepared，首次真实GEMM验证后再固定最终后端。
+            FastllmCudaTryPrepareFp8W8A8Weight(*this);
+        }
+        if (device == DataDevice::CUDA && copyData &&
+            this->dataType == DataType::FP8_E4M3 &&
+            this->linearQuantScheme ==
+                LinearQuantScheme::FP8_W8A8_BLOCK128 &&
+            this->weightType == WeightType::LINEAR &&
+            this->cudaData != nullptr) {
+            // Blockwise FP8权重上传后构建设备scale，并记录Prepared；首次
+            // 真实GEMM验证成功后固定CUTLASS后端。
+            FastllmCudaTryPrepareFp8W8A8Block128Weight(*this);
+        }
+#endif
     }
 
     // 临时移动到cuda 
@@ -3105,6 +3499,7 @@ namespace fastllm {
         } else if (this->dataType == DataType::INT4_GROUP32) {
             return DataType::INF_INT8_GROUP32;
         } else if (this->dataType == DataType::BFLOAT16 || 
+                    this->dataType == DataType::INT8_W8A8 ||
                     this->dataType == DataType::FP8_E4M3 ||
                     this->dataType == DataType::FP8_E4M3_BLOCK_128 ||
                     this->dataType == DataType::FP8_E4M3_PERCHANNEL) {
@@ -5425,93 +5820,106 @@ namespace fastllm {
     int PagedCacheManager::GetUnusedPageIndex(bool pick) {
         std::lock_guard<std::mutex> guard(this->pageIndexLocker);
 
-        // 尝试将 triePages 中已不在 Trie 中的 stale 条目迁移到 freePages
-        while (this->freePages.empty() && !this->triePages.empty()) {
-            int candidate = this->triePages.back();
-            auto it = this->pageToTrieNode.find(candidate);
-            if (it == this->pageToTrieNode.end()) {
-                // 页面已不在 Trie 中，迁移到 freePages
-                this->triePages.pop_back();
-                this->triePagesSet.erase(candidate);
-                this->freePages.push_back(candidate);
-                this->freePagesSet.insert(candidate);
-            } else {
-                break;
-            }
-        }
-
+        // 两个列表都没有可用页时，直接报错。
         if (this->freePages.empty() && this->triePages.empty()) {
             ErrorInFastLLM("PagedCacheManager::GetUnusedPageIndex: no page can be use.\n");
         }
 
-        int pageIndex;
+        // 优先使用已有空闲页；pick=false 时只查看，不领走。
         if (!this->freePages.empty()) {
-            pageIndex = this->freePages.back();
+            int pageIndex = this->freePages.back();
             if (pick) {
                 this->freePages.pop_back();
                 this->freePagesSet.erase(pageIndex);
                 this->pageRefCount[pageIndex] = 1;
             }
-        } else {
-            if (!pick) {
-                pageIndex = this->triePages.back();
-                return pageIndex;
-            }
+            return pageIndex;
+        }
 
-            // pick 模式：从 triePages 中淘汰，优先选叶子节点
-            pageIndex = -1;
-            for (int i = (int)this->triePages.size() - 1; i >= 0; i--) {
-                int candidate = this->triePages[i];
-                auto it = this->pageToTrieNode.find(candidate);
-                if (it == this->pageToTrieNode.end()) {
-                    // stale 条目：页面已不在 Trie 中，直接用
-                    pageIndex = candidate;
-                    this->triePages[i] = this->triePages.back();
-                    this->triePages.pop_back();
-                    this->triePagesSet.erase(pageIndex);
-                    break;
-                }
-                if (it->second->children.empty()) {
-                    pageIndex = candidate;
-                    this->triePages[i] = this->triePages.back();
-                    this->triePages.pop_back();
-                    this->triePagesSet.erase(pageIndex);
-                    RemoveTrieLeaf(it->second, pageIndex, this->pageToTrieNode);
-                    break;
-                }
+        // freePages 已为空：只检查 triePages 末尾，最多迁移一个失效页。
+        // 末尾仍有树记录就不迁移，不在这里扫描整个列表。
+        if (!this->triePages.empty()) {
+            int candidate = this->triePages.back();
+            auto it = this->pageToTrieNode.find(candidate);
+            if (it == this->pageToTrieNode.end()) {
+                this->triePages.pop_back();
+                this->triePagesSet.erase(candidate);
+                this->freePages.push_back(candidate);
+                this->freePagesSet.insert(candidate);
             }
+        }
 
-            if (pageIndex == -1) {
-                // 没有叶子可淘汰，选一个非叶子，递归清理其整个子树
-                pageIndex = this->triePages.back();
+        // 如果迁移得到空闲页，就使用该页。
+        if (!this->freePages.empty()) {
+            int pageIndex = this->freePages.back();
+            if (pick) {
+                this->freePages.pop_back();
+                this->freePagesSet.erase(pageIndex);
+                this->pageRefCount[pageIndex] = 1;
+            }
+            return pageIndex;
+        }
+
+        // 仍无空闲页，沿用原来的前缀缓存选页和清理逻辑。
+        int pageIndex;
+        if (!pick) {
+            pageIndex = this->triePages.back();
+            return pageIndex;
+        }
+
+        // pick 模式：从 triePages 中淘汰，优先选叶子节点
+        pageIndex = -1;
+        for (int i = (int)this->triePages.size() - 1; i >= 0; i--) {
+            int candidate = this->triePages[i];
+            auto it = this->pageToTrieNode.find(candidate);
+            if (it == this->pageToTrieNode.end()) {
+                // stale 条目：页面已不在 Trie 中，直接用
+                pageIndex = candidate;
+                this->triePages[i] = this->triePages.back();
                 this->triePages.pop_back();
                 this->triePagesSet.erase(pageIndex);
-                auto it = this->pageToTrieNode.find(pageIndex);
-                if (it != this->pageToTrieNode.end()) {
-                    CacheTrieNode *node = it->second;
-                    for (auto &childKv : node->children) {
-                        EvictTrieSubtree(childKv.second);
-                    }
-                    node->children.clear();
-                    if (node->parent) {
-                        node->parent->children.erase(node->edgeHash);
-                    }
-                    this->pageToTrieNode.erase(it);
-                    delete node;
-                }
-                // EvictTrieSubtree 可能将子树页面从 triePages 迁移到 freePages，
-                // 过滤 triePages 中已不在 triePagesSet 的脏条目
-                int w = 0;
-                for (int i = 0; i < (int)this->triePages.size(); i++) {
-                    if (this->triePagesSet.count(this->triePages[i])) {
-                        this->triePages[w++] = this->triePages[i];
-                    }
-                }
-                this->triePages.resize(w);
+                break;
             }
-
-            this->pageRefCount[pageIndex] = 1;
+            if (it->second->children.empty()) {
+                pageIndex = candidate;
+                this->triePages[i] = this->triePages.back();
+                this->triePages.pop_back();
+                this->triePagesSet.erase(pageIndex);
+                RemoveTrieLeaf(it->second, pageIndex, this->pageToTrieNode);
+                break;
+            }
         }
+
+        if (pageIndex == -1) {
+            // 没有叶子可淘汰，选一个非叶子，递归清理其整个子树
+            pageIndex = this->triePages.back();
+            this->triePages.pop_back();
+            this->triePagesSet.erase(pageIndex);
+            auto it = this->pageToTrieNode.find(pageIndex);
+            if (it != this->pageToTrieNode.end()) {
+                CacheTrieNode *node = it->second;
+                for (auto &childKv : node->children) {
+                    EvictTrieSubtree(childKv.second);
+                }
+                node->children.clear();
+                if (node->parent) {
+                    node->parent->children.erase(node->edgeHash);
+                }
+                this->pageToTrieNode.erase(it);
+                delete node;
+            }
+            // EvictTrieSubtree 可能将子树页面从 triePages 迁移到 freePages，
+            // 过滤 triePages 中已不在 triePagesSet 的脏条目
+            int w = 0;
+            for (int i = 0; i < (int)this->triePages.size(); i++) {
+                if (this->triePagesSet.count(this->triePages[i])) {
+                    this->triePages[w++] = this->triePages[i];
+                }
+            }
+            this->triePages.resize(w);
+        }
+
+        this->pageRefCount[pageIndex] = 1;
         return pageIndex;
     }
 

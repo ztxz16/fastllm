@@ -70,6 +70,11 @@ namespace fastllm {
         }
     }
 
+    ModelAttentionCapabilities MiniCpmModel::GetModelAttentionCapabilities() const {
+        return {"minicpm", ModelKVCacheLayout::CONTINUOUS,
+                true, false, false, false};
+    }
+
     int MiniCpmModel::Forward(const fastllm::Data &inputIds, const fastllm::Data &attentionMask,
                             const fastllm::Data &positionIds, std::vector<std::pair<Data, Data>> &pastKeyValues,
                             const GenerationConfig &generationConfig, const LastTokensManager &lastTokens,

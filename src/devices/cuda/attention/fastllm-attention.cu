@@ -106,7 +106,8 @@ __global__ void HalfFC(
     for (int i = 0; i < 4; i++) {
         #pragma unroll
         for (int j = 0; j < 4; j++) {
-            wmma::store_matrix_sync(&cur[(wrap0 * 64 + i * 16)][(wrap1 * 64 + j * 16)], frag_c[i][j], BK, wmma::mem_row_major);
+            wmma::store_matrix_sync(
+                &cur[(wrap0 * 64 + i * 16)][(wrap1 * 64 + j * 16)], frag_c[i][j], BK, wmma::mem_row_major);
         }
     }
     __syncthreads();
@@ -173,7 +174,8 @@ __global__ void FastllmHalfMatMulTransBBatchKernel(uint8_t** pointer, float alph
 
                 #pragma unroll
                 for (int j = 0; j < 8; j++) {
-                    wmma::load_matrix_sync(frag_b[j], &input1[(stK + wid * 32) * input1Stride + j * 16], input1Stride);
+                    wmma::load_matrix_sync(
+                        frag_b[j], &input1[(stK + wid * 32) * input1Stride + j * 16], input1Stride);
                 }
                 __syncthreads();
 
@@ -395,7 +397,8 @@ __global__ void FastllmHalfMatMulKernel(uint8_t** pointer, float alpha) {
 
                 #pragma unroll
                 for (int j = 0; j < 8; j++) {
-                    wmma::load_matrix_sync(frag_b[j], &input1[(stM + 16 * j) * input1Stride + wid * 32], input1Stride);
+                    wmma::load_matrix_sync(
+                        frag_b[j], &input1[(stM + 16 * j) * input1Stride + wid * 32], input1Stride);
                 }
                 __syncthreads();
 
@@ -634,7 +637,10 @@ __global__ void InitBlockAtten(float *sum0, float *max0, float *sum1, float *max
 }
 
 template <int THREAD_PER_BLOCK>
-__global__ void AttnBlockUpdate(half *data, int n, int m, float *lastMax, float *lastSum, float *curMax, float *curSum) {
+__global__ void AttnBlockUpdate(
+    half *data, int n, int m,
+    float *lastMax, float *lastSum,
+    float *curMax, float *curSum) {
     __shared__ float scale;
     unsigned int tid = threadIdx.x;
     unsigned int bid = blockIdx.x;
@@ -655,7 +661,9 @@ __global__ void AttnBlockUpdate(half *data, int n, int m, float *lastMax, float 
 }
 
 template <int THREAD_PER_BLOCK>
-__device__ void FastllmSoftmaxKernelInner1Func(float *input, float *output, int channels, float *maxp, float *sump) {
+__device__ void FastllmSoftmaxKernelInner1Func(
+    float *input, float *output, int channels,
+    float *maxp, float *sump) {
     __shared__ float sdata[THREAD_PER_BLOCK];
     __shared__ float maxV;
 
@@ -728,7 +736,9 @@ __device__ half FastllmHalfMaxFunc(const __half a, const __half b) {
 }
 
 template <int THREAD_PER_BLOCK>
-__device__ void FastllmSoftmaxKernelInner1Func(half *input, half *output, int channels, float *maxp, float *sump) {
+__device__ void FastllmSoftmaxKernelInner1Func(
+    half *input, half *output, int channels,
+    float *maxp, float *sump) {
     __shared__ float sdata[THREAD_PER_BLOCK];
 
     // 1. 每个线程计算一部分
@@ -793,31 +803,44 @@ __device__ void FastllmSoftmaxKernelInner1Func(half *input, half *output, int ch
 template <int THREAD_PER_BLOCK>
 __global__ void FastllmSoftmaxKernelInner1(float* input, float *output, int outer, int channels) {
     int o = blockIdx.x;
-    FastllmSoftmaxKernelInner1Func <THREAD_PER_BLOCK> (input + o * channels, output + o * channels, channels, nullptr, nullptr);
+    FastllmSoftmaxKernelInner1Func <THREAD_PER_BLOCK> (
+        input + o * channels, output + o * channels, channels, nullptr, nullptr);
 }
 
 template <int THREAD_PER_BLOCK>
 __global__ void FastllmSoftmaxKernelInner1(half* input, half *output, int outer, int channels) {
     int o = blockIdx.x;
-    FastllmSoftmaxKernelInner1Func <THREAD_PER_BLOCK> (input + o * channels, output + o * channels, channels, nullptr, nullptr);
+    FastllmSoftmaxKernelInner1Func <THREAD_PER_BLOCK> (
+        input + o * channels, output + o * channels, channels, nullptr, nullptr);
 }
 
 template <int THREAD_PER_BLOCK>
-__global__ void FastllmSoftmaxKernelInner1(half* input, half *output, int outer, int channels, float *maxp, float *sump) {
+__global__ void FastllmSoftmaxKernelInner1(
+    half* input, half *output,
+    int outer, int channels,
+    float *maxp, float *sump) {
     int o = blockIdx.x;
-    FastllmSoftmaxKernelInner1Func <THREAD_PER_BLOCK> (input + o * channels, output + o * channels, channels, maxp + o, sump + o);
+    FastllmSoftmaxKernelInner1Func <THREAD_PER_BLOCK> (
+        input + o * channels, output + o * channels, channels, maxp + o, sump + o);
 }
 
 template <int THREAD_PER_BLOCK, typename T>
-__global__ void FastllmSoftmaxKernelInner1WithCausalMask(T* input, T *output, int outer, int channels, int base) {
+__global__ void FastllmSoftmaxKernelInner1WithCausalMask(
+    T* input, T *output,
+    int outer, int channels, int base) {
     int o = blockIdx.x;
-    FastllmSoftmaxKernelInner1Func <THREAD_PER_BLOCK> (input + o * channels, output + o * channels, o + base + 1, nullptr, nullptr);
+    FastllmSoftmaxKernelInner1Func <THREAD_PER_BLOCK> (
+        input + o * channels, output + o * channels, o + base + 1, nullptr, nullptr);
 }
 
 template <int THREAD_PER_BLOCK, typename T>
-__global__ void FastllmSoftmaxKernelInner1WithCausalMask(T* input, T *output, int outer, int channels, int base, float *maxp, float *sump) {
+__global__ void FastllmSoftmaxKernelInner1WithCausalMask(
+    T* input, T *output,
+    int outer, int channels, int base,
+    float *maxp, float *sump) {
     int o = blockIdx.x;
-    FastllmSoftmaxKernelInner1Func <THREAD_PER_BLOCK> (input + o * channels, output + o * channels, min(channels, o + base + 1), maxp + o, sump + o);
+    FastllmSoftmaxKernelInner1Func <THREAD_PER_BLOCK> (
+        input + o * channels, output + o * channels, min(channels, o + base + 1), maxp + o, sump + o);
 }
 
 template <typename T, int THREAD_PER_BLOCK>
@@ -831,8 +854,10 @@ template <typename T, int THREAD_PER_BLOCK>
 __global__ void FastllmSoftmaxKernelBatchInner1(uint8_t** pointer, int outer) {
     int o = blockIdx.x;
     int channels = (int)((size_t)pointer[o / outer * 2 + 1]);
-    FastllmSoftmaxKernelInner1Func <THREAD_PER_BLOCK> ((T*)pointer[o / outer * 2] + (o % outer) * channels, (T*)pointer[o / outer * 2] + (o % outer) * channels,
-                                                       channels, nullptr, nullptr);
+    FastllmSoftmaxKernelInner1Func <THREAD_PER_BLOCK> (
+        (T*)pointer[o / outer * 2] + (o % outer) * channels,
+        (T*)pointer[o / outer * 2] + (o % outer) * channels,
+        channels, nullptr, nullptr);
 }
 
 bool FastllmCudaSoftmax(const fastllm::Data &input, fastllm::Data &output, int axis) {
@@ -857,13 +882,17 @@ bool FastllmCudaSoftmax(const fastllm::Data &input, fastllm::Data &output, int a
             }
         } else {
             if (channels < 8) {
-                FastllmSoftmaxKernelInner1 <1> <<< outer, 1 >>> ((half*)cudaInput, (half*)cudaOutput, outer, channels);
+                FastllmSoftmaxKernelInner1 <1> <<< outer, 1 >>> (
+                    (half*)cudaInput, (half*)cudaOutput, outer, channels);
             } else if (channels < 64) {
-                FastllmSoftmaxKernelInner1 <8> <<< outer, 8 >>> ((half*)cudaInput, (half*)cudaOutput, outer, channels);
+                FastllmSoftmaxKernelInner1 <8> <<< outer, 8 >>> (
+                    (half*)cudaInput, (half*)cudaOutput, outer, channels);
             } else if (channels < 512) {
-                FastllmSoftmaxKernelInner1 <64> <<< outer, 64 >>> ((half*)cudaInput, (half*)cudaOutput, outer, channels);
+                FastllmSoftmaxKernelInner1 <64> <<< outer, 64 >>> (
+                    (half*)cudaInput, (half*)cudaOutput, outer, channels);
             } else {
-                FastllmSoftmaxKernelInner1 <256> <<< outer, 256 >>> ((half*)cudaInput, (half*)cudaOutput, outer, channels);
+                FastllmSoftmaxKernelInner1 <256> <<< outer, 256 >>> (
+                    (half*)cudaInput, (half*)cudaOutput, outer, channels);
             }
         }
     } else {
@@ -925,8 +954,10 @@ bool FastllmCudaSoftmaxBatch(fastllm::Data **inputs, fastllm::Data **outputs, in
 
 extern bool FastllmCudaPermute(fastllm::Data &input, const std::vector<int> &axis);
 
-bool FastllmCudaHalfAttention(const fastllm::Data &q, const fastllm::Data &k, const fastllm::Data &v,
-                              const fastllm::Data &mask, const fastllm::Data &output, int group, float scale, int maskType) {
+bool FastllmCudaHalfAttention(
+    const fastllm::Data &q, const fastllm::Data &k, const fastllm::Data &v,
+    const fastllm::Data &mask, const fastllm::Data &output,
+    int group, float scale, int maskType) {
 #ifdef FASTLLM_ENABLE_FLASHINFER
     using namespace flashinfer;
 #endif
@@ -1087,10 +1118,14 @@ mask_mode = MaskMode::kCausal;
                 
                 // 调用 FlashInfer prefill 接口，根据 mask_mode 选择不同的 variant
                 if (mask_mode == MaskMode::kCausal) {
-                    status = SinglePrefillWithKVCacheDispatched<128, 128, PosEncodingMode::kNone, false, MaskMode::kCausal, DefaultAttention<false, false, false, false>>(
+                    status = SinglePrefillWithKVCacheDispatched<
+                        128, 128, PosEncodingMode::kNone, false, MaskMode::kCausal,
+                        DefaultAttention<false, false, false, false>>(
                         params, tmp, stream);
                 } else {
-                    status = SinglePrefillWithKVCacheDispatched<128, 128, PosEncodingMode::kNone, false, MaskMode::kNone, DefaultAttention<false, false, false, false>>(
+                    status = SinglePrefillWithKVCacheDispatched<
+                        128, 128, PosEncodingMode::kNone, false, MaskMode::kNone,
+                        DefaultAttention<false, false, false, false>>(
                         params, tmp, stream);
                 }
             }
@@ -1147,7 +1182,8 @@ FastllmCudaPermute(*((fastllm::Data*)&output), {1, 0, 2});
                     float *currentMax = (float*)FastllmCudaMalloc(alignQ1 * sizeof(float));
 
                     int threadPerBlock = std::min(256, alignQ1);
-                    InitBlockAtten <<< (alignQ1 - 1) / threadPerBlock + 1, threadPerBlock>>> (lastSum, lastMax, currentSum, currentMax, alignQ1);
+                    InitBlockAtten <<< (alignQ1 - 1) / threadPerBlock + 1, threadPerBlock>>> (
+                        lastSum, lastMax, currentSum, currentMax, alignQ1);
 
                     int part = 8192;
                     for (int st = 0; st < alignK1; st += part) {
@@ -1160,9 +1196,11 @@ FastllmCudaPermute(*((fastllm::Data*)&output), {1, 0, 2});
                                             &beta, 
                                             qk, len);
                         CausalMask<256, half> <<<q1, 256>>>(qk, __float2half_rn(0.0f), alignQ1, len, k1 - q1 - st);
-                        FastllmSoftmaxKernelInner1WithCausalMask<256> <<< q1, 256 >>>(qk, qk, alignQ1, len, k1 - q1 - st, currentMax, currentSum);
+                        FastllmSoftmaxKernelInner1WithCausalMask<256> <<< q1, 256 >>>(
+                            qk, qk, alignQ1, len, k1 - q1 - st, currentMax, currentSum);
                         if (st > 0) {
-                            AttnBlockUpdate <128> <<< alignQ1, 128 >>> (od + i * v2 * q1, alignQ1, v2, lastMax, lastSum, currentMax, currentSum);
+                            AttnBlockUpdate <128> <<< alignQ1, 128 >>> (
+                                od + i * v2 * q1, alignQ1, v2, lastMax, lastSum, currentMax, currentSum);
                         } else {
                             cudaMemcpy(lastMax, currentMax, alignQ1 * sizeof(float), cudaMemcpyDeviceToDevice);
                             cudaMemcpy(lastSum, currentSum, alignQ1 * sizeof(float), cudaMemcpyDeviceToDevice);
@@ -1182,7 +1220,9 @@ FastllmCudaPermute(*((fastllm::Data*)&output), {1, 0, 2});
                     FastllmCudaFree(currentSum);
                     FastllmCudaFree(currentMax);
                 } else {
-                    GpuQK(qd + i * q.Count(1), kd + (i / group) * k.Count(1), qk, alignQ1, alignK1, q2, scale, k1 - q1);
+                    GpuQK(
+                        qd + i * q.Count(1), kd + (i / group) * k.Count(1), qk, alignQ1, alignK1, q2, scale,
+                        k1 - q1);
                     FastllmSoftmaxKernelInner1WithCausalMask<128> <<< q1, 128 >>>(qk, qk, q1, alignK1, k1 - q1);
                     status = cublasHgemmStridedBatched(fastllmCublasHandle,
                                                 CUBLAS_OP_N, CUBLAS_OP_N,
@@ -1212,7 +1252,8 @@ FastllmCudaPermute(*((fastllm::Data*)&output), {1, 0, 2});
                     FastllmSoftmaxKernelInner1WithCausalMask<128> <<< q1, 128 >>>(qk, qk, q1, k1, k1 - q1);
                 } else {
                     if (maskd != nullptr) {
-                        SimpleMask<256> <<< (q1 * k1 / 256) + 1, 256>>>(qk, maskd + (i / (q0 / batch)) * maskStride, __float2half_rn(-10000), q1 * k1);
+                        SimpleMask<256> <<< (q1 * k1 / 256) + 1, 256>>>(
+                            qk, maskd + (i / (q0 / batch)) * maskStride, __float2half_rn(-10000), q1 * k1);
                     }
 
                     int outer = q1;
@@ -1283,7 +1324,8 @@ printf("n = %d, m = %d, k = %d, spend %f s, gops = %f\n", n, m, k, spend, gops);
             // qk 物理布局为 [q0, q1, k1]，对每个 head 单独应用因果 mask。
             // base=k1-q1 使 query 行 r 可见 key [0, k1-q1+r]（兼容带历史上下文的分块 prefill）。
             for (int h = 0; h < q0; h++) {
-                CausalMask<256, half> <<< q1, 256 >>>(qk + (size_t)h * q1 * k1, __float2half_rn(-10000.0f), q1, k1, k1 - q1);
+                CausalMask<256, half> <<< q1, 256 >>>(
+                    qk + (size_t)h * q1 * k1, __float2half_rn(-10000.0f), q1, k1, k1 - q1);
             }
         }
 
@@ -1319,8 +1361,10 @@ printf("n = %d, m = %d, k = %d, spend %f s, gops = %f\n", n, m, k, spend, gops);
     return true;
 }
 
-bool FastllmCudaAttention(const fastllm::Data &q, const fastllm::Data &k, const fastllm::Data &v,
-                          const fastllm::Data &mask, const fastllm::Data &output, int group, float scale, int maskType) {
+bool FastllmCudaAttention(
+    const fastllm::Data &q, const fastllm::Data &k, const fastllm::Data &v,
+    const fastllm::Data &mask, const fastllm::Data &output,
+    int group, float scale, int maskType) {
     int q0 = q.dims[0], q1 = q.dims[1], q2 = q.dims[2], k0 = k.dims[0], k1 = k.dims[1], v2 = v.dims[2];
     float *qd = (float*)q.cudaData;
     float *kd = (float*)k.cudaData;
@@ -1357,7 +1401,8 @@ bool FastllmCudaAttention(const fastllm::Data &q, const fastllm::Data &k, const 
                 FastllmSoftmaxKernelInner1WithCausalMask<128> <<< q1, 128 >>>(qk, qk, q1, k1, k1 - q1);
             } else {
                 if (maskd) {
-                    SimpleMask<256> <<< (q1 * k1 / 256) + 1, 256>>>(qk, maskd + (i / (q0 / batch)) * maskStride, -10000, q1 * k1);
+                    SimpleMask<256> <<< (q1 * k1 / 256) + 1, 256>>>(
+                        qk, maskd + (i / (q0 / batch)) * maskStride, -10000, q1 * k1);
                 }
                 int outer = q1;
                 if (k1 < 8) {
@@ -1458,8 +1503,10 @@ bool FastllmCudaAttention(const fastllm::Data &q, const fastllm::Data &k, const 
 }
 
 template <typename T>
-bool DoFastllmCudaAttentionBatch(fastllm::Data **q, fastllm::Data **k, fastllm::Data **v,
-                               fastllm::Data **mask, fastllm::Data **output, int group, float scale, int batch) {
+bool DoFastllmCudaAttentionBatch(
+    fastllm::Data **q, fastllm::Data **k, fastllm::Data **v,
+    fastllm::Data **mask, fastllm::Data **output,
+    int group, float scale, int batch) {
     if (false) {
         half beta = __float2half_rn(0.0f), one = __float2half_rn(1.0f), hscale = __float2half_rn(scale);
         int q0 = q[0]->dims[0], q1 = q[0]->dims[1], q2 = q[0]->dims[2], k0 = k[0]->dims[0], k1 = k[0]->dims[1], v2 = v[0]->dims[2];
@@ -1488,7 +1535,9 @@ bool DoFastllmCudaAttentionBatch(fastllm::Data **q, fastllm::Data **k, fastllm::
             widths.push_back(v[i]->dims[1] * v2 * sizeof(half));
             heights.push_back(k0);
         }
-        FastllmCudaMemcpy2DDeviceToDeviceBatch(dsts.data(), dpitchs.data(), srcs.data(), spitchs.data(), widths.data(), heights.data(), dsts.size());
+        FastllmCudaMemcpy2DDeviceToDeviceBatch(
+            dsts.data(), dpitchs.data(), srcs.data(), spitchs.data(), widths.data(), heights.data(),
+            dsts.size());
 /*
         for (int i = 0; i < batch; i++) {
             cudaMemcpy2D(
@@ -1648,8 +1697,10 @@ bool DoFastllmCudaAttentionBatch(fastllm::Data **q, fastllm::Data **k, fastllm::
     return true;
 }
 
-bool FastllmCudaAttentionBatch(fastllm::Data **q, fastllm::Data **k, fastllm::Data **v,
-                               fastllm::Data **mask, fastllm::Data **output, int group, float scale, int batch) {
+bool FastllmCudaAttentionBatch(
+    fastllm::Data **q, fastllm::Data **k, fastllm::Data **v,
+    fastllm::Data **mask, fastllm::Data **output,
+    int group, float scale, int batch) {
     if (q[0]->dataType == fastllm::DataType::FLOAT32) {
         return DoFastllmCudaAttentionBatch <float> (q, k, v, mask, output, group, scale, batch);
     } else if (q[0]->dataType == fastllm::DataType::FLOAT16) {
@@ -1670,16 +1721,20 @@ bool FastllmCudaAttentionMask(fastllm::Data &input, const fastllm::Data &mask, f
         FastllmAttentionMaskKernel <256> <<< n * m, 256>>>(cudaData, maskData, maskValue,
                                                        n, m, spatial);
     } else {
-        FastllmAttentionMaskKernel <256> <<< n * m, 256>>>((half*)cudaData, (half*)maskData, __float2half(maskValue),
-                                                        n, m, spatial);
+        FastllmAttentionMaskKernel <256> <<< n * m, 256>>>(
+            (half*)cudaData, (half*)maskData, __float2half(maskValue),
+            n, m, spatial);
     }
     FastllmCudaFinishInput(mask, maskData);
     FastllmCudaFinishOutput(input, cudaData);
     return true;
 }
 
-bool FastllmCudaMLA(const fastllm::Data &qNope, const fastllm::Data &qPe, const fastllm::Data &kvCache, const fastllm::Data &peCache, 
-    fastllm::Data &ss, fastllm::Data &output, float softmaxScale) {
+bool FastllmCudaMLA(
+    const fastllm::Data &qNope, const fastllm::Data &qPe,
+    const fastllm::Data &kvCache, const fastllm::Data &peCache,
+    fastllm::Data &ss, fastllm::Data &output,
+    float softmaxScale) {
     int b = qPe.dims[0], s = qPe.dims[1], h = qPe.dims[2], c = qNope.dims.back(), t = kvCache.dims[1], r = qPe.dims[3];
     auto fastllmCublasHandle = getFastllmCublasHandle();
     cublasStatus_t status;
@@ -1924,11 +1979,13 @@ void FastllmCudaPagedCacheCopy(
             FastllmCudaPagedCacheCopyTyped<__nv_bfloat16, half>(pagedData, pageIdx, pageLen, numHeads, headDim,
                                                                 inputData, seqLen, inputOffset, copyLen, pageOffset);
         } else if (dstType == fastllm::DataType::BFLOAT16) {
-            FastllmCudaPagedCacheCopyTyped<__nv_bfloat16, __nv_bfloat16>(pagedData, pageIdx, pageLen, numHeads, headDim,
-                                                                         inputData, seqLen, inputOffset, copyLen, pageOffset);
+            FastllmCudaPagedCacheCopyTyped<__nv_bfloat16, __nv_bfloat16>(
+                pagedData, pageIdx, pageLen, numHeads, headDim,
+                inputData, seqLen, inputOffset, copyLen, pageOffset);
         } else if (dstType == fastllm::DataType::FP8_E4M3) {
-            FastllmCudaPagedCacheCopyTyped<__nv_bfloat16, __nv_fp8_e4m3>(pagedData, pageIdx, pageLen, numHeads, headDim,
-                                                                         inputData, seqLen, inputOffset, copyLen, pageOffset);
+            FastllmCudaPagedCacheCopyTyped<__nv_bfloat16, __nv_fp8_e4m3>(
+                pagedData, pageIdx, pageLen, numHeads, headDim,
+                inputData, seqLen, inputOffset, copyLen, pageOffset);
         } else {
             fastllm::ErrorInFastLLM("FastllmCudaPagedCacheCopy: unsupported dstType.\n");
         }
@@ -2271,10 +2328,12 @@ void FastllmCudaPagedCacheCopyBatch(
             FastllmCudaPagedCacheCopyBatchTyped<__nv_bfloat16, half>(pagedData, pageIdxArray, pageOffsetArray,
                 pageLen, batch, numHeads, headDim, inputData, sync);
         } else if (dstType == fastllm::DataType::BFLOAT16) {
-            FastllmCudaPagedCacheCopyBatchTyped<__nv_bfloat16, __nv_bfloat16>(pagedData, pageIdxArray, pageOffsetArray,
+            FastllmCudaPagedCacheCopyBatchTyped<__nv_bfloat16, __nv_bfloat16>(
+                pagedData, pageIdxArray, pageOffsetArray,
                 pageLen, batch, numHeads, headDim, inputData, sync);
         } else if (dstType == fastllm::DataType::FP8_E4M3) {
-            FastllmCudaPagedCacheCopyBatchTyped<__nv_bfloat16, __nv_fp8_e4m3>(pagedData, pageIdxArray, pageOffsetArray,
+            FastllmCudaPagedCacheCopyBatchTyped<__nv_bfloat16, __nv_fp8_e4m3>(
+                pagedData, pageIdxArray, pageOffsetArray,
                 pageLen, batch, numHeads, headDim, inputData, sync);
         } else {
             fastllm::ErrorInFastLLM("FastllmCudaPagedCacheCopyBatch: unsupported dstType.\n");
@@ -2485,8 +2544,9 @@ void FastllmReleaseDequantScratch(void *ptr, bool own) {
 
 #ifdef FASTLLM_ENABLE_FLASHINFER
 template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM, typename DType, typename Params>
-static cudaError_t FastllmDispatchPagedPrefillKernel(Params &prefill_params, DType *tmp_v, float *tmp_s,
-                                                     bool enable_pdl, cudaStream_t stream) {
+static cudaError_t FastllmDispatchPagedPrefillKernel(
+    Params &prefill_params, DType *tmp_v, float *tmp_s,
+    bool enable_pdl, cudaStream_t stream) {
     return flashinfer::BatchPrefillWithPagedKVCacheDispatched<
         CTA_TILE_Q, HEAD_DIM, HEAD_DIM,
         flashinfer::PosEncodingMode::kNone, /*USE_FP16_QK_REDUCTION=*/false,
@@ -2495,16 +2555,21 @@ static cudaError_t FastllmDispatchPagedPrefillKernel(Params &prefill_params, DTy
 }
 
 template <uint32_t HEAD_DIM, typename DType, typename Params>
-static cudaError_t FastllmDispatchPagedPrefillByCtaTile(long cta_tile_q, Params &prefill_params, DType *tmp_v,
-                                                        float *tmp_s, bool enable_pdl, cudaStream_t stream,
-                                                        const char *op_name) {
+static cudaError_t FastllmDispatchPagedPrefillByCtaTile(
+    long cta_tile_q, Params &prefill_params,
+    DType *tmp_v, float *tmp_s,
+    bool enable_pdl, cudaStream_t stream,
+    const char *op_name) {
     switch (cta_tile_q) {
         case 16:
-            return FastllmDispatchPagedPrefillKernel<16, HEAD_DIM>(prefill_params, tmp_v, tmp_s, enable_pdl, stream);
+            return FastllmDispatchPagedPrefillKernel<16, HEAD_DIM>(
+                prefill_params, tmp_v, tmp_s, enable_pdl, stream);
         case 64:
-            return FastllmDispatchPagedPrefillKernel<64, HEAD_DIM>(prefill_params, tmp_v, tmp_s, enable_pdl, stream);
+            return FastllmDispatchPagedPrefillKernel<64, HEAD_DIM>(
+                prefill_params, tmp_v, tmp_s, enable_pdl, stream);
         case 128:
-            return FastllmDispatchPagedPrefillKernel<128, HEAD_DIM>(prefill_params, tmp_v, tmp_s, enable_pdl, stream);
+            return FastllmDispatchPagedPrefillKernel<128, HEAD_DIM>(
+                prefill_params, tmp_v, tmp_s, enable_pdl, stream);
         default:
             printf("%s: Unsupported cta_tile_q: %ld\n", op_name, cta_tile_q);
             return cudaErrorNotSupported;
@@ -2512,9 +2577,11 @@ static cudaError_t FastllmDispatchPagedPrefillByCtaTile(long cta_tile_q, Params 
 }
 
 template <typename DType, typename Params>
-static cudaError_t FastllmDispatchPagedPrefillByHeadDim(uint32_t head_dim, long cta_tile_q, Params &prefill_params,
-                                                        DType *tmp_v, float *tmp_s, bool enable_pdl,
-                                                        cudaStream_t stream, const char *op_name) {
+static cudaError_t FastllmDispatchPagedPrefillByHeadDim(
+    uint32_t head_dim, long cta_tile_q, Params &prefill_params,
+    DType *tmp_v, float *tmp_s,
+    bool enable_pdl, cudaStream_t stream,
+    const char *op_name) {
     switch (head_dim) {
         // case 64:
         //     return FastllmDispatchPagedPrefillByCtaTile<64>(cta_tile_q, prefill_params, tmp_v, tmp_s, enable_pdl, stream, op_name);
@@ -2525,13 +2592,15 @@ static cudaError_t FastllmDispatchPagedPrefillByHeadDim(uint32_t head_dim, long 
         // case 112:
         //    return FastllmDispatchPagedPrefillByCtaTile<112>(cta_tile_q, prefill_params, tmp_v, tmp_s, enable_pdl, stream, op_name);
         case 128:
-            return FastllmDispatchPagedPrefillByCtaTile<128>(cta_tile_q, prefill_params, tmp_v, tmp_s, enable_pdl, stream, op_name);
+            return FastllmDispatchPagedPrefillByCtaTile<128>(
+                cta_tile_q, prefill_params, tmp_v, tmp_s, enable_pdl, stream, op_name);
         // case 160:
         //    return FastllmDispatchPagedPrefillByCtaTile<160>(cta_tile_q, prefill_params, tmp_v, tmp_s, enable_pdl, stream, op_name);
         // case 192:
         //     return FastllmDispatchPagedPrefillByCtaTile<192>(cta_tile_q, prefill_params, tmp_v, tmp_s, enable_pdl, stream, op_name);
         case 256:
-            return FastllmDispatchPagedPrefillByCtaTile<256>(cta_tile_q, prefill_params, tmp_v, tmp_s, enable_pdl, stream, op_name);
+            return FastllmDispatchPagedPrefillByCtaTile<256>(
+                cta_tile_q, prefill_params, tmp_v, tmp_s, enable_pdl, stream, op_name);
         // case 512:
         //    return FastllmDispatchPagedPrefillByCtaTile<512>(cta_tile_q, prefill_params, tmp_v, tmp_s, enable_pdl, stream, op_name);
         default:
@@ -2541,7 +2610,10 @@ static cudaError_t FastllmDispatchPagedPrefillByHeadDim(uint32_t head_dim, long 
 }
 #endif
 
-bool FastllmCudaHalfPagedAttention(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v, fastllm::Data &output, int group, float scale, bool inited) {
+bool FastllmCudaHalfPagedAttention(
+    fastllm::Data &q, fastllm::Data &k, fastllm::Data &v,
+    fastllm::Data &output,
+    int group, float scale, bool inited) {
 #ifndef FASTLLM_ENABLE_FLASHINFER
     return FastllmCudaHalfPagedAttentionFastllmFallback(q, k, v, output, group, scale);
 #else
@@ -3029,7 +3101,74 @@ void FastllmFlashInferAppendPointerKey(std::vector<uint32_t> &key,
 } // namespace
 #endif
 
-bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches, fastllm::Data &vCaches, fastllm::Data &qSizes, fastllm::Data &pageSizes, fastllm::Data &pageIndexs, fastllm::Data &lastPageLens, fastllm::Data &output, int group, float scale, int attentionType, bool inited, bool sync, bool enableCudaGraph, int flashInferCudaGraph, int windowLeft) {
+/**
+ * 使用分页KV Cache执行批量因果注意力，并管理FlashInfer执行计划的复用。
+ *
+ * 每个请求执行output = softmax(scale * Q * K^T + causal_mask) * V，
+ * group个Q头共享一组K/V头。本函数只读取已写入的KV页，不负责追加或分配KV页。
+ * FlashInfer不可用时调用FastLLM原生实现；滑动窗口不允许走该回退路径。
+ * FlashInfer路径为prefill和decode共用分页prefill接口，按设备、形状及元数据
+ * 缓存计划；CUDA Graph捕获前须准备计划，满足条件的decode计划在GPU上更新。
+ * 执行使用cudaStreamPerThread；sync控制末尾DeviceSync，但计划准备及首次
+ * 动态计划验证仍可能同步，不能将sync=false理解为整个函数绝不阻塞。
+ *
+ * 令B为请求数、T为所有请求的Query token总数、Hq=group*Hkv、D为头维度。
+ * FlashInfer按q.strides[1]索引token、q.strides[0]索引头，典型Q布局为
+ * [Hq, T, D]。调用方也存在第一维合并batch与头数的形状；入口对q.dims[0]
+ * 仅作Hq整除检查，不是完整布局验证，调用方必须保证stride与qSizes一致。
+ * 请求边界来自qSizes，而非q.dims[0]/Hq。物理KV页布局为
+ * [页容量, pageLen, Hkv, D]；FlashInfer当前要求Q/K/V头维度相等。
+ *
+ * @param q                   GPU上的FP16/BF16 Query；正常主流程形状为[Hq, T, D]。
+ *                            Hq是每个请求的Query头数，T是本次所有请求输入的token
+ *                            总数，D是每个头的维度。各请求沿T维依次拼接，由qSizes
+ *                            标明起止位置；例如请求长度为3和2时，形状为[Hq, 5, D]。
+ *                            普通decode每个请求输入1个token，此时T=B，形状为
+ *                            [Hq, B, D]。按q.strides[1]定位token、q.strides[0]定位头；
+ *                            数据在GPU执行完成前须保持有效。
+ * @param kCaches             K缓存描述，dims[0]为Hkv；pagedKVCacheData指向
+ *                            所有请求共用的物理页池，类型为q类型或FP8_E4M3。
+ * @param vCaches             V缓存描述，dims[2]为V头维度；物理页布局及类型须
+ *                            与K兼容，页索引与K共用。
+ * @param qSizes              INT32数组，记录每个请求的Query token在合并输入中的
+ *                            起止位置。例如3个请求本次分别输入3、2、1个token，
+ *                            数组就是[0, 3, 5, 6]，相邻两项表示一个请求的起点
+ *                            和终点（不含终点）。数组长度为请求数+1，最后一项
+ *                            为总token数。GPU读取cudaData来区分各请求；CPU读取
+ *                            cpuIntDatas来安排这些请求的计算任务。
+ * @param pageSizes           INT32数组，长度为B+1，记录各请求在pageIndexs中的
+ *                            起止位置（终点不含）。例如A用2页、B用1页，值为
+ *                            [0, 2, 3]，不是[2, 1]；首项为0，末项为页编号总数。
+ *                            GPU数据与cpuIntDatas须符合当前执行计划及Graph更新约定。
+ * @param pageIndexs          GPU INT32页编号数组，将各请求使用的页按token顺序
+ *                            依次拼接。例如A用页7、页3，B用页9，值为[7, 3, 9]；
+ *                            配合pageSizes=[0, 2, 3]，A取前两项，B取第三项。
+ * @param lastPageLens        GPU INT32数组，长度为B，记录每个请求末页实际存了
+ *                            多少个token。例如每页容量4，A共6个token、B共3个，
+ *                            值为[2, 3]。末页满时填pageLen，不是0。
+ * @param output              已分配GPU输出，类型与q一致；FlashInfer写入
+ *                            token优先的[T, Hq, D]结果，并交换原shape前两维。
+ * @param group               正整数Hq/Hkv，表示每组KV头共享的Q头数。
+ * @param scale               QK分数缩放系数，通常为1/sqrt(D)。
+ * @param attentionType       保留的接口参数，当前函数体不使用；仍执行因果注意力。
+ * @param inited              保留的接口参数，当前函数体不使用；计划按缓存键复用。
+ * @param sync                true时在返回前执行DeviceSync。
+ * @param enableCudaGraph     调用方是否启用CUDA Graph，参与动态decode计划选择。
+ * @param flashInferCudaGraph 小于0时跟随enableCudaGraph，0关闭FlashInfer
+ *                            Graph计划，非0启用；捕获期间不允许计划缓存缺失。
+ * @param windowLeft          小于0表示不限制左窗口；非负时限制左侧可见范围，
+ *                            该功能要求FlashInfer可用。
+ * @return true表示执行提交成功并完成所要求的同步，false表示显式校验失败或
+ *         原生实现返回失败，原因见日志。部分非法输入及FlashInfer执行错误
+ *         仍会打印日志后exit(0)，窗口回退限制通过断言报错，并非统一返回false。
+ */
+bool FastllmCudaHalfPagedAttentionBatch(
+    fastllm::Data &q, fastllm::Data &kCaches, fastllm::Data &vCaches,
+    fastllm::Data &qSizes, fastllm::Data &pageSizes, fastllm::Data &pageIndexs, fastllm::Data &lastPageLens,
+    fastllm::Data &output,
+    int group, float scale, int attentionType,
+    bool inited, bool sync, bool enableCudaGraph, int flashInferCudaGraph,
+    int windowLeft) {
 #ifndef FASTLLM_ENABLE_FLASHINFER
     fastllm::AssertInFastLLM(windowLeft < 0,
                              "Sliding-window paged attention requires FlashInfer.\n");
@@ -3616,8 +3755,11 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches
 #endif
 }
 
-bool FastllmCudaMLAPaged(const fastllm::Data &qNope, const fastllm::Data &qPe, const fastllm::Data &kvCachePaged, const fastllm::Data &peCachePaged,
-                         fastllm::Data &output, float softmaxScale, int requestedKvLen) {
+bool FastllmCudaMLAPaged(
+    const fastllm::Data &qNope, const fastllm::Data &qPe,
+    const fastllm::Data &kvCachePaged, const fastllm::Data &peCachePaged,
+    fastllm::Data &output,
+    float softmaxScale, int requestedKvLen) {
 #ifndef FASTLLM_ENABLE_FLASHINFER
     // FlashInfer 不可用（sm_70 以下），分页 MLA 暂无原生实现。
     return false;

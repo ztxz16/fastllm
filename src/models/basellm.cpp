@@ -13,6 +13,8 @@
 #include <exception>
 #include <set>
 #include <tuple>
+#include <cstdio>
+#include <cctype>
 
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
@@ -20,6 +22,37 @@
 
 namespace fastllm {
     namespace {
+        std::atomic<int> activeResponseContextCount(0);
+
+        /**
+         * 判断是否开启异步响应调度器的CPU分段耗时诊断。
+         *
+         * 开关默认关闭；开启后将批次准备细分为临时容器初始化、请求字典锁
+         * 等待、上下文扫描、分页占用查询、请求选择、LastTokens准备及Decode
+         * 分页检查，并继续记录模型Forward和结果入队耗时。诊断不改变调度、
+         * 分页、同步或后端选择语义。
+         *
+         * @return 环境变量FASTLLM_RESPONSE_CPU_TRACE为真值时返回true。
+         */
+        static bool ResponseCpuTraceEnabled() {
+            static const bool enabled = []() {
+                const char *env = std::getenv("FASTLLM_RESPONSE_CPU_TRACE");
+                if (env == nullptr) {
+                    return false;
+                }
+                std::string value(env);
+                std::transform(value.begin(), value.end(), value.begin(),
+                               [](unsigned char c) { return (char)std::tolower(c); });
+                return value == "1" || value == "true" || value == "on";
+            }();
+            return enabled;
+        }
+
+        template <typename Duration>
+        static long long ResponseCpuTraceMicroseconds(const Duration &duration) {
+            return std::chrono::duration_cast<std::chrono::microseconds>(duration).count();
+        }
+
         static bool NeedRepeatPenalty(const GenerationConfig &config) {
             float diff = config.repeat_penalty - 1.0f;
             return diff > 1e-6f || diff < -1e-6f;
@@ -391,6 +424,11 @@ namespace fastllm {
         return IsPureGpuMode(this);
     }
 
+    /** 返回进程中尚未销毁的异步推理请求上下文数量。 */
+    int GetActiveResponseContextCount() {
+        return activeResponseContextCount.load(std::memory_order_relaxed);
+    }
+
     int ResponseContextDict::CreateHandle() {
         locker.lock();
         int newId = 0;
@@ -398,6 +436,7 @@ namespace fastllm {
             newId++;
         }
         dicts[newId] = new ResponseContext();
+        activeResponseContextCount.fetch_add(1, std::memory_order_relaxed);
         locker.unlock();
         return newId;
     }
@@ -419,6 +458,8 @@ namespace fastllm {
     }
 
     ResponseContext::~ResponseContext() {
+        activeResponseContextCount.fetch_sub(1, std::memory_order_relaxed);
+
         // A tensor-parallel cache descriptor mirrors the first local shard's
         // page metadata without owning an additional page reference.  Release
         // the root and all local descriptors as one deduplicated unit before
@@ -473,13 +514,43 @@ namespace fastllm {
         model->TryRecordResponseContext(this);
     }
 
+    /**
+     * 按当前KV Cache布局记录已完成请求的Prefix Cache。
+     *
+     * Continuous Cache拥有独立且连续的Data缓冲区，继续保存到通用
+     * PastKVCacheManager。Paged Cache的Data仅保存页表描述符，实际K/V位于
+     * PagedCacheManager，因此只记录Page Trie，禁止把描述符当连续张量深拷贝。
+     *
+     * @param context 已完成或中止、准备记录Prefix Cache的请求上下文。
+     */
     void basellm::TryRecordResponseContext(ResponseContext *context) {
         if (context == nullptr) {
             return;
         }
+
         this->TryRecordHistoryCache(context->allTokens);
-        if (this->saveHistoryChat && this->UseGenericHistoryCache()) {
-            this->pastKVCacheManager.Record(context->allTokens, context->allTokens.size(), &context->pastKeyValues);
+        if (!this->saveHistoryChat) {
+            return;
+        }
+
+        bool hasPagedCache = false;
+        for (const auto &kv : context->pastKeyValues) {
+            if (kv.first.isPagedKVCache || kv.second.isPagedKVCache ||
+                kv.first.pagedKVCacheData != nullptr ||
+                kv.second.pagedKVCacheData != nullptr) {
+                hasPagedCache = true;
+                break;
+            }
+        }
+        if (hasPagedCache) {
+            context->TryRecordPagedCache(this);
+            return;
+        }
+
+        if (this->UseGenericHistoryCache()) {
+            this->pastKVCacheManager.Record(
+                context->allTokens, context->allTokens.size(),
+                &context->pastKeyValues);
         }
     }
 
@@ -1587,8 +1658,12 @@ namespace fastllm {
 
         auto lastRecordTime = std::chrono::system_clock::now();
         long long genTokens = 0;
+        // 这些模型的单Token Decode只需要当前Token和绝对Position，不需要
+        // 重新执行FillLLMInputs构造临时AttentionMask及Position张量。
         const bool canUseFastDecodeInput =
-            model->model_type == "qwen3" || model->model_type == "qwen3_5";
+            model->model_type == "qwen3" ||
+            model->model_type == "qwen3_moe" ||
+            model->model_type == "qwen3_5";
         const bool printProfile = GetFastllmEnv().printProfile;
         int idlePrefillBatchWaitUs =
             useGPUForward && maxBatch > 1 && model->model_type == "qwen3_5" ?
@@ -1620,6 +1695,10 @@ namespace fastllm {
             if (model->isFree) {
                 break;
             }
+            const bool responseCpuTrace = ResponseCpuTraceEnabled();
+            const auto responseLoopBegin = responseCpuTrace ?
+                std::chrono::steady_clock::now() :
+                std::chrono::steady_clock::time_point();
             std::vector <Data*> attentionMasks;
             std::vector <Data*> positionIds;
             std::vector <Data*> ownedAttentionMasks;
@@ -1653,7 +1732,13 @@ namespace fastllm {
             decodePositionValues.reserve(reserveBatch);
             decodePositionIds.reserve(reserveBatch);
 
+            const auto containerReady = responseCpuTrace ?
+                std::chrono::steady_clock::now() :
+                std::chrono::steady_clock::time_point();
             std::unique_lock<std::mutex> dictLocker(model->dictLocker);
+            const auto dictLockAcquired = responseCpuTrace ?
+                std::chrono::steady_clock::now() :
+                std::chrono::steady_clock::time_point();
             auto &forwardLocker = model->forwardLocker;
 
             // 单次遍历：处理abort、释放isEnding的KV cache、统计alive、构建orders、检测hasPrefill
@@ -1769,6 +1854,9 @@ namespace fastllm {
                     }
                 }
             }
+            const auto contextScanDone = responseCpuTrace ?
+                std::chrono::steady_clock::now() :
+                std::chrono::steady_clock::time_point();
 
             // 通过PagedCacheManager获取实际使用的物理页数（复用的页只算一次）
             if (totalPages > 0) {
@@ -1782,6 +1870,9 @@ namespace fastllm {
                     pagesLimit = totalPages * 4 / 5;
                 }
             }
+            const auto pageUsageDone = responseCpuTrace ?
+                std::chrono::steady_clock::now() :
+                std::chrono::steady_clock::time_point();
 
             // 当busyPages未超过pagesLimit时可以开启新的Prefill；超过时只做Decode
             bool canAddPrefill = (pagesLimit > 0) ? (busyPages < pagesLimit) : true;
@@ -2302,6 +2393,9 @@ namespace fastllm {
                     }
                 }
             }
+            const auto requestSelectionDone = responseCpuTrace ?
+                std::chrono::steady_clock::now() :
+                std::chrono::steady_clock::time_point();
 
             if (!seqLens.empty()) {
                 if (selectedHasPrompt && interleaveActivePrefill) {
@@ -2324,6 +2418,9 @@ namespace fastllm {
                     tokensManager.units.push_back(ctx->tokens);
                 }
             }
+            const auto lastTokensDone = responseCpuTrace ?
+                std::chrono::steady_clock::now() :
+                std::chrono::steady_clock::time_point();
 
             // Decode阶段：检查空闲分页是否足够，不够时释放资源
             if (seqLens.size() > 0 && selectedHasDecode) {
@@ -2429,8 +2526,14 @@ namespace fastllm {
                     seqLens.clear();
                 }
             }
+            const auto pagedKvDone = responseCpuTrace ?
+                std::chrono::steady_clock::now() :
+                std::chrono::steady_clock::time_point();
 
             if (seqLens.size() > 0) {
+                const auto selectionDone = responseCpuTrace ?
+                    std::chrono::steady_clock::now() :
+                    std::chrono::steady_clock::time_point();
                 ResponseContext *singleContext = nullptr;
                 bool isSingleMultimodal = false;
                 if (handles.size() == 1) {
@@ -2441,7 +2544,13 @@ namespace fastllm {
                     }
                 }
                 dictLocker.unlock();
+                const auto forwardLockBegin = responseCpuTrace ?
+                    std::chrono::steady_clock::now() :
+                    std::chrono::steady_clock::time_point();
                 forwardLocker.lock();
+                const auto forwardBegin = responseCpuTrace ?
+                    std::chrono::steady_clock::now() :
+                    std::chrono::steady_clock::time_point();
 #ifdef USE_CUDA
                 // FastllmCudaClearBigBuffer();
 #endif
@@ -2569,6 +2678,9 @@ namespace fastllm {
                 if (printProfile) {
                     PrintLoopProfile("new", seqLens, (int)ret.size(), profileStartTime);
                 }
+                const auto forwardDone = responseCpuTrace ?
+                    std::chrono::steady_clock::now() :
+                    std::chrono::steady_clock::time_point();
 
                 forwardLocker.unlock();
                 dictLocker.lock();
@@ -2596,6 +2708,9 @@ namespace fastllm {
                     }
                 }
 
+                const auto enqueueBegin = responseCpuTrace ?
+                    std::chrono::steady_clock::now() :
+                    std::chrono::steady_clock::time_point();
                 for (int i = 0; i < handles.size(); i++) {
                     ResponseContext *ctx = tokenContexts[i];
                     int curRet = ret[i];
@@ -2641,6 +2756,36 @@ namespace fastllm {
                 }
                 model->dictCV.notify_all();
                 ReleasePendingResultLogits(logits);
+                if (responseCpuTrace) {
+                    const auto enqueueDone = std::chrono::steady_clock::now();
+                    std::fprintf(
+                        stderr,
+                        "[fastllm][response][cpu] batch=%zu workload=%s "
+                        "container_init_us=%lld dict_lock_us=%lld "
+                        "context_scan_us=%lld page_usage_us=%lld "
+                        "request_select_us=%lld "
+                        "last_tokens_us=%lld paged_kv_us=%lld "
+                        "batch_finalize_us=%lld "
+                        "batch_prepare_us=%lld forward_lock_us=%lld "
+                        "forward_us=%lld post_forward_us=%lld "
+                        "enqueue_us=%lld total_us=%lld\n",
+                        seqLens.size(),
+                        selectedHasDecode && !selectedHasPrompt ? "decode" : "prefill",
+                        ResponseCpuTraceMicroseconds(containerReady - responseLoopBegin),
+                        ResponseCpuTraceMicroseconds(dictLockAcquired - containerReady),
+                        ResponseCpuTraceMicroseconds(contextScanDone - dictLockAcquired),
+                        ResponseCpuTraceMicroseconds(pageUsageDone - contextScanDone),
+                        ResponseCpuTraceMicroseconds(requestSelectionDone - pageUsageDone),
+                        ResponseCpuTraceMicroseconds(lastTokensDone - requestSelectionDone),
+                        ResponseCpuTraceMicroseconds(pagedKvDone - lastTokensDone),
+                        ResponseCpuTraceMicroseconds(selectionDone - pagedKvDone),
+                        ResponseCpuTraceMicroseconds(selectionDone - responseLoopBegin),
+                        ResponseCpuTraceMicroseconds(forwardBegin - forwardLockBegin),
+                        ResponseCpuTraceMicroseconds(forwardDone - forwardBegin),
+                        ResponseCpuTraceMicroseconds(enqueueBegin - forwardDone),
+                        ResponseCpuTraceMicroseconds(enqueueDone - enqueueBegin),
+                        ResponseCpuTraceMicroseconds(enqueueDone - responseLoopBegin));
+                }
             } else {
                 // 没有任何请求可以调度时，等待新请求
             }
@@ -2796,6 +2941,11 @@ namespace fastllm {
                         for (auto &it: model->responseContextDict.dicts) {
                             if (it.second->pastKeyValues[model->kvCacheId].first.expansionDims.size() > 0) {
                                 lenSum += it.second->pastKeyValues[model->kvCacheId].first.expansionDims[1];
+                            }
+                            // Prefix Cache恢复会在首次Prefill前创建KV，但该
+                            // 请求尚未占用调度Batch名额。只有已处理过Token
+                            // 的未结束请求才是活动请求，与新调度器语义一致。
+                            if (!it.second->isEnding && it.second->preTokens > 0) {
                                 currentActivate++;
                             }
                         }
@@ -2826,19 +2976,8 @@ namespace fastllm {
                                     // TODO: multicuda支持多prompt一起推理
                                     continue;
                                 }
-                                if (isPrompt) {
-                                    int alive = 0;
-                                    for (auto &it: model->responseContextDict.dicts) {
-                                        if (it.second->isEnding) {
-                                            continue;
-                                        }
-                                        if (it.second->pastKeyValues[model->kvCacheId].first.expansionDims.size() > 0) {
-                                            alive++;
-                                        }
-                                    }
-                                    if (alive >= maxBatch) {
-                                        continue;
-                                    }
+                                if (isPrompt && currentActivate >= maxBatch) {
+                                    continue;
                                 }
 
                                 if (it.second->isEnding) {

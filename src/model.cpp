@@ -885,6 +885,8 @@ namespace fastllm {
         uint8_t *buffer = nullptr;
         float *minsBuffer = nullptr, *scalesBuffer = nullptr;
         int blockK, blockM;
+        std::vector<uint8_t> nvfp4GroupScales;
+        float nvfp4GlobalScale = 1.0f;
 
         SafeTensorItem() {} 
 
@@ -919,8 +921,9 @@ namespace fastllm {
             AssertInFastLLM(this->shape.size() >= 2 && (isScalarScale || scale.shape.size() >= 2),
                             "CreateBufferWithScale error: weight shape should be >= 2 and scale should be scalar or >= 2.");
             bool isFp8 = this->dtype == "F8_E4M3";
+            bool isInt8W8A8 = this->dtype == "I8" && dstType == DataType::INT8_W8A8;
             bool isPackedFp4 = this->dtype == "I8" || this->dtype == "U8";
-            if (!isFp8 && !isPackedFp4) {
+            if (!isFp8 && !isPackedFp4 && !isInt8W8A8) {
                 ErrorInFastLLM("CreateBufferWithScale error: dtype should be FP8_E4M3 or packed FP4 I8/U8");
             }
             long long n64 = 1, ns64 = 1;
@@ -937,7 +940,7 @@ namespace fastllm {
                             (isScalarScale || scale.shape.back() <= INT_MAX),
                             "CreateBufferWithScale error: shape is too large.");
             int n = (int)n64, packedM = (int)this->shape.back();
-            int m = isPackedFp4 ? packedM * 2 : packedM;
+            int m = (isPackedFp4 && !isInt8W8A8) ? packedM * 2 : packedM;
             int ns, ms, blockN, blockM;
             if (isScalarScale) {
                 ns = n;
@@ -959,7 +962,27 @@ namespace fastllm {
             }
             ClearBuffer();
 
-            if (dstType == DataType::FP8_E4M3 || dstType == DataType::NVFP4 ||
+            if (dstType == DataType::INT8_W8A8) {
+                AssertInFastLLM(!isScalarScale && ns == n && ms == 1 &&
+                                scale.len == (size_t)n,
+                                "INT8_W8A8 requires [out,1] per-channel scales.");
+                buffer = new uint8_t[this->bytes];
+                FILE *fw = fopen(this->fileName.c_str(), "rb");
+#if defined(_WIN32) || defined(_WIN64)
+                _fseeki64(fw, this->data_offsets[0], 0);
+#else
+                fseek(fw, this->data_offsets[0], 0);
+#endif
+                size_t ret = fread(buffer, 1, this->bytes, fw);
+                fclose(fw);
+                AssertInFastLLM(ret == this->bytes && this->bytes == (size_t)n * m,
+                                "INT8_W8A8 signed weight byte size mismatch.");
+                scalesBuffer = new float[n];
+                memcpy(scalesBuffer, scale.buffer, (size_t)n * sizeof(float));
+                blockK = 1;
+                blockM = m;
+                return;
+            } else if (dstType == DataType::FP8_E4M3 || dstType == DataType::NVFP4 ||
                 dstType == DataType::NVFP4_BLOCK_16 || dstType == DataType::NVFP4_BLOCK_16_E8M0) {
                 if (dstType == DataType::FP8_E4M3 && !isFp8) {
                     ErrorInFastLLM("CreateBufferWithScale error: packed FP4 cannot be loaded as FP8_E4M3.");
@@ -1005,6 +1028,8 @@ namespace fastllm {
                         }
                     }
 
+                    nvfp4GroupScales.clear();
+                    nvfp4GlobalScale = 1.0f;
                     // Keep the per-tensor dequant multiplier as metadata.  The
                     // compact CUDA layout below stores only the already-combined
                     // float scale (FP8 scale * multiplier) in each 16-value
@@ -1044,6 +1069,12 @@ namespace fastllm {
                     AssertInFastLLM(ret == scale.bytes,
                                     "CreateBufferWithScale error: read NVFP4_BLOCK_16 scale failed.");
 
+                    if (dstType == DataType::NVFP4_BLOCK_16) {
+                        // 保留 checkpoint 中的 E4M3 group scale 和 FP32 global scale。
+                        // inline FP32 effective scale 暂时保留，仅用于现有 CPU/CUDA fallback。
+                        nvfp4GlobalScale = scale2Value;
+                    }
+
                     buffer = new uint8_t[outputBytes];
                     memset(buffer, 0, outputBytes);
                     for (int i = 0; i < n; i++) {
@@ -1062,6 +1093,9 @@ namespace fastllm {
                                 memcpy(dstBlock + 8, &curScale, sizeof(float));
                             }
                         }
+                    }
+                    if (dstType == DataType::NVFP4_BLOCK_16) {
+                        nvfp4GroupScales = std::move(scaleBytes);
                     }
                     return;
                 }
@@ -1320,6 +1354,13 @@ namespace fastllm {
                 ret = fread(buffer, 1, this->bytes, fi);
                 fclose(fi);
                 return;
+            } else if (this->dtype == "I8" && dstType == DataType::INT8_W8A8) {
+                ClearBuffer();
+                buffer = new uint8_t[this->bytes];
+                ret = fread(buffer, 1, this->bytes, fi);
+                AssertInFastLLM(ret == this->bytes, "Failed to read signed INT8 W8A8 tensor.");
+                fclose(fi);
+                return;
             } else if (this->dtype == "F8_E4M3") {
                 srcType = DataType::FP8_E4M3;
             } else if (this->dtype == "BF16") {
@@ -1524,6 +1565,276 @@ namespace fastllm {
             foundLinearW4A8 = true;
         }
         return foundLinearW4A8;
+    }
+
+    struct CompressedTensorsLinearSchemeGroup {
+        LinearQuantScheme scheme = LinearQuantScheme::NONE;
+        bool inputDynamic = true;
+        bool inputSymmetric = true;
+        std::vector<std::string> targets;
+    };
+
+    /**
+     * 保存compressed-tensors为各个Linear声明的量化方案。
+     *
+     * 解析结果只描述W/A量化语义，不选择CUDA实现。Resolve在加载每个逻辑
+     * 权重时先应用顶层ignore，再按config_groups顺序匹配targets；未被量化
+     * 配置覆盖的Linear返回NONE，无compressed-tensors配置时返回LEGACY_AUTO。
+     */
+    struct CompressedTensorsLinearSchemePlan {
+        bool configured = false;
+        std::vector<std::string> ignore;
+        std::vector<CompressedTensorsLinearSchemeGroup> groups;
+
+        static bool MatchNameRule(const std::string &weightName,
+                                  const std::string &rule) {
+            if (rule.empty()) return false;
+            std::string logicalName = weightName;
+            if (StringEndWith(logicalName, ".weight")) {
+                logicalName.resize(logicalName.size() - strlen(".weight"));
+            }
+            std::string pattern = rule.substr(0, 3) == "re:" ? rule.substr(3) : rule;
+            if (weightName == pattern || logicalName == pattern ||
+                StringEndWith(weightName, "." + pattern) ||
+                StringEndWith(logicalName, "." + pattern)) {
+                return true;
+            }
+            try {
+                return std::regex_search(weightName, std::regex(pattern)) ||
+                       std::regex_search(logicalName, std::regex(pattern));
+            } catch (const std::regex_error &) {
+                return false;
+            }
+        }
+
+        const CompressedTensorsLinearSchemeGroup *ResolveGroup(
+                const std::string &weightName, WeightType weightType) const {
+            if (!configured || weightType != WeightType::LINEAR) return nullptr;
+            for (const auto &rule : ignore) {
+                if (MatchNameRule(weightName, rule)) return nullptr;
+            }
+            for (const auto &group : groups) {
+                for (const auto &target : group.targets) {
+                    if (target == "Linear" || MatchNameRule(weightName, target)) {
+                        return &group;
+                    }
+                }
+            }
+            return nullptr;
+        }
+
+        LinearQuantScheme Resolve(const std::string &weightName,
+                                  WeightType weightType) const {
+            const auto *group = ResolveGroup(weightName, weightType);
+            if (group != nullptr) return group->scheme;
+            return configured ? LinearQuantScheme::NONE :
+                                LinearQuantScheme::LEGACY_AUTO;
+        }
+    };
+
+    static LinearQuantScheme ParseCompressedTensorsLinearScheme(
+            const json11::Json &group, const std::string &globalFormat) {
+        const auto &weight = group["weights"];
+        const auto &input = group["input_activations"];
+        if (weight.is_null()) return LinearQuantScheme::NONE;
+        const std::string format = group["format"].string_value().empty()
+            ? globalFormat : group["format"].string_value();
+        const std::string weightType = weight["type"].string_value();
+        const int weightBits = weight["num_bits"].int_value();
+        const std::string weightStrategy = weight["strategy"].string_value();
+        const std::string inputType = input["type"].string_value();
+        const int inputBits = input["num_bits"].int_value();
+        const std::string inputStrategy = input["strategy"].string_value();
+
+        auto blockStructureEquals = [](const json11::Json &value,
+                                       int rows, int cols) {
+            const auto &items = value.array_items();
+            return items.size() == 2 &&
+                   items[0].int_value() == rows &&
+                   items[1].int_value() == cols;
+        };
+
+        if (weightType == "float" && weightBits == 4 &&
+            format.find("nvfp4") != std::string::npos) {
+            // 与vLLM的compressed-tensors分派保持一致：存在NVFP4激活
+            // 配置表示W4A4；没有input_activations表示weight-only W4A16。
+            if (input.is_null()) {
+                return LinearQuantScheme::NVFP4_W4A16;
+            }
+            if (inputType == "float" && inputBits == 4) {
+                return LinearQuantScheme::NVFP4_W4A4;
+            }
+        }
+        if (weightType == "float" && weightBits == 8 &&
+            inputType == "float" && inputBits == 8 &&
+            blockStructureEquals(weight["block_structure"], 128, 128) &&
+            input["group_size"].int_value() == 128 &&
+            !weight["dynamic"].bool_value() &&
+            input["dynamic"].bool_value()) {
+            return LinearQuantScheme::FP8_W8A8_BLOCK128;
+        }
+        if (weightType == "float" && weightBits == 8 &&
+            inputType == "float" && inputBits == 8 &&
+            (weightStrategy == "tensor" || weightStrategy == "channel") &&
+            !weight["dynamic"].bool_value() &&
+            (input["dynamic"].bool_value() ||
+             (input["symmetric"].bool_value() && inputStrategy == "tensor"))) {
+            return LinearQuantScheme::FP8_W8A8;
+        }
+        if (weightType == "int" && weightBits == 8 &&
+            inputType == "int" && inputBits == 8 &&
+            weightStrategy == "channel" && weight["symmetric"].bool_value() &&
+            !weight["dynamic"].bool_value() &&
+            ((inputStrategy == "token" && input["dynamic"].bool_value()) ||
+             (inputStrategy == "tensor" && !input["dynamic"].bool_value()))) {
+            return LinearQuantScheme::INT8_W8A8;
+        }
+        if (weightType == "int" && weightBits == 4 &&
+            inputType == "float" && inputBits == 8 &&
+            weightStrategy == "group" && inputStrategy == "token" &&
+            weight["group_size"].int_value() == COMPRESSED_W4A8_GROUP_SIZE &&
+            weight["symmetric"].bool_value() &&
+            !weight["dynamic"].bool_value() && input["dynamic"].bool_value()) {
+            return LinearQuantScheme::INT4_W4A8;
+        }
+        return LinearQuantScheme::NONE;
+    }
+
+    /**
+     * 从模型config.json构建逐Linear量化方案。
+     *
+     * @param config 模型完整配置。
+     * @return 包含config_groups、targets和ignore解析结果的只读方案。
+     */
+    static CompressedTensorsLinearSchemePlan BuildCompressedTensorsLinearSchemePlan(
+            const json11::Json &config) {
+        CompressedTensorsLinearSchemePlan plan;
+        const auto &quant = config["quantization_config"];
+        if (quant.is_null()) {
+            return plan;
+        }
+
+        const std::string quantMethod = quant["quant_method"].string_value();
+        if (quantMethod == "fp8") {
+            const auto &blockSize = quant["weight_block_size"].array_items();
+            CompressedTensorsLinearSchemeGroup parsed;
+            parsed.scheme = blockSize.size() == 2 &&
+                            blockSize[0].int_value() == 128 &&
+                            blockSize[1].int_value() == 128
+                ? LinearQuantScheme::FP8_W8A8_BLOCK128
+                : LinearQuantScheme::FP8_W8A8;
+            parsed.targets.push_back("Linear");
+
+            plan.configured = true;
+            for (const auto &value : quant["ignored_layers"].array_items()) {
+                if (!value.string_value().empty()) {
+                    plan.ignore.push_back(value.string_value());
+                }
+            }
+            plan.groups.push_back(std::move(parsed));
+            return plan;
+        }
+        if (quantMethod != "compressed-tensors") return plan;
+
+        plan.configured = true;
+        for (const auto &value : quant["ignore"].array_items()) {
+            if (!value.string_value().empty()) plan.ignore.push_back(value.string_value());
+        }
+        const std::string globalFormat = quant["format"].string_value();
+        for (const auto &entry : quant["config_groups"].object_items()) {
+            CompressedTensorsLinearSchemeGroup parsed;
+            parsed.scheme = ParseCompressedTensorsLinearScheme(entry.second, globalFormat);
+            const auto &input = entry.second["input_activations"];
+            parsed.inputDynamic = input.is_null() || input["dynamic"].bool_value();
+            parsed.inputSymmetric = input.is_null() || input["symmetric"].bool_value();
+            for (const auto &target : entry.second["targets"].array_items()) {
+                if (!target.string_value().empty()) parsed.targets.push_back(target.string_value());
+            }
+            if (!parsed.targets.empty()) plan.groups.push_back(std::move(parsed));
+        }
+        return plan;
+    }
+
+    /**
+     * 验证配置声明的Linear量化方案与实际加载权重一致。
+     *
+     * 验证发生在权重完成解包和scale加载之后，防止配置声称W8A8而权重却
+     * 静默进入W4A8或普通FP8路径。NONE和LEGACY_AUTO不施加格式约束。
+     *
+     * @param weightName 逻辑Linear权重名称。
+     * @param weight 已完成CPU侧加载的权重。
+     */
+    static void ValidateConfiguredLinearQuantScheme(const std::string &weightName,
+                                                     const Data &weight) {
+        const auto fail = [&](const std::string &reason) {
+            ErrorInFastLLM("Configured Linear quantization mismatch for " +
+                           weightName + ": " + reason + "\n");
+        };
+        switch (weight.linearQuantScheme) {
+            case LinearQuantScheme::FP8_W8A8_BLOCK128:
+                if (weight.dataType != DataType::FP8_E4M3 ||
+                    weight.dims.size() != 2) {
+                    fail("blockwise FP8 W8A8 requires a 2D FP8_E4M3 weight");
+                }
+                if (weight.blockK != 128 || weight.blockM != 128 ||
+                    weight.dims[0] % 128 != 0 ||
+                    weight.dims[1] % 128 != 0 ||
+                    weight.scales.size() !=
+                        (size_t)(weight.dims[0] / 128) *
+                        (weight.dims[1] / 128)) {
+                    fail("blockwise FP8 W8A8 requires 128x128 weight scales");
+                }
+                break;
+            case LinearQuantScheme::FP8_W8A8:
+                if (weight.dataType != DataType::FP8_E4M3 || weight.dims.size() != 2) {
+                    fail("FP8 W8A8 requires a 2D FP8_E4M3 weight");
+                }
+                if (weight.blockK != 1 || weight.blockM != weight.dims[1] ||
+                    (weight.scales.size() != 1 &&
+                     weight.scales.size() != (size_t)weight.dims[0])) {
+                    fail("FP8 W8A8 requires tensorwise/per-channel scales");
+                }
+                break;
+            case LinearQuantScheme::INT8_W8A8:
+                if (weight.dataType != DataType::INT8_W8A8 || weight.dims.size() != 2 ||
+                    weight.scales.size() != (size_t)weight.dims[0]) {
+                    fail("INT8 W8A8 requires signed I8 [N,K] and N channel scales");
+                }
+                if (!weight.w8a8InputDynamic &&
+                    (!(weight.w8a8InputScale > 0.0f) ||
+                     !std::isfinite(weight.w8a8InputScale))) {
+                    fail("static INT8 W8A8 requires a positive finite input scale");
+                }
+                if (weight.w8a8InputZeroPoint < -128 ||
+                    weight.w8a8InputZeroPoint > 127) {
+                    fail("INT8 W8A8 input zero-point is outside INT8 range");
+                }
+                if (weight.w8a8InputSymmetric &&
+                    weight.w8a8InputZeroPoint != 0) {
+                    fail("symmetric INT8 W8A8 requires input zero-point 0");
+                }
+                break;
+            case LinearQuantScheme::INT4_W4A8: {
+                std::string reason;
+                if (weight.dataType != DataType::INT4_W4A8 ||
+                    !weight.ValidateW4A8Weight(&reason)) {
+                    fail(reason.empty() ? "W4A8 weight metadata is invalid" : reason);
+                }
+                break;
+            }
+            case LinearQuantScheme::NVFP4_W4A4:
+            case LinearQuantScheme::NVFP4_W4A16:
+                if (weight.dataType != DataType::NVFP4 &&
+                    weight.dataType != DataType::NVFP4_BLOCK_16 &&
+                    weight.dataType != DataType::NVFP4_BLOCK_16_E8M0 &&
+                    weight.dataType != DataType::NVFP4_BLOCK_32_E8M0) {
+                    fail("NVFP4 W4A4/W4A16 requires an NVFP4 weight");
+                }
+                break;
+            case LinearQuantScheme::NONE:
+            case LinearQuantScheme::LEGACY_AUTO:
+                break;
+        }
     }
 
     static bool DescribeCompressedTensorsW4A8Bundle(
@@ -2031,6 +2342,8 @@ namespace fastllm {
         weight.mins.clear();
         weight.zeros.clear();
         weight.halfScales.clear();
+        weight.nvfp4GroupScales.clear();
+        weight.nvfp4GlobalScale = 1.0f;
         weight.perChannelsConfigs.clear();
         weight.disableGGUFRepack = false;
         weight.blockK = -1;
@@ -2415,6 +2728,16 @@ namespace fastllm {
         mergeData.expansionBytes = 0;
         mergeData.dataDevice = DataDevice::CPU;
         mergeData.weightType = WeightType::LINEAR;
+        auto firstInput = inputs.empty() ? weights.end() : weights.find(inputs[0]);
+        mergeData.linearQuantScheme = firstInput == weights.end()
+            ? LinearQuantScheme::LEGACY_AUTO
+            : firstInput->second.linearQuantScheme;
+        if (firstInput != weights.end()) {
+            mergeData.w8a8InputDynamic = firstInput->second.w8a8InputDynamic;
+            mergeData.w8a8InputSymmetric = firstInput->second.w8a8InputSymmetric;
+            mergeData.w8a8InputScale = firstInput->second.w8a8InputScale;
+            mergeData.w8a8InputZeroPoint = firstInput->second.w8a8InputZeroPoint;
+        }
         mergeData.scales.clear();
         mergeData.mins.clear();
         mergeData.zeros.clear();
@@ -3297,11 +3620,19 @@ namespace fastllm {
                                         Data &mergeData = model->weight[mergeName];
                                         mergeData.name = mergeName;
                                         mergeData.isModelWeight = true;
+                                        mergeData.weightType = WeightType::LINEAR;
+                                        mergeData.linearQuantScheme =
+                                            model->weight[input0].linearQuantScheme;
+                                        mergeData.w8a8InputDynamic = model->weight[input0].w8a8InputDynamic;
+                                        mergeData.w8a8InputSymmetric = model->weight[input0].w8a8InputSymmetric;
+                                        mergeData.w8a8InputScale = model->weight[input0].w8a8InputScale;
+                                        mergeData.w8a8InputZeroPoint = model->weight[input0].w8a8InputZeroPoint;
                                         mergeData.perChannelAxis = model->weight[input0].perChannelAxis;
                                         mergeData.group = model->weight[input0].group;
                                         mergeData.groupCnt = model->weight[input0].groupCnt;
                                         mergeData.blockK = model->weight[input0].blockK;
                                         mergeData.blockM = model->weight[input0].blockM;
+                                        mergeData.nvfp4GlobalScale = model->weight[input0].nvfp4GlobalScale;
 
                                         if (AllInputsAreDiskWeights(model->weight.weight, it.inputs)) {
                                             MergeDiskWeightMeta(model->weight.weight, it.inputs, mergeData);
@@ -3316,6 +3647,16 @@ namespace fastllm {
                                                 mergeData.scales = AppendVector(mergeData.scales, model->weight[input].scales);
                                                 mergeData.mins = AppendVector(mergeData.mins, model->weight[input].mins);
                                                 mergeData.halfScales = AppendVector(mergeData.halfScales, model->weight[input].halfScales);
+                                                if (mergeData.dataType == DataType::NVFP4_BLOCK_16) {
+                                                    if (!model->weight[input].nvfp4GroupScales.empty() &&
+                                                        model->weight[input].nvfp4GlobalScale == mergeData.nvfp4GlobalScale) {
+                                                        mergeData.nvfp4GroupScales = AppendVector(
+                                                            mergeData.nvfp4GroupScales,
+                                                            model->weight[input].nvfp4GroupScales);
+                                                    } else {
+                                                        mergeData.nvfp4GroupScales.clear();
+                                                    }
+                                                }
                                                 if (compactNVFP4) {
                                                     AppendCompactNVFP4Weight(mergeData, model->weight[input], offset, scaleOffset);
                                                 } else {
@@ -3526,6 +3867,7 @@ namespace fastllm {
         auto config = weightOnly ? json11::Json() : json11::Json::parse(ReadAllFile(configFile), error);
         bool isAwqModel = false;
         bool isCompressedW4A8Model = false;
+        CompressedTensorsLinearSchemePlan linearSchemePlan;
         int awqGroupCnt = 128;
         std::string modelType = "";
         if (weightOnly) {
@@ -3561,6 +3903,7 @@ namespace fastllm {
                 printf("[Fastllm] AWQ: keep unquantized floating-point tensors in source dtype.\n");
             }
             isCompressedW4A8Model = IsCompressedTensorsW4A8Config(config);
+            linearSchemePlan = BuildCompressedTensorsLinearSchemePlan(config);
         }
         basellm *model = CreateModelWithType(modelType);
         if (isJsonModel) {
@@ -3753,6 +4096,22 @@ namespace fastllm {
                 allWeightNames.insert(weightName);
                 auto dataType = it.second;
                 int ggmlType = -1;
+                const WeightType logicalWeightType =
+                    model->weight.GetWeightType(weightName);
+                const LinearQuantScheme configuredScheme =
+                    linearSchemePlan.Resolve(weightName, logicalWeightType);
+                if (configuredScheme == LinearQuantScheme::INT8_W8A8 &&
+                    tensor.dtype == "I8" &&
+                    StringEndWith(tensorName, ".weight")) {
+                    const std::string scaleTensorName = tensorName + "_scale";
+                    AssertInFastLLM(
+                        safeTensors.itmeDict.find(scaleTensorName) !=
+                            safeTensors.itmeDict.end(),
+                        "INT8_W8A8 weight is missing weight_scale: " +
+                            tensorName + "\n");
+                    dataType = DataType::INT8_W8A8;
+                }
+
                 if ((dataType == DATA_AUTO_LINEAR || dataType == DATA_AUTO_CONV) && dtypeRules.size() > 0) {
                     int groupCnt = -1;
                     ParseDataType(weightName, dtypeRules, dataType, groupCnt, ggmlType);
@@ -3940,6 +4299,8 @@ namespace fastllm {
                         auto &tensorName = (*activeTensors)[i];
                         auto &tensor = safeTensors.itmeDict[tensorName];
                         if (w4a8CompanionTensorNames.find(tensorName) != w4a8CompanionTensorNames.end() ||
+                            StringEndWith(tensorName, ".input_scale") ||
+                            StringEndWith(tensorName, ".input_zero_point") ||
                             IsSafeTensorQuantScaleTensorName(safeTensors, tensorName) ||
                             (isAwqModel && (StringEndWith(tensorName, ".scales") || StringEndWith(tensorName, ".qzeros")))) {
                             printLoadingProgress(tensor.bytes);
@@ -3955,6 +4316,17 @@ namespace fastllm {
                             std::string weightName = it.first;
                             auto dataType = it.second;
                             int ggmlType = -1;
+                            const WeightType logicalWeightType =
+                                model->weight.GetWeightType(weightName);
+                            Data &logicalWeight = model->weight[weightName];
+                            logicalWeight.linearQuantScheme =
+                                linearSchemePlan.Resolve(weightName, logicalWeightType);
+                            const auto *schemeGroup =
+                                linearSchemePlan.ResolveGroup(weightName, logicalWeightType);
+                            if (schemeGroup != nullptr) {
+                                logicalWeight.w8a8InputDynamic = schemeGroup->inputDynamic;
+                                logicalWeight.w8a8InputSymmetric = schemeGroup->inputSymmetric;
+                            }
 
                             bool isMoeLinear = model->moeLinears.find(weightName) != model->moeLinears.end();
                             // With no explicit --moe_dtype, AWQ experts inherit the global
@@ -3964,6 +4336,18 @@ namespace fastllm {
                             int curGroupCnt = isMoeLinear
                                     ? ((isAwqModel && !useMoeDataType) ? awqGroupCnt : moeGroupCnt)
                                     : groupCnt;
+                            if (logicalWeight.linearQuantScheme ==
+                                    LinearQuantScheme::INT8_W8A8 &&
+                                tensor.dtype == "I8" &&
+                                StringEndWith(tensorName, ".weight")) {
+                                std::string candidate = tensorName + "_scale";
+                                auto scaleIt = safeTensors.itmeDict.find(candidate);
+                                AssertInFastLLM(scaleIt != safeTensors.itmeDict.end(),
+                                                "INT8_W8A8 weight is missing weight_scale: " + tensorName + "\n");
+                                dataType = DataType::INT8_W8A8;
+                                oriDataType = DataType::INT8_W8A8;
+                                scaleTensorName = candidate;
+                            }
                             if (isW4A8PackedTensor) {
                                 dataType = DataType::INT4_W4A8;
                                 oriDataType = DataType::INT4_W4A8;
@@ -4209,10 +4593,64 @@ namespace fastllm {
                                     if (it.second == DATA_AUTO_CONV) {
                                         tensor.Transpose(oriDataType);
                                     }
-                                    model->weight[weightName].CreateFromOriData(WeightType::AUTO, oriDataType, 
+                                    model->weight[weightName].CreateFromOriData(logicalWeightType, oriDataType,
                                             tensor.buffer, tensor.minsBuffer, tensor.scalesBuffer,
                                             curGroupCnt, tensor.blockK, tensor.blockM);
+                                    if (oriDataType == DataType::NVFP4_BLOCK_16) {
+                                        model->weight[weightName].nvfp4GroupScales =
+                                            std::move(tensor.nvfp4GroupScales);
+                                        model->weight[weightName].nvfp4GlobalScale = tensor.nvfp4GlobalScale;
+                                    }
                                 }
+                                if (model->weight[weightName].linearQuantScheme ==
+                                        LinearQuantScheme::INT8_W8A8 &&
+                                    !model->weight[weightName].w8a8InputDynamic) {
+                                    const std::string prefix = tensorName.substr(
+                                        0, tensorName.size() - strlen(".weight"));
+                                    auto inputScaleIt = safeTensors.itmeDict.find(
+                                        prefix + ".input_scale");
+                                    AssertInFastLLM(
+                                        inputScaleIt != safeTensors.itmeDict.end(),
+                                        "Static INT8_W8A8 is missing input_scale: " +
+                                            tensorName + "\n");
+                                    inputScaleIt->second.CreateBuffer(DataType::FLOAT32);
+                                    AssertInFastLLM(inputScaleIt->second.len == 1,
+                                                    "Static INT8_W8A8 input_scale must be tensorwise.\n");
+                                    model->weight[weightName].w8a8InputScale =
+                                        ((float*)inputScaleIt->second.buffer)[0];
+                                    inputScaleIt->second.ClearBuffer();
+
+                                    auto inputZeroIt = safeTensors.itmeDict.find(
+                                        prefix + ".input_zero_point");
+                                    if (model->weight[weightName].w8a8InputSymmetric) {
+                                        model->weight[weightName].w8a8InputZeroPoint = 0;
+                                    } else {
+                                        AssertInFastLLM(
+                                            inputZeroIt != safeTensors.itmeDict.end(),
+                                            "Asymmetric static INT8_W8A8 is missing input_zero_point: " +
+                                                tensorName + "\n");
+                                        AssertInFastLLM(inputZeroIt->second.len == 1,
+                                                        "Static INT8_W8A8 input_zero_point must be tensorwise.\n");
+                                        if (inputZeroIt->second.dtype == "I8") {
+                                            inputZeroIt->second.CreateBuffer(DataType::INT8_W8A8);
+                                            model->weight[weightName].w8a8InputZeroPoint =
+                                                (int)((int8_t*)inputZeroIt->second.buffer)[0];
+                                        } else {
+                                            AssertInFastLLM(inputZeroIt->second.dtype == "I32",
+                                                            "Static INT8_W8A8 input_zero_point must be I8 or I32.\n");
+                                            inputZeroIt->second.CreateBuffer(DataType::INT32);
+                                            model->weight[weightName].w8a8InputZeroPoint =
+                                                ((int32_t*)inputZeroIt->second.buffer)[0];
+                                        }
+                                        AssertInFastLLM(
+                                            model->weight[weightName].w8a8InputZeroPoint >= -128 &&
+                                            model->weight[weightName].w8a8InputZeroPoint <= 127,
+                                            "Static INT8_W8A8 input_zero_point is outside INT8 range.\n");
+                                        inputZeroIt->second.ClearBuffer();
+                                    }
+                                }
+                                ValidateConfiguredLinearQuantScheme(
+                                    weightName, model->weight[weightName]);
                                 if (isW4A8PackedTensor) {
                                     std::string reason;
                                     AssertInFastLLM(
@@ -4268,7 +4706,17 @@ namespace fastllm {
                                                 break;
                                             }
                                             if (model->weight[input].dataType != model->weight[it.inputs[0]].dataType ||
-                                                model->weight[input].dims[1] != model->weight[it.inputs[0]].dims[1]) {
+                                                model->weight[input].dims[1] != model->weight[it.inputs[0]].dims[1] ||
+                                                model->weight[input].linearQuantScheme !=
+                                                    model->weight[it.inputs[0]].linearQuantScheme ||
+                                                model->weight[input].w8a8InputDynamic !=
+                                                    model->weight[it.inputs[0]].w8a8InputDynamic ||
+                                                model->weight[input].w8a8InputSymmetric !=
+                                                    model->weight[it.inputs[0]].w8a8InputSymmetric ||
+                                                model->weight[input].w8a8InputScale !=
+                                                    model->weight[it.inputs[0]].w8a8InputScale ||
+                                                model->weight[input].w8a8InputZeroPoint !=
+                                                    model->weight[it.inputs[0]].w8a8InputZeroPoint) {
                                                 canMerge = false;
                                                 break;
                                             }
@@ -4321,6 +4769,13 @@ namespace fastllm {
                                         Data &mergeData = model->weight[mergeName];
                                         mergeData.name = mergeName;
                                         mergeData.isModelWeight = true;
+                                        mergeData.weightType = WeightType::LINEAR;
+                                        mergeData.linearQuantScheme =
+                                            model->weight[input0].linearQuantScheme;
+                                        mergeData.w8a8InputDynamic = model->weight[input0].w8a8InputDynamic;
+                                        mergeData.w8a8InputSymmetric = model->weight[input0].w8a8InputSymmetric;
+                                        mergeData.w8a8InputScale = model->weight[input0].w8a8InputScale;
+                                        mergeData.w8a8InputZeroPoint = model->weight[input0].w8a8InputZeroPoint;
                                         if (mergeData.dataType == DataType::INT4_W4A8) {
                                             for (const auto &input : it.inputs) {
                                                 std::string reason;
@@ -4342,6 +4797,7 @@ namespace fastllm {
                                         }
                                         mergeData.blockK = model->weight[input0].blockK;
                                         mergeData.blockM = model->weight[input0].blockM;
+                                        mergeData.nvfp4GlobalScale = model->weight[input0].nvfp4GlobalScale;
 
                                         if (AllInputsAreDiskWeights(model->weight.weight, it.inputs)) {
                                             MergeDiskWeightMeta(model->weight.weight, it.inputs, mergeData);
@@ -4359,6 +4815,16 @@ namespace fastllm {
                                                 mergeData.w4a8GroupScales = AppendVector(
                                                     mergeData.w4a8GroupScales,
                                                     model->weight[input].w4a8GroupScales);
+                                                if (mergeData.dataType == DataType::NVFP4_BLOCK_16) {
+                                                    if (!model->weight[input].nvfp4GroupScales.empty() &&
+                                                        model->weight[input].nvfp4GlobalScale == mergeData.nvfp4GlobalScale) {
+                                                        mergeData.nvfp4GroupScales = AppendVector(
+                                                            mergeData.nvfp4GroupScales,
+                                                            model->weight[input].nvfp4GroupScales);
+                                                    } else {
+                                                        mergeData.nvfp4GroupScales.clear();
+                                                    }
+                                                }
                                                 if (compactNVFP4) {
                                                     AppendCompactNVFP4Weight(mergeData, model->weight[input], offset, scaleOffset);
                                                 } else {
@@ -4888,6 +5354,11 @@ namespace fastllm {
                             weights[weightName].CreateFromOriData(WeightType::AUTO, oriDataType, 
                                 tensor.buffer, tensor.minsBuffer, tensor.scalesBuffer,
                                 curGroupCnt, tensor.blockK, tensor.blockM);
+                            if (oriDataType == DataType::NVFP4_BLOCK_16) {
+                                weights[weightName].nvfp4GroupScales =
+                                    std::move(tensor.nvfp4GroupScales);
+                                weights[weightName].nvfp4GlobalScale = tensor.nvfp4GlobalScale;
+                            }
                             tensor.ClearBuffer();
                         }
                     }, st, end)

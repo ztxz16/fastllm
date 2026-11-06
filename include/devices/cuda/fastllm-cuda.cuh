@@ -3,6 +3,25 @@
 
 #include "fastllm.h"
 
+// native/machete/auto策略由FASTLLM_LINEAR_BACKEND指定，默认native。
+#ifdef USE_ROCM
+#include <cstdlib>
+#include <stdexcept>
+inline bool FastllmCudaTryMacheteLinear(const fastllm::Data&, fastllm::Data&,
+                                      const fastllm::Data&, fastllm::Data&) {
+    const char *policy = std::getenv("FASTLLM_LINEAR_BACKEND");
+    if (policy && std::string(policy) == "machete") {
+        throw std::runtime_error("Machete requires NVIDIA Hopper, not ROCm");
+    }
+    return false;
+}
+inline void FastllmCudaReleaseMacheteCache(const fastllm::Data*) {}
+#else
+bool FastllmCudaTryMacheteLinear(const fastllm::Data &input, fastllm::Data &weight,
+                               const fastllm::Data &bias, fastllm::Data &output);
+void FastllmCudaReleaseMacheteCache(const fastllm::Data *weight);
+#endif
+
 // Device-resident request/chunk offsets shared by the ragged GDN frontend,
 // recurrent kernels, and output layout conversion.  The backing storage is
 // owned by a per-worker CUDA cache; callers must only retain this view until
@@ -204,6 +223,15 @@ void FastllmCudaClearBigBuffer();
 cudaError_t FastllmCudaCheckedMalloc(void **ret, size_t size, const char *file, int line);
 #endif
 void *FastllmCudaMalloc(size_t size);
+void *FastllmCudaMallocWithSource(size_t size, const char *file, int line);
+void *FastllmCudaMallocWithDataTag(size_t size, const void *owner,
+                                   int dataType, const int *dims, int dimCount,
+                                   bool isFake, bool isKVCache,
+                                   const char *file, int line);
+#ifndef FASTLLM_CUDA_NO_MALLOC_CHECK_MACRO
+#define FastllmCudaMalloc(size) \
+    FastllmCudaMallocWithSource((size), __FILE__, __LINE__)
+#endif
 void FastllmCudaForceFree(void *ret);
 // Return a pooled allocation after all work already submitted to this host
 // thread's per-thread stream has completed. The allocation is detached from
@@ -278,14 +306,22 @@ bool FastllmCudaMarlinHalfFP8Gemm(const void *a, const uint32_t *b_q_weight,
                                   const void *b_scales, void *c,
                                   int size_m, int size_n, int size_k,
                                   int group_size, int *workspace);
-// SM75+ weight-only NVFP4 Marlin (W4A16, group size 16).  SM75 selects the
-// two-stage Turing specialization; SM80+ selects the four-stage kernel.
-bool FastllmCudaMarlinHalfNVFP4Gemm(const void *a,
-                                    const uint32_t *b_q_weight,
+bool FastllmCudaMarlinHalfNVFP4Gemm(const void *a, const uint32_t *b_q_weight,
                                     const void *b_scales,
                                     const float *global_scale, void *c,
                                     int size_m, int size_n, int size_k,
-                                    int *workspace, void *c_tmp);
+                                    int *workspace, void *c_tmp = nullptr);
+bool FastllmCudaTryMarlinHalfMatMulNVFP4(
+    const fastllm::Data &input, fastllm::Data &weight,
+    const fastllm::Data &bias, fastllm::Data &output,
+    int n, int m, int k);
+bool FastllmCudaTryNvfp4W4A4Linear(
+    const fastllm::Data &input, fastllm::Data &weight,
+    const fastllm::Data &bias, fastllm::Data &output,
+    int n, int m, int k);
+void FastllmCudaReleaseNvfp4MarlinCache(const fastllm::Data *weight);
+// SM75+ weight-only NVFP4 Marlin (W4A16, group size 16).  SM75 selects the
+// two-stage Turing specialization; SM80+ selects the four-stage kernel.
 bool FastllmCudaMarlinNVFP4Supported(int size_n, int size_k);
 bool FastllmCudaHasFp8MarlinLayout(const fastllm::Data &weight);
 bool FastllmCudaTryMarlinHalfMatMulFloatFP8E4M3(const fastllm::Data &input,
@@ -315,6 +351,26 @@ bool FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(
     void *dst, const void *src, size_t size);
 bool FastllmCudaBatchCopyFromDeviceToDeviceAsyncCurrentThread(
     void *const *dsts, const void *const *srcs, const size_t *sizes, int count);
+
+/** 返回是否启用分页Attention的CUDA阶段诊断。 */
+bool FastllmCudaPagedDebugEnabled();
+
+/**
+ * 同步检查分页Attention阶段，并在首次CUDA错误处输出张量上下文。
+ *
+ * 仅在FASTLLM_CUDA_PAGED_DEBUG非零时执行同步；默认路径直接返回，不改变
+ * 正式推理的异步边界。失败日志包含阶段、层号、设备以及两个相关张量的
+ * dtype、shape和CUDA地址，调用方应立即停止当前Attention Block。
+ *
+ * @param stage  当前分页执行阶段名称。
+ * @param layer  当前模型层号。
+ * @param first  第一相关张量，可为空。
+ * @param second 第二相关张量，可为空。
+ * @return true表示未启用诊断或同步成功；false表示发现CUDA错误。
+ */
+bool FastllmCudaPagedDebugSynchronize(
+    const char *stage, int layer, const fastllm::Data *first,
+    const fastllm::Data *second);
 
 void *FastllmCudaHostMalloc(size_t size);
 void FastllmCudaHostFree(void *ptr);
@@ -902,6 +958,165 @@ bool FastllmCudaPermuteTo(const fastllm::Data &input, fastllm::Data &output,
 bool TryFastllmCudaAwqGemm(const fastllm::Data &input, fastllm::Data &weight,
                            const fastllm::Data &bias, fastllm::Data &output,
                            int numTokens, int inChannels, int outChannels);
+
+/** NVFP4权重在指定GPU上的W4A4后端选择与兼容降级状态。 */
+enum class FastllmCudaNvfp4BackendState : uint8_t {
+    Uninitialized,
+    Prepared,
+    CutlassW4A4,
+    Cutlass = CutlassW4A4,
+    MarlinW4A16Fallback,
+    NativeW4A16Fallback,
+    Rejected,
+};
+
+#ifdef FASTLLM_ENABLE_CUTLASS_NVFP4
+size_t FastllmCudaNvfp4SwizzledScaleBytes(int rows, int columns);
+bool FastllmCudaNvfp4QuantizeActivation(
+    const void *input, fastllm::DataType inputType,
+    uint8_t *output, uint8_t *outputScales,
+    int rows, int columns, float globalScale, void *streamPtr = nullptr);
+bool FastllmCudaNvfp4QuantizeActivationPadded(
+    const void *input, fastllm::DataType inputType,
+    uint8_t *output, uint8_t *outputScales,
+    int rows, int columns, int paddedColumns,
+    float globalScale, void *streamPtr = nullptr);
+enum class FastllmCudaNvfp4SiluMulVersion {
+    Baseline,
+    Optimized,
+    Cached,
+};
+bool FastllmCudaSiluMulNvfp4QuantizeVersion(
+    const void *input, fastllm::DataType inputType,
+    uint8_t *output, uint8_t *outputScales,
+    int rows, int hidden, float globalScale,
+    FastllmCudaNvfp4SiluMulVersion version, void *streamPtr = nullptr);
+bool FastllmCudaSiluMulNvfp4Quantize(
+    const void *input, fastllm::DataType inputType,
+    uint8_t *output, uint8_t *outputScales,
+    int rows, int hidden, float globalScale, void *streamPtr = nullptr);
+bool FastllmCudaSiluMulNvfp4QuantizePadded(
+    const void *input, fastllm::DataType inputType,
+    uint8_t *output, uint8_t *outputScales,
+    int rows, int hidden, int paddedHidden,
+    float globalScale, void *streamPtr = nullptr);
+bool FastllmCudaNvfp4Block16ToCutlass(
+    const uint8_t *source, const uint8_t *groupScales,
+    uint8_t *packedWeight, uint8_t *weightScales,
+    int rows, int columns, void *streamPtr = nullptr);
+bool FastllmCudaNvfp4Block16ToCutlassPadded(
+    const uint8_t *source, const uint8_t *groupScales,
+    uint8_t *packedWeight, uint8_t *weightScales,
+    int rows, int columns, int paddedRows, int paddedColumns,
+    void *streamPtr = nullptr);
+bool FastllmCudaNvfp4CutlassGemmSm100(
+    const uint8_t *a, const uint8_t *b, const uint8_t *scaleA,
+    const uint8_t *scaleB, const float *alpha, void *d,
+    fastllm::DataType outputType, int m, int n, int k, void *streamPtr = nullptr);
+bool FastllmCudaNvfp4CutlassGemmSm120(
+    const uint8_t *a, const uint8_t *b, const uint8_t *scaleA,
+    const uint8_t *scaleB, const float *alpha, void *d,
+    fastllm::DataType outputType, int m, int n, int k, void *streamPtr = nullptr);
+bool FastllmCudaNvfp4GroupedGemmSm100(
+    const uint8_t *const *a, const uint8_t *const *b,
+    const uint8_t *const *scaleA, const uint8_t *const *scaleB,
+    const float *const *alpha, void *const *d, const int *rows,
+    int groups, int n, int k, fastllm::DataType outputType,
+    void *streamPtr = nullptr);
+bool FastllmCudaNvfp4GroupedGemmSm120(
+    const uint8_t *const *a, const uint8_t *const *b,
+    const uint8_t *const *scaleA, const uint8_t *const *scaleB,
+    const float *const *alpha, void *const *d, const int *rows,
+    int groups, int n, int k, fastllm::DataType outputType,
+    void *streamPtr = nullptr);
+bool FastllmCudaNvfp4GroupedGemmSm120DeviceRoutes(
+    const uint8_t *aBase, const uint8_t *scaleABase, void *dBase,
+    const uint8_t *const *b, const uint8_t *const *scaleB,
+    const float *const *alpha, const int *expertOffsets,
+    const int *blockscaleOffsets, int groups, int n, int k,
+    fastllm::DataType outputType, void *streamPtr = nullptr);
+bool FastllmCudaPrepareNvfp4W4A4Weight(
+    fastllm::Data &weight, int inFeatures, int outFeatures,
+    const uint8_t **packedWeight, const uint8_t **scales,
+    const float **alpha);
+bool FastllmCudaTryPrepackNvfp4W4A4Weight(fastllm::Data &weight);
+FastllmCudaNvfp4BackendState FastllmCudaGetNvfp4W4A4BackendState(
+    const fastllm::Data &weight, int device);
+void FastllmCudaSetNvfp4W4A4BackendState(
+    const fastllm::Data &weight, int device,
+    FastllmCudaNvfp4BackendState state);
+void FastllmCudaReleaseNvfp4W4A4CacheForDevice(
+    const fastllm::Data *weight, int device);
+bool TryCudaCutlassNvfp4W4A4(
+    const fastllm::Data &input, fastllm::Data &weight,
+    const fastllm::Data &bias, fastllm::Data &output,
+    int m, int n, int k);
+bool FastllmCudaCutlassNvfp4W4A4FromSwiglu(
+    const fastllm::Data &input, fastllm::Data &weight,
+    const fastllm::Data &bias, fastllm::Data &output,
+    int n, int m, int k);
+void FastllmCudaReleaseNvfp4W4A4Cache(const fastllm::Data *weight);
+bool FastllmCudaMergeMoeNvfp4W4A4Grouped(
+    const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &w2,
+    fastllm::Data &output, fastllm::Data **weights, int weightsBatch,
+    const fastllm::Data &index, const fastllm::Data &score,
+    int batch, int topk, int hidden, int inter,
+    fastllm::MoeGateType gateType);
+#else
+inline bool TryCudaCutlassNvfp4W4A4(
+    const fastllm::Data &, fastllm::Data &, const fastllm::Data &,
+    fastllm::Data &, int, int, int) { return false; }
+inline bool FastllmCudaTryPrepackNvfp4W4A4Weight(fastllm::Data &) {
+    return false;
+}
+/**
+ * 在未启用CUTLASS NVFP4时拒绝取得W4A4权重cache。
+ *
+ * 本占位实现只用于保持不同CUDA架构下的接口完整性；它不创建cache，
+ * 并清空所有可选输出，调用方应据false返回值回退或拒绝对应图路径。
+ *
+ * @param weight         未使用的逻辑权重。
+ * @param inFeatures     未使用的输入特征数。
+ * @param outFeatures    未使用的输出特征数。
+ * @param packedWeight   可选输出，存在时写为nullptr。
+ * @param scales         可选输出，存在时写为nullptr。
+ * @param alpha          可选输出，存在时写为nullptr。
+ * @return 始终返回false，表示当前构建没有CUTLASS NVFP4权重cache。
+ */
+inline bool FastllmCudaPrepareNvfp4W4A4Weight(
+        fastllm::Data &weight, int inFeatures, int outFeatures,
+        const uint8_t **packedWeight, const uint8_t **scales,
+        const float **alpha) {
+    (void)weight;
+    (void)inFeatures;
+    (void)outFeatures;
+
+    if (packedWeight != nullptr) *packedWeight = nullptr;
+    if (scales != nullptr) *scales = nullptr;
+    if (alpha != nullptr) *alpha = nullptr;
+
+    return false;
+}
+inline FastllmCudaNvfp4BackendState FastllmCudaGetNvfp4W4A4BackendState(
+        const fastllm::Data &, int) {
+    return FastllmCudaNvfp4BackendState::Rejected;
+}
+inline void FastllmCudaSetNvfp4W4A4BackendState(
+        const fastllm::Data &, int, FastllmCudaNvfp4BackendState) {}
+inline void FastllmCudaReleaseNvfp4W4A4CacheForDevice(
+        const fastllm::Data *, int) {}
+inline bool FastllmCudaCutlassNvfp4W4A4FromSwiglu(
+    const fastllm::Data &, fastllm::Data &, const fastllm::Data &,
+    fastllm::Data &, int, int, int) { return false; }
+inline void FastllmCudaReleaseNvfp4W4A4Cache(const fastllm::Data *) {}
+inline bool FastllmCudaMergeMoeNvfp4W4A4Grouped(
+    const fastllm::Data &, fastllm::Data &, fastllm::Data &,
+    fastllm::Data &, fastllm::Data **, int, const fastllm::Data &,
+    const fastllm::Data &, int, int, int, int,
+    fastllm::MoeGateType) {
+    return false;
+}
+#endif
 #ifdef FASTLLM_ENABLE_CUTLASS_W4A8
 bool TryCudaCutlassW4A8(const fastllm::Data &input, fastllm::Data &weight,
                         const fastllm::Data &bias, fastllm::Data &output,
@@ -909,6 +1124,9 @@ bool TryCudaCutlassW4A8(const fastllm::Data &input, fastllm::Data &weight,
 bool FastllmCudaW4A8QuantizeActivationPerToken(
     const fastllm::Data &input, int n, int m,
     void *fp8Data, float *tokenScales);
+bool FastllmCudaW4A8QuantizeActivationPerTokenStream(
+    const fastllm::Data &input, int n, int m,
+    void *fp8Data, float *tokenScales, void *stream);
 bool FastllmCudaW4A8PrepareWeightCache(
     fastllm::Data &weight, int inChannels, int outChannels);
 bool FastllmCudaInspectW4A8Activation(
@@ -932,6 +1150,23 @@ inline void FastllmCudaReleaseW4A8WeightCache(fastllm::Data &weight) {
     weight.w4a8CudaCaches.clear();
 }
 inline bool FastllmCudaBFloat16MergeMOEW4A8GroupedIndexed(
+    const fastllm::Data &, fastllm::Data &, fastllm::Data &,
+    fastllm::Data &, fastllm::Data **, int, const int *, const float *,
+    const int *, const int *, const int *, int, int, int, int, int) {
+    return false;
+}
+#endif
+#if defined(FASTLLM_ENABLE_CUTLASS_W8A8) && \
+    defined(FASTLLM_CUTLASS_W8A8_SM90)
+bool FastllmCudaMergeMOEFp8W8A8CutlassSm90(
+    const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &w2,
+    fastllm::Data &output, fastllm::Data **weights, int weightsBatch,
+    const int *routeRows, const float *routeScales,
+    const int *routePositions, const int *expertStarts,
+    const int *expertCounts, int batch, int topk, int totalTasks,
+    int hidden, int inter);
+#else
+inline bool FastllmCudaMergeMOEFp8W8A8CutlassSm90(
     const fastllm::Data &, fastllm::Data &, fastllm::Data &,
     fastllm::Data &, fastllm::Data **, int, const int *, const float *,
     const int *, const int *, const int *, int, int, int, int, int) {
@@ -1364,6 +1599,28 @@ bool FastllmCudaBFloat16MatMulFP8E4M3Block128Swiglu(const fastllm::Data &input, 
 bool FastllmCudaBFloat16MatMulFP8E4M3Block128AddTo(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &output, float alpha, bool overwrite, int n, int m, int k);
 bool FastllmCudaCutlassLinearFP8E4M3PerChannel(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaCutlassLinearFP8E4M3Block128(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
+bool FastllmCudaCutlassLinearInt8W8A8Sm90(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
+bool FastllmCudaCutlassLinearFp8W8A8(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
+bool FastllmCudaCutlassLinearFp8W8A8Sm120(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
+enum class FastllmCudaFp8W8A8BackendState : uint8_t {
+    Uninitialized,
+    Prepared,
+    Cutlass,
+    Rejected,
+};
+bool FastllmCudaTryPrepareFp8W8A8Weight(fastllm::Data &weight);
+FastllmCudaFp8W8A8BackendState FastllmCudaGetFp8W8A8BackendState(
+    const fastllm::Data &weight, int device);
+void FastllmCudaReleaseFp8W8A8BackendState(const fastllm::Data *weight);
+bool FastllmCudaTryPrepareFp8W8A8Block128Weight(fastllm::Data &weight);
+FastllmCudaFp8W8A8BackendState FastllmCudaGetFp8W8A8Block128BackendState(
+    const fastllm::Data &weight, int device);
+void FastllmCudaReleaseFp8W8A8Block128BackendState(
+    const fastllm::Data *weight);
+bool FastllmCudaCutlassLinearFp8W8A8Block128(
+    const fastllm::Data &input, fastllm::Data &weight,
+    const fastllm::Data &bias, fastllm::Data &output,
+    int m, int k, int n);
 bool FastllmCudaCutlassLinearFP8E4M3Block128Add(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaCutlassLinearFP8E4M3Block128FromRMSNorm(const fastllm::Data &input, fastllm::Data &normWeight, float eps, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaCutlassLinearFP8E4M3Block128FromRMSNormMaterialize(
@@ -1497,10 +1754,26 @@ bool FastllmCudaTritonMergeMOEFP8E4M3Indexed(
     const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &output,
     fastllm::Data **weights, int weightsBatch, const int32_t *indices, const float *scores,
     int batch, int topk, int hidden, int inter);
+bool FastllmCudaTritonMergeMOEFP8E4M3Block128Indexed(
+    const char *const *cubinPaths, const char *const *kernelNames,
+    const int *numWarps, const int *shared,
+    int routeBlockT, int maxExperts, int groupBlockM, int groupBlockN,
+    int groupBlockK, int groupSizeM, const fastllm::Data &input,
+    fastllm::Data &w1, fastllm::Data &output, fastllm::Data **weights,
+    int weightsBatch, const int32_t *indices, const float *scores,
+    int batch, int topk, int hidden, int inter);
 bool FastllmCudaTritonMergeMOEFP8E4M3IndexedIsPacked(
     fastllm::Data **weights, int weightsBatch, int hidden, int inter);
 
 bool FastllmCudaTritonFusedMOEFP8E4M3(
+    const char *const *cubinPaths, const char *const *kernelNames,
+    const int *numWarps, const int *shared,
+    int routeBlockT, int maxExperts, int groupBlockM, int groupBlockN, int groupBlockK, int groupSizeM,
+    const fastllm::Data &input, fastllm::Data &gate, fastllm::Data &up, fastllm::Data &down,
+    const fastllm::Data &index, const fastllm::Data &score,
+    fastllm::Data &w1, fastllm::Data &output,
+    int batch, int topk, int hidden, int inter, int experts);
+bool FastllmCudaTritonFusedMOEFP8E4M3Block128(
     const char *const *cubinPaths, const char *const *kernelNames,
     const int *numWarps, const int *shared,
     int routeBlockT, int maxExperts, int groupBlockM, int groupBlockN, int groupBlockK, int groupSizeM,

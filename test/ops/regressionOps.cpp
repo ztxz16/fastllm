@@ -5,6 +5,7 @@
 #include "models/deepseekv4.h"
 #include "devices/cpu/computeutils.h"
 #include "gguf.h"
+#include "utils/math.hpp"
 
 #ifdef USE_NUMAS
 #include "devices/numas/numasdevice.h"
@@ -40,6 +41,25 @@
 #include <thread>
 #include <utility>
 #include <vector>
+
+static_assert(fastllm::next_pow_2(0) == 0 && fastllm::next_pow_2(1) == 1,
+              "Power-of-two rounding must preserve zero and one");
+static_assert(fastllm::next_pow_2(8) == 8 && fastllm::next_pow_2(9) == 16 &&
+              fastllm::next_pow_2(0x80000000u) == 0x80000000u,
+              "Power-of-two rounding must support exact powers and the upper bound");
+static_assert(fastllm::div_ceil(0, 256) == 0 && fastllm::div_ceil(1024, 256) == 4 &&
+              fastllm::div_ceil(1025, 256) == 5,
+              "Block counts must include a partial final block");
+static_assert(fastllm::div_ceil(std::uint64_t{1} << 40, 256) == (std::uint64_t{1} << 32),
+              "Mixed-width division must preserve large dimensions");
+static_assert(fastllm::round_to_previous_multiple_of(0, 4) == 0 &&
+              fastllm::round_to_previous_multiple_of(8, 4) == 8 &&
+              fastllm::round_to_previous_multiple_of(10, 4) == 8,
+              "Downward alignment must preserve aligned values and truncate remainders");
+static_assert(fastllm::round_to_next_multiple_of(0, 4) == 0 &&
+              fastllm::round_to_next_multiple_of(8, 4) == 8 &&
+              fastllm::round_to_next_multiple_of(10, 4) == 12,
+              "Upward alignment must preserve aligned values and pad remainders");
 
 namespace fastllm {
     bool FastllmGemmBFloat16NVFP4Block16E8M0_AVX512BF16(

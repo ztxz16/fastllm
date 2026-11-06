@@ -24,6 +24,8 @@ option(BUILD_CLI "build cli" OFF)
 
 option(UNIT_TEST "build unit tests" OFF)
 
+option(BUILD_PROCESS_TP "build Linux process TP infrastructure (experimental)" OFF)
+
 if(NOT DEFINED CUDA_ARCH)
     if(DEFINED CMAKE_CUDA_ARCHITECTURES)
         set(CUDA_ARCH "${CMAKE_CUDA_ARCHITECTURES}")
@@ -257,13 +259,27 @@ if (USE_CUDA)
     add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
     add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>)
     set(FASTLLM_CUDA_ARCHITECTURES ${CUDA_ARCH})
-    if (CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.9)
+    if (CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.8)
         set(FASTLLM_CUDA_ARCHITECTURES_NORMALIZED "")
         foreach(FASTLLM_CUDA_ARCH IN LISTS FASTLLM_CUDA_ARCHITECTURES)
-            if (FASTLLM_CUDA_ARCH STREQUAL "120")
-                list(APPEND FASTLLM_CUDA_ARCHITECTURES_NORMALIZED "120f")
+            if (FASTLLM_CUDA_ARCH STREQUAL "100")
+                if (CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13.0)
+                    list(APPEND FASTLLM_CUDA_ARCHITECTURES_NORMALIZED "100f")
+                else()
+                    list(APPEND FASTLLM_CUDA_ARCHITECTURES_NORMALIZED "100a")
+                endif()
+            elseif (FASTLLM_CUDA_ARCH STREQUAL "120")
+                if (CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13.0)
+                    list(APPEND FASTLLM_CUDA_ARCHITECTURES_NORMALIZED "120f")
+                else()
+                    list(APPEND FASTLLM_CUDA_ARCHITECTURES_NORMALIZED "120a")
+                endif()
             elseif (FASTLLM_CUDA_ARCH STREQUAL "121")
-                list(APPEND FASTLLM_CUDA_ARCHITECTURES_NORMALIZED "121f")
+                if (CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13.0)
+                    list(APPEND FASTLLM_CUDA_ARCHITECTURES_NORMALIZED "121f")
+                else()
+                    list(APPEND FASTLLM_CUDA_ARCHITECTURES_NORMALIZED "121a")
+                endif()
             else()
                 list(APPEND FASTLLM_CUDA_ARCHITECTURES_NORMALIZED "${FASTLLM_CUDA_ARCH}")
             endif()
@@ -283,15 +299,20 @@ if (USE_CUDA)
     set(FASTLLM_CUTLASS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/cutlass")
     set(FASTLLM_CUTLASS_FP8_ARCH_ENABLED OFF)
     set(FASTLLM_CUTLASS_FP8_SM89_ENABLED OFF)
+    set(FASTLLM_CUTLASS_FP8_SM90_ENABLED OFF)
     set(FASTLLM_CUTLASS_FP8_SM120_ENABLED OFF)
     set(FASTLLM_CUTLASS_FP8_SM121_ENABLED OFF)
     foreach(FASTLLM_CUDA_ARCH IN LISTS FASTLLM_CUDA_ARCHITECTURES)
         if (FASTLLM_CUDA_ARCH STREQUAL "89")
             set(FASTLLM_CUTLASS_FP8_SM89_ENABLED ON)
+        elseif (FASTLLM_CUDA_ARCH STREQUAL "90a" OR
+            FASTLLM_CUDA_ARCH STREQUAL "9.0a")
+            set(FASTLLM_CUTLASS_FP8_ARCH_ENABLED ON)
+            set(FASTLLM_CUTLASS_FP8_SM90_ENABLED ON)
         endif()
-        if (FASTLLM_CUDA_ARCH STREQUAL "120f")
+        if (FASTLLM_CUDA_ARCH STREQUAL "120a" OR FASTLLM_CUDA_ARCH STREQUAL "120f")
             set(FASTLLM_CUTLASS_FP8_SM120_ENABLED ON)
-        elseif (FASTLLM_CUDA_ARCH STREQUAL "121f")
+        elseif (FASTLLM_CUDA_ARCH STREQUAL "121a" OR FASTLLM_CUDA_ARCH STREQUAL "121f")
             set(FASTLLM_CUTLASS_FP8_SM121_ENABLED ON)
         endif()
     endforeach()
@@ -315,6 +336,9 @@ if (USE_CUDA)
             CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.4)
             add_compile_definitions(FASTLLM_CUTLASS_FP8_ENABLE_SM89)
         endif()
+        if (FASTLLM_CUTLASS_FP8_SM90_ENABLED)
+            add_compile_definitions(FASTLLM_CUTLASS_FP8_ENABLE_SM90)
+        endif()
         if (FASTLLM_CUTLASS_FP8_SM120_ENABLED AND
             CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.9)
             add_compile_definitions(FASTLLM_CUTLASS_FP8_ENABLE_SM120)
@@ -325,6 +349,51 @@ if (USE_CUDA)
         endif()
     else()
         message(STATUS "CUTLASS FP8 kernels: OFF (${FASTLLM_CUTLASS_DIR})")
+    endif()
+
+    # Native NVFP4 W4A4 uses block-scaled Tensor Core instructions.  Keep the
+    # feature tied to the exact accelerated architecture variants that CUTLASS
+    # requires; a plain PTX-compatible target is not sufficient.
+    set(FASTLLM_CUTLASS_NVFP4_SM100_ENABLED OFF)
+    set(FASTLLM_CUTLASS_NVFP4_SM120_ENABLED OFF)
+    foreach(FASTLLM_CUDA_ARCH IN LISTS FASTLLM_CUDA_ARCHITECTURES)
+        if (FASTLLM_CUDA_ARCH STREQUAL "100a" OR
+            FASTLLM_CUDA_ARCH STREQUAL "100f" OR
+            FASTLLM_CUDA_ARCH STREQUAL "10.0a" OR
+            FASTLLM_CUDA_ARCH STREQUAL "10.0f")
+            set(FASTLLM_CUTLASS_NVFP4_SM100_ENABLED ON)
+        elseif(FASTLLM_CUDA_ARCH STREQUAL "120a" OR
+               FASTLLM_CUDA_ARCH STREQUAL "121a" OR
+               FASTLLM_CUDA_ARCH STREQUAL "120f" OR
+               FASTLLM_CUDA_ARCH STREQUAL "121f" OR
+               FASTLLM_CUDA_ARCH STREQUAL "12.0a" OR
+               FASTLLM_CUDA_ARCH STREQUAL "12.1a" OR
+               FASTLLM_CUDA_ARCH STREQUAL "12.0f" OR
+               FASTLLM_CUDA_ARCH STREQUAL "12.1f")
+            set(FASTLLM_CUTLASS_NVFP4_SM120_ENABLED ON)
+        endif()
+    endforeach()
+    set(FASTLLM_CUTLASS_NVFP4_ENABLED OFF)
+    if (EXISTS "${FASTLLM_CUTLASS_DIR}/include/cutlass/cutlass.h" AND
+        CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.8 AND
+        (FASTLLM_CUTLASS_NVFP4_SM100_ENABLED OR FASTLLM_CUTLASS_NVFP4_SM120_ENABLED))
+        set(FASTLLM_CUTLASS_NVFP4_ENABLED ON)
+        include_directories("${FASTLLM_CUTLASS_DIR}/include")
+        include_directories(src/devices/cuda/fp4)
+        add_compile_definitions(FASTLLM_ENABLE_CUTLASS_NVFP4)
+        if (FASTLLM_CUTLASS_NVFP4_SM100_ENABLED)
+            add_compile_definitions(FASTLLM_ENABLE_CUTLASS_NVFP4_SM100)
+        endif()
+        if (FASTLLM_CUTLASS_NVFP4_SM120_ENABLED)
+            add_compile_definitions(FASTLLM_ENABLE_CUTLASS_NVFP4_SM120)
+        endif()
+        if (CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.9)
+            message(STATUS "CUTLASS NVFP4 W4A4 kernels: ON (PACK16 activation quantization)")
+        else()
+            message(STATUS "CUTLASS NVFP4 W4A4 kernels: ON (PACK8 activation quantization)")
+        endif()
+    else()
+        message(STATUS "CUTLASS NVFP4 W4A4 kernels: OFF")
     endif()
 
     set(FASTLLM_CUTLASS_W4A8_ARCH_ENABLED OFF)
@@ -351,11 +420,26 @@ if (USE_CUDA)
         message(STATUS "CUTLASS W4A8 kernels: OFF (${FASTLLM_CUTLASS_DIR})")
     endif()
 
+    set(FASTLLM_CUTLASS_W8A8_ENABLED OFF)
+    if (EXISTS "${FASTLLM_CUTLASS_DIR}/include/cutlass/cutlass.h" AND
+        ((FASTLLM_CUTLASS_FP8_SM90_ENABLED AND CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.3) OR
+         (FASTLLM_CUTLASS_FP8_SM120_ENABLED AND CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.9)))
+        set(FASTLLM_CUTLASS_W8A8_ENABLED ON)
+        add_compile_definitions(FASTLLM_ENABLE_CUTLASS_W8A8)
+        if (FASTLLM_CUTLASS_FP8_SM90_ENABLED AND CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.3)
+            add_compile_definitions(FASTLLM_CUTLASS_W8A8_SM90)
+        endif()
+        if (FASTLLM_CUTLASS_FP8_SM120_ENABLED AND CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.9)
+            add_compile_definitions(FASTLLM_CUTLASS_W8A8_SM120)
+        endif()
+    endif()
+
     #message(${CMAKE_CUDA_IMPLICIT_LINK_DIRECTORIES})
     set(FASTLLM_CUDA_SOURCES src/devices/cuda/cudadevice.cpp src/devices/cuda/cudadevicebatch.cpp 
         src/devices/cuda/fastllm-cuda.cu 
         src/devices/cuda/fastllm-triton-cuda.cu
         src/devices/cuda/fastllm-ggml-cuda.cu
+        src/devices/cuda/attention/fastllm-attention-backend.cpp
         src/devices/cuda/attention/fastllm-attention.cu
         src/devices/cuda/attention/paged/fastllm-paged-attention-native.cu
         src/devices/cuda/linear/fastllm-linear-fp32.cu
@@ -366,15 +450,34 @@ if (USE_CUDA)
         src/devices/cuda/linear/fastllm-linear-nvfp4-marlin.cu
         src/devices/cuda/linear/fastllm-marlin-fp8-dense.cu
         src/devices/cuda/linear/fastllm-linear-fp8-cutlass.cu
+        src/devices/cuda/linear/fastllm-linear-w8a8-cutlass.cu
         src/devices/cuda/linear/fastllm-linear-fp8-cutlass-sm89.cu
         src/devices/cuda/moe/fastllm-moe-fp8.cu
         src/devices/cuda/moe/fastllm-moe-vllm-marlin.cu
         src/devices/cuda/linear/fastllm-linear-int8.cu
+        src/devices/cuda/linear/fastllm-linear-machete.cu
         src/devices/cuda/linear/fastllm-linear-int4.cu
         src/devices/cuda/linear/fastllm-linear-int4group.cu
         src/devices/cuda/linear/fastllm-marlin.cu
         src/devices/cuda/linear/fastllm-linear-int4nozero.cu
         src/devices/cuda/models/deepseekv4-kernels.cu)
+
+    option(FASTLLM_ENABLE_MACHETE_BUILD "Build Hopper Machete W4A16/W8A16 backend" ON)
+    if(FASTLLM_ENABLE_MACHETE_BUILD AND FASTLLM_CUTLASS_W4A8_ENABLED)
+        # 独立目标强制90a，不能仅设置无效的逐源文件CUDA_ARCHITECTURES属性。
+        add_library(fastllm_machete_kernels OBJECT
+            src/devices/cuda/linear/machete/fastllm-machete-kernel.cu)
+        set_target_properties(fastllm_machete_kernels PROPERTIES
+            CUDA_ARCHITECTURES "90a" CUDA_STANDARD 17
+            POSITION_INDEPENDENT_CODE ON)
+        target_compile_options(fastllm_machete_kernels PRIVATE
+            $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+        add_compile_definitions(FASTLLM_ENABLE_MACHETE)
+        list(APPEND FASTLLM_CUDA_SOURCES $<TARGET_OBJECTS:fastllm_machete_kernels>)
+        message(STATUS "Machete W4A16/W8A16: ON (sm_90a; runtime opt-in)")
+    else()
+        message(STATUS "Machete W4A16/W8A16: OFF")
+    endif()
 
     if(FASTLLM_CUTLASS_W4A8_ENABLED)
         include_directories(src)
@@ -382,6 +485,24 @@ if (USE_CUDA)
             src/devices/cuda/linear/fastllm-linear-w4a8-cutlass.cu
             src/devices/cuda/linear/fastllm-w4a8-utils.cu
             src/devices/cuda/moe/fastllm-moe-w4a8-cutlass.cu
+        )
+    endif()
+
+    if(FASTLLM_CUTLASS_W8A8_ENABLED AND FASTLLM_CUTLASS_FP8_SM90_ENABLED)
+        list(APPEND FASTLLM_CUDA_SOURCES
+            src/devices/cuda/moe/fastllm-moe-fp8-w8a8-cutlass-sm90.cu
+        )
+    endif()
+
+    if(FASTLLM_CUTLASS_NVFP4_ENABLED)
+        list(APPEND FASTLLM_CUDA_SOURCES
+            src/devices/cuda/fp4/fastllm-nvfp4-quant.cu
+            src/devices/cuda/linear/fastllm-linear-nvfp4-cutlass.cu
+            src/devices/cuda/linear/fastllm-linear-nvfp4-cutlass-sm100.cu
+            src/devices/cuda/linear/fastllm-linear-nvfp4-cutlass-sm120.cu
+            src/devices/cuda/moe/fastllm-moe-nvfp4-cutlass-sm100.cu
+            src/devices/cuda/moe/fastllm-moe-nvfp4-cutlass-sm120.cu
+            src/devices/cuda/moe/fastllm-moe-nvfp4-cutlass.cu
         )
     endif()
 
@@ -571,6 +692,37 @@ if (USE_TOPS) # For suiyuan
     #target_link_libraries(main rtcu)
 endif()
 
+if (BUILD_PROCESS_TP)
+    if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR USE_ROCM OR USE_IVCOREX)
+        message(FATAL_ERROR "Process TP currently requires Linux with NVIDIA CUDA or a CPU control-only build")
+    endif()
+    find_package(Threads REQUIRED)
+    add_library(fastllm_process_tp STATIC src/distributed/process_group.cpp)
+    set_target_properties(fastllm_process_tp PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(fastllm_process_tp PUBLIC ${PROJECT_SOURCE_DIR}/include)
+    target_link_libraries(fastllm_process_tp PUBLIC Threads::Threads)
+
+    add_executable(fastllm_tp_worker tools/src/tp_worker.cpp)
+    target_include_directories(fastllm_tp_worker PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    target_link_libraries(fastllm_tp_worker PRIVATE fastllm_process_tp)
+    if(USE_CUDA)
+        find_library(FASTLLM_PROCESS_CUDART cudart HINTS ${CMAKE_CUDA_IMPLICIT_LINK_DIRECTORIES})
+        if(NOT FASTLLM_PROCESS_CUDART)
+            message(FATAL_ERROR "Process TP worker requires the CUDA runtime library (cudart)")
+        endif()
+        target_compile_definitions(fastllm_tp_worker PRIVATE FASTLLM_PROCESS_TP_CUDA)
+        target_include_directories(fastllm_tp_worker PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        target_link_libraries(fastllm_tp_worker PRIVATE ${FASTLLM_PROCESS_CUDART} nccl)
+        set_target_properties(fastllm_tp_worker PROPERTIES
+            BUILD_RPATH "$ORIGIN;$ORIGIN/../nvidia/cuda_runtime/lib;$ORIGIN/../nvidia/nccl/lib"
+            INSTALL_RPATH "$ORIGIN;$ORIGIN/../nvidia/cuda_runtime/lib;$ORIGIN/../nvidia/nccl/lib")
+    endif()
+
+    add_executable(fastllm_tp_check tools/src/tp_check.cpp third_party/json11/json11.cpp)
+    target_link_libraries(fastllm_tp_check PRIVATE fastllm_process_tp)
+    install(TARGETS fastllm_tp_worker fastllm_tp_check RUNTIME DESTINATION bin)
+endif()
+
 if (PY_API)
     if(POLICY CMP0148)
         cmake_policy(SET CMP0148 NEW)
@@ -619,6 +771,9 @@ if (UNIT_TEST)
     endif()
 
     if (USE_CUDA AND NOT USE_ROCM)
+        add_executable(macheteLinearTest test/ops/macheteLinearTest.cpp)
+        target_link_libraries(macheteLinearTest fastllm)
+        target_include_directories(macheteLinearTest PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
         add_executable(cudaGraphPoolMissRegression test/ops/cudaGraphPoolMissRegression.cpp)
         target_link_libraries(cudaGraphPoolMissRegression fastllm)
         target_include_directories(cudaGraphPoolMissRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
@@ -651,6 +806,14 @@ endif()
 
 add_library(fastllm_tools SHARED ${FASTLLM_CXX_SOURCES} ${FASTLLM_CUDA_SOURCES} ${FASTLLM_TFACC_SOURCES} ${FASTLLM_TOPS_SOURCES} tools/src/pytools.cpp)
 target_link_libraries(fastllm_tools PUBLIC ${FASTLLM_LINKED_LIBS})
+
+if (BUILD_PROCESS_TP)
+    add_dependencies(fastllm_tools fastllm_tp_worker fastllm_tp_check)
+    add_custom_command(TARGET fastllm_tools POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/tools/ftllm
+        COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:fastllm_tp_worker> ${CMAKE_BINARY_DIR}/tools/ftllm/
+        COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:fastllm_tp_check> ${CMAKE_BINARY_DIR}/tools/ftllm/)
+endif()
 
 set(BUILD_INFO_USE_CUDA "false")
 set(BUILD_INFO_USE_ROCM "false")

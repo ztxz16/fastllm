@@ -18,6 +18,9 @@ namespace fastllm {
 
         virtual void InitParams(); // 初始化参数信息
 
+        /** MiniCPM3当前只接入Continuous KV Cache。 */
+        virtual ModelAttentionCapabilities GetModelAttentionCapabilities() const override;
+
         // 推理
         virtual int Forward(
                 const Data &inputIds,

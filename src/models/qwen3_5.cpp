@@ -2668,6 +2668,11 @@ namespace fastllm {
                 local->name = data.name;
                 local->isModelWeight = data.isModelWeight;
                 local->weightType = data.weightType;
+                local->linearQuantScheme = data.linearQuantScheme;
+                local->w8a8InputDynamic = data.w8a8InputDynamic;
+                local->w8a8InputSymmetric = data.w8a8InputSymmetric;
+                local->w8a8InputScale = data.w8a8InputScale;
+                local->w8a8InputZeroPoint = data.w8a8InputZeroPoint;
                 local->dataDevice = DataDevice::CUDA;
                 local->dataDeviceIds = {device};
                 if (local->Count(0) > 0) {
@@ -2742,6 +2747,11 @@ namespace fastllm {
                 local->name = weight.name;
                 local->isModelWeight = weight.isModelWeight;
                 local->weightType = weight.weightType;
+                local->linearQuantScheme = weight.linearQuantScheme;
+                local->w8a8InputDynamic = weight.w8a8InputDynamic;
+                local->w8a8InputSymmetric = weight.w8a8InputSymmetric;
+                local->w8a8InputScale = weight.w8a8InputScale;
+                local->w8a8InputZeroPoint = weight.w8a8InputZeroPoint;
                 local->dataDevice = DataDevice::CUDA;
                 local->dataDeviceIds = {device};
                 if (local->Count(0) > 0) {
@@ -6265,6 +6275,7 @@ namespace fastllm {
         mergeData.groupCnt = input0.groupCnt;
         mergeData.blockK = input0.blockK;
         mergeData.blockM = input0.blockM;
+        mergeData.nvfp4GlobalScale = input0.nvfp4GlobalScale;
         mergeData.Allocate();
 
         uint64_t offset = 0;
@@ -6274,6 +6285,15 @@ namespace fastllm {
             mergeData.scales = AppendVector(mergeData.scales, input->scales);
             mergeData.mins = AppendVector(mergeData.mins, input->mins);
             mergeData.halfScales = AppendVector(mergeData.halfScales, input->halfScales);
+            if (mergeData.dataType == DataType::NVFP4_BLOCK_16) {
+                if (!input->nvfp4GroupScales.empty() &&
+                    input->nvfp4GlobalScale == mergeData.nvfp4GlobalScale) {
+                    mergeData.nvfp4GroupScales = AppendVector(
+                        mergeData.nvfp4GroupScales, input->nvfp4GroupScales);
+                } else {
+                    mergeData.nvfp4GroupScales.clear();
+                }
+            }
             memcpy(mergeData.cpuData + offset, input->cpuData, input->GetBytes());
             offset += input->GetBytes();
         }

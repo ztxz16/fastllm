@@ -1,0 +1,30 @@
+UTC: 2026-08-03T14:33:45Z
+PWD: /home/project/vllm_fastllm
+
+COMMAND: git diff --check
+EXIT: 0
+OUTPUT: <empty>
+
+COMMAND: bash -n test/w8a8/run_w8a8_tests.sh
+EXIT: 0
+OUTPUT: <empty>
+
+COMMAND: command -v nvidia-smi
+EXIT: 1
+OUTPUT: <empty; nvidia-smi is not installed>
+
+COMMAND: rg -n strict dispatch predicates src/devices/cuda src/model.cpp
+EXIT: 0
+OUTPUT:
+src/model.cpp:877: INT8_W8A8 requires [out,1] per-channel scales.
+src/devices/cuda/moe/fastllm-moe-w4a8-cutlass.cu:739: exact runtime SM90 gate
+src/devices/cuda/moe/fastllm-moe-w4a8-cutlass.cu:744: batch >= 16 and route-count gate
+src/devices/cuda/linear/fastllm-linear-fp8-cutlass.cu:809: blockM=128, blockK=128 gate
+src/devices/cuda/linear/fastllm-linear-w8a8-cutlass.cu:292: exact runtime SM90 INT8 gate
+src/devices/cuda/linear/fastllm-linear-w8a8-cutlass.cu:315: exact runtime SM120 FP8 gate
+src/devices/cuda/linear/fastllm-linear-w8a8-cutlass.cu:318: standard FP8 blockK=1 gate
+src/devices/cuda/linear/fastllm-linear-w8a8-cutlass.cu:319: standard FP8 blockM=K and scale-count=N gate
+
+POLICY: No CMake configure, compiler, linker, CUDA kernel, operator, forward_check,
+or end-to-end benchmark command was run locally, per user request. Runtime logs are
+produced by test/w8a8/run_w8a8_tests.sh on an SM90 or SM120 machine.

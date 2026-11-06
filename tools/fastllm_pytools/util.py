@@ -480,12 +480,28 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--moe_atype', type = str, default = "", help = 'MOE层激活类型，可使用auto、float32、float16或bfloat16')
     parser.add_argument('--atype', type = str, default = "auto", help = '推理类型，可使用float32或float16')
     parser.add_argument('--kv_cache_dtype', type = str, default = "auto", help = 'KV Cache类型，可使用auto、float16、bfloat16或fp8_e4m3')
+    parser.add_argument('--kv-cache-layout', choices = ('auto', 'continuous', 'paged'), default = 'auto',
+                        help = '支持双KV布局模型的Cache布局；auto保留模型默认布局')
+    parser.add_argument('--attention-backend', type = str, default = "auto",
+                        help = 'Attention实现，可使用auto、legacy_contiguous、native_paged或flashinfer_paged')
+    parser.add_argument('--linear-backend', choices=('native', 'machete', 'auto'),
+                        default=os.environ.get('FASTLLM_LINEAR_BACKEND', 'native'),
+                        help='W4A16/W8A16 Linear后端；machete严格拒绝不支持的组合')
+    parser.add_argument('--linear-backend-trace', action='store_true',
+                        default=os.environ.get('FASTLLM_LINEAR_BACKEND_TRACE') == '1',
+                        help='记录Linear路径及scale/offset舍入误差，测速前关闭')
+    parser.add_argument('--attention-backend-strict', action = 'store_true',
+                        help = '指定Attention Backend不兼容时直接失败，禁止fallback')
+    parser.add_argument('--attention-backend-trace', action = 'store_true',
+                        help = '输出每种Attention静态调用签名首次选择的Backend')
     parser.add_argument('--cuda_embedding', action = 'store_true', help = '在cuda上进行embedding')
     parser.add_argument('--kv_cache_limit', type = str, default = "auto",  help = 'kv缓存最大使用量')
     parser.add_argument('--max_batch', type = int, default = -1,  help = '每次最多同时推理的询问数量')
     parser.add_argument('--chunked_prefill_size', type = int, default = -1, help = '分块 prefill 的切片大小（首块与后续块相同），如 8192')
     parser.add_argument('--device', type = str, help = '使用的设备')
-    parser.add_argument('--tp', type = str, default = "", help = '线程级张量并行设备；裸数字X表示使用前X张卡，0表示0号卡，也可写 0,1 或 auto')
+    parser.add_argument('--tp', type = str, default = "", help = '张量并行设备；裸数字X表示使用前X张卡，0表示0号卡，也可写 0,1 或 auto')
+    parser.add_argument('--tp_backend', '--tp-backend', choices = ['thread', 'process'], default = 'thread',
+                        help = 'TP后端；默认thread。process目前只有进程底座，尚未接入模型推理')
     parser.add_argument('--moe_device', type = str, default = "", help = 'moe使用的设备')
     parser.add_argument('--moe_device_layers', type = int, default = -1, help = '后面多少层moe使用moe_device，-1表示全部moe层使用moe_device')
     parser.add_argument('--moe_experts', type = int, default = -1, help = 'moe使用的专家数')
@@ -588,6 +604,14 @@ def make_normal_llm_model(args, startup_progress = None):
                     if (it == "FASTLLM_ACTIVATE_NUMA" or it == "FASTLLM_NUMA_THREADS"):
                         os.environ[it] = str(args_config[it])
                     setattr(args, it, args_config[it])
+
+    tp_backend = getattr(args, "tp_backend", "thread")
+    if tp_backend not in ("thread", "process"):
+        raise ValueError("tp_backend must be thread or process")
+    if tp_backend == "process":
+        raise NotImplementedError(
+            "process TP inference is not connected yet; use fastllm_tp_check to validate "
+            "worker lifecycle/NCCL. No model has been loaded and no thread fallback was selected.")
 
     user_set_device = bool(args.device and args.device != "")
     user_set_moe_device = bool(args.moe_device and args.moe_device != "")
@@ -1005,6 +1029,12 @@ def make_normal_llm_model(args, startup_progress = None):
     apply_page_size_default(args)
     if (args.page_size > 0):
         llm.set_page_size(args.page_size)
+    llm.set_kv_cache_layout(args.kv_cache_layout)
+    llm.set_attention_backend(args.attention_backend)
+    llm.set_attention_backend_strict(args.attention_backend_strict)
+    llm.set_attention_backend_trace(args.attention_backend_trace)
+    llm.set_linear_backend(getattr(args, 'linear_backend', os.environ.get('FASTLLM_LINEAR_BACKEND', 'native')))
+    llm.set_linear_backend_trace(getattr(args, 'linear_backend_trace', os.environ.get('FASTLLM_LINEAR_BACKEND_TRACE') == '1'))
     apply_prefix_cache_env(args)
     if (hasattr(args, 'gpu_mem_ratio')):
         llm.set_gpu_mem_ratio(args.gpu_mem_ratio)

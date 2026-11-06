@@ -9,6 +9,7 @@
 #include <vector>
 #include <cstdint>
 #include <string>
+#include <tuple>
 #include <map>
 #include <set>
 #include <queue>
@@ -105,6 +106,26 @@ namespace fastllm {
     int GetMaxTokens();
     void SetPageLen(int pageLen);
     int GetPageLen();
+    /** 设置支持双KV布局模型使用的Cache布局；应在模型加载前调用。 */
+    void SetKVCacheLayout(const std::string &layout);
+    /** 返回请求的KV Cache布局名称。 */
+    std::string GetKVCacheLayout();
+    /** 在Attention路径记录开启时输出模型实际使用的KV Cache布局。 */
+    void TraceKVCacheLayout(const std::string &model, const std::string &actual);
+    /** 设置进程级Attention Backend名称；应在模型加载前调用。 */
+    void SetAttentionBackend(const std::string &backend);
+    /** 返回当前进程请求的Attention Backend名称。 */
+    std::string GetAttentionBackend();
+    /** 设置显式Backend不兼容时是否禁止回退到auto。 */
+    void SetAttentionBackendStrict(bool strict);
+    /** 返回Attention Backend严格选择开关。 */
+    bool GetAttentionBackendStrict();
+    /** 设置是否记录每种静态调用签名的首次Backend选择。 */
+    void SetAttentionBackendTrace(bool trace);
+    /** 返回Attention Backend路径记录开关。 */
+    bool GetAttentionBackendTrace();
+    /** 返回进程中尚未销毁的异步推理请求上下文数量。 */
+    int GetActiveResponseContextCount();
     void SetGpuMemRatio(float ratio);
     float GetGpuMemRatio();
     AliveThreadPool *GetAlivePool();
@@ -321,22 +342,42 @@ namespace fastllm {
         FP8_E4M3_PERCHANNEL = 1003, // fp8, per channel量化
         INT4_GROUP128 = 1004, // int4, per group量化，group = 128
         INT8_PERCHANNEL = 1005, // int8, per channel量化
-        NVFP4_BLOCK_16 = 1006, // packed fp4 e2m1, blockM = 16, inline float scale per block
+        NVFP4_BLOCK_16 = 1006, // packed fp4 e2m1 + effective FP32 scale; original E4M3/global scales are kept in Data metadata
         NVFP4_BLOCK_16_E8M0 = 1007, // packed fp4 e2m1, blockM = 16, inline e8m0 scale per block
         // Symmetric group-32 INT4. Four groups form one compact block:
         // [up to 4 * 16 packed INT4 bytes] [the corresponding BF16 scales].
         // The final partial block has no padding. The implicit zero point is 8.
         INT4_GROUP32 = 1008,
         INT4_W4A8 = 1009, // independent W4A8: uint4b8 source + BF16 symmetric group=128 scales
+        INT8_W8A8 = 1010, // signed symmetric INT8 weight + FP32 per-output-channel scales
         // Internal NUMA layout for NVFP4 blockM=32 weights:
         // [16 packed fp4 bytes] [one inline E8M0 scale byte].
-        NVFP4_BLOCK_32_E8M0 = 1010,
+        NVFP4_BLOCK_32_E8M0 = 1011,
         INF_INT8_PERCHANNEL = 2000, // 推理用的int8, per channel量化
         INF_INT8_GROUP128 = 2001, // 推理用的int8, per group量化，group = 128
         INF_INT8_GROUP32 = 2002, // 推理用的int8, per group量化，group = 32
         DATA_GGUF_FORMAT = 9999, DATA_GGUF_FORMAT_END = 19999, // [DATA_GGUF_FORMAT, DATA_GGUF_FORMAT_END]之间为GGUF格式的数据，ggml_type = type - DATA_FFUF_FORMAT
         DATA_AUTO_NONE = 99999, DATA_AUTO_LINEAR, DATA_AUTO_EMBEDDING, DATA_AUTO_CONV,
         DATA_AUTO_SOURCE // auto keeps scaled FP8 source weights, otherwise uses FLOAT16
+    };
+
+    /**
+     * 描述Linear权重在模型配置中声明的量化计算方案。
+     *
+     * 该枚举只回答“本层采用哪种权重/激活量化语义”，不指定CUTLASS、
+     * Triton或Legacy等硬件后端。HF compressed-tensors模型在加载阶段根据
+     * quantization_config为每个Linear固定方案；LEGACY_AUTO仅用于没有可用
+     * 配置元数据的旧模型和手工构造权重，保留原有运行时兼容探测。
+     */
+    enum class LinearQuantScheme {
+        NONE = 0,
+        LEGACY_AUTO,
+        FP8_W8A8,
+        FP8_W8A8_BLOCK128,
+        INT8_W8A8,
+        INT4_W4A8,
+        NVFP4_W4A4,
+        NVFP4_W4A16,
     };
 
     enum class W4A8WeightEncoding {
@@ -493,6 +534,14 @@ namespace fastllm {
 
         bool lockInCPU = false; // 如果lock在CPU上，那么不允许移动到其余设备
         WeightType weightType = WeightType::NONE; // 权重类型，NONE代表非权重（或未知权重）
+        // 模型配置确定的Linear量化语义；硬件后端生命周期由CUDA侧独立管理。
+        LinearQuantScheme linearQuantScheme = LinearQuantScheme::LEGACY_AUTO;
+        // INT8 W8A8激活量化语义。动态方案在每个token上生成scale/zero-point；
+        // 静态方案使用checkpoint随Linear保存的tensorwise参数。
+        bool w8a8InputDynamic = true;
+        bool w8a8InputSymmetric = true;
+        float w8a8InputScale = 0.0f;
+        int w8a8InputZeroPoint = 0;
 
         DataType dataType = DataType::FLOAT32; // 数据类型
         int unitSize, unitSizeDiv = 1; // 单个元素的字节数 = unitSIze / unitSizeDiv
@@ -522,6 +571,13 @@ namespace fastllm {
 
         // FP8的分组量化， [blockK, blockM]的小矩阵为一组
         int blockK = -1, blockM = -1;
+
+        // compressed-tensors / ModelOpt NVFP4 的原始两级 scale。
+        // group scale 保持 checkpoint 中的 E4M3 字节；global scale 保持为 FP32 乘数。
+        // compressed-tensors 存的是 divisor，加载时只做一次取倒数转换。
+        // NVFP4_BLOCK_16 中的 inline FP32 scale 仅供旧 fallback 路径使用。
+        std::vector <uint8_t> nvfp4GroupScales;
+        float nvfp4GlobalScale = 1.0f;
 
         // 以下为每个通道/分组的量化参数
         // 1. 若不使用分通道量化，那么总组数 = 1
@@ -623,6 +679,17 @@ namespace fastllm {
 
         void FreeSpace(); // 回收设备上的内存
 
+        // CUDA后端warmup成功后释放原始设备端分配，逻辑张量仍位于CUDA。
+        // host/mmap副本只用于显式换卡后的后端重建；正式推理不再按调用
+        // 恢复原始权重并切换fallback。
+        bool ReleaseCudaDataForRepackedWeight();
+
+        bool RestoreCudaDataForRepackedWeight();
+
+        // 跨GPU重建重排权重时，直接把host/mmap源恢复到目标GPU，
+        // 避免先恢复到旧GPU再进行一次GPU间复制。
+        bool RestoreCudaDataForRepackedWeight(int targetDevice);
+
         void UpdateUnitSize(); // 更新unitSize
 
         void Resize(const std::vector <int> &dims); // 更改尺寸
@@ -698,7 +765,7 @@ namespace fastllm {
             // 类型
             PagedCacheManagerType type;
 
-            // 页长
+            // 每页最多存储的 token 数
             int pageLen;
 
             // 最大页数
@@ -1014,7 +1081,6 @@ namespace fastllm {
             const Data &rawGate, const Data &rawBeta,
             const Data &aLog, const Data &dtBias, float lowerBound,
             Data &state, Data &output);
-
     // Replays only the recurrent-state transition for the first `tokens`
     // rows of a captured verification batch.
     void KimiK3RecurrentKDAUpdateState(

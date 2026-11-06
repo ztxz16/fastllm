@@ -6,6 +6,9 @@
 #include "devices/cuda/cudadevice.h"
 
 #include "fastllm-cuda.cuh"
+#ifndef USE_ROCM
+#include "devices/cuda/attention/fastllm-attention-backend.h"
+#endif
 #include "utils.h"
 
 namespace fastllm {
@@ -16,7 +19,10 @@ namespace fastllm {
         int axis = intParams.find("axis") != intParams.end() ? intParams.find("axis")->second : -1;
         int dimsLen = input.dims.size();
         axis = (axis % dimsLen + dimsLen) % dimsLen;
-        int part = input.dims[axis];
+        int part = intParams.find("output___batch") != intParams.end()
+            ? intParams.find("output___batch")->second : -1;
+        AssertInFastLLM(part == input.dims[axis],
+                        "CudaSplitBatchOp: output count must equal input size on split axis.\n");
         std::vector <int> dims = input.dims;
         dims[axis] = 1;
         for (int i = 0; i < part; i++) {
@@ -32,7 +38,10 @@ namespace fastllm {
         int axis = intParams.find("axis") != intParams.end() ? intParams.find("axis")->second : -1;
         int dimsLen = input.dims.size();
         axis = (axis % dimsLen + dimsLen) % dimsLen;
-        int part = input.dims[axis];
+        int part = intParams.find("output___batch") != intParams.end()
+            ? intParams.find("output___batch")->second : -1;
+        AssertInFastLLM(part == input.dims[axis],
+                        "CudaSplitBatchOp: output count must equal input size on split axis.\n");
         for (int i = 0; i < part; i++) {
             outputs[i]->Allocate();
         }
@@ -380,7 +389,120 @@ namespace fastllm {
         DoCudaAttentionBatchReshape(qs, vs, outputs, batch);
     }
 
-    void DoCudaAttentionBatch(Data **qs, Data **ks, Data **vs, Data **masks, Data **outputs, int group, float scale, int batch) {
+#ifndef USE_ROCM
+    namespace {
+        /**
+         * 检查原有连续KV Cache实现是否接受当前调用。
+         *
+         * @param invocation 统一Attention参数；必须携带批量Q/K/V和输出数组。
+         * @return 支持状态及拒绝原因。
+         */
+        CudaAttentionSupportResult SupportsLegacyContiguousAttention(
+            const CudaAttentionInvocation &invocation) {
+            if (invocation.cacheLayout != CudaAttentionCacheLayout::CONTIGUOUS) {
+                return {false, "requires contiguous KV cache"};
+            }
+            if (invocation.qs == nullptr || invocation.ks == nullptr ||
+                invocation.vs == nullptr || invocation.outputs == nullptr ||
+                invocation.batch <= 0) {
+                return {false, "missing contiguous attention tensors"};
+            }
+            if (invocation.dataType != DataType::FLOAT32 &&
+                invocation.dataType != DataType::FLOAT16 &&
+                invocation.dataType != DataType::BFLOAT16) {
+                return {false, "requires float32, float16 or bfloat16"};
+            }
+            return {true, "supported"};
+        }
+
+        /**
+         * 执行原有连续KV Cache Attention实现。
+         *
+         * BF16保持历史行为：逐请求转换Q/K/V到FP32，执行FP32 Attention后
+         * 再转换输出；FLOAT32和FLOAT16继续调用原批量入口。本Backend作为
+         * 重构基线和不兼容实现的显式fallback，不改变同步与数值语义。
+         *
+         * @param invocation 连续KV Cache Attention参数。
+         * @return true表示原有实现完成执行；false表示参数不完整。
+         */
+        bool RunLegacyContiguousAttention(CudaAttentionInvocation &invocation) {
+            Data **qs = invocation.qs;
+            Data **ks = invocation.ks;
+            Data **vs = invocation.vs;
+            Data **masks = invocation.masks;
+            Data **outputs = invocation.outputs;
+            const int group = invocation.group;
+            const float scale = invocation.scale;
+            const int batch = invocation.batch;
+
+            if (qs[0]->dataType == DataType::BFLOAT16) {
+                for (int i = 0; i < batch; i++) {
+                    outputs[i]->Allocate();
+                    Data q32, k32, v32, mask32, output32;
+                    ToDataType(*qs[i], q32, DataType::FLOAT32);
+                    ToDataType(*ks[i], k32, DataType::FLOAT32);
+                    ToDataType(*vs[i], v32, DataType::FLOAT32);
+                    output32.dataType = DataType::FLOAT32;
+                    output32.UpdateUnitSize();
+                    output32.Resize(outputs[i]->dims);
+                    output32.ToDevice(outputs[i]->dataDevice, false);
+                    output32.Allocate();
+                    if (masks != nullptr && masks[i] != nullptr && !masks[i]->dims.empty()) {
+                        ToDataType(*masks[i], mask32, DataType::FLOAT32);
+                    }
+                    FastllmCudaAttention(q32, k32, v32, mask32, output32,
+                                         group, scale, 0);
+                    ToDataType(output32, *outputs[i], DataType::BFLOAT16);
+                }
+                return true;
+            }
+
+            for (int i = 0; i < batch; i++) {
+                outputs[i]->Allocate();
+            }
+            FastllmCudaAttentionBatch(qs, ks, vs, masks, outputs, group, scale, batch);
+            return true;
+        }
+    }
+
+    /** 注册保持原数值和同步语义的连续KV Cache基线Backend。 */
+    void RegisterCudaContiguousAttentionBackends() {
+        static const bool registered = RegisterCudaAttentionBackend({
+            "legacy_contiguous", 10,
+            SupportsLegacyContiguousAttention,
+            RunLegacyContiguousAttention,
+        });
+        AssertInFastLLM(registered,
+                        "Failed to register legacy_contiguous attention backend.\n");
+    }
+
+    void DoCudaAttentionBatch(Data **qs, Data **ks, Data **vs, Data **masks,
+                              Data **outputs, int group, float scale, int batch) {
+        CudaAttentionInvocation invocation;
+        invocation.cacheLayout = CudaAttentionCacheLayout::CONTIGUOUS;
+        invocation.phase = qs[0]->dims[1] == 1
+            ? CudaAttentionPhase::DECODE : CudaAttentionPhase::PREFILL;
+        invocation.dataType = qs[0]->dataType;
+        invocation.deviceId = FastllmCudaGetDevice();
+        invocation.batch = batch;
+        invocation.group = group;
+        invocation.headDim = qs[0]->dims[2];
+        invocation.scale = scale;
+        invocation.qs = qs;
+        invocation.ks = ks;
+        invocation.vs = vs;
+        invocation.masks = masks;
+        invocation.outputs = outputs;
+
+        std::string actualBackend;
+        std::string lastError;
+        if (!RunCudaAttentionBackend(invocation, actualBackend, lastError)) {
+            ErrorInFastLLM("AttentionBatch backend selection failed: " + lastError + "\n");
+        }
+    }
+#else
+    void DoCudaAttentionBatch(Data **qs, Data **ks, Data **vs, Data **masks,
+                              Data **outputs, int group, float scale, int batch) {
         if (qs[0]->dataType == DataType::BFLOAT16) {
             for (int i = 0; i < batch; i++) {
                 outputs[i]->Allocate();
@@ -402,34 +524,12 @@ namespace fastllm {
             }
             return;
         }
-        long long aveLen = 0;
         for (int i = 0; i < batch; i++) {
-            aveLen += ks[i]->dims[1];
+            outputs[i]->Allocate();
         }
-        aveLen /= batch;
-        if (qs[0]->dataType == DataType::FLOAT32 || 
-            true) {
-            for (int i = 0; i < batch; i++) {
-                outputs[i]->Allocate();
-            }
-            FastllmCudaAttentionBatch(qs, ks, vs, masks, outputs, group, scale, batch);
-        } else {
-            for (int i = 0; i < batch; i++) {
-                outputs[i]->Allocate();
-            }
-            for (int i = 0; i < batch; i++) {
-                if (qs[i]->dataType == DataType::FLOAT16) {
-                    if (masks == nullptr || masks[i] == nullptr) {
-                        FastllmCudaHalfAttention(*qs[i], *ks[i], *vs[i], Data(), *outputs[i], group, scale, 0);
-                    } else {
-                        FastllmCudaHalfAttention(*qs[i], *ks[i], *vs[i], *masks[i], *outputs[i], group, scale, 0);
-                    }
-                } else {
-                    ErrorInFastLLM("AttentionBatch: datatype should be float32 or float16.");
-                }
-            }
-        }
+        FastllmCudaAttentionBatch(qs, ks, vs, masks, outputs, group, scale, batch);
     }
+#endif
 
     void CudaAttentionBatchOp::Run(const std::string &opType, const fastllm::DataDict &datas,
                                   const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {

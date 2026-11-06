@@ -1,0 +1,91 @@
+{
+  "name": "算子优化前后示例",
+  "baseline": "before",
+  "selection": {
+    "candidates": ["before", "after"],
+    "reference": "reference",
+    "metric": "latency_ms"
+  },
+  "repeat": 3,
+  "aggregate": "median",
+  "keep_going": true,
+  "timeout": 60,
+  "metrics": [
+    {
+      "name": "latency_ms",
+      "unit": "ms",
+      "goal": "min",
+      "pattern": "latency_ms=(?P<value>[0-9.eE+-]+)"
+    },
+    {
+      "name": "throughput",
+      "unit": "items/s",
+      "goal": "max",
+      "pattern": "throughput=(?P<value>[0-9.eE+-]+)"
+    }
+  ],
+  "implementations": [
+    {
+      "name": "before",
+      "command": [
+        "bash",
+        "-lc",
+        "echo latency_ms={before_latency}; echo throughput={before_throughput}"
+      ]
+    },
+    {
+      "name": "after",
+      "command": [
+        "bash",
+        "-lc",
+        "echo latency_ms={after_latency}; echo throughput={after_throughput}"
+      ]
+    },
+    {
+      "name": "reference",
+      "command": [
+        "bash",
+        "-lc",
+        "echo latency_ms={reference_latency}; echo throughput={reference_throughput}"
+      ]
+    }
+  ],
+  "cases": [
+    {
+      "name": "demo_m1",
+      "dimensions": {
+        "op": "demo",
+        "M": 1,
+        "N": 4096,
+        "K": 4096,
+        "dtype": "bf16"
+      },
+      "variables": {
+        "before_latency": 0.02,
+        "after_latency": 0.01,
+        "before_throughput": 100,
+        "after_throughput": 200,
+        "reference_latency": 0.012,
+        "reference_throughput": 180
+      }
+    },
+    {
+      "name": "demo_m128",
+      "dimensions": {
+        "op": "demo",
+        "M": 128,
+        "N": 4096,
+        "K": 4096,
+        "dtype": "bf16"
+      },
+      "variables": {
+        "before_latency": 0.08,
+        "after_latency": 0.06,
+        "before_throughput": 400,
+        "after_throughput": 533.33,
+        "reference_latency": 0.055,
+        "reference_throughput": 550
+      }
+    }
+  ]
+}

@@ -2,6 +2,7 @@
 #define FASTLLM_BASEBLOCK_H
 
 #include "fastllm.h"
+#include "blocks/attentionexecutor.h"
 
 namespace fastllm {
     /*
@@ -159,6 +160,21 @@ namespace fastllm {
         Data *precomputedGreedyIds = nullptr,
         Data *precomputedGreedyScores = nullptr,
         const std::map<int, void*> *precomputedReadyEvents = nullptr
+    );
+
+    /**
+     * 按诊断开关输出同一次正式采样的CUDA/CPU Top1与TopK。
+     *
+     * 本函数只读取已经完成EOS处理并参与正式采样的FLOAT32 logits，不发起
+     * 第二次模型请求，也不修改正式Token。未启用FASTLLM_SAMPLING_TOP1_TRACE
+     * 时立即返回；启用后会把完整logits同步到CPU，因此只能用于正确性诊断。
+     *
+     * @param logits       正式采样使用的FLOAT32 logits，最后一维为词表。
+     * @param sampledIds   同一份logits已经选出的正式Token ID，每个batch一项。
+     */
+    void TraceSamplingTop1IfEnabled (
+        Data &logits,
+        const std::vector<int> &sampledIds
     );
 }
 

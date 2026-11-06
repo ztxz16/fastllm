@@ -11,8 +11,10 @@
 #include <functional>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -109,8 +111,10 @@ namespace {
     struct ComparisonStats {
         bool passed = true;
         float maxAbsDiff = 0.0f;
+        float meanAbsDiff = 0.0f;
         float maxRelDiff = 0.0f;
         float maxToleranceExcess = 0.0f;
+        size_t failedElements = 0;
         size_t mismatchIndex = 0;
         float expected = 0.0f;
         float actual = 0.0f;
@@ -1070,8 +1074,10 @@ namespace {
         std::vector<float> actualVec = ToFloatVector(actual);
 
         ComparisonStats stats;
+        double absDiffSum = 0.0;
         for (size_t i = 0; i < expectedVec.size(); i++) {
             float absDiff = std::fabs(expectedVec[i] - actualVec[i]);
+            absDiffSum += absDiff;
             float relDiff = absDiff / std::max(std::fabs(expectedVec[i]), 1e-6f);
             stats.maxAbsDiff = std::max(stats.maxAbsDiff, absDiff);
             stats.maxRelDiff = std::max(stats.maxRelDiff, relDiff);
@@ -1084,7 +1090,13 @@ namespace {
                 stats.expected = expectedVec[i];
                 stats.actual = actualVec[i];
             }
+            if (toleranceExcess > 0.0f) {
+                stats.failedElements++;
+            }
         }
+        stats.meanAbsDiff = expectedVec.empty()
+            ? 0.0f
+            : static_cast<float>(absDiffSum / expectedVec.size());
         return stats;
     }
 
@@ -1951,6 +1963,654 @@ namespace {
         };
     }
 
+#if defined(USE_CUDA) && defined(FASTLLM_ENABLE_CUTLASS_NVFP4)
+    struct Nvfp4SwiGLUQuantState {
+        int rows = 0, hidden = 0;
+        fastllm::DataType inputType = fastllm::DataType::FLOAT16;
+        bool useProduction = true;
+        FastllmCudaNvfp4SiluMulVersion implementation =
+            FastllmCudaNvfp4SiluMulVersion::Cached;
+        fastllm::Data input;
+        uint8_t *packed = nullptr;
+        uint8_t *scales = nullptr;
+        size_t packedBytes = 0, scaleBytes = 0;
+
+        explicit Nvfp4SwiGLUQuantState(const OpTestParams &params) {
+            rows = params.GetInt("rows");
+            hidden = params.GetInt("hidden");
+            inputType = params.GetString("input_type") == "bf16"
+                ? fastllm::DataType::BFLOAT16 : fastllm::DataType::FLOAT16;
+            const std::string implementationName = params.GetString("implementation");
+            if (implementationName == "production") {
+                // 常规功能和性能测试必须经过正式推理入口，避免测试路径
+                // 与模型主流程选择不同的融合实现。
+                useProduction = true;
+            } else if (implementationName == "baseline") {
+                useProduction = false;
+                implementation = FastllmCudaNvfp4SiluMulVersion::Baseline;
+            } else if (implementationName == "optimized") {
+                useProduction = false;
+                implementation = FastllmCudaNvfp4SiluMulVersion::Optimized;
+            } else if (implementationName == "cached") {
+                useProduction = false;
+                implementation = FastllmCudaNvfp4SiluMulVersion::Cached;
+            } else {
+                throw std::runtime_error(
+                    "nvfp4_swiglu_quant implementation must be production, baseline, optimized or cached");
+            }
+            if (rows <= 0 || hidden <= 0 || hidden % 32 != 0 ||
+                (params.GetString("input_type") != "fp16" &&
+                 params.GetString("input_type") != "bf16")) {
+                throw std::runtime_error(
+                    "nvfp4_swiglu_quant requires rows>0, 32-aligned hidden and fp16/bf16 input");
+            }
+            input.CopyFrom(MakeTensor({rows, hidden * 2}, 0.619f, 0.5f));
+            fastllm::ToDataType(input, inputType);
+            input.ToDevice(fastllm::DataDevice::CUDA);
+            packedBytes = (size_t)rows * hidden / 2;
+            scaleBytes = FastllmCudaNvfp4SwizzledScaleBytes(rows, hidden);
+            packed = static_cast<uint8_t *>(FastllmCudaMalloc(packedBytes));
+            scales = static_cast<uint8_t *>(FastllmCudaMalloc(scaleBytes));
+            if (packed == nullptr || scales == nullptr) {
+                throw std::runtime_error("NVFP4 SwiGLU quant scratch allocation failed");
+            }
+        }
+
+        ~Nvfp4SwiGLUQuantState() {
+            FastllmCudaFree(packed);
+            FastllmCudaFree(scales);
+        }
+
+        void Run() {
+            const bool launched = useProduction
+                ? FastllmCudaSiluMulNvfp4Quantize(
+                      input.cudaData, inputType, packed, scales,
+                      rows, hidden, 1.0f, nullptr)
+                : FastllmCudaSiluMulNvfp4QuantizeVersion(
+                      input.cudaData, inputType, packed, scales,
+                      rows, hidden, 1.0f, implementation, nullptr);
+            if (!launched) {
+                throw std::runtime_error("NVFP4 fused SwiGLU quant launch failed");
+            }
+        }
+
+        fastllm::Data DequantizedBuffers(uint8_t *sourcePacked,
+                                         uint8_t *sourceScales) const {
+            ForceDeviceSync();
+            std::vector<uint8_t> hostPacked(packedBytes), hostScales(scaleBytes);
+            FastllmCudaCopyFromDeviceToHost(hostPacked.data(), sourcePacked, packedBytes);
+            FastllmCudaCopyFromDeviceToHost(hostScales.data(), sourceScales, scaleBytes);
+            static const float e2m1[16] = {
+                0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+                -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
+            std::vector<float> values((size_t)rows * hidden);
+            const int kTiles = (hidden + 63) / 64;
+            for (int row = 0; row < rows; ++row) {
+                for (int col = 0; col < hidden; ++col) {
+                    int pack = col / 16;
+                    int mTile = row >> 7;
+                    int outerM = row & 31;
+                    int innerM = (row >> 5) & 3;
+                    int kTile = pack >> 2;
+                    int innerK = pack & 3;
+                    size_t scaleOffset = ((size_t)mTile * kTiles + kTile) * 512 +
+                                         outerM * 16 + innerM * 4 + innerK;
+                    uint8_t byte = hostPacked[(size_t)row * (hidden / 2) + col / 2];
+                    uint8_t q = uint8_t((byte >> ((col & 1) * 4)) & 0xf);
+                    values[(size_t)row * hidden + col] =
+                        e2m1[q] * DecodeFp8E4M3(hostScales[scaleOffset]);
+                }
+            }
+            return fastllm::Data(fastllm::DataType::FLOAT32, {rows, hidden}, values);
+        }
+
+        fastllm::Data Dequantized() {
+            Run();
+            return DequantizedBuffers(packed, scales);
+        }
+
+        fastllm::Data Reference() const {
+            // 对照路径与 vLLM 测试一致：普通 SwiGLU，再单独做 NVFP4 动态量化。
+            fastllm::Data ordinary;
+            ordinary.dataDevice = fastllm::DataDevice::CUDA;
+            ordinary.dataType = inputType;
+            ordinary.UpdateUnitSize();
+            ordinary.Resize({rows, hidden});
+            ordinary.Allocate(false);
+            if (!FastllmCudaSwiglu(input, ordinary)) {
+                throw std::runtime_error("ordinary SwiGLU launch failed");
+            }
+            uint8_t *referencePacked = static_cast<uint8_t *>(FastllmCudaMalloc(packedBytes));
+            uint8_t *referenceScales = static_cast<uint8_t *>(FastllmCudaMalloc(scaleBytes));
+            if (!referencePacked || !referenceScales ||
+                !FastllmCudaNvfp4QuantizeActivation(
+                    ordinary.cudaData, inputType, referencePacked, referenceScales,
+                    rows, hidden, 1.0f, nullptr)) {
+                FastllmCudaFree(referencePacked);
+                FastllmCudaFree(referenceScales);
+                throw std::runtime_error("separate NVFP4 activation quantization failed");
+            }
+            fastllm::Data result = DequantizedBuffers(referencePacked, referenceScales);
+            FastllmCudaFree(referencePacked);
+            FastllmCudaFree(referenceScales);
+            return result;
+        }
+    };
+#endif
+
+    /**
+     * 按正式主流程测量SwiGLU与NVFP4融合量化的平均延迟。
+     *
+     * 测试状态只初始化一次，循环内持续调用Nvfp4SwiGLUQuantState::Run；
+     * production配置会进一步进入FastllmCudaSiluMulNvfp4Quantize正式入口。
+     * warmup循环结束后同步一次，全部计时迭代结束后再同步一次，不在每次
+     * kernel启动后强制同步，从而与正式异步执行方式及vLLM基准保持一致。
+     * 显式选择baseline、optimized或cached时仍复用相同计时协议，仅用于
+     * 独立多版本微基准。
+     *
+     * @param params 算子参数，包含rows、hidden、input_type和implementation。
+     * @param device 目标CUDA设备，例如cuda:0。
+     * @param warmup 计时前连续执行的预热次数。
+     * @param iters  纳入计时的连续执行次数。
+     * @return 平均延迟、逻辑访存字节数和估算计算量；CUDA不可用时抛出异常。
+     */
+    static BenchmarkResult BenchmarkNvfp4SwiGLUQuantCuda(
+            const OpTestParams &params, const std::string &device,
+            int warmup, int iters) {
+#if defined(USE_CUDA) && defined(FASTLLM_ENABLE_CUTLASS_NVFP4)
+        ScopedFirstDevice guard(device);
+        auto state = std::make_shared<Nvfp4SwiGLUQuantState>(params);
+
+        // 预热与正式推理一样连续提交，边界同步确保计时区间不包含预热。
+        for (int i = 0; i < warmup; ++i) state->Run();
+        ForceDeviceSync();
+
+        const auto begin = Clock::now();
+        for (int i = 0; i < iters; ++i) state->Run();
+        ForceDeviceSync();
+        const auto end = Clock::now();
+
+        BenchmarkResult result;
+        result.avgMs = std::chrono::duration<double, std::milli>(end - begin).count() /
+                       std::max(iters, 1);
+        result.bytesMoved = (double)params.GetInt("rows") *
+                            params.GetInt("hidden") * 4.5;
+        result.flops = (double)params.GetInt("rows") *
+                       params.GetInt("hidden") * 5.0;
+        const double seconds = result.avgMs / 1000.0;
+        if (seconds > 0.0) {
+            result.bandwidthGBps = result.bytesMoved / seconds / 1e9;
+            result.computeTFlops = result.flops / seconds / 1e12;
+        }
+        return result;
+#else
+        (void)params;
+        (void)device;
+        (void)warmup;
+        (void)iters;
+        throw std::runtime_error("NVFP4 SwiGLU benchmark requires CUDA SM100+ build");
+#endif
+    }
+
+    static OpCase MakeNvfp4SwiGLUQuantCase() {
+        OpCase result{
+            "nvfp4_swiglu_quant",
+            "fused SwiGLU plus dynamic NVFP4 activation quantization",
+            []() {
+                OpTestParams params;
+                params.Add("rows", "32", "flattened token rows");
+                params.Add("hidden", "1024", "post-SwiGLU width, multiple of 32");
+                params.Add("input_type", "fp16", "fp16 or bf16");
+                params.Add("implementation", "production",
+                           "production main path, baseline, optimized or cached CUDA kernel");
+                return params;
+            },
+            [](const OpTestParams&, const std::string &device) {
+#if defined(USE_CUDA) && defined(FASTLLM_ENABLE_CUTLASS_NVFP4)
+                return device.rfind("cuda:", 0) == 0 &&
+                       FastllmCudaRuntimeArch() >= 100 && FastllmCudaRuntimeArch() < 130;
+#else
+                (void)device;
+                return false;
+#endif
+            },
+            [](const OpTestParams &params, const std::string &device) -> fastllm::Data {
+#if defined(USE_CUDA) && defined(FASTLLM_ENABLE_CUTLASS_NVFP4)
+                ScopedFirstDevice guard(device);
+                Nvfp4SwiGLUQuantState state(params);
+                return state.Dequantized();
+#else
+                (void)params; (void)device;
+                throw std::runtime_error("nvfp4_swiglu_quant requires SM100+ CUDA build");
+#endif
+            },
+            [](const OpTestParams &params, const std::string &device) -> std::function<void()> {
+#if defined(USE_CUDA) && defined(FASTLLM_ENABLE_CUTLASS_NVFP4)
+                ScopedFirstDevice guard(device);
+                auto state = std::make_shared<Nvfp4SwiGLUQuantState>(params);
+                return [state]() { state->Run(); };
+#else
+                (void)params; (void)device;
+                return {};
+#endif
+            },
+            [](const OpTestParams &params) {
+                return (double)params.GetInt("rows") * params.GetInt("hidden") * 4.5;
+            },
+            [](const OpTestParams &params) {
+                return (double)params.GetInt("rows") * params.GetInt("hidden") * 5.0;
+            }};
+        result.runReference = [](const OpTestParams &params, const std::string&) {
+#if defined(USE_CUDA) && defined(FASTLLM_ENABLE_CUTLASS_NVFP4)
+            Nvfp4SwiGLUQuantState state(params);
+            return state.Reference();
+#else
+            (void)params;
+            return fastllm::Data();
+#endif
+        };
+        result.benchmarkOverride = BenchmarkNvfp4SwiGLUQuantCuda;
+        return result;
+    }
+
+    struct LinearNvfp4Fixture {
+        int batch = 0, in = 0, out = 0;
+        bool useBias = false;
+        bool checkRelease = false;
+        bool checkFixedBackend = false;
+        bool checkWarmupFallback = false;
+        bool checkMarlinFallback = false;
+        bool checkDeviceMove = false;
+        bool checkFusionSeparation = false;
+        fastllm::LinearQuantScheme quantScheme =
+            fastllm::LinearQuantScheme::LEGACY_AUTO;
+        fastllm::DataType inputType = fastllm::DataType::FLOAT16;
+        std::vector<float> inputValues;
+        std::vector<float> biasValues;
+        std::vector<uint8_t> weightBytes;
+        std::vector<uint8_t> groupScales;
+        // 故意使用不能被 E4M3 精确表示的 global scale，
+        // 防止测试意外放过“合并后再量化 group scale”的旧实现。
+        float globalScale = 0.01f;
+
+        explicit LinearNvfp4Fixture(const OpTestParams &params) {
+            batch = params.GetInt("batch");
+            in = params.GetInt("in");
+            out = params.GetInt("out");
+            useBias = params.GetInt("bias") != 0;
+            checkRelease = params.GetInt("check_release") != 0;
+            checkFixedBackend = params.GetInt("check_fixed_backend") != 0;
+            checkWarmupFallback = params.GetInt("check_warmup_fallback") != 0;
+            checkMarlinFallback = params.GetInt("check_marlin_fallback") != 0;
+            checkDeviceMove = params.GetInt("check_device_move") != 0;
+            checkFusionSeparation = params.GetInt("check_fusion_separation") != 0;
+            const std::string scheme = params.GetString("quant_scheme");
+            if (scheme == "w4a4") {
+                quantScheme = fastllm::LinearQuantScheme::NVFP4_W4A4;
+            } else if (scheme == "w4a16") {
+                quantScheme = fastllm::LinearQuantScheme::NVFP4_W4A16;
+            } else if (scheme != "auto") {
+                throw std::runtime_error(
+                    "linear_nvfp4 quant_scheme must be auto, w4a4 or w4a16");
+            }
+            const std::string dtype = params.GetString("input_type");
+            inputType = dtype == "bf16" ? fastllm::DataType::BFLOAT16
+                                         : fastllm::DataType::FLOAT16;
+            if (batch <= 0 || in <= 0 || out <= 0 || in % 16 != 0 ||
+                (dtype != "fp16" && dtype != "bf16")) {
+                throw std::runtime_error(
+                    "linear_nvfp4 requires positive batch/out, 16-aligned in, and fp16/bf16 input");
+            }
+
+            fastllm::Data typed(inputType, {batch, in},
+                                ToFloatVector(MakeTensor({batch, in}, 0.271f, 0.35f)));
+            fastllm::Data normalized;
+            fastllm::ToDataType(typed, normalized, fastllm::DataType::FLOAT32);
+            normalized.ToDevice(fastllm::DataDevice::CPU);
+            inputValues = ToFloatVector(normalized);
+            biasValues.resize(out);
+            for (int i = 0; i < out; ++i) biasValues[i] = 0.001f * float((i % 17) - 8);
+
+            const size_t rowBytes = fastllm::GetDataBytes(
+                fastllm::DataType::NVFP4_BLOCK_16, 1, in);
+            weightBytes.resize((size_t)out * rowBytes);
+            groupScales.resize((size_t)out * (in / 16));
+            for (int row = 0; row < out; ++row) {
+                for (int group = 0; group < in / 16; ++group) {
+                    uint8_t *block = weightBytes.data() + (size_t)row * rowBytes +
+                                     (size_t)group * (8 + sizeof(float));
+                    for (int pair = 0; pair < 8; ++pair) {
+                        // Valid E2M1 encodings.  Avoid signed zero.
+                        uint8_t low = uint8_t(1 + (row * 3 + group + pair * 5) % 7);
+                        uint8_t high = uint8_t(1 + (row + group * 3 + pair * 2) % 7);
+                        if ((row + group + pair) & 1) low |= 8;
+                        if ((row + group + pair * 2) & 2) high |= 8;
+                        block[pair] = uint8_t(low | (high << 4));
+                    }
+                    const uint8_t scaleByte = uint8_t(0x28 + ((row * 7 + group * 3) % 16));
+                    groupScales[(size_t)row * (in / 16) + group] = scaleByte;
+                    float scale = DecodeFp8E4M3(scaleByte) * globalScale;
+                    std::memcpy(block + 8, &scale, sizeof(scale));
+                }
+            }
+        }
+
+        fastllm::Data MakeInput() const {
+            return fastllm::Data(inputType, {batch, in}, inputValues);
+        }
+
+        void MakeWeight(fastllm::Data &weight) const {
+            weight.dataType = fastllm::DataType::NVFP4_BLOCK_16;
+            weight.blockM = 16;
+            weight.blockK = 1;
+            weight.weightType = fastllm::WeightType::LINEAR;
+            weight.linearQuantScheme = quantScheme;
+            weight.UpdateUnitSize();
+            weight.Resize({out, in});
+            weight.Allocate(true);
+            std::memcpy(weight.cpuData, weightBytes.data(), weightBytes.size());
+            weight.nvfp4GroupScales = groupScales;
+            weight.nvfp4GlobalScale = globalScale;
+        }
+
+        fastllm::Data MakeBias() const {
+            return useBias
+                ? fastllm::Data(fastllm::DataType::FLOAT32, {out}, biasValues)
+                : fastllm::Data();
+        }
+
+        fastllm::Data Reference() const {
+            static const float e2m1[16] = {
+                0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+                -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
+            const size_t rowBytes = fastllm::GetDataBytes(
+                fastllm::DataType::NVFP4_BLOCK_16, 1, in);
+            std::vector<float> result((size_t)batch * out, 0.0f);
+            for (int token = 0; token < batch; ++token) {
+                for (int row = 0; row < out; ++row) {
+                    float sum = 0.0f;
+                    for (int col = 0; col < in; ++col) {
+                        const uint8_t *block = weightBytes.data() + (size_t)row * rowBytes +
+                                               (size_t)(col / 16) * (8 + sizeof(float));
+                        float scale;
+                        std::memcpy(&scale, block + 8, sizeof(scale));
+                        uint8_t packed = block[(col % 16) / 2];
+                        uint8_t q = uint8_t((packed >> ((col & 1) * 4)) & 0xf);
+                        sum += inputValues[(size_t)token * in + col] * e2m1[q] * scale;
+                    }
+                    result[(size_t)token * out + row] = sum +
+                        (useBias ? biasValues[row] : 0.0f);
+                }
+            }
+            return fastllm::Data(fastllm::DataType::FLOAT32, {batch, out}, result);
+        }
+
+        fastllm::Data RunCuda() const {
+            fastllm::Data input = MakeInput(), weight, bias = MakeBias(), output;
+            MakeWeight(weight);
+            input.ToDevice(fastllm::DataDevice::CUDA);
+            weight.ToDevice(fastllm::DataDevice::CUDA);
+            if (checkRelease && FastllmCudaRuntimeArch() >= 100 &&
+                FastllmCudaRuntimeArch() < 130 && weight.cudaData != nullptr) {
+                throw std::runtime_error(
+                    "NVFP4 upload-time prepack retained the original CUDA weight");
+            }
+            if (checkFusionSeparation) {
+                fastllm::Data malformed(
+                    inputType, {batch, in * 2 - 16},
+                    std::vector<float>((size_t)batch * (in * 2 - 16), 0.25f));
+                malformed.ToDevice(fastllm::DataDevice::CUDA);
+                fastllm::Data fusedOutput;
+                fusedOutput.dataType = inputType;
+                fusedOutput.UpdateUnitSize();
+                fusedOutput.Resize({batch, out});
+                if (FastllmCudaCutlassNvfp4W4A4FromSwiglu(
+                        malformed, weight, bias, fusedOutput, batch, in, out)) {
+                    throw std::runtime_error(
+                        "malformed NVFP4 SwiGLU unexpectedly used the fused backend");
+                }
+            }
+            const char *oldValue = std::getenv("FASTLLM_CUDA_NVFP4_W4A4");
+            const bool hadOldValue = oldValue != nullptr;
+            const std::string savedValue = hadOldValue ? oldValue : "";
+            if (checkWarmupFallback) {
+                // 权重已在ToDevice阶段预重排。用错误的激活宽度触发首次
+                // GEMM验证失败，检查cache销毁、原始权重恢复和Legacy固定。
+                fastllm::Data malformed(
+                    inputType, {batch, in - 16},
+                    std::vector<float>((size_t)batch * (in - 16), 0.25f));
+                malformed.ToDevice(fastllm::DataDevice::CUDA);
+                fastllm::Data rejectedOutput;
+                rejectedOutput.dataType = inputType;
+                rejectedOutput.UpdateUnitSize();
+                rejectedOutput.Resize({batch, out});
+                if (TryCudaCutlassNvfp4W4A4(
+                        malformed, weight, bias, rejectedOutput,
+                        batch, out, in)) {
+                    throw std::runtime_error(
+                        "malformed NVFP4 warmup unexpectedly used CUTLASS");
+                }
+            }
+            fastllm::Linear(input, weight, bias, output);
+            if (checkMarlinFallback &&
+                FastllmCudaGetNvfp4W4A4BackendState(
+                    weight, FastllmCudaGetDevice()) !=
+                    FastllmCudaNvfp4BackendState::MarlinW4A16Fallback) {
+                throw std::runtime_error(
+                    "NVFP4 W4A4 selector did not fix the Marlin W4A16 fallback");
+            }
+            if (checkRelease && FastllmCudaRuntimeArch() >= 100 &&
+                FastllmCudaRuntimeArch() < 130 && weight.cudaData != nullptr) {
+                throw std::runtime_error(
+                    "NVFP4 W4A4 retained the original CUDA weight after repack");
+            }
+            fastllm::Data nativeOutput = ConvertToFloat32Data(output);
+            if (checkFixedBackend && FastllmCudaRuntimeArch() >= 100 &&
+                FastllmCudaRuntimeArch() < 130) {
+                setenv("FASTLLM_CUDA_NVFP4_W4A4", "0", 1);
+                fastllm::Data fixedOutput;
+                fastllm::Linear(input, weight, bias, fixedOutput);
+                if (hadOldValue) setenv("FASTLLM_CUDA_NVFP4_W4A4", savedValue.c_str(), 1);
+                else unsetenv("FASTLLM_CUDA_NVFP4_W4A4");
+                if (weight.cudaData != nullptr) {
+                    throw std::runtime_error(
+                        "NVFP4 changed a fixed CUTLASS backend during inference");
+                }
+            }
+            if (checkWarmupFallback && weight.cudaData == nullptr) {
+                throw std::runtime_error(
+                    "NVFP4 warmup fallback did not retain the original CUDA weight");
+            }
+            if (checkWarmupFallback) {
+                fastllm::Data fixedLegacyOutput;
+                fastllm::Linear(input, weight, bias, fixedLegacyOutput);
+                if (weight.cudaData == nullptr) {
+                    throw std::runtime_error(
+                        "NVFP4 warmup fallback did not retain its original CUDA weight");
+                }
+                if (FastllmCudaGetNvfp4W4A4BackendState(
+                        weight, FastllmCudaGetDevice()) !=
+                    FastllmCudaNvfp4BackendState::NativeW4A16Fallback) {
+                    throw std::runtime_error(
+                        "NVFP4 W4A4 selector did not fix the native W4A16 fallback");
+                }
+            }
+            if (checkDeviceMove) {
+                int deviceCount = FastllmCudaGetDeviceCount();
+                if (deviceCount >= 2 && FastllmCudaRuntimeArch() >= 100 &&
+                    FastllmCudaRuntimeArch() < 130) {
+                    input.ToDevice(fastllm::DataDevice::CUDA, {1});
+                    weight.ToDevice(fastllm::DataDevice::CUDA, {1});
+                    if (useBias) bias.ToDevice(fastllm::DataDevice::CUDA, {1});
+                    if (weight.cudaData != nullptr) {
+                        throw std::runtime_error(
+                            "NVFP4 device move retained the destination original CUDA weight");
+                    }
+                    FastllmCudaSetDevice(1);
+                    fastllm::Data movedOutput;
+                    fastllm::Linear(input, weight, bias, movedOutput);
+                    if (weight.cudaData != nullptr) {
+                        throw std::runtime_error(
+                            "NVFP4 destination warmup retained the original CUDA weight");
+                    }
+                    ComparisonStats movedStats = CompareData(
+                        nativeOutput, ConvertToFloat32Data(movedOutput), 0.20f, 0.20f);
+                    if (!movedStats.passed) {
+                        throw std::runtime_error(
+                            "NVFP4 GPU 1 output differs from GPU 0 output");
+                    }
+                    FastllmCudaSetDevice(0);
+                }
+            }
+            return nativeOutput;
+        }
+    };
+
+    struct LinearNvfp4BenchState {
+        int batch = 0, in = 0, out = 0;
+        bool requireCutlass = false;
+        fastllm::Data input, weight, bias, output;
+
+        void Init(const OpTestParams &params) {
+            LinearNvfp4Fixture fixture(params);
+            batch = fixture.batch;
+            in = fixture.in;
+            out = fixture.out;
+            requireCutlass = fixture.checkRelease;
+            fastllm::Data hostInput = fixture.MakeInput();
+            input.CopyFrom(hostInput);
+            fixture.MakeWeight(weight);
+            if (fixture.useBias) {
+                fastllm::Data hostBias = fixture.MakeBias();
+                bias.CopyFrom(hostBias);
+                bias.ToDevice(fastllm::DataDevice::CUDA);
+            }
+            input.ToDevice(fastllm::DataDevice::CUDA);
+            weight.ToDevice(fastllm::DataDevice::CUDA);
+        }
+
+        void Run() {
+            fastllm::Linear(input, weight, bias, output);
+        }
+
+        void CheckRequiredBackend() const {
+            if (requireCutlass && weight.cudaData != nullptr) {
+                throw std::runtime_error(
+                    "strict NVFP4 dense benchmark fell back from CUTLASS");
+            }
+        }
+    };
+
+    static BenchmarkResult BenchmarkLinearNvfp4Cuda(
+            const OpTestParams &params, const std::string &device,
+            int warmup, int iters) {
+#ifdef USE_CUDA
+        ScopedFirstDevice guard(device);
+        auto state = std::make_shared<LinearNvfp4BenchState>();
+        state->Init(params);
+        for (int i = 0; i < warmup; ++i) state->Run();
+        ForceDeviceSync();
+        state->CheckRequiredBackend();
+        auto begin = Clock::now();
+        for (int i = 0; i < iters; ++i) state->Run();
+        ForceDeviceSync();
+        auto end = Clock::now();
+
+        BenchmarkResult result;
+        result.avgMs = std::chrono::duration<double, std::milli>(end - begin).count() /
+                       std::max(iters, 1);
+        result.bytesMoved = (double)state->batch * state->in * 2.0 +
+                            (double)fastllm::GetDataBytes(
+                                fastllm::DataType::NVFP4_BLOCK_16,
+                                state->out, state->in) +
+                            (double)state->batch * state->out * 2.0;
+        result.flops = 2.0 * state->batch * state->in * state->out;
+        const double seconds = result.avgMs / 1000.0;
+        if (seconds > 0.0) {
+            result.bandwidthGBps = result.bytesMoved / seconds / 1e9;
+            result.computeTFlops = result.flops / seconds / 1e12;
+        }
+        return result;
+#else
+        (void)params;
+        (void)device;
+        (void)warmup;
+        (void)iters;
+        throw std::runtime_error("linear_nvfp4 benchmark requires CUDA");
+#endif
+    }
+
+    static OpCase MakeLinearNvfp4Case() {
+        OpCase result{
+            "linear_nvfp4",
+            "NVFP4 dense: native W4A4 CUTLASS or weight-only Marlin W4A16",
+            []() {
+                OpTestParams params;
+                params.Add("batch", "1", "rows; W4A4 and Marlin support decode M=1");
+                params.Add("in", "1008", "input features, multiple of 16; CUTLASS pads to 32");
+                params.Add("out", "1000", "output features; CUTLASS pads to 32 and slices");
+                params.Add("bias", "1", "add FP32 bias after W4A4 GEMM");
+                params.Add("input_type", "fp16", "fp16 or bf16; Marlin accepts fp16 only");
+                params.Add("quant_scheme", "auto", "auto, w4a4 or w4a16");
+                params.Add("check_release", "0", "require W4A4 to release the original CUDA weight");
+                params.Add("check_fixed_backend", "0", "verify inference cannot switch a warmed CUTLASS backend");
+                params.Add("check_warmup_fallback", "0", "force first GEMM failure and verify native W4A16 fallback remains fixed");
+                params.Add("check_marlin_fallback", "0", "disable CUTLASS and verify Marlin W4A16 fallback remains fixed");
+                params.Add("check_device_move", "0", "on 2+ GPUs, rebuild the fixed backend on GPU 1");
+                params.Add("check_fusion_separation", "0", "verify fused SwiGLU rejection does not reject Linear CUTLASS");
+                params.Add("performance_only", "0", "skip the O(MNK) CPU reference for large benchmark shapes");
+                return params;
+            },
+            [](const OpTestParams &params, const std::string &device) {
+#ifdef USE_CUDA
+                if (device.rfind("cuda:", 0) != 0) return false;
+                LinearNvfp4Fixture fixture(params);
+                int arch = FastllmCudaRuntimeArch();
+#ifdef FASTLLM_ENABLE_CUTLASS_NVFP4
+                if (arch >= 100 && arch < 130) return true;
+#endif
+                return arch >= 75 && arch < 100 && fixture.inputType == fastllm::DataType::FLOAT16 &&
+                       fixture.batch >= 2 && fixture.in % 64 == 0 && fixture.out % 64 == 0;
+#else
+                (void)params; (void)device;
+                return false;
+#endif
+            },
+            [](const OpTestParams &params, const std::string &device) {
+#ifdef USE_CUDA
+                ScopedFirstDevice guard(device);
+                if (params.GetInt("performance_only") != 0) {
+                    fastllm::Data marker(fastllm::DataType::FLOAT32, {1});
+                    marker.Allocate(0.0f);
+                    return marker;
+                }
+                return LinearNvfp4Fixture(params).RunCuda();
+#else
+                (void)params; (void)device;
+                throw std::runtime_error("linear_nvfp4 requires CUDA");
+#endif
+            },
+            [](const OpTestParams &params) {
+                int batch = params.GetInt("batch"), in = params.GetInt("in"), out = params.GetInt("out");
+                return (double)batch * in * 2.0 +
+                       (double)fastllm::GetDataBytes(fastllm::DataType::NVFP4_BLOCK_16, out, in) +
+                       (double)batch * out * 2.0;
+            },
+            [](const OpTestParams &params) {
+                return 2.0 * params.GetInt("batch") * params.GetInt("in") * params.GetInt("out");
+            }};
+        result.runReference = [](const OpTestParams &params, const std::string&) {
+            if (params.GetInt("performance_only") != 0) {
+                fastllm::Data marker(fastllm::DataType::FLOAT32, {1});
+                marker.Allocate(0.0f);
+                return marker;
+            }
+            return LinearNvfp4Fixture(params).Reference();
+        };
+        result.benchmarkOverride = BenchmarkLinearNvfp4Cuda;
+        return result;
+    }
+
     static OpCase MakeLinearCase() {
         return {
             "linear",
@@ -2456,7 +3116,8 @@ namespace {
                     for (int c = 0; c < block; c++) {
                         blockPtr[c] = static_cast<uint8_t>(0x20 + ((r * 131 + b * 17 + c + (int)(seed * 11.0f)) & 0x1f));
                     }
-                    float scale = 0.0125f + 0.0001f * (float)((r + b + (int)seed) % 11);
+                    float scale = 0.0125f + 0.0001f *
+                        (float)(((r / block) + b + (int)seed) % 11);
                     memcpy(blockPtr + block, &scale, sizeof(float));
                 }
             }
@@ -2502,8 +3163,8 @@ namespace {
             weight.weightType = fastllm::WeightType::LINEAR;
             weight.blockK = 1;
             weight.blockM = in;
+            weight.perChannelAxis = 0;
             weight.Allocate(false);
-
             uint8_t *ptr = reinterpret_cast<uint8_t*>(weight.cpuData);
             for (uint64_t i = 0; i < weight.GetBytes(); ++i) {
                 ptr[i] = static_cast<uint8_t>(
@@ -2558,11 +3219,19 @@ namespace {
                 InitPackedWeight(weight, out, in, block, 0.7f);
             } else if (weightLayout == "separate") {
                 InitSeparateScaleWeight(weight, out, in, block, 0.7f);
+                weight.linearQuantScheme =
+                    fastllm::LinearQuantScheme::FP8_W8A8_BLOCK128;
             } else if (weightLayout == "perchannel") {
                 InitPerChannelWeight(weight, out, in, 0.7f);
+                weight.linearQuantScheme = fastllm::LinearQuantScheme::FP8_W8A8;
+            } else if (weightLayout == "tensorwise") {
+                InitPerChannelWeight(weight, out, in, 0.7f);
+                weight.scales.assign(1, 0.0075f);
+                weight.perChannelAxis = -1;
+                weight.linearQuantScheme = fastllm::LinearQuantScheme::FP8_W8A8;
             } else {
                 throw std::runtime_error(
-                    "weight_layout must be packed, separate or perchannel");
+                    "weight_layout must be packed, separate, perchannel or tensorwise");
             }
             weight.ToDevice(fastllm::DataDevice::CUDA);
 
@@ -2579,7 +3248,7 @@ namespace {
             ForceDeviceSync();
 #else
             (void)params;
-            throw std::runtime_error("linear_fp8_block128 benchmark requires USE_CUDA");
+            throw std::runtime_error("linear FP8 benchmark requires USE_CUDA");
 #endif
         }
 
@@ -2621,9 +3290,9 @@ namespace {
         return output;
     }
 
-    static void PrintLinearFp8Block128CheckStats(const std::vector<float> &expected,
-                                                 const std::vector<float> &actual,
-                                                 int batch, int out) {
+    static void PrintLinearFp8CheckStats(const std::vector<float> &expected,
+                                         const std::vector<float> &actual,
+                                         int batch, int out) {
         if (expected.empty() || expected.size() != actual.size()) {
             throw std::runtime_error(
                 "linear FP8 check received empty or mismatched output vectors");
@@ -2656,7 +3325,7 @@ namespace {
         }
         int row = out == 0 ? 0 : (int)(maxIndex / (size_t)out);
         int col = out == 0 ? 0 : (int)(maxIndex % (size_t)out);
-        std::cout << "linear_fp8_block128 check: batch=" << batch << ", out=" << out
+        std::cout << "linear_fp8 check: batch=" << batch << ", out=" << out
                   << ", count=" << expected.size() << "\n";
         std::cout << "  max_abs_diff=" << maxAbsDiff
                   << ", max_rel_diff=" << maxRelDiff
@@ -2726,18 +3395,22 @@ namespace {
         }
         ForceDeviceSync();
 
-        ok = FastllmCudaCutlassLinearFP8E4M3Block128(state->input, state->weight, state->bias,
-                                                     cutlass, state->batch, state->in, state->out);
-        if (!ok) {
-            throw std::runtime_error("CUTLASS FP8 linear path failed");
-        }
+        // 被测结果走正式Linear入口；权重在Init阶段已经声明为Block128
+        // W8A8，严格模式下目标CUTLASS后端未接管会直接失败。
+        fastllm::Linear(state->input, state->weight, state->bias, cutlass);
         ForceDeviceSync();
 
         fastllm::Data ref32 = ConvertToFloat32Data(ref);
         fastllm::Data cutlass32 = ConvertToFloat32Data(cutlass);
         std::vector<float> refVec = ToFloatVector(ref32);
         std::vector<float> cutlassVec = ToFloatVector(cutlass32);
-        PrintLinearFp8Block128CheckStats(refVec, cutlassVec, state->batch, state->out);
+        PrintLinearFp8CheckStats(refVec, cutlassVec, state->batch, state->out);
+
+        ComparisonStats stats = CompareData(ref32, cutlass32, 0.5f, 0.1f);
+        if (!stats.passed) {
+            throw std::runtime_error(
+                "Block128 FP8 W8A8 output mismatch");
+        }
 
         if (params.GetInt("print") != 0) {
             fastllm::Data input32 = ConvertToFloat32Data(state->input);
@@ -2749,6 +3422,469 @@ namespace {
             ref32.Print("linear_fp8_check.ref.float32");
             cutlass32.Print("linear_fp8_check.cutlass.float32");
         }
+    }
+
+    static void CheckLinearFp8StandardCuda(const OpTestParams &params) {
+        const std::string weightLayout = params.GetString("weight_layout");
+        if (weightLayout != "perchannel" && weightLayout != "tensorwise") {
+            throw std::runtime_error(
+                "standard FP8 check requires perchannel or tensorwise weight scale");
+        }
+        auto state = std::make_shared<LinearFp8Block128BenchState>();
+        state->Init(params);
+        fastllm::Data reference = MakeCudaOutputLike(state->input.dataType, state->batch, state->out);
+        fastllm::Data actual = MakeCudaOutputLike(state->input.dataType, state->batch, state->out);
+        // 旧参考kernel只实现per-channel scale。tensorwise case仅在参考
+        // 计算期间把同一个标量广播成N份；正式Linear调用前恢复单元素，
+        // 确保被测CUTLASS路径真正执行标量广播分支。
+        const bool tensorwise = weightLayout == "tensorwise";
+        const float tensorScale = tensorwise ? state->weight.scales[0] : 0.0f;
+        if (tensorwise) {
+            state->weight.scales.assign(state->out, tensorScale);
+        }
+        bool ok = state->input.dataType == fastllm::DataType::FLOAT16
+            ? FastllmCudaHalfMatMulFloatFP8E4M3(state->input, state->weight, state->bias,
+                                                reference, state->batch, state->in, state->out)
+            : FastllmCudaBFloat16MatMulFP8E4M3(state->input, state->weight, state->bias,
+                                                reference, state->batch, state->in, state->out);
+        if (tensorwise) {
+            state->weight.scales.assign(1, tensorScale);
+        }
+        if (!ok) throw std::runtime_error("standard FP8 reference failed");
+        // 正确性case走正式Linear入口；严格模式保证该标准FP8权重必须由
+        // Dense FP8 W8A8 CUTLASS完成，避免测试绕过生产后端选择和缓存流程。
+        fastllm::Linear(
+            state->input, state->weight, state->bias, actual);
+        ForceDeviceSync();
+        fastllm::Data reference32 = ConvertToFloat32Data(reference);
+        fastllm::Data actual32 = ConvertToFloat32Data(actual);
+        PrintLinearFp8CheckStats(
+            ToFloatVector(reference32), ToFloatVector(actual32),
+            state->batch, state->out);
+        ComparisonStats stats = CompareData(reference32, actual32, 0.5f, 0.1f);
+        if (!stats.passed)
+            throw std::runtime_error("standard FP8 W8A8 output mismatch");
+    }
+
+    static void CheckLinearFp8StandardLifecycleCuda(
+            const OpTestParams &params) {
+        auto restoreEnv = [](const char *name, const std::string &value,
+                             bool existed) {
+            if (existed) setenv(name, value.c_str(), 1);
+            else unsetenv(name);
+        };
+        const char *enabledValue = std::getenv("FASTLLM_CUDA_W8A8");
+        const char *strictValue = std::getenv("FASTLLM_CUDA_W8A8_STRICT");
+        const bool enabledExisted = enabledValue != nullptr;
+        const bool strictExisted = strictValue != nullptr;
+        const std::string oldEnabled = enabledValue == nullptr ? "" : enabledValue;
+        const std::string oldStrict = strictValue == nullptr ? "" : strictValue;
+
+        try {
+            setenv("FASTLLM_CUDA_W8A8", "1", 1);
+            setenv("FASTLLM_CUDA_W8A8_STRICT", "1", 1);
+            auto fixed = std::make_shared<LinearFp8Block128BenchState>();
+            fixed->Init(params);
+            bool ok = FastllmCudaCutlassLinearFp8W8A8(
+                fixed->input, fixed->weight, fixed->bias, fixed->output,
+                fixed->batch, fixed->in, fixed->out);
+            if (!ok) throw std::runtime_error("W8A8 first backend selection failed");
+
+            // 后端固定为CUTLASS后，运行期开关变化不能令同一权重静默改走
+            // Legacy；第二次调用仍必须由已经固定的CUTLASS完成。
+            setenv("FASTLLM_CUDA_W8A8", "0", 1);
+            ok = FastllmCudaCutlassLinearFp8W8A8(
+                fixed->input, fixed->weight, fixed->bias, fixed->output,
+                fixed->batch, fixed->in, fixed->out);
+            if (!ok) throw std::runtime_error("fixed W8A8 backend was not retained");
+
+            // 新权重在开关关闭时只能固定为Rejected。关闭strict以便直接
+            // 观察false返回；后续主流程会据此选择既有Legacy后端。
+            unsetenv("FASTLLM_CUDA_W8A8_STRICT");
+            auto rejected = std::make_shared<LinearFp8Block128BenchState>();
+            rejected->Init(params);
+            ok = FastllmCudaCutlassLinearFp8W8A8(
+                rejected->input, rejected->weight, rejected->bias,
+                rejected->output, rejected->batch, rejected->in, rejected->out);
+            if (ok) throw std::runtime_error("disabled W8A8 backend was not rejected");
+        } catch (...) {
+            restoreEnv("FASTLLM_CUDA_W8A8", oldEnabled, enabledExisted);
+            restoreEnv("FASTLLM_CUDA_W8A8_STRICT", oldStrict, strictExisted);
+            throw;
+        }
+        restoreEnv("FASTLLM_CUDA_W8A8", oldEnabled, enabledExisted);
+        restoreEnv("FASTLLM_CUDA_W8A8_STRICT", oldStrict, strictExisted);
+        std::cout << "Dense FP8 W8A8 fixed backend lifecycle: PASS\n";
+    }
+
+    static void CheckLinearFp8W8A8FirstFailureRejectedCuda(
+            const OpTestParams &params) {
+        const char *enabledValue = std::getenv("FASTLLM_CUDA_W8A8");
+        const char *strictValue = std::getenv("FASTLLM_CUDA_W8A8_STRICT");
+        const char *failureValue = std::getenv(
+            "FASTLLM_CUDA_W8A8_TEST_FORCE_GEMM_FAILURE");
+        const std::optional<std::string> oldEnabled = enabledValue == nullptr
+            ? std::nullopt : std::optional<std::string>(enabledValue);
+        const std::optional<std::string> oldStrict = strictValue == nullptr
+            ? std::nullopt : std::optional<std::string>(strictValue);
+        const std::optional<std::string> oldFailure = failureValue == nullptr
+            ? std::nullopt : std::optional<std::string>(failureValue);
+        auto restore = [](const char *name,
+                          const std::optional<std::string> &value) {
+            if (value.has_value()) setenv(name, value->c_str(), 1);
+            else unsetenv(name);
+        };
+
+        try {
+            setenv("FASTLLM_CUDA_W8A8", "1", 1);
+            unsetenv("FASTLLM_CUDA_W8A8_STRICT");
+            setenv("FASTLLM_CUDA_W8A8_TEST_FORCE_GEMM_FAILURE", "1", 1);
+            LinearFp8Block128BenchState state;
+            state.Init(params);
+            bool ok = FastllmCudaCutlassLinearFp8W8A8(
+                state.input, state.weight, state.bias, state.output,
+                state.batch, state.in, state.out);
+            if (ok || FastllmCudaGetFp8W8A8BackendState(
+                    state.weight, FastllmCudaGetDevice()) !=
+                    FastllmCudaFp8W8A8BackendState::Rejected) {
+                throw std::runtime_error(
+                    "first W8A8 GEMM failure did not fix the backend to Rejected");
+            }
+
+            // 清除故障后同一权重仍必须保持Rejected，不能重新探测CUTLASS。
+            unsetenv("FASTLLM_CUDA_W8A8_TEST_FORCE_GEMM_FAILURE");
+            ok = FastllmCudaCutlassLinearFp8W8A8(
+                state.input, state.weight, state.bias, state.output,
+                state.batch, state.in, state.out);
+            if (ok) {
+                throw std::runtime_error(
+                    "Rejected W8A8 weight unexpectedly retried CUTLASS");
+            }
+        } catch (...) {
+            restore("FASTLLM_CUDA_W8A8", oldEnabled);
+            restore("FASTLLM_CUDA_W8A8_STRICT", oldStrict);
+            restore("FASTLLM_CUDA_W8A8_TEST_FORCE_GEMM_FAILURE", oldFailure);
+            throw;
+        }
+        restore("FASTLLM_CUDA_W8A8", oldEnabled);
+        restore("FASTLLM_CUDA_W8A8_STRICT", oldStrict);
+        restore("FASTLLM_CUDA_W8A8_TEST_FORCE_GEMM_FAILURE", oldFailure);
+        std::cout << "Dense FP8 W8A8 first GEMM failure -> Rejected: PASS\n";
+    }
+
+    static void CheckLinearFp8W8A8FixedFailureThrowsCuda(
+            const OpTestParams &params) {
+        const char *failureValue = std::getenv(
+            "FASTLLM_CUDA_W8A8_TEST_FORCE_GEMM_FAILURE");
+        const std::optional<std::string> oldFailure = failureValue == nullptr
+            ? std::nullopt : std::optional<std::string>(failureValue);
+        auto restoreFailure = [&]() {
+            if (oldFailure.has_value()) {
+                setenv("FASTLLM_CUDA_W8A8_TEST_FORCE_GEMM_FAILURE",
+                       oldFailure->c_str(), 1);
+            } else {
+                unsetenv("FASTLLM_CUDA_W8A8_TEST_FORCE_GEMM_FAILURE");
+            }
+        };
+
+        try {
+            unsetenv("FASTLLM_CUDA_W8A8_TEST_FORCE_GEMM_FAILURE");
+            LinearFp8Block128BenchState state;
+            state.Init(params);
+            bool ok = FastllmCudaCutlassLinearFp8W8A8(
+                state.input, state.weight, state.bias, state.output,
+                state.batch, state.in, state.out);
+            if (!ok || FastllmCudaGetFp8W8A8BackendState(
+                    state.weight, FastllmCudaGetDevice()) !=
+                    FastllmCudaFp8W8A8BackendState::Cutlass) {
+                throw std::runtime_error("W8A8 backend was not fixed to CUTLASS");
+            }
+
+            setenv("FASTLLM_CUDA_W8A8_TEST_FORCE_GEMM_FAILURE", "1", 1);
+            bool threw = false;
+            try {
+                FastllmCudaCutlassLinearFp8W8A8(
+                    state.input, state.weight, state.bias, state.output,
+                    state.batch, state.in, state.out);
+            } catch (const std::runtime_error &) {
+                threw = true;
+            }
+            if (!threw || FastllmCudaGetFp8W8A8BackendState(
+                    state.weight, FastllmCudaGetDevice()) !=
+                    FastllmCudaFp8W8A8BackendState::Cutlass) {
+                throw std::runtime_error(
+                    "fixed W8A8 failure did not throw or changed backend");
+            }
+
+            // 故障消失后仍使用原来固定的CUTLASS，不允许中途切到Legacy。
+            unsetenv("FASTLLM_CUDA_W8A8_TEST_FORCE_GEMM_FAILURE");
+            if (!FastllmCudaCutlassLinearFp8W8A8(
+                    state.input, state.weight, state.bias, state.output,
+                    state.batch, state.in, state.out)) {
+                throw std::runtime_error(
+                    "fixed W8A8 backend did not recover after injected failure");
+            }
+        } catch (...) {
+            restoreFailure();
+            throw;
+        }
+        restoreFailure();
+        std::cout << "Dense FP8 W8A8 fixed CUTLASS failure forbids fallback: PASS\n";
+    }
+
+    static void CheckLinearFp8W8A8DestructorClearsStateCuda(
+            const OpTestParams &params) {
+        std::optional<LinearFp8Block128BenchState> holder;
+        holder.emplace();
+        holder->Init(params);
+        if (!FastllmCudaCutlassLinearFp8W8A8(
+                holder->input, holder->weight, holder->bias, holder->output,
+                holder->batch, holder->in, holder->out)) {
+            throw std::runtime_error("W8A8 destructor test selection failed");
+        }
+        const fastllm::Data *oldAddress = &holder->weight;
+        if (FastllmCudaGetFp8W8A8BackendState(
+                holder->weight, FastllmCudaGetDevice()) !=
+                FastllmCudaFp8W8A8BackendState::Cutlass) {
+            throw std::runtime_error("W8A8 destructor test did not reach CUTLASS");
+        }
+
+        // optional在同一内嵌存储上析构并重建对象。新Data地址相同，若析构
+        // 未清状态，它会错误继承旧权重的Cutlass记录。
+        holder.reset();
+        holder.emplace();
+        if (&holder->weight != oldAddress ||
+            FastllmCudaGetFp8W8A8BackendState(
+                holder->weight, FastllmCudaGetDevice()) !=
+                FastllmCudaFp8W8A8BackendState::Uninitialized) {
+            throw std::runtime_error(
+                "destroyed W8A8 weight left a stale backend state");
+        }
+        std::cout << "Dense FP8 W8A8 Data destructor clears backend state: PASS\n";
+    }
+
+    static void CheckLinearFp8W8A8DeviceMoveCuda(
+            const OpTestParams &params) {
+        if (FastllmCudaGetDeviceCount() < 2) {
+            std::cout << "Dense FP8 W8A8 GPU migration: SKIP (requires 2 GPUs)\n";
+            return;
+        }
+        LinearFp8Block128BenchState state;
+        state.Init(params);
+        if (!FastllmCudaCutlassLinearFp8W8A8(
+                state.input, state.weight, state.bias, state.output,
+                state.batch, state.in, state.out)) {
+            throw std::runtime_error("W8A8 GPU0 backend selection failed");
+        }
+        ForceDeviceSync();
+        fastllm::Data gpu0 = ConvertToFloat32Data(state.output);
+
+        // Data::ToDevice必须先销毁GPU0的scale/bias cache和后端状态，再从
+        // Data::scales主机源在GPU1创建新cache，不能沿用extraCudaData地址。
+        state.input.ToDevice(fastllm::DataDevice::CUDA, {1});
+        state.weight.ToDevice(fastllm::DataDevice::CUDA, {1});
+        if (!state.bias.dims.empty()) {
+            state.bias.ToDevice(fastllm::DataDevice::CUDA, {1});
+        }
+        state.output.ToDevice(fastllm::DataDevice::CUDA, {1}, false);
+        FastllmCudaSetDevice(1);
+        if (FastllmCudaGetFp8W8A8BackendState(state.weight, 0) !=
+                FastllmCudaFp8W8A8BackendState::Uninitialized ||
+            FastllmCudaGetFp8W8A8BackendState(state.weight, 1) !=
+                FastllmCudaFp8W8A8BackendState::Prepared) {
+            throw std::runtime_error("W8A8 GPU migration retained stale backend state");
+        }
+        if (!FastllmCudaCutlassLinearFp8W8A8(
+                state.input, state.weight, state.bias, state.output,
+                state.batch, state.in, state.out)) {
+            throw std::runtime_error("W8A8 GPU1 backend selection failed");
+        }
+        ForceDeviceSync();
+        fastllm::Data gpu1 = ConvertToFloat32Data(state.output);
+        ComparisonStats stats = CompareData(gpu0, gpu1, 0.02f, 0.02f);
+        if (!stats.passed) {
+            throw std::runtime_error("W8A8 GPU migration output mismatch");
+        }
+        FastllmCudaSetDevice(0);
+        std::cout << "Dense FP8 W8A8 GPU migration rebuilds cache: PASS\n";
+    }
+
+    static void CheckLinearFp8Block128LifecycleCuda(
+            const OpTestParams &params, int mode) {
+        const char *enabledValue = std::getenv("FASTLLM_CUDA_W8A8");
+        const char *strictValue = std::getenv("FASTLLM_CUDA_W8A8_STRICT");
+        const char *failureValue = std::getenv(
+            "FASTLLM_CUDA_W8A8_TEST_FORCE_GEMM_FAILURE");
+        const std::optional<std::string> oldEnabled = enabledValue == nullptr
+            ? std::nullopt : std::optional<std::string>(enabledValue);
+        const std::optional<std::string> oldStrict = strictValue == nullptr
+            ? std::nullopt : std::optional<std::string>(strictValue);
+        const std::optional<std::string> oldFailure = failureValue == nullptr
+            ? std::nullopt : std::optional<std::string>(failureValue);
+        auto restore = [](const char *name,
+                          const std::optional<std::string> &value) {
+            if (value.has_value()) setenv(name, value->c_str(), 1);
+            else unsetenv(name);
+        };
+        auto restoreAll = [&]() {
+            restore("FASTLLM_CUDA_W8A8", oldEnabled);
+            restore("FASTLLM_CUDA_W8A8_STRICT", oldStrict);
+            restore("FASTLLM_CUDA_W8A8_TEST_FORCE_GEMM_FAILURE", oldFailure);
+        };
+
+        try {
+            setenv("FASTLLM_CUDA_W8A8", "1", 1);
+            unsetenv("FASTLLM_CUDA_W8A8_TEST_FORCE_GEMM_FAILURE");
+
+            if (mode == 0) {
+                setenv("FASTLLM_CUDA_W8A8_STRICT", "1", 1);
+                LinearFp8Block128BenchState state;
+                state.Init(params);
+                if (!FastllmCudaCutlassLinearFp8W8A8Block128(
+                        state.input, state.weight, state.bias, state.output,
+                        state.batch, state.in, state.out)) {
+                    throw std::runtime_error(
+                        "Block128 first backend selection failed");
+                }
+                setenv("FASTLLM_CUDA_W8A8", "0", 1);
+                if (!FastllmCudaCutlassLinearFp8W8A8Block128(
+                        state.input, state.weight, state.bias, state.output,
+                        state.batch, state.in, state.out)) {
+                    throw std::runtime_error(
+                        "fixed Block128 backend was not retained");
+                }
+            } else if (mode == 1) {
+                unsetenv("FASTLLM_CUDA_W8A8_STRICT");
+                setenv("FASTLLM_CUDA_W8A8_TEST_FORCE_GEMM_FAILURE", "1", 1);
+                LinearFp8Block128BenchState state;
+                state.Init(params);
+                bool ok = FastllmCudaCutlassLinearFp8W8A8Block128(
+                    state.input, state.weight, state.bias, state.output,
+                    state.batch, state.in, state.out);
+                if (ok || FastllmCudaGetFp8W8A8Block128BackendState(
+                        state.weight, FastllmCudaGetDevice()) !=
+                        FastllmCudaFp8W8A8BackendState::Rejected) {
+                    throw std::runtime_error(
+                        "Block128 first failure did not fix Rejected");
+                }
+                unsetenv("FASTLLM_CUDA_W8A8_TEST_FORCE_GEMM_FAILURE");
+                if (FastllmCudaCutlassLinearFp8W8A8Block128(
+                        state.input, state.weight, state.bias, state.output,
+                        state.batch, state.in, state.out)) {
+                    throw std::runtime_error(
+                        "Rejected Block128 weight retried CUTLASS");
+                }
+            } else if (mode == 2) {
+                setenv("FASTLLM_CUDA_W8A8_STRICT", "1", 1);
+                LinearFp8Block128BenchState state;
+                state.Init(params);
+                if (!FastllmCudaCutlassLinearFp8W8A8Block128(
+                        state.input, state.weight, state.bias, state.output,
+                        state.batch, state.in, state.out)) {
+                    throw std::runtime_error(
+                        "Block128 backend was not fixed to CUTLASS");
+                }
+                setenv("FASTLLM_CUDA_W8A8_TEST_FORCE_GEMM_FAILURE", "1", 1);
+                bool threw = false;
+                try {
+                    FastllmCudaCutlassLinearFp8W8A8Block128(
+                        state.input, state.weight, state.bias, state.output,
+                        state.batch, state.in, state.out);
+                } catch (const std::runtime_error &) {
+                    threw = true;
+                }
+                if (!threw || FastllmCudaGetFp8W8A8Block128BackendState(
+                        state.weight, FastllmCudaGetDevice()) !=
+                        FastllmCudaFp8W8A8BackendState::Cutlass) {
+                    throw std::runtime_error(
+                        "fixed Block128 failure did not forbid fallback");
+                }
+            } else if (mode == 3) {
+                std::optional<LinearFp8Block128BenchState> holder;
+                holder.emplace();
+                holder->Init(params);
+                if (!FastllmCudaCutlassLinearFp8W8A8Block128(
+                        holder->input, holder->weight, holder->bias,
+                        holder->output, holder->batch, holder->in,
+                        holder->out)) {
+                    throw std::runtime_error(
+                        "Block128 destructor test selection failed");
+                }
+                const fastllm::Data *address = &holder->weight;
+                holder.reset();
+                holder.emplace();
+                if (&holder->weight != address ||
+                    FastllmCudaGetFp8W8A8Block128BackendState(
+                        holder->weight, FastllmCudaGetDevice()) !=
+                        FastllmCudaFp8W8A8BackendState::Uninitialized) {
+                    throw std::runtime_error(
+                        "destroyed Block128 weight left stale state");
+                }
+            } else if (mode == 4) {
+                if (FastllmCudaGetDeviceCount() < 2) {
+                    std::cout << "Block128 W8A8 GPU migration: SKIP "
+                              << "(requires 2 GPUs)\n";
+                    restoreAll();
+                    return;
+                }
+
+                setenv("FASTLLM_CUDA_W8A8_STRICT", "1", 1);
+                LinearFp8Block128BenchState state;
+                state.Init(params);
+
+                if (!FastllmCudaCutlassLinearFp8W8A8Block128(
+                        state.input, state.weight, state.bias, state.output,
+                        state.batch, state.in, state.out)) {
+                    throw std::runtime_error(
+                        "Block128 GPU0 backend selection failed");
+                }
+                ForceDeviceSync();
+                fastllm::Data gpu0 = ConvertToFloat32Data(state.output);
+
+                state.input.ToDevice(fastllm::DataDevice::CUDA, {1});
+                state.weight.ToDevice(fastllm::DataDevice::CUDA, {1});
+                if (!state.bias.dims.empty()) {
+                    state.bias.ToDevice(fastllm::DataDevice::CUDA, {1});
+                }
+                state.output.ToDevice(
+                    fastllm::DataDevice::CUDA, {1}, false);
+                FastllmCudaSetDevice(1);
+
+                if (FastllmCudaGetFp8W8A8Block128BackendState(
+                        state.weight, 0) !=
+                            FastllmCudaFp8W8A8BackendState::Uninitialized ||
+                    FastllmCudaGetFp8W8A8Block128BackendState(
+                        state.weight, 1) !=
+                            FastllmCudaFp8W8A8BackendState::Prepared) {
+                    throw std::runtime_error(
+                        "Block128 GPU migration retained stale backend state");
+                }
+
+                if (!FastllmCudaCutlassLinearFp8W8A8Block128(
+                        state.input, state.weight, state.bias, state.output,
+                        state.batch, state.in, state.out)) {
+                    throw std::runtime_error(
+                        "Block128 GPU1 backend selection failed");
+                }
+                ForceDeviceSync();
+                fastllm::Data gpu1 = ConvertToFloat32Data(state.output);
+
+                ComparisonStats stats = CompareData(gpu0, gpu1, 0.02f, 0.02f);
+                if (!stats.passed) {
+                    throw std::runtime_error(
+                        "Block128 GPU migration output mismatch");
+                }
+                FastllmCudaSetDevice(0);
+            }
+        } catch (...) {
+            FastllmCudaSetDevice(0);
+            restoreAll();
+            throw;
+        }
+
+        restoreAll();
+        std::cout << "Block128 W8A8 lifecycle check " << mode
+                  << ": PASS\n";
     }
 
     static void CheckLinearFp8PerChannelCuda(const OpTestParams &params) {
@@ -2784,7 +3920,7 @@ namespace {
 
         std::vector<float> refVec = ToFloatVector(ConvertToFloat32Data(reference));
         std::vector<float> cutlassVec = ToFloatVector(ConvertToFloat32Data(cutlass));
-        PrintLinearFp8Block128CheckStats(
+        PrintLinearFp8CheckStats(
             refVec, cutlassVec, state->batch, state->out);
         const float atol = state->input.dataType == fastllm::DataType::FLOAT16
             ? 2.0e-3f : 8.0e-3f;
@@ -2837,7 +3973,7 @@ namespace {
         expected.resize(state->out);
         std::vector<float> observed =
             ToFloatVector(ConvertToFloat32Data(single));
-        PrintLinearFp8Block128CheckStats(
+        PrintLinearFp8CheckStats(
             expected, observed, 1, state->out);
 
         int mismatches = 0;
@@ -2920,7 +4056,7 @@ namespace {
 
         std::vector<float> expected = ToFloatVector(ConvertToFloat32Data(reference));
         std::vector<float> observed = ToFloatVector(ConvertToFloat32Data(actual));
-        PrintLinearFp8Block128CheckStats(
+        PrintLinearFp8CheckStats(
             expected, observed, state->batch, state->out);
 
         int mismatches = 0;
@@ -2938,7 +4074,7 @@ namespace {
 
         expected.resize(state->out);
         observed = ToFloatVector(ConvertToFloat32Data(actualSingle));
-        PrintLinearFp8Block128CheckStats(expected, observed, 1, state->out);
+        PrintLinearFp8CheckStats(expected, observed, 1, state->out);
         mismatches = 0;
         for (size_t i = 0; i < expected.size(); i++) {
             float diff = std::fabs(expected[i] - observed[i]);
@@ -3083,7 +4219,7 @@ namespace {
         fastllm::Data fused32 = ConvertToFloat32Data(fused);
         std::vector<float> refVec = ToFloatVector(ref32);
         std::vector<float> fusedVec = ToFloatVector(fused32);
-        PrintLinearFp8Block128CheckStats(refVec, fusedVec, state->batch, state->out);
+        PrintLinearFp8CheckStats(refVec, fusedVec, state->batch, state->out);
 
         float maxAbsDiff = 0.0f;
         for (size_t i = 0; i < refVec.size(); i++) {
@@ -3127,6 +4263,29 @@ namespace {
         } else if (params.GetInt("check") == 6) {
             CheckLinearFp8PerChannelCuda(params);
             return BenchmarkResult();
+        } else if (params.GetInt("check") == 7) {
+            CheckLinearFp8StandardCuda(params);
+            return BenchmarkResult();
+        } else if (params.GetInt("check") == 8) {
+            CheckLinearFp8StandardLifecycleCuda(params);
+            return BenchmarkResult();
+        } else if (params.GetInt("check") == 9) {
+            CheckLinearFp8W8A8FirstFailureRejectedCuda(params);
+            return BenchmarkResult();
+        } else if (params.GetInt("check") == 10) {
+            CheckLinearFp8W8A8FixedFailureThrowsCuda(params);
+            return BenchmarkResult();
+        } else if (params.GetInt("check") == 11) {
+            CheckLinearFp8W8A8DestructorClearsStateCuda(params);
+            return BenchmarkResult();
+        } else if (params.GetInt("check") == 12) {
+            CheckLinearFp8W8A8DeviceMoveCuda(params);
+            return BenchmarkResult();
+        } else if (params.GetInt("check") >= 13 &&
+                   params.GetInt("check") <= 17) {
+            CheckLinearFp8Block128LifecycleCuda(
+                params, params.GetInt("check") - 13);
+            return BenchmarkResult();
         }
 
         auto state = std::make_shared<LinearFp8Block128BenchState>();
@@ -3163,10 +4322,15 @@ namespace {
         int batch = params.GetInt("batch"), in = params.GetInt("in"), out = params.GetInt("out");
         BenchmarkResult result;
         result.avgMs = totalMs / std::max(iters, 1);
+        const double weightBytes =
+            (double)state->weight.GetBytes() +
+            (double)state->weight.scales.size() * sizeof(float);
         result.bytesMoved = (double)batch * in * 2.0 +
                             (double)batch * out * 2.0 +
-                            (double)fastllm::GetDataBytes(fastllm::DataType::FP8_E4M3_BLOCK_128, out, in) +
-                            (double)out * sizeof(float);
+                            weightBytes +
+                            (params.GetInt("has_bias") != 0
+                                ? (double)out * sizeof(float)
+                                : 0.0);
         result.flops = 2.0 * (double)batch * in * out;
         double seconds = result.avgMs / 1000.0;
         if (seconds > 0.0 && result.bytesMoved > 0.0) {
@@ -3181,14 +4345,165 @@ namespace {
         (void)device;
         (void)warmup;
         (void)iters;
-        throw std::runtime_error("linear_fp8_block128 benchmark requires USE_CUDA");
+        throw std::runtime_error("linear FP8 benchmark requires USE_CUDA");
 #endif
     }
 
+    /**
+     * 执行标准Dense FP8 W8A8功能或性能测试。
+     *
+     * 本入口只接受per-channel或tensorwise权重scale，并把对外连续编号的
+     * 检查项映射到已有公共实现；实际计算仍通过正式Linear入口完成。
+     *
+     * @param params  测试参数；check=1..6依次表示正确性、固定后端、首次
+     *                失败拒绝、固定后端失败、析构清理和设备迁移。
+     * @param device  CUDA设备名称。
+     * @param warmup  性能测试预热次数。
+     * @param iters   性能测试正式迭代次数。
+     * @return 功能检查结果或性能统计。
+     */
+    static BenchmarkResult BenchmarkLinearFp8W8A8Cuda(
+            const OpTestParams &params, const std::string &device,
+            int warmup, int iters) {
+        const std::string layout = params.GetString("weight_layout");
+        if (layout != "perchannel" && layout != "tensorwise") {
+            throw std::runtime_error(
+                "linear_fp8_w8a8 requires perchannel or tensorwise "
+                "weight_layout");
+        }
+        if (params.GetString("kernel") != "auto") {
+            throw std::runtime_error(
+                "linear_fp8_w8a8 only supports the production auto path");
+        }
+
+        const int check = params.GetInt("check");
+        if (check < 0 || check > 6) {
+            throw std::runtime_error("linear_fp8_w8a8 check must be 0..6");
+        }
+
+        OpTestParams forwarded = params;
+        if (check != 0) {
+            forwarded.Override("check", std::to_string(check + 6));
+        }
+        return BenchmarkLinearFp8Block128Cuda(
+            forwarded, device, warmup, iters);
+    }
+
+    /**
+     * 执行Block128 FP8 W8A8功能或性能测试。
+     *
+     * 本入口只接受分离存放的(128,128)权重scale；check=2..6复用已有
+     * Block128后端生命周期检查，实际计算仍通过正式Linear入口完成。
+     *
+     * @param params  测试参数；check=1表示正确性，2..6表示后端生命周期。
+     * @param device  CUDA设备名称。
+     * @param warmup  性能测试预热次数。
+     * @param iters   性能测试正式迭代次数。
+     * @return 功能检查结果或性能统计。
+     */
+    static BenchmarkResult BenchmarkLinearFp8Block128OnlyCuda(
+            const OpTestParams &params, const std::string &device,
+            int warmup, int iters) {
+        if (params.GetString("weight_layout") != "separate") {
+            throw std::runtime_error(
+                "linear_fp8_block128 requires separate weight_layout");
+        }
+        if (params.GetString("kernel") != "auto") {
+            throw std::runtime_error(
+                "linear_fp8_block128 only supports the production auto path");
+        }
+
+        const int check = params.GetInt("check");
+        if (check < 0 || check > 6) {
+            throw std::runtime_error(
+                "linear_fp8_block128 check must be 0..6");
+        }
+
+        OpTestParams forwarded = params;
+        if (check >= 2) {
+            forwarded.Override("check", std::to_string(check + 11));
+        }
+        return BenchmarkLinearFp8Block128Cuda(
+            forwarded, device, warmup, iters);
+    }
+
+    /**
+     * 构造标准Dense FP8 W8A8测试入口。
+     *
+     * 该入口仅暴露per-channel和tensorwise scale语义，并统一调用正式
+     * Linear路径；Block128和历史实验检查由其他入口承载。
+     *
+     * @return 标准Dense FP8 W8A8算子测试定义。
+     */
+    static OpCase MakeLinearFp8W8A8Case() {
+        return {
+            "linear_fp8_w8a8",
+            "dense FP8 W8A8 linear functional and performance test",
+            []() {
+                OpTestParams params;
+                params.Add("batch", "16", "token batch size");
+                params.Add("in", "4096", "input features");
+                params.Add("out", "4096", "output features");
+                params.Add("block", "128", "input pattern group size");
+                params.Add("input_type", "bf16", "fp16 or bf16");
+                params.Add("input_pattern", "blocky", "smooth or blocky");
+                params.Add("weight_layout", "perchannel",
+                           "perchannel or tensorwise");
+                params.Add("has_bias", "1",
+                           "1 to include a float32 bias, 0 for no bias");
+                params.Add("kernel", "auto", "auto only for production path");
+                params.Add("check", "0",
+                           "1 correctness, 2 fixed backend lifecycle, "
+                           "3 first failure rejection, 4 fixed backend failure, "
+                           "5 destructor cleanup, 6 GPU migration cache rebuild");
+                params.Add("print", "0", "1 to print debug tensors");
+                return params;
+            },
+            [](const OpTestParams&, const std::string &device) {
+                return device.rfind("cuda", 0) == 0;
+            },
+            [](const OpTestParams&, const std::string&) {
+                fastllm::Data marker(fastllm::DataType::FLOAT32, {1});
+                marker.Allocate(0.0f);
+                return marker;
+            },
+            BenchmarkLinearFp8W8A8Cuda,
+            [](const OpTestParams &params) {
+                int batch = params.GetInt("batch");
+                int in = params.GetInt("in");
+                int out = params.GetInt("out");
+                double inputBytes = (double)batch * in * 2.0;
+                double outputBytes = (double)batch * out * 2.0;
+                double scaleBytes =
+                    params.GetString("weight_layout") == "tensorwise"
+                        ? sizeof(float)
+                        : (double)out * sizeof(float);
+                double biasBytes = params.GetInt("has_bias") != 0
+                    ? (double)out * sizeof(float)
+                    : 0.0;
+                return inputBytes + outputBytes +
+                       (double)out * in + scaleBytes + biasBytes;
+            },
+            [](const OpTestParams &params) {
+                return 2.0 * (double)params.GetInt("batch") *
+                       params.GetInt("in") * params.GetInt("out");
+            },
+            true
+        };
+    }
+
+    /**
+     * 构造Block128 FP8 W8A8测试入口。
+     *
+     * 该入口只允许独立存放的(128,128)权重scale，并通过正式Linear
+     * 路径验证Block128后端及其生命周期。
+     *
+     * @return Block128 FP8 W8A8算子测试定义。
+     */
     static OpCase MakeLinearFp8Block128Case() {
         return {
             "linear_fp8_block128",
-            "benchmark-only dense FP8 block128 linear",
+            "Block128 FP8 W8A8 linear functional and performance test",
             []() {
                 OpTestParams params;
                 params.Add("batch", "16", "token batch size");
@@ -3197,14 +4512,77 @@ namespace {
                 params.Add("block", "128", "FP8 scale block size");
                 params.Add("input_type", "bf16", "fp16 or bf16");
                 params.Add("input_pattern", "blocky", "smooth or blocky");
-                params.Add("weight_layout", "packed", "packed, separate or perchannel");
+                params.Add("weight_layout", "separate",
+                           "separate Block128 scales only");
                 params.Add("has_bias", "1", "1 to include a float32 bias, 0 for no bias");
-                params.Add("kernel", "auto", "auto, legacy, or marlin_batch1");
+                params.Add("kernel", "auto", "auto only for production path");
                 params.Add("check", "0",
-                           "1 linear, 2 fused swiglu+quant, 3 Marlin bulk/tail, "
+                           "1 correctness, 2 fixed backend lifecycle, "
+                           "3 first failure rejection, 4 fixed backend failure, "
+                           "5 destructor cleanup, 6 GPU migration cache rebuild");
+                params.Add("print", "0", "1 to print debug tensors when check=1");
+                return params;
+            },
+            [](const OpTestParams&, const std::string &device) {
+                return device.rfind("cuda", 0) == 0;
+            },
+            [](const OpTestParams&, const std::string&) {
+                fastllm::Data marker(fastllm::DataType::FLOAT32, {1});
+                marker.Allocate(0.0f);
+                return marker;
+            },
+            BenchmarkLinearFp8Block128OnlyCuda,
+            [](const OpTestParams &params) {
+                int batch = params.GetInt("batch"), in = params.GetInt("in"), out = params.GetInt("out");
+                double inputBytes = (double)batch * in * 2.0;
+                double outputBytes = (double)batch * out * 2.0;
+                double weightBytes = (double)out * in;
+                double scaleBytes = (double)(out / 128) * (in / 128) *
+                                    sizeof(float);
+                double biasBytes = params.GetInt("has_bias") != 0
+                    ? (double)out * sizeof(float)
+                    : 0.0;
+                return inputBytes + outputBytes + weightBytes +
+                       scaleBytes + biasBytes;
+            },
+            [](const OpTestParams &params) {
+                return 2.0 * (double)params.GetInt("batch") * params.GetInt("in") * params.GetInt("out");
+            },
+            true
+        };
+    }
+
+    /**
+     * 构造历史FP8专项检查入口。
+     *
+     * 该入口保留融合SwiGLU、Marlin、原始Batch-1和布局安全等既有测试，
+     * 避免Dense与Block128入口拆分后丢失原有专项验证能力。
+     *
+     * @return 历史FP8专项测试定义。
+     */
+    static OpCase MakeLinearFp8LegacyCase() {
+        return {
+            "linear_fp8_legacy",
+            "legacy FP8 fused, Marlin and layout safety tests",
+            []() {
+                OpTestParams params;
+                params.Add("batch", "16", "token batch size");
+                params.Add("in", "4096", "input features");
+                params.Add("out", "4096", "output features");
+                params.Add("block", "128", "FP8 scale block size");
+                params.Add("input_type", "bf16", "fp16 or bf16");
+                params.Add("input_pattern", "blocky", "smooth or blocky");
+                params.Add("weight_layout", "packed",
+                           "packed, separate, perchannel or tensorwise");
+                params.Add("has_bias", "1",
+                           "1 to include a float32 bias, 0 for no bias");
+                params.Add("kernel", "auto",
+                           "auto, legacy, or marlin_batch1");
+                params.Add("check", "0",
+                           "2 fused swiglu+quant, 3 Marlin bulk/tail, "
                            "4 raw batch-one, 5 Marlin/CUTLASS layout safety, "
                            "6 per-channel CUTLASS scaled-mm");
-                params.Add("print", "0", "1 to print debug tensors when check=1");
+                params.Add("print", "0", "1 to print debug tensors");
                 return params;
             },
             [](const OpTestParams&, const std::string &device) {
@@ -3217,17 +4595,250 @@ namespace {
             },
             BenchmarkLinearFp8Block128Cuda,
             [](const OpTestParams &params) {
-                int batch = params.GetInt("batch"), in = params.GetInt("in"), out = params.GetInt("out");
-                double inputBytes = (double)batch * in * 2.0;
-                double outputBytes = (double)batch * out * 2.0;
-                double weightBytes = (double)fastllm::GetDataBytes(fastllm::DataType::FP8_E4M3_BLOCK_128, out, in);
-                return inputBytes + outputBytes + weightBytes + (double)out * sizeof(float);
+                int batch = params.GetInt("batch");
+                int in = params.GetInt("in");
+                int out = params.GetInt("out");
+                return (double)batch * in * 2.0 +
+                       (double)batch * out * 2.0 +
+                       (double)fastllm::GetDataBytes(
+                           fastllm::DataType::FP8_E4M3_BLOCK_128, out, in) +
+                       (double)out * sizeof(float);
             },
             [](const OpTestParams &params) {
-                return 2.0 * (double)params.GetInt("batch") * params.GetInt("in") * params.GetInt("out");
+                return 2.0 * (double)params.GetInt("batch") *
+                       params.GetInt("in") * params.GetInt("out");
             },
             true
         };
+    }
+
+    struct LinearInt8W8A8State {
+        int batch, in, out, check;
+        std::string activationScheme;
+        fastllm::Data input, weight, bias, output;
+        void Init(const OpTestParams &params) {
+#ifdef USE_CUDA
+            batch = params.GetInt("batch"); in = params.GetInt("in"); out = params.GetInt("out");
+            check = params.GetInt("check");
+            std::vector<float> inputValues((size_t)batch * in);
+            for (size_t i = 0; i < inputValues.size(); ++i) {
+                inputValues[i] = ((int)(i * 37 % 501) - 100) * 0.001f;
+            }
+            fastllm::Data fp32(
+                fastllm::DataType::FLOAT32, {batch, in}, inputValues);
+            input.CopyFrom(fp32);
+            fastllm::ToDataType(input, params.GetString("input_type") == "fp16"
+                ? fastllm::DataType::FLOAT16 : fastllm::DataType::BFLOAT16);
+            input.ToDevice(fastllm::DataDevice::CUDA);
+            weight.dataType = fastllm::DataType::INT8_W8A8;
+            weight.UpdateUnitSize(); weight.Resize({out, in}); weight.Allocate(false);
+            weight.weightType = fastllm::WeightType::LINEAR;
+            weight.linearQuantScheme = fastllm::LinearQuantScheme::INT8_W8A8;
+            activationScheme = params.GetString("activation_scheme");
+            if (activationScheme != "symmetric" &&
+                activationScheme != "symmetric_static" &&
+                activationScheme != "azp_dynamic" &&
+                activationScheme != "azp_static") {
+                throw std::runtime_error(
+                    "activation_scheme must be symmetric, symmetric_static, "
+                    "azp_dynamic or azp_static");
+            }
+            weight.w8a8InputDynamic = activationScheme != "symmetric_static" &&
+                                      activationScheme != "azp_static";
+            weight.w8a8InputSymmetric =
+                activationScheme == "symmetric" ||
+                activationScheme == "symmetric_static";
+            weight.w8a8InputScale = 0.01f;
+            weight.w8a8InputZeroPoint = weight.w8a8InputSymmetric ? 0 : -3;
+            weight.perChannelAxis = 0; weight.scales.resize(out);
+            int8_t *q = (int8_t*)weight.cpuData;
+            for (int row = 0; row < out; ++row) {
+                float scale = 0.0025f + 0.00001f * (row % 31);
+                weight.scales[row] = scale;
+                for (int col = 0; col < in; ++col)
+                    q[(size_t)row * in + col] = (int8_t)(((row * 17 + col * 13) % 255) - 127);
+            }
+            weight.ToDevice(fastllm::DataDevice::CUDA);
+            if (params.GetInt("has_bias")) {
+                bias.CopyFrom(MakeRampTensor({out}, -0.1f));
+                bias.ToDevice(fastllm::DataDevice::CUDA);
+            }
+            output.dataType = input.dataType; output.UpdateUnitSize();
+            output.Resize({batch, out}); output.Allocate(false);
+            output.ToDevice(fastllm::DataDevice::CUDA, false);
+#else
+            (void)params;
+#endif
+        }
+        void Run() {
+            if (!FastllmCudaCutlassLinearInt8W8A8Sm90(
+                    input, weight, bias, output, batch, in, out))
+                throw std::runtime_error("SM90 INT8 W8A8 path rejected the test case");
+        }
+        void Check() {
+            if (check >= 2 && check <= 4) {
+                const char *reason = nullptr;
+                if (check == 2) {
+                    weight.zeros.assign(out, 1);
+                    reason = "asymmetric weight zero-points";
+                } else if (check == 3) {
+                    weight.w8a8InputDynamic = false;
+                    weight.w8a8InputScale = 0.0f;
+                    reason = "non-positive static activation scale";
+                } else {
+                    weight.w8a8InputSymmetric = true;
+                    weight.w8a8InputZeroPoint = 1;
+                    reason = "non-zero symmetric activation zero-point";
+                }
+                if (FastllmCudaCutlassLinearInt8W8A8Sm90(
+                        input, weight, bias, output, batch, in, out)) {
+                    throw std::runtime_error(
+                        std::string("SM90 INT8 W8A8 accepted ") + reason);
+                }
+                std::cout << "linear_int8_w8a8 rejected " << reason << "\n";
+                return;
+            }
+            Run(); ForceDeviceSync();
+            std::vector<float> x = ToFloatVector(ConvertToFloat32Data(input));
+            std::vector<float> y = ToFloatVector(ConvertToFloat32Data(output));
+            const int8_t *q = (const int8_t*)weight.cpuData;
+            const float *b = bias.dims.empty() ? nullptr : (const float*)bias.cpuData;
+            float maxDiff = 0.0f, sumDiff = 0.0f;
+            int failures = 0;
+            for (int r = 0; r < batch; ++r) {
+                float tokenScale = weight.w8a8InputScale;
+                int zeroPoint = weight.w8a8InputZeroPoint;
+                if (weight.w8a8InputDynamic && weight.w8a8InputSymmetric) {
+                    float maxInput = 0.0f;
+                    for (int p = 0; p < in; ++p)
+                        maxInput = std::max(maxInput, std::fabs(x[(size_t)r * in + p]));
+                    tokenScale = std::max(maxInput / 127.0f, 1.1920928955078125e-7f);
+                    zeroPoint = 0;
+                } else if (weight.w8a8InputDynamic) {
+                    float minimum = std::numeric_limits<float>::max();
+                    float maximum = std::numeric_limits<float>::lowest();
+                    for (int p = 0; p < in; ++p) {
+                        float value = x[(size_t)r * in + p];
+                        minimum = std::min(minimum, value);
+                        maximum = std::max(maximum, value);
+                    }
+                    tokenScale = (maximum - minimum) / 255.0f;
+                    zeroPoint = (int)std::nearbyint(
+                        -128.0f - minimum / tokenScale);
+                }
+                for (int c = 0; c < out; ++c) {
+                    int32_t dot = 0, weightSum = 0;
+                    for (int p = 0; p < in; ++p) {
+                        int value = (int)std::nearbyint(
+                            x[(size_t)r * in + p] / tokenScale) + zeroPoint;
+                        const int qmin = weight.w8a8InputDynamic &&
+                                         weight.w8a8InputSymmetric ? -127 : -128;
+                        value = std::max(qmin, std::min(127, value));
+                        const int weightValue = (int)q[(size_t)c * in + p];
+                        dot += value * weightValue;
+                        weightSum += weightValue;
+                    }
+                    int32_t corrected = dot - zeroPoint * weightSum;
+                    float ref = (float)corrected * tokenScale * weight.scales[c] +
+                                (b ? b[c] : 0.0f);
+                    float diff = std::fabs(ref - y[(size_t)r * out + c]);
+                    maxDiff = std::max(maxDiff, diff);
+                    sumDiff += diff;
+                    failures += diff > 0.75f;
+                }
+            }
+            const float meanDiff = sumDiff / std::max(1, batch * out);
+            std::cout << "linear_int8_w8a8 check max_abs_diff=" << maxDiff
+                      << " mean_abs_diff=" << meanDiff
+                      << " failed_elements=" << failures
+                      << " activation_scheme="
+                      << activationScheme
+                      << "\n";
+            if (!std::isfinite(maxDiff) || failures != 0)
+                throw std::runtime_error("SM90 INT8 W8A8 output mismatch");
+        }
+    };
+
+    static BenchmarkResult BenchmarkLinearInt8W8A8(
+        const OpTestParams &params, const std::string &device, int warmup, int iters) {
+#ifdef USE_CUDA
+        ScopedFirstDevice guard(device);
+        LinearInt8W8A8State state; state.Init(params);
+        if (params.GetInt("check")) { state.Check(); return {}; }
+
+        for (int i = 0; i < warmup; ++i) state.Run();
+        ForceDeviceSync();
+
+        cudaEvent_t begin = nullptr;
+        cudaEvent_t end = nullptr;
+        if (cudaEventCreate(&begin) != cudaSuccess ||
+            cudaEventCreate(&end) != cudaSuccess) {
+            if (begin != nullptr) cudaEventDestroy(begin);
+            if (end != nullptr) cudaEventDestroy(end);
+            throw std::runtime_error(
+                "linear_int8_w8a8 failed to create CUDA timing events");
+        }
+        if (cudaEventRecord(begin, 0) != cudaSuccess) {
+            cudaEventDestroy(begin);
+            cudaEventDestroy(end);
+            throw std::runtime_error(
+                "linear_int8_w8a8 failed to record the start CUDA event");
+        }
+
+        for (int i = 0; i < iters; ++i) state.Run();
+        if (cudaEventRecord(end, 0) != cudaSuccess ||
+            cudaEventSynchronize(end) != cudaSuccess) {
+            cudaEventDestroy(begin);
+            cudaEventDestroy(end);
+            throw std::runtime_error(
+                "linear_int8_w8a8 failed to record or synchronize the end CUDA event");
+        }
+
+        float elapsedMs = 0.0f;
+        if (cudaEventElapsedTime(&elapsedMs, begin, end) != cudaSuccess) {
+            cudaEventDestroy(begin);
+            cudaEventDestroy(end);
+            throw std::runtime_error(
+                "linear_int8_w8a8 failed to read CUDA event timing");
+        }
+        cudaEventDestroy(begin);
+        cudaEventDestroy(end);
+
+        BenchmarkResult result;
+        result.avgMs = elapsedMs / std::max(iters, 1);
+        result.bytesMoved = (double)state.batch * state.in * 2 +
+            (double)state.out * state.in + state.out * sizeof(float) +
+            (double)state.batch * state.out * 2;
+        result.flops = 2.0 * state.batch * state.in * state.out;
+        double seconds = result.avgMs / 1000.0;
+        if (seconds > 0) result.computeTFlops = result.flops / seconds / 1e12;
+        return result;
+#else
+        (void)params; (void)device; (void)warmup; (void)iters;
+        throw std::runtime_error("linear_int8_w8a8 requires CUDA");
+#endif
+    }
+
+    static OpCase MakeLinearInt8W8A8Case() {
+        return {"linear_int8_w8a8", "SM90 symmetric/asymmetric INT8 W8A8 dense",
+            [](){ OpTestParams p; p.Add("batch","16","rows"); p.Add("in","4096","K");
+                  p.Add("out","4096","N"); p.Add("input_type","bf16","fp16 or bf16");
+                  p.Add("has_bias","1","FP32 bias");
+                  p.Add("activation_scheme","symmetric","symmetric, symmetric_static, azp_dynamic or azp_static");
+                  p.Add("check","0","1 functional, 2 reject weight zero-points, 3 reject static scale, 4 reject symmetric zero-point"); return p; },
+            [](const OpTestParams&, const std::string &device) {
+#ifdef USE_CUDA
+                if (device.rfind("cuda",0) != 0) return false;
+                ScopedFirstDevice guard(device); return FastllmCudaRuntimeArch() == 90;
+#else
+                return false;
+#endif
+            },
+            [](const OpTestParams&, const std::string&) { fastllm::Data x(fastllm::DataType::FLOAT32,{1}); x.Allocate(0.0f); return x; },
+            BenchmarkLinearInt8W8A8,
+            [](const OpTestParams &p) { return (double)p.GetInt("batch")*p.GetInt("in")*2 +
+                (double)p.GetInt("out")*p.GetInt("in") + (double)p.GetInt("batch")*p.GetInt("out")*2; },
+            [](const OpTestParams &p) { return 2.0*p.GetInt("batch")*p.GetInt("in")*p.GetInt("out"); }, true};
     }
 
     struct MergeMoeFp8BenchState {
@@ -3238,11 +4849,17 @@ namespace {
         int experts = 82;
         int block = 128;
         std::string path = "operator";
+        std::string weightType = "fp8";
+        std::string scaleLayout = "block128";
+        float sharedScale = 0.0f;
+        fastllm::MoeGateType gateType = fastllm::MoeGateSwiglu;
         fastllm::Data input, index, score, output;
         fastllm::Data w1, w2, w3, curInput, curOutput;
         fastllm::Data referenceW1, referenceOutput;
         std::vector<std::unique_ptr<fastllm::Data>> ownedWeights;
         std::vector<fastllm::Data*> weights;
+        std::vector<std::unique_ptr<fastllm::Data>> referenceOwnedWeights;
+        std::vector<fastllm::Data*> referenceWeights;
         std::vector<fastllm::Data*> biass;
 
         static void InitFp8Weight(fastllm::Data &weight, int rows, int cols, int block, float seed) {
@@ -3266,6 +4883,80 @@ namespace {
             weight.ToDevice(fastllm::DataDevice::CUDA);
         }
 
+        /**
+         * 构造与vLLM 128x128 scale语义一致的交错FP8测试权重。
+         *
+         * @param weight 返回CPU初始化后迁移至CUDA的Block128权重。
+         * @param rows 逻辑输出行数。
+         * @param cols 逻辑输入列数，必须按128对齐。
+         * @param block scale块大小，当前必须为128。
+         * @param seed 固定测试数据的确定性种子。
+         */
+        static void InitFp8PackedBlock128Weight(
+            fastllm::Data &weight, int rows, int cols, int block, float seed) {
+            LinearFp8Block128BenchState::InitPackedWeight(
+                weight, rows, cols, block, seed);
+            weight.ToDevice(fastllm::DataDevice::CUDA);
+        }
+
+        static void InitFp8PerChannelWeight(fastllm::Data &weight, int rows,
+                                             int cols, float seed) {
+            weight.dataType = fastllm::DataType::FP8_E4M3;
+            weight.UpdateUnitSize();
+            weight.Resize({rows, cols});
+            weight.weightType = fastllm::WeightType::LINEAR;
+            weight.blockK = 1;
+            weight.blockM = cols;
+            weight.Allocate(false);
+            uint8_t *ptr = reinterpret_cast<uint8_t*>(weight.cpuData);
+            for (uint64_t i = 0; i < weight.GetBytes(); i++)
+                ptr[i] = static_cast<uint8_t>(0x20 + ((i + (uint64_t)(seed * 17.0f)) & 0x1f));
+            weight.scales.resize(rows);
+            for (int i = 0; i < rows; ++i)
+                weight.scales[i] = 0.015f + 0.0001f * (float)((i + (int)seed) % 7);
+            weight.ToDevice(fastllm::DataDevice::CUDA);
+        }
+
+        static void InitFp8TensorwiseWeight(fastllm::Data &weight, int rows,
+                                             int cols, float seed) {
+            InitFp8PerChannelWeight(weight, rows, cols, seed);
+            weight.scales.resize(1);
+            weight.scales[0] = 0.015f +
+                0.0001f * static_cast<float>(static_cast<int>(seed) % 7);
+        }
+
+        static void InitNvfp4Weight(fastllm::Data &weight, int rows, int cols, int seed) {
+            weight.dataType = fastllm::DataType::NVFP4_BLOCK_16;
+            weight.blockM = 16;
+            weight.blockK = 1;
+            weight.weightType = fastllm::WeightType::LINEAR;
+            weight.UpdateUnitSize();
+            weight.Resize({rows, cols});
+            weight.Allocate(false);
+            const size_t rowBytes = fastllm::GetDataBytes(
+                fastllm::DataType::NVFP4_BLOCK_16, 1, cols);
+            weight.nvfp4GlobalScale = 0.01f;
+            weight.nvfp4GroupScales.resize((size_t)rows * (cols / 16));
+            for (int row = 0; row < rows; ++row) {
+                for (int group = 0; group < cols / 16; ++group) {
+                    uint8_t *dst = weight.cpuData + (size_t)row * rowBytes +
+                                   (size_t)group * (8 + sizeof(float));
+                    for (int pair = 0; pair < 8; ++pair) {
+                        uint8_t low = uint8_t(1 + (row + group * 3 + pair + seed) % 7);
+                        uint8_t high = uint8_t(1 + (row * 3 + group + pair * 5 + seed) % 7);
+                        if ((row + pair + seed) & 1) low |= 8;
+                        if ((group + pair + seed) & 1) high |= 8;
+                        dst[pair] = uint8_t(low | (high << 4));
+                    }
+                    const uint8_t scaleByte = uint8_t(0x28 + ((row + group + seed) % 16));
+                    weight.nvfp4GroupScales[(size_t)row * (cols / 16) + group] = scaleByte;
+                    float scale = DecodeFp8E4M3(scaleByte) * weight.nvfp4GlobalScale;
+                    std::memcpy(dst + 8, &scale, sizeof(scale));
+                }
+            }
+            weight.ToDevice(fastllm::DataDevice::CUDA);
+        }
+
         void Init(const OpTestParams &params) {
 #ifdef USE_CUDA
             batch = params.GetInt("batch");
@@ -3275,6 +4966,17 @@ namespace {
             experts = params.GetInt("experts");
             block = params.GetInt("block");
             path = params.GetString("path");
+            weightType = params.GetString("weight_type");
+            scaleLayout = params.GetString("scale_layout");
+            sharedScale = params.GetInt("shared_expert") ? 0.5f : 0.0f;
+            const std::string gateTypeName = params.GetString("gate_type");
+            if (gateTypeName == "swiglu") {
+                gateType = fastllm::MoeGateSwiglu;
+            } else if (gateTypeName == "geglu") {
+                gateType = fastllm::MoeGateGeglu;
+            } else {
+                throw std::runtime_error("gate_type must be swiglu or geglu");
+            }
             FastllmCudaSetDevice(0);
 
             fastllm::Data fp32Input = MakeTensor({batch, hidden}, 0.11f, 0.02f);
@@ -3311,14 +5013,88 @@ namespace {
             ownedWeights.resize((size_t)(experts + 1) * 2);
             weights.assign((size_t)(experts + 1) * 2, nullptr);
             biass.assign((size_t)(experts + 1) * 2, nullptr);
+            if (sharedScale != 0.0f) {
+                ownedWeights[0] = std::make_unique<fastllm::Data>();
+                ownedWeights[1] = std::make_unique<fastllm::Data>();
+                if (weightType == "nvfp4") {
+                    InitNvfp4Weight(*ownedWeights[0], inter * 2, hidden, 101);
+                    InitNvfp4Weight(*ownedWeights[1], hidden, inter, 117);
+                } else if (scaleLayout == "perchannel") {
+                    InitFp8PerChannelWeight(
+                        *ownedWeights[0], inter * 2, hidden, 101.0f);
+                    InitFp8PerChannelWeight(
+                        *ownedWeights[1], hidden, inter, 117.0f);
+                } else if (scaleLayout == "tensorwise") {
+                    InitFp8TensorwiseWeight(
+                        *ownedWeights[0], inter * 2, hidden, 101.0f);
+                    InitFp8TensorwiseWeight(
+                        *ownedWeights[1], hidden, inter, 117.0f);
+                } else if (scaleLayout == "block128") {
+                    InitFp8PackedBlock128Weight(
+                        *ownedWeights[0], inter * 2, hidden, block, 101.0f);
+                    InitFp8PackedBlock128Weight(
+                        *ownedWeights[1], hidden, inter, block, 117.0f);
+                } else {
+                    throw std::runtime_error(
+                        "scale_layout must be block128, perchannel or tensorwise");
+                }
+                weights[0] = ownedWeights[0].get();
+                weights[1] = ownedWeights[1].get();
+            }
             for (int e = 0; e < experts; e++) {
                 int idx = (e + 1) * 2;
                 ownedWeights[idx] = std::make_unique<fastllm::Data>();
                 ownedWeights[idx + 1] = std::make_unique<fastllm::Data>();
-                InitFp8Weight(*ownedWeights[idx], inter * 2, hidden, block, (float)e + 0.3f);
-                InitFp8Weight(*ownedWeights[idx + 1], hidden, inter, block, (float)e + 13.7f);
+                if (weightType == "nvfp4") {
+                    InitNvfp4Weight(*ownedWeights[idx], inter * 2, hidden, e + 3);
+                    InitNvfp4Weight(*ownedWeights[idx + 1], hidden, inter, e + 17);
+                } else if (weightType == "fp8") {
+                    if (scaleLayout == "perchannel") {
+                        InitFp8PerChannelWeight(*ownedWeights[idx], inter * 2, hidden, (float)e + 0.3f);
+                        InitFp8PerChannelWeight(*ownedWeights[idx + 1], hidden, inter, (float)e + 13.7f);
+                    } else if (scaleLayout == "tensorwise") {
+                        InitFp8TensorwiseWeight(*ownedWeights[idx], inter * 2, hidden, (float)e + 0.3f);
+                        InitFp8TensorwiseWeight(*ownedWeights[idx + 1], hidden, inter, (float)e + 13.7f);
+                    } else if (scaleLayout == "block128") {
+                        InitFp8PackedBlock128Weight(
+                            *ownedWeights[idx], inter * 2, hidden, block,
+                            (float)e + 0.3f);
+                        InitFp8PackedBlock128Weight(
+                            *ownedWeights[idx + 1], hidden, inter, block,
+                            (float)e + 13.7f);
+                    } else {
+                        throw std::runtime_error(
+                            "scale_layout must be block128, perchannel or tensorwise");
+                    }
+                } else {
+                    throw std::runtime_error("weight_type must be fp8 or nvfp4");
+                }
                 weights[idx] = ownedWeights[idx].get();
                 weights[idx + 1] = ownedWeights[idx + 1].get();
+            }
+
+            // grouped正确性检查使用独立权重对象生成非grouped参考值，避免
+            // 参考计算提前改变正式被测权重的Prepared/Cutlass生命周期。
+            if (weightType == "nvfp4" && path == "check_nvfp4") {
+                referenceOwnedWeights.resize(weights.size());
+                referenceWeights.assign(weights.size(), nullptr);
+                if (sharedScale != 0.0f) {
+                    referenceOwnedWeights[0] = std::make_unique<fastllm::Data>();
+                    referenceOwnedWeights[1] = std::make_unique<fastllm::Data>();
+                    InitNvfp4Weight(*referenceOwnedWeights[0], inter * 2, hidden, 101);
+                    InitNvfp4Weight(*referenceOwnedWeights[1], hidden, inter, 117);
+                    referenceWeights[0] = referenceOwnedWeights[0].get();
+                    referenceWeights[1] = referenceOwnedWeights[1].get();
+                }
+                for (int e = 0; e < experts; ++e) {
+                    const int idx = (e + 1) * 2;
+                    referenceOwnedWeights[idx] = std::make_unique<fastllm::Data>();
+                    referenceOwnedWeights[idx + 1] = std::make_unique<fastllm::Data>();
+                    InitNvfp4Weight(*referenceOwnedWeights[idx], inter * 2, hidden, e + 3);
+                    InitNvfp4Weight(*referenceOwnedWeights[idx + 1], hidden, inter, e + 17);
+                    referenceWeights[idx] = referenceOwnedWeights[idx].get();
+                    referenceWeights[idx + 1] = referenceOwnedWeights[idx + 1].get();
+                }
             }
 
             output.dataType = input.dataType;
@@ -3357,7 +5133,9 @@ namespace {
 
         void CheckWarpSpecialization() {
 #ifdef USE_CUDA
-            if (batch != 1 || topk != 8 || hidden != 2048 || inter != 256 || block != 128) {
+            if (weightType != "fp8" || scaleLayout == "block128" ||
+                batch != 1 || topk != 8 || hidden != 2048 ||
+                inter != 256 || block != 128) {
                 return;
             }
             if (!RunIndexed(referenceW1, referenceOutput, false)) {
@@ -3388,7 +5166,155 @@ namespace {
             if (path == "operator") {
                 fastllm::MergeMOE(input, index, score, weights, biass,
                                   w1, w2, w3, curInput, curOutput,
-                                  0.0f, output, 0, fastllm::MoeGateSwiglu);
+                                  sharedScale, output, 0, gateType);
+            } else if (path == "check_nvfp4") {
+                if (weightType != "nvfp4") {
+                    throw std::runtime_error("check_nvfp4 requires weight_type=nvfp4");
+                }
+                // 先用正式权重走grouped入口完成首次后端选择；随后关闭MoE
+                // grouped，使用数值相同但生命周期独立的权重计算参考值。
+                setenv("FASTLLM_CUDA_MOE_NVFP4_W4A4", "1", 1);
+                fastllm::MergeMOE(input, index, score, weights, biass,
+                                  w1, w2, w3, curInput, curOutput,
+                                  sharedScale, output, 0, gateType);
+                ForceDeviceSync();
+                if (index.dataDevice != fastllm::DataDevice::CUDA ||
+                    score.dataDevice != fastllm::DataDevice::CUDA) {
+                    throw std::runtime_error(
+                        "grouped NVFP4 W4A4 moved routing tensors off CUDA");
+                }
+                setenv("FASTLLM_CUDA_MOE_NVFP4_W4A4_STRICT", "0", 1);
+                setenv("FASTLLM_CUDA_MOE_NVFP4_W4A4", "0", 1);
+                fastllm::MergeMOE(input, index, score, referenceWeights, biass,
+                                  referenceW1, w2, w3, curInput, curOutput,
+                                  sharedScale, referenceOutput, 0, gateType);
+                ForceDeviceSync();
+                setenv("FASTLLM_CUDA_MOE_NVFP4_W4A4", "1", 1);
+                setenv("FASTLLM_CUDA_MOE_NVFP4_W4A4_STRICT", "1", 1);
+                ComparisonStats stats = CompareData(
+                    ConvertToFloat32Data(referenceOutput),
+                    ConvertToFloat32Data(output), 0.25f, 0.25f);
+                if (!stats.passed) {
+                    throw std::runtime_error(
+                        "grouped NVFP4 W4A4 differs from non-grouped reference");
+                }
+            } else if (path == "check_nvfp4_lifecycle") {
+                if (weightType != "nvfp4") {
+                    throw std::runtime_error(
+                        "check_nvfp4_lifecycle requires weight_type=nvfp4");
+                }
+                // 人为让首次grouped选择失败；主流程应整层清cache、恢复原始
+                // 权重并固定Rejected，随后即使条件恢复也不得再次尝试CUTLASS。
+                setenv("FASTLLM_CUDA_MOE_NVFP4_W4A4", "0", 1);
+                fastllm::MergeMOE(input, index, score, weights, biass,
+                                  referenceW1, w2, w3, curInput, curOutput,
+                                  sharedScale, referenceOutput, 0, gateType);
+                ForceDeviceSync();
+
+                const int device = FastllmCudaGetDevice();
+                for (size_t i = 2; i < weights.size(); ++i) {
+                    if (weights[i] == nullptr || weights[i]->cudaData == nullptr ||
+                        FastllmCudaGetNvfp4W4A4BackendState(*weights[i], device) !=
+                            FastllmCudaNvfp4BackendState::Rejected) {
+                        throw std::runtime_error(
+                            "grouped NVFP4 fallback did not restore and reject all routed weights");
+                    }
+                }
+
+                setenv("FASTLLM_CUDA_MOE_NVFP4_W4A4", "1", 1);
+                fastllm::MergeMOE(input, index, score, weights, biass,
+                                  w1, w2, w3, curInput, curOutput,
+                                  sharedScale, output, 0, gateType);
+                ForceDeviceSync();
+                if (FastllmCudaGetNvfp4W4A4BackendState(*weights[2], device) !=
+                    FastllmCudaNvfp4BackendState::Rejected) {
+                    throw std::runtime_error(
+                        "grouped NVFP4 fallback retried after backend rejection");
+                }
+                ComparisonStats stats = CompareData(
+                    ConvertToFloat32Data(referenceOutput),
+                    ConvertToFloat32Data(output), 0.25f, 0.25f);
+                if (!stats.passed) {
+                    throw std::runtime_error(
+                        "fixed NVFP4 Legacy output changed after retry conditions recovered");
+                }
+            } else if (path == "check_fp8") {
+                if (weightType != "fp8" ||
+                    (scaleLayout != "perchannel" &&
+                     scaleLayout != "tensorwise") ||
+                    (input.dataType != fastllm::DataType::FLOAT16 &&
+                     input.dataType != fastllm::DataType::BFLOAT16)) {
+                    throw std::runtime_error(
+                        "check_fp8 requires fp16/bf16 + fp8 + "
+                        "perchannel/tensorwise scales");
+                }
+                setenv("FASTLLM_CUDA_MOE_CUTLASS_FP8_SM90", "0", 1);
+                fastllm::MergeMOE(input, index, score, weights, biass,
+                                  referenceW1, w2, w3, curInput, curOutput,
+                                  sharedScale, referenceOutput, 0,
+                                  fastllm::MoeGateSwiglu);
+                ForceDeviceSync();
+                setenv("FASTLLM_CUDA_MOE_CUTLASS_FP8_SM90", "1", 1);
+                fastllm::MergeMOE(input, index, score, weights, biass,
+                                  w1, w2, w3, curInput, curOutput,
+                                  sharedScale, output, 0,
+                                  fastllm::MoeGateSwiglu);
+                ForceDeviceSync();
+                ComparisonStats stats = CompareData(
+                    ConvertToFloat32Data(referenceOutput),
+                    ConvertToFloat32Data(output), 0.25f, 0.25f);
+                std::printf(
+                    "SM90 FP8 W8A8 grouped MoE correctness: "
+                    "max_abs_diff=%.6f mean_abs_diff=%.6f "
+                    "failed_elements=%zu result=%s\n",
+                    stats.maxAbsDiff, stats.meanAbsDiff,
+                    stats.failedElements, stats.passed ? "PASS" : "FAIL");
+                if (!stats.passed) {
+                    throw std::runtime_error(
+                        "SM90 grouped FP8 CUTLASS differs from CUDA fallback");
+                }
+            } else if (path == "check_block128") {
+                if (weightType != "fp8" || scaleLayout != "block128" ||
+                    (input.dataType != fastllm::DataType::FLOAT16 &&
+                     input.dataType != fastllm::DataType::BFLOAT16)) {
+                    throw std::runtime_error(
+                        "check_block128 requires fp16/bf16 + packed Block128 FP8");
+                }
+                setenv("FASTLLM_CUDA_TRITON", "1", 1);
+                setenv("FASTLLM_CUDA_TRITON_MERGE_MOE", "1", 1);
+                setenv("FASTLLM_CUDA_MOE_BLOCK128_SM90", "1", 1);
+                setenv("FASTLLM_CUDA_MOE_BLOCK128_SM90_STRICT", "1", 1);
+                fastllm::MergeMOE(input, index, score, weights, biass,
+                                  w1, w2, w3, curInput, curOutput,
+                                  sharedScale, output, 0,
+                                  fastllm::MoeGateSwiglu);
+                ForceDeviceSync();
+
+                setenv("FASTLLM_CUDA_MOE_BLOCK128_SM90_STRICT", "0", 1);
+                setenv("FASTLLM_CUDA_MOE_BLOCK128_SM90", "0", 1);
+                setenv("FASTLLM_CUDA_TRITON_MERGE_MOE", "0", 1);
+                fastllm::MergeMOE(input, index, score, weights, biass,
+                                  referenceW1, w2, w3, curInput, curOutput,
+                                  sharedScale, referenceOutput, 0,
+                                  fastllm::MoeGateSwiglu);
+                ForceDeviceSync();
+                setenv("FASTLLM_CUDA_TRITON_MERGE_MOE", "1", 1);
+                setenv("FASTLLM_CUDA_MOE_BLOCK128_SM90", "1", 1);
+                setenv("FASTLLM_CUDA_MOE_BLOCK128_SM90_STRICT", "1", 1);
+
+                ComparisonStats stats = CompareData(
+                    ConvertToFloat32Data(referenceOutput),
+                    ConvertToFloat32Data(output), 0.25f, 0.25f);
+                std::printf(
+                    "SM90 Block128 FP8 W8A8 MoE correctness: "
+                    "max_abs_diff=%.6f mean_abs_diff=%.6f "
+                    "failed_elements=%zu result=%s\n",
+                    stats.maxAbsDiff, stats.meanAbsDiff,
+                    stats.failedElements, stats.passed ? "PASS" : "FAIL");
+                if (!stats.passed) {
+                    throw std::runtime_error(
+                        "SM90 Block128 Triton MoE differs from CUDA fallback");
+                }
             } else if (path == "legacy") {
                 if (!RunIndexed(w1, output, false)) {
                     throw std::runtime_error("legacy MergeMOE FP8 launch failed");
@@ -3398,7 +5324,9 @@ namespace {
                     throw std::runtime_error("warp MergeMOE FP8 launch failed");
                 }
             } else {
-                throw std::runtime_error("path must be operator, legacy or warp");
+                throw std::runtime_error(
+                    "path must be operator, check_fp8, check_block128, check_nvfp4, "
+                    "check_nvfp4_lifecycle, legacy or warp");
             }
         }
     };
@@ -3413,8 +5341,9 @@ namespace {
 
         for (int i = 0; i < warmup; i++) {
             state->Run();
-            ForceDeviceSync();
         }
+        // 与正式异步主流程及vLLM基准一致：整段warmup结束后只同步一次。
+        ForceDeviceSync();
 
         auto begin = Clock::now();
         for (int i = 0; i < iters; i++) {
@@ -3430,7 +5359,9 @@ namespace {
             result.avgMs = 0.0;
         }
         result.bytesMoved = 0.0;
-        result.flops = (double)params.GetInt("batch") * params.GetInt("topk") *
+        const int expertCalls = params.GetInt("topk") +
+                                (params.GetInt("shared_expert") ? 1 : 0);
+        result.flops = (double)params.GetInt("batch") * expertCalls *
                        6.0 * (double)params.GetInt("hidden") * params.GetInt("inter");
         double seconds = result.avgMs / 1000.0;
         if (seconds > 0.0 && result.flops > 0.0) {
@@ -3449,7 +5380,7 @@ namespace {
     static OpCase MakeMergeMoeFp8Case() {
         return {
             "mergemoe_fp8",
-            "benchmark-only Qwen3-style FP8 block-scaled MergeMOE",
+            "benchmark/check Qwen3-style FP8 or NVFP4 grouped MergeMOE",
             []() {
                 OpTestParams params;
                 params.Add("batch", "1", "token batch size");
@@ -3459,11 +5390,25 @@ namespace {
                 params.Add("topk", "8", "experts per token");
                 params.Add("block", "128", "FP8 scale block size");
                 params.Add("input_type", "fp16", "fp16 or bf16");
-                params.Add("path", "operator", "operator, legacy or warp");
+                params.Add("path", "operator",
+                           "operator, check_fp8, check_nvfp4, check_nvfp4_lifecycle, legacy or warp");
+                params.Add("weight_type", "fp8", "fp8 or nvfp4");
+                params.Add("scale_layout", "block128",
+                           "FP8 scale layout: block128, perchannel or tensorwise");
+                params.Add("gate_type", "swiglu", "swiglu or geglu");
+                params.Add("shared_expert", "0", "1 enables one separately computed shared expert");
                 return params;
             },
-            [](const OpTestParams&, const std::string &device) {
-                return device.rfind("cuda", 0) == 0;
+            [](const OpTestParams &params, const std::string &device) {
+                if (device.rfind("cuda", 0) != 0) return false;
+#ifdef USE_CUDA
+                if (params.GetString("weight_type") == "nvfp4") {
+                    int arch = FastllmCudaRuntimeArch();
+                    return arch >= 100 && arch < 130 &&
+                           (arch < 120 || params.GetString("input_type") == "bf16");
+                }
+#endif
+                return true;
             },
             [](const OpTestParams&, const std::string&) {
                 fastllm::Data marker(fastllm::DataType::FLOAT32, {1});
@@ -3491,12 +5436,20 @@ namespace {
         int experts = 16;
         int block = 128;
         std::string path = "warp";
+        std::string scaleLayout = "separate";
         fastllm::Data input, index, score;
         fastllm::Data gate, up, down;
         fastllm::Data w1, output, referenceW1, referenceOutput;
 
         static void InitWeight(fastllm::Data &weight, const std::vector<int> &dims,
-                               int block, int seed) {
+                               int block, int seed, const std::string &scaleLayout) {
+            if (scaleLayout == "block128") {
+                LinearFp8Block128BenchState::InitPackedWeight(
+                    weight, dims[0] * dims[1], dims[2], block, (float)seed);
+                weight.Resize(dims);
+                weight.ToDevice(fastllm::DataDevice::CUDA);
+                return;
+            }
             weight.dataType = fastllm::DataType::FP8_E4M3;
             weight.UpdateUnitSize();
             weight.Resize(dims);
@@ -3522,6 +5475,15 @@ namespace {
         bool RunDirect(fastllm::Data &work, fastllm::Data &result,
                        bool allowWarpSpecialization) {
 #ifdef USE_CUDA
+            if (scaleLayout == "block128") {
+                return input.dataType == fastllm::DataType::FLOAT16 ?
+                    FastllmCudaHalfFusedMOEFP8E4M3Block128(
+                        input, gate, up, down, index, score, work, result,
+                        batch, topk, hidden, inter, experts, 0.0f) :
+                    FastllmCudaBFloat16FusedMOEFP8E4M3Block128(
+                        input, gate, up, down, index, score, work, result,
+                        batch, topk, hidden, inter, experts, 0.0f);
+            }
             if (input.dataType == fastllm::DataType::FLOAT16) {
                 return FastllmCudaHalfFusedMOEFP8E4M3(
                     input, gate, up, down, index, score, work, result,
@@ -3542,7 +5504,8 @@ namespace {
 
         void CheckWarpSpecialization() {
 #ifdef USE_CUDA
-            if (batch != 1 || topk != 8 || hidden != 2048 || inter != 256 || block != 128) {
+            if (scaleLayout == "block128" || batch != 1 || topk != 8 ||
+                hidden != 2048 || inter != 256 || block != 128) {
                 return;
             }
             if (!RunDirect(referenceW1, referenceOutput, false)) {
@@ -3578,6 +5541,7 @@ namespace {
             experts = params.GetInt("experts");
             block = params.GetInt("block");
             path = params.GetString("path");
+            scaleLayout = params.GetString("scale_layout");
             FastllmCudaSetDevice(0);
 
             fastllm::Data fp32Input = MakeTensor({batch, hidden}, 0.11f, 0.02f);
@@ -3611,9 +5575,9 @@ namespace {
             index.ToDevice(fastllm::DataDevice::CUDA);
             score.ToDevice(fastllm::DataDevice::CUDA);
 
-            InitWeight(gate, {experts, inter, hidden}, block, 3);
-            InitWeight(up, {experts, inter, hidden}, block, 17);
-            InitWeight(down, {experts, hidden, inter}, block, 29);
+            InitWeight(gate, {experts, inter, hidden}, block, 3, scaleLayout);
+            InitWeight(up, {experts, inter, hidden}, block, 17, scaleLayout);
+            InitWeight(down, {experts, hidden, inter}, block, 29, scaleLayout);
             ForceDeviceSync();
             CheckWarpSpecialization();
 #else
@@ -3623,7 +5587,47 @@ namespace {
         }
 
         void Run() {
-            if (path == "legacy") {
+            if (path == "operator") {
+                fastllm::FusedMOE(input, index, score, gate, up, down, w1,
+                                  output, 0, fastllm::MoeGateSwiglu, 0.0f);
+            } else if (path == "check_block128") {
+                if (scaleLayout != "block128") {
+                    throw std::runtime_error(
+                        "check_block128 requires packed Block128 FP8 weights");
+                }
+                setenv("FASTLLM_CUDA_TRITON", "1", 1);
+                setenv("FASTLLM_CUDA_TRITON_MERGE_MOE", "1", 1);
+                setenv("FASTLLM_CUDA_MOE_BLOCK128_SM90", "1", 1);
+                setenv("FASTLLM_CUDA_MOE_BLOCK128_SM90_STRICT", "1", 1);
+                fastllm::FusedMOE(input, index, score, gate, up, down, w1,
+                                  output, 0, fastllm::MoeGateSwiglu, 0.0f);
+                ForceDeviceSync();
+
+                setenv("FASTLLM_CUDA_MOE_BLOCK128_SM90_STRICT", "0", 1);
+                setenv("FASTLLM_CUDA_MOE_BLOCK128_SM90", "0", 1);
+                setenv("FASTLLM_CUDA_TRITON_MERGE_MOE", "0", 1);
+                fastllm::FusedMOE(
+                    input, index, score, gate, up, down, referenceW1,
+                    referenceOutput, 0, fastllm::MoeGateSwiglu, 0.0f);
+                ForceDeviceSync();
+                setenv("FASTLLM_CUDA_TRITON_MERGE_MOE", "1", 1);
+                setenv("FASTLLM_CUDA_MOE_BLOCK128_SM90", "1", 1);
+                setenv("FASTLLM_CUDA_MOE_BLOCK128_SM90_STRICT", "1", 1);
+
+                ComparisonStats stats = CompareData(
+                    ConvertToFloat32Data(referenceOutput),
+                    ConvertToFloat32Data(output), 0.25f, 0.25f);
+                std::printf(
+                    "SM90 Block128 FP8 W8A8 FusedMOE correctness: "
+                    "max_abs_diff=%.6f mean_abs_diff=%.6f "
+                    "failed_elements=%zu result=%s\n",
+                    stats.maxAbsDiff, stats.meanAbsDiff,
+                    stats.failedElements, stats.passed ? "PASS" : "FAIL");
+                if (!stats.passed) {
+                    throw std::runtime_error(
+                        "SM90 Block128 Triton FusedMOE differs from CUDA fallback");
+                }
+            } else if (path == "legacy") {
                 if (!RunDirect(w1, output, false)) {
                     throw std::runtime_error("legacy FusedMOE FP8 launch failed");
                 }
@@ -3632,7 +5636,8 @@ namespace {
                     throw std::runtime_error("warp FusedMOE FP8 launch failed");
                 }
             } else {
-                throw std::runtime_error("path must be legacy or warp");
+                throw std::runtime_error(
+                    "path must be operator, check_block128, legacy or warp");
             }
         }
     };
@@ -3686,7 +5691,10 @@ namespace {
                 params.Add("topk", "8", "experts per token");
                 params.Add("block", "128", "FP8 scale block size");
                 params.Add("input_type", "fp16", "fp16 or bf16");
-                params.Add("path", "warp", "legacy or warp");
+                params.Add("path", "warp",
+                           "operator, check_block128, legacy or warp");
+                params.Add("scale_layout", "separate",
+                           "separate or block128");
                 return params;
             },
             [](const OpTestParams&, const std::string &device) {
@@ -4297,6 +6305,8 @@ namespace {
             MakeLayerNormCase(),
             MakeRmsNormCase(),
             MakeW4A8ActivationQuantCase(),
+            MakeNvfp4SwiGLUQuantCase(),
+            MakeLinearNvfp4Case(),
             MakeLinearCase(),
             MakeMergeMoeW4A8Case(),
             MakeSiluCase(),
@@ -4306,7 +6316,10 @@ namespace {
             MakeAttentionCase(),
             MakeRmsNormSpecializedCase(),
             MakeRecurrentFromConvFp16Case(),
+            MakeLinearFp8LegacyCase(),
+            MakeLinearFp8W8A8Case(),
             MakeLinearFp8Block128Case(),
+            MakeLinearInt8W8A8Case(),
             MakeMergeMoeFp8Case(),
             MakeFusedMoeFp8Case(),
             MakeRouterLinearFp16Case(),

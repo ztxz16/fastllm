@@ -558,7 +558,8 @@ static bool FastllmCudaW4A8LaunchActivationQuant(
     cutlass::float_e4m3_t *fp8,
     float *tokenScales,
     int n,
-    int m) {
+    int m,
+    cudaStream_t stream) {
     if (!FastllmCudaW4A8CanQuantizeActivation(input, n, m) ||
         inputData == nullptr || fp8 == nullptr || tokenScales == nullptr) {
         return false;
@@ -567,11 +568,11 @@ static bool FastllmCudaW4A8LaunchActivationQuant(
     dim3 grid(n);
     if (input.dataType == fastllm::DataType::FLOAT16) {
         FastllmCudaW4A8QuantizeActivationPerTokenKernel<<<
-            grid, W4A8_FP8_QUANT_THREADS>>>(
+            grid, W4A8_FP8_QUANT_THREADS, 0, stream>>>(
                 (const half*)inputData, fp8, tokenScales, n, m);
     } else {
         FastllmCudaW4A8QuantizeActivationPerTokenKernel<<<
-            grid, W4A8_FP8_QUANT_THREADS>>>(
+            grid, W4A8_FP8_QUANT_THREADS, 0, stream>>>(
                 (const __nv_bfloat16*)inputData, fp8, tokenScales, n, m);
     }
     return cudaGetLastError() == cudaSuccess;
@@ -866,7 +867,7 @@ static bool FastllmCudaW4A8QuantizeActivation(const fastllm::Data &input,
     }
 
     if (!FastllmCudaW4A8LaunchActivationQuant(
-            input, inputData, scratch.fp8, scratch.tokenScales, n, m)) {
+            input, inputData, scratch.fp8, scratch.tokenScales, n, m, 0)) {
         FastllmCudaW4A8ReleaseActivationScratch(scratch);
         return false;
     }
@@ -1060,7 +1061,23 @@ bool FastllmCudaW4A8QuantizeActivationPerToken(
     }
     bool ready = FastllmCudaW4A8LaunchActivationQuant(
         input, inputData, (cutlass::float_e4m3_t*)fp8Data,
-        tokenScales, n, m);
+        tokenScales, n, m, 0);
+    FastllmCudaFinishInput(input, inputData);
+    return ready;
+}
+
+bool FastllmCudaW4A8QuantizeActivationPerTokenStream(
+    const fastllm::Data &input, int n, int m,
+    void *fp8Data, float *tokenScales, void *streamPtr) {
+    void *inputData = FastllmCudaPrepareInput(input);
+    if (inputData == nullptr) {
+        return false;
+    }
+    cudaStream_t stream = streamPtr == nullptr
+        ? cudaStreamPerThread : static_cast<cudaStream_t>(streamPtr);
+    bool ready = FastllmCudaW4A8LaunchActivationQuant(
+        input, inputData, static_cast<cutlass::float_e4m3_t*>(fp8Data),
+        tokenScales, n, m, stream);
     FastllmCudaFinishInput(input, inputData);
     return ready;
 }

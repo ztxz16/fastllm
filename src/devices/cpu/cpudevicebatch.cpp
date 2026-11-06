@@ -26,7 +26,10 @@ namespace fastllm {
         int axis = intParams.find("axis") != intParams.end() ? intParams.find("axis")->second : -1;
         int dimsLen = input.dims.size();
         axis = (axis % dimsLen + dimsLen) % dimsLen;
-        int part = input.dims[axis];
+        int part = intParams.find("output___batch") != intParams.end()
+            ? intParams.find("output___batch")->second : -1;
+        AssertInFastLLM(part == input.dims[axis],
+                        "CpuSplitBatchOp: output count must equal input size on split axis.\n");
         std::vector <int> dims = input.dims;
         dims[axis] = 1;
         for (int i = 0; i < part; i++) {
@@ -42,7 +45,10 @@ namespace fastllm {
         int axis = intParams.find("axis") != intParams.end() ? intParams.find("axis")->second : -1;
         int dimsLen = input.dims.size();
         axis = (axis % dimsLen + dimsLen) % dimsLen;
-        int part = input.dims[axis];
+        int part = intParams.find("output___batch") != intParams.end()
+            ? intParams.find("output___batch")->second : -1;
+        AssertInFastLLM(part == input.dims[axis],
+                        "CpuSplitBatchOp: output count must equal input size on split axis.\n");
 
         int outer = input.Count(0) / input.Count(axis);
         int inputStride = input.Count(axis);

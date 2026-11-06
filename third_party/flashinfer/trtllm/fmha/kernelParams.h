@@ -22,11 +22,11 @@
 #endif
 
 #include <cutlass/cutlass.h>
+#include <cutlass/fast_math.h>
 
 #include <cmath>
 #include <cstdint>
 #include <cstring>
-#include <cuda/cmath>
 #include <cute/tensor.hpp>
 
 #include "../../utils.cuh"
@@ -35,7 +35,7 @@
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-using FastModDivInt32 = cuda::fast_mod_div<int32_t>;
+using FastModDivInt32 = cutlass::FastDivmod;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 using Dtype = Data_type;

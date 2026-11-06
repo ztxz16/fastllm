@@ -1,3 +1,6 @@
+// Blockwise FP8 W8A8 CUTLASS实现。激活使用(1,128)动态scale，权重
+// 使用(128,128)静态scale；标准per-token/per-channel W8A8位于
+// fastllm-linear-w8a8-cutlass.cu。
 #include "fastllm-cuda.cuh"
 #include "fastllm.h"
 
@@ -7,17 +10,22 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
 #include <mutex>
+#include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
 #if defined(FASTLLM_ENABLE_CUTLASS_FP8) && \
-    (defined(FASTLLM_CUTLASS_FP8_ENABLE_SM120) || defined(FASTLLM_CUTLASS_FP8_ENABLE_SM121))
+    (defined(FASTLLM_CUTLASS_FP8_ENABLE_SM90) || \
+     defined(FASTLLM_CUTLASS_FP8_ENABLE_SM120) || \
+     defined(FASTLLM_CUTLASS_FP8_ENABLE_SM121))
 
 #include "cute/tensor.hpp"
 #include "cutlass/cutlass.h"
@@ -31,7 +39,19 @@
 #include "cutlass/numeric_types.h"
 #include "cutlass/util/packed_stride.hpp"
 
-namespace fastllm_cuda_cutlass_fp8 {
+namespace fastllm_w8a8_blockwise_detail {
+
+template <typename Kernel>
+struct FastllmEnableSm90Only : Kernel {
+    template <typename... Args>
+    CUTLASS_DEVICE void operator()(Args&&... args) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 900)
+        Kernel::operator()(std::forward<Args>(args)...);
+#elif defined(__CUDA_ARCH__)
+        asm("trap;");
+#endif
+    }
+};
 
 template <typename Kernel>
 struct FastllmEnableSm120Family : Kernel {
@@ -70,6 +90,7 @@ using FastllmCutlassExactResidualCallbacks =
             cutlass::epilogue::fusion::Sm90AccFetch>,
         cutlass::epilogue::fusion::Sm90SrcFetch<OutType>>;
 
+#if defined(FASTLLM_CUTLASS_FP8_ENABLE_SM120) || defined(FASTLLM_CUTLASS_FP8_ENABLE_SM121)
 template <class OutType, int ScaleGranularityM, int ScaleGranularityN, int ScaleGranularityK,
           class MmaTileShape, class ClusterShape, class EpilogueScheduler,
           class MainloopScheduler, bool SwapAB = false, bool ExactResidual = false>
@@ -155,7 +176,71 @@ struct FastllmCutlassFp8BlockwiseGemm {
 
     struct GemmKernel : public KernelType {};
 };
+#endif
 
+#if defined(FASTLLM_CUTLASS_FP8_ENABLE_SM90)
+template <class OutType, bool SwapAB = false>
+struct FastllmCutlassSm90Fp8BlockwiseGemm {
+    static constexpr bool swap_ab = SwapAB;
+    using ElementAB = cutlass::float_e4m3_t;
+    using ElementA = ElementAB;
+    using ElementB = ElementAB;
+    using ElementD = OutType;
+    using ElementAccumulator = float;
+    using ElementCompute = float;
+    using ElementBlockScale = float;
+    using LayoutA = cutlass::layout::RowMajor;
+    using LayoutB = cutlass::layout::ColumnMajor;
+    using LayoutD = cutlass::layout::RowMajor;
+    using LayoutAT = typename cutlass::layout::LayoutTranspose<LayoutA>::type;
+    using LayoutBT = typename cutlass::layout::LayoutTranspose<LayoutB>::type;
+    using LayoutDT = typename cutlass::layout::LayoutTranspose<LayoutD>::type;
+    static constexpr int AlignmentA = 16;
+    static constexpr int AlignmentB = 16;
+    static constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;
+    using TileShape = std::conditional_t<SwapAB, Shape<_128, _16, _128>, Shape<_128, _128, _128>>;
+    using ClusterShape = std::conditional_t<SwapAB, Shape<_1, _1, _1>, Shape<_1, _2, _1>>;
+    using ScaleConfig = std::conditional_t<SwapAB,
+        cutlass::detail::Sm90BlockwiseScaleConfig<128, 1, 128, GMMA::Major::K, GMMA::Major::MN>,
+        cutlass::detail::Sm90BlockwiseScaleConfig<1, 128, 128, GMMA::Major::MN, GMMA::Major::K>>;
+    using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
+    using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
+    using EpilogueSchedule = std::conditional_t<SwapAB,
+        cutlass::epilogue::TmaWarpSpecialized,
+        cutlass::epilogue::TmaWarpSpecializedCooperative>;
+    using MainloopSchedule = std::conditional_t<SwapAB,
+        cutlass::gemm::KernelTmaWarpSpecializedPingpongFP8BlockScaledAccum,
+        cutlass::gemm::KernelTmaWarpSpecializedCooperativeFP8BlockScaledAccum>;
+    using Operation = cutlass::epilogue::fusion::LinearCombination<
+        ElementD, ElementCompute, void, float, cutlass::FloatRoundStyle::round_to_nearest>;
+    using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+        cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp, TileShape, ClusterShape,
+        cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator,
+        ElementCompute, void, std::conditional_t<SwapAB, LayoutDT, LayoutD>, AlignmentD,
+        ElementD, std::conditional_t<SwapAB, LayoutDT, LayoutD>, AlignmentD,
+        EpilogueSchedule, Operation>::CollectiveOp;
+    using CollectiveMainloop = std::conditional_t<SwapAB,
+        typename cutlass::gemm::collective::CollectiveBuilder<
+            cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp,
+            ElementB, cute::tuple<LayoutBT, LayoutSFA>, AlignmentB,
+            ElementA, cute::tuple<LayoutAT, LayoutSFB>, AlignmentA,
+            ElementAccumulator, TileShape, ClusterShape,
+            cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+            MainloopSchedule>::CollectiveOp,
+        typename cutlass::gemm::collective::CollectiveBuilder<
+            cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp,
+            ElementA, cute::tuple<LayoutA, LayoutSFA>, AlignmentA,
+            ElementB, cute::tuple<LayoutB, LayoutSFB>, AlignmentB,
+            ElementAccumulator, TileShape, ClusterShape,
+            cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+            MainloopSchedule>::CollectiveOp>;
+    using KernelType = FastllmEnableSm90Only<cutlass::gemm::kernel::GemmUniversal<
+        Shape<int, int, int, int>, CollectiveMainloop, CollectiveEpilogue>>;
+    struct GemmKernel : KernelType {};
+};
+#endif
+
+#if defined(FASTLLM_CUTLASS_FP8_ENABLE_SM120) || defined(FASTLLM_CUTLASS_FP8_ENABLE_SM121)
 template <typename OutType, bool ExactResidual = false>
 struct FastllmSm120Fp8DefaultConfig {
     using KernelSchedule = cutlass::gemm::collective::KernelScheduleAuto;
@@ -188,17 +273,21 @@ struct FastllmSm120Fp8SwapABConfig {
         OutType, 128, 1, 128, TileShape, ClusterShape, EpilogueSchedule,
         KernelSchedule, true, ExactResidual>;
 };
+#endif
 
 struct FastllmCutlassFp8Scratch {
     cutlass::float_e4m3_t *input = nullptr;
     float *inputScales = nullptr;
+    void *workspace = nullptr;
     size_t inputElems = 0;
     size_t scaleElems = 0;
+    size_t workspaceBytes = 0;
     // CUDA graphs retain the exact scratch addresses observed during capture.
     // Qwen3.5 pre-captures increasing batch sizes, so growing this buffer must
     // not free storage that an earlier graph still references.
     std::vector<cutlass::float_e4m3_t*> retiredInputs;
     std::vector<float*> retiredInputScales;
+    std::vector<void*> retiredWorkspaces;
 };
 
 struct FastllmCutlassFp8WeightCache {
@@ -211,12 +300,65 @@ struct FastllmCutlassFp8WeightCache {
     int outFeatures = 0;
     int blockM = 0;
     int blockK = 0;
+    const void *weightSource = nullptr;
 };
 
 static std::mutex g_cutlassScratchMutex;
 static std::map<int, FastllmCutlassFp8Scratch> g_cutlassScratchByDevice;
 static std::mutex g_cutlassWeightMutex;
-static std::map<std::pair<int, const void*>, FastllmCutlassFp8WeightCache> g_cutlassWeightCache;
+static std::map<std::pair<const fastllm::Data *, int>,
+                FastllmCutlassFp8WeightCache> g_cutlassWeightCache;
+static std::mutex g_cutlassBackendMutex;
+static std::map<std::pair<const fastllm::Data *, int>,
+                FastllmCudaFp8W8A8BackendState> g_cutlassBackendStates;
+
+static bool FastllmCutlassBlockwiseEnabled() {
+    const char *value = std::getenv("FASTLLM_CUDA_W8A8");
+    return value == nullptr || value[0] == '\0' || value[0] != '0';
+}
+
+static bool FastllmCutlassBlockwiseStrictEnabled() {
+    const char *value = std::getenv("FASTLLM_CUDA_W8A8_STRICT");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+static bool FastllmCutlassBlockwiseTraceEnabled() {
+    const char *value = std::getenv("FASTLLM_CUDA_W8A8_TRACE");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+static bool FastllmCutlassBlockwiseForceFailureForTest() {
+    const char *value = std::getenv(
+        "FASTLLM_CUDA_W8A8_TEST_FORCE_GEMM_FAILURE");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+static void FastllmCutlassBlockwiseTrace(
+    const char *reason, int m, int n, int k) {
+    if (!FastllmCutlassBlockwiseTraceEnabled()) return;
+
+    std::fprintf(
+        stderr,
+        "[fastllm][w8a8] path=w8a8-block128-cutlass "
+        "reason=%s m=%d n=%d k=%d sm=%d\n",
+        reason, m, n, k, FastllmCudaRuntimeArch());
+}
+
+static FastllmCudaFp8W8A8BackendState FastllmCutlassGetBackendState(
+    const fastllm::Data &weight, int device) {
+    std::lock_guard<std::mutex> guard(g_cutlassBackendMutex);
+    auto found = g_cutlassBackendStates.find({&weight, device});
+    return found == g_cutlassBackendStates.end()
+        ? FastllmCudaFp8W8A8BackendState::Uninitialized
+        : found->second;
+}
+
+static void FastllmCutlassSetBackendState(
+    const fastllm::Data &weight, int device,
+    FastllmCudaFp8W8A8BackendState state) {
+    std::lock_guard<std::mutex> guard(g_cutlassBackendMutex);
+    g_cutlassBackendStates[{&weight, device}] = state;
+}
 
 static bool FastllmCutlassIsStreamCapturing(cudaStream_t stream) {
     cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
@@ -226,6 +368,10 @@ static bool FastllmCutlassIsStreamCapturing(cudaStream_t stream) {
 
 static bool FastllmCutlassFp8CompiledForRuntimeArch(int arch) {
     switch (arch) {
+#if defined(FASTLLM_CUTLASS_FP8_ENABLE_SM90)
+    case 90:
+        return true;
+#endif
 #if defined(FASTLLM_CUTLASS_FP8_ENABLE_SM120)
     case 120:
         return true;
@@ -789,6 +935,33 @@ static bool FastllmCutlassEnsureScratch(
     return scratch->input != nullptr && scratch->inputScales != nullptr;
 }
 
+static void *FastllmCutlassGetWorkspace(
+    size_t bytes, cudaStream_t stream) {
+    if (bytes == 0) return nullptr;
+
+    const int device = FastllmCudaGetDevice();
+    std::lock_guard<std::mutex> guard(g_cutlassScratchMutex);
+    auto &scratch = g_cutlassScratchByDevice[device];
+
+    if (scratch.workspace != nullptr && scratch.workspaceBytes >= bytes) {
+        return scratch.workspace;
+    }
+
+    if (FastllmCutlassIsStreamCapturing(stream)) return nullptr;
+
+    void *replacement = FastllmCudaMalloc(bytes);
+    if (replacement == nullptr) return nullptr;
+
+    if (scratch.workspace != nullptr) {
+        // 已捕获的CUDA Graph可能仍引用旧workspace。扩容时保留旧地址，
+        // 避免后续较大形状破坏先前Batch对应的Graph。
+        scratch.retiredWorkspaces.push_back(scratch.workspace);
+    }
+    scratch.workspace = replacement;
+    scratch.workspaceBytes = bytes;
+    return scratch.workspace;
+}
+
 static bool FastllmCutlassEnsureWeightCache(
     fastllm::Data &weight, int inFeatures, int outFeatures,
     cudaStream_t stream, FastllmCutlassFp8WeightCache *&cache) {
@@ -797,17 +970,18 @@ static bool FastllmCutlassEnsureWeightCache(
     if (FastllmCudaHasFp8MarlinLayout(weight)) {
         return false;
     }
-    const void *key = weight.cudaData;
-    if (key == nullptr || weight.scales.empty() || weight.blockM != 128 || weight.blockK != 128) {
+    if (weight.cudaData == nullptr || weight.scales.empty() ||
+        weight.blockM != 128 || weight.blockK != 128) {
         return false;
     }
     int device = FastllmCudaGetDevice();
     std::lock_guard<std::mutex> guard(g_cutlassWeightMutex);
-    auto cacheKey = std::make_pair(device, key);
+    auto cacheKey = std::make_pair(&weight, device);
     auto it = g_cutlassWeightCache.find(cacheKey);
     if (it != g_cutlassWeightCache.end()) {
         auto &entry = it->second;
         if (entry.weightTN != nullptr &&
+            entry.weightSource == weight.cudaData &&
             entry.inFeatures == inFeatures && entry.outFeatures == outFeatures &&
             entry.blockM == weight.blockM && entry.blockK == weight.blockK &&
             entry.hostScales == weight.scales.data() && entry.scaleCount == weight.scales.size()) {
@@ -833,6 +1007,7 @@ static bool FastllmCutlassEnsureWeightCache(
     // CUTLASS consumes FastLLM's native packed [out][in] FP8 bytes directly.
     // Keep an alias here; allocating another weightTN copy doubles FP8 weight VRAM.
     entry.weightTN = (cutlass::float_e4m3_t*)weight.cudaData;
+    entry.weightSource = weight.cudaData;
     entry.ownsWeightTN = false;
     entry.weightScales = (float*)FastllmCudaMalloc(scaleBytes);
     if (entry.weightTN == nullptr || entry.weightScales == nullptr) {
@@ -857,6 +1032,30 @@ static bool FastllmCutlassEnsureWeightCache(
     entry.scaleCount = weight.scales.size();
     cache = &entry;
     return true;
+}
+
+static void FastllmCutlassReleaseWeightCache(
+    FastllmCutlassFp8WeightCache &cache) {
+    if (cache.weightTN != nullptr && cache.ownsWeightTN) {
+        FastllmCudaFree(cache.weightTN);
+    }
+    if (cache.weightScales != nullptr) {
+        FastllmCudaFree(cache.weightScales);
+    }
+    cache = FastllmCutlassFp8WeightCache();
+}
+
+static void FastllmCutlassReleaseWeightCacheForDevice(
+    const fastllm::Data *weight, int device) {
+    std::lock_guard<std::mutex> guard(g_cutlassWeightMutex);
+    auto found = g_cutlassWeightCache.find({weight, device});
+    if (found == g_cutlassWeightCache.end()) return;
+
+    const int originalDevice = FastllmCudaGetDevice();
+    FastllmCudaSetDevice(device);
+    FastllmCutlassReleaseWeightCache(found->second);
+    g_cutlassWeightCache.erase(found);
+    FastllmCudaSetDevice(originalDevice);
 }
 
 template <typename Gemm>
@@ -934,20 +1133,10 @@ static bool FastllmRunCutlassFp8Blockwise(
         return false;
     }
     size_t workspaceBytes = GemmOp::get_workspace_size(args);
-    void *workspace = nullptr;
-    if (workspaceBytes > 0) {
-        if (FastllmCutlassIsStreamCapturing(stream)) {
-            return false;
-        }
-        workspace = FastllmCudaMalloc(workspaceBytes);
-        if (workspace == nullptr) {
-            return false;
-        }
-    }
+    void *workspace = FastllmCutlassGetWorkspace(workspaceBytes, stream);
+    if (workspaceBytes > 0 && workspace == nullptr) return false;
+
     status = gemm.run(args, workspace, stream);
-    if (workspace != nullptr) {
-        FastllmCudaFree(workspace);
-    }
     return status == cutlass::Status::kSuccess;
 }
 
@@ -956,22 +1145,52 @@ static bool FastllmDispatchCutlassFp8Blockwise(
     cutlass::float_e4m3_t *input, cutlass::float_e4m3_t *weightTN,
     float *inputScales, float *weightScales, OutType *output,
     int batch, int outFeatures, int inFeatures, cudaStream_t stream) {
-    // The SM120 ping-pong blockwise kernel can produce run-to-run differences
-    // for Qwen3.5's wide projections (for example a 92-token prefill), which
-    // is enough to change greedy decoding. Use the deterministic SwapAB path.
-    if (batch <= 256) {
+    const int arch = FastllmCudaRuntimeArch();
+#if defined(FASTLLM_CUTLASS_FP8_ENABLE_SM90)
+    if (arch == 90) {
+        if ((batch % 4) != 0) {
+            using Gemm = FastllmCutlassSm90Fp8BlockwiseGemm<OutType, true>;
+            return FastllmRunCutlassFp8Blockwise<Gemm>(
+                input, weightTN, inputScales, weightScales, output,
+                batch, outFeatures, inFeatures, stream);
+        }
+        using Gemm = FastllmCutlassSm90Fp8BlockwiseGemm<OutType, false>;
+        return FastllmRunCutlassFp8Blockwise<Gemm>(
+            input, weightTN, inputScales, weightScales, output,
+            batch, outFeatures, inFeatures, stream);
+    }
+#endif
+#if defined(FASTLLM_CUTLASS_FP8_ENABLE_SM120) || defined(FASTLLM_CUTLASS_FP8_ENABLE_SM121)
+    // 忠实采用vLLM SM120 blockwise分派：小M或M不能被4整除时交换A/B；
+    // 其余M<=256使用Pingpong，大M使用默认Cooperative配置。
+    const bool swapAB = batch <= 64 || batch % 4 != 0;
+    if (swapAB) {
         using Gemm =
             typename FastllmSm120Fp8SwapABConfig<OutType, ExactResidual>::Gemm;
         return FastllmRunCutlassFp8Blockwise<Gemm>(
             input, weightTN, inputScales, weightScales, output, batch, outFeatures, inFeatures, stream);
     }
-    using Gemm =
-        typename FastllmSm120Fp8DefaultConfig<OutType, ExactResidual>::Gemm;
+    if (batch <= 256) {
+        using Gemm =
+            typename FastllmSm120Fp8PingpongConfig<OutType, ExactResidual>::Gemm;
+        return FastllmRunCutlassFp8Blockwise<Gemm>(
+            input, weightTN, inputScales, weightScales, output,
+            batch, outFeatures, inFeatures, stream);
+    }
+
+    using Gemm = typename FastllmSm120Fp8DefaultConfig<
+        OutType, ExactResidual>::Gemm;
     return FastllmRunCutlassFp8Blockwise<Gemm>(
         input, weightTN, inputScales, weightScales, output, batch, outFeatures, inFeatures, stream);
+#else
+    (void)input; (void)weightTN; (void)inputScales; (void)weightScales;
+    (void)output; (void)batch; (void)outFeatures; (void)inFeatures;
+    (void)arch; (void)stream;
+    return false;
+#endif
 }
 
-} // namespace fastllm_cuda_cutlass_fp8
+} // namespace fastllm_w8a8_blockwise_detail
 
 #endif
 
@@ -979,19 +1198,23 @@ static bool FastllmCudaCutlassLinearFP8E4M3Block128Impl(
     const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias,
     fastllm::Data &output, int n, int m, int k, bool exactResidual) {
 #if defined(FASTLLM_ENABLE_CUTLASS_FP8) && \
-    (defined(FASTLLM_CUTLASS_FP8_ENABLE_SM120) || defined(FASTLLM_CUTLASS_FP8_ENABLE_SM121))
-    using namespace fastllm_cuda_cutlass_fp8;
+    (defined(FASTLLM_CUTLASS_FP8_ENABLE_SM90) || defined(FASTLLM_CUTLASS_FP8_ENABLE_SM120) || defined(FASTLLM_CUTLASS_FP8_ENABLE_SM121))
+    using namespace fastllm_w8a8_blockwise_detail;
 
     if (n <= 0 || m <= 0 || k <= 0 || (m % 128) != 0 || (k % 128) != 0 ||
-        input.cudaData == nullptr || weight.cudaData == nullptr ||
+        input.cudaData == nullptr || weight.cudaData == nullptr || output.cudaData == nullptr ||
         weight.dataType != fastllm::DataType::FP8_E4M3 ||
-        weight.blockM != 128 || weight.blockK != 128 || weight.scales.empty() ||
+        weight.dims != std::vector<int>({k, m}) ||
+        weight.blockM != 128 || weight.blockK != 128 ||
+        weight.scales.size() != (size_t)(k / 128) * (m / 128) ||
         output.dataType != input.dataType ||
         (input.dataType != fastllm::DataType::FLOAT16 &&
          input.dataType != fastllm::DataType::BFLOAT16) ||
         (exactResidual && (input.dataType != fastllm::DataType::FLOAT16 ||
                            !bias.dims.empty())) ||
-        (bias.dims.size() > 0 && bias.dataType != fastllm::DataType::FLOAT32)) {
+        (bias.dims.size() > 0 &&
+         (bias.dataType != fastllm::DataType::FLOAT32 ||
+          bias.cudaData == nullptr || bias.Count(0) != k))) {
         return false;
     }
     int arch = FastllmCudaRuntimeArch();
@@ -1097,6 +1320,289 @@ bool FastllmCudaCutlassLinearFP8E4M3Block128(
         input, weight, bias, output, n, m, k, false);
 }
 
+/**
+ * 清除指定Blockwise FP8权重的CUTLASS后端状态与设备scale缓存。
+ *
+ * 权重本体由Data管理，本函数只释放按“Data对象、GPU”保存的设备scale
+ * 和后端选择状态。张量覆盖、迁移GPU或析构时由统一FP8生命周期入口
+ * 调用，避免新权重继承旧地址对应的Cutlass/Rejected状态。
+ *
+ * @param weight 即将覆盖、迁移或销毁的FP8权重；nullptr表示无需处理。
+ */
+void FastllmCudaReleaseFp8W8A8Block128BackendState(
+        const fastllm::Data *weight) {
+#if defined(FASTLLM_ENABLE_CUTLASS_FP8) && \
+    (defined(FASTLLM_CUTLASS_FP8_ENABLE_SM90) || \
+     defined(FASTLLM_CUTLASS_FP8_ENABLE_SM120) || \
+     defined(FASTLLM_CUTLASS_FP8_ENABLE_SM121))
+    using namespace fastllm_w8a8_blockwise_detail;
+    if (weight == nullptr) return;
+
+    {
+        std::lock_guard<std::mutex> guard(g_cutlassBackendMutex);
+        for (auto it = g_cutlassBackendStates.begin();
+             it != g_cutlassBackendStates.end();) {
+            if (it->first.first == weight) {
+                it = g_cutlassBackendStates.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    std::lock_guard<std::mutex> guard(g_cutlassWeightMutex);
+    const int originalDevice = FastllmCudaGetDevice();
+    for (auto it = g_cutlassWeightCache.begin();
+         it != g_cutlassWeightCache.end();) {
+        if (it->first.first == weight) {
+            FastllmCudaSetDevice(it->first.second);
+            FastllmCutlassReleaseWeightCache(it->second);
+            it = g_cutlassWeightCache.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    FastllmCudaSetDevice(originalDevice);
+#else
+    (void)weight;
+#endif
+}
+
+FastllmCudaFp8W8A8BackendState
+FastllmCudaGetFp8W8A8Block128BackendState(
+        const fastllm::Data &weight, int device) {
+#if defined(FASTLLM_ENABLE_CUTLASS_FP8) && \
+    (defined(FASTLLM_CUTLASS_FP8_ENABLE_SM90) || \
+     defined(FASTLLM_CUTLASS_FP8_ENABLE_SM120) || \
+     defined(FASTLLM_CUTLASS_FP8_ENABLE_SM121))
+    return fastllm_w8a8_blockwise_detail::FastllmCutlassGetBackendState(
+        weight, device);
+#else
+    (void)weight;
+    (void)device;
+    return FastllmCudaFp8W8A8BackendState::Rejected;
+#endif
+}
+
+/**
+ * 在Blockwise FP8权重上传GPU后准备CUTLASS固定后端。
+ *
+ * 本阶段只验证与运行时M无关的权重语义：权重为FP8_E4M3 [N,K]，
+ * N和K均按128对齐，FP32 scale按[N/128,K/128]组织，blockK和blockM
+ * 均为128。验证通过后创建稳定的设备scale缓存并记录Prepared；首次
+ * 真实GEMM负责验证kernel并最终固定Cutlass或Rejected。
+ *
+ * @param weight 已上传当前GPU的Blockwise FP8二维Linear权重。
+ * @return true表示已处于Prepared/Cutlass；false表示不满足目标后端。
+ */
+bool FastllmCudaTryPrepareFp8W8A8Block128Weight(
+        fastllm::Data &weight) {
+#if defined(FASTLLM_ENABLE_CUTLASS_FP8) && \
+    (defined(FASTLLM_CUTLASS_FP8_ENABLE_SM90) || \
+     defined(FASTLLM_CUTLASS_FP8_ENABLE_SM120) || \
+     defined(FASTLLM_CUTLASS_FP8_ENABLE_SM121))
+    using namespace fastllm_w8a8_blockwise_detail;
+    if (weight.dataType != fastllm::DataType::FP8_E4M3 ||
+        weight.weightType != fastllm::WeightType::LINEAR ||
+        weight.dims.size() != 2) return false;
+
+    const int device = FastllmCudaGetDevice();
+    const auto state = FastllmCutlassGetBackendState(weight, device);
+    if (state == FastllmCudaFp8W8A8BackendState::Prepared ||
+        state == FastllmCudaFp8W8A8BackendState::Cutlass) return true;
+    if (state == FastllmCudaFp8W8A8BackendState::Rejected) return false;
+
+    const int n = weight.dims[0];
+    const int k = weight.dims[1];
+    const int arch = FastllmCudaRuntimeArch();
+    const bool supported = FastllmCutlassBlockwiseEnabled() &&
+        FastllmCutlassFp8CompiledForRuntimeArch(arch) &&
+        n > 0 && k > 0 && n % 128 == 0 && k % 128 == 0 &&
+        weight.blockK == 128 && weight.blockM == 128 &&
+        weight.scales.size() ==
+            (size_t)(n / 128) * (k / 128) &&
+        weight.cudaData != nullptr;
+    if (!supported) {
+        FastllmCutlassSetBackendState(
+            weight, device, FastllmCudaFp8W8A8BackendState::Rejected);
+        FastllmCutlassBlockwiseTrace(
+            "weight-load backend selection rejected", 1, n, k);
+        if (FastllmCutlassBlockwiseStrictEnabled()) {
+            throw std::runtime_error(
+                "strict FP8 W8A8 Block128 weight-load selection failed");
+        }
+        return false;
+    }
+
+    FastllmCutlassFp8WeightCache *cache = nullptr;
+    if (!FastllmCutlassEnsureWeightCache(weight, k, n, 0, cache) ||
+        cache == nullptr || cache->weightScales == nullptr) {
+        FastllmCutlassReleaseWeightCacheForDevice(&weight, device);
+        FastllmCutlassSetBackendState(
+            weight, device, FastllmCudaFp8W8A8BackendState::Rejected);
+        FastllmCutlassBlockwiseTrace(
+            "weight scale cache creation failed", 1, n, k);
+        if (FastllmCutlassBlockwiseStrictEnabled()) {
+            throw std::runtime_error(
+                "strict FP8 W8A8 Block128 scale cache creation failed");
+        }
+        return false;
+    }
+
+    FastllmCutlassSetBackendState(
+        weight, device, FastllmCudaFp8W8A8BackendState::Prepared);
+    FastllmCutlassBlockwiseTrace(
+        "weight prepared; first GEMM validation pending", 1, n, k);
+    return true;
+#else
+    (void)weight;
+    return false;
+#endif
+}
+
+/**
+ * 执行一次正式Blockwise FP8 W8A8 CUTLASS线性计算。
+ *
+ * 数学语义为output[M,N] = input[M,K] * weight[N,K]^T + bias[N]。
+ * FP16/BF16激活按每个token的连续128个K元素动态量化为FP8；权重使用
+ * 静态128x128 FP32 scale。SM90与SM120按编译及运行架构选择对应CUTLASS
+ * kernel，SM120的SwapAB、Pingpong和默认配置沿用vLLM形状分派。
+ *
+ * 后端按权重与GPU固定。首次GEMM同步验证成功后记录Cutlass；首次失败
+ * 固定Rejected并允许非严格模式退出。Cutlass固定后任何语义或运行错误
+ * 都抛出异常，禁止同一层静默切换Legacy。
+ *
+ * @param input  CUDA FP16/BF16激活，逻辑形状为[m,k]。
+ * @param weight CUDA FP8_E4M3权重，逻辑形状为[n,k]，blockK=blockM=128。
+ * @param bias   可选CUDA FP32偏置，长度为n。
+ * @param output CUDA FP16/BF16输出，逻辑形状为[m,n]，类型与input相同。
+ * @param m      GEMM的M维，通常为token数。
+ * @param k      GEMM的K维，必须按128对齐。
+ * @param n      GEMM的N维，必须按128对齐。
+ * @return true表示CUTLASS计算成功提交；false仅表示首次选择被拒绝。
+ */
+bool FastllmCudaCutlassLinearFp8W8A8Block128(
+        const fastllm::Data &input, fastllm::Data &weight,
+        const fastllm::Data &bias, fastllm::Data &output,
+        int m, int k, int n) {
+#if defined(FASTLLM_ENABLE_CUTLASS_FP8) && \
+    (defined(FASTLLM_CUTLASS_FP8_ENABLE_SM90) || \
+     defined(FASTLLM_CUTLASS_FP8_ENABLE_SM120) || \
+     defined(FASTLLM_CUTLASS_FP8_ENABLE_SM121))
+    using namespace fastllm_w8a8_blockwise_detail;
+    if (weight.dataType != fastllm::DataType::FP8_E4M3) return false;
+
+    const int device = FastllmCudaGetDevice();
+    auto state = FastllmCutlassGetBackendState(weight, device);
+    if (state == FastllmCudaFp8W8A8BackendState::Uninitialized) {
+        if (!FastllmCudaTryPrepareFp8W8A8Block128Weight(weight)) {
+            return false;
+        }
+        state = FastllmCutlassGetBackendState(weight, device);
+    }
+    if (state == FastllmCudaFp8W8A8BackendState::Rejected) {
+        if (FastllmCutlassBlockwiseStrictEnabled()) {
+            throw std::runtime_error(
+                "strict FP8 W8A8 Block128 requires the CUTLASS backend");
+        }
+        return false;
+    }
+
+    const bool selecting =
+        state == FastllmCudaFp8W8A8BackendState::Prepared;
+    const char *failure = nullptr;
+    if (m <= 0 || k <= 0 || n <= 0) failure = "invalid GEMM dimensions";
+    else if (k % 128 != 0 || n % 128 != 0) {
+        failure = "K/N is not aligned to 128";
+    } else if (input.cudaData == nullptr || weight.cudaData == nullptr ||
+               output.cudaData == nullptr) {
+        failure = "CUDA tensor pointer is null";
+    } else if (weight.dims != std::vector<int>({n, k})) {
+        failure = "weight shape mismatch";
+    } else if (weight.blockK != 128 || weight.blockM != 128 ||
+               weight.scales.size() !=
+                   (size_t)(n / 128) * (k / 128)) {
+        failure = "weight scale layout mismatch";
+    } else if (input.dataType != fastllm::DataType::FLOAT16 &&
+               input.dataType != fastllm::DataType::BFLOAT16) {
+        failure = "input is not FP16/BF16";
+    } else if (output.dataType != input.dataType) {
+        failure = "output dtype differs from input";
+    } else if (!bias.dims.empty() &&
+               (bias.dataType != fastllm::DataType::FLOAT32 ||
+                bias.cudaData == nullptr || bias.Count(0) != n)) {
+        failure = "bias must be empty or FP32[N] on CUDA";
+    }
+
+    if (failure != nullptr) {
+        FastllmCutlassBlockwiseTrace(failure, m, n, k);
+        if (selecting) {
+            FastllmCutlassReleaseWeightCacheForDevice(&weight, device);
+            FastllmCutlassSetBackendState(
+                weight, device,
+                FastllmCudaFp8W8A8BackendState::Rejected);
+            if (FastllmCutlassBlockwiseStrictEnabled()) {
+                throw std::runtime_error(
+                    std::string("strict FP8 W8A8 Block128 selection failed: ") +
+                    failure);
+            }
+            return false;
+        }
+        throw std::runtime_error(
+            std::string("fixed FP8 W8A8 Block128 CUTLASS backend failed: ") +
+            failure);
+    }
+
+    const bool ok = FastllmCudaCutlassLinearFP8E4M3Block128Impl(
+        input, weight, bias, output, m, k, n, false);
+    cudaError_t validation = selecting && ok
+        ? cudaStreamSynchronize(0)
+        : (ok ? cudaSuccess : cudaErrorUnknown);
+    const bool forcedFailure = ok && validation == cudaSuccess &&
+        FastllmCutlassBlockwiseForceFailureForTest();
+    if (forcedFailure && !selecting) {
+        validation = cudaStreamSynchronize(0);
+    }
+
+    if (!ok || validation != cudaSuccess || forcedFailure) {
+        const char *reason = !ok ? "CUTLASS launch failed" :
+            (forcedFailure ? "forced CUTLASS failure" :
+             "CUTLASS asynchronous validation failed");
+        FastllmCutlassBlockwiseTrace(reason, m, n, k);
+        if (selecting) {
+            FastllmCutlassReleaseWeightCacheForDevice(&weight, device);
+            FastllmCutlassSetBackendState(
+                weight, device,
+                FastllmCudaFp8W8A8BackendState::Rejected);
+            if (FastllmCutlassBlockwiseStrictEnabled()) {
+                throw std::runtime_error(
+                    std::string("strict FP8 W8A8 Block128 failed: ") + reason);
+            }
+            return false;
+        }
+        throw std::runtime_error(
+            std::string("fixed FP8 W8A8 Block128 CUTLASS backend failed: ") +
+            reason);
+    }
+
+    if (selecting) {
+        FastllmCutlassSetBackendState(
+            weight, device, FastllmCudaFp8W8A8BackendState::Cutlass);
+        FastllmCutlassBlockwiseTrace("backend fixed", m, n, k);
+    }
+    return true;
+#else
+    (void)input;
+    (void)weight;
+    (void)bias;
+    (void)output;
+    (void)m;
+    (void)k;
+    (void)n;
+    return false;
+#endif
+}
+
 bool FastllmCudaCutlassLinearFP8E4M3Block128Add(
     const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias,
     fastllm::Data &output, int n, int m, int k) {
@@ -1111,7 +1617,7 @@ static bool FastllmCudaCutlassLinearFP8E4M3Block128FromRMSNormImpl(
     fastllm::Data &output, int n, int m, int k) {
 #if defined(FASTLLM_ENABLE_CUTLASS_FP8) && \
     (defined(FASTLLM_CUTLASS_FP8_ENABLE_SM120) || defined(FASTLLM_CUTLASS_FP8_ENABLE_SM121))
-    using namespace fastllm_cuda_cutlass_fp8;
+    using namespace fastllm_w8a8_blockwise_detail;
 
     if (!FastllmCutlassUseWarpQuant() ||
         n < 64 || m != 5120 || k <= 0 || (k % 128) != 0 ||
@@ -1246,7 +1752,7 @@ static bool FastllmCudaCutlassLinearFP8E4M3Block128FromGdnOutputGateImpl(
     bool exactResidual) {
 #if defined(FASTLLM_ENABLE_CUTLASS_FP8) && \
     (defined(FASTLLM_CUTLASS_FP8_ENABLE_SM120) || defined(FASTLLM_CUTLASS_FP8_ENABLE_SM121))
-    using namespace fastllm_cuda_cutlass_fp8;
+    using namespace fastllm_w8a8_blockwise_detail;
 
     auto isDense = [](const fastllm::Data &data) {
         if (data.dims.empty() ||
@@ -1435,8 +1941,8 @@ static bool FastllmCudaCutlassLinearFP8E4M3Block128FromSwigluImpl(
     const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias,
     fastllm::Data &output, int n, int m, int k, bool exactResidual) {
 #if defined(FASTLLM_ENABLE_CUTLASS_FP8) && \
-    (defined(FASTLLM_CUTLASS_FP8_ENABLE_SM120) || defined(FASTLLM_CUTLASS_FP8_ENABLE_SM121))
-    using namespace fastllm_cuda_cutlass_fp8;
+    (defined(FASTLLM_CUTLASS_FP8_ENABLE_SM90) || defined(FASTLLM_CUTLASS_FP8_ENABLE_SM120) || defined(FASTLLM_CUTLASS_FP8_ENABLE_SM121))
+    using namespace fastllm_w8a8_blockwise_detail;
 
     if (!FastllmCutlassUseFusedSwigluQuant() || !FastllmCutlassUseWarpQuant()) {
         return false;

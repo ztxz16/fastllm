@@ -34,6 +34,11 @@ namespace fastllm {
                                           {"<|action_start|>", 92541}, {"<|action_end|>", 92540}, {"<|interpreter|>", 92539}, {"<|plugin|>", 92538}});
     }
 
+    ModelAttentionCapabilities Internlm2Model::GetModelAttentionCapabilities() const {
+        return {"internlm2", ModelKVCacheLayout::CONTINUOUS,
+                true, false, false, false};
+    }
+
     int Internlm2Model::Forward(const fastllm::Data &inputIds, const fastllm::Data &attentionMask,
                                 const fastllm::Data &positionIds, std::vector<std::pair<Data, Data>> &pastKeyValues,
                                 const GenerationConfig &generationConfig, const LastTokensManager &lastTokens,

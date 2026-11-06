@@ -371,6 +371,12 @@ namespace fastllm {
         // though attention and the generic path still use a bounded tail.
         virtual bool BoundedKVCacheUsesTokenGrowingStorage() const { return false; }
 
+        /** 返回模型前向路径支持的KV Cache布局能力。 */
+        virtual ModelAttentionCapabilities GetModelAttentionCapabilities() const {
+            return {model_type, ModelKVCacheLayout::CONTINUOUS,
+                    true, false, false, false};
+        }
+
         virtual bool ShouldEnforceAutoWarmupRuntimeBatchLimit() const { return false; }
 
         virtual void WarmupCudaRuntimeBuffers(int batch) {}

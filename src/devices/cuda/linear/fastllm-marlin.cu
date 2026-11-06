@@ -13,6 +13,7 @@
  */
 
 #include "fastllm-cuda.cuh"
+#include "utils/math.hpp"
 
 #include <cuda.h>
 #include <cuda_bf16.h>
@@ -99,7 +100,9 @@ struct Vec {
 
 using I4 = Vec<int, 4>;
 
-__host__ __device__ constexpr int div_ceil(int a, int b) { return (a + b - 1) / b; }
+__host__ __device__ constexpr int div_ceil(int a, int b) {
+  return fastllm::div_ceil(a, b);
+}
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
 

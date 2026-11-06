@@ -6,6 +6,7 @@
 
 #include "fastllm-cuda.cuh"
 #include "fastllm.h"
+#include "utils/math.hpp"
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -384,17 +385,8 @@ static bool FastllmRunSelectedSm89(
         rows, outFeatures, inFeatures, stream);
 }
 
-static uint32_t FastllmNextPowerOfTwo(uint32_t value) {
-    if (value <= 1) {
-        return 1;
-    }
-    --value;
-    value |= value >> 1;
-    value |= value >> 2;
-    value |= value >> 4;
-    value |= value >> 8;
-    value |= value >> 16;
-    return value + 1;
+static constexpr uint32_t FastllmNextPowerOfTwo(uint32_t value) {
+    return fastllm::next_pow_2(value == 0 ? 1u : value);
 }
 
 template <typename OutType>

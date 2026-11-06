@@ -10,6 +10,7 @@
 #include "cutlass/layout/matrix.h"
 #include "cutlass/numeric_types.h"
 #include "cutlass/util/mixed_dtype_utils.hpp"
+#include "cutlass/util/packed_stride.hpp"
 #include "libtorch_stable/cutlass_extensions/epilogue/broadcast_load_epilogue_array_c3x.hpp"
 
 #include <cuda_bf16.h>

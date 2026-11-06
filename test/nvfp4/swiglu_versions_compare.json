@@ -1,0 +1,79 @@
+{
+  "name": "SwiGLU+NVFP4 FastLLM多版本选优及vLLM对比",
+  "baseline": "ft_baseline",
+  "selection": {
+    "candidates": ["ft_baseline", "ft_optimized", "ft_cached"],
+    "reference": "vllm",
+    "metric": "latency_ms"
+  },
+  "repeat": 3,
+  "aggregate": "median",
+  "keep_going": true,
+  "timeout": 300,
+  "metrics": [
+    {
+      "name": "latency_ms",
+      "unit": "ms",
+      "goal": "min",
+      "pattern": "latency:\\s+avg_ms=(?P<value>[0-9.eE+-]+)"
+    }
+  ],
+  "implementations": [
+    {
+      "name": "ft_baseline",
+      "command": [
+        "{repo}/optest", "--op", "nvfp4_swiglu_quant", "--device", "cuda:0",
+        "--param", "implementation=baseline",
+        "--param", "rows={rows}", "--param", "hidden={hidden}",
+        "--param", "input_type={dtype}",
+        "--warmup", "100", "--iters", "2000", "--atol", "0.20", "--rtol", "0.20"
+      ]
+    },
+    {
+      "name": "ft_optimized",
+      "command": [
+        "{repo}/optest", "--op", "nvfp4_swiglu_quant", "--device", "cuda:0",
+        "--param", "implementation=optimized",
+        "--param", "rows={rows}", "--param", "hidden={hidden}",
+        "--param", "input_type={dtype}",
+        "--warmup", "100", "--iters", "2000", "--atol", "0.20", "--rtol", "0.20"
+      ]
+    },
+    {
+      "name": "ft_cached",
+      "command": [
+        "{repo}/optest", "--op", "nvfp4_swiglu_quant", "--device", "cuda:0",
+        "--param", "implementation=cached",
+        "--param", "rows={rows}", "--param", "hidden={hidden}",
+        "--param", "input_type={dtype}",
+        "--warmup", "100", "--iters", "2000", "--atol", "0.20", "--rtol", "0.20"
+      ]
+    },
+    {
+      "name": "vllm",
+      "command": [
+        "{NVFP4_VLLM_PYTHON}",
+        "{repo}/test/nvfp4/benchmark_swiglu_nvfp4_vllm.py",
+        "--rows", "{rows}", "--hidden", "{hidden}", "--dtype", "{dtype}",
+        "--warmup", "100", "--iters", "2000", "--device", "0"
+      ]
+    }
+  ],
+  "cases": [
+    {"name": "swiglu_r1_k4096", "dimensions": {"op": "swiglu_nvfp4", "rows": 1, "hidden": 4096, "dtype": "bf16"}},
+    {"name": "swiglu_r16_k4096", "dimensions": {"op": "swiglu_nvfp4", "rows": 16, "hidden": 4096, "dtype": "bf16"}},
+    {"name": "swiglu_r32_k4096", "dimensions": {"op": "swiglu_nvfp4", "rows": 32, "hidden": 4096, "dtype": "bf16"}},
+    {"name": "swiglu_r64_k4096", "dimensions": {"op": "swiglu_nvfp4", "rows": 64, "hidden": 4096, "dtype": "bf16"}},
+    {"name": "swiglu_r128_k4096", "dimensions": {"op": "swiglu_nvfp4", "rows": 128, "hidden": 4096, "dtype": "bf16"}},
+    {"name": "swiglu_r1_k7168", "dimensions": {"op": "swiglu_nvfp4", "rows": 1, "hidden": 7168, "dtype": "bf16"}},
+    {"name": "swiglu_r16_k7168", "dimensions": {"op": "swiglu_nvfp4", "rows": 16, "hidden": 7168, "dtype": "bf16"}},
+    {"name": "swiglu_r32_k7168", "dimensions": {"op": "swiglu_nvfp4", "rows": 32, "hidden": 7168, "dtype": "bf16"}},
+    {"name": "swiglu_r64_k7168", "dimensions": {"op": "swiglu_nvfp4", "rows": 64, "hidden": 7168, "dtype": "bf16"}},
+    {"name": "swiglu_r128_k7168", "dimensions": {"op": "swiglu_nvfp4", "rows": 128, "hidden": 7168, "dtype": "bf16"}},
+    {"name": "swiglu_r1_k14336", "dimensions": {"op": "swiglu_nvfp4", "rows": 1, "hidden": 14336, "dtype": "bf16"}},
+    {"name": "swiglu_r16_k14336", "dimensions": {"op": "swiglu_nvfp4", "rows": 16, "hidden": 14336, "dtype": "bf16"}},
+    {"name": "swiglu_r32_k14336", "dimensions": {"op": "swiglu_nvfp4", "rows": 32, "hidden": 14336, "dtype": "bf16"}},
+    {"name": "swiglu_r64_k14336", "dimensions": {"op": "swiglu_nvfp4", "rows": 64, "hidden": 14336, "dtype": "bf16"}},
+    {"name": "swiglu_r128_k14336", "dimensions": {"op": "swiglu_nvfp4", "rows": 128, "hidden": 14336, "dtype": "bf16"}}
+  ]
+}

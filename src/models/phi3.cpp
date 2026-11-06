@@ -32,6 +32,11 @@ namespace fastllm {
         LlamaModel::InitParams();
     }
 
+    ModelAttentionCapabilities Phi3Model::GetModelAttentionCapabilities() const {
+        return {"phi3", ModelKVCacheLayout::CONTINUOUS,
+                true, false, false, false};
+    }
+
     int Phi3Model::Forward(const fastllm::Data &inputIds, const fastllm::Data &attentionMask,
                                 const fastllm::Data &positionIds, std::vector<std::pair<Data, Data>> &pastKeyValues,
                                 const GenerationConfig &generationConfig, const LastTokensManager &lastTokens,

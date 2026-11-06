@@ -12,6 +12,7 @@
 
 #include <cstdlib>
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cfloat>
 #include <cmath>
@@ -24,6 +25,7 @@
 #include <random>
 #include <set>
 #include <string>
+#include <tuple>
 #include <type_traits>
 #include <vector>
 #include <cuda_fp8.h>
@@ -510,6 +512,67 @@ static bool FastllmCudaEnvFlagEnabled(const char *name) {
            std::strcmp(v, "false") != 0 && std::strcmp(v, "FALSE") != 0 &&
            std::strcmp(v, "off") != 0 && std::strcmp(v, "OFF") != 0 &&
            std::strcmp(v, "disable") != 0 && std::strcmp(v, "DISABLE") != 0;
+}
+
+bool FastllmCudaPagedDebugEnabled() {
+    static const bool enabled =
+        FastllmCudaEnvFlagEnabled("FASTLLM_CUDA_PAGED_DEBUG");
+    return enabled;
+}
+
+/** 输出分页诊断中的单个张量描述，不读取张量内容。 */
+static void FastllmCudaPrintPagedDebugTensor(
+        const char *name, const fastllm::Data *data) {
+    if (data == nullptr) {
+        fprintf(stderr, "[fastllm][paged-debug] %s=null\n", name);
+        return;
+    }
+
+    std::string shape = "[";
+    for (size_t i = 0; i < data->dims.size(); i++) {
+        if (i > 0) {
+            shape += ",";
+        }
+        shape += std::to_string(data->dims[i]);
+    }
+    shape += "]";
+    int pointerDevice = data->cudaData == nullptr
+        ? -1 : GetPointerDeviceId(data->cudaData);
+    fprintf(stderr,
+            "[fastllm][paged-debug] %s dtype=%s shape=%s cuda=%p "
+            "pointer_device=%d data_device=%d unit=%d\n",
+            name, fastllm::GetDataTypeName(data->dataType).c_str(),
+            shape.c_str(), data->cudaData, pointerDevice,
+            (int)data->dataDevice, data->unitSize);
+}
+
+bool FastllmCudaPagedDebugSynchronize(
+        const char *stage, int layer, const fastllm::Data *first,
+        const fastllm::Data *second) {
+    if (!FastllmCudaPagedDebugEnabled()) {
+        return true;
+    }
+
+    int device = -1;
+    cudaGetDevice(&device);
+    cudaError_t pending = cudaPeekAtLastError();
+    cudaError_t synchronized = cudaDeviceSynchronize();
+    cudaError_t state = pending != cudaSuccess ? pending : synchronized;
+    if (state == cudaSuccess) {
+        return true;
+    }
+
+    FastllmCudaSetThreadError();
+    fprintf(stderr,
+            "[fastllm][paged-debug] FAILED stage=%s layer=%d device=%d "
+            "pending=%d(%s) synchronize=%d(%s)\n",
+            stage == nullptr ? "unknown" : stage, layer, device,
+            (int)pending, cudaGetErrorName(pending),
+            (int)synchronized, cudaGetErrorName(synchronized));
+    FastllmCudaPrintPagedDebugTensor("first", first);
+    FastllmCudaPrintPagedDebugTensor("second", second);
+    fflush(stderr);
+    return false;
 }
 
 bool FastllmCudaFlashInferSupported() {
@@ -3710,6 +3773,11 @@ __global__ void FastllmLayerNormKernelInner1(half *input, float *gamma, float *b
     }
 }
 
+__device__ __forceinline__ bool FastllmGreedyIsBetter(
+        float value, int id, float bestValue, int bestId) {
+    return value > bestValue ||
+           (value == bestValue && id < bestId);
+}
 
 template <int THREAD_PER_BLOCK>
 __global__ void FastllmLayerNormKernelTop1(float *input, float *output, int channels) {
@@ -3729,11 +3797,11 @@ __global__ void FastllmLayerNormKernelTop1(float *input, float *output, int chan
     __syncthreads();
 
     for (unsigned int s = THREAD_PER_BLOCK / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            if (maxData[tid] < maxData[tid + s]) {
-                maxData[tid] = maxData[tid + s];
-                idData[tid] = idData[tid + s];
-            }
+        if (tid < s && FastllmGreedyIsBetter(
+                maxData[tid + s], (int)idData[tid + s],
+                maxData[tid], (int)idData[tid])) {
+            maxData[tid] = maxData[tid + s];
+            idData[tid] = idData[tid + s];
         }
         __syncthreads();
     }
@@ -3875,6 +3943,16 @@ void FastllmCudaFinishOutput(fastllm::Data &output, void *data) {
     DeviceSync();
 }
 
+/** 保存Data分配时的紧凑快照；只用于OOM报告，不持有或解引用owner。 */
+struct CudaAllocationMetadata {
+    const void *owner = nullptr;
+    int dataType = -1;
+    int dimCount = 0;
+    std::array<int, 4> dims = {0, 0, 0, 0};
+    bool isFake = false;
+    bool isKVCache = false;
+};
+
 struct CudaMemoryBuffer {
     void *data;
     size_t size;
@@ -3882,14 +3960,36 @@ struct CudaMemoryBuffer {
     int graphPins;
     cudaEvent_t reuseReadyEvent;
     bool reusePending;
+    const char *sourceFile;
+    int sourceLine;
+    size_t requestedSize;
+    CudaAllocationMetadata metadata;
 
     CudaMemoryBuffer () : data(nullptr), size(0), busy(false), graphPins(0),
-            reuseReadyEvent(nullptr), reusePending(false) {}
+            reuseReadyEvent(nullptr), reusePending(false),
+            sourceFile("<unknown>"), sourceLine(0), requestedSize(0) {}
 
-    CudaMemoryBuffer (void *data, size_t size, bool busy) :
+    CudaMemoryBuffer (void *data, size_t size, bool busy,
+                      const char *sourceFile = nullptr, int sourceLine = 0,
+                      const CudaAllocationMetadata *metadata = nullptr) :
             data(data), size(size), busy(busy), graphPins(0),
-            reuseReadyEvent(nullptr), reusePending(false) {}
+            reuseReadyEvent(nullptr), reusePending(false),
+            sourceFile(sourceFile == nullptr ? "<unknown>" : sourceFile),
+            sourceLine(sourceLine), requestedSize(size),
+            metadata(metadata == nullptr ? CudaAllocationMetadata() : *metadata) {}
 };
+
+/** 更新池中Buffer当前使用者的源码位置。 */
+static void FastllmCudaSetBufferSource(CudaMemoryBuffer &buffer,
+                                       const char *file, int line,
+                                       size_t requestedSize,
+                                       const CudaAllocationMetadata *metadata) {
+    buffer.sourceFile = file == nullptr ? "<unknown>" : file;
+    buffer.sourceLine = line;
+    buffer.requestedSize = requestedSize;
+    buffer.metadata = metadata == nullptr
+        ? CudaAllocationMetadata() : *metadata;
+}
 
 static bool FastllmCudaBufferReadyForReuseLocked(CudaMemoryBuffer &buffer) {
     if (!buffer.reusePending) {
@@ -4531,6 +4631,149 @@ static void FastllmCudaPrintPoolRejectStateLocked(int id, size_t requestSize,
     fflush(stderr);
 }
 
+/**
+ * 在真实OOM后输出设备内存池与请求生命周期摘要。
+ *
+ * 调用方必须已经持有目标设备的内存池锁。本函数只读取池元数据，不释放
+ * Buffer、不执行同步，也不改变正常分配和回退行为。
+ *
+ * @param id               CUDA设备编号。
+ * @param requestSize      本次失败的申请字节数。
+ * @param bigBuffersPtr    大块内存池。
+ * @param smallBuffersPtr  小块内存池。
+ */
+static void FastllmCudaPrintOomPoolStateLocked(
+        int id, size_t requestSize,
+        const std::vector<CudaMemoryBuffer> *bigBuffersPtr,
+        const std::vector<CudaMemoryBuffer> *smallBuffersPtr) {
+    struct PoolSummary {
+        size_t busyBytes = 0;
+        size_t freeBytes = 0;
+        size_t pinnedBytes = 0;
+        size_t pendingBytes = 0;
+        int busyCount = 0;
+        int freeCount = 0;
+        int pinnedCount = 0;
+        int pendingCount = 0;
+    };
+    auto summarize = [](const std::vector<CudaMemoryBuffer> *buffers) {
+        PoolSummary summary;
+        if (buffers == nullptr) {
+            return summary;
+        }
+        for (const auto &buffer : *buffers) {
+            if (buffer.busy) {
+                summary.busyBytes += buffer.size;
+                summary.busyCount++;
+            } else {
+                summary.freeBytes += buffer.size;
+                summary.freeCount++;
+            }
+            if (buffer.graphPins > 0) {
+                summary.pinnedBytes += buffer.size;
+                summary.pinnedCount++;
+            }
+            if (buffer.reusePending) {
+                summary.pendingBytes += buffer.size;
+                summary.pendingCount++;
+            }
+        }
+        return summary;
+    };
+
+    const PoolSummary big = summarize(bigBuffersPtr);
+    const PoolSummary small = summarize(smallBuffersPtr);
+    fprintf(stderr,
+            "[FASTLLM_CUDA_OOM] device=%d request_mb=%.2f active_response_contexts=%d\n",
+            id, requestSize / 1048576.0,
+            fastllm::GetActiveResponseContextCount());
+    fprintf(stderr,
+            "[FASTLLM_CUDA_OOM] big_pool busy_mb=%.2f busy_count=%d "
+            "free_mb=%.2f free_count=%d pinned_mb=%.2f pinned_count=%d "
+            "pending_mb=%.2f pending_count=%d\n",
+            big.busyBytes / 1048576.0, big.busyCount,
+            big.freeBytes / 1048576.0, big.freeCount,
+            big.pinnedBytes / 1048576.0, big.pinnedCount,
+            big.pendingBytes / 1048576.0, big.pendingCount);
+    fprintf(stderr,
+            "[FASTLLM_CUDA_OOM] small_pool busy_mb=%.2f busy_count=%d "
+            "free_mb=%.2f free_count=%d pinned_mb=%.2f pinned_count=%d "
+            "pending_mb=%.2f pending_count=%d\n",
+            small.busyBytes / 1048576.0, small.busyCount,
+            small.freeBytes / 1048576.0, small.freeCount,
+            small.pinnedBytes / 1048576.0, small.pinnedCount,
+            small.pendingBytes / 1048576.0, small.pendingCount);
+
+    struct OwnerSummary {
+        size_t bytes = 0;
+        int count = 0;
+        const void *exampleOwner = nullptr;
+    };
+    auto describeMetadata = [](const CudaAllocationMetadata &metadata) {
+        if (metadata.owner == nullptr) {
+            return std::string("data=none");
+        }
+        std::string description = "dtype=" + fastllm::GetDataTypeName(
+            (fastllm::DataType)metadata.dataType) + " shape=[";
+        for (int i = 0; i < metadata.dimCount; i++) {
+            if (i > 0) {
+                description += ",";
+            }
+            description += std::to_string(metadata.dims[i]);
+        }
+        description += "] fake=" + std::to_string((int)metadata.isFake) +
+            " kv=" + std::to_string((int)metadata.isKVCache);
+        return description;
+    };
+    std::map<std::tuple<std::string, int, size_t, size_t, std::string>,
+             OwnerSummary> owners;
+    auto collectOwners = [&](const std::vector<CudaMemoryBuffer> *buffers) {
+        if (buffers == nullptr) {
+            return;
+        }
+        for (const auto &buffer : *buffers) {
+            if (!buffer.busy) {
+                continue;
+            }
+            auto &owner = owners[{std::string(buffer.sourceFile),
+                                  buffer.sourceLine, buffer.size,
+                                  buffer.requestedSize,
+                                  describeMetadata(buffer.metadata)}];
+            owner.bytes += buffer.size;
+            owner.count++;
+            if (owner.exampleOwner == nullptr) {
+                owner.exampleOwner = buffer.metadata.owner;
+            }
+        }
+    };
+    collectOwners(bigBuffersPtr);
+    collectOwners(smallBuffersPtr);
+    std::vector<std::pair<
+        std::tuple<std::string, int, size_t, size_t, std::string>,
+        OwnerSummary>> rankedOwners(
+        owners.begin(), owners.end());
+    std::sort(rankedOwners.begin(), rankedOwners.end(),
+              [](const auto &left, const auto &right) {
+                  return left.second.bytes > right.second.bytes;
+              });
+    const int ownerLimit = std::min(20, (int)rankedOwners.size());
+    for (int i = 0; i < ownerLimit; i++) {
+        const auto &key = rankedOwners[i].first;
+        const auto &value = rankedOwners[i].second;
+        fprintf(stderr,
+                "[FASTLLM_CUDA_OOM] busy_owner rank=%d source=%s:%d "
+                "buffer_mb=%.2f requested_mb=%.2f total_mb=%.2f count=%d "
+                "owner=%p %s\n",
+                i + 1, std::get<0>(key).c_str(), std::get<1>(key),
+                std::get<2>(key) / 1048576.0,
+                std::get<3>(key) / 1048576.0,
+                value.bytes / 1048576.0, value.count,
+                const_cast<void *>(value.exampleOwner),
+                std::get<4>(key).c_str());
+    }
+    fflush(stderr);
+}
+
 static void FastllmCudaReleaseIdleCachedBuffersForDevice(int id) {
     cudaError_t state = cudaSetDevice(id);
     checkCudaErrors("Error: CUDA error when switching device to release cached memory!", state);
@@ -4738,7 +4981,20 @@ void FastllmCudaGraphMemoryPoolRelease(const std::vector<void*> &reservedPointer
     }
 }
 
-void * FastllmCudaMalloc(size_t size) {
+/**
+ * 从当前设备的CUDA内存池分配Buffer，并记录当前调用位置。
+ *
+ * @param size        请求字节数。
+ * @param sourceFile  发起分配的源码文件；未知时为nullptr。
+ * @param sourceLine  发起分配的源码行号；未知时为0。
+ * @param metadata    可选Data元数据快照；函数返回前完成复制。
+ * @return 成功时返回设备地址，失败时返回nullptr并设置CUDA错误状态。
+ */
+static void *FastllmCudaMallocImpl(size_t size, const char *sourceFile,
+                                   int sourceLine,
+                                   const CudaAllocationMetadata *metadata) {
+    sourceFile = sourceFile == nullptr ? "<unknown>" : sourceFile;
+
     int id = -1;
     cudaError_t state = cudaSuccess;
     state = cudaGetDevice(&id);
@@ -4767,6 +5023,8 @@ void * FastllmCudaMalloc(size_t size) {
         }
         if (selId != -1) {
             bigBuffers[selId].busy = true;
+            FastllmCudaSetBufferSource(
+                bigBuffers[selId], sourceFile, sourceLine, size, metadata);
             FastllmCudaGraphPoolAfterAllocLocked(
                 bigBuffers[selId].data, captureIdentity);
 #ifdef CUDA_MEM_DEBUG
@@ -4788,6 +5046,8 @@ void * FastllmCudaMalloc(size_t size) {
             }
             if (selId != -1) {
                 bigBuffers[selId].busy = true;
+                FastllmCudaSetBufferSource(
+                    bigBuffers[selId], sourceFile, sourceLine, size, metadata);
                 FastllmCudaGraphPoolAfterAllocLocked(
                     bigBuffers[selId].data, captureIdentity);
 #ifdef CUDA_MEM_DEBUG
@@ -4805,11 +5065,15 @@ void * FastllmCudaMalloc(size_t size) {
             FastllmCudaSetThreadError();
             return nullptr;
         }
-        state = FastllmCudaCheckedMalloc(&ret, size, __FILE__, __LINE__);
-        if (cudaSuccess != state && FastllmCudaRetryMallocAfterReleasingIdle(size, &ret, id, __FILE__, __LINE__)) {
+        state = FastllmCudaCheckedMalloc(
+            &ret, size, sourceFile, sourceLine);
+        if (cudaSuccess != state && FastllmCudaRetryMallocAfterReleasingIdle(
+                size, &ret, id, sourceFile, sourceLine)) {
             state = cudaSuccess;
         }
         if (cudaSuccess != state) {
+            FastllmCudaPrintOomPoolStateLocked(
+                id, size, view.bigBuffers, view.smallBuffers);
             size_t freeMem = 0, totalMem = 0;
             cudaMemGetInfo(&freeMem, &totalMem);
             printf("Error: CUDA error when allocating %lu MB memory on device %d! "
@@ -4819,7 +5083,8 @@ void * FastllmCudaMalloc(size_t size) {
             checkCudaErrors("", state);
             return nullptr;
         }
-        bigBuffers.push_back(CudaMemoryBuffer(ret, size, true));
+        bigBuffers.push_back(CudaMemoryBuffer(
+            ret, size, true, sourceFile, sourceLine, metadata));
         FastllmCudaGraphPoolAfterAllocLocked(ret, captureIdentity);
 #ifdef CUDA_MEM_DEBUG
         CudaMemDebugRecord(ret, size);
@@ -4834,6 +5099,8 @@ void * FastllmCudaMalloc(size_t size) {
             FastllmCudaGraphPoolPointerReusableLocked(
                 cudaBuffers[i].data, captureIdentity)) {
             cudaBuffers[i].busy = true;
+            FastllmCudaSetBufferSource(
+                cudaBuffers[i], sourceFile, sourceLine, size, metadata);
             FastllmCudaGraphPoolAfterAllocLocked(
                 cudaBuffers[i].data, captureIdentity);
             *view.noBusy -= cudaBuffers[i].size;
@@ -4864,6 +5131,8 @@ void * FastllmCudaMalloc(size_t size) {
         }
         if (selId != -1) {
             bigBuffers[selId].busy = true;
+            FastllmCudaSetBufferSource(
+                bigBuffers[selId], sourceFile, sourceLine, size, metadata);
             FastllmCudaGraphPoolAfterAllocLocked(
                 bigBuffers[selId].data, captureIdentity);
 #ifdef CUDA_MEM_DEBUG
@@ -4880,11 +5149,14 @@ void * FastllmCudaMalloc(size_t size) {
         FastllmCudaSetThreadError();
         return nullptr;
     }
-    state = FastllmCudaCheckedMalloc(&ret, size, __FILE__, __LINE__);
-    if (cudaSuccess != state && FastllmCudaRetryMallocAfterReleasingIdle(size, &ret, id, __FILE__, __LINE__)) {
+    state = FastllmCudaCheckedMalloc(&ret, size, sourceFile, sourceLine);
+    if (cudaSuccess != state && FastllmCudaRetryMallocAfterReleasingIdle(
+            size, &ret, id, sourceFile, sourceLine)) {
         state = cudaSuccess;
     }
     if (cudaSuccess != state) {
+        FastllmCudaPrintOomPoolStateLocked(
+            id, size, view.bigBuffers, view.smallBuffers);
         size_t freeMem = 0, totalMem = 0;
         cudaMemGetInfo(&freeMem, &totalMem);
         printf("Error: CUDA error when allocating %lu KB memory on device %d! "
@@ -4894,12 +5166,58 @@ void * FastllmCudaMalloc(size_t size) {
         checkCudaErrors("", state);
         return nullptr;
     }
-    cudaBuffers.push_back(CudaMemoryBuffer(ret, size, true));
+    cudaBuffers.push_back(CudaMemoryBuffer(
+        ret, size, true, sourceFile, sourceLine, metadata));
     FastllmCudaGraphPoolAfterAllocLocked(ret, captureIdentity);
 #ifdef CUDA_MEM_DEBUG
     CudaMemDebugRecord(ret, size);
 #endif
     return ret;
+}
+
+/** 使用未知调用位置执行兼容的CUDA池分配。 */
+void *FastllmCudaMalloc(size_t size) {
+    return FastllmCudaMallocImpl(size, nullptr, 0, nullptr);
+}
+
+/** 使用源码位置标记执行CUDA池分配，供OOM诊断归因。 */
+void *FastllmCudaMallocWithSource(size_t size, const char *file, int line) {
+    return FastllmCudaMallocImpl(size, file, line, nullptr);
+}
+
+/**
+ * 使用Data的紧凑元数据标记CUDA池分配。
+ *
+ * 仅复制owner地址、dtype、前四维形状和所有权标记；OOM报告不会解引用
+ * owner，因此Data析构后地址失效也不会造成访问越界。正常分配路径不构造
+ * 字符串，避免给模型热路径引入明显开销。
+ *
+ * @param size      请求字节数。
+ * @param owner     发起分配的Data地址，仅作为诊断标识。
+ * @param dataType  DataType枚举整数值。
+ * @param dims      逻辑形状数组，可为nullptr。
+ * @param dimCount  dims维数；报告最多保存前四维。
+ * @param isFake    Data是否为非拥有型视图。
+ * @param isKVCache Data是否为KV Cache。
+ * @param file      发起分配的源码文件。
+ * @param line      发起分配的源码行号。
+ * @return 成功时返回设备地址，失败时返回nullptr。
+ */
+void *FastllmCudaMallocWithDataTag(size_t size, const void *owner,
+                                   int dataType, const int *dims, int dimCount,
+                                   bool isFake, bool isKVCache,
+                                   const char *file, int line) {
+    CudaAllocationMetadata metadata;
+    metadata.owner = owner;
+    metadata.dataType = dataType;
+    metadata.dimCount = dims == nullptr
+        ? 0 : std::max(0, std::min(dimCount, 4));
+    for (int i = 0; i < metadata.dimCount; i++) {
+        metadata.dims[i] = dims[i];
+    }
+    metadata.isFake = isFake;
+    metadata.isKVCache = isKVCache;
+    return FastllmCudaMallocImpl(size, file, line, &metadata);
 }
 
 void FastllmCudaForceFree(void *ret) {
@@ -5499,6 +5817,15 @@ void FastllmCudaCopyFromDeviceToDevice(void *dst, void *src, size_t size) {
     }
 
     state = cudaMemcpy(dst, src, size, cudaMemcpyDeviceToDevice);
+    if (state != cudaSuccess && FastllmCudaPagedDebugEnabled()) {
+        int device = -1;
+        cudaGetDevice(&device);
+        fprintf(stderr,
+                "[fastllm][paged-debug] FAILED stage=device_to_device_copy "
+                "device=%d dst=%p src=%p bytes=%zu error=%d(%s)\n",
+                device, dst, src, size, (int)state, cudaGetErrorName(state));
+        fflush(stderr);
+    }
     checkCudaErrors("Error: CUDA error when copy on GPU!", state);
     //cudaDeviceSynchronize();
 }
@@ -13639,12 +13966,6 @@ struct FastllmGreedyPartial {
     float value;
     int id;
 };
-
-__device__ __forceinline__ bool FastllmGreedyIsBetter(
-        float value, int id, float bestValue, int bestId) {
-    return value > bestValue ||
-           (value == bestValue && id < bestId);
-}
 
 template <int THREAD_PER_BLOCK>
 __global__ void FastllmGreedySamplingKernel(float *logits, int *output,

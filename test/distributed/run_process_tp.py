@@ -1,0 +1,276 @@
+#!/usr/bin/env python3
+"""运行已有进程底座产物并生成报告；本脚本从不编译或安装任何组件。"""
+
+import argparse
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
+import csv
+import ctypes
+from datetime import datetime, timezone
+import json
+import os
+from pathlib import Path
+import select
+import shlex
+import signal
+import subprocess
+import sys
+import time
+import uuid
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "test/nvfp4"))
+from xlsx_report import write_xlsx
+
+
+def capture(command, timeout=10):
+    try:
+        result = subprocess.run(command, cwd=ROOT, text=True, capture_output=True, timeout=timeout)
+        return result.stdout.strip() if result.returncode == 0 else result.stderr.strip()
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return str(error)
+
+
+def save_report(output, rows, metadata):
+    status = "PASS" if rows and all(row["status"] == "PASS" for row in rows) else "FAIL"
+    (output / "summary.json").write_text(json.dumps(
+        {"status": status, "metadata": metadata, "cases": rows}, ensure_ascii=False, indent=2), encoding="utf-8")
+    fields = ["case", "backend", "status", "max_abs_error", "mean_abs_error", "failed_elements", "reason"]
+
+    def cell(value):
+        if isinstance(value, float):
+            return f"{value:.3f}"
+        return "n/a" if value is None else str(value)
+
+    display = [[cell(row.get(key)) for key in fields] for row in rows]
+    with (output / "summary.csv").open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(fields)
+        writer.writerows(display)
+    lines = [f"# Process TP infrastructure: {status}", "",
+             "功能检查；不代表模型 TP、CUDA Graph、自定义 AllReduce 或前缀缓存已实现。",
+             "无数值输出的生命周期检查，误差字段为 n/a。所有原始结果见 summary.json。", "",
+             "| " + " | ".join(fields) + " |", "| " + " | ".join(["---"] * len(fields)) + " |"]
+    lines.extend("| " + " | ".join(item.replace("|", "\\|").replace("\n", " ") for item in row) + " |"
+                 for row in display)
+    lines.extend(["", "```json", json.dumps(metadata, ensure_ascii=False, indent=2), "```"])
+    (output / "summary.md").write_text("\n".join(lines), encoding="utf-8")
+    write_xlsx(output / "summary.xlsx", [
+        ("Cases", fields, display),
+        ("Metadata", ["key", "value"], [[key, json.dumps(value, ensure_ascii=False)] for key, value in metadata.items()]),
+    ])
+    return status
+
+
+def enable_child_subreaper():
+    # 接管协调器退出后的孤儿 worker，避免依赖容器 PID 1 帮助回收僵尸进程。
+    libc = ctypes.CDLL(None, use_errno=True)
+    prctl = libc.prctl
+    prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong]
+    prctl.restype = ctypes.c_int
+    if prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
+        error = ctypes.get_errno()
+        raise OSError(error, "cannot enable child subreaper: " + os.strerror(error))
+
+
+def wait_case(process, timeout):
+    # 保留已退出组长的 wait 状态，直到整组清理完成，防止 PID/PGID 被提前复用。
+    deadline = time.monotonic() + timeout
+    while True:
+        result = os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        if result is not None:
+            return result.si_status if result.si_code == os.CLD_EXITED else -result.si_status
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(process.args, timeout)
+        time.sleep(min(0.02, remaining))
+
+
+def cleanup_process_group(process, timeout=5):
+    deadline = time.monotonic() + timeout
+    try:
+        # SIGKILL 对 SIGSTOP 中的 worker 同样生效；先杀整组，再回收组长。
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.wait(timeout=max(0, deadline - time.monotonic()))
+
+    # 只回收本 case 的进程组，不能使用 waitpid(-1) 抢走其他子进程的状态。
+    while True:
+        try:
+            pid, _ = os.waitpid(-process.pid, os.WNOHANG)
+        except ChildProcessError:
+            return
+        if pid == 0:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(f"process group {process.pid} cleanup timed out")
+            time.sleep(min(0.02, remaining))
+
+
+@contextmanager
+def case_process(command, **kwargs):
+    enable_child_subreaper()
+    process = subprocess.Popen(command, cwd=ROOT, start_new_session=True, **kwargs)
+    try:
+        yield process
+    finally:
+        cleanup_process_group(process)
+
+
+def run_case(name, command, output, timeout, parse_json=True, environment=None):
+    row = {"case": name, "status": "FAIL", "command": shlex.join(command)}
+    stdout_path = output / f"{name}.stdout.log"
+    stderr_path = output / f"{name}.stderr.log"
+    try:
+        # 直接写日志文件：超时或中断也保留输出，不等待后代关闭继承的 pipe。
+        with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
+            with case_process(command, stdout=stdout, stderr=stderr, env=environment) as process:
+                returncode = wait_case(process, timeout)
+        result = stdout_path.read_text(encoding="utf-8", errors="replace")
+        errors = stderr_path.read_text(encoding="utf-8", errors="replace")
+        if parse_json:
+            data = json.loads(result.strip().splitlines()[-1])
+            if not isinstance(data, dict):
+                raise ValueError("case output must be a JSON object")
+            row.update(data)
+            row["case"] = name
+            if data.get("status") != "PASS":
+                row["status"] = "FAIL"
+        else:
+            row.update(backend="python/options", status="PASS" if returncode == 0 else "FAIL")
+        if returncode != 0:
+            row.update(status="FAIL", reason=row.get("reason", errors.strip() or f"exit {returncode}"))
+    except (OSError, subprocess.TimeoutExpired, RuntimeError, ValueError, IndexError) as error:
+        row.update(status="FAIL", reason=str(error))
+    return row
+
+
+def parent_death_case(command, timeout, output):
+    row = {"case": "parent_death", "status": "FAIL", "backend": "process/control-only",
+           "command": shlex.join(command)}
+    pidfds = []
+    try:
+        with (output / "parent_death.stderr.log").open("w", encoding="utf-8") as errors:
+            with case_process(command, stdout=subprocess.PIPE, stderr=errors) as process:
+                with process.stdout:
+                    deadline = time.monotonic() + timeout
+                    line = bytearray()
+                    try:
+                        while not line.endswith(b"\n"):
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0 or not select.select([process.stdout], [], [], remaining)[0]:
+                                raise RuntimeError("parent did not report worker identities in time")
+                            piece = os.read(process.stdout.fileno(), 1)
+                            if not piece or len(line) > 1024 * 1024:
+                                raise RuntimeError("invalid parent startup output")
+                            line.extend(piece)
+                    finally:
+                        (output / "parent_death.stdout.log").write_bytes(line)
+                    data = json.loads(line)
+                    row["workers"] = data["workers"]
+                    for worker in data["workers"]:
+                        pidfds.append(os.pidfd_open(worker["pid"]))
+                    if not pidfds:
+                        raise RuntimeError("parent reported no workers")
+
+                    # 先只杀协调器，观察 worker 自行退出；整组兜底清理必须在观察之后。
+                    os.kill(process.pid, signal.SIGKILL)
+                    wait_case(process, 5)
+                    deadline = time.monotonic() + 5
+                    for fd in pidfds:
+                        if not select.select([fd], [], [], max(0, deadline - time.monotonic()))[0]:
+                            raise RuntimeError("worker survived parent death")
+                    row["status"] = "PASS"
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired, AttributeError) as error:
+        row["status"] = "FAIL"
+        row["reason"] = str(error)
+    finally:
+        for fd in pidfds:
+            os.close(fd)
+    return row
+
+
+def run_cleanup_checks(output):
+    from test_process_tp_runner import run_tests
+
+    # 自测会创建多组独立 session，因此直接在验收器内执行。
+    # 若再套一层可被 SIGKILL 的子进程，其清理逻辑会被跳过，内层 session 也不在外层组内。
+    with (output / "runner_cleanup.stdout.log").open("w", encoding="utf-8") as stdout, \
+            (output / "runner_cleanup.stderr.log").open("w", encoding="utf-8") as stderr:
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            row = run_tests()
+    row.update(case="runner_cleanup", execution="in-process Python test suite")
+    return row
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--check", type=Path, help="已编译的 fastllm_tp_check")
+    parser.add_argument("--worker", type=Path, help="已编译的 fastllm_tp_worker")
+    parser.add_argument("--devices", default="0,1", help="CUDA_VISIBLE_DEVICES 之后的显式逻辑设备列表")
+    parser.add_argument("--cuda", action="store_true", help="额外验证真实 CUDA/NCCL，必须有 GPU")
+    parser.add_argument("--frontend-only", action="store_true", help="仅执行 Python 参数与进程清理检查，不运行 C++ 产物")
+    parser.add_argument("--pid-namespace", action="store_true", help="额外用 unshare 验证 PID 1 协调器，须允许创建 user/PID namespace")
+    parser.add_argument("--build-cache", type=Path, help="服务器构建的 CMakeCache.txt，保存架构配置")
+    parser.add_argument("--output-root", type=Path, default=ROOT / "test/distributed/results")
+    args = parser.parse_args()
+    if args.frontend_only and (args.cuda or args.pid_namespace):
+        parser.error("--frontend-only cannot be combined with --cuda or --pid-namespace")
+    if not args.frontend_only and (args.check is None or args.worker is None):
+        parser.error("--check and --worker are required unless --frontend-only")
+
+    output = args.output_root / (datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "_" + uuid.uuid4().hex[:8])
+    output.mkdir(parents=True, exist_ok=False)
+    metadata = {
+        "command": shlex.join([sys.executable, *sys.argv]), "git": capture(["git", "rev-parse", "HEAD"]),
+        "git_status": capture(["git", "status", "--short"]), "python": sys.version,
+        "test_kind": "functional infrastructure checks; not an inference benchmark",
+        "seed": 0, "warmup": 0, "iterations": 1, "repeats": 1,
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", "unset"),
+        "gpu": "not queried (frontend/control-only)",
+        "cuda_runtime_version": "worker metadata when --cuda; otherwise n/a",
+        "compile_architecture": "host C++; process TP targets contain no device kernels",
+        "cmake_cuda_architecture": "not supplied", "frontend_only": args.frontend_only,
+    }
+    rows = []
+    try:
+        if args.cuda:
+            metadata["gpu"] = capture(["nvidia-smi", "--query-gpu=name,uuid,driver_version", "--format=csv,noheader"])
+        if args.build_cache:
+            cache = args.build_cache.read_text(encoding="utf-8")
+            (output / "CMakeCache.txt").write_text(cache, encoding="utf-8")
+            metadata["cmake_cuda_architecture"] = [line for line in cache.splitlines()
+                if line.startswith(("CUDA_ARCH:", "CMAKE_CUDA_ARCHITECTURES:", "CMAKE_CUDA_COMPILER:"))]
+        rows.append(run_case("frontend_options", [sys.executable, str(ROOT / "test/distributed/test_process_tp_options.py")],
+                             output, 30, parse_json=False))
+        rows.append(run_cleanup_checks(output))
+        if not args.frontend_only:
+            base = [str(args.check.resolve()), "--worker", str(args.worker.resolve()), "--devices", args.devices]
+            for name in ("smoke", "restart", "crash", "stall", "invalid_devices", "missing_worker", "startup_exit"):
+                command = base + ["--control-only", "--case", name, "--operation-timeout-ms", "1000"]
+                rows.append(run_case("control_" + name, command, output, 90))
+            fixture = output / "startup_timeout_worker"
+            source = (ROOT / "test/distributed/startup_timeout_worker.py").read_text(encoding="utf-8")
+            fixture.write_text(source, encoding="utf-8")
+            fixture.chmod(0o700)
+            for name in ("startup_timeout", "protocol_version", "protocol_session"):
+                command = [str(args.check.resolve()), "--worker", str(fixture.resolve()), "--devices", args.devices,
+                           "--control-only", "--case", name, "--startup-timeout-ms", "2000"]
+                environment = dict(os.environ, FASTLLM_TEST_STARTUP_FAULT="timeout" if name == "startup_timeout" else name)
+                rows.append(run_case("control_" + name, command, output, 20, environment=environment))
+            rows.append(parent_death_case(base + ["--control-only", "--case", "hold"], 90, output))
+            if args.pid_namespace:
+                command = ["unshare", "--user", "--map-root-user", "--pid", "--fork", "--kill-child=SIGKILL"]
+                rows.append(run_case("control_pid1", command + base + ["--control-only", "--case", "pid1"], output, 90))
+            if args.cuda:
+                for name in ("smoke", "restart", "crash", "stall"):
+                    rows.append(run_case("cuda_" + name, base + ["--case", name], output, 240))
+    except (Exception, KeyboardInterrupt) as error:
+        rows.append({"case": "runner", "status": "FAIL", "reason": str(error) or type(error).__name__})
+    status = save_report(output, rows, metadata)
+    print(f"{status}: {output}")
+    return 0 if status == "PASS" else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
