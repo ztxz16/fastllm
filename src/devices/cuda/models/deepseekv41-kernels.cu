@@ -41,9 +41,14 @@ SOFTWARE.
 #include "deepseekv41-reference.cuh"
 #ifndef USE_ROCM
 #include "deepseekv41-flashinfer.cuh"
+// The gathered FP16 backend uses SM75 Tensor Core instructions. Keep its
+// FlashInfer synchronization headers out of older architecture passes.
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 750
+#define FASTLLM_V41_FLASHINFER_FP16
 #include "attention/default_prefill_params.cuh"
 #include "attention/prefill.cuh"
 #include "attention/variants.cuh"
+#endif
 #endif
 #include "fastllm.h"
 
@@ -6310,7 +6315,7 @@ extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, co
     }
 #endif
 
-#ifndef USE_ROCM
+#ifdef FASTLLM_V41_FLASHINFER_FP16
     // FP16 Tensor Cores are available on SM75 even though native BF16 MMA is
     // not. Use the same gathered-KV backend for eager chunks and full graphs.
     if (!legacyAttention && !referenceMath && FastllmV41FlashInferEnabled() && V41IsSm75() &&
@@ -7280,7 +7285,7 @@ void *FastllmCudaV41CreateFullDecode(const FastllmV41FullDecodeConfig &c,
         ok = ok && cudaHostAlloc(reinterpret_cast<void **>(&p->host), (size_t)c.batch * sizeof(*p->host), cudaHostAllocDefault) == cudaSuccess &&
              cudaEventCreateWithFlags(&p->copied, cudaEventDisableTiming) == cudaSuccess;
     if (!ok) { cudaGetLastError(); return nullptr; }
-#ifndef USE_ROCM
+#ifdef FASTLLM_V41_FLASHINFER_FP16
     if (V41IsSm75() && FastllmV41FlashInferEnabled() && v41_fp16_attention::Ready()) {
         p->fp16WorkspaceBytes = v41_fp16_attention::Bytes(c.batch, c.heads, c.window + (c.ratio ? c.topK : 0));
         void *storage = nullptr;
@@ -7493,7 +7498,7 @@ bool FastllmCudaV41FinishFullDecode(void *handle) {
         }
     }
     const int *fallbackRows = nullptr;
-#ifndef USE_ROCM
+#ifdef FASTLLM_V41_FLASHINFER_FP16
     if (p->fp16Workspace) {
         const int keys = c.window + (c.ratio ? c.topK : 0);
         if (!v41_fp16_attention::Run(p->attention, p->fp16Workspace.get(), c.batch, c.heads,
