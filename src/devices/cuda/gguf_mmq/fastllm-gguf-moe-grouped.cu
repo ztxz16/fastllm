@@ -128,7 +128,7 @@ bool fastllm_gguf_mmq::RunStreamedMoe(StreamedMoePhase phase, const fastllm::Dat
     }
 }
 
-size_t FastllmCudaV41GGUFGroupedWorkspaceBytes(int gateType, int downType,
+bool FastllmCudaV41GGUFStreamedSupported(int gateType, int downType,
         int rows, int hidden, int inter, int experts, int topk) {
     using namespace fastllm_gguf_mmq;
     const auto supported = [](int type) {
@@ -137,12 +137,24 @@ size_t FastllmCudaV41GGUFGroupedWorkspaceBytes(int gateType, int downType,
             type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_XS ||
             type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_XXS;
     };
-    if (rows <= 32 || rows > 4096 || !supported(gateType) || !supported(downType) ||
+    if (rows <= 32 || !supported(gateType) || !supported(downType) ||
         hidden <= 0 || hidden > 24576 || hidden%256 ||
         inter <= 0 || inter > 24576 || inter%256 ||
         experts <= 0 || experts > 1024 || topk <= 0 || topk > 32 ||
-        rows*topk + experts*(grouped_moe::kTile-1) + grouped_moe::kTile-1 > 65535 ||
-        !int8_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) return 0;
+        // Route IDs and the final flattened reduction still use signed int.
+        // Input quantization is launched in bounded row windows; grouped
+        // compute/activation grids use only the bounded padded route slice.
+        int64_t(rows) * std::max(hidden, topk) > INT32_MAX - 255 ||
+        !int8_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) return false;
+    return true;
+}
+
+size_t FastllmCudaV41GGUFGroupedWorkspaceBytes(int gateType, int downType,
+        int rows, int hidden, int inter, int experts, int topk) {
+    using namespace fastllm_gguf_mmq;
+    if (!FastllmCudaV41GGUFStreamedSupported(gateType, downType,
+            rows, hidden, inter, experts, topk) || rows > 4096 ||
+        int64_t(rows)*topk + experts*(grouped_moe::kTile-1) + grouped_moe::kTile-1 > 65535) return 0;
     return grouped_moe::Workspace(nullptr, rows, hidden, inter, experts, topk).bytes;
 }
 

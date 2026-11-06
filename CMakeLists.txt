@@ -1277,6 +1277,10 @@ if (UNIT_TEST)
             endif()
             add_executable(disk_v41_gguf_cache_test test/basic/test_disk_v41_gguf_cache.cpp)
             target_link_libraries(disk_v41_gguf_cache_test PRIVATE fastllm)
+            fastllm_add_checked_test(cuda_v41_gguf_large_prefill disk_v41_gguf_cache_test
+                "PASS: large V4.1 streamed prefill" 300 --large-prefill)
+            set_tests_properties(cuda_v41_gguf_large_prefill PROPERTIES LABELS "cuda;gguf" RUN_SERIAL TRUE
+                ENVIRONMENT "FT_GPU_PREFILL=1;FASTLLM_DISK_DIRECT_IO=1")
             fastllm_add_checked_test(disk_v41_gguf_cache disk_v41_gguf_cache_test
                 "PASS: disk V4.1 GGUF cache" 300)
             set_tests_properties(disk_v41_gguf_cache PROPERTIES LABELS "cuda;gguf" RUN_SERIAL TRUE

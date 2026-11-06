@@ -10542,20 +10542,20 @@ namespace fastllm {
                     if (!FastllmCudaGetMoePrefillResidents(weights, m, view,
                             nativeGlm && (i == 0 || weights[2]->dataType == DATA_GGUF_FORMAT))) continue;
                     if (!view.sharedWeights) {
-                        size_t groupedBytes = 0;
+                        bool groupedSupported = false;
                         if (view.weightType == DATA_GGUF_FORMAT) {
 #ifndef USE_ROCM
-                            if (nativeGlm) groupedBytes = fastllm_gguf_mmq::Glm5GroupedWorkspaceBytes(
-                                view.gateType, view.downType, bs, view.hidden, view.inter, m, topk);
+                            if (nativeGlm) groupedSupported = fastllm_gguf_mmq::Glm5GroupedWorkspaceBytes(
+                                view.gateType, view.downType, bs, view.hidden, view.inter, m, topk) != 0;
                             else if (deepSeekV4Mode && activationQuantBlock == 32)
-                                groupedBytes = FastllmCudaV41GGUFGroupedWorkspaceBytes(
+                                groupedSupported = FastllmCudaV41GGUFStreamedSupported(
                                     view.gateType, view.downType, bs, view.hidden, view.inter, m, topk);
                             else
 #endif
-                            groupedBytes = FastllmCudaMoeGGUFGroupedWorkspaceBytes(view.gateType,
-                                view.downType, bs, view.hidden, view.inter, m, topk);
+                            groupedSupported = FastllmCudaMoeGGUFGroupedWorkspaceBytes(view.gateType,
+                                view.downType, bs, view.hidden, view.inter, m, topk) != 0;
                         }
-                        if (view.weightType == DATA_GGUF_FORMAT ? !groupedBytes : !nativeGlm) continue;
+                        if (view.weightType == DATA_GGUF_FORMAT ? !groupedSupported : !nativeGlm) continue;
                     }
                     cacheOwnerRanks[i] = view.ownerRank;
                     cacheOwnerCounts[i] = view.ownerCount;

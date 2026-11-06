@@ -1371,14 +1371,26 @@ class HybridAutoTest(unittest.TestCase):
             generic = auto._workspace_bytes(a, g, 4096, 1048576, 'tp', 0)
             self.assertLess(phased, generic)
             # Even maximally skewed routing must fit, with all BF16 partials.
-            capacity = ((4096 * g.topk + 8 * 15 + 15) // 16) * 16
+            capacity = 4096
             grouped = capacity * ((max(g.hidden, g.intermediate) + 255) // 256 * 288 +
                                    max(g.hidden, 2 * g.intermediate) * 4)
             partials = 4096 * g.topk * g.hidden * 2
             self.assertGreater(phased, grouped + partials + 256 * MiB)
-            # Above MMQ's row limit, no optimistic phase budget is used.
-            self.assertEqual(auto._workspace_bytes(a, g, 8192, 1048576, 'pp', 0),
-                             auto._workspace_bytes(a, g, 8192, 1048576, 'tp', 0))
+            # Outer chunks can exceed both the old row and resident route/grid
+            # limits. Persistent inputs/partials grow; projection scratch does not.
+            for rows in (8192, 16384, 32768, 65537):
+                self.assertTrue(auto._v41_streamed_mmq(g, rows, 32))
+                phased_large = auto._workspace_bytes(a, g, rows, 1048576, 'pp', 0)
+                self.assertLess(phased_large, auto._workspace_bytes(a, g, rows, 1048576, 'tp', 0))
+                self.assertGreaterEqual(phased_large,
+                    rows * g.topk * g.hidden * 2 + grouped + rows * g.hidden * 296 // 256)
+            maximum = ((1 << 31) - 1 - 255) // g.hidden
+            self.assertTrue(auto._v41_streamed_mmq(g, maximum, g.topk))
+            self.assertFalse(auto._v41_streamed_mmq(g, maximum + 1, g.topk))
+            for field, value in [('hidden', 513), ('intermediate', 257), ('experts', 1025)]:
+                bad = copy.copy(g); setattr(bad, field, value)
+                self.assertFalse(auto._v41_streamed_mmq(bad, 8192, g.topk))
+            self.assertFalse(auto._v41_streamed_mmq(g, 8192, 33))
             self.assertEqual(auto._workspace_bytes(a, g, 4096, 1048576, 'pp', 0, gguf_mmq=False), generic)
             g.disk_prefill['streamed_mmq'] = False
             self.assertEqual(auto._workspace_bytes(a, g, 4096, 1048576, 'pp', 0), generic)
@@ -1400,11 +1412,10 @@ class HybridAutoTest(unittest.TestCase):
                          dict(total=64*GiB, available=64*GiB))
         self.assertEqual(disk['expert_transport_bytes_per_device'], 25 * 10 * MiB + 16 * MiB)
         self.assertLess(disk['workspace_bytes_per_device'], result['workspace_bytes_per_device'])
-        # A skewed expert group slices activations while reusing its weights;
-        # the host/NUMA path retains its original conservative capacity.
+        # Both backends bound route skew independently of the outer chunk.
         unsliced = auto._workspace_bytes(a, g, 4096, 1048576, 'pp', 0)
         sliced = auto._workspace_bytes(disk_args, g, 4096, 1048576, 'pp', 0)
-        capacity = ((4096 * g.topk + 8 * 15 + 15) // 16) * 16
+        capacity = 4096
         row_bytes = ((max(g.hidden, g.intermediate) + 255) // 256 * 288 +
                      max(g.hidden, 2 * g.intermediate) * 4)
         self.assertEqual(unsliced - sliced, (capacity - min(capacity, 2048)) * row_bytes)
@@ -1443,7 +1454,7 @@ class HybridAutoTest(unittest.TestCase):
         ram = dict(total=128*GiB, available=128*GiB)
         def chunk():
             return auto.plan(a, g, costs, 'pp', {0: 1}, gpu, ram)['chunked_prefill_size']
-        self.assertEqual(chunk(), 4096)
+        self.assertEqual(chunk(), 8192)
         a.chunked_prefill_size = 8192
         self.assertEqual(chunk(), 8192)
         a.chunked_prefill_size = 'auto'
@@ -1454,7 +1465,7 @@ class HybridAutoTest(unittest.TestCase):
         self.assertEqual(chunk(), 8192)
         g.disk_prefill['streamed_mmq'] = True
         a.moe_device = 'disk'
-        self.assertEqual(chunk(), 4096)
+        self.assertEqual(chunk(), 8192)
         with patch.dict(os.environ, {'FT_GPU_PREFILL': '0'}):
             self.assertEqual(chunk(), 8192)
 

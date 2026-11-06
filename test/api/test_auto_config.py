@@ -139,9 +139,16 @@ class AutoConfigTest(unittest.TestCase):
         self.assertGreater(auto._deepseek_priority(large, self.g, 'disk'),
                            auto._deepseek_priority(small, self.g, 'disk'))
         prompt = dict(large, chunked_prefill_size=4096, moe_cuda_cache=GiB//2)
+        # Bounded internal route slices keep large outer chunks streamed;
+        # the interactive soft target itself remains 4K.
+        self.assertEqual(auto._deepseek_priority(dict(prompt, chunked_prefill_size=8192), self.g, 'disk'),
+                         auto._deepseek_priority(prompt, self.g, 'disk'))
         self.assertGreater(auto._deepseek_priority(prompt, self.g, 'disk'),
                            auto._deepseek_priority(large, self.g, 'disk'))
-        fallback = dict(prompt, chunked_prefill_size=8192, moe_cuda_cache=3*GiB)
+        larger = dict(prompt, chunked_prefill_size=8192, moe_cuda_cache=3*GiB)
+        self.assertGreater(auto._deepseek_priority(larger, self.g, 'disk'),
+                           auto._deepseek_priority(prompt, self.g, 'disk'))
+        fallback = dict(larger, expert_transport_bytes_per_device=0)
         self.assertGreater(auto._deepseek_priority(prompt, self.g, 'disk'),
                            auto._deepseek_priority(fallback, self.g, 'disk'))
         # Concurrent decode does not multiply V4.1's streamed prefill rows.

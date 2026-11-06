@@ -278,7 +278,7 @@ def _deepseek_priority(candidate, model, backend=None):
     # solver accounts for route skew, pinned staging and the full context.
     streamed_disk = ((backend or candidate.get("moe_device")) == "disk" and
                      model.disk_prefill.get("streamed_mmq", False) and
-                     32 < chunk <= 4096 and
+                     chunk > 32 and
                      candidate.get("expert_transport_bytes_per_device", 0) > 0)
     # Once these targets are met, compare predicted latency. An unbounded
     # chunk preference otherwise discards a faster fully resident GPU plan

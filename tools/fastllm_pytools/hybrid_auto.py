@@ -1021,11 +1021,13 @@ def _score_workspace(model, rows, context):
 
 
 def _v41_streamed_mmq(model, rows, topk):
-    return (model.disk_prefill.get("streamed_mmq", False) and 32 < rows <= 4096 and
+    # Match FastllmCudaV41GGUFStreamedSupported, not the resident launcher.
+    # Projection route/grid limits apply to an internal 4096/2048-route slice.
+    return (model.disk_prefill.get("streamed_mmq", False) and rows > 32 and
             0 < model.hidden <= 24576 and model.hidden % 256 == 0 and
             0 < model.intermediate <= 24576 and model.intermediate % 256 == 0 and
             0 < model.experts <= 1024 and 0 < topk <= 32 and
-            rows * topk + model.experts * 15 + 15 <= 65535)
+            rows * max(model.hidden, topk) <= (1 << 31) - 1 - 255)
 
 
 def _disk_v41_streamed_mmq(args, model, rows, topk):
@@ -1086,8 +1088,8 @@ def _workspace_bytes(args, model, rows, context, mode, resident, *, gguf_mmq=Tru
                 args.atype in ("auto", "bfloat16") and args.moe_atype in ("", "auto", "bfloat16") and
                 "FASTLLM_DSV41_DUMP_DIR" not in os.environ and
                 os.environ.get("FASTLLM_DSV41_REFERENCE_MATH", "0") in ("", "0"))
-    # Canonical GGUF's streamed grouped MMQ currently accepts <=4096 rows.
-    # Larger explicit chunks retain the conservative per-expert fallback bound.
+    # Streamed MMQ slices routes independently of the outer chunk. Unsupported
+    # formats/geometries still need the conservative per-expert fallback bound.
     if canonical_gguf and (not gguf_mmq or not _v41_streamed_mmq(model, rows, topk) or
                            (args.moe_device == "disk" and not disk_streamed)):
         reusable = False
@@ -1124,17 +1126,18 @@ def _workspace_bytes(args, model, rows, context, mode, resident, *, gguf_mmq=Tru
     streamed_scratch = 0
     if canonical_gguf and resident < model.layers:
         # RunPipelined's direct allocation survives attention/WoA releases.
-        # Bound the worst routing skew, not average experts per token: one
-        # eight-expert batch can contain every route, plus 15-row padding each.
-        capacity = math.ceil((rows * topk + 8 * 15) / 16) * 16
-        if disk_streamed:
-            # Disk RunPipelined slices activations at 2048 padded routes while
-            # retaining each weight group across slices, even under route skew.
-            capacity = min(capacity, 2048)
+        # Match RunPipelined's padded route bound, including worst-case skew.
+        # Expert weights remain uploaded across these activation-only slices.
+        capacity = min(math.ceil((rows * topk + 8 * 15) / 16) * 16,
+                       2048 if disk_streamed else 4096)
+        # Full-chunk input quantization and BF16 route partials still scale with
+        # rows. Route lists, indices/scores and aligned per-slice descriptors do
+        # too; the 16 MiB allocation quantum is not a metadata capacity limit.
+        metadata = rows * topk * 16 + model.experts * 2048
         streamed_scratch = (rows * model.hidden * 296 // 256 +
                             capacity * (math.ceil(max(model.hidden, model.intermediate) / 256) * 288 +
                                         max(model.hidden, 2 * model.intermediate) * 4) +
-                            rows * topk * model.hidden * 2 + 16 * MiB)
+                            rows * topk * model.hidden * 2 + metadata + 16 * MiB)
         # Raw/canonical weight rings and lookahead are accounted in transport.
         # Keep the 256 MiB dense dequant fallback independent of those rings.
         woa = max(woa, rows * phase["woa"] + 256 * MiB)
@@ -1464,7 +1467,8 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
             # conservative fallback budget below.
             if (args.chunked_prefill_size == "auto" and canonical_gguf and gguf_mmq and
                     (shared_host or _disk_v41_streamed_mmq(args, model, 4096, max(model.topk, args.moe_experts))) and
-                    mode == "pp" and resident < model.layers and rows > 4096 and
+                    mode == "pp" and resident < model.layers and
+                    not _v41_streamed_mmq(model, rows, max(model.topk, args.moe_experts)) and
                     args.fast_prefill and args.atype in ("auto", "bfloat16") and
                     args.moe_atype in ("", "auto", "bfloat16") and
                     _v41_streamed_mmq(model, 4096, max(model.topk, args.moe_experts))):

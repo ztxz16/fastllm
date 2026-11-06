@@ -4,6 +4,10 @@
 #include <cuda_runtime_api.h>
 
 namespace fastllm_gguf_mmq {
+// Padded routes, not input tokens. Both are tile-aligned and below grid.y's
+// 65535 limit. Keep hybrid_auto.py's streamed scratch bounds in sync.
+constexpr int kV41StreamedRoutes = 4096;
+constexpr int kV41DiskStreamedRoutes = 2048;
 struct StreamedMoeBatch {
     int experts = 0, rows = 0;
     const uint8_t *const *weights = nullptr;

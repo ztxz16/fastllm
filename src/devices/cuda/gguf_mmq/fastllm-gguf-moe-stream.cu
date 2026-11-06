@@ -214,6 +214,8 @@ static bool RunPipelined(const fastllm::Data &input, fastllm::Data &gate,
     // V4.1's mixed Q2_0/Q4_K layers have larger records than low-bit gates.
     // Bound both upload rings so they fit the hybrid transport reservation.
     const int batchExperts = nativeV41 ? 8 : Pipeline::experts;
+    const int routeCapacity = disk ? kV41DiskStreamedRoutes : nativeV41 ? kV41StreamedRoutes :
+        glm5 ? INT32_MAX : workspace.cudaWorkspace ? 4096 : 65520;
     size_t metaBytes = 0;
     auto reserve = [&](size_t bytes) { const size_t at = metaBytes; metaBytes += Align(bytes); return at; };
     for (size_t begin = 0; begin < order.size(); begin += batchExperts) {
@@ -230,8 +232,7 @@ static bool RunPipelined(const fastllm::Data &input, fastllm::Data &gate,
             // SSD reads nor H2D copies are repeated by this workspace bound.
             // CUDA grid.y is limited to 65535. Keep weights uploaded once,
             // slicing only skewed route groups when a larger prompt needs it.
-            int remaining = disk ? 2048 : workspace.cudaWorkspace && !glm5 && !nativeV41
-                ? 4096 : (!glm5 && !nativeV41 ? 65520 : INT32_MAX);
+            int remaining = routeCapacity;
             more = false;
             for (size_t j = 0; j < batch.experts.size(); ++j) {
                 const auto &selected = routes[batch.experts[j]];
@@ -278,10 +279,16 @@ static bool RunPipelined(const fastllm::Data &input, fastllm::Data &gate,
     // A pooled buffer must not grow a little at each layer and strand every
     // previous allocation. Bound routing metadata and projection capacity by
     // the request shape; only ownership changes, logical GEMM routes do not.
-    constexpr size_t pooledMetadata = 2 * size_t(1024 * 1024);
+    // Full-chunk route IDs/scores survive all slices. Include their growth
+    // even when projections borrow a pooled/phase workspace.
+    const size_t pooledMetadata = nativeV41
+        ? std::max(2 * size_t(1024 * 1024), Align(size_t(rows) * topk * 16 + size_t(expertCount) * 2048))
+        : 2 * size_t(1024 * 1024);
     if (!direct && metaBytes > pooledMetadata) return false;
     const size_t computeOffset = metaOffset + (direct ? metaBytes : pooledMetadata);
-    const int allocationCapacity = (direct || workspace.cudaWorkspace)
+    const int allocationCapacity = nativeV41
+        ? std::min(routeCapacity, (rows * topk + 15 * batchExperts + 15) / 16 * 16)
+        : (direct || workspace.cudaWorkspace)
         ? capacity : rows * topk + 15 * batchExperts;
     // Borrowed prefill arenas opt into compact scratch; other models retain
     // their existing workspace contract and activation materialization.
@@ -686,11 +693,12 @@ bool FastllmCudaMergeMOEGGUFHost(const fastllm::Data &input,
     using namespace fastllm_gguf_stream;
     using fastllm_gguf_moe::AllocateTensor;
     if (!weights || !indices || !scores || input.dims.size() != 2 ||
-        input.dims[0] <= 32 || input.dims[0] > 8192 || topk <= 0 || topk > 32 ||
+        input.dims[0] <= 32 || topk <= 0 || topk > 32 ||
         expertCount <= 0 || expertCount > 1024 || experts.empty() || experts.count(0) ||
         input.dataDevice != fastllm::CUDA || !input.cudaData ||
         !fastllm_gguf_moe::IsActivationType(input.dataType)) return false;
     const bool glm5 = deepSeekV4Mode && activationQuantBlock == 128;
+    if (input.dims[0] > 8192 && (!deepSeekV4Mode || activationQuantBlock != 32)) return false;
     // GLM keeps positive Q8_K scales without V4.1's FP8 block-32 conversion.
     if (deepSeekV4Mode && ((activationQuantBlock != 32 && !glm5) ||
         input.dataType != fastllm::BFLOAT16)) return false;
@@ -722,7 +730,7 @@ bool FastllmCudaMergeMOEGGUFHost(const fastllm::Data &input,
     }
     // Native V4.1 Q8_1 arithmetic differs from the Q8_K host path below.
     // Reuse the resident projection kernels, but upload only bounded groups.
-    if (deepSeekV4Mode && !glm5 && FastllmCudaV41GGUFGroupedWorkspaceBytes(
+    if (deepSeekV4Mode && !glm5 && FastllmCudaV41GGUFStreamedSupported(
             gt, dt, rows, hidden, inter, expertCount, topk))
         return RunPipelined(input, gate, workspace, output, weights, expertCount,
             indices, scores, topk, experts, crossSwiglu, gt, dt, inter, false, swigluLimit, true);
@@ -843,7 +851,9 @@ static bool MergeMOEGGUFDisk(const fastllm::Data &input,
     using namespace fastllm_gguf_stream;
     if (!weights || !indices || !scores || !source.read || !source.release || !source.staging ||
         input.dataType != (v41 ? fastllm::BFLOAT16 : fastllm::FLOAT32) || input.dataDevice != fastllm::CUDA ||
-        !input.cudaData || input.dims.size() != 2 || expertCount <= 0 || topk <= 0 ||
+        !input.cudaData || input.dims.size() != 2 || expertCount <= 0 || expertCount > 1024 ||
+        topk <= 0 || topk > 32 || input.dims[0] <= 32 ||
+        int64_t(input.dims[0]) * topk > INT32_MAX - 255 ||
         source.residents.size() != size_t(2 * expertCount)) return false;
     std::unordered_set<int> experts;
     for (int r = 0; r < input.dims[0] * topk; ++r) {
@@ -863,11 +873,11 @@ static bool MergeMOEGGUFDisk(const fastllm::Data &input,
     // IQ1_M gate has a disk-only Q8 dot fallback; an IQ1_M down matrix still
     // uses the ordinary expert path. Other backends retain their admission.
     if (!v41 && dt == GGML_TYPE_IQ1_M) return false;
-    const size_t bytes = v41 ? FastllmCudaV41GGUFGroupedWorkspaceBytes(gt, dt,
+    const bool supported = v41 ? FastllmCudaV41GGUFStreamedSupported(gt, dt,
         input.dims[0], input.dims[1], inter, expertCount, topk) :
         FastllmCudaMoeGGUFGroupedWorkspaceBytes(gt, dt, input.dims[0], input.dims[1],
-            inter, expertCount, topk, false);
-    if (!bytes) return false;
+            inter, expertCount, topk, false) != 0;
+    if (!supported) return false;
     fastllm::Data gate;
     return RunPipelined(input, gate, workspace, output, weights, expertCount,
         indices, scores, topk, experts, false, gt, dt, inter, false, swigluLimit, v41, &source);

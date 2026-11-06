@@ -2980,7 +2980,7 @@ namespace fastllm {
 
     void PrefetchDiskMoeV41(const std::vector<Data *> &weights, int rows) {
 #if defined(USE_CUDA) && !defined(USE_ROCM)
-        if (rows <= 32 || rows > 4096 || weights.size() < 4 || !weights[2] ||
+        if (rows <= 32 || weights.size() < 4 || !weights[2] ||
             !weights[2]->isDiskWeight || weights[2]->dataType != DATA_GGUF_FORMAT ||
             !DiskMoeGpuPrefillEnabled() || rows < DiskMoeGpuPrefillMinTokens()) return;
         auto &cache = GetDiskExpertCache();
@@ -4316,7 +4316,7 @@ namespace fastllm {
 #if defined(USE_CUDA) && !defined(USE_ROCM)
         if (input.dataType != BFLOAT16 || input.dataDevice != CUDA || !input.cudaData ||
             input.multiDeviceData || input.dims.size() != 2 ||
-            input.dims[0] <= 32 || input.dims[0] > 4096 ||
+            input.dims[0] <= 32 ||
             !DiskMoeGpuPrefillEnabled() || input.dims[0] < DiskMoeGpuPrefillMinTokens() ||
             weights.size() < 4 || weights.size() % 2 || weights[0] || weights[1] ||
             index.dataType != INT32 || score.dataType != FLOAT32 ||
@@ -4326,6 +4326,9 @@ namespace fastllm {
         for (size_t e = 2; e < weights.size(); e += 2)
             if (!weights[e] || !weights[e + 1] || !weights[e]->isDiskWeight ||
                 !weights[e + 1]->isDiskWeight || !DiskV41GGUFPair(*weights[e], *weights[e + 1])) return false;
+        if (!FastllmCudaV41GGUFStreamedSupported(weights[2]->ggmlType, weights[3]->ggmlType,
+                input.dims[0], input.dims[1], weights[3]->dims[1], weights.size() / 2 - 1,
+                index.dims[1])) return false;
         // Only routing metadata needs host bucketing. Keep activation ownership
         // and the resident output independent of the CPU executor's placement.
         Data hostIndex, hostScore;
@@ -4552,7 +4555,10 @@ namespace fastllm {
         // also queue anonymous expert records for the same misses.
 #if defined(USE_CUDA) && !defined(USE_ROCM)
         const bool ordinaryStream = nativeOrdinaryGGUF && input.dataType == FLOAT32;
-        if ((nativeV41GGUF || ordinaryStream) && device >= 0 && tokens > 32 && tokens <= 4096 &&
+        const bool v41Stream = nativeV41GGUF && device >= 0 &&
+            FastllmCudaV41GGUFStreamedSupported(weights[2]->ggmlType, weights[3]->ggmlType,
+                tokens, input.dims[1], weights[3]->dims[1], count, topk);
+        if ((v41Stream || (ordinaryStream && tokens <= 4096)) && device >= 0 && tokens > 32 &&
             DiskMoeGpuPrefillEnabled() && tokens >= DiskMoeGpuPrefillMinTokens()) {
             FastllmCudaV41DiskExperts source;
             auto &staging = cache.ggufStaging[device];
