@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import select
 import socket
 import struct
 import subprocess
@@ -17,7 +18,7 @@ import unittest
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
-from qwen3_process_session import BACKEND, EMPTY, GenerationRejected, Qwen3ProcessSession
+from qwen3_process_session import BACKEND, EMPTY, GenerationCancelled, GenerationRejected, Qwen3ProcessSession
 import qwen3_process_chat as chat
 import run_qwen3_session as runner
 from run_qwen3_prefill import make_model
@@ -28,6 +29,7 @@ def fixture():
     args = dict(zip(sys.argv[1::2], sys.argv[2::2]))
     mode = Path(args["--model"]).name
     channel = socket.socket(fileno=int(args["--session-fd"]))
+    cancellation = socket.socket(fileno=int(args["--cancel-fd"]))
     workers = [dict(rank=i, device=i, pid=os.getpid()+i) for i in range(2)]
     cache = [EMPTY.copy(), EMPTY.copy()]
 
@@ -49,7 +51,7 @@ def fixture():
 
     print("NCCL INFO simulated noisy stdout", flush=True)
     send(dict(event="ready", status="PASS", protocol=1, backend=BACKEND,
-              model_load_count=1, workers=workers, cache=cache))
+              model_load_count=1, workers=workers, cache=cache, cancellation="request_id_datagram"))
     while True:
         try:
             message = json.loads(read(struct.unpack("!I", read(4))[0]))
@@ -75,6 +77,15 @@ def fixture():
         result = dict(event="result", id=message["id"], status="PASS", backend=BACKEND,
                       workers=workers, reusable=True, request=request, token_ids=[request["token_ids"][0]],
                       finish_reason="length", cache_after_generate=cache)
+        if mode == "cancel" and request.get("max_new_tokens", 1) > 1:
+            while True:
+                if select.select([cancellation], [], [], 5)[0]:
+                    cancelled_id = struct.unpack("!I", cancellation.recv(4))[0]
+                    if cancelled_id == message["id"]:
+                        break
+                else:
+                    raise RuntimeError("fixture cancellation timed out")
+            result.update(status="FAIL", cancelled=True, error="generation cancelled", cache_after_error=cache)
         if request.get("max_new_tokens") == 0:
             result.update(status="FAIL", error="invalid generation length", cache_after_error=cache)
         if mode == "bad_id":
@@ -128,6 +139,40 @@ class SessionTests(unittest.TestCase):
             results = [future.result() for future in futures]
             self.assertEqual([r["token_ids"] for r in results], [[i] for i in range(8)])
             self.assertEqual(sorted(r["id"] for r in results), list(range(1, 9)))
+
+    def test_cancellation_releases_kv_and_preserves_workers(self):
+        import threading
+        with self.session("cancel") as session:
+            workers = session.ready["workers"]
+            event = threading.Event()
+            timer = threading.Timer(0.1, event.set)
+            timer.start()
+            try:
+                with self.assertRaises(GenerationCancelled) as caught:
+                    session.generate(dict(self.request, max_new_tokens=16), cancel_event=event)
+                self.assertEqual(caught.exception.report["cache_after_error"], [EMPTY, EMPTY])
+            finally:
+                timer.cancel()
+                timer.join()
+            self.assertEqual(session.state, "ready")
+            self.assertEqual(session.generate(self.request)["workers"], workers)
+
+    def test_late_cancel_id_does_not_affect_following_request(self):
+        import threading
+        with self.session("cancel") as session:
+            session.generate(self.request)
+            session._cancel_socket.send(struct.pack("!I", 1))
+            event = threading.Event()
+            timer = threading.Timer(0.2, event.set)
+            timer.start()
+            start = time.monotonic()
+            try:
+                with self.assertRaises(GenerationCancelled):
+                    session.generate(dict(self.request, max_new_tokens=16), cancel_event=event)
+                self.assertGreaterEqual(time.monotonic() - start, 0.15)
+            finally:
+                timer.cancel()
+                timer.join()
 
     def test_invalid_local_request_does_not_poison_session(self):
         with self.session() as session:

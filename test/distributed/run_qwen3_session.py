@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import shlex
 import sys
+import threading
 import uuid
 
 from run_process_tp import ROOT, capture, save_report
@@ -16,7 +17,7 @@ from run_qwen3_prefill import compare_logits, make_model, require, report_error
 from run_qwen3_generation import candidates, replay_tasks
 from run_qwen3_decode import invoke, verify as verify_decode
 from qwen3_layer_reference import prefill
-from qwen3_process_session import BACKEND, GenerationRejected, Qwen3ProcessSession
+from qwen3_process_session import BACKEND, GenerationCancelled, GenerationRejected, Qwen3ProcessSession
 
 
 def verify_output(report, request, vocab):
@@ -55,7 +56,7 @@ def main():
         git_status=capture(["git", "status", "--short"]), seed=123, warmup=0, iterations=1, repeats=1,
         gpu=capture(["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv,noheader"]),
         cuda_visible_devices=os.environ.get("CUDA_VISIBLE_DEVICES"), devices=devices,
-        expected_case_count=len(specs)*10, execution="eager", prefix_cache=False, kv_cache="FP16 request-local",
+        expected_case_count=len(specs)*12, execution="eager", prefix_cache=False, kv_cache="FP16 request-local",
         report_title="Qwen3 persistent session correctness",
         report_description="同一常驻进程组串行处理请求；小模型对照CPU，真实模型逐步单卡重放。非性能测试。")
     rows = []
@@ -74,7 +75,8 @@ def main():
                      ("reject_length", dict(base, max_new_tokens=0)), ("reject_empty", dict(base, token_ids=[])),
                      ("A_after_reject", base),
                      ("eos_first", None), ("seeded", dict(base, temperature=0.8, top_k=5, top_p=0.9)),
-                     ("seeded_repeat", dict(base, temperature=0.8, top_k=5, top_p=0.9))]
+                     ("seeded_repeat", dict(base, temperature=0.8, top_k=5, top_p=0.9)),
+                     ("cancel_before_begin", base), ("A_after_cancel", base)]
             previous = {}
             with Qwen3ProcessSession(args.generate, args.worker, model, args.devices, directory / "session", trace=True) as session:
                 for task_name, request in tasks:
@@ -90,7 +92,17 @@ def main():
                             require("A" in previous, "first request failed; cannot determine EOS")
                             request = dict(base, eos_token_ids=[previous["A"]["token_ids"][0]])
                         row.update(prompt_tokens=len(request["token_ids"]), max_new_tokens=request["max_new_tokens"])
-                        if task_name in ("reject_length", "reject_empty"):
+                        if task_name == "cancel_before_begin":
+                            event = threading.Event()
+                            event.set()
+                            try:
+                                session.generate(request, cancel_event=event)
+                            except GenerationCancelled as error:
+                                require(not error.report.get("steps"), "pre-cancelled request executed tokens")
+                                row.update(status="PASS", reason="cancelled before prefill; KV empty and workers reusable")
+                            else:
+                                raise AssertionError("pre-cancelled request was executed")
+                        elif task_name in ("reject_length", "reject_empty"):
                             try:
                                 session.generate(request)
                             except GenerationRejected as error:
@@ -104,7 +116,7 @@ def main():
                             if task_name == "eos_first":
                                 require(len(report["token_ids"]) == 1 and report["finish_reason"] == "eos",
                                         "first EOS did not stop generation")
-                            if task_name in ("A_repeat", "A_after_reject", "seeded_repeat"):
+                            if task_name in ("A_repeat", "A_after_reject", "A_after_cancel", "seeded_repeat"):
                                 original = "seeded" if task_name == "seeded_repeat" else "A"
                                 require(original in previous and report["token_ids"] == previous[original]["token_ids"],
                                         "request state/seed changed across session reuse")

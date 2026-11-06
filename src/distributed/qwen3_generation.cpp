@@ -78,7 +78,8 @@ uint32_t SampleQwen3(const std::vector<float> &logits,
 
 Qwen3GenerationResult GenerateQwen3(ProcessGroup &group, const std::vector<uint32_t> &prompt,
     const Qwen3GenerationOptions &options,
-    const std::function<void(uint32_t, const std::vector<float>&)> &observer) {
+    const std::function<void(uint32_t, const std::vector<float>&)> &observer,
+    const std::function<bool()> &cancelled) {
     ValidateSampling(options);
     if (prompt.empty() || prompt.size() > 128 || options.maxNewTokens == 0 ||
         uint64_t(prompt.size()) + options.maxNewTokens - 1 > 2048) {
@@ -94,6 +95,7 @@ Qwen3GenerationResult GenerateQwen3(ProcessGroup &group, const std::vector<uint3
     std::mt19937_64 random(options.seed);
     bool ownsRequest = false;
     try {
+        if (cancelled && cancelled()) throw Qwen3GenerationCancelled();
         auto logits = group.BeginQwen3Request(prompt, uint32_t(prompt.size() + options.maxNewTokens - 1));
         ownsRequest = true;
         for (auto eos : options.eosTokenIds) {
@@ -102,6 +104,7 @@ Qwen3GenerationResult GenerateQwen3(ProcessGroup &group, const std::vector<uint3
             }
         }
         for (uint32_t step = 0; step < options.maxNewTokens; ++step) {
+            if (cancelled && cancelled()) throw Qwen3GenerationCancelled();
             // 显式定义 53-bit 均匀采样，避免 uniform_real_distribution 的标准库差异。
             double uniform = double(random() >> 11) * (1.0 / 9007199254740992.0);
             uint32_t token = SampleQwen3(logits, options, uniform);
@@ -117,6 +120,7 @@ Qwen3GenerationResult GenerateQwen3(ProcessGroup &group, const std::vector<uint3
                 result.finishReason = "length";
                 break;
             }
+            if (cancelled && cancelled()) throw Qwen3GenerationCancelled();
             logits = group.DecodeQwen3(token);
         }
         group.EndQwen3Request();
