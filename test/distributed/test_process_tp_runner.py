@@ -10,8 +10,10 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 import run_process_tp as runner
+from linux_process import check_pidfd_support, open_pidfd, send_pidfd_signal
 
 
 def fixture_worker(mode, parent):
@@ -27,7 +29,7 @@ def fixture_worker(mode, parent):
 
 
 def fixture_parent(mode, identity_path):
-    worker_mode = "watch" if mode == "parent_death" else "stop"
+    worker_mode = "watch" if mode in ("parent_death", "parent_death_chunked") else "stop"
     worker = subprocess.Popen([sys.executable, __file__, "--worker", worker_mode,
                                str(os.getpid()), str(identity_path)], stdout=subprocess.PIPE)
     if worker_mode == "watch":
@@ -48,7 +50,14 @@ def fixture_parent(mode, identity_path):
     else:
         if mode == "bad_startup":
             data["workers"].append({"pid": 0})
-        print(json.dumps(data), flush=True)
+        if mode == "parent_death_chunked":
+            data["note"] = '中文、括号 {} 和引号 "'
+            print("startup log before JSON", flush=True)
+            for line in json.dumps(data, ensure_ascii=False, indent=2).splitlines():
+                print(line, flush=True)
+                time.sleep(0.01)
+        else:
+            print(json.dumps(data, indent=2), flush=True)
     if mode in ("success", "invalid_output", "nonzero"):
         return 7 if mode == "nonzero" else 0
     if mode in ("interrupt", "interrupt_startup"):
@@ -70,13 +79,13 @@ class RunnerCleanupTest(unittest.TestCase):
             identities = json.loads(path.read_text(encoding="utf-8"))
             for pid in identities.values():
                 try:
-                    fd = os.pidfd_open(pid)
+                    fd = open_pidfd(pid)
                 except ProcessLookupError:
                     continue
                 try:
                     command = Path(f"/proc/{pid}/cmdline").read_bytes()
                     if str(self.output).encode() in command:
-                        signal.pidfd_send_signal(fd, signal.SIGKILL)
+                        send_pidfd_signal(fd, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
                 finally:
@@ -118,6 +127,28 @@ class RunnerCleanupTest(unittest.TestCase):
         self.assertEqual(row["status"], "PASS", row)
         self.assert_reaped("success")
 
+    def test_single_line_report(self):
+        command = [sys.executable, "-c", 'print(\'{"status": "PASS"}\')']
+        row = runner.run_case("compact", command, self.output, 5)
+        self.assertEqual(row["status"], "PASS", row)
+
+    def test_multiline_report_after_logs_preserves_values(self):
+        data = {"status": "PASS", "actual": [3.0, 3.0], "max_abs_error": 0.0, "failed_elements": 0}
+        text = "NCCL INFO fixture log\n" + json.dumps(data, indent=2)
+        command = [sys.executable, "-c", f"print({text!r})"]
+        row = runner.run_case("pretty", command, self.output, 5)
+        for key, value in data.items():
+            self.assertEqual(row[key], value)
+
+    def test_truncated_or_trailing_output_cannot_pass(self):
+        for text in ('{"status": "PASS", "nested": {"status": "PASS"}',
+                     '{"nested":\n  {"status": "PASS"}',
+                     '{"status": "PASS"}\ntrailing error', '[{"status": "PASS"}]'):
+            with self.subTest(output=text):
+                command = [sys.executable, "-c", f"print({text!r})"]
+                row = runner.run_case("invalid_json", command, self.output, 5)
+                self.assertEqual(row["status"], "FAIL", row)
+
     def test_invalid_output_cleans_remaining_workers(self):
         row = runner.run_case("invalid_output", self.command("invalid_output"), self.output, 5)
         self.assertEqual(row["status"], "FAIL")
@@ -137,6 +168,36 @@ class RunnerCleanupTest(unittest.TestCase):
         row = runner.parent_death_case(self.command("parent_death"), 5, self.output)
         self.assertEqual(row["status"], "PASS", row)
         self.assert_reaped("parent_death")
+
+    def test_parent_death_reads_chunked_multiline_report(self):
+        row = runner.parent_death_case(self.command("parent_death_chunked"), 5, self.output)
+        self.assertEqual(row["status"], "PASS", row)
+        self.assert_reaped("parent_death_chunked")
+
+    def test_parent_death_without_python_pidfd_apis(self):
+        with mock.patch.object(os, "pidfd_open", None, create=True), \
+                mock.patch.object(signal, "pidfd_send_signal", None, create=True):
+            check_pidfd_support()
+            row = runner.parent_death_case(self.command("parent_death"), 5, self.output)
+            self.assertEqual(row["status"], "PASS", row)
+            self.assert_reaped("parent_death")
+
+    def test_pidfd_fallback_signals_and_preserves_errno(self):
+        with mock.patch.object(os, "pidfd_open", None, create=True), \
+                mock.patch.object(signal, "pidfd_send_signal", None, create=True):
+            with runner.case_process([sys.executable, "-c", "import time; time.sleep(120)"]) as process:
+                fd = open_pidfd(process.pid)
+                try:
+                    self.assertFalse(os.get_inheritable(fd))
+                    send_pidfd_signal(fd, signal.SIGKILL)
+                    self.assertEqual(runner.wait_case(process, 5), -signal.SIGKILL)
+                finally:
+                    os.close(fd)
+            with self.assertRaises(ProcessLookupError):
+                open_pidfd(process.pid)
+            with self.assertRaises(OSError) as caught:
+                send_pidfd_signal(-1, 0)
+            self.assertEqual(caught.exception.errno, 9)  # EBADF
 
     def test_parent_death_cannot_pass_by_killing_worker(self):
         row = runner.parent_death_case(self.command("stopped_parent_death"), 5, self.output)

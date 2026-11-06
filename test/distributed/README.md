@@ -10,7 +10,8 @@ NCCL 初始化和标量 SUM 自检、心跳、超时、退出与故障回收。
 ## 运行条件
 
 - Linux 5.3+，内核与容器策略允许 `pidfd_open`、`pidfd_send_signal`。
-- Python 3.9+（父进程死亡测试使用 Python 的 pidfd 接口）。
+- Python 3.9+。部分 Conda Python 没有暴露 pidfd 接口，验收器在 Linux x86_64/aarch64
+  上通过系统调用提供同等语义；仍需内核和容器允许 pidfd，不退回裸 PID 发信号。
 - 验收器须允许 `prctl(PR_SET_CHILD_SUBREAPER)`，以回收协调器死亡后的孤儿 worker。
 - CUDA/NCCL 检查需要 NVIDIA GPU、CUDA 开发环境及 NCCL 头文件和库。
 - 设备编号是 `CUDA_VISIBLE_DEVICES` 生效后的逻辑编号；不能重复指定同一 GPU。
@@ -71,6 +72,8 @@ PYTHONDONTWRITEBYTECODE=1 python3 test/distributed/run_process_tp.py --frontend-
 - Python 回归实际创建 SIGSTOP 子进程，检查超时、错误输出、非零退出、Ctrl+C、父进程
   死亡及启动失败后的回收和日志；同时确认不会清理或回收其他 case 的进程。
 - 父进程死亡测试先只杀协调器，观察 worker 自行退出；兜底清理不能替代这项断言。
+- 报告读取支持 json11 的多行 JSON 和前置日志；父进程死亡握手等待完整 JSON，
+  同时保留截止时间、输出大小限制及失败时的部分日志。
 - CUDA 路径每卡提交 FP32 标量 `rank + 1`，检查真实 NCCL SUM 输出。
   例如两卡每卡均须返回 `3`，四卡均须返回 `10`；记录最大/平均绝对误差和失败元素数。
 - CUDA 检查没有 CPU fallback，缺少 CUDA 或 NCCL 时失败。
