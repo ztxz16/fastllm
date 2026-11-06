@@ -45,6 +45,7 @@ struct DeviceRuntime {
     bool controlOnly;
     bool cudaGraph;
     bool customAllReduce;
+    bool prefixCache;
 #ifdef FASTLLM_PROCESS_TP_CUDA
     cudaStream_t stream = nullptr;
     ncclComm_t comm = nullptr;
@@ -235,7 +236,7 @@ struct DeviceRuntime {
             memcpy(&input[i], &bits, sizeof(bits));
         }
         if (!layerExecutor) {
-            layerExecutor = std::make_unique<fastllm::distributed::Qwen3LayerExecutor>(*weights, stream, comm, *allReduce, cudaGraph);
+            layerExecutor = std::make_unique<fastllm::distributed::Qwen3LayerExecutor>(*weights, stream, comm, *allReduce, cudaGraph, prefixCache);
         }
         auto output = layerExecutor->Forward(Get32(payload, 0), Get32(payload, 4), Get32(payload, 8),
             Get32(payload, 12), static_cast<fastllm::distributed::Qwen3LayerStage>(Get32(payload, 16)), input);
@@ -274,7 +275,7 @@ struct DeviceRuntime {
             ids.push_back(Get32(payload, offset));
         }
         if (!layerExecutor) {
-            layerExecutor = std::make_unique<fastllm::distributed::Qwen3LayerExecutor>(*weights, stream, comm, *allReduce, cudaGraph);
+            layerExecutor = std::make_unique<fastllm::distributed::Qwen3LayerExecutor>(*weights, stream, comm, *allReduce, cudaGraph, prefixCache);
         }
         auto logits = decode ? layerExecutor->Decode(Get32(payload, 0)) :
             begin ? layerExecutor->BeginRequest(ids, Get32(payload, 8), Get32(payload, 0)) :
@@ -295,16 +296,22 @@ struct DeviceRuntime {
     }
 
     /** 查询或同步释放唯一请求 KV；未加载模型也返回全零状态，禁止 control-only。 */
-    std::vector<uint8_t> RequestState(bool end) {
+    std::vector<uint8_t> RequestState(bool end, bool clearPrefix = false) {
         if (controlOnly) {
             throw std::runtime_error("Qwen3 request requires CUDA");
         }
 #ifdef FASTLLM_PROCESS_TP_CUDA
+        if (clearPrefix && prefixCache && weights && !layerExecutor) {
+            layerExecutor = std::make_unique<fastllm::distributed::Qwen3LayerExecutor>(
+                *weights, stream, comm, *allReduce, cudaGraph, prefixCache);
+        }
         if (end && layerExecutor) {
             layerExecutor->EndRequest();
         }
+        if (clearPrefix && layerExecutor) layerExecutor->ClearPrefixCache();
         auto info = layerExecutor ? layerExecutor->RequestInfo() : fastllm::distributed::Qwen3RequestInfo{};
         if (!layerExecutor) info.graph.enabled = cudaGraph;
+        if (!layerExecutor) info.prefix.enabled = prefixCache;
         std::vector<uint8_t> result;
         Put32(result, info.active);
         Put32(result, info.tokens);
@@ -324,6 +331,16 @@ struct DeviceRuntime {
         Put64(result, ar.customCalls);
         Put64(result, ar.ncclCalls);
         Put64(result, ar.workspaceBytes);
+        Put32(result, info.prefix.enabled);
+        Put32(result, info.prefix.entries);
+        Put64(result, info.prefix.deviceBytes);
+        Put64(result, info.prefix.lookups);
+        Put64(result, info.prefix.hits);
+        Put64(result, info.prefix.reusedTokens);
+        Put64(result, info.prefix.lastReusedTokens);
+        Put64(result, info.prefix.lastComputedTokens);
+        Put64(result, info.prefix.evictions);
+        Put64(result, info.prefix.clears);
         return result;
 #else
         throw std::runtime_error("worker built without CUDA");
@@ -360,10 +377,11 @@ int main(int argc, char **argv) {
                 throw std::runtime_error("invalid/duplicate worker arguments");
             }
         }
-        if (args.size() != 9 || args.at("--control-fd") != uint64_t(kWorkerFd) ||
+        if (args.size() != 10 || args.at("--control-fd") != uint64_t(kWorkerFd) ||
             args.at("--world-size") == 0 || args.at("--world-size") > 1024 ||
             args.at("--rank") >= args.at("--world-size") || args.at("--device") > INT_MAX ||
             args.at("--control-only") > 1 || args.at("--cuda-graph") > 1 || args.at("--custom-allreduce") > 1 ||
+            args.at("--prefix-cache") > 1 || (args.at("--control-only") && args.at("--prefix-cache")) ||
             (args.at("--custom-allreduce") && (args.at("--world-size") != 2 || args.at("--control-only"))) ||
             (args.at("--control-only") && args.at("--cuda-graph")) || args.at("--parent-pid") == 0 ||
             args.at("--parent-pid") > INT_MAX || args.at("--session") == 0) {
@@ -391,7 +409,7 @@ int main(int argc, char **argv) {
         int world = static_cast<int>(args.at("--world-size"));
         int device = static_cast<int>(args.at("--device"));
         DeviceRuntime runtime{args.at("--control-only") != 0, args.at("--cuda-graph") != 0,
-                              args.at("--custom-allreduce") != 0};
+                              args.at("--custom-allreduce") != 0, args.at("--prefix-cache") != 0};
         runtime.Bind(device);
 
         std::vector<uint8_t> hello;
@@ -437,11 +455,13 @@ int main(int argc, char **argv) {
             switch (message.kind) {
                 case Kind::EndQwen3Request:
                 case Kind::QueryQwen3Request:
+                case Kind::ClearQwen3Prefix:
                     if (!initialized) {
                         throw std::runtime_error("Qwen3 request state before Initialize");
                     }
-                    payload = runtime.RequestState(message.kind == Kind::EndQwen3Request);
-                    response = message.kind == Kind::EndQwen3Request ? Kind::Qwen3RequestEnded : Kind::Qwen3RequestState;
+                    payload = runtime.RequestState(message.kind == Kind::EndQwen3Request, message.kind == Kind::ClearQwen3Prefix);
+                    response = message.kind == Kind::ClearQwen3Prefix ? Kind::Qwen3PrefixCleared :
+                        message.kind == Kind::EndQwen3Request ? Kind::Qwen3RequestEnded : Kind::Qwen3RequestState;
                     break;
                 case Kind::BeginQwen3Request:
                 case Kind::DecodeQwen3:

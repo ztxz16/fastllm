@@ -18,8 +18,9 @@ public:
      * @param comm 已初始化的 TP 通信组。
      * @param allReduce 与执行器共享 stream 的规约器；须晚于全部请求图释放。
      * @param cudaGraph true 时单 token Decode 使用严格 CUDA Graph；Prefill 保持 Eager。
+     * @param prefixCache 是否保留跨请求 Prompt KV 快照；模型卸载时释放。
      */
-    Qwen3LayerExecutor(const Qwen3DeviceWeights &weights, cudaStream_t stream, ncclComm_t comm, ProcessAllReduce &allReduce, bool cudaGraph = false);
+    Qwen3LayerExecutor(const Qwen3DeviceWeights &weights, cudaStream_t stream, ncclComm_t comm, ProcessAllReduce &allReduce, bool cudaGraph = false, bool prefixCache = false);
     ~Qwen3LayerExecutor();
     Qwen3LayerExecutor(const Qwen3LayerExecutor&) = delete;
     Qwen3LayerExecutor &operator=(const Qwen3LayerExecutor&) = delete;
@@ -52,7 +53,8 @@ public:
     std::vector<float> Prefill(const std::vector<uint32_t> &tokenIds, uint32_t positionBegin);
 
     /**
-     * 分配单请求各层 FP16 KV 并执行 Prefill；失败必须终止 worker。
+     * 分配单请求各层 FP16 KV；可选复制最长前缀后计算后缀，成功后保存 Prompt 快照。
+     * 至少重算末 token，失败必须终止 worker；快照不包含后续 Decode token。
      * @param tokenIds 1..128 个合法 ID。
      * @param capacity 1..2048，覆盖 Prompt 和后续 token；每 rank KV 总上限 256 MiB。
      * @param positionBegin 起点，容量末位置不得超过 1048576。
@@ -67,10 +69,13 @@ public:
     /** 同步销毁请求 Graph 并释放固定工作区及 KV；保留累计执行计数，允许重复调用。 */
     void EndRequest();
 
-    /** @return 实际 KV 分配/有效长度与 Graph 执行计数、固定工作区字节。 */
+    /** 同步清空所有不可变前缀快照；保留命中计数，不影响独立的活动请求 KV 或 Graph。 */
+    void ClearPrefixCache();
+
+    /** @return 请求 KV、Graph 计数/工作区及前缀快照计数/显存字节。 */
     Qwen3RequestInfo RequestInfo() const;
 
-    /** 同步释放请求 KV、工作区和 cuBLAS handle；必须在权重卸载前调用，失败须终止 worker。 */
+    /** 同步释放请求 KV、前缀快照、工作区和 cuBLAS handle；必须在权重卸载前调用，失败须终止 worker。 */
     void Clear();
 
 private:

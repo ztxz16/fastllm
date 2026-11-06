@@ -23,6 +23,7 @@ struct ProcessGroupOptions {
     // 组内全部 worker 使用相同 Decode Graph 模式；不支持与 controlOnly 组合。
     bool cudaGraph = false;
     bool customAllReduce = false; // 严格要求双卡 P2P；大消息显式走 NCCL。
+    bool prefixCache = false; // 模型内跨请求 Prompt 快照；至多 8 条、每 rank 64 MiB。
 };
 
 struct ProcessWorkerInfo {
@@ -52,12 +53,21 @@ struct ProcessAllReduceInfo {
     uint64_t customCalls = 0, ncclCalls = 0, workspaceBytes = 0;
 };
 
+/** 模型生命周期的前缀缓存证据；清空快照保留计数，卸载模型全部清零。 */
+struct Qwen3PrefixInfo {
+    bool enabled = false;
+    uint32_t entries = 0;
+    uint64_t deviceBytes = 0, lookups = 0, hits = 0, reusedTokens = 0;
+    uint64_t lastReusedTokens = 0, lastComputedTokens = 0, evictions = 0, clears = 0;
+};
+
 struct Qwen3RequestInfo {
     bool active = false;
     uint32_t tokens = 0, capacity = 0, positionBegin = 0;
     uint64_t deviceBytes = 0;
     Qwen3GraphInfo graph;
     ProcessAllReduceInfo allReduce;
+    Qwen3PrefixInfo prefix;
 };
 
 enum class Qwen3LayerStage : uint32_t { Full = 0, Attention = 1, Mlp = 2 };
@@ -162,7 +172,8 @@ public:
     /**
      * 开始唯一活动请求，执行 Prefill 并保留各层 rank-local FP16 K/V。
      *
-     * 无分页、共享前缀或调度；请求结束必须调用 EndQwen3Request，卸载也会释放。
+     * 可选跨请求前缀快照，复制命中 KV 后仅计算后缀；至少重算末 token 以取得 logits。
+     * 无分页或并发调度；请求结束必须调用 EndQwen3Request，卸载也会释放。
      * 每 rank KV 上限 256 MiB，独立于临时工作区；任一 worker 失败终止整组。
      * @param tokenIds Prompt ID，长度 1..128，不能超过 capacity。
      * @param capacity Prompt 加后续输入 token 的总容量，范围 1..2048。
@@ -184,7 +195,10 @@ public:
     /** 同步释放活动请求的全部 KV，允许重复调用；失败终止整组。 */
     void EndQwen3Request();
 
-    /** @return 各 rank 的实际 KV 分配和有效长度；无活动请求时均为零。失败终止整组。 */
+    /** 同步清空模型的前缀快照，保留累计计数；不改变活动请求 KV 或 Graph，失败终止整组。 */
+    void ClearQwen3PrefixCache();
+
+    /** @return 各 rank 的请求 KV、Graph、规约和前缀快照证据；无活动请求时仅请求 KV 为零。失败终止整组。 */
     std::vector<Qwen3RequestInfo> Qwen3Requests();
 
     /**

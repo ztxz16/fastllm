@@ -221,6 +221,13 @@ struct Qwen3LayerExecutor::Impl {
     std::vector<half*> kvCache;
     Qwen3RequestInfo request;
     Qwen3GraphInfo graphInfo;
+    Qwen3PrefixInfo prefixInfo;
+    struct PrefixEntry {
+        std::vector<uint32_t> ids;
+        uint32_t position = 0;
+        std::vector<half*> layers;
+    };
+    std::vector<PrefixEntry> prefixes; // 最久未使用在前；快照永不被 Decode 写入。
     std::vector<void*> graphBuffers;
     size_t graphAllocated = 0;
     cudaGraph_t graph = nullptr;
@@ -265,6 +272,118 @@ struct Qwen3LayerExecutor::Impl {
         float *partial = nullptr;
     };
     Workspace graphWorkspace;
+
+    /** @return 每层每 token 的 rank-local FP16 [2,kvHeads,headDim] 字节数。 */
+    uint64_t KVTokenBytes() const {
+        const auto &p = weights.Plan();
+        return 2 * p.kvHeadCount * p.headDim * sizeof(half);
+    }
+
+    /**
+     * 同步释放一条快照；调用方须确保拷贝和前向已经完成。
+     * @param index LRU 容器中的有效下标；只改变快照资源，不改变活动请求。
+     */
+    void ErasePrefix(size_t index) {
+        auto &entry = prefixes.at(index);
+        for (auto &layer : entry.layers) {
+            Cuda(cudaFree(layer));
+            layer = nullptr;
+        }
+        prefixInfo.deviceBytes -= entry.ids.size() * KVTokenBytes() * weights.Plan().layerCount;
+        prefixes.erase(prefixes.begin() + index);
+        prefixInfo.entries = prefixes.size();
+    }
+
+    /**
+     * 恢复最长公共前缀，至少留下一个 token 重算末位置 logits。
+     *
+     * 各 rank 在进入层间规约前用 NCCL 核对复用长度；不一致即失败，不能静默降级。
+     * 模型/布局由执行器生命周期隔离，键另外包含完整 ID 前缀和 RoPE 起点。
+     * @param ids 已验证的 1..128 个 Prompt ID。
+     * @param position 当前 Prompt 的 RoPE 起点。
+     * @return 实际复制的 token 数；复制到独立请求 KV，不共享可写地址。
+     */
+    uint32_t RestorePrefix(const std::vector<uint32_t> &ids, uint32_t position) {
+        if (!prefixInfo.enabled) return 0;
+        uint32_t reused = 0;
+        size_t selected = 0;
+        for (size_t i = 0; i < prefixes.size(); ++i) {
+            const auto &entry = prefixes[i];
+            if (entry.position != position) continue;
+            uint32_t common = 0;
+            const size_t limit = std::min(entry.ids.size(), ids.size() - 1);
+            while (common < limit && entry.ids[common] == ids[common]) ++common;
+            if (common > reused) { reused = common; selected = i; }
+        }
+
+        const auto &p = weights.Plan();
+        auto local = static_cast<uint32_t*>(Allocate(sizeof(uint32_t)));
+        auto peers = static_cast<uint32_t*>(Allocate(p.worldSize * sizeof(uint32_t)));
+        Cuda(cudaMemcpyAsync(local, &reused, sizeof(reused), cudaMemcpyHostToDevice, stream));
+        Nccl(ncclAllGather(local, peers, 1, ncclUint32, comm, stream));
+        std::vector<uint32_t> decisions(p.worldSize);
+        Cuda(cudaMemcpyAsync(decisions.data(), peers, decisions.size() * sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
+        Synchronize();
+        ReleaseBuffers();
+        for (auto decision : decisions) {
+            if (decision != reused) throw std::runtime_error("inconsistent Qwen3 prefix cache ranks");
+        }
+
+        if (reused) {
+            auto &entry = prefixes[selected];
+            for (size_t layer = 0; layer < kvCache.size(); ++layer) {
+                Cuda(cudaMemcpyAsync(kvCache[layer], entry.layers[layer], reused * KVTokenBytes(), cudaMemcpyDeviceToDevice, stream));
+            }
+            std::rotate(prefixes.begin() + selected, prefixes.begin() + selected + 1, prefixes.end());
+        }
+        ++prefixInfo.lookups;
+        prefixInfo.hits += reused != 0;
+        prefixInfo.reusedTokens += reused;
+        prefixInfo.lastReusedTokens = reused;
+        prefixInfo.lastComputedTokens = ids.size() - reused;
+        return reused;
+    }
+
+    /**
+     * 在成功 Prefill 后保存不可变 Prompt KV，后续生成取消仍可复用该有效快照。
+     *
+     * 每条各层布局为 FP16 [promptTokens,2,localKVHeads,headDim]。最多 8 条；
+     * 使用全局 KV 头数保守计费，保证所有 rank 的 64 MiB 淘汰决策完全相同。
+     * 超过单条预算时不插入；分配或复制错误终止 worker，不假装缓存成功。
+     * @param ids 已完成前向的原始 Prompt ID，不包含 Decode token。
+     * @param position Prompt 的 RoPE 起点。
+     */
+    void SavePrefix(const std::vector<uint32_t> &ids, uint32_t position) {
+        if (!prefixInfo.enabled) return;
+        for (size_t i = 0; i < prefixes.size(); ++i) {
+            if (prefixes[i].position == position && prefixes[i].ids == ids) {
+                std::rotate(prefixes.begin() + i, prefixes.begin() + i + 1, prefixes.end());
+                return;
+            }
+        }
+        const auto &p = weights.Plan();
+        constexpr uint64_t budget = 64ULL * 1024 * 1024;
+        const uint64_t charge = 2 * p.kvHeads * p.headDim * sizeof(half) * p.layerCount;
+        if (ids.size() > budget / charge) return;
+        uint64_t tokens = ids.size();
+        for (const auto &entry : prefixes) tokens += entry.ids.size();
+        while (!prefixes.empty() && (prefixes.size() >= 8 || tokens > budget / charge)) {
+            tokens -= prefixes.front().ids.size();
+            ErasePrefix(0);
+            ++prefixInfo.evictions;
+        }
+
+        prefixes.push_back({ids, position, std::vector<half*>(p.layerCount, nullptr)});
+        auto &entry = prefixes.back();
+        const uint64_t bytes = ids.size() * KVTokenBytes();
+        for (size_t layer = 0; layer < entry.layers.size(); ++layer) {
+            Cuda(cudaMalloc(reinterpret_cast<void**>(&entry.layers[layer]), bytes));
+            Cuda(cudaMemcpyAsync(entry.layers[layer], kvCache[layer], bytes, cudaMemcpyDeviceToDevice, stream));
+        }
+        Synchronize();
+        prefixInfo.deviceBytes += bytes * p.layerCount;
+        prefixInfo.entries = prefixes.size();
+    }
 
     /** 在分配和算子执行前检查单层与完整 prefill 共用的布局约束。 */
     void Validate(uint32_t layer, uint32_t tokens, uint32_t hidden, uint32_t positionBegin,
@@ -434,12 +553,13 @@ struct Qwen3LayerExecutor::Impl {
     }
 };
 
-Qwen3LayerExecutor::Qwen3LayerExecutor(const Qwen3DeviceWeights &weights, cudaStream_t stream, ncclComm_t comm, ProcessAllReduce &allReduce, bool cudaGraph)
+Qwen3LayerExecutor::Qwen3LayerExecutor(const Qwen3DeviceWeights &weights, cudaStream_t stream, ncclComm_t comm, ProcessAllReduce &allReduce, bool cudaGraph, bool prefixCache)
     : impl(new Impl{weights, stream, comm, allReduce}) {
     if (!stream || !comm) {
         throw std::runtime_error("Qwen3 layer requires initialized stream/NCCL");
     }
     impl->graphInfo.enabled = cudaGraph;
+    impl->prefixInfo.enabled = prefixCache;
     Blas(cublasCreate(&impl->blas));
     Blas(cublasSetStream(impl->blas, stream));
     Blas(cublasSetMathMode(impl->blas, CUBLAS_DEFAULT_MATH));
@@ -568,7 +688,11 @@ std::vector<float> Qwen3LayerExecutor::BeginRequest(const std::vector<uint32_t> 
     r.request.active = true;
     r.request.capacity = capacity;
     r.request.positionBegin = positionBegin;
-    return RunTokens(tokenIds, positionBegin, true);
+    r.request.tokens = r.RestorePrefix(tokenIds, positionBegin);
+    std::vector<uint32_t> suffix(tokenIds.begin() + r.request.tokens, tokenIds.end());
+    auto result = RunTokens(suffix, positionBegin + r.request.tokens, true);
+    r.SavePrefix(tokenIds, positionBegin);
+    return result;
 }
 
 std::vector<float> Qwen3LayerExecutor::Decode(uint32_t tokenId) {
@@ -656,11 +780,20 @@ Qwen3RequestInfo Qwen3LayerExecutor::RequestInfo() const {
     info.graph = impl->graphInfo;
     info.graph.active = impl->graphExec != nullptr;
     info.graph.workspaceBytes = impl->graphAllocated;
+    info.prefix = impl->prefixInfo;
     return info;
+}
+
+void Qwen3LayerExecutor::ClearPrefixCache() {
+    auto &r = *impl;
+    r.Synchronize();
+    while (!r.prefixes.empty()) r.ErasePrefix(0);
+    if (r.prefixInfo.enabled) ++r.prefixInfo.clears;
 }
 
 void Qwen3LayerExecutor::Clear() {
     EndRequest();
+    ClearPrefixCache();
     impl->ReleaseBuffers();
     if (impl->blas) {
         Blas(cublasDestroy(impl->blas));

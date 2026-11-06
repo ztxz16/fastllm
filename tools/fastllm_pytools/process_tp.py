@@ -62,7 +62,7 @@ def native_binary(value, name):
 
 
 def validate_options(args):
-    """进程后端仅接受已实现的参数；拒绝其他后端参数和缓存开关，绝不静默忽略。"""
+    """进程后端仅接受已实现的参数；拒绝线程后端专用配置，绝不静默忽略。"""
     from .util import make_normal_parser, add_server_args
 
     parser = make_normal_parser('process validation')
@@ -74,7 +74,7 @@ def validate_options(args):
                   'kv_cache_dtype': ('auto', 'float16'), 'kv_cache_layout': ('auto', 'continuous'),
                   'device': (None, ''), 'FASTLLM_ACTIVATE_NUMA': ('OFF',), 'FASTLLM_NUMA_THREADS': (27,),
                   'max_batch': (-1, 1), 'enable_thinking': ('', 'false'),
-                  'prefix_cache': ('', 'false'), 'cache_history': ('', 'false'), 'cache_fast': ('', 'false')}
+                  'prefix_cache': ('', 'false', 'true'), 'cache_history': ('', 'false'), 'cache_fast': ('', 'false')}
     frontend = {'command', 'version', 'prompt', 'max_new_tokens', '_model_config_loaded'}
     for key, value in vars(args).items():
         if key in allowed or key in frontend:
@@ -88,6 +88,8 @@ def validate_options(args):
     for key in ('FASTLLM_PREFIX_CACHE', 'FASTLLM_CUDA_GRAPH', 'FASTLLM_CUDA_CUSTOM_ALLREDUCE',
                 'FASTLLM_CUDA_TP2_P2P_ALLREDUCE'):
         if os.environ.get(key, '').strip().lower() not in ('', '0', 'false', 'off'):
+            if key == 'FASTLLM_PREFIX_CACHE':
+                raise ValueError('process TP rejects FASTLLM_PREFIX_CACHE; use --prefix-cache true')
             if key == 'FASTLLM_CUDA_GRAPH':
                 raise ValueError('process TP rejects FASTLLM_CUDA_GRAPH; use --cuda-graph for Decode Graph')
             if key == 'FASTLLM_CUDA_CUSTOM_ALLREDUCE':
@@ -117,7 +119,7 @@ def validate_options(args):
 
 
 class ProcessTPModel:
-    """模型工厂的进程后端：常驻权重、串行请求、请求内 KV；提供显式关闭与上下文管理。"""
+    """模型工厂的进程后端：常驻权重、串行请求、可选前缀快照；提供显式清理与上下文管理。"""
 
     tp_backend = 'process'
     backend = BACKEND
@@ -147,7 +149,8 @@ class ProcessTPModel:
         self.session = Qwen3ProcessSession(binary, worker, self.model_path, self.devices,
                                           self.output / 'session', timeout=getattr(args, 'tp_timeout', 180),
                                           cuda_graph=getattr(args, 'cuda_graph', False),
-                                          custom_allreduce=getattr(args, 'custom_allreduce', False))
+                                          custom_allreduce=getattr(args, 'custom_allreduce', False),
+                                          prefix_cache=getattr(args, 'prefix_cache', '') == 'true')
         self.session.__enter__()
         args.path = str(self.model_path)
 
@@ -245,6 +248,13 @@ class ProcessTPModel:
                 # 不能将取消时的协议/回收失败吞掉；正常协作取消允许复用模型。
                 if errors and not isinstance(errors[0], GenerationCancelled) and self.state != 'ready':
                     raise errors[0]
+
+    def clear_prefix_cache(self):
+        """清空跨请求前缀快照；等待当前生成完成，不卸载权重。"""
+        with self._lifecycle_lock:
+            if self._closing:
+                raise RuntimeError('process TP model is closed')
+        return self.session.clear_prefix_cache()
 
     def release_memory(self):
         with self._lifecycle_lock:

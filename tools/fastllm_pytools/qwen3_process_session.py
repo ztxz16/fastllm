@@ -13,7 +13,7 @@ import threading
 import time
 
 from .tp_process_utils import isolated_process, wait_case
-from .tp_graph import validate_graph, validate_allreduce
+from .tp_graph import validate_graph, validate_allreduce, validate_prefix
 
 BACKEND = "qwen3_process_generate_cublas_nccl"
 EMPTY = dict(active=False, tokens=0, capacity=0, device_bytes=0)
@@ -42,7 +42,7 @@ class GenerationObserverError(RuntimeError):
 class Qwen3ProcessSession:
     """同步会话；线程调用串行化，超时或协议错误后整组回收，不自动重试请求。"""
 
-    def __init__(self, binary, worker, model, devices, output, *, timeout=1800, trace=False, cuda_graph=False, custom_allreduce=False):
+    def __init__(self, binary, worker, model, devices, output, *, timeout=1800, trace=False, cuda_graph=False, custom_allreduce=False, prefix_cache=False):
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("session timeout must be finite and positive")
         device_ids = [int(value) for value in devices.split(",")]
@@ -56,6 +56,9 @@ class Qwen3ProcessSession:
         if type(custom_allreduce) is not bool or (custom_allreduce and len(device_ids) != 2):
             raise ValueError("custom_allreduce requires a boolean and TP=2")
         self.custom_allreduce = custom_allreduce
+        if type(prefix_cache) is not bool:
+            raise ValueError('prefix_cache must be boolean')
+        self.prefix_cache = prefix_cache
         self.cuda_graph = cuda_graph
         self._graph_state = None
         self.timeout, self.trace = timeout, trace
@@ -123,14 +126,18 @@ class Qwen3ProcessSession:
         if cache != [EMPTY for _ in self.devices]:
             raise RuntimeError("session returned nonempty or invalid KV state")
 
-    def _check_graph(self, report, *, reset=False, decodes=None):
+    def _check_graph(self, report, *, reset=False, decodes=None, cleared=False):
         key = "graph_after_unload" if reset else "graph"
-        if not self.cuda_graph and not self.custom_allreduce and key not in report:
+        if not self.cuda_graph and not self.custom_allreduce and not self.prefix_cache and key not in report:
             return  # Eager 客户端兼容旧原生报告；Graph 必须具有执行证据。
         expected = "decode_cuda_graph" if self.cuda_graph else "eager"
         if report.get("execution") != expected:
             raise RuntimeError("CUDA Graph execution mode mismatch")
         states = validate_graph(report.get(key), len(self.devices), self.cuda_graph)
+        if self.prefix_cache or any('prefix_cache' in state for state in states):
+            validate_prefix(states, len(self.devices), self.prefix_cache, previous=self._graph_state,
+                            reset=reset or self._graph_state is None, cleared=cleared,
+                            prompt_tokens=len(report['request']['token_ids']) if decodes is not None else None)
         if self.custom_allreduce or any('allreduce' in state for state in states):
             ar = validate_allreduce(states, len(self.devices), self.custom_allreduce, previous=self._graph_state,
                                     require_progress=self.custom_allreduce and decodes is not None and decodes > 0)
@@ -186,6 +193,8 @@ class Qwen3ProcessSession:
                     command += ["--cuda-graph", "1"]
                 if self.custom_allreduce:
                     command += ["--custom-allreduce", "1"]
+                if self.prefix_cache:
+                    command += ["--prefix-cache", "1"]
                 (self.output / "command.txt").write_text(shlex.join(command) + "\n")
                 stdout = self._stack.enter_context((self.output / "native.stdout.log").open("wb"))
                 stderr = self._stack.enter_context((self.output / "native.stderr.log").open("wb"))
@@ -296,6 +305,27 @@ class Qwen3ProcessSession:
         finally:
             self._cancel_event = None
             self._observer_error = None
+            self._lock.release()
+
+    def clear_prefix_cache(self):
+        """串行等待当前请求结束后清空 GPU 快照，保留模型、规约器及累计计数。"""
+        if not self._lock.acquire(timeout=self.timeout):
+            raise TimeoutError('session busy: prefix cache clear timed out')
+        try:
+            if self.state != 'ready':
+                raise RuntimeError(f'session is {self.state}')
+            try:
+                result = self._exchange(dict(id=self._next_id, op='clear_prefix_cache'))
+                if result.get('event') != 'prefix_cache_cleared' or result.get('status') != 'PASS':
+                    raise RuntimeError('prefix cache clear failed')
+                self._empty(result.get('cache'))
+                self._check_graph(result, cleared=True)
+                (self.output / f'clear-{result["id"]:06d}.json').write_text(json.dumps(result, indent=2))
+                return result
+            except BaseException:
+                self._dispose('failed')
+                raise
+        finally:
             self._lock.release()
 
     def close(self):
