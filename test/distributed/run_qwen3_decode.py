@@ -16,7 +16,7 @@ from run_process_tp import ROOT, capture, save_report
 from run_qwen3_prefill import compare_logits, invoke, make_model, report_error, require
 from run_qwen3_shards import decode, encode, save_fixture
 from qwen3_layer_reference import prefill
-from fastllm_pytools.tp_graph import validate_graph
+from fastllm_pytools.tp_graph import validate_graph, validate_allreduce
 
 BACKEND = "qwen3_process_decode_cublas_nccl"
 EMPTY = dict(active=False, tokens=0, capacity=0, position_begin=0, device_bytes=0)
@@ -201,6 +201,33 @@ def verify_graph(report, tasks, world, enabled):
             "unloaded model retained graph counters")
 
 
+def verify_allreduce(report, tasks, config, graph_enabled):
+    """逐任务精确计数：包括 Graph warmup、重放、交错 Prefill 和模型重载。"""
+    custom = nccl = 0
+    graph_active = False
+    previous = None
+    for task, result in zip(tasks, report['results']):
+        op = task['op']
+        if op in ('begin', 'prefill', 'decode'):
+            count = config['hidden_size'] * (1 if op == 'decode' else len(task['token_ids']))
+            calls = 2 * config['num_hidden_layers']
+            if op == 'decode' and graph_enabled:
+                calls *= 1 + int(not graph_active)
+                graph_active = True
+            if count <= 65536:
+                custom += calls
+            else:
+                nccl += calls
+        if op in ('end', 'unload'):
+            graph_active = False
+        observed = validate_allreduce(result.get('graph'), 2, True, previous=previous)
+        require(observed[0]['custom_calls'] == custom and observed[0]['nccl_calls'] == nccl,
+                task['name'] + ': incorrect custom/NCCL execution counts')
+        previous = result['graph']
+    validate_allreduce(report.get('graph_after_unload'), 2, True, previous=previous)
+    require(custom > 0, 'custom AllReduce was never exercised')
+
+
 def verify_failure(code, report, spec, tasks):
     require(code == 1 and report.get("status") == "FAIL" and report.get("backend") == BACKEND,
             f"exit={code}; {report_error(report)}")
@@ -261,6 +288,7 @@ def main():
     parser.add_argument("--build-cache", type=Path, required=True)
     parser.add_argument("--model", type=Path)
     parser.add_argument("--cuda-graph", action="store_true")
+    parser.add_argument("--custom-allreduce", action="store_true")
     parser.add_argument("--output", type=Path, default=ROOT / "test/distributed/results")
     args = parser.parse_args()
     devices = [int(part) for part in args.devices.split(",")]
@@ -276,7 +304,7 @@ def main():
         cuda_visible_devices=os.environ.get("CUDA_VISIBLE_DEVICES"), devices=devices, atol=atol, rtol=rtol,
         model=str(args.model.resolve()) if args.model else "generated", kv_cache="FP16 request-local contiguous",
         prefix_cache=False, execution="decode_cuda_graph" if args.cuda_graph else "eager",
-        graph_warmup_per_request=1 if args.cuda_graph else 0, sampling="fixed input IDs; no sampling", eos="no stopping",
+        custom_allreduce=args.custom_allreduce, graph_warmup_per_request=1 if args.cuda_graph else 0, sampling="fixed input IDs; no sampling", eos="no stopping",
         expected_case_count=len(selected), report_title="Qwen3 request KV and decode correctness",
         report_description="逐步 TP/单卡对比，前缀不超过128时对照完整重算；小模型含独立CPU参考。max_context仅在128/129/256/2048检查CPU，其余步仍逐元素比较TP与单卡。非性能或HF端到端验收。")
     rows = []
@@ -308,7 +336,8 @@ def main():
                            decode_steps=spec.get("steps", 3), cycles=spec.get("cycles", 2),
                            output_tokens=0, input_tasks="tasks.json")
                 extra_args = ["--max-logit-elements", str(spec["max_logit_elements"])] if "max_logit_elements" in spec else []
-                extra_args += ["--cuda-graph", "1" if args.cuda_graph else "0"]
+                extra_args += ["--cuda-graph", "1" if args.cuda_graph else "0",
+                               "--custom-allreduce", "1" if args.custom_allreduce else "0"]
                 code, tp = invoke(args.check.resolve(), args.worker.resolve(), model, directory, devices, "tp",
                                   reload_model=reload_model, extra_args=extra_args)
                 row["workers"] = tp.get("workers", [])
@@ -318,12 +347,17 @@ def main():
                     require(code == 0, f"TP exit={code}; {report_error(tp)}")
                     verify(tp, devices, tasks, config)
                     verify_graph(tp, tasks, len(devices), args.cuda_graph)
+                    if args.custom_allreduce:
+                        verify_allreduce(tp, tasks, config, args.cuda_graph)
+                        row["allreduce"] = tp["graph_after_unload"][0]["allreduce"]
+                        row.update(backend='qwen3_process/custom-ipc-fp32-tp2+nccl-large',
+                                   custom_calls=row['allreduce']['custom_calls'], nccl_calls=row['allreduce']['nccl_calls'])
                     row["execution"] = tp["execution"]
                     observed = [g for item in tp["results"] for g in item["graph"]]
                     row.update(max_graph_captures=max(g['captures'] for g in observed),
                                max_graph_replays=max(g['replays'] for g in observed),
                                peak_graph_workspace_bytes=max(g['workspace_bytes'] for g in observed))
-                    if args.cuda_graph:
+                    if args.cuda_graph or args.custom_allreduce:
                         code, eager = invoke(args.check.resolve(), args.worker.resolve(), model, directory, devices,
                                              "eager_tp", reload_model=reload_model)
                         require(code == 0, f"Eager TP exit={code}; {report_error(eager)}")
@@ -332,7 +366,7 @@ def main():
                         for actual, baseline in zip(tp["results"], eager["results"]):
                             if "logits" in actual:
                                 compare_logits(actual["logits"], baseline["logits"], metrics,
-                                               actual["task"] + " Graph vs Eager TP", atol, rtol)
+                                               actual["task"] + " selected path vs NCCL Eager TP", atol, rtol)
                     code, single = invoke(args.check.resolve(), args.worker.resolve(), model, directory, devices[:1], "single", reload_model=reload_model)
                     require(code == 0, f"single exit={code}; {report_error(single)}")
                     verify(single, devices[:1], tasks, config)

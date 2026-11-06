@@ -42,6 +42,9 @@ def save_report(output, rows, metadata):
         summary.update(complete=complete, completed_case_count=len(rows), expected_case_count=expected)
     (output / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     fields = ["case", "backend", "status", "max_abs_error", "mean_abs_error", "failed_elements", "reason"]
+    for key in ('custom_calls', 'nccl_calls'):
+        if any(key in row for row in rows):
+            fields.append(key)
 
     def cell(value):
         if isinstance(value, float):
@@ -58,7 +61,7 @@ def save_report(output, rows, metadata):
     if expected is not None:
         description += f" 已完成 {len(rows)}/{expected} 个用例。"
     lines = [f"# {title}: {status}", "",
-             "功能检查；不代表模型 TP、CUDA Graph、自定义 AllReduce 或前缀缓存已实现。",
+             "功能检查；通过范围仅限本报告实际执行的配置与用例，不代表性能结果。",
              description, "",
              "| " + " | ".join(fields) + " |", "| " + " | ".join(["---"] * len(fields)) + " |"]
     lines.extend("| " + " | ".join(item.replace("|", "\\|").replace("\n", " ") for item in row) + " |"
@@ -190,11 +193,14 @@ def main():
     parser.add_argument("--worker", type=Path, help="已编译的 fastllm_tp_worker")
     parser.add_argument("--devices", default="0,1", help="CUDA_VISIBLE_DEVICES 之后的显式逻辑设备列表")
     parser.add_argument("--cuda", action="store_true", help="额外验证真实 CUDA/NCCL，必须有 GPU")
+    parser.add_argument("--custom-allreduce", action="store_true", help="CUDA 进程使用 TP2 IPC 规约并验证分支边界")
     parser.add_argument("--frontend-only", action="store_true", help="仅执行 Python 参数与进程清理检查，不运行 C++ 产物")
     parser.add_argument("--pid-namespace", action="store_true", help="额外用 unshare 验证 PID 1 协调器，须允许创建 user/PID namespace")
     parser.add_argument("--build-cache", type=Path, help="服务器构建的 CMakeCache.txt，保存架构配置")
     parser.add_argument("--output-root", type=Path, default=ROOT / "test/distributed/results")
     args = parser.parse_args()
+    if args.custom_allreduce and not args.cuda:
+        parser.error("--custom-allreduce requires --cuda")
     if args.frontend_only and (args.cuda or args.pid_namespace):
         parser.error("--frontend-only cannot be combined with --cuda or --pid-namespace")
     if not args.frontend_only and (args.check is None or args.worker is None):
@@ -213,7 +219,8 @@ def main():
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", "unset"),
         "gpu": "not queried (frontend/control-only)",
         "cuda_runtime_version": "worker metadata when --cuda; otherwise n/a",
-        "compile_architecture": "host C++; process TP targets contain no device kernels",
+        "compile_architecture": "see build cache; CUDA worker contains production kernels",
+        "custom_allreduce": args.custom_allreduce,
         "cmake_cuda_architecture": "not supplied", "frontend_only": args.frontend_only,
     }
     rows = []
@@ -248,8 +255,11 @@ def main():
                 command = ["unshare", "--user", "--map-root-user", "--pid", "--fork", "--kill-child=SIGKILL"]
                 rows.append(run_case("control_pid1", command + base + ["--control-only", "--case", "pid1"], output, 90))
             if args.cuda:
-                for name in ("smoke", "restart", "crash", "stall"):
-                    rows.append(run_case("cuda_" + name, base + ["--case", name], output, 240))
+                cuda_base = base + (["--custom-allreduce", "1"] if args.custom_allreduce else [])
+                for name in ("smoke", "restart", "crash", "stall", "allreduce_boundaries", "collective_crash"):
+                    rows.append(run_case("cuda_" + name, cuda_base + ["--case", name], output, 240))
+                if args.custom_allreduce:
+                    rows.append(run_case("custom_invalid_world", cuda_base + ["--case", "custom_invalid_world"], output, 30))
     except (Exception, KeyboardInterrupt) as error:
         rows.append({"case": "runner", "status": "FAIL", "reason": str(error) or type(error).__name__})
     status = save_report(output, rows, metadata)

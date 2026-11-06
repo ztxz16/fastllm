@@ -92,7 +92,15 @@ class ProcessEntryTests(unittest.TestCase):
             self.assertIn('--cuda-graph 1', (model.output / 'session/command.txt').read_text())
         self.assertEqual(model.session.shutdown['graph_after_unload'][0]['workspace_bytes'], 0)
 
-    def test_unimplemented_optimizations_are_rejected(self):
+    def test_custom_allreduce_factory_passes_flag_and_checks_native_path(self):
+        with make_normal_llm_model(self.args(['--custom-allreduce', '--cuda-graph'])) as model:
+            self.assertTrue(model.session.custom_allreduce)
+            self.assertTrue(model.session.cuda_graph)
+            self.assertEqual(model.response('你好', max_length=1), '答')
+            self.assertGreater(model.session._graph_state[0]['allreduce']['custom_calls'], 0)
+            self.assertIn('--custom-allreduce 1', (model.output / 'session/command.txt').read_text())
+
+    def test_legacy_optimization_envs_are_rejected(self):
         for name in ('FASTLLM_PREFIX_CACHE', 'FASTLLM_CUDA_GRAPH', 'FASTLLM_CUDA_CUSTOM_ALLREDUCE'):
             with self.subTest(name=name), mock.patch.dict(os.environ, {name: '1'}), \
                     self.assertRaisesRegex(ValueError, name):

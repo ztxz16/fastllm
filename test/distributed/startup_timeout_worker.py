@@ -15,7 +15,7 @@ else:
     connection = socket.socket(fileno=int(args["--control-fd"]))
     connection.setblocking(True)
     session = int(args["--session"])
-    version = 1 if fault == "protocol_version" else 2
+    version = 2 if fault == "protocol_version" else 3
     if fault == "protocol_session":
         session ^= 1
     payload = struct.pack("<IIIIII", int(args["--rank"]), int(args["--device"]), os.getpid(), 0, 0, 0)
