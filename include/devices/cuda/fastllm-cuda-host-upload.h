@@ -109,10 +109,21 @@ public:
 
 inline std::shared_ptr<HostCopyPool> GetHostCopyPool(int device, const std::vector<int> &cpus = {}) {
     static std::mutex mutex;
+#ifdef _WIN32
+    // TLS destructors run under the Windows loader lock. Joining the last
+    // helper there deadlocks its DLL_THREAD_DETACH notification. Keep one
+    // sleeping helper per device for the process lifetime; rings still free
+    // their bounded pinned storage when the submitting thread exits.
+    static auto &pools = *new std::map<int, std::shared_ptr<HostCopyPool>>;
+    std::lock_guard<std::mutex> lock(mutex);
+    auto &pool = pools[device];
+    if (!pool) pool = std::make_shared<HostCopyPool>(cpus);
+#else
     static std::map<int, std::weak_ptr<HostCopyPool>> pools;
     std::lock_guard<std::mutex> lock(mutex);
     auto pool = pools[device].lock();
     if (!pool) { pool = std::make_shared<HostCopyPool>(cpus); pools[device] = pool; }
+#endif
     return pool;
 }
 
@@ -282,10 +293,18 @@ public:
 
 inline std::shared_ptr<HostUploadProducer> GetHostUploadProducer(int device) {
     static std::mutex mutex;
+#ifdef _WIN32
+    // As with HostCopyPool, do not join this worker from a TLS destructor.
+    static auto &producers = *new std::map<int, std::shared_ptr<HostUploadProducer>>;
+    std::lock_guard<std::mutex> lock(mutex);
+    auto &producer = producers[device];
+    if (!producer) producer = std::make_shared<HostUploadProducer>(device);
+#else
     static std::map<int, std::weak_ptr<HostUploadProducer>> producers;
     std::lock_guard<std::mutex> lock(mutex);
     auto producer = producers[device].lock();
     if (!producer) { producer = std::make_shared<HostUploadProducer>(device); producers[device] = producer; }
+#endif
     return producer;
 }
 

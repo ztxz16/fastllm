@@ -1,6 +1,7 @@
 #include "devices/cuda/fastllm-cuda-host-upload.h"
 #include "devices/cuda/fastllm-cuda-mapped-host.h"
 #include <cstdio>
+#include <exception>
 #include <stdexcept>
 #include <vector>
 
@@ -13,6 +14,32 @@ int main() {
         int devices = 0;
         Check(cudaGetDeviceCount(&devices));
         if (!devices) return 77;
+        // Exercise the last owner on a transient submitting thread before
+        // the main thread retains any upload ring or shared copy helper.
+        for (bool immutable : {false, true}) {
+            std::exception_ptr failure;
+            std::thread uploader([&] {
+                try {
+                    Check(cudaSetDevice(0));
+                    std::vector<unsigned char> source(1ULL << 20, 37), actual(source.size());
+                    unsigned char *target = nullptr;
+                    cudaStream_t stream = nullptr;
+                    Check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+                    Check(cudaMalloc(&target, source.size()));
+                    Check(immutable
+                        ? fastllm::cuda::UploadImmutableHostWeight(target, source.data(), source.size(), false, stream)
+                        : fastllm::cuda::UploadHostWeight(target, source.data(), source.size(), false, stream));
+                    Check(cudaStreamSynchronize(stream));
+                    Check(cudaMemcpy(actual.data(), target, source.size(), cudaMemcpyDeviceToHost));
+                    if (actual != source) throw std::runtime_error("transient uploader corrupted data");
+                    Check(cudaFree(target));
+                    Check(cudaStreamDestroy(stream));
+                } catch (...) { failure = std::current_exception(); }
+            });
+            uploader.join();
+            if (failure) std::rethrow_exception(failure);
+        }
+        std::puts("PASS transient uploader thread lifetime");
         // Cross more than four ring slots, include an unaligned tail, and
         // immediately overwrite each ordinary source after Copy returns.
         const size_t bytes = (21ULL << 20) + 37;
