@@ -727,8 +727,7 @@ namespace fastllm {
         const int originalDevice = FastllmCudaGetDevice();
         auto &pool = GetMultiCudaDedicatedWorkerPool();
         {
-            // Prevent a new submission from re-recording a completion event
-            // until all waits refer to the callbacks being joined here.
+            // Keep each completion record stable until the host has joined it.
             std::lock_guard<std::mutex> dispatchLock(pool.dispatchMutex);
             std::vector<void *> events;
             {
@@ -740,10 +739,11 @@ namespace fastllm {
                     events.push_back(it->second->GetCompletionEvent());
                 }
             }
-            FastllmCudaSetDevice(devices.front());
-            for (void *event : events) FastllmCudaCurrentThreadStreamWaitEvent(event);
+            for (size_t i = 0; i < events.size(); ++i) {
+                FastllmCudaSetDevice(devices[i]);
+                FastllmCudaEventSynchronize(events[i]);
+            }
         }
-        FastllmCudaSyncCurrentThreadStream();
         const bool ok = !FastllmCudaGetThreadError();
         FastllmCudaSetDevice(originalDevice);
         return ok;
