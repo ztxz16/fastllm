@@ -12,7 +12,6 @@
 #include "persistent_worker_group.h"
 #include "utils/hostbufferreclaim.h"
 #include "utils/hybrid_moe.h"
-#include "utils/qwen38_hybrid.h"
 #include "devices/moe_prefill_policy.h"
 #include "utils/autotune.h"
 
@@ -10683,7 +10682,9 @@ namespace fastllm {
             std::vector<std::unique_ptr<Data> > gpuInputAliases;
             std::vector<std::unique_ptr<Data> > gpuOutputPartials;
             std::vector<std::thread> gpuThreads;
-            const bool persistentPrefill = qwen38ForwardActive && gpuPrefill &&
+            // Reuse one GPU submitter for any supported single-device host MoE.
+            // The format adapter below retains each model's numerical semantics.
+            const bool persistentPrefill = gpuPrefill &&
                 cudaInputReplicas.size() == 1 && !gpuExperts.empty();
             std::function<void()> prefillGpuTask;
             void *cpuOutputStaging = nullptr;
@@ -10826,6 +10827,9 @@ namespace fastllm {
                     fflush(stdout);
                 }
 
+                if (persistentPrefill) {
+                    assistPartialEvents[0] = fastllmMoeDataManagerNumas.EnsureAssistPartialReadyEvent(gpuId);
+                }
                 gpuThreads.reserve(gpuWorkerCount);
                 for (int i = 0; i < gpuWorkerCount; i++) {
                     int workerDevice = cudaInputReplicas[i].deviceId;
@@ -10961,6 +10965,11 @@ namespace fastllm {
                                 assistPartialEvents[i] = nullptr;
                             }
                         }
+                        if (persistentPrefill) {
+                            // Native experts may leave the final BF16 cast in
+                            // flight. A finished host task is not GPU completion.
+                            FastllmCudaEventRecordCurrentThread(assistPartialEvents[0]);
+                        }
                     };
                     if (persistentPrefill) prefillGpuTask = std::move(gpuTask);
                     else gpuThreads.emplace_back(std::move(gpuTask));
@@ -11032,7 +11041,11 @@ namespace fastllm {
                 }, errors);
                 // Drain both sides before propagating errors: every task borrows
                 // this layer's input, output and routing metadata.
-                for (const auto &error : errors) if (error) std::rethrow_exception(error);
+                for (const auto &error : errors) if (error) {
+                    FastllmCudaSetDevice(cudaInputReplicas[0].deviceId);
+                    FastllmCudaEventSynchronize(assistPartialEvents[0]);
+                    std::rethrow_exception(error);
+                }
             } else
 #endif
             runCpuPrefill();
@@ -11047,6 +11060,7 @@ namespace fastllm {
                 }
                 phaseLap(phaseJoinMs);
                 FastllmCudaSetDevice(gpuId);
+                if (persistentPrefill) FastllmCudaCurrentThreadStreamWaitEvent(assistPartialEvents[0]);
                 Data gpuOutputAlias(
                     output.dataType, output.dims,
                     DataDevice::CUDA, output.cudaData);
