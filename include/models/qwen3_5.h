@@ -346,6 +346,7 @@ namespace fastllm {
         mutable std::unordered_map<ResponseContext*, MtpKvCache> mtpCaches;
         mutable std::unordered_map<ResponseContext*, DFlashContext> dflashContexts;
         mutable std::mutex mtpCacheMutex;
+        std::set<int> cooperativeLongPrefillHandles; // guarded by dictLocker
         std::atomic<bool> mtpLogPrinted{false};
         std::atomic<bool> mtpSkipLogPrinted{false};
         std::atomic<long long> mtpValidationCount{0};
@@ -595,7 +596,7 @@ namespace fastllm {
                               const std::vector<Data*> &positionIds,
                               const std::vector<int> &sampleRows,
                               std::vector<Data> *sampledHiddenStates = nullptr);
-        void Qwen35MTPLoop();
+        void Qwen35MTPLoop(std::atomic<bool> *helperStop = nullptr);
         bool Qwen35MTPForward(
                 bool useGPUForward,
                 ResponseContext *context,
