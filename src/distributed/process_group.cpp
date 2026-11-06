@@ -651,6 +651,59 @@ std::vector<std::vector<float>> ProcessGroup::ForwardQwen3Layer(uint32_t layer, 
     }
 }
 
+std::vector<float> ProcessGroup::PrefillQwen3(const std::vector<uint32_t> &tokenIds,
+                                            uint32_t positionBegin, int timeoutMs) {
+    if (tokenIds.empty() || tokenIds.size() > 128 || positionBegin > 1048576 || timeoutMs <= 0) {
+        throw std::invalid_argument("invalid Qwen3 prefill request count/position/timeout");
+    }
+    std::vector<uint8_t> payload;
+    Put32(payload, positionBegin);
+    Put32(payload, uint32_t(timeoutMs));
+    for (auto id : tokenIds) {
+        Put32(payload, id);
+    }
+
+    std::lock_guard<std::mutex> lock(impl->mutex);
+    if (impl->state != ProcessGroupState::Ready || impl->options.controlOnly) {
+        throw std::runtime_error("Qwen3 prefill requires a ready CUDA process TP group");
+    }
+    try {
+        auto replies = impl->Exchange(Kind::PrefillQwen3, Kind::PrefillLogits, payload,
+                                      Clock::now() + std::chrono::milliseconds(timeoutMs));
+        std::vector<float> logits;
+        uint64_t vocabulary = 0;
+        for (const auto &reply : replies) {
+            if (reply.payload.size() < 24) {
+                throw std::runtime_error("invalid Qwen3 prefill reply header");
+            }
+            uint64_t begin = Get64(reply.payload, 0), count = Get64(reply.payload, 8);
+            uint64_t total = Get64(reply.payload, 16);
+            if (!total || total > 1048576 || (vocabulary && total != vocabulary) ||
+                begin != logits.size() || begin >= total || !count || count > total - begin ||
+                count > (kMaxPayload - 24) / 4 || reply.payload.size() != 24 + count * 4) {
+                throw std::runtime_error("invalid Qwen3 prefill vocabulary slices");
+            }
+            vocabulary = total;
+            for (uint64_t i = 0; i < count; ++i) {
+                uint32_t bits = Get32(reply.payload, 24 + i * 4);
+                float value;
+                memcpy(&value, &bits, sizeof(value));
+                if (!std::isfinite(value)) {
+                    throw std::runtime_error("nonfinite Qwen3 prefill logits");
+                }
+                logits.push_back(value);
+            }
+        }
+        if (!vocabulary || logits.size() != vocabulary) {
+            throw std::runtime_error("incomplete Qwen3 prefill vocabulary");
+        }
+        return logits;
+    } catch (const std::exception &error) {
+        impl->Fail(error.what());
+        throw std::runtime_error(impl->error);
+    }
+}
+
 void ProcessGroup::Stop() {
     std::lock_guard<std::mutex> lifecycleLock(impl->lifecycle);
     {

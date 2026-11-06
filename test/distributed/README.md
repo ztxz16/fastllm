@@ -1,8 +1,9 @@
 # 多进程 TP 底座验收
 
-当前只提供 Linux 单机进程底座：独立 C++ worker、Unix socket 控制协议、
+本目录按阶段提供 Linux 单机进程底座、Qwen3 分片/GPU 权重加载、单层前向，
+以及文末新增的完整 Prefill 验收。通信底座包括独立 C++ worker、Unix socket、
 NCCL 初始化和标量 SUM 自检、心跳、超时、退出与故障回收。
-**尚未接入模型权重、推理调度、CUDA Graph、自定义 AllReduce 或前缀缓存。**
+**尚未接入 KV/Decode、推理调度、CUDA Graph、自定义 AllReduce 或前缀缓存。**
 `--tp-backend process` / `--tp_backend process` 已加入公共参数入口，但会在模型加载前
 明确报错；默认 `thread` 保持原行为。禁止把底座检查成功当成模型 TP 已实现。
 构建选项 `BUILD_PROCESS_TP` 默认关闭，显式开启后才构建和打包这两个实验程序。
@@ -246,7 +247,11 @@ build-process-tp-cu126/fastllm_tp_model_check \
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/distributed -p 'test_*.py'
 ```
 
-## Qwen3 单层 TP 前向（待服务器验收）
+## Qwen3 单层 TP 前向
+
+用户回传的双 V100 日志显示提交 `135809d7` 编译成功，并通过通信底座、GPU
+权重和单层验收。单层报告在服务器 `test/distributed/results/20261106T082732Z_layer_02b42bad`。
+后续完整 Prefill 改动复用并调整单层工作区，须重新执行以下单层回归。
 
 `ProcessGroup::ForwardQwen3Layer` 调用正式 worker 持有的 GPU 权重和执行 stream，
 使用 cuBLAS GEMM、CUDA 算子及 NCCL；验收工具不另建测试专用计算路径。
@@ -268,7 +273,7 @@ RoPE 使用 FP16 sin/cos 与乘法舍入；Attention 的 score/softmax/V 累加�
 1 MiB 控制帧限制（24 字节任务头 + T*H*4 字节输入）。连续位置起点<=1048576，
 只影响 RoPE，不意味着 KV 已存在。非 SiLU、rope scaling/rope_parameters、
 部分旋转或 sliding attention 配置明确拒绝。输入/结果非有限值拒绝，绝无 CPU fallback。
-尚不支持持久 KV、Decode、全模型串联、最终 logits/采样、CUDA Graph 或前缀缓存；
+本单层接口不提供持久 KV、Decode、全模型 logits/采样、CUDA Graph 或前缀缓存；
 Python `--tp_backend process` 仍保持未实现保护。
 
 在上述 CUDA 12.6 环境下，于**服务器**构建和验收：
@@ -307,3 +312,82 @@ rank 之间以及改变尾 token 前后的前缀必须完全相同。覆盖三�
 hidden, position_begin, stage, input`，其中 input 为行主序 FP32 数组，stage 为
 0/1/2。可指向真实模型做单层冒烟，但本轮默认验收使用小型完整模型，不能替代
 Qwen3-1.7B 全模型 logits/生成验证。
+
+## Qwen3 完整 Prefill（待服务器验收）
+
+`ProcessGroup::PrefillQwen3` 接收单请求 token ID，执行 Embedding → 全部 Decoder
+层 → 最终 RMSNorm → 分片 lm_head。Embedding 为每卡复制，隐藏状态为 FP16，
+所有层在 GPU 同一 stream 上执行；每层的 Attention/MLP 分别进行一次 NCCL FP32
+SUM，复用单层入口的全部计算与通信逻辑。工作区在请求内跨层复用，成功后释放。
+失败时整组退出，卸载时先销毁执行器再释放权重，重载后不得复用旧指针。
+
+本轮仅返回**最后一个输入 token 的完整词表 FP32 logits**，不返回所有 token。
+各卡按已有词表分片计算 logits，协调进程验证分片连续、总长度一致和数值有限后
+按词表序拼接。结果是下一 token 的未归一化分数；不采样，不推进 Decode，不保存 KV。
+原 Python `--tp_backend process` 仍拒绝启动完整生成服务，不能把此入口当成已完成的服务端后端。
+
+支持未量化 F16/BF16/F32 源权重，GPU 统一 FP16；支持 tied embedding、非均匀
+词表分片及已有 QKV/O/Down bias。序列长度 1..128，position 起点 0..1048576；
+head/hidden 等限制沿用单层入口。总词表上限 1048576，每 rank 至多 262138 个词表
+元素（24 字节头和 FP32 logits 必须放入 1 MiB 帧），工作区总上限 256 MiB。
+不支持量化、RoPE scaling、滑窗及非 SiLU 配置，明确拒绝，不做 CPU fallback。
+
+默认验收有 21 个小模型 case：三种源精度、bias、tied embedding、KV 复制、不同
+层数、257 维 RMSNorm、128 维头、token/位置边界、重复请求、变更权重后的重载、
+卸载后访问、非法 token ID 与不支持配置。每个正例比较双卡 TP、单卡和独立 CPU
+完整权重数学参考；逐元素容差 `0.008 + 0.008*abs(reference)`，重复请求必须精确相等。
+
+`--model` 模式直接读取现有真实模型，固定相同 token ID、FP16 激活、Eager、无 KV/
+前缀缓存、无采样、输出 token 数为 0，比较单卡与双卡的末 token logits，容差
+`0.05 + 0.01*abs(single)`。它验证多进程 TP 与单卡路径一致性，**不能排除两条路径
+共用的数学错误，也不替代 HF/原线程后端的独立全模型验证**。报告记录 argmax，
+但通过条件为逐元素误差和重复请求一致性，不保证近似平分时 argmax 一致。
+
+所有报告保存原始完整 logits、固定 token ID、误差统计、GPU/CUDA/NCCL 信息、Git
+提交和构建配置，以及 Markdown/CSV/JSON/XLSX 汇总；失败或中断保留部分结果并非零退出。
+汇总错误只保存有界诊断字段，完整 logits（包括失败前已完成任务）保留在各 case 的
+`tp.stdout.log` / `single.stdout.log`，避免词表向量挤入汇总表格。
+功能检查不含性能计时，warmup=0、iterations=1、repeats=1。
+
+在**服务器**沿用 CUDA 12.6、CUDA 12 版 NCCL 环境执行；首次先运行上节的通信、
+权重、单层回归，再运行新增两组验收：
+
+```bash
+export CUDA_HOME=/usr/local/cuda-12.6
+export CUDACXX="$CUDA_HOME/bin/nvcc"
+export PATH="$CUDA_HOME/bin:$PATH"
+export LD_LIBRARY_PATH="$CUDA_HOME/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export CUDA_VISIBLE_DEVICES=0,1
+
+cmake -S . -B build-process-tp-cu126 \
+  -DUSE_CUDA=ON -DUSE_NUMAS=OFF -DBUILD_PROCESS_TP=ON \
+  -DCMAKE_CUDA_COMPILER="$CUDACXX" -DCUDA_ARCH=70
+cmake --build build-process-tp-cu126 \
+  --target fastllm_tp_worker fastllm_tp_check fastllm_tp_model_check \
+           fastllm_tp_layer_check fastllm_tp_prefill_check -j 4
+
+python3 test/distributed/run_qwen3_prefill.py \
+  --check build-process-tp-cu126/fastllm_tp_prefill_check \
+  --worker build-process-tp-cu126/fastllm_tp_worker --devices 0,1 \
+  --build-cache build-process-tp-cu126/CMakeCache.txt
+
+python3 test/distributed/run_qwen3_prefill.py \
+  --check build-process-tp-cu126/fastllm_tp_prefill_check \
+  --worker build-process-tp-cu126/fastllm_tp_worker --devices 0,1 \
+  --build-cache build-process-tp-cu126/CMakeCache.txt \
+  --model /home/models/Qwen3-1.7B
+```
+
+底层检查程序的 `--tasks` 是 JSON 数组，元素为 `{name, token_ids, position_begin}`，
+不是自然语言文本；如需自行选择 prompt，先用该模型的 tokenizer 得到 token ID。
+本轮默认真实模型用确定性 ID 序列检验数值，不以生成文本作为正确性依据。
+
+现有双 V100 服务器也可一键构建并依次执行通信、GPU 权重、单层、小模型完整
+Prefill、真实模型 Prefill 五组验收；失败立即停止，无安装或模型下载：
+
+```bash
+bash test/distributed/run_qwen3_prefill_v100.sh /home/models/Qwen3-1.7B
+```
+
+该脚本固定 CUDA 12.6、架构 70、逻辑 GPU 0/1，**会触发 C++/CUDA 编译，仅在服务器运行**。
+模型目录可传绝对路径，也可传相对于调用者当前目录的路径。

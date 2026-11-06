@@ -38,6 +38,16 @@ public:
     std::vector<float> Forward(uint32_t layer, uint32_t tokens, uint32_t hidden,
         uint32_t positionBegin, Qwen3LayerStage stage, const std::vector<float> &input);
 
+    /**
+     * 运行完整无 KV prefill，复用单层执行路径和同一 stream，仅读回本 rank 的末 token logits。
+     *
+     * 输入、隐藏状态和工作区在一次请求内复用；成功后释放，失败必须终止 worker。
+     * @param tokenIds 非空 token ID，长度至多 128，不能超出词表。
+     * @param positionBegin 连续位置起点，范围 0..1048576。
+     * @return 本 rank 的 [vocabCount] FP32 logits，词表起点由权重 Plan 指定。
+     */
+    std::vector<float> Prefill(const std::vector<uint32_t> &tokenIds, uint32_t positionBegin);
+
     /** 同步并释放工作区和 cuBLAS handle；必须在权重卸载前调用，失败须终止 worker。 */
     void Clear();
 

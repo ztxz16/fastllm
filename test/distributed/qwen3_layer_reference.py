@@ -99,3 +99,16 @@ def forward(config, tensors, task):
         activated = [[half(half(f32(a / (1 + math.exp(-a)))) * b) for a, b in zip(g, u)] for g, u in zip(gate, up)]
         x = residual(x, linear(activated, weight("mlp.down_proj.weight"), bias("mlp.down_proj.bias"), rounded=False))
     return [value for row in x for value in row]
+
+
+def prefill(config, tensors, token_ids, position_begin=0):
+    """完整未分片数学参考；Embedding → 全部层 → 最终 Norm → 末 token FP32 logits。"""
+    h = config["hidden_size"]
+    embedding = matrix(tensors["model.embed_tokens.weight"])
+    x = [value for token in token_ids for value in embedding[token]]
+    for layer in range(config["num_hidden_layers"]):
+        x = forward(config, tensors, dict(layer=layer, tokens=len(token_ids), stage=0,
+                    position_begin=position_begin, input=x))
+    normalized = norm(x[-h:], matrix(tensors["model.norm.weight"]), config.get("rms_norm_eps", 1e-6))
+    head = tensors.get("lm_head.weight", tensors["model.embed_tokens.weight"])
+    return linear([normalized], matrix(head), rounded=False)[0]

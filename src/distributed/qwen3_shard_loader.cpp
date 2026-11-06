@@ -248,6 +248,7 @@ struct Qwen3ShardLoader::Impl {
         plan.headDim = headDim;
         plan.queryHeads = qHeads;
         plan.kvHeads = kvHeads;
+        plan.vocabSize = vocab;
         auto forwardNumber = [&](const std::string &key, float fallback) {
             if (config[key].is_null()) {
                 return fallback;

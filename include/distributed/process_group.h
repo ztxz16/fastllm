@@ -122,6 +122,19 @@ public:
         uint32_t positionBegin, Qwen3LayerStage stage, const std::vector<float> &input, int timeoutMs = 60000);
 
     /**
+     * 执行完整 Qwen3 causal prefill，拼接各 rank 的词表分片得到末 token logits。
+     *
+     * Embedding、全部 Decoder 层、最终 RMSNorm 和分片 lm_head 均在 worker GPU 执行。
+     * 激活保持 FP16，末层投影输出 FP32；不建立 KV cache、不采样、不返回所有 token。
+     * @param tokenIds 单请求 token ID，长度 1..128；每个 ID 必须小于模型词表大小。
+     * @param positionBegin 连续位置起点，范围 0..1048576，不表示已有 KV。
+     * @param timeoutMs 包括通信与读回的整组截止时间，必须为正。
+     * @return 按全局词表顺序排列的有限 FP32 logits；分片不连续或 worker 出错终止整组。
+     */
+    std::vector<float> PrefillQwen3(const std::vector<uint32_t> &tokenIds,
+        uint32_t positionBegin = 0, int timeoutMs = 300000);
+
+    /**
      * 停止监控、请求正常退出并回收全部 worker。
      *
      * 正常退出超时后发送 SIGKILL，在限定时间内轮询回收，不无限 waitpid。
