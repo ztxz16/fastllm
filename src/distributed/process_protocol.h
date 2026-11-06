@@ -20,7 +20,7 @@ enum class Kind : uint32_t {
     Hello = 1, CreateId, UniqueId, Initialize, Ready,
     Ping, Pong, Shutdown, Bye, Error, AllReduce, AllReduceResult,
     LoadQwen3, ModelLoaded, ReadWeight, WeightData, UnloadQwen3, ModelUnloaded,
-    ForwardLayer, LayerOutput
+    ForwardLayer, LayerOutput, PrefillQwen3, PrefillLogits
 };
 struct Message {
     Kind kind;

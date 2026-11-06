@@ -1,4 +1,5 @@
 #include "distributed/qwen3_layer.h"
+#include "process_protocol.h"
 
 #include <cuda_fp16.h>
 #include <cublas_v2.h>
@@ -9,6 +10,21 @@
 namespace fastllm {
 namespace distributed {
 namespace {
+/**
+ * 从复制的词嵌入表查找输入激活，token ID 已在 CPU 验证。
+ * @param ids GPU uint32 [tokens]。
+ * @param embedding FP16 行主序 [vocab,hidden]。
+ * @param x FP16 行主序 [tokens,hidden] 输出。
+ * @param count tokens*hidden，已检查不超出 int。
+ * @param hidden 每个词嵌入的宽度。
+ */
+__global__ void Embed(const uint32_t *ids, const half *embedding, half *x, int count, int hidden) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) {
+        x[i] = embedding[uint64_t(ids[i / hidden]) * hidden + i % hidden];
+    }
+}
+
 void Cuda(cudaError_t result) {
     if (result != cudaSuccess) {
         throw std::runtime_error(std::string("Qwen3 layer CUDA: ") + cudaGetErrorString(result));
@@ -204,6 +220,104 @@ struct Qwen3LayerExecutor::Impl {
             n, CUBLAS_COMPUTE_32F_PEDANTIC, CUBLAS_GEMM_DEFAULT));
     }
 
+    struct Workspace {
+        half *norm = nullptr, *qkv = nullptr, *context = nullptr, *gateup = nullptr, *activated = nullptr;
+        float *partial = nullptr;
+    };
+
+    /** 在分配和算子执行前检查单层与完整 prefill 共用的布局约束。 */
+    void Validate(uint32_t layer, uint32_t tokens, uint32_t hidden, uint32_t positionBegin,
+                  Qwen3LayerStage stage) const {
+        const auto &p = weights.Plan();
+        if (!blas || layer >= p.layerCount || !tokens || tokens > 128 || hidden != p.hiddenSize ||
+            !hidden || hidden > 65536 || positionBegin > 1048576 ||
+            uint32_t(stage) > 2 || p.headDim % 2 || p.headDim > 256 || !p.headDim ||
+            (p.queryHeadCount + 2 * p.kvHeadCount) * p.headDim > 65536 || p.intermediateCount > 262144) {
+            throw std::runtime_error("invalid/unsupported Qwen3 layer shape, stage or position");
+        }
+        if (!p.forwardUnsupportedReason.empty() || p.ropeTheta <= 1) {
+            throw std::runtime_error("unsupported Qwen3 forward configuration: " + p.forwardUnsupportedReason);
+        }
+    }
+
+    /** 按请求一次性分配工作区；同一模型各层复用，成功结束后统一释放。 */
+    Workspace Prepare(uint32_t tokens, uint32_t hidden, Qwen3LayerStage stage) {
+        const auto &p = weights.Plan();
+        Workspace w;
+        w.norm = static_cast<half*>(Allocate(size_t(tokens) * hidden * 2));
+        w.partial = static_cast<float*>(Allocate(size_t(tokens) * hidden * 4));
+        if (stage != Qwen3LayerStage::Mlp) {
+            w.qkv = static_cast<half*>(Allocate(size_t(tokens) * (p.queryHeadCount + 2 * p.kvHeadCount) * p.headDim * 2));
+            w.context = static_cast<half*>(Allocate(size_t(tokens) * p.queryHeadCount * p.headDim * 2));
+        }
+        if (stage != Qwen3LayerStage::Attention) {
+            w.gateup = static_cast<half*>(Allocate(size_t(tokens) * p.intermediateCount * 4));
+            w.activated = static_cast<half*>(Allocate(size_t(tokens) * p.intermediateCount * 2));
+        }
+        return w;
+    }
+
+    /**
+     * 在 GPU 原地更新一层隐藏状态；单层检查与全模型共用此计算和通信路径。
+     * @param layer 层号，调用方已验证。
+     * @param tokens 序列长度，范围 1..128。
+     * @param positionBegin 连续位置起点。
+     * @param stage 指定 Attention、MLP 或完整层。
+     * @param x FP16 [tokens,hidden] 行主序输入/输出，不读回 CPU。
+     * @param w 当前请求的 GPU 工作区，同 stream 顺序复用。
+     */
+    void RunLayer(uint32_t layer, uint32_t tokens, uint32_t positionBegin, Qwen3LayerStage stage,
+                  half *x, const Workspace &w) {
+        auto &r = *this;
+        const auto &p = weights.Plan();
+        const uint32_t hidden = p.hiddenSize;
+        auto norm = w.norm, qkv = w.qkv, context = w.context, gateup = w.gateup, activated = w.activated;
+        auto partial = w.partial;
+        const int t = tokens, h = hidden, d = p.headDim, qh = p.queryHeadCount, kh = p.kvHeadCount;
+        const int qw = qh * d, kw = kh * d, qkvWidth = qw + 2 * kw, m = p.intermediateCount;
+        const std::string prefix = "model.layers." + std::to_string(layer) + ".";
+        const bool attention = stage != Qwen3LayerStage::Mlp, mlp = stage != Qwen3LayerStage::Attention;
+        if (attention) {
+            Norm<<<t,256,0,r.stream>>>(x, r.Weight(prefix + "input_layernorm.weight", {hidden}), norm, h, h, 1, 0, p.rmsNormEps);
+            r.Linear(norm, r.Weight(prefix + "self_attn.mergeqkv.weight", {uint64_t(qkvWidth), hidden}), qkv, t, qkvWidth, h, false);
+            if (auto bias = r.Weight(prefix + "self_attn.mergeqkv.bias", {uint64_t(qkvWidth)}, true)) {
+                Bias<<<(t*qkvWidth+255)/256,256,0,r.stream>>>(qkv, bias, t*qkvWidth, qkvWidth);
+            }
+            Norm<<<t*qh,256,0,r.stream>>>(qkv, r.Weight(prefix + "self_attn.q_norm.weight", {uint64_t(d)}), qkv, d, qkvWidth, qh, 0, p.rmsNormEps);
+            Norm<<<t*kh,256,0,r.stream>>>(qkv, r.Weight(prefix + "self_attn.k_norm.weight", {uint64_t(d)}), qkv, d, qkvWidth, kh, qw, p.rmsNormEps);
+            Rope<<<t*(qh+kh),256,0,r.stream>>>(qkv, qh, kh, d, qkvWidth, positionBegin, p.ropeTheta);
+            Attention<<<t*qh,256,0,r.stream>>>(qkv, context, qh, kh, d, p.queryHeadBegin, p.kvHeadBegin, p.queryHeads / p.kvHeads);
+            r.Linear(context, r.Weight(prefix + "self_attn.o_proj.weight", {hidden, uint64_t(qw)}), partial, t, h, qw, true);
+            if (auto bias = r.Weight(prefix + "self_attn.o_proj.bias", {hidden}, true)) {
+                Bias<<<(t*h+255)/256,256,0,r.stream>>>(partial, bias, t*h, h);
+            }
+            Cuda(cudaGetLastError());
+            Nccl(ncclAllReduce(partial, partial, size_t(t) * h, ncclFloat, ncclSum, r.comm, r.stream));
+            Residual<<<(t*h+255)/256,256,0,r.stream>>>(x, partial, t*h);
+        }
+        if (mlp) {
+            Norm<<<t,256,0,r.stream>>>(x, r.Weight(prefix + "post_attention_layernorm.weight", {hidden}), norm, h, h, 1, 0, p.rmsNormEps);
+            r.Linear(norm, r.Weight(prefix + "mlp.gateup_proj.weight", {uint64_t(2*m), hidden}), gateup, t, 2*m, h, false);
+            Swiglu<<<(t*m+255)/256,256,0,r.stream>>>(gateup, activated, t*m, m);
+            r.Linear(activated, r.Weight(prefix + "mlp.down_proj.weight", {hidden, uint64_t(m)}), partial, t, h, m, true);
+            if (auto bias = r.Weight(prefix + "mlp.down_proj.bias", {hidden}, true)) {
+                Bias<<<(t*h+255)/256,256,0,r.stream>>>(partial, bias, t*h, h);
+            }
+            Cuda(cudaGetLastError());
+            Nccl(ncclAllReduce(partial, partial, size_t(t) * h, ncclFloat, ncclSum, r.comm, r.stream));
+            Residual<<<(t*h+255)/256,256,0,r.stream>>>(x, partial, t*h);
+        }
+        Cuda(cudaGetLastError());
+    }
+
+    /** 同步当前 stream 并检查 NCCL 异步错误；失败交给 worker 整组退出。 */
+    void Synchronize() {
+        Cuda(cudaStreamSynchronize(stream));
+        ncclResult_t asynchronous;
+        Nccl(ncclCommGetAsyncError(comm, &asynchronous));
+        Nccl(asynchronous);
+    }
+
     void ReleaseBuffers() {
         Cuda(cudaStreamSynchronize(stream));
         for (auto &buffer : buffers) {
@@ -231,20 +345,10 @@ Qwen3LayerExecutor::~Qwen3LayerExecutor() = default;
 std::vector<float> Qwen3LayerExecutor::Forward(uint32_t layer, uint32_t tokens, uint32_t hidden,
         uint32_t positionBegin, Qwen3LayerStage stage, const std::vector<float> &input) {
     auto &r = *impl;
-    const auto &p = r.weights.Plan();
-    if (!r.blas || layer >= p.layerCount || !tokens || tokens > 128 || hidden != p.hiddenSize ||
-        !hidden || hidden > 65536 || input.size() != uint64_t(tokens) * hidden || positionBegin > 1048576 ||
-        uint32_t(stage) > 2 || p.headDim % 2 || p.headDim > 256 || !p.headDim ||
-        (p.queryHeadCount + 2 * p.kvHeadCount) * p.headDim > 65536 || p.intermediateCount > 262144) {
-        throw std::runtime_error("invalid/unsupported Qwen3 layer shape, stage or position");
+    r.Validate(layer, tokens, hidden, positionBegin, stage);
+    if (input.size() != uint64_t(tokens) * hidden) {
+        throw std::runtime_error("invalid Qwen3 layer input size");
     }
-    if (!p.forwardUnsupportedReason.empty() || p.ropeTheta <= 1) {
-        throw std::runtime_error("unsupported Qwen3 forward configuration: " + p.forwardUnsupportedReason);
-    }
-    const int t = tokens, h = hidden, d = p.headDim, qh = p.queryHeadCount, kh = p.kvHeadCount;
-    const int qw = qh * d, kw = kh * d, qkvWidth = qw + 2 * kw, m = p.intermediateCount;
-    const std::string prefix = "model.layers." + std::to_string(layer) + ".";
-    const bool attention = stage != Qwen3LayerStage::Mlp, mlp = stage != Qwen3LayerStage::Attention;
     std::vector<half> host(input.size());
     for (size_t i = 0; i < input.size(); ++i) {
         if (!std::isfinite(input[i]) || std::fabs(input[i]) > 65504) {
@@ -253,57 +357,70 @@ std::vector<float> Qwen3LayerExecutor::Forward(uint32_t layer, uint32_t tokens, 
         host[i] = __float2half_rn(input[i]);
     }
     // Find 会检查设备绑定；任何算子开始前先验证当前设备与权重一致。
-    r.Weight(prefix + "input_layernorm.weight", {hidden});
+    r.Weight("model.layers." + std::to_string(layer) + ".input_layernorm.weight", {hidden});
     auto x = static_cast<half*>(r.Allocate(input.size() * 2));
-    auto norm = static_cast<half*>(r.Allocate(input.size() * 2));
-    auto partial = static_cast<float*>(r.Allocate(input.size() * 4));
+    auto workspace = r.Prepare(tokens, hidden, stage);
     Cuda(cudaMemcpyAsync(x, host.data(), host.size() * 2, cudaMemcpyHostToDevice, r.stream));
-
-    if (attention) {
-        auto qkv = static_cast<half*>(r.Allocate(size_t(t) * qkvWidth * 2));
-        auto context = static_cast<half*>(r.Allocate(size_t(t) * qw * 2));
-        Norm<<<t,256,0,r.stream>>>(x, r.Weight(prefix + "input_layernorm.weight", {hidden}), norm, h, h, 1, 0, p.rmsNormEps);
-        r.Linear(norm, r.Weight(prefix + "self_attn.mergeqkv.weight", {uint64_t(qkvWidth), hidden}), qkv, t, qkvWidth, h, false);
-        if (auto bias = r.Weight(prefix + "self_attn.mergeqkv.bias", {uint64_t(qkvWidth)}, true)) {
-            Bias<<<(t*qkvWidth+255)/256,256,0,r.stream>>>(qkv, bias, t*qkvWidth, qkvWidth);
-        }
-        Norm<<<t*qh,256,0,r.stream>>>(qkv, r.Weight(prefix + "self_attn.q_norm.weight", {uint64_t(d)}), qkv, d, qkvWidth, qh, 0, p.rmsNormEps);
-        Norm<<<t*kh,256,0,r.stream>>>(qkv, r.Weight(prefix + "self_attn.k_norm.weight", {uint64_t(d)}), qkv, d, qkvWidth, kh, qw, p.rmsNormEps);
-        Rope<<<t*(qh+kh),256,0,r.stream>>>(qkv, qh, kh, d, qkvWidth, positionBegin, p.ropeTheta);
-        Attention<<<t*qh,256,0,r.stream>>>(qkv, context, qh, kh, d, p.queryHeadBegin, p.kvHeadBegin, p.queryHeads / p.kvHeads);
-        r.Linear(context, r.Weight(prefix + "self_attn.o_proj.weight", {hidden, uint64_t(qw)}), partial, t, h, qw, true);
-        if (auto bias = r.Weight(prefix + "self_attn.o_proj.bias", {hidden}, true)) {
-            Bias<<<(t*h+255)/256,256,0,r.stream>>>(partial, bias, t*h, h);
-        }
-        Cuda(cudaGetLastError());
-        Nccl(ncclAllReduce(partial, partial, input.size(), ncclFloat, ncclSum, r.comm, r.stream));
-        Residual<<<(t*h+255)/256,256,0,r.stream>>>(x, partial, t*h);
-    }
-    if (mlp) {
-        auto gateup = static_cast<half*>(r.Allocate(size_t(t) * 2 * m * 2));
-        auto activated = static_cast<half*>(r.Allocate(size_t(t) * m * 2));
-        Norm<<<t,256,0,r.stream>>>(x, r.Weight(prefix + "post_attention_layernorm.weight", {hidden}), norm, h, h, 1, 0, p.rmsNormEps);
-        r.Linear(norm, r.Weight(prefix + "mlp.gateup_proj.weight", {uint64_t(2*m), hidden}), gateup, t, 2*m, h, false);
-        Swiglu<<<(t*m+255)/256,256,0,r.stream>>>(gateup, activated, t*m, m);
-        r.Linear(activated, r.Weight(prefix + "mlp.down_proj.weight", {hidden, uint64_t(m)}), partial, t, h, m, true);
-        if (auto bias = r.Weight(prefix + "mlp.down_proj.bias", {hidden}, true)) {
-            Bias<<<(t*h+255)/256,256,0,r.stream>>>(partial, bias, t*h, h);
-        }
-        Cuda(cudaGetLastError());
-        Nccl(ncclAllReduce(partial, partial, input.size(), ncclFloat, ncclSum, r.comm, r.stream));
-        Residual<<<(t*h+255)/256,256,0,r.stream>>>(x, partial, t*h);
-    }
-    Cuda(cudaGetLastError());
+    r.RunLayer(layer, tokens, positionBegin, stage, x, workspace);
     Cuda(cudaMemcpyAsync(host.data(), x, host.size() * 2, cudaMemcpyDeviceToHost, r.stream));
-    Cuda(cudaStreamSynchronize(r.stream));
-    ncclResult_t asynchronous;
-    Nccl(ncclCommGetAsyncError(r.comm, &asynchronous));
-    Nccl(asynchronous);
+    r.Synchronize();
     std::vector<float> result(host.size());
     for (size_t i = 0; i < host.size(); ++i) {
         result[i] = __half2float(host[i]);
         if (!std::isfinite(result[i])) {
             throw std::runtime_error("Qwen3 layer produced nonfinite output");
+        }
+    }
+    r.ReleaseBuffers();
+    return result;
+}
+
+std::vector<float> Qwen3LayerExecutor::Prefill(const std::vector<uint32_t> &tokenIds,
+                                             uint32_t positionBegin) {
+    auto &r = *impl;
+    const auto &p = r.weights.Plan();
+    if (tokenIds.empty() || tokenIds.size() > 128) {
+        throw std::runtime_error("invalid Qwen3 prefill token count");
+    }
+    r.Validate(0, tokenIds.size(), p.hiddenSize, positionBegin, Qwen3LayerStage::Full);
+    if (!p.vocabSize || p.vocabSize > 1048576 || !p.vocabCount ||
+        p.vocabCount > (protocol::kMaxPayload - 24) / 4 ||
+        p.vocabBegin > p.vocabSize || p.vocabCount > p.vocabSize - p.vocabBegin) {
+        throw std::runtime_error("unsupported Qwen3 prefill vocabulary size/slice");
+    }
+    for (auto id : tokenIds) {
+        if (id >= p.vocabSize) {
+            throw std::runtime_error("Qwen3 prefill token ID outside vocabulary");
+        }
+    }
+
+    // 权重查找同时验证设备绑定；不在任何 Decoder 层之间读回或上传隐藏状态。
+    const auto embedding = r.Weight("model.embed_tokens.weight", {p.vocabSize, p.hiddenSize});
+    const auto finalNorm = r.Weight("model.norm.weight", {p.hiddenSize});
+    const auto lmHead = r.Weight("lm_head.weight", {p.vocabCount, p.hiddenSize});
+    const int t = tokenIds.size(), h = p.hiddenSize;
+    auto ids = static_cast<uint32_t*>(r.Allocate(tokenIds.size() * sizeof(uint32_t)));
+    auto x = static_cast<half*>(r.Allocate(size_t(t) * h * 2));
+    auto workspace = r.Prepare(t, h, Qwen3LayerStage::Full);
+    auto logits = static_cast<float*>(r.Allocate(p.vocabCount * sizeof(float)));
+
+    Cuda(cudaMemcpyAsync(ids, tokenIds.data(), tokenIds.size() * sizeof(uint32_t), cudaMemcpyHostToDevice, r.stream));
+    Embed<<<(t*h+255)/256,256,0,r.stream>>>(ids, embedding, x, t*h, h);
+    Cuda(cudaGetLastError());
+    for (uint32_t layer = 0; layer < p.layerCount; ++layer) {
+        r.RunLayer(layer, t, positionBegin, Qwen3LayerStage::Full, x, workspace);
+    }
+    Norm<<<1,256,0,r.stream>>>(x + size_t(t - 1) * h, finalNorm, workspace.norm,
+                              h, h, 1, 0, p.rmsNormEps);
+    r.Linear(workspace.norm, lmHead, logits, 1, p.vocabCount, h, true);
+    Cuda(cudaGetLastError());
+
+    std::vector<float> result(p.vocabCount);
+    Cuda(cudaMemcpyAsync(result.data(), logits, result.size() * sizeof(float), cudaMemcpyDeviceToHost, r.stream));
+    r.Synchronize();
+    for (float value : result) {
+        if (!std::isfinite(value)) {
+            throw std::runtime_error("Qwen3 prefill produced nonfinite logits");
         }
     }
     r.ReleaseBuffers();
