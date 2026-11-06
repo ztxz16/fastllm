@@ -174,7 +174,11 @@ def collect(args: argparse.Namespace) -> Dict[str, object]:
         item for item in (str(output), str(root), os.environ.get("LD_LIBRARY_PATH", "")) if item
     )
 
-    queue = deque(iter_initial_elfs(root, output, excludes))
+    initial_elfs = list(iter_initial_elfs(root, output, excludes))
+    existing_libraries: Dict[str, List[Path]] = {}
+    for binary in initial_elfs:
+        existing_libraries.setdefault(binary.name, []).append(binary)
+    queue = deque(initial_elfs)
     scanned = set()
     bundled: Dict[str, Dict[str, Optional[str]]] = {}
     host: Dict[str, Dict[str, Optional[str]]] = {}
@@ -188,7 +192,14 @@ def collect(args: argparse.Namespace) -> Dict[str, object]:
             if not filecmp.cmp(source, target, shallow=False):
                 raise RuntimeError(f"Conflicting resolutions for {soname}: {source} and {target}")
         else:
-            shutil.copy2(source, target)
+            # Reuse an identical library already shipped by another runtime
+            # (for example FFmpeg), keeping links valid after relocation.
+            existing = next((path for path in existing_libraries.get(soname, [])
+                             if filecmp.cmp(source, path, shallow=False)), None)
+            if existing is not None:
+                target.symlink_to(os.path.relpath(existing, target.parent))
+            else:
+                shutil.copy2(source, target)
 
         package = owning_package(source) if has_dpkg_query else None
         copyright_name = copy_copyright(package, copyright_dir) if package else None

@@ -4,9 +4,10 @@
 import unittest
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
-from desktop.collect_libraries import find_nss_libraries, is_driver_library
+from desktop.collect_libraries import collect, find_nss_libraries, is_driver_library
 
 
 class DriverLibraryClassificationTest(unittest.TestCase):
@@ -51,6 +52,30 @@ class DriverLibraryClassificationTest(unittest.TestCase):
                 (private / "libsoftokn3.so").unlink()
                 with self.assertRaisesRegex(RuntimeError, "libsoftokn3"):
                     find_nss_libraries()
+
+
+class BundledLibraryReuseTest(unittest.TestCase):
+    def test_reuse_requires_identical_contents_and_survives_relocation(self):
+        for identical in (True, False):
+            with self.subTest(identical=identical), tempfile.TemporaryDirectory() as temporary:
+                parent = Path(temporary)
+                root = parent / "bundle"
+                media = root / "media/lib/libmedia.so.1"
+                media.parent.mkdir(parents=True)
+                media.write_bytes(b"\x7fELF bundled media")
+                external = parent / "libmedia.so.1"
+                external.write_bytes(media.read_bytes() if identical else b"\x7fELF other version")
+                args = SimpleNamespace(root=root, output=root / "lib", copyrights=root / "licenses",
+                                       exclude=[], optional=[], no_nss=True)
+                with patch("desktop.collect_libraries.run_ldd", return_value=[(external.name, external)]), \
+                     patch("desktop.collect_libraries.shutil.which", return_value=None):
+                    collect(args)
+                target = args.output / external.name
+                self.assertEqual(target.is_symlink(), identical)
+                self.assertEqual(target.read_bytes(), external.read_bytes())
+                moved = parent / "relocated bundle 中文"
+                root.rename(moved)
+                self.assertEqual((moved / "lib" / external.name).read_bytes(), external.read_bytes())
 
 
 if __name__ == "__main__":
