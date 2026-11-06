@@ -440,10 +440,10 @@ code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospac
 .confirmation-confirm-button:hover { background: #9f5908; box-shadow: 0 7px 17px rgba(185, 108, 18, 0.24); }
 .confirmation-confirm-button.danger { background: var(--danger); box-shadow: 0 6px 15px rgba(217, 74, 88, 0.18); }
 .confirmation-confirm-button.danger:hover { background: #bd3442; box-shadow: 0 7px 17px rgba(217, 74, 88, 0.24); }
-.profile-editor { width: min(100%, 840px); max-height: calc(100dvh - 48px); margin: 0; padding: 0 20px; overflow-y: auto; overscroll-behavior: contain; border-radius: 16px; box-shadow: 0 24px 80px #122c2430; animation: modal-window-in .18s ease-out; }
+.profile-editor { width: min(100%, 920px); max-height: calc(100dvh - 48px); margin: 0; padding: 0 28px; overflow-y: auto; overscroll-behavior: contain; border-radius: 16px; box-shadow: 0 24px 80px #122c2430; animation: modal-window-in .18s ease-out; }
 .profile-editor::-webkit-scrollbar { width: 8px; }
 .profile-editor::-webkit-scrollbar-thumb { border: 2px solid white; border-radius: 999px; background: #c9cdd7; }
-.modal-close-button { gap: 6px; background: white; }
+.modal-close-button { flex-shrink: 0; gap: 6px; background: white; white-space: nowrap; }
 .modal-close-button > span:first-child { color: #737c8d; font-size: 17px; font-weight: 400; line-height: 1; }
 #profile-editor-title:focus { outline: none; }
 @keyframes modal-backdrop-in { from { opacity: 0; } }
@@ -468,11 +468,12 @@ code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospac
 .save-state.downloading { background: var(--primary-soft); color: var(--primary); }
 .save-state.failed { background: var(--danger-soft); color: var(--danger); }
 
-.simple-profile { width: min(100%, 760px); }
+.simple-profile { width: min(100%, 840px); }
 .video-profile .configuration-mode-section,
 .video-profile #automatic-resource-limits,
 .video-profile #vision-module,
 .video-profile #profile-parameters,
+.video-profile #editor-speculative,
 .video-profile [data-inference-setting],
 .video-profile #server-model-name-field,
 .video-profile #server-hide-input-field { display: none !important; }
@@ -500,12 +501,15 @@ code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospac
 .video-job p { white-space: pre-wrap; overflow-wrap: anywhere; }
 #api-contract { width: 100%; font-family: monospace; resize: vertical; }
 .runtime-auto-profile .editor-navigation,
-.runtime-auto-profile #editor-speculative,
 .runtime-auto-profile #editor-hybrid,
 .runtime-auto-profile #editor-advanced,
 .runtime-auto-profile [data-inference-setting],
 .runtime-auto-profile .speculative-auto-option { display: none; }
-.model-selection-section { padding: 4px 0 24px; }
+.model-selection-section { display: grid; gap: 20px; padding: 4px 0 28px; }
+.model-selection-section > .setup-section-heading { margin-bottom: 0; }
+.profile-editor .form-grid { gap: 18px 20px; }
+.model-selection-section .field > small { margin-top: 8px; line-height: 1.6; }
+.model-selection-section .field :is(input, select) { height: 40px; }
 .configuration-mode-section { padding: 22px 0 8px; border-top: 1px solid var(--line); }
 .setup-section-heading { display: flex; align-items: center; gap: 10px; margin-bottom: 15px; }
 .setup-section-heading > span { display: grid; width: 26px; height: 26px; place-items: center; border-radius: 8px; background: var(--primary-soft); color: var(--primary); font-size: 11px; font-weight: 700; }
@@ -628,8 +632,8 @@ code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospac
 .section-title { display: flex; align-items: baseline; gap: 9px; margin-bottom: 12px; }
 .section-title strong { color: #25352e; font-size: 13px; }
 .section-title small { color: var(--subtle); font-size: 11px; }
-.speculative-section { padding: 20px 0 0; border: 0; border-top: 1px solid var(--line); border-radius: 0; background: transparent; }
-.speculative-section .section-title { margin-bottom: 11px; }
+.profile-editor > .speculative-section { margin: 16px 0; }
+.speculative-section .configuration-mode-description { margin: 0; }
 .hybrid-inference-section { padding: 20px 0 0; border: 0; border-top: 1px solid var(--line); border-radius: 0; background: transparent; }
 .hybrid-inference-section .section-title { margin-bottom: 11px; }
 .hybrid-inference-section .switch-field { border-color: #dbe5ec; background: rgba(255, 255, 255, 0.88); }

@@ -57,7 +57,8 @@ const AUTOMATIC_CONFIGURATION_DEFAULTS = Object.freeze({
   mtp: "auto",
   draft_tokens: "auto"
 });
-const AUTOMATIC_CONFIGURATION_FIELDS = new Set(Object.keys(AUTOMATIC_CONFIGURATION_DEFAULTS));
+const EXTERNAL_DRAFT_FIELDS = new Set(["use_external_draft", "speculative_algorithm", "speculative_draft_model_path", "mtp", "draft_tokens", "draft_threshold"]);
+const AUTOMATIC_CONFIGURATION_FIELDS = new Set([...Object.keys(AUTOMATIC_CONFIGURATION_DEFAULTS), ...EXTERNAL_DRAFT_FIELDS]);
 function resetProfileSearch() {
   state.profileQuery = "";
   elements.profileSearch.value = "";
@@ -79,7 +80,14 @@ function fillForm(config) {
       .map((field) => `--${field} ${JSON.stringify(config[field])}`);
     config = { ...config, extra_args: [...limits, config.extra_args].filter(Boolean).join(" ") };
   }
+  config = {...config, use_external_draft: config?.use_external_draft ??
+    (config?.config_mode !== "auto" && Boolean(config?.speculative_draft_model_path))};
+  if (config.use_external_draft) {
+    config = {...config, mtp: "auto", draft_tokens:
+      Number(config.draft_tokens) > 0 ? config.draft_tokens : Number(config.mtp) > 0 ? config.mtp : "auto"};
+  }
   state.speculativeCountField = initialSpeculativeTokenField(config || {});
+  if (config.use_external_draft) document.getElementById("editor-speculative").open = true;
   for (const input of elements.launchForm.querySelectorAll("[data-field]")) {
     const value = config?.[input.dataset.field];
     if (input.type === "checkbox") {
@@ -213,15 +221,31 @@ function handleFormChange(event) {
     state.automaticConfigStatus = {phase: "idle"};
     elements.launchForm.querySelector('[data-field="command"]').value = "server";
   }
+  if (changedField === "use_external_draft") {
+    const enabled = event.target.checked;
+    const algorithm = elements.launchForm.querySelector('[data-field="speculative_algorithm"]');
+    if (!enabled || algorithm.value === "off") algorithm.value = "auto";
+    elements.launchForm.querySelector('[data-field="mtp"]').value = "auto";
+    if (!enabled) {
+      elements.launchForm.querySelector('[data-field="speculative_draft_model_path"]').value = "";
+      elements.launchForm.querySelector('[data-field="draft_tokens"]').value = "auto";
+      elements.launchForm.querySelector('[data-field="draft_threshold"]').value = "";
+    }
+    state.speculativeCountField = "draft_tokens";
+  }
   if (changedField === "speculative_algorithm" && event.target.value === "off") {
     for (const [field, value] of Object.entries({ mtp: "0", draft_tokens: "auto", speculative_draft_model_path: "" })) {
       elements.launchForm.querySelector(`[data-field="${field}"]`).value = value;
     }
     elements.launchForm.querySelector('[data-field="enable_speculative_decoding"]').checked = false;
+    elements.launchForm.querySelector('[data-field="use_external_draft"]').checked = false;
+    elements.launchForm.querySelector('[data-field="draft_threshold"]').value = "";
   } else if (changedField === "speculative_algorithm" && event.target.value !== state.editingConfig?.speculative_algorithm) {
     const mtp = elements.launchForm.querySelector('[data-field="mtp"]');
     const draft = elements.launchForm.querySelector('[data-field="draft_tokens"]');
-    if (event.target.value === "mtp") {
+    if (collectForm().use_external_draft) {
+      mtp.value = "auto";
+    } else if (event.target.value === "mtp") {
       const count = Number(draft.value) > 0 ? draft.value : mtp.value;
       mtp.value = Number(count) >= 1 && Number(count) <= 8 ? count
         : collectForm().speculative_draft_model_path ? "auto" : "3";
@@ -238,7 +262,7 @@ function handleFormChange(event) {
   if (changedField === "speculative_algorithm") {
     state.speculativeCountField = initialSpeculativeTokenField(collectForm());
   }
-  if (changedField === "speculative_draft_model_path" && !event.target.value.trim()
+  if (changedField === "speculative_draft_model_path" && !collectForm().use_external_draft && !event.target.value.trim()
       && collectForm().speculative_algorithm === "mtp" && state.speculativeCountField === "draft_tokens") {
     elements.launchForm.querySelector('[data-field="mtp"]').value = collectForm().draft_tokens;
     elements.launchForm.querySelector('[data-field="draft_tokens"]').value = "auto";
@@ -288,15 +312,23 @@ function updateConditionalFields() {
     document.getElementById(id).classList.toggle("hidden", isWebui);
   }
   const speculativeOff = config.speculative_algorithm === "off";
+  const externalDraft = Boolean(config.use_external_draft);
+  const automaticDraftOff = config.config_mode === "auto" && !externalDraft;
+  document.getElementById("editor-speculative").classList.toggle("hidden", isWebui || config.backend !== "llm");
+  document.getElementById("speculative-options").classList.toggle("hidden", automaticDraftOff);
+  const thresholdEnabled = !speculativeOff && !automaticDraftOff && ["", "auto", "dspark"].includes(config.speculative_algorithm);
+  document.getElementById("speculative-threshold-field").classList.toggle("hidden", !thresholdEnabled);
+  elements.launchForm.querySelector('[data-field="draft_threshold"]').disabled = !thresholdEnabled;
   const mtpCount = speculativeTokenField() === "mtp";
   elements.speculativeMtpField.classList.toggle("hidden", speculativeOff || !mtpCount);
   elements.speculativeDraftTokensField.classList.toggle("hidden", speculativeOff || mtpCount);
-  elements.speculativePathField.classList.toggle("hidden", speculativeOff);
+  elements.speculativePathField.classList.toggle("hidden", speculativeOff || !externalDraft);
   for (const field of ["mtp", "draft_tokens", "speculative_draft_model_path"]) {
     elements.launchForm.querySelector(`[data-field="${field}"]`).disabled = speculativeOff
+      || (field === "speculative_draft_model_path" && !externalDraft)
       || (field === "mtp" && !mtpCount) || (field === "draft_tokens" && mtpCount);
   }
-  elements.chooseDraftModelFolder.disabled = speculativeOff;
+  elements.chooseDraftModelFolder.disabled = speculativeOff || !externalDraft;
   const speculativeHints = {
     off: t("Speculative decoding is off. No draft model will be loaded."),
     mtp: t("Built-in MTP needs 1–8 draft tokens. For external MTP, choose a checkpoint file or folder; auto uses its default."),
@@ -304,7 +336,9 @@ function updateConditionalFields() {
     dspark: t("Choose a DSpark model folder, or set the token count for built-in DSpark. MTP is disabled."),
     auto: t("Detect the algorithm from the draft model or existing MTP settings. Without either, speculative decoding stays off.")
   };
-  elements.speculativeModeHint.textContent = speculativeHints[config.speculative_algorithm] || speculativeHints.auto;
+  elements.speculativeModeHint.textContent = automaticDraftOff
+    ? t("Enable an external draft to configure its file, token count and threshold.")
+    : speculativeHints[config.speculative_algorithm] || speculativeHints.auto;
   elements.cudaDeviceField.classList.toggle("hidden", config.device !== "cuda");
   elements.tpDeviceField.classList.toggle("hidden", config.device !== "tp");
   elements.cudappDeviceField.classList.toggle("hidden", config.device !== "cudapp");
@@ -329,6 +363,7 @@ function updateConditionalFields() {
 }
 
 function initialSpeculativeTokenField(config) {
+  if (config.use_external_draft) return "draft_tokens";
   if (config.speculative_algorithm === "mtp") {
     const externalCount = config.speculative_draft_model_path && !(Number(config.mtp) > 0) && Number(config.draft_tokens) > 0;
     return externalCount ? "draft_tokens" : "mtp";
@@ -441,7 +476,8 @@ async function configureProfileAutomatically({ automatic = false, selection = nu
     }
     const recommendedFields = {};
     for (const [field, value] of Object.entries(recommendation.config)) {
-      if (AUTOMATIC_CONFIGURATION_FIELDS.has(field)) recommendedFields[field] = value;
+      if (AUTOMATIC_CONFIGURATION_FIELDS.has(field)
+          && !(current.use_external_draft && EXTERNAL_DRAFT_FIELDS.has(field))) recommendedFields[field] = value;
     }
     state.editingConfig = {
       ...collectForm(), ...selection, ...recommendedFields,
@@ -954,6 +990,9 @@ function showProfileEditor() {
   document.body.classList.add("modal-open");
   elements.launchForm.scrollTop = 0;
   elements.automaticResourceLimits.open = false;
+  const config = collectForm();
+  document.getElementById("editor-speculative").open = Boolean(config.use_external_draft)
+    || (config.config_mode !== "auto" && (Number(config.mtp) > 0 || ["mtp", "dspark", "dflash"].includes(config.speculative_algorithm)));
   elements.automaticTuning.open = false;
   document.getElementById("vision-module").open = false;
   elements.launchForm.querySelector("#editor-advanced").open = !isSimpleNewProfile();

@@ -112,6 +112,62 @@ class LauncherConfigTest(unittest.TestCase):
         self.assertIn("--draft_tokens 7", preview["command"])
         self.assertEqual(preview["endpoint"], "http://127.0.0.1:18080")
 
+    def test_external_draft_round_trip_and_actual_cli_arguments(self):
+        from fastllm_pytools.cli import args_parser
+        for mode in ("auto", "custom"):
+            for threshold in ("", "0", "0.75"):
+                with self.subTest(mode=mode, threshold=threshold):
+                    saved = self.runtime.save_profile(None, self.config(
+                        config_mode=mode, use_external_draft=True,
+                        speculative_algorithm="auto", speculative_draft_model_path=self.draft_path,
+                        draft_tokens="5", draft_threshold=threshold))
+                    profile = self.runtime.profiles()[saved["index"]]
+                    self.assertTrue(profile["use_external_draft"])
+                    self.assertEqual(profile["draft_threshold"], threshold)
+                    self.assertEqual(self.runtime.preview(profile)["errors"], [])
+                    args = args_parser().parse_args(build_fastllm_argv(config_from_dict(profile))[1:])
+                    self.assertEqual(args.speculative_draft_model_path, self.draft_path)
+                    self.assertEqual(args.draft_tokens, 5)
+                    self.assertEqual(args.speculative_dspark_confidence_threshold,
+                                     float(threshold) if threshold else 0.5)
+
+    def test_external_draft_validation_includes_automatic_mode(self):
+        for mode in ("auto", "custom"):
+            base = self.config(config_mode=mode, use_external_draft=True,
+                               speculative_draft_model_path=self.draft_path)
+            for threshold in ("-0.1", "1.01", "nan", "inf", "invalid"):
+                with self.subTest(mode=mode, threshold=threshold):
+                    preview = self.runtime.preview({**base, "draft_threshold": threshold})
+                    self.assertIn("draft_threshold", {field for issue in preview["fieldErrors"]
+                                                     for field in issue["fields"]})
+            for path in ("", "/missing/draft-model"):
+                preview = self.runtime.preview({**base, "speculative_draft_model_path": path})
+                self.assertIn("speculative_draft_model_path", {field for issue in preview["fieldErrors"]
+                                                             for field in issue["fields"]})
+            preview = self.runtime.preview({**base, "draft_tokens": "0"})
+            self.assertIn("draft_tokens", {field for issue in preview["fieldErrors"]
+                                          for field in issue["fields"]})
+
+    def test_external_draft_switch_disables_saved_path_and_preserves_legacy_profiles(self):
+        for mode in ("auto", "custom"):
+            saved = self.runtime.save_profile(None, self.config(
+                config_mode=mode, use_external_draft=False,
+                speculative_draft_model_path="/missing/old-draft"))["profile"]
+            self.assertEqual(saved["speculative_draft_model_path"], "")
+            self.assertEqual(self.runtime.preview(saved)["errors"], [])
+            self.assertNotIn("--speculative_draft_model_path", build_fastllm_argv(config_from_dict(saved)))
+        legacy = config_from_dict(self.config(speculative_draft_model_path=self.draft_path))
+        self.assertIsNone(legacy.use_external_draft)
+        self.assertIn(self.draft_path, build_fastllm_argv(legacy))
+        self.assertFalse(config_from_dict({"use_external_draft": "false"}).use_external_draft)
+
+    def test_dspark_threshold_is_not_forwarded_to_other_algorithms(self):
+        for algorithm in ("mtp", "dflash"):
+            config = config_from_dict(self.config(use_external_draft=True,
+                speculative_algorithm=algorithm, speculative_draft_model_path=self.draft_path,
+                draft_threshold="0.2"))
+            self.assertNotIn("--speculative_dspark_confidence_threshold", build_fastllm_argv(config))
+
     def test_profile_round_trip_uses_tui_config_file(self):
         saved = self.runtime.save_profile(None, self.config())
         self.assertEqual(saved["index"], 0)
