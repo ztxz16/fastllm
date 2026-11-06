@@ -95,3 +95,80 @@ PYTHONDONTWRITEBYTECODE=1 python3 test/distributed/run_process_tp.py --frontend-
 - 普通超时会发送 SIGKILL 并限时回收。内核不可中断状态等异常情况下仍可能无法及时回收；
   此时保留错误并阻止重启，不承诺强制信号能解除驱动或内核挂死。
 - Ready 仅表示底座就绪，不代表模型可接收请求。
+
+## Qwen3 按 rank 读取权重（独立组件，尚未接入推理）
+
+新增 `Qwen3ShardLoader` 公共 C++ 接口。构造时只读 HF 配置、索引和 safetensors
+文件头；`LoadTensor` 直接读取本 rank 的行/列区间，合并到最终本地缓冲区。
+这一步没有把权重装入 GPU，也没有启用 `--tp-backend process` 推理。
+
+支持范围：
+
+- 标准 HF `model_type=qwen3` 稠密模型，单文件或 `weight_map` 多文件 safetensors。
+- F16、BF16、F32 原样读取，不进行精度转换；融合的来源张量必须 dtype 相同。
+- QKV 按头切分、Gate/Up 成对切分、O/Down 按列切分、LM head 按词表切分。
+- Embedding 和 Norm 复制；tied embedding 缺少独立 LM head 时从 embedding 读取词表分片。
+- 维度非整除时均匀分配余数；TP 大于 KV 头数时复制 KV，保持 Q/O 分片对应。
+- 可选完整 Q/K/V bias；O/Down bias 仅 rank 0 读取，其他 rank 输出零，避免归约重复相加。
+- 未量化权重之外的 dtype、预融合源权重、Gate/Up bias、未知权重与非法布局明确拒绝。
+  尚不支持设备比例配置或线程后端的逐层分片尺寸轮换。
+- 输入文件在读取器生命周期内必须保持不变。读取器检查文件大小变化与短读，
+  不保证检测同尺寸的外部篡改。调用方提供每个目标张量的分配上限。
+- 相对模型路径在构造时固定，后续改变工作目录不会切换来源。配置、索引和
+  safetensors 文件头的重复 JSON 字段（含转义后的同名键）明确拒绝，不采用覆盖值。
+
+在**服务器**编译并运行（这些命令不会由验收脚本自动执行）：
+
+```bash
+cmake -S . -B build-process-tp-04d4599f \
+  -DUSE_CUDA=ON -DUSE_NUMAS=OFF -DBUILD_PROCESS_TP=ON -DCUDA_ARCH=native
+cmake --build build-process-tp-04d4599f --target fastllm_tp_shard_check -j 4
+python3 test/distributed/run_qwen3_shards.py \
+  --check build-process-tp-04d4599f/fastllm_tp_shard_check \
+  --build-cache build-process-tp-04d4599f/CMakeCache.txt
+```
+
+该检查是纯 CPU 文件读取测试，不需要下载模型或占用 GPU。也可以在服务器使用
+`-DUSE_CUDA=OFF` 的独立构建目录。它不代表 CUDA 前向或进程推理已经通过。
+
+首个真实模型选用官方 [Qwen/Qwen3-1.7B](https://huggingface.co/Qwen/Qwen3-1.7B)
+未量化 safetensors 版本，保留 config.json、权重及 tokenizer 相关文件。
+官方配置为 28 层、16 个 Q 头、8 个 KV 头、共享 embedding，权重 dtype 为 BF16；
+这些维度适合先验证 TP=2。当前 CPU 读取器原样读取 BF16，不要求预先转 FP16。
+不要选 GGUF、AWQ、GPTQ、FP8 或 MoE 变体；这些格式尚未接入此读取器。
+后续 V100 GPU 前向验证计划使用 FP16，精度转换还需在接入前向时实现与验证。
+若导出真实模型分片，embedding 的单张量大小超过默认 512 MiB，应添加
+`--max-bytes 1073741824`；仅检查元数据不分配该权重缓冲区。
+
+验收器保留固定小型输入、逐 rank 原始输出、完整命令与日志，验证每个目标张量的
+dtype/shape、逐元素数值和原始字节，并将分片重组后与原始权重比较；覆盖三种 dtype、
+TP=1/2/3/4/8、MHA/GQA、不均匀 KV 分组、共享权重、偏置、多文件和拒绝路径。
+还覆盖构造后切换工作目录、重复 JSON 字段和包含转义的合法 JSON。
+结果保存为 `summary.md/csv/json/xlsx`，任一 case 失败退出非零。全部预定用例完成前
+汇总不能为 PASS，JSON 记录 `complete` 与完成数量；异常退出不能充当正常拒绝。
+超时和中断也保留已写出的 stdout/stderr。禁止 `python -O`。
+
+报告中的 `payload_bytes_read` 是请求读取的 payload 字节数，不是真实磁盘带宽或
+页缓存读取量；`max_tensor_buffer_bytes` 是最大单个返回缓冲区，不是测得的进程 RSS。
+正式 worker 持有的权重总量可由 `tensor_bytes` 估计，仍需后续接入后的真实内存验证。
+
+仅检查真实模型元数据，不读取权重 payload：
+
+```bash
+build-process-tp-04d4599f/fastllm_tp_shard_check \
+  --model /path/to/Qwen3 --rank 0 --world-size 2
+```
+
+带 `--output NEW_DIR` 会逐张量读取并导出原始字节；目录必须不存在，失败时保留已导出部分。
+`--max-bytes` 默认 512 MiB，限制单个目标张量；大模型 embedding 可能需要显式提高此值。
+检查程序的 `--change-cwd DIR` 仅用于构造后切换目录的回归，仍调用相同公共读取接口。
+
+仅运行验收器自身的 Python 回归（不验证 C++，不编译）：
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover \
+  -s test/distributed -p 'test_qwen3_shard_runner.py' -v
+```
+
+后续再将该公共读取器接入 worker 加载命令、Qwen3 rank-local 前向、KV 生命周期与统一采样。
+CUDA Graph、自定义 AllReduce、跨请求前缀缓存仍需后续逐项适配。
