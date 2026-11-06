@@ -24,6 +24,8 @@ option(BUILD_CLI "build cli" OFF)
 
 option(UNIT_TEST "build unit tests" OFF)
 
+option(BUILD_PROCESS_TP "build Linux process TP infrastructure (experimental)" OFF)
+
 if(NOT DEFINED CUDA_ARCH)
     if(DEFINED CMAKE_CUDA_ARCHITECTURES)
         set(CUDA_ARCH "${CMAKE_CUDA_ARCHITECTURES}")
@@ -690,6 +692,37 @@ if (USE_TOPS) # For suiyuan
     #target_link_libraries(main rtcu)
 endif()
 
+if (BUILD_PROCESS_TP)
+    if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR USE_ROCM OR USE_IVCOREX)
+        message(FATAL_ERROR "Process TP currently requires Linux with NVIDIA CUDA or a CPU control-only build")
+    endif()
+    find_package(Threads REQUIRED)
+    add_library(fastllm_process_tp STATIC src/distributed/process_group.cpp)
+    set_target_properties(fastllm_process_tp PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(fastllm_process_tp PUBLIC ${PROJECT_SOURCE_DIR}/include)
+    target_link_libraries(fastllm_process_tp PUBLIC Threads::Threads)
+
+    add_executable(fastllm_tp_worker tools/src/tp_worker.cpp)
+    target_include_directories(fastllm_tp_worker PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    target_link_libraries(fastllm_tp_worker PRIVATE fastllm_process_tp)
+    if(USE_CUDA)
+        find_library(FASTLLM_PROCESS_CUDART cudart HINTS ${CMAKE_CUDA_IMPLICIT_LINK_DIRECTORIES})
+        if(NOT FASTLLM_PROCESS_CUDART)
+            message(FATAL_ERROR "Process TP worker requires the CUDA runtime library (cudart)")
+        endif()
+        target_compile_definitions(fastllm_tp_worker PRIVATE FASTLLM_PROCESS_TP_CUDA)
+        target_include_directories(fastllm_tp_worker PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        target_link_libraries(fastllm_tp_worker PRIVATE ${FASTLLM_PROCESS_CUDART} nccl)
+        set_target_properties(fastllm_tp_worker PROPERTIES
+            BUILD_RPATH "$ORIGIN;$ORIGIN/../nvidia/cuda_runtime/lib;$ORIGIN/../nvidia/nccl/lib"
+            INSTALL_RPATH "$ORIGIN;$ORIGIN/../nvidia/cuda_runtime/lib;$ORIGIN/../nvidia/nccl/lib")
+    endif()
+
+    add_executable(fastllm_tp_check tools/src/tp_check.cpp third_party/json11/json11.cpp)
+    target_link_libraries(fastllm_tp_check PRIVATE fastllm_process_tp)
+    install(TARGETS fastllm_tp_worker fastllm_tp_check RUNTIME DESTINATION bin)
+endif()
+
 if (PY_API)
     if(POLICY CMP0148)
         cmake_policy(SET CMP0148 NEW)
@@ -773,6 +806,14 @@ endif()
 
 add_library(fastllm_tools SHARED ${FASTLLM_CXX_SOURCES} ${FASTLLM_CUDA_SOURCES} ${FASTLLM_TFACC_SOURCES} ${FASTLLM_TOPS_SOURCES} tools/src/pytools.cpp)
 target_link_libraries(fastllm_tools PUBLIC ${FASTLLM_LINKED_LIBS})
+
+if (BUILD_PROCESS_TP)
+    add_dependencies(fastllm_tools fastllm_tp_worker fastllm_tp_check)
+    add_custom_command(TARGET fastllm_tools POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/tools/ftllm
+        COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:fastllm_tp_worker> ${CMAKE_BINARY_DIR}/tools/ftllm/
+        COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:fastllm_tp_check> ${CMAKE_BINARY_DIR}/tools/ftllm/)
+endif()
 
 set(BUILD_INFO_USE_CUDA "false")
 set(BUILD_INFO_USE_ROCM "false")
