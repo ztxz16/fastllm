@@ -720,6 +720,16 @@ if (BUILD_PROCESS_TP)
 
     add_executable(fastllm_tp_check tools/src/tp_check.cpp third_party/json11/json11.cpp)
     target_link_libraries(fastllm_tp_check PRIVATE fastllm_process_tp)
+
+    # 独立的 rank-local 权重加载组件；不链接 CUDA，也不启用模型 process 后端。
+    add_library(fastllm_tp_weights STATIC
+        src/distributed/qwen3_shard_loader.cpp third_party/json11/json11.cpp)
+    set_target_properties(fastllm_tp_weights PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(fastllm_tp_weights PUBLIC ${PROJECT_SOURCE_DIR}/include
+        PRIVATE ${PROJECT_SOURCE_DIR}/third_party/json11)
+    target_compile_features(fastllm_tp_weights PUBLIC cxx_std_17)
+    add_executable(fastllm_tp_shard_check tools/src/tp_shard_check.cpp)
+    target_link_libraries(fastllm_tp_shard_check PRIVATE fastllm_tp_weights)
     install(TARGETS fastllm_tp_worker fastllm_tp_check RUNTIME DESTINATION bin)
 endif()
 

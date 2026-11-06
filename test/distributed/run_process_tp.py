@@ -32,9 +32,13 @@ def capture(command, timeout=10):
 
 
 def save_report(output, rows, metadata):
-    status = "PASS" if rows and all(row["status"] == "PASS" for row in rows) else "FAIL"
-    (output / "summary.json").write_text(json.dumps(
-        {"status": status, "metadata": metadata, "cases": rows}, ensure_ascii=False, indent=2), encoding="utf-8")
+    expected = metadata.get("expected_case_count")
+    complete = expected is None or len(rows) == expected
+    status = "PASS" if complete and rows and all(row["status"] == "PASS" for row in rows) else "FAIL"
+    summary = {"status": status, "metadata": metadata, "cases": rows}
+    if expected is not None:
+        summary.update(complete=complete, completed_case_count=len(rows), expected_case_count=expected)
+    (output / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     fields = ["case", "backend", "status", "max_abs_error", "mean_abs_error", "failed_elements", "reason"]
 
     def cell(value):
@@ -47,9 +51,13 @@ def save_report(output, rows, metadata):
         writer = csv.writer(handle)
         writer.writerow(fields)
         writer.writerows(display)
-    lines = [f"# Process TP infrastructure: {status}", "",
+    title = metadata.get("report_title", "Process TP infrastructure")
+    description = metadata.get("report_description", "无数值输出的生命周期检查，误差字段为 n/a。所有原始结果见 summary.json。")
+    if expected is not None:
+        description += f" 已完成 {len(rows)}/{expected} 个用例。"
+    lines = [f"# {title}: {status}", "",
              "功能检查；不代表模型 TP、CUDA Graph、自定义 AllReduce 或前缀缓存已实现。",
-             "无数值输出的生命周期检查，误差字段为 n/a。所有原始结果见 summary.json。", "",
+             description, "",
              "| " + " | ".join(fields) + " |", "| " + " | ".join(["---"] * len(fields)) + " |"]
     lines.extend("| " + " | ".join(item.replace("|", "\\|").replace("\n", " ") for item in row) + " |"
                  for row in display)
