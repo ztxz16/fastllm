@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Qwen3 多进程 TP 单请求文本入口；tokenizer 在 CPU，权重和前向只在独立 worker。"""
+"""Qwen3 多进程 TP 单次/常驻文本入口；tokenizer 在 CPU，权重和前向只在独立 worker。"""
 
 import argparse
 from datetime import datetime, timezone
@@ -106,10 +106,51 @@ def run_native(binary, worker, model, request, devices, output, timeout=1800):
     return report
 
 
+def run_interactive(args, tokenizer, output):
+    from qwen3_process_session import Qwen3ProcessSession, GenerationRejected
+
+    count, failures = 0, 0
+    with Qwen3ProcessSession(args.binary, args.worker, args.model, args.devices, output / "session") as session:
+        print("模型已加载。每行一个独立请求，Ctrl-D 退出；不自动保留对话历史。", file=sys.stderr)
+        for line in sys.stdin:
+            prompt = line.rstrip("\r\n")
+            if not prompt.strip():
+                continue
+            count += 1
+            item = dict(status="FAIL", prompt=prompt)
+            try:
+                request = prepare_request(args.model.resolve(), tokenizer, prompt, raw=args.raw,
+                    thinking=args.thinking, max_new_tokens=args.max_new_tokens, temperature=args.temperature,
+                    top_k=args.top_k, top_p=args.top_p, seed=args.seed, eos_ids=args.eos_token_id,
+                    ignore_eos=args.ignore_eos)
+                report = session.generate(request)
+                text = tokenizer.decode(report["token_ids"], skip_special_tokens=True, clean_up_tokenization_spaces=False)
+                item.update(status="PASS", text=text, native=report)
+                print(text, flush=True)
+                print(f"request={count}, finish={report['finish_reason']}, tokens={len(report['token_ids'])}", file=sys.stderr)
+            except (ValueError, GenerationRejected) as error:
+                failures += 1
+                item["status"] = "FAIL"
+                item["error"] = f"{type(error).__name__}: {error}"
+                print(f"request={count}, FAIL: {item['error']}", file=sys.stderr)
+                if session.state != "ready":
+                    raise
+            except BaseException as error:
+                item.update(status="FAIL", error=f"{type(error).__name__}: {error}")
+                raise
+            finally:
+                (output / f"text-{count:06d}.json").write_text(json.dumps(item, ensure_ascii=False, indent=2))
+    print(f"requests={count}, failed={failures}, logs={output}", file=sys.stderr)
+    return dict(status="FAIL" if failures else "PASS", requests=count, failed_requests=failures,
+                shutdown_complete=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, required=True)
-    parser.add_argument("--prompt", required=True)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--prompt")
+    mode.add_argument("--interactive", action="store_true", help="常驻模型，每行独立请求，EOF 退出")
     parser.add_argument("--binary", type=Path, default=ROOT / "build-process-tp-cu126/fastllm_tp_generate")
     parser.add_argument("--worker", type=Path, default=ROOT / "build-process-tp-cu126/fastllm_tp_worker")
     parser.add_argument("--devices", default="0,1")
@@ -134,6 +175,9 @@ def main():
         os.environ.setdefault("USE_TORCH", "0")
         from transformers import AutoTokenizer
         tokenizer = AutoTokenizer.from_pretrained(str(args.model.resolve()), local_files_only=True, trust_remote_code=False)
+        if args.interactive:
+            result.update(run_interactive(args, tokenizer, output))
+            return 0 if result["status"] == "PASS" else 1
         request = prepare_request(args.model.resolve(), tokenizer, args.prompt, raw=args.raw,
             thinking=args.thinking, max_new_tokens=args.max_new_tokens, temperature=args.temperature,
             top_k=args.top_k, top_p=args.top_p, seed=args.seed, eos_ids=args.eos_token_id, ignore_eos=args.ignore_eos)

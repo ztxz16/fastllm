@@ -489,7 +489,13 @@ python3 test/distributed/run_qwen3_decode.py \
   --model /home/models/Qwen3-1.7B
 ```
 
-## 文本入口与协调器生成循环（待服务器验收）
+## 文本入口与协调器生成循环（单请求已完成服务器验收）
+
+用户提供的双 V100 服务器日志确认两组生成验收通过：
+`20261106T105443Z_generation_aed9accf`、`20261106T105519Z_generation_ebb16515`。
+修复 tokenizer 返回格式后，真实中文问答在
+`text-generation/20261106T110219Z_c6a8caac` 正常生成 17 token，以 EOS 结束。
+这些是服务器回传结果，本地未重新执行 GPU 验收。
 
 本轮新增独立 `fastllm_tp_generate` 程序和 `tools/qwen3_process_chat.py` 文本前端。
 正式公开接口为 `GenerateQwen3`，直接复用 `BeginQwen3Request`、`DecodeQwen3` 和
@@ -511,7 +517,8 @@ AutoTokenizer 分词和解码，不加载 PyTorch 模型；worker 各自加载�
 - 输出 ID 包含实际采样出的 EOS，显示文本会跳过特殊 token；停止原因区分 eos/length。
   最后一个输出不再送入 Decode，所需容量为 `Prompt + max_new_tokens - 1 <= 2048`。
   默认最多输出 32 token；公开接口拒绝覆盖已有活动请求。
-- 一次调用一个请求，文本在结束后完整显示；不支持流式 HTTP、多请求调度或跨请求缓存。
+- 单次模式处理一个请求，文本在结束后完整显示；新增常驻串行模式见下节。
+  不支持流式 HTTP、连续批处理或跨请求缓存。
   无 CUDA Graph、自定义 AllReduce、重复惩罚、min-p 和 stop-string。
 - 默认不存储历史 logits；原生 `--trace-logits 1` 用于诊断，累计最多 8388608 个元素。
   诊断只观察正式生成结果，不改变采样、权重布局、CUDA stream 或同步策略。
@@ -564,3 +571,50 @@ python3 tools/qwen3_process_chat.py \
 只有 `token_ids` 必填。原生程序不读取 tokenizer/EOS 配置，省略 EOS 数组即仅按
 长度停止，文本前端会显式传入解析后的 EOS 配置。成功 stdout 是最终 JSON，
 可能带 NCCL 前置日志；任何失败返回非零，保留部分 steps 和清理状态。
+
+## 常驻模型与连续请求（待服务器验收）
+
+`fastllm_tp_generate --session-fd FD` 接受父进程传入的独立 stream socket；
+Python 公开客户端为 `tools/qwen3_process_session.py` 中的 `Qwen3ProcessSession`。
+模型和 NCCL 组只初始化一次，各请求串行调用与单次入口共用的 `GenerateQwen3`。
+每次请求都新建并释放独立 KV；不保留前一请求的上下文，不实现 prefix cache。
+
+- 控制消息为网络字节序 uint32 长度 + UTF-8 JSON；与 stdout/stderr 日志隔离。
+  请求最多 1 MiB，响应最多 512 MiB；trace 仍限制累计 8M logits 元素。
+- ready 消息确认模型已加载；generate 的 id 从 1 连续递增，响应包含原请求、
+  worker 身份、输出 ID、结束原因和 KV 状态。客户端串行化并发调用；尚无 FIFO
+  调度保证、连续批处理、异步 token 流或单请求主动取消。
+- 参数拒绝且确认 KV 为空时允许继续；worker 失败、超时、协议错乱或资源异常
+  终止并回收整组，后续调用失败，不会自动重试或切换线程后端。
+- shutdown/EOF 卸载模型并退出；Python 在正常退出及异常时都使用已有的进程组
+  清理工具。客户端超时包含一次请求的控制通信和生成，不是单个 token 的耗时。
+  只有整组回收成功后才写入成功退出记录；清理异常和已失败会话不能被汇总为 PASS。
+- 原通用 Python 服务 `--tp_backend process` 仍未开放；本轮是服务接入前的常驻
+  后端基础，不宣称 HTTP、多请求并行计算、CUDA Graph 或自定义 AllReduce 已完成。
+
+服务器一键构建并执行四组检查（已有生成两组、新增常驻两组），再连续回答两条问题：
+
+```bash
+bash test/distributed/run_qwen3_session_v100.sh /home/models/Qwen3-1.7B
+```
+
+已有七组底座验收不在此脚本重复执行。新检查使用正式会话客户端，覆盖 F16/BF16/F32、
+bias、tied embedding、KV 复制，逐组验证 A→B→A、空 Prompt/零输出长度拒绝后恢复、EOS 首步停止、
+固定 seed 重复采样、worker PID 不变和最终清理。小模型逐步对照 CPU，真实模型
+将相同输出前缀在单卡重放；输出最大/平均绝对误差及失败元素数。每组生成唯一目录，
+保存 JSON/Markdown/CSV/XLSX、完整命令、编译配置、GPU/CUDA 信息和逐请求原始输出。
+任意用例失败或执行不完整均返回非零并保存部分报告。这些是正确性检查，不是性能结论。
+
+仅运行常驻交互入口（需要已重新编译的生成程序）：
+
+```bash
+export CUDA_VISIBLE_DEVICES=0,1
+export USE_TORCH=0
+python3 tools/qwen3_process_chat.py \
+  --model /home/models/Qwen3-1.7B --interactive --max-new-tokens 64 \
+  --output test/distributed/results/text-session
+```
+
+每行独立提问，Ctrl-D 退出；每条原始问题和回答保存到 `text-NNNNNN.json`。
+某条输入非法时显示错误并继续接受下一条；只要出现过失败，最终退出码就是非零。
+`session/ready.json`、逐请求结果、`shutdown.json` 记录权重驻留与清理情况。
