@@ -1,7 +1,7 @@
 set_directory_properties(PROPERTIES COMPILE_OPTIONS "" COMPILE_DEFINITIONS "" INCLUDE_DIRECTORIES "")
 add_library(fastllm_minimax_h3 SHARED
     ops.cu encode.cu conditioning.cpp transformer.cpp audio.cpp video.cpp
-    text.cpp parallel.cpp pipeline.cpp media.cpp media_input.cpp)
+    text.cpp parallel.cpp pipeline.cpp pika.cpp media.cpp media_input.cpp)
 target_link_libraries(fastllm_minimax_h3 PUBLIC fastllm_continuous pthread)
 target_include_directories(fastllm_minimax_h3 PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
 target_compile_options(fastllm_minimax_h3 PRIVATE
@@ -30,6 +30,10 @@ if(UNIT_TEST)
     set_target_properties(minimax_h3_fused_ops PROPERTIES CXX_STANDARD 17)
     add_test(NAME minimax_h3_fused_ops COMMAND minimax_h3_fused_ops)
     set_tests_properties(minimax_h3_fused_ops PROPERTIES LABELS cuda TIMEOUT 180 SKIP_RETURN_CODE 77)
+    add_executable(minimax_h3_pika_parallel EXCLUDE_FROM_ALL ${PROJECT_SOURCE_DIR}/test/minimax_h3/test_pika_parallel.cpp)
+    target_include_directories(minimax_h3_pika_parallel PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+    target_link_libraries(minimax_h3_pika_parallel PRIVATE fastllm_minimax_h3 cudart)
+    set_target_properties(minimax_h3_pika_parallel PROPERTIES CXX_STANDARD 17)
     add_library(minimax_h3_reference SHARED ${PROJECT_SOURCE_DIR}/test/minimax_h3/reference_bridge.cpp)
     target_link_libraries(minimax_h3_reference PRIVATE fastllm_minimax_h3)
     set_target_properties(minimax_h3_reference PROPERTIES CXX_STANDARD 17

@@ -9,6 +9,7 @@ public:
     ParallelModel(const std::string &, const std::vector<int> &, bool fp32, DType videoPrecision, VideoVAE &,
                   nomas::RowReduction);
     ~ParallelModel();
+    void loadPika(const std::string &);
     Tensor encode(const std::vector<int> &, const std::vector<VisionInput> &, Trace);
     void prepare(const std::vector<std::vector<float>> &, bool reference,
                  std::function<void(int,int)>);
@@ -21,5 +22,6 @@ private:
     struct Rank;
     nomas::ParallelGroup group_;
     std::vector<std::unique_ptr<Rank>> ranks_;
+    std::string pikaDirectory_;
 };
 }} // namespace fastllm::minimax_h3

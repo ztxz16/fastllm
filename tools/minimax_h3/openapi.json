@@ -1,8 +1,8 @@
 {
   "openapi": "3.1.0",
   "info": {
-    "title": "FastLLM MiniMax-H3 native API",
-    "version": "0.2.0",
+    "title": "FastLLM MiniMax-H3 / Pika H3 Flex native API",
+    "version": "0.3.0",
     "description": "Asynchronous video and stereo audio generation: text, first/last keyframes, or ordered image/video/audio references. Media uses multipart uploads; keyframes and references are mutually exclusive."
   },
   "security": [
@@ -73,6 +73,13 @@
                       "minItems": 1,
                       "uniqueItems": true,
                       "items": {"type": "integer", "minimum": 0}
+                    },
+                    "model": {
+                      "type": "string",
+                      "enum": ["minimax-h3", "pika-h3-flex"]
+                    },
+                    "default_inference_steps": {
+                      "type": "integer"
                     },
                     "conditioning": {
                       "type": "boolean"
@@ -339,7 +346,8 @@
           "num_inference_steps": {
             "type": "integer",
             "minimum": 2,
-            "maximum": 100
+            "maximum": 100,
+            "description": "H3: 2..100 grid points, default 50. Pika: exactly 6 evaluations, default 6."
           }
         }
       },
@@ -351,8 +359,8 @@
         ],
         "properties": {
           "model": {
-            "const": "minimax-h3",
-            "default": "minimax-h3"
+            "enum": ["minimax-h3", "pika-h3-flex"],
+            "description": "Must match the model selected when starting the server; omitted uses that model."
           },
           "prompt": {
             "type": "string",
@@ -360,7 +368,7 @@
           },
           "size": {
             "type": "string",
-            "default": "768x448",
+            "description": "Default 768x448 for H3, 832x480 for Pika.",
             "pattern": "^[0-9]+x[0-9]+$"
           },
           "seconds": {
@@ -385,24 +393,21 @@
             "type": "integer",
             "minimum": 2,
             "maximum": 100,
-            "default": 50,
-            "description": "Schedule points including terminal zero; normally N-1 denoising evaluations."
+            "description": "H3: 2..100 grid points, default 50. Pika: exactly 6 evaluations, default 6."
           },
           "reference_image_short_edge": {
             "type": "integer",
-            "default": 2048,
             "minimum": 64,
             "maximum": 2048,
             "multipleOf": 32,
-            "description": "Ref2VA image reference short edge. 2048 matches the released preprocessing; smaller values are explicit diagnostic/quality tradeoffs."
+            "description": "Ref2VA image reference short edge. H3 defaults to 2048. Pika defaults to 1024 when the output short edge is at most 544, otherwise 2048."
           },
           "reference_video_short_edge": {
             "type": "integer",
-            "default": 768,
             "minimum": 64,
             "maximum": 768,
             "multipleOf": 32,
-            "description": "Reference video short edge before the native area cap. Default 768 matches the released preprocessing; lower values explicitly trade condition quality for cost."
+            "description": "Reference video short edge before the native area cap. H3 defaults to 768. Pika defaults to 480, 544 or 768 according to the output short edge."
           }
         }
       },
@@ -414,8 +419,8 @@
         ],
         "properties": {
           "model": {
-            "const": "minimax-h3",
-            "default": "minimax-h3"
+            "enum": ["minimax-h3", "pika-h3-flex"],
+            "description": "Must match the model selected when starting the server; omitted uses that model."
           },
           "prompt": {
             "type": "string",
@@ -423,7 +428,7 @@
           },
           "size": {
             "type": "string",
-            "default": "768x448",
+            "description": "Default 768x448 for H3, 832x480 for Pika.",
             "pattern": "^[0-9]+x[0-9]+$"
           },
           "seconds": {
@@ -448,16 +453,14 @@
             "type": "integer",
             "minimum": 2,
             "maximum": 100,
-            "default": 50,
-            "description": "Schedule points including terminal zero; normally N-1 denoising evaluations."
+            "description": "H3: 2..100 grid points, default 50. Pika: exactly 6 evaluations, default 6."
           },
           "reference_image_short_edge": {
             "type": "integer",
-            "default": 2048,
             "minimum": 64,
             "maximum": 2048,
             "multipleOf": 32,
-            "description": "Ref2VA image reference short edge. 2048 matches the released preprocessing; smaller values are explicit diagnostic/quality tradeoffs."
+            "description": "Ref2VA image reference short edge. H3 defaults to 2048. Pika defaults to 1024 when the output short edge is at most 544, otherwise 2048."
           },
           "input_reference": {
             "type": "string",
@@ -485,11 +488,10 @@
           },
           "reference_video_short_edge": {
             "type": "integer",
-            "default": 768,
             "minimum": 64,
             "maximum": 768,
             "multipleOf": 32,
-            "description": "Reference video short edge before the native area cap. Default 768 matches the released preprocessing; lower values explicitly trade condition quality for cost."
+            "description": "Reference video short edge before the native area cap. H3 defaults to 768. Pika defaults to 480, 544 or 768 according to the output short edge."
           }
         }
       }

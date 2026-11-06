@@ -59,6 +59,55 @@ MiniMax-H3/
 
 加载本地 safetensors / JSON 文件，无联网下载、转换脚本或额外权重副本。
 
+## Pika H3 Flex
+
+Pika 复用指定版本的 H3 基座（`42ed227ee7df40d41602854ae760620d6eb651fe`）。
+另下载官方 `Pika-Labs/Pika-H3-Flex` 的 `fl2va/` 与 `ref2va/`，每个目录须包含
+`manifest.json` 和原生 FP32 `adapter.safetensors`。两套增量合计约 5.15 GiB。
+不需要转换或复制基座；ComfyUI 格式的适配器不适用于此入口。
+
+```bash
+CUDA_VISIBLE_DEVICES=7 build-h3/src/models/minimax_h3/minimax_h3_generate \
+  --model /workspace2/hfmodels/MiniMax-H3 \
+  --pika /workspace2/hfmodels/Pika-H3-Flex \
+  --prompt 'A small orange cat plays a piano. Soft piano music fills the room.' \
+  --width 832 --height 480 --frames 124 --seed 42 \
+  --device 0 --output pika.mp4
+```
+
+`--pika` 自动启用六次 DiT 前向，显式 `--steps` 只接受 `6`。文字／首尾帧模式
+加载 FL2VA，参考素材模式加载 Ref2VA。服务同样接受 `--pika`；HTTP 模型名为
+`pika-h3-flex`，`num_inference_steps` 默认且只允许 6，Demo 自动识别。
+Pika CLI/HTTP 默认输出 832×480；参考图像短边随输出档位取 1024 或 2048，
+参考视频短边取 480、544 或 768，显式参考尺寸参数仍优先。
+C++ 调用先执行 `pipeline.loadPika(adapterRoot)`，并设置 `GenerateOptions.steps = 6`。
+
+实现保留独立 LoRA 分支：FP32 文件加载为 BF16，两个低秩 GEMM 和基座结果相加时
+遵循 BF16 舍入；没有离线合并权重。使用 `[1000,750,500,250,100,40,0]` 网格、
+视频 shift=12／音频 shift=3，每步先计算 `x0 = x + sigma * velocity`，再用新噪声
+形成下一步输入；最后一步直接返回 x0。FL2VA 条件潜变量在加噪前舍入到 BF16，
+Ref2VA 保留 FP32。初始噪声、重新加噪、条件增强分别使用独立的随机数流。
+
+当前 Pika 路径支持 BF16 主干，已验证单卡和双卡；拒绝 FP32 主干配置。双卡使用
+`--devices 0,1` 并需要 NCCL，设备限制与下文的 H3 张量并行相同。例如：
+
+```bash
+CUDA_VISIBLE_DEVICES=6,7 build-h3/src/models/minimax_h3/minimax_h3_generate \
+  --model /workspace2/hfmodels/MiniMax-H3 \
+  --pika /workspace2/hfmodels/Pika-H3-Flex --devices 0,1 \
+  --prompt 'A small orange cat plays a piano. Soft piano music fills the room.' \
+  --width 832 --height 480 --frames 124 --seed 42 --output pika-tp2.mp4
+```
+
+LoRA 随基座投影切分：列并行复制 A、切分 B；行并行切分 A、复制 B。FFN up/gate
+分别切分。Pika 行投影的基座分支和 LoRA A 分支都先以 FP32 跨卡求和，再舍入至 BF16，
+两分支结果最后相加；该精度规则不受调用方的 H3 行归并策略影响。文本编码和视频 VAE
+继续使用现有 H3 并行路径，六步采样在 rank 0 执行，FL2VA/Ref2VA 可在请求间切换。
+
+图像尺寸、参考素材及帧数限制沿用下文的 H3 接口。种子在本实现内可复现，C++ 随机数序列与官方
+PyTorch CUDA 序列不同，同一个 seed 不承诺产生相同视频。原有 H3 路径不加 `--pika`
+时继续使用原采样器。数值验证与生成实测见 [VALIDATION.md](VALIDATION.md)。
+
 ## 命令行
 
 ```bash

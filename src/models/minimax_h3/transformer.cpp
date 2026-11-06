@@ -107,8 +107,7 @@ Tensor Transformer::projectModulation(int layer, const Tensor &input) {
 }
 Tensor Transformer::attention(const Tensor &x, const std::string &p, const Tensor *cs, const Tensor *sn,
                               Trace trace) {
-    auto q = weights_.linear(x, p + ".to_q"), k = weights_.linear(x, p + ".to_k"),
-         v = weights_.linear(x, p + ".to_v");
+    auto q = linear(x, p + ".to_q"), k = linear(x, p + ".to_k"), v = linear(x, p + ".to_v");
     if (cs) {
         auto qk = rt_.qkNormRotary(q, k, weights_.get(p + ".norm_q.weight"),
                                  weights_.get(p + ".norm_k.weight"), config_.qkEps, *cs, *sn,
@@ -127,15 +126,15 @@ Tensor Transformer::attention(const Tensor &x, const std::string &p, const Tenso
     auto out = rt_.selfAttention(q, k, v, config_.heads / parallel_.size());
     if (trace)
         trace("attention", out);
-    return parallel_.row(rt_, weights_, out, p + ".to_out.0");
+    return lora_ ? rowLinear(out, p + ".to_out.0") : parallel_.row(rt_, weights_, out, p + ".to_out.0");
 }
 Tensor Transformer::feedForward(const Tensor &x, const std::string &p) {
     std::vector<Tensor> chunks;
     Tensor out;
-    const bool overlap = parallel_.size() > 1 && !x.isFloat32() && x.rows > 4096;
+    const bool overlap = !lora_ && parallel_.size() > 1 && !x.isFloat32() && x.rows > 4096;
     Tensor reduced;
     if (!x.isFloat32() || parallel_.size() > 1)
-        out = Tensor(x.rows, config_.hidden, parallel_.size() > 1 ? parallel_.partialType(x.dtype) : x.dtype);
+        out = Tensor(x.rows, config_.hidden, !lora_ && parallel_.size() > 1 ? parallel_.partialType(x.dtype) : x.dtype);
     if (overlap)
         reduced = out.dtype == x.dtype ? out : Tensor(x.rows, config_.hidden, x.dtype);
     // Bound BF16 scratch and preserve the original sub-512 tail GEMM: folding
@@ -146,10 +145,13 @@ Tensor Transformer::feedForward(const Tensor &x, const std::string &p) {
         int count = std::min(chunk, x.rows - first);
         if (count > 512)
             count -= count % 512;
-        auto y = weights_.linear(x.rowSlice(first, count), p + ".net.0.proj");
+        auto y = linear(x.rowSlice(first, count), p + ".net.0.proj");
         if (out.data) {
             auto target = out.rowSlice(first, count);
-            if (parallel_.size() > 1) {
+            if (lora_) {
+                auto value = rowLinear(rt_.siluMultiply(y), p + ".net.2");
+                rt_.concatInto({value}, target);
+            } else if (parallel_.size() > 1) {
                 parallel_.rowPartial(rt_, weights_, rt_.siluMultiply(y), p + ".net.2", target);
                 if (overlap) {
                     auto result = reduced.rowSlice(first, count);
@@ -167,7 +169,7 @@ Tensor Transformer::feedForward(const Tensor &x, const std::string &p) {
         return reduced;
     }
     if (out.data)
-        return parallel_.size() > 1 ? parallel_.finishRow(rt_, weights_, out, p + ".net.2", x.dtype) : out;
+        return !lora_ && parallel_.size() > 1 ? parallel_.finishRow(rt_, weights_, out, p + ".net.2", x.dtype) : out;
     return chunks.size() == 1 ? chunks[0] : rt_.concat(chunks);
 }
 Tensor Transformer::refine(const Tensor &input) {
@@ -269,6 +271,7 @@ std::pair<Tensor, Tensor> Transformer::forward(const Tensor &video, const Tensor
             fullWeights_.linear(rt_.cast(rt_.gather(x, ai), DType::FP32), "audio_proj_out")};
 }
 void Transformer::unload() {
+    if (lora_) lora_->clear();
     weights_.clear();
     fullWeights_.clear();
     modulation_.clear();

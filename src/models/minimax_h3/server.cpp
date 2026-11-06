@@ -40,7 +40,7 @@ int integer(const Json &j, const std::string &key, int fallback, int minimum, in
 }
 struct Job {
     GenerateOptions options;
-    std::string mode = "t2va";
+    std::string mode = "t2va", model = "minimax-h3";
     int referenceCount = 0;
     std::string id, status = "queued", stage = "queued", failure;
     int current = 0, total = 0, progress = 0;
@@ -53,7 +53,7 @@ Json metadata(const Job &job) {
     return Json::object{
         {"id", job.id},
         {"object", "video"},
-        {"model", "minimax-h3"},
+        {"model", job.model},
         {"mode", job.mode},
         {"reference_count", job.referenceCount},
         {"status", job.status},
@@ -80,8 +80,8 @@ Json metadata(const std::shared_ptr<Job> &job) {
 }
 class Service {
   public:
-    Service(std::string model, std::string output, std::vector<int> devices, bool fp32, DType videoType, std::string ffmpeg)
-        : output_(std::move(output)), fp32_(fp32), videoType_(videoType), devices_(devices) {
+    Service(std::string model, std::string output, std::vector<int> devices, bool fp32, DType videoType, std::string ffmpeg, std::string pika)
+        : output_(std::move(output)), fp32_(fp32), pika_(!pika.empty()), videoType_(videoType), devices_(devices) {
         std::filesystem::create_directories(output_);
         referencesAvailable_ = std::filesystem::is_regular_file(model + "/transformer_ref/config.json");
         // Completed jobs have a small sidecar, so updating the inference service
@@ -106,6 +106,7 @@ class Service {
             job->created = data["created_at"].number_value();
             job->completed = data["completed_at"].number_value();
             job->options.prompt = data["prompt"].string_value();
+            if (data["model"].is_string()) job->model = data["model"].string_value();
             job->options.frames = data["frames"].int_value();
             job->options.seed = data["seed"].number_value();
             if (data["num_inference_steps"].is_number())
@@ -121,9 +122,10 @@ class Service {
             job->referenceCount = data["reference_count"].int_value();
             jobs_[id] = job;
         }
-        worker_ = std::thread([this, model, devices, fp32, videoType, ffmpeg] {
+        worker_ = std::thread([this, model, devices, fp32, videoType, ffmpeg, pika] {
             try {
                 Pipeline pipeline(model, devices, fp32, videoType);
+                if (pika_) pipeline.loadPika(pika);
                 ready_ = true;
                 for (;;) {
                     std::shared_ptr<Job> job;
@@ -215,6 +217,7 @@ class Service {
         worker_.join();
     }
     bool ready() const { return ready_; }
+    const char *modelName() const { return pika_ ? "pika-h3-flex" : "minimax-h3"; }
     Json health() {
         std::lock_guard<std::mutex> lock(mutex_);
         return Json::object{{"status", ready_                  ? "ready"
@@ -226,6 +229,8 @@ class Service {
                             {"tensor_parallel_size", int(devices_.size())},
                             {"devices", devices_},
                             {"conditioning", true},
+                            {"model", modelName()},
+                            {"default_inference_steps", pika_ ? 6 : 50},
                             {"reference_model_available", referencesAvailable_}};
     }
     std::shared_ptr<Job>
@@ -243,11 +248,12 @@ class Service {
                 kv.first != "frames" && kv.first != "seed" && kv.first != "num_inference_steps" &&
                 kv.first != "reference_image_short_edge" && kv.first != "reference_video_short_edge")
                 throw std::invalid_argument("unsupported parameter: " + kv.first);
-        if (!j["model"].is_null() && j["model"].string_value() != "minimax-h3")
+        if (!j["model"].is_null() && j["model"].string_value() != modelName())
             throw std::invalid_argument("unknown model");
         auto job = std::make_shared<Job>();
+        job->model = modelName();
         job->options.prompt = j["prompt"].string_value();
-        std::string size = j["size"].is_null() ? "768x448" : j["size"].string_value();
+        std::string size = j["size"].is_null() ? (pika_ ? "832x480" : "768x448") : j["size"].string_value();
         std::smatch match;
         if (!std::regex_match(size, match, std::regex("([0-9]{2,4})x([0-9]{2,4})")))
             throw std::invalid_argument("size must be WIDTHxHEIGHT");
@@ -268,12 +274,15 @@ class Service {
         while (frames % 17 != 5)
             ++frames;
         job->options.frames = frames;
-        job->options.steps = integer(j, "num_inference_steps", 50, 2, 100);
+        job->options.steps = integer(j, "num_inference_steps", pika_ ? 6 : 50, pika_ ? 6 : 2, pika_ ? 6 : 100);
         job->options.seed =
             integer(j, "seed", int(std::chrono::steady_clock::now().time_since_epoch().count() & 0x7fffffff),
                     0, 2147483647);
-        job->options.referenceImageShortEdge = integer(j, "reference_image_short_edge", 2048, 64, 2048);
-        job->options.referenceVideoShortEdge = integer(j, "reference_video_short_edge", 768, 64, 768);
+        int edge = std::min(job->options.width, job->options.height);
+        int imageEdge = pika_ && edge <= 544 ? 1024 : 2048;
+        int videoEdge = pika_ ? (edge <= 480 ? 480 : edge <= 544 ? 544 : 768) : 768;
+        job->options.referenceImageShortEdge = integer(j, "reference_image_short_edge", imageEdge, 64, 2048);
+        job->options.referenceVideoShortEdge = integer(j, "reference_video_short_edge", videoEdge, 64, 768);
         if (!uploads.empty()) {
             struct Temporary {
                 std::string path;
@@ -381,6 +390,7 @@ class Service {
     std::string output_, startupError_;
     bool referencesAvailable_ = false;
     const bool fp32_;
+    const bool pika_;
     const DType videoType_;
     const std::vector<int> devices_;
     std::atomic<bool> ready_{false}, stopping_{false};
@@ -396,7 +406,7 @@ class Service {
 int main(int argc, char **argv) {
     try {
         std::string model, output = "minimax-h3-output", host = "127.0.0.1", key,
-                           demo = "tools/minimax_h3/demo.html", ffmpeg = "ffmpeg", vaePrecision;
+                           demo = "tools/minimax_h3/demo.html", ffmpeg = "ffmpeg", vaePrecision, pika;
         int port = 8009;
         std::vector<int> devices{0};
         bool fp32 = false;
@@ -407,6 +417,8 @@ int main(int argc, char **argv) {
             std::string v = argv[++i];
             if (arg == "--model")
                 model = v;
+            else if (arg == "--pika")
+                pika = v;
             else if (arg == "--output")
                 output = v;
             else if (arg == "--host")
@@ -433,7 +445,7 @@ int main(int argc, char **argv) {
         if (model.empty())
             throw std::invalid_argument("--model is required");
         auto videoType = parseVideoPrecision(vaePrecision, fp32);
-        Service service(model, output, devices, fp32, videoType, ffmpeg);
+        Service service(model, output, devices, fp32, videoType, ffmpeg, pika);
         httplib::Server server;
         server.new_task_queue = [] { return new httplib::ThreadPool(8); };
         server.set_payload_max_length(size_t(256) << 20);
@@ -448,7 +460,7 @@ int main(int argc, char **argv) {
         server.Get("/v1/models", [&](const auto &r, auto &s) {
             if (auth(r, s))
                 reply(s, Json::object{{"object", "list"},
-                                      {"data", Json::array{Json::object{{"id", "minimax-h3"},
+                                      {"data", Json::array{Json::object{{"id", service.modelName()},
                                                                         {"object", "model"},
                                                                         {"owned_by", "local"}}}}});
         });

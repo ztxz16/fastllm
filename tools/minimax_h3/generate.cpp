@@ -10,9 +10,11 @@ int main(int argc, char **argv) {
     try {
         GenerateOptions options;
         std::string model, output = "minimax-h3.mp4", ffmpeg = "ffmpeg", traceDirectory, initialVideo,
-                           initialAudio, vaePrecision;
+                           initialAudio, vaePrecision, pika;
         std::vector<int> devices{0};
-        bool fp32 = false;
+        bool fp32 = false, stepsSpecified = false;
+        bool widthSpecified = false, heightSpecified = false;
+        bool referenceImageSpecified = false, referenceVideoSpecified = false;
         std::string firstFrame, lastFrame;
         std::vector<std::pair<Reference::Kind, std::string>> references;
         for (int i = 1; i < argc; ++i) {
@@ -22,20 +24,26 @@ int main(int argc, char **argv) {
             std::string v = argv[++i];
             if (arg == "--model")
                 model = v;
+            else if (arg == "--pika")
+                pika = v;
             else if (arg == "--prompt")
                 options.prompt = v;
             else if (arg == "--output")
                 output = v;
             else if (arg == "--ffmpeg")
                 ffmpeg = v;
-            else if (arg == "--width")
+            else if (arg == "--width") {
                 options.width = std::stoi(v);
-            else if (arg == "--height")
+                widthSpecified = true;
+            } else if (arg == "--height") {
                 options.height = std::stoi(v);
-            else if (arg == "--frames")
+                heightSpecified = true;
+            } else if (arg == "--frames")
                 options.frames = std::stoi(v);
-            else if (arg == "--steps")
+            else if (arg == "--steps") {
                 options.steps = std::stoi(v);
+                stepsSpecified = true;
+            }
             else if (arg == "--seed")
                 options.seed = std::stoull(v);
             else if (arg == "--device" || arg == "--devices")
@@ -56,11 +64,13 @@ int main(int argc, char **argv) {
                 firstFrame = v;
             else if (arg == "--last-frame")
                 lastFrame = v;
-            else if (arg == "--reference-image-short-edge")
+            else if (arg == "--reference-image-short-edge") {
                 options.referenceImageShortEdge = std::stoi(v);
-            else if (arg == "--reference-video-short-edge")
+                referenceImageSpecified = true;
+            } else if (arg == "--reference-video-short-edge") {
                 options.referenceVideoShortEdge = std::stoi(v);
-            else if (arg == "--reference-image")
+                referenceVideoSpecified = true;
+            } else if (arg == "--reference-image")
                 references.push_back({Reference::Kind::Image, v});
             else if (arg == "--reference-video")
                 references.push_back({Reference::Kind::Video, v});
@@ -71,6 +81,16 @@ int main(int argc, char **argv) {
         }
         if (model.empty())
             throw std::invalid_argument("--model is required");
+        if (!pika.empty()) {
+            if (stepsSpecified && options.steps != 6)
+                throw std::invalid_argument("Pika H3 Flex requires --steps 6");
+            options.steps = 6;
+            if (!widthSpecified) options.width = 832;
+            if (!heightSpecified) options.height = 480;
+            int edge = std::min(options.width, options.height);
+            if (!referenceImageSpecified) options.referenceImageShortEdge = edge <= 544 ? 1024 : 2048;
+            if (!referenceVideoSpecified) options.referenceVideoShortEdge = edge <= 480 ? 480 : edge <= 544 ? 544 : 768;
+        }
         auto videoType = parseVideoPrecision(vaePrecision, fp32);
         if (!firstFrame.empty())
             options.firstFrame =
@@ -113,6 +133,7 @@ int main(int argc, char **argv) {
         };
         auto video = read(initialVideo), audio = read(initialAudio);
         Pipeline pipeline(model, devices, fp32, videoType);
+        if (!pika.empty()) pipeline.loadPika(pika);
         std::string last;
         int current = -1;
         std::cerr << "Precision: " << (fp32 ? "fp32" : "bf16") << ", video VAE: " << precisionName(videoType)

@@ -36,6 +36,14 @@ ParallelModel::~ParallelModel() {
     // Release device caches on their owning streams before stopping workers.
     try { group_.run([&](int rank) { ranks_[rank].reset(); }); } catch(...) {}
 }
+void ParallelModel::loadPika(const std::string &dir) {
+    group_.run([&](int rank) {
+        auto &r=*ranks_[rank];
+        if(r.transformer)
+            r.transformer->loadPikaAdapter(dir+(r.reference?"/ref2va":"/fl2va"),r.reference);
+    });
+    pikaDirectory_=dir;
+}
 Tensor ParallelModel::encode(const std::vector<int> &tokens,const std::vector<VisionInput> &visual,Trace trace) {
     Tensor result;
     group_.run([&](int rank) {
@@ -56,6 +64,8 @@ void ParallelModel::prepare(const std::vector<std::vector<float>> &plans,bool re
                 r.directory+(reference?"/transformer_ref":"/transformer"),r.context);
             r.reference=reference;
         }
+        if(!pikaDirectory_.empty())
+            r.transformer->loadPikaAdapter(pikaDirectory_+(reference?"/ref2va":"/fl2va"),reference);
         r.transformer->prepare(plans,rank==0?progress:std::function<void(int,int)>{});
     });
 }

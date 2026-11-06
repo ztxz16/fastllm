@@ -531,6 +531,36 @@ static void audioConvolution() {
         }
 }
 
+static void pikaSampling() {
+    Runtime rt(0, true);
+    auto x = randomTensor(rt, 17, 96), v = randomTensor(rt, 17, 96), noise = randomTensor(rt, 17, 96);
+    auto xs = rt.download(x), vs = rt.download(v), ns = rt.download(noise);
+    for (float shift : {12.f, 3.f}) {
+        auto schedule = pikaSigmaSchedule(shift);
+        const int knots[] = {1000, 750, 500, 250, 100, 40, 0};
+        if (schedule.size() != 7) throw std::runtime_error("Pika must run six evaluations");
+        for (int i = 0; i < 7; ++i) {
+            double t = knots[i] / 1000.;
+            double expected = shift * t / (1 + (shift - 1) * t);
+            if (std::abs(schedule[i] - expected) > 1e-7) throw std::runtime_error("Pika schedule mismatch");
+            if (i == 6) continue;
+            float sigma = schedule[i], next = schedule[i + 1];
+            std::vector<float> expectedValues(xs.size());
+            for (size_t j = 0; j < xs.size(); ++j) {
+                float clean = xs[j] + sigma * vs[j];
+                expectedValues[j] = next == 0 ? clean : (1.f - next) * clean + next * ns[j];
+            }
+            std::cout << "Pika renoise shift=" << shift << " step=" << i;
+            equal(rt, rt.upload(expectedValues.data(), x.rows, x.cols),
+                  rt.renoise(x, v, next == 0 ? Tensor{} : noise, sigma, next));
+            std::cout << std::endl;
+        }
+    }
+    rejects([&] { rt.renoise(x, v, {}, 1.f, .5f); });
+    rejects([&] { rt.renoise(x, v, noise, .5f, .5f); });
+    rejects([&] { pikaSigmaSchedule(0); });
+}
+
 int main() {
     try {
         int count = 0;
@@ -551,6 +581,7 @@ int main() {
         visionInputPreparation();
         longPresentationEmbedding();
         linearOutputs();
+        pikaSampling();
         Runtime rt(0, false), full(0, true);
         residuals(rt);
         residuals(full);

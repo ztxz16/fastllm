@@ -23,10 +23,10 @@
 </div>
 <details><summary>HTTP 调用示例</summary><pre id="curl"></pre><small>提交后查询 GET /v1/videos/{id}，完成后下载 GET /v1/videos/{id}/content。<a href="/openapi.json">OpenAPI 规范</a></small></details>
 <script>
-const $=id=>document.getElementById(id);let job=null,objectURL=null;
+const $=id=>document.getElementById(id);let job=null,objectURL=null,modelName='minimax-h3';
 const headers=()=>({'Authorization':'Bearer '+$('key').value});
 async function api(path,options={}){const r=await fetch(path,{...options,headers:{...headers(),...options.headers}});const data=await r.json();if(!r.ok)throw new Error(data.error?.message||r.statusText);return data}
-function request(){return {model:'minimax-h3',prompt:$('prompt').value,size:$('size').value,seconds:$('seconds').value,num_inference_steps:Number($('steps').value),seed:Number($('seed').value)}}
+function request(){return {model:modelName,prompt:$('prompt').value,size:$('size').value,seconds:$('seconds').value,num_inference_steps:Number($('steps').value),seed:Number($('seed').value)}}
 let referenceFiles=[];
 function uploads(){const mode=$('mode').value,files=[];
 if(['first','both'].includes(mode)&&$('firstFrame').files[0])files.push(['input_reference',$('firstFrame').files[0]]);
@@ -39,7 +39,7 @@ $('mode').onchange=modeChanged;
 const quote=s=>"'"+String(s).replaceAll("'","'\\''")+"'";
 function curl(){const lines=[`curl ${location.origin}/v1/videos`];if($('key').value)lines.push("-H 'Authorization: Bearer YOUR_API_KEY'");for(const [k,v] of Object.entries(request()))lines.push('--form-string '+quote(k+'='+v));for(const [k,file] of uploads())lines.push('-F '+quote(k+'=@'+file.name+';type='+file.type));$('curl').textContent=lines.join(' \\\n  ')}
 $('form').addEventListener('input',curl);modeChanged();
-fetch('/health').then(r=>r.json()).then(h=>{if(!h.conditioning){$('mode').value='text';$('mode').disabled=true;modeChanged()}else if(!h.reference_model_available)$('mode').querySelector('option[value="reference"]').disabled=true}).catch(()=>{});
+fetch('/health').then(r=>r.json()).then(h=>{modelName=h.model||'minimax-h3';if(modelName==='pika-h3-flex'){document.title='Pika H3 Flex · FastLLM';document.querySelector('h1').textContent='Pika H3 Flex';$('size').replaceChildren(...['832x480','640x640','480x832','1344x768'].map(size=>new Option(size,size)));$('steps').value=6;$('steps').min=6;$('steps').max=6;$('steps').readOnly=true;$('steps').parentElement.firstChild.textContent='采样步数';$('download').download='pika-h3-flex.mp4'}curl();if(!h.conditioning){$('mode').value='text';$('mode').disabled=true;modeChanged()}else if(!h.reference_model_available)$('mode').querySelector('option[value="reference"]').disabled=true}).catch(()=>{});
 $('form').onsubmit=async event=>{event.preventDefault();$('submit').disabled=true;$('download').style.display='none';$('progress').value=0;
 try{if($('mode').value==='reference'&&!referenceFiles.length)throw new Error('请添加参考素材');const body=new FormData();for(const [k,v] of Object.entries(request()))body.append(k,String(v));for(const [k,file] of uploads())body.append(k,file);job=await api('/v1/videos',{method:'POST',body});$('cancel').disabled=false;
 while(true){$('progress').value=job.progress;$('status').textContent=`${job.id}\n${job.status} · ${job.mode||'t2va'} · ${job.stage} ${job.current}/${job.total}\n${job.frames} 帧 · ${job.size}`;

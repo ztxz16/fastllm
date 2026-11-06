@@ -718,5 +718,25 @@ Tensor Runtime::step(const Tensor &x, const Tensor &v, float time, float sigma, 
     check(cudaGetLastError());
     return out;
 }
+namespace {
+__global__ void renoiseStep(const float *x, const float *v, const float *noise, float *out,
+                           float sigma, float next, size_t n) {
+    for (size_t i = size_t(blockIdx.x) * 256 + threadIdx.x; i < n; i += size_t(gridDim.x) * 256) {
+        float clean = x[i] + sigma * v[i];
+        out[i] = next == 0.f ? clean : (1.f - next) * clean + next * noise[i];
+    }
+}
+}
+Tensor Runtime::renoise(const Tensor &x, const Tensor &v, const Tensor &noise, float sigma, float next) {
+    require(x.isFloat32() && v.isFloat32() && x.rows == v.rows && x.cols == v.cols &&
+            std::isfinite(sigma) && sigma > 0 && sigma <= 1 && std::isfinite(next) && next >= 0 && next < sigma &&
+            (next == 0 || (noise.isFloat32() && noise.rows == x.rows && noise.cols == x.cols)),
+            "invalid Pika renoise input");
+    Tensor out(x.rows, x.cols, true);
+    renoiseStep<<<grid(x.size()), 256, 0, cudaStreamPerThread>>>(ptr<float>(x), ptr<float>(v),
+        next == 0 ? nullptr : ptr<float>(noise), ptr<float>(out), sigma, next, x.size());
+    check(cudaGetLastError());
+    return out;
+}
 } // namespace minimax_h3
 } // namespace fastllm

@@ -50,6 +50,8 @@ class Runtime : public nomas::Runtime {
     Tensor poolAudioHeads(const Tensor &, int heads, int dimensions);
     Tensor affine(const Tensor &, float scale, float bias = 0, bool clamp = false);
     Tensor step(const Tensor &sample, const Tensor &velocity, float timestep, float sigma, float nextSigma);
+    Tensor renoise(const Tensor &sample, const Tensor &velocity, const Tensor &noise,
+                   float sigma, float nextSigma);
 };
 
 struct TransformerConfig {
@@ -69,6 +71,8 @@ class Transformer {
   public:
     Transformer(Runtime &, Runtime &fp32, const std::string &directory, nomas::ParallelContext = {});
     const TransformerConfig &config() const { return config_; }
+    // Native Pika release: BF16 LoRA branches, without merging into base weights.
+    void loadPikaAdapter(const std::string &directory, bool reference);
     Tensor timeEmbedding(const std::vector<float> &times);
     // input is SiLU(temb), rounded to the main runtime's dtype after activation.
     Tensor projectModulation(int layer, const Tensor &input);
@@ -82,12 +86,16 @@ class Transformer {
     void unload();
 
   private:
+    Tensor linear(const Tensor &, const std::string &);
+    Tensor rowLinear(const Tensor &, const std::string &);
     Tensor attention(const Tensor &, const std::string &, const Tensor *cos = nullptr,
                      const Tensor *sin = nullptr, Trace trace = {});
     Tensor feedForward(const Tensor &, const std::string &);
     Tensor refine(const Tensor &);
     Runtime &rt_, &fp32_;
     Weights weights_, fullWeights_;
+    std::unique_ptr<Weights> lora_;
+    std::string loraDirectory_;
     TransformerConfig config_;
     nomas::ParallelContext parallel_;
     std::vector<Tensor> modulation_;
@@ -231,6 +239,7 @@ struct ReferenceGeometry {
 PackedLayout referenceLayout(const std::vector<int> &textTags, int frames, int height, int width,
                              int audioFrames, const std::vector<ReferenceGeometry> &);
 std::vector<float> sigmaSchedule(int steps, float shift);
+std::vector<float> pikaSigmaSchedule(float shift);
 class ParallelModel;
 class Pipeline {
   public:
@@ -240,6 +249,9 @@ class Pipeline {
     Pipeline(const std::string &directory, const std::vector<int> &devices, bool fp32, DType videoPrecision,
              nomas::RowReduction ditReduction);
     ~Pipeline();
+    // Directory contains fl2va/ and ref2va/ manifests and adapter.safetensors.
+    // BF16 trunk; adapters follow the base model's tensor partitions.
+    void loadPika(const std::string &directory);
     Generation generate(const GenerateOptions &, Progress progress = {}, Trace trace = {},
                         const std::vector<float> *initialVideo = nullptr,
                         const std::vector<float> *initialAudio = nullptr);
@@ -258,6 +270,7 @@ class Pipeline {
     Transformer transformer_;
     std::unique_ptr<Transformer> referenceTransformer_;
     std::string directory_;
+    std::string pikaDirectory_;
     VideoVAE video_;
     AudioVAE audio_;
     std::vector<float> videoMean_, videoStd_, audioMean_, audioStd_;
