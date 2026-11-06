@@ -595,7 +595,9 @@ class WebUIRuntime:
             timeout=float(getattr(args, "api_timeout", 3600.0)),
         )
         self._generation_controls: Dict[str, GenerationControl] = {}
-        self._generation_controls_lock = threading.Lock()
+        services = getattr(args, "media_services", None)
+        self._generation_controls_lock = services.generation_lock if services else threading.RLock()
+        self._active_generations = services.generation_controls if services else {}
         self._closed = False
         self._pi_agent_lock = threading.Lock()
         self.pi_agent = None
@@ -661,19 +663,20 @@ class WebUIRuntime:
 
     def begin_generation(self, conversation_id: str) -> GenerationControl:
         with self.active_session():
-            if conversation_id in self._generation_controls:
+            if conversation_id in self._active_generations:
                 raise RuntimeError("该会话已有任务正在运行")
             control = GenerationControl()
             self._generation_controls[conversation_id] = control
+            self._active_generations[conversation_id] = control
             return control
 
     def is_generating(self, conversation_id: str) -> bool:
         with self._generation_controls_lock:
-            return conversation_id in self._generation_controls
+            return conversation_id in self._active_generations
 
     def cancel_generation(self, conversation_id: str) -> bool:
         with self._generation_controls_lock:
-            control = self._generation_controls.get(conversation_id)
+            control = self._active_generations.get(conversation_id)
         if control is None:
             return False
         control.cancel()
@@ -696,6 +699,8 @@ class WebUIRuntime:
         with self._generation_controls_lock:
             if self._generation_controls.get(conversation_id) is control:
                 self._generation_controls.pop(conversation_id, None)
+            if self._active_generations.get(conversation_id) is control:
+                self._active_generations.pop(conversation_id, None)
 
     def managed_generation(
         self,
@@ -1146,6 +1151,7 @@ class WebUIRuntime:
         control: Optional[GenerationControl] = None,
         working_directory: Optional[str] = None,
         tool_calls_out: Optional[List[Dict[str, Any]]] = None,
+        media_download=None,
     ):
         control = control or GenerationControl()
         content = ""
@@ -1203,8 +1209,15 @@ class WebUIRuntime:
             stream_args["working_directory"] = working_directory
         stream_args["cancel_event"] = control.event
         control.check()
-        stream = self._get_pi_agent().stream(**stream_args)
+        bridge = None
+        stream = None
         try:
+            services = getattr(self.args, "media_services", None)
+            if working_directory is not None and services is not None:
+                from .media_agent import GenerationBridge
+                bridge = GenerationBridge(services, on_download=media_download)
+                stream_args["system_prompt"] += bridge.instructions()
+            stream = self._get_pi_agent().stream(**stream_args)
             for event in stream:
                 control.check(
                     content=content,
@@ -1330,6 +1343,8 @@ class WebUIRuntime:
             close = getattr(stream, "close", None)
             if callable(close):
                 close()
+            if bridge is not None:
+                bridge.close(cancel=control.cancelled)
         finish_running_tools("cancelled" if control.cancelled else "done")
         control.check(
             content=content,
@@ -1687,6 +1702,10 @@ class WebUIRuntime:
         tool_calls: List[Dict[str, Any]] = []
         web_sources: List[Dict[str, Any]] = []
         attachment_sources: List[Dict[str, Any]] = []
+        generated_media = []
+        def save_generated_media(name, data):
+            generated_media.append(self.store.save_upload(
+                conversation_id, _Upload(name, "video/mp4", data)))
         assistant_message: Dict[str, Any]
         try:
             normalized = self.normalize_agent_settings(settings)
@@ -1766,6 +1785,7 @@ class WebUIRuntime:
                     control=control,
                     working_directory=str(workspace),
                     tool_calls_out=tool_calls,
+                    media_download=save_generated_media,
                 )
             )
             if not content and reasoning:
@@ -1800,6 +1820,8 @@ class WebUIRuntime:
             }
             yield _json_line({"type": "error", "message": str(error)})
 
+        if generated_media:
+            assistant_message["attachments"] = generated_media
         yield self._finish_generation(
             conversation_id, messages, settings, title, assistant_message)
 

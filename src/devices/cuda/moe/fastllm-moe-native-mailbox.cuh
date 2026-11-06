@@ -842,7 +842,10 @@ struct NativeMoeMailbox {
             const int32_t *stagedSlots = w.rows > 1 ? w.mapped->stagedSlots : w.slots + 4 * topk;
             const int32_t *stagedCount = w.rows > 1 ? &w.mapped->stagedCount : w.slots + 5 * topk;
             const int maxStaged = w.rows > 1 ? kMaxTopK : topk;
-            if (!group.ggufSources.empty()) {
+            if (cache.pageableSource) {
+                if (!cache.pageableSource->Copy(table, fullCopy->records, stagedExperts, stagedSlots,
+                        stagedCount, nullptr, maxStaged, launch, cudaStreamPerThread)) return false;
+            } else if (!group.ggufSources.empty()) {
                 const auto &source = group.ggufSources[table];
                 auto *pointers = cache.numaPointers + size_t(table) * layout.experts * 2 * source.shards;
                 // Device IDs select immutable mapped NUMA shards. Restore the

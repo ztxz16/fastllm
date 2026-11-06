@@ -1,5 +1,4 @@
 #pragma once
-
 #include "fastllm-cuda-record-copy.cuh"
 #include "fastllm-cuda-mapped-host.h"
 
@@ -423,7 +422,7 @@ inline bool CopySharedExpertRecord(const SharedExpertLayout &layout, void *const
 inline bool UploadSharedExpertRecord(const SharedExpertLayout &layout,
         void *const *hostPointers, uint8_t *staging, size_t stagingBytes,
         uint8_t *destination, cudaStream_t stream, const uint8_t *hostAuxiliary = nullptr,
-        const MappedHostBuffer *auxiliaryOwner = nullptr) {
+        const MappedHostBuffer *auxiliaryOwner = nullptr, bool pinned = true) {
     const size_t payload = size_t(layout.sourceBytes[0]) + layout.sourceBytes[1];
     const size_t bytes = payload + layout.auxiliaryBytes;
     if (!hostPointers || !staging || !destination || staging == destination ||
@@ -439,8 +438,8 @@ inline bool UploadSharedExpertRecord(const SharedExpertLayout &layout,
     for (int part = 0; part < 2; ++part) {
         const size_t shardBytes = layout.weights[part].shardBytes;
         for (unsigned shard = 0; shard < layout.shards; ++shard) {
-            if (cudaMemcpyAsync(staging + offset, hostPointers[part * layout.shards + shard],
-                    shardBytes, cudaMemcpyHostToDevice, stream) != cudaSuccess) return false;
+            if (UploadImmutableHostWeight(staging + offset, hostPointers[part * layout.shards + shard],
+                    shardBytes, pinned, stream) != cudaSuccess) return false;
             offset += shardBytes;
         }
     }

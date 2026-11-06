@@ -1,4 +1,27 @@
 <section id="view-webui" class="view">
+            <div class="studio-toolbar">
+              <button id="studio-chat-tab" class="secondary-button" type="button">对话 / 工作区</button>
+              <button id="studio-video-tab" class="secondary-button" type="button">视频生成</button>
+              <label id="studio-chat-select-label">对话模型 <select id="studio-chat-select" aria-label="对话模型"></select></label>
+            </div>
+            <section id="video-studio" class="video-studio hidden" aria-label="视频生成工作室">
+              <form id="video-form">
+                <h2>视频生成</h2>
+                <p>也可以在工作区中告诉 Pi Agent 要生成什么视频，它会调用已启动的视频模型，并将结果保存到工作区。</p>
+                <div class="form-grid two-columns">
+                  <label class="field span-2"><span>视频模型</span><select id="video-service" required></select></label>
+                  <label class="field span-2"><span>视频描述</span><textarea id="video-prompt" required maxlength="16000" placeholder="描述画面、动作、镜头和声音…"></textarea></label>
+                  <label class="field"><span>分辨率</span><select id="video-size"><option>640x384</option><option>384x640</option><option>768x432</option><option>1280x720</option><option>720x1280</option></select></label>
+                  <label class="field"><span>时长</span><select id="video-seconds"><option value="5">5 秒</option><option value="10">10 秒</option><option value="15">15 秒</option></select></label>
+                  <label class="field"><span>随机种子（可选）</span><input id="video-seed" type="number" min="0" max="2147483647"></label>
+                  <label class="field"><span>采样步数（可选）</span><input id="video-steps" type="number" min="2" max="100" placeholder="使用模型默认值"><small>Pika 固定 6 步；MiniMax H3 使用模型默认值或自定义步数。</small></label>
+                  <label class="field"><span>首帧图片（可选）</span><input id="video-first-frame" type="file" accept="image/*"></label>
+                  <label class="field"><span>尾帧图片（可选）</span><input id="video-last-frame" type="file" accept="image/*"></label>
+                </div>
+                <div class="video-job-actions"><button id="video-generate" class="primary-button" type="submit">生成视频</button><span id="video-service-status" role="status"></span></div>
+              </form>
+              <div id="video-jobs" class="video-jobs" aria-live="polite"></div>
+            </section>
             <section id="agent-runtime-card" class="agent-runtime-card hidden" aria-label="Pi 智能体运行时">
               <svg class="icon" aria-hidden="true"><use href="#icon-spark"/></svg>
               <div class="agent-runtime-copy">

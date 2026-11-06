@@ -392,13 +392,14 @@ int h3_image_text_encode(const char *model, const int *tokens, int count, int he
         return -1;
     }
 }
-int h3_transformer(const char *model, int nt, int na, int nv, int timeCount, const float *text,
+int h3_transformer_impl(const char *model, int nt, int na, int nv, int timeCount, const float *text,
                    const float *audio, const float *video, const float *times, const int *indices,
                    const float *positions, const char *directory, float *outVideo, float *outAudio,
-                   int fp32) {
+                   int fp32, const char *adapter, int reference) {
     try {
         Runtime rt(0, fp32), full(0, true);
         Transformer dit(rt, full, model);
+        if (adapter && *adapter) dit.loadPikaAdapter(adapter, reference);
         PackedLayout layout;
         int n = nt + na + nv;
         layout.timeIndices.assign(indices, indices + n);
@@ -431,4 +432,25 @@ int h3_transformer(const char *model, int nt, int na, int nv, int timeCount, con
         return -1;
     }
 }
+int h3_transformer(const char *model, int nt, int na, int nv, int timeCount, const float *text,
+                   const float *audio, const float *video, const float *times, const int *indices,
+                   const float *positions, const char *directory, float *outVideo, float *outAudio,
+                   int fp32) {
+    return h3_transformer_impl(model, nt, na, nv, timeCount, text, audio, video, times, indices,
+                              positions, directory, outVideo, outAudio, fp32, nullptr, 0);
+}
+int h3_pika_transformer(const char *model, int nt, int na, int nv, int timeCount, const float *text,
+                        const float *audio, const float *video, const float *times, const int *indices,
+                        const float *positions, const char *directory, float *outVideo, float *outAudio,
+                        int fp32, const char *adapter, int reference) {
+    return h3_transformer_impl(model, nt, na, nv, timeCount, text, audio, video, times, indices,
+                              positions, directory, outVideo, outAudio, fp32, adapter, reference);
+}
+int h3_pika_load(void *handle, const char *adapter, int reference) {
+    try {
+        static_cast<Model *>(handle)->transformer.loadPikaAdapter(adapter, reference);
+        return 0;
+    } catch (const std::exception &e) { error = e.what(); return -1; }
+}
+
 }

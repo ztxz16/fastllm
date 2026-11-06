@@ -1,4 +1,5 @@
 #include "models/minimax_h3/runtime.h"
+#include "models/minimax_h3/model_source.h"
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -10,9 +11,12 @@ int main(int argc, char **argv) {
     try {
         GenerateOptions options;
         std::string model, output = "minimax-h3.mp4", ffmpeg = "ffmpeg", traceDirectory, initialVideo,
-                           initialAudio, vaePrecision;
+                           initialAudio, vaePrecision, pika, baseModel;
         std::vector<int> devices{0};
-        bool fp32 = false;
+        bool fp32 = false, stepsSpecified = false;
+        double gpuMemoryLimit = 0, hostMemoryLimit = 0;
+        bool widthSpecified = false, heightSpecified = false;
+        bool referenceImageSpecified = false, referenceVideoSpecified = false;
         std::string firstFrame, lastFrame;
         std::vector<std::pair<Reference::Kind, std::string>> references;
         for (int i = 1; i < argc; ++i) {
@@ -22,24 +26,36 @@ int main(int argc, char **argv) {
             std::string v = argv[++i];
             if (arg == "--model")
                 model = v;
+            else if (arg == "--pika")
+                pika = v;
+            else if (arg == "--base-model")
+                baseModel = v;
             else if (arg == "--prompt")
                 options.prompt = v;
             else if (arg == "--output")
                 output = v;
             else if (arg == "--ffmpeg")
                 ffmpeg = v;
-            else if (arg == "--width")
+            else if (arg == "--width") {
                 options.width = std::stoi(v);
-            else if (arg == "--height")
+                widthSpecified = true;
+            } else if (arg == "--height") {
                 options.height = std::stoi(v);
-            else if (arg == "--frames")
+                heightSpecified = true;
+            } else if (arg == "--frames")
                 options.frames = std::stoi(v);
-            else if (arg == "--steps")
+            else if (arg == "--steps") {
                 options.steps = std::stoi(v);
+                stepsSpecified = true;
+            }
             else if (arg == "--seed")
                 options.seed = std::stoull(v);
             else if (arg == "--device" || arg == "--devices")
                 devices = fastllm::nomas::parseParallelDevices(v);
+            else if (arg == "--gpu-memory-limit")
+                gpuMemoryLimit = parseGpuMemoryLimit(v);
+            else if (arg == "--host-memory-limit")
+                hostMemoryLimit = parseHostMemoryLimit(v);
             else if (arg == "--trace")
                 traceDirectory = v;
             else if (arg == "--precision") {
@@ -56,11 +72,13 @@ int main(int argc, char **argv) {
                 firstFrame = v;
             else if (arg == "--last-frame")
                 lastFrame = v;
-            else if (arg == "--reference-image-short-edge")
+            else if (arg == "--reference-image-short-edge") {
                 options.referenceImageShortEdge = std::stoi(v);
-            else if (arg == "--reference-video-short-edge")
+                referenceImageSpecified = true;
+            } else if (arg == "--reference-video-short-edge") {
                 options.referenceVideoShortEdge = std::stoi(v);
-            else if (arg == "--reference-image")
+                referenceVideoSpecified = true;
+            } else if (arg == "--reference-image")
                 references.push_back({Reference::Kind::Image, v});
             else if (arg == "--reference-video")
                 references.push_back({Reference::Kind::Video, v});
@@ -69,8 +87,19 @@ int main(int argc, char **argv) {
             else
                 throw std::invalid_argument("unknown argument " + arg);
         }
-        if (model.empty())
-            throw std::invalid_argument("--model is required");
+        auto source = resolveModelSource(model, baseModel, pika);
+        model = source.baseDirectory;
+        pika = source.pikaDirectory;
+        if (!pika.empty()) {
+            if (stepsSpecified && options.steps != 6)
+                throw std::invalid_argument("Pika H3 Flex requires --steps 6");
+            options.steps = 6;
+            if (!widthSpecified) options.width = 832;
+            if (!heightSpecified) options.height = 480;
+            int edge = std::min(options.width, options.height);
+            if (!referenceImageSpecified) options.referenceImageShortEdge = edge <= 544 ? 1024 : 2048;
+            if (!referenceVideoSpecified) options.referenceVideoShortEdge = edge <= 480 ? 480 : edge <= 544 ? 544 : 768;
+        }
         auto videoType = parseVideoPrecision(vaePrecision, fp32);
         if (!firstFrame.empty())
             options.firstFrame =
@@ -113,6 +142,9 @@ int main(int argc, char **argv) {
         };
         auto video = read(initialVideo), audio = read(initialAudio);
         Pipeline pipeline(model, devices, fp32, videoType);
+        pipeline.setGpuMemoryLimit(gpuMemoryLimit);
+        pipeline.setHostMemoryLimit(hostMemoryLimit);
+        if (!pika.empty()) pipeline.loadPika(pika);
         std::string last;
         int current = -1;
         std::cerr << "Precision: " << (fp32 ? "fp32" : "bf16") << ", video VAE: " << precisionName(videoType)

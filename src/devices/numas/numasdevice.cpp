@@ -3135,11 +3135,20 @@ namespace fastllm {
             bool usePinned = allowPinned &&
                              MoeEnvConfig::GetInstance().GetPinnedWeight();
 
-            auto allocFunc = [usePinned](size_t size, int node) -> void* {
+            bool allPinned = usePinned;
+            std::vector<void *> registrations;
+            auto allocFunc = [&](size_t size, int node) -> void* {
+                void *ptr = allocate_aligned_numa(size, node);
+                AssertInFastLLM(ptr != nullptr, "NUMA weight allocation failed.\n");
+#ifdef USE_CUDA
                 if (usePinned) {
-                    return allocate_pinned_numa(size, node);
+                    if (FastllmCudaHostRegister(ptr, size)) registrations.push_back(ptr);
+                    else allPinned = false;
                 }
-                return allocate_aligned_numa(size, node);
+#else
+                allPinned = false;
+#endif
+                return ptr;
             };
 
             if (data->dataType == DataType::DATA_GGUF_FORMAT) {
@@ -3355,7 +3364,12 @@ namespace fastllm {
                 }
             }
             data->expansionBytes = data->GetBytes();
-            data->isPinned = usePinned;
+            // A failed registration is ordinary RAM, not a mapped source.
+            // Release partial pins so small graph/transfer buffers keep room.
+#ifdef USE_CUDA
+            if (!allPinned) for (void *ptr : registrations) FastllmCudaHostUnregister(ptr);
+#endif
+            data->isPinned = allPinned;
         }
 
         if (data->dataType == DataType::INT4_GROUP32) {

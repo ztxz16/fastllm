@@ -98,6 +98,20 @@ Tensor Transformer::timeEmbedding(const std::vector<float> &times) {
     x = fp32_.activation(fullWeights_.linear(x, "time_embedder.linear_1"));
     return fullWeights_.linear(x, "time_embedder.linear_2");
 }
+void Transformer::setHostMemoryBudget(const std::shared_ptr<nomas::HostMemoryBudget> &budget) {
+    hostBudget_=budget;
+    weights_.setHostMemoryBudget(budget);
+    fullWeights_.setHostMemoryBudget(budget);
+    if(lora_) lora_->setHostMemoryBudget(budget);
+}
+void Transformer::setLowMemory(bool enabled) {
+    if (enabled == lowMemory_) return;
+    unload();
+    lowMemory_ = enabled;
+    hostCacheEnabled_ = false;
+    weights_.enableHostCache(0);
+    if (lora_) lora_->enableHostCache(enabled ? size_t(2) << 30 : 0);
+}
 Tensor Transformer::projectModulation(int layer, const Tensor &input) {
     auto p = "transformer_blocks." + std::to_string(layer) + ".adaln_proj.linear";
     auto x = parallel_.column(weights_, input, p, true);
@@ -107,8 +121,7 @@ Tensor Transformer::projectModulation(int layer, const Tensor &input) {
 }
 Tensor Transformer::attention(const Tensor &x, const std::string &p, const Tensor *cs, const Tensor *sn,
                               Trace trace) {
-    auto q = weights_.linear(x, p + ".to_q"), k = weights_.linear(x, p + ".to_k"),
-         v = weights_.linear(x, p + ".to_v");
+    auto q = linear(x, p + ".to_q"), k = linear(x, p + ".to_k"), v = linear(x, p + ".to_v");
     if (cs) {
         auto qk = rt_.qkNormRotary(q, k, weights_.get(p + ".norm_q.weight"),
                                  weights_.get(p + ".norm_k.weight"), config_.qkEps, *cs, *sn,
@@ -127,15 +140,15 @@ Tensor Transformer::attention(const Tensor &x, const std::string &p, const Tenso
     auto out = rt_.selfAttention(q, k, v, config_.heads / parallel_.size());
     if (trace)
         trace("attention", out);
-    return parallel_.row(rt_, weights_, out, p + ".to_out.0");
+    return lora_ ? rowLinear(out, p + ".to_out.0") : parallel_.row(rt_, weights_, out, p + ".to_out.0");
 }
 Tensor Transformer::feedForward(const Tensor &x, const std::string &p) {
     std::vector<Tensor> chunks;
     Tensor out;
-    const bool overlap = parallel_.size() > 1 && !x.isFloat32() && x.rows > 4096;
+    const bool overlap = !lora_ && parallel_.size() > 1 && !x.isFloat32() && x.rows > 4096;
     Tensor reduced;
     if (!x.isFloat32() || parallel_.size() > 1)
-        out = Tensor(x.rows, config_.hidden, parallel_.size() > 1 ? parallel_.partialType(x.dtype) : x.dtype);
+        out = Tensor(x.rows, config_.hidden, !lora_ && parallel_.size() > 1 ? parallel_.partialType(x.dtype) : x.dtype);
     if (overlap)
         reduced = out.dtype == x.dtype ? out : Tensor(x.rows, config_.hidden, x.dtype);
     // Bound BF16 scratch and preserve the original sub-512 tail GEMM: folding
@@ -146,10 +159,13 @@ Tensor Transformer::feedForward(const Tensor &x, const std::string &p) {
         int count = std::min(chunk, x.rows - first);
         if (count > 512)
             count -= count % 512;
-        auto y = weights_.linear(x.rowSlice(first, count), p + ".net.0.proj");
+        auto y = linear(x.rowSlice(first, count), p + ".net.0.proj");
         if (out.data) {
             auto target = out.rowSlice(first, count);
-            if (parallel_.size() > 1) {
+            if (lora_) {
+                auto value = rowLinear(rt_.siluMultiply(y), p + ".net.2");
+                rt_.concatInto({value}, target);
+            } else if (parallel_.size() > 1) {
                 parallel_.rowPartial(rt_, weights_, rt_.siluMultiply(y), p + ".net.2", target);
                 if (overlap) {
                     auto result = reduced.rowSlice(first, count);
@@ -167,7 +183,7 @@ Tensor Transformer::feedForward(const Tensor &x, const std::string &p) {
         return reduced;
     }
     if (out.data)
-        return parallel_.size() > 1 ? parallel_.finishRow(rt_, weights_, out, p + ".net.2", x.dtype) : out;
+        return !lora_ && parallel_.size() > 1 ? parallel_.finishRow(rt_, weights_, out, p + ".net.2", x.dtype) : out;
     return chunks.size() == 1 ? chunks[0] : rt_.concat(chunks);
 }
 Tensor Transformer::refine(const Tensor &input) {
@@ -178,6 +194,10 @@ Tensor Transformer::refine(const Tensor &input) {
                     attention(rt_.rms(x, weights_.get(p + ".norm1.weight"), config_.normEps), p + ".attn"));
         x = rt_.add(x,
                     feedForward(rt_.rms(x, weights_.get(p + ".norm2.weight"), config_.normEps), p + ".ff"));
+        if (lowMemory_) {
+            weights_.erasePrefix(p + ".");
+            if (lora_) lora_->erasePrefix(p + ".");
+        }
     }
     return rt_.rms(x, weights_.get("token_refiner.final_norm.weight"), config_.finalEps);
 }
@@ -234,8 +254,14 @@ void Transformer::prepare(const std::vector<std::vector<float>> &plans,
     outputModulation_ = rows.size() == 1 ? rows[0] : rt_.concat(rows);
     weights_.erasePrefix("norm_out.linear.");
     // FP32 diagnostics can reuse packed weights across steps; BF16 weights stay resident.
-    if (rt_.isFloat32())
+    if (rt_.isFloat32() && !lowMemory_)
         weights_.enablePackedCache(size_t(16) << 30);
+    if (lowMemory_ && !hostCacheEnabled_) {
+        // AdaLN is used only to prepare the tiny timestep tables; do not let
+        // its 24 GiB of projections crowd out repeatedly streamed block weights.
+        weights_.enableHostCache(size_t(48) << 30);
+        hostCacheEnabled_ = true;
+    }
     plans_ = plans;
 }
 std::pair<Tensor, Tensor> Transformer::forward(const Tensor &video, const Tensor &audio, const Tensor &text,
@@ -260,8 +286,10 @@ std::pair<Tensor, Tensor> Transformer::forward(const Tensor &video, const Tensor
         x = block(i, x, modulation_[i], idx, rope.first, rope.second);
         if (trace)
             trace("block." + std::to_string(i), x);
-        if (rt_.isFloat32())
+        if (rt_.isFloat32() || lowMemory_)
             weights_.erasePrefix("transformer_blocks." + std::to_string(i) + ".");
+        if (lowMemory_ && lora_)
+            lora_->erasePrefix("transformer_blocks." + std::to_string(i) + ".");
     }
     x = rt_.rmsModulateRows(x, weights_.get("norm_out.norm.weight"), config_.finalEps,
                            outputModulation_, rt_.indices(layout.timeIndices), 0, 1);
@@ -269,6 +297,7 @@ std::pair<Tensor, Tensor> Transformer::forward(const Tensor &video, const Tensor
             fullWeights_.linear(rt_.cast(rt_.gather(x, ai), DType::FP32), "audio_proj_out")};
 }
 void Transformer::unload() {
+    if (lora_) lora_->clear();
     weights_.clear();
     fullWeights_.clear();
     modulation_.clear();

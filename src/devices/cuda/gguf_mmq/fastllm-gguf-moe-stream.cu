@@ -1,3 +1,4 @@
+#include "devices/cuda/fastllm-cuda-host-upload.h"
 #include "devices/cuda/cudaworkspace.h"
 #include "fastllm-gguf-mmq-common.cuh"
 #include <chrono>
@@ -54,12 +55,12 @@ static size_t Align(size_t bytes) { return (bytes+255)&~size_t(255); }
 
 static void UploadWeight(const fastllm::Data &weight, uint8_t *target, cudaStream_t stream) {
     if (weight.cpuData) {
-        CUDA_CHECK(cudaMemcpyAsync(target, weight.cpuData, weight.GetBytes(), cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(fastllm::cuda::UploadImmutableHostWeight(target, weight.cpuData, weight.GetBytes(), weight.isPinned, stream));
     } else {
         const size_t shardBytes = weight.GetBytes() / weight.numasData.size();
         for (size_t node = 0; node < weight.numasData.size(); ++node)
-            CUDA_CHECK(cudaMemcpyAsync(target + node * shardBytes, weight.numasData[node],
-                shardBytes, cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(fastllm::cuda::UploadImmutableHostWeight(target + node * shardBytes, weight.numasData[node],
+                shardBytes, weight.isPinned, stream));
     }
 }
 
@@ -82,7 +83,7 @@ struct DownUpload {
     }
 };
 // A bounded raw-weight lookahead. Only already registered host storage may be
-// queued here; unsupported/pageable sources retain the ordinary streamed path.
+// queued directly; ordinary RAM uses the same lookahead through bounded host staging.
 struct Prefetch {
     static constexpr size_t budget = size_t(256) * 1024 * 1024;
     static constexpr int groups = 16, expertsPerGroup = 16;
@@ -114,13 +115,6 @@ struct Prefetch {
     }
     static const uint8_t *Host(const fastllm::Data &w) {
         return w.cpuData ? w.cpuData : w.numasData.empty() ? nullptr : w.numasData[0];
-    }
-    static bool Pinned(const void *source) {
-        if (!source) return false;
-        cudaPointerAttributes attr{};
-        const auto status = cudaPointerGetAttributes(&attr, source);
-        if (status != cudaSuccess) { cudaGetLastError(); return false; }
-        return attr.type == cudaMemoryTypeHost;
     }
     const Item *Find(fastllm::Data **weights, const fastllm::Data &w) const {
         if (table != weights) return nullptr;
@@ -625,8 +619,7 @@ bool FastllmCudaPrefetchMoeGGUFHost(fastllm::Data **weights, int expertCount) {
         if (valid) for (const auto *w : {gate, down}) {
             valid = valid && w->dataType == fastllm::DATA_GGUF_FORMAT &&
                 Ordinary(w->ggmlType) >= 0 && !w->numasData.empty();
-            if (w->cpuData) valid = valid && Prefetch::Pinned(w->cpuData);
-            else for (const auto *p : w->numasData) valid = valid && Prefetch::Pinned(p);
+            if (!w->cpuData) for (const auto *p : w->numasData) valid = valid && p;
         }
         if (!valid) continue;
         const size_t extra = Align(gate->GetBytes()) + Align(down->GetBytes());

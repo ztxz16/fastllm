@@ -671,6 +671,9 @@ int main(int argc, char **argv) {
             return false;
         };
         const bool dual = option("--dual"), fp8 = option("--fp8");
+        const bool pageable = option("--pageable");
+        if (pageable) setenv("FT_PINNED_WEIGHT", "0", 1);
+        auto freeShard = [&](void *p) { if (pageable) free(p); else Check(cudaFreeHost(p)); };
         if (option("--mailbox")) SetCudaGraph(true);
         std::printf("V4.1 cache weights: %s\n", fp8 ? "FP8 block128" : "NVFP4 block32");
         int devices = 0;
@@ -832,7 +835,8 @@ int main(int argc, char **argv) {
                     }
                     for (int node = 0; node < nodes; ++node) {
                         void *ptr = nullptr;
-                        Check(cudaHostAlloc(&ptr, rows / nodes * pitch, cudaHostAllocMapped | cudaHostAllocPortable));
+                        if (pageable) Require(posix_memalign(&ptr, 64, rows / nodes * pitch) == 0, "pageable shard allocation");
+                        else Check(cudaHostAlloc(&ptr, rows / nodes * pitch, cudaHostAllocMapped | cudaHostAllocPortable));
                         for (int r = 0; r < rows / nodes; ++r) {
                             const int physical = node * (rows / nodes) + r;
                             const int logical = part ? physical : physical / 2 + (physical & 1) * inter;
@@ -841,7 +845,7 @@ int main(int argc, char **argv) {
                         shards.push_back(ptr);
                         w->numasData.push_back((uint8_t *)ptr);
                     }
-                    w->isPinned = true;
+                    w->isPinned = !pageable;
                     w->isModelWeight = true;
                     weights[t][2 * (e + 1) + part] = w.get();
                     owned.push_back(std::move(w));
@@ -852,7 +856,7 @@ int main(int argc, char **argv) {
             SetMoeCudaCacheBytes(0);
             CheckNumasPrefill(weights, tables);
             for (auto &weight : owned) weight->numasData.clear();
-            for (void *pointer : shards) Check(cudaFreeHost(pointer));
+            for (void *pointer : shards) freeShard(pointer);
             return 0;
         }
         const size_t record = ((weights[0][2]->GetBytes() + weights[0][3]->GetBytes() + 127) / 128) * 128;
@@ -894,15 +898,36 @@ int main(int argc, char **argv) {
             Check(cudaSetDevice(0));
             ClearNumasMoeRuntimeCache();
             for (auto &weight : owned) weight->numasData.clear();
-            for (void *pointer : shards) Check(cudaFreeHost(pointer));
+            for (void *pointer : shards) freeShard(pointer);
             SetMoeCudaCacheBytes(0);
             std::printf("RESIDENT_DEVICE_BUDGET_PASS: owners 0/1, no duplicate cache, 240 graph/NUMA comparisons\n");
             return 0;
         }
         SetMoeCudaCacheBytes(0);
         Require(!FastllmCudaPrepareMoeCache(layers, tables, [] {}), "disabled cache accepted");
+        SetMoeCudaCacheBytes(record);
+        // Hybrid decode admits small resident caches; its staged misses have
+        // separate workspace. Registration no longer requires sixteen slots.
+        Require(FastllmCudaPrepareMoeCache(layers, tables, [] {}), "single-slot hybrid registration rejected");
+        FastllmCudaReleaseMoeCache(weights[0].data(), weights[0].size());
         SetMoeCudaCacheBytes(record * 16);
         Require(!FastllmCudaPrepareMoeCache(layers, tables), "unowned NUMA cache accepted");
+        // Pure GPU execution cannot use hybrid's zero-resident streaming
+        // fallback. Invalid overrides must reject that mode on this device.
+        setenv("FASTLLM_DSV41_MOE_CACHE_MODE", "gpu", 1);
+        for (const char *value : {"0", "1", "-1", "1g", "bad", "18446744073709551616"}) {
+            setenv("FASTLLM_MOE_CUDA_CACHE_BYTES_0", value, 1);
+            Require(FastllmCudaPrepareMoeCache(layers, tables, [] {}), "host preparation rejected device override");
+            Require(!FastllmCudaUseMoeHybrid(weights[0].data(), weights[0].size()), "invalid device budget accepted");
+            if (dual && std::string(value) == "0") {
+                Check(cudaSetDevice(1));
+                Require(FastllmCudaUseMoeHybrid(weights[0].data(), weights[0].size()), "disabled GPU 0 affected GPU 1");
+                Check(cudaSetDevice(0));
+            }
+            FastllmCudaReleaseMoeCache(weights[0].data(), weights[0].size());
+        }
+        unsetenv("FASTLLM_MOE_CUDA_CACHE_BYTES_0");
+        unsetenv("FASTLLM_DSV41_MOE_CACHE_MODE");
         if (dual) {
             // Different capacities must remain independent across devices.
             const auto first = std::to_string(record * 24), second = std::to_string(record * 16);
@@ -948,7 +973,7 @@ int main(int argc, char **argv) {
             if (dual) CheckResidentAssist(weights[0]);
             fastllm_prefill_test::Run(layers, weights, tables, true, 32);
             FastllmCudaReleaseMoeCache(weights[0].data(), weights[0].size());
-            for (void *pointer : shards) Check(cudaFreeHost(pointer));
+            for (void *pointer : shards) freeShard(pointer);
             return 0;
         }
 
@@ -1539,8 +1564,7 @@ int main(int argc, char **argv) {
         ClearNumasMoeRuntimeCache();
         for (auto &w : owned)
             w->numasData.clear();
-        for (void *p : shards)
-            Check(cudaFreeHost(p));
+        for (void *p : shards) freeShard(p);
         SetMoeCudaCacheBytes(0);
         unsetenv("FASTLLM_MOE_CUDA_CACHE_BYTES_0");
         unsetenv("FASTLLM_MOE_CUDA_CACHE_BYTES_1");

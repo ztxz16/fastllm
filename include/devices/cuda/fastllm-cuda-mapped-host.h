@@ -1,8 +1,10 @@
 #pragma once
+#include "fastllm-cuda-host-upload.h"
 
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <vector>
 #if defined(__linux__)
@@ -16,9 +18,12 @@ namespace fastllm { namespace cuda {
 // cudaHostAlloc calls can fail on some driver/host configurations; bounded registrations
 // avoid requiring one large driver page-pointer allocation. No record layout
 // or GPU address arithmetic changes when this fallback is used.
+// Explicit ordinary storage has no device mapping; its immutable bytes are
+// uploaded through bounded staging by CopyToDeviceAsync.
 class MappedHostBuffer {
     void *host_ = nullptr, *device_ = nullptr;
     size_t mappedBytes_ = 0, bytes_ = 0;
+    bool pageable_ = false;
     std::vector<void *> registrations_;
 public:
     MappedHostBuffer() = default;
@@ -30,6 +35,8 @@ public:
     size_t Registrations() const { return registrations_.size(); }
     void Reset() {
         if (!host_) return;
+        if (pageable_) std::free(host_);
+        else {
 #if defined(__linux__)
         if (mappedBytes_) {
             for (void *ptr : registrations_) cudaHostUnregister(ptr);
@@ -37,9 +44,11 @@ public:
         } else
 #endif
         cudaFreeHost(host_);
+        }
         host_ = device_ = nullptr;
         mappedBytes_ = 0;
         bytes_ = 0;
+        pageable_ = false;
         registrations_.clear();
     }
     cudaError_t CopyToDeviceAsync(void *destination, const void *source, size_t bytes,
@@ -49,6 +58,7 @@ public:
         if (!host_ || address < base || address - base > bytes_ ||
             bytes > bytes_ - (address - base)) return cudaErrorInvalidValue;
         if (!bytes) return cudaSuccess;
+        if (pageable_) return UploadImmutableHostWeight(destination, source, bytes, false, stream);
         if (registrations_.empty())
             return cudaMemcpyAsync(destination, source, bytes, cudaMemcpyHostToDevice, stream);
         // CUDA permits direct GPU loads across adjacent mapped registrations,
@@ -68,10 +78,15 @@ public:
         }
         return cudaSuccess;
     }
-    cudaError_t Allocate(size_t bytes) {
+    cudaError_t Allocate(size_t bytes, bool mapped = true) {
         Reset();
         if (!bytes) return cudaErrorInvalidValue;
         bytes_ = bytes;
+        if (!mapped) {
+            host_ = std::malloc(bytes);
+            pageable_ = host_ != nullptr;
+            return host_ ? cudaSuccess : cudaErrorMemoryAllocation;
+        }
         cudaError_t state = cudaHostAlloc(&host_, bytes, cudaHostAllocMapped | cudaHostAllocPortable);
         if (state == cudaSuccess) {
             state = cudaHostGetDevicePointer(&device_, host_, 0);
