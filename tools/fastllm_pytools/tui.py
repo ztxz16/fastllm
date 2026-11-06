@@ -70,6 +70,8 @@ class DeployConfig:
     server_binary: str = ""
     base_model: str = ""
     output_dir: str = ""
+    video_gpu_memory_limit: str = ""
+    video_host_memory_limit: str = ""
     command: str = "server"
     model: str = ""
     model_name: str = ""

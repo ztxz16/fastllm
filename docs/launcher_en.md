@@ -43,6 +43,15 @@ To launch video:
    is not beside Pika as `MiniMax-H3` or linked through `base_model`.
 3. Once ready, API information includes create, status, cancel and content-download
    endpoints with an example request. Output defaults to `~/.local/share/fastllm/videos/<port>`.
+   For limited VRAM, set **GPU memory budget per device** in GiB (for example `4`).
+   Empty or `0` preserves the original policy and speed. Explicit budgets reserve GPU
+   memory at startup; large budgets retain weights, while smaller budgets stream layers.
+   The GPU budget applies separately to each
+   selected GPU; Pika text-to-video at 832×480 / 124 frames has been tested at 4 GiB.
+   **Host memory budget** is shared by the service: `2` GiB streams weights from disk
+   without caching; additional budget caches weights. Empty or `0` preserves the original
+   cache policy. These are model budgets, not OS-enforced process limits; leave RAM for
+   the system, runtime and media processing.
 4. Studio → Video generation provides prompts, resolution, duration, seed and optional
    first/last frames, with progress, cancellation, preview and MP4 download. Pika uses
    six steps; H3 defaults to 50. Reference uploads total at most 31 MiB; Studio downloads

@@ -22,7 +22,7 @@ from fastllm_pytools.launcher import LauncherError, LauncherRuntime, create_laun
 from fastllm_pytools.launcher_services import LauncherServicePool
 from fastllm_pytools.media_agent import GenerationBridge
 from fastllm_pytools.service_backends import visible_gpu_environment
-from fastllm_pytools.tui import DeployConfig, build_fastllm_env, build_fastllm_argv, config_from_dict
+from fastllm_pytools.tui import DeployConfig, build_fastllm_env, build_fastllm_argv, config_from_dict, validate_config
 
 
 WORKER = r'''
@@ -143,6 +143,31 @@ class ServiceTest(unittest.TestCase):
         self.client.post("/api/services/" + video + "/stop", headers=self.headers)
         self.assertTrue(self.pool.service(chat).state()["ready"])
         self.assertEqual(self.client.get("/webui/" + chat + "/api/config").status_code, 200)
+
+    def test_video_memory_budget_is_validated_saved_and_passed_only_to_video(self):
+        payload = self.profile("minimax_h3", video_gpu_memory_limit="4.5", video_host_memory_limit="2")
+        config = config_from_dict(payload)
+        command = build_fastllm_argv(config)
+        self.assertEqual(command[command.index("--gpu-memory-limit") + 1], "4.5")
+        self.assertEqual(command[command.index("--host-memory-limit") + 1], "2")
+        saved = self.pool.save_profile(None, payload)
+        self.assertEqual(saved["profile"]["video_host_memory_limit"], "2")
+        self.assertEqual(saved["profile"]["video_gpu_memory_limit"], "4.5")
+        for invalid in ("-1", "1", "nan", "inf", "4GB", "1048577"):
+            fields = []
+            validate_config(config_from_dict(dict(payload, video_gpu_memory_limit=invalid)), fields)
+            self.assertTrue(any("video_gpu_memory_limit" in item["fields"] for item in fields), invalid)
+        for valid in ("", "0", "4", "6.5"):
+            self.assertEqual(validate_config(config_from_dict(dict(payload, video_gpu_memory_limit=valid))), [])
+        for invalid in ("-1", "0.5", "1", "nan", "inf", "2GB", "1048577"):
+            fields = []
+            validate_config(config_from_dict(dict(payload, video_host_memory_limit=invalid)), fields)
+            self.assertTrue(any("video_host_memory_limit" in item["fields"] for item in fields), invalid)
+        for valid in ("", "0", "2", "2.5"):
+            self.assertEqual(validate_config(config_from_dict(dict(payload, video_host_memory_limit=valid))), [])
+        llm = build_fastllm_argv(config_from_dict(self.profile(video_gpu_memory_limit="4", video_host_memory_limit="2")))
+        self.assertNotIn("--gpu-memory-limit", llm)
+        self.assertNotIn("--host-memory-limit", llm)
 
     def test_video_api_contract_authentication_and_scoped_proxy(self):
         started = time.monotonic()
@@ -337,6 +362,12 @@ class ServiceTest(unittest.TestCase):
             page.locator("#model-backend").select_option("minimax_h3")
             expect(page.locator('[data-field="server_binary"]')).to_be_visible()
             expect(page.locator('[data-field="visible_gpus"]')).to_be_visible()
+            expect(page.locator('[data-field="video_gpu_memory_limit"]')).to_be_visible()
+            page.locator('[data-field="video_gpu_memory_limit"]').fill("3.75")
+            self.assertTrue(page.locator('[data-field="video_gpu_memory_limit"]').evaluate("input => input.checkValidity()"))
+            expect(page.locator('[data-field="video_host_memory_limit"]')).to_be_visible()
+            page.locator('[data-field="video_host_memory_limit"]').fill("2.5")
+            self.assertTrue(page.locator('[data-field="video_host_memory_limit"]').evaluate("input => input.checkValidity()"))
             page.locator('#gpu-choices input[value="1"]').check()
             expect(page.locator('[data-field="visible_gpus"]')).to_have_value("1")
             expect(page.locator("#configuration-mode-settings")).not_to_be_visible()

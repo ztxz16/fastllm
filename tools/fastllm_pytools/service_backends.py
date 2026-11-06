@@ -5,6 +5,7 @@ probe, capabilities and public API contract. No inference implementation lives
 in the launcher or in the studio.
 """
 import os
+import math
 import re
 import shutil
 import subprocess
@@ -126,6 +127,10 @@ class H3Backend:
         for flag, value in (("--base-model", config.base_model), ("--api-key", config.api_key)):
             if value.strip():
                 command.extend((flag, os.path.expanduser(value.strip()) if flag == "--base-model" else value.strip()))
+        if config.video_gpu_memory_limit.strip():
+            command.extend(("--gpu-memory-limit", config.video_gpu_memory_limit.strip()))
+        if config.video_host_memory_limit.strip():
+            command.extend(("--host-memory-limit", config.video_host_memory_limit.strip()))
         return command
 
     def validate(self, config):
@@ -148,6 +153,20 @@ class H3Backend:
             add("端口必须在 1-65535 之间。", "port")
         if not config.host.strip():
             add("监听地址不能为空。", "host")
+        if config.video_gpu_memory_limit.strip():
+            try:
+                limit = float(config.video_gpu_memory_limit)
+                if not math.isfinite(limit) or not (limit == 0 or 1 < limit <= 1048576):
+                    raise ValueError()
+            except ValueError:
+                add("视频显存预算须为大于 1 的 GiB 数值，或填 0 使用默认策略。", "video_gpu_memory_limit")
+        if config.video_host_memory_limit.strip():
+            try:
+                limit = float(config.video_host_memory_limit)
+                if not math.isfinite(limit) or not (limit == 0 or 2 <= limit <= 1048576):
+                    raise ValueError()
+            except ValueError:
+                add("视频内存预算须为至少 2 的 GiB 数值，或填 0 使用默认策略。", "video_host_memory_limit")
         return errors
 
     def api_contract(self, state):
