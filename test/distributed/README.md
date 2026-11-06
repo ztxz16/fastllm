@@ -534,7 +534,7 @@ FP16 KV 类型、Eager、无 prefix cache，不能让两个后端各自采样不
 服务器安装分词依赖（仅需 tokenizer，不需安装 torch），并沿用 CUDA 12.6/NCCL 环境：
 
 ```bash
-python3 -m pip install transformers
+python3 -m pip install transformers jinja2
 bash test/distributed/run_qwen3_generation_v100.sh /home/models/Qwen3-1.7B
 ```
 

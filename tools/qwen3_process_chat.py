@@ -51,7 +51,8 @@ def prepare_request(model, tokenizer, prompt, *, raw=False, thinking=False, max_
                 tokenizer.chat_template = template.read_text()
             else:
                 raise ValueError("model has no chat template; use --raw only for raw completion")
-        ids = tokenizer.apply_chat_template([dict(role="user", content=prompt)], tokenize=True,
+        # 显式返回 token 列表，避免新版默认 BatchEncoding 被 list() 转成字段名。
+        ids = tokenizer.apply_chat_template([dict(role="user", content=prompt)], tokenize=True, return_dict=False,
             add_generation_prompt=True, enable_thinking=thinking)
 
     eos = []

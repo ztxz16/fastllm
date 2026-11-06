@@ -1,6 +1,7 @@
 """生成前端、采样判定、数值验收的纯 Python 回归，不编译或启动 GPU。"""
 
 import copy
+from collections import UserDict
 from contextlib import redirect_stdout, redirect_stderr
 import io
 import json
@@ -45,7 +46,7 @@ class GenerationTests(unittest.TestCase):
         self.assertEqual(request["token_ids"], [1, 2])
         self.assertEqual(request["eos_token_ids"], [14, 16])
         self.tokenizer.apply_chat_template.assert_called_once_with([dict(role="user", content="你好")],
-            tokenize=True, add_generation_prompt=True, enable_thinking=False)
+            tokenize=True, return_dict=False, add_generation_prompt=True, enable_thinking=False)
 
     def test_raw_eos_override_and_ignore(self):
         request = prepare_request(self.model, self.tokenizer, "hello", raw=True, eos_ids=[5])
@@ -53,6 +54,18 @@ class GenerationTests(unittest.TestCase):
         self.assertEqual(request["eos_token_ids"], [5])
         self.tokenizer.encode.assert_called_once_with("hello", add_special_tokens=False)
         self.assertEqual(prepare_request(self.model, self.tokenizer, "hello", ignore_eos=True)["eos_token_ids"], [])
+
+    def test_chat_template_return_type_does_not_depend_on_library_default(self):
+        for default_return_dict in (False, True):
+            with self.subTest(default_return_dict=default_return_dict):
+                # 模拟旧版列表与新版 BatchEncoding（UserDict）默认返回值。
+                self.tokenizer.apply_chat_template.side_effect = lambda *args, **kwargs: (
+                    UserDict(input_ids=[1, 2], attention_mask=[1, 1])
+                    if kwargs.get("return_dict", default_return_dict) else [1, 2])
+                request = prepare_request(self.model, self.tokenizer, "你好")
+                self.assertEqual(request["token_ids"], [1, 2])
+                self.assertTrue(all(type(token) is int for token in request["token_ids"]))
+                self.assertEqual(request["eos_token_ids"], [15, 16])
 
     def test_local_template_fallback_and_missing_template(self):
         self.tokenizer.chat_template = None
