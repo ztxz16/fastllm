@@ -11,7 +11,7 @@ namespace distributed {
 class Qwen3LayerExecutor {
 public:
     /**
-     * 创建单个 worker 的 eager 单层执行器，不取得权重、stream 或通信组所有权。
+     * 创建单个 worker 的 eager 执行器，不取得权重、stream 或通信组所有权。
      * @param weights 已上传的 rank-local FP16 权重，必须比执行器存活更久。
      * @param stream worker 执行 stream；全部算子与 NCCL 使用此 stream。
      * @param comm 已初始化的 TP 通信组。
@@ -48,10 +48,37 @@ public:
      */
     std::vector<float> Prefill(const std::vector<uint32_t> &tokenIds, uint32_t positionBegin);
 
-    /** 同步并释放工作区和 cuBLAS handle；必须在权重卸载前调用，失败须终止 worker。 */
+    /**
+     * 分配单请求各层 FP16 KV 并执行 Prefill；失败必须终止 worker。
+     * @param tokenIds 1..128 个合法 ID。
+     * @param capacity 1..2048，覆盖 Prompt 和后续 token；每 rank KV 总上限 256 MiB。
+     * @param positionBegin 起点，容量末位置不得超过 1048576。
+     * @return 本 rank 末 token 的 FP32 词表分片。
+     */
+    std::vector<float> BeginRequest(const std::vector<uint32_t> &tokenIds,
+        uint32_t capacity, uint32_t positionBegin);
+
+    /** @param tokenId 追加的单个 ID；必须已有请求且尚有容量。@return 本 rank FP32 logits；失败终止 worker。 */
+    std::vector<float> Decode(uint32_t tokenId);
+
+    /** 同步释放全部请求 KV 并清零状态；允许重复调用，失败终止 worker。 */
+    void EndRequest();
+
+    /** @return 实际成功分配的 KV 字节及有效长度，不包含请求临时工作区。 */
+    Qwen3RequestInfo RequestInfo() const;
+
+    /** 同步释放请求 KV、工作区和 cuBLAS handle；必须在权重卸载前调用，失败须终止 worker。 */
     void Clear();
 
 private:
+    /**
+     * 复用完整模型计算，成功同步并释放临时工作区后才提交缓存有效长度。
+     * @param tokenIds 1..128 个输入 ID，Decode 仅传一个；入口检查词表边界。
+     * @param positionBegin 当前输入的 RoPE 起点，缓存模式必须紧接历史位置。
+     * @param cached true 时读取并追加各层 FP16 KV；false 不接触活动请求缓存。
+     * @return 本 rank 的 FP32 词表分片，出现异常后必须终止 worker。
+     */
+    std::vector<float> RunTokens(const std::vector<uint32_t> &tokenIds, uint32_t positionBegin, bool cached);
     struct Impl;
     std::unique_ptr<Impl> impl;
 };
