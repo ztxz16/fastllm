@@ -1,0 +1,147 @@
+{
+  "version": 1,
+  "name": "deepseek-v41-pd",
+  "model_id": "deepseek-v41-flash-1017/checkpoint-revision",
+  "state_dir": "/srv/fastllm/pd",
+  "transport": {
+    "type": "rdma",
+    "rdma_devices": [
+      "mlx5_0",
+      "mlx5_1"
+    ],
+    "max_inflight_bytes": 8589934592
+  },
+  "router": {
+    "host": "0.0.0.0",
+    "port": 8000
+  },
+  "ingress": {
+    "ssh": {
+      "host": "operator@decode-node",
+      "port": 22,
+      "identity": "/home/operator/.ssh/id_ed25519"
+    },
+    "python": "/opt/fastllm/bin/python"
+  },
+  "prefill": [
+    {
+      "name": "p0",
+      "ssh": {
+        "host": "operator@prefill-node",
+        "port": 22,
+        "identity": "/home/operator/.ssh/id_ed25519"
+      },
+      "python": "/opt/fastllm/bin/python",
+      "url": "http://prefill-node:19001",
+      "env": {
+        "FASTLLM_EXECUTION_MODE": "gpu",
+        "FASTLLM_CUDA_GRAPH": "1"
+      },
+      "command": [
+        "/opt/fastllm/bin/ftllm",
+        "serve",
+        "/models/deepseek-v41-flash-1017",
+        "--model_name",
+        "deepseek-v41",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "19001",
+        "--tp",
+        "8",
+        "--attn-dp-size",
+        "8",
+        "--ngram_device",
+        "cuda",
+        "--moe_device",
+        "multicuda:0,1,2,3,4,5,6,7",
+        "--atype",
+        "float32",
+        "--kv_cache_dtype",
+        "fp4_e2m1",
+        "--dspark",
+        "5",
+        "--fast_prefill",
+        "--max_batch",
+        "16",
+        "--tokens",
+        "1048576",
+        "--max_context_length",
+        "262144",
+        "--chunked_prefill_size",
+        "4096",
+        "--cache_history",
+        "true",
+        "--prefix_cache",
+        "true",
+        "--prefill_batch_tokens",
+        "32768",
+        "--prefill_batch_requests",
+        "8",
+        "--prefill_max_requests",
+        "16",
+        "--prefill_max_wait_ms",
+        "2"
+      ],
+      "endpoint": "prefill-node:19000",
+      "listen": "0.0.0.0:19000",
+      "chunk_tokens": 4096,
+      "cache_bytes": 17179869184
+    }
+  ],
+  "decode": [
+    {
+      "name": "d0",
+      "ssh": {
+        "host": "operator@decode-node",
+        "port": 22,
+        "identity": "/home/operator/.ssh/id_ed25519"
+      },
+      "python": "/opt/fastllm/bin/python",
+      "url": "http://decode-node:19002",
+      "env": {
+        "FASTLLM_EXECUTION_MODE": "gpu",
+        "FASTLLM_CUDA_GRAPH": "1"
+      },
+      "command": [
+        "/opt/fastllm/bin/ftllm",
+        "serve",
+        "/models/deepseek-v41-flash-1017",
+        "--model_name",
+        "deepseek-v41",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "19002",
+        "--tp",
+        "8",
+        "--attn-dp-size",
+        "4",
+        "--ngram_device",
+        "cuda",
+        "--moe_device",
+        "multicuda:0,1,2,3,4,5,6,7",
+        "--atype",
+        "float32",
+        "--kv_cache_dtype",
+        "fp4_e2m1",
+        "--dspark",
+        "5",
+        "--fast_prefill",
+        "--max_batch",
+        "64",
+        "--tokens",
+        "16777216",
+        "--max_context_length",
+        "262144",
+        "--chunked_prefill_size",
+        "4096",
+        "--cache_history",
+        "true",
+        "--prefix_cache",
+        "true"
+      ],
+      "max_inflight": 64
+    }
+  ]
+}

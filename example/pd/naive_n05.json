@@ -1,0 +1,135 @@
+{
+  "version": 1,
+  "name": "naive-n05-pd",
+  "model_id": "naive-n05-flash/checkpoint-revision",
+  "state_dir": "/srv/fastllm/naive-pd",
+  "transport": {
+    "type": "rdma",
+    "rdma_devices": [
+      "mlx5_0",
+      "mlx5_1"
+    ],
+    "max_inflight_bytes": 8589934592
+  },
+  "router": {
+    "host": "0.0.0.0",
+    "port": 8000
+  },
+  "ingress": {
+    "ssh": {
+      "host": "operator@decode-node",
+      "port": 22,
+      "identity": "/home/operator/.ssh/id_ed25519"
+    },
+    "python": "/opt/fastllm/bin/python"
+  },
+  "prefill": [
+    {
+      "name": "p0",
+      "ssh": {
+        "host": "operator@prefill-node",
+        "port": 22,
+        "identity": "/home/operator/.ssh/id_ed25519"
+      },
+      "python": "/opt/fastllm/bin/python",
+      "url": "http://prefill-node:19001",
+      "env": {
+        "FASTLLM_CUDA_GRAPH": "1"
+      },
+      "command": [
+        "/opt/fastllm/bin/ftllm",
+        "serve",
+        "/models/Naive-N0.5-Flash-FP8",
+        "--model_name",
+        "naive-n05-flash",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "19001",
+        "--tp",
+        "4",
+        "--dtype",
+        "auto",
+        "--atype",
+        "bfloat16",
+        "--kv_cache_dtype",
+        "bfloat16",
+        "--max_batch",
+        "4",
+        "--tokens",
+        "131072",
+        "--max_context_length",
+        "32768",
+        "--chunked_prefill_size",
+        "2048",
+        "--dspark",
+        "0",
+        "--cache_history",
+        "true",
+        "--prefix_cache",
+        "true",
+        "--prefill_batch_tokens",
+        "8192",
+        "--prefill_batch_requests",
+        "4",
+        "--prefill_max_requests",
+        "4",
+        "--prefill_max_wait_ms",
+        "2"
+      ],
+      "endpoint": "prefill-node:19000",
+      "listen": "0.0.0.0:19000",
+      "chunk_tokens": 2048,
+      "cache_bytes": 1073741824
+    }
+  ],
+  "decode": [
+    {
+      "name": "d0",
+      "ssh": {
+        "host": "operator@decode-node",
+        "port": 22,
+        "identity": "/home/operator/.ssh/id_ed25519"
+      },
+      "python": "/opt/fastllm/bin/python",
+      "url": "http://decode-node:19002",
+      "env": {
+        "FASTLLM_CUDA_GRAPH": "1"
+      },
+      "command": [
+        "/opt/fastllm/bin/ftllm",
+        "serve",
+        "/models/Naive-N0.5-Flash-FP8",
+        "--model_name",
+        "naive-n05-flash",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "19002",
+        "--tp",
+        "4",
+        "--dtype",
+        "auto",
+        "--atype",
+        "bfloat16",
+        "--kv_cache_dtype",
+        "bfloat16",
+        "--max_batch",
+        "4",
+        "--tokens",
+        "131072",
+        "--max_context_length",
+        "32768",
+        "--chunked_prefill_size",
+        "2048",
+        "--dspark",
+        "0",
+        "--cache_history",
+        "true",
+        "--prefix_cache",
+        "true"
+      ],
+      "max_inflight": 4
+    }
+  ]
+}
