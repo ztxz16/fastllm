@@ -43,6 +43,24 @@ namespace {
         return result;
     }
 #ifdef USE_CUDA
+    void GatherContextCandidates(Data &exchange, int part, int rank, int ranks, int gpu) {
+        if (!FastllmCudaCustomAllGatherRows(exchange.cudaData, ranks * part, 4096, FLOAT32, gpu))
+            AssertInFastLLM(FastllmNcclAllGather((int *)exchange.cudaData + rank * part,
+                exchange.cudaData, part, INT32, gpu), "Indexer context all-gather failed.");
+    }
+    void RunContextVerifyIndexer(const Data &query, const Data &weights,
+            const std::vector<FastllmNaiveVerifyIndexerItem> &items,
+            FastllmNaiveDecodeScratch &scratch, Data &live, Data &exchange,
+            int rank, int ranks, int page, int gpu, bool fp8Query) {
+        int part = 0;
+        for (const auto &item : items) part += item.rows * 2048 * 2;
+        exchange.dataType = INT32; exchange.Resize({ranks * part});
+        exchange.ToDevice(query.dataDevice, query.dataDeviceIds, false); exchange.Allocate(false);
+        AssertInFastLLM(FastllmCudaNaiveBatchVerifyIndexer(query, weights, items, fp8Query,
+            scratch, live, rank, ranks, &exchange, page), "Unsupported context-sharded verification layout.");
+        GatherContextCandidates(exchange, part, rank, ranks, gpu);
+        FastllmCudaNaiveMergeVerifyIndexer(items, scratch, live, exchange, ranks, page);
+    }
     void RunContextDecodeIndexer(const Data &query, const Data &weights, const Data &live,
             const std::vector<FastllmNaiveIndexerRow> &rows, Data &exchange,
             int rank, int ranks, int page, int gpu, bool fp8Query) {
@@ -53,15 +71,13 @@ namespace {
         exchange.Allocate(false);
         AssertInFastLLM(FastllmCudaNaiveBatchDecodeIndexer(query, weights, live, rows, fp8Query,
             rank, ranks, &exchange, page), "Unsupported context-sharded decode Indexer layout.");
-        if (!FastllmCudaCustomAllGatherRows(exchange.cudaData, ranks * part, 4096, FLOAT32, gpu))
-            AssertInFastLLM(FastllmNcclAllGather((int *)exchange.cudaData + rank * part,
-                exchange.cudaData, part, INT32, gpu), "Indexer context all-gather failed.");
+        GatherContextCandidates(exchange, part, rank, ranks, gpu);
         FastllmCudaNaiveMergeDecodeIndexer(live, rows, exchange, ranks, page);
     }
     // Copy stored KV bits between a request's window and chronological scratch.
     // At most one side wraps; copies are ordered with attention on the rank stream.
     void CopySwaWindow(const Data &key, const Data &value, Data &targetKey, Data &targetValue,
-                       int sourceFirst, int targetFirst, int rows) {
+                       int sourceFirst, int targetFirst, int rows, int sourceWindow = 0, int targetWindow = 0) {
         if (rows == 0) return;
         void *dsts[4]; const void *srcs[4]; size_t sizes[4];
         int copies = 0;
@@ -71,11 +87,15 @@ namespace {
             const size_t rowBytes = (size_t)source.expansionDims[2] * source.unitSize;
             AssertInFastLLM(source.dataType == target.dataType &&
                 source.expansionDims[2] == target.expansionDims[2], "Invalid SWA workspace layout.");
+            // Verification reserves staging rows after the ring. Its logical
+            // window stays unchanged even when the backing allocation grows.
+            const int sourceCapacity = sourceWindow ? sourceWindow : source.expansionDims[1];
+            const int targetCapacity = targetWindow ? targetWindow : target.expansionDims[1];
             for (int offset = 0; offset < rows;) {
-                int from = (sourceFirst + offset) % source.expansionDims[1];
-                int to = (targetFirst + offset) % target.expansionDims[1];
-                int count = std::min({rows - offset, source.expansionDims[1] - from,
-                                     target.expansionDims[1] - to});
+                int from = (sourceFirst + offset) % sourceCapacity;
+                int to = (targetFirst + offset) % targetCapacity;
+                int count = std::min({rows - offset, sourceCapacity - from,
+                                     targetCapacity - to});
                 AssertInFastLLM(copies < 4, "Invalid SWA window copy.");
                 dsts[copies] = (uint8_t *)target.cudaData + to * rowBytes;
                 srcs[copies] = (uint8_t *)source.cudaData + from * rowBytes;
@@ -140,7 +160,7 @@ int NaiveN05FlashModel::CacheReserveCapacity(const GenerationConfig &config) con
     return (int)std::min<int64_t>(capacity, limit);
 }
 
-void NaiveN05FlashModel::AppendCache(Data &cache, Data &input, DataType cacheType, int reserveCapacity) {
+void NaiveN05FlashModel::AppendCache(Data &cache, Data &input, DataType cacheType, int reserveCapacity, bool usePool) {
     int oldLength = cache.dims.empty() ? 0 : cache.dims[1];
     int length = oldLength + input.dims[1];
     cache.dataType = cacheType;
@@ -153,7 +173,7 @@ void NaiveN05FlashModel::AppendCache(Data &cache, Data &input, DataType cacheTyp
     const int64_t wanted = std::max(length, reserveCapacity);
     if (cache.expansionDims.empty() || cache.expansionDims[1] < wanted) {
         const int capacity = (int)std::min<int64_t>(INT_MAX, (wanted + 127) / 128 * 128);
-        ReserveCache(cache, capacity, width);
+        ReserveCache(cache, capacity, width, usePool);
     }
     if (cache.dims.empty()) cache.Resize({1, 0, width});
     if (cache.isPagedKVCache || cache.dataType == FP8_E4M3 || cache.kvCacheFp8Indexer ||
@@ -167,11 +187,11 @@ void NaiveN05FlashModel::AppendCache(Data &cache, Data &input, DataType cacheTyp
     cache.isKVCache = true;
 }
 
-void NaiveN05FlashModel::ReserveCache(Data &cache, int capacity, int width, const Data *requestKey) {
+void NaiveN05FlashModel::ReserveCache(Data &cache, int capacity, int width, bool usePool, const Data *requestKey) {
     if (cache.expansionDims.size() == 3 && cache.expansionDims[1] >= capacity) return;
     InvalidateTensorParallelCache(requestKey);
 #ifdef USE_CUDA
-    auto pool = cache.dataDevice == DataDevice::CUDA && cache.dataDeviceIds.size() == 1
+    auto pool = usePool && cache.dataDevice == DataDevice::CUDA && cache.dataDeviceIds.size() == 1
         ? tpKVPool.find(cache.dataDeviceIds[0]) : tpKVPool.end();
     if (pool != tpKVPool.end()) {
         AssertInFastLLM(FastllmNaiveKVType(cache.dataType) && !cache.isFake && !cache.cudaDataBorrowed &&
@@ -207,10 +227,47 @@ void NaiveN05FlashModel::ReserveCache(Data &cache, int capacity, int width, cons
 void NaiveN05FlashModel::UploadPagedCacheTables(const std::vector<Data *> &pendingPageTables) {
 #ifdef USE_CUDA
     if (pendingPageTables.empty()) return;
+    // A single table is cheaper to copy directly. For a batch, upload packed
+    // indices once, then scatter using the generic bounded batch-copy kernel.
+    // Scratch is per worker and device; the stream completes before reuse.
+    if (pendingPageTables.size() == 1) {
+        Data &cache = *pendingPageTables.front();
+        FastllmCudaCopyFromHostToDevice(cache.cudaData, cache.pageIndex.data(),
+            cache.pageIndex.size() * sizeof(int));
+        return;
+    }
+    struct Staging {
+        Data device{INT32};
+        std::vector<int> host;
+        std::vector<void *> dst;
+        std::vector<const void *> src;
+        std::vector<size_t> sizes;
+    };
+    static thread_local std::map<int, Staging> stagingByDevice;
+    const int device = pendingPageTables.front()->dataDeviceIds[0];
+    auto &staging = stagingByDevice[device];
+    size_t count = 0;
+    for (Data *cache : pendingPageTables) count += cache->pageIndex.size();
+    staging.host.resize(count);
+    staging.device.Resize({(int)count});
+    staging.device.ToDevice(DataDevice::CUDA, {device}, false);
+    staging.device.Allocate(false);
+    staging.dst.clear(); staging.src.clear(); staging.sizes.clear();
+    size_t offset = 0;
+    for (Data *cache : pendingPageTables) {
+        const size_t size = cache->pageIndex.size();
+        std::copy(cache->pageIndex.begin(), cache->pageIndex.end(), staging.host.begin() + offset);
+        staging.dst.push_back(cache->cudaData);
+        staging.src.push_back((int *)staging.device.cudaData + offset);
+        staging.sizes.push_back(size * sizeof(int));
+        offset += size;
+    }
     try {
-        for (Data *cache : pendingPageTables)
-            FastllmCudaCopyFromHostToDeviceAsync(cache->cudaData, cache->pageIndex.data(),
-                cache->pageIndex.size() * sizeof(int), cudaStreamPerThread);
+        FastllmCudaCopyFromHostToDeviceAsync(staging.device.cudaData, staging.host.data(),
+            count * sizeof(int), cudaStreamPerThread);
+        AssertInFastLLM(FastllmCudaBatchCopyFromDeviceToDeviceAsyncCurrentThread(
+            staging.dst.data(), staging.src.data(), staging.sizes.data(), staging.dst.size()),
+            "Naive page table upload failed.");
     } catch (...) {
         FastllmCudaSyncCurrentThreadStream();
         throw;
@@ -270,14 +327,12 @@ bool NaiveN05FlashModel::PreparePagedCache(Data &cache, PagedCacheManager &manag
         size_t bytes = GetDataBytes(manager.dataType, cache.pageLen, width);
         FastllmCudaCopyFromDeviceToDevice((uint8_t *)manager.cudaData + page * bytes,
             (uint8_t *)manager.cudaData + old * bytes, bytes);
-        if (sparseKv) {
-            auto sidecar = sparseKv->indexSidecars.find(&manager);
-            if (sidecar != sparseKv->indexSidecars.end()) {
-                Data &index = *sidecar->second;
-                size_t indexBytes = size_t(index.dims[1]) * index.dims[3] * index.unitSize;
-                FastllmCudaCopyFromDeviceToDevice((char *)index.cudaData + page * indexBytes,
-                    (char *)index.cudaData + old * indexBytes, indexBytes);
-            }
+        auto sidecar = tpIndexerSidecars.find(&manager);
+        if (sidecar != tpIndexerSidecars.end()) {
+            Data &index = *sidecar->second;
+            size_t indexBytes = size_t(index.dims[1]) * index.dims[3] * index.unitSize;
+            FastllmCudaCopyFromDeviceToDevice((char *)index.cudaData + page * indexBytes,
+                (char *)index.cudaData + old * indexBytes, indexBytes);
         }
         cache.pageIndex[last] = page;
         manager.ReleasePageIndex(old);
@@ -337,6 +392,8 @@ NaiveN05FlashModel::~NaiveN05FlashModel() {
     tpDecodeState.reset();
     tpVerifyState.reset();
     tpBatchState.reset();
+    tpBatchVerifyState.reset();
+    tpBatchVerifyGraphs.clear();
     tpEp8MegaState.reset();
     for (auto &rank : tpPagedCaches) for (auto &pool : rank) {
         if (pool && pool->trieRoot) {
@@ -392,7 +449,9 @@ void NaiveN05FlashModel::InitParams() {
     indexFp8 = weight.dicts["indexer_activation_dtype"] != "bf16";
     InitDraft();
     InitTensorParallel();
-    canDoBatchForward = !draftEnabled && tpDevices.size() > 1;
+    canDoBatchForward = tpDevices.size() > 1;
+    // Single-device and unsupported speculative modes retain request rotation.
+    canDoConcurrentForward = draftEnabled;
     AssertInFastLLM(window > 0 && indexDim == 128 && indexTopK > 0 &&
                     full.heads % full.kvHeads == 0 && sliding.heads % sliding.kvHeads == 0 &&
                     (int)(full.headDim * partialRotary) <= indexDim &&
@@ -469,7 +528,7 @@ int NaiveN05FlashModel::GetKVCacheRetainedTokens(int layer) const {
 }
 
 bool NaiveN05FlashModel::SupportsPrefillBatching() const {
-    return !draftEnabled && tpDevices.size() > 1 && CanUseGPUForward() &&
+    return tpDevices.size() > 1 && CanUseGPUForward() &&
            !GetKVCacheInCPU();
 }
 
@@ -506,10 +565,23 @@ std::vector<int> NaiveN05FlashModel::ForwardBatch(int batch, const Data &inputId
         for (auto *position : positionIds) contexts.push_back(TraceContextBefore(position));
         trace.reset(new inference_trace::Forward(*step, seqLens, std::move(contexts)));
     }
-    AssertInFastLLM(!draftEnabled && tpDevices.size() > 1 && batch > 0 &&
+    if (draftEnabled)
+        return ForwardDraftBatch(batch, inputIds, positionIds, seqLens, pastKeyValues,
+                                 configs, lastTokens, retLogits);
+    return ForwardTargetBatch(batch, inputIds, attentionMask, positionIds, seqLens,
+                              pastKeyValues, configs, lastTokens, retLogits);
+}
+
+std::vector<int> NaiveN05FlashModel::ForwardTargetBatch(int batch, const Data &inputIds,
+        const std::vector<Data *> &attentionMask, const std::vector<Data *> &positionIds,
+        const std::vector<int> &seqLens, std::vector<std::pair<Data *, Data *>> &pastKeyValues,
+        const std::vector<GenerationConfig> &configs, const LastTokensManager &lastTokens,
+        std::vector<std::vector<float> *> *retLogits, TargetCapture *capture) {
+    auto *trace = inference_trace::CurrentForward();
+    AssertInFastLLM(tpDevices.size() > 1 && batch > 0 &&
         (int)seqLens.size() == batch && (int)configs.size() == batch &&
         (int)positionIds.size() == batch && (int)pastKeyValues.size() == batch * block_cnt,
-        "Naive batch forward requires ordinary TP inference and complete request descriptors.");
+        "Naive batch forward requires TP inference and complete request descriptors.");
     TargetBatch requests{pastKeyValues, configs, seqLens, block_cnt};
     std::vector<float> packedPositions;
     packedPositions.reserve(inputIds.Count(0));
@@ -553,7 +625,7 @@ std::vector<int> NaiveN05FlashModel::ForwardBatch(int batch, const Data &inputId
     std::vector<std::pair<Data, Data>> unused;
     if (trace) trace->Mark("input_prepare_ms");
     Data logits = ForwardTensorParallel(inputIds, positions, unused, configs[0],
-                                        nullptr, &selection, &requests);
+                                        capture, &selection, &requests);
     if (!selection.sampledTokens.empty()) return selection.sampledTokens;
     std::vector<int> tokens(batch);
     if (!selection.candidates.dims.empty()) {
@@ -659,8 +731,10 @@ Data NaiveN05FlashModel::RunTarget(
     };
     int length = inputIds.dims[1];
     const int epRanks = tensorParallel ? (int)tpDevices.size() : 1;
-    const bool shardMoe = tensorParallel && tpEp8MegaState && decodeWorkspace &&
-        !verifying && length >= epRanks && length % epRanks == 0;
+    // Shard balanced token blocks by their actual row count, including eager
+    // multi-request verification. Uneven blocks retain the replicated fallback.
+    const bool shardMoe = tensorParallel && tpEp8MegaState && (decodeWorkspace || verifying) &&
+        length >= epRanks && length % epRanks == 0;
     // Small prefill chunks use MegaMoE's replicated (up to 64 rows) path.
     // Larger chunks dispatch contiguous token shards, including uneven tails.
     const bool shardPrefillRouter = tensorParallel && tpEp8MegaState &&
@@ -701,6 +775,7 @@ Data NaiveN05FlashModel::RunTarget(
     if (!tensorParallel) ApplyDeviceMap(deviceMap, 1, block_cnt);
     TargetWorkspace temporary;
     TargetWorkspace &buf = workspace ? *workspace : temporary;
+    Data *prefillScores = tensorParallel && !tpPrefillScores.empty() ? &tpPrefillScores.at(tpRank) : nullptr;
     Data &hidden = buf.hidden;
     Data &normed = buf.normed;
     Data &q = buf.q;
@@ -728,6 +803,10 @@ Data NaiveN05FlashModel::RunTarget(
         positions.CopyFrom(positionIds);
         ToDataType(positions, DataType::FLOAT32);
     }
+    if (!decodeWorkspace && verifying && tensorParallel) {
+        positions.ToDevice(DataDevice::CUDA, std::vector<int>{gpu});
+        FastllmCudaNaiveVerifyLengths(positions, buf.liveKeys);
+    }
     if (embedding) hidden.CopyFrom(*embedding);
     // A persistent verification workspace keeps BF16 storage. Embedding's
     // FP32 intermediate cannot reuse that allocation at the same element count.
@@ -749,7 +828,9 @@ Data NaiveN05FlashModel::RunTarget(
             else AssertInFastLLM(false, "Naive TP RMSNorm launch failed.");
         }
     };
-    const bool fusePrefillNorm = !decodeWorkspace && !verifying && length > 1;
+    // Raw fused kernels require the TP path's prebound CUDA norm weights.
+    // The generic path keeps the dispatcher that transfers weights on demand.
+    const bool fusePrefillNorm = tensorParallel && !decodeWorkspace && !verifying && length > 1;
     bool prefillNormReady = false, prefillResidualSharded = false;
     for (int layer = 0; layer < block_cnt; layer++) {
         const bool shardPrefillNorm = fusePrefillNorm && shardPrefillRouter &&
@@ -766,6 +847,8 @@ Data NaiveN05FlashModel::RunTarget(
         std::string ap = prefix + ".self_attn.";
         const bool localIndexer = HasLocalIndexer(layer, tpRank);
         const bool sparseLayer = sparseKv && !slidingLayers[layer];
+        const bool separateIndex = HasSeparateIndexer() && !slidingLayers[layer];
+        const bool contextSharded = indexerContextSharding && separateIndex;
         auto cfg = slidingLayers[layer] ? sliding : full;
         if (tensorParallel) {
             cfg.heads /= tpDevices.size();
@@ -805,17 +888,23 @@ Data NaiveN05FlashModel::RunTarget(
         // Prepare all independent caches/index lists first, then attend to the
         // complete decode batch in one call. Prefill and verification retain
         // their causal multi-query paths.
-        const bool batchedDSA = !slidingLayers[layer] && !graphVerify &&
-            (!capture || !capture->verifying) && indexTopK <= 2048 && cfg.headDim <= 256 &&
-            (cfg.valueDim == 128 || cfg.valueDim == 256) &&
+        const bool batchVerifyDSA = verifying &&
             (batch ? std::all_of(batch->lengths.begin(), batch->lengths.end(),
-                [](int count) { return count == 1; }) : length == 1);
+                [](int count) { return count > 0 && count <= 8; }) : length > 0 && length <= 8);
+        const bool batchedDSA = !slidingLayers[layer] && (!graphVerify || batch || separateIndex) &&
+            indexTopK <= 2048 && cfg.headDim <= 256 &&
+            (cfg.valueDim == 128 || cfg.valueDim == 256) &&
+            (batchVerifyDSA || (!verifying &&
+                (batch ? batch->Decode() : length == 1)));
         std::vector<FastllmNaiveDSARow> dsaRows;
-        if (batchedDSA) dsaRows.reserve(batch ? batch->Size() : 1);
-        const bool batchedSWA = slidingLayers[layer] && decodeWorkspace && !graphVerify &&
-            batch && batch->Decode() && tpSwaRingCache;
+        if (batchedDSA) dsaRows.reserve(length);
+        const bool verifySWA = verifying && (!graphVerify || (batch && capture->ringVerify)) && window == 128 &&
+            cfg.headDim == 192 && cfg.valueDim == 128 &&
+            (cfg.heads < 64 || cfg.heads / cfg.kvHeads != 8);
+        const bool batchedSWA = slidingLayers[layer] &&
+            (verifySWA || (decodeWorkspace && batch && batch->Decode() && tpSwaRingCache));
         std::vector<FastllmNaiveSWARow> swaRows;
-        if (batchedSWA) swaRows.reserve(batch->Size());
+        if (batchedSWA) swaRows.reserve(length);
         auto prepareIndexKey = [&](Data &normed, TargetWorkspace &buf, bool alreadyProjected = false) {
             if (!localIndexer) return;
             Data &indexKey = buf.indexKey;
@@ -841,25 +930,25 @@ Data NaiveN05FlashModel::RunTarget(
         bool batchNeedsIndex = false;
         // DSA needs a second binding for the independent Indexer. Keep SWA's
         // four-pointer row so existing projection/RoPE fusion stays eligible.
-        const int cacheStride = sparseLayer ? 8 : 4;
-        const void *const *layerCache = buf.cacheTable ? buf.cacheTable + (size_t)layer * buf.tableRows * (sparseKv ? 8 : 4) : nullptr;
+        const int cacheStride = separateIndex ? 8 : 4;
+        const void *const *layerCache = buf.cacheTable ? buf.cacheTable + (size_t)layer * buf.tableRows * (HasSeparateIndexer() ? 8 : 4) : nullptr;
         const unsigned char *layerMaps = buf.cacheMaps ? buf.cacheMaps + (size_t)layer * buf.tableRows * FastllmNaiveDSAMapBytes : nullptr;
         if (batch) {
             while ((int)buf.sequences.size() < batch->Size())
                 buf.sequences.emplace_back(new TargetWorkspace());
         }
         std::vector<std::unique_ptr<Data>> separateIndexCaches;
-        if (sparseLayer && batch && localIndexer) {
-            for (int sequence = 0; sequence < batch->Size(); ++sequence)
-                separateIndexCaches.emplace_back(new Data(SparseIndexer(layer, tpRank,
-                    *batch->Key(sequence, layer).multiDeviceDatas.at(gpu))));
+        if (separateIndex && localIndexer) {
+            for (int sequence = 0; sequence < (batch ? batch->Size() : 1); ++sequence)
+                separateIndexCaches.emplace_back(new Data(SeparateIndexer(layer, tpRank,
+                    *(batch ? batch->Key(sequence, layer) : pastKeyValues[layer].first).multiDeviceDatas.at(gpu))));
         }
         auto indexCache = [&](int sequence) -> Data * {
-            return sparseLayer ? separateIndexCaches[sequence].get() :
+            return separateIndex ? separateIndexCaches[sequence].get() :
                 batch->Key(sequence, layer).multiDeviceDatas.at(gpu);
         };
         auto indexTable = [&](int sequence) {
-            return layerCache ? layerCache + sequence * cacheStride + (sparseLayer ? 4 : 0) : nullptr;
+            return layerCache ? layerCache + sequence * cacheStride + (separateIndex ? 4 : 0) : nullptr;
         };
         if (batchRope) {
             std::vector<FastllmNaiveRopeCacheRow> caches;
@@ -892,8 +981,8 @@ Data NaiveN05FlashModel::RunTarget(
                     batch->Value(sequence, layer).multiDeviceDatas.at(gpu),
                     localIndexer ? &indexKeys[sequence] : nullptr,
                     layerCache ? layerCache + sequence * cacheStride : nullptr,
-                    sparseLayer && localIndexer ? separateIndexCaches[sequence].get() : nullptr,
-                    indexerContextSharding ? tpRank : 0});
+                    separateIndex && localIndexer ? separateIndexCaches[sequence].get() : nullptr,
+                    contextSharded ? tpRank : 0});
             }
 #ifndef USE_ROCM
             if (mergedQkv)
@@ -912,6 +1001,55 @@ Data NaiveN05FlashModel::RunTarget(
                     mergedQkv ? &qkv : nullptr, slidingLayers[layer] && tpSwaRingCache);
             }
         }
+        // Pack all verification queries, including ragged requests, into the
+        // existing RoPE/cache kernel. Shared cache addresses are safe because
+        // every descriptor owns a distinct candidate/chronological write slot.
+        if (tensorParallel && verifying && (!decodeWorkspace || (batch && capture->ringVerify))) {
+            prepareIndexKey(normed, buf);
+            std::vector<FastllmNaiveRopeCacheRow> caches;
+            std::vector<Data> indexRows(length);
+            caches.reserve(length);
+            int offset = 0;
+            for (int sequence = 0; sequence < (batch ? batch->Size() : 1); ++sequence) {
+                const int count = batch ? batch->lengths[sequence] : length;
+                Data &key = *(batch ? batch->Key(sequence, layer) : pastKeyValues[layer].first).multiDeviceDatas.at(gpu);
+                Data &value = *(batch ? batch->Value(sequence, layer) : pastKeyValues[layer].second).multiDeviceDatas.at(gpu);
+                key.kvCacheFp8Indexer = !separateIndex && fp8IndexerCache && localIndexer;
+                // Eager contiguous caches can end inside this verification
+                // block. Unlike AppendCache, the fused writer never grows them.
+                const int needed = slidingLayers[layer] && capture->ringVerify
+                    ? window + count : key.dims[1] + count;
+                if (!decodeWorkspace) for (Data *cache : {&key, &value})
+                    if (!cache->isPagedKVCache)
+                        ReserveCache(*cache, (needed + 127) / 128 * 128, cache->dims[2]);
+                for (int row = 0; row < count; ++row) {
+                    Data *index = nullptr;
+                    if (localIndexer) {
+                        index = &indexRows[offset + row];
+                        index->Resize({1, 1, indexDim});
+                        index->FakeFrom(buf.indexKey, (size_t)(offset + row) * indexDim * buf.indexKey.unitSize);
+                    }
+                    FastllmNaiveRopeCacheRow item{&key, &value, index,
+                        layerCache ? layerCache + sequence * cacheStride : nullptr,
+                        separateIndex && localIndexer ? separateIndexCaches[sequence].get() : nullptr,
+                        contextSharded ? tpRank : 0};
+                    if (slidingLayers[layer]) {
+                        if (capture->ringVerify) item.verifyOffset = row;
+                        else item.cacheOffset = key.dims[1] + row;
+                    }
+                    caches.push_back(item);
+                }
+                offset += count;
+            }
+            batchRopePrepared = FastllmCudaNaiveBatchRopeAppendCache(q, k, v, positions,
+                caches, buf.liveKeys, cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim,
+                rotaryDim, cfg.theta, valueScale, slidingLayers[layer] ? window : 0,
+                mergedQkv ? &qkv : nullptr, false);
+        }
+        // A dynamic binding must reach every KV consumer. An unsupported
+        // fused append may still execute eagerly, but cannot be captured.
+        if (graphVerify && layerCache && !batchRopePrepared)
+            tpDecodeState->ranks[tpRank]->ok = false;
         auto prepareIndexQuery = [&](Data &normed, Data &positions, Data &indexQ, Data &indexWeights) {
             const std::string ip = ap + "indexer.";
             Linear(normed, localWeight(ip + "wq.weight"), Data(), indexQ);
@@ -919,26 +1057,32 @@ Data NaiveN05FlashModel::RunTarget(
             Linear(normed, localWeight(ip + "weights_proj.weight"), Data(), indexWeights);
             Mul(indexWeights, 1.0f / std::sqrt((float)indexHeads), indexWeights);
         };
+        const bool batchVerifyIndex = batchVerifyDSA && batch &&
+            indexHeads == 16 && indexDim == 128 && indexTopK == 2048;
+        std::vector<FastllmNaiveVerifyIndexerItem> verifyIndexItems;
         const bool batchIndexPrepared = batchRopePrepared && batchNeedsIndex && localIndexer;
         Data &batchIndexQ = buf.indexQ, &batchIndexWeights = buf.indexWeights;
-        if (batchIndexPrepared) {
+        if (batchIndexPrepared || (batchVerifyIndex && localIndexer)) {
             if (indexProjectionPrepared)
                 FastllmCudaNaiveRope(batchIndexQ, positions, indexHeads, indexDim, rotaryDim, cfg.theta);
             else prepareIndexQuery(normed, positions, batchIndexQ, batchIndexWeights);
         }
-        const bool broadcastBatchIndex = (indexerLayerSharding || sparseLayer) && batchRopePrepared && batchNeedsIndex;
-        if (broadcastBatchIndex) {
+        const bool broadcastBatchIndex = (indexerLayerSharding || separateIndex) && batchRopePrepared && batchNeedsIndex;
+        if (broadcastBatchIndex || batchVerifyIndex) {
             // One contiguous TopK exchange per layer, independent of the number
             // of requests. Graph shapes share the largest warmup allocation.
             buf.indexBroadcast.dataType = INT32;
-            buf.indexBroadcast.Resize({batch->Size(), indexTopK});
+            buf.indexBroadcast.Resize({batchVerifyIndex ? length : batch->Size(), indexTopK});
             buf.indexBroadcast.ToDevice(normed.dataDevice, normed.dataDeviceIds, false);
             buf.indexBroadcast.Allocate(false);
+            int offset = 0;
             for (int sequence = 0; sequence < batch->Size(); ++sequence) {
+                const int rows = batchVerifyIndex ? batch->lengths[sequence] : 1;
                 Data &indices = buf.sequences[sequence]->indices;
                 indices.FreeSpace(); // Fake views do not own their allocation.
-                indices.Resize({1, indexTopK});
-                indices.FakeFrom(buf.indexBroadcast, (size_t)sequence * indexTopK * sizeof(int));
+                indices.Resize({rows, indexTopK});
+                indices.FakeFrom(buf.indexBroadcast, (size_t)offset * indexTopK * sizeof(int));
+                offset += rows;
             }
         }
         bool batchIndexerPrepared = false;
@@ -952,12 +1096,12 @@ Data NaiveN05FlashModel::RunTarget(
                         &part.decode, &part.indices, sequence, part.capacity, indexTable(sequence)});
             }
             const int ranks = tensorParallel ? (int)tpDevices.size() : 1;
-            const bool contextParallel = !indexerLayerSharding && !indexerContextSharding && !verifying && decodeWorkspace && ranks > 1 &&
+            const bool contextParallel = !indexerLayerSharding && !contextSharded && !verifying && decodeWorkspace && ranks > 1 &&
                 rows.size() >= 4 && buf.capacity >= std::max(65536, ranks * 4096) &&
                 FastllmCudaNaiveIndexerContextSupported(tpDevices) &&
                 buf.decode.indexScores.Count(0) >= (size_t)ranks * rows.size() * indexTopK * 2;
             Data &exchange = buf.decode.indexScores;
-            if (indexerContextSharding) {
+            if (contextSharded) {
                 RunContextDecodeIndexer(batchIndexQ, batchIndexWeights, buf.liveKeys, rows,
                     buf.indexContextExchange, tpRank, ranks, GetPageLen(), gpu, indexFp8);
                 batchIndexerPrepared = true;
@@ -1002,8 +1146,8 @@ Data NaiveN05FlashModel::RunTarget(
         // all requests together. Attention remains in its original request order.
         const int prefillRanks = tensorParallel ? (int)tpDevices.size() : 1;
         bool batchPrefillIndex = batch && batch->Size() > 1 && batch->Size() <= 8 &&
-            !decodeWorkspace && !verifying && sparseLayer && tpEp8MegaState &&
-            ((indexerLayerSharding && tpIndexerPeerAccess) || indexerContextSharding) && indexFp8 && indexHeads == 16 &&
+            !decodeWorkspace && !verifying && separateIndex && tpEp8MegaState &&
+            ((indexerLayerSharding && tpIndexerPeerAccess) || contextSharded) && indexFp8 && indexHeads == 16 &&
             indexDim == 128 && indexTopK == 2048 &&
             (prefillRanks == 2 || prefillRanks == 4 || prefillRanks == 8) &&
             FastllmCudaRuntimeArch() == 90;
@@ -1034,24 +1178,28 @@ Data NaiveN05FlashModel::RunTarget(
                 !decodeWorkspace && !verifying && !tpSwaPrefillWorkspaces.empty();
             Data &pastKey = sharedSwa ? tpSwaPrefillWorkspaces[tpRank].first : cacheKey;
             Data &pastValue = sharedSwa ? tpSwaPrefillWorkspaces[tpRank].second : cacheValue;
-            pastKey.kvCacheFp8Indexer = !sparseLayer && fp8IndexerCache && localIndexer;
+            pastKey.kvCacheFp8Indexer = !separateIndex && fp8IndexerCache && localIndexer;
             int localPast = cacheKey.dims.empty() ? 0 : cacheKey.dims[1];
-            if (attendPhase == 2) localPast -= length;
+            if (attendPhase == 2 && !decodeWorkspace) localPast -= length;
             const bool ringCache = tensorParallel && slidingLayers[layer] && tpSwaRingCache;
             const bool ringDecode = ringCache && decodeWorkspace && !graphVerify;
+            const bool ringVerify = ringCache && capture && capture->ringVerify;
             Data noIndices;
-            Data *selected = attendPhase == 2 ? &indices : &noIndices;
+            Data *selected = attendPhase == 2 &&
+                (decodeWorkspace ? buf.capacity : localPast + length) > indexTopK ? &indices : &noIndices;
             int balancedIndexRanks = attendPhase == 2 ? prefillRanks : 0;
             if (attendPhase != 2) {
+                if (sparseLayer && !batchedDSA)
+                    sparseKv->ranks[tpRank]->layers[layer]->InvalidateTail(cacheKey.cudaData, localPast, cudaStreamPerThread);
                 if (sharedSwa) {
                     pastKey.Resize({1, localPast, cfg.kvHeads * cfg.headDim});
                     pastValue.Resize({1, localPast, cfg.kvHeads * cfg.valueDim});
                     CopySwaWindow(cacheKey, cacheValue, pastKey, pastValue,
-                        ringCache ? (globalPast - localPast) % window : 0, 0, localPast);
+                        ringCache ? (globalPast - localPast) % window : 0, 0, localPast, ringCache ? window : 0);
                 }
                 // Graph replay reads/writes the ring directly. Eager prefill/fallback
                 // uses the existing contiguous kernels and restores the ring once.
-                // Verify was linearized outside capture by ForwardTensorParallel.
+                // Verification stages candidates after the ring or was linearized outside capture.
                 if (ringCache && !decodeWorkspace && !verifying && !sharedSwa)
                     FastllmCudaNaiveSwaCacheLayout(pastKey, pastValue, globalPast, false);
                 // Sliding layers retain only window-1 rows between chunks. Keep their
@@ -1059,29 +1207,39 @@ Data NaiveN05FlashModel::RunTarget(
                 const int layerCapacity = slidingLayers[layer]
                     ? (int)std::min<int64_t>(reserveCapacity, (int64_t)window - 1 + length)
                     : reserveCapacity;
-                Data separateIndex = sparseLayer && localIndexer ? SparseIndexer(layer, tpRank, cacheKey) : Data();
-                Data &scoringKey = sparseLayer ? separateIndex : pastKey;
+                Data &scoringKey = separateIndex && localIndexer ? *separateIndexCaches[sequence] : pastKey;
+                auto indexLength = [&](int tokens) {
+                    if (!contextSharded) return tokens;
+                    const int page = GetPageLen(), local = page / (int)tpDevices.size();
+                    return tokens / page * local + std::clamp(tokens % page - tpRank * local, 0, local);
+                };
+                if (separateIndex && localIndexer && batchRopePrepared)
+                    scoringKey.Resize({1, indexLength(localPast + length), scoringKey.dims[2]});
+                // Scoring masks reads by liveKeys; its graph capacity can span
+                // future pages of the fixed table. Appends validate page bindings.
+                if (separateIndex && localIndexer && graphVerify)
+                    scoringKey.expansionDims[1] = std::max(scoringKey.expansionDims[1], indexLength(buf.capacity));
                 if (!batchRopePrepared) prepareIndexKey(normed, buf);
-                if (sparseLayer && localIndexer && !batchRopePrepared) {
+                if (separateIndex && localIndexer && !batchRopePrepared) {
                     FastllmCudaNaiveRope(indexKey, positions, 1, indexDim, rotaryDim, cfg.theta);
                     Data *input = &indexKey;
                     if (fp8IndexerCache) {
                         FastllmCudaNaivePackIndexer(indexKey, buf.packedIndexer);
                         input = &buf.packedIndexer;
                     }
-                    if (indexerContextSharding)
-                        FastllmCudaNaiveContextIndexerWrite(separateIndex, *input, localPast,
+                    if (contextSharded)
+                        FastllmCudaNaiveContextIndexerWrite(scoringKey, *input, localPast,
                             decodeWorkspace ? &buf.liveKeys : nullptr, tpRank, tpDevices.size());
                     else if (decodeWorkspace)
-                        FastllmCudaNaivePagedWrite(separateIndex, *input, 0, &buf.liveKeys);
-                    else AppendCache(separateIndex, *input, AuxiliaryKVType(), 0);
+                        FastllmCudaNaivePagedWrite(scoringKey, *input, 0, &buf.liveKeys);
+                    else AppendCache(scoringKey, *input, AuxiliaryKVType(), 0);
                 }
                 Data noIndexKey, noLiveKeys;
-                bool fusedCache = batchRopePrepared || ((decodeWorkspace || (!tensorParallel && length <= 8 && localPast > 0)) &&
-                    FastllmCudaNaiveRopeAppendCache(q, k, v, localIndexer && !sparseLayer ? indexKey : noIndexKey,
-                        positions, pastKey, pastValue, decodeWorkspace ? buf.liveKeys : noLiveKeys, cfg.heads, cfg.kvHeads,
+                bool fusedCache = batchRopePrepared || ((decodeWorkspace || ringVerify || (!tensorParallel && length <= 8 && localPast > 0)) &&
+                    FastllmCudaNaiveRopeAppendCache(q, k, v, localIndexer && !separateIndex ? indexKey : noIndexKey,
+                        positions, pastKey, pastValue, decodeWorkspace || ringVerify ? buf.liveKeys : noLiveKeys, cfg.heads, cfg.kvHeads,
                         cfg.headDim, cfg.valueDim, rotaryDim, cfg.theta, valueScale,
-                        slidingLayers[layer] ? window : 0, mergedQkv ? &qkv : nullptr, ringDecode));
+                        slidingLayers[layer] ? window : 0, mergedQkv ? &qkv : nullptr, ringDecode, ringVerify));
                 if (fusedCache && !decodeWorkspace) {
                     pastKey.Resize({1, localPast + length, pastKey.dims[2]});
                     pastValue.Resize({1, localPast + length, pastValue.dims[2]});
@@ -1093,7 +1251,7 @@ Data NaiveN05FlashModel::RunTarget(
                 if (!fusedCache) {
                     FastllmCudaNaiveRopeQKScaleV(q, k, v, positions, cfg.heads, cfg.kvHeads,
                         cfg.headDim, cfg.valueDim, rotaryDim, cfg.theta, valueScale, mergedQkv ? &qkv : nullptr);
-                    if (localIndexer && !sparseLayer) {
+                    if (localIndexer && !separateIndex) {
                         FastllmCudaNaiveRope(indexKey, positions, 1, indexDim, rotaryDim, cfg.theta);
                         Cat(k, indexKey, 2, packed);
                     } else {
@@ -1104,11 +1262,15 @@ Data NaiveN05FlashModel::RunTarget(
                         FastllmCudaNaivePackIndexer(packed, buf.packedIndexer);
                         cacheInput = &buf.packedIndexer;
                     }
-                    if (decodeWorkspace) {
-                        if (graphVerify) FastllmCudaNaiveAppendVerifyCache(pastKey, pastValue, *cacheInput, v,
-                            buf.liveKeys, slidingLayers[layer] ? window : 0);
+                    if (decodeWorkspace || ringVerify) {
+                        if (graphVerify || ringVerify) FastllmCudaNaiveAppendVerifyCache(pastKey, pastValue, *cacheInput, v,
+                            buf.liveKeys, slidingLayers[layer] ? window : 0, ringVerify);
                         else FastllmCudaNaiveAppendDecodeCache(pastKey, pastValue, *cacheInput, v,
                             buf.liveKeys, slidingLayers[layer] ? window : 0, ringDecode);
+                        if (ringVerify && !decodeWorkspace) {
+                            pastKey.Resize({1, localPast + length, pastKey.dims[2]});
+                            pastValue.Resize({1, localPast + length, pastValue.dims[2]});
+                        }
                     } else {
                         AppendCache(pastKey, *cacheInput, LayerKVType(layer), layerCapacity);
                         AppendCache(pastValue, v, LayerKVType(layer), layerCapacity);
@@ -1128,16 +1290,34 @@ Data NaiveN05FlashModel::RunTarget(
                         (int64_t)(length / ranks) * pastKey.dims[1] >= 1024 * 1024;
                     if ((localIndexer || parallelIndex) && !batchIndexerPrepared) {
                         Data rowIndexQ, rowIndexWeights;
-                        Data &indexQ = batchIndexPrepared ? rowIndexQ : buf.indexQ;
-                        Data &indexWeights = batchIndexPrepared ? rowIndexWeights : buf.indexWeights;
-                        if (batchIndexPrepared) {
-                            indexQ.Resize({1, 1, indexHeads * indexDim});
-                            indexQ.FakeFrom(batchIndexQ, (size_t)sequence * indexHeads * indexDim * batchIndexQ.unitSize);
-                            indexWeights.Resize({1, 1, indexHeads});
-                            indexWeights.FakeFrom(batchIndexWeights, (size_t)sequence * indexHeads * batchIndexWeights.unitSize);
+                        const bool packedQueries = batchIndexPrepared || batchVerifyIndex;
+                        Data &indexQ = packedQueries ? rowIndexQ : buf.indexQ;
+                        Data &indexWeights = packedQueries ? rowIndexWeights : buf.indexWeights;
+                        int queryOffset = sequence;
+                        if (batchVerifyIndex) {
+                            queryOffset = 0;
+                            for (int i = 0; i < sequence; ++i) queryOffset += batch->lengths[i];
+                        }
+                        if (packedQueries) {
+                            indexQ.Resize({1, length, indexHeads * indexDim});
+                            indexQ.FakeFrom(batchIndexQ, (size_t)queryOffset * indexHeads * indexDim * batchIndexQ.unitSize);
+                            indexWeights.Resize({1, length, indexHeads});
+                            indexWeights.FakeFrom(batchIndexWeights, (size_t)queryOffset * indexHeads * batchIndexWeights.unitSize);
                         } else if (localIndexer) prepareIndexQuery(normed, positions, indexQ, indexWeights);
+                        if (batchVerifyIndex) {
+                            verifyIndexItems.push_back({&scoringKey, &indices, queryOffset, length, localPast,
+                                graphVerify ? buf.capacity : 0, indexTable(sequence)});
+                            return;
+                        }
+                        if (contextSharded && verifying) {
+                            RunContextVerifyIndexer(indexQ, indexWeights,
+                                {{&scoringKey, &indices, 0, length, localPast,
+                                  graphVerify ? buf.capacity : 0, indexTable(sequence)}},
+                                buf.decode, buf.liveKeys, buf.indexContextExchange,
+                                tpRank, ranks, GetPageLen(), gpu, indexFp8);
+                        } else {
                         const Data *scoreKey = &scoringKey;
-                        if (indexerContextSharding && !decodeWorkspace) {
+                        if (contextSharded && !decodeWorkspace) {
                             // Prefill consumes a chronological view. Only this request's
                             // active history is gathered; the persistent pool stays sharded.
                             const int keys = localPast + length;
@@ -1173,8 +1353,8 @@ Data NaiveN05FlashModel::RunTarget(
                             // before peer reads. The cache stays live through gather.
                             const Data &root = batch ? batch->Key(sequence, layer) : pastKeyValues[layer].first;
                             scoreKey = root.multiDeviceDatas.at(owner);
-                            if (sparseLayer) {
-                                peerIndex = SparseIndexer(layer, IndexerOwnerRank(layer), *scoreKey);
+                            if (separateIndex) {
+                                peerIndex = SeparateIndexer(layer, IndexerOwnerRank(layer), *scoreKey);
                                 // The owner appended on its stream before broadcast;
                                 // use this query's length rather than stale root metadata.
                                 peerIndex.dims[1] = localPast + length;
@@ -1182,8 +1362,7 @@ Data NaiveN05FlashModel::RunTarget(
                             }
                         }
                         if (decodeWorkspace) {
-                            if (indexerContextSharding) {
-                                AssertInFastLLM(!graphVerify, "Context-sharded Indexer does not support speculative verification.");
+                            if (contextSharded) {
                                 std::vector<FastllmNaiveIndexerRow> rows{{&scoringKey, &buf.decode, &indices,
                                     0, buf.capacity, indexTable(sequence)}};
                                 RunContextDecodeIndexer(indexQ, indexWeights, buf.liveKeys, rows,
@@ -1195,7 +1374,7 @@ Data NaiveN05FlashModel::RunTarget(
                                 indexTable(sequence));
                         } else {
                             if (capture && capture->verifying && length <= 8)
-                                FastllmCudaNaiveVerifyIndexer(indexQ, indexWeights, scoringKey, indexHeads,
+                                FastllmCudaNaiveVerifyIndexer(indexQ, indexWeights, *scoreKey, indexHeads,
                                     indexDim, localPast, indexTopK, indexFp8, indices);
                             else if (parallelIndex) {
                                 // Score disjoint query tiles and gather only indices.
@@ -1212,7 +1391,7 @@ Data NaiveN05FlashModel::RunTarget(
                                 indices.ToDevice(indexQ.dataDevice, indexQ.dataDeviceIds, false);
                                 indices.Allocate(false);
                                 if (attendPhase == 1) {
-                                    // SparseIndexer returns backend-approved non-owning views.
+                                    // SeparateIndexer returns backend-approved non-owning views.
                                     // Keep their metadata alive through the batched launch/gathers.
                                     auto keyView = std::make_unique<Data>(scoreKey->dataType, scoreKey->dims);
                                     keyView->FakeFrom(*scoreKey, 0);
@@ -1231,7 +1410,7 @@ Data NaiveN05FlashModel::RunTarget(
                                 rankIndices.FakeFrom(indices, (size_t)tpRank * rows * indexTopK * sizeof(int));
                                 const bool mergedParts = balanced && indexTopK == 2048 &&
                                     FastllmCudaNaiveBalancedIndexer(indexQ, indexWeights, *scoreKey,
-                                        localPast, tpRank, ranks, indexFp8, indexerLayerSharding || indexerContextSharding, rankIndices);
+                                        localPast, tpRank, ranks, indexFp8, indexerLayerSharding || contextSharded, rankIndices, prefillScores);
                                 for (int part = 0; !mergedParts && part < parts; ++part) {
                                     const int first = part == 0 ? tpRank * partRows :
                                         length - (tpRank + 1) * partRows;
@@ -1244,7 +1423,7 @@ Data NaiveN05FlashModel::RunTarget(
                                     localIndices.FakeFrom(indices,
                                         (size_t)(tpRank * rows + part * partRows) * indexTopK * sizeof(int));
                                     FastllmCudaNaiveIndexer(localQ, localWeights, *scoreKey, indexHeads, indexDim,
-                                        localPast + first, indexTopK, indexFp8, localIndices, indexerLayerSharding || indexerContextSharding);
+                                        localPast + first, indexTopK, indexFp8, localIndices, indexerLayerSharding || contextSharded, prefillScores);
                                 }
                                 FastllmCudaMimoEp8PrefillAllGather(*tpEp8MegaState, tpRank, indices);
                                 if (balanced) balancedIndexRanks = ranks;
@@ -1253,7 +1432,7 @@ Data NaiveN05FlashModel::RunTarget(
                                 Data temporary;
                                 Data &gathered = length % ranks ? temporary : indices;
                                 ScoreRaggedIndexer(indexQ, indexWeights, *scoreKey, localPast,
-                                    indexTopK, indexFp8, tpRank, ranks, gathered);
+                                    indexTopK, indexFp8, tpRank, ranks, gathered, prefillScores);
                                 const int rows = RaggedIndexerRows(length, ranks);
                                 AssertInFastLLM(FastllmNcclAllGather(
                                     (int *)gathered.cudaData + (size_t)tpRank * rows * indexTopK,
@@ -1262,10 +1441,11 @@ Data NaiveN05FlashModel::RunTarget(
                                 if (length % ranks) CompactRaggedIndexer(gathered, length, ranks, indices);
                             }
                             else FastllmCudaNaiveIndexer(indexQ, indexWeights, *scoreKey, indexHeads, indexDim,
-                                                        localPast, indexTopK, indexFp8, indices);
+                                                        localPast, indexTopK, indexFp8, indices, false, prefillScores);
                         }
                     }
-                    if (indexerLayerSharding && !broadcastBatchIndex && !parallelIndex) {
+                    }
+                    if (indexerLayerSharding && !broadcastBatchIndex && !batchVerifyIndex && !parallelIndex) {
                         if (!localIndexer) {
                             indices.dataType = INT32;
                             indices.Resize({length, indexTopK});
@@ -1284,6 +1464,7 @@ Data NaiveN05FlashModel::RunTarget(
                     selected = &indices;
                 }
             }
+            if (batchVerifyIndex && attendPhase == 1) return;
             Data stagedKey, stagedValue;
             if (sparseLayer && !batchedDSA) StageSparseKv(tpRank, layer, pastKey, pastValue, stagedKey, stagedValue);
             Data &attentionKey = sparseLayer && !batchedDSA ? stagedKey : pastKey;
@@ -1313,14 +1494,36 @@ Data NaiveN05FlashModel::RunTarget(
                 row.capacity = decodeWorkspace ? buf.capacity : pastKey.dims[1];
                 row.keyStride = pastKey.dims[2];
                 row.selectedCount = row.indices ? selected->dims.back() : 0;
-                dsaRows.push_back(row);
+                // Verification queries share KV storage, but retain independent
+                // causal lengths and sparse selections, including a dense/sparse
+                // boundary inside one block. Reuse the normal batched DSA kernels.
+                for (int query = 0; query < length; ++query) {
+                    auto item = row;
+                    if (batchVerifyDSA) {
+                        item.length = localPast + query + 1;
+                        item.capacity = graphVerify ? buf.capacity : item.length;
+                        item.liveKeys = graphVerify ? (const int *)buf.liveKeys.cudaData + query : nullptr;
+                        item.indices = row.indices && (graphVerify ? buf.capacity : item.length) > row.selectedCount
+                            ? row.indices + (size_t)query * row.selectedCount : nullptr;
+                        item.selectedCount = item.indices ? row.selectedCount : 0;
+                    }
+                    dsaRows.push_back(item);
+                }
             } else if (batchedSWA) {
-                swaRows.push_back({pastKey.cudaData, pastValue.cudaData, layerCache ? layerCache + sequence * cacheStride : nullptr,
-                                   pastKey.dataType == FP8_E4M3});
+                for (int query = 0; query < length; ++query) {
+                    FastllmNaiveSWARow row{pastKey.cudaData, pastValue.cudaData,
+                        layerCache ? layerCache + sequence * cacheStride : nullptr, pastKey.dataType == FP8_E4M3};
+                    if (verifySWA) {
+                        row.ring = ringVerify;
+                        row.length = (ringVerify ? globalPast : localPast) + query + 1;
+                        row.verifyOffset = ringVerify ? query : -1;
+                    }
+                    swaRows.push_back(row);
+                }
             } else if (decodeWorkspace) {
                 if (graphVerify) FastllmCudaNaiveGraphVerifyAttention(q, attentionKey, attentionValue, *selected, sink,
                     buf.liveKeys, buf.capacity, cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim,
-                    slidingLayers[layer] ? window : 0, buf.decode, attn);
+                    slidingLayers[layer] ? window : 0, buf.decode, attn, ringVerify);
                 else FastllmCudaNaiveDecodeAttention(q, attentionKey, attentionValue, *selected, sink,
                     buf.liveKeys, buf.capacity, cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim,
                     slidingLayers[layer] ? window : 0, buf.decode, attn, ringDecode);
@@ -1350,7 +1553,7 @@ Data NaiveN05FlashModel::RunTarget(
                     const int rows = std::min(localPast + length, window - 1);
                     CopySwaWindow(pastKey, pastValue, cacheKey, cacheValue,
                         localPast + length - rows,
-                        ringCache ? (globalPast + length - rows) % window : 0, rows);
+                        ringCache ? (globalPast + length - rows) % window : 0, rows, 0, ringCache ? window : 0);
                     cacheKey.Resize({1, rows, cfg.kvHeads * cfg.headDim});
                     cacheValue.Resize({1, rows, cfg.kvHeads * cfg.valueDim});
                 } else if (slidingLayers[layer] && !verifying)
@@ -1364,8 +1567,8 @@ Data NaiveN05FlashModel::RunTarget(
             attn.Resize({1, length, cfg.heads * cfg.valueDim});
             attn.ToDevice(q.dataDevice, q.dataDeviceIds, false);
             attn.Allocate(false);
-            for (int phase = 0; phase < (batchPrefillIndex ? 2 : 1); ++phase) {
-                attendPhase = batchPrefillIndex ? phase + 1 : 0;
+            for (int phase = 0; phase < (batchPrefillIndex || batchVerifyIndex ? 2 : 1); ++phase) {
+                attendPhase = batchPrefillIndex || batchVerifyIndex ? phase + 1 : 0;
                 int offset = 0;
                 for (int sequence = 0; sequence < batch->Size(); ++sequence) {
                     const int count = batch->lengths[sequence];
@@ -1382,10 +1585,15 @@ Data NaiveN05FlashModel::RunTarget(
                     view(rowAttention, attn, cfg.heads * cfg.valueDim);
                     rowPositions.Resize({1, count});
                     rowPositions.FakeFrom(positions, (size_t)offset * sizeof(float));
-                    auto &part = *buf.sequences[sequence];
-                    if (decodeWorkspace) {
-                        part.liveKeys.Resize({1});
-                        part.liveKeys.FakeFrom(buf.liveKeys, sequence * sizeof(int));
+                    // Sequential prefill attention needs one scratch/history
+                    // buffer, regardless of the number of admitted requests.
+                    // Deferred Indexer scoring and decode keep independent rows.
+                    const bool sharedPrefill = !batch->Decode() && !decodeWorkspace &&
+                        !verifying && !batchPrefillIndex;
+                    auto &part = sharedPrefill ? buf : *buf.sequences[sequence];
+                    if (decodeWorkspace || (capture && capture->ringVerify)) {
+                        part.liveKeys.Resize({count});
+                        part.liveKeys.FakeFrom(buf.liveKeys, offset * sizeof(int));
                     }
                     attend(rowNorm, rowQ, rowK, rowV, rowQkv, rowPositions,
                            *batch->Key(sequence, layer).multiDeviceDatas.at(gpu),
@@ -1395,12 +1603,40 @@ Data NaiveN05FlashModel::RunTarget(
                            sequence);
                     offset += count;
                 }
+                if (batchVerifyIndex && phase == 0) {
+                    if (contextSharded && !verifyIndexItems.empty()) {
+                        RunContextVerifyIndexer(batchIndexQ, batchIndexWeights, verifyIndexItems,
+                            buf.decode, buf.liveKeys, buf.indexContextExchange,
+                            tpRank, (int)tpDevices.size(), GetPageLen(), gpu, indexFp8);
+                    } else if (localIndexer && !verifyIndexItems.empty() &&
+                        !FastllmCudaNaiveBatchVerifyIndexer(batchIndexQ, batchIndexWeights,
+                            verifyIndexItems, indexFp8, buf.decode, buf.liveKeys)) {
+                        if (graphVerify && layerCache) tpDecodeState->ranks[tpRank]->ok = false;
+                        for (const auto &item : verifyIndexItems) {
+                            Data iq(BFLOAT16, {1, item.rows, indexHeads * indexDim});
+                            Data iw(BFLOAT16, {1, item.rows, indexHeads});
+                            iq.FakeFrom(batchIndexQ, (size_t)item.offset * indexHeads * indexDim * sizeof(uint16_t));
+                            iw.FakeFrom(batchIndexWeights, (size_t)item.offset * indexHeads * sizeof(uint16_t));
+                            if (graphVerify) {
+                                int sequence = 0, offset = 0;
+                                while (offset < item.offset) offset += batch->lengths[sequence++];
+                                auto &part = *buf.sequences[sequence];
+                                FastllmCudaNaiveGraphVerifyIndexer(iq, iw, *item.key,
+                                    part.liveKeys, item.capacity, indexFp8, part.decode, *item.indices);
+                            } else FastllmCudaNaiveVerifyIndexer(iq, iw, *item.key, indexHeads, indexDim,
+                                item.past, indexTopK, indexFp8, *item.indices);
+                        }
+                    }
+                    if (indexerLayerSharding)
+                        FastllmNcclBroadcast(buf.indexBroadcast.cudaData, buf.indexBroadcast.Count(0), INT32,
+                            tpDevices[IndexerOwnerRank(layer)], gpu);
+                }
                 if (batchPrefillIndex && phase == 0) {
                     AssertInFastLLM((int)prefillItems.size() == batch->Size(), "Incomplete prefill Indexer batch.");
-                    if (!FastllmCudaNaiveBatchBalancedIndexer(prefillItems, tpRank, prefillRanks, indexFp8, true)) {
+                    if (!FastllmCudaNaiveBatchBalancedIndexer(prefillItems, tpRank, prefillRanks, indexFp8, true, prefillScores)) {
                         for (const auto &item : prefillItems) {
                             if (FastllmCudaNaiveBalancedIndexer(*item.query, *item.weights, *item.keys,
-                                    item.past, tpRank, prefillRanks, indexFp8, true, *item.indices)) continue;
+                                    item.past, tpRank, prefillRanks, indexFp8, true, *item.indices, prefillScores)) continue;
                             const int part = item.query->dims[1] / (2 * prefillRanks);
                             for (int range = 0; range < 2; ++range) {
                                 const int first = range ? item.query->dims[1] - (tpRank + 1) * part : tpRank * part;
@@ -1410,7 +1646,7 @@ Data NaiveN05FlashModel::RunTarget(
                                 localWeights.FakeFrom(*item.weights, (size_t)first * indexHeads * item.weights->unitSize);
                                 localIndices.FakeFrom(*item.indices, (size_t)range * part * indexTopK * sizeof(int));
                                 FastllmCudaNaiveIndexer(localQ, localWeights, *item.keys, indexHeads, indexDim,
-                                    item.past + first, indexTopK, indexFp8, localIndices, true);
+                                    item.past + first, indexTopK, indexFp8, localIndices, true, prefillScores);
                             }
                         }
                     }
@@ -1425,51 +1661,79 @@ Data NaiveN05FlashModel::RunTarget(
         }
         if (batchedDSA && sparseLayer) {
             auto &cache = *sparseKv->ranks[tpRank]->layers[layer];
-            const int count = dsaRows.size();
-            if (decodeWorkspace && layerCache) {
-                cache.ResolveFromPointers(layerCache + 2, 8, (const int *)buf.liveKeys.cudaData,
-                    batchNeedsIndex ? (const int *)buf.indexBroadcast.cudaData : nullptr,
-                    nullptr, count, cudaStreamPerThread);
-            } else {
-                // Eager boundary shapes use the same exact storage. Upload only
-                // pointers/lengths; selection and KV payload never visit the CPU.
-                std::vector<const void *> pointers(count), selected(count);
-                std::vector<int> lengths(count);
+            // Each group contains at most the configured number of queries per
+            // owner. Small hot caches retain a batched fallback across requests.
+            std::vector<std::vector<int>> groups(1);
+            int offset = 0;
+            for (int sequence = 0; sequence < (batch ? batch->Size() : 1); ++sequence) {
+                const int count = batchVerifyDSA ? (batch ? batch->lengths[sequence] : length) : 1;
                 for (int row = 0; row < count; ++row) {
-                    pointers[row] = dsaRows[row].keyPages;
-                    selected[row] = dsaRows[row].indices;
-                    lengths[row] = dsaRows[row].length;
+                    const int group = row / sparseKv->queries;
+                    if ((int)groups.size() <= group) groups.resize(group + 1);
+                    groups[group].push_back(offset + row);
                 }
-                auto upload = [&](Data &data, void *src, size_t bytes) {
-                    data.dataType = INT32; data.Resize({(int)((bytes + 3) / 4)});
-                    data.ToDevice(DataDevice::CUDA, {gpu}, false); data.Allocate(false);
-                    FastllmCudaCopyFromHostToDevice(data.cudaData, src, bytes);
-                };
-                upload(buf.sparsePointers, pointers.data(), count * sizeof(void *));
-                upload(buf.sparseLengths, lengths.data(), count * sizeof(int));
-                upload(buf.sparseSelected, selected.data(), count * sizeof(void *));
-                cache.ResolveFromPointers((const void *const *)buf.sparsePointers.cudaData, 1,
-                    (const int *)buf.sparseLengths.cudaData, nullptr, nullptr, count, cudaStreamPerThread,
-                    (const int *const *)buf.sparseSelected.cudaData);
+                offset += count;
             }
-            for (int row = 0; row < count; ++row) {
-                auto &d = dsaRows[row];
-                const int selectedCount = d.indices ? d.selectedCount : std::min(d.capacity, indexTopK);
-                d.cache = cache.CachePointers() + row * 2;
-                d.indices = cache.Indices() + row * indexTopK;
-                d.liveKeys = cache.Lengths() + row;
-                d.capacity = kvMemConfig.residentTokens;
-                d.selectedCount = selectedCount;
-                d.tensorMaps = nullptr;
-                d.pageLen = 0; d.keyPages = d.valuePages = nullptr;
+            if (groups.size() > 1) {
+                attn.dataType = BFLOAT16; attn.UpdateUnitSize();
+                attn.Resize({1, length, cfg.heads * cfg.valueDim});
+                attn.ToDevice(q.dataDevice, q.dataDeviceIds, false); attn.Allocate(false);
             }
-        }
-        if (batchedDSA)
+            for (const auto &group : groups) {
+                std::vector<KvMemSparseQuery> queries;
+                std::vector<FastllmNaiveDSARow> rows;
+                for (int index : group) {
+                    const auto &d = dsaRows[index];
+                    queries.push_back({d.keyPages, d.cache ? d.cache + 2 : nullptr,
+                        d.liveKeys, d.indices, d.length, d.indices ? d.selectedCount : indexTopK});
+                    rows.push_back(d);
+                }
+                cache.ResolveQueries(queries.data(), queries.size(), cudaStreamPerThread, true);
+                for (size_t row = 0; row < rows.size(); ++row) {
+                    auto &d = rows[row];
+                    d.cache = cache.CachePointers() + row * 2;
+                    d.indices = cache.Indices() + row * indexTopK;
+                    d.liveKeys = cache.Lengths() + row;
+                    d.capacity = kvMemConfig.residentTokens; d.selectedCount = indexTopK;
+                    d.tensorMaps = nullptr; d.pageLen = 0; d.keyPages = d.valuePages = nullptr;
+                }
+                if (groups.size() == 1) {
+                    FastllmCudaNaiveBatchDSADecode(q, localWeight(ap + "attention_sink_bias"), rows,
+                        cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim, buf.decode, attn);
+                } else {
+                    auto &query = buf.sparseQuery;
+                    query.dataType = q.dataType; query.UpdateUnitSize();
+                    query.Resize({1, (int)group.size(), cfg.heads * cfg.headDim});
+                    query.ToDevice(q.dataDevice, q.dataDeviceIds, false); query.Allocate(false);
+                    std::vector<void *> dst;
+                    std::vector<const void *> src;
+                    std::vector<size_t> bytes;
+                    const size_t queryBytes = size_t(cfg.heads) * cfg.headDim * q.unitSize;
+                    for (size_t row = 0; row < group.size(); ++row) {
+                        dst.push_back((char *)query.cudaData + row * queryBytes);
+                        src.push_back((char *)q.cudaData + group[row] * queryBytes); bytes.push_back(queryBytes);
+                    }
+                    AssertInFastLLM(FastllmCudaBatchCopyFromDeviceToDeviceAsyncCurrentThread(
+                        dst.data(), src.data(), bytes.data(), dst.size()), "Sparse query gather failed.");
+                    FastllmCudaNaiveBatchDSADecode(query, localWeight(ap + "attention_sink_bias"), rows,
+                        cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim, buf.decode, buf.sparseAttention);
+                    const size_t outputBytes = size_t(cfg.heads) * cfg.valueDim * attn.unitSize;
+                    for (size_t row = 0; row < group.size(); ++row) {
+                        dst[row] = (char *)attn.cudaData + group[row] * outputBytes;
+                        src[row] = (char *)buf.sparseAttention.cudaData + row * outputBytes; bytes[row] = outputBytes;
+                    }
+                    AssertInFastLLM(FastllmCudaBatchCopyFromDeviceToDeviceAsyncCurrentThread(
+                        dst.data(), src.data(), bytes.data(), dst.size()), "Sparse attention scatter failed.");
+                }
+            }
+        } else if (batchedDSA)
             FastllmCudaNaiveBatchDSADecode(q, localWeight(ap + "attention_sink_bias"), dsaRows,
                 cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim, buf.decode, attn);
-        if (batchedSWA)
+        if (batchedSWA) {
+            Data eagerLengths;
             FastllmCudaNaiveBatchSWADecode(q, localWeight(ap + "attention_sink_bias"), swaRows,
-                buf.liveKeys, cfg.heads, cfg.kvHeads, attn);
+                verifySWA && !graphVerify ? eagerLengths : buf.liveKeys, cfg.heads, cfg.kvHeads, attn);
+        }
         Linear(attn, localWeight(ap + "o_proj.weight"), Data(), projected);
         Data &postAttentionNorm = localWeight(prefix + ".post_attention_layernorm.weight");
         bool attentionNormReady = false;
@@ -1595,7 +1859,7 @@ Data NaiveN05FlashModel::RunTarget(
             bool moeNormReady = false;
             if (tensorParallel && tpEp8MegaState) {
                 moeNormReady = FastllmCudaRunMimoEp8Mega(*tpEp8MegaState, tpRank, layer, normed,
-                    expertIndex, expertScore, moeOutput, decodeWorkspace,
+                    expertIndex, expertScore, moeOutput, decodeWorkspace || shardMoe,
                     (shardMoe || shardPrefillNorm) ? &hidden : nullptr,
                     mlpNormWeight, mlpNormOutput, rms_norm_eps,
                     !decodeWorkspace && !hasRouterProbabilities ? &routerInput : nullptr,
@@ -1676,15 +1940,24 @@ Data NaiveN05FlashModel::RunTarget(
                 addMlpResidual(moeOutput, !(tensorParallel && tpEp8MegaState));
         }
         prefillNormReady = fusePrefillNorm && mlpNormWeight;
-        if (capture && capture->collectHidden &&
-            std::find(draftTargetLayers.begin(), draftTargetLayers.end(), layer) != draftTargetLayers.end())
-            Copy(hidden, capture->hidden[layer]);
+        if (capture && capture->collectHidden && tpRank <= 0 &&
+            std::find(draftTargetLayers.begin(), draftTargetLayers.end(), layer) != draftTargetLayers.end()) {
+            if (workspace && capture->borrowOutputs && !capture->verifying) {
+                // Internal prefill consumers finish before the next forward.
+                // Retain the feature storage just like the other TP scratch.
+                auto &backing = buf.features[layer];
+                Copy(hidden, backing);
+                auto &view = capture->hidden[layer];
+                view.FreeSpace(); view.FakeFrom(backing, 0); view.Resize(backing.dims);
+            } else Copy(hidden, capture->hidden[layer]);
+        }
     }
     if (isIntermediateChunkedPrefill) return Data();
     Data localLogits;
     Data &last = buf.last, &logits = decodeWorkspace ? buf.logits : localLogits;
     if (!decodeWorkspace) {
-        if (batch) {
+        if (capture && capture->verifying) Copy(hidden, last);
+        else if (batch) {
             last.dataType = BFLOAT16;
             last.Resize({1, batch->Size(), embed_dim});
             last.ToDevice(hidden.dataDevice, hidden.dataDeviceIds, false);
@@ -1695,8 +1968,7 @@ Data NaiveN05FlashModel::RunTarget(
                 FastllmCudaCopyFromDeviceToDevice((uint16_t *)last.cudaData + (size_t)sequence * embed_dim,
                     (uint16_t *)hidden.cudaData + (size_t)(offset - 1) * embed_dim, (size_t)embed_dim * sizeof(uint16_t));
             }
-        } else if (capture && capture->verifying) Copy(hidden, last);
-        else Split(hidden, 1, length - 1, length, last);
+        } else Split(hidden, 1, length - 1, length, last);
         norm(last, localWeight("model.norm.weight"), last);
     }
     if (decodeWorkspace) {
@@ -1720,17 +1992,22 @@ NaiveN05FlashModel::LogitsSelection NaiveN05FlashModel::SelectLogits(
         std::abs(config.repeat_penalty - 1.0f) > 1e-8f ||
         !config.tool_call_allowed_token_ids.empty()) return selection;
     selection.greedy = config.IsSimpleGreedy();
+    // Grammar masks are applied to the full logits before sampling, outside
+    // CUDA Graphs. Compact shard top-k cannot select before a branch-local mask.
+    if (config.tool_call_token_mask && config.top_k <= 1) selection.greedy = true;
     // Full-vocabulary top-p matches the shared CUDA sampler's distribution.
     // Finite top-k keeps its existing top-k-then-top-p semantics, as does
     // speculative verification, which needs probabilities rather than a draw.
-    if (!speculative && !selection.greedy &&
-        config.top_k >= weight.weight.at("lm_head.weight").dims[0] &&
+    if (!speculative && ((!selection.greedy &&
+        config.top_k >= weight.weight.at("lm_head.weight").dims[0]) ||
+        (selection.greedy && config.tool_call_token_mask)) &&
         std::isfinite(config.temperature) && config.temperature > 0 &&
         std::isfinite(1.0f / config.temperature) &&
         std::isfinite(config.top_p) && config.top_p > 0 && config.top_p <= 1) {
         selection.cudaSampling = true;
         return selection;
     }
+    if (config.tool_call_grammar || config.tool_call_token_mask) return LogitsSelection();
     if (selection.greedy) selection.count = 1;
     else if (config.top_k > 1 && config.top_k <= kNaiveLogitsMaxTopK &&
              std::isfinite(config.temperature) && config.temperature > 0 &&
@@ -1755,6 +2032,8 @@ std::vector<int> NaiveN05FlashModel::SampleCudaLogits(
     for (int row = 0; row < rows; ++row) {
         temperatures[row] = configs[row].temperature;
         topPs[row] = configs[row].top_p;
+        topKs[row] = std::max(1, configs[row].top_k);
+        ApplyToolTokenMask(logits, row, configs[row]);
     }
     AssertInFastLLM(FastllmCudaTopKTopPSampling((float *)logits.cudaData,
         temperatures.data(), topKs.data(), topPs.data(), tokens.data(), rows, vocab),
@@ -1831,10 +2110,28 @@ void NaiveN05FlashModel::WarmUp() {
         }
     }
     cache.clear();
+#ifdef USE_CUDA
+    PrepareTensorParallelMemory();
+    // Ragged prefill warmup may leave large idle allocator blocks. Return only
+    // those blocks before KVMem sizing; graph-pinned and busy workspaces stay.
+    if (draftEnabled && prefillBatchPolicy.targetTokens > 0)
+        FastllmCudaReleaseIdleCachedBuffers();
     kvCacheDataType = requestedKV;
-    if (kvMemConfig.enabled) InitSparseKv();
-    else InitTensorParallelKVPool();
+    if (kvMemConfig.enabled) {
+        InitSparseKv();
+        if (draftEnabled) {
+            // Native warmup reserved activations before sizing storage. Prepare
+            // the actual sparse bindings/workspaces before accepting requests.
+            for (auto &graph : tpBatchVerifyGraphs) graph->ClearGraphs();
+            tpBatchVerifyGraphs.clear(); tpBatchVerifyState.reset();
+            tpVerifyState.reset(); tpDecodeState.reset();
+            PrepareTensorParallelMemory();
+            if (prefillBatchPolicy.targetTokens > 0)
+                FastllmCudaReleaseIdleCachedBuffers();
+        }
+    } else InitTensorParallelKVPool();
     PrepareTensorParallelServing();
+#endif
 }
 
 void NaiveN05FlashModel::PrepareSwaPrefillWorkspace(int rank, int length) {
@@ -1867,11 +2164,12 @@ std::shared_ptr<CudaWorkspace> NaiveN05FlashModel::RequestKVPool(int device, siz
 
 void NaiveN05FlashModel::InitTensorParallelKVPool() {
 #ifdef USE_CUDA
-    // Keep CPU/layer-serial and speculative execution on their existing cache
-    // paths. This pool serves ordinary BF16/FP8 TP, independently of GPU generation
-    // and whether CUDA Graph is enabled.
+    // Keep CPU/layer-serial execution on its existing cache path. This pool
+    // serves BF16/FP8 TP, independently of GPU generation and CUDA Graph.
+    // Draft checkpoints distribute normalized inputs across the TP GPUs.
+    // Restore rebuilds owner-local or sharded draft KV through AppendDraftContext.
     if (!tpKVPool.empty() || !tpPrepared || tpDevices.size() <= 1 ||
-        GetKVCacheInCPU() || !FastllmNaiveKVType(kvCacheDataType) || draftEnabled ||
+        GetKVCacheInCPU() || !FastllmNaiveKVType(kvCacheDataType) ||
         elementsInKVCachePerToken <= 0) return;
     const double gpuMemRatio = GetGpuMemRatio();
     AssertInFastLLM(std::isfinite(gpuMemRatio) && gpuMemRatio > 0 && gpuMemRatio <= 1,
@@ -1879,7 +2177,7 @@ void NaiveN05FlashModel::InitTensorParallelKVPool() {
     const int ranks = tpDevices.size();
     const int batch = maxBatch > 0 ? maxBatch : 512;
     const int chunk = std::max(1, GetChunkedPrefillSize());
-    const int64_t swaCapacity = ((int64_t)window + 127) / 128 * 128;
+    const int64_t swaCapacity = ((int64_t)window + (draftEnabled ? draftBlock : 0) + 127) / 128 * 128;
     if (std::count(slidingLayers.begin(), slidingLayers.end(), 1)) {
         tpSwaPrefillWorkspaces.resize(ranks);
         for (int rank = 0; rank < ranks; ++rank) PrepareSwaPrefillWorkspace(rank, chunk);
@@ -1897,12 +2195,36 @@ void NaiveN05FlashModel::InitTensorParallelKVPool() {
         }
         else for (int rank = 0; rank < ranks; ++rank)
             rankBytesPerToken[rank] += (std::max(1, cfg.kvHeads / ranks) *
-                (cfg.headDim + cfg.valueDim) + LocalIndexerCacheWidth(layer, rank)) * kvBytes;
+                (cfg.headDim + cfg.valueDim) + (indexerContextSharding
+                    ? IndexerCacheWidth(kvCacheDataType) / ranks : LocalIndexerCacheWidth(layer, rank))) * kvBytes;
     }
     fullBytesPerToken = *std::max_element(rankBytesPerToken.begin(), rankBytesPerToken.end());
     AssertInFastLLM(fullBytesPerToken > 0, "Naive KV pool requires full-attention layers.");
     // Scratch is allocated before measuring free memory, so the total budget
     // accounts for it without multiplying it by layers or concurrent requests.
+    if (indexerContextSharding) {
+        const int capacity = (max_positions + GetPageLen() - 1) / GetPageLen() * GetPageLen();
+        for (int rank = 0; rank < ranks; ++rank) {
+            FastllmCudaSetDevice(tpDevices[rank]);
+            auto &buf = *tpPrefillWorkspaces.at(rank);
+            auto reserve = [&](Data &data) {
+                data.dataType = kvCacheDataType;
+                data.UpdateUnitSize();
+                data.Resize({1, capacity, IndexerCacheWidth(kvCacheDataType)});
+                data.ToDevice(DataDevice::CUDA, {tpDevices[rank]}, false);
+                data.Allocate(false);
+            };
+            reserve(buf.indexContextGather);
+            reserve(buf.indexContextFull);
+            // Deferred prefill scoring retains at most eight histories. Charge
+            // these bounded buffers before sizing the persistent GPU page pool.
+            const int prefillRows = std::min(batch, 8);
+            while ((int)buf.sequences.size() < prefillRows)
+                buf.sequences.emplace_back(new TargetWorkspace());
+            if (prefillRows > 1) for (int row = 0; row < prefillRows; ++row)
+                reserve(buf.sequences[row]->indexContextFull);
+        }
+    }
     auto freeSizes = FastllmCudaGetFreeSizes();
     auto totalSizes = FastllmCudaGetTotalSizes();
     int64_t budget = INT64_MAX;
@@ -1933,8 +2255,10 @@ void NaiveN05FlashModel::InitTensorParallelKVPool() {
         }
     }
     prefixes->slotBytes = (prefixes->slotBytes + 255) / 256 * 256;
+    if (draftEnabled) prefixes->draftSlotBytes = (size_t)(draftWindow - 1) * embed_dim * sizeof(uint16_t);
     const int prefixSlots = prefixes->SlotCount(batch, budget);
-    const int64_t prefixBytes = (int64_t)prefixSlots * prefixes->slotBytes;
+    const int64_t prefixBytes = (int64_t)prefixSlots * prefixes->slotBytes +
+        (int64_t)PrefixPool::DraftShardSlots(prefixSlots, 0, ranks) * prefixes->draftSlotBytes;
     fixedBytes += prefixBytes;
     int64_t tokens = GetMaxTokens() > 0 ? GetMaxTokens() :
         std::min<int64_t>((int64_t)max_positions * batch,
@@ -2000,9 +2324,25 @@ void NaiveN05FlashModel::InitTensorParallelKVPool() {
             storage.Resize({prefixSlots, (int)prefixes->slotBytes});
             storage.dataDevice = DataDevice::CUDA;
             storage.dataDeviceIds = {tpDevices[rank]};
-            storage.cudaData = AllocateCudaWorkspace(tpKVPool.at(tpDevices[rank]), prefixBytes);
+            storage.cudaData = AllocateCudaWorkspace(tpKVPool.at(tpDevices[rank]), (size_t)prefixSlots * prefixes->slotBytes);
             if (!storage.cudaData) throw CudaWorkspaceExhausted("Naive GPU prefix pool exhausted.");
             storage.directMemory = true;
+        }
+        if (prefixes->draftSlotBytes) {
+            prefixes->draftStorage.resize(ranks);
+            for (int rank = 0; rank < ranks; ++rank) {
+                const int slots = PrefixPool::DraftShardSlots(prefixSlots, rank, ranks);
+                if (!slots) continue;
+                FastllmCudaSetDevice(tpDevices[rank]);
+                Data &storage = prefixes->draftStorage[rank];
+                storage.dataType = BFLOAT16; storage.UpdateUnitSize();
+                storage.Resize({slots, draftWindow - 1, embed_dim});
+                storage.dataDevice = DataDevice::CUDA;
+                storage.dataDeviceIds = {tpDevices[rank]};
+                storage.cudaData = AllocateCudaWorkspace(tpKVPool.at(tpDevices[rank]), storage.GetBytes());
+                if (!storage.cudaData) throw CudaWorkspaceExhausted("Naive draft prefix pool exhausted.");
+                storage.directMemory = true;
+            }
         }
         for (int slot = 0; slot < prefixSlots; ++slot) prefixes->freeSlots.push_back(slot);
         prefixPool = std::move(prefixes);
@@ -2010,17 +2350,19 @@ void NaiveN05FlashModel::InitTensorParallelKVPool() {
                prefixSlots, prefixBytes / 1048576.0);
     }
     tpPagedCaches.resize(ranks);
+    if (indexerContextSharding) tpIndexerCaches.resize(ranks);
     for (int rank = 0; rank < ranks; ++rank) {
         FastllmCudaSetDevice(tpDevices[rank]);
         auto &managers = tpPagedCaches[rank];
         managers.resize(block_cnt * 2);
+        if (indexerContextSharding) tpIndexerCaches[rank].resize(block_cnt);
         for (int layer = 0; layer < block_cnt; ++layer) {
             if (slidingLayers[layer]) continue;
             for (int part = 0; part < 2; ++part) {
                 int width = std::max(1, full.kvHeads / ranks) * (part ? full.valueDim : full.headDim) + (!part ? LocalIndexerCacheWidth(layer, rank) : 0);
                 auto manager = std::make_unique<PagedCacheManager>();
                 manager->type = PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE;
-                manager->kvCacheFp8Indexer = !part && fp8IndexerCache && HasLocalIndexer(layer, rank);
+                manager->kvCacheFp8Indexer = !indexerContextSharding && !part && fp8IndexerCache && HasLocalIndexer(layer, rank);
                 manager->dataType = kvCacheDataType;
                 manager->UpdateUnitSize();
                 manager->dataDevice = DataDevice::CUDA;
@@ -2033,6 +2375,24 @@ void NaiveN05FlashModel::InitTensorParallelKVPool() {
                 manager->SetMaxPages(pages);
                 FastllmCudaMemset0(manager->cudaData, (size_t)pageLen * width * kvBytes);
                 managers[layer * 2 + part] = std::move(manager);
+            }
+            if (indexerContextSharding) {
+                auto index = std::make_unique<PagedCacheManager>();
+                index->pageLen = pageLen / ranks;
+                index->maxPages = pages;
+                index->kvCacheFp8Indexer = fp8IndexerCache;
+                index->dataType = kvCacheDataType;
+                index->UpdateUnitSize();
+                index->dataDevice = DataDevice::CUDA;
+                index->dataDeviceIds = {tpDevices[rank]};
+                index->Resize({pages, index->pageLen, 1, IndexerCacheWidth(kvCacheDataType)});
+                index->cudaData = AllocateCudaWorkspace(tpKVPool.at(tpDevices[rank]), index->GetBytes());
+                if (!index->cudaData) throw CudaWorkspaceExhausted("Naive context Indexer pool exhausted.");
+                index->directMemory = true;
+                FastllmCudaMemset0(index->cudaData, (size_t)index->pageLen * index->dims[3] * kvBytes);
+                // Share K's page IDs/refcounts, including prefix forks and rollback.
+                tpIndexerSidecars.emplace(managers[layer * 2].get(), index.get());
+                tpIndexerCaches[rank][layer] = std::move(index);
             }
         }
         ForceDeviceSync();

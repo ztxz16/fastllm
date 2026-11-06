@@ -712,8 +712,8 @@ int main(int argc,char **argv){try{
 
         SetMoeCpuCacheBytes(f.bytes*5);SetMoeCudaCacheBytes(f.bytes*3);
         auto start=GetDiskMoeCacheStats();
-        const int deviceCount = std::min(2, FastllmCudaGetDeviceCount());
-        for(int device=0;device<deviceCount;++device)
+        const int devices=std::min(2,FastllmCudaGetDeviceCount());
+        for(int device=0;device<devices;++device)
             for(int rows:{1,1,3,9,40,1,260,1}){
                 auto before=GetDiskMoeCacheStats();
                 auto want=f.Run(false,rows,0,-1);Compare(f.Run(true,rows,0,device),want);
@@ -731,8 +731,8 @@ int main(int argc,char **argv){try{
             const auto after=GetDiskMoeCacheStats();
             Check(after.cpuHits-before.cpuHits+after.cudaHits-before.cudaHits+
                 after.misses-before.misses==uint64_t(rows*3),"streamed prefill skipped routes");
-            // cudaBytes sums all devices warmed above; the budget is per device.
-            Check(after.cpuBytes<=GetMoeCpuCacheBytes() && after.cudaBytes<=GetMoeCudaCacheBytes()*deviceCount &&
+            // Statistics include cached experts on every device used above.
+            Check(after.cpuBytes<=GetMoeCpuCacheBytes() && after.cudaBytes<=GetMoeCudaCacheBytes()*devices &&
                 !after.cpuCudaOverlapBytes,"streamed prefill cache budgets");
         }
         for (int pass=0;pass<12;++pass)

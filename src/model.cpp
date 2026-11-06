@@ -5241,8 +5241,10 @@ namespace fastllm {
             }
         }
 
+        // MiMo's native tool grammar needs token text even when the frontend
+        // uses Hugging Face for encoding and chat templates.
         // 3. 读取分词
-        if (!skipTokenizer) {
+        if (!skipTokenizer || model->model_type == "naive_n05_flash") {
             ReportModelLoadProgress("tokenizer", 0, 1);
             LoadLLMTokenizerFromHFToModel(path, model);
             ReportModelLoadProgress("tokenizer", 1, 1);

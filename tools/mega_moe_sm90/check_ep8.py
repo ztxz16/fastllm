@@ -1,14 +1,20 @@
-"""Check full-expert EP4/EP8 against installed single-rank DeepGEMM on identical W8A8 data."""
+"""Check EP4/EP8 against DeepGEMM, or --batched against 128-row decode.
+
+The batched mode covers bounded 512-row launches and masked CUDA Graph replay.
+"""
 
 import argparse, ctypes, json, types
+import ctypes.util
 from pathlib import Path
-import torch, deep_gemm as dg
+import torch
 
 p = argparse.ArgumentParser()
 p.add_argument("--lib", required=True)
 p.add_argument("--output", required=True)
 p.add_argument("--ranks", type=int, choices=(4, 8), default=8)
-p.add_argument("--prefill", action="store_true")
+mode = p.add_mutually_exclusive_group()
+mode.add_argument("--prefill", action="store_true")
+mode.add_argument("--batched", action="store_true")
 a = p.parse_args()
 torch.manual_seed(1026)
 R, E, H, I, K, C = a.ranks, 256, 4096, 2048, 8, (8192 if a.prefill else 512)
@@ -37,9 +43,10 @@ lib.fastllm_ep8_mega_moe_create.restype = ptr
 lib.fastllm_ep8_mega_moe_run.argtypes = [ptr, ptr, ptr, ptr, ptr, ctypes.c_int]
 lib.fastllm_ep8_mega_moe_destroy.argtypes = [ptr]
 size = lib.fastllm_ep8_mega_moe_workspace_bytes(R)
-assert size <= 48 * 1024**2
+assert 0 < size <= 512 * 1024**2
 lib.fastllm_ep8_mega_moe_max_rows.restype = ctypes.c_int
-assert lib.fastllm_ep8_mega_moe_max_rows() == 64
+decode_capacity = lib.fastllm_ep8_mega_moe_max_rows()
+assert decode_capacity == 128
 print("WORKSPACE_BYTES", size, flush=True)
 torch.cuda.set_device(0)
 w1 = torch.randn(E, 2 * I, H, device="cuda", dtype=torch.bfloat16).to(
@@ -73,10 +80,124 @@ for r, v in enumerate(ranks):
     # null-pointer rejection cannot hide a missing capacity check.
     assert not lib.fastllm_ep8_mega_moe_run(v["handle"], None, None, None, None, 0)
     scratch = v["scratch"].data_ptr()
-    for invalid_rows in (-1, 65):
+    for invalid_rows in (-1, decode_capacity + 1):
         assert not lib.fastllm_ep8_mega_moe_run(
             v["handle"], scratch, scratch, scratch, scratch, invalid_rows
         )
+cuda = ctypes.CDLL(ctypes.util.find_library("cudart") or "libcudart.so")
+cuda.cudaStreamBeginCapture.argtypes = [ptr, ctypes.c_int]
+cuda.cudaStreamEndCapture.argtypes = [ptr, ctypes.POINTER(ptr)]
+cuda.cudaGraphInstantiateWithFlags.argtypes = [
+    ctypes.POINTER(ptr),
+    ptr,
+    ctypes.c_ulonglong,
+]
+cuda.cudaGraphLaunch.argtypes = [ptr, ptr]
+cuda.cudaGraphExecDestroy.argtypes = [ptr]
+cuda.cudaGraphDestroy.argtypes = [ptr]
+
+
+def check_batched():
+    lib.fastllm_ep8_mega_moe_run_batched.argtypes = [ptr] * 5 + [ctypes.c_int, ctypes.c_int, ptr]
+    lib.fastllm_ep8_mega_moe_decode_capacity.argtypes = [ctypes.c_int, ctypes.c_int]
+    assert lib.fastllm_ep8_mega_moe_decode_capacity(R * decode_capacity, R) == decode_capacity
+    assert lib.fastllm_ep8_mega_moe_decode_capacity(R * decode_capacity + 1, R) == 512
+
+    def sync():
+        for r in range(R):
+            torch.cuda.synchronize(r)
+
+    def launch(v, start, count, capacity, name):
+        # Empty sources still enter every collective, with valid pointers.
+        assert lib.fastllm_ep8_mega_moe_run_batched(
+            v["handle"], v["x"].data_ptr() + start * H * 2,
+            v[name].data_ptr() + start * H * 2,
+            v["idx"].data_ptr() + start * K * 4,
+            v["score"].data_ptr() + start * K * 4,
+            count, capacity, v["live"].data_ptr() + start * 4,
+        ), lib.fastllm_ep8_mega_moe_error()
+
+    def run(capacity, name, rows):
+        for first in range(0, rows, capacity):
+            for r, v in enumerate(ranks):
+                torch.cuda.set_device(r)
+                start = min(first, v["active"])
+                launch(v, start, max(0, min(capacity, v["active"] - first)), capacity, name)
+        sync()
+
+    cases = [(n, "random") for n in (1, 128, 129, 256, 320, 512, 513, 1025)]
+    cases += [(512, "one_owner"), (320, "uneven"), (512, "masked"), (1, "random")]
+    result = []
+    for N, scenario in cases:
+        for r, v in enumerate(ranks):
+            torch.cuda.set_device(r)
+            x = torch.randn(N + 7, H, device=r, dtype=torch.bfloat16) * .1
+            idx = torch.argsort(torch.rand(N + 7, E, device=r), dim=-1)[:, :K].int().contiguous()
+            if scenario == "one_owner":
+                idx = torch.arange(K, device=r, dtype=torch.int32).repeat(N + 7, 1)
+            live = torch.ones(N + 7, device=r, dtype=torch.int32)
+            if scenario == "masked":
+                live[::3] = 0
+            active = [N, N - 1, 1, 0, 7, 0, 31, 2][r] if scenario == "uneven" else N
+            v.update(x=x, idx=idx, score=torch.softmax(torch.randn(N + 7, K, device=r), -1),
+                     live=live, active=active, ref=torch.full_like(x, 777), y=torch.full_like(x, 777))
+        sync()
+        run(decode_capacity, "ref", N)
+        run(512, "y", N)
+        run(512, "y", N)
+        errors = []
+        for r, v in enumerate(ranks):
+            delta = v["y"].float() - v["ref"].float()
+            errors.append(dict(rank=r, max_abs=float(delta.abs().max()), different=int((delta != 0).sum())))
+            assert bool((v["y"][v["active"]:] == 777).all()), "Inactive output overwritten"
+            assert bool((v["guard"] == 165).all()), "Workspace overflow"
+        item = dict(rows=N, scenario=scenario, errors=errors)
+        print(json.dumps(item), flush=True)
+        assert all(e["different"] == 0 for e in errors), item
+        # Replay the large arena against the small-arena eager reference.
+        # Changing live masks must not require recapture.
+        if N in (320, 512) and scenario in ("random", "masked"):
+            graphs = []
+            for r, v in enumerate(ranks):
+                torch.cuda.set_device(r)
+                g, ex = ptr(), ptr()
+                assert cuda.cudaStreamBeginCapture(ptr(2), 1) == 0
+                launch(v, 0, N, 512, "y")
+                assert cuda.cudaStreamEndCapture(ptr(2), ctypes.byref(g)) == 0
+                assert cuda.cudaGraphInstantiateWithFlags(ctypes.byref(ex), g, 0) == 0
+                graphs.append((g, ex))
+            for replay in range(3):
+                if scenario == "masked":
+                    for v in ranks:
+                        v["live"].copy_(v["live"].roll(1))
+                    sync()
+                    run(decode_capacity, "ref", N)
+                for r, (_, ex) in enumerate(graphs):
+                    torch.cuda.set_device(r)
+                    assert cuda.cudaGraphLaunch(ex, ptr(2)) == 0
+                sync()
+                assert all(torch.equal(v["y"], v["ref"]) for v in ranks), "Graph mismatch"
+                assert all(bool((v["guard"] == 165).all()) for v in ranks), "Graph workspace overflow"
+            for r, (g, ex) in enumerate(graphs):
+                torch.cuda.set_device(r)
+                assert cuda.cudaGraphExecDestroy(ex) == 0
+                assert cuda.cudaGraphDestroy(g) == 0
+            item["graph_replays"] = 3
+        result.append(item)
+    return result
+
+
+if a.batched:
+    result = check_batched()
+    for r, v in enumerate(ranks):
+        torch.cuda.set_device(r)
+        lib.fastllm_ep8_mega_moe_destroy(v["handle"])
+    Path(a.output).write_text(json.dumps(dict(ranks=R, workspace_bytes=size, cases=result), indent=2) + "\n")
+    print("BATCHED_MOE_PASS", flush=True)
+    raise SystemExit(0)
+
+import deep_gemm as dg
+
 torch.cuda.set_device(0)
 refbytes, slicer = dg._C.get_symm_buffer_size_for_sm90_mega_moe(
     1, E, C, K, H, I, True, "swiglu"
@@ -111,11 +232,13 @@ cases = [
     (7, "idle_ranks"),
     (64, "idle_ranks"),
     (64, "uneven_rows"),
-    (64, "pool_bound"),
+    (decode_capacity, "different_ranks"),
+    (decode_capacity, "one_owner"),
+    (decode_capacity, "pool_bound"),
 ]
 if a.prefill:
     cases += [(n, "prefill") for n in (128, 256, 512, 1024)]
-    # End on decode so the graph test uses the persistent 64-row arena.
+    # End on decode so the graph test uses the persistent decode arena.
     cases += [(64, "different_ranks")]
     lib.fastllm_ep8_mega_moe_prefill_workspace_bytes.argtypes = [ctypes.c_int, ctypes.c_int]
     lib.fastllm_ep8_mega_moe_prefill_workspace_bytes.restype = ctypes.c_size_t
@@ -123,8 +246,7 @@ if a.prefill:
     lib.fastllm_ep8_mega_moe_run_prefill.argtypes = [ptr, P, ptr, ptr, ptr, ptr, ctypes.c_int]
 for N, scenario in cases:
     if scenario == "pool_bound":
-        # 31 experts receive 129 rows and one receives 97. Their BM=64
-        # aligned spans occupy exactly 6080 rows: the compiled pool bound.
+        # Saturate the compact pool with uneven BM=64-aligned expert spans.
         local_e = E // R
         # Put one route in every local expert, then distribute the remaining
         # full 64-row groups to saturate the compact aligned pool.
@@ -245,17 +367,6 @@ for N, scenario in cases:
 # Capture every peer before replaying any of them. Each graph contains the
 # quantization and fused EP kernel on the per-thread stream. Descriptors are
 # already resident and are not uploaded during capture or replay.
-cuda = ctypes.CDLL("libcudart.so.13")
-cuda.cudaStreamBeginCapture.argtypes = [ptr, ctypes.c_int]
-cuda.cudaStreamEndCapture.argtypes = [ptr, ctypes.POINTER(ptr)]
-cuda.cudaGraphInstantiateWithFlags.argtypes = [
-    ctypes.POINTER(ptr),
-    ptr,
-    ctypes.c_ulonglong,
-]
-cuda.cudaGraphLaunch.argtypes = [ptr, ptr]
-cuda.cudaGraphExecDestroy.argtypes = [ptr]
-cuda.cudaGraphDestroy.argtypes = [ptr]
 graphs = []
 for r, v in enumerate(ranks):
     torch.cuda.set_device(r)

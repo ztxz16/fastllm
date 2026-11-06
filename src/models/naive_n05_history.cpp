@@ -34,7 +34,10 @@ void NaiveN05FlashModel::OnResponseContextCreated(ResponseContext *context) {
         tpRequestIds[&context->pastKeyValues.front().first] = ++tpNextRequestId;
     }
     std::lock_guard<std::mutex> guard(historyMutex);
-    if (saveHistoryChat && !draftEnabled && context->multimodalInput.empty())
+    // Register ownership without touching CUDA. Batched prefill initializes
+    // draft state on the inference thread, just like single-request prefill.
+    if (draftEnabled) draftContexts.try_emplace(&context->pastKeyValues);
+    if (saveHistoryChat && context->multimodalInput.empty())
         activePrefixes.try_emplace(&context->pastKeyValues.front().first);
 }
 
@@ -48,13 +51,21 @@ void NaiveN05FlashModel::OnResponseContextRemoved(ResponseContext *context) {
     std::lock_guard<std::mutex> guard(historyMutex);
     activePrefixes.erase(key);
     auto draft = draftContexts.find(&context->pastKeyValues);
+    if (draft != draftContexts.end() && !draft->second) {
+        draftContexts.erase(draft);
+        return;
+    }
     if (draft != draftContexts.end()) {
         const auto &s = *draft->second;
         if (verbose && s.rounds)
             std::cout << "[Naive DSpark] rounds=" << s.rounds << " proposed=" << s.proposed
                       << " accepted=" << s.accepted << " acceptance=" << (double)s.accepted / s.proposed
                       << " tokens_per_round=" << 1.0 + (double)s.accepted / s.rounds << std::endl;
-        if (s.workspace || !s.kv.empty()) idleDraftContext = std::move(draft->second);
+        if (s.workspace || !s.kv.empty()) {
+            if (idleDraftContext && idleDraftContexts.size() + 1 < (size_t)(maxBatch > 0 ? maxBatch : 512))
+                idleDraftContexts.push_back(std::move(idleDraftContext));
+            idleDraftContext = std::move(draft->second);
+        }
         draftContexts.erase(draft);
     }
 }
@@ -252,6 +263,7 @@ void NaiveN05FlashModel::TryRecordResponseContext(ResponseContext *context) {
         entry.second = tokenHash;
     }
     for (const auto &snapshot : snapshots) {
+        if (draftEnabled && !snapshot->draftReady) continue;
         recordTrace.Next("history.snapshot_copy_hash");
         if ((int)context->allTokens.size() < snapshot->length) continue;
         if (snapshot->tokens.empty()) {
@@ -344,7 +356,7 @@ int NaiveN05FlashModel::PreviewPagedPrefixCacheExtra(ResponseContext *context, i
         memo.candidates.clear();
         size_t fingerprintRejects = 0;
         for (const auto &entry : prefixHistory) {
-            if (entry->tokens.size() > preview.tokens.size()) continue;
+            if ((draftEnabled && !entry->draftReady) || entry->tokens.size() > preview.tokens.size()) continue;
             // Most history belongs to unrelated conversations. Reject it with
             // the immutable fingerprint before allocating a memo entry or
             // touching a weak_ptr control block. Equality still checks tokens.
@@ -384,7 +396,7 @@ bool NaiveN05FlashModel::RestorePagedPrefixCacheExtra(ResponseContext *context, 
     {
         std::lock_guard<std::mutex> guard(historyMutex);
         for (auto it = self->prefixHistory.begin(); it != self->prefixHistory.end(); ++it) {
-            if ((*it)->length == length && (*it)->tokenHash == tokenHash &&
+            if ((!draftEnabled || (*it)->draftReady) && (*it)->length == length && (*it)->tokenHash == tokenHash &&
                 (*it)->tokens.size() <= context->currentTokens.size() &&
                 (*it)->HasResidentPrefix() &&
                 std::equal((*it)->tokens.begin(), (*it)->tokens.end(), context->currentTokens.begin())) {
@@ -400,7 +412,7 @@ bool NaiveN05FlashModel::RestorePagedPrefixCacheExtra(ResponseContext *context, 
     // Its private hot/SWA slot is attached when the scheduler admits it.
     if (!sparseKv) {
         const int rows = std::min(length, window - 1), ranks = tpDevices.size();
-        const int capacity = (window + 127) / 128 * 128;
+        const int capacity = (window + (draftEnabled ? draftBlock : 0) + 127) / 128 * 128;
         // Set up shared descriptors on the scheduler thread before rank workers
         // touch their disjoint local caches. Do not mutate the root maps in parallel.
         for (int layer = 0; layer < block_cnt; ++layer) {
@@ -436,7 +448,7 @@ bool NaiveN05FlashModel::RestorePagedPrefixCacheExtra(ResponseContext *context, 
                     cache->isKVCache = true;
                     cache->dataDevice = DataDevice::CUDA;
                     cache->dataDeviceIds = {tpDevices[rank]};
-                    self->ReserveCache(*cache, capacity, width, &context->pastKeyValues.front().first);
+                    self->ReserveCache(*cache, capacity, width, true, &context->pastKeyValues.front().first);
                     cache->Resize({1, rows, width});
                     const size_t rowBytes = (size_t)width * cache->unitSize;
                     auto *source = (uint8_t *)snapshot->pool->storage.at(rank).cudaData +
@@ -459,6 +471,18 @@ bool NaiveN05FlashModel::RestorePagedPrefixCacheExtra(ResponseContext *context, 
             FastllmCudaSyncCurrentThreadStream();
         }, errors);
         for (auto error : errors) if (error) std::rethrow_exception(error);
+    }
+    if (draftEnabled) {
+        // Reconstruct the draft's bounded KV from the exact normalized inputs
+        // at this checkpoint, including absolute RoPE positions. Proposal/RNG
+        // state belongs to the new request and must never be inherited.
+        std::shared_ptr<DraftContext> draft;
+        {
+            std::lock_guard<std::mutex> guard(historyMutex);
+            draft = self->CreateDraftContext();
+            self->draftContexts[&context->pastKeyValues] = draft;
+        }
+        self->RestoreDraftPrefix(*snapshot, length, *draft);
     }
     context->preTokens = length;
     context->intParams["add_special_tokens"] = 0;

@@ -1,5 +1,6 @@
 """Counted chat requests must launch those exact IDs with native KV history on."""
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
 import sys
@@ -41,6 +42,32 @@ class Tokenizer:
         if kwargs.get('tools'):
             text += json.dumps(kwargs['tools'])
         return self.encode(text) if tokenize else text
+
+
+class TokenizerCacheConcurrencyTest(unittest.TestCase):
+    def test_history_append_during_lookup_keeps_snapshot(self):
+        cache = llm.TokenizerCache()
+        cache.add(['x'], [[ord('x')]])
+        entered, appended = threading.Event(), threading.Event()
+        original_match = cache.prompt_can_match
+
+        def paused_match(*args):
+            entered.set()
+            if not appended.wait(5):
+                raise AssertionError('history writer blocked during cache lookup')
+            return original_match(*args)
+
+        cache.prompt_can_match = paused_match
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            lookup = pool.submit(cache.tokenize_with_cache, Tokenizer(), 'xyz')
+            try:
+                self.assertTrue(entered.wait(5), 'lookup did not reach cached history')
+                cache.add(['xy'], [[999]])
+            finally:
+                appended.set()
+            self.assertEqual(lookup.result(timeout=5), [ord(c) for c in 'xyz'])
+        cache.prompt_can_match = original_match
+        self.assertEqual(cache.tokenize_with_cache(Tokenizer(), 'xyz'), [999, ord('z')])
 
 
 class CountedHistoryTokensTest(unittest.TestCase):

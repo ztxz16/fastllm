@@ -18,6 +18,15 @@ static thread_local cublasStatus_t injectedStatus = CUBLAS_STATUS_SUCCESS;
 static thread_local int injectedCalls = 0;
 static std::mutex observedMutex;
 static std::map<unsigned long long, std::set<void *>> observed;
+static thread_local int heuristicQueries = 0;
+static cublasStatus_t ObserveHeuristic(cublasLtHandle_t h, cublasLtMatmulDesc_t op,
+        cublasLtMatrixLayout_t a, cublasLtMatrixLayout_t b, cublasLtMatrixLayout_t c,
+        cublasLtMatrixLayout_t d, cublasLtMatmulPreference_t preference, int requested,
+        cublasLtMatmulHeuristicResult_t *results, int *returned) {
+    ++heuristicQueries;
+    return cublasLtMatmulAlgoGetHeuristic(h, op, a, b, c, d, preference, requested,
+                                        results, returned);
+}
 static cublasStatus_t ObserveMatmul(cublasLtHandle_t h, cublasLtMatmulDesc_t op, const void *alpha,
                                     const void *a, cublasLtMatrixLayout_t ad, const void *b,
                                     cublasLtMatrixLayout_t bd, const void *beta, const void *c,
@@ -41,7 +50,9 @@ static cublasStatus_t ObserveMatmul(cublasLtHandle_t h, cublasLtMatmulDesc_t op,
                           stream);
 }
 #define cublasLtMatmul ObserveMatmul
+#define cublasLtMatmulAlgoGetHeuristic ObserveHeuristic
 #include "fastllm-bf16-lt.cuh"
+#undef cublasLtMatmulAlgoGetHeuristic
 #undef cublasLtMatmul
 namespace lt = fastllm_bf16_lt;
 static void need(bool ok, const char *message) {
@@ -134,6 +145,40 @@ int main() {
         for (int i = 0; i < 3; ++i)
             p[i].init(17 + i);
         std::exception_ptr error;
+        // Larger batches must not pin every cache slot and evict smaller hot
+        // shapes on each layer. Exercise eviction through real GEMMs and verify
+        // both bounded storage and absence of repeated heuristic queries.
+        std::thread cacheChurn([&]() {
+            try {
+                cu(cudaSetDevice(0));
+                for (size_t i = 0; i < lt::maxPlans; ++i)
+                    need(lt::Matmul(p[2].input, p[2].weight, p[2].output,
+                                    M, 64 * (i + 1), 128), "cold plan unavailable");
+                std::vector<std::vector<unsigned short>> references(3);
+                for (int rows = 2; rows <= 4; ++rows) {
+                    need(lt::Matmul(p[2].input, p[2].weight, p[2].output, rows, K, 256),
+                         "hot plan unavailable");
+                    references[rows - 2].resize(rows * 256);
+                    cu(cudaMemcpy(references[rows - 2].data(), p[2].output,
+                                  rows * 256 * 2, cudaMemcpyDeviceToHost));
+                }
+                const int queries = heuristicQueries;
+                for (int replay = 0; replay < 8; ++replay) for (int rows = 2; rows <= 4; ++rows) {
+                    need(lt::Matmul(p[2].input, p[2].weight, p[2].output, rows, K, 256),
+                         "cached plan unavailable");
+                    std::vector<unsigned short> actual(rows * 256);
+                    cu(cudaMemcpy(actual.data(), p[2].output, actual.size() * 2,
+                                  cudaMemcpyDeviceToHost));
+                    need(actual == references[rows - 2], "plan eviction changed GEMM output");
+                }
+                need(heuristicQueries == queries, "small hot plans repeatedly evicted");
+                need(lt::GetState(0, false)->plans.size() == lt::maxPlans,
+                     "plan cache exceeded its bound");
+            } catch (...) { error = std::current_exception(); }
+        });
+        cacheChurn.join();
+        if (error) std::rethrow_exception(error);
+        waitBusy(0);
         std::thread owner([&]() {
             try {
                 cu(cudaSetDevice(0));
@@ -390,7 +435,7 @@ int main() {
             cu(cudaStreamDestroy(s));
         puts("PASS independent captures, cross-thread replay/eager, graph lifetime, 24 worker "
              "recreations, capture/tuning failures, 48 serial variants in concurrent "
-             "families, bounded reusable leases");
+             "families, bounded reusable leases, bounded hot-plan reuse after eviction");
         return 0;
     } catch (const std::exception &e) {
         fprintf(stderr, "FAIL %s\n", e.what());

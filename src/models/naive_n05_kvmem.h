@@ -23,8 +23,7 @@ struct NaiveN05FlashModel::SparseKvState {
     std::mutex mutex;
     std::vector<int> free, devices;
     std::vector<std::unique_ptr<Rank>> ranks;
-    int requests = 0, tokens = 0;
-    std::map<PagedCacheManager *, Data *> indexSidecars;
+    int requests = 0, tokens = 0, queries = 1;
     ~SparseKvState();
 };
 }

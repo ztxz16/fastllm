@@ -1,14 +1,9 @@
 #pragma once
 namespace naive_indexer_sortpack {
 using namespace naive_indexer_batch;
-template<int Threads, int RadixBits, bool Striped, bool Pack = true, class BatchType = Batch>
-__global__ void SortPack(
-#if CUDART_VERSION >= 12010
-        const __grid_constant__
-#endif
-        BatchType batch) {
+template<int Threads, int RadixBits, bool Striped, bool Pack = true, int Capacity = naive_topk::kCapacity>
+__device__ void SortRow(const Row &r) {
     using namespace naive_topk;
-    const Row r = TopKRow(batch, blockIdx.x);
     const State &state = r.workspace->state;
     auto &candidate = r.workspace->candidates;
     if (state.uniform) {
@@ -22,7 +17,7 @@ __global__ void SortPack(
         }
         return;
     }
-    constexpr int Items = kCapacity / Threads;
+    constexpr int Items = Capacity / Threads;
     using BlockSort = cub::BlockRadixSort<unsigned, Threads, Items, int, RadixBits>;
     extern __shared__ __align__(16) unsigned char shared_storage[];
     auto &storage = *reinterpret_cast<typename BlockSort::TempStorage *>(shared_storage);
@@ -56,9 +51,32 @@ __global__ void SortPack(
     }
 }
 
-template<int Threads, int RadixBits, bool Striped, bool Pack = true>
+template<int Threads, int RadixBits, bool Striped, bool Pack = true, class BatchType = Batch>
+__global__ void SortPack(
+#if CUDART_VERSION >= 12010
+        const __grid_constant__
+#endif
+        BatchType batch) {
+    const Row r = TopKRow(batch, blockIdx.x);
+    SortRow<Threads, RadixBits, Striped, Pack>(r);
+}
+// Keep exact score/position order while avoiding a separate selection launch.
+// Smaller candidate storage requires a finer threshold; use it only for short rows.
+template<int Capacity = naive_topk::kTopK>
+__global__ void SelectSort(
+#if CUDART_VERSION >= 12010
+        const __grid_constant__
+#endif
+        Batch batch) {
+    const Row r = batch.rows[blockIdx.x];
+    SelectRow<false, Capacity>(r);
+    __syncthreads();
+    SortRow<256, 5, true, false, Capacity>(r);
+}
+
+template<int Threads, int RadixBits, bool Striped, bool Pack = true, int Capacity = naive_topk::kCapacity>
 constexpr size_t SortBytes() {
-    using Sort = cub::BlockRadixSort<unsigned, Threads, naive_topk::kCapacity / Threads, int, RadixBits>;
+    using Sort = cub::BlockRadixSort<unsigned, Threads, Capacity / Threads, int, RadixBits>;
     return sizeof(typename Sort::TempStorage);
 }
 

@@ -258,10 +258,10 @@ static void Test(int batch, int heads, int kvHeads, int dim, int vd, int capacit
 // Replace and reorder KV behind one captured graph. The original addresses
 // remain valid but contain different values, so stale kernel parameters cannot
 // pass this test accidentally.
-static void TestRebinding(int batch, int capacity, bool sparse, bool generic = false) {
-    const int heads = 8, kvHeads = 1, dim = generic ? 128 : 192, vd = generic ? 256 : 128, stride = dim + 128;
+static void TestRebinding(int batch, int capacity, bool sparse, bool generic = false, bool contiguousSelection = false, bool fp8 = false, int sharedQueries = 1, int heads = 8) {
+    const int kvHeads = 1, dim = generic ? 128 : 192, vd = generic ? 256 : 128, stride = dim + 128;
     Data q(BFLOAT16), sink(FLOAT32), live(INT32), table(INT32), maps(INT32), actual, expected;
-    const bool useMaps = !generic && FastllmCudaNaiveDSAMapsSupported();
+    const bool useMaps = !generic && !contiguousSelection && !fp8 && sharedQueries == 1 && FastllmCudaNaiveDSAMapsSupported();
     std::vector<unsigned char> hostMaps(batch * FastllmNaiveDSAMapBytes);
     maps.Resize({(int)hostMaps.size() / (int)sizeof(int)});
     maps.ToDevice(DataDevice::CUDA, {0}, false); maps.Allocate();
@@ -270,24 +270,43 @@ static void TestRebinding(int batch, int capacity, bool sparse, bool generic = f
     live.Resize({batch}); live.Allocate(); live.ToDevice(DataDevice::CUDA, {0}, false); live.Allocate();
     table.Resize({batch * 2 * (int)(sizeof(void *) / sizeof(int))});
     table.ToDevice(DataDevice::CUDA, {0}, false); table.Allocate();
-    std::vector<Data> keys(batch * 2, Data(BFLOAT16)), values(batch * 2, Data(BFLOAT16));
+    std::vector<Data> keys(batch * 2, Data(fp8 ? FP8_E4M3 : BFLOAT16)), values(batch * 2, Data(fp8 ? FP8_E4M3 : BFLOAT16));
     std::vector<Data> indices(batch, Data(INT32));
     std::vector<void *> pointers(batch * 2);
     std::vector<FastllmNaiveDSARow> rows(batch), direct(batch);
     std::vector<int> lengths(batch, capacity);
+    auto uploadCache = [&](Data &data, std::vector<int> dims, unsigned state) {
+        if (!fp8) { Upload(data, dims, state); return; }
+        data.Resize(dims); data.Allocate();
+        for (size_t i = 0; i < data.Count(0); ++i) {
+            state = state * 1664525u + 1013904223u;
+            ((uint8_t *)data.cpuData)[i] = (state >> 24) & 0xbf; // Finite signed E4M3 values below 2.
+        }
+        data.ToDevice(DataDevice::CUDA, std::vector<int>{0});
+    };
     for (int i = 0; i < batch * 2; ++i) {
-        Upload(keys[i], {1, capacity, stride}, 131 + i);
-        Upload(values[i], {1, capacity, vd}, 517 + i);
+        uploadCache(keys[i], {1, capacity, stride}, 131 + i);
+        uploadCache(values[i], {1, capacity, vd}, 517 + i);
+    }
+    Data contiguousIndices(INT32);
+    if (sparse && contiguousSelection) {
+        contiguousIndices.Resize({batch, 2048}); contiguousIndices.Allocate();
+        for (int i = 0; i < batch; ++i) for (int j = 0; j < 2048; ++j)
+            ((int *)contiguousIndices.cpuData)[(size_t)i * 2048 + j] = (j * 7 + i * 13) % capacity;
+        contiguousIndices.ToDevice(DataDevice::CUDA, std::vector<int>{0});
     }
     for (int i = 0; i < batch; ++i) {
         auto &r = rows[i];
-        r.key = keys[i].cudaData; r.value = values[i].cudaData;
+        r.key = keys[i].cudaData; r.value = values[i].cudaData; r.fp8 = fp8;
         r.liveKeys = (const int *)live.cudaData + i;
         r.capacity = capacity; r.keyStride = stride;
-        r.cache = (const void *const *)table.cudaData + i * 2;
+        r.cache = (const void *const *)table.cudaData + (i / sharedQueries) * 2;
         if (useMaps) r.tensorMaps = (const unsigned char *)maps.cudaData + i * FastllmNaiveDSAMapBytes;
         pointers[i * 2] = keys[i].cudaData; pointers[i * 2 + 1] = values[i].cudaData;
-        if (sparse) {
+        if (sparse && contiguousSelection) {
+            r.indices = (const int *)contiguousIndices.cudaData + (size_t)i * 2048;
+            r.selectedCount = 2048;
+        } else if (sparse) {
             indices[i].Resize({1, 2048}); indices[i].Allocate();
             for (int j = 0; j < 2048; ++j) ((int *)indices[i].cpuData)[j] = (j * 7 + i * 13) % capacity;
             indices[i].ToDevice(DataDevice::CUDA, {0}, true);
@@ -311,16 +330,41 @@ static void TestRebinding(int batch, int capacity, bool sparse, bool generic = f
         for (int i = 0; i < batch; ++i) {
             int source = pass == 0 ? batch - i - 1 : batch + (i + pass) % batch;
             pointers[i * 2] = keys[source].cudaData; pointers[i * 2 + 1] = values[source].cudaData;
-            lengths[i] = pass == 1 ? 3 : capacity - i % 5;
+            lengths[i] = pass == 1 ? ((contiguousSelection || sharedQueries > 1) && i % 13 == 0 ? 0 : 3) : capacity - i % 5;
             direct[i] = rows[i]; direct[i].cache = nullptr; direct[i].tensorMaps = nullptr;
-            direct[i].key = pointers[i * 2]; direct[i].value = pointers[i * 2 + 1];
+        }
+        for (int i = 0; i < batch; ++i) {
+            direct[i].key = pointers[(i / sharedQueries) * 2];
+            direct[i].value = pointers[(i / sharedQueries) * 2 + 1];
         }
         Cuda(cudaMemcpy(table.cudaData, pointers.data(), pointers.size() * sizeof(void *), cudaMemcpyHostToDevice));
         Cuda(cudaMemcpy(live.cudaData, lengths.data(), batch * sizeof(int), cudaMemcpyHostToDevice));
         updateMaps();
         graph.Run();
-        FastllmCudaNaiveBatchDSADecode(q, sink, direct, heads, kvHeads, dim, vd, referenceScratch, expected);
-        auto a = Read<uint16_t>(actual), b = Read<uint16_t>(expected);
+        std::vector<uint16_t> b;
+        if (heads == 16) {
+            b.reserve((size_t)batch * heads * vd);
+            // Sub-64-row launches retain the eight-head KV-load path. Compare
+            // the large-batch shared-head graph with that independent fallback.
+            for (int first = 0; first < batch;) {
+                const int count = batch - first < 64 ? batch - first : 32;
+                Data partQuery(BFLOAT16), partOutput;
+                partQuery.FakeFrom(q, (size_t)first * heads * dim * 2);
+                partQuery.Resize({1, count, heads * dim});
+                std::vector<FastllmNaiveDSARow> part(direct.begin() + first, direct.begin() + first + count);
+                FastllmCudaNaiveBatchDSADecode(partQuery, sink, part, heads, kvHeads, dim, vd,
+                                             referenceScratch, partOutput);
+                auto reference = Read<uint16_t>(partOutput);
+                b.insert(b.end(), reference.begin(), reference.end());
+                first += count;
+            }
+        } else {
+            FastllmCudaNaiveBatchDSADecode(q, sink, direct, heads, kvHeads, dim, vd, referenceScratch, expected);
+            b = Read<uint16_t>(expected);
+        }
+        auto a = Read<uint16_t>(actual);
+        if (heads == 16) Require(a == b, "shared-head chunking changed fallback output bits");
+        if (contiguousSelection || sharedQueries > 1) Require(a == b, "compact attention changed output bits after rebinding");
         double error = 0, norm = 0;
         for (size_t i = 0; i < a.size(); ++i) {
             const double delta = std::abs((double)Float(a[i]) - Float(b[i]));
@@ -399,12 +443,168 @@ static void TestPagedBatchIndexer(int pageLen, bool generic) {
     std::printf("PAGED BATCH INDEXER PASS page_len=%d generic=%d\n", pageLen, generic);
 }
 
+
+static void TestSharedIndexerQueries(int requests, int width) {
+    const int count = requests * width, capacity = 4097;
+    Data q(BFLOAT16), weights(BFLOAT16), live(INT32);
+    Upload(q, {1, count, 16 * 128}, 113);
+    Upload(weights, {1, count, 16}, 137);
+    live.Resize({count}); live.Allocate();
+    std::vector<int> lengths(count, capacity);
+    std::memcpy(live.cpuData, lengths.data(), count * sizeof(int));
+    live.ToDevice(DataDevice::CUDA, {0}, true);
+    std::vector<Data> keys(requests, Data(BFLOAT16)), aliases(count), expected(count), actual(count);
+    std::vector<FastllmNaiveDecodeScratch> reference(count), optimized(count);
+    std::vector<FastllmNaiveIndexerRow> singles, shared;
+    for (int i = 0; i < requests; ++i) Upload(keys[i], {1, capacity, 320}, 239 + i);
+    for (int i = 0; i < count; ++i) {
+        aliases[i].FakeFrom(keys[i / width], 0); aliases[i].Resize(keys[i / width].dims);
+        // Distinct Data objects prevent host query grouping while sharing the
+        // same physical KV, providing the original one-query MMA reference.
+        singles.push_back({&aliases[i], &reference[i], &expected[i], i, capacity});
+        shared.push_back({&keys[i / width], &optimized[i], &actual[i], i, capacity});
+    }
+    Graph graph;
+    graph.Capture([&] {
+        Require(FastllmCudaNaiveBatchDecodeIndexer(q, weights, live, shared, true), "shared indexer unavailable");
+    });
+    for (int base : {capacity, 2093, 129, 0}) {
+        for (int i = 0; i < count; ++i)
+            lengths[i] = i % 11 ? std::max(0, base - width + i % width + 1) : 0;
+        Cuda(cudaMemcpy(live.cudaData, lengths.data(), count * sizeof(int), cudaMemcpyHostToDevice));
+        graph.Run();
+        Require(FastllmCudaNaiveBatchDecodeIndexer(q, weights, live, singles, true), "single-query reference unavailable");
+        for (int i = 0; i < count; ++i) {
+            Require(Read<int>(actual[i]) == Read<int>(expected[i]), "query reuse changed TopK indices");
+            const auto a = Read<unsigned>(optimized[i].indexScores), b = Read<unsigned>(reference[i].indexScores);
+            Require(std::equal(a.begin(), a.begin() + lengths[i], b.begin()), "query reuse changed score bits");
+        }
+        ++checks;
+    }
+}
+
+static void TestVerifySwa(int requests, int width, bool fp8) {
+    const int heads = 8, batch = requests * width, capacity = 128 + width;
+    Data q(BFLOAT16), sink(FLOAT32), live(INT32), actual, none;
+    Upload(q, {1, batch, heads * 192}, 791); Upload(sink, {heads}, 357);
+    live.Resize({batch}); live.ToDevice(DataDevice::CUDA, {0}, false); live.Allocate();
+    std::vector<Data> keys(requests, Data(fp8 ? FP8_E4M3 : BFLOAT16));
+    std::vector<Data> values(requests, Data(fp8 ? FP8_E4M3 : BFLOAT16));
+    auto upload = [&](Data &d, int dim, int seed) {
+        if (!fp8) { Upload(d, {1, capacity, dim}, seed); return; }
+        d.Resize({1, capacity, dim}); d.Allocate();
+        unsigned state = seed;
+        for (size_t j = 0; j < d.Count(0); ++j) {
+            state = state * 1664525u + 1013904223u;
+            ((uint8_t *)d.cpuData)[j] = (state & 128) | (0x20 + ((state >> 16) % 40));
+        }
+        d.ToDevice(DataDevice::CUDA, {0}, true);
+    };
+    std::vector<FastllmNaiveSWARow> rows(batch);
+    std::vector<int> lengths(batch);
+    for (int r = 0; r < requests; ++r) {
+        upload(keys[r], 192, 451 + r); upload(values[r], 128, 717 + r);
+        for (int j = 0; j < width; ++j) {
+            auto &row = rows[r * width + j];
+            row.key = keys[r].cudaData; row.value = values[r].cudaData;
+            row.fp8 = fp8; row.verifyOffset = j;
+            lengths[r * width + j] = 707 + j;
+        }
+    }
+    Cuda(cudaMemcpy(live.cudaData, lengths.data(), batch * sizeof(int), cudaMemcpyHostToDevice));
+    Graph graph;
+    graph.Capture([&] { FastllmCudaNaiveBatchSWADecode(q, sink, rows, live, heads, 1, actual); });
+    for (int prefix : {0, 123, 127, 128, 707}) {
+        for (int r = 0; r < requests; ++r) for (int j = 0; j < width; ++j) {
+            const int i = r * width + j;
+            lengths[i] = prefix + r % 5 + j + 1;
+            rows[i].length = lengths[i];
+        }
+        Cuda(cudaMemcpy(live.cudaData, lengths.data(), batch * sizeof(int), cudaMemcpyHostToDevice));
+        graph.Run(); auto result = Read<uint16_t>(actual);
+        double error = 0, norm = 0;
+        for (int i = 0; i < batch; ++i) {
+            Data query, expected;
+            query.Resize({1, 1, heads * 192}); query.FakeFrom(q, (size_t)i * heads * 192 * 2);
+            // One-row calls select the unchanged scalar kernel, independent of
+            // the bulk ring addressing. Check all candidates around wrap.
+            FastllmCudaNaiveBatchSWADecode(query, sink, {rows[i]}, none, heads, 1, expected);
+            auto reference = Read<uint16_t>(expected);
+            for (size_t j = 0; j < reference.size(); ++j) {
+                double ref = Float(reference[j]), delta = Float(result[(size_t)i * heads * 128 + j]) - ref;
+                error += delta * delta; norm += ref * ref;
+                Require(std::abs(delta) <= .004 + .01 * std::abs(ref), "verification SWA element error");
+            }
+        }
+        Require(std::sqrt(error / std::max(norm, 1e-20)) < .004, "verification SWA relative error");
+        // Eager boundary forwards use host lengths; their output must agree
+        // with the captured dynamic-length path bit for bit.
+        FastllmCudaNaiveBatchSWADecode(q, sink, rows, none, heads, 1, actual);
+        Require(result == Read<uint16_t>(actual), "verification SWA eager/graph differs");
+        ++checks;
+    }
+    std::printf("VERIFY SWA PASS batch=%d width=%d fp8=%d\n", requests, width, fp8);
+}
+
+// Compare every physical byte against a CPU ring update, including unwritten
+// slots, mixed BF16/FP8 rows and chunks that end partway through a batch.
+static void TestCommitSwa(int count) {
+    std::vector<Data> keys(count), values(count);
+    std::vector<std::vector<unsigned char>> expected(count * 2);
+    std::vector<FastllmNaiveCacheCommit> updates;
+    for (int i = 0; i < count; ++i) {
+        const int past = 121 + i * 13, accepted = i % 9;
+        for (int part = 0; part < 2; ++part) {
+            Data &cache = part ? values[i] : keys[i];
+            cache.dataType = i % 2 ? FP8_E4M3 : BFLOAT16;
+            cache.UpdateUnitSize();
+            const int width = part ? 128 : 192;
+            cache.dataDevice = DataDevice::CUDA; cache.dataDeviceIds = {0};
+            cache.Expansion({1, 136, width}); cache.Resize({1, 136, width});
+            const size_t bytes = cache.GetBytes(), rowBytes = width * cache.unitSize;
+            std::vector<unsigned char> initial(bytes);
+            for (size_t j = 0; j < bytes; ++j) initial[j] = (j * 37 + i * 31 + j / rowBytes) % 251;
+            Cuda(cudaMemcpy(cache.cudaData, initial.data(), bytes, cudaMemcpyHostToDevice));
+            auto &ref = expected[i * 2 + part]; ref = initial;
+            for (int row = 0; row < accepted; ++row)
+                std::memcpy(ref.data() + ((past + row) & 127) * rowBytes,
+                    initial.data() + (128 + row) * rowBytes, rowBytes);
+        }
+        updates.push_back({&keys[i], &values[i], past, accepted});
+    }
+    FastllmCudaNaiveBatchCommitSwaVerify(updates);
+    Cuda(cudaStreamSynchronize(cudaStreamPerThread));
+    for (int i = 0; i < count; ++i) for (int part = 0; part < 2; ++part) {
+        Data &cache = part ? values[i] : keys[i];
+        Require(cache.dims[1] == std::min(121 + i * 13 + i % 9, 127), "SWA commit logical length");
+        std::vector<unsigned char> actual(expected[i * 2 + part].size());
+        Cuda(cudaMemcpy(actual.data(), cache.cudaData, actual.size(), cudaMemcpyDeviceToHost));
+        if (actual != expected[i * 2 + part]) {
+            size_t first = 0; while (first < actual.size() && actual[first] == expected[i * 2 + part][first]) ++first;
+            std::fprintf(stderr, "COMMIT count=%d row=%d part=%d first=%zu actual=%u expected=%u\n",
+                count, i, part, first, actual[first], expected[i * 2 + part][first]);
+            throw std::runtime_error("SWA commit physical bytes");
+        }
+    }
+    ++checks;
+}
+
 int main() {
     try {
         int devices = 0;
         if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0)
             return 77;
         FastllmCudaSetDevice(0);
+        for (int batch : {63, 64, 312, 313, 339, 340, 512, 640, 651, 652, 768, 1025})
+            TestRebinding(batch, 257, true, false, false, true, 1, 16);
+        for (int width : {3, 5, 6, 8, 11})
+            TestRebinding(65 * width, 257, true, false, false, true, width, 16);
+        for (int requests : {8, 65}) for (int width : {4, 6, 7, 8})
+            TestSharedIndexerQueries(requests, width);
+        for (int count : {1, 32, 112, 113, 257}) TestCommitSwa(count);
+        for (int requests : {8, 32, 128}) for (int width : {4, 6, 8})
+            for (bool fp8 : {false, true}) TestVerifySwa(requests, width, fp8);
+
         Test(1, 8, 1, 192, 128, 896, false, true);
         Test(2, 8, 1, 192, 128, 896, false, true);
         for (int batch : {3, 4, 8}) {
@@ -423,6 +623,13 @@ int main() {
         for (int batch : {1, 4, 32, 128, 256}) {
             TestRebinding(batch, 707, false);
             TestRebinding(batch, 4097, true);
+        }
+        for (int batch : {257, 513}) for (bool fp8 : {false, true})
+            TestRebinding(batch, 4097, true, false, true, fp8);
+        for (bool fp8 : {false, true}) {
+            TestRebinding(257, 4097, true, false, false, fp8, 4);
+            TestRebinding(769, 4097, true, false, false, fp8, 6);
+            TestRebinding(1025, 4097, true, false, false, fp8, 8);
         }
         TestRebinding(4, 707, false, true);
         TestRebinding(33, 4097, true, true);

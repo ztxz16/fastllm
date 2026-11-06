@@ -44,6 +44,7 @@ struct Plan {
     cublasLtMatrixLayout_t a = nullptr, b = nullptr, c = nullptr;
     cublasLtMatmulAlgo_t algo{};
     bool valid = false;
+    uint64_t lastUse = 0;
 
     ~Plan() {
         if (op) cublasLtMatmulDescDestroy(op);
@@ -169,6 +170,7 @@ struct State {
     unsigned long long captureId = 0;
     Workspace *captured = nullptr; // borrowed only while captureId is active
     std::map<Key, std::unique_ptr<Plan>> plans;
+    uint64_t planClock = 0;
 
     explicit State(int device) : device(device) {
         int major = 0, minor = 0;
@@ -441,8 +443,13 @@ inline bool Matmul(const void *input, const void *weight, void *output, int M, i
     auto found = s->plans.find(key);
     if (found == s->plans.end()) {
         if (capture != cudaStreamCaptureStatusNone) return false;
-        while (s->plans.size() > maxPlans - (referenceRows ? 2 : 1))
-            s->plans.erase(s->plans.begin());
+        while (s->plans.size() > maxPlans - (referenceRows ? 2 : 1)) {
+            // Shape order is not recency: erasing begin() repeatedly evicts
+            // small hot batches after larger batches fill the bounded cache.
+            auto oldest = std::min_element(s->plans.begin(), s->plans.end(),
+                [](const auto &a, const auto &b) { return a.second->lastUse < b.second->lastUse; });
+            s->plans.erase(oldest);
+        }
         auto plan = std::make_unique<Plan>();
         if (referenceRows) {
             // Select exactly the ordinary 32-row plan, then keep its tile and
@@ -465,6 +472,7 @@ inline bool Matmul(const void *input, const void *weight, void *output, int M, i
         found = s->plans.emplace(key, std::move(plan)).first;
     }
     Plan &p = *found->second;
+    p.lastUse = ++s->planClock;
     if (!p.valid) return false;
     void *workspace = capture == cudaStreamCaptureStatusNone
         ? s->eager->data : CaptureWorkspace(*s);

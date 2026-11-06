@@ -1,7 +1,7 @@
 #ifndef CUDA_API_PER_THREAD_DEFAULT_STREAM
 #define CUDA_API_PER_THREAD_DEFAULT_STREAM 1
 #endif
-#include "../../src/models/naive_n05_kvmem.h"
+#include "models/naive_n05_flash.h"
 #include "devices/cuda/fastllm-cuda-kvmem.cuh"
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/cuda/naive-n05-cuda.cuh"
@@ -20,10 +20,9 @@ namespace fastllm {
 // Exercise the real shared-prefix tail-copy path, including the FP8 Indexer
 // sidecar. The page table is preallocated so no model workspace is needed.
 struct NaiveN05FP4KVTestAccess : NaiveN05FlashModel {
-    void Copy(Data &cache, PagedCacheManager &pool, Data &index) {
+    void Copy(Data &cache, PagedCacheManager &pool, PagedCacheManager &index) {
         max_positions = 384;
-        sparseKv = std::make_shared<SparseKvState>();
-        sparseKv->indexSidecars.emplace(&pool, &index);
+        tpIndexerSidecars.emplace(&pool, &index);
         if (!PreparePagedCache(cache, pool, 64))
             throw std::runtime_error("shared prefix did not copy on write");
     }
@@ -35,6 +34,26 @@ void Require(bool v, const char *s) {
         throw std::runtime_error(s);
 }
 void Cuda(cudaError_t e) { Require(e == cudaSuccess, cudaGetErrorString(e)); }
+void LengthMetadata() {
+    // Graph bindings retain the length address and physical row stride while
+    // logical lengths grow. The shared helper must preserve the FP4 layout.
+    for (DataType type : {BFLOAT16, FP8_E4M3, FP4_E2M1}) {
+        Data cache(type, {1, 17, 192});
+        cache.expansionDims = {1, 128, 192};
+        cache.strides = {128 * 192, 192, 1};
+        const auto strides = cache.strides;
+        int *length = &cache.dims[1];
+        Require(FastllmNaiveCanResizeKVLength(cache, 127, 192), "KV length fast path rejected supported layout");
+        FastllmNaiveResizeKVLength(cache, 127, 192);
+        Require(length == &cache.dims[1] && *length == 127 && cache.strides == strides,
+                "KV length update changed graph metadata storage");
+        Require(cache.GetBytes() == GetDataBytes(type, 1, 128 * 192), "KV length update changed physical storage bytes");
+        Require(!FastllmNaiveCanResizeKVLength(cache, 129, 192), "KV length fast path exceeded capacity");
+        Require(!FastllmNaiveCanResizeKVLength(cache, 127, 128), "KV length fast path ignored width change");
+        cache.cudaNativeNvfp4Layout = true;
+        Require(!FastllmNaiveCanResizeKVLength(cache, 127, 192), "native FP4 layout entered row-packed fast path");
+    }
+}
 void Allocate(Data &d, const std::vector<int> &shape) {
     d.UpdateUnitSize();
     d.Resize(shape);
@@ -201,7 +220,9 @@ void PrefixCopy() {
         pool.pageLen = 128;
         Allocate(pool, {3, 128, 1, width});
         pool.SetMaxPages(3);
-        Data index(FP8_E4M3), cache(INT32);
+        PagedCacheManager index;
+        index.dataType = FP8_E4M3;
+        Data cache(INT32);
         Allocate(index, {3, 128, 1, 128});
         Allocate(cache, {3});
         std::vector<uint8_t> original(pool.GetBytes()), sidecar(index.GetBytes());
@@ -639,6 +660,7 @@ int main() {
         if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices)
             return 77;
         FastllmCudaSetDevice(0);
+        LengthMetadata();
         ReadWrite();
         Prefill();
         PrefixCopy();

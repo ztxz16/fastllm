@@ -96,6 +96,8 @@ ftllm server /data/models/qwen3.8 \
   --draft_tokens 7
 ~~~
 
+外置 DSpark 的 `--draft_tokens N` 与 `--dspark N` 指定待验证的候选前缀，草稿骨干始终计算 checkpoint 的完整 `block_size`。例如 block 7 配合 `--draft_tokens 3`，仍计算 7 个草稿位置，最多验证前 3 个候选。请保留原始 checkpoint 配置；修改 `block_size` 会改变块内非因果注意力，可能降低接受率。候选数超过 checkpoint 的 block size 时会报错。
+
 `--draft` 会根据 draft checkpoint 自动识别 MTP、DFlash2 或 DSpark。独立 MTP 当前用于 Qwen3.5 GGUF，路径可指向包含 `config.json` 和 `mtp.safetensors` 的目录，也可直接指向 `mtp.safetensors`；省略 `--draft_tokens` 时默认使用 5。DFlash2 的 `--draft_tokens` 表示实际 draft token 数，不包含 anchor token。
 
 DFlash2 的完整配置和验证结果见 [Qwen3.8 DFlash2 文档](benchmarks/qwen38_27b_dflash2.md)。
@@ -169,7 +171,7 @@ CLI 会持续演进，`ftllm <command> --help` 是当前安装版本的最终依
 | `--enable_thinking` | 控制模型的思考模板开关，需要模型支持 |
 | `--mtp` | 支持 MTP 的模型每轮生成的 draft token 数，`0` 关闭，当前最大为 8 |
 | `--mtp_fp8_draft_head` / `--mtp-fp8-draft-head` | Qwen3.5 系列多卡 MTP 的 FP8 draft 输出头开关：`1` 开启，`0` 复用原输出头以节省显存，可能降低生成速度；不改变 MTP draft 数。显式参数优先于 `FASTLLM_MTP_FP8_DRAFT_HEAD`，未指定时沿用环境变量，默认开启 |
-| `--dspark` | 启用模型内置 DSpark，并设置每轮 draft token 数 |
+| `--dspark` | 启用 DSpark 并设置每轮候选数；外置草稿配合 `--draft` 使用 |
 | `--draft` / `--draft_model_path` | 外部 MTP/DSpark/DFlash draft checkpoint；根据配置自动识别算法，MTP 可直接指定 `mtp.safetensors` |
 | `--draft_tokens` | 每轮最多使用的 draft token 数；未指定时读取 draft 配置 |
 | `--tool_call_parser` | 工具调用解析器；默认 `auto` |

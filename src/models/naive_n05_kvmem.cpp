@@ -17,9 +17,11 @@ void NaiveN05FlashModel::ConfigureKvMem(const KvMemConfig &config) {
 #ifndef USE_CUDA
     throw std::invalid_argument("MiMo KVMem requires CUDA");
 #else
-    if (tpDevices.size() < 2 || GetKVCacheInCPU() || draftEnabled || dataType != BFLOAT16 ||
+    if (tpDevices.size() < 2 || GetKVCacheInCPU() || dataType != BFLOAT16 ||
         !FastllmNaiveAttentionKVType(kvCacheDataType) || maxBatch < 1 || maxBatch > MaxTPDecodeBatch)
-        throw std::invalid_argument("MiMo KVMem requires CUDA TP, BF16 compute, BF16/FP8/FP4 DSA KV, explicit max_batch in [1,512], and no draft");
+        throw std::invalid_argument("MiMo KVMem requires CUDA TP, BF16 compute, BF16/FP8/FP4 DSA KV, explicit max_batch in [1,512]");
+    if (draftEnabled && kvCacheDataType == FP4_E2M1)
+        throw std::invalid_argument("MiMo FP4 DSA KV does not support draft decoding");
     if (config.maxTokens < 2 || config.maxTokens > max_positions ||
         config.residentTokens < indexTopK || config.residentTokens > config.maxTokens ||
         config.prefillTokens < 1 || !config.hostBytes || GetFastllmEnv().skipWarmup)
@@ -86,7 +88,8 @@ void NaiveN05FlashModel::InitSparseKv() {
 #ifdef USE_CUDA
     if (sparseKv) return;
     const int owners = DecodeGraphBatchBuckets(maxBatch).back(), ranks = tpDevices.size();
-    const int page = GetPageLen(), windowCapacity = (window + 127) / 128 * 128;
+    const int page = GetPageLen(), windowCapacity = (window + (draftEnabled ? draftBlock + 1 : 0) + 127) / 128 * 128;
+    const int queries = std::min(kvMemConfig.residentTokens / indexTopK, draftEnabled ? std::min(8, draftBlock + 1) : 1);
     const int indexPage = indexerContextSharding ? page / ranks : page;
     const int tokens = (kvMemConfig.maxTokens + page - 1) / page * page;
     const int pages = tokensLimit / page, unit = AuxiliaryKVType() == FP8_E4M3 ? 1 : 2;
@@ -103,6 +106,8 @@ void NaiveN05FlashModel::InitSparseKv() {
             prefixes->slotBytes += size_t(window) * std::max(1, sliding.kvHeads / ranks) *
                 (part ? sliding.valueDim : sliding.headDim) * unit;
         }
+    prefixes->slotBytes = (prefixes->slotBytes + 255) / 256 * 256;
+    if (draftEnabled) prefixes->draftSlotBytes = size_t(draftWindow - 1) * embed_dim * sizeof(uint16_t);
     int64_t prefixBudget = INT64_MAX;
     for (int device : tpDevices) {
         const int64_t reserve = totalBytes.at(device) * (1.0 - GetGpuMemRatio());
@@ -113,7 +118,8 @@ void NaiveN05FlashModel::InitSparseKv() {
     tpPagedCaches.resize(ranks);
     size_t hostBytes = 0;
     for (int rank = 0; rank < ranks; ++rank) {
-        size_t deviceBytes = size_t(prefixSlots) * prefixes->slotBytes;
+        size_t deviceBytes = size_t(prefixSlots) * prefixes->slotBytes +
+            size_t(PrefixPool::DraftShardSlots(prefixSlots, rank, ranks)) * prefixes->draftSlotBytes;
         for (int layer = 0; layer < block_cnt; ++layer) {
             const auto &cfg = slidingLayers[layer] ? sliding : full;
             const size_t width = GetDataBytes(LayerKVType(layer), 1,
@@ -122,9 +128,9 @@ void NaiveN05FlashModel::InitSparseKv() {
             else {
                 // Sparse storage: hot KV, bidirectional maps, eviction workspace,
                 // selected indices and metadata. Charge graph padding as owners.
-                deviceBytes += size_t(owners) * (kvMemConfig.residentTokens * (width + 8) +
-                    tokens * 4ULL + ((tokens / page + 3) / 4 * 4) * 8ULL + indexTopK * 8ULL + 128) +
-                    size_t(owners) * (kvMemConfig.residentTokens * 4ULL + indexTopK * 4ULL + 32);
+                deviceBytes += size_t(owners) * (kvMemConfig.residentTokens * (width + 12) +
+                    tokens * 4ULL + ((tokens / page + 3) / 4 * 4) * 8ULL +
+                    queries * (indexTopK * 8ULL + 44) + 128);
                 if (HasLocalIndexer(layer, rank))
                     deviceBytes += size_t(pages) * indexPage * IndexerCacheWidth(AuxiliaryKVType()) * unit;
             }
@@ -133,7 +139,11 @@ void NaiveN05FlashModel::InitSparseKv() {
             (full.headDim + full.valueDim) * stagingUnit;
         const size_t reserve = totalBytes.at(tpDevices[rank]) * (1.0 - GetGpuMemRatio());
         if (freeBytes.at(tpDevices[rank]) <= reserve || deviceBytes > freeBytes.at(tpDevices[rank]) - reserve)
-            throw std::invalid_argument("MiMo KVMem GPU budget insufficient for hot KV, Indexer, metadata and four SWA prefix checkpoints per request; reduce tokens/max_batch/max_tokens/resident_tokens or increase gpu_mem_ratio");
+            throw std::invalid_argument("MiMo KVMem GPU budget insufficient on device " +
+                std::to_string(tpDevices[rank]) + " (free=" + std::to_string(freeBytes.at(tpDevices[rank]) >> 20) +
+                " MiB, required=" + std::to_string(deviceBytes >> 20) + " MiB, reserve=" +
+                std::to_string(reserve >> 20) + " MiB) for hot KV, Indexer, metadata and four SWA prefix checkpoints per request; "
+                "reduce tokens/max_batch/max_tokens/resident_tokens or increase gpu_mem_ratio");
         FastllmCudaSetDevice(tpDevices[rank]);
         auto r = std::make_unique<SparseKvState::Rank>();
         r->layers.resize(block_cnt); r->indexers.resize(block_cnt); r->windows.resize(block_cnt);
@@ -156,7 +166,8 @@ void NaiveN05FlashModel::InitSparseKv() {
                 continue;
             }
             KvMemSparseConfig sc;
-            sc.maxRequests = sc.maxBatch = owners; sc.maxTokens = tokens; sc.pageLen = page;
+            sc.maxRequests = owners; sc.maxQueries = queries; sc.maxBatch = owners * queries;
+            sc.maxTokens = tokens; sc.pageLen = page;
             sc.totalTokens = tokensLimit;
             sc.residentTokens = kvMemConfig.residentTokens; sc.maxSelected = indexTopK;
             sc.keyRowBytes = GetDataBytes(kvCacheDataType, 1, heads * cfg.headDim);
@@ -185,7 +196,7 @@ void NaiveN05FlashModel::InitSparseKv() {
                 index->Resize({pages, indexPage, 1, IndexerCacheWidth(AuxiliaryKVType())});
                 index->ToDevice(DataDevice::CUDA, {tpDevices[rank]}, false); index->Allocate(false);
                 measured += index->GetBytes();
-                state->indexSidecars.emplace(managers[layer * 2].get(), index.get());
+                tpIndexerSidecars.emplace(managers[layer * 2].get(), index.get());
                 r->indexers[layer] = std::move(index);
             }
         }
@@ -208,8 +219,21 @@ void NaiveN05FlashModel::InitSparseKv() {
         state->ranks.push_back(std::move(r));
     }
     for (int slot = owners - 1; slot >= 0; --slot) state->free.push_back(slot);
+    state->queries = queries;
     sparseKv = std::move(state);
     if (prefixSlots) {
+        if (prefixes->draftSlotBytes) {
+            prefixes->draftStorage.resize(ranks);
+            for (int rank = 0; rank < ranks; ++rank) {
+                const int slots = PrefixPool::DraftShardSlots(prefixSlots, rank, ranks);
+                if (!slots) continue;
+                FastllmCudaSetDevice(tpDevices[rank]);
+                auto &storage = prefixes->draftStorage[rank];
+                storage.dataType = BFLOAT16; storage.UpdateUnitSize();
+                storage.Resize({slots, draftWindow - 1, embed_dim});
+                storage.ToDevice(DataDevice::CUDA, {tpDevices[rank]}, false); storage.Allocate(false);
+            }
+        }
         for (int slot = 0; slot < prefixSlots; ++slot) prefixes->freeSlots.push_back(slot);
         prefixPool = std::move(prefixes);
         printf("[MiMo KVMem prefix cache] %d window slots, %d reserved per request, %.2f MiB/GPU within KV budget.\n",
@@ -247,7 +271,7 @@ void NaiveN05FlashModel::AttachSparseKv(const std::vector<std::pair<Data *, Data
         if (active != activePrefixes.end() && !active->second.prefill.empty())
             snapshot = active->second.prefill.back();
     }
-    const int windowCapacity = (window + 127) / 128 * 128;
+    const int windowCapacity = (window + (draftEnabled ? draftBlock + 1 : 0) + 127) / 128 * 128;
     // Descriptor maps are scheduler-owned, before starting rank workers.
     for (int layer = 0; layer < block_cnt; ++layer)
     for (Data *root : {roots[layer].first, roots[layer].second}) {
@@ -339,11 +363,11 @@ void NaiveN05FlashModel::AttachSparseKv(const std::vector<std::pair<Data *, Data
 #endif
 }
 
-Data NaiveN05FlashModel::SparseIndexer(int layer, int rank, const Data &key) const {
+Data NaiveN05FlashModel::SeparateIndexer(int layer, int rank, const Data &key) const {
     Data result;
 #ifdef USE_CUDA
     if (!HasLocalIndexer(layer, rank)) return result;
-    auto &storage = *sparseKv->ranks[rank]->indexers[layer];
+    auto &storage = IndexerStorage(layer, rank);
     const int width = storage.dims[3];
     result.FakeFrom(key, 0);
     result.dataType = storage.dataType; result.UpdateUnitSize();

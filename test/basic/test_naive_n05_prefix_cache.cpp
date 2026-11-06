@@ -165,6 +165,25 @@ struct NaiveN05PrefixCacheTestAccess : NaiveN05FlashModel {
 
     static void Capacity() {
         PrefixPool pool;
+        pool.draftSlotBytes = 1023 * 4096 * 2;
+        for (int ranks : {1, 2, 3, 4, 6, 8}) for (int slots : {1, 4, 17, 1536}) {
+            pool.draftStorage.resize(ranks);
+            int total = 0;
+            for (int rank = 0; rank < ranks; ++rank) {
+                const int count = pool.DraftShardSlots(slots, rank, ranks);
+                total += count;
+                Require(count <= (slots + ranks - 1) / ranks, "draft shard exceeds balanced budget");
+            }
+            Require(total == slots, "draft sharding changed checkpoint capacity");
+            for (int slot = 0; slot < slots; ++slot) {
+                const int rank = slot % ranks;
+                Require(&pool.DraftShard(slot) == &pool.draftStorage[rank] &&
+                        pool.DraftOffset(slot) + pool.draftSlotBytes <=
+                            size_t(pool.DraftShardSlots(slots, rank, ranks)) * pool.draftSlotBytes,
+                        "draft checkpoint falls outside its shard");
+            }
+        }
+        pool.draftSlotBytes = 0;
         pool.slotBytes = 3194880;
         for (int batch : {1, 2, 3, 4, 8, 16, 32, 64, 128, 220, 224, 400, 512}) {
             Require(pool.SlotCount(batch, 0) == batch * 4, "missing minimum checkpoint reservation");

@@ -46,6 +46,8 @@ namespace fastllm {
                               const GenerationConfig &config, const Data *embedding = nullptr,
                               TargetCapture *capture = nullptr, float *candidateResult = nullptr,
                               const LogitsSelection *selection = nullptr, const TargetBatch *batch = nullptr);
+        bool PopPendingResponseToken(ResponseContext *context, int previousToken,
+                                     int &token) override;
         bool NeedAttentionMask(int, int) override { return false; }
         bool SupportsPrefillBatching() const override;
         // Bound idle TP prefill workspace with the shared pressure-aware pool.
@@ -73,6 +75,7 @@ namespace fastllm {
         bool SupportsKvMem() const override { return true; }
         bool SupportsKvMemBatch() const override { return true; }
         bool SupportsKvMemPrefixCache() const override { return true; }
+        bool SupportsSharedPagedKVPool() const override { return !tpPagedCaches.empty(); }
         int Ep8ExpertDevice(int expert, const std::vector<int> &loadDevices) const {
             AssertInFastLLM(tpEp8Mega && loadDevices == tpDevices && expert >= 0 && expert < 256,
                            "MiMo EP8 expert loading must use the same ordered devices as TP.");
@@ -108,6 +111,15 @@ namespace fastllm {
             std::vector<Data> storage;
             std::vector<size_t> offsets;
             size_t slotBytes = 0;
+            size_t draftSlotBytes = 0;
+            // Distribute complete normalized-input checkpoints across TP ranks.
+            // Keeping a slot intact also supports peers without direct GPU access.
+            std::vector<Data> draftStorage;
+            static int DraftShardSlots(int slots, int rank, int ranks) {
+                return (slots + ranks - 1 - rank) / ranks;
+            }
+            Data &DraftShard(int slot) { return draftStorage.at(slot % draftStorage.size()); }
+            size_t DraftOffset(int slot) const { return size_t(slot / draftStorage.size()) * draftSlotBytes; }
             // Serialized by historyMutex. Metadata previews never own slots.
             uint64_t historyVersion = 0;
             int SlotCount(int requests, int64_t budget) const {
@@ -116,12 +128,13 @@ namespace fastllm {
                 // on completed history. The caller must check the total fits.
                 return (int)std::max<int64_t>((int64_t)requests * PrefixSnapshotsPerRequest,
                     std::min<int64_t>((int64_t)requests * 8,
-                        std::max<int64_t>(0, budget) / 32 / slotBytes));
+                        std::max<int64_t>(0, budget) / 32 / (slotBytes + draftSlotBytes)));
             }
         };
         struct PrefixSnapshot {
             std::shared_ptr<PrefixPool> pool;
             int slot = -1, length = 0;
+            bool draftReady = false;
             std::vector<int> tokens;
             uint64_t tokenHash = 0; // Immutable with tokens after publication.
             // Observe the resident full-prefix endpoint without pinning KV.
@@ -160,6 +173,7 @@ namespace fastllm {
             int count = 0;
             bool greedy = false;
             bool cudaSampling = false;
+            bool cudaLogits = false; // Keep full logits on device for rejection sampling.
             float invTemperature = 1.0f;
             Data candidates; // CPU [rows, count * 2], (global token ID, score).
             std::vector<int> sampledTokens;
@@ -171,29 +185,48 @@ namespace fastllm {
             LogitsSelection *selection = nullptr;
             bool verifying = false;
             bool collectHidden = true;
+            // Internal consumers finish before the next target forward. Public
+            // callers keep owning outputs unless they explicitly opt in.
+            bool borrowOutputs = false;
+            bool ringVerify = false; // Candidates are staged after the retained SWA ring.
             std::map<int, Data> hidden;
             std::vector<PrefixSnapshots> prefixes;
         };
         struct DraftTPState;
         std::shared_ptr<DraftTPState> draftTP;
         struct DraftWorkspace;
+        // Bounded LRU; graph-owned inputs are refreshed on every replay.
+        std::vector<std::shared_ptr<DraftWorkspace>> draftBatchWorkspaces;
+        std::vector<std::shared_ptr<DraftWorkspace>> draftProposalWorkspaces;
+        // Graph variants execute serially and share their large activation buffers.
+        std::shared_ptr<DraftWorkspace> draftBatchStorage, draftContextStorage;
+        std::shared_ptr<DraftWorkspace> draftProposalStorage;
+        // Single-device draft graphs execute serially, including request churn.
+        std::map<int, std::shared_ptr<void>> draftLinearGraphWorkspaces;
         struct DraftContext {
             int committed = 0;
+            Data prefixHidden; // Logical prefill tail; backing belongs to the request workspace.
             std::vector<std::pair<Data, Data>> kv;
             std::shared_ptr<DraftWorkspace> workspace;
+            Data proposalProbs{FLOAT32}; // Actual GPU proposal distributions, retained until verification.
             std::deque<std::pair<int, int>> pending;
             std::mt19937_64 random{std::random_device{}()};
             uint64_t rounds = 0, proposed = 0, accepted = 0;
             double Uniform() { return std::generate_canonical<double, 53>(random); }
         };
         struct TargetWorkspace;
+        std::vector<int> ForwardTargetBatch(int batch, const Data &inputIds,
+            const std::vector<Data *> &attentionMask, const std::vector<Data *> &positionIds,
+            const std::vector<int> &seqLens, std::vector<std::pair<Data *, Data *>> &pastKeyValues,
+            const std::vector<GenerationConfig> &configs, const LastTokensManager &lastTokens,
+            std::vector<std::vector<float> *> *retLogits, TargetCapture *capture = nullptr);
         Data RunTarget(const Data &inputIds, const Data &positions,
                        std::vector<std::pair<Data, Data>> &kv, const GenerationConfig &config,
                        TargetCapture *capture, int tpRank = -1, const Data *embedding = nullptr,
                        TargetWorkspace *workspace = nullptr, const TargetBatch *batch = nullptr);
         int CacheReserveCapacity(const GenerationConfig &config) const;
-        void AppendCache(Data &cache, Data &input, DataType cacheType, int reserveCapacity = 0);
-        void ReserveCache(Data &cache, int capacity, int width, const Data *requestKey = nullptr);
+        void AppendCache(Data &cache, Data &input, DataType cacheType, int reserveCapacity = 0, bool usePool = true);
+        void ReserveCache(Data &cache, int capacity, int width, bool usePool = true, const Data *requestKey = nullptr);
         bool PreparePagedCache(Data &cache, PagedCacheManager &manager, int end);
         bool PreparePagedCache(Data &cache, PagedCacheManager &manager, int end,
                                std::vector<Data *> *pendingPageTables, const Data *requestKey = nullptr);
@@ -204,24 +237,46 @@ namespace fastllm {
                          std::vector<float> *retLogits, LogitsSelection *selection = nullptr);
         void InitDraft();
         void AppendDraftContext(Data &hidden, int start, DraftContext &context);
+        void RestoreDraftPrefix(const PrefixSnapshot &snapshot, int length, DraftContext &context);
         bool AppendDraftContextFused(Data &hidden, int start, DraftContext &context);
         void CommitDraftContext(TargetCapture &capture, int tokens, DraftContext &context,
                                 std::vector<std::pair<Data, Data>> &kv);
         std::shared_ptr<DraftContext> CreateDraftContext();
         bool PrepareDraftTP();
         bool AppendDraftContextTP(Data &hidden, int start, DraftContext &context);
-        bool RunDraftTP(int anchor, DraftContext &context, Data &output);
         bool RunDraftGraph(int anchor, DraftContext &context, Data &output);
+        bool RunDraftSamplingStep(int previous, int step, const Data &baseLogits,
+            DraftContext &context, const GenerationConfig &config, int &token);
         bool RunDraftProposalGraph(int anchor, const Data &baseLogits,
                                    DraftContext &context, std::vector<int> &proposed);
         Data RunDraft(int anchor, DraftContext &context);
+        bool RunDraftBatch(const std::vector<int> &anchors,
+                           const std::vector<DraftContext *> &contexts, Data &normalized);
         void ApplyDraftDevice();
         Data &DraftWeight(const std::string &name);
         Data RunDraftHead(Data &hidden);
         Data RunDraftTarget(const Data &inputIds, const Data &positions,
                             std::vector<std::pair<Data, Data>> &kv,
-                            const GenerationConfig &config, TargetCapture &capture);
-        void CommitTargetCache(std::vector<std::pair<Data, Data>> &kv, int past, int count);
+                            const GenerationConfig &config, TargetCapture &capture,
+                            const TargetBatch *batch = nullptr);
+        void CommitTargetCache(std::vector<std::pair<Data, Data>> &kv, int past, int count, bool ringVerify = false);
+        void CommitTargetCaches(const std::vector<std::vector<std::pair<Data, Data>> *> &caches,
+            const std::vector<int> &past, const std::vector<int> &counts, bool ringVerify);
+        bool CommitDraftContexts(TargetCapture &capture, const std::vector<int> &lengths,
+            const std::vector<int> &counts, const std::vector<DraftContext *> &contexts);
+        struct DraftRound;
+        void PrepareDraftRound(DraftRound &round, const Data *preparedLogits = nullptr);
+        bool PrepareDraftBatch(std::vector<std::unique_ptr<DraftRound>> &rounds, const Data &baseLogits);
+        bool PrepareDraftBatchGraph(std::vector<std::unique_ptr<DraftRound>> &rounds, const Data &baseLogits);
+        void PrepareDraftSamplingMemory(int rows, int steps, int vocab, int latentWidth);
+        void PrepareDraftAcceptance(std::vector<std::unique_ptr<DraftRound>> &rounds, Data &logits);
+        int FinishDraftRound(DraftRound &round, Data &logits, TargetCapture &capture,
+                             std::vector<std::pair<Data, Data>> &kv);
+        std::vector<int> ForwardDraftBatch(int batch, const Data &inputIds,
+                const std::vector<Data *> &positions, const std::vector<int> &lengths,
+                std::vector<std::pair<Data *, Data *>> &kv,
+                const std::vector<GenerationConfig> &configs, const LastTokensManager &lastTokens,
+                std::vector<std::vector<float> *> *retLogits);
         int ForwardDraft(const Data &inputIds, const Data &positions,
                          std::vector<std::pair<Data, Data>> &kv,
                          const GenerationConfig &config, const LastTokensManager &lastTokens,
@@ -234,10 +289,13 @@ namespace fastllm {
         std::vector<int> draftTargetLayers;
         std::map<const std::vector<std::pair<Data, Data>> *, std::shared_ptr<DraftContext>> draftContexts;
         std::shared_ptr<DraftContext> idleDraftContext;
+        std::vector<std::shared_ptr<DraftContext>> idleDraftContexts;
+        void PrepareDraftServingMemory(bool history);
 
     private:
         friend struct NaiveN05PrefixCacheTestAccess;
         friend struct NaiveN05FP4KVTestAccess;
+        friend struct NaiveN05GraphTestAccess;
         // Only request lifecycle callbacks (serialized by dictLocker) own this
         // single idle allocation set. No token contents are reused.
         std::vector<std::pair<Data, Data>> tpIdleCache;
@@ -248,19 +306,26 @@ namespace fastllm {
         std::shared_ptr<SparseKvState> sparseKv;
         void InitSparseKv();
         void AttachSparseKv(const std::vector<std::pair<Data *, Data *>> &roots);
-        Data SparseIndexer(int layer, int rank, const Data &key) const;
+        Data SeparateIndexer(int layer, int rank, const Data &key) const;
+        bool HasSeparateIndexer() const { return sparseKv || !tpIndexerCaches.empty(); }
+        PagedCacheManager &IndexerStorage(int layer, int rank) const {
+            return *tpIndexerSidecars.at(tpPagedCaches[rank][layer * 2].get());
+        }
         void StageSparseKv(int rank, int layer, const Data &key, const Data &value, Data &outKey, Data &outValue);
         // FP4 is limited to DSA K/V. SWA and the independent Indexer retain FP8.
         DataType AuxiliaryKVType() const { return kvCacheDataType == FP4_E2M1 ? FP8_E4M3 : kvCacheDataType; }
         DataType LayerKVType(int layer) const { return slidingLayers[layer] ? AuxiliaryKVType() : kvCacheDataType; }
-        int PackedIndexerWidth() const { return sparseKv ? 0 : IndexerCacheWidth(AuxiliaryKVType()); }
+        int PackedIndexerWidth() const { return HasSeparateIndexer() ? 0 : IndexerCacheWidth(AuxiliaryKVType()); }
         bool InitTensorParallel();
         void PrepareTensorParallel();
         void InitTensorParallelKVPool();
         std::shared_ptr<CudaWorkspace> RequestKVPool(int device, size_t bytes) const;
         void PrepareSwaPrefillWorkspace(int rank, int length);
         struct TPDecodeState;
-        std::shared_ptr<TPDecodeState> tpDecodeState, tpVerifyState, tpBatchState;
+        std::shared_ptr<TPDecodeState> tpDecodeState, tpVerifyState, tpBatchState, tpBatchVerifyState;
+        std::vector<std::shared_ptr<TPDecodeState>> tpBatchVerifyGraphs;
+        std::shared_ptr<TPDecodeState> tpBatchVerifyStorage;
+        Data tpSamplingLogits{FLOAT32};
         struct TPServingState;
         std::shared_ptr<TPServingState> tpServingState;
         std::atomic<uint64_t> tpCacheEpoch{0};
@@ -283,7 +348,7 @@ namespace fastllm {
                                         std::vector<std::pair<Data, Data>> &kv, bool verifying,
                                         const LogitsSelection &selection, std::vector<int *> &cacheLengths,
                                         const TargetBatch *batch = nullptr,
-                                        bool collectHidden = false);
+                                        bool collectHidden = false, bool reuseOnly = false);
         Data ForwardTensorParallelDecode(int rank, const Data &inputIds, const Data &positions,
                                         std::vector<std::pair<Data, Data>> &kv,
                                         const GenerationConfig &config, const Data *embedding, TargetCapture *capture,
@@ -302,16 +367,23 @@ namespace fastllm {
         // and requests. Request-owned SWA storage only holds the sliding window.
         std::vector<std::pair<Data, Data>> tpSwaPrefillWorkspaces;
         std::vector<std::vector<std::unique_ptr<PagedCacheManager>>> tpPagedCaches;
+        std::vector<std::vector<std::unique_ptr<PagedCacheManager>>> tpIndexerCaches;
+        std::map<PagedCacheManager *, PagedCacheManager *> tpIndexerSidecars;
         bool tpPrepared = false;
         // Fixed at TP preparation so toggling CUDA Graph cannot change live KV
-        // layout. Prefill/eager and verify temporarily use chronological rows.
+        // layout. Prefill/eager fallback temporarily uses chronological rows.
         bool tpSwaRingCache = false;
         bool tpEp8Mega = false;
         std::shared_ptr<FastllmCudaMimoEp8Mega> tpEp8MegaState;
         std::vector<std::shared_ptr<TargetWorkspace>> tpVerifyWorkspaces;
         std::vector<std::shared_ptr<TargetWorkspace>> tpBatchWorkspaces;
+        std::vector<std::shared_ptr<TargetWorkspace>> tpPrefillWorkspaces;
+        std::vector<Data> tpPrefillScores;
+        void PrepareTensorParallelMemory();
         std::vector<Data> tpDraftHeadInputs, tpDraftHeadLogits;
         Data tpDraftHeadOutput;
+        struct DraftHeadState;
+        std::shared_ptr<DraftHeadState> tpDraftHeadState;
         PersistentWorkerGroup tpWorkers;
         std::vector<std::vector<std::vector<Data *>>> tpMoeWeights, tpMoeBiases;
         std::vector<std::pair<int, int>> tpVocabRanges;
@@ -348,7 +420,7 @@ namespace fastllm {
             return fp8IndexerCache ? 144 / (type == FP8_E4M3 ? 1 : 2) : indexDim;
         }
         int LocalIndexerCacheWidth(int layer, int rank) const {
-            return !sparseKv && HasLocalIndexer(layer, rank) ? IndexerCacheWidth(AuxiliaryKVType()) : 0;
+            return !HasSeparateIndexer() && HasLocalIndexer(layer, rank) ? IndexerCacheWidth(AuxiliaryKVType()) : 0;
         }
         std::vector<std::vector<Data *>> moeWeights, moeBiases;
     };

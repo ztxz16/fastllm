@@ -48,4 +48,45 @@ inline bool PackRope(const RopeCacheRow *rows,int count,CompactRopeRequests &bat
     return true;
 }
 
+// Staged verification has contiguous projections, but independently rebound KV.
+// Preserve the original head-per-CTA calculation while reducing argument size.
+struct VerifyRopeBinding {
+    const void *const *cache;
+    int offset;
+};
+constexpr int kVerifyRopeRows = 1024;
+struct VerifyRopeBatch {
+    RopeCacheRow geometry;
+    VerifyRopeBinding rows[kVerifyRopeRows];
+};
+static_assert(sizeof(VerifyRopeBatch) + 128 <= 32764);
+inline bool CanPackVerifyRope(const std::vector<RopeCacheRow> &rows,
+        int heads, int kvHeads, int dim, int valueDim) {
+    const auto &first = rows.front();
+    for (size_t i = 0; i < rows.size(); ++i) {
+        const auto &r = rows[i];
+        if (!r.cache || !r.length || !r.ringVerify || r.pageLen || r.keyPages ||
+            r.valuePages || r.indexKey || r.indexCache || r.separateIndex || r.scaledIndexer ||
+            r.keyRows != first.keyRows || r.valueRows != first.valueRows || r.fp8 != first.fp8 ||
+            r.q != first.q + i * heads * dim || r.k != first.k + i * kvHeads * dim ||
+            r.v != first.v + i * kvHeads * valueDim || r.positions != first.positions + i ||
+            r.length != first.length + i ||
+            r.qkv != (first.qkv ? first.qkv + i * ((heads + kvHeads) * dim + kvHeads * valueDim) : nullptr))
+            return false;
+    }
+    return true;
+}
+__device__ __forceinline__ RopeCacheRow VerifyRopeRow(const VerifyRopeBatch &batch,
+        int i, int heads, int kvHeads, int dim, int valueDim) {
+    auto r = batch.geometry;
+    r.q += (size_t)i * heads * dim;
+    r.k += (size_t)i * kvHeads * dim;
+    r.v += (size_t)i * kvHeads * valueDim;
+    if (r.qkv) r.qkv += (size_t)i * ((heads + kvHeads) * dim + kvHeads * valueDim);
+    r.positions += i;
+    r.length += i;
+    r.cache = batch.rows[i].cache;
+    r.verifyOffset = batch.rows[i].offset;
+    return r;
+}
 #endif

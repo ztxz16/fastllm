@@ -139,6 +139,108 @@ static void PointerBindingTest() {
     std::puts("PASS graph pointer binding, implicit selection and request reorder");
 }
 
+static void QueryUnionTest(int queries, bool paged, int ownersCount = 4, int selectedCount = 17) {
+    KvMemSparseConfig c;
+    c.maxRequests = ownersCount; c.maxQueries = queries; c.maxBatch = ownersCount * queries;
+    c.maxTokens = 512; c.pageLen = paged ? 64 : 0;
+    c.maxSelected = selectedCount; c.residentTokens = queries * c.maxSelected;
+    c.keyRowBytes = 192; c.valueRowBytes = 7;
+    KvMemSparseCache cache(c); Stream stream; Fill(cache, c);
+    if (paged) for (int owner = 0; owner < c.maxRequests; ++owner) {
+        std::vector<int> pages(8);
+        for (int i = 0; i < 8; ++i) pages[i] = owner * 8 + (i * 3 + 1) % 8;
+        C(cudaMemcpy(cache.KeyPages(owner), pages.data(), 32, cudaMemcpyHostToDevice));
+        std::reverse(pages.begin(), pages.end());
+        C(cudaMemcpy(cache.ValuePages(owner), pages.data(), 32, cudaMemcpyHostToDevice));
+    }
+    C(cudaDeviceSynchronize());
+    Buffer<const void *> bindings(c.maxBatch);
+    Buffer<int> lengths(c.maxBatch), indices(size_t(c.maxBatch) * c.maxSelected);
+    std::vector<KvMemSparseQuery> descriptors(c.maxBatch);
+    for (int row = 0; row < c.maxBatch; ++row)
+        descriptors[row] = {nullptr, bindings.p + row, lengths.p + row,
+                           indices.p + size_t(row) * c.maxSelected, 0, c.maxSelected};
+    Graph graph, append;
+    graph.Capture(stream.s, [&] { cache.ResolveQueries(descriptors.data(), c.maxBatch, stream.s); });
+    append.Capture(stream.s, [&] { cache.ResolveQueries(descriptors.data(), c.maxBatch, stream.s, true); });
+    std::vector<int> owners(c.maxBatch), live(c.maxBatch), selected(indices.size), counts(c.maxBatch, c.maxSelected);
+    for (int round = 0; round < 6; ++round) {
+        std::vector<int> order(c.maxBatch); std::iota(order.begin(), order.end(), 0);
+        std::mt19937 random(17 + round); std::shuffle(order.begin(), order.end(), random);
+        std::vector<const void *> pointers(c.maxBatch);
+        for (int row = 0; row < c.maxBatch; ++row) {
+            int source = order[row], owner = source / queries, step = source % queries;
+            owners[row] = owner == round % 4 ? -1 : owner;
+            live[row] = owners[row] < 0 ? 0 : 65 + round * 39 + step;
+            pointers[row] = owners[row] < 0 ? nullptr : paged ? cache.KeyPages(owner) : cache.DeviceHostKey(owner);
+            for (int k = 0; k < c.maxSelected; ++k)
+                selected[size_t(row) * c.maxSelected + k] = k < 8 ? k * 7 : live[row] - (k % 5);
+        }
+        bindings.Put(pointers); lengths.Put(live); indices.Put(selected);
+        graph.Run(stream.s); stream.Sync();
+        Verify(cache, c, owners, live, selected, counts);
+        auto before = Read(cache.DeviceStats(), c.maxRequests);
+        graph.Run(stream.s); stream.Sync();
+        auto after = Read(cache.DeviceStats(), c.maxRequests);
+        for (int owner = 0; owner < c.maxRequests; ++owner)
+            Require(before[owner].copiedBytes == after[owner].copiedBytes, "query union reloaded a sibling hit");
+        // Simulate the model's mapped-host writer overwriting a rejected suffix.
+        // Old accepted prefix bytes remain identical; hot suffix must be discarded.
+        for (int owner = 0; owner < c.maxRequests; ++owner) {
+            const int first = 64 + round * 39;
+            auto kp = paged ? Read(cache.KeyPages(owner), 8) : std::vector<int>();
+            auto vp = paged ? Read(cache.ValuePages(owner), 8) : std::vector<int>();
+            for (int token = first; token < first + queries; ++token) {
+                size_t kr = paged ? kp[token / 64] * 64 + token % 64 : token;
+                size_t vr = paged ? vp[token / 64] * 64 + token % 64 : token;
+                std::memset((char *)cache.HostKey(paged ? 0 : owner) + kr * c.keyRowBytes, 37 + round, c.keyRowBytes);
+                std::memset((char *)cache.HostValue(paged ? 0 : owner) + vr * c.valueRowBytes, 91 + round, c.valueRowBytes);
+            }
+        }
+        append.Run(stream.s); stream.Sync();
+        Verify(cache, c, owners, live, selected, counts);
+        for (int owner = 0; owner < c.maxRequests; ++owner)
+            cache.InvalidateTail(paged ? cache.KeyPages(owner) : cache.DeviceHostKey(owner), 32, stream.s);
+        stream.Sync();
+        for (int owner = 0; owner < c.maxRequests; ++owner) {
+            auto kp = paged ? Read(cache.KeyPages(owner), 8) : std::vector<int>();
+            auto vp = paged ? Read(cache.ValuePages(owner), 8) : std::vector<int>();
+            for (int token = 32; token < c.maxTokens; ++token) {
+                const size_t kr = paged ? kp[token / 64] * 64 + token % 64 : token;
+                const size_t vr = paged ? vp[token / 64] * 64 + token % 64 : token;
+                std::memset((char *)cache.HostKey(paged ? 0 : owner) + kr * c.keyRowBytes, 101 + round, c.keyRowBytes);
+                std::memset((char *)cache.HostValue(paged ? 0 : owner) + vr * c.valueRowBytes, 141 + round, c.valueRowBytes);
+            }
+        }
+        graph.Run(stream.s); stream.Sync();
+        Verify(cache, c, owners, live, selected, counts);
+        // Complete replacement also exercises reset without moving graph bindings.
+        Fill(cache, c, round + 1);
+        for (int owner = 0; owner < c.maxRequests; ++owner) cache.Reset(owner, stream.s);
+        stream.Sync(); graph.Run(stream.s); stream.Sync();
+        Verify(cache, c, owners, live, selected, counts);
+    }
+    // A completely disjoint union must also fit, including a full-cache eviction.
+    for (int owner = 0; owner < c.maxRequests; ++owner) cache.Reset(owner, stream.s);
+    stream.Sync();
+    for (int phase = 0; phase < 2; ++phase) {
+        std::vector<const void *> pointers(c.maxBatch);
+        for (int row = 0; row < c.maxBatch; ++row) {
+            const int owner = row / queries;
+            owners[row] = owner; live[row] = c.maxTokens;
+            pointers[row] = paged ? cache.KeyPages(owner) : cache.DeviceHostKey(owner);
+            for (int k = 0; k < c.maxSelected; ++k)
+                selected[size_t(row) * c.maxSelected + k] = phase * c.residentTokens + row % queries * c.maxSelected + k;
+        }
+        bindings.Put(pointers); lengths.Put(live); indices.Put(selected);
+        graph.Run(stream.s); stream.Sync(); Verify(cache, c, owners, live, selected, counts);
+        for (const auto &stats : Read(cache.DeviceStats(), c.maxRequests))
+            Require(stats.misses == (phase + 1ULL) * c.residentTokens &&
+                    stats.evictions == phase * c.residentTokens, "disjoint query union lost or duplicated a row");
+    }
+    std::printf("PASS query union owners=%d q=%d paged=%d, causal lengths, hot hits, graph reorder and suffix overwrite\n", ownersCount, queries, paged);
+}
+
 static void PagedSharingTest(int totalTokens = 0, size_t keyBytes = 16, size_t valueBytes = 7) {
     KvMemSparseConfig c;
     c.maxRequests = 2; c.maxBatch = 3; c.maxTokens = 320; c.pageLen = 64;
@@ -382,6 +484,9 @@ static void InvalidInputs() {
         Require(ok, "invalid configuration accepted");
     };
     auto bad = c; bad.residentTokens = bad.maxSelected - 1; rejected(bad);
+    bad = c; bad.maxQueries = 0; rejected(bad);
+    bad = c; bad.maxQueries = 3; rejected(bad);
+    bad = c; bad.maxQueries = 2147483647; rejected(bad);
     bad = c; bad.hostBudgetBytes = 1; rejected(bad);
     bad = c; bad.keyRowBytes = size_t(-1); rejected(bad);
     KvMemSparseCache cache(c); Stream stream;
@@ -396,6 +501,21 @@ static void InvalidInputs() {
     cache.ClearErrors(stream.s); ids.Put({0}); pos.Put({c.maxTokens});
     cache.Write(ids.p, pos.p, key.p, value.p, 1, stream.s); stream.Sync();
     Require(Read(cache.DeviceErrors(), 1)[0] == 4, "invalid append handling");
+    KvMemSparseConfig grouped = c; grouped.maxQueries = 2; grouped.maxBatch = 3;
+    KvMemSparseCache unionCache(grouped); Fill(unionCache, grouped);
+    std::vector<KvMemSparseQuery> queries(3);
+    for (auto &query : queries) query = {unionCache.DeviceHostKey(0), nullptr, nullptr, nullptr, 16, 8};
+    unionCache.ResolveQueries(queries.data(), 3, stream.s); stream.Sync();
+    Require(Read(unionCache.DeviceErrors(), 1)[0] == 1 &&
+            Read(unionCache.Lengths(), 3) == std::vector<int>(3, 0), "excess owner queries accepted");
+    unionCache.ClearErrors(stream.s); queries[1].count = grouped.maxSelected + 1;
+    unionCache.ResolveQueries(queries.data(), 2, stream.s); stream.Sync();
+    Require(Read(unionCache.DeviceErrors(), 1)[0] == 2 &&
+            Read(unionCache.Lengths(), 2) == std::vector<int>(2, 0), "invalid sibling count accepted");
+    unionCache.ClearErrors(stream.s); queries[1].count = 8;
+    unionCache.ResolveQueries(queries.data(), 2, stream.s); stream.Sync();
+    Require(Read(unionCache.DeviceErrors(), 1)[0] == 0 &&
+            Read(unionCache.DeviceStats(), 1)[0].misses == 8, "invalid group changed resident state");
     std::puts("PASS invalid configuration and device metadata guards");
 }
 
@@ -498,6 +618,11 @@ int main(int argc, char **argv) {
         Require(argc == 1 || quick, "unknown argument");
         InvalidInputs();
         PointerBindingTest();
+        for (int queries : {1, 2, 3, 6, 8}) for (bool paged : {false, true}) QueryUnionTest(queries, paged);
+        // Cross kernel argument groups and exercise the large-batch refill path.
+        for (bool paged : {false, true}) QueryUnionTest(6, paged, 128);
+        // Multiple refill CTAs must preserve grouped ownership and byte tails.
+        for (bool paged : {false, true}) QueryUnionTest(4, paged, 160, 64);
         PagedSharingTest();
         PagedSharingTest(512); // Two 320-token histories share a smaller physical pool.
         PagedSharingTest(512, 108, 72); // Block-scaled FP4 K/V rows use different copy widths.
@@ -516,6 +641,7 @@ int main(int argc, char **argv) {
         }
         StorageTest(1, 1, 200003, 2048, 4096, 384, 256);
         StorageTest(32, 32, 4099, 257, 512, 192, 128);
+        StorageTest(160, 160, 4099, 257, 512, 192, 128);
         StorageTest(220, 224, 4099, 64, 128, 64, 32);
 #if CUDART_VERSION >= 12000
         for (bool fp8 : {false, true}) {

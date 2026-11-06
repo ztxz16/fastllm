@@ -229,7 +229,9 @@ class AutotuneTest(unittest.TestCase):
         self.ram = {'total': 32 * GiB, 'available': 30 * GiB}
         with tempfile.TemporaryDirectory() as d:
             Path(d, "config.json").write_text(json.dumps({"model_type": "qwen4_exp"}))
-            args = make_normal_parser("test").parse_args([d, "--auto", "--dspark", "0"])
+            # Pin the slab budget: Qwen3.8 may adjust its automatic default after planning.
+            args = make_normal_parser("test").parse_args(
+                [d, "--auto", "--dspark", "0", "--cuda_slab", "0"])
             runtime = MagicMock()
             runtime.get_cuda_memory_info.side_effect = self.gpu.__getitem__
             runtime.model.return_value.get_max_input_len.return_value = 4096
