@@ -98,15 +98,14 @@ FastllmCudaDiskV41Graph::Host FastllmCudaDiskV41Graph::Request() const {
 }
 void FastllmCudaDiskV41Graph::Reset() {
     auto *c = static_cast<disk_v41_graph::Control *>(impl->host);
-    __atomic_store_n(&c->published, 0u, __ATOMIC_RELEASE);
-    __atomic_store_n(&c->completed, 0u, __ATOMIC_RELEASE);
+    HostStoreRelease(&c->published, 0u);
+    HostStoreRelease(&c->completed, 0u);
 }
 bool FastllmCudaDiskV41Graph::Published() const {
-    return __atomic_load_n(&static_cast<disk_v41_graph::Control *>(impl->host)->published,
-                           __ATOMIC_ACQUIRE) != 0;
+    return HostLoadAcquire(&static_cast<disk_v41_graph::Control *>(impl->host)->published) != 0;
 }
 void FastllmCudaDiskV41Graph::Complete() {
-    __atomic_store_n(&static_cast<disk_v41_graph::Control *>(impl->host)->completed, 1u, __ATOMIC_RELEASE);
+    HostStoreRelease(&static_cast<disk_v41_graph::Control *>(impl->host)->completed, 1u);
 }
 std::unique_ptr<FastllmCudaDiskV41Graph>
 FastllmCudaDiskV41Graph::Create(const fastllm::Data &input, const fastllm::Data &index,
@@ -119,7 +118,7 @@ FastllmCudaDiskV41Graph::Create(const fastllm::Data &input, const fastllm::Data 
     if (weightType != DATA_GGUF_FORMAT && !native)
         return {};
     if (input.dataType != BFLOAT16 || input.dims.size() != 2 || input.dims[0] < 1 || input.dims[0] > 32 ||
-        index.dataType != INT32 || score.dataType != FLOAT32 || index.dims != score.dims ||
+        index.dataType != fastllm::INT32 || score.dataType != FLOAT32 || index.dims != score.dims ||
         index.dims.size() != 2 || index.dims[0] != input.dims[0] || index.dims[1] < 1 || index.dims[1] > 16 ||
         (!native && !FastllmCudaV41GGUFSupported(gateType, downType)) || experts < 1 || inter < 1 ||
         input.dims[1] < 1 || input.dims[1] % 32 || inter % 32 || FastllmCudaGraphIsCapturingFast())

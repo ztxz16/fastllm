@@ -3927,7 +3927,7 @@ static bool RunCompleteNativeCache(OffloadGroup &group, DeviceCache &cache, int 
         input.dims.size() != 2 || input.dims[0] < 1 || input.dims[1] != layout.hidden ||
         index.dims.size() != 2 || index.dims[0] != input.dims[0] || index.dims != score.dims ||
         index.dims[1] < 1 || index.dims[1] > kMaxTopK ||
-        index.dataDevice != CUDA || index.dataType != INT32 || score.dataDevice != CUDA ||
+        index.dataDevice != CUDA || index.dataType != fastllm::INT32 || score.dataDevice != CUDA ||
         score.dataType != FLOAT32 || !input.cudaData || !index.cudaData || !score.cudaData ||
         !PackedCacheRows(input) || !PackedCacheRows(index) || !PackedCacheRows(score)) return false;
     auto aliases = [&](const Data &source) {
@@ -3954,8 +3954,8 @@ static bool RunCompleteNativeCache(OffloadGroup &group, DeviceCache &cache, int 
         scores.FakeFrom(score, size_t(first) * topk * sizeof(float)); scores.Resize({rows, topk});
         result.FakeFrom(output, size_t(first) * hidden * sizeof(uint16_t)); result.Resize({rows, hidden});
         allocate(quantized, BFLOAT16, {rows, hidden}); allocate(gate, BFLOAT16, {routes, layout.inter});
-        allocate(partial, FLOAT32, {routes, hidden}); allocate(slots, INT32, {routes});
-        allocate(routeMap, INT32, {routes});
+        allocate(partial, FLOAT32, {routes, hidden}); allocate(slots, fastllm::INT32, {routes});
+        allocate(routeMap, fastllm::INT32, {routes});
         PrepareCompleteNativeRoutes<<<1, 256, 0, cudaStreamPerThread>>>(
             static_cast<const int32_t *>(ids.cudaData), cache.keyToSlot,
             static_cast<int32_t *>(slots.cudaData), static_cast<int32_t *>(routeMap.cudaData),
@@ -4356,8 +4356,8 @@ bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int 
             : FastllmCudaMoeGGUFCacheBatchWorkspaceBytes(hidden, layout.inter, rows, topk);
         if (groupedEnabled && !layout.planarMxfp4) {
             const size_t rawBytes = size_t(routes) * 2 * layout.inter * sizeof(uint16_t);
-            allocate(work.batchWorkspace, INT8, {int(std::max(bytes, rawBytes))});
-        } else if (batchGGUF && bytes) allocate(work.batchWorkspace, INT8, {int(bytes)});
+            allocate(work.batchWorkspace, fastllm::INT8, {int(std::max(bytes, rawBytes))});
+        } else if (batchGGUF && bytes) allocate(work.batchWorkspace, fastllm::INT8, {int(bytes)});
     }
     const int admissionSlots = !work.cache ? 0 : work.cache->layerSlots.empty()
         ? work.cache->slots : work.cache->layerSlots[work.table].count;

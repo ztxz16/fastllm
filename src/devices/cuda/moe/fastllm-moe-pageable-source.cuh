@@ -91,7 +91,7 @@ struct PageableExpertSource {
             unsigned idle = 0;
             auto lastActive = std::chrono::steady_clock::now();
             while (!stopping.load(std::memory_order_acquire)) {
-                if (!__atomic_load_n(&host->published, __ATOMIC_ACQUIRE)) {
+                if (!fastllm::cuda::LoadHostSignal(&host->published)) {
                     if (++idle == 512) {
                         idle = 0;
                         const auto quiet = std::chrono::steady_clock::now() - lastActive;
@@ -113,8 +113,8 @@ struct PageableExpertSource {
                 if (valid) for (int i = 0; i < count; ++i) Stage(table, host->experts[i], i);
                 else { host->count = 0; invalid.store(true, std::memory_order_release); }
                 lastActive = std::chrono::steady_clock::now();
-                __atomic_store_n(&host->published, 0u, __ATOMIC_RELEASE);
-                __atomic_store_n(&host->ready, 1u, __ATOMIC_RELEASE);
+                fastllm::cuda::StoreHostSignal(&host->published, 0u);
+                fastllm::cuda::StoreHostSignal(&host->ready, 1u);
             }
         });
         std::fprintf(stderr, "[Fastllm] Pageable expert source on cuda:%d: %.2f MiB bounded mapped staging for cache, dynamic routing and CUDA graphs.\n",

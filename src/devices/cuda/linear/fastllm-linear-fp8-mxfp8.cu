@@ -377,7 +377,7 @@ extern "C" bool FastllmCudaTryFp8DraftHead(const fastllm::Data &input,
     if (totalBytes > INT_MAX) return false;
     // A shared temporary buffer can grow after capture and invalidate replay
     // addresses. Pooled Data storage is instead retained by the graph owner.
-    Data scratchData(INT8, {int(totalBytes)});
+    Data scratchData(fastllm::INT8, {int(totalBytes)});
     scratchData.ToDevice(CUDA, input.dataDeviceIds, false);
     scratchData.Allocate(false);
     auto *scratch = static_cast<uint8_t *>(scratchData.cudaData);

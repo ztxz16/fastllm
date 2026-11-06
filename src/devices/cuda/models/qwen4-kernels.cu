@@ -5245,7 +5245,7 @@ bool FastllmCudaQwen4CausalPrefill(const fastllm::Data &query, const fastllm::Da
 #else
     using namespace fastllm;
     if (query.dataType != FLOAT16 || key.dataType != FLOAT16 || value.dataType != FLOAT16 ||
-        indices.dataType != INT32 || query.dims.size() != 3 || key.dims.size() != 3 ||
+        indices.dataType != fastllm::INT32 || query.dims.size() != 3 || key.dims.size() != 3 ||
         value.dims != key.dims || indices.dims.size() != 2 || groups <= 0 ||
         query.dims[0] != key.dims[0] * groups || query.dims[2] != key.dims[2] ||
         query.dims[1] != indices.dims[0] || query.dims[2] <= 0 || query.dims[2] > 256 ||
@@ -5283,12 +5283,12 @@ bool FastllmCudaQwen4CausalPrefill(const fastllm::Data &query, const fastllm::Da
             static_cast<const half *>(query.cudaData) + size_t(start) * dim,
             size_t(rows) * dim * 2, size_t(n) * dim * 2, heads,
             cudaMemcpyDeviceToDevice, stream) == cudaSuccess, "QSA query slice failed");
-        Data selected(INT32, {n, width}, CUDA,
+        Data selected(fastllm::INT32, {n, width}, CUDA,
             static_cast<int32_t *>(indices.cudaData) + size_t(start) * width);
         selected.cudaDataBorrowed = true;
         selected.dataDeviceIds = {device};
         if (part == 0) {
-            Data prefixIds(INT32, {1, denseContextLimit});
+            Data prefixIds(fastllm::INT32, {1, denseContextLimit});
             prefixIds.Allocate();
             for (int i = 0; i < denseContextLimit; ++i) ((int32_t *)prefixIds.cpuData)[i] = i;
             prefixIds.ToDevice(CUDA, std::vector<int>{device});

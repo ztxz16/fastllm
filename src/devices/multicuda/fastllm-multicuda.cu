@@ -3431,6 +3431,7 @@ const void *FastllmTP2P2PExchangeHostPointer(
     while (hostSlot.sequences[peerRank].load(std::memory_order_acquire) !=
            sequence) {
         if ((++spins & 1023U) == 0) {
+#ifdef FASTLLM_USE_NCCL
             // Share the NCCL group's cancellation state. A rank failure must
             // also release peers waiting in the eager P2P pointer exchange.
             if (g_ncclSubmitRendezvous && !g_ncclSubmitRendezvous->Error().empty()) {
@@ -3438,6 +3439,7 @@ const void *FastllmTP2P2PExchangeHostPointer(
                 FastllmCudaSetThreadError();
                 return nullptr;
             }
+#endif
             std::this_thread::yield();
         }
     }
@@ -4109,7 +4111,11 @@ static void FastllmNcclAllReduceImpl(void* data, void* dest, int count,
 }
 
 void FastllmNcclAbort(const char *reason) {
+#ifdef FASTLLM_USE_NCCL
     if (g_ncclSubmitRendezvous) g_ncclSubmitRendezvous->Abort(reason);
+#else
+    (void)reason;
+#endif
 }
 
 void FastllmNcclAllReduce(void* data, void* dest, int count, int dataType, int deviceId) {

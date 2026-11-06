@@ -125,7 +125,7 @@ bool FastllmCudaV41Mxfp4Linear(const fastllm::Data &input, const fastllm::Data &
     const size_t workspaceBytes = Gemm::get_workspace_size(Arguments(nullptr,nullptr,nullptr,nullptr,nullptr,m,n,k));
     const size_t total = ab + bb + as + bs + workspaceBytes;
     if (total > INT_MAX) return false;
-    scratch.dataType = INT8;
+    scratch.dataType = fastllm::INT8;
     scratch.UpdateUnitSize();
     scratch.Resize({int(total)});
     scratch.ToDevice(CUDA, {FastllmCudaGetDevice()}, false);

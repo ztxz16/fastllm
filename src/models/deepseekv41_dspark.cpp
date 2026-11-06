@@ -2368,7 +2368,7 @@ namespace fastllm {
             // upload this small draft activation before capture/replay; the
             // backbone and Markov head can still use the same complete graph.
             if (graphEligible && embedded.dataDevice == DataDevice::CPU)
-                embedded.ToDevice(DataDevice::CUDA, {graphDevices.front()});
+                embedded.ToDevice(DataDevice::CUDA, std::vector<int>{graphDevices.front()});
         }
         std::vector<void*> cachePointers;
         for (auto &layer : dspark.layers) cachePointers.push_back(layer.windowKV.cudaData);

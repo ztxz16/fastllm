@@ -1423,7 +1423,7 @@ bool FastllmCudaMergeMOEV41NativeResident(
     using fastllm_gguf_moe::AllocateTensor;
     const int device = FastllmCudaGetDevice();
     if (input.dataType != BFLOAT16 || input.dims.size() != 2 || input.dims[0] < 1 || input.dims[0] > 8 ||
-        indices.dataType != INT32 || scores.dataType != FLOAT32 || indices.dims != scores.dims ||
+        indices.dataType != fastllm::INT32 || scores.dataType != FLOAT32 || indices.dims != scores.dims ||
         indices.dims.size() != 2 || indices.dims[0] != input.dims[0] ||
         indices.dims[1] < 1 || indices.dims[1] > 16 || !std::isfinite(swigluLimit) || swigluLimit < 0)
         return false;

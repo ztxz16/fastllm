@@ -1103,10 +1103,8 @@ void FinishNativeMoeMailbox(DeviceCache &cache, bool observe) {
 }
 #else
 void FinishNativeMoeMailbox(DeviceCache &, bool) {}
-#ifdef USE_NUMAS
 bool TryNativeMoeMailbox(OffloadGroup &, DeviceCache &, int,
         const fastllm::Data &, const fastllm::Data &, const fastllm::Data &, fastllm::Data &,
         fastllm::Data **, int, int, const std::function<void()> &, const std::vector<int> *) { return false; }
-#endif
 #endif
 } // namespace

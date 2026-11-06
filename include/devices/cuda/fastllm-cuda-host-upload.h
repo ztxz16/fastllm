@@ -13,12 +13,35 @@
 #include <thread>
 #include <vector>
 #include <deque>
+#ifdef _MSC_VER
+#include <intrin.h>
+#endif
 #if defined(__linux__)
 #include <pthread.h>
 #include <sched.h>
 #endif
 
 namespace fastllm { namespace cuda {
+
+// These words are also published by the GPU after a system fence. Keep the
+// host operations lock-free and preserve their acquire/release ordering.
+inline unsigned LoadHostSignal(const unsigned *value) {
+#ifdef _MSC_VER
+    static_assert(sizeof(unsigned) == sizeof(long), "32-bit mapped signal required");
+    return static_cast<unsigned>(_InterlockedCompareExchange(
+        reinterpret_cast<volatile long *>(const_cast<unsigned *>(value)), 0, 0));
+#else
+    return __atomic_load_n(value, __ATOMIC_ACQUIRE);
+#endif
+}
+
+inline void StoreHostSignal(unsigned *target, unsigned value) {
+#ifdef _MSC_VER
+    _InterlockedExchange(reinterpret_cast<volatile long *>(target), static_cast<long>(value));
+#else
+    __atomic_store_n(target, value, __ATOMIC_RELEASE);
+#endif
+}
 
 // One helper per device, shared by graph staging and all upload streams.
 // Large copies use two CPUs; small copies stay inline. The helper sleeps
@@ -233,7 +256,7 @@ public:
             work_.wait(lock, [&] { return stopping_ || !jobs_.empty(); });
             if (stopping_) return;
             auto job = std::find_if(jobs_.begin(), jobs_.end(), [](const Job &j) {
-                return __atomic_load_n(&j.signal->consumed, __ATOMIC_ACQUIRE) == j.generation - 1;
+                return LoadHostSignal(&j.signal->consumed) == j.generation - 1;
             });
             if (job == jobs_.end()) {
                 lock.unlock(); std::this_thread::yield(); lock.lock(); continue;
@@ -242,7 +265,7 @@ public:
             jobs_.erase(job); space_.notify_one();
             lock.unlock();
             copies_->Copy(copy.destination, copy.source, copy.bytes);
-            __atomic_store_n(&copy.signal->ready, copy.generation, __ATOMIC_RELEASE);
+            StoreHostSignal(&copy.signal->ready, copy.generation);
             lock.lock();
         }
     }) {}
@@ -333,7 +356,7 @@ public:
             if (consumed != CUDA_SUCCESS || recorded != cudaSuccess) {
                 const auto completed = cudaStreamSynchronize(stream);
                 if (completed == cudaSuccess)
-                    __atomic_store_n(&s.host->consumed, generation, __ATOMIC_RELEASE);
+                    StoreHostSignal(&s.host->consumed, generation);
                 if (status == cudaSuccess) status = completed != cudaSuccess ? completed :
                     recorded != cudaSuccess ? recorded : cudaErrorUnknown;
             }
