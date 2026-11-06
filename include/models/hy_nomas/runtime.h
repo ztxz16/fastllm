@@ -3,6 +3,7 @@
 // HY-Nomas continuous-tensor inference. This API deliberately has no dependency
 // on a Python tensor library or on the token sampling / LLM KV-cache APIs.
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -20,7 +21,10 @@ class TensorPool {
 public:
     // Optional bounded reuse of freed blocks on their original inference thread.
     // Disabled by default; the host cache cannot be used during CUDA capture.
-    explicit TensorPool(int device, size_t cacheBytes=0);
+    // maxBytes bounds the CUDA pool itself, including unused reserved pages.
+    // Zero preserves the existing unlimited behavior.
+    // reserve commits maxBytes at construction and retains the backing pages.
+    explicit TensorPool(int device, size_t cacheBytes=0, size_t maxBytes=0, bool reserve=false);
     class Scope {
     public:
         explicit Scope(const TensorPool &);
@@ -156,6 +160,21 @@ private:
     Numerics numerics_;
 };
 
+// One quota shared by all components and TP ranks of an inference service.
+// Only immutable weight cache bytes count here; callers reserve separate space
+// for small disk staging buffers and their other host allocations.
+class HostMemoryBudget {
+public:
+    explicit HostMemoryBudget(size_t bytes):limit_(bytes) {}
+    bool acquire(size_t bytes);
+    void release(size_t bytes) { used_.fetch_sub(bytes); }
+    size_t used() const { return used_.load(); }
+    size_t limit() const { return limit_; }
+private:
+    const size_t limit_;
+    std::atomic<size_t> used_{0};
+};
+
 class Weights {
 public:
     Weights(Runtime &runtime, const std::string &path);
@@ -180,9 +199,13 @@ public:
     // Same rank/partition; cache population must be serialized, as for host caches.
     void sharePackedCache(const Weights &source);
     // Retain immutable CPU checkpoint bytes across clear(), preferring pinned
-    // memory. Capped by one quarter of available host RAM; rejected pinning
-    // uses ordinary memory, exhaustion uses files. Zero releases the cache.
+    // memory. Capped by one quarter of available host RAM unless an explicit
+    // shared quota is configured. Rejected pinning uses ordinary memory;
+    // exhaustion uses files. Zero releases the cache.
     void enableHostCache(size_t maxBytes);
+    // Configure before loading. With a quota, uncached weights are read in
+    // 16 MiB chunks, without a resident mmap or a full-tensor host temporary.
+    void setHostMemoryBudget(const std::shared_ptr<HostMemoryBudget> &);
     // Share the immutable CPU cache and its budget with another GPU staging buffer
     // for the same runtime and checkpoint.
     // The callers must serialize cache population.

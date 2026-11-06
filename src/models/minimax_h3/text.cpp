@@ -38,11 +38,15 @@ TextEncoder::TextEncoder(Runtime &rt, const std::string &dir, nomas::ParallelCon
 Tensor TextEncoder::encode(const std::vector<int> &tokens, Trace trace) {
     return encodeVisual(tokens, {}, std::move(trace));
 }
+void TextEncoder::setHostMemoryBudget(const std::shared_ptr<nomas::HostMemoryBudget> &budget) {
+    weights_.setHostMemoryBudget(budget);
+    if(prefetchedWeights_) prefetchedWeights_->shareHostCache(weights_);
+}
 Tensor TextEncoder::encodeVisual(const std::vector<int> &tokens, const std::vector<VisionInput> &images,
                                  Trace trace) {
     if (tokens.empty() || tokens.size() > 65536)
         throw std::invalid_argument("H3 presentation requires 1..65536 tokens");
-    if (parallel_.size() > 1 && !rt_.isFloat32()) {
+    if (!lowMemory_ && parallel_.size() > 1 && !rt_.isFloat32()) {
         // Reserve room for the sharded DiT, replicated VAEs and activations.
         // Re-enable after cancellation/unload; uncached weights still stream.
         weights_.enablePackedCache((size_t(16) << 30) + (size_t(40) << 30) / parallel_.size());
@@ -103,11 +107,12 @@ Tensor TextEncoder::encodeVisual(const std::vector<int> &tokens, const std::vect
         ropePositions = rt_.indices(positions);
     // Populate the CPU cache serially on the first request. Short prompts have
     // too little compute to benefit from an additional staging stream.
-    bool prefetch = prefetchedWeights_ && hostCacheWarm_ && tokens.size() >= 256;
+    bool prefetch = !lowMemory_ && prefetchedWeights_ && hostCacheWarm_ && tokens.size() >= 256;
     auto layerWeights = [&](int layer) -> Weights & {
         return prefetch && layer % 2 ? *prefetchedWeights_ : weights_;
     };
     auto loadLayer = [&](int layer) {
+        auto scope=memoryPool_?std::make_unique<nomas::TensorPool::Scope>(*memoryPool_):nullptr;
         // Only this worker populates the shared CPU cache. Inference reads the
         // other, fully uploaded GPU cache and uses the main thread's cuBLAS handle.
         auto &weights = layerWeights(layer);

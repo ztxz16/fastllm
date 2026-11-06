@@ -36,7 +36,7 @@ endif()
 
 if(UNIT_TEST)
     enable_testing()
-    foreach(test IN ITEMS norm_modulate attention tensor_pool parallel)
+    foreach(test IN ITEMS norm_modulate attention tensor_pool host_budget parallel)
         set(target continuous_${test})
         add_executable(${target} ${PROJECT_SOURCE_DIR}/test/hy_nomas/test_${test}.cpp)
         target_include_directories(${target} PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})

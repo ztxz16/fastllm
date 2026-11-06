@@ -98,6 +98,20 @@ Tensor Transformer::timeEmbedding(const std::vector<float> &times) {
     x = fp32_.activation(fullWeights_.linear(x, "time_embedder.linear_1"));
     return fullWeights_.linear(x, "time_embedder.linear_2");
 }
+void Transformer::setHostMemoryBudget(const std::shared_ptr<nomas::HostMemoryBudget> &budget) {
+    hostBudget_=budget;
+    weights_.setHostMemoryBudget(budget);
+    fullWeights_.setHostMemoryBudget(budget);
+    if(lora_) lora_->setHostMemoryBudget(budget);
+}
+void Transformer::setLowMemory(bool enabled) {
+    if (enabled == lowMemory_) return;
+    unload();
+    lowMemory_ = enabled;
+    hostCacheEnabled_ = false;
+    weights_.enableHostCache(0);
+    if (lora_) lora_->enableHostCache(enabled ? size_t(2) << 30 : 0);
+}
 Tensor Transformer::projectModulation(int layer, const Tensor &input) {
     auto p = "transformer_blocks." + std::to_string(layer) + ".adaln_proj.linear";
     auto x = parallel_.column(weights_, input, p, true);
@@ -180,6 +194,10 @@ Tensor Transformer::refine(const Tensor &input) {
                     attention(rt_.rms(x, weights_.get(p + ".norm1.weight"), config_.normEps), p + ".attn"));
         x = rt_.add(x,
                     feedForward(rt_.rms(x, weights_.get(p + ".norm2.weight"), config_.normEps), p + ".ff"));
+        if (lowMemory_) {
+            weights_.erasePrefix(p + ".");
+            if (lora_) lora_->erasePrefix(p + ".");
+        }
     }
     return rt_.rms(x, weights_.get("token_refiner.final_norm.weight"), config_.finalEps);
 }
@@ -236,8 +254,14 @@ void Transformer::prepare(const std::vector<std::vector<float>> &plans,
     outputModulation_ = rows.size() == 1 ? rows[0] : rt_.concat(rows);
     weights_.erasePrefix("norm_out.linear.");
     // FP32 diagnostics can reuse packed weights across steps; BF16 weights stay resident.
-    if (rt_.isFloat32())
+    if (rt_.isFloat32() && !lowMemory_)
         weights_.enablePackedCache(size_t(16) << 30);
+    if (lowMemory_ && !hostCacheEnabled_) {
+        // AdaLN is used only to prepare the tiny timestep tables; do not let
+        // its 24 GiB of projections crowd out repeatedly streamed block weights.
+        weights_.enableHostCache(size_t(48) << 30);
+        hostCacheEnabled_ = true;
+    }
     plans_ = plans;
 }
 std::pair<Tensor, Tensor> Transformer::forward(const Tensor &video, const Tensor &audio, const Tensor &text,
@@ -262,8 +286,10 @@ std::pair<Tensor, Tensor> Transformer::forward(const Tensor &video, const Tensor
         x = block(i, x, modulation_[i], idx, rope.first, rope.second);
         if (trace)
             trace("block." + std::to_string(i), x);
-        if (rt_.isFloat32())
+        if (rt_.isFloat32() || lowMemory_)
             weights_.erasePrefix("transformer_blocks." + std::to_string(i) + ".");
+        if (lowMemory_ && lora_)
+            lora_->erasePrefix("transformer_blocks." + std::to_string(i) + ".");
     }
     x = rt_.rmsModulateRows(x, weights_.get("norm_out.norm.weight"), config_.finalEps,
                            outputModulation_, rt_.indices(layout.timeIndices), 0, 1);

@@ -32,6 +32,12 @@ VideoVAE::VideoVAE(Runtime &rt, Runtime &full, const std::string &dir)
     if (!full.isFloat32())
         throw std::invalid_argument("video VAE residual runtime must be FP32");
 }
+void VideoVAE::setLowMemory(bool enabled) {
+    if (enabled == lowMemory_) return;
+    unload();
+    lowMemory_ = enabled;
+    weights_.enableHostCache(enabled ? size_t(12) << 30 : 0);
+}
 Tensor VideoVAE::decodeTile(const Tensor &latent, int frames, int height, int width, Trace trace) {
     return decodeTiles(latent, frames, height, width, 1, std::move(trace));
 }
@@ -139,6 +145,11 @@ Tensor VideoVAE::decodeTiles(const Tensor &latent, int frames, int height, int w
         x = rt_.scaledResidual(x, output, fullWeights_.get(p + ".scale2"));
         if (trace)
             trace("block." + std::to_string(layer), x);
+        if (lowMemory_) {
+            weights_.erasePrefix(p + ".");
+            fullWeights_.erasePrefix(p + ".");
+            if (!qkv_.empty()) qkv_[layer] = {};
+        }
     }
     std::vector<Tensor> pixels;
     for (int i = 0; i < batch; ++i)
@@ -319,20 +330,26 @@ Tensor VideoVAE::decodeDevice(const VideoTensor &z, std::function<void(int, int)
                               std::function<void(const Tensor &)> onFrames) {
     auto shape = decodedVideoShape(z);
     int chunks = shape.chunks, frames = shape.frames, framePixels = shape.framePixels;
-    Tensor out(int(framePixels * frames), 3, DType::FP32), overlap;
+    // File output only needs the current 17-frame chunk. Keeping all decoded
+    // FP32 frames on the GPU made memory grow with duration even with tiling.
+    Tensor out, overlap;
+    if (!lowMemory_ || !onFrames)
+        out = Tensor(int(framePixels * frames), 3, DType::FP32);
     for (int i = 0; i < chunks; ++i) {
         auto clip = decodeClip(crop(z, i * 5, 7, 0, z.height, 0, z.width), [&] {
             if (progress)
                 progress(i, chunks);
         });
-        auto chunk = out.rowSlice(i * 17 * framePixels, std::min(17, frames - i * 17) * framePixels);
+        int rows = std::min(17, frames - i * 17) * framePixels;
+        auto chunk = out.data ? out.rowSlice(i * 17 * framePixels, rows) : Tensor(rows, 3, DType::FP32);
         rt_.copyVideoFrames(chunk, clip, overlap.rows ? &overlap : nullptr, framePixels, 3);
         if (onFrames)
             onFrames(chunk);
         overlap = clip.rowSlice(23 * framePixels, 5 * framePixels);
     }
     if (frames > chunks * 17) {
-        auto tail = out.rowSlice(chunks * 17 * framePixels, (frames - chunks * 17) * framePixels);
+        int rows = (frames - chunks * 17) * framePixels;
+        auto tail = out.data ? out.rowSlice(chunks * 17 * framePixels, rows) : Tensor(rows, 3, DType::FP32);
         rt_.copyVideoFrames(tail, overlap, nullptr, framePixels, 0);
         if (onFrames)
             onFrames(tail);

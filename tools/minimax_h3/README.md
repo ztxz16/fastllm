@@ -114,6 +114,80 @@ LoRA 随基座投影切分：列并行复制 A、切分 B；行并行切分 A、
 PyTorch CUDA 序列不同，同一个 seed 不承诺产生相同视频。`--model` 指向原版 H3 目录时，
 继续使用原采样器和默认参数。数值验证与生成实测见 [VALIDATION.md](VALIDATION.md)。
 
+## 显存、内存预算与磁盘加载
+
+CLI 与 HTTP 服务均支持以下可选参数，生成请求不能修改进程预算：
+
+| 参数 | 含义 |
+| --- | --- |
+| `--gpu-memory-limit GIB` | 每张 GPU 的预算；`0`／省略保留原有策略，非零须大于 1 |
+| `--host-memory-limit GIB` | 整个服务共享的主机内存预算；`0`／省略保留原有缓存策略，非零至少为 2 |
+
+```bash
+build-h3/src/models/minimax_h3/minimax_h3_generate \
+  --model /path/to/Pika-H3-Flex --base-model /path/to/MiniMax-H3 \
+  --prompt 'A small orange cat walks through a sunny garden.' \
+  --width 832 --height 480 --frames 124 \
+  --gpu-memory-limit 4 --host-memory-limit 2 --output cat.mp4
+
+# 双卡：每卡各有 4 GiB 预算，所有组件和 TP rank 共享一份 CPU 缓存预算。
+build-h3/src/models/minimax_h3/minimax_h3_server \
+  --model /path/to/Pika-H3-Flex --base-model /path/to/MiniMax-H3 \
+  --devices 0,1 --gpu-memory-limit 4 --host-memory-limit 4 --port 8009
+```
+
+`ftllm launch` 的视频启动项提供「每卡显存预算」和「主机内存预算」。`/health` 返回
+`gpu_memory_limit_gib`、`host_memory_limit_gib`、`gpu_memory_reserved` 和 `layer_streaming`。
+C++ 调用方在首次生成前调用 `pipeline.setGpuMemoryLimit(4)` 和 `pipeline.setHostMemoryLimit(2)`。
+
+**默认模式不改变原来的驻留、预取、精度和计算路径。** 显式 GPU 预算较充足时也保留原有
+执行方式：当前 BF16 主干／非 FP32 视频 VAE 的保守阈值为单卡 60 GiB、TP 每卡 48 GiB。
+较小预算才逐层换入文本、DiT、Pika LoRA 和视频 VAE，关闭双层预取及额外的 GPU 权重缓存。
+单独限制主机内存不会开启 GPU 逐层换入。精度、采样步数和分辨率不会自动改变。
+
+显式 GPU 预算使用独立 CUDA 内存池，上限为 `预算 − 1 GiB`，包括权重、dtype 转换、
+激活和注意力工作区。启动时实际申请整个池，再回收为池内可复用空间，并保留物理页；
+层间切换、请求结束及同步时不把这部分显存还给其他进程。预留失败在服务就绪前报错。
+另外的 1 GiB 是 CUDA 上下文、cuBLAS/NCCL、池外运行时的开销余量，并非额外可用的权重空间。
+显存池需要工具链／驱动支持 `cudaMemPoolProps::maxSize`，已在 CUDA 13.0 验证；旧工具链
+仍可运行默认模式。物理上限与回收阈值的区别见
+[CUDA 内存池 API](https://docs.nvidia.com/cuda/cuda-runtime-api/cuda_runtime_api/group__CUDART__MEMORY__POOLS.html)。
+
+显式主机内存预算中，`预算 − 2 GiB` 是所有组件、分片和 TP rank **合计**的权重缓存上限，
+优先使用锁页内存；分配失败或配额用尽则直接读文件。`2` 表示零权重缓存。
+未缓存的权重按最多 16 MiB 的缓冲区读取并上传，TP 只读本 rank 的切片，既不映射整份模型，
+也不建立整层 CPU 临时副本；无需转换或另存模型。操作系统可自行缓存、回收文件页。
+缓存很小时，速度依赖磁盘、文件页缓存和 PCIe 带宽。
+
+这些是**模型内存管理预算，不是 OS/cgroup 对整个进程的硬隔离**：主机的 2 GiB 是运行时、
+分块上传和媒体处理的余量，第三方库、FFmpeg、超长参考素材及 C++ 调用者保留的完整 RGB
+输出不属于权重配额。GPU 的库开销也随驱动和设备变化。部署时应给系统和其他服务留下余量。
+低显存文件输出只保留当前时间块，不在 GPU 上保存整段 FP32 视频。
+预算不足会明确报错，提示提高预算或降低输入尺寸／时长；HTTP worker 可继续处理后续请求。
+
+### 最低显存如何计算
+
+以下按实际 H3／Pika 权重形状、BF16 主干、FP16 视频 VAE 计算，不包含量化：
+
+| 部分 | 单块权重占用 | 处理方式 |
+| --- | ---: | --- |
+| 文本编码器词嵌入 | 1483.75 MiB | 使用后释放；这是文本阶段最大的单块 |
+| 文本编码器一层 | 约 930 MiB | 逐层模式关闭双层预取和 GPU 权重缓存 |
+| DiT 一层 | 约 735 MiB | AdaLN 已预计算并释放；50 层只驻留当前层 |
+| Pika 一层 LoRA | 25.375 MiB | 随主干层一起释放 |
+| 视频 VAE 解码一层 | 约 128 MiB | 逐层释放，包括打包的 QKV |
+
+DiT 主矩阵按 `2 × (4HA + 3HF)` 字节计算：`H=5376`、`A=56×128=7168`、
+`F=14336`，结果为 735 MiB，另有少量归一化参数。
+实际峰值还必须加上活跃张量、预计算的时间调制表、加载时的 dtype 转换和内存池碎片。
+默认 832×480、124 帧的潜空间有 `37×15×26=14430` 个视频 token，另加音频和文本 token。
+以 128 个文本 token 估算，打包序列约 14972 行，仅 Q/K 归一化时的输入和 Q/K/V 临时量
+就约 `2×N×(2H+5A)=1.30 GiB`，因此单层权重的 760 MiB 不能代表最低显存。
+
+各阶段串行，估算应取文本、DiT、VAE 的**阶段峰值最大值**，再加 CUDA／库开销，
+不必把三个完整模型相加。高分辨率、长视频、长提示词、多参考素材以及 H3 更多步数的调制表
+都会提高峰值。实测值与适用范围见 [VALIDATION.md](VALIDATION.md)。
+
 ## 命令行
 
 ```bash

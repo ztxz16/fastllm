@@ -14,6 +14,7 @@ int main(int argc, char **argv) {
                            initialAudio, vaePrecision, pika, baseModel;
         std::vector<int> devices{0};
         bool fp32 = false, stepsSpecified = false;
+        double gpuMemoryLimit = 0, hostMemoryLimit = 0;
         bool widthSpecified = false, heightSpecified = false;
         bool referenceImageSpecified = false, referenceVideoSpecified = false;
         std::string firstFrame, lastFrame;
@@ -51,6 +52,10 @@ int main(int argc, char **argv) {
                 options.seed = std::stoull(v);
             else if (arg == "--device" || arg == "--devices")
                 devices = fastllm::nomas::parseParallelDevices(v);
+            else if (arg == "--gpu-memory-limit")
+                gpuMemoryLimit = parseGpuMemoryLimit(v);
+            else if (arg == "--host-memory-limit")
+                hostMemoryLimit = parseHostMemoryLimit(v);
             else if (arg == "--trace")
                 traceDirectory = v;
             else if (arg == "--precision") {
@@ -137,6 +142,8 @@ int main(int argc, char **argv) {
         };
         auto video = read(initialVideo), audio = read(initialAudio);
         Pipeline pipeline(model, devices, fp32, videoType);
+        pipeline.setGpuMemoryLimit(gpuMemoryLimit);
+        pipeline.setHostMemoryLimit(hostMemoryLimit);
         if (!pika.empty()) pipeline.loadPika(pika);
         std::string last;
         int current = -1;

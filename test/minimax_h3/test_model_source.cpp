@@ -1,4 +1,5 @@
 #include "models/minimax_h3/model_source.h"
+#include "models/minimax_h3/runtime.h"
 #include "json11.hpp"
 #include <filesystem>
 #include <fstream>
@@ -66,6 +67,18 @@ struct Temporary {
 
 int main() {
     try {
+        check(parseGpuMemoryLimit("0") == 0, "default memory policy changed");
+        check(parseGpuMemoryLimit("4.5") == 4.5, "fractional GiB budget lost");
+        for (const char *value : {"-1", "nan", "inf", "1048577"})
+            reject([&] { parseGpuMemoryLimit(value); }, "finite GiB");
+        for (const char *value : {"0.5", "1"})
+            reject([&] { parseGpuMemoryLimit(value); }, "reserve");
+        reject([&] { parseGpuMemoryLimit("4GB"); }, "GiB number");
+        reject([&] { parseGpuMemoryLimit("abc"); }, "GiB number");
+        reject([&] { parseGpuMemoryLimit("1e999"); }, "GiB number");
+        check(parseHostMemoryLimit("0") == 0 && parseHostMemoryLimit("2") == 2 && parseHostMemoryLimit("2.5") == 2.5, "host memory policy");
+        for(const char *value : {"-1", "nan", "inf", "1048577", "0.5", "1", "1GB", "abc", "1e999"})
+            reject([&] { parseHostMemoryLimit(value); }, "GiB number");
         Temporary tmp;
         auto original = tmp.path / "MiniMax-H3", pika = tmp.path / "arbitrary-name";
         base(original);

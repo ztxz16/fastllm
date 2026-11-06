@@ -45,5 +45,25 @@ int main() {
     }
     if(rt.download(survivor)!=std::vector<float>(257*16,4.f))
         throw std::runtime_error("tensor did not retain allocation pool");
+#if CUDART_VERSION >= 12080
+    {
+        TensorPool limited(0,0,256u<<20,true);
+        if(limited.reusableBytes() < (256u<<20)) throw std::runtime_error("GPU reservation is not physically backed");
+        TensorPool::Scope scope(limited);
+        Tensor first(12288,4096,DType::BF16),second(12288,4096,DType::BF16);
+        bool rejected=false;
+        try { Tensor third(12288,4096,DType::BF16); }
+        catch(const std::runtime_error &e) {
+            rejected=std::string(e.what()).find("GPU memory budget exhausted")!=std::string::npos;
+        }
+        if(!rejected) throw std::runtime_error("CUDA pool exceeded its physical memory limit");
+        first={};second={};rt.synchronize();
+        if(limited.reusableBytes() < (256u<<20)) throw std::runtime_error("idle reserved GPU pages were released");
+        second=Tensor(12288,4096,DType::BF16);
+        if(!second.data) throw std::runtime_error("bounded pool could not recover after release");
+    }
+    // The optional scope must not restrict unrelated allocations afterwards.
+    { Tensor unrestricted(36864,4096,DType::BF16); rt.synchronize(); }
+#endif
     std::cout<<"PASS bounded tensor reuse, stream order, snapshots and pool lifetime\n";
 } catch(const std::exception &e) {std::cerr<<e.what()<<'\n';return 1;}}

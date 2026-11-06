@@ -10,6 +10,8 @@ public:
                   nomas::RowReduction);
     ~ParallelModel();
     void loadPika(const std::string &);
+    void setMemoryLimit(size_t poolBytes, const std::shared_ptr<nomas::TensorPool> &rootPool, bool streaming);
+    void setHostMemoryBudget(const std::shared_ptr<nomas::HostMemoryBudget> &);
     Tensor encode(const std::vector<int> &, const std::vector<VisionInput> &, Trace);
     void prepare(const std::vector<std::vector<float>> &, bool reference,
                  std::function<void(int,int)>);

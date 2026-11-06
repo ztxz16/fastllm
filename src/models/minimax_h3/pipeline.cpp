@@ -10,6 +10,37 @@
 
 namespace fastllm {
 namespace minimax_h3 {
+namespace {
+double validateGpuMemoryLimit(double gib) {
+    if (!std::isfinite(gib) || gib < 0 || gib > 1048576)
+        throw std::invalid_argument("gpu-memory-limit must be a finite GiB value between 0 and 1048576");
+    if (gib != 0 && gib <= 1)
+        throw std::invalid_argument("gpu-memory-limit must exceed the 1 GiB CUDA/library reserve");
+    return gib;
+}
+double validateHostMemoryLimit(double gib) {
+    if (!std::isfinite(gib) || gib < 0 || gib > 1048576 || (gib > 0 && gib < 2))
+        throw std::invalid_argument("host-memory-limit must be 0 or a finite GiB number of at least 2");
+    return gib;
+}
+double parseMemoryLimit(const std::string &value, const std::string &name) {
+    size_t used = 0;
+    double gib = 0;
+    try {
+        gib = std::stod(value, &used);
+    } catch (const std::exception &) {
+        throw std::invalid_argument(name + " must be a finite GiB number");
+    }
+    if (used != value.size()) throw std::invalid_argument(name + " must be a GiB number");
+    return gib;
+}
+} // namespace
+double parseGpuMemoryLimit(const std::string &value) {
+    return validateGpuMemoryLimit(parseMemoryLimit(value, "gpu-memory-limit"));
+}
+double parseHostMemoryLimit(const std::string &value) {
+    return validateHostMemoryLimit(parseMemoryLimit(value, "host-memory-limit"));
+}
 void GenerateOptions::validate() const {
     if (prompt.empty() || prompt.size() > 32768)
         throw std::invalid_argument("prompt must contain 1..32768 UTF-8 bytes");
@@ -137,6 +168,43 @@ Pipeline::Pipeline(const std::string &dir, const std::vector<int> &devices, bool
     rt_.activate();
 }
 Pipeline::~Pipeline() = default;
+void Pipeline::setGpuMemoryLimit(double gib) {
+    validateGpuMemoryLimit(gib);
+    if (gib == 0) return;
+    rt_.activate();
+    int device = 0;
+    auto status = cudaGetDevice(&device);
+    if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
+    size_t bytes = size_t(gib * double(size_t(1) << 30)) - (size_t(1) << 30);
+    // Runtime workspaces and CUDA/library state precede this scope. Every model
+    // tensor, conversion scratch buffer and attention workspace is pool-bound.
+    memoryPool_ = std::make_shared<nomas::TensorPool>(device, 0, bytes, true);
+    // A generous budget keeps the original resident/prefetched execution path.
+    // Conservative headroom covers the supported H3/Pika working shapes; a
+    // request that exceeds it still fails against the same physical pool cap.
+    lowMemory_ = rt_.isFloat32() || videoRuntime_.isFloat32() || gib < (parallel_ ? 48 : 60);
+    text_.unload();
+    text_.setMemoryPool(memoryPool_);
+    text_.setLowMemory(lowMemory_);
+    transformer_.setLowMemory(lowMemory_);
+    if (referenceTransformer_) referenceTransformer_->setLowMemory(lowMemory_);
+    video_.setLowMemory(lowMemory_);
+    audio_.unload();
+    if (parallel_) parallel_->setMemoryLimit(bytes, memoryPool_, lowMemory_);
+    if (lowMemory_) retainWeights_ = false;
+    rt_.activate();
+}
+void Pipeline::setHostMemoryLimit(double gib) {
+    validateHostMemoryLimit(gib);
+    if (gib == 0) return;
+    hostBudget_ = std::make_shared<nomas::HostMemoryBudget>(size_t((gib - 2) * double(size_t(1) << 30)));
+    text_.setHostMemoryBudget(hostBudget_);
+    transformer_.setHostMemoryBudget(hostBudget_);
+    if (referenceTransformer_) referenceTransformer_->setHostMemoryBudget(hostBudget_);
+    video_.setHostMemoryBudget(hostBudget_);
+    audio_.setHostMemoryBudget(hostBudget_);
+    if (parallel_) parallel_->setHostMemoryBudget(hostBudget_);
+}
 Generation Pipeline::generate(const GenerateOptions &o, Progress progress, Trace trace,
                               const std::vector<float> *initialVideo,
                               const std::vector<float> *initialAudio) {
@@ -158,6 +226,7 @@ Generation Pipeline::generateImpl(const GenerateOptions &o, Progress progress, T
     if (pika && o.steps != 6)
         throw std::invalid_argument("Pika H3 Flex requires exactly 6 inference steps");
     rt_.activate();
+    auto memoryScope = memoryPool_ ? std::make_unique<nomas::TensorPool::Scope>(*memoryPool_) : nullptr;
     auto tick = [&](const std::string &stage, int i, int n) {
         if (progress)
             progress(stage, i, n);
@@ -183,6 +252,8 @@ Generation Pipeline::generateImpl(const GenerateOptions &o, Progress progress, T
             if (!referenceTransformer_)
                 referenceTransformer_ =
                     std::make_unique<Transformer>(rt_, full_, directory_ + "/transformer_ref");
+            referenceTransformer_->setLowMemory(lowMemory_);
+            referenceTransformer_->setHostMemoryBudget(hostBudget_);
             denoiser = referenceTransformer_.get();
         } else if (referenceTransformer_)
             referenceTransformer_->unload();

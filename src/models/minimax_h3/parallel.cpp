@@ -1,4 +1,6 @@
 #include "models/minimax_h3/parallel.h"
+#include <cuda_runtime_api.h>
+#include <stdexcept>
 
 namespace fastllm { namespace minimax_h3 {
 struct ParallelModel::Rank {
@@ -11,6 +13,12 @@ struct ParallelModel::Rank {
     std::unique_ptr<Runtime> videoRuntime;
     std::unique_ptr<VideoVAE> ownedVideo;
     VideoVAE *video;
+    std::shared_ptr<nomas::TensorPool> pool;
+    std::shared_ptr<nomas::HostMemoryBudget> hostBudget;
+    bool streaming=false;
+    std::unique_ptr<nomas::TensorPool::Scope> memoryScope() {
+        return pool ? std::make_unique<nomas::TensorPool::Scope>(*pool) : nullptr;
+    }
     Rank(const std::string &dir,int device,bool fp32,nomas::ParallelContext ctx,DType videoPrecision,VideoVAE &rootVideo)
         :rt(device,fp32),full(device,true),text(rt,dir+"/text_encoder",ctx),
          context(ctx),directory(dir),video(&rootVideo) {
@@ -36,6 +44,29 @@ ParallelModel::~ParallelModel() {
     // Release device caches on their owning streams before stopping workers.
     try { group_.run([&](int rank) { ranks_[rank].reset(); }); } catch(...) {}
 }
+void ParallelModel::setMemoryLimit(size_t bytes,const std::shared_ptr<nomas::TensorPool> &rootPool,bool streaming) {
+    unload();
+    group_.run([&](int rank) {
+        auto &r=*ranks_[rank];
+        int device=0;
+        auto status=cudaGetDevice(&device);
+        if(status!=cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
+        r.pool=rank ? std::make_shared<nomas::TensorPool>(device,0,bytes,true) : rootPool;
+        r.streaming=streaming;
+        r.text.setMemoryPool(r.pool);
+        r.text.setLowMemory(streaming);
+        r.video->setLowMemory(streaming);
+        if(r.transformer) r.transformer->setLowMemory(streaming);
+    });
+}
+void ParallelModel::setHostMemoryBudget(const std::shared_ptr<nomas::HostMemoryBudget> &budget) {
+    group_.run([&](int rank) {
+        auto &r=*ranks_[rank];r.hostBudget=budget;
+        r.text.setHostMemoryBudget(budget);
+        r.video->setHostMemoryBudget(budget);
+        if(r.transformer) r.transformer->setHostMemoryBudget(budget);
+    });
+}
 void ParallelModel::loadPika(const std::string &dir) {
     group_.run([&](int rank) {
         auto &r=*ranks_[rank];
@@ -48,6 +79,7 @@ Tensor ParallelModel::encode(const std::vector<int> &tokens,const std::vector<Vi
     Tensor result;
     group_.run([&](int rank) {
         auto &r=*ranks_[rank];
+        auto scope=r.memoryScope();
         auto x=r.text.encodeVisual(tokens,visual,rank==0?trace:Trace{});
         r.text.unload(true);
         if(rank==0) result=std::move(x);
@@ -58,12 +90,15 @@ void ParallelModel::prepare(const std::vector<std::vector<float>> &plans,bool re
                             std::function<void(int,int)> progress) {
     group_.run([&](int rank) {
         auto &r=*ranks_[rank];
+        auto scope=r.memoryScope();
         if(r.transformer && r.reference!=reference) r.transformer.reset();
         if(!r.transformer) {
             r.transformer=std::make_unique<Transformer>(r.rt,r.full,
                 r.directory+(reference?"/transformer_ref":"/transformer"),r.context);
             r.reference=reference;
         }
+        r.transformer->setLowMemory(r.streaming);
+        r.transformer->setHostMemoryBudget(r.hostBudget);
         if(!pikaDirectory_.empty())
             r.transformer->loadPikaAdapter(pikaDirectory_+(reference?"/ref2va":"/fl2va"),reference);
         r.transformer->prepare(plans,rank==0?progress:std::function<void(int,int)>{});
@@ -73,6 +108,7 @@ std::pair<Tensor,Tensor> ParallelModel::forward(const Tensor &video,const Tensor
                                               const PackedLayout &layout,Trace trace) {
     std::pair<Tensor,Tensor> result;
     group_.run([&](int rank) {
+        auto scope=ranks_[rank]->memoryScope();
         auto v=group_.broadcast(video,rank),a=group_.broadcast(audio,rank),t=group_.broadcast(text,rank);
         auto x=ranks_[rank]->transformer->forward(v,a,t,layout,rank==0?trace:Trace{});
         if(rank==0) result=std::move(x);
@@ -91,6 +127,9 @@ void ParallelModel::unloadVideo() {
     group_.run([&](int rank) { ranks_[rank]->video->unload(); });
 }
 std::vector<Tensor> ParallelModel::videoTiles(size_t count,const std::function<Tensor(VideoVAE &,size_t)> &task) {
-    return group_.mapToRoot(count,[&](int rank,size_t job) { return task(*ranks_[rank]->video,job); });
+    return group_.mapToRoot(count,[&](int rank,size_t job) {
+        auto scope=ranks_[rank]->memoryScope();
+        return task(*ranks_[rank]->video,job);
+    });
 }
 }} // namespace fastllm::minimax_h3

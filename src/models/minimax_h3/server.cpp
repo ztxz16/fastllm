@@ -81,8 +81,10 @@ Json metadata(const std::shared_ptr<Job> &job) {
 }
 class Service {
   public:
-    Service(std::string model, std::string output, std::vector<int> devices, bool fp32, DType videoType, std::string ffmpeg, std::string pika)
-        : output_(std::move(output)), fp32_(fp32), pika_(!pika.empty()), videoType_(videoType), devices_(devices) {
+    Service(std::string model, std::string output, std::vector<int> devices, bool fp32, DType videoType,
+            std::string ffmpeg, std::string pika, double gpuMemoryLimit, double hostMemoryLimit)
+        : output_(std::move(output)), fp32_(fp32), pika_(!pika.empty()), videoType_(videoType), devices_(devices),
+          gpuMemoryLimit_(gpuMemoryLimit), hostMemoryLimit_(hostMemoryLimit) {
         std::filesystem::create_directories(output_);
         referencesAvailable_ = std::filesystem::is_regular_file(model + "/transformer_ref/config.json");
         // Completed jobs have a small sidecar, so updating the inference service
@@ -126,7 +128,10 @@ class Service {
         worker_ = std::thread([this, model, devices, fp32, videoType, ffmpeg, pika] {
             try {
                 Pipeline pipeline(model, devices, fp32, videoType);
+                pipeline.setGpuMemoryLimit(gpuMemoryLimit_);
+                pipeline.setHostMemoryLimit(hostMemoryLimit_);
                 if (pika_) pipeline.loadPika(pika);
+                layerStreaming_ = pipeline.layerStreaming();
                 ready_ = true;
                 for (;;) {
                     std::shared_ptr<Job> job;
@@ -229,6 +234,10 @@ class Service {
                             {"vae_precision", precisionName(videoType_)},
                             {"tensor_parallel_size", int(devices_.size())},
                             {"devices", devices_},
+                            {"gpu_memory_limit_gib", gpuMemoryLimit_},
+                            {"host_memory_limit_gib", hostMemoryLimit_},
+                            {"gpu_memory_reserved", gpuMemoryLimit_ > 0 && ready_},
+                            {"layer_streaming", layerStreaming_.load()},
                             {"conditioning", true},
                             {"model", modelName()},
                             {"default_inference_steps", pika_ ? 6 : 50},
@@ -394,6 +403,8 @@ class Service {
     const bool pika_;
     const DType videoType_;
     const std::vector<int> devices_;
+    const double gpuMemoryLimit_, hostMemoryLimit_;
+    std::atomic<bool> layerStreaming_{false};
     std::atomic<bool> ready_{false}, stopping_{false};
     std::atomic<int> pending_{0};
     uint64_t sequence_ = 0;
@@ -411,6 +422,7 @@ int main(int argc, char **argv) {
         int port = 8009;
         std::vector<int> devices{0};
         bool fp32 = false;
+        double gpuMemoryLimit = 0, hostMemoryLimit = 0;
         for (int i = 1; i < argc; ++i) {
             std::string arg = argv[i];
             if (i + 1 >= argc)
@@ -430,6 +442,10 @@ int main(int argc, char **argv) {
                 port = std::stoi(v);
             else if (arg == "--device" || arg == "--devices")
                 devices = fastllm::nomas::parseParallelDevices(v);
+            else if (arg == "--gpu-memory-limit")
+                gpuMemoryLimit = parseGpuMemoryLimit(v);
+            else if (arg == "--host-memory-limit")
+                hostMemoryLimit = parseHostMemoryLimit(v);
             else if (arg == "--api-key")
                 key = v;
             else if (arg == "--demo")
@@ -449,7 +465,7 @@ int main(int argc, char **argv) {
         model = source.baseDirectory;
         pika = source.pikaDirectory;
         auto videoType = parseVideoPrecision(vaePrecision, fp32);
-        Service service(model, output, devices, fp32, videoType, ffmpeg, pika);
+        Service service(model, output, devices, fp32, videoType, ffmpeg, pika, gpuMemoryLimit, hostMemoryLimit);
         httplib::Server server;
         server.new_task_queue = [] { return new httplib::ThreadPool(8); };
         server.set_payload_max_length(size_t(256) << 20);

@@ -91,6 +91,8 @@ void Transformer::loadPikaAdapter(const std::string &dir, bool reference) {
     for (int i = 0; i < config_.refiners; ++i) block("token_refiner.refiner_blocks." + std::to_string(i));
     unload();
     lora_ = std::move(weights);
+    lora_->setHostMemoryBudget(hostBudget_);
+    if (lowMemory_) lora_->enableHostCache(size_t(2) << 30);
     loraDirectory_ = dir;
 }
 Tensor Transformer::linear(const Tensor &x, const std::string &p) {
@@ -124,6 +126,8 @@ void Pipeline::loadPika(const std::string &dir) {
     transformer_.loadPikaAdapter(dir + "/fl2va", false);
     if (!referenceTransformer_)
         referenceTransformer_ = std::make_unique<Transformer>(rt_, full_, directory_ + "/transformer_ref");
+    referenceTransformer_->setLowMemory(lowMemory_);
+    referenceTransformer_->setHostMemoryBudget(hostBudget_);
     referenceTransformer_->loadPikaAdapter(dir + "/ref2va", true);
     if (parallel_) parallel_->loadPika(dir);
     pikaDirectory_ = dir;
