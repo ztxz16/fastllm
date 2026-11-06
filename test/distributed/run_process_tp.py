@@ -20,6 +20,7 @@ import uuid
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "test/nvfp4"))
 from xlsx_report import write_xlsx
+from linux_process import check_pidfd_support, open_pidfd
 
 
 def capture(command, timeout=10):
@@ -117,6 +118,41 @@ def case_process(command, **kwargs):
         cleanup_process_group(process)
 
 
+def parse_report(text):
+    offset = 0
+    # json11 输出多行 JSON；NCCL 等库也可能先向 stdout 写日志。
+    # 第一个行首对象必须完整占据剩余输出；解析失败后不能跳到嵌套对象误报 PASS。
+    for line in text.splitlines(keepends=True):
+        stripped = line.lstrip()
+        if stripped.startswith("{"):
+            return json.loads(text[offset + len(line) - len(stripped):])
+        offset += len(line)
+    raise ValueError("stdout has no complete final JSON object")
+
+
+def read_startup_report(stream, timeout, log_path):
+    deadline = time.monotonic() + timeout
+    output = bytearray()
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not select.select([stream], [], [], remaining)[0]:
+                raise RuntimeError("parent did not report worker identities in time")
+            piece = os.read(stream.fileno(), 65536)
+            if not piece:
+                raise RuntimeError("invalid parent startup output: EOF before complete JSON")
+            output.extend(piece)
+            if len(output) > 1024 * 1024:
+                raise RuntimeError("parent startup output exceeds 1 MiB")
+            if output.endswith(b"\n"):
+                try:
+                    return parse_report(output.decode("utf-8"))
+                except ValueError:
+                    pass
+    finally:
+        log_path.write_bytes(output)
+
+
 def run_case(name, command, output, timeout, parse_json=True, environment=None):
     row = {"case": name, "status": "FAIL", "command": shlex.join(command)}
     stdout_path = output / f"{name}.stdout.log"
@@ -129,9 +165,7 @@ def run_case(name, command, output, timeout, parse_json=True, environment=None):
         result = stdout_path.read_text(encoding="utf-8", errors="replace")
         errors = stderr_path.read_text(encoding="utf-8", errors="replace")
         if parse_json:
-            data = json.loads(result.strip().splitlines()[-1])
-            if not isinstance(data, dict):
-                raise ValueError("case output must be a JSON object")
+            data = parse_report(result)
             row.update(data)
             row["case"] = name
             if data.get("status") != "PASS":
@@ -153,23 +187,10 @@ def parent_death_case(command, timeout, output):
         with (output / "parent_death.stderr.log").open("w", encoding="utf-8") as errors:
             with case_process(command, stdout=subprocess.PIPE, stderr=errors) as process:
                 with process.stdout:
-                    deadline = time.monotonic() + timeout
-                    line = bytearray()
-                    try:
-                        while not line.endswith(b"\n"):
-                            remaining = deadline - time.monotonic()
-                            if remaining <= 0 or not select.select([process.stdout], [], [], remaining)[0]:
-                                raise RuntimeError("parent did not report worker identities in time")
-                            piece = os.read(process.stdout.fileno(), 1)
-                            if not piece or len(line) > 1024 * 1024:
-                                raise RuntimeError("invalid parent startup output")
-                            line.extend(piece)
-                    finally:
-                        (output / "parent_death.stdout.log").write_bytes(line)
-                    data = json.loads(line)
+                    data = read_startup_report(process.stdout, timeout, output / "parent_death.stdout.log")
                     row["workers"] = data["workers"]
                     for worker in data["workers"]:
-                        pidfds.append(os.pidfd_open(worker["pid"]))
+                        pidfds.append(open_pidfd(worker["pid"]))
                     if not pidfds:
                         raise RuntimeError("parent reported no workers")
 
@@ -224,6 +245,9 @@ def main():
     metadata = {
         "command": shlex.join([sys.executable, *sys.argv]), "git": capture(["git", "rev-parse", "HEAD"]),
         "git_status": capture(["git", "status", "--short"]), "python": sys.version,
+        "python_executable": sys.executable,
+        "pidfd_open_api": "python" if callable(getattr(os, "pidfd_open", None)) else "linux syscall",
+        "pidfd_signal_api": "python" if callable(getattr(signal, "pidfd_send_signal", None)) else "linux syscall",
         "test_kind": "functional infrastructure checks; not an inference benchmark",
         "seed": 0, "warmup": 0, "iterations": 1, "repeats": 1,
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", "unset"),
@@ -234,6 +258,7 @@ def main():
     }
     rows = []
     try:
+        check_pidfd_support()
         if args.cuda:
             metadata["gpu"] = capture(["nvidia-smi", "--query-gpu=name,uuid,driver_version", "--format=csv,noheader"])
         if args.build_cache:
