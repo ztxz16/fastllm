@@ -37,7 +37,7 @@ if build_features.get("USE_CUDA", False) and build_features.get("USE_NCCL", Fals
     native_require.append('nvidia-nccl-cu12; platform_system == "Linux"')
 
 PACKAGE_INFO = {
-    "release": {"name": "ftllm", "version": "1.9.0"},
+    "release": {"name": "ftllm", "version": "1.9.1"},
     "nightly": {"name": "ftllm-nightly", "version": "0.0.0.3"},
 }
 

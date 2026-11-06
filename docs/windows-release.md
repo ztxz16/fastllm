@@ -1,6 +1,6 @@
 # Windows wheel 与 Electron 发布流程
 
-适配范围、代码整理和开发分支建议见 [Windows 适配整理](windows-adaptation.md)。
+平台支持和维护范围见 [Windows 支持与维护范围](windows-adaptation.md)。
 
 仓库根目录的 `make_release.ps1` 将当前工作区构建为 Windows wheel 和 Electron
 绿色包，并统一输出校验和、构建日志及验证报告。
@@ -27,7 +27,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\make_release.ps1 `
 ```
 
 默认架构直接读取 `make_whl.sh` 中的 `CUDA_ARCH_LIST`。`-CudaArch "86"` 等参数可以
-覆盖默认列表。版本从 wheel 元数据读取；`-Version "0.1.8.2"` 只要求版本匹配，
+覆盖默认列表。版本从 wheel 元数据读取；`-Version "1.9.1"` 只要求版本匹配，
 不会修改源代码里的版本号。
 
 没有本机 GPU 时可以构建和核验 CUDA 包。`-RequireCuda` 要求实际加载 CUDA 后端并
@@ -40,11 +40,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\make_release.ps1 `
 ```powershell
 # 复用已有 wheel；CudaArch 必须与其实际编译参数一致
 powershell -NoProfile -ExecutionPolicy Bypass -File .\make_release.ps1 `
-  -Wheel "D:\wheels\ftllm-0.1.8.2-py3-none-win_amd64.whl" `
+  -Wheel "D:\wheels\ftllm-1.9.1-py3-none-win_amd64.whl" `
   -CudaArch "86" -OutputDirectory build-release-from-wheel -Offline
 
 # 继续已有多架构编译；保持上次的构建目录及 CMake 参数
-.\make_release.ps1 -BuildDirectory build-release-0.1.8.2/native `
+.\make_release.ps1 -BuildDirectory build-release-1.9.1/native `
   -OutputDirectory build-release-next -Offline `
   -CMakeArgs "-DCMAKE_CUDA_FLAGS=--split-compile=2"
 ```
@@ -112,7 +112,7 @@ GPU 模式仍需系统 NVIDIA 驱动，模型权重另行提供。
 
 ```powershell
 .\build-portable-cache\bootstrap\python\python.exe -I -B -X utf8 `
-  .\tools\windows\verify_wheel.py "D:\wheels\ftllm-0.1.8.2-py3-none-win_amd64.whl" `
+  .\tools\windows\verify_wheel.py "D:\wheels\ftllm-1.9.1-py3-none-win_amd64.whl" `
   --cuda-arch "86" --report build-wheel-check/result.json
 ```
 

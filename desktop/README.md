@@ -82,7 +82,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\desktop\package.ps1 `
 
 # 使用已经编译好的 Windows wheel；CudaArch 应与 wheel 一致
 powershell -NoProfile -ExecutionPolicy Bypass -File .\desktop\package.ps1 `
-  -Wheel .\build-fastllm-benchmark-sm86\cuda\tools\dist\ftllm-0.1.8.2-py3-none-win_amd64.whl `
+  -Wheel .\build-fastllm-benchmark-sm86\cuda\tools\dist\ftllm-1.9.1-py3-none-win_amd64.whl `
   -CudaArch 86 -Offline
 ```
 

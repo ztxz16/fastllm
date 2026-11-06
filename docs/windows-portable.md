@@ -36,7 +36,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\make_portable.ps1 -CpuOnly
 
 # 复用已有 Windows wheel
 powershell -NoProfile -ExecutionPolicy Bypass -File .\make_portable.ps1 `
-  -Wheel .\build-fastllm-windows\cuda\tools\dist\ftllm-0.1.8.2-py3-none-win_amd64.whl `
+  -Wheel .\build-fastllm-windows\cuda\tools\dist\ftllm-1.9.1-py3-none-win_amd64.whl `
   -CudaArch 86
 ```
 
