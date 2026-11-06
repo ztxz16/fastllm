@@ -181,8 +181,8 @@ CUDA Graph、自定义 AllReduce、跨请求前缀缓存仍需后续逐项适配
 不要求 V100 原生支持 BF16。CPU 源字节上限与 GPU 权重总字节上限独立；
 在读取 payload/分配 GPU 前检查配额。拒绝 NaN、Inf 和绝对值大于 65504 的值。
 
-这一阶段只提供权重存储，尚未调用正式前向算子；Norm 权重也按 FP16 保存，
-前向接入时仍须验证其数值精度和算子布局。量化、设备迁移、CUDA Graph、
+权重阶段只提供权重存储；Norm 权重也按 FP16 保存，
+单层前向见下节，仍须服务器验证数值精度和算子布局。量化、设备迁移、CUDA Graph、
 自定义 AllReduce、KV/前缀缓存均未在此阶段实现。原线程 TP 路径未改变，
 Python `--tp_backend process` 仍保留未实现保护，不得据此宣称模型生成已完成。
 
@@ -245,3 +245,65 @@ build-process-tp-cu126/fastllm_tp_model_check \
 ```bash
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/distributed -p 'test_*.py'
 ```
+
+## Qwen3 单层 TP 前向（待服务器验收）
+
+`ProcessGroup::ForwardQwen3Layer` 调用正式 worker 持有的 GPU 权重和执行 stream，
+使用 cuBLAS GEMM、CUDA 算子及 NCCL；验收工具不另建测试专用计算路径。
+支持单请求、连续位置、无历史 KV 的完整 causal prefill，执行一个 Decoder 层：
+Input RMSNorm → QKV → Q/K RMSNorm → split-half RoPE → causal GQA → O projection
+→ NCCL SUM → 残差 → Post RMSNorm → Gate/Up → SiLU*Up → Down → NCCL SUM → 残差。
+支持可选 QKV/O/Down bias；O/Down bias 由原加载器仅在 rank 0 保留。
+KV 头复制及非均匀头/MLP 分片沿用同一分片计划。
+
+该入口提供 `Full`、`Attention`、`Mlp` 三个阶段，独立阶段仍使用完整层中的同一
+算子与通信逻辑。输入/结果经控制协议以 FP32 传输，内部激活/权重为 FP16，
+GEMM 用 `CUBLAS_COMPUTE_32F_PEDANTIC` 累加；O/Down 的 rank-local 结果以
+FP32 规约，整体转 FP16 后与残差相加。RMSNorm 归一化后转 FP16 再乘 scale；
+RoPE 使用 FP16 sin/cos 与乘法舍入；Attention 的 score/softmax/V 累加为 FP32。
+这是明确的 eager 正确性基线，不是速度或完整 HF 模型一致性的验收结论。
+
+边界：token 数 1..128、hidden<=65536、偶数 head_dim<=256、本地融合 QKV
+宽度<=65536、本地 MLP 宽度<=262144，临时缓冲总上限 256 MiB；单个请求仍受
+1 MiB 控制帧限制（24 字节任务头 + T*H*4 字节输入）。连续位置起点<=1048576，
+只影响 RoPE，不意味着 KV 已存在。非 SiLU、rope scaling/rope_parameters、
+部分旋转或 sliding attention 配置明确拒绝。输入/结果非有限值拒绝，绝无 CPU fallback。
+尚不支持持久 KV、Decode、全模型串联、最终 logits/采样、CUDA Graph 或前缀缓存；
+Python `--tp_backend process` 仍保持未实现保护。
+
+在上述 CUDA 12.6 环境下，于**服务器**构建和验收：
+
+```bash
+cmake -S . -B build-process-tp-cu126 \
+  -DUSE_CUDA=ON -DUSE_NUMAS=OFF -DBUILD_PROCESS_TP=ON \
+  -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.6/bin/nvcc -DCUDA_ARCH=70
+cmake --build build-process-tp-cu126 \
+  --target fastllm_tp_worker fastllm_tp_check fastllm_tp_model_check fastllm_tp_layer_check -j 4
+
+python3 test/distributed/run_process_tp.py \
+  --check build-process-tp-cu126/fastllm_tp_check \
+  --worker build-process-tp-cu126/fastllm_tp_worker --devices 0,1 --cuda \
+  --build-cache build-process-tp-cu126/CMakeCache.txt
+python3 test/distributed/run_qwen3_device_weights.py \
+  --check build-process-tp-cu126/fastllm_tp_model_check \
+  --worker build-process-tp-cu126/fastllm_tp_worker --devices 0,1 \
+  --build-cache build-process-tp-cu126/CMakeCache.txt
+python3 test/distributed/run_qwen3_layer.py \
+  --check build-process-tp-cu126/fastllm_tp_layer_check \
+  --worker build-process-tp-cu126/fastllm_tp_worker --devices 0,1 \
+  --build-cache build-process-tp-cu126/CMakeCache.txt
+```
+
+单层验收用相同的固定输入、源精度和模型配置对比独立 CPU 数学参考、单 GPU
+进程入口和双 GPU TP 的每个 rank。逐元素阈值为 `0.004 + 0.004*abs(reference)`；
+rank 之间以及改变尾 token 前后的前缀必须完全相同。覆盖三种源精度、偏置、
+非均匀 KV 分片、KV 复制、单 token/128 token、head_dim=128/256、位置边界、
+层号/形状/阶段错误、卸载后访问及不支持配置，共 25 个用例。
+实际值或参考值出现 NaN/Inf 均失败；预期拒绝用例还必须确认退出清理成功。
+保存完整实际输出、参考数据、命令、GPU/CUDA/NCCL/
+构建信息及 Markdown/CSV/JSON/XLSX 汇总。任何失败均退出非零；中断也保留部分报告。
+
+检查程序 `--tasks` 接收有界 JSON 数组，每个任务包含 `name, layer, tokens,
+hidden, position_begin, stage, input`，其中 input 为行主序 FP32 数组，stage 为
+0/1/2。可指向真实模型做单层冒烟，但本轮默认验收使用小型完整模型，不能替代
+Qwen3-1.7B 全模型 logits/生成验证。
