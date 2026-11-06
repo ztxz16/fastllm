@@ -242,13 +242,17 @@ struct DeviceRuntime {
     }
 
     /**
-     * 解码完整 prefill 请求并返回本 rank 的末 token 词表分片。
-     * @param payload position、timeout 两个 uint32，随后为 1..128 个 uint32 token ID。
+     * 解码无状态 Prefill、请求初始化或单 token Decode，统一打包词表分片。
+     * @param payload 前两项为 position/token、timeout；Begin 另有 capacity，之后为 Prompt ID。
+     * @param kind PrefillQwen3、BeginQwen3Request 或 DecodeQwen3。
      * @return 三个 uint64（词表起点、长度、总长）及 FP32 logits；失败由 worker 终止整组。
      */
-    std::vector<uint8_t> Prefill(const std::vector<uint8_t> &payload) {
-        if (controlOnly || payload.size() < 12 || payload.size() > 8 + 128 * 4 ||
-            (payload.size() - 8) % 4 || !Get32(payload, 4) || Get32(payload, 4) > INT_MAX) {
+    std::vector<uint8_t> Prefill(const std::vector<uint8_t> &payload, Kind kind) {
+        const bool decode = kind == Kind::DecodeQwen3, begin = kind == Kind::BeginQwen3Request;
+        const size_t header = begin ? 12 : 8;
+        const bool valid = decode ? payload.size() == 8 :
+            (payload.size() >= header + 4 && payload.size() <= header + 128 * 4 && (payload.size() - header) % 4 == 0);
+        if (controlOnly || !valid || !Get32(payload, 4) || Get32(payload, 4) > INT_MAX) {
             throw std::runtime_error("invalid Qwen3 prefill payload/state");
         }
 #ifdef FASTLLM_PROCESS_TP_CUDA
@@ -256,13 +260,15 @@ struct DeviceRuntime {
             throw std::runtime_error("Qwen3 weights not loaded");
         }
         std::vector<uint32_t> ids;
-        for (size_t offset = 8; offset < payload.size(); offset += 4) {
+        for (size_t offset = header; offset < payload.size(); offset += 4) {
             ids.push_back(Get32(payload, offset));
         }
         if (!layerExecutor) {
             layerExecutor = std::make_unique<fastllm::distributed::Qwen3LayerExecutor>(*weights, stream, comm);
         }
-        auto logits = layerExecutor->Prefill(ids, Get32(payload, 0));
+        auto logits = decode ? layerExecutor->Decode(Get32(payload, 0)) :
+            begin ? layerExecutor->BeginRequest(ids, Get32(payload, 8), Get32(payload, 0)) :
+                    layerExecutor->Prefill(ids, Get32(payload, 0));
         std::vector<uint8_t> result;
         Put64(result, weights->Plan().vocabBegin);
         Put64(result, logits.size());
@@ -272,6 +278,28 @@ struct DeviceRuntime {
             memcpy(&bits, &value, sizeof(bits));
             Put32(result, bits);
         }
+        return result;
+#else
+        throw std::runtime_error("worker built without CUDA");
+#endif
+    }
+
+    /** 查询或同步释放唯一请求 KV；未加载模型也返回全零状态，禁止 control-only。 */
+    std::vector<uint8_t> RequestState(bool end) {
+        if (controlOnly) {
+            throw std::runtime_error("Qwen3 request requires CUDA");
+        }
+#ifdef FASTLLM_PROCESS_TP_CUDA
+        if (end && layerExecutor) {
+            layerExecutor->EndRequest();
+        }
+        auto info = layerExecutor ? layerExecutor->RequestInfo() : fastllm::distributed::Qwen3RequestInfo{};
+        std::vector<uint8_t> result;
+        Put32(result, info.active);
+        Put32(result, info.tokens);
+        Put32(result, info.capacity);
+        Put32(result, info.positionBegin);
+        Put64(result, info.deviceBytes);
         return result;
 #else
         throw std::runtime_error("worker built without CUDA");
@@ -375,15 +403,26 @@ int main(int argc, char **argv) {
             std::vector<uint8_t> payload;
             if (message.kind != Kind::Initialize && message.kind != Kind::LoadQwen3 &&
                 message.kind != Kind::ReadWeight && message.kind != Kind::ForwardLayer &&
-                message.kind != Kind::PrefillQwen3 && !message.payload.empty()) {
+                message.kind != Kind::PrefillQwen3 && message.kind != Kind::BeginQwen3Request &&
+                message.kind != Kind::DecodeQwen3 && !message.payload.empty()) {
                 throw std::runtime_error("unexpected worker command payload");
             }
             switch (message.kind) {
+                case Kind::EndQwen3Request:
+                case Kind::QueryQwen3Request:
+                    if (!initialized) {
+                        throw std::runtime_error("Qwen3 request state before Initialize");
+                    }
+                    payload = runtime.RequestState(message.kind == Kind::EndQwen3Request);
+                    response = message.kind == Kind::EndQwen3Request ? Kind::Qwen3RequestEnded : Kind::Qwen3RequestState;
+                    break;
+                case Kind::BeginQwen3Request:
+                case Kind::DecodeQwen3:
                 case Kind::PrefillQwen3:
                     if (!initialized) {
                         throw std::runtime_error("PrefillQwen3 before Initialize");
                     }
-                    payload = runtime.Prefill(message.payload);
+                    payload = runtime.Prefill(message.payload, message.kind);
                     response = Kind::PrefillLogits;
                     break;
                 case Kind::ForwardLayer:
@@ -456,7 +495,8 @@ int main(int argc, char **argv) {
             }
             auto responseTimeout = message.kind == Kind::ForwardLayer ?
                 std::chrono::milliseconds(Get32(message.payload, 20)) :
-                message.kind == Kind::PrefillQwen3 ? std::chrono::milliseconds(Get32(message.payload, 4)) :
+                (message.kind == Kind::PrefillQwen3 || message.kind == Kind::BeginQwen3Request || message.kind == Kind::DecodeQwen3) ?
+                std::chrono::milliseconds(Get32(message.payload, 4)) :
                 std::chrono::milliseconds(10000);
             Send(kWorkerFd, {response, session, sequence, payload}, Clock::now() + responseTimeout);
         }

@@ -104,10 +104,26 @@ __global__ void Rope(half *qkv, int qHeads, int kvHeads, int dim, int stride,
 }
 
 /**
- * 计算一个 token/head 的 causal attention，无 KV cache。
+ * 将当前层旋转后的 K 与原始 V 追加到请求缓存，不写历史 token。
+ * @param qkv FP16 [tokens,(qHeads+2*kvHeads)*dim]，K 已执行 Norm/RoPE。
+ * @param cache FP16 [capacity,2,kvHeads,dim]，第二维依次 K、V。
+ * @param count tokens*2*kvHeads*dim，调用方已检查边界。
+ * @param width 2*kvHeads*dim。
+ * @param qWidth qHeads*dim。
+ * @param past 已缓存 token 数；写入 [past,past+tokens)。
+ */
+__global__ void AppendKV(const half *qkv, half *cache, int count, int width, int qWidth, int past) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) {
+        cache[size_t(past) * width + i] = qkv[(i / width) * (qWidth + width) + qWidth + i % width];
+    }
+}
+
+/**
+ * 计算一个 token/head 的 causal attention，支持请求内 KV 与无缓存重算。
  *
  * QK 点积、softmax、加权 V 均 FP32 累加，输出 FP16。按全局 Q 头编号映射 KV，
- * 支持 KV 头复制及不均匀 Q 分片。共享内存只存 <=128 个概率，不创建 T*T*H 张量。
+ * 支持 KV 头复制及不均匀 Q 分片。共享内存只存 <=2048 个概率，不创建 T*T*H 张量。
  * @param qkv FP16 [T,(qHeads+2*kvHeads)*dim]，Q/K 已归一化并旋转。
  * @param context FP16 [T,qHeads*dim] 输出。
  * @param qHeads 本 rank 的 Q 头数。
@@ -116,40 +132,45 @@ __global__ void Rope(half *qkv, int qHeads, int kvHeads, int dim, int stride,
  * @param qBegin 本 rank 首个 Q 头的全局编号。
  * @param kvBegin 本 rank 首个 KV 头的全局编号。
  * @param groupSize 全局 Q 头数除以全局 KV 头数。
+ * @param cache 可空的 FP16 [capacity,2,kvHeads,dim]；非空时当前 token 的 KV 已追加。
+ * @param past 当前输入之前已缓存的长度；无缓存时为零。
  */
 __global__ void Attention(const half *qkv, half *context, int qHeads, int kvHeads, int dim,
-                          int qBegin, int kvBegin, int groupSize) {
-    __shared__ float probabilities[128];
+                          int qBegin, int kvBegin, int groupSize, const half *cache, int past) {
+    __shared__ float probabilities[2048];
     int head = blockIdx.x % qHeads, token = blockIdx.x / qHeads;
     int kv = (qBegin + head) / groupSize - kvBegin;
     int stride = (qHeads + 2 * kvHeads) * dim;
-    for (int key = threadIdx.x; key <= token; key += blockDim.x) {
+    const half *keys = cache ? cache : qkv + qHeads * dim;
+    int kvStride = cache ? 2 * kvHeads * dim : stride;
+    int last = past + token;
+    for (int key = threadIdx.x; key <= last; key += blockDim.x) {
         float dot = 0;
         for (int d = 0; d < dim; ++d) {
             dot += __half2float(qkv[token * stride + head * dim + d]) *
-                   __half2float(qkv[key * stride + (qHeads + kv) * dim + d]);
+                   __half2float(keys[key * kvStride + kv * dim + d]);
         }
         probabilities[key] = dot * rsqrtf(float(dim));
     }
     __syncthreads();
     if (threadIdx.x == 0) {
         float maximum = probabilities[0], total = 0;
-        for (int i = 1; i <= token; ++i) {
+        for (int i = 1; i <= last; ++i) {
             maximum = fmaxf(maximum, probabilities[i]);
         }
-        for (int i = 0; i <= token; ++i) {
+        for (int i = 0; i <= last; ++i) {
             probabilities[i] = expf(probabilities[i] - maximum);
             total += probabilities[i];
         }
-        for (int i = 0; i <= token; ++i) {
+        for (int i = 0; i <= last; ++i) {
             probabilities[i] /= total;
         }
     }
     __syncthreads();
     for (int d = threadIdx.x; d < dim; d += blockDim.x) {
         float value = 0;
-        for (int key = 0; key <= token; ++key) {
-            value += probabilities[key] * __half2float(qkv[key * stride + (qHeads + kvHeads + kv) * dim + d]);
+        for (int key = 0; key <= last; ++key) {
+            value += probabilities[key] * __half2float(keys[key * kvStride + (kvHeads + kv) * dim + d]);
         }
         context[(token * qHeads + head) * dim + d] = __float2half_rn(value);
     }
@@ -190,6 +211,8 @@ struct Qwen3LayerExecutor::Impl {
     cublasHandle_t blas = nullptr;
     std::vector<void*> buffers;
     size_t allocated = 0;
+    std::vector<half*> kvCache;
+    Qwen3RequestInfo request;
 
     void *Allocate(size_t bytes) {
         if (bytes > 256ULL * 1024 * 1024 - allocated) {
@@ -265,9 +288,10 @@ struct Qwen3LayerExecutor::Impl {
      * @param stage 指定 Attention、MLP 或完整层。
      * @param x FP16 [tokens,hidden] 行主序输入/输出，不读回 CPU。
      * @param w 当前请求的 GPU 工作区，同 stream 顺序复用。
+     * @param cached true 表示写入当前层 KV，并在 Attention 中读取有效历史。
      */
     void RunLayer(uint32_t layer, uint32_t tokens, uint32_t positionBegin, Qwen3LayerStage stage,
-                  half *x, const Workspace &w) {
+                  half *x, const Workspace &w, bool cached = false) {
         auto &r = *this;
         const auto &p = weights.Plan();
         const uint32_t hidden = p.hiddenSize;
@@ -286,7 +310,13 @@ struct Qwen3LayerExecutor::Impl {
             Norm<<<t*qh,256,0,r.stream>>>(qkv, r.Weight(prefix + "self_attn.q_norm.weight", {uint64_t(d)}), qkv, d, qkvWidth, qh, 0, p.rmsNormEps);
             Norm<<<t*kh,256,0,r.stream>>>(qkv, r.Weight(prefix + "self_attn.k_norm.weight", {uint64_t(d)}), qkv, d, qkvWidth, kh, qw, p.rmsNormEps);
             Rope<<<t*(qh+kh),256,0,r.stream>>>(qkv, qh, kh, d, qkvWidth, positionBegin, p.ropeTheta);
-            Attention<<<t*qh,256,0,r.stream>>>(qkv, context, qh, kh, d, p.queryHeadBegin, p.kvHeadBegin, p.queryHeads / p.kvHeads);
+            half *cache = cached ? kvCache.at(layer) : nullptr;
+            const int past = cached ? request.tokens : 0;
+            if (cached) {
+                AppendKV<<<(t*2*kw+255)/256,256,0,r.stream>>>(qkv, cache, t*2*kw, 2*kw, qw, past);
+            }
+            Attention<<<t*qh,256,0,r.stream>>>(qkv, context, qh, kh, d, p.queryHeadBegin, p.kvHeadBegin,
+                                              p.queryHeads / p.kvHeads, cache, past);
             r.Linear(context, r.Weight(prefix + "self_attn.o_proj.weight", {hidden, uint64_t(qw)}), partial, t, h, qw, true);
             if (auto bias = r.Weight(prefix + "self_attn.o_proj.bias", {hidden}, true)) {
                 Bias<<<(t*h+255)/256,256,0,r.stream>>>(partial, bias, t*h, h);
@@ -377,12 +407,22 @@ std::vector<float> Qwen3LayerExecutor::Forward(uint32_t layer, uint32_t tokens, 
 
 std::vector<float> Qwen3LayerExecutor::Prefill(const std::vector<uint32_t> &tokenIds,
                                              uint32_t positionBegin) {
+    return RunTokens(tokenIds, positionBegin, false);
+}
+
+std::vector<float> Qwen3LayerExecutor::RunTokens(const std::vector<uint32_t> &tokenIds,
+                                               uint32_t positionBegin, bool cached) {
     auto &r = *impl;
     const auto &p = r.weights.Plan();
     if (tokenIds.empty() || tokenIds.size() > 128) {
         throw std::runtime_error("invalid Qwen3 prefill token count");
     }
     r.Validate(0, tokenIds.size(), p.hiddenSize, positionBegin, Qwen3LayerStage::Full);
+    if (cached && (!r.request.active || r.request.tokens > r.request.capacity ||
+        tokenIds.size() > r.request.capacity - r.request.tokens ||
+        positionBegin != r.request.positionBegin + r.request.tokens)) {
+        throw std::runtime_error("invalid Qwen3 request cache append");
+    }
     if (!p.vocabSize || p.vocabSize > 1048576 || !p.vocabCount ||
         p.vocabCount > (protocol::kMaxPayload - 24) / 4 ||
         p.vocabBegin > p.vocabSize || p.vocabCount > p.vocabSize - p.vocabBegin) {
@@ -408,7 +448,7 @@ std::vector<float> Qwen3LayerExecutor::Prefill(const std::vector<uint32_t> &toke
     Embed<<<(t*h+255)/256,256,0,r.stream>>>(ids, embedding, x, t*h, h);
     Cuda(cudaGetLastError());
     for (uint32_t layer = 0; layer < p.layerCount; ++layer) {
-        r.RunLayer(layer, t, positionBegin, Qwen3LayerStage::Full, x, workspace);
+        r.RunLayer(layer, t, positionBegin, Qwen3LayerStage::Full, x, workspace, cached);
     }
     Norm<<<1,256,0,r.stream>>>(x + size_t(t - 1) * h, finalNorm, workspace.norm,
                               h, h, 1, 0, p.rmsNormEps);
@@ -424,10 +464,75 @@ std::vector<float> Qwen3LayerExecutor::Prefill(const std::vector<uint32_t> &toke
         }
     }
     r.ReleaseBuffers();
+    if (cached) {
+        r.request.tokens += tokenIds.size();
+    }
     return result;
 }
 
+std::vector<float> Qwen3LayerExecutor::BeginRequest(const std::vector<uint32_t> &tokenIds,
+                                                  uint32_t capacity, uint32_t positionBegin) {
+    auto &r = *impl;
+    const auto &p = r.weights.Plan();
+    if (r.request.active) {
+        throw std::runtime_error("Qwen3 request already active");
+    }
+    if (!capacity || capacity > 2048 || tokenIds.empty() || tokenIds.size() > 128 ||
+        tokenIds.size() > capacity || positionBegin > 1048576 || capacity - 1 > 1048576 - positionBegin) {
+        throw std::runtime_error("invalid Qwen3 request capacity/position");
+    }
+    r.Validate(0, tokenIds.size(), p.hiddenSize, positionBegin, Qwen3LayerStage::Full);
+    r.Weight("model.embed_tokens.weight", {p.vocabSize, p.hiddenSize});
+    for (auto id : tokenIds) {
+        if (id >= p.vocabSize) {
+            throw std::runtime_error("Qwen3 prefill token ID outside vocabulary");
+        }
+    }
+    const uint64_t layerBytes = uint64_t(capacity) * 2 * p.kvHeadCount * p.headDim * sizeof(half);
+    if (!layerBytes || layerBytes > 256ULL * 1024 * 1024 || p.layerCount > (256ULL * 1024 * 1024) / layerBytes) {
+        throw std::runtime_error("Qwen3 request KV exceeds 256 MiB");
+    }
+
+    // KV 生命周期跨调用，不能放入每次前向结束就释放的临时 buffers。
+    r.kvCache.resize(p.layerCount, nullptr);
+    for (auto &cache : r.kvCache) {
+        Cuda(cudaMalloc(reinterpret_cast<void**>(&cache), layerBytes));
+        r.request.deviceBytes += layerBytes;
+    }
+    r.request.active = true;
+    r.request.capacity = capacity;
+    r.request.positionBegin = positionBegin;
+    return RunTokens(tokenIds, positionBegin, true);
+}
+
+std::vector<float> Qwen3LayerExecutor::Decode(uint32_t tokenId) {
+    const auto &request = impl->request;
+    if (!request.active) {
+        throw std::runtime_error("Qwen3 decode requires active request");
+    }
+    if (request.tokens >= request.capacity) {
+        throw std::runtime_error("Qwen3 request capacity exhausted");
+    }
+    return RunTokens({tokenId}, request.positionBegin + request.tokens, true);
+}
+
+void Qwen3LayerExecutor::EndRequest() {
+    auto &r = *impl;
+    r.Synchronize();
+    for (auto &cache : r.kvCache) {
+        Cuda(cudaFree(cache));
+        cache = nullptr;
+    }
+    r.kvCache.clear();
+    r.request = {};
+}
+
+Qwen3RequestInfo Qwen3LayerExecutor::RequestInfo() const {
+    return impl->request;
+}
+
 void Qwen3LayerExecutor::Clear() {
+    EndRequest();
     impl->ReleaseBuffers();
     if (impl->blas) {
         Blas(cublasDestroy(impl->blas));

@@ -297,6 +297,89 @@ struct ProcessGroup::Impl {
         return results;
     }
 
+    /** 串行执行 Prefill/Begin/Decode，复用分片连续性和有限值验证；错误终止整组。 */
+    std::vector<float> Logits(Kind kind, const std::vector<uint8_t> &payload, int timeoutMs) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (state != ProcessGroupState::Ready || options.controlOnly) {
+            throw std::runtime_error("Qwen3 prefill requires a ready CUDA process TP group");
+        }
+        try {
+            auto replies = Exchange(kind, Kind::PrefillLogits, payload,
+                                    Clock::now() + std::chrono::milliseconds(timeoutMs));
+            std::vector<float> logits;
+            uint64_t vocabulary = 0;
+            for (const auto &reply : replies) {
+                if (reply.payload.size() < 24) {
+                    throw std::runtime_error("invalid Qwen3 prefill reply header");
+                }
+                uint64_t begin = Get64(reply.payload, 0), count = Get64(reply.payload, 8);
+                uint64_t total = Get64(reply.payload, 16);
+                if (!total || total > 1048576 || (vocabulary && total != vocabulary) ||
+                    begin != logits.size() || begin >= total || !count || count > total - begin ||
+                    count > (kMaxPayload - 24) / 4 || reply.payload.size() != 24 + count * 4) {
+                    throw std::runtime_error("invalid Qwen3 prefill vocabulary slices");
+                }
+                vocabulary = total;
+                for (uint64_t i = 0; i < count; ++i) {
+                    uint32_t bits = Get32(reply.payload, 24 + i * 4);
+                    float value;
+                    memcpy(&value, &bits, sizeof(value));
+                    if (!std::isfinite(value)) {
+                        throw std::runtime_error("nonfinite Qwen3 prefill logits");
+                    }
+                    logits.push_back(value);
+                }
+            }
+            if (!vocabulary || logits.size() != vocabulary) {
+                throw std::runtime_error("incomplete Qwen3 prefill vocabulary");
+            }
+            return logits;
+        } catch (const std::exception &failure) {
+            Fail(failure.what());
+            throw std::runtime_error(error);
+        }
+    }
+
+    /** 查询或释放请求缓存；验证各 rank 的活动状态、长度和容量一致。 */
+    std::vector<Qwen3RequestInfo> RequestStates(bool end) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (state != ProcessGroupState::Ready || options.controlOnly) {
+            throw std::runtime_error("Qwen3 request requires a ready CUDA process TP group");
+        }
+        try {
+            auto replies = Exchange(end ? Kind::EndQwen3Request : Kind::QueryQwen3Request,
+                end ? Kind::Qwen3RequestEnded : Kind::Qwen3RequestState, {},
+                Clock::now() + std::chrono::milliseconds(options.operationTimeoutMs));
+            std::vector<Qwen3RequestInfo> result;
+            for (const auto &reply : replies) {
+                const auto &bytes = reply.payload;
+                if (bytes.size() != 24 || Get32(bytes, 0) > 1) {
+                    throw std::runtime_error("invalid Qwen3 request state header");
+                }
+                Qwen3RequestInfo info{Get32(bytes, 0) != 0, Get32(bytes, 4), Get32(bytes, 8),
+                                      Get32(bytes, 12), Get64(bytes, 16)};
+                bool invalid = info.active ?
+                    (end || !info.tokens || info.tokens > info.capacity || info.capacity > 2048 ||
+                     info.positionBegin > 1048576 || info.capacity - 1 > 1048576 - info.positionBegin ||
+                     !info.deviceBytes || info.deviceBytes > 256ULL * 1024 * 1024) :
+                    (info.tokens || info.capacity || info.positionBegin || info.deviceBytes);
+                if (!result.empty()) {
+                    const auto &first = result.front();
+                    invalid = invalid || info.active != first.active || info.tokens != first.tokens ||
+                              info.capacity != first.capacity || info.positionBegin != first.positionBegin;
+                }
+                if (invalid) {
+                    throw std::runtime_error("invalid/inconsistent Qwen3 request state");
+                }
+                result.push_back(info);
+            }
+            return result;
+        } catch (const std::exception &failure) {
+            Fail(failure.what());
+            throw std::runtime_error(error);
+        }
+    }
+
     /**
      * 创建独立 worker 并重定向指定控制 socket。
      * @param rank 连续的组内编号。
@@ -663,45 +746,42 @@ std::vector<float> ProcessGroup::PrefillQwen3(const std::vector<uint32_t> &token
         Put32(payload, id);
     }
 
-    std::lock_guard<std::mutex> lock(impl->mutex);
-    if (impl->state != ProcessGroupState::Ready || impl->options.controlOnly) {
-        throw std::runtime_error("Qwen3 prefill requires a ready CUDA process TP group");
+    return impl->Logits(Kind::PrefillQwen3, payload, timeoutMs);
+}
+
+std::vector<float> ProcessGroup::BeginQwen3Request(const std::vector<uint32_t> &tokenIds,
+                                                 uint32_t capacity, uint32_t positionBegin, int timeoutMs) {
+    if (tokenIds.empty() || tokenIds.size() > 128 || !capacity || capacity > 2048 ||
+        tokenIds.size() > capacity || positionBegin > 1048576 ||
+        capacity - 1 > 1048576 - positionBegin || timeoutMs <= 0) {
+        throw std::invalid_argument("invalid Qwen3 request capacity/position/timeout");
     }
-    try {
-        auto replies = impl->Exchange(Kind::PrefillQwen3, Kind::PrefillLogits, payload,
-                                      Clock::now() + std::chrono::milliseconds(timeoutMs));
-        std::vector<float> logits;
-        uint64_t vocabulary = 0;
-        for (const auto &reply : replies) {
-            if (reply.payload.size() < 24) {
-                throw std::runtime_error("invalid Qwen3 prefill reply header");
-            }
-            uint64_t begin = Get64(reply.payload, 0), count = Get64(reply.payload, 8);
-            uint64_t total = Get64(reply.payload, 16);
-            if (!total || total > 1048576 || (vocabulary && total != vocabulary) ||
-                begin != logits.size() || begin >= total || !count || count > total - begin ||
-                count > (kMaxPayload - 24) / 4 || reply.payload.size() != 24 + count * 4) {
-                throw std::runtime_error("invalid Qwen3 prefill vocabulary slices");
-            }
-            vocabulary = total;
-            for (uint64_t i = 0; i < count; ++i) {
-                uint32_t bits = Get32(reply.payload, 24 + i * 4);
-                float value;
-                memcpy(&value, &bits, sizeof(value));
-                if (!std::isfinite(value)) {
-                    throw std::runtime_error("nonfinite Qwen3 prefill logits");
-                }
-                logits.push_back(value);
-            }
-        }
-        if (!vocabulary || logits.size() != vocabulary) {
-            throw std::runtime_error("incomplete Qwen3 prefill vocabulary");
-        }
-        return logits;
-    } catch (const std::exception &error) {
-        impl->Fail(error.what());
-        throw std::runtime_error(impl->error);
+    std::vector<uint8_t> payload;
+    Put32(payload, positionBegin);
+    Put32(payload, uint32_t(timeoutMs));
+    Put32(payload, capacity);
+    for (auto id : tokenIds) {
+        Put32(payload, id);
     }
+    return impl->Logits(Kind::BeginQwen3Request, payload, timeoutMs);
+}
+
+std::vector<float> ProcessGroup::DecodeQwen3(uint32_t tokenId, int timeoutMs) {
+    if (timeoutMs <= 0) {
+        throw std::invalid_argument("invalid Qwen3 decode timeout");
+    }
+    std::vector<uint8_t> payload;
+    Put32(payload, tokenId);
+    Put32(payload, uint32_t(timeoutMs));
+    return impl->Logits(Kind::DecodeQwen3, payload, timeoutMs);
+}
+
+void ProcessGroup::EndQwen3Request() {
+    impl->RequestStates(true);
+}
+
+std::vector<Qwen3RequestInfo> ProcessGroup::Qwen3Requests() {
+    return impl->RequestStates(false);
 }
 
 void ProcessGroup::Stop() {

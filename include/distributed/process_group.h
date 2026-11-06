@@ -37,6 +37,12 @@ struct ProcessModelInfo {
     uint64_t sourceBytesRead = 0;
 };
 
+struct Qwen3RequestInfo {
+    bool active = false;
+    uint32_t tokens = 0, capacity = 0, positionBegin = 0;
+    uint64_t deviceBytes = 0;
+};
+
 enum class Qwen3LayerStage : uint32_t { Full = 0, Attention = 1, Mlp = 2 };
 
 // Linux 单机控制面。Ready 仅代表 worker/通信就绪，不代表模型已加载。
@@ -133,6 +139,34 @@ public:
      */
     std::vector<float> PrefillQwen3(const std::vector<uint32_t> &tokenIds,
         uint32_t positionBegin = 0, int timeoutMs = 300000);
+
+    /**
+     * 开始唯一活动请求，执行 Prefill 并保留各层 rank-local FP16 K/V。
+     *
+     * 无分页、共享前缀或调度；请求结束必须调用 EndQwen3Request，卸载也会释放。
+     * 每 rank KV 上限 256 MiB，独立于临时工作区；任一 worker 失败终止整组。
+     * @param tokenIds Prompt ID，长度 1..128，不能超过 capacity。
+     * @param capacity Prompt 加后续输入 token 的总容量，范围 1..2048。
+     * @param positionBegin RoPE 起点，整个容量的位置必须不超过 1048576。
+     * @param timeoutMs 整组截止时间，必须为正。
+     * @return Prompt 末 token 的完整 FP32 logits；不采样。
+     */
+    std::vector<float> BeginQwen3Request(const std::vector<uint32_t> &tokenIds,
+        uint32_t capacity = 2048, uint32_t positionBegin = 0, int timeoutMs = 300000);
+
+    /**
+     * 向唯一活动请求追加一个 token，读取历史 K/V 并返回下一 token 的 logits。
+     * @param tokenId 调用者选择的输入 token；本接口不执行采样或 EOS 停止。
+     * @param timeoutMs 整组截止时间，必须为正。
+     * @return 完整 FP32 词表；无请求、容量不足或非法 ID 会使 worker 拒绝并终止整组。
+     */
+    std::vector<float> DecodeQwen3(uint32_t tokenId, int timeoutMs = 300000);
+
+    /** 同步释放活动请求的全部 KV，允许重复调用；失败终止整组。 */
+    void EndQwen3Request();
+
+    /** @return 各 rank 的实际 KV 分配和有效长度；无活动请求时均为零。失败终止整组。 */
+    std::vector<Qwen3RequestInfo> Qwen3Requests();
 
     /**
      * 停止监控、请求正常退出并回收全部 worker。
