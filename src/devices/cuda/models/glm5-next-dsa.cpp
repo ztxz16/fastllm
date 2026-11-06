@@ -74,9 +74,9 @@ bool FastllmCudaGlm5NextDsaPrefill(const fastllm::Data &query,
     const int rows = query.dims[1], tokens = latent.dims[1];
     const int width = indices.dims[2], paddedWidth = (width + 63) / 64 * 64;
     Data bytes, scales, packed, padded, lse;
-    Prepare(bytes, INT8, {tokens, 512}, device);
+    Prepare(bytes, fastllm::INT8, {tokens, 512}, device);
     Prepare(scales, FLOAT32, {tokens, 4}, device);
-    Prepare(packed, INT8, {tokens, 528}, device);
+    Prepare(packed, fastllm::INT8, {tokens, 528}, device);
     Prepare(padded, fastllm::INT32, {rows, paddedWidth}, device);
     Prepare(lse, FLOAT32, {rows, 64}, device);
     Prepare(output, BFLOAT16, query.dims, device);
