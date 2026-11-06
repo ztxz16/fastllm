@@ -45,8 +45,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\make_release.ps1 `
 
 # 继续已有多架构编译；保持上次的构建目录及 CMake 参数
 .\make_release.ps1 -BuildDirectory build-release-1.9.1/native `
-  -OutputDirectory build-release-next -Offline `
-  -CMakeArgs "-DCMAKE_CUDA_FLAGS=--split-compile=2"
+  -OutputDirectory build-release-next -Offline
 ```
 
 发布入口总是增量编译。中断后重新运行时，保留相同的 `-BuildDirectory`、

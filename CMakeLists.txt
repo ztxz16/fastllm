@@ -473,6 +473,12 @@ if (USE_CUDA)
     else()
         message(STATUS "CUTLASS FP8 kernels: OFF (${FASTLLM_CUTLASS_DIR})")
     endif()
+    if (MSVC AND (FASTLLM_CUTLASS_FP8_ARCH_ENABLED OR FASTLLM_DEEPGEMM_FP8_SM90_ENABLED))
+        # NVCC's generated host code contains dependent CuTe CTAD expressions
+        # that MSVC diagnoses before instantiation in C++20 two-phase mode.
+        # Retain delayed host template parsing for these CUDA backends.
+        add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:twoPhase->)
+    endif()
     #message(${CMAKE_CUDA_IMPLICIT_LINK_DIRECTORIES})
     # Start the large CUTLASS instantiations before the smaller dispatch units.
     set(FASTLLM_CUDA_SOURCES

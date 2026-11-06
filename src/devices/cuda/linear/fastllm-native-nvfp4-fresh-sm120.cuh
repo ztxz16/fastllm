@@ -8,6 +8,7 @@
 // Only valid AS rows are fetched; invalid shared rows are explicitly zeroed.
 #pragma once
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -43,8 +44,15 @@ template <int MODE, int WN> __device__ __forceinline__ int weightrow(int local, 
         return start + local;
 }
 struct Descriptors {
-    alignas(128) CUtensorMap a, b;
+    // MSVC cannot pass over-aligned types by value in NVCC's host stub.
+    // Keep the device parameter alignment and align host storage at its use.
+#if !defined(_MSC_VER) || defined(__CUDA_ARCH__)
+    alignas(128)
+#endif
+    CUtensorMap a, b;
 };
+static_assert(sizeof(Descriptors) == 2 * sizeof(CUtensorMap));
+static_assert(offsetof(Descriptors, b) == sizeof(CUtensorMap));
 __device__ __forceinline__ void tmaload(void *dst, const CUtensorMap *desc, int x, int y, uint64_t *bar) {
     asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes [%0], [%1, "
                  "{%2,%3}], [%4];" ::"r"(smem(dst)),
@@ -300,7 +308,7 @@ static bool Run(const uint8_t *x, const uint8_t *xs, const uint8_t *w, const uin
                 const float *gw, half *y, int m, int n, int k, int mode) {
     if (!CanRun(m, n, k, mode))
         return false;
-    Descriptors desc{};
+    alignas(128) Descriptors desc{};
     auto encode = [](CUtensorMap *d, const void *p, int width, int height, int rows) {
         uint64_t shape[] = {uint64_t(width), uint64_t(height)}, strides[] = {uint64_t(width)};
         uint32_t box[] = {64, uint32_t(rows)}, elem[] = {1, 1};
