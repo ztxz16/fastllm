@@ -35,13 +35,14 @@ void CheckNccl(ncclResult_t result) {
 #endif
 
 /**
- * 持有单个 worker 的 CUDA/NCCL 资源、可选 Qwen3 权重和单层执行器，不创建 KV。
+ * 持有单个 worker 的 CUDA/NCCL、可选 Qwen3 权重和管理请求 KV/Graph 的执行器。
  *
  * 失败时由进程退出释放 CUDA 上下文；正常退出必须先同步，再销毁通信组和缓冲。
  * 不在异常析构路径进入可能阻塞的 NCCL 清理，由父进程负责超时终止。
  */
 struct DeviceRuntime {
     bool controlOnly;
+    bool cudaGraph;
 #ifdef FASTLLM_PROCESS_TP_CUDA
     cudaStream_t stream = nullptr;
     ncclComm_t comm = nullptr;
@@ -225,7 +226,7 @@ struct DeviceRuntime {
             memcpy(&input[i], &bits, sizeof(bits));
         }
         if (!layerExecutor) {
-            layerExecutor = std::make_unique<fastllm::distributed::Qwen3LayerExecutor>(*weights, stream, comm);
+            layerExecutor = std::make_unique<fastllm::distributed::Qwen3LayerExecutor>(*weights, stream, comm, cudaGraph);
         }
         auto output = layerExecutor->Forward(Get32(payload, 0), Get32(payload, 4), Get32(payload, 8),
             Get32(payload, 12), static_cast<fastllm::distributed::Qwen3LayerStage>(Get32(payload, 16)), input);
@@ -264,7 +265,7 @@ struct DeviceRuntime {
             ids.push_back(Get32(payload, offset));
         }
         if (!layerExecutor) {
-            layerExecutor = std::make_unique<fastllm::distributed::Qwen3LayerExecutor>(*weights, stream, comm);
+            layerExecutor = std::make_unique<fastllm::distributed::Qwen3LayerExecutor>(*weights, stream, comm, cudaGraph);
         }
         auto logits = decode ? layerExecutor->Decode(Get32(payload, 0)) :
             begin ? layerExecutor->BeginRequest(ids, Get32(payload, 8), Get32(payload, 0)) :
@@ -294,12 +295,20 @@ struct DeviceRuntime {
             layerExecutor->EndRequest();
         }
         auto info = layerExecutor ? layerExecutor->RequestInfo() : fastllm::distributed::Qwen3RequestInfo{};
+        if (!layerExecutor) info.graph.enabled = cudaGraph;
         std::vector<uint8_t> result;
         Put32(result, info.active);
         Put32(result, info.tokens);
         Put32(result, info.capacity);
         Put32(result, info.positionBegin);
         Put64(result, info.deviceBytes);
+        Put32(result, info.graph.enabled);
+        Put32(result, info.graph.active);
+        Put64(result, info.graph.captures);
+        Put64(result, info.graph.replays);
+        Put64(result, info.graph.warmups);
+        Put64(result, info.graph.eagerDecodes);
+        Put64(result, info.graph.workspaceBytes);
         return result;
 #else
         throw std::runtime_error("worker built without CUDA");
@@ -336,10 +345,11 @@ int main(int argc, char **argv) {
                 throw std::runtime_error("invalid/duplicate worker arguments");
             }
         }
-        if (args.size() != 7 || args.at("--control-fd") != uint64_t(kWorkerFd) ||
+        if (args.size() != 8 || args.at("--control-fd") != uint64_t(kWorkerFd) ||
             args.at("--world-size") == 0 || args.at("--world-size") > 1024 ||
             args.at("--rank") >= args.at("--world-size") || args.at("--device") > INT_MAX ||
-            args.at("--control-only") > 1 || args.at("--parent-pid") == 0 ||
+            args.at("--control-only") > 1 || args.at("--cuda-graph") > 1 ||
+            (args.at("--control-only") && args.at("--cuda-graph")) || args.at("--parent-pid") == 0 ||
             args.at("--parent-pid") > INT_MAX || args.at("--session") == 0) {
             throw std::runtime_error("invalid worker identity");
         }
@@ -364,7 +374,7 @@ int main(int argc, char **argv) {
         int rank = static_cast<int>(args.at("--rank"));
         int world = static_cast<int>(args.at("--world-size"));
         int device = static_cast<int>(args.at("--device"));
-        DeviceRuntime runtime{args.at("--control-only") != 0};
+        DeviceRuntime runtime{args.at("--control-only") != 0, args.at("--cuda-graph") != 0};
         runtime.Bind(device);
 
         std::vector<uint8_t> hello;

@@ -1,5 +1,6 @@
 #include "distributed/qwen3_generation.h"
 #include "json11.hpp"
+#include "tp_graph_report.h"
 
 #include <cmath>
 #include <cerrno>
@@ -53,7 +54,8 @@ std::vector<uint32_t> Ids(const Json &value) {
 Json::array EmptyCache(ProcessGroup &group) {
     Json::array states;
     for (const auto &info : group.Qwen3Requests()) {
-        if (info.active || info.tokens || info.capacity || info.positionBegin || info.deviceBytes) {
+        if (info.active || info.tokens || info.capacity || info.positionBegin || info.deviceBytes ||
+            info.graph.active || info.graph.workspaceBytes) {
             throw std::runtime_error("generation leaked request KV");
         }
         states.push_back(Json::object{{"active", info.active}, {"tokens", int(info.tokens)},
@@ -115,6 +117,7 @@ void Generate(ProcessGroup &group, const Json &request, bool trace, Json::object
         report["token_ids"] = std::move(ids);
         report["finish_reason"] = result.finishReason;
         report["cache_after_generate"] = EmptyCache(group);
+        report["graph"] = GraphState(group);
     } catch (...) {
         report["steps"] = std::move(steps);
         throw;
@@ -265,6 +268,7 @@ void Serve(ProcessGroup &group, SessionSocket &socket, bool trace, Json::object 
     ready["status"] = "PASS";
     ready["model_load_count"] = 1;
     ready["cache"] = EmptyCache(group);
+    ready["graph"] = GraphState(group);
     ready["cancellation"] = cancellation ? "request_id_datagram" : "none";
     ready["token_events"] = true;
     socket.Write(ready);
@@ -289,7 +293,8 @@ void Serve(ProcessGroup &group, SessionSocket &socket, bool trace, Json::object 
         uint32_t tokenIndex = 0;
 
         Json::object result{{"event", "result"}, {"id", static_cast<long long>(id)},
-            {"status", "FAIL"}, {"backend", report["backend"]}, {"workers", report["workers"]}};
+            {"status", "FAIL"}, {"backend", report["backend"]}, {"workers", report["workers"]},
+            {"execution", report["execution"]}};
         try {
             Generate(group, message["request"], trace, result, [&]() {
                 if (socket.Disconnected()) throw std::runtime_error("session client disconnected");
@@ -309,6 +314,7 @@ void Serve(ProcessGroup &group, SessionSocket &socket, bool trace, Json::object 
             if (group.State() == ProcessGroupState::Ready && (!cancellation || cancellation->Valid())) {
                 try {
                     result["cache_after_error"] = EmptyCache(group);
+                    result["graph"] = GraphState(group);
                     reusable = true;
                 } catch (...) {}
             }
@@ -322,6 +328,7 @@ void Serve(ProcessGroup &group, SessionSocket &socket, bool trace, Json::object 
 
     group.UnloadQwen3();
     report["cache_after_unload"] = EmptyCache(group);
+    report["graph_after_unload"] = GraphState(group);
     group.Stop();
     if (!group.LastError().empty() || !group.Workers().empty()) {
         throw std::runtime_error("session shutdown failed: " + group.LastError());
@@ -354,7 +361,7 @@ int main(int argc, char **argv) {
             const std::string key = argv[i];
             if (i + 1 == argc || (key != "--worker" && key != "--model" && key != "--request" &&
                 key != "--devices" && key != "--trace-logits" && key != "--session-fd" &&
-                key != "--cancel-fd") || !args.emplace(key, argv[i+1]).second) {
+                key != "--cancel-fd" && key != "--cuda-graph") || !args.emplace(key, argv[i+1]).second) {
                 throw std::runtime_error("invalid/duplicate generation argument");
             }
         }
@@ -389,6 +396,8 @@ int main(int argc, char **argv) {
         }
 
         ProcessGroupOptions options;
+        options.cudaGraph = args.count("--cuda-graph") && ParseCudaGraph(args.at("--cuda-graph"));
+        report["execution"] = options.cudaGraph ? "decode_cuda_graph" : "eager";
         options.workerPath = fs::absolute(args.at("--worker")).string();
         options.operationTimeoutMs = options.shutdownTimeoutMs = 30000;
         auto devices = args.count("--devices") ? args.at("--devices") : "0,1";
@@ -414,6 +423,7 @@ int main(int argc, char **argv) {
             Generate(group, request, trace, report);
             group.UnloadQwen3();
             report["cache_after_unload"] = EmptyCache(group);
+            report["graph_after_unload"] = GraphState(group);
             group.Stop();
             if (!group.LastError().empty() || !group.Workers().empty()) {
                 throw std::runtime_error("generation shutdown failed: " + group.LastError());

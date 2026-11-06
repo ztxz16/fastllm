@@ -11,12 +11,13 @@ namespace distributed {
 class Qwen3LayerExecutor {
 public:
     /**
-     * 创建单个 worker 的 eager 执行器，不取得权重、stream 或通信组所有权。
+     * 创建单个 worker 的执行器，不取得权重、stream 或通信组所有权。
      * @param weights 已上传的 rank-local FP16 权重，必须比执行器存活更久。
      * @param stream worker 执行 stream；全部算子与 NCCL 使用此 stream。
      * @param comm 已初始化的 TP 通信组。
+     * @param cudaGraph true 时单 token Decode 使用严格 CUDA Graph；Prefill 保持 Eager。
      */
-    Qwen3LayerExecutor(const Qwen3DeviceWeights &weights, cudaStream_t stream, ncclComm_t comm);
+    Qwen3LayerExecutor(const Qwen3DeviceWeights &weights, cudaStream_t stream, ncclComm_t comm, bool cudaGraph = false);
     ~Qwen3LayerExecutor();
     Qwen3LayerExecutor(const Qwen3LayerExecutor&) = delete;
     Qwen3LayerExecutor &operator=(const Qwen3LayerExecutor&) = delete;
@@ -61,10 +62,10 @@ public:
     /** @param tokenId 追加的单个 ID；必须已有请求且尚有容量。@return 本 rank FP32 logits；失败终止 worker。 */
     std::vector<float> Decode(uint32_t tokenId);
 
-    /** 同步释放全部请求 KV 并清零状态；允许重复调用，失败终止 worker。 */
+    /** 同步销毁请求 Graph 并释放固定工作区及 KV；保留累计执行计数，允许重复调用。 */
     void EndRequest();
 
-    /** @return 实际成功分配的 KV 字节及有效长度，不包含请求临时工作区。 */
+    /** @return 实际 KV 分配/有效长度与 Graph 执行计数、固定工作区字节。 */
     Qwen3RequestInfo RequestInfo() const;
 
     /** 同步释放请求 KV、工作区和 cuBLAS handle；必须在权重卸载前调用，失败须终止 worker。 */
@@ -79,6 +80,12 @@ private:
      * @return 本 rank 的 FP32 词表分片，出现异常后必须终止 worker。
      */
     std::vector<float> RunTokens(const std::vector<uint32_t> &tokenIds, uint32_t positionBegin, bool cached);
+    /**
+     * 使用请求内固定地址重放单 token Decode，成功后才提交 KV 长度。
+     * @param tokenId 已验证范围的输入 ID；首次调用先预热同一位置，再捕获和重放。
+     * @return FP32 本 rank 词表 logits；任何捕获、执行或检查失败均终止 worker，不回退。
+     */
+    std::vector<float> DecodeGraph(uint32_t tokenId);
     struct Impl;
     std::unique_ptr<Impl> impl;
 };

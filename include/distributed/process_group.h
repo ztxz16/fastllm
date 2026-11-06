@@ -20,6 +20,8 @@ struct ProcessGroupOptions {
     int operationTimeoutMs = 10000;
     int shutdownTimeoutMs = 3000;
     int heartbeatIntervalMs = 1000;
+    // 组内全部 worker 使用相同 Decode Graph 模式；不支持与 controlOnly 组合。
+    bool cudaGraph = false;
 };
 
 struct ProcessWorkerInfo {
@@ -37,10 +39,17 @@ struct ProcessModelInfo {
     uint64_t sourceBytesRead = 0;
 };
 
+/** 单个模型生命周期内的执行证据；请求结束释放图，卸载模型清零计数。 */
+struct Qwen3GraphInfo {
+    bool enabled = false, active = false;
+    uint64_t captures = 0, replays = 0, warmups = 0, eagerDecodes = 0, workspaceBytes = 0;
+};
+
 struct Qwen3RequestInfo {
     bool active = false;
     uint32_t tokens = 0, capacity = 0, positionBegin = 0;
     uint64_t deviceBytes = 0;
+    Qwen3GraphInfo graph;
 };
 
 enum class Qwen3LayerStage : uint32_t { Full = 0, Attention = 1, Mlp = 2 };

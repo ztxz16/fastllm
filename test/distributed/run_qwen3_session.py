@@ -41,6 +41,7 @@ def main():
     for name in ("generate", "worker", "decode-check", "build-cache"):
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--model", type=Path)
+    parser.add_argument("--cuda-graph", action="store_true")
     parser.add_argument("--devices", default="0,1")
     parser.add_argument("--output", type=Path, default=ROOT / "test/distributed/results")
     args = parser.parse_args()
@@ -56,7 +57,9 @@ def main():
         git_status=capture(["git", "status", "--short"]), seed=123, warmup=0, iterations=1, repeats=1,
         gpu=capture(["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv,noheader"]),
         cuda_visible_devices=os.environ.get("CUDA_VISIBLE_DEVICES"), devices=devices,
-        expected_case_count=len(specs)*14, execution="eager", prefix_cache=False, kv_cache="FP16 request-local",
+        expected_case_count=len(specs)*(16 if args.cuda_graph else 14),
+        execution="decode_cuda_graph" if args.cuda_graph else "eager",
+        graph_warmup_per_request=1 if args.cuda_graph else 0, prefix_cache=False, kv_cache="FP16 request-local",
         report_title="Qwen3 persistent session correctness",
         report_description="同一常驻进程组串行处理请求；小模型对照CPU，真实模型逐步单卡重放。非性能测试。")
     rows = []
@@ -78,8 +81,10 @@ def main():
                      ("seeded_repeat", dict(base, temperature=0.8, top_k=5, top_p=0.9)),
                      ("cancel_before_begin", base), ("A_after_cancel", base),
                      ("stream_A", base), ("stream_seeded", dict(base, temperature=0.8, top_k=5, top_p=0.9))]
+            if args.cuda_graph:
+                tasks += [("cancel_after_graph", dict(base, max_new_tokens=32)), ("A_after_graph_cancel", base)]
             previous = {}
-            with Qwen3ProcessSession(args.generate, args.worker, model, args.devices, directory / "session", trace=True) as session:
+            with Qwen3ProcessSession(args.generate, args.worker, model, args.devices, directory / "session", trace=True, cuda_graph=args.cuda_graph) as session:
                 for task_name, request in tasks:
                     path = directory / task_name
                     path.mkdir()
@@ -93,7 +98,30 @@ def main():
                             require("A" in previous, "first request failed; cannot determine EOS")
                             request = dict(base, eos_token_ids=[previous["A"]["token_ids"][0]])
                         row.update(prompt_tokens=len(request["token_ids"]), max_new_tokens=request["max_new_tokens"])
-                        if task_name == "cancel_before_begin":
+                        if task_name == "cancel_after_graph":
+                            event, received = threading.Event(), []
+                            def on_token(token):
+                                received.append(token)
+                                if len(received) == 2:
+                                    event.set()
+                            before = session._graph_state[0]['replays']
+                            try:
+                                session.generate(request, cancel_event=event, on_token=on_token)
+                            except GenerationCancelled as error:
+                                require(len(received) >= 2 and error.report['graph'][0]['replays'] > before,
+                                        'cancellation did not exercise captured graph')
+                                baseline = previous['A']
+                                checked = min(len(received), len(baseline['token_ids']))
+                                require(received[:checked] == baseline['token_ids'][:checked],
+                                        'cancelled graph changed output prefix')
+                                for index in range(checked):
+                                    compare_logits(error.report['steps'][index]['logits'], baseline['steps'][index]['logits'],
+                                                   metrics, f'cancel_after_graph/step-{index}', 0, 0)
+                                row.update(status="PASS", graph=error.report['graph'],
+                                           reason="cancelled after graph replay; workspace/KV released")
+                            else:
+                                raise AssertionError("graph request ignored cancellation")
+                        elif task_name == "cancel_before_begin":
                             event = threading.Event()
                             event.set()
                             try:
@@ -115,6 +143,7 @@ def main():
                             streamed = []
                             report = session.generate(request, on_token=streamed.append if task_name.startswith("stream_") else None)
                             verify_output(report, request, vocab)
+                            row.update(execution=report.get("execution"), graph=report.get("graph"))
                             if task_name.startswith("stream_"):
                                 require(streamed == report["token_ids"], "streamed Token IDs differ from final result")
                                 original = "A" if task_name == "stream_A" else "seeded"
@@ -123,7 +152,7 @@ def main():
                             if task_name == "eos_first":
                                 require(len(report["token_ids"]) == 1 and report["finish_reason"] == "eos",
                                         "first EOS did not stop generation")
-                            if task_name in ("A_repeat", "A_after_reject", "A_after_cancel", "seeded_repeat"):
+                            if task_name in ("A_repeat", "A_after_reject", "A_after_cancel", "seeded_repeat", "A_after_graph_cancel"):
                                 original = "seeded" if task_name == "seeded_repeat" else "A"
                                 require(original in previous and report["token_ids"] == previous[original]["token_ids"],
                                         "request state/seed changed across session reuse")

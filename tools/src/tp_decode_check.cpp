@@ -1,5 +1,6 @@
 #include "distributed/process_group.h"
 #include "json11.hpp"
+#include "tp_graph_report.h"
 
 #include <algorithm>
 #include <cmath>
@@ -53,7 +54,7 @@ int main(int argc, char **argv) {
             std::string key = argv[i];
             if (i + 1 == argc || (key != "--worker" && key != "--model" && key != "--tasks" &&
                 key != "--devices" && key != "--case" && key != "--reload-model" &&
-                key != "--max-logit-elements") || !args.emplace(key, argv[i + 1]).second) {
+                key != "--max-logit-elements" && key != "--cuda-graph") || !args.emplace(key, argv[i + 1]).second) {
                 throw std::runtime_error("invalid/duplicate decode checker argument");
             }
         }
@@ -69,6 +70,8 @@ int main(int argc, char **argv) {
             throw std::runtime_error("invalid decode tasks JSON: " + error);
         }
         ProcessGroupOptions options;
+        options.cudaGraph = args.count("--cuda-graph") && ParseCudaGraph(args.at("--cuda-graph"));
+        report["execution"] = options.cudaGraph ? "decode_cuda_graph" : "eager";
         options.workerPath = fs::absolute(args.at("--worker")).string();
         options.operationTimeoutMs = options.shutdownTimeoutMs = 30000;
         std::string devices = args.count("--devices") ? args.at("--devices") : "0,1";
@@ -138,7 +141,7 @@ int main(int argc, char **argv) {
             } else if (op != "query") {
                 throw std::runtime_error("unknown decode task operation");
             }
-            Json::object result{{"task", task["name"]}, {"op", op}, {"cache", CacheState(group)}};
+            Json::object result{{"task", task["name"]}, {"op", op}, {"cache", CacheState(group)}, {"graph", GraphState(group)}};
             if (!logits.empty()) {
                 // Json 的每个数字都有对象开销；仅限制任务数不足以约束长序列报告的内存。
                 if (logits.size() > logitLimit - recordedLogits) {
@@ -159,6 +162,7 @@ int main(int argc, char **argv) {
         }
         group.UnloadQwen3();
         report["after_unload"] = CacheState(group);
+        report["graph_after_unload"] = GraphState(group);
         group.Ping();
         group.Stop();
         if (!group.LastError().empty() || !group.Workers().empty()) {

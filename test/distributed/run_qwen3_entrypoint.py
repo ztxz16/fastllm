@@ -38,6 +38,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('generate', 'worker', 'model', 'build-cache', 'package-root'):
         parser.add_argument('--' + name, type=Path, required=True)
+    parser.add_argument('--cuda-graph', action='store_true')
     parser.add_argument('--devices', default='0,1')
     parser.add_argument('--output', type=Path, default=ROOT / 'test/distributed/results')
     args = parser.parse_args()
@@ -48,7 +49,8 @@ def main():
         gpu=capture(['nvidia-smi', '--query-gpu=name,driver_version', '--format=csv,noheader']),
         cuda=capture(['nvcc', '--version']),
         cuda_visible_devices=os.environ.get('CUDA_VISIBLE_DEVICES'), devices=args.devices,
-        expected_case_count=12, execution='eager', prefix_cache=False, kv_cache='FP16 request-local',
+        expected_case_count=12, execution='decode_cuda_graph' if args.cuda_graph else 'eager',
+        graph_warmup_per_request=1 if args.cuda_graph else 0, prefix_cache=False, kv_cache='FP16 request-local',
         report_title='FastLLM process TP public entrypoint',
         report_description='正式工厂/CLI 与原生生成的 Token ID 精确对照；不代表性能或独立数学精度验证。')
     rows = []
@@ -91,6 +93,8 @@ def main():
         case('native_reference', baseline)
         expected_text = tokenizer.decode(reference['token_ids'], skip_special_tokens=True, clean_up_tokenization_spaces=False)
         common = [str(args.model.resolve()), '--tp_backend', 'process', '--tp', args.devices]
+        if args.cuda_graph:
+            common += ['--cuda-graph']
         # 包目录自动发现产物，故意不传显式 binary/worker，验证正式打包布局。
         model = make_normal_llm_model(make_normal_parser('accept').parse_args(common + ['--tp-output', str(output / 'factory')]))
         try:

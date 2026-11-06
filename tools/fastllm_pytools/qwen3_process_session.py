@@ -13,6 +13,7 @@ import threading
 import time
 
 from .tp_process_utils import isolated_process, wait_case
+from .tp_graph import validate_graph
 
 BACKEND = "qwen3_process_generate_cublas_nccl"
 EMPTY = dict(active=False, tokens=0, capacity=0, device_bytes=0)
@@ -41,7 +42,7 @@ class GenerationObserverError(RuntimeError):
 class Qwen3ProcessSession:
     """同步会话；线程调用串行化，超时或协议错误后整组回收，不自动重试请求。"""
 
-    def __init__(self, binary, worker, model, devices, output, *, timeout=1800, trace=False):
+    def __init__(self, binary, worker, model, devices, output, *, timeout=1800, trace=False, cuda_graph=False):
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("session timeout must be finite and positive")
         device_ids = [int(value) for value in devices.split(",")]
@@ -50,6 +51,10 @@ class Qwen3ProcessSession:
         self.binary, self.worker, self.model = (Path(value).resolve() for value in (binary, worker, model))
         self.devices = device_ids
         self.output = Path(output).resolve()
+        if type(cuda_graph) is not bool:
+            raise ValueError("cuda_graph must be boolean")
+        self.cuda_graph = cuda_graph
+        self._graph_state = None
         self.timeout, self.trace = timeout, trace
         self.state = "new"
         self.ready = self.shutdown = None
@@ -115,6 +120,29 @@ class Qwen3ProcessSession:
         if cache != [EMPTY for _ in self.devices]:
             raise RuntimeError("session returned nonempty or invalid KV state")
 
+    def _check_graph(self, report, *, reset=False, decodes=None):
+        key = "graph_after_unload" if reset else "graph"
+        if not self.cuda_graph and key not in report:
+            return  # Eager 客户端兼容旧原生报告；Graph 必须具有执行证据。
+        expected = "decode_cuda_graph" if self.cuda_graph else "eager"
+        if report.get("execution") != expected:
+            raise RuntimeError("CUDA Graph execution mode mismatch")
+        states = validate_graph(report.get(key), len(self.devices), self.cuda_graph)
+        counts = ('captures', 'replays', 'warmups', 'eager_decodes')
+        if reset or self._graph_state is None:
+            if any(states[0][key] for key in counts):
+                raise RuntimeError("CUDA Graph state not reset")
+        else:
+            before, after = self._graph_state[0], states[0]
+            if any(after[key] < before[key] for key in counts):
+                raise RuntimeError("CUDA Graph counters regressed")
+            if decodes is not None:
+                key = 'replays' if self.cuda_graph else 'eager_decodes'
+                captures = int(decodes > 0) if self.cuda_graph else 0
+                if after[key] - before[key] != decodes or after['captures'] - before['captures'] != captures:
+                    raise RuntimeError("CUDA Graph decode count mismatch")
+        self._graph_state = copy.deepcopy(states)
+
     def _dispose(self, state):
         self.state = "closing" if state == "closed" else state
         try:
@@ -146,6 +174,8 @@ class Qwen3ProcessSession:
                 command = [str(self.binary), "--worker", str(self.worker), "--model", str(self.model),
                            "--devices", ",".join(map(str, self.devices)), "--session-fd", str(child.fileno()),
                            "--trace-logits", "1" if self.trace else "0", "--cancel-fd", str(cancel_child.fileno())]
+                if self.cuda_graph:
+                    command += ["--cuda-graph", "1"]
                 (self.output / "command.txt").write_text(shlex.join(command) + "\n")
                 stdout = self._stack.enter_context((self.output / "native.stdout.log").open("wb"))
                 stderr = self._stack.enter_context((self.output / "native.stderr.log").open("wb"))
@@ -167,6 +197,7 @@ class Qwen3ProcessSession:
                     raise RuntimeError("invalid session workers")
                 self._workers = copy.deepcopy(workers)
                 self._empty(self.ready.get("cache"))
+                self._check_graph(self.ready)
                 (self.output / "ready.json").write_text(json.dumps(self.ready, ensure_ascii=False, indent=2))
                 self.state = "ready"
                 return self
@@ -236,6 +267,7 @@ class Qwen3ProcessSession:
                         raise RuntimeError("invalid session stopping condition")
                 else:
                     raise RuntimeError("invalid session result status")
+                self._check_graph(result, decodes=len(result["token_ids"]) - 1 if result["status"] == "PASS" else None)
                 if on_token is not None:
                     expected = result.get("token_ids") if result["status"] == "PASS" else [step["token_id"] for step in result.get("steps", [])]
                     if (not isinstance(expected, list) or any(type(token) is not int for token in expected) or
@@ -269,6 +301,7 @@ class Qwen3ProcessSession:
                     self.shutdown.get("shutdown_complete") is not True):
                     raise RuntimeError("session shutdown failed")
                 self._empty(self.shutdown.get("cache_after_unload"))
+                self._check_graph(self.shutdown, reset=True)
                 if wait_case(self._process, min(30, self.timeout)) != 0:
                     raise RuntimeError("session exited with failure")
                 self._dispose("closed")
