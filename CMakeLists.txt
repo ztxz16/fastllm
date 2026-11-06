@@ -2628,6 +2628,9 @@ if (UNIT_TEST)
             fastllm_add_checked_test(cuda_standard_moe_mailbox cuda_standard_moe_mailbox_test "ALL_PASS" 240)
             set_tests_properties(cuda_standard_moe_mailbox PROPERTIES LABELS cuda
                 ENVIRONMENT "FT_NUMAS=1;FT_THREADS=4" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240)
+            fastllm_add_checked_test(cuda_standard_moe_pageable cuda_standard_moe_mailbox_test "ALL_PASS" 360)
+            set_tests_properties(cuda_standard_moe_pageable PROPERTIES LABELS "cuda;hybrid"
+                ENVIRONMENT "FT_NUMAS=1;FT_THREADS=4;FT_PINNED_WEIGHT=0" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
             fastllm_add_checked_test(cuda_standard_moe_placement_policy
                 cuda_standard_moe_mailbox_test "ALL_PASS" 120 --placement-policy)
             set_tests_properties(cuda_standard_moe_placement_policy PROPERTIES LABELS cuda
@@ -2790,8 +2793,29 @@ if (UNIT_TEST)
         fastllm_add_checked_test(cuda_moe_shared_prefill cuda_moe_cache_test "ALL_PASS shared prefill" 180 --prefill)
         fastllm_add_checked_test(cuda_moe_shared_prefill_model_shape cuda_moe_cache_test "ALL_PASS shared prefill model shape" 180 --prefill-model-shape)
         set_tests_properties(cuda_moe_shared_prefill cuda_moe_shared_prefill_model_shape PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+        fastllm_add_checked_test(cuda_moe_shared_prefill_pageable cuda_moe_cache_test "ALL_PASS shared prefill" 180 --prefill)
+        fastllm_add_checked_test(cuda_moe_shared_prefill_model_shape_pageable cuda_moe_cache_test "ALL_PASS shared prefill model shape" 180 --prefill-model-shape)
+        set_tests_properties(cuda_moe_shared_prefill_pageable cuda_moe_shared_prefill_model_shape_pageable PROPERTIES
+            LABELS "cuda;hybrid" RUN_SERIAL TRUE ENVIRONMENT "FT_PINNED_WEIGHT=0")
 
         set_tests_properties(cuda_moe_cache_compact PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+
+        add_executable(cuda_host_upload_test test/basic/test_cuda_host_upload.cu)
+        target_include_directories(cuda_host_upload_test PRIVATE include)
+        target_link_libraries(cuda_host_upload_test PRIVATE Threads::Threads)
+        set_target_properties(cuda_host_upload_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON CUDA_RUNTIME_LIBRARY Shared LINKER_LANGUAGE CXX)
+        fastllm_add_checked_test(cuda_host_upload cuda_host_upload_test "PASS pageable upload" 120)
+        set_tests_properties(cuda_host_upload PROPERTIES LABELS cuda RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
+        if (TARGET cuda_host_register_fault)
+            fastllm_add_checked_test(cuda_host_upload_unpinned cuda_host_upload_test "PASS pageable upload" 120)
+            set_tests_properties(cuda_host_upload_unpinned PROPERTIES LABELS cuda RUN_SERIAL TRUE
+                ENVIRONMENT "LD_PRELOAD=$<TARGET_FILE:cuda_host_register_fault>;FASTLLM_TEST_HOST_ALLOC_MAX_BYTES=0")
+        endif()
+        if (TARGET cuda_host_register_fault AND TARGET cuda_standard_moe_mailbox_test)
+            fastllm_add_checked_test(cuda_standard_moe_pin_failure cuda_standard_moe_mailbox_test "ALL_PASS" 360)
+            set_tests_properties(cuda_standard_moe_pin_failure PROPERTIES LABELS "cuda;hybrid" RUN_SERIAL TRUE
+                ENVIRONMENT "LD_PRELOAD=$<TARGET_FILE:cuda_host_register_fault>;FASTLLM_TEST_PIN_MAX_BYTES=1;FASTLLM_TEST_HOST_ALLOC_MAX_BYTES=268435456;FT_NUMAS=1;FT_THREADS=4")
+        endif()
 
         add_executable(cuda_shared_weight_upload_test test/basic/test_cuda_shared_weight_upload.cu)
         target_link_libraries(cuda_shared_weight_upload_test PRIVATE fastllm)
@@ -2862,6 +2886,10 @@ if (UNIT_TEST)
                     "MAILBOX_CHAIN_PASS" 180 --mailbox)
                 fastllm_add_checked_test(cuda_dsv41_moe_fullgraph cuda_dsv41_moe_cache_test
                     "FULL_GRAPH_CHAIN_PASS" 180 --fullgraph)
+                fastllm_add_checked_test(cuda_dsv41_moe_pageable_fullgraph cuda_dsv41_moe_cache_test
+                    "FULL_GRAPH_CHAIN_PASS" 240 --fullgraph --pageable)
+                set_tests_properties(cuda_dsv41_moe_pageable_fullgraph PROPERTIES
+                    LABELS "cuda;moe;numa" RUN_SERIAL TRUE ENVIRONMENT "OMP_NUM_THREADS=1;FT_PINNED_WEIGHT=0")
                 set_tests_properties(cuda_dsv41_moe_mailbox cuda_dsv41_moe_fullgraph PROPERTIES
                     LABELS "cuda;moe;numa" RUN_SERIAL TRUE ENVIRONMENT "OMP_NUM_THREADS=1")
             endif()

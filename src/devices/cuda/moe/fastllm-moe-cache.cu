@@ -317,6 +317,7 @@ struct DecodePolicyState {
 };
 
 struct NativeMoeMailbox;
+struct PageableExpertSource;
 void FinishNativeMoeMailbox(struct DeviceCache &cache, bool observe);
 
 struct DeviceCache {
@@ -379,6 +380,7 @@ struct DeviceCache {
     size_t ggufWorkspaceBytes = 0;
     std::unique_ptr<HybridWorkspace> hybrid;
     std::shared_ptr<NativeMoeMailbox> nativeMailbox;
+    std::shared_ptr<PageableExpertSource> pageableSource;
     std::shared_ptr<FastllmCudaMoeExpertParallel> batchHybrid;
     std::array<uint64_t, 8> cooperativeStats{};
     std::array<std::array<uint64_t, 8>, 4> phaseStats{};
@@ -403,6 +405,7 @@ struct OffloadGroup {
     // When NUMA storage is shared, hostRecords contains only original metadata.
     // The weight shards are borrowed from the model's prefill backend.
     std::vector<void *> numaPointers;
+    bool mappedWeights = true;
     bool cpuDecodeReady = false;
     bool nativeStandardGGUF = false;
     bool qwen38FlashNext = false;
@@ -479,6 +482,9 @@ bool StandardNativeGGUFSupported(const OffloadGroup &group) {
     return true;
 }
 
+// The source adapter also serves graph-selected cache misses without CUDA calls on its CPU producer.
+#include "fastllm-moe-pageable-source.cuh"
+
 void CopyNativeGGUFExpert(const OffloadGroup &group, int table, int expert,
                           uint8_t *destination, cudaStream_t stream) {
     const auto &source = group.ggufSources[table];
@@ -487,10 +493,9 @@ void CopyNativeGGUFExpert(const OffloadGroup &group, int table, int expert,
         const auto &weight = source.weights[part];
         const size_t bytes = weight.rows * weight.rowBytes / source.shards;
         for (int node = 0; node < source.shards; ++node)
-            checkCudaErrors("MoE native GGUF admission", cudaMemcpyAsync(
+            checkCudaErrors("MoE native GGUF admission", fastllm::cuda::UploadImmutableHostWeight(
                 destination + (part ? group.LayerLayout(table).downOffset : 0) + node * bytes,
-                group.numaPointers[base + part * source.shards + node], bytes,
-                cudaMemcpyHostToDevice, stream));
+                group.numaPointers[base + part * source.shards + node], bytes, group.mappedWeights, stream));
     }
 }
 
@@ -502,10 +507,10 @@ void CopyNativeSharedExpert(const OffloadGroup &group, int table, int expert,
         const auto &view = plan.weights[part];
         const size_t bytes = size_t(view.rowsPerShard) * view.rowBytes;
         for (unsigned node = 0; node < plan.shards; ++node)
-            checkCudaErrors("MoE native expert DMA", cudaMemcpyAsync(
+            checkCudaErrors("MoE native expert DMA", fastllm::cuda::UploadImmutableHostWeight(
                 destination + view.destinationOffset + node * bytes,
                 group.numaPointers[base + part * plan.shards + node],
-                bytes, cudaMemcpyHostToDevice, stream));
+                bytes, group.mappedWeights, stream));
     }
 }
 
@@ -553,9 +558,9 @@ void DecodeOverlapWorkspace::CopyExpert(const OffloadGroup &group, int table,
             const auto &view = shared.weights[part];
             auto *target = sharedUpload + (part ? bytes[0] : 0);
             for (unsigned node = 0; node < shared.shards; ++node)
-                checkCudaErrors("MoE shared weight DMA", cudaMemcpyAsync(target + size_t(node) * view.shardBytes,
+                checkCudaErrors("MoE shared weight DMA", fastllm::cuda::UploadImmutableHostWeight(target + size_t(node) * view.shardBytes,
                     group.numaPointers[(key * 2 + part) * shared.shards + node], view.shardBytes,
-                    cudaMemcpyHostToDevice, copyStream));
+                    group.mappedWeights, copyStream));
             if (splitStages || part == 1)
                 fastllm::AssertInFastLLM(fastllm::cuda::CopySharedExpertRecord(shared, nullptr,
                     sharedUpload, sharedUpload + bytes[0], auxiliary, destination, copyStream,
@@ -593,10 +598,10 @@ void DecodeOverlapWorkspace::CopyExpert(const OffloadGroup &group, int table,
             const auto &weight = source.weights[part];
             const size_t bytes = weight.rows * weight.rowBytes / source.shards;
             for (int node = 0; node < source.shards; ++node)
-                checkCudaErrors("MoE NUMA expert DMA", cudaMemcpyAsync(
+                checkCudaErrors("MoE NUMA expert DMA", fastllm::cuda::UploadImmutableHostWeight(
                     target + (part ? source.downOffset : 0) + node * bytes,
                     group.numaPointers[base + part * source.shards + node],
-                    bytes, cudaMemcpyHostToDevice, copyStream));
+                    bytes, group.mappedWeights, copyStream));
             if (splitStages && part == 0)
                 checkCudaErrors("MoE gate ready", cudaEventRecord(gateReady[i], copyStream));
         }
@@ -771,13 +776,14 @@ bool BindSharedFP8(const OffloadLayout &l, const fastllm::Data &w, int part,
     return true;
 }
 
-bool AppendMappedNumaPointers(const fastllm::Data &weight, std::vector<void *> &pointers) {
+bool AppendNumaPointers(const fastllm::Data &weight, std::vector<void *> &pointers, bool &allMapped) {
     for (uint8_t *source : weight.numasData) {
         void *mapped = nullptr;
-        if (!source || (reinterpret_cast<uintptr_t>(source) & 15) ||
-            cudaHostGetDevicePointer(&mapped, source, 0) != cudaSuccess || !mapped) {
+        if (!source || (reinterpret_cast<uintptr_t>(source) & 15)) return false;
+        if (!weight.isPinned) allMapped = false;
+        else if (cudaHostGetDevicePointer(&mapped, source, 0) != cudaSuccess || !mapped) {
             cudaGetLastError();
-            return false;
+            allMapped = false;
         }
         pointers.push_back(source);
     }
@@ -813,9 +819,9 @@ bool BindNumaWeights(OffloadGroup &group, const std::vector<fastllm::Data *> &we
             weight.blockK != weights[part]->blockK || weight.blockM != weights[part]->blockM ||
             weight.dims.size() != 2 || weight.dims[0] != rows || weight.dims[1] != columns ||
             weight.dataDevice != fastllm::DataDevice::CPU ||
-            !weight.isPinned || weight.cpuData != nullptr ||
+            weight.cpuData != nullptr ||
             weight.numasData.size() != size_t(nodes)) return false;
-        if (!AppendMappedNumaPointers(weight, pointers)) return false;
+        if (!AppendNumaPointers(weight, pointers, group.mappedWeights)) return false;
     }
     group.numaPointers = std::move(pointers);
     return true;
@@ -823,7 +829,6 @@ bool BindNumaWeights(OffloadGroup &group, const std::vector<fastllm::Data *> &we
 
 bool CanShareGGUFWeights(const FastllmCudaMoeCacheLayer *layers, int count) {
 #ifdef USE_NUMAS
-    if (!fastllm::NumasMoeWeightsArePinned()) return false;
     for (int layer = 0; layer < count; ++layer) {
         for (int index = 2; index < layers[layer].weightsBatch; ++index) {
             const auto &weight = *layers[layer].weights[index];
@@ -859,7 +864,7 @@ bool BindGGUFWeights(OffloadGroup &group, const std::vector<fastllm::Data *> &we
                 const int columns = part ? layout.inter : layout.hidden;
                 const size_t bytes = part ? layout.downBytes : layout.gateBytes;
                 if (weight.numasData.size() != size_t(nodes) || rows % nodes ||
-                    weight.cpuData || !weight.isPinned || weight.GetBytes() != bytes ||
+                    weight.cpuData || weight.GetBytes() != bytes ||
                     weight.dims.size() != 2 || weight.dims[0] != rows || weight.dims[1] != columns ||
                     fastllm_gguf_restore::Ordinary(weight.ggmlType) !=
                         (part ? layout.downGgmlType : layout.gateGgmlType)) return false;
@@ -867,7 +872,7 @@ bool BindGGUFWeights(OffloadGroup &group, const std::vector<fastllm::Data *> &we
                     (rows % (4 * nodes) || columns % 256)) return false;
                 if (!expert) source.weights[part] = {weight.ggmlType, rows, columns, bytes / rows};
                 else if (source.weights[part].type != weight.ggmlType) return false;
-                if (!AppendMappedNumaPointers(weight, group.numaPointers)) return false;
+                if (!AppendNumaPointers(weight, group.numaPointers, group.mappedWeights)) return false;
             }
         }
         group.ggufSources.push_back(source);
@@ -1138,6 +1143,7 @@ void ReleaseDeviceCache(DeviceCache &cache) {
     cache.hybrid.reset();
     cache.batchHybrid.reset();
     cache.decode.reset();
+    cache.pageableSource.reset();
     cudaFree(cache.records);
     cudaFree(cache.slotOffsets);
     cudaFree(cache.keyToSlot);
@@ -1326,7 +1332,8 @@ void PreloadCompleteNativeCache(OffloadGroup &group, DeviceCache &cache) {
         fastllm::AssertInFastLLM(fastllm::cuda::UploadSharedExpertRecord(shared,
             group.numaPointers.data() + size_t(key) * 2 * shared.shards,
             static_cast<uint8_t *>(scratch.cudaData), scratch.expansionBytes,
-            cache.records + size_t(key) * group.layout.recordStride, cudaStreamPerThread),
+            cache.records + size_t(key) * group.layout.recordStride, cudaStreamPerThread,
+            nullptr, nullptr, group.mappedWeights),
             "MoE full-resident initial upload failed.");
         changes[key] = changes[cache.slots + key] = key;
     }
@@ -1524,7 +1531,7 @@ DeviceCache *GetDeviceCache(OffloadGroup &group, bool waitForAdmission = true) {
         initialized = AllocateOne(reinterpret_cast<void **>(&cache.slotOffsets), bytes) &&
             cudaMemcpy(cache.slotOffsets, slotPlan.offsets.data(), bytes, cudaMemcpyHostToDevice) == cudaSuccess;
     }
-    if (initialized && !group.numaPointers.empty()) {
+    if (initialized && !group.numaPointers.empty() && group.mappedWeights) {
         std::vector<void *> pointers(group.numaPointers.size());
         for (size_t i = 0; initialized && i < pointers.size(); ++i) {
             initialized = cudaHostGetDevicePointer(
@@ -1535,6 +1542,10 @@ DeviceCache *GetDeviceCache(OffloadGroup &group, bool waitForAdmission = true) {
             AllocateOne(reinterpret_cast<void **>(&cache.numaPointers), bytes) &&
             cudaMemcpy(cache.numaPointers, pointers.data(), bytes,
                        cudaMemcpyHostToDevice) == cudaSuccess;
+    }
+    if (initialized && !group.mappedWeights) {
+        cache.pageableSource = std::make_shared<PageableExpertSource>(group);
+        initialized = cache.pageableSource->Init(device);
     }
     if (initialized && group.cpuDecodeReady) {
         // Create the fence before any graph can capture this cache. A graph
@@ -2302,7 +2313,15 @@ bool FastllmCudaPrepareMoeCacheWithBudgets(
     }
     void *host = nullptr;
     if (hostBytes) {
-        cudaError_t state = group->hostStorage.Allocate(hostBytes);
+        bool mapMetadata = true;
+#ifdef USE_NUMAS
+        mapMetadata = !shareNuma || fastllm::NumasMoeWeightsArePinned();
+#endif
+        cudaError_t state = group->hostStorage.Allocate(hostBytes, mapMetadata);
+        if (state != cudaSuccess && shareNuma) {
+            cudaGetLastError();
+            state = group->hostStorage.Allocate(hostBytes, false);
+        }
         host = group->hostStorage.Host();
         if (state != cudaSuccess || !host) {
             std::fprintf(stderr, "[Fastllm] CUDA expert cache could not allocate %.3f GiB "
@@ -2313,6 +2332,7 @@ bool FastllmCudaPrepareMoeCacheWithBudgets(
         }
         group->hostRecords = static_cast<uint8_t *>(host);
         group->deviceHostRecords = static_cast<uint8_t *>(group->hostStorage.Device());
+        if (!group->deviceHostRecords) group->mappedWeights = false;
         if (group->hostStorage.Registrations()) {
             std::fprintf(stderr, "[Fastllm] CUDA expert metadata uses %zu bounded host registrations.\n",
                          group->hostStorage.Registrations());
@@ -2359,7 +2379,7 @@ bool FastllmCudaPrepareMoeCacheWithBudgets(
     if (shareNuma) {
         if (!registerBeforeSnapshot) registerNumaWeights();
         if (!BindNumaWeights(*group, expertWeights, *storage)) {
-            std::fprintf(stderr, "[Fastllm] CUDA expert cache requires matching pinned NUMA "
+            std::fprintf(stderr, "[Fastllm] CUDA expert cache requires matching NUMA "
                          "shards after registration; using the configured MoE backend.\n");
             return false;
         }
@@ -2390,11 +2410,11 @@ bool FastllmCudaPrepareMoeCacheWithBudgets(
     Groups().push_back(std::move(group));
     std::fprintf(stderr,
         "[Fastllm] Prepared %d x %d %s experts in %.3f "
-        "GiB of mapped host storage (record %zu bytes).\n",
+        "GiB of %s host storage (record %zu bytes).\n",
         layerCount, experts, FormatName(layout.weightType),
         static_cast<double>(hostBytes) /
             (1024.0 * 1024.0 * 1024.0),
-        layout.recordStride);
+        rawGroup->deviceHostRecords ? "mapped" : "ordinary", layout.recordStride);
     return true;
 }
 
@@ -2820,6 +2840,9 @@ bool EnsureCachedExperts(OffloadGroup *group, DeviceCache *cache, int tableId,
             metadata, indices, tableId * layout.experts, layout.experts, topk,
             cache->routeSlots, cache->missExperts, cache->missSlots, cache->missCount,
             cache->ensureThreads, stream)) return false;
+    if (cache->pageableSource) return cache->pageableSource->Copy(tableId, cache->records,
+        cache->missExperts, cache->missSlots, cache->missCount, cache->slotOffsets,
+        topk, cache->copyLaunch, stream);
     const auto &shared = group->sharedLayout;
     if (!group->ggufSources.empty()) {
         const auto &source = group->ggufSources[tableId];
@@ -3254,8 +3277,23 @@ void FastllmCudaStoreMoePrefillExpert(const FastllmCudaMoePrefillPlan &plan,
     // in its source extent; that is not extra padding between uploaded shards.
     shared.weights[0].shardBytes = gate.GetBytes() / shared.shards;
     shared.weights[1].shardBytes = down.GetBytes() / shared.shards;
-    const auto *auxiliary = shared.auxiliaryBytes ? group.deviceHostRecords +
-        (size_t(plan.table) * group.layout.experts + expert) * shared.auxiliaryBytes : nullptr;
+    const size_t auxiliaryOffset = (size_t(plan.table) * group.layout.experts + expert) * shared.auxiliaryBytes;
+    const uint8_t *auxiliary = nullptr;
+    if (shared.auxiliaryBytes) {
+        if (group.deviceHostRecords) auxiliary = group.deviceHostRecords + auxiliaryOffset;
+        else {
+            auto &scratch = cache.frequencyUpload;
+            if (scratch.expansionBytes < shared.auxiliaryBytes) {
+                scratch.dataType = fastllm::INT8;
+                scratch.Resize({int(shared.auxiliaryBytes)});
+                scratch.ToDevice(fastllm::CUDA, {cache.device}, false);
+                scratch.Allocate(false);
+            }
+            auxiliary = static_cast<const uint8_t *>(scratch.cudaData);
+            checkCudaErrors("MoE prefill pageable metadata", group.hostStorage.CopyToDeviceAsync(
+                scratch.cudaData, group.hostRecords + auxiliaryOffset, shared.auxiliaryBytes, cudaStreamPerThread));
+        }
+    }
     fastllm::AssertInFastLLM(fastllm::cuda::CopySharedExpertRecord(shared, nullptr,
         static_cast<const uint8_t *>(gate.cudaData), static_cast<const uint8_t *>(down.cudaData),
         auxiliary, static_cast<uint8_t *>(plan.weights[2 * expert]), cudaStreamPerThread),
@@ -3387,7 +3425,20 @@ void FastllmCudaMoePrefillCache::Upload(int slot, void *streamPointer) {
     if (weight == s.source[slot]) {
         if (weight->cpuData || !weight->numasData.empty()) {
             if (slot >= 2) s.cache->prefillStats[6] += weight->GetBytes();
-            weight->ToCudaTemporary({}, true, streamPointer);
+            if (weight->isPinned) weight->ToCudaTemporary({}, true, streamPointer);
+            else {
+                weight->ToCudaTemporary({}, false);
+                if (weight->cpuData) {
+                    checkCudaErrors("MoE prefill pageable upload", fastllm::cuda::UploadImmutableHostWeight(
+                        weight->cudaData, weight->cpuData, weight->GetBytes(), false, stream));
+                } else {
+                    const size_t bytes = weight->GetBytes() / weight->numasData.size();
+                    for (size_t node = 0; node < weight->numasData.size(); ++node)
+                        checkCudaErrors("MoE prefill pageable shard", fastllm::cuda::UploadImmutableHostWeight(
+                            static_cast<uint8_t *>(weight->cudaData) + node * bytes,
+                            weight->numasData[node], bytes, false, stream));
+                }
+            }
         }
         return;
     }
@@ -3396,9 +3447,9 @@ void FastllmCudaMoePrefillCache::Upload(int slot, void *streamPointer) {
             const auto &source = *s.source[slot];
             const size_t bytes = source.GetBytes() / source.numasData.size();
             for (size_t node = 0; node < source.numasData.size(); ++node)
-                checkCudaErrors("MoE prefill native upload", cudaMemcpyAsync(
+                checkCudaErrors("MoE prefill native upload", fastllm::cuda::UploadImmutableHostWeight(
                     static_cast<uint8_t *>(weight->cudaData) + node * bytes,
-                    source.numasData[node], bytes, cudaMemcpyHostToDevice, stream));
+                    source.numasData[node], bytes, source.isPinned, stream));
             s.cache->prefillStats[6] += source.GetBytes();
         }
         return;
@@ -4719,14 +4770,14 @@ static int EndMoeFrequencyStep(DeviceCache &cache) {
     }
     const bool requestedDma = group.qwen38FlashNext && group.ggufSources.empty();
     const bool stagedShared = group.sharedLayout.shards &&
-        ((group.layout.deepSeekV41 && group.layout.weightType == fastllm::NVFP4_BLOCK_32_E8M0 &&
+        (!group.mappedWeights || (group.layout.deepSeekV41 && group.layout.weightType == fastllm::NVFP4_BLOCK_32_E8M0 &&
           !group.sharedLayout.auxiliaryBytes) ||
          (!group.layout.deepSeekV41 && !group.layout.glm5 && requestedDma));
     // DMA and canonical restoration depend on the registered byte layout,
     // not on the model's activation arithmetic. Mixed Standard GGUF layers
     // use their own offsets and record strides just like V4.1 layers.
     const bool stagedGGUF = !group.ggufSources.empty() && !NativeStandardGGUFRecords(group) &&
-        (group.layout.deepSeekV41 || (!group.layout.glm5 && requestedDma));
+        (!group.mappedWeights || group.layout.deepSeekV41 || (!group.layout.glm5 && requestedDma));
     if (stagedShared || stagedGGUF) {
         size_t bytes = group.layout.recordStride;
         for (const auto &layout : group.layerLayouts) bytes = std::max(bytes, layout.recordStride);
@@ -4780,7 +4831,7 @@ static int EndMoeFrequencyStep(DeviceCache &cache) {
                 static_cast<uint8_t *>(cache.frequencyUpload.cudaData),
                 cache.frequencyUpload.expansionBytes, destination, stream,
                 shared.auxiliaryBytes ? group.hostRecords + key * shared.auxiliaryBytes : nullptr,
-                &group.hostStorage) :
+                &group.hostStorage, group.mappedWeights) :
                 fastllm::cuda::CopySharedExpertRecord(shared,
                 cache.numaPointers + key * 2 * shared.shards, nullptr, nullptr,
                 shared.auxiliaryBytes ? group.deviceHostRecords + key * shared.auxiliaryBytes : nullptr,
@@ -4803,7 +4854,7 @@ static int EndMoeFrequencyStep(DeviceCache &cache) {
                 uploaded = static_cast<const uint8_t *>(scratch.cudaData);
             }
             checkCudaErrors("MoE global admission", fastllm_gguf_restore::CopyRecords(source,
-                cache.numaPointers + size_t(table) * layout.experts * 2 * source.shards,
+                cache.numaPointers ? cache.numaPointers + size_t(table) * layout.experts * 2 * source.shards : nullptr,
                 destination, stream, nullptr, nullptr, nullptr, nullptr, expert,
                 nullptr, -1, uploaded, false, cache.admissionCopyBlocks));
         }
