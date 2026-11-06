@@ -178,9 +178,9 @@ class LauncherWebUITest(unittest.TestCase):
                 config = client.get(self.base + '/api/config').json()
                 self.assertTrue(config['workspace_agent_enabled'])
                 self.assertTrue(config['pi_agent']['available'])
-                self.assertEqual(config['agent_workspace_root'], root)
+                self.assertEqual(config['agent_workspace_root'], os.path.realpath(root))
                 listing = client.get(self.base + '/api/agent/directories').json()
-                self.assertEqual(listing['path'], root)
+                self.assertEqual(listing['path'], os.path.realpath(root))
                 self.assertEqual(client.get(self.base + '/api/agent/directories',
                                            params={'path': self.temp.name}).status_code, 400)
                 record = client.post(self.base + '/api/conversations', json={'settings': {

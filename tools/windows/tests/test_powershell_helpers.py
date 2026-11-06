@@ -17,13 +17,14 @@ class PowerShellHelperTests(unittest.TestCase):
             root = Path(temporary)
             (root / "make_whl.sh").write_text(source, encoding="utf-8")
             quote = lambda value: "'" + str(value).replace("'", "''") + "'"
-            script = ("$ErrorActionPreference='Stop';$RepoRoot=" + quote(root) +
+            script = ("[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);"
+                      "$ErrorActionPreference='Stop';$RepoRoot=" + quote(root) +
                       ";. " + quote(COMMON) + ";Get-FastllmCudaArch")
             encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
             return subprocess.run(
                 [POWERSHELL, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
                  "-EncodedCommand", encoded],
-                capture_output=True, text=True,
+                capture_output=True, text=True, encoding="utf-8",
             )
 
     def test_current_bash_default_and_legacy_assignment(self):

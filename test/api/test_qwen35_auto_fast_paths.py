@@ -368,6 +368,7 @@ class NvidiaCudaPlatformDetectionTest(unittest.TestCase):
     def test_non_nvidia_pci_device_is_not_misdetected(self):
         for device_class in ("0x030000", "0x120000"):
             def fake_open(path, *args, **kwargs):
+                path = str(path).replace("\\", "/")
                 if str(path).endswith("/vendor"):
                     return io.StringIO("0x1234\n")
                 if str(path).endswith("/class"):
@@ -387,6 +388,7 @@ class NvidiaCudaPlatformDetectionTest(unittest.TestCase):
 
     def test_nvidia_gpu_with_bmc_display_is_detected(self):
         def fake_open(path, *args, **kwargs):
+            path = str(path).replace("\\", "/")
             device = os.path.basename(os.path.dirname(str(path)))
             if str(path).endswith("/vendor"):
                 vendor = "0x10de" if device == "nvidia" else "0x1a03"
@@ -410,6 +412,7 @@ class NvidiaCudaPlatformDetectionTest(unittest.TestCase):
 
     def test_nvidia_gpu_with_cirrus_display_is_detected(self):
         def fake_open(path, *args, **kwargs):
+            path = str(path).replace("\\", "/")
             device = os.path.basename(os.path.dirname(str(path)))
             if str(path).endswith("/vendor"):
                 vendor = "0x10de" if device == "nvidia" else "0x1013"
@@ -433,6 +436,7 @@ class NvidiaCudaPlatformDetectionTest(unittest.TestCase):
 
     def test_mixed_compute_gpu_vendors_are_not_treated_as_nvidia(self):
         def fake_open(path, *args, **kwargs):
+            path = str(path).replace("\\", "/")
             device = os.path.basename(os.path.dirname(str(path)))
             if str(path).endswith("/vendor"):
                 vendor = "0x10de" if device == "nvidia" else "0x1234"
@@ -457,7 +461,7 @@ class NvidiaCudaPlatformDetectionTest(unittest.TestCase):
 
 class TritonPythonAutoDetectionTest(unittest.TestCase):
     def test_checks_only_current_python(self):
-        current_python = "/tmp/current-venv/bin/python"
+        current_python = os.path.abspath("/tmp/current-venv/bin/python")
         with patch.dict(os.environ, {}, clear=True), patch(
                 "fastllm_pytools.util.sys.executable", current_python), patch(
                     "fastllm_pytools.util._triton_python_works",
@@ -467,7 +471,7 @@ class TritonPythonAutoDetectionTest(unittest.TestCase):
         checker.assert_called_once_with(current_python)
 
     def test_returns_empty_when_current_python_lacks_triton(self):
-        current_python = "/tmp/current-venv/bin/python"
+        current_python = os.path.abspath("/tmp/current-venv/bin/python")
         with patch(
                 "fastllm_pytools.util.sys.executable", current_python), patch(
                     "fastllm_pytools.util._triton_python_works",

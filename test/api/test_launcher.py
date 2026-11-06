@@ -733,7 +733,7 @@ class LauncherConfigTest(unittest.TestCase):
             preview = self.runtime.preview_download(payload)
 
         self.assertEqual(preview["errors"], [])
-        self.assertIn("modelscope_download.py download", preview["command"])
+        self.assertRegex(preview["command"], r"modelscope_download\.py'? download")
         self.assertNotIn("private-modelscope-token", preview["command"])
         self.assertIn("Token injected through environment", preview["command"])
         self.assertIn("--include 'Q2_0/*'", preview["command"])
@@ -748,12 +748,12 @@ class LauncherConfigTest(unittest.TestCase):
                 pass
         config = DownloadConfig(target_dir=self.model_path, include="Q2_0/*,mmproj-*.gguf")
         self.assertEqual(_downloaded_model_path(config),
-                         os.path.join(self.model_path, "Q2_0/model-00001-of-00002.gguf"))
+                         os.path.join(self.model_path, "Q2_0", "model-00001-of-00002.gguf"))
         self.runtime._download_state["destination"] = self.model_path
         self.runtime._watch_download(SimpleNamespace(wait=lambda: 0),
                                     self.runtime._download_generation, config)
         self.assertEqual(self.runtime.download_state()["modelPath"],
-                         os.path.join(self.model_path, "Q2_0/model-00001-of-00002.gguf"))
+                         os.path.join(self.model_path, "Q2_0", "model-00001-of-00002.gguf"))
         # Do not silently pick one variant from a complete multi-variant repo.
         config.include = ""
         self.assertEqual(_downloaded_model_path(config), self.model_path)

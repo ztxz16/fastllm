@@ -1213,7 +1213,8 @@ class AutoConfigTest(unittest.TestCase):
                 self.assertEqual(a.ngram_device, expected)
 
     def test_missing_cuda_driver_has_actionable_error(self):
-        with patch.object(auto.ctypes, 'CDLL', side_effect=OSError('missing')):
+        loader = 'WinDLL' if os.name == 'nt' else 'CDLL'
+        with patch.object(auto.ctypes, loader, side_effect=OSError('missing')):
             with self.assertRaisesRegex(ValueError, 'NVIDIA CUDA driver'):
                 auto.cuda_hardware()
 

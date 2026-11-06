@@ -79,6 +79,8 @@ class ServiceTest(unittest.TestCase):
             self.commands.append((argv, kwargs["env"].copy()))
             if "-m" in argv:
                 argv = [str(self.worker), "--kind", "llm"] + argv[4:]
+            if argv[0] == str(self.worker):
+                argv = [sys.executable, *argv]
             return subprocess.Popen(argv, **kwargs)
         runtime = LauncherRuntime(str(self.directory / "profiles.json"), popen_factory=popen,
             webui_history_dir=str(self.directory / "history"),
