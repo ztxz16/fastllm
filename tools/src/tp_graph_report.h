@@ -22,7 +22,17 @@ inline json11::Json::array GraphState(fastllm::distributed::ProcessGroup &group)
             {"allreduce", json11::Json::object{{"enabled", info.allReduce.enabled}, {"active", info.allReduce.active},
                 {"custom_calls", static_cast<long long>(info.allReduce.customCalls)},
                 {"nccl_calls", static_cast<long long>(info.allReduce.ncclCalls)},
-                {"workspace_bytes", static_cast<long long>(info.allReduce.workspaceBytes)}}}});
+                {"workspace_bytes", static_cast<long long>(info.allReduce.workspaceBytes)}}},
+            {"prefix_cache", json11::Json::object{{"enabled", info.prefix.enabled},
+                {"entries", static_cast<long long>(info.prefix.entries)},
+                {"device_bytes", static_cast<long long>(info.prefix.deviceBytes)},
+                {"lookups", static_cast<long long>(info.prefix.lookups)},
+                {"hits", static_cast<long long>(info.prefix.hits)},
+                {"reused_tokens", static_cast<long long>(info.prefix.reusedTokens)},
+                {"last_reused_tokens", static_cast<long long>(info.prefix.lastReusedTokens)},
+                {"last_computed_tokens", static_cast<long long>(info.prefix.lastComputedTokens)},
+                {"evictions", static_cast<long long>(info.prefix.evictions)},
+                {"clears", static_cast<long long>(info.prefix.clears)}}}});
     }
     return states;
 }
@@ -40,5 +50,11 @@ inline bool ParseCudaGraph(const std::string &value) {
 /** 严格解析自定义规约开关；不能把其他字符串静默解释为关闭。 */
 inline bool ParseCustomAllReduce(const std::string &value) {
     if (value != "0" && value != "1") throw std::invalid_argument("custom-allreduce must be 0 or 1");
+    return value == "1";
+}
+
+/** 严格解析前缀快照开关；默认关闭，拒绝未知值。 */
+inline bool ParsePrefixCache(const std::string &value) {
+    if (value != "0" && value != "1") throw std::invalid_argument("prefix-cache must be 0 or 1");
     return value == "1";
 }

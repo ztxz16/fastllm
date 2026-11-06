@@ -43,6 +43,7 @@ def main():
     parser.add_argument("--model", type=Path)
     parser.add_argument("--cuda-graph", action="store_true")
     parser.add_argument("--custom-allreduce", action="store_true")
+    parser.add_argument("--prefix-cache", action="store_true")
     parser.add_argument("--devices", default="0,1")
     parser.add_argument("--output", type=Path, default=ROOT / "test/distributed/results")
     args = parser.parse_args()
@@ -60,7 +61,7 @@ def main():
         cuda_visible_devices=os.environ.get("CUDA_VISIBLE_DEVICES"), devices=devices,
         expected_case_count=len(specs)*(16 if args.cuda_graph else 14),
         execution="decode_cuda_graph" if args.cuda_graph else "eager",
-        custom_allreduce=args.custom_allreduce, graph_warmup_per_request=1 if args.cuda_graph else 0, prefix_cache=False, kv_cache="FP16 request-local",
+        custom_allreduce=args.custom_allreduce, graph_warmup_per_request=1 if args.cuda_graph else 0, prefix_cache=args.prefix_cache, kv_cache="FP16 request-local + optional immutable snapshots",
         report_title="Qwen3 persistent session correctness",
         report_description="同一常驻进程组串行处理请求；小模型对照CPU，真实模型逐步单卡重放。非性能测试。")
     rows = []
@@ -85,7 +86,7 @@ def main():
             if args.cuda_graph:
                 tasks += [("cancel_after_graph", dict(base, max_new_tokens=32)), ("A_after_graph_cancel", base)]
             previous = {}
-            with Qwen3ProcessSession(args.generate, args.worker, model, args.devices, directory / "session", trace=True, cuda_graph=args.cuda_graph, custom_allreduce=args.custom_allreduce) as session:
+            with Qwen3ProcessSession(args.generate, args.worker, model, args.devices, directory / "session", trace=True, cuda_graph=args.cuda_graph, custom_allreduce=args.custom_allreduce, prefix_cache=args.prefix_cache) as session:
                 for task_name, request in tasks:
                     path = directory / task_name
                     path.mkdir()
@@ -117,7 +118,8 @@ def main():
                                         'cancelled graph changed output prefix')
                                 for index in range(checked):
                                     compare_logits(error.report['steps'][index]['logits'], baseline['steps'][index]['logits'],
-                                                   metrics, f'cancel_after_graph/step-{index}', 0, 0)
+                                                   metrics, f'cancel_after_graph/step-{index}',
+                                                   0.05 if args.prefix_cache else 0, 0.01 if args.prefix_cache else 0)
                                 row.update(status="PASS", graph=error.report['graph'],
                                            reason="cancelled after graph replay; workspace/KV released")
                             else:

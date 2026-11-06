@@ -106,6 +106,18 @@ class ProcessEntryTests(unittest.TestCase):
                     self.assertRaisesRegex(ValueError, name):
                 make_normal_llm_model(self.args())
 
+    def test_prefix_factory_combines_graph_allreduce_and_clears_snapshots(self):
+        with make_normal_llm_model(self.args(['--prefix-cache', 'true', '--cuda-graph', '--custom-allreduce'])) as model:
+            model.clear_prefix_cache()
+            for _ in range(2):
+                self.assertEqual(model.response('相同前缀', max_length=1), '答')
+            p = model.session._graph_state[0]['prefix_cache']
+            self.assertEqual((p['hits'], p['last_reused_tokens']), (1, 1))
+            self.assertIn('--prefix-cache 1', (model.output / 'session/command.txt').read_text())
+            model.clear_prefix_cache()
+            self.assertEqual(model.session._graph_state[0]['prefix_cache']['entries'], 0)
+        self.assertEqual(model.session.shutdown['graph_after_unload'][0]['prefix_cache']['device_bytes'], 0)
+
     def test_config_cannot_change_command_or_enable_unknown_option(self):
         config = self.root / 'options.json'
         for update in ({'command': 'export'}, {'tp_backend': 'process', 'unknown': 'value'}):
@@ -121,7 +133,8 @@ class ProcessEntryTests(unittest.TestCase):
             self.assertFalse(self.tokenizer.apply_chat_template.call_args.kwargs['enable_thinking'])
 
     def test_explicit_unsupported_options_rejected_before_model_load(self):
-        for extra in (['--dtype', 'int4'], ['--atype', 'float32'], ['--prefix-cache', 'true'],
+        for extra in (['--dtype', 'int4'], ['--atype', 'float32'], ['--prefix-cache', 'maybe'],
+                      ['--prefix-cache-snapshot-max-records', '3'],
                       ['--kv-cache-layout', 'paged'], ['--max_batch', '2'], ['--device', 'cpu'],
                       ['--lora', 'adapter'], ['--enable_thinking', 'true'], ['--triton'],
                       ['--linear-backend', 'machete']):
@@ -226,7 +239,7 @@ class AutoTokenizer:
         cache.write_text('CUDA_ARCH:STRING=70\n')
         argv = ['runner', '--generate', str(self.fixture.binary), '--worker', str(self.fixture.binary),
                 '--model', str(model), '--build-cache', str(cache), '--package-root', str(package),
-                '--output', str(self.root / 'reports')]
+                '--output', str(self.root / 'reports'), '--prefix-cache']
 
         def reference(binary, worker, model, request, devices, output):
             return dict(backend=process_tp.BACKEND, request=request, token_ids=[1], finish_reason='eos')
@@ -240,7 +253,7 @@ class AutoTokenizer:
             directory = next((self.root / 'reports').iterdir())
             report = json.loads((directory / 'summary.json').read_text())
             self.assertEqual(result, 0, report)
-            self.assertEqual(len(report['cases']), 12)
+            self.assertEqual(len(report['cases']), 13)
             for suffix in ('json', 'md', 'csv', 'xlsx'):
                 self.assertTrue((directory / ('summary.' + suffix)).is_file())
             # 同一验收入口失败时仍保存已执行部分，不得把缺少 case 的报告记为 PASS。

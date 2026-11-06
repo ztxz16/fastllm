@@ -341,19 +341,19 @@ struct ProcessGroup::Impl {
     }
 
     /** 查询或释放请求缓存；验证各 rank 的活动状态、长度和容量一致。 */
-    std::vector<Qwen3RequestInfo> RequestStates(bool end) {
+    std::vector<Qwen3RequestInfo> RequestStates(bool end, bool clearPrefix = false) {
         std::lock_guard<std::mutex> lock(mutex);
         if (state != ProcessGroupState::Ready || options.controlOnly) {
             throw std::runtime_error("Qwen3 request requires a ready CUDA process TP group");
         }
         try {
-            auto replies = Exchange(end ? Kind::EndQwen3Request : Kind::QueryQwen3Request,
-                end ? Kind::Qwen3RequestEnded : Kind::Qwen3RequestState, {},
+            auto replies = Exchange(clearPrefix ? Kind::ClearQwen3Prefix : end ? Kind::EndQwen3Request : Kind::QueryQwen3Request,
+                clearPrefix ? Kind::Qwen3PrefixCleared : end ? Kind::Qwen3RequestEnded : Kind::Qwen3RequestState, {},
                 Clock::now() + std::chrono::milliseconds(options.operationTimeoutMs));
             std::vector<Qwen3RequestInfo> result;
             for (const auto &reply : replies) {
                 const auto &bytes = reply.payload;
-                if (bytes.size() != 104 || Get32(bytes, 0) > 1 ||
+                if (bytes.size() != 176 || Get32(bytes, 0) > 1 || Get32(bytes, 104) > 1 ||
                     Get32(bytes, 24) > 1 || Get32(bytes, 28) > 1 ||
                     Get32(bytes, 72) > 1 || Get32(bytes, 76) > 1) {
                     throw std::runtime_error("invalid Qwen3 request state header");
@@ -364,6 +364,10 @@ struct ProcessGroup::Impl {
                     Get64(bytes, 32), Get64(bytes, 40), Get64(bytes, 48), Get64(bytes, 56), Get64(bytes, 64)};
                 info.allReduce = {Get32(bytes, 72) != 0, Get32(bytes, 76) != 0,
                     Get64(bytes, 80), Get64(bytes, 88), Get64(bytes, 96)};
+                info.prefix = {Get32(bytes, 104) != 0, Get32(bytes, 108), Get64(bytes, 112),
+                    Get64(bytes, 120), Get64(bytes, 128), Get64(bytes, 136), Get64(bytes, 144),
+                    Get64(bytes, 152), Get64(bytes, 160), Get64(bytes, 168)};
+                const auto &prefix = info.prefix;
                 const auto &ar = info.allReduce;
                 const auto &g = info.graph;
                 bool invalid = info.active ?
@@ -378,6 +382,15 @@ struct ProcessGroup::Impl {
                     g.active != (g.workspaceBytes != 0) || g.workspaceBytes > 256ULL * 1024 * 1024 ||
                     (g.active && (!info.active || !g.captures)) ||
                     (g.enabled ? g.eagerDecodes != 0 : (g.active || g.captures || g.replays || g.warmups));
+                invalid = invalid || prefix.enabled != options.prefixCache || prefix.entries > 8 ||
+                    prefix.deviceBytes > 64ULL * 1024 * 1024 || bool(prefix.entries) != bool(prefix.deviceBytes) ||
+                    prefix.hits > prefix.lookups || prefix.reusedTokens < prefix.hits ||
+                    prefix.lastReusedTokens > 127 || prefix.lastComputedTokens > 128 ||
+                    prefix.lastReusedTokens + prefix.lastComputedTokens > 128 ||
+                    (prefix.lookups && !prefix.lastComputedTokens) ||
+                    (clearPrefix && (prefix.entries || prefix.deviceBytes)) ||
+                    (!prefix.enabled && (prefix.entries || prefix.deviceBytes || prefix.lookups || prefix.hits ||
+                        prefix.reusedTokens || prefix.lastReusedTokens || prefix.lastComputedTokens || prefix.evictions || prefix.clears));
                 if (!result.empty()) {
                     const auto &first = result.front();
                     invalid = invalid || info.active != first.active || info.tokens != first.tokens ||
@@ -387,6 +400,11 @@ struct ProcessGroup::Impl {
                               g.eagerDecodes != first.graph.eagerDecodes ||
                               ar.customCalls != first.allReduce.customCalls || ar.ncclCalls != first.allReduce.ncclCalls ||
                               ar.workspaceBytes != first.allReduce.workspaceBytes;
+                    const auto &f = first.prefix;
+                    invalid = invalid || prefix.entries != f.entries || prefix.lookups != f.lookups ||
+                        prefix.hits != f.hits || prefix.reusedTokens != f.reusedTokens ||
+                        prefix.lastReusedTokens != f.lastReusedTokens || prefix.lastComputedTokens != f.lastComputedTokens ||
+                        prefix.evictions != f.evictions || prefix.clears != f.clears;
                 }
                 if (invalid) {
                     throw std::runtime_error("invalid/inconsistent Qwen3 request state");
@@ -422,7 +440,8 @@ struct ProcessGroup::Impl {
             "--device", std::to_string(options.devices[rank]), "--session", std::to_string(session),
             "--parent-pid", std::to_string(getpid()), "--control-only", options.controlOnly ? "1" : "0",
             "--cuda-graph", options.cudaGraph ? "1" : "0",
-            "--custom-allreduce", options.customAllReduce ? "1" : "0"};
+            "--custom-allreduce", options.customAllReduce ? "1" : "0",
+            "--prefix-cache", options.prefixCache ? "1" : "0"};
         std::vector<char*> argv;
         for (auto &arg : args) {
             argv.push_back(&arg[0]);
@@ -517,7 +536,7 @@ void ProcessGroup::Start(const ProcessGroupOptions &options) {
         unique.size() != options.devices.size() || *unique.begin() < 0 ||
         options.startupTimeoutMs <= 0 || options.operationTimeoutMs <= 0 ||
         options.shutdownTimeoutMs <= 0 || options.heartbeatIntervalMs <= 0 ||
-        (options.controlOnly && (options.cudaGraph || options.customAllReduce)) ||
+        (options.controlOnly && (options.cudaGraph || options.customAllReduce || options.prefixCache)) ||
         (options.customAllReduce && options.devices.size() != 2)) {
         throw std::invalid_argument("invalid process TP worker path, devices or timeout");
     }
@@ -808,6 +827,10 @@ std::vector<float> ProcessGroup::DecodeQwen3(uint32_t tokenId, int timeoutMs) {
 
 void ProcessGroup::EndQwen3Request() {
     impl->RequestStates(true);
+}
+
+void ProcessGroup::ClearQwen3PrefixCache() {
+    impl->RequestStates(false, true);
 }
 
 std::vector<Qwen3RequestInfo> ProcessGroup::Qwen3Requests() {

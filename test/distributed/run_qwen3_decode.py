@@ -209,7 +209,11 @@ def verify_allreduce(report, tasks, config, graph_enabled):
     for task, result in zip(tasks, report['results']):
         op = task['op']
         if op in ('begin', 'prefill', 'decode'):
-            count = config['hidden_size'] * (1 if op == 'decode' else len(task['token_ids']))
+            tokens = 1 if op == 'decode' else len(task['token_ids'])
+            prefix = result.get('graph', [{}])[0].get('prefix_cache', {})
+            if op == 'begin' and prefix.get('enabled'):
+                tokens = prefix['last_computed_tokens']
+            count = config['hidden_size'] * tokens
             calls = 2 * config['num_hidden_layers']
             if op == 'decode' and graph_enabled:
                 calls *= 1 + int(not graph_active)

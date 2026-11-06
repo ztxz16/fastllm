@@ -40,6 +40,7 @@ def main():
         parser.add_argument('--' + name, type=Path, required=True)
     parser.add_argument('--cuda-graph', action='store_true')
     parser.add_argument('--custom-allreduce', action='store_true')
+    parser.add_argument('--prefix-cache', action='store_true')
     parser.add_argument('--devices', default='0,1')
     parser.add_argument('--output', type=Path, default=ROOT / 'test/distributed/results')
     args = parser.parse_args()
@@ -50,8 +51,8 @@ def main():
         gpu=capture(['nvidia-smi', '--query-gpu=name,driver_version', '--format=csv,noheader']),
         cuda=capture(['nvcc', '--version']),
         cuda_visible_devices=os.environ.get('CUDA_VISIBLE_DEVICES'), devices=args.devices,
-        expected_case_count=12, execution='decode_cuda_graph' if args.cuda_graph else 'eager',
-        custom_allreduce=args.custom_allreduce, graph_warmup_per_request=1 if args.cuda_graph else 0, prefix_cache=False, kv_cache='FP16 request-local',
+        expected_case_count=13 if args.prefix_cache else 12, execution='decode_cuda_graph' if args.cuda_graph else 'eager',
+        custom_allreduce=args.custom_allreduce, graph_warmup_per_request=1 if args.cuda_graph else 0, prefix_cache=args.prefix_cache, kv_cache='FP16 request-local + optional immutable snapshots',
         report_title='FastLLM process TP public entrypoint',
         report_description='正式工厂/CLI 与原生生成的 Token ID 精确对照；不代表性能或独立数学精度验证。')
     rows = []
@@ -98,6 +99,8 @@ def main():
             common += ['--cuda-graph']
         if args.custom_allreduce:
             common += ['--custom-allreduce']
+        if args.prefix_cache:
+            common += ['--prefix-cache', 'true']
         # 包目录自动发现产物，故意不传显式 binary/worker，验证正式打包布局。
         model = make_normal_llm_model(make_normal_parser('accept').parse_args(common + ['--tp-output', str(output / 'factory')]))
         try:
@@ -117,6 +120,17 @@ def main():
                 return metrics
             case('factory_response', check_text)
             case('factory_stream_reuse', lambda: check_text(True))
+            if args.prefix_cache:
+                def clear_prefix():
+                    p = model.session._graph_state[0]['prefix_cache']
+                    require(p['last_reused_tokens'] == len(request['token_ids'])-1 and p['hits'] == 1,
+                            'formal factory did not reuse the actual prompt')
+                    model.clear_prefix_cache()
+                    result = check_text()
+                    require(model.session._graph_state[0]['prefix_cache']['last_reused_tokens'] == 0,
+                            'formal clear left a stale snapshot')
+                    return result
+                case('factory_prefix_clear', clear_prefix)
 
             def reject_recover():
                 before = model.session._next_id

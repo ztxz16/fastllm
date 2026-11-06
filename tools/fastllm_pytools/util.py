@@ -521,7 +521,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument("--tokens", type = int, default = -1, help = "设置总的token数量（用于计算paged cache的最大页数）")
     parser.add_argument("--page_size", type = int, default = -1, help = "设置paged cache每页的大小（token数），默认multicuda为16，其它设备使用后端默认值")
     parser.add_argument("--prefix_cache", "--prefix-cache", dest = "prefix_cache", type = str, default = "",
-                        help = "是否启用前缀缓存（true/false），对应 FASTLLM_PREFIX_CACHE")
+                        help = "是否启用前缀缓存（true/false）；进程 TP 使用有界 Prompt KV 快照，线程后端对应 FASTLLM_PREFIX_CACHE")
     parser.add_argument("--prefix_cache_snapshot_interval_pages", "--prefix-cache-snapshot-interval-pages",
                         dest = "prefix_cache_snapshot_interval_pages", type = int, default = -1,
                         help = "前缀缓存快照间隔页数，对应 FASTLLM_PREFIX_CACHE_SNAPSHOT_INTERVAL_PAGES")
