@@ -353,20 +353,32 @@ struct ProcessGroup::Impl {
             std::vector<Qwen3RequestInfo> result;
             for (const auto &reply : replies) {
                 const auto &bytes = reply.payload;
-                if (bytes.size() != 24 || Get32(bytes, 0) > 1) {
+                if (bytes.size() != 72 || Get32(bytes, 0) > 1 ||
+                    Get32(bytes, 24) > 1 || Get32(bytes, 28) > 1) {
                     throw std::runtime_error("invalid Qwen3 request state header");
                 }
                 Qwen3RequestInfo info{Get32(bytes, 0) != 0, Get32(bytes, 4), Get32(bytes, 8),
                                       Get32(bytes, 12), Get64(bytes, 16)};
+                info.graph = {Get32(bytes, 24) != 0, Get32(bytes, 28) != 0,
+                    Get64(bytes, 32), Get64(bytes, 40), Get64(bytes, 48), Get64(bytes, 56), Get64(bytes, 64)};
+                const auto &g = info.graph;
                 bool invalid = info.active ?
                     (end || !info.tokens || info.tokens > info.capacity || info.capacity > 2048 ||
                      info.positionBegin > 1048576 || info.capacity - 1 > 1048576 - info.positionBegin ||
                      !info.deviceBytes || info.deviceBytes > 256ULL * 1024 * 1024) :
                     (info.tokens || info.capacity || info.positionBegin || info.deviceBytes);
+                invalid = invalid || g.enabled != options.cudaGraph ||
+                    g.captures != g.warmups || g.replays < g.captures ||
+                    g.active != (g.workspaceBytes != 0) || g.workspaceBytes > 256ULL * 1024 * 1024 ||
+                    (g.active && (!info.active || !g.captures)) ||
+                    (g.enabled ? g.eagerDecodes != 0 : (g.active || g.captures || g.replays || g.warmups));
                 if (!result.empty()) {
                     const auto &first = result.front();
                     invalid = invalid || info.active != first.active || info.tokens != first.tokens ||
-                              info.capacity != first.capacity || info.positionBegin != first.positionBegin;
+                              info.capacity != first.capacity || info.positionBegin != first.positionBegin ||
+                              g.active != first.graph.active || g.captures != first.graph.captures ||
+                              g.replays != first.graph.replays || g.warmups != first.graph.warmups ||
+                              g.eagerDecodes != first.graph.eagerDecodes;
                 }
                 if (invalid) {
                     throw std::runtime_error("invalid/inconsistent Qwen3 request state");
@@ -400,7 +412,8 @@ struct ProcessGroup::Impl {
         std::vector<std::string> args{options.workerPath, "--control-fd", std::to_string(kWorkerFd),
             "--rank", std::to_string(rank), "--world-size", std::to_string(options.devices.size()),
             "--device", std::to_string(options.devices[rank]), "--session", std::to_string(session),
-            "--parent-pid", std::to_string(getpid()), "--control-only", options.controlOnly ? "1" : "0"};
+            "--parent-pid", std::to_string(getpid()), "--control-only", options.controlOnly ? "1" : "0",
+            "--cuda-graph", options.cudaGraph ? "1" : "0"};
         std::vector<char*> argv;
         for (auto &arg : args) {
             argv.push_back(&arg[0]);
@@ -494,7 +507,8 @@ void ProcessGroup::Start(const ProcessGroupOptions &options) {
     if (options.workerPath.empty() || options.devices.empty() || options.devices.size() > 1024 ||
         unique.size() != options.devices.size() || *unique.begin() < 0 ||
         options.startupTimeoutMs <= 0 || options.operationTimeoutMs <= 0 ||
-        options.shutdownTimeoutMs <= 0 || options.heartbeatIntervalMs <= 0) {
+        options.shutdownTimeoutMs <= 0 || options.heartbeatIntervalMs <= 0 ||
+        (options.controlOnly && options.cudaGraph)) {
         throw std::invalid_argument("invalid process TP worker path, devices or timeout");
     }
     impl->options = options;

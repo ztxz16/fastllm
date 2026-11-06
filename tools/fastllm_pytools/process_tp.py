@@ -69,7 +69,7 @@ def validate_options(args):
     add_server_args(parser)
     defaults = vars(parser.parse_args([]))
     allowed = {'model', 'path', 'tp', 'tp_backend', 'tp_binary', 'tp_worker', 'tp_output', 'tp_timeout',
-               'tp_request_timeout', 'tp_queue_size', 'host', 'port', 'model_name'}
+               'tp_request_timeout', 'tp_queue_size', 'host', 'port', 'model_name', 'cuda_graph'}
     compatible = {'dtype': ('auto', 'float16'), 'atype': ('auto', 'float16'),
                   'kv_cache_dtype': ('auto', 'float16'), 'kv_cache_layout': ('auto', 'continuous'),
                   'device': (None, ''), 'FASTLLM_ACTIVATE_NUMA': ('OFF',), 'FASTLLM_NUMA_THREADS': (27,),
@@ -88,7 +88,11 @@ def validate_options(args):
     for key in ('FASTLLM_PREFIX_CACHE', 'FASTLLM_CUDA_GRAPH', 'FASTLLM_CUDA_CUSTOM_ALLREDUCE',
                 'FASTLLM_CUDA_TP2_P2P_ALLREDUCE'):
         if os.environ.get(key, '').strip().lower() not in ('', '0', 'false', 'off'):
+            if key == 'FASTLLM_CUDA_GRAPH':
+                raise ValueError('process TP rejects FASTLLM_CUDA_GRAPH; use --cuda-graph for Decode Graph')
             raise ValueError(f'process TP does not support {key} yet')
+    if type(getattr(args, 'cuda_graph', False)) is not bool:
+        raise ValueError('cuda_graph must be boolean')
     if not sys.platform.startswith('linux'):
         raise ValueError('process TP currently requires Linux + NVIDIA CUDA')
     if hasattr(args, 'max_new_tokens') and (type(args.max_new_tokens) is not int or not 1 <= args.max_new_tokens <= 2048):
@@ -137,7 +141,8 @@ class ProcessTPModel:
         self._pending_cancels = []
         self._closing = False
         self.session = Qwen3ProcessSession(binary, worker, self.model_path, self.devices,
-                                          self.output / 'session', timeout=getattr(args, 'tp_timeout', 180))
+                                          self.output / 'session', timeout=getattr(args, 'tp_timeout', 180),
+                                          cuda_graph=getattr(args, 'cuda_graph', False))
         self.session.__enter__()
         args.path = str(self.model_path)
 

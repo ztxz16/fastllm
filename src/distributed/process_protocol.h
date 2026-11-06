@@ -14,7 +14,7 @@ namespace protocol {
 using Clock = std::chrono::steady_clock;
 using Deadline = Clock::time_point;
 constexpr int kWorkerFd = 3;
-constexpr uint32_t kVersion = 1;
+constexpr uint32_t kVersion = 2;
 constexpr uint32_t kMaxPayload = 1024 * 1024;
 enum class Kind : uint32_t {
     Hello = 1, CreateId, UniqueId, Initialize, Ready,

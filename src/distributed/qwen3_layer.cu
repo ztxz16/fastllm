@@ -85,9 +85,11 @@ __global__ void Norm(const half *x, const half *weight, half *output, int width,
  * @param stride 每 token 的元素跨度。
  * @param positionBegin 序列的连续位置起点。
  * @param theta RoPE 基数。
+ * @param decodeMeta 可空的 GPU uint32[2]，依次为历史长度和本次 RoPE 位置；Graph 重放时读取。
  */
 __global__ void Rope(half *qkv, int qHeads, int kvHeads, int dim, int stride,
-                     int positionBegin, float theta) {
+                     int positionBegin, float theta, const uint32_t *decodeMeta = nullptr) {
+    if (decodeMeta) positionBegin = decodeMeta[1];
     int head = blockIdx.x % (qHeads + kvHeads), token = blockIdx.x / (qHeads + kvHeads);
     int base = token * stride + head * dim;
     for (int i = threadIdx.x; i < dim / 2; i += blockDim.x) {
@@ -111,8 +113,10 @@ __global__ void Rope(half *qkv, int qHeads, int kvHeads, int dim, int stride,
  * @param width 2*kvHeads*dim。
  * @param qWidth qHeads*dim。
  * @param past 已缓存 token 数；写入 [past,past+tokens)。
+ * @param decodeMeta 可空的 GPU uint32[2]；非空时以第零项覆盖 past。
  */
-__global__ void AppendKV(const half *qkv, half *cache, int count, int width, int qWidth, int past) {
+__global__ void AppendKV(const half *qkv, half *cache, int count, int width, int qWidth, int past, const uint32_t *decodeMeta = nullptr) {
+    if (decodeMeta) past = decodeMeta[0];
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < count) {
         cache[size_t(past) * width + i] = qkv[(i / width) * (qWidth + width) + qWidth + i % width];
@@ -134,9 +138,11 @@ __global__ void AppendKV(const half *qkv, half *cache, int count, int width, int
  * @param groupSize 全局 Q 头数除以全局 KV 头数。
  * @param cache 可空的 FP16 [capacity,2,kvHeads,dim]；非空时当前 token 的 KV 已追加。
  * @param past 当前输入之前已缓存的长度；无缓存时为零。
+ * @param decodeMeta 可空的 GPU uint32[2]；Graph 重放时读取实际历史长度。
  */
 __global__ void Attention(const half *qkv, half *context, int qHeads, int kvHeads, int dim,
-                          int qBegin, int kvBegin, int groupSize, const half *cache, int past) {
+                          int qBegin, int kvBegin, int groupSize, const half *cache, int past, const uint32_t *decodeMeta = nullptr) {
+    if (decodeMeta) past = decodeMeta[0];
     __shared__ float probabilities[2048];
     int head = blockIdx.x % qHeads, token = blockIdx.x / qHeads;
     int kv = (qBegin + head) / groupSize - kvBegin;
@@ -213,15 +219,25 @@ struct Qwen3LayerExecutor::Impl {
     size_t allocated = 0;
     std::vector<half*> kvCache;
     Qwen3RequestInfo request;
+    Qwen3GraphInfo graphInfo;
+    std::vector<void*> graphBuffers;
+    size_t graphAllocated = 0;
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t graphExec = nullptr;
+    uint32_t *graphIds = nullptr, *graphMeta = nullptr;
+    half *graphX = nullptr;
+    float *graphLogits = nullptr;
 
-    void *Allocate(size_t bytes) {
-        if (bytes > 256ULL * 1024 * 1024 - allocated) {
+    void *Allocate(size_t bytes, bool persistent = false) {
+        auto &pool = persistent ? graphBuffers : buffers;
+        auto &used = persistent ? graphAllocated : allocated;
+        if (bytes > 256ULL * 1024 * 1024 - used) {
             throw std::runtime_error("Qwen3 layer workspace exceeds 256 MiB");
         }
-        buffers.push_back(nullptr);
-        Cuda(cudaMalloc(&buffers.back(), bytes));
-        allocated += bytes;
-        return buffers.back();
+        pool.push_back(nullptr);
+        Cuda(cudaMalloc(&pool.back(), bytes));
+        used += bytes;
+        return pool.back();
     }
 
     const half *Weight(const std::string &name, const std::vector<uint64_t> &shape, bool optional = false) {
@@ -247,6 +263,7 @@ struct Qwen3LayerExecutor::Impl {
         half *norm = nullptr, *qkv = nullptr, *context = nullptr, *gateup = nullptr, *activated = nullptr;
         float *partial = nullptr;
     };
+    Workspace graphWorkspace;
 
     /** 在分配和算子执行前检查单层与完整 prefill 共用的布局约束。 */
     void Validate(uint32_t layer, uint32_t tokens, uint32_t hidden, uint32_t positionBegin,
@@ -264,18 +281,18 @@ struct Qwen3LayerExecutor::Impl {
     }
 
     /** 按请求一次性分配工作区；同一模型各层复用，成功结束后统一释放。 */
-    Workspace Prepare(uint32_t tokens, uint32_t hidden, Qwen3LayerStage stage) {
+    Workspace Prepare(uint32_t tokens, uint32_t hidden, Qwen3LayerStage stage, bool persistent = false) {
         const auto &p = weights.Plan();
         Workspace w;
-        w.norm = static_cast<half*>(Allocate(size_t(tokens) * hidden * 2));
-        w.partial = static_cast<float*>(Allocate(size_t(tokens) * hidden * 4));
+        w.norm = static_cast<half*>(Allocate(size_t(tokens) * hidden * 2, persistent));
+        w.partial = static_cast<float*>(Allocate(size_t(tokens) * hidden * 4, persistent));
         if (stage != Qwen3LayerStage::Mlp) {
-            w.qkv = static_cast<half*>(Allocate(size_t(tokens) * (p.queryHeadCount + 2 * p.kvHeadCount) * p.headDim * 2));
-            w.context = static_cast<half*>(Allocate(size_t(tokens) * p.queryHeadCount * p.headDim * 2));
+            w.qkv = static_cast<half*>(Allocate(size_t(tokens) * (p.queryHeadCount + 2 * p.kvHeadCount) * p.headDim * 2, persistent));
+            w.context = static_cast<half*>(Allocate(size_t(tokens) * p.queryHeadCount * p.headDim * 2, persistent));
         }
         if (stage != Qwen3LayerStage::Attention) {
-            w.gateup = static_cast<half*>(Allocate(size_t(tokens) * p.intermediateCount * 4));
-            w.activated = static_cast<half*>(Allocate(size_t(tokens) * p.intermediateCount * 2));
+            w.gateup = static_cast<half*>(Allocate(size_t(tokens) * p.intermediateCount * 4, persistent));
+            w.activated = static_cast<half*>(Allocate(size_t(tokens) * p.intermediateCount * 2, persistent));
         }
         return w;
     }
@@ -289,9 +306,10 @@ struct Qwen3LayerExecutor::Impl {
      * @param x FP16 [tokens,hidden] 行主序输入/输出，不读回 CPU。
      * @param w 当前请求的 GPU 工作区，同 stream 顺序复用。
      * @param cached true 表示写入当前层 KV，并在 Attention 中读取有效历史。
+     * @param decodeMeta Graph 的 GPU uint32[2] 动态位置；为空时沿用 Eager 的值参数。
      */
     void RunLayer(uint32_t layer, uint32_t tokens, uint32_t positionBegin, Qwen3LayerStage stage,
-                  half *x, const Workspace &w, bool cached = false) {
+                  half *x, const Workspace &w, bool cached = false, const uint32_t *decodeMeta = nullptr) {
         auto &r = *this;
         const auto &p = weights.Plan();
         const uint32_t hidden = p.hiddenSize;
@@ -309,14 +327,14 @@ struct Qwen3LayerExecutor::Impl {
             }
             Norm<<<t*qh,256,0,r.stream>>>(qkv, r.Weight(prefix + "self_attn.q_norm.weight", {uint64_t(d)}), qkv, d, qkvWidth, qh, 0, p.rmsNormEps);
             Norm<<<t*kh,256,0,r.stream>>>(qkv, r.Weight(prefix + "self_attn.k_norm.weight", {uint64_t(d)}), qkv, d, qkvWidth, kh, qw, p.rmsNormEps);
-            Rope<<<t*(qh+kh),256,0,r.stream>>>(qkv, qh, kh, d, qkvWidth, positionBegin, p.ropeTheta);
+            Rope<<<t*(qh+kh),256,0,r.stream>>>(qkv, qh, kh, d, qkvWidth, positionBegin, p.ropeTheta, decodeMeta);
             half *cache = cached ? kvCache.at(layer) : nullptr;
             const int past = cached ? request.tokens : 0;
             if (cached) {
-                AppendKV<<<(t*2*kw+255)/256,256,0,r.stream>>>(qkv, cache, t*2*kw, 2*kw, qw, past);
+                AppendKV<<<(t*2*kw+255)/256,256,0,r.stream>>>(qkv, cache, t*2*kw, 2*kw, qw, past, decodeMeta);
             }
             Attention<<<t*qh,256,0,r.stream>>>(qkv, context, qh, kh, d, p.queryHeadBegin, p.kvHeadBegin,
-                                              p.queryHeads / p.kvHeads, cache, past);
+                                              p.queryHeads / p.kvHeads, cache, past, decodeMeta);
             r.Linear(context, r.Weight(prefix + "self_attn.o_proj.weight", {hidden, uint64_t(qw)}), partial, t, h, qw, true);
             if (auto bias = r.Weight(prefix + "self_attn.o_proj.bias", {hidden}, true)) {
                 Bias<<<(t*h+255)/256,256,0,r.stream>>>(partial, bias, t*h, h);
@@ -340,6 +358,62 @@ struct Qwen3LayerExecutor::Impl {
         Cuda(cudaGetLastError());
     }
 
+    /**
+     * 提交全模型计算，供 Eager 与 Graph 共用；不分配、同步或读回 CPU。
+     * @param ids GPU uint32[t] token ID。
+     * @param x FP16 [t,hidden] 隐藏状态工作区。
+     * @param workspace 与 stream 同生命周期的算子工作区。
+     * @param logits FP32 [local_vocab] 最后一个 token 的分片 logits。
+     * @param t 本轮 token 数；Graph 固定为 1。
+     * @param positionBegin Eager 的绝对位置起点。
+     * @param cached 是否读写请求 KV。
+     * @param decodeMeta Graph 的 GPU uint32[2]={历史长度,绝对位置}，Eager 为空。
+     */
+    void EnqueueTokens(const uint32_t *ids, half *x, const Workspace &workspace,
+                       float *logits, int t, uint32_t positionBegin, bool cached,
+                       const uint32_t *decodeMeta = nullptr) {
+        const auto &p = weights.Plan();
+        const int h = p.hiddenSize;
+        auto embedding = Weight("model.embed_tokens.weight", {p.vocabSize, p.hiddenSize});
+        auto finalNorm = Weight("model.norm.weight", {p.hiddenSize});
+        auto lmHead = Weight("lm_head.weight", {p.vocabCount, p.hiddenSize});
+        Embed<<<(t*h+255)/256,256,0,stream>>>(ids, embedding, x, t*h, h);
+        Cuda(cudaGetLastError());
+        for (uint32_t layer = 0; layer < p.layerCount; ++layer) {
+            RunLayer(layer, t, positionBegin, Qwen3LayerStage::Full, x, workspace, cached, decodeMeta);
+        }
+        Norm<<<1,256,0,stream>>>(x + size_t(t - 1) * h, finalNorm, workspace.norm,
+                                h, h, 1, 0, p.rmsNormEps);
+        Linear(workspace.norm, lmHead, logits, 1, p.vocabCount, h, true);
+        Cuda(cudaGetLastError());
+    }
+
+    /** 销毁请求图后释放其固定地址；调用方须先同步 stream，失败由 worker 整组退出。 */
+    void ReleaseGraph() {
+        if (graphExec) {
+            Cuda(cudaGraphExecDestroy(graphExec));
+            graphExec = nullptr;
+        }
+        if (graph) {
+            Cuda(cudaGraphDestroy(graph));
+            graph = nullptr;
+        }
+        if (!graphBuffers.empty()) {
+            // SetStream 将 cuBLAS 的用户工作区恢复为默认值，避免释放后继续引用。
+            Blas(cublasSetStream(blas, stream));
+        }
+        for (auto &buffer : graphBuffers) {
+            Cuda(cudaFree(buffer));
+            buffer = nullptr;
+        }
+        graphBuffers.clear();
+        graphAllocated = 0;
+        graphIds = graphMeta = nullptr;
+        graphX = nullptr;
+        graphLogits = nullptr;
+        graphWorkspace = {};
+    }
+
     /** 同步当前 stream 并检查 NCCL 异步错误；失败交给 worker 整组退出。 */
     void Synchronize() {
         Cuda(cudaStreamSynchronize(stream));
@@ -359,11 +433,12 @@ struct Qwen3LayerExecutor::Impl {
     }
 };
 
-Qwen3LayerExecutor::Qwen3LayerExecutor(const Qwen3DeviceWeights &weights, cudaStream_t stream, ncclComm_t comm)
+Qwen3LayerExecutor::Qwen3LayerExecutor(const Qwen3DeviceWeights &weights, cudaStream_t stream, ncclComm_t comm, bool cudaGraph)
     : impl(new Impl{weights, stream, comm}) {
     if (!stream || !comm) {
         throw std::runtime_error("Qwen3 layer requires initialized stream/NCCL");
     }
+    impl->graphInfo.enabled = cudaGraph;
     Blas(cublasCreate(&impl->blas));
     Blas(cublasSetStream(impl->blas, stream));
     Blas(cublasSetMathMode(impl->blas, CUBLAS_DEFAULT_MATH));
@@ -434,10 +509,8 @@ std::vector<float> Qwen3LayerExecutor::RunTokens(const std::vector<uint32_t> &to
         }
     }
 
-    // 权重查找同时验证设备绑定；不在任何 Decoder 层之间读回或上传隐藏状态。
-    const auto embedding = r.Weight("model.embed_tokens.weight", {p.vocabSize, p.hiddenSize});
-    const auto finalNorm = r.Weight("model.norm.weight", {p.hiddenSize});
-    const auto lmHead = r.Weight("lm_head.weight", {p.vocabCount, p.hiddenSize});
+    // 在分配前验证权重绑定设备；共享提交路径内继续核对全部布局。
+    r.Weight("model.embed_tokens.weight", {p.vocabSize, p.hiddenSize});
     const int t = tokenIds.size(), h = p.hiddenSize;
     auto ids = static_cast<uint32_t*>(r.Allocate(tokenIds.size() * sizeof(uint32_t)));
     auto x = static_cast<half*>(r.Allocate(size_t(t) * h * 2));
@@ -445,15 +518,7 @@ std::vector<float> Qwen3LayerExecutor::RunTokens(const std::vector<uint32_t> &to
     auto logits = static_cast<float*>(r.Allocate(p.vocabCount * sizeof(float)));
 
     Cuda(cudaMemcpyAsync(ids, tokenIds.data(), tokenIds.size() * sizeof(uint32_t), cudaMemcpyHostToDevice, r.stream));
-    Embed<<<(t*h+255)/256,256,0,r.stream>>>(ids, embedding, x, t*h, h);
-    Cuda(cudaGetLastError());
-    for (uint32_t layer = 0; layer < p.layerCount; ++layer) {
-        r.RunLayer(layer, t, positionBegin, Qwen3LayerStage::Full, x, workspace, cached);
-    }
-    Norm<<<1,256,0,r.stream>>>(x + size_t(t - 1) * h, finalNorm, workspace.norm,
-                              h, h, 1, 0, p.rmsNormEps);
-    r.Linear(workspace.norm, lmHead, logits, 1, p.vocabCount, h, true);
-    Cuda(cudaGetLastError());
+    r.EnqueueTokens(ids, x, workspace, logits, t, positionBegin, cached);
 
     std::vector<float> result(p.vocabCount);
     Cuda(cudaMemcpyAsync(result.data(), logits, result.size() * sizeof(float), cudaMemcpyDeviceToHost, r.stream));
@@ -513,12 +578,70 @@ std::vector<float> Qwen3LayerExecutor::Decode(uint32_t tokenId) {
     if (request.tokens >= request.capacity) {
         throw std::runtime_error("Qwen3 request capacity exhausted");
     }
-    return RunTokens({tokenId}, request.positionBegin + request.tokens, true);
+    if (tokenId >= impl->weights.Plan().vocabSize) {
+        throw std::runtime_error("Qwen3 prefill token ID outside vocabulary");
+    }
+    if (impl->graphInfo.enabled) return DecodeGraph(tokenId);
+    auto result = RunTokens({tokenId}, request.positionBegin + request.tokens, true);
+    ++impl->graphInfo.eagerDecodes;
+    return result;
+}
+
+std::vector<float> Qwen3LayerExecutor::DecodeGraph(uint32_t tokenId) {
+    auto &r = *impl;
+    const auto &p = r.weights.Plan();
+    const uint32_t meta[] = {r.request.tokens, r.request.positionBegin + r.request.tokens};
+    r.Validate(0, 1, p.hiddenSize, meta[1], Qwen3LayerStage::Full);
+    r.Weight("model.embed_tokens.weight", {p.vocabSize, p.hiddenSize});
+
+    if (!r.graphExec) {
+        r.graphIds = static_cast<uint32_t*>(r.Allocate(sizeof(uint32_t), true));
+        r.graphMeta = static_cast<uint32_t*>(r.Allocate(sizeof(meta), true));
+        r.graphX = static_cast<half*>(r.Allocate(size_t(p.hiddenSize) * sizeof(half), true));
+        r.graphWorkspace = r.Prepare(1, p.hiddenSize, Qwen3LayerStage::Full, true);
+        r.graphLogits = static_cast<float*>(r.Allocate(p.vocabCount * sizeof(float), true));
+        constexpr size_t blasWorkspaceBytes = 4 * 1024 * 1024;
+        Blas(cublasSetWorkspace(r.blas, r.Allocate(blasWorkspaceBytes, true), blasWorkspaceBytes));
+    }
+    Cuda(cudaMemcpyAsync(r.graphIds, &tokenId, sizeof(tokenId), cudaMemcpyHostToDevice, r.stream));
+    Cuda(cudaMemcpyAsync(r.graphMeta, meta, sizeof(meta), cudaMemcpyHostToDevice, r.stream));
+
+    if (!r.graphExec) {
+        // warmup 只覆盖当前 KV 槽位，不推进有效长度；重放重新从 embedding 开始计算。
+        r.EnqueueTokens(r.graphIds, r.graphX, r.graphWorkspace, r.graphLogits, 1, meta[1], true, r.graphMeta);
+        r.Synchronize();
+        ++r.graphInfo.warmups;
+        Cuda(cudaStreamBeginCapture(r.stream, cudaStreamCaptureModeThreadLocal));
+        try {
+            r.EnqueueTokens(r.graphIds, r.graphX, r.graphWorkspace, r.graphLogits, 1, meta[1], true, r.graphMeta);
+        } catch (...) {
+            // 即便捕获失效，也必须结束捕获；失败不允许退回 Eager。
+            cudaGraph_t abandoned = nullptr;
+            cudaStreamEndCapture(r.stream, &abandoned);
+            if (abandoned) cudaGraphDestroy(abandoned);
+            throw;
+        }
+        Cuda(cudaStreamEndCapture(r.stream, &r.graph));
+        Cuda(cudaGraphInstantiate(&r.graphExec, r.graph, nullptr, nullptr, 0));
+        ++r.graphInfo.captures;
+    }
+
+    Cuda(cudaGraphLaunch(r.graphExec, r.stream));
+    std::vector<float> result(p.vocabCount);
+    Cuda(cudaMemcpyAsync(result.data(), r.graphLogits, result.size() * sizeof(float), cudaMemcpyDeviceToHost, r.stream));
+    r.Synchronize();
+    for (float value : result) {
+        if (!std::isfinite(value)) throw std::runtime_error("Qwen3 CUDA Graph produced nonfinite logits");
+    }
+    ++r.graphInfo.replays;
+    ++r.request.tokens;
+    return result;
 }
 
 void Qwen3LayerExecutor::EndRequest() {
     auto &r = *impl;
     r.Synchronize();
+    r.ReleaseGraph();
     for (auto &cache : r.kvCache) {
         Cuda(cudaFree(cache));
         cache = nullptr;
@@ -528,7 +651,11 @@ void Qwen3LayerExecutor::EndRequest() {
 }
 
 Qwen3RequestInfo Qwen3LayerExecutor::RequestInfo() const {
-    return impl->request;
+    auto info = impl->request;
+    info.graph = impl->graphInfo;
+    info.graph.active = impl->graphExec != nullptr;
+    info.graph.workspaceBytes = impl->graphAllocated;
+    return info;
 }
 
 void Qwen3LayerExecutor::Clear() {
