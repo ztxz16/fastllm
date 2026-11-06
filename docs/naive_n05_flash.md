@@ -103,12 +103,15 @@ RoPE 写入还覆盖 packed QKV、带 scale 的 FP8 Indexer、79～449 路边界
 重绑；TP4 回归覆盖两种 Indexer 分片的扩页、请求生命周期与前缀恢复。
 普通显存回归还对照 KVMem FP4 检查 eager/Graph logits，覆盖 replicated、
 layer_shard、context_shard 三种 Indexer 存储、跨页增长和跨请求前缀恢复。
+PD 交接支持普通显存的 replicated/layer_shard：传输 FP4 K/V、FP8 SWA 和独立
+Indexer，不重新量化；FP4 使用 v2 状态格式，BF16/FP8 保持原 v1 格式。
+PD 的 context_shard 限制保持不变。
 在启用 `-DUNIT_TEST=ON` 的 CUDA 构建中，GPU 空闲后可运行：
 
 ```bash
 cmake --build build --target naive_n05_fp4_kv_test naive_n05_fp4_vector_test -j2
 cmake --build build --target naive_n05_verify_graph_test -j2
-ctest --test-dir build -R '^naive_n05_(fp4_(kv|vector)|kvmem(_transition|_prefix)?_fp4_.*|gpu_fp4_.*)$' --output-on-failure
+ctest --test-dir build -R '^naive_n05_(fp4_(kv|vector)|kvmem(_transition|_prefix)?_fp4_.*|gpu_fp4_.*|pd_.*)$' --output-on-failure
 ```
 
 这是实验路径；上述回归检查存储和执行一致性，不代表 FP4 与原模型精度等价。

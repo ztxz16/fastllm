@@ -180,6 +180,22 @@ static void TestPrefillBatch() {
 
 int main() {
     try {
+        // Packed FP4 rows include E4M3 scales. Transfer all stored bytes
+        // without expanding or re-quantizing their values.
+        Data fp4(FP4_E2M1, {1, 3, 192});
+        fp4.Allocate();
+        for (size_t i = 0; i < fp4.GetBytes(); ++i) fp4.cpuData[i] = i * 17;
+        PDStateWriter packedWriter;
+        packedWriter.Tensor(fp4);
+        auto packed = packedWriter.Finish();
+        Check(packed.buffers.size() == 1 && packed.buffers[0].Size() == 3 * 12 * 9,
+              "FP4 wire byte count");
+        PDStateReader packedReader(packed);
+        Data unpacked;
+        packedReader.Tensor(unpacked); packedReader.End();
+        Check(unpacked.dataType == FP4_E2M1 && unpacked.dims == fp4.dims &&
+                  std::equal(fp4.cpuData, fp4.cpuData + fp4.GetBytes(), unpacked.cpuData),
+              "FP4 payload/scales round trip");
         Data source(FLOAT32, {2, 3}, std::vector<float>{1, 2, 3, 4, 5, 6});
         source.Expansion({2, 8});
         PDStateWriter writer;

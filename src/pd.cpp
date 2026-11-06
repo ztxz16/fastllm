@@ -24,6 +24,10 @@ uint64_t TensorBytes(const Data &data) {
         Check(n >= 0 && (!n || elements <= (UINT64_MAX / 16) / n), "invalid tensor shape");
         elements *= n;
     }
+    if (data.dataType == FP4_E2M1) {
+        Check(data.dims.empty() || data.dims.back() % 16 == 0, "FP4 row width must be block16 aligned");
+        return elements / 16 * 9;
+    }
     Check(data.unitSizeDiv == 1, "packed element type requires a model wire codec");
     return elements * data.unitSize;
 }
@@ -62,7 +66,8 @@ void PDStateWriter::Tensor(const Data &root) {
         data.dataDevice == CUDA ? data.cudaData : data.cpuData,
         std::max<uint64_t>(bytes, data.expansionBytes),
         data.dataDevice == CUDA ? fastkv::MemoryKind::Cuda : fastkv::MemoryKind::Host, device, sourceLease);
-    const size_t rowBytes = size_t(data.dims.back()) * data.unitSize;
+    const size_t rowBytes = data.dataType == FP4_E2M1 ? GetDataBytes(data.dataType, 1, data.dims.back())
+                                                   : size_t(data.dims.back()) * data.unitSize;
     Check(rowBytes > 0 && data.strides.size() == data.dims.size(), "invalid tensor strides");
     const uint64_t rows = bytes / rowBytes;
     uint64_t stride = 1;
@@ -71,6 +76,8 @@ void PDStateWriter::Tensor(const Data &root) {
         contiguous &= data.dims[axis] == 1 || data.strides[axis] == stride;
         stride *= data.dims[axis];
     }
+    Check(data.dataType != FP4_E2M1 || contiguous,
+          "FP4 tensors must be compacted by their model adapter");
     if (contiguous) {
         output.CopyFrom(input, 0, 0, bytes);
         buffers.push_back(std::move(output));
@@ -94,7 +101,7 @@ PDStateReader::PDStateReader(const fastkv::Message &value) : metadata(value.meta
 void PDStateReader::Tensor(Data &tensor) {
     const auto type = DataType(metadata.U32());
     Check(type == FLOAT32 || type == FLOAT16 || type == BFLOAT16 || type == INT8 || type == FP8_E4M3 ||
-              type == INT32PARAM,
+              type == INT32PARAM || type == FP4_E2M1,
           "unsupported tensor wire type");
     auto dims = metadata.Ints(8);
     const bool fp8Index = metadata.U32() != 0;

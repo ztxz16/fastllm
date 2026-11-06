@@ -2,6 +2,7 @@
 #include "devices/cuda/cudaworkspace.h"
 #include "devices/multicuda/fastllm-multicuda.cuh"
 #include "models/naive_n05_flash.h"
+#include "pd.h"
 #include "../../src/models/naive_n05_tp.h"
 #include "models/speculative_sampling.h"
 #include "utils/utils.h"
@@ -711,6 +712,49 @@ class Fixture : public NaiveN05FlashModel {
         return result;
     }
 #endif
+    void PDStateChecks() {
+        maxBatch = 4; SetMaxTokens(16384); SetChunkedPrefillSize(4096);
+        WarmUp();
+        for (int length : {1, 127, 129, 257, 3073}) {
+            ResponseContext reference, imported;
+            for (auto *context : {&reference, &imported}) {
+                context->Init(block_cnt, dataType, kvCacheDataType);
+                context->generationConfig.top_k = 1;
+                context->generationConfig.output_logits = true;
+                context->generationConfig.output_token_limit = 8;
+                context->generationConfig.input_token_length = length + 1;
+                for (int i = 0; i < length; ++i) context->allTokens.push_back((i * 17 + 3) % 256);
+                context->inputTokens = length + 1;
+                OnResponseContextCreated(context);
+            }
+            std::vector<float> ids(reference.allTokens.begin(), reference.allTokens.end()), positions(length);
+            std::iota(positions.begin(), positions.end(), 0.f);
+            isIntermediateChunkedPrefill = true;
+            Forward(Data(FLOAT32, {1, length}, ids), Data(), Data(FLOAT32, {1, length}, positions),
+                    reference.pastKeyValues, reference.generationConfig);
+            isIntermediateChunkedPrefill = false;
+            reference.preTokens = length;
+            auto message = ExportPDState(reference);
+            imported.allTokens.push_back(42);
+            ImportPDState(imported, message);
+            imported.preTokens = length;
+            // Both eager and captured decode must read the restored Indexer,
+            // FP4 scales and the SWA ring at the same logical positions.
+            for (int step = 0; step < 3; ++step) {
+                SetCudaGraph(step != 0);
+                Data token(FLOAT32, {1, 1}, {float(42 + step)}), pos(FLOAT32, {1, 1}, {float(length + step)});
+                std::vector<float> expected, actual;
+                Forward(token, Data(), pos, reference.pastKeyValues, reference.generationConfig, LastTokensManager(), &expected);
+                Forward(token, Data(), pos, imported.pastKeyValues, imported.generationConfig, LastTokensManager(), &actual);
+                if (expected.empty() || expected != actual ||
+                    !std::all_of(actual.begin(), actual.end(), [](float x) { return std::isfinite(x); }))
+                    throw std::runtime_error("PD restored logits differ");
+            }
+            OnResponseContextRemoved(&reference);
+            OnResponseContextRemoved(&imported);
+        }
+        std::cout << "NAIVE PD STATE PASS ranks=" << ranks << " dtype=" << kvCacheDataType << std::endl;
+    }
     mutable int pagedRestores = 0, lastPrefixLength = 0;
     mutable bool failPrefixRestore = false;
     int hostRestores = 0;
@@ -3465,6 +3509,15 @@ int main(int argc, char **argv) {
             DraftFixture fixture(true, 2, 0, 5); fixture.PrefillCommitChecks(); return 0;
         }
 #endif
+        if (argc > 2 && std::string(argv[2]) == "pd_state") {
+            SetCudaEmbedding(true); SetCudaGraph(true);
+            Fixture fixture(ranks, false, true, true, true);
+            if (argc > 3 && std::string(argv[3]) == "fp4") fixture.SetKVCacheDataType(FP4_E2M1);
+            if (argc > 3 && std::string(argv[3]) == "fp8") fixture.SetKVCacheDataType(FP8_E4M3);
+            fixture.SetIndexerTPStorage(argc > 4 && std::string(argv[4]) == "layer_shard");
+            fixture.SetIndexerDataType(FP8_E4M3);
+            fixture.PDStateChecks(); return 0;
+        }
         if (argc > 2 && std::string(argv[2]) == "draft_prefix") {
             SetCudaEmbedding(true); SetCudaGraph(!(argc > 4 && std::string(argv[4]) == "eager"));
             Fixture fixture(ranks, false, true, true, true);

@@ -2335,7 +2335,7 @@ if (UNIT_TEST)
         set_tests_properties(naive_n05_serving_metadata PROPERTIES ENVIRONMENT "FASTLLM_CUDA_GRAPH=1")
 
         add_executable(naive_n05_tp_model_test test/basic/test_naive_n05_tp_model.cpp)
-        target_link_libraries(naive_n05_tp_model_test PRIVATE fastllm)
+        target_link_libraries(naive_n05_tp_model_test PRIVATE fastllm fastkv)
         target_include_directories(naive_n05_tp_model_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
         add_test(NAME naive_n05_tp_model COMMAND naive_n05_tp_model_test)
         add_test(NAME naive_n05_tp_model_2 COMMAND naive_n05_tp_model_test 2)
@@ -2395,7 +2395,7 @@ if (UNIT_TEST)
                 ENABLE_EXPORTS ON LINKER_LANGUAGE CUDA)
             target_include_directories(naive_n05_tp_graph_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
             target_link_libraries(naive_n05_verify_graph_test PRIVATE
-                fastllm_tools ${NAIVE_TP_GRAPH_CUDART} ${CMAKE_DL_LIBS})
+                fastllm_tools fastkv ${NAIVE_TP_GRAPH_CUDART} ${CMAKE_DL_LIBS})
             set_target_properties(naive_n05_verify_graph_test PROPERTIES ENABLE_EXPORTS ON LINKER_LANGUAGE CUDA)
             target_include_directories(naive_n05_verify_graph_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
             foreach(NAIVE_SPARSE_KV_TYPE bf16 fp8)
@@ -2451,6 +2451,15 @@ if (UNIT_TEST)
             set_tests_properties(naive_n05_gpu_fp4_auto_indexer PROPERTIES
                 LABELS "cuda;multigpu" RUN_SERIAL TRUE TIMEOUT 300 SKIP_RETURN_CODE 77
                 PASS_REGULAR_EXPRESSION "FP4 EXECUTION PASS")
+            foreach(NAIVE_PD_KV bf16 fp8 fp4)
+                foreach(NAIVE_PD_STORAGE replicated layer_shard)
+                    add_test(NAME naive_n05_pd_${NAIVE_PD_KV}_${NAIVE_PD_STORAGE}
+                        COMMAND naive_n05_verify_graph_test 4 pd_state ${NAIVE_PD_KV} ${NAIVE_PD_STORAGE})
+                    set_tests_properties(naive_n05_pd_${NAIVE_PD_KV}_${NAIVE_PD_STORAGE} PROPERTIES
+                        LABELS "cuda;multigpu" RUN_SERIAL TRUE TIMEOUT 180 SKIP_RETURN_CODE 77
+                        PASS_REGULAR_EXPRESSION "NAIVE PD STATE PASS")
+                endforeach()
+            endforeach()
             foreach(NAIVE_SPARSE_DRAFT_KV bf16 fp8)
                 add_test(NAME naive_n05_kvmem_draft_${NAIVE_SPARSE_DRAFT_KV}
                     COMMAND naive_n05_verify_graph_test 2 kvmem_draft ${NAIVE_SPARSE_DRAFT_KV} 5 16384)
