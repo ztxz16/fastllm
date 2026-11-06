@@ -1,3 +1,4 @@
+#include <linux/mempolicy.h>
 #include "numas.h"
 #include <fstream>
 #include <map>

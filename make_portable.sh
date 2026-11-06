@@ -540,6 +540,10 @@ python_bin="${runtime_dir}/bin/python3"
 
 wheelhouse_dir="${cache_dir}/wheelhouse-cp311-linux-x86_64"
 mkdir -p "$wheelhouse_dir"
+# Portable CUDA dependencies are required even for an older input wheel whose
+# metadata does not declare every native dependency. Constraints alone do not
+# cause pip to install a package.
+cuda_runtime_requirements=(nvidia-cuda-runtime-cu12 nvidia-cublas-cu12 nvidia-nccl-cu12)
 pip_constraint_args=()
 if ((use_constraints)); then
     pip_constraint_args+=(--constraint "$constraints_path")
@@ -573,7 +577,7 @@ if ((! offline)); then
         --dest "$wheelhouse_dir" \
         "${download_target_args[@]}" \
         "${pip_constraint_args[@]}" \
-        "$wheel_path"
+        "$wheel_path" "${cuda_runtime_requirements[@]}"
 fi
 
 log "从本地 wheelhouse 安装 ${package_name} ${package_version} 及全部依赖"
@@ -586,7 +590,11 @@ pip_install_args=(
     --find-links "$wheelhouse_dir"
 )
 pip_install_args+=("${pip_constraint_args[@]}")
-"$python_bin" -m pip "${pip_install_args[@]}" "$wheel_path"
+"$python_bin" -m pip "${pip_install_args[@]}" "$wheel_path" "${cuda_runtime_requirements[@]}"
+
+# This is an integrity requirement, including for --skip-tests and CPU-only
+# build hosts: a system libnccl must not hide a missing file in the bundle.
+"$python_bin" "${PORTABLE_ASSETS_DIR}/cuda_runtime.py" --runtime-root "$runtime_dir"
 
 # Build the companion wheel from this checkout, in a disposable environment.
 # Do not reuse a version-only wheel cache: bridge/extension code may have changed.
@@ -638,6 +646,7 @@ install -m 0755 "${PORTABLE_ASSETS_DIR}/launcher.sh" "${bundle_dir}/pip"
 install -m 0755 "${PORTABLE_ASSETS_DIR}/launcher.sh" "${bundle_dir}/ftllm-check"
 install -m 0644 "${PORTABLE_ASSETS_DIR}/activate.sh" "${bundle_dir}/libexec/activate.sh"
 install -m 0755 "${PORTABLE_ASSETS_DIR}/check.py" "${bundle_dir}/libexec/check.py"
+install -m 0644 "${PORTABLE_ASSETS_DIR}/cuda_runtime.py" "${bundle_dir}/libexec/cuda_runtime.py"
 install -m 0644 "${PORTABLE_ASSETS_DIR}/env.sh" "${bundle_dir}/env.sh"
 install -m 0644 "${PORTABLE_ASSETS_DIR}/README.md.in" "${bundle_dir}/README.md"
 install -m 0644 "${PORTABLE_ASSETS_DIR}/THIRD-PARTY-NOTICES.md" "${bundle_dir}/THIRD-PARTY-NOTICES.md"

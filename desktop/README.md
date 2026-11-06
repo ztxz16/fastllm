@@ -3,6 +3,8 @@
 此目录把现有 `ftllm launch` 网页界面嵌入 Electron，并复用仓库根目录的
 `make_portable.sh` 生成完整 FastLLM 运行时。最终用户不需要安装 Electron、Node.js、
 Python、CUDA Toolkit、cuBLAS、NCCL 或 Python 包。
+构建时会强制安装并检查包内 CUDA runtime、cuBLAS 和 NCCL 动态库；
+即使使用 `--skip-tests`，缺少 `libnccl.so.2` 等文件也会阻止出包。
 包内同时包含 Pi Agent 和 FastLLM 桥接扩展，启动模型后可直接使用“工作室”中的目录 Agent。
 目录搜索所需的 ripgrep、fd 也会随包提供，不依赖目标机器预先安装这些工具。
 
