@@ -14,6 +14,56 @@ Add a profile → select a model → choose Automatic configuration → save and
 
 `ftllm` (or `ftllm launch`) listens only on `127.0.0.1:8000` by default and opens the browser after the service is ready; use `ftllm launch --no-browser` to disable automatic opening. The page can download models from ModelScope, save and preview launch profiles, and run either `ftllm server` or the chat-oriented `ftllm webui`. For a new profile, select a local model and Automatic configuration; `--auto` plans inference settings when the service starts. Expand Resource limits or Model parameters to override individual options. Leave Chunk and Maximum concurrency blank to restore automatic planning. See the [`--auto` tuning guide](auto_en.md#launcher-automatic-mode). Custom configuration remains available. Its interface supports Simplified Chinese and English, preferring the last selection and otherwise following the browser language; terminal output from `ftllm launch` always uses English. To access it from the LAN, run `ftllm launch --host 0.0.0.0`; the terminal and Launcher page then list loopback, LAN, and directly assigned public-interface addresses when available. Public access also requires the host firewall and cloud security group to allow the port, plus port forwarding when behind NAT; Launcher does not discover NAT public mappings. Non-loopback access uses unencrypted HTTP and should only be enabled on a trusted network. It shares profiles with the terminal wizard and stops its managed download and model processes when the launcher exits. Run `ftllm launch --help` for other options.
 
+## Concurrent models, GPUs and video generation
+
+Each profile selects a backend: LLM or **MiniMax H3 / Pika H3 video**. Services
+can run concurrently on different ports. The top service selector controls API
+information and Stop; profile cards can also manage or stop an individual service.
+Stopping one model leaves other services running. Exiting Launcher stops all of them.
+LLMs share conversation history. Only one generation may write a conversation at a
+time, and it can be cancelled from another model's chat view. Each native adapter
+(Harness, OpenCode, Codex, Claude) shares its installation and workspace, so opening
+it for another model stops its previous instance. Workspace Pi tasks run per conversation.
+
+Select GPUs using the checkboxes or a comma-separated list of launcher-visible
+indices / UUIDs. Each child receives its own `CUDA_VISIBLE_DEVICES`; its device
+indices become `0,1,…`. For example, choose GPU `0` for the LLM and `1` for video.
+Video uses all explicitly selected GPUs for tensor parallelism; without a selection
+it uses logical GPU 0. Manual LLM CUDA/TP settings use the **remapped indices**.
+Automatic planning sees only the selected GPUs. An inherited GPU mask is respected;
+this setting cannot widen it. Visibility restrictions do not reserve GPUs exclusively.
+
+To launch video:
+
+1. Build `minimax_h3_server` using the [H3 instructions](../tools/minimax_h3/README.md).
+   Enter its absolute path, add it to `PATH`, or set `FTLLM_H3_SERVER`. The source
+   `build` and `build-cuda` directories are also searched.
+2. Choose the video backend, model directory, port and GPUs. Pika is detected
+   automatically and still requires the full H3 base. Set the base directory if it
+   is not beside Pika as `MiniMax-H3` or linked through `base_model`.
+3. Once ready, API information includes create, status, cancel and content-download
+   endpoints with an example request. Output defaults to `~/.local/share/fastllm/videos/<port>`.
+4. Studio → Video generation provides prompts, resolution, duration, seed and optional
+   first/last frames, with progress, cancellation, preview and MP4 download. Pika uses
+   six steps; H3 defaults to 50. Reference uploads total at most 31 MiB; Studio downloads
+   are limited to 256 MiB per result. Refreshing reloads the service's job list.
+
+Studio has an independent chat model selector. Opening a video service or demo
+does not disconnect chat. Start an LLM and video service, install Pi and create a
+workspace Agent. Ask it to generate a video and save it in the workspace. It receives
+a live generation-service catalog and a scoped local helper, uses its existing bash
+tool to create/poll/download jobs, and returns video attachments in the conversation.
+Pi 0.3.3 already supports this; ordinary chat does not execute these commands.
+Stopping the Agent cancels unfinished jobs created in that turn. Jobs remain visible
+in the demo if an Agent reaches its own time/turn limit.
+
+Backend contracts live in `service_backends.py`; `launcher_services.py` owns process
+isolation, discovery and authenticated proxying, and `media_agent.py` exposes the
+per-turn local bridge without revealing service keys or the launcher control token.
+Future image/audio/world backends can add contracts, protocol adapters and Studio
+components while reusing this infrastructure. The currently implemented generation
+capability is `video.generate`.
+
 ## Launch settings and model downloads
 
 **Model location** comes first, followed by Basic settings. The two modes are Automatic configuration and Custom configuration. Three sections below are collapsed by default:
@@ -50,7 +100,7 @@ Chat, Agent replies, and reasoning support Markdown tables, headings, nested lis
 
 ## Studio and WebUI
 
-Once the API Server is ready, click **Open Studio** to use chat, saved conversations, Markdown, attachments, reasoning, and agents directly in Launcher's content area. Model management navigation stays visible, so you can visit launch profiles, downloads, logs, and hardware, then return to the same conversation. Launcher and standalone `ftllm webui` share the chat component and backend; the component adapts its colors, sizing, and language to Launcher. It connects to the active model with the configured API key, without another WebUI process or port. Conversations use WebUI’s existing local storage and survive page refreshes. Stopping or switching models cancels active WebUI tasks and disposes of the old component.
+Once the API Server is ready, click **Open Studio** to use chat, saved conversations, Markdown, attachments, reasoning, and agents directly in Launcher's content area. Model management navigation stays visible, so you can visit launch profiles, downloads, logs, and hardware, then return to the same conversation. Launcher and standalone `ftllm webui` share the chat component and backend; the component adapts its colors, sizing, and language to Launcher. It connects to the LLM selected in Studio with the configured API key, without another WebUI process or port. Conversations use WebUI’s existing local storage and survive page refreshes. Stopping the selected LLM cancels its active WebUI tasks. Switching the top-bar service or opening the video demo preserves the current chat; switching the Studio LLM loads that model’s chat component.
 
 The Studio reads reasoning options from the active model's `/v1/models` metadata and sends the selected value unchanged. DeepSeek V4.1, for example, offers `none / low / high / max`. Servers without this metadata show **Model default**. Saved legacy choices are migrated for the corresponding model.
 

@@ -227,6 +227,14 @@ export async function mountWebUI(host, {basePath = "", embedded = false, locale 
         }
         const card = document.createElement("div"); card.className = "attachment-card"; const media = document.createElement(attachment.kind === "video" ? "video" : "img"); media.src = localUrl(attachment.url); media.alt = attachment.name || t("common.attachment"); if (attachment.kind === "video") media.controls = true; const name = document.createElement("div"); name.className = "attachment-name"; name.textContent = attachment.name || t("common.attachment"); card.append(media,name); grid.append(card);
       }
+      for (const card of grid.querySelectorAll(".attachment-card")) {
+        const video = card.querySelector("video");
+        if (!video) continue;
+        const download = document.createElement("a");
+        download.href = video.src; download.download = card.querySelector(".attachment-name")?.textContent || "video.mp4";
+        download.textContent = t("artifact.download_video");
+        card.append(download);
+      }
       parent.append(grid);
     }
 

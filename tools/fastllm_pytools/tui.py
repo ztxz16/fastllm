@@ -65,6 +65,11 @@ MODELSCOPE_MODEL_CHOICES: Sequence[Choice] = _flatten_modelscope_model_choices()
 @dataclass
 class DeployConfig:
     name: str = ""
+    backend: str = "llm"
+    visible_gpus: str = ""
+    server_binary: str = ""
+    base_model: str = ""
+    output_dir: str = ""
     command: str = "server"
     model: str = ""
     model_name: str = ""
@@ -566,7 +571,10 @@ def parse_env_vars(value: str) -> dict:
 
 
 def build_fastllm_env(config: DeployConfig) -> dict:
-    return parse_env_vars(_runtime_auto_config(config).env_vars)
+    from .service_backends import visible_gpu_environment
+    environment = parse_env_vars(_runtime_auto_config(config).env_vars)
+    environment.update(visible_gpu_environment(config.visible_gpus))
+    return environment
 
 
 def _env_prefix(config: DeployConfig) -> List[str]:
@@ -759,6 +767,9 @@ def default_model_name_from_path(model_path: str) -> str:
 
 
 def effective_model_name(config: DeployConfig) -> str:
+    if config.backend != "llm":
+        from .service_backends import get_backend
+        return get_backend(config).model_name(config)
     return config.model_name.strip() or default_model_name_from_path(config.model)
 
 
@@ -994,9 +1005,9 @@ def _runtime_auto_options(config: DeployConfig):
 
 def _runtime_auto_config(config: DeployConfig) -> DeployConfig:
     """Keep service settings and explicit auto overrides, excluding manual fields."""
-    if config.config_mode != "auto" or config.command != "server":
+    if config.backend != "llm" or config.config_mode != "auto" or config.command != "server":
         return config
-    service_fields = ("name", "command", "model", "model_name", "host", "port",
+    service_fields = ("name", "backend", "visible_gpus", "command", "model", "model_name", "host", "port",
                       "api_key", "hide_input", "config_mode", "auto_gpu_memory_limit",
                       "auto_host_memory_limit", "force_ddr_limit", "mmproj",
                       "extra_args", "env_vars", *AUTO_TUNING_OPTIONS)
@@ -1165,6 +1176,9 @@ def complete_path_prefix(raw_prefix: str, directories_only: bool = False) -> Lis
 
 
 def build_fastllm_argv(config: DeployConfig) -> List[str]:
+    if config.backend != "llm":
+        from .service_backends import get_backend
+        return get_backend(config).argv(config)
     config = _normalize_speculative_config(config)
     argv = ["ftllm", config.command]
     model = _expand_user_path(config.model.strip())
@@ -1276,8 +1290,25 @@ def build_fastllm_command(config: DeployConfig) -> str:
 
 
 def validate_config(config: DeployConfig, field_errors: Optional[List[dict]] = None) -> List[str]:
+    from .service_backends import get_backend, visible_gpu_environment
+    backend_errors = []
+    try:
+        backend = get_backend(config)
+    except ValueError as error:
+        backend_errors.append({"message": str(error), "fields": ["backend"]})
+        backend = None
+    try:
+        visible_gpu_environment(config.visible_gpus)
+    except ValueError as error:
+        backend_errors.append({"message": str(error), "fields": ["visible_gpus"]})
+    if backend is not None and backend.kind != "llm":
+        backend_errors.extend(backend.validate(config))
+    if field_errors is not None:
+        field_errors.extend(backend_errors)
+    if backend is None or backend.kind != "llm":
+        return [item["message"] for item in backend_errors]
     config = _normalize_speculative_config(_runtime_auto_config(config))
-    errors = []
+    errors = [item["message"] for item in backend_errors]
 
     def add_error(message, *field_names):
         errors.append(message)
