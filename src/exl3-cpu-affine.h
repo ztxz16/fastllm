@@ -2,7 +2,7 @@
 //
 // mul1 has an affine byte-sum codebook. Omitting its per-weight FP16 rounding
 // permits a byte-sum dot followed by one scale and offset. The exact decoder
-// remains in exl3.cpp for reconstruction, prefill and numerical reference.
+// remains in exl3.cpp for reconstruction, prefill and exceptional inputs.
 //
 // Quantized dot: symmetric 12-bit activations per 128 inputs. Each decoded
 // byte pair sums to at most 510, so maddubs against ones cannot saturate.
@@ -13,6 +13,7 @@
 //
 // Cache shifted word vectors once per tile. A row then selects at most two
 // adjacent vectors, avoiding gathers in the 16-row inner dot product.
+#if defined(__AVX2__) || defined(__AVX512F__)
 template <int Bits, int Half> struct Exl3AffineGeometry {
     static constexpr int base(int c) {
         const int col = c + Half;
@@ -185,8 +186,6 @@ template <int Bits, int Half> struct Exl3AffineTile {
         }
         return v;
     }
-#else
-    const uint32_t *words;
 #endif
 #if defined(__AVX512F__) || defined(__AVX2__)
     template <int J = 0> inline void prepare(const Raw &raw) {
@@ -199,8 +198,6 @@ template <int Bits, int Half> struct Exl3AffineTile {
 #if defined(__AVX512F__) || defined(__AVX2__)
         Raw raw(p);
         prepare(raw);
-#else
-        words = p;
 #endif
     }
     template <int Row, bool Integer = false> inline auto values() const {
@@ -297,51 +294,19 @@ template <int Bits, int Half> struct Exl3AffineTile {
             auto sum = _mm256_madd_epi16(_mm256_maddubs_epi16(mixed, _mm256_set1_epi8(1)), _mm256_set1_epi16(1));
             return _mm256_cvtepi32_ps(sum);
         }
-#else
-        float v[Exl3Lanes];
-        for (int c = 0; c < Exl3Lanes; ++c) {
-            const int bit = (G::base(c) + G::delta(Row)) % (128 * Bits), at = bit / 32;
-            const uint64_t pair = (uint64_t(words[at]) << 32) | words[(at + 1) % (4 * Bits)];
-            const uint32_t m = uint32_t(uint16_t(pair >> (48 - bit % 32))) * 0x83dcd12du;
-            v[c] = float((m & 255) + ((m >> 8) & 255) + ((m >> 16) & 255) + (m >> 24));
-        }
-        return Load(v);
 #endif
     }
 };
 
-template <int Bits, int Half> inline void Exl3AffineAccTile(const uint32_t *words, const float *x, float *result) {
-    auto acc = Load(result);
-    Exl3AffineTile<Bits, Half> tile(words);
-#define EXL3_AFFINE_ROW(R) acc = Madd(tile.template values<R>(), x[R], acc)
-    EXL3_AFFINE_ROW(0);
-    EXL3_AFFINE_ROW(1);
-    EXL3_AFFINE_ROW(2);
-    EXL3_AFFINE_ROW(3);
-    EXL3_AFFINE_ROW(4);
-    EXL3_AFFINE_ROW(5);
-    EXL3_AFFINE_ROW(6);
-    EXL3_AFFINE_ROW(7);
-    EXL3_AFFINE_ROW(8);
-    EXL3_AFFINE_ROW(9);
-    EXL3_AFFINE_ROW(10);
-    EXL3_AFFINE_ROW(11);
-    EXL3_AFFINE_ROW(12);
-    EXL3_AFFINE_ROW(13);
-    EXL3_AFFINE_ROW(14);
-    EXL3_AFFINE_ROW(15);
-#undef EXL3_AFFINE_ROW
-    Store(result, acc);
-}
 #if defined(__AVX2__) && !defined(__AVX512F__)
-template <int Bits, bool Quant> inline void Exl3AccPair(const uint32_t *p, const void *x, void *out) {
+template <int Bits> inline void Exl3AccPair(const uint32_t *p, const void *x, void *out) {
     Exl3AffineTile<Bits, 0> lo(p);
     Exl3AffineTile<Bits, 8> hi(p);
-    if constexpr (Quant) {
-        int *dst = static_cast<int *>(out);
-        const volatile int *in = static_cast<const volatile int *>(x);
-        auto a = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(dst));
-        auto b = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(dst + 8));
+
+    int *dst = static_cast<int *>(out);
+    const volatile int *in = static_cast<const volatile int *>(x);
+    auto a = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(dst));
+    auto b = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(dst + 8));
 #define EXL3_PAIR(R)                                                                                                   \
     {                                                                                                                  \
         const auto q = _mm256_set1_epi16(in[R]);                                                                       \
@@ -350,98 +315,27 @@ template <int Bits, bool Quant> inline void Exl3AccPair(const uint32_t *p, const
         b = _mm256_add_epi32(                                                                                          \
             b, _mm256_madd_epi16(_mm256_maddubs_epi16(hi.template values<R, true>(), _mm256_set1_epi8(1)), q));        \
     }
-        EXL3_PAIR(0);
-        EXL3_PAIR(1);
-        EXL3_PAIR(2);
-        EXL3_PAIR(3);
-        EXL3_PAIR(4);
-        EXL3_PAIR(5);
-        EXL3_PAIR(6);
-        EXL3_PAIR(7);
-        EXL3_PAIR(8);
-        EXL3_PAIR(9);
-        EXL3_PAIR(10);
-        EXL3_PAIR(11);
-        EXL3_PAIR(12);
-        EXL3_PAIR(13);
-        EXL3_PAIR(14);
-        EXL3_PAIR(15);
+    EXL3_PAIR(0);
+    EXL3_PAIR(1);
+    EXL3_PAIR(2);
+    EXL3_PAIR(3);
+    EXL3_PAIR(4);
+    EXL3_PAIR(5);
+    EXL3_PAIR(6);
+    EXL3_PAIR(7);
+    EXL3_PAIR(8);
+    EXL3_PAIR(9);
+    EXL3_PAIR(10);
+    EXL3_PAIR(11);
+    EXL3_PAIR(12);
+    EXL3_PAIR(13);
+    EXL3_PAIR(14);
+    EXL3_PAIR(15);
 #undef EXL3_PAIR
-        _mm256_storeu_si256(reinterpret_cast<__m256i *>(dst), a);
-        _mm256_storeu_si256(reinterpret_cast<__m256i *>(dst + 8), b);
-    } else {
-        float *dst = static_cast<float *>(out);
-        const float *in = static_cast<const float *>(x);
-        auto a = Load(dst), b = Load(dst + 8);
-#define EXL3_PAIR(R)                                                                                                   \
-    a = Madd(lo.template values<R>(), in[R], a);                                                                       \
-    b = Madd(hi.template values<R>(), in[R], b)
-        EXL3_PAIR(0);
-        EXL3_PAIR(1);
-        EXL3_PAIR(2);
-        EXL3_PAIR(3);
-        EXL3_PAIR(4);
-        EXL3_PAIR(5);
-        EXL3_PAIR(6);
-        EXL3_PAIR(7);
-        EXL3_PAIR(8);
-        EXL3_PAIR(9);
-        EXL3_PAIR(10);
-        EXL3_PAIR(11);
-        EXL3_PAIR(12);
-        EXL3_PAIR(13);
-        EXL3_PAIR(14);
-        EXL3_PAIR(15);
-#undef EXL3_PAIR
-        Store(dst, a);
-        Store(dst + 8, b);
-    }
+    _mm256_storeu_si256(reinterpret_cast<__m256i *>(dst), a);
+    _mm256_storeu_si256(reinterpret_cast<__m256i *>(dst + 8), b);
 }
 #endif
-template <int Bits>
-void Exl3AffineDot(const uint8_t *packed, int outputs, int inputs, int first, const float *x, float *result,
-                   int count) {
-    double sum = 0;
-    for (int i = 0; i < inputs; ++i)
-        sum += x[i];
-    const float correction = float(sum) * (1024.0f * half_to_float(0x1eee) + half_to_float(0xc931));
-    const auto *words = reinterpret_cast<const uint32_t *>(packed);
-    std::fill(result, result + count, 0.0f);
-    for (int i = 0; i < inputs; i += 16)
-        for (int c = 0; c < count; c += 16) {
-            const auto *p = words + (size_t(i / 16) * (outputs / 16) + (first + c) / 16) * (4 * Bits);
-#if defined(__AVX2__) && !defined(__AVX512F__)
-            Exl3AccPair<Bits, false>(p, x + i, result + c);
-#else
-            Exl3AffineAccTile<Bits, 0>(p, x + i, result + c);
-            if constexpr (Exl3Lanes <= 8)
-                Exl3AffineAccTile<Bits, 8>(p, x + i, result + c + 8);
-            if constexpr (Exl3Lanes <= 4) {
-                Exl3AffineAccTile<Bits, 4>(p, x + i, result + c + 4);
-                Exl3AffineAccTile<Bits, 12>(p, x + i, result + c + 12);
-            }
-            if constexpr (Exl3Lanes == 1) {
-#define EXL3_AFFINE_COL(C) Exl3AffineAccTile<Bits, C>(p, x + i, result + c + C)
-                EXL3_AFFINE_COL(1);
-                EXL3_AFFINE_COL(2);
-                EXL3_AFFINE_COL(3);
-                EXL3_AFFINE_COL(5);
-                EXL3_AFFINE_COL(6);
-                EXL3_AFFINE_COL(7);
-                EXL3_AFFINE_COL(9);
-                EXL3_AFFINE_COL(10);
-                EXL3_AFFINE_COL(11);
-                EXL3_AFFINE_COL(13);
-                EXL3_AFFINE_COL(14);
-                EXL3_AFFINE_COL(15);
-#undef EXL3_AFFINE_COL
-            }
-#endif
-        }
-    const float gain = half_to_float(0x1eee);
-    for (int c = 0; c < count; ++c)
-        result[c] = std::fma(result[c], gain, correction);
-}
 
 #if defined(__AVX512F__) || defined(__AVX2__)
 template <int Bits, int Half> inline void Exl3QuantAccTile(const uint32_t *words, const int *x, int *result) {
@@ -551,7 +445,7 @@ inline bool Exl3QuantizeBlock(const float *x, int *q, float &scale, int &sum) {
 #endif
 
 template <int Bits>
-void Exl3QuantDot(const uint8_t *packed, int outputs, int inputs, int first, const float *x, float *result, int count) {
+bool Exl3QuantDot(const uint8_t *packed, int outputs, int inputs, int first, const float *x, float *result, int count) {
 #if defined(__AVX512F__) || defined(__AVX2__)
     constexpr int block = 128;
     alignas(64) int local[256];
@@ -567,7 +461,7 @@ void Exl3QuantDot(const uint8_t *packed, int outputs, int inputs, int first, con
         int sum;
         float scale;
         if (!Exl3QuantizeBlock(x + k0, q, scale, sum))
-            return Exl3AffineDot<Bits>(packed, outputs, inputs, first, x, result, count);
+            return false;
         if (scale == 0)
             continue;
         std::fill(acc, acc + count, 0);
@@ -575,7 +469,7 @@ void Exl3QuantDot(const uint8_t *packed, int outputs, int inputs, int first, con
             for (int c = 0; c < count; c += 16) {
                 const auto *p = words + (size_t((k0 + i) / 16) * (outputs / 16) + (first + c) / 16) * (4 * Bits);
 #if defined(__AVX2__) && !defined(__AVX512F__)
-                Exl3AccPair<Bits, true>(p, q + i, acc + c);
+                Exl3AccPair<Bits>(p, q + i, acc + c);
 #else
                 Exl3QuantAccTile<Bits, 0>(p, q + i, acc + c);
 #endif
@@ -584,7 +478,8 @@ void Exl3QuantDot(const uint8_t *packed, int outputs, int inputs, int first, con
         for (int c = 0; c < count; ++c)
             result[c] += std::fma(float(acc[c]), scale * gain, correction);
     }
-#else
-    Exl3AffineDot<Bits>(packed, outputs, inputs, first, x, result, count);
 #endif
+    return true;
 }
+
+#endif // AVX2 or AVX512

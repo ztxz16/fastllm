@@ -2585,8 +2585,7 @@ int sm_count() {
 }
 
 // Whether the current device decodes with v1.1.8's kernels (exl3_legacy.cu): NVIDIA before sm_80, where this file's
-// tiles run on the CUDA cores and were slower. The
-// token path and the verify windows take the same family on a device, so a window stays bit for bit its token path.
+// tiles run on the CUDA cores and were slower. The token path and the verify windows take the same family on a device, so a window stays bit for bit its token path.
 // Asked once per device.
 bool use_legacy() {
 #if defined(STRATA_USE_HIP)

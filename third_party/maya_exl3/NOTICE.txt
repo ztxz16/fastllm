@@ -50,3 +50,8 @@ CUDA operators are Fastllm's independent implementation, not imported Maya code.
   all supported CUDA architectures.
 No new upstream code is imported by this optimization. The import revision,
 upstream hashes and both MIT license files above remain unchanged.
+
+2026-11-07 cleanup (Fastllm local changes):
+- Select single-row specialization and legacy/modern CUDA decode automatically.
+- Keep the legacy gate/up scratch-capacity fallback without an A/B environment
+  switch. Existing architecture and numerical fallback kernels remain available.

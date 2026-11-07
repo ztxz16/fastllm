@@ -482,8 +482,17 @@ void Exl3DotRows(const Data &weight, int part, int node, int nodes,
     // activation boundaries. Preserve their exact decoder; large decode
     // matrices amortize block quantization and use the bounded integer dot.
     if (v.inputs >= 1024 && v.outputs >= 1024 && count % 16 == 0 && start % 16 == 0) {
-#define EXL3_FAST_CASE(B) case B: return Exl3QuantDot<B>(packed + part * v.partBytes, columns, v.inputs, start, rotated, output, count)
-        switch (weight.blockK) { EXL3_FAST_CASE(2);EXL3_FAST_CASE(3);EXL3_FAST_CASE(4);EXL3_FAST_CASE(5);EXL3_FAST_CASE(6);EXL3_FAST_CASE(7);EXL3_FAST_CASE(8);EXL3_FAST_CASE(10);EXL3_FAST_CASE(12);EXL3_FAST_CASE(14);EXL3_FAST_CASE(16); }
+#define EXL3_FAST_CASE(B) \
+        case B: \
+            if (Exl3QuantDot<B>(packed + part * v.partBytes, columns, v.inputs, start, rotated, output, count)) \
+                return; \
+            break
+        switch (weight.blockK) {
+            EXL3_FAST_CASE(2);  EXL3_FAST_CASE(3);  EXL3_FAST_CASE(4);
+            EXL3_FAST_CASE(5);  EXL3_FAST_CASE(6);  EXL3_FAST_CASE(7);
+            EXL3_FAST_CASE(8);  EXL3_FAST_CASE(10); EXL3_FAST_CASE(12);
+            EXL3_FAST_CASE(14); EXL3_FAST_CASE(16);
+        }
 #undef EXL3_FAST_CASE
     }
 #endif

@@ -27,6 +27,7 @@ void Exl3PrepareInputBlock(const Data &weight, int part, const float *input,
     float *rotated, int first, bool roundBfloat);
 // Large x86 decode matrices use blockwise 12-bit activations and the affine
 // mul1 codebook. Short matrices, other ISAs and reconstruction stay exact.
+// Nonfinite inputs or an unrepresentable quantization scale use the exact decoder.
 void Exl3DotRows(const Data &weight, int part, int node, int nodes,
     const float *rotated, float *output, int first, int count);
 void Exl3FinishOutputBlock(const Data &weight, int part, float *output, int first);
