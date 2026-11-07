@@ -26,7 +26,7 @@ D 端保留最后一个 prompt token，导入前 N−1 个 token 的状态后重
 
 在正常 FastLLM CUDA 构建参数中添加 `-DFASTKV_RDMA=ON` 即可启用原生 RDMA。没有该选项时仍支持 TCP。独立组件的构建、接口、依赖和测试见 [fastkv/README.md](../fastkv/README.md)。
 
-两端都需要安装包含本次 PD 支持的 FastLLM。P/D 的权重、模型配置和 KV 表示必须兼容；`model_id` 应使用包含 checkpoint revision 的不可变标识，不能只写一个可变的服务别名。当前协议检查该标识和 adapter 的布局版本，不逐文件计算权重哈希。
+两端都需要安装包含本次 PD 支持的 FastLLM。P/D 的权重、模型配置和 KV 表示必须兼容；`model_id` 应使用包含 checkpoint revision 的不可变标识，不能只写一个可变的服务别名。当前协议检查该标识、GPU 状态传输协议版本和 adapter 的布局版本，不逐文件计算权重哈希。
 
 ## 部署配置
 
@@ -85,9 +85,11 @@ P 的单个请求在恢复或导出失败时只返回该请求的错误；批量
 - 例如 P 的 DP8/TP1/EP8 部署可使用 `--max_batch 16 --chunked_prefill_size 4096 --prefill_batch_tokens 32768 --prefill_batch_requests 8 --prefill_max_requests 16 --prefill_max_wait_ms 2`，并将 P 配置的 `chunk_tokens` 设为 `4096`。只改拓扑或增加网络并发不能替代模型合批。`[FastKV PD] prefill_batch` 日志记录实际进入一次前向的请求数、token 数和前向耗时。
 - D 在发起远端 prefill 前预留请求槽位和按 KV 页大小向上取整的 token 额度，避免大量已完成 P 的请求挤占 D 显存。未获额度的请求排队，不分配活动模型 KV。
 - 传输只含逻辑状态，不含模型权重、GPU 地址、allocator page ID、graph 或 scratch buffer。数据完整接收并验证后才由模型 adapter 提交。
-- 通过 router 部署时，P 默认保留最多 1 GiB 的主存前缀状态，使用 `cache_bytes` 修改，设为 `0` 可关闭。不同前缀版本共享相同的不可变数据块，按唯一数据块和 checkpoint 元数据计费，不再默认限制为 256 个完整快照。完整命中直接交付；部分命中在已保存的准确边界恢复状态后继续 prefill。已有读取 lease 在缓存淘汰后仍有效；活动请求恢复出的连续副本属于额外临时内存。
-- `max_inflight_bytes` 限制接收 staging；P 缓存额度、D 的 `--tokens` 和 HTTP `max_inflight` 是不同的限制，不应混淆。
-- `ftllm serve` 默认开启模型 verbose 日志；Python API 可用 `model.set_verbose()` 控制。`[FastKV PD] prefix_hit` 记录 P 的前缀复用（未命中为 0），同时记录条目数、实际缓存字节和未共享时的逻辑字节；`handoff_ms` 包含排队、P 计算、打包、传输和导入，不是纯网络耗时。D 的 API `cached_tokens` 当前不把远端 P 命中计入本地缓存统计。
+- P 默认不创建主存 KV 缓存。模型声明支持 GPU 常驻前缀恢复时直接复用模型页池和状态检查点（Naive），不再建立第二份 FastKV payload 缓存；容量和淘汰仍由模型已有缓存策略管理。其他 adapter 默认使用总计 1 GiB、保留源 GPU 归属的不可变检查点，可用 `device_cache_bytes` 调整或设为 `0` 关闭。此通用 GPU 缓存不做 CPU payload 哈希和跨版本数据块去重。仅在没有模型常驻缓存且显式设置 `cache_bytes > 0` 时启用旧的主存缓存。前缀只在模型可恢复的边界复用，淘汰不使已取得的读取 lease 失效。
+- `max_inflight_bytes` 限制接收 staging；模型预热后再按每张卡剩余显存的一半收紧 GPU staging 预算，保留余量给计算 workspace。P 导出使用独立的有界 GPU arena 池。暂时没有空闲 arena 时等待 lease 释放，单条状态超过预算则明确报错，不自动回退 CPU。各池独立计费，这不是进程全部显存的总上限；P 缓存额度、D 的 `--tokens` 和 HTTP `max_inflight` 也是不同的限制，不应混淆。
+- `ftllm serve` 默认开启模型 verbose 日志；Python API 可用 `model.set_verbose()` 控制。`[FastKV PD] prefix_hit` 记录 P 的前缀复用（未命中为 0），`resident_gpu=1` 表示复用模型 GPU 前缀缓存，此时 FastKV 缓存条目/字节为 0，不代表没有缓存；其他模式记录 FastKV 条目和字节；`handoff_ms` 包含排队、P 计算、打包、传输和导入，不是纯网络耗时。D 保留模型声明支持的 GPU 常驻缓存；对于没有此能力的模型，D 已不使用主存历史恢复，因此也跳过无用的完成请求主存快照。D 的 API `cached_tokens` 当前不把远端 P 命中计入本地缓存统计。`[FastKV PD timing]` 分别记录恢复、记录检查点、导出、发布、释放和导入耗时；累计 `kv_d2h_bytes/kv_h2d_bytes` 只统计 FastKV payload 搬运，不代表模型前向的全部 CUDA 拷贝。
+
+`forward_ms` 是模型前向调用的 CPU 墙钟耗时，不是 CUDA event 计时；D 的 `Decode Speed` 是解码段内的日志速度，遇到新请求的 Prompt 计算会重新计时。评估端到端吞吐时，应在同一时间窗口对照 P 新计算 token、D 稳态样本和 API 输出 token，不能将日志速度与 API 吞吐的差值直接视为传输耗时。
 
 ## 模型接入与当前边界
 
@@ -101,9 +103,9 @@ Naive 部署使用 [Naive 模板](../example/pd/naive_n05.json)，两端保持�
 
 当前部署路径支持文本请求。多模态 PD 需要继续补充媒体身份与状态 adapter，目前明确拒绝，不能通过仅传 token 冒充多模态交接。DeepSeek 可开启 DSpark 5。当前只有单请求路径执行草稿和验证；多请求批次先排出已接受 token，随后使用普通 target decode，丢弃不能继续使用的草稿状态。请求回到单请求路径后从当前 target 边界重建草稿窗口。P 的中间 prefill 不生成候选；P/D 的 DSpark 开关需要保持一致。Naive 的 draft TP 暂不支持，使用 `--dspark 0`。
 
-当前模型导入使用主存 staging；传输组件的 BufferPool 已复用内存、MR、socket 和 QP，但模型适配尚未实现全程 GPU 传输。小 buffer 合并到有界 arena 中。连接复用不等于模型页池直传。
+GPU 状态在协议中携带逻辑 rank，由接收方映射到本地 GPU；网络线程只写私有 GPU staging，完成 RDMA 可见性处理后交给模型拥有者。Naive 在拥有者 stream 上批量整理/恢复页和滑窗，避免逐页 CUDA API 调用以及额外的导入副本。小 buffer 合并到有界 arena，复用内存、MR 和连接。RDMA 默认路径不经主存 KV；TCP 兼容路径仍经主存分块搬运。当前仍有 GPU gather/scatter、完整状态传输和导入结束同步，不是最终页池地址直传，也不是增量交接。
 
-新增模型需要实现 `PDLayout`、`ExportPDState`、`ImportPDState`，并覆盖全量交接、前缀续接、页边界、并发、取消和错误布局测试。逻辑分片规划独立于通信后端；未来多机 wide-EP 的进程组与 collective 属于计算层，需要单独接入，不能仅靠增加 router 的 D 节点来替代。
+新增模型需要实现 `PDLayout`、`ExportPDState`、`ImportPDState`；多 GPU adapter 用 `PDDevices` 声明逻辑 rank 的设备顺序。可选的 `HasPDResidentPrefixCache` 只应用于确实支持 GPU 常驻恢复的模型，未实现时使用通用检查点缓存。接入测试应覆盖全量交接、前缀续接、页边界、并发、取消和错误布局测试。逻辑分片规划独立于通信后端；未来多机 wide-EP 的进程组与 collective 属于计算层，需要单独接入，不能仅靠增加 router 的 D 节点来替代。
 
 ## 部署检查与排障
 

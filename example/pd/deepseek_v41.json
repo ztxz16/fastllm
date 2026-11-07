@@ -86,7 +86,7 @@
       "endpoint": "prefill-node:19000",
       "listen": "0.0.0.0:19000",
       "chunk_tokens": 4096,
-      "cache_bytes": 17179869184
+      "cache_bytes": 0
     }
   ],
   "decode": [

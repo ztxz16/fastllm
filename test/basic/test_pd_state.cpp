@@ -1,6 +1,9 @@
 #include "json11.hpp"
 #include "models/basellm.h"
 #include "pd.h"
+#ifdef USE_CUDA
+#include "devices/cuda/fastllm-cuda.cuh"
+#endif
 #include <chrono>
 #include <algorithm>
 #include <future>
@@ -16,6 +19,10 @@ static void Check(bool ok, const char *message) {
 class StateModel : public basellm {
   public:
     std::atomic<int> forwards{0};
+    int historyRecords = 0;
+    bool residentHistory = false;
+    bool HasPDResidentPrefixCache() const override { return residentHistory; }
+    void TryRecordResponseContext(ResponseContext *) override { ++historyRecords; }
     StateModel() {
         block_cnt = 1;
         max_positions = 4096;
@@ -107,7 +114,7 @@ static void TestPrefillBatch() {
     fastkv::Service client(options);
     auto call = [&](const std::vector<int> &tokens) {
         fastkv::Writer writer;
-        writer.U32(1); writer.String("test:test-recurrent-state-v1"); writer.Ints(tokens);
+        writer.U32(1); writer.String("test:gpu-state-v2:test-recurrent-state-v1"); writer.Ints(tokens);
         return client.Call(endpoint, {std::move(writer.bytes), {}});
     };
     auto verify = [&](const std::vector<int> &tokens, const fastkv::Message &reply) {
@@ -228,6 +235,93 @@ static void TestQueuedTransfers() {
     Check(admitted, "admitted requests must fit the transfer queue");
 }
 
+static void TestGPUState() {
+#ifdef USE_CUDA
+    uint64_t freeBytes = 0, totalBytes = 0;
+    if (!FastllmCudaGetMemoryInfo(0, freeBytes, totalBytes)) return;
+    std::vector<int> devices{0};
+    if (FastllmCudaGetMemoryInfo(1, freeBytes, totalBytes)) devices.push_back(1);
+    fastkv::BufferPool pool(256 << 20);
+    PDStateWriter writer(&pool);
+    std::vector<std::vector<uint8_t>> reference;
+    for (int device : devices) {
+        FastllmCudaSetDevice(device);
+        Data tensor(FP4_E2M1, {1, 17, 192});
+        tensor.dataDevice = CUDA; tensor.dataDeviceIds = {device};
+        writer.AllocateTensor(tensor);
+        reference.emplace_back(tensor.GetBytes());
+        for (size_t i = 0; i < tensor.GetBytes(); ++i) reference.back()[i] = (i * 17 + device * 31) & 255;
+        FastllmCudaCopyFromHostToDevice(tensor.cudaData, reference.back().data(), tensor.GetBytes());
+        FastllmCudaSyncCurrentThreadStream();
+    }
+    auto message = writer.Finish(devices);
+    auto destination = devices;
+    std::reverse(destination.begin(), destination.end());
+    fastkv::Options options;
+    options.receivePlacement = [destination](const auto &metadata, const auto &sizes) {
+        return PDReceivePlacement(metadata, sizes.size(), destination);
+    };
+    fastkv::Service server, client(options);
+    server.Start("127.0.0.1:0", [&](const fastkv::Message &) { return message; });
+    auto received = client.Call(server.Address(), {});
+    PDStateReader reader(received);
+    for (size_t i = 0; i < devices.size(); ++i) {
+        Check(received.buffers[i].Kind() == fastkv::MemoryKind::Cuda &&
+              received.buffers[i].Device() == destination[i], "receiver rank placement");
+        Data tensor;
+        reader.Tensor(tensor, true);
+        Check(tensor.cudaData == received.buffers[i].Data() && tensor.cudaDataBorrowed,
+              "GPU reader copied a borrowed state");
+        std::vector<uint8_t> actual(tensor.GetBytes());
+        FastllmCudaSetDevice(destination[i]);
+        FastllmCudaCopyFromDeviceToHost(actual.data(), tensor.cudaData, actual.size());
+        Check(actual == reference[i], "GPU FP4 payload or scales changed");
+    }
+    reader.End();
+    PDStateReader ownedReader(received);
+    for (size_t i = 0; i < devices.size(); ++i) {
+        const int callerDevice = devices[i];
+        FastllmCudaSetDevice(callerDevice);
+        Data tensor;
+        ownedReader.Tensor(tensor);
+        Check(FastllmCudaGetDevice() == callerDevice, "GPU reader changed caller device");
+        Check(!tensor.cudaDataBorrowed && tensor.cudaData != received.buffers[i].Data() &&
+              FastllmCudaValidatePointerRange(tensor.cudaData, tensor.GetBytes(), destination[i]),
+              "owned GPU reader allocated on wrong device");
+        std::vector<uint8_t> actual(tensor.GetBytes());
+        FastllmCudaSetDevice(destination[i]);
+        FastllmCudaCopyFromDeviceToHost(actual.data(), tensor.cudaData, actual.size());
+        Check(actual == reference[i], "owned GPU reader payload changed");
+    }
+    ownedReader.End();
+    {
+        fastkv::BufferPool smallPool(64 << 20);
+        PDStateWriter first(&smallPool), second = first.Fork();
+        Data firstTensor(FP4_E2M1, {1, 17, 192}), secondTensor(FP4_E2M1, {1, 17, 192});
+        for (Data *tensor : {&firstTensor, &secondTensor}) {
+            tensor->dataDevice = CUDA; tensor->dataDeviceIds = {devices[0]};
+        }
+        first.AllocateTensor(firstTensor);
+        bool rejected = false;
+        try { second.AllocateTensor(secondTensor); }
+        catch (const std::runtime_error &) { rejected = true; }
+        Check(rejected, "rank writers must reject an oversized message instead of deadlocking");
+    }
+    fastkv::PrefixCache cache(256 << 20, 0, -2);
+    cache.Publish("gpu", {1,2,3}, received);
+    auto hit = cache.Find("gpu", {1,2,3,4}, 4);
+    Check(hit.tokens == 3, "GPU checkpoint prefix match");
+    for (size_t i = 0; i < devices.size(); ++i) {
+        Check(hit.state->buffers[i].Device() == destination[i], "GPU cache lost owner device");
+        std::vector<uint8_t> actual(reference[i].size());
+        hit.state->buffers[i].Read(actual.data(), 0, actual.size());
+        Check(actual == reference[i], "GPU cache payload changed");
+    }
+    server.Stop(); client.Stop();
+    std::cout << "PASS GPU PD placement, pooled payload, borrowed import and device checkpoint\n";
+#endif
+}
+
 int main() {
     try {
         // Packed FP4 rows include E4M3 scales. Transfer all stored bytes
@@ -304,6 +398,14 @@ int main() {
         Check(((float *)context.pastKeyValues[0].first.cpuData)[0] == 3 + 14 + 33 + 76 + 115,
               "chunk position/state correctness");
         Check(prefill.forwards == 3, "three prefill chunks");
+        context.TryRecord(&decode);
+        Check(decode.historyRecords == 0, "PD decode retained an unused host snapshot");
+        decode.residentHistory = true;
+        context.TryRecord(&decode);
+        Check(decode.historyRecords == 1, "PD decode skipped resident history");
+        decode.residentHistory = false;
+        context.TryRecord(&prefill);
+        Check(prefill.historyRecords == 1, "non-decode history policy changed");
         ResponseContext queued;
         queued.Init(1, FLOAT32, FLOAT32);
         queued.allTokens = {1, 2, 3};
@@ -380,6 +482,7 @@ int main() {
         decode.StopPD();
         mismatch.StopPD();
         prefill.StopPD();
+        TestGPUState();
         TestPrefillBatch();
         TestQueuedTransfers();
         std::cout << "PASS PD tensor packing, chunk positions, handoff, rejection "

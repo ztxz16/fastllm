@@ -1,5 +1,7 @@
 // Included inside namespace fastllm, alongside the existing request-state
 // lifecycle and scheduler marker helpers.
+std::vector<int> DeepSeekV41Model::PDDevices() const { return V41TpDevices(deviceMap); }
+
 std::string DeepSeekV41Model::PDLayout() const {
     return "deepseek-v41-state-v1:" + std::to_string(block_cnt) + ":" + std::to_string(dataType) + ":" +
            std::to_string(kvCacheDataType) + ":" + std::to_string(window_size) + ":" +
@@ -13,7 +15,7 @@ fastkv::Message DeepSeekV41Model::ExportPDState(ResponseContext &context) {
     const auto &owner = state->attentionRanks.empty() ? state : state->attentionRanks.front();
     if (!owner || owner->layers.size() != size_t(block_cnt))
         throw std::runtime_error("FastKV: missing DeepSeek KV owner");
-    PDStateWriter writer;
+    PDStateWriter writer(PDExportPool());
     writer.metadata.String(PDLayout());
     writer.metadata.U32(state->totalLen);
     writer.metadata.Ints(state->engramHistory);
@@ -47,7 +49,7 @@ fastkv::Message DeepSeekV41Model::ExportPDState(ResponseContext &context) {
         // A proposal depends on D's sampler. Transfer committed draft KV only;
         // D builds its first proposal while consuming the last prompt token.
     }
-    return writer.Finish();
+    return writer.Finish(PDDevices());
 }
 
 void DeepSeekV41Model::ImportPDState(ResponseContext &context, const fastkv::Message &message) {

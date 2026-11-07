@@ -240,6 +240,8 @@ class PrefixCache {
         size_t entries = 0, bytes = 0, logicalBytes = 0;
     };
     // Zero maxEntries uses only the byte budget, including checkpoint metadata.
+    // storageDevice=-2 retains independent snapshots on their source devices,
+    // without CPU payload hashing or deduplication. The same byte limit applies.
     explicit PrefixCache(size_t byteLimit, size_t maxEntries = 0, int storageDevice = -1);
     ~PrefixCache();
     void Publish(const std::string &nameSpace, const std::vector<int> &tokens, Message state);

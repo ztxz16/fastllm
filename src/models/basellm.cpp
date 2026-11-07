@@ -565,6 +565,9 @@ namespace fastllm {
     }
 
     void ResponseContext::TryRecord(basellm *model) {
+        // PD decode bypasses host history restoration. Do not build unused CPU
+        // snapshots; models with resident GPU history retain their native cache.
+        if (model->IsPDDecode() && !model->HasPDResidentPrefixCache()) return;
         if (model->kvMemConfig.enabled && !model->SupportsKvMemPrefixCache()) return;
         if (model->DeferHistoryCacheRestore()) this->TryRecordPagedCache(model);
         else model->TryRecordResponseContext(this);
@@ -1852,6 +1855,11 @@ namespace fastllm {
             }
         }
         return probeManager;
+    }
+
+    int basellm::RestorePDResidentPrefix(ResponseContext *context) {
+        RestoreResidentPrefixImpl(this, context);
+        return context->cacheLen;
     }
 
     static PagedCacheManager *RestoreResidentPrefix(basellm *model, ResponseContext *ctx) {

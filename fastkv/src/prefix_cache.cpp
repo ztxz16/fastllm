@@ -49,6 +49,7 @@ struct PrefixCache::Impl {
         // Wire consumers still see the original contiguous tensor boundaries.
         // Only active readers materialize a message; cached versions share pages.
         std::weak_ptr<const Message> materialized;
+        std::unique_ptr<Message> deviceSnapshot;
         size_t logicalBytes = 0;
     };
     struct Entry {
@@ -69,7 +70,7 @@ struct PrefixCache::Impl {
 
     Impl(size_t bytes, size_t count, int device)
         : budget(bytes), capacity(bytes), maxEntries(count), device(device) {
-        Require(device >= -1, "FastKV: invalid prefix storage device");
+        Require(device >= -2, "FastKV: invalid prefix storage device");
     }
     uint64_t Match(const std::string &name, const std::vector<int> &tokens, size_t end) const {
         uint64_t hash = NamespaceHash(name);
@@ -155,6 +156,8 @@ struct PrefixCache::Impl {
         return !std::memcmp(staging.data(), host.Data(), host.Size());
     }
     std::shared_ptr<const Message> Restore(const std::shared_ptr<State> &state) {
+        if (state->deviceSnapshot)
+            return std::shared_ptr<const Message>(state, state->deviceSnapshot.get());
         if (auto cached = state->materialized.lock())
             return cached;
         Message value;
@@ -218,7 +221,11 @@ void PrefixCache::Publish(const std::string &name, const std::vector<int> &token
     metadataBytes = CheckedAdd(metadataBytes, CheckedMul(value.buffers.size(), sizeof(Impl::Payload)));
     size_t neededPages = 0;
     std::unordered_map<uint64_t, std::vector<std::shared_ptr<Impl::Page>>> newPages;
-    for (const auto &source : value.buffers) {
+    if (p.device == -2) {
+        for (const auto &source : value.buffers)
+            metadataBytes = CheckedAdd(metadataBytes, source.Size());
+        state->logicalBytes = metadataBytes;
+    } else for (const auto &source : value.buffers) {
         auto host = source;
         if (source.Kind() != MemoryKind::Host) {
             host = Buffer::Allocate(source.Size());
@@ -258,7 +265,7 @@ void PrefixCache::Publish(const std::string &name, const std::vector<int> &token
         }
         state->payloads.push_back(std::move(payload));
     }
-    state->logicalBytes = CheckedAdd(state->logicalBytes, metadataBytes);
+    if (p.device != -2) state->logicalBytes = CheckedAdd(state->logicalBytes, metadataBytes);
     const size_t needed = CheckedAdd(metadataBytes, neededPages);
     size_t minimum = metadataBytes;
     std::unordered_set<const Impl::Page *> requiredPages;
@@ -270,6 +277,10 @@ void PrefixCache::Publish(const std::string &name, const std::vector<int> &token
     while ((p.maxEntries && p.entries.size() >= p.maxEntries) || needed > p.capacity - p.budget.Used())
         Require(p.Evict(), "FastKV: prefix cache is pinned by active readers");
     state->credit = p.budget.Reserve(metadataBytes);
+    if (p.device == -2) {
+        Message source{state->metadata, value.buffers};
+        state->deviceSnapshot.reset(new Message(Snapshot(source)));
+    }
     for (auto &bucket : newPages)
         for (auto &page : bucket.second) {
             auto credit = p.budget.Reserve(CheckedAdd(page->data.Size(), sizeof(Impl::Page)));

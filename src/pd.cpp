@@ -31,7 +31,84 @@ uint64_t TensorBytes(const Data &data) {
     Check(data.unitSizeDiv == 1, "packed element type requires a model wire codec");
     return elements * data.unitSize;
 }
+constexpr uint32_t PDWireMagic = 0x32564450;
+bool HasPDEnvelope(const fastkv::Bytes &bytes) {
+    if (bytes.size() < 4) return false;
+    fastkv::Reader reader(bytes);
+    return reader.U32() == PDWireMagic;
+}
 } // namespace
+fastkv::Message PDStatePayload(const fastkv::Message &value) {
+    if (!HasPDEnvelope(value.metadata)) return value;
+    fastkv::Reader reader(value.metadata);
+    reader.U32();
+    fastkv::Message result;
+    result.metadata = reader.Blob();
+    const auto placement = reader.Ints(value.buffers.size());
+    Check(placement.size() == value.buffers.size(), "placement count mismatch");
+    reader.End();
+    result.buffers = value.buffers;
+    return result;
+}
+std::vector<int> PDReceivePlacement(const fastkv::Bytes &metadata,
+                                   size_t buffers, const std::vector<int> &devices) {
+    if (!HasPDEnvelope(metadata)) return {};
+    fastkv::Reader reader(metadata);
+    reader.U32(); reader.Blob();
+    auto result = reader.Ints(buffers);
+    Check(result.size() == buffers, "placement count mismatch");
+    reader.End();
+    for (int &rank : result) {
+        Check(rank >= -1 && (rank == -1 || size_t(rank) < devices.size()), "unknown destination rank");
+        if (rank >= 0) rank = devices[rank];
+    }
+    return result;
+}
+struct PDStateWriter::Allocations {
+    std::mutex mutex;
+    std::vector<std::pair<int, size_t>> plan;
+};
+PDStateWriter::PDStateWriter(fastkv::BufferPool *pool)
+    : pool(pool), allocations(std::make_shared<Allocations>()) {}
+PDStateWriter PDStateWriter::Fork() const {
+    PDStateWriter child(pool);
+    child.allocations = allocations;
+    return child;
+}
+fastkv::Buffer PDStateWriter::Allocate(size_t bytes, int device) {
+    if (!pool) return fastkv::Buffer::Allocate(bytes, device);
+    const size_t aligned = (arenaOffset + 255) / 256 * 256;
+    if (!arena.Size() || arena.Device() != device || aligned > arena.Size() || bytes > arena.Size() - aligned) {
+        const size_t capacity = std::max(bytes, size_t(64) << 20);
+        {
+            std::lock_guard<std::mutex> lock(allocations->mutex);
+            allocations->plan.emplace_back(device, capacity);
+            try { pool->CheckCapacity(allocations->plan); }
+            catch (...) { allocations->plan.pop_back(); throw; }
+        }
+        for (;;) {
+            try { arena = pool->Acquire(capacity, device); break; }
+            catch (const fastkv::CapacityBusy &) { pool->WaitForRelease(); }
+        }
+        arenaOffset = 0;
+    } else arenaOffset = aligned;
+    auto buffer = arena.Slice(arenaOffset, bytes);
+    arenaOffset += bytes;
+    return buffer;
+}
+void PDStateWriter::AllocateTensor(Data &data) {
+    Check(data.dataDevice == CUDA && !data.cudaData && !data.cpuData && data.dims.size() <= 8,
+          "direct payload requires an empty compact GPU tensor");
+    const uint64_t bytes = TensorBytes(data);
+    metadata.U32(uint32_t(data.dataType)); metadata.Ints(data.dims);
+    metadata.U32(data.kvCacheFp8Indexer); metadata.U64(bytes);
+    if (!bytes) return;
+    Check(data.dataDeviceIds.size() == 1, "direct payload requires one owner");
+    auto buffer = Allocate(bytes, data.dataDeviceIds.front());
+    data.cudaData = buffer.MutableData(); data.cudaDataBorrowed = true;
+    data.expansionDims = data.dims; data.expansionBytes = bytes;
+    buffers.push_back(std::move(buffer));
+}
 
 void PDStateWriter::Tensor(const Data &root) {
     const Data *source = &root;
@@ -60,7 +137,7 @@ void PDStateWriter::Tensor(const Data &root) {
     if (data.dataDevice == CUDA)
         device = data.dataDeviceIds.empty() ? FastllmCudaGetDevice() : data.dataDeviceIds.front();
 #endif
-    auto output = fastkv::Buffer::Allocate(bytes, device);
+    auto output = Allocate(bytes, device);
     auto sourceLease = std::shared_ptr<void>(const_cast<Data *>(&data), [](void *) {});
     auto input = fastkv::Buffer::Borrow(
         data.dataDevice == CUDA ? data.cudaData : data.cpuData,
@@ -93,30 +170,73 @@ void PDStateWriter::Tensor(const Data &root) {
     }
     buffers.push_back(std::move(output));
 }
-fastkv::Message PDStateWriter::Finish() {
+fastkv::Message PDStateWriter::Finish(const std::vector<int> &localDevices) {
     fastkv::Message result{std::move(metadata.bytes), std::move(buffers)};
-    return result.buffers.size() > 1 ? fastkv::Snapshot(result) : std::move(result);
+    if (!pool && result.buffers.size() > 1) result = fastkv::Snapshot(result);
+    std::vector<int> devices = localDevices, placement;
+    if (devices.empty()) {
+        for (const auto &buffer : result.buffers)
+            if (buffer.Kind() == fastkv::MemoryKind::Cuda &&
+                std::find(devices.begin(), devices.end(), buffer.Device()) == devices.end())
+                devices.push_back(buffer.Device());
+        std::sort(devices.begin(), devices.end());
+    }
+    for (const auto &buffer : result.buffers) {
+        int rank = -1;
+        if (buffer.Kind() == fastkv::MemoryKind::Cuda) {
+            auto it = std::find(devices.begin(), devices.end(), buffer.Device());
+            Check(it != devices.end(), "payload owner absent from device map");
+            rank = it - devices.begin();
+        }
+        placement.push_back(rank);
+    }
+    fastkv::Writer envelope;
+    envelope.U32(PDWireMagic); envelope.Blob(result.metadata.data(), result.metadata.size());
+    envelope.Ints(placement); result.metadata = std::move(envelope.bytes);
+    return result;
 }
-PDStateReader::PDStateReader(const fastkv::Message &value) : metadata(value.metadata), message(value) {}
-void PDStateReader::Tensor(Data &tensor) {
+PDStateReader::PDStateReader(const fastkv::Message &value)
+    : message(PDStatePayload(value)), metadata(message.metadata) {}
+void PDStateReader::Tensor(Data &tensor, bool borrowGpu) {
     const auto type = DataType(metadata.U32());
     Check(type == FLOAT32 || type == FLOAT16 || type == BFLOAT16 || type == INT8 || type == FP8_E4M3 ||
-              type == INT32PARAM || type == FP4_E2M1,
-          "unsupported tensor wire type");
-    auto dims = metadata.Ints(8);
+              type == INT32PARAM || type == FP4_E2M1, "unsupported tensor wire type");
+    const auto dims = metadata.Ints(8);
     const bool fp8Index = metadata.U32() != 0;
     const uint64_t bytes = metadata.U64();
-    Data value(type);
-    value.Resize(dims);
-    Check(TensorBytes(value) == bytes, "tensor size mismatch");
+    Data shape(type); shape.Resize(dims);
+    Check(TensorBytes(shape) == bytes, "tensor size mismatch");
+    Check(!tensor.cudaData && !tensor.cpuData, "PD destination must be empty");
+    tensor.dataType = type; tensor.UpdateUnitSize(); tensor.Resize(dims);
+    tensor.kvCacheFp8Indexer = fp8Index;
     if (bytes) {
         Check(next < message.buffers.size() && message.buffers[next].Size() == bytes,
               "tensor payload mismatch");
-        value.Allocate();
-        message.buffers[next++].Read(value.cpuData, 0, bytes);
+        const auto &buffer = message.buffers[next++];
+        if (buffer.Kind() == fastkv::MemoryKind::Cuda) {
+            tensor.dataDevice = CUDA; tensor.dataDeviceIds = {buffer.Device()};
+            if (borrowGpu) {
+                tensor.cudaData = const_cast<void *>(buffer.Data()); tensor.cudaDataBorrowed = true;
+                tensor.expansionDims = dims; tensor.expansionBytes = bytes;
+            } else {
+#ifdef USE_CUDA
+                struct DeviceScope {
+                    int previous = FastllmCudaGetDevice();
+                    explicit DeviceScope(int device) { FastllmCudaSetDevice(device); }
+                    ~DeviceScope() { FastllmCudaSetDevice(previous); }
+                } scope(buffer.Device());
+#endif
+                tensor.Allocate();
+                auto owner = std::shared_ptr<void>(&tensor, [](void *) {});
+                auto dst = fastkv::Buffer::Borrow(tensor.cudaData, bytes, fastkv::MemoryKind::Cuda,
+                                                  buffer.Device(), owner);
+                dst.CopyFrom(buffer, 0, 0, bytes);
+            }
+        } else {
+            tensor.dataDevice = CPU; tensor.Allocate();
+            buffer.Read(tensor.cpuData, 0, bytes);
+        }
     }
-    value.kvCacheFp8Indexer = fp8Index;
-    tensor.CopyFrom(value);
     tensor.SetKVCache();
 }
 void PDStateReader::End() {
@@ -151,6 +271,8 @@ struct PDRuntime {
     size_t tokenCapacity = 0;
     std::unique_ptr<fastkv::Budget> slots, tokens;
     std::unique_ptr<fastkv::PrefixCache> cache;
+    std::unique_ptr<fastkv::BufferPool> exportPool;
+    bool residentPrefix = false;
     // Routing stores only token keys and an endpoint, never KV payloads.
     std::unique_ptr<fastkv::PrefixCache> routes;
     std::mutex prefillMutex, prefillStopMutex;
@@ -164,6 +286,7 @@ struct PDRuntime {
         if (service) service->Stop(); // callbacks capture this runtime
     }
     void StopPrefill() {
+        if (exportPool) exportPool->Clear();
         std::lock_guard<std::mutex> stoppingLock(prefillStopMutex);
         {
             std::lock_guard<std::mutex> lock(prefillMutex);
@@ -234,14 +357,9 @@ void PDRuntime::RunPrefill(basellm &model) {
             std::lock_guard<std::mutex> lock(model.forwardLocker);
             for (const auto &request : admitted) {
                 try {
+                    const auto restoreBegin = std::chrono::steady_clock::now();
                     fastkv::PrefixCache::Hit hit;
                     if (cache) hit = cache->Find(identity, request->input, request->input.size());
-                    if (model.verbose) {
-                        const auto stats = cache ? cache->Stats() : fastkv::PrefixCache::Statistics{};
-                        std::cout << "[FastKV PD] prefix_hit=" << hit.tokens << " prompt=" << request->input.size()
-                                  << " cache_entries=" << stats.entries << " cache_bytes=" << stats.bytes
-                                  << " cache_logical_bytes=" << stats.logicalBytes << std::endl;
-                    }
                     if (hit.state && hit.tokens == request->input.size()) {
                         retire(request);
                         request->result.set_value(*hit.state);
@@ -250,18 +368,32 @@ void PDRuntime::RunPrefill(basellm &model) {
                     request->context.reset(new ResponseContext);
                     auto &context = *request->context;
                     context.Init(model.block_cnt, model.dataType, model.kvCacheDataType);
-                    context.allTokens = request->input;
+                    context.currentTokens = context.allTokens = request->input;
                     context.inputTokens = request->input.size();
                     context.generationConfig.top_k = 1;
                     context.generationConfig.output_token_limit = 1;
                     context.generationConfig.input_token_length = request->input.size() + 1;
                     model.OnResponseContextCreated(&context);
+                    if (residentPrefix) {
+                        context.preTokens = model.RestorePDResidentPrefix(&context);
+                        hit.tokens = context.preTokens;
+                    }
                     if (hit.state) {
                         context.allTokens.resize(hit.tokens);
                         context.allTokens.push_back(0); // adapter validates the N-1 boundary
                         model.ImportPDState(context, *hit.state);
                         context.preTokens = hit.tokens;
                         context.allTokens = request->input;
+                    }
+                    if (model.verbose) {
+                        const auto stats = cache ? cache->Stats() : fastkv::PrefixCache::Statistics{};
+                        std::cout << "[FastKV PD] prefix_hit=" << hit.tokens << " prompt=" << request->input.size()
+                                  << " cache_entries=" << stats.entries << " cache_bytes=" << stats.bytes
+                                  << " cache_logical_bytes=" << stats.logicalBytes
+                                  << " resident_gpu=" << residentPrefix << std::endl;
+                        std::cout << "[FastKV PD timing] restore_ms="
+                                  << std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - restoreBegin).count()
+                                  << std::endl;
                     }
                     active.push_back(request);
                 } catch (...) {
@@ -344,14 +476,28 @@ void PDRuntime::RunPrefill(basellm &model) {
                     continue;
                 }
                 try {
+                    const auto exportBegin = std::chrono::steady_clock::now();
+                    if (residentPrefix) request->context->TryRecordPagedCache(&model);
+                    const auto recorded = std::chrono::steady_clock::now();
                     auto reply = model.ExportPDState(*request->context);
+                    const auto exported = std::chrono::steady_clock::now();
                     if (cache) {
                         try { cache->Publish(identity, request->input, reply); }
                         catch (const std::exception &error) {
                             if (model.verbose) std::cerr << "[FastKV PD] prefix not retained: " << error.what() << std::endl;
                         }
                     }
+                    const auto published = std::chrono::steady_clock::now();
                     retire(request);
+                    if (model.verbose) {
+                        const auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+                        std::cout << "[FastKV PD timing] record_ms=" << ms(exportBegin, recorded)
+                                  << " export_ms=" << ms(recorded, exported)
+                                  << " publish_ms=" << ms(exported, published)
+                                  << " retire_ms=" << ms(published, std::chrono::steady_clock::now())
+                                  << " kv_d2h_bytes=" << fastkv::Buffer::Traffic().deviceToHost
+                                  << " kv_h2d_bytes=" << fastkv::Buffer::Traffic().hostToDevice << std::endl;
+                    }
                     request->result.set_value(std::move(reply));
                 } catch (...) {
                     auto error = std::current_exception();
@@ -385,6 +531,17 @@ void basellm::ImportPDState(ResponseContext &, const fastkv::Message &) {
     throw std::logic_error("missing PD adapter");
 }
 
+std::vector<int> basellm::PDDevices() const {
+#ifdef USE_CUDA
+    return {FastllmCudaGetDevice()};
+#else
+    return {};
+#endif
+}
+fastkv::BufferPool *basellm::PDExportPool() const {
+    return pdRuntime ? pdRuntime->exportPool.get() : nullptr;
+}
+
 bool basellm::IsPDDecode() const { return pdRuntime && pdRuntime->role == "decode"; }
 void basellm::StopPD() {
     if (pdRuntime) {
@@ -400,7 +557,7 @@ void basellm::ConfigurePD(const json11::Json &config) {
     Check(runtime->role == "prefill" || runtime->role == "decode", "role must be prefill or decode");
     Check(!config["model_id"].string_value().empty(),
           "model_id must identify the same checkpoint on P and D");
-    runtime->identity = config["model_id"].string_value() + ":" + PDLayout();
+    runtime->identity = config["model_id"].string_value() + ":gpu-state-v2:" + PDLayout();
     Check(!UseModelSpecificScheduler(), "PD requires a supported common scheduler");
     Check(!kvMemConfig.enabled, "the sparse/offloaded KV adapter is not implemented");
     const int concurrent = maxBatch > 0 ? maxBatch : 1;
@@ -432,15 +589,35 @@ void basellm::ConfigurePD(const json11::Json &config) {
                                               : fastkv::Transport::Tcp;
     for (const auto &device : config["rdma_devices"].array_items())
         options.rdmaDevices.push_back(device.string_value());
-    // Model adapters currently import through host staging. GPU transport
-    // remains available in the independent component, not as a model knob.
+    auto devices = PDDevices();
+#ifdef USE_CUDA
+    if (devices.empty()) devices.push_back(FastllmCudaGetDevice());
+#endif
+    options.receivePlacement = [devices](const fastkv::Bytes &metadata, const std::vector<size_t> &sizes) {
+        return PDReceivePlacement(metadata, sizes.size(), devices);
+    };
     if (config["max_inflight_bytes"].is_number()) {
         double limit = config["max_inflight_bytes"].number_value();
         Check(limit >= (1 << 20) && limit <= double(size_t(1) << 40), "invalid inflight byte limit");
         options.maxInflightBytes = size_t(limit);
         options.maxPayloadBytes = size_t(limit);
     }
+#ifdef USE_CUDA
+    size_t stagingCapacity = 0;
+    for (int device : devices) {
+        uint64_t freeBytes = 0, totalBytes = 0;
+        if (FastllmCudaGetMemoryInfo(device, freeBytes, totalBytes)) {
+            // Leave half the unallocated memory for request/model scratch.
+            const size_t limit = freeBytes / 2;
+            options.deviceBufferBytes[device] = limit;
+            stagingCapacity += limit;
+        }
+    }
+    if (stagingCapacity) options.maxInflightBytes = std::min(options.maxInflightBytes, stagingCapacity);
+#endif
     runtime->service.reset(new fastkv::Service(options));
+    runtime->exportPool.reset(new fastkv::BufferPool(options.maxInflightBytes, options.deviceBufferBytes));
+    runtime->residentPrefix = HasPDResidentPrefixCache();
     for (const auto &peer : config["prefill"].array_items()) {
         Check(peer.is_string() && !peer.string_value().empty(), "invalid prefill endpoint");
         runtime->peers.push_back(peer.string_value());
@@ -456,8 +633,13 @@ void basellm::ConfigurePD(const json11::Json &config) {
         Check(runtime->chunk > 0 && runtime->chunk <= max_positions, "invalid prefill chunk size");
         const double cacheBytes = config["cache_bytes"].number_value();
         Check(cacheBytes >= 0 && cacheBytes <= double(size_t(1) << 40), "invalid prefix cache byte limit");
-        if (cacheBytes > 0)
-            runtime->cache.reset(new fastkv::PrefixCache(size_t(cacheBytes)));
+        if (!runtime->residentPrefix) {
+            const double deviceBytes = config["device_cache_bytes"].is_number() ?
+                config["device_cache_bytes"].number_value() : double(size_t(1) << 30);
+            Check(deviceBytes >= 0 && deviceBytes <= double(size_t(1) << 40), "invalid device cache byte limit");
+            if (cacheBytes > 0) runtime->cache.reset(new fastkv::PrefixCache(size_t(cacheBytes)));
+            else if (deviceBytes > 0) runtime->cache.reset(new fastkv::PrefixCache(size_t(deviceBytes), 0, -2));
+        }
     }
     pdRuntime = runtime;
     try {
@@ -559,7 +741,12 @@ bool basellm::PollPD(ResponseContext *context) {
     try {
         auto state = pending->result.get();
         std::lock_guard<std::mutex> lock(forwardLocker);
+        const auto importBegin = std::chrono::steady_clock::now();
         ImportPDState(*context, state);
+        if (verbose) std::cout << "[FastKV PD timing] import_ms="
+            << std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - importBegin).count()
+            << " kv_d2h_bytes=" << fastkv::Buffer::Traffic().deviceToHost
+            << " kv_h2d_bytes=" << fastkv::Buffer::Traffic().hostToDevice << std::endl;
         context->preTokens = pending->length;
         context->currentTokens = {context->allTokens.back()};
         context->intParams = {

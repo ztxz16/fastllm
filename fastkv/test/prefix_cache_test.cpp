@@ -237,6 +237,7 @@ int main(int argc, char **argv) {
     try {
         const bool cuda = argc > 1 && std::string(argv[1]) == "--cuda";
         BoundariesAndLeases(-1);
+        BoundariesAndLeases(-2);
         if (cuda)
             BoundariesAndLeases(0);
         GrowingPages();

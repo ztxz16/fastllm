@@ -69,7 +69,8 @@ class ConfigurationTest(unittest.TestCase):
             self.assertNotIn('receive_device', pd)
             prefill_pd = json.loads(loaded['prefill'][0]['command'][-1])
             self.assertEqual(prefill_pd['chunk_tokens'], 2048)
-            self.assertEqual(prefill_pd['cache_bytes'], 1 << 30)
+            self.assertEqual(prefill_pd['cache_bytes'], 0)
+            self.assertNotIn('device_cache_bytes', prefill_pd)
             self.assertNotIn('prefill', prefill_pd)
             self.assertEqual(loaded['decode'][0]['command'][-2], '--pd')
             config['decode'][0]['prefill'] = ['unknown:19000']

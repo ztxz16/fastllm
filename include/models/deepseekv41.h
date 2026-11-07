@@ -225,6 +225,7 @@ namespace fastllm {
 
         bool MoveSpecialWeightToCudaIfNeeded(const std::string &weightName, Data &data) const override;
         std::string PDLayout() const override;
+        std::vector<int> PDDevices() const override;
         fastkv::Message ExportPDState(ResponseContext &context) override;
         void ImportPDState(ResponseContext &context, const fastkv::Message &state) override;
 

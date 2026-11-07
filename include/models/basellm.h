@@ -25,7 +25,7 @@ using RuntimeResult = std::function<void(int index, const char* content)>;
 using RuntimeResultBatch = std::function<void(int index, std::vector <std::string> &contents)>;
 #endif
 
-namespace fastkv { struct Message; }
+namespace fastkv { struct Message; class BufferPool; }
 
 namespace fastllm {
     struct PDRuntime;
@@ -709,6 +709,10 @@ namespace fastllm {
         void BeginPD(ResponseContext *context);
         bool PollPD(ResponseContext *context);
         virtual std::string PDLayout() const;
+        virtual std::vector<int> PDDevices() const;
+        virtual bool HasPDResidentPrefixCache() const { return false; }
+        int RestorePDResidentPrefix(ResponseContext *context);
+        fastkv::BufferPool *PDExportPool() const;
         virtual fastkv::Message ExportPDState(ResponseContext &context);
         virtual void ImportPDState(ResponseContext &context, const fastkv::Message &state);
         std::shared_ptr<PDRuntime> pdRuntime;

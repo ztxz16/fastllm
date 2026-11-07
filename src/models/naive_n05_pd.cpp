@@ -13,8 +13,27 @@ void CheckPD(bool ok, const char *message) {
         throw std::runtime_error(std::string("FastKV Naive: ") + message);
 }
 #ifdef USE_CUDA
+// Submit all independent ranges on the owner worker's stream. Adjacent
+// physical pages coalesce; the existing generic batch-copy kernel handles
+// the remaining fragmented spans without one CUDA API call per page.
+struct StateCopies {
+    std::vector<void *> dst;
+    std::vector<const void *> src;
+    std::vector<size_t> bytes;
+    void Add(void *to, const void *from, size_t n) {
+        if (!n || to == from) return;
+        if (!bytes.empty() && (char *)dst.back() + bytes.back() == to &&
+            (const char *)src.back() + bytes.back() == from) bytes.back() += n;
+        else { dst.push_back(to); src.push_back(from); bytes.push_back(n); }
+    }
+    void Submit() {
+        CheckPD(FastllmCudaBatchCopyFromDeviceToDeviceAsyncCurrentThread(
+                    dst.data(), src.data(), bytes.data(), bytes.size()), "state copy failed");
+        FastllmCudaSyncCurrentThreadStream();
+    }
+};
 // Indexer sidecars share K's physical page IDs, but have their own row width.
-void CopyPagedRows(Data &compact, const Data &key, const PagedCacheManager &pool, bool restore) {
+void CopyPagedRows(Data &compact, const Data &key, const PagedCacheManager &pool, bool restore, StateCopies &copies) {
     CheckPD(key.isPagedKVCache && key.pageLen > 0 && pool.pageLen == key.pageLen &&
                 pool.dataType == compact.dataType && pool.dims.back() == compact.dims[2],
             "incompatible page storage");
@@ -25,7 +44,7 @@ void CopyPagedRows(Data &compact, const Data &key, const PagedCacheManager &pool
         CheckPD(page >= 0 && page < pool.maxPages, "invalid physical page");
         void *dense = (char *)compact.cudaData + size_t(at) * rowBytes;
         void *paged = (char *)pool.cudaData + size_t(page) * key.pageLen * rowBytes;
-        FastllmCudaCopyFromDeviceToDevice(restore ? paged : dense, restore ? dense : paged,
+        copies.Add(restore ? paged : dense, restore ? dense : paged,
             size_t(std::min(key.pageLen, rows - at)) * rowBytes);
     }
 }
@@ -49,16 +68,18 @@ fastkv::Message NaiveN05FlashModel::ExportPDState(ResponseContext &context) {
     CheckPD(context.preTokens > 0, "empty prefill state");
     const auto devices = tpDevices.empty() ? std::vector<int>{FastllmCudaGetDevice()} : tpDevices;
     const bool tp = tpDevices.size() > 1;
-    PDStateWriter writer;
+    PDStateWriter writer(PDExportPool());
     writer.metadata.String(PDLayout());
     writer.metadata.U32(context.preTokens);
     for (const auto &pair : context.pastKeyValues)
         for (const Data *root : {&pair.first, &pair.second})
             writer.metadata.Ints(root->dims);
-    std::vector<PDStateWriter> ranks(devices.size());
+    std::vector<PDStateWriter> ranks;
+    for (size_t i = 0; i < devices.size(); ++i) ranks.push_back(writer.Fork());
     auto pack = [&](int rank) {
         FastllmCudaSetDevice(devices[rank]);
         auto &output = ranks[rank];
+        StateCopies copies;
         for (int layer = 0; layer < block_cnt; ++layer) {
             for (int part = 0; part < 2; ++part) {
                 const Data &root =
@@ -73,25 +94,23 @@ fastkv::Message NaiveN05FlashModel::ExportPDState(ResponseContext &context) {
                 Data compact(cache.dataType, {1, rows, width});
                 compact.dataDevice = CUDA;
                 compact.dataDeviceIds = {devices[rank]};
-                compact.Allocate();
                 compact.kvCacheFp8Indexer = cache.kvCacheFp8Indexer;
+                output.AllocateTensor(compact);
                 const size_t rowBytes = GetDataBytes(cache.dataType, 1, width);
                 if (cache.isPagedKVCache) {
                     CheckPD(cache.pagedKVCacheData && cache.pageLen > 0, "missing page owner");
-                    CopyPagedRows(compact, cache, *cache.pagedKVCacheData, false);
+                    CopyPagedRows(compact, cache, *cache.pagedKVCacheData, false, copies);
                 } else {
                     const bool ring = tp && tpSwaRingCache && slidingLayers[layer];
                     const int first = ring ? (context.preTokens - rows) % window : 0;
                     const int count = ring ? std::min(rows, window - first) : rows;
-                    FastllmCudaCopyFromDeviceToDevice(compact.cudaData,
+                    copies.Add(compact.cudaData,
                                                       (char *)cache.cudaData + size_t(first) * rowBytes,
                                                       size_t(count) * rowBytes);
                     if (count < rows)
-                        FastllmCudaCopyFromDeviceToDevice((char *)compact.cudaData + size_t(count) * rowBytes,
+                        copies.Add((char *)compact.cudaData + size_t(count) * rowBytes,
                                                           cache.cudaData, size_t(rows - count) * rowBytes);
                 }
-                FastllmCudaSyncCurrentThreadStream();
-                output.Tensor(compact);
             }
             if (HasSeparateIndexer() && HasLocalIndexer(layer, rank)) {
                 const auto &root = context.pastKeyValues[layer].first;
@@ -100,13 +119,12 @@ fastkv::Message NaiveN05FlashModel::ExportPDState(ResponseContext &context) {
                 Data compact(pool.dataType, {1, context.preTokens, pool.dims[3]});
                 compact.dataDevice = CUDA;
                 compact.dataDeviceIds = {devices[rank]};
-                compact.Allocate();
                 compact.kvCacheFp8Indexer = pool.kvCacheFp8Indexer;
-                CopyPagedRows(compact, key, pool, false);
-                FastllmCudaSyncCurrentThreadStream();
-                output.Tensor(compact);
+                output.AllocateTensor(compact);
+                CopyPagedRows(compact, key, pool, false, copies);
             }
         }
+        copies.Submit();
     };
     if (tp) {
         std::vector<std::exception_ptr> errors(devices.size());
@@ -133,14 +151,15 @@ fastkv::Message NaiveN05FlashModel::ExportPDState(ResponseContext &context) {
             writer.Tensor(pair.second);
         }
     }
-    return writer.Finish();
+    return writer.Finish(devices);
 #endif
 }
 
-void NaiveN05FlashModel::ImportPDState(ResponseContext &context, const fastkv::Message &message) {
+void NaiveN05FlashModel::ImportPDState(ResponseContext &context, const fastkv::Message &wire) {
 #ifndef USE_CUDA
     throw std::runtime_error("FastKV Naive requires CUDA");
 #else
+    const auto message = PDStatePayload(wire);
     fastkv::Reader metadata(message.metadata);
     CheckPD(metadata.String() == PDLayout(), "incompatible state layout or TP size");
     const int length = metadata.U32();
@@ -187,10 +206,13 @@ void NaiveN05FlashModel::ImportPDState(ResponseContext &context, const fastkv::M
     auto unpack = [&](int rank) {
         FastllmCudaSetDevice(devices[rank]);
         PDStateReader reader(rankStates[rank]);
+        StateCopies copies;
+        std::vector<std::unique_ptr<Data>> imported;
         for (int layer = 0; layer < block_cnt; ++layer) {
             for (int part = 0; part < 2; ++part) {
-                Data value;
-                reader.Tensor(value);
+                imported.emplace_back(new Data());
+                Data &value = *imported.back();
+                reader.Tensor(value, true);
                 const int rows = slidingLayers[layer] ? std::min(length, window - 1) : length;
                 const auto &cfg = slidingLayers[layer] ? sliding : full;
                 const int expected =
@@ -208,12 +230,12 @@ void NaiveN05FlashModel::ImportPDState(ResponseContext &context, const fastkv::M
                 cache.kvCacheFp8Indexer = value.kvCacheFp8Indexer;
                 const int width = expected;
                 const size_t rowBytes = GetDataBytes(cache.dataType, 1, width);
-                // H2D is submitted by the persistent owner worker. Network
-                // workers never mutate this request's live page table.
+                // Placement and scatter belong to the persistent owner worker.
+                // Network workers never mutate this request's live page table.
                 value.ToDevice(CUDA, std::vector<int>{devices[rank]});
                 if (tp && !slidingLayers[layer] && !tpPagedCaches.empty()) {
                     PreparePagedCache(cache, *tpPagedCaches[rank][layer * 2 + part], rows);
-                    CopyPagedRows(value, cache, *cache.pagedKVCacheData, true);
+                    CopyPagedRows(value, cache, *cache.pagedKVCacheData, true, copies);
                     cache.lastPageLen = (rows - 1) % cache.pageLen + 1;
                 } else {
                     const bool ring = tp && tpSwaRingCache && slidingLayers[layer];
@@ -225,10 +247,10 @@ void NaiveN05FlashModel::ImportPDState(ResponseContext &context, const fastkv::M
                     ReserveCache(cache, capacity, width);
                     const int first = ring ? (length - rows) % window : 0;
                     const int count = ring ? std::min(rows, window - first) : rows;
-                    FastllmCudaCopyFromDeviceToDevice((char *)cache.cudaData + size_t(first) * rowBytes,
+                    copies.Add((char *)cache.cudaData + size_t(first) * rowBytes,
                                                       value.cudaData, size_t(count) * rowBytes);
                     if (count < rows)
-                        FastllmCudaCopyFromDeviceToDevice(cache.cudaData,
+                        copies.Add(cache.cudaData,
                                                           (char *)value.cudaData + size_t(count) * rowBytes,
                                                           size_t(rows - count) * rowBytes);
                 }
@@ -236,8 +258,9 @@ void NaiveN05FlashModel::ImportPDState(ResponseContext &context, const fastkv::M
                 cache.isKVCache = true;
             }
             if (HasSeparateIndexer() && HasLocalIndexer(layer, rank)) {
-                Data value;
-                reader.Tensor(value);
+                imported.emplace_back(new Data());
+                Data &value = *imported.back();
+                reader.Tensor(value, true);
                 const auto &root = context.pastKeyValues[layer].first;
                 const auto &key = *root.multiDeviceDatas.at(devices[rank]);
                 const auto &pool = IndexerStorage(layer, rank);
@@ -246,12 +269,11 @@ void NaiveN05FlashModel::ImportPDState(ResponseContext &context, const fastkv::M
                             value.kvCacheFp8Indexer == pool.kvCacheFp8Indexer,
                         "local Indexer shape mismatch");
                 value.ToDevice(CUDA, std::vector<int>{devices[rank]});
-                CopyPagedRows(value, key, pool, true);
-                FastllmCudaSyncCurrentThreadStream();
+                CopyPagedRows(value, key, pool, true, copies);
             }
         }
-        FastllmCudaSyncCurrentThreadStream();
         reader.End();
+        copies.Submit();
     };
     if (tp) {
         std::vector<std::exception_ptr> errors(devices.size());

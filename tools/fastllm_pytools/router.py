@@ -66,7 +66,9 @@ def load_config(path):
                     if group['endpoint'] in node.get('prefill', peers)))
                 pd['listen'] = group.get('listen', group['endpoint'])
                 pd['chunk_tokens'] = group.get('chunk_tokens', 2048)
-                pd['cache_bytes'] = group.get('cache_bytes', 1 << 30)
+                pd['cache_bytes'] = group.get('cache_bytes', 0)
+                if 'device_cache_bytes' in group:
+                    pd['device_cache_bytes'] = group['device_cache_bytes']
             else:
                 pd['queue_depth'] = group.get('max_inflight', 64)
                 pd['prefill'] = group.get('prefill', peers)
