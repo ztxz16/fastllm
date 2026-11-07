@@ -183,6 +183,8 @@ inline Exl3Vec Zero() { return 0; }
 inline Exl3Vec Madd(Exl3Vec w, float x, Exl3Vec y) { return w * x + y; }
 #endif
 
+#include "exl3-cpu-affine.h"
+
 // Transposed extraction windows, shared by all tiles of one bit rate.
 struct LaneWindows {
     alignas(64) uint32_t first[16], second[16], right[16], left[16], tail[16];
@@ -475,6 +477,16 @@ void Exl3DotRows(const Data &weight, int part, int node, int nodes,
     const int columns = v.outputs / storedNodes;
     const auto *packed = weight.numasData.empty() ? weight.cpuData : weight.numasData[node];
     const int start = weight.numasData.empty() ? node * (v.outputs / nodes) + first : first;
+#if defined(__AVX2__) || defined(__AVX512F__)
+    // Short projections can amplify codebook differences at FP16 subnormal
+    // activation boundaries. Preserve their exact decoder; large decode
+    // matrices amortize block quantization and use the bounded integer dot.
+    if (v.inputs >= 1024 && v.outputs >= 1024 && count % 16 == 0 && start % 16 == 0) {
+#define EXL3_FAST_CASE(B) case B: return Exl3QuantDot<B>(packed + part * v.partBytes, columns, v.inputs, start, rotated, output, count)
+        switch (weight.blockK) { EXL3_FAST_CASE(2);EXL3_FAST_CASE(3);EXL3_FAST_CASE(4);EXL3_FAST_CASE(5);EXL3_FAST_CASE(6);EXL3_FAST_CASE(7);EXL3_FAST_CASE(8);EXL3_FAST_CASE(10);EXL3_FAST_CASE(12);EXL3_FAST_CASE(14);EXL3_FAST_CASE(16); }
+#undef EXL3_FAST_CASE
+    }
+#endif
     DecodeMatmul(packed + part * v.partBytes, columns, v.inputs, weight.blockK,
         start, rotated, 1, output, count);
 }

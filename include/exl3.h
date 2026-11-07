@@ -25,6 +25,8 @@ void Exl3CopyRowShard(const Data &weight, uint8_t *destination, int node, int no
 void Exl3CopyCanonical(const Data &weight, uint8_t *destination);
 void Exl3PrepareInputBlock(const Data &weight, int part, const float *input,
     float *rotated, int first, bool roundBfloat);
+// Large x86 decode matrices use blockwise 12-bit activations and the affine
+// mul1 codebook. Short matrices, other ISAs and reconstruction stay exact.
 void Exl3DotRows(const Data &weight, int part, int node, int nodes,
     const float *rotated, float *output, int first, int count);
 void Exl3FinishOutputBlock(const Data &weight, int part, float *output, int first);

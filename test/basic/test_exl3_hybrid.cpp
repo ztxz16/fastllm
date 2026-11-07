@@ -12,6 +12,28 @@ static float ReadBf(const Data &d,int i) {
     uint32_t word=uint32_t(reinterpret_cast<const uint16_t *>(d.cpuData)[i])<<16;
     float f;std::memcpy(&f,&word,4);return f;
 }
+// Validate approximate CPU arithmetic independently, then use its per-route
+// outputs for the strict CPU/GPU mixture check. This keeps stale cache records,
+// wrong scores and graph workspace reuse visible at the original tolerance.
+static void DecodeCpuOracle(const Data &input,float *routes,Data **weights,int weightCount,
+        const int *ids,const float *scores,int topk,int layer) {
+#ifdef USE_NUMAS
+    if(!CanRunNumasMoeDecodeExperts(weights,weightCount))return;
+    const int k=input.dims.back();std::vector<float> x(k),actual(topk*k);
+    for(int i=0;i<k;++i)x[i]=ReadBf(input,i);
+    NumasMoeDecodeExperts(x.data(),actual.data(),weights,ids,nullptr,topk,layer,scores,.01f);
+    for(int at=0;at<topk;++at) {
+        double error=0,norm=0;
+        for(int c=0;c<k;++c) {
+            const float a=routes[at*k+c],b=actual[at*k+c];
+            Require(std::isfinite(a)&&std::isfinite(b),"Nonfinite CPU expert output");
+            error+=double(a-b)*(a-b);norm+=double(a)*a;
+        }
+        Require(std::sqrt(error/std::max(norm,1e-30))<.02,"Approximate CPU expert exceeds L2 limit");
+    }
+    std::copy(actual.begin(),actual.end(),routes);
+#endif
+}
 static void CheckHybrid() {
     constexpr int layers=2,experts=8,topk=3;
     const bool large=std::getenv("EXL3_TEST_LARGE")!=nullptr;
@@ -81,6 +103,8 @@ static void CheckHybrid() {
                     Require(a==b,"CPU per-route boundaries");
                 }
             }
+            DecodeCpuOracle(input,perRoute.data(),weights[l].data(),weights[l].size(),
+                reinterpret_cast<int *>(index.cpuData),reinterpret_cast<float *>(score.cpuData),topk,l);
             Data gx,gi,gs,result;gx.CopyFrom(input);gi.CopyFrom(index);gs.CopyFrom(score);
             for(auto *v:{&gx,&gi,&gs})v->ToDevice(CUDA,std::vector<int>{0});
             { FastllmCudaMoeRouteScope scope(FastllmMoeRoutePhase::Decode);
@@ -169,6 +193,9 @@ static void CheckHybrid() {
                     *reinterpret_cast<float *>(ss.cpuData)=reinterpret_cast<float *>(score.cpuData)[at];
                     Exl3MoeCPU(input,one,ii,ss,weights[l].data(),weights[l].size(),0,.01f);
                     std::memcpy(cpu.data()+at*k,one.cpuData,k*4);
+                    DecodeCpuOracle(input,cpu.data()+at*k,weights[l].data(),weights[l].size(),
+                        reinterpret_cast<int *>(ii.cpuData),reinterpret_cast<float *>(ss.cpuData),1,l);
+
                     ii.ToDevice(CUDA,std::vector<int>{0});ss.ToDevice(CUDA,std::vector<int>{0});
                     Require(FastllmCudaExl3Moe(gx,other,ii,ss,gpuWeights[l].data(),gpuWeights[l].size(),.01f),"Graph GPU route oracle");
                     other.ToDevice(CPU);std::memcpy(gpu.data()+at*k,other.cpuData,k*4);

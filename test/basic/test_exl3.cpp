@@ -2,6 +2,7 @@
 #include "exl3.h"
 #include "utils.h"
 #include <cmath>
+#include <limits>
 #include <cstring>
 #include <iostream>
 #include <random>
@@ -91,6 +92,46 @@ void Case(int bits,int rows,int parts,bool gpu) {
     for(size_t i=0;i<reference.size();++i){double delta=reinterpret_cast<float *>(output.cpuData)[i]-reference[i];error+=delta*delta;norm+=double(reference[i])*reference[i];}
     Require(std::isfinite(error) && std::sqrt(error/std::max(norm,1e-30))<0.0005,"EXL3 numeric oracle");
 }
+// Compare the decode dot against the bit-at-a-time matrix oracle. Output views
+// also exercise the canonical-storage mapping used before NUMA registration.
+void DecodeDotCase(int bits) {
+    const int n=1024,k=1024;
+    std::mt19937 rng(417+bits);
+    Data weight(EXL3);weight.blockK=bits;weight.blockM=2;
+    weight.Resize({2*n,k});weight.Allocate(false);
+    const size_t bytes=Exl3PartBytes(n,k,bits),trellis=size_t(n)*k*bits/16;
+    for(int part=0;part<2;++part) {
+        auto *packed=weight.cpuData+part*bytes;
+        for(size_t i=0;i<trellis;i+=4){uint32_t value=rng();std::memcpy(packed+i,&value,4);}
+        auto matrix=Oracle(packed,n,k,bits);
+        for(int mode=0;mode<6;++mode) {
+            std::vector<float> x(k);
+            for(int i=0;i<k;++i) {
+                float v=(int(rng()%1001)-500)/1024.f;
+                if(mode==1)v=1;else if(mode==2)v=i%2?-1:1;
+                else if(mode==3)v=0;else if(mode==4)v*=1e-37f;
+                x[i]=v;
+            }
+            if(mode==5)x[17]=std::numeric_limits<float>::quiet_NaN();
+            for(int view=0;view<3;++view) {
+                const int nodes=view?2:1,node=view==2?1:0,first=view?16:0,count=view?96:n;
+                std::vector<float> y(count+2,-12345.f);
+                Exl3DotRows(weight,part,node,nodes,x.data(),y.data()+1,first,count);
+                Require(y.front()==-12345.f&&y.back()==-12345.f,"Decode dot wrote past its output view");
+                double error=0,norm=0;
+                for(int c=0;c<count;++c) {
+                    if(mode==5){Require(std::isnan(y[c+1]),"Decode dot lost NaN input");continue;}
+                    double reference=0;
+                    for(int i=0;i<k;++i)reference+=double(x[i])*matrix[size_t(node*(n/nodes)+first+c)*k+i];
+                    Require(std::isfinite(y[c+1]),"Nonfinite decode dot result");
+                    error+=double(y[c+1]-reference)*(y[c+1]-reference);norm+=reference*reference;
+                }
+                Require(std::sqrt(error/std::max(norm,1e-30))<.01,"Decode dot exceeds relative L2 limit");
+            }
+        }
+    }
+}
+
 }
 int main(int argc,char **argv) {
     const bool gpu=argc>1 && std::string(argv[1])=="--cuda";
@@ -100,6 +141,7 @@ int main(int argc,char **argv) {
     if(gpu)return 77;
 #endif
     SetThreads(4);
+    if(!gpu)for(int bits:{2,3,4,5,6,7,8,10,12,14,16})DecodeDotCase(bits);
     for(int bits:{2,3,4,5,6,7,8,10,12,14,16}) for(int rows:{1,2,3,4,5,7,8,9,16,17,64}) for(int parts:{1,2}) Case(bits,rows,parts,gpu);
-    std::cout<<"EXL3 PASS: 242 independent numeric cases"<<std::endl;
+    std::cout<<"EXL3 PASS: 242 independent numeric cases and CPU decode-dot precision/views"<<std::endl;
 }
