@@ -142,17 +142,21 @@ __global__ void FastllmGemvFp32OutputTileUnpredicatedKernel(const float* __restr
 
 
 static void FastllmCudaFloat32EnsureBiasOnDevice(fastllm::Data &weight, const fastllm::Data &bias, int k) {
-    if (weight.cudaData == nullptr || weight.extraCudaData.size() == 0) {
+    // Auxiliary router caches reserve slots before the first ordinary Linear.
+    // A nonempty vector therefore does not imply that bias slot zero exists.
+    if (weight.extraCudaData.empty()) weight.extraCudaData.resize(1, nullptr);
+    if (weight.extraCudaData[0] == nullptr) {
         cudaError_t state = cudaSuccess;
         float *cudaBiasData;
         state = cudaMalloc(&cudaBiasData, k * sizeof(float));
+        checkCudaErrors("Error: CUDA error when allocating bias!", state);
         if (bias.dims.size() > 0) {
             state = cudaMemcpy(cudaBiasData, (uint8_t*)bias.cudaData, k * sizeof(float), cudaMemcpyDeviceToDevice);
         } else {
             state = cudaMemset(cudaBiasData, 0, k * sizeof(float));
         }
         checkCudaErrors("Error: CUDA error when moving bias to device!", state);
-        weight.extraCudaData.push_back((void*)cudaBiasData);
+        weight.extraCudaData[0] = cudaBiasData;
     }
 }
 
