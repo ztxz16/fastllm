@@ -1,3 +1,4 @@
+#include "exl3.h"
 #include "devices/cuda/glm5-next-cuda.cuh"
 #include "fastllm-cuda.cuh"
 #include "../fastllm-hybrid-prefill.cuh"
@@ -10305,6 +10306,8 @@ extern "C" bool FastllmCudaDeepSeekV4WoA(const fastllm::Data &o, const fastllm::
                                      {bsz, seqlen, groups * oRank})) {
         return false;
     }
+
+    if (woA.dataType == fastllm::EXL3) return FastllmCudaExl3Grouped(o, woA, output);
 
 #ifdef FASTLLM_ENABLE_DSV4_WOA_DEEPGEMM_SM120
     // The SM120 DeepGEMM specialization produces its FP8 operand and packed

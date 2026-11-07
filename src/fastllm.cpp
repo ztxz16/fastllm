@@ -6,6 +6,7 @@
 
 #include "fastllm.h"
 #include "utils/inference_trace.h"
+#include "exl3.h"
 #include "kvmem.h"
 #if defined(USE_CUDA) && !defined(USE_ROCM)
 #include "devices/cuda/fastllm-fp8-auxiliary.h"
@@ -629,6 +630,7 @@ namespace fastllm {
         {DataType::NVFP4_BLOCK_16_E8M0, {"nvfp4_block_16_e8m0"}},
         {DataType::NVFP4_BLOCK_16_E4M3, {"nvfp4_block_16_e4m3"}},
         {DataType::INT4_GROUP32, {"int4_group32"}},
+        {DataType::EXL3, {"exl3"}},
         {DataType::NVFP4_BLOCK_32_E8M0, {"nvfp4_block_32_e8m0"}},
         {DataType::INF_INT8_PERCHANNEL, {"inf_int8_perchannel"}}, {DataType::INF_INT8_GROUP128, {"inf_int8_group128"}},
         {DataType::INF_INT8_GROUP32, {"inf_int8_group32"}},
@@ -1253,6 +1255,7 @@ namespace fastllm {
         this->tpKVHeads = ori.tpKVHeads;
         this->tpHeadDim = ori.tpHeadDim;
         this->tpSplitUnit = ori.tpSplitUnit;
+        if (ori.dataType == DataType::EXL3) { blockK = ori.blockK; blockM = ori.blockM; }
         bool needRebuildGGUFTensor = ori.dataType == DataType::DATA_GGUF_FORMAT &&
                                      (this->ggmlTensor == nullptr || this->ggmlType != ori.ggmlType);
         this->isGGUFData = ori.isGGUFData || ori.dataType == DataType::DATA_GGUF_FORMAT;
@@ -1307,7 +1310,8 @@ namespace fastllm {
         }
 
         if (this->dataDevice == DataDevice::CPU) {
-            std::memcpy(this->cpuData, ori.cpuData, this->GetBytes());
+            if (ori.dataType == EXL3 && !ori.cpuData && !ori.numasData.empty()) Exl3CopyCanonical(ori, this->cpuData);
+            else std::memcpy(this->cpuData, ori.cpuData, this->GetBytes());
         } else if (this->dataDevice == DataDevice::CUDA) {
 #ifdef USE_CUDA
             FastllmCudaCopyFromDeviceToDevice(this->cudaData, ori.cudaData, this->GetBytes());
@@ -1604,6 +1608,13 @@ namespace fastllm {
             int groupCnt, int blockK, int blockM) {
         auto &data = *this;
         data.weightType = weightType;
+        if (dataType == DataType::EXL3) {
+            AssertInFastLLM(oriDataType == DataType::EXL3, "EXL3 is a source format, not a float quantizer.");
+            this->blockK = blockK; this->blockM = blockM;
+            UpdateUnitSize(); Allocate(false);
+            memcpy(cpuData, oriData, GetBytes());
+            return;
+        }
         if (dataType == oriDataType &&
             (dataType == DataType::NVFP4 || dataType == DataType::NVFP4_BLOCK_16 ||
              dataType == DataType::NVFP4_BLOCK_16_PLANAR ||
@@ -1956,6 +1967,11 @@ namespace fastllm {
     }
 
     void Data::UpdateUnitSize() {
+        if (dataType == DataType::EXL3) {
+            unitSize = unitSizeDiv = 1;
+            expansionBytes = ((dims.size() == 2 || dims.size() == 3) && blockK > 0 && blockM > 0) ? Exl3StorageBytes(*this) : 0;
+            return;
+        }
         if (this->dataType == DataType::INT4_GROUP32 && this->dims.size() >= 2) {
             const int columns = this->dims.back();
             AssertInFastLLM(columns % 32 == 0,
@@ -2244,6 +2260,7 @@ namespace fastllm {
         if (this->dims.empty() || this->strides.empty() || this->Count(0) == 0) {
             return 0;
         }
+        if (this->dataType == DataType::EXL3) return Exl3StorageBytes(*this);
         if (this->dataType == DataType::DATA_GGUF_FORMAT) {
             return ggml_nbytes((ggml_tensor*)this->ggmlTensor);
         }
@@ -2273,7 +2290,9 @@ namespace fastllm {
 
     void Data::MallocSpace(uint64_t size, bool zero) {
         this->expansionSize = size;
-        if ((this->dataType == DataType::FP8_E4M3_BLOCK_128 ||
+        if (dataType == DataType::EXL3) {
+            expansionBytes = Exl3StorageBytes(*this);
+        } else if ((this->dataType == DataType::FP8_E4M3_BLOCK_128 ||
              this->dataType == DataType::FP8_E4M3_PERCHANNEL ||
              this->dataType == DataType::NVFP4_BLOCK_16 ||
              this->dataType == DataType::NVFP4_BLOCK_16_PLANAR ||
@@ -2513,6 +2532,9 @@ namespace fastllm {
     }
 
     Data::~Data() {
+#ifdef USE_CUDA
+        if (this->dataType == DataType::EXL3 && !this->isFake) FastllmCudaReleaseExl3(this);
+#endif
         if (this->isDiskWeight) {
             ReleaseDiskMoeCache(this);
         }
@@ -2987,6 +3009,8 @@ namespace fastllm {
 
                         if (cpuData != nullptr) {
                             FastllmCudaCopyFromHostToDevice(this->cudaData, cpuData, copyBytes);
+                        } else if (this->dataType == EXL3 && !this->numasData.empty()) {
+                            FastllmCudaRestoreExl3Weight(*this, this->cudaData);
                         } else if (!this->numasData.empty() && this->dims.size() == 2) {
                             int numaCnt = this->numasData.size();
                             int k = this->dims[0], m = this->dims[1];
@@ -3113,6 +3137,8 @@ namespace fastllm {
                         FastllmCudaCopyFromHostToDevice(this->cudaData, this->cpuData, bytes);
                     }
                 }
+            } else if (this->dataType == EXL3 && !this->numasData.empty()) {
+                FastllmCudaRestoreExl3Weight(*this, this->cudaData, stream);
             } else {
                 int numaCnt = this->numasData.size();
                 int k = this->dims[0], m = this->dims[1];

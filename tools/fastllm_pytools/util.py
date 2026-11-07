@@ -1078,6 +1078,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--image-embedding-cache', '--image_embedding_cache',
                         dest = 'image_embedding_cache', type = _memory_size_bytes, default = None,
                         help = 'Qwen3.5图片embedding的CPU缓存上限，如512m或1g；默认512m，0关闭')
+    parser.add_argument('--engram-path', dest='engram_path', default=None, help='独立 Engram safetensors 目录')
     parser.add_argument('--ngram_device', '--ngram-device', dest = 'ngram_device',
                         choices = ['cpu', 'disk', 'cuda'], default = 'cpu',
                         help = 'ngram表存放位置；cpu常驻内存（默认），disk按行读取，cuda为V4.1多卡GPU分片（容量/拓扑不支持时回退CPU）')
@@ -1222,6 +1223,9 @@ def make_normal_llm_model(args, startup_progress = None):
 
     if getattr(args, "autotune", False):
         args.auto = True
+
+    if getattr(args, "engram_path", None):
+        os.environ["FASTLLM_DSV41_ENGRAM_PATH"] = os.path.abspath(os.path.expanduser(args.engram_path))
 
     draft_gpu_resident = getattr(args, "draft_gpu_resident", None)
     if draft_gpu_resident not in (None, 0, 1):

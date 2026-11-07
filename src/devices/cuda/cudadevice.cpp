@@ -2,6 +2,7 @@
 #include "models/deepseekv41-indexer.cuh"
 #include "devices/cuda/fastllm-prefill-workspace.h"
 #include "gguf.h"
+#include "exl3.h"
 #include "devices/cuda/fastllm-cuda-v41-gguf.h"
 #include "devices/cuda/fastllm-cuda-gguf-projections.h"
 #include "devices/cuda/fastllm-cuda-gguf-linear-add.h"
@@ -6431,6 +6432,8 @@ namespace fastllm {
     }
 
     bool IsCudaLinearDataTypeSupported(DataType inputType, DataType weightType, DataType biasType) {
+        if (weightType == DataType::EXL3) return biasType == DataType::FLOAT32 &&
+            (inputType == DataType::FLOAT32 || inputType == DataType::FLOAT16 || inputType == DataType::BFLOAT16);
         if (biasType != DataType::FLOAT32) {
             return false;
         }
@@ -6496,6 +6499,10 @@ namespace fastllm {
     void DoCudaLinear(Data &input, Data &weight, const Data &bias, Data &output) {
         if (weight.cudaNativeNvfp4Layout && input.dataType != DataType::FLOAT16) FastllmCudaRestoreNativeNvfp4(weight);
         output.Allocate(false);
+        if (weight.dataType == DataType::EXL3) {
+            AssertInFastLLM(FastllmCudaExl3Linear(input, weight, bias, output), "EXL3 CUDA linear failed.");
+            return;
+        }
         int n = input.Count(0) / input.dims.back();
         int m = input.dims.back();
         int k = output.dims.back();
@@ -10649,6 +10656,9 @@ namespace fastllm {
         if (score.dataDevice == DataDevice::CUDA)
             FastllmCudaCopyFromDeviceToHost(scores.data(), score.cudaData, scores.size() * sizeof(float));
         else std::memcpy(scores.data(), score.cpuData, scores.size() * sizeof(float));
+        // Allocation capacity is counted in elements. A prior BF16 output
+        // must release its smaller byte buffer before becoming FP32.
+        if (output.dataType != DataType::FLOAT32) output.FreeSpace();
         output.dataType = DataType::FLOAT32;
         output.UpdateUnitSize();
         output.Resize(input.dims);
@@ -10662,8 +10672,7 @@ namespace fastllm {
         }
         for (int slot = 0; slot + 1 < weightsBatch; slot += 2) {
             if (weights[slot] == nullptr || weights[slot + 1] == nullptr) continue;
-            AssertInFastLLM(weights[slot]->cudaData && weights[slot + 1]->cudaData,
-                "V4.1 MoE cannot fall back after discarding source weights. A packed kernel failed.");
+
             std::vector<int32_t> selected;
             std::vector<float> selectedScores;
             for (int row = 0; row < rows; ++row) {
@@ -10681,6 +10690,11 @@ namespace fastllm {
             }
             int count = (int)selected.size();
             if (count == 0) continue;
+            AssertInFastLLM(weights[slot]->cudaData && weights[slot + 1]->cudaData,
+                "V4.1 MoE cannot fall back after discarding source weights. A packed kernel failed.");
+            const bool exl3 = weights[slot]->dataType == DataType::EXL3;
+            AssertInFastLLM(exl3 == (weights[slot + 1]->dataType == DataType::EXL3),
+                "V4.1 EXL3 expert projections must use matching activation semantics.");
             Data rowIds(DataType::INT32, {count});
             rowIds.Allocate();
             std::memcpy(rowIds.cpuData, selected.data(), count * sizeof(int32_t));
@@ -10695,11 +10709,14 @@ namespace fastllm {
             gathered.Allocate(false);
             FastllmCudaPickInput((uint8_t *)input.cudaData, (uint8_t *)gathered.cudaData,
                 count, hidden * sizeof(uint16_t), (int *)rowIds.cudaData);
-            AssertInFastLLM(FastllmCudaDeepSeekV41QuantizeActivation(gathered, gathered),
+            if (!exl3) AssertInFastLLM(FastllmCudaDeepSeekV41QuantizeActivation(gathered, gathered),
                 "V4.1 CUDA MoE input quantization failed.");
             DoCudaLinearReshape(gathered, *weights[slot], middle);
             DoCudaLinear(gathered, *weights[slot], *GetEmptyData(), middle);
-            AssertInFastLLM(FastllmCudaDeepSeekV41SharedSwigluQuantized(
+            if (exl3) {
+                AssertInFastLLM(FastllmCudaDeepSeekV41SharedSwiglu(middle, swigluLimit, activation),
+                    "EXL3 CUDA MoE gated activation failed.");
+            } else AssertInFastLLM(FastllmCudaDeepSeekV41SharedSwigluQuantized(
                 middle, swigluLimit, activation, (const float *)routeScales.cudaData),
                 "V4.1 CUDA MoE gated activation failed.");
             DoCudaLinearReshape(activation, *weights[slot + 1], expertOut);
@@ -10710,7 +10727,7 @@ namespace fastllm {
             floatOut.Allocate(false);
             FastllmBF16ToFloat(expertOut.cudaData, floatOut.cudaData, expertOut.Count(0));
             FastllmCudaPickOutputFloat((float *)floatOut.cudaData, (float *)output.cudaData,
-                count, hidden, (int *)rowIds.cudaData, (float *)unitScales.cudaData);
+                count, hidden, (int *)rowIds.cudaData, (float *)(exl3 ? routeScales.cudaData : unitScales.cudaData));
             // The per-expert route buffers are released before the next group.
             FastllmCudaSyncDevice(device);
         }
@@ -10737,6 +10754,7 @@ namespace fastllm {
         clearIfOnOtherDevice(output);
         if (deepSeekV41) {
             AssertInFastLLM(gateType == MoeGateSwiglu, "V4.1 MoE requires SwiGLU.");
+            if (FastllmCudaExl3Moe(input, output, index, score, weights, weightsBatch, swigluLimit)) return;
 #ifndef USE_ROCM
             if (TryCudaMergeMOEV41Mxfp4Marlin(input, output, index, score, w1,
                     weights, weightsBatch, sharedScale, swigluLimit)) return;
@@ -11044,7 +11062,8 @@ namespace fastllm {
                        "CUDA MoE swigluLimit must be finite and non-negative.");
         const bool deepSeekV41 = intParams.count("deepSeekV4Mode") &&
             intParams.at("deepSeekV4Mode") && intParams.count("activationQuantBlock") &&
-            intParams.at("activationQuantBlock") == 32;
+            (intParams.at("activationQuantBlock") == 32 ||
+             (weightsBatch > 2 && weights[2] && weights[2]->dataType == DataType::EXL3));
         DoCudaMergeMOE (
             input, output, index, score, w1, w2, w3, weights, biass, sharedScale, gateType, weightsBatch, swigluLimit, deepSeekV41
         );

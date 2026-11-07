@@ -3160,6 +3160,11 @@ namespace fastllm {
         AssertInFastLLM(V41HasKey(this->weight, "model_directory"),
                         "DeepSeekV41: model directory is unknown, can't load engram tables.");
         std::string dir = this->weight.dicts["model_directory"];
+        auto external = this->weight.dicts.find("engram_table_dir");
+        if (external != this->weight.dicts.end() && !external->second.empty()) dir = external->second;
+        if (const char *env = std::getenv("FASTLLM_DSV41_ENGRAM_PATH"))
+            if (*env) dir = env;
+        if (!dir.empty() && dir.back() != '/' && dir.back() != '\\') dir += '/';
         V41EngramMadviseCfg madviseCfg = V41EngramMadvise();
         engramTables.clear();
         for (size_t l = 0; l < engram_layer_ids.size(); l++) {
