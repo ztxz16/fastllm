@@ -1,0 +1,256 @@
+// Fastllm adapter for Project Maya's MIT-licensed EXL3 kernels.
+// Provenance, licenses and local upstream changes: third_party/maya_exl3/NOTICE.txt.
+#include "exl3.h"
+#include "utils.h"
+#include "devices/cuda/fastllm-cuda.cuh"
+#include "strata/kernels/exl3.hpp"
+#include <cuda_fp16.h>
+#include <algorithm>
+#include <array>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <tuple>
+
+namespace {
+namespace maya = strata::kernels::exl3;
+using namespace fastllm;
+bool Enabled() {
+#ifdef CUDA_NO_TENSOR_CORE
+    return false;
+#else
+    return true;
+#endif
+}
+struct Workspace {
+    Data plan{INT8}, h{FLOAT32};
+    explicit Workspace(int dev) {
+        for (Data *d : {&plan, &h}) { d->dataDevice = DataDevice::CUDA; d->dataDeviceIds = {dev}; }
+    }
+};
+Workspace &Work(int k, int n, int rows, int topk = 0) {
+    static thread_local std::map<std::tuple<int,int,int,int,int>, std::unique_ptr<Workspace>> map;
+    const int dev = FastllmCudaGetDevice();
+    auto &p = map[{dev,k,n,rows,topk}];
+    if (!p) p.reset(new Workspace(dev));
+    return *p;
+}
+maya::Mat Matrix(const Data &weight, int part) {
+    maya::Mat m;
+    m.k = weight.dims[1]; m.n = weight.dims[0] / weight.blockM; m.k2 = weight.blockK;
+    const auto *base = static_cast<const uint8_t *>(weight.cudaData) + part * Exl3PartBytes(m.n,m.k,m.k2);
+    m.trellis = reinterpret_cast<const uint32_t *>(base);
+    m.suh = reinterpret_cast<const uint16_t *>(base + maya::trellis_bytes_k2(m.k,m.n,m.k2));
+    m.svh = m.suh + m.k;
+    return m;
+}
+struct Signature {
+    const void *gate, *down;
+    int kg, kd;
+    bool operator==(const Signature &b) const { return gate==b.gate && down==b.down && kg==b.kg && kd==b.kd; }
+};
+struct Directory {
+    std::vector<Signature> signature;
+    Data table{INT8}; // [expert descriptors: 3 pointers each][expert-id -> descriptor pointer]
+    maya::ExpertLayout lay;
+    maya::MixedLayouts mix;
+    const unsigned long long *lookup = nullptr;
+    int k = 0, mid = 0;
+};
+using Key = std::pair<const Data *,int>;
+std::mutex &DirectoryMutex() { static auto *p = new std::mutex; return *p; }
+std::map<Key,std::shared_ptr<Directory>> &Directories() { static auto *p = new std::map<Key,std::shared_ptr<Directory>>; return *p; }
+maya::ExpertLayout Layout(int k, int mid, int kg, int kd) {
+    maya::ExpertLayout lay;
+    for (int role = 0; role < 3; ++role) {
+        int in = role==2 ? mid : k, out = role==2 ? k : mid;
+        lay.k2[role] = role==2 ? kd : kg;
+        lay.suh[role] = maya::trellis_bytes_k2(in,out,lay.k2[role]);
+        lay.svh[role] = lay.suh[role] + 2ull * in;
+    }
+    return lay;
+}
+__global__ void Plan(const int *ids, const unsigned long long *lookup, unsigned long long *plan, int count, int experts) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) plan[i] = ids[i] >= 0 && ids[i] < experts ? lookup[ids[i]] : 0ull;
+}
+__global__ void CachePlan(const uint8_t *records, const int *slots, const uint64_t *offsets,
+                         size_t stride, unsigned long long *plan, int count) {
+    const int i = threadIdx.x;
+    if (i < count) {
+        const int slot = slots[i];
+        plan[i] = slot < 0 ? 0ull : reinterpret_cast<unsigned long long>(
+            records + (offsets ? offsets[slot] : size_t(slot) * stride));
+    }
+}
+}
+
+bool FastllmCudaExl3MayaCache(const fastllm::Data &input, const uint8_t *records,
+    const int32_t *slots, const uint64_t *offsets, size_t stride, size_t downOffset,
+    int inter, int gateBits, int downBits, const float *scores, int topk,
+    float limit, float *perExpert, int workspace) {
+    using namespace fastllm;
+    if (!Enabled() || input.dataType != BFLOAT16 || input.dims.size() != 2 ||
+        input.dims[0] < 1 || input.dims[0] > 8 || topk < 1 || topk > 8 ||
+        !maya::k2_supported(gateBits,2) || !maya::k2_supported(downBits,2)) return false;
+    const int k = input.dims[1], rows = input.dims[0];
+    if (k < 128 || inter < 128 || k > 8192 || inter > 8192 || k%128 || inter%128) return false;
+    auto &work = Work(k, inter, rows, -topk-16*workspace);
+    work.plan.Resize({rows*topk*int(sizeof(unsigned long long))}); work.plan.Allocate(false);
+    work.h.Resize({rows*topk,inter}); work.h.Allocate(false);
+    auto *plan = static_cast<unsigned long long *>(work.plan.cudaData);
+    CachePlan<<<1,64,0,cudaStreamPerThread>>>(records,slots,offsets,stride,plan,rows*topk);
+    maya::MoeArgs a; a.k=topk; a.n_embd=k; a.n_ff=inter; a.limit=limit; a.route_output=true; a.scratch_lane=1+workspace;
+    a.lay=Layout(k,inter,gateBits,downBits); a.round_bf16=true;
+    const size_t roleOffset[3]={0,Exl3PartBytes(inter,k,gateBits),downOffset};
+    for (int role=0;role<3;++role) {
+        a.lay.trellis[role]+=roleOffset[role];
+        a.lay.suh[role]+=roleOffset[role]; a.lay.svh[role]+=roleOffset[role];
+    }
+    // Keep every selected expert in one upstream launch. The extension only
+    // changes the final output layout; the shared cache owns route reduction.
+    for (int row=0;row<rows;++row) {
+        const int at=row*topk;
+        a.plan_ptr=plan+at; a.plan_w=scores+at;
+        a.x16=static_cast<const uint16_t *>(input.cudaData)+size_t(row)*k; a.x_bf16=true;
+        auto *hidden=static_cast<float *>(work.h.cudaData)+size_t(at)*inter;
+        maya::moe_gate_up(a,nullptr,hidden,cudaStreamPerThread);
+        maya::moe_down(a,hidden,nullptr,perExpert+size_t(at)*k,cudaStreamPerThread);
+    }
+    return cudaGetLastError()==cudaSuccess;
+}
+
+bool FastllmCudaExl3MayaLinear(const fastllm::Data &input, fastllm::Data &weight,
+                              const fastllm::Data &bias, fastllm::Data &output) {
+    using namespace fastllm;
+    if (!Enabled() || weight.dataType != EXL3 || weight.dims.size()!=2 || weight.blockM<1 || weight.blockM>maya::kMaxMvJobs ||
+        !input.cudaData || !weight.cudaData || !output.cudaData ||
+        (input.dataType!=FLOAT32 && input.dataType!=FLOAT16 && input.dataType!=BFLOAT16) ||
+        (output.dataType!=FLOAT32 && output.dataType!=FLOAT16 && output.dataType!=BFLOAT16)) return false;
+    int k = weight.dims[1], total = weight.dims[0], rows = input.Count(0)/k;
+    // Large prefill retains Fastllm's bounded decode + cuBLAS path.
+    if (rows<1 || rows>maya::kMaxMvCols) return false;
+    AssertInFastLLM(input.dims.back()==k && output.dims.back()==total,"EXL3 Maya: linear shape mismatch.");
+    Exl3StorageBytes(weight);
+    std::array<maya::Mat,maya::kMaxMvJobs> mats;
+    for (int p=0;p<weight.blockM;++p) { mats[p]=Matrix(weight,p); if(!maya::supported(mats[p])) return false; }
+    auto stream = cudaStreamPerThread;
+    std::array<maya::MvJob,maya::kMaxMvJobs> jobs;
+    for (int p=0;p<weight.blockM;++p) {
+        auto &j=jobs[p]; j.m=&mats[p];
+        if (input.dataType==FLOAT32) j.xf=static_cast<const float *>(input.cudaData);
+        else { j.x16=static_cast<const uint16_t *>(input.cudaData); j.x_bf16=input.dataType==BFLOAT16; }
+        if (output.dataType==FLOAT32) j.y=static_cast<float *>(output.cudaData)+p*mats[p].n;
+        else { j.y16=static_cast<uint16_t *>(output.cudaData)+p*mats[p].n; j.y_bf16=output.dataType==BFLOAT16; }
+        j.bias=bias.dims.empty()?nullptr:static_cast<const float *>(bias.cudaData)+p*mats[p].n;
+        j.ncol=rows; j.xf_cs=k; j.y_cs=total;
+    }
+    AssertInFastLLM(maya::mv(jobs.data(),weight.blockM,stream),"EXL3 Maya: matrix launch rejected.");
+    AssertInFastLLM(cudaGetLastError()==cudaSuccess,"EXL3 Maya: linear CUDA failure.");
+    return true;
+}
+
+void FastllmCudaReleaseExl3Maya(const fastllm::Data *owner) {
+    std::lock_guard<std::mutex> lock(DirectoryMutex());
+    auto &map=Directories();
+    for(auto it=map.begin();it!=map.end();) { if(it->first.first==owner) it=map.erase(it); else ++it; }
+}
+
+bool FastllmCudaExl3MayaMoe(const fastllm::Data &input, fastllm::Data &output,
+                           const fastllm::Data &index, const fastllm::Data &score,
+                           fastllm::Data **weights, int count, float limit) {
+    using namespace fastllm;
+    if (!Enabled() || input.dataType!=BFLOAT16 || input.dims.size()!=2 || input.dims[0]<1 || input.dims[0]>8 || count<4 || count%2 ||
+        weights[0] || !weights[2] || weights[2]->dataType!=EXL3 || weights[2]->dims.size()!=2 ||
+        index.dataDevice!=DataDevice::CUDA || score.dataDevice!=DataDevice::CUDA || index.dims.empty() ||
+        index.dataType!=INT32 || score.dataType!=FLOAT32) return false;
+    const int k=input.dims[1], mid=weights[2]->dims[0]/2, rows=input.dims[0], topk=index.dims.back();
+    const int experts=count/2-1, device=FastllmCudaGetDevice();
+    if (topk<1 || topk>8 || k<128 || k>8192 || mid<128 || mid>8192 || k%128 || mid%128) return false;
+    std::vector<Signature> signature; signature.reserve(experts);
+    std::map<std::pair<int,int>,std::vector<int>> classes;
+    for(int e=0;e<experts;++e) {
+        Data *g=weights[2+2*e], *d=weights[3+2*e];
+        if(!g || !d || g->dataType!=EXL3 || d->dataType!=EXL3 || !g->cudaData || !d->cudaData ||
+           g->dims!=std::vector<int>({2*mid,k}) || d->dims!=std::vector<int>({k,mid}) || g->blockM!=2 || d->blockM!=1 ||
+           !maya::k2_supported(g->blockK,2) || !maya::k2_supported(d->blockK,2)) return false;
+        signature.push_back({g->cudaData,d->cudaData,g->blockK,d->blockK});
+        classes[{g->blockK,d->blockK}].push_back(e);
+    }
+    if(classes.size()>maya::kMaxClasses) return false;
+    if(classes.size()>1) for(const auto &c:classes) if(!maya::mixed_supported(Layout(k,mid,c.first.first,c.first.second))) return false;
+    std::shared_ptr<Directory> dir;
+    {
+        std::lock_guard<std::mutex> lock(DirectoryMutex());
+        auto &entry=Directories()[{weights[2],device}];
+        if(!entry || entry->k!=k || entry->mid!=mid || entry->signature!=signature) {
+            entry=std::make_shared<Directory>(); auto &d=*entry;
+            d.signature=std::move(signature); d.k=k; d.mid=mid;
+            d.table.dataDevice=DataDevice::CUDA; d.table.dataDeviceIds={device};
+            d.table.Resize({experts*4*int(sizeof(unsigned long long))}); d.table.Allocate(false);
+            std::vector<unsigned long long> data(experts*4);
+            auto base=reinterpret_cast<unsigned long long>(d.table.cudaData);
+            int slot=0, cls=0;
+            for(const auto &c:classes) {
+                auto lay=Layout(k,mid,c.first.first,c.first.second);
+                d.mix.lo[cls]=base+slot*3*sizeof(unsigned long long);
+                for(int e:c.second) {
+                    const auto &sig=d.signature[e];
+                    data[slot*3]=reinterpret_cast<unsigned long long>(sig.gate);
+                    data[slot*3+1]=data[slot*3]+Exl3PartBytes(mid,k,sig.kg);
+                    data[slot*3+2]=reinterpret_cast<unsigned long long>(sig.down);
+                    data[experts*3+e]=base+slot*3*sizeof(unsigned long long); ++slot;
+                }
+                d.mix.hi[cls]=base+slot*3*sizeof(unsigned long long); d.mix.lay[cls]=lay; d.lay=lay; ++cls;
+            }
+            d.mix.n=classes.size()>1?cls:0;
+            d.lookup=reinterpret_cast<const unsigned long long *>(base+experts*3*sizeof(unsigned long long));
+            FastllmCudaCopyFromHostToDevice(d.table.cudaData,data.data(),d.table.GetBytes());
+        }
+        dir=entry;
+    }
+    auto stream=cudaStreamPerThread;
+    auto &work=Work(k,mid,rows,topk);
+    work.plan.Resize({rows*topk*int(sizeof(unsigned long long))}); work.plan.Allocate(false);
+    work.h.Resize({topk,mid}); work.h.Allocate(false);
+    auto *plan=static_cast<unsigned long long *>(work.plan.cudaData);
+    Plan<<<(rows*topk+127)/128,128,0,stream>>>(static_cast<const int *>(index.cudaData),dir->lookup,plan,rows*topk,experts);
+    if(output.dataType!=FLOAT32) { output.FreeSpace(); output.dataType=FLOAT32; }
+    output.Resize({rows,k}); output.ToDevice(DataDevice::CUDA,{device},false); output.Allocate(false);
+    maya::MoeArgs a; a.k=topk; a.n_embd=k; a.n_ff=mid; a.limit=limit;
+    a.lay=dir->lay; a.mix=dir->mix; a.indirect=true; a.round_bf16=true;
+    for(int row=0;row<rows;++row) {
+        a.plan_ptr=plan+row*topk; a.plan_w=static_cast<const float *>(score.cudaData)+row*topk;
+        auto *h=static_cast<float *>(work.h.cudaData);
+        a.x16=static_cast<const uint16_t *>(input.cudaData)+row*k; a.x_bf16=true;
+        maya::moe_gate_up(a,nullptr,h,stream);
+        maya::moe_down(a,h,nullptr,static_cast<float *>(output.cudaData)+row*k,stream);
+    }
+    AssertInFastLLM(cudaGetLastError()==cudaSuccess,"EXL3 Maya: MoE CUDA failure.");
+    return true;
+}
+
+bool FastllmCudaExl3MayaGrouped(const fastllm::Data &input, const fastllm::Data &weight, fastllm::Data &output) {
+    using namespace fastllm;
+    if (!Enabled() || weight.dims.size() != 3) return false;
+    const int groups = weight.dims[0], n = weight.dims[1], k = weight.dims[2];
+    const int rows = input.Count(0) / (groups * k);
+    if (groups < 1 || groups > maya::kMaxMvJobs || rows < 1 || rows > maya::kMaxMvCols) return false;
+    std::array<maya::Mat,maya::kMaxMvJobs> mats;
+    std::array<maya::MvJob,maya::kMaxMvJobs> jobs;
+    for (int g = 0; g < groups; ++g) {
+        auto &m = mats[g]; m.k = k; m.n = n; m.k2 = weight.blockK;
+        const auto *base = static_cast<const uint8_t *>(weight.cudaData) + size_t(g) * Exl3PartBytes(n,k,m.k2);
+        m.trellis = reinterpret_cast<const uint32_t *>(base);
+        m.suh = reinterpret_cast<const uint16_t *>(base + maya::trellis_bytes_k2(k,n,m.k2)); m.svh = m.suh + k;
+        if (!maya::supported(m)) return false;
+        auto &j = jobs[g]; j.m = &m;
+        if (input.dataType == FLOAT32) j.xf = static_cast<const float *>(input.cudaData) + size_t(g) * k;
+        else { j.x16 = static_cast<const uint16_t *>(input.cudaData) + size_t(g) * k; j.x_bf16 = input.dataType == BFLOAT16; }
+        if (output.dataType == FLOAT32) j.y = static_cast<float *>(output.cudaData) + size_t(g) * n;
+        else { j.y16 = static_cast<uint16_t *>(output.cudaData) + size_t(g) * n; j.y_bf16 = output.dataType == BFLOAT16; }
+        j.ncol = rows; j.xf_cs = groups * k; j.y_cs = groups * n;
+    }
+    AssertInFastLLM(maya::mv(jobs.data(),groups,cudaStreamPerThread),"EXL3 Maya: grouped launch rejected");
+    return cudaGetLastError() == cudaSuccess;
+}

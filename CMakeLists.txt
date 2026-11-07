@@ -500,6 +500,17 @@ if (USE_CUDA)
 
     set_source_files_properties(src/devices/cuda/models/deepseekv41-reference.cu PROPERTIES COMPILE_OPTIONS "--fmad=false")
 
+    # Project Maya / Strata MIT EXL3 kernels; provenance: third_party/maya_exl3/NOTICE.txt.
+    # CPU, ROCm, and CUDA_NO_TENSOR_CORE retain Fastllm's portable operators.
+    if (NOT USE_ROCM AND NOT CUDA_NO_TENSOR_CORE)
+        add_compile_definitions(FASTLLM_USE_MAYA_EXL3)
+        include_directories(third_party/maya_exl3/include)
+        list(APPEND FASTLLM_CUDA_SOURCES
+            src/devices/cuda/linear/fastllm-linear-exl3-maya.cu
+            third_party/maya_exl3/src/exl3.cu
+            third_party/maya_exl3/src/exl3_legacy.cu)
+    endif()
+
     if (FASTLLM_DEEPGEMM_FP8_SM90_ENABLED AND NOT CUDA_NO_TENSOR_CORE AND
         CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.8 AND
         EXISTS "${FASTLLM_CUTLASS_DIR}/include/cutlass/cutlass.h")
@@ -3797,5 +3808,17 @@ else()
             COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_BINARY_DIR}/build_info.json ${CMAKE_BINARY_DIR}/tools/ftllm/.
     )
 endif()
+
+if (USE_CUDA AND NOT USE_ROCM AND NOT CUDA_NO_TENSOR_CORE)
+    add_custom_command(TARGET fastllm_tools POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/tools/ftllm/licenses/maya_exl3
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${CMAKE_CURRENT_SOURCE_DIR}/third_party/maya_exl3/LICENSE
+            ${CMAKE_CURRENT_SOURCE_DIR}/third_party/maya_exl3/LICENSE.exllamav3
+            ${CMAKE_CURRENT_SOURCE_DIR}/third_party/maya_exl3/NOTICE.txt
+            ${CMAKE_CURRENT_SOURCE_DIR}/third_party/maya_exl3/UPSTREAM.json
+            ${CMAKE_BINARY_DIR}/tools/ftllm/licenses/maya_exl3)
+endif()
+
 
 endif()

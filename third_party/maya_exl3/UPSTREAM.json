@@ -1,0 +1,13 @@
+{
+  "repository": "https://github.com/mw00/project-maya",
+  "commit": "5d20b0e8fd7c15fde2a9f2b4eac5e9776883690b",
+  "version": "1.1.44",
+  "original_sha256": {
+    "src/exl3.cu": "934cdc150eb700079a5253341b4beae72a148f1b2fc9face069ffcd6a2b73a5c",
+    "src/exl3_legacy.cu": "0d487a91dcd02825402707e9288cd78e85c0e0535251b4e04ac65e4f77c5c85f",
+    "include/strata/kernels/exl3.hpp": "1d79a99c3972b83d97027621d39bec5773d1510db96fbbb1606cd6eb5ecd414f",
+    "include/strata/kernels/dp4a.hpp": "70c28583a58358bc720131d3f0bc5030b8c4f31520ad7bd8e0e4b6b189aa10e3",
+    "LICENSE": "574cffb7c57769a9271043ac0c2b07c5e7e7621cfb81081b901d8981e791d121",
+    "LICENSE.exllamav3": "93ccc2f4c97c03bc767c611c75f3bb16b97e49606f5cd3ca05d7f6201ff8f8de"
+  }
+}
