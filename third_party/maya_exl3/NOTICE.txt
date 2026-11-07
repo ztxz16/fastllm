@@ -40,3 +40,13 @@ CUDA operators are Fastllm's independent implementation, not imported Maya code.
   multi-job mv API, with separate input/output offsets and row strides.
 - This adapter change does not modify the upstream matrix kernels or their
   split policy. Portable CUDA and CPU grouped fallbacks are Fastllm code.
+
+2026-11-07 single-token BF16 specialization (Fastllm local changes):
+- Enable the existing single-row scratch/accumulator specialization for CUDA.
+- Specialize mul1 jobs with BF16 input and output at compile time, removing
+  unused F32/F16/q8 input paths from those kernels. Other jobs keep the generic
+  I/O path; multi-row jobs and the input-split planner are unchanged.
+- Preserve FP32 accumulation, split reduction order, BF16 output rounding,
+  all supported CUDA architectures.
+No new upstream code is imported by this optimization. The import revision,
+upstream hashes and both MIT license files above remain unchanged.

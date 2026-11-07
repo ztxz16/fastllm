@@ -608,7 +608,7 @@ struct KBatch {
 // a launch's blocks: its jobs' (output block, input split) pairs, each for all of the job's nc activations at once
 // (block_gemv).  S > 1: the partial sums go to the scratch and the last block of an output block adds them up in split
 // order (deterministic) and runs the epilogue
-template <int K2, int cb, bool Single = false>
+template <int K2, int cb, bool Single = false, bool NativeBfloat = false>
 __global__ void EXL3_BOUNDS(kMinBlocksMv<K2>) mv_kernel(const KBatch b) {
     __shared__ __align__(16) BlockSmem<K2, Single ? 1 : kTok> sm;
     __shared__ int last;
@@ -625,7 +625,8 @@ __global__ void EXL3_BOUNDS(kMinBlocksMv<K2>) mv_kernel(const KBatch b) {
     if (b.skip != nullptr && *b.skip) return;
     Xin x;
     if (warp < nc) {
-        if (J.x16 != nullptr) { x.h = J.x16 + warp * J.xf_cs; x.bf16 = J.x_bf16; }
+        if constexpr (NativeBfloat) {x.h = J.x16 + warp * J.xf_cs; x.bf16 = true;}
+        else if (J.x16 != nullptr) { x.h = J.x16 + warp * J.xf_cs; x.bf16 = J.x_bf16; }
         else if (J.xf != nullptr) x.f = J.xf + warp * J.xf_cs;
         else x.q = (const Q81*) ((const uint8_t*) J.xq + warp * J.xq_cs);
     }
@@ -633,8 +634,8 @@ __global__ void EXL3_BOUNDS(kMinBlocksMv<K2>) mv_kernel(const KBatch b) {
     const float* bias = J.bias != nullptr ? J.bias + g * kCols : nullptr;
     if (J.S == 1) {
         if (warp < nc)
-            epilogue(sm.out + warp * kCols, J.svh + g * kCols, J.alpha, bias, J.y != nullptr ? J.y + warp * J.y_cs + g * kCols : nullptr,
-                     J.y16 != nullptr ? J.y16 + warp * J.y_cs + g * kCols : nullptr, J.y_bf16);
+            epilogue(sm.out + warp * kCols, J.svh + g * kCols, J.alpha, bias, !NativeBfloat && J.y != nullptr ? J.y + warp * J.y_cs + g * kCols : nullptr,
+                     J.y16 != nullptr ? J.y16 + warp * J.y_cs + g * kCols : nullptr, NativeBfloat || J.y_bf16);
         return;
     }
     if (threadIdx.x < kCols)
@@ -658,8 +659,8 @@ __global__ void EXL3_BOUNDS(kMinBlocksMv<K2>) mv_kernel(const KBatch b) {
         }
     __syncthreads();
     if (warp < nc)
-        epilogue(sm.out + warp * kCols, J.svh + g * kCols, J.alpha, bias, J.y != nullptr ? J.y + warp * J.y_cs + g * kCols : nullptr,
-                     J.y16 != nullptr ? J.y16 + warp * J.y_cs + g * kCols : nullptr, J.y_bf16);
+        epilogue(sm.out + warp * kCols, J.svh + g * kCols, J.alpha, bias, !NativeBfloat && J.y != nullptr ? J.y + warp * J.y_cs + g * kCols : nullptr,
+                     J.y16 != nullptr ? J.y16 + warp * J.y_cs + g * kCols : nullptr, NativeBfloat || J.y_bf16);
     if (threadIdx.x == 0) J.cnt[g] = 0u;
 }
 
@@ -2423,14 +2424,20 @@ bool dispatch(int K2, int cb, A&&... args) {
 
 template <int K2, int cb> struct RunMv {
     static void run(const KBatch& b, int blocks, cudaStream_t s) {
-#if defined(STRATA_USE_HIP)
-        // A one-row batch needs only one row of accumulators/scratch. Keep the input-split planner
-        // and reduction order unchanged; a mixed/multi-row batch always uses the generic kernel.
-        // Enabled by default on HIP.
+
+        // Fastllm: specialize single-row batches on CUDA as well as HIP.
+        // Keep the input-split planner and reduction order unchanged. Native
+        // BF16 jobs also resolve their I/O types at compile time. Mixed or
+        // multi-row batches retain the generic kernel.
         bool single = true;
         for (int i = 0; i < b.n && single; ++i) single = b.j[i].nc == 1;
+        if constexpr (cb == 2) {
+            bool native = single;
+            for (int i=0; i<b.n && native; ++i) native=b.j[i].x16 && b.j[i].y16 && b.j[i].x_bf16 && b.j[i].y_bf16;
+            if (native) {mv_kernel<K2,cb,true,true><<<blocks,kThreads,0,s>>>(b);return;}
+        }
         if (single) { mv_kernel<K2, cb, true><<<blocks, kThreads, 0, s>>>(b); return; }
-#endif
+
         mv_kernel<K2, cb><<<blocks, kThreads, 0, s>>>(b);
     }
 };
