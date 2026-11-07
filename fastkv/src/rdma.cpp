@@ -3,6 +3,11 @@
 #include <cstring>
 #include <fstream>
 #include <set>
+#include <cstdlib>
+#include <deque>
+#ifdef FASTKV_CUDA
+#include <cuda_runtime_api.h>
+#endif
 #ifdef FASTKV_RDMA
 #include <infiniband/verbs.h>
 #endif
@@ -58,7 +63,21 @@ struct Endpoint {
     uint32_t qpn = 0, psn = 0, lid = 0, mtu = 0;
     ibv_gid gid{};
 };
+std::string PciPath(const std::string &path) {
+    char *resolved = realpath(path.c_str(), nullptr);
+    if (!resolved) return {};
+    std::string result(resolved);
+    free(resolved);
+    return result;
+}
+size_t CommonPath(const std::string &a, const std::string &b) {
+    size_t last = 0;
+    for (size_t i = 0; i < std::min(a.size(), b.size()) && a[i] == b[i]; ++i)
+        if (a[i] == '/') last = i;
+    return last;
+}
 struct Rail {
+    std::string pciPath;
     std::shared_ptr<Device> device;
     ibv_cq *cq = nullptr;
     ibv_qp *qp = nullptr;
@@ -129,6 +148,7 @@ std::unique_ptr<Rail> CreateRail(const std::string &name, const Options &o) {
             break;
         }
     Require(bool(rail->device), "FastKV: RDMA device unavailable");
+    rail->pciPath = PciPath("/sys/class/infiniband/" + selected + "/device");
     ibv_port_attr port{};
     Require(!ibv_query_port(rail->device->context, o.rdmaPort, &port) && port.state == IBV_PORT_ACTIVE,
             "FastKV: RDMA port is not active");
@@ -219,12 +239,45 @@ class Connection final : public RdmaConnection {
   public:
     std::vector<std::unique_ptr<Rail>> rails;
     std::vector<Buffer> held;
+    mutable std::map<int, std::vector<size_t>> deviceRails;
+    const std::vector<size_t> &SendRails(const Buffer &buffer) const {
+        const int device = buffer.Kind() == MemoryKind::Cuda ? buffer.Device() : -1;
+        auto found = deviceRails.find(device);
+        if (found != deviceRails.end()) return found->second;
+        std::vector<size_t> selected;
+        std::string path;
+#ifdef FASTKV_CUDA
+        char address[32]{};
+        if (device >= 0 && cudaDeviceGetPCIBusId(address, sizeof(address), device) == cudaSuccess) {
+            for (char &c : address) if (c >= 'A' && c <= 'F') c += 'a' - 'A';
+            path = PciPath(std::string("/sys/bus/pci/devices/") + address);
+        }
+#endif
+        size_t best = 0;
+        for (size_t i = 0; i < rails.size(); ++i) {
+            size_t locality = path.empty() ? 0 : CommonPath(path, rails[i]->pciPath);
+            if (locality > best) { selected.clear(); best = locality; }
+            if (locality == best) selected.push_back(i);
+        }
+        // Host transfers stripe over all rails. Unknown GPU topology does too.
+        return deviceRails.emplace(device, std::move(selected)).first->second;
+    }
     ~Connection() override {
         // Destroy every QP before releasing any receive allocation. On error,
         // posted writes must not outlive the MR or touch a recycled slot.
         for (auto &r : rails)
             r->Close();
         held.clear();
+    }
+    void Complete() override {
+        for (auto &rail : rails) Require(!rail->outstanding, "FastKV: incomplete RDMA operation");
+        held.clear();
+    }
+    bool Registered(const Buffer &buffer) const override {
+        if (!buffer.Size()) return true;
+        for (auto index : SendRails(buffer))
+            if (!buffer.HasAttachment("verbs:" + std::to_string(rails[index]->device->id))) return false;
+        return true;
     }
     void Send(const Socket &socket, const std::vector<Buffer> &buffers, Deadline deadline) override {
         held.insert(held.end(), buffers.begin(), buffers.end());
@@ -248,36 +301,47 @@ class Connection final : public RdmaConnection {
         }
         reader.End();
         uint64_t total = 0, sequence = 0;
-        for (size_t b = 0; b < buffers.size(); ++b) {
-            if (!buffers[b].Size())
-                continue;
+        struct Pending {
+            size_t buffer, offset = 0;
             std::vector<std::shared_ptr<Registration>> regs;
-            for (auto &r : rails)
-                regs.push_back(r->Register(buffers[b]));
-            for (size_t offset = 0; offset < buffers[b].Size();) {
-                size_t index = sequence++ % rails.size();
-                auto &rail = *rails[index];
-                if (rail.outstanding >= 32)
-                    rail.Poll(socket, deadline, false);
-                uint32_t n = uint32_t(std::min(size_t(1 << 20), buffers[b].Size() - offset));
-                ibv_sge sge{};
-                sge.addr = uint64_t(reinterpret_cast<uintptr_t>(buffers[b].Data())) + offset;
-                sge.length = n;
-                sge.lkey = regs[index]->mr->lkey;
-                ibv_send_wr wr{}, *bad = nullptr;
-                wr.wr_id = rail.nextId++;
-                wr.sg_list = &sge;
-                wr.num_sge = 1;
-                wr.opcode = IBV_WR_RDMA_WRITE;
-                wr.send_flags = IBV_SEND_SIGNALED;
-                Require(offset <= UINT64_MAX - remote[b].address, "FastKV: remote address overflow");
-                wr.wr.rdma.remote_addr = remote[b].address + offset;
-                wr.wr.rdma.rkey = remote[b].keys[index];
-                Require(!ibv_post_send(rail.qp, &wr, &bad), "FastKV: ibv_post_send failed");
-                ++rail.outstanding;
-                offset += n;
-                total += n;
-            }
+        };
+        std::deque<Pending> pending;
+        for (size_t b = 0; b < buffers.size(); ++b) {
+            if (!buffers[b].Size()) continue;
+            Pending work{b, 0, std::vector<std::shared_ptr<Registration>>(rails.size())};
+            for (size_t index : SendRails(buffers[b]))
+                work.regs[index] = rails[index]->Register(buffers[b]);
+            pending.push_back(std::move(work));
+        }
+        // Interleave payloads so a large tensor on one GPU cannot prevent
+        // other GPUs and their local NICs from issuing DMA concurrently.
+        while (!pending.empty()) {
+            auto work = std::move(pending.front());
+            pending.pop_front();
+            const size_t b = work.buffer, offset = work.offset;
+            const auto &selected = SendRails(buffers[b]);
+            size_t index = selected[sequence++ % selected.size()];
+            auto &rail = *rails[index];
+            if (rail.outstanding >= 32) rail.Poll(socket, deadline, false);
+            uint32_t n = uint32_t(std::min(size_t(1 << 20), buffers[b].Size() - offset));
+            ibv_sge sge{};
+            sge.addr = uint64_t(reinterpret_cast<uintptr_t>(buffers[b].Data())) + offset;
+            sge.length = n;
+            sge.lkey = work.regs[index]->mr->lkey;
+            ibv_send_wr wr{}, *bad = nullptr;
+            wr.wr_id = rail.nextId++;
+            wr.sg_list = &sge;
+            wr.num_sge = 1;
+            wr.opcode = IBV_WR_RDMA_WRITE;
+            wr.send_flags = IBV_SEND_SIGNALED;
+            Require(offset <= UINT64_MAX - remote[b].address, "FastKV: remote address overflow");
+            wr.wr.rdma.remote_addr = remote[b].address + offset;
+            wr.wr.rdma.rkey = remote[b].keys[index];
+            Require(!ibv_post_send(rail.qp, &wr, &bad), "FastKV: ibv_post_send failed");
+            ++rail.outstanding;
+            work.offset += n;
+            total += n;
+            if (work.offset < buffers[b].Size()) pending.push_back(std::move(work));
         }
         for (auto &rail : rails)
             rail->Poll(socket, deadline, true);

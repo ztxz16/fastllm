@@ -7,6 +7,10 @@
 #endif
 
 namespace fastkv {
+namespace { std::atomic<uint64_t> deviceToHostBytes{0}, hostToDeviceBytes{0}; }
+Buffer::CopyTraffic Buffer::Traffic() {
+    return {deviceToHostBytes.load(std::memory_order_relaxed), hostToDeviceBytes.load(std::memory_order_relaxed)};
+}
 void Require(bool ok, const char *message) {
     if (!ok)
         throw std::runtime_error(message);
@@ -191,6 +195,7 @@ void Buffer::Read(void *host, size_t at, size_t n) const {
 #ifdef FASTKV_CUDA
     DeviceScope scope(Device());
     CudaCheck(cudaMemcpy(host, b.Data(), n, cudaMemcpyDeviceToHost));
+    deviceToHostBytes.fetch_add(n, std::memory_order_relaxed);
 #else
     throw std::runtime_error("FastKV: CUDA unavailable");
 #endif
@@ -207,6 +212,7 @@ void Buffer::Write(const void *host, size_t at, size_t n) const {
     DeviceScope scope(Device());
     CudaCheck(cudaMemcpy(b.MutableData(), host, n, cudaMemcpyHostToDevice));
     CudaCheck(cudaStreamSynchronize(nullptr));
+    hostToDeviceBytes.fetch_add(n, std::memory_order_relaxed);
 #else
     throw std::runtime_error("FastKV: CUDA unavailable");
 #endif
@@ -242,16 +248,26 @@ void Buffer::MakeRemoteWritesVisible() const {
         int ordering = 0, flush = 0;
         CudaCheck(cudaDeviceGetAttribute(&ordering, cudaDevAttrGPUDirectRDMAWritesOrdering, Device()));
         CudaCheck(cudaDeviceGetAttribute(&flush, cudaDevAttrGPUDirectRDMAFlushWritesOptions, Device()));
-        if (ordering < cudaGPUDirectRDMAWritesOrderingAllDevices &&
-            (flush & cudaFlushGPUDirectRDMAWritesOptionHost))
+        // The transport has already observed remote completion. Consumers are
+        // submitted only after this visibility fence returns; unrelated kernels
+        // on other allocations need not finish first.
+        if (ordering >= cudaGPUDirectRDMAWritesOrderingAllDevices) return;
+        if (flush & cudaFlushGPUDirectRDMAWritesOptionHost) {
             CudaCheck(cudaDeviceFlushGPUDirectRDMAWrites(cudaFlushGPUDirectRDMAWritesTargetCurrentDevice,
-                                                         cudaFlushGPUDirectRDMAWritesToAllDevices));
+                                                       cudaFlushGPUDirectRDMAWritesToAllDevices));
+            return;
+        }
 #endif
-        // This submission follows the transport completion notification. No
-        // consumer is allowed to run concurrently with the remote writes.
+        // Compatibility path for devices/runtimes without an explicit flush.
         CudaCheck(cudaDeviceSynchronize());
     }
 #endif
+}
+bool Buffer::HasAttachment(const std::string &key) const {
+    if (!storage) return false;
+    std::lock_guard<std::mutex> lock(storage->mutex);
+    auto it = storage->attachments.find(key);
+    return it != storage->attachments.end() && bool(it->second);
 }
 std::shared_ptr<void>
 Buffer::Attachment(const std::string &key,
@@ -335,7 +351,8 @@ std::shared_ptr<void> Budget::Reserve(size_t n) {
     auto lease = std::make_shared<Reservation>();
     {
         std::lock_guard<std::mutex> lock(state->mutex);
-        Require(n <= state->capacity - state->used, "FastKV: receiver byte budget exhausted");
+        Require(n <= state->capacity, "FastKV: payload exceeds byte budget");
+        if (n > state->capacity - state->used) throw CapacityBusy("FastKV: receiver byte budget exhausted");
         state->used += n;
         lease->state = state;
         lease->bytes = n;

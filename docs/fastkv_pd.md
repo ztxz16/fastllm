@@ -101,7 +101,7 @@ Naive 部署使用 [Naive 模板](../example/pd/naive_n05.json)，两端保持�
 
 当前部署路径支持文本请求。多模态 PD 需要继续补充媒体身份与状态 adapter，目前明确拒绝，不能通过仅传 token 冒充多模态交接。DeepSeek 可开启 DSpark 5。当前只有单请求路径执行草稿和验证；多请求批次先排出已接受 token，随后使用普通 target decode，丢弃不能继续使用的草稿状态。请求回到单请求路径后从当前 target 边界重建草稿窗口。P 的中间 prefill 不生成候选；P/D 的 DSpark 开关需要保持一致。Naive 的 draft TP 暂不支持，使用 `--dspark 0`。
 
-当前模型导入使用主存 staging 后由 GPU 拥有者恢复；传输组件具备 GPUDirect buffer 能力，但这不等于模型适配已实现全程 GPU 零拷贝。小 buffer 已合并到有界 arena 中，减少 RDMA 注册次数。连接复用、分层传输与计算重叠属于后续性能工作。
+当前模型导入使用主存 staging；传输组件的 BufferPool 已复用内存、MR、socket 和 QP，但模型适配尚未实现全程 GPU 传输。小 buffer 合并到有界 arena 中。连接复用不等于模型页池直传。
 
 新增模型需要实现 `PDLayout`、`ExportPDState`、`ImportPDState`，并覆盖全量交接、前缀续接、页边界、并发、取消和错误布局测试。逻辑分片规划独立于通信后端；未来多机 wide-EP 的进程组与 collective 属于计算层，需要单独接入，不能仅靠增加 router 的 D 节点来替代。
 

@@ -22,7 +22,9 @@ cmake --build build-fastkv -j
 
 嵌入其他 CMake 项目时，可以使用 `add_subdirectory(fastkv)`，然后链接 `fastkv` target。公共头文件为 `fastkv/fastkv.h`。
 
-诊断工具在计时窗口后校验每一个返回的 payload 字节，覆盖往返两个方向。`seconds` 包含连接、内存分配、注册和往返传输；`wall_seconds` 还包含客户端校验。`aggregate_GBps` 是双向累计字节除以前者，不是单向链路峰值带宽；并发下的 `amortized_call_ms` 是摊销耗时，不是单请求延迟。
+诊断工具在每批计时窗口后校验每一个返回的 payload 字节。`seconds` 包含计时批次的连接、分配、注册和传输；`wall_seconds` 还包含预热和客户端校验。`--warmup N` 可在计时前预热 N 次调用；不指定时包含冷启动。校验期间暂停打流，因此这里测的是传输批次带宽，不是包含校验的持续业务吞吐。并发下的 `amortized_call_ms` 是摊销耗时，不是单请求延迟。
+
+`call` 回显 payload，`aggregate_GBps` 统计双向累计字节；`read` 仅发送元数据、单向读取服务端准备好的 payload，适合测量 PD 状态拉取。两端 `read` 的 `--bytes/--buffers/--seed` 必须一致。每次读取创建新的源 buffer 身份，模拟独立状态快照；源数据的准备不计入传输时间。`connections/reused_connections` 分别记录新建和复用连接次数；字节和调用计数包含预热，带宽分子仅包含计时批次。
 
 ```bash
 # 接收端
@@ -59,6 +61,7 @@ flowchart LR
 | `Buffer` | Host/CUDA 内存、切片、只读视图，以及 allocation lease。地址复用不会复用 allocation ID。 |
 | `Message` | 有界元数据和独立 buffer 列表，不含远端指针或本地分配器对象。 |
 | `Service` | 同步 `Call/Start`、异步 `Submit/StartAsync`、有界工作队列、超时、停止和统计。 |
+| `BufferPool` | 有界 Host/CUDA arena 和注册复用；支持每设备物理容量、lease 释放通知与关闭。 |
 | `Budget` | RAII 字节或槽位额度；最后一个 lease 释放后归还额度。 |
 | `PlanCopies` | 同一逻辑表示下的多维分片交集，支持源副本去重，拒绝覆盖缺口和歧义。 |
 | `ObjectStore` | 完整对象的不可变发布、LRU 淘汰、读取 lease；被读取的对象不会提前释放。 |
@@ -72,7 +75,13 @@ flowchart LR
 
 调用者负责在借用 GPU buffer 前完成生产者的写入，并提供真实的生命周期 owner。`Read`、`Write`、`CopyFrom` 是同步接口。网络接收使用私有 staging；传输完成且可见后才交付给调用者。向模型的提交和 GPU graph 的执行由模型拥有者负责。
 
-RDMA 使用 RC QP 和多 NIC 分条传输。注册缓存挂在 allocation lease 上；QP/CQ 先销毁，随后释放在途 buffer 和 MR。协议先交换长度并预留接收额度，再传 payload，最后确认完成。请求失败不会将部分 buffer 发布为可用状态。
+RDMA 使用 RC QP。Host 数据跨配置的 NIC 分条发送；GPU 数据优先使用 PCIe 路径最近的 NIC，拓扑不可见时使用全部配置的 NIC。不同 buffer 按块交错投递，避免一个 GPU 的大 tensor 阻塞其他 GPU/NIC。注册缓存挂在 allocation lease 上；QP/CQ 先销毁，随后释放在途 buffer 和 MR。协议先交换长度并预留接收额度，再传 payload，最后确认完成。请求失败不会将部分 buffer 发布为可用状态。
+
+协议 v2 在完整请求/回复结束后复用 socket 和 QP，同一连接上的 RPC 串行，不交错消息。空闲服务端连接不占用传输 worker。仍可与 v1 对端逐请求连接；仅在尚未发送应用请求的握手阶段尝试旧版协议。传输错误关闭连接，不重放请求。
+
+`Options.receivePlacement(metadata, sizes)` 可将每个接收 buffer 映射到本地设备；空结果使用 `receiveDevice`，错误长度或设备映射会被拒绝。回调只解析元数据，不操作模型页表。`deviceBufferBytes` 约束每张设备的物理池容量，计入空闲 arena。
+
+接收 staging 按尺寸类别复用内存和 MR；切片及只读视图共享本次使用的 lease，最后一个视图释放后才能归还池。空闲内存不持有在途字节额度。GPU 新快照可复制到注册池，避免反复注册 GPU 内存；已注册或来自公共 `BufferPool` 的 GPU buffer 以及 Host buffer 直接发送。发送池容量为 `min(maxInflightBytes, workers × 512 MiB)`，容量不足时直接注册原始发送 buffer，传输语义不变。池不会预先分配全部容量；存活的接收 buffer 在 Service 关闭后仍有效。
 
 `rdma` 模式不可静默降级。`auto` 允许握手双方协商 TCP/RDMA，但不会在传输中途重放失败的操作。TCP 同时支持 Host 和 CUDA buffer，CUDA 当前经主存分块搬运。RDMA GPU 内存需要驱动提供可用的 peer-memory/GPUDirect 支持；它不是单纯安装 libibverbs 就能保证的能力。
 
@@ -90,7 +99,7 @@ RDMA 使用 RC QP 和多 NIC 分条传输。注册缓存挂在 allocation lease 
 4. 模型 adapter 校验 checkpoint、布局和状态边界，再由拥有者线程恢复本地状态。该阶段属于调用者，不由网络工作池执行 GPU 图或修改请求页表。
 5. 缓存发布复制为不可变内容。读取 lease 保证淘汰或缓存析构不会让仍在使用的数据失效；最后一个 owner 释放后归还预算和内存。
 
-`maxPayloadBytes` 限制单条消息，`maxInflightBytes` 限制接收 staging，`workers/queueDepth` 限制各传输池的执行与等待队列。服务端额外使用 `maxActiveRequests` 限制已经调用 handler、但尚未完成回复的请求数（0 表示使用 `workers`），与线程数解耦。handler future、已完成但待发送的结果都继续持有此额度；服务端超时会关闭网络，但未完成生产者仍保留准入额度，直到其 future 完成或 Service 关闭，防止超时后无限堆积后台计算。端到端 deadline 从 Submit/accept 开始，包含排队。缓存字节预算只覆盖所核算的缓存状态和数据块，并不代表进程 RSS 上限；索引容器开销、发布时的临时副本、活动命中的连续重建副本和模型 KV 都需要额外预算。网络队列满或接收额度不足会返回错误，模型层应在发起请求前做自己的准入控制。
+`maxPayloadBytes` 限制单条消息，`maxInflightBytes` 同时限制在途接收字节及接收池的驻留内存；池容量按 4 KiB（小于 1 MiB）或 2 MiB 类别取整，边界处可能先达到驻留上限。`workers/queueDepth` 限制各传输池的执行与等待队列。服务端额外使用 `maxActiveRequests` 限制已经调用 handler、但尚未完成回复的请求数（0 表示使用 `workers`），与线程数解耦。handler future、已完成但待发送的结果都继续持有此额度；服务端超时会关闭网络，但未完成生产者仍保留准入额度，直到其 future 完成或 Service 关闭，防止超时后无限堆积后台计算。端到端 deadline 从 Submit/accept 开始，包含排队。缓存字节预算只覆盖所核算的缓存状态和数据块，并不代表进程 RSS 上限；索引容器开销、发布时的临时副本、活动命中的连续重建副本和模型 KV 都需要额外预算。网络队列满会返回错误；接收额度或设备池暂时不足时在 deadline 内等待释放，停止服务会唤醒等待者。单条消息超过配置容量直接拒绝，不自动切换内存类型。模型层仍应在发起请求前做自己的准入控制。
 
 独立组件通过 `Options` 和构造参数配置，不引入运行时调试环境变量。可复用的 `fastkv_probe` 是显式运行的诊断程序，不随模型服务启动。
 

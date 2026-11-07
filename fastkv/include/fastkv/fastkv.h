@@ -54,6 +54,8 @@ enum class Transport : uint32_t { Tcp = 0, Rdma = 1, Auto = 2 };
 // never repeat within a process, even when a device address is recycled.
 class Buffer {
   public:
+    struct CopyTraffic { uint64_t deviceToHost = 0, hostToDevice = 0; };
+    static CopyTraffic Traffic();
     struct Storage;
     Buffer() = default;
     static Buffer Allocate(size_t bytes, int cudaDevice = -1);
@@ -66,19 +68,42 @@ class Buffer {
     MemoryKind Kind() const;
     int Device() const;
     uint64_t Id() const;
+    bool PoolBacked() const { return bool(lease); }
     size_t Offset() const { return offset; }
     void Read(void *host, size_t at, size_t bytes) const;
     void Write(const void *host, size_t at, size_t bytes) const;
     void CopyFrom(const Buffer &source, size_t sourceOffset, size_t targetOffset, size_t bytes) const;
     void MakeRemoteWritesVisible() const;
+    bool HasAttachment(const std::string &key) const;
     std::shared_ptr<void>
     Attachment(const std::string &key,
                const std::function<std::shared_ptr<void>(void *, size_t)> &create) const;
 
   private:
+    friend class BufferPool;
     std::shared_ptr<Storage> storage;
+    std::shared_ptr<void> lease;
     size_t offset = 0, length = 0;
     bool readOnly = false;
+};
+
+// A lease, including every slice, pins an arena until it is safe to reuse.
+// Allocation registrations remain attached while the arena is cached.
+class CapacityBusy : public std::runtime_error {
+  public: explicit CapacityBusy(const char *message) : std::runtime_error(message) {}
+};
+class BufferPool {
+  public:
+    explicit BufferPool(size_t limit, std::map<int, size_t> deviceLimits = {});
+    ~BufferPool();
+    Buffer Acquire(size_t bytes, int device, std::shared_ptr<void> credit = {});
+    void Clear();
+    size_t Limit(int device) const;
+    void CheckCapacity(const std::vector<std::pair<int, size_t>> &allocations) const;
+    void WaitForRelease();
+  private:
+    struct State;
+    std::shared_ptr<State> state;
 };
 
 struct Message {
@@ -97,6 +122,13 @@ struct Options {
     int rdmaPort = 1;
     int gidIndex = -1;      // discover an IPv4 RoCE-v2 GID, or use an explicit index
     int receiveDevice = -1; // -1: host; otherwise receive into this CUDA device
+    // Receiver-owned placement, resolved from bounded logical metadata. The
+    // callback never allocates or mutates live model state; an empty result
+    // uses receiveDevice. One destination per nonempty wire buffer.
+    std::function<std::vector<int>(const Bytes &, const std::vector<size_t> &)> receivePlacement;
+    // Physical pool bounds, including idle registered buffers. Omitted devices
+    // use maxInflightBytes. Model integration derives these from free memory.
+    std::map<int, size_t> deviceBufferBytes;
     size_t maxPayloadBytes = size_t(4) << 30;
     size_t maxInflightBytes = size_t(8) << 30;
     size_t maxMetadataBytes = 64 << 20;
@@ -113,6 +145,7 @@ struct Options {
 
 struct Metrics {
     uint64_t tcpBytes = 0, rdmaBytes = 0, calls = 0, failures = 0;
+    uint64_t connections = 0, reusedConnections = 0;
 };
 
 // A service is embedded in an owning process. Transfer workers do not wait

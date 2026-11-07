@@ -12,7 +12,7 @@
 #include <unistd.h>
 
 namespace fastkv {
-static constexpr uint32_t Magic = 0x314b5646, Version = 1;
+static constexpr uint32_t Magic = 0x314b5646, Version = 2;
 static constexpr size_t Chunk = 1 << 20;
 static std::runtime_error SystemError(const char *s) {
     return std::runtime_error(std::string("FastKV ") + s + ": " + std::strerror(errno));
@@ -186,13 +186,17 @@ static std::string BoundAddress(const Socket &s) {
     return addr.ss_family == AF_INET6 ? "[" + std::string(host) + "]:" + port
                                       : std::string(host) + ":" + port;
 }
+struct LegacyHandshake : std::runtime_error { using std::runtime_error::runtime_error; };
 static std::unique_ptr<RdmaConnection> Handshake(const Socket &s, const Options &o, bool server,
-                                                 Deadline d) {
+                                                 Deadline d, bool &reusable, bool legacy = false) {
     Transport chosen = Transport::Tcp;
     if (server) {
         auto b = s.ReceiveFrame(64, d);
         Reader r(b);
-        Require(r.U32() == Magic && r.U32() == Version, "FastKV: incompatible protocol");
+        Require(r.U32() == Magic, "FastKV: incompatible protocol");
+        const auto version = r.U32();
+        Require(version == 1 || version == Version, "FastKV: incompatible protocol");
+        reusable = version == Version;
         uint32_t mode = r.U32();
         r.End();
         Require(mode <= uint32_t(Transport::Auto), "FastKV: unknown transport");
@@ -200,7 +204,7 @@ static std::unique_ptr<RdmaConnection> Handshake(const Socket &s, const Options 
         chosen = (mode != uint32_t(Transport::Tcp) && available) ? Transport::Rdma : Transport::Tcp;
         Writer reply;
         reply.U32(Magic);
-        reply.U32(Version);
+        reply.U32(version);
         bool compatible = (mode != uint32_t(Transport::Rdma) || available) &&
                           (o.transport != Transport::Rdma || mode != uint32_t(Transport::Tcp));
         reply.U32(compatible ? uint32_t(chosen) : UINT32_MAX);
@@ -209,14 +213,22 @@ static std::unique_ptr<RdmaConnection> Handshake(const Socket &s, const Options 
     } else {
         Writer hello;
         hello.U32(Magic);
-        hello.U32(Version);
+        hello.U32(legacy ? 1 : Version);
         const auto offered =
             o.transport == Transport::Auto && !RdmaAvailable() ? Transport::Tcp : o.transport;
         hello.U32(uint32_t(offered));
         s.SendFrame(hello.bytes, d);
-        auto b = s.ReceiveFrame(64, d);
+        Bytes b;
+        try { b = s.ReceiveFrame(64, d); }
+        catch (const std::exception &e) {
+            if (!legacy) throw LegacyHandshake(e.what());
+            throw;
+        }
         Reader r(b);
-        Require(r.U32() == Magic && r.U32() == Version, "FastKV: incompatible protocol");
+        Require(r.U32() == Magic, "FastKV: incompatible protocol");
+        const auto version = r.U32();
+        Require(version == 1 || version == Version, "FastKV: incompatible protocol");
+        reusable = version == Version;
         uint32_t mode = r.U32();
         r.End();
         Require(mode <= uint32_t(Transport::Rdma), "FastKV: peer rejected transport");
@@ -230,6 +242,8 @@ static std::unique_ptr<RdmaConnection> Handshake(const Socket &s, const Options 
 struct Service::Impl {
     Options options;
     Budget budget, clientSlots, serverSlots, handlerSlots;
+    BufferPool receiveBuffers, sendBuffers;
+    std::mutex receiveAllocationMutex;
     // Separate request and reply lanes: a new request handshake must never
     // wait behind a reply whose receiver is occupied sending that request.
     Pool servers, clients, sendReplies, receiveReplies;
@@ -237,11 +251,25 @@ struct Service::Impl {
     AsyncHandler handler;
     std::thread acceptor, progress;
     std::condition_variable wake;
-    enum class Stage { Connect, ReceiveRequest, Admit, Handler, Reply, Drain };
-    struct Exchange {
+    enum class Stage { Connect, ReceiveRequest, IdleRequest, Admit, Handler, Reply, Drain };
+    struct Channel {
         Impl &owner;
         Socket socket;
         std::unique_ptr<RdmaConnection> rdma;
+        std::shared_ptr<void> serverSlot;
+        bool ready = false, reusable = false, tracked = false;
+        explicit Channel(Impl &owner) : owner(owner) {}
+        ~Channel() {
+            if (tracked) {
+                std::lock_guard<std::mutex> lock(owner.mutex);
+                owner.sockets.erase(socket.fd);
+            }
+            // On failure, QP teardown precedes every buffer/credit release.
+            rdma.reset();
+        }
+    };
+    struct Exchange {
+        std::shared_ptr<Channel> channel;
         std::shared_ptr<void> slot, handlerSlot;
         Message request;
         std::future<Message> result;
@@ -249,30 +277,27 @@ struct Service::Impl {
         std::string peer;
         Deadline deadline;
         Stage stage;
-        bool server, tracked = false;
-        Exchange(Impl &owner, bool server, std::shared_ptr<void> slot)
-            : owner(owner), slot(std::move(slot)),
+        bool server;
+        Exchange(Impl &owner, bool server, std::shared_ptr<void> slot = {})
+            : slot(std::move(slot)),
               deadline(std::chrono::steady_clock::now() + std::chrono::milliseconds(owner.options.timeoutMs)),
               stage(server ? Stage::ReceiveRequest : Stage::Connect), server(server) {}
-        ~Exchange() {
-            if (tracked) {
-                std::lock_guard<std::mutex> lock(owner.mutex);
-                owner.sockets.erase(socket.fd);
-            }
-            // QP teardown must precede every buffer/credit release.
-            rdma.reset();
-        }
     };
+    std::multimap<std::string, std::shared_ptr<Channel>> idleClients;
+    std::set<std::string> legacyPeers;
     std::vector<std::shared_ptr<Exchange>> pending;
     mutable std::mutex mutex;
     std::set<int> sockets;
     std::atomic<bool> stopped{false};
     std::atomic<uint64_t> tcpBytes{0}, rdmaBytes{0}, calls{0}, failures{0};
+    std::atomic<uint64_t> connections{0}, reusedConnections{0};
     explicit Impl(Options o)
         : options(std::move(o)), budget(options.maxInflightBytes),
           clientSlots(size_t(options.queueDepth) + options.workers),
           serverSlots(size_t(options.queueDepth) + ActiveLimit(options)),
           handlerSlots(ActiveLimit(options)),
+          receiveBuffers(options.maxInflightBytes, options.deviceBufferBytes),
+          sendBuffers(std::min(options.maxInflightBytes, size_t(options.workers) * (size_t(512) << 20))),
           servers(options.workers, options.queueDepth), clients(options.workers, options.queueDepth),
           sendReplies(options.workers, options.queueDepth), receiveReplies(options.workers, options.queueDepth) {
         Require(options.timeoutMs > 0 && options.maxPayloadBytes && options.maxMetadataBytes &&
@@ -284,7 +309,7 @@ struct Service::Impl {
     static int ActiveLimit(const Options &o) {
         return o.maxActiveRequests > 0 ? o.maxActiveRequests : o.workers;
     }
-    void Track(const std::shared_ptr<Exchange> &c) {
+    void Track(const std::shared_ptr<Channel> &c) {
         std::lock_guard<std::mutex> lock(mutex);
         Require(!stopped, "FastKV: service stopped");
         sockets.insert(c->socket.fd);
@@ -299,6 +324,36 @@ struct Service::Impl {
     void Fail(const std::shared_ptr<Exchange> &c, std::exception_ptr error) {
         ++failures;
         if (!c->server) c->completion.set_exception(error);
+    }
+    // Host snapshots are already resident: copying them is slower than their
+    // registration. GPU snapshots benefit from reusing expensive GPU MRs.
+    std::vector<Buffer> PrepareSend(RdmaConnection &rdma, const std::vector<Buffer> &buffers) {
+        auto result = buffers;
+        for (size_t first = 0; first < buffers.size();) {
+            if (buffers[first].Kind() == MemoryKind::Host || buffers[first].PoolBacked() || rdma.Registered(buffers[first])) { ++first; continue; }
+            size_t end = first + 1, bytes = buffers[first].Size();
+            const int device = buffers[first].Device();
+            constexpr size_t arenaBytes = 64 << 20;
+            while (end < buffers.size() && bytes < arenaBytes && buffers[end].Size() <= arenaBytes - bytes &&
+                   buffers[end].Device() == device && !buffers[end].PoolBacked() && !rdma.Registered(buffers[end]))
+                bytes = CheckedAdd(bytes, buffers[end++].Size());
+            Buffer arena;
+            try { arena = sendBuffers.Acquire(bytes, device); }
+            catch (const std::runtime_error &) {
+                // Pool pressure changes performance, never delivery semantics.
+                // Register the caller-owned buffers directly in this case.
+                first = end;
+                continue;
+            }
+            size_t offset = 0;
+            for (size_t i = first; i < end; ++i) {
+                arena.CopyFrom(buffers[i], 0, offset, buffers[i].Size());
+                result[i] = arena.Slice(offset, buffers[i].Size());
+                offset += buffers[i].Size();
+            }
+            first = end;
+        }
+        return result;
     }
     void SendMessage(const Socket &s, RdmaConnection *rdma, const Message &message, Deadline deadline) {
         Require(message.metadata.size() <= options.maxMetadataBytes &&
@@ -322,7 +377,8 @@ struct Service::Impl {
             throw std::runtime_error("FastKV receiver: " + r.String());
         r.End();
         if (rdma) {
-            rdma->Send(s, message.buffers, deadline);
+            auto prepared = PrepareSend(*rdma, message.buffers);
+            rdma->Send(s, prepared, deadline);
             rdmaBytes += total;
         } else {
             std::vector<uint8_t> host;
@@ -344,6 +400,7 @@ struct Service::Impl {
         Reader done(committed);
         Require(done.U32() == Magic, "FastKV: payload not acknowledged");
         done.End();
+        if (rdma) rdma->Complete();
     }
     Message ReceiveMessage(const Socket &s, RdmaConnection *rdma, Deadline deadline) {
         auto b = s.ReceiveFrame(
@@ -369,23 +426,47 @@ struct Service::Impl {
         Writer ready;
         try {
             Require(total <= options.maxPayloadBytes, "FastKV: payload limit exceeded");
-            auto credit = budget.Reserve(total);
+            auto devices = options.receivePlacement ? options.receivePlacement(m.metadata, sizes)
+                                                    : std::vector<int>{};
+            if (devices.empty()) devices.assign(sizes.size(), options.receiveDevice);
+            Require(devices.size() == sizes.size(), "FastKV: invalid receive placement count");
+            for (int device : devices) Require(device >= -1, "FastKV: invalid receive device");
+            struct Arena { size_t begin, end, bytes; int device; };
+            std::vector<Arena> plan;
+            std::vector<std::pair<int, size_t>> allocations;
             for (size_t start = 0; start < sizes.size();) {
                 size_t end = start, bytes = 0;
                 constexpr size_t arenaBytes = 64 << 20;
                 while (end < sizes.size()) {
-                    if (end > start && (bytes >= arenaBytes || sizes[end] > arenaBytes - bytes))
-                        break;
+                    if (end > start && (devices[end] != devices[start] ||
+                                        bytes >= arenaBytes || sizes[end] > arenaBytes - bytes)) break;
                     bytes = CheckedAdd(bytes, sizes[end++]);
                 }
-                auto arena = Buffer::Allocate(bytes, options.receiveDevice);
-                arena.Attachment("receive-credit", [credit](void *, size_t) { return credit; });
-                size_t offset = 0;
-                for (size_t i = start; i < end; ++i) {
-                    m.buffers.push_back(arena.Slice(offset, sizes[i]));
-                    offset += sizes[i];
-                }
+                plan.push_back({start, end, bytes, devices[start]});
+                allocations.emplace_back(devices[start], bytes);
                 start = end;
+            }
+            receiveBuffers.CheckCapacity(allocations);
+            // Reserve a complete message, not competing partial messages. Only
+            // transfer workers wait here; the model can consume earlier replies.
+            std::unique_lock<std::mutex> allocationLock(receiveAllocationMutex);
+            for (;;) {
+                s.CheckRunning(deadline);
+                try {
+                    auto credit = budget.Reserve(total);
+                    for (const auto &part : plan) {
+                        auto arena = receiveBuffers.Acquire(part.bytes, part.device, credit);
+                        size_t offset = 0;
+                        for (size_t i = part.begin; i < part.end; ++i) {
+                            m.buffers.push_back(arena.Slice(offset, sizes[i]));
+                            offset += sizes[i];
+                        }
+                    }
+                    break;
+                } catch (const CapacityBusy &) {
+                    m.buffers.clear();
+                    receiveBuffers.WaitForRelease();
+                }
             }
             ready.U32(1);
         } catch (const std::exception &e) {
@@ -417,30 +498,80 @@ struct Service::Impl {
         Writer done;
         done.U32(Magic);
         s.SendFrame(done.bytes, deadline);
+        if (rdma) rdma->Complete();
         return m;
+    }
+    std::shared_ptr<Channel> TakeChannel(const std::string &peer) {
+        for (;;) {
+            std::shared_ptr<Channel> channel;
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                auto it = idleClients.find(peer);
+                if (it == idleClients.end()) return {};
+                channel = std::move(it->second);
+                idleClients.erase(it);
+            }
+            pollfd fd{channel->socket.fd, POLLIN, 0};
+            // An idle channel must have no unread bytes or disconnect event.
+            if (poll(&fd, 1, 0) == 0) return channel;
+        }
+    }
+    void RecycleServer(const std::shared_ptr<Exchange> &c) {
+        if (!c->channel->reusable) return;
+        auto next = std::make_shared<Exchange>(*this, true);
+        next->channel = c->channel;
+        next->stage = Stage::IdleRequest;
+        Park(next);
     }
     void BeginCall(const std::shared_ptr<Exchange> &c) {
         try {
-            c->socket = Open(c->peer, false, c->deadline, &stopped);
-            Track(c);
-            c->rdma = Handshake(c->socket, options, false, c->deadline);
-            SendMessage(c->socket, c->rdma.get(), c->request, c->deadline);
+            c->channel = TakeChannel(c->peer);
+            if (c->channel) ++reusedConnections;
+            else {
+                bool legacy;
+                { std::lock_guard<std::mutex> lock(mutex); legacy = legacyPeers.count(c->peer); }
+                auto connect = [&](bool oldProtocol) {
+                    c->channel = std::make_shared<Channel>(*this);
+                    c->channel->socket = Open(c->peer, false, c->deadline, &stopped);
+                    Track(c->channel);
+                    c->channel->rdma = Handshake(c->channel->socket, options, false, c->deadline,
+                                                c->channel->reusable, oldProtocol);
+                };
+                try { connect(legacy); }
+                catch (const LegacyHandshake &) {
+                    // Negotiation failed before any application bytes were
+                    // sent. Retry v1 once; never replay an application request.
+                    c->channel.reset();
+                    connect(true);
+                    std::lock_guard<std::mutex> lock(mutex);
+                    if (legacyPeers.size() >= size_t(options.queueDepth)) legacyPeers.clear();
+                    legacyPeers.insert(c->peer);
+                }
+                c->channel->ready = true;
+                ++connections;
+            }
+            SendMessage(c->channel->socket, c->channel->rdma.get(), c->request, c->deadline);
             c->request = {};
             c->stage = Stage::Reply;
-            Park(c); // Waiting for model computation consumes no transfer worker.
+            Park(c);
         } catch (...) { Fail(c, std::current_exception()); }
     }
     void ReceiveRequest(const std::shared_ptr<Exchange> &c) {
         try {
-            c->rdma = Handshake(c->socket, options, true, c->deadline);
-            c->request = ReceiveMessage(c->socket, c->rdma.get(), c->deadline);
+            if (!c->channel->ready) {
+                c->channel->rdma = Handshake(c->channel->socket, options, true, c->deadline,
+                                            c->channel->reusable);
+                c->channel->ready = true;
+                ++connections;
+            } else ++reusedConnections;
+            c->request = ReceiveMessage(c->channel->socket, c->channel->rdma.get(), c->deadline);
             c->stage = Stage::Admit;
             Park(c);
         } catch (...) { Fail(c, std::current_exception()); }
     }
     void BeginHandler(const std::shared_ptr<Exchange> &c) {
         try {
-            c->socket.CheckRunning(c->deadline);
+            c->channel->socket.CheckRunning(c->deadline);
             // Keep the admission lease through sending the reply. A producer
             // cannot fill GPU memory with completed, unsent snapshots.
             std::promise<Message> failed;
@@ -463,18 +594,25 @@ struct Service::Impl {
             catch (const std::exception &e) {
                 Writer error;
                 error.U32(1); error.String(e.what());
-                c->socket.SendFrame(error.bytes, c->deadline);
+                c->channel->socket.SendFrame(error.bytes, c->deadline);
                 ++failures;
                 return;
             }
-            SendMessage(c->socket, c->rdma.get(), reply, c->deadline);
+            SendMessage(c->channel->socket, c->channel->rdma.get(), reply, c->deadline);
             ++calls;
+            RecycleServer(c);
         } catch (...) { Fail(c, std::current_exception()); }
     }
     void ReceiveReply(const std::shared_ptr<Exchange> &c) {
         try {
-            auto reply = ReceiveMessage(c->socket, c->rdma.get(), c->deadline);
+            auto reply = ReceiveMessage(c->channel->socket, c->channel->rdma.get(), c->deadline);
             ++calls;
+            if (c->channel->reusable) {
+                std::lock_guard<std::mutex> lock(mutex);
+                if (!stopped && idleClients.size() < size_t(options.queueDepth) + options.workers)
+                    idleClients.emplace(c->peer, c->channel);
+            }
+            c->channel.reset();
             c->completion.set_value(std::move(reply));
         } catch (...) { Fail(c, std::current_exception()); }
     }
@@ -488,14 +626,16 @@ struct Service::Impl {
             }
             for (auto &c : work) {
                 try {
+                    if (c->stage == Stage::IdleRequest &&
+                        (stopped || std::chrono::steady_clock::now() >= c->deadline)) continue;
                     Require(!stopped, "FastKV: service stopped");
                     if (c->stage != Stage::Drain && std::chrono::steady_clock::now() >= c->deadline) {
                         if (c->stage != Stage::Handler)
                             throw std::runtime_error("FastKV: transport deadline exceeded");
                         // Computation may still be running. Close the network
                         // endpoint, but retain admission until its result dies.
-                        shutdown(c->socket.fd, SHUT_RDWR);
-                        c->rdma.reset();
+                        shutdown(c->channel->socket.fd, SHUT_RDWR);
+                        c->channel->rdma.reset();
                         c->stage = Stage::Drain;
                         ++failures;
                     }
@@ -507,6 +647,21 @@ struct Service::Impl {
                     case Stage::ReceiveRequest:
                         scheduled = servers.TryEnqueue([this, c] { ReceiveRequest(c); });
                         break;
+                    case Stage::IdleRequest: {
+                        pollfd fd{c->channel->socket.fd, POLLIN, 0};
+                        if (poll(&fd, 1, 0) > 0) {
+                            char byte;
+                            const auto n = recv(fd.fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
+                            if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
+                                scheduled = true; // normal idle peer disconnect
+                                break;
+                            }
+                            if (n < 0) break;
+                            c->deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(options.timeoutMs);
+                            scheduled = servers.TryEnqueue([this, c] { ReceiveRequest(c); });
+                        }
+                        break;
+                    }
                     case Stage::Admit:
                         if (!c->handlerSlot) {
                             try { c->handlerSlot = handlerSlots.Reserve(1); }
@@ -523,7 +678,7 @@ struct Service::Impl {
                         scheduled = c->result.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
                         break;
                     case Stage::Reply: {
-                        pollfd fd{c->socket.fd, POLLIN, 0};
+                        pollfd fd{c->channel->socket.fd, POLLIN, 0};
                         if (poll(&fd, 1, 0) > 0)
                             scheduled = receiveReplies.TryEnqueue([this, c] { ReceiveReply(c); });
                         break;
@@ -571,9 +726,11 @@ void Service::StartAsync(const std::string &address, AsyncHandler h) {
             Socket socket(fd, &impl->stopped);
             try {
                 Configure(fd);
-                auto c = std::make_shared<Impl::Exchange>(*impl, true, impl->serverSlots.Reserve(1));
-                c->socket = std::move(socket);
-                impl->Track(c);
+                auto c = std::make_shared<Impl::Exchange>(*impl, true);
+                c->channel = std::make_shared<Impl::Channel>(*impl);
+                c->channel->serverSlot = impl->serverSlots.Reserve(1);
+                c->channel->socket = std::move(socket);
+                impl->Track(c->channel);
                 impl->Park(c);
             } catch (...) {
                 ++impl->failures;
@@ -599,6 +756,11 @@ void Service::Stop() {
     impl->servers.Stop();
     impl->sendReplies.Stop();
     impl->receiveReplies.Stop();
+    decltype(impl->idleClients) idle;
+    { std::lock_guard<std::mutex> lock(impl->mutex); idle.swap(impl->idleClients); }
+    idle.clear();
+    impl->receiveBuffers.Clear();
+    impl->sendBuffers.Clear();
     impl->listener = Socket();
 }
 std::string Service::Address() const { return BoundAddress(impl->listener); }
@@ -612,7 +774,8 @@ std::future<Message> Service::Submit(const std::string &peer, Message m) {
     return future;
 }
 Metrics Service::Stats() const {
-    return {impl->tcpBytes.load(), impl->rdmaBytes.load(), impl->calls.load(), impl->failures.load()};
+    return {impl->tcpBytes.load(), impl->rdmaBytes.load(), impl->calls.load(), impl->failures.load(),
+            impl->connections.load(), impl->reusedConnections.load()};
 }
 bool Service::HasRdma() { return RdmaAvailable(); }
 } // namespace fastkv
