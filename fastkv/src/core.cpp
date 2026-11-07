@@ -295,14 +295,14 @@ Pool::Pool(int n, int cap) : capacity(cap) {
 Pool::~Pool() {
     Stop();
 }
-void Pool::Enqueue(std::function<void()> f) {
+bool Pool::TryEnqueue(std::function<void()> f) {
     {
         std::lock_guard<std::mutex> lock(mutex);
-        Require(!stop, "FastKV: service stopped");
-        Require(queue.size() < capacity, "FastKV: queue is full");
+        if (stop || queue.size() >= capacity) return false;
         queue.push_back(std::move(f));
     }
     cv.notify_one();
+    return true;
 }
 void Pool::Stop() {
     {

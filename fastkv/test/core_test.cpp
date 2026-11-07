@@ -198,6 +198,8 @@ int main() {
             } else if (request.metadata == Bytes{2}) {
                 entered.set_value();
                 gate.wait();
+            } else if (request.metadata == Bytes{3}) {
+                gate.wait();
             }
             return request;
         });
@@ -215,7 +217,7 @@ int main() {
         blocked.metadata = {2};
         auto active = cancellable.Submit(slow.Address(), blocked);
         entered.get_future().wait();
-        auto queued = cancellable.Submit(slow.Address(), {});
+        auto queued = cancellable.Submit(slow.Address(), {Bytes{3}, {}});
         const auto begin = std::chrono::steady_clock::now();
         cancellable.Stop();
         const auto elapsed = std::chrono::steady_clock::now() - begin;

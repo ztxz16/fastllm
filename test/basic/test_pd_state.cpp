@@ -56,6 +56,7 @@ class BatchStateModel final : public StateModel {
   public:
     std::atomic<int> batches{0}, largest{0}, live{0}, peakTokens{0}, liveTokens{0};
     std::atomic<bool> fail{false}, entered{false}, hold{false};
+    bool fullChunks = false;
     BatchStateModel() { maxBatch = 4; use_new_engine = false; canDoBatchForward = true; }
     ~BatchStateModel() override { hold = false; ShutdownRuntime(); }
     bool SupportsPrefillBatching() const override { return true; }
@@ -79,6 +80,7 @@ class BatchStateModel final : public StateModel {
         size_t offset = 0;
         for (int i = 0; i < batch; ++i) {
             Check(lengths[i] > 0 && lengths[i] <= 2, "per-request chunk bound");
+            if (fullChunks) Check(lengths[i] == 2, "token budget fragmented full chunks");
             auto &state = *kv[i].first;
             float value = state.dims.empty() ? 0 : ((float *)state.cpuData)[0];
             for (int j = 0; j < lengths[i]; ++j)
@@ -98,9 +100,9 @@ static void TestPrefillBatch() {
     }();
     SetMaxTokens(24);
     BatchStateModel model;
-    Check(model.SetPrefillBatching(8, 50, 4), "configure PD batch policy");
+    Check(model.SetPrefillBatching(4, 50, 4), "configure PD batch policy");
     model.ConfigurePD(json11::Json::object{{"role", "prefill"}, {"model_id", "test"},
-        {"transport", "tcp"}, {"listen", endpoint}, {"cache_bytes", 65536}, {"chunk_tokens", 2}});
+        {"transport", "tcp"}, {"listen", endpoint}, {"cache_bytes", 65536}, {"chunk_tokens", 2}, {"transfer_workers", 1}});
     fastkv::Options options; options.transport = fastkv::Transport::Tcp; options.workers = 8;
     fastkv::Service client(options);
     auto call = [&](const std::vector<int> &tokens) {
@@ -127,6 +129,9 @@ static void TestPrefillBatch() {
     };
     const std::vector<std::vector<int>> inputs{{3,4,5}, {7,8,9,10}, {11,12,13,14,15},
         {17,18,19,20,21,22,23}};
+    model.fullChunks = true;
+    run({{31,32,33,34}, {41,42,43,44}, {51,52,53,54}, {61,62,63,64}});
+    model.fullChunks = false;
     run(inputs);
     Check(model.largest >= 2 && model.batches > 0, "RPC concurrency did not become model batching");
     Check(model.live == 0 && model.liveTokens == 0 && model.peakTokens <= 24, "prefill state/credit leak");
@@ -176,6 +181,51 @@ static void TestPrefillBatch() {
     failing.StopPD();
     Check(failing.live == 0, "batch error leaked P contexts");
     std::cout << "PASS PD real prefill batching, ragged chunks, prefix reuse, token credits and shutdown\n";
+}
+
+static void TestQueuedTransfers() {
+    fastkv::Service port;
+    port.Start("127.0.0.1:0", [](const fastkv::Message &m) { return m; });
+    const auto endpoint = port.Address();
+    port.Stop();
+    SetMaxTokens(65536);
+    BatchStateModel prefill;
+    Check(prefill.SetPrefillBatching(8, 0, 4), "configure queued PD batch");
+    prefill.hold = true;
+    prefill.ConfigurePD(json11::Json::object{{"role", "prefill"}, {"model_id", "queued"},
+        {"transport", "tcp"}, {"listen", endpoint}, {"chunk_tokens", 2}, {"queue_depth", 128}});
+    StateModel decode;
+    decode.maxBatch = 128;
+    decode.ConfigurePD(json11::Json::object{{"role", "decode"}, {"model_id", "queued"},
+        {"transport", "tcp"}, {"prefill", json11::Json::array{endpoint}}});
+    std::vector<std::unique_ptr<ResponseContext>> requests;
+    bool admitted = true;
+    for (int i = 0; i < 128; ++i) {
+        requests.emplace_back(new ResponseContext());
+        auto &context = *requests.back();
+        context.Init(1, FLOAT32, FLOAT32);
+        context.generationConfig.output_token_limit = 1;
+        context.currentTokens = context.allTokens = {i + 1, i + 2, i + 3};
+        context.inputTokens = 3;
+        decode.BeginPD(&context);
+        decode.PollPD(&context);
+        admitted &= !context.isEnding;
+    }
+    prefill.hold = false;
+    for (auto &request : requests) {
+        for (int i = 0; i < 5000 && !request->isEnding && !decode.PollPD(request.get()); ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        admitted &= !request->isEnding && request->preTokens == 2;
+        if (!request->isEnding && request->preTokens == 2) {
+            const float expected = request->allTokens[0] + 2 * request->allTokens[1];
+            Check(((float *)request->pastKeyValues[0].first.cpuData)[0] == expected,
+                  "queued transfer mixed request states");
+        }
+        request->pdPending.reset();
+    }
+    decode.StopPD();
+    prefill.StopPD();
+    Check(admitted, "admitted requests must fit the transfer queue");
 }
 
 int main() {
@@ -234,7 +284,8 @@ int main() {
                                                  {"listen", endpoint},
                                                  {"cache_bytes", 16384},
                                                  {"chunk_tokens", 2}});
-        SetMaxTokens(130);
+        SetMaxTokens(4096);
+        decode.tokensLimit = 130;
         decode.ConfigurePD(json11::Json::object{{"role", "decode"},
                                                 {"model_id", "test"},
                                                 {"transport", "tcp"},
@@ -330,6 +381,7 @@ int main() {
         mismatch.StopPD();
         prefill.StopPD();
         TestPrefillBatch();
+        TestQueuedTransfers();
         std::cout << "PASS PD tensor packing, chunk positions, handoff, rejection "
                      "and cancellation\n";
     } catch (const std::exception &error) {

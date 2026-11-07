@@ -151,13 +151,18 @@ struct PDRuntime {
     size_t tokenCapacity = 0;
     std::unique_ptr<fastkv::Budget> slots, tokens;
     std::unique_ptr<fastkv::PrefixCache> cache;
+    // Routing stores only token keys and an endpoint, never KV payloads.
+    std::unique_ptr<fastkv::PrefixCache> routes;
     std::mutex prefillMutex, prefillStopMutex;
     std::condition_variable prefillCV;
     std::deque<std::shared_ptr<PrefillRequest>> waiting;
     std::thread prefillThread;
     int batchRequests = 1, batchTokens = 1, targetRequests = 1, waitMs = 0;
 
-    ~PDRuntime() { StopPrefill(); }
+    ~PDRuntime() {
+        StopPrefill();
+        if (service) service->Stop(); // callbacks capture this runtime
+    }
     void StopPrefill() {
         std::lock_guard<std::mutex> stoppingLock(prefillStopMutex);
         {
@@ -167,7 +172,7 @@ struct PDRuntime {
         prefillCV.notify_all();
         if (prefillThread.joinable()) prefillThread.join();
     }
-    fastkv::Message Prefill(std::vector<int> input) {
+    std::future<fastkv::Message> Prefill(std::vector<int> input) {
         auto request = std::make_shared<PrefillRequest>();
         request->input = std::move(input);
         auto result = request->result.get_future();
@@ -177,7 +182,7 @@ struct PDRuntime {
             waiting.push_back(request);
         }
         prefillCV.notify_one();
-        return result.get();
+        return result;
     }
     void RunPrefill(basellm &model);
 };
@@ -224,8 +229,8 @@ void PDRuntime::RunPrefill(basellm &model) {
                 }
             }
             // Only the model execution lane touches contexts and GPU state.
-            // RPC handlers wait on their independent result; they never hold
-            // forwardLocker while waiting for another request to arrive.
+            // RPC handlers return futures immediately; network workers never
+            // wait for the model or hold forwardLocker.
             std::lock_guard<std::mutex> lock(model.forwardLocker);
             for (const auto &request : admitted) {
                 try {
@@ -270,13 +275,11 @@ void PDRuntime::RunPrefill(basellm &model) {
             std::vector<Request> selected;
             std::vector<int> lengths;
             int budget = batchTokens;
-            int remaining = int(std::min(size_t(batchTokens), active.size()));
             for (const auto &request : active) {
-                if (!remaining) break;
-                const int count = std::min({chunk, budget / remaining,
+                if (!budget) break;
+                const int count = std::min({chunk, budget,
                     int(request->input.size()) - request->context->preTokens});
                 selected.push_back(request); lengths.push_back(count); budget -= count;
-                --remaining;
             }
             const int batch = selected.size();
             std::vector<Data> ids(batch), masks(batch), positions(batch);
@@ -403,8 +406,25 @@ void basellm::ConfigurePD(const json11::Json &config) {
     const int concurrent = maxBatch > 0 ? maxBatch : 1;
     runtime->tokenCapacity =
         GetMaxTokens() > 0 ? size_t(GetMaxTokens()) : size_t(max_positions) * concurrent;
+    if (tokensLimit > 0)
+        runtime->tokenCapacity = std::min(runtime->tokenCapacity, size_t(tokensLimit));
     fastkv::Options options;
     options.workers = std::max(4, std::min(concurrent, 16));
+    if (!config["transfer_workers"].is_null()) {
+        const double workers = config["transfer_workers"].number_value();
+        Check(config["transfer_workers"].is_number() && workers >= 1 && workers <= 64 &&
+                  workers == int(workers), "transfer_workers must be an integer in [1, 64]");
+        options.workers = int(workers);
+    }
+    options.maxActiveRequests = concurrent;
+    // Every admitted D request can wait on one transfer. P queue capacity is
+    // supplied by the router from the D groups that can submit work to it.
+    options.queueDepth = std::max(options.queueDepth, concurrent);
+    if (config["queue_depth"].is_number()) {
+        const double depth = config["queue_depth"].number_value();
+        Check(depth >= 1 && depth <= 1048576 && depth == int(depth), "invalid queue depth");
+        options.queueDepth = std::max(options.queueDepth, int(depth));
+    }
     const std::string transport = config["transport"].string_value();
     Check(transport == "tcp" || transport == "rdma" || transport == "auto", "unknown transport");
     options.transport = transport == "rdma"   ? fastkv::Transport::Rdma
@@ -427,6 +447,7 @@ void basellm::ConfigurePD(const json11::Json &config) {
     }
     if (runtime->role == "decode") {
         Check(!runtime->peers.empty(), "decode needs a prefill execution group");
+        runtime->routes.reset(new fastkv::PrefixCache(64 << 20, std::max(64, concurrent * 4)));
         runtime->slots.reset(new fastkv::Budget(concurrent));
         runtime->tokens.reset(new fastkv::Budget(runtime->tokenCapacity));
     } else {
@@ -443,7 +464,7 @@ void basellm::ConfigurePD(const json11::Json &config) {
         if (runtime->role == "prefill") {
             Check(!config["listen"].string_value().empty(), "prefill listen endpoint is required");
             const bool batching = SupportsPrefillBatching() && canDoBatchForward;
-            runtime->batchRequests = batching ? std::min(concurrent, options.workers) : 1;
+            runtime->batchRequests = batching ? concurrent : 1;
             if (prefillBatchPolicy.maxRequests > 0)
                 runtime->batchRequests = std::min(runtime->batchRequests, prefillBatchPolicy.maxRequests);
             runtime->batchTokens = batching ? std::max(runtime->chunk, GetBatchedPrefillTokenLimit()) : runtime->chunk;
@@ -451,7 +472,7 @@ void basellm::ConfigurePD(const json11::Json &config) {
                 std::min(runtime->batchRequests, prefillBatchPolicy.targetRequests) : runtime->batchRequests;
             runtime->waitMs = batching ? prefillBatchPolicy.maxWaitMs : 0;
             runtime->prefillThread = std::thread([this, raw = runtime.get()] { raw->RunPrefill(*this); });
-            runtime->service->Start(config["listen"].string_value(), [this, raw = runtime.get()](
+            runtime->service->StartAsync(config["listen"].string_value(), [this, raw = runtime.get()](
                                                                          const fastkv::Message &request) {
                 fastkv::Reader reader(request.metadata);
                 Check(reader.U32() == 1 && reader.String() == raw->identity,
@@ -494,7 +515,14 @@ void basellm::BeginPD(ResponseContext *context) {
     const size_t page = std::max(1, GetPageLen());
     pending->reservation =
         std::min(pdRuntime->tokenCapacity, ((pending->reservation + page - 1) / page) * page);
-    pending->peer = pdRuntime->peers[pdRuntime->next.fetch_add(1) % pdRuntime->peers.size()];
+    auto route = pdRuntime->routes->Find(pdRuntime->identity, prefix, prefix.size());
+    if (route.state) {
+        fastkv::Reader chosen(route.state->metadata);
+        pending->peer = chosen.String(); chosen.End();
+    } else pending->peer = pdRuntime->peers[pdRuntime->next.fetch_add(1) % pdRuntime->peers.size()];
+    fastkv::Writer chosen; chosen.String(pending->peer);
+    try { pdRuntime->routes->Publish(pdRuntime->identity, prefix, {std::move(chosen.bytes), {}}); }
+    catch (const std::runtime_error &) { /* Routing history is an optional bounded hint. */ }
     pending->request.metadata = std::move(writer.bytes);
     context->pdPending = std::move(pending);
 }

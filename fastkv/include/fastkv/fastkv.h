@@ -101,7 +101,12 @@ struct Options {
     size_t maxInflightBytes = size_t(8) << 30;
     size_t maxMetadataBytes = 64 << 20;
     size_t maxBuffers = 4096;
+    // Workers per request/reply direction. Separate lanes prevent handshake
+    // and reply ACK cycles; model waits consume none of these workers.
     int workers = 4;
+    // Server handler + reply admission, independent of transfer threads.
+    // Zero preserves the synchronous handler limit (workers).
+    int maxActiveRequests = 0;
     int queueDepth = 64;
     int timeoutMs = 1800000;
 };
@@ -110,17 +115,21 @@ struct Metrics {
     uint64_t tcpBytes = 0, rdmaBytes = 0, calls = 0, failures = 0;
 };
 
-// A service is embedded in an owning process. The bounded worker pool runs
-// handlers; buffers are retained until transfer completion or QP teardown.
+// A service is embedded in an owning process. Transfer workers do not wait
+// for asynchronous handlers. Buffers live through completion or QP teardown.
 // No model library, scheduler, or external registry is required.
 class Service {
   public:
     using Handler = std::function<Message(const Message &)>;
+    using AsyncHandler = std::function<std::future<Message>(Message)>;
     explicit Service(Options options = {});
     ~Service();
     Service(const Service &) = delete;
     Service &operator=(const Service &) = delete;
     void Start(const std::string &listenAddress, Handler handler);
+    // Return a promise-backed future promptly; long computation belongs to
+    // the caller's executor. Stop does not wait for an unfulfilled promise.
+    void StartAsync(const std::string &listenAddress, AsyncHandler handler);
     void Stop();
     std::string Address() const;
     Message Call(const std::string &peer, const Message &request);

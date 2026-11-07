@@ -23,11 +23,11 @@ int main(int argc, char **argv) {
             throw std::runtime_error("usage: fastkv_probe serve|call host:port [--transport "
                                      "tcp|rdma|auto] "
                                      "[--device N] [--bytes N] [--buffers N] [--count N] [--seed N] "
-                                     "[--cancel-after-ms N] [--rdma-devices mlx5_0,...]");
+                                     "[--workers N] [--concurrency N] [--cancel-after-ms N] [--rdma-devices mlx5_0,...]");
         Options o;
         o.timeoutMs = 30000;
         size_t size = 16 << 20;
-        int count = 3, buffers = 1, seed = 17, cancelMs = 0;
+        int count = 3, buffers = 1, seed = 17, cancelMs = 0, concurrency = 1;
         for (int i = 3; i < argc; i += 2) {
             if (i + 1 == argc)
                 throw std::runtime_error("missing argument");
@@ -49,6 +49,10 @@ int main(int argc, char **argv) {
                 count = std::stoi(v);
             else if (k == "--buffers")
                 buffers = std::stoi(v);
+            else if (k == "--workers")
+                o.workers = std::stoi(v);
+            else if (k == "--concurrency")
+                concurrency = std::stoi(v);
             else if (k == "--seed")
                 seed = std::stoi(v);
             else if (k == "--cancel-after-ms")
@@ -66,7 +70,8 @@ int main(int argc, char **argv) {
                 throw std::runtime_error("unknown option " + k);
         }
         if (count < 1 || buffers < 1 || buffers > int(o.maxBuffers) || size > o.maxPayloadBytes / buffers ||
-            seed < 0 || seed > 255 || cancelMs < 0)
+            seed < 0 || seed > 255 || cancelMs < 0 || o.workers < 1 || o.workers > 64 ||
+            concurrency < 1 || concurrency > o.queueDepth + o.workers)
             throw std::runtime_error("invalid count, buffer count or payload size");
         Service service(o);
         if (std::string(argv[1]) == "serve") {
@@ -75,8 +80,8 @@ int main(int argc, char **argv) {
             service.Start(argv[2], [](const Message &m) {
                 if (m.metadata.size() != 3)
                     throw std::runtime_error("invalid diagnostic metadata");
-                for (auto &b : m.buffers)
-                    Verify(b, m.metadata[2]);
+                // Echo without CPU readback; the caller verifies every byte
+                // after the timed interval, covering both transfer directions.
                 return m;
             });
             std::cout << "Fast KV Manager listening " << service.Address() << std::endl;
@@ -117,23 +122,35 @@ int main(int argc, char **argv) {
                           << ",\"requested_delay_ms\":" << cancelMs << ",\"stop_ms\":" << stopMs << "}\n";
                 return cancelled ? 0 : 2;
             }
-            for (int i = 0; i < count; ++i) {
-                auto reply = service.Call(argv[2], request);
-                if (reply.metadata != request.metadata || reply.buffers.size() != size_t(buffers))
-                    throw std::runtime_error("reply shape mismatch");
-                for (const auto &part : reply.buffers) {
-                    if (part.Size() != size)
-                        throw std::runtime_error("reply buffer size mismatch");
-                    Verify(part, uint8_t(seed));
+            double seconds = 0;
+            for (int i = 0; i < count; i += concurrency) {
+                const auto transferBegin = std::chrono::steady_clock::now();
+                std::vector<std::future<Message>> pending;
+                for (int j = 0; j < std::min(concurrency, count - i); ++j)
+                    pending.push_back(service.Submit(argv[2], request));
+                std::vector<Message> replies;
+                for (auto &future : pending) replies.push_back(future.get());
+                seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - transferBegin).count();
+                for (const auto &reply : replies) {
+                    if (reply.metadata != request.metadata || reply.buffers.size() != size_t(buffers))
+                        throw std::runtime_error("reply shape mismatch");
+                    for (const auto &part : reply.buffers) {
+                        if (part.Size() != size)
+                            throw std::runtime_error("reply buffer size mismatch");
+                        Verify(part, uint8_t(seed));
+                    }
                 }
             }
-            double seconds =
+            const double wallSeconds =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
             auto stats = service.Stats();
             std::cout << "{\"correct\":true,\"bytes\":" << size * buffers << ",\"buffers\":" << buffers
+                      << ",\"workers\":" << o.workers << ",\"concurrency\":" << concurrency
                       << ",\"calls\":" << stats.calls << ",\"tcp_bytes\":" << stats.tcpBytes
                       << ",\"rdma_bytes\":" << stats.rdmaBytes << ",\"seconds\":" << seconds
-                      << ",\"roundtrip_ms\":" << seconds * 1000 / count << "}\n";
+                      << ",\"wall_seconds\":" << wallSeconds
+                      << ",\"aggregate_GBps\":" << 2.0 * size * buffers * count / seconds / 1e9
+                      << ",\"amortized_call_ms\":" << seconds * 1000 / count << "}\n";
         } else
             throw std::runtime_error("expected serve or call");
     } catch (const std::exception &e) {

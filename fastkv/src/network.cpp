@@ -3,6 +3,7 @@
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
+#include <iterator>
 #include <netdb.h>
 #include <netinet/tcp.h>
 #include <poll.h>
@@ -228,37 +229,77 @@ static std::unique_ptr<RdmaConnection> Handshake(const Socket &s, const Options 
 
 struct Service::Impl {
     Options options;
-    Budget budget;
-    Pool servers, clients;
+    Budget budget, clientSlots, serverSlots, handlerSlots;
+    // Separate request and reply lanes: a new request handshake must never
+    // wait behind a reply whose receiver is occupied sending that request.
+    Pool servers, clients, sendReplies, receiveReplies;
     Socket listener;
-    Handler handler;
-    std::thread acceptor;
+    AsyncHandler handler;
+    std::thread acceptor, progress;
+    std::condition_variable wake;
+    enum class Stage { Connect, ReceiveRequest, Admit, Handler, Reply, Drain };
+    struct Exchange {
+        Impl &owner;
+        Socket socket;
+        std::unique_ptr<RdmaConnection> rdma;
+        std::shared_ptr<void> slot, handlerSlot;
+        Message request;
+        std::future<Message> result;
+        std::promise<Message> completion;
+        std::string peer;
+        Deadline deadline;
+        Stage stage;
+        bool server, tracked = false;
+        Exchange(Impl &owner, bool server, std::shared_ptr<void> slot)
+            : owner(owner), slot(std::move(slot)),
+              deadline(std::chrono::steady_clock::now() + std::chrono::milliseconds(owner.options.timeoutMs)),
+              stage(server ? Stage::ReceiveRequest : Stage::Connect), server(server) {}
+        ~Exchange() {
+            if (tracked) {
+                std::lock_guard<std::mutex> lock(owner.mutex);
+                owner.sockets.erase(socket.fd);
+            }
+            // QP teardown must precede every buffer/credit release.
+            rdma.reset();
+        }
+    };
+    std::vector<std::shared_ptr<Exchange>> pending;
     mutable std::mutex mutex;
     std::set<int> sockets;
     std::atomic<bool> stopped{false};
     std::atomic<uint64_t> tcpBytes{0}, rdmaBytes{0}, calls{0}, failures{0};
     explicit Impl(Options o)
         : options(std::move(o)), budget(options.maxInflightBytes),
-          servers(options.workers, options.queueDepth), clients(options.workers, options.queueDepth) {
+          clientSlots(size_t(options.queueDepth) + options.workers),
+          serverSlots(size_t(options.queueDepth) + ActiveLimit(options)),
+          handlerSlots(ActiveLimit(options)),
+          servers(options.workers, options.queueDepth), clients(options.workers, options.queueDepth),
+          sendReplies(options.workers, options.queueDepth), receiveReplies(options.workers, options.queueDepth) {
         Require(options.timeoutMs > 0 && options.maxPayloadBytes && options.maxMetadataBytes &&
-                    options.maxBuffers <= 65536,
+                    options.maxBuffers <= 65536 && options.maxActiveRequests >= 0,
                 "FastKV: invalid options");
         Require(options.transport != Transport::Rdma || RdmaAvailable(),
                 "FastKV: RDMA requires libibverbs support and an available device");
     }
-    struct Active {
-        Impl &impl;
-        int fd;
-        Active(Impl &i, int f) : impl(i), fd(f) {
-            std::lock_guard<std::mutex> lock(i.mutex);
-            Require(!i.stopped, "FastKV: service stopped");
-            i.sockets.insert(f);
-        }
-        ~Active() {
-            std::lock_guard<std::mutex> lock(impl.mutex);
-            impl.sockets.erase(fd);
-        }
-    };
+    static int ActiveLimit(const Options &o) {
+        return o.maxActiveRequests > 0 ? o.maxActiveRequests : o.workers;
+    }
+    void Track(const std::shared_ptr<Exchange> &c) {
+        std::lock_guard<std::mutex> lock(mutex);
+        Require(!stopped, "FastKV: service stopped");
+        sockets.insert(c->socket.fd);
+        c->tracked = true;
+    }
+    void Park(const std::shared_ptr<Exchange> &c) {
+        std::lock_guard<std::mutex> lock(mutex);
+        Require(!stopped, "FastKV: service stopped");
+        pending.push_back(c);
+        wake.notify_one();
+    }
+    void Fail(const std::shared_ptr<Exchange> &c, std::exception_ptr error) {
+        ++failures;
+        if (!c->server) c->completion.set_exception(error);
+    }
     void SendMessage(const Socket &s, RdmaConnection *rdma, const Message &message, Deadline deadline) {
         Require(message.metadata.size() <= options.maxMetadataBytes &&
                     message.buffers.size() <= options.maxBuffers,
@@ -378,50 +419,143 @@ struct Service::Impl {
         s.SendFrame(done.bytes, deadline);
         return m;
     }
-    Message Call(const std::string &peer, const Message &request) {
-        Require(!stopped, "FastKV: service stopped");
-        const auto deadline =
-            std::chrono::steady_clock::now() + std::chrono::milliseconds(options.timeoutMs);
-        Socket socket = Open(peer, false, deadline, &stopped);
-        Active active(*this, socket.fd);
+    void BeginCall(const std::shared_ptr<Exchange> &c) {
         try {
-            auto rdma = Handshake(socket, options, false, deadline);
-            SendMessage(socket, rdma.get(), request, deadline);
-            auto reply = ReceiveMessage(socket, rdma.get(), deadline);
-            ++calls;
-            return reply;
-        } catch (...) {
-            ++failures;
-            throw;
-        }
+            c->socket = Open(c->peer, false, c->deadline, &stopped);
+            Track(c);
+            c->rdma = Handshake(c->socket, options, false, c->deadline);
+            SendMessage(c->socket, c->rdma.get(), c->request, c->deadline);
+            c->request = {};
+            c->stage = Stage::Reply;
+            Park(c); // Waiting for model computation consumes no transfer worker.
+        } catch (...) { Fail(c, std::current_exception()); }
     }
-    void Serve(const std::shared_ptr<Socket> &socket) {
-        Active active(*this, socket->fd);
-        auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(options.timeoutMs);
+    void ReceiveRequest(const std::shared_ptr<Exchange> &c) {
         try {
-            auto rdma = Handshake(*socket, options, true, deadline);
-            auto request = ReceiveMessage(*socket, rdma.get(), deadline);
+            c->rdma = Handshake(c->socket, options, true, c->deadline);
+            c->request = ReceiveMessage(c->socket, c->rdma.get(), c->deadline);
+            c->stage = Stage::Admit;
+            Park(c);
+        } catch (...) { Fail(c, std::current_exception()); }
+    }
+    void BeginHandler(const std::shared_ptr<Exchange> &c) {
+        try {
+            c->socket.CheckRunning(c->deadline);
+            // Keep the admission lease through sending the reply. A producer
+            // cannot fill GPU memory with completed, unsent snapshots.
+            std::promise<Message> failed;
+            try { c->result = handler(std::move(c->request)); }
+            catch (...) {
+                failed.set_exception(std::current_exception());
+                c->result = failed.get_future();
+            }
+            Require(c->result.valid(), "FastKV: handler returned an invalid future");
+            Require(c->result.wait_for(std::chrono::seconds(0)) != std::future_status::deferred,
+                    "FastKV: async handler requires a promise-backed future");
+            c->stage = Stage::Handler;
+            Park(c);
+        } catch (...) { Fail(c, std::current_exception()); }
+    }
+    void SendReply(const std::shared_ptr<Exchange> &c) {
+        try {
             Message reply;
-            try {
-                reply = handler(request);
-            } catch (const std::exception &e) {
+            try { reply = c->result.get(); }
+            catch (const std::exception &e) {
                 Writer error;
-                error.U32(1);
-                error.String(e.what());
-                socket->SendFrame(error.bytes, deadline);
+                error.U32(1); error.String(e.what());
+                c->socket.SendFrame(error.bytes, c->deadline);
                 ++failures;
                 return;
             }
-            SendMessage(*socket, rdma.get(), reply, deadline);
+            SendMessage(c->socket, c->rdma.get(), reply, c->deadline);
             ++calls;
-        } catch (...) {
-            ++failures;
+        } catch (...) { Fail(c, std::current_exception()); }
+    }
+    void ReceiveReply(const std::shared_ptr<Exchange> &c) {
+        try {
+            auto reply = ReceiveMessage(c->socket, c->rdma.get(), c->deadline);
+            ++calls;
+            c->completion.set_value(std::move(reply));
+        } catch (...) { Fail(c, std::current_exception()); }
+    }
+    void Progress() {
+        for (;;) {
+            std::vector<std::shared_ptr<Exchange>> work, waiting;
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                wake.wait(lock, [&] { return stopped || !pending.empty(); });
+                work.swap(pending);
+            }
+            for (auto &c : work) {
+                try {
+                    Require(!stopped, "FastKV: service stopped");
+                    if (c->stage != Stage::Drain && std::chrono::steady_clock::now() >= c->deadline) {
+                        if (c->stage != Stage::Handler)
+                            throw std::runtime_error("FastKV: transport deadline exceeded");
+                        // Computation may still be running. Close the network
+                        // endpoint, but retain admission until its result dies.
+                        shutdown(c->socket.fd, SHUT_RDWR);
+                        c->rdma.reset();
+                        c->stage = Stage::Drain;
+                        ++failures;
+                    }
+                    bool scheduled = false;
+                    switch (c->stage) {
+                    case Stage::Connect:
+                        scheduled = clients.TryEnqueue([this, c] { BeginCall(c); });
+                        break;
+                    case Stage::ReceiveRequest:
+                        scheduled = servers.TryEnqueue([this, c] { ReceiveRequest(c); });
+                        break;
+                    case Stage::Admit:
+                        if (!c->handlerSlot) {
+                            try { c->handlerSlot = handlerSlots.Reserve(1); }
+                            catch (const std::runtime_error &) { break; }
+                        }
+                        scheduled = servers.TryEnqueue([this, c] { BeginHandler(c); });
+                        break;
+                    case Stage::Handler:
+                        if (c->result.wait_for(std::chrono::seconds(0)) != std::future_status::timeout)
+                            scheduled = sendReplies.TryEnqueue([this, c] { SendReply(c); });
+                        break;
+                    case Stage::Drain:
+                        // No get(): discarding an exceptional result is safe.
+                        scheduled = c->result.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+                        break;
+                    case Stage::Reply: {
+                        pollfd fd{c->socket.fd, POLLIN, 0};
+                        if (poll(&fd, 1, 0) > 0)
+                            scheduled = receiveReplies.TryEnqueue([this, c] { ReceiveReply(c); });
+                        break;
+                    }
+                    }
+                    if (!scheduled) waiting.push_back(std::move(c));
+                } catch (...) { Fail(c, std::current_exception()); }
+            }
+            // Destroy completed exchange owners outside mutex (they untrack
+            // their descriptors there). New work may arrive during dispatch.
+            work.clear();
+            std::unique_lock<std::mutex> lock(mutex);
+            pending.insert(pending.end(), std::make_move_iterator(waiting.begin()),
+                           std::make_move_iterator(waiting.end()));
+            if (stopped && pending.empty()) break;
+            if (!pending.empty()) wake.wait_for(lock, std::chrono::milliseconds(1));
         }
     }
 };
-Service::Service(Options o) : impl(new Impl(std::move(o))) {}
+Service::Service(Options o) : impl(new Impl(std::move(o))) {
+    impl->progress = std::thread([this] { impl->Progress(); });
+}
 Service::~Service() { Stop(); }
 void Service::Start(const std::string &address, Handler h) {
+    Require(bool(h), "FastKV: invalid handler");
+    StartAsync(address, [h = std::move(h)](Message request) {
+        std::promise<Message> result;
+        result.set_value(h(request));
+        return result.get_future();
+    });
+}
+void Service::StartAsync(const std::string &address, AsyncHandler h) {
     Require(!impl->stopped && !impl->acceptor.joinable() && bool(h), "FastKV: invalid service start");
     impl->handler = std::move(h);
     impl->listener = Open(address, true, std::chrono::steady_clock::now() + std::chrono::seconds(30));
@@ -434,10 +568,13 @@ void Service::Start(const std::string &address, Handler h) {
             int fd = accept(impl->listener.fd, nullptr, nullptr);
             if (fd < 0)
                 continue;
-            auto socket = std::make_shared<Socket>(fd, &impl->stopped);
+            Socket socket(fd, &impl->stopped);
             try {
                 Configure(fd);
-                impl->servers.Enqueue([this, socket] { impl->Serve(socket); });
+                auto c = std::make_shared<Impl::Exchange>(*impl, true, impl->serverSlots.Reserve(1));
+                c->socket = std::move(socket);
+                impl->Track(c);
+                impl->Park(c);
             } catch (...) {
                 ++impl->failures;
             }
@@ -456,17 +593,22 @@ void Service::Stop() {
     }
     if (impl->acceptor.joinable())
         impl->acceptor.join();
+    impl->wake.notify_all();
+    if (impl->progress.joinable()) impl->progress.join();
     impl->clients.Stop();
     impl->servers.Stop();
+    impl->sendReplies.Stop();
+    impl->receiveReplies.Stop();
     impl->listener = Socket();
 }
 std::string Service::Address() const { return BoundAddress(impl->listener); }
-Message Service::Call(const std::string &peer, const Message &m) { return impl->Call(peer, m); }
+Message Service::Call(const std::string &peer, const Message &m) { return Submit(peer, m).get(); }
 std::future<Message> Service::Submit(const std::string &peer, Message m) {
-    auto task = std::make_shared<std::packaged_task<Message()>>(
-        [this, peer, m = std::move(m)] { return impl->Call(peer, m); });
-    auto future = task->get_future();
-    impl->clients.Enqueue([task] { (*task)(); });
+    auto c = std::make_shared<Impl::Exchange>(*impl, false, impl->clientSlots.Reserve(1));
+    c->peer = peer;
+    c->request = std::move(m);
+    auto future = c->completion.get_future();
+    impl->Park(c);
     return future;
 }
 Metrics Service::Stats() const {

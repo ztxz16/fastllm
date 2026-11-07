@@ -59,7 +59,7 @@ ftllm router stop --config pd.json
 
 `start` 表示进程已创建，模型仍可能在加载。`status` 区分 `running` 和 `ready`。HTTP `/health` 检查 D 以及它的 P 依赖。部署记录包含 PID、启动时间和 boot ID，停止时核实进程身份，不按进程名称批量终止。
 
-可以配置多个 P 和多个 D。D 默认轮转使用所有 P，也可以用执行组的 `prefill` 字段指定 endpoint 子集。HTTP router 负责 D 的队列与会话亲和性，KV 不经过 HTTP router。P 选择目前是 D 内部轮转，不是按前缀命中或实时负载路由；多个 P 的缓存也不共享。当前静态分配要求某个 D 的全部 P 依赖都在线；不支持运行中自动变更拓扑。
+可以配置多个 P 和多个 D。D 默认轮转使用所有 P，也可以用执行组的 `prefill` 字段指定 endpoint 子集。HTTP router 负责 D 的队列与会话亲和性，KV 不经过 HTTP router。D 记录已路由的完整 token 前缀与 P 的对应关系，续接请求优先回到原 P，首次请求轮转分配。该提示不保证 P 计算已经完成或缓存仍然存在，也不是实时负载均衡；多个 P 的缓存不共享。当前静态分配要求某个 D 的全部 P 依赖都在线；不支持运行中自动变更拓扑。
 
 ## 调度和线程归属
 
@@ -67,7 +67,7 @@ ftllm router stop --config pd.json
 |---|---|---|
 | HTTP router | D 的健康检查、排队、流转发、会话亲和性 | token 化、采样、KV 传输 |
 | D 调度器 | 请求/token 额度、异步 P 请求、导入成功后允许 decode | 在网络线程中改 GPU 页表 |
-| P RPC 工作池 | 校验请求身份，等待对应 future，发送完整状态 | 持有模型锁等待其他请求到达 |
+| P RPC 工作池 | 校验请求身份、提交计算、发送已就绪结果 | 等待模型 future 或操作模型状态 |
 | P 模型执行线程 | 接纳请求、复用前缀、分配 chunk、调用批量前向、发布结果 | 多个 RPC 同时操作同一个模型 |
 | GPU 持久工作线程 | 各 rank 的状态恢复、计算和 graph replay | 接收远端指针或远端页号 |
 | Fast KV Manager | 有界传输、buffer lease、不可变状态缓存 | 模型算子、分布式 MoE collective |
@@ -79,7 +79,9 @@ P 的单个请求在恢复或导出失败时只返回该请求的错误；批量
 ## 状态、缓存与容量
 
 - P 的网络请求先进入同一个模型执行队列。支持 prefill 合批的模型按请求数和总 token 预算合并 chunk，再调用批量前向；每条请求保留独立的位置、KV 和交接结果。未声明合批能力的模型保留单请求前向。DeepSeek V4.1 仅在纯 GPU 模式启用，Naive 使用已有的普通 TP 合批能力。
-- P 复用 `--max_batch`、`--prefill_batch_tokens`、`--prefill_batch_requests`、`--prefill_max_requests` 和 `--prefill_max_wait_ms`。`chunk_tokens` 是每请求每轮上限，总预算不足时会给多条请求分配更小的 chunk；长请求按轮推进。当前原生服务最多有 16 个请求处理线程，因此一次 P 合批最多接入 16 条请求。`--tokens` 同时约束活动 P 请求的总 prompt 长度，未获额度的请求排队。
+- P 复用 `--max_batch`、`--prefill_batch_tokens`、`--prefill_batch_requests`、`--prefill_max_requests` 和 `--prefill_max_wait_ms`。 `--max_batch` 还影响模型预分配的请求/前缀状态容量，不等于每次前向的合批数；大并发多轮会话可提高 P 的 `--max_batch`，同时用 `--prefill_max_requests` 限制活动计算请求、`--prefill_batch_requests` 限制目标合批，避免小计算批次把缓存容量也限制得过小。`chunk_tokens` 是每请求每轮上限；按请求依次消耗总 token 预算，尽量保留完整 chunk，未完成请求移到队尾按轮推进，不将预算平分给全部活动请求。P 返回异步结果，计算等待不占通信线程，合批请求数不再受通信 worker 数限制。`--tokens` 同时约束活动 P 请求的总 prompt 长度，未获额度的请求排队。
+- 传输线程可在 router 的 `transport.transfer_workers` 中设置，P/D group 的同名字段可覆盖全局值；原生 `--pd` JSON 也支持 `transfer_workers`。取值为 1～64，省略时沿用 `max(4, min(max_batch, 16))`。它控制每个请求/回复方向工作池的 worker 数，不改变 GPU 线程数或模型合批上限。P 的 handler/待发送结果准入上限为 `max_batch`；传输队列由 router 根据关联 D 的 `max_inflight` 推导，接收暂存仍受 `max_inflight_bytes` 约束。线程更多不保证更快，应使用独立 probe 测量。
+- P/D 的网络请求和回复分池调度，等待慢 P 计算的 D 请求不占通信 worker，其他 P 的请求及已就绪结果可以继续推进。当前使用静态 peer 列表和前缀亲和性，没有全局负载迁移；GPU 状态整理、缓存发布和模型导入/导出仍有成本，异步传输不等于 GPU 页池直传。
 - 例如 P 的 DP8/TP1/EP8 部署可使用 `--max_batch 16 --chunked_prefill_size 4096 --prefill_batch_tokens 32768 --prefill_batch_requests 8 --prefill_max_requests 16 --prefill_max_wait_ms 2`，并将 P 配置的 `chunk_tokens` 设为 `4096`。只改拓扑或增加网络并发不能替代模型合批。`[FastKV PD] prefill_batch` 日志记录实际进入一次前向的请求数、token 数和前向耗时。
 - D 在发起远端 prefill 前预留请求槽位和按 KV 页大小向上取整的 token 额度，避免大量已完成 P 的请求挤占 D 显存。未获额度的请求排队，不分配活动模型 KV。
 - 传输只含逻辑状态，不含模型权重、GPU 地址、allocator page ID、graph 或 scratch buffer。数据完整接收并验证后才由模型 adapter 提交。

@@ -22,16 +22,16 @@ cmake --build build-fastkv -j
 
 嵌入其他 CMake 项目时，可以使用 `add_subdirectory(fastkv)`，然后链接 `fastkv` target。公共头文件为 `fastkv/fastkv.h`。
 
-诊断工具会校验每一个 payload 字节。其耗时包含分配、注册、往返以及 CPU 校验，不能直接当作网络带宽：
+诊断工具在计时窗口后校验每一个返回的 payload 字节，覆盖往返两个方向。`seconds` 包含连接、内存分配、注册和往返传输；`wall_seconds` 还包含客户端校验。`aggregate_GBps` 是双向累计字节除以前者，不是单向链路峰值带宽；并发下的 `amortized_call_ms` 是摊销耗时，不是单请求延迟。
 
 ```bash
 # 接收端
 build-fastkv/fastkv_probe serve 0.0.0.0:19000 \
-  --transport rdma --device 0 --rdma-devices mlx5_0,mlx5_1
+  --transport rdma --device 0 --workers 4 --rdma-devices mlx5_0,mlx5_1
 
 # 发送端
 build-fastkv/fastkv_probe call receiver:19000 \
-  --transport rdma --device 0 --bytes 67108864 --count 10 \
+  --transport rdma --device 0 --workers 4 --concurrency 8 --bytes 67108864 --count 32 \
   --rdma-devices mlx5_0,mlx5_1
 ```
 
@@ -58,7 +58,7 @@ flowchart LR
 |---|---|
 | `Buffer` | Host/CUDA 内存、切片、只读视图，以及 allocation lease。地址复用不会复用 allocation ID。 |
 | `Message` | 有界元数据和独立 buffer 列表，不含远端指针或本地分配器对象。 |
-| `Service` | 同步 `Call`、异步 `Submit`、有界工作队列、超时、停止和统计。 |
+| `Service` | 同步 `Call/Start`、异步 `Submit/StartAsync`、有界工作队列、超时、停止和统计。 |
 | `Budget` | RAII 字节或槽位额度；最后一个 lease 释放后归还额度。 |
 | `PlanCopies` | 同一逻辑表示下的多维分片交集，支持源副本去重，拒绝覆盖缺口和歧义。 |
 | `ObjectStore` | 完整对象的不可变发布、LRU 淘汰、读取 lease；被读取的对象不会提前释放。 |
@@ -76,7 +76,11 @@ RDMA 使用 RC QP 和多 NIC 分条传输。注册缓存挂在 allocation lease 
 
 `rdma` 模式不可静默降级。`auto` 允许握手双方协商 TCP/RDMA，但不会在传输中途重放失败的操作。TCP 同时支持 Host 和 CUDA buffer，CUDA 当前经主存分块搬运。RDMA GPU 内存需要驱动提供可用的 peer-memory/GPUDirect 支持；它不是单纯安装 libibverbs 就能保证的能力。
 
-`Service::Stop()` 应由拥有者线程调用；它中断网络等待并等待 handler 退出，不能从该 Service 自己的 handler 中调用。handler 中的长计算需要自己检查停止标志。元数据、buffer 数量、payload、在途字节、线程和队列都有上限。
+`Service::StartAsync()` 的 handler 只负责提交计算，立即返回由 `std::promise<Message>` 驱动的 future。组件的进度线程检查完成状态，计算等待期间不占用通信 worker；生产者拥有自己的执行线程和停止逻辑。不要返回析构时可能等待线程的 `std::async` future。普通 `Start()` 保留同步 handler 语义。
+
+请求发送、请求接收、回复发送、回复接收使用独立工作池，避免握手和回复 ACK 互相等待；每池最多 `workers` 个线程。单向 P/D 角色通常只有两个池执行任务，另外两个空闲；此外每个 Service 有一个进度线程，监听端还有一个 accept 线程。增加 worker 可以并行处理多个 RPC，单个 RPC 的 RDMA 多网卡分条仍由一个 worker 驱动。只有多条独立传输可并行、且 CPU/内存/网卡尚有余量时，增加线程才有收益。
+
+`Service::Stop()` 应由拥有者线程调用，不能从自身 handler 调用。它中断网络等待并等待正在执行的同步 handler 返回；异步 handler 已交回的未完成 promise 不阻止关闭。关闭组件不等于取消调用者的计算，调用者必须另外停止并回收生产者线程。元数据、buffer 数量、payload、在途字节、线程和队列都有上限。
 
 ## 生命周期与背压
 
@@ -86,7 +90,7 @@ RDMA 使用 RC QP 和多 NIC 分条传输。注册缓存挂在 allocation lease 
 4. 模型 adapter 校验 checkpoint、布局和状态边界，再由拥有者线程恢复本地状态。该阶段属于调用者，不由网络工作池执行 GPU 图或修改请求页表。
 5. 缓存发布复制为不可变内容。读取 lease 保证淘汰或缓存析构不会让仍在使用的数据失效；最后一个 owner 释放后归还预算和内存。
 
-`maxPayloadBytes` 限制单条消息，`maxInflightBytes` 限制接收 staging，`workers/queueDepth` 限制执行与等待队列。缓存字节预算只覆盖所核算的缓存状态和数据块，并不代表进程 RSS 上限；索引容器开销、发布时的临时副本、活动命中的连续重建副本和模型 KV 都需要额外预算。网络队列满或接收额度不足会返回错误，模型层应在发起请求前做自己的准入控制。
+`maxPayloadBytes` 限制单条消息，`maxInflightBytes` 限制接收 staging，`workers/queueDepth` 限制各传输池的执行与等待队列。服务端额外使用 `maxActiveRequests` 限制已经调用 handler、但尚未完成回复的请求数（0 表示使用 `workers`），与线程数解耦。handler future、已完成但待发送的结果都继续持有此额度；服务端超时会关闭网络，但未完成生产者仍保留准入额度，直到其 future 完成或 Service 关闭，防止超时后无限堆积后台计算。端到端 deadline 从 Submit/accept 开始，包含排队。缓存字节预算只覆盖所核算的缓存状态和数据块，并不代表进程 RSS 上限；索引容器开销、发布时的临时副本、活动命中的连续重建副本和模型 KV 都需要额外预算。网络队列满或接收额度不足会返回错误，模型层应在发起请求前做自己的准入控制。
 
 独立组件通过 `Options` 和构造参数配置，不引入运行时调试环境变量。可复用的 `fastkv_probe` 是显式运行的诊断程序，不随模型服务启动。
 

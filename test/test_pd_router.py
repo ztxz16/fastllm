@@ -19,6 +19,43 @@ def configuration(directory):
 
 
 class ConfigurationTest(unittest.TestCase):
+    def test_transfer_queues_cover_dependent_decode_groups(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = configuration(directory)
+            config['prefill'].append({'name': 'p2', 'endpoint': '127.0.0.1:19010',
+                'url': 'http://127.0.0.1:19011', 'command': ['ftllm', 'serve', '/model']})
+            config['decode'][0]['max_inflight'] = 128
+            config['decode'].append({'name': 'd2', 'url': 'http://127.0.0.1:19012',
+                'command': ['ftllm', 'serve', '/model'], 'max_inflight': 256,
+                'prefill': ['127.0.0.1:19010']})
+            path = Path(directory) / 'config.json'
+            path.write_text(json.dumps(config))
+            loaded = load_config(path)
+            depths = {node['name']: json.loads(node['command'][-1])['queue_depth']
+                      for role in ('prefill', 'decode') for node in loaded[role]}
+            self.assertEqual(depths, {'p1': 128, 'p2': 384, 'd1': 128, 'd2': 256})
+            for invalid in (True, 0, -1, '128'):
+                config['decode'][0]['max_inflight'] = invalid
+                path.write_text(json.dumps(config))
+                with self.assertRaises(ValueError):
+                    load_config(path)
+
+    def test_transfer_workers_are_independent_and_validated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = configuration(directory)
+            config['transport'] = {'type': 'tcp', 'transfer_workers': 2}
+            config['prefill'][0]['transfer_workers'] = 1
+            path = Path(directory) / 'config.json'
+            path.write_text(json.dumps(config))
+            loaded = load_config(path)
+            self.assertEqual(json.loads(loaded['prefill'][0]['command'][-1])['transfer_workers'], 1)
+            self.assertEqual(json.loads(loaded['decode'][0]['command'][-1])['transfer_workers'], 2)
+            for invalid in (True, 0, -1, 65, 1.5, '4'):
+                config['prefill'][0]['transfer_workers'] = invalid
+                path.write_text(json.dumps(config))
+                with self.assertRaisesRegex(ValueError, 'transfer_workers'):
+                    load_config(path)
+
     def test_deployment_validation(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'config.json'

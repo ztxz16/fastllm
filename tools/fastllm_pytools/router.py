@@ -30,6 +30,9 @@ def load_config(path):
     peers = [group['endpoint'] for group in config['prefill']]
     if len(set(peers)) != len(peers):
         raise ValueError('Prefill endpoints must be unique')
+    if any(type(node.get('max_inflight', 64)) is not int or node.get('max_inflight', 64) <= 0
+           for node in config['decode']):
+        raise ValueError('max_inflight must be a positive integer')
     names = set()
     transport = config.get('transport', {'type': 'tcp'})
     if transport.get('type', 'tcp') not in ('tcp', 'rdma', 'auto'):
@@ -53,11 +56,19 @@ def load_config(path):
                   'transport': transport.get('type', 'tcp'),
                   'rdma_devices': group.get('rdma_devices', transport.get('rdma_devices', [])),
                   'max_inflight_bytes': transport.get('max_inflight_bytes', 8 << 30)}
+            workers = group.get('transfer_workers', transport.get('transfer_workers'))
+            if workers is not None:
+                if type(workers) is not int or not 1 <= workers <= 64:
+                    raise ValueError('transfer_workers must be an integer in [1, 64]')
+                pd['transfer_workers'] = workers
             if role == 'prefill':
+                pd['queue_depth'] = max(1, sum(node.get('max_inflight', 64) for node in config['decode']
+                    if group['endpoint'] in node.get('prefill', peers)))
                 pd['listen'] = group.get('listen', group['endpoint'])
                 pd['chunk_tokens'] = group.get('chunk_tokens', 2048)
                 pd['cache_bytes'] = group.get('cache_bytes', 1 << 30)
             else:
+                pd['queue_depth'] = group.get('max_inflight', 64)
                 pd['prefill'] = group.get('prefill', peers)
                 if not pd['prefill'] or not set(pd['prefill']).issubset(peers):
                     raise ValueError('Decode prefill endpoints must name configured prefill groups')
@@ -80,8 +91,6 @@ def load_config(path):
     # Reuse the tested HTTP streaming, cancellation and bounded queue code.
     config['replicas'] = [{'name': node['name'], 'url': node['url'], 'max_inflight': node.get('max_inflight', 64)}
                           for node in config['decode']]
-    if any(type(node['max_inflight']) is not int or node['max_inflight'] <= 0 for node in config['replicas']):
-        raise ValueError('max_inflight must be a positive integer')
     return config
 
 

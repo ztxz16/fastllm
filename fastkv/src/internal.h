@@ -25,7 +25,7 @@ class Pool {
   public:
     Pool(int count, int capacity);
     ~Pool();
-    void Enqueue(std::function<void()> task);
+    bool TryEnqueue(std::function<void()> task);
     void Stop();
 
   private:
