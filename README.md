@@ -157,6 +157,8 @@ FastLLM 的实现参考或使用了以下开源项目与文章中的思路或代
 - [Transformers](https://github.com/huggingface/transformers)：模型结构与参考实现。
 - [llama.cpp](https://github.com/ggml-org/llama.cpp) 和 [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp)：GGUF 量化格式与 kernel。
 - [Strata](https://github.com/Niko1221/Strata)：一些算子。
+- [ExLlamaV3](https://github.com/turboderp-org/exllamav3)（Turboderp，MIT）：EXL3 格式、码本、trellis 解码及 Tensor Core tile 解码的原始参考来源；保留其 [MIT 许可证](third_party/maya_exl3/LICENSE.exllamav3)。
+- [Project Maya](https://github.com/mw00/project-maya)（MIT）：FastLLM 的 EXL3 CUDA 内核直接移植自其基于 ExLlamaV3 的适配实现，并增加 FastLLM 的算子接入与优化；保留 [Maya 许可证](third_party/maya_exl3/LICENSE)。导入版本、源码哈希、来源链和本地修改见 [EXL3 引用说明](third_party/maya_exl3/NOTICE.txt)。EXL3 CPU 和 portable CUDA 回退算子由 FastLLM 独立实现。
 - [KVMem / kvmem-llama.cpp](https://github.com/kvmem/kvmem-llama.cpp)：分层 KV 缓存与内容检索的设计参考，包括固定 GPU 工作集、主机 KV 备份和 pre-RoPE mean-K 检索。FastLLM 接入说明见 [KVMem 文档](docs/kvmem.md)。
 - [FlashInfer](https://github.com/flashinfer-ai/flashinfer)：Attention、MLA 等算子。
 - [TurboMind / LMDeploy 的 GEMM 内核](https://github.com/InternLM/lmdeploy/tree/main/src/turbomind/kernels/gemm)：仓内 `third_party/turbomind` 的 SM70 s884（`SM70_MMA_884` / HMMA 8x8x4）核心由其源码移植，并在其上接入 AWQ INT4、块缩放 FP8 与 NVFP4 Linear。

@@ -9,5 +9,18 @@
     "include/strata/kernels/dp4a.hpp": "70c28583a58358bc720131d3f0bc5030b8c4f31520ad7bd8e0e4b6b189aa10e3",
     "LICENSE": "574cffb7c57769a9271043ac0c2b07c5e7e7621cfb81081b901d8981e791d121",
     "LICENSE.exllamav3": "93ccc2f4c97c03bc767c611c75f3bb16b97e49606f5cd3ca05d7f6201ff8f8de"
+  },
+  "algorithm_origin": {
+    "project": "ExLlamaV3",
+    "repository": "https://github.com/turboderp-org/exllamav3",
+    "author": "Turboderp",
+    "license": "LICENSE.exllamav3",
+    "source_paths": [
+      "exllamav3/exllamav3_ext/quant/codebook.cuh",
+      "exllamav3/exllamav3_ext/quant/exl3_dq.cuh",
+      "exllamav3/exllamav3_ext/quant/hadamard_inner.cuh"
+    ],
+    "scope": "EXL3 format, codebooks, trellis-window arithmetic and tensor-core tile decoding",
+    "revision_note": "The directly imported Maya files do not record the ExLlamaV3 revision."
   }
 }

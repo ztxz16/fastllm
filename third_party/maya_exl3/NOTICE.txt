@@ -1,4 +1,20 @@
-Maya EXL3 kernels in Fastllm
+EXL3 kernels based on ExLlamaV3, adapted via Project Maya for Fastllm
+
+Primary algorithm reference: ExLlamaV3 by Turboderp
+https://github.com/turboderp-org/exllamav3
+Copyright (c) 2025 Turboderp; MIT license: LICENSE.exllamav3.
+
+ExLlamaV3 is the source of the EXL3 format, codebooks, trellis-window arithmetic
+and tensor-core tile decoding used by these adapted kernels. Its relevant
+sources are exllamav3/exllamav3_ext/quant/codebook.cuh, exl3_dq.cuh and
+hadamard_inner.cuh. The imported Maya files do not record an exact ExLlamaV3
+revision. They are not unmodified ExLlamaV3 source files: Maya supplies its own
+kernel organization, split scheduling, activation handling and workspaces;
+Fastllm adds the integration and local changes listed below.
+
+Provenance: ExLlamaV3 -> Project Maya/Strata -> Fastllm.
+The direct import remains pinned to the Maya revision below; its original
+hashes and both projects' copyright and permission notices are retained.
 
 Imported from Project Maya v1.1.44, commit
 5d20b0e8fd7c15fde2a9f2b4eac5e9776883690b
@@ -55,3 +71,5 @@ upstream hashes and both MIT license files above remain unchanged.
 - Select single-row specialization and legacy/modern CUDA decode automatically.
 - Keep the legacy gate/up scratch-capacity fallback without an A/B environment
   switch. Existing architecture and numerical fallback kernels remain available.
+- Name ExLlamaV3 as the primary algorithm reference while retaining the Maya
+  import provenance, local modifications and both MIT license files.

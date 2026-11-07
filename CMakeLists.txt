@@ -500,7 +500,8 @@ if (USE_CUDA)
 
     set_source_files_properties(src/devices/cuda/models/deepseekv41-reference.cu PROPERTIES COMPILE_OPTIONS "--fmad=false")
 
-    # Project Maya / Strata MIT EXL3 kernels; provenance: third_party/maya_exl3/NOTICE.txt.
+    # ExLlamaV3-derived EXL3 kernels, adapted via Project Maya (MIT).
+    # Origin and import provenance: third_party/maya_exl3/NOTICE.txt.
     # CPU, ROCm, and CUDA_NO_TENSOR_CORE retain Fastllm's portable operators.
     if (NOT USE_ROCM AND NOT CUDA_NO_TENSOR_CORE)
         add_compile_definitions(FASTLLM_USE_MAYA_EXL3)

@@ -1,4 +1,5 @@
-// Fastllm adapter for Project Maya's MIT-licensed EXL3 kernels.
+// Fastllm adapter for ExLlamaV3-derived EXL3 kernels, imported via Project Maya.
+// Original format/tile decoding: https://github.com/turboderp-org/exllamav3 (MIT).
 // Provenance, licenses and local upstream changes: third_party/maya_exl3/NOTICE.txt.
 #include "exl3.h"
 #include "utils.h"

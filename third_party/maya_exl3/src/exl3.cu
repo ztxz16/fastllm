@@ -1,3 +1,7 @@
+// EXL3 format/codebook/tile-decoding origin: ExLlamaV3, Turboderp (MIT).
+// https://github.com/turboderp-org/exllamav3
+// This implementation was imported via Project Maya and modified by Fastllm.
+// See ../NOTICE.txt and both accompanying MIT licenses for the full provenance.
 #include <thread>
 #include <tuple>
 // src/kernels/cuda/exl3.cu - the EXL3 device kernels (the format: include/strata/kernels/exl3.hpp).
