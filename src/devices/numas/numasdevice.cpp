@@ -1,3 +1,4 @@
+#include "exl3.h"
 //
 // Created by huangyuyang on 10/15/24.
 //
@@ -2264,19 +2265,42 @@ namespace fastllm {
         int gateUnitRows = 4;
         size_t downRowBytes = 0;
         bool gate = true, fuseConvert = false, skipCrossSwiglu = false, roundDown = false;
-        bool canonical = false;
+        bool canonical = false, rotated = false;
+        int transform = 0, totalWorkers = 1;
+        float *rotatedInput = nullptr;
     };
 
     struct NumasMoeDecodeWorker : MultiThreadBaseOp, NumasMoeWorkerTiming {
         NumasMoeDecodeContext *context = nullptr;
-        int node = 0, worker = 0, workers = 1;
+        int node = 0, worker = 0, workers = 1, globalWorker = 0;
 
         void Run() override {
             auto &c = *context;
             const int columns = c.gate ? c.interDim * 2 : c.outputDim;
+            if (c.rotated && c.transform) {
+                const int blocks = (c.transform < 0 ? 2 * c.inputDim : c.outputDim) / 128;
+                const int tasks = int(c.experts->size()) * blocks;
+                for (int task = tasks * globalWorker / c.totalWorkers;
+                     task < tasks * (globalWorker + 1) / c.totalWorkers; ++task) {
+                    const int slot = task / blocks, at = task % blocks * 128;
+                    const int expert = (*c.experts)[slot].first;
+                    if (c.transform < 0) {
+                        const int part = at / c.inputDim, first = at % c.inputDim;
+                        Exl3PrepareInputBlock(*c.weights[2 * expert], part,
+                            reinterpret_cast<const float *>(c.input),
+                            c.rotatedInput + (size_t(slot) * 2 + part) * c.inputDim, first, true);
+                    } else {
+                        const int route = c.outputRoutes ? (*c.outputRoutes)[slot] : slot;
+                        float *out = c.downOutput + size_t(route) * c.outputDim;
+                        Exl3FinishOutputBlock(*c.weights[2 * expert + 1], 0, out, at);
+                        for (int i = at; i < at + 128; ++i) out[i] *= (*c.experts)[slot].second;
+                    }
+                }
+                Complete(); return;
+            }
             const int perNode = columns / c.numaCnt;
             const int base = perNode * node;
-            const int unit = c.gate ? c.gateUnitRows : 4;
+            const int unit = c.rotated ? 16 : (c.gate ? c.gateUnitRows : 4);
             const int units = perNode * (int)c.experts->size() / unit;
             const int first = unit * (worker * (units / workers) +
                                       std::min(worker, units % workers));
@@ -2288,6 +2312,22 @@ namespace fastllm {
                 const int end = std::min(perNode, start + last - row);
                 const int expert = (*c.experts)[slot].first;
                 Data &weight = *c.weights[expert * 2 + (c.gate ? 0 : 1)];
+                if (c.rotated) {
+                    const int parts = weight.blockM, perPart = perNode / parts;
+                    const int route = c.gate || !c.outputRoutes ? slot : (*c.outputRoutes)[slot];
+                    float *out = (c.gate ? c.gateUp : c.downOutput) + size_t(route) * columns;
+                    for (int local = start; local < end;) {
+                        const int part = local / perPart, first = local % perPart;
+                        const int count = std::min(end - local, perPart - first);
+                        const float *in = c.gate ? c.rotatedInput + (size_t(slot) * 2 + part) * c.inputDim :
+                            reinterpret_cast<const float *>(c.downInput + slot * c.downRowBytes);
+                        Exl3DotRows(weight, part, node, c.numaCnt, in,
+                            out + part * (columns / parts) + node * perPart + first, first, count);
+                        local += count;
+                    }
+                    row += end - start;
+                    continue;
+                }
                 uint8_t *record = c.canonical ? weight.cpuData : weight.numasData[node];
                 if (c.gate && c.canonical) {
                     MultiThreadGemmOp task(c.input, c.inputType, record, weight.GetDataType(),
@@ -2338,6 +2378,21 @@ namespace fastllm {
             for (int task = tasks * worker / workers; task < tasks * (worker + 1) / workers; ++task) {
                 const int slot = task / blocks, start = task % blocks * block;
                 const auto &expert = (*c.experts)[slot];
+                if (c.rotated) {
+                    float *gate = c.gateUp + size_t(slot) * c.interDim * 2;
+                    float *up = gate + c.interDim;
+                    Exl3FinishOutputBlock(*c.weights[2 * expert.first], 0, gate, start);
+                    Exl3FinishOutputBlock(*c.weights[2 * expert.first], 1, up, start);
+                    float *activated = c.swiglu + size_t(slot) * c.interDim;
+                    for (int j = start; j < start + block; ++j) {
+                        float g = gate[j], u = up[j];
+                        if (swigluLimit > 0) { g = std::min(g, swigluLimit); u = std::max(-swigluLimit, std::min(u, swigluLimit)); }
+                        activated[j] = RoundFloat32ToBFloat16RNE(g / (1.0f + std::exp(-g)) * u);
+                    }
+                    Exl3PrepareInputBlock(*c.weights[2 * expert.first + 1], 0, activated,
+                        reinterpret_cast<float *>(c.downInput + slot * c.downRowBytes), start, false);
+                    continue;
+                }
                 const bool quantize = activationQuantBlock == 32 ||
                     IsDeepSeekV4QuantizedWeight(*c.weights[2 * expert.first + 1]);
                 if (c.canonical) {
@@ -3384,12 +3439,24 @@ namespace fastllm {
     }
 
     void RegisterNumas(fastllm::Data *data, std::string weightType) {
+        if (data->dataType == EXL3) {
+            AssertInFastLLM(weightType == "linear" || weightType == "linearColumn" || weightType == "linearSwiglu",
+                "EXL3 NUMA registration requires a linear projection.");
+            RegisterNumasMoeWeightBatch({{data, weightType}});
+            return;
+        }
         RegisterNumasImpl(data, weightType, true);
     }
 
     void DynamicScheduleTasks(std::vector<std::vector<MultiThreadBaseOp*>> &ops, bool deleteTasks);
 
     namespace {
+        struct NumasBatchRowShardOp : MultiThreadBaseOp {
+            Data *weight; uint8_t *destination; int node, nodes;
+            NumasBatchRowShardOp(Data *w, uint8_t *d, int n, int count)
+                : weight(w), destination(d), node(n), nodes(count) {}
+            void Run() override { Exl3CopyRowShard(*weight, destination, node, nodes); }
+        };
         struct NumasBatchMemcpyOp : MultiThreadBaseOp {
             uint8_t *dst;
             const uint8_t *src;
@@ -3489,7 +3556,7 @@ namespace fastllm {
                     CrossSwigluReorder(weight->cpuData, rows, rowBytes, reordered);
                     memcpy(weight->cpuData, reordered.data(), rows * rowBytes);
                 } else {
-                    weight->Repack();
+                    if (weight->dataType != EXL3) weight->Repack();
                 }
             }
         };
@@ -3541,8 +3608,8 @@ namespace fastllm {
             for (Entry &entry : entries) {
                 arenaBytes = (arenaBytes + 63) & ~(size_t)63;
                 entry.offset = arenaBytes;
-                entry.shardBytes = (entry.weight->dims[0] / config->numaCnt) *
-                    GetDataBytes(entry.weight->GetDataType(), 1, entry.weight->dims[1]);
+                entry.shardBytes = entry.weight->dataType == EXL3 ? entry.weight->GetBytes() / config->numaCnt :
+                    (entry.weight->dims[0] / config->numaCnt) * GetDataBytes(entry.weight->GetDataType(), 1, entry.weight->dims[1]);
                 arenaBytes += entry.shardBytes;
             }
             auto arena = std::make_shared<NumasMoeWeightArena>(arenaBytes, config->numaCnt);
@@ -3568,7 +3635,10 @@ namespace fastllm {
                     for (size_t i = begin; i < end; ++i) {
                         const Entry &entry = entries[i];
                         for (int node = 0; node < config->numaCnt; ++node) {
-                            copyOps[node].push_back(new NumasBatchMemcpyOp(
+                            if (entry.weight->dataType == EXL3)
+                                copyOps[node].push_back(new NumasBatchRowShardOp(entry.weight,
+                                    arena->nodes[node] + entry.offset, node, config->numaCnt));
+                            else copyOps[node].push_back(new NumasBatchMemcpyOp(
                                 arena->nodes[node] + entry.offset,
                                 entry.weight->cpuData + node * entry.shardBytes,
                                 entry.shardBytes));
@@ -3693,7 +3763,7 @@ namespace fastllm {
                 continue;
             }
             const std::string &type = weights[i].second;
-            if (weight->dataType != DATA_GGUF_FORMAT ||
+            if ((weight->dataType != DATA_GGUF_FORMAT && weight->dataType != EXL3) ||
                 (type != "linearSwiglu" && type != "linearColumn" && type != "linear")) {
                 flush();
                 RegisterNumas(weight, type);
@@ -3705,14 +3775,20 @@ namespace fastllm {
             }
             AssertInFastLLM(!weight->isDiskWeight && weight->cpuData != nullptr &&
                            weight->dims.size() == 2 && weight->dims[0] % config->numaCnt == 0,
-                           "NUMA MoE batch requires resident, evenly shardable GGUF weights.\n");
+                           "NUMA MoE batch requires resident, evenly shardable weights.\n");
+            if (weight->dataType == EXL3) {
+                Exl3StorageBytes(*weight);
+                AssertInFastLLM(weight->dims[0] / weight->blockM % (16 * config->numaCnt) == 0 &&
+                    weight->dims[1] % (16 * config->numaCnt) == 0,
+                    "EXL3 NUMA requires complete trellis tiles in each row shard.");
+            }
             const size_t sourceBytes = weight->GetBytes();
             if (!entries.empty() && arenaBytes * config->numaCnt + sourceBytes > batchBytes) {
                 flush();
                 if (onProgress) onProgress(i);
             }
             arenaBytes = (arenaBytes + 63) & ~(size_t)63;
-            entries.push_back({weight, 0, 0, type == "linearSwiglu"});
+            entries.push_back({weight, 0, 0, type == "linearSwiglu" && weight->dataType != EXL3});
             arenaBytes += sourceBytes / config->numaCnt;
         }
         flush();
@@ -4158,6 +4234,7 @@ namespace fastllm {
     }
 
     static DataType GetNumasLinearActDataType(Data *weight, int batchSize) {
+        if (weight && weight->dataType == EXL3) return FLOAT32;
         // Mixed-quant MoE grouping queries the activation type before the
         // selected weights are registered. Mirror RegisterNumas' native
         // quantized-weight conversions so the pre-registration and registered
@@ -4314,6 +4391,7 @@ namespace fastllm {
         HostMoePlacementScope placement(canonical || weights[2]->hostMoeUnbound);
         const bool scoredBfloat = routeScores != nullptr;
         const bool scoredGguf = scoredBfloat && weights[2]->dataType == DataType::DATA_GGUF_FORMAT;
+        const bool rotatedFormat = weights[2]->dataType == EXL3;
         double cpuHostStart = cpuElapsedUs ? NumasProfileNowMs() * 1000 : 0;
         double cpuWorkUs = 0;
         if (cpuElapsedUs) *cpuElapsedUs = 0;
@@ -4326,7 +4404,7 @@ namespace fastllm {
         auto &routes = work.activeExperts;
         routes.clear();
         for (int r = 0; r < topk; ++r)
-            if (gpuIndices[r] < 0) routes.push_back(r);
+            if (indices[r] >= 0 && (!gpuIndices || gpuIndices[r] < 0)) routes.push_back(r);
         if (routes.empty()) {
             if (submitGpu) submitGpu();
             return;
@@ -4338,7 +4416,7 @@ namespace fastllm {
         // Only the fused native-weight writer needs shard-local FP8 blocks.
         AssertInFastLLM(!scoredBfloat ||
                         ((activationQuantBlock == 32 || activationQuantBlock == 128) &&
-                         (scoredGguf || inter % (config->numaCnt * activationQuantBlock) == 0)),
+                         (scoredGguf || rotatedFormat || inter % (config->numaCnt * activationQuantBlock) == 0)),
                         "Scored MoE decode requires complete activation blocks in each NUMA shard.\n");
         const DataType gateAct = canonical ? weights[2]->GetLinearActDataType(1) : GetNumasLinearActDataType(weights[2], 1);
         const DataType downAct = canonical ? weights[3]->GetLinearActDataType(1) : GetNumasLinearActDataType(weights[3], 1);
@@ -4357,24 +4435,29 @@ namespace fastllm {
         } else {
             RunMultiThreadConvertFromFloat32(work.realInput.data(), gateAct,
                                             input, 1, hidden, pool);
-            if (scoredBfloat && activationQuantBlock == 32)
+            if (!rotatedFormat && scoredBfloat && activationQuantBlock == 32)
                 QuantizeNumasV41Input(work.realInput.data(), gateAct, 1, hidden);
         }
         auto runWorkers = [&](auto &workers, bool overlap, const std::vector<int> *active = nullptr) {
             const int workerCount = active ? int(active->size()) : config->threads;
             auto id = [&](int t) { return active ? (*active)[t] : t; };
+            const auto interval = pool->curActivateThreadInterval;
+            const bool serial = interval.first != 0 || interval.second < config->threads;
             const double start = cpuElapsedUs ? NumasProfileNowMs() * 1000 : 0;
             if (cpuElapsedUs) cpuWorkUs += start - cpuHostStart;
             for (int t = 0; t < workerCount; ++t) workers[id(t)].measureTime = cpuElapsedUs != nullptr;
-            for (int t = 0; t < workerCount; ++t) pool->PushOp(id(t), &workers[id(t)]);
+            for (int t = 0; t < workerCount; ++t) {
+                if (serial) workers[id(t)].Run();
+                else pool->PushOp(id(t), &workers[id(t)]);
+            }
             try {
                 if (overlap && submitGpu) submitGpu();
             } catch (...) {
                 // Jobs borrow the layer workspace; drain them before unwinding.
-                for (int t = 0; t < workerCount; ++t) pool->Wait(id(t));
+                if (!serial) for (int t = 0; t < workerCount; ++t) pool->Wait(id(t));
                 throw;
             }
-            for (int t = 0; t < workerCount; ++t) pool->Wait(id(t));
+            if (!serial) for (int t = 0; t < workerCount; ++t) pool->Wait(id(t));
             if (cpuElapsedUs) {
                 double completed = start;
                 for (int t = 0; t < workerCount; ++t) completed = std::max(completed, workers[id(t)].completedUs);
@@ -4382,16 +4465,19 @@ namespace fastllm {
                 cpuHostStart = NumasProfileNowMs() * 1000;
             }
         };
-        if (scoredGguf) {
+        if (scoredGguf || rotatedFormat) {
             // Do not send one row through the verifier's per-expert task
             // builder. Reuse ordinary decode's contiguous row partitioning,
             // with an output-route map for the CPU/GPU subset and duplicates.
             auto &experts = work.selectedExperts;
             experts.clear();
-            for (int route : routes) experts.emplace_back(indices[route] + 1, routeScores[route]);
+            for (int route : routes) experts.emplace_back(indices[route] + 1, routeScores ? routeScores[route] : 1.0f);
             auto &context = work.decodeContext;
             context.canonical = canonical;
-            struct ResetCanonical { NumasMoeDecodeContext &c; ~ResetCanonical() { c.canonical = false; } } reset{context};
+            context.rotated = rotatedFormat; context.transform = 0; context.totalWorkers = config->threads;
+            if (rotatedFormat) work.expandInput.resize(size_t(count) * hidden * 2 * sizeof(float));
+            context.rotatedInput = reinterpret_cast<float *>(work.expandInput.data());
+            struct ResetCanonical { NumasMoeDecodeContext &c; ~ResetCanonical() { c.canonical = false; c.rotated = false; c.transform = 0; } } reset{context};
             context.weights = weights; context.experts = &experts;
             context.outputRoutes = &routes;
             context.input = work.realInput.data(); context.sharedInput = nullptr;
@@ -4410,11 +4496,13 @@ namespace fastllm {
                     auto &worker = work.rowWorkers[nodeWorkers[t].first];
                     worker.context = &context; worker.node = node;
                     worker.worker = t; worker.workers = nodeWorkers.size();
+                    worker.globalWorker = nodeWorkers[t].first;
                 }
             }
             context.gate = true;
+            if (rotatedFormat) { context.transform = -1; runWorkers(work.rowWorkers, false); context.transform = 0; }
             runWorkers(work.rowWorkers, true);
-            const int prepareBlock = DeepSeekV4QuantizedPrepareBlock(downAct, inter, activationQuantBlock);
+            const int prepareBlock = rotatedFormat ? 128 : DeepSeekV4QuantizedPrepareBlock(downAct, inter, activationQuantBlock);
             const bool floating = downAct == FLOAT32 || downAct == FLOAT16 || downAct == BFLOAT16;
             if (prepareBlock || (floating && inter % activationQuantBlock == 0)) {
                 work.scoredPrepareWorkers.resize(config->threads);
@@ -4436,6 +4524,7 @@ namespace fastllm {
             }
             context.gate = false;
             runWorkers(work.rowWorkers, false);
+            if (rotatedFormat) { context.transform = 1; runWorkers(work.rowWorkers, false); context.transform = 0; }
             finishCpu();
             return;
         }
@@ -4677,6 +4766,12 @@ namespace fastllm {
         if (weight == nullptr || weight->dims.size() != 2) {
             return false;
         }
+        if (weight->dataType == EXL3) {
+            return (weight->blockM == 1 || weight->blockM == 2) &&
+                weight->dims[0] > 0 && weight->dims[1] > 0 &&
+                weight->dims[0] % (weight->blockM * 128) == 0 && weight->dims[1] % 128 == 0 &&
+                Exl3BitRateSupported(weight->blockK);
+        }
         if (weight->dataType == DataType::DATA_GGUF_FORMAT) {
             return true;
         }
@@ -4738,6 +4833,18 @@ namespace fastllm {
     }
 
     int GetNumasMoeShardCount() { return GetNumaConfig()->numaCnt; }
+
+    std::vector<std::vector<int>> GetNumasExpertWorkerIds() {
+        HostMoePlacementScope placement(false);
+        const auto *config = GetNumaConfig();
+        std::vector<std::vector<int>> result(config->numaCnt);
+        const auto interval = GetAlivePool()->curActivateThreadInterval;
+        for (int node = 0; node < config->numaCnt; ++node)
+            for (const auto &worker : config->numaToCpuDict[node])
+                if (worker.first >= interval.first && worker.first < interval.second)
+                    result[node].push_back(worker.first);
+        return result;
+    }
 
     namespace {
         struct NumasLinearGemmOp : MultiThreadBaseOp {
@@ -9223,6 +9330,25 @@ namespace fastllm {
     void NumasMergeMOE::Run(const std::string &opType, const fastllm::DataDict &datas,
                     const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         HostMoePlacementScope placement(datas.at("weights") ? ((Data **)datas.at("weights"))[2] : nullptr);
+        auto **exl3Weights = reinterpret_cast<Data **>(datas.at("weights"));
+        const int exl3Count = intParams.at("weights___batch");
+        if (exl3Count > 2 && exl3Weights[2] && exl3Weights[2]->dataType == EXL3) {
+            AssertInFastLLM(!intParams.count("gateType") || intParams.at("gateType") == int(MoeGateSwiglu),
+                "EXL3 MoE currently requires SwiGLU.");
+            std::vector<std::pair<Data *, std::string>> pending;
+            for (int i = 2; i < exl3Count; ++i)
+                if (exl3Weights[i] && exl3Weights[i]->numasData.empty())
+                    pending.push_back({exl3Weights[i], i % 2 ? "linear" : "linearSwiglu"});
+            if (!pending.empty()) RegisterNumasMoeWeightBatch(pending);
+            Data x, ids, scores;
+            auto *input = GetCpuTensor(*datas.at("input"), x, "input");
+            auto *index = GetCpuTensor(*datas.at("index"), ids, "index");
+            auto *score = GetCpuTensor(*datas.at("score"), scores, "score");
+            Exl3MoeCPU(*input, *datas.at("output"), *index, *score, exl3Weights, exl3Count,
+                floatParams.count("sharedScale") ? floatParams.at("sharedScale") : 1.0f,
+                floatParams.count("swigluLimit") ? floatParams.at("swigluLimit") : 0.0f);
+            return;
+        }
  // auto ttt = std::chrono::system_clock::now();
  // std::vector <std::pair <std::string, float> > record;
   auto st = std::chrono::system_clock::now();

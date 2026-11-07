@@ -1,4 +1,5 @@
 #pragma once
+#include "../linear/fastllm-exl3-shards.cuh"
 
 // Lossless inverse of NUMA's R4 packing for prefill, canonical cache admission
 // and temporary experts whose projection kernels cannot read NUMA layouts.
@@ -158,6 +159,11 @@ __device__ inline void Block(const uint8_t *source, uint8_t *destination,
 struct Matrix {
     int type = -1, rows = 0, columns = 0;
     size_t rowBytes = 0;
+    int exl3Bits = 0, parts = 1;
+    __host__ __device__ size_t Bytes() const {
+        return exl3Bits ? size_t(rows) * columns * exl3Bits / 16 + size_t(parts * columns + rows) * 2 :
+            size_t(rows) * rowBytes;
+    }
 };
 struct Record {
     Matrix weights[2];
@@ -171,7 +177,7 @@ __device__ void Rows(const Matrix &w, void *const *pointers,
     if (!cross) {
         // Down projections are already in row order. Copy entire shards,
         // including across row boundaries, without per-element row division.
-        const size_t units = size_t(w.rows) * w.rowBytes / shards / sizeof(Unit);
+        const size_t units = w.Bytes() / shards / sizeof(Unit);
         for (int node = 0; node < shards; ++node) {
             const auto *source = static_cast<const Unit *>(pointers[node]);
             for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -181,7 +187,7 @@ __device__ void Rows(const Matrix &w, void *const *pointers,
         return;
     }
     if constexpr (sizeof(Unit) < 16) {
-        const size_t shardBytes = size_t(w.rows) * w.rowBytes / shards;
+        const size_t shardBytes = w.Bytes() / shards;
         if (!(shardBytes & 15)) {
             // Read the packed host rows contiguously and transpose in shared memory.
             const size_t rowUnits = w.rowBytes / sizeof(Unit);
@@ -291,8 +297,11 @@ static __global__ void Records(Record layout, void *const *pointers,
         void *deviceSource = deviceRecord ? const_cast<uint8_t *>(deviceRecord + offset) : nullptr;
         void *const *sources = deviceRecord ? &deviceSource : pointers + (expert * 2 + part) * layout.shards;
         const int shards = deviceRecord ? 1 : layout.shards;
-        if (Ordinary(w.type) == w.type) {
-            const size_t alignment = part ? size_t(w.rows) * w.rowBytes / shards : w.rowBytes;
+        if (w.exl3Bits) {
+            fastllm_exl3_shards::Restore(w.rows, w.columns, w.exl3Bits, w.parts,
+                sources, layout.shards, deviceRecord ? static_cast<const uint8_t *>(deviceSource) : nullptr, output);
+        } else if (Ordinary(w.type) == w.type) {
+            const size_t alignment = part ? w.Bytes() / shards : w.rowBytes;
             if (!(alignment & 15)) Rows<uint4>(w, sources, output, shards, part == 0, tile);
             else if (!(alignment & 3)) Rows<uint32_t>(w, sources, output, shards, part == 0, tile);
             else Rows<uint8_t>(w, sources, output, shards, part == 0, tile);
@@ -310,7 +319,7 @@ static __global__ void Records(Record layout, void *const *pointers,
         // Slot payloads include alignment padding, just like canonical snapshots.
         if (blockIdx.x == 0) {
             const size_t end = part ? layout.stride : layout.downOffset;
-            for (size_t i = offset + w.rows * w.rowBytes + threadIdx.x; i < end; i += blockDim.x)
+            for (size_t i = offset + w.Bytes() + threadIdx.x; i < end; i += blockDim.x)
                 record[i] = 0;
         }
     }
@@ -326,7 +335,7 @@ static __global__ void NativeRecords(Record layout, void *const *pointers, uint8
     const int part = blockIdx.z;
     const auto &w = layout.weights[part];
     const size_t offset = part ? layout.downOffset : 0;
-    const size_t bytes = size_t(w.rows) * w.rowBytes / layout.shards;
+    const size_t bytes = w.Bytes() / layout.shards;
     const int requests = count ? *count : 1;
     for (int request = 0; request < requests; ++request) {
         const int expert = experts ? experts[request] : fixedExpert;
@@ -350,7 +359,7 @@ static __global__ void NativeRecords(Record layout, void *const *pointers, uint8
         }
         if (blockIdx.x == 0) {
             const size_t end = part ? layout.stride : layout.downOffset;
-            for (size_t i = offset + size_t(w.rows) * w.rowBytes + threadIdx.x; i < end; i += blockDim.x)
+            for (size_t i = offset + w.Bytes() + threadIdx.x; i < end; i += blockDim.x)
                 record[i] = 0;
         }
     }

@@ -2192,6 +2192,8 @@ bool FastllmCudaMergeMOEGGUFHost(const fastllm::Data &input,
 // Eager single-token decode: generic FP32 or explicitly registered V4.1
 // BF16 math. Adapters execute disjoint CPU/CUDA subsets with shared scheduling.
 bool FastllmCudaCanRunMoeHybrid(fastllm::Data **weights, int weightsBatch);
+// Registered backend has a bounded, cache-aware multi-row implementation.
+bool FastllmCudaCanRunMoeHybridPrefill(fastllm::Data **weights, int weightsBatch);
 bool FastllmCudaMoeCacheFullyResident(fastllm::Data **weights, int weightsBatch);
 // Optional single-token callback runs once after routing copies, never on
 // rejection. It must not reenter the cache or alter its tensor allocations.

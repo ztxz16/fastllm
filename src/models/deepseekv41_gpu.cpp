@@ -50,7 +50,8 @@ namespace fastllm {
 #ifdef USE_CUDA
         markParallel(1);
 #endif
-        const bool fp32ExpertSum =
+        const bool fp32ExpertSum = MoeHasNativeFp32Output(
+            moeWeights.size() > 2 ? moeWeights[2] : nullptr, HybridMoeMath::DeepSeekV41) ||
             quantizedLinearNames.count(pre + ".ffn.experts.0.w1.weight") != 0;
         const bool sharedPartial = ws->sharedExpertPartition == V41SharedExpertPartition::Intermediate;
         bool combineFfnPostDispatch = false;

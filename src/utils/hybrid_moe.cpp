@@ -128,6 +128,10 @@ bool IsSharedHostMoeDevice(const std::string &device) {
     return false;
 #endif
 }
+bool MoeHasNativeFp32Output(const Data *weight, HybridMoeMath math) {
+    return weight && weight->dataType == EXL3 && math == HybridMoeMath::DeepSeekV41;
+}
+
 bool HybridMoeMeasuredNativePrefill(const Data *gate, const Data *down, HybridMoeMath math) {
     if (!gate || !down || gate->dataType != down->dataType) return false;
     switch (gate->dataType) {

@@ -28,6 +28,7 @@ namespace fastllm {
     void RegisterHostMoeWeightBatch(const std::vector<std::pair<Data*, std::string>> &weights,
         bool unbound, const std::function<void(size_t)> &onProgress = {});
     int GetNumasMoeShardCount();
+    std::vector<std::vector<int>> GetNumasExpertWorkerIds();
     // Thread-TP models carry their own device set, independently of the
     // process-wide executor map. Borrow it for one synchronous MoE call.
     class NumasMoeCudaAssistScope {

@@ -152,7 +152,8 @@ namespace fastllm {
                 const auto device = SelectMoeDeviceForLayer(layer);
                 // GPU-resident layers are not members of the host cache.
                 if (!UsesHostMoe(device)) continue;
-                supported &= quantizedLinearNames.count("layers." + std::to_string(layer) + ".ffn.experts.0.w1.weight");
+                supported &= MoeHasNativeFp32Output(weights[layer][2], HybridMoeMath::DeepSeekV41) ||
+                    quantizedLinearNames.count("layers." + std::to_string(layer) + ".ffn.experts.0.w1.weight");
                 routedWeights[layer][0] = routedWeights[layer][1] = nullptr;
                 int owner = tpOwners.empty() ? -1 : tpOwners[size_t(layer) * tpOwners.size() / block_cnt];
                 if (hybridMoeStageOwned || (!tp && stages.size() > 1 &&
@@ -164,7 +165,7 @@ namespace fastllm {
             if (supported && cpuHost) WarmupNumaMoeWeights(true);
             if (!supported || !cache.Prepare(
                     [this] { WarmupNumaMoeWeights(true); }, streamGGUF, mainBudgets, false)) {
-                fprintf(stderr, "[Fastllm] V4.1 expert cache requires host FP8 block128, NVFP4 block32 or supported GGUF experts, "
+                fprintf(stderr, "[Fastllm] V4.1 expert cache requires a supported host weight backend, "
                     "CUDA shared experts and ordinary math; using the configured backend.\n");
             }
             if (supported && !draftWeights.empty()) {
@@ -294,8 +295,10 @@ namespace fastllm {
         // entry point used to bypass it and call the legacy MergeMOEBlock.
         // Keep this bounded to the verifier-sized batch so long prefill keeps
         // its established grouped path.
-        const bool batchCacheCandidate = !tp && !graphActive && !ctx.pipelineHostExperts && !single &&
-            seqlen > 1 && seqlen < 32 && !dumpDebug &&
+        const bool cachedPrefill = seqlen > 1 &&
+            FastllmCudaCanRunMoeHybridPrefill(moeWeights.data(), (int)moeWeights.size());
+        const bool batchCacheCandidate = !tp && !graphActive && !ctx.pipelineHostExperts &&
+            ((!single && seqlen > 1 && seqlen < 32) || cachedPrefill) && !dumpDebug &&
             !V41ReferenceMathEnabled() && UsesHostMoe(overlapMoeDevice);
         if (((step && *step) || singleStageCache || streamingStep || cooperativeMoe ||
              batchCacheCandidate) && hasSharedExpertOut &&

@@ -56,6 +56,10 @@ void RunRemoteHybridMoe(HybridMoeRemoteWorkspace &workspace,
 // Both placements use the same kernels and cache policy in NUMA-enabled builds.
 bool IsSharedHostMoeDevice(const std::string &device);
 
+// The model supplies its activation semantics; the weight backend supplies
+// any native projection/reduction semantics. Storage placement is independent.
+bool MoeHasNativeFp32Output(const Data *weight, HybridMoeMath math);
+
 // Full prefill timings are meaningful for these host-expert layouts. Keep
 // this capability independent of model names and cache capacity.
 bool HybridMoeMeasuredNativePrefill(const Data *gate, const Data *down,
