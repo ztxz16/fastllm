@@ -29,10 +29,10 @@ class AutoConfigTest(unittest.TestCase):
         self.hardware = info, {(a, b): True for a in info for b in info}
         self.ram = {'total': 32 * GiB, 'available': 32 * GiB}
 
-    def resolve(self, a, *, use_numa=True):
+    def resolve(self, a, *, use_numa=True, metadata=None, tensors=None):
         # Keep planning-policy fixtures independent of this host's CPU quota
         # and CUDA device count. CPU calibration has dedicated tests below.
-        with patch.object(memory, 'model_inputs', return_value=({}, [], self.g)), \
+        with patch.object(memory, 'model_inputs', return_value=(metadata or {}, tensors or [], self.g)), \
                 patch.object(memory, 'geometry', return_value=self.g), \
                 patch.object(memory, 'weight_costs', return_value=self.costs), \
                 patch.object(auto, 'cpu_threads', return_value=36), \
@@ -49,6 +49,26 @@ class AutoConfigTest(unittest.TestCase):
                                  [1024] * 8, [1 << 20] * 8, 4, 1024, 1024)
         self.costs = ([4 * GiB] * 8, [1 << 20] * 8, 1 << 20, 1 << 20, 4 * GiB, False)
         self.ram = {'total': 32 * GiB, 'available': 30 * GiB}
+
+    def test_exl3_uses_canonical_numa_weights_with_shared_cuda_cache(self):
+        self.mixed_fixture()
+        self.ram = {'total':128*GiB, 'available':120*GiB}
+        metadata = {}  # Storage capabilities come from tensors, even in mixed checkpoints.
+        tensors = [memory.Tensor('layers.0.ffn.experts.0.w1.weight', (128,128), 6656, 'EXL3')]
+        a = self.args('--device','cuda:0','--moe_device_layers','-1')
+        result = self.resolve(a,metadata=metadata,tensors=tensors)
+        self.assertEqual(result['moe_device'],'numa')
+        self.assertGreater(result['moe_cuda_cache'],0)
+        self.assertEqual(result['resident_expert_layers'],0)
+        explicit = self.resolve(self.args('--device','cuda:0','--moe_device_layers','-1',
+            '--moe_cuda_cache','1g'),metadata=metadata,tensors=tensors)
+        self.assertEqual(explicit['moe_cuda_cache'],GiB)
+        for backend in ('cpu','numa'):
+            plan = self.resolve(self.args('--moe_device',backend),metadata=metadata,tensors=tensors)
+            self.assertEqual(plan['moe_device'],backend)
+            self.assertGreater(plan['moe_cuda_cache'],0)
+        with self.assertRaisesRegex(ValueError,'storage format'):
+            self.resolve(self.args('--moe_device','disk'),metadata=metadata,tensors=tensors)
 
     def test_disk_cache_ratio_default_alias_and_validation(self):
         self.assertEqual(self.args().auto_disk_cache_ratio, .5)

@@ -645,6 +645,14 @@ def _resolve_impl(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
                      "topk": model.topk} if numa_calibration or pair else {})
         if pair:
             workload['down_type'] = pair[1]
+        probes = {}
+        for tensor in tensors:
+            probe = tensor.calibration_override
+            if probe is not None and memory._is_routed_expert(tensor.name):
+                probes[probe] = probes.get(probe, 0) + tensor.bytes
+        if probes:
+            kind = max(probes, key=probes.get)
+            workload = {}
         base.threads, base._cpu_thread_benchmark = select_threads(
             model.hidden, model.intermediate, kind, base.threads, **workload)
     # Dense Qwen3's graph warmup currently hits stream-capture-unsupported
@@ -654,7 +662,7 @@ def _resolve_impl(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
     if disable_qwen3_graph:
         graph_enabled = False
     if (model.family == "deepseek_v41" and "cuda_slab" not in explicit and
-            any(t.kind.startswith("gguf:") and memory._is_routed_expert(t.name) for t in tensors)):
+            any(t.preserve_source and memory._is_routed_expert(t.name) for t in tensors)):
         # Thousands of standalone GGUF expert allocations waste CUDA pages.
         # Reuse the existing persistent weight slabs; explicit zero still wins.
         base.cuda_slab = 64
@@ -699,14 +707,20 @@ def _resolve_impl(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
             os.environ[key] = "1"
             _AUTO_QWEN_ENV_APPLIED[key] = "1"
     ram = ram if ram is not None else memory.host_memory()
-    base._host_moe_shared = numa
+    host_shared = numa
+    base._host_moe_shared = host_shared
     if model.family == "qwen35":
         return _resolve_dense_qwen35(args, base, explicit, metadata, tensors, model,
                                      info, gpu, ram, numa)
-    backends = ["numa" if numa else "cpu", "disk"]
+    disk_supported = all(t.supports_disk for t in tensors if memory._is_routed_expert(t.name))
+    backends = ["numa" if numa else "cpu"]
+    if disk_supported:
+        backends.append("disk")
     if model.family == "deepseek_v41" and numa:
         backends.insert(1, "cpu")
     if "moe_device" in explicit and base.moe_device:
+        if not disk_supported and base.moe_device == "disk":
+            raise ValueError("Expert storage format requires CPU, NUMA or resident CUDA storage")
         backends = [base.moe_device]
     elif getattr(base, "draft_gpu_resident", None) == 1:
         # Disk experts use a separate cache allocator. Do not replace the

@@ -16,6 +16,7 @@ import re
 import struct
 
 from . import gguf_metadata as gguf
+from .weight_formats import Tensor, normalize_checkpoint
 
 GiB = 1 << 30
 MiB = 1 << 20
@@ -57,13 +58,6 @@ def host_budget(args, ram):
     return budget, limit, override
 
 
-@dataclass(frozen=True)
-class Tensor:
-    name: str
-    shape: tuple
-    bytes: int
-    kind: str
-
 
 def _gguf_header(path):
     metadata, tensors = {}, []
@@ -101,6 +95,7 @@ def _gguf_header(path):
             # Include alignment padding rather than duplicating ggml's type table.
             tensors.append(Tensor(name, shape[::-1], end - offset, "gguf:%d" % kind))
     return metadata, tensors
+
 
 
 def inventory(path):
@@ -182,6 +177,23 @@ def inventory(path):
                     tensors.append(Tensor(key, tuple(item["shape"]), end - start, kind))
         if weight_map is not None and set(weight_map) != {t.name for t in tensors}:
             raise ValueError("Hybrid auto: incomplete safetensors checkpoint")
+    tensors = normalize_checkpoint(metadata, tensors)
+    if not path.is_file():
+        engram_path = os.environ.get("FASTLLM_DSV41_ENGRAM_PATH") or metadata.get("engram_table_dir")
+        if engram_path:
+            external_path = Path(engram_path)
+            if external_path.resolve() != path.resolve():
+                _, external = inventory(external_path)
+                tables = [t for t in external if ".engram.embed." in t.name]
+                if not tables:
+                    raise ValueError("External Engram checkpoint contains no lookup tables")
+                names = {t.name for t in tables}
+                tensors = [t for t in tensors if t.name not in names] + tables
+        names = {t.name for t in tensors}
+        for layer in (metadata.get("text_config") or metadata).get("engram_layer_ids", []):
+            prefix = "layers.%d.engram.embed." % layer
+            if prefix + "weight" not in names or prefix + "scale" not in names:
+                raise ValueError("Checkpoint is missing Engram tables; supply --engram-path")
     if metadata.get("general.architecture") == "deepseek41" and metadata.get("deepseek41.engram.present"):
         name = metadata["deepseek41.engram.file"]
         if not name or name in (".", "..") or "/" in name or "\\" in name:
@@ -877,7 +889,7 @@ def weight_costs(tensors, model, args):
             # NUMA Q5_K/Q6_K R4 cannot currently be restored by the cache;
             # the entire cache group takes its established host snapshot.
             snapshot = True
-        if is_expert and name.endswith(".weight") and not tensor.kind.startswith("gguf:"):
+        if is_expert and name.endswith(".weight") and not tensor.preserve_source:
             target = args.moe_dtype or args.dtype
             dense_expert = target in ("float16", "bfloat16", "float32") or (
                 target == "auto" and tensor.kind in ("F16", "BF16", "F32"))
@@ -888,7 +900,7 @@ def weight_costs(tensors, model, args):
                     not ((tensor.kind in ("U8", "I8") and target in ("auto", "nvfp4")) or
                          (tensor.kind in ("F8_E4M3", "F8_E4M3FN") and target in ("auto", "fp8_e4m3")))):
                 raise ValueError("Hybrid auto: this model's NUMA CUDA cache requires GGUF, native FP8 E4M3 or packed FP4 experts")
-        if not tensor.kind.startswith("gguf:"):
+        if not tensor.preserve_source:
             dtype = (args.moe_dtype or args.dtype) if is_expert or is_shared else args.dtype
             if dtype not in ("auto", "float16", "bfloat16", "float32", "fp8_e4m3", "nvfp4"):
                 raise ValueError("Hybrid auto: unsupported HF target weight precision " + dtype)

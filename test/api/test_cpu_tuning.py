@@ -59,6 +59,13 @@ class CpuTuningTest(unittest.TestCase):
         self.assertEqual(chosen, 8)
         self.assertEqual(detail['selected'], 8)
 
+    def test_exl3_kind_uses_its_own_calibration(self):
+        with patch.object(tuning,'_measure',return_value={'samples_ms':{'1':3,'2':2,'4':1}}) as probe:
+            chosen,detail=tuning.select_threads(5120,2304,-6,4)
+        probe.assert_called_once_with(5120,2304,-6,(1,2,4))
+        self.assertEqual(chosen,4)
+        self.assertEqual(detail['method'],'quantized-gemv')
+
     def test_failed_calibration_preserves_original_limit(self):
         for limit in (1, 6, 9, 28, 128):
             for error in (subprocess.TimeoutExpired('probe', 10), OSError('library unavailable'),

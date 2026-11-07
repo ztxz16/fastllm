@@ -2,6 +2,7 @@
 
 #include "devices/cpu/computeutils.h"
 #include "gguf.h"
+#include "exl3.h"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -11,10 +12,77 @@
 #include <stdexcept>
 #include <vector>
 
+// Negative linear calibration kinds encode EXL3's twice-bits value. Keep
+// its actual decoder and worker pool, rather than timing an unrelated GGUF.
+static std::string BenchmarkCpuExl3Threads(int hidden, int intermediate, int bits,
+        const int *counts, int count, int budgetMs) {
+    using namespace fastllm;
+    using Clock=std::chrono::steady_clock;
+    if(!Exl3BitRateSupported(bits) || hidden<128 || hidden>8192 || intermediate<128 ||
+       intermediate>8192 || hidden%128 || intermediate%128) throw std::runtime_error("invalid EXL3 calibration shape");
+    const auto start=Clock::now();
+    auto elapsed=[&]{return std::chrono::duration<double,std::milli>(Clock::now()-start).count();};
+    const size_t pairBytes=2*Exl3PartBytes(intermediate,hidden,bits)+Exl3PartBytes(hidden,intermediate,bits);
+    const int banks=std::clamp(int(((32ull<<20)+pairBytes-1)/pairBytes),2,8);
+    std::vector<std::unique_ptr<Data>> weights;
+    uint32_t random=9127;
+    for(int bank=0;bank<banks;++bank) for(int part=0;part<2;++part) {
+        auto w=std::make_unique<Data>(EXL3);
+        w->blockK=bits; w->blockM=part?1:2;
+        const int k=part?intermediate:hidden,n=part?hidden:intermediate;
+        w->Resize({w->blockM*n,k}); w->Allocate(false);
+        const size_t trellis=size_t(k)*n*bits/16, stride=Exl3PartBytes(n,k,bits);
+        for(int projection=0;projection<w->blockM;++projection) {
+            auto *data=w->cpuData+projection*stride;
+            for(size_t at=0;at<trellis;at+=4) {
+                random=random*1664525u+1013904223u; std::memcpy(data+at,&random,4);
+            }
+            auto *scales=reinterpret_cast<uint16_t *>(data+trellis);
+            std::fill_n(scales,k+n,uint16_t(0x2800));
+        }
+        weights.push_back(std::move(w));
+    }
+    Data x(FLOAT32,{1,hidden}),downX(FLOAT32,{1,intermediate}),
+        gateY(FLOAT32,{1,2*intermediate}),downY(FLOAT32,{1,hidden}),empty;
+    for(auto *v:{&x,&downX}) {
+        v->Allocate(false);
+        for(int i=0;i<v->Count(0);++i) reinterpret_cast<float *>(v->cpuData)[i]=float(i%31-15)/32;
+    }
+    int next=0;
+    auto pass=[&] {
+        const int bank=next++%banks;
+        Exl3LinearCPU(x,*weights[2*bank],empty,gateY);
+        Exl3LinearCPU(downX,*weights[2*bank+1],empty,downY);
+    };
+    SetThreads(1);pass();
+    const double setup=elapsed();
+    std::ostringstream samples; int previous=0;
+    for(int i=0;i<count;++i) {
+        const int threads=counts[i];
+        if(threads<=previous || threads>128 || elapsed()>=budgetMs) break;
+        previous=threads; SetThreads(threads);pass();
+        std::vector<double> times;
+        for(int repeat=0;repeat<3;++repeat) {
+            const auto begin=Clock::now();pass();
+            times.push_back(std::chrono::duration<double,std::milli>(Clock::now()-begin).count());
+        }
+        if(!std::isfinite(reinterpret_cast<float *>(downY.cpuData)[0])) throw std::runtime_error("nonfinite EXL3 calibration output");
+        std::sort(times.begin(),times.end());
+        if(i) samples<<',';
+        samples<<'"'<<threads<<"\":"<<times[1];
+    }
+    std::ostringstream out;
+    out<<"{\"samples_ms\":{"<<samples.str()<<"},\"setup_ms\":"<<setup<<",\"native_elapsed_ms\":"<<elapsed()
+       <<",\"hidden\":"<<hidden<<",\"intermediate\":"<<intermediate<<",\"kernel_type\":\"exl3\",\"twice_bits\":"<<bits
+       <<",\"weight_bytes\":"<<pairBytes*banks<<'}';
+    return out.str();
+}
+
 // Only invoked by cpu_tuning.py's short-lived subprocess, so calibration's
 // synthetic weights and cache state do not affect the inference process.
 static std::string BenchmarkCpuLinearThreads(int hidden, int intermediate, int kind,
                                             const int *counts, int count, int budgetMs) {
+    if (kind < 0) return BenchmarkCpuExl3Threads(hidden, intermediate, -kind, counts, count, budgetMs);
     using namespace fastllm;
     using Clock = std::chrono::steady_clock;
     const auto started = Clock::now();
