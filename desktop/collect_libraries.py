@@ -174,7 +174,11 @@ def collect(args: argparse.Namespace) -> Dict[str, object]:
         item for item in (str(output), str(root), os.environ.get("LD_LIBRARY_PATH", "")) if item
     )
 
-    queue = deque(iter_initial_elfs(root, output, excludes))
+    initial_elfs = list(iter_initial_elfs(root, output, excludes))
+    existing_libraries: Dict[str, List[Path]] = {}
+    for binary in initial_elfs:
+        existing_libraries.setdefault(binary.name, []).append(binary)
+    queue = deque(initial_elfs)
     scanned = set()
     bundled: Dict[str, Dict[str, Optional[str]]] = {}
     host: Dict[str, Dict[str, Optional[str]]] = {}
@@ -188,7 +192,14 @@ def collect(args: argparse.Namespace) -> Dict[str, object]:
             if not filecmp.cmp(source, target, shallow=False):
                 raise RuntimeError(f"Conflicting resolutions for {soname}: {source} and {target}")
         else:
-            shutil.copy2(source, target)
+            # Reuse an identical library already shipped by another runtime
+            # (for example FFmpeg), keeping links valid after relocation.
+            existing = next((path for path in existing_libraries.get(soname, [])
+                             if filecmp.cmp(source, path, shallow=False)), None)
+            if existing is not None:
+                target.symlink_to(os.path.relpath(existing, target.parent))
+            else:
+                shutil.copy2(source, target)
 
         package = owning_package(source) if has_dpkg_query else None
         copyright_name = copy_copyright(package, copyright_dir) if package else None
@@ -201,7 +212,8 @@ def collect(args: argparse.Namespace) -> Dict[str, object]:
 
     for soname, optional_path in find_optional_libraries(args.optional).items():
         bundle_library(soname, optional_path)
-    for soname, source in find_nss_libraries().items():
+    nss_libraries = {} if getattr(args, "no_nss", False) else find_nss_libraries()
+    for soname, source in nss_libraries.items():
         bundle_library(soname, source)
         checksum = source.with_suffix(".chk")
         if checksum.is_file():
@@ -279,6 +291,7 @@ def main() -> int:
     parser.add_argument("--copyrights", type=Path, required=True, help="Directory for distro copyright files")
     parser.add_argument("--exclude", action="append", default=[], type=Path, help="Subtree not scanned")
     parser.add_argument("--optional", action="append", default=[], help="Runtime-loaded SONAME to include")
+    parser.add_argument("--no-nss", action="store_true", help="Skip Electron-specific NSS modules for non-browser tools")
     args = parser.parse_args()
     try:
         report = collect(args)

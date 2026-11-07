@@ -35,7 +35,8 @@ this setting cannot widen it. Visibility restrictions do not reserve GPUs exclus
 
 To launch video:
 
-1. Build `minimax_h3_server` using the [H3 instructions](../tools/minimax_h3/README.md).
+1. Release wheels and portable packages include `minimax_h3_server`; leave its path empty.
+   For source installations or older wheels, follow the [H3 build instructions](../tools/minimax_h3/README.md).
    Enter its absolute path, add it to `PATH`, or set `FTLLM_H3_SERVER`. The source
    `build` and `build-cuda` directories are also searched.
 2. Choose the video backend, model directory, port and GPUs. Pika is detected

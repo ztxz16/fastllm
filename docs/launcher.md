@@ -54,7 +54,8 @@ Harness、OpenCode、Codex、Claude 共用各自的安装和工作目录，每�
 
 视频启动流程：
 
-1. 按 [H3 构建说明](../tools/minimax_h3/README.md#构建) 编译 `minimax_h3_server`。
+1. 发布 wheel 和绿色包内置 `minimax_h3_server`，可将可执行文件路径留空。
+   源码安装或旧版 wheel 按 [H3 构建说明](../tools/minimax_h3/README.md#构建) 编译该服务。
    在启动项中填写该可执行文件的绝对路径，也可将其加入 `PATH`，或设置
    `FTLLM_H3_SERVER=/path/to/minimax_h3_server`。源码 `build` / `build-cuda` 目录也会自动查找。
 2. 选择视频后端，填写 H3 或 Pika 模型目录、监听地址、端口、API Key 和可用 GPU。

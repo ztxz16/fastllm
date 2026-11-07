@@ -115,11 +115,11 @@ run "$CMAKE" --build "$BUILD_DIR/cpu" --target fastllm_tools --parallel "$CPU_JO
 printf 'CPU build: %s seconds\n' "$((SECONDS - START_SECONDS))"
 CUDA_START_SECONDS=$SECONDS
 run "$CMAKE" -S "$SOURCE_DIR" -B "$BUILD_DIR/cuda" "${COMMON[@]}" \
-    -DUSE_CUDA=ON -DCUDA_ARCH="$CUDA_ARCH_LIST" -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCH_LIST" \
+    -DUSE_CUDA=ON -DBUILD_MINIMAX_H3=ON -DCUDA_ARCH="$CUDA_ARCH_LIST" -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCH_LIST" \
     -DCMAKE_CUDA_HOST_COMPILER="$CXX" -DCMAKE_CUDA_COMPILER="$CUDA_COMPILER" \
     -DFASTLLM_CUDA_COMPRESSION="$COMPRESSION" \
     "-DCMAKE_CUDA_FLAGS=--threads=$NVCC_THREADS --split-compile=$NVCC_SPLIT_COMPILE"
-run "$CMAKE" --build "$BUILD_DIR/cuda" --target fastllm_tools --parallel "$CUDA_JOBS"
+run "$CMAKE" --build "$BUILD_DIR/cuda" --target fastllm_tools minimax_h3_server minimax_h3_generate --parallel "$CUDA_JOBS"
 printf 'CUDA build: %s seconds\n' "$((SECONDS - CUDA_START_SECONDS))"
 run "$PYTHON" "$SOURCE_DIR/tools/wheel/package_wheel.py" \
     --source-dir "$SOURCE_DIR" --build-dir "$BUILD_DIR" --output-dir "$OUTPUT_DIR" --max-glibc "$MAX_GLIBC" \

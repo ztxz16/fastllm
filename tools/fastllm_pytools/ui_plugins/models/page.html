@@ -62,11 +62,11 @@
                 <section class="model-selection-section" aria-labelledby="model-selection-title">
                   <div class="setup-section-heading"><span aria-hidden="true">01</span><h3 id="model-selection-title">文件选择</h3></div>
                   <label class="field"><span>模型类型 / 后端</span><select data-field="backend" id="model-backend">
-                    <option value="llm">LLM · FastLLM</option>
-                    <option value="minimax_h3">视频 · MiniMax H3 / Pika H3</option>
+                    <option value="llm">llm</option>
+                    <option value="minimax_h3">视频（minimax h3）系列模型</option>
                   </select></label>
                   <div class="field model-path-field">
-                    <label class="visually-hidden" for="model-path">模型路径</label>
+                    <label for="model-path">模型路径</label>
                     <div class="path-input-with-button">
                       <input id="model-path" data-field="model" data-path-input type="text" list="path-suggestions" placeholder="/path/to/model 或 /path/to/model.gguf" spellcheck="false">
                       <button id="choose-model-folder" class="folder-picker-button" type="button"><span class="folder-button-icon" aria-hidden="true"></span>浏览文件或文件夹</button>
@@ -74,11 +74,11 @@
                     <small>选择运行 Launcher 的机器上的模型文件夹、GGUF 或 FastLLM 模型文件。</small>
                   </div>
                   <div id="video-backend-fields" class="form-grid two-columns hidden">
-                    <label class="field"><span>H3 服务可执行文件</span><input data-field="server_binary" data-path-input type="text" placeholder="/path/to/minimax_h3_server"><small>留空时从 PATH、FTLLM_H3_SERVER 或源码 build 目录查找。</small></label>
-                    <label class="field"><span>MiniMax H3 基座目录（Pika 可选）</span><input data-field="base_model" data-path-input type="text" placeholder="/path/to/MiniMax-H3"><small>自动识别 Pika；基座放在相邻 MiniMax-H3 目录时可留空。</small></label>
+                    <label class="field span-2"><span>H3 服务可执行文件</span><input data-field="server_binary" data-path-input type="text" placeholder="/path/to/minimax_h3_server"><small>留空使用内置视频后端；也可填写自定义路径。</small></label>
+                    <label class="field span-2"><span>MiniMax H3 基座目录（Pika 可选）</span><input data-field="base_model" data-path-input type="text" placeholder="/path/to/MiniMax-H3"><small>自动识别 Pika；基座放在相邻 MiniMax-H3 目录时可留空。</small></label>
                     <label class="field span-2"><span>视频输出目录（可选）</span><input data-field="output_dir" data-path-input type="text" placeholder="~/.local/share/fastllm/videos/端口"></label>
-                    <label class="field span-2"><span>每卡显存预算（GiB，可选）</span><input data-field="video_gpu_memory_limit" type="number" min="0" step="any" placeholder="0"><small>留空或 0 保留原有速度；预算充足时权重驻留，较小时逐层加载。启动时预留显存。</small></label>
-                    <label class="field span-2"><span>主机内存预算（GiB，可选）</span><input data-field="video_host_memory_limit" type="number" min="0" step="any" placeholder="0"><small>留空或 0 使用默认缓存；2 表示从磁盘分块读取，较大预算用于缓存权重。另需为系统和媒体处理留出内存。</small></label>
+                    <label class="field"><span>每卡显存预算（GiB，可选）</span><input data-field="video_gpu_memory_limit" type="number" min="0" step="any" placeholder="0"><small>留空或 0 保留原有速度；预算充足时权重驻留，较小时逐层加载。启动时预留显存。</small></label>
+                    <label class="field"><span>主机内存预算（GiB，可选）</span><input data-field="video_host_memory_limit" type="number" min="0" step="any" placeholder="0"><small>留空或 0 使用默认缓存；2 表示从磁盘分块读取，较大预算用于缓存权重。另需为系统和媒体处理留出内存。</small></label>
                   </div>
                 </section>
 
@@ -270,6 +270,33 @@
                   </div>
                 </details>
 
+                <details id="editor-speculative" class="advanced-section speculative-section">
+                  <summary><span><strong>推测解码（可选）</strong><small>外挂草稿文件、草稿数量与置信度阈值</small></span><i aria-hidden="true"></i></summary>
+                  <div class="advanced-content">
+                    <label class="switch-field">
+                      <input type="checkbox" data-field="use_external_draft" id="use-external-draft">
+                      <span><strong>启用外挂草稿文件</strong><small>选择外置 MTP、DFlash2 或 DSpark 草稿模型，自动配置时也会使用。</small></span>
+                    </label>
+                    <div id="speculative-options" class="form-grid two-columns">
+                      <div id="speculative-path-field" class="field span-2">
+                        <label for="draft-model-path">外挂草稿文件 / 目录</label>
+                        <div class="path-input-with-button">
+                          <input id="draft-model-path" data-field="speculative_draft_model_path" data-path-input type="text" list="path-suggestions" placeholder="选择草稿模型文件或目录" spellcheck="false">
+                          <button id="choose-draft-model-folder" class="folder-picker-button" type="button"><span class="folder-button-icon" aria-hidden="true"></span>浏览文件或文件夹</button>
+                        </div>
+                      </div>
+                      <label class="field"><span>算法</span><select data-field="speculative_algorithm">
+                        <option value="off">关闭推测解码</option><option value="auto">自动识别</option>
+                        <option value="mtp">MTP</option><option value="dflash">DFlash2</option><option value="dspark">DSpark</option>
+                      </select></label>
+                      <label id="speculative-mtp-field" class="field"><span>草稿数量</span><input data-field="mtp" type="text" placeholder="auto / 0-8"></label>
+                      <label id="speculative-draft-tokens-field" class="field"><span>草稿数量</span><input data-field="draft_tokens" type="text" placeholder="auto"><small>每轮最多使用的草稿 token 数；auto 使用模型默认值。</small></label>
+                      <label id="speculative-threshold-field" class="field span-2"><span>草稿阈值</span><input data-field="draft_threshold" type="number" min="0" max="1" step="any" placeholder="0.5"><small>仅对 DSpark 生效；留空为 0.5，0 表示不按置信度提前截短草稿。</small></label>
+                    </div>
+                    <p id="speculative-mode-hint" class="configuration-mode-description"></p>
+                  </div>
+                </details>
+
                 <div id="profile-parameters">
                 <nav class="editor-navigation" aria-label="配置分区">
                   <button type="button" data-editor-section="basic">基础配置</button>
@@ -277,37 +304,7 @@
                   <button type="button" data-editor-section="hybrid">混合推理</button>
                   <button type="button" data-editor-section="advanced">高级设置</button>
                 </nav>
-                <section id="editor-speculative" class="form-section speculative-section">
-                  <div class="section-title"><strong>推测解码</strong><small>支持内置 MTP 以及外置 MTP、DFlash2、DSpark</small></div>
-                  <div class="form-grid four-columns">
-                    <label class="field">
-                      <span>算法</span>
-                      <select data-field="speculative_algorithm">
-                        <option value="off">关闭推测解码</option>
-                        <option value="auto">自动识别</option>
-                        <option value="mtp">MTP</option>
-                        <option value="dflash">DFlash2</option>
-                        <option value="dspark">DSpark</option>
-                      </select>
-                    </label>
-                    <label id="speculative-mtp-field" class="field">
-                      <span>每轮 Draft Token 数</span>
-                      <input data-field="mtp" type="text" placeholder="auto / 0-8">
-                    </label>
-                    <label id="speculative-draft-tokens-field" class="field">
-                      <span>每轮 Draft Token 数</span>
-                      <input data-field="draft_tokens" type="text" placeholder="auto">
-                    </label>
-                    <div id="speculative-path-field" class="field span-2">
-                      <label for="draft-model-path">Draft 模型路径</label>
-                      <div class="path-input-with-button">
-                        <input id="draft-model-path" data-field="speculative_draft_model_path" data-path-input type="text" list="path-suggestions" placeholder="留空使用模型内置能力" spellcheck="false">
-                        <button id="choose-draft-model-folder" class="folder-picker-button" type="button"><span class="folder-button-icon" aria-hidden="true"></span>浏览文件或文件夹</button>
-                      </div>
-                    </div>
-                  </div>
-                  <p id="speculative-mode-hint" class="configuration-mode-description"></p>
-                </section>
+
 
                 <section id="editor-hybrid" class="form-section hybrid-inference-section">
                   <div class="section-title"><strong>混合推理配置</strong><small>为 MoE 专家层和大型 N-gram 表选择独立存储设备</small></div>

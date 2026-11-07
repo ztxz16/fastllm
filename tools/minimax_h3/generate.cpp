@@ -21,6 +21,18 @@ int main(int argc, char **argv) {
         std::vector<std::pair<Reference::Kind, std::string>> references;
         for (int i = 1; i < argc; ++i) {
             std::string arg = argv[i];
+            if (arg == "--help" || arg == "-h") {
+                std::cout << R"(Usage: minimax_h3_generate --model PATH --prompt TEXT [options]
+  --output FILE --width N --height N --frames N --steps N --seed N
+  --device ID[,ID] --precision bf16|fp32 --vae-precision fp16|bf16|fp32
+  --gpu-memory-limit SIZE --host-memory-limit SIZE --ffmpeg PATH
+  --pika PATH --base-model PATH --trace DIRECTORY
+  --initial-video FILE --initial-audio FILE --first-frame FILE --last-frame FILE
+  --reference-image FILE --reference-video FILE --reference-audio FILE
+  --reference-image-short-edge N --reference-video-short-edge N
+)";
+                return 0;
+            }
             if (i + 1 >= argc)
                 throw std::invalid_argument("missing value for " + arg);
             std::string v = argv[++i];

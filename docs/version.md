@@ -2,6 +2,14 @@
 
 [English](version_en.md)
 
+## V1.9.1
+
+- 新增 Clover、Qwen-Image、HY-Nomas、LingBot World、MiniMax-H3 和 Pika-H3-Flex 模型支持
+- 完善启动器，支持多模型管理、视频生成和外挂草稿配置
+- 优化推测解码、并发和混合推理，完善 KV 缓存与多副本部署
+- 完善 Wheel 和绿色包，补齐 NCCL、视频后端及媒体工具依赖
+- 修复了一些 bug
+
 ## V1.9.0
 
 - 新增 `--auto` 参数，支持自动调参和部署

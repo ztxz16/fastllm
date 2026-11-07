@@ -13,7 +13,7 @@ video_require = ['imageio', 'imageio-ffmpeg']
 all_require = server_require + download_require + tokenizer_require + video_require + pptx_require + document_require + data_require
 
 PACKAGE_INFO = {
-    "release": {"name": "ftllm", "version": "1.9.0"},
+    "release": {"name": "ftllm", "version": "1.9.1"},
     "nightly": {"name": "ftllm-nightly", "version": "0.0.0.3"},
 }
 
@@ -70,7 +70,7 @@ setup (
         '': ['*.dll', '*.so', '*.dylib', '*.so.*', '*.html', '*.js', '*.mjs', '*.svg', 'build_info.json',
              'fastllm_triton_server.py', 'launcher_assets/*',
              'launcher_assets/locales/*.json', 'webui_assets/*',
-             'ui_plugins/*/*', 'plugin_assets/*']
+             'ui_plugins/*/*', 'plugin_assets/*', 'minimax_h3_server', 'minimax_h3_generate', 'h3_assets/*']
     },
     install_requires=[
         'pyreadline3',

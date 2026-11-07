@@ -110,6 +110,8 @@ class DeployConfig:
     speculative_algorithm: str = "auto"
     speculative_draft_model_path: str = ""
     draft_tokens: str = "auto"
+    use_external_draft: Optional[bool] = None
+    draft_threshold: str = ""
     max_batch: str = "auto"
     max_context_length: str = "auto"
     rope_scaling: str = ""
@@ -987,9 +989,13 @@ def normalize_moe_hybrid_config(
 
 
 def _normalize_speculative_config(config: DeployConfig) -> DeployConfig:
+    # None preserves saved profiles created before the external-draft switch.
+    if config.use_external_draft is False:
+        config = replace(config, speculative_draft_model_path="")
     if str(config.speculative_algorithm).strip().lower() == "off":
         return replace(config, speculative_algorithm="off", mtp="0", draft_tokens="auto",
-                       speculative_draft_model_path="", enable_speculative_decoding=False)
+                       speculative_draft_model_path="", enable_speculative_decoding=False,
+                       use_external_draft=False, draft_threshold="")
     return config
 
 
@@ -1013,6 +1019,9 @@ def _runtime_auto_config(config: DeployConfig) -> DeployConfig:
                       "api_key", "hide_input", "config_mode", "auto_gpu_memory_limit",
                       "auto_host_memory_limit", "force_ddr_limit", "mmproj",
                       "extra_args", "env_vars", *AUTO_TUNING_OPTIONS)
+    if config.use_external_draft is True:
+        service_fields += ("use_external_draft", "speculative_algorithm", "speculative_draft_model_path",
+                           "mtp", "draft_tokens", "draft_threshold")
     return DeployConfig(**{name: getattr(config, name) for name in service_fields})
 
 
@@ -1026,7 +1035,7 @@ def config_from_dict(data: dict) -> DeployConfig:
         if key not in valid_keys:
             continue
         default = getattr(config, key)
-        if isinstance(default, bool):
+        if isinstance(default, bool) or (key == "use_external_draft" and value is not None):
             if isinstance(value, str):
                 value = value.strip().lower() in ("1", "true", "yes", "on")
             else:
@@ -1177,6 +1186,18 @@ def complete_path_prefix(raw_prefix: str, directories_only: bool = False) -> Lis
     return [value for _, value in matches]
 
 
+def _add_speculative_options(argv: List[str], config: DeployConfig):
+    if config.speculative_algorithm == "off":
+        return
+    _add_option(argv, "--mtp", _optional_text(config.mtp))
+    _add_option(argv, "--speculative_algorithm", _optional_text(config.speculative_algorithm))
+    _add_option(argv, "--speculative_draft_model_path",
+                _expand_user_path(config.speculative_draft_model_path.strip()))
+    _add_option(argv, "--draft_tokens", _optional_text(config.draft_tokens))
+    if config.speculative_algorithm in ("", "auto", "dspark"):
+        _add_option(argv, "--speculative_dspark_confidence_threshold", _optional_text(config.draft_threshold))
+
+
 def build_fastllm_argv(config: DeployConfig) -> List[str]:
     if config.backend != "llm":
         from .service_backends import get_backend
@@ -1201,8 +1222,12 @@ def build_fastllm_argv(config: DeployConfig) -> List[str]:
             _add_option(argv, "--" + option, value)
         if config.hide_input:
             argv.append("--hide_input")
+        if config.use_external_draft is True:
+            _add_speculative_options(argv, config)
         if config.extra_args.strip():
             argv.extend(shlex.split(config.extra_args))
+        if config.speculative_algorithm == "off":
+            argv.extend(["--speculative_algorithm", "off"])
         return argv
 
     if config.command == "webui":
@@ -1247,15 +1272,7 @@ def build_fastllm_argv(config: DeployConfig) -> List[str]:
     _add_option(argv, "--moe_dtype", moe_dtype)
     _add_option(argv, "-t", _optional_text(config.threads))
     _add_option(argv, "--kv_cache_limit", _optional_text(config.kv_cache_limit))
-    if config.speculative_algorithm != "off":
-        _add_option(argv, "--mtp", _optional_text(config.mtp))
-        _add_option(argv, "--speculative_algorithm", _optional_text(config.speculative_algorithm))
-    _add_option(
-        argv,
-        "--speculative_draft_model_path",
-        _expand_user_path(config.speculative_draft_model_path.strip()),
-    )
-    _add_option(argv, "--draft_tokens", _optional_text(config.draft_tokens))
+    _add_speculative_options(argv, config)
     _add_option(argv, "--max_batch", _optional_text(config.max_batch))
     _add_option(argv, "--cache_dir", _expand_user_path(config.cache_dir.strip()))
     if is_gguf_model(config.model):
@@ -1378,7 +1395,15 @@ def validate_config(config: DeployConfig, field_errors: Optional[List[dict]] = N
     ):
         add_error("推测算法必须是 off、auto、mtp、dflash 或 dspark。", "speculative_algorithm")
 
+    if config.speculative_algorithm in ("", "auto", "dspark") and _optional_text(config.draft_threshold):
+        try:
+            if not 0 <= float(config.draft_threshold) <= 1:
+                raise ValueError()
+        except (TypeError, ValueError):
+            add_error("草稿阈值必须是 0 到 1 之间的数字；留空使用默认值 0.5。", "draft_threshold")
     draft_path = _expand_user_path(config.speculative_draft_model_path.strip())
+    if config.use_external_draft is True and not draft_path:
+        add_error("启用外挂草稿文件后必须选择草稿模型文件或目录。", "speculative_draft_model_path")
     draft_path_exists = bool(
         draft_path
         and (os.path.isdir(draft_path) or os.path.isfile(draft_path))
