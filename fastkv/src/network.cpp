@@ -26,22 +26,26 @@ Socket &Socket::operator=(Socket &&s) noexcept {
         ::close(fd);
     fd = s.fd;
     stopped = s.stopped;
+    cancellation = std::move(s.cancellation);
     s.fd = -1;
     return *this;
 }
 void Socket::CheckRunning(Deadline deadline) const {
     Require(!stopped || !stopped->load(), "FastKV: service stopped");
+    Require(!cancellation || !cancellation->Cancelled(), "FastKV: request cancelled");
     Require(std::chrono::steady_clock::now() < deadline, "FastKV: transport deadline exceeded");
 }
-static void Wait(int fd, short events, Deadline deadline, const std::atomic<bool> *stopped) {
+static void Wait(int fd, short events, Deadline deadline, const std::atomic<bool> *stopped,
+                 const Cancellation *cancellation = nullptr) {
     for (;;) {
         Require(!stopped || !stopped->load(), "FastKV: service stopped");
+        Require(!cancellation || !cancellation->Cancelled(), "FastKV: request cancelled");
         auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline -
                                                                           std::chrono::steady_clock::now())
                         .count();
         Require(left > 0, "FastKV: transport deadline exceeded");
         pollfd p{fd, events, 0};
-        int n = poll(&p, 1, int(std::min<int64_t>(left, 1000)));
+        int n = poll(&p, 1, int(std::min<int64_t>(left, cancellation ? 50 : 1000)));
         if (n < 0 && errno == EINTR)
             continue;
         if (n < 0)
@@ -63,7 +67,7 @@ void Socket::Send(const void *data, size_t n, Deadline d) const {
         ssize_t k = ::send(fd, p, n, 0);
 #endif
         if (k < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            Wait(fd, POLLOUT, d, stopped);
+            Wait(fd, POLLOUT, d, stopped, cancellation.get());
             continue;
         }
         if (k < 0 && errno == EINTR)
@@ -82,7 +86,7 @@ void Socket::Receive(void *data, size_t n, Deadline d) const {
         CheckRunning(d);
         ssize_t k = ::recv(fd, p, n, 0);
         if (k < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            Wait(fd, POLLIN, d, stopped);
+            Wait(fd, POLLIN, d, stopped, cancellation.get());
             continue;
         }
         if (k < 0 && errno == EINTR)
@@ -131,7 +135,8 @@ static std::pair<std::string, std::string> SplitAddress(const std::string &s) {
     return {host, s.substr(i + 1)};
 }
 static Socket Open(const std::string &endpoint, bool listen, Deadline deadline,
-                   const std::atomic<bool> *stopped = nullptr) {
+                   const std::atomic<bool> *stopped = nullptr,
+                   std::shared_ptr<Cancellation> cancellation = {}) {
     auto parts = SplitAddress(endpoint);
     addrinfo hints{}, *raw = nullptr;
     hints.ai_family = AF_UNSPEC;
@@ -146,6 +151,8 @@ static Socket Open(const std::string &endpoint, bool listen, Deadline deadline,
     for (auto *a = raw; a; a = a->ai_next) {
         try {
             Socket socket(::socket(a->ai_family, a->ai_socktype, a->ai_protocol), stopped);
+            socket.cancellation = cancellation;
+            socket.CheckRunning(deadline);
             if (socket.fd < 0)
                 throw SystemError("socket");
             Configure(socket.fd);
@@ -157,7 +164,7 @@ static Socket Open(const std::string &endpoint, bool listen, Deadline deadline,
             } else if (connect(socket.fd, a->ai_addr, a->ai_addrlen) < 0) {
                 if (errno != EINPROGRESS)
                     throw SystemError("connect");
-                Wait(socket.fd, POLLOUT, deadline, stopped);
+                Wait(socket.fd, POLLOUT, deadline, stopped, cancellation.get());
                 int status = 0;
                 socklen_t len = sizeof(status);
                 if (getsockopt(socket.fd, SOL_SOCKET, SO_ERROR, &status, &len) < 0)
@@ -243,12 +250,12 @@ struct Service::Impl {
     Options options;
     Budget budget, clientSlots, serverSlots, handlerSlots;
     BufferPool receiveBuffers, sendBuffers;
-    std::mutex receiveAllocationMutex;
+    std::timed_mutex receiveAllocationMutex;
     // Separate request and reply lanes: a new request handshake must never
     // wait behind a reply whose receiver is occupied sending that request.
     Pool servers, clients, sendReplies, receiveReplies;
     Socket listener;
-    AsyncHandler handler;
+    CancellableHandler handler;
     std::thread acceptor, progress;
     std::condition_variable wake;
     enum class Stage { Connect, ReceiveRequest, IdleRequest, Admit, Handler, Reply, Drain };
@@ -271,6 +278,8 @@ struct Service::Impl {
     struct Exchange {
         std::shared_ptr<Channel> channel;
         std::shared_ptr<void> slot, handlerSlot;
+        std::shared_ptr<void> lifetime;
+        std::shared_ptr<Cancellation> cancellation = std::make_shared<Cancellation>();
         Message request;
         std::future<Message> result;
         std::promise<Message> completion;
@@ -282,6 +291,7 @@ struct Service::Impl {
             : slot(std::move(slot)),
               deadline(std::chrono::steady_clock::now() + std::chrono::milliseconds(owner.options.timeoutMs)),
               stage(server ? Stage::ReceiveRequest : Stage::Connect), server(server) {}
+        ~Exchange() { channel.reset(); } // QP teardown before caller admission is released
     };
     std::multimap<std::string, std::shared_ptr<Channel>> idleClients;
     std::set<std::string> legacyPeers;
@@ -291,11 +301,12 @@ struct Service::Impl {
     std::atomic<bool> stopped{false};
     std::atomic<uint64_t> tcpBytes{0}, rdmaBytes{0}, calls{0}, failures{0};
     std::atomic<uint64_t> connections{0}, reusedConnections{0};
+    std::atomic<uint64_t> cancelledRequests{0}, admissionWaits{0};
     explicit Impl(Options o)
         : options(std::move(o)), budget(options.maxInflightBytes),
-          clientSlots(size_t(options.queueDepth) + options.workers),
-          serverSlots(size_t(options.queueDepth) + ActiveLimit(options)),
-          handlerSlots(ActiveLimit(options)),
+          clientSlots(size_t(options.queueDepth) + options.workers, "client request slots"),
+          serverSlots(size_t(options.queueDepth) + ActiveLimit(options), "server connection slots"),
+          handlerSlots(ActiveLimit(options), "handler slots"),
           receiveBuffers(options.maxInflightBytes, options.deviceBufferBytes),
           sendBuffers(std::min(options.maxInflightBytes, size_t(options.workers) * (size_t(512) << 20))),
           servers(options.workers, options.queueDepth), clients(options.workers, options.queueDepth),
@@ -323,7 +334,17 @@ struct Service::Impl {
     }
     void Fail(const std::shared_ptr<Exchange> &c, std::exception_ptr error) {
         ++failures;
+        if (!c->server && c->cancellation->Cancelled()) ++cancelledRequests;
+        c->cancellation->Cancel();
+        c->channel.reset();
         if (!c->server) c->completion.set_exception(error);
+    }
+    static bool PeerClosed(const Socket &socket) {
+        pollfd fd{socket.fd, POLLIN, 0};
+        if (poll(&fd, 1, 0) <= 0) return false;
+        char byte;
+        auto n = recv(socket.fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
+        return n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR);
     }
     // Host snapshots are already resident: copying them is slower than their
     // registration. GPU snapshots benefit from reusing expensive GPU MRs.
@@ -449,7 +470,8 @@ struct Service::Impl {
             receiveBuffers.CheckCapacity(allocations);
             // Reserve a complete message, not competing partial messages. Only
             // transfer workers wait here; the model can consume earlier replies.
-            std::unique_lock<std::mutex> allocationLock(receiveAllocationMutex);
+            std::unique_lock<std::timed_mutex> allocationLock(receiveAllocationMutex, std::defer_lock);
+            while (!allocationLock.try_lock_for(std::chrono::milliseconds(5))) s.CheckRunning(deadline);
             for (;;) {
                 s.CheckRunning(deadline);
                 try {
@@ -525,20 +547,25 @@ struct Service::Impl {
     }
     void BeginCall(const std::shared_ptr<Exchange> &c) {
         try {
+            Require(!c->cancellation->Cancelled(), "FastKV: request cancelled");
             c->channel = TakeChannel(c->peer);
-            if (c->channel) ++reusedConnections;
+            if (c->channel) {
+                c->channel->socket.cancellation = c->cancellation;
+                ++reusedConnections;
+            }
             else {
                 bool legacy;
                 { std::lock_guard<std::mutex> lock(mutex); legacy = legacyPeers.count(c->peer); }
                 auto connect = [&](bool oldProtocol) {
                     c->channel = std::make_shared<Channel>(*this);
-                    c->channel->socket = Open(c->peer, false, c->deadline, &stopped);
+                    c->channel->socket = Open(c->peer, false, c->deadline, &stopped, c->cancellation);
                     Track(c->channel);
                     c->channel->rdma = Handshake(c->channel->socket, options, false, c->deadline,
                                                 c->channel->reusable, oldProtocol);
                 };
                 try { connect(legacy); }
                 catch (const LegacyHandshake &) {
+                    Require(!c->cancellation->Cancelled(), "FastKV: request cancelled");
                     // Negotiation failed before any application bytes were
                     // sent. Retry v1 once; never replay an application request.
                     c->channel.reset();
@@ -558,6 +585,7 @@ struct Service::Impl {
     }
     void ReceiveRequest(const std::shared_ptr<Exchange> &c) {
         try {
+            c->channel->socket.cancellation = c->cancellation;
             if (!c->channel->ready) {
                 c->channel->rdma = Handshake(c->channel->socket, options, true, c->deadline,
                                             c->channel->reusable);
@@ -575,7 +603,7 @@ struct Service::Impl {
             // Keep the admission lease through sending the reply. A producer
             // cannot fill GPU memory with completed, unsent snapshots.
             std::promise<Message> failed;
-            try { c->result = handler(std::move(c->request)); }
+            try { c->result = handler(std::move(c->request), c->cancellation); }
             catch (...) {
                 failed.set_exception(std::current_exception());
                 c->result = failed.get_future();
@@ -600,6 +628,7 @@ struct Service::Impl {
             }
             SendMessage(c->channel->socket, c->channel->rdma.get(), reply, c->deadline);
             ++calls;
+            c->channel->socket.cancellation.reset();
             RecycleServer(c);
         } catch (...) { Fail(c, std::current_exception()); }
     }
@@ -607,6 +636,7 @@ struct Service::Impl {
         try {
             auto reply = ReceiveMessage(c->channel->socket, c->channel->rdma.get(), c->deadline);
             ++calls;
+            c->channel->socket.cancellation.reset();
             if (c->channel->reusable) {
                 std::lock_guard<std::mutex> lock(mutex);
                 if (!stopped && idleClients.size() < size_t(options.queueDepth) + options.workers)
@@ -629,11 +659,20 @@ struct Service::Impl {
                     if (c->stage == Stage::IdleRequest &&
                         (stopped || std::chrono::steady_clock::now() >= c->deadline)) continue;
                     Require(!stopped, "FastKV: service stopped");
-                    if (c->stage != Stage::Drain && std::chrono::steady_clock::now() >= c->deadline) {
-                        if (c->stage != Stage::Handler)
+                    if (!c->server)
+                        Require(!c->cancellation->Cancelled(), "FastKV: request cancelled");
+                    const bool expired = std::chrono::steady_clock::now() >= c->deadline;
+                    const bool disconnected = c->server &&
+                        (c->stage == Stage::Admit || c->stage == Stage::Handler) && PeerClosed(c->channel->socket);
+                    if (c->stage != Stage::Drain && (expired || disconnected)) {
+                        if (c->stage != Stage::Handler) {
+                            Require(!disconnected, "FastKV: peer closed connection");
                             throw std::runtime_error("FastKV: transport deadline exceeded");
+                        }
                         // Computation may still be running. Close the network
                         // endpoint, but retain admission until its result dies.
+                        c->cancellation->Cancel();
+                        ++cancelledRequests;
                         shutdown(c->channel->socket.fd, SHUT_RDWR);
                         c->channel->rdma.reset();
                         c->stage = Stage::Drain;
@@ -711,6 +750,12 @@ void Service::Start(const std::string &address, Handler h) {
     });
 }
 void Service::StartAsync(const std::string &address, AsyncHandler h) {
+    Require(bool(h), "FastKV: invalid handler");
+    StartAsync(address, [h = std::move(h)](Message request, std::shared_ptr<Cancellation>) {
+        return h(std::move(request));
+    });
+}
+void Service::StartAsync(const std::string &address, CancellableHandler h) {
     Require(!impl->stopped && !impl->acceptor.joinable() && bool(h), "FastKV: invalid service start");
     impl->handler = std::move(h);
     impl->listener = Open(address, true, std::chrono::steady_clock::now() + std::chrono::seconds(30));
@@ -720,6 +765,14 @@ void Service::StartAsync(const std::string &address, AsyncHandler h) {
             int n = poll(&p, 1, 100);
             if (n <= 0)
                 continue;
+            std::shared_ptr<void> slot;
+            try { slot = impl->serverSlots.Reserve(1); }
+            catch (const CapacityBusy &) {
+                // Leave excess connections in the kernel backlog instead of
+                // accepting and immediately resetting an otherwise valid RPC.
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                continue;
+            }
             int fd = accept(impl->listener.fd, nullptr, nullptr);
             if (fd < 0)
                 continue;
@@ -728,7 +781,7 @@ void Service::StartAsync(const std::string &address, AsyncHandler h) {
                 Configure(fd);
                 auto c = std::make_shared<Impl::Exchange>(*impl, true);
                 c->channel = std::make_shared<Impl::Channel>(*impl);
-                c->channel->serverSlot = impl->serverSlots.Reserve(1);
+                c->channel->serverSlot = std::move(slot);
                 c->channel->socket = std::move(socket);
                 impl->Track(c->channel);
                 impl->Park(c);
@@ -766,16 +819,37 @@ void Service::Stop() {
 std::string Service::Address() const { return BoundAddress(impl->listener); }
 Message Service::Call(const std::string &peer, const Message &m) { return Submit(peer, m).get(); }
 std::future<Message> Service::Submit(const std::string &peer, Message m) {
-    auto c = std::make_shared<Impl::Exchange>(*impl, false, impl->clientSlots.Reserve(1));
+    std::future<Message> result;
+    if (!TrySubmit(peer, m, result)) throw CapacityBusy("FastKV: client request slots exhausted");
+    return result;
+}
+bool Service::TrySubmit(const std::string &peer, Message &request, std::future<Message> &result,
+                        std::shared_ptr<Cancellation> cancellation, std::shared_ptr<void> lifetime) {
+    Require(!impl->stopped, "FastKV: service stopped");
+    Require(!result.valid(), "FastKV: result already holds a submission");
+    std::shared_ptr<void> slot;
+    try { slot = impl->clientSlots.Reserve(1); }
+    catch (const CapacityBusy &) { ++impl->admissionWaits; return false; }
+    auto c = std::make_shared<Impl::Exchange>(*impl, false, std::move(slot));
+    if (cancellation) c->cancellation = std::move(cancellation);
+    c->lifetime = std::move(lifetime);
     c->peer = peer;
-    c->request = std::move(m);
     auto future = c->completion.get_future();
-    impl->Park(c);
-    return future;
+    {
+        std::lock_guard<std::mutex> lock(impl->mutex);
+        Require(!impl->stopped, "FastKV: service stopped");
+        c->request = std::move(request);
+        impl->pending.push_back(c);
+    }
+    result = std::move(future);
+    impl->wake.notify_one();
+    return true;
 }
 Metrics Service::Stats() const {
     return {impl->tcpBytes.load(), impl->rdmaBytes.load(), impl->calls.load(), impl->failures.load(),
-            impl->connections.load(), impl->reusedConnections.load()};
+            impl->connections.load(), impl->reusedConnections.load(),
+            impl->clientSlots.Used(), impl->handlerSlots.Used(),
+            impl->cancelledRequests.load(), impl->admissionWaits.load()};
 }
 bool Service::HasRdma() { return RdmaAvailable(); }
 } // namespace fastkv

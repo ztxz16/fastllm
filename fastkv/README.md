@@ -60,7 +60,7 @@ flowchart LR
 |---|---|
 | `Buffer` | Host/CUDA 内存、切片、只读视图，以及 allocation lease。地址复用不会复用 allocation ID。 |
 | `Message` | 有界元数据和独立 buffer 列表，不含远端指针或本地分配器对象。 |
-| `Service` | 同步 `Call/Start`、异步 `Submit/StartAsync`、有界工作队列、超时、停止和统计。 |
+| `Service` | 同步 `Call/Start`、异步 `Submit/TrySubmit/StartAsync`、有界工作队列、取消、超时、停止和统计。 |
 | `BufferPool` | 有界 Host/CUDA arena 和注册复用；支持每设备物理容量、lease 释放通知与关闭。 |
 | `Budget` | RAII 字节或槽位额度；最后一个 lease 释放后归还额度。 |
 | `PlanCopies` | 同一逻辑表示下的多维分片交集，支持源副本去重，拒绝覆盖缺口和歧义。 |
@@ -86,6 +86,8 @@ RDMA 使用 RC QP。Host 数据跨配置的 NIC 分条发送；GPU 数据优先�
 `rdma` 模式不可静默降级。`auto` 允许握手双方协商 TCP/RDMA，但不会在传输中途重放失败的操作。TCP 同时支持 Host 和 CUDA buffer，CUDA 当前经主存分块搬运。RDMA GPU 内存需要驱动提供可用的 peer-memory/GPUDirect 支持；它不是单纯安装 libibverbs 就能保证的能力。
 
 `Service::StartAsync()` 的 handler 只负责提交计算，立即返回由 `std::promise<Message>` 驱动的 future。组件的进度线程检查完成状态，计算等待期间不占用通信 worker；生产者拥有自己的执行线程和停止逻辑。不要返回析构时可能等待线程的 `std::async` future。普通 `Start()` 保留同步 handler 语义。
+
+`TrySubmit()` 在客户端槽位暂时不足时返回 `false`，保留请求和输出 future，调用者可以稍后重试；其他错误仍抛出异常。可传入共享 `Cancellation` 和准入 lease：取消会中断网络等待，lease 持有至传输退出及 QP 清理完成。仅丢弃 future 不会取消请求。带取消参数的 `StartAsync()` handler 可在对端退出或超时后停止排队任务，并在当前 GPU step 完成后回收计算状态；未完成的生产者仍占用 handler 额度，直到 future 就绪。旧 handler 接口保持兼容。`Metrics` 提供客户端在途槽位、活动 handler、取消数和准入等待次数，额度错误也标明具体资源。
 
 请求发送、请求接收、回复发送、回复接收使用独立工作池，避免握手和回复 ACK 互相等待；每池最多 `workers` 个线程。单向 P/D 角色通常只有两个池执行任务，另外两个空闲；此外每个 Service 有一个进度线程，监听端还有一个 accept 线程。增加 worker 可以并行处理多个 RPC，单个 RPC 的 RDMA 多网卡分条仍由一个 worker 驱动。只有多条独立传输可并行、且 CPU/内存/网卡尚有余量时，增加线程才有收益。
 

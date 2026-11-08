@@ -14,6 +14,9 @@ void Service::Start(const std::string &, Handler) {
 void Service::StartAsync(const std::string &, AsyncHandler) {
     throw std::runtime_error("FastKV transport unavailable");
 }
+void Service::StartAsync(const std::string &, CancellableHandler) {
+    throw std::runtime_error("FastKV transport unavailable");
+}
 void Service::Stop() {}
 std::string Service::Address() const {
     return {};
@@ -22,6 +25,10 @@ Message Service::Call(const std::string &, const Message &) {
     throw std::runtime_error("FastKV transport unavailable");
 }
 std::future<Message> Service::Submit(const std::string &, Message) {
+    throw std::runtime_error("FastKV transport unavailable");
+}
+bool Service::TrySubmit(const std::string &, Message &, std::future<Message> &,
+                        std::shared_ptr<Cancellation>, std::shared_ptr<void>) {
     throw std::runtime_error("FastKV transport unavailable");
 }
 Metrics Service::Stats() const {

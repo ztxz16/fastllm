@@ -90,7 +90,7 @@ class Buffer {
 // A lease, including every slice, pins an arena until it is safe to reuse.
 // Allocation registrations remain attached while the arena is cached.
 class CapacityBusy : public std::runtime_error {
-  public: explicit CapacityBusy(const char *message) : std::runtime_error(message) {}
+  public: using std::runtime_error::runtime_error;
 };
 class BufferPool {
   public:
@@ -109,6 +109,16 @@ class BufferPool {
 struct Message {
     Bytes metadata;
     std::vector<Buffer> buffers;
+};
+
+// Cancellation is cooperative: GPU work finishes its current step, and
+// transport buffers remain pinned until I/O has stopped and QPs are retired.
+class Cancellation {
+  public:
+    void Cancel() { cancelled.store(true, std::memory_order_release); }
+    bool Cancelled() const { return cancelled.load(std::memory_order_acquire); }
+  private:
+    std::atomic<bool> cancelled{false};
 };
 
 // Independent immutable copy with the same logical buffer boundaries. Small
@@ -146,6 +156,8 @@ struct Options {
 struct Metrics {
     uint64_t tcpBytes = 0, rdmaBytes = 0, calls = 0, failures = 0;
     uint64_t connections = 0, reusedConnections = 0;
+    uint64_t clientRequests = 0, activeHandlers = 0;
+    uint64_t cancelledRequests = 0, admissionWaits = 0;
 };
 
 // A service is embedded in an owning process. Transfer workers do not wait
@@ -155,6 +167,8 @@ class Service {
   public:
     using Handler = std::function<Message(const Message &)>;
     using AsyncHandler = std::function<std::future<Message>(Message)>;
+    using CancellableHandler =
+        std::function<std::future<Message>(Message, std::shared_ptr<Cancellation>)>;
     explicit Service(Options options = {});
     ~Service();
     Service(const Service &) = delete;
@@ -163,10 +177,16 @@ class Service {
     // Return a promise-backed future promptly; long computation belongs to
     // the caller's executor. Stop does not wait for an unfulfilled promise.
     void StartAsync(const std::string &listenAddress, AsyncHandler handler);
+    void StartAsync(const std::string &listenAddress, CancellableHandler handler);
     void Stop();
     std::string Address() const;
     Message Call(const std::string &peer, const Message &request);
     std::future<Message> Submit(const std::string &peer, Message request);
+    // False means transient admission pressure: request/result are unchanged.
+    // lifetime retains caller admission/resources through transfer teardown,
+    // even if the caller drops its future. Cancel explicitly before dropping.
+    bool TrySubmit(const std::string &peer, Message &request, std::future<Message> &result,
+                   std::shared_ptr<Cancellation> cancellation = {}, std::shared_ptr<void> lifetime = {});
     Metrics Stats() const;
     static bool HasRdma();
     static bool HasCuda();
@@ -192,10 +212,10 @@ struct CopyRegion {
 };
 std::vector<CopyRegion> PlanCopies(const std::vector<Shard> &sources, const std::vector<Shard> &targets);
 
-// Receiver-owned, byte-based credits; reservations survive queued transfers.
+// Named credits for either byte budgets or request counts.
 class Budget {
   public:
-    explicit Budget(size_t capacity);
+    explicit Budget(size_t capacity, std::string name = "receiver byte budget");
     std::shared_ptr<void> Reserve(size_t bytes);
     size_t Used() const;
 

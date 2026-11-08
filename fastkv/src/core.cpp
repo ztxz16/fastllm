@@ -334,9 +334,10 @@ void Pool::Stop() {
 struct Budget::State {
     mutable std::mutex mutex;
     size_t capacity, used = 0;
-    explicit State(size_t c) : capacity(c) {}
+    std::string name;
+    State(size_t c, std::string name) : capacity(c), name(std::move(name)) {}
 };
-Budget::Budget(size_t c) : state(std::make_shared<State>(c)) {}
+Budget::Budget(size_t c, std::string name) : state(std::make_shared<State>(c, std::move(name))) {}
 std::shared_ptr<void> Budget::Reserve(size_t n) {
     struct Reservation {
         std::shared_ptr<State> state;
@@ -351,8 +352,8 @@ std::shared_ptr<void> Budget::Reserve(size_t n) {
     auto lease = std::make_shared<Reservation>();
     {
         std::lock_guard<std::mutex> lock(state->mutex);
-        Require(n <= state->capacity, "FastKV: payload exceeds byte budget");
-        if (n > state->capacity - state->used) throw CapacityBusy("FastKV: receiver byte budget exhausted");
+        if (n > state->capacity) throw std::runtime_error("FastKV: request exceeds " + state->name);
+        if (n > state->capacity - state->used) throw CapacityBusy("FastKV: " + state->name + " exhausted");
         state->used += n;
         lease->state = state;
         lease->bytes = n;

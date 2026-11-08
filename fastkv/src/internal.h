@@ -9,9 +9,10 @@ using Deadline = std::chrono::steady_clock::time_point;
 struct Socket {
     int fd = -1;
     const std::atomic<bool> *stopped = nullptr;
+    std::shared_ptr<Cancellation> cancellation;
     explicit Socket(int fd = -1, const std::atomic<bool> *stopped = nullptr) : fd(fd), stopped(stopped) {}
     ~Socket();
-    Socket(Socket &&s) noexcept : fd(s.fd), stopped(s.stopped) { s.fd = -1; }
+    Socket(Socket &&s) noexcept : fd(s.fd), stopped(s.stopped), cancellation(std::move(s.cancellation)) { s.fd = -1; }
     Socket &operator=(Socket &&s) noexcept;
     Socket(const Socket &) = delete;
     void Send(const void *p, size_t n, Deadline deadline) const;
