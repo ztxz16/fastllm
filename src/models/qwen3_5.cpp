@@ -4,23 +4,44 @@
 
 #include "utils/recurrent_prefix_cache.h"
 #include "utils.h"
+#include "utils/checkpoint_trace.h"
+#include "utils/load_stage_timing.h"
+#include "utils/prefix_cache_logging.h"
+#include "utils/prefill_chunk_profile.h"
+#include "utils/snapshot_prefix_identity.h"
+#include "utils/host_malloc_trim.h"
+
+#if defined(FASTLLM_DISK_PREFIX_CACHE)
+#include "utils/disk_prefix_cache.h"
+#include "utils/disk_prefix_storage_config.h"
+#include "utils/disk_prefix_write_coordinator.h"
+#include "utils/disk_prefix_format_v4.h"
+#include "utils/disk_prefix_v5.h"
+#endif
 
 #include "qwen3_5.h"
+#include "models/qwen35_dflash_async.h"
+#include "utils/qwen35_observability.h"
+#include "utils/qwen35_state_staging.h"
 #include "models/qwen3_5_paged_cache.h"
 #include "models/qwen3_5_mtp_shortlist.h"
 #include "blocks/baseblock.h"
 #include "executor.h"
 
 #include <algorithm>
+#include <unistd.h>
 #include <atomic>
 #include <chrono>
 #include <climits>
+#include <deque>
 #include <condition_variable>
 #include <thread>
 #include <exception>
+#include <future>
 #include <initializer_list>
 #include <fstream>
 #include <limits>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -57,6 +78,144 @@
 #endif
 
 namespace fastllm {
+
+#ifdef USE_CUDA
+    // A-6 fix F (2026-11-01, user-approved, measurement only): in-process GPU timeline for G9.
+    // FASTLLM_GPU_TIMELINE=1 records CUDA timing events on the export copy stream and on each TP
+    // rank's compute stream. Offsets are ms from one anchor event per device, so values are only
+    // comparable on the same device (cudaEventElapsedTime). Default off: no events, no prints.
+    // Events are resolved only after syncs the code already does; no new wait is added.
+    static bool Qwen35GpuTimelineEnabled() {
+        static const bool enabled = [] {
+            const char *text = std::getenv("FASTLLM_GPU_TIMELINE");
+            return text != nullptr && *text != '\0' && std::strcmp(text, "0") != 0;
+        }();
+        return enabled;
+    }
+
+    // The caller must have `device` current. The anchor is recorded once per device on a private
+    // non-blocking stream and synchronized there, so it never waits for compute or copy work. This
+    // one-time host sync on an empty stream is the only blocking call the timeline adds (ON only).
+    static void *Qwen35GpuTimelineAnchor(int device) {
+        static std::mutex anchorMutex;
+        static void *anchors[64] = {};
+        if (device < 0 || device >= 64) return nullptr;
+        std::lock_guard<std::mutex> lock(anchorMutex);
+        if (anchors[device] == nullptr) {
+            void *stream = FastllmCudaStreamCreate(true);
+            void *event = FastllmCudaEventCreateTiming();
+            FastllmCudaEventRecord(event, stream);
+            FastllmCudaEventSynchronize(event);
+            FastllmCudaStreamDestroy(stream);
+            anchors[device] = event;
+        }
+        return anchors[device];
+    }
+
+    // ms from the device anchor to a completed event; -1 when not ready or unavailable.
+    // The caller must have `device` current. Float ms: about 0.01 ms resolution after ~1e5 ms.
+    static double Qwen35GpuTimelineMs(int device, void *event) {
+        void *anchor = Qwen35GpuTimelineAnchor(device);
+        if (anchor == nullptr || event == nullptr) return -1.0;
+        if (FastllmCudaEventQuery(anchor) != 1 || FastllmCudaEventQuery(event) != 1) return -1.0;
+        return FastllmCudaEventElapsedTime(anchor, event);
+    }
+
+    // Two reusable timing events per (thread, device) for the TP prefill forward. Each rank's work
+    // runs on one thread (rank 0 on the caller, others on that model's persistent workers), and a
+    // thread records, waits and reads its pair inside one forward, so no two forwards (of this or
+    // another model) can overwrite a pair in use. Fixed count: at most 2 events per thread x device.
+    static void Qwen35GpuTimelineRankEvents(int device, void **begin, void **end) {
+        thread_local void *events[64][2] = {};
+        *begin = nullptr;
+        *end = nullptr;
+        if (device < 0 || device >= 64) return;
+        Qwen35GpuTimelineAnchor(device);
+        if (events[device][0] == nullptr) {
+            events[device][0] = FastllmCudaEventCreateTiming();
+            events[device][1] = FastllmCudaEventCreateTiming();
+        }
+        *begin = events[device][0];
+        *end = events[device][1];
+    }
+#endif
+
+    namespace {
+        static const std::vector<std::string> *Qwen35SnapshotBaseKeys(
+                const ResponseContext *context) {
+            if (context == nullptr || !context->HasMultimodalPrefixIdentity()) return nullptr;
+            // With no SSD adapter the planner's keys already are base keys.
+            // A nonempty provenance requires the separately retained base.
+            if (context->prefixCacheBasePageKeys.empty() &&
+                context->prefixCacheProvenance.empty()) return &context->prefixCachePageKeys;
+            return &context->prefixCacheBasePageKeys;
+        }
+
+        template<class Snapshot>
+        static bool Qwen35SetSnapshotMatchIdentity(const ResponseContext *context,
+                                                   Snapshot &snapshot) {
+            const int pageLen = fastllm::GetPageLen();
+            if (context == nullptr || pageLen <= 0 || snapshot.cachedLen <= 0 ||
+                snapshot.cachedLen % pageLen != 0) return false;
+            return BuildSnapshotPrefixIdentity(snapshot.mediaPageKeys,
+                Qwen35SnapshotBaseKeys(context), context->prefixCacheProvenance,
+                snapshot.cachedLen / pageLen, snapshot.matchIdentity);
+        }
+
+        template<class Snapshot>
+        static bool Qwen35SnapshotMatchesContext(const Snapshot &snapshot,
+                                                 const ResponseContext *context) {
+            return context != nullptr && SnapshotPrefixIdentityMatches(
+                snapshot.matchIdentity, snapshot.mediaPageKeys,
+                Qwen35SnapshotBaseKeys(context), context->prefixCacheProvenance);
+        }
+
+        struct Qwen35LoadProfile {
+            std::atomic<uint64_t> streamLayerUs{0}, streamGroupUs{0};
+            std::atomic<uint64_t> draftPrepareUs{0}, draftRotaryUs{0};
+            std::atomic<uint64_t> mtpWarmupUs{0}, fp8WarmupUs{0};
+            std::atomic<uint64_t> servingUs{0}, servingForwardUs{0};
+            std::atomic<uint64_t> finishUs{0};
+        };
+        Qwen35LoadProfile &Qwen35StartupProfile() {
+            static Qwen35LoadProfile profile;
+            return profile;
+        }
+        void PrintQwen35StartupProfile() {
+            if (!LoadStageTimingEnabled()) return;
+            auto &t = Qwen35StartupProfile();
+            printf("[Fastllm] Qwen35 startup timing (us, nested wall scopes): "
+                   "stream_layer=%llu stream_group=%llu draft_prepare=%llu "
+                   "draft_rotary=%llu mtp_warmup=%llu fp8_layout=%llu "
+                   "serving=%llu serving_forward=%llu auto_finish=%llu.\n",
+                   (unsigned long long)t.streamLayerUs.load(),
+                   (unsigned long long)t.streamGroupUs.load(),
+                   (unsigned long long)t.draftPrepareUs.load(),
+                   (unsigned long long)t.draftRotaryUs.load(),
+                   (unsigned long long)t.mtpWarmupUs.load(),
+                   (unsigned long long)t.fp8WarmupUs.load(),
+                   (unsigned long long)t.servingUs.load(),
+                   (unsigned long long)t.servingForwardUs.load(),
+                   (unsigned long long)t.finishUs.load());
+            fflush(stdout);
+        }
+    }
+
+    static void Qwen35StopSpillWorker(Qwen3_5Model *model);
+    static void Qwen35EnsureSpillState(Qwen3_5Model *model);
+    static void Qwen35StopSpillPrefetch(const std::shared_ptr<Qwen35SpillState> &state);
+    static bool Qwen35L2HostKVEnabled();
+    static uint64_t Qwen35L2HostKVPoolLimitBytes();
+    // Reuse the storage commit acknowledgement to protect host demotion.
+    struct Qwen35PrefixWriteStatus {
+        std::atomic<int> state{0}; // 0 pending, 1 durable, -1 failed
+    };
+    static std::vector<std::shared_ptr<Qwen35PrefixWriteStatus>> Qwen35ProtectSpillPrefix(Qwen3_5Model *model,
+        const std::vector<int> &tokens, const std::vector<std::string> &keys,
+        int begin, int length, uint64_t parentHash);
+    static void Qwen35FinishSpillWrite(const std::shared_ptr<Qwen35SpillState> &spill,
+        const std::vector<std::shared_ptr<Qwen35PrefixWriteStatus>> &statuses, bool durable,
+        std::vector<std::shared_ptr<void>> owners = {});
 
 #ifdef USE_CUDA
     // Query the existing SM70 backend without including CUDA runtime types in
@@ -380,6 +539,52 @@ namespace fastllm {
     }
 #endif
 
+    // 草稿独立设备：FASTLLM_DFLASH_DRAFT_DEVICE=4 时，DFlash 草稿独占该卡。
+    // 未设置或非法时返回 -1。
+    static int Qwen35DFlashDraftDevice() {
+        const char *value = std::getenv("FASTLLM_DFLASH_DRAFT_DEVICE");
+        if (value == nullptr || value[0] == '\0') {
+            return -1;
+        }
+        char *end = nullptr;
+        long parsed = std::strtol(value, &end, 10);
+        if (end == value || parsed < 0 || parsed > 64) {
+            return -1;
+        }
+        return (int)parsed;
+    }
+
+    // 草稿独占设备时，所有草稿入口统一走该设备；未设置时保持原行为。
+    // 存在多个草稿驱动分支（主循环/长预填/单卡前向/批量），必须共用这两个函数，
+    // 否则漏掉的分支会把草稿重新搬回 target 根卡（实测导致 GPU0 显存耗尽）。
+    static int Qwen35DFlashDraftDeviceOr(
+            const std::vector<int> &fallback) {
+        const int draftDevice = Qwen35DFlashDraftDevice();
+        if (draftDevice >= 0) {
+            return draftDevice;
+        }
+        return fallback.empty() ? 0 : fallback.front();
+    }
+
+    static std::vector<int> Qwen35DFlashDraftDevicesOrDefault(
+            const std::vector<int> &fallback) {
+        const int draftDevice = Qwen35DFlashDraftDevice();
+        if (draftDevice >= 0) {
+            return std::vector<int>{draftDevice};
+        }
+        return fallback;
+    }
+
+#ifdef USE_CUDA
+    struct Qwen35DFlashPrefillPayload {
+        std::vector<Data> captured;
+        int expectedTokens = 0;
+        int chunkTokens = 0;
+        int anchorToken = -1;
+        bool generateDrafts = false;
+    };
+#endif
+
     static uint64_t Qwen35DFlashTpMinWeightBytes() {
         const char *value =
             std::getenv("FASTLLM_CUDA_DFLASH_TP_MIN_WEIGHT_MB");
@@ -536,6 +741,225 @@ namespace fastllm {
         return env != nullptr && Qwen35MoeIsTrueString(env);
     }
 
+    // CHUNKTAIL: all new behaviour is strict opt-in, independently of MULTI_PREFILL.
+    static bool Qwen35ChunkPrefillEnabled() {
+        const char *value = std::getenv("FASTLLM_QWEN35_CHUNK_PREFILL");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }
+
+    static bool Qwen35ChunkWideEnabled() {
+        const char *value = std::getenv("FASTLLM_QWEN35_CHUNK_WIDE");
+        return Qwen35ChunkPrefillEnabled() && value != nullptr && std::strcmp(value, "1") == 0;
+    }
+
+    // FASTLLM_QWEN35_CHUNK_WIDE_SIZE: forward size under CHUNK_WIDE, default 3072.
+    static int Qwen35ChunkWideSize() {
+        static const int value = [] {
+            const char *env = std::getenv("FASTLLM_QWEN35_CHUNK_WIDE_SIZE");
+            const int v = env != nullptr ? std::atoi(env) : 0;
+            return v > 0 ? std::min(v, 8192) : 3072;
+        }();
+        return value;
+    }
+
+    // FASTLLM_QWEN35_CKPT_TIMER=1: host spans of one prefill checkpoint, one line per checkpoint.
+    static bool Qwen35CkptTimerEnabled() {
+        static const bool enabled = [] {
+            const char *value = std::getenv("FASTLLM_QWEN35_CKPT_TIMER");
+            return value != nullptr && std::strcmp(value, "1") == 0;
+        }();
+        return enabled;
+    }
+
+    static std::atomic<long long> &Qwen35CkptAllocNs() {
+        static std::atomic<long long> value{0};
+        return value;
+    }
+
+    static std::atomic<long long> &Qwen35CkptCopyNs() {
+        static std::atomic<long long> value{0};
+        return value;
+    }
+
+    struct Qwen35CkptSpan {
+        std::atomic<long long> *slot;
+        std::chrono::steady_clock::time_point begin;
+        explicit Qwen35CkptSpan(std::atomic<long long> &target)
+            : slot(Qwen35CkptTimerEnabled() ? &target : nullptr) {
+            if (slot != nullptr) begin = std::chrono::steady_clock::now();
+        }
+        ~Qwen35CkptSpan() {
+            if (slot != nullptr) {
+                slot->fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - begin).count());
+            }
+        }
+    };
+
+    struct Qwen35CkptTrace {
+        bool started = false;
+        int tokens = 0;
+        std::chrono::steady_clock::time_point begin;
+        std::chrono::steady_clock::time_point last;
+        double linearMs = -1, dflashMs = -1, publishMs = -1, captureMs = -1;
+        void Start(int currentLen) {
+            if (!Qwen35CkptTimerEnabled()) return;
+            started = true;
+            tokens = currentLen;
+            Qwen35CkptAllocNs().store(0);
+            Qwen35CkptCopyNs().store(0);
+            begin = last = std::chrono::steady_clock::now();
+        }
+        void Mark(double &slot) {
+            if (!started) return;
+            const auto now = std::chrono::steady_clock::now();
+            slot = std::chrono::duration<double, std::milli>(now - last).count();
+            last = now;
+        }
+        ~Qwen35CkptTrace() {
+            if (!started) return;
+            printf("[CKPT-TIMER] tokens=%d begin_ns=%lld total_ms=%.3f linear_ms=%.3f dflash_ms=%.3f publish_ms=%.3f capture_ms=%.3f "
+                   "alloc_sum_ms=%.3f copy_sum_ms=%.3f\n",
+                   tokens, (long long)std::chrono::duration_cast<std::chrono::nanoseconds>(begin.time_since_epoch()).count(),
+                   std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count(),
+                   linearMs, dflashMs, publishMs, captureMs,
+                   Qwen35CkptAllocNs().load() / 1e6, Qwen35CkptCopyNs().load() / 1e6);
+            fflush(stdout);
+        }
+    };
+
+    static bool Qwen35Tp4AttnOverlapEnabled() {
+        const char *value = std::getenv("FASTLLM_QWEN35_TP4_ATTN_OVERLAP");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }
+
+    static bool Qwen35Tp4MlpOverlapEnabled() {
+        const char *value = std::getenv("FASTLLM_QWEN35_TP4_MLP_OVERLAP");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }
+
+    // Pack resumed long-prefill rows into one forward, fair share per row.
+    // Restore drain: default on (accepted 2026-11-07, stab6/finB); FASTLLM_QWEN35_RESTORE_DRAIN=0 disables.
+    static bool Qwen35RestoreDrainEnabled() {
+        const char *value = std::getenv("FASTLLM_QWEN35_RESTORE_DRAIN");
+        return value == nullptr || std::strcmp(value, "0") != 0;
+    }
+
+    static bool Qwen35ResumePackEnabled() {
+        const char *value = std::getenv("FASTLLM_QWEN35_RESUME_PACK");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }
+
+    static bool Qwen35ChunkSavePackEnabled() {
+        const char *value = std::getenv("FASTLLM_QWEN35_CHUNK_SAVE_PACK");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }
+
+    static bool Qwen35ChunkDebugEnabled() {
+        const char *value = std::getenv("FASTLLM_QWEN35_CHUNK_DEBUG");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }
+
+    // TOP2DEBUG (FASTLLM_QWEN35_TOP2_DEBUG=1, exact match, default off): print
+    // the global best and second-best target logit of every token the target
+    // selects, one line per decided row:
+    //   [TOP2] handle=<request handle> pos=<committed length> top1=<id>
+    //          top1_logit=<float> top2=<id> top2_logit=<float> chosen=<id>
+    // lm_head is sharded over the TP ranks, so every shard's second best is kept
+    // as well, not only each shard's argmax. Diagnostic only: with the flag on
+    // the sampler may copy logits to the host and synchronize. With it off each
+    // call site is one cached bool test and nothing else.
+    static bool Qwen35Top2DebugEnabled() {
+        static const bool enabled = []() {
+            const char *value = std::getenv("FASTLLM_QWEN35_TOP2_DEBUG");
+            return value != nullptr && std::strcmp(value, "1") == 0;
+        }();
+        return enabled;
+    }
+
+#ifndef USE_CUDA
+    // No CUDA: nothing decides tokens here, but the scheduler hook is shared
+    // code and still refers to this handle list.
+    static thread_local std::vector<int> qwen35Top2DebugRequestHandles;
+#endif
+#ifdef USE_CUDA
+    struct Qwen35Top2DebugRow {
+        int top1;
+        int top2;
+        float top1Logit;
+        float top2Logit;
+        Qwen35Top2DebugRow() : top1(-1), top2(-1),
+            top1Logit(-std::numeric_limits<float>::infinity()),
+            top2Logit(-std::numeric_limits<float>::infinity()) {}
+    };
+
+    // Keep one row's best two values. Equal scores break to the smaller
+    // vocabulary id so two runs compare like with like.
+    static void Qwen35Top2DebugConsider(Qwen35Top2DebugRow &row, int id, float score) {
+        if (score > row.top1Logit ||
+            (score == row.top1Logit && row.top1 >= 0 && id < row.top1)) {
+            row.top2Logit = row.top1Logit;
+            row.top2 = row.top1;
+            row.top1Logit = score;
+            row.top1 = id;
+        } else if (score > row.top2Logit ||
+                   (score == row.top2Logit && row.top2 >= 0 && id < row.top2)) {
+            row.top2Logit = score;
+            row.top2 = id;
+        }
+    }
+
+    // Request handles of the rows this forward decides, published once per
+    // scheduler round (the forward itself never receives handles). Empty means
+    // unknown, and the line then prints handle=-1.
+    static thread_local std::vector<int> qwen35Top2DebugRequestHandles;
+    // Ids the target decided on the GPU but did not hand back to the host
+    // (asynchronous GPU token handoff); the caller logs those rows from here.
+    static thread_local std::vector<int> qwen35Top2DebugDecidedTokens;
+    static thread_local std::string qwen35Top2DebugLastPath;
+    // A [TOP2] block queued by the caller of a sampler that both decides and
+    // returns the chosen ids (root full-vocabulary sampling). The sampler emits
+    // it at its own return, so the line carries the real chosen ids even when
+    // the GPU token handoff keeps sampling asynchronous.
+    struct Qwen35Top2DebugPending {
+        bool armed;
+        std::string path;
+        const Data *logits;
+        int rows;
+        int vocabSize;
+        int batch;
+        std::vector<int> seqLens;
+        std::vector<Data*> positionIds;
+        bool perRow;
+        Qwen35Top2DebugPending() : armed(false), logits(nullptr), rows(0),
+            vocabSize(0), batch(0), perRow(false) {}
+    };
+    static thread_local Qwen35Top2DebugPending qwen35Top2DebugPending;
+#endif
+
+    // V5 junction (FASTLLM_PREFIX_V5=1, draft3 H24/H25): a text prefill chunk that
+    // would cross the branch point ends there, so a checkpoint is captured at it.
+    static int Qwen35JunctionClamp(const ResponseContext *ctx, int scheduled) {
+        if (!fastllm::DiskPrefixV5Enabled() || ctx == nullptr || !ctx->multimodalInput.empty()) return scheduled;
+        const auto found = ctx->intParams.find("qwen35_v5_junction");
+        if (found == ctx->intParams.end() || found->second <= 0) return scheduled;
+        const int begin = ctx->cacheLen + ctx->preTokens;
+        const int junction = found->second;
+        return begin < junction && junction < begin + scheduled ? junction - begin : scheduled;
+    }
+    static int Qwen35ChunkTailTokens(const ResponseContext *ctx, int scheduled, int cap) {
+        scheduled = Qwen35JunctionClamp(ctx, scheduled);
+        if (!Qwen35ChunkPrefillEnabled() || ctx == nullptr ||
+            !ctx->multimodalInput.empty() || ctx->inputTokens <= cap ||
+            scheduled != (int)ctx->currentTokens.size()) return scheduled;
+        const int pageLen = fastllm::GetPageLen();
+        const int begin = ctx->cacheLen + ctx->preTokens;
+        const int end = begin + scheduled;
+        const int boundary = end / pageLen * pageLen;
+        // Never round a recurrent state backwards: end an actual forward here.
+        return end % pageLen != 0 && boundary > begin ? boundary - begin : scheduled;
+    }
+
     static constexpr int QWEN35_MTP_LOG_INTERVAL = 64;
     static constexpr int QWEN35_MTP_MAX_DRAFTS = 8;
     static constexpr int QWEN35_MTP_FAST_SEQ_MAX = 8;
@@ -543,7 +967,36 @@ namespace fastllm {
         QWEN35_MTP_FAST_SEQ_MAX - 1;
     static constexpr int QWEN35_MTP_PREFIX_SNAPSHOT_BATCH_MAX = 4;
     static constexpr int QWEN35_BATCH_PREFILL_SEQ_MAX = 4096;
-    static constexpr int QWEN35_DFLASH_LONG_PREFILL_CHUNK_SIZE = 2048;
+    // Long multimodal prefills are split into fixed chunks and each chunk pays a
+    // draft + checkpoint boundary. The value used to be hard-coded to 2048, which
+    // made the boundary frequency untunable from the command line. Allow an
+    // explicit opt-in override (default keeps the historical 2048 behaviour).
+    static int Qwen35PrefillChunkMax() {
+        static const int value = []() {
+            const char *env = getenv("FASTLLM_QWEN35_PREFILL_CHUNK_MAX");
+            int v = (env != nullptr) ? atoi(env) : 0;
+            if (v <= 0) return 2048;
+            if (v < 512) return 512;
+            if (v > 8192) return 8192;
+            return v;
+        }();
+        return value;
+    }
+    static const int QWEN35_DFLASH_LONG_PREFILL_CHUNK_SIZE = Qwen35PrefillChunkMax();
+    // MMCHUNK (FASTLLM_QWEN35_MM_PREFILL_CHUNK_MAX, default 0 = keep today's
+    // 2048 cap): the multimodal loop below caps its chunk at the DFlash long
+    // prefill size, so raising the text-path knob would silently change image
+    // prefill too. 0 leaves every existing behaviour byte identical.
+    static int Qwen35MultimodalPrefillChunkCap() {
+        static const int value = []() {
+            const char *env = getenv("FASTLLM_QWEN35_MM_PREFILL_CHUNK_MAX");
+            int v = (env != nullptr) ? atoi(env) : 0;
+            if (v < 512) return 0;
+            if (v > 8192) return 8192;
+            return v;
+        }();
+        return value > 0 ? value : QWEN35_DFLASH_LONG_PREFILL_CHUNK_SIZE;
+    }
 
     static int Qwen35DFlashCacheTrimThreshold(int slidingWindow) {
         const int keepTokens = std::max(1, slidingWindow - 1);
@@ -1532,6 +1985,306 @@ namespace fastllm {
             return value != nullptr && Qwen35MoeIsTrueString(value);
         }
 
+        // 实验开关：把长 prompt 的分块预填并进批路径（多请求 chunk 同批推进）。
+        // 默认关闭；关闭时行为与改动前完全一致。
+        static bool Qwen35BatchPrefillEnabled() {
+            const char *value =
+                std::getenv("FASTLLM_QWEN35_BATCH_PREFILL");
+            return value != nullptr && Qwen35MoeIsTrueString(value);
+        }
+
+        // Pack fresh text prompt rows only when explicitly enabled.
+        static bool Qwen35MultiPrefillEnabled() {
+            const char *value =
+                std::getenv("FASTLLM_QWEN35_MULTI_PREFILL");
+            return value != nullptr && Qwen35MoeIsTrueString(value);
+        }
+
+        static bool Qwen35MmOneChunkPerRoundEnabled() {
+            const char *value =
+                std::getenv("FASTLLM_QWEN35_MM_ONE_CHUNK_PER_ROUND");
+            return value != nullptr && Qwen35MoeIsTrueString(value);
+        }
+
+        static bool Qwen35MixedRowsEnabled() {
+            static const bool enabled = [] {
+                const char *value = std::getenv("FASTLLM_QWEN35_MIXED_ROWS");
+                return value != nullptr && Qwen35MoeIsTrueString(value);
+            }();
+            return enabled;
+        }
+
+        // MMDECODEBATCH (FASTLLM_QWEN35_MM_DECODE_BATCH=1, exact, default off):
+        // after its prompt, a multimodal request decodes in the shared batch
+        // like text. Its positions are context + mrope delta on all three axes,
+        // which the 1-D rope path computes; vLLM 83c078d955 computes the same
+        // completion positions (gpu_model_runner.py:2575-2587,
+        // rotary_embedding/mrope.py:556-568).
+        static bool Qwen35MmDecodeBatchEnabled() {
+            static const bool enabled = [] {
+                const char *value = std::getenv("FASTLLM_QWEN35_MM_DECODE_BATCH");
+                return value != nullptr && value[0] == '1' && value[1] == '\0';
+            }();
+            return enabled;
+        }
+
+        // Mirrors AdjustPositionIdsWithDelta: a missing delta means 0.
+        static float Qwen35MropeDelta(const ResponseContext *ctx) {
+            auto it = ctx->multimodalInput.find("mrope_position_delta");
+            if (it == ctx->multimodalInput.end() || it->second.empty() ||
+                it->second[0] == nullptr) {
+                return 0.0f;
+            }
+            Data delta(*it->second[0]);
+            delta.ToDevice(DataDevice::CPU);
+            if (delta.dataType != DataType::FLOAT32) {
+                ToDataType(delta, DataType::FLOAT32);
+                delta.ToDevice(DataDevice::CPU);
+            }
+            return ((float*)delta.cpuData)[0];
+        }
+
+        // PDMIX (FASTLLM_QWEN35_PD_MIX=1, exact, default off): prefill and decode
+        // in parallel. Phase of a context follows one rule in every round, as in
+        // vLLM 83c078d955 v1/worker/gpu/model_runner.py:1321-1326
+        // (num_computed_prefill_tokens < prefill_len): prefillRemain reaches 0 when
+        // the prompt is fully fed, in resume and in legacy rounds.
+        static bool Qwen35PdMixEnabled() {
+            static const bool enabled = [] {
+                const char *value = std::getenv("FASTLLM_QWEN35_PD_MIX");
+                return value != nullptr && value[0] == '1' && value[1] == '\0';
+            }();
+            return enabled;
+        }
+
+        // Diagnostic only (FASTLLM_QWEN35_PD_MIX_PROFILE=1, exact): synced per-layer
+        // GDN / attention buckets of prefill forwards on the first TP rank and
+        // target / seed / total time of every DFlash batch verify forward.
+        // FASTLLM_QWEN35_PD_GDN_SPLIT=1 (exact, default off): in a PDMIX mixed forward the
+        // verify rows run the pure-verify recurrent GDN kernel on their own states and the
+        // prompt row runs the single-row uniform chunk prefill, instead of one ragged chunk
+        // prefill over all rows with packed states. Same split as vLLM 83c078d955
+        // qwen_gdn_linear_attn.py _forward_core (spec tokens: recurrent update, non-spec
+        // tokens: chunk prefill, merged back by token index, lines 1626-1680 and 1904).
+        static bool Qwen35PdGdnSplitEnabled() {
+            static const bool enabled = [] {
+                const char *value = std::getenv("FASTLLM_QWEN35_PD_GDN_SPLIT");
+                return Qwen35PdMixEnabled() &&
+                       value != nullptr && value[0] == '1' && value[1] == '\0';
+            }();
+            return enabled;
+        }
+
+        // PDMIX GDN swap (FASTLLM_QWEN35_PD_GDN_SWAP=1, needs PD_GDN_SPLIT): in a mixed
+        // round the verify rows' recurrent kernel writes new states into the replay
+        // scratch and exchanges storage (the decode-round contract, stateOutputs), so the
+        // pre-round state stays as the rollback backup with no full-state D2D copy.
+        static bool Qwen35PdGdnSwapEnabled() {
+            static const bool enabled = [] {
+                const char *value = std::getenv("FASTLLM_QWEN35_PD_GDN_SWAP");
+                return Qwen35PdGdnSplitEnabled() &&
+                       value != nullptr && value[0] == '1' && value[1] == '\0';
+            }();
+            return enabled;
+        }
+
+        // PDMIX attention split (FASTLLM_QWEN35_PD_ATTN_SPLIT=1, needs PD_MIX): in a mixed
+        // forward the verify rows attend as chronological q1 decodes with row page tables
+        // (the decode-round exact verifier) and the prompt row as a one-request prefill;
+        // one QKV projection and one o_proj/all-reduce cover both. vLLM 83c078d955 keeps
+        // spec rows on the decode kernel in a mixed batch (v1/attention/backends/utils.py
+        // reorder_batch_threshold; flashinfer.py decode plan with q_len_per_req).
+        static bool Qwen35PdAttnSplitEnabled() {
+            static const bool enabled = [] {
+                const char *value = std::getenv("FASTLLM_QWEN35_PD_ATTN_SPLIT");
+                return Qwen35PdMixEnabled() &&
+                       value != nullptr && value[0] == '1' && value[1] == '\0';
+            }();
+            return enabled;
+        }
+
+        static bool Qwen35PdMixProfileEnabled() {
+            static const bool enabled = [] {
+                const char *value = std::getenv("FASTLLM_QWEN35_PD_MIX_PROFILE");
+                return Qwen35PdMixEnabled() &&
+                       value != nullptr && value[0] == '1' && value[1] == '\0';
+            }();
+            return enabled;
+        }
+
+        // PDMIX tail (FASTLLM_QWEN35_PD_MIX_TAIL=1, needs PD_MIX): a prompt whose rest
+        // fits one chunk still mixes all but its last partial page (at most one page),
+        // and a prompt skipped only because its prefix restore ran this round mixes in
+        // the next round. vLLM 83c078d955 schedules a WAITING prompt, prefix hit
+        // included, in the step of its lookup with all its remaining tokens, final chunk
+        // too, next to the RUNNING rows (v1/core/sched/scheduler.py:1153-1163,1238-1254).
+        // The mixed forward here has no prompt logits, so the last <= 1 page keeps the
+        // prompt-only path (no precedent for that split).
+        // DFlash mixed verify (FASTLLM_QWEN35_DFLASH_MIXED_VERIFY=1, default off): one DFlash batch may hold
+        // greedy and sampling decode rows. Greedy rows take the target argmax, sampling rows go through the
+        // DFlash rejection kernel as a gathered sub-batch, in the same target forward. vLLM 83c078d955
+        // v1/sample/rejection_sampler.py:481-534 does the same per request (is_greedy mask). Off: a mixed
+        // group is rejected and the whole batch falls back to target-only decode.
+        static bool Qwen35DFlashMixedVerifyEnabled() {
+            static const bool enabled = [] {
+                const char *value = std::getenv("FASTLLM_QWEN35_DFLASH_MIXED_VERIFY");
+                return value != nullptr && value[0] == '1' && value[1] == '\0';
+            }();
+            return enabled;
+        }
+
+        // Resumable multimodal prefill: embed and merge only the current chunk's rows (default off).
+        static bool Qwen35MmChunkEmbedEnabled() {
+            static const bool enabled = [] {
+                const char *value = std::getenv("FASTLLM_QWEN35_MM_CHUNK_EMBED");
+                return value != nullptr && value[0] == '1' && value[1] == '\0';
+            }();
+            return enabled;
+        }
+
+        static bool Qwen35VisionAsyncFlag(const char *name) {
+            const char *value = std::getenv(name);
+            return value != nullptr && value[0] == '1' && value[1] == '\0';
+        }
+
+        // Background image encode on the exact vision device (default off; see Qwen3_5Model::VisionAsyncWait).
+        static bool Qwen35VisionAsyncEnabled() {
+            static const bool enabled = [] {
+                const char *value = std::getenv("FASTLLM_QWEN35_VISION_ASYNC");
+                return value != nullptr && value[0] == '1' && value[1] == '\0';
+            }();
+            return enabled;
+        }
+
+        // An explicit FASTLLM_QWEN35_VISION_DEVICE=cuda:N stays on that device instead of following text TP (default off).
+        static bool Qwen35VisionDeviceExactEnabled() {
+            static const bool enabled = [] {
+                const char *value = std::getenv("FASTLLM_QWEN35_VISION_DEVICE_EXACT");
+                return value != nullptr && value[0] == '1' && value[1] == '\0';
+            }();
+            return enabled;
+        }
+
+        // Keep the CUDA big-buffer pool after each encoded image instead of freeing it (default off).
+        static bool Qwen35VisionKeepBuffersEnabled() {
+            static const bool enabled = [] {
+                const char *value = std::getenv("FASTLLM_QWEN35_VISION_KEEP_BUFFERS");
+                return value != nullptr && value[0] == '1' && value[1] == '\0';
+            }();
+            return enabled;
+        }
+
+        // Diagnostic: per-stage vision encode times (adds one stream sync per stage when on).
+        static bool Qwen35VisionStageTimerEnabled() {
+            static const bool enabled = [] {
+                const char *value = std::getenv("FASTLLM_QWEN35_VISION_STAGE_TIMER");
+                return value != nullptr && value[0] == '1' && value[1] == '\0';
+            }();
+            return enabled;
+        }
+
+        static bool Qwen35PdMixTailEnabled() {
+            static const bool enabled = [] {
+                const char *value = std::getenv("FASTLLM_QWEN35_PD_MIX_TAIL");
+                return Qwen35PdMixEnabled() &&
+                       value != nullptr && value[0] == '1' && value[1] == '\0';
+            }();
+            return enabled;
+        }
+
+        // PDMIX prompt tokens per mixed forward (FASTLLM_QWEN35_PD_MIX_CHUNK, default 0 =
+        // the shared token budget only). A smaller chunk gives decode rows more steps
+        // per second while a prompt runs. Rounded down to whole pages (at least one) so
+        // every chunk still ends on a page.
+        static int Qwen35PdMixChunkMax() {
+            static const int value = [] {
+                const char *env = std::getenv("FASTLLM_QWEN35_PD_MIX_CHUNK");
+                const int v = env != nullptr ? atoi(env) : 0;
+                const int pageLen = fastllm::GetPageLen();
+                return v <= 0 ? 0 : std::max(pageLen, v / pageLen * pageLen);
+            }();
+            return value;
+        }
+
+        // Short prompt first (FASTLLM_QWEN35_PD_SHORT_FIRST=N tokens, default 0 = off, needs PD_MIX):
+        // a prompt with at most N tokens left runs ahead of longer prompts, alone in its forward and
+        // without decode-only rounds between its pieces, so a new short request starts output soon
+        // during a long prefill. Comparable knob: vLLM 83c078d955 long_prefill_token_threshold
+        // (config/scheduler.py:79). No precedent for this exact order.
+        static int Qwen35PdShortFirstTokens() {
+            static const int value = [] {
+                const char *env = std::getenv("FASTLLM_QWEN35_PD_SHORT_FIRST");
+                const int v = env != nullptr ? atoi(env) : 0;
+                return v > 0 ? std::min(v, 4096) : 0;
+            }();
+            return value;
+        }
+
+        // Solo image chunk (FASTLLM_QWEN35_MM_SOLO_CHUNK=N tokens, default 0 = off, needs PD_MIX_IMAGE):
+        // a media prompt longer than N with no decode row keeps running in one forward, and stops
+        // at the next N-token chunk boundary only if a new request arrived since it was scheduled.
+        // Nothing arrives -> same single forward as the flag-off path (no extra re-entry cost).
+        static int Qwen35MmSoloChunk() {
+            static const int value = [] {
+                const char *env = std::getenv("FASTLLM_QWEN35_MM_SOLO_CHUNK");
+                const int v = env != nullptr ? atoi(env) : 0;
+                const int pageLen = fastllm::GetPageLen();
+                return v <= 0 ? 0 : std::max(pageLen, v / pageLen * pageLen);
+            }();
+            return value;
+        }
+
+        // PDALT (FASTLLM_QWEN35_PD_ALT=1, exact, needs PD_MIX): while a text prompt and
+        // decode rows are both pending, rounds alternate between a decode-only batch
+        // and a prompt-only chunk (capped by FASTLLM_QWEN35_PD_MIX_CHUNK). No mixed
+        // forward: both rounds keep the flag-off forward shapes.
+        static bool Qwen35PdAltEnabled() {
+            static const bool enabled = [] {
+                const char *value = std::getenv("FASTLLM_QWEN35_PD_ALT");
+                return value != nullptr && value[0] == '1' && value[1] == '\0';
+            }();
+            return enabled;
+        }
+
+        // PD_MIX decode rounds (FASTLLM_QWEN35_PD_MIX_DECODE_ROUNDS=k, needs PD_MIX, default 0 = off):
+        // after each mixed round (decode rows + one text prompt chunk) the next k rounds are
+        // decode-only while the prompt waits, to raise the decode share during a long prefill.
+        // No precedent: vLLM 83c078d955 joins decodes every step and only caps the prefill chunk
+        // (v1/core/sched/scheduler.py:730-739,769); SGLang a4a6eddd runs prefill first
+        // (managers/scheduler.py:4130). Measured here, the vLLM-style cap tops out near 0.35 decode
+        // share (logs/a6-pdmix-chunk21-20261105), so it cannot reach the equal split asked for.
+        static int Qwen35PdMixDecodeRounds() {
+            static const int value = [] {
+                const char *env = std::getenv("FASTLLM_QWEN35_PD_MIX_DECODE_ROUNDS");
+                const int v = env != nullptr ? atoi(env) : 0;
+                return v > 0 ? std::min(v, 64) : 0;
+            }();
+            return value;
+        }
+
+        // PDMIX image (FASTLLM_QWEN35_PD_MIX_IMAGE=1, exact, needs PD_MIX): a pending media
+        // prompt keeps chunked resume on and prefills one resumable chunk per round (the
+        // existing MM_ONE_CHUNK_PER_ROUND serial media path, unchanged chunk grid); while
+        // decode rows wait, the next round is decode-only. Decode rows advance once per
+        // media chunk instead of after the whole media prefill. Measured: a mixed text
+        // round costs the same as a prompt-only round plus a decode round (accept7/8).
+        static bool Qwen35PdMixImageEnabled() {
+            static const bool enabled = [] {
+                const char *value = std::getenv("FASTLLM_QWEN35_PD_MIX_IMAGE");
+                return Qwen35PdMixEnabled() &&
+                       value != nullptr && value[0] == '1' && value[1] == '\0';
+            }();
+            return enabled;
+        }
+
+        static bool Qwen35MixedDFlashSeedEnabled() {
+            static const bool enabled = [] {
+                const char *value = std::getenv("FASTLLM_QWEN35_MIXED_DFLASH_SEED");
+                return value != nullptr && Qwen35MoeIsTrueString(value);
+            }();
+            return enabled;
+        }
+
         struct Qwen35GpuTokenHandoffControl {
             Data cudaTokens[2] = {
                 Data(DataType::FLOAT32), Data(DataType::FLOAT32)
@@ -1623,7 +2376,9 @@ namespace fastllm {
                     if (tokenReadyRecorded[slot] &&
                         tokenReadyEvents[slot] != nullptr) {
                         FastllmCudaSetDevice(device);
-                        FastllmCudaEventSynchronize(tokenReadyEvents[slot]);
+                        { RequestDiagnosticCurrentOperation diagnosticCompletion("cuda_event_completion_wait",
+                                RequestDiagnosticResource("CUDA.event", tokenReadyEvents[slot]).c_str());
+                            FastllmCudaEventSynchronize(tokenReadyEvents[slot]); }
                     }
                     if (hostSamplingParams[slot] != nullptr) {
                         FastllmCudaHostFree(hostSamplingParams[slot]);
@@ -1663,19 +2418,25 @@ namespace fastllm {
                 if (needGrow && capacity > 0) {
                     for (int i = 0; i < 2; i++) {
                         if (eventPending[i] && events[i] != nullptr) {
-                            FastllmCudaEventSynchronize(events[i]);
+                            { RequestDiagnosticCurrentOperation diagnosticCompletion("cuda_event_completion_wait",
+                                RequestDiagnosticResource("CUDA.event", events[i]).c_str());
+                            FastllmCudaEventSynchronize(events[i]); }
                             eventPending[i] = false;
                         }
                         if (tokenReadyRecorded[i] &&
                             tokenReadyEvents[i] != nullptr) {
-                            FastllmCudaEventSynchronize(tokenReadyEvents[i]);
+                            { RequestDiagnosticCurrentOperation diagnosticCompletion("cuda_event_completion_wait",
+                                RequestDiagnosticResource("CUDA.event", tokenReadyEvents[i]).c_str());
+                            FastllmCudaEventSynchronize(tokenReadyEvents[i]); }
                             tokenReadyRecorded[i] = false;
                         }
                     }
                     if (positionReadyRecorded) {
                         for (void *event : positionReadyEvents) {
                             if (event != nullptr) {
-                                FastllmCudaEventSynchronize(event);
+                                { RequestDiagnosticCurrentOperation diagnosticCompletion("cuda_event_completion_wait",
+                                RequestDiagnosticResource("CUDA.event", event).c_str());
+                            FastllmCudaEventSynchronize(event); }
                             }
                         }
                         positionReadyRecorded = false;
@@ -2002,7 +2763,9 @@ namespace fastllm {
                                 "Qwen3.5 GPU token handoff got invalid host slot.\n");
                 if (eventPending[slot]) {
                     FastllmCudaSetDevice(device);
-                    FastllmCudaEventSynchronize(events[slot]);
+                    { RequestDiagnosticCurrentOperation diagnosticCompletion("cuda_event_completion_wait",
+                                RequestDiagnosticResource("CUDA.event", events[slot]).c_str());
+                            FastllmCudaEventSynchronize(events[slot]); }
                     eventPending[slot] = false;
                 }
                 return std::vector<int>(hostTokens[slot],
@@ -2015,7 +2778,9 @@ namespace fastllm {
                 }
                 for (int i = 0; i < 2; i++) {
                     if (eventPending[i] && events[i] != nullptr) {
-                        FastllmCudaEventSynchronize(events[i]);
+                        { RequestDiagnosticCurrentOperation diagnosticCompletion("cuda_event_completion_wait",
+                                RequestDiagnosticResource("CUDA.event", events[i]).c_str());
+                            FastllmCudaEventSynchronize(events[i]); }
                         eventPending[i] = false;
                     }
                     if (events[i] != nullptr) {
@@ -2024,8 +2789,10 @@ namespace fastllm {
                     }
                     if (tokenReadyEvents[i] != nullptr) {
                         if (tokenReadyRecorded[i]) {
+                            { RequestDiagnosticCurrentOperation diagnosticCompletion("cuda_event_completion_wait",
+                                RequestDiagnosticResource("CUDA.event", tokenReadyEvents[i]).c_str());
                             FastllmCudaEventSynchronize(
-                                tokenReadyEvents[i]);
+                                tokenReadyEvents[i]); }
                             tokenReadyRecorded[i] = false;
                         }
                         FastllmCudaEventDestroy(tokenReadyEvents[i]);
@@ -2047,7 +2814,9 @@ namespace fastllm {
                     }
                     FastllmCudaSetDevice(devices[i]);
                     if (positionReadyRecorded) {
-                        FastllmCudaEventSynchronize(positionReadyEvents[i]);
+                        { RequestDiagnosticCurrentOperation diagnosticCompletion("cuda_event_completion_wait",
+                                RequestDiagnosticResource("CUDA.event", positionReadyEvents[i]).c_str());
+                            FastllmCudaEventSynchronize(positionReadyEvents[i]); }
                     }
                     FastllmCudaEventDestroy(positionReadyEvents[i]);
                     positionReadyEvents[i] = nullptr;
@@ -2055,8 +2824,10 @@ namespace fastllm {
                         forwardReadyEvents[i] != nullptr) {
                         if (i < (int)forwardReadyRecorded.size() &&
                             forwardReadyRecorded[i]) {
+                            { RequestDiagnosticCurrentOperation diagnosticCompletion("cuda_event_completion_wait",
+                                RequestDiagnosticResource("CUDA.event", forwardReadyEvents[i]).c_str());
                             FastllmCudaEventSynchronize(
-                                forwardReadyEvents[i]);
+                                forwardReadyEvents[i]); }
                             forwardReadyRecorded[i] = false;
                         }
                         FastllmCudaEventDestroy(forwardReadyEvents[i]);
@@ -2065,8 +2836,10 @@ namespace fastllm {
                     if (shardSamplingReadyEvents[i] != nullptr) {
                         if (i < (int)shardSamplingReadyRecorded.size() &&
                             shardSamplingReadyRecorded[i]) {
+                            { RequestDiagnosticCurrentOperation diagnosticCompletion("cuda_event_completion_wait",
+                                RequestDiagnosticResource("CUDA.event", shardSamplingReadyEvents[i]).c_str());
                             FastllmCudaEventSynchronize(
-                                shardSamplingReadyEvents[i]);
+                                shardSamplingReadyEvents[i]); }
                             shardSamplingReadyRecorded[i] = false;
                         }
                         FastllmCudaEventDestroy(
@@ -4593,6 +5366,12 @@ namespace fastllm {
             }
         }
 
+        // Defined with the staging budget further down; declared here because a
+        // staged capture can still be reading a slot on the device's producer
+        // stream when this path rewrites that slot on the caller stream.
+        static bool Qwen35StateStageEnabled();
+        static void Qwen35StateStageAwaitProducer(int device);
+
         static bool Qwen35AttachLinearSlot(
                 Data &cache,
                 PagedCacheManager *manager,
@@ -4629,6 +5408,14 @@ namespace fastllm {
                 manager->Pick(pickedPages);
             }
 
+            // Both writes below run on the caller stream, so neither is ordered
+            // against a capture copy still queued on this device's producer
+            // stream for the slot being reused.
+            if (Qwen35StateStageEnabled()) {
+                const int slotDevice = cache.dataDeviceIds.empty() ?
+                    FastllmCudaGetDevice() : cache.dataDeviceIds[0];
+                Qwen35StateStageAwaitProducer(slotDevice);
+            }
             if (oldPtr != nullptr && oldPtr != slotPtr && oldBytes == slotBytes &&
                 cache.dataDevice == DataDevice::CUDA) {
                 FastllmCudaCopyFromDeviceToDevice(slotPtr, oldPtr, slotBytes);
@@ -4822,21 +5609,40 @@ namespace fastllm {
             bool transposed = false;
         };
 
+
         struct Qwen35LinearPrefixSnapshotLayer {
             bool linear = false;
             Qwen35LinearPrefixSnapshotCache first;
             Qwen35LinearPrefixSnapshotCache second;
         };
 
-        struct Qwen35LinearPrefixSnapshot : RecurrentPrefixKey {
+        struct Qwen35LinearPrefixSnapshot {
+            int cachedLen = 0;
+            int requestId = 0;
+            long long timestamp = 0;
+            std::vector<int> tokens;
+            std::vector<std::string> mediaPageKeys;
+            SnapshotPrefixIdentity matchIdentity;
             std::vector<Qwen35LinearPrefixSnapshotLayer> layers;
             bool mtpValid = false;
             int mtpTokens = 0;
             Data mtpKey;
             Data mtpValue;
+            std::vector<int> mtpProposalTokens;
             bool dflashValid = false;
             int dflashTokens = 0;
             std::vector<std::pair<Data, Data> > dflashKeyValues;
+            std::vector<int> dflashProposalTokens;
+            std::vector<int> dflashProposalCandidateIds;
+            std::vector<float> dflashProposalCandidateProbs;
+            // Valid remains false until export-lane D2H and materialization finish.
+            std::shared_ptr<fastllm::qwen35_state_stage::Ticket> stateStage;
+            std::map<int, size_t> stateStageBytes;
+            uint64_t stateStageD2DEnqueueNs = 0;
+            uint64_t stateStageReadyWaitNs = 0;
+            uint64_t stateStageMaterializeNs = 0;
+            uint64_t stateStageFallbackSyncCount = 0;
+            std::string stateStageFallbackReason;
         };
 
         static std::mutex &Qwen35LinearPrefixSnapshotsMutex() {
@@ -4844,10 +5650,10 @@ namespace fastllm {
             return *mutex;
         }
 
-        static std::map<const Qwen3_5Model*, std::vector<std::unique_ptr<Qwen35LinearPrefixSnapshot> > >
+        static std::map<const Qwen3_5Model*, std::vector<std::shared_ptr<Qwen35LinearPrefixSnapshot> > >
                 &Qwen35LinearPrefixSnapshots() {
             static auto *snapshots =
-                new std::map<const Qwen3_5Model*, std::vector<std::unique_ptr<Qwen35LinearPrefixSnapshot> > >();
+                new std::map<const Qwen3_5Model*, std::vector<std::shared_ptr<Qwen35LinearPrefixSnapshot> > >();
             return *snapshots;
         }
 
@@ -4865,8 +5671,38 @@ namespace fastllm {
             return RecurrentPrefixCacheEnabled();
         }
 
+        static int Qwen35EnvInt(const char *name, int fallback) {
+            const char *value = std::getenv(name);
+            if (value == nullptr || value[0] == 0) {
+                return fallback;
+            }
+            char *end = nullptr;
+            long parsed = std::strtol(value, &end, 10);
+            if (end == value) {
+                return fallback;
+            }
+            return (int)parsed;
+        }
+
         static int Qwen35LinearPrefixSnapshotIntervalTokens() {
             return RecurrentPrefixInterval(fastllm::GetPageLen());
+        }
+
+        // 【一本账·本地账记全】**记账门**必须与**预填块大小**解耦。
+        //
+        // 背景（读码 + 实测）：`GetChunkedPrefillSize()`（本文件 10601-10611）把预填块钳成
+        //   `max(pageLen, min(base, interval))`。此前为了"让每个页对齐点都能记账"，我把
+        //   `FASTLLM_PREFIX_CACHE_SNAPSHOT_INTERVAL_PAGES` 从 16 改成 1 —— 结果**连带把预填块
+        //   从 2048 压成 128**（一次 16012 token 的预填：8 块 → 125 块），而每一块都真的拷贝了
+        //   一份 ≈151 MiB 的线性注意力状态快照 ⇒ 实测净亏 3.6 倍（Turn1 19.77 s / Turn2 14.57 s）。
+        //   该改动已回退。
+        //
+        // ⇒ 正确做法：**块大小继续由 `SNAPSHOT_INTERVAL_PAGES`（16 页 = 2048）决定**；
+        //   **记账门单独放宽到"页对齐即可"**；再配合长预填尾块"在最后一个页边界切一刀"
+        //   （本文件 24578 一带），使**恰好一次 forward 结束在页对齐长度**上
+        //   ⇒ 那一点能记账，且**只多一次 forward**（不是 125 块）。
+        static int Qwen35LinearPrefixSnapshotGateTokens() {
+            return fastllm::GetPageLen();
         }
 
         static int Qwen35LinearPrefixSnapshotMaxPerRequest() {
@@ -4939,7 +5775,9 @@ namespace fastllm {
             if (src.dims.empty()) {
                 return false;
             }
-            if (src.isPagedKVCache) {
+            // Linear state slots also use paged ownership, but their tensor
+            // pointer is already the contiguous conv/recurrent state view.
+            if (src.isPagedKVCache && !src.isLinearAttention) {
                 PagedCacheManager *pool = src.pagedKVCacheData;
                 if (pool == nullptr || pool->cudaData == nullptr ||
                     src.dims.size() != 3 || src.unitSizeDiv != 1) return false;
@@ -4947,7 +5785,7 @@ namespace fastllm {
                 dst.UpdateUnitSize();
                 dst.dataDevice = DataDevice::CPU;
                 dst.Resize(src.dims);
-                dst.Allocate();
+                { Qwen35CkptSpan allocSpan(Qwen35CkptAllocNs()); dst.Allocate(); }
                 const size_t headBytes = (size_t)src.dims[2] * src.unitSize;
                 const size_t tokenBytes = src.dims[0] * headBytes;
                 std::vector<uint8_t> page((size_t)src.pageLen * tokenBytes);
@@ -4956,6 +5794,7 @@ namespace fastllm {
                 int begin = 0;
                 for (int id : src.pageIndex) {
                     const int count = std::min(src.pageLen, src.dims[1] - begin);
+                    Qwen35CkptSpan copySpan(Qwen35CkptCopyNs());
                     FastllmCudaCopyFromDeviceToHost(page.data(),
                         (uint8_t*)pool->cudaData + (size_t)id * src.pageLen * tokenBytes,
                         (size_t)count * tokenBytes);
@@ -4989,13 +5828,14 @@ namespace fastllm {
                 if (!src.expansionDims.empty() && src.expansionDims != src.dims) {
                     dst.Expansion(src.expansionDims);
                 }
-                dst.Allocate(false);
+                { Qwen35CkptSpan allocSpan(Qwen35CkptAllocNs()); dst.Allocate(false); }
                 int oldDevice = FastllmCudaGetDevice();
                 int sourceDevice = src.dataDeviceIds.empty()
                     ? GetPointerDeviceId(src.cudaData) : src.dataDeviceIds[0];
                 if (sourceDevice >= 0) {
                     FastllmCudaSetDevice(sourceDevice);
                 }
+                Qwen35CkptSpan copySpan(Qwen35CkptCopyNs());
                 FastllmCudaCopyFromDeviceToHost(
                     dst.cpuData, src.cudaData, dst.GetBytes());
                 FastllmCudaSetDevice(oldDevice);
@@ -5038,7 +5878,7 @@ namespace fastllm {
             dst.dataDeviceIds.clear();
             dst.expansionDims.clear();
             dst.Resize(src.dims);
-            dst.Allocate();
+            { Qwen35CkptSpan allocSpan(Qwen35CkptAllocNs()); dst.Allocate(); }
             const size_t rowBytes =
                 (size_t)src.dims[1] * src.dims[2] * sizeof(uint16_t);
             if (src.dataDevice == DataDevice::CUDA) {
@@ -5047,6 +5887,7 @@ namespace fastllm {
                     FastllmCudaSetDevice(src.dataDeviceIds[0]);
                 }
                 for (int head = 0; head < src.dims[0]; head++) {
+                    Qwen35CkptSpan copySpan(Qwen35CkptCopyNs());
                     FastllmCudaCopyFromDeviceToHost(
                         dst.cpuData + (size_t)head * rowBytes,
                         (uint8_t*)src.cudaData +
@@ -5078,37 +5919,555 @@ namespace fastllm {
             return dst.cpuData != nullptr;
         }
 
-        static bool Qwen35SnapshotCopyCache(
-                const Data &src,
-                Qwen35LinearPrefixSnapshotCache &dst) {
-            dst.valid = false;
-            dst.multiDevice = src.multiDeviceData && !src.multiDeviceDatas.empty();
-            dst.dataDeviceIds = src.dataDeviceIds;
-            dst.tpLayout = src.tpLayout;
-            dst.tpAxis = src.tpAxis;
-            dst.tpRanges = src.tpRanges;
-            dst.tpGlobalDims = src.tpGlobalDims;
-            dst.dims = src.dims;
-            dst.dataType = src.dataType;
-            dst.transposed = src.isLinearAttentionTransposed;
-            if (dst.multiDevice) {
-                for (auto &it : src.multiDeviceDatas) {
-                    if (it.second == nullptr) {
-                        continue;
+        static bool Qwen35SnapshotCopyCachesSync(
+                const std::vector<std::pair<const Data*,
+                    Qwen35LinearPrefixSnapshotCache*> > &caches) {
+            struct Copy {
+                const Data *source;
+                Data *destination;
+            };
+            std::map<int, std::vector<Copy> > byDevice;
+            std::vector<Copy> hostCopies;
+            // Allocate destination map nodes on the scheduler thread. Workers
+            // only fill distinct Data objects while the source state is held
+            // at this exact token boundary; nothing is valid/published yet.
+            auto append = [&](const Data &source, Data &destination) {
+                if (source.dims.empty()) return false;
+                if (source.dataDevice == DataDevice::CUDA) {
+                    if (source.cudaData == nullptr) return false;
+                    const int device = source.dataDeviceIds.empty()
+                        ? GetPointerDeviceId(source.cudaData)
+                        : source.dataDeviceIds[0];
+                    if (device < 0) return false;
+                    byDevice[device].push_back({&source, &destination});
+                } else {
+                    if (source.cpuData == nullptr) return false;
+                    hostCopies.push_back({&source, &destination});
+                }
+                return true;
+            };
+            for (const auto &entry : caches) {
+                if (entry.first == nullptr || entry.second == nullptr) return false;
+                const Data &src = *entry.first;
+                auto &dst = *entry.second;
+                dst.valid = false;
+                dst.multiDevice = src.multiDeviceData && !src.multiDeviceDatas.empty();
+                dst.dataDeviceIds = src.dataDeviceIds;
+                dst.tpLayout = src.tpLayout;
+                dst.tpAxis = src.tpAxis;
+                dst.tpRanges = src.tpRanges;
+                dst.tpGlobalDims = src.tpGlobalDims;
+                dst.dims = src.dims;
+                dst.dataType = src.dataType;
+                dst.transposed = src.isLinearAttentionTransposed;
+                if (dst.multiDevice) {
+                    bool found = false;
+                    for (const auto &local : src.multiDeviceDatas) {
+                        if (local.second == nullptr) continue;
+                        if (!append(*local.second, dst.locals[local.first])) return false;
+                        found = true;
                     }
-                    Data &copied = dst.locals[it.first];
-                    if (!Qwen35SnapshotCopyTensor(*it.second, copied)) {
-                        return false;
+                    if (!found) return false;
+                } else if (!append(src, dst.single)) {
+                    return false;
+                }
+            }
+            for (const auto &copy : hostCopies) {
+                if (!Qwen35SnapshotCopyTensor(*copy.source, *copy.destination)) return false;
+            }
+            std::vector<int> devices;
+            std::vector<const std::vector<Copy>*> copies;
+            for (const auto &entry : byDevice) {
+                devices.push_back(entry.first);
+                copies.push_back(&entry.second);
+            }
+            std::vector<char> copied(devices.size(), 0);
+            auto copyRank = [&](int rank, int device) {
+                (void)device;
+                for (const auto &copy : *copies[rank]) {
+                    if (!Qwen35SnapshotCopyTensor(*copy.source, *copy.destination)) return;
+                }
+                copied[rank] = 1;
+            };
+            // Reuse the existing ordered producer/worker handoff. Every copy
+            // remains synchronous on its own device; overlap only independent
+            // devices. The dispatcher joins all callbacks, including errors,
+            // before this function can publish or let the next forward run.
+            if (devices.size() == 1 || (devices.size() > 1 &&
+                !MultiCudaRunDeviceCallbacks(devices, copyRank))) {
+                for (int rank = 0; rank < (int)devices.size(); ++rank) {
+                    copyRank(rank, devices[rank]);
+                }
+            }
+            if (!std::all_of(copied.begin(), copied.end(),
+                    [](char value) { return value != 0; })) return false;
+            for (const auto &entry : caches) entry.second->valid = true;
+            return true;
+        }
+
+#ifdef USE_CUDA
+        static bool Qwen35StateStageEnabled() {
+            const char *value = std::getenv("FASTLLM_QWEN35_STATE_STAGE");
+            return value != nullptr && std::strcmp(value, "1") == 0;
+        }
+
+        static std::mutex &Qwen35StateStagePoolsMutex() {
+            static auto *mutex = new std::mutex(); return *mutex;
+        }
+        static std::map<const Qwen3_5Model*, std::shared_ptr<fastllm::qwen35_state_stage::Pool> > &
+        Qwen35StateStagePools() {
+            static auto *pools = new std::map<const Qwen3_5Model*,
+                std::shared_ptr<fastllm::qwen35_state_stage::Pool> >();
+            return *pools;
+        }
+        static std::shared_ptr<fastllm::qwen35_state_stage::Pool>
+        Qwen35StateStagePoolFor(const Qwen3_5Model *model) {
+            std::lock_guard<std::mutex> lock(Qwen35StateStagePoolsMutex());
+            auto &pools = Qwen35StateStagePools();
+            auto &pool = pools[model];
+            if (!pool) pool = std::make_shared<fastllm::qwen35_state_stage::Pool>();
+            return pool;
+        }
+        static void *Qwen35StateStageEnsureReaderEvent(int device) {
+            auto &gate = fastllm::qwen35_state_stage::GlobalReaderGate();
+            void *existing = gate.For(device);
+            if (existing != nullptr) return existing;
+            const int previous = FastllmCudaGetDevice();
+            FastllmCudaSetDevice(device);
+            void *created = FastllmCudaEventCreate();
+            FastllmCudaSetDevice(previous);
+            if (created == nullptr) return nullptr;
+            void *adopted = gate.Adopt(device, created);
+            if (adopted != created) FastllmCudaEventDestroy(created);
+            return adopted;
+        }
+        static void Qwen35StateStageAwaitProducer(int device) {
+            void *event = fastllm::qwen35_state_stage::GlobalReaderGate().For(device);
+            if (event != nullptr) FastllmCudaEventSynchronize(event);
+        }
+        // Capture runs on the scheduler thread; the copy enqueue inside it runs on
+        // the producer workers. A capture must never re-enter that fan-out.
+        static bool &Qwen35StateStageDispatching() {
+            static thread_local bool dispatching = false;
+            return dispatching;
+        }
+        struct Qwen35StateStageCudaOwner {
+            std::shared_ptr<fastllm::qwen35_state_stage::Arena> arena;
+            std::vector<std::pair<int, std::pair<size_t, size_t> > > spans;
+            ~Qwen35StateStageCudaOwner() {
+                // The D2D copies were enqueued on each device's producer stream;
+                // a span may only return to the arena once they have finished.
+                for (const auto &span : spans) {
+                    void *event = fastllm::qwen35_state_stage::GlobalReaderGate().For(span.first);
+                    if (event != nullptr) FastllmCudaEventSynchronize(event);
+                    if (arena) arena->Release(span.first, span.second.first, span.second.second);
+                }
+            }
+        };
+        static size_t Qwen35StateStageAlignBytes(size_t bytes) {
+            return fastllm::qwen35_state_stage::Arena::Align(bytes);
+        }
+        static size_t Qwen35StateStageCreditBytes(long long available) {
+            const char *text = std::getenv("FASTLLM_QWEN35_STATE_STAGE_LIMIT_MB");
+            const long long configured = text ? std::atoll(text) : 0;
+            if (available <= 0) return 0;
+            if (configured > 0) return std::min<size_t>(size_t(configured) << 20, size_t(available));
+            // 8 rows x 3072 tokens need 8 x 18.94 MiB of linear state per TP
+            // device and 8 x 40..60 MiB of draft KV on the draft device. The old
+            // 128 MiB cap (divided by 8 again) refused that case outright, and a
+            // refused capture is a 46 ms synchronous copy on the compute thread.
+            return std::min<size_t>(size_t(512) << 20, size_t(available));
+        }
+        static void Qwen35StateStageInitBudget(const Qwen3_5Model *model,
+                                                const std::vector<int> &devices) {
+            if (!Qwen35StateStageEnabled()) return;
+            auto pool = Qwen35StateStagePoolFor(model);
+            auto arena = pool->ArenaRef();
+            // Warmup only knows the TP forward devices. The standalone DFlash
+            // draft GPU first owns staged state at capture time, so a device
+            // without a limit (or without an arena) must enter configuration
+            // here instead of being refused by Pool::TryReserve forever.
+            bool unconfigured = false;
+            for (int device : devices)
+                if (!pool->HasLimit(device) || !arena->HasBase(device)) {
+                    unconfigured = true; break;
+                }
+            if (!unconfigured) return;
+            const auto freeBytes = FastllmCudaGetFreeSizes();
+            const auto totalBytes = FastllmCudaGetTotalSizes();
+            std::map<int, size_t> limits;
+            for (int device : devices) {
+                if (device < 0 || device >= (int)freeBytes.size() ||
+                    device >= (int)totalBytes.size()) continue;
+                if (pool->HasLimit(device) && arena->HasBase(device)) continue;
+                const long long reserved = (long long)(totalBytes[device] *
+                    (1.0 - GetGpuMemRatio()));
+                const long long serving = model->GetAutoWarmupCudaServingReserveBytes(device);
+                const long long available = std::max<long long>(0, freeBytes[device] -
+                    reserved - serving);
+                const size_t credit = Qwen35StateStageCreditBytes(available);
+                limits[device] = credit;
+                std::fprintf(stderr,
+                    "[Prefix SSD] qwen35-state-stage: gpu=%d ratio=%.3f free=%lld total=%lld "
+                    "reserved=%lld serving_reserve=%lld credit_bytes=%zu default_credit_mb=%d enabled=1.\n",
+                    device, GetGpuMemRatio(), freeBytes[device], totalBytes[device], reserved,
+                    serving, credit, 512);
+            }
+            pool->Configure(limits);
+            // Preallocate the arena once per device, so a capture only
+            // sub-allocates memory the budget already owns.
+            const int previous = FastllmCudaGetDevice();
+            for (const auto &entry : limits) {
+                if (entry.second == 0 || arena->HasBase(entry.first)) continue;
+                FastllmCudaSetDevice(entry.first);
+                void *base = FastllmCudaMalloc(entry.second);
+                if (base == nullptr) {
+                    std::fprintf(stderr,
+                        "[Prefix SSD] qwen35-state-stage: gpu=%d arena_alloc_failed bytes=%zu "
+                        "fallback=sync.\n", entry.first, entry.second);
+                    continue;
+                }
+                arena->Adopt(entry.first, base, entry.second);
+            }
+            FastllmCudaSetDevice(previous);
+        }
+        static void Qwen35StateStageClose(const Qwen3_5Model *model) {
+            std::lock_guard<std::mutex> lock(Qwen35StateStagePoolsMutex());
+            auto it = Qwen35StateStagePools().find(model);
+            if (it != Qwen35StateStagePools().end() && it->second) it->second->Close();
+        }
+#else
+        static bool Qwen35StateStageEnabled() { return false; }
+        static void Qwen35StateStageAwaitProducer(int) {}
+        static void Qwen35StateStageInitBudget(const Qwen3_5Model *, const std::vector<int> &) {}
+        static void Qwen35StateStageClose(const Qwen3_5Model *) {}
+#endif
+
+        static void Qwen35StateStageBindIdentity(
+                const std::shared_ptr<fastllm::qwen35_state_stage::Ticket> &ticket,
+                uint64_t requestId, uint64_t requestGeneration, uint64_t copyGeneration,
+                const std::string &cacheIdentity) {
+            if (!ticket) return;
+            ticket->identity.requestId = requestId;
+            ticket->identity.requestGeneration = requestGeneration;
+            ticket->identity.copyGeneration = copyGeneration;
+            ticket->identity.cacheIdentity = cacheIdentity;
+        }
+        static bool Qwen35StateStageIdentityMatches(
+                const std::shared_ptr<fastllm::qwen35_state_stage::Ticket> &ticket,
+                uint64_t requestId, uint64_t requestGeneration, uint64_t copyGeneration,
+                const std::string &cacheIdentity) {
+            return ticket && ticket->identity.Matches(requestId, requestGeneration,
+                copyGeneration, cacheIdentity);
+        }
+
+        static bool Qwen35SnapshotStageCaches(Qwen3_5Model *model,
+                const std::vector<std::pair<const Data*, Qwen35LinearPrefixSnapshotCache*> > &caches,
+                Qwen35LinearPrefixSnapshot &snapshot,
+                const std::vector<fastllm::qwen35_state_stage::Piece> &extraPieces,
+                std::string *fallbackReason) {
+#ifndef USE_CUDA
+            (void)model; (void)caches; (void)snapshot; (void)extraPieces;
+            (void)fallbackReason; return false;
+#else
+            if (!Qwen35StateStageEnabled()) return false;
+            // Every refusal falls back to the synchronous path with a reason; a
+            // capture is never dropped.
+            auto refuse = [&](const char *reason) {
+                if (fallbackReason) *fallbackReason = reason;
+                std::fprintf(stderr, "[Prefix SSD] qwen35-state-stage: capture_refused "
+                    "reason=%s tokens=%d fallback=sync.\n", reason, snapshot.cachedLen);
+                return false;
+            };
+            if (Qwen35StateStageDispatching()) return refuse("reentrant_dispatch");
+            std::map<int, size_t> needs;
+            std::vector<fastllm::qwen35_state_stage::Piece> planned;
+            auto append = [&](const Data &source, Data &destination, bool &valid) {
+                if (source.dataDevice != DataDevice::CUDA || source.cudaData == nullptr ||
+                    source.dims.empty() || source.GetBytes() == 0) return false;
+                const int device = source.dataDeviceIds.empty() ?
+                    GetPointerDeviceId(source.cudaData) : source.dataDeviceIds[0];
+                if (device < 0) return false;
+                destination.FreeSpace(); destination.dataType = source.dataType;
+                destination.UpdateUnitSize(); destination.dataDevice = DataDevice::CPU;
+                destination.dataDeviceIds.clear(); destination.expansionDims.clear();
+                destination.Resize(source.dims);
+                if (!source.expansionDims.empty() && source.expansionDims != source.dims)
+                    destination.Expansion(source.expansionDims);
+                destination.isKVCache = true;
+                destination.isLinearAttention = source.isLinearAttention;
+                destination.isLinearAttentionTransposed = source.isLinearAttentionTransposed;
+                destination.isPagedKVCache = false; destination.pagedKVCacheData = nullptr;
+                destination.name = source.name; destination.cacheUid = source.cacheUid;
+                fastllm::qwen35_state_stage::Piece piece;
+                piece.device = device; piece.bytes = source.GetBytes();
+                piece.source = source.cudaData; piece.destination = &destination;
+                piece.validFlag = &valid; piece.dataType = (int)source.dataType;
+                piece.dims = source.dims; piece.expansionDims = source.expansionDims;
+                piece.linear = source.isLinearAttention;
+                piece.transposed = source.isLinearAttentionTransposed;
+                piece.cacheUid = source.cacheUid; piece.name = source.name;
+                needs[device] += Qwen35StateStageAlignBytes(piece.bytes);
+                planned.push_back(std::move(piece));
+                return true;
+            };
+            for (const auto &entry : caches) {
+                if (!entry.first || !entry.second) return false;
+                auto &cache = *entry.second; cache.valid = false;
+                cache.multiDevice = entry.first->multiDeviceData && !entry.first->multiDeviceDatas.empty();
+                cache.dataDeviceIds = entry.first->dataDeviceIds;
+                cache.tpLayout = entry.first->tpLayout; cache.tpAxis = entry.first->tpAxis;
+                cache.tpRanges = entry.first->tpRanges; cache.tpGlobalDims = entry.first->tpGlobalDims;
+                cache.dims = entry.first->dims; cache.dataType = entry.first->dataType;
+                cache.transposed = entry.first->isLinearAttentionTransposed;
+                if (cache.multiDevice) {
+                    bool found = false;
+                    for (const auto &local : entry.first->multiDeviceDatas) {
+                        if (!local.second) continue;
+                        if (!append(*local.second, cache.locals[local.first], cache.valid)) return false;
+                        found = true;
+                    }
+                    if (!found) return false;
+                } else if (!append(*entry.first, cache.single, cache.valid)) return false;
+            }
+            for (const auto &extra : extraPieces) {
+                if (extra.device < 0 || extra.source == nullptr ||
+                    extra.destination == nullptr || extra.bytes == 0) return false;
+                if (extra.compactSource &&
+                    (extra.rows <= 0 || extra.rowBytes == 0 ||
+                     extra.sourceStrideBytes < extra.rowBytes ||
+                     extra.rowBytes * (size_t)extra.rows != extra.bytes)) return false;
+                planned.push_back(extra);
+                needs[extra.device] += Qwen35StateStageAlignBytes(extra.bytes);
+            }
+            std::vector<int> devices;
+            for (const auto &entry : needs) devices.push_back(entry.first);
+            Qwen35StateStageInitBudget(model, devices);
+            auto pool = Qwen35StateStagePoolFor(model);
+            auto arena = pool->ArenaRef();
+            for (int device : devices)
+                if (!arena->HasBase(device)) return refuse("arena_missing");
+            fastllm::qwen35_state_stage::Identity identity;
+            identity.requestId = (uint64_t)std::max(0, snapshot.requestId);
+            std::shared_ptr<fastllm::qwen35_state_stage::Ticket> ticket;
+            const auto reserved = pool->TryReserve(needs, identity, ticket);
+            if (reserved != fastllm::qwen35_state_stage::Result::Granted) {
+                switch (reserved) {
+                    case fastllm::qwen35_state_stage::Result::PoolFull: return refuse("arena_full");
+                    case fastllm::qwen35_state_stage::Result::TooLarge: return refuse("credit_too_large");
+                    case fastllm::qwen35_state_stage::Result::Retry: return refuse("credit_busy");
+                    case fastllm::qwen35_state_stage::Result::Closed: return refuse("pool_closed");
+                    default: return refuse("reserve_failed");
+                }
+            }
+            ticket->stageBytes = needs;
+            auto owner = std::make_shared<Qwen35StateStageCudaOwner>();
+            owner->arena = arena;
+            for (const auto &span : ticket->arenaSpans) owner->spans.push_back(span);
+            ticket->pieces = std::move(planned); ticket->owner = owner;
+            const int previous = FastllmCudaGetDevice();
+            // Rank 0 of the TP forward reuses the caller PTDS; ranks 1..n run on
+            // the persistent workers. A device whose producer is a worker must be
+            // served by that worker, exactly like the paged-page producer events
+            // (Qwen35PersistentCache: "Record on the actual persistent TP
+            // producers, not an unrelated scheduler-thread stream on the same
+            // device"). The standalone DFlash draft GPU runs inline on the
+            // scheduler (RunDFlashLmHead on draftDevices.size() == 1), so it stays
+            // on the caller path.
+            std::vector<int> callerDevices;
+            bool anyWorkerOwned = false;
+            for (const auto &span : ticket->arenaSpans) {
+                const int device = span.first;
+                const bool workerOwned = model->Qwen35StageWorkerGroup().HasWorkers() &&
+                    std::find(model->Qwen35StagePreparedDevices().begin(),
+                              model->Qwen35StagePreparedDevices().end(),
+                              device) != model->Qwen35StagePreparedDevices().end();
+                if (workerOwned) anyWorkerOwned = true;
+                else callerDevices.push_back(device);
+            }
+            std::vector<uint64_t> enqueueNs(devices.size(), 0);
+            // Enqueue on the stream that writes this device's state, so the copy
+            // is ordered after the kernels that produced it and before the next
+            // forward overwrites it. One event per device, recorded after that
+            // device's last copy: every copy for a device is FIFO on one stream.
+            auto enqueueOnDevice = [&](int device) {
+                FastllmCudaSetDevice(device);
+                void *base = arena->Base(device);
+                const size_t spanOffset = ticket->arenaSpans[device].first;
+                // Keep the per-device event a true barrier for both consumers: a
+                // capture issued earlier on another producer stream (a re-prepared
+                // worker group) must still be ordered before this record, so wait
+                // on the previous record before overwriting it (pattern: 2264-2267).
+                void *previousEvent = fastllm::qwen35_state_stage::GlobalReaderGate().For(device);
+                if (previousEvent != nullptr)
+                    FastllmCudaCurrentThreadStreamWaitEvent(previousEvent);
+                void *readyEvent = Qwen35StateStageEnsureReaderEvent(device);
+                const auto start = std::chrono::steady_clock::now();
+                bool ok = readyEvent != nullptr && base != nullptr;
+                size_t cursor = 0;
+                for (auto &piece : ticket->pieces) {
+                    if (!ok) break;
+                    if (piece.device != device) continue;
+                    if (piece.compactSource && (piece.rows <= 0 || piece.rowBytes == 0 ||
+                            piece.sourceStrideBytes < piece.rowBytes ||
+                            piece.rowBytes * (size_t)piece.rows != piece.bytes)) {
+                        ok = false; break;
+                    }
+                    piece.arenaOffset = spanOffset + cursor;
+                    piece.arenaReservedBytes = Qwen35StateStageAlignBytes(piece.bytes);
+                    piece.deviceBuffer = (uint8_t *)base + piece.arenaOffset;
+                    if (piece.compactSource) {
+                        ok = FastllmCudaMemcpy2DDeviceToDeviceAsyncCurrentThread(
+                            piece.deviceBuffer, piece.rowBytes, piece.source,
+                            piece.sourceStrideBytes, piece.rowBytes, (size_t)piece.rows);
+                    } else {
+                        ok = FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(
+                            piece.deviceBuffer, const_cast<void *>(piece.source), piece.bytes);
+                    }
+                    if (!ok) break;
+                    cursor += piece.arenaReservedBytes;
+                }
+                // Record even on failure: the span is released through the owner,
+                // which must not return memory with a copy still in flight.
+                if (readyEvent != nullptr) FastllmCudaEventRecordCurrentThread(readyEvent);
+                const size_t rank = (size_t)(std::find(devices.begin(), devices.end(), device) -
+                                             devices.begin());
+                if (rank < enqueueNs.size())
+                    enqueueNs[rank] = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - start).count();
+                return ok;
+            };
+            bool enqueued = true;
+            if (anyWorkerOwned) {
+                // Run the full prepared device list: the group's rank 0 is the
+                // caller, every other rank is that device's persistent worker. A
+                // partial list would move the caller off the device it owns.
+                const std::vector<int> &prepared = model->Qwen35StagePreparedDevices();
+                std::vector<char> rankOk(prepared.size(), 0);
+                std::vector<std::exception_ptr> errors(prepared.size());
+                Qwen35StateStageDispatching() = true;
+                try {
+                    model->Qwen35StageWorkerGroup().RunWithCaller(prepared,
+                        [&](int rank) {
+                            const int device = prepared[rank];
+                            if (ticket->arenaSpans.find(device) == ticket->arenaSpans.end()) return;
+                            rankOk[rank] = enqueueOnDevice(device) ? 1 : 0;
+                        }, errors);
+                } catch (...) {
+                    Qwen35StateStageDispatching() = false;
+                    FastllmCudaSetDevice(previous);
+                    throw;
+                }
+                Qwen35StateStageDispatching() = false;
+                for (size_t i = 0; i < errors.size(); ++i) {
+                    if (ticket->arenaSpans.find(prepared[i]) == ticket->arenaSpans.end()) continue;
+                    if (errors[i] || !rankOk[i]) enqueued = false;
+                }
+            }
+            for (int device : callerDevices)
+                if (!enqueueOnDevice(device)) enqueued = false;
+            FastllmCudaSetDevice(previous);
+            if (!enqueued) return refuse("copy_failed");
+            for (uint64_t ns : enqueueNs) ticket->d2dEnqueueNs += ns;
+            snapshot.stateStageBytes = ticket->stageBytes;
+            snapshot.stateStageD2DEnqueueNs = ticket->d2dEnqueueNs;
+            if (!fastllm::qwen35_state_stage::MarkEnqueued(ticket) ||
+                !fastllm::qwen35_state_stage::MarkReady(ticket)) return false;
+            snapshot.stateStage = std::move(ticket);
+            return true;
+#endif
+        }
+
+        static bool Qwen35StateStageMaterialize(
+                const std::shared_ptr<fastllm::qwen35_state_stage::Ticket> &ticket,
+                void *pinned, size_t pinnedBytes, const std::map<int, void*> &streams) {
+#ifndef USE_CUDA
+            (void)ticket; (void)pinned; (void)pinnedBytes; (void)streams; return false;
+#else
+            if (!ticket || ticket->state != fastllm::qwen35_state_stage::State::Ready) return false;
+            const int previous = FastllmCudaGetDevice();
+            const auto materializeStart = std::chrono::steady_clock::now();
+            try {
+                int syncedDevice = -1;
+                for (auto &piece : ticket->pieces) {
+                    FastllmCudaSetDevice(piece.device);
+                    const auto readyStart = std::chrono::steady_clock::now();
+                    if (piece.device != syncedDevice) {
+                        // Every copy for a device is FIFO on that device's producer
+                        // stream, so one synchronisation covers all its pieces.
+                        syncedDevice = piece.device;
+                        void *readyEvent =
+                            fastllm::qwen35_state_stage::GlobalReaderGate().For(piece.device);
+                        if (readyEvent != nullptr) {
+                            FastllmCudaEventSynchronize(readyEvent);
+                            ticket->readyWaitNs += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - readyStart).count();
+                        }
+                    }
+                    Data *destination = static_cast<Data *>(piece.destination);
+                    if (!destination) return false;
+                    destination->FreeSpace(); destination->dataType = (DataType)piece.dataType;
+                    destination->UpdateUnitSize(); destination->dataDevice = DataDevice::CPU;
+                    destination->dataDeviceIds.clear(); destination->expansionDims.clear();
+                    destination->Resize(piece.dims);
+                    if (!piece.expansionDims.empty() && piece.expansionDims != piece.dims)
+                        destination->Expansion(piece.expansionDims);
+                    destination->Allocate(false); destination->isKVCache = true;
+                    destination->isLinearAttention = piece.linear;
+                    destination->isLinearAttentionTransposed = piece.transposed;
+                    destination->isPagedKVCache = false; destination->pagedKVCacheData = nullptr;
+                    destination->name = piece.name; destination->cacheUid = piece.cacheUid;
+                    auto stream = streams.find(piece.device);
+                    size_t offset = 0;
+                    while (offset < piece.bytes) {
+                        const size_t count = std::min(piece.bytes - offset,
+                            pinned && pinnedBytes ? pinnedBytes : piece.bytes - offset);
+                        if (stream != streams.end() && pinned && pinnedBytes) {
+                            if (!FastllmCudaCopyFromDeviceToPinnedHostAsync(
+                                    pinned, (char*)piece.deviceBuffer + offset, count, stream->second)) return false;
+                            FastllmCudaStreamSynchronize(stream->second);
+                            std::memcpy(destination->cpuData + offset, pinned, count);
+                        } else {
+                            FastllmCudaCopyFromDeviceToHost(destination->cpuData + offset,
+                                (char*)piece.deviceBuffer + offset, count);
+                        }
+                        offset += count;
                     }
                 }
-                dst.valid = !dst.locals.empty();
-                return dst.valid;
+                // Publish validity only after every piece in this ticket is materialized.
+                for (const auto &piece : ticket->pieces) {
+                    if (piece.validFlag) *static_cast<bool *>(piece.validFlag) = true;
+                }
+            } catch (...) {
+                FastllmCudaSetDevice(previous); fastllm::qwen35_state_stage::Fail(ticket); throw;
             }
-            dst.valid = Qwen35SnapshotCopyTensor(src, dst.single);
-            return dst.valid;
+            FastllmCudaSetDevice(previous);
+            ticket->materializeNs = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - materializeStart).count();
+            if (!fastllm::qwen35_state_stage::MarkMaterialized(ticket)) return false;
+            ticket->owner.reset();
+            return true;
+#endif
+        }
+
+        static void Qwen35PublishMaterializedSnapshot(
+                const Qwen3_5Model *model,
+                const std::shared_ptr<Qwen35LinearPrefixSnapshot> &snapshot) {
+            if (!snapshot) return;
+            std::lock_guard<std::mutex> guard(Qwen35LinearPrefixSnapshotsMutex());
+            auto &items = Qwen35LinearPrefixSnapshots()[model];
+            for (auto it = items.begin(); it != items.end();) {
+                if (*it && (*it)->cachedLen == snapshot->cachedLen &&
+                    (*it)->tokens == snapshot->tokens &&
+                    (*it)->mediaPageKeys == snapshot->mediaPageKeys) it = items.erase(it);
+                else ++it;
+            }
+            items.push_back(snapshot);
+            while ((int)items.size() > Qwen35LinearPrefixSnapshotMaxRecords()) items.erase(items.begin());
         }
 
         static void Qwen35ReleasePagedReferencesNoDuplicate(
+
                 Data &cache,
                 std::set<std::pair<PagedCacheManager*, int> > &released) {
             if (cache.isPagedKVCache && cache.pagedKVCacheData != nullptr) {
@@ -5273,28 +6632,78 @@ namespace fastllm {
         static const Qwen35LinearPrefixSnapshot *Qwen35FindLinearPrefixSnapshotLocked(
                 const Qwen3_5Model *model,
                 const std::vector<int> &tokens,
+                const ResponseContext *context,
                 int maxCachedLen,
                 int exactLen = -1,
                 bool requireMtp = false,
                 bool requireDFlash = false,
                 int dflashLayers = 0,
                 int dflashKvHeads = 0,
-                int dflashHeadDim = 0) {
+                int dflashHeadDim = 0, std::map<std::string, std::string> *diagnostics = nullptr) {
+            std::map<std::string, uint64_t> rejected;
+            auto reject = [&](const char *reason) { if (diagnostics) ++rejected[reason]; };
+            struct Summary {
+                std::map<std::string, std::string> *out;
+                std::map<std::string, uint64_t> &counts;
+                ~Summary() { if (out) for (const auto &entry : counts)
+                    (*out)["snapshot_reject_" + entry.first] = std::to_string(entry.second); }
+            } summary{diagnostics, rejected};
+            if (diagnostics) (*diagnostics)["snapshot_max_tokens"] = std::to_string(maxCachedLen);
             auto &all = Qwen35LinearPrefixSnapshots();
             auto it = all.find(model);
             if (it == all.end()) {
+                reject("no_snapshot_registry");
                 return nullptr;
             }
-            return FindRecurrentPrefix(it->second, tokens, maxCachedLen, exactLen,
-                [&](const Qwen35LinearPrefixSnapshot &snapshot) {
-                    if (requireMtp &&
-                        (!snapshot.mtpValid || snapshot.mtpTokens != snapshot.cachedLen ||
-                         snapshot.mtpKey.dims.size() < 2 || snapshot.mtpValue.dims.size() < 2 ||
-                         snapshot.mtpKey.dims[1] != snapshot.cachedLen ||
-                         snapshot.mtpValue.dims[1] != snapshot.cachedLen)) return false;
-                    return !requireDFlash || Qwen35DFlashSnapshotMatches(
-                        snapshot, snapshot.cachedLen, dflashLayers, dflashKvHeads, dflashHeadDim);
-                });
+            if (diagnostics) (*diagnostics)["snapshot_count"] = std::to_string(it->second.size());
+            const Qwen35LinearPrefixSnapshot *best = nullptr;
+            for (auto &snapshotPtr : it->second) {
+                Qwen35LinearPrefixSnapshot *snapshot = snapshotPtr.get();
+                if (snapshot == nullptr || snapshot->cachedLen <= 0 ||
+                    snapshot->cachedLen > maxCachedLen ||
+                    snapshot->cachedLen > (int)tokens.size()) {
+                    reject("length");
+                    continue;
+                }
+                if (exactLen >= 0 && snapshot->cachedLen != exactLen) {
+                    reject("exact_length");
+                    continue;
+                }
+                if ((int)snapshot->tokens.size() != snapshot->cachedLen ||
+                    !std::equal(snapshot->tokens.begin(), snapshot->tokens.end(), tokens.begin())) {
+                    reject("token_prefix");
+                    continue;
+                }
+                if (!Qwen35SnapshotMatchesContext(*snapshot, context)) {
+                    reject("media_position_or_provenance");
+                    continue;
+                }
+                if (requireMtp &&
+                    (!snapshot->mtpValid || snapshot->mtpTokens != snapshot->cachedLen ||
+                     snapshot->mtpKey.dims.size() < 2 ||
+                     snapshot->mtpValue.dims.size() < 2 ||
+                     snapshot->mtpKey.dims[1] != snapshot->cachedLen ||
+                     snapshot->mtpValue.dims[1] != snapshot->cachedLen)) {
+                    reject("mtp_state");
+                    continue;
+                }
+                if (requireDFlash &&
+                    !Qwen35DFlashSnapshotMatches(
+                        *snapshot, snapshot->cachedLen,
+                        dflashLayers, dflashKvHeads,
+                        dflashHeadDim)) {
+                    reject("dflash_state");
+                    continue;
+                }
+                if (best == nullptr ||
+                    snapshot->cachedLen > best->cachedLen ||
+                    (snapshot->cachedLen == best->cachedLen &&
+                     snapshot->timestamp > best->timestamp)) {
+                    best = snapshot;
+                }
+            }
+            if (diagnostics) (*diagnostics)["snapshot_selected_tokens"] = std::to_string(best ? best->cachedLen : 0);
+            return best;
         }
 
         static void Qwen35EraseLinearPrefixSnapshots(const Qwen3_5Model *model) {
@@ -6241,6 +7650,15 @@ namespace fastllm {
                     int valuePage =
                         value.pagedKVCacheData->GetUnusedPageIndex(true);
                     if (keyPage < 0 || valuePage != keyPage) {
+                        // KVPAIR: record both managers before rollback (failure path only).
+                        std::printf("[KVPAIR] reserve-mismatch key_page=%d value_page=%d append=%d base=%d | K %s | V %s | K@v %s | V@k %s | diff %s.\n",
+                                    keyPage, valuePage, appendTokens, baseTokens,
+                                    key.pagedKVCacheData->PageStateString(keyPage).c_str(),
+                                    value.pagedKVCacheData->PageStateString(valuePage).c_str(),
+                                    key.pagedKVCacheData->PageStateString(valuePage).c_str(),
+                                    value.pagedKVCacheData->PageStateString(keyPage).c_str(),
+                                    key.pagedKVCacheData->PairDiff(*value.pagedKVCacheData).c_str());
+                        std::fflush(stdout);
                         if (valuePage >= 0) {
                             value.pagedKVCacheData->ReleasePageIndex(
                                 valuePage);
@@ -7219,6 +8637,7 @@ namespace fastllm {
                         cacheLayerIdx * 2, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, kCacheDesc);
                     PagedCacheManager *pagedCacheVManager = AllocatePagedCacheManager(
                         cacheLayerIdx * 2 + 1, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, vCacheDesc);
+                    PairPagedCacheManagers(pagedCacheKManager, pagedCacheVManager);  // KVPAIR (no-op unless enabled)
                     Qwen3CudaAppendPagedCache(runner, *pagedCacheKManager, pastKey, *k);
                     Qwen3CudaAppendPagedCache(runner, *pagedCacheVManager, pastValue, *v);
                 } else {
@@ -7236,6 +8655,7 @@ namespace fastllm {
                             cacheLayerIdx * 2, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, kCacheDesc);
                         PagedCacheManager *pagedCacheVManager = AllocatePagedCacheManager(
                             cacheLayerIdx * 2 + 1, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, vCacheDesc);
+                        PairPagedCacheManagers(pagedCacheKManager, pagedCacheVManager);  // KVPAIR (no-op unless enabled)
                         Qwen3CudaAppendPagedCache(runner, *pagedCacheKManager, pastKey, curK);
                         Qwen3CudaAppendPagedCache(runner, *pagedCacheVManager, pastValue, curV);
                         total += seqLens[b];
@@ -7267,10 +8687,13 @@ namespace fastllm {
                 Data &vCaches = *(*batchPastValues)[0];
                 PagedCacheManager *pagedCacheKManager = kCaches.pagedKVCacheData;
                 PagedCacheManager *pagedCacheVManager = vCaches.pagedKVCacheData;
+                PairPagedCacheManagers(pagedCacheKManager, pagedCacheVManager);  // KVPAIR (no-op unless enabled)
                 AssertInFastLLM(pagedCacheKManager != nullptr && pagedCacheVManager != nullptr,
                                 "Qwen3.5 gated paged attention decode requires paged KV cache.\n");
 
-                if (!externalDecodeMeta && !(*generatedAppendParams)) {
+                // KVPAIR: with paired managers each layer previews (reserves) its own pages; the shared
+                // first-layer preview assumed equal free-list order in every layer.
+                if (!externalDecodeMeta && (!(*generatedAppendParams) || pagedCacheKManager->pairPartner != nullptr)) {
                     Qwen3CudaGenerateAppendPagedCacheBatchParams(runner, *pagedCacheKManager,
                                                                  *batchPastKeys, batch,
                                                                  *insertIndexs, *insertPositions);
@@ -7465,6 +8888,210 @@ namespace fastllm {
             }
         }
 
+        // ---- TOP2DEBUG CUDA helpers ----------------------------------------
+        // Exact global top-2 over the lm_head shards. Every rank's shard logits
+        // are copied to the host and every id is considered, so a shard that
+        // owns both of the two best logits still reports both (a shard's argmax
+        // plus its runner-up, merged globally). Debug only: this synchronizes and
+        // copies the whole vocabulary.
+        static void Qwen35Top2DebugFromShards(
+                const std::vector<int> &devices,
+                const DivisionScheme &lmHeadScheme,
+                std::vector<Data> &localLogits,
+                int rows, int vocabSize,
+                std::vector<Qwen35Top2DebugRow> &out) {
+            out.assign(rows > 0 ? rows : 0, Qwen35Top2DebugRow());
+            if (rows <= 0 || devices.empty() || localLogits.empty()) {
+                return;
+            }
+            const int previousDevice = FastllmCudaGetDevice();
+            for (int r = 0; r < (int)devices.size() &&
+                            r < (int)localLogits.size(); r++) {
+                auto schemeIt = lmHeadScheme.find(devices[r]);
+                if (schemeIt == lmHeadScheme.end()) {
+                    continue;
+                }
+                Data &local = localLogits[r];
+                if (local.dataDevice != DataDevice::CUDA ||
+                    local.cudaData == nullptr || local.dims.empty()) {
+                    continue;
+                }
+                const int localVocab = (int)local.dims.back();
+                if (localVocab <= 0 ||
+                    (int)(local.Count(0) / (uint64_t)localVocab) != rows) {
+                    continue;
+                }
+                FastllmCudaSetDevice(devices[r]);
+                Data host;
+                host.CopyFrom(local);
+                host.ToDevice(DataDevice::CPU);
+                if (host.dataType != DataType::FLOAT32) {
+                    ToDataType(host, DataType::FLOAT32);
+                    host.ToDevice(DataDevice::CPU);
+                }
+                const float *values = (const float*)host.cpuData;
+                if (values == nullptr) {
+                    continue;
+                }
+                int localOffset = 0;
+                for (const auto &range : schemeIt->second) {
+                    const int len = range.second - range.first;
+                    const int begin = localOffset;
+                    const int end = std::min(localOffset + len, localVocab);
+                    for (int localId = begin; localId < end; localId++) {
+                        const int globalId = range.first + (localId - begin);
+                        if (globalId < 0 || globalId >= vocabSize) {
+                            continue;
+                        }
+                        for (int row = 0; row < rows; row++) {
+                            Qwen35Top2DebugConsider(out[row], globalId,
+                                values[(size_t)row * (size_t)localVocab +
+                                       (size_t)localId]);
+                        }
+                    }
+                    localOffset += len;
+                }
+            }
+            FastllmCudaSetDevice(previousDevice);
+        }
+
+        // Top-2 of a full-vocabulary logits tensor (gathered shards, or one GPU
+        // that already owns the whole vocabulary).
+        static void Qwen35Top2DebugFromFullLogits(
+                const Data &logits, int rows, int vocabSize,
+                std::vector<Qwen35Top2DebugRow> &out) {
+            out.assign(rows > 0 ? rows : 0, Qwen35Top2DebugRow());
+            if (rows <= 0 || vocabSize <= 0 || logits.dims.empty()) {
+                return;
+            }
+            const int width = (int)logits.dims.back();
+            if (width <= 0 ||
+                (int)(logits.Count(0) / (uint64_t)width) < rows) {
+                return;
+            }
+            Data host;
+            host.CopyFrom(logits);
+            host.ToDevice(DataDevice::CPU);
+            if (host.dataType != DataType::FLOAT32) {
+                ToDataType(host, DataType::FLOAT32);
+                host.ToDevice(DataDevice::CPU);
+            }
+            const float *values = (const float*)host.cpuData;
+            if (values == nullptr) {
+                return;
+            }
+            const int limit = std::min(width, vocabSize);
+            for (int row = 0; row < rows; row++) {
+                for (int id = 0; id < limit; id++) {
+                    Qwen35Top2DebugConsider(out[row], id,
+                        values[(size_t)row * (size_t)width + (size_t)id]);
+                }
+            }
+        }
+
+        // Row -> request handle. A speculative forward decides seqLens[b] rows
+        // for request b; every other forward decides one row per request.
+        static void Qwen35Top2DebugRowHandles(
+                int rows, const std::vector<int> &seqLens, bool perRow,
+                std::vector<int> &handles) {
+            const std::vector<int> &requestHandles =
+                qwen35Top2DebugRequestHandles;
+            handles.assign(rows, -1);
+            if (perRow) {
+                int row = 0;
+                for (int b = 0; b < (int)requestHandles.size() && row < rows; b++) {
+                    const int len = b < (int)seqLens.size() ?
+                        std::max(1, seqLens[b]) : 1;
+                    for (int j = 0; j < len && row < rows; j++, row++) {
+                        handles[row] = requestHandles[b];
+                    }
+                }
+            } else if ((int)requestHandles.size() == rows) {
+                handles = requestHandles;
+            }
+        }
+
+        // Row -> committed length after the row's token, from the forward's own
+        // position ids (same convention as the CHUNKTAIL-LOGITS probe: pos is
+        // position + 1).
+        static void Qwen35Top2DebugRowPositions(
+                const std::vector<Data*> &positionIds, int batch,
+                const std::vector<int> &seqLens, bool perRow,
+                std::vector<int> &positions) {
+            positions.clear();
+            for (int b = 0; b < batch; b++) {
+                Data position;
+                if (b < (int)positionIds.size() && positionIds[b] != nullptr) {
+                    position.CopyFrom(*positionIds[b]);
+                    position.ToDevice(DataDevice::CPU);
+                    if (position.dataType != DataType::FLOAT32) {
+                        ToDataType(position, DataType::FLOAT32);
+                        position.ToDevice(DataDevice::CPU);
+                    }
+                }
+                const int count = position.cpuData == nullptr ?
+                    0 : (int)position.Count(0);
+                const int len = perRow && b < (int)seqLens.size() ?
+                    std::max(1, seqLens[b]) : 1;
+                for (int j = 0; j < len; j++) {
+                    const int index = perRow ? j : len - 1;
+                    positions.push_back(index >= 0 && index < count ?
+                        (int)((const float*)position.cpuData)[index] + 1 : -1);
+                }
+            }
+        }
+
+        static void Qwen35Top2DebugEmit(
+                const char *path, int batch, const std::vector<int> &seqLens,
+                const std::vector<Data*> &positionIds, bool perRow,
+                const std::vector<Qwen35Top2DebugRow> &rows,
+                const std::vector<int> &chosen) {
+            if (!Qwen35Top2DebugEnabled() || rows.empty()) {
+                return;
+            }
+            std::vector<int> handles, positions;
+            Qwen35Top2DebugRowHandles((int)rows.size(), seqLens, perRow, handles);
+            Qwen35Top2DebugRowPositions(positionIds, batch, seqLens, perRow,
+                                        positions);
+            const std::string pathName = path == nullptr ? "unknown" : path;
+            if (pathName != qwen35Top2DebugLastPath) {
+                qwen35Top2DebugLastPath = pathName;
+                printf("[TOP2SCOPE] path=%s rows=%d batch=%d\n",
+                       pathName.c_str(), (int)rows.size(), batch);
+            }
+            for (int row = 0; row < (int)rows.size(); row++) {
+                printf("[TOP2] handle=%d pos=%d top1=%d top1_logit=%.9g top2=%d top2_logit=%.9g chosen=%d\n",
+                       row < (int)handles.size() ? handles[row] : -1,
+                       row < (int)positions.size() ? positions[row] : -1,
+                       rows[row].top1, rows[row].top1Logit,
+                       rows[row].top2, rows[row].top2Logit,
+                       row < (int)chosen.size() ? chosen[row] : -1);
+            }
+            fflush(stdout);
+        }
+
+        // Emit the block the caller queued before a sampler call that decides
+        // the tokens itself. Disarms first so a block can never be emitted twice.
+        static void Qwen35Top2DebugFlushPending(const std::vector<int> &chosen) {
+            if (!Qwen35Top2DebugEnabled() || !qwen35Top2DebugPending.armed ||
+                qwen35Top2DebugPending.logits == nullptr) {
+                return;
+            }
+            const std::string path = qwen35Top2DebugPending.path;
+            const int rows = qwen35Top2DebugPending.rows;
+            const int vocabSize = qwen35Top2DebugPending.vocabSize;
+            const int batch = qwen35Top2DebugPending.batch;
+            const std::vector<int> seqLens = qwen35Top2DebugPending.seqLens;
+            const std::vector<Data*> positionIds = qwen35Top2DebugPending.positionIds;
+            const bool perRow = qwen35Top2DebugPending.perRow;
+            const Data &logits = *qwen35Top2DebugPending.logits;
+            qwen35Top2DebugPending = Qwen35Top2DebugPending();
+            std::vector<Qwen35Top2DebugRow> top2;
+            Qwen35Top2DebugFromFullLogits(logits, rows, vocabSize, top2);
+            Qwen35Top2DebugEmit(path.c_str(), batch, seqLens, positionIds, perRow,
+                                top2, chosen);
+        }
+
         static void Qwen35GatherShardLogitsToRootCuda(
                 int rootDevice,
                 const std::vector<int> &devices,
@@ -7534,6 +9161,11 @@ namespace fastllm {
                 const std::vector<int> &eosIds) {
             AssertInFastLLM(batch > 0 && !devices.empty(),
                             "Qwen3.5 CUDA greedy shard sampling got empty input.\n");
+            if (Qwen35Top2DebugEnabled()) {
+                // Fresh per sampling call: only this call may publish the ids it
+                // decided for the asynchronous GPU token handoff.
+                qwen35Top2DebugDecidedTokens.clear();
+            }
             static thread_local std::vector<std::vector<int> > localBestIds;
             static thread_local std::vector<std::vector<float> > localBestScores;
             static thread_local std::vector<Data> cudaBestIds;
@@ -7755,6 +9387,15 @@ namespace fastllm {
                         (float*)cudaFloatOutput.cudaData,
                         ranks, batch),
                     "Qwen3.5 CUDA greedy candidate merge failed.\n");
+                if (Qwen35Top2DebugEnabled()) {
+                    // The chosen ids stay on the device for the asynchronous
+                    // handoff. Copy them so the caller logs the same rows; the
+                    // copy also makes the logits of this step final on the host.
+                    qwen35Top2DebugDecidedTokens.assign(batch, 0);
+                    FastllmCudaCopyFromDeviceToHost(
+                        qwen35Top2DebugDecidedTokens.data(),
+                        cudaOutput.cudaData, (size_t)batch * sizeof(int));
+                }
                 handoff->PublishToken(handoff->outputTokenSlot);
                 handoff->deviceTokenProduced = true;
                 if (handoff->asyncSampling) {
@@ -7861,6 +9502,19 @@ namespace fastllm {
             FastllmCudaSetDevice(rootDevice);
             std::vector<int> lastRet;
             lastRet.reserve(batch);
+            if (Qwen35Top2DebugEnabled()) {
+                // Fresh per sampling call: only this call publishes what it
+                // decided, so a caller can log rows it did not get back.
+                qwen35Top2DebugDecidedTokens.clear();
+            }
+            // TOP2DEBUG: this sampler decides and returns the ids itself, so the
+            // caller queues the block and this call emits it at its own return.
+            auto top2DebugFlushRoot = [&](const std::vector<int> &chosen) {
+                if (!Qwen35Top2DebugEnabled()) {
+                    return;
+                }
+                Qwen35Top2DebugFlushPending(chosen);
+            };
             if (!allSimple) {
                 static thread_local std::vector<float> temperatures;
                 static thread_local std::vector<int> topKs;
@@ -8018,14 +9672,22 @@ namespace fastllm {
                         "Qwen3.5 CUDA handoff sampling failed.\n");
                     handoff->PublishToken(handoff->outputTokenSlot);
                     handoff->deviceTokenProduced = true;
+                    if (Qwen35Top2DebugEnabled()) {
+                        qwen35Top2DebugDecidedTokens.assign(batch, 0);
+                        FastllmCudaCopyFromDeviceToHost(
+                            qwen35Top2DebugDecidedTokens.data(),
+                            cudaOutput.cudaData, (size_t)batch * sizeof(int));
+                    }
                     if (handoff->asyncSampling) {
                         handoff->QueueHostTokens(cudaOutput);
+                        top2DebugFlushRoot(qwen35Top2DebugDecidedTokens);
                         return std::vector<int>(batch, 0);
                     }
                     lastRet.resize(batch);
                     FastllmCudaCopyFromDeviceToHost(
                         lastRet.data(), cudaOutput.cudaData,
                         (size_t)batch * sizeof(int));
+                    top2DebugFlushRoot(lastRet);
                     return lastRet;
                 }
                 lastRet.resize(batch);
@@ -8036,6 +9698,10 @@ namespace fastllm {
                     lastRet.data(), batch, vocabSize);
                 AssertInFastLLM(sampled,
                                 "Qwen3.5 CUDA top-k/top-p sampling failed.\n");
+                if (Qwen35Top2DebugEnabled()) {
+                    qwen35Top2DebugDecidedTokens = lastRet;
+                }
+                top2DebugFlushRoot(lastRet);
                 return lastRet;
             }
 
@@ -8077,19 +9743,61 @@ namespace fastllm {
                                           (int*)cudaOutput.cudaData,
                                           batch, vocabSize);
             }
+            if (Qwen35Top2DebugEnabled()) {
+                // Covers the asynchronous handoff return and the plain copy
+                // below; the copy also makes this step's ids final on the host.
+                qwen35Top2DebugDecidedTokens.assign(batch, 0);
+                FastllmCudaCopyFromDeviceToHost(
+                    qwen35Top2DebugDecidedTokens.data(),
+                    cudaOutput.cudaData, (size_t)batch * sizeof(int));
+            }
 
             if (handoffSampling && handoff->asyncSampling) {
                 handoff->QueueHostTokens(cudaOutput);
+                top2DebugFlushRoot(qwen35Top2DebugDecidedTokens);
                 return std::vector<int>(batch, 0);
             }
             lastRet.resize(batch);
             FastllmCudaCopyFromDeviceToHost(lastRet.data(), cudaOutput.cudaData,
                                             (size_t)batch * sizeof(int));
+            top2DebugFlushRoot(lastRet);
             return lastRet;
         }
     }
 #else
     namespace {
+        // The CPU build still compiles the common prefix-cache accounting
+        // paths below.  Keep the CUDA-side helpers' small environment API
+        // available when their CUDA implementation is excluded.
+        static int Qwen35EnvInt(const char *name, int fallback) {
+            const char *value = std::getenv(name);
+            if (value == nullptr || value[0] == 0) return fallback;
+            char *end = nullptr;
+            long parsed = std::strtol(value, &end, 10);
+            return end == value ? fallback : (int)parsed;
+        }
+        static bool Qwen35BatchPrefillEnabled() {
+            const char *value = std::getenv("FASTLLM_QWEN35_BATCH_PREFILL");
+            return value != nullptr && value[0] != 0 && value[0] != '0';
+        }
+
+        // Keep the CPU helper strict and default-off like the CUDA helper.
+        static bool Qwen35MultiPrefillEnabled() {
+            const char *value = std::getenv("FASTLLM_QWEN35_MULTI_PREFILL");
+            return value != nullptr && Qwen35MoeIsTrueString(value);
+        }
+
+        static bool Qwen35MixedRowsEnabled() {
+            static const bool enabled = [] {
+                const char *value = std::getenv("FASTLLM_QWEN35_MIXED_ROWS");
+                return value != nullptr && Qwen35MoeIsTrueString(value);
+            }();
+            return enabled;
+        }
+        static int Qwen35LinearPrefixSnapshotGateTokens() {
+            return fastllm::GetPageLen();
+        }
+
         struct Qwen35LinearPrefixSnapshotCache {
             bool valid = false;
         };
@@ -8100,15 +9808,32 @@ namespace fastllm {
             Qwen35LinearPrefixSnapshotCache second;
         };
 
-        struct Qwen35LinearPrefixSnapshot : RecurrentPrefixKey {
+        struct Qwen35LinearPrefixSnapshot {
+            int cachedLen = 0;
+            int requestId = 0;
+            long long timestamp = 0;
+            std::vector<int> tokens;
+            std::vector<std::string> mediaPageKeys;
+            SnapshotPrefixIdentity matchIdentity;
             std::vector<Qwen35LinearPrefixSnapshotLayer> layers;
             bool mtpValid = false;
             int mtpTokens = 0;
             Data mtpKey;
             Data mtpValue;
+            std::vector<int> mtpProposalTokens;
             bool dflashValid = false;
             int dflashTokens = 0;
             std::vector<std::pair<Data, Data> > dflashKeyValues;
+            std::vector<int> dflashProposalTokens;
+            std::vector<int> dflashProposalCandidateIds;
+            std::vector<float> dflashProposalCandidateProbs;
+            std::shared_ptr<fastllm::qwen35_state_stage::Ticket> stateStage;
+            std::map<int, size_t> stateStageBytes;
+            uint64_t stateStageD2DEnqueueNs = 0;
+            uint64_t stateStageReadyWaitNs = 0;
+            uint64_t stateStageMaterializeNs = 0;
+            uint64_t stateStageFallbackSyncCount = 0;
+            std::string stateStageFallbackReason;
         };
 
         static std::mutex &Qwen35LinearPrefixSnapshotsMutex() {
@@ -8116,10 +9841,10 @@ namespace fastllm {
             return *mutex;
         }
 
-        static std::map<const Qwen3_5Model*, std::vector<std::unique_ptr<Qwen35LinearPrefixSnapshot> > >
+        static std::map<const Qwen3_5Model*, std::vector<std::shared_ptr<Qwen35LinearPrefixSnapshot> > >
                 &Qwen35LinearPrefixSnapshots() {
             static auto *snapshots =
-                new std::map<const Qwen3_5Model*, std::vector<std::unique_ptr<Qwen35LinearPrefixSnapshot> > >();
+                new std::map<const Qwen3_5Model*, std::vector<std::shared_ptr<Qwen35LinearPrefixSnapshot> > >();
             return *snapshots;
         }
 
@@ -8173,11 +9898,11 @@ namespace fastllm {
             return 0;
         }
 
-        static bool Qwen35SnapshotCopyCache(
-                const Data &src,
-                Qwen35LinearPrefixSnapshotCache &dst) {
-            (void)src;
-            (void)dst;
+        static bool Qwen35StateStageEnabled() { return false; }
+        static bool Qwen35SnapshotCopyCachesSync(
+                const std::vector<std::pair<const Data*,
+                    Qwen35LinearPrefixSnapshotCache*> > &caches) {
+            (void)caches;
             return false;
         }
 
@@ -8192,15 +9917,18 @@ namespace fastllm {
         static const Qwen35LinearPrefixSnapshot *Qwen35FindLinearPrefixSnapshotLocked(
                 const Qwen3_5Model *model,
                 const std::vector<int> &tokens,
+                const ResponseContext *context,
                 int maxCachedLen,
                 int exactLen = -1,
                 bool requireMtp = false,
                 bool requireDFlash = false,
                 int dflashLayers = 0,
                 int dflashKvHeads = 0,
-                int dflashHeadDim = 0) {
+                int dflashHeadDim = 0,
+                std::map<std::string, std::string> *diagnostics = nullptr) {
             (void)model;
             (void)tokens;
+            (void)context;
             (void)maxCachedLen;
             (void)exactLen;
             (void)requireMtp;
@@ -8208,6 +9936,7 @@ namespace fastllm {
             (void)dflashLayers;
             (void)dflashKvHeads;
             (void)dflashHeadDim;
+            (void)diagnostics;
             return nullptr;
         }
 
@@ -9065,7 +10794,23 @@ namespace fastllm {
                          pagedPastKeyValues, generationConfigs, lastTokens, &batchLogits)[0];
     }
 
+    #include "qwen3_5_persistent.inc"
+
     Qwen3_5Model::Qwen3_5Model() {
+#ifdef USE_CUDA
+        // Match the Python entry point for native API callers. An automatic
+        // timing decision must not change cached-state arithmetic on restart.
+        const char *reduction = std::getenv("FASTLLM_CUDA_CUSTOM_ALLREDUCE");
+        std::string reductionMode = reduction == nullptr ? "auto" : reduction;
+        std::transform(reductionMode.begin(), reductionMode.end(), reductionMode.begin(),
+                       [](unsigned char c) { return (char)std::tolower(c); });
+        if (reductionMode.empty() || reductionMode == "auto") {
+            ::setenv("FASTLLM_CUDA_CUSTOM_ALLREDUCE", "off", 1);
+        }
+#endif
+#if defined(FASTLLM_DISK_PREFIX_CACHE)
+        persistentPrefixCache = Qwen35PersistentCache::Create(this);
+#endif
         this->model_struct = "qwen3_5";
         this->model_type = "qwen3_5";
         this->use_new_engine = true;
@@ -9222,9 +10967,19 @@ namespace fastllm {
     }
 
     Qwen3_5Model::~Qwen3_5Model() {
+        VisionAsyncShutdown();
         // Linear slot Data objects keep raw PagedCacheManager pointers. Stop
         // model work and destroy all request contexts before deleting pools.
         ShutdownRuntime();
+        // 方案 §13 第 5 条：必须先停掉持久缓存的 worker（及其内部的协调器/
+        // 哈希池），再销毁 CUDA/model。persistentPrefixCache 是 shared_ptr 成员，
+        // 若只靠成员析构，Stop() 会发生在下面 CUDA 拆解**之后**，后台线程可能
+        // 在设备已拆解的情况下仍去访问 CUDA。
+        if (persistentPrefixCache) {
+            persistentPrefixCache->Stop();
+            persistentPrefixCache.reset();
+        }
+        Qwen35StopSpillWorker(this);
         mtpCaches.clear();
         mtpPagedCachePools.clear();
         if (threadTpWorkerGroup.HasWorkers()) {
@@ -9264,6 +11019,15 @@ namespace fastllm {
 #else
         return false;
 #endif
+    }
+
+    bool Qwen3_5Model::PersistentPrefixRestorePending(const ResponseContext *context) const {
+        const bool pending = context != nullptr &&
+            context->intParams.find("qwen35_l2_promotion_pending") !=
+                context->intParams.end() &&
+            context->intParams.at("qwen35_l2_promotion_pending") != 0;
+        return context && (context->prefixRestore.phase == PrefixCacheRestoreStatus::Reading ||
+                           pending);
     }
 
     bool Qwen3_5Model::ShouldEnforceAutoWarmupRuntimeBatchLimit() const {
@@ -9560,7 +11324,10 @@ namespace fastllm {
         }
 
         const bool dflash = HasDFlashWeights();
-        if (dflash && deviceId == devices.front() && dflashSlidingWindow > 0) {
+        // 草稿卡（显式指定或默认 target 根卡）承接草稿自身的滑动窗口缓存；
+        // 指定草稿卡时这笔预留要记到草稿卡，而不是 target 根卡。
+        if (dflash && deviceId == Qwen35DFlashDraftDeviceOr(devices) &&
+            dflashSlidingWindow > 0) {
             // Draft attention keeps its own FP16 window on the root GPU even
             // when its linear layers use TP. These per-request caches are not
             // target paged KV and were previously absent from auto budgeting.
@@ -9740,6 +11507,16 @@ namespace fastllm {
             }
             const int localRatio = ratios.find(deviceId) == ratios.end() ? 1 :
                 std::max(1, ratios.find(deviceId)->second);
+            // 草稿独占设备（FASTLLM_DFLASH_DRAFT_DEVICE）时，草稿不在 target 的
+            // TP 组内，而本函数只会被 AutoWarmup 对 target 各卡调用，因此
+            // target 四卡一律不记草稿权重（否则整份草稿会压在本卡 root 上，
+            // 实测导致 GPU0 预留暴涨、KV 页数腰斩并 OOM）。
+            // 草稿卡自身的开销由 PrepareMtpCudaServingWarmup 的余量打印核对。
+            const bool draftOwnDevice = Qwen35DFlashDraftDevice() >= 0;
+            // 本函数只对 target 组内各卡调用，故该条件等价于"显式指定的草稿卡
+            // 就是本卡"（TP5：草稿卡同时兼任 target 分片卡，草稿不再分片）。
+            const bool draftOnThisCard = draftOwnDevice &&
+                Qwen35DFlashDraftDevice() == deviceId;
             for (const auto &item : weight.weight) {
                 if (item.first.rfind("dflash.", 0) != 0 ||
                     item.first ==
@@ -9750,7 +11527,7 @@ namespace fastllm {
                 }
                 const long long bytes =
                     (long long)item.second.GetBytes();
-                const bool sharded = useDFlashTp &&
+                const bool sharded = !draftOwnDevice && useDFlashTp &&
                     (Qwen35DFlashTpLinearEligible(item.first, item.second) ||
                      pairedDownWeightNames.count(item.first) != 0);
                 if (sharded) {
@@ -9767,13 +11544,22 @@ namespace fastllm {
                         largestFallbackSource = std::max(
                             largestFallbackSource, bytes);
                     }
-                } else if (deviceId == devices.front()) {
+                } else if ((!draftOwnDevice && deviceId == devices.front()) ||
+                           draftOnThisCard) {
                     reserveBytes += bytes;
                 }
             }
-            if (deviceId == devices.front()) {
+            if (!draftOwnDevice && deviceId == devices.front()) {
                 reserveBytes += largestFallbackSource;
                 reserveBytes += (long long)(dflashHeadDim / 2) * sizeof(float);
+            }
+            if (draftOnThisCard) {
+                // 草稿权重本身已按 weight map 全额计入；这里补的是派生 FP4
+                // 副本与草稿运行期工作区。来源：build-fastllm/diag-gpu4.log
+                // 第 52/88 行实测——准备阶段净增 4.070 GB = BF16 权重 2.071
+                // + FP4 增量 0.157 + 工作区 1.842，扣除上方已单列的草稿窗口
+                // 缓存约 0.44 GB 后取 1.6 GB（偏保守）。
+                reserveBytes += 1600LL * 1024 * 1024;
             }
         }
         return reserveBytes;
@@ -9784,6 +11570,9 @@ namespace fastllm {
     }
 
     void Qwen3_5Model::WarmupCudaRuntimeBuffers(int batch) {
+        // The TP layout and collective auto-test are complete. Start auxiliary
+        // storage work here so it cannot perturb the auto-test selection.
+        if (persistentPrefixCache) persistentPrefixCache->StartPrefetch();
 #ifdef USE_CUDA
         if (batch <= 0) {
             return;
@@ -9793,6 +11582,7 @@ namespace fastllm {
         if (!GetQwen35GPUForwardDevices(this->deviceMap, devices, ratios) || devices.empty()) {
             return;
         }
+        Qwen35StateStageInitBudget(this, devices);
 
         auto it = this->weight.weight.find("lm_head.weight");
         if (it == this->weight.weight.end()) {
@@ -9832,17 +11622,70 @@ namespace fastllm {
         if (mtpCudaServingWarmupPrepared) {
             return;
         }
+        ScopedLoadTimer _mtpWarmup(Qwen35StartupProfile().mtpWarmupUs);
         if (HasDFlashWeights()) {
             std::vector<int> devices;
             std::map<int, int> ratios;
             if (GetQwen35GPUForwardDevices(this->deviceMap, devices, ratios) &&
                 !devices.empty()) {
-                int device = devices[0];
+                // 草稿独占设备时，权重与 rotary 直接准备到草稿卡，避免先落到
+                // target 根卡后再把整份权重复制过去。
+                const int dflashDraftDevice = Qwen35DFlashDraftDevice();
+                int device =
+                    dflashDraftDevice >= 0 ? dflashDraftDevice : devices[0];
+                // ===== TEMP-DIAG 临时诊断（验证 GPU4 占用归属；结论出来后删除）=====
+                auto qwen35DraftDiag = [&](const char *tag) {
+                    const std::vector<long long> f = FastllmCudaGetFreeSizes();
+                    const std::vector<long long> t = FastllmCudaGetTotalSizes();
+                    const long long freeB =
+                        (device >= 0 && device < (int)f.size()) ? f[device] : -1;
+                    const long long totalB =
+                        (device >= 0 && device < (int)t.size()) ? t[device] : -1;
+                    unsigned long long wBytes = 0;
+                    int wCount = 0;
+                    for (const auto &item : weight.weight) {
+                        if (item.first.rfind("dflash.", 0) != 0) continue;
+                        const Data &w = item.second;
+                        if (w.dataDevice != DataDevice::CUDA) continue;
+                        if (std::find(w.dataDeviceIds.begin(), w.dataDeviceIds.end(),
+                                      device) == w.dataDeviceIds.end()) continue;
+                        wBytes += w.GetBytes();
+                        wCount++;
+                    }
+                    unsigned long long cBytes = dflashNvfp4DraftLmHead.GetBytes();
+                    for (const auto &kv : dflashNvfp4ViewWeights) {
+                        cBytes += kv.second.GetBytes();
+                    }
+                    printf("[TEMP-DIAG] %s cuda:%d used=%.3f GB | dflash weights %d %.3f GB | fp4 copies (including lm_head) %.3f GB | other %.3f GB\n",
+                           tag, device, (totalB - freeB) / 1e9, wCount, wBytes / 1e9,
+                           cBytes / 1e9,
+                           (totalB - freeB - (long long)wBytes - (long long)cBytes) / 1e9);
+                    fflush(stdout);
+                };
+                // ===== TEMP-DIAG 结束 =====
+                qwen35DraftDiag("(1)before-prep");
                 PrepareDFlashWeightsForDevice(device);
-                PrepareDFlashRotary(device);
+                qwen35DraftDiag("(2)after-prep-device");
+                { ScopedLoadTimer _rotary(Qwen35StartupProfile().draftRotaryUs);
+                  PrepareDFlashRotary(device); }
+                qwen35DraftDiag("(3)after-rotary");
                 printf("[Qwen3.5 DFlash2] warmup: weights and RoPE frequencies on cuda:%d.\n",
                        device);
                 fflush(stdout);
+                if (dflashDraftDevice >= 0) {
+                    const std::vector<long long> draftFree =
+                        FastllmCudaGetFreeSizes();
+                    const std::vector<long long> draftTotal =
+                        FastllmCudaGetTotalSizes();
+                    if (device >= 0 && device < (int)draftFree.size() &&
+                        device < (int)draftTotal.size()) {
+                        printf("[Qwen3.5 DFlash2] draft card cuda:%d free=%.2f GB / total=%.2f GB.\n",
+                               device, draftFree[device] / 1e9,
+                               draftTotal[device] / 1e9);
+                    }
+                    fflush(stdout);
+                    qwen35DraftDiag("(4)after-warmup");
+                }
             }
         } else if (!Qwen35MtpDisabledByEnv() && Qwen35MtpWarmupEnabled() &&
                    HasMtpWeights()) {
@@ -9929,6 +11772,13 @@ namespace fastllm {
             return;
         }
         PrepareMtpCudaServingWarmup();
+        // Pool shapes are final in eager serving. Let the already-running
+        // storage worker decode while serving scratch warmup continues.
+        if (!GetFastllmEnv().cudaGraph && persistentPrefixCache)
+        {
+            if (Qwen35L2HostKVEnabled()) Qwen35EnsureSpillState(this);
+            persistentPrefixCache->PrefetchReady();
+        }
         PrepareCudaServingAfterWarmup(true);
 #endif
     }
@@ -9978,6 +11828,7 @@ namespace fastllm {
 
     void Qwen3_5Model::OnAutoWarmupFinished() {
         if (kvMemConfig.enabled) return;
+        ScopedLoadTimer _autoFinish(Qwen35StartupProfile().finishUs);
 #ifdef USE_CUDA
         PrepareMtpCudaServingWarmup();
         std::vector<int> fp8Devices;
@@ -9985,6 +11836,7 @@ namespace fastllm {
         if (HasDFlashWeights() && !GetFastllmEnv().cudaGraph &&
             GetQwen35GPUForwardDevices(this->deviceMap, fp8Devices, fp8Ratios) &&
             !fp8Devices.empty()) {
+            ScopedLoadTimer _fp8Layout(Qwen35StartupProfile().fp8WarmupUs);
             // DFlash repeatedly verifies multiple rows. Fix the eligible FP8
             // weight layouts before any real prefill builds recurrent/KV state.
             // Startup still uses synchronous NCCL and all TP workers are idle.
@@ -10050,6 +11902,14 @@ namespace fastllm {
             }
         }
 #endif
+        // Register only after the final serving warmup/possible pool resize.
+        // The normal AutoWarmup path never called the old Initialize hook.
+        if (persistentPrefixCache) InitializePersistentPrefixCache();
+        else InstallPagedSpillHooks();
+        if (persistentPrefixCache) persistentPrefixCache->PrefetchReady();
+        InitializeCacheCapacityObservation();
+        _autoFinish.Stop();
+        PrintQwen35StartupProfile();
     }
 
     PagedCacheManager* Qwen3_5Model::GetPagedKVCacheManager(int layerIndex, bool isKey) const {
@@ -10141,26 +12001,273 @@ namespace fastllm {
                Qwen35MtpSupportsGenerationConfig(context->generationConfig);
     }
 
+    static uint64_t Qwen35L2HostKVPoolLimitBytes() {
+        static const uint64_t value =
+            (uint64_t)std::max(0, Qwen35EnvInt("FASTLLM_PREFIX_CACHE_L2_HOST_KV_MB", 4096)) << 20;
+        return value;
+    }
+
+    // 【L2：显存 → 内存溢出】开关（默认关 ⇒ 零行为变更）。
+    static bool Qwen35L2HostKVEnabled() {
+        static const bool enabled = [] {
+            const char *text = std::getenv("FASTLLM_PREFIX_CACHE_L2_HOST_KV");
+            return text != nullptr && text[0] != '0';
+        }();
+        return enabled;
+    }
+
+    // Opt-in observation only: FASTLLM_PREFIX_CACHE_SPILL_STATS=1. Unset, empty
+    // and false values disable counters/logging and do not enable L2 host KV.
+    // Reuse the relaxed atomic aggregates used by Qwen35MtpProfileStats above.
+    // Page counts are physical (layer, K/V, device) copies, not token positions.
+    // Registration/worker/queue/restore-call counts distinguish an unreachable
+    // path from a zero-hit path. Registrations include repeated installations.
+    struct Qwen35SpillStats {
+        std::atomic<uint64_t> hookRegistrations{0};
+        std::atomic<uint64_t> onRecordPageCalls{0};
+        std::atomic<uint64_t> workerTasks{0};
+        std::atomic<uint64_t> spillSuccessPages{0};
+        std::atomic<uint64_t> lruEvictedPages{0};
+        std::atomic<uint64_t> poolBytes{0};
+        std::atomic<uint64_t> queueDroppedTasks{0};
+        std::atomic<uint64_t> restoreCalls{0};
+        std::atomic<uint64_t> restoreHitPages{0};
+    };
+    static bool Qwen35SpillStatsEnabled() {
+        if (!PrefixCacheDebugEnabled()) return false;
+        static const bool enabled = Qwen35MoeIsTrueString(
+            std::getenv("FASTLLM_PREFIX_CACHE_SPILL_STATS"));
+        return enabled;
+    }
+    static Qwen35SpillStats &Qwen35SpillStatsRef() {
+        // The existing spill worker/pool have process lifetime.
+        static auto *stats = new Qwen35SpillStats();
+        return *stats;
+    }
+    static void Qwen35PrintSpillStats(const char *event, bool force = false) {
+        if (!Qwen35SpillStatsEnabled()) return;
+        // Fields are sampled independently; worker_idle is the useful settled
+        // snapshot. Observation does not wait for copies or take cache locks.
+        static auto *printMutex = new std::mutex();
+        std::unique_lock<std::mutex> lock(*printMutex, std::try_to_lock);
+        if (!lock.owns_lock()) return;
+        static auto lastPrint = std::chrono::steady_clock::time_point();
+        const auto now = std::chrono::steady_clock::now();
+        if (!force && now - lastPrint < std::chrono::seconds(1)) return;
+        lastPrint = now;
+        const auto &stats = Qwen35SpillStatsRef();
+        printf("[PrefixCache] spill stats: event=%s l2_enabled=%d "
+               "hook_registrations=%llu on_record_page=%llu worker_tasks=%llu "
+               "spill_success_pages=%llu lru_evicted_pages=%llu spill_pool_bytes=%llu "
+               "queue_dropped_tasks=%llu restore_calls=%llu restore_hit_pages=%llu.\n",
+               event, Qwen35L2HostKVEnabled() ? 1 : 0,
+               (unsigned long long)stats.hookRegistrations.load(std::memory_order_relaxed),
+               (unsigned long long)stats.onRecordPageCalls.load(std::memory_order_relaxed),
+               (unsigned long long)stats.workerTasks.load(std::memory_order_relaxed),
+               (unsigned long long)stats.spillSuccessPages.load(std::memory_order_relaxed),
+               (unsigned long long)stats.lruEvictedPages.load(std::memory_order_relaxed),
+               (unsigned long long)stats.poolBytes.load(std::memory_order_relaxed),
+               (unsigned long long)stats.queueDroppedTasks.load(std::memory_order_relaxed),
+               (unsigned long long)stats.restoreCalls.load(std::memory_order_relaxed),
+               (unsigned long long)stats.restoreHitPages.load(std::memory_order_relaxed));
+        fflush(stdout);
+    }
+
+    #include "qwen3_5_spill.inc"
+
+    void Qwen3_5Model::InitializeCacheCapacityObservation() {
+        if (GetFastllmObservabilityMode() == FastllmObservabilityMode::Off) return;
+        std::vector<PagedCacheManager*> managers;
+        std::set<PagedCacheManager*> seen;
+        for (int layer = 0; layer < block_cnt; ++layer) {
+            if (Qwen35LayerIsLinearAttention(this, layer)) continue;
+            for (bool key : {true, false}) {
+                auto refs = GetPagedKVCacheManagers(layer, key);
+                if (refs.empty()) return; // Never present a partial layout as total capacity.
+                for (const auto &ref : refs)
+                    if (ref.second && seen.insert(ref.second).second)
+                        managers.push_back(ref.second);
+            }
+        }
+        std::lock_guard<std::mutex> guard(capacityObservationMutex);
+        capacityObservationManagers = std::move(managers);
+    }
+
+    std::map<std::string, std::string> Qwen3_5Model::GetCacheCapacityObservation() {
+        RequestStatusFields fields;
+        const auto stampBegin = [&](const std::string &tier) {
+            fields[tier + "_sample_begin_ns"] = std::to_string(RequestStatusNowNs());
+        };
+        const auto stampEnd = [&](const std::string &tier) {
+            fields[tier + "_sample_end_ns"] = std::to_string(RequestStatusNowNs());
+            fields[tier + "_sample_unix_ns"] = std::to_string(RequestStatusWallNs());
+        };
+        fields["capacity_scope"] = "shared_model_pools";
+        fields["capacity_consistency"] = "independent_tier_samples";
+        stampBegin("l1");
+        std::unique_lock<std::mutex> layout(capacityObservationMutex, std::try_to_lock);
+        if (!layout.owns_lock()) fields["l1_capacity_state"] = "busy";
+        else {
+            std::vector<L1CapacityPageSample> samples;
+            std::vector<std::unique_lock<std::mutex>> locks;
+            for (auto *manager : capacityObservationManagers) {
+                locks.emplace_back(manager->pageIndexLocker, std::try_to_lock);
+                if (!locks.back().owns_lock()) { fields["l1_capacity_state"] = "busy"; break; }
+            }
+            if (!fields.count("l1_capacity_state")) for (auto *manager : capacityObservationManagers) {
+                L1CapacityPageSample sample;
+                sample.total = std::max(0, manager->maxPages);
+                sample.ready = std::max(0, manager->FreePageCount());
+                sample.empty = manager->freePages.size();
+                sample.pageLen = std::max(0, manager->pageLen);
+                sample.bytes = manager->GetBytes();
+                samples.push_back(sample);
+            }
+            if (!fields.count("l1_capacity_state")) {
+                const auto capacity = L1CapacityFields(samples);
+                fields.insert(capacity.begin(), capacity.end());
+                fields["l1_snapshot_consistency"] = "all_required_pool_locks_held";
+                fields["l1_used_scope"] = "allocated_or_retained_including_reserve";
+                fields["l1_available_scope"] = "empty_pages_only";
+            }
+        }
+        if (layout.owns_lock()) layout.unlock();
+        stampEnd("l1");
+        stampBegin("l2");
+        // Capacity uses the real pool ledger, never opt-in diagnostic counters.
+        if (!Qwen35L2HostKVEnabled()) fields["l2_capacity_state"] = "disabled";
+        else if (!pagedSpillState) fields["l2_capacity_state"] = "initializing";
+        else {
+            std::unique_lock<std::mutex> lock(pagedSpillState->poolMutex, std::try_to_lock);
+            if (!lock.owns_lock()) fields["l2_capacity_state"] = "busy";
+            else {
+                fields["l2_capacity_state"] = "ok";
+                ByteCapacityFields(fields, "l2", pagedSpillState->bytes,
+                                   Qwen35L2HostKVPoolLimitBytes());
+            }
+        }
+        stampEnd("l2");
+        fields["l2_accounting"] = "host_kv_pool_ledger";
+        stampBegin("ssd");
+#if defined(FASTLLM_DISK_PREFIX_CACHE)
+        if (!persistentPrefixCache)
+            fields["ssd_capacity_state"] = "disabled";
+        else {
+            try {
+                const auto memory = persistentPrefixCache->MemoryObservation();
+                fields.insert(memory.begin(), memory.end());
+                const auto capacity = persistentPrefixCache->CapacityObservation();
+                fields["ssd_capacity_state"] = capacity["state"].string_value();
+
+                if (fields["ssd_capacity_state"] == "ready" ||
+                    fields["ssd_capacity_state"] == "capacity_unavailable") {
+                    const uint64_t physical = std::stoull(capacity["physical_bytes"].string_value());
+                    const uint64_t limit = std::stoull(capacity["limit_bytes"].string_value());
+                    ByteCapacityFields(fields, "ssd", physical, limit);
+                    fields["ssd_accounting"] = capacity["accounting"].string_value();
+                    fields["ssd_inflight_bytes"] = capacity["inflight_bytes"].string_value();
+                }
+            } catch (const std::exception &) { fields["ssd_capacity_state"] = "unavailable"; }
+        }
+#else
+        fields["ssd_capacity_state"] = "disabled";
+#endif
+        stampEnd("ssd");
+        return fields;
+    }
+
     bool Qwen3_5Model::TryRecordPagedPrefixCacheExtra(ResponseContext *context) {
+        // CHUNK_DEBUG: name the line that rejected a checkpoint.
+        auto ckptReject = [](int line) {
+            if (Qwen35ChunkDebugEnabled()) {
+                printf("[CKPT-REJECT] line=%d\n", line);
+                fflush(stdout);
+            }
+            return false;
+        };
+        Qwen35CkptTrace ckptTrace;
+    // 【最快可用·关键修正】门槛必须早于"做快照"。
+    // 实测（H 与 M 两个服务日志的消息签名对比，tag=fastgate-ensurefirst）：
+    //   H（缓存开着、短请求已被门槛拦掉写盘）：`snapshot recorded` **12 条**、`write_gated` 12 条；
+    //   M（完全不开缓存）：`snapshot recorded` **0 条**。
+    // ⇒ 被拦下的短请求**照样执行了状态快照拷贝**（下面 for 循环里 48 个线性层的卷积缓存
+    //   {1,9216,4} + 循环状态 {1,48,128,128}，按单层 ≈3.14 MiB 计、48 层 ≈151 MiB/次），
+    //   而 M 从不做。这正是"读侧/Ensure 侧怎么拦都无效"的原因：代价在**写侧的拍快照**上。
+    // 因此：长度不够 ⇒ **连快照都不做**（既不读也不拍），让短请求与 `--prefix_cache false` 同路径。
+    // 与读/写门槛同源：同一个 env `FASTLLM_PREFIX_CACHE_MIN_CONTEXT_TOKENS`（**默认 0 = 门槛关闭**，短请求照常读写；设 >0 才开启）。
+    {
+        static const int minContextTokens = [] {
+            const char *text = std::getenv("FASTLLM_PREFIX_CACHE_MIN_CONTEXT_TOKENS");
+            if (text == nullptr) return 0;              // 默认关闭门槛：短请求照常读写缓存
+            const int parsed = std::atoi(text);
+            return parsed > 0 ? parsed : 0;
+        }();
+        if (minContextTokens > 0 && (int)context->allTokens.size() < minContextTokens) return ckptReject(__LINE__);
+    }
         if (context == nullptr ||
+            !context->CanUsePagedPrefixCache() ||
             !Qwen35LinearPrefixCacheEnabled() ||
             !Qwen35HasLinearAttentionLayers(this, this->block_cnt)) {
-            return false;
+            return ckptReject(__LINE__);
         }
         int pageLen = fastllm::GetPageLen();
         int currentLen = Qwen35CurrentTokenGrowingCacheLen(this, this->block_cnt, context->pastKeyValues);
+        if (Qwen35ChunkPrefillEnabled() && !Qwen35ChunkWideEnabled() &&
+            context->multimodalInput.empty() && !kvMemConfig.enabled && context->prefillRemain > 0) {
+            const int tail = context->inputTokens / pageLen * pageLen;
+            const int cap = HasDFlashWeights() ?
+                std::min(GetChunkedPrefillSize(), QWEN35_DFLASH_LONG_PREFILL_CHUNK_SIZE) :
+                GetChunkedPrefillSize();
+            // A final aligned snapshot is less than one chunk away. Keep the
+            // previous durable checkpoint and coalesce this redundant copy.
+            if (currentLen < tail && tail - currentLen < cap) return ckptReject(__LINE__);
+        }
+        if (!context->multimodalInput.empty()) {
+            int chunkSize = GetChunkedPrefillSize();
+            if (RequiresDFlashPrefixSnapshot(context)) {
+                chunkSize = std::min(chunkSize, Qwen35MultimodalPrefillChunkCap());
+            }
+            // Preserve the actual prefill chunk boundaries; a page-aligned
+            // tail alone is not a complete chunk (FP8/GDN is shape-sensitive).
+            // A restored prefix can end halfway through the cold-request
+            // chunk grid (for example 39936 % 2048 == 1024).  The new
+            // prefill chunks are still complete; their boundary is relative
+            // to the restored cache, not to token zero.  Checking the
+            // absolute length rejects every later checkpoint and pins
+            // reuse at the restored length.
+            const int restoredLen = std::max(0, context->cacheLen);
+            // FASTLLM_QWEN35_MM_TAIL_ALIGN: the prefill loop then ends a real
+            // forward at the last page boundary of the prompt; accept it too.
+            static const bool mmTailAlign =
+                Qwen35MoeIsTrueString(std::getenv("FASTLLM_QWEN35_MM_TAIL_ALIGN"));
+            const bool alignedTail = mmTailAlign &&
+                currentLen == context->inputTokens / pageLen * pageLen;
+            const auto junctionIt = context->intParams.find("qwen35_v5_junction");
+            const bool atJunction = fastllm::DiskPrefixV5Enabled() && junctionIt != context->intParams.end() &&
+                junctionIt->second > 0 && currentLen == junctionIt->second;
+            if (currentLen <= restoredLen || currentLen > context->inputTokens ||
+                chunkSize <= 0 ||
+                ((currentLen - restoredLen) % chunkSize != 0 && !alignedTail && !atJunction)) return ckptReject(__LINE__);
+        }
         if (currentLen <= 0 || currentLen > (int)context->allTokens.size() ||
             currentLen % pageLen != 0) {
-            return false;
+            return ckptReject(__LINE__);
         }
+        // Also cover skip-warmup/lazily allocated pools before Record executes.
+        if (Qwen35L2HostKVEnabled() && !pagedSpillState) InstallPagedSpillHooks();
         int lastSnapshotLen = context->intParams["qwen35_linear_prefix_last_len"];
         int snapshotCount = context->intParams["qwen35_linear_prefix_count"];
         if (currentLen <= lastSnapshotLen) {
-            return false;
+            return ckptReject(__LINE__);
         }
-        int interval = Qwen35LinearPrefixSnapshotIntervalTokens();
+        // 【一本账·本地账记全】记账门改用**独立**的门限函数
+        // （`Qwen35LinearPrefixSnapshotGateTokens()` = 一页），**不再复用 interval**。
+        // 原因见该函数定义处的完整说明：复用 interval 会经 `GetChunkedPrefillSize()`
+        // 把预填块一起压小（实测净亏 3.6 倍）。此处只放宽**记账**，不动**块大小**。
+        // 保留 `snapshotCount > 0` 的形式不变，只是把门限从 interval 换成 gate。
+        int interval = Qwen35LinearPrefixSnapshotGateTokens();
         if (snapshotCount > 0 && currentLen % interval != 0) {
-            return false;
+            return ckptReject(__LINE__);
         }
         int requestId = context->intParams["qwen35_linear_prefix_request_id"];
         if (requestId <= 0) {
@@ -10172,42 +12279,146 @@ namespace fastllm {
             context->intParams["qwen35_linear_prefix_request_id"] = requestId;
         }
 
-        std::unique_ptr<Qwen35LinearPrefixSnapshot> snapshot(new Qwen35LinearPrefixSnapshot());
+        std::shared_ptr<Qwen35LinearPrefixSnapshot> snapshot(new Qwen35LinearPrefixSnapshot());
         snapshot->cachedLen = currentLen;
         snapshot->requestId = requestId;
         snapshot->tokens.assign(context->allTokens.begin(), context->allTokens.begin() + currentLen);
+        if (!context->prefixCachePageKeys.empty()) {
+            if ((int)context->prefixCachePageKeys.size() < currentLen / pageLen) return ckptReject(__LINE__);
+            snapshot->mediaPageKeys.assign(context->prefixCachePageKeys.begin(),
+                context->prefixCachePageKeys.begin() + currentLen / pageLen);
+        }
+        if (!Qwen35SetSnapshotMatchIdentity(context, *snapshot)) return ckptReject(__LINE__);
+        bool requireMtp = RequiresMtpPrefixSnapshot(context);
+        bool requireDFlash = RequiresDFlashPrefixSnapshot(context);
         snapshot->layers.resize(this->block_cnt);
+        std::vector<std::pair<const Data*, Qwen35LinearPrefixSnapshotCache*> > linearCopies;
+        linearCopies.reserve(this->block_cnt * 2);
         for (int i = 0; i < this->block_cnt; i++) {
             if (!Qwen35LayerIsLinearAttention(this, i)) {
                 continue;
             }
             snapshot->layers[i].linear = true;
-            if (i >= (int)context->pastKeyValues.size() ||
-                !Qwen35SnapshotCopyCache(context->pastKeyValues[i].first, snapshot->layers[i].first) ||
-                !Qwen35SnapshotCopyCache(context->pastKeyValues[i].second, snapshot->layers[i].second)) {
-                return false;
+            if (i >= (int)context->pastKeyValues.size()) return ckptReject(__LINE__);
+            linearCopies.push_back({&context->pastKeyValues[i].first,
+                                    &snapshot->layers[i].first});
+            linearCopies.push_back({&context->pastKeyValues[i].second,
+                                    &snapshot->layers[i].second});
+        }
+        std::vector<fastllm::qwen35_state_stage::Piece> stateStageExtras;
+        bool dflashStagePlanReady = !requireDFlash;
+        bool stagedState = false;
+        if (Qwen35StateStageEnabled() && !requireMtp) {
+#ifdef USE_CUDA
+            {
+                // Keep the live DFlash source stable until all D2D copies are enqueued.
+                std::lock_guard<std::mutex> guard(mtpCacheMutex);
+                if (requireDFlash) {
+                    auto dflashIt = dflashContexts.find(context);
+                    if (dflashIt == dflashContexts.end() ||
+                        dflashIt->second.committedTokens != currentLen ||
+                        (int)dflashIt->second.draftKeyValues.size() != dflashLayers) {
+                        dflashStagePlanReady = false;
+                    } else {
+                        dflashStagePlanReady = true;
+                        snapshot->dflashKeyValues.resize(dflashLayers);
+                        snapshot->dflashProposalTokens = dflashIt->second.proposalTokens;
+                        snapshot->dflashProposalCandidateIds = dflashIt->second.proposalCandidateIds;
+                        snapshot->dflashProposalCandidateProbs = dflashIt->second.proposalCandidateProbs;
+                        snapshot->dflashValid = dflashLayers == 0;
+                        snapshot->dflashTokens = currentLen;
+                        for (int layer = 0; layer < dflashLayers && dflashStagePlanReady; ++layer) {
+                            const Data &key = dflashIt->second.draftKeyValues[layer].first;
+                            const Data &value = dflashIt->second.draftKeyValues[layer].second;
+                            if (key.dims.size() != 3 || value.dims.size() != 3 ||
+                                key.dims[0] != dflashKvHeads || value.dims[0] != dflashKvHeads ||
+                                key.dims[1] <= 0 || key.dims[1] > currentLen ||
+                                key.dims[1] != value.dims[1] ||
+                                key.dims[2] != dflashHeadDim || value.dims[2] != dflashHeadDim) {
+                                dflashStagePlanReady = false;
+                                break;
+                            }
+                            const Data *sources[2] = {&key, &value};
+                            Data *destinations[2] = {
+                                &snapshot->dflashKeyValues[layer].first,
+                                &snapshot->dflashKeyValues[layer].second};
+                            for (int part = 0; part < 2; ++part) {
+                                const Data &source = *sources[part];
+                                if (source.dataDevice != DataDevice::CUDA || source.cudaData == nullptr ||
+                                    source.dataType != DataType::FLOAT16 || source.strides.size() != 3 ||
+                                    source.strides[2] != 1 || source.strides[1] != source.dims[2] ||
+                                    source.strides[0] < source.dims[1] * source.dims[2]) {
+                                    dflashStagePlanReady = false;
+                                    break;
+                                }
+                                const int device = source.dataDeviceIds.empty() ?
+                                    GetPointerDeviceId(source.cudaData) : source.dataDeviceIds[0];
+                                if (device < 0) {
+                                    dflashStagePlanReady = false;
+                                    break;
+                                }
+                                const size_t rowBytes = (size_t)source.dims[1] *
+                                    (size_t)source.dims[2] * source.unitSize;
+                                fastllm::qwen35_state_stage::Piece piece;
+                                piece.device = device;
+                                piece.bytes = rowBytes * (size_t)source.dims[0];
+                                piece.sourceStrideBytes = (size_t)source.strides[0] * source.unitSize;
+                                piece.rowBytes = rowBytes;
+                                piece.rows = source.dims[0];
+                                piece.compactSource = true;
+                                piece.source = source.cudaData;
+                                piece.destination = destinations[part];
+                                piece.validFlag = &snapshot->dflashValid;
+                                piece.dataType = (int)source.dataType;
+                                piece.dims = source.dims;
+                                piece.cacheUid = source.cacheUid;
+                                piece.name = source.name;
+                                stateStageExtras.push_back(std::move(piece));
+                            }
+                        }
+                        if (!dflashStagePlanReady) stateStageExtras.clear();
+                    }
+                }
+                if (dflashStagePlanReady) {
+                    stagedState = Qwen35SnapshotStageCaches(this, linearCopies, *snapshot,
+                        stateStageExtras, &snapshot->stateStageFallbackReason);
+                }
+            }
+#else
+            dflashStagePlanReady = !requireDFlash;
+#endif
+        }
+        if (Qwen35StateStageEnabled() && !stagedState) {
+            snapshot->stateStageFallbackSyncCount = 1;
+            // A refusal inside Qwen35SnapshotStageCaches already named its
+            // reason; keep it so a full arena is visible in the logs.
+            if (snapshot->stateStageFallbackReason.empty()) {
+                snapshot->stateStageFallbackReason = requireMtp ? "mtp_uses_sync" :
+                    requireDFlash ? (dflashStagePlanReady ? "stage_unavailable" : "dflash_not_stageable") :
+                    "stage_unavailable";
             }
         }
+        ckptTrace.Start(currentLen);
+        if (!stagedState && !Qwen35SnapshotCopyCachesSync(linearCopies)) return ckptReject(__LINE__);
+        ckptTrace.Mark(ckptTrace.linearMs);
 
-        bool requireMtp = RequiresMtpPrefixSnapshot(context);
-        bool requireDFlash = RequiresDFlashPrefixSnapshot(context);
-        if (requireMtp || requireDFlash) {
+        // Full-attention KV enters L2 only on deferred recycle. Keep the
+        // matching recurrent/draft state in this snapshot.
+
+        if ((requireMtp || requireDFlash) && !stagedState) {
 #ifdef USE_CUDA
             std::lock_guard<std::mutex> guard(mtpCacheMutex);
             if (requireDFlash) {
                 auto dflashIt = dflashContexts.find(context);
                 if (dflashIt == dflashContexts.end() ||
                     dflashIt->second.committedTokens != currentLen ||
-                    (int)dflashIt->second.draftKeyValues.size() !=
-                        dflashLayers) {
-                    return false;
+                    (int)dflashIt->second.draftKeyValues.size() != dflashLayers) {
+                    return ckptReject(__LINE__);
                 }
                 snapshot->dflashKeyValues.resize(dflashLayers);
                 for (int layer = 0; layer < dflashLayers; layer++) {
-                    const Data &key =
-                        dflashIt->second.draftKeyValues[layer].first;
-                    const Data &value =
-                        dflashIt->second.draftKeyValues[layer].second;
+                    const Data &key = dflashIt->second.draftKeyValues[layer].first;
+                    const Data &value = dflashIt->second.draftKeyValues[layer].second;
                     if (key.dims.size() != 3 || value.dims.size() != 3 ||
                         key.dims[0] != dflashKvHeads ||
                         value.dims[0] != dflashKvHeads ||
@@ -10216,14 +12427,18 @@ namespace fastllm {
                         key.dims[2] != dflashHeadDim ||
                         value.dims[2] != dflashHeadDim ||
                         !Qwen35SnapshotCopyCompactTensor(
-                            key,
-                            snapshot->dflashKeyValues[layer].first) ||
+                            key, snapshot->dflashKeyValues[layer].first) ||
                         !Qwen35SnapshotCopyCompactTensor(
-                            value,
-                            snapshot->dflashKeyValues[layer].second)) {
-                        return false;
+                            value, snapshot->dflashKeyValues[layer].second)) {
+                        return ckptReject(__LINE__);
                     }
                 }
+                snapshot->dflashProposalTokens =
+                    dflashIt->second.proposalTokens;
+                snapshot->dflashProposalCandidateIds =
+                    dflashIt->second.proposalCandidateIds;
+                snapshot->dflashProposalCandidateProbs =
+                    dflashIt->second.proposalCandidateProbs;
                 snapshot->dflashValid = true;
                 snapshot->dflashTokens = currentLen;
             } else {
@@ -10235,23 +12450,30 @@ namespace fastllm {
                     mtpIt->second.key.dims[1] != currentLen ||
                     mtpIt->second.value.dims[1] != currentLen ||
                     !SnapshotMtpPagedCache(mtpIt->second, snapshot->mtpKey, snapshot->mtpValue)) {
-                    return false;
+                    return ckptReject(__LINE__);
                 }
                 snapshot->mtpValid = true;
                 snapshot->mtpTokens = currentLen;
             }
 #else
-            return false;
+            return ckptReject(__LINE__);
 #endif
         }
 
-        {
+        ckptTrace.Mark(ckptTrace.dflashMs);
+#if defined(FASTLLM_DISK_PREFIX_CACHE)
+        // 方案 §7.1/§3：Capture 不得在全局快照锁内运行。这里先在锁内取一个
+        // 强引用（发布之后），等锁释放后再登记持久化；被淘汰的条目由该引用
+        // 保活，因此 Capture 看到的数据与入队时完全一致。
+        std::shared_ptr<Qwen35LinearPrefixSnapshot> publishedSnapshot;
+#endif
+        if (!snapshot->stateStage) {
             std::lock_guard<std::mutex> guard(Qwen35LinearPrefixSnapshotsMutex());
             auto &items = Qwen35LinearPrefixSnapshots()[this];
             for (auto it = items.begin(); it != items.end(); ) {
                 Qwen35LinearPrefixSnapshot *old = it->get();
                 if (old != nullptr && old->cachedLen == snapshot->cachedLen &&
-                    old->tokens == snapshot->tokens) {
+                    old->tokens == snapshot->tokens && Qwen35SnapshotMatchesContext(*old, context)) {
                     // A draft-aware snapshot also contains everything needed
                     // by requests that do not use speculative decoding.
                     if ((old->mtpValid && !snapshot->mtpValid) ||
@@ -10266,15 +12488,63 @@ namespace fastllm {
             snapshot->requestId = requestId;
             snapshot->timestamp = ++Qwen35LinearPrefixSnapshotTimestamp();
             items.push_back(std::move(snapshot));
-            TrimRecurrentPrefixes(items, requestId,
-                Qwen35LinearPrefixSnapshotMaxPerRequest(), Qwen35LinearPrefixSnapshotMaxRecords());
+#if defined(FASTLLM_DISK_PREFIX_CACHE)
+            // 只取强引用；真正的 Capture 调用在全局锁之外。
+            if (persistentPrefixCache && !items.empty()) publishedSnapshot = items.back();
+#endif
+            int maxPerRequest = Qwen35LinearPrefixSnapshotMaxPerRequest();
+            int requestRecords = 0;
+            for (auto &item : items) {
+                if (item != nullptr && item->requestId == requestId) {
+                    requestRecords++;
+                }
+            }
+            while (requestRecords > maxPerRequest) {
+                auto oldest = items.end();
+                for (auto it = items.begin(); it != items.end(); ++it) {
+                    Qwen35LinearPrefixSnapshot *old = it->get();
+                    if (old == nullptr || old->requestId != requestId) {
+                        continue;
+                    }
+                    if (oldest == items.end() ||
+                        old->timestamp < (*oldest)->timestamp) {
+                        oldest = it;
+                    }
+                }
+                if (oldest == items.end()) {
+                    break;
+                }
+                items.erase(oldest);
+                requestRecords--;
+            }
+            int maxRecords = Qwen35LinearPrefixSnapshotMaxRecords();
+            while ((int)items.size() > maxRecords) {
+                items.erase(items.begin());
+            }
         }
+#if defined(FASTLLM_DISK_PREFIX_CACHE)
+        else { publishedSnapshot = snapshot; }
+#endif
+#if defined(FASTLLM_DISK_PREFIX_CACHE)
+        // 全局锁已释放：Capture 只做短临界区的身份登记与入队（§7.1）。
+        ckptTrace.Mark(ckptTrace.publishMs);
+        if (persistentPrefixCache && publishedSnapshot) {
+            persistentPrefixCache->Capture(context, publishedSnapshot);
+        }
+        ckptTrace.Mark(ckptTrace.captureMs);
+#endif
         context->intParams["qwen35_linear_prefix_last_len"] = currentLen;
         context->intParams["qwen35_linear_prefix_count"] = snapshotCount + 1;
+        if (verbose && PrefixCacheDebugEnabled()) {
+            printf("[PrefixCache] snapshot recorded: tokens=%d multimodal=%d dflash=%d.\n",
+                   currentLen, !context->multimodalInput.empty(), requireDFlash);
+            fflush(stdout);
+        }
         return true;
     }
 
     int Qwen3_5Model::QueryPagedPrefixCacheExtra(ResponseContext *context, int maxCachedLen) const {
+        if (context != nullptr && !context->CanUsePagedPrefixCache()) return 0;
         if (context != nullptr && maxCachedLen > 0 &&
             threadTpPreparedDevices.size() > 1) {
             // Both schedulers call this before restoring any state. An empty
@@ -10313,13 +12583,17 @@ namespace fastllm {
         std::lock_guard<std::mutex> guard(Qwen35LinearPrefixSnapshotsMutex());
         const Qwen35LinearPrefixSnapshot *snapshot =
             Qwen35FindLinearPrefixSnapshotLocked(
-                this, context->currentTokens, maxCachedLen, -1,
+                this, context->currentTokens, context, maxCachedLen, -1,
                 requireMtp, requireDFlash, dflashLayers,
                 dflashKvHeads, dflashHeadDim);
-        return snapshot == nullptr ? 0 : snapshot->cachedLen;
+        if (snapshot == nullptr) {
+            return 0;
+        }
+        return snapshot->cachedLen;
     }
 
     bool Qwen3_5Model::RestorePagedPrefixCacheExtra(ResponseContext *context, int cachedLen) const {
+        if (context != nullptr && !context->CanUsePagedPrefixCache()) return false;
         if (context == nullptr || cachedLen <= 0 ||
             !Qwen35HasLinearAttentionLayers(this, this->block_cnt)) {
             return true;
@@ -10331,7 +12605,7 @@ namespace fastllm {
         {
             std::lock_guard<std::mutex> guard(Qwen35LinearPrefixSnapshotsMutex());
             snapshot = Qwen35FindLinearPrefixSnapshotLocked(
-                this, context->currentTokens, cachedLen, cachedLen,
+                this, context->currentTokens, context, cachedLen, cachedLen,
                 requireMtp, requireDFlash, dflashLayers,
                 dflashKvHeads, dflashHeadDim);
             if (snapshot == nullptr || (int)snapshot->layers.size() < this->block_cnt) {
@@ -10359,6 +12633,8 @@ namespace fastllm {
                     return false;
                 }
             }
+            // Paged KV promotion happens before the scheduler queries/pins
+            // pages. This hook restores only the matching recurrent/draft state.
             if (requireMtp || requireDFlash) {
 #ifdef USE_CUDA
                 std::vector<int> devices;
@@ -10379,20 +12655,28 @@ namespace fastllm {
                     }
                     DFlashContext &dflashCache =
                         dflashContexts[context];
+                    // Match every draft append/decode entry point, including
+                    // deployments with a dedicated draft GPU.
+                    const int draftDevice = Qwen35DFlashDraftDeviceOr(devices);
                     dflashCache.draftKeyValues.resize(dflashLayers);
                     for (int layer = 0; layer < dflashLayers; layer++) {
                         if (!Qwen35RestoreDraftSnapshotTensor(
                                 snapshot->dflashKeyValues[layer].first,
                                 dflashCache.draftKeyValues[layer].first,
-                                devices[0]) ||
+                                draftDevice) ||
                             !Qwen35RestoreDraftSnapshotTensor(
                                 snapshot->dflashKeyValues[layer].second,
                                 dflashCache.draftKeyValues[layer].second,
-                                devices[0])) {
+                                draftDevice)) {
                             dflashContexts.erase(context);
                             return false;
                         }
                     }
+                    dflashCache.proposalTokens = snapshot->dflashProposalTokens;
+                    dflashCache.proposalCandidateIds =
+                        snapshot->dflashProposalCandidateIds;
+                    dflashCache.proposalCandidateProbs =
+                        snapshot->dflashProposalCandidateProbs;
                     dflashCache.committedTokens = cachedLen;
                     restoredDFlashCacheTokens =
                         dflashCache.draftKeyValues.empty() ? 0 :
@@ -10415,16 +12699,55 @@ namespace fastllm {
 #endif
             }
         }
+#ifdef USE_CUDA
+        // Diagnosis only (default off): FASTLLM_DIAG_RESTORE_HASH=1 prints a
+        // content hash of the restored linear-attention state, so two runs can
+        // show whether the restored inputs or the following forward differ.
+        {
+            static const bool diagHash = [] {
+                const char *env = std::getenv("FASTLLM_DIAG_RESTORE_HASH");
+                return env != nullptr && env[0] == '1' && env[1] == '\0';
+            }();
+            if (diagHash) {
+                uint64_t h = 1469598103934665603ULL;
+                auto mix = [&](const Data &d, int device) {
+                    if (d.cudaData == nullptr) return;
+                    std::vector<uint8_t> host(d.GetBytes());
+                    FastllmCudaSetDevice(device);
+                    FastllmCudaCopyFromDeviceToHost(host.data(), d.cudaData, host.size());
+                    for (uint8_t b : host) { h ^= b; h *= 1099511628211ULL; }
+                };
+                int tensors = 0;
+                for (int i = 0; i < this->block_cnt && i < (int)context->pastKeyValues.size(); i++) {
+                    if (!Qwen35LayerIsLinearAttention(this, i)) continue;
+                    for (Data *d : {&context->pastKeyValues[i].first, &context->pastKeyValues[i].second}) {
+                        if (d->multiDeviceData) {
+                            for (auto &it : d->multiDeviceDatas) if (it.second) { mix(*it.second, it.first); ++tensors; }
+                        } else if (!d->dataDeviceIds.empty()) { mix(*d, d->dataDeviceIds[0]); ++tensors; }
+                    }
+                }
+                printf("[DIAG-RESTORE] request=%d cached=%d gdn_tensors=%d gdn_hash=%016llx\n",
+                       context != nullptr ? (int)context->requestId : -1, cachedLen, tensors,
+                       (unsigned long long)h);
+                fflush(stdout);
+            }
+        }
+#endif
         if (requireDFlash) {
-            printf("[Qwen3.5 DFlash2] prefix cache restored: tokens=%d, draft_kv_tokens=%d.\n",
+            PrefixCacheDebug("[Qwen3.5 DFlash2] prefix cache restored: tokens=%d, draft_kv_tokens=%d.\n",
                    cachedLen, restoredDFlashCacheTokens);
-            fflush(stdout);
+            FastllmEvent("cache", context != nullptr ? context->requestId : 0,
+                         "dflash_cache_seeded",
+                         "tokens=%d draft_kv_tokens=%d", cachedLen,
+                         restoredDFlashCacheTokens);
         }
         return true;
     }
 
     int Qwen3_5Model::GetChunkedPrefillSize() {
         int base = basellm::GetChunkedPrefillSize();
+        if (Qwen35ChunkWideEnabled() && !kvMemConfig.enabled && chunkedPrefillSize < 0)
+            return Qwen35ChunkWideSize();
         if (!Qwen35LinearPrefixCacheEnabled() ||
             !Qwen35HasLinearAttentionLayers(this, this->block_cnt)) {
             return base;
@@ -10441,17 +12764,108 @@ namespace fastllm {
         // sum of unrelated short prompts needlessly splits, for example, 32
         // 92-token requests into 22 + 10 prefills.  Preserve an explicit user
         // chunk limit, otherwise use the model's normal aggregate budget.
-        if (this->chunkedPrefillSize >= 0) {
-            return this->chunkedPrefillSize;
+        int limit = this->chunkedPrefillSize >= 0
+            ? this->chunkedPrefillSize
+            : std::max(this->GetChunkedPrefillSize(),
+                       this->defaultChunkedPrefillSize);
+        // FASTLLM_QWEN35_BATCH_PREFILL：分块预填并进批路径时，单前向要能装下
+        // 多个请求的分块。默认预算（未显式设 --chunked_prefill_size 时 = 一个
+        // 分块 2048）会让长 prompt 一轮只推进一个请求，等于没并发。这里把预算
+        // 抬到"分块上限 × 可同批分块数"。工作区大小由 servingPrefillTokenLimit
+        // (= 本函数) 决定，AutoWarmup 会自动按同一预算预留，无需另改。
+        // 默认关闭；关闭时行为与改动前完全一致。
+        if (Qwen35BatchPrefillEnabled() || Qwen35MultiPrefillEnabled()) {
+            const int chunkCap = HasDFlashWeights()
+                ? std::max(1, std::min(this->GetChunkedPrefillSize(),
+                                       QWEN35_DFLASH_LONG_PREFILL_CHUNK_SIZE))
+                : std::max(1, this->GetChunkedPrefillSize());
+            const int maxChunks = this->maxBatch > 0
+                ? std::min(this->maxBatch, 4) : 4;
+            limit = std::max(limit, chunkCap * maxChunks);
         }
-        return std::max(this->GetChunkedPrefillSize(),
-                        this->defaultChunkedPrefillSize);
+        return limit;
+    }
+
+    void Qwen3_5Model::PrepareMultimodalPrefixCache(ResponseContext *context) {
+        context->prefixCachePageKeys.clear();
+        context->multimodalPrefixSpans.clear();
+        auto &inputs = context->multimodalInput;
+        const char *enabled = getenv("FASTLLM_MULTIMODAL_PREFIX_CACHE");
+        if (inputs.empty() || (enabled != nullptr && std::string(enabled) == "0")) return;
+#ifndef USE_CUDA
+        return;
+#else
+        if (!CanUseGPUForward()) return;
+        auto frames = inputs.find("image_frames");
+        auto keys = inputs.find("image_cache_keys");
+        auto grid = inputs.find("image_grid_thw");
+        for (const char *unsupported : {"video_frames", "video_embeds", "image_embeds"}) {
+            auto it = inputs.find(unsupported);
+            if (it != inputs.end() && !it->second.empty()) return;
+        }
+        if (frames == inputs.end() || frames->second.empty() || keys == inputs.end() ||
+            keys->second.size() != 1 || grid == inputs.end() || grid->second.size() != 1) return;
+        const int count = (int)frames->second.size();
+        Data *digests = keys->second[0];
+        Data *grids = grid->second[0];
+        if (digests == nullptr || grids == nullptr || digests->cpuData == nullptr ||
+            grids->cpuData == nullptr || digests->dataType != DataType::INT32 ||
+            digests->dims != std::vector<int>({count, 8}) ||
+            grids->dims != std::vector<int>({count, 3}) ||
+            (grids->dataType != DataType::INT32 && grids->dataType != DataType::INT32PARAM)) return;
+        std::vector<std::vector<int>> imageGrids;
+        const int *values = (const int*)grids->cpuData;
+        for (int i = 0; i < count; ++i) imageGrids.push_back({values[i * 3], values[i * 3 + 1], values[i * 3 + 2]});
+        const auto &tokens = context->allTokens;
+        Data ids(DataType::FLOAT32, {1, (int)tokens.size()}, std::vector<float>(tokens.begin(), tokens.end()));
+        Data types, positions, delta;
+        BuildMultimodalPositionData(ids, imageGrids, {}, types, positions, delta);
+        for (size_t i = 0; i < tokens.size();) {
+            if (tokens[i] != image_token_id) { ++i; continue; }
+            MultimodalPrefixSpan span;
+            span.begin = (int)i;
+            while (i < tokens.size() && tokens[i] == image_token_id) ++i;
+            span.end = (int)i;
+            size_t index = context->multimodalPrefixSpans.size();
+            if (index >= (size_t)count) { context->multimodalPrefixSpans.clear(); return; }
+            memcpy(span.digest.data(), digests->cpuData + index * 32, 32);
+            context->multimodalPrefixSpans.push_back(span);
+        }
+        if ((int)context->multimodalPrefixSpans.size() != count) {
+            context->multimodalPrefixSpans.clear();
+            return;
+        }
+        std::vector<int> positionValues;
+        const float *p = (const float*)positions.cpuData;
+        for (int i = 0; i < (int)positions.Count(0); ++i) positionValues.push_back((int)p[i]);
+        context->prefixCachePageKeys = BuildMultimodalPrefixPageKeys(
+            tokens, positionValues, context->multimodalPrefixSpans, fastllm::GetPageLen());
+        if (verbose && PrefixCacheDebugEnabled()) {
+            printf("[PrefixCache] image layout: tokens=%zu spans=", tokens.size());
+            for (const auto &span : context->multimodalPrefixSpans) printf("[%d,%d)", span.begin, span.end);
+            printf("\n");
+            fflush(stdout);
+        }
+        auto replace = [&](const char *name, const Data &data) {
+            for (Data *old : inputs[name]) delete old;
+            inputs[name] = {new Data(data)};
+        };
+        replace("mm_token_type_ids", types);
+        replace("mrope_position_ids", positions);
+        replace("mrope_position_delta", delta);
+#endif
     }
 
     void Qwen3_5Model::OnResponseContextCreated(ResponseContext *context) {
         if (context == nullptr) {
             return;
         }
+        PrepareMultimodalPrefixCache(context);
+        // 移植自源仓库 qwen3_5.cpp:10830：把本次请求的页键锚定为基准页键。
+        // 缺此行会导致 prefixCacheBasePageKeys 恒空，SSD 读盘成功后
+        // SetProvenance(.inc:409-411) 用空值覆盖页键 -> CanUsePagedPrefixCache()
+        // 变假 -> 恢复被拒（实测 canUse=0）。
+        if (persistentPrefixCache) persistentPrefixCache->Created(context);
         // Paged-prefix restore runs before the first forward.  Mark recurrent
         // state slots now so the generic atomic TP restore plan does not treat
         // linear-attention layers (which deliberately have no paged managers)
@@ -10474,6 +12888,12 @@ namespace fastllm {
         if (context == nullptr) {
             return;
         }
+        ReleasePagedPrefixRestoreOwners(context);
+        ReleasePagedSpillRetryHolds(context);
+        // Cancel the value-owned read ticket before deleting the context.
+        // A worker never dereferences the context and cannot publish after
+        // cancellation; already admitted background writes retain their owners.
+        if (persistentPrefixCache) persistentPrefixCache->Removed(context);
         std::lock_guard<std::mutex> guard(mtpCacheMutex);
         mtpCaches.erase(context);
         dflashContexts.erase(context);
@@ -10628,6 +13048,7 @@ namespace fastllm {
     void Qwen3_5Model::PrepareCudaServingAfterWarmup(
             bool highWaterOnly, bool allowDuringAutoWarmup) {
 #ifdef USE_CUDA
+        ScopedLoadTimer _serving(Qwen35StartupProfile().servingUs);
         if (cudaServingPrepared ||
             (highWaterOnly && cudaServingHighWaterPrepared)) {
             return;
@@ -10861,9 +13282,10 @@ namespace fastllm {
                     Data(DataType::FLOAT32, {1, seqLens[b]}, positions));
                 positionIds.push_back(&positionIdsStorage.back());
             }
-            ForwardGPU(eagerWarmupBatch, inputIds, attentionMasks, positionIds,
-                       seqLens, pastKeyValues, generationConfigs, lastTokens,
-                       nullptr);
+            { ScopedLoadTimer _forward(Qwen35StartupProfile().servingForwardUs);
+              ForwardGPU(eagerWarmupBatch, inputIds, attentionMasks, positionIds,
+                         seqLens, pastKeyValues, generationConfigs, lastTokens,
+                         nullptr); }
             printf("[Fastllm] Qwen3.5 serving eager prefill warmup (%s): "
                    "batch %d, total tokens %d.\n",
                    reason, eagerWarmupBatch, eagerWarmupTokens);
@@ -12925,8 +15347,9 @@ namespace fastllm {
                 qwen35GpuTokenHandoffControl->inputTokenSlot, gpuId);
         }
         Qwen3CudaDirectRunner cudaRunner(gpuId);
-        int mtpWorkerProfileInterval = speculativeCollectAllLogits ?
-            Qwen35MtpWorkerProfileInterval() : 0;
+        int mtpWorkerProfileInterval =
+            (autoWarmupRunning.load() && LoadStageTimingEnabled()) ? 1 :
+            (speculativeCollectAllLogits ? Qwen35MtpWorkerProfileInterval() : 0);
         bool mtpWorkerProfileEnabled = mtpWorkerProfileInterval > 0;
         int mtpWorkerProfileSeqTokens = 0;
         for (int len : seqLens) {
@@ -13104,6 +15527,10 @@ namespace fastllm {
         Data z, b, a, g, conv, localConvOutput, convOutputPermuted;
         Data coreAttnOut, coreTemp, gatedCoreAttnOut;
         Qwen35ExactDFlashPagedMeta exactDFlashPagedMeta;
+        // PD_ATTN_SPLIT prompt-row paged metadata (its own cache across layers).
+        Data pdAttnQSizes, pdAttnPageSizes, pdAttnPageIndexs, pdAttnLastPageLens;
+        Data pdAttnInsertIndexs, pdAttnInsertPositions;
+        bool pdAttnGeneratedAppend = false, pdAttnGeneratedDecode = false;
         Data convInputWithCache;
         Data convToken0, convToken1, convOutput0, convOutput1;
         Data convRow0, convRow1, baRow0, baRow1;
@@ -13196,6 +15623,28 @@ namespace fastllm {
             }
         };
 
+        const bool pdMixLayerProfile = Qwen35PdMixProfileEnabled() &&
+            firstTensorParallelRank && isPrefill && !all1;
+        long long pdMixGdnUs = 0, pdMixAttnUs = 0;
+        std::chrono::steady_clock::time_point pdMixLayerLast;
+        if (pdMixLayerProfile) {
+            ForceDeviceSync();
+            pdMixLayerLast = std::chrono::steady_clock::now();
+        }
+        // Book the previous layer at the top of each iteration and the last layer
+        // after the loop, so every early `continue` of a fast path is counted.
+        // A bucket holds the whole layer (mixer + MLP + capture), split by mixer type.
+        bool pdMixPrevAttn = false;
+        bool pdMixHavePrev = false;
+        auto pdMixLayerBook = [&]() {
+            if (!pdMixLayerProfile || !pdMixHavePrev) return;
+            ForceDeviceSync();
+            auto now = std::chrono::steady_clock::now();
+            (pdMixPrevAttn ? pdMixAttnUs : pdMixGdnUs) +=
+                Qwen35MtpProfileElapsedUs(pdMixLayerLast, now);
+            pdMixLayerLast = now;
+            pdMixHavePrev = false;
+        };
         for (int i = 0; i < block_cnt; i++) {
             std::string prefix = language_prefix + "layers." + std::to_string(i) + ".";
             std::string inputRmsName = prefix + "input_layernorm.weight";
@@ -13205,10 +15654,23 @@ namespace fastllm {
             std::string downBiasName = prefix + "mlp.down_proj.bias";
             bool isAttentionLayer =
                 weight.weight.find(prefix + "self_attn.o_proj.weight") != weight.weight.end();
+            pdMixLayerBook();
+            pdMixPrevAttn = isAttentionLayer;
+            pdMixHavePrev = true;
             Data &inputRmsWeight =
                 *requireLocal(weight[inputRmsName], inputRmsName);
             int bsz = hiddenStates.dims[0];
             int seqlen = hiddenStates.dims[1];
+            // TP4 overlap: hold this layer's attention reduce for the MLP pipeline.
+            // PDMIX keeps the prefill TP4 overlap: it only reorders reductions,
+            // and the chunk seed already runs it with DFlash hidden capture.
+            const bool deferAttnReduce = tensorParallel && isPrefill && !all1 && seqlen >= 1024 &&
+                (!speculativeCollectAllLogits || pdMixVerifyTokens > 0) &&
+                computeType == DataType::FLOAT16 &&
+                Qwen35Tp4MlpOverlapEnabled() && Qwen35Tp4AttnOverlapEnabled() &&
+                weight.weight.find(swigluWeightName) != weight.weight.end() &&
+                weight.weight.find(downWeightName) != weight.weight.end();
+            if (deferAttnReduce) FastllmTP4ArmDeferredReduce(true);
 
             if (isAttentionLayer) {
                 std::string mergeQkvWeightName = prefix + "self_attn.mergeqkv.weight";
@@ -13288,6 +15750,18 @@ namespace fastllm {
                         !kvMemConfig.enabled && exactSmallDFlashVerifier &&
                         mtpVerifyGraphDeviceState == nullptr &&
                         bsz == 1 && seqlen > 1;
+                    {
+                        static const bool attnSplitDiag = [] {
+                            const char *v = std::getenv("FASTLLM_QWEN35_PD_ATTN_SPLIT_DIAG");
+                            return v != nullptr && v[0] == '1' && v[1] == '\0';
+                        }();
+                        if (attnSplitDiag && seqlen > 1)
+                            fprintf(stderr, "[PD-ATTN-SPLIT-DIAG] entry layer=%d split=%d mix=%d verify=%d "
+                                    "exact=%d batch=%d seqlen=%d isPrefill=%d\n", i,
+                                    Qwen35PdAttnSplitEnabled() ? 1 : 0, Qwen35PdMixEnabled() ? 1 : 0,
+                                    pdMixVerifyTokens, exactDFlashVerifierAttention ? 1 : 0, batch, seqlen,
+                                    isPrefill ? 1 : 0);
+                    }
                     if (exactDFlashVerifierAttention) {
                         // Project all verifier rows together, but run the
                         // cache append and attention core as chronological
@@ -13559,6 +16033,146 @@ namespace fastllm {
                             attenLastOutput, hiddenStates,
                             tensorParallel, firstTensorParallelRank,
                             gpuId, true);
+                    } else if ([&]() {
+                        // PD_ATTN_SPLIT eligibility: uniform verify rows lead, one text
+                        // prompt row last, flat positions, merged QKV, no graph/kvmem.
+                        // FASTLLM_QWEN35_PD_ATTN_SPLIT_DIAG=1 prints the failing check.
+                        auto reject = [&](int why) {
+                            static const bool diag = [] {
+                                const char *v = std::getenv("FASTLLM_QWEN35_PD_ATTN_SPLIT_DIAG");
+                                return v != nullptr && v[0] == '1' && v[1] == '\0';
+                            }();
+                            if (diag && pdMixVerifyTokens > 0)
+                                fprintf(stderr, "[PD-ATTN-SPLIT-DIAG] layer=%d reject=%d batch=%d bsz=%d "
+                                        "seqlens=%d verify=%d seqlen=%d posdims=%d,%d,%d graph=%d merged=%d\n",
+                                        i, why, batch, bsz, (int)seqLens.size(), pdMixVerifyTokens, seqlen,
+                                        (int)positionIds.dims.size(),
+                                        positionIds.dims.size() > 0 ? positionIds.dims[0] : -1,
+                                        positionIds.dims.size() > 1 ? positionIds.dims[1] : -1,
+                                        mtpVerifyGraphDeviceState != nullptr ? 1 : 0,
+                                        localMergedQkv != nullptr ? 1 : 0);
+                            return false;
+                        };
+                        if (!Qwen35PdAttnSplitEnabled() || pdMixVerifyTokens <= 0) return false;
+                        if (kvMemConfig.enabled) return reject(1);
+                        if (mtpVerifyGraphDeviceState != nullptr) return reject(2);
+                        if (bsz != 1 || batch < 2 || (int)seqLens.size() != batch) return reject(3);
+                        if (localMergedQkv == nullptr) return reject(4);
+                        if (seqLens.back() <= 1) return reject(5);
+                        const Data &pos = *requireLocal((Data&)positionIds, "positionIds");
+                        if (pos.dims.size() != 2 || pos.dims[0] != 1 || pos.dims[1] != seqlen)
+                            return reject(6);
+                        int sum = 0;
+                        for (int rb = 0; rb + 1 < batch; rb++) {
+                            if (seqLens[rb] != seqLens[0]) return reject(7);
+                            sum += seqLens[rb];
+                        }
+                        if (!(seqLens[0] > 1 && seqLens[0] <= QWEN35_MTP_FAST_SEQ_MAX &&
+                              sum == pdMixVerifyTokens && sum + seqLens.back() == seqlen))
+                            return reject(8);
+                        // Last: row page tables for the verify rows. On failure it rolls
+                        // its own page advance back and the old mixed path runs.
+                        std::vector<Data*> verifyKeys(batch - 1), verifyValues(batch - 1);
+                        for (int rb = 0; rb + 1 < batch; rb++) {
+                            verifyKeys[rb] = pastKeyValues[rb * block_cnt + i].first;
+                            verifyValues[rb] = pastKeyValues[rb * block_cnt + i].second;
+                        }
+                        std::vector<int> verifySeqLens(seqLens.begin(), seqLens.end() - 1);
+                        if (!exactDFlashPagedMeta.PrepareBatch(
+                                verifyKeys, verifyValues, verifySeqLens, gpuId))
+                            return reject(9);
+                        return true;
+                    }()) {
+                        const int verifyRows = batch - 1;
+                        const int verifyTokens = pdMixVerifyTokens;
+                        const int promptTokens = seqLens.back();
+                        Qwen3CudaRMSNorm(cudaRunner, hiddenStates, inputRmsWeight,
+                                         rms_norm_eps, attenInput);
+                        Qwen3CudaLinear(cudaRunner, attenInput, *localMergedQkv,
+                                        *localMergedQkvBias, merged);
+                        Data &localPositionIds = *requireLocal((Data&)positionIds, "positionIds");
+                        Data verifyMerged, promptMerged, verifyPos, promptPos;
+                        Qwen3CudaSplit(cudaRunner, merged, 1, 0, verifyTokens, verifyMerged);
+                        Qwen3CudaSplit(cudaRunner, merged, 1, verifyTokens, seqlen, promptMerged);
+                        Qwen3CudaSplit(cudaRunner, localPositionIds, -1, 0, verifyTokens, verifyPos);
+                        Qwen3CudaSplit(cudaRunner, localPositionIds, -1, verifyTokens, seqlen, promptPos);
+
+                        // Verify rows: the decode-round exact q1 attention (row page tables
+                        // prepared in the eligibility check above).
+                        std::vector<Data*> splitPastKeys(verifyTokens), splitPastValues(verifyTokens);
+                        Data verifyAttn, verifyLast;
+                        std::vector<int> verifyRowSeqLens(verifyTokens, 1);
+                        bool verifyGeneratedAppend = false, verifyGeneratedDecode = false;
+                        Qwen35CudaAttentionPagedBlock(
+                            cudaRunner, &verifyMerged,
+                            localMergedQkv, localMergedQkvBias,
+                            localQWeight, localQBias, localKWeight, localKBias,
+                            localVWeight, localVBias,
+                            requireLocal(weight[qNormName], qNormName),
+                            requireLocal(weight[kNormName], kNormName),
+                            requireLocal(weight[oWeightName], oWeightName),
+                            requireLocal(GetThreadTensorParallelBias(oBiasName), oBiasName),
+                            &verifyPos, &pastKeyValues,
+                            &splitPastKeys, &splitPastValues,
+                            &verifyMerged, &qgate, &gate, &q, &k, &v,
+                            &verifyAttn, &verifyLast, &qForAttentionHolder,
+                            &exactDFlashPagedMeta.insertIndexRows,
+                            &exactDFlashPagedMeta.insertPositionRows,
+                            &exactDFlashPagedMeta.batchQSizes,
+                            &exactDFlashPagedMeta.batchPageSizes,
+                            &exactDFlashPagedMeta.batchPageIndexs,
+                            &exactDFlashPagedMeta.batchLastPageLens,
+                            &verifyGeneratedAppend, &verifyGeneratedDecode,
+                            verifyTokens, block_cnt, i, verifyRowSeqLens,
+                            localQHeads, localKVHeads, head_dim,
+                            rotary_dim, mrope_sections,
+                            rms_norm_eps, rope_base, rope_factor,
+                            rope_type, YarnConfig(), false,
+                            nullptr, pagedCacheLayerOffset,
+                            true, true, false, -1, false, nullptr,
+                            nullptr, true, true);
+
+                        // Prompt row: a one-request prefill on its own cache.
+                        std::vector<std::pair<Data*, Data*> > promptKeyValues(
+                            pastKeyValues.begin() + verifyRows * block_cnt,
+                            pastKeyValues.begin() + (verifyRows + 1) * block_cnt);
+                        std::vector<Data*> promptPastKeys(1), promptPastValues(1);
+                        const std::vector<int> promptSeqLens{promptTokens};
+                        Data promptAttn, promptLast;
+                        Qwen35CudaAttentionPagedBlock(
+                            cudaRunner, &promptMerged,
+                            localMergedQkv, localMergedQkvBias,
+                            localQWeight, localQBias, localKWeight, localKBias,
+                            localVWeight, localVBias,
+                            requireLocal(weight[qNormName], qNormName),
+                            requireLocal(weight[kNormName], kNormName),
+                            requireLocal(weight[oWeightName], oWeightName),
+                            requireLocal(GetThreadTensorParallelBias(oBiasName), oBiasName),
+                            &promptPos, &promptKeyValues,
+                            &promptPastKeys, &promptPastValues,
+                            &promptMerged, &qgate, &gate, &q, &k, &v,
+                            &promptAttn, &promptLast, &qForAttentionHolder,
+                            &pdAttnInsertIndexs, &pdAttnInsertPositions,
+                            &pdAttnQSizes, &pdAttnPageSizes,
+                            &pdAttnPageIndexs, &pdAttnLastPageLens,
+                            &pdAttnGeneratedAppend, &pdAttnGeneratedDecode,
+                            1, block_cnt, i, promptSeqLens,
+                            localQHeads, localKVHeads, head_dim,
+                            rotary_dim, mrope_sections,
+                            rms_norm_eps, rope_base, rope_factor,
+                            rope_type, YarnConfig(), true,
+                            nullptr, pagedCacheLayerOffset,
+                            true, false, false, -1, false, nullptr,
+                            nullptr, true, false);
+                        verifyAttn.Reshape({1, verifyTokens, -1});
+                        promptAttn.Reshape({1, promptTokens, -1});
+                        Qwen3CudaCat(cudaRunner, verifyAttn, promptAttn, 1, attenOutput);
+                        Qwen3CudaLinearResidualReduce(
+                            cudaRunner, attenOutput,
+                            *requireLocal(weight[oWeightName], oWeightName),
+                            *requireLocal(GetThreadTensorParallelBias(oBiasName), oBiasName),
+                            attenLastOutput, hiddenStates,
+                            tensorParallel, firstTensorParallelRank, gpuId, true);
                     } else {
                         Qwen35CudaAttentionPagedBlock(
                             cudaRunner,
@@ -13654,14 +16268,18 @@ namespace fastllm {
                 // Produce directly into that storage so later layers cannot
                 // overwrite it and no post-projection backup copy is needed.
                 // Other layouts retain the existing explicit capture fallback.
-                const bool directReplayInput = linearReplay != nullptr &&
+                // PDMIX: the mixed batch also carries a prompt chunk, so the
+                // per-layer replay storage must not hold all of its tokens; the
+                // verify-row prefix is copied in before out_proj instead.
+                const bool replayAliasing = linearReplay != nullptr && pdMixVerifyTokens == 0;
+                const bool directReplayInput = replayAliasing &&
                     Qwen35MtpTokenMajorConvEnabled();
                 Data &gdnMerged = directReplayInput && !hasSeparateQkvZGdnInLinear ?
                     linearReplay->input : projectionScratch;
                 Data &qkvConvInput = directReplayInput && hasSeparateQkvZGdnInLinear ?
                     linearReplay->input : localQkvConvInput;
-                Data &baMerged = linearReplay != nullptr ? linearReplay->ba : localBaMerged;
-                Data &convOutput = linearReplay != nullptr ? linearReplay->conv : localConvOutput;
+                Data &baMerged = replayAliasing ? linearReplay->ba : localBaMerged;
+                Data &convOutput = replayAliasing ? linearReplay->conv : localConvOutput;
                 const char *tritonEnv = std::getenv("FASTLLM_CUDA_TRITON");
                 const bool compactGdnScratch = reusePrefillScratch &&
                     !hasSeparateQkvZGdnInLinear &&
@@ -13920,7 +16538,7 @@ namespace fastllm {
                 }
                 bool batchedRaggedPrefill =
                     isPrefill && batch > 1 && !all1 &&
-                    !speculativeCollectAllLogits &&
+                    (!speculativeCollectAllLogits || pdMixVerifyTokens > 0) &&
                     (int)seqLens.size() == batch && bsz == 1 &&
                     !batchedUniformPrefill;
                 int raggedPrefillTotalTokens = 0;
@@ -13928,7 +16546,8 @@ namespace fastllm {
                 if (batchedRaggedPrefill) {
                     for (int len : seqLens) {
                         batchedRaggedPrefill &=
-                            len > 1 && len <= QWEN35_BATCH_PREFILL_SEQ_MAX;
+                            (len > 1 || (Qwen35MixedRowsEnabled() && len == 1)) &&
+                            len <= QWEN35_BATCH_PREFILL_SEQ_MAX;
                         raggedPrefillTotalTokens += len;
                         raggedPrefillTotalChunks += (len + 63) / 64;
                     }
@@ -13977,6 +16596,8 @@ namespace fastllm {
                         baSplitReady = true;
                     }
                 }
+                // Set only by the PDMIX GDN split: [1, P, 2*Hv] BA of its prompt-row prefill.
+                Data *pdGdnSplitBa = nullptr;
                 auto ensureBaSplit = [&]() {
                     if (baSplitReady) {
                         return;
@@ -13987,6 +16608,10 @@ namespace fastllm {
                         deferBaSplitForPrefill) {
                         splitSource = &gdnMerged;
                         splitOffset = localQkvDim + localVd;
+                    }
+                    if (pdGdnSplitBa != nullptr) {
+                        splitSource = pdGdnSplitBa;
+                        splitOffset = 0;
                     }
                     AssertInFastLLM(!splitSource->dims.empty(),
                                     "Qwen3.5 linear attention missing combined ba tensor.\n");
@@ -14630,7 +17255,27 @@ namespace fastllm {
                 Data batchPrefillRecurrentState;
                 std::vector<Data*> batchPrefillRecurrentStates;
                 Data *chunkPastValue = &pastValue;
-                if (batchedPrefill) {
+                // PDMIX GDN split: verify rows [0, V) share one width w (<= the fast
+                // verify length) and lead the token axis; the prompt row is last.
+                bool pdGdnSplit = Qwen35PdGdnSplitEnabled() && pdMixVerifyTokens > 0 &&
+                    batchedRaggedPrefill && batch >= 2 && bsz == 1 &&
+                    computeType == DataType::FLOAT16 &&
+                    (int)seqLens.size() == batch && seqLens.back() > 1 &&
+                    convOutputForRecurrent->dims.size() == 3 &&
+                    convOutputForRecurrent->dims[0] == 1 &&
+                    convOutputForRecurrent->dims[1] == seqlen;
+                if (pdGdnSplit) {
+                    const int w = seqLens[0];
+                    int verifySum = 0;
+                    for (int rb = 0; rb + 1 < batch; rb++) {
+                        pdGdnSplit &= seqLens[rb] == w;
+                        verifySum += seqLens[rb];
+                    }
+                    pdGdnSplit &= w > 1 && w <= QWEN35_MTP_FAST_SEQ_MAX &&
+                        verifySum == pdMixVerifyTokens &&
+                        verifySum + seqLens.back() == seqlen;
+                }
+                if (batchedPrefill && !pdGdnSplit) {
                     if (batchedUniformPrefill) {
                         convOutputForRecurrent->Reshape(
                             {batch, uniformPrefillSeqLen,
@@ -14677,6 +17322,10 @@ namespace fastllm {
                                 hasMergedGdnInLinear ? &gdnMerged : &baMerged;
                             int combinedBaOffset = hasMergedGdnInLinear ?
                                 localQkvDim + localVd : 0;
+                            if (pdGdnSplitBa != nullptr) {
+                                combinedBaSource = pdGdnSplitBa;
+                                combinedBaOffset = 0;
+                            }
                             combinedBaPostProcess =
                                 FastllmCudaTryCombinedBaSigmoidMambaSoftplus(
                                     *combinedBaSource,
@@ -15101,6 +17750,134 @@ namespace fastllm {
                         }
                     }
                 };
+                auto runPdGdnSplit = [&]() {
+                    const int verifyRows = batch - 1;
+                    const int verifyWidth = seqLens[0];
+                    const int verifyTokens = pdMixVerifyTokens;
+                    const int promptTokens = seqLens.back();
+                    const int convChannels = convOutputForRecurrent->dims.back();
+                    // BA columns of every token: [1, S, 2*Hv].
+                    Data baAllRows;
+                    Data *baRows = &baMerged;
+                    if (hasMergedGdnInLinear) {
+                        Qwen3CudaSplit(cudaRunner, gdnMerged, -1, localQkvDim + localVd,
+                                       localQkvDim + localVd + localValueHeads * 2, baAllRows);
+                        baRows = &baAllRows;
+                    }
+                    AssertInFastLLM(baRows->dims.size() == 3 && baRows->dims[1] == seqlen,
+                                    "PDMIX GDN split: BA rows do not cover the token axis.\n");
+
+                    // Verify rows: the pure-verify recurrent kernel on each request's state.
+                    Data verifyConv, verifyBa, verifyOut;
+                    Qwen3CudaSplit(cudaRunner, *convOutputForRecurrent, 1, 0, verifyTokens, verifyConv);
+                    verifyConv.Reshape({verifyRows, verifyWidth, convChannels});
+                    Qwen3CudaSplit(cudaRunner, *baRows, 1, 0, verifyTokens, verifyBa);
+                    verifyBa.Reshape({verifyRows, verifyWidth, localValueHeads * 2});
+                    std::vector<Data*> verifyStates(verifyRows);
+                    for (int rb = 0; rb < verifyRows; rb++) {
+                        Data *state = pastKeyValues[rb * block_cnt + i].second;
+                        AssertInFastLLM(state != nullptr && !state->dims.empty(),
+                                        "PDMIX GDN split: verify row has no recurrent state.\n");
+                        Qwen35PrepareLinearAttentionCache(*state, computeType);
+                        state->dataDeviceIds = {gpuId};
+                        AssertInFastLLM(Qwen35EnsureCudaLinearAttnStateTransposed(*state),
+                                        "PDMIX GDN split: verify state transpose failed.\n");
+                        verifyStates[rb] = state;
+                    }
+                    const std::vector<Data*> noStateOutputs;
+                    std::vector<Data*> noSnapshots;
+                    const bool swapStates = linearReplay != nullptr &&
+                        !linearReplay->stateOutputs.empty();
+                    AssertInFastLLM(!swapStates ||
+                                    (int)linearReplay->stateOutputs.size() == verifyRows,
+                                    "PDMIX GDN swap: replay outputs do not match verify rows.\n");
+                    AssertInFastLLM(
+                        FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16BatchSnapshotsWithOutput(
+                            verifyConv, verifyBa,
+                            *requireLocal(inv_scale_data, "linear_attn.inv_scale"),
+                            *requireLocal(weight[aLogName], aLogName),
+                            *requireLocal(weight[dtBiasName], dtBiasName),
+                            verifyStates, verifyOut, noSnapshots, 0,
+                            localKeyHeads, localValueHeads,
+                            head_k_dim, head_v_dim, rms_norm_eps,
+                            1.0f / std::sqrt((float)head_k_dim),
+                            swapStates ? linearReplay->stateOutputs : noStateOutputs),
+                        "PDMIX GDN split: verify recurrent kernel unavailable.\n");
+                    if (swapStates) {
+                        // Same exchange as the decode round: live takes the new state,
+                        // the scratch keeps the pre-round state for rollback.
+                        for (int rb = 0; rb < verifyRows; rb++) {
+                            Data &live = *verifyStates[rb];
+                            Data &scratch = *linearReplay->stateOutputs[rb];
+                            std::swap(live.cudaData, scratch.cudaData);
+                            std::swap(live.expansionSize, scratch.expansionSize);
+                            std::swap(live.expansionBytes, scratch.expansionBytes);
+                            std::swap(live.expansionDims, scratch.expansionDims);
+                        }
+                        linearReplay->statesExchanged = true;
+                    }
+                    verifyOut.Reshape({1, verifyTokens, localValueHeads, head_v_dim});
+
+                    // Prompt row: the single-row uniform chunk prefill on its own state.
+                    Data promptConv, promptBa;
+                    Qwen3CudaSplit(cudaRunner, *convOutputForRecurrent, 1, verifyTokens,
+                                   verifyTokens + promptTokens, promptConv);
+                    Qwen3CudaSplit(cudaRunner, *baRows, 1, verifyTokens,
+                                   verifyTokens + promptTokens, promptBa);
+                    Data *promptState = pastKeyValues[verifyRows * block_cnt + i].second;
+                    AssertInFastLLM(promptState != nullptr,
+                                    "PDMIX GDN split: prompt row has no recurrent state.\n");
+                    Qwen35PrepareLinearAttentionCache(*promptState, computeType);
+                    promptState->dataDeviceIds = {gpuId};
+                    if (promptState->dims.empty()) {
+                        promptState->dataDevice = DataDevice::CUDA;
+                        promptState->Resize({1, localValueHeads, head_k_dim, head_v_dim});
+                        promptState->Allocate(0.0f);
+                        promptState->isLinearAttentionTransposed = false;
+                    } else {
+                        AssertInFastLLM(Qwen35EnsureCudaLinearAttnStateKVLayout(*promptState),
+                                        "PDMIX GDN split: prompt state layout restore failed.\n");
+                    }
+                    Data *savedConv = convOutputForRecurrent;
+                    Data *savedChunkPast = chunkPastValue;
+                    const int savedBatch = batch;
+                    const int savedUniformLen = uniformPrefillSeqLen;
+                    const bool savedUniform = uniformPrefill;
+                    const bool savedRagged = batchedRaggedPrefill;
+                    const bool savedBatched = batchedPrefill;
+                    convOutputForRecurrent = &promptConv;
+                    chunkPastValue = promptState;
+                    batch = 1;
+                    uniformPrefillSeqLen = promptTokens;
+                    uniformPrefill = true;
+                    batchedRaggedPrefill = false;
+                    batchedPrefill = false;
+                    pdGdnSplitBa = &promptBa;
+                    baSplitReady = false;
+                    convQkvSplitReady = false;
+                    runChunkLinearAttention();
+                    convOutputForRecurrent = savedConv;
+                    chunkPastValue = savedChunkPast;
+                    batch = savedBatch;
+                    uniformPrefillSeqLen = savedUniformLen;
+                    uniformPrefill = savedUniform;
+                    batchedRaggedPrefill = savedRagged;
+                    batchedPrefill = savedBatched;
+                    pdGdnSplitBa = nullptr;
+                    baSplitReady = false;
+                    convQkvSplitReady = false;
+                    // Uniform prefill leaves a head-major [1, Hv, padded, V] output.
+                    AssertInFastLLM(deferredGdnOutputLayout && coreAttnOut.dims.size() == 4 &&
+                                    coreAttnOut.dims[2] >= promptTokens,
+                                    "PDMIX GDN split: unexpected prompt GDN output layout.\n");
+                    deferredGdnOutputLayout = false;
+                    Data promptHeadMajor, promptOut;
+                    Qwen3CudaSplit(cudaRunner, coreAttnOut, 2, 0, promptTokens, promptHeadMajor);
+                    Qwen3CudaPermuteSelf(cudaRunner, promptHeadMajor, {0, 2, 1, 3});
+                    Qwen35CudaMul(cudaRunner, promptHeadMajor, 1.0f, promptOut);
+                    Qwen3CudaCat(cudaRunner, verifyOut, promptOut, 1, coreAttnOut);
+                    coreAttnOut.Reshape({1, seqlen, localValueHeads, head_v_dim});
+                };
                 if (fusedBatchSpeculativeSequence) {
                     // coreAttnOut is already produced request-by-request by
                     // the small-sequence recurrent kernels above.
@@ -15370,11 +18147,67 @@ namespace fastllm {
                         Qwen35PrepareLinearAttentionCache(*recurrentStates[rb], computeType);
                     }
                     coreAttnOut.Reshape({1, batch, coreAttnOut.dims[1], coreAttnOut.dims[3]});
+                } else if (pdGdnSplit) {
+                    runPdGdnSplit();
                 } else {
+                    // PD_GDN_SWAP armed output buffers that only the split kernel fills.
+                    AssertInFastLLM(pdMixVerifyTokens == 0 || linearReplay == nullptr ||
+                                    linearReplay->stateOutputs.empty(),
+                                    "PDMIX GDN swap needs the split path.\n");
                     runChunkLinearAttention();
                 }
                 std::vector<int> zShape =
                     {bsz, seqlen, localValueHeads, head_v_dim};
+                if (pdMixVerifyTokens > 0 && batchedRaggedPrefill &&
+                    linearReplay != nullptr) {
+                    // Same tensors the batched speculative branch keeps for
+                    // FastllmCudaDFlashRestoreLinearPrefixes, cut to the verify rows,
+                    // which lead the token-major batch with one common width.
+                    const int verifyRows = batch - 1;
+                    const int verifyWidth = pdMixVerifyTokens / std::max(1, verifyRows);
+                    auto keepPrefix = [&](Data &dst, const Data &src, int channels) {
+                        if (&dst != &src) {
+                            dst.dataType = src.dataType;
+                            dst.Resize({verifyRows, verifyWidth, channels});
+                            dst.ToDevice(DataDevice::CUDA, std::vector<int>{gpuId});
+                            dst.Allocate(false);
+                            const size_t bytes = (size_t)pdMixVerifyTokens * channels * src.unitSize;
+                            const size_t rowStride = (size_t)src.dims.back() * src.unitSize;
+                            const size_t rowBytes = (size_t)channels * src.unitSize;
+                            AssertInFastLLM(
+                                FastllmCudaMemcpy2DDeviceToDeviceAsyncCurrentThread(
+                                    dst.cudaData, rowBytes, src.cudaData, rowStride,
+                                    rowBytes, pdMixVerifyTokens),
+                                "PDMIX replay activation capture failed.\n");
+                            (void)bytes;
+                        } else {
+                            AssertInFastLLM(src.dims.back() == channels,
+                                            "PDMIX replay activation layout mismatch.\n");
+                            dst.Resize({verifyRows, verifyWidth, channels});
+                        }
+                    };
+                    Data &replayInputSource =
+                        hasSeparateQkvZGdnInLinear ? qkvConvInput : gdnMerged;
+                    keepPrefix(linearReplay->input, replayInputSource,
+                               replayInputSource.dims.back());
+                    keepPrefix(linearReplay->conv, convOutput, convOutput.dims.back());
+                    if (hasMergedGdnInLinear) {
+                        Data pdMixBa;
+                        Qwen3CudaSplit(cudaRunner, gdnMerged, -1,
+                                       localQkvDim + localVd,
+                                       localQkvDim + localVd + localValueHeads * 2,
+                                       pdMixBa);
+                        keepPrefix(linearReplay->ba, pdMixBa, localValueHeads * 2);
+                    } else {
+                        keepPrefix(linearReplay->ba, baMerged, localValueHeads * 2);
+                    }
+                    linearReplay->norm = requireLocal(inv_scale_data, "linear_attn.inv_scale");
+                    linearReplay->aLog = requireLocal(weight[aLogName], aLogName);
+                    linearReplay->dtBias = requireLocal(weight[dtBiasName], dtBiasName);
+                    linearReplay->keyHeads = localKeyHeads;
+                    linearReplay->valueHeads = localValueHeads;
+                    linearReplay->ready = true;
+                }
                 Data &outProjWeight = *requireLocal(
                     weight[outProjWeightName], outProjWeightName);
                 bool fusedGdnOutputProjection = false;
@@ -15518,6 +18351,7 @@ namespace fastllm {
                         tensorParallel, firstTensorParallelRank, gpuId);
                 }
             }
+            if (deferAttnReduce) FastllmTP4ArmDeferredReduce(false);
             bool hasMergedDenseMlp =
                 weight.weight.find(swigluWeightName) != weight.weight.end() &&
                 weight.weight.find(downWeightName) != weight.weight.end();
@@ -15529,7 +18363,12 @@ namespace fastllm {
                     {{&swigluResult}, gateUpElements / 2},
                     {{&mlpPart}, prefillResidualElements}});
             }
-            if (hasMergedDenseMlp) {
+            // The pipeline takes already normalized rows, so it skips the post-norm fusion.
+            const bool tryTp4MlpOverlap = tensorParallel && isPrefill && !all1 && seqlen >= 1024 &&
+                (!speculativeCollectAllLogits || pdMixVerifyTokens > 0) &&
+                computeType == DataType::FLOAT16 &&
+                Qwen35Tp4MlpOverlapEnabled();
+            if (hasMergedDenseMlp && !tryTp4MlpOverlap) {
                 Data &gateUpWeight = *requireLocal(
                     weight[swigluWeightName], swigluWeightName);
                 Data &gateUpBias = *requireLocal(
@@ -15555,6 +18394,39 @@ namespace fastllm {
                     continue;
                 }
             }
+            if (deferAttnReduce && FastllmTP4HasDeferredReduce()) {
+                Data &postRmsWeight = *requireLocal(weight[postRmsName], postRmsName);
+                attenInput.dataType = hiddenStates.dataType;
+                attenInput.UpdateUnitSize();
+                attenInput.dataDevice = DataDevice::CUDA;
+                attenInput.dataDeviceIds = {gpuId};
+                attenInput.Resize(hiddenStates.dims);
+                attenInput.Allocate(false);
+                const size_t rowBytes = (size_t)hiddenStates.dims.back() * hiddenStates.unitSize;
+                const std::function<void(int, int)> normChunk = [&](int offset, int rows) {
+                    Data inputRows, outputRows;
+                    inputRows.FakeFrom(hiddenStates, (size_t)offset * rowBytes);
+                    inputRows.Resize({1, rows, hiddenStates.dims.back()});
+                    outputRows.FakeFrom(attenInput, (size_t)offset * rowBytes);
+                    outputRows.Resize({1, rows, hiddenStates.dims.back()});
+                    // Borrowed output: the default runner path would detach it from attenInput.
+                    cudaRunner.Run("RMSNorm",
+                                   DataDict{{"input", &inputRows}, {"weight", &postRmsWeight}, {"output", &outputRows}},
+                                   FloatDict{{"eps", rms_norm_eps}}, IntDict(), {"output"}, true, true);
+                };
+                if (FastllmTryTP4MlpOverlap(
+                        attenInput,
+                        *requireLocal(weight[swigluWeightName], swigluWeightName),
+                        *requireLocal(GetThreadTensorParallelBias(swigluWeightName + ".tp_bias"),
+                                      swigluWeightName + ".tp_bias"),
+                        *requireLocal(weight[downWeightName], downWeightName),
+                        *requireLocal(GetThreadTensorParallelBias(downBiasName), downBiasName),
+                        hiddenStates, seqlen, gpuId, &normChunk)) {
+                    captureDFlashHidden(i);
+                    continue;
+                }
+                FastllmTP4FlushDeferredReduce(gpuId);
+            }
             Qwen3CudaRMSNorm(cudaRunner, hiddenStates,
                              *requireLocal(weight[postRmsName], postRmsName),
                              rms_norm_eps, attenInput);
@@ -15564,6 +18436,12 @@ namespace fastllm {
                                                  swigluWeightName + ".tp_bias");
                 Data &downWeight = *requireLocal(weight[downWeightName], downWeightName);
                 Data &downBias = *requireLocal(GetThreadTensorParallelBias(downBiasName), downBiasName);
+                if (tryTp4MlpOverlap && FastllmTryTP4MlpOverlap(
+                        attenInput, gateUpWeight, gateUpBias, downWeight, downBias,
+                        hiddenStates, seqlen, gpuId)) {
+                    captureDFlashHidden(i);
+                    continue;
+                }
                 if (tensorParallel && FastllmTryTP2MlpOverlap(
                         attenInput, gateUpWeight, gateUpBias, downWeight, downBias,
                         hiddenStates, gpuId)) {
@@ -15820,6 +18698,14 @@ namespace fastllm {
             addPartialToResidualReduce(moeFinal);
             captureDFlashHidden(i);
         }
+        pdMixLayerBook();
+        if (pdMixLayerProfile) {
+            int tokens = 0;
+            for (int len : seqLens) tokens += len;
+            printf("[PDMIX-PROFILE] layers rows=%d tokens=%d verify_tokens=%d all_logits=%d gdn_ms=%.1f attn_ms=%.1f\n",
+                   batch, tokens, pdMixVerifyTokens, speculativeCollectAllLogits ? 1 : 0,
+                   pdMixGdnUs / 1000.0, pdMixAttnUs / 1000.0);
+        }
         mtpWorkerProfileSyncMark(mtpWorkerProfileLayersUs);
         if (speculativeCacheOnlyForward ||
             (isIntermediateChunkedPrefill &&
@@ -15837,6 +18723,12 @@ namespace fastllm {
         bool keepAllRowsForSpeculative =
             speculativeCollectAllLogits ||
             (speculativeCaptureAllHiddenStates && batch == 1);
+        Data pdMixVerifyHidden;
+        if (pdMixVerifyTokens > 0 && keepAllRowsForSpeculative) {
+            Qwen3CudaSplit(cudaRunner, hiddenStates, 1, 0, pdMixVerifyTokens,
+                           pdMixVerifyHidden);
+            headInput = &pdMixVerifyHidden;
+        }
         if (!all1 && !keepAllRowsForSpeculative) {
             int total = 0;
             std::vector<Data> lastToks(seqLens.size());
@@ -15889,6 +18781,83 @@ namespace fastllm {
 #endif
     }
 
+#ifdef USE_CUDA
+    // Diagnostic only, default off: locate a per-process wrong answer by comparing the
+    // device bytes of every weight shard between a good and a bad server start.
+    static void Qwen35DebugWeightDigestMaybe(WeightMap &weights) {
+        static const char *prefix = std::getenv("FASTLLM_DEBUG_WEIGHT_DIGEST");
+        if (prefix == nullptr || prefix[0] == '\0') return;
+        static std::atomic<int> seq{0};
+        static std::atomic<bool> busy{false};
+        const std::string trigger = std::string(prefix) + ".trigger";
+        if (seq.load() > 0 && !std::ifstream(trigger).good()) return;
+        bool expected = false;
+        if (!busy.compare_exchange_strong(expected, true)) return;
+        if (seq.load() > 0) std::remove(trigger.c_str());
+        const int id = seq.fetch_add(1);
+        struct Item { std::string name; int device; void *ptr; uint64_t bytes; uint64_t hash; uint64_t hostScaleHash; };
+        auto fnvBytes = [](uint64_t h, const uint8_t *p, size_t n) {
+            size_t i = 0;
+            for (; i + 8 <= n; i += 8) { uint64_t w; std::memcpy(&w, p + i, 8); h ^= w; h *= 1099511628211ull; }
+            for (; i < n; ++i) { h ^= p[i]; h *= 1099511628211ull; }
+            return h;
+        };
+        std::vector<Item> items;
+        for (auto &entry : weights.weight) {
+            Data &w = entry.second;
+            auto add = [&](int device, Data *d) {
+                if (d == nullptr || d->cudaData == nullptr || d->dataDevice != DataDevice::CUDA) return;
+                uint64_t sh = 1469598103934665603ull;
+                if (!d->scales.empty())
+                    sh = fnvBytes(sh, reinterpret_cast<const uint8_t *>(d->scales.data()), d->scales.size() * sizeof(float));
+                items.push_back({entry.first, device, d->cudaData, d->GetBytes(), 0, sh});
+            };
+            if (w.multiDeviceData) {
+                for (auto &local : w.multiDeviceDatas) add(local.first, local.second);
+            } else {
+                add(-1, &w);
+            }
+        }
+        std::sort(items.begin(), items.end(), [](const Item &a, const Item &b) {
+            return a.name != b.name ? a.name < b.name : a.device < b.device; });
+        std::map<int, std::vector<size_t>> byDevice;
+        for (size_t i = 0; i < items.size(); ++i) byDevice[items[i].device].push_back(i);
+        auto begin = std::chrono::steady_clock::now();
+        std::vector<std::thread> threads;
+        for (auto &group : byDevice) {
+            threads.emplace_back([&items, &fnvBytes, group]() {
+                if (group.first >= 0) FastllmCudaSetDevice(group.first);
+                std::vector<uint8_t> buffer(64ull << 20);
+                for (size_t index : group.second) {
+                    Item &it = items[index];
+                    uint64_t h = 1469598103934665603ull;
+                    for (uint64_t off = 0; off < it.bytes; off += buffer.size()) {
+                        size_t n = (size_t)std::min<uint64_t>(buffer.size(), it.bytes - off);
+                        FastllmCudaCopyFromDeviceToHost(buffer.data(), (uint8_t *)it.ptr + off, n);
+                        h = fnvBytes(h, buffer.data(), n);
+                    }
+                    it.hash = h;
+                }
+            });
+        }
+        for (auto &th : threads) th.join();
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
+        const std::string out = std::string(prefix) + "." + std::to_string((long long)getpid()) + "." + std::to_string(id) + ".txt";
+        std::ofstream file(out);
+        uint64_t all = 1469598103934665603ull, totalBytes = 0;
+        for (const Item &it : items) {
+            file << it.name << " " << it.device << " " << it.bytes << " " << std::hex << it.hash << " " << it.hostScaleHash << std::dec << "\n";
+            all = fnvBytes(all, reinterpret_cast<const uint8_t *>(&it.hash), 8);
+            totalBytes += it.bytes;
+        }
+        file.close();
+        std::fprintf(stderr, "[DEBUG] weight-digest: seq=%d tensors=%zu bytes=%llu all=%016llx ms=%.1f file=%s.\n",
+                     id, items.size(), (unsigned long long)totalBytes, (unsigned long long)all, ms, out.c_str());
+        std::fflush(stderr);
+        busy.store(false);
+    }
+#endif
+
     std::vector <int> Qwen3_5Model::ForwardGPU(
         int batch,
         const Data &inputIds,
@@ -15899,6 +18868,9 @@ namespace fastllm {
         const std::vector <GenerationConfig> &generationConfigs,
         const LastTokensManager &lastTokens,
         std::vector <std::vector <float>*> *retLogits) {
+#ifdef USE_CUDA
+        Qwen35DebugWeightDigestMaybe(this->weight);
+#endif
         return ForwardGPUWithHiddenStates(
             batch, inputIds, attentionMask, positionIds, seqLens,
             pastKeyValues, generationConfigs, lastTokens, retLogits, nullptr);
@@ -15921,8 +18893,9 @@ namespace fastllm {
                          pastKeyValues, generationConfigs, lastTokens, retLogits);
 #else
         (void)attentionMask;
-        int mtpTargetProfileInterval = speculativeCollectAllLogits ?
-            Qwen35MtpProfileInterval() : 0;
+        int mtpTargetProfileInterval =
+            (autoWarmupRunning.load() && LoadStageTimingEnabled()) ? 1 :
+            (speculativeCollectAllLogits ? Qwen35MtpProfileInterval() : 0);
         bool mtpTargetProfileEnabled = mtpTargetProfileInterval > 0;
         int mtpTargetProfileSeqTokens = 0;
         for (int len : seqLens) {
@@ -16008,6 +18981,17 @@ namespace fastllm {
             all1 &= (seqLens[i] == 1);
         }
         bool isPrefill = !all1;
+        bool hasDecodeRow = false;
+        bool hasPrefillRow = false;
+        for (int len : seqLens) {
+            hasDecodeRow |= len == 1;
+            hasPrefillRow |= len > 1;
+        }
+        const bool mixedRowsTargetOnly = Qwen35MixedRowsEnabled() && batch > 1 &&
+            hasDecodeRow && hasPrefillRow && !speculativeCollectAllLogits &&
+            !speculativeCaptureFirstTokenLinearState &&
+            (!speculativeCaptureDFlashHiddenStates ||
+             Qwen35MixedDFlashSeedEnabled());
         if ((int)threadTpLinearAttentionLayers.size() != block_cnt) {
             threadTpLinearAttentionLayers.assign(block_cnt, 0);
             for (int i = 0; i < block_cnt; i++) {
@@ -16089,7 +19073,7 @@ namespace fastllm {
 
         auto canRunFusedBatchPrefill = [&]() -> bool {
             if (Qwen35DisableBatchPrefill() || batch <= 1 || all1 ||
-                speculativeCollectAllLogits ||
+                (speculativeCollectAllLogits && pdMixVerifyTokens == 0) ||
                 ResolveQwen35ThreadTpComputeType(this->dataType) !=
                     DataType::FLOAT16 ||
                 (int)seqLens.size() != batch ||
@@ -16114,7 +19098,7 @@ namespace fastllm {
                     // continued or chunked request keeps the established
                     // request-local path until its cache semantics are
                     // covered explicitly.
-                    if (isLinearLayer &&
+                    if (isLinearLayer && !Qwen35ResumePackEnabled() &&
                         (!pastKey->dims.empty() || !pastValue->dims.empty())) {
                         return false;
                     }
@@ -16129,7 +19113,7 @@ namespace fastllm {
             speculativeCaptureFirstTokenLinearState;
         bool canRunFusedBatchPrefillNow = canRunFusedBatchPrefill();
         if (batch > 1 && ((!all1 && !canRunFusedBatchSpeculative &&
-                           !canRunFusedBatchPrefillNow) ||
+                           !canRunFusedBatchPrefillNow && !mixedRowsTargetOnly) ||
                           (all1 && !canRunFusedBatchDecode()))) {
             return runSplitBatchForward();
         }
@@ -17487,11 +20471,27 @@ namespace fastllm {
                     [](const GenerationConfig &config) {
                         return config.IsSimpleGreedy() && !config.output_logits;
                     });
+            // A-6 fix F: per-rank device timeline for prefill. Only the non-pipelined path, where the
+            // ForceDeviceSync below already completes both events before they are read. On this path
+            // ForwardSingleGPU's WaitInputReady is skipped (it runs only when launchActive, i.e.
+            // pipelined), so the begin event is directly ahead of the forward's first kernel.
+            const bool gpuTimeline = Qwen35GpuTimelineEnabled() && isPrefill &&
+                !pipelineGpuTokenHandoff;
+            std::vector<double> timelineBeginMs(devices.size(), -1.0);
+            std::vector<double> timelineEndMs(devices.size(), -1.0);
+            const uint64_t timelineHostNs = gpuTimeline ? FastllmObservationTimestampNs() : 0;
             threadTpWorkerGroup.RunWithCaller(devices, [&](int r) {
                 Qwen35ScopedGpuTokenHandoffControl handoffScope(
                     activeGpuTokenHandoff);
                 Qwen35ScopedTpDecodeGraphContext graphContextScope(
                     coordinateNormalDecodeGraph, &tpDecodeGraphContext, r);
+                void *timelineBegin = nullptr;
+                void *timelineEnd = nullptr;
+                if (gpuTimeline) {
+                    FastllmCudaSetDevice(devices[r]);
+                    Qwen35GpuTimelineRankEvents(devices[r], &timelineBegin, &timelineEnd);
+                    if (timelineBegin != nullptr) FastllmCudaEventRecordCurrentThread(timelineBegin);
+                }
                 ForwardSingleGPU(
                     devices[r], ratios, batch, gpuInputIds,
                     allPositionIds, seqLens, localPastKeyValues[r],
@@ -17502,9 +20502,30 @@ namespace fastllm {
                 if (pipelineGpuTokenHandoff) {
                     activeGpuTokenHandoff->RecordForwardReady(r);
                 } else {
-                    ForceDeviceSync();
+                    if (timelineEnd != nullptr) FastllmCudaEventRecordCurrentThread(timelineEnd);
+                    // A-6 fix G: wait only for this rank's own stream. Forward kernels, cuBLAS, custom
+                    // allreduce and NCCL all run on cudaStreamPerThread (built with
+                    // --default-stream=per-thread), so this keeps compute ordering; the device-wide
+                    // cudaDeviceSynchronize also waited for the export lane's D2H copy stream
+                    // (logs/a6-forcesync-20261101T083551). Exceptional drains elsewhere stay device-wide.
+                    FastllmCudaSyncCurrentThreadStream();
+                    if (timelineEnd != nullptr) {
+                        timelineBeginMs[r] = Qwen35GpuTimelineMs(devices[r], timelineBegin);
+                        timelineEndMs[r] = Qwen35GpuTimelineMs(devices[r], timelineEnd);
+                    }
                 }
             }, errors);
+            if (gpuTimeline) {
+                int timelineTokens = 0;
+                for (int len : seqLens) timelineTokens += len;
+                for (size_t r = 0; r < devices.size(); r++) {
+                    std::printf("[GpuTimeline] prefill-forward: device=%d rank=%zu fwd_begin_dev_ms=%.3f "
+                                "fwd_end_dev_ms=%.3f host_ns=%llu batch=%d tokens=%d.\n",
+                                devices[r], r, timelineBeginMs[r], timelineEndMs[r],
+                                (unsigned long long)timelineHostNs, batch, timelineTokens);
+                }
+                std::fflush(stdout);
+            }
             bool hasWorkerError = std::any_of(
                 errors.begin(), errors.end(),
                 [](const std::exception_ptr &error) {
@@ -17611,6 +20632,74 @@ namespace fastllm {
             return {};
         }
 
+        // Diagnostic build path: raw pre-EOS-mask logits, untouched by sampling.
+        // Copy shards rather than gathering into the production sampling buffer.
+        if (Qwen35ChunkDebugEnabled() && !autoWarmupRunning.load() &&
+            !localLogits.empty() && !localLogits[0].dims.empty()) {
+            const int rows = localLogits[0].Count(0) / localLogits[0].dims.back();
+            std::vector<int> firstIds(rows, -1), secondIds(rows, -1);
+            std::vector<float> firstScores(rows, -std::numeric_limits<float>::infinity());
+            std::vector<float> secondScores = firstScores;
+            const int oldDevice = FastllmCudaGetDevice();
+            for (size_t rank = 0; rank < localLogits.size(); ++rank) {
+                FastllmCudaSetDevice(devices[rank]);
+                Data cpu;
+                cpu.CopyFrom(localLogits[rank]);
+                cpu.ToDevice(DataDevice::CPU);
+                if (cpu.dataType != DataType::FLOAT32) {
+                    ToDataType(cpu, DataType::FLOAT32);
+                    cpu.ToDevice(DataDevice::CPU);
+                }
+                const int width = cpu.dims.back();
+                const float *values = (const float*)cpu.cpuData;
+                int localOffset = 0;
+                for (const auto &range : lmHeadScheme->at(devices[rank])) {
+                    for (int id = range.first; id < range.second; ++id) {
+                        const int localId = localOffset + id - range.first;
+                        for (int row = 0; row < rows; ++row) {
+                            const float score = values[(size_t)row * width + localId];
+                            if (score > firstScores[row] ||
+                                (score == firstScores[row] && id < firstIds[row])) {
+                                secondScores[row] = firstScores[row];
+                                secondIds[row] = firstIds[row];
+                                firstScores[row] = score;
+                                firstIds[row] = id;
+                            } else if (score > secondScores[row] ||
+                                       (score == secondScores[row] && id < secondIds[row])) {
+                                secondScores[row] = score;
+                                secondIds[row] = id;
+                            }
+                        }
+                    }
+                    localOffset += range.second - range.first;
+                }
+            }
+            FastllmCudaSetDevice(oldDevice);
+            int row = 0;
+            for (int b = 0; b < batch; ++b) {
+                Data positions;
+                if (b < (int)positionIds.size() && positionIds[b] != nullptr) {
+                    positions.CopyFrom(*positionIds[b]);
+                    positions.ToDevice(DataDevice::CPU);
+                    if (positions.dataType != DataType::FLOAT32) {
+                        ToDataType(positions, DataType::FLOAT32);
+                        positions.ToDevice(DataDevice::CPU);
+                    }
+                }
+                const int count = speculativeCollectAllLogits ? seqLens[b] : 1;
+                for (int j = 0; j < count && row < rows; ++j, ++row) {
+                    const int index = speculativeCollectAllLogits ? j : seqLens[b] - 1;
+                    const int pos = positions.cpuData != nullptr && index < positions.Count(0) ?
+                        (int)((const float*)positions.cpuData)[index] + 1 : -1;
+                    printf("[CHUNKTAIL-LOGITS] chunk=%d verify=%d batch=%d row=%d pos=%d top1=%d score1=%.9g top2=%d score2=%.9g margin=%.9g\n",
+                           Qwen35ChunkPrefillEnabled() ? 1 : 0,
+                           speculativeCollectAllLogits ? 1 : 0, b, j, pos,
+                           firstIds[row], firstScores[row], secondIds[row], secondScores[row],
+                           firstScores[row] - secondScores[row]);
+                }
+            }
+            fflush(stdout);
+        }
         int vocabSize = lmHead.dims[0];
         int logitRows = batch;
         auto singleDeviceHasFullVocabLogits = [&]() {
@@ -17628,7 +20717,63 @@ namespace fastllm {
                    localLogits[0].dims.size() >= 2 &&
                    localLogits[0].dims.back() == vocabSize;
         };
+        // TOP2DEBUG: one [TOP2] line per row this forward decides. Defined once
+        // below, after logitRows/vocabSize exist; the full-vocabulary variant
+        // takes the logits tensor as an argument because the gathered buffer is
+        // created further down. Every site is guarded by the cached bool.
+        if (Qwen35Top2DebugEnabled()) {
+            qwen35Top2DebugDecidedTokens.clear();
+            qwen35Top2DebugPending = Qwen35Top2DebugPending();
+        }
+        // Queue the [TOP2] block for a sampler that decides the tokens itself
+        // and returns them (root full-vocabulary sampling below).
+        auto top2DebugArm = [&](const char *path, const Data &logits) {
+            qwen35Top2DebugPending.armed = true;
+            qwen35Top2DebugPending.path = path;
+            qwen35Top2DebugPending.logits = &logits;
+            qwen35Top2DebugPending.rows = logitRows;
+            qwen35Top2DebugPending.vocabSize = vocabSize;
+            qwen35Top2DebugPending.batch = batch;
+            qwen35Top2DebugPending.seqLens = seqLens;
+            qwen35Top2DebugPending.positionIds = positionIds;
+            qwen35Top2DebugPending.perRow = speculativeCollectAllLogits;
+        };
+        auto top2DebugChosen = [&](const std::vector<int> &chosen) {
+            return (int)qwen35Top2DebugDecidedTokens.size() == logitRows ?
+                qwen35Top2DebugDecidedTokens : chosen;
+        };
+        auto top2DebugEmitShards = [&](const char *path,
+                                       const std::vector<int> &chosen) {
+            std::vector<Qwen35Top2DebugRow> top2;
+            Qwen35Top2DebugFromShards(devices, *lmHeadScheme, localLogits,
+                                      logitRows, vocabSize, top2);
+            Qwen35Top2DebugEmit(path, batch, seqLens, positionIds,
+                                speculativeCollectAllLogits, top2,
+                                top2DebugChosen(chosen));
+            qwen35Top2DebugDecidedTokens.clear();
+        };
+        auto top2DebugEmitFull = [&](const char *path, const Data &logits,
+                                     const std::vector<int> &chosen) {
+            std::vector<Qwen35Top2DebugRow> top2;
+            Qwen35Top2DebugFromFullLogits(logits, logitRows, vocabSize, top2);
+            Qwen35Top2DebugEmit(path, batch, seqLens, positionIds,
+                                speculativeCollectAllLogits, top2,
+                                top2DebugChosen(chosen));
+            qwen35Top2DebugDecidedTokens.clear();
+        };
+        // PDMIX: logits exist only for the verify rows; the trailing prompt
+        // chunk has no head output.
+        const int pdMixSampleBatch = pdMixVerifyTokens > 0 ? batch - 1 : batch;
+        std::vector<int> pdMixSampleSeqLensStorage;
+        if (pdMixVerifyTokens > 0) {
+            pdMixSampleSeqLensStorage.assign(
+                seqLens.begin(), seqLens.begin() + std::max(0, pdMixSampleBatch));
+        }
+        const std::vector<int> &pdMixSampleSeqLens =
+            pdMixVerifyTokens > 0 ? pdMixSampleSeqLensStorage : seqLens;
         if (speculativeCollectAllLogits) {
+            const int batch = pdMixSampleBatch;
+            const std::vector<int> &seqLens = pdMixSampleSeqLens;
             speculativeMtpAccepted.clear();
             speculativeDFlashAccepted.clear();
             AssertInFastLLM(!localLogits.empty() && !localLogits[0].dims.empty(),
@@ -17764,6 +20909,9 @@ namespace fastllm {
                 std::vector<int> sampled = Qwen35SampleGreedyFromShardedCudaLogits(
                     devices, *lmHeadScheme, localLogits, logitRows, vocabSize,
                     anyRowNeedsEosReset, commonResetEosIds);
+                if (Qwen35Top2DebugEnabled()) {
+                    top2DebugEmitShards("sharded-greedy", sampled);
+                }
                 mtpTargetProfileMark(mtpTargetProfileSamplingUs);
                 mtpTargetProfileRecord(logitRows);
                 return sampled;
@@ -17795,6 +20943,9 @@ namespace fastllm {
                     // lifetime; concurrent calls never share its scratch.
                     FastllmCudaCopyFromDeviceToHost(sampled.data(), greedyIds.cudaData,
                                                   (size_t)logitRows * sizeof(int));
+                    if (Qwen35Top2DebugEnabled()) {
+                        top2DebugEmitFull("root-typed-greedy", *sampleLogits, sampled);
+                    }
                     mtpTargetProfileMark(mtpTargetProfileSamplingUs);
                     mtpTargetProfileRecord(logitRows);
                     return sampled;
@@ -17805,6 +20956,116 @@ namespace fastllm {
             for (const GenerationConfig &config : rowConfigs) {
                 int curTopK = config.IsSimpleGreedy() ? 1 : config.top_k;
                 maxTopK = std::max(maxTopK, curTopK);
+            }
+            bool dflashMixedRows = false;
+            if (!speculativeDFlashSamplingContexts.empty() && !allSimple &&
+                Qwen35DFlashMixedVerifyEnabled() && qwen35GpuTokenHandoffControl == nullptr &&
+                (int)seqLens.size() == batch && batch > 1) {
+                for (int b = 0, off = 0; b < batch; off += seqLens[b], b++) {
+                    dflashMixedRows |= rowConfigs[off].IsSimpleGreedy();
+                }
+            }
+            if (dflashMixedRows) {
+                AssertInFastLLM((int)speculativeDFlashSamplingContexts.size() == batch && logitRows >= 2,
+                                "DFlash mixed verify batch shape is invalid.\n");
+                const int draftTokens = seqLens[0] - 1;
+                const int rowsPer = draftTokens + 1;
+                AssertInFastLLM(draftTokens > 0 && logitRows == batch * rowsPer,
+                                "DFlash mixed verify batch shape is invalid.\n");
+                // Greedy rows: target argmax over all rows (vLLM rejection_sampler.py:509-534).
+                std::vector<int> sampled(logitRows, -1);
+                {
+                    Data greedyIds(DataType::INT32), greedyScratch;
+                    Qwen3CudaPrepareLocalOutput(greedyIds, devices[0]);
+                    greedyIds.Resize({logitRows});
+                    greedyIds.Allocate(false);
+                    AssertInFastLLM(Qwen35TryTypedGreedySampling(*sampleLogits,
+                            (int*)greedyIds.cudaData, nullptr, nullptr, logitRows, greedyScratch),
+                        "DFlash mixed verify greedy sampling failed.\n");
+                    FastllmCudaCopyFromDeviceToHost(sampled.data(), greedyIds.cudaData,
+                                                  (size_t)logitRows * sizeof(int));
+                }
+                Data verifyInputCpu;
+                verifyInputCpu.CopyFrom(inputIds);
+                verifyInputCpu.ToDevice(DataDevice::CPU);
+                if (verifyInputCpu.dataType != DataType::FLOAT32) {
+                    ToDataType(verifyInputCpu, DataType::FLOAT32);
+                    verifyInputCpu.ToDevice(DataDevice::CPU);
+                }
+                AssertInFastLLM(verifyInputCpu.Count(0) >= (uint64_t)logitRows,
+                                "DFlash mixed verify input shape mismatch.\n");
+                const float *verifyInput = (const float*)verifyInputCpu.cpuData;
+                // Sampling rows: gather their logits into one contiguous sub-batch for the kernel.
+                std::vector<int> sampleRequests;
+                for (int b = 0; b < batch; b++) {
+                    if (!rowConfigs[b * rowsPer].IsSimpleGreedy()) sampleRequests.push_back(b);
+                }
+                const int subBatch = (int)sampleRequests.size();
+                Data gathered(DataType::FLOAT32);
+                Qwen3CudaPrepareLocalOutput(gathered, devices[0]);
+                gathered.Resize({subBatch * rowsPer, vocabSize});
+                gathered.Allocate(false);
+                FastllmCudaSetDevice(devices[0]);
+                std::vector<int> proposalTokens, proposalCandidateIds;
+                std::vector<float> proposalCandidateProbs, temperatures, topPs;
+                std::vector<int> topKs;
+                for (int i = 0; i < subBatch; i++) {
+                    const int b = sampleRequests[i];
+                    const int off = b * rowsPer;
+                    DFlashContext *proposal = speculativeDFlashSamplingContexts[b];
+                    AssertInFastLLM(
+                        proposal != nullptr && seqLens[b] == rowsPer &&
+                            (int)proposal->proposalTokens.size() >= draftTokens &&
+                            (int)proposal->proposalCandidateIds.size() >= draftTokens * dflashSelectorTopK &&
+                            (int)proposal->proposalCandidateProbs.size() >= draftTokens * dflashSelectorTopK,
+                        "DFlash mixed verify is missing selector probabilities.\n");
+                    FastllmCudaCopyFromDeviceToDevice(
+                        (float*)gathered.cudaData + (size_t)i * rowsPer * vocabSize,
+                        (float*)sampleLogits->cudaData + (size_t)off * vocabSize,
+                        (size_t)rowsPer * vocabSize * sizeof(float));
+                    for (int token = 0; token < draftTokens; token++) {
+                        AssertInFastLLM(proposal->proposalTokens[token] ==
+                                            (int)(verifyInput[off + token + 1] + 1.0e-3f),
+                                        "DFlash mixed verify proposal is out of sync.\n");
+                        proposalTokens.push_back(proposal->proposalTokens[token]);
+                    }
+                    proposalCandidateIds.insert(proposalCandidateIds.end(),
+                        proposal->proposalCandidateIds.begin(),
+                        proposal->proposalCandidateIds.begin() + draftTokens * dflashSelectorTopK);
+                    proposalCandidateProbs.insert(proposalCandidateProbs.end(),
+                        proposal->proposalCandidateProbs.begin(),
+                        proposal->proposalCandidateProbs.begin() + draftTokens * dflashSelectorTopK);
+                    for (int r = 0; r < rowsPer; r++) {
+                        temperatures.push_back(rowConfigs[off + r].temperature);
+                        topKs.push_back(rowConfigs[off + r].top_k);
+                        topPs.push_back(rowConfigs[off + r].top_p);
+                    }
+                }
+                std::vector<int> subSampled(subBatch * rowsPer, -1), subAccepted(subBatch, 0);
+                AssertInFastLLM(
+                    FastllmCudaDFlashRejectionSampling(
+                        (float*)gathered.cudaData, temperatures.data(), topKs.data(), topPs.data(),
+                        proposalTokens.data(), proposalCandidateIds.data(),
+                        proposalCandidateProbs.data(), subSampled.data(), subAccepted.data(),
+                        subBatch, draftTokens, dflashSelectorTopK, vocabSize),
+                    "DFlash CUDA rejection sampling failed.\n");
+                speculativeDFlashAccepted.assign(logitRows, 0);
+                for (int i = 0; i < subBatch; i++) {
+                    const int off = sampleRequests[i] * rowsPer;
+                    AssertInFastLLM(subAccepted[i] >= 0 && subAccepted[i] <= draftTokens,
+                                    "DFlash rejection sampling returned an invalid acceptance length.\n");
+                    for (int r = 0; r < rowsPer; r++) sampled[off + r] = subSampled[i * rowsPer + r];
+                    for (int token = 0; token < subAccepted[i]; token++) speculativeDFlashAccepted[off + token] = 1;
+                }
+                static std::atomic<bool> mixedVerifyLogged{false};
+                if (!mixedVerifyLogged.exchange(true)) {
+                    printf("[DFLASH-MIXED-VERIFY] first mixed greedy/sampling DFlash batch: requests=%d sampling=%d width=%d\n",
+                           batch, subBatch, rowsPer);
+                    fflush(stdout);
+                }
+                mtpTargetProfileMark(mtpTargetProfileSamplingUs);
+                mtpTargetProfileRecord(logitRows);
+                return sampled;
             }
             if ((speculativeDFlashSamplingContext != nullptr ||
                  !speculativeDFlashSamplingContexts.empty()) && !allSimple) {
@@ -17903,6 +21164,9 @@ namespace fastllm {
                     }
                     rowOffset += seqLens[b];
                 }
+                if (Qwen35Top2DebugEnabled()) {
+                    top2DebugEmitFull("dflash-verify", *sampleLogits, sampled);
+                }
                 mtpTargetProfileMark(mtpTargetProfileSamplingUs);
                 mtpTargetProfileRecord(logitRows);
                 return sampled;
@@ -17961,6 +21225,10 @@ namespace fastllm {
                     for (int b = 0; b < batch; ++b)
                         for (int i = 0; i < accepted[b]; ++i)
                             speculativeMtpAccepted[b * (batchDrafts + 1) + i] = 1;
+                    if (Qwen35Top2DebugEnabled()) {
+                        top2DebugEmitFull("mtp-verify-batched", *sampleLogits,
+                                          sampled);
+                    }
                     mtpTargetProfileMark(mtpTargetProfileSamplingUs);
                     mtpTargetProfileRecord(logitRows);
                     return sampled;
@@ -18069,6 +21337,9 @@ namespace fastllm {
                     }
                 }
             }
+            if (Qwen35Top2DebugEnabled()) {
+                top2DebugEmitFull("mtp-acceptance", *sampleLogits, sampled);
+            }
             mtpTargetProfileMark(mtpTargetProfileSamplingUs);
             mtpTargetProfileRecord(logitRows);
             return sampled;
@@ -18106,6 +21377,9 @@ namespace fastllm {
                     std::vector<int> sampled = Qwen35SampleGreedyFromShardedCudaLogits(
                         devices, *lmHeadScheme, localLogits, batch, vocabSize,
                         false, {});
+                    if (Qwen35Top2DebugEnabled()) {
+                        top2DebugEmitShards("sharded-greedy", sampled);
+                    }
                     mtpTargetProfileMark(mtpTargetProfileSamplingUs);
                     mtpTargetProfileRecord(batch);
                     return sampled;
@@ -18122,6 +21396,9 @@ namespace fastllm {
                         std::vector<int> sampled = Qwen35SampleGreedyFromShardedCudaLogits(
                             devices, *lmHeadScheme, localLogits, batch,
                             vocabSize, true, commonEosIds);
+                        if (Qwen35Top2DebugEnabled()) {
+                            top2DebugEmitShards("sharded-greedy", sampled);
+                        }
                         mtpTargetProfileMark(mtpTargetProfileSamplingUs);
                         mtpTargetProfileRecord(batch);
                         return sampled;
@@ -18153,6 +21430,11 @@ namespace fastllm {
             ResetLogitsOfEOS(batch, rootCudaLogits, pastKeyValues, generationConfigs);
             Qwen35PrintCudaLogitsTopK(*rootCudaLogits, batch, "Qwen3.5 CUDA");
             SetCurrentThreadExecutor(oldExecutor);
+            if (Qwen35Top2DebugEnabled()) {
+                // The sampler emits this block at its own return, once the
+                // chosen ids exist (it may only produce them on the device).
+                top2DebugArm("root-sampling", *rootCudaLogits);
+            }
             return Qwen35SampleFromRootCudaLogits(devices[0], *rootCudaLogits, batch,
                                                   cudaSamplingTopK, allSimpleCudaSampling,
                                                   generationConfigs, &lastTokens);
@@ -19230,6 +22512,9 @@ namespace fastllm {
             return ret;
         };
 
+        const bool chunkCacheOnlySeed = Qwen35ChunkPrefillEnabled() && useDFlash &&
+            context->curTokens == 0 && context->prefillRemain > 0 &&
+            context->multimodalInput.empty();
         auto runTargetSeed = [&](const Data &curInputIds,
                                  const std::vector<Data*> &curAttentionMask,
                                  const std::vector<Data*> &curPositionIds,
@@ -19237,9 +22522,11 @@ namespace fastllm {
             bool oldSpeculativeCollectAllLogits = speculativeCollectAllLogits;
             bool oldSpeculativeCaptureAllHiddenStates = speculativeCaptureAllHiddenStates;
             bool oldCaptureDFlash = speculativeCaptureDFlashHiddenStates;
+            bool oldCacheOnlySeed = speculativeCacheOnlyForward;
             speculativeCollectAllLogits = false;
-            speculativeCaptureAllHiddenStates = true;
+            speculativeCaptureAllHiddenStates = !chunkCacheOnlySeed;
             speculativeCaptureDFlashHiddenStates = useDFlash;
+            speculativeCacheOnlyForward = oldCacheOnlySeed || chunkCacheOnlySeed;
             if (useDFlash) {
                 speculativeDFlashHiddenStates.clear();
                 speculativeDFlashHiddenStates.resize(
@@ -19258,11 +22545,13 @@ namespace fastllm {
                                  pastKeyValues, generationConfigs,
                                  LastTokensManager(), nullptr);
             } catch (...) {
+                speculativeCacheOnlyForward = oldCacheOnlySeed;
                 speculativeCaptureDFlashHiddenStates = oldCaptureDFlash;
                 speculativeCaptureAllHiddenStates = oldSpeculativeCaptureAllHiddenStates;
                 speculativeCollectAllLogits = oldSpeculativeCollectAllLogits;
                 throw;
             }
+            speculativeCacheOnlyForward = oldCacheOnlySeed;
             speculativeCaptureDFlashHiddenStates = oldCaptureDFlash;
             speculativeCaptureAllHiddenStates = oldSpeculativeCaptureAllHiddenStates;
             speculativeCollectAllLogits = oldSpeculativeCollectAllLogits;
@@ -19465,8 +22754,11 @@ namespace fastllm {
             auto draftStart = mtpProfileEnabled ?
                 std::chrono::steady_clock::now() :
                 std::chrono::steady_clock::time_point();
+            const int draftChainDevice = Qwen35DFlashDraftDeviceOr(devices);
+            const std::vector<int> draftChainDevices =
+                Qwen35DFlashDraftDevicesOrDefault(devices);
             AppendDFlashTargetHidden(
-                device, (int)draftInputTokens.size(), dflashContext);
+                draftChainDevice, (int)draftInputTokens.size(), dflashContext);
             if (Qwen35DFlashCommitEndsRequest(
                     *this, context, committedTokens) ||
                 !Qwen35DFlashDraftFitsContext(
@@ -19476,7 +22768,8 @@ namespace fastllm {
                 return std::vector<int>();
             }
             std::vector<int> drafts = RunDFlashDraft(
-                device, devices, draftInputTokens.back(),
+                draftChainDevice, draftChainDevices,
+                draftInputTokens.back(),
                 generationConfigs[0], dflashContext);
             mtpProfileAddSpan(mtpProfileDraftFirstUs, draftStart);
             return drafts;
@@ -19500,11 +22793,33 @@ namespace fastllm {
         mtpProfileMark(mtpProfileSetupUs);
         std::vector<int> targetRet;
         bool isSpeculativeValidation =
+            (!Qwen35ChunkPrefillEnabled() || context->curTokens > 0) &&
             seqLen >= 2 && seqLen <= mtpDraftsPerStep + 1 &&
             activeCacheTokens > 0 && context->preTokens > seqLen;
         if (!isSpeculativeValidation) {
+            const bool chunkProfile = Qwen35ChunkPrefillEnabled();
+            const auto chunkTargetStart = chunkProfile ? std::chrono::steady_clock::now() :
+                std::chrono::steady_clock::time_point();
             targetRet = runTargetSeed(inputIds, attentionMask, positionIds, seqLens);
+            const auto chunkTargetEnd = chunkProfile ? std::chrono::steady_clock::now() :
+                std::chrono::steady_clock::time_point();
             mtpProfileMark(mtpProfileTargetUs);
+            if (chunkCacheOnlySeed) {
+                // Same no-proposal contract as the established long-prefill loop:
+                // fully materialize draft K/V before allowing a checkpoint, but
+                // no head or proposal from an unfinished prompt can be committed.
+                AppendDFlashTargetHidden(Qwen35DFlashDraftDeviceOr(devices), seqLen, dflashContext);
+                AssertInFastLLM(dflashContext.committedTokens == expectedMtpTokens + seqLen,
+                                "CHUNKTAIL partial DFlash cache length mismatch.\n");
+                const auto end = std::chrono::steady_clock::now();
+                printf("[CHUNKTAIL-WORK] tokens=%d partial=1 head=0 proposals=0 target_host_ms=%.3f append_host_ms=%.3f committed_tokens=%d\n",
+                       seqLen, std::chrono::duration<double,std::milli>(chunkTargetEnd-chunkTargetStart).count(),
+                       std::chrono::duration<double,std::milli>(end-chunkTargetEnd).count(), dflashContext.committedTokens);
+                fflush(stdout);
+                mtpProfileMark(mtpProfileDraftUs);
+                // acceptedTokens/nextInputTokens were initialized to empty above.
+                return true;
+            }
             AssertInFastLLM(!targetRet.empty(),
                             "Qwen3.5 MTP target forward returned no token.\n");
             int nextToken = targetRet.back();
@@ -19519,6 +22834,14 @@ namespace fastllm {
                 speculativeHiddenStates, mtpInputTokens, mtpPositionIds,
                 seqLen - 1, seqLen - 1, std::vector<int>{nextToken});
             mtpProfileMark(mtpProfileDraftUs);
+            if (chunkProfile) {
+                const auto end = std::chrono::steady_clock::now();
+                printf("[CHUNKTAIL-WORK] tokens=%d partial=0 head=1 proposals=%zu target_host_ms=%.3f append_and_draft_host_ms=%.3f committed_tokens=%d\n",
+                       seqLen, drafts.size(),
+                       std::chrono::duration<double,std::milli>(chunkTargetEnd-chunkTargetStart).count(),
+                       std::chrono::duration<double,std::milli>(end-chunkTargetEnd).count(), dflashContext.committedTokens);
+                fflush(stdout);
+            }
             acceptedTokens[0].push_back(nextToken);
             setNextInputWithDrafts(nextToken, drafts);
             mtpProfileRecord(QWEN35_MTP_PROFILE_SEED, false, 0, 0, 1);
@@ -21150,7 +24473,7 @@ namespace fastllm {
         const std::vector<GenerationConfig> &generationConfigs,
         std::vector<std::vector<int> > &acceptedTokens,
         std::vector<std::vector<int> > &nextInputTokens,
-        std::vector<int> &keptInputLens) {
+        std::vector<int> &keptInputLens, int draftsPerStepOverride) {
 #ifndef USE_CUDA
         (void)useGPUForward;
         (void)contexts;
@@ -21165,6 +24488,75 @@ namespace fastllm {
         (void)keptInputLens;
         return false;
 #else
+        if (pdMixPromptTail) {
+            // PDMIX: the last row is a non-final prompt chunk that rides the
+            // verify forward. Verify logic below sees only the first rows.
+            pdMixPromptTail = false;
+            const int all = (int)contexts.size();
+            AssertInFastLLM(all >= 2 && (int)seqLens.size() == all &&
+                            (int)positionIds.size() >= all &&
+                            (int)generationConfigs.size() >= all &&
+                            (int)pastKeyValues.size() >= all * block_cnt,
+                            "PDMIX mixed batch shape is invalid.\n");
+            const int verifyRows = all - 1;
+            int verifyTokens = 0;
+            for (int b = 0; b < verifyRows; b++) verifyTokens += seqLens[b];
+            Data idsCpu;
+            idsCpu.CopyFrom(inputIds);
+            idsCpu.ToDevice(DataDevice::CPU);
+            AssertInFastLLM((int)idsCpu.Count(0) == verifyTokens + seqLens[verifyRows],
+                            "PDMIX mixed input ids are invalid.\n");
+            const float *idsPtr = (const float*)idsCpu.cpuData;
+            std::vector<float> verifyIds(idsPtr, idsPtr + verifyTokens);
+            Data verifyInputIds(DataType::FLOAT32, {1, verifyTokens}, verifyIds);
+            pdMixTail = PdMixTail();
+            pdMixTail.active = true;
+            pdMixTail.ctx = contexts[verifyRows];
+            pdMixTail.ids.assign(idsPtr + verifyTokens,
+                                 idsPtr + verifyTokens + seqLens[verifyRows]);
+            pdMixTail.mask = verifyRows < (int)attentionMask.size() ?
+                attentionMask[verifyRows] : nullptr;
+            pdMixTail.position = positionIds[verifyRows];
+            pdMixTail.len = seqLens[verifyRows];
+            pdMixTail.pastKeyValues.assign(
+                pastKeyValues.begin() + verifyRows * block_cnt,
+                pastKeyValues.begin() + all * block_cnt);
+            pdMixTail.config = generationConfigs[verifyRows];
+            std::vector<ResponseContext*> verifyContexts(
+                contexts.begin(), contexts.begin() + verifyRows);
+            std::vector<Data*> verifyMasks(
+                attentionMask.begin(),
+                attentionMask.begin() + std::min(verifyRows, (int)attentionMask.size()));
+            std::vector<Data*> verifyPositions(
+                positionIds.begin(), positionIds.begin() + verifyRows);
+            std::vector<int> verifySeqLens(seqLens.begin(), seqLens.begin() + verifyRows);
+            std::vector<std::pair<Data*, Data*> > verifyKeyValues(
+                pastKeyValues.begin(), pastKeyValues.begin() + verifyRows * block_cnt);
+            std::vector<GenerationConfig> verifyConfigs(
+                generationConfigs.begin(), generationConfigs.begin() + verifyRows);
+            bool ok = false;
+            try {
+                ok = Qwen35MTPBatchForward(useGPUForward, verifyContexts, verifyInputIds,
+                    verifyMasks, verifyPositions, verifySeqLens, verifyKeyValues,
+                    verifyConfigs, acceptedTokens, nextInputTokens, keptInputLens,
+                    draftsPerStepOverride);
+            } catch (...) {
+                pdMixTail = PdMixTail();
+                throw;
+            }
+            const bool ran = pdMixTail.ran;
+            pdMixTail = PdMixTail();
+            // The prompt chunk was fed at selection; a silent fallback would
+            // re-run or drop it. Fail loudly instead.
+            AssertInFastLLM(ok && ran, "PDMIX mixed verify forward was rejected.\n");
+            acceptedTokens.resize(all);
+            nextInputTokens.resize(all);
+            keptInputLens.resize(all, seqLens[verifyRows]);
+            acceptedTokens[verifyRows].clear();
+            nextInputTokens[verifyRows].clear();
+            keptInputLens[verifyRows] = seqLens[verifyRows];
+            return true;
+        }
         const int batch = (int)contexts.size();
         if (!useGPUForward || batch < 1 ||
             (int)seqLens.size() != batch ||
@@ -21180,12 +24572,14 @@ namespace fastllm {
         }
         const int configuredDraftsPerStep = useDFlash ?
             DFlashDraftsPerStep() : Qwen35MtpDraftsPerStep();
-        if (configuredDraftsPerStep <= 0) {
+        const int requestedDraftsPerStep = draftsPerStepOverride < 0 ? configuredDraftsPerStep :
+            std::min(configuredDraftsPerStep, std::max(1, draftsPerStepOverride));
+        if (requestedDraftsPerStep <= 0) {
             return false;
         }
         if (useDFlash ?
-                !CanUseQwen35DFlashBatchForward(configuredDraftsPerStep) :
-                !CanUseQwen35MTPBatchForward(configuredDraftsPerStep)) {
+                !CanUseQwen35DFlashBatchForward(requestedDraftsPerStep) :
+                !CanUseQwen35MTPBatchForward(requestedDraftsPerStep)) {
             return false;
         }
         // The fused target-validation kernels keep a bounded per-token prefix.
@@ -21193,7 +24587,7 @@ namespace fastllm {
         // the supported prefix instead of falling back to plain decode or
         // serializing every request.
         const int draftsPerStep = std::min(
-            configuredDraftsPerStep, QWEN35_MTP_PREFIX_SNAPSHOT_MAX);
+            requestedDraftsPerStep, QWEN35_MTP_PREFIX_SNAPSHOT_MAX);
         int totalTokens = 0;
         int captureSlots = 0;
         bool allSimpleGreedy = true;
@@ -21214,8 +24608,10 @@ namespace fastllm {
         // The DFlash CUDA rejection kernel batches homogeneous sampling rows.
         // A mixed greedy/sampling group remains correct through the scheduler's
         // ordinary target-only fallback.
+        const bool dflashMixedVerify = useDFlash && !allSimpleGreedy && !allSampling &&
+            Qwen35DFlashMixedVerifyEnabled();
         if (captureSlots <= 0 ||
-            (useDFlash && !allSimpleGreedy && !allSampling)) {
+            (useDFlash && !allSimpleGreedy && !allSampling && !dflashMixedVerify)) {
             return false;
         }
 
@@ -21230,6 +24626,28 @@ namespace fastllm {
         const int rootDevice = devices[0];
 
         std::lock_guard<std::mutex> mtpCacheGuard(mtpCacheMutex);
+        struct PdMixBatchProfile {
+            bool on;
+            int rows;
+            std::chrono::steady_clock::time_point begin;
+            long long targetUs = 0, seedUs = 0;
+            int promptTokens = 0;
+            // No clock reads unless the profile is on.
+            std::chrono::steady_clock::time_point Now() const {
+                return on ? std::chrono::steady_clock::now() :
+                            std::chrono::steady_clock::time_point();
+            }
+            void Add(long long &acc, std::chrono::steady_clock::time_point from) const {
+                if (on) acc += Qwen35MtpProfileElapsedUs(from, std::chrono::steady_clock::now());
+            }
+            ~PdMixBatchProfile() {
+                if (!on) return;
+                printf("[PDMIX-PROFILE] batch_forward rows=%d prompt_tokens=%d target_ms=%.1f seed_ms=%.1f total_ms=%.1f\n",
+                       rows, promptTokens, targetUs / 1000.0, seedUs / 1000.0,
+                       Qwen35MtpProfileElapsedUs(begin, std::chrono::steady_clock::now()) / 1000.0);
+            }
+        } pdMixBatchProfile{Qwen35PdMixProfileEnabled(), batch};
+        pdMixBatchProfile.begin = pdMixBatchProfile.Now();
         std::vector<MtpKvCache*> requestMtpCaches(batch, nullptr);
         std::vector<DFlashContext*> requestDFlashContexts(batch, nullptr);
         for (int b = 0; b < batch; b++) {
@@ -21669,6 +25087,8 @@ namespace fastllm {
             (tensorParallel || batch <= QWEN35_MTP_PREFIX_SNAPSHOT_BATCH_MAX);
         const bool useLinearReplay = useDFlash && !useLinearPrefixSnapshots &&
             Qwen35DFlashBatchPrefixSnapshotsEnabled();
+        AssertInFastLLM(!pdMixTail.active || useLinearReplay,
+                        "PDMIX needs the compact replay rollback.\n");
         if (useLinearReplay) {
             dflashLinearReplay.resize(block_cnt);
             for (int layer = 0; layer < block_cnt; layer++) {
@@ -21689,7 +25109,11 @@ namespace fastllm {
                             !state->cudaDataBorrowed && !state->directMemory &&
                             state->extraCudaData.empty() && state->extraCudaHalfData.empty();
                     }
-                    if (canExchange) entry->stateOutputs.resize(batch, nullptr);
+                    // PDMIX rows run the ragged kernel, which updates states in
+                    // place; the backups must be real copies. PD_GDN_SWAP: the split
+                    // verify kernel takes the decode-round output buffers instead.
+                    if (canExchange && (!pdMixTail.active || Qwen35PdGdnSwapEnabled()))
+                        entry->stateOutputs.resize(batch, nullptr);
                 }
             }
         }
@@ -22022,7 +25446,7 @@ namespace fastllm {
         speculativeCaptureDFlashHiddenStates = useDFlash;
         speculativeDFlashSamplingContext = nullptr;
         speculativeDFlashSamplingContexts =
-            useDFlash && allSampling ? requestDFlashContexts :
+            useDFlash && (allSampling || dflashMixedVerify) ? requestDFlashContexts :
                                       std::vector<DFlashContext*>();
         speculativeLinearStateCaptureSlots = linearCaptureSlots;
         speculativeMtpAccepted.clear();
@@ -22038,9 +25462,50 @@ namespace fastllm {
         speculativeHiddenStates.expansionDims.clear();
         std::vector<int> targetRet;
         try {
+            if (pdMixTail.active) {
+                Data idsCpu;
+                idsCpu.CopyFrom(inputIds);
+                idsCpu.ToDevice(DataDevice::CPU);
+                std::vector<float> mixedIds((const float*)idsCpu.cpuData,
+                                            (const float*)idsCpu.cpuData + totalTokens);
+                mixedIds.insert(mixedIds.end(), pdMixTail.ids.begin(), pdMixTail.ids.end());
+                Data mixedInputIds(DataType::FLOAT32, {1, (int)mixedIds.size()}, mixedIds);
+                std::vector<Data*> mixedMasks(attentionMask.begin(),
+                    attentionMask.begin() + std::min(batch, (int)attentionMask.size()));
+                mixedMasks.resize(batch, nullptr);
+                mixedMasks.push_back(pdMixTail.mask);
+                std::vector<Data*> mixedPositions(positionIds.begin(), positionIds.begin() + batch);
+                mixedPositions.push_back(pdMixTail.position);
+                std::vector<int> mixedSeqLens(seqLens.begin(), seqLens.begin() + batch);
+                mixedSeqLens.push_back(pdMixTail.len);
+                std::vector<std::pair<Data*, Data*> > mixedKeyValues(
+                    pastKeyValues.begin(), pastKeyValues.begin() + batch * block_cnt);
+                mixedKeyValues.insert(mixedKeyValues.end(),
+                    pdMixTail.pastKeyValues.begin(), pdMixTail.pastKeyValues.end());
+                std::vector<GenerationConfig> mixedConfigs(
+                    generationConfigs.begin(), generationConfigs.begin() + batch);
+                mixedConfigs.push_back(pdMixTail.config);
+                struct PdMixTokensReset {
+                    int &value;
+                    ~PdMixTokensReset() { value = 0; }
+                } pdMixTokensReset{pdMixVerifyTokens};
+                // Ragged branch, no per-position snapshots: rollback uses replay.
+                speculativeCaptureFirstTokenLinearState = false;
+                pdMixVerifyTokens = totalTokens;
+                const auto targetBegin = pdMixBatchProfile.Now();
+                targetRet = ForwardGPU(batch + 1, mixedInputIds, mixedMasks, mixedPositions,
+                                       mixedSeqLens, mixedKeyValues, mixedConfigs,
+                                       LastTokensManager(), nullptr);
+                pdMixBatchProfile.Add(pdMixBatchProfile.targetUs, targetBegin);
+                pdMixBatchProfile.promptTokens = pdMixTail.len;
+                pdMixTail.ran = true;
+            } else {
+            const auto targetBegin = pdMixBatchProfile.Now();
             targetRet = ForwardGPU(batch, inputIds, attentionMask, positionIds,
                                    seqLens, pastKeyValues, generationConfigs,
                                    LastTokensManager(), nullptr);
+            pdMixBatchProfile.Add(pdMixBatchProfile.targetUs, targetBegin);
+            }
         } catch (const Qwen35MtpBatchFastPathUnavailable &) {
             speculativeCaptureLinearReplay = oldCaptureReplay;
             speculativeLinearStateCaptureSlots = oldCaptureSlots;
@@ -22148,6 +25613,35 @@ namespace fastllm {
                           tokenOffsets[b], tokenOffsets[b] + commitLens[b],
                           committedDFlashHidden[b][feature]);
                 }
+            }
+            if (pdMixTail.active) {
+                // Draft K/V for the prompt chunk, the same contract as the
+                // chunked-prefill cache-only seed: no head, no proposal.
+                const auto seedBegin = pdMixBatchProfile.Now();
+                auto promptIt = dflashContexts.find(pdMixTail.ctx);
+                const int expected = pdMixTail.ctx->cacheLen +
+                    pdMixTail.ctx->preTokens - pdMixTail.len;
+                if (promptIt == dflashContexts.end() && expected == 0) {
+                    promptIt = dflashContexts.emplace(pdMixTail.ctx, DFlashContext()).first;
+                }
+                AssertInFastLLM(promptIt != dflashContexts.end() &&
+                                promptIt->second.committedTokens == expected,
+                                "PDMIX prompt DFlash cache is not aligned.\n");
+                std::vector<Data> promptHidden(speculativeDFlashHiddenStates.size());
+                for (int feature = 0;
+                     feature < (int)speculativeDFlashHiddenStates.size(); feature++) {
+                    Split(speculativeDFlashHiddenStates[feature], 1, totalTokens,
+                          totalTokens + pdMixTail.len, promptHidden[feature]);
+                }
+                std::vector<Data> verifyHidden;
+                verifyHidden.swap(speculativeDFlashHiddenStates);
+                speculativeDFlashHiddenStates = std::move(promptHidden);
+                AppendDFlashTargetHidden(Qwen35DFlashDraftDeviceOr(devices),
+                                         pdMixTail.len, promptIt->second);
+                speculativeDFlashHiddenStates.swap(verifyHidden);
+                AssertInFastLLM(promptIt->second.committedTokens == expected + pdMixTail.len,
+                                "PDMIX prompt DFlash cache length mismatch.\n");
+                pdMixBatchProfile.Add(pdMixBatchProfile.seedUs, seedBegin);
             }
         } else {
             // Sharded sampling may leave the current device on the last rank.
@@ -22312,6 +25806,14 @@ namespace fastllm {
                                 speculativeLinearStates[layer][rollbackSlotBase + b].first, device);
                             initialValues[b] = getLocalCache(
                                 speculativeLinearStates[layer][rollbackSlotBase + b].second, device);
+                        }
+                        if (pdMixTail.active) {
+                            // The ragged kernel leaves states in [K,V] layout.
+                            for (int b = 0; b < batch; b++) {
+                                AssertInFastLLM(
+                                    Qwen35EnsureCudaLinearAttnStateTransposed(*values[b]),
+                                    "PDMIX state transpose failed.\n");
+                            }
                         }
                         if (!cache.ready || !FastllmCudaDFlashRestoreLinearPrefixes(
                                 cache.input, cache.conv, cache.ba,
@@ -22523,7 +26025,8 @@ namespace fastllm {
                 speculativeDFlashHiddenStates =
                     std::move(committedDFlashHidden[b]);
                 AppendDFlashTargetHidden(
-                    rootDevice, commitLen, *requestDFlashContexts[b]);
+                    Qwen35DFlashDraftDeviceOr(devices), commitLen,
+                    *requestDFlashContexts[b]);
                 if (!Qwen35DFlashCommitEndsRequest(
                         *this, contexts[b], acceptedTokens[b]) &&
                     Qwen35DFlashDraftFitsContext(
@@ -22539,8 +26042,11 @@ namespace fastllm {
             if (!activeIndices.empty()) {
                 std::vector<std::vector<int> > activeDrafts =
                     RunDFlashDraftBatch(
-                        rootDevice, devices, activeAnchors,
-                        activeConfigs, activeContexts);
+                        Qwen35DFlashDraftDeviceOr(devices),
+                        Qwen35DFlashDraftDevicesOrDefault(devices),
+                        activeAnchors,
+                        activeConfigs, activeContexts,
+                        draftsPerStepOverride < 0 ? -1 : draftsPerStep);
                 AssertInFastLLM(
                     activeDrafts.size() == activeIndices.size(),
                     "Qwen3.5 batched DFlash draft returned invalid batch.\n");
@@ -22697,7 +26203,8 @@ namespace fastllm {
         }
 
         long long validations = mtpValidationCount.load(std::memory_order_relaxed);
-        if (validations > 0 && validations % QWEN35_MTP_LOG_INTERVAL == 0) {
+        if (validations > 0 &&
+            validations % QWEN35_MTP_LOG_INTERVAL == 0) {
             printf("[Qwen3.5 %s] pos_accept_rate=[",
                    useDFlash ? "DFlash2" : "MTP");
             for (int pos = 0; pos < draftsPerStep; pos++) {
@@ -22768,6 +26275,9 @@ namespace fastllm {
         const bool useMtpBatchScheduling = mtpSchedulerLanes > 1;
         const int mtpBatchDecodeTokens = std::min(
             mtpDraftsPerStep + 1, QWEN35_MTP_FAST_SEQ_MAX);
+        Qwen35AdaptiveSpecPolicy adaptiveSpecPolicy(mtpDraftsPerStep, schedulerUsesDFlash);
+        int schedulerDraftsPerStep = mtpDraftsPerStep;
+        int schedulerBatchDecodeTokens = mtpBatchDecodeTokens;
         int prefillChunkSize = model->GetChunkedPrefillSize();
 
         auto releasePagedCachePages = [](Data &cache, bool clearDims = false) {
@@ -22822,6 +26332,7 @@ namespace fastllm {
             if (ctx == nullptr) {
                 return;
             }
+            model->ResetPersistentPrefixRestore(ctx);
             for (int i = 0; i < model->block_cnt && i < (int)ctx->pastKeyValues.size(); i++) {
                 releasePagedCachePages(ctx->pastKeyValues[i].first, true);
                 releasePagedCachePages(ctx->pastKeyValues[i].second, true);
@@ -22829,6 +26340,7 @@ namespace fastllm {
             eraseMtpCache(ctx);
             ctx->currentTokens = ctx->allTokens;
             ctx->preTokens = 0;
+            ctx->prefillRemain = (int)ctx->allTokens.size();
             ctx->cacheLen = 0;
             ctx->intParams.clear();
         };
@@ -22843,7 +26355,7 @@ namespace fastllm {
                 tokens = std::min(tokens, std::max(1, std::min(remaining, model->kvMemConfig.prefillTokens)));
             }
             if (useMtpBatchScheduling && ctx->preTokens > 0 && tokens > 1) {
-                tokens = std::min(tokens, mtpBatchDecodeTokens);
+                tokens = std::min(tokens, schedulerBatchDecodeTokens);
             }
             return tokens;
         };
@@ -23117,7 +26629,9 @@ namespace fastllm {
             return needs;
         };
 
-        auto hasPagedManagerShortage = [](const std::map<PagedCacheManager*, int> &needs) -> bool {
+        auto hasPagedManagerShortage = [&](const std::map<PagedCacheManager*, int> &needs,
+                                           bool *capacityUnavailable = nullptr) -> bool {
+            if (capacityUnavailable) *capacityUnavailable = false;
             for (auto &it : needs) {
                 PagedCacheManager *manager = it.first;
                 if (manager == nullptr || it.second <= 0) {
@@ -23129,7 +26643,32 @@ namespace fastllm {
                     freePages = manager->FreePageCount();
                 }
                 if (freePages < it.second) {
-                    return true;
+                    // A deferred-recycle pool cannot make progress by merely
+                    // observing FreePageCount: trie pages are deliberately
+                    // excluded until their migration lease is acknowledged.
+                    // Dispatch the missing victim transfers here, then retry
+                    // the scheduler after the spill worker completes D2H and
+                    // CommitL2.  PrepareFreePages is idempotent while tickets
+                    // are in flight and never waits while holding the manager
+                    // lock.
+                    try {
+                        manager->PrepareFreePages(it.second);
+                    } catch (...) {
+                        // Keep the original shortage semantics.  The next
+                        // scheduler iteration may observe a completed ticket
+                        // or a fail-closed capacity condition.
+                    }
+                    {
+                        std::lock_guard<std::mutex> guard(manager->pageIndexLocker);
+                        freePages = manager->FreePageCount();
+                    }
+                    if (freePages < it.second) {
+                        if (capacityUnavailable &&
+                            manager->DeferredRecycleCapacityUnavailable(it.second)) {
+                            *capacityUnavailable = true;
+                        }
+                        return true;
+                    }
                 }
             }
             return false;
@@ -23234,13 +26773,33 @@ namespace fastllm {
         };
 
         auto tryRestorePrefixCache = [&](ResponseContext *ctx) -> int {
-            // Restoring text-only KV here makes Qwen35ForwardMultimodal take
-            // its decode branch, skipping vision encoding and chunked prefill.
-            // Media-aware cache keys and position state are required first.
-            if (model->kvMemConfig.enabled || ctx == nullptr || !ctx->multimodalInput.empty() ||
+            if (model->kvMemConfig.enabled || ctx == nullptr || !ctx->CanUsePagedPrefixCache() ||
                 ctx->cacheLen != 0 || ctx->currentTokens.empty()) {
                 return 0;
             }
+            // A resumable media prompt mid-chunk keeps cacheLen 0 and its whole prompt in
+            // currentTokens, so the lookup matched the pages its own checkpoints had just
+            // recorded (accept12: request 2 adopted 6144 of 8191 tokens mid-prompt, the
+            // stored whole-image features no longer matched the suffix mm types, assert
+            // qwen3_5.cpp MergeMultimodalFeaturesIntoText). Look up a prefix only before
+            // the request computed anything, as vLLM 83c078d955
+            // v1/core/sched/scheduler.py:1076 ("if request.num_computed_tokens == 0:").
+            {
+                auto cur = ctx->intParams.find("mm_embedding_cursor");
+                if (!ctx->multimodalInput.empty() && cur != ctx->intParams.end() && cur->second > 0) {
+                    static std::atomic<bool> noRestoreLogged{false};
+                    if (!noRestoreLogged.exchange(true)) {
+                        printf("[MM-RESUME-NORESTORE] request=%llu cursor=%d\n",
+                               (unsigned long long)ctx->requestId, cur->second);
+                        fflush(stdout);
+                    }
+                    return 0;
+                }
+            }
+#if defined(FASTLLM_DISK_PREFIX_CACHE)
+            model->PreparePersistentPrefixCache(ctx);
+            if (model->PersistentPrefixRestorePending(ctx)) return -2;
+#endif
             auto probeRefs = model->GetPagedKVCacheManagers(model->kvCacheId, true);
             PagedCacheManager *probeManager = nullptr;
             for (auto &ref : probeRefs) {
@@ -23254,11 +26813,17 @@ namespace fastllm {
             }
 
             std::map<PagedCacheManager*, std::vector<int> > queriedPages;
+            struct QueryLeases {
+                decltype(queriedPages) &pages;
+                ~QueryLeases() {
+                    for (auto &entry : pages) entry.first->ReleasePageIndices(entry.second);
+                }
+            } queryLeases{queriedPages};
             auto queryManager = [&](PagedCacheManager *manager) -> std::vector<int>& {
                 auto it = queriedPages.find(manager);
                 if (it == queriedPages.end()) {
                     std::vector<int> pages;
-                    manager->Query(ctx->currentTokens, pages);
+                    manager->Query(ctx->currentTokens, pages, ctx->PrefixCachePageKeys(), nullptr, true);
                     it = queriedPages.emplace(manager, std::move(pages)).first;
                 }
                 return it->second;
@@ -23417,13 +26982,50 @@ namespace fastllm {
                     return -1;
                 }
             }
+            // The restore/promotion transaction held temporary refs until the
+            // scheduler Pick calls above completed. Release only now, after
+            // every K/V layer and rank has its request-owned page references.
+            model->ReleasePagedPrefixRestoreOwners(ctx);
             ctx->currentTokens.erase(
                 ctx->currentTokens.begin(),
                 ctx->currentTokens.begin() + cachedLen);
             ctx->cacheLen = cachedLen;
+            ctx->prefillRemain = (int)ctx->currentTokens.size();
+#if defined(FASTLLM_DISK_PREFIX_CACHE)
+            model->OnPersistentPrefixRestored(ctx);
+#endif
+            {
+                const int inputTokens = std::max(1, ctx->inputTokens);
+                // 【监控口径统一】
+                // tier=L1(GPU) = 显存页池命中：不碰主机内存、不碰 SSD。
+                // 同格式另见 L2（`qwen3_5_persistent.inc:1485`）与 L3（同文件 `:1492`）。
+                bool reportL1 =
+                    ctx->prefixRestore.tier != PrefixCacheRestoreStatus::Host &&
+                    ctx->prefixRestore.tier != PrefixCacheRestoreStatus::SSD;
+#if defined(FASTLLM_DISK_PREFIX_CACHE)
+                // The persistent adapter already reports the actual adopted
+                // tier once. Report here only when that adapter is absent.
+                reportL1 = reportL1 && !model->persistentPrefixCache;
+#endif
+                if (reportL1) {
+                    PrefixCacheInfo("[PrefixCache] hit: tier=L1(GPU) tokens=%d input=%d rate=%.1f%% image=%d.\n",
+                           cachedLen, ctx->inputTokens, 100.0 * cachedLen / inputTokens,
+                           ctx->multimodalInput.empty() ? 0 : 1);
+                    ctx->progressL1Tokens = std::max(ctx->progressL1Tokens, cachedLen);
+                    ctx->cacheSegments.clear();
+                    PrefixCacheObservationSegment segment;
+                    segment.sourceTier = "L1";
+                    segment.promotedTo = "NONE";
+                    segment.sourceTokens = cachedLen;
+                    segment.effectiveReusedTokens = cachedLen;
+                    ctx->cacheSegments.push_back(segment);
+                    FastllmEvent("cache", ctx->requestId, "cache_result",
+                                 "source_tier=L1 promoted_to=NONE source_tokens=%d "
+                                 "effective_reused_tokens=%d", cachedLen, cachedLen);
+                }
+            }
             if (model->verbose) {
-                printf("[Qwen3.5 MTP] prefix cache hit: tokens=%d.\n", cachedLen);
-                fflush(stdout);
+                PrefixCacheDebug("[Qwen3.5 MTP] prefix cache hit: tokens=%d.\n", cachedLen);
             }
             return cachedLen;
         };
@@ -23767,7 +27369,47 @@ namespace fastllm {
             }
             return gpuTokenHandoffPendingCanChain;
         };
+        const bool bp2ObservabilityDebug = FastllmObservabilityDebugEnabled();
+        // PDMIX holds a text prompt until a chunked resume round, so it needs
+        // resume (else the prompt never runs) and MM_DECODE_BATCH (else a decoding
+        // media row turns resume off every round). Without them the flag is off.
+        const bool pdMixRequested = Qwen35PdMixEnabled();
+        const bool pdMixEnabled = pdMixRequested &&
+            (Qwen35BatchPrefillEnabled() || Qwen35MultiPrefillEnabled() ||
+             Qwen35ResumePackEnabled() || Qwen35ChunkPrefillEnabled()) &&
+            Qwen35MmDecodeBatchEnabled() && !Qwen35MixedRowsEnabled() &&
+            !gpuTokenHandoffConfigured && !model->kvMemConfig.enabled;
+        if (pdMixRequested && !pdMixEnabled) {
+            printf("[PDMIX] FASTLLM_QWEN35_PD_MIX=1 ignored: needs chunked resume "
+                   "(CHUNK_PREFILL, BATCH_PREFILL, MULTI_PREFILL or RESUME_PACK), "
+                   "MM_DECODE_BATCH=1, MIXED_ROWS off, GPU token handoff off and KVMem off.\n");
+        }
+        const bool pdAltEnabled = pdMixEnabled && Qwen35PdAltEnabled();
+        if (pdAltEnabled) {
+            printf("[PDMIX] alternate schedule on (decode-only and prompt-only rounds), chunk cap %d.\n",
+                   Qwen35PdMixChunkMax());
+        }
+        bool pdMixSkipRound = false;
+        bool pdAltNextDecode = true;
+        const int pdMixDecodeRounds = pdMixEnabled && !pdAltEnabled ? Qwen35PdMixDecodeRounds() : 0;
+        if (pdMixDecodeRounds > 0) {
+            printf("[PDMIX] %d decode-only rounds after each mixed round.\n", pdMixDecodeRounds);
+        }
+        int pdMixDecodeLeft = 0;
+        const bool pdMixImage = pdMixEnabled && Qwen35PdMixImageEnabled() &&
+            model->CanUseGPUForward();
+        if (pdMixImage) {
+            printf("[PDMIX] image prompts: one resumable chunk per round, decode rounds between.\n");
+        }
+        bool pdImgNextDecode = false;
         while (true) {
+            uint64_t schedulerRoundId = 0;
+            uint64_t schedulerRoundObservationNs = 0;
+            if (bp2ObservabilityDebug) {
+                schedulerRoundId = model->observabilitySchedulerRoundId.fetch_add(
+                    1, std::memory_order_relaxed) + 1;
+                schedulerRoundObservationNs = FastllmObservationTimestampNs();
+            }
             if (model->isFree) {
                 clearGpuTokenHandoffPending(true);
                 break;
@@ -23791,9 +27433,32 @@ namespace fastllm {
             int selectedPrefillTokens = 0;
             const int batchedPrefillTokenLimit =
                 model->GetBatchedPrefillTokenLimit();
+            // 实验：长 prompt 分块预填并进批路径（默认关）。
+            bool mixedRowsEnabled = Qwen35MixedRowsEnabled();
+            // Mixed rows and the GPU token handoff build positions without the
+            // mrope delta, so the flag applies only when both are off.
+            const bool mmDecodeBatch = Qwen35MmDecodeBatchEnabled() &&
+                !mixedRowsEnabled && !gpuTokenHandoffConfigured;
+            const bool mmOneChunkPerRound = Qwen35MmOneChunkPerRoundEnabled();
+            const bool resumePackEnabled = Qwen35ResumePackEnabled();
+            const bool multiPrefillEnabled = Qwen35MultiPrefillEnabled() || resumePackEnabled;
+            // CHUNKC8: resuming one prompt does not opt fresh rows into packed prefill.
+            const bool batchPrefillAdmissionEnabled = Qwen35BatchPrefillEnabled() ||
+                multiPrefillEnabled || mixedRowsEnabled;
+            bool batchPrefillResume = batchPrefillAdmissionEnabled ||
+                Qwen35ChunkPrefillEnabled();
+            const int batchPrefillChunkCap = schedulerUsesDFlash && !Qwen35ChunkWideEnabled() ?
+                std::max(1, std::min(prefillChunkSize,
+                                     QWEN35_DFLASH_LONG_PREFILL_CHUNK_SIZE)) :
+                prefillChunkSize;
             bool selectedNeedLastTokens = false;
             bool selectedIsPrompt = false;
+            bool selectedHasPrefill = false;
+            bool selectedHasDecode = false;
+            bool mixedRowsSelected = false;
+            int selectedDecodeTokens = 0;
             bool selectedMultimodal = false;
+            std::vector<unsigned char> rowIsPrompt;
             bool prefillPageCapacityBlocked = false;
             std::map<PagedCacheManager*, int> selectedPrefillPageNeeds;
             std::map<PagedCacheManager*, int> selectedDecodePageNeeds;
@@ -23808,11 +27473,89 @@ namespace fastllm {
             handles.reserve(mtpSchedulerLanes);
             generationConfigs.reserve(mtpSchedulerLanes);
             tokenContexts.reserve(mtpSchedulerLanes);
+            rowIsPrompt.reserve(mtpSchedulerLanes);
             logits.reserve(mtpSchedulerLanes);
             decodePositionValues.reserve(mtpSchedulerLanes);
             decodePositionIds.reserve(mtpSchedulerLanes);
 
+            RequestDiagnosticBatchOperation diagnosticDictWait(RequestDiagnosticHandlesForModel(model),
+                "scheduler_dict_lock_wait", RequestDiagnosticResource("model.dictLocker", &model->dictLocker).c_str());
             std::unique_lock<std::mutex> dictLocker(model->dictLocker);
+            diagnosticDictWait.Finish();
+            RequestDiagnosticBatchOperation diagnosticSelect(RequestDiagnosticHandlesForModel(model),
+                "scheduler_select", RequestDiagnosticResource("model.dictLocker", &model->dictLocker).c_str());
+            // The experimental chunked path updates the text-token cursor on
+            // each partial forward. Multimodal forwarding owns an additional
+            // image/video embedding cursor; BP3 opts in only for a GPU-capable
+            // long-media request, while media still clears mixed-row mode.
+            // PDMIX: a media context whose prompt is done decodes as a text row
+            // (MM_DECODE_BATCH) and keeps chunked resume on. A pending media prompt
+            // still turns resume off for this round; with the single phase rule a
+            // text prompt mid-chunk stays a prompt and waits for a resume round.
+            // PD_MIX_IMAGE keeps resume on (media chunked one per round) only while a
+            // decode row waits or a media prompt is already mid-chunk; otherwise the
+            // media prompt takes the old resume-off path unchanged.
+            bool pdImgKeepResume = false;
+            if (pdMixImage && batchPrefillResume) {
+                for (const auto &pending : model->responseContextDict.dicts) {
+                    const ResponseContext *c = pending.second;
+                    if (c == nullptr || c->isEnding) continue;
+                    if (c->prefillRemain <= 0 && c->preTokens != 0) pdImgKeepResume = true;
+                    if (Qwen35MmSoloChunk() > 0 && !c->multimodalInput.empty() &&
+                        c->prefillRemain > Qwen35MmSoloChunk()) pdImgKeepResume = true;
+                    auto cur = c->intParams.find("mm_embedding_cursor");
+                    if (!c->multimodalInput.empty() && cur != c->intParams.end() && cur->second > 0)
+                        pdImgKeepResume = true;
+                }
+            }
+            if (pdMixEnabled && batchPrefillResume) {
+                for (const auto &pending : model->responseContextDict.dicts) {
+                    const ResponseContext *c = pending.second;
+                    if (c == nullptr || c->multimodalInput.empty()) continue;
+                    mixedRowsEnabled = false;
+                    if (c->isEnding) continue;
+                    if (mmDecodeBatch && c->prefillRemain <= 0 && c->preTokens != 0) continue;
+                    if (pdImgKeepResume) continue;
+                    batchPrefillResume = false;
+                    break;
+                }
+            }
+            if (batchPrefillResume && !pdMixEnabled) {
+                for (const auto &pending : model->responseContextDict.dicts) {
+                    if (pending.second != nullptr &&
+                        !pending.second->multimodalInput.empty()) {
+                        mixedRowsEnabled = false;
+                        // A media row decides below whether it is resumable; do not
+                        // let a short second media request change the phase of another
+                        // context that is already mid-prefill.
+                        if (!mmOneChunkPerRound || !model->CanUseGPUForward()) {
+                            batchPrefillResume = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            // Mixed rounds run decode rows target-only (one token, no DFlash).
+            // Use them only while a text prefill is actually waiting, so a
+            // decode-only round keeps the established speculative path.
+            if (mixedRowsEnabled) {
+                bool textPrefillWaiting = false;
+                for (const auto &pending : model->responseContextDict.dicts) {
+                    const ResponseContext *pendingCtx = pending.second;
+                    if (pendingCtx != nullptr && !pendingCtx->isEnding &&
+                        pendingCtx->multimodalInput.empty() &&
+                        // batchPrefillResume is on whenever mixed rows are, and
+                        // decoding contexts keep preTokens == 0 on that path.
+                        pendingCtx->prefillRemain > 0) {
+                        textPrefillWaiting = true;
+                        break;
+                    }
+                }
+                if (!textPrefillWaiting) {
+                    mixedRowsEnabled = false;
+                    batchPrefillResume = Qwen35BatchPrefillEnabled();
+                }
+            }
             auto &forwardLocker = model->forwardLocker;
             std::vector<int> forcedGpuTokenHandoffHandles;
             std::set<int> gpuTokenHandoffDiscardedCacheHandles;
@@ -23835,6 +27578,11 @@ namespace fastllm {
             }
 
             std::vector<int> abortHandles;
+            std::vector<int> removedHandles;
+            int waitingCount = 0;
+            int prefillCount = 0;
+            int decodeCount = 0;
+            int readyCount = 0;
             int busyPages = 0;
             int currentActivate = 0;
             bool hasPrefill = false;
@@ -23846,20 +27594,44 @@ namespace fastllm {
             std::vector<DecodeOrder> orders;
             orders.reserve(model->responseContextDict.dicts.size());
 
+            schedulerDraftsPerStep = mtpDraftsPerStep;
+            schedulerBatchDecodeTokens = mtpBatchDecodeTokens;
+            if (adaptiveSpecPolicy.Enabled()) {
+                int adaptiveDecodeRows = 0;
+                for (auto &it : model->responseContextDict.dicts) {
+                    ResponseContext *ctx = it.second;
+                    if (ctx == nullptr || ctx->isAbort || ctx->isEnding) continue;
+                    const bool needsPrefill = (batchPrefillResume || pdMixEnabled) ?
+                        (ctx->prefillRemain > 0) : (ctx->preTokens == 0);
+                    if (!needsPrefill) ++adaptiveDecodeRows;
+                }
+                adaptiveDecodeRows = std::min(adaptiveDecodeRows, mtpSchedulerLanes);
+                schedulerDraftsPerStep = adaptiveSpecPolicy.Choose(adaptiveDecodeRows, mtpDraftsPerStep);
+                schedulerBatchDecodeTokens = std::min(schedulerDraftsPerStep + 1, mtpBatchDecodeTokens);
+            }
+
             for (auto &it : model->responseContextDict.dicts) {
                 ResponseContext *ctx = it.second;
                 if (ctx == nullptr) {
                     continue;
                 }
+                if (bp2ObservabilityDebug) {
+                    if (ctx->observabilityArrivalNs == 0)
+                        ctx->observabilityArrivalNs = ctx->nativeGeneration.createdNs;
+                    if (ctx->observabilityEnqueueNs == 0)
+                        ctx->observabilityEnqueueNs = ctx->nativeGeneration.createdNs;
+                    if (ctx->observabilityReadyNs == 0)
+                        ctx->observabilityReadyNs = schedulerRoundObservationNs;
+                }
                 if (ctx->isAbort) {
-                    if (gpuTokenHandoffDiscardedCacheHandles.find(it.first) ==
-                        gpuTokenHandoffDiscardedCacheHandles.end()) {
-                        ctx->TryRecordPagedCache(model);
-                    }
+                    removedHandles.push_back(it.first);
+                    // Same rule as basellm: never publish an aborted prefix while
+                    // holding dictLocker; it can stall the scheduler for a long time.
                     abortHandles.push_back(it.first);
                     continue;
                 }
                 if (ctx->isEnding) {
+                    removedHandles.push_back(it.first);
                     for (int i = 0; i < model->block_cnt && i < (int)ctx->pastKeyValues.size(); i++) {
                         releasePagedCachePages(ctx->pastKeyValues[i].first);
                         releasePagedCachePages(ctx->pastKeyValues[i].second);
@@ -23867,12 +27639,31 @@ namespace fastllm {
                     eraseMtpCache(ctx);
                     continue;
                 }
-                if (ctx->preTokens > 0) {
+                const bool ctxNeedsPrefill = (batchPrefillResume || pdMixEnabled) ?
+                    (ctx->prefillRemain > 0) : (ctx->preTokens == 0);
+                if (!ctxNeedsPrefill) {
                     currentActivate++;
                 }
-                if (ctx->preTokens == 0) {
-                    hasPrefill = true;
+                if (ctxNeedsPrefill) {
+                    // FASTLLM_QWEN35_VISION_ASYNC: a prompt whose image encode is pending is not
+                    // schedulable this round, so it must not hold the decode rows back
+                    // (vLLM 83c078d955 v1/core/sched/scheduler.py:804-813).
+                    if (!model->VisionAsyncWait(ctx)) {
+                        hasPrefill = true;
+                    } else {
+                        static std::atomic<bool> pendingLogged{false};
+                        if (!pendingLogged.exchange(true)) {
+                            printf("[VISION-ASYNC] encode pending request=%llu: decode rows keep running\n",
+                                   (unsigned long long)ctx->requestId);
+                            fflush(stdout);
+                        }
+                    }
+                    waitingCount++;
+                    prefillCount++;
+                } else {
+                    decodeCount++;
                 }
+                readyCount++;
                 orders.push_back({-scheduledDecodeTokens(ctx), it.first, ctx});
             }
             for (int handle : abortHandles) {
@@ -23884,6 +27675,73 @@ namespace fastllm {
                 }
                 return a.handle < b.handle;
             });
+            // FASTLLM_QWEN35_RESTORE_DRAIN: consume finished SSD reads of every waiting
+            // prompt before any per-row skip rule. Otherwise a skipped row (e.g. text rows
+            // in a round turned resume-off by a media prompt) holds the single read worker
+            // and every later read waits until timeout (stab1 s2). vLLM 83c078d955 records
+            // finished loads every step for every request (scheduler.py:3375-3393) and drains
+            // KV-holding requests first (scheduler.py:1029-1031). Imported pages stay owned
+            // by adoptedGpuOwners until the row is selected.
+            if (Qwen35RestoreDrainEnabled()) {
+                for (const DecodeOrder &order : orders) {
+                    ResponseContext *c = order.context;
+                    if (c == nullptr || c->isEnding) continue;
+                    const bool needsPrefill = (batchPrefillResume || pdMixEnabled) ?
+                        (c->prefillRemain > 0) : (c->preTokens == 0);
+                    if (needsPrefill && model->PersistentPrefixRestorePending(c))
+                        model->PreparePersistentPrefixCache(c);
+                }
+            }
+            ResponseContext *pdShortCtx = nullptr;
+            if (pdMixEnabled && Qwen35PdShortFirstTokens() > 0) {
+                const int shortTokens = Qwen35PdShortFirstTokens();
+                auto isShort = [&](const ResponseContext *c) {
+                    return !c->isEnding && c->prefillRemain > 0 && c->prefillRemain <= shortTokens;
+                };
+                std::stable_partition(orders.begin(), orders.end(),
+                    [&](const DecodeOrder &order) { return isShort(order.context); });
+                for (const DecodeOrder &order : orders) {
+                    if (!isShort(order.context)) break;
+                    if (!model->VisionAsyncWait(order.context)) {
+                        pdShortCtx = order.context;
+                        break;
+                    }
+                }
+                if (pdShortCtx != nullptr) {
+                    pdMixDecodeLeft = 0;
+                    static std::atomic<bool> shortLogged{false};
+                    if (!shortLogged.exchange(true)) {
+                        printf("[PD-SHORT-FIRST] request=%llu remain=%d limit=%d\n",
+                               (unsigned long long)pdShortCtx->requestId, pdShortCtx->prefillRemain, shortTokens);
+                        fflush(stdout);
+                    }
+                }
+            }
+            // RESUME_PACK: one forward carries a fair share of every waiting prompt
+            // (vLLM 900b8b08 scheduler.py:753-767), page aligned for checkpoints.
+            int resumePackShare = 0;
+            if (resumePackEnabled && batchPrefillResume && !mixedRowsEnabled) {
+                int promptRows = 0;
+                for (const DecodeOrder &order : orders) {
+                    if (order.context->prefillRemain > 0 &&
+                        order.context->multimodalInput.empty()) ++promptRows;
+                }
+                promptRows = std::min(promptRows, mtpSchedulerLanes);
+                if (promptRows > 1) {
+                    const int sharePage = (int)fastllm::GetPageLen();
+                    resumePackShare = std::max(sharePage,
+                        std::min(batchPrefillChunkCap, batchedPrefillTokenLimit) /
+                            promptRows / sharePage * sharePage);
+                }
+                // Test only: run even a lone row at this chunk size.
+                if (const char *debugShare = std::getenv("FASTLLM_QWEN35_RESUME_PACK_DEBUG_SHARE")) {
+                    resumePackShare = std::atoi(debugShare);
+                }
+                // Fused prefill needs len > 1, so a one-token tail runs alone first
+                // instead of waiting behind the packed rows.
+                std::stable_partition(orders.begin(), orders.end(),
+                    [](const DecodeOrder &order) { return order.context->prefillRemain == 1; });
+            }
             bool gpuTokenHandoffHasWaitingPrefill =
                 gpuTokenHandoffPending && hasPrefill;
             if (!forcedGpuTokenHandoffHandles.empty()) {
@@ -23932,6 +27790,9 @@ namespace fastllm {
                             handoffIdlePrefillBatchQuietUs));
                 }
                 if (now < handoffIdlePrefillBatchDeadline) {
+                    diagnosticSelect.Finish();
+                    RequestDiagnosticBatchOperation diagnosticWait(RequestDiagnosticHandlesForModel(model),
+                        "scheduler_batch_collection_wait", "model.dictCV");
                     model->dictCV.wait_until(
                         dictLocker, handoffIdlePrefillBatchDeadline);
                     continue;
@@ -23943,10 +27804,13 @@ namespace fastllm {
                 std::chrono::steady_clock::time_point();
             handoffIdlePrefillBatchObservedSize = 0;
 
+            bool deferredSpillAdmission = false;
             if (totalPages > 0) {
                 PagedCacheManager *probeManager = findRuntimePagedManager();
                 if (probeManager != nullptr) {
                     std::lock_guard<std::mutex> guard(probeManager->pageIndexLocker);
+                    deferredSpillAdmission = probeManager->deferredRecycleEnabled &&
+                        static_cast<bool>(probeManager->onRecyclePage);
                     busyPages = probeManager->maxPages - probeManager->FreePageCount();
                     totalPages = probeManager->maxPages;
                     pageLen = probeManager->pageLen;
@@ -23961,8 +27825,15 @@ namespace fastllm {
             // Keep excess requests pending before prefill so the number of
             // resident request states cannot exceed the startup-validated MTP
             // scheduler capacity.
+            // The generic 80% soft throttle is useful when the page pool is
+            // the only tier, but it prevents a pending request from reaching
+            // the deferred-recycle admission path once L1 is intentionally
+            // full. With L2 enabled, let the request enter the per-manager
+            // capacity check; PrepareFreePages will migrate safe victims and
+            // keep the hard pool bound.
             bool canAddPrefill = currentActivate < mtpSchedulerLanes &&
-                ((pagesLimit > 0) ? (busyPages < pagesLimit) : true);
+                (deferredSpillAdmission || currentActivate == 0 ||
+                 pagesLimit <= 0 || busyPages < pagesLimit);
             bool gpuTokenHandoffAllRunnable =
                 !orders.empty() &&
                 (int)orders.size() <= mtpSchedulerLanes;
@@ -23982,7 +27853,141 @@ namespace fastllm {
                 hasPrefill = false;
             }
 
-            for (int isPrompt = 1; isPrompt >= 0 && seqLens.empty(); isPrompt--) {
+            const bool bp3DecodeFirst = mmOneChunkPerRound && batchPrefillResume &&
+                currentActivate > 0;
+            // PDMIX: every decode row (one DFlash width) verifies in the same
+            // forward as one non-final chunk of a resumed text prompt, as the
+            // vLLM 83c078d955 scheduler runs RUNNING rows first, then WAITING
+            // prefills in one step (v1/core/sched/scheduler.py:769-774, 1015-1040);
+            // the V2 runner maps per-request query and logits rows with draft tokens
+            // (v1/worker/gpu/model_runner.py:1398-1467). Final chunks keep the old order.
+            if (!hasPrefill) pdMixDecodeLeft = 0;
+            const bool pdMixDecodeTurn = pdMixDecodeLeft > 0 && hasPrefill && canAddPrefill &&
+                decodeCount > 0 && !prefillPageCapacityBlocked && !mixedRowsEnabled &&
+                !bp3DecodeFirst && forcedGpuTokenHandoffHandles.empty();
+            bool pdMixSelect = false;
+            bool pdMixRestoreSkipped = false;
+            ResponseContext *pdMixPromptCtx = nullptr;
+            int pdMixPromptTokens = 0;
+            if (pdMixEnabled && !pdAltEnabled && batchPrefillResume && schedulerUsesDFlash &&
+                !mixedRowsEnabled && !bp3DecodeFirst && !pdMixSkipRound && !pdMixDecodeTurn &&
+                forcedGpuTokenHandoffHandles.empty() && canAddPrefill && hasPrefill &&
+                decodeCount > 0 && decodeCount < mtpSchedulerLanes &&
+                !prefillPageCapacityBlocked) {
+                bool ok = true;
+                int width = -1, greedy = -1, verifyRows = 0;
+                for (const DecodeOrder &order : orders) {
+                    ResponseContext *c = order.context;
+                    if (c == nullptr || c->isEnding) continue;
+                    if (c->prefillRemain > 0) {
+                        if (pdMixPromptCtx == nullptr && !model->VisionAsyncWait(c)) pdMixPromptCtx = c;
+                        continue;
+                    }
+                    ++verifyRows;
+                    const int w = scheduledDecodeTokens(c);
+                    const int g = c->generationConfig.IsSimpleGreedy() ? 1 : 0;
+                    if (width < 0) width = w;
+                    if (greedy < 0) greedy = g;
+                    ok &= w == width && w >= 2 && g == greedy &&
+                          Qwen35MtpSupportsGenerationConfig(c->generationConfig);
+                }
+                ResponseContext *pc = pdMixPromptCtx;
+                ok &= pc != nullptr && pc->multimodalInput.empty();
+                // The mixed forward needs the fused ragged prefill (else ForwardGPU
+                // splits rows and the verify logits mapping breaks) and the compact
+                // replay rollback (Qwen35MTPBatchForward picks prefix snapshots for
+                // max_batch <= 4). Otherwise keep the old order.
+                ok &= resumePackEnabled && !Qwen35DisableBatchPrefill() &&
+                      Qwen35DFlashBatchPrefixSnapshotsEnabled() &&
+                      !(model->maxBatch > 0 &&
+                        model->maxBatch <= QWEN35_MTP_PREFIX_SNAPSHOT_BATCH_MAX &&
+                        verifyRows > 1);
+                if (ok) {
+                    int st = std::max(1, std::min((int)pc->currentTokens.size(),
+                                                  batchPrefillChunkCap));
+                    // The mixed round carries ONE prompt row, so the fair share of the
+                    // waiting prompts (resumePackShare, sized for packing all of them into one
+                    // forward) does not apply: accept15 c8 ran mixed prompt chunks of exactly
+                    // 3072 / waiting prompts (384/512/768/1024/1536) and prefill total fell to
+                    // 0.7043 x flags off. The budget is the verify-row rule and PD_MIX_CHUNK below.
+                    if (resumePackShare > 0 && st > resumePackShare) {
+                        static std::atomic<bool> noShareLogged{false};
+                        if (!noShareLogged.exchange(true)) {
+                            printf("[PDMIX-NOSHARE] request=%llu share=%d chunk_before_budget=%d\n",
+                                   (unsigned long long)pc->requestId, resumePackShare, st);
+                            fflush(stdout);
+                        }
+                    }
+                    if (!model->kvMemConfig.enabled)
+                        st = Qwen35ChunkTailTokens(pc, st, batchPrefillChunkCap);
+                    // One token budget for the whole forward (vLLM 83c078d955
+                    // v1/core/sched/scheduler.py:815-824: each row takes
+                    // min(tokens, token_budget)), so the mixed forward never exceeds the
+                    // chunk size that warmup sized memory for. End on a page.
+                    st = std::min(st, batchPrefillChunkCap - verifyRows * std::max(0, width));
+                    if (Qwen35PdMixChunkMax() > 0) st = std::min(st, Qwen35PdMixChunkMax());
+                    const int pageLen = fastllm::GetPageLen();
+                    const int begin = pc->cacheLen + pc->preTokens;
+                    const int boundary = (begin + st) / pageLen * pageLen;
+                    if ((begin + st) % pageLen != 0 && boundary > begin) st = boundary - begin;
+                    if (Qwen35PdMixTailEnabled() && st >= pc->prefillRemain) {
+                        // Leave the last partial page (1..pageLen tokens) to the
+                        // prompt-only path, which owns the first-token logits.
+                        st = (begin + pc->prefillRemain - 1) / pageLen * pageLen - begin;
+                    }
+                    ok = st > 1 && st < pc->prefillRemain &&
+                         st <= QWEN35_BATCH_PREFILL_SEQ_MAX;
+                    pdMixPromptTokens = st;
+                }
+                if (ok) {
+                    std::lock_guard<std::mutex> guard(model->mtpCacheMutex);
+                    auto cacheIt = model->dflashContexts.find(pc);
+                    // A fresh prompt has no draft context yet; the seed creates it
+                    // (same rule as the prompt-only seed, expectedTokens == 0).
+                    ok = cacheIt != model->dflashContexts.end() ?
+                         cacheIt->second.committedTokens == pc->cacheLen + pc->preTokens :
+                         pc->cacheLen + pc->preTokens == 0;
+                }
+                pdMixSelect = ok;
+            }
+            pdMixSkipRound = false;
+            // PDALT decode turn: decode rows only while a prompt waits; the next
+            // round is the prompt's.
+            const bool pdAltDecodeTurn = pdAltEnabled && pdAltNextDecode &&
+                hasPrefill && canAddPrefill && decodeCount > 0 &&
+                !prefillPageCapacityBlocked && !mixedRowsEnabled && !bp3DecodeFirst &&
+                forcedGpuTokenHandoffHandles.empty();
+            // PD_MIX_IMAGE: the round after a media chunk serves the decode rows (a text
+            // prompt may still mix into it through pdMixSelect).
+            const bool pdImgDecodeTurn = pdMixImage && pdImgNextDecode &&
+                decodeCount > 0 && !mixedRowsEnabled && !bp3DecodeFirst &&
+                forcedGpuTokenHandoffHandles.empty();
+            // Off: prompt pass, then decode only if nothing was selected (old
+            // order). Mixed: decode rows first, then one prefill chunk. BP3
+            // prioritizes existing decode rows but does not mix media into BMIX.
+            for (int selectionPass = 0; selectionPass < 2; ++selectionPass) {
+                const bool decodeFirst = mixedRowsEnabled || bp3DecodeFirst || pdMixSelect ||
+                                         pdAltDecodeTurn || pdImgDecodeTurn || pdMixDecodeTurn;
+                const int isPrompt = decodeFirst ?
+                    (selectionPass == 0 ? 0 : 1) :
+                    (selectionPass == 0 ? 1 : 0);
+                if ((pdAltDecodeTurn || pdMixDecodeTurn) && isPrompt == 1) {
+                    break;
+                }
+                if (pdImgDecodeTurn && !pdMixSelect && isPrompt == 1) {
+                    break;
+                }
+                if (!decodeFirst && isPrompt == 0 && !seqLens.empty()) {
+                    break;
+                }
+                if (bp3DecodeFirst && !mixedRowsEnabled && isPrompt == 1 &&
+                    !seqLens.empty()) {
+                    break;
+                }
+                if (mixedRowsEnabled && isPrompt == 1 &&
+                    (int)seqLens.size() >= mtpSchedulerLanes) {
+                    break;
+                }
                 if (!forcedGpuTokenHandoffHandles.empty() && isPrompt != 0) {
                     continue;
                 }
@@ -23990,7 +27995,8 @@ namespace fastllm {
                     continue;
                 }
                 if (isPrompt == 0 && hasPrefill && canAddPrefill &&
-                    !prefillPageCapacityBlocked) {
+                    !prefillPageCapacityBlocked && !mixedRowsEnabled && !bp3DecodeFirst &&
+                    !pdMixSelect && !pdAltDecodeTurn && !pdImgDecodeTurn && !pdMixDecodeTurn) {
                     continue;
                 }
 
@@ -23999,43 +28005,182 @@ namespace fastllm {
                     if (ctx == nullptr || ctx->isEnding) {
                         continue;
                     }
-                    if (isPrompt && ctx->preTokens != 0) {
+                    if (isPrompt && ((batchPrefillResume || pdMixEnabled) ?
+                                     (ctx->prefillRemain <= 0) :
+                                     (ctx->preTokens != 0))) {
                         continue;
                     }
-                    if (!isPrompt && ctx->preTokens == 0) {
+                    if (!isPrompt && ((batchPrefillResume || pdMixEnabled) ?
+                                      (ctx->prefillRemain > 0) :
+                                      (ctx->preTokens == 0))) {
                         continue;
                     }
-                    if (!isPrompt && !seqLens.empty() &&
+                    if (pdMixSelect && isPrompt && ctx != pdMixPromptCtx) {
+                        continue;
+                    }
+                    if (!mixedRowsEnabled && !isPrompt && !seqLens.empty() &&
                         scheduledDecodeTokens(ctx) != seqLens[0]) {
                         continue;
                     }
 
                     bool isMultimodal = !ctx->multimodalInput.empty();
+                    const bool mmDecodeRow = mmDecodeBatch && isMultimodal && !isPrompt;
+                    if (mmDecodeRow) {
+                        isMultimodal = false;
+                    }
+                    if (isPrompt && isMultimodal && model->VisionAsyncWait(ctx)) {
+                        continue;
+                    }
+                    if (mixedRowsEnabled && isMultimodal) {
+                        continue;
+                    }
                     if (selectedMultimodal && !isMultimodal) {
                         continue;
+                    }
+                    if (pdMixEnabled && isPrompt) {
+                        // A text prompt in a legacy (resume off) round would run
+                        // unchunked; it waits for the next resume round.
+                        if (!isMultimodal && !batchPrefillResume) {
+                            continue;
+                        }
                     }
                     if (isMultimodal && !seqLens.empty()) {
                         continue;
                     }
 
                     int scheduledTokens = isPrompt ?
-                        (int)ctx->currentTokens.size() : scheduledDecodeTokens(ctx);
-                    if (isPrompt && gpuTokenHandoffConfigured &&
+                        (int)ctx->currentTokens.size() :
+                        (mixedRowsEnabled ? 1 : scheduledDecodeTokens(ctx));
+                    if (batchPrefillResume && isPrompt) {
+                        scheduledTokens = std::max(1, std::min(
+                            scheduledTokens, batchPrefillChunkCap));
+                        if (resumePackShare > 0 && !(pdImgKeepResume && isMultimodal) &&
+                            !pdMixSelect && ctx != pdShortCtx)
+                            scheduledTokens = std::min(scheduledTokens, resumePackShare);
+                        if (!model->kvMemConfig.enabled)
+                            scheduledTokens = Qwen35ChunkTailTokens(ctx, scheduledTokens, batchPrefillChunkCap);
+                    }
+                    if (pdMixSelect && isPrompt) {
+                        scheduledTokens = std::min(scheduledTokens, pdMixPromptTokens);
+                    }
+                    if (pdAltEnabled && isPrompt && decodeCount > 0 && Qwen35PdMixChunkMax() > 0) {
+                        scheduledTokens = std::min(scheduledTokens, Qwen35PdMixChunkMax());
+                    }
+                    if (mixedRowsEnabled && isPrompt) {
+                        int remaining = batchedPrefillTokenLimit - selectedDecodeTokens;
+                        if (remaining <= 0) continue;
+                        scheduledTokens = std::min(scheduledTokens, remaining);
+                    }
+                    // A resumed row joins only if its draft context is exactly at the
+                    // row's prompt position; the packed path erases every row's context
+                    // on one mismatch.
+                    auto resumePackRowReady = [&]() {
+                        if (!resumePackEnabled || !batchPrefillResume) return false;
+                        std::lock_guard<std::mutex> guard(model->mtpCacheMutex);
+                        auto cacheIt = model->dflashContexts.find(ctx);
+                        return cacheIt != model->dflashContexts.end() &&
+                            cacheIt->second.committedTokens == ctx->cacheLen + ctx->preTokens;
+                    };
+                    auto multiPrefillRowPackableNow = [&]() {
+                        return !multiPrefillEnabled ||
+                            (schedulerUsesDFlash && !Qwen35DisableBatchPrefill() &&
+                             ResolveQwen35ThreadTpComputeType(model->dataType) ==
+                                 DataType::FLOAT16 &&
+                             ((ctx->cacheLen == 0 && ctx->preTokens == 0) ||
+                              resumePackRowReady()) &&
+                             ctx->multimodalInput.empty() &&
+                             scheduledTokens > 1 &&
+                             scheduledTokens <= QWEN35_BATCH_PREFILL_SEQ_MAX);
+                    };
+                    bool multiPrefillRowPackable = multiPrefillRowPackableNow();
+                    // Do not mix a continued/restored row into a fresh packed
+                    // prefill. It uses the existing serial path instead.
+                    if (isPrompt && multiPrefillEnabled && !seqLens.empty() &&
+                        !multiPrefillRowPackable) {
+                        continue;
+                    }
+                    // selectedPrefillTokens does not include this row yet.
+                    if (isPrompt && multiPrefillEnabled && !seqLens.empty() && !pdMixSelect &&
+                        selectedPrefillTokens + selectedDecodeTokens + scheduledTokens >
+                            batchedPrefillTokenLimit) {
+                        continue;
+                    }
+                    if (isPrompt && !mixedRowsEnabled && gpuTokenHandoffConfigured &&
                         !seqLens.empty() &&
                         (scheduledTokens > prefillChunkSize ||
                          selectedPrefillTokens + scheduledTokens >
                              batchedPrefillTokenLimit)) {
                         continue;
                     }
+                    const int promptEndTokens = (isPrompt && batchPrefillResume) ?
+                        (ctx->cacheLen + ctx->preTokens + scheduledTokens) :
+                        (ctx->cacheLen + scheduledTokens);
                     if ((maxTotalLens > 0 &&
-                         ctx->cacheLen + scheduledTokens > maxTotalLens) ||
-                        ctx->cacheLen + scheduledTokens > model->max_positions) {
+                         promptEndTokens > maxTotalLens) ||
+                        promptEndTokens > model->max_positions) {
                         ctx->isEnding = true;
                         ctx->error = ResponseContextErrorPromptTooLong;
                         continue;
                     }
 
+                    if (isPrompt && model->PersistentPrefixRestorePending(ctx)) {
+                        model->PreparePersistentPrefixCache(ctx);
+                        if (model->PersistentPrefixRestorePending(ctx)) {
+                            prefillPageCapacityBlocked = true;
+                            continue;
+                        }
+                    }
                     if (isPrompt) {
+                        // Resolve an SSD/L2 prefix before budgeting the
+                        // remaining prefill pages.  A direct L3 restore
+                        // publishes those pages into L1 and shrinks
+                        // currentTokens; checking the full cold prompt first
+                        // would see a shortage, skip this context forever, and
+                        // never reach tryRestorePrefixCache.
+                        if (ctx->cacheLen == 0) {
+                            const int restoreResult = tryRestorePrefixCache(ctx);
+                            if (restoreResult == -2) {
+                                prefillPageCapacityBlocked = true;
+                                continue;
+                            }
+                            if (restoreResult < 0) {
+                                releaseAndReinitRequest(ctx);
+                                continue;
+                            }
+                            scheduledTokens = (int)ctx->currentTokens.size();
+                            if (batchPrefillResume) {
+                                scheduledTokens = std::max(1, std::min(
+                                    scheduledTokens, batchPrefillChunkCap));
+                                if (resumePackShare > 0 && !pdMixSelect && ctx != pdShortCtx)
+                                    scheduledTokens = std::min(scheduledTokens, resumePackShare);
+                                if (!model->kvMemConfig.enabled)
+                                    scheduledTokens = Qwen35ChunkTailTokens(ctx, scheduledTokens, batchPrefillChunkCap);
+                            }
+                            if (mixedRowsEnabled) {
+                                int remaining = batchedPrefillTokenLimit - selectedDecodeTokens;
+                                if (remaining <= 0) continue;
+                                scheduledTokens = std::min(scheduledTokens, remaining);
+                            }
+                            if (pdMixSelect) {
+                                // A prefix hit moved the prompt start: the planned chunk
+                                // and its draft alignment no longer hold, so it runs
+                                // in the next round instead (pdMixSkipRound).
+                                if (ctx->cacheLen != 0) {
+                                    pdMixRestoreSkipped = true;
+                                    continue;
+                                }
+                                scheduledTokens = std::min(scheduledTokens, pdMixPromptTokens);
+                            }
+                            if (pdAltEnabled && decodeCount > 0 && Qwen35PdMixChunkMax() > 0) {
+                                scheduledTokens = std::min(scheduledTokens, Qwen35PdMixChunkMax());
+                            }
+                        }
+                        if (multiPrefillEnabled) {
+                            // tryRestorePrefixCache above may have set cacheLen
+                            // and shrunk currentTokens: decide packing now.
+                            multiPrefillRowPackable = multiPrefillRowPackableNow();
+                            if (!seqLens.empty() && !multiPrefillRowPackable) continue;
+                        }
                         int cachedAndScheduled =
                             ctx->cacheLen + scheduledTokens;
                         int remainingCapacity =
@@ -24046,27 +28191,36 @@ namespace fastllm {
                                 maxTotalLens - cachedAndScheduled);
                         }
                         int reserveTokens = std::min(
-                            mtpBatchDecodeTokens,
+                            schedulerBatchDecodeTokens,
                             std::max(0, remainingCapacity));
                         auto pageNeeds = collectPrefillPageNeeds(
                             ctx, scheduledTokens + reserveTokens);
                         auto combinedPageNeeds = selectedPrefillPageNeeds;
                         accumulatePagedManagerNeeds(combinedPageNeeds, pageNeeds);
-                        if (hasPagedManagerShortage(combinedPageNeeds)) {
-                            // A decode request can temporarily leave too few
-                            // pages to rebuild an evicted long context. Keep
-                            // the prefill pending until that request releases
-                            // its cache; restoring a prefix here would consume
-                            // every free page and fail on the first append.
+                        if (pdMixSelect) {
+                            // Decode rows were selected first in a mixed round; the
+                            // chunk must fit in the pages they leave.
+                            auto mixedPageNeeds = combinedPageNeeds;
+                            accumulatePagedManagerNeeds(mixedPageNeeds, selectedDecodePageNeeds);
+                            if (hasPagedManagerShortage(mixedPageNeeds)) {
+                                prefillPageCapacityBlocked = true;
+                                continue;
+                            }
+                        }
+                        bool capacityUnavailable = false;
+                        if (hasPagedManagerShortage(combinedPageNeeds,
+                                                    &capacityUnavailable)) {
+                            if (capacityUnavailable) {
+                                ctx->error = ResponseContextErrorCapacityUnavailable;
+                                ctx->isEnding = true;
+                            }
+                            // Keep the remaining prefill pending until safe
+                            // victim transfers complete or active decode
+                            // requests release their pages. Never overcommit
+                            // the hard pool bound to bypass this check.
                             prefillPageCapacityBlocked = true;
                             continue;
                         }
-                        if (ctx->cacheLen == 0 &&
-                            tryRestorePrefixCache(ctx) < 0) {
-                            releaseAndReinitRequest(ctx);
-                        }
-                        scheduledTokens =
-                            (int)ctx->currentTokens.size();
                         // Prefix restore has already acquired its pages.
                         // Keep only still-unallocated needs for this batch.
                         accumulatePagedManagerNeeds(selectedPrefillPageNeeds,
@@ -24076,14 +28230,27 @@ namespace fastllm {
                     if (!isPrompt &&
                         forcedGpuTokenHandoffHandles.empty()) {
                         auto pageNeeds = collectDecodePageNeeds(ctx);
-                        if (!pageNeeds.empty() && hasPagedManagerShortage(pageNeeds)) {
-                            releaseAndReinitRequest(ctx);
+                        bool capacityUnavailable = false;
+                        if (!pageNeeds.empty() &&
+                            hasPagedManagerShortage(pageNeeds, &capacityUnavailable)) {
+                            if (capacityUnavailable) {
+                                ctx->error = ResponseContextErrorCapacityUnavailable;
+                                ctx->isEnding = true;
+                            } else {
+                                releaseAndReinitRequest(ctx);
+                            }
                             continue;
                         }
                         if (!pageNeeds.empty()) {
                             auto combinedPageNeeds = selectedDecodePageNeeds;
                             accumulatePagedManagerNeeds(combinedPageNeeds, pageNeeds);
-                            if (hasPagedManagerShortage(combinedPageNeeds)) {
+                            bool capacityUnavailable = false;
+                            if (hasPagedManagerShortage(combinedPageNeeds,
+                                                        &capacityUnavailable)) {
+                                if (capacityUnavailable) {
+                                    ctx->error = ResponseContextErrorCapacityUnavailable;
+                                    ctx->isEnding = true;
+                                }
                                 // This request fits by itself, but not together
                                 // with the requests already selected for this
                                 // forward. Leave it untouched for the next
@@ -24100,14 +28267,20 @@ namespace fastllm {
                     logits.push_back(createPendingResultLogits(ctx->generationConfig));
                     selectedNeedLastTokens |= Qwen35NeedRepeatPenalty(ctx->generationConfig) ||
                                               ctx->generationConfig.output_logits;
-                    selectedIsPrompt = isPrompt != 0;
-                    selectedMultimodal = isMultimodal;
+                    selectedIsPrompt |= isPrompt != 0;
+                    selectedHasPrefill |= isPrompt != 0;
+                    selectedHasDecode |= isPrompt == 0;
+                    selectedMultimodal |= isMultimodal;
+                    rowIsPrompt.push_back(isPrompt != 0);
                     if (isPrompt) {
                         selectedPrefillTokens += scheduledTokens;
+                    } else {
+                        selectedDecodeTokens += scheduledTokens;
                     }
 
                     if (!isPrompt && !ctx->currentTokens.empty()) {
-                        int seqLen = scheduledDecodeTokens(ctx);
+                        const float mmDecodeDelta = mmDecodeRow ? Qwen35MropeDelta(ctx) : 0.0f;
+                        int seqLen = mixedRowsEnabled ? 1 : scheduledDecodeTokens(ctx);
                         if (seqLen == 1) {
                             if (!selectingGpuTokenHandoffPending) {
                                 ids.push_back((float)ctx->currentTokens[0]);
@@ -24119,6 +28292,7 @@ namespace fastllm {
                             } else {
                                 float position = ctx->allTokens.empty() ?
                                     0.0f : (float)((int)ctx->allTokens.size() - 1);
+                                position += mmDecodeDelta;
                                 decodePositionValues.push_back(position);
                                 decodePositionIds.emplace_back(
                                     DataType::FLOAT32, decodeScalarDims,
@@ -24138,7 +28312,7 @@ namespace fastllm {
 
                             std::vector<float> vPositionIds(seqLen, 0.0f);
                             for (int i = 0; i < seqLen; i++) {
-                                vPositionIds[i] = (float)(startPosition + i);
+                                vPositionIds[i] = (float)(startPosition + i) + mmDecodeDelta;
                             }
                             positionIds.push_back(new Data());
                             ownedPositionIds.push_back(positionIds.back());
@@ -24163,7 +28337,56 @@ namespace fastllm {
                             ctx->preTokens += seqLen;
                         }
                     } else {
-                        if (ctx->preTokens == 0) {
+                        // PD_MIX_IMAGE: resume is on for a media prompt only under
+                        // pdImgKeepResume (a decode row waits or it is mid-chunk).
+                        const bool pdImgChunk = pdMixImage && !mmOneChunkPerRound &&
+                            pdImgKeepResume;
+                        const bool pdImgSolo = Qwen35MmSoloChunk() > 0 && decodeCount == 0;
+                        const int pdImgChunkSize = pdImgSolo ?
+                            std::min(batchPrefillChunkCap, Qwen35MmSoloChunk()) :
+                            Qwen35PdMixChunkMax() > 0 ?
+                            std::min(batchPrefillChunkCap, Qwen35PdMixChunkMax()) :
+                            batchPrefillChunkCap;
+                        if (pdImgSolo && pdImgChunk) {
+                            static std::atomic<bool> soloLogged{false};
+                            if (!soloLogged.exchange(true)) {
+                                printf("[MM-SOLO-CHUNK] request=%llu chunk=%d\n",
+                                       (unsigned long long)ctx->requestId, pdImgChunkSize);
+                                fflush(stdout);
+                            }
+                        }
+                        const int mmResumeChunk = pdImgChunk ? pdImgChunkSize : batchPrefillChunkCap;
+                        const bool resumableMultimodal = batchPrefillResume &&
+                            (mmOneChunkPerRound || pdImgChunk) && isPrompt && isMultimodal &&
+                            model->CanUseGPUForward() &&
+                            (int)ctx->currentTokens.size() > mmResumeChunk;
+                        if (mmOneChunkPerRound || pdMixImage) {
+                            ctx->intParams["mm_prefill_resumable"] =
+                                resumableMultimodal ? 1 : 0;
+                            if (resumableMultimodal) {
+                                ctx->intParams["mm_prefill_chunk_size"] = mmResumeChunk;
+                                if (pdImgSolo && pdImgChunk && !Qwen35MmChunkEmbedEnabled()) {
+                                    std::lock_guard<std::mutex> guard(model->responseContextDict.locker);
+                                    ctx->intParams["mm_prefill_solo_count"] =
+                                        (int)model->responseContextDict.dicts.size();
+                                } else {
+                                    ctx->intParams.erase("mm_prefill_solo_count");
+                                }
+                            } else {
+                                ctx->intParams.erase("mm_prefill_chunk_size");
+                                ctx->intParams.erase("mm_prefill_solo_count");
+                            }
+                        }
+                        if (batchPrefillResume) {
+                            ctx->intParams["add_special_tokens"] =
+                                (ctx->cacheLen > 0 || ctx->preTokens > 0) ?
+                                    false : ctx->generationConfig.add_special_tokens;
+                            ctx->intParams["promptLen"] =
+                                resumableMultimodal ?
+                                    ctx->cacheLen + ctx->inputTokens :
+                                    ctx->cacheLen + ctx->preTokens + scheduledTokens;
+                            ctx->intParams["index"] = 0;
+                        } else if (ctx->preTokens == 0) {
                             ctx->intParams["add_special_tokens"] =
                                 ctx->cacheLen > 0 ? false : ctx->generationConfig.add_special_tokens;
                             ctx->intParams["promptLen"] =
@@ -24174,9 +28397,15 @@ namespace fastllm {
                         }
                         Data inputIds, attentionMask, curPositionIds;
                         std::vector<std::vector<float> > tokens(1);
-                        tokens[0].reserve(ctx->currentTokens.size());
-                        for (int token : ctx->currentTokens) {
-                            tokens[0].push_back((float)token);
+                        const int promptFeedTokens = resumableMultimodal ?
+                            (int)ctx->currentTokens.size() :
+                            (batchPrefillResume && isPrompt) ?
+                            std::min(scheduledTokens,
+                                     (int)ctx->currentTokens.size()) :
+                            (int)ctx->currentTokens.size();
+                        tokens[0].reserve(promptFeedTokens);
+                        for (int ti = 0; ti < promptFeedTokens; ti++) {
+                            tokens[0].push_back((float)ctx->currentTokens[ti]);
                         }
                         model->FillLLMInputs(tokens, ctx->intParams,
                                              inputIds, attentionMask, curPositionIds);
@@ -24202,24 +28431,87 @@ namespace fastllm {
                             positionIds.back()->CopyFrom(curPositionIds);
                         }
                         ctx->preTokens += seqLens.back();
+                        if (pdMixEnabled && isPrompt && !batchPrefillResume) {
+                            // Legacy rounds feed the whole prompt in this forward.
+                            ctx->prefillRemain = 0;
+                        }
+                        if (batchPrefillResume && isPrompt && !resumableMultimodal) {
+                            const int fedTokens = seqLens.back();
+                            if (fedTokens > 0 &&
+                                fedTokens <= (int)ctx->currentTokens.size()) {
+                                ctx->currentTokens.erase(
+                                    ctx->currentTokens.begin(),
+                                    ctx->currentTokens.begin() + fedTokens);
+                            }
+                            ctx->prefillRemain =
+                                std::max(0, ctx->prefillRemain - fedTokens);
+                            // The mixed forward has no prompt logits: never its last chunk.
+                            AssertInFastLLM(!pdMixSelect || ctx->prefillRemain > 0,
+                                            "PDMIX selected the final prompt chunk.\n");
+                        }
                     }
 
                     for (int i = 0; i < model->block_cnt; i++) {
                         pastKeyValues.push_back(std::make_pair(&ctx->pastKeyValues[i].first,
                                                                &ctx->pastKeyValues[i].second));
                     }
+                    const bool promptBudgetFits = !multiPrefillEnabled ?
+                        selectedPrefillTokens <= batchedPrefillTokenLimit :
+                        selectedPrefillTokens + selectedDecodeTokens <=
+                            batchedPrefillTokenLimit;
                     bool canKeepBatchingPrompt =
-                        isPrompt && gpuTokenHandoffConfigured &&
+                        isPrompt &&
+                        (gpuTokenHandoffConfigured ||
+                         (batchPrefillResume && batchPrefillAdmissionEnabled)) &&
+                        (!multiPrefillEnabled || multiPrefillRowPackable) &&
                         !selectedMultimodal &&
                         scheduledTokens <= prefillChunkSize &&
-                        selectedPrefillTokens <= batchedPrefillTokenLimit;
+                        promptBudgetFits;
                     if ((isPrompt && !canKeepBatchingPrompt) ||
+                        (isPrompt && ctx == pdShortCtx) ||
+                        (mixedRowsEnabled && isPrompt) ||
+                        (pdMixSelect && isPrompt) ||
                         selectedMultimodal ||
                         (int)seqLens.size() >= mtpSchedulerLanes) {
                         break;
                     }
                 }
             }
+
+            if (pdAltEnabled) pdAltNextDecode = !pdAltDecodeTurn;
+            if (pdMixImage) pdImgNextDecode = selectedMultimodal && selectedHasPrefill;
+            const bool pdMixRound = pdMixSelect && selectedHasPrefill && selectedHasDecode;
+            if (pdMixDecodeRounds > 0) {
+                if (pdMixRound) {
+                    pdMixDecodeLeft = pdMixDecodeRounds;
+                } else if (pdMixDecodeTurn) {
+                    static std::atomic<bool> decodeTurnLogged{false};
+                    if (!decodeTurnLogged.exchange(true)) {
+                        printf("[PDMIX-DECODE-TURN] first decode-only round after a mixed round, left=%d decode_selected=%d\n",
+                               pdMixDecodeLeft, selectedHasDecode ? 1 : 0);
+                        fflush(stdout);
+                    }
+                    --pdMixDecodeLeft;
+                }
+            }
+            if (pdMixSelect && !pdMixRound) {
+                // The planned chunk did not join; give the prompt the next round.
+                // PD_MIX_TAIL: a restore this round already aligned the draft cache
+                // (committedTokens = cacheLen), so the next round may mix it.
+                pdMixSkipRound = !(Qwen35PdMixTailEnabled() && pdMixRestoreSkipped);
+            }
+            mixedRowsSelected = mixedRowsEnabled && selectedHasPrefill && selectedHasDecode;
+            if (mixedRowsSelected) {
+                // The mixed round is target-only: no speculative cache is allowed
+                // to observe a batch containing unequal decode/prefill lengths.
+                selectedIsPrompt = true;
+            }
+            // Per-row prompt flags only matter in a mixed round; every other round keeps
+            // the old phase-wide selectedIsPrompt semantics byte for byte.
+            auto rowPrompt = [&](size_t row) {
+                return (mixedRowsSelected || pdMixRound) ?
+                    (row < rowIsPrompt.size() && rowIsPrompt[row] != 0) : selectedIsPrompt;
+            };
 
             if (selectedNeedLastTokens) {
                 tokensManager.units.reserve(tokenContexts.size());
@@ -24228,10 +28520,174 @@ namespace fastllm {
                 }
             }
 
+            if (bp2ObservabilityDebug) {
+                const uint64_t safeBoundaryNs = FastllmObservationTimestampNs();
+                std::vector<int> readyHandles;
+                readyHandles.reserve(orders.size());
+                std::vector<qwen35_observability::RequestClockRow> requestClocks;
+                requestClocks.reserve(orders.size());
+                for (const DecodeOrder &order : orders) {
+                    readyHandles.push_back(order.handle);
+                    ResponseContext *ctx = order.context;
+                    if (ctx == nullptr) continue;
+                    const bool selected = std::find(handles.begin(), handles.end(), order.handle) != handles.end();
+                    if (selected) {
+                        ctx->observabilitySafeBoundaryNs = safeBoundaryNs;
+                        ctx->observabilityAdmitNs = safeBoundaryNs;
+                    }
+                    requestClocks.push_back({
+                        ctx->requestId, ctx->observabilityArrivalNs,
+                        ctx->observabilityEnqueueNs, ctx->observabilityReadyNs,
+                        ctx->observabilitySafeBoundaryNs, ctx->observabilityAdmitNs});
+                }
+                int roundPrefillTokens = 0;
+                int roundDecodeTokens = 0;
+                for (size_t row = 0; row < seqLens.size(); ++row) {
+                    if (rowPrompt(row))
+                        roundPrefillTokens += seqLens[row];
+                    else
+                        roundDecodeTokens += seqLens[row];
+                }
+                const int roundTokenBudgetUsed = roundPrefillTokens + roundDecodeTokens;
+                const int roundTotalBudget = handles.empty() ? 0 :
+                    (mixedRowsSelected ? batchedPrefillTokenLimit :
+                     (selectedIsPrompt ? batchedPrefillTokenLimit :
+                      schedulerBatchDecodeTokens * std::max(1, (int)handles.size())));
+                const std::string roundPhase = handles.empty() ? "idle" :
+                    (mixedRowsSelected ? "mixed" :
+                     (selectedIsPrompt ? "prefill" : "decode"));
+                bool clocksValid = schedulerRoundObservationNs != 0;
+                for (const auto &clock : requestClocks) {
+                    clocksValid = clocksValid && clock.arrivalNs != 0 &&
+                        clock.enqueueNs != 0 && clock.readyNs != 0 &&
+                        clock.safeBoundaryNs != 0;
+                }
+                const uint64_t primaryRequestId = !tokenContexts.empty() &&
+                    tokenContexts[0] != nullptr ? tokenContexts[0]->requestId :
+                    (!orders.empty() && orders[0].context != nullptr ?
+                     orders[0].context->requestId : 0);
+                std::ostringstream roundPayload;
+                roundPayload << "round_id=" << schedulerRoundId
+                    << " phase=" << roundPhase
+                    << " waiting_count=" << waitingCount
+                    << " prefill_count=" << prefillCount
+                    << " decode_count=" << decodeCount
+                    << " cancel_count=" << abortHandles.size()
+                    << " ready_count=" << readyCount
+                    << " selected_count=" << handles.size()
+                    << " total_budget=" << roundTotalBudget
+                    << " token_budget_used=" << roundTokenBudgetUsed
+                    << " decode_tokens=" << roundDecodeTokens
+                    << " prefill_tokens=" << roundPrefillTokens
+                    << " max_batch=" << model->maxBatch
+                    << " selected_handles=" << qwen35_observability::FormatIntList(handles)
+                    << " ready_handles=" << qwen35_observability::FormatIntList(readyHandles)
+                    << " removed_handles=" << qwen35_observability::FormatIntList(removedHandles)
+                    << " safe_boundary_ns=" << safeBoundaryNs
+                    << " request_clocks=" << qwen35_observability::FormatRequestClocks(requestClocks)
+                    << " clock_state=" << (clocksValid ? "valid" : "partial");
+                FastllmEvent("scheduler", primaryRequestId, "scheduler_round", "%s",
+                             roundPayload.str().c_str());
+            }
+
             if (!seqLens.empty()) {
                 ResponseContext *singleContext = tokenContexts.empty() ? nullptr : tokenContexts[0];
+                diagnosticSelect.Finish();
                 dictLocker.unlock();
+                RequestDiagnosticBatchOperation diagnosticForwardWait(handles, "forward_lock_wait",
+                    RequestDiagnosticResource("model.forwardLocker", &forwardLocker).c_str());
                 forwardLocker.lock();
+                diagnosticForwardWait.Finish();
+                RequestDiagnosticBatchOperation diagnosticForward(handles, "native_forward",
+                    RequestDiagnosticResource("model.forwardLocker", &forwardLocker).c_str());
+
+                const uint64_t forwardId = bp2ObservabilityDebug ?
+                    model->observabilityForwardId.fetch_add(1, std::memory_order_relaxed) + 1 : 0;
+                const uint64_t forwardBeginNs = bp2ObservabilityDebug ?
+                    FastllmObservationTimestampNs() : 0;
+                const std::vector<int> forwardSeqLens = seqLens;
+                std::vector<int> forwardTokenOffsets(forwardSeqLens.size() + 1, 0);
+                for (size_t row = 0; row < forwardSeqLens.size(); ++row)
+                    forwardTokenOffsets[row + 1] = forwardTokenOffsets[row] + forwardSeqLens[row];
+                // TOP2DEBUG: the forward knows its rows but never sees request
+                // handles, so publish this round's handle list (one entry per
+                // request; the forward expands it over speculative rows). Every
+                // forward of this round, including the pipelined GPU token
+                // handoff launch below, logs those handles.
+                if (Qwen35Top2DebugEnabled()) {
+                    qwen35Top2DebugRequestHandles = handles;
+                }
+                std::vector<std::vector<int> > mixedSeedNext;
+                std::vector<int> mixedDFlashDevices;
+                std::map<int, int> mixedDFlashRatios;
+                const bool seedMixedDFlash = mixedRowsSelected &&
+                    Qwen35MixedDFlashSeedEnabled() && schedulerUsesDFlash &&
+                    schedulerDraftsPerStep > 0 &&
+                    GetQwen35GPUForwardDevices(model->deviceMap, mixedDFlashDevices,
+                                                mixedDFlashRatios) &&
+                    !mixedDFlashDevices.empty() &&
+                    !model->dflashTargetLayerIds.empty();
+                if (seedMixedDFlash)
+                    mixedSeedNext.assign(tokenContexts.size(), std::vector<int>());
+                const std::string initialNativePath = mixedRowsSelected ? "mixed:target-only" :
+                    (selectedMultimodal ? "multimodal" :
+                    (forwardSeqLens.size() > 1 && mtpDraftsPerStep > 0 ?
+                     (schedulerUsesDFlash ? "dflash" : "mtp") : "text"));
+                std::string nativeExecutionPath = initialNativePath;
+                std::vector<qwen35_observability::NativeForwardRow> nativeRows;
+                nativeRows.reserve(tokenContexts.size());
+                std::vector<int> nativeOutputRowMap;
+                nativeOutputRowMap.reserve(tokenContexts.size());
+                for (size_t row = 0; row < tokenContexts.size(); ++row) {
+                    ResponseContext *ctx = tokenContexts[row];
+                    qwen35_observability::NativeForwardRow observationRow;
+                    observationRow.requestId = ctx == nullptr ? 0 : ctx->requestId;
+                    observationRow.nativeHandle = row < handles.size() ? handles[row] : -1;
+                    observationRow.generation = ctx == nullptr ? 0 : ctx->nativeRequestGeneration;
+                    observationRow.rowId = (int)row;
+                    observationRow.seqLen = row < forwardSeqLens.size() ? forwardSeqLens[row] : 0;
+                    observationRow.mode = rowPrompt(row) ?
+                        "prompt" : "decode";
+                    observationRow.path = initialNativePath;
+                    nativeRows.push_back(observationRow);
+                    nativeOutputRowMap.push_back((int)row);
+                }
+                std::vector<int> nativeDFlashAccepted;
+                std::vector<int> nativeDFlashDrafts;
+                auto emitBp2NativeEvent = [&](const char *dispatch, uint64_t endNs,
+                                               const std::string &executionPath) {
+                    if (!bp2ObservabilityDebug) return;
+                    qwen35_observability::NativeForwardPayload payload;
+                    payload.forwardId = forwardId;
+                    payload.roundId = schedulerRoundId;
+                    payload.dispatch = dispatch;
+                    payload.phase = mixedRowsSelected ? "mixed" :
+                        (selectedIsPrompt ? "prefill" : "decode");
+                    payload.batch = (int)nativeRows.size();
+                    payload.rowCount = (int)nativeRows.size();
+                    payload.rows = nativeRows;
+                    for (auto &row : payload.rows) row.path = executionPath;
+                    payload.tokenOffsets = forwardTokenOffsets;
+                    payload.positionSpans.assign(nativeRows.size(), "unknown");
+                    payload.mropeSpans.assign(nativeRows.size(), "unknown");
+                    payload.maskSpans.assign(nativeRows.size(), "unknown");
+                    payload.kvPageOwnerIds.assign(nativeRows.size(), "unknown");
+                    payload.linearOwnerIds.assign(nativeRows.size(), "unknown");
+                    payload.dflashMtpOwnerIds.assign(nativeRows.size(), "unknown");
+                    payload.outputRowMap = nativeOutputRowMap;
+                    payload.accepted = nativeDFlashAccepted;
+                    payload.drafts = nativeDFlashDrafts;
+                    payload.executionPath = executionPath;
+                    payload.beginNs = forwardBeginNs;
+                    payload.endNs = endNs;
+                    const uint64_t primaryRequestId = !nativeRows.empty() ?
+                        nativeRows[0].requestId : 0;
+                    const std::string text =
+                        qwen35_observability::FormatNativeForwardPayload(payload);
+                    FastllmEvent("native", primaryRequestId, "native_forward_batch",
+                                 "%s", text.c_str());
+                };
+                emitBp2NativeEvent("begin", 0, nativeExecutionPath);
 
                 Data inputIds(DataType::FLOAT32, {1, (int)ids.size()}, ids);
                 Data multimodalAdjustedPositionIds;
@@ -24259,11 +28715,28 @@ namespace fastllm {
                 std::vector<std::vector<int> > nextInputTokenLists;
                 std::vector<int> keptInputLens;
                 bool usedMtpForward = false;
+                bool fallbackNativeForward = false;
+                // The packed prefill branch has already run this round's forward.
+                bool multiPrefillForwarded = false;
+                // Draft inputs are staged locally because the generic fallback
+                // below clears nextInputTokenLists when no row is speculative.
+                std::vector<std::vector<int> > multiPrefillSeedNext(
+                    multiPrefillEnabled ? tokenContexts.size() : 0);
                 std::set<int> gpuTokenHandoffSpeculatedHandles;
+                const uint64_t nativeStepBeginNs = GetFastllmObservabilityMode() == FastllmObservabilityMode::Off ? 0 : FastllmObservationTimestampNs();
+                const uint64_t nativeVisionBeforeNs = singleContext ? singleContext->nativeGeneration.visionElapsedNs : 0;
+                if (nativeStepBeginNs && selectedIsPrompt) {
+                    for (size_t row = 0; row < tokenContexts.size(); ++row) {
+                        if (!rowPrompt(row)) continue;
+                        auto *ctx = tokenContexts[row];
+                        if (ctx) BeginRequestPrefillStatus(ctx->requestId,
+                            std::max(0, ctx->inputTokens - ctx->cacheLen));
+                    }
+                }
                 bool consumeGpuTokenHandoff = gpuTokenHandoffPending &&
                     !handles.empty() && seqLens.size() == handles.size() &&
                     tokenContexts.size() == handles.size();
-                const int longPrefillChunkSize = schedulerUsesDFlash ?
+                const int longPrefillChunkSize = schedulerUsesDFlash && !Qwen35ChunkWideEnabled() ?
                     std::max(1, std::min(
                         prefillChunkSize,
                         QWEN35_DFLASH_LONG_PREFILL_CHUNK_SIZE)) :
@@ -24393,6 +28866,18 @@ namespace fastllm {
                                 model->deviceMap, longPrefillDraftDevices,
                                 longPrefillDraftRatios) &&
                             !longPrefillDraftDevices.empty();
+                        // 长预填分支也要用草稿独占设备，否则会把整份草稿
+                        // 权重搬回 target 根卡并重建分片（实测 GPU0 显存耗尽）。
+                        if (schedulerUsesDFlash) {
+                            const int longPrefillDraftDevice =
+                                Qwen35DFlashDraftDevice();
+                            if (longPrefillDraftDevice >= 0) {
+                                longPrefillDraftDevices =
+                                    std::vector<int>{longPrefillDraftDevice};
+                                longPrefillDraftRatios =
+                                    std::map<int, int>{{longPrefillDraftDevice, 1}};
+                            }
+                        }
                         bool seedLongPrefillMtp =
                             !schedulerUsesDFlash && canSeedLongPrefillDraft &&
                             !Qwen35MtpDisabledByEnv() &&
@@ -24573,10 +29058,39 @@ namespace fastllm {
                         for (int st = 0; st < len; ) {
                             int curLen = std::min(
                                 longPrefillChunkSize, len - st);
-                            if (model->kvMemConfig.enabled && curLen > 1 && st + curLen == len) {
-                                --curLen;
+                            if (model->kvMemConfig.enabled) {
+                                // kvMemConfig 模式：尾块减 1，避免单 token 尾块。
+                                if (curLen > 1 && st + curLen == len) {
+                                    --curLen;
+                                }
+                            }
+                            // 【一本账·本地账记全】把**最后一块**在
+                            // **最后一个页边界**处切开，使"恰好一次 forward 结束在页对齐长度"上。
+                            //
+                            // 为什么必须这样（读码 + 实测）：
+                            //   本地账（页池 trie ∩ 线性状态快照）只在 `cachedTokens % pageLen == 0`
+                            //   时记（本文件 24753 一带），而快照里的线性状态**必须对应一次真的
+                            //   结束在那个长度的 forward**。chunk=2048 时最后一块的结束长度是 `len`，
+                            //   通常不是页对齐 ⇒ 那个点**永远记不上账** ⇒ 下一轮只能命中
+                            //   "≤len 的最大 2048 整数倍"。
+                            //   实测证据：
+                            //     prompt 4102→cached 4096（无损失）、6385→6144（−128）、
+                            //     16379→14336（−1920）、**60587→49152（−11392）**。
+                            // 反面教训：曾用"把 interval 压到 1 页"实现同一目的，结果连带把 chunk
+                            //   也压成 128（8 块→125 块）+ 每块各拷 ~151MiB 快照 ⇒ 实测净亏 3.6 倍。已回退。
+                            // 本改法**只多切一次**（尾块拆成 页对齐段 + <pageLen 的残段），
+                            //   `longPrefillChunkSize` 仍是 2048。
+                            if (!model->kvMemConfig.enabled && st + curLen == len) {
+                                const int pageLen = (int)fastllm::GetPageLen();
+                                const int end = st + curLen;
+                                if (pageLen > 0 && end % pageLen != 0) {
+                                    const int boundary = end / pageLen * pageLen;
+                                    if (boundary > st) curLen = boundary - st;
+                                }
                             }
                             bool isLastChunk = st + curLen == len;
+                            const uint64_t observationChunkBeginNs =
+                                nativeStepBeginNs ? FastllmObservationTimestampNs() : 0;
                             auto chunkStartTime = std::chrono::system_clock::now();
                             Data curInput, curPositionIds;
                             Split(inputIds, 1, st, st + curLen, curInput);
@@ -24721,7 +29235,16 @@ namespace fastllm {
                                     longPrefillDFlashSeeded = true;
                                 }
                             }
+#if defined(FASTLLM_DISK_PREFIX_CACHE)
+                            model->ObservePersistentPrefill(curLen,
+                                std::chrono::duration<double,std::milli>(std::chrono::system_clock::now()-chunkStartTime).count());
+#endif
                             st += curLen;
+                            if (observationChunkBeginNs)
+                                RecordRequestPrefillStatus(singleContext->requestId,
+                                    singleContext->nativeGeneration.prefillTokens + st,
+                                    observationChunkBeginNs, FastllmObservationTimestampNs());
+                            RecordRequestDiagnosticProgress(singleContext->requestId, FastllmObservationTimestampNs());
                             int cachedTokens = longPrefillBaseTokens + st;
                             if (cachedTokens % pageLen == 0) {
                                 singleContext->TryRecordPagedCache(model);
@@ -24781,12 +29304,422 @@ namespace fastllm {
                     }
                 } else {
                     auto batchStartTime = std::chrono::system_clock::now();
-                    if (seqLens.size() > 1) {
+                    if (mixedRowsSelected) {
+                        const bool oldCollect = model->speculativeCollectAllLogits;
+                        const bool oldCapture = model->speculativeCaptureAllHiddenStates;
+                        const bool oldDFlashCapture = model->speculativeCaptureDFlashHiddenStates;
+                        const bool oldFirstLinear = model->speculativeCaptureFirstTokenLinearState;
+                        const bool oldCacheOnly = model->speculativeCacheOnlyForward;
+                        model->speculativeCollectAllLogits = false;
+                        model->speculativeCaptureAllHiddenStates = false;
+                        model->speculativeCaptureDFlashHiddenStates = seedMixedDFlash;
+                        model->speculativeCaptureFirstTokenLinearState = false;
+                        model->speculativeCacheOnlyForward = false;
+                        if (seedMixedDFlash) {
+                            model->speculativeDFlashHiddenStates.clear();
+                            model->speculativeDFlashHiddenStates.resize(
+                                model->dflashTargetLayerIds.size());
+                        }
+                        auto releaseMixedDFlashHidden = [&]() {
+                            if (!seedMixedDFlash) return;
+                            for (Data &hidden : model->speculativeDFlashHiddenStates) {
+                                hidden.FreeSpace();
+                                hidden.dims.clear();
+                                hidden.strides.clear();
+                                hidden.expansionDims.clear();
+                            }
+                            model->speculativeDFlashHiddenStates.clear();
+                        };
+                        try {
+                            ret = model->ForwardGPU((int)tokenContexts.size(), inputIds,
+                                attentionMasks, forwardPositionIds, seqLens,
+                                pastKeyValues, generationConfigs, tokensManager, &logits);
+                        } catch (...) {
+                            model->speculativeCollectAllLogits = oldCollect;
+                            model->speculativeCaptureAllHiddenStates = oldCapture;
+                            model->speculativeCaptureDFlashHiddenStates = oldDFlashCapture;
+                            model->speculativeCaptureFirstTokenLinearState = oldFirstLinear;
+                            model->speculativeCacheOnlyForward = oldCacheOnly;
+                            releaseMixedDFlashHidden();
+                            throw;
+                        }
+                        model->speculativeCollectAllLogits = oldCollect;
+                        model->speculativeCaptureAllHiddenStates = oldCapture;
+                        model->speculativeCaptureDFlashHiddenStates = oldDFlashCapture;
+                        model->speculativeCaptureFirstTokenLinearState = oldFirstLinear;
+                        model->speculativeCacheOnlyForward = oldCacheOnly;
+                        if (seedMixedDFlash) {
+                            if (ret.size() == tokenContexts.size() &&
+                                model->speculativeDFlashHiddenStates.size() ==
+                                    model->dflashTargetLayerIds.size() &&
+                                forwardTokenOffsets.size() == tokenContexts.size() + 1 &&
+                                !forwardTokenOffsets.empty() &&
+                                forwardTokenOffsets.back() == (int)ids.size()) {
+                            const int draftDevice =
+                                Qwen35DFlashDraftDeviceOr(mixedDFlashDevices);
+                            const std::vector<int> draftDevices =
+                                Qwen35DFlashDraftDevicesOrDefault(mixedDFlashDevices);
+                            bool captureShapeValid = true;
+                            for (const Data &hidden :
+                                 model->speculativeDFlashHiddenStates) {
+                                captureShapeValid &= hidden.dims.size() == 3 &&
+                                    hidden.dims[0] == 1 &&
+                                    hidden.dims[1] >= forwardTokenOffsets.back();
+                            }
+                            if (captureShapeValid) {
+                                for (int row = 0; row < (int)tokenContexts.size(); ++row) {
+                                    ResponseContext *ctx = tokenContexts[row];
+                                    const int rowTokens = forwardSeqLens[row];
+                                    bool rowSeeded = false;
+                                    if (ctx != nullptr && rowTokens > 0 &&
+                                        row < (int)generationConfigs.size()) {
+                                        const int expectedTokens =
+                                            ctx->cacheLen + ctx->preTokens - rowTokens;
+                                        try {
+                                            std::vector<Data> rowHidden(
+                                                model->speculativeDFlashHiddenStates.size());
+                                            for (int feature = 0;
+                                                 feature < (int)rowHidden.size();
+                                                 ++feature) {
+                                                Split(model->speculativeDFlashHiddenStates[feature],
+                                                      1, forwardTokenOffsets[row],
+                                                      forwardTokenOffsets[row + 1],
+                                                      rowHidden[feature]);
+                                            }
+                                            std::lock_guard<std::mutex> guard(
+                                                model->mtpCacheMutex);
+                                            auto cacheIt = model->dflashContexts.find(ctx);
+                                            if (cacheIt == model->dflashContexts.end() &&
+                                                expectedTokens == 0) {
+                                                cacheIt = model->dflashContexts.emplace(
+                                                    ctx, DFlashContext()).first;
+                                            }
+                                            if (cacheIt != model->dflashContexts.end()) {
+                                                DFlashContext &cache = cacheIt->second;
+                                                const bool cacheReady =
+                                                    expectedTokens >= 0 &&
+                                                    cache.committedTokens == expectedTokens &&
+                                                    (expectedTokens == 0 ||
+                                                     (int)cache.draftKeyValues.size() ==
+                                                         model->dflashLayers);
+                                                if (cacheReady) {
+                                                    model->AppendDFlashTargetHidden(
+                                                        draftDevice, rowTokens, cache,
+                                                        &rowHidden);
+                                                    if (cache.committedTokens ==
+                                                        expectedTokens + rowTokens) {
+                                                        const bool promptStillWaiting =
+                                                            rowPrompt((size_t)row) &&
+                                                            ctx->prefillRemain > 0;
+                                                        const bool requestEnds =
+                                                            Qwen35DFlashCommitEndsRequest(
+                                                                *model, ctx,
+                                                                std::vector<int>{ret[row]});
+                                                        std::vector<int> drafts;
+                                                        if (!promptStillWaiting &&
+                                                            !requestEnds &&
+                                                            Qwen35DFlashDraftFitsContext(
+                                                                model->max_positions,
+                                                                model->dflashCheckpointBlockSize,
+                                                                cache.committedTokens)) {
+                                                            drafts = model->RunDFlashDraft(
+                                                                draftDevice, draftDevices, ret[row],
+                                                                generationConfigs[row], cache, false,
+                                                                schedulerDraftsPerStep);
+                                                        }
+                                                        if (!promptStillWaiting &&
+                                                            (int)drafts.size() ==
+                                                                schedulerDraftsPerStep) {
+                                                            mixedSeedNext[row].clear();
+                                                            mixedSeedNext[row].push_back(ret[row]);
+                                                            mixedSeedNext[row].insert(
+                                                                mixedSeedNext[row].end(),
+                                                                drafts.begin(), drafts.end());
+                                                        }
+                                                        rowSeeded = true;
+                                                    }
+                                                }
+                                            }
+                                        } catch (...) {
+                                            rowSeeded = false;
+                                        }
+                                    }
+                                    if (!rowSeeded && ctx != nullptr) {
+                                        std::lock_guard<std::mutex> guard(
+                                            model->mtpCacheMutex);
+                                        model->dflashContexts.erase(ctx);
+                                    }
+                                }
+                            }
+                        }
+                        releaseMixedDFlashHidden();
+                        }
+                    } else if (multiPrefillEnabled && schedulerUsesDFlash && !pdMixRound &&
+                               selectedIsPrompt && !mixedRowsSelected &&
+                               !selectedMultimodal && seqLens.size() > 1 &&
+                               !Qwen35DisableBatchPrefill() &&
+                               std::all_of(seqLens.begin(), seqLens.end(),
+                                           [](int len) { return len > 1; }) &&
+                               model->HasDFlashWeights() &&
+                               model->DFlashDraftsPerStep() > 0 &&
+                               ResolveQwen35ThreadTpComputeType(model->dataType) ==
+                                   DataType::FLOAT16) {
+                        multiPrefillForwarded = true;
+                        // A packed fresh prefill has one flattened target-hidden
+                        // capture. Split it by the scheduler offsets, append each
+                        // row to its own DFlash context, then batch the draft pass.
+                        const bool oldCollect = model->speculativeCollectAllLogits;
+                        const bool oldCapture = model->speculativeCaptureAllHiddenStates;
+                        const bool oldDFlashCapture =
+                            model->speculativeCaptureDFlashHiddenStates;
+                        const bool oldFirstLinear =
+                            model->speculativeCaptureFirstTokenLinearState;
+                        const bool oldCacheOnly = model->speculativeCacheOnlyForward;
+                        auto releaseMultiPrefillHidden = [&]() {
+                            for (Data &hidden : model->speculativeDFlashHiddenStates) {
+                                hidden.FreeSpace();
+                                hidden.dims.clear();
+                                hidden.strides.clear();
+                                hidden.expansionDims.clear();
+                            }
+                            model->speculativeDFlashHiddenStates.clear();
+                        };
+                        model->speculativeCollectAllLogits = false;
+                        model->speculativeCaptureAllHiddenStates = false;
+                        model->speculativeCaptureDFlashHiddenStates = true;
+                        model->speculativeCaptureFirstTokenLinearState = false;
+                        model->speculativeCacheOnlyForward = false;
+                        model->speculativeDFlashHiddenStates.clear();
+                        model->speculativeDFlashHiddenStates.resize(
+                            model->dflashTargetLayerIds.size());
+                        try {
+                            ret = model->ForwardGPU(
+                                (int)tokenContexts.size(), inputIds,
+                                attentionMasks, forwardPositionIds, seqLens,
+                                pastKeyValues, generationConfigs, tokensManager,
+                                &logits);
+                        } catch (...) {
+                            model->speculativeCollectAllLogits = oldCollect;
+                            model->speculativeCaptureAllHiddenStates = oldCapture;
+                            model->speculativeCaptureDFlashHiddenStates =
+                                oldDFlashCapture;
+                            model->speculativeCaptureFirstTokenLinearState =
+                                oldFirstLinear;
+                            model->speculativeCacheOnlyForward = oldCacheOnly;
+                            releaseMultiPrefillHidden();
+                            throw;
+                        }
+                        model->speculativeCollectAllLogits = oldCollect;
+                        model->speculativeCaptureAllHiddenStates = oldCapture;
+                        model->speculativeCaptureDFlashHiddenStates =
+                            oldDFlashCapture;
+                        model->speculativeCaptureFirstTokenLinearState =
+                            oldFirstLinear;
+                        model->speculativeCacheOnlyForward = oldCacheOnly;
+
+                        keptInputLens.assign(seqLens.begin(), seqLens.end());
+                        const int totalForwardTokens = forwardTokenOffsets.empty() ?
+                            0 : forwardTokenOffsets.back();
+                        bool captureReady =
+                            ret.size() == tokenContexts.size() &&
+                            model->speculativeDFlashHiddenStates.size() ==
+                                model->dflashTargetLayerIds.size() &&
+                            !model->speculativeDFlashHiddenStates.empty();
+                        for (const Data &hidden :
+                             model->speculativeDFlashHiddenStates) {
+                            captureReady &= hidden.dims.size() == 3 &&
+                                hidden.dims[0] == 1 &&
+                                hidden.dims[1] >= totalForwardTokens &&
+                                hidden.dims[2] == model->embed_dim;
+                        }
+                        std::vector<int> multiDFlashDevices;
+                        std::map<int, int> multiDFlashRatios;
+                        const bool haveMultiDFlashDevices =
+                            GetQwen35GPUForwardDevices(
+                                model->deviceMap, multiDFlashDevices,
+                                multiDFlashRatios) &&
+                            !multiDFlashDevices.empty();
+                        const int multiDFlashDraftDevice =
+                            haveMultiDFlashDevices ?
+                                Qwen35DFlashDraftDeviceOr(multiDFlashDevices) : -1;
+                        const std::vector<int> multiDFlashDraftDevices =
+                            haveMultiDFlashDevices ?
+                                Qwen35DFlashDraftDevicesOrDefault(multiDFlashDevices) :
+                                std::vector<int>();
+                        std::vector<unsigned char> rowSeeded(tokenContexts.size(), 0);
+                        std::vector<std::vector<Data> > rowHidden(tokenContexts.size());
+                        std::vector<int> draftRows;
+                        std::vector<std::vector<int> > draftsByRow(
+                            tokenContexts.size());
+                        bool allRowsSeeded = captureReady &&
+                            haveMultiDFlashDevices &&
+                            multiDFlashDraftDevice >= 0;
+                        if (allRowsSeeded) {
+                            for (size_t row = 0; row < tokenContexts.size(); ++row) {
+                                if (row >= seqLens.size() ||
+                                    row >= forwardTokenOffsets.size() - 1 ||
+                                    tokenContexts[row] == nullptr ||
+                                    seqLens[row] <= 0) {
+                                    allRowsSeeded = false;
+                                    break;
+                                }
+                                rowHidden[row].resize(
+                                    model->speculativeDFlashHiddenStates.size());
+                                for (size_t feature = 0;
+                                     feature < rowHidden[row].size(); ++feature) {
+                                    Split(model->speculativeDFlashHiddenStates[feature],
+                                          1, forwardTokenOffsets[row],
+                                          forwardTokenOffsets[row] + seqLens[row],
+                                          rowHidden[row][feature]);
+                                }
+                            }
+                        }
+                        if (allRowsSeeded) {
+                          try {
+                            std::lock_guard<std::mutex> guard(
+                                model->mtpCacheMutex);
+                            bool prepared = false;
+                            for (size_t row = 0; row < tokenContexts.size(); ++row) {
+                                ResponseContext *ctx = tokenContexts[row];
+                                const int expectedTokens = ctx->cacheLen +
+                                    ctx->preTokens - seqLens[row];
+                                auto cacheIt = model->dflashContexts.find(ctx);
+                                if (cacheIt == model->dflashContexts.end() &&
+                                    expectedTokens == 0) {
+                                    cacheIt = model->dflashContexts.emplace(
+                                        ctx, Qwen3_5Model::DFlashContext()).first;
+                                }
+                                if (cacheIt == model->dflashContexts.end() ||
+                                    expectedTokens < 0 ||
+                                    cacheIt->second.committedTokens !=
+                                        expectedTokens ||
+                                    (expectedTokens > 0 &&
+                                     (int)cacheIt->second.draftKeyValues.size() !=
+                                         model->dflashLayers)) {
+                                    allRowsSeeded = false;
+                                    break;
+                                }
+                                DFlashContext &cache = cacheIt->second;
+                                model->AppendDFlashTargetHidden(
+                                    multiDFlashDraftDevice, seqLens[row], cache,
+                                    &rowHidden[row], prepared);
+                                prepared = true;
+                                rowSeeded[row] = 1;
+                                if (ctx->prefillRemain <= 0 &&
+                                    Qwen35MtpSupportsGenerationConfig(
+                                        generationConfigs[row]) &&
+                                    !Qwen35DFlashCommitEndsRequest(
+                                        *model, ctx, std::vector<int>{ret[row]}) &&
+                                    Qwen35DFlashDraftFitsContext(
+                                        model->max_positions,
+                                        model->dflashCheckpointBlockSize,
+                                        cache.committedTokens)) {
+                                    draftRows.push_back((int)row);
+                                }
+                            }
+                            if (allRowsSeeded && !draftRows.empty()) {
+                                bool allSimple = true;
+                                bool allSampling = true;
+                                std::vector<int> anchors;
+                                std::vector<const GenerationConfig*> configs;
+                                std::vector<DFlashContext*> contexts;
+                                anchors.reserve(draftRows.size());
+                                configs.reserve(draftRows.size());
+                                contexts.reserve(draftRows.size());
+                                for (int row : draftRows) {
+                                    allSimple &= generationConfigs[row].IsSimpleGreedy();
+                                    allSampling &= !generationConfigs[row].IsSimpleGreedy();
+                                    anchors.push_back(ret[row]);
+                                    configs.push_back(&generationConfigs[row]);
+                                    contexts.push_back(&model->dflashContexts.at(
+                                        tokenContexts[row]));
+                                }
+                                if (draftRows.size() > 1 &&
+                                    (allSimple || allSampling)) {
+                                    std::vector<std::vector<int> > drafts =
+                                        model->RunDFlashDraftBatch(
+                                            multiDFlashDraftDevice,
+                                            multiDFlashDraftDevices, anchors,
+                                            configs, contexts,
+                                            schedulerDraftsPerStep);
+                                    if (drafts.size() != draftRows.size()) {
+                                        allRowsSeeded = false;
+                                    } else {
+                                        for (size_t i = 0; i < draftRows.size(); ++i) {
+                                            if ((int)drafts[i].size() !=
+                                                schedulerDraftsPerStep) {
+                                                allRowsSeeded = false;
+                                                break;
+                                            }
+                                            draftsByRow[draftRows[i]] =
+                                                std::move(drafts[i]);
+                                        }
+                                    }
+                                } else {
+                                    for (int row : draftRows) {
+                                        draftsByRow[row] = model->RunDFlashDraft(
+                                            multiDFlashDraftDevice,
+                                            multiDFlashDraftDevices, ret[row],
+                                            generationConfigs[row],
+                                            model->dflashContexts.at(
+                                                tokenContexts[row]), false,
+                                            schedulerDraftsPerStep);
+                                        if ((int)draftsByRow[row].size() !=
+                                            schedulerDraftsPerStep) {
+                                            allRowsSeeded = false;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            if (!allRowsSeeded) {
+                                for (ResponseContext *ctx : tokenContexts) {
+                                    if (ctx != nullptr) {
+                                        model->dflashContexts.erase(ctx);
+                                    }
+                                }
+                            }
+                          } catch (...) {
+                            {
+                                std::lock_guard<std::mutex> guard(
+                                    model->mtpCacheMutex);
+                                for (ResponseContext *ctx : tokenContexts) {
+                                    if (ctx != nullptr) {
+                                        model->dflashContexts.erase(ctx);
+                                    }
+                                }
+                            }
+                            releaseMultiPrefillHidden();
+                            throw;
+                          }
+                        }
+                        if (allRowsSeeded) {
+                            acceptedTokenLists.assign(tokenContexts.size(), {});
+                            bool anyFinalRow = false;
+                            for (size_t row = 0; row < tokenContexts.size(); ++row) {
+                                if (!rowSeeded[row] ||
+                                    tokenContexts[row]->prefillRemain > 0) {
+                                    continue;
+                                }
+                                acceptedTokenLists[row].push_back(ret[row]);
+                                multiPrefillSeedNext[row].push_back(ret[row]);
+                                multiPrefillSeedNext[row].insert(
+                                    multiPrefillSeedNext[row].end(),
+                                    draftsByRow[row].begin(),
+                                    draftsByRow[row].end());
+                                anyFinalRow = true;
+                            }
+                            usedMtpForward = anyFinalRow;
+                        }
+                        releaseMultiPrefillHidden();
+                    } else if (seqLens.size() > 1) {
+                        model->pdMixPromptTail = pdMixRound;
                         usedMtpForward = model->Qwen35MTPBatchForward(
                             true, tokenContexts, inputIds, attentionMasks,
                             forwardPositionIds,
                             seqLens, pastKeyValues, generationConfigs,
-                            acceptedTokenLists, nextInputTokenLists, keptInputLens);
+                            acceptedTokenLists, nextInputTokenLists, keptInputLens,
+                            schedulerDraftsPerStep);
                     } else {
                         usedMtpForward = model->Qwen35MTPForward(
                             true, singleContext, inputIds, attentionMasks,
@@ -24797,6 +29730,7 @@ namespace fastllm {
 
                     if (!usedMtpForward && !selectedIsPrompt &&
                         !seqLens.empty() && seqLens[0] > 1) {
+                        fallbackNativeForward = true;
                         // The fallback advances only the target cache by one
                         // token. Any existing draft cache still describes the
                         // pre-fallback prefix and must not be reused next turn.
@@ -24852,7 +29786,7 @@ namespace fastllm {
                                                 fallbackSeqLens, pastKeyValues,
                                                 generationConfigs, tokensManager, &logits);
                         seqLens = fallbackSeqLens;
-                    } else if (!usedMtpForward) {
+                    } else if (!usedMtpForward && !mixedRowsSelected && !multiPrefillForwarded) {
                         bool allHandoffDecodeRows = !seqLens.empty() &&
                             seqLens.size() == tokenContexts.size() &&
                             generationConfigs.size() == seqLens.size();
@@ -24932,12 +29866,23 @@ namespace fastllm {
                         }
                     }
 
+                    if (mixedRowsSelected) {
+                        nativeExecutionPath = "mixed:target-only";
+                    } else if (selectedMultimodal) {
+                        nativeExecutionPath = "multimodal";
+                    } else if (fallbackNativeForward) {
+                        nativeExecutionPath = "fallback:mtp_to_forward_gpu";
+                    } else if (usedMtpForward) {
+                        nativeExecutionPath = schedulerUsesDFlash ? "dflash" : "mtp";
+                    } else {
+                        nativeExecutionPath = "text";
+                    }
+
                     if (model->verbose && selectedIsPrompt) {
                         int prefillTokens = 0;
-                        for (int len : seqLens) {
-                            if (len > 1) {
-                                prefillTokens += len;
-                            }
+                        for (size_t row = 0; row < seqLens.size(); ++row) {
+                            if (rowPrompt(row) && seqLens[row] > 1)
+                                prefillTokens += seqLens[row];
                         }
                         if (prefillTokens > 0) {
                             auto batchEndTime = std::chrono::system_clock::now();
@@ -24945,6 +29890,15 @@ namespace fastllm {
                             float prefillSpeed = batchSpend > 0 ? prefillTokens / batchSpend : 0;
                             printf("[Prompt] %d Tokens. Speed: %f tokens / s.\n",
                                    prefillTokens, prefillSpeed);
+                            fflush(stdout);
+                            // 口径修正：[Decode] 的计时秒表在服务循环入口
+                            // 起算，会把**本请求自己的 SSD 导入 + prefill** 一起算进第一个窗口
+                            // ⇒ 首窗"速度"被严重低估。真机铁证：重启重放 40k 上下文的窗口反算
+                            // = 1 token / 215.2 s（打出 0.004646 tok/s），而同配置导入 18.0 s +
+                            // prefill 1.3 s 只有 19.3 s；改前同位置是 0.049978（= 1/20.0 s）。
+                            // 修法：prefill 打印即重置秒表 ⇒ 第一个 [Decode] 窗口只度量真正的 decode。
+                            lastRecordTime = std::chrono::system_clock::now();
+                            genTokens = 0;
                         }
                     }
                 }
@@ -24960,9 +29914,76 @@ namespace fastllm {
                         nextInputTokenLists.push_back(std::vector<int>{token});
                     }
                 }
+                if (seedMixedDFlash && !mixedSeedNext.empty()) {
+                    if (nextInputTokenLists.size() < mixedSeedNext.size())
+                        nextInputTokenLists.resize(mixedSeedNext.size());
+                    for (size_t row = 0; row < mixedSeedNext.size(); ++row) {
+                        if (mixedSeedNext[row].size() > 1)
+                            nextInputTokenLists[row] = std::move(mixedSeedNext[row]);
+                    }
+                }
+                // Publish only rows that really received a draft proposal. A
+                // one-token row remains on the generic target-only fallback.
+                if (multiPrefillEnabled && !multiPrefillSeedNext.empty()) {
+                    if (nextInputTokenLists.size() < multiPrefillSeedNext.size()) {
+                        nextInputTokenLists.resize(multiPrefillSeedNext.size());
+                    }
+                    for (size_t row = 0; row < multiPrefillSeedNext.size(); ++row) {
+                        if (multiPrefillSeedNext[row].size() > 1) {
+                            nextInputTokenLists[row] =
+                                multiPrefillSeedNext[row];
+                        }
+                    }
+                }
 
+                if (adaptiveSpecPolicy.Enabled() && usedMtpForward && !selectedIsPrompt &&
+                    !mixedRowsSelected && schedulerDraftsPerStep > 0) {
+                    int adaptiveRows = 0;
+                    int acceptedTotal = 0;
+                    for (size_t row = 0; row < tokenContexts.size(); ++row) {
+                        if (rowPrompt(row)) continue;
+                        ++adaptiveRows;
+                        if (row < acceptedTokenLists.size())
+                            acceptedTotal += (int)acceptedTokenLists[row].size();
+                    }
+                    adaptiveSpecPolicy.ObserveAccepted(
+                        schedulerDraftsPerStep, adaptiveRows, acceptedTotal);
+                }
+
+                if (bp2ObservabilityDebug && nativeExecutionPath == "dflash") {
+                    bool hasDFlashDecodeRow = false;
+                    for (size_t row = 0; row < tokenContexts.size(); ++row) {
+                        if (!rowPrompt(row)) {
+                            hasDFlashDecodeRow = true;
+                            break;
+                        }
+                    }
+                    if (hasDFlashDecodeRow) {
+                        nativeDFlashAccepted.assign(nativeRows.size(), 0);
+                        nativeDFlashDrafts.assign(nativeRows.size(), 0);
+                        for (size_t row = 0; row < tokenContexts.size(); ++row) {
+                            if (rowPrompt(row)) continue;
+                            const int drafts = row < seqLens.size() ?
+                                std::max(0, seqLens[row] - 1) : 0;
+                            const int committed = row < acceptedTokenLists.size() ?
+                                static_cast<int>(acceptedTokenLists[row].size()) : 0;
+                            nativeDFlashAccepted[row] = std::max(0, committed);
+                            nativeDFlashDrafts[row] = drafts;
+                            if (tokenContexts[row] != nullptr) {
+                                tokenContexts[row]->nativeGeneration.DFlashStep(
+                                    static_cast<uint64_t>(nativeDFlashAccepted[row]));
+                            }
+                        }
+                    }
+                }
+                const uint64_t nativeStepEndNs = nativeStepBeginNs ? FastllmObservationTimestampNs() : 0;
+                emitBp2NativeEvent("end", nativeStepEndNs, nativeExecutionPath);
+                diagnosticForward.Finish();
                 forwardLocker.unlock();
+                RequestDiagnosticBatchOperation diagnosticPublishWait(handles, "scheduler_publish_dict_lock_wait",
+                    RequestDiagnosticResource("model.dictLocker", &model->dictLocker).c_str());
                 dictLocker.lock();
+                diagnosticPublishWait.Finish();
 
                 std::set<int>
                     gpuTokenHandoffCacheAdvancedPastEndHandles;
@@ -24983,13 +30004,38 @@ namespace fastllm {
 
                 if (selectedIsPrompt) {
                     for (int i = 0; i < (int)handles.size(); i++) {
+                        if (!rowPrompt((size_t)i)) continue;
                         auto contextIt = model->responseContextDict.dicts.find(handles[i]);
                         if (contextIt == model->responseContextDict.dicts.end()) {
                             continue;
                         }
                         if (i < (int)seqLens.size() && seqLens[i] > 1 &&
                             (int)contextIt->second->allTokens.size() >= pageLen) {
-                            contextIt->second->TryRecordPagedCache(model);
+                            // RESUME_PACK: every short forward ends on a page, so keep
+                            // the single-row checkpoint cadence per row.
+                            ResponseContext *recordCtx = contextIt->second;
+                            if (!resumePackEnabled || recordCtx->prefillRemain < pageLen ||
+                                recordCtx->cacheLen + recordCtx->preTokens -
+                                    recordCtx->intParams["qwen35_linear_prefix_last_len"] >=
+                                    batchPrefillChunkCap) {
+                                recordCtx->TryRecordPagedCache(model);
+                            }
+                        }
+                    }
+                }
+
+                // Prompt input accounting is separate from committed generation.
+                if (selectedIsPrompt) {
+                    for (int i = 0; i < (int)handles.size(); ++i) {
+                        auto it = model->responseContextDict.dicts.find(handles[i]);
+                        if (it == model->responseContextDict.dicts.end()) continue;
+                        ResponseContext *ctx = it->second;
+                        if (!rowPrompt((size_t)i)) continue;
+                        const int count = i < (int)seqLens.size() ? seqLens[i] : 0;
+                        RecordRequestPrefillProgress(ctx, count);
+                        if (count > 0 && ctx->intParams["event_prefill"] == 0) {
+                            FastllmEvent("prefill", ctx->requestId, "prefill", "tokens=%d", count);
+                            ctx->intParams["event_prefill"] = 1;
                         }
                     }
                 }
@@ -25006,6 +30052,7 @@ namespace fastllm {
                         printf("[Decode] alive = %d, pending = %d, context usages: %.1f%%, Speed: %f tokens / s.\n",
                                currentActivate, logPending, kvUsage,
                                spend > 0 ? (float)genTokens / spend : 0.0f);
+                        fflush(stdout);
                         lastRecordTime = nowTime;
                         genTokens = 0;
                     }
@@ -25026,10 +30073,19 @@ namespace fastllm {
                         ctx->preTokens -= seqLens[i] - keptInputLens[i];
                     }
 
+                    const bool nativePromptStep =
+                        rowPrompt((size_t)i) ||
+                        ctx->curTokens == 0;
                     static const std::vector<int> emptyAcceptedTokens;
                     const std::vector<int> &curAcceptedTokens =
                         i < (int)acceptedTokenLists.size() ?
                             acceptedTokenLists[i] : emptyAcceptedTokens;
+                    // 分块预填：本批只推进了一块，采样出的 token 无意义，
+                    // 不得入队/追加历史/切换到解码态。
+                    const bool partialPrefill = batchPrefillResume &&
+                        rowPrompt((size_t)i) &&
+                        ctx->prefillRemain > 0;
+                    if (!partialPrefill) {
                     for (int tokenIndex = 0; tokenIndex < (int)curAcceptedTokens.size(); tokenIndex++) {
                         int curRet = curAcceptedTokens[tokenIndex];
                         if (curRet == model->eos_token_id ||
@@ -25039,6 +30095,8 @@ namespace fastllm {
                                 ctx->TryRecordPagedCache(model);
                             }
                             eraseMtpCache(ctx);
+                            FastllmEvent("output", ctx->requestId, "native_generation_finished",
+                                         "reason=eos output_tokens=%d", ctx->curTokens);
                             break;
                         }
                         auto itStopTk = ctx->generationConfig.stop_token_ids.find(curRet);
@@ -25048,9 +30106,17 @@ namespace fastllm {
                                 ctx->TryRecordPagedCache(model);
                             }
                             eraseMtpCache(ctx);
+                            FastllmEvent("output", ctx->requestId, "native_generation_finished",
+                                         "reason=stop output_tokens=%d", ctx->curTokens);
                             break;
                         }
 
+                        if (Qwen35ChunkDebugEnabled()) {
+                            printf("[CHUNKTAIL-COMMIT] request=%llu output=%d pos=%zu token=%d\n",
+                                   (unsigned long long)ctx->requestId, ctx->curTokens,
+                                   ctx->allTokens.size(), curRet);
+                            fflush(stdout);
+                        }
                         ctx->resultTokenQueue.push(curRet);
                         if (tokenIndex == 0) {
                             queueGeneratedResultLogits(ctx, logits, i);
@@ -25060,12 +30126,15 @@ namespace fastllm {
                             ctx->tokens.Push(curRet);
                         }
                         ctx->curTokens++;
+                        RecordRequestNativeCommit(ctx, nativePromptStep);
                         if (ctx->curTokens == ctx->generationConfig.output_token_limit) {
                             ctx->isEnding = true;
                             if (!skipPagedCacheRecord) {
                                 ctx->TryRecordPagedCache(model);
                             }
                             eraseMtpCache(ctx);
+                            FastllmEvent("output", ctx->requestId, "native_generation_finished",
+                                         "reason=output_limit output_tokens=%d", ctx->curTokens);
                         } else if (ctx->allTokens.size() >= model->max_positions ||
                                    (model->kvMemConfig.enabled && ctx->allTokens.size() >= (size_t)maxTotalLens)) {
                             ctx->isEnding = true;
@@ -25073,6 +30142,8 @@ namespace fastllm {
                                 ctx->TryRecordPagedCache(model);
                             }
                             eraseMtpCache(ctx);
+                            FastllmEvent("output", ctx->requestId, "native_generation_finished",
+                                         "reason=context_limit output_tokens=%d", ctx->curTokens);
                         }
                         if (ctx->isEnding) {
                             break;
@@ -25086,6 +30157,14 @@ namespace fastllm {
                             ctx->currentTokens.assign(1, curAcceptedTokens.back());
                         }
                     }
+                    }
+                    RecordRequestNativeStep(ctx, nativePromptStep, partialPrefill,
+                                            nativePromptStep && i < (int)seqLens.size() ? seqLens[i] : 0,
+                                            nativeStepBeginNs, nativeStepEndNs,
+                                            singleContext == ctx ? ctx->nativeGeneration.visionElapsedNs - nativeVisionBeforeNs : 0);
+                    ReportRequestProgress(ctx,
+                        rowPrompt((size_t)i) ?
+                            "prefill" : "decode", ctx->isEnding);
                 }
                 model->dictCV.notify_all();
                 releasePendingResultLogits(logits);
@@ -25099,6 +30178,9 @@ namespace fastllm {
             }
 
             if (seqLens.empty()) {
+                diagnosticSelect.Finish();
+                RequestDiagnosticBatchOperation diagnosticWait(RequestDiagnosticHandlesForModel(model),
+                    "scheduler_condition_wait", "model.dictCV");
                 if (!orders.empty()) {
                     model->dictCV.wait_for(dictLocker, std::chrono::milliseconds(10));
                 } else {
@@ -26037,6 +31119,7 @@ namespace fastllm {
             devices.size() <= 1) {
             return;
         }
+        ScopedLoadTimer _streamLayer(Qwen35StartupProfile().streamLayerUs);
 
         const std::string prefix = language_prefix + "layers." +
                                    std::to_string(layer) + ".";
@@ -26618,6 +31701,7 @@ namespace fastllm {
     }
 
     void Qwen3_5Model::OnWeightLoadGroupFinished() {
+        ScopedLoadTimer _streamGroup(Qwen35StartupProfile().streamGroupUs);
         if (!consumedFusedMoeSourceWeights.empty()) {
             for (auto &weightName : consumedFusedMoeSourceWeights) {
                 this->weight.weight.erase(weightName);
@@ -26649,6 +31733,43 @@ namespace fastllm {
                 AssertInFastLLM(lmHeadIt != this->weight.weight.end(),
                                 "Qwen3.5 streaming CUDA load is missing lm_head.weight.\n");
                 Data &lmHead = lmHeadIt->second;
+                // 若指定了 DFlash 草稿独立设备：在 lm_head 被切分、完整源被释放
+                // 之前，把完整（未分片）的 lm-head 量化成 NVFP4 放到该卡，供
+                // 单卡草稿使用。复用 dflashNvfp4DraftLmHead 成员承载这份头；
+                // 之后的 PrepareDFlashWeightsForDevice 会补上 marlin 视图。
+                const int dflashDraftDev = Qwen35DFlashDraftDevice();
+                if (dflashDraftDev >= 0 && !lmHead.multiDeviceData &&
+                    !lmHead.dims.empty() && lmHead.cpuData != nullptr &&
+                    dflashNvfp4DraftLmHead.dims.empty()) {
+                    const int previousCudaDevice = FastllmCudaGetDevice();
+                    Data draftHeadSource;
+                    draftHeadSource.CopyFrom(lmHead);
+                    draftHeadSource.ToDevice(
+                        DataDevice::CUDA, {dflashDraftDev}, true);
+                    FastllmCudaSetDevice(dflashDraftDev);
+                    const bool draftHeadReady =
+                        FastllmCudaQuantizeLinearWeightNVFP4Block16(
+                            draftHeadSource, dflashNvfp4DraftLmHead);
+                    if (draftHeadReady) {
+                        dflashNvfp4DraftLmHead.name =
+                            "dflash.draft_lm_head_nvfp4";
+                        dflashNvfp4DraftLmHead.weightType = WeightType::LINEAR;
+                        dflashNvfp4DraftLmHead.isModelWeight = true;
+                    } else {
+                        dflashNvfp4DraftLmHead.FreeSpace();
+                        dflashNvfp4DraftLmHead.dims.clear();
+                    }
+                    printf("[Qwen3.5 DFlash2] draft GPU %d full lm-head [%d,%d] "
+                           "src dtype=%d ready=%d.\n",
+                           dflashDraftDev,
+                           lmHead.dims.size() > 0 ? lmHead.dims[0] : -1,
+                           lmHead.dims.size() > 1 ? lmHead.dims[1] : -1,
+                           (int)lmHead.dataType, draftHeadReady ? 1 : 0);
+                    fflush(stdout);
+                    if (previousCudaDevice >= 0) {
+                        FastllmCudaSetDevice(previousCudaDevice);
+                    }
+                }
                 if (devices.size() == 1) {
                     lmHead.ToDevice(DataDevice::CUDA, devices, true);
                 } else {
@@ -26980,6 +32101,14 @@ namespace fastllm {
     }
 
     void Qwen3_5Model::Prepare() {
+        if (pagedCacheModelIdentity.empty()) pagedCacheModelIdentity = "qwen3.5";
+        if (pagedCacheFamilyIdentity.empty()) {
+            const char *family = std::getenv("FASTLLM_PREFIX_CACHE_FAMILY_IDENTITY");
+            pagedCacheFamilyIdentity = family && *family ? family : "qwen3.5";
+        }
+        if (pagedCacheLayout.empty()) pagedCacheLayout = "paged-kv-v4";
+        if (persistentPrefixCache && Qwen35L2HostKVEnabled() && !pagedSpillState)
+            pagedSpillState = std::make_shared<Qwen35SpillState>();
         const char *patchBudget = std::getenv("FASTLLM_QWEN35_MM_MAX_PATCHES");
         const int maxPatches = patchBudget == nullptr ? 0 : std::atoi(patchBudget);
         if (multimodalWarmedUp || maxPatches <= 0) return;
@@ -27168,7 +32297,14 @@ namespace fastllm {
 #ifdef USE_CUDA
         std::vector<int> tpDevices;
         std::map<int, int> tpRatios;
-        if (visionDeviceId >= 0 && GetQwen35GPUForwardDevices(this->deviceMap, tpDevices, tpRatios) &&
+        const bool visionDeviceExact = visionDeviceId >= 0 && Qwen35VisionDeviceExactEnabled() &&
+            StartWith(requestedVisionDevice, "cuda:");
+        if (visionDeviceExact) {
+            printf("[VISION-DEVICE-EXACT] vision encoder on cuda:%d (single device; text TP unchanged).\n", visionDeviceId);
+            fflush(stdout);
+        }
+        if (!visionDeviceExact && visionDeviceId >= 0 &&
+            GetQwen35GPUForwardDevices(this->deviceMap, tpDevices, tpRatios) &&
             tpDevices.size() > 1) {
             // CUDA vision follows text TP, including when an older caller
             // supplies cuda:N. CPU remains an explicit host execution choice.
@@ -27340,16 +32476,177 @@ namespace fastllm {
         input.CopyFrom(rotated);
     }
 
+    void Qwen3_5Model::VisionAsyncShutdown() {
+        {
+            std::lock_guard<std::mutex> guard(visionAsyncMutex);
+            visionAsyncStop = true;
+            visionAsyncJobs.clear();
+        }
+        visionAsyncCV.notify_all();
+        if (visionAsyncThread.joinable()) visionAsyncThread.join();
+    }
+
+    void Qwen3_5Model::VisionAsyncWorker() {
+#ifdef USE_CUDA
+        FastllmCudaUsePrivateCublasHandle(true);
+        FastllmCudaUsePrivateScratch(true);
+        printf("[VISION-ASYNC] private scratch on the vision worker\n");
+        fflush(stdout);
+        {
+            const char *device = std::getenv("FASTLLM_QWEN35_VISION_DEVICE");
+            const int id = device != nullptr ? std::atoi(device + 5) : -1;   // "cuda:N", checked by VisionAsyncWait
+            FastllmCudaEnableDeferredFreeDevice(id);
+            printf("[VISION-ASYNC] stream-ordered pool frees on cuda:%d\n", id);
+            fflush(stdout);
+        }
+#endif
+        static std::atomic<bool> firstLogged{false};
+        while (true) {
+            std::unique_ptr<VisionAsyncJob> jobHolder;
+            {
+                std::unique_lock<std::mutex> lock(visionAsyncMutex);
+                visionAsyncCV.wait(lock, [&] { return visionAsyncStop || !visionAsyncJobs.empty(); });
+                if (visionAsyncStop) return;
+                jobHolder = std::move(visionAsyncJobs.front());
+                visionAsyncJobs.pop_front();
+            }
+            VisionAsyncJob &job = *jobHolder;
+            const auto begin = std::chrono::steady_clock::now();
+            int state = 2;
+            try {
+                std::vector<Data*> images;
+                for (auto &image : job.images) images.push_back(&image);
+                Data features;
+                std::vector<std::vector<int>> gridList;
+                EncodeVisualItems(images, &job.grid, false, features, gridList, &job.keys, nullptr);
+            } catch (const std::exception &error) {
+                state = 3;
+                printf("[VISION-ASYNC] background encode failed request=%llu: %s\n",
+                       (unsigned long long)job.requestId, error.what());
+                fflush(stdout);
+            } catch (...) {
+                state = 3;
+                printf("[VISION-ASYNC] background encode failed request=%llu\n", (unsigned long long)job.requestId);
+                fflush(stdout);
+            }
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
+            {
+                std::lock_guard<std::mutex> guard(visionAsyncMutex);
+                visionAsyncState[job.requestId] = state;
+            }
+            if (!firstLogged.exchange(true)) {
+                printf("[VISION-ASYNC] first background encode done: request=%llu images=%zu ms=%.1f state=%d\n",
+                       (unsigned long long)job.requestId, job.images.size(), ms, state);
+            }
+            printf("[VISION-ASYNC-JOB] request=%llu begin_ns=%lld end_ns=%lld ms=%.1f state=%d\n",
+                   (unsigned long long)job.requestId,
+                   (long long)std::chrono::duration_cast<std::chrono::nanoseconds>(begin.time_since_epoch()).count(),
+                   (long long)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       std::chrono::steady_clock::now().time_since_epoch()).count(), ms, state);
+            fflush(stdout);
+            dictCV.notify_all();
+        }
+    }
+
+    bool Qwen3_5Model::VisionAsyncWait(ResponseContext *ctx) {
+        if (!Qwen35VisionAsyncEnabled() || ctx == nullptr || ctx->multimodalInput.empty()) return false;
+        if (ctx->intParams.count("mm_async_encoded")) return false;
+        auto finish = [&]() { ctx->intParams["mm_async_encoded"] = 1; return false; };
+        // Only a fresh image prompt: restored prefixes, video and already started prompts keep the old path.
+        auto frames = ctx->multimodalInput.find("image_frames");
+        auto grid = ctx->multimodalInput.find("image_grid_thw");
+        auto keys = ctx->multimodalInput.find("image_cache_keys");
+        auto video = ctx->multimodalInput.find("video_frames");
+        if (frames == ctx->multimodalInput.end() || frames->second.empty() ||
+            grid == ctx->multimodalInput.end() || grid->second.empty() || grid->second[0] == nullptr ||
+            keys == ctx->multimodalInput.end() || keys->second.empty() || keys->second[0] == nullptr ||
+            (video != ctx->multimodalInput.end() && !video->second.empty()) ||
+            ctx->cacheLen > 0 ||
+            (ctx->intParams.count("mm_embedding_cursor") && ctx->intParams.at("mm_embedding_cursor") > 0)) {
+            return finish();
+        }
+        static const bool usable = [] {
+            const char *device = std::getenv("FASTLLM_QWEN35_VISION_DEVICE");
+            const char *exact = std::getenv("FASTLLM_QWEN35_VISION_DEVICE_EXACT");
+            const char *keep = std::getenv("FASTLLM_QWEN35_VISION_KEEP_BUFFERS");
+            const bool ok = device != nullptr && std::string(device).rfind("cuda:", 0) == 0 &&
+                exact != nullptr && std::string(exact) == "1" && keep != nullptr && std::string(keep) == "1";
+            printf("[VISION-ASYNC] %s\n", ok ? "background image encode enabled on the exact vision device." :
+                   "disabled: needs FASTLLM_QWEN35_VISION_DEVICE=cuda:N, _DEVICE_EXACT=1 and _KEEP_BUFFERS=1.");
+            fflush(stdout);
+            return ok;
+        }();
+        if (!usable) return finish();
+        // created here, on the scheduler thread, before the worker exists (EncodeVisualItems creates it lazily too)
+        if (!imageEmbeddingCache) {
+            const size_t capacity = ImageEmbeddingCache::CapacityFromEnv();
+            if (capacity == 0) return finish();
+            imageEmbeddingCache = std::make_unique<ImageEmbeddingCache>(capacity);
+        }
+        std::lock_guard<std::mutex> guard(visionAsyncMutex);
+        auto it = visionAsyncState.find(ctx->requestId);
+        if (it != visionAsyncState.end()) {
+            if (it->second == 1) return true;
+            visionAsyncState.erase(it);
+            return finish();
+        }
+        for (Data *image : frames->second) {
+            if (image == nullptr) return finish();
+        }
+        // under visionAsyncMutex, request not queued yet; lock order visionAsyncMutex -> cache mutex
+        if (Qwen35VisionAsyncFlag("FASTLLM_QWEN35_VISION_ASYNC_SKIP_CACHED")) {
+            const Data *k = keys->second[0];
+            const int n = (int)frames->second.size();
+            if (k->cpuData != nullptr && k->dataType == DataType::INT32 && k->dims == std::vector<int>({n, 8})) {
+                bool all = true;
+                for (int i = 0; i < n && all; i++) {
+                    // same key as EncodeVisualItems: 32 hash bytes + model dtype
+                    std::string key((const char*)k->cpuData + i * 32, 32);
+                    key += std::to_string((int)this->dataType);
+                    all = imageEmbeddingCache->Contains(key);
+                }
+                if (all) {
+                    static std::atomic<bool> skipLogged{false};
+                    if (!skipLogged.exchange(true)) {
+                        printf("[VISION-ASYNC-SKIP-CACHED] request=%llu images=%d\n", (unsigned long long)ctx->requestId, n);
+                        fflush(stdout);
+                    }
+                    return finish();
+                }
+            }
+        }
+        auto job = std::make_unique<VisionAsyncJob>();
+        job->requestId = ctx->requestId;
+        job->images.reserve(frames->second.size());
+        for (Data *image : frames->second) job->images.emplace_back(*image);   // deep copy constructor
+        job->grid.CopyFrom(*grid->second[0]);
+        job->keys.CopyFrom(*keys->second[0]);
+        visionAsyncJobs.push_back(std::move(job));
+        visionAsyncState[ctx->requestId] = 1;
+        if (!visionAsyncThread.joinable()) {
+            visionAsyncThread = std::thread([this] { VisionAsyncWorker(); });
+        }
+        visionAsyncCV.notify_all();
+        return true;
+    }
+
     void Qwen3_5Model::EncodeVisualItems(const std::vector <Data*> &rawInputs,
                                          const Data *gridThwData,
                                          bool isVideo,
                                          Data &features,
                                          std::vector<std::vector<int>> &gridThwList,
-                                         const Data *imageCacheKeys) {
+                                         const Data *imageCacheKeys,
+                                         ResponseContext *context) {
         gridThwList.clear();
         features = Data();
         if (rawInputs.empty()) {
             return;
+        }
+        RequestDiagnosticCurrentOperation diagnosticVision("vision_encode", "Qwen3_5Model.EncodeVisualItems");
+        const auto visionStageBegin = std::chrono::steady_clock::now();
+        if (context != nullptr) {
+            FastllmEvent("vision", context->requestId, "vision_encode_begin",
+                         "images=%zu video=%d", rawInputs.size(), isVideo ? 1 : 0);
         }
         // Isolate both CPU and explicit CUDA vision from the text executor.
         // Restore the calling thread's CUDA device after initial weight moves
@@ -27368,7 +32665,18 @@ namespace fastllm {
 #endif
             }
         } visionExecutorScope;
-        PrepareVision();
+        const auto visionPrepareBegin = std::chrono::steady_clock::now();
+        {
+            std::unique_lock<std::mutex> visionPrepareLock(visionEncodeMutex, std::defer_lock);
+            if (Qwen35VisionAsyncEnabled() && !visionPrepared) visionPrepareLock.lock();
+            PrepareVision();
+        }
+        if (context != nullptr) {
+            const double prepareMs = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - visionPrepareBegin).count();
+            FastllmEvent("vision", context->requestId, "vision_prepare_end",
+                         "elapsed_ms=%.3f", prepareMs);
+        }
 #ifdef USE_CUDA
         CudaWorkspaceScope workspaceScope(visionWorkspace);
 #endif
@@ -27398,8 +32706,14 @@ namespace fastllm {
         const float attnScale = powf((float) vision_head_dim, -0.5f);
         std::vector<float> mergedFeatures;
         int totalFeatureCount = 0;
+        int visionCacheHits = 0;
+        int visionCacheMisses = 0;
 
         ImageEmbeddingCache *imageCache = nullptr;
+        if (context != nullptr) {
+            FastllmEvent("vision", context->requestId, "vision_cache_lookup",
+                         "phase=begin images=%zu", rawInputs.size());
+        }
         if (!isVideo && imageCacheKeys != nullptr && imageCacheKeys->cpuData != nullptr &&
             imageCacheKeys->dataType == DataType::INT32 &&
             imageCacheKeys->dims == std::vector<int>({(int)rawInputs.size(), 8})) {
@@ -27432,16 +32746,39 @@ namespace fastllm {
                 // and processor settings. Keep all 256 bits, outside token IDs.
                 imageCacheKey.assign((const char*)imageCacheKeys->cpuData + mediaIndex * 32, 32);
                 imageCacheKey += std::to_string((int)this->dataType);
+                const auto visionLookupBegin = std::chrono::steady_clock::now();
                 size_t cached = imageCache->Append(imageCacheKey, mergedFeatures);
                 if (cached > 0) {
+                    visionCacheHits++;
                     totalFeatureCount += (int)(cached / vision_out_hidden_size);
                     if (this->verbose) {
                         printf("[Vision] Image embedding cache hit (%zu bytes).\n", cached * sizeof(float));
                     }
+                    if (context != nullptr) {
+                        FastllmEvent("vision", context->requestId, "vision_cache_restore",
+                                     "tier=L1(GPU/RAM) bytes=%zu", cached * sizeof(float));
+                        FastllmEvent(
+                            "vision", context->requestId, "vision_cache_lookup_result",
+                            "hit=1 lookup_ms=%.3f bytes=%zu",
+                            std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - visionLookupBegin).count(),
+                            cached * sizeof(float));
+                    }
                     continue;
+                }
+                visionCacheMisses++;
+                if (context != nullptr) {
+                    FastllmEvent(
+                        "vision", context->requestId, "vision_cache_lookup_result",
+                        "hit=0 lookup_ms=%.3f",
+                        std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - visionLookupBegin).count());
                 }
             }
             size_t featureStart = mergedFeatures.size();
+            std::unique_lock<std::mutex> visionMediaLock(visionEncodeMutex, std::defer_lock);
+            if (Qwen35VisionAsyncEnabled()) visionMediaLock.lock();
+            const auto visionStageMediaBegin = std::chrono::steady_clock::now();
 
             Data rawCpu(*rawInputs[mediaIndex]);
             rawCpu.ToDevice(DataDevice::CPU);
@@ -27502,7 +32839,34 @@ namespace fastllm {
 #else
                 false;
 #endif
+            const bool visionStageTimer = Qwen35VisionStageTimerEnabled();
+            enum { VST_SETUP, VST_EMBED, VST_QKV, VST_ATTN, VST_PROJ, VST_MLP, VST_MERGER, VST_COMM, VST_COUNT };
+#ifdef USE_CUDA
+            const int visionStageRanks = rankCount;
+#else
+            const int visionStageRanks = 1;
+#endif
+            std::vector<std::array<double, VST_COUNT>> visionStageMs(visionStageRanks);
+            for (auto &row : visionStageMs) row.fill(0.0);
+            std::vector<double> visionStageEntryMs(visionStageRanks, 0.0);
+            const auto visionStageSpawn = std::chrono::steady_clock::now();
             auto encodeRank = [&](int rankIndex) {
+                auto stageLast = std::chrono::steady_clock::now();
+                int stageCur = VST_SETUP;
+                if (visionStageTimer) {
+                    visionStageEntryMs[rankIndex] =
+                        std::chrono::duration<double, std::milli>(stageLast - visionStageSpawn).count();
+                }
+                auto stageEnd = [&](int stage, int next) {
+                    if (!visionStageTimer) return;
+#ifdef USE_CUDA
+                    FastllmCudaSyncCurrentThreadStream();
+#endif
+                    const auto now = std::chrono::steady_clock::now();
+                    visionStageMs[rankIndex][stage] += std::chrono::duration<double, std::milli>(now - stageLast).count();
+                    stageLast = now;
+                    stageCur = next;
+                };
 #ifdef USE_CUDA
                 auto *rank = tensorParallel ? visionTP->ranks[rankIndex].get() : nullptr;
                 Executor rankExecutor;
@@ -27591,12 +32955,14 @@ namespace fastllm {
                     ToDataType(output, DataType::FLOAT32);
                     FastllmCudaSyncCurrentThreadStream();
                     if (FastllmCudaGetThreadError()) throw std::runtime_error("Vision TP CUDA error before all-reduce");
+                    stageEnd(stageCur, stageCur);
                     barrier.Wait();
                     FastllmNcclAllReduceNoCustom(output.cudaData, output.cudaData,
                                                 output.Count(0), output.dataType, rank->device);
                     FastllmCudaSyncCurrentThreadStream();
                     if (FastllmCudaGetThreadError()) throw std::runtime_error("Vision TP CUDA all-reduce failed");
                     barrier.Wait();
+                    stageEnd(VST_COMM, stageCur);
                     auto finishOutput = [&](Data &value, Data *addResidual) {
                         const auto dims = value.dims;
                         const int width = dims.back();
@@ -27737,6 +33103,7 @@ namespace fastllm {
 #endif
                     Linear(input, projectionWeight, bias, output);
                 };
+            stageEnd(VST_SETUP, VST_EMBED);
             Data &patchWeight = visionWeights[patchWeightName];
             DataType pixelType = DataType::FLOAT32;
 #ifdef USE_CUDA
@@ -27917,13 +33284,14 @@ namespace fastllm {
                 // In particular, return the one-shot packed-pixel allocation
                 // before the QKV/MLP high-water phase begins.
                 FastllmCudaSyncCurrentThreadStream();
-                if (!tensorParallel) FastllmCudaClearBigBufferAll();
+                if (!tensorParallel && !Qwen35VisionKeepBuffersEnabled()) FastllmCudaClearBigBufferAll();
             }
 #endif
 
             Data posHData(DataType::FLOAT32, {1, patchCount}, posH);
             Data posWData(DataType::FLOAT32, {1, patchCount}, posW);
 
+            stageEnd(VST_EMBED, VST_QKV);
             for (int layer = 0; layer < vision_depth; layer++) {
                 // Keep each block's temporaries independent.  Some of them are
                 // converted in place (notably the MLP activation), so reusing
@@ -27942,6 +33310,7 @@ namespace fastllm {
                 columnProjection(blockInput, visionWeights[pre + ".attn.qkv.weight"],
                                  visionWeights[pre + ".attn.qkv.bias"], qkv, true);
                 blockInput.FreeSpace();
+                stageEnd(VST_QKV, VST_ATTN);
                 // Qwen3.5 vision uses a 72-wide head. Process one vision head
                 // at a time so FlashInfer only needs one set of 128-wide padded
                 // Q/K/V buffers. Keeping all 16 padded heads alive costs about
@@ -28075,6 +33444,7 @@ namespace fastllm {
                 } else {
                     blockInput.FreeSpace();
                 }
+                stageEnd(VST_ATTN, VST_PROJ);
                 Data projectedAttn;
 #ifdef USE_CUDA
                 if (tensorParallel) {
@@ -28122,6 +33492,7 @@ namespace fastllm {
                     projectedAttn.FreeSpace();
                 }
                 hiddenStates.CopyFrom(residual);
+                stageEnd(VST_PROJ, VST_MLP);
 
                 Mul(hiddenStates, 1.0f, residual);
                 LayerNorm(hiddenStates,
@@ -28232,7 +33603,9 @@ namespace fastllm {
                     mlpOutput.FreeSpace();
                 }
                 hiddenStates.CopyFrom(residual);
+                stageEnd(VST_MLP, VST_QKV);
             }
+            stageCur = VST_MERGER;
 
             const int mergeUnit = vision_spatial_merge_size * vision_spatial_merge_size;
             AssertInFastLLM(patchCount % mergeUnit == 0, "Qwen3.5 merger input length must be divisible by merge unit.");
@@ -28243,7 +33616,7 @@ namespace fastllm {
                 // merger. Do not retain the allocator's normal 300 MiB cache
                 // at this explicit phase boundary.
                 FastllmCudaSyncCurrentThreadStream();
-                if (!tensorParallel) FastllmCudaClearBigBufferAll();
+                if (!tensorParallel && !Qwen35VisionKeepBuffersEnabled()) FastllmCudaClearBigBufferAll();
             }
 #endif
             auto appendMergerOutput = [&](Data &mergerOutput) {
@@ -28371,11 +33744,13 @@ namespace fastllm {
                 appendMergerOutput(mergerOutput);
             }
 
+                stageEnd(VST_MERGER, VST_COMM);
 #ifdef USE_CUDA
                 if (tensorParallel) {
                     FastllmCudaSyncCurrentThreadStream();
                     if (FastllmCudaGetThreadError()) throw std::runtime_error("Vision TP CUDA encoder failed");
                     barrier.Wait();
+                    stageEnd(VST_COMM, VST_COMM);
                 }
 #endif
             };
@@ -28399,6 +33774,7 @@ namespace fastllm {
             {
                 encodeRank(0);
             }
+            const auto visionStageJoined = std::chrono::steady_clock::now();
             if (!imageCacheKey.empty()) {
                 size_t count = mergedFeatures.size() - featureStart;
                 bool stored = imageCache->Put(
@@ -28409,9 +33785,41 @@ namespace fastllm {
                            imageCache->SizeBytes(), imageCache->Capacity());
                 }
             }
+            const auto visionStagePut = std::chrono::steady_clock::now();
 #ifdef USE_CUDA
-            FastllmCudaClearBigBufferAll();
+            if (Qwen35VisionKeepBuffersEnabled()) {
+                static bool keepBuffersPrinted = false;
+                if (!keepBuffersPrinted) {
+                    keepBuffersPrinted = true;
+                    printf("[VISION-KEEP-BUFFERS] first image: skipped FastllmCudaClearBigBufferAll after encode.\n");
+                    fflush(stdout);
+                }
+            } else {
+                FastllmCudaClearBigBufferAll();
+            }
 #endif
+            if (visionStageTimer) {
+                auto msBetween = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
+                    return std::chrono::duration<double, std::milli>(b - a).count();
+                };
+                static const char *stageNames[VST_COUNT] = {"setup", "embed", "qkv", "attn", "proj", "mlp", "merger", "comm"};
+                std::string rankText;
+                for (int r = 0; r < visionStageRanks; ++r) {
+                    char buffer[512];
+                    int used = snprintf(buffer, sizeof(buffer), " r%d{entry=%.1f", r, visionStageEntryMs[r]);
+                    for (int st = 0; st < VST_COUNT && used < (int)sizeof(buffer); ++st) {
+                        used += snprintf(buffer + used, sizeof(buffer) - used, " %s=%.1f", stageNames[st], visionStageMs[r][st]);
+                    }
+                    if (used < (int)sizeof(buffer)) snprintf(buffer + used, sizeof(buffer) - used, "}");
+                    rankText += buffer;
+                }
+                printf("[VISION-STAGE] media=%d patches=%d host_prep_ms=%.1f ranks_ms=%.1f post_ms=%.1f put_ms=%.1f%s\n",
+                       mediaIndex, patchCount, msBetween(visionStageMediaBegin, visionStageSpawn),
+                       msBetween(visionStageSpawn, visionStageJoined),
+                       msBetween(visionStageJoined, std::chrono::steady_clock::now()),
+                       msBetween(visionStageJoined, visionStagePut), rankText.c_str());
+                fflush(stdout);
+            }
         }
 
         if (totalFeatureCount > 0) {
@@ -28439,6 +33847,18 @@ namespace fastllm {
             fflush(stdout);
         }
 #endif
+        if (context != nullptr) {
+            if (GetFastllmObservabilityMode() != FastllmObservabilityMode::Off) {
+                context->nativeGeneration.visionElapsedNs += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - visionStageBegin).count();
+            }
+            FastllmEvent(
+                "vision", context->requestId, "vision_encode_end",
+                "elapsed_ms=%.3f features=%d cache_hits=%d cache_misses=%d",
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - visionStageBegin).count(),
+                totalFeatureCount, visionCacheHits, visionCacheMisses);
+        }
     }
 
     void Qwen3_5Model::BuildMultimodalPositionData(const Data &inputIds,
@@ -28616,7 +34036,8 @@ namespace fastllm {
     }
 
     void Qwen3_5Model::BuildMultimodalTextEmbeddings(const Data &inputIds,
-                                                   Data &hiddenStates) {
+                                                   Data &hiddenStates,
+                                                   int rowBegin, int rowEnd) {
         Data idsCpu(inputIds);
         idsCpu.ToDevice(DataDevice::CPU);
         if (idsCpu.dataType != DataType::FLOAT32) {
@@ -28657,8 +34078,11 @@ namespace fastllm {
         const int chunkSize = std::max(1, std::min(2048, GetChunkedPrefillSize() > 0
                                                       ? GetChunkedPrefillSize() : 2048));
         const float *ids = (const float*)idsCpu.cpuData;
-        for (int start = 0; start < tokens; start += chunkSize) {
-            const int count = std::min(chunkSize, tokens - start);
+        // Rows outside [rowBegin, rowEnd) stay unwritten; callers read only this range.
+        if (rowEnd < 0 || rowEnd > tokens) rowEnd = tokens;
+        rowBegin = std::max(0, std::min(rowBegin, rowEnd));
+        for (int start = rowBegin; start < rowEnd; start += chunkSize) {
+            const int count = std::min(chunkSize, rowEnd - start);
             Data chunkIds(DataType::FLOAT32, {1, count},
                           std::vector<float>(ids + start, ids + start + count));
             Data embedding;
@@ -28697,7 +34121,8 @@ namespace fastllm {
     void Qwen3_5Model::MergeMultimodalFeaturesIntoText(const Data &mmTokenTypeIds,
                                                        const Data *imageEmbeds,
                                                        const Data *videoEmbeds,
-                                                       Data &hiddenStates) {
+                                                       Data &hiddenStates,
+                                                       int rowBegin, int rowEnd) {
         Data mmCpu(mmTokenTypeIds);
         mmCpu.ToDevice(DataDevice::CPU);
         if (mmCpu.dataType != DataType::FLOAT32) {
@@ -28748,19 +34173,25 @@ namespace fastllm {
         uint8_t *hiddenPtr = (uint8_t*) hiddenStates.cpuData;
         float *mmPtr = (float*) mmCpu.cpuData;
         int nextImage = 0, nextVideo = 0;
+        if (rowEnd < 0 || rowEnd > hiddenStates.dims[1]) rowEnd = hiddenStates.dims[1];
         for (int i = 0; i < hiddenStates.dims[1]; i++) {
             int tokenType = (int) mmPtr[i];
+            const bool inRange = i >= rowBegin && i < rowEnd;
             if (tokenType == 1) {
                 AssertInFastLLM(nextImage < imageCount, "Qwen3.5 image embeds count does not match image placeholders.");
-                memcpy(hiddenPtr + (size_t) i * rowBytes,
-                       imagePtr + (size_t) nextImage * rowBytes,
-                       rowBytes);
+                if (inRange) {
+                    memcpy(hiddenPtr + (size_t) i * rowBytes,
+                           imagePtr + (size_t) nextImage * rowBytes,
+                           rowBytes);
+                }
                 nextImage++;
             } else if (tokenType == 2) {
                 AssertInFastLLM(nextVideo < videoCount, "Qwen3.5 video embeds count does not match video placeholders.");
-                memcpy(hiddenPtr + (size_t) i * rowBytes,
-                       videoPtr + (size_t) nextVideo * rowBytes,
-                       rowBytes);
+                if (inRange) {
+                    memcpy(hiddenPtr + (size_t) i * rowBytes,
+                           videoPtr + (size_t) nextVideo * rowBytes,
+                           rowBytes);
+                }
                 nextVideo++;
             }
         }
@@ -29217,10 +34648,24 @@ namespace fastllm {
         if (!HasDFlashWeights()) {
             return;
         }
+        // 防呆：指定草稿独占设备后，任何其它设备上的草稿准备都是错误的
+        // （会把整份草稿权重搬回 target 卡并重建分片，直接撑爆显存）。
+        const int draftOwnDevice = Qwen35DFlashDraftDevice();
+        if (draftOwnDevice >= 0 && device != draftOwnDevice) {
+            static std::atomic<int> ignoredPrepares(0);
+            if (ignoredPrepares.fetch_add(1) < 8) {
+                printf("[Qwen3.5 DFlash2] draft device is cuda:%d; "
+                       "ignored prepare on cuda:%d.\n",
+                       draftOwnDevice, device);
+                fflush(stdout);
+            }
+            return;
+        }
         if (dflashWeightsPrepared && dflashWeightsPreparedDevice == device) {
             PrepareDFlashBackboneTensorParallelWeights(device);
             return;
         }
+        ScopedLoadTimer _draftPrepare(Qwen35StartupProfile().draftPrepareUs);
         if (!dflashDraftTokenIds.empty()) {
             dflashDraftLmHeads.clear();
             dflashDraftTokenIds.clear();
@@ -29453,10 +34898,14 @@ namespace fastllm {
                 }
             }
             Data &head = weight["lm_head.weight"];
-            if (!head.multiDeviceData && supported(head)) {
+            // 草稿独占设备（FASTLLM_DFLASH_DRAFT_DEVICE）时草稿就是单卡，
+            // 不存在目标 TP4 那套"分片头 + 短表"通路，两处都跳过。
+            const bool draftOwnDevice = device == Qwen35DFlashDraftDevice();
+            if (!draftOwnDevice && !head.multiDeviceData && supported(head)) {
                 PrepareDFlashDraftShortlist({device});
             }
-            if (head.multiDeviceData && !PrepareDFlashDraftShortlist(tpDevices)) {
+            if (!draftOwnDevice && head.multiDeviceData &&
+                !PrepareDFlashDraftShortlist(tpDevices)) {
                 for (int tpDevice : tpDevices) {
                     auto local = head.multiDeviceDatas.find(tpDevice);
                     if (local == head.multiDeviceDatas.end() || !local->second) continue;
@@ -29719,10 +35168,15 @@ namespace fastllm {
         auto selected = dflashDraftTokenIds.find(device);
         const bool compact = useShortlist && selected != dflashDraftTokenIds.end();
         Data *head = &originalHead;
-        auto local = dflashDraftLmHeads.find(device);
-        if (local != dflashDraftLmHeads.end() &&
+        auto shortlistHead = dflashDraftLmHeads.find(device);
+        if (shortlistHead != dflashDraftLmHeads.end() &&
             (selected == dflashDraftTokenIds.end() || compact)) {
-            head = &local->second;
+            head = &shortlistHead->second;
+        } else if (device == Qwen35DFlashDraftDevice() &&
+                   !dflashNvfp4DraftLmHead.dims.empty()) {
+            // 草稿独占设备：草稿是单卡，直接用这份完整头，
+            // 不进目标 lm_head 的分片/短表通路。
+            head = &dflashNvfp4DraftLmHead;
         } else if (!weight["lm_head.weight"].multiDeviceData && !dflashNvfp4DraftLmHead.dims.empty()) {
             head = &dflashNvfp4DraftLmHead;
         }
@@ -29883,17 +35337,22 @@ namespace fastllm {
     }
 
     void Qwen3_5Model::AppendDFlashTargetHidden(
-            int device, int tokens, DFlashContext &context) {
+            int device, int tokens, DFlashContext &context,
+            std::vector<Data> *capturedHidden, bool prepared) {
 #ifndef USE_CUDA
         (void)device;
         (void)tokens;
         (void)context;
+        (void)capturedHidden;
+        (void)prepared;
 #else
+        std::vector<Data> &inputHidden = capturedHidden == nullptr ?
+            speculativeDFlashHiddenStates : *capturedHidden;
         AssertInFastLLM(tokens > 0 &&
-                            speculativeDFlashHiddenStates.size() ==
+                            inputHidden.size() ==
                                 dflashTargetLayerIds.size(),
                         "DFlash target hidden capture is incomplete.\n");
-        PrepareDFlashWeightsForDevice(device);
+        if (!prepared) PrepareDFlashWeightsForDevice(device);
         Qwen35ScopedGenericExecutor executor(
             "cuda:" + std::to_string(device));
         FastllmCudaSetDevice(device);
@@ -29914,7 +35373,7 @@ namespace fastllm {
         combined.dataType = projectionInputType;
         combined.UpdateUnitSize();
         const int combinedWidth = embed_dim *
-            (int)speculativeDFlashHiddenStates.size();
+            (int)inputHidden.size();
         const int projectionTokens = std::max(8, tokens);
         combined.Resize({1, projectionTokens, combinedWidth});
         combined.Allocate(false);
@@ -29933,17 +35392,50 @@ namespace fastllm {
                 size_t(tokens) * combinedRowBytes,
                 size_t(projectionTokens - tokens) * combinedRowBytes);
         }
+        // 草稿独占设备：捕获张量在 target 卡上，先整块搬到草稿卡，之后的
+        // 类型转换与逐行拷贝仍是同卡 D2D，避免每行都走跨卡调用。
+        std::vector<Data> stagedTargetHidden;
+        bool useStagedTargetHidden = false;
+        if (!inputHidden.empty()) {
+            const Data &firstCaptured = inputHidden[0];
+            const int captureDevice = firstCaptured.dataDeviceIds.empty() ?
+                0 : firstCaptured.dataDeviceIds[0];
+            if (firstCaptured.dataDevice == DataDevice::CUDA &&
+                firstCaptured.cudaData != nullptr &&
+                captureDevice != device) {
+                useStagedTargetHidden = true;
+                FastllmCudaSetDevice(device);
+                stagedTargetHidden.resize(
+                    inputHidden.size());
+                for (size_t index = 0;
+                     index < inputHidden.size(); index++) {
+                    Data &source = inputHidden[index];
+                    Data &staged = stagedTargetHidden[index];
+                    staged.dataType = source.dataType;
+                    staged.UpdateUnitSize();
+                    staged.Resize(source.dims);
+                    staged.dataDevice = DataDevice::CUDA;
+                    staged.dataDeviceIds = {device};
+                    staged.Allocate(false);
+                    FastllmCudaMemcpyBetweenDevices(
+                        device, staged.cudaData, captureDevice,
+                        source.cudaData, source.GetBytes());
+                }
+            }
+        }
         std::vector<void*> copyDsts;
         std::vector<const void*> copySrcs;
         std::vector<size_t> copySizes;
         const bool batchCopies = tokens <= 8;
         if (batchCopies) {
-            const size_t count = size_t(tokens) * speculativeDFlashHiddenStates.size();
+            const size_t count = size_t(tokens) * inputHidden.size();
             copyDsts.reserve(count); copySrcs.reserve(count); copySizes.reserve(count);
         }
         for (int feature = 0;
-             feature < (int)speculativeDFlashHiddenStates.size(); feature++) {
-            Data &captured = speculativeDFlashHiddenStates[feature];
+             feature < (int)inputHidden.size(); feature++) {
+            Data &captured = useStagedTargetHidden ?
+                stagedTargetHidden[feature] :
+                inputHidden[feature];
             AssertInFastLLM(captured.dims.size() == 3 &&
                                 captured.dims[0] == 1 &&
                                 captured.dims[1] >= tokens &&
@@ -30001,7 +35493,7 @@ namespace fastllm {
         const int startPosition = context.committedTokens;
         AssertInFastLLM(startPosition >= 0 && tokens <= max_positions - startPosition,
                        "DFlash context exceeds the target position limit.\n");
-        PrepareDFlashRotary(device);
+        if (!prepared) PrepareDFlashRotary(device);
         std::vector<float> positionValues(tokens);
         for (int token = 0; token < tokens; token++) {
             positionValues[token] = (float)(startPosition + token);
@@ -30329,7 +35821,7 @@ namespace fastllm {
     std::vector<int> Qwen3_5Model::SelectDFlashDraftTokens(
             const float *candidateTopK, const float *selectorHidden,
             int anchorToken, const GenerationConfig &generationConfig,
-            DFlashContext &context) {
+            DFlashContext &context, int draftsPerStep) {
         AssertInFastLLM(candidateTopK != nullptr && selectorHidden != nullptr,
                         "DFlash selector input is null.\n");
         Data &predecessor =
@@ -30361,7 +35853,9 @@ namespace fastllm {
             return ((const float*)table.cpuData)[index];
         };
 
-        const int slots = dflashRuntimeBlockSize - 1;
+        const int slots = std::min(dflashRuntimeBlockSize - 1,
+            draftsPerStep < 0 ? dflashRuntimeBlockSize - 1 :
+            std::max(0, draftsPerStep));
         std::vector<int> drafts;
         drafts.reserve(slots);
         context.proposalTokens.clear();
@@ -30626,7 +36120,7 @@ namespace fastllm {
     std::vector<int> Qwen3_5Model::RunDFlashDraft(
             int device, const std::vector<int> &devices,
             int anchorToken, const GenerationConfig &generationConfig,
-            DFlashContext &context) {
+            DFlashContext &context, bool prepared, int draftsPerStep) {
 #ifndef USE_CUDA
         (void)device;
         (void)devices;
@@ -30635,7 +36129,7 @@ namespace fastllm {
         (void)context;
         return {};
 #else
-        PrepareDFlashWeightsForDevice(device);
+        if (!prepared) PrepareDFlashWeightsForDevice(device);
         const bool useShortlist = !dflashDraftTokenIds.empty() && generationConfig.IsSimpleGreedy();
         AssertInFastLLM(HasDFlashWeights() &&
                             (int)context.draftKeyValues.size() == dflashLayers,
@@ -30658,10 +36152,12 @@ namespace fastllm {
         // GEMM path while leaving the visible prefix mathematically identical.
         const int blockSize = dflashCheckpointBlockSize;
         const int slots = runtimeBlockSize - 1;
+        const int requestedDraftsPerStep = draftsPerStep < 0 ? slots :
+            std::min(slots, std::max(0, draftsPerStep));
         const int cacheAllocationUnit =
             Qwen35DFlashCacheAllocationUnit(
                 dflashSlidingWindow, blockSize);
-        PrepareDFlashRotary(device);
+        if (!prepared) PrepareDFlashRotary(device);
 
         Data &embedWeight =
             weight[language_prefix + "embed_tokens.weight"];
@@ -30681,7 +36177,12 @@ namespace fastllm {
             draftEmbedWeight->dataDeviceIds[0] == device;
         Qwen35DFlashComputeWorkspace *compute = nullptr;
         const bool useComputeGraphs = Qwen35CudaGraphEnabled();
-        const bool useComputeWorkspace = useCudaEmbedding &&
+        bool asyncWorkspaceReady = true;
+        if (prepared) {
+            asyncWorkspaceReady =
+                GetQwen35CudaGraphWorkspace(this, device).dflashCompute != nullptr;
+        }
+        const bool useComputeWorkspace = asyncWorkspaceReady && useCudaEmbedding &&
             (draftEmbedWeight->dataType == DataType::BFLOAT16 ||
              draftEmbedWeight->dataType == DataType::FLOAT16) &&
             (useComputeGraphs || dflashTpBackbonePrepared) &&
@@ -31507,7 +37008,7 @@ namespace fastllm {
         return SelectDFlashDraftTokens(
             (const float*)candidateTopK.cpuData,
             (const float*)selectorHidden.cpuData,
-            anchorToken, generationConfig, context);
+            anchorToken, generationConfig, context, requestedDraftsPerStep);
 #endif
     }
 
@@ -31515,7 +37016,7 @@ namespace fastllm {
             int device, const std::vector<int> &devices,
             const std::vector<int> &anchorTokens,
             const std::vector<const GenerationConfig*> &generationConfigs,
-            const std::vector<DFlashContext*> &contexts) {
+            const std::vector<DFlashContext*> &contexts, int draftsPerStep) {
 #ifndef USE_CUDA
         (void)device;
         (void)devices;
@@ -31533,8 +37034,11 @@ namespace fastllm {
             AssertInFastLLM(contexts[0] != nullptr &&
                                 generationConfigs[0] != nullptr,
                             "DFlash single draft input is null.\n");
+            const int singleSlots = std::max(0, dflashRuntimeBlockSize - 1);
+            const int requested = draftsPerStep < 0 ? singleSlots :
+                std::min(singleSlots, std::max(0, draftsPerStep));
             return {RunDFlashDraft(device, devices, anchorTokens[0],
-                                   *generationConfigs[0], *contexts[0])};
+                                   *generationConfigs[0], *contexts[0], false, requested)};
         }
 
         PrepareDFlashWeightsForDevice(device);
@@ -31546,6 +37050,8 @@ namespace fastllm {
         const int runtimeBlockSize = dflashRuntimeBlockSize;
         const int blockSize = dflashCheckpointBlockSize;
         const int slots = runtimeBlockSize - 1;
+        const int requestedDraftsPerStep = draftsPerStep < 0 ? slots :
+            std::min(slots, std::max(0, draftsPerStep));
         const int totalTokens = batch * blockSize;
         const int cacheAllocationUnit = Qwen35DFlashCacheAllocationUnit(
             dflashSlidingWindow, blockSize);
@@ -32182,7 +37688,8 @@ namespace fastllm {
                 topKData +
                     (size_t)b * slots * dflashSelectorTopK * 2,
                 hiddenData + (size_t)b * slots * dflashSelectorRank,
-                anchorTokens[b], *generationConfigs[b], *contexts[b]);
+                anchorTokens[b], *generationConfigs[b], *contexts[b],
+                requestedDraftsPerStep);
         }
         return drafts;
 #endif
@@ -34463,6 +39970,7 @@ namespace fastllm {
                     i * 2, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, k);
                 PagedCacheManager *pagedCacheVManager = AllocatePagedCacheManager(
                     i * 2 + 1, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, v);
+                PairPagedCacheManagers(pagedCacheKManager, pagedCacheVManager);  // KVPAIR (no-op unless enabled)
                 AppendPagedCache(*pagedCacheKManager, pastKey, k);
                 AppendPagedCache(*pagedCacheVManager, pastValue, v);
                 AttentionPaged(q, pastKey, pastValue, qkv, q.dims[0] / k.dims[0], 1.0 / sqrt(head_dim), 1, pagedAttentionInited);
@@ -35196,6 +40704,20 @@ namespace fastllm {
         return lastRet;
     }
 
+    std::vector<int> Qwen3_5Model::ForwardMultimodalContext(
+            ResponseContext *context, const Data &inputIds,
+            const Data &attentionMask, const Data &positionIds,
+            const GenerationConfig &generationConfig,
+            const LastTokensManager &lastTokens,
+            std::vector<std::vector<float>*> *logits) {
+        std::vector<std::vector<int>> accepted, next;
+        std::vector<int> kept;
+        bool usedMtp = false;
+        return Qwen35ForwardMultimodal(context, inputIds, attentionMask, positionIds,
+            context->pastKeyValues, context->multimodalInput, generationConfig,
+            lastTokens, logits, accepted, next, kept, usedMtp);
+    }
+
     std::vector <int> Qwen3_5Model::ForwardMultimodal(
             const fastllm::Data &inputIds,
             const fastllm::Data &attentionMask,
@@ -35237,7 +40759,14 @@ namespace fastllm {
             logits = (*retLogits)[0];
         }
 
-        if (pastKeyValues.size() > 0 && pastKeyValues[0].second.dims.size() > 0) {
+        auto getMultimodalIntParam = [&](const char *name) {
+            if (context == nullptr) return 0;
+            auto it = context->intParams.find(name);
+            return it == context->intParams.end() ? 0 : it->second;
+        };
+        const bool contextPrefill = context != nullptr && context->intParams["index"] == 0;
+        const int prefixTokens = contextPrefill ? context->cacheLen : 0;
+        if (!contextPrefill && pastKeyValues.size() > 0 && pastKeyValues[0].second.dims.size() > 0) {
             Data adjustedPositionIds;
             auto deltaIt = multimodalInput.find("mrope_position_delta");
             if (deltaIt != multimodalInput.end() && !deltaIt->second.empty()) {
@@ -35293,48 +40822,172 @@ namespace fastllm {
             (rawImageIt != multimodalInput.end() && !rawImageIt->second.empty()) ||
             (rawVideoIt != multimodalInput.end() && !rawVideoIt->second.empty());
 
+        auto preparedImageIt = multimodalInput.find("mm_prefill_image_embeds");
+        auto preparedVideoIt = multimodalInput.find("mm_prefill_video_embeds");
+        const uint64_t requestGeneration =
+            context != nullptr && context->pagedPageOwnerLease != nullptr ?
+            context->pagedPageOwnerLease->generation : 0;
+        const bool resumableRequest = context != nullptr &&
+            getMultimodalIntParam("mm_prefill_resumable") != 0 &&
+            context->inputTokens - context->cacheLen == inputIds.dims[1] &&
+            requestGeneration != 0;
+        const bool hasPreparedImage = preparedImageIt != multimodalInput.end() &&
+            !preparedImageIt->second.empty() && preparedImageIt->second[0] != nullptr;
+        const bool hasPreparedVideo = preparedVideoIt != multimodalInput.end() &&
+            !preparedVideoIt->second.empty() && preparedVideoIt->second[0] != nullptr;
+        const bool preparedRequestEmbeddings = resumableRequest &&
+            context->multimodalPrefillEmbeddingsOwned &&
+            context->multimodalPrefillGeneration == requestGeneration &&
+            mmTypeIt != multimodalInput.end() && !mmTypeIt->second.empty() &&
+            mropeIt != multimodalInput.end() && !mropeIt->second.empty() &&
+            (!hasRawMedia ||
+             ((rawImageIt == multimodalInput.end() || rawImageIt->second.empty() ||
+               hasPreparedImage) &&
+              (rawVideoIt == multimodalInput.end() || rawVideoIt->second.empty() ||
+               hasPreparedVideo)));
+
         Data imageFeatures, videoFeatures;
+        Data remainingMmTypes;
         std::vector<std::vector<int>> imageGridThwList, videoGridThwList;
-        if (hasRawMedia) {
-            auto imageCacheIt = multimodalInput.find("image_cache_keys");
-            EncodeVisualItems(
-                rawImageIt != multimodalInput.end() ? rawImageIt->second : std::vector<Data*>(),
-                (imageGridIt != multimodalInput.end() && !imageGridIt->second.empty()) ? imageGridIt->second[0] : nullptr,
-                false,
-                imageFeatures,
-                imageGridThwList,
-                (imageCacheIt != multimodalInput.end() && !imageCacheIt->second.empty()) ?
-                    imageCacheIt->second[0] : nullptr
-            );
-            EncodeVisualItems(
-                rawVideoIt != multimodalInput.end() ? rawVideoIt->second : std::vector<Data*>(),
-                (videoGridIt != multimodalInput.end() && !videoGridIt->second.empty()) ? videoGridIt->second[0] : nullptr,
-                true,
-                videoFeatures,
-                videoGridThwList
-            );
+        auto clearPreparedMultimodalEmbeddings = [&]() {
+            if (context == nullptr || !context->multimodalPrefillEmbeddingsOwned) return;
+            for (const char *name : {"mm_prefill_image_embeds",
+                                      "mm_prefill_video_embeds"}) {
+                auto it = mutableMultimodalInput.find(name);
+                if (it == mutableMultimodalInput.end()) continue;
+                for (Data *data : it->second) delete data;
+                mutableMultimodalInput.erase(it);
+            }
+            context->multimodalPrefillEmbeddingsOwned = false;
+            context->multimodalPrefillGeneration = 0;
+            context->intParams.erase("mm_prefill_chunk_size");
+        };
+        if (context != nullptr && context->multimodalPrefillEmbeddingsOwned &&
+            (!resumableRequest || context->multimodalPrefillGeneration != requestGeneration)) {
+            clearPreparedMultimodalEmbeddings();
+        }
+        auto storePreparedMultimodalEmbeddings = [&]() {
+            if (!resumableRequest || context == nullptr || requestGeneration == 0 ||
+                (imageFeatures.dims.empty() && videoFeatures.dims.empty())) return;
+            auto store = [&](const char *name, const Data &value) {
+                if (value.dims.empty()) return;
+                auto &slot = mutableMultimodalInput[name];
+                for (Data *old : slot) delete old;
+                slot.clear();
+                slot.push_back(new Data(value));
+            };
+            store("mm_prefill_image_embeds", imageFeatures);
+            store("mm_prefill_video_embeds", videoFeatures);
+            context->multimodalPrefillGeneration = requestGeneration;
+            context->multimodalPrefillEmbeddingsOwned = true;
+        };
+        const bool preparedImages = contextPrefill && !preparedRequestEmbeddings &&
+            !context->multimodalPrefixSpans.empty();
+        if (preparedImages) {
+            // Use this request's full position plan even when cached KV covers
+            // earlier images. Only materialize image rows needed by the suffix.
+            Data *types = mmTypeIt->second[0];
+            Data *fullPositions = mropeIt->second[0];
+            if (fullPositions->dims[1] != prefixTokens + inputIds.dims[1]) {
+                PrepareMultimodalPrefixCache(context); // preemption/re-prefill
+                types = mutableMultimodalInput["mm_token_type_ids"][0];
+            }
+            const float *typeValues = (const float*)types->cpuData;
+            remainingMmTypes.CopyFrom(Data(DataType::FLOAT32, {1, inputIds.dims[1]},
+                std::vector<float>(typeValues + prefixTokens, typeValues + prefixTokens + inputIds.dims[1])));
+            Data *allGrids = imageGridIt->second[0];
+            Data *allKeys = mutableMultimodalInput["image_cache_keys"][0];
+            std::vector<float> features;
+            for (size_t item = 0; item < context->multimodalPrefixSpans.size(); ++item) {
+                const auto &span = context->multimodalPrefixSpans[item];
+                if (span.end <= prefixTokens) continue;
+                Data grid(DataType::INT32, {1, 3}, DataDevice::CPU,
+                          allGrids->cpuData + item * 3 * sizeof(int));
+                Data key(DataType::INT32, {1, 8}, DataDevice::CPU, allKeys->cpuData + item * 32);
+                Data itemFeatures;
+                std::vector<std::vector<int>> itemGrids;
+                EncodeVisualItems({rawImageIt->second[item]}, &grid, false, itemFeatures, itemGrids, &key,
+                                  context);
+                itemFeatures.ToDevice(DataDevice::CPU);
+                const int skip = std::max(0, prefixTokens - span.begin);
+                const float *rows = (const float*)itemFeatures.cpuData;
+                AssertInFastLLM(itemFeatures.dataType == DataType::FLOAT32 &&
+                    itemFeatures.dims == std::vector<int>({1, span.end - span.begin, vision_out_hidden_size}),
+                    "Qwen3.5 image features do not match prefix layout.\n");
+                features.insert(features.end(), rows + (size_t)skip * vision_out_hidden_size,
+                    rows + itemFeatures.Count(0));
+            }
+            if (!features.empty()) {
+                imageFeatures.CopyFrom(Data(DataType::FLOAT32,
+                    {(int)(features.size() / vision_out_hidden_size), vision_out_hidden_size}, features));
+                imageEmbeds = &imageFeatures;
+            }
+            storePreparedMultimodalEmbeddings();
+        } else if (hasRawMedia) {
+            if (preparedRequestEmbeddings) {
+                imageEmbeds = hasPreparedImage ? preparedImageIt->second[0] : nullptr;
+                videoEmbeds = hasPreparedVideo ? preparedVideoIt->second[0] : nullptr;
+            } else {
+                auto imageCacheIt = multimodalInput.find("image_cache_keys");
+                const auto mmStageBegin = std::chrono::steady_clock::now();
+                EncodeVisualItems(
+                    rawImageIt != multimodalInput.end() ? rawImageIt->second : std::vector<Data*>(),
+                    (imageGridIt != multimodalInput.end() && !imageGridIt->second.empty()) ? imageGridIt->second[0] : nullptr,
+                    false,
+                    imageFeatures,
+                    imageGridThwList,
+                    (imageCacheIt != multimodalInput.end() && !imageCacheIt->second.empty()) ?
+                        imageCacheIt->second[0] : nullptr,
+                    context
+                );
+                const auto mmStageImage = std::chrono::steady_clock::now();
+                EncodeVisualItems(
+                    rawVideoIt != multimodalInput.end() ? rawVideoIt->second : std::vector<Data*>(),
+                    (videoGridIt != multimodalInput.end() && !videoGridIt->second.empty()) ? videoGridIt->second[0] : nullptr,
+                    true,
+                    videoFeatures,
+                    videoGridThwList,
+                    nullptr,
+                    context
+                );
 
-            Data computedMmTokenTypeIds, computedMropePositionIds, computedMropePositionDelta;
-            BuildMultimodalPositionData(
-                inputIds,
-                imageGridThwList,
-                videoGridThwList,
-                computedMmTokenTypeIds,
-                computedMropePositionIds,
-                computedMropePositionDelta
-            );
+                if (contextPrefill && GetFastllmObservabilityMode() != FastllmObservabilityMode::Off)
+                    BeginRequestPrefillStatus(context->requestId, std::max(0, context->inputTokens - context->cacheLen));
+                Data computedMmTokenTypeIds, computedMropePositionIds, computedMropePositionDelta;
+                BuildMultimodalPositionData(
+                    inputIds,
+                    imageGridThwList,
+                    videoGridThwList,
+                    computedMmTokenTypeIds,
+                    computedMropePositionIds,
+                    computedMropePositionDelta
+                );
 
-            mutableMultimodalInput["mm_token_type_ids"].clear();
-            mutableMultimodalInput["mrope_position_ids"].clear();
-            mutableMultimodalInput["mrope_position_delta"].clear();
-            mutableMultimodalInput["mm_token_type_ids"].push_back(new Data(computedMmTokenTypeIds));
-            mutableMultimodalInput["mrope_position_ids"].push_back(new Data(computedMropePositionIds));
-            mutableMultimodalInput["mrope_position_delta"].push_back(new Data(computedMropePositionDelta));
+                for (const char *name : {"mm_token_type_ids", "mrope_position_ids", "mrope_position_delta"}) {
+                    for (Data *old : mutableMultimodalInput[name]) delete old;
+                    mutableMultimodalInput[name].clear();
+                }
+                mutableMultimodalInput["mm_token_type_ids"].push_back(new Data(computedMmTokenTypeIds));
+                mutableMultimodalInput["mrope_position_ids"].push_back(new Data(computedMropePositionIds));
+                mutableMultimodalInput["mrope_position_delta"].push_back(new Data(computedMropePositionDelta));
+                const auto mmStagePositions = std::chrono::steady_clock::now();
 
-            mmTypeIt = mutableMultimodalInput.find("mm_token_type_ids");
-            mropeIt = mutableMultimodalInput.find("mrope_position_ids");
-            imageEmbeds = imageFeatures.dims.empty() ? nullptr : &imageFeatures;
-            videoEmbeds = videoFeatures.dims.empty() ? nullptr : &videoFeatures;
+                mmTypeIt = mutableMultimodalInput.find("mm_token_type_ids");
+                mropeIt = mutableMultimodalInput.find("mrope_position_ids");
+                imageEmbeds = imageFeatures.dims.empty() ? nullptr : &imageFeatures;
+                videoEmbeds = videoFeatures.dims.empty() ? nullptr : &videoFeatures;
+                storePreparedMultimodalEmbeddings();
+                if (Qwen35VisionStageTimerEnabled()) {
+                    const auto mmStageStored = std::chrono::steady_clock::now();
+                    auto ms = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
+                        return std::chrono::duration<double, std::milli>(b - a).count();
+                    };
+                    printf("[VISION-STAGE] caller image_encode_ms=%.1f video_and_positions_ms=%.1f store_ms=%.1f\n",
+                           ms(mmStageBegin, mmStageImage), ms(mmStageImage, mmStagePositions),
+                           ms(mmStagePositions, mmStageStored));
+                    fflush(stdout);
+                }
+            }
         } else {
             AssertInFastLLM(mmTypeIt != multimodalInput.end() && !mmTypeIt->second.empty(),
                             "Qwen3.5 multimodal requires mm_token_type_ids.");
@@ -35360,11 +41013,77 @@ namespace fastllm {
             SetCudaEmbedding(true);
         }
 
+        int mmRowBegin = 0, mmRowEnd = inputIds.dims[1];
+#ifdef USE_CUDA
+        if (Qwen35MmChunkEmbedEnabled() && context != nullptr &&
+            getMultimodalIntParam("mm_prefill_resumable") != 0 &&
+            context->inputTokens - context->cacheLen == inputIds.dims[1] &&
+            context->pagedPageOwnerLease != nullptr &&
+            context->pagedPageOwnerLease->generation != 0) {
+            const int cursor = getMultimodalIntParam("mm_embedding_cursor");
+            const int chunk = getMultimodalIntParam("mm_prefill_chunk_size");
+            if (cursor >= 0 && cursor < inputIds.dims[1] && chunk > 0) {
+                mmRowBegin = cursor;
+                mmRowEnd = std::min(inputIds.dims[1], cursor + chunk);
+            }
+        }
+#endif
+        const bool mmPartialRows = mmRowBegin != 0 || mmRowEnd != inputIds.dims[1];
+        const auto mmStageEmbedBegin = std::chrono::steady_clock::now();
         Data hiddenStates;
-        BuildMultimodalTextEmbeddings(inputIds, hiddenStates);
-        MergeMultimodalFeaturesIntoText(*mmTypeIt->second[0], imageEmbeds, videoEmbeds, hiddenStates);
+        BuildMultimodalTextEmbeddings(inputIds, hiddenStates, mmRowBegin, mmRowEnd);
+        Data *allMmTypes = mmTypeIt->second[0];
+        AssertInFastLLM(allMmTypes != nullptr,
+                        "Qwen3.5 multimodal token-type state is null.");
+        const Data *mergeMmTypes = allMmTypes;
+        Data preparedMmTypes;
+        if (preparedImages) {
+            mergeMmTypes = &remainingMmTypes;
+        } else if (preparedRequestEmbeddings && prefixTokens > 0 &&
+                   allMmTypes->dims.size() == 2 &&
+                   allMmTypes->dims[1] == prefixTokens + inputIds.dims[1]) {
+            allMmTypes->ToDevice(DataDevice::CPU);
+            const float *typeValues = (const float*)allMmTypes->cpuData;
+            std::vector<float> suffix(typeValues + prefixTokens,
+                typeValues + prefixTokens + inputIds.dims[1]);
+            preparedMmTypes.CopyFrom(Data(DataType::FLOAT32,
+                {1, inputIds.dims[1]}, suffix));
+            mergeMmTypes = &preparedMmTypes;
+        }
+        MergeMultimodalFeaturesIntoText(*mergeMmTypes,
+                                       imageEmbeds, videoEmbeds, hiddenStates, mmRowBegin, mmRowEnd);
+        const auto mmStageMerged = std::chrono::steady_clock::now();
+        int mmChunkVerified = -1;
+        if (mmPartialRows) {
+            // Evidence for the chunk-range path: the first three uses are byte-compared with the full-prompt path.
+            static int mmChunkEmbedVerifyLeft = 3;
+            if (mmChunkEmbedVerifyLeft > 0) {
+                --mmChunkEmbedVerifyLeft;
+                Data fullStates;
+                BuildMultimodalTextEmbeddings(inputIds, fullStates);
+                MergeMultimodalFeaturesIntoText(*mergeMmTypes, imageEmbeds, videoEmbeds, fullStates);
+                const size_t rowBytes = (size_t)hiddenStates.dims[2] * hiddenStates.unitSize / hiddenStates.unitSizeDiv;
+                mmChunkVerified = fullStates.dims == hiddenStates.dims &&
+                    fullStates.dataType == hiddenStates.dataType &&
+                    memcmp(fullStates.cpuData + (size_t)mmRowBegin * rowBytes,
+                           hiddenStates.cpuData + (size_t)mmRowBegin * rowBytes,
+                           (size_t)(mmRowEnd - mmRowBegin) * rowBytes) == 0 ? 1 : 0;
+                printf("[MM-CHUNK-EMBED] verify rows=[%d,%d) of %d equal_to_full=%d\n",
+                       mmRowBegin, mmRowEnd, inputIds.dims[1], mmChunkVerified);
+                fflush(stdout);
+            }
+        }
         imageFeatures.FreeSpace();
         videoFeatures.FreeSpace();
+        if (Qwen35VisionStageTimerEnabled()) {
+#ifdef USE_CUDA
+            FastllmCudaSyncCurrentThreadStream();
+#endif
+            printf("[VISION-STAGE] round text_embed_and_merge_ms=%.1f input_tokens=%d rows=%d-%d\n",
+                   std::chrono::duration<double, std::milli>(mmStageMerged - mmStageEmbedBegin).count(),
+                   inputIds.dims.size() == 2 ? inputIds.dims[1] : -1, mmRowBegin, mmRowEnd);
+            fflush(stdout);
+        }
 
         Data mropePositionIds;
         mropePositionIds.CopyFrom(*mropeIt->second[0]);
@@ -35374,6 +41093,16 @@ namespace fastllm {
             // ForwardFromHiddenStates 期望 allPositionIds 在 CPU 上, 这里需要再次 ToDevice(CPU).
             ToDataType(mropePositionIds, DataType::FLOAT32);
             mropePositionIds.ToDevice(DataDevice::CPU);
+        }
+        if (prefixTokens > 0) {
+            const int fullLength = mropePositionIds.dims[1];
+            const float *positions = (const float*)mropePositionIds.cpuData;
+            std::vector<float> suffix;
+            for (int axis = 0; axis < 3; ++axis) {
+                suffix.insert(suffix.end(), positions + axis * fullLength + prefixTokens,
+                    positions + axis * fullLength + prefixTokens + inputIds.dims[1]);
+            }
+            mropePositionIds.CopyFrom(Data(DataType::FLOAT32, {3, inputIds.dims[1]}, suffix));
         }
 
         Data attentionMaskCopy(attentionMask);
@@ -35386,27 +41115,97 @@ namespace fastllm {
         }
 #ifdef USE_CUDA
         const int totalLen = inputIds.dims[1];
+        const bool resumableMultimodalPrefill =
+            context != nullptr &&
+            getMultimodalIntParam("mm_prefill_resumable") != 0 &&
+            context->inputTokens - context->cacheLen == totalLen &&
+            context->pagedPageOwnerLease != nullptr &&
+            context->pagedPageOwnerLease->generation != 0;
+        const int resumableCursor = resumableMultimodalPrefill ?
+            getMultimodalIntParam("mm_embedding_cursor") : 0;
+        const bool validResumableCursor = !resumableMultimodalPrefill ||
+            (resumableCursor >= 0 && resumableCursor < totalLen &&
+             getMultimodalIntParam("mm_text_cursor") == resumableCursor);
+        if (!validResumableCursor) {
+            context->error = ResponseContextErrorForwardFailed;
+            context->isEnding = true;
+            keptInputLens = {0};
+            clearPreparedMultimodalEmbeddings();
+            return {};
+        }
+        const int resumableOffset = resumableMultimodalPrefill ?
+            resumableCursor : 0;
+        const int configuredMultimodalChunkSize = resumableMultimodalPrefill ?
+            getMultimodalIntParam("mm_prefill_chunk_size") : 0;
+        // Shared by the DFlash/MTP and the plain GPU chunk loops below.
+        auto finishResumableMultimodalPrefill = [&]() {
+            if (!resumableMultimodalPrefill) return true;
+            const int finalChunk = totalLen - resumableOffset;
+            if (finalChunk <= 0) {
+                context->error = ResponseContextErrorForwardFailed;
+                context->isEnding = true;
+                keptInputLens = {0};
+                clearPreparedMultimodalEmbeddings();
+                return false;
+            }
+            // The whole prompt was fed this round (preTokens += totalLen) and every token of
+            // it is now in the KV cache, exactly as in a whole media prefill, so keep
+            // totalLen. finalChunk made the scheduler roll preTokens back to finalChunk and
+            // the next DFlash verify saw expected 511 vs committed 8191; the batch-wide
+            // fallback then dropped every
+            // decode row to width 1. A non-DFlash return resets keptInputLens to seqLens.
+            keptInputLens = {totalLen};
+            context->intParams["mm_embedding_cursor"] = 0;
+            context->intParams["mm_text_cursor"] = 0;
+            context->intParams["mm_prefill_resumable"] = 0;
+            context->intParams.erase("mm_prefill_chunk_size");
+            context->intParams.erase("mm_prefill_solo_count");
+            context->prefillRemain = 0;
+            clearPreparedMultimodalEmbeddings();
+            return true;
+        };
+        std::vector<int> targetDevices;
         std::vector<int> draftDevices;
         std::map<int, int> draftRatios;
         const bool canSeedDraftCache =
-            context != nullptr && context->cacheLen == 0 &&
+            context != nullptr &&
             context->preTokens == totalLen && totalLen > 0 &&
             Qwen35MtpSupportsGenerationConfig(generationConfig) &&
             CanUseGPUForward() &&
             GetQwen35GPUForwardDevices(
-                deviceMap, draftDevices, draftRatios) &&
-            !draftDevices.empty();
+                deviceMap, targetDevices, draftRatios) &&
+            !targetDevices.empty();
+        draftDevices = targetDevices;
         bool seedDFlash = canSeedDraftCache && HasDFlashWeights() &&
             DFlashDraftsPerStep() > 0;
         bool seedMtp = canSeedDraftCache && !seedDFlash &&
             !Qwen35MtpDisabledByEnv() && HasMtpWeights() &&
             Qwen35MtpDraftsPerStep() > 0;
+        if (resumableOffset > 0) {
+            // Hit check for the acceptance run: first resumed media chunk, either way.
+            static std::atomic<bool> resumeSeedLogged{false};
+            if (!resumeSeedLogged.exchange(true)) {
+                printf("[MM-RESUME-SEED] request=%llu offset=%d total=%d pre=%d draft=%s\n",
+                       (unsigned long long)context->requestId, resumableOffset, totalLen,
+                       context->preTokens, seedDFlash ? "dflash" : (seedMtp ? "mtp" : "none"));
+                fflush(stdout);
+            }
+        }
+        // 草稿独立设备：把 DFlash 草稿从 target 的 TP 卡集合中拆出来独占一张卡。
+        {
+            const int dflashDraftDevice = Qwen35DFlashDraftDevice();
+            if (seedDFlash && dflashDraftDevice >= 0) {
+                draftDevices = std::vector<int>{dflashDraftDevice};
+                draftRatios = std::map<int, int>{{dflashDraftDevice, 1}};
+            }
+        }
 
+        bool abortedMultimodalPrefill = false;
         if (seedDFlash || seedMtp) {
             hiddenStates.ToDevice(DataDevice::CPU);
             FastllmCudaClearBigBuffer();
 
-            {
+            if (prefixTokens == 0 && resumableOffset == 0) {
                 std::lock_guard<std::mutex> guard(mtpCacheMutex);
                 mtpCaches.erase(context);
                 dflashContexts.erase(context);
@@ -35490,7 +41289,9 @@ namespace fastllm {
                                          int chunkTokens,
                                          bool generateDrafts,
                                          int anchorToken,
-                                         std::vector<int> &drafts) {
+                                         std::vector<int> &drafts,
+                                         std::vector<Data> *captured,
+                                         bool prepared) {
                 std::lock_guard<std::mutex> guard(mtpCacheMutex);
                 auto cacheIt = dflashContexts.find(context);
                 if (cacheIt == dflashContexts.end()) {
@@ -35507,14 +41308,33 @@ namespace fastllm {
                 }
                 try {
                     AppendDFlashTargetHidden(
-                        draftDevices[0], chunkTokens, cache);
+                        draftDevices[0], chunkTokens, cache, captured, prepared);
                     if (generateDrafts) {
                         drafts = RunDFlashDraft(
                             draftDevices[0], draftDevices, anchorToken,
-                            generationConfig, cache);
+                            generationConfig, cache, prepared);
                     }
                 } catch (...) {
-                    dflashContexts.erase(context);
+                    if (prepared) {
+                        cache.committedTokens = expectedTokens;
+                        for (auto &layerCache : cache.draftKeyValues) {
+                            if (layerCache.first.dims.size() == 3) {
+                                Qwen35ResizeDraftSequenceCache(
+                                    layerCache.first,
+                                    std::min(expectedTokens, layerCache.first.dims[1]));
+                            }
+                            if (layerCache.second.dims.size() == 3) {
+                                Qwen35ResizeDraftSequenceCache(
+                                    layerCache.second,
+                                    std::min(expectedTokens, layerCache.second.dims[1]));
+                            }
+                        }
+                        cache.proposalTokens.clear();
+                        cache.proposalCandidateIds.clear();
+                        cache.proposalCandidateProbs.clear();
+                    } else {
+                        dflashContexts.erase(context);
+                    }
                     throw;
                 }
                 const int newTokens = expectedTokens + chunkTokens;
@@ -35527,6 +41347,75 @@ namespace fastllm {
                 return valid;
             };
 
+            // Opt-in only: the target owns the capture until ready is recorded,
+            // one worker consumes the DFlash context in order, and the ring
+            // recycles a slot only after consumed is synchronized. Graph capture
+            // remains excluded because the worker uses a separate CUDA stream.
+            const int overlapChunkSize = configuredMultimodalChunkSize > 0 ?
+                configuredMultimodalChunkSize :
+                std::min(GetChunkedPrefillSize() > 0 ? GetChunkedPrefillSize() : totalLen,
+                         Qwen35MultimodalPrefillChunkCap());
+            bool overlapDFlashPrefill =
+                Qwen35MoeIsTrueString(std::getenv("FASTLLM_DFLASH_PREFILL_OVERLAP")) &&
+                seedDFlash &&
+                totalLen > overlapChunkSize &&
+                !targetDevices.empty() && draftDevices.size() == 1 &&
+                draftDevices[0] != targetDevices[0] &&
+                !Qwen35CudaGraphEnabled();
+            std::unique_ptr<Qwen35DFlashAsyncRing<Qwen35DFlashPrefillPayload>>
+                dflashOverlap;
+            if (overlapDFlashPrefill) {
+                try {
+                    dflashOverlap.reset(new Qwen35DFlashAsyncRing<
+                        Qwen35DFlashPrefillPayload>(targetDevices[0], draftDevices[0],
+                        [&](auto &slot) {
+                            std::vector<int> ignoredDrafts;
+                            const bool appended = appendDFlashChunk(
+                                slot.payload.expectedTokens,
+                                slot.payload.chunkTokens,
+                                slot.payload.generateDrafts,
+                                slot.payload.anchorToken,
+                                ignoredDrafts, &slot.payload.captured, true);
+                            if (!appended) {
+                                throw std::runtime_error(
+                                    "DFlash prefill overlap context validation failed");
+                            }
+                        },
+                        [&]() {
+                            struct RestoreDevice {
+                                int device;
+                                ~RestoreDevice() { FastllmCudaSetDevice(device); }
+                            } restore{FastllmCudaGetDevice()};
+                            Qwen35ScopedGenericExecutor executor(
+                                "cuda:" + std::to_string(draftDevices[0]));
+                            FastllmCudaSetDevice(draftDevices[0]);
+                            PrepareDFlashWeightsForDevice(draftDevices[0]);
+                            PrepareDFlashRotary(draftDevices[0]);
+                            FastllmCudaSyncCurrentThreadStream();
+                            if (FastllmCudaGetThreadError()) {
+                                throw std::runtime_error(
+                                    "DFlash async caller-side preparation failed");
+                            }
+                        }));
+                } catch (...) {
+                    overlapDFlashPrefill = false;
+                    dflashOverlap.reset();
+                }
+            }
+
+            auto replayDFlashPayloads = [&](std::vector<Qwen35DFlashPrefillPayload> &payloads) {
+                for (auto &payload : payloads) {
+                    std::vector<int> ignoredDrafts;
+                    const bool appended = appendDFlashChunk(
+                        payload.expectedTokens, payload.chunkTokens, false,
+                        -1, ignoredDrafts, &payload.captured, false);
+                    if (!appended) {
+                        throw std::runtime_error(
+                            "DFlash serial replay context validation failed");
+                    }
+                }
+            };
+
             Data inputCpu;
             inputCpu.CopyFrom(inputIds);
             inputCpu.ToDevice(DataDevice::CPU);
@@ -35535,13 +41424,14 @@ namespace fastllm {
                 inputCpu.ToDevice(DataDevice::CPU);
             }
             const float *inputPtr = (const float*)inputCpu.cpuData;
-            int chunkSize = GetChunkedPrefillSize();
+            int chunkSize = configuredMultimodalChunkSize > 0 ?
+                configuredMultimodalChunkSize : GetChunkedPrefillSize();
             if (chunkSize <= 0) {
                 chunkSize = totalLen;
             }
-            if (seedDFlash) {
+            if (configuredMultimodalChunkSize <= 0 && seedDFlash) {
                 chunkSize = std::min(
-                    chunkSize, QWEN35_DFLASH_LONG_PREFILL_CHUNK_SIZE);
+                    chunkSize, Qwen35MultimodalPrefillChunkCap());
             }
             chunkSize = std::max(1, std::min(chunkSize, totalLen));
 
@@ -35549,13 +41439,66 @@ namespace fastllm {
             std::vector<int> dflashDrafts;
             int firstMtpDraft = -1;
             try {
-                for (int st = 0; st < totalLen; st += chunkSize) {
-                    const int curLen = std::min(chunkSize, totalLen - st);
+                for (int st = resumableOffset; st < totalLen; ) {
+                    // A client abort must not wait for the whole chunked prefill.
+                    // Stop at the current chunk boundary and return through the
+                    // explicit partial-prefill exit below; the scheduler drops the
+                    // context on its next iteration and releases forwardLocker.
+                    if (context != nullptr && context->isAbort) {
+                        abortedMultimodalPrefill = true;
+                        break;
+                    }
+                    // Preserve prefill arithmetic across cold and restored requests:
+                    // checkpoint existing complete chunks; do not split the tail
+                    // solely to create another checkpoint (FP8/GDN is shape-sensitive).
+                    // FASTLLM_QWEN35_MM_TAIL_ALIGN (default off) opts in to the text
+                    // path rule: cut the last chunk at the last page boundary so the
+                    // checkpoint below also records the tail of image prompts.
+                    static const bool mmTailAlign =
+                        Qwen35MoeIsTrueString(std::getenv("FASTLLM_QWEN35_MM_TAIL_ALIGN"));
+                    // Chunks keep the grid of chunkSize from st = 0 (a junction cut below returns
+                    // to it), so later checkpoints stay on the restored-relative grid.
+                    int curLen = std::min(chunkSize - st % chunkSize, totalLen - st);
+                    // V5 junction (draft3 H24/H25) for image prompts: end a chunk at the deepest page
+                    // shared with any stored conversation so its state is saved at the branch point.
+                    if (fastllm::DiskPrefixV5Enabled() && context != nullptr) {
+                        const auto junctionIt = context->intParams.find("qwen35_v5_junction");
+                        const int junction = junctionIt == context->intParams.end() ? 0 : junctionIt->second;
+                        const int rel = junction - prefixTokens;
+                        if (rel > st && rel < st + curLen) curLen = rel - st;
+                    }
+                    if (mmTailAlign && st + curLen == totalLen) {
+                        const int pageLen = (int)fastllm::GetPageLen();
+                        const int end = prefixTokens + st + curLen;
+                        if (pageLen > 0 && end % pageLen != 0) {
+                            const int boundary = end / pageLen * pageLen - prefixTokens;
+                            if (boundary > st) curLen = boundary - st;
+                        }
+                    }
                     const bool isLastChunk = st + curLen == totalLen;
+                    const uint64_t observationChunkBeginNs =
+                        GetFastllmObservabilityMode() != FastllmObservabilityMode::Off && context
+                        ? FastllmObservationTimestampNs() : 0;
+                    // Real requests only: warmup has no observed creation time.
+                    // Keep the established prefill speed counter unchanged.
+                    PrefillChunkProfile chunkProfile(
+                        context && context->nativeGeneration.createdNs > 0 &&
+                            GetFastllmObservabilityMode() == FastllmObservabilityMode::Debug,
+                        FastllmObservationTimestampNs);
+                    using ProfilePhase = PrefillChunkProfile::Phase;
+                    chunkProfile.MarkAt(ProfilePhase::Begin, observationChunkBeginNs);
+                    const char *profileDraftKind =
+                        seedDFlash ? "dflash" : (seedMtp ? "mtp" : "none");
+                    if (observationChunkBeginNs) BeginRequestPrefillStatus(context->requestId, totalLen);
+#if defined(FASTLLM_DISK_PREFIX_CACHE)
+                    auto persistentChunkStarted = std::chrono::steady_clock::now();
+#endif
                     Data curInputIds, curPositionIds, curHiddenStates;
                     Split(inputIds, 1, st, st + curLen, curInputIds);
                     Split(mropePositionIds, 1, st, st + curLen,
                           curPositionIds);
+                    AssertInFastLLM(st >= mmRowBegin && st + curLen <= mmRowEnd,
+                                    "Qwen3.5 chunk embedding rows do not cover this chunk.");
                     SplitMultimodalTextEmbeddings(hiddenStates, st, st + curLen,
                                                   curHiddenStates);
                     std::vector<Data*> curAttentionMasks = {nullptr};
@@ -35590,6 +41533,7 @@ namespace fastllm {
                         speculativeDFlashHiddenStates.resize(
                             dflashTargetLayerIds.size());
                     }
+                    chunkProfile.Mark(ProfilePhase::TargetBegin);
                     try {
                         chunkRet = ForwardGPUWithHiddenStates(
                             1, curInputIds, curAttentionMasks,
@@ -35606,6 +41550,7 @@ namespace fastllm {
                         releaseDFlashHidden();
                         throw;
                     }
+                    chunkProfile.Mark(ProfilePhase::TargetEnd);
                     speculativeCaptureAllHiddenStates =
                         oldCaptureAllHiddenStates;
                     speculativeCaptureDFlashHiddenStates =
@@ -35618,6 +41563,7 @@ namespace fastllm {
                             "Qwen3.5 multimodal prefill returned no token.\n");
                     }
 
+                    chunkProfile.Mark(ProfilePhase::DraftBegin);
                     if (seedMtp) {
                         std::vector<int> mtpInputTokens(curLen);
                         for (int token = 0; token < curLen; token++) {
@@ -35628,36 +41574,184 @@ namespace fastllm {
                         }
                         const bool appended = appendMtpChunk(
                             speculativeHiddenStates, mtpInputTokens,
-                            curPositionIds, st, !isLastChunk,
+                            curPositionIds, prefixTokens + st, !isLastChunk,
                             firstMtpDraft);
                         if (!appended) {
                             seedMtp = false;
                         }
                     }
                     if (seedDFlash) {
+                        // Move the capture out of model-owned storage before the
+                        // next target chunk resets speculativeDFlashHiddenStates.
+                        std::vector<Data> captured =
+                            std::move(speculativeDFlashHiddenStates);
+                        speculativeDFlashHiddenStates.clear();
                         const bool generateDrafts = isLastChunk &&
                             !Qwen35DFlashCommitEndsRequest(
                                 *this, context,
                                 std::vector<int>{chunkRet.back()}) &&
                             Qwen35DFlashDraftFitsContext(
                                 max_positions, dflashCheckpointBlockSize,
-                                st + curLen);
-                        const bool appended = appendDFlashChunk(
-                            st, curLen, generateDrafts,
-                            isLastChunk ? chunkRet.back() : -1,
-                            dflashDrafts);
-                        releaseDFlashHidden();
-                        if (!appended) {
-                            seedDFlash = false;
+                                prefixTokens + st + curLen);
+                        if (dflashOverlap && !isLastChunk) {
+                            Qwen35DFlashPrefillPayload payload;
+                            payload.captured = std::move(captured);
+                            payload.expectedTokens = prefixTokens + st;
+                            payload.chunkTokens = curLen;
+                            payload.anchorToken = -1;
+                            payload.generateDrafts = false;
+                            try {
+                                dflashOverlap->Publish(
+                                    payload, (st / std::max(1, chunkSize)) & 1);
+                            } catch (...) {
+                                std::vector<Qwen35DFlashPrefillPayload> pending =
+                                    dflashOverlap->CancelAndTakePending();
+                                dflashOverlap.reset();
+                                replayDFlashPayloads(pending);
+                                if (!payload.captured.empty()) {
+                                    std::vector<Qwen35DFlashPrefillPayload> current;
+                                    current.push_back(std::move(payload));
+                                    replayDFlashPayloads(current);
+                                }
+                                overlapDFlashPrefill = false;
+                            }
+                        } else {
+                            // The final chunk must observe the ordered context
+                            // produced by all interior workers before drafting.
+                            if (dflashOverlap) {
+                                try {
+                                    dflashOverlap->Drain();
+                                    dflashOverlap.reset();
+                                } catch (...) {
+                                    std::vector<Qwen35DFlashPrefillPayload> pending =
+                                        dflashOverlap->CancelAndTakePending();
+                                    dflashOverlap.reset();
+                                    replayDFlashPayloads(pending);
+                                }
+                            }
+                            const bool appended = appendDFlashChunk(
+                                prefixTokens + st, curLen, generateDrafts,
+                                isLastChunk ? chunkRet.back() : -1,
+                                dflashDrafts, &captured, false);
+                            if (!appended) {
+                                seedDFlash = false;
+                            }
                         }
+                        releaseDFlashHidden();
+                    }
+                    chunkProfile.Mark(ProfilePhase::DraftEnd);
+#if defined(FASTLLM_DISK_PREFIX_CACHE)
+                    ObservePersistentPrefill(curLen,std::chrono::duration<double,std::milli>(
+                        std::chrono::steady_clock::now()-persistentChunkStarted).count());
+#endif
+                    st += curLen;
+                    if (resumableMultimodalPrefill && context != nullptr &&
+                        context->isAbort) {
+                        abortedMultimodalPrefill = true;
+                        break;
+                    }
+                    if (observationChunkBeginNs)
+                        RecordRequestPrefillStatus(context->requestId,
+                            context->nativeGeneration.prefillTokens + st,
+                            observationChunkBeginNs, FastllmObservationTimestampNs());
+                    if (context != nullptr)
+                        RecordRequestDiagnosticProgress(context->requestId, FastllmObservationTimestampNs());
+                    chunkProfile.Mark(ProfilePhase::CheckpointBegin);
+                    if ((prefixTokens + st) % fastllm::GetPageLen() == 0) {
+                        context->TryRecordPagedCache(this);
+                    }
+                    chunkProfile.Mark(ProfilePhase::CheckpointEnd);
+                    if (chunkProfile.Enabled()) {
+                        if (chunkProfile.Complete()) {
+                            FastllmEvent("prefill", context->requestId, "prefill_chunk_profile",
+                                "timing_scope=host_call_wall_without_added_cuda_sync clock_state=valid "
+                                "path=multimodal draft_kind=%s chunk_tokens=%d completed_tokens=%d "
+                                "chunk_begin_ns=%llu target_begin_ns=%llu target_end_ns=%llu "
+                                "draft_begin_ns=%llu draft_end_ns=%llu "
+                                "checkpoint_begin_ns=%llu checkpoint_end_ns=%llu "
+                                "chunk_wall_ns=%llu target_call_ns=%llu draft_call_ns=%llu checkpoint_call_ns=%llu",
+                                profileDraftKind, curLen, prefixTokens + st,
+                                (unsigned long long)chunkProfile.At(ProfilePhase::Begin),
+                                (unsigned long long)chunkProfile.At(ProfilePhase::TargetBegin),
+                                (unsigned long long)chunkProfile.At(ProfilePhase::TargetEnd),
+                                (unsigned long long)chunkProfile.At(ProfilePhase::DraftBegin),
+                                (unsigned long long)chunkProfile.At(ProfilePhase::DraftEnd),
+                                (unsigned long long)chunkProfile.At(ProfilePhase::CheckpointBegin),
+                                (unsigned long long)chunkProfile.At(ProfilePhase::CheckpointEnd),
+                                (unsigned long long)chunkProfile.Duration(ProfilePhase::Begin, ProfilePhase::CheckpointEnd),
+                                (unsigned long long)chunkProfile.Duration(ProfilePhase::TargetBegin, ProfilePhase::TargetEnd),
+                                (unsigned long long)chunkProfile.Duration(ProfilePhase::DraftBegin, ProfilePhase::DraftEnd),
+                                (unsigned long long)chunkProfile.Duration(ProfilePhase::CheckpointBegin, ProfilePhase::CheckpointEnd));
+                        } else {
+                            FastllmEvent("prefill", context->requestId, "prefill_chunk_profile",
+                                "timing_scope=host_call_wall_without_added_cuda_sync clock_state=invalid "
+                                "path=multimodal draft_kind=%s chunk_tokens=%d completed_tokens=%d",
+                                profileDraftKind, curLen, prefixTokens + st);
+                        }
+                    }
+                    const int soloCount = getMultimodalIntParam("mm_prefill_solo_count");
+                    bool soloContinue = false;
+                    if (resumableMultimodalPrefill && st < totalLen && soloCount > 0) {
+                        std::lock_guard<std::mutex> guard(responseContextDict.locker);
+                        soloContinue = (int)responseContextDict.dicts.size() <= soloCount;
+                        static std::atomic<bool> yieldLogged{false};
+                        if (!soloContinue && !yieldLogged.exchange(true)) {
+                            printf("[MM-SOLO-YIELD] request=%llu st=%d total=%d\n",
+                                   (unsigned long long)context->requestId, st, totalLen);
+                            fflush(stdout);
+                        }
+                    }
+                    if (resumableMultimodalPrefill && st < totalLen && !soloContinue) {
+                        if (dflashOverlap) {
+                            try {
+                                dflashOverlap->Drain();
+                                dflashOverlap.reset();
+                            } catch (...) {
+                                std::vector<Qwen35DFlashPrefillPayload> pending =
+                                    dflashOverlap->CancelAndTakePending();
+                                dflashOverlap.reset();
+                                replayDFlashPayloads(pending);
+                                overlapDFlashPrefill = false;
+                            }
+                        }
+                        context->intParams["mm_embedding_cursor"] = st;
+                        context->intParams["mm_text_cursor"] = st;
+                        context->prefillRemain = totalLen - st;
+                        // The scheduler fed the whole prompt (preTokens += totalLen) and,
+                        // with usedMtpForward false, resets keptInputLens to seqLens, so its
+                        // rollback never runs. Undo the feed here: the next round enters with
+                        // preTokens == totalLen like the first one and seeds DFlash/MTP again
+                        // (accept11: without this, round 2 entered with 2 x totalLen, draft=none).
+                        context->preTokens -= totalLen;
+                        keptInputLens = {soloCount > 0 ? st - resumableOffset : curLen};
+                        return {};
                     }
                 }
             } catch (...) {
+                if (dflashOverlap) {
+                    std::vector<Qwen35DFlashPrefillPayload> pending =
+                        dflashOverlap->CancelAndTakePending();
+                    dflashOverlap.reset();
+                    replayDFlashPayloads(pending);
+                }
                 releaseDFlashHidden();
                 eraseDraftCache();
                 throw;
             }
 
+            if (abortedMultimodalPrefill) {
+                // Abort uses one cleanup exit: do not publish partial prompt state,
+                // leave prepared media, or retain DFlash state for a discarded ctx.
+                if (dflashOverlap) {
+                    dflashOverlap->Cancel();
+                    dflashOverlap.reset();
+                }
+                keptInputLens = {0};
+                clearPreparedMultimodalEmbeddings();
+                releaseDFlashHidden();
+                eraseDraftCache();
+                return chunkRet;
+            }
             if (seedDFlash || (seedMtp && firstMtpDraft >= 0)) {
                 const int nextToken = chunkRet.back();
                 acceptedTokens = {{nextToken}};
@@ -35682,25 +41776,52 @@ namespace fastllm {
                            draftDevices[0], draftDevices.size());
                     fflush(stdout);
                 }
+                if (!finishResumableMultimodalPrefill()) return {};
                 return chunkRet;
             }
             eraseDraftCache();
+            if (!finishResumableMultimodalPrefill()) return {};
             return chunkRet;
         }
 
-        if (IsThreadTensorParallelEnabled()) {
+        if (CanUseGPUForward()) {
             hiddenStates.ToDevice(DataDevice::CPU);
             FastllmCudaClearBigBuffer();
 
-            const int chunkSize = GetChunkedPrefillSize();
-            if (chunkSize > 0 && totalLen > chunkSize) {
+            const int chunkSize = configuredMultimodalChunkSize > 0 ?
+                configuredMultimodalChunkSize : std::max(1, GetChunkedPrefillSize());
+            if (totalLen > chunkSize) {
                 std::vector<int> chunkRet;
-                for (int st = 0; st < totalLen; st += chunkSize) {
-                    const int curLen = std::min(chunkSize, totalLen - st);
+                for (int st = resumableOffset; st < totalLen; ) {
+                    // Same opt-in tail rule as the DFlash/MTP loop above.
+                    static const bool mmTailAlign =
+                        Qwen35MoeIsTrueString(std::getenv("FASTLLM_QWEN35_MM_TAIL_ALIGN"));
+                    // Chunks keep the grid of chunkSize from st = 0 (a junction cut below returns
+                    // to it), so later checkpoints stay on the restored-relative grid.
+                    int curLen = std::min(chunkSize - st % chunkSize, totalLen - st);
+                    // V5 junction (draft3 H24/H25) for image prompts: end a chunk at the deepest page
+                    // shared with any stored conversation so its state is saved at the branch point.
+                    if (fastllm::DiskPrefixV5Enabled() && context != nullptr) {
+                        const auto junctionIt = context->intParams.find("qwen35_v5_junction");
+                        const int junction = junctionIt == context->intParams.end() ? 0 : junctionIt->second;
+                        const int rel = junction - prefixTokens;
+                        if (rel > st && rel < st + curLen) curLen = rel - st;
+                    }
+                    if (mmTailAlign && st + curLen == totalLen) {
+                        const int pageLen = (int)fastllm::GetPageLen();
+                        const int end = prefixTokens + st + curLen;
+                        if (pageLen > 0 && end % pageLen != 0) {
+                            const int boundary = end / pageLen * pageLen - prefixTokens;
+                            if (boundary > st) curLen = boundary - st;
+                        }
+                    }
+                    CheckpointTrace("mm_chunk_begin", st, curLen);
                     Data curInputIds, curPositionIds, curHiddenStates;
                     Split(inputIds, 1, st, st + curLen, curInputIds);
                     Split(mropePositionIds, 1, st, st + curLen,
                           curPositionIds);
+                    AssertInFastLLM(st >= mmRowBegin && st + curLen <= mmRowEnd,
+                                    "Qwen3.5 chunk embedding rows do not cover this chunk.");
                     SplitMultimodalTextEmbeddings(hiddenStates, st, st + curLen,
                                                   curHiddenStates);
 
@@ -35710,11 +41831,18 @@ namespace fastllm {
                     };
                     std::vector<int> curSeqLens = {curLen};
 
+                    const uint64_t observationChunkBeginNs =
+                        GetFastllmObservabilityMode() != FastllmObservabilityMode::Off && context
+                        ? FastllmObservationTimestampNs() : 0;
+                    if (observationChunkBeginNs) BeginRequestPrefillStatus(context->requestId, totalLen);
                     bool oldIntermediateChunkedPrefill =
                         isIntermediateChunkedPrefill;
                     isIntermediateChunkedPrefill =
                         st + curLen < totalLen &&
                         generationConfig.IsSimpleGreedy();
+#if defined(FASTLLM_DISK_PREFIX_CACHE)
+                    auto persistentChunkStarted = std::chrono::steady_clock::now();
+#endif
                     try {
                         chunkRet = ForwardGPUWithHiddenStates(
                             1, curInputIds, curAttentionMasks,
@@ -35728,11 +41856,50 @@ namespace fastllm {
                     }
                     isIntermediateChunkedPrefill =
                         oldIntermediateChunkedPrefill;
+#if defined(FASTLLM_DISK_PREFIX_CACHE)
+                    ObservePersistentPrefill(curLen,std::chrono::duration<double,std::milli>(
+                        std::chrono::steady_clock::now()-persistentChunkStarted).count());
+#endif
+                    st += curLen;
+                    if (resumableMultimodalPrefill && context != nullptr &&
+                        context->isAbort) {
+                        abortedMultimodalPrefill = true;
+                        break;
+                    }
+                    if (observationChunkBeginNs)
+                        RecordRequestPrefillStatus(context->requestId,
+                            context->nativeGeneration.prefillTokens + st,
+                            observationChunkBeginNs, FastllmObservationTimestampNs());
+                    if (context != nullptr)
+                        RecordRequestDiagnosticProgress(context->requestId, FastllmObservationTimestampNs());
+                    if (context != nullptr && (prefixTokens + st) % fastllm::GetPageLen() == 0) {
+                        context->TryRecordPagedCache(this);
+                    }
+                    if (resumableMultimodalPrefill && st < totalLen) {
+                        context->intParams["mm_embedding_cursor"] = st;
+                        context->intParams["mm_text_cursor"] = st;
+                        context->prefillRemain = totalLen - st;
+                        // The scheduler fed the whole prompt (preTokens += totalLen) and,
+                        // with usedMtpForward false, resets keptInputLens to seqLens, so its
+                        // rollback never runs. Undo the feed here: the next round enters with
+                        // preTokens == totalLen like the first one and seeds DFlash/MTP again
+                        // (accept11: without this, round 2 entered with 2 x totalLen, draft=none).
+                        context->preTokens -= totalLen;
+                        keptInputLens = {curLen};
+                        return {};
+                    }
                 }
+                if (abortedMultimodalPrefill) {
+                    keptInputLens = {0};
+                    clearPreparedMultimodalEmbeddings();
+                    return {};
+                }
+                if (!finishResumableMultimodalPrefill()) return {};
                 return chunkRet;
             }
 
             std::vector <Data*> positionIds = {&mropePositionIds};
+            AssertInFastLLM(!mmPartialRows, "Qwen3.5 full-prompt forward needs all embedding rows.");
             return ForwardGPUWithHiddenStates(
                 1, inputIds, attentionMasks, positionIds, seqLens,
                 pagedPastKeyValues, generationConfigs, lastTokens,
@@ -35751,6 +41918,7 @@ namespace fastllm {
         if (hiddenStates.dataType != this->dataType) {
             ToDataType(hiddenStates, this->dataType);
         }
+        AssertInFastLLM(!mmPartialRows, "Qwen3.5 full-prompt forward needs all embedding rows.");
         return ForwardFromHiddenStates(1, inputIds, attentionMasks, mropePositionIds, seqLens,
                                        pagedPastKeyValues, generationConfigs, lastTokens,
                                        retLogits, hiddenStates, inputIds.dims[1] == 1);
@@ -36049,6 +42217,7 @@ namespace fastllm {
                     Data &vCaches = *batchPastValues[0];
                     PagedCacheManager *pagedCacheKManager = kCaches.pagedKVCacheData;
                     PagedCacheManager *pagedCacheVManager = vCaches.pagedKVCacheData;
+                    PairPagedCacheManagers(pagedCacheKManager, pagedCacheVManager);  // KVPAIR (no-op unless enabled)
                     AssertInFastLLM(pagedCacheKManager != nullptr && pagedCacheVManager != nullptr,
                                     "Qwen3.5 fused batch decode requires paged KV cache.");
 
@@ -36087,6 +42256,7 @@ namespace fastllm {
                         i * 2, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, kCacheDesc);
                     PagedCacheManager *pagedCacheVManager = AllocatePagedCacheManager(
                         i * 2 + 1, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, vCacheDesc);
+                    PairPagedCacheManagers(pagedCacheKManager, pagedCacheVManager);  // KVPAIR (no-op unless enabled)
                     AppendPagedCache(*pagedCacheKManager, pastKey, k);
                     AppendPagedCache(*pagedCacheVManager, pastValue, v);
                     AttentionPaged(q, pastKey, pastValue, qkv, q.dims[0] / k.dims[0], 1.0 / sqrt(head_dim), 1, pagedAttentionInited);

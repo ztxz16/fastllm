@@ -266,7 +266,7 @@ namespace fastllm {
 
             ~V41EngramProfiler() {
                 if (level > 0) {
-                    Report("汇总");
+                    Report("summary");
                 }
             }
 
@@ -290,7 +290,7 @@ namespace fastllm {
                 }
                 if (reportEvery > 0 && ++sinceReport >= reportEvery) {
                     sinceReport = 0;
-                    ReportLocked("进行中");
+                    ReportLocked("in progress");
                 }
             }
 
@@ -311,8 +311,8 @@ namespace fastllm {
                 }
                 double n = (double)s.calls;
                 double sum = s.hash + s.prep + s.gather + s.wkv + s.apply;
-                printf("[Engram %s] %s %llu 次 / %llu token：每次 hash %.3f + prep %.3f + gather %.3f + wkv %.3f "
-                       "+ apply %.3f = %.3f ms（等待预取 %.3f，累计 %.1f ms）\n",
+                printf("[Engram %s] %s %llu calls / %llu tokens: per-call hash %.3f + prep %.3f + gather %.3f + wkv %.3f "
+                       "+ apply %.3f = %.3f ms (prefetch wait %.3f, cumulative %.1f ms)\n",
                        tag, name, (unsigned long long)s.calls, (unsigned long long)s.tokens,
                        s.hash / n, s.prep / n, s.gather / n, s.wkv / n, s.apply / n, sum / n, s.wait / n, sum);
             }

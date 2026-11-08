@@ -9,6 +9,11 @@
 #include "parallel/model.h"
 #include "devices/disk/diskdevice.h"
 #include "moe_cache_config.h"
+#include "utils/prefix_cache_logging.h"
+#if defined(FASTLLM_DISK_PREFIX_CACHE)
+#include "utils/disk_prefix_cache.h"
+#include "utils/disk_prefix_storage_config.h"
+#endif
 #include "utils/autotune.h"
 #include "cpu_thread_bench.h"
 
@@ -1065,10 +1070,208 @@ extern "C" {
         return ret;
     }
 
+    DLL_EXPORT bool get_response_observation_llm_model(
+            int modelId, int handleId, int *cachedInputTokens,
+            int *missedInputTokens, int *outputTokens,
+            unsigned long long *nativeHandle, char *segments,
+            int segmentsCapacity) {
+        auto model = models.GetModel(modelId);
+        fastllm::ResponseObservation observation;
+        const bool ret = model->GetResponseObservation(handleId, observation);
+        if (!ret) return false;
+        if (cachedInputTokens != nullptr) *cachedInputTokens = observation.cachedInputTokens;
+        if (missedInputTokens != nullptr) *missedInputTokens = observation.missedInputTokens;
+        if (outputTokens != nullptr) *outputTokens = observation.outputTokens;
+        if (nativeHandle != nullptr) *nativeHandle = observation.nativeHandle;
+        if (segments != nullptr && segmentsCapacity > 0) {
+            int used = 0;
+            segments[0] = '\0';
+            for (const auto &segment : observation.cacheSegments) {
+                if (used >= segmentsCapacity - 1) break;
+                const int written = std::snprintf(
+                    segments + used, size_t(segmentsCapacity - used),
+                    "%ssource_tier=%s,promoted_to=%s,source_tokens=%d,effective_reused_tokens=%d"
+                    ",lookup_ms=%.3f,restore_ms=%.3f,read_mib_s=%.3f,restore_tokens_s=%.3f",
+                    used == 0 ? "" : ";", segment.sourceTier.c_str(),
+                    segment.promotedTo.c_str(), segment.sourceTokens,
+                    segment.effectiveReusedTokens, segment.lookupMs,
+                    segment.restoreMs, segment.readMiBS, segment.restoreTokensS);
+                if (written <= 0 || written >= segmentsCapacity - used) break;
+                used += written;
+            }
+        }
+        return true;
+    }
+
+    DLL_EXPORT void register_request_observation_llm_model(
+            int, int handleId, const char *publicRequestId) {
+        fastllm::RegisterFastllmPublicRequestId(
+            static_cast<uint64_t>(static_cast<int64_t>(handleId)), publicRequestId);
+    }
+
+    DLL_EXPORT void unregister_request_observation_llm_model(int, int handleId) {
+        fastllm::UnregisterFastllmPublicRequestId(
+            static_cast<uint64_t>(static_cast<int64_t>(handleId)));
+    }
+
+    DLL_EXPORT void unregister_request_observation_checked_llm_model(
+            int, int handleId, const char *publicId) {
+        if (publicId) fastllm::UnregisterFastllmPublicRequestId(
+            static_cast<uint64_t>(handleId), publicId);
+    }
+
+    // Independent diagnostic evidence: no model lookup, status lock, cache
+    // sampling or GPU call is allowed in this ABI, even if those are blocked.
+    DLL_EXPORT bool get_request_diagnostics_llm_model(
+            int modelId, int handleId, const char *publicId, char *buffer, int capacity) {
+        (void)modelId;
+        if (publicId == nullptr || buffer == nullptr || capacity <= 0) return false;
+        buffer[0] = '\0';
+        try {
+            fastllm::RequestDiagnosticFields fields;
+            if (!fastllm::ReadRequestDiagnostics(uint64_t(handleId), publicId, fields)) return false;
+            std::string result;
+            for (const auto &field : fields) result += field.first + "=" + field.second + "\n";
+            if (result.size() >= static_cast<size_t>(capacity)) return false;
+            std::memcpy(buffer, result.c_str(), result.size() + 1);
+            return true;
+        } catch (...) { buffer[0] = '\0'; return false; }
+    }
+
+    DLL_EXPORT bool get_request_status_llm_model(
+            int modelId, int handleId, const char *publicId, char *buffer, int capacity) {
+        if (!publicId || !buffer || capacity <= 0) return false;
+        try {
+            const auto begin = fastllm::RequestStatusNowNs();
+            fastllm::RequestStatusFields before, fields;
+            if (!fastllm::ReadRequestStatus(static_cast<uint64_t>(handleId), publicId, before))
+                return false;
+            auto model = models.GetModel(modelId);
+            auto cache = model->GetCacheCapacityObservation();
+            if (!fastllm::ReadRequestStatus(static_cast<uint64_t>(handleId), publicId, fields) ||
+                fields["native_generation"] != before["native_generation"]) return false;
+            fields.insert(cache.begin(), cache.end());
+            fields["snapshot_begin_ns"] = std::to_string(begin);
+            fields["snapshot_end_ns"] = std::to_string(fastllm::RequestStatusNowNs());
+            fields["snapshot_timestamp_utc"] = fastllm::RequestStatusWallTimestamp(fastllm::RequestStatusWallNs());
+            fields["snapshot_phase_consistency"] =
+                fields["phase_revision"] == before["phase_revision"] ? "stable" : "changed_during_capacity_sample";
+            fields["phase_before_capacity"] = before["phase"];
+            fields["native_model_id"] = std::to_string(modelId);
+            std::string encoded;
+            for (const auto &field : fields) {
+                if (!encoded.empty()) encoded += " ";
+                encoded += field.first + "=" + field.second;
+            }
+            if (encoded.size() >= static_cast<size_t>(capacity)) return false;
+            std::memcpy(buffer, encoded.c_str(), encoded.size() + 1);
+            return true;
+        } catch (const std::exception &) { return false; }
+    }
+
+    DLL_EXPORT unsigned long long next_fastllm_observation_seq() {
+        return static_cast<unsigned long long>(fastllm::FastllmNextObservationSequence());
+    }
+
     // 终止handleId的请求
     DLL_EXPORT void abort_response_llm_model(int modelId, int handleId) {
         auto model = models.GetModel(modelId);
         model->AbortResponse(handleId);
+    }
+
+    DLL_EXPORT int set_persistent_prefix_manifest(const char *manifest) {
+#if defined(FASTLLM_DISK_PREFIX_CACHE)
+        try {
+            if (manifest == nullptr) {
+                fastllm::DiskPrefixCache::SetStartupManifest("");
+                return 1;
+            }
+            const size_t bytes = strnlen(manifest, fastllm::DiskPrefixCache::MaxMetadataBytes + 1);
+            if (bytes > fastllm::DiskPrefixCache::MaxMetadataBytes) return 0;
+            std::string error, value(manifest, bytes);
+            auto parsed = json11::Json::parse(value, error);
+            if (!error.empty() || !parsed.is_object()) return 0;
+            fastllm::DiskPrefixCache::SetStartupManifest(value);
+            return 1;
+        } catch (...) { return 0; }
+#else
+        return manifest == nullptr ? 1 : 0;
+#endif
+    }
+
+    DLL_EXPORT int get_persistent_prefix_cache_version() {
+#if defined(FASTLLM_DISK_PREFIX_CACHE) && defined(USE_CUDA)
+        return 4;
+#else
+        return 0;
+#endif
+    }
+
+    // SSD_CACHE_REWRITE_PLAN.md §13.1 版本协商合同。
+    // Retained symbol for ABI compatibility; this v4-only build reports 4.
+    static thread_local std::string persistentPrefixStorageConfigError;
+
+    DLL_EXPORT uint32_t get_persistent_prefix_cache_storage_capabilities() {
+#if defined(FASTLLM_DISK_PREFIX_CACHE)
+        return fastllm::PersistentPrefixStorageCapabilities();
+#else
+        return 0;
+#endif
+    }
+
+    // 返回 1 表示配置已被接受；返回 0 时用下面的 error getter 取原因。
+    // 所有校验都在 native 创建任何 writer/打开任何目录之前完成。
+    DLL_EXPORT int set_persistent_prefix_cache_storage_config(const char *json) {
+#if defined(FASTLLM_DISK_PREFIX_CACHE)
+        persistentPrefixStorageConfigError.clear();
+        try {
+            if (json == nullptr) {
+                persistentPrefixStorageConfigError = "storage_config_null";
+                return 0;
+            }
+            const size_t bytes = strnlen(json, (1u << 20));
+            if (bytes >= (1u << 20)) {
+                persistentPrefixStorageConfigError = "storage_config_too_large";
+                return 0;
+            }
+            std::string error, text(json, bytes);
+            fastllm::PersistentPrefixStorageConfig config;
+            if (!fastllm::ParsePersistentPrefixStorageConfig(text, config, error)) {
+                persistentPrefixStorageConfigError = error;
+                return 0;
+            }
+            if (!fastllm::SetPersistentPrefixStorageConfig(config, error)) {
+                persistentPrefixStorageConfigError = error;
+                return 0;
+            }
+            return 1;
+        } catch (...) {
+            persistentPrefixStorageConfigError = "storage_config_exception";
+            return 0;
+        }
+#else
+        return json == nullptr ? 1 : 0;
+#endif
+    }
+
+    // 诊断扩展（非协商合同必需）：最近一次 storage-config 失败的原因。
+    DLL_EXPORT const char *get_persistent_prefix_cache_storage_config_error() {
+        return persistentPrefixStorageConfigError.c_str();
+    }
+
+    // §13 第 2 条：关闭新准入（排空之前调用），不改动在途作业。
+    DLL_EXPORT void close_persistent_prefix_admission(int modelId) {
+        models.GetModel(modelId)->ClosePersistentPrefixAdmission();
+    }
+
+    DLL_EXPORT bool wait_persistent_prefix_cache(int modelId, int timeoutMs) {
+        return models.GetModel(modelId)->WaitPersistentPrefixCache(timeoutMs);
+    }
+
+    DLL_EXPORT const char *get_persistent_prefix_cache_statistics(int modelId) {
+        static thread_local std::string result;
+        result = models.GetModel(modelId)->PersistentPrefixCacheStatistics();
+        return result.c_str();
     }
 
     DLL_EXPORT char *fetch_response_str_llm_model(int modelId, int handleId) {

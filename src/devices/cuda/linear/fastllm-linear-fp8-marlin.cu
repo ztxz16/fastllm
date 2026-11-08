@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <map>
 #include <memory>
@@ -342,9 +343,19 @@ static void BuildFp8MarlinPermutedScales(const fastllm::Data &weight, int m, int
     }
 }
 
+static std::mutex &Fp8MarlinPrepareMutex() {
+    int device = -1;
+    cudaGetDevice(&device);
+    static std::mutex registryMutex;
+    static std::map<int, std::mutex> deviceMutexes;
+    std::lock_guard<std::mutex> registryLock(registryMutex);
+    return deviceMutexes[device];
+}
+
 static bool EnsureFp8MarlinOnDevice(fastllm::Data &weight, int m, int k) {
-    static std::mutex mu;
-    std::lock_guard<std::mutex> lock(mu);
+    // TP shards own distinct device allocations. Serialize preparation on
+    // each device while letting independent GPU repacks proceed together.
+    std::lock_guard<std::mutex> lock(Fp8MarlinPrepareMutex());
     if (HasFp8MarlinOnDevice(weight)) return true;
     if (weight.cudaData == nullptr ||
         weight.blockM != FP8_GROUP_SIZE || weight.blockK != FP8_GROUP_SIZE ||

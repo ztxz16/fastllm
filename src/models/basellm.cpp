@@ -5,7 +5,10 @@
 #include "basellm.h"
 #include "models/mimo_tool_grammar.h"
 #include "utils.h"
+#include "utils/checkpoint_trace.h"
 #include "utils/cuda_cache_budget.h"
+#include "utils/load_stage_timing.h"
+#include "utils/prefix_cache_logging.h"
 #include "utils/inference_trace.h"
 #include "utils/dense_id_set.h"
 #include "utils/paged_prefix_preview.h"
@@ -25,6 +28,203 @@
 #endif
 
 namespace fastllm {
+    namespace {
+        // A-3: monotonic request-lease generation. Deliberately separate from
+        // page timestamps, recycle serials and copy generations.
+        std::atomic<uint64_t> gPagedPageOwnerGeneration{0};
+
+        // RECORDOPT (FASTLLM_QWEN35_RECORD_FAST=1, default off). Strict opt-in:
+        // any value other than "1" keeps the per-manager inline hash path.
+        bool RecordOptFastEnabled() {
+            static const bool enabled = [] {
+                const char *value = std::getenv("FASTLLM_QWEN35_RECORD_FAST");
+                return value != nullptr && std::strcmp(value, "1") == 0;
+            }();
+            return enabled;
+        }
+
+        // One checkpoint records the same text range into every (layer, K/V,
+        // rank) manager. Those managers share the token range and page length,
+        // so the page hashes are computed once and reused. Entries are keyed by
+        // (pageLen, prefix-callback set); a new key recomputes, never reuses.
+        struct SharedPageHashes {
+            PagedCacheManager::PageHashes hashes[2];
+            int pageLen[2] = {-1, -1};
+            bool withPrefix[2] = {false, false};
+            bool ready[2] = {false, false};
+            int next = 0;
+            const PagedCacheManager::PageHashes *Get(const std::vector<int> &tokens,
+                                                     int len, bool prefix) {
+                for (int slot = 0; slot < 2; slot++) {
+                    if (ready[slot] && pageLen[slot] == len && withPrefix[slot] == prefix) {
+                        return &hashes[slot];
+                    }
+                }
+                const int slot = next;
+                next = slot == 0 ? 1 : 0;
+                PagedCacheManager::PreparePageHashes(hashes[slot], tokens.data(),
+                                                    tokens.size(), len, nullptr, prefix);
+                ready[slot] = true;
+                pageLen[slot] = len;
+                withPrefix[slot] = prefix;
+                return &hashes[slot];
+            }
+        };
+    }
+    void RecordRequestNativeCommit(ResponseContext *context, bool prompt) {
+        if (context == nullptr || GetFastllmObservabilityMode() == FastllmObservabilityMode::Off) return;
+        auto &m = context->nativeGeneration;
+        const bool first = m.generatedTokens == 0;
+        const uint64_t firstNs = first ? FastllmObservationTimestampNs() : 0;
+        m.Commit(prompt, firstNs);
+        RecordRequestDecodeProgress(context, 1); // committed queue entries only
+    }
+
+    void RecordRequestNativeStep(ResponseContext *context, bool prompt, bool partial,
+                                 int tokens, uint64_t beginNs, uint64_t endNs,
+                                 uint64_t visionNs) {
+        if (context == nullptr || GetFastllmObservabilityMode() == FastllmObservabilityMode::Off) return;
+        auto &m = context->nativeGeneration;
+        RecordRequestDiagnosticProgress(context->requestId, endNs);
+        if (prompt) {
+            m.Prefill(std::max(0, tokens), beginNs, endNs, visionNs);
+            BeginRequestPrefillStatus(context->requestId,
+                std::max(0, context->inputTokens - context->cacheLen));
+            const uint64_t observedBegin = endNs > beginNs && visionNs < endNs - beginNs
+                ? beginNs + visionNs : endNs;
+            RecordRequestPrefillStatus(context->requestId, m.prefillTokens, observedBegin, endNs);
+            if (!partial) {
+                m.Ready(FastllmObservationTimestampNs());
+                if (!m.prefillReported) {
+                    const int input = std::max(0, context->inputTokens);
+                    const int cached = std::min(input, std::max(0, context->cacheLen));
+                    FastllmEvent("prefill", context->requestId, "prefill_summary",
+                                 "measurement=native_forward_excluding_vision input_tokens=%d cached_input_tokens=%d "
+                                 "missed_input_tokens=%d prefill_tokens=%llu elapsed_ns=%llu excluded_vision_ns=%llu",
+                                 input, cached, input - cached, (unsigned long long)m.prefillTokens,
+                                 (unsigned long long)m.prefillElapsedNs, (unsigned long long)m.excludedVisionNs);
+                    if (m.prefillClockValid && m.prefillTokens > 0 && m.prefillElapsedNs > 0) {
+                        FastllmEvent("prefill", context->requestId, "prefill_speed",
+                                     "measurement=native_forward_excluding_vision prefill_tokens=%llu elapsed_ns=%llu "
+                                     "elapsed_ms=%.3f prefill_tokens_s=%.3f",
+                                     (unsigned long long)m.prefillTokens, (unsigned long long)m.prefillElapsedNs,
+                                     double(m.prefillElapsedNs) / 1e6,
+                                     double(m.prefillTokens) * 1e9 / double(m.prefillElapsedNs));
+                    }
+                    m.prefillReported = true;
+                    RecordRequestDecodeStatus(context->requestId, m.generatedTokens, 0,
+                                              m.generationStartNs, m.generationStartNs, false);
+                }
+            }
+        } else {
+            m.DecodeEnd(endNs);
+            RecordRequestDecodeStatus(context->requestId, m.generatedTokens, m.decodeTokens,
+                                      m.generationStartNs, endNs, context->isEnding);
+            if (m.HasDecodeRate() && (context->isEnding || endNs - m.lastReportNs >= 1000000000ULL)) {
+                FastllmEvent("decode", context->requestId, "native_decode",
+                             "measurement=committed_tokens_after_prefill timing_scope=post_prefill_native_generation "
+                             "generated_tokens=%llu prefill_generated_tokens=%llu native_decode_tokens=%llu "
+                             "window_start_ns=%llu window_end_ns=%llu elapsed_ns=%llu elapsed_ms=%.3f native_tokens_s=%.3f",
+                             (unsigned long long)m.generatedTokens, (unsigned long long)m.prefillGeneratedTokens,
+                             (unsigned long long)m.decodeTokens, (unsigned long long)m.generationStartNs,
+                             (unsigned long long)m.generationEndNs,
+                             (unsigned long long)(m.generationEndNs - m.generationStartNs),
+                             double(m.generationEndNs - m.generationStartNs) / 1e6, m.DecodeTokensPerSecond());
+                m.lastReportNs = endNs;
+            }
+        }
+        if (!m.firstTokenReported && m.createdNs > 0 && m.firstCommitNs >= m.createdNs && m.firstCommitNs > 0) {
+            FastllmEvent("output", context->requestId, "native_first_token",
+                         "measurement=native_committed_token window_start_ns=%llu window_end_ns=%llu ttft_ms=%.3f",
+                         (unsigned long long)m.createdNs, (unsigned long long)m.firstCommitNs,
+                         double(m.firstCommitNs - m.createdNs) / 1e6);
+            m.firstTokenReported = true;
+        }
+        if (context->isEnding && !m.finishedReported) {
+            if (FastllmObservabilityDebugEnabled()) {
+                FastllmEvent("output", context->requestId, "native_generation_summary",
+                             "generated_tokens=%llu prefill_generated_tokens=%llu native_decode_tokens=%llu "
+                             "counter_source=committed_output_queue native_rate_available=%d native_average_tokens_s=%.3f "
+                             "dflash_steps=%llu dflash_accepted_total=%llu dflash_accept_mean=%.3f",
+                             (unsigned long long)m.generatedTokens, (unsigned long long)m.prefillGeneratedTokens,
+                             (unsigned long long)m.decodeTokens, m.HasDecodeRate() ? 1 : 0, m.DecodeTokensPerSecond(),
+                             (unsigned long long)m.dflashSteps, (unsigned long long)m.dflashAcceptedTotal,
+                             m.DFlashAcceptMean());
+            } else {
+                FastllmEvent("output", context->requestId, "native_generation_summary",
+                             "generated_tokens=%llu prefill_generated_tokens=%llu native_decode_tokens=%llu "
+                             "counter_source=committed_output_queue native_rate_available=%d native_average_tokens_s=%.3f",
+                             (unsigned long long)m.generatedTokens, (unsigned long long)m.prefillGeneratedTokens,
+                             (unsigned long long)m.decodeTokens, m.HasDecodeRate() ? 1 : 0, m.DecodeTokensPerSecond());
+            }
+            m.finishedReported = true;
+        }
+    }
+
+    void RecordRequestPrefillProgress(ResponseContext *context, int tokens) {
+        if (context != nullptr && tokens > 0) {
+            context->progressPrefillTokens += tokens;
+        }
+    }
+
+    void RecordRequestDecodeProgress(ResponseContext *context, int tokens) {
+        if (context != nullptr && tokens > 0) {
+            context->progressDecodeTokens += tokens;
+        }
+    }
+
+    void ReportRequestProgress(ResponseContext *context, const char *phase,
+                               bool force) {
+        if (context == nullptr) return;
+        const auto now = std::chrono::steady_clock::now();
+        if (context->progressLastReport == std::chrono::steady_clock::time_point()) {
+            context->progressLastReport = now;
+        }
+        const double elapsed = std::chrono::duration<double>(
+            now - context->progressLastReport).count();
+        if (!force && elapsed < 1.0) return;
+        const double safeElapsed = std::max(elapsed, 1e-9);
+        const char *effectivePhase = phase != nullptr ? phase : "unknown";
+        if (context->progressPrefillTokens > 0 && context->progressDecodeTokens > 0) {
+            effectivePhase = "mixed";
+        } else if (context->progressDecodeTokens > 0) {
+            effectivePhase = "decode";
+        } else if (context->progressPrefillTokens > 0) {
+            effectivePhase = "prefill";
+        }
+        int effectiveReused = 0;
+        for (const auto &segment : context->cacheSegments)
+            effectiveReused += std::max(0, segment.effectiveReusedTokens);
+        if (GetFastllmObservabilityMode() != FastllmObservabilityMode::Off) {
+            FastllmEvent(
+                "progress", context->requestId, "progress",
+                "phase=%s elapsed_s=%.3f prefill_interval_tokens_s=%.2f committed_interval_tokens_s=%.2f "
+                "l1_reused_tokens=%d l2_reused_tokens=%d l3_reused_tokens=%d "
+                "effective_reused_tokens=%d prefix_lookup_ms=%.1f prefix_restore_ms=%.1f "
+                "ssd_read_mib_s=%.2f ssd_restore_tokens_s=%.2f vision_ssd_load_mib_s=%.2f",
+                effectivePhase, safeElapsed,
+                context->progressPrefillTokens / safeElapsed,
+                context->progressDecodeTokens / safeElapsed,
+                context->progressL1Tokens, context->progressL2Tokens,
+                context->progressL3Tokens, effectiveReused,
+                context->progressPrefixLookupMs,
+                context->progressPrefixRestoreMs, context->progressSsdReadMiBS,
+                context->progressSsdRestoreTokensS,
+                context->progressVisionSsdMiBS);
+        } else {
+            FastllmEvent(
+                "progress", context->requestId, "progress",
+                "phase=%s elapsed_s=%.3f prefill_tokens_s=%.2f output_tokens_s=%.2f "
+                "effective_reused_tokens=%d",
+                effectivePhase, safeElapsed,
+                context->progressPrefillTokens / safeElapsed,
+                context->progressDecodeTokens / safeElapsed, effectiveReused);
+        }
+        context->progressPrefillTokens = 0;
+        context->progressDecodeTokens = 0;
+        context->progressLastReport = now;
+    }
+
     namespace {
         static void SplitPrefillInput(const Data &input, int start, int count, Data &output) {
             // Keep host token/position metadata on the host while chunking.
@@ -487,12 +687,28 @@ namespace fastllm {
         std::lock_guard<std::mutex> lock(locker);
         // Cancelled async fetches may outlive removal. Do not immediately
         // recycle their handle for the next request (the ABA problem).
+        // 0 means "no request" across the codebase (CommitIdentity::Valid()
+        // requires a non-zero requestId; qwen3_5.cpp treats <=0 as unset),
+        // so handles start at 1 and wrap back to 1.
         int newId;
         do {
+            if (nextHandle <= 0) nextHandle = 1;
             newId = nextHandle;
-            nextHandle = nextHandle == INT_MAX ? 0 : nextHandle + 1;
+            nextHandle = nextHandle == INT_MAX ? 1 : nextHandle + 1;
         } while (dicts.find(newId) != dicts.end());
         dicts[newId] = new ResponseContext();
+        dicts[newId]->requestId = (uint64_t)newId;
+        // A-3: stable per-request owner lease. ResponseContext is raw new/delete
+        // and cannot outlive itself, so background saves hold this lease.
+        dicts[newId]->pagedPageOwnerLease = std::make_shared<PagedPageOwnerLease>();
+        dicts[newId]->pagedPageOwnerLease->requestId = (uint64_t)newId;
+        dicts[newId]->pagedPageOwnerLease->generation =
+            gPagedPageOwnerGeneration.fetch_add(1, std::memory_order_acq_rel) + 1;
+        if (GetFastllmObservabilityMode() != FastllmObservabilityMode::Off) {
+            BeginFastllmNativeRequest((uint64_t)newId);
+            dicts[newId]->nativeGeneration.createdNs = FastllmObservationTimestampNs();
+        }
+        dicts[newId]->progressLastReport = std::chrono::steady_clock::now();
         dicts[newId]->generation = ++nextGeneration;
         return newId;
     }
@@ -507,8 +723,13 @@ namespace fastllm {
     void ResponseContextDict::RemoveHandle(int handleId) {
         locker.lock();
         if (dicts.find(handleId) != dicts.end()) {
+            if (GetFastllmObservabilityMode() != FastllmObservabilityMode::Off)
+                FastllmEvent("lifecycle", handleId, "native_context_cleanup_begin",
+                             "ending=%d abort_requested=%d", dicts[handleId]->isEnding, int(dicts[handleId]->isAbort.load(std::memory_order_acquire)));
             delete dicts[handleId];
             dicts.erase(handleId);
+            if (GetFastllmObservabilityMode() != FastllmObservabilityMode::Off)
+                EndFastllmNativeRequest(handleId);
         }
         locker.unlock();
     }
@@ -741,9 +962,84 @@ namespace fastllm {
     void basellm::RemoveResponseContext(int handleId) {
         ResponseContext *context = responseContextDict.GetHandle(handleId);
         if (context != nullptr) {
+            if (context->isAbort.load(std::memory_order_acquire) &&
+                context->pagedPageOwnerLease) {
+                context->pagedPageOwnerLease->cancelled.store(
+                    true, std::memory_order_release);
+            }
             this->OnResponseContextRemoved(context);
         }
         responseContextDict.RemoveHandle(handleId);
+    }
+
+    void basellm::RegisterPagedPageOwners(PagedCacheManager *manager,
+                                          const std::vector<int> &pages,
+                                          const PagedCacheManager::RecycleRequestIdentity &identity) {
+        if (manager == nullptr || pages.empty() || identity.requestGeneration == 0 ||
+            !identity.ownerLease) {
+            return;
+        }
+        std::vector<std::pair<int, long long>> timestampedPages;
+        {
+            std::lock_guard<std::mutex> managerLock(manager->pageIndexLocker);
+            timestampedPages.reserve(pages.size());
+            for (int page : pages) {
+                if (page >= 0 && page < (int)manager->pageTimestamp.size()) {
+                    timestampedPages.emplace_back(page, manager->pageTimestamp[page]);
+                }
+            }
+        }
+        std::lock_guard<std::mutex> lock(this->pagedPageOwnerMutex);
+        for (const auto &entry : timestampedPages) {
+            const auto key = std::make_pair(manager, entry.first);
+            auto found = this->pagedPageOwners.find(key);
+            if (found == this->pagedPageOwners.end() ||
+                found->second.pageTimestamp != entry.second) {
+                PagedPageOwnerRecord owner;
+                owner.identity = identity;
+                owner.pageTimestamp = entry.second;
+                this->pagedPageOwners[key] = std::move(owner);
+            }
+        }
+    }
+
+    bool basellm::PeekPagedPageOwner(
+            PagedCacheManager *manager, int pageIndex,
+            PagedCacheManager::RecycleRequestIdentity &identity) {
+        if (manager == nullptr || pageIndex < 0) return false;
+        std::lock_guard<std::mutex> lock(this->pagedPageOwnerMutex);
+        auto found = this->pagedPageOwners.find({manager, pageIndex});
+        if (found == this->pagedPageOwners.end()) return false;
+        identity = found->second.identity;
+        return true;
+    }
+
+    bool basellm::ErasePagedPageOwner(
+            PagedCacheManager *manager, int pageIndex,
+            const PagedCacheManager::RecycleRequestIdentity &expected) {
+        if (manager == nullptr || pageIndex < 0) return false;
+        std::lock_guard<std::mutex> lock(this->pagedPageOwnerMutex);
+        auto found = this->pagedPageOwners.find({manager, pageIndex});
+        if (found == this->pagedPageOwners.end()) return false;
+        const auto &actual = found->second.identity;
+        if (actual.requestId != expected.requestId ||
+            actual.requestGeneration != expected.requestGeneration ||
+            actual.ownerLease != expected.ownerLease) {
+            return false;
+        }
+        this->pagedPageOwners.erase(found);
+        return true;
+    }
+
+    bool basellm::TakePagedPageOwner(PagedCacheManager *manager, int pageIndex,
+                                     PagedCacheManager::RecycleRequestIdentity &identity) {
+        if (manager == nullptr || pageIndex < 0) return false;
+        std::lock_guard<std::mutex> lock(this->pagedPageOwnerMutex);
+        auto found = this->pagedPageOwners.find({manager, pageIndex});
+        if (found == this->pagedPageOwners.end()) return false;
+        identity = found->second.identity;
+        this->pagedPageOwners.erase(found);
+        return true;
     }
 
     void ResponseContext::TryRecordPagedCache(basellm *model) {
@@ -751,9 +1047,7 @@ namespace fastllm {
         inference_trace::DetailSpan recordTrace("record.model_history", detail);
         if (model->kvMemConfig.enabled && !model->SupportsKvMemPrefixCache()) return;
         if (model->DeferHistoryCacheRestore()) model->TryRecordResponseContext(this);
-        if (!this->multimodalInput.empty()) {
-            return;
-        }
+        if (!CanUsePagedPrefixCache()) return;
         recordTrace.Next("record.descriptor_scan");
         bool hasLinearAttentionCache = false;
         bool hasBoundedAttentionCache = false;
@@ -826,6 +1120,14 @@ namespace fastllm {
             reusablePrefixLen = 0;
         }
 
+        CheckpointTrace("record_begin", (long long)this->allTokens.size(),
+                        (long long)this->pastKeyValues.size());
+        // Record the ready event on the model's persistent producer streams,
+        // before any page is made recyclable in the trie.
+        model->RecordPagedPrefixProducerEvents();
+        CheckpointTrace("record_producer_events_done");
+        const bool recordOptFast = RecordOptFastEnabled();
+        SharedPageHashes sharedPageHashes;
         recordTrace.Next("record.paged_publish");
         std::map<int, std::vector<uint64_t>> recordHashes;
         std::vector<PagedCacheBatchExecutor::Publication> publications;
@@ -844,16 +1146,57 @@ namespace fastllm {
             }
             if (cache.pagedKVCacheData != nullptr && !cache.pageIndex.empty() &&
                 cache.pagedKVCacheData->type == PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE) {
-                inference_trace::DetailSpan descriptorTrace("record.page_copy_hash", detail);
-                auto pages = cache.pageIndex;
-                if (cache.lastPageLen < cache.pageLen) pages.pop_back();
-                const int pageLen = cache.pagedKVCacheData->pageLen;
-                auto &hashes = recordHashes[pageLen];
-                const int count = std::min(this->allTokens.size() / pageLen, pages.size());
-                for (int i = hashes.size(); i < count; ++i)
-                    hashes.push_back(PagedCacheManager::HashTokenPage(this->allTokens.data() + i * pageLen, pageLen));
-                if (detail) detail->Count("record.page_count", pages.size());
-                publications.push_back({cache.pagedKVCacheData, &hashes, std::move(pages)});
+                PagedCacheManager *recordManager = cache.pagedKVCacheData;
+                const bool ledgerManager = recordManager->onRecordPage || recordManager->onRecyclePage;
+                if (this->multimodalInput.empty() && !ledgerManager && !recordOptFast) {
+                    // Text pages of a manager without a page ledger: publish the same page
+                    // hashes in parallel after the scan (upstream batch path). A ledger needs
+                    // token-based records and owner registration, handled below.
+                    inference_trace::DetailSpan descriptorTrace("record.page_copy_hash", detail);
+                    auto pages = cache.pageIndex;
+                    if (cache.lastPageLen < cache.pageLen) pages.pop_back();
+                    const int pageLen = cache.pagedKVCacheData->pageLen;
+                    auto &hashes = recordHashes[pageLen];
+                    const int count = std::min(this->allTokens.size() / pageLen, pages.size());
+                    for (int i = hashes.size(); i < count; ++i)
+                        hashes.push_back(PagedCacheManager::HashTokenPage(this->allTokens.data() + i * pageLen, pageLen));
+                    if (detail) detail->Count("record.page_count", pages.size());
+                    publications.push_back({cache.pagedKVCacheData, &hashes, std::move(pages)});
+                } else {
+                    if (this->multimodalInput.empty()) {
+                        if (recordOptFast) {
+                            // RECORDOPT: the text range is the same for every
+                            // manager of this checkpoint, so hash it once. The
+                            // manager validates the hashes and falls back to its
+                            // inline computation if anything differs.
+                            PagedCacheManager *manager = cache.pagedKVCacheData;
+                            const PagedCacheManager::PageHashes *hashes = sharedPageHashes.Get(
+                                this->allTokens, manager->pageLen,
+                                manager->onRecordPage || manager->onRecyclePage);
+                            manager->RecordRangePrehashed(this->allTokens.data(),
+                                                          this->allTokens.size(),
+                                                          cache.pageIndex, nullptr, *hashes);
+                        } else {
+                            cache.pagedKVCacheData->Record(this->allTokens, cache.pageIndex);
+                        }
+                    } else {
+                        // Do not publish uncomputed prompt tokens during a chunked prefill.
+                        const int length = std::min((int)this->allTokens.size(), pagedCacheTokenLen(cache));
+                        std::vector<int> committed(this->allTokens.begin(), this->allTokens.begin() + length);
+                        cache.pagedKVCacheData->Record(committed, cache.pageIndex, PrefixCachePageKeys());
+                    }
+                    // A-3: capture the owning request at the moment its pages are
+                    // published, never later at eviction time.
+                    if (model != nullptr && this->pagedPageOwnerLease &&
+                        this->pagedPageOwnerLease->generation != 0) {
+                        PagedCacheManager::RecycleRequestIdentity owner;
+                        owner.requestId = this->requestId;
+                        owner.requestGeneration = this->pagedPageOwnerLease->generation;
+                        owner.ownerLease = this->pagedPageOwnerLease;
+                        model->RegisterPagedPageOwners(cache.pagedKVCacheData,
+                                                       cache.pageIndex, owner);
+                    }
+                }
             }
         };
         for (int i = 0; i < (int)this->pastKeyValues.size(); i++) {
@@ -865,9 +1208,12 @@ namespace fastllm {
                  pagedCacheTokenLen(kvSecond) < reusablePrefixLen)) {
                 continue;
             }
+            CheckpointTrace("record_layer", i, reusablePrefixLen);
             recordPagedCache(kvFirst);
             recordPagedCache(kvSecond);
+            CheckpointTrace("record_layer_done", i);
         }
+        CheckpointTrace("record_end", (long long)this->allTokens.size());
         // Hashes are complete and stable before workers access them. Each
         // manager retains its lock, page-generation checks and publication LRU.
         model->pagedCacheExecutor.Publish(publications, GetThreads());
@@ -898,6 +1244,8 @@ namespace fastllm {
         (void)context;
         return false;
     }
+
+    void basellm::RecordPagedPrefixProducerEvents() {}
 
     int basellm::QueryPagedPrefixCacheExtra(ResponseContext *context, int maxCachedLen) const {
         (void)context;
@@ -1471,6 +1819,17 @@ namespace fastllm {
         exit(0);
     }
 
+    std::vector<int> basellm::ForwardMultimodalContext(
+            ResponseContext *context, const Data &inputIds,
+            const Data &attentionMask, const Data &positionIds,
+            const GenerationConfig &generationConfig,
+            const LastTokensManager &lastTokens,
+            std::vector<std::vector<float>*> *logits) {
+        return ForwardMultimodal(inputIds, attentionMask, positionIds,
+            context->pastKeyValues, context->multimodalInput,
+            generationConfig, lastTokens, logits);
+    }
+
     // Manager topology is stable while one scheduling pass holds dictLocker.
     // Enumerate/deduplicate it once for all waiting prompts in that pass.
     struct ResidentPrefixManagers {
@@ -1548,7 +1907,7 @@ namespace fastllm {
     // Both schedulers restore the same page references and model-specific
     // companion state. Called while scheduling is locked, between forwards.
     static PagedCacheManager *RestoreResidentPrefixImpl(basellm *model, ResponseContext *ctx) {
-        if ((model->kvMemConfig.enabled && !model->SupportsKvMemPrefixCache()) || !ctx->multimodalInput.empty() || ctx->cacheLen != 0 ||
+        if ((model->kvMemConfig.enabled && !model->SupportsKvMemPrefixCache()) || !ctx->CanUsePagedPrefixCache() || ctx->cacheLen != 0 ||
             ctx->intParams.count("paged_prefix_restore_disabled")) return nullptr;
         PagedCacheManager *probeManager = nullptr;
         bool queryUnboundedLayersOnly = false;
@@ -1580,11 +1939,27 @@ namespace fastllm {
             auto &preview = *ctx->prefillPreview;
             preview.Reset(ctx->currentTokens);
             std::map<PagedCacheManager*, std::vector<int> > queriedPages;
+            // vLLM prepare_load / SGLang inc_lock_ref: lookup and protection are
+            // atomic with eviction (a background SSD promotion can allocate).
+            // The lookup references are dropped when this restore returns; the
+            // request takes its own references through Pick below.
+            struct QueryLeases {
+                decltype(queriedPages) &pages;
+                ~QueryLeases() {
+                    for (auto &entry : pages) entry.first->ReleasePageIndices(entry.second);
+                }
+            } queryLeases{queriedPages};
             auto queryManager = [&](PagedCacheManager *manager) -> std::vector<int>& {
                 auto it = queriedPages.find(manager);
                 if (it == queriedPages.end()) {
                     std::vector<int> pages;
-                    manager->QueryPrefix(preview.Hashes(manager->pageLen), preview.matches[manager], pages);
+                    if (ctx->multimodalInput.empty()) {
+                        manager->QueryPrefix(preview.Hashes(manager->pageLen), preview.matches[manager], pages, true);
+                    } else {
+                        // Media pages carry position/identity keys that text-page
+                        // hashes cannot express; keep the keyed token lookup.
+                        manager->Query(ctx->currentTokens, pages, ctx->PrefixCachePageKeys(), nullptr, true);
+                    }
                     it = queriedPages.insert(std::make_pair(manager, std::move(pages))).first;
                 }
                 return it->second;
@@ -1837,6 +2212,9 @@ namespace fastllm {
                         ctx->currentTokens.begin(),
                         ctx->currentTokens.begin() + cachedLen);
                     ctx->cacheLen = cachedLen;
+#if defined(FASTLLM_DISK_PREFIX_CACHE)
+                    model->OnPersistentPrefixRestored(ctx);
+#endif
                 } else {
                     // A prefix hit is useful only when its
                     // complete model state can be restored.
@@ -1937,6 +2315,7 @@ namespace fastllm {
 
         // 辅助lambda：释放一个请求占用的所有KV Cache分页，并以allTokens重新初始化为pending prefill状态
         auto releaseAndReinitRequest = [&](ResponseContext *ctx) {
+            model->ResetPersistentPrefixRestore(ctx);
             for (int i = 0; i < model->block_cnt; i++) {
                 auto &kvFirst = ctx->pastKeyValues[i].first;
                 auto &kvSecond = ctx->pastKeyValues[i].second;
@@ -1945,6 +2324,7 @@ namespace fastllm {
             }
             ctx->currentTokens = ctx->allTokens;
             ctx->preTokens = 0;
+            ctx->prefillRemain = (int)ctx->allTokens.size();
             ctx->cacheLen = 0;
             ctx->intParams.clear();
         };
@@ -2287,7 +2667,12 @@ namespace fastllm {
             decodePositionValues.reserve(reserveBatch);
             decodePositionIds.reserve(reserveBatch);
 
+            RequestDiagnosticBatchOperation diagnosticDictWait(RequestDiagnosticHandlesForModel(model),
+                "scheduler_dict_lock_wait", RequestDiagnosticResource("model.dictLocker", &model->dictLocker).c_str());
             std::unique_lock<std::mutex> dictLocker(model->dictLocker);
+            diagnosticDictWait.Finish();
+            RequestDiagnosticBatchOperation diagnosticSelect(RequestDiagnosticHandlesForModel(model),
+                "scheduler_select", RequestDiagnosticResource("model.dictLocker", &model->dictLocker).c_str());
             // Pair the shutdown check with the condition variable's lock so
             // its notification cannot be lost before an idle wait.
             if (model->isFree) break;
@@ -2309,7 +2694,11 @@ namespace fastllm {
 
             for (auto &it: model->responseContextDict.dicts) {
                 if (it.second->isAbort) {
-                    it.second->TryRecordPagedCache(model);
+                    // Do not publish an aborted prefix here. This loop runs with
+                    // dictLocker held on the scheduler thread; for long contexts the
+                    // synchronous record/publish blocks every API thread and makes
+                    // later requests look permanently queued. Dropping the partial
+                    // prefix only costs one future cache miss.
                     abortHandles.push_back(it.first);
                     continue;
                 }
@@ -2380,6 +2769,9 @@ namespace fastllm {
                         now + std::chrono::microseconds(idlePrefillBatchQuietUs));
                 }
                 if (now < idlePrefillBatchDeadline) {
+                    diagnosticSelect.Finish();
+                    RequestDiagnosticBatchOperation diagnosticWait(RequestDiagnosticHandlesForModel(model),
+                        "scheduler_batch_collection_wait", "model.dictCV");
                     model->dictCV.wait_until(dictLocker, idlePrefillBatchDeadline);
                     continue;
                 }
@@ -2501,6 +2893,14 @@ namespace fastllm {
                     }
 
                     if (isPrompt) {
+#if defined(FASTLLM_DISK_PREFIX_CACHE)
+                        // kvMemConfig owns KV management exclusively and never uses the
+                        // paged/persistent prefix cache (same gate as qwen3_5.cpp).
+                        if (!model->kvMemConfig.enabled) {
+                            model->PreparePersistentPrefixCache(ctx);
+                            if (model->PersistentPrefixRestorePending(ctx)) continue;
+                        }
+#endif
                         if (auto *manager = RestoreResidentPrefix(model, ctx)) {
                             std::lock_guard<std::mutex> guard(manager->pageIndexLocker);
                             curBusyPages = manager->maxPages - manager->FreePageCount() + pendingNewPages;
@@ -2787,26 +3187,34 @@ namespace fastllm {
                         isSingleMultimodal = !singleContext->multimodalInput.empty();
                     }
                 }
+                diagnosticSelect.Finish();
                 dictLocker.unlock();
+                RequestDiagnosticBatchOperation diagnosticForwardWait(handles, "forward_lock_wait",
+                    RequestDiagnosticResource("model.forwardLocker", &forwardLocker).c_str());
                 forwardLocker.lock();
+                CheckpointTrace("forward_lock_acquired");
+                diagnosticForwardWait.Finish();
+                RequestDiagnosticBatchOperation diagnosticForward(handles, "native_forward",
+                    RequestDiagnosticResource("model.forwardLocker", &forwardLocker).c_str());
 #ifdef USE_CUDA
                 // FastllmCudaClearBigBuffer();
 #endif
                 Data inputIds = Data(DataType::FLOAT32, {1, (int) ids.size()}, ids);
                 std::vector<int> ret;
                 int chunkedPrefillToken = -1;
+                const uint64_t nativeStepBeginNs = GetFastllmObservabilityMode() == FastllmObservabilityMode::Off ? 0 : FastllmObservationTimestampNs();
+                const uint64_t nativeVisionBeforeNs = singleContext ? singleContext->nativeGeneration.visionElapsedNs : 0;
                 std::chrono::system_clock::time_point profileStartTime;
                 if (printProfile) {
                     profileStartTime = std::chrono::system_clock::now();
                     ClearProfiler();
                 }
                 if (isSingleMultimodal) {
-                    ret = model->ForwardMultimodal(
+                    ret = model->ForwardMultimodalContext(
+                        singleContext,
                         inputIds,
                         attentionMasks[0] == nullptr ? Data() : *attentionMasks[0],
                         positionIds[0] == nullptr ? Data() : *positionIds[0],
-                        singleContext->pastKeyValues,
-                        singleContext->multimodalInput,
                         generationConfigs[0],
                         tokensManager,
                         &logits
@@ -2932,15 +3340,34 @@ namespace fastllm {
                     PrintLoopProfile("new", seqLens, (int)ret.size(), profileStartTime);
                 }
 
+                const uint64_t nativeStepEndNs = nativeStepBeginNs ? FastllmObservationTimestampNs() : 0;
+                diagnosticForward.Finish();
                 forwardLocker.unlock();
+                RequestDiagnosticBatchOperation diagnosticPublishWait(handles, "scheduler_publish_dict_lock_wait",
+                    RequestDiagnosticResource("model.dictLocker", &model->dictLocker).c_str());
                 dictLocker.lock();
+                diagnosticPublishWait.Finish();
 
                 // Prefill完成后立即Record，使其他请求可以尽早命中Prefix Cache
                 for (int i = 0; i < (int)handles.size(); i++) {
+                    ResponseContext *ctx = model->responseContextDict.dicts[handles[i]];
                     if (seqLens[i] > 1) {
-                        auto &ctx = *model->responseContextDict.dicts[handles[i]];
-                        if ((int)ctx.allTokens.size() >= pageLen) {
-                            ctx.TryRecordPagedCache(model);
+                        RecordRequestPrefillProgress(ctx, seqLens[i]);
+                        if (ctx->intParams["event_prefill"] == 0) {
+                            FastllmEvent("prefill", ctx->requestId, "prefill",
+                                         "tokens=%d", seqLens[i]);
+                            ctx->intParams["event_prefill"] = 1;
+                        }
+                    } else {
+                        if (ctx->intParams["event_decode"] == 0) {
+                            FastllmEvent("decode", ctx->requestId, "decode",
+                                         "phase=output");
+                            ctx->intParams["event_decode"] = 1;
+                        }
+                    }
+                    if (seqLens[i] > 1) {
+                        if ((int)ctx->allTokens.size() >= pageLen) {
+                            ctx->TryRecordPagedCache(model);
                         }
                     }
                 }
@@ -2960,16 +3387,31 @@ namespace fastllm {
 
                 for (int i = 0; i < handles.size(); i++) {
                     ResponseContext *ctx = tokenContexts[i];
+                    const bool nativePrompt = ctx->curTokens == 0;
+                    if ((int)ret.size() != (int)handles.size()) {
+                        // The forward returned a short result because the request
+                        // was aborted mid-prefill. Never index past the vector;
+                        // mark the context ending and let the abort path release it.
+                        ctx->isEnding = true;
+                        continue;
+                    }
                     int curRet = ret[i];
+                    // The first committed token of a prompt step is the prompt
+                    // commit; pending speculative tokens popped below are decode.
+                    bool commitPrompt = nativePrompt;
                     do {
                         if (curRet == model->eos_token_id || model->eos_token_ids.find(curRet) != model->eos_token_ids.end()) {
                             ctx->isEnding = true;
                             ctx->TryRecordPagedCache(model);
+                            FastllmEvent("output", ctx->requestId, "native_generation_finished",
+                                         "reason=eos output_tokens=%d", ctx->curTokens);
                         } else {
                             auto itStopTk = ctx->generationConfig.stop_token_ids.find(curRet);
                             if (itStopTk != ctx->generationConfig.stop_token_ids.end()) {
                                 ctx->isEnding = true;
                                 ctx->TryRecordPagedCache(model);
+                                FastllmEvent("output", ctx->requestId, "native_generation_finished",
+                                             "reason=stop output_tokens=%d", ctx->curTokens);
                             }
                         }
                         if (ctx->isEnding == false) {
@@ -2986,13 +3428,19 @@ namespace fastllm {
                                 ctx->tokens.Push(curRet);
                             }
                             ctx->curTokens++;
+                            RecordRequestNativeCommit(ctx, commitPrompt);
+                            commitPrompt = false;
                             if (ctx->curTokens == ctx->generationConfig.output_token_limit) {
                                 ctx->isEnding = true;
                                 ctx->TryRecordPagedCache(model);
+                                FastllmEvent("output", ctx->requestId, "native_generation_finished",
+                                             "reason=output_limit output_tokens=%d", ctx->curTokens);
                             } else if ((maxTotalLens > 0 && (int)ctx->allTokens.size() >= maxTotalLens) ||
                                        ctx->allTokens.size() >= model->max_positions) {
                                 ctx->isEnding = true;
                                 ctx->TryRecordPagedCache(model);
+                                FastllmEvent("output", ctx->requestId, "native_generation_finished",
+                                             "reason=context_limit output_tokens=%d", ctx->curTokens);
                             }
                         }
                         if (ctx->isEnding || !model->PopPendingResponseToken(ctx, curRet, curRet)) break;
@@ -3000,6 +3448,10 @@ namespace fastllm {
                         ++ctx->preTokens;
                         if (model->verbose) ++genTokens;
                     } while (true);
+                    RecordRequestNativeStep(ctx, nativePrompt, false, nativePrompt ? seqLens[i] : 0,
+                                            nativeStepBeginNs, nativeStepEndNs,
+                                            singleContext == ctx ? ctx->nativeGeneration.visionElapsedNs - nativeVisionBeforeNs : 0);
+                    ReportRequestProgress(ctx, nativePrompt ? "prefill" : "decode", ctx->isEnding);
                 }
                 model->dictCV.notify_all();
                 ReleasePendingResultLogits(logits);
@@ -3015,6 +3467,9 @@ namespace fastllm {
             }
 
             if (seqLens.size() == 0) {
+                diagnosticSelect.Finish();
+                RequestDiagnosticBatchOperation diagnosticWait(RequestDiagnosticHandlesForModel(model),
+                    "scheduler_condition_wait", "model.dictCV");
                 if (!orders.empty() || pendingPD) {
                     model->dictCV.wait_for(dictLocker, std::chrono::milliseconds(10));
                 } else {
@@ -3159,6 +3614,9 @@ namespace fastllm {
                         std::vector <int> handles;
                         std::vector <GenerationConfig> generationConfigs;
                         std::vector <std::vector <float>* > logits;
+
+                        RequestDiagnosticBatchOperation diagnosticDictWait(RequestDiagnosticHandlesForModel(model),
+                            "scheduler_dict_lock_wait", RequestDiagnosticResource("model.dictLocker", &model->dictLocker).c_str());
                         attentionMasks.reserve(maxBatch);
                         positionIds.reserve(maxBatch);
                         pastKeyValues.reserve((size_t)maxBatch * model->block_cnt);
@@ -3170,6 +3628,9 @@ namespace fastllm {
 
                         if (trace) trace->Mark("allocation_ms");
                         std::unique_lock<std::mutex> dictLocker(model->dictLocker);
+                        diagnosticDictWait.Finish();
+                        RequestDiagnosticBatchOperation diagnosticSelect(RequestDiagnosticHandlesForModel(model),
+                            "scheduler_select", RequestDiagnosticResource("model.dictLocker", &model->dictLocker).c_str());
                         if (trace) trace->Mark("dict_lock_ms");
                         if (model->isFree) break;
                         auto &forwardLocker = model->forwardLocker;
@@ -3686,9 +4147,15 @@ namespace fastllm {
                                 pastKeyValue1 = &singleContext->pastKeyValues;
                                 isSingleText = singleContext->multimodalInput.empty();
                             }
+                            diagnosticSelect.Finish();
                             if (trace) trace->Mark("batch_finalize_ms");
                             dictLocker.unlock();
+                            RequestDiagnosticBatchOperation diagnosticForwardWait(handles, "forward_lock_wait",
+                                RequestDiagnosticResource("model.forwardLocker", &forwardLocker).c_str());
                             forwardLocker.lock();
+                            diagnosticForwardWait.Finish();
+                            RequestDiagnosticBatchOperation diagnosticForward(handles, "native_forward",
+                                RequestDiagnosticResource("model.forwardLocker", &forwardLocker).c_str());
                             if (trace) trace->Mark("forward_lock_ms");
 #ifdef USE_CUDA
                             if (model->RetainCudaWorkspace()) {
@@ -3762,10 +4229,23 @@ namespace fastllm {
                                     }
                                 } else {
                                     if (!singleContext->multimodalInput.empty()) {
+                                        const auto multimodalForwardBegin =
+                                            std::chrono::steady_clock::now();
+                                        FastllmEvent(
+                                            "prefill", singleContext->requestId,
+                                            "multimodal_forward_begin",
+                                            "input_tokens=%d", (int)inputIds.Count(0));
                                         ret = model->ForwardMultimodal(inputIds,
                                                             attentionMasks[0] == nullptr ? Data() : *attentionMasks[0],
                                                             *positionIds[0], *pastKeyValue1, singleContext->multimodalInput,
                                                             generationConfigs[0], tokensManager, &logits);
+                                        FastllmEvent(
+                                            "prefill", singleContext->requestId,
+                                            "multimodal_forward_end",
+                                            "elapsed_ms=%.3f output_rows=%zu",
+                                            std::chrono::duration<double, std::milli>(
+                                                std::chrono::steady_clock::now() - multimodalForwardBegin).count(),
+                                            ret.size());
                                     } else {
                                         ret = std::vector <int> {model->Forward(inputIds,
                                                                         attentionMasks[0] == nullptr ? Data() : *attentionMasks[0],
@@ -3785,6 +4265,7 @@ namespace fastllm {
                             if (printProfile) {
                                 PrintLoopProfile("old", seqLens, (int)ret.size(), profileStartTime);
                             }
+                            diagnosticForward.Finish();
                             if (trace) trace->Mark("legacy_forward_log_ms");
 #ifdef USE_CUDA
                             } catch (const CudaWorkspaceExhausted &error) {
@@ -3807,7 +4288,10 @@ namespace fastllm {
                             }
 #endif
                             forwardLocker.unlock();
+                            RequestDiagnosticBatchOperation diagnosticPublishWait(handles, "scheduler_publish_dict_lock_wait",
+                                RequestDiagnosticResource("model.dictLocker", &model->dictLocker).c_str());
                             dictLocker.lock();
+                            diagnosticPublishWait.Finish();
                             if (trace) trace->Mark("result_lock_ms");
 
                             if (model->verbose) {
@@ -3832,7 +4316,8 @@ namespace fastllm {
                                             pending++;
                                         }
                                     }
-                                    printf("[Decode] alive = %d, pending = %d, contextLen = %d, Speed: %f tokens / s.\n", alive, pending, aliveLen, (float)genTokens / spend);
+                                    printf("[Decode] alive = %d, pending = %d, contextLen = %d, Speed: %f tokens / s.\n",
+                                           alive, pending, aliveLen, (float)genTokens / spend);
                                     lastRecordTime = nowTime;
                                     genTokens = 0;
                                 }
@@ -3907,6 +4392,9 @@ namespace fastllm {
                                         return entry.second->isEnding && allocatedTokens(
                                             entry.second->pastKeyValues[model->kvCacheId].first) > 0;
                                     })) {
+                                diagnosticSelect.Finish();
+                                RequestDiagnosticBatchOperation diagnosticWait(RequestDiagnosticHandlesForModel(model),
+                                    "scheduler_kv_release_wait", "model.dictCV");
                                 if (!waitingPD.empty()) model->dictCV.wait_for(dictLocker, std::chrono::milliseconds(10));
                                 else model->dictCV.wait(dictLocker);
                                 continue;
@@ -3937,6 +4425,9 @@ namespace fastllm {
                         if (trace) trace->Mark("cleanup_ms");
 
                         if (seqLens.size() == 0) {
+                            diagnosticSelect.Finish();
+                            RequestDiagnosticBatchOperation diagnosticWait(RequestDiagnosticHandlesForModel(model),
+                                "scheduler_condition_wait", "model.dictCV");
                             if (!waitingPD.empty()) model->dictCV.wait_for(dictLocker, std::chrono::milliseconds(10));
                             else model->dictCV.wait(dictLocker);
                         }
@@ -3951,10 +4442,12 @@ namespace fastllm {
         dictLocker.lock();
         int handleId = responseContextDict.CreateHandle();
         ResponseContext *context = responseContextDict.GetHandle(handleId);
+        BindRequestDiagnosticModel(uint64_t(handleId), this);
         context->Init(this->block_cnt, this->dataType, this->kvCacheDataType);
         context->inputTokens = (int)inputTokens.size();
         context->currentTokens = inputTokens;
         context->allTokens = inputTokens;
+        context->prefillRemain = (int)inputTokens.size();
         context->generationConfig = generationConfig;
         context->multimodalInput = multimodalInput;
         context->tokens = LastTokensUnit(generationConfig.last_n);
@@ -4013,6 +4506,7 @@ namespace fastllm {
     }
 
     bool basellm::CanFetchResponse(int handleId) {
+        RequestDiagnosticOperation diagnosticCall(uint64_t(handleId), "api_poll_call", "model.dictLocker_or_output_queue");
         std::unique_lock<std::mutex> dictLocker(this->dictLocker);
         ResponseContext *context = responseContextDict.GetHandle(handleId);
         if (context == nullptr) {
@@ -4048,19 +4542,40 @@ namespace fastllm {
         return true;
     }
 
+    bool basellm::GetResponseObservation(int handleId, ResponseObservation &observation) {
+        RequestDiagnosticOperation diagnosticCall(uint64_t(handleId), "api_observation_call", "model.dictLocker_or_output_queue");
+        std::unique_lock<std::mutex> dictLocker(this->dictLocker);
+        ResponseContext *context = responseContextDict.GetHandle(handleId);
+        observation = ResponseObservation{};
+        if (context == nullptr) return false;
+        observation.nativeHandle = context->requestId;
+        const int inputTokens = std::max(0, context->inputTokens);
+        observation.cachedInputTokens = std::min(inputTokens, std::max(0, context->cacheLen));
+        observation.missedInputTokens = inputTokens - observation.cachedInputTokens;
+        observation.outputTokens = std::max(0, context->curTokens);
+        observation.cacheSegments = context->cacheSegments;
+        return true;
+    }
+
     void basellm::AbortResponse(int handleId) {
+        RequestDiagnosticOperation diagnosticCall(uint64_t(handleId), "api_abort_call", "model.dictLocker_or_output_queue");
         std::unique_lock<std::mutex> dictLocker(this->dictLocker);
         ResponseContext *context = responseContextDict.GetHandle(handleId);
 
         if (context == nullptr) {
             return;
         } else {
-            context->isAbort = true;
+            context->isAbort.store(true, std::memory_order_release);
+            if (context->pagedPageOwnerLease) {
+                context->pagedPageOwnerLease->cancelled.store(
+                    true, std::memory_order_release);
+            }
         }
         dictCV.notify_all();
     }
 
     int basellm::FetchResponseTokens(int handleId) {
+        RequestDiagnosticOperation diagnosticCall(uint64_t(handleId), "api_fetch_call", "model.dictLocker_or_output_queue");
         std::unique_lock<std::mutex> dictLocker(this->dictLocker);
         ResponseContext *context = responseContextDict.GetHandle(handleId);
         if (context == nullptr) {
@@ -4083,7 +4598,10 @@ namespace fastllm {
                         if (err == ResponseContextErrorPromptTooLong) {
                             return -2;
                         }
-                        if (err == ResponseContextErrorRuntime) return -3;
+                        if (err == ResponseContextErrorCapacityUnavailable) {
+                            return -3;
+                        }
+                        if (err == ResponseContextErrorRuntime) return -5;
                         return -1;
                     }
                 }
@@ -4107,6 +4625,7 @@ namespace fastllm {
         if (output == nullptr || maxTokens <= 0) {
             return 0;
         }
+        RequestDiagnosticOperation diagnosticCall(uint64_t(handleId), "api_fetch_batch_call", "model.dictLocker_or_output_queue");
         std::unique_lock<std::mutex> dictLocker(this->dictLocker);
         ResponseContext *context = responseContextDict.GetHandle(handleId);
         if (context == nullptr) {
@@ -4132,8 +4651,10 @@ namespace fastllm {
                 RemoveResponseContext(handleId);
                 dictLocker.unlock();
                 dictCV.notify_all();
-                return err == ResponseContextErrorPromptTooLong ? -2 :
-                       err == ResponseContextErrorRuntime ? -3 : -1;
+                if (err == ResponseContextErrorPromptTooLong) return -2;
+                if (err == ResponseContextErrorCapacityUnavailable) return -3;
+                if (err == ResponseContextErrorRuntime) return -5;
+                return -1;
             }
             // The async Python server used to pair CanFetchResponse() with a
             // zero-sleep polling loop here.  During a long CUDA graph replay
@@ -4142,7 +4663,10 @@ namespace fastllm {
             // speculative block.  Wait for the scheduler notification instead.
             // The bounded timeout preserves the server's periodic prefill
             // keepalive even if a legacy scheduler misses a notification.
+            RequestDiagnosticOperation diagnosticWait(uint64_t(handleId),
+                "api_output_condition_wait", "model.dictCV");
             const auto status = dictCV.wait_for(dictLocker, std::chrono::seconds(1));
+            diagnosticWait.Finish();
             context = responseContextDict.GetHandle(handleId);
             if (context == nullptr || context->generation != generation) {
                 return -1;
@@ -4152,6 +4676,7 @@ namespace fastllm {
     }
 
     int basellm::FetchResponseLogits(int handleId, std::vector<float> &logits) {
+        RequestDiagnosticOperation diagnosticCall(uint64_t(handleId), "api_fetch_logits_call", "model.dictLocker_or_output_queue");
         std::unique_lock<std::mutex> dictLocker(this->dictLocker);
         ResponseContext *context = responseContextDict.GetHandle(handleId);
         if (context == nullptr) {
@@ -4789,6 +5314,9 @@ namespace fastllm {
             if (contextPlan.requestedLength > 0) {
                 throw std::runtime_error("Explicit context length requires warmup to validate KV capacity.");
             }
+#if defined(FASTLLM_DISK_PREFIX_CACHE)
+            InitializePersistentPrefixCache();
+#endif
             ReportModelLoadProgress("warmup", 1, 1);
             return;
         }
@@ -4924,14 +5452,30 @@ namespace fastllm {
                                     std::vector <std::pair <Data*, Data*> > &warmupPastKeyValues,
                                     const std::vector <GenerationConfig> &warmupGenerationConfigs,
                                     const LastTokensManager &warmupLastTokens) -> std::vector<int> {
+            const bool timed = LoadStageTimingEnabled();
+            const auto start = timed ? std::chrono::steady_clock::now()
+                                     : std::chrono::steady_clock::time_point{};
+            auto finish = [&]() {
+                if (timed) {
+                    const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - start).count();
+                    printf("[Fastllm] AutoWarmup forward timing: batch=%d tokens=%llu time=%lld us.\n",
+                           batch, (unsigned long long)warmupInputIds.Count(0), (long long)us);
+                    fflush(stdout);
+                }
+            };
             if (useGPUForwardForWarmup) {
-                return ForwardGPU(batch, warmupInputIds, warmupAttentionMasks, warmupPositionIds,
-                                  warmupSeqLens, warmupPastKeyValues, warmupGenerationConfigs,
-                                  warmupLastTokens, nullptr);
+                auto result = ForwardGPU(batch, warmupInputIds, warmupAttentionMasks, warmupPositionIds,
+                                         warmupSeqLens, warmupPastKeyValues, warmupGenerationConfigs,
+                                         warmupLastTokens, nullptr);
+                finish();
+                return result;
             }
-            return ForwardV2(batch, warmupInputIds, warmupAttentionMasks, warmupPositionIds,
-                             warmupSeqLens, warmupPastKeyValues, warmupGenerationConfigs,
-                             warmupLastTokens, nullptr);
+            auto result = ForwardV2(batch, warmupInputIds, warmupAttentionMasks, warmupPositionIds,
+                                    warmupSeqLens, warmupPastKeyValues, warmupGenerationConfigs,
+                                    warmupLastTokens, nullptr);
+            finish();
+            return result;
         };
 
         auto captureWarmupPagedCacheManager = [&](std::vector <std::pair <Data, Data> > &storage) {

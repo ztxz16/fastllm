@@ -20,6 +20,9 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <deque>
+#include <atomic>
+#include <thread>
 #include <locale>
 #include <codecvt>
 #include "devices/cpu/alivethreadpool.h"
@@ -753,46 +756,31 @@ namespace fastllm {
     };
 
     struct CacheTrieNode {
-        uint64_t nodeId = 0;
+        int pageId = -1;
         long long timestamp = 0;
-        long long lastAccess = 0;
+        std::string extraKey; // Full media/position identity; empty for text.
+        std::unordered_map<uint64_t, CacheTrieNode*> children;
         CacheTrieNode *parent = nullptr;
         uint64_t edgeHash = 0;
-        int pageId = -1;
-        int unusedIndex = -1;
-        bool evictable = false;
-        // Most cached token pages have exactly one successor. Allocate a hash
-        // table only at a fork, rather than two heap allocations per page.
-        CacheTrieNode *singleChild = nullptr;
-        std::unique_ptr<std::unordered_map<uint64_t, CacheTrieNode*>> branches;
-        bool HasChildren() const { return singleChild || (branches && !branches->empty()); }
+        // 【页的身份】这一页的**页键**，与
+        // 包含当前页及此前所有页的身份，不能只用 children 的单页 edgeHash。
+        // 照抄 SGLang `rust/sglang-radix-tree/src/node.rs:166` 的 `pub key: K` 与
+        // `:177` 的 `pub hash_value: Option<Vec<String>>`：**身份挂在节点上**，
+        // 使"页被回收/搬走/搬回"时能反问出这一页是谁。
+        // 纯新增字段 + 纯新增写入，不参与任何既有判断 ⇒ 零行为变更。
+        uint64_t pageHash = 0;
+        // Owned event recorded after the writes on this page's producer stream.
+        std::shared_ptr<void> producerEvent;
+        uint64_t nodeId = 0;
+        // Child lookup helpers with the upstream node interface, over the
+        // single children map this cache manager maintains.
+        bool HasChildren() const { return !children.empty(); }
         CacheTrieNode *FindChild(uint64_t hash) const {
-            if (singleChild) return singleChild->edgeHash == hash ? singleChild : nullptr;
-            if (!branches) return nullptr;
-            auto it = branches->find(hash);
-            return it == branches->end() ? nullptr : it->second;
+            auto it = children.find(hash);
+            return it == children.end() ? nullptr : it->second;
         }
-        void AddChild(CacheTrieNode *child) {
-            if (branches) {
-                branches->emplace(child->edgeHash, child);
-                singleChild = branches->size() == 1 ? child : nullptr;
-            } else if (singleChild) {
-                branches = std::make_unique<std::unordered_map<uint64_t, CacheTrieNode*>>();
-                branches->emplace(singleChild->edgeHash, singleChild);
-                branches->emplace(child->edgeHash, child);
-                singleChild = nullptr;
-            } else {
-                singleChild = child;
-            }
-        }
-        void EraseChild(uint64_t hash) {
-            if (branches) {
-                branches->erase(hash);
-                singleChild = branches->size() == 1 ? branches->begin()->second : nullptr;
-                // Keep an existing fork's bucket order so subtree eviction
-                // returns physical pages in the same order after it shrinks.
-            } else if (singleChild && singleChild->edgeHash == hash) singleChild = nullptr;
-        }
+        void AddChild(CacheTrieNode *child) { children[child->edgeHash] = child; }
+        void EraseChild(uint64_t hash) { children.erase(hash); }
     };
 
     // 一个带PageCache功能的Data，可以管理多个PageCache
@@ -815,12 +803,21 @@ namespace fastllm {
             // 空闲页双池：freePages 不在 Trie 中，triePages 在 Trie 中但未被引用
             std::vector<int> freePages;
             std::vector<int> triePages;
-            // Page IDs are dense. Avoid allocating hash-set nodes whenever
-            // a cached prefix enters or leaves the unused-page pools.
-            std::vector<uint8_t> freePageFlags;
+            std::unordered_set<int> freePagesSet;
+            std::unordered_set<int> triePagesSet;
             std::mutex pageIndexLocker;
 
-            int FreePageCount() const { return (int)freePages.size() + (int)triePages.size(); }
+            int FreePageCount() const {
+                if (deferredRecycleEnabled) {
+                    // Trie pages require a completed D2H/host-owner transfer.
+                    // The reserve is protected for a victim replacement, not
+                    // ordinary allocation; counting it would admit a request
+                    // even when every other page is pinned.
+                    return (int)freePages.size();
+                }
+                return (int)freePages.size() + (int)triePages.size();
+            }
+            int ReadyFreePageCount() const { return FreePageCount(); }
 
             // 每个页面的使用时间戳
             std::vector<long long> pageTimestamp;
@@ -828,36 +825,245 @@ namespace fastllm {
 
             // 每个页面的引用计数
             std::vector<int> pageRefCount;
+            // Set by the model on its actual producer threads before Record.
+            // Each trie node retains the event for its own recorded contents.
+            std::shared_ptr<void> recordProducerEvent;
+
+            // Deferred recycle transfers a victim out of the GPU cache while
+            // retaining a migration lease until the spill owner completes.
+            struct RecycleRequestIdentity {
+                uint64_t requestId = 0;
+                uint64_t requestGeneration = 0;
+                std::string cacheIdentity;
+                std::shared_ptr<const void> ownerLease;
+                bool Valid() const noexcept {
+                    return requestId != 0 && requestGeneration != 0 &&
+                        !cacheIdentity.empty() && ownerLease != nullptr;
+                }
+            };
+            struct RecycleTicket {
+                int pageIndex = -1;
+                uint64_t pageHash = 0;
+                uint64_t parentHash = 0;
+                uint64_t pageOrdinal = 0;
+                std::string extraKey;
+                uint64_t generation = 0;
+                std::shared_ptr<void> producerEvent;
+                uint64_t serial = 0;
+                RecycleRequestIdentity requestIdentity;
+                bool terminal = false;
+                bool success = false;
+                std::string failureReason;
+            };
+
+            bool deferredRecycleEnabled = false;
+            int recycleReservePage = -1;
+            uint64_t nextRecycleSerial = 0;
+            struct PendingRecycle {
+                std::shared_ptr<RecycleTicket> ticket;
+                int pageIndex = -1;
+                uint64_t pageHash = 0;
+            };
+            std::unordered_map<uint64_t, PendingRecycle> pendingRecycleTickets;
+            std::unordered_set<int> pendingRecyclePages;
+            std::unordered_set<int> quarantinedRecyclePages;
+            std::unordered_set<uint64_t> failedRecycleSerials;
+            std::unordered_map<uint64_t, std::shared_ptr<RecycleTicket>> failedRecycleTickets;
+
+            // 【回收前钩子】
+            // 位置与职责照抄 vLLM 的 `OffloadingManager`（vllm/v1/kv_offload/base.py:234）：
+            // 页池不认识模型、也不认识"内存层"，所以**只负责在回收一页之前问一声**；
+            // 由模型层（qwen3_5）注册进来的回调去决定要不要把内容搬走、搬到哪。
+            // 第 2 步："显存腾位置时搬进内存（不许扔）"，这里就是那个"腾位置"的出口。
+            // **未注册时什么都不做** ⇒ 行为与既有实现逐字节相同（零行为变更）。
+            // 参数：(页号, 该页身份 pageHash, 迁移 ticket)。页内容由注册方
+            // 自行从 cudaData 取；迁移完成后必须调用 CompleteRecyclePage。
+            std::function<void(int, uint64_t, const std::shared_ptr<RecycleTicket>&)> onRecyclePage;
+
+            // EnableDeferredRecycle reserves one GPU page for the next victim
+            // migration. The reserve is absent from freePages and excluded from
+            // deferred FreePageCount because it is reserved for migration.
+            void EnableDeferredRecycle();
+            void DisableDeferredRecycle();
+            void CompleteRecyclePage(const std::shared_ptr<RecycleTicket> &ticket,
+                                     bool success, const char *failureReason = nullptr);
+            // Dispatch victim transfers until the manager can provide this
+            // absolute ready-page target. No condition-variable wait occurs
+            // here: false requires scheduler retry after the worker completes
+            // host ownership.
+            bool PrepareFreePages(int count,
+                                  const RecycleRequestIdentity &identity);
+            bool PrepareFreePages(int count) {
+                return PrepareFreePages(count, RecycleRequestIdentity{});
+            }
+            // True only when no ready page, in-flight migration, or eligible
+            // trie victim remains. Pending D2H/host work is still recoverable.
+            bool DeferredRecycleCapacityUnavailable(int count);
+
+            // 【页写好就通知】
+            // 为什么必须在这个时刻、而不是回收时刻：<br>
+            //   回收那一刻页可能已经"回到空闲池"，随时会被别人重写 ⇒ 那时再读显存
+            //   拿到的内容不可靠。页**刚写进 trie** 时内容才确定、且还没可能被人拿走。
+            //   SGLang 的物理前提同此：节点上的 `host_value` 是在写入该节点时备份的。
+            // 全程只读、不改任何既有判断；未注册 ⇒ 零行为变更。
+            std::function<void(int, uint64_t)> onRecordPage;
 
             // Trie树缓存管理
             CacheTrieNode *trieRoot = nullptr;
-            std::vector<CacheTrieNode*> pageToTrieNode;
+            std::unordered_map<int, CacheTrieNode*> pageToTrieNode;
 
             void SetMaxPages(int maxPages);
-            int GetUnusedPageIndex(bool pick);
+            int GetUnusedPageIndex(bool pick, bool onlyFree,
+                                   const RecycleRequestIdentity &identity);
+            int GetUnusedPageIndex(bool pick, bool onlyFree = false) {
+                return GetUnusedPageIndex(pick, onlyFree, RecycleRequestIdentity{});
+            }
+            // KVPAIR pair allocation (FASTLLM_PAGED_KV_PAIR_ALLOC=1, default off; non-deferred recycle only).
+            // K and V managers of one layer/rank must hand out equal page ids, but other threads (SSD D2H lease
+            // release, import) change K and V one after the other, so two separate GetUnusedPageIndex calls can
+            // return different ids. With a partner set, the first manager asked picks a page claimable in BOTH
+            // under both locks, takes it, and reserves it in the partner for the same thread; the partner's next
+            // allocation on that thread returns the reserved page. Releasing a page whose partner reservation is
+            // still unconsumed cancels the reservation.
+            std::atomic<PagedCacheManager*> pairPartner{nullptr};   // set once by PairPagedCacheManagers
+            struct PairReservation { int page; std::thread::id owner; };
+            std::deque<PairReservation> pairReserved;   // guarded by pageIndexLocker
+            unsigned long long pairAllocs = 0, pairConsumed = 0, pairCancelled = 0, pairFallbacks = 0;
+            int PairAllocate();
+            bool PairClaimableLocked(int page) const;
+            void PairClaimLocked(int page);
+            bool ReleaseLocked(int pageIndex);   // caller holds pageIndexLocker
+            void ReleasePairedLocked(const std::vector<int> &pageIndices);   // caller holds both locks
+            // Append-preview support: claims `count` pages in both managers and reserves each of them for the
+            // calling thread in BOTH managers (FIFO), so the following K and V GetUnusedPageIndex(true) calls on
+            // this thread return exactly these ids. Returns false (nothing reserved) when not paired or deferred.
+            bool PairReserveForThread(int count, std::vector<int> &pages);
+
+            // KVPAIR diagnostics: used only on the page-reservation failure path and by the opt-in
+            // FASTLLM_PAGED_KV_PAIR_CHECK=1 check. K and V managers of one layer must hand out equal page ids.
+            std::string PageStateString(int page) {
+                std::lock_guard<std::mutex> guard(this->pageIndexLocker);
+                std::string out = "free=" + std::to_string(freePages.size()) + " trie=" + std::to_string(triePages.size()) +
+                    " max=" + std::to_string(maxPages) + " pending=" + std::to_string(pendingRecyclePages.size()) +
+                    " quarantined=" + std::to_string(quarantinedRecyclePages.size()) + " page=" + std::to_string(page);
+                if (page >= 0 && page < (int)pageRefCount.size())
+                    out += " ref=" + std::to_string(pageRefCount[page]) + " ts=" + std::to_string(pageTimestamp[page]) +
+                        " in_free=" + std::to_string((int)freePagesSet.count(page)) + " in_trie=" +
+                        std::to_string((int)triePagesSet.count(page)) + " trie_node=" + std::to_string((int)pageToTrieNode.count(page));
+                return out;
+            }
+            // First difference between this manager and its pair (empty when equal), checked under both locks.
+            std::string PairDiff(PagedCacheManager &other) {
+                std::unique_lock<std::mutex> a(this->pageIndexLocker, std::defer_lock), b(other.pageIndexLocker, std::defer_lock);
+                std::lock(a, b);
+                if (freePagesSet != other.freePagesSet) return "free_set size " + std::to_string(freePagesSet.size()) + "/" + std::to_string(other.freePagesSet.size());
+                if (triePagesSet != other.triePagesSet) return "trie_set size " + std::to_string(triePagesSet.size()) + "/" + std::to_string(other.triePagesSet.size());
+                if (freePages != other.freePages) return "free_order";
+                if (pageRefCount != other.pageRefCount) {
+                    for (size_t i = 0; i < pageRefCount.size() && i < other.pageRefCount.size(); ++i)
+                        if (pageRefCount[i] != other.pageRefCount[i])
+                            return "ref page=" + std::to_string(i) + " " + std::to_string(pageRefCount[i]) + "/" + std::to_string(other.pageRefCount[i]);
+                    return "ref size";
+                }
+                if (pageToTrieNode.size() != other.pageToTrieNode.size())
+                    return "trie_nodes " + std::to_string(pageToTrieNode.size()) + "/" + std::to_string(other.pageToTrieNode.size());
+                for (int page : triePages) {
+                    if (page >= 0 && page < (int)pageTimestamp.size() && page < (int)other.pageTimestamp.size() &&
+                        pageTimestamp[page] != other.pageTimestamp[page])
+                        return "trie_ts page=" + std::to_string(page) + " " + std::to_string(pageTimestamp[page]) + "/" + std::to_string(other.pageTimestamp[page]);
+                }
+                return "";
+            }
             void EvictTrieSubtree(CacheTrieNode *node);
             void ReleasePageIndex(int pageIndex);
             void ReleasePageIndices(const std::vector<int> &pageIndices);
             void Pick(std::vector<int> &pageIds);
+            // Same protection as Pick; caller already holds pageIndexLocker
+            // (onRecordPage runs inside Record's critical section).
+            void PickLocked(const std::vector<int> &pageIds);
 
+            // Rolling multiplier of HashTokenPage (callers extend page hashes incrementally).
             static constexpr uint64_t TokenHashMultiplier = 1000000007ULL;
             static uint64_t HashTokenPage(const int *tokens, int len);
-            void Record(const std::vector<int> &tokens, const std::vector<int> &pages);
-            void Query(const std::vector<int> &tokens, std::vector<int> &cachedPageIds);
-            // Hashes belong to an immutable, caller-validated query. These
-            // methods neither allocate KV nor acquire request page references.
+            static uint64_t HashTokenPrefixPage(uint64_t parentHash, const int *tokens,
+                                                int len, const std::string &extraKey = "");
+            void Record(const std::vector<int> &tokens, const std::vector<int> &pages,
+                        const std::vector<std::string> *extraKeys = nullptr);
+            // Same publication path, but over an explicit token range. The
+            // asynchronous L1 publisher uses this so a boundary snapshot can be
+            // recorded later without copying the request's full token vector.
+            void RecordRange(const int *tokens, size_t tokenCount,
+                             const std::vector<int> &pages,
+                             const std::vector<std::string> *extraKeys = nullptr);
+            // RECORDOPT (FASTLLM_QWEN35_RECORD_FAST=1, default off): page
+            // hashes of one token range, computed once by the model and reused
+            // by every manager that records the same range in one checkpoint.
+            // Every value is the same value RecordRange computes inline, so a
+            // prehashed record publishes byte-identical trie content.
+            struct PageHashes {
+                const int *tokens = nullptr;
+                size_t tokenCount = 0;
+                int pageLen = 0;
+                const std::vector<std::string> *extraKeys = nullptr;
+                bool withPrefix = false;
+                std::vector<uint64_t> pageHash;   // HashPrefixExtra(HashTokenPage(page), extra)
+                std::vector<uint64_t> prefixHash; // rolling chain; valid when withPrefix
+            };
+            static void PreparePageHashes(PageHashes &out, const int *tokens, size_t tokenCount,
+                                          int pageLen, const std::vector<std::string> *extraKeys,
+                                          bool withPrefix);
+            // Same publication path as RecordRange. Falls back to the inline
+            // computation (identical result) whenever hashes do not describe
+            // exactly this token range, page length and callback set.
+            void RecordRangePrehashed(const int *tokens, size_t tokenCount,
+                                      const std::vector<int> &pages,
+                                      const std::vector<std::string> *extraKeys,
+                                      const PageHashes &hashes);
+            void RecordRangeImpl(const int *tokens, size_t tokenCount,
+                                 const std::vector<int> &pages,
+                                 const std::vector<std::string> *extraKeys,
+                                 const PageHashes *prehashed);
+            // 【一本账·截断可观测】Query 的可选出参。
+            //   默认 nullptr ⇒ **零行为变更**。
+            //   为什么需要它：Query 遇到"哈希不命中 / extraKey 不符 / page 已释放 /
+            //   页被覆盖"时都是**静默 break**（见 fastllm.cpp 里的 Query 实现），
+            //   调用方只拿到"命中了几页"，**无法区分"本来就只有这么多"还是"被回收截断"**
+            //   ⇒ 命中变短时日志里一个字都没有（这正是"两本账各管一层"留下的盲区）。
+            struct QueryResult {
+                int matchedPages = 0;
+                bool truncated = false;        // 是否提前停（还有页没走到就断了）
+                const char *reason = "";       // 断链原因（静态字符串，便于日志直接用）
+                uint64_t evictionEpoch = 0;    // 本次查询时页账本的"淘汰世代"
+            };
+            void Query(const std::vector<int> &tokens, std::vector<int> &cachedPageIds,
+                       const std::vector<std::string> *extraKeys = nullptr,
+                       QueryResult *out = nullptr, bool pick = false);
+            void QueryPagePositions(const std::vector<int> &tokens,
+                                    std::vector<int> &pageIds,
+                                    const std::vector<std::string> *extraKeys = nullptr,
+                                    int maxPages = -1, bool pick = false);
+            // 页账本的"淘汰世代"：任何时候有页因为"给别的请求腾地方"而离开 Trie 就 +1
+            // （叶子淘汰、子树淘汰、整池重置）。只在 pageIndexLocker 内自增，单向前进。
+            // 用途：让模型侧能说清"这份快照写完之后，页账本被淘汰过几次"（**只观测、不作废**
+            // —— 精确性已由 maxCachedLen 夹取保证）。
+            uint64_t evictionEpoch = 0;
+
+            // Upstream prefix-preview interface (text pages only: the hashes are
+            // HashTokenPage values, which equal this trie's edge hashes when a page
+            // has no extra key). Hashes belong to an immutable, caller-validated
+            // query. These methods neither allocate KV nor acquire page references.
             int PreviewPrefix(const std::vector<uint64_t> &hashes, PagedPrefixMatch &match);
             // Reuse hashes across layers/ranks. A match belongs to this exact
             // immutable query; a stale cache generation falls back to the trie.
+            // pick=true acquires the reported pages under the same lock as the
+            // lookup (see Query), so a background allocation cannot reclaim them.
             void QueryPrefix(const std::vector<uint64_t> &hashes, PagedPrefixMatch &match,
-                             std::vector<int> &cachedPageIds);
+                             std::vector<int> &cachedPageIds, bool pick = false);
             void RecordPrefix(const std::vector<uint64_t> &hashes, const std::vector<int> &pages);
             bool PreviewUnreferencedPrefixPages(const PagedPrefixMatch &match, int pages,
                                                std::vector<int> &unreferenced);
             bool PreviewUnreferencedPrefixPages(const PagedPrefixMatch &match, int pages,
                                                std::vector<int> &unreferenced, PagedPrefixPath &path);
-
-
             // Materialize free pages in the same order used by allocation.
             // This may evict unreferenced cache entries, but never reserves pages.
             void PreviewUnusedPageIndices(int count, std::vector<int> &pages);
@@ -865,14 +1071,7 @@ namespace fastllm {
 
         private:
             uint64_t nextTrieNodeId = 0;
-            uint64_t prefixBindingVersion = 0;
             CacheTrieNode *FindPrefixLocked(const std::vector<uint64_t> &hashes, PagedPrefixMatch &match);
-            std::set<std::pair<long long, int>> evictableLeaves;
-            void UpdateEvictableLeaf(CacheTrieNode *node);
-            void TouchTrieNode(CacheTrieNode *node, long long access);
-            void RemoveTriePage(int pageIndex);
-            void ReleasePageIndexLocked(int pageIndex);
-            void PrepareFreePages(int count);
     };
 
     struct PartitionLinkNode {
@@ -1585,6 +1784,9 @@ namespace fastllm {
     void IA3Layer(Data &input, Data &weight, Data &ia3_l, Data &bias, Data &output,
                   std::map <std::string, std::string> ia3Config);
 
+    // KVPAIR: link the K and V managers of one layer/rank (idempotent; no-op unless FASTLLM_PAGED_KV_PAIR_ALLOC=1).
+    bool PagedKVPairAllocEnabled();
+    void PairPagedCacheManagers(PagedCacheManager *key, PagedCacheManager *value);
     PagedCacheManager* AllocatePagedCacheManager(int layerIndex, 
         PagedCacheManager::PagedCacheManagerType type, 
         const Data &cacheData, 

@@ -189,6 +189,10 @@ void *FastllmCudaPrepareOutput(fastllm::Data &output);
 void FastllmCudaFinishInput(const fastllm::Data &input, void *data);
 void FastllmCudaFinishOutput(fastllm::Data &output, void *data);
 cublasHandle_t getFastllmCublasHandle();
+// The calling thread gets its own cuBLAS handle per device (used by the background vision worker).
+void FastllmCudaUsePrivateCublasHandle(bool enable);
+// Frees on this device become stream-ordered for every thread (background vision encode shares the device).
+void FastllmCudaEnableDeferredFreeDevice(int device);
 // Separate, immutable precision mode for BF16 output with FP32 reductions.
 // Returns null if unsupported or first requested during graph capture.
 cublasHandle_t getFastllmCublasFp32ReductionHandle();
@@ -203,6 +207,7 @@ void FastllmCudaSyncCurrentThreadStream();
 void FastllmInitCublas(void);
 
 void *FastllmCudaStreamCreate(bool nonBlocking = true);
+void *FastllmCudaStreamCreateLowestPriority();
 void FastllmCudaStreamDestroy(void *stream);
 void FastllmCudaStreamSynchronize(void *stream);
 
@@ -216,6 +221,9 @@ bool FastllmCudaEventComplete(void *event);
 float FastllmCudaEventElapsedTime(void *start, void *end);
 void FastllmCudaStreamWaitEvent(void *stream, void *event);
 void FastllmCudaCurrentThreadStreamWaitEvent(void *event);
+// §④：非阻塞就绪查询（1=已就绪 0=未就绪 -1=错误）。D2-stream 的 EventReady 需要它；
+// 没有它就只能退化成 cudaEventSynchronize 阻塞等待（PumpCopy 线程会被占住）。
+int FastllmCudaEventQuery(void *event);
 
 bool FastllmCudaGraphBeginCapture();
 // Register a stream joined to an existing capture by a cross-device event.
@@ -380,6 +388,14 @@ bool FastllmCudaIsWeightSlabPointer(const void *pointer);
 void FastllmCudaMemPoolStats();
 void * FastllmCudaDirectMalloc(size_t size);
 void FastllmCudaDirectFree(void *ret);
+// 权重源分片竞技场：compact NVFP4 专家分片数量极大（每层每 rank 1024 个），逐个
+// cudaMalloc/cudaFree 在接近满载的卡上要 90~240us/次，累计可超过 90s。这里按
+// (device, layer) 用固定大小块链 + 用户态 bump 切片，把分配/释放次数从约 25 万降到几千。
+// 用法：分片分配前 SetCudaWeightArenaLayer(layer)，整层重排完成后 ReleaseCudaWeightArena(layer)。
+void SetCudaWeightArenaLayer(int layer);
+void *TryAllocateFromCudaWeightArena(size_t bytes);
+bool FreeCudaWeightArenaPointer(void *pointer);
+void ReleaseCudaWeightArena(int layer);
 void FastllmCudaMemset0(void *ret, size_t size);
 
 // Borrow a per-device temporary CUDA buffer for short-lived intermediate data.
@@ -392,6 +408,8 @@ void FastllmCudaMemset0(void *ret, size_t size);
 // buffers are cache-owned, so callers should still pair Release with Borrow but
 // should not assume Release frees the CUDA memory.
 void *FastllmBorrowCudaTempBuffer(size_t needBytes, size_t *outBytes, bool *outOwn);
+// The calling thread borrows scratch from its own per-device buffer (background vision worker).
+void FastllmCudaUsePrivateScratch(bool enable);
 void FastllmReleaseCudaTempBuffer(void *ptr, bool own);
 
 // 借用 FlashInfer 的 d_float_workspace 作为临时 scratch（例如 INT4 反量化为 FP16 的临时缓冲）。

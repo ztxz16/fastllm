@@ -42,6 +42,26 @@ def _args(**overrides):
 
 
 class Qwen35AutoFastPathsTest(unittest.TestCase):
+    def test_cached_state_uses_same_default_reduction_with_ssd_off_or_on(self):
+        for cache_dir in (None, "/unused/cache"):
+            for inherited in ({}, {"FASTLLM_CUDA_CUSTOM_ALLREDUCE": "auto"}):
+                with self.subTest(cache_dir=cache_dir, inherited=inherited), patch.dict(
+                        os.environ, inherited, clear=True), patch(
+                        "fastllm_pytools.util._cuda_graph_auto_supported",
+                        return_value=False):
+                    _configure_qwen35_auto_fast_paths(
+                        _args(prefix_cache_dir=cache_dir, low_gpu_mem=True,
+                              speculative_algorithm="dflash"), True, 0)
+                    self.assertEqual(os.environ["FASTLLM_CUDA_CUSTOM_ALLREDUCE"], "off")
+
+    def test_explicit_reduction_override_is_preserved(self):
+        for flag in ("1", "on", "off", "0"):
+            with self.subTest(flag=flag), patch.dict(os.environ,
+                    {"FASTLLM_CUDA_CUSTOM_ALLREDUCE": flag}, clear=True), patch(
+                    "fastllm_pytools.util._cuda_graph_auto_supported", return_value=False):
+                _configure_qwen35_auto_fast_paths(_args(low_gpu_mem=True), True, 0)
+                self.assertEqual(os.environ["FASTLLM_CUDA_CUSTOM_ALLREDUCE"], flag)
+
     def test_low_gpu_mem_is_opt_in_and_independent_of_low(self):
         parser = make_normal_parser("test")
         self.assertFalse(parser.parse_args([]).low_gpu_mem)

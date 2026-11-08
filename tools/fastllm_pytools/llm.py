@@ -17,9 +17,9 @@ from collections import OrderedDict
 from typing import Optional, Tuple, Union, List, Callable, Dict, Any;
 
 try:
-    from .generation_errors import PromptTooLongError
+    from .generation_errors import PromptTooLongError, CapacityUnavailableError
 except ImportError:
-    from generation_errors import PromptTooLongError
+    from generation_errors import PromptTooLongError, CapacityUnavailableError
 
 try:
     from .gguf_metadata import get_gguf_model_config, try_load_gguf_tokenizer
@@ -496,6 +496,57 @@ fastllm_lib.get_response_statistics_llm_model.argtypes = [
     ctypes.POINTER(ctypes.c_int)
 ]
 fastllm_lib.get_response_statistics_llm_model.restype = ctypes.c_bool
+
+_get_response_observation = getattr(
+    fastllm_lib, "get_response_observation_llm_model", None)
+if _get_response_observation is not None:
+    _get_response_observation.argtypes = [
+        ctypes.c_int, ctypes.c_int,
+        ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
+        ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_ulonglong),
+        ctypes.c_char_p, ctypes.c_int]
+    _get_response_observation.restype = ctypes.c_bool
+
+_register_request_observation = getattr(
+    fastllm_lib, "register_request_observation_llm_model", None)
+if _register_request_observation is not None:
+    _register_request_observation.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_char_p]
+    _register_request_observation.restype = None
+
+_unregister_request_observation = getattr(
+    fastllm_lib, "unregister_request_observation_llm_model", None)
+if _unregister_request_observation is not None:
+    _unregister_request_observation.argtypes = [ctypes.c_int, ctypes.c_int]
+    _unregister_request_observation.restype = None
+
+_unregister_request_observation_by_id = getattr(
+    fastllm_lib, "unregister_request_observation_by_id_llm_model", None)
+if _unregister_request_observation_by_id is not None:
+    _unregister_request_observation_by_id.argtypes = [
+        ctypes.c_int, ctypes.c_int, ctypes.c_char_p]
+    _unregister_request_observation_by_id.restype = None
+_unregister_request_observation_checked = getattr(
+    fastllm_lib, "unregister_request_observation_checked_llm_model", None)
+if _unregister_request_observation_checked is not None:
+    _unregister_request_observation_checked.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_char_p]
+    _unregister_request_observation_checked.restype = None
+
+_get_request_status = getattr(fastllm_lib, "get_request_status_llm_model", None)
+if _get_request_status is not None:
+    _get_request_status.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_char_p,
+                                    ctypes.c_void_p, ctypes.c_int]
+    _get_request_status.restype = ctypes.c_bool
+
+_get_request_diagnostics = getattr(fastllm_lib, "get_request_diagnostics_llm_model", None)
+if _get_request_diagnostics is not None:
+    _get_request_diagnostics.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_char_p,
+                                        ctypes.c_void_p, ctypes.c_int]
+    _get_request_diagnostics.restype = ctypes.c_bool
+
+_next_observation_seq = getattr(fastllm_lib, "next_fastllm_observation_seq", None)
+if _next_observation_seq is not None:
+    _next_observation_seq.argtypes = []
+    _next_observation_seq.restype = ctypes.c_ulonglong
 
 fastllm_lib.abort_response_llm_model.argtypes = [ctypes.c_int, ctypes.c_int]
 
@@ -3204,16 +3255,127 @@ class model:
             ctypes.byref(output_tokens))
         if not found:
             return None
-        return {
+        result = {
             "cached_input_tokens": cached_input_tokens.value,
             "missed_input_tokens": missed_input_tokens.value,
             "output_tokens": output_tokens.value,
         }
+        observation = self.get_response_observation(handle)
+        if observation is not None:
+            result.update(observation)
+        return result
+
+    def get_response_observation(self, handle):
+        if _get_response_observation is None:
+            return None
+        cached = ctypes.c_int(0)
+        missed = ctypes.c_int(0)
+        output = ctypes.c_int(0)
+        native_handle = ctypes.c_ulonglong(0)
+        segment_buffer = ctypes.create_string_buffer(16384)
+        found = _get_response_observation(
+            self.model, handle, ctypes.byref(cached), ctypes.byref(missed),
+            ctypes.byref(output), ctypes.byref(native_handle),
+            segment_buffer, ctypes.sizeof(segment_buffer))
+        if not found:
+            return None
+        segments = []
+        encoded = segment_buffer.value.decode("utf-8", errors="replace")
+        for row in filter(None, encoded.split(";")):
+            values = {}
+            for item in row.split(","):
+                key, separator, value = item.partition("=")
+                if not separator:
+                    continue
+                if key in {"source_tokens", "effective_reused_tokens"}:
+                    try:
+                        values[key] = int(value)
+                    except ValueError:
+                        continue
+                elif key in {"lookup_ms", "restore_ms", "read_mib_s", "restore_tokens_s"}:
+                    try:
+                        values[key] = float(value)
+                    except ValueError:
+                        continue
+                else:
+                    values[key] = value
+            if values:
+                segments.append(values)
+        return {
+            "native_handle": int(native_handle.value),
+            "effective_reused_tokens": sum(
+                max(0, int(row.get("effective_reused_tokens", 0))) for row in segments),
+            "cache_segments": segments,
+            "cached_input_tokens": cached.value,
+            "missed_input_tokens": missed.value,
+            "output_tokens": output.value,
+        }
+
+    def get_request_status(self, handle, public_request_id):
+        if _get_request_status is None or handle is None:
+            return None
+        buffer = ctypes.create_string_buffer(16384)
+        if not _get_request_status(self.model, handle, str(public_request_id).encode("utf-8"),
+                                   buffer, ctypes.sizeof(buffer)):
+            return None
+        return dict(item.split("=", 1) for item in buffer.value.decode("ascii").split()
+                    if "=" in item)
+
+    def get_request_diagnostics(self, handle, public_request_id):
+        # Independent native registry only: no normal status/capacity/model locks.
+        if _get_request_diagnostics is None or handle is None:
+            return None
+        buffer = ctypes.create_string_buffer(65536)
+        if not _get_request_diagnostics(self.model, handle,
+                str(public_request_id).encode("utf-8"), buffer, ctypes.sizeof(buffer)):
+            return None
+        return dict(item.split("=", 1) for item in buffer.value.decode("ascii").split()
+                    if "=" in item)
+
+    def register_request_observation(self, handle, public_request_id):
+        if _register_request_observation is not None:
+            _register_request_observation(
+                self.model, handle, str(public_request_id).encode("utf-8"))
+
+    def unregister_request_observation_by_id(self, handle, public_request_id):
+        if _unregister_request_observation_by_id is not None:
+            _unregister_request_observation_by_id(
+                self.model, handle, str(public_request_id).encode("utf-8"))
+
+    def unregister_request_observation(self, handle, public_request_id=None):
+        if public_request_id is not None:
+            self.unregister_request_observation_by_id(handle, public_request_id)
+            return
+    def unregister_request_observation_scoped(self, handle, public_request_id):
+        if _unregister_request_observation_checked is not None:
+            _unregister_request_observation_checked(
+                self.model, handle, str(public_request_id).encode("utf-8"))
+        # Do not erase an unverified reused handle when paired with an older ABI.
+
+    def unregister_request_observation(self, handle):
+        if _unregister_request_observation is not None:
+            _unregister_request_observation(self.model, handle)
+
+    @staticmethod
+    def next_observation_sequence():
+        if _next_observation_seq is None:
+            return None
+        return int(_next_observation_seq())
     
     def _raise_prompt_too_long(self, handle):
         if self.save_history:
             self.current_tokenizer_cache.pop(handle, None)
         raise PromptTooLongError()
+
+    def _raise_capacity_unavailable(self, handle):
+        if self.save_history:
+            self.current_tokenizer_cache.pop(handle, None)
+        raise CapacityUnavailableError()
+
+    def _raise_native_forward_failed(self, handle):
+        if self.save_history:
+            self.current_tokenizer_cache.pop(handle, None)
+        raise RuntimeError("native packed multimodal forward failed; see the matching native request error")
 
     def stream_response_handle(self, handle):
         if (self._can_apply_hf_chat_template() or
@@ -3227,7 +3389,11 @@ class model:
                 if (cur <= -1):
                     if (cur == -2):
                         self._raise_prompt_too_long(handle)
-                    if cur == -3:
+                    if (cur == -3):
+                        self._raise_capacity_unavailable(handle)
+                    if (cur == -4):
+                        self._raise_native_forward_failed(handle)
+                    if (cur == -5):
                         raise RuntimeError("Native model generation failed; see server log for details")
                     break
                 tokens.append(cur)
@@ -3251,6 +3417,10 @@ class model:
                 if token == -2:
                     self._raise_prompt_too_long(handle)
                 if token == -3:
+                    self._raise_capacity_unavailable(handle)
+                if token == -4:
+                    self._raise_native_forward_failed(handle)
+                if token == -5:
                     raise RuntimeError("Native model generation failed; see server log for details")
                 if (self.save_history and handle in self.current_tokenizer_cache):
                     if (token <= -1):
@@ -3285,7 +3455,8 @@ class model:
                     pending_tokens.clear()
                 yield cur
 
-    async def stream_response_handle_async(self, handle, response_statistics = None):
+    async def stream_response_handle_async(self, handle, response_statistics = None,
+                                           on_native_context_released = None):
         import time
         is_prefill = True
         start_time = time.time()
@@ -3327,11 +3498,19 @@ class model:
                         yield ""
                     continue
                 is_prefill = False
-                capture_response_statistics()
                 if count <= -1:
+                    # The native fetch has already deleted this context. Retire
+                    # its API ownership before any buffered tail is yielded.
+                    # Never sample a bare handle again after native release.
+                    if on_native_context_released is not None:
+                        on_native_context_released()
                     if count == -2:
                         self._raise_prompt_too_long(handle)
                     if count == -3:
+                        self._raise_capacity_unavailable(handle)
+                    if count == -4:
+                        self._raise_native_forward_failed(handle)
+                    if count == -5:
                         raise RuntimeError("Native model generation failed; see server log for details")
                     if (self.save_history):
                         try:
@@ -3341,6 +3520,7 @@ class model:
                             pass
                     break
 
+                capture_response_statistics()
                 # Decode at the original token boundaries and only coalesce
                 # the yielded text. This keeps byte-fallback handling and exact
                 # output text identical to the one-token streaming path.
@@ -3371,11 +3551,19 @@ class model:
                 count, ready_tokens = await asyncio.to_thread(fetch_ready_tokens)
                 if count == 0:
                     continue
-                capture_response_statistics()
                 if count <= -1:
+                    # The native fetch has already deleted this context. Retire
+                    # its API ownership before any buffered tail is yielded.
+                    # Never sample a bare handle again after native release.
+                    if on_native_context_released is not None:
+                        on_native_context_released()
                     if count == -2:
                         self._raise_prompt_too_long(handle)
                     if count == -3:
+                        self._raise_capacity_unavailable(handle)
+                    if count == -4:
+                        self._raise_native_forward_failed(handle)
+                    if count == -5:
                         raise RuntimeError("Native model generation failed; see server log for details")
                     if (self.save_history and
                             handle in self.current_tokenizer_cache):
@@ -3385,6 +3573,7 @@ class model:
                         except:
                             pass
                     break
+                capture_response_statistics()
                 for token in ready_tokens:
                     ret += self._decode_fastllm_token(token)
                     if (self.save_history and
@@ -3558,8 +3747,34 @@ class model:
             raise RuntimeError(error.decode("utf-8", errors="replace"))
         self._refresh_context_config()
 
+    def persistent_prefix_cache_statistics(self):
+        get_stats = getattr(fastllm_lib, "get_persistent_prefix_cache_statistics", None)
+        if get_stats is None:
+            raise RuntimeError("Loaded native library lacks persistent-cache statistics")
+        get_stats.argtypes = [ctypes.c_int]
+        get_stats.restype = ctypes.c_char_p
+        return json.loads(get_stats(self.model).decode("utf-8"))
+
     def set_moe_experts(self, experts: int):
         fastllm_lib.set_moe_experts(self.model, experts)
+
+    def close_persistent_prefix_admission(self):
+        # §13 第 2 条：关闭新准入（在排空之前调用），在途作业不受影响。
+        close = getattr(fastllm_lib, "close_persistent_prefix_admission", None)
+        if close is not None:
+            close.argtypes = [ctypes.c_int]
+            close.restype = None
+            close(self.model)
+
+    def wait_persistent_prefix_cache(self, timeout = 30.0):
+        # §13 第 3/4/6 条：排空后台提交；native 侧已包含 GPU lease 与 host 信用
+        # 归零判定，超时会显式失败并打印原因（这里只如实返回结果）。
+        wait = getattr(fastllm_lib, "wait_persistent_prefix_cache", None)
+        if wait is None:
+            return True
+        wait.argtypes = [ctypes.c_int, ctypes.c_int]
+        wait.restype = ctypes.c_bool
+        return bool(wait(self.model, int(timeout * 1000)))
     
     def set_cuda_shared_expert(self, cuda_shared_expert: bool):
         fastllm_lib.set_cuda_shared_expert(cuda_shared_expert)

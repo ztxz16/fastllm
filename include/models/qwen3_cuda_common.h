@@ -1399,6 +1399,7 @@ namespace fastllm {
                     cacheLayerIdx * 2, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, kCacheDesc);
                 PagedCacheManager *pagedCacheVManager = AllocatePagedCacheManager(
                     cacheLayerIdx * 2 + 1, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, vCacheDesc);
+                PairPagedCacheManagers(pagedCacheKManager, pagedCacheVManager);  // KVPAIR (no-op unless enabled)
                 Qwen3CudaAppendPagedCache(runner, *pagedCacheKManager, *(*batchPastKeys)[0], k);
                 Qwen3CudaAppendPagedCache(runner, *pagedCacheVManager, *(*batchPastValues)[0], v);
             } else {
@@ -1419,6 +1420,7 @@ namespace fastllm {
                         cacheLayerIdx * 2, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, kCacheDesc);
                     PagedCacheManager *pagedCacheVManager = AllocatePagedCacheManager(
                         cacheLayerIdx * 2 + 1, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, vCacheDesc);
+                    PairPagedCacheManagers(pagedCacheKManager, pagedCacheVManager);  // KVPAIR (no-op unless enabled)
                     Qwen3CudaAppendPagedCache(runner, *pagedCacheKManager, pastKey, curK);
                     Qwen3CudaAppendPagedCache(runner, *pagedCacheVManager, pastValue, curV);
 

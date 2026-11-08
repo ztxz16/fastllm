@@ -20,6 +20,19 @@ extern "C" {
 using DivisionScheme = std::map <int, std::vector <std::pair <int, int> > >;
 
 bool FastllmInitNccl(const std::vector<int>& devices);
+// Independent NCCL group used by PP stages. The legacy functions above keep
+// their process-global communicator for existing models; Qwen4 PP binds every
+// stage to one of these opaque contexts so creating Stage 1 cannot replace
+// Stage 0's communicator.
+struct FastllmNcclGroup;
+FastllmNcclGroup *FastllmCreateNcclGroup(const std::vector<int> &devices);
+void FastllmDestroyNcclGroup(FastllmNcclGroup *group);
+bool FastllmNcclGroupAllReduce(FastllmNcclGroup *group, void *data, void *dest,
+                               int count, int dataType, int deviceId);
+bool FastllmNcclGroupBroadcast(FastllmNcclGroup *group, void *data, void *recv,
+                               int count, int dataType, int root, int deviceId);
+bool FastllmNcclGroupAllGather(FastllmNcclGroup *group, const void *data, void *dest,
+                               int count, int dataType, int deviceId);
 // Monotonically identifies the currently initialized global NCCL communicator
 // group. Custom collective state must match this generation before it can run.
 uint64_t FastllmGetNcclGeneration();

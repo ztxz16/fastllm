@@ -18,6 +18,18 @@
 #endif
 #include <cstring>
 
+// 空闲时的轮询参数（可被编译期覆盖）。
+// 背景：AliveThreadPool 的工人线程在空闲时原本每 65536 圈复查一次时间、只睡 2ms，
+// 实测 32 个工人线程常驻占用约 267% CPU。
+// 默认改为：空闲时每 FASTLLM_ALIVE_IDLE_SPIN 圈复查一次时间、睡 FASTLLM_ALIVE_IDLE_POLL_US 微秒，
+// 实测空闲 CPU 约 1%，活跃路径参数不变（有活干立刻恢复 65536 圈）。
+#ifndef FASTLLM_ALIVE_IDLE_POLL_US
+#define FASTLLM_ALIVE_IDLE_POLL_US 100000   // 100ms：空闲时每秒检查 10 次
+#endif
+#ifndef FASTLLM_ALIVE_IDLE_SPIN
+#define FASTLLM_ALIVE_IDLE_SPIN 1024        // 空闲态复查时间的周期（圈数）
+#endif
+
 namespace fastllm {
     static void barrier() {
 #ifdef __aarch64__
@@ -60,6 +72,7 @@ namespace fastllm {
             uint64_t lastRunId = 0;
             auto lastRunTime = std::chrono::system_clock::now();
             while (true) {
+                // 活跃期热循环与改动前逐字节一致（复查周期恒为 65536 圈）。
                 uint64_t currentId = task->publishId.load(std::memory_order_acquire);
                 if (currentId != lastRunId) {
                     lastRunId = currentId;
@@ -75,7 +88,26 @@ namespace fastllm {
                     auto duration = std::chrono::duration_cast<std::chrono::microseconds> (std::chrono::system_clock::now() - lastRunTime);
                     double gap = double(duration.count()) * std::chrono::microseconds::period::num / std::chrono::microseconds::period::den;
                     if (gap > 3) {
-                        std::this_thread::sleep_for(std::chrono::microseconds(2000));
+                        // 空闲态：进入内层等待循环。
+                        // 原实现只睡 2ms 就回去空转 65536 圈，32 个工人线程常驻约 267% CPU（实测）。
+                        // 这里改为：每次睡 FASTLLM_ALIVE_IDLE_POLL_US 微秒，醒来只快速复查
+                        // FASTLLM_ALIVE_IDLE_SPIN 圈；一直没有活就继续睡。有活立即执行并回到外层热循环。
+                        // 纯轮询、无新增原子操作与锁，工人每次醒来都会自己复查，不存在丢失唤醒。
+                        bool got = false;
+                        while (!got) {
+                            std::this_thread::sleep_for(std::chrono::microseconds(FASTLLM_ALIVE_IDLE_POLL_US));
+                            for (int k = 0; k < FASTLLM_ALIVE_IDLE_SPIN; k++) {
+                                uint64_t id = task->publishId.load(std::memory_order_acquire);
+                                if (id != lastRunId) {
+                                    lastRunId = id;
+                                    task->op->Run();
+                                    task->doneId.store(id, std::memory_order_release);
+                                    lastRunTime = std::chrono::system_clock::now();
+                                    got = true;
+                                    break;
+                                }
+                            }
+                        }
                     }
                 }
             }

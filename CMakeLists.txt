@@ -23,6 +23,7 @@ option(USE_IVCOREX "use iluvatar corex gpu" OFF)
 option(BUILD_CLI "build cli" OFF)
 
 option(UNIT_TEST "build unit tests" OFF)
+option(FASTLLM_P0_CPU_REGRESSIONS "Build P0 production-helper CPU regressions" OFF)
 
 option(BUILD_HY_NOMAS "build the native HY-Nomas continuous-tensor backend" OFF)
 option(BUILD_QWEN_IMAGE "build native Qwen-Image-2.1" OFF)
@@ -210,6 +211,22 @@ else()
 endif()
 
 
+# ---- SSD 前缀缓存依赖（移植自源仓库；OpenSSL + SQLite3 都存在才启用）----
+find_package(OpenSSL QUIET)
+find_package(SQLite3 QUIET HINTS "$ENV{CONDA_PREFIX}")
+if (NOT SQLite3_FOUND)
+    find_path(SQLite3_INCLUDE_DIR sqlite3.h HINTS "$ENV{CONDA_PREFIX}/include")
+    find_library(SQLite3_LIBRARY sqlite3 HINTS "$ENV{CONDA_PREFIX}/lib")
+    find_package(SQLite3 QUIET)
+endif()
+if (OpenSSL_FOUND AND SQLite3_FOUND)
+    message(STATUS "SSD prefix cache: OpenSSL + SQLite3 found -> disk_prefix_cache enabled")
+    add_compile_definitions(FASTLLM_DISK_PREFIX_CACHE)
+    list(APPEND FASTLLM_LINKED_LIBS OpenSSL::Crypto SQLite::SQLite3)
+else()
+    message(STATUS "SSD prefix cache: OpenSSL or SQLite3 missing -> disk_prefix_cache disabled")
+endif()
+
 message(STATUS "CMAKE_CXX_FLAGS: ${CMAKE_CXX_FLAGS}")
 file(GLOB GRAPH_MODEL_FILES "src/models/graph/*.cpp")
 file(GLOB BLOCK_FILES "src/blocks/*.cpp")
@@ -237,6 +254,18 @@ set(FASTLLM_CXX_SOURCES src/fastllm.cpp src/pd.cpp src/models/naive_n05_pd.cpp s
         ${CPU_DEVICE_FILES}
         ${BLOCK_FILES}
         ${GRAPH_MODEL_FILES})
+
+if (OpenSSL_FOUND AND SQLite3_FOUND AND UNIX AND NOT APPLE)
+    list(APPEND FASTLLM_CXX_SOURCES src/utils/disk_prefix_cache.cpp)
+    # SSD prefix cache V5 (DESIGN-V5-draft3), default store; FASTLLM_PREFIX_V5=0 selects V4.
+    list(APPEND FASTLLM_CXX_SOURCES src/utils/disk_prefix_v5.cpp)
+    # v4-only storage configuration and capability negotiation.
+    list(APPEND FASTLLM_CXX_SOURCES src/utils/disk_prefix_storage_config.cpp)
+    # v4 记录/对象表/manifest 节点编解码（SSD_CACHE_REWRITE_PLAN.md §10.1/§10.2）
+    list(APPEND FASTLLM_CXX_SOURCES src/utils/disk_prefix_format_v4.cpp)
+    # 写盘协调器：非阻塞准入、固定哈希池、按序消费、预算/生命周期（§6/§7）
+    list(APPEND FASTLLM_CXX_SOURCES src/utils/disk_prefix_write_coordinator.cpp)
+endif()
 
 include_directories(include)
 include_directories(include/utils)
@@ -331,6 +360,20 @@ if (USE_CUDA)
     if (FASTLLM_CUDA_LEGACY_ONLY)
         message(STATUS "FlashInfer kernels: OFF (all CUDA architectures are below sm_70)")
         add_compile_definitions(FASTLLM_CUDA_LEGACY_ONLY)
+    endif()
+    # Same reasoning for kernels whose device code exists only on sm_80+: the
+    # host pass must not reference them when no device pass will define them.
+    set(FASTLLM_CUDA_NO_SM80 ON)
+    foreach(FASTLLM_CUDA_ARCH IN LISTS FASTLLM_CUDA_ARCHITECTURES)
+        string(REGEX MATCH "^[0-9]+" FASTLLM_CUDA_ARCH_NUMBER
+            "${FASTLLM_CUDA_ARCH}")
+        if (FASTLLM_CUDA_ARCH_NUMBER STREQUAL "" OR
+            FASTLLM_CUDA_ARCH_NUMBER GREATER_EQUAL 80)
+            set(FASTLLM_CUDA_NO_SM80 OFF)
+        endif()
+    endforeach()
+    if (FASTLLM_CUDA_NO_SM80)
+        add_compile_definitions(FASTLLM_CUDA_NO_SM80)
     endif()
     if (CUDA_NO_TENSOR_CORE)
         add_compile_definitions(CUDA_NO_TENSOR_CORE)
@@ -584,6 +627,9 @@ if (USE_CUDA)
     # These C++ units include CUDA runtime/driver headers without going through nvcc.
     set_property(SOURCE src/devices/cuda/models/glm5-next-dsa.cpp src/models/clover.cpp src/models/clover_parallel.cpp
         src/models/naive_n05_flash.cpp src/models/naive_n05_tp.cpp src/models/naive_n05_kvmem.cpp
+        APPEND PROPERTY INCLUDE_DIRECTORIES "${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}")
+    # F1a's checked host adapter calls runtime APIs from this C++ source only.
+    set_property(SOURCE src/models/qwen3_5.cpp
         APPEND PROPERTY INCLUDE_DIRECTORIES "${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}")
 
     # GLM53 prefill uses architecture-specific register and matrix-load
@@ -881,9 +927,13 @@ add_library(fastllm OBJECT
             )
 # Compile the core once for executables and the Python shared library.
 set_target_properties(fastllm PROPERTIES POSITION_INDEPENDENT_CODE ON)
-target_link_libraries(fastllm PUBLIC ${FASTLLM_LINKED_LIBS})
+target_link_libraries(fastllm PUBLIC ${FASTLLM_LINKED_LIBS} ${CMAKE_DL_LIBS})
 if (FASTLLM_MIMO_EP8_MEGA_ENABLED)
     target_link_libraries(fastllm INTERFACE ${FASTLLM_MIMO_EP8_MEGA_OBJECTS})
+endif()
+option(FASTLLM_DIAGNOSTIC_SYMBOLS "Keep C++ line information for offline diagnostic address symbolization" OFF)
+if (FASTLLM_DIAGNOSTIC_SYMBOLS AND NOT MSVC)
+    target_compile_options(fastllm PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-g1>)
 endif()
 if (FASTLLM_CUDA_SM90_SOURCES)
     target_link_libraries(fastllm INTERFACE $<TARGET_OBJECTS:fastllm_cuda_sm90>)
@@ -908,6 +958,57 @@ target_link_libraries(main fastllm)
 
 add_executable(quant tools/src/quant.cpp)
 target_link_libraries(quant fastllm)
+
+if (FASTLLM_P0_CPU_REGRESSIONS)
+    # S02-F05: the zero-CUDA requirement is structural, not a counter reset. This
+    # fixture links the real Data/helper implementation, so the target must be
+    # configured with -DUSE_CUDA=OFF; the SM75 production package stays in its
+    # own build tree. The ELF --wrap tripwires below stay armed in both.
+    if (USE_CUDA)
+        message(FATAL_ERROR
+            "p0SnapshotCopyCpuRegression requires -DUSE_CUDA=OFF so the real "
+            "Data fixture contains no CUDA call sites (S02-F05). Build the SM75 "
+            "production package in a separate build tree.")
+    endif()
+    if (NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        message(FATAL_ERROR "P0 CPU regression requires the ELF CUDA rejection guard")
+    endif()
+    enable_testing()
+    add_executable(p0RequestResourceLedgerCpu test/basic/p0_request_resource_ledger_cpu.cpp)
+    add_executable(p0PackedLayoutCpu test/basic/p0_packed_layout_cpu.cpp)
+    add_executable(p0MultimodalChunkPlanCpu test/basic/p0_multimodal_chunk_plan_cpu.cpp)
+    add_executable(p0RequestTeardownCpu test/basic/p0_request_teardown_cpu.cpp)
+    add_executable(p0PackedCpuRejection test/basic/p0_packed_cpu_rejection.cpp)
+    target_link_libraries(p0RequestTeardownCpu PRIVATE fastllm)
+    target_link_libraries(p0PackedCpuRejection PRIVATE fastllm)
+    foreach(p0_cpu_target p0RequestResourceLedgerCpu p0PackedLayoutCpu
+                          p0MultimodalChunkPlanCpu p0RequestTeardownCpu p0PackedCpuRejection)
+        target_include_directories(${p0_cpu_target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+        set_target_properties(${p0_cpu_target} PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+    endforeach()
+    add_test(NAME p0_request_resource_ledger_cpu COMMAND p0RequestResourceLedgerCpu)
+    add_test(NAME p0_packed_layout_cpu COMMAND p0PackedLayoutCpu)
+    add_test(NAME p0_multimodal_chunk_plan_cpu COMMAND p0MultimodalChunkPlanCpu)
+    add_test(NAME p0_request_teardown_cpu COMMAND p0RequestTeardownCpu)
+    add_test(NAME p0_packed_cpu_rejection COMMAND p0PackedCpuRejection)
+    set_tests_properties(p0_request_teardown_cpu PROPERTIES TIMEOUT 60
+        ENVIRONMENT "CUDA_VISIBLE_DEVICES=;FASTLLM_OBSERVABILITY_MODE=debug")
+    add_executable(p0SnapshotCopyCpuRegression
+        test/basic/p0_snapshot_copy_cpu_regression.cpp
+        test/basic/p0_snapshot_cuda_guard.cpp)
+    target_link_libraries(p0SnapshotCopyCpuRegression PRIVATE fastllm)
+    set_target_properties(p0SnapshotCopyCpuRegression PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+    # Every direct runtime/driver initialization/allocation/launch attempt is
+    # counted and rejected before entering CUDA, even in a CUDA-enabled build.
+    foreach(p0_guard_symbol cuInit cudaGetDeviceCount cudaGetDevice cudaSetDevice
+            cudaGetDeviceProperties cudaGetDeviceProperties_v2 cudaMalloc cudaMallocAsync
+            cudaFree cudaHostAlloc cudaHostRegister cudaStreamCreateWithFlags cudaStreamCreateWithPriority
+            cudaEventCreateWithFlags cudaMemcpy cudaMemcpyAsync cudaLaunchKernel)
+        target_link_libraries(p0SnapshotCopyCpuRegression PRIVATE "-Wl,--wrap=${p0_guard_symbol}")
+    endforeach()
+    add_test(NAME p0_snapshot_copy_cpu COMMAND p0SnapshotCopyCpuRegression)
+    set_tests_properties(p0_snapshot_copy_cpu PROPERTIES TIMEOUT 60 ENVIRONMENT "CUDA_VISIBLE_DEVICES=")
+endif()
 
 if (UNIT_TEST)
     enable_testing()
@@ -949,6 +1050,22 @@ if (UNIT_TEST)
     add_executable(deepseekV41StubKVRegression test/ops/deepseekV41StubKVRegression.cpp)
     target_link_libraries(deepseekV41StubKVRegression PRIVATE fastllm)
     fastllm_add_checked_test(deepseekV41StubKV deepseekV41StubKVRegression "PASS [0-9]+ scheduler stub states" 60)
+
+    # T0 prefix-cache ownership/ledger regressions.  These tests do not start
+    # a model or require a GPU; keep them in the normal unit-test graph so the
+    # recycle/adoption contracts cannot silently drift out of CI.
+    find_package(Threads REQUIRED)
+    add_executable(prefix_cache_page_ledger_test
+        test/basic/test_prefix_cache_page_ledger.cpp)
+    target_include_directories(prefix_cache_page_ledger_test PRIVATE include)
+    target_link_libraries(prefix_cache_page_ledger_test PRIVATE Threads::Threads)
+    add_test(NAME prefix_cache_page_ledger COMMAND prefix_cache_page_ledger_test)
+
+    add_executable(paged_cache_deferred_recycle_test
+        test/basic/test_paged_cache_deferred_recycle.cpp)
+    target_link_libraries(paged_cache_deferred_recycle_test PRIVATE fastllm)
+    add_test(NAME paged_cache_deferred_recycle COMMAND paged_cache_deferred_recycle_test)
+
     add_executable(kvmem_pages_test test/basic/test_kvmem_pages.cpp src/kvmem.cpp)
     if(UNIX)
         add_executable(pd_state_test test/basic/test_pd_state.cpp)
@@ -1342,6 +1459,63 @@ if (UNIT_TEST)
                                  PROPERTIES LABELS cuda RUN_SERIAL TRUE SKIP_RETURN_CODE 77 TIMEOUT 180)
         endif()
     endif()
+    # ---- SSD 持久前缀缓存单测（移植自源仓库）----
+    if (OpenSSL_FOUND AND SQLite3_FOUND AND UNIX AND NOT APPLE)
+        # 写盘协调器接口与失败合同（P1 先冻结接口；纯头文件，无实现依赖）。
+        add_executable(disk_prefix_coordinator_contract_test
+            test/basic/test_disk_prefix_coordinator_contract.cpp
+            src/utils/disk_prefix_write_coordinator.cpp)
+        target_include_directories(disk_prefix_coordinator_contract_test PRIVATE include)
+        target_link_libraries(disk_prefix_coordinator_contract_test PRIVATE OpenSSL::Crypto Threads::Threads)
+        add_test(NAME disk_prefix_coordinator_contract COMMAND disk_prefix_coordinator_contract_test)
+        set_tests_properties(disk_prefix_coordinator_contract PROPERTIES TIMEOUT 60)
+
+        # A-5（2026-10-31）：D2 流水"一张单只搬一次 + 残留清理"的离线判据。
+        add_executable(d2_copy_terminal_test
+            test/basic/test_d2_copy_terminal.cpp
+            src/utils/disk_prefix_write_coordinator.cpp)
+        target_include_directories(d2_copy_terminal_test PRIVATE include)
+        target_link_libraries(d2_copy_terminal_test PRIVATE OpenSSL::Crypto Threads::Threads)
+        add_test(NAME d2_copy_terminal COMMAND d2_copy_terminal_test)
+        set_tests_properties(d2_copy_terminal PROPERTIES TIMEOUT 60)
+
+        # v4 存储核心：真实写盘、断电恢复、索引重建、空间回收（纯 CPU）。
+        add_executable(disk_prefix_store_test test/basic/test_disk_prefix_store_v4.cpp
+            src/utils/disk_prefix_write_coordinator.cpp
+            src/utils/disk_prefix_cache.cpp
+            src/utils/disk_prefix_v5.cpp
+            src/utils/disk_prefix_format_v4.cpp
+            src/utils/disk_prefix_storage_config.cpp
+            third_party/json11/json11.cpp)
+        target_include_directories(disk_prefix_store_test PRIVATE include)
+        target_link_libraries(disk_prefix_store_test PRIVATE OpenSSL::Crypto SQLite::SQLite3 Threads::Threads)
+        target_compile_definitions(disk_prefix_store_test PRIVATE FASTLLM_DISK_PREFIX_CACHE_TESTING=1)
+        add_test(NAME disk_prefix_store COMMAND disk_prefix_store_test)
+        set_tests_properties(disk_prefix_store PROPERTIES TIMEOUT 120 ENVIRONMENT FASTLLM_PREFIX_V5=0)
+
+        # §17.1（P1 收口，2026-09-30）HostLimit/预算贴近下限：不卡死、拒绝必须可见、
+        # 已受理的最终能完成、计数/内存峰值有界（纯 CPU，无 CUDA/模型/服务）。
+        add_executable(disk_prefix_hostlimit_test test/basic/test_disk_prefix_hostlimit.cpp
+            src/utils/disk_prefix_write_coordinator.cpp
+            src/utils/disk_prefix_cache.cpp
+            src/utils/disk_prefix_v5.cpp
+            src/utils/disk_prefix_format_v4.cpp
+            src/utils/disk_prefix_storage_config.cpp
+            third_party/json11/json11.cpp)
+        target_include_directories(disk_prefix_hostlimit_test PRIVATE include)
+        target_link_libraries(disk_prefix_hostlimit_test PRIVATE OpenSSL::Crypto SQLite::SQLite3 Threads::Threads)
+        target_compile_definitions(disk_prefix_hostlimit_test PRIVATE FASTLLM_DISK_PREFIX_CACHE_TESTING=1)
+        add_test(NAME disk_prefix_hostlimit COMMAND disk_prefix_hostlimit_test)
+        set_tests_properties(disk_prefix_hostlimit PROPERTIES TIMEOUT 180 ENVIRONMENT FASTLLM_PREFIX_V5=0)
+
+        # v4 编解码黄金字节/边界/溢出/重叠测试（纯 CPU，无 CUDA/模型/服务）。
+        add_executable(disk_prefix_format_test test/basic/test_disk_prefix_format_v4.cpp
+            src/utils/disk_prefix_format_v4.cpp)
+        target_include_directories(disk_prefix_format_test PRIVATE include)
+        target_link_libraries(disk_prefix_format_test PRIVATE OpenSSL::Crypto Threads::Threads)
+        add_test(NAME disk_prefix_format COMMAND disk_prefix_format_test)
+        set_tests_properties(disk_prefix_format PROPERTIES TIMEOUT 60)
+    endif()
     find_package(Threads REQUIRED)
     add_executable(ncclSubmitRendezvousRegression test/ops/ncclSubmitRendezvousRegression.cpp)
     target_include_directories(ncclSubmitRendezvousRegression PRIVATE include)
@@ -1365,6 +1539,79 @@ if (UNIT_TEST)
     add_executable(qwen4_mtp_confidence_test test/basic/test_qwen4_mtp_confidence.cpp)
     target_include_directories(qwen4_mtp_confidence_test PRIVATE include)
     add_test(NAME qwen4_mtp_confidence COMMAND qwen4_mtp_confidence_test)
+
+    add_executable(qwen4_ple_ssd_load_test test/basic/test_qwen4_ple_ssd_load.cpp)
+    target_link_libraries(qwen4_ple_ssd_load_test PRIVATE fastllm)
+    add_test(NAME qwen4_merged_load_frontier COMMAND qwen4_ple_ssd_load_test --group)
+    set_tests_properties(qwen4_merged_load_frontier PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=")
+
+    add_executable(qwen4_pipeline_layout_test test/basic/test_qwen4_pipeline_layout.cpp)
+    target_include_directories(qwen4_pipeline_layout_test PRIVATE include)
+    target_compile_features(qwen4_pipeline_layout_test PRIVATE cxx_std_17)
+    target_link_libraries(qwen4_pipeline_layout_test PRIVATE Threads::Threads)
+    add_test(NAME qwen4_pipeline_layout COMMAND qwen4_pipeline_layout_test)
+
+    add_executable(qwen4_pipeline_graph_boundary_test test/basic/test_qwen4_pipeline_graph_boundary.cpp)
+    target_include_directories(qwen4_pipeline_graph_boundary_test PRIVATE include)
+    target_compile_features(qwen4_pipeline_graph_boundary_test PRIVATE cxx_std_17)
+    add_test(NAME qwen4_pipeline_graph_boundary COMMAND qwen4_pipeline_graph_boundary_test)
+    add_executable(infer_stage_checkpoints_test test/basic/test_qwen4_stage_checkpoints.cpp)
+    target_link_libraries(infer_stage_checkpoints_test PRIVATE fastllm_tools)
+    if (USE_CUDA)
+        target_link_directories(infer_stage_checkpoints_test PRIVATE ${CMAKE_CUDA_IMPLICIT_LINK_DIRECTORIES})
+    endif()
+    add_executable(infer_pipeline_boundary_test test/basic/test_qwen4_pipeline_boundary.cpp)
+    target_link_libraries(infer_pipeline_boundary_test PRIVATE fastllm_tools)
+    if (USE_CUDA)
+        target_link_directories(infer_pipeline_boundary_test PRIVATE ${CMAKE_CUDA_IMPLICIT_LINK_DIRECTORIES})
+    endif()
+
+    add_executable(qwen4_shared_embedding_test test/basic/test_qwen4_shared_embedding.cpp)
+    target_compile_features(qwen4_shared_embedding_test PRIVATE cxx_std_17)
+    target_link_libraries(qwen4_shared_embedding_test PRIVATE fastllm)
+    add_test(NAME qwen4_shared_embedding COMMAND qwen4_shared_embedding_test)
+    set_tests_properties(qwen4_shared_embedding PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=")
+
+    add_executable(qwen4_stage_checkpoints_test test/basic/test_qwen4_stage_checkpoints.cpp)
+    target_link_libraries(qwen4_stage_checkpoints_test PRIVATE fastllm)
+    add_test(NAME qwen4_stage_checkpoints COMMAND qwen4_stage_checkpoints_test)
+    set_tests_properties(qwen4_stage_checkpoints PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=")
+
+    add_executable(qwen4_pipeline_boundary_test test/basic/test_qwen4_pipeline_boundary.cpp)
+    target_link_libraries(qwen4_pipeline_boundary_test PRIVATE fastllm)
+    fastllm_add_checked_test(qwen4_pipeline_boundary qwen4_pipeline_boundary_test
+        "PASS real ForwardTarget boundary" 30)
+    set_tests_properties(qwen4_pipeline_boundary PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=")
+
+    add_executable(qwen4_pipeline_inputs_test test/basic/test_qwen4_pipeline_inputs.cpp)
+    target_link_libraries(qwen4_pipeline_inputs_test PRIVATE fastllm)
+    fastllm_add_checked_test(qwen4_pipeline_inputs qwen4_pipeline_inputs_test
+        "PASS owned MTP candidate inputs" 30)
+    set_tests_properties(qwen4_pipeline_inputs PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=")
+
+    add_executable(qwen4_stage1_commit_test test/basic/test_qwen4_stage1_commit.cpp)
+    target_link_libraries(qwen4_stage1_commit_test PRIVATE fastllm)
+    fastllm_add_checked_test(qwen4_stage1_commit qwen4_stage1_commit_test
+        "PASS stage 1 rejected suffix" 30)
+    set_tests_properties(qwen4_stage1_commit PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=")
+
+    add_executable(qwen4_pipeline_warmup_test test/basic/test_qwen4_pipeline_warmup.cpp)
+    target_link_libraries(qwen4_pipeline_warmup_test PRIVATE fastllm)
+    fastllm_add_checked_test(qwen4_pipeline_warmup qwen4_pipeline_warmup_test
+        "PASS PP2 warmup requires executable greedy MTP" 30)
+    set_tests_properties(qwen4_pipeline_warmup PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=")
+
+    add_executable(qwen4_streaming_norm_test test/basic/test_qwen4_streaming_norm.cpp)
+    target_link_libraries(qwen4_streaming_norm_test PRIVATE fastllm)
+    fastllm_add_checked_test(qwen4_streaming_norm qwen4_streaming_norm_test
+        "PASS streamed MTP/PLE norm values" 30)
+    set_tests_properties(qwen4_streaming_norm PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=")
+
+    add_executable(streaming_load_budget_test test/basic/test_streaming_load_budget.cpp)
+    target_include_directories(streaming_load_budget_test PRIVATE include)
+    target_compile_features(streaming_load_budget_test PRIVATE cxx_std_17)
+    target_link_libraries(streaming_load_budget_test PRIVATE Threads::Threads)
+    add_test(NAME streaming_load_budget COMMAND streaming_load_budget_test)
 
     add_executable(qwen35_paged_cache_test test/basic/test_qwen35_paged_cache.cpp)
     add_test(NAME qwen35_paged_cache COMMAND qwen35_paged_cache_test)
@@ -3731,6 +3978,58 @@ endif()
 
 add_library(fastllm_tools SHARED tools/src/pytools.cpp)
 target_link_libraries(fastllm_tools PRIVATE fastllm)
+if (FASTLLM_DIAGNOSTIC_SYMBOLS AND NOT MSVC)
+    target_compile_options(fastllm_tools PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-g1>)
+endif()
+
+# Python serving changes must reach the packaged tools directory even when the
+# native fastllm_tools shared library is already up to date.  Keep the
+# P-State controller and its server integration as explicit build outputs.
+set(FASTLLM_PSTATE_PYTOOLS_DIR "${CMAKE_BINARY_DIR}/tools/ftllm")
+set(FASTLLM_PSTATE_PYTOOLS_OUTPUTS
+    "${FASTLLM_PSTATE_PYTOOLS_DIR}/llm.py"
+    "${FASTLLM_PSTATE_PYTOOLS_DIR}/server.py"
+    "${FASTLLM_PSTATE_PYTOOLS_DIR}/pstate_controller.py"
+    "${FASTLLM_PSTATE_PYTOOLS_DIR}/request_progress.py"
+    "${FASTLLM_PSTATE_PYTOOLS_DIR}/request_diagnostics.py"
+    "${FASTLLM_PSTATE_PYTOOLS_DIR}/terminal_colorizer.py"
+    "${FASTLLM_PSTATE_PYTOOLS_DIR}/openai_server/fastllm_completion.py")
+add_custom_command(
+    OUTPUT ${FASTLLM_PSTATE_PYTOOLS_OUTPUTS}
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${FASTLLM_PSTATE_PYTOOLS_DIR}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${FASTLLM_PSTATE_PYTOOLS_DIR}/openai_server"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/tools/fastllm_pytools/llm.py"
+            "${FASTLLM_PSTATE_PYTOOLS_DIR}/llm.py"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/tools/fastllm_pytools/server.py"
+            "${FASTLLM_PSTATE_PYTOOLS_DIR}/server.py"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/tools/fastllm_pytools/pstate_controller.py"
+            "${FASTLLM_PSTATE_PYTOOLS_DIR}/pstate_controller.py"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/tools/fastllm_pytools/request_diagnostics.py"
+            "${FASTLLM_PSTATE_PYTOOLS_DIR}/request_diagnostics.py"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/tools/fastllm_pytools/request_progress.py"
+            "${FASTLLM_PSTATE_PYTOOLS_DIR}/request_progress.py"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/tools/fastllm_pytools/terminal_colorizer.py"
+            "${FASTLLM_PSTATE_PYTOOLS_DIR}/terminal_colorizer.py"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/tools/fastllm_pytools/openai_server/fastllm_completion.py"
+            "${FASTLLM_PSTATE_PYTOOLS_DIR}/openai_server/fastllm_completion.py"
+    DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/tools/fastllm_pytools/llm.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tools/fastllm_pytools/server.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tools/fastllm_pytools/pstate_controller.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tools/fastllm_pytools/request_progress.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tools/fastllm_pytools/request_diagnostics.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tools/fastllm_pytools/terminal_colorizer.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tools/fastllm_pytools/openai_server/fastllm_completion.py")
+add_custom_target(fastllm_pstate_pytools_copy
+    DEPENDS ${FASTLLM_PSTATE_PYTOOLS_OUTPUTS})
+add_dependencies(fastllm_tools fastllm_pstate_pytools_copy)
 
 set(BUILD_INFO_USE_CUDA "false")
 set(BUILD_INFO_USE_ROCM "false")
@@ -3756,8 +4055,15 @@ endif()
 if (USE_IVCOREX)
     set(BUILD_INFO_USE_IVCOREX "true")
 endif()
+# Provenance is recorded at configure time; runtime does not invoke Git.
+execute_process(COMMAND git rev-parse HEAD WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+                OUTPUT_VARIABLE FASTLLM_BUILD_COMMIT OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+if (NOT FASTLLM_BUILD_COMMIT)
+    set(FASTLLM_BUILD_COMMIT "unknown")
+endif()
+string(TIMESTAMP FASTLLM_BUILD_CONFIGURED_UTC "%Y-%m-%dT%H:%M:%SZ" UTC)
 file(WRITE ${CMAKE_BINARY_DIR}/build_info.json
-"{\n  \"USE_CUDA\": ${BUILD_INFO_USE_CUDA},\n  \"USE_ROCM\": ${BUILD_INFO_USE_ROCM},\n  \"USE_NUMAS\": ${BUILD_INFO_USE_NUMAS},\n  \"USE_TFACC\": ${BUILD_INFO_USE_TFACC},\n  \"USE_TOPS\": ${BUILD_INFO_USE_TOPS},\n  \"USE_IVCOREX\": ${BUILD_INFO_USE_IVCOREX}\n}\n")
+"{\n  \"source_commit\": \"${FASTLLM_BUILD_COMMIT}\",\n  \"configured_utc\": \"${FASTLLM_BUILD_CONFIGURED_UTC}\",\n  \"cuda_architectures\": \"${CMAKE_CUDA_ARCHITECTURES}\",\n  \"USE_CUDA\": ${BUILD_INFO_USE_CUDA},\n  \"USE_ROCM\": ${BUILD_INFO_USE_ROCM},\n  \"USE_NUMAS\": ${BUILD_INFO_USE_NUMAS},\n  \"USE_TFACC\": ${BUILD_INFO_USE_TFACC},\n  \"USE_TOPS\": ${BUILD_INFO_USE_TOPS},\n  \"USE_IVCOREX\": ${BUILD_INFO_USE_IVCOREX}\n}\n")
 
 if (${CMAKE_HOST_WIN32})
     add_custom_command(

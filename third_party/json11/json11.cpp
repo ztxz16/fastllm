@@ -198,6 +198,10 @@ namespace json11 {
         m_ptr->dump(out);
     }
 
+    void Json::dump_compact(string &out) const {
+        m_ptr->dump_compact(out);
+    }
+
 /* * * * * * * * * * * * * * * * * * * *
  * Value wrappers
  */
@@ -225,6 +229,8 @@ namespace json11 {
 
         const T m_value;
         void dump(string &out) const override { json11::dump(m_value, out); }
+        // 紧凑输出：标量本身无空白，默认复用 dump；容器在 JsonArray/JsonObject 里重写。
+        void dump_compact(string &out) const override { json11::dump(m_value, out); }
     };
 
     class JsonDouble final : public Value<Json::NUMBER, double> {
@@ -274,6 +280,17 @@ namespace json11 {
     public:
         explicit JsonArray(const Json::array &value) : Value(value) {}
         explicit JsonArray(Json::array &&value)      : Value(move(value)) {}
+        // 与 dump()+去空白逐字节等价：无换行/缩进，分隔符 ','。
+        void dump_compact(string &out) const override {
+            out += "[";
+            bool first = true;
+            for (const auto &value : m_value) {
+                if (!first) out += ",";
+                value.dump_compact(out);
+                first = false;
+            }
+            out += "]";
+        }
     };
 
     class JsonObject final : public Value<Json::OBJECT, Json::object> {
@@ -282,6 +299,22 @@ namespace json11 {
     public:
         explicit JsonObject(const Json::object &value) : Value(value) {}
         explicit JsonObject(Json::object &&value)      : Value(move(value)) {}
+        void dump_compact(string &out) const override {
+            out += "{";
+            vector<string> keys;
+            for (const auto &kv : m_value) keys.push_back(kv.first);
+            sort(keys.begin(), keys.end(), tfdlCompareKey);   // 与 dump() 同一键序
+            bool first = true;
+            for (const auto key : keys) {
+                if (!first) out += ",";
+                const auto &kv = *m_value.find(key);
+                json11::dump(kv.first, out);                  // 与 dump() 同一转义
+                out += ":";
+                kv.second.dump_compact(out);
+                first = false;
+            }
+            out += "}";
+        }
     };
 
     class JsonNull final : public Value<Json::NUL, NullStruct> {

@@ -9,7 +9,7 @@ import threading
 import time
 import uvicorn
 from fastapi import Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from .openai_server.protocal.openai_protocol import *
@@ -23,6 +23,7 @@ from .util import make_normal_parser
 from .util import add_server_args
 from .util import apply_page_size_default
 from .startup_progress import StartupProgressReporter
+from .pstate_controller import PStateAccessLogMiddleware, install_pstate_access_log_filter
 global fastllm_completion
 global fastllm_embed
 global fastllm_reranker
@@ -30,6 +31,7 @@ global fastllm_model
 global dev_mode_enabled
 global api_thread_pool_workers
 global request_executor
+global pstate_controller
 
 # Adapted from: https://github.com/sgl-project/sglang/blob/v0.4.1/python/sglang/srt/utils.py#L630
 def set_ulimit(target_soft_limit: int = 65535):
@@ -83,6 +85,67 @@ fastllm_model:FastLLmModel
 dev_mode_enabled:bool = False
 api_thread_pool_workers:int = 32
 request_executor = None
+pstate_controller = None
+
+_PSTATE_INFERENCE_PATHS = frozenset({
+    "/v1/chat/completions",
+    "/v1/completions",
+    "/v1/responses",
+    "/v1/response",
+    "/v1/messages",
+    "/v1/embed",
+    "/v1/rerank",
+})
+_request_activity = None
+
+
+def _get_request_activity():
+    global _request_activity
+    if _request_activity is None:
+        from .pstate_controller import RequestActivity
+        _request_activity = RequestActivity()
+    return _request_activity
+
+
+@app.middleware("http")
+async def pstate_activity_middleware(request: Request, call_next):
+    tracked = request.method == "POST" and request.url.path in _PSTATE_INFERENCE_PATHS
+    activity = _get_request_activity() if tracked else None
+    if activity is not None:
+        activity.begin()
+        controller = globals().get("pstate_controller")
+        if controller is not None:
+            controller.notify_request()
+    try:
+        response = await call_next(request)
+    except BaseException:
+        if activity is not None:
+            activity.end()
+        raise
+    if activity is None:
+        return response
+
+    # StreamingResponse returns before the body is drained. Keep the active
+    # count until the final chunk so a long stream cannot be classified idle.
+    body_iterator = getattr(response, "body_iterator", None)
+    if body_iterator is None:
+        activity.end()
+        return response
+
+    async def tracked_body():
+        try:
+            async for chunk in body_iterator:
+                yield chunk
+        finally:
+            activity.end()
+
+    response.body_iterator = tracked_body()
+    return response
+
+
+@app.get("/metrics")
+async def pstate_metrics():
+    return PlainTextResponse(_get_request_activity().render_prometheus())
 
 def _prewarm_request_executor(executor, workers: int) -> int:
     started = 0
@@ -114,6 +177,43 @@ class FastLLMUvicornServer(uvicorn.Server):
         super().__init__(config)
         self.startup_progress = startup_progress
 
+    async def shutdown(self, sockets=None):
+        # SSD 持久前缀缓存：关停前等待后台提交完成（默认 300 秒，可配置）。
+        await super().shutdown(sockets)
+        completion = globals().get("fastllm_completion")
+        model = getattr(completion, "model", None)
+        # §13 第 2 条：关闭准入必须在排空之前（第 1 条已由 super().shutdown() 完成）。
+        if model is not None and hasattr(model, "close_persistent_prefix_admission"):
+            model.close_persistent_prefix_admission()
+        if model is not None and hasattr(model, "wait_persistent_prefix_cache"):
+            # Large, valid workloads can have hundreds of accepted v4 writes
+            # still in the store pipeline when the API receives SIGTERM.  A
+            # fixed 30-second budget turns that normal backlog into a false
+            # loss report and exits before the accepted tickets are durable.
+            # Keep the timeout bounded and configurable for deployment; the
+            # default covers the production-sized drain while preserving the
+            # fail-closed exit on a genuinely stuck pipeline.
+            try:
+                drain_timeout_s = max(
+                    1.0, float(os.environ.get("FASTLLM_PREFIX_CACHE_DRAIN_TIMEOUT_S", "300")))
+            except ValueError:
+                drain_timeout_s = 300.0
+            logging.info("SSD prefix cache drain started (timeout=%ss)", drain_timeout_s)
+            finished = await asyncio.to_thread(model.wait_persistent_prefix_cache,
+                                                drain_timeout_s)
+            if not finished:
+                # S1-3 修复（2026-10-02，对标审计 P0-C）：关停排空超时**不得静默成功**。
+                # 旧代码只打 warning，且进程照常以 0 退出 ⇒ 编排层看不出"缓存里还有已受理未落盘的数据"。
+                # 现在：打 ERROR 日志 + 注册退出码 3（atexit 里 os._exit，避免与 uvicorn 的退出流程打架），
+                # 让容器/编排层能识别"这次关停不完整"。
+                logging.error("SSD prefix cache drain timed out; only committed checkpoints survive restart "
+                              "(process will exit with code 3)")
+                import atexit
+                import os as _os
+                atexit.register(lambda: _os._exit(3))
+            else:
+                logging.info("SSD prefix cache drain complete")
+
     async def startup(self, sockets = None):
         global request_executor
         loop = asyncio.get_running_loop()
@@ -131,6 +231,9 @@ class FastLLMUvicornServer(uvicorn.Server):
         if self.started and not self.should_exit:
             from .llm import disable_cuda_malloc
             disable_cuda_malloc()
+            controller = globals().get("pstate_controller")
+            if controller is not None:
+                controller.mark_ready()
             if self.startup_progress is not None:
                 self.startup_progress.ready()
 
@@ -271,6 +374,51 @@ def apply_default_generation_config_overrides(model, args):
     if overrides:
         logging.info("Override default generation config from cli: %s", overrides)
 
+
+def _reset_pstate_before_load():
+    """FASTLLM_PSTATE_RESET_AT_START=1 (default off): return the GPUs to driver-auto
+    (the controller's own "active" P-State) before the model loads.
+
+    The controller starts only after the model is ready, and nvidia-pstated (the
+    design it follows) restores P-State 16 only on a clean exit. A previous process
+    that ended while idle can leave the GPUs forced to P8 (645 MHz on Tesla T10);
+    load and warmup then run at that clock: start 205-221 s instead of 96-104 s and
+    a different greedy output for the whole process (chain73 P1 vs P2)."""
+
+    if os.environ.get("FASTLLM_PSTATE_RESET_AT_START", "") != "1":
+        return
+    from .pstate_controller import NvApiPStateBackend, PStateConfig
+
+    config = PStateConfig.from_env()
+    if config is None:
+        return
+    backend = NvApiPStateBackend(config.gpu_ids)
+    try:
+        backend.set_pstate(config.high)
+    finally:
+        backend.close()
+    logging.info("FastLLM P-State reset before model load: gpus=%s pstate=%d",
+                 config.gpu_ids, config.high)
+
+
+def _start_pstate_controller(port: int):
+    """Start the opt-in driver controller after the model is ready."""
+
+    from .pstate_controller import PStateConfig, PStateController
+
+    config = PStateConfig.from_env(f"http://127.0.0.1:{port}/metrics")
+    if config is None:
+        return None
+    completion = globals().get("fastllm_completion")
+    native_model = getattr(completion, "model", None)
+    provider = getattr(native_model, "next_observation_sequence", None)
+    controller = PStateController(
+        config, sequence_provider=provider if callable(provider) else None)
+    if controller.start():
+        return controller
+    return None
+
+
 def _fastllm_server(args, startup_progress):
     if args.api_key:
         @app.middleware("http")
@@ -309,6 +457,7 @@ def _fastllm_server(args, startup_progress):
     # explicitly enabled; ordinary serving must not pay the fixed frozen-pool
     # reserve merely because it uses the API frontend.
     os.environ["FASTLLM_CUDA_SERVING_WARMUP"] = "1"
+    _reset_pstate_before_load()
     from .util import make_normal_llm_model
     model = make_normal_llm_model(args, startup_progress = startup_progress)
     apply_default_generation_config_overrides(model, args)
@@ -341,9 +490,33 @@ def _fastllm_server(args, startup_progress):
         api_thread_pool_workers = default_workers
     api_thread_pool_workers = max(1, min(256, api_thread_pool_workers))
     set_ulimit()
-    config = uvicorn.Config(app, host = args.host, port = args.port)
+    # RCA 2（2026-10-03，真机 merge-verify-a1 实证）：uvicorn 默认 `timeout_graceful_shutdown=None`
+    # ⇒ `await super().shutdown()` 会**无限期**等在途请求连接；而"客户端是否断开"是**逐 token**
+    # 检查的（fastllm_completion.py 的 is_disconnected），一旦生成长时间不出 token，
+    # 关服就会一直挂住并继续占显存。实测：SIGTERM 14:49:00 → Finished 14:52:37 = **217s**。
+    # 业界做法就是给 uvicorn 设一个**有界的优雅关服超时**：到点取消在途任务，继续 lifespan
+    # shutdown 并退出（客户端会收到中断，但进程必然释放显存）。
+    # 可用环境变量覆盖（秒），便于现场调配；默认 20s。
+    try:
+        graceful_shutdown_timeout = int(os.getenv("FASTLLM_SHUTDOWN_GRACEFUL_TIMEOUT_S", "20"))
+    except ValueError:
+        graceful_shutdown_timeout = 20
+    # Wrap outside FastAPI's middleware stack: Uvicorn emits access logs
+    # synchronously when this outer ASGI send forwards response headers.
+    config = uvicorn.Config(PStateAccessLogMiddleware(app), host = args.host, port = args.port,
+                            timeout_graceful_shutdown=max(1, graceful_shutdown_timeout))
+    install_pstate_access_log_filter()
     startup_progress.progress("server_starting", 1, 1)
-    FastLLMUvicornServer(config, startup_progress = startup_progress).run()
+    global pstate_controller
+    pstate_controller = None
+    try:
+        pstate_controller = _start_pstate_controller(args.port)
+        FastLLMUvicornServer(config, startup_progress = startup_progress).run()
+    finally:
+        controller = pstate_controller
+        pstate_controller = None
+        if controller is not None:
+            controller.stop()
 
 def fastllm_server(args):
     startup_progress = StartupProgressReporter(

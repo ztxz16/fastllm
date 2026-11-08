@@ -1,4 +1,5 @@
 #include "fastllm-attention-common.cuh"
+#include "utils/prefix_cache_logging.h"
 
 template <int BN, int BM, int BK>
 __global__ void HalfFC(

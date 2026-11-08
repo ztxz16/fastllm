@@ -47,6 +47,7 @@ MODEL_NOTES = {
     "page_size": ("分页缓存每页的 token 数；-1 采用后端默认值，multicuda 默认 16。通常保留默认，修改时需要考虑后端支持。", "16"),
     "prefix_cache": ("带值的开关 true/false，复用相同输入前缀的缓存；留空不覆盖 FASTLLM_PREFIX_CACHE 环境设置。", "true"),
     "prefix_cache_snapshot_interval_pages": ("按多少页保存一次前缀缓存快照；-1 不覆盖对应环境设置。更密集的快照需要额外缓存管理开销。", "16"),
+    "prefix_cache_log_level": ("默认 info，只显示简洁的缓存配置和复用结果；debug 输出每个检查点的性能与排队诊断；off 关闭普通缓存日志。警告和错误始终保留。环境变量 FASTLLM_PREFIX_CACHE_LOG_LEVEL 可设置默认级别，命令行优先。", "info"),
     "prefix_cache_snapshot_max_per_request": ("每个请求最多保留的前缀快照数；-1 不覆盖对应环境设置。", "4"),
     "prefix_cache_snapshot_max_records": ("全局前缀快照记录数上限；-1 不覆盖对应环境设置。", "128"),
     "gpu_mem_ratio": ("运行时预算使用的 GPU 显存比例，例如 0.9 为 90%。这不是进程显存的硬隔离配额；降低它可以给其他显存用途留余量。", "0.85"),
@@ -153,7 +154,7 @@ GROUPS = {
     "precision": "dtype atype moe_dtype moe_atype enable_thinking".split(),
     "memory": "kv_cache_dtype kv_cache_limit max_context_length rope_scaling tokens page_size gpu_mem_ratio max_batch chunked_prefill_size cuda_slab image_embedding_cache".split(),
     "moe": "moe_device moe_device_layers moe_cuda_cache moe_experts cuda_shared_expert ngram_device".split(),
-    "cache": "cache_history cache_fast prefix_cache prefix_cache_snapshot_interval_pages prefix_cache_snapshot_max_per_request prefix_cache_snapshot_max_records".split(),
+    "cache": "cache_history cache_fast prefix_cache prefix_cache_log_level prefix_cache_snapshot_interval_pages prefix_cache_snapshot_max_per_request prefix_cache_snapshot_max_records".split(),
     "speculative": "mtp dspark speculative_algorithm speculative_draft_model_path draft_tokens speculative_num_draft_tokens speculative_dspark_block_size speculative_dspark_confidence_threshold".split(),
 }
 

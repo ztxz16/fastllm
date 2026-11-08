@@ -8,12 +8,20 @@
 #include "contextconfig.h"
 #include "baseblock.h"
 #include "template.h"
+#include "utils/multimodal_prefix_cache.h"
+#include "utils/native_generation_metrics.h"
+#include "utils/request_resource_ledger.h"
 #include "utils/prefill_batch.h"
 
 #include <atomic>
+#include <chrono>
 #include <thread>
 #include <mutex>
 #include <condition_variable>
+#include <deque>
+#include <map>
+#include <memory>
+#include <utility>
 
 #ifdef PY_API
 #include "Python.h"
@@ -33,7 +41,11 @@ namespace fastllm {
     using ChatMessages = std::vector <std::pair <std::string, std::string> >;
 
     enum ResponseContextError {
-        ResponseContextErrorNone = 0, ResponseContextErrorPromptTooLong, ResponseContextErrorRuntime
+        ResponseContextErrorNone = 0,
+        ResponseContextErrorPromptTooLong,
+        ResponseContextErrorCapacityUnavailable,
+        ResponseContextErrorForwardFailed,
+        ResponseContextErrorRuntime
     };
 
     class basellm;
@@ -90,18 +102,125 @@ namespace fastllm {
         }
     };
 
+    // One prefix decision record for the three physical tiers. Readiness is
+    // filled from a live tier query, not inferred from an old disk load or a
+    // page that may already have been evicted. Only the scheduler updates it.
+    struct PrefixCacheRecord {
+        enum Component : unsigned { FullAttentionKV = 1, LinearState = 2, SpeculativeState = 4 };
+        enum LoadState : unsigned { Unknown = 0, Loading = 1, Ready = 2,
+                                    Resident = 3, Failed = 4 };
+        enum RuntimeTier : unsigned { TierNone = 0, TierL1 = 1, TierL2 = 2,
+                                      TierMigrating = 3 };
+        enum RuntimeState : unsigned { RuntimeUnknown = 0, RuntimeResident = 1,
+                                       RuntimeReclaimPending = 2,
+                                       RuntimePromotePending = 3,
+                                       RuntimeEvictPending = 4 };
+        enum DurableState : unsigned { DurableNone = 0, DurableWritePending = 1,
+                                       DurableReady = 2, DurableFailed = 3 };
+        std::string key, identity, provenance;
+        int length = 0;
+        unsigned requiredComponents = FullAttentionKV;
+        unsigned gpuComponents = 0, hostComponents = 0, ssdComponents = 0;
+        RuntimeTier runtimeTier = TierNone;
+        RuntimeState runtimeState = RuntimeUnknown;
+        DurableState durableState = DurableNone;
+        uint64_t runtimeLease = 0;
+        LoadState loadingState = Unknown;
+        bool gpuReady() const { return (gpuComponents & requiredComponents) == requiredComponents; }
+        bool hostReady() const { return (hostComponents & requiredComponents) == requiredComponents; }
+        bool ssdReady() const { return (ssdComponents & requiredComponents) == requiredComponents; }
+    };
+
+    struct PrefixCacheRestoreStatus : PrefixCacheRecord {
+        enum Phase { Unqueried, Reading, Ready, Adopted, Miss, Failed, TimedOut };
+        enum Tier { None, GPU, Host, SSD };
+        Phase phase = Unqueried;
+        Tier tier = None;
+        uint64_t requestId = 0, loadedBytes = 0;
+        int candidateTokens = 0, cachedTokens = 0;
+        double lookupMs = 0, readMs = 0, restoreMs = 0, totalMs = 0;
+        std::string reason;
+    };
+
+    // Request-visible cache accounting. A segment is one source interval;
+    // promotion never creates a second effective hit for the same tokens.
+    struct PrefixCacheObservationSegment {
+        std::string sourceTier = "unknown";
+        std::string promotedTo = "NONE";
+        int sourceTokens = 0;
+        int effectiveReusedTokens = 0;
+        double lookupMs = -1.0;
+        double restoreMs = -1.0;
+        double readMiBS = -1.0;
+        double restoreTokensS = -1.0;
+    };
+
+    struct ResponseObservation {
+        uint64_t nativeHandle = 0;
+        int cachedInputTokens = 0;
+        int missedInputTokens = 0;
+        int outputTokens = 0;
+        std::vector<PrefixCacheObservationSegment> cacheSegments;
+    };
+
+    // A-3: per-request page-owner lease. ResponseContext itself is a raw
+    // new/delete object and cannot own a shared lifetime, so this separate
+    // shared object is the stable owner that keeps source pages alive until a
+    // background spill copy reaches a terminal state. Its generation is a
+    // request-lease generation, never a page or copy generation.
+    struct PagedPageOwnerLease {
+        uint64_t requestId = 0;
+        uint64_t generation = 0;
+        std::atomic<bool> cancelled{false};
+    };
+
     struct ResponseContext {
+        // Integer handle is the native request correlation id used by the
+        // scheduler logs.  Python adds its public request id to the same
+        // lifecycle, so concurrent requests remain distinguishable.
+        uint64_t requestId = 0;
+        // A-3 owner identity: created once per request, shared with every page
+        // this request records, and held by save jobs until they terminate.
+        std::shared_ptr<PagedPageOwnerLease> pagedPageOwnerLease;
         std::shared_ptr<PDPending> pdPending;
         uint64_t generation = 0; // Distinguish a reused handle while a consumer waits.
         std::unique_ptr<PrefillPrefixPreview> prefillPreview;
         PrefillBatchPolicy::Clock::time_point queuedAt = PrefillBatchPolicy::Clock::now();
         bool isEnding = false; // 代表这个请求已经处理完成了，不需要再forward了，但生成的token可能还没有被fetch
-        bool isAbort = false; // 代表这个请求被中断了，也就是说不会再有人来fetch它了，那么推理完之后就可以删除这个请求了
+        std::shared_ptr<std::atomic<bool>> persistentWriteFailed;
+        std::atomic<int> persistentCheckpointState{0};
+        bool finishAfterPersistentCheckpoint = false;
+        // Lifetime hold is independent from the request's real terminal intent.
+        bool persistentCheckpointLifetimeHold = false;
+        bool persistentCheckpointTerminalIntent = false; // HOST: 1=Deferred,2=Queued,3=Failed,4=Cancelled
+        std::shared_ptr<void> persistentCheckpointOwner; // HOST mutex protects immutable snapshot+Pages
+        uint64_t persistentCheckpointGeneration = 0;
+        int persistentCheckpointLength = 0;
+        bool schedulerSlotReleased = false;
+        std::atomic<bool> isAbort{false}; // 代表这个请求被中断了，也就是说不会再有人来fetch它了，那么推理完之后就可以删除这个请求了
         
         std::vector <int> allTokens;
         std::vector <std::pair <Data, Data> > pastKeyValues;
         std::vector <int> currentTokens;
         std::map <std::string, std::vector <Data*> > multimodalInput;
+        std::vector<MultimodalPrefixSpan> multimodalPrefixSpans;
+        // BP3: generated visual features remain request-owned across one-chunk rounds.
+        uint64_t multimodalPrefillGeneration = 0;
+        bool multimodalPrefillEmbeddingsOwned = false;
+        std::vector<std::string> prefixCachePageKeys;
+        // ---- SSD 持久前缀缓存所需字段（移植自源仓库 basellm.h:47-52）----
+        std::vector<int> prefixCachePositionIds;
+        std::vector<std::string> prefixCacheBasePageKeys;
+        std::string prefixCacheProvenance;
+        bool HasMultimodalPrefixIdentity() const {
+            return !multimodalInput.empty() || !multimodalPrefixSpans.empty();
+        }
+        bool CanUsePagedPrefixCache() const {
+            return !HasMultimodalPrefixIdentity() || !prefixCachePageKeys.empty();
+        }
+        const std::vector<std::string> *PrefixCachePageKeys() const {
+            return HasMultimodalPrefixIdentity() ? &prefixCachePageKeys : nullptr;
+        }
         std::queue <int> resultTokenQueue;
         std::queue <std::vector <float>*> resultLogits;
         GenerationConfig generationConfig;
@@ -110,11 +229,44 @@ namespace fastllm {
         std::string toolCallConstraintGeneratedText;
 
         int preTokens = 0;
+        // FASTLLM_QWEN35_BATCH_PREFILL：尚未预填的 prompt token 数。
+        // 仅在该开关打开时由 Qwen3.5 调度器使用；默认 0 时不参与任何判断。
+        int prefillRemain = 0;
+        // Scheduler-owned: true until the legacy media suffix commits its last chunk.
+        bool legacyMultimodalPrefill = false;
         int curTokens = 0;
         int inputTokens = 0;
         std::map <std::string, int> intParams;
 
         int cacheLen = 0;
+        PrefixCacheRestoreStatus prefixRestore;
+
+        // One-second progress reporter state.  These counters are diagnostic
+        // only and never participate in scheduling or cache identity.
+        std::chrono::steady_clock::time_point progressLastReport;
+        int progressPrefillTokens = 0;
+        int progressDecodeTokens = 0;
+        NativeGenerationMetrics nativeGeneration;
+        // BP2 scheduler clocks are observation-only and are sampled under the
+        // scheduler dictionary lock; they never participate in admission/cache identity.
+        uint64_t observabilityArrivalNs = 0;
+        uint64_t observabilityEnqueueNs = 0;
+        uint64_t observabilityReadyNs = 0;
+        uint64_t observabilitySafeBoundaryNs = 0;
+        uint64_t observabilityAdmitNs = 0;
+        // Shared so RemoveHandle can sample after this object is destroyed.
+        std::shared_ptr<RequestResourceLedger> resourceLedger;
+        uint64_t nativeRequestGeneration = 0;
+        bool resourceObservationError = false;
+        int progressL1Tokens = 0;
+        int progressL2Tokens = 0;
+        int progressL3Tokens = 0;
+        double progressPrefixLookupMs = 0.0;
+        double progressPrefixRestoreMs = 0.0;
+        double progressSsdReadMiBS = 0.0;
+        double progressSsdRestoreTokensS = 0.0;
+        double progressVisionSsdMiBS = 0.0;
+        std::vector<PrefixCacheObservationSegment> cacheSegments;
 
         ~ResponseContext();
 
@@ -122,6 +274,15 @@ namespace fastllm {
         void TryRecord(basellm *model);
         void TryRecordPagedCache(basellm *model);
     };
+
+    void RecordRequestNativeCommit(ResponseContext *context, bool prompt);
+    void RecordRequestNativeStep(ResponseContext *context, bool prompt, bool partial,
+                                 int tokens, uint64_t beginNs, uint64_t endNs,
+                                 uint64_t visionNs = 0);
+    void RecordRequestPrefillProgress(ResponseContext *context, int tokens);
+    void RecordRequestDecodeProgress(ResponseContext *context, int tokens);
+    void ReportRequestProgress(ResponseContext *context, const char *phase,
+                               bool force = false);
 
     struct ResponseContextDict {
         std::mutex locker;
@@ -234,6 +395,22 @@ namespace fastllm {
         std::map<std::string, std::vector<Data*>> dataPtrVectorMap;
     };
 
+    // Asynchronous L1 publication: the forward thread snapshots the checkpoint
+    // (token range + page indices + media keys) and a dedicated worker performs
+    // the trie walk and page-ledger observation, so the next GPU chunk starts
+    // immediately. Jobs are flushed before a request's pages are released.
+    struct PagedPublishJobItem {
+        PagedCacheManager *manager = nullptr;
+        std::vector<int> pages;
+        size_t tokenLen = 0;
+    };
+    struct PagedPublishJob {
+        RequestResourceHold requestPending;
+        std::vector<int> tokens;
+        std::shared_ptr<std::vector<std::string> > extraKeys;
+        std::vector<PagedPublishJobItem> items;
+    };
+
     class basellm {
     public:
         basellm() {};
@@ -298,6 +475,20 @@ namespace fastllm {
 
         // 一组提前读取的权重读取结束，模型可统一删除已消费的源权重占位。
         virtual void OnWeightLoadGroupFinished() {}
+
+        // Optional bounded source-tensor path. A model may ask the loader to
+        // read a paired tensor in small byte ranges instead of calling the
+        // whole-tensor CreateBuffer path. The default keeps every existing
+        // model unchanged.
+        virtual bool WantsChunkedWeight(const std::string &) const { return false; }
+        virtual std::string ChunkedWeightPair(const std::string &) const { return {}; }
+        virtual uint64_t ChunkedWeightBytes(const std::string &, uint64_t totalBytes) const {
+            return totalBytes;
+        }
+        virtual bool ConsumeWeightChunk(const std::string &,
+                const std::vector<uint64_t> &, const std::string &, uint64_t,
+                const uint8_t *, size_t) { return false; }
+        virtual void FinishChunkedWeight(const std::string &) {}
 
         // 所有权重完成加载后，允许模型做收尾合成。
         virtual void OnModelWeightsLoaded() {}
@@ -394,6 +585,13 @@ namespace fastllm {
                 const LastTokensManager &lastTokens = LastTokensManager(),
                 std::vector <std::vector <float>*> *logits = nullptr);
 
+        virtual std::vector<int> ForwardMultimodalContext(
+                ResponseContext *context, const Data &inputIds,
+                const Data &attentionMask, const Data &positionIds,
+                const GenerationConfig &generationConfig,
+                const LastTokensManager &lastTokens,
+                std::vector<std::vector<float>*> *logits);
+
         // 是否需要生成AttentionMask
         virtual bool NeedAttentionMask(int qlen, int klen);
 
@@ -447,6 +645,11 @@ namespace fastllm {
 
         virtual bool GetResponseStatistics(int handleId, int &cachedInputTokens,
                                            int &missedInputTokens, int &outputTokens);
+        virtual bool GetResponseObservation(int handleId, ResponseObservation &observation);
+        virtual std::map<std::string, std::string> GetCacheCapacityObservation() {
+            return {{"l1_capacity_state", "unsupported"}, {"l2_capacity_state", "unsupported"},
+                    {"ssd_capacity_state", "unsupported"}};
+        }
 
         virtual void AbortResponse(int handleId); // 中断handleId的请求
 
@@ -558,8 +761,58 @@ namespace fastllm {
         virtual PagedCacheManager* GetPagedKVCacheManager(int layerIndex, bool isKey) const;
         virtual std::vector<std::pair<int, PagedCacheManager*> > GetPagedKVCacheManagers(int layerIndex, bool isKey) const;
         virtual bool TryRecordPagedPrefixCacheExtra(ResponseContext *context);
+        virtual void RecordPagedPrefixProducerEvents();
         virtual int QueryPagedPrefixCacheExtra(ResponseContext *context, int maxCachedLen) const;
         virtual bool RestorePagedPrefixCacheExtra(ResponseContext *context, int cachedLen) const;
+
+        // A-3 page-owner registry. Identity is captured at Record time, when
+        // the request that actually wrote the page is known; the recycle path
+        // may only consume what was recorded here, never guess a request.
+        void RegisterPagedPageOwners(PagedCacheManager *manager,
+                                     const std::vector<int> &pages,
+                                     const PagedCacheManager::RecycleRequestIdentity &identity);
+        bool PeekPagedPageOwner(PagedCacheManager *manager, int pageIndex,
+                                PagedCacheManager::RecycleRequestIdentity &identity);
+        bool ErasePagedPageOwner(
+            PagedCacheManager *manager, int pageIndex,
+            const PagedCacheManager::RecycleRequestIdentity &expected);
+        bool TakePagedPageOwner(PagedCacheManager *manager, int pageIndex,
+                                PagedCacheManager::RecycleRequestIdentity &identity);
+        struct PagedPageOwnerRecord {
+            PagedCacheManager::RecycleRequestIdentity identity;
+            long long pageTimestamp = 0;
+        };
+        std::mutex pagedPageOwnerMutex;
+        std::map<std::pair<PagedCacheManager *, int>, PagedPageOwnerRecord>
+            pagedPageOwners;
+
+        // ---- asynchronous L1 publication (block-tail off the forward thread) ----
+        void EnqueuePagedPublish(PagedPublishJob job);
+        void FlushPagedPublish();
+        void StopPagedPublish();
+        void RunPagedPublish();
+
+        std::thread pagedPublishThread;
+        std::mutex pagedPublishMutex;
+        std::condition_variable pagedPublishCv;
+        std::condition_variable pagedPublishDrainedCv;
+        std::deque<PagedPublishJob> pagedPublishQueue;
+        uint64_t pagedPublishEnqueued = 0;
+        uint64_t pagedPublishCompleted = 0;
+        bool pagedPublishStop = false;
+
+        // ---- SSD 持久前缀缓存虚接口（移植自源仓库；默认空实现，由 Qwen3.5 覆写）----
+        virtual void InitializePersistentPrefixCache() {}
+        virtual void PreparePersistentPrefixCache(ResponseContext *context) {}
+        virtual bool PersistentPrefixRestorePending(const ResponseContext *context) const { return false; }
+        virtual void ResetPersistentPrefixRestore(ResponseContext *context) {
+            if (context) context->prefixRestore = PrefixCacheRestoreStatus{};
+        }
+        virtual void OnPersistentPrefixRestored(ResponseContext *context) {}
+        virtual bool WaitPersistentPrefixCache(int timeoutMs) { return true; }
+        // §13 第 2 条：关停时先关闭准入，再做排空，避免排空期间产生新检查点。
+        virtual void ClosePersistentPrefixAdmission() {}
+        virtual std::string PersistentPrefixCacheStatistics() const { return "{}"; }
 
         virtual void PrepareToolCallConstraint(ResponseContext *context, GenerationConfig &generationConfig);
 

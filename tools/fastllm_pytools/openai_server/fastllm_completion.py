@@ -4,6 +4,7 @@ import binascii
 import copy
 import contextvars
 import inspect
+import functools
 import io
 import json
 import logging
@@ -33,11 +34,56 @@ from .protocal.anthropic_protocol import *
 from .structured_output import (prepare_structured_output,
                                 responses_response_format,
                                 validate_structured_output)
+from ..request_progress import RequestProgressReporter, observability_mode
+
+def _observe_completion_lifecycle(function):
+    """Always close reporter/ownership, including cancellation and generator close."""
+    signature = inspect.signature(function)
+    if inspect.isasyncgenfunction(function):
+        @functools.wraps(function)
+        async def stream(self, *args, **kwargs):
+            bound = signature.bind(self, *args, **kwargs)
+            request_id, handle = bound.arguments["request_id"], bound.arguments.get("handle")
+            terminal = "incomplete"
+            iterator = function(self, *args, **kwargs)
+            try:
+                async for item in iterator:
+                    yield item
+                terminal = "ok"
+            except BaseException as error:
+                terminal = "cancelled" if isinstance(error, (asyncio.CancelledError, GeneratorExit)) else "error"
+                self._record_request_error(request_id, error)
+                raise
+            finally:
+                try:
+                    await iterator.aclose()
+                finally:
+                    self._finish_request_observation(request_id, handle, terminal)
+        return stream
+    @functools.wraps(function)
+    async def full(self, *args, **kwargs):
+        bound = signature.bind(self, *args, **kwargs)
+        request_id, handle = bound.arguments["request_id"], bound.arguments.get("handle")
+        terminal = "incomplete"
+        try:
+            result = await function(self, *args, **kwargs)
+            terminal = "error" if isinstance(result, ErrorResponse) else "ok"
+            return result
+        except BaseException as error:
+            terminal = "cancelled" if isinstance(error, asyncio.CancelledError) else "error"
+            self._record_request_error(request_id, error)
+            if isinstance(error, (PromptTooLongError, CapacityUnavailableError)):
+                self._release_conversation_handle(request_id, handle)
+            raise
+        finally:
+            self._finish_request_observation(request_id, handle, terminal)
+    return full
+
 
 try:
-    from ..generation_errors import PromptTooLongError
+    from ..generation_errors import PromptTooLongError, CapacityUnavailableError
 except ImportError:
-    from generation_errors import PromptTooLongError
+    from generation_errors import PromptTooLongError, CapacityUnavailableError
 
 try:
     from ..gemma4_multimodal import (
@@ -2403,6 +2449,7 @@ class FastLLmCompletion:
       self,
       handle: int,
       response_statistics: Dict[str, int],
+      request_id: Optional[str] = None,
   ) -> AsyncIterator:
       stream_fn = self.model.stream_response_handle_async
       try:
@@ -2410,20 +2457,26 @@ class FastLLmCompletion:
       except (TypeError, ValueError):
           return stream_fn(handle)
 
+      terminal_callback = {}
+      if request_id is not None and (
+              "on_native_context_released" in parameters or
+              any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values())):
+          terminal_callback["on_native_context_released"] = (
+              lambda: self._release_conversation_handle(request_id, handle))
       statistics_parameter = parameters.get("response_statistics")
       if statistics_parameter is not None:
           if statistics_parameter.kind == inspect.Parameter.POSITIONAL_ONLY:
-              return stream_fn(handle, response_statistics)
+              return stream_fn(handle, response_statistics, **terminal_callback)
           return stream_fn(
-              handle, response_statistics = response_statistics)
+              handle, response_statistics = response_statistics, **terminal_callback)
       if any(parameter.kind == inspect.Parameter.VAR_KEYWORD
              for parameter in parameters.values()):
           return stream_fn(
-              handle, response_statistics = response_statistics)
+              handle, response_statistics = response_statistics, **terminal_callback)
       if any(parameter.kind == inspect.Parameter.VAR_POSITIONAL
              for parameter in parameters.values()):
-          return stream_fn(handle, response_statistics)
-      return stream_fn(handle)
+          return stream_fn(handle, response_statistics, **terminal_callback)
+      return stream_fn(handle, **terminal_callback)
 
   def _chat_usage(
       self,
@@ -3205,9 +3258,12 @@ class FastLLmCompletion:
       finally:
           self._cleanup_temp_paths(media.temp_paths)
       self.conversation_handles[request_id] = handle
+      register = getattr(self.model, "register_request_observation", None)
+      if callable(register):
+          register(handle, request_id)
       response_statistics: Dict[str, int] = {}
       result_generator = self._stream_response_handle_with_statistics(
-          handle, response_statistics)
+          handle, response_statistics, request_id)
 
       emit_reasoning_content = self._uses_tagged_reasoning_response(enable_thinking)
       if request.stream:
@@ -3224,7 +3280,7 @@ class FastLLmCompletion:
                   input_token_len, parser_request,
                   response_statistics = response_statistics,
                   emit_reasoning_content = emit_reasoning_content)
-          except PromptTooLongError as e:
+          except (PromptTooLongError, CapacityUnavailableError) as e:
               self._release_conversation_handle(request_id, handle)
               return self.create_error_response(str(e))
           except ValueError as e:
@@ -3316,6 +3372,8 @@ class FastLLmCompletion:
           return self.create_error_response(str(e))
 
       request_id = f"fastllm-{self.model_name}-{random_uuid()}"
+      request_path = getattr(getattr(raw_request, "url", None), "path",
+                             "/v1/chat/completions")
       
       default_gen = self.model.default_generation_config
       top_p = request.top_p if request.top_p is not None else default_gen['top_p']
@@ -3461,10 +3519,13 @@ class FastLLmCompletion:
           self._cleanup_temp_paths(media.temp_paths)
       # Store the mapping between conversation ID and handle
       self.conversation_handles[request_id] = handle
+      register = getattr(self.model, "register_request_observation", None)
+      if callable(register):
+          register(handle, request_id)
       # logging.info(f"Created conversation: {request_id}, handle: {handle}")
       response_statistics: Dict[str, int] = {}
       result_generator = self._stream_response_handle_with_statistics(
-          handle, response_statistics)
+          handle, response_statistics, request_id)
       # --think 是用户显式指定"在输出前补 <think>\n 起始标签"的开关，
       # 严格按用户意愿执行，与 enable_thinking（是否进入思考模式）解耦。
       need_think_prefix = self.think
@@ -3488,7 +3549,7 @@ class FastLLmCompletion:
                   input_token_len, think = need_think_prefix,
                   emit_reasoning_content = emit_reasoning_content,
                   response_statistics = response_statistics)
-          except PromptTooLongError as e:
+          except (PromptTooLongError, CapacityUnavailableError) as e:
               self._release_conversation_handle(request_id, handle)
               return self.create_error_response(str(e))
           except ValueError as e:
@@ -3499,15 +3560,82 @@ class FastLLmCompletion:
   ) -> bool:
     if handle is None or self.conversation_handles.get(request_id) != handle:
       return False
+    reporter = getattr(self, "_request_reporters", {}).get(request_id)
+    if reporter is not None:
+      reporter.close_native_observation("conversation_handle_released")
     self.conversation_handles.pop(request_id, None)
+    unregister = getattr(self.model, "unregister_request_observation_scoped", None)
+    if callable(unregister):
+      unregister(handle, request_id)
+    else:
+      unregister = getattr(self.model, "unregister_request_observation", None)
+      if callable(unregister):
+        unregister(handle)
+    if reporter is not None:
+      reporter.lifecycle("conversation_handle_released", owner_check="request_id_and_handle")
     return True
+
+  def _new_request_reporter(self, request_id: str, handle: Optional[int]):
+    provider = getattr(self.model, "next_observation_sequence", None)
+    reporter = RequestProgressReporter(
+        request_id,
+        native_handle=handle,
+        mode=observability_mode(),
+        sequence_provider=provider if callable(provider) else None,
+        status_provider=(lambda: self.model.get_request_status(handle, request_id))
+            if callable(getattr(self.model, "get_request_status", None)) else None,
+        diagnostics_provider=(lambda: self.model.get_request_diagnostics(handle, request_id))
+            if callable(getattr(self.model, "get_request_diagnostics", None)) else None,
+        # Native cache_result is the authoritative user event. Python keeps
+        # the statistics for completion/usage but must not duplicate it.
+        emit_cache_events=False)
+    if not hasattr(self, "_request_reporters"):
+      self._request_reporters = {}
+    self._request_reporters[request_id] = reporter
+    return reporter
+
+  def _record_request_error(self, request_id, error):
+    reporter = getattr(self, "_request_reporters", {}).get(request_id)
+    if reporter is not None:
+      reporter.error(error, stage="api_completion")
+
+  def _finish_request_observation(self, request_id, handle, status):
+    reporters = getattr(self, "_request_reporters", {})
+    reporter = reporters.get(request_id)
+    try:
+      # A still-owned handle indicates an interrupted generator. Terminal
+      # native errors already freed it and must use release, never abort.
+      try:
+        if handle is not None and self.conversation_handles.get(request_id) == handle:
+          self._abort_conversation_handle(request_id, handle)
+      except BaseException as error:
+        if reporter is not None:
+          reporter.error(error, stage="api_cleanup")
+        status = "cleanup_error"
+        raise
+      finally:
+        if reporter is not None:
+          reporter.finish(status=status)
+    finally:
+      if reporter is not None:
+        reporter.stop()
+      reporters.pop(request_id, None)
 
   def _abort_conversation_handle(
       self, request_id: str, handle: Optional[int]
   ) -> bool:
-    if not self._release_conversation_handle(request_id, handle):
+    if handle is None or self.conversation_handles.get(request_id) != handle:
       return False
-    self.model.abort_handle(handle)
+    reporter = getattr(self, "_request_reporters", {}).get(request_id)
+    if reporter is not None:
+      reporter.lifecycle("abort_requested")
+    try:
+      self.model.abort_handle(handle)
+    except BaseException as error:
+      self._record_request_error(request_id, error)
+      raise
+    finally:
+      self._release_conversation_handle(request_id, handle)
     return True
 
   async def check_disconnect(self, raw_request: Request, request_id, handle: int):
@@ -3519,7 +3647,9 @@ class FastLLmCompletion:
     if not self._abort_conversation_handle(request_id, handle):
       return
     logging.info(f"Abort disconnected request: {request_id}")
+    self._finish_request_observation(request_id, handle, "disconnected")
       
+  @_observe_completion_lifecycle
   async def chat_completion_full_generator(
               self, request: ChatCompletionRequest, raw_request: Request,
               handle: int,
@@ -3534,16 +3664,28 @@ class FastLLmCompletion:
       created_time = int(time.time())
       result = "" if emit_reasoning_content else ("<think>\n" if think else "")
       completion_tokens = 0
+      reporter = self._new_request_reporter(request_id, handle)
+      reporter.request_context = {
+          "model": model_name, "stream": bool(request.stream), "input_tokens": input_token_len,
+          "max_tokens": request.max_tokens, "temperature": request.temperature,
+          "top_p": request.top_p, "tool_count": len(request.tools or []),
+          "response_format_type": (request.response_format or {}).get("type")}
+      reporter.received(path="/v1/chat/completions")
       async for res in result_generator:
         res = self._normalize_model_delta(res)
         result += res
         completion_tokens += 1
+        reporter.observe_cache(response_statistics)
+        # Observe actual native counts; text deltas may contain multiple tokens
+        # or be a five-second prefill heartbeat with no generated token.
+        reporter.callback(response_statistics)
         if await raw_request.is_disconnected():
-           print("is_disconnected!!!")
-           self.model.abort_handle(handle)
+           self._abort_conversation_handle(request_id, handle)
+           reporter.finish(status="disconnected")
            logging.info(f"Abort request: {request_id}")
            return self.create_error_response("Client disconnected")
 
+      self._release_conversation_handle(request_id, handle)
       history_raw = result
       result, reasoning_content = self._split_reasoning_response(
           result, emit_reasoning_content, preserve_xtml=bool(request.tools))
@@ -3558,11 +3700,14 @@ class FastLLmCompletion:
       tool_call_info = self._parse_non_stream_tool_calls(
           result, request, finish_reason=finish_reason)
       if isinstance(tool_call_info, ErrorResponse):
-          if request_id in self.conversation_handles:
-              del self.conversation_handles[request_id]
+          reporter.finish(
+              status="tool_parse_error",
+              output_tokens=usage.completion_tokens or 0)
+          self._release_conversation_handle(request_id, handle)
           return tool_call_info
 
       if tool_call_info.tools_called:
+          reporter.tool_call(len(tool_call_info.tool_calls))
           remember = getattr(self.model, "remember_deepseek_v41_tool_output", None)
           if callable(remember):
               remember(history_raw if emit_reasoning_content else result, tool_call_info.content,
@@ -3584,6 +3729,8 @@ class FastLLmCompletion:
               try:
                   validate_structured_output(tool_call_info.content, request.response_format)
               except ValueError as error:
+                  reporter.error(error, stage="structured_output_validation")
+                  reporter.finish(status="invalid_response_format", output_tokens=output_tokens)
                   self._release_conversation_handle(request_id, handle)
                   return self.create_error_response(
                       str(error), err_type="invalid_response_format",
@@ -3607,10 +3754,10 @@ class FastLLmCompletion:
           usage = usage,
       )
 
-      # After completion, remove the conversation from tracking dictionary
-      if request_id in self.conversation_handles:
-          del self.conversation_handles[request_id]
-          # logging.info(f"Removed completed conversation from tracking: {request_id}")
+      self._release_conversation_handle(request_id, handle)
+
+      reporter.finish(
+          status="ok", output_tokens=usage.completion_tokens or 0)
 
       return response
 
@@ -3641,6 +3788,7 @@ class FastLLmCompletion:
           await stream.aclose()
 
             
+  @_observe_completion_lifecycle
   async def chat_completion_stream_generator(
           self, request: ChatCompletionRequest, raw_request: Request,
           result_generator: AsyncIterator,
@@ -3659,6 +3807,13 @@ class FastLLmCompletion:
       stop_strings = self._normalize_stop_strings(request.stop)
       stop_filter_state = {"buffer": ""}
       stopped_by_stop_string = False
+      reporter = self._new_request_reporter(request_id, handle)
+      reporter.request_context = {
+          "model": model_name, "stream": bool(request.stream), "input_tokens": input_token_len,
+          "max_tokens": request.max_tokens, "temperature": request.temperature,
+          "top_p": request.top_p, "tool_count": len(request.tools or []),
+          "response_format_type": (request.response_format or {}).get("type")}
+      reporter.received(path="/v1/chat/completions")
 
       # TODO: 支持request.n 和 request.echo配置
       first_iteration = True
@@ -3719,6 +3874,8 @@ class FastLLmCompletion:
         tool_call_parser = (
             self._create_function_call_parser(request) if request.tools else None
         )
+        if tool_call_parser is not None:
+            reporter.tool_parser_selected(type(tool_call_parser).__name__)
         
         completion_tokens = 0
 
@@ -3739,6 +3896,9 @@ class FastLLmCompletion:
         async for res in result_generator:
             res = self._normalize_model_delta(res)
             completion_tokens += 1
+            reporter.observe_cache(response_statistics)
+            # Use native counts; empty prefill heartbeats are not output tokens.
+            reporter.callback(response_statistics)
             if remember:
                 history_raw_parts.append(res)
             delta_text = res
@@ -3801,6 +3961,8 @@ class FastLLmCompletion:
                         parse_result.diagnostics)
                     logging.warning("Invalid stream tool call suppressed: %s",
                                     diagnostics)
+                if parse_result.valid_tool_calls:
+                    reporter.tool_call(len(parse_result.valid_tool_calls))
                 if parse_result.content or parse_result.valid_tool_calls:
                     delta_message = DeltaMessage(
                         content = parse_result.content,
@@ -3997,17 +4159,24 @@ class FastLLmCompletion:
                 yield f"data: {flush_data}\n\n"
         yield f"data: {data}\n\n"
       except ValueError as e:
+        reporter.error(e, stage="stream_generation")
         # A native context error is terminal: fetching it already freed the
         # backend handle, which another request may have reused.
-        if isinstance(e, PromptTooLongError):
+        if isinstance(e, (PromptTooLongError, CapacityUnavailableError)):
           self._release_conversation_handle(request_id, handle)
         elif self._abort_conversation_handle(request_id, handle):
           logging.info(f"Abort failed streaming request: {request_id}")
         data = self.create_streaming_error_response(
             str(e), err_type = "context_length_exceeded" if isinstance(e, PromptTooLongError) else "BadRequestError")
+        reporter.finish(
+            status="error",
+            output_tokens=(response_statistics or {}).get("output_tokens"))
         yield f"data: {data}\n\n"
-        await asyncio.sleep(0)
+        yield "data: [DONE]\n\n"
+        return
 
+      reporter.finish(
+          status="ok", output_tokens=usage.completion_tokens or 0)
       yield "data: [DONE]\n\n"
       await asyncio.sleep(0)
 
@@ -4299,7 +4468,7 @@ class FastLLmCompletion:
               "message_stop",
               MessageStopEvent())
       except ValueError as e:
-          if isinstance(e, PromptTooLongError):
+          if isinstance(e, (PromptTooLongError, CapacityUnavailableError)):
               self._release_conversation_handle(request_id, handle)
           elif self._abort_conversation_handle(request_id, handle):
               logging.info(f"Abort failed Anthropic streaming request: {request_id}")
