@@ -1,6 +1,8 @@
 // Device Markov proposals: conditional q, fresh graph RNG, and target joint law.
 #include "models/deepseekv41.h"
 #include "baseblock.h"
+#include "utils.h"
+#include <cstring>
 #include "devices/cuda/fastllm-cuda-dspark.h"
 #include <cuda_runtime.h>
 #include <algorithm>
@@ -21,9 +23,10 @@ struct Probe : DeepSeekV41Model {
 struct Fixture {
     int vocab, rank, block;
     float temperature;
+    bool filtered = false;
     std::vector<float> e, h, x;
     Data embed, head, logits, tokens, probs, samplingScratch, out;
-    Fixture(int v, int r, int b, DataType type, float t, bool smallSupport = false)
+    Fixture(int v, int r, int b, DataType type, float t, bool smallSupport = false, int headType = -1)
         : vocab(v), rank(r), block(b), temperature(t), e(v * r), h(v * r), x(b * v),
           tokens(DataType::INT32, {b + 1}) {
         for (int i = 0; i < v * r; ++i) {
@@ -33,7 +36,7 @@ struct Fixture {
         for (int i = 0; i < b * v; ++i)
             x[i] = smallSupport && i % v >= 4 ? -INFINITY : ((i * 11 + i / v * 7) % 23 - 11) / 8.0f;
         embed.CopyFrom(Data(type, {v, r}, e));
-        head.CopyFrom(Data(type, {v, r}, h));
+        head.CopyFrom(Data(headType < 0 ? type : DataType(headType), {v, r}, h));
         logits.CopyFrom(Data(FLOAT32, {1, b, v}, x));
         for (Data *d : {&embed, &head, &logits, &tokens})
             d->ToDevice(DataDevice::CUDA, std::vector<int>{0});
@@ -42,6 +45,8 @@ struct Fixture {
     }
     void Anchor(int a) { Cuda(cudaMemcpy(tokens.cudaData, &a, sizeof(a), cudaMemcpyHostToDevice)); }
     bool Run() {
+        if (filtered) return FastllmCudaDeepSeekV41MarkovFilteredSampleDevice(logits, embed, head,
+            block, temperature, vocab, 1.0f, tokens, probs, out, samplingScratch);
         return FastllmCudaDeepSeekV41MarkovSampleDevice(logits, embed, head, block, temperature, tokens,
                                                         probs, samplingScratch, out);
     }
@@ -54,10 +59,16 @@ struct Fixture {
         std::vector<double> q(vocab);
         double maximum = -INFINITY, total = 0;
         for (int v = 0; v < vocab; ++v) {
-            double score = x[step * vocab + v];
+            double dot = 0;
             for (int d = 0; d < rank; ++d)
-                score += (double)e[previous * rank + d] * h[v * rank + d];
-            q[v] = (float)score;
+                dot += (double)e[previous * rank + d] * h[v * rank + d];
+            float projection = float(dot);
+            if (filtered && embed.dataType == FLOAT16) projection = half_to_float(float_to_half(projection));
+            if (filtered && embed.dataType == BFLOAT16) {
+                uint32_t bits = uint32_t(Float32ToBFloat16RNEBits(projection)) << 16;
+                std::memcpy(&projection, &bits, sizeof(projection));
+            }
+            q[v] = x[step * vocab + v] + projection;
             maximum = std::max(maximum, q[v]);
         }
         for (double &v : q) {
@@ -87,8 +98,11 @@ struct Fixture {
                           << " step=" << s << " anchor=" << t[s] << " sum=" << sum << " L1=" << l1
                           << " q0=" << p[s * vocab] << " ref0=" << q[0] << '\n';
             Check(std::abs(sum - 1) < 1e-5 && l1 < 1e-5, "stored q differs from conditional softmax");
-            for (int d = 0; d < rank; ++d)
+            for (int d = 0; d < rank; ++d) {
+                if(embeddings[s * rank + d] != e[t[s] * rank + d])
+                    std::cerr << "embedding mismatch embed=" << embed.dataType << " head=" << head.dataType << " filtered=" << filtered << " step=" << s << " token=" << t[s] << " d=" << d << " actual=" << embeddings[s*rank+d] << " expected=" << e[t[s]*rank+d] << '\n';
                 Check(embeddings[s * rank + d] == e[t[s] * rank + d], "wrong conditional embedding");
+            }
         }
     }
 };
@@ -192,6 +206,76 @@ static void Distribution(bool equal) {
         Check(accepted[0] > 0 && accepted[1] > 0 && accepted[3] > 0, "missing rejection branch coverage");
     std::cout << "graph joint p=q:" << equal << " raw_z=" << qz << " verified_z=" << pz << " PASS\n";
 }
+// A verifier with no drafts must sample p directly, without reading saved q.
+// Alternate the active logits through a captured producer to catch stale rows
+// or RNG state, and check the filtered law against an independent CPU oracle.
+static void AnchorOnlySampling(int vocab, int topK, float topP, float temperature, int trials) {
+    Probe model;
+    DeepSeekV41DsparkState proposal;
+    DeepSeekV41SpecScratch scratch;
+    GenerationConfig config;
+    config.do_sample = true; config.top_k = topK;
+    config.top_p = topP; config.temperature = temperature;
+    std::vector<float> values(vocab, -INFINITY);
+    std::vector<double> expected(7);
+    double total = 0;
+    for (int i = 0; i < 7; ++i) {
+        expected[i] = std::exp(std::log(float(i + 1)) / temperature);
+        total += expected[i];
+    }
+    for (double &p : expected) p /= total;
+    double cumulative = 0;
+    int cutoff = 0;
+    for (int i = 6; i >= 0; --i) {
+        cumulative += expected[i];
+        if (cumulative >= topP) { cutoff = i; break; }
+    }
+    total = 0;
+    for (int i = 0; i < 7; ++i) {
+        if (i < cutoff || i < 7 - topK) expected[i] = 0;
+        total += expected[i];
+    }
+    for (double &p : expected) p /= total;
+    Data source(FLOAT32, {1, 1, vocab}, values), logits(FLOAT32, {1, 1, vocab});
+    for (Data *d : {&source, &logits}) {
+        d->ToDevice(DataDevice::CUDA, std::vector<int>{0}); d->Allocate(false);
+    }
+    cudaGraph_t graph = nullptr; cudaGraphExec_t exec = nullptr;
+    Cuda(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+    Cuda(cudaMemcpyAsync(logits.cudaData, source.cudaData, vocab * sizeof(float),
+                         cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+    Cuda(cudaStreamEndCapture(cudaStreamPerThread, &graph));
+    Cuda(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+    std::vector<int> counts(7);
+    for (int n = 0; n < trials; ++n) {
+        const int offset = (n % 2) * (vocab - 7);
+        std::fill(values.begin(), values.end(), -INFINITY);
+        for (int i = 0; i < 7; ++i) values[offset + i] = std::log(float(i + 1));
+        Cuda(cudaMemcpy(source.cudaData, values.data(), vocab * sizeof(float), cudaMemcpyHostToDevice));
+        Cuda(cudaGraphLaunch(exec, cudaStreamPerThread));
+        // Deliberately provide no q buffer and an invalid stale proposal token.
+        proposal.sampledProposal = (n % 2) != 0;
+        proposal.proposalTokens = {-1};
+        scratch.draftTokens.clear(); scratch.tokens = {-1, -1}; scratch.acceptedDrafts = 7;
+        model.DsparkSampleVerify(logits, proposal, scratch, config);
+        Check(scratch.acceptedDrafts == 0 && scratch.tokens.size() == 1,
+              "anchor-only verifier emitted a draft or wrong commit count");
+        const int token = scratch.tokens[0] - offset;
+        Check(token >= 0 && token < 7 && expected[token] > 0,
+              "anchor-only sampling used a stale row or violated filtering");
+        ++counts[token];
+    }
+    double maxZ = 0;
+    for (int i = 0; i < 7; ++i) if (expected[i] > 0 && expected[i] < 1)
+        maxZ = std::max(maxZ, std::abs(counts[i] - trials * expected[i]) /
+            std::sqrt(trials * expected[i] * (1 - expected[i])));
+    Check(maxZ < 6, "anchor-only target distribution differs from filtered p");
+    Cuda(cudaGraphExecDestroy(exec)); Cuda(cudaGraphDestroy(graph));
+    std::cout << "anchor-only vocab=" << vocab << " k=" << topK << " p=" << topP
+              << " temperature=" << temperature << " trials=" << trials
+              << " max_z=" << maxZ << " PASS\n";
+}
+
 int main() {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0)
@@ -266,6 +350,26 @@ int main() {
             Check(!f.Run(), "short token buffer accepted");
             std::cout << "vocab=" << vocab << " grouped q/graph inputs/guards PASS\n";
         }
+        for (auto embedType : {FLOAT32, FLOAT16, BFLOAT16})
+            for (auto headType : {FLOAT32, FLOAT16, BFLOAT16})
+                for (bool filtered : {false, true}) {
+                    Fixture f(31, 17, 5, embedType, .7f, false, headType);
+                    f.filtered = filtered;
+                    Check(f.Run(), "mixed storage sample rejected"); f.Numeric();
+                    SampleGraph graph(f);
+                    for (int anchor : {3, 30, 7}) { f.Anchor(anchor); graph.Run(); f.Numeric(); }
+                }
+        for (auto embedType : {FLOAT32, FLOAT16}) {
+            Fixture f(32769, 256, 5, embedType, .7f, false, BFLOAT16);
+            for (bool filtered : {false, true}) {
+                f.filtered = filtered; Check(f.Run(), "mixed grouped sample rejected"); f.Numeric();
+                SampleGraph graph(f); f.Anchor(32768); graph.Run(); f.Numeric();
+            }
+        }
+        std::cout << "mixed storage q/filtered q/replay PASS\n";
+        AnchorOnlySampling(128, 128, 1.0f, 1.0f, 6000);
+        AnchorOnlySampling(128, 3, .8f, .8f, 6000);
+        AnchorOnlySampling(129280, 50, .95f, .8f, 2048);
         Distribution(false);
         Distribution(true);
         std::cout << "DSpark device sampling regression PASS\n";

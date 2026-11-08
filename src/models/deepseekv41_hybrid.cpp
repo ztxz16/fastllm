@@ -86,7 +86,8 @@ namespace fastllm {
                     const int layer = std::max(0, block_cnt - v41DsparkLayers + stage);
                     const std::string pre = "mtp." + std::to_string(stage) + ".ffn";
                     if (!UsesHostMoe(SelectSpecialWeightDevice(pre + ".experts.0.gateup.weight", layer)) ||
-                        !quantizedLinearNames.count(pre + ".experts.0.w1.weight")) {
+                        (!MoeHasNativeFp32Output(draftWeights[stage][2], HybridMoeMath::DeepSeekV41) &&
+                         !quantizedLinearNames.count(pre + ".experts.0.w1.weight"))) {
                         draftWeights.clear(); break;
                     }
                 }

@@ -89,6 +89,7 @@ namespace fastllm {
         struct SharedExpertWorkspace {
             Data output, gateup, activated, floatOutput;
         };
+        Data confidenceLogits;
         std::vector<SharedExpertWorkspace> sharedExperts;
         struct RoutedExpertWorkspace {
             Data input, index, score, output;
@@ -1576,7 +1577,7 @@ namespace fastllm {
         const int rows = drafts + 1;
         AssertInFastLLM(logits.dataDevice == DataDevice::CUDA && logits.cudaData &&
                         logits.dataType == DataType::FLOAT32 && !logits.dims.empty() &&
-                        logits.Count(0) == (uint64_t)rows * logits.dims.back() && drafts > 0 &&
+                        logits.Count(0) == (uint64_t)rows * logits.dims.back() &&
                         (int)proposal.proposalTokens.size() >= drafts,
                         "DeepSeekV41 DSpark: invalid rejection sampling proposal/logits shape.");
         DsparkMaskToolLogits(logits, sampling, scratch.draftTokens);
@@ -1591,6 +1592,20 @@ namespace fastllm {
         if (!logits.dataDeviceIds.empty()) FastllmCudaSetDevice(logits.dataDeviceIds[0]);
         const int device = FastllmCudaGetDevice(), vocab = logits.dims.back();
         Data localProbs(DataType::FLOAT32);
+        if (drafts == 0) {
+            // An anchor-only verification step has no proposal distribution.
+            // Sample its target row with the same filtering law as rejection
+            // verification, then commit exactly one input through the graph path.
+            localProbs.Resize({1, vocab});
+            localProbs.ToDevice(DataDevice::CUDA, std::vector<int>{device}, false);
+            localProbs.Allocate(false);
+            AssertInFastLLM(FastllmCudaMtpSampleDraft((float*)logits.cudaData,
+                (float*)localProbs.cudaData, temperatures.data(), topKs.data(), topPs.data(),
+                scratch.tokens.data(), 1, vocab),
+                "DeepSeekV41 DSpark: anchor-only target sampling failed.");
+            scratch.acceptedDrafts = 0;
+            return;
+        }
         float *probs = (float*)proposal.proposalProbs.cudaData;
         if (proposal.sampledProposal) {
             const Data &q = proposal.proposalProbs;
@@ -1815,6 +1830,7 @@ namespace fastllm {
         Data verifyIds;
         const Data *idsPtr = &inputIds;
         int drafts = 0;
+        bool verifyStep = false;
         const int startPos = numSegments == 1 ? segments[0].startPos : 0;
         const int seqlen = numSegments == 1 ? segments[0].seqlen : 0;
         // Capture visual prefill hidden states for the draft window, but only
@@ -1838,8 +1854,12 @@ namespace fastllm {
                     verifyIds.Resize({1, drafts + 1});
                 }
             }
-            if (drafts > 0) {
-                idsPtr = &verifyIds;
+            // An anchor-only step still needs the same target features as
+            // multi-row verification. Both greedy and sampled requests can
+            // reuse its graph and one-row KV commit without any proposal.
+            verifyStep = drafts > 0 || segments[0].state->dspark != nullptr;
+            if (verifyStep) {
+                if (drafts > 0) idsPtr = &verifyIds;
                 segments[0].seqlen = 1 + drafts;
                 scratches[0].deferWindow = true;
                 scratches[0].wantAllTokens = true;
@@ -1861,7 +1881,7 @@ namespace fastllm {
             DsProfiler().AddPlainForward(forwardMs);
         }
 
-        if (drafts > 0) {
+        if (verifyStep) {
             DeepSeekV41RequestState &state = *segments[0].state;
             DeepSeekV41SpecScratch &scratch = scratches[0];
             AssertInFastLLM((int)scratch.tokens.size() == drafts + 1,
@@ -1872,19 +1892,21 @@ namespace fastllm {
             const double commitStart = DsTick();
             DsparkCommitPrefix(state, scratch, startPos, commitCount, drafts + 1);
             const double commitMs = DsElapsed(commitStart);
-            DsProfiler().AddVerify(drafts, accepted, forwardMs, commitMs);
+            if (drafts > 0) DsProfiler().AddVerify(drafts, accepted, forwardMs, commitMs);
             ret.assign(1, scratch.tokens[0]);
             for (int j = 1; j <= accepted; j++) {
                 state.dspark->pending.push_back(std::make_pair(scratch.tokens[j - 1], scratch.tokens[j]));
             }
-            const long long round = v41DsparkVerifyRounds.fetch_add(1) + 1;
-            v41DsparkProposedTokens.fetch_add(drafts);
-            v41DsparkAcceptedTokens.fetch_add(accepted);
-            DsRecordStats(round, drafts, accepted);
-            state.dspark->rounds++;
-            state.dspark->proposed += drafts;
-            state.dspark->accepted += accepted;
-            DsparkDebugDumpState(state, "verify");
+            if (drafts > 0) {
+                const long long round = v41DsparkVerifyRounds.fetch_add(1) + 1;
+                v41DsparkProposedTokens.fetch_add(drafts);
+                v41DsparkAcceptedTokens.fetch_add(accepted);
+                DsRecordStats(round, drafts, accepted);
+                state.dspark->rounds++;
+                state.dspark->proposed += drafts;
+                state.dspark->accepted += accepted;
+            }
+            DsparkDebugDumpState(state, drafts > 0 ? "verify" : "plain");
             const int anchor = scratch.tokens[accepted];
             const bool stopped = anchor == eos_token_id || eos_token_ids.count(anchor) ||
                 generationConfigs[0].stop_token_ids.count(anchor);
@@ -2372,9 +2394,10 @@ namespace fastllm {
             markovHeadWeight.dims[1] == markovEmbedWeight.dims[1] &&
             markovEmbedWeight.dims[0] >= vocab && markovHeadWeight.dims[0] >= vocab &&
             anchorToken >= 0 && anchorToken < markovEmbedWeight.dims[0] &&
-            markovEmbedWeight.dataType == markovHeadWeight.dataType &&
             (markovEmbedWeight.dataType == DataType::BFLOAT16 ||
-             markovEmbedWeight.dataType == DataType::FLOAT16 || markovEmbedWeight.dataType == DataType::FLOAT32);
+             markovEmbedWeight.dataType == DataType::FLOAT16 || markovEmbedWeight.dataType == DataType::FLOAT32) &&
+            (markovHeadWeight.dataType == DataType::BFLOAT16 ||
+             markovHeadWeight.dataType == DataType::FLOAT16 || markovHeadWeight.dataType == DataType::FLOAT32);
         const bool graphEligible = graphMarkov && DsDraftGraphEnabled() &&
             fusedMarkovAllowed && (!randomDraft || sampledMarkov) &&
             (residentDraft || hybridDraft || diskDraft || v41DsparkTpDevices.size() > 1) &&
@@ -2468,6 +2491,14 @@ namespace fastllm {
         Data &headHidden = graphState ? graphState->headHidden : eagerHeadHidden;
         Data &normed = graphState ? graphState->normalized : eagerNormed;
         Data &markovAll = graphState ? graphState->markovEmbeds : eagerMarkov;
+        auto projectConfidence = [&](Data &output) {
+            Data hiddenFloat, markovFloat, features;
+            ToDataType(headHidden, hiddenFloat, DataType::FLOAT32);
+            ToDataType(markovAll, markovFloat, DataType::FLOAT32);
+            Cat(hiddenFloat, markovFloat, -1, features);
+            Linear(features, *confidenceWeight, Data(), output);
+            ToDataType(output, DataType::FLOAT32);
+        };
         auto backbone = [&]() {
 #ifdef USE_CUDA
             if (graphState && graphState->deviceInputs) {
@@ -2833,6 +2864,8 @@ namespace fastllm {
                 AssertInFastLLM(ok,
                     "DeepSeekV41 DSpark device Markov chain rejected input.");
             }
+            if (graphState && confidenceWeight && markovAll.dims.size() == 3)
+                projectConfidence(graphState->confidenceLogits);
 #endif
         };
 #ifdef USE_CUDA
@@ -2950,14 +2983,22 @@ namespace fastllm {
         const double confStart = DsTick();
         confidence.assign(block, 1.0f);
         if (confidenceWeight && markovAll.dims.size() == 3) {
-            Data hiddenFloat, markovFloat, features, confLogits;
-            ToDataType(headHidden, hiddenFloat, DataType::FLOAT32);
-            ToDataType(markovAll, markovFloat, DataType::FLOAT32);
-            Cat(hiddenFloat, markovFloat, -1, features);
-            Linear(features, *confidenceWeight, Data(), confLogits);
-            ToDataType(confLogits, DataType::FLOAT32);
-            confLogits.ToDevice(DataDevice::CPU);
-            const float *values = (const float*)confLogits.cpuData;
+            Data confLogits;
+            std::vector<float> capturedValues;
+            const float *values = nullptr;
+#ifdef USE_CUDA
+            if (graphState) {
+                capturedValues.resize(block);
+                FastllmCudaCopyFromDeviceToHost(capturedValues.data(), graphState->confidenceLogits.cudaData,
+                    block * sizeof(float));
+                values = capturedValues.data();
+            } else
+#endif
+            {
+                projectConfidence(confLogits);
+                confLogits.ToDevice(DataDevice::CPU);
+                values = (const float*)confLogits.cpuData;
+            }
             for (int i = 0; i < block; i++) {
                 float p = DsSigmoid(values[i]);
                 confidence[i] = std::isfinite(p) ? p : 1.0f;
