@@ -10,6 +10,7 @@
 
 #ifdef FASTLLM_USE_MAYA_EXL3
 bool FastllmCudaExl3MayaGrouped(const fastllm::Data &, const fastllm::Data &, fastllm::Data &);
+bool FastllmCudaExl3MayaLinearShared(const fastllm::Data &, fastllm::Data *const *, fastllm::Data *const *, int);
 bool FastllmCudaExl3MayaLinear(const fastllm::Data &, fastllm::Data &, const fastllm::Data &, fastllm::Data &);
 bool FastllmCudaExl3MayaMoe(const fastllm::Data &, fastllm::Data &, const fastllm::Data &, const fastllm::Data &, fastllm::Data **, int, float);
 bool FastllmCudaExl3MayaCache(const fastllm::Data &, const uint8_t *, const int32_t *, const uint64_t *, size_t, size_t, int, int, int, const float *, int, float, float *, int);
@@ -200,6 +201,15 @@ static bool Exl3LinearStrided(const fastllm::Data &input, fastllm::Data &weight,
     }
     AssertInFastLLM(cudaGetLastError() == cudaSuccess, "EXL3: CUDA kernel launch failed.");
     return true;
+}
+
+bool FastllmCudaExl3LinearShared(const fastllm::Data &input, fastllm::Data *const *weights,
+                               fastllm::Data *const *outputs, int count) {
+#ifdef FASTLLM_USE_MAYA_EXL3
+    return FastllmCudaExl3MayaLinearShared(input, weights, outputs, count);
+#else
+    return false;
+#endif
 }
 
 bool FastllmCudaExl3Linear(const fastllm::Data &input, fastllm::Data &weight,

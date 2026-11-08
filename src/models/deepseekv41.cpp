@@ -37,6 +37,7 @@
 #include "fastllm-cuda.cuh"
 #include "fastllm-v41-decode.cuh"
 #include "devices/cuda/fastllm-cuda-gguf-projections.h"
+#include "devices/cuda/fastllm-cuda-linear-shared.h"
 #include "devices/cuda/fastllm-append-only-cuda-rows.h"
 #include "devices/cuda/fastllm-fp8-auxiliary.h"
 #include "devices/cuda/fastllm-cuda-linear-output.h"
@@ -948,6 +949,52 @@ namespace fastllm {
             return std::all_of(ok.begin(), ok.end(), [](int value) { return value != 0; });
         }
 
+        // Replicated projections keep separate weights/output precision while
+        // the CUDA backend decides whether it can share their execution.
+        bool V41SharedInputProjections(const Data &input, const std::vector<Data *> &weights,
+                const std::vector<Data *> &outputs, const std::vector<DataType> &types) {
+            if (weights.size() < 2 || weights.size() != outputs.size() || outputs.size() != types.size() ||
+                input.dims.empty() || input.dims.back() <= 0 || input.Count(0) / input.dims.back() > 8)
+                return false;
+            std::vector<int> devices;
+            if (input.multiDeviceData) {
+                if (!input.IsTensorParallelReplicated()) return false;
+                for (const auto &entry : input.multiDeviceDatas) {
+                    if (!entry.second || !entry.second->cudaData) return false;
+                    devices.push_back(entry.first);
+                }
+                if (devices.empty()) return false;
+            } else if (input.dataDevice != DataDevice::CUDA || !input.cudaData ||
+                input.dataDeviceIds != std::vector<int>{FastllmCudaGetDevice()}) return false;
+            for (size_t i = 0; i < weights.size(); ++i) {
+                Data &w = *weights[i];
+                if (w.dims.size() != 2 || w.dims[1] != input.dims.back()) return false;
+                if (devices.empty()) {
+                    if (w.multiDeviceData) return false;
+                    w.ToDevice(DataDevice::CUDA, input.dataDeviceIds, true);
+                } else {
+                    if (!w.multiDeviceData) PrepareMultiCudaReplicatedData(w, devices, true);
+                    if (!w.IsTensorParallelReplicated()) return false;
+                    for (int dev : devices) if (!w.multiDeviceDatas.count(dev) ||
+                        !w.multiDeviceDatas.at(dev) || !w.multiDeviceDatas.at(dev)->cudaData) return false;
+                }
+                auto dims = input.dims; dims.back() = w.dims[0];
+                V41AllocLike(*outputs[i], types[i], dims, input, devices);
+            }
+            if (devices.empty()) return FastllmCudaLinearShared(input, weights.data(), outputs.data(), weights.size());
+            std::vector<int> ok(devices.size(), 0);
+            const bool submitted = MultiCudaRunDeviceCallbacks(devices, [&](int rank, int dev) {
+                std::vector<Data *> localWeights, localOutputs;
+                for (size_t i = 0; i < weights.size(); ++i) {
+                    localWeights.push_back(weights[i]->multiDeviceDatas.at(dev));
+                    localOutputs.push_back(outputs[i]->multiDeviceDatas.at(dev));
+                }
+                ok[rank] = FastllmCudaLinearShared(*input.multiDeviceDatas.at(dev),
+                    localWeights.data(), localOutputs.data(), localWeights.size());
+            });
+            return submitted && std::all_of(ok.begin(), ok.end(), [](int value) { return value != 0; });
+        }
+
         bool V41PrepareQkvWeight(Data &merged, Data &qw, Data &kw,
                                   const std::vector<int> &devices) {
             if (!merged.dims.empty()) {
@@ -1185,7 +1232,7 @@ namespace fastllm {
                 if (gguf) {
                     Data *weights[] = {&wq, &wk}, *outputs[] = {&qraw, &kout};
                     return (inputQuantized || FastllmCudaDeepSeekV41QuantizeActivation(x, xq)) &&
-                        FastllmCudaGGUFLinearShared(xq, weights, outputs, 2) &&
+                        FastllmCudaLinearShared(xq, weights, outputs, 2) &&
                         FastllmCudaV41QKVNormQuant(qraw, kout, nq, nk, eps, qout, qq, kout);
                 }
                 if (packed) {
@@ -6351,8 +6398,35 @@ namespace fastllm {
 
             // wq_a / wkv 是复制的（KV 是 MLA 式的单份 latent，与 head 无关）；
             // wq_b 按行切 -> q 的 head 维分片，Reshape 会把 tpAxis 从最后一维换算到 head 维。
-            bool qkvPrepared = false;
+            bool qkvPrepared = false, sharedProjections = false, sharedCompressor = false;
 #ifdef USE_CUDA
+            // Group only projections with the same activation boundary. Native
+            // FP8/GGUF activation-quantized QKV retains its existing fused path.
+            if (reuseQuantized && !dumpDebug &&
+                !quantizedLinearNames.count(pre + ".attn.wq_a.weight") &&
+                !quantizedLinearNames.count(pre + ".attn.wkv.weight")) {
+                std::vector<Data *> projections{&weight[pre + ".attn.wq_a.weight"], &weight[pre + ".attn.wkv.weight"]};
+                std::vector<Data *> outputs{&qr, &kv};
+                std::vector<DataType> types{attnInput.dataType, attnInput.dataType};
+                const std::string cpre = pre + ".attn.compressor";
+                const bool includeCompressor = ratio > 0 && isKvSource[layer] &&
+                    !quantizedLinearNames.count(cpre + ".wkv.weight") &&
+                    (ratio <= 1 || !quantizedLinearNames.count(cpre + ".wgate.weight"));
+                if (includeCompressor) {
+                    projections.push_back(&weight[cpre + ".wkv.weight"]);
+                    outputs.push_back(&rawKVAll); types.push_back(DataType::FLOAT32);
+                    if (ratio > 1) {
+                        projections.push_back(&weight[cpre + ".wgate.weight"]);
+                        outputs.push_back(&rawScoreAll); types.push_back(DataType::FLOAT32);
+                    }
+                }
+                sharedProjections = V41SharedInputProjections(attnInput, projections, outputs, types);
+                sharedCompressor = sharedProjections && includeCompressor;
+                if (!sharedProjections && projections.size() > 2) {
+                    projections.resize(2); outputs.resize(2); types.resize(2);
+                    sharedProjections = V41SharedInputProjections(attnInput, projections, outputs, types);
+                }
+            }
             if ((attnQuant || weightOnlyQkv) && quantizedLinearNames.count(pre + ".attn.wq_b.weight") && !dumpDebug &&
                 precisionRows <= 8 &&
                 !(v41AttentionRankRuntime && seqlen == 1 && (weightOnlyQkv || weightOnlyQuery))) {
@@ -6366,7 +6440,7 @@ namespace fastllm {
 #endif
             if (!qkvPrepared) {
                 // Reuse the fused quantizer even when the combined QKV path is unavailable.
-                quantizedLinear(attentionInputQuantized ? *attnQuant : attnInput,
+                if (!sharedProjections) quantizedLinear(attentionInputQuantized ? *attnQuant : attnInput,
                                 pre + ".attn.wq_a.weight", qr, tp,
                                 attentionInputQuantized ? nullptr : attnQuant, attentionInputQuantized);
                 V41RMSNormBF16(qr, weight[pre + ".attn.q_norm.weight"], rms_norm_eps, qNorm);
@@ -6392,7 +6466,7 @@ namespace fastllm {
             q.Reshape({1, seqlen, num_attention_heads, headDim});
 
             if (!qkvPrepared) {
-                quantizedLinear(attnQuant ? *attnQuant : attnInput, pre + ".attn.wkv.weight", kv,
+                if (!sharedProjections) quantizedLinear(attnQuant ? *attnQuant : attnInput, pre + ".attn.wkv.weight", kv,
                                 tp, nullptr, attnQuant != nullptr);
                 if (dumpDebug) V41DumpTensor(kv, "fl_layer" + std::to_string(layer) + "_kv_proj" + dumpSuffix);
                 V41RMSNormBF16(kv, weight[pre + ".attn.kv_norm.weight"], rms_norm_eps, kv);
@@ -6402,7 +6476,7 @@ namespace fastllm {
 
             // kv source 层：compressor 的投影按整批算，分组 / 追加按片段做
             // （rawKVAll / rawScoreAll / qIdxAll / idxWeightsAll 见上面的工作区绑定）
-            if (ratio > 0 && isKvSource[layer]) {
+            if (ratio > 0 && isKvSource[layer] && !sharedCompressor) {
                 std::string cpre = pre + ".attn.compressor";
                 bool projected = false;
 #ifdef USE_CUDA

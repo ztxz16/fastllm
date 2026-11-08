@@ -573,9 +573,9 @@ static bool GgufOverlap(const fastllm::Data &a, const fastllm::Data &b) {
     return x < y+b.GetBytes() && y < x+a.GetBytes();
 }
 static bool GgufSharedProjectionCanRun(const fastllm::Data &input,
-        const fastllm::Data &weight, const fastllm::Data &output, bool allowBfloat16 = false) {
+        const fastllm::Data &weight, const fastllm::Data &output, bool sharedLinear = false) {
     using namespace fastllm;
-    const bool bfloat16 = allowBfloat16 && input.dataType == BFLOAT16;
+    const bool bfloat16 = sharedLinear && input.dataType == BFLOAT16;
     if ((!bfloat16 && input.dataType != FLOAT16) || output.dataType != input.dataType ||
         weight.dataType != DATA_GGUF_FORMAT || weight.dims.size() != 2 ||
         !GgufDenseLocal(input) || !GgufDenseLocal(output) ||
@@ -597,6 +597,10 @@ static bool GgufSharedProjectionCanRun(const fastllm::Data &input,
             case GGML_TYPE_Q4_K: case GGML_TYPE_Q2_K:
             case GGML_TYPE_IQ2_XXS: case GGML_TYPE_IQ2_XS: case GGML_TYPE_IQ2_S:
             case GGML_TYPE_IQ1_M: break;
+            case GGML_TYPE_Q5_0: case GGML_TYPE_Q5_1: case GGML_TYPE_Q5_K:
+            case GGML_TYPE_Q6_K: case GGML_TYPE_Q8_0: case GGML_TYPE_IQ4_NL:
+                if (!sharedLinear) return false; // Plain shared projections only.
+                break;
             default: return false;
         }
     }
@@ -1014,12 +1018,60 @@ static void GgufProjectFromQ8(const block_q8_1 *input, const fastllm::Data &weig
     switch (static_cast<ggml_type>(weight.ggmlType)) {
         PROJECT_CASE(GGML_TYPE_IQ3_S); PROJECT_CASE(GGML_TYPE_IQ3_XXS);
         PROJECT_CASE(GGML_TYPE_IQ4_XS); PROJECT_CASE(GGML_TYPE_Q4_K); PROJECT_CASE(GGML_TYPE_Q2_K);
+#define SHARED_PROJECT_CASE(TYPE) \
+        case TYPE: if constexpr (StoreMode == 0) \
+            mul_mat_vec_q_cuda<TYPE, half, 0>(weight.cudaData, input, output, nullptr, \
+                columns, outputs, columns, rows, outputs, 1, 0, 0, 0, 0, stream); break
+        SHARED_PROJECT_CASE(GGML_TYPE_Q5_0); SHARED_PROJECT_CASE(GGML_TYPE_Q5_1); SHARED_PROJECT_CASE(GGML_TYPE_Q5_K);
+        SHARED_PROJECT_CASE(GGML_TYPE_Q6_K); SHARED_PROJECT_CASE(GGML_TYPE_Q8_0); SHARED_PROJECT_CASE(GGML_TYPE_IQ4_NL);
+#undef SHARED_PROJECT_CASE
         case GGML_TYPE_IQ2_XXS: case GGML_TYPE_IQ2_XS: case GGML_TYPE_IQ2_S: case GGML_TYPE_IQ1_M:
             FastllmCudaGGUFExtendedFromQ8(input, weight.cudaData, output,
                 weight.ggmlType, rows, columns, outputs, StoreMode, stream); break;
         default: break; // validated before allocating or launching
     }
 #undef PROJECT_CASE
+}
+
+template <typename Output>
+static bool GgufLaunchSharedMmvq(int type, const FastllmGgufSharedMmvqBatch &batch,
+        const void *input, int columns, int rows, cudaStream_t stream) {
+#define SHARED_FORMAT(T) case T: return FastllmGgufSharedMmvq<T, Output>(batch, input, columns, rows, stream)
+    switch (type) {
+        SHARED_FORMAT(GGML_TYPE_Q8_0); SHARED_FORMAT(GGML_TYPE_Q5_0); SHARED_FORMAT(GGML_TYPE_Q5_1);
+        SHARED_FORMAT(GGML_TYPE_Q5_K); SHARED_FORMAT(GGML_TYPE_Q6_K); SHARED_FORMAT(GGML_TYPE_IQ4_NL);
+        default: return false; // Retain the specialized IQ/planar dispatch.
+    }
+#undef SHARED_FORMAT
+}
+
+template <typename Output>
+static void GgufProjectSharedQ8(const block_q8_1 *input, fastllm::Data *const *weights,
+        fastllm::Data *const *outputs, int count, int rows, int columns, cudaStream_t stream) {
+    std::vector<bool> done(count, false);
+    ggml_backend_cuda_context ctx;
+    for (int i = 0; i < count; ++i) {
+        if (done[i]) continue;
+        FastllmGgufSharedMmvqBatch batch{};
+        int indices[FastllmGgufMaxSharedJobs];
+        for (int j = i; j < count && batch.count < FastllmGgufMaxSharedJobs; ++j) {
+            if (done[j] || weights[j]->ggmlType != weights[i]->ggmlType) continue;
+            indices[batch.count] = j;
+            batch.jobs[batch.count++] = {weights[j]->cudaData, outputs[j]->cudaData, weights[j]->dims[0], 0};
+        }
+        if (GgufLaunchSharedMmvq<Output>(weights[i]->ggmlType, batch, input, columns, rows, stream)) {
+            for (int j = 0; j < batch.count; ++j) done[indices[j]] = true;
+            continue;
+        }
+        const int n = weights[i]->dims[0];
+        if constexpr (std::is_same<Output, __nv_bfloat16>::value)
+            ggml_cuda_op_mul_mat_vec_q_impl(ctx, (ggml_type)weights[i]->ggmlType,
+                columns, n, 1, 0, 0, 0, 0, (const char *)weights[i]->cudaData, (const char *)input,
+                static_cast<Output *>(outputs[i]->cudaData), nullptr, 0, n, rows, columns, stream);
+        else
+            GgufProjectFromQ8<0>(input, *weights[i], static_cast<half *>(outputs[i]->cudaData), rows, columns, stream);
+        done[i] = true;
+    }
 }
 }
 
@@ -1059,20 +1111,11 @@ bool FastllmCudaGGUFLinearShared(const fastllm::Data &input,
     if (input.dataType == fastllm::BFLOAT16) {
         quantize_row_q8_1_cuda(static_cast<const __nv_bfloat16 *>(input.cudaData), q8,
             columns, rows, 1, columns, GGML_TYPE_Q8_1, stream);
-        ggml_backend_cuda_context ctx;
-        for (int i = 0; i < count; ++i) {
-            const int k = weights[i]->dims[0];
-            ggml_cuda_op_mul_mat_vec_q_impl(ctx, (ggml_type)weights[i]->ggmlType,
-                columns, k, 1, 0, 0, 0, 0,
-                (const char *)weights[i]->cudaData, (const char *)q8,
-                static_cast<__nv_bfloat16 *>(outputs[i]->cudaData), nullptr,
-                0, k, rows, columns, stream);
-        }
+        GgufProjectSharedQ8<__nv_bfloat16>(q8, weights, outputs, count, rows, columns, stream);
     } else {
         quantize_row_q8_1_cuda(static_cast<const half *>(input.cudaData), q8,
             columns, rows, 1, columns, GGML_TYPE_Q8_1, stream);
-        for (int i = 0; i < count; ++i)
-            GgufProjectFromQ8<0>(q8, *weights[i], static_cast<half *>(outputs[i]->cudaData), rows, columns, stream);
+        GgufProjectSharedQ8<half>(q8, weights, outputs, count, rows, columns, stream);
     }
     FastllmCudaFree(q8);
     return true;

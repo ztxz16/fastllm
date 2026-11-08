@@ -6,6 +6,8 @@ class Data;
 
 // Resident, bias-free FP16/BF16 projections of the same input (1..8 rows).
 // Any number of projections >= 2 may share the call-local Q8 workspace.
+// Compatible same-format Q5/Q6/Q8/IQ4_NL jobs also share one MMVQ launch
+// (up to 8 jobs per launch); specialized IQ/planar kernels keep their dispatch.
 // Unsupported types/layouts and MMQ batches return false before any writes.
 bool FastllmCudaGGUFLinearShared(const fastllm::Data &input, fastllm::Data *const *weights,
                                  fastllm::Data *const *outputs, int count);

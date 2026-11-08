@@ -5,7 +5,8 @@
 template <ggml_type type, int ncols_y, int nwarps, typename OType, int StoreMode = 0>
 static __device__ void mul_mat_vec_q(
     const void * __restrict__ vx, const void * __restrict__ vy, OType * __restrict__ dst,
-    const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
+    const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst,
+    const int outputBlock = -1) {
     constexpr int qk  = ggml_cuda_type_traits<type>::qk;
     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
     constexpr int vdr = get_vdr_mmvq(type);
@@ -24,7 +25,7 @@ static __device__ void mul_mat_vec_q(
 #endif // defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__) && !defined(RDNA2) && !defined(RDNA3)
 
     const     int tid = WARP_SIZE*threadIdx.y + threadIdx.x;
-    const     int row0 = rows_per_cuda_block*blockIdx.x;
+    const     int row0 = rows_per_cuda_block*(outputBlock < 0 ? blockIdx.x : outputBlock);
     const     int blocks_per_row_x = ncols_x / qk;
     const     int blocks_per_col_y = nrows_y / QK8_1;
     constexpr int blocks_per_iter = vdr * nwarps*WARP_SIZE / qi;
@@ -392,6 +393,73 @@ void mul_mat_vec_q_cuda(
     }
 }
 
+
+
+// One flat grid for independent projections. Descriptors live in kernel
+// arguments, so capture/replay needs neither pointer uploads nor packed weights.
+// The dot products and their accumulation order are the ordinary MMVQ body.
+template <ggml_type Type, int Tokens, int Warps, typename Output>
+__global__ __launch_bounds__(Warps * WARP_SIZE,
+    (Type == GGML_TYPE_Q5_K || Type == GGML_TYPE_Q6_K) && Tokens >= 2 && Tokens <= 4 ? 4 : 1)
+void FastllmGgufSharedMmvqKernel(
+        FastllmGgufSharedMmvqBatch batch, const void *input, int columns) {
+    int job = 0, first = 0;
+    while (blockIdx.x >= batch.jobs[job].blockEnd) first = batch.jobs[job++].blockEnd;
+    const auto &p = batch.jobs[job];
+    mul_mat_vec_q<Type, Tokens, Warps, Output, 0>(p.weight, input,
+        static_cast<Output *>(p.output), columns, p.rows, columns, p.rows, blockIdx.x - first);
+}
+
+template <ggml_type Type, int Tokens, typename Output>
+static void FastllmLaunchSharedMmvq(FastllmGgufSharedMmvqBatch batch,
+        const void *input, int columns, cudaStream_t stream) {
+    constexpr int tile = ((Type == GGML_TYPE_Q5_K || Type == GGML_TYPE_Q6_K) && Tokens == 4) || Tokens < 4 ? 1 : 2;
+    int blocks = 0;
+    for (int i = 0; i < batch.count; ++i) {
+        blocks += (batch.jobs[i].rows + tile - 1) / tile;
+        batch.jobs[i].blockEnd = blocks;
+    }
+    // Keep the exact-batch policy used by separate projections.
+    if (Tokens <= 4 || Tokens < fastllm::FastllmCudaGetLinearExactBatchThreshold())
+        FastllmGgufSharedMmvqKernel<Type, Tokens, 4, Output><<<blocks, dim3(WARP_SIZE, 4), 0, stream>>>(batch, input, columns);
+    else
+        FastllmGgufSharedMmvqKernel<Type, Tokens, 1, Output><<<blocks, dim3(WARP_SIZE, 1), 0, stream>>>(batch, input, columns);
+}
+
+template <ggml_type Type, typename Output>
+bool FastllmGgufSharedMmvq(const FastllmGgufSharedMmvqBatch &batch,
+        const void *input, int columns, int tokens, cudaStream_t stream) {
+#if defined(USE_ROCM)
+    // Keep the existing HIP layout/reduction dispatch until validated there.
+    return false;
+#else
+    if (batch.count < 2 || batch.count > FastllmGgufMaxSharedJobs || tokens < 1 || tokens > 8)
+        return false;
+    // Large Q5/Q6 projections on Turing retain their specialized kernels.
+    if constexpr (Type == GGML_TYPE_Q5_K || Type == GGML_TYPE_Q6_K) {
+        if (FastllmCudaRuntimeArch() == 75) {
+            for (int i = 0; i < batch.count; ++i) {
+                const int rows = batch.jobs[i].rows;
+                if constexpr (Type == GGML_TYPE_Q5_K) {
+                    if (rows >= 2048 && ((tokens == 1 && columns == 2560) ||
+                        (tokens >= 2 && columns >= 1280 && columns <= 2560))) return false;
+                } else if (rows >= 32768 && columns == 2560 && tokens <= 4) return false;
+            }
+        }
+    }
+#define SHARED_ROWS(N) case N: FastllmLaunchSharedMmvq<Type, N, Output>(batch, input, columns, stream); break
+    switch (tokens) {
+        SHARED_ROWS(1); SHARED_ROWS(2); SHARED_ROWS(3); SHARED_ROWS(4);
+        SHARED_ROWS(5); SHARED_ROWS(6); SHARED_ROWS(7); SHARED_ROWS(8);
+    }
+#undef SHARED_ROWS
+    return true;
+#endif
+}
+
+#define FASTLLM_INSTANTIATE_SHARED_MMVQ(TYPE) \
+    template bool FastllmGgufSharedMmvq<TYPE, half>(const FastllmGgufSharedMmvqBatch &, const void *, int, int, cudaStream_t); \
+    template bool FastllmGgufSharedMmvq<TYPE, __nv_bfloat16>(const FastllmGgufSharedMmvqBatch &, const void *, int, int, cudaStream_t);
 
 #define FASTLLM_INSTANTIATE_MMVQ(TYPE, OUTPUT, STORE) \
     template void mul_mat_vec_q_cuda<TYPE, OUTPUT, STORE>( \

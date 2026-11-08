@@ -151,6 +151,44 @@ bool FastllmCudaExl3MayaLinear(const fastllm::Data &input, fastllm::Data &weight
     return true;
 }
 
+bool FastllmCudaExl3MayaLinearShared(const fastllm::Data &input,
+        fastllm::Data *const *weights, fastllm::Data *const *outputs, int count) {
+    using namespace fastllm;
+    if (!Enabled() || count < 2 || count > maya::kMaxMvJobs || !weights || !outputs ||
+        input.dims.empty() || input.dims.back() <= 0 || !input.cudaData ||
+        (input.dataType != FLOAT32 && input.dataType != FLOAT16 && input.dataType != BFLOAT16)) return false;
+    const int k = input.dims.back(), rows = input.Count(0) / k;
+    if (rows < 1 || rows > maya::kMaxMvCols) return false;
+    std::array<maya::Mat, maya::kMaxMvJobs> mats;
+    std::array<maya::MvJob, maya::kMaxMvJobs> jobs;
+    int used = 0;
+    // Build every descriptor before launching: a rejected group must leave all
+    // outputs intact so the caller can safely use its ordinary linear path.
+    for (int i = 0; i < count; ++i) {
+        if (!weights[i] || !outputs[i]) return false;
+        const Data &w = *weights[i]; Data &y = *outputs[i];
+        if (w.dataType != EXL3 || w.dims.size() != 2 || w.dims[1] != k ||
+            w.blockM < 1 || w.blockM > maya::kMaxMvJobs - used || w.dims[0] % w.blockM ||
+            !w.cudaData || !y.cudaData || y.dims.empty() || y.dims.back() != w.dims[0] ||
+            y.Count(0) != uint64_t(rows) * w.dims[0] ||
+            (y.dataType != FLOAT32 && y.dataType != FLOAT16 && y.dataType != BFLOAT16)) return false;
+        Exl3StorageBytes(w);
+        for (int p = 0; p < w.blockM; ++p) {
+            auto &m = mats[used]; m = Matrix(w, p);
+            if (!maya::supported(m)) return false;
+            auto &j = jobs[used++]; j.m = &m;
+            if (input.dataType == FLOAT32) j.xf = static_cast<const float *>(input.cudaData);
+            else { j.x16 = static_cast<const uint16_t *>(input.cudaData); j.x_bf16 = input.dataType == BFLOAT16; }
+            if (y.dataType == FLOAT32) j.y = static_cast<float *>(y.cudaData) + p * m.n;
+            else { j.y16 = static_cast<uint16_t *>(y.cudaData) + p * m.n; j.y_bf16 = y.dataType == BFLOAT16; }
+            j.ncol = rows; j.xf_cs = k; j.y_cs = w.dims[0];
+        }
+    }
+    AssertInFastLLM(maya::mv(jobs.data(), used, cudaStreamPerThread), "EXL3 shared projection launch rejected.");
+    AssertInFastLLM(cudaGetLastError() == cudaSuccess, "EXL3 shared projection CUDA failure.");
+    return true;
+}
+
 void FastllmCudaReleaseExl3Maya(const fastllm::Data *owner) {
     std::lock_guard<std::mutex> lock(DirectoryMutex());
     auto &map=Directories();

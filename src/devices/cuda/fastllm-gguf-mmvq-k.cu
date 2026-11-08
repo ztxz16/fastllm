@@ -26,3 +26,7 @@ void FastllmGgufQ5KGroupedGemv(const void *weights, const void *input,
 #undef DISPATCH
 #undef GROUPED
 }
+
+// Shared-input projections reuse this translation unit's GGUF primitives.
+FASTLLM_INSTANTIATE_SHARED_MMVQ(GGML_TYPE_Q5_K)
+FASTLLM_INSTANTIATE_SHARED_MMVQ(GGML_TYPE_Q6_K)

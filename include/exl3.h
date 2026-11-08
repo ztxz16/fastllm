@@ -50,6 +50,8 @@ bool FastllmCudaExl3Grouped(const fastllm::Data &input, const fastllm::Data &wei
 void FastllmCudaReleaseExl3(const fastllm::Data *owner);
 bool FastllmCudaExl3Moe(const fastllm::Data &input, fastllm::Data &output,
     const fastllm::Data &index, const fastllm::Data &score, fastllm::Data **weights, int count, float limit);
+bool FastllmCudaExl3LinearShared(const fastllm::Data &input, fastllm::Data *const *weights,
+                               fastllm::Data *const *outputs, int count);
 bool FastllmCudaExl3Linear(const fastllm::Data &input, fastllm::Data &weight,
                           const fastllm::Data &bias, fastllm::Data &output);
 // Opaque cache records retain the original trellis and scale bytes. Inactive

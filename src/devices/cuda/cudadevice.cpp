@@ -5,6 +5,7 @@
 #include "exl3.h"
 #include "devices/cuda/fastllm-cuda-v41-gguf.h"
 #include "devices/cuda/fastllm-cuda-gguf-projections.h"
+#include "devices/cuda/fastllm-cuda-linear-shared.h"
 #include "devices/cuda/fastllm-cuda-gguf-linear-add.h"
 #include "devices/cuda/fastllm-cuda-gdn.h"
 #include "devices/cuda/fastllm-cuda-rmsnorm-small-linear.h"
@@ -43,6 +44,46 @@ extern "C" bool FastllmCudaDeepSeekV41HcPost(const fastllm::Data&, const fastllm
 #include <thread>
 #include <tuple>
 #include <vector>
+
+bool FastllmCudaLinearShared(const fastllm::Data &input,
+        fastllm::Data *const *weights, fastllm::Data *const *outputs, int count) {
+    using namespace fastllm;
+    if (count < 2 || !weights || !outputs || input.dims.empty() || input.dims.back() <= 0) return false;
+    for (int i = 0; i < count; ++i) if (!weights[i] || !outputs[i]) return false;
+    const DataType type = weights[0]->dataType;
+    for (int i = 1; i < count; ++i) if (weights[i]->dataType != type) return false;
+    // GGUF owns its packed tensor strides and validates those through ggmlTensor.
+    if (type == DATA_GGUF_FORMAT) return FastllmCudaGGUFLinearShared(input, weights, outputs, count);
+    if (type != EXL3) return false;
+    const std::vector<int> device{FastllmCudaGetDevice()};
+    auto resident = [&](const Data &d) {
+        if (d.multiDeviceData || d.dataDevice != CUDA || d.dataDeviceIds != device || !d.cudaData ||
+            d.dims.empty() || d.strides.size() != d.dims.size()) return false;
+        uint64_t stride = 1;
+        for (int i = int(d.dims.size()) - 1; i >= 0; --i) {
+            if (d.dims[i] <= 0 || d.strides[i] != stride) return false;
+            stride *= d.dims[i];
+        }
+        return true;
+    };
+    auto floating = [](DataType t) { return t == FLOAT32 || t == FLOAT16 || t == BFLOAT16; };
+    auto overlap = [](const Data &a, const Data &b) {
+        const uintptr_t x = reinterpret_cast<uintptr_t>(a.cudaData), y = reinterpret_cast<uintptr_t>(b.cudaData);
+        return x < y + b.GetBytes() && y < x + a.GetBytes();
+    };
+    if (!resident(input) || !floating(input.dataType)) return false;
+    const uint64_t rows = input.Count(0) / input.dims.back();
+    for (int i = 0; i < count; ++i) {
+        if (!resident(*weights[i]) || !resident(*outputs[i]) ||
+            weights[i]->dims.size() != 2 || weights[i]->dims[1] != input.dims.back() ||
+            !floating(outputs[i]->dataType) || outputs[i]->dims.back() != weights[i]->dims[0] ||
+            outputs[i]->Count(0) != rows * weights[i]->dims[0] || overlap(input, *outputs[i])) return false;
+        for (int j = 0; j < count; ++j)
+            if (overlap(*weights[j], *outputs[i]) ||
+                (j < i && overlap(*outputs[j], *outputs[i]))) return false;
+    }
+    return FastllmCudaExl3LinearShared(input, weights, outputs, count);
+}
 
 #if !defined(_WIN32) && !defined(USE_ROCM)
 #include <arpa/inet.h>
