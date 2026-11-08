@@ -7,6 +7,8 @@
 #include "fastllm.h"
 #include "utils/inference_trace.h"
 #include "kvmem.h"
+
+#include "utils/load_stage_timing.h"
 #if defined(USE_CUDA) && !defined(USE_ROCM)
 #include "devices/cuda/fastllm-fp8-auxiliary.h"
 #endif
@@ -26,10 +28,13 @@
 #include <cmath>
 #include <cfloat>
 #include <climits>
+#include <stdexcept>
 #include <thread>
+#include <chrono>
 #include <algorithm>
 #include <atomic>
 #include <queue>
+#include <tuple>
 
 #ifdef USE_MMAP
 #include <sys/mman.h>
@@ -122,6 +127,9 @@ namespace fastllm {
 
 #ifdef USE_CUDA
         static void *CudaMallocForData(const Data &data, uint64_t bytes) {
+            fastllm::LoadStageTiming &allocTiming = fastllm::GetLoadStageTiming();
+            allocTiming.allocForDataCalls.fetch_add(1, std::memory_order_relaxed);
+            fastllm::ScopedLoadTimer _allocTimer(allocTiming.allocForDataUs);
             if (data.cudaWorkspace) {
                 AssertInFastLLM(!data.isModelWeight && !data.isKVCache &&
                     !data.isFake && !FastllmCudaGraphIsCapturingFast() &&
@@ -134,6 +142,14 @@ namespace fastllm {
                 bool transientExpert = data.dataType == DataType::NVFP4_BLOCK_16_E4M3_PACKED &&
                     (data.tpLinearType == TP_LINEAR_ROW || data.tpLinearType == TP_LINEAR_COLUMN);
                 return FastllmCudaMallocModelWeightGrouped(bytes, data.name, transientExpert);
+            }
+            if (data.directMemory) {
+                // 与下面走 FastllmCudaDirectMalloc 的分支条件严格一致：compact NVFP4
+                // 专家分片由 split 显式置 directMemory=true，数量极大；优先走按层竞技场
+                // （用户态切片），避免每专家一次 cudaMalloc 在满载卡上约 240us 的代价。
+                if (void *arenaSlice = TryAllocateFromCudaWeightArena(bytes)) {
+                    return arenaSlice;
+                }
             }
             return data.directMemory ? FastllmCudaDirectMalloc(bytes) : FastllmCudaMalloc(bytes);
         }
@@ -2494,6 +2510,28 @@ namespace fastllm {
                 int input0Stride = this->Count(axis);
                 int inner = this->strides[axis];
                 int unitSize = this->unitSize;
+                if (getenv("FASTLLM_2DCOPY_TRACE") != nullptr) {
+                    // 诊断（默认关闭，仅 FASTLLM_2DCOPY_TRACE=1 时打印）：
+                    // 这次扩容拷贝的全部几何参数，用于判断是否 width > 行距。
+                    printf("[EXPANSION] axis=%d outer=%d inner=%d unitSize=%d unitSizeDiv=%d "
+                           "width=%llu dstPitch=%llu srcPitch=%llu width>dstPitch=%d width>srcPitch=%d\n",
+                           axis, outer, inner, unitSize, this->unitSizeDiv,
+                           (unsigned long long)((size_t)this->dims[axis] * inner * unitSize),
+                           (unsigned long long)((size_t)input0Stride * unitSize),
+                           (unsigned long long)((size_t)input1Stride * unitSize),
+                           (int)((size_t)this->dims[axis] * inner * unitSize > (size_t)input0Stride * unitSize),
+                           (int)((size_t)this->dims[axis] * inner * unitSize > (size_t)input1Stride * unitSize));
+                    printf("            dims=[");
+                    for (int di = 0; di < (int)this->dims.size(); di++) printf("%d%s", this->dims[di], di + 1 < (int)this->dims.size() ? "," : "");
+                    printf("] target=[");
+                    for (int di = 0; di < (int)dims.size(); di++) printf("%d%s", dims[di], di + 1 < (int)dims.size() ? "," : "");
+                    printf("] strides=[");
+                    for (int di = 0; di < (int)this->strides.size(); di++) printf("%d%s", this->strides[di], di + 1 < (int)this->strides.size() ? "," : "");
+                    printf("] expansionDims=[");
+                    for (int di = 0; di < (int)this->expansionDims.size(); di++) printf("%d%s", this->expansionDims[di], di + 1 < (int)this->expansionDims.size() ? "," : "");
+                    printf("] device=%d dataType=%d\n", (int)this->dataDevice, (int)this->dataType);
+                    fflush(stdout);
+                }
                 FastllmCudaMemcpy2DDeviceToDevice((uint8_t*)this->cudaData, input0Stride * unitSize,
                                             (uint8_t*)old, input1Stride * unitSize, this->dims[axis] * inner * unitSize, outer);
                 if (!oldBorrowed) {
@@ -4059,34 +4097,77 @@ namespace fastllm {
         this->peftDict[name][key] = value;
     }
 
+    // 通配匹配（零分配、线性时间）。语义与下面的 DpLinearNameMatch 一致：
+    // 模式里的 '*' 匹配任意长度（含空）的子串。
+    static bool FastLinearNameMatch(const char *s, const char *p) {
+        const size_t n = strlen(s), m = strlen(p);
+        size_t si = 0, pi = 0;
+        size_t star = (size_t)-1, retry = 0;
+        while (si < n) {
+            if (pi < m && p[pi] == '*') {
+                star = pi++;
+                retry = si;
+            } else if (pi < m && p[pi] == s[si]) {
+                ++pi;
+                ++si;
+            } else if (star != (size_t)-1) {
+                pi = star + 1;
+                si = ++retry;
+            } else {
+                return false;
+            }
+        }
+        while (pi < m && p[pi] == '*') ++pi;
+        return pi == m;
+    }
+
+    // 原实现（DP + 每次分配 (n+1)x(m+1) 的二维表）。
+    // 仅在 key 自身含 '*' 这种非常规输入时作为兜底使用 —— 原实现对 key 里的 '*'
+    // 也按通配处理，与标准 glob 语义不同，不能改动这类输入的行为。
+    static bool DpLinearNameMatch(const std::string &key, const std::string &linearName) {
+        int n = key.size(), m = linearName.size();
+        std::vector <std::vector <bool> > f = std::vector <std::vector <bool> > (n + 1, std::vector <bool>(m + 1, 0));
+        f[0][0] = 1;
+        for (int i = 0; i <= n; i++) {
+            for (int j = 0; j <= m; j++) {
+                if (f[i][j]) {
+                    if (i + 1 <= n && key[i] == '*') {
+                        for (int l = j; l <= m; l++) {
+                            f[i + 1][l] = 1;
+                        }
+                    }
+                    if (j + 1 <= m && linearName[j] == '*') {
+                        for (int l = i; l <= n; l++) {
+                            f[l][j + 1] = 1;
+                        }
+                    }
+                    if (i + 1 <= n && j + 1 <= m && key[i] == linearName[j]) {
+                        f[i + 1][j + 1] = 1;
+                    }
+                }
+            }
+        }
+        return f[n][m] != 0;
+    }
+
     WeightType WeightMap::GetWeightType(const std::string &key) {
         if (this->embeddingNames.find(key) != this->embeddingNames.end()) {
             return WeightType::EMBEDDING;
         }
+        // 原来这里对每条模式都新建一张二维表做 DP，逐个名字的开销是 525 微秒；
+        // 换成下面的比法后实测 2.8 微秒（离线核对：对全部 149,019 个真实名字，
+        // 新旧结果逐名完全一致；见 tools/tp5/weighttype_probe.cpp）。
+        const bool keyHasStar = key.find('*') != std::string::npos;
         for (auto &linearName : this->linearNames) {
-            int n = key.size(), m = linearName.size();
-            std::vector <std::vector <bool> > f = std::vector <std::vector <bool> > (n + 1, std::vector <bool>(m + 1, 0));
-            f[0][0] = 1;
-            for (int i = 0; i <= n; i++) {
-                for (int j = 0; j <= m; j++) {
-                    if (f[i][j]) {
-                        if (i + 1 <= n && key[i] == '*') {
-                            for (int l = j; l <= m; l++) {
-                                f[i + 1][l] = 1;
-                            }
-                        }
-                        if (j + 1 <= m && linearName[j] == '*') {
-                            for (int l = i; l <= n; l++) {
-                                f[l][j + 1] = 1;
-                            }
-                        }
-                        if (i + 1 <= n && j + 1 <= m && key[i] == linearName[j]) {
-                            f[i + 1][j + 1] = 1;
-                        }
-                    }
-                }
+            bool matched;
+            if (keyHasStar) {
+                matched = DpLinearNameMatch(key, linearName);      // 兜底：保持原语义
+            } else if (linearName.find('*') == std::string::npos) {
+                matched = (linearName == key);                     // 无通配：直接比
+            } else {
+                matched = FastLinearNameMatch(key.c_str(), linearName.c_str());
             }
-            if (f[n][m]) {
+            if (matched) {
                 return WeightType::LINEAR;
             }
         }
@@ -6022,286 +6103,1148 @@ namespace fastllm {
     }
 
     void PagedCacheManager::SetMaxPages(int maxPages) {
-        std::lock_guard<std::mutex> guard(pageIndexLocker);
-        if (trieRoot) EvictTrieSubtree(trieRoot);
+        std::lock_guard<std::mutex> guard(this->pageIndexLocker);
+        if (!this->pendingRecycleTickets.empty()) {
+            throw std::runtime_error("PagedCacheManager::SetMaxPages: recycle still pending");
+        }
+        const auto preservedQuarantine = this->quarantinedRecyclePages;
+        const auto preservedFailures = this->failedRecycleTickets;
+        const auto preservedFailureSerials = this->failedRecycleSerials;
         this->maxPages = maxPages;
-        freePages.clear(); triePages.clear();
-        evictableLeaves.clear();
-        pageToTrieNode.assign(maxPages, nullptr);
-        freePageFlags.assign(maxPages, 1);
-        freePages.reserve(maxPages);
-        for (int i = 0; i < maxPages; ++i) {
-            freePages.push_back(i);
+        this->deferredRecycleEnabled = false;
+        this->recycleReservePage = -1;
+        this->pendingRecycleTickets.clear();
+        this->pendingRecyclePages.clear();
+        this->quarantinedRecyclePages.clear();
+        this->failedRecycleTickets.clear();
+        this->freePages.clear();
+        this->triePages.clear();
+        this->freePagesSet.clear();
+        this->triePagesSet.clear();
+        this->freePages.reserve(maxPages);
+        this->freePagesSet.reserve(maxPages);
+        for (int i = 0; i < maxPages; i++) {
+            this->freePages.push_back(i);
+            this->freePagesSet.insert(i);
         }
-        pageTimestamp.assign(maxPages, 0);
-        pageRefCount.assign(maxPages, 0);
-        // Keep generations monotonic across pool resets as well as page reuse.
-        trieRoot = new CacheTrieNode();
-    }
-
-    void PagedCacheManager::UpdateEvictableLeaf(CacheTrieNode *node) {
-        if (!node || node->pageId < 0) return;
-        if (node->evictable) evictableLeaves.erase({node->lastAccess, node->pageId});
-        node->evictable = pageRefCount[node->pageId] == 0 && !node->HasChildren();
-        if (node->evictable)
-            evictableLeaves.insert({node->lastAccess, node->pageId});
-    }
-
-    void PagedCacheManager::TouchTrieNode(CacheTrieNode *node, long long access) {
-        // Matching changes recency, not references or trie topology. Internal
-        // nodes need no leaf-set work; retain the allocation for an actual leaf.
-        if (node->evictable) {
-            auto entry = evictableLeaves.extract({node->lastAccess, node->pageId});
-            entry.value().first = access;
-            evictableLeaves.insert(std::move(entry));
+        this->pageTimestamp.assign(maxPages, 0);
+        this->pageRefCount.assign(maxPages, 0);
+        this->currentTimestamp = 0;
+        this->recordProducerEvent.reset();
+        this->pageToTrieNode.clear();
+        for (int page : preservedQuarantine) {
+            if (page >= 0 && page < maxPages) {
+                this->quarantinedRecyclePages.insert(page);
+                this->freePagesSet.erase(page);
+                this->freePages.erase(std::remove(this->freePages.begin(),
+                                                  this->freePages.end(), page),
+                                      this->freePages.end());
+            }
         }
-        node->lastAccess = access;
+        for (const auto &entry : preservedFailures) {
+            if (entry.second && entry.second->pageIndex >= 0 &&
+                entry.second->pageIndex < maxPages) {
+                this->failedRecycleTickets.emplace(entry.first, entry.second);
+                this->failedRecycleSerials.insert(entry.first);
+            }
+        }
+        for (uint64_t serial : preservedFailureSerials) {
+            this->failedRecycleSerials.insert(serial);
+        }
+        if (this->trieRoot) {
+            // 简单起见，不递归删除旧树节点（在生命周期内 SetMaxPages 通常只调用一次）
+        }
+        this->trieRoot = new CacheTrieNode();
+        // 【一本账·淘汰世代】整池重置 = 全部前缀一次性消失
+        this->evictionEpoch++;
     }
 
-    void PagedCacheManager::RemoveTriePage(int pageIndex) {
-        auto *node = pageToTrieNode[pageIndex];
-        if (!node || node->unusedIndex < 0) return;
-        const int index = node->unusedIndex;
-        int moved = triePages.back();
-        triePages[index] = moved;
-        triePages.pop_back();
-        pageToTrieNode[moved]->unusedIndex = index;
-        node->unusedIndex = -1;
+    void PagedCacheManager::EnableDeferredRecycle() {
+        std::lock_guard<std::mutex> guard(this->pageIndexLocker);
+        if (this->deferredRecycleEnabled) return;
+
+        this->deferredRecycleEnabled = true;
+        if (this->recycleReservePage < 0 && !this->freePages.empty()) {
+            this->recycleReservePage = this->freePages.back();
+            this->freePages.pop_back();
+            this->freePagesSet.erase(this->recycleReservePage);
+            this->pageRefCount[this->recycleReservePage] = 0;
+        }
     }
 
-    // The caller owns pageIndexLocker (or is destroying an idle pool).
+    void PagedCacheManager::DisableDeferredRecycle() {
+        std::lock_guard<std::mutex> guard(this->pageIndexLocker);
+        this->deferredRecycleEnabled = false;
+        // A migration ticket may still be in flight.  It owns its victim
+        // page until CompleteRecyclePage; only the unused replacement reserve
+        // can safely return to the ordinary free pool here.
+        if (this->recycleReservePage >= 0) {
+            const int reserve = this->recycleReservePage;
+            this->recycleReservePage = -1;
+            if (!this->pendingRecyclePages.count(reserve) &&
+                !this->quarantinedRecyclePages.count(reserve) &&
+                this->freePagesSet.insert(reserve).second) {
+                this->freePages.push_back(reserve);
+            }
+        }
+    }
+
+    void PagedCacheManager::CompleteRecyclePage(
+            const std::shared_ptr<RecycleTicket> &ticket, bool success,
+            const char *failureReason) {
+        if (!ticket) return;
+        std::lock_guard<std::mutex> guard(this->pageIndexLocker);
+
+        auto it = this->pendingRecycleTickets.find(ticket->serial);
+        if (it == this->pendingRecycleTickets.end() ||
+            it->second.ticket != ticket || it->second.pageIndex != ticket->pageIndex ||
+            it->second.pageHash != ticket->pageHash ||
+            ticket->pageIndex < 0 || ticket->pageIndex >= this->maxPages) {
+            // Completion is deliberately idempotent. A stale/duplicate ticket
+            // must never alter a page that has since been reused. Failed
+            // tickets remain terminally recorded so a second completion cannot
+            // accidentally make their quarantined page allocatable.
+            return;
+        }
+        const int pageIndex = ticket->pageIndex;
+        this->pendingRecycleTickets.erase(it);
+        this->pendingRecyclePages.erase(pageIndex);
+
+        // The victim's refcount is the migration lease installed by
+        // GetUnusedPageIndex.  It must be released only after the host owner
+        // has acknowledged the D2H transfer.
+        if (!success) {
+            this->pageRefCount[pageIndex] = 1;
+            this->quarantinedRecyclePages.insert(pageIndex);
+            this->failedRecycleSerials.insert(ticket->serial);
+            ticket->terminal = true;
+            ticket->success = false;
+            ticket->failureReason = failureReason == nullptr ?
+                "recycle_failed" : failureReason;
+            this->failedRecycleTickets[ticket->serial] = ticket;
+            std::fprintf(stderr,
+                         "[PrefixCache] recycle-quarantine: serial=%llu page=%d ref=1 "
+                         "reason=%s.\n",
+                         (unsigned long long)ticket->serial, pageIndex,
+                         ticket->failureReason.c_str());
+            return;
+        }
+
+        this->pageRefCount[pageIndex] = 0;
+        ticket->terminal = true;
+        ticket->success = true;
+        ticket->failureReason.clear();
+
+        if (this->deferredRecycleEnabled && this->recycleReservePage < 0) {
+            this->recycleReservePage = pageIndex;
+            return;
+        }
+        if (this->freePagesSet.insert(pageIndex).second) {
+            this->freePages.push_back(pageIndex);
+        }
+    }
+
+    // 从 Trie 中移除一个叶子节点，断开父子关系并清理映射
+    static void RemoveTrieLeaf(CacheTrieNode *node, int pageIndex,
+                               std::unordered_map<int, CacheTrieNode*> &pageToTrieNode) {
+        if (node->parent) {
+            node->parent->children.erase(node->edgeHash);
+        }
+        pageToTrieNode.erase(pageIndex);
+        delete node;
+    }
+
+    bool PagedCacheManager::PrepareFreePages(
+            int count, const RecycleRequestIdentity &identity) {
+        if (count <= 0) return true;
+        std::vector<std::tuple<int, uint64_t, std::shared_ptr<RecycleTicket> > > callbacks;
+        std::function<void(int, uint64_t, const std::shared_ptr<RecycleTicket>&)> callback;
+        {
+            std::lock_guard<std::mutex> guard(this->pageIndexLocker);
+            const bool deferredProtocol = this->deferredRecycleEnabled;
+            if (!deferredProtocol) {
+                return this->FreePageCount() >= count;
+            }
+            auto ready = [&]() {
+                return (int)this->freePages.size();
+            };
+            if (ready() >= count) return true;
+            if (!this->onRecyclePage) return false;
+            callback = this->onRecyclePage;
+
+            // An outstanding ticket is a possible future free page, but it is
+            // not allocatable until its host owner acknowledges the transfer.
+            // Account for both already-pending tickets and tickets dispatched
+            // by this call so one preflight does not evict the whole trie when
+            // only a small number of pages is missing.
+            int inFlight = (int)this->pendingRecycleTickets.size();
+            while (ready() + inFlight < count) {
+                int victim = -1;
+                bool victimIsLeaf = false;
+                for (int i = 0; i < (int)this->triePages.size(); ++i) {
+                    const int candidate = this->triePages[i];
+                    if (candidate < 0 || candidate >= this->maxPages ||
+                        this->pageRefCount[candidate] != 0 ||
+                        !this->triePagesSet.count(candidate) ||
+                        this->pendingRecyclePages.count(candidate) ||
+                        this->quarantinedRecyclePages.count(candidate)) continue;
+                    auto found = this->pageToTrieNode.find(candidate);
+                    if (found == this->pageToTrieNode.end()) continue;
+                    const bool leaf = found->second->children.empty();
+                    if (victim < 0 || (leaf && !victimIsLeaf) ||
+                        (leaf == victimIsLeaf &&
+                         this->pageTimestamp[candidate] <
+                         this->pageTimestamp[this->triePages[victim]])) {
+                        victim = i;
+                        victimIsLeaf = leaf;
+                    }
+                }
+                if (victim < 0) break;
+                const int pageIndex = this->triePages[victim];
+                auto found = this->pageToTrieNode.find(pageIndex);
+                if (found == this->pageToTrieNode.end()) break;
+                CacheTrieNode *node = found->second;
+                auto ticket = std::make_shared<RecycleTicket>();
+                ticket->pageIndex = pageIndex;
+                ticket->pageHash = node->pageHash;
+                ticket->parentHash = node->parent == nullptr ? 0 : node->parent->pageHash;
+                ticket->extraKey = node->extraKey;
+                ticket->generation = (uint64_t)this->pageTimestamp[pageIndex];
+                ticket->producerEvent = node->producerEvent;
+                uint64_t pageOrdinal = 0;
+                for (CacheTrieNode *cursor = node; cursor != nullptr && cursor->parent != nullptr;
+                     cursor = cursor->parent) ++pageOrdinal;
+                ticket->pageOrdinal = pageOrdinal == 0 ? 0 : pageOrdinal - 1;
+                ticket->serial = ++this->nextRecycleSerial;
+                ticket->requestIdentity = identity;
+                PendingRecycle pending;
+                pending.ticket = ticket;
+                pending.pageIndex = pageIndex;
+                pending.pageHash = ticket->pageHash;
+                this->pendingRecycleTickets.emplace(ticket->serial, pending);
+                this->pendingRecyclePages.insert(pageIndex);
+                this->triePages[victim] = this->triePages.back();
+                this->triePages.pop_back();
+                this->triePagesSet.erase(pageIndex);
+                if (node->children.empty()) {
+                    RemoveTrieLeaf(node, pageIndex, this->pageToTrieNode);
+                } else {
+                    node->pageId = -1;
+                    this->pageToTrieNode.erase(found);
+                }
+                ++this->evictionEpoch;
+                this->pageRefCount[pageIndex] = 1; // migration lease
+                callbacks.emplace_back(pageIndex, ticket->pageHash, std::move(ticket));
+                ++inFlight;
+            }
+        }
+        for (auto &entry : callbacks) {
+            const auto &ticket = std::get<2>(entry);
+            try {
+                callback(std::get<0>(entry), std::get<1>(entry), ticket);
+            } catch (...) {
+                this->CompleteRecyclePage(ticket, false, "recycle_callback_threw");
+            }
+        }
+        std::lock_guard<std::mutex> guard(this->pageIndexLocker);
+        return this->ReadyFreePageCount() >= count;
+    }
+
+    bool PagedCacheManager::DeferredRecycleCapacityUnavailable(int count) {
+        if (count <= 0) return false;
+        std::lock_guard<std::mutex> guard(this->pageIndexLocker);
+        if (!this->deferredRecycleEnabled ||
+            (int)this->freePages.size() >= count ||
+            !this->pendingRecycleTickets.empty()) return false;
+        for (int candidate : this->triePages) {
+            if (candidate < 0 || candidate >= this->maxPages ||
+                this->pageRefCount[candidate] != 0 ||
+                !this->triePagesSet.count(candidate) ||
+                this->pendingRecyclePages.count(candidate) ||
+                this->quarantinedRecyclePages.count(candidate)) continue;
+            if (this->pageToTrieNode.find(candidate) != this->pageToTrieNode.end())
+                return false;
+        }
+        std::fprintf(stderr,
+                     "[PrefixCache] capacity_unavailable: deferred recycle has no eligible replacement "
+                     "page requested=%d free=%zu pending=%zu trie=%zu quarantined=%zu.\n",
+                     count, this->freePages.size(), this->pendingRecycleTickets.size(),
+                     this->triePages.size(), this->quarantinedRecyclePages.size());
+        return true;
+    }
+
+    // 递归删除 Trie 子树中所有节点，将其关联的页面迁移回 freePages
     void PagedCacheManager::EvictTrieSubtree(CacheTrieNode *node) {
-        if (node->branches) {
-            for (auto &child : *node->branches) EvictTrieSubtree(child.second);
-        } else if (node->singleChild) EvictTrieSubtree(node->singleChild);
-        const int pid = node->pageId;
+        // 【一本账·淘汰世代】子树里每个带页的节点都让一段前缀消失
+        if (node != nullptr && node->pageId >= 0) this->evictionEpoch++;
+        // 先递归处理所有子节点
+        for (auto &kv : node->children) {
+            EvictTrieSubtree(kv.second);
+        }
+        int pid = node->pageId;
         if (pid >= 0) {
-            if (node->evictable) evictableLeaves.erase({node->lastAccess, pid});
-            RemoveTriePage(pid);
-            pageToTrieNode[pid] = nullptr;
-            pageTimestamp[pid] = ++currentTimestamp;
-            if (pageRefCount[pid] == 0 && !freePageFlags[pid]) {
-                freePageFlags[pid] = 1;
-                freePages.push_back(pid);
+            this->pageToTrieNode.erase(pid);
+            // 如果页面空闲（在 triePagesSet 中），迁移到 freePages
+            if (this->triePagesSet.erase(pid)) {
+                this->freePagesSet.insert(pid);
+                this->freePages.push_back(pid);
             }
         }
         delete node;
     }
 
-    void PagedCacheManager::PrepareFreePages(int count) {
-        while ((int)freePages.size() < count) {
-            if (triePages.empty())
-                ErrorInFastLLM("PagedCacheManager: no unused page available.\n");
-            CacheTrieNode *node = nullptr;
-            if (!evictableLeaves.empty()) {
-                node = pageToTrieNode.at(evictableLeaves.begin()->second);
+    static void FastllmDiagSortFreePages(std::vector<int> &freePages);
+
+    int PagedCacheManager::GetUnusedPageIndex(
+            bool pick, bool onlyFree, const RecycleRequestIdentity &identity) {
+        // KVPAIR: paired K/V allocation (see fastllm.h); -1 means "use the single-manager path below".
+        if (pick && !onlyFree && this->pairPartner != nullptr) {
+            const int paired = this->PairAllocate();
+            if (paired >= 0) return paired;
+        }
+        std::unique_lock<std::mutex> guard(this->pageIndexLocker);
+        // Background prefetch may use spare pages but must never evict the
+        // primary GPU cache. Admission and reservation are atomic here.
+        if (onlyFree && this->freePages.empty()) return -1;
+        const bool deferredProtocol = this->deferredRecycleEnabled;
+
+        // 尝试将 triePages 中已不在 Trie 中的 stale 条目迁移到 freePages
+        while (this->freePages.empty() && !this->triePages.empty()) {
+            int candidate = this->triePages.back();
+            auto it = this->pageToTrieNode.find(candidate);
+            if (it == this->pageToTrieNode.end() &&
+                !this->pendingRecyclePages.count(candidate) &&
+                !this->quarantinedRecyclePages.count(candidate)) {
+                // 页面已不在 Trie 中，迁移到 freePages
+                this->triePages.pop_back();
+                this->triePagesSet.erase(candidate);
+                this->freePages.push_back(candidate);
+                this->freePagesSet.insert(candidate);
             } else {
-                // Defensive fallback for callers retaining only a suffix of a
-                // chain. Detach its metadata without freeing referenced pages.
-                for (int pid : triePages) {
-                    auto *candidate = pageToTrieNode[pid];
-                    if (!node || candidate->lastAccess < node->lastAccess)
-                        node = candidate;
+                break;
+            }
+        }
+
+        // The deferred-recycle reserve is a replacement page for the next
+        // victim migration.  It must never be consumed as an ordinary free
+        // page: doing so leaves no destination for the following recycle and
+        // makes the real allocator fail before invoking onRecyclePage.
+        // Keep it protected; if there is no eligible victim, report bounded
+        // capacity failure rather than violating the migration contract.
+        if (this->freePages.empty() && this->triePages.empty()) {
+            if (deferredProtocol) {
+                throw std::runtime_error(
+                    "capacity_unavailable: paged recycle has no replacement page");
+            }
+            ErrorInFastLLM("PagedCacheManager::GetUnusedPageIndex: no page can be use.\n");
+        }
+
+        if (!this->freePages.empty()) {
+            FastllmDiagSortFreePages(this->freePages);
+            const int pageIndex = this->freePages.back();
+            if (pick) {
+                this->freePages.pop_back();
+                this->freePagesSet.erase(pageIndex);
+                this->pageRefCount[pageIndex] = 1;
+                // A-3/S5 入库章：页从池里交出去的那一刻就盖唯一递增号。
+                // 检查点导出要求每页 pageTimestamp != 0
+                //（qwen3_5_persistent.inc:2315-2318），否则整份检查点被丢弃
+                //（"capture skipped: ssd_page_generation_missing"）。
+                // 发布时 RecordPage 用新 ts 同时刷新 pageTimestamp 与 node->timestamp
+                //（fastllm.cpp:6709-6723），"页号==节点号"的既有不变量不变。
+                this->pageTimestamp[pageIndex] = ++this->currentTimestamp;
+            }
+            return pageIndex;
+        } else {
+            // Reuse the existing trie and timestamps: reclaim the least
+            // recently used eligible leaf (SGLang radix-cache LRU). A read
+            // lease or in-flight backup must never become an eviction victim.
+            int victim = -1;
+            bool victimIsLeaf = false;
+            for (int i = 0; i < (int)this->triePages.size(); ++i) {
+                const int candidate = this->triePages[i];
+                if (candidate < 0 || candidate >= this->maxPages ||
+                    this->pageRefCount[candidate] != 0 ||
+                    !this->triePagesSet.count(candidate) ||
+                    this->pendingRecyclePages.count(candidate) ||
+                    this->quarantinedRecyclePages.count(candidate)) continue;
+                auto found = this->pageToTrieNode.find(candidate);
+                if (deferredProtocol && found == this->pageToTrieNode.end()) continue;
+                const bool leaf = found == this->pageToTrieNode.end() ||
+                                  found->second->children.empty();
+                if (victim == -1 || (leaf && !victimIsLeaf) ||
+                    (leaf == victimIsLeaf && this->pageTimestamp[candidate] <
+                                             this->pageTimestamp[this->triePages[victim]])) {
+                    victim = i;
+                    victimIsLeaf = leaf;
                 }
             }
-            CacheTrieNode *parent = node->parent;
-            if (parent) parent->EraseChild(node->edgeHash);
-            EvictTrieSubtree(node);
-            UpdateEvictableLeaf(parent);
-        }
-    }
-
-    int PagedCacheManager::GetUnusedPageIndex(bool pick) {
-        std::lock_guard<std::mutex> guard(pageIndexLocker);
-        PrepareFreePages(1);
-        int pageIndex = freePages.back();
-        if (pick) {
-            freePages.pop_back();
-            freePageFlags[pageIndex] = 0;
-            pageRefCount[pageIndex] = 1;
-            pageTimestamp[pageIndex] = ++currentTimestamp;
-        }
-        return pageIndex;
-    }
-
-    void PagedCacheManager::PreviewUnusedPageIndices(int count, std::vector<int> &pages) {
-        std::lock_guard<std::mutex> guard(pageIndexLocker);
-        PrepareFreePages(count);
-        pages.clear();
-        for (int i = 0; i < count; ++i) pages.push_back(freePages[freePages.size() - 1 - i]);
-    }
-
-    bool PagedCacheManager::IsCachedPage(int pageIndex, long long generation) {
-        std::lock_guard<std::mutex> guard(pageIndexLocker);
-        auto *node = pageIndex >= 0 && pageIndex < maxPages ? pageToTrieNode[pageIndex] : nullptr;
-        return node && pageTimestamp[pageIndex] == generation && node->timestamp == generation;
-    }
-
-    void PagedCacheManager::ReleasePageIndexLocked(int pageIndex) {
-        if (--pageRefCount[pageIndex] > 0) return;
-        pageRefCount[pageIndex] = 0;
-        auto *node = pageToTrieNode[pageIndex];
-        if (node) {
-            if (node->unusedIndex < 0) {
-                node->unusedIndex = (int)triePages.size();
-                triePages.push_back(pageIndex);
+            if (victim == -1) {
+                if (deferredProtocol) {
+                    throw std::runtime_error(
+                        "capacity_unavailable: paged recycle has no replacement page");
+                }
+                ErrorInFastLLM("PagedCacheManager::GetUnusedPageIndex: all pages are pinned.\n");
             }
-            UpdateEvictableLeaf(node);
-        } else if (!freePageFlags[pageIndex]) {
-            freePageFlags[pageIndex] = 1;
-            freePages.push_back(pageIndex);
+            const int pageIndex = this->triePages[victim];
+            if (!pick) return pageIndex;
+            auto found = this->pageToTrieNode.find(pageIndex);
+            if (found != this->pageToTrieNode.end() && deferredProtocol) {
+                if (!this->onRecyclePage) {
+                    throw std::runtime_error(
+                        "capacity_unavailable: deferred recycle callback is unavailable");
+                }
+                // A victim cannot be removed until a replacement page is
+                // already reserved.  Preflight callers use PrepareFreePages;
+                // never evict a GPU page and then discover there is nowhere
+                // for its request to go.
+                if (this->recycleReservePage < 0) {
+                    throw std::runtime_error(
+                        "capacity_unavailable: deferred recycle has no reserve page");
+                }
+                CacheTrieNode *node = found->second;
+                const uint64_t pageHash = node->pageHash;
+                std::function<void(int, uint64_t,
+                                   const std::shared_ptr<RecycleTicket>&)> callback =
+                    this->onRecyclePage;
+                auto ticket = std::make_shared<RecycleTicket>();
+                ticket->pageIndex = pageIndex;
+                ticket->pageHash = pageHash;
+                ticket->parentHash = node->parent == nullptr ? 0 : node->parent->pageHash;
+                ticket->extraKey = node->extraKey;
+                ticket->generation = (uint64_t)this->pageTimestamp[pageIndex];
+                ticket->producerEvent = node->producerEvent;
+                uint64_t pageOrdinal = 0;
+                for (CacheTrieNode *cursor = node; cursor != nullptr && cursor->parent != nullptr;
+                     cursor = cursor->parent) ++pageOrdinal;
+                ticket->pageOrdinal = pageOrdinal == 0 ? 0 : pageOrdinal - 1;
+                ticket->serial = ++this->nextRecycleSerial;
+                ticket->requestIdentity = identity;
+                PendingRecycle pending;
+                pending.ticket = ticket;
+                pending.pageIndex = pageIndex;
+                pending.pageHash = pageHash;
+                this->pendingRecycleTickets.emplace(ticket->serial, pending);
+                this->pendingRecyclePages.insert(pageIndex);
+                this->triePages[victim] = this->triePages.back();
+                this->triePages.pop_back();
+                this->triePagesSet.erase(pageIndex);
+                if (node->children.empty()) {
+                    RemoveTrieLeaf(node, pageIndex, this->pageToTrieNode);
+                } else {
+                    // Descendants can have independent active read/store
+                    // leases. Release only this page; preserve their nodes.
+                    node->pageId = -1;
+                    this->pageToTrieNode.erase(found);
+                }
+                ++this->evictionEpoch;
+                this->pageRefCount[pageIndex] = 1; // migration lease
+                const int replacement = this->recycleReservePage;
+                if (replacement >= 0) {
+                    this->recycleReservePage = -1;
+                    this->pageRefCount[replacement] = 1;
+                    // A-3/S5 入库章：替换页同样刚交出去，必须带唯一递增号。
+                    this->pageTimestamp[replacement] = ++this->currentTimestamp;
+                }
+                guard.unlock();
+                bool callbackFailed = false;
+                try {
+                    callback(pageIndex, pageHash, ticket);
+                } catch (...) {
+                    callbackFailed = true;
+                    this->CompleteRecyclePage(ticket, false, "recycle_callback_threw");
+                    if (replacement >= 0) this->ReleasePageIndex(replacement);
+                }
+                if (replacement < 0) {
+                    throw std::runtime_error(
+                        "capacity_unavailable: paged recycle has no replacement page");
+                }
+                if (callbackFailed) {
+                    throw std::runtime_error(
+                        "capacity_unavailable: paged recycle callback failed");
+                }
+                bool completedFailure = false;
+                {
+                    std::lock_guard<std::mutex> stateGuard(this->pageIndexLocker);
+                    completedFailure = this->failedRecycleSerials.count(ticket->serial) != 0;
+                }
+                if (completedFailure) {
+                    this->ReleasePageIndex(replacement);
+                    throw std::runtime_error(
+                        "capacity_unavailable: paged recycle failed");
+                }
+                return replacement;
+            } else {
+                this->triePages[victim] = this->triePages.back();
+                this->triePages.pop_back();
+                this->triePagesSet.erase(pageIndex);
+                if (found != this->pageToTrieNode.end()) {
+                    CacheTrieNode *node = found->second;
+                    if (node->children.empty()) {
+                        RemoveTrieLeaf(node, pageIndex, this->pageToTrieNode);
+                    } else {
+                        // Descendants can have independent active read/store
+                        // leases. Release only this page; preserve their nodes.
+                        node->pageId = -1;
+                        this->pageToTrieNode.erase(found);
+                    }
+                    ++this->evictionEpoch;
+                }
+                this->pageRefCount[pageIndex] = 1;
+                // A-3/S5 入库章：非延迟回收直接复用的页也要盖章。
+                this->pageTimestamp[pageIndex] = ++this->currentTimestamp;
+                return pageIndex;
+            }
+        }
+        return -1;
+    }
+
+    bool PagedKVPairAllocEnabled() {
+        static const bool enabled = [] {
+            const char *v = std::getenv("FASTLLM_PAGED_KV_PAIR_ALLOC");
+            return v != nullptr && std::string(v) == "1";
+        }();
+        return enabled;
+    }
+
+    void PairPagedCacheManagers(PagedCacheManager *key, PagedCacheManager *value) {
+        if (!PagedKVPairAllocEnabled() || key == nullptr || value == nullptr || key == value) return;
+        if (key->pairPartner == value && value->pairPartner == key) return;  // fast path, already linked
+        std::unique_lock<std::mutex> a(key->pageIndexLocker, std::defer_lock), b(value->pageIndexLocker, std::defer_lock);
+        std::lock(a, b);
+        if (key->pairPartner == value && value->pairPartner == key) return;
+        if (key->pairPartner != nullptr || value->pairPartner != nullptr || key->maxPages != value->maxPages) {
+            static std::atomic<int> warned{0};
+            if (warned.fetch_add(1) < 4)
+                printf("[KVPAIR] pair-link skipped: key_partner=%p value_partner=%p max=%d/%d.\n",
+                       (void*)key->pairPartner, (void*)value->pairPartner, key->maxPages, value->maxPages);
+            return;
+        }
+        key->pairPartner = value;
+        value->pairPartner = key;
+    }
+
+    // Diagnosis only (default off): FASTLLM_PAGED_FREE_MAX_FIRST=1 keeps the free
+    // list ascending before every pick, so the back-first scans hand out the
+    // highest free page and every request gets the same descending contiguous
+    // layout as the first request of a process.
+    static void FastllmDiagSortFreePages(std::vector<int> &freePages) {
+        static const bool on = [] {
+            const char *env = std::getenv("FASTLLM_PAGED_FREE_MAX_FIRST");
+            return env != nullptr && env[0] == '1' && env[1] == '\0';
+        }();
+        if (!on) return;
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true)) { printf("[PagedCache] free-max-first enabled\n"); fflush(stdout); }
+        if (!std::is_sorted(freePages.begin(), freePages.end())) std::sort(freePages.begin(), freePages.end());
+    }
+
+    bool PagedCacheManager::PairClaimableLocked(int page) const {
+        if (page < 0 || page >= this->maxPages || this->pageRefCount[page] != 0 ||
+            this->pendingRecyclePages.count(page) || this->quarantinedRecyclePages.count(page) ||
+            this->recycleReservePage == page) return false;
+        return this->freePagesSet.count(page) != 0 || this->triePagesSet.count(page) != 0;
+    }
+
+    // Takes a claimable page out of the free or trie pool exactly like the non-deferred paths of
+    // GetUnusedPageIndex (trie leaf removed, inner node keeps its children). Caller holds the lock.
+    void PagedCacheManager::PairClaimLocked(int page) {
+        if (this->freePagesSet.erase(page)) {
+            for (int i = (int)this->freePages.size() - 1; i >= 0; --i)
+                if (this->freePages[i] == page) { this->freePages.erase(this->freePages.begin() + i); break; }
+            return;
+        }
+        if (this->triePagesSet.erase(page)) {
+            for (int i = (int)this->triePages.size() - 1; i >= 0; --i)
+                if (this->triePages[i] == page) { this->triePages[i] = this->triePages.back(); this->triePages.pop_back(); break; }
+            auto found = this->pageToTrieNode.find(page);
+            if (found != this->pageToTrieNode.end()) {
+                CacheTrieNode *node = found->second;
+                if (node->children.empty()) {
+                    RemoveTrieLeaf(node, page, this->pageToTrieNode);
+                } else {
+                    node->pageId = -1;
+                    this->pageToTrieNode.erase(found);
+                }
+                ++this->evictionEpoch;
+            }
+        }
+    }
+
+    int PagedCacheManager::PairAllocate() {
+        PagedCacheManager *partner = this->pairPartner;
+        std::unique_lock<std::mutex> a(this->pageIndexLocker, std::defer_lock), b(partner->pageIndexLocker, std::defer_lock);
+        std::lock(a, b);
+        if (this->deferredRecycleEnabled || partner->deferredRecycleEnabled) { ++this->pairFallbacks; return -1; }
+        const std::thread::id self = std::this_thread::get_id();
+        for (auto it = this->pairReserved.begin(); it != this->pairReserved.end(); ++it) {
+            if (it->owner != self) continue;
+            const int page = it->page;
+            this->pairReserved.erase(it);
+            this->pageRefCount[page] = 1;
+            this->pageTimestamp[page] = ++this->currentTimestamp;
+            ++this->pairConsumed;
+            return page;
+        }
+        FastllmDiagSortFreePages(this->freePages);
+        int chosen = -1;
+        for (int i = (int)this->freePages.size() - 1; i >= 0 && chosen < 0; --i)
+            if (partner->PairClaimableLocked(this->freePages[i])) chosen = this->freePages[i];
+        if (chosen < 0) {
+            // Same victim preference as GetUnusedPageIndex: leaves first, then least recently used.
+            bool chosenLeaf = false;
+            for (int candidate : this->triePages) {
+                if (!this->PairClaimableLocked(candidate) || !partner->PairClaimableLocked(candidate)) continue;
+                auto found = this->pageToTrieNode.find(candidate);
+                const bool leaf = found == this->pageToTrieNode.end() || found->second->children.empty();
+                if (chosen < 0 || (leaf && !chosenLeaf) ||
+                    (leaf == chosenLeaf && this->pageTimestamp[candidate] < this->pageTimestamp[chosen])) {
+                    chosen = candidate;
+                    chosenLeaf = leaf;
+                }
+            }
+        }
+        if (chosen < 0) { ++this->pairFallbacks; return -1; }
+        this->PairClaimLocked(chosen);
+        partner->PairClaimLocked(chosen);
+        partner->pairReserved.push_back(PairReservation{chosen, self});
+        this->pageRefCount[chosen] = 1;
+        this->pageTimestamp[chosen] = ++this->currentTimestamp;
+        ++this->pairAllocs;
+        return chosen;
+    }
+
+    bool PagedCacheManager::PairReserveForThread(int count, std::vector<int> &pages) {
+        pages.clear();
+        PagedCacheManager *partner = this->pairPartner;
+        if (partner == nullptr || count <= 0) return false;
+        std::unique_lock<std::mutex> a(this->pageIndexLocker, std::defer_lock), b(partner->pageIndexLocker, std::defer_lock);
+        std::lock(a, b);
+        if (this->deferredRecycleEnabled || partner->deferredRecycleEnabled) return false;
+        const std::thread::id self = std::this_thread::get_id();
+        // Pages already reserved for this thread in this manager come first (they will be handed out first).
+        for (const auto &reservation : this->pairReserved)
+            if (reservation.owner == self && (int)pages.size() < count) pages.push_back(reservation.page);
+        while ((int)pages.size() < count) {
+            FastllmDiagSortFreePages(this->freePages);
+            int chosen = -1;
+            for (int i = (int)this->freePages.size() - 1; i >= 0 && chosen < 0; --i)
+                if (partner->PairClaimableLocked(this->freePages[i])) chosen = this->freePages[i];
+            if (chosen < 0) {
+                bool chosenLeaf = false;
+                for (int candidate : this->triePages) {
+                    if (!this->PairClaimableLocked(candidate) || !partner->PairClaimableLocked(candidate)) continue;
+                    auto found = this->pageToTrieNode.find(candidate);
+                    const bool leaf = found == this->pageToTrieNode.end() || found->second->children.empty();
+                    if (chosen < 0 || (leaf && !chosenLeaf) ||
+                        (leaf == chosenLeaf && this->pageTimestamp[candidate] < this->pageTimestamp[chosen])) {
+                        chosen = candidate;
+                        chosenLeaf = leaf;
+                    }
+                }
+            }
+            if (chosen < 0) { ++this->pairFallbacks; break; }
+            this->PairClaimLocked(chosen);
+            partner->PairClaimLocked(chosen);
+            this->pairReserved.push_back(PairReservation{chosen, self});
+            partner->pairReserved.push_back(PairReservation{chosen, self});
+            pages.push_back(chosen);
+        }
+        return (int)pages.size() >= count;
+    }
+
+    // Returns true when this call dropped the page's last reference (page handed out before, free now).
+    bool PagedCacheManager::ReleaseLocked(int pageIndex) {
+        if (pageIndex < 0 || pageIndex >= this->maxPages ||
+            this->pendingRecyclePages.count(pageIndex) ||
+            this->quarantinedRecyclePages.count(pageIndex) ||
+            this->recycleReservePage == pageIndex) return false;
+        const bool wasHeld = this->pageRefCount[pageIndex] > 0;
+        this->pageRefCount[pageIndex]--;
+        if (this->pageRefCount[pageIndex] <= 0) {
+            this->pageRefCount[pageIndex] = 0;
+            if (this->pageToTrieNode.find(pageIndex) != this->pageToTrieNode.end()) {
+                if (this->triePagesSet.find(pageIndex) == this->triePagesSet.end()) {
+                    this->triePages.push_back(pageIndex);
+                    this->triePagesSet.insert(pageIndex);
+                }
+            } else {
+                if (this->freePagesSet.find(pageIndex) == this->freePagesSet.end()) {
+                    this->freePages.push_back(pageIndex);
+                    this->freePagesSet.insert(pageIndex);
+                }
+            }
+            return wasHeld;
+        }
+        return false;
+    }
+
+    // KVPAIR: with a partner, release and reservation cancel run under both locks in one critical section, and
+    // only for pages whose last reference this call dropped, so a reservation made after the release is kept.
+    void PagedCacheManager::ReleasePairedLocked(const std::vector<int> &pageIndices) {
+        PagedCacheManager *partner = this->pairPartner;
+        for (int pageIndex : pageIndices) {
+            if (!this->ReleaseLocked(pageIndex) || partner->pairReserved.empty()) continue;
+            for (auto it = partner->pairReserved.begin(); it != partner->pairReserved.end(); ++it) {
+                if (it->page != pageIndex) continue;
+                partner->pairReserved.erase(it);
+                if (partner->freePagesSet.insert(pageIndex).second) partner->freePages.push_back(pageIndex);
+                ++partner->pairCancelled;
+                break;
+            }
         }
     }
 
     void PagedCacheManager::ReleasePageIndex(int pageIndex) {
-        std::lock_guard<std::mutex> guard(pageIndexLocker);
-        ReleasePageIndexLocked(pageIndex);
+        if (PagedCacheManager *partner = this->pairPartner) {
+            std::unique_lock<std::mutex> a(this->pageIndexLocker, std::defer_lock), b(partner->pageIndexLocker, std::defer_lock);
+            std::lock(a, b);
+            this->ReleasePairedLocked(std::vector<int>{pageIndex});
+            return;
+        }
+        std::lock_guard<std::mutex> guard(this->pageIndexLocker);
+        this->ReleaseLocked(pageIndex);
     }
 
     void PagedCacheManager::ReleasePageIndices(const std::vector<int> &pageIndices) {
-        auto *detail = inference_trace::CurrentDetail();
-        inference_trace::DetailSpan pageTrace("pages.release.lock", detail);
-        std::lock_guard<std::mutex> guard(pageIndexLocker);
-        pageTrace.Next("pages.release.work");
-        for (int pageIndex : pageIndices) ReleasePageIndexLocked(pageIndex);
+        if (PagedCacheManager *partner = this->pairPartner) {
+            std::unique_lock<std::mutex> a(this->pageIndexLocker, std::defer_lock), b(partner->pageIndexLocker, std::defer_lock);
+            std::lock(a, b);
+            this->ReleasePairedLocked(pageIndices);
+            return;
+        }
+        std::lock_guard<std::mutex> guard(this->pageIndexLocker);
+        for (int pageIndex : pageIndices) this->ReleaseLocked(pageIndex);
     }
 
     void PagedCacheManager::Pick(std::vector<int> &pageIds) {
-        std::lock_guard<std::mutex> guard(pageIndexLocker);
-        bool rebuildFree = false;
-        for (int pid : pageIds) {
-            // Already referenced pages cannot be in either unused-page pool.
-            if (++pageRefCount[pid] > 1) continue;
-            if (freePageFlags[pid]) {
-                freePageFlags[pid] = 0;
-                rebuildFree = true;
+        std::lock_guard<std::mutex> guard(this->pageIndexLocker);
+        PickLocked(pageIds);
+    }
+
+    void PagedCacheManager::PickLocked(const std::vector<int> &pageIds) {
+        for (int pageIndex : pageIds) {
+            if (pageIndex < 0 || pageIndex >= this->maxPages ||
+                this->pendingRecyclePages.count(pageIndex) ||
+                this->quarantinedRecyclePages.count(pageIndex) ||
+                this->recycleReservePage == pageIndex ||
+                (this->pageRefCount[pageIndex] == 0 &&
+                 !this->freePagesSet.count(pageIndex) &&
+                 !this->triePagesSet.count(pageIndex) &&
+                 this->pageToTrieNode.find(pageIndex) == this->pageToTrieNode.end())) {
+                throw std::runtime_error(
+                    "capacity_unavailable: paged cache page is no longer available");
             }
-            RemoveTriePage(pid);
-            UpdateEvictableLeaf(pageToTrieNode[pid]);
         }
-        if (rebuildFree) {
-            freePages.erase(std::remove_if(freePages.begin(), freePages.end(),
-                [&](int pid) { return !freePageFlags[pid]; }), freePages.end());
+        bool needRebuildFree = false, needRebuildTrie = false;
+        for (int pageIndex : pageIds) {
+            this->pageRefCount[pageIndex]++;
+            if (this->freePagesSet.erase(pageIndex)) {
+                needRebuildFree = true;
+            } else if (this->triePagesSet.erase(pageIndex)) {
+                needRebuildTrie = true;
+            }
+        }
+        if (needRebuildFree) {
+            int w = 0;
+            for (int i = 0; i < (int)this->freePages.size(); i++) {
+                if (this->freePagesSet.count(this->freePages[i])) {
+                    this->freePages[w++] = this->freePages[i];
+                }
+            }
+            this->freePages.resize(w);
+        }
+        if (needRebuildTrie) {
+            int w = 0;
+            for (int i = 0; i < (int)this->triePages.size(); i++) {
+                if (this->triePagesSet.count(this->triePages[i])) {
+                    this->triePages[w++] = this->triePages[i];
+                }
+            }
+            this->triePages.resize(w);
         }
     }
 
     uint64_t PagedCacheManager::HashTokenPage(const int *tokens, int len) {
         uint64_t hash = 0;
+        const uint64_t P = 1000000007ULL;
         for (int i = 0; i < len; i++) {
-            hash = hash * TokenHashMultiplier + (uint64_t)tokens[i];
+            hash = hash * P + (uint64_t)tokens[i];
         }
         return hash;
     }
 
-    void PagedCacheManager::Record(const std::vector<int> &tokens, const std::vector<int> &pages) {
-        const int count = std::min((int)tokens.size() / pageLen, (int)pages.size());
-        std::vector<uint64_t> hashes(count);
-        for (int i = 0; i < count; ++i)
-            hashes[i] = HashTokenPage(tokens.data() + i * pageLen, pageLen);
-        RecordPrefix(hashes, pages);
+    static uint64_t HashPrefixExtra(uint64_t hash, const std::string &key) {
+        for (unsigned char byte : key) {
+            hash = (hash ^ byte) * 1099511628211ULL;
+        }
+        return hash;
     }
 
-    void PagedCacheManager::RecordPrefix(const std::vector<uint64_t> &hashes, const std::vector<int> &pages) {
-        auto *detail = inference_trace::CurrentDetail();
-        inference_trace::DetailSpan pageTrace("pages.publish.lock", detail);
-        std::lock_guard<std::mutex> guard(pageIndexLocker);
-        pageTrace.Next("pages.publish.work");
-        const long long access = ++currentTimestamp;
-        const int count = std::min(hashes.size(), pages.size());
-        CacheTrieNode *cur = trieRoot;
-        for (int i = 0; i < count; ++i) {
-            uint64_t hash = hashes[i];
-            int pid = pages[i];
-            auto *previous = pageToTrieNode[pid];
-            if (previous && previous->parent == cur && previous->edgeHash == hash &&
-                previous->timestamp == pageTimestamp[pid]) {
-                // Republish an unchanged prefix without rewriting the
-                // physical-page maps and unused pools. Refresh the same
-                // recency as the general publication path.
-                TouchTrieNode(previous, access);
-                cur = previous;
-                continue;
+    uint64_t PagedCacheManager::HashTokenPrefixPage(uint64_t parentHash, const int *tokens,
+                                                   int len, const std::string &extraKey) {
+        // vLLM kv_cache_utils.py:685-715: block identity includes its parent
+        // prefix, tokens and extra/media keys. Reuse this manager's existing
+        // rolling token hash, seeded by the complete preceding prefix.
+        const uint64_t P = 1000000007ULL;
+        parentHash = parentHash * P + (uint64_t)len;
+        for (int i = 0; i < len; ++i) parentHash = parentHash * P + (uint64_t)tokens[i];
+        parentHash = parentHash * P + extraKey.size();
+        return HashPrefixExtra(parentHash, extraKey);
+    }
+
+    void PagedCacheManager::Record(const std::vector<int> &tokens, const std::vector<int> &pages,
+                                   const std::vector<std::string> *extraKeys) {
+        RecordRange(tokens.data(), tokens.size(), pages, extraKeys);
+    }
+
+    void PagedCacheManager::RecordRange(const int *tokens, size_t tokenCount,
+                                        const std::vector<int> &pages,
+                                        const std::vector<std::string> *extraKeys) {
+        RecordRangeImpl(tokens, tokenCount, pages, extraKeys, nullptr);
+    }
+
+    // RECORDOPT: the page hashes only depend on the token range, the page
+    // length and the extra keys, never on the manager. One checkpoint records
+    // the same range into 16 layers x K,V x 4 ranks, so the model computes them
+    // once (PreparePageHashes) and every manager reuses them here. Every value
+    // below is the value the inline branch would compute.
+    void PagedCacheManager::PreparePageHashes(PageHashes &out, const int *tokens,
+                                              size_t tokenCount, int pageLen,
+                                              const std::vector<std::string> *extraKeys,
+                                              bool withPrefix) {
+        out.tokens = tokens;
+        out.tokenCount = tokenCount;
+        out.pageLen = pageLen;
+        out.extraKeys = extraKeys;
+        out.withPrefix = withPrefix;
+        const size_t numPages = pageLen > 0 ? tokenCount / (size_t)pageLen : 0;
+        out.pageHash.resize(numPages);
+        out.prefixHash.resize(withPrefix ? numPages : 0);
+        uint64_t prefixHash = 0;
+        for (size_t i = 0; i < numPages; i++) {
+            const int *pageTokens = tokens + i * (size_t)pageLen;
+            const std::string extra = extraKeys == nullptr ? std::string() : (*extraKeys)[i];
+            const uint64_t h = HashPrefixExtra(HashTokenPage(pageTokens, pageLen), extra);
+            out.pageHash[i] = h;
+            if (withPrefix) {
+                prefixHash = HashTokenPrefixPage(prefixHash, pageTokens, pageLen, extra);
+                out.prefixHash[i] = prefixHash;
             }
-            CacheTrieNode *child = cur->FindChild(hash);
-            if (previous && previous != child) {
-                // Publishing different contents in a physical page must also
-                // invalidate its old prefix and every dependent suffix.
-                for (auto ancestor = cur; ancestor; ancestor = ancestor->parent)
-                    AssertInFastLLM(ancestor != previous, "Repeated page in cache prefix.\n");
-                CacheTrieNode *parent = previous->parent;
-                parent->EraseChild(previous->edgeHash);
-                EvictTrieSubtree(previous);
-                UpdateEvictableLeaf(parent);
+        }
+    }
+
+    void PagedCacheManager::RecordRangePrehashed(const int *tokens, size_t tokenCount,
+                                                 const std::vector<int> &pages,
+                                                 const std::vector<std::string> *extraKeys,
+                                                 const PageHashes &hashes) {
+        const bool needPrefix = this->onRecordPage || this->onRecyclePage;
+        const size_t expectedPages =
+            this->pageLen > 0 ? tokenCount / (size_t)this->pageLen : 0;
+        if (hashes.tokens != tokens || hashes.tokenCount != tokenCount ||
+            hashes.pageLen != this->pageLen || hashes.extraKeys != extraKeys ||
+            hashes.withPrefix != needPrefix || hashes.pageHash.size() < expectedPages) {
+            // Not this exact range/page length/callback set: compute inline.
+            // The published content is identical either way.
+            RecordRangeImpl(tokens, tokenCount, pages, extraKeys, nullptr);
+            return;
+        }
+        RecordRangeImpl(tokens, tokenCount, pages, extraKeys, &hashes);
+    }
+
+    void PagedCacheManager::RecordRangeImpl(const int *tokens, size_t tokenCount,
+                                            const std::vector<int> &pages,
+                                            const std::vector<std::string> *extraKeys,
+                                            const PageHashes *prehashed) {
+        std::lock_guard<std::mutex> guard(this->pageIndexLocker);
+        long long ts = 0;
+        bool timestampAllocated = false;
+        auto ensureTimestamp = [&]() {
+            if (!timestampAllocated) {
+                ts = ++this->currentTimestamp;
+                timestampAllocated = true;
             }
-            if (!child) {
-                child = new CacheTrieNode();
-                child->nodeId = ++nextTrieNodeId;
-                child->parent = cur; child->edgeHash = hash;
-                cur->AddChild(child);
-                UpdateEvictableLeaf(cur);
+            return ts;
+        };
+        const auto producerEvent = std::move(this->recordProducerEvent);
+
+        int numPages = (int)tokenCount / this->pageLen;
+        if ((int)pages.size() < numPages) {
+            numPages = (int)pages.size();
+        }
+        if (extraKeys != nullptr) numPages = std::min(numPages, (int)extraKeys->size());
+
+        CacheTrieNode *cur = this->trieRoot;
+        uint64_t prefixHash = 0;
+        const bool needPrefix = this->onRecordPage || this->onRecyclePage;
+        for (int i = 0; i < numPages; i++) {
+            const std::string extra = extraKeys == nullptr ? std::string() : (*extraKeys)[i];
+            uint64_t h;
+            if (prehashed != nullptr) {
+                // RECORDOPT: identical values, computed once for the whole
+                // record section instead of once per manager.
+                h = prehashed->pageHash[i];
+                if (needPrefix) prefixHash = prehashed->prefixHash[i];
             } else {
-                if (child->evictable) evictableLeaves.erase({child->lastAccess, child->pageId});
-                child->evictable = false;
-                if (child->pageId >= 0 && child->pageId != pid) {
-                    // Identical prefix contents can move to another physical
-                    // page without removing descendant trie nodes. Invalidate
-                    // cached ancestor page lists even if their endpoint lives.
-                    ++prefixBindingVersion;
-                    int old = child->pageId;
-                    RemoveTriePage(old);
-                    pageToTrieNode[old] = nullptr;
-                    if (pageRefCount[old] == 0 && !freePageFlags[old]) {
-                        freePageFlags[old] = 1;
-                        freePages.push_back(old);
+                h = HashTokenPage(tokens + i * this->pageLen, this->pageLen);
+                h = HashPrefixExtra(h, extra);
+                if (needPrefix) {
+                    prefixHash = HashTokenPrefixPage(prefixHash, tokens + i * this->pageLen,
+                                                    this->pageLen, extra);
+                }
+            }
+            const uint64_t publishedHash = (this->onRecordPage || this->onRecyclePage)
+                ? prefixHash : h;
+            int pid = pages[i];
+            if (pid < 0 || pid >= this->maxPages ||
+                this->pendingRecyclePages.count(pid) ||
+                this->quarantinedRecyclePages.count(pid) ||
+                this->recycleReservePage == pid) {
+                throw std::runtime_error(
+                    "capacity_unavailable: paged cache page is no longer available");
+            }
+
+            auto it = cur->children.find(h);
+            CacheTrieNode *child;
+            if (it == cur->children.end()) {
+                child = new CacheTrieNode();
+                child->nodeId = ++this->nextTrieNodeId;
+                child->extraKey = extra;
+                child->parent = cur;
+                child->edgeHash = h;
+                cur->children[h] = child;
+            } else {
+                child = it->second;
+                // A hash collision is a safe miss, never a media identity match.
+                if (child->extraKey != extra) return;
+                const auto mapped = this->pageToTrieNode.find(pid);
+                const bool samePublishedPage =
+                    mapped != this->pageToTrieNode.end() && mapped->second == child &&
+                    child->pageId == pid && pid < (int)this->pageTimestamp.size() &&
+                    this->pageTimestamp[pid] != 0 &&
+                    child->timestamp == this->pageTimestamp[pid] &&
+                    child->pageHash == publishedHash;
+                if (samePublishedPage) {
+                    // A full committed KV page is append-only, so its content and
+                    // generation stay valid. Still carry the newest producer event:
+                    // it completes after the old one on the same streams, so a later
+                    // recycle ticket waits at least as long as before (W4-RVRECORD 2.3).
+                    if (producerEvent) child->producerEvent = producerEvent;
+                    cur = child;
+                    continue;
+                }
+                if (child->pageId != -1 && child->pageId != pid) {
+                    int oldPid = child->pageId;
+                    this->pageToTrieNode.erase(oldPid);
+                    // 旧页面如果空闲，从 triePages 迁移到 freePages
+                    if (this->triePagesSet.erase(oldPid)) {
+                        for (int j = (int)this->triePages.size() - 1; j >= 0; j--) {
+                            if (this->triePages[j] == oldPid) {
+                                this->triePages[j] = this->triePages.back();
+                                this->triePages.pop_back();
+                                break;
+                            }
+                        }
+                        this->freePages.push_back(oldPid);
+                        this->freePagesSet.insert(oldPid);
                     }
                 }
             }
-            if (freePageFlags[pid]) {
-                freePageFlags[pid] = 0;
-                freePages.erase(std::find(freePages.begin(), freePages.end(), pid));
+
+            // 新页面加入 Trie：如果它在 freePages 中（空闲且不在 Trie 中），迁移到 triePages
+            if (this->pageToTrieNode.find(pid) == this->pageToTrieNode.end()) {
+                if (this->freePagesSet.erase(pid)) {
+                    for (int j = (int)this->freePages.size() - 1; j >= 0; j--) {
+                        if (this->freePages[j] == pid) {
+                            this->freePages[j] = this->freePages.back();
+                            this->freePages.pop_back();
+                            break;
+                        }
+                    }
+                    if (this->pageRefCount[pid] <= 0) {
+                        this->triePages.push_back(pid);
+                        this->triePagesSet.insert(pid);
+                    }
+                }
             }
-            // A generation identifies the physical contents, not how often an
-            // unchanged page is published or matched by concurrent requests.
-            if (!pageTimestamp[pid]) pageTimestamp[pid] = ++currentTimestamp;
+
             child->pageId = pid;
-            child->timestamp = pageTimestamp[pid];
-            child->lastAccess = access;
-            pageToTrieNode[pid] = child;
-            if (pageRefCount[pid] == 0 && child->unusedIndex < 0) {
-                child->unusedIndex = (int)triePages.size();
-                triePages.push_back(pid);
+            child->timestamp = ensureTimestamp();
+            child->producerEvent = producerEvent;
+            // 【页的身份】留下这一页的页键。
+            // 照抄 SGLang `rust/sglang-radix-tree/src/node.rs:166` 的 `pub key: K`
+            // （身份挂在节点上，使回收/搬运时能反问"这一页是谁"）。
+            // 纯新增写入，不参与任何既有判断 ⇒ 零行为变更。
+            child->pageHash = publishedHash;
+            this->pageTimestamp[pid] = ts;
+            this->pageToTrieNode[pid] = child;
+
+            // 【页写好就通知】此刻内容确定、页还没被人拿走。
+            // 未注册回调 ⇒ 什么都不做 ⇒ 行为与既有实现逐字节相同。
+            if (this->onRecordPage) {
+                try {
+                    this->onRecordPage(pid, prefixHash);
+                } catch (...) {
+                    // The optional ledger hook may reject this physical page.
+                    // Roll back only the trie publication. Record never
+                    // acquired an allocator reference: the request still owns
+                    // pid in its pageIndex and must release it itself.
+                    auto current = this->pageToTrieNode.find(pid);
+                    if (current != this->pageToTrieNode.end() &&
+                        current->second == child) {
+                        this->pageToTrieNode.erase(current);
+                        if (child->children.empty()) {
+                            if (child->parent) child->parent->children.erase(child->edgeHash);
+                            delete child;
+                        } else {
+                            child->pageId = -1;
+                        }
+                        ++this->evictionEpoch;
+                    }
+                    if (this->pageRefCount[pid] == 0 &&
+                        this->pageToTrieNode.find(pid) == this->pageToTrieNode.end() &&
+                        this->pendingRecyclePages.count(pid) == 0 &&
+                        this->quarantinedRecyclePages.count(pid) == 0 &&
+                        this->recycleReservePage != pid) {
+                        this->triePagesSet.erase(pid);
+                        this->triePages.erase(std::remove(this->triePages.begin(),
+                                                        this->triePages.end(), pid),
+                                             this->triePages.end());
+                        if (this->freePagesSet.insert(pid).second)
+                            this->freePages.push_back(pid);
+                    }
+                    return;
+                }
             }
-            UpdateEvictableLeaf(child);
+
             cur = child;
         }
     }
 
-    CacheTrieNode *PagedCacheManager::FindPrefixLocked(const std::vector<uint64_t> &hashes,
-                                                     PagedPrefixMatch &match) {
-        CacheTrieNode *cur = trieRoot;
-        int count = 0;
-        auto *cached = match.pageId >= 0 && match.pageId < maxPages ? pageToTrieNode[match.pageId] : nullptr;
-        if (match.pages > 0 && match.pages <= (int)hashes.size() && cached &&
-            cached->nodeId == match.nodeId && cached->timestamp == match.generation &&
-            pageTimestamp[match.pageId] == match.generation) {
-            // Trie nodes never change their prefix path. Removing/reparenting
-            // an ancestor evicts the entire subtree, including this anchor.
-            cur = cached;
-            count = match.pages;
-        }
-        const int reused = count;
-        for (; count < (int)hashes.size(); ++count) {
-            auto *child = cur->FindChild(hashes[count]);
-            if (!child) break;
-            if (child->pageId < 0 || pageTimestamp[child->pageId] != child->timestamp) break;
+    void PagedCacheManager::Query(const std::vector<int> &tokens, std::vector<int> &cachedPageIds,
+                                  const std::vector<std::string> *extraKeys,
+                                  QueryResult *out, bool pick) {
+        std::lock_guard<std::mutex> guard(this->pageIndexLocker);
+        cachedPageIds.clear();
+        // 【一本账·截断可观测】out 默认 nullptr ⇒ 零行为变更。
+        // 下面每个 break 都标出原因，让调用方能区分"本来就没有"与"被回收截断"。
+        if (out != nullptr) { out->matchedPages = 0; out->truncated = false;
+                              out->reason = ""; out->evictionEpoch = this->evictionEpoch; }
+
+        int numPages = (int)tokens.size() / this->pageLen;
+        if (extraKeys != nullptr) numPages = std::min(numPages, (int)extraKeys->size());
+        CacheTrieNode *cur = this->trieRoot;
+
+        for (int i = 0; i < numPages; i++) {
+            uint64_t h = HashTokenPage(tokens.data() + i * this->pageLen, this->pageLen);
+            const std::string extra = extraKeys == nullptr ? std::string() : (*extraKeys)[i];
+            h = HashPrefixExtra(h, extra);
+
+            auto it = cur->children.find(h);
+            if (it == cur->children.end()) {
+                if (out != nullptr) { out->truncated = false; out->reason = "not_in_trie"; }
+                break;
+            }
+
+            CacheTrieNode *child = it->second;
+            if (child->extraKey != extra) {
+                if (out != nullptr) { out->truncated = false; out->reason = "extra_key_mismatch"; }
+                break;
+            }
+            if (child->pageId == -1) {
+                if (out != nullptr) { out->truncated = true; out->reason = "page_released"; }
+                break;
+            }
+
+            // 验证时间戳：页面未被覆盖
+            if (this->pageTimestamp[child->pageId] != child->timestamp) {
+                if (out != nullptr) { out->truncated = true; out->reason = "page_overwritten"; }
+                break;
+            }
+
+            cachedPageIds.push_back(child->pageId);
             cur = child;
         }
-        if (auto *detail = inference_trace::CurrentDetail()) {
-            detail->Count("pages.reused_prefix_pages", reused);
-            detail->Count("pages.walked_prefix_pages", count - reused);
+        if (out != nullptr) out->matchedPages = (int)cachedPageIds.size();
+        // vLLM prepare_load / SGLang inc_lock_ref: lookup and protection must
+        // be atomic with eviction when a background promotion can allocate.
+        if (pick) {
+            PickLocked(cachedPageIds);
+            if (!cachedPageIds.empty()) {
+                const long long touched = ++this->currentTimestamp;
+                for (int page : cachedPageIds) {
+                    this->pageTimestamp[page] = touched;
+                    this->pageToTrieNode.at(page)->timestamp = touched;
+                }
+            }
+        }
+    }
+
+    void PagedCacheManager::QueryPagePositions(
+            const std::vector<int> &tokens, std::vector<int> &pageIds,
+            const std::vector<std::string> *extraKeys, int maxPages, bool pick) {
+        std::lock_guard<std::mutex> guard(this->pageIndexLocker);
+        pageIds.clear();
+        if (this->pageLen <= 0) return;
+        int numPages = (int)tokens.size() / this->pageLen;
+        if (extraKeys != nullptr) numPages = std::min(numPages, (int)extraKeys->size());
+        if (maxPages >= 0) numPages = std::min(numPages, maxPages);
+        CacheTrieNode *cur = this->trieRoot;
+        std::vector<int> picked;
+        for (int i = 0; i < numPages && cur != nullptr; ++i) {
+            const std::string extra = extraKeys == nullptr ? std::string() : (*extraKeys)[i];
+            uint64_t h = HashTokenPage(tokens.data() + i * this->pageLen, this->pageLen);
+            h = HashPrefixExtra(h, extra);
+            auto it = cur->children.find(h);
+            if (it == cur->children.end() || it->second == nullptr ||
+                it->second->extraKey != extra) break;
+            cur = it->second;
+            int page = cur->pageId;
+            if (page >= 0 && page < this->maxPages &&
+                this->pageTimestamp[page] == cur->timestamp &&
+                !this->pendingRecyclePages.count(page) &&
+                !this->quarantinedRecyclePages.count(page) &&
+                this->recycleReservePage != page) {
+                pageIds.push_back(page);
+                picked.push_back(page);
+            } else {
+                // Preserve the logical position.  Descendants may still be
+                // valid and are intentionally queried after this hole.
+                pageIds.push_back(-1);
+            }
+        }
+        if (!pick || picked.empty()) return;
+        this->PickLocked(picked);
+        const long long touched = ++this->currentTimestamp;
+        for (int page : picked) {
+            auto it = this->pageToTrieNode.find(page);
+            if (it == this->pageToTrieNode.end() || it->second == nullptr) continue;
+            this->pageTimestamp[page] = touched;
+            it->second->timestamp = touched;
+        }
+    }
+
+    // Upstream prefix-preview interface on this cache manager. The hashes are
+    // HashTokenPage values of whole text pages; they equal this trie's edge
+    // hashes for pages without an extra key, and a media page never matches.
+    // Each lookup walks from the root and validates every node, because this
+    // manager may detach a page from a node that keeps its children; a cached
+    // anchor alone does not prove that its ancestors still own valid pages.
+    CacheTrieNode *PagedCacheManager::FindPrefixLocked(const std::vector<uint64_t> &hashes,
+                                                     PagedPrefixMatch &match) {
+        CacheTrieNode *cur = this->trieRoot;
+        int count = 0;
+        for (; cur != nullptr && count < (int)hashes.size(); ++count) {
+            auto it = cur->children.find(hashes[count]);
+            if (it == cur->children.end()) break;
+            CacheTrieNode *child = it->second;
+            if (child == nullptr || !child->extraKey.empty() || child->pageId < 0 ||
+                child->pageId >= (int)this->pageTimestamp.size() ||
+                this->pageTimestamp[child->pageId] != child->timestamp) break;
+            cur = child;
         }
         match = {};
-        if (count) {
+        if (count > 0) {
             match.nodeId = cur->nodeId;
             match.pageId = cur->pageId;
             match.generation = cur->timestamp;
@@ -6311,32 +7254,48 @@ namespace fastllm {
     }
 
     int PagedCacheManager::PreviewPrefix(const std::vector<uint64_t> &hashes, PagedPrefixMatch &match) {
-        auto *detail = inference_trace::CurrentDetail();
-        inference_trace::DetailSpan pageTrace("pages.preview.lock", detail);
-        std::lock_guard<std::mutex> guard(pageIndexLocker);
-        pageTrace.Next("pages.preview.work");
-        auto *cur = FindPrefixLocked(hashes, match);
-        if (match.pages) {
-            // Only a leaf can be evicted. Refresh its recency without walking
-            // and rewriting every ancestor on each decode-time preview.
-            TouchTrieNode(cur, ++currentTimestamp);
-        }
+        std::lock_guard<std::mutex> guard(this->pageIndexLocker);
+        FindPrefixLocked(hashes, match);
         return match.pages;
     }
 
     void PagedCacheManager::QueryPrefix(const std::vector<uint64_t> &hashes, PagedPrefixMatch &match,
-                                       std::vector<int> &cachedPageIds) {
-        std::lock_guard<std::mutex> guard(pageIndexLocker);
-        auto *cur = FindPrefixLocked(hashes, match);
-        const long long access = ++currentTimestamp;
+                                       std::vector<int> &cachedPageIds, bool pick) {
+        // Same contract as Query(tokens): report validated pages; without pick,
+        // acquire no references and leave recency unchanged.
+        std::lock_guard<std::mutex> guard(this->pageIndexLocker);
+        CacheTrieNode *cur = FindPrefixLocked(hashes, match);
         cachedPageIds.resize(match.pages);
-        // An endpoint identifies an immutable trie path. Ancestor eviction
-        // removes its entire subtree, so validating the endpoint also guards
-        // this walk. Keep Query's recency update for every restored page.
-        for (int i = match.pages - 1; i >= 0; --i, cur = cur->parent) {
-            cachedPageIds[i] = cur->pageId;
-            TouchTrieNode(cur, access);
+        for (int i = match.pages - 1; i >= 0; --i, cur = cur->parent) cachedPageIds[i] = cur->pageId;
+        if (pick) {
+            PickLocked(cachedPageIds);
+            if (!cachedPageIds.empty()) {
+                const long long touched = ++this->currentTimestamp;
+                for (int page : cachedPageIds) {
+                    this->pageTimestamp[page] = touched;
+                    this->pageToTrieNode.at(page)->timestamp = touched;
+                }
+            }
         }
+    }
+
+    void PagedCacheManager::RecordPrefix(const std::vector<uint64_t> &hashes, const std::vector<int> &pages) {
+        if (this->onRecordPage || this->onRecyclePage) {
+            // The page ledger identifies a page by its full prefix, which needs
+            // the tokens. Publishing from hashes alone would record a wrong
+            // identity, so this manager keeps the page out of the trie instead.
+            static std::atomic<bool> warned{false};
+            if (!warned.exchange(true)) {
+                fprintf(stderr, "[PagedCache] RecordPrefix skipped: page ledger callbacks "
+                                "need token-based Record().\n");
+            }
+            return;
+        }
+        PageHashes prehashed;
+        prehashed.tokenCount = hashes.size() * (size_t)this->pageLen;
+        prehashed.pageLen = this->pageLen;
+        prehashed.pageHash = hashes;
+        RecordRangeImpl(nullptr, prehashed.tokenCount, pages, nullptr, &prehashed);
     }
 
     bool PagedCacheManager::PreviewUnreferencedPrefixPages(const PagedPrefixMatch &match, int pages,
@@ -6347,58 +7306,64 @@ namespace fastllm {
 
     bool PagedCacheManager::PreviewUnreferencedPrefixPages(const PagedPrefixMatch &match, int pages,
                                                           std::vector<int> &unreferenced, PagedPrefixPath &path) {
-        auto *detail = inference_trace::CurrentDetail();
-        inference_trace::DetailSpan pageTrace("pages.reclaimable.lock", detail);
-        std::lock_guard<std::mutex> guard(pageIndexLocker);
-        pageTrace.Next("pages.reclaimable.work");
+        std::lock_guard<std::mutex> guard(this->pageIndexLocker);
         unreferenced.clear();
         if (pages == 0) return true;
-        auto *node = match.pageId >= 0 && match.pageId < maxPages ? pageToTrieNode[match.pageId] : nullptr;
-        if (pages < 0 || pages > match.pages || !node ||
+        auto mapped = match.pageId >= 0 ? this->pageToTrieNode.find(match.pageId) : this->pageToTrieNode.end();
+        CacheTrieNode *node = mapped == this->pageToTrieNode.end() ? nullptr : mapped->second;
+        if (pages < 0 || pages > match.pages || node == nullptr ||
             node->nodeId != match.nodeId || node->timestamp != match.generation ||
-            pageTimestamp[match.pageId] != match.generation) return false;
-        if (path.manager != this || path.anchor.nodeId != match.nodeId || path.anchor.generation != match.generation ||
-            path.anchor.pageId != match.pageId || path.bindingVersion != prefixBindingVersion ||
-            path.pageIds.size() != (size_t)match.pages) {
-            if (detail) detail->Count("pages.ancestor_rebuild_pages", match.pages);
-            path.manager = nullptr;
-            path.anchor = {};
-            path.pageIds.resize(match.pages);
-            for (int depth = match.pages; depth > 0; --depth, node = node->parent) {
-                if (node == nullptr || node == trieRoot || node->pageId < 0 ||
-                    pageTimestamp[node->pageId] != node->timestamp) {
-                    path.pageIds.clear();
-                    return false;
-                }
-                path.pageIds[depth - 1] = node->pageId;
+            match.pageId >= (int)this->pageTimestamp.size() ||
+            this->pageTimestamp[match.pageId] != match.generation) return false;
+        // Rebuild and validate the whole ancestor path on every call (see
+        // FindPrefixLocked). Reference counts are read live, never memoized.
+        path.manager = nullptr;
+        path.anchor = {};
+        path.bindingVersion = 0;
+        path.pageIds.resize(match.pages);
+        for (int depth = match.pages; depth > 0; --depth, node = node->parent) {
+            if (node == nullptr || node == this->trieRoot || node->pageId < 0 ||
+                !node->extraKey.empty() ||
+                node->pageId >= (int)this->pageTimestamp.size() ||
+                this->pageTimestamp[node->pageId] != node->timestamp) {
+                path.pageIds.clear();
+                return false;
             }
-            path.manager = this;
-            path.anchor = match;
-            path.bindingVersion = prefixBindingVersion;
+            path.pageIds[depth - 1] = node->pageId;
         }
-        // Manager identity scopes node/page IDs to their pool. The endpoint
-        // guards trie lifetime; bindingVersion additionally guards
-        // same-content physical-page replacement along its ancestor path.
-        // Reference counts remain live: never memoize whether a page is pinned.
-        if (detail) detail->Count("pages.reference_checks", pages);
+        if (node != this->trieRoot) {
+            path.pageIds.clear();
+            return false;
+        }
+        path.manager = this;
+        path.anchor = match;
         for (int i = pages - 1; i >= 0; --i)
-            if (pageRefCount[path.pageIds[i]] == 0) unreferenced.push_back(path.pageIds[i]);
+            if (this->pageRefCount[path.pageIds[i]] == 0) unreferenced.push_back(path.pageIds[i]);
         return true;
     }
 
-    void PagedCacheManager::Query(const std::vector<int> &tokens, std::vector<int> &cachedPageIds) {
-        std::lock_guard<std::mutex> guard(pageIndexLocker);
-        cachedPageIds.clear();
-        const long long access = ++currentTimestamp;
-        CacheTrieNode *cur = trieRoot;
-        for (int i = 0; i < (int)tokens.size() / pageLen; ++i) {
-            uint64_t hash = HashTokenPage(tokens.data() + i * pageLen, pageLen);
-            CacheTrieNode *child = cur->FindChild(hash);
-            if (!child) break;
-            if (child->pageId < 0 || pageTimestamp[child->pageId] != child->timestamp) break;
-            TouchTrieNode(child, access);
-            cachedPageIds.push_back(child->pageId);
-            cur = child;
+    void PagedCacheManager::PreviewUnusedPageIndices(int count, std::vector<int> &pages) {
+        // Same order as this manager's allocation preview: free pages from the
+        // tail first, then unreferenced trie pages. Nothing is reserved.
+        std::lock_guard<std::mutex> guard(this->pageIndexLocker);
+        pages.clear();
+        if (count <= 0) return;
+        pages.reserve(count);
+        for (int i = 0; i < count && i < (int)this->freePages.size(); i++) {
+            pages.push_back(this->freePages[(int)this->freePages.size() - 1 - i]);
         }
+        int trieOffset = count - (int)pages.size();
+        for (int i = 0; i < trieOffset && i < (int)this->triePages.size(); i++) {
+            pages.push_back(this->triePages[(int)this->triePages.size() - 1 - i]);
+        }
+    }
+
+    bool PagedCacheManager::IsCachedPage(int pageIndex, long long generation) {
+        std::lock_guard<std::mutex> guard(this->pageIndexLocker);
+        auto mapped = this->pageToTrieNode.find(pageIndex);
+        if (mapped == this->pageToTrieNode.end() || mapped->second == nullptr) return false;
+        CacheTrieNode *node = mapped->second;
+        return node->pageId == pageIndex && pageIndex < (int)this->pageTimestamp.size() &&
+               node->timestamp == generation && this->pageTimestamp[pageIndex] == generation;
     }
 }

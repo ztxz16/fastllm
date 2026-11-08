@@ -161,6 +161,13 @@ namespace json11 {
             dump(out);
             return out;
         }
+        // 紧凑输出：与 dump() 再去掉字符串外的空白逐字节一致（供 MetadataText 用）。
+        void dump_compact(std::string &out) const;
+        std::string dump_compact() const {
+            std::string out;
+            dump_compact(out);
+            return out;
+        }
 
         // Parse. If parse fails, return Json() and assign an error message to err.
         static Json parse(const std::string & in,
@@ -221,6 +228,7 @@ namespace json11 {
         virtual bool equals(const JsonValue * other) const = 0;
         virtual bool less(const JsonValue * other) const = 0;
         virtual void dump(std::string &out) const = 0;
+        virtual void dump_compact(std::string &out) const = 0;
         virtual double number_value() const;
         virtual int int_value() const;
         virtual long long ll_value() const;

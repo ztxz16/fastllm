@@ -20,6 +20,7 @@
 #include "devices/cpu/computeutils.h"
 #include "executor.h"
 #include "utils.h"
+#include "utils/prefix_cache_logging.h"
 
 #include <sstream>
 #include <random>
@@ -10690,7 +10691,8 @@ namespace fastllm {
             context.speculativeWindowCommitted = 0;
             context.speculativeWindowRounds = 0;
         }
-        if (validations % DEEPSEEK_V4_DSPARK_LOG_INTERVAL == 0) {
+        if (!FastllmObservabilityUserEnabled() &&
+            validations % DEEPSEEK_V4_DSPARK_LOG_INTERVAL == 0) {
             const long long proposed = dsparkProposedTokenCount.load(
                 std::memory_order_relaxed);
             const long long acceptedTotal = dsparkAcceptedTokenCount.load(

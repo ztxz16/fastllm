@@ -23,6 +23,7 @@
 #endif
 #include "fastllm.h"
 #include "utils/utils.h"
+#include "utils/load_stage_timing.h"
 
 #include <cstdlib>
 #include <algorithm>
@@ -471,9 +472,36 @@ struct FastllmCublasState {
 // another operator or graph family may be using.
 static std::map<std::pair<int, bool>, std::unique_ptr<FastllmCublasState>> s_fastllmCublasHandleMap;
 static std::mutex s_fastllmCublasHandleMapMutex;
+static thread_local bool t_fastllmPrivateCublas = false;
+static thread_local std::map<std::pair<int, bool>, cublasHandle_t> t_fastllmPrivateCublasMap;
+void FastllmCudaUsePrivateCublasHandle(bool enable) {
+    t_fastllmPrivateCublas = enable;
+}
 static cublasHandle_t GetFastllmCublasHandle(bool fp32Reduction) {
     int id = -1;
     cudaGetDevice(&id);
+    if (t_fastllmPrivateCublas) {
+        // Background vision workers own per-thread handles; they never share
+        // a handle (or its workspace) with the compute threads.
+        auto own = t_fastllmPrivateCublasMap.find({id, fp32Reduction});
+        if (own != t_fastllmPrivateCublasMap.end()) return own->second;
+        cublasHandle_t handler = nullptr;
+        if (cublasCreate(&handler) != CUBLAS_STATUS_SUCCESS ||
+            cublasSetStream(handler, cudaStreamPerThread) != CUBLAS_STATUS_SUCCESS) {
+            printf("Error: private CUBLAS handle initialization failed on device %d.\n", id);
+            exit(0);
+        }
+#if !defined(USE_ROCM) && CUBLAS_VERSION >= 11000
+        if (fp32Reduction && cublasSetMathMode(handler,
+                static_cast<cublasMath_t>(CUBLAS_DEFAULT_MATH |
+                    CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION)) != CUBLAS_STATUS_SUCCESS) {
+            cublasDestroy(handler);
+            return nullptr;
+        }
+#endif
+        t_fastllmPrivateCublasMap[{id, fp32Reduction}] = handler;
+        return handler;
+    }
     FastllmCublasState *state;
     {
         // Only protect the registry here. CUDA initialization/allocation may
@@ -799,6 +827,16 @@ void *FastllmCudaStreamCreate(bool nonBlocking) {
     return (void*)stream;
 }
 
+void *FastllmCudaStreamCreateLowestPriority() {
+    int lowest = 0, highest = 0;
+    checkCudaErrors("Error: CUDA stream priority range!",
+                    cudaDeviceGetStreamPriorityRange(&lowest, &highest));
+    cudaStream_t stream;
+    checkCudaErrors("Error: CUDA low priority stream!",
+                    cudaStreamCreateWithPriority(&stream, cudaStreamNonBlocking, lowest));
+    return (void*)stream;
+}
+
 void FastllmCudaStreamDestroy(void *stream) {
     cudaError_t state = cudaStreamDestroy((cudaStream_t)stream);
     checkCudaErrors("Error: CUDA error when destroying stream!", state);
@@ -866,6 +904,21 @@ void FastllmCudaStreamWaitEvent(void *stream, void *event) {
 void FastllmCudaCurrentThreadStreamWaitEvent(void *event) {
     cudaError_t state = cudaStreamWaitEvent(cudaStreamPerThread, (cudaEvent_t)event, 0);
     checkCudaErrors("Error: CUDA error when the per-thread stream is waiting for event!", state);
+}
+
+// §④：非阻塞就绪查询。cudaErrorNotReady 是"还没好"的正常返回，不是故障；但 CUDA 会把它
+// 记进 last error，所以这里先 cudaGetLastError() 清掉，避免后续 checkCudaErrors() 误报。
+int FastllmCudaEventQuery(void *event) {
+    const cudaError_t state = cudaEventQuery((cudaEvent_t)event);
+    if (state == cudaSuccess) {
+        return 1;
+    }
+    if (state == cudaErrorNotReady) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    checkCudaErrors("Error: CUDA error when querying event readiness!", state);
+    return -1;
 }
 
 static thread_local std::string fastllmCudaGraphLastError;
@@ -5126,7 +5179,214 @@ static void CudaMemDebugRemove(void *ptr) {
 }
 #endif // CUDA_MEM_DEBUG
 
+// FASTLLM_CUDA_POOL_TRACE=1 (diagnostic, default off). Records the allocating call
+// stack of every pool buffer handed out and of every direct allocation, prints each
+// pool growth / direct allocation, and on a fatal OOM prints the busy bytes of the
+// failing device grouped by call stack. Disabled cost: one static bool check.
+#include <sys/syscall.h>
+#include <unistd.h>
+#include <unordered_map>
+struct FastllmCudaPoolTraceSite {
+    void *frames[14];
+    int depth = 0;
+    int tid = 0;
+    int device = -1;
+    size_t size = 0;
+    bool direct = false;
+};
+static bool FastllmCudaPoolTraceEnabled() {
+    static const bool enabled = [] {
+        const char *v = std::getenv("FASTLLM_CUDA_POOL_TRACE");
+        return v != nullptr && std::atoi(v) > 0;
+    }();
+    return enabled;
+}
+static std::mutex fastllmCudaPoolTraceMutex;
+static std::unordered_map<void *, FastllmCudaPoolTraceSite> fastllmCudaPoolTraceSites;
+static std::atomic<int> fastllmCudaPoolTraceLines{0};
+
+static FastllmCudaPoolTraceSite FastllmCudaPoolTraceCapture(int device, size_t size, bool direct) {
+    FastllmCudaPoolTraceSite site;
+    site.depth = backtrace(site.frames, 14);
+    site.tid = (int)syscall(SYS_gettid);
+    site.device = device;
+    site.size = size;
+    site.direct = direct;
+    return site;
+}
+
+static std::string FastllmCudaPoolTraceThreadName(int tid) {
+    std::ifstream in("/proc/self/task/" + std::to_string(tid) + "/comm");
+    std::string name;
+    std::getline(in, name);
+    return name;
+}
+
+// Frames 0-2 are this helper chain and the allocator; print the callers.
+static std::string FastllmCudaPoolTraceFrames(const FastllmCudaPoolTraceSite &site) {
+    std::string out;
+    char **symbols = backtrace_symbols(site.frames, site.depth);
+    for (int i = 3; i < site.depth; i++) {
+        if (!out.empty()) out += " | ";
+        out += symbols != nullptr ? symbols[i] : "?";
+    }
+    if (symbols != nullptr) free(symbols);
+    return out;
+}
+
+static void FastllmCudaPoolTraceRecord(void *ptr, int device, size_t size, bool direct, const char *growKind) {
+    if (!FastllmCudaPoolTraceEnabled() || ptr == nullptr) return;
+    FastllmCudaPoolTraceSite site = FastllmCudaPoolTraceCapture(device, size, direct);
+    {
+        std::lock_guard<std::mutex> lock(fastllmCudaPoolTraceMutex);
+        fastllmCudaPoolTraceSites[ptr] = site;
+    }
+    if (growKind == nullptr || fastllmCudaPoolTraceLines.fetch_add(1) >= 20000) return;
+    size_t freeMem = 0, totalMem = 0;
+    cudaMemGetInfo(&freeMem, &totalMem);
+    auto now = std::chrono::system_clock::now().time_since_epoch();
+    printf("[POOL-TRACE] grow kind=%s dev=%d size=%.2fMB tid=%d comm=%s gpuFree=%zuMB t_ms=%lld at %s\n",
+           growKind, device, size / 1048576.0, site.tid,
+           FastllmCudaPoolTraceThreadName(site.tid).c_str(), freeMem >> 20,
+           (long long)std::chrono::duration_cast<std::chrono::milliseconds>(now).count(),
+           FastllmCudaPoolTraceFrames(site).c_str());
+    fflush(stdout);
+}
+
+static void FastllmCudaPoolTraceForget(void *ptr) {
+    if (!FastllmCudaPoolTraceEnabled() || ptr == nullptr) return;
+    std::lock_guard<std::mutex> lock(fastllmCudaPoolTraceMutex);
+    fastllmCudaPoolTraceSites.erase(ptr);
+}
+
+namespace {
+
+struct CudaWeightArenaBlock {
+    int device = -1;
+    void *base = nullptr;
+    size_t capacity = 0;
+    size_t used = 0;
+};
+
+std::mutex &CudaWeightArenaMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+std::map<std::pair<int, int>, std::vector<CudaWeightArenaBlock> > &
+CudaWeightArenaChains() {
+    static std::map<std::pair<int, int>, std::vector<CudaWeightArenaBlock> > chains;
+    return chains;
+}
+
+// 竞技场块基址 -> 容量：释放拦截用（块内指针不真释放，统一由 ReleaseCudaWeightArena 释放）
+std::map<uintptr_t, size_t> &CudaWeightArenaRanges() {
+    static std::map<uintptr_t, size_t> ranges;
+    return ranges;
+}
+
+thread_local int cudaWeightArenaLayer = -1;
+
+constexpr size_t kCudaWeightArenaBlockBytes = 288ull << 20;
+constexpr size_t kCudaWeightArenaAlign = 256;
+
+}  // namespace
+
+void SetCudaWeightArenaLayer(int layer) {
+    cudaWeightArenaLayer = layer;
+}
+
+void *TryAllocateFromCudaWeightArena(size_t bytes) {
+    if (bytes == 0 || cudaWeightArenaLayer < 0) {
+        return nullptr;
+    }
+    int device = -1;
+    if (cudaGetDevice(&device) != cudaSuccess) {
+        cudaGetLastError();
+        return nullptr;
+    }
+    const size_t aligned = (bytes + kCudaWeightArenaAlign - 1) /
+                           kCudaWeightArenaAlign * kCudaWeightArenaAlign;
+    std::lock_guard<std::mutex> guard(CudaWeightArenaMutex());
+    std::vector<CudaWeightArenaBlock> &chain =
+        CudaWeightArenaChains()[std::make_pair(device, cudaWeightArenaLayer)];
+    if (!chain.empty()) {
+        CudaWeightArenaBlock &block = chain.back();
+        if (block.capacity - block.used >= aligned) {
+            void *slice = (uint8_t *)block.base + block.used;
+            block.used += aligned;
+            return slice;
+        }
+    }
+    const size_t capacity = std::max(kCudaWeightArenaBlockBytes, aligned);
+    void *base = FastllmCudaDirectMalloc(capacity);
+    if (base == nullptr) {
+        return nullptr;  // 回退：调用方走普通分配，释放路径不受影响
+    }
+    CudaWeightArenaBlock block;
+    block.device = device;
+    block.base = base;
+    block.capacity = capacity;
+    block.used = aligned;
+    chain.push_back(block);
+    CudaWeightArenaRanges()[(uintptr_t)base] = capacity;
+    return base;
+}
+
+bool FreeCudaWeightArenaPointer(void *pointer) {
+    if (pointer == nullptr) {
+        return false;
+    }
+    std::lock_guard<std::mutex> guard(CudaWeightArenaMutex());
+    std::map<uintptr_t, size_t> &ranges = CudaWeightArenaRanges();
+    if (ranges.empty()) {
+        return false;
+    }
+    const uintptr_t address = (uintptr_t)pointer;
+    std::map<uintptr_t, size_t>::iterator it = ranges.upper_bound(address);
+    if (it == ranges.begin()) {
+        return false;
+    }
+    --it;
+    return address < it->first + it->second;
+}
+
+void ReleaseCudaWeightArena(int layer) {
+    std::vector<CudaWeightArenaBlock> blocks;
+    {
+        std::lock_guard<std::mutex> guard(CudaWeightArenaMutex());
+        std::map<std::pair<int, int>, std::vector<CudaWeightArenaBlock> > &chains =
+            CudaWeightArenaChains();
+        std::map<uintptr_t, size_t> &ranges = CudaWeightArenaRanges();
+        for (std::map<std::pair<int, int>, std::vector<CudaWeightArenaBlock> >::iterator
+                 it = chains.begin(); it != chains.end();) {
+            if (it->first.second == layer) {
+                for (size_t i = 0; i < it->second.size(); i++) {
+                    ranges.erase((uintptr_t)it->second[i].base);
+                    blocks.push_back(it->second[i]);
+                }
+                it = chains.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    for (size_t i = 0; i < blocks.size(); i++) {
+        int previous = -1;
+        const bool havePrevious = cudaGetDevice(&previous) == cudaSuccess;
+        if (cudaSetDevice(blocks[i].device) == cudaSuccess) {
+            FastllmCudaDirectFree(blocks[i].base);
+        }
+        if (havePrevious) {
+            cudaSetDevice(previous);
+        }
+    }
+}
+
 void * FastllmCudaDirectMalloc(size_t size) {
+    fastllm::LoadStageTiming &allocTiming = fastllm::GetLoadStageTiming();
+    allocTiming.directMallocCalls.fetch_add(1, std::memory_order_relaxed);
+    fastllm::ScopedLoadTimer _mallocTimer(allocTiming.directMallocUs);
     if (FastllmCudaGraphIsCapturingFast()) {
         FastllmCudaSetThreadError();
         return nullptr;
@@ -5137,7 +5397,10 @@ void * FastllmCudaDirectMalloc(size_t size) {
     checkCudaErrors("Error: CUDA error when find device!", state);
     FastllmCudaMemPoolView view = FastllmGetCudaMemPoolView(id);
     std::lock_guard<std::mutex> lock(*view.lock);
-    state = FastllmCudaCheckedMallocWithIdlePoolRetry(&ret, size, id, view, __FILE__, __LINE__);
+    {
+        fastllm::ScopedLoadTimer _inner(allocTiming.directMallocInnerUs);
+        state = FastllmCudaCheckedMallocWithIdlePoolRetry(&ret, size, id, view, __FILE__, __LINE__);
+    }
     if (cudaSuccess != state) {
         printf("Error: CUDA error when allocating %lu kB memory! maybe there's no enough memory left on device.", size >> 10);
         checkCudaErrors("", state);
@@ -5146,6 +5409,7 @@ void * FastllmCudaDirectMalloc(size_t size) {
 #ifdef CUDA_MEM_DEBUG
     CudaMemDebugRecord(ret, size);
 #endif
+    FastllmCudaPoolTraceRecord(ret, id, size, true, "direct");
     return ret;
 }
 
@@ -5182,6 +5446,7 @@ FastllmCudaTryMallocResult FastllmCudaTryDirectMalloc(
 #ifdef CUDA_MEM_DEBUG
         CudaMemDebugRecord(*ret, size);
 #endif
+        FastllmCudaPoolTraceRecord(*ret, id, size, true, "direct_try");
         return FASTLLM_CUDA_TRY_MALLOC_SUCCESS;
     }
     if (state == cudaErrorMemoryAllocation &&
@@ -5206,11 +5471,25 @@ FastllmCudaTryMallocResult FastllmCudaTryDirectMalloc(
 }
 
 void FastllmCudaDirectFree(void *ret) {
-    if (fastllm::TryFreeCudaWorkspace(ret)) return;
+    if (FreeCudaWeightArenaPointer(ret)) {
+        return;  // 竞技场切片：整层结束后由 ReleaseCudaWeightArena 统一释放
+    }
+    fastllm::LoadStageTiming &freeTiming = fastllm::GetLoadStageTiming();
+    freeTiming.directFreeCalls.fetch_add(1, std::memory_order_relaxed);
+    fastllm::ScopedLoadTimer _freeTimer(freeTiming.directFreeUs);
+    {
+        fastllm::ScopedLoadTimer _ws(freeTiming.directFreeWsUs);
+        if (fastllm::TryFreeCudaWorkspace(ret)) return;
+    }
+    FastllmCudaPoolTraceForget(ret);
 #ifdef CUDA_MEM_DEBUG
     CudaMemDebugRemove(ret);
 #endif
-    cudaError_t state = cudaFree(ret);
+    cudaError_t state;
+    {
+        fastllm::ScopedLoadTimer _inner(freeTiming.directFreeInnerUs);
+        state = cudaFree(ret);
+    }
     //checkCudaErrors("Error: CUDA error when release memory!", state);
 }
 
@@ -5318,6 +5597,70 @@ static void FastllmCudaPrintPoolRejectStateLocked(int id, size_t requestSize,
                 smallFree / 1048576.0, freeCount, smallBusy / 1048576.0, busyCount);
     }
     fflush(stderr);
+}
+
+// Fatal-path summary only (an allocation already failed after the idle-release
+// retry): how much of the device the pool holds busy vs cached, so an OOM report
+// shows the working set instead of only gpuFree.
+static void FastllmCudaPrintPoolSummaryOnFailureLocked(int id, size_t requestSize,
+                                                     std::vector<CudaMemoryBuffer> *bigBuffersPtr,
+                                                     std::vector<CudaMemoryBuffer> *smallBuffersPtr) {
+    static std::atomic<int> printed{0};
+    if (printed.fetch_add(1, std::memory_order_relaxed) >= 8) return;
+    size_t bigBusy = 0, bigFree = 0, bigFreeMax = 0, smallBusy = 0, smallFree = 0;
+    int bigBusyN = 0, bigFreeN = 0;
+    if (bigBuffersPtr != nullptr) {
+        for (auto &b : *bigBuffersPtr) {
+            if (b.busy) { bigBusy += b.size; bigBusyN++; }
+            else { bigFree += b.size; bigFreeN++; bigFreeMax = std::max(bigFreeMax, b.size); }
+        }
+    }
+    if (smallBuffersPtr != nullptr) {
+        for (auto &b : *smallBuffersPtr) (b.busy ? smallBusy : smallFree) += b.size;
+    }
+    printf("[CUDA-POOL-OOM] device %d request %.2f MB: big busy %.2f MB (%d) free %.2f MB (%d, largest %.2f MB), "
+           "small busy %.2f MB free %.2f MB.\n",
+           id, requestSize / 1048576.0, bigBusy / 1048576.0, bigBusyN, bigFree / 1048576.0, bigFreeN,
+           bigFreeMax / 1048576.0, smallBusy / 1048576.0, smallFree / 1048576.0);
+    if (FastllmCudaPoolTraceEnabled()) {
+        struct Group { size_t bytes = 0; int count = 0; std::set<int> tids; FastllmCudaPoolTraceSite site; const char *kind = ""; };
+        std::map<std::string, Group> groups;
+        size_t untraced = 0, directBytes = 0, bigTotal = 0, smallTotal = 0;
+        std::lock_guard<std::mutex> traceLock(fastllmCudaPoolTraceMutex);
+        auto add = [&](void *ptr, size_t size, const char *kind) {
+            auto it = fastllmCudaPoolTraceSites.find(ptr);
+            if (it == fastllmCudaPoolTraceSites.end()) { untraced += size; return; }
+            std::string key(kind);
+            for (int i = 3; i < it->second.depth; i++) key += std::to_string((uintptr_t)it->second.frames[i]) + ",";
+            Group &g = groups[key];
+            g.bytes += size; g.count++; g.tids.insert(it->second.tid); g.site = it->second; g.kind = kind;
+        };
+        if (bigBuffersPtr != nullptr) for (auto &b : *bigBuffersPtr) { bigTotal += b.size; if (b.busy) add(b.data, b.size, "big"); }
+        if (smallBuffersPtr != nullptr) for (auto &b : *smallBuffersPtr) { smallTotal += b.size; if (b.busy) add(b.data, b.size, "small"); }
+        for (auto &it : fastllmCudaPoolTraceSites) {
+            if (it.second.direct && it.second.device == id) { directBytes += it.second.size; add(it.first, it.second.size, "direct"); }
+        }
+        size_t freeMem = 0, totalMem = 0;
+        cudaMemGetInfo(&freeMem, &totalMem);
+        size_t used = totalMem - freeMem;
+        size_t known = bigTotal + smallTotal + directBytes;
+        printf("[POOL-TRACE] oom dev=%d used=%.2fMB poolBig=%.2fMB poolSmall=%.2fMB directTraced=%.2fMB "
+               "other(weights arena/workspace/context)=%.2fMB untracedBusy=%.2fMB groups=%zu\n",
+               id, used / 1048576.0, bigTotal / 1048576.0, smallTotal / 1048576.0, directBytes / 1048576.0,
+               used > known ? (used - known) / 1048576.0 : 0.0, untraced / 1048576.0, groups.size());
+        std::vector<const Group *> sorted;
+        for (auto &it : groups) sorted.push_back(&it.second);
+        std::sort(sorted.begin(), sorted.end(), [](const Group *a, const Group *b) { return a->bytes > b->bytes; });
+        for (int i = 0; i < (int)sorted.size() && i < 40; i++) {
+            const Group &g = *sorted[i];
+            std::string tids;
+            for (int t : g.tids) tids += std::to_string(t) + ":" + FastllmCudaPoolTraceThreadName(t) + ",";
+            printf("[POOL-TRACE] oom-group %d kind=%s bytes=%.2fMB count=%d tids=%s at %s\n",
+                   i, g.kind, g.bytes / 1048576.0, g.count, tids.c_str(),
+                   FastllmCudaPoolTraceFrames(g.site).c_str());
+        }
+    }
+    fflush(stdout);
 }
 
 static void FastllmCudaReleaseIdleCachedBuffersForDevice(int id) {
@@ -5623,6 +5966,7 @@ static void *FastllmCudaMallocImpl(
 #ifdef CUDA_MEM_DEBUG
             CudaMemDebugRecord(bigBuffers[selId].data, size);
 #endif
+            FastllmCudaPoolTraceRecord(bigBuffers[selId].data, id, bigBuffers[selId].size, false, nullptr);
             return allocationSucceeded(bigBuffers[selId].data);
         }
         if (useAnyFittingPooledBuffer) {
@@ -5645,6 +5989,7 @@ static void *FastllmCudaMallocImpl(
 #ifdef CUDA_MEM_DEBUG
                 CudaMemDebugRecord(bigBuffers[selId].data, size);
 #endif
+                FastllmCudaPoolTraceRecord(bigBuffers[selId].data, id, bigBuffers[selId].size, false, nullptr);
                 return allocationSucceeded(bigBuffers[selId].data);
             }
         }
@@ -5682,6 +6027,7 @@ static void *FastllmCudaMallocImpl(
             printf("Error: CUDA error when allocating %lu MB memory on device %d! "
                    "gpuFree: %lu MB / %lu MB.\n",
                    size >> 20, id, freeMem >> 20, totalMem >> 20);
+            FastllmCudaPrintPoolSummaryOnFailureLocked(id, size, view.bigBuffers, view.smallBuffers);
             fflush(stdout);
             checkCudaErrors("", state);
             return nullptr;
@@ -5691,6 +6037,7 @@ static void *FastllmCudaMallocImpl(
 #ifdef CUDA_MEM_DEBUG
         CudaMemDebugRecord(ret, size);
 #endif
+        FastllmCudaPoolTraceRecord(ret, id, size, false, "big");
         return allocationSucceeded(ret);
     }
     auto &cudaBuffers = *view.smallBuffers;
@@ -5723,6 +6070,7 @@ static void *FastllmCudaMallocImpl(
 #ifdef CUDA_MEM_DEBUG
         CudaMemDebugRecord(buffer.data, size);
 #endif
+        FastllmCudaPoolTraceRecord(buffer.data, id, buffer.size, false, nullptr);
         return allocationSucceeded(buffer.data);
     }
     if (useAnyFittingPooledBuffer) {
@@ -5747,6 +6095,7 @@ static void *FastllmCudaMallocImpl(
 #ifdef CUDA_MEM_DEBUG
             CudaMemDebugRecord(bigBuffers[selId].data, size);
 #endif
+            FastllmCudaPoolTraceRecord(bigBuffers[selId].data, id, bigBuffers[selId].size, false, nullptr);
             return allocationSucceeded(bigBuffers[selId].data);
         }
     }
@@ -5792,6 +6141,7 @@ static void *FastllmCudaMallocImpl(
 #ifdef CUDA_MEM_DEBUG
     CudaMemDebugRecord(ret, size);
 #endif
+    FastllmCudaPoolTraceRecord(ret, id, size, false, "small");
     return allocationSucceeded(ret);
 }
 
@@ -5816,6 +6166,20 @@ FastllmCudaTryMallocResult FastllmCudaTryMalloc(
     return result;
 }
 
+// Diagnosis only (default off): FASTLLM_CUDA_POOL_FILL=<byte> fills every
+// FastllmCudaMalloc result, so a kernel that reads memory it never wrote
+// becomes independent of what an earlier request left in a reused buffer.
+static int FastllmCudaPoolFillByte() {
+    static int value = []() {
+        const char *env = std::getenv("FASTLLM_CUDA_POOL_FILL");
+        if (env == nullptr || env[0] == '\0') return -1;
+        int v = atoi(env);
+        printf("[CUDA] pool fill enabled: byte=%d\n", v & 255);
+        return v & 255;
+    }();
+    return value;
+}
+
 bool FastllmCudaReserveGraphWorkspace(const std::vector<size_t> &requests) {
     if (FastllmCudaGraphIsCapturingFast()) return false;
     FastllmCudaAllocationRecorder suspend(nullptr);
@@ -5836,7 +6200,19 @@ bool FastllmCudaReserveGraphWorkspace(const std::vector<size_t> &requests) {
 }
 
 void * FastllmCudaMalloc(size_t size) {
-    return FastllmCudaMallocImpl(size, nullptr);
+    void *ret = FastllmCudaMallocImpl(size, nullptr);
+    const int fill = FastllmCudaPoolFillByte();
+    if (fill >= 0 && ret != nullptr && size > 0) {
+        cudaStreamCaptureStatus a = cudaStreamCaptureStatusNone, b = cudaStreamCaptureStatusNone;
+        cudaStreamIsCapturing(cudaStreamPerThread, &a);
+        cudaStreamIsCapturing(cudaStreamLegacy, &b);
+        if (a == cudaStreamCaptureStatusNone && b == cudaStreamCaptureStatusNone) {
+            cudaDeviceSynchronize();
+            cudaMemset(ret, fill, size);
+            cudaDeviceSynchronize();
+        }
+    }
+    return ret;
 }
 
 void FastllmCudaForceFree(void *ret) {
@@ -5997,15 +6373,32 @@ bool FastllmCudaFreeAfterCurrentThreadStream(void *ret) {
     return FastllmCudaFreeAfterStream(ret, cudaStreamPerThread);
 }
 
+static std::atomic<int> fastllmCudaDeferredFreeDevice{-1};
+void FastllmCudaEnableDeferredFreeDevice(int device) {
+    fastllmCudaDeferredFreeDevice.store(device, std::memory_order_release);
+    int previous = FastllmCudaGetDevice();
+    cudaSetDevice(device);
+    cudaError_t state = cudaDeviceSynchronize();
+    checkCudaErrors("Error: CUDA error when enabling deferred frees!", state);
+    cudaSetDevice(previous);
+}
+
 void FastllmCudaFree(void *ret) {
     if (ret == nullptr) {
         return;
     }
+    FastllmCudaPoolTraceForget(ret);
     if (fastllm::TryFreeCudaWorkspace(ret)) return;
     if (FastllmCudaTryFreeWeightSlabPtr(ret)) {
         return;
     }
     int oriId = FastllmCudaGetDevice();
+    // Another thread may run on this device on its own per-thread stream: reuse only after this
+    // thread's pending work on the buffer is done (event-ordered, FastllmCudaFreeAfterStream).
+    if (oriId == fastllmCudaDeferredFreeDevice.load(std::memory_order_acquire) &&
+        FastllmCudaFreeAfterStream(ret, cudaStreamPerThread)) {
+        return;
+    }
     FastllmCudaGraphCaptureIdentity captureIdentity =
         FastllmCudaGraphCurrentCaptureIdentity();
 
@@ -6736,6 +7129,30 @@ void FastllmCudaMemcpy2DDeviceToDevice(void * 	dst, size_t 	dpitch, const void *
     }
 
     state = cudaMemcpy2D(dst, dpitch, src, spitch, width, height, cudaMemcpyDeviceToDevice);
+    if (state != cudaSuccess) {
+        // 诊断（只在失败时打印，不影响任何成功路径）：打印"当前卡 / 两个指针各自所属卡 /
+        // 全部几何参数 / 调用点回栈"，用于判定是"跨设备拷贝"还是"几何尺寸非法"。
+        const int diagCurrentDevice = FastllmCudaGetDevice();
+        const int diagDstDevice = GetPointerDeviceId(dst);
+        const int diagSrcDevice = GetPointerDeviceId(const_cast<void *>(src));
+        printf("[2DCOPY-FAIL] cur_dev=%d dst_dev=%d src_dev=%d width=%llu height=%llu "
+               "dpitch=%llu spitch=%llu width>dpitch=%d width>spitch=%d dst=%p src=%p\n",
+               diagCurrentDevice, diagDstDevice, diagSrcDevice,
+               (unsigned long long)width, (unsigned long long)height,
+               (unsigned long long)dpitch, (unsigned long long)spitch,
+               (int)(width > dpitch), (int)(width > spitch),
+               dst, src);
+        void *diagFrames[16];
+        const int diagFramesNum = backtrace(diagFrames, 16);
+        char **diagSymbols = backtrace_symbols(diagFrames, diagFramesNum);
+        for (int di = 0; di < diagFramesNum; di++) {
+            printf("    #%d %s\n", di, diagSymbols == nullptr ? "?" : diagSymbols[di]);
+        }
+        if (diagSymbols != nullptr) {
+            free(diagSymbols);
+        }
+        fflush(stdout);
+    }
     checkCudaErrors("Error: CUDA error when 2D copy on GPU!", state);
     DeviceSync();
 }
@@ -22326,6 +22743,48 @@ __global__ void FastllmRecurrentGatedDeltaRuleBatchFromConvBaHalfKernel(
     }
 }
 
+// Preserve the established single-token state arithmetic in all fused sequence
+// snapshot/restore paths. An explicit rounded decay prevents NVCC from choosing
+// state*decay + (key*delta) as a different contracted FMA before the FP16 store.
+static __device__ __forceinline__ float FastllmGdnDecayState(float state, float decay) {
+    return __fmul_rn(state, decay);
+}
+
+static __device__ __forceinline__ float FastllmGdnUpdateState(
+        float decayedState, float key, float delta) {
+    return __fmaf_rn(key, delta, decayedState);
+}
+
+// Same contract as fastllm::cuda_gdn::Step128<half, true>, but with the
+// rounded-decay arithmetic above. Every single-token GDN path in this file
+// uses that arithmetic, so restore/snapshot replays stay bit-identical to
+// normal decode (an SSD restore must reproduce the uncached output).
+static __device__ __forceinline__ float FastllmGdnStep128(
+        half (&state)[4], const float (&q)[4], const float (&k)[4],
+        float value, float beta, float decay, float qScale) {
+    float decayed[4], sumK = 0.f;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        decayed[j] = FastllmGdnDecayState(__half2float(state[j]), decay);
+        sumK += decayed[j] * k[j];
+    }
+#pragma unroll
+    for (int offset = 16; offset; offset >>= 1)
+        sumK += __shfl_down_sync(0xffffffff, sumK, offset);
+    float delta = (value - __shfl_sync(0xffffffff, sumK, 0)) * beta;
+    float sumQ = 0.f;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        float updated = FastllmGdnUpdateState(decayed[j], k[j], delta);
+        state[j] = __float2half_rn(updated);
+        sumQ += updated * (q[j] * qScale);
+    }
+#pragma unroll
+    for (int offset = 16; offset; offset >>= 1)
+        sumQ += __shfl_down_sync(0xffffffff, sumQ, offset);
+    return __shfl_sync(0xffffffff, sumQ, 0);
+}
+
 template <int TILE_V, bool EXACT_NORM_128>
 __global__ void FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedHalfWarpKernel(
     half **last_recurrent_states,
@@ -22516,7 +22975,7 @@ __global__ void FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedHalfWarpK
 #pragma unroll
         for (int item = 0; item < 4; item++) {
             int j = lane_id + item * 32;
-            decayedState[item] = __half2float(state_row[j]) * gVal;
+            decayedState[item] = FastllmGdnDecayState(__half2float(state_row[j]), gVal);
             sumK += decayedState[item] * k_norm[j];
         }
         for (int offset = 16; offset > 0; offset >>= 1) {
@@ -22529,7 +22988,7 @@ __global__ void FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedHalfWarpK
 #pragma unroll
         for (int item = 0; item < 4; item++) {
             int j = lane_id + item * 32;
-            float updated = decayedState[item] + k_norm[j] * delta;
+            float updated = FastllmGdnUpdateState(decayedState[item], k_norm[j], delta);
             state_row[j] = __float2half_rn(updated);
             sumQ += updated * (q_norm[j] * qScale);
         }
@@ -22823,7 +23282,7 @@ __global__ void FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWa
             for (int j = 0; j < 4; ++j) {
                 q[j] = qToken[lane_id + j * 32]; k[j] = kToken[lane_id + j * 32];
             }
-            float sumQ = fastllm::cuda_gdn::Step128<half, true>(stateValues, q, k,
+            float sumQ = FastllmGdnStep128(stateValues, q, k,
                 __half2float(convOutput[vOffset + v_col]), gateValues[token * gateTokenStride], gVal, qScale);
             half *snapBase = nullptr;
             if (token < numSnaps && snapshotPointers != nullptr) {
@@ -24528,14 +24987,19 @@ struct FastllmChunkGdnVarlenScratch {
     size_t hBytes = 0;
     size_t vNewBytes = 0;
     size_t stateBytes = 0;
+    void *common64 = nullptr;
+    size_t common64Bytes = 0;
 };
+
+static FastllmChunkGdnVarlenScratch &FastllmChunkGdnVarlenScratchForDevice() {
+    thread_local static std::map<int, FastllmChunkGdnVarlenScratch> scratches;
+    return scratches[FastllmCudaGetDevice()];
+}
 
 static bool FastllmEnsureChunkGdnVarlenScratch(
     size_t hBytes, size_t vNewBytes, size_t stateBytes,
     FastllmChunkGdnVarlenScratch *&scratch) {
-    thread_local static std::map<int, FastllmChunkGdnVarlenScratch> scratches;
-    int device = FastllmCudaGetDevice();
-    FastllmChunkGdnVarlenScratch &cached = scratches[device];
+    FastllmChunkGdnVarlenScratch &cached = FastllmChunkGdnVarlenScratchForDevice();
     if (cached.hBytes < hBytes || cached.vNewBytes < vNewBytes ||
         cached.stateBytes < stateBytes) {
         if (cached.h != nullptr || cached.vNew != nullptr ||
@@ -24545,7 +25009,8 @@ static bool FastllmEnsureChunkGdnVarlenScratch(
         if (cached.h != nullptr) FastllmCudaFree(cached.h);
         if (cached.vNew != nullptr) FastllmCudaFree(cached.vNew);
         if (cached.nextState != nullptr) FastllmCudaFree(cached.nextState);
-        cached = FastllmChunkGdnVarlenScratch();
+        cached.h = cached.vNew = cached.nextState = nullptr;
+        cached.hBytes = cached.vNewBytes = cached.stateBytes = 0;
         cached.h = FastllmCudaMalloc(hBytes);
         cached.vNew = FastllmCudaMalloc(vNewBytes);
         cached.nextState = FastllmCudaMalloc(stateBytes);
@@ -24554,7 +25019,8 @@ static bool FastllmEnsureChunkGdnVarlenScratch(
             if (cached.h != nullptr) FastllmCudaFree(cached.h);
             if (cached.vNew != nullptr) FastllmCudaFree(cached.vNew);
             if (cached.nextState != nullptr) FastllmCudaFree(cached.nextState);
-            cached = FastllmChunkGdnVarlenScratch();
+            cached.h = cached.vNew = cached.nextState = nullptr;
+        cached.hBytes = cached.vNewBytes = cached.stateBytes = 0;
             return false;
         }
         cached.hBytes = hBytes;
@@ -24566,7 +25032,374 @@ static bool FastllmEnsureChunkGdnVarlenScratch(
 }
 }
 
-bool FastllmChunkGatedDeltaRuleVarlenPrefillNative(
+
+// Keep the original strided FP16 path below as an explicit numerical baseline.
+// Both production layouts select this common implementation together.
+static bool FastllmChunkGdnUseCommon64() {
+    const char *value = std::getenv("FASTLLM_CUDA_GDN_COMMON64");
+    return (value == nullptr || value[0] != '0') &&
+        !FastllmCudaGraphIsCapturingFast() &&
+        fastllmCudaGraphPointerTableScopes.empty();
+}
+
+// Default off: packed prefill with more than 8 rows falls back to legacy.
+static bool FastllmChunkGdnWideLegacy() {
+    static const bool enabled = [] {
+        const char *value = std::getenv("FASTLLM_CUDA_GDN_WIDE_LEGACY");
+        return value != nullptr && value[0] == '1' && value[1] == '\0';
+    }();
+    return enabled;
+}
+
+struct FastllmChunkGdn64Layout {
+    int batch, heads, keyHeads, chunks, totalChunks, windowStart, windowChunks;
+    bool ragged, applyDecay;
+    int rowChunks[8], chunkBase[8], tokenBase[8];
+    int activeCount[32], activeRows[32][8];
+};
+
+struct FastllmChunkGdn64Workspace {
+    half *qScaled, *kScaledTrans, *vNew, *out, *attn, *state;
+    float *lastExp;
+    const half **kCumPointers, **stateReadPointers, **qPointers;
+    const half **vReadPointers, **attnPointers, **kPointers;
+    half **vPointers, **outPointers, **statePointers;
+    size_t capacity;
+};
+
+// Persistent buffers are reused only on their owning worker's PTDS. Resizing
+// waits for old users exactly as the existing varlen scratch did; reuse does not.
+static size_t FastllmChunkGdn64WorkspaceBytes(size_t jobs, size_t stateElements) {
+    auto aligned = [](size_t x) { return (x + 255) & ~size_t(255); };
+    return aligned(jobs * 64 * 128 * sizeof(half)) * 4 +
+        aligned(jobs * 64 * 64 * sizeof(half)) +
+        aligned(stateElements * sizeof(half)) +
+        aligned(jobs * sizeof(float)) + aligned(jobs * sizeof(half*)) * 9;
+}
+
+static bool FastllmEnsureChunkGdn64Workspace(
+    size_t jobs, size_t stateElements, FastllmChunkGdn64Workspace &view) {
+    FastllmChunkGdnVarlenScratch &owner = FastllmChunkGdnVarlenScratchForDevice();
+    void *&scratchData = owner.common64;
+    size_t &scratchCapacity = owner.common64Bytes;
+    auto aligned = [](size_t x) { return (x + 255) & ~size_t(255); };
+    const size_t vectorBytes = aligned(jobs * 64 * 128 * sizeof(half));
+    const size_t attnBytes = aligned(jobs * 64 * 64 * sizeof(half));
+    const size_t stateBytes = aligned(stateElements * sizeof(half));
+    const size_t scaleBytes = aligned(jobs * sizeof(float));
+    const size_t pointerBytes = aligned(jobs * sizeof(half*));
+    const size_t bytes = FastllmChunkGdn64WorkspaceBytes(jobs, stateElements);
+    if (scratchCapacity < bytes) {
+        if (scratchData) {
+            FastllmCudaSyncCurrentThreadStream();
+            FastllmCudaFree(scratchData);
+            scratchData = nullptr;
+            scratchCapacity = 0;
+        }
+        scratchData = FastllmCudaMalloc(bytes);
+        if (!scratchData) return false;
+        scratchCapacity = bytes;
+    }
+    uint8_t *p = (uint8_t*)scratchData;
+    view.qScaled = (half*)p; p += vectorBytes;
+    view.kScaledTrans = (half*)p; p += vectorBytes;
+    view.vNew = (half*)p; p += vectorBytes;
+    view.out = (half*)p; p += vectorBytes;
+    view.attn = (half*)p; p += attnBytes;
+    view.state = (half*)p; p += stateBytes;
+    view.lastExp = (float*)p; p += scaleBytes;
+    view.kCumPointers = (const half**)p; p += pointerBytes;
+    view.stateReadPointers = (const half**)p; p += pointerBytes;
+    view.qPointers = (const half**)p; p += pointerBytes;
+    view.vReadPointers = (const half**)p; p += pointerBytes;
+    view.attnPointers = (const half**)p; p += pointerBytes;
+    view.kPointers = (const half**)p; p += pointerBytes;
+    view.vPointers = (half**)p; p += pointerBytes;
+    view.outPointers = (half**)p; p += pointerBytes;
+    view.statePointers = (half**)p;
+    view.capacity = jobs;
+    return true;
+}
+
+// One block prepares one active row/head/chunk, batching the entire window.
+// The expressions and conversion points are the original FP16 uniform window
+// Q scale / g scale / transposed K scale / V copy, with pointer-table layout.
+__global__ void FastllmChunkGdn64PrepareWindowKernel(
+    const half *q, const half *k, const half *v, const half *g,
+    const half *attn, const half *kCum, const half *decay,
+    const half *initialState, FastllmChunkGdn64Layout layout,
+    FastllmChunkGdn64Workspace work) {
+    const int slots = layout.batch * layout.heads;
+    int localChunk = blockIdx.x / slots;
+    int activeBh = blockIdx.x % slots;
+    if (activeBh >= layout.activeCount[localChunk] * layout.heads) return;
+    const int row = layout.activeRows[localChunk][activeBh / layout.heads];
+    const int head = activeBh % layout.heads;
+    const int keyHead = head * layout.keyHeads / layout.heads;
+    const int relativeChunk = layout.windowStart + localChunk;
+    const size_t keyChunk = layout.ragged
+        ? (size_t)keyHead * layout.totalChunks + layout.chunkBase[row] + relativeChunk
+        : ((size_t)row * layout.keyHeads + keyHead) * layout.chunks + relativeChunk;
+    const size_t valueChunk = layout.ragged
+        ? (size_t)head * layout.totalChunks + layout.chunkBase[row] + relativeChunk
+        : ((size_t)row * layout.heads + head) * layout.chunks + relativeChunk;
+    const size_t job = (size_t)localChunk * slots + activeBh;
+    half *qScaled = work.qScaled + job * 64 * 128;
+    half *kScaled = work.kScaledTrans + job * 64 * 128;
+    half *vNew = work.vNew + job * 64 * 128;
+    half *out = work.out + job * 64 * 128;
+    half *maskedAttn = work.attn + job * 64 * 64;
+    const half *gChunk = g + valueChunk * 64;
+    const float last = __half2float(gChunk[63]);
+    for (int i = threadIdx.x; i < 64 * 128; i += blockDim.x) {
+        const int token = i / 128, kd = i % 128;
+        const float decayValue = __half2float(gChunk[token]);
+        qScaled[i] = __float2half(__half2float(q[keyChunk * 64 * 128 + i]) *
+                                expf(decayValue));
+        kScaled[(size_t)kd * 64 + token] = __float2half(
+            __half2float(k[keyChunk * 64 * 128 + i]) * expf(last - decayValue));
+        vNew[i] = v[valueChunk * 64 * 128 + i];
+    }
+    for (int i = threadIdx.x; i < 64 * 64; i += blockDim.x) {
+        half value = attn[keyChunk * 64 * 64 + i];
+        if (layout.applyDecay) {
+            value = i % 64 <= i / 64
+                ? __float2half(__half2float(value) *
+                    __half2float(decay[valueChunk * 64 * 64 + i]))
+                : __float2half(0.0f);
+        }
+        maskedAttn[i] = value;
+    }
+    if (threadIdx.x == 0) {
+        half *state = work.state + ((size_t)row * layout.heads + head) * 128 * 128;
+        work.lastExp[job] = expf(last);
+        work.kCumPointers[job] = kCum + valueChunk * 64 * 128;
+        work.stateReadPointers[job] = relativeChunk == 0
+            ? initialState + ((size_t)row * layout.heads + head) * 128 * 128
+            : state;
+        work.qPointers[job] = qScaled;
+        work.vReadPointers[job] = vNew;
+        work.attnPointers[job] = maskedAttn;
+        work.kPointers[job] = kScaled;
+        work.vPointers[job] = vNew;
+        work.outPointers[job] = out;
+        work.statePointers[job] = state;
+    }
+}
+
+__global__ void FastllmChunkGdn64ScaleStateKernel(
+    const half *const *readStates, half *const *states,
+    const float *lastExp, size_t total) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < total) {
+        size_t bh = i / (128 * 128);
+        half *value = states[bh] + i % (128 * 128);
+        *value = __float2half(__half2float(readStates[bh][i % (128 * 128)]) *
+                             lastExp[bh]);
+    }
+}
+
+static void FastllmChunkGdn64HalfMatMul(
+    const half *const *input0, const half *const *input1, half *const *output,
+    int batch, int n, int m, int k, float alpha, float beta) {
+    half hAlpha = __float2half(alpha), hBeta = __float2half(beta);
+    cublasStatus_t status = cublasHgemmBatched(getFastllmCublasHandle(),
+        CUBLAS_OP_N, CUBLAS_OP_N, k, n, m, &hAlpha,
+        input1, k, input0, m, &hBeta, output, k, batch);
+    fastllm::AssertInFastLLM(status == CUBLAS_STATUS_SUCCESS,
+                           "CUDA common64 GDN batched GEMM failed.\n");
+}
+
+// This is the single FP16 64-token arithmetic implementation for both layouts.
+// Every intermediate retains the original uniform half storage boundary.
+static void FastllmChunkGdn64ExecuteStep(
+    FastllmChunkGdn64Workspace work, size_t offset, int activeBh) {
+    FastllmChunkGdn64HalfMatMul(work.kCumPointers + offset,
+        work.stateReadPointers + offset, work.vPointers + offset,
+        activeBh, 64, 128, 128, -1.0f, 1.0f);
+    FastllmChunkGdn64HalfMatMul(work.qPointers + offset,
+        work.stateReadPointers + offset, work.outPointers + offset,
+        activeBh, 64, 128, 128, 1.0f, 0.0f);
+    FastllmChunkGdn64HalfMatMul(work.attnPointers + offset,
+        work.vReadPointers + offset, work.outPointers + offset,
+        activeBh, 64, 64, 128, 1.0f, 1.0f);
+    const size_t total = (size_t)activeBh * 128 * 128;
+    FastllmChunkGdn64ScaleStateKernel<<<(total + 255) / 256, 256>>>(
+        work.stateReadPointers + offset, work.statePointers + offset,
+        work.lastExp + offset, total);
+    FastllmChunkGdn64HalfMatMul(work.kPointers + offset,
+        work.vReadPointers + offset, work.statePointers + offset,
+        activeBh, 128, 64, 128, 1.0f, 1.0f);
+}
+
+__global__ void FastllmChunkGdn64ScatterWindowKernel(
+    const half *source, half *destination, FastllmChunkGdn64Layout layout,
+    int totalTokens, const int *validTokens, const int *chunkTokenBases) {
+    const int slots = layout.batch * layout.heads;
+    int localChunk = blockIdx.x / slots, activeBh = blockIdx.x % slots;
+    if (activeBh >= layout.activeCount[localChunk] * layout.heads) return;
+    int row = layout.activeRows[localChunk][activeBh / layout.heads];
+    int head = activeBh % layout.heads;
+    int relativeChunk = layout.windowStart + localChunk;
+    size_t job = (size_t)localChunk * slots + activeBh;
+    for (int i = threadIdx.x; i < 64 * 128; i += blockDim.x) {
+        if (layout.ragged) {
+            int ci = layout.chunkBase[row] + relativeChunk, token = i / 128;
+            if (token < validTokens[ci])
+                destination[((size_t)(chunkTokenBases[ci] + token) * layout.heads + head) *
+                            128 + i % 128] = source[job * 64 * 128 + i];
+        } else {
+            size_t chunk = ((size_t)row * layout.heads + head) * layout.chunks + relativeChunk;
+            destination[chunk * 64 * 128 + i] = source[job * 64 * 128 + i];
+        }
+    }
+}
+
+static bool FastllmChunkGdnCommon64(
+    fastllm::Data &q, fastllm::Data &k, fastllm::Data &v, fastllm::Data &g,
+    fastllm::Data &attn, fastllm::Data &kCum, fastllm::Data &state,
+    const std::vector<int> &seqLens, bool ragged, fastllm::Data &output,
+    const fastllm::Data *decayMask = nullptr, bool applyDecay = false,
+    bool *legacyFallback = nullptr) {
+    if (legacyFallback) *legacyFallback = false;
+    if (q.dims.size() != 5 || k.dims != q.dims || v.dims.size() != 5 ||
+        q.dims[3] != 64 || q.dims[4] != 128 || q.dims[2] <= 0 ||
+        (ragged && q.dims[0] != 1)) return false;
+    const int batch = ragged ? (int)seqLens.size() : q.dims[0];
+    const int heads = v.dims[1], keyHeads = q.dims[1];
+    // The layout arrays hold 8 rows. With the flag, more rows use the legacy
+    // varlen kernel (one H block per row/head, like vLLM cu_seqlens kernels)
+    // instead of failing the request; nothing has been written yet.
+    if (ragged && batch > 8 && legacyFallback && FastllmChunkGdnWideLegacy()) {
+        *legacyFallback = true;
+        return false;
+    }
+    if (batch <= 0 || batch > 8 || heads <= 0 || keyHeads <= 0 ||
+        heads % keyHeads || q.dataType != fastllm::DataType::FLOAT16 ||
+        state.dataType != fastllm::DataType::FLOAT16) return false;
+    const int outer = ragged ? 1 : batch, chunks = q.dims[2];
+    if (v.dims != std::vector<int>({outer, heads, chunks, 64, 128}) ||
+        g.dims != std::vector<int>({outer, heads, chunks, 64}) ||
+        kCum.dims != std::vector<int>({outer, heads, chunks, 64, 128}) ||
+        attn.dims != std::vector<int>({outer, keyHeads, chunks, 64, 64}) ||
+        state.dims != std::vector<int>({batch, heads, 128, 128}) ||
+        (!ragged && heads != keyHeads)) return false;
+    if (applyDecay && (!decayMask ||
+        decayMask->dataType != fastllm::DataType::FLOAT16 ||
+        decayMask->dims != std::vector<int>({outer, heads, chunks, 64, 64})))
+        return false;
+    for (int length : seqLens)
+        if (length <= 0 || length > std::numeric_limits<int>::max() - 63) return false;
+    int device = -1;
+    if (q.multiDeviceData || !FastllmCudaResolveDataDeviceId(q, device) ||
+        FastllmCudaGetDevice() != device || !FastllmCudaDataHasDenseStrides(q))
+        return false;
+    std::vector<const fastllm::Data*> inputs{&k, &v, &g, &attn, &kCum, &state};
+    if (applyDecay) inputs.push_back(decayMask);
+    for (const auto *input : inputs) {
+        if (input == nullptr || input->dataType != fastllm::DataType::FLOAT16 ||
+            input->dataDevice != fastllm::DataDevice::CUDA || input->multiDeviceData ||
+            input->cudaData == nullptr || input->dataDeviceIds.size() > 1 ||
+            (!input->dataDeviceIds.empty() && input->dataDeviceIds[0] != device) ||
+            !FastllmCudaDataHasDenseStrides(*input)) return false;
+    }
+    // Owning/borrowed pool allocations carry authoritative device ownership.
+    // Check their current live registry under one device lock, never trust a
+    // stale tensor device id or persistent pointer cache. External allocations
+    // and unregistered views are resolved once each outside the pool lock.
+    std::vector<const fastllm::Data*> unknown;
+    FastllmCudaMemPoolView pool = FastllmGetCudaMemPoolView(device);
+    {
+        std::lock_guard<std::mutex> guard(*pool.lock);
+        auto inPool = [&](const void *pointer) {
+            const uintptr_t address = reinterpret_cast<uintptr_t>(pointer);
+            for (const auto *buffers : {pool.smallBuffers, pool.bigBuffers})
+                for (const auto &buffer : *buffers) {
+                    const uintptr_t begin = reinterpret_cast<uintptr_t>(buffer.data);
+                    if (buffer.busy && address >= begin && address - begin < buffer.size)
+                        return true;
+                }
+            return false;
+        };
+        for (const auto *input : inputs)
+            if (!inPool(input->cudaData)) unknown.push_back(input);
+    }
+    for (const auto *input : unknown) {
+        int inputDevice = -1;
+        if (!FastllmCudaResolveDataDeviceId(*input, inputDevice) || inputDevice != device)
+            return false;
+    }
+    FastllmChunkGdn64Layout layout{};
+    layout.batch = batch; layout.heads = heads; layout.keyHeads = keyHeads;
+    layout.ragged = ragged; layout.applyDecay = applyDecay;
+    layout.chunks = q.dims[2]; layout.totalChunks = q.dims[2];
+    FastllmCudaRaggedGdnMetadataView metadata;
+    int maxChunks = layout.chunks;
+    if (ragged) {
+        if (!FastllmCudaGetRaggedGdnMetadata(seqLens, 64, metadata) ||
+            metadata.totalChunks != q.dims[2]) return false;
+        maxChunks = metadata.maxChunks;
+        int chunkBase = 0, tokenBase = 0;
+        for (int row = 0; row < batch; ++row) {
+            layout.rowChunks[row] = (seqLens[row] + 63) / 64;
+            layout.chunkBase[row] = chunkBase; layout.tokenBase[row] = tokenBase;
+            chunkBase += layout.rowChunks[row]; tokenBase += seqLens[row];
+        }
+    } else for (int row = 0; row < batch; ++row) layout.rowChunks[row] = maxChunks;
+    if (&output == &state || output.cudaData == state.cudaData) return false;
+    output.dataType = fastllm::DataType::FLOAT16;
+    output.dataDevice = q.dataDevice; output.dataDeviceIds = q.dataDeviceIds;
+    output.Resize(ragged ? std::vector<int>{1, metadata.totalTokens, heads, 128}
+                         : std::vector<int>{batch, heads, maxChunks, 64, 128});
+    output.Allocate(false);
+    if (!output.cudaData || !FastllmCudaDataHasDenseStrides(output)) return false;
+    const size_t bhCount = (size_t)batch * heads;
+    constexpr size_t budget = (size_t)64 << 20;
+    // Bounded window, never one allocation per step. Includes pointer operands,
+    // preprocessed attention and output so no borrowed-arena alias is introduced.
+    const size_t stateElements = bhCount * 128 * 128;
+    int window = std::min(maxChunks, 32);
+    while (window > 0 && FastllmChunkGdn64WorkspaceBytes(
+            bhCount * window, stateElements) > budget) --window;
+    if (window == 0) {
+        if (legacyFallback) *legacyFallback = true;
+        return false; // one chunk exceeds the full aligned cap, before state writes
+    }
+    FastllmChunkGdn64Workspace work{};
+    if (!FastllmEnsureChunkGdn64Workspace(bhCount * window, stateElements, work))
+        return false;
+    for (int first = 0; first < maxChunks; first += window) {
+        layout.windowStart = first; layout.windowChunks = std::min(window, maxChunks - first);
+        for (int local = 0; local < layout.windowChunks; ++local) {
+            int count = 0;
+            for (int row = 0; row < batch; ++row)
+                if (first + local < layout.rowChunks[row]) layout.activeRows[local][count++] = row;
+            layout.activeCount[local] = count;
+        }
+        const int jobs = layout.windowChunks * batch * heads;
+        FastllmChunkGdn64PrepareWindowKernel<<<jobs, 256>>>(
+            (const half*)q.cudaData, (const half*)k.cudaData, (const half*)v.cudaData,
+            (const half*)g.cudaData, (const half*)attn.cudaData, (const half*)kCum.cudaData,
+            applyDecay ? (const half*)decayMask->cudaData : nullptr,
+            (const half*)state.cudaData, layout, work);
+        checkCudaErrors("CUDA common64 window preparation", cudaGetLastError());
+        for (int local = 0; local < layout.windowChunks; ++local) {
+            const int active = layout.activeCount[local] * heads;
+            if (active != 0)
+                FastllmChunkGdn64ExecuteStep(work, (size_t)local * bhCount, active);
+        }
+        FastllmChunkGdn64ScatterWindowKernel<<<jobs, 256>>>(work.out,
+            (half*)output.cudaData, layout, metadata.totalTokens,
+            metadata.chunkValidTokens, metadata.chunkTokenBases);
+        checkCudaErrors("CUDA common64 window output", cudaGetLastError());
+    }
+    checkCudaErrors("CUDA common64 state commit",
+        cudaMemcpyAsync(state.cudaData, work.state, stateElements * sizeof(half),
+                        cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+    return true;
+}
+
+static bool FastllmChunkGatedDeltaRuleVarlenPrefillNativeLegacy(
     fastllm::Data &q, fastllm::Data &k, fastllm::Data &v,
     fastllm::Data &g, fastllm::Data &attn,
     fastllm::Data &k_cumdecay, fastllm::Data &last_recurrent_state,
@@ -24709,6 +25542,25 @@ bool FastllmChunkGatedDeltaRuleVarlenPrefillNative(
         return false;
     }
     return true;
+}
+
+bool FastllmChunkGatedDeltaRuleVarlenPrefillNative(
+    fastllm::Data &q, fastllm::Data &k, fastllm::Data &v,
+    fastllm::Data &g, fastllm::Data &attn,
+    fastllm::Data &k_cumdecay, fastllm::Data &last_recurrent_state,
+    const std::vector<int> &seqLens, fastllm::Data &core_attn_out,
+    const fastllm::Data *decay_mask, bool apply_decay_mask) {
+    if (FastllmChunkGdnUseCommon64()) {
+        bool legacyFallback = false;
+        if (FastllmChunkGdnCommon64(q, k, v, g, attn, k_cumdecay,
+                                   last_recurrent_state, seqLens, true,
+                                   core_attn_out, decay_mask,
+                                   apply_decay_mask, &legacyFallback)) return true;
+        if (!legacyFallback) return false;
+    }
+    return FastllmChunkGatedDeltaRuleVarlenPrefillNativeLegacy(
+            q, k, v, g, attn, k_cumdecay, last_recurrent_state, seqLens,
+            core_attn_out, decay_mask, apply_decay_mask);
 }
 
 void FastllmChunkGatedDeltaRulePrefill(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v,

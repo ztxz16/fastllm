@@ -94,6 +94,30 @@ FlashInferWorkSpaceManager& getFastllmFlashInferWorkSpace(bool allocateFloat) {
     return *workspace;
 }
 
+// Background vision worker: per-thread, per-device scratch instead of the shared per-device buffers below.
+static thread_local bool t_fastllmPrivateScratch = false;
+struct FastllmPrivateScratchHolder { void *data = nullptr; size_t size = 0; };
+static thread_local std::map<int, FastllmPrivateScratchHolder> t_fastllmPrivateScratchMap;
+void FastllmCudaUsePrivateScratch(bool enable) { t_fastllmPrivateScratch = enable; }
+static void *FastllmPrivateScratch(int id, size_t needBytes, size_t *outBytes) {
+    if (needBytes == 0) needBytes = 1;
+    const size_t allocBytes = ((needBytes + 255) / 256) * 256;
+    auto &holder = t_fastllmPrivateScratchMap[id];
+    if (holder.size < allocBytes) {
+        if (holder.data != nullptr) {
+            // only this thread's stream uses it; drain before growing
+            checkCudaErrors("Error: CUDA error when draining private scratch!", cudaStreamSynchronize(cudaStreamPerThread));
+            FastllmCudaDirectFree(holder.data);
+            holder.data = nullptr;
+            holder.size = 0;
+        }
+        holder.data = FastllmCudaDirectMalloc(allocBytes);
+        holder.size = holder.data != nullptr ? allocBytes : 0;
+    }
+    if (outBytes != nullptr) *outBytes = holder.size;
+    return holder.data;
+}
+
 static void *TryGetFlashInferFloatWorkspace(int id, size_t *outSize) {
     if (outSize != nullptr) *outSize = 0;
     auto *entry = FindFlashInferWorkSpace(id, false);
@@ -108,11 +132,24 @@ static void *TryGetFlashInferFloatWorkspace(int id, size_t *outSize) {
 void *FastllmCudaTryGetFlashInferFloatWorkspace(size_t *outSize) {
     int id = -1;
     checkCudaErrors("Error: CUDA error when find device!", cudaGetDevice(&id));
+    if (t_fastllmPrivateScratch) {
+        size_t sharedBytes = 0;
+        if (TryGetFlashInferFloatWorkspace(id, &sharedBytes) == nullptr) {
+            if (outSize != nullptr) *outSize = 0;
+            return nullptr;
+        }
+        return FastllmPrivateScratch(id, sharedBytes, outSize);
+    }
     return TryGetFlashInferFloatWorkspace(id, outSize);
 }
 
 void *FastllmCudaGetFlashInferFloatWorkspace(size_t *outSize) {
     FlashInferWorkSpaceManager &workspace = getFastllmFlashInferWorkSpace();
+    if (t_fastllmPrivateScratch) {
+        int id = -1;
+        checkCudaErrors("Error: CUDA error when find device!", cudaGetDevice(&id));
+        return FastllmPrivateScratch(id, workspace.float_workspace_size, outSize);
+    }
     if (outSize != nullptr) {
         *outSize = workspace.float_workspace_size;
     }
@@ -162,6 +199,9 @@ void *FastllmBorrowCudaTempBuffer(size_t needBytes, size_t *outBytes, bool *outO
     int id = -1;
     cudaError_t state = cudaGetDevice(&id);
     checkCudaErrors("Error: CUDA error when find device!", state);
+    if (t_fastllmPrivateScratch) {
+        return FastllmPrivateScratch(id, needBytes, outBytes);
+    }
 
     size_t workspaceBytes = 0;
     void *workspace = TryGetFlashInferFloatWorkspace(id, &workspaceBytes);

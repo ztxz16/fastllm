@@ -36,6 +36,7 @@
 #include "devices/numas/numasdevice.h"
 #endif
 #include "utils.h"
+#include "utils/prefix_cache_logging.h"
 #include "utils/hybrid_moe.h"
 #if defined(USE_CUDA) && !defined(USE_ROCM)
 #include "devices/cuda/fastllm-cuda-moe-policy.h"
@@ -803,7 +804,7 @@ namespace fastllm {
 
             ~DsparkProfiler() {
                 if (level > 0) {
-                    Report("汇总");
+                    Report("summary");
                 }
             }
 
@@ -925,13 +926,13 @@ namespace fastllm {
                     stat.acceptHist[accepted]++;
                 }
                 if (level >= 2) {
-                    printf("[DSpark] round %llu：候选 %d 接受 %d，校验前向 %.3f ms，回滚 %.3f ms\n",
+                    printf("[DSpark] round %llu: proposed %d accepted %d, verify forward %.3f ms, rollback %.3f ms\n",
                            (unsigned long long)stat.verifyRounds, drafts, accepted, forwardMs, commitMs);
                     fflush(stdout);
                 }
                 if (reportEvery > 0 && ++sinceReport >= reportEvery) {
                     sinceReport = 0;
-                    ReportLocked("进行中");
+                    ReportLocked("in progress");
                 }
             }
 
@@ -968,8 +969,8 @@ namespace fastllm {
                 const uint64_t forwards = s.verifyRounds + s.plainRounds;
                 const uint64_t outputs = forwards + s.pendingHits;
 
-                printf("[DSpark %s] 前向 %llu 次（校验 %llu + 普通 %llu），出队 %llu，共产出 %llu 个 token"
-                       "；每次前向 %.3f 个 token（已跳过 %llu 轮预热）\n",
+                printf("[DSpark %s] forward %llu times (verify %llu + plain %llu), dequeued %llu, produced %llu tokens"
+                       "; %.3f tokens per forward (skipped %llu warmup rounds)\n",
                        tag, (unsigned long long)forwards, (unsigned long long)s.verifyRounds,
                        (unsigned long long)s.plainRounds, (unsigned long long)s.pendingHits,
                        (unsigned long long)outputs,
@@ -977,15 +978,15 @@ namespace fastllm {
                        (unsigned long long)warmupSkipped);
 
                 if (s.verifyRounds > 0) {
-                    printf("[DSpark %s] 候选 %llu 接受 %llu（接受率 %.1f%%），平均每轮接受 %.2f 个"
-                           "；草稿产出 %llu 个候选，置信度筛掉 %.1f%%\n",
+                    printf("[DSpark %s] proposed %llu accepted %llu (acceptance rate %.1f%%), average %.2f per round"
+                           "; draft produced %llu candidates, confidence filtered %.1f%%\n",
                            tag, (unsigned long long)s.proposed, (unsigned long long)s.accepted,
                            s.proposed > 0 ? 100.0 * (double)s.accepted / (double)s.proposed : 0.0,
                            (double)s.accepted / verify,
                            (unsigned long long)s.generatedByDraft,
                            s.generatedByDraft > 0 ?
                                100.0 * (double)(s.generatedByDraft - s.proposed) / (double)s.generatedByDraft : 0.0);
-                    PrintHist(tag, "接受长度", s.acceptHist, s.verifyRounds);
+                    PrintHist(tag, "accepted length", s.acceptHist, s.verifyRounds);
                 }
                 if (!s.offerHist.empty()) {
                     uint64_t total = 0;
@@ -993,44 +994,44 @@ namespace fastllm {
                         total += v;
                     }
                     if (total > 0) {
-                        PrintHist(tag, "送检候选数", s.offerHist, total);
+                        PrintHist(tag, "proposed candidates", s.offerHist, total);
                     }
                 }
                 if (s.noProposal > 0) {
-                    printf("[DSpark %s] 没有可用候选的轮次 %llu\n", tag, (unsigned long long)s.noProposal);
+                    printf("[DSpark %s] rounds without available candidates %llu\n", tag, (unsigned long long)s.noProposal);
                 }
 
-                printf("[DSpark %s] 每次前向：校验 %.3f ms（%llu 次）/ 普通 %.3f ms（%llu 次），"
-                       "差 %.3f ms；回滚 %.3f ms\n",
+                printf("[DSpark %s] per-forward: verify %.3f ms (%llu) / plain %.3f ms (%llu), "
+                       "delta %.3f ms; rollback %.3f ms\n",
                        tag, s.verifyForward / verify, (unsigned long long)s.verifyRounds,
                        s.plainForward / plain, (unsigned long long)s.plainRounds,
                        s.verifyRounds > 0 && s.plainRounds > 0 ?
                            s.verifyForward / verify - s.plainForward / plain : 0.0,
                        s.commit / verify);
-                printf("[DSpark %s] 每次草稿 %.3f ms = main %.3f + 三层 %.3f + head %.3f + markov %.3f"
-                       " + confidence %.3f（%llu 次）\n",
+                printf("[DSpark %s] per-draft %.3f ms = main %.3f + three_layers %.3f + head %.3f + markov %.3f"
+                       " + confidence %.3f (%llu)\n",
                        tag, s.draftTotal / draft, s.draftMain / draft, s.draftLayers / draft,
                        s.draftHead / draft, s.draftMarkov / draft, s.draftConf / draft,
                        (unsigned long long)s.draftCalls);
                 if (s.draftCalls > 0 && s.draftMarkovFused == s.draftCalls) {
-                    printf("[DSpark %s] 其中 markov %.3f ms（融合 kernel，%d 个位置的链留在设备上，"
-                           "主机只取回一次）\n", tag, s.draftMarkov / draft, blockSize);
+                    printf("[DSpark %s] markov %.3f ms (fused kernel, chain for %d positions kept on device, "
+                           "host fetched once)\n", tag, s.draftMarkov / draft, blockSize);
                 } else {
-                    printf("[DSpark %s] 其中 markov %.3f ms = 投影 %.3f + argmax/同步 %.3f"
-                           "（%d 个位置逐位置串行，融合 kernel 用上 %llu / %llu 次）\n",
+                    printf("[DSpark %s] markov %.3f ms = projection %.3f + argmax/sync %.3f"
+                           " (%d positions serialized, fused kernel used %llu / %llu times)\n",
                            tag, s.draftMarkov / draft, s.draftMarkovBias / draft,
                            s.draftMarkovArgmax / draft, blockSize,
                            (unsigned long long)s.draftMarkovFused, (unsigned long long)s.draftCalls);
                 }
                 if (s.mainOnlyCalls > 0) {
-                    printf("[DSpark %s] 只更新草稿滑窗（prefill 分块等）%llu 次，每次 %.3f ms\n",
+                    printf("[DSpark %s] draft sliding-window-only updates (prefill chunks, etc.) %llu times, %.3f ms each\n",
                            tag, (unsigned long long)s.mainOnlyCalls,
                            s.mainOnly / (double)s.mainOnlyCalls);
                 }
                 // 每产出一个 token 的实际开销：目标前向 + 草稿 + 回滚
                 const double totalMs = s.verifyForward + s.plainForward + s.draftTotal + s.mainOnly + s.commit;
                 if (outputs > 0) {
-                    printf("[DSpark %s] 每个输出 token 合计 %.3f ms（目标前向 %.3f + 草稿 %.3f + 回滚 %.3f）\n",
+                    printf("[DSpark %s] total per output token %.3f ms (target forward %.3f + draft %.3f + rollback %.3f)\n",
                            tag, totalMs / (double)outputs,
                            (s.verifyForward + s.plainForward) / (double)outputs,
                            (s.draftTotal + s.mainOnly) / (double)outputs,
@@ -1051,7 +1052,7 @@ namespace fastllm {
                              (int)i, (unsigned long long)hist[i], 100.0 * (double)hist[i] / (double)total);
                     line += buffer;
                 }
-                printf("[DSpark %s] %s分布 %s\n", tag, name, line.c_str());
+                printf("[DSpark %s] %s distribution %s\n", tag, name, line.c_str());
             }
         };
 

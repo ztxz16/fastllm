@@ -8,26 +8,76 @@
 #include "cmath"
 #include "utils/persistent_worker_group.h"
 #include "utils/image_embedding_cache.h"
+#include "utils/prefix_cache_page_ledger.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdlib>
 #include <iostream>
 #include <map>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <set>
 #include <unordered_map>
 #include <vector>
+#include <condition_variable>
+#include <deque>
+#include <thread>
 
 namespace fastllm {
     class CudaWorkspace;
     struct Qwen35VisionTPState;
     struct Qwen35DFlashTpMlpWorkspace;
-
+    class Qwen35PersistentCache;
+    struct Qwen35SpillState;
     class Qwen3_5Model: public basellm {
+    friend class Qwen35PersistentCache;
+    std::shared_ptr<Qwen35PersistentCache> persistentPrefixCache;
+    // BP2 model-owned monotonic IDs; enabled counters are observation-only.
+    std::atomic<uint64_t> observabilitySchedulerRoundId{0};
+    std::atomic<uint64_t> observabilityForwardId{0};
+    std::mutex capacityObservationMutex;
+    std::vector<PagedCacheManager*> capacityObservationManagers;
     public:
+        // Staged capture runs on the same worker streams as the forward.
+        PersistentWorkerGroup &Qwen35StageWorkerGroup() { return threadTpWorkerGroup; }
+        std::vector<int> &Qwen35StagePreparedDevices() { return threadTpPreparedDevices; }
+    std::shared_ptr<Qwen35SpillState> pagedSpillState;
+    std::shared_ptr<PrefixCachePageLedger> pagedPageLedger =
+        std::make_shared<PrefixCachePageLedger>();
+    std::string pagedCacheModelIdentity, pagedCacheFamilyIdentity, pagedCacheLayout;
     Qwen3_5Model (); // 构造函数
+    // 第 2 步-2：把"回收前搬进内存"的搬运函数挂到各个 KV 页池上（实现在 qwen3_5.cpp）。
+    void InstallPagedSpillHooks();
+    void PreparePagedSpillPrefix(ResponseContext *context, bool background = false);
+    int QueryPagedSpillPrefix(ResponseContext *context, int maxTokens) const;
+    bool PromotePagedSpillPrefix(ResponseContext *context, int wantTokens,
+                                 bool background = false);
+    std::vector<PrefixCachePageIdentity> DescribePagedPrefixPages(
+        const std::vector<int> &tokens, const std::vector<std::string> &keys,
+        int length) const;
+    bool PublishDirectPagedPrefix(ResponseContext *context, int length,
+                                  const std::function<bool()> &publish,
+                                  const std::function<void()> &rollback = {});
+    void ReleasePagedPrefixRestoreOwners(ResponseContext *context);
+    void ReleasePagedSpillRetryHolds(ResponseContext *context);
+    void AdoptPagedPrefixRestoreOwners(ResponseContext *context,
+        std::vector<std::pair<PagedCacheManager *, std::vector<int>>> pages);
+    void RecordPagedPrefixProducerEvents() override;
+    void RecordPagedPrefixProducerEventsOnCurrentThread();
         virtual ~Qwen3_5Model();
+        // ---- SSD 持久前缀缓存覆写（移植自源仓库 qwen3_5.h:126-131）----
+        void InitializePersistentPrefixCache() override;
+        void PreparePersistentPrefixCache(ResponseContext *context) override;
+        bool PersistentPrefixRestorePending(const ResponseContext *context) const override;
+        void ResetPersistentPrefixRestore(ResponseContext *context) override;
+        void OnPersistentPrefixRestored(ResponseContext *context) override;
+        bool WaitPersistentPrefixCache(int timeoutMs) override;
+        void ClosePersistentPrefixAdmission() override;
+        std::string PersistentPrefixCacheStatistics() const override;
+        void ObservePersistentPrefill(int tokens, double milliseconds);
 
         virtual void InitParams(); // 初始化参数信息
         ModelContextSpec GetContextSpec() const override { return {true, true, "text_config."}; }
@@ -99,6 +149,14 @@ namespace fastllm {
                 const LastTokensManager &lastTokens = LastTokensManager(),
                 std::vector <std::vector <float>*> *logits = nullptr) override;
         
+        std::vector<int> ForwardMultimodalContext(
+                ResponseContext *context, const Data &inputIds,
+                const Data &attentionMask, const Data &positionIds,
+                const GenerationConfig &generationConfig,
+                const LastTokensManager &lastTokens,
+                std::vector<std::vector<float>*> *logits) override;
+        void PrepareMultimodalPrefixCache(ResponseContext *context);
+
         // 是否需要生成AttentionMask
         virtual bool NeedAttentionMask(int qlen, int klen);
 
@@ -115,6 +173,8 @@ namespace fastllm {
 
         virtual PagedCacheManager* GetPagedKVCacheManager(int layerIndex, bool isKey) const override;
         virtual std::vector<std::pair<int, PagedCacheManager*> > GetPagedKVCacheManagers(int layerIndex, bool isKey) const override;
+        void InitializeCacheCapacityObservation();
+        virtual std::map<std::string, std::string> GetCacheCapacityObservation() override;
         virtual bool TryRecordPagedPrefixCacheExtra(ResponseContext *context) override;
         virtual int QueryPagedPrefixCacheExtra(ResponseContext *context, int maxCachedLen) const override;
         virtual bool RestorePagedPrefixCacheExtra(ResponseContext *context, int cachedLen) const override;
@@ -331,6 +391,23 @@ namespace fastllm {
             bool ready = false;
         };
         bool speculativeCaptureLinearReplay = false;
+        // PDMIX (FASTLLM_QWEN35_PD_MIX=1): one target forward carries the DFlash
+        // verify rows (first pdMixVerifyTokens tokens) plus one trailing non-final
+        // prompt chunk. Set by Qwen35MTPBatchForward around its ForwardGPU call;
+        // constant while TP workers run.
+        int pdMixVerifyTokens = 0;
+        // Scheduler: the last row of the next Qwen35MTPBatchForward call is that
+        // prompt chunk.
+        bool pdMixPromptTail = false;
+        struct PdMixTail {
+            bool active = false, ran = false;
+            ResponseContext *ctx = nullptr;
+            std::vector<float> ids;
+            Data *mask = nullptr, *position = nullptr;
+            int len = 0;
+            std::vector<std::pair<Data*, Data*> > pastKeyValues;
+            GenerationConfig config;
+        } pdMixTail;
         std::vector<std::map<int, std::unique_ptr<DFlashLinearReplay>>> dflashLinearReplay;
         // Verify graphs capture addresses in this scratch storage.
         unsigned long long speculativeLinearStateGeneration = 0;
@@ -484,7 +561,8 @@ namespace fastllm {
                 std::map<int, int> ratios);
 #endif
         void PrepareVision();
-        void BuildMultimodalTextEmbeddings(const Data &inputIds, Data &hiddenStates);
+        void BuildMultimodalTextEmbeddings(const Data &inputIds, Data &hiddenStates,
+                                           int rowBegin = 0, int rowEnd = -1);
         void SplitMultimodalTextEmbeddings(const Data &hiddenStates, int start, int end, Data &chunk);
         Data BuildFlattenedPositionIds(const std::vector <Data*> &positionIds,
                                       const std::vector <int> &seqLens,
@@ -492,7 +570,8 @@ namespace fastllm {
         void MergeMultimodalFeaturesIntoText(const Data &mmTokenTypeIds,
                                              const Data *imageEmbeds,
                                              const Data *videoEmbeds,
-                                             Data &hiddenStates);
+                                             Data &hiddenStates,
+                                             int rowBegin = 0, int rowEnd = -1);
         void ApplyVisionRotary(Data &input, const Data &posX, const Data &posY,
                                Data &sinData, Data &cosData);
         void EncodeVisualItems(const std::vector <Data*> &rawInputs,
@@ -500,10 +579,29 @@ namespace fastllm {
                                bool isVideo,
                                Data &features,
                                std::vector<std::vector<int>> &gridThwList,
-                               const Data *imageCacheKeys = nullptr);
+                               const Data *imageCacheKeys = nullptr,
+                               ResponseContext *context = nullptr);
         // Created only when an image request supplies cache keys and caching
         // is enabled. Text-only models never construct a cache pool.
         std::unique_ptr<ImageEmbeddingCache> imageEmbeddingCache;
+        // FASTLLM_QWEN35_VISION_ASYNC: background image encode on the dedicated vision device.
+        struct VisionAsyncJob {
+            uint64_t requestId = 0;
+            std::vector<Data> images;
+            Data grid, keys;
+        };
+        std::mutex visionEncodeMutex;           // one EncodeVisualItems at a time (worker or forward thread)
+        std::mutex visionAsyncMutex;            // guards the fields below
+        std::condition_variable visionAsyncCV;
+        // unique_ptr: Data has no safe assignment (implicit copy assignment shares raw buffers)
+        std::deque<std::unique_ptr<VisionAsyncJob>> visionAsyncJobs;
+        std::map<uint64_t, int> visionAsyncState;   // requestId -> 1 pending, 2 done, 3 failed
+        std::thread visionAsyncThread;
+        bool visionAsyncStop = false;
+        // true = the image prompt must wait for its background encode this round
+        bool VisionAsyncWait(ResponseContext *ctx);
+        void VisionAsyncWorker();
+        void VisionAsyncShutdown();
         void BuildMultimodalPositionData(const Data &inputIds,
                                          const std::vector<std::vector<int>> &imageGridThwList,
                                          const std::vector<std::vector<int>> &videoGridThwList,
@@ -536,20 +634,25 @@ namespace fastllm {
         std::vector<int> SelectDFlashDraftTokens(
                 const float *candidateTopK, const float *selectorHidden,
                 int anchorToken, const GenerationConfig &generationConfig,
-                DFlashContext &context);
+                DFlashContext &context, int draftsPerStep = -1);
         void PrepareDFlashRotary(int device);
         void AppendDFlashTargetHidden(int device, int tokens,
-                                      DFlashContext &context);
+                                      DFlashContext &context,
+                                      std::vector<Data> *capturedHidden = nullptr,
+                                      bool prepared = false);
         std::vector<int> RunDFlashDraft(int device,
                                        const std::vector<int> &devices,
                                        int anchorToken,
                                        const GenerationConfig &generationConfig,
-                                       DFlashContext &context);
+                                       DFlashContext &context,
+                                       bool prepared = false,
+                                       int draftsPerStep = -1);
         std::vector<std::vector<int> > RunDFlashDraftBatch(
                 int device, const std::vector<int> &devices,
                 const std::vector<int> &anchorTokens,
                 const std::vector<const GenerationConfig*> &generationConfigs,
-                const std::vector<DFlashContext*> &contexts);
+                const std::vector<DFlashContext*> &contexts,
+                int draftsPerStep = -1);
         bool HasMtpMoeWeights() const;
         bool CanUseQwen35MTPBatchForward(int draftsPerStep) const;
         bool CanUseQwen35DFlashBatchForward(int draftsPerStep) const;
@@ -633,7 +736,8 @@ namespace fastllm {
                 const std::vector <GenerationConfig> &generationConfigs,
                 std::vector <std::vector <int> > &acceptedTokens,
                 std::vector <std::vector <int> > &nextInputTokens,
-                std::vector <int> &keptInputLens);
+                std::vector <int> &keptInputLens,
+                int draftsPerStepOverride = -1);
         std::vector <int> ForwardFromHiddenStates(
                 int batch,
                 const Data &inputIds,
@@ -646,6 +750,56 @@ namespace fastllm {
                 std::vector <std::vector <float>*> *retLogits,
                 Data &hiddenStates,
                 bool all1);
+    };
+
+    // Default-off CPU policy for homogeneous per-round DFlash speculation.
+    class Qwen35AdaptiveSpecPolicy {
+    public:
+        Qwen35AdaptiveSpecPolicy(int maxDrafts, bool dflash)
+            : enabled_(dflash && maxDrafts > 0 && EnvEnabled()),
+              acceptedPerRowEwma_(1.6),
+              timingMs_({38.6, 48.6, 60.8, 64.5, 73.9, 77.6, 86.3, 89.6}) {}
+        bool Enabled() const { return enabled_; }
+        int Choose(int decodeRows, int maxDrafts) const {
+            const int cap = std::max(0, maxDrafts);
+            if (!enabled_ || decodeRows <= 0 || decodeRows == 1) return cap;
+            // DFlash stays on: never pick zero drafts.
+            const int minK = std::min(1, cap);
+            int bestK = minK;
+            double bestCost = std::numeric_limits<double>::infinity();
+            for (int k = minK; k <= cap; ++k) {
+                const double accepted = k == 0 ? 1.0 :
+                    std::min((double)k + 1.0, std::max(1.0, acceptedPerRowEwma_));
+                const double cost = PredictForwardMs(decodeRows * (k + 1)) /
+                    std::max(1.0, decodeRows * accepted);
+                if (cost < bestCost - 1.0e-9) { bestCost = cost; bestK = k; }
+            }
+            return bestK;
+        }
+        void ObserveAccepted(int draftsPerStep, int decodeRows, int acceptedTotal) {
+            if (!enabled_ || draftsPerStep <= 0 || decodeRows <= 0 || acceptedTotal <= 0) return;
+            const double observed = std::max(1.0, std::min((double)draftsPerStep + 1.0,
+                (double)acceptedTotal / (double)decodeRows));
+            acceptedPerRowEwma_ = 0.75 * acceptedPerRowEwma_ + 0.25 * observed;
+        }
+    private:
+        static bool EnvEnabled() {
+            const char *env = std::getenv("FASTLLM_QWEN35_ADAPTIVE_SPEC");
+            return env != nullptr && env[0] == '1' && env[1] == '\0';
+        }
+        double PredictForwardMs(int totalTokens) const {
+            static const int bucket[8] = {8, 16, 24, 32, 40, 48, 56, 64};
+            if (totalTokens <= bucket[0]) return timingMs_[0] * std::max(1, totalTokens) / bucket[0];
+            if (totalTokens >= bucket[7]) return timingMs_[7] * (double)totalTokens / bucket[7];
+            for (int i = 1; i < 8; ++i) if (totalTokens <= bucket[i]) {
+                const double f = (double)(totalTokens - bucket[i - 1]) / (bucket[i] - bucket[i - 1]);
+                return timingMs_[i - 1] + f * (timingMs_[i] - timingMs_[i - 1]);
+            }
+            return timingMs_[7];
+        }
+        bool enabled_;
+        double acceptedPerRowEwma_;
+        std::array<double, 8> timingMs_;
     };
 }
 

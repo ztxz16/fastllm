@@ -17,6 +17,7 @@
  */
 
 #include "fastllm-cuda.cuh"
+#include "utils/load_stage_timing.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -3111,6 +3112,10 @@ static bool BuildNvfp4E4M3LayerCache(
 
     int device = 0;
     int sms = 0;
+    fastllm::LoadStageTiming &loadTiming = fastllm::GetLoadStageTiming();
+    loadTiming.repackBuilds.fetch_add(1, std::memory_order_relaxed);
+    loadTiming.repackExperts.fetch_add((uint64_t)experts, std::memory_order_relaxed);
+    const auto repackPrologueStart = std::chrono::steady_clock::now();
     if (cudaGetDevice(&device) != cudaSuccess ||
         cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount,
                                device) != cudaSuccess ||
@@ -3217,20 +3222,31 @@ static bool BuildNvfp4E4M3LayerCache(
     // Keep the fast GPU-only repack when it fits. Under memory pressure,
     // retain one layer on the host before releasing any source allocation.
     // The device then only needs one expert's compact weights as scratch.
+    if (fastllm::LoadStageTimingEnabled()) {
+        loadTiming.repackPrologueUs.fetch_add(
+            (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - repackPrologueStart).count(),
+            std::memory_order_relaxed);
+    }
     std::vector<uint8_t> hostSource;
     if (stageSource) {
+        loadTiming.repackStageBuilds.fetch_add(1, std::memory_order_relaxed);
+        loadTiming.repackStageBytes.fetch_add(sourceBytes, std::memory_order_relaxed);
         hostSource.resize(sourceBytes);
-        for (int expert = 0; expert < experts; ++expert) {
-            float commonGlobal = 0.0f;
-            if ((!bf16 && (!GetNvfp4E4M3CommonGlobal(*weights[2 + expert * 2], commonGlobal) ||
-                !GetNvfp4E4M3CommonGlobal(*weights[3 + expert * 2], commonGlobal))) ||
-                cudaMemcpy(hostSource.data() + expertSourceBytes * expert,
-                           weights[2 + expert * 2]->cudaData, gateSourceBytes,
-                           cudaMemcpyDeviceToHost) != cudaSuccess ||
-                cudaMemcpy(hostSource.data() + expertSourceBytes * expert + gateSourceBytes,
-                           weights[3 + expert * 2]->cudaData, downSourceBytes,
-                           cudaMemcpyDeviceToHost) != cudaSuccess) {
-                return false;
+        {
+            fastllm::ScopedLoadTimer _stageIn(loadTiming.repackStageInUs);
+            for (int expert = 0; expert < experts; ++expert) {
+                float commonGlobal = 0.0f;
+                if ((!bf16 && (!GetNvfp4E4M3CommonGlobal(*weights[2 + expert * 2], commonGlobal) ||
+                    !GetNvfp4E4M3CommonGlobal(*weights[3 + expert * 2], commonGlobal))) ||
+                    cudaMemcpy(hostSource.data() + expertSourceBytes * expert,
+                               weights[2 + expert * 2]->cudaData, gateSourceBytes,
+                               cudaMemcpyDeviceToHost) != cudaSuccess ||
+                    cudaMemcpy(hostSource.data() + expertSourceBytes * expert + gateSourceBytes,
+                               weights[3 + expert * 2]->cudaData, downSourceBytes,
+                               cudaMemcpyDeviceToHost) != cudaSuccess) {
+                    return false;
+                }
             }
         }
         releaseSourceWeights();
@@ -3251,6 +3267,13 @@ static bool BuildNvfp4E4M3LayerCache(
     cache.hidden = hidden;
     cache.intermediate = intermediate;
     cache.sms = sms;
+    uint32_t *standardQWeight = nullptr;
+    const size_t gateQWeightCount =
+        (size_t)(hidden / 8) * gateRows;
+    const size_t downQWeightCount =
+        (size_t)(intermediate / 8) * hidden;
+    {
+    fastllm::ScopedLoadTimer _allocT(loadTiming.repackAllocUs);
     cache.gateWeight = (uint32_t *)AllocateDirect(
         gateWeightBytes * experts);
     cache.downWeight = (uint32_t *)AllocateDirect(
@@ -3280,21 +3303,21 @@ static bool BuildNvfp4E4M3LayerCache(
         return failBuild();
     }
 
-    const size_t gateQWeightCount =
-        (size_t)(hidden / 8) * gateRows;
-    const size_t downQWeightCount =
-        (size_t)(intermediate / 8) * hidden;
-    uint32_t *standardQWeight = (uint32_t *)AllocateDirect(
+    standardQWeight = (uint32_t *)AllocateDirect(
         scratchBytes);
     if (standardQWeight == nullptr) {
         return failBuild();
+    }
     }
 
     std::vector<float> gateGlobals(experts * (bf16 ? 2 : 1));
     std::vector<float> downGlobals(experts);
     cudaStream_t stream = cudaStreamPerThread;
     constexpr int threads = 256;
-    bool success =
+    bool success = false;
+    {
+    fastllm::ScopedLoadTimer _loop(loadTiming.repackLoopCpuUs);
+    success =
         cudaMemsetAsync(cache.workspace, 0, workspaceBytes, stream) ==
         cudaSuccess;
     for (int expert = 0; expert < experts && success; ++expert) {
@@ -3321,9 +3344,10 @@ static bool BuildNvfp4E4M3LayerCache(
         const uint8_t *downSource = (const uint8_t *)down.cudaData;
         if (stageSource) {
             auto *sourceScratch = (uint8_t *)standardQWeight + transposeBytes;
-            success = cudaMemcpyAsync(
+            { fastllm::ScopedLoadTimer _h2d(loadTiming.repackStageH2dUs);
+              success = cudaMemcpyAsync(
                 sourceScratch, hostSource.data() + expertSourceBytes * expert,
-                expertSourceBytes, cudaMemcpyHostToDevice, stream) == cudaSuccess;
+                expertSourceBytes, cudaMemcpyHostToDevice, stream) == cudaSuccess; }
             if (!success) {
                 break;
             }
@@ -3401,8 +3425,15 @@ static bool BuildNvfp4E4M3LayerCache(
                             downGlobals.size() * sizeof(float),
                             cudaMemcpyHostToDevice, stream) == cudaSuccess;
     }
-    cudaError_t syncState = cudaStreamSynchronize(stream);
+    }
+    cudaError_t syncState;
+    {
+        fastllm::ScopedLoadTimer _sync(loadTiming.repackSyncUs);
+        syncState = cudaStreamSynchronize(stream);
+    }
     success = success && syncState == cudaSuccess;
+    {
+    fastllm::ScopedLoadTimer _relT(loadTiming.repackReleaseUs);
     ReleaseDirect(standardQWeight);
     if (!success) {
         return failBuild();
@@ -3410,6 +3441,7 @@ static bool BuildNvfp4E4M3LayerCache(
 
     if (!stageSource) {
         releaseSourceWeights();
+    }
     }
 
     if (stageSource) {

@@ -149,11 +149,11 @@ struct Fixture : Qwen3_5Model {
         SetCudaGraph(graph);
         const int positions[]={32,65528,65535,131065,204792,262128};
         context.committedTokens=positions[seed%6];
-        if (context.draftKeyValues.empty()) context.draftKeyValues.resize(1);
-        FillCache(context.draftKeyValues[0].first,device,seed);
-        FillCache(context.draftKeyValues[0].second,device,seed+9);
-        const auto beforeKey=DownloadCache(context.draftKeyValues[0].first);
-        const auto beforeValue=DownloadCache(context.draftKeyValues[0].second);
+        if (context.draft->keyValues.empty()) context.draft->keyValues.resize(1);
+        FillCache(context.draft->keyValues[0].first,device,seed);
+        FillCache(context.draft->keyValues[0].second,device,seed+9);
+        const auto beforeKey=DownloadCache(context.draft->keyValues[0].first);
+        const auto beforeValue=DownloadCache(context.draft->keyValues[0].second);
         GenerationConfig config;config.temperature=0;config.top_k=1;config.top_p=1;
         const size_t instantiated = graphTrace.instantiated, launched = graphTrace.launched;
         auto tokens=RunDFlashDraft(device,{device},seed*7%100,config,context);
@@ -166,8 +166,8 @@ struct Fixture : Qwen3_5Model {
         Check(graphTrace.launched-launched==expectedLaunches,
               "draft graph replay count mismatch (unexpected eager fallback)");
         if (graph) ++graphCalls;
-        Check(DownloadCache(context.draftKeyValues[0].first)==beforeKey,"key cache changed");
-        Check(DownloadCache(context.draftKeyValues[0].second)==beforeValue,"value cache changed");
+        Check(DownloadCache(context.draft->keyValues[0].first)==beforeKey,"key cache changed");
+        Check(DownloadCache(context.draft->keyValues[0].second)==beforeValue,"value cache changed");
         Check(tokens.size()==size_t(dflashRuntimeBlockSize-1),"wrong proposal size");
         tokens.insert(tokens.end(),context.proposalCandidateIds.begin(),context.proposalCandidateIds.end());
         for (float value:context.proposalCandidateProbs) {int bits;memcpy(&bits,&value,4);tokens.push_back(bits);}

@@ -43,6 +43,11 @@ public:
         return sizeBytes;
     }
 
+    bool Contains(const std::string &key) const {
+        std::lock_guard<std::mutex> guard(mutex);
+        return index.find(key) != index.end();
+    }
+
     // Returns the number of floats appended, or zero on a miss.
     size_t Append(const std::string &key, std::vector<float> &output) {
         std::lock_guard<std::mutex> guard(mutex);

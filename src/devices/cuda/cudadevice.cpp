@@ -11587,7 +11587,26 @@ namespace fastllm {
         }
 
         std::vector<int> previewNewPages;
-        manager.PreviewUnusedPageIndices(newPageCount, previewNewPages);
+        previewNewPages.reserve(newPageCount);
+        // KVPAIR: with paired managers the preview is a real reservation for this thread in both K and V,
+        // so the later GetUnusedPageIndex(true) calls of this thread return exactly these ids even if another
+        // thread releases pages in between (a plain preview of the free-list tail can go stale).
+        if (newPageCount > 0 && manager.pairPartner != nullptr) {
+            // Reserved ids come first (handed out first); a shortfall (no page claimable in both) falls back to
+            // the plain preview below for the remaining pages, as without pairing.
+            manager.PairReserveForThread(newPageCount, previewNewPages);
+        }
+        if (newPageCount > (int)previewNewPages.size()) {
+            const int reserved = (int)previewNewPages.size();
+            std::lock_guard<std::mutex> guard(manager.pageIndexLocker);
+            for (int i = 0; reserved + i < newPageCount && i < (int)manager.freePages.size(); i++) {
+                previewNewPages.push_back(manager.freePages[(int)manager.freePages.size() - 1 - i]);
+            }
+            int trieOffset = newPageCount - (int)previewNewPages.size();
+            for (int i = 0; i < trieOffset && i < (int)manager.triePages.size(); i++) {
+                previewNewPages.push_back(manager.triePages[(int)manager.triePages.size() - 1 - i]);
+            }
+        }
         AssertInFastLLM((int)previewNewPages.size() >= newPageCount,
                         "CudaGenerateAppendPagedCacheBatchParamsOp: no enough pages for batch append.\n");
 

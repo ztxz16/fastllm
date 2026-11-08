@@ -1,10 +1,114 @@
 import json
+import os
 import sys
 import threading
 import time
 
+from .request_progress import RequestProgressReporter, observability_mode
+
 
 PROGRESS_PREFIX = "FTLLM_PROGRESS "
+
+
+def _startup_memory_snapshot():
+    """Read current host facts; unavailable data remains explicitly unknown."""
+    result = {"process_rss_bytes": "unknown", "system_mem_available_bytes": "unknown"}
+    for path, prefix, field in (
+            ("/proc/self/status", "VmRSS:", "process_rss_bytes"),
+            ("/proc/meminfo", "MemAvailable:", "system_mem_available_bytes")):
+        try:
+            with open(path, "r", encoding="ascii") as handle:
+                for line in handle:
+                    if line.startswith(prefix):
+                        parts = line.split()
+                        if len(parts) >= 3 and parts[2] == "kB":
+                            result[field] = str(int(parts[1]) * 1024)
+                        break
+        except (OSError, ValueError):
+            pass
+    return result
+
+
+class StartupStatusHeartbeat:
+    """Snapshot explicit load stages without executing logging in callbacks."""
+
+    def __init__(self, mode="off", stream=None, clock=None,
+                 heartbeat_interval=1.0, resource_reader=None):
+        self.mode = observability_mode(mode)
+        self.stream = sys.stderr if stream is None else stream
+        self.clock = time.monotonic if clock is None else clock
+        self.resource_reader = resource_reader or _startup_memory_snapshot
+        self.interval = max(0.01, float(heartbeat_interval))
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.started_at = self.phase_started = self.updated_at = self.clock()
+        self.state = ("initializing", 0, 0, 0, 0)
+        self.closed = False
+        self.sequence_provider = None
+        self.thread = None
+        self.reporter = RequestProgressReporter(
+            "startup", mode=self.mode, emit=self._write_raw, clock=self.clock)
+        if self.mode != "off":
+            self.thread = threading.Thread(
+                target=self._run, name="ftllm-startup-status", daemon=True)
+            self.thread.start()
+
+    def _write_raw(self, line):
+        self.stream.write(line + "\n")
+        self.stream.flush()
+
+    def set_sequence_provider(self, provider):
+        with self.lock:
+            self.sequence_provider = provider
+
+    def update(self, stage, current=0, total=0, completed_bytes=0, total_bytes=0):
+        if self.mode == "off":
+            return
+        state = (str(stage), int(current), int(total), int(completed_bytes), int(total_bytes))
+        with self.lock:
+            if self.closed or state == self.state:
+                return
+            now = self.clock()
+            if state[0] != self.state[0]:
+                self.phase_started = now
+            self.updated_at = now
+            self.state = state
+
+    def emit_snapshot(self):
+        with self.lock:
+            if self.closed or self.mode == "off":
+                return
+            stage, current, total, completed_bytes, total_bytes = self.state
+            now = self.clock()
+            elapsed_ms = f"{max(0.0, now - self.started_at) * 1000:.3f}"
+            phase_elapsed_ms = f"{max(0.0, now - self.phase_started) * 1000:.3f}"
+            idle_ms = f"{max(0.0, now - self.updated_at) * 1000:.3f}"
+            provider = self.sequence_provider
+        # Resource reads and output happen outside the snapshot lock. Even a
+        # blocked stderr cannot hold model-load callbacks or close()/ready().
+        memory = self.resource_reader()
+        self.reporter.sequence_provider = provider
+        self.reporter._event(
+            "startup", "startup_status", stage=stage,
+            detail=stage.partition(":")[2] or stage,
+            elapsed_ms=elapsed_ms, phase_elapsed_ms=phase_elapsed_ms, idle_ms=idle_ms,
+            current=current, total=total, completed_bytes=completed_bytes, total_bytes=total_bytes,
+            process_pid=os.getpid(),
+            process_rss_bytes=memory.get("process_rss_bytes", "unknown"),
+            system_mem_available_bytes=memory.get("system_mem_available_bytes", "unknown"))
+
+    def _run(self):
+        while not self.stop_event.wait(self.interval):
+            try:
+                self.emit_snapshot()
+            except Exception:
+                # Startup observation must not fail the actual model load.
+                pass
+
+    def close(self):
+        with self.lock:
+            self.closed = True
+        self.stop_event.set()
 
 
 class StartupProgressReporter:
@@ -31,7 +135,8 @@ class StartupProgressReporter:
     }
 
     def __init__(self, mode = "off", stream = None, clock = None,
-                 heartbeat_interval = 1.0):
+                 heartbeat_interval = 1.0, observation_mode = "off",
+                 status_stream = None, resource_reader = None):
         if mode not in ["off", "ndjson"]:
             raise ValueError("startup progress mode must be 'off' or 'ndjson'")
         self.mode = mode
@@ -49,6 +154,17 @@ class StartupProgressReporter:
         self._heartbeat_thread = None
         self._ready = False
         self._closed = False
+        self._status = StartupStatusHeartbeat(
+            observability_mode(observation_mode),
+            stream=self.stream if status_stream is None else status_stream,
+            clock=self.clock, heartbeat_interval=self.heartbeat_interval,
+            resource_reader=resource_reader)
+
+    def set_sequence_provider(self, provider):
+        self._status.set_sequence_provider(provider)
+
+    def observe_stage(self, stage):
+        self._status.update(stage)
 
     @property
     def enabled(self):
@@ -84,7 +200,10 @@ class StartupProgressReporter:
 
     def progress(self, stage, current = 0, total = 0,
                  completed_bytes = 0, total_bytes = 0,
-                 message = None, indeterminate = False, force = False):
+                 message = None, indeterminate = False, force = False,
+                 _observe_status = True):
+        if _observe_status:
+            self._status.update(stage, current, total, completed_bytes, total_bytes)
         if not self.enabled:
             return
         current = max(0, int(current))
@@ -153,6 +272,11 @@ class StartupProgressReporter:
 
     def model_load_progress(self, stage, current = 0, total = 0,
                             completed_bytes = 0, total_bytes = 0):
+        if stage.startswith("warmup:"):
+            self._status.update(stage, current, total, completed_bytes, total_bytes)
+            self.progress("warmup", current, total, completed_bytes, total_bytes,
+                          indeterminate=True, _observe_status=False)
+            return
         if stage == "warmup":
             complete = total > 0 and current >= total
             if complete:
@@ -183,6 +307,7 @@ class StartupProgressReporter:
                         total_bytes,
                         indeterminate = True,
                         force = True,
+                        _observe_status = False,
                     )
 
             thread = threading.Thread(
@@ -205,6 +330,7 @@ class StartupProgressReporter:
             thread.join(timeout = min(1.0, self.heartbeat_interval * 2))
 
     def ready(self):
+        self._status.close()
         self._stop_heartbeat()
         if not self.enabled:
             self._ready = True
@@ -226,6 +352,7 @@ class StartupProgressReporter:
             })
 
     def fail(self, error):
+        self._status.close()
         self._stop_heartbeat()
         if not self.enabled:
             return
@@ -242,6 +369,7 @@ class StartupProgressReporter:
             })
 
     def close(self):
+        self._status.close()
         self._stop_heartbeat()
         with self._lock:
             self._closed = True

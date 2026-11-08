@@ -1,0 +1,57 @@
+// SPDX-License-Identifier: Apache-2.0
+#pragma once
+
+#include "../connector_base.h"
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/statvfs.h>
+#include <unistd.h>
+#include <cstring>
+#include <filesystem>
+#include <string>
+#include <vector>
+
+namespace lmcache {
+namespace connector {
+
+// Key encoding constants — must match fs_l2_adapter.py
+static constexpr const char* TMP_EXT = ".tmp";
+
+// Per-worker connection state for the FS connector.
+// Each worker maintains its own I/O buffer for O_DIRECT.
+struct WorkerFSConn {
+  std::filesystem::path base_path;
+  std::filesystem::path tmp_dir;  // empty if not configured
+  bool use_odirect = false;
+  size_t disk_block_size = 0;
+  // If > 0, trigger filesystem readahead by issuing a small
+  // initial read of this many bytes before reading the rest.
+  size_t read_ahead_size = 0;
+};
+
+class FSConnector : public ConnectorBase<WorkerFSConn> {
+ public:
+  FSConnector(std::string base_path, int num_workers,
+              std::string relative_tmp_dir = "", bool use_odirect = false,
+              size_t read_ahead_size = 0);
+  ~FSConnector() override;
+
+ protected:
+  WorkerFSConn create_connection() override;
+  void do_single_get(WorkerFSConn& conn, const std::string& key, void* buf,
+                     size_t len, size_t chunk_size) override;
+  void do_single_set(WorkerFSConn& conn, const std::string& key,
+                     const void* buf, size_t len, size_t chunk_size) override;
+  bool do_single_exists(WorkerFSConn& conn, const std::string& key) override;
+  bool do_single_delete(WorkerFSConn& conn, const std::string& key) override;
+
+ private:
+  std::string base_path_;
+  std::string relative_tmp_dir_;
+  bool use_odirect_;
+  size_t disk_block_size_;
+  size_t read_ahead_size_;
+};
+
+}  // namespace connector
+}  // namespace lmcache

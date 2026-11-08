@@ -1,5 +1,18 @@
 #include "utils.h"
 #include "json11.hpp"
+#include "utils/streaming_load_budget.h"
+#include "utils/layer_raw_prefetch.h"
+#include "utils/load_stage_timing.h"
+#include "utils/weight_merge_index.h"
+#include "utils/weight_load_group_nodes.h"
+
+namespace fastllm {
+// 计时器的单一全局实例（见头文件注释）。
+LoadStageTiming &GetLoadStageTiming() {
+    static LoadStageTiming timing;
+    return timing;
+}
+}  // namespace fastllm
 
 #include "model.h"
 #include "fastllm.h"
@@ -670,33 +683,6 @@ namespace fastllm {
         return std::atoi(weightName.substr(begin, end - begin).c_str());
     }
 
-    // Build after model callbacks define the rules, then share read-only across
-    // loader threads. Preserve rule order and all matches for shared inputs.
-    class WeightMergeIndex {
-    public:
-        explicit WeightMergeIndex(const std::vector<WeightMergeRule> &rules) {
-            size_t inputCount = 0;
-            for (const auto &rule : rules) {
-                inputCount += rule.allInputs.size();
-            }
-            rulesByInput.reserve(inputCount);
-            for (size_t i = 0; i < rules.size(); ++i) {
-                for (const auto &input : rules[i].allInputs) {
-                    rulesByInput[input].push_back(i);
-                }
-            }
-        }
-
-        const std::vector<size_t> &Find(const std::string &weightName) const {
-            static const std::vector<size_t> empty;
-            auto it = rulesByInput.find(weightName);
-            return it == rulesByInput.end() ? empty : it->second;
-        }
-
-    private:
-        std::unordered_map<std::string, std::vector<size_t>> rulesByInput;
-    };
-
     static std::string GetMoeWeightSelectedDevice(const basellm *model, const std::string &weightName,
                                                  const WeightMergeIndex &mergeIndex) {
         if (model == nullptr) {
@@ -709,7 +695,7 @@ namespace fastllm {
         if (model->moeLinears.find(weightName) == model->moeLinears.end()) {
             return "";
         }
-        for (size_t ruleId : mergeIndex.Find(weightName)) {
+        for (size_t ruleId : FindWeightMergeRules(mergeIndex, weightName)) {
             const auto &mergeRule = model->weightMergeRules[ruleId];
             for (auto &rule : mergeRule.rules) {
                 if (std::find(rule.inputs.begin(), rule.inputs.end(), weightName) == rule.inputs.end()) {
@@ -1155,9 +1141,24 @@ namespace fastllm {
             bytes = this->data_offsets[1] - this->data_offsets[0];
         }
 
+        // Read only a checked interval of this tensor payload. The ordinary
+        // CreateBuffer path remains unchanged; bounded Qwen4 loading uses
+        // this primitive for expert/MTP chunks.
+        bool ReadRawRange(uint64_t relativeOffset, uint64_t byteCount,
+                          void *destination, uint64_t destinationCapacity,
+                          std::string *error = nullptr) const {
+            return fastllm::ReadFileRange(
+                fileName, data_offsets[0], bytes, relativeOffset,
+                destination, byteCount, destinationCapacity, error);
+        }
+
         struct FP8E4M3ToFP32Manager fp8e4m3tofp32;
 
         void CreateBufferWithScale(DataType dstType, SafeTensorItem &scale, SafeTensorItem *scale2 = nullptr) {
+            fastllm::GetLoadStageTiming().callsWithScale.fetch_add(1, std::memory_order_relaxed);
+            fastllm::ScopedLoadTimer _ownTimer(fastllm::GetLoadStageTiming().usWithScale);
+            fastllm::ScopedLoadTimer _totalTimer(fastllm::GetLoadStageTiming().bufferTotalUs);
+            fastllm::GetLoadStageTiming().bufferCalls.fetch_add(1, std::memory_order_relaxed);
             bool isScalarScale = scale.len == 1 && scale.shape.size() <= 1;
             AssertInFastLLM(this->shape.size() >= 2 && (isScalarScale || scale.shape.size() >= 2),
                             "CreateBufferWithScale error: weight shape should be >= 2 and scale should be scalar or >= 2.");
@@ -1275,6 +1276,8 @@ namespace fastllm {
                     }
 
                     if (dstType == DataType::NVFP4_BLOCK_16_E4M3) {
+                        fastllm::ScopedLoadTimer _compactRead(
+                            fastllm::GetLoadStageTiming().compactReadUs);
                         const size_t weightBytes = GetNVFP4WeightBytes(n, m);
                         const size_t scaleBytesCount =
                             GetNVFP4ScaleBytes(n, m, blockN, blockM);
@@ -1291,7 +1294,9 @@ namespace fastllm {
 #else
                         fseek(fw, this->data_offsets[0], 0);
 #endif
-                        size_t ret = fread(buffer, 1, weightBytes, fw);
+                        size_t ret;
+                        { fastllm::ScopedLoadTimer _io(fastllm::GetLoadStageTiming().fileIoUs);
+                          ret = fread(buffer, 1, weightBytes, fw); }
                         fclose(fw);
                         AssertInFastLLM(ret == weightBytes,
                                         "CreateBufferWithScale error: read compact E4M3 NVFP4 weight failed.");
@@ -1301,8 +1306,9 @@ namespace fastllm {
 #else
                         fseek(fs, scale.data_offsets[0], 0);
 #endif
-                        ret = fread(buffer + weightBytes, 1,
-                                    scaleBytesCount, fs);
+                        { fastllm::ScopedLoadTimer _io(fastllm::GetLoadStageTiming().fileIoUs);
+                          ret = fread(buffer + weightBytes, 1,
+                                      scaleBytesCount, fs); }
                         fclose(fs);
                         AssertInFastLLM(ret == scaleBytesCount,
                                         "CreateBufferWithScale error: read compact E4M3 NVFP4 scale failed.");
@@ -1343,6 +1349,7 @@ namespace fastllm {
                         return;
                     }
                     memset(buffer, 0, outputBytes);
+                    const auto packT0 = std::chrono::steady_clock::now();
                     for (int i = 0; i < n; i++) {
                         const uint8_t *srcRow = packed.data() + (size_t)i * packedM;
                         uint8_t *dstRow = buffer + (size_t)i * scaleCols * blockBytes;
@@ -1360,20 +1367,37 @@ namespace fastllm {
                             }
                         }
                     }
+                    {
+                        const auto packT1 = std::chrono::steady_clock::now();
+                        fastllm::GetLoadStageTiming().bufferPackUs.fetch_add(
+                            (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+                                packT1 - packT0).count(),
+                            std::memory_order_relaxed);
+                    }
                     return;
                 }
                 size_t dataBytes = dstType == DataType::NVFP4 ? GetNVFP4WeightBytes(n, m) : (size_t)n * m;
                 size_t scaleBytes = dstType == DataType::NVFP4 ? scale.bytes : 0;
-                buffer = new uint8_t[dataBytes + scaleBytes];
-                FILE *fi = fopen(this->fileName.c_str(), "rb");
+                if (dstType == DataType::FP8_E4M3) {
+                    buffer = ScopedPrefetchedRawTensor::Take(
+                        tensorName, fileName, data_offsets[0], bytes);
+                }
+                size_t ret;
+                if (buffer == nullptr) {
+                    buffer = new uint8_t[dataBytes + scaleBytes];
+                    FILE *fi = fopen(this->fileName.c_str(), "rb");
 #if defined(_WIN32) || defined(_WIN64)
-                _fseeki64(fi, this->data_offsets[0], 0);
+                    _fseeki64(fi, this->data_offsets[0], 0);
 #else
-                fseek(fi, this->data_offsets[0], 0);
+                    fseek(fi, this->data_offsets[0], 0);
 #endif
-                size_t ret = fread(buffer, 1, this->bytes, fi);
-                fclose(fi);
-                AssertInFastLLM(ret == this->bytes && this->bytes == dataBytes,
+                    { fastllm::ScopedLoadTimer _io(fastllm::GetLoadStageTiming().fileIoUs);
+                      ret = fread(buffer, 1, this->bytes, fi); }
+                    fclose(fi);
+                    AssertInFastLLM(ret == this->bytes,
+                                    "CreateBufferWithScale error: scaled data bytes mismatch.");
+                }
+                AssertInFastLLM(this->bytes == dataBytes,
                                 "CreateBufferWithScale error: scaled data bytes mismatch.");
 
                 if (dstType == DataType::NVFP4) {
@@ -1385,7 +1409,8 @@ namespace fastllm {
 #else
                     fseek(fs, scale.data_offsets[0], 0);
 #endif
-                    ret = fread(buffer + dataBytes, 1, scale.bytes, fs);
+                    { fastllm::ScopedLoadTimer _io(fastllm::GetLoadStageTiming().fileIoUs);
+                      ret = fread(buffer + dataBytes, 1, scale.bytes, fs); }
                     fclose(fs);
                     AssertInFastLLM(ret == scale.bytes,
                                     "CreateBufferWithScale error: read NVFP4 scale failed.");
@@ -1412,7 +1437,11 @@ namespace fastllm {
     #else
                 fseek(fi, this->data_offsets[0], 0);
     #endif
-                uint8_t *ori = new uint8_t[this->bytes];
+                uint8_t *ori = nullptr;
+                {
+                    fastllm::ScopedLoadTimer _alloc(fastllm::GetLoadStageTiming().bufferAllocUs);
+                    ori = new uint8_t[this->bytes];
+                }
                 ret = fread(ori, 1, this->bytes, fi);
                 for (int bi = 0; bi < ns; bi++) {
                     for (int bj = 0; bj < ms; bj++) {
@@ -1438,6 +1467,8 @@ namespace fastllm {
         }
 
         void CreateBufferWithAWQ(DataType dstType, SafeTensorItem &scale, SafeTensorItem &qzero) {
+            fastllm::GetLoadStageTiming().callsAwq.fetch_add(1, std::memory_order_relaxed);
+            fastllm::ScopedLoadTimer _ownTimer(fastllm::GetLoadStageTiming().usAwq);
             const int groupCnt = this->shape[0] / scale.shape[0];
             AssertInFastLLM(this->shape.size() == 2 && scale.shape.size() == 2 && qzero.shape.size() == 2,
                             "CreateBufferWithAWQ error: shape.size() should be 2.");
@@ -1516,6 +1547,8 @@ namespace fastllm {
 
         void CreateBufferWithPackedInt4Group(SafeTensorItem &scale, int groupCnt,
                                              DataType dstType) {
+            fastllm::GetLoadStageTiming().callsInt4Group.fetch_add(1, std::memory_order_relaxed);
+            fastllm::ScopedLoadTimer _ownTimer(fastllm::GetLoadStageTiming().usInt4Group);
             AssertInFastLLM(this->dtype == "I32" && this->shape.size() >= 2 &&
                             scale.shape.size() >= 2,
                             "CreateBufferWithPackedInt4Group error: invalid weight or scale tensor.");
@@ -1710,6 +1743,10 @@ namespace fastllm {
         }
 
         void CreateBuffer(DataType dstType) {
+            fastllm::GetLoadStageTiming().callsCreateBuffer.fetch_add(1, std::memory_order_relaxed);
+            fastllm::ScopedLoadTimer _ownTimer(fastllm::GetLoadStageTiming().usCreateBuffer);
+            fastllm::ScopedLoadTimer _totalTimer(fastllm::GetLoadStageTiming().bufferTotalUs);
+            fastllm::GetLoadStageTiming().bufferCalls.fetch_add(1, std::memory_order_relaxed);
             //printf("read %s from %s [%llu %llu] (%f M)\n", this->tensorName.c_str(), this->fileName.c_str(), this->data_offsets[0], this->data_offsets[0] + this->bytes, (float)this->bytes / 1e6);
             FILE *fi = fopen(this->fileName.c_str(), "rb");
             int ret;
@@ -1722,7 +1759,8 @@ namespace fastllm {
             if (this->dtype == "fastllm") {
                 ClearBuffer();
                 buffer = new uint8_t[this->bytes];
-                ret = fread(buffer, 1, this->bytes, fi);
+                { fastllm::ScopedLoadTimer _io(fastllm::GetLoadStageTiming().fileIoUs);
+                  ret = fread(buffer, 1, this->bytes, fi); }
                 fclose(fi);
                 return;
             } else if (this->dtype == "F8_E4M3") {
@@ -1749,7 +1787,8 @@ namespace fastllm {
                 ClearBuffer();
                 buffer = new uint8_t[(size_t)len * sizeof(float)];
                 std::vector<uint8_t> ori(len);
-                ret = fread(ori.data(), sizeof(uint8_t), len, fi);
+                { fastllm::ScopedLoadTimer _io(fastllm::GetLoadStageTiming().fileIoUs);
+                  ret = fread(ori.data(), sizeof(uint8_t), len, fi); }
                 float *dst = (float*)buffer;
                 for (int i = 0; i < len; i++) {
                     dst[i] = FP8E8M0ToFloat(ori[i]);
@@ -1763,7 +1802,8 @@ namespace fastllm {
                 ClearBuffer();
                 buffer = new uint8_t[(size_t)len * sizeof(int32_t)];
                 std::vector<int64_t> ori(len);
-                ret = fread(ori.data(), sizeof(int64_t), len, fi);
+                { fastllm::ScopedLoadTimer _io(fastllm::GetLoadStageTiming().fileIoUs);
+                  ret = fread(ori.data(), sizeof(int64_t), len, fi); }
                 int32_t *dst = (int32_t*)buffer;
                 for (int i = 0; i < len; i++) {
                     dst[i] = (int32_t)ori[i];
@@ -1787,13 +1827,21 @@ namespace fastllm {
                 ErrorInFastLLM("SafeTensorItem.CreateBuffer: unsupport dst dtype " + std::to_string(dstType) + "\n");
             }
             ClearBuffer();
-            buffer = new uint8_t[(size_t)len * unitSize];
+            {
+                fastllm::ScopedLoadTimer _alloc(fastllm::GetLoadStageTiming().bufferAllocUs);
+                buffer = new uint8_t[(size_t)len * unitSize];
+            }
             if (dstType == srcType) {
-                ret = fread(buffer, 1, this->bytes, fi);
+                { fastllm::ScopedLoadTimer _io(fastllm::GetLoadStageTiming().fileIoUs);
+                  ret = fread(buffer, 1, this->bytes, fi); }
             } else {
                 uint8_t *ori = new uint8_t[this->bytes];
-                ret = fread(ori, 1, this->bytes, fi);
-                ConvertDataType(ori, srcType, buffer, dstType, len);
+                { fastllm::ScopedLoadTimer _io(fastllm::GetLoadStageTiming().fileIoUs);
+                  ret = fread(ori, 1, this->bytes, fi); }
+                {
+                    fastllm::ScopedLoadTimer _convert(fastllm::GetLoadStageTiming().bufferConvertUs);
+                    ConvertDataType(ori, srcType, buffer, dstType, len);
+                }
                 delete[] ori;
             }
             fclose(fi);
@@ -2325,8 +2373,13 @@ namespace fastllm {
         if (model == nullptr) {
             return WeightType::NONE;
         }
+        const bool qwen4NgramShard =
+            model->model_type == "qwen4_exp" &&
+            weightName.find(".ple.ple_embedding.ngram_embedding.shard_") != std::string::npos &&
+            StringEndWith(weightName, ".weight");
         if (model->ngramDevice == "disk" &&
-            model->ngramWeights.find(weightName) != model->ngramWeights.end()) {
+            (model->ngramWeights.find(weightName) != model->ngramWeights.end() ||
+             qwen4NgramShard)) {
             return WeightType::EMBEDDING;
         }
         if (IsDiskMoeWeight(model, weightName, mergeIndex)) {
@@ -4382,6 +4435,11 @@ namespace fastllm {
             allWeightNames.insert(weightName);
             model->weight.AddEmptyWeight(weightName, {1}, DataType::FLOAT32);
             readGGUFTasks[i].weight = &model->weight.weight[weightName];
+            // Qwen4's pre-load callback chooses eager TP vs deferred GGUF
+            // layout restoration before any payload has been imported.
+            if (model->model_struct == "qwen4_exp") {
+                readGGUFTasks[i].weight->isGGUFData = true;
+            }
             readGGUFTaskDict[readGGUFTasks[i].name] = &readGGUFTasks[i];
             totalLoadBytes += ggml_nbytes(&readGGUFTasks[i].tensor);
         }
@@ -4495,7 +4553,7 @@ namespace fastllm {
             model->GetTensorMap(tensors);
         }
         model->OnWeightsCreated(allWeightNames);
-        const WeightMergeIndex mergeIndex(model->weightMergeRules);
+        const WeightMergeIndex mergeIndex = BuildWeightMergeIndex(model->weightMergeRules);
         ReportModelLoadProgress("weights_prepare", 1, 1);
         std::stable_sort(tensors.begin(), tensors.end(),
                          [&](const std::string &a, const std::string &b) {
@@ -4570,7 +4628,7 @@ namespace fastllm {
                 if (claimed[i]) continue;
                 LoadJob job;
                 job.index = i;
-                const auto &matches = mergeIndex.Find(loadTensors[i]);
+                const auto &matches = FindWeightMergeRules(mergeIndex, loadTensors[i]);
                 if (matches.size() == 1) {
                     const auto &group = model->weightMergeRules[matches.front()];
                     // Coupled rules/shared inputs and cross-group dependencies
@@ -4580,13 +4638,13 @@ namespace fastllm {
                         bool eligible = rule.inputs.size() >= 2 &&
                             group.allInputs.size() == rule.inputs.size() &&
                             mergeOutputUses.at(rule.output) == 1 &&
-                            mergeIndex.Find(rule.output).empty() &&
+                            FindWeightMergeRules(mergeIndex, rule.output).empty() &&
                             model->weight.weight.find(rule.output) == model->weight.weight.end();
                         for (const auto &name : rule.inputs) {
                             auto pos = positions.find(name);
                             auto task = readGGUFTaskDict.find(name);
                             if (!eligible || pos == positions.end() || claimed[pos->second] ||
-                                task == readGGUFTaskDict.end() || mergeIndex.Find(name).size() != 1 ||
+                                task == readGGUFTaskDict.end() || FindWeightMergeRules(mergeIndex, name).size() != 1 ||
                                 mergeOutputUses.find(name) != mergeOutputUses.end()) {
                                 eligible = false;
                                 break;
@@ -4718,7 +4776,7 @@ namespace fastllm {
                             allFinishNames.insert(weightName);
                             // 检查是否需要合并权重
                             bool needMerge = false;
-                            for (size_t ruleId : mergeIndex.Find(weightName)) {
+                            for (size_t ruleId : FindWeightMergeRules(mergeIndex, weightName)) {
                                 auto &rule = model->weightMergeRules[ruleId];
                                 needMerge = true;
                                 bool canMerge = true;
@@ -5117,7 +5175,9 @@ namespace fastllm {
                 }
             }
         }
+        fastllm::MarkLoadStage(fastllm::GetLoadStageTiming().tStartMs);
         SafeTensors safeTensors(stFiles);
+        fastllm::MarkLoadStage(fastllm::GetLoadStageTiming().tHeadersMs);
 
         // 2. 创建网络基本信息
         std::string configFile = path + "config.json";
@@ -5271,10 +5331,12 @@ namespace fastllm {
 
         // 4.1 读取权重
         auto tensors = safeTensors.GetSortedItemNames();
+        fastllm::MarkLoadStage(fastllm::GetLoadStageTiming().tSortedNamesMs);
         
         // tensorMap[name]代表本名为name的tensor，创建后的名字以及类型
         // 有些tensor被共享，可能需要创建多次
         auto tensorMap = model->GetTensorMap(tensors);
+        fastllm::MarkLoadStage(fastllm::GetLoadStageTiming().tTensorMapMs);
         tensors.erase(
             std::remove_if(tensors.begin(), tensors.end(),
                 [&](const std::string &name) {
@@ -5282,12 +5344,13 @@ namespace fastllm {
                     return it == tensorMap.end() || it->second.empty();
                 }),
             tensors.end());
+        fastllm::MarkLoadStage(fastllm::GetLoadStageTiming().tFilterMs);
 
         // 如果有需要，为moe设置特定的量化参数。AWQ 的专家权重使用
         // .qweight 保存，即使名称模式未把它识别成普通 LINEAR，也必须走
         // 全局线性量化类型；否则会按普通 I32 参数加载。
 #if defined(__aarch64__)
-        const WeightMergeIndex earlyMergeIndex(model->weightMergeRules);
+        const WeightMergeIndex earlyMergeIndex = BuildWeightMergeIndex(model->weightMergeRules);
 #endif
         bool awqArmCpuMoeInt8Fallback = false;
         if (model->moeLinears.size() > 0 && (useMoeDataType || isAwqModel)) {
@@ -5459,8 +5522,9 @@ namespace fastllm {
         if (tensors.empty()) {
             ReportModelLoadProgress("weights_prepare", 1, 1);
         }
+        fastllm::MarkLoadStage(fastllm::GetLoadStageTiming().tPrepareMs);
         model->OnWeightsCreated(allWeightNames);
-        const WeightMergeIndex mergeIndex(model->weightMergeRules);
+        const WeightMergeIndex mergeIndex = BuildWeightMergeIndex(model->weightMergeRules);
         std::stable_sort(tensors.begin(), tensors.end(),
                          [&](const std::string &a, const std::string &b) {
                              return model->GetWeightLoadPriority(a, tensorMap[a]) <
@@ -5468,15 +5532,28 @@ namespace fastllm {
                          });
 
         // 4.2 读取
+        // Qwen4 finishes constructing its merge rules before this point. Borrow
+        // their input names and preserve rule order instead of scanning every
+        // expert's rule for every tensor while holding the loader lock.
+        const bool useWeightMergeIndex = model->model_struct == "qwen4_exp";
+        const WeightMergeIndex weightMergeIndex = useWeightMergeIndex
+            ? BuildWeightMergeIndex(model->weightMergeRules) : WeightMergeIndex{};
+        const bool stableWeightNodes = useWeightMergeIndex &&
+            model->ShouldLoadWeightSeriallyBeforeOthers("", {});
+        std::set<std::string> consumedWeightNodes;
         std::vector <std::thread*> threads;
         int threadNum = std::min(16, std::max(4, (int)GetAlivePool()->threads.size()));
         std::mutex locker;
+        auto timedLoaderLock = [&]() {
+            fastllm::ScopedLoadTimer _lockerWait(fastllm::GetLoadStageTiming().lockerWaitUs);
+            locker.lock();
+        };
         int cnt = 0;
         int loadProgressTotal = std::max(1, (int)tensorMap.size());
         uint64_t completedLoadBytes = 0;
         uint64_t totalLoadBytes = 0;
         auto printLoadingProgress = [&](uint64_t tensorBytes) {
-            locker.lock();
+            timedLoaderLock();
             int current = ++cnt;
             completedLoadBytes += tensorBytes;
             uint64_t currentBytes = completedLoadBytes;
@@ -5560,7 +5637,20 @@ namespace fastllm {
             ret.back().second = rangeEnd;
             return ret;
         };
+        // Bound concurrent raw Safetensors buffers. This is a hard admission
+        // gate, not a hint: a worker waits before allocating its source
+        // buffer, so several large expert files cannot add up past 4 GiB.
+        StreamingLoadBudget loadBudget(kQwen4HostLoadBudgetBytes);
+        BoundedLayerRawPrefetch rawPrefetch(loadBudget, 512ULL * 1024 * 1024, 4);
+        const bool useLayerRawPrefetch = model->model_struct == "qwen3_5" &&
+                                        model->num_experts <= 0 &&
+                                        loraDicts.empty() && !isAwqModel;
+        std::set<std::string> chunkedStarted;
+        std::set<std::string> chunkedConsumed;
+        std::mutex chunkedMutex;
         auto loadSafeTensorRange = [&](int st, int end) {
+                    fastllm::ScopedLoadTimer _workerWall(
+                        fastllm::GetLoadStageTiming().workerWallUs);
                     for (int i = st; i < end; i++) {
                         auto &tensorName = (*activeTensors)[i];
                         auto &tensor = safeTensors.itmeDict[tensorName];
@@ -5569,6 +5659,82 @@ namespace fastllm {
                             printLoadingProgress(tensor.bytes);
                             continue;
                         }
+                        if (model->WantsChunkedWeight(tensorName)) {
+                            const std::string pairName = model->ChunkedWeightPair(tensorName);
+                            auto pairIt = safeTensors.itmeDict.find(pairName);
+                            AssertInFastLLM(!pairName.empty() && pairIt != safeTensors.itmeDict.end(),
+                                "Chunked weight pair metadata is missing: " + tensorName);
+                            bool startPair = false;
+                            {
+                                std::lock_guard<std::mutex> lock(chunkedMutex);
+                                if (chunkedConsumed.count(tensorName)) continue;
+                                const std::string canonical = std::min(tensorName, pairName);
+                                startPair = chunkedStarted.insert(canonical).second;
+                            }
+                            if (!startPair) continue;
+                            SafeTensorItem &pairTensor = pairIt->second;
+                            const uint64_t chunkBytes = model->ChunkedWeightBytes(
+                                tensorName, tensor.bytes);
+                            const uint64_t pairChunkBytes = model->ChunkedWeightBytes(
+                                pairName, pairTensor.bytes);
+                            AssertInFastLLM(chunkBytes > 0 && pairChunkBytes > 0 &&
+                                chunkBytes <= kQwen4HostLoadBudgetBytes &&
+                                pairChunkBytes <= kQwen4HostLoadBudgetBytes - chunkBytes,
+                                "Chunked weight frontier exceeds the host load budget.");
+                            const uint64_t chunks = (tensor.bytes + chunkBytes - 1) / chunkBytes;
+                            for (uint64_t chunk = 0; chunk < chunks; ++chunk) {
+                                const uint64_t offset = chunk * chunkBytes;
+                                const uint64_t bytesA = std::min(chunkBytes, tensor.bytes - offset);
+                                const uint64_t pairOffset = chunk * pairChunkBytes;
+                                const uint64_t bytesB = std::min(pairChunkBytes,
+                                    pairTensor.bytes > pairOffset ? pairTensor.bytes - pairOffset : 0);
+                                AssertInFastLLM(bytesB > 0,
+                                    "Chunked weight pair has fewer expert bytes than its mate.");
+                                StreamingLoadBudget::Lease lease;
+                                { fastllm::ScopedLoadTimer _budgetWait(
+                                      fastllm::GetLoadStageTiming().budgetWaitUs);
+                                  lease = loadBudget.Acquire(bytesA + bytesB); }
+                                std::vector<uint8_t> bufferA(bytesA), bufferB(bytesB);
+                                std::string readError;
+                                AssertInFastLLM(tensor.ReadRawRange(
+                                    offset, bytesA, bufferA.data(), bufferA.size(), &readError),
+                                    "Chunked weight range read failed: " + tensorName +
+                                    " (" + readError + ")");
+                                AssertInFastLLM(pairTensor.ReadRawRange(
+                                    pairOffset, bytesB, bufferB.data(), bufferB.size(), &readError),
+                                    "Chunked weight range read failed: " + pairName +
+                                    " (" + readError + ")");
+                                AssertInFastLLM(model->ConsumeWeightChunk(
+                                    tensorName, tensor.shape, tensor.dtype, offset,
+                                    bufferA.data(), bufferA.size()),
+                                    "Model rejected chunked weight: " + tensorName);
+                                AssertInFastLLM(model->ConsumeWeightChunk(
+                                    pairName, pairTensor.shape, pairTensor.dtype, pairOffset,
+                                    bufferB.data(), bufferB.size()),
+                                    "Model rejected chunked weight: " + pairName);
+                            }
+                            model->FinishChunkedWeight(tensorName);
+                            model->FinishChunkedWeight(pairName);
+                            {
+                                std::lock_guard<std::mutex> lock(chunkedMutex);
+                                chunkedConsumed.insert(tensorName);
+                                chunkedConsumed.insert(pairName);
+                            }
+                            printLoadingProgress(tensor.bytes);
+                            printLoadingProgress(pairTensor.bytes);
+                            continue;
+                        }
+                        {
+                            std::lock_guard<std::mutex> lock(chunkedMutex);
+                            if (chunkedConsumed.count(tensorName)) continue;
+                        }
+                        StreamingLoadBudget::Lease tensorLease;
+                        auto prefetched = useLayerRawPrefetch && tensor.dtype == "F8_E4M3"
+                            ? rawPrefetch.Take({tensorName, tensor.fileName,
+                                                tensor.data_offsets[0], tensor.bytes})
+                            : PrefetchedRawTensor{};
+                        ScopedPrefetchedRawTensor prefetchedScope(prefetched);
+                        if (prefetched) tensorLease = std::move(prefetched.lease);
                         std::string scaleTensorName = "";
                         std::string qzeroTensorName = "";
                         PackedInt4GroupInfo packedInt4Info;
@@ -5591,6 +5757,8 @@ namespace fastllm {
                             }
                             auto dataType = it.second;
                             int ggmlType = -1;
+                            fastllm::ScopedLoadTimer _dtypeParse(
+                                fastllm::GetLoadStageTiming().dtypeParseUs);
 
                             bool isMoeLinear = model->moeLinears.find(weightName) != model->moeLinears.end();
                             // With no explicit --moe_dtype, AWQ experts inherit the global
@@ -5684,6 +5852,7 @@ namespace fastllm {
                                 }
                             }
 
+                            _dtypeParse.Stop();
                             WeightType diskLazyWeightType = GetDiskLazyWeightType(
                                 model, weightName, tensor.bytes, mergeIndex);
                             bool diskLazyWeight = diskLazyWeightType != WeightType::NONE;
@@ -5748,6 +5917,14 @@ namespace fastllm {
                                     }
                                 }
                             } else {
+                                // Disk metadata has no payload allocation and
+                                // must not consume a full tensor's read budget.
+                                if (!tensorLease) {
+                                    fastllm::ScopedLoadTimer _budgetWait(
+                                        fastllm::GetLoadStageTiming().budgetWaitUs);
+                                    tensorLease = loadBudget.Acquire(
+                                        std::max<uint64_t>(tensor.bytes, 1));
+                                }
                                 if (packedInt4Info.isAffine) {
                                     auto &scaleTensor = safeTensors.itmeDict[
                                         packedInt4Info.scaleTensorName];
@@ -5893,7 +6070,9 @@ namespace fastllm {
 
                             // Match the GGUF loader: publish, merge, erase and
                             // register weights as one map mutation transaction.
-                            std::lock_guard<std::mutex> weightGuard(locker);
+                            fastllm::ScopedLoadTimer _lockerWait(fastllm::GetLoadStageTiming().lockerWaitUs);
+                            std::unique_lock<std::mutex> weightGuard(locker);
+                            _lockerWait.Stop();
                             allFinishNames.insert(weightName);
                             model->OnWeightLoaded(weightName, allFinishNames);
                             if (model->IsWeightConsumedAfterLoad(weightName)) {
@@ -5901,7 +6080,9 @@ namespace fastllm {
                             }
                             // 检查是否需要合并权重
                             bool needMerge = false;
-                            for (size_t ruleId : mergeIndex.Find(weightName)) {
+                            fastllm::ScopedLoadTimer _mergeProcess(
+                                fastllm::GetLoadStageTiming().mergeProcessUs);
+                            for (size_t ruleId : FindWeightMergeRules(mergeIndex, weightName)) {
                                 auto &rule = model->weightMergeRules[ruleId];
                                 needMerge = true;
                                 bool canMerge = true;
@@ -6037,11 +6218,19 @@ namespace fastllm {
 
                                     allFinishNames.insert(mergedWeightName);
                                     model->OnWeightLoaded(mergedWeightName, allFinishNames);
-                                    for (auto input : it.inputs) {
-                                        model->weight.weight.erase(input);
+                                    if (stableWeightNodes) {
+                                        // Release payloads at the original point, but keep
+                                        // map nodes while other workers may read the map.
+                                        ReleaseMergedInputs(model->weight.weight, it.inputs,
+                                                            consumedWeightNodes);
+                                    } else {
+                                        for (auto input : it.inputs) {
+                                            model->weight.weight.erase(input);
+                                        }
                                     }
                                 }
                             }
+                            _mergeProcess.Stop();
 #ifdef USE_TFACC
                             try {
                                 if (!needMerge && model->ShouldRegisterSpecialWeightForDeviceType(weightName, "tfacc")) {
@@ -6078,9 +6267,13 @@ namespace fastllm {
                     }
         };
 
+        {
+        fastllm::ScopedLoadTimer _serialGroups(
+            fastllm::GetLoadStageTiming().serialGroupsUs);
         activeTensors = &serialTensors;
         int serialStart = 0;
         while (serialStart < (int)serialTensors.size()) {
+            rawPrefetch.Join();
             int priority = model->GetWeightLoadPriority(serialTensors[serialStart],
                                                         tensorMap[serialTensors[serialStart]]);
             int serialEnd = serialStart + 1;
@@ -6094,6 +6287,10 @@ namespace fastllm {
                 for (auto &mapped : tensorMap[serialTensors[i]]) {
                     groupWeightNames.insert(mapped.first);
                 }
+            }
+            if (stableWeightNodes) {
+                PrepareMergeOutputNodes(model->weight.weight, model->weightMergeRules,
+                                        weightMergeIndex, groupWeightNames);
             }
             model->OnWeightLoadGroupStarted(groupWeightNames);
             int groupThreadNum = std::min(threadNum, std::max(1, serialEnd - serialStart));
@@ -6112,11 +6309,55 @@ namespace fastllm {
                     delete groupThreads[i];
                 }
             }
+            if (stableWeightNodes) {
+                EraseConsumedWeightNodes(model->weight.weight, consumedWeightNodes);
+            }
+            // Drop unused raw slots before reserving the next window, including
+            // before the larger lm_head group which uses the ordinary reader.
+            rawPrefetch.Clear();
+            // Current layer's read/merge workers have joined. Read only the
+            // next FP8 decoder layer while this finish callback uploads the
+            // current layer; never run model callbacks or conversions ahead.
+            if (useLayerRawPrefetch && priority >= 100000 &&
+                priority < 100000 + model->block_cnt - 1 &&
+                serialEnd < (int)serialTensors.size()) {
+                std::vector<RawPrefetchRange> nextRanges;
+                for (int i = serialEnd; i < (int)serialTensors.size(); ++i) {
+                    const auto &name = serialTensors[i];
+                    if (model->GetWeightLoadPriority(name, tensorMap[name]) != priority + 1) break;
+                    const auto &tensor = safeTensors.itmeDict.at(name);
+                    const auto &mapped = tensorMap.at(name);
+                    if (tensor.dtype != "F8_E4M3" || mapped.size() != 1 ||
+                        IsSafeTensorQuantAuxTensorName(safeTensors, name) ||
+                        FindSafeTensorScaleTensorName(safeTensors, name).empty()) continue;
+                    const auto weightIt = model->weight.weight.find(mapped[0].first);
+                    if (weightIt == model->weight.weight.end() ||
+                        weightIt->second.dataType != DataType::FP8_E4M3) continue;
+                    nextRanges.push_back({name, tensor.fileName, tensor.data_offsets[0], tensor.bytes});
+                }
+                rawPrefetch.Start(nextRanges);
+            }
             model->OnWeightLoadGroupFinished();
             serialStart = serialEnd;
         }
+        }
+        rawPrefetch.Clear();
         activeTensors = &tensors;
 
+        if (stableWeightNodes) {
+            std::set<std::string> parallelWeightNames;
+            for (const auto &tensorName : tensors) {
+                for (const auto &mapped : tensorMap[tensorName]) {
+                    parallelWeightNames.insert(mapped.first);
+                }
+            }
+            PrepareMergeOutputNodes(model->weight.weight, model->weightMergeRules,
+                                    weightMergeIndex, parallelWeightNames);
+        }
+
+        {
+        fastllm::ScopedLoadTimer _parallelParts(
+            fastllm::GetLoadStageTiming().parallelPartsUs);
         for (int i = 0; i < threadNum; i++) {
             threads.push_back(new std::thread(loadSafeTensorRange, parts[i].first, parts[i].second));
         }
@@ -6124,8 +6365,31 @@ namespace fastllm {
             threads[i]->join();
             delete threads[i];
         }
+        }
+        if (stableWeightNodes) {
+            EraseConsumedWeightNodes(model->weight.weight, consumedWeightNodes);
+        }
         model->OnWeightLoadGroupFinished();
+        fastllm::MarkLoadStage(fastllm::GetLoadStageTiming().tLoadMs);
         model->OnModelWeightsLoaded();
+
+        printf("[Fastllm] bounded host load budget: limit=%llu bytes peak=%llu bytes.\n",
+               (unsigned long long)loadBudget.Limit(),
+               (unsigned long long)loadBudget.Peak());
+        fastllm::PrintLoadStageTiming();
+        if (useLayerRawPrefetch && fastllm::LoadStageTimingEnabled()) {
+            const auto stats = rawPrefetch.Stats();
+            printf("[Fastllm] layer raw prefetch: windows=%llu read_calls=%llu read_bytes=%llu "
+                   "read_us=%llu join_wait_us=%llu adopted_calls=%llu adopted_bytes=%llu "
+                   "read_failures=%llu skipped_windows=%llu max_window_bytes=%llu reader_workers=%llu.\n",
+                   (unsigned long long)stats.windows, (unsigned long long)stats.readCalls,
+                   (unsigned long long)stats.readBytes, (unsigned long long)stats.readUs,
+                   (unsigned long long)stats.joinWaitUs, (unsigned long long)stats.adoptedCalls,
+                   (unsigned long long)stats.adoptedBytes, (unsigned long long)stats.readFailures,
+                   (unsigned long long)stats.skippedWindows, (unsigned long long)stats.maxWindowBytes,
+                   (unsigned long long)stats.readerWorkers);
+            fflush(stdout);
+        }
 
         printf("\n");
         fflush(stdout);
@@ -6143,7 +6407,7 @@ namespace fastllm {
         }
         // 检查源目录是否存在
         if (!fs::exists(modelPath) || !fs::is_directory(modelPath)) {
-            std::cerr << "源目录不存在或不是一个目录: " << modelPath << std::endl;
+            std::cerr << "Source directory does not exist or is not a directory: " << modelPath << std::endl;
             return;
         }
 

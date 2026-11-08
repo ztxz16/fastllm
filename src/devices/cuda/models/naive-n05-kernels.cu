@@ -30,7 +30,8 @@
 #include <type_traits>
 #include <vector>
 
-#if !defined(FASTLLM_CUDA_LEGACY_ONLY) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800)
+#if !defined(FASTLLM_CUDA_LEGACY_ONLY) && !defined(FASTLLM_CUDA_NO_SM80) && \
+    (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800)
 #define FASTLLM_NAIVE_SWA_FLASHINFER
 #include "naive-n05-swa-flashinfer.cuh"
 #endif

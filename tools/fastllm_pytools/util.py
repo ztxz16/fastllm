@@ -6,12 +6,15 @@ import sys
 import subprocess
 import glob
 import math
+from pathlib import Path
 from decimal import Decimal, InvalidOperation, localcontext
 
 try:
     from .gguf_metadata import get_gguf_model_config, read_gguf_metadata, read_gguf_tensor_names
+    from .prefix_cache_logging import configure_prefix_cache_logging
 except ImportError:
     from gguf_metadata import get_gguf_model_config, read_gguf_metadata, read_gguf_tensor_names
+    from prefix_cache_logging import configure_prefix_cache_logging
 
 def _positive_int(value: str) -> int:
     try:
@@ -30,6 +33,10 @@ def _probability(value: str) -> float:
     if not 0.0 <= result <= 1.0:
         raise argparse.ArgumentTypeError("must be a probability in [0, 1]")
     return result
+
+def _configured_prefix_cache_dir():
+    """Only an explicitly configured SSD root; never invent a cache directory."""
+    return os.environ.get("FASTLLM_PREFIX_CACHE_DIR") or None
 
 def _moe_cache_int(value: str) -> int:
     try:
@@ -622,15 +629,83 @@ def _vision_device(value):
 
 
 def apply_prefix_cache_env(args):
+    configure_prefix_cache_logging(args)
     prefix_cache = getattr(args, "prefix_cache", "")
     if (prefix_cache != ""):
         os.environ["FASTLLM_PREFIX_CACHE"] = str(prefix_cache)
+    # L2 host KV is explicit. SSD persistence/read does not depend on L2.
+    l2_mode = str(getattr(args, "prefix_cache_l2", "off") or "off").lower()
+    l2_gb = float(getattr(args, "prefix_cache_l2_gb", 4.0))
+    if l2_mode not in ("on", "off") or not (1 / 1024 <= l2_gb <= 2097151):
+        raise ValueError("prefix_cache_l2 must be on/off and prefix_cache_l2_gb must be finite and between 1 MiB and 2097151 GiB")
+    os.environ["FASTLLM_PREFIX_CACHE_L2_HOST_KV"] = "1" if l2_mode == "on" else "0"
+    os.environ["FASTLLM_PREFIX_CACHE_L2_HOST_KV_MB"] = str(int(l2_gb * 1024))
 
     env_args = [
         ("prefix_cache_snapshot_interval_pages", "FASTLLM_PREFIX_CACHE_SNAPSHOT_INTERVAL_PAGES"),
         ("prefix_cache_snapshot_max_per_request", "FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_PER_REQUEST"),
         ("prefix_cache_snapshot_max_records", "FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_RECORDS"),
+        # 可恢复检查点的长度间隔(token)：默认 256，传 >0 覆盖
+        ("prefix_cache_checkpoint_interval", "FASTLLM_PREFIX_CACHE_CHECKPOINT_INTERVAL"),
+        # 主机侧内存预算(MiB)：显式设置则精确使用；不设置时下界 2048 MiB，上界由机器可用内存决定
+        # （MemAvailable−4096 MiB），**可能超过 8192 MiB**（实测 25748 MiB）
+        ("prefix_cache_host_limit_mb", "FASTLLM_PREFIX_CACHE_HOST_LIMIT_MB"),
+        # Full-snapshot budget headroom: 8; not an enforced queue/thread limit.
+        ("prefix_cache_checkpoint_jobs", "FASTLLM_PREFIX_CACHE_CHECKPOINT_JOBS"),
+        # SSD 请求等待上限：默认 100 秒；部署命令显式传值时覆盖默认值
+        ("prefix_cache_restore_timeout_ms", "FASTLLM_PREFIX_CACHE_RESTORE_TIMEOUT_MS"),
     ]
+    # SSD cache V5 flags: exported only when given on the deploy command (None = keep env / built-in default).
+    v5_switches = [
+        ("prefix_cache_v5", "FASTLLM_PREFIX_V5"),
+        ("prefix_cache_v5_trim", "FASTLLM_PREFIX_V5_TRIM"),
+        ("prefix_cache_v5_request_hold", "FASTLLM_PREFIX_V5_REQUEST_HOLD"),
+        ("prefix_cache_restore_drain", "FASTLLM_QWEN35_RESTORE_DRAIN"),
+        ("prefix_cache_mm_tail_align", "FASTLLM_QWEN35_MM_TAIL_ALIGN"),
+        ("prefix_cache_ledger_bound", "FASTLLM_PREFIX_LEDGER_BOUND"),
+        ("prefix_cache_v4_segments", "FASTLLM_PREFIX_V4_SEGMENTS"),
+    ]
+    for arg_name, env_name in v5_switches:
+        value = getattr(args, arg_name, None)
+        if value is not None:
+            if value not in ("on", "off"):
+                raise ValueError(f"--{arg_name} must be on or off")
+            os.environ[env_name] = "1" if value == "on" else "0"
+    v5_numbers = [
+        ("prefix_cache_v5_read_threads", "FASTLLM_PREFIX_V5_READ_THREADS", 1, 64),
+        ("prefix_cache_v5_drain_ms", "FASTLLM_PREFIX_V5_DRAIN_MS", 1, 24 * 3600 * 1000),
+        ("prefix_cache_v5_interval_tokens", "FASTLLM_PREFIX_V5_INTERVAL_TOKENS", 1, 1 << 24),
+        # Ranges follow the clamps in the native readers (e.g. write workers / pack workers <= 16, pinned slots <= 64).
+        ("prefix_cache_d2_staging_mb", "FASTLLM_PREFIX_CACHE_D2_STAGING_MB", 1, 1 << 20),
+        ("prefix_cache_drain_timeout_s", "FASTLLM_PREFIX_CACHE_DRAIN_TIMEOUT_S", 1, 24 * 3600),
+        ("prefix_cache_gpu_pin_limit_mb", "FASTLLM_PREFIX_CACHE_GPU_PIN_LIMIT_MB", 1, 1 << 20),
+        ("prefix_cache_hash_pool_mb", "FASTLLM_PREFIX_CACHE_HASH_POOL_MB", 1, 1 << 20),
+        ("prefix_cache_host_limit_max_mb", "FASTLLM_PREFIX_CACHE_HOST_LIMIT_MAX_MB", 1, 1 << 24),
+        ("prefix_cache_min_context_tokens", "FASTLLM_PREFIX_CACHE_MIN_CONTEXT_TOKENS", 0, 1 << 24),
+        ("prefix_cache_pack_workers", "FASTLLM_PREFIX_CACHE_PACK_WORKERS", 1, 16),
+        ("prefix_cache_pinned_slots", "FASTLLM_PREFIX_CACHE_PINNED_SLOTS", 1, 64),
+        ("prefix_cache_write_min_reuse", "FASTLLM_PREFIX_CACHE_WRITE_MIN_REUSE", 0, 1 << 20),
+        ("prefix_cache_write_workers", "FASTLLM_PREFIX_CACHE_WRITE_WORKERS", 1, 16),
+        ("prefix_cache_ledger_max_page_refs", "FASTLLM_PREFIX_LEDGER_MAX_PAGE_REFS", 0, 1 << 40),
+        ("prefix_cache_ledger_max_records", "FASTLLM_PREFIX_LEDGER_MAX_RECORDS", 1, 1 << 30),
+        ("host_malloc_trim_seconds", "FASTLLM_HOST_MALLOC_TRIM_SECONDS", 0, 3600),
+    ]
+    for arg_name, env_name, low, high in v5_numbers:
+        value = getattr(args, arg_name, None)
+        if value is not None:
+            if not (low <= int(value) <= high):
+                raise ValueError(f"--{arg_name} must be between {low} and {high}")
+            os.environ[env_name] = str(int(value))
+    v5_choices = [
+        ("prefix_cache_hash_mode", "FASTLLM_PREFIX_CACHE_HASH_MODE", ("inline", "pool1", "pool4")),
+        ("prefix_cache_write_mode", "FASTLLM_PREFIX_CACHE_WRITE_MODE", ("parallel", "serial")),
+    ]
+    for arg_name, env_name, allowed in v5_choices:
+        value = getattr(args, arg_name, None)
+        if value is not None:
+            if value not in allowed:
+                raise ValueError(f"--{arg_name} must be one of {allowed}")
+            os.environ[env_name] = value
     for arg_name, env_name in env_args:
         value = getattr(args, arg_name, -1)
         try:
@@ -713,6 +788,14 @@ def _configure_qwen35_auto_fast_paths(args, is_qwen35_model: bool, mtp: int):
         getattr(args, "speculative_algorithm", "") or "").strip().lower()
     cuda_execution = (_uses_thread_tp(tp_arg) or
                       _uses_single_cuda_device(device))
+    # Startup timing can select different FP16 summation orders after a
+    # restart. Keep Qwen3.5 target arithmetic stable with SSD off or on.
+    reduction_flag = "FASTLLM_CUDA_CUSTOM_ALLREDUCE"
+    if is_qwen35_model and cuda_execution and os.environ.get(
+            reduction_flag, "auto").strip().lower() in ("", "auto"):
+        os.environ[reduction_flag] = "off"
+        print("[Fastllm] Qwen3.5 automatic TP reduction: fixed NCCL for reproducible cached state.",
+              flush=True)
     eligible = (is_qwen35_model and mtp == 0 and
                 speculative_algorithm != "dflash" and
                 not bool(getattr(args, "low", False)) and
@@ -1096,6 +1179,35 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument("--page_size", type = int, default = -1, help = "设置paged cache每页的大小（token数），默认multicuda为16，其它设备使用后端默认值")
     parser.add_argument("--prefix_cache", "--prefix-cache", dest = "prefix_cache", type = str, default = "",
                         help = "是否启用前缀缓存（true/false），对应 FASTLLM_PREFIX_CACHE")
+    parser.add_argument("--prefix_cache_log_level", "--prefix-cache-log-level",
+                        choices = ("off", "info", "debug"),
+                        default = os.environ.get("FASTLLM_PREFIX_CACHE_LOG_LEVEL", "info").strip().lower(),
+                        help = "前缀缓存日志：info（默认）显示简洁状态；debug 显示检查点和性能诊断；off 关闭普通日志，警告和错误始终保留；对应 FASTLLM_PREFIX_CACHE_LOG_LEVEL")
+    # ---- SSD 持久前缀缓存（移植自源仓库）----
+    parser.add_argument("--prefix_cache_dir", "--prefix-cache-dir", default=None,
+                        help="SSD cache directory chosen by the user; unset disables SSD persistence (FASTLLM_PREFIX_CACHE_DIR may also specify it)")
+    parser.add_argument("--prefix_cache_disk_gb", "--prefix-cache-disk-gb",
+                        type=float, default=256.0,
+                        help="SSD quota in GiB (default 256 GiB)")
+    parser.add_argument("--prefix_cache_restore_policy", "--prefix-cache-restore-policy",
+                        choices=("auto", "always", "never"), default="auto",
+                        help="SSD 恢复策略：auto/always 在本地未命中且 SSD 明确命中时挂起请求、后台读取；never 禁止 SSD 读取（不影响写入）")
+    parser.add_argument("--prefix_cache_restore_timeout_ms", "--prefix-cache-restore-timeout-ms",
+                        dest="prefix_cache_restore_timeout_ms", type=_positive_int, default=100000,
+                        help="SSD 请求恢复等待上限（毫秒），默认 100000；显式部署参数优先")
+    parser.add_argument("--prefix_cache_l2", "--prefix-cache-l2", choices=("off", "on"), default="off",
+                        help="主机 L2 KV 溢出层；默认关闭，开启后默认 4 GiB")
+    parser.add_argument("--prefix_cache_l2_gb", "--prefix-cache-l2-gb", type=float, default=4.0,
+                        help="L2 主机 KV 容量（GiB），仅在 --prefix_cache_l2 on 时使用")
+    parser.add_argument("--prefix_cache_checkpoint_interval", "--prefix-cache-checkpoint-interval",
+                        dest = "prefix_cache_checkpoint_interval", type = int, default = 256,
+                        help = "可恢复检查点的长度间隔(token)，默认 256；对应 FASTLLM_PREFIX_CACHE_CHECKPOINT_INTERVAL")
+    parser.add_argument("--prefix_cache_host_limit_mb", "--prefix-cache-host-limit-mb",
+                        dest = "prefix_cache_host_limit_mb", type = int, default = 0,
+                        help = "主机侧内存预算(MiB)；0 表示按可用内存动态扩张")
+    parser.add_argument("--prefix_cache_checkpoint_jobs", "--prefix-cache-checkpoint-jobs",
+                        dest = "prefix_cache_checkpoint_jobs", type = int, default = 8,
+                        help = "Full-snapshot budget headroom (default 8 jobs); not a queue/thread limit; FASTLLM_PREFIX_CACHE_CHECKPOINT_JOBS")
     parser.add_argument("--prefix_cache_snapshot_interval_pages", "--prefix-cache-snapshot-interval-pages",
                         dest = "prefix_cache_snapshot_interval_pages", type = int, default = -1,
                         help = "前缀缓存快照间隔页数，对应 FASTLLM_PREFIX_CACHE_SNAPSHOT_INTERVAL_PAGES")
@@ -1105,6 +1217,62 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument("--prefix_cache_snapshot_max_records", "--prefix-cache-snapshot-max-records",
                         dest = "prefix_cache_snapshot_max_records", type = int, default = -1,
                         help = "全局最多保留的前缀缓存快照数，对应 FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_RECORDS")
+    # ---- SSD cache V5 (default store since 2026-11-07). Each flag has a built-in default (shown in
+    # the help); a flag given on the deploy command overrides it, an unset flag leaves the environment
+    # variable (or, if that is unset too, the built-in default) in effect.
+    parser.add_argument("--prefix_cache_v5", "--prefix-cache-v5", choices=("on", "off"), default=None,
+                        help="SSD 缓存 V5（默认 on）；off = 回退 V4；对应 FASTLLM_PREFIX_V5")
+    parser.add_argument("--prefix_cache_v5_trim", "--prefix-cache-v5-trim", choices=("on", "off"), default=None,
+                        help="V5 配额满时先截掉久未使用长对话的文件尾部、保留开头（默认 on）；对应 FASTLLM_PREFIX_V5_TRIM")
+    parser.add_argument("--prefix_cache_v5_request_hold", "--prefix-cache-v5-request-hold", choices=("on", "off"), default=None,
+                        help="V5 请求在结束前保护它恢复用的缓存链不被删除（默认 on）；对应 FASTLLM_PREFIX_V5_REQUEST_HOLD")
+    parser.add_argument("--prefix_cache_restore_drain", "--prefix-cache-restore-drain", choices=("on", "off"), default=None,
+                        help="多个请求同时从 SSD 恢复时每轮都接收已读完的数据，避免卡住（默认 on）；对应 FASTLLM_QWEN35_RESTORE_DRAIN")
+    parser.add_argument("--prefix_cache_v5_read_threads", "--prefix-cache-v5-read-threads", type=int, default=None,
+                        help="V5 SSD 读取线程数，1-64（默认 8）；对应 FASTLLM_PREFIX_V5_READ_THREADS")
+    parser.add_argument("--prefix_cache_v5_drain_ms", "--prefix-cache-v5-drain-ms", type=int, default=None,
+                        help="V5 关机时等待未写完数据落盘的上限（毫秒，默认 30000）；对应 FASTLLM_PREFIX_V5_DRAIN_MS")
+    parser.add_argument("--prefix_cache_v5_interval_tokens", "--prefix-cache-v5-interval-tokens", type=int, default=None,
+                        help="V5 长期保留检查点的网格（token，默认 3072）；对应 FASTLLM_PREFIX_V5_INTERVAL_TOKENS")
+    parser.add_argument("--prefix_cache_mm_tail_align", "--prefix-cache-mm-tail-align", choices=("on", "off"), default=None,
+                        help="图片请求在最后一个页边界多存一个检查点（默认 off：2026-11-08 实测恢复答案与不用缓存不一致）；对应 FASTLLM_QWEN35_MM_TAIL_ALIGN")
+    parser.add_argument("--prefix_cache_ledger_bound", "--prefix-cache-ledger-bound", choices=("on", "off"), default=None,
+                        help="内存里的缓存页记录表超过上限时，丢弃最旧的已落盘记录（默认 on）；对应 FASTLLM_PREFIX_LEDGER_BOUND")
+    parser.add_argument("--prefix_cache_ledger_max_page_refs", "--prefix-cache-ledger-max-page-refs", type=int, default=None,
+                        help="缓存页记录表保留的已落盘页引用上限（默认 V5 且 L2 关 = 0，只留最新一条，SSD 上的数据由 V5 自己的索引管理；V4 或 L2 开 = 1048576）；对应 FASTLLM_PREFIX_LEDGER_MAX_PAGE_REFS")
+    parser.add_argument("--prefix_cache_ledger_max_records", "--prefix-cache-ledger-max-records", type=int, default=None,
+                        help="缓存页记录表攒到多少条才做一次全表清理（默认 262144；V5 且 L2 关时，遗忘旧记录的同时就逐页删除无用记录，不靠全表清理）；对应 FASTLLM_PREFIX_LEDGER_MAX_RECORDS")
+    parser.add_argument("--host_malloc_trim_seconds", "--host-malloc-trim-seconds", type=int, default=None,
+                        help="每隔 N 秒把空闲的主机内存还给系统，0 = 关闭（默认 10）；对应 FASTLLM_HOST_MALLOC_TRIM_SECONDS")
+    parser.add_argument("--prefix_cache_v4_segments", "--prefix-cache-v4-segments", choices=("on", "off"), default=None,
+                        help="允许回收内存记录表里没有记录的旧缓存（默认 V5 且 L2 关 = on；V4 或 L2 开 = off）；对应 FASTLLM_PREFIX_V4_SEGMENTS")
+    parser.add_argument("--prefix_cache_min_context_tokens", "--prefix-cache-min-context-tokens", type=int, default=None,
+                        help="短于该 token 数的请求不读写 SSD 缓存，0 = 不限制（默认 0）；对应 FASTLLM_PREFIX_CACHE_MIN_CONTEXT_TOKENS")
+    parser.add_argument("--prefix_cache_write_min_reuse", "--prefix-cache-write-min-reuse", type=int, default=None,
+                        help="同一前缀至少出现几次才写入 SSD，0/1 = 不限制（默认 0）；对应 FASTLLM_PREFIX_CACHE_WRITE_MIN_REUSE")
+    parser.add_argument("--prefix_cache_drain_timeout_s", "--prefix-cache-drain-timeout-s", type=int, default=None,
+                        help="服务关闭时等待缓存写完的上限（秒，默认 300）；对应 FASTLLM_PREFIX_CACHE_DRAIN_TIMEOUT_S")
+    parser.add_argument("--prefix_cache_write_workers", "--prefix-cache-write-workers", type=int, default=None,
+                        help="缓存写入并行通道数，1-16（默认 4）；对应 FASTLLM_PREFIX_CACHE_WRITE_WORKERS")
+    parser.add_argument("--prefix_cache_write_mode", "--prefix-cache-write-mode", choices=("parallel", "serial"), default=None,
+                        help="缓存写入方式：parallel（默认，按 write_workers 并行）或 serial（单通道）；对应 FASTLLM_PREFIX_CACHE_WRITE_MODE")
+    parser.add_argument("--prefix_cache_pack_workers", "--prefix-cache-pack-workers", type=int, default=None,
+                        help="缓存打包线程数，1-16（默认 4）；对应 FASTLLM_PREFIX_CACHE_PACK_WORKERS")
+    parser.add_argument("--prefix_cache_pinned_slots", "--prefix-cache-pinned-slots", type=int, default=None,
+                        help="每个写入通道的锁页缓冲槽数（每槽 8 MiB），1-64（默认 4）；对应 FASTLLM_PREFIX_CACHE_PINNED_SLOTS")
+    parser.add_argument("--prefix_cache_d2_staging_mb", "--prefix-cache-d2-staging-mb", type=int, default=None,
+                        help="每个写入通道从显卡拷出数据的暂存预算（MiB，默认 1024）；对应 FASTLLM_PREFIX_CACHE_D2_STAGING_MB")
+    parser.add_argument("--prefix_cache_gpu_pin_limit_mb", "--prefix-cache-gpu-pin-limit-mb", type=int, default=None,
+                        help="保存时每张卡可暂时保留的显存页预算（MiB，默认自动 = min(256, 缓存池/10)）；对应 FASTLLM_PREFIX_CACHE_GPU_PIN_LIMIT_MB")
+    parser.add_argument("--prefix_cache_host_limit_max_mb", "--prefix-cache-host-limit-max-mb", type=int, default=None,
+                        help="自动主机内存预算的基础上限（MiB，默认 8192）；显式 --prefix_cache_host_limit_mb 时不生效；对应 FASTLLM_PREFIX_CACHE_HOST_LIMIT_MAX_MB")
+    parser.add_argument("--prefix_cache_hash_mode", "--prefix-cache-hash-mode", choices=("inline", "pool1", "pool4"), default=None,
+                        help="缓存校验哈希的计算方式：inline（默认）、pool1、pool4；对应 FASTLLM_PREFIX_CACHE_HASH_MODE")
+    parser.add_argument("--prefix_cache_hash_pool_mb", "--prefix-cache-hash-pool-mb", type=int, default=None,
+                        help="哈希线程池的内存预算（MiB，默认 512，仅 pool1/pool4 时生效）；对应 FASTLLM_PREFIX_CACHE_HASH_POOL_MB")
+    parser.add_argument("--prefix_cache_storage_version", "--prefix-cache-storage-version",
+                        dest = "prefix_cache_storage_version", type = int, choices = (4,), default = 4,
+                        help = "外层目录清单格式（仅 4）；与存储引擎无关，存储引擎默认 V5，见 --prefix_cache_v5")
     parser.add_argument("--gpu_mem_ratio", type = float, default = 0.9, help = "GPU显存使用比例，如0.9表示使用90%%的显存")
     parser.add_argument("--cuda_slab", type = int, default = None,
                         help = "CUDA模型权重slab大小（MiB）；默认按模型选择，0表示关闭")
@@ -1599,6 +1767,24 @@ def make_normal_llm_model(args, startup_progress = None):
                 model_type in ("qwen3_8_flash_next", "qwen4_exp") or
                 text_model_type in ("qwen3_8_flash_next_text", "qwen4_exp_text")
             )
+            if is_qwen35_model or is_qwen38_flash_next_model:
+                # The v4 backend has a complete default profile. Explicit
+                # --prefix_cache false remains the opt-out for controls.
+                if str(getattr(args, "prefix_cache", "") or "").lower() not in (
+                        "false", "0", "off"):
+                    args.prefix_cache = "true"
+                    if not getattr(args, "prefix_cache_dir", None):
+                        args.prefix_cache_dir = _configured_prefix_cache_dir()
+                    if getattr(args, "prefix_cache_disk_gb", None) is None:
+                        args.prefix_cache_disk_gb = 256.0
+                    if getattr(args, "prefix_cache_restore_policy", None) is None:
+                        args.prefix_cache_restore_policy = "auto"
+                    if getattr(args, "prefix_cache_checkpoint_interval", -1) <= 0:
+                        args.prefix_cache_checkpoint_interval = 256
+                    if getattr(args, "prefix_cache_checkpoint_jobs", -1) <= 0:
+                        args.prefix_cache_checkpoint_jobs = 8
+                    if getattr(args, "prefix_cache_host_limit_mb", -1) < 0:
+                        args.prefix_cache_host_limit_mb = 0
             is_glm5_next_model = (
                 architecture == "Glm5NextForConditionalGeneration" or
                 model_type == "glm5_next" or
@@ -2182,6 +2368,9 @@ def make_normal_llm_model(args, startup_progress = None):
             args.chat_template = file.read()
     if startup_progress is not None:
         startup_progress.progress("initializing", 1, 1)
+        provider = getattr(llm.model, "next_observation_sequence", None)
+        if callable(provider):
+            startup_progress.set_sequence_provider(provider)
         llm.set_model_load_progress_callback(startup_progress.model_load_progress)
     max_context_length = getattr(args, "max_context_length", -1)
     rope_scaling = getattr(args, "rope_scaling", "")
@@ -2189,20 +2378,24 @@ def make_normal_llm_model(args, startup_progress = None):
     # Explicit RoPE options must reach the constructor's capability check.
     legacy_context_limit = (max_context_length > 0 and not rope_scaling and
                             (graph is not None or not os.path.isdir(args.path)))
+    from .persistent_prefix import persistent_prefix_environment
+    native_library = getattr(llm, "fastllm_lib", None)
+    library_path = getattr(native_library, "_name", "")
     model = None
     try:
-        model = llm.model(args.path, dtype = args.dtype, kv_cache_dtype = args.kv_cache_dtype,
-                            moe_dtype = args.moe_dtype, graph = graph, tokenizer_type = "auto", lora = args.lora,
-                            dtype_config = args.dtype_config, ori_model_path = args.ori,
-                            chat_template = args.chat_template,
-                            tool_call_parser = args.tool_call_parser,
-                            external_mtp_path = (speculative_draft_path
-                                if speculative_algorithm == "mtp" or draft_is_dspark_gguf else ""),
-                            mmproj_path = args.mmproj,
-                            max_context_length = -1 if legacy_context_limit else max_context_length,
-                            rope_scaling = rope_scaling,
-                            indexer_dtype = getattr(args, "indexer_dtype", "auto"),
-                            indexer_tp_storage = indexer_storage)
+        with persistent_prefix_environment(args, is_qwen35_model, library_path, native_library):
+            model = llm.model(args.path, dtype = args.dtype, kv_cache_dtype = args.kv_cache_dtype,
+                                moe_dtype = args.moe_dtype, graph = graph, tokenizer_type = "auto", lora = args.lora,
+                                dtype_config = args.dtype_config, ori_model_path = args.ori,
+                                chat_template = args.chat_template,
+                                tool_call_parser = args.tool_call_parser,
+                                external_mtp_path = (speculative_draft_path
+                                    if speculative_algorithm == "mtp" or draft_is_dspark_gguf else ""),
+                                mmproj_path = args.mmproj,
+                                max_context_length = -1 if legacy_context_limit else max_context_length,
+                                rope_scaling = rope_scaling,
+                                indexer_dtype = getattr(args, "indexer_dtype", "auto"),
+                                indexer_tp_storage = indexer_storage)
         if hybrid_auto_plan is not None:
             model.hybrid_auto_plan = hybrid_auto_plan
         if is_clover_model:

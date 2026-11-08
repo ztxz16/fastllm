@@ -1,0 +1,232 @@
+// SPDX-License-Identifier: Apache-2.0
+
+#include "connector.h"
+#include <cerrno>
+#include <cstdint>
+#include <cstdio>
+#include <stdexcept>
+#include <string>
+#include "../keys.h"
+
+namespace lmcache {
+namespace connector {
+
+// ---------------------------------------------------------------
+// read/write helpers
+// ---------------------------------------------------------------
+
+static void write_all(int fd, const void* data, size_t len) {
+  size_t written = 0;
+  const char* ptr = static_cast<const char*>(data);
+  while (written < len) {
+    ssize_t n = ::write(fd, ptr + written, len - written);
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      throw std::runtime_error("write failed: " + std::string(strerror(errno)));
+    }
+    if (n == 0) {
+      throw std::runtime_error("write returned 0");
+    }
+    written += static_cast<size_t>(n);
+  }
+}
+
+static size_t read_all(int fd, void* buf, size_t len) {
+  size_t total = 0;
+  char* ptr = static_cast<char*>(buf);
+  while (total < len) {
+    ssize_t n = ::read(fd, ptr + total, len - total);
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      throw std::runtime_error("read failed: " + std::string(strerror(errno)));
+    }
+    if (n == 0) break;  // EOF
+    total += static_cast<size_t>(n);
+  }
+  return total;
+}
+
+static bool try_enable_odirect(int& flags, const void* buf, size_t len,
+                               size_t disk_block_size) {
+#ifdef O_DIRECT
+  if (disk_block_size == 0 || len % disk_block_size != 0) {
+    return false;
+  }
+  auto addr = reinterpret_cast<std::uintptr_t>(buf);
+  if (addr % disk_block_size != 0) {
+    throw std::runtime_error(
+        "O_DIRECT buffer address is not aligned to filesystem block size");
+  }
+  flags |= O_DIRECT;
+  return true;
+#else
+  (void)flags;
+  (void)buf;
+  (void)len;
+  (void)disk_block_size;
+  return false;
+#endif
+}
+
+// ---------------------------------------------------------------
+// FSConnector
+// ---------------------------------------------------------------
+
+FSConnector::FSConnector(std::string base_path, int num_workers,
+                         std::string relative_tmp_dir, bool use_odirect,
+                         size_t read_ahead_size)
+    : ConnectorBase(num_workers),
+      base_path_(std::move(base_path)),
+      relative_tmp_dir_(std::move(relative_tmp_dir)),
+      use_odirect_(use_odirect),
+      disk_block_size_(0),
+      read_ahead_size_(read_ahead_size) {
+  // Create base directory
+  std::filesystem::create_directories(base_path_);
+
+  // Create tmp directory if configured
+  if (!relative_tmp_dir_.empty()) {
+    auto tmp_path = std::filesystem::path(base_path_) / relative_tmp_dir_;
+    std::filesystem::create_directories(tmp_path);
+  }
+
+  // Query disk block size for O_DIRECT
+  if (use_odirect_) {
+    struct statvfs st;
+    if (statvfs(base_path_.c_str(), &st) == 0) {
+      disk_block_size_ = st.f_bsize;
+    }
+  }
+
+  start_workers();  // IMPORTANT: call at END of constructor
+}
+
+FSConnector::~FSConnector() { close(); }
+
+WorkerFSConn FSConnector::create_connection() {
+  WorkerFSConn conn;
+  conn.base_path = base_path_;
+  if (!relative_tmp_dir_.empty()) {
+    conn.tmp_dir = std::filesystem::path(base_path_) / relative_tmp_dir_;
+  }
+  conn.use_odirect = use_odirect_;
+  conn.disk_block_size = disk_block_size_;
+  conn.read_ahead_size = read_ahead_size_;
+  return conn;
+}
+
+void FSConnector::do_single_get(WorkerFSConn& conn, const std::string& key,
+                                void* buf, size_t len, size_t chunk_size) {
+  std::string filename = key_to_filename(key);
+  auto file_path = conn.base_path / filename;
+
+  int flags = O_RDONLY;
+  bool do_odirect = conn.use_odirect &&
+                    try_enable_odirect(flags, buf, len, conn.disk_block_size);
+
+  int fd = ::open(file_path.c_str(), flags);
+  if (fd < 0) {
+    throw std::runtime_error("open for read failed: " + file_path.string() +
+                             ": " + strerror(errno));
+  }
+
+  try {
+    size_t n;
+    bool use_read_ahead =
+        !do_odirect && conn.read_ahead_size > 0 && len > conn.read_ahead_size;
+    if (use_read_ahead) {
+      // Trigger filesystem readahead with a small initial
+      // read, then read the remainder.
+      size_t ra = conn.read_ahead_size;
+      size_t n_head = read_all(fd, buf, ra);
+      if (n_head < ra) {
+        // Short read on the head portion — treat as
+        // incomplete
+        n = n_head;
+      } else {
+        size_t n_tail = read_all(fd, static_cast<char*>(buf) + ra, len - ra);
+        n = n_head + n_tail;
+      }
+    } else {
+      n = read_all(fd, buf, len);
+    }
+    if (n != len) {
+      throw std::runtime_error("incomplete read for " + file_path.string() +
+                               ": expected " + std::to_string(len) + ", got " +
+                               std::to_string(n));
+    }
+  } catch (...) {
+    ::close(fd);
+    throw;
+  }
+  ::close(fd);
+}
+
+void FSConnector::do_single_set(WorkerFSConn& conn, const std::string& key,
+                                const void* buf, size_t len,
+                                size_t chunk_size) {
+  std::string filename = key_to_filename(key);
+  auto file_path = conn.base_path / filename;
+
+  // Skip if already stored on disk
+  if (std::filesystem::exists(file_path)) {
+    return;
+  }
+
+  // Determine temp file path
+  std::filesystem::path tmp_path;
+  if (!conn.tmp_dir.empty()) {
+    tmp_path = conn.tmp_dir / filename;
+  } else {
+    tmp_path = file_path;
+    tmp_path.replace_extension(TMP_EXT);
+  }
+
+  int flags = O_CREAT | O_WRONLY | O_TRUNC;
+  if (conn.use_odirect) {
+    try_enable_odirect(flags, buf, len, conn.disk_block_size);
+  }
+
+  int fd = ::open(tmp_path.c_str(), flags, 0644);
+  if (fd < 0) {
+    throw std::runtime_error("open for write failed: " + tmp_path.string() +
+                             ": " + strerror(errno));
+  }
+
+  try {
+    write_all(fd, buf, len);
+  } catch (...) {
+    ::close(fd);
+    // Clean up temp file on failure
+    std::filesystem::remove(tmp_path);
+    throw;
+  }
+  ::close(fd);
+
+  // Atomic rename: tmp -> final
+  std::error_code ec;
+  std::filesystem::rename(tmp_path, file_path, ec);
+  if (ec) {
+    // Try to clean up, but prioritize reporting the original error.
+    std::error_code remove_ec;
+    std::filesystem::remove(tmp_path, remove_ec);
+    throw std::runtime_error("rename failed: " + tmp_path.string() + " -> " +
+                             file_path.string() + ": " + ec.message());
+  }
+}
+
+bool FSConnector::do_single_exists(WorkerFSConn& conn, const std::string& key) {
+  std::string filename = key_to_filename(key);
+  auto file_path = conn.base_path / filename;
+  return std::filesystem::exists(file_path);
+}
+
+bool FSConnector::do_single_delete(WorkerFSConn& conn, const std::string& key) {
+  std::string filename = key_to_filename(key);
+  auto file_path = conn.base_path / filename;
+  std::error_code ec;
+  return std::filesystem::remove(file_path, ec);
+}
+
+}  // namespace connector
+}  // namespace lmcache

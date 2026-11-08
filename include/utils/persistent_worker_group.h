@@ -2,6 +2,7 @@
 #define FASTLLM_PERSISTENT_WORKER_GROUP_H
 
 #include <condition_variable>
+#include <cstdlib>
 #include <cstdint>
 #include <exception>
 #include <functional>
@@ -44,6 +45,7 @@ namespace fastllm {
                 std::lock_guard<std::mutex> lock(mutex);
                 currentTask = task;
                 currentErrors = &errors;
+                taskFirstRank = 0;
                 activeCount = (int)workerKeys.size();
                 finishedCount = 0;
                 taskId++;
@@ -78,6 +80,7 @@ namespace fastllm {
                 std::lock_guard<std::mutex> lock(mutex);
                 currentTask = task;
                 currentErrors = &errors;
+                taskFirstRank = 1;
                 activeCount = (int)workerKeys.size() - 1;
                 finishedCount = 0;
                 taskId++;
@@ -107,7 +110,22 @@ namespace fastllm {
         }
 
     private:
+        // FASTLLM_TP_WORKERS_STABLE=1: keep one worker per rank for these keys and let
+        // Run / RunWithCaller only choose which ranks take a task. Without it, a switch
+        // between Run (first rank 0) and RunWithCaller (first rank 1) joins and recreates
+        // every worker, so per-thread CUDA state (PTDS, thread_local scratch) is rebuilt.
+        static bool StableWorkersEnabled() {
+            static const bool enabled = [] {
+                const char *v = std::getenv("FASTLLM_TP_WORKERS_STABLE");
+                return v != nullptr && std::atoi(v) > 0;
+            }();
+            return enabled;
+        }
+
         void EnsureLocked(const std::vector<int> &workerKeys, int firstRank = 0) {
+            if (StableWorkersEnabled()) {
+                firstRank = 0;
+            }
             {
                 std::lock_guard<std::mutex> lock(mutex);
                 if (!stop && keys == workerKeys && firstWorkerRank == firstRank &&
@@ -209,6 +227,9 @@ namespace fastllm {
                         return;
                     }
                     lastTaskId = taskId;
+                    if (rank < taskFirstRank) {
+                        continue;  // the caller runs this rank (RunWithCaller)
+                    }
                     task = currentTask;
                     errors = currentErrors;
                 }
@@ -246,6 +267,7 @@ namespace fastllm {
         int activeCount = 0;
         int finishedCount = 0;
         int firstWorkerRank = 0;
+        int taskFirstRank = 0;
         bool stop = false;
     };
 }
