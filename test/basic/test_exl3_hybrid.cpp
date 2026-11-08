@@ -34,6 +34,104 @@ static void DecodeCpuOracle(const Data &input,float *routes,Data **weights,int w
     std::copy(actual.begin(),actual.end(),routes);
 #endif
 }
+static void CheckVerifierRows(std::vector<std::vector<Data *>> &weights,
+        std::vector<std::vector<Data *>> &gpuWeights, int k, int mid) {
+    const int layers=weights.size(), experts=(weights[0].size()-2)/2, topk=3;
+    std::mt19937 rng(981);
+    for (int rows=2;rows<=8;++rows) {
+        Data x(BFLOAT16,{rows,k}),ids(INT32,{rows,topk}),scores(FLOAT32,{rows,topk});
+        for (auto *d:{&x,&ids,&scores}) d->Allocate(false);
+        std::memset(x.cpuData,0,x.GetBytes());std::memset(ids.cpuData,0,ids.GetBytes());std::memset(scores.cpuData,0,scores.GetBytes());
+        Data gx,gi,gs;gx.CopyFrom(x);gi.CopyFrom(ids);gs.CopyFrom(scores);
+        for(auto *d:{&gx,&gi,&gs})d->ToDevice(CUDA,{0});
+        std::vector<Data> outputs(layers);
+        std::vector<const void *> children;std::vector<void *> handles;
+        for(int l=0;l<layers;++l) {
+            void *child=nullptr;
+            auto *handle=FastllmCudaCreateNativeMoeFullGraph(gx,gi,gs,outputs[l],weights[l].data(),weights[l].size(),l,nullptr,&child);
+            Require(handle&&child,"EXL3 multirow full graph creation");children.push_back(child);handles.push_back(handle);
+        }
+        HybridMoeGraph graph;Require(graph.Compose(children,handles),"EXL3 multirow composition");
+        double maxRelativeL2=0;
+        uint64_t before[8]{};fastllm_moe_cuda_cache_route_stats(0,before);
+        for(int turn=0;turn<10;++turn) {
+            for(int i=0;i<rows*k;++i)reinterpret_cast<uint16_t *>(x.cpuData)[i]=Float32ToBFloat16RNEBits((int(rng()%97)-48)/32.f);
+            for(int row=0;row<rows;++row)for(int at=0;at<topk;++at) {
+                const int route=row*topk+at;
+                // Alternate complete reuse and different experts across rows.
+                reinterpret_cast<int *>(ids.cpuData)[route]=(turn+(turn%2?row:0)+at*3)%experts;
+                reinterpret_cast<float *>(scores.cpuData)[route]=float(int(rng()%17)-4)/16.f;
+            }
+            FastllmCudaCopyFromHostToDevice(gx.cudaData,x.cpuData,x.GetBytes());
+            FastllmCudaCopyFromHostToDevice(gi.cudaData,ids.cpuData,ids.GetBytes());
+            FastllmCudaCopyFromHostToDevice(gs.cudaData,scores.cpuData,scores.GetBytes());
+            HybridMoeDecodeStep step;step.Begin(weights[0].data(),weights[0].size(),topk);
+            Require(graph.Launch(),"EXL3 multirow full graph replay");
+            Require(cudaDeviceSynchronize()==cudaSuccess,"EXL3 multirow graph completion");step.Finish();
+            for(int l=0;l<layers;++l) {
+                std::vector<uint16_t> actual(rows*k);FastllmCudaCopyFromDeviceToHost(actual.data(),outputs[l].cudaData,rows*k*2);
+                std::vector<float> cpu(rows*topk*k),gpu(rows*topk*k);
+                std::vector<int> cpuOwners(rows*topk,-1);
+                NumasMoeVerifyExpertsWithOverlap(reinterpret_cast<uint16_t *>(x.cpuData),cpu.data(),rows,
+                    weights[l].data(),weights[l].size(),reinterpret_cast<int *>(ids.cpuData),cpuOwners.data(),
+                    reinterpret_cast<float *>(scores.cpuData),topk,l,.01f,true,32,{},nullptr,true);
+                for(int at=0;at<topk;++at) {
+                    Data oneId(INT32,{rows,1}),oneScore(FLOAT32,{rows,1}),one;
+                    oneId.Allocate(false);oneScore.Allocate(false);
+                    for(int row=0;row<rows;++row) {
+                        reinterpret_cast<int *>(oneId.cpuData)[row]=reinterpret_cast<int *>(ids.cpuData)[row*topk+at];
+                        reinterpret_cast<float *>(oneScore.cpuData)[row]=reinterpret_cast<float *>(scores.cpuData)[row*topk+at];
+                    }
+                    oneId.ToDevice(CUDA,{0});oneScore.ToDevice(CUDA,{0});
+                    Require(FastllmCudaExl3Moe(gx,one,oneId,oneScore,gpuWeights[l].data(),gpuWeights[l].size(),.01f),"EXL3 multirow GPU route oracle");
+                    one.ToDevice(CPU);
+                    for(int row=0;row<rows;++row)std::memcpy(gpu.data()+size_t(row*topk+at)*k,reinterpret_cast<float *>(one.cpuData)+row*k,k*4);
+                }
+                auto check=[&](const uint16_t *observed) {
+                    for(int row=0;row<rows;++row) {
+                        std::vector<int> order(topk);for(int at=0;at<topk;++at)order[at]=row*topk+at;
+                        std::stable_sort(order.begin(),order.end(),[&](int a,int b){return reinterpret_cast<int *>(ids.cpuData)[a]<reinterpret_cast<int *>(ids.cpuData)[b];});
+                        double best=1e100,norm=0,bestNorm=0;
+                        for(int mask=0;mask<(1<<topk);++mask) {
+                            double error=0;norm=0;
+                            for(int c=0;c<k;++c) {
+                                float sum=0;
+                                for(int route:order)sum+=(mask&(1<<(route%topk))?gpu:cpu)[size_t(route)*k+c];
+                                uint32_t a=uint32_t(observed[row*k+c])<<16,b=uint32_t(Float32ToBFloat16RNEBits(sum))<<16;
+                                float av,bv;std::memcpy(&av,&a,4);std::memcpy(&bv,&b,4);
+                                Require(std::isfinite(av)&&std::isfinite(bv),"Nonfinite EXL3 multirow output");
+                                error+=double(av-bv)*(av-bv);norm+=double(bv)*bv;
+                            }
+                            if(error<best){best=error;bestNorm=norm;}
+                        }
+                        const double relativeL2=std::sqrt(best/std::max(bestNorm,1e-30));
+                        maxRelativeL2=std::max(maxRelativeL2,relativeL2);
+                        // The grouped-window and single-expert layouts can
+                        // cross a BF16 rounding boundary. Match the independent
+                        // projection test's 0.8% L2 bound, retaining finite checks.
+                        Require(relativeL2<.008,"EXL3 multirow result differs from valid CPU/GPU routes");
+                    }
+                };
+                check(actual.data());
+                // The noncaptured verify/draft path must use the same batched
+                // backend and preserve partials across sparse resident/staged calls.
+                if(turn<2) {
+                    Data eager;int callbacks=0;
+                    FastllmCudaMoeRouteScope scope(turn?FastllmMoeRoutePhase::Draft:FastllmMoeRoutePhase::Verify);
+                    HybridMoeDecodeStep eagerStep;eagerStep.Begin(weights[0].data(),weights[0].size(),topk);
+                    Require(RunHybridMoe(gx,gi,gs,eager,weights[l].data(),weights[l].size(),l,[&]{++callbacks;}),"EXL3 multirow eager hybrid");
+                    eager.ToDevice(CPU);eagerStep.Finish();Require(callbacks==1&&eager.dataType==BFLOAT16,"EXL3 multirow eager semantics");
+                    check(reinterpret_cast<uint16_t *>(eager.cpuData));
+                }
+            }
+        }
+        uint64_t after[8]{};fastllm_moe_cuda_cache_route_stats(0,after);
+        Require(after[4]>before[4]&&after[5]>before[5],"Multirow graph must exercise CPU and GPU routes");
+        std::cout<<"EXL3 MULTIROW GRAPH PASS rows="<<rows<<" hidden="<<k<<" inter="<<mid<<" max_l2="<<maxRelativeL2<<" staged_routes="<<(after[4]-before[4]-(after[2]-before[2]))<<std::endl;
+        graph.Reset();
+    }
+}
+
 static void CheckHybrid() {
     constexpr int layers=2,experts=8,topk=3;
     const bool large=std::getenv("EXL3_TEST_LARGE")!=nullptr;
@@ -160,7 +258,7 @@ static void CheckHybrid() {
         for(int i=0;i<rows*k;++i) {double a=reinterpret_cast<float *>(reference.cpuData)[i],b=reinterpret_cast<float *>(actual.cpuData)[i];err+=(a-b)*(a-b);norm+=a*a;}
         Require(called==1&&std::sqrt(err/std::max(norm,1e-30))<1e-5,"Prefill differs from original CUDA projections");
     }
-    if(std::getenv("EXL3_TEST_FULLGRAPH")) {
+    {
         Data gx,gi,gs;gx.CopyFrom(input);gi.CopyFrom(index);gs.CopyFrom(score);
         for(auto *v:{&gx,&gi,&gs})v->ToDevice(CUDA,std::vector<int>{0});
         std::array<Data,layers> outputs;
@@ -221,6 +319,7 @@ static void CheckHybrid() {
         if(large)Require(staged>0,"Large full graph must exercise staged DMA experts");
         graph.Reset();std::cout<<"EXL3 FULL GRAPH PASS: two mixed-bitrate layers, changing inputs/routes, CPU/GPU mixtures"<<std::endl;
     }
+    CheckVerifierRows(weights,gpuWeights,k,mid);
     FastllmCudaReleaseMoeCache(weights[0].data(),weights[0].size());
     std::cout<<"EXL3 HYBRID PASS: heterogeneous layers, cold/hot cache, changing routes, exact CPU boundaries"<<std::endl;
 }

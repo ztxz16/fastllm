@@ -73,3 +73,12 @@ upstream hashes and both MIT license files above remain unchanged.
   switch. Existing architecture and numerical fallback kernels remain available.
 - Name ExLlamaV3 as the primary algorithm reference while retaining the Maya
   import provenance, local modifications and both MIT license files.
+
+2026-11-07 multi-row verification and draft integration (Fastllm local changes):
+- Reuse the imported grouped-window MoE kernels for multi-row activations,
+  including native BF16 input, indirect matrix pointers and BF16 boundaries.
+- Add compact weighted per-route outputs and optional missing-route preservation;
+  keep resident/staged window scratch independent during graph replay.
+- Fastllm's adapter groups repeated expert pointers on the GPU and reuses the
+  ordinary hybrid scheduler for verifier and draft rows. No new upstream code
+  is imported; both MIT licenses and the pinned import hashes are retained.

@@ -24,9 +24,9 @@ bool Enabled() {
 #endif
 }
 struct Workspace {
-    Data plan{INT8}, h{FLOAT32};
+    Data plan{INT8}, h{FLOAT32}, part{FLOAT32}, groups{INT8}, scores{FLOAT32};
     explicit Workspace(int dev) {
-        for (Data *d : {&plan, &h}) { d->dataDevice = DataDevice::CUDA; d->dataDeviceIds = {dev}; }
+        for (Data *d : {&plan, &h, &part, &groups, &scores}) { d->dataDevice = DataDevice::CUDA; d->dataDeviceIds = {dev}; }
     }
 };
 Workspace &Work(int k, int n, int rows, int topk = 0) {
@@ -84,18 +84,109 @@ __global__ void CachePlan(const uint8_t *records, const int *slots, const uint64
             records + (offsets ? offsets[slot] : size_t(slot) * stride));
     }
 }
+
+// At most eight rows with eight routes each. Normalize the scheduler's compact
+// route map and group equal device records without a host readback. Padded
+// entries retain the upstream window ABI (token * 8 + top-k slot).
+__global__ void WindowPlan(const int *selection, const float *scores, int rows, int topk,
+        const unsigned long long *lookup, int experts, const uint8_t *records,
+        const uint64_t *offsets, size_t stride, const int *routeMap, int routeCount,
+        unsigned long long *plan, float *weights, unsigned long long *groupPointers,
+        int *starts, int *entries, int *groupCount) {
+    __shared__ unsigned long long pointers[64];
+    __shared__ int leaders[64], counts[64], positions[64];
+    const int e = threadIdx.x, row = e / 8, lane = e % 8;
+    unsigned long long ptr = 0;
+    if (row < rows && lane < topk) {
+        const int route = row * topk + lane;
+        int selected = route;
+        if (routeMap) {
+            selected = -1;
+            for (int i = 0; i < routeCount; ++i)
+                if (routeMap[i] == route) { selected = i; break; }
+        }
+        const int id = selected < 0 ? -1 : selection[selected];
+        if (id >= 0) {
+            if (lookup) ptr = id < experts ? lookup[id] : 0;
+            else ptr = reinterpret_cast<unsigned long long>(records + (offsets ? offsets[id] : size_t(id) * stride));
+        }
+        weights[e] = scores[route];
+    } else if (row < rows) weights[e] = 0;
+    if (row < rows) plan[e] = ptr;
+    pointers[e] = ptr;
+    __syncthreads();
+    int first = e, rank = 0, count = 0;
+    if (ptr) for (int i = 0; i < rows * 8; ++i) if (pointers[i] == ptr) {
+        first = min(first, i); rank += i < e; ++count;
+    }
+    leaders[e] = ptr ? first : -1;
+    counts[e] = count;
+    __syncthreads();
+    if (e == 0) {
+        int groups = 0, cursor = 0;
+        for (int i = 0; i < rows * 8; ++i) if (leaders[i] == i) {
+            groupPointers[groups] = pointers[i]; starts[groups++] = cursor;
+            positions[i] = cursor; cursor += counts[i];
+        }
+        starts[groups] = cursor; *groupCount = groups;
+    }
+    __syncthreads();
+    if (ptr) entries[positions[first] + rank] = e;
+}
+
+bool Window(const Data &input, const int *selection, const float *scores, int topk,
+        int mid, float limit, const maya::ExpertLayout &layout, const maya::MixedLayouts &mix,
+        bool indirect, const unsigned long long *lookup, int experts, const uint8_t *records,
+        const uint64_t *offsets, size_t stride, const int *routeMap, int routeCount,
+        float *output, bool routeOutput, bool preserveMissing, int scratchLane) {
+    const int rows = input.dims[0], k = input.dims[1], capacity = rows * 8;
+    auto &work = Work(k, mid, rows, -128-16*scratchLane-topk);
+    work.plan.Resize({capacity * int(sizeof(unsigned long long))});
+    work.scores.Resize({capacity});
+    work.h.Resize({capacity, mid}); work.part.Resize({capacity, k});
+    work.groups.Resize({capacity * int(sizeof(unsigned long long)) + (2*capacity+2) * int(sizeof(int))});
+    for (auto *d : {&work.plan, &work.scores, &work.h, &work.part, &work.groups}) d->Allocate(false);
+    auto *plan = static_cast<unsigned long long *>(work.plan.cudaData);
+    auto *groupPointers = static_cast<unsigned long long *>(work.groups.cudaData);
+    auto *starts = reinterpret_cast<int *>(groupPointers + capacity);
+    auto *entries = starts + capacity + 1, *groupCount = entries + capacity;
+    auto *weights = static_cast<float *>(work.scores.cudaData);
+    WindowPlan<<<1,64,0,cudaStreamPerThread>>>(selection,scores,rows,topk,lookup,experts,records,
+        offsets,stride,routeMap,routeCount,plan,weights,groupPointers,starts,entries,groupCount);
+    maya::WinArgs a;
+    a.T=rows; a.k=topk; a.n_embd=k; a.n_ff=mid; a.limit=limit;
+    a.grp_ptr=groupPointers; a.grp_start=starts; a.grp_ent=entries; a.n_groups=groupCount;
+    a.plan_ptr=plan; a.plan_w=weights; a.lay=layout; a.mix=mix; a.indirect=indirect;
+    a.x16=static_cast<const uint16_t *>(input.cudaData); a.x_bf16=true; a.x_stride=k;
+    a.h=static_cast<float *>(work.h.cudaData); a.part=static_cast<float *>(work.part.cudaData);
+    a.out=output; a.out_stride=k; a.round_bf16=true; a.route_output=routeOutput;
+    a.preserve_missing=preserveMissing; a.scratch_lane=scratchLane;
+    return maya::win_experts(a,cudaStreamPerThread) && cudaGetLastError()==cudaSuccess;
+}
+
 }
 
 bool FastllmCudaExl3MayaCache(const fastllm::Data &input, const uint8_t *records,
     const int32_t *slots, const uint64_t *offsets, size_t stride, size_t downOffset,
     int inter, int gateBits, int downBits, const float *scores, int topk,
-    float limit, float *perExpert, int workspace) {
+    float limit, float *perExpert, int workspace, const int32_t *routeMap, int routeCount, bool preserveMissing) {
     using namespace fastllm;
     if (!Enabled() || input.dataType != BFLOAT16 || input.dims.size() != 2 ||
         input.dims[0] < 1 || input.dims[0] > 8 || topk < 1 || topk > 8 ||
         !maya::k2_supported(gateBits,2) || !maya::k2_supported(downBits,2)) return false;
     const int k = input.dims[1], rows = input.dims[0];
     if (k < 128 || inter < 128 || k > 8192 || inter > 8192 || k%128 || inter%128) return false;
+    if (rows > 1 || routeMap || preserveMissing) {
+        auto layout = Layout(k, inter, gateBits, downBits);
+        const size_t offsetsByRole[3] = {0, Exl3PartBytes(inter,k,gateBits), downOffset};
+        for (int role=0; role<3; ++role) {
+            layout.trellis[role] += offsetsByRole[role];
+            layout.suh[role] += offsetsByRole[role]; layout.svh[role] += offsetsByRole[role];
+        }
+        return Window(input, slots, scores, topk, inter, limit, layout, {}, false,
+            nullptr, 0, records, offsets, stride, routeMap, routeCount,
+            perExpert, true, preserveMissing, 1+workspace);
+    }
     auto &work = Work(k, inter, rows, -topk-16*workspace);
     work.plan.Resize({rows*topk*int(sizeof(unsigned long long))}); work.plan.Allocate(false);
     work.h.Resize({rows*topk,inter}); work.h.Allocate(false);
@@ -108,16 +199,12 @@ bool FastllmCudaExl3MayaCache(const fastllm::Data &input, const uint8_t *records
         a.lay.trellis[role]+=roleOffset[role];
         a.lay.suh[role]+=roleOffset[role]; a.lay.svh[role]+=roleOffset[role];
     }
-    // Keep every selected expert in one upstream launch. The extension only
-    // changes the final output layout; the shared cache owns route reduction.
-    for (int row=0;row<rows;++row) {
-        const int at=row*topk;
-        a.plan_ptr=plan+at; a.plan_w=scores+at;
-        a.x16=static_cast<const uint16_t *>(input.cudaData)+size_t(row)*k; a.x_bf16=true;
-        auto *hidden=static_cast<float *>(work.h.cudaData)+size_t(at)*inter;
-        maya::moe_gate_up(a,nullptr,hidden,cudaStreamPerThread);
-        maya::moe_down(a,hidden,nullptr,perExpert+size_t(at)*k,cudaStreamPerThread);
-    }
+    // Multi-row requests use Window above; keep the single-row specialization.
+    a.plan_ptr=plan; a.plan_w=scores;
+    a.x16=static_cast<const uint16_t *>(input.cudaData); a.x_bf16=true;
+    auto *hidden=static_cast<float *>(work.h.cudaData);
+    maya::moe_gate_up(a,nullptr,hidden,cudaStreamPerThread);
+    maya::moe_down(a,hidden,nullptr,perExpert,cudaStreamPerThread);
     return cudaGetLastError()==cudaSuccess;
 }
 
@@ -247,6 +334,13 @@ bool FastllmCudaExl3MayaMoe(const fastllm::Data &input, fastllm::Data &output,
             FastllmCudaCopyFromHostToDevice(d.table.cudaData,data.data(),d.table.GetBytes());
         }
         dir=entry;
+    }
+    if (rows > 1) {
+        if (output.dataType != FLOAT32) { output.FreeSpace(); output.dataType=FLOAT32; }
+        output.Resize({rows,k}); output.ToDevice(CUDA,{device},false); output.Allocate(false);
+        return Window(input, static_cast<const int *>(index.cudaData), static_cast<const float *>(score.cudaData),
+            topk, mid, limit, dir->lay, dir->mix, true, dir->lookup, experts,
+            nullptr, nullptr, 0, nullptr, 0, static_cast<float *>(output.cudaData), false, false, 0);
     }
     auto stream=cudaStreamPerThread;
     auto &work=Work(k,mid,rows,topk);

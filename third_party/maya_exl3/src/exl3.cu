@@ -932,6 +932,8 @@ struct KWin {
     size_t cpu_stride;
     const int* cpu_flag;
     const float* x;
+    const uint16_t* x16;
+    bool x_bf16, indirect, round_bf16, route_output, preserve_missing;
     size_t x_stride;
     float* h;            // [T * 8][n_ff]: the gate's values, then the swiglu
     float* u;            // [T * 8][n_ff]: the up's values
@@ -961,14 +963,19 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) win_gu_kernel(const KWin a) {
     const int grp = blockIdx.y, g = blockIdx.x, r = blockIdx.z;
 #endif
     if (grp >= *a.n_groups) return;
-    const uint8_t* blob = (const uint8_t*) a.grp_ptr[grp];
+    const uint8_t* blob = projection_base(a.grp_ptr[grp], r, a.indirect);
     const int warp = threadIdx.x >> 5;
     const int m0 = a.grp_start[grp], m1 = a.grp_start[grp + 1];
     float* dst = r == 0 ? a.h : a.u;
     for (int mm = m0; mm < m1; mm += kTok) {
         const int nc = min(kTok, m1 - mm);
         Xin x;
-        if (warp < nc) x.f = a.x + (size_t) (a.grp_ent[mm + warp] >> 3) * a.x_stride;
+        if (warp < nc) {
+            const size_t offset = (size_t) (a.grp_ent[mm + warp] >> 3) * a.x_stride;
+            x.f = a.x != nullptr ? a.x + offset : nullptr;
+            x.h = a.x16 != nullptr ? a.x16 + offset : nullptr;
+            x.bf16 = a.x_bf16;
+        }
 #if defined(EXL3_SEP_DEV)
         block_gemv<K2, cb>((const uint32_t*) (blob + a.tr[r]), a.n_ff / 16, g * 8, sp * a.gkr,
                           min(a.n_embd, (sp + 1) * a.gkr), x, (const uint16_t*) (blob + a.suh[r]), nc, sm);
@@ -990,7 +997,7 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) win_gu_kernel(const KWin a) {
     if (threadIdx.x < kCols)
         for (int m = m0; m < m1; ++m) {
             const size_t row = (size_t) a.grp_ent[m] * a.n_ff + g * kCols + threadIdx.x;
-            a.h[row] = swiglu(*(volatile const float*) &a.h[row], *(volatile const float*) &a.u[row], a.limit);
+            a.h[row] = swiglu_boundary(*(volatile const float*) &a.h[row], *(volatile const float*) &a.u[row], a.limit, a.round_bf16);
         }
 }
 
@@ -1003,7 +1010,7 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) win_down_kernel(const KWin a) {
     const int sp = blockIdx.z;
 #endif
     if (grp >= *a.n_groups) return;
-    const uint8_t* blob = (const uint8_t*) a.grp_ptr[grp];
+    const uint8_t* blob = projection_base(a.grp_ptr[grp], 2, a.indirect);
     const int warp = threadIdx.x >> 5;
     const int m0 = a.grp_start[grp], m1 = a.grp_start[grp + 1];
     for (int mm = m0; mm < m1; mm += kTok) {
@@ -1035,8 +1042,11 @@ __global__ void __launch_bounds__(kCols) win_combine_kernel(const KWin a) {
     float p[8];
     for (int i = 0; i < a.k; ++i) {
         const int e = t * 8 + i;
-        p[i] = a.plan_ptr[e] != 0ull ? a.part[(size_t) e * a.n_embd + r] : 0.0f;
+        p[i] = a.plan_ptr[e] != 0ull ? bf16_boundary(a.part[(size_t) e * a.n_embd + r], a.round_bf16) : 0.0f;
+        if (a.route_output && (!a.preserve_missing || a.plan_ptr[e] != 0ull))
+            a.out[((size_t) t * a.k + i) * a.n_embd + r] = a.plan_w[e] * p[i];
     }
+    if (a.route_output) return;
     a.out[(size_t) t * a.out_stride + r] =
         combine(a.plan_w + t * 8, p, a.k,
                 a.cpu_flag != nullptr && a.cpu_flag[t] ? a.cpu_part + (size_t) t * a.cpu_stride + r : nullptr,
@@ -1052,7 +1062,7 @@ __global__ void __launch_bounds__(kCols) moe_swiglu_kernel(const KMoe a) {
     if (a.plan_ptr[ei] == 0ull) return;
     if (a.skip != nullptr && *a.skip) return;
     const size_t row = (size_t) ei * a.n_ff + blockIdx.x * kCols + threadIdx.x;
-    a.h[row] = swiglu(a.h[row], a.u[row], a.limit);
+    a.h[row] = swiglu_boundary(a.h[row], a.u[row], a.limit, a.round_bf16);
 }
 // grid (n_embd / 128): moe_down_kernel's combine
 __global__ void __launch_bounds__(kCols) moe_combine_kernel(const KMoe a) {
@@ -1069,7 +1079,7 @@ __global__ void __launch_bounds__(kCols) win_swiglu_kernel(const KWin a) {
     if (grp >= *a.n_groups) return;
     for (int m = a.grp_start[grp]; m < a.grp_start[grp + 1]; ++m) {
         const size_t row = (size_t) a.grp_ent[m] * a.n_ff + blockIdx.x * kCols + threadIdx.x;
-        a.h[row] = swiglu(a.h[row], a.u[row], a.limit);
+        a.h[row] = swiglu_boundary(a.h[row], a.u[row], a.limit, a.round_bf16);
     }
 }
 // whether this GPU's device code runs those pieces as kernels of their own (EXL3_SEP_DEV above): gfx942 / gfx950,
@@ -1136,7 +1146,7 @@ __global__ void __launch_bounds__(kCols) win_gu_red_kernel(const KWin a) {
     __shared__ float red[2][kCols];
     const int grp = blockIdx.y, g = blockIdx.x, warp = threadIdx.x >> 5;
     if (grp >= *a.n_groups) return;
-    const uint8_t* blob = (const uint8_t*) a.grp_ptr[grp];
+    const uint8_t* blob = projection_base(a.grp_ptr[grp], warp < 2 ? warp : 0, a.indirect);
     for (int m = a.grp_start[grp]; m < a.grp_start[grp + 1]; ++m) {
         const size_t e = (size_t) a.grp_ent[m];
         for (int r = 0; r < 2; ++r)
@@ -1153,7 +1163,7 @@ __global__ void __launch_bounds__(kCols) win_down_red_kernel(const KWin a) {
     __shared__ float red[kCols];
     const int grp = blockIdx.y, g = blockIdx.x;
     if (grp >= *a.n_groups) return;
-    const uint8_t* blob = (const uint8_t*) a.grp_ptr[grp];
+    const uint8_t* blob = projection_base(a.grp_ptr[grp], 2, a.indirect);
     for (int m = a.grp_start[grp]; m < a.grp_start[grp + 1]; ++m) {
         const size_t e = (size_t) a.grp_ent[m];
         red[threadIdx.x] = split_sum(a.xp + e * a.dS * a.n_embd + g * kCols + threadIdx.x, a.dS, a.n_embd);
@@ -1302,14 +1312,19 @@ __global__ void EXL3_BOUNDS(2) win_gu_mix_kernel(const KWin a, const KMix mx) {
     if (grp >= *a.n_groups) return;
     const unsigned long long ptr = a.grp_ptr[grp];
     const int c = mix_cls(mx, ptr), k2 = mx.k2[c][r];
-    const uint8_t* blob = (const uint8_t*) ptr;
+    const uint8_t* blob = projection_base(ptr, r, a.indirect);
     const int warp = threadIdx.x >> 5;
     const int m0 = a.grp_start[grp], m1 = a.grp_start[grp + 1];
     float* dst = r == 0 ? a.h : a.u;
     for (int mm = m0; mm < m1; mm += kTok) {
         const int nc = min(kTok, m1 - mm);
         Xin x;
-        if (warp < nc) x.f = a.x + (size_t) (a.grp_ent[mm + warp] >> 3) * a.x_stride;
+        if (warp < nc) {
+            const size_t offset = (size_t) (a.grp_ent[mm + warp] >> 3) * a.x_stride;
+            x.f = a.x != nullptr ? a.x + offset : nullptr;
+            x.h = a.x16 != nullptr ? a.x16 + offset : nullptr;
+            x.bf16 = a.x_bf16;
+        }
         mix_gemv<cb>(k2, (const uint32_t*) (blob + mx.tr[c][r]), a.n_ff / 16, g * 8, 0, a.n_embd, x,
                      (const uint16_t*) (blob + mx.suh[c][r]), nc, sm);
         if (warp < nc)
@@ -1321,7 +1336,7 @@ __global__ void EXL3_BOUNDS(2) win_gu_mix_kernel(const KWin a, const KMix mx) {
     if (threadIdx.x < kCols)
         for (int m = m0; m < m1; ++m) {
             const size_t row = (size_t) a.grp_ent[m] * a.n_ff + g * kCols + threadIdx.x;
-            a.h[row] = swiglu(*(volatile const float*) &a.h[row], *(volatile const float*) &a.u[row], a.limit);
+            a.h[row] = swiglu_boundary(*(volatile const float*) &a.h[row], *(volatile const float*) &a.u[row], a.limit, a.round_bf16);
         }
 }
 template <int cb>
@@ -1331,7 +1346,7 @@ __global__ void EXL3_BOUNDS(2) win_down_mix_kernel(const KWin a, const KMix mx) 
     if (grp >= *a.n_groups) return;
     const unsigned long long ptr = a.grp_ptr[grp];
     const int c = mix_cls(mx, ptr), k2 = mx.k2[c][2];
-    const uint8_t* blob = (const uint8_t*) ptr;
+    const uint8_t* blob = projection_base(ptr, 2, a.indirect);
     const int warp = threadIdx.x >> 5;
     const int m0 = a.grp_start[grp], m1 = a.grp_start[grp + 1];
     for (int mm = m0; mm < m1; mm += kTok) {
@@ -2962,7 +2977,8 @@ void moe_down(const MoeArgs& a, const float* h, const float* sh_out, float* out,
 }
 
 bool win_experts(const WinArgs& a, cudaStream_t s) {
-    if (a.mix.n == 0) EXL3_LEGACY_MOE(a, win_experts(a, s));
+    if (a.mix.n == 0 && !a.indirect && !a.round_bf16 && !a.route_output && !a.x16)
+        EXL3_LEGACY_MOE(a, win_experts(a, s));
     if (a.mix.n > 0 && !mixed_ok(a.mix, "win_experts")) return false;
     if (a.T < 1 || a.k < 1 || a.k > 8 || a.n_embd % kCols != 0 || a.n_ff % kCols != 0 || a.n_embd > kMaxMoeK ||
         a.n_ff > kMaxMoeK || (a.mix.n == 0 && a.lay.k2[0] != a.lay.k2[1]) || a.h == nullptr || a.part == nullptr ||
@@ -2971,7 +2987,7 @@ bool win_experts(const WinArgs& a, cudaStream_t s) {
                      a.k, a.n_embd, a.n_ff, a.lay.k2[0] / 2.0, a.lay.k2[1] / 2.0);
         return false;
     }
-    Scratch* sc = scratch(s);
+    Scratch* sc = scratch(s, a.scratch_lane);
     if (sc == nullptr) return false;
     const int groups = a.T * a.k;   // at most (the blocks past the real count return at once)
     if ((size_t) a.T * 8 * a.n_ff > kUFloats || kCntGU + (size_t) groups * (a.n_ff / kCols) > kCounters) {
@@ -2989,6 +3005,9 @@ bool win_experts(const WinArgs& a, cudaStream_t s) {
     w.cpu_stride = a.cpu_stride != 0 ? a.cpu_stride : (size_t) a.n_embd;
     w.cpu_flag = a.cpu_flag;
     w.x = a.x;
+    w.x16 = a.x16; w.x_bf16 = a.x_bf16;
+    w.indirect = a.indirect; w.round_bf16 = a.round_bf16;
+    w.route_output = a.route_output; w.preserve_missing = a.preserve_missing;
     w.x_stride = a.x_stride;
     w.h = a.h;
     w.u = sc->u;

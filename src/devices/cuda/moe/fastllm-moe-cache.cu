@@ -3876,6 +3876,10 @@ bool FastllmCudaMoeExpertParallelReadback(FastllmCudaMoeExpertParallel &state, i
 static bool ComputeBatchExperts(const fastllm::Data &input, fastllm::Data &activation,
         fastllm::Data &output, const OffloadLayout &layout, const FastllmCudaMoeGGUFCacheView &view,
         const float *scores, int topk, float *perExpert, bool grouped = false) {
+    if (layout.weightType == fastllm::EXL3)
+        return FastllmCudaExl3Cache(input, view.records, view.routeSlots, view.slotOffsets,
+            layout.recordStride, layout.downOffset, layout.inter, layout.gateBlockK, layout.downBlockK,
+            scores, topk, layout.swigluLimit, perExpert, 0, view.routeMap, view.routeCount, true);
     if (layout.weightType == fastllm::DATA_GGUF_FORMAT)
         return ComputeGGUFExperts(input, activation, output, layout, view, scores, topk, perExpert);
     if (layout.glm5)
@@ -5117,7 +5121,7 @@ static bool MergeMOEHybrid(const fastllm::Data &input,
         if (!SupportedCacheInput(input)) return false;
         int table = -1;
         auto *group = FindHybridGroup(weights, weightsBatch, &table);
-        if (!group || group->layout.weightType==fastllm::EXL3) return false;
+        if (!group || (group->layout.weightType==fastllm::EXL3 && (input.dims[0]>8 || index.dims.back()>8))) return false;
         if (group->layout.glm5 && group->layout.weightType == fastllm::DATA_GGUF_FORMAT) {
             auto *cache = GetDeviceCache(*group);
             return cache && TryCooperativeMoe(*group, *cache, table,
@@ -5596,7 +5600,8 @@ bool FastllmCudaMergeMOEHybrid(const fastllm::Data &input,
         const fastllm::Data &index, const fastllm::Data &score,
         fastllm::Data &output, fastllm::Data **weights, int weightsBatch, int layer,
         const std::function<void()> &launchParallel) {
-    if (weights && weightsBatch >= 4 && weights[2] && input.dims.size() == 2 && input.dims[0] > 1) {
+    if (weights && weightsBatch >= 4 && weights[2] && input.dims.size() == 2 && input.dims[0] > 1 &&
+        (input.dims[0] > 8 || (routePhase != FastllmMoeRoutePhase::Verify && routePhase != FastllmMoeRoutePhase::Draft))) {
         const auto *backend = FindExpertCacheBackend(weights[2]->dataType);
         if (backend && backend->prefill)
             return backend->prefill(input, index, score, output, weights, weightsBatch, launchParallel);
@@ -5882,7 +5887,7 @@ void *FastllmCudaNativeMoeGraphOwner(fastllm::Data **weights, int weightsBatch, 
     if (!standard && (!layout.deepSeekV41 ||
         (layout.weightType != fastllm::NVFP4_BLOCK_32_E8M0 &&
          layout.weightType != fastllm::FP8_E4M3_BLOCK_128 &&
-         !(layout.weightType==fastllm::EXL3 && rows==1 && Exl3HybridShape(layout)) && !supportedGGUF))) return nullptr;
+         !(layout.weightType==fastllm::EXL3 && rows<=8 && Exl3HybridShape(layout)) && !supportedGGUF))) return nullptr;
     // Preserve the existing readiness fence for non-Qwen models.
     auto *cache = GetDeviceCache(*group, !standard);
     if (!cache || !NativeMailboxOwnsLayer(*group, *cache, table)) return nullptr;

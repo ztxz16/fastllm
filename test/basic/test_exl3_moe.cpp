@@ -75,7 +75,7 @@ int main(){
     SetThreads(8);
     for(int repeat=0;repeat<2;++repeat)for(int rows:{1,3,8}){Check(rows,256,128,true);Check(rows,5120,2304,false);}
     // Uniform half-integer / high bitrates use Maya's non-mixed kernels.
-    for(int bits:{2,3,4,5,6,7,8,10,12,14,16})Check(1,256,128,true,false,bits);
+    for(int bits:{2,3,4,5,6,7,8,10,12,14,16})for(int rows:{1,3,8})Check(rows,256,128,true,false,bits);
     Check(9,256,128,false,true);
     std::cout<<"EXL3 MOE PASS: mixed bitrates, clamping, graph replay, cache retirement"<<std::endl;
 }

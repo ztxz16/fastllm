@@ -13,7 +13,7 @@ bool FastllmCudaExl3MayaGrouped(const fastllm::Data &, const fastllm::Data &, fa
 bool FastllmCudaExl3MayaLinearShared(const fastllm::Data &, fastllm::Data *const *, fastllm::Data *const *, int);
 bool FastllmCudaExl3MayaLinear(const fastllm::Data &, fastllm::Data &, const fastllm::Data &, fastllm::Data &);
 bool FastllmCudaExl3MayaMoe(const fastllm::Data &, fastllm::Data &, const fastllm::Data &, const fastllm::Data &, fastllm::Data **, int, float);
-bool FastllmCudaExl3MayaCache(const fastllm::Data &, const uint8_t *, const int32_t *, const uint64_t *, size_t, size_t, int, int, int, const float *, int, float, float *, int);
+bool FastllmCudaExl3MayaCache(const fastllm::Data &, const uint8_t *, const int32_t *, const uint64_t *, size_t, size_t, int, int, int, const float *, int, float, float *, int, const int32_t *, int, bool);
 void FastllmCudaReleaseExl3Maya(const fastllm::Data *);
 #endif
 
@@ -297,13 +297,13 @@ __global__ void MoeGateAndPrepareDown(const float *partial, const int *routes, c
     downInput[size_t(task) * mid + c] = __half2float(__float2half_rn(Rotate(activated, shared)));
 }
 __global__ void MoeFinish(const float *partial, const int *routes, const float *scores,
-                          const Exl3Projection *weights, float *output, int k, int topk, int splits, float *perExpert = nullptr) {
+                          const Exl3Projection *weights, float *output, int k, int topk, int splits, float *perExpert = nullptr, bool preserveMissing = false) {
     __shared__ float shared[128];
     const int c = blockIdx.x * 128 + threadIdx.x, row = blockIdx.y;
     float total = 0;
     for (int route = 0; route < topk; ++route) {
         const int task = row * topk + route;
-        if (routes[task] < 0) { if (perExpert) perExpert[size_t(task)*k+c]=0; continue; }
+        if (routes[task] < 0) { if (perExpert && !preserveMissing) perExpert[size_t(task)*k+c]=0; continue; }
         float value = 0;
         for (int split = 0; split < splits; ++split)
             value += partial[(size_t(task) * splits + split) * k + c];
@@ -413,10 +413,15 @@ bool FastllmCudaExl3Moe(const fastllm::Data &input, fastllm::Data &output,
 namespace {
 __global__ void CacheDescriptors(const uint8_t *records, const int32_t *slots,
     const uint64_t *offsets, size_t stride, size_t downOffset, int k, int mid,
-    int gateBits, int downBits, int count, Exl3Projection *table, int *routes) {
+    int gateBits, int downBits, int count, Exl3Projection *table, int *routes, const int *routeMap, int routeCount) {
     const int at=threadIdx.x;
     if (at>=count) return;
-    const int slot=slots[at]; routes[at]=slot<0?-1:at;
+    int selected=at;
+    if (routeMap) {
+        selected=-1;
+        for (int i=0;i<routeCount;++i) if (routeMap[i]==at) {selected=i;break;}
+    }
+    const int slot=selected<0?-1:slots[selected]; routes[at]=slot<0?-1:at;
     if (slot<0) return;
     const auto *record=records+(offsets?offsets[slot]:size_t(slot)*stride);
     for(int part=0;part<3;++part) {
@@ -438,12 +443,12 @@ struct CacheWorkspace: MoeWorkspace {
 bool FastllmCudaExl3Cache(const fastllm::Data &input, const uint8_t *records,
     const int32_t *slots, const uint64_t *offsets, size_t stride, size_t downOffset,
     int mid, int gateBits, int downBits, const float *scores, int topk,
-    float limit, float *perExpert, int workspace) {
+    float limit, float *perExpert, int workspace, const int32_t *routeMap, int routeCount, bool preserveMissing) {
     if (input.dims.size()!=2 || input.dims[1]<128 || input.dims[1]%128 || mid<128 || mid%128 ||
         input.dataDevice!=fastllm::CUDA || !input.cudaData || !records || !slots || !scores || !perExpert || workspace<0 || workspace>1) return false;
 #ifdef FASTLLM_USE_MAYA_EXL3
     if(FastllmCudaExl3MayaCache(input,records,slots,offsets,stride,downOffset,mid,
-        gateBits,downBits,scores,topk,limit,perExpert,workspace)) return true;
+        gateBits,downBits,scores,topk,limit,perExpert,workspace,routeMap,routeCount,preserveMissing)) return true;
 #endif
     using namespace fastllm;
     if(input.dataType!=BFLOAT16 || input.dims.size()!=2 || input.dims[0]<1 || input.dims[0]>8 ||
@@ -459,7 +464,7 @@ bool FastllmCudaExl3Cache(const fastllm::Data &input, const uint8_t *records,
     for(auto *d:{&work.input,&work.gate,&work.down,&work.result,&work.table,&work.routes})d->Allocate(false);
     auto *table=static_cast<Exl3Projection *>(work.table.cudaData);auto *routes=static_cast<int *>(work.routes.cudaData);
     const auto stream=cudaStreamPerThread;
-    CacheDescriptors<<<1,64,0,stream>>>(records,slots,offsets,stride,downOffset,k,mid,gateBits,downBits,tasks,table,routes);
+    CacheDescriptors<<<1,64,0,stream>>>(records,slots,offsets,stride,downOffset,k,mid,gateBits,downBits,tasks,table,routes,routeMap,routeCount);
     MoePrepare<<<dim3(k/128,topk*2,rows),128,0,stream>>>(input.cudaData,input.dataType,routes,table,
         static_cast<float *>(work.input.cudaData),k,topk);
     MoeProduct<<<dim3(mid/128,gateSplits,tasks*2),128,0,stream>>>(static_cast<float *>(work.input.cudaData),
@@ -469,7 +474,7 @@ bool FastllmCudaExl3Cache(const fastllm::Data &input, const uint8_t *records,
     MoeProduct<<<dim3(k/128,downSplits,tasks),128,0,stream>>>(static_cast<float *>(work.down.cudaData),routes,table,
         static_cast<float *>(work.result.cudaData),mid,k,topk,downSplits,true);
     MoeFinish<<<dim3(k/128,rows),128,0,stream>>>(static_cast<float *>(work.result.cudaData),routes,scores,table,
-        nullptr,k,topk,downSplits,perExpert);
+        nullptr,k,topk,downSplits,perExpert,preserveMissing);
     return cudaGetLastError()==cudaSuccess;
 }
 

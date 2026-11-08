@@ -138,6 +138,9 @@ __global__ void ReduceStandardMailbox(const float *cpu, const float *resident, c
 __global__ void ReduceNativeScoredMailbox(const float *cpu, const float *resident,
         const float *staged, const int32_t *residentSlots, const int32_t *gpu,
         const int32_t *indices, __nv_bfloat16 *output, int hidden, int topk) {
+    const int row = blockIdx.y, base = row * topk;
+    cpu += size_t(base) * hidden; resident += size_t(base) * hidden; staged += size_t(base) * hidden;
+    residentSlots += base; gpu += base; indices += base; output += size_t(row) * hidden;
     __shared__ int order[16];
     if(threadIdx.x<topk) {
         const int r=threadIdx.x; int rank=0;
@@ -717,12 +720,13 @@ struct NativeMoeMailbox {
         if (layout.weightType==fastllm::EXL3) {
             // Resident, staged and shared experts have independent scratch;
             // their captured branches can execute concurrently.
-            fastllm::AssertInFastLLM(stream==cudaStreamPerThread && w.owner && w.rows==1,
+            fastllm::AssertInFastLLM(stream==cudaStreamPerThread && w.owner && w.rows<=8,
                 "EXL3 mailbox requires the full-graph compute stream");
             fastllm::AssertInFastLLM(FastllmCudaExl3Cache(w.compute->quantized,records,slots,
                 resident?w.owner->cache.slotOffsets:nullptr,layout.recordStride,layout.downOffset,
                 layout.inter,layout.gateBlockK,layout.downBlockK,scores,w.topk,layout.swigluLimit,
-                w.compute->partial+(resident?0:size_t(w.routes)*w.hidden),resident?0:1),"EXL3 graph expert compute failed");
+                w.compute->partial+(resident?0:size_t(w.routes)*w.hidden),resident?0:1,
+                w.rows>1?w.routeMap:nullptr,w.routes),"EXL3 graph expert compute failed");
             return;
         }
         if (resident && w.hidden % 256 == 0 && layout.inter % 32 == 0 && FastllmCudaRuntimeArch() == 120) {
@@ -821,7 +825,8 @@ struct NativeMoeMailbox {
             if (!PrepareCacheInput(layout,input,w.compute->quantized)) return nullptr;
             // Allocate/load both adapter paths before any captured node can
             // wait on host publication. Inactive routes do not read records.
-            if(cudaMemsetAsync(w.slots,255,(5*w.routes+1)*sizeof(int32_t),cudaStreamPerThread)!=cudaSuccess) return nullptr;
+            if(cudaMemsetAsync(w.slots,255,(w.rows>1?3*w.routes:5*w.routes+1)*sizeof(int32_t),cudaStreamPerThread)!=cudaSuccess) return nullptr;
+            if(w.routeMap && cudaMemsetAsync(w.routeMap,255,w.routes*sizeof(int32_t),cudaStreamPerThread)!=cudaSuccess) return nullptr;
             Compute(w,layout,cache.records,w.slots,static_cast<const float *>(score.cudaData),cudaStreamPerThread,true);
             Compute(w,layout,fullCopy->records,w.slots+w.routes,static_cast<const float *>(score.cudaData),cudaStreamPerThread,false);
             if(cudaStreamSynchronize(cudaStreamPerThread)!=cudaSuccess) return nullptr;
@@ -864,7 +869,7 @@ struct NativeMoeMailbox {
             } else if (layout.weightType == fastllm::DATA_GGUF_FORMAT) {
                 if (!ComputeGGUF(w, layout, cache.records, w.slots,
                         static_cast<const float *>(score.cudaData), true)) return false;
-            } else if (w.rows > 1 || layout.weightType == fastllm::FP8_E4M3_BLOCK_128) {
+            } else if (layout.weightType != fastllm::EXL3 && (w.rows > 1 || layout.weightType == fastllm::FP8_E4M3_BLOCK_128)) {
                 if (!ComputeBatch(w, layout, cache.records, w.slots, static_cast<const float *>(score.cudaData))) return false;
             } else Compute(w, layout, cache.records, w.slots, static_cast<const float *>(score.cudaData), cudaStreamPerThread, true);
             if (cudaEventRecordWithFlags(w.residentDone, cudaStreamPerThread, cudaEventRecordExternal) != cudaSuccess) return false;
@@ -921,16 +926,16 @@ struct NativeMoeMailbox {
             } else if (layout.weightType == fastllm::DATA_GGUF_FORMAT) {
                 if (!ComputeGGUF(w, layout, fullCopy->records, w.slots + w.routes,
                         static_cast<const float *>(score.cudaData), false)) return false;
-            } else if (w.rows > 1 || layout.weightType == fastllm::FP8_E4M3_BLOCK_128) {
+            } else if (layout.weightType != fastllm::EXL3 && (w.rows > 1 || layout.weightType == fastllm::FP8_E4M3_BLOCK_128)) {
                 if (!ComputeBatch(w, layout, fullCopy->records, w.slots + w.routes, static_cast<const float *>(score.cudaData))) return false;
-            } else Compute(w, layout, fullCopy->records, w.slots + topk, static_cast<const float *>(score.cudaData), cudaStreamPerThread);
+            } else Compute(w, layout, fullCopy->records, w.slots + w.routes, static_cast<const float *>(score.cudaData), cudaStreamPerThread);
             if (cudaEventRecordWithFlags(w.done, cudaStreamPerThread, cudaEventRecordExternal) != cudaSuccess) return false;
             if (FastllmCudaStreamUpdateCaptureDependencies(cudaStreamPerThread, residentTail.data(), residentTail.size(),
                     cudaStreamAddCaptureDependencies) != cudaSuccess) return false;
             WaitNativeMoe<<<1, 1, 0, cudaStreamPerThread>>>(&w.mapped->computed);
-            if (layout.weightType==fastllm::EXL3) ReduceNativeScoredMailbox<<<(w.hidden+255)/256,256,0,cudaStreamPerThread>>>(
-                w.mappedData+w.hidden,w.compute->partial,w.compute->partial+size_t(w.routes)*w.hidden,
-                w.slots,w.slots+2*w.routes,static_cast<const int32_t *>(index.cudaData),
+            if (layout.weightType==fastllm::EXL3) ReduceNativeScoredMailbox<<<dim3((w.hidden+255)/256,w.rows),256,0,cudaStreamPerThread>>>(
+                w.mappedData+w.rows*w.hidden,w.compute->partial,w.compute->partial+size_t(w.routes)*w.hidden,
+                w.rows>1?w.mapped->resident:w.slots,w.slots+2*w.routes,static_cast<const int32_t *>(index.cudaData),
                 static_cast<__nv_bfloat16 *>(output.cudaData),w.hidden,topk);
             else if (w.standard) ReduceStandardMailbox<<<dim3((w.hidden+255)/256, w.rows), 256, 0, cudaStreamPerThread>>>(
                 w.mappedData + w.rows * w.hidden, w.compute->partial, w.compute->partial + w.routes * w.hidden,

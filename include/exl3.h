@@ -57,9 +57,12 @@ bool FastllmCudaExl3Linear(const fastllm::Data &input, fastllm::Data &weight,
 // Opaque cache records retain the original trellis and scale bytes. Inactive
 // route slots are -1; each output row is the weighted result of that route.
 // Two bounded workspaces isolate parallel resident/staged graph branches.
+// Optional routeMap maps compact selected slots to original row/top-k routes;
+// preserveMissing leaves outputs belonging to another launch untouched.
 bool FastllmCudaExl3Cache(const fastllm::Data &input, const uint8_t *records,
     const int32_t *slots, const uint64_t *offsets, size_t stride, size_t downOffset,
     int inter, int gateBits, int downBits, const float *scores, int topk,
-    float limit, float *perExpert, int workspace = 0);
+    float limit, float *perExpert, int workspace = 0,
+    const int32_t *routeMap = nullptr, int routeCount = 0, bool preserveMissing = false);
 #endif
 #endif

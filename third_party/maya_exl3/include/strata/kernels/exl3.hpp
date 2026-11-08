@@ -169,6 +169,13 @@ struct WinArgs {
     size_t out_stride = 0;
     ExpertLayout lay;
     MixedLayouts mix;     // (n > 0: the experts' layouts by class - lay is not used)
+    // Fastllm: native activation and BF16 boundaries, matching MoeArgs.
+    const uint16_t* x16 = nullptr;
+    bool x_bf16 = false, indirect = false, round_bf16 = false;
+    // Weighted per-route output uses compact [T][k][n_embd] rows. Missing
+    // routes can be preserved when separate launches fill disjoint routes.
+    bool route_output = false, preserve_missing = false;
+    int scratch_lane = 0;
     int T = 0, k = 8, n_embd = 4096, n_ff = 2048;
     float limit = 0.0f;
     // (given) the combine first waits on the device until *wait_ptr == wait_val (the host's answer to the CPU lane's
