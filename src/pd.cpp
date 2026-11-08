@@ -245,19 +245,23 @@ void PDStateReader::End() {
 }
 
 struct PDPending {
+    struct Admission { std::shared_ptr<void> slot, tokens; };
     std::future<fastkv::Message> result;
     fastkv::Message request;
     std::string peer;
-    std::shared_ptr<void> slot, tokens;
+    std::shared_ptr<Admission> admission;
+    std::shared_ptr<fastkv::Cancellation> cancellation = std::make_shared<fastkv::Cancellation>();
     int length = 0;
     size_t reservation = 0;
     bool committed = false;
     std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    ~PDPending() { cancellation->Cancel(); }
 };
 struct PDRuntime {
     struct PrefillRequest {
         std::vector<int> input;
         std::promise<fastkv::Message> result;
+        std::shared_ptr<fastkv::Cancellation> cancellation;
         std::unique_ptr<ResponseContext> context;
         bool reserved = false;
         std::chrono::steady_clock::time_point queued = std::chrono::steady_clock::now();
@@ -295,9 +299,11 @@ struct PDRuntime {
         prefillCV.notify_all();
         if (prefillThread.joinable()) prefillThread.join();
     }
-    std::future<fastkv::Message> Prefill(std::vector<int> input) {
+    std::future<fastkv::Message> Prefill(std::vector<int> input,
+                                       std::shared_ptr<fastkv::Cancellation> cancellation) {
         auto request = std::make_shared<PrefillRequest>();
         request->input = std::move(input);
+        request->cancellation = std::move(cancellation);
         auto result = request->result.get_future();
         {
             std::lock_guard<std::mutex> lock(prefillMutex);
@@ -325,6 +331,7 @@ void PDRuntime::RunPrefill(basellm &model) {
             model.OnResponseContextRemoved(context.get());
         }
     };
+    const auto cancelled = std::make_exception_ptr(std::runtime_error("FastKV PD: request cancelled"));
     try {
         while (true) {
             std::vector<Request> admitted;
@@ -343,6 +350,12 @@ void PDRuntime::RunPrefill(basellm &model) {
                     }
                 }
                 if (stopping) break;
+                for (auto it = waiting.begin(); it != waiting.end();) {
+                    if ((*it)->cancellation->Cancelled()) {
+                        (*it)->result.set_exception(cancelled);
+                        it = waiting.erase(it);
+                    } else ++it;
+                }
                 while (!waiting.empty() && int(active.size() + admitted.size()) < batchRequests &&
                        waiting.front()->input.size() <= tokenCapacity - reserved) {
                     auto request = waiting.front(); waiting.pop_front();
@@ -355,8 +368,18 @@ void PDRuntime::RunPrefill(basellm &model) {
             // RPC handlers return futures immediately; network workers never
             // wait for the model or hold forwardLocker.
             std::lock_guard<std::mutex> lock(model.forwardLocker);
+            // Cancellation touches model state only on its execution lane,
+            // between completed forward calls. The service drains the future.
+            for (auto it = active.begin(); it != active.end();) {
+                if ((*it)->cancellation->Cancelled()) {
+                    retire(*it);
+                    (*it)->result.set_exception(cancelled);
+                    it = active.erase(it);
+                } else ++it;
+            }
             for (const auto &request : admitted) {
                 try {
+                    if (request->cancellation->Cancelled()) std::rethrow_exception(cancelled);
                     const auto restoreBegin = std::chrono::steady_clock::now();
                     fastkv::PrefixCache::Hit hit;
                     if (cache) hit = cache->Find(identity, request->input, request->input.size());
@@ -471,6 +494,11 @@ void PDRuntime::RunPrefill(basellm &model) {
             for (int i = 0; i < batch; ++i) {
                 auto request = active.front(); active.pop_front();
                 request->context->preTokens += lengths[i];
+                if (request->cancellation->Cancelled()) {
+                    retire(request);
+                    request->result.set_exception(cancelled);
+                    continue;
+                }
                 if (size_t(request->context->preTokens) != request->input.size()) {
                     active.push_back(request); // round-robin chunks, no long-request monopolization
                     continue;
@@ -625,8 +653,8 @@ void basellm::ConfigurePD(const json11::Json &config) {
     if (runtime->role == "decode") {
         Check(!runtime->peers.empty(), "decode needs a prefill execution group");
         runtime->routes.reset(new fastkv::PrefixCache(64 << 20, std::max(64, concurrent * 4)));
-        runtime->slots.reset(new fastkv::Budget(concurrent));
-        runtime->tokens.reset(new fastkv::Budget(runtime->tokenCapacity));
+        runtime->slots.reset(new fastkv::Budget(concurrent, "decode request slots"));
+        runtime->tokens.reset(new fastkv::Budget(runtime->tokenCapacity, "decode token budget"));
     } else {
         if (config["chunk_tokens"].is_number())
             runtime->chunk = config["chunk_tokens"].int_value();
@@ -654,8 +682,9 @@ void basellm::ConfigurePD(const json11::Json &config) {
                 std::min(runtime->batchRequests, prefillBatchPolicy.targetRequests) : runtime->batchRequests;
             runtime->waitMs = batching ? prefillBatchPolicy.maxWaitMs : 0;
             runtime->prefillThread = std::thread([this, raw = runtime.get()] { raw->RunPrefill(*this); });
-            runtime->service->StartAsync(config["listen"].string_value(), [this, raw = runtime.get()](
-                                                                         const fastkv::Message &request) {
+            runtime->service->StartAsync(config["listen"].string_value(),
+                [this, raw = runtime.get()](fastkv::Message request,
+                                           std::shared_ptr<fastkv::Cancellation> cancellation) {
                 fastkv::Reader reader(request.metadata);
                 Check(reader.U32() == 1 && reader.String() == raw->identity,
                       "incompatible checkpoint or state layout");
@@ -664,7 +693,7 @@ void basellm::ConfigurePD(const json11::Json &config) {
                 Check(request.buffers.empty() && !tokens.empty() && tokens.size() < size_t(max_positions),
                       "invalid prefill request");
                 Check(tokens.size() <= raw->tokenCapacity, "prompt exceeds the prefill token pool");
-                return raw->Prefill(std::move(tokens));
+                return raw->Prefill(std::move(tokens), std::move(cancellation));
             });
         }
     } catch (...) {
@@ -719,15 +748,20 @@ bool basellm::PollPD(ResponseContext *context) {
         // Admission precedes P work and receive allocation. Waiting requests
         // do not consume model pages or block the scheduler on a network call.
         try {
-            auto slot = pdRuntime->slots->Reserve(1);
-            auto tokens = pdRuntime->tokens->Reserve(pending->reservation);
-            pending->slot = std::move(slot);
-            pending->tokens = std::move(tokens);
-        } catch (const std::runtime_error &) {
+            if (!pending->admission) {
+                auto admission = std::make_shared<PDPending::Admission>();
+                admission->slot = pdRuntime->slots->Reserve(1);
+                admission->tokens = pdRuntime->tokens->Reserve(pending->reservation);
+                pending->admission = std::move(admission);
+            }
+        } catch (const fastkv::CapacityBusy &) {
             return false;
         }
         try {
-            pending->result = pdRuntime->service->Submit(pending->peer, std::move(pending->request));
+            // Transient transport pressure must preserve the prompt for retry.
+            // The Exchange also holds admission until cancellation/I/O drains.
+            pdRuntime->service->TrySubmit(pending->peer, pending->request, pending->result,
+                                          pending->cancellation, pending->admission);
         } catch (const std::exception &error) {
             std::cerr << "[FastKV PD] admission failed: " << error.what() << std::endl;
             context->error = ResponseContextErrorRuntime;

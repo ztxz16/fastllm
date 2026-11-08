@@ -197,7 +197,7 @@ static void TestQueuedTransfers() {
     port.Stop();
     SetMaxTokens(65536);
     BatchStateModel prefill;
-    Check(prefill.SetPrefillBatching(8, 0, 4), "configure queued PD batch");
+    Check(prefill.SetPrefillBatching(8, 50, 4), "configure queued PD batch");
     prefill.hold = true;
     prefill.ConfigurePD(json11::Json::object{{"role", "prefill"}, {"model_id", "queued"},
         {"transport", "tcp"}, {"listen", endpoint}, {"chunk_tokens", 2}, {"queue_depth", 128}});
@@ -218,6 +218,23 @@ static void TestQueuedTransfers() {
         decode.PollPD(&context);
         admitted &= !context.isEnding;
     }
+    // A timeout wave must cancel both P work and the caller's transfer. New
+    // model requests may wait for draining leases but must never become 500s.
+    for (int i = 0; i < 2000 && !prefill.entered; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    Check(prefill.entered, "queued cancellation did not reach held P work");
+    requests.clear();
+    for (int i = 0; i < 128; ++i) {
+        requests.emplace_back(new ResponseContext());
+        auto &context = *requests.back();
+        context.Init(1, FLOAT32, FLOAT32);
+        context.generationConfig.output_token_limit = 1;
+        context.currentTokens = context.allTokens = {i + 1001, i + 1002, i + 1003};
+        context.inputTokens = 3;
+        decode.BeginPD(&context);
+        decode.PollPD(&context);
+        admitted &= !context.isEnding;
+    }
     prefill.hold = false;
     for (auto &request : requests) {
         for (int i = 0; i < 5000 && !request->isEnding && !decode.PollPD(request.get()); ++i)
@@ -233,6 +250,8 @@ static void TestQueuedTransfers() {
     decode.StopPD();
     prefill.StopPD();
     Check(admitted, "admitted requests must fit the transfer queue");
+    Check(prefill.live == 0 && prefill.liveTokens == 0, "cancel/replacement wave leaked P states");
+    std::cout << "PASS PD 128-request cancel/replacement wave, admission and state correctness\n";
 }
 
 static void TestGPUState() {
