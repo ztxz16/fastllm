@@ -13,7 +13,8 @@ static void Require(bool ok, const char *message) {
 }
 
 static void Run(unsigned hidden, unsigned inter, unsigned shards, bool planar,
-                unsigned sourceSkew = 0, bool auxiliary = false, bool packed = false, bool registered = false) {
+                unsigned sourceSkew = 0, bool auxiliary = false, bool packed = false, bool registered = false,
+                unsigned records = 2, fastllm::cuda::RecordCopyLaunch launch = {32, 256}, bool mappedControl = false) {
     using namespace fastllm::cuda;
     SharedExpertLayout layout;
     layout.shards = shards;
@@ -44,7 +45,7 @@ static void Run(unsigned hidden, unsigned inter, unsigned shards, bool planar,
     if (packed) for (const auto &view : layout.weights)
         Require(view.shardBytes == view.rowsPerShard * view.rowStride, "row prefix extended NUMA shard");
     const size_t bytes = size_t(layout.sourceBytes[0]) + layout.sourceBytes[1] + layout.auxiliaryBytes;
-    constexpr unsigned records = 2, guard = 32;
+    constexpr unsigned guard = 32;
     const size_t stride = size_t(layout.recordBytes) + 2 * guard;
     std::vector<void *> host(records * 2 * shards), mapped(host.size()), owners(host.size());
     uint8_t *hostAuxiliary = nullptr, *mappedAuxiliary = nullptr;
@@ -144,36 +145,46 @@ static void Run(unsigned hidden, unsigned inter, unsigned shards, bool planar,
         }
         // Batched graph replay reads its count and route IDs on the device.
         // Change both between replays, including zero work and a repeated source.
-        int32_t *ids;
-        Check(cudaMalloc(&ids, 5 * sizeof(int32_t)));
+        int32_t *ids, *hostIds = nullptr;
+        if (mappedControl) {
+            Check(cudaHostAlloc(&hostIds, (2 * records + 1) * sizeof(int32_t), cudaHostAllocMapped));
+            Check(cudaHostGetDevicePointer(&ids, hostIds, 0));
+        } else Check(cudaMalloc(&ids, (2 * records + 1) * sizeof(int32_t)));
         cudaGraph_t batchGraph;
         cudaGraphExec_t batchExec;
         Check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
         Require(CopySharedExpertRecords(layout, devicePointers, mappedAuxiliary, legacy,
-            ids, ids + 2, ids + 4, records, {32, 256}, stream), "batch copy rejected");
+            ids, ids + records, ids + 2 * records, records, launch, stream), "batch copy rejected");
         Check(cudaStreamEndCapture(stream, &batchGraph));
         Check(cudaGraphInstantiate(&batchExec, batchGraph, nullptr, nullptr, 0));
-        for (int count : {0, 1, 2}) {
-            const int32_t mapping[5] = {1, pass == 1 ? 1 : 0, 1, 0, count};
+        for (unsigned count : {0u, 1u, (records + 1) / 2, records}) {
+            std::vector<int32_t> mapping(2 * records + 1);
+            for (unsigned i = 0; i < records; ++i) {
+                mapping[i] = pass == 1 ? records - 1 : records - 1 - i;
+                mapping[records + i] = records - 1 - i;
+            }
+            mapping[2 * records] = count;
             Check(cudaMemsetAsync(legacy, 0xa5, old.size(), stream));
-            Check(cudaMemcpyAsync(ids, mapping, sizeof(mapping), cudaMemcpyHostToDevice, stream));
+            if (mappedControl) std::memcpy(hostIds, mapping.data(), mapping.size() * sizeof(int32_t));
+            else Check(cudaMemcpyAsync(ids, mapping.data(), mapping.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
             Check(cudaGraphLaunch(batchExec, stream));
             Check(cudaStreamSynchronize(stream));
             Check(cudaMemcpy(old.data(), legacy, old.size(), cudaMemcpyDeviceToHost));
             std::vector<uint8_t> batchExpected(old.size(), 0xa5);
             for (int i = 0; i < count; ++i)
-                std::memcpy(batchExpected.data() + mapping[2 + i] * layout.recordBytes,
+                std::memcpy(batchExpected.data() + mapping[records + i] * layout.recordBytes,
                     expected.data() + mapping[i] * layout.recordBytes, layout.recordBytes);
             Require(old == batchExpected, "batch dynamic-count/CPU oracle mismatch");
         }
-        cudaGraphExecDestroy(batchExec); cudaGraphDestroy(batchGraph); cudaFree(ids);
+        cudaGraphExecDestroy(batchExec); cudaGraphDestroy(batchGraph);
+        if (mappedControl) cudaFreeHost(hostIds); else cudaFree(ids);
     }
     cudaGraphExecDestroy(exec); cudaGraphDestroy(graph); cudaStreamDestroy(stream);
     cudaFree(devicePointers); cudaFree(scratch); cudaFree(actual); cudaFree(legacy);
     for (auto p : owners) cudaFreeHost(p);
     if (hostAuxiliary && !registered) cudaFreeHost(hostAuxiliary);
-    std::printf("PASS shared upload hidden=%u inter=%u shards=%u skew=%u auxiliary=%u bytes=%u staged and dynamic batch graphs\n",
-        hidden, inter, shards, sourceSkew, layout.auxiliaryBytes, layout.recordBytes);
+    std::printf("PASS shared upload hidden=%u inter=%u shards=%u skew=%u auxiliary=%u bytes=%u records=%u grid=%d threads=%d mapped_control=%d staged and dynamic batch graphs\n",
+        hidden, inter, shards, sourceSkew, layout.auxiliaryBytes, layout.recordBytes, records, launch.blocks, launch.threads, int(mappedControl));
 }
 
 int main(int argc, char **argv) {
@@ -197,6 +208,14 @@ int main(int argc, char **argv) {
         if (auxiliary) for (unsigned shards : {1u, 2u, 4u, 8u})
             Run(2560, 640, shards, false, 0, true, true);
         if (planar) for (unsigned skew : {1u, 2u, 3u}) Run(128, 96, 2, true, skew);
+        if (planar) {
+            // Uneven tiles, sparse outputs, repeated sources and multiple
+            // records share a bounded grid, including a single CTA.
+            for (auto launch : {fastllm::cuda::RecordCopyLaunch{1, 128}, {7, 256}, {48, 1024}})
+                for (unsigned records : {3u, 7u, 16u, 33u})
+                    Run(96, 160, 2, true, records % 4, false, false, false, records, launch, true);
+            Run(5120, 2304, 2, true, 0, false, false, false, 8, {48, 1024}, true);
+        }
         std::puts("ALL_PASS shared expert DMA upload");
         return 0;
     } catch (const std::exception &e) {

@@ -1285,6 +1285,12 @@ namespace fastllm {
     bool TryCudaTritonSmallProjection(const Data &input, Data &weight, Data &output, int groups) {
         return TryCudaTritonSmallProjectionCandidate(input, weight, output, groups, false);
     }
+    bool TryCudaTritonMxfp4Grouped(const Data &input, Data &activation, const unsigned char *records,
+            const int *slots, const int *routes, const float *scores, float *output, void *scratch,
+            int count, int hidden, int inter, int topk, size_t stride, size_t down, float limit, bool planar) {
+        return TryCudaTritonMxfp4GroupedCandidate(input, activation, records, slots, routes, scores,
+            output, scratch, count, hidden, inter, topk, stride, down, limit, planar, false);
+    }
 
     bool TryCudaTritonSmallProjectionCandidate(const Data &input, Data &weight, Data &output, int groups, bool tuningCandidate) {
         if (!tuningCandidate && kernels::bypassDepth) return false;
@@ -1376,7 +1382,9 @@ namespace fastllm {
             return false;
         if (flag && flag[0] && !CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON_MXFP4_GROUPED"))
             return false;
-        const bool explicitlyEnabled = globalEnabled || (flag && flag[0]);
+        const bool explicitlyEnabled = globalEnabled || (flag && flag[0]) ||
+            kernels::CandidateAllowed("cuda.moe.nvfp4.triton") ||
+            kernels::CandidateAllowed("cuda.moe.nvfp4.triton.batch");
         if (!explicitlyEnabled && !CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON_MXFP4_GROUPED_AUTO"))
             return false;
         const int arch = CudaTritonRuntimeArch();
@@ -1384,18 +1392,21 @@ namespace fastllm {
         return arch == 120 || (arch == 121 && explicitlyEnabled);
     }
 
-    bool TryCudaTritonMxfp4Grouped(const Data &input, Data &activation, const unsigned char *records,
+    static bool TryCudaTritonMxfp4GroupedImpl(const Data &input, Data &activation, const unsigned char *records,
                                    const int *slots, const int *routes, const float *scores, float *output,
                                    void *scratch, int count, int hidden, int inter, int topk, size_t stride,
-                                   size_t down, float limit, bool planar) {
+                                   size_t down, float limit, bool planar, bool tuningCandidate, bool batch) {
+        if (!tuningCandidate && kernels::bypassDepth) return false;
+        if (batch && !planar) return false;
         if (!CudaTritonMxfp4GroupedEnabled())
             return false;
         if (hidden != 5120 || inter != 2304 || (topk != 6 && (!planar || topk != 3)) || limit != 10.0f ||
             down != size_t(2 * inter) * (hidden / 32) * 17 ||
-            stride != down + size_t(hidden) * (inter / 32) * 17 || count < 4 || count > 48 || !records ||
+            stride != down + size_t(hidden) * (inter / 32) * 17 || count < 4 ||
+            count > (batch ? kCudaTritonMxfp4GroupedMaxRoutes : 48) || !records ||
             !slots || !routes || !scores || !output || (!planar && !scratch) || input.dataType != BFLOAT16 ||
             input.dataDevice != CUDA || !input.cudaData || input.dims.size() != 2 || input.dims[0] < 2 ||
-            input.dims[0] > 8 || input.dims[1] != hidden || activation.dataType != BFLOAT16 ||
+            input.dims[0] > (batch ? kCudaTritonMxfp4GroupedMaxRoutes / topk : 8) || input.dims[1] != hidden || activation.dataType != BFLOAT16 ||
             activation.dataDevice != CUDA || !activation.cudaData ||
             activation.Count(0) < size_t(input.dims[0]) * topk * inter || count > input.dims[0] * topk ||
             input.multiDeviceData || activation.multiDeviceData || input.cudaData == activation.cudaData ||
@@ -1404,7 +1415,8 @@ namespace fastllm {
             return false;
         int arch = CudaTritonRuntimeArch();
         std::string dir = CudaTritonCacheDir();
-        std::string base = planar ?
+        std::string base = batch ?
+            "mxfp4_grouped_batch_v1_planar_sm" + std::to_string(arch) + "_h5120_i2304_k" + std::to_string(topk) + "_m16_n32_64_k256_w4_s2" : planar ?
             "mxfp4_grouped_v6_planar_sm" + std::to_string(arch) + "_h5120_i2304_k" + std::to_string(topk) + "_n32_64_k256_w4_s2" :
             "mxfp4_grouped_v3_sm" + std::to_string(arch) + "_h5120_i2304_k6_n64_k128_w4_s3";
         std::string path = CudaTritonJoinPath(dir, base + ".json");
@@ -1434,7 +1446,7 @@ namespace fastllm {
                         return false;
                     }
                     json11::Json request =
-                        json11::Json::object{{"op", "mxfp4_grouped"}, {"arch", arch}, {"cache_dir", dir}, {"planar", planar}, {"topk", topk}};
+                        json11::Json::object{{"op", batch ? "mxfp4_grouped_batch" : "mxfp4_grouped"}, {"arch", arch}, {"cache_dir", dir}, {"planar", planar}, {"topk", topk}};
                     int status = 0;
                     if (!CudaTritonHttpRequest("POST", "/compile", request.dump(), &status, body) ||
                         status != 200) {
@@ -1444,7 +1456,8 @@ namespace fastllm {
                     error.clear();
                     json = json11::Json::parse(body, error);
                 }
-                bool valid = error.empty() && json["ok"].bool_value() && json["version"].int_value() == (planar ? 6 : 3) &&
+                bool valid = error.empty() && json["ok"].bool_value() && json["version"].int_value() == (batch ? 1 : planar ? 6 : 3) &&
+                             json["batch"].bool_value() == batch &&
                              json["arch"].int_value() == arch && json["planar"].bool_value() == planar &&
                              (!planar || json["topk"].int_value() == topk);
                 const char *keys[] = {"gate", planar ? "down" : "activate", "down"};
@@ -1474,6 +1487,20 @@ namespace fastllm {
         }
         return FastllmCudaTritonMxfp4Grouped(cubins, names, shared, input, activation, records, slots, routes,
                                              scores, output, scratch, count, planar);
+    }
+
+    bool TryCudaTritonMxfp4GroupedCandidate(const Data &input, Data &activation, const unsigned char *records,
+                                   const int *slots, const int *routes, const float *scores, float *output,
+                                   void *scratch, int count, int hidden, int inter, int topk, size_t stride,
+                                   size_t down, float limit, bool planar, bool tuningCandidate) {
+        return TryCudaTritonMxfp4GroupedImpl(input, activation, records, slots, routes, scores, output, scratch, count, hidden, inter, topk, stride, down, limit, planar, tuningCandidate, false);
+    }
+
+    bool TryCudaTritonMxfp4GroupedBatchCandidate(const Data &input, Data &activation, const unsigned char *records,
+                                   const int *slots, const int *routes, const float *scores, float *output,
+                                   void *scratch, int count, int hidden, int inter, int topk, size_t stride,
+                                   size_t down, float limit, bool planar, bool tuningCandidate) {
+        return TryCudaTritonMxfp4GroupedImpl(input, activation, records, slots, routes, scores, output, scratch, count, hidden, inter, topk, stride, down, limit, planar, tuningCandidate, true);
     }
 
     static bool CudaTritonRequestLinearFp8Block128Kernel(

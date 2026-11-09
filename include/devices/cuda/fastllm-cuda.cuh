@@ -2855,11 +2855,21 @@ extern "C" bool FastllmCudaTritonSmallProjection(const char *cubin, const char *
 
 // Sorted original MXFP4 expert slots, at most eight routes per slot.
 namespace fastllm {
+// The independent planar batch kernel is bounded by CUDA grid.y.
+constexpr int kCudaTritonMxfp4GroupedMaxRoutes = 65535;
 bool CudaTritonMxfp4GroupedEnabled();
 bool TryCudaTritonMxfp4Grouped(const Data &input, Data &activation,
     const unsigned char *records, const int *slots, const int *routes,
     const float *scores, float *output, void *scratch, int count,
     int hidden, int inter, int topk, size_t stride, size_t down, float limit, bool planar = false);
+bool TryCudaTritonMxfp4GroupedCandidate(const Data &input, Data &activation,
+    const unsigned char *records, const int *slots, const int *routes,
+    const float *scores, float *output, void *scratch, int count,
+    int hidden, int inter, int topk, size_t stride, size_t down, float limit, bool planar, bool tuningCandidate);
+bool TryCudaTritonMxfp4GroupedBatchCandidate(const Data &input, Data &activation,
+    const unsigned char *records, const int *slots, const int *routes,
+    const float *scores, float *output, void *scratch, int count,
+    int hidden, int inter, int topk, size_t stride, size_t down, float limit, bool planar, bool tuningCandidate);
 }
 extern "C" bool FastllmCudaTritonMxfp4Grouped(
     const char *const *cubins, const char *const *names, const int *shared,

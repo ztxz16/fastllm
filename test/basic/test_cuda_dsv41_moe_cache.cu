@@ -450,7 +450,7 @@ static void CheckCompleteNativeGraphs(std::vector<Data *> &weights, int layer) {
 static void CheckVerifierMailbox(std::vector<Data *> *weights) {
     const int hidden=weights[0][2]->dims[1], experts=weights[0].size()/2-1, topk=6;
     int checks=0;
-    for (int rows : {2,3,5,6,8,9,16,32}) {
+    for (int rows : {2,3,5,6,8,9,12,16,17,24,32,65}) {
         Data input(BFLOAT16,{rows,hidden}), ids[2], scores[2], output[2]; Gpu(input);
         for(int l=0;l<2;++l){ids[l].dataType=INT32;ids[l].Resize({rows,topk});Gpu(ids[l]);
             scores[l].dataType=FLOAT32;scores[l].Resize({rows,topk});Gpu(scores[l]);
@@ -508,7 +508,7 @@ static void CheckVerifierMailbox(std::vector<Data *> *weights) {
         }
         FastllmCudaGraphExecDestroy(untimed);FastllmCudaGraphExecDestroy(exec);FastllmCudaGraphDestroy(graph);
     }
-    std::printf("VERIFY_MAILBOX_GRAPH_PASS %d dependent layer checks; rows 2/3/5/6/8/9/16/32\n",checks);
+    std::printf("VERIFY_MAILBOX_GRAPH_PASS %d dependent layer checks; rows 2/3/5/6/8/9/12/16/17/24/32/65\n",checks);
 }
 
 // A cache concentrated on one GPU must not disable the other prefill worker.
@@ -1264,8 +1264,9 @@ int main(int argc, char **argv) {
         setenv("FASTLLM_DSV41_MOE_CACHE_PREFETCH", "0", 1);
         int verifyChecks = 0;
         Data verifyOutput;
-        for (int pass = 0; pass < 21; ++pass) {
-            const int t = pass % tables, rows = std::vector<int>{8, 2, 3, 4, 5, 6, 7}[pass % 7];
+        const std::vector<int> verifyRows{8, 2, 3, 5, 7, 9, 12, 17, 24, 33, 65};
+        for (int pass = 0; pass < 3 * int(verifyRows.size()); ++pass) {
+            const int t = pass % tables, rows = verifyRows[pass % verifyRows.size()];
             const int base = pass * 7 % experts;
             std::vector<float> x(rows * hidden), route(rows * topk), expected(rows * hidden);
             std::vector<int32_t> ids(rows * topk);
@@ -1414,10 +1415,10 @@ int main(int argc, char **argv) {
                 Require(!runVerify(),
                         "verify wrong dtype accepted");
                 bx.dataType = BFLOAT16;
-                bx.dims[0] = bi.dims[0] = bs.dims[0] = 32;
-                Require(!runVerify(),
-                        "verify oversized batch accepted");
-                bx.dims[0] = bi.dims[0] = bs.dims[0] = rows;
+                // Reject inconsistent routing, not a particular batch length.
+                bi.dims[0] = rows + 1;
+                Require(!runVerify(), "verify mismatched routing rows accepted");
+                bi.dims[0] = rows;
                 Check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
                 const bool captureAccepted = runVerify();
                 cudaGraph_t graph;

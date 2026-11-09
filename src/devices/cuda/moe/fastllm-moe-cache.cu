@@ -1,3 +1,4 @@
+#include "devices/cuda/fastllm-kernel-benchmark.cuh"
 //
 // Graph-capturable GGUF, FP8 and compact NVFP4 expert cache.
 //
@@ -59,6 +60,7 @@
 #include <cuda.h>
 #endif
 #include "fastllm-moe-deepseekv41-cache.cuh"
+#include "fastllm-moe-mxfp4-batch.cuh"
 #include "fastllm-moe-cache-publication.cuh"
 #include "fastllm-moe-glm5-cache.cuh"
 #include "fastllm-moe-fp8-scored.cuh"
@@ -3871,6 +3873,73 @@ bool FastllmCudaMoeExpertParallelReadback(FastllmCudaMoeExpertParallel &state, i
     return true;
 }
 
+static bool Mxfp4BatchMmaSupported() {
+#if defined(CUDA_NO_TENSOR_CORE) || defined(USE_ROCM)
+    return false;
+#else
+    static thread_local std::map<int, bool> supported;
+    const int device = FastllmCudaGetDevice();
+    auto found = supported.find(device);
+    if (found != supported.end()) return found->second;
+    if (FastllmCudaGraphIsCapturingFast()) return false;
+    cudaDeviceProp properties{};
+    cudaFuncAttributes gate{}, down{};
+    using namespace fastllm::cuda::dsv41_cache;
+    const bool ok = cudaGetDeviceProperties(&properties, device) == cudaSuccess &&
+        properties.major >= 8 &&
+        cudaFuncGetAttributes(&gate, GateMmaBatch) == cudaSuccess &&
+        cudaFuncGetAttributes(&down, DownMmaBatch) == cudaSuccess &&
+        gate.ptxVersion >= 80 && down.ptxVersion >= 80 &&
+        gate.maxThreadsPerBlock >= 512 && down.maxThreadsPerBlock >= 256;
+    if (!ok) (void)cudaGetLastError();
+    supported.emplace(device, ok);
+    return ok;
+#endif
+}
+
+const fastllm::kernels::Family mxfp4Family{3,"moe.nvfp4.gate_swiglu_down",__DATE__ " " __TIME__,{
+    {"cuda.moe.nvfp4.native",json11::Json::object{{"backend","cuda"},{"description","CUDA grouped fused expert block"},{"layout","interleaved or planar"},{"graph",true}}},
+    {"cuda.moe.nvfp4.triton",json11::Json::object{{"backend","triton"},{"description","Triton grouped gate/SwiGLU/down block"},
+        {"sm",json11::Json::array{120,121}},{"rows",json11::Json::array{2,8}},{"hidden",5120},{"intermediate",2304},
+        {"topk",json11::Json::array{3,6}},{"layout","planar"},{"parameters",json11::Json::object{{"warps",4},{"stages",2}}},{"graph",true}}},
+    {"cuda.moe.nvfp4.triton.batch",json11::Json::object{{"backend","triton"},{"description","Triton 16-route grouped expert block"},
+        {"sm",json11::Json::array{120,121}},{"rows_min",2},{"max_routes",fastllm::kCudaTritonMxfp4GroupedMaxRoutes},
+        {"row_limit","rows * topk <= max_routes"},{"hidden",5120},{"intermediate",2304},
+        {"topk",json11::Json::array{3,6}},{"layout","planar"},
+        {"parameters",json11::Json::object{{"route_tile",16},{"warps",4},{"stages",2}}},{"graph",true}}}
+}};
+const bool mxfp4Registered=[] {fastllm::kernels::Register(&mxfp4Family);return true;}();
+fastllm::kernels::Signature Mxfp4Signature(const OffloadLayout &layout,int rows,int topk,int routes) {
+    return {{3,FastllmCudaGetDevice(),FastllmCudaRuntimeArch(),rows,layout.hidden,layout.inter,topk,routes,
+        int(layout.planarMxfp4),int(layout.weightType),int(layout.swigluLimit*1000),0}};
+}
+static bool ComputeBatchExperts(const fastllm::Data &,fastllm::Data &,fastllm::Data &,const OffloadLayout &,
+        const FastllmCudaMoeGGUFCacheView &,const float *,int,float *,bool);
+struct Mxfp4KernelContext {
+    const fastllm::Data &input;fastllm::Data &activation,&output;
+    const OffloadLayout &layout;const FastllmCudaMoeGGUFCacheView &view;
+    const float *scores;int topk;float *perExpert;
+    static bool Run(void *p,int impl) {
+        auto &c=*static_cast<Mxfp4KernelContext *>(p);
+        if(impl==1)return fastllm::TryCudaTritonMxfp4GroupedCandidate(c.input,c.activation,c.view.records,c.view.routeSlots,
+            c.view.routeMap,c.scores,c.perExpert,c.view.workspace,c.view.routeCount,c.layout.hidden,c.layout.inter,
+            c.topk,c.layout.recordStride,c.layout.downOffset,c.layout.swigluLimit,c.layout.planarMxfp4,true);
+        if(impl==2)return fastllm::TryCudaTritonMxfp4GroupedBatchCandidate(c.input,c.activation,c.view.records,c.view.routeSlots,
+            c.view.routeMap,c.scores,c.perExpert,c.view.workspace,c.view.routeCount,c.layout.hidden,c.layout.inter,
+            c.topk,c.layout.recordStride,c.layout.downOffset,c.layout.swigluLimit,c.layout.planarMxfp4,true);
+        return ComputeBatchExperts(c.input,c.activation,c.output,c.layout,c.view,c.scores,c.topk,c.perExpert,true);
+    }
+    static std::string Unsupported(void *p,int impl) {
+        if(!impl)return "";
+        auto &c=*static_cast<Mxfp4KernelContext *>(p);
+        if(c.layout.hidden!=5120||c.layout.inter!=2304||!c.layout.planarMxfp4||c.layout.swigluLimit!=10||
+           (c.topk!=3&&c.topk!=6)||c.view.routeCount<4||
+           c.view.routeCount>(impl==1 ? 48 : fastllm::kCudaTritonMxfp4GroupedMaxRoutes))return "unsupported expert shape/layout";
+        return fastllm::kernels::TritonSupport(c.input.dims[0],impl==1 ? 8 : fastllm::kCudaTritonMxfp4GroupedMaxRoutes/c.topk,
+            "FASTLLM_CUDA_TRITON_MXFP4_GROUPED");
+    }
+};
+
 // Shared batch arithmetic adapter; scheduling and transport are independent
 // of the model's activation boundary and ordered expert reduction.
 static bool ComputeBatchExperts(const fastllm::Data &input, fastllm::Data &activation,
@@ -3889,18 +3958,58 @@ static bool ComputeBatchExperts(const fastllm::Data &input, fastllm::Data &activ
         return ComputeScoredFP8Experts(input, activation, layout, view.records, view.routeSlots,
             scores, topk, perExpert, view.routeMap, view.routeCount);
     if (layout.weightType != fastllm::NVFP4_BLOCK_32_E8M0) return false;
+    if(grouped && view.routeMap && fastllm::kernels::Enabled()) {
+        Mxfp4KernelContext context{input,activation,output,layout,view,scores,topk,perExpert};
+        auto signature=Mxfp4Signature(layout,input.dims[0],topk,view.routeCount);
+        fastllm::kernels::CudaCase benchmark{&context,Mxfp4KernelContext::Run,Mxfp4KernelContext::Unsupported,
+            perExpert,size_t(input.dims[0])*topk*layout.hidden,false};
+        const int selected=fastllm::kernels::SelectCuda(mxfp4Family,signature,benchmark);
+        if(selected>=0){fastllm::kernels::Bypass bypass;return fastllm::kernels::LaunchCuda(mxfp4Family,benchmark,selected);}
+    }
     if (grouped && fastllm::TryCudaTritonMxfp4Grouped(input, activation,
             view.records, view.routeSlots, view.routeMap, scores, perExpert,
             view.workspace, view.routeCount, layout.hidden, layout.inter,
             topk, layout.recordStride, layout.downOffset, layout.swigluLimit, layout.planarMxfp4)) return true;
     using namespace fastllm::cuda::dsv41_cache;
-    Gate<true><<<dim3(layout.inter / 32, view.routeCount), 512, 0, cudaStreamPerThread>>>(
-        (const __nv_bfloat16 *)input.cudaData, view.routeSlots, view.records, scores,
-        (__nv_bfloat16 *)activation.cudaData, layout.hidden, layout.inter,
-        layout.recordStride, layout.swigluLimit, topk, view.routeMap, layout.planarMxfp4);
-    Down<<<dim3(layout.hidden / 8, view.routeCount), 128, 0, cudaStreamPerThread>>>(
-        (const __nv_bfloat16 *)activation.cudaData, view.routeSlots, view.records, perExpert,
-        layout.hidden, layout.inter, layout.recordStride, layout.downOffset, view.routeMap, layout.planarMxfp4);
+    if (grouped && view.routeMap && layout.hidden % 32 == 0 && layout.inter % 32 == 0 &&
+            Mxfp4BatchMmaSupported()) {
+        // Select by actual expert reuse on device. One/two-route groups retain
+        // the existing SIMT geometry; larger groups share decoded MMA fragments.
+        const int tiles = (view.routeCount + batch_mma::Tokens - 1) / batch_mma::Tokens;
+        GateReuse<true><<<dim3(layout.inter / 32, view.routeCount), 512, 0, cudaStreamPerThread>>>(
+            (const __nv_bfloat16 *)input.cudaData, view.routeSlots, view.records, scores,
+            (__nv_bfloat16 *)activation.cudaData, layout.hidden, layout.inter,
+            layout.recordStride, layout.swigluLimit, topk, view.routeMap, view.routeCount, layout.planarMxfp4);
+        GateMmaBatch<<<dim3(layout.inter / 32, tiles), 512, 0, cudaStreamPerThread>>>(
+            (const __nv_bfloat16 *)input.cudaData, view.routeSlots, view.records, scores,
+            (__nv_bfloat16 *)activation.cudaData, layout.hidden, layout.inter,
+            layout.recordStride, layout.swigluLimit, topk, view.routeMap, view.routeCount, layout.planarMxfp4);
+        DownReuse<true><<<dim3(layout.hidden / 8, view.routeCount), 128, 0, cudaStreamPerThread>>>(
+            (const __nv_bfloat16 *)activation.cudaData, view.routeSlots, view.records, perExpert,
+            layout.hidden, layout.inter, layout.recordStride, layout.downOffset,
+            view.routeMap, view.routeCount, layout.planarMxfp4);
+        DownMmaBatch<<<dim3(layout.hidden / 16, tiles), 256, 0, cudaStreamPerThread>>>(
+            (const __nv_bfloat16 *)activation.cudaData, view.routeSlots, view.records, perExpert,
+            layout.hidden, layout.inter, layout.recordStride, layout.downOffset,
+            view.routeMap, view.routeCount, layout.planarMxfp4);
+    } else if (grouped && view.routeMap) {
+        GateReuse<<<dim3(layout.inter / 32, view.routeCount), 512, 0, cudaStreamPerThread>>>(
+            (const __nv_bfloat16 *)input.cudaData, view.routeSlots, view.records, scores,
+            (__nv_bfloat16 *)activation.cudaData, layout.hidden, layout.inter,
+            layout.recordStride, layout.swigluLimit, topk, view.routeMap, view.routeCount, layout.planarMxfp4);
+        DownReuse<<<dim3(layout.hidden / 8, view.routeCount), 128, 0, cudaStreamPerThread>>>(
+            (const __nv_bfloat16 *)activation.cudaData, view.routeSlots, view.records, perExpert,
+            layout.hidden, layout.inter, layout.recordStride, layout.downOffset,
+            view.routeMap, view.routeCount, layout.planarMxfp4);
+    } else {
+        Gate<true><<<dim3(layout.inter / 32, view.routeCount), 512, 0, cudaStreamPerThread>>>(
+            (const __nv_bfloat16 *)input.cudaData, view.routeSlots, view.records, scores,
+            (__nv_bfloat16 *)activation.cudaData, layout.hidden, layout.inter,
+            layout.recordStride, layout.swigluLimit, topk, view.routeMap, layout.planarMxfp4);
+        Down<<<dim3(layout.hidden / 8, view.routeCount), 128, 0, cudaStreamPerThread>>>(
+            (const __nv_bfloat16 *)activation.cudaData, view.routeSlots, view.records, perExpert,
+            layout.hidden, layout.inter, layout.recordStride, layout.downOffset, view.routeMap, layout.planarMxfp4);
+    }
     return cudaGetLastError() == cudaSuccess;
 }
 
@@ -5070,6 +5179,42 @@ namespace { void WaitMailboxMoe(OffloadGroup &group); }
 #include "fastllm-moe-cooperative.cuh"
 #include "fastllm-moe-mailbox.cuh"
 #endif
+// A graph cannot benchmark kernels. Prepare each new expert signature on private
+// buffers before capture, using resident model records and deterministic, reused
+// routes. This does not touch request KV, sampler state or expert-cache ownership.
+static void WarmupMxfp4KernelPlan(const OffloadLayout &layout,DeviceCache &cache,int rows,int topk) {
+    using namespace fastllm;
+    if(!kernels::Enabled()||rows<2||layout.weightType!=NVFP4_BLOCK_32_E8M0||cache.slots<=0)return;
+    const int routes=rows*topk;
+    if(!kernels::NeedsPreparation(Mxfp4Signature(layout,rows,topk,routes)))return;
+    std::vector<int> keys(cache.slots);
+    kernels::CudaCheck(cudaMemcpyAsync(keys.data(),cache.slotKeys,keys.size()*sizeof(int),cudaMemcpyDeviceToHost,cudaStreamPerThread));
+    kernels::CudaCheck(cudaStreamSynchronize(cudaStreamPerThread));
+    std::vector<int> available;
+    for(int i=0;i<cache.slots&&available.size()<size_t(routes);++i)if(keys[i]>=0)available.push_back(i);
+    if(available.empty())return;
+    Data input(BFLOAT16,{rows,layout.hidden}),activation(BFLOAT16,{routes,layout.inter}),partial(FLOAT32,{routes,layout.hidden});
+    Data slots(INT32,{routes}),mapping(INT32,{routes}),scores(FLOAT32,{routes});
+    for(auto *d:{&input,&activation,&partial,&slots,&mapping,&scores}){d->dataDevice=CUDA;d->dataDeviceIds={cache.device};d->Allocate(false);}
+    std::vector<uint16_t> x(input.Count(0));std::vector<float> weights(routes,1.0f/topk);
+    std::vector<int> slot(routes),route(routes);
+    for(size_t i=0;i<x.size();++i){float f=float(int((i*73)%257)-128)/64;uint32_t bits;memcpy(&bits,&f,4);x[i]=uint16_t(bits>>16);}
+    // Mix repeated experts and distinct experts; sorted slots match the grouped contract.
+    for(int i=0;i<routes;++i)route[i]=i;
+    const int unique=std::min<int>(available.size(),std::max(topk,(routes+1)/2));
+    std::stable_sort(route.begin(),route.end(),[&](int a,int b){return a%unique<b%unique;});
+    for(int i=0;i<routes;++i)slot[i]=available[route[i]%unique];
+    auto upload=[&](void *dst,const void *src,size_t bytes){kernels::CudaCheck(cudaMemcpyAsync(dst,src,bytes,cudaMemcpyHostToDevice,cudaStreamPerThread));};
+    upload(input.cudaData,x.data(),x.size()*2);upload(slots.cudaData,slot.data(),routes*4);
+    upload(mapping.cudaData,route.data(),routes*4);upload(scores.cudaData,weights.data(),routes*4);
+    FastllmCudaMoeGGUFCacheView view{};view.records=cache.records;view.routeSlots=(int32_t*)slots.cudaData;
+    view.routeMap=(int32_t*)mapping.cudaData;view.routeCount=routes;
+    Data dummy;
+    if(!ComputeBatchExperts(input,activation,dummy,layout,view,(float*)scores.cudaData,topk,(float*)partial.cudaData,true))
+        throw std::runtime_error("kernel warmup expert plan rejected");
+    kernels::CudaCheck(cudaStreamSynchronize(cudaStreamPerThread));
+}
+
 #include "fastllm-moe-native-mailbox.cuh"
 
 void FastllmCudaWaitMoeDecodeCpu(void *state) {
@@ -5601,15 +5746,15 @@ bool FastllmCudaMergeMOEHybrid(const fastllm::Data &input,
         fastllm::Data &output, fastllm::Data **weights, int weightsBatch, int layer,
         const std::function<void()> &launchParallel) {
     if (weights && weightsBatch >= 4 && weights[2] && input.dims.size() == 2 && input.dims[0] > 1 &&
-        (input.dims[0] > 8 || (routePhase != FastllmMoeRoutePhase::Verify && routePhase != FastllmMoeRoutePhase::Draft))) {
+        (routePhase != FastllmMoeRoutePhase::Verify && routePhase != FastllmMoeRoutePhase::Draft)) {
         const auto *backend = FindExpertCacheBackend(weights[2]->dataType);
         if (backend && backend->prefill)
             return backend->prefill(input, index, score, output, weights, weightsBatch, launchParallel);
     }
-    // Bound scratch to the existing verifier capacity. Each row keeps its
-    // activation quantization and reduction; short prefill tails need not use
-    // the CPU-only backend just because they exceed the verifier row count.
-    if (input.dims.size() == 2 && input.dims[0] > 8 && input.dims[0] < 32 &&
+    // Tile the eager adapter's bounded math workspace without imposing a
+    // scheduling limit on the logical batch. Full graphs group all rows once
+    // through their dynamically sized mailbox and tile only GPU computation.
+    if (input.dims.size() == 2 && input.dims[0] > 8 &&
         !FastllmCudaMoeCacheFullyResident(weights, weightsBatch) &&
         input.dataDevice == fastllm::DataDevice::CUDA && index.dataDevice == fastllm::DataDevice::CUDA &&
         score.dataDevice == fastllm::DataDevice::CUDA && input.dataType == fastllm::BFLOAT16 &&
@@ -5871,13 +6016,17 @@ extern "C" bool fastllm_moe_cuda_cache_prefill_stats(int device, uint64_t *value
 void *FastllmCudaNativeMoeGraphOwner(fastllm::Data **weights, int weightsBatch, int rows) {
 #if defined(USE_NUMAS) && !defined(USE_ROCM) && CUDART_VERSION >= 11070
     const char *mode = std::getenv("FASTLLM_DSV41_MOE_CACHE_MODE");
-    if ((mode && std::strcmp(mode, "gpu") == 0) || rows < 1 || rows > kNativeMoeMaxRows ||
+    if ((mode && std::strcmp(mode, "gpu") == 0) || rows < 1 || rows > std::numeric_limits<int>::max() / kMaxTopK ||
         FastllmCudaGraphIsCapturingFast()) return nullptr;
     int table = -1;
     auto *group = FindHybridGroup(weights, weightsBatch, &table);
     if (!group || !group->cpuDecodeReady || !group->expertDevices.empty() ||
         group->tensorParallelRequested) return nullptr;
     const auto &layout = group->LayerLayout(table);
+    // Math kernels use signed 32-bit element offsets. Check that capacity from
+    // the actual weight dimensions rather than choosing a scheduling row limit.
+    const int width = std::max(layout.hidden, layout.inter);
+    if (width <= 0 || rows > std::numeric_limits<int>::max() / kMaxTopK / width / 2) return nullptr;
     const bool supportedGGUF = layout.weightType == fastllm::DATA_GGUF_FORMAT &&
         FastllmCudaV41GGUFSupported(layout.gateGgmlType, layout.downGgmlType) &&
         FastllmCudaV41CanonicalGGUFCacheWorkspaceBytes(layout.hidden, layout.inter) != 0;
@@ -5887,7 +6036,7 @@ void *FastllmCudaNativeMoeGraphOwner(fastllm::Data **weights, int weightsBatch, 
     if (!standard && (!layout.deepSeekV41 ||
         (layout.weightType != fastllm::NVFP4_BLOCK_32_E8M0 &&
          layout.weightType != fastllm::FP8_E4M3_BLOCK_128 &&
-         !(layout.weightType==fastllm::EXL3 && rows<=8 && Exl3HybridShape(layout)) && !supportedGGUF))) return nullptr;
+         !(layout.weightType==fastllm::EXL3 && Exl3HybridShape(layout)) && !supportedGGUF))) return nullptr;
     // Preserve the existing readiness fence for non-Qwen models.
     auto *cache = GetDeviceCache(*group, !standard);
     if (!cache || !NativeMailboxOwnsLayer(*group, *cache, table)) return nullptr;
@@ -5926,7 +6075,7 @@ void *FastllmCudaCreateNativeMoeFullGraph(const fastllm::Data &input, const fast
         input.dataDeviceIds != device || index.dataDeviceIds != device || score.dataDeviceIds != device ||
         input.multiDeviceData || index.multiDeviceData || score.multiDeviceData || output.multiDeviceData ||
         &output == &input || &output == &index || &output == &score ||
-        input.dims[0] < 1 || input.dims[0] > kNativeMoeMaxRows ||
+        input.dims[0] < 1 || input.dims[0] > std::numeric_limits<int>::max() / kMaxTopK ||
         (input.dataType != fastllm::BFLOAT16 && input.dataType != fastllm::FLOAT16 && input.dataType != fastllm::FLOAT32) ||
         index.dims[0] != input.dims[0] || index.dataType != fastllm::INT32 ||
         score.dims != index.dims || score.dataType != fastllm::FLOAT32 ||

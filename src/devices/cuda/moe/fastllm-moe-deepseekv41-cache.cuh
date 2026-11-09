@@ -290,6 +290,115 @@ static __global__ void Down(const __nv_bfloat16 *activation, const int32_t *slot
     if ((threadIdx.x & 15) == 0)
         output[route * hidden + column] = BFloat(value);
 }
+// Reuse a decoded expert row across a bounded register tile of routes. Tile
+// boundaries are independent of request count; partial and nonrepeated groups
+// retain the same accumulation and BF16/FP8 rounding as the scalar route path.
+constexpr int kExpertRouteTile = 4;
+constexpr int kExpertMmaRouteTile = 16;
+template<int Capacity = kExpertRouteTile>
+__device__ inline int ExpertRouteTile(const int32_t *slots, int selected, int routes) {
+    const int slot = slots[selected];
+    if (slot < 0) return 0;
+    int first = selected;
+    while (first % Capacity && slots[first - 1] == slot) --first;
+    int count = 1;
+    while (count < Capacity - first % Capacity && first + count < routes &&
+           slots[first + count] == slot) ++count;
+    // A pair is already served efficiently from L2 by the scalar CTAs.
+    // Register reuse pays off only when it removes more repeated decodes.
+    if (count <= 2) return 1;
+    return first == selected ? count : 0;
+}
+template<bool SmallOnly = false>
+__global__ void GateReuse(const __nv_bfloat16 *input, const int32_t *slots,
+        const uint8_t *records, const float *scores, __nv_bfloat16 *activation,
+        int hidden, int inter, size_t stride, float limit, int topk,
+        const int32_t *routeMap, int routes, bool planar) {
+    const int selected = blockIdx.y;
+    if constexpr (SmallOnly) if (ExpertRouteTile<kExpertMmaRouteTile>(slots,selected,routes) != 1) return;
+    const int count = ExpertRouteTile(slots, selected, routes);
+    if (!count) return;
+    const int lane = threadIdx.x & 15, column = blockIdx.x * 32 + threadIdx.x / 16;
+    const uint8_t *record = records + size_t(slots[selected]) * stride;
+    const int blocks = hidden / 32, pitch = blocks * (planar ? 16 : 17);
+    const uint8_t *g = record + size_t(column) * pitch, *u = g + size_t(inter) * pitch;
+    const uint8_t *scales = record + size_t(2 * inter) * hidden / 2;
+    int route[kExpertRouteTile];const unsigned *x[kExpertRouteTile];
+    float gs[kExpertRouteTile]{},us[kExpertRouteTile]{};
+#pragma unroll
+    for(int r=0;r<kExpertRouteTile;++r)if(r<count){
+        route[r]=routeMap ? routeMap[selected+r] : selected+r;
+        x[r]=reinterpret_cast<const unsigned *>(input+size_t(route[r]/topk)*hidden);
+    }
+    if(count==1){
+        const auto *a=reinterpret_cast<const __nv_bfloat16 *>(x[0]);
+        const float2 value=planar ? DotGateUp<true>(a,g,u,hidden,scales+size_t(column)*blocks,
+            scales+size_t(column+inter)*blocks) : DotGateUp(a,g,u,hidden);
+        StoreGate(value,scores[route[0]],activation,route[0],inter,limit);return;
+    }
+#pragma unroll 4
+    for(int b=0;b<blocks;++b){
+        const int at=b*(planar?16:17);
+        const float2 gv=FP4Pair(g[at+lane],planar?scales[size_t(column)*blocks+b]:g[at+16]);
+        const float2 uv=FP4Pair(u[at+lane],planar?scales[size_t(column+inter)*blocks+b]:u[at+16]);
+#pragma unroll
+        for(int r=0;r<kExpertRouteTile;++r)if(r<count){
+            const unsigned value=x[r][b*16+lane];
+            const float x0=__uint_as_float(value<<16),x1=__uint_as_float(value&0xffff0000u);
+            gs[r]=__fadd_rn(gs[r],__fadd_rn(__fmul_rn(x0,gv.x),__fmul_rn(x1,gv.y)));
+            us[r]=__fadd_rn(us[r],__fadd_rn(__fmul_rn(x0,uv.x),__fmul_rn(x1,uv.y)));
+        }
+    }
+#pragma unroll
+    for(int r=0;r<kExpertRouteTile;++r)if(r<count){
+        for(int delta=8;delta;delta>>=1){
+            gs[r]=__fadd_rn(gs[r],__shfl_down_sync(0xffffffff,gs[r],delta,16));
+            us[r]=__fadd_rn(us[r],__shfl_down_sync(0xffffffff,us[r],delta,16));
+        }
+        StoreGate(make_float2(gs[r],us[r]),scores[route[r]],activation,route[r],inter,limit);
+        __syncthreads();
+    }
+}
+template<bool SmallOnly = false>
+__global__ void DownReuse(const __nv_bfloat16 *activation, const int32_t *slots,
+        const uint8_t *records, float *output, int hidden, int inter, size_t stride,
+        size_t downOffset, const int32_t *routeMap, int routes, bool planar) {
+    const int selected=blockIdx.y;
+    if constexpr (SmallOnly) if (ExpertRouteTile<kExpertMmaRouteTile>(slots,selected,routes) != 1) return;
+    const int count=ExpertRouteTile(slots,selected,routes);
+    if(!count)return;
+    const int lane=threadIdx.x&15,column=blockIdx.x*8+threadIdx.x/16,blocks=inter/32;
+    const uint8_t *matrix=records+size_t(slots[selected])*stride+downOffset;
+    const uint8_t *w=matrix+size_t(column)*blocks*(planar?16:17);
+    const uint8_t *scales=matrix+size_t(hidden)*inter/2+size_t(column)*blocks;
+    int route[kExpertRouteTile];const unsigned *x[kExpertRouteTile];float sum[kExpertRouteTile]{};
+#pragma unroll
+    for(int r=0;r<kExpertRouteTile;++r)if(r<count){
+        route[r]=routeMap?routeMap[selected+r]:selected+r;
+        x[r]=reinterpret_cast<const unsigned *>(activation+size_t(route[r])*inter);
+    }
+    if(count==1){
+        const auto *a=reinterpret_cast<const __nv_bfloat16 *>(x[0]);
+        const float value=planar?Dot<true>(a,w,inter,scales):Dot(a,w,inter);
+        if(!lane)output[size_t(route[0])*hidden+column]=BFloat(value);return;
+    }
+#pragma unroll 8
+    for(int b=0;b<blocks;++b){
+        const int at=b*(planar?16:17);const float2 value=FP4Pair(w[at+lane],planar?scales[b]:w[at+16]);
+#pragma unroll
+        for(int r=0;r<kExpertRouteTile;++r)if(r<count){
+            const unsigned v=x[r][b*16+lane];
+            sum[r]=__fadd_rn(sum[r],__fadd_rn(__fmul_rn(__uint_as_float(v<<16),value.x),
+                __fmul_rn(__uint_as_float(v&0xffff0000u),value.y)));
+        }
+    }
+#pragma unroll
+    for(int r=0;r<kExpertRouteTile;++r)if(r<count){
+        for(int delta=8;delta;delta>>=1)sum[r]=__fadd_rn(sum[r],__shfl_down_sync(0xffffffff,sum[r],delta,16));
+        if(!lane)output[size_t(route[r])*hidden+column]=BFloat(sum[r]);
+    }
+}
+
 static __global__ void Reduce(const float *cpu, const float *gpu, const int32_t *gpuIndices, const int32_t *indices,
                               __nv_bfloat16 *output, int hidden, int topk) {
     const int column = blockIdx.x * blockDim.x + threadIdx.x;

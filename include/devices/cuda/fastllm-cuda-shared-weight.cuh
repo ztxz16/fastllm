@@ -104,54 +104,88 @@ namespace shared_weight_detail {
 // its NUMA/row address once, then load aligned words and publish one uint4.
 // Shard extents are word-aligned, so the final word containing the scale is
 // in bounds even when the 17-byte block starts at an unaligned address.
+__device__ __forceinline__ void RestoreBlock32PlanarBlock(const SharedExpertLayout &layout,
+        const uint8_t *gate, const uint8_t *down, uint8_t *destination,
+        void *const *pointers, unsigned part, int expert, int slot, size_t block) {
+    const auto &view = layout.weights[part];
+    const unsigned blocksPerRow = view.rowBytes / 17;
+    const size_t blocks = size_t(view.rows) * blocksPerRow;
+    if (block >= blocks) return;
+    uint8_t *record = destination + size_t(slot) * layout.recordBytes + view.destinationOffset;
+    unsigned row = block / blocksPerRow;
+    const unsigned column = (block - size_t(row) * blocksPerRow) * 17;
+    const unsigned group = row / view.groupRows;
+    row = row * view.rowGroups - group * (view.rows - 1);
+    const unsigned shard = row / view.rowsPerShard;
+    row -= shard * view.rowsPerShard;
+    const unsigned tile = row / view.tileRows;
+    const size_t offset = view.sourceOffset + size_t(tile) * view.tileStride +
+        size_t(row - tile * view.tileRows) * view.rowStride + column;
+    const auto *base = pointers ? static_cast<const uint8_t *>(
+        pointers[(expert * 2 + part) * layout.shards + shard]) :
+        (part ? down : gate) + size_t(shard) * view.shardBytes;
+    // Borrowed views may start inside an allocation. Do not round such a
+    // pointer down and read bytes outside the owner's declared extent.
+    if (reinterpret_cast<uintptr_t>(base) & 3) {
+        #pragma unroll
+        for (unsigned byte = 0; byte < 16; ++byte)
+            record[block * 16 + byte] = base[offset + byte];
+        record[blocks * 16 + block] = base[offset + 16];
+        return;
+    }
+    const unsigned shift = (offset & 3) * 8;
+    const auto *words = reinterpret_cast<const uint32_t *>(base + (offset & ~size_t(3)));
+    const uint32_t a = words[0], b = words[1], c = words[2], d = words[3];
+    uint4 value = make_uint4(a, b, c, d);
+    if (shift) {
+        const uint32_t e = words[4];
+        value = make_uint4(__funnelshift_r(a, b, shift), __funnelshift_r(b, c, shift),
+                          __funnelshift_r(c, d, shift), __funnelshift_r(d, e, shift));
+    }
+    reinterpret_cast<uint4 *>(record)[block] = value;
+    record[blocks * 16 + block] = base[offset + 16];
+}
+
 template<bool Batch>
 __global__ void RestoreBlock32Planar(SharedExpertLayout layout,
         const uint8_t *gate, const uint8_t *down, uint8_t *destination,
         void *const *pointers, const int32_t *sourceIds,
         const int32_t *destinationIds, const int32_t *count, int stage) {
-    const unsigned request = Batch ? blockIdx.y / 2 : 0;
-    const unsigned part = Batch ? blockIdx.y % 2 : (stage < 0 ? blockIdx.y : stage);
-    if (Batch && int(request) >= *count) return;
-    const int expert = Batch ? sourceIds[request] : 0;
-    const int slot = Batch ? destinationIds[request] : 0;
-    const auto &view = layout.weights[part];
-    const unsigned blocksPerRow = view.rowBytes / 17;
-    const size_t blocks = size_t(view.rows) * blocksPerRow;
-    uint8_t *record = destination + size_t(slot) * layout.recordBytes + view.destinationOffset;
-    for (size_t block = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-         block < blocks; block += size_t(gridDim.x) * blockDim.x) {
-        unsigned row = block / blocksPerRow;
-        const unsigned column = (block - size_t(row) * blocksPerRow) * 17;
-        const unsigned group = row / view.groupRows;
-        row = row * view.rowGroups - group * (view.rows - 1);
-        const unsigned shard = row / view.rowsPerShard;
-        row -= shard * view.rowsPerShard;
-        const unsigned tile = row / view.tileRows;
-        const size_t offset = view.sourceOffset + size_t(tile) * view.tileStride +
-            size_t(row - tile * view.tileRows) * view.rowStride + column;
-        const auto *base = pointers ? static_cast<const uint8_t *>(
-            pointers[(expert * 2 + part) * layout.shards + shard]) :
-            (part ? down : gate) + size_t(shard) * view.shardBytes;
-        // Borrowed views may start inside an allocation. Do not round such a
-        // pointer down and read bytes outside the owner's declared extent.
-        if (reinterpret_cast<uintptr_t>(base) & 3) {
-            #pragma unroll
-            for (unsigned byte = 0; byte < 16; ++byte)
-                record[block * 16 + byte] = base[offset + byte];
-            record[blocks * 16 + block] = base[offset + 16];
-            continue;
+    if constexpr (Batch) {
+        const int records = *count;
+        if (records <= 0) return;
+        // One grid-wide CTA budget covers every selected record and both
+        // matrices. Expanding grid.y per expert would multiply that budget
+        // and keep independent resident-expert kernels from progressing.
+        const size_t gateBlocks = size_t(layout.weights[0].rows) * (layout.weights[0].rowBytes / 17);
+        const size_t downBlocks = size_t(layout.weights[1].rows) * (layout.weights[1].rowBytes / 17);
+        const size_t gateTiles = (gateBlocks + blockDim.x - 1) / blockDim.x;
+        const size_t tilesPerRecord = gateTiles + (downBlocks + blockDim.x - 1) / blockDim.x;
+        unsigned previous = ~0u;
+        int expert = 0, slot = 0;
+        for (size_t tile = blockIdx.x; tile < size_t(records) * tilesPerRecord; tile += gridDim.x) {
+            const unsigned request = tile / tilesPerRecord;
+            // Graph mailboxes may keep these IDs in mapped host memory.
+            // Tiles advance monotonically: cache the IDs until the record
+            // changes instead of paying a host-link read for every tile.
+            if (request != previous) {
+                expert = sourceIds[request];
+                slot = destinationIds[request];
+                previous = request;
+            }
+            const size_t local = tile - size_t(request) * tilesPerRecord;
+            const unsigned part = local >= gateTiles;
+            const size_t block = (local - (part ? gateTiles : 0)) * blockDim.x + threadIdx.x;
+            RestoreBlock32PlanarBlock(layout, gate, down, destination, pointers,
+                part, expert, slot, block);
         }
-        const unsigned shift = (offset & 3) * 8;
-        const auto *words = reinterpret_cast<const uint32_t *>(base + (offset & ~size_t(3)));
-        const uint32_t a = words[0], b = words[1], c = words[2], d = words[3];
-        uint4 value = make_uint4(a, b, c, d);
-        if (shift) {
-            const uint32_t e = words[4];
-            value = make_uint4(__funnelshift_r(a, b, shift), __funnelshift_r(b, c, shift),
-                              __funnelshift_r(c, d, shift), __funnelshift_r(d, e, shift));
-        }
-        reinterpret_cast<uint4 *>(record)[block] = value;
-        record[blocks * 16 + block] = base[offset + 16];
+    } else {
+        const unsigned part = stage < 0 ? blockIdx.y : stage;
+        const auto &view = layout.weights[part];
+        const size_t blocks = size_t(view.rows) * (view.rowBytes / 17);
+        for (size_t block = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+             block < blocks; block += size_t(gridDim.x) * blockDim.x)
+            RestoreBlock32PlanarBlock(layout, gate, down, destination, pointers, part, 0, 0, block);
     }
 }
 
@@ -467,8 +501,13 @@ inline bool CopySharedExpertRecords(const SharedExpertLayout &layout,
         (layout.auxiliaryBytes && !auxiliary)) return false;
     if (maxRecords <= 32767 && !(reinterpret_cast<uintptr_t>(destination) & 15) &&
         shared_weight_detail::ContiguousBlock32Planar(layout)) {
-        const unsigned blocks = shared_weight_detail::Block32PlanarGrid(layout, launch.blocks, launch.threads);
-        shared_weight_detail::RestoreBlock32Planar<true><<<dim3(blocks, 2 * maxRecords), launch.threads, 0, stream>>>(
+        size_t tiles = 0;
+        for (const auto &view : layout.weights) {
+            const size_t work = size_t(view.rows) * (view.rowBytes / 17);
+            tiles += (work + launch.threads - 1) / launch.threads;
+        }
+        const unsigned blocks = unsigned(std::min(size_t(launch.blocks), tiles * maxRecords));
+        shared_weight_detail::RestoreBlock32Planar<true><<<blocks, launch.threads, 0, stream>>>(
             layout, nullptr, nullptr, destination, pointers, sourceIds, destinationIds, count, -1);
         return cudaGetLastError() == cudaSuccess;
     }

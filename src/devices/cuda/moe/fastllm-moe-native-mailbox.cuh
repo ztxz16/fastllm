@@ -8,16 +8,21 @@
 
 namespace {
 #if defined(USE_NUMAS) && !defined(USE_ROCM) && CUDART_VERSION >= 11070
-constexpr int kNativeMoeMaxRows = 32;
-constexpr int kNativeMoeMaxRoutes = kNativeMoeMaxRows * kMaxTopK;
 struct NativeMoeControl {
     alignas(64) unsigned published = 0;
     alignas(64) unsigned computed = 0;
     alignas(64) unsigned planned = 0;
     int stagedCount = 0;
     alignas(64) int stagedByHits[kMaxTopK + 1];
-    alignas(64) int32_t ids[kNativeMoeMaxRoutes], resident[kNativeMoeMaxRoutes], staged[kNativeMoeMaxRoutes], gpu[kNativeMoeMaxRoutes];
-    float scores[kNativeMoeMaxRoutes];
+    // Route storage follows the control header, sized for this graph's batch.
+    // Derive addresses from the local host/device mapping, without assuming UVA
+    // maps pinned storage to the same virtual address on both processors.
+    int routes = 0;
+    __host__ __device__ int32_t *ids() const { return reinterpret_cast<int32_t *>(const_cast<NativeMoeControl *>(this + 1)); }
+    __host__ __device__ int32_t *resident() const { return ids() + routes; }
+    __host__ __device__ int32_t *staged() const { return ids() + 2 * routes; }
+    __host__ __device__ int32_t *gpu() const { return ids() + 3 * routes; }
+    __host__ __device__ float *scores() const { return reinterpret_cast<float *>(ids() + 4 * routes); }
     int32_t stagedExperts[kMaxTopK], stagedSlots[kMaxTopK];
 };
 
@@ -53,13 +58,13 @@ __global__ void PublishNativeMoe(NativeMoeControl *box, float *hostInput,
         const unsigned mask = __ballot_sync(0xffffffff, r < topk && resident);
         if (!r) { *hits += __popc(mask); *misses += topk - __popc(mask); }
         if (r < topk) {
-            box->ids[r] = e; box->scores[r] = scores[r];
-            box->resident[r] = slots[r] = resident ? slot : -1;
+            box->ids()[r] = e; box->scores()[r] = scores[r];
+            box->resident()[r] = slots[r] = resident ? slot : -1;
             if (publish) {
                 const int selected = box->stagedByHits[__popc(mask)];
                 const int at = fastllm::cuda::dsv41_cache::NativeStagedSlot(mask, r, selected);
-                box->staged[r] = slots[topk + r] = at;
-                box->gpu[r] = slots[2 * topk + r] = resident || at >= 0 ? e : -1;
+                box->staged()[r] = slots[topk + r] = at;
+                box->gpu()[r] = slots[2 * topk + r] = resident || at >= 0 ? e : -1;
                 if (at >= 0) {
                     slots[3 * topk + at] = e;
                     slots[4 * topk + at] = at;
@@ -94,12 +99,12 @@ __global__ void PublishStandardMoe(NativeMoeControl *box, float *hostInput, floa
             const unsigned mask = __ballot_sync(0xffffffffu, r < topk && resident);
             if (!r) { *hits += __popc(mask); *misses += topk - __popc(mask); }
             if (r < topk) {
-                box->ids[r] = e; box->scores[r] = scores[r];
-                box->resident[r] = slots[r] = resident ? slot : -1;
+                box->ids()[r] = e; box->scores()[r] = scores[r];
+                box->resident()[r] = slots[r] = resident ? slot : -1;
                 const int selected = box->stagedByHits[__popc(mask)];
                 const int at = fastllm::cuda::dsv41_cache::NativeStagedSlot(mask, r, selected);
-                box->staged[r] = slots[topk + r] = at;
-                box->gpu[r] = slots[2 * topk + r] = resident || at >= 0 ? e : -1;
+                box->staged()[r] = slots[topk + r] = at;
+                box->gpu()[r] = slots[2 * topk + r] = resident || at >= 0 ? e : -1;
                 if (at >= 0) { slots[3 * topk + at] = e; slots[4 * topk + at] = at; }
                 if (!r) box->stagedCount = slots[5 * topk] = selected;
             }
@@ -109,8 +114,8 @@ __global__ void PublishStandardMoe(NativeMoeControl *box, float *hostInput, floa
         int slot = e >= 0 && e < experts ?
             fastllm::cuda::moe_admission::LoadAdmission(keys + key) : -1;
         if (slot >= 0 && slotKeys[slot] != key) slot = -1;
-        box->ids[route] = e; box->scores[route] = scores[route];
-        box->resident[route] = slots[route] = slot;
+        box->ids()[route] = e; box->scores()[route] = scores[route];
+        box->resident()[route] = slots[route] = slot;
         atomicAdd(slot >= 0 ? hits : misses, 1ULL);
     }
     __threadfence_system(); __syncthreads();
@@ -159,11 +164,17 @@ __global__ void ReduceNativeScoredMailbox(const float *cpu, const float *residen
     output[c]=__float2bfloat16_rn(sum);
 }
 
-// Route order is local to an eight-row compute tile, matching both the
-// grouped CUDA implementation and its exact native fallback.
-__device__ int NativeBatchRouteRank(const int32_t *indices, int r, int rows, int topk) {
-    const int first = r / (8 * topk) * (8 * topk);
-    const int end = min(rows * topk, first + 8 * topk);
+// Route ordering follows the arithmetic backend's capacity, independently
+// of request boundaries. Native block-FP4 kernels accept the complete batch;
+// adapters with bounded scratch retain their existing compute tiles.
+static int NativeBatchTileRows(const OffloadLayout &layout, int rows) {
+    // The route grid uses CUDA's y dimension. Keep its limit independent of
+    // the request count and of the number of rows in a speculative proposal.
+    return std::min(rows, layout.weightType == fastllm::NVFP4_BLOCK_32_E8M0 ? 65535 / kMaxTopK : 8);
+}
+__device__ int NativeBatchRouteRank(const int32_t *indices, int r, int rows, int topk, int tileRows = 8) {
+    const int first = r / (tileRows * topk) * (tileRows * topk);
+    const int end = min(rows * topk, first + tileRows * topk);
     int rank = first;
     for (int j = first; j < end; ++j)
         rank += indices[j] < indices[r] || (indices[j] == indices[r] && j < r);
@@ -173,34 +184,34 @@ __global__ void PublishNativeBatchMoe(NativeMoeControl *box, uint16_t *hostInput
         const uint16_t *input, const int32_t *indices, const float *scores,
         const int32_t *keys, const int32_t *slotKeys, int32_t *slots, int32_t *routeMap,
         unsigned long long *hits, unsigned long long *misses,
-        int base, int experts, int hidden, int rows, int topk) {
+        int base, int experts, int hidden, int rows, int topk, int tileRows = 8) {
     for (int c = threadIdx.x; c < rows * hidden; c += blockDim.x) hostInput[c] = input[c];
     for (int r = threadIdx.x; r < rows * topk; r += blockDim.x) {
         const int expert = indices[r], key = base + expert;
         int slot = expert >= 0 && expert < experts ?
             fastllm::cuda::moe_admission::LoadAdmission(keys + key) : -1;
         if (slot >= 0 && slotKeys[slot] != key) slot = -1;
-        const int at = NativeBatchRouteRank(indices, r, rows, topk);
+        const int at = NativeBatchRouteRank(indices, r, rows, topk, tileRows);
         slots[at] = slot;
-        routeMap[at] = r % (8 * topk);
-        box->ids[r] = expert; box->resident[r] = slot; box->scores[r] = scores[r];
+        routeMap[at] = r % (tileRows * topk);
+        box->ids()[r] = expert; box->resident()[r] = slot; box->scores()[r] = scores[r];
         atomicAdd(slot >= 0 ? hits : misses, 1ULL);
     }
     __threadfence_system(); __syncthreads();
     if (!threadIdx.x) atomicExch_system(&box->published, 1u);
 }
 __global__ void ReadNativeBatchPlan(const NativeMoeControl *box, const int32_t *indices,
-        int32_t *staged, int32_t *gpu, int rows, int topk, bool sorted = true) {
+        int32_t *staged, int32_t *gpu, int rows, int topk, bool sorted = true, int tileRows = 8) {
     for (int r = threadIdx.x; r < rows * topk; r += blockDim.x) {
-        staged[sorted ? NativeBatchRouteRank(indices, r, rows, topk) : r] = box->staged[r];
-        gpu[r] = box->gpu[r];
+        staged[sorted ? NativeBatchRouteRank(indices, r, rows, topk, tileRows) : r] = box->staged()[r];
+        gpu[r] = box->gpu()[r];
     }
 }
 
 __global__ void ReadNativeMoePlan(const NativeMoeControl *box, int32_t *staged, int32_t *gpu, int topk) {
     if (threadIdx.x < topk) {
-        staged[threadIdx.x] = box->staged[threadIdx.x];
-        gpu[threadIdx.x] = box->gpu[threadIdx.x];
+        staged[threadIdx.x] = box->staged()[threadIdx.x];
+        gpu[threadIdx.x] = box->gpu()[threadIdx.x];
     }
 }
 
@@ -337,13 +348,15 @@ struct NativeMoeMailbox {
         bool Init(const OffloadLayout &layout, int selected, int device, int inputRows = 1, std::shared_ptr<ComputeScratch> shared = {}) {
             standard = !layout.deepSeekV41 && !layout.glm5;
             hidden = layout.hidden; topk = selected; rows = inputRows; routes = rows * topk;
-            if (cudaHostAlloc(&host, sizeof(*host), cudaHostAllocMapped) != cudaSuccess ||
+            if (cudaHostAlloc(&host, sizeof(*host) + size_t(routes) * 5 * sizeof(int32_t), cudaHostAllocMapped) != cudaSuccess ||
                 cudaHostGetDevicePointer(&mapped, host, 0) != cudaSuccess ||
                 cudaHostAlloc(&hostData, (routes + rows) * hidden * sizeof(float), cudaHostAllocMapped) != cudaSuccess ||
                 cudaHostGetDevicePointer(&mappedData, hostData, 0) != cudaSuccess ||
                 cudaMalloc(&slots, (rows > 1 ? 3 * routes : 5 * routes + 1) * sizeof(int32_t)) != cudaSuccess ||
                 (!standard && rows > 1 && cudaMalloc(&routeMap, routes * sizeof(int32_t)) != cudaSuccess)) return false;
             new (host) NativeMoeControl{};
+            host->routes = routes;
+            std::fill_n(host->ids(), size_t(routes) * 5, int32_t(0));
             std::fill_n(hostData, (routes + rows) * hidden, 0.0f);
             for (auto *e : {&begin, &residentDone, &stagedBegin, &done, &completed, &uploadBegin, &uploadDone})
                 if (cudaEventCreate(e) != cudaSuccess) return false;
@@ -371,6 +384,11 @@ struct NativeMoeMailbox {
     std::map<ScratchKey, std::weak_ptr<ComputeScratch>> fullScratch;
     std::thread dispatcher;
     std::vector<int> dispatcherCpus;
+    // Request cleanup may release a draft graph on a consumer thread while
+    // the executor creates or replays another graph owned by this mailbox.
+    // Serialize handle ownership and timing retirement, separately from the
+    // dispatch queue lock. Finish() is also called by the owning operations.
+    std::recursive_mutex lifecycleMutex;
     std::mutex mutex;
     std::condition_variable wake, drained;
     std::deque<Request> queue;
@@ -386,6 +404,7 @@ struct NativeMoeMailbox {
         if (cpus.size() == 1) dispatcherCpus = cpus.front();
     }
     void Finish(bool observe) {
+        std::lock_guard<std::recursive_mutex> lifecycle(lifecycleMutex);
         std::unique_lock<std::mutex> lock(mutex);
         drained.wait(lock, [&] { return queue.empty() && !busy; });
         auto failure = std::exchange(error, nullptr);
@@ -484,25 +503,25 @@ struct NativeMoeMailbox {
                 int hits = 0;
                 std::array<int, kMaxTopK> order{};
                 for (int i = 0; i < w.topk; ++i) {
-                    fastllm::AssertInFastLLM(box.ids[i] >= 0 && box.ids[i] < layout.experts,
+                    fastllm::AssertInFastLLM(box.ids()[i] >= 0 && box.ids()[i] < layout.experts,
                                            "Native mailbox invalid expert ID.");
-                    if (box.resident[i] >= 0) {
+                    if (box.resident()[i] >= 0) {
                         if (!full) order[hits] = i;
                         ++hits;
                     }
                     if (!full) {
-                        box.gpu[i] = box.resident[i] >= 0 ? box.ids[i] : -1;
-                        box.staged[i] = -1;
+                        box.gpu()[i] = box.resident()[i] >= 0 ? box.ids()[i] : -1;
+                        box.staged()[i] = -1;
                     }
                 }
                 int next = hits;
                 for (int i = 0; !full && i < w.topk; ++i)
-                    if (box.resident[i] < 0) order[next++] = i;
-                cache.frequency->Observe(w.table * layout.experts, box.ids, w.topk);
+                    if (box.resident()[i] < 0) order[next++] = i;
+                cache.frequency->Observe(w.table * layout.experts, box.ids(), w.topk);
                 const int staged = full ? box.stagedCount : w.cost.SelectDecodeMisses(w.topk - hits, hits);
                 for (int i = 0; !full && i < staged; ++i) {
                     const int route = order[hits + i];
-                    box.staged[route] = i; box.gpu[route] = box.ids[route];
+                    box.staged()[route] = i; box.gpu()[route] = box.ids()[route];
                 }
                 w.hits = hits; w.staged = staged;
                 double cpuUs = 0;
@@ -510,7 +529,7 @@ struct NativeMoeMailbox {
                     if (full) return;
                     const double start = HybridNowUs();
                     for (int i = 0; i < staged; ++i)
-                        copy->CopyExpert(group, w.table, box.ids[order[hits + i]], i, staged);
+                        copy->CopyExpert(group, w.table, box.ids()[order[hits + i]], i, staged);
                     w.cost.dispatch.Observe(HybridNowUs() - start);
                     // Record a CUDA-visible dependency before letting the
                     // caller enqueue its result graph. A graph memory wait
@@ -527,8 +546,8 @@ struct NativeMoeMailbox {
                     w.submitted.store(true, std::memory_order_release);
                 };
                 fastllm::NumasMoeDecodeExpertsWithOverlap(w.hostData, w.hostData + w.hidden,
-                    w.weights.data(), box.ids, box.gpu, w.topk, w.modelLayer, upload,
-                    w.standard ? nullptr : box.scores, layout.swigluLimit, 32, &cpuUs);
+                    w.weights.data(), box.ids(), box.gpu(), w.topk, w.modelLayer, upload,
+                    w.standard ? nullptr : box.scores(), layout.swigluLimit, 32, &cpuUs);
                 w.cost.ObserveDecodeCpu(w.topk - hits - staged, cpuUs);
                 ++w.cost.calls;
                 {
@@ -546,12 +565,12 @@ struct NativeMoeMailbox {
                 // thread. Invalid output is never returned as a successful step.
                 std::fill_n(w.hostData + w.rows * w.hidden, w.routes * w.hidden, 0.0f);
                 if (w.rows > 1 && !__atomic_load_n(&box.planned, __ATOMIC_ACQUIRE)) {
-                    std::fill_n(box.staged, w.routes, -1); std::fill_n(box.gpu, w.routes, -1);
+                    std::fill_n(box.staged(), w.routes, -1); std::fill_n(box.gpu(), w.routes, -1);
                     box.stagedCount = 0;
                     __atomic_store_n(&box.planned, 1u, __ATOMIC_RELEASE);
                 }
                 if (!full) {
-                    std::fill_n(box.gpu, w.topk, -1); std::fill_n(box.staged, w.topk, -1);
+                    std::fill_n(box.gpu(), w.topk, -1); std::fill_n(box.staged(), w.topk, -1);
                     ReadNativeMoePlan<<<1, 32, 0, copy->copyStream>>>(w.mapped,
                         w.slots+w.topk, w.slots+2*w.topk, w.topk);
                     cudaEventRecord(w.done, copy->copyStream);
@@ -566,24 +585,24 @@ struct NativeMoeMailbox {
         std::vector<int> missed, reuse;
         w.hits = 0;
         for (int r = 0; r < w.routes; ++r) {
-            fastllm::AssertInFastLLM(box.ids[r] >= 0 && box.ids[r] < layout.experts,
+            fastllm::AssertInFastLLM(box.ids()[r] >= 0 && box.ids()[r] < layout.experts,
                                    "Native verifier mailbox invalid expert ID.");
-            box.staged[r] = -1;
-            box.gpu[r] = box.resident[r] >= 0 ? box.ids[r] : -1;
-            if (box.resident[r] >= 0) { ++w.hits; continue; }
-            auto found = std::find(missed.begin(), missed.end(), box.ids[r]);
-            if (found == missed.end()) { missed.push_back(box.ids[r]); reuse.push_back(1); }
+            box.staged()[r] = -1;
+            box.gpu()[r] = box.resident()[r] >= 0 ? box.ids()[r] : -1;
+            if (box.resident()[r] >= 0) { ++w.hits; continue; }
+            auto found = std::find(missed.begin(), missed.end(), box.ids()[r]);
+            if (found == missed.end()) { missed.push_back(box.ids()[r]); reuse.push_back(1); }
             else ++reuse[found - missed.begin()];
         }
         for (size_t i = 0; i < missed.size(); ++i) for (size_t j = i + 1; j < missed.size(); ++j)
             if (reuse[j] > reuse[i]) { std::swap(reuse[i], reuse[j]); std::swap(missed[i], missed[j]); }
-        cache.frequency->Observe(w.table * layout.experts, box.ids, w.routes);
+        cache.frequency->Observe(w.table * layout.experts, box.ids(), w.routes);
         w.staged = std::min(kMaxTopK, w.cost.SelectMisses(missed.size(), w.hits, reuse.data()));
         w.stagedRoutes = 0;
         for (int i = 0; i < w.staged; ++i) {
             box.stagedExperts[i] = missed[i]; box.stagedSlots[i] = i;
-            for (int r = 0; r < w.routes; ++r) if (box.ids[r] == missed[i]) {
-                box.staged[r] = i; box.gpu[r] = box.ids[r]; ++w.stagedRoutes;
+            for (int r = 0; r < w.routes; ++r) if (box.ids()[r] == missed[i]) {
+                box.staged()[r] = i; box.gpu()[r] = box.ids()[r]; ++w.stagedRoutes;
             }
         }
         box.stagedCount = w.staged;
@@ -598,11 +617,11 @@ struct NativeMoeMailbox {
             // scanning every expert again on each layer's critical path.
             if (w.standard) fastllm::NumasMoeDecodeExpertsBatch(w.hostData,
                 w.hostData + w.rows * w.hidden, w.rows, w.weights.data(), w.weights.size(),
-                box.ids, box.gpu, box.scores, w.topk, w.modelLayer);
+                box.ids(), box.gpu(), box.scores(), w.topk, w.modelLayer);
             else fastllm::NumasMoeVerifyExpertsWithOverlap(
                 reinterpret_cast<const uint16_t *>(w.hostData),
                 w.hostData + w.rows * w.hidden, w.rows, w.weights.data(), w.weights.size(),
-                box.ids, box.gpu, box.scores, w.topk, w.modelLayer, layout.swigluLimit,
+                box.ids(), box.gpu(), box.scores(), w.topk, w.modelLayer, layout.swigluLimit,
                 true, 32, {}, nullptr, group.cpuDecodeReady);
             w.cost.cpuExpert.Observe((HybridNowUs() - begin) / cpuRoutes);
         }
@@ -679,8 +698,9 @@ struct NativeMoeMailbox {
     }
     static bool ComputeBatch(Layer &w, const OffloadLayout &layout, const uint8_t *records,
             const int32_t *slots, const float *scores) {
-        for (int first = 0; first < w.rows; first += 8) {
-            const int rows = std::min(8, w.rows - first), base = first * w.topk;
+        const int tileRows = NativeBatchTileRows(layout, w.rows);
+        for (int first = 0; first < w.rows; first += tileRows) {
+            const int rows = std::min(tileRows, w.rows - first), base = first * w.topk;
             fastllm::Data input, gate, dummy;
             input.FakeFrom(w.compute->quantized, size_t(first) * w.hidden * 2); input.Resize({rows, w.hidden});
             gate.FakeFrom(w.compute->gate, size_t(base) * layout.inter * 2); gate.Resize({rows*w.topk, layout.inter});
@@ -720,13 +740,20 @@ struct NativeMoeMailbox {
         if (layout.weightType==fastllm::EXL3) {
             // Resident, staged and shared experts have independent scratch;
             // their captured branches can execute concurrently.
-            fastllm::AssertInFastLLM(stream==cudaStreamPerThread && w.owner && w.rows<=8,
+            fastllm::AssertInFastLLM(stream==cudaStreamPerThread && w.owner,
                 "EXL3 mailbox requires the full-graph compute stream");
-            fastllm::AssertInFastLLM(FastllmCudaExl3Cache(w.compute->quantized,records,slots,
-                resident?w.owner->cache.slotOffsets:nullptr,layout.recordStride,layout.downOffset,
-                layout.inter,layout.gateBlockK,layout.downBlockK,scores,w.topk,layout.swigluLimit,
-                w.compute->partial+(resident?0:size_t(w.routes)*w.hidden),resident?0:1,
-                w.rows>1?w.routeMap:nullptr,w.routes),"EXL3 graph expert compute failed");
+            for (int first = 0; first < w.rows; first += 8) {
+                const int rows = std::min(8, w.rows - first), base = first * w.topk;
+                fastllm::Data input;
+                input.FakeFrom(w.compute->quantized, size_t(first) * w.hidden * sizeof(uint16_t));
+                input.Resize({rows, w.hidden});
+                fastllm::AssertInFastLLM(FastllmCudaExl3Cache(input, records, slots + base,
+                    resident ? w.owner->cache.slotOffsets : nullptr, layout.recordStride, layout.downOffset,
+                    layout.inter, layout.gateBlockK, layout.downBlockK, scores + base, w.topk, layout.swigluLimit,
+                    w.compute->partial + (resident ? 0 : size_t(w.routes) * w.hidden) + size_t(base) * w.hidden,
+                    resident ? 0 : 1, w.routeMap ? w.routeMap + base : nullptr, rows * w.topk),
+                    "EXL3 graph expert compute failed");
+            }
             return;
         }
         if (resident && w.hidden % 256 == 0 && layout.inter % 32 == 0 && FastllmCudaRuntimeArch() == 120) {
@@ -795,6 +822,7 @@ struct NativeMoeMailbox {
     Layer *CreateFull(int table, const fastllm::Data &input, const fastllm::Data &index,
             const fastllm::Data &score, fastllm::Data &output, fastllm::Data **weights,
             int weightsBatch, int layer, cudaGraph_t sharedGraph) {
+        std::lock_guard<std::recursive_mutex> lifecycle(lifecycleMutex);
         if (failed) return nullptr;
         Finish(true);
         const auto &layout = group.LayerLayout(table);
@@ -804,9 +832,9 @@ struct NativeMoeMailbox {
         const ScratchKey scratchKey{layout.hidden, layout.inter, input.dims[0], topk,
             int(layout.weightType), int(layout.deepSeekV41), int(layout.glm5)};
         auto fresh = std::make_unique<Layer>();
-        if (!fresh->Init(layout, topk, cache.device, input.dims[0], group.qwen38FlashNext ? fullScratch[scratchKey].lock() : nullptr))
+        if (!fresh->Init(layout, topk, cache.device, input.dims[0], fullScratch[scratchKey].lock()))
             return nullptr;
-        if (group.qwen38FlashNext) fullScratch[scratchKey] = fresh->compute;
+        fullScratch[scratchKey] = fresh->compute;
         auto &w = *fresh;
         w.sharedQ8Input = group.qwen38FlashNext && w.standard &&
             layout.weightType == fastllm::DATA_GGUF_FORMAT &&
@@ -820,6 +848,8 @@ struct NativeMoeMailbox {
         w.pointers = {input.cudaData, index.cudaData, score.cudaData, output.cudaData};
         cudaDeviceProp prop;
         if (cudaGetDeviceProperties(&prop, cache.device) != cudaSuccess) return nullptr;
+        if (layout.weightType == fastllm::NVFP4_BLOCK_32_E8M0) (void)Mxfp4BatchMmaSupported();
+        WarmupMxfp4KernelPlan(layout,cache,w.rows,topk);
         const auto launch = fastllm::cuda::RecordCopyConfiguration(layout.recordStride, kMaxTopK, prop);
         if (layout.weightType==fastllm::EXL3) {
             if (!PrepareCacheInput(layout,input,w.compute->quantized)) return nullptr;
@@ -838,7 +868,7 @@ struct NativeMoeMailbox {
                 reinterpret_cast<uint16_t *>(w.mappedData), static_cast<const uint16_t *>(input.cudaData),
                 static_cast<const int32_t *>(index.cudaData), static_cast<const float *>(score.cudaData),
                 cache.keyToSlot, cache.slotKeys, w.slots, w.routeMap, cache.hitCount, cache.totalMissCount,
-                table * layout.experts, layout.experts, w.hidden, w.rows, topk);
+                table * layout.experts, layout.experts, w.hidden, w.rows, topk, NativeBatchTileRows(layout, w.rows));
             else PublishNativeMoe<<<1, w.hidden >= 4096 ? 512 : 256, 0, cudaStreamPerThread>>>(w.mapped, w.mappedData,
                 static_cast<const __nv_bfloat16 *>(input.cudaData), static_cast<const int32_t *>(index.cudaData),
                 static_cast<const float *>(score.cudaData), cache.keyToSlot, cache.slotKeys, w.slots,
@@ -863,27 +893,17 @@ struct NativeMoeMailbox {
                     w.compute->ggufWorkspace[0].cudaData, w.compute->ggufWorkspace[0].GetBytes())) return false;
             if (FastllmCudaStreamGetCaptureDependencies(cudaStreamPerThread, &status, &graph, &deps, &count) != cudaSuccess) return false;
             std::vector<cudaGraphNode_t> fork(deps, deps + count);
-            if (w.standard) {
-                if (!ComputeStandard(w, layout, cache.records, w.slots,
-                        static_cast<const float *>(score.cudaData), true)) return false;
-            } else if (layout.weightType == fastllm::DATA_GGUF_FORMAT) {
-                if (!ComputeGGUF(w, layout, cache.records, w.slots,
-                        static_cast<const float *>(score.cudaData), true)) return false;
-            } else if (layout.weightType != fastllm::EXL3 && (w.rows > 1 || layout.weightType == fastllm::FP8_E4M3_BLOCK_128)) {
-                if (!ComputeBatch(w, layout, cache.records, w.slots, static_cast<const float *>(score.cudaData))) return false;
-            } else Compute(w, layout, cache.records, w.slots, static_cast<const float *>(score.cudaData), cudaStreamPerThread, true);
-            if (cudaEventRecordWithFlags(w.residentDone, cudaStreamPerThread, cudaEventRecordExternal) != cudaSuccess) return false;
-            if (FastllmCudaStreamGetCaptureDependencies(cudaStreamPerThread, &status, &graph, &deps, &count) != cudaSuccess) return false;
-            std::vector<cudaGraphNode_t> residentTail(deps, deps + count);
-            // Resident and staged routes write disjoint gate/partial rows.
-            // Both depend on publication and quantization, and join at Reduce.
-            if (FastllmCudaStreamUpdateCaptureDependencies(cudaStreamPerThread, fork.data(), fork.size(),
-                    cudaStreamSetCaptureDependencies) != cudaSuccess) return false;
+            std::vector<cudaGraphNode_t> residentFork = fork;
+            // Resolve the small batch plan before forking the two GPU paths.
+            // Otherwise the plan reader itself can queue behind resident CTA
+            // waves, leaving the entire copy branch on the completion tail.
             if (w.rows > 1) {
                 WaitNativeMoe<<<1, 1, 0, cudaStreamPerThread>>>(&w.mapped->planned);
                 ReadNativeBatchPlan<<<1, 256, 0, cudaStreamPerThread>>>(w.mapped,
                     static_cast<const int32_t *>(index.cudaData), w.slots + w.routes,
-                    w.slots + 2 * w.routes, w.rows, topk, !w.standard);
+                    w.slots + 2 * w.routes, w.rows, topk, !w.standard, NativeBatchTileRows(layout, w.rows));
+                if (FastllmCudaStreamGetCaptureDependencies(cudaStreamPerThread, &status, &graph, &deps, &count) != cudaSuccess) return false;
+                residentFork.assign(deps, deps + count);
             }
             if (cudaEventRecordWithFlags(w.uploadBegin, cudaStreamPerThread, cudaEventRecordExternal) != cudaSuccess) return false;
             // GPU reads the selected pinned records using device-side IDs.
@@ -930,12 +950,28 @@ struct NativeMoeMailbox {
                 if (!ComputeBatch(w, layout, fullCopy->records, w.slots + w.routes, static_cast<const float *>(score.cudaData))) return false;
             } else Compute(w, layout, fullCopy->records, w.slots + w.routes, static_cast<const float *>(score.cudaData), cudaStreamPerThread);
             if (cudaEventRecordWithFlags(w.done, cudaStreamPerThread, cudaEventRecordExternal) != cudaSuccess) return false;
-            if (FastllmCudaStreamUpdateCaptureDependencies(cudaStreamPerThread, residentTail.data(), residentTail.size(),
+            if (FastllmCudaStreamGetCaptureDependencies(cudaStreamPerThread, &status, &graph, &deps, &count) != cudaSuccess) return false;
+            std::vector<cudaGraphNode_t> stagedTail(deps, deps + count);
+            // The resident branch consumes the same immutable activation and
+            // writes disjoint route rows. Join both branches before reducing.
+            if (FastllmCudaStreamUpdateCaptureDependencies(cudaStreamPerThread, residentFork.data(), residentFork.size(),
+                    cudaStreamSetCaptureDependencies) != cudaSuccess) return false;
+            if (w.standard) {
+                if (!ComputeStandard(w, layout, cache.records, w.slots,
+                        static_cast<const float *>(score.cudaData), true)) return false;
+            } else if (layout.weightType == fastllm::DATA_GGUF_FORMAT) {
+                if (!ComputeGGUF(w, layout, cache.records, w.slots,
+                        static_cast<const float *>(score.cudaData), true)) return false;
+            } else if (layout.weightType != fastllm::EXL3 && (w.rows > 1 || layout.weightType == fastllm::FP8_E4M3_BLOCK_128)) {
+                if (!ComputeBatch(w, layout, cache.records, w.slots, static_cast<const float *>(score.cudaData))) return false;
+            } else Compute(w, layout, cache.records, w.slots, static_cast<const float *>(score.cudaData), cudaStreamPerThread, true);
+            if (cudaEventRecordWithFlags(w.residentDone, cudaStreamPerThread, cudaEventRecordExternal) != cudaSuccess) return false;
+            if (FastllmCudaStreamUpdateCaptureDependencies(cudaStreamPerThread, stagedTail.data(), stagedTail.size(),
                     cudaStreamAddCaptureDependencies) != cudaSuccess) return false;
             WaitNativeMoe<<<1, 1, 0, cudaStreamPerThread>>>(&w.mapped->computed);
             if (layout.weightType==fastllm::EXL3) ReduceNativeScoredMailbox<<<dim3((w.hidden+255)/256,w.rows),256,0,cudaStreamPerThread>>>(
                 w.mappedData+w.rows*w.hidden,w.compute->partial,w.compute->partial+size_t(w.routes)*w.hidden,
-                w.rows>1?w.mapped->resident:w.slots,w.slots+2*w.routes,static_cast<const int32_t *>(index.cudaData),
+                w.rows>1?w.mapped->resident():w.slots,w.slots+2*w.routes,static_cast<const int32_t *>(index.cudaData),
                 static_cast<__nv_bfloat16 *>(output.cudaData),w.hidden,topk);
             else if (w.standard) ReduceStandardMailbox<<<dim3((w.hidden+255)/256, w.rows), 256, 0, cudaStreamPerThread>>>(
                 w.mappedData + w.rows * w.hidden, w.compute->partial, w.compute->partial + w.routes * w.hidden,
@@ -954,6 +990,7 @@ struct NativeMoeMailbox {
         return handle;
     }
     void ReleaseFull(Layer *handle) {
+        std::lock_guard<std::recursive_mutex> lifecycle(lifecycleMutex);
         Finish(true);
         auto it = std::find_if(fullLayers.begin(), fullLayers.end(),
             [handle](const std::unique_ptr<Layer> &layer) { return layer.get() == handle; });
@@ -1001,6 +1038,7 @@ struct NativeMoeMailbox {
         return true;
     }
     bool CreateReplay(cudaGraph_t source, void *const *handles, int count, void **result) {
+        std::lock_guard<std::recursive_mutex> lifecycle(lifecycleMutex);
         std::vector<cudaEvent_t> events;
         for (int i = 0; i < count; ++i) {
             auto *w = static_cast<Layer *>(handles[i]);
@@ -1019,6 +1057,7 @@ struct NativeMoeMailbox {
         return true;
     }
     bool LaunchFull(void *exec, void *const *handles, int count, bool timed) {
+        std::lock_guard<std::recursive_mutex> lifecycle(lifecycleMutex);
         Finish(true);
         if (!cache.frequencyActive) return false;
         for (int i = 0; i < count; ++i) {
@@ -1071,6 +1110,7 @@ struct NativeMoeMailbox {
     bool Submit(int table, const fastllm::Data &input, const fastllm::Data &index,
             const fastllm::Data &score, fastllm::Data &output, fastllm::Data **weights,
             int weightsBatch, int layer, const std::function<void()> &parallel) {
+        std::lock_guard<std::recursive_mutex> lifecycle(lifecycleMutex);
         if (failed || !memops.ready) return false;
         const int topk = index.dims[1];
         if (!copy) {
