@@ -1278,6 +1278,24 @@ class HybridAutoTest(unittest.TestCase):
                 self.assertEqual(reserve({"FASTLLM_CUDA_GRAPH": "1", flag: "1"}), eager)
         self.assertEqual(reserve({"FASTLLM_DSV41_REFERENCE_MATH": "0"}), reserve({}))
 
+    def test_joint_verifier_cache_reserves_concurrent_lifetimes(self):
+        g = auto.geometry(self.dspark_metadata(), "fp4", 0, 5)
+        a = args(auto=True, dspark=5, moe_device_layers=-1, max_batch=8)
+        with patch.dict(os.environ, {}, clear=True):
+            one = auto._v41_runtime_bytes(a, g, "pp", {0:1}, 0, 8192, 1, 4096)
+            joint = auto._v41_runtime_bytes(a, g, "pp", {0:1}, 0, 8192, 8, 4096)
+            # The complete LRU can contain eight distinct, nearly full joint
+            # verifiers. Their private route outputs and attention scores
+            # coexist; the previous estimate grew only with decode warmups.
+            private_floor = sum(range(41,49)) * g.layers * 4 * (
+                g.topk * g.hidden + g.runtime["heads"] *
+                (g.runtime["window"] + g.runtime["index_topk"]))
+            self.assertGreaterEqual(joint["graphs"][0] - one["graphs"][0], private_floor)
+            self.assertEqual(joint["prefill_persistent"], one["prefill_persistent"])
+        with patch.dict(os.environ, {"FASTLLM_CUDA_GRAPH":"0"}, clear=True):
+            eager = auto._v41_runtime_bytes(a, g, "pp", {0:1}, 0, 8192, 8, 4096)
+            self.assertEqual(eager["graphs"][0], 0)
+
     def test_v41_new_runtime_reserve_reduces_cache_without_changing_context(self):
         g = auto.geometry(self.dspark_metadata(), "fp4", 0, 7)
         costs = ([4 * GiB] * len(g.kv), [MiB] * len(g.kv), 0, 0, MiB, False)

@@ -4884,6 +4884,8 @@ namespace fastllm {
             bool replaying = false;
             bool captureFailed = false;
             int warmupRounds = 0;
+            bool jointVerify = false;
+            uint64_t lastUse = 0;
             int blockCnt = 0;
             std::string signature;             // 设备布局 / dtype 等，变化时重新捕获
             std::vector<int> devices;          // 参与的 CUDA 设备（单卡时只有一个）
@@ -5720,8 +5722,43 @@ namespace fastllm {
                     verifyGraph ? -(seqlen + (segments.size() > 1 ? FastllmV41FullDecodeMaxBatch : 0)) : v41AttentionRankRuntime ?
                     seqlen * 3 + (v41AttentionLogicalRows == 1 ? 0 : v41AttentionLogicalRows <= 8 ? 1 : 2) : seqlen;
                 auto found = v41CudaGraphSlots.find(graphKey);
+                const bool jointVerify = verifyGraph && !f.pipeline && segments.size() > 1;
+                if (jointVerify && found == v41CudaGraphSlots.end()) {
+                    // Shortened proposals can produce every row count up to
+                    // maxBatch * (drafts + 1). Keep a bounded LRU of joint
+                    // shapes; ordinary decode and single-request warmups have
+                    // separate slots. The capacity planner reserves this same
+                    // number of maximum-size workspaces.
+                    const int capacity = std::max(1, this->maxBatch);
+                    for (;;) {
+                        int count = 0;
+                        auto oldest = v41CudaGraphSlots.end();
+                        uint64_t age = UINT64_MAX;
+                        for (auto it = v41CudaGraphSlots.begin(); it != v41CudaGraphSlots.end(); ++it) {
+                            if (!it->second) continue;
+                            auto state = V41GetCudaGraphState(it->second);
+                            if (!state->jointVerify) continue;
+                            ++count;
+                            if (state->lastUse < age) { age = state->lastUse; oldest = it; }
+                        }
+                        if (count < capacity || oldest == v41CudaGraphSlots.end()) break;
+                        // Retirement may release graph-pinned pool addresses.
+                        // Drain their devices before making those addresses
+                        // available to a new shape; warm cache hits never sync.
+                        auto retired = V41GetCudaGraphState(oldest->second);
+                        const int originalDevice = FastllmCudaGetDevice();
+                        for (int device : retired->devices) FastllmCudaSyncDevice(device);
+                        FastllmCudaSetDevice(originalDevice);
+                        v41CudaGraphSlots.erase(oldest);
+                    }
+                }
                 if (v41CudaGraphWarmingUp || verifyGraph || found != v41CudaGraphSlots.end()) {
                     graphState = V41GetCudaGraphState(v41CudaGraphSlots[graphKey]);
+                    if (jointVerify) {
+                        static std::atomic<uint64_t> access{0};
+                        graphState->jointVerify = true;
+                        graphState->lastUse = access.fetch_add(1, std::memory_order_relaxed) + 1;
+                    }
                 }
             }
             if (!graphState || (graphState->disabled && !f.pipeline)) {
@@ -8251,6 +8288,9 @@ namespace fastllm {
                     BuildFullDecodeGraph(batch, segments);
                 }
                 if (v41DsparkEnabled) {
+                    if (this->maxBatch > 1)
+                        printf("[Warmup] DeepSeek-V4.1 joint verify graph cache: %d slots, up to %lld rows per slot.\n",
+                               this->maxBatch, (long long)this->maxBatch * (v41DsparkTokens + 1));
                     // Confidence filtering and the output limit can shorten a
                     // proposal. Warm every supported verification shape, using
                     // private KV so no synthetic history enters a real request.

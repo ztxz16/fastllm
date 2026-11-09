@@ -1211,7 +1211,16 @@ def _v41_runtime_bytes(args, model, mode, mapping, resident, context, batch, chu
     shapes = list(dict.fromkeys([1 << i for i in range(batch.bit_length())] + [batch]))
     if hybrid and mode == "pp" and len(mapping) > 1 and drafts:
         shapes = []  # PP DSpark captures verifier stages, not ordinary one-token forwards.
-    shapes.extend(range(2, drafts + 2))
+    if drafts:
+        # A final one-token verifier has a separate slot from ordinary decode.
+        shapes.extend(range(1, drafts + 2))
+    if drafts and batch > 1 and (mode != "pp" or len(mapping) == 1):
+        # Joint verification has its own bounded LRU, with max_batch slots.
+        # Budget every slot at the largest possible aggregate row count: mixed
+        # output limits/confidence filtering can leave several near-maximum
+        # shapes resident at once. These coexist with the single-request and
+        # ordinary decode slots above, including after their requests finish.
+        shapes.extend([batch * (drafts + 1)] * batch)
     page_bytes = 64 * 1024
 
     def page(n):
