@@ -380,7 +380,8 @@ static void FastllmCudaPrintMallocStack(size_t size, const char *file, int line,
     fflush(stderr);
 }
 
-cudaError_t FastllmCudaCheckedMalloc(void **ret, size_t size, const char *file, int line) {
+// Pool internals already hold their device lock and perform their own recovery.
+static cudaError_t FastllmCudaCheckedMallocRaw(void **ret, size_t size, const char *file, int line) {
     if (ret != nullptr) {
         *ret = nullptr;
     }
@@ -4744,7 +4745,7 @@ static cudaError_t FastllmCudaCheckedMallocWithIdlePoolRetry(
     if (ret != nullptr) {
         *ret = nullptr;
     }
-    cudaError_t state = FastllmCudaCheckedMalloc(ret, size, file, line);
+    cudaError_t state = FastllmCudaCheckedMallocRaw(ret, size, file, line);
     if (cudaSuccess == state || state != cudaErrorMemoryAllocation ||
         fastllmCudaMallocDisabled.load(std::memory_order_relaxed)) {
         return state;
@@ -4754,7 +4755,25 @@ static cudaError_t FastllmCudaCheckedMallocWithIdlePoolRetry(
     if (released == 0) {
         return state;
     }
-    return FastllmCudaCheckedMalloc(ret, size, file, line);
+    return FastllmCudaCheckedMallocRaw(ret, size, file, line);
+}
+
+static void FastllmCudaReleaseIdleCachedBuffersForDevice(int device);
+cudaError_t FastllmCudaCheckedMalloc(void **ret, size_t size, const char *file, int line) {
+    // Direct operator allocations must be able to reclaim eager scratch too.
+    // Keep the common successful allocation free of pool locks, and never
+    // release graph-owned memory or attempt cudaFree during capture.
+    cudaError_t state = FastllmCudaCheckedMallocRaw(ret, size, file, line);
+    if (state != cudaErrorMemoryAllocation || FastllmCudaGraphIsCapturingFast() ||
+        FastllmCudaGraphMemoryPoolActive() ||
+        fastllmCudaMallocDisabled.load(std::memory_order_relaxed)) return state;
+    int device = -1;
+    if (cudaGetDevice(&device) != cudaSuccess || device < 0) return state;
+    auto view = FastllmGetCudaMemPoolView(device);
+    std::lock_guard<std::mutex> lock(*view.lock);
+    cudaGetLastError();
+    FastllmCudaReleaseIdleCachedBuffersForDevice(device);
+    return FastllmCudaCheckedMallocRaw(ret, size, file, line);
 }
 
 static size_t fastllmCudaMemPoolAllocated = 0;
@@ -5401,7 +5420,7 @@ static bool FastllmCudaRetryMallocAfterReleasingIdle(
     }
     cudaGetLastError();
     FastllmCudaReleaseIdleCachedBuffersForDevice(id);
-    cudaError_t state = FastllmCudaCheckedMalloc(ret, size, file, line);
+    cudaError_t state = FastllmCudaCheckedMallocRaw(ret, size, file, line);
     if (failureState != nullptr) {
         *failureState = state;
     }
@@ -5663,7 +5682,7 @@ static void *FastllmCudaMallocImpl(
             FastllmCudaSetThreadError();
             return nullptr;
         }
-        state = FastllmCudaCheckedMalloc(&ret, size, __FILE__, __LINE__);
+        state = FastllmCudaCheckedMallocRaw(&ret, size, __FILE__, __LINE__);
         if (state == cudaErrorMemoryAllocation &&
             FastllmCudaRetryMallocAfterReleasingIdle(
                 size, &ret, id, __FILE__, __LINE__, &state)) {
@@ -5764,7 +5783,7 @@ static void *FastllmCudaMallocImpl(
         FastllmCudaSetThreadError();
         return nullptr;
     }
-    state = FastllmCudaCheckedMalloc(&ret, size, __FILE__, __LINE__);
+    state = FastllmCudaCheckedMallocRaw(&ret, size, __FILE__, __LINE__);
     if (state == cudaErrorMemoryAllocation &&
         FastllmCudaRetryMallocAfterReleasingIdle(
             size, &ret, id, __FILE__, __LINE__, &state)) {
@@ -6155,7 +6174,7 @@ int FastllmCudaTryMallocBigBuffers(size_t size, int count) {
         // ordinary OOM retry here: that retry releases existing idle blocks and
         // could turn a partially successful reserve into one final block while
         // still reporting success to the caller.
-        state = FastllmCudaCheckedMalloc(&ret, size, __FILE__, __LINE__);
+        state = FastllmCudaCheckedMallocRaw(&ret, size, __FILE__, __LINE__);
         if (state == cudaSuccess && ret == nullptr) {
             state = cudaErrorMemoryAllocation;
         }
