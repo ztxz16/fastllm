@@ -5,6 +5,7 @@
 #include "naive-n05-topk.cuh"
 #include "devices/cuda/naive-n05-kv.cuh"
 #include "naive-n05-dsa-decode.cuh"
+#include "naive-n05-attention-small.cuh"
 #include "naive-n05-attention-prefetch.cuh"
 #include "naive-n05-attention-hopper.cuh"
 #include "naive-n05-prefill.cuh"
@@ -2113,6 +2114,76 @@ __global__ void AttentionShortDecode(const BF16 *q, FastllmNaiveKV k, FastllmNai
         }
         out[(size_t)h * kSwaValueDim + firstDim + t] = __float2bfloat16(result);
     }
+}
+
+// Reuse a KV tile across four complete GQA heads without changing the
+// scalar QK reduction, softmax tree or ordered PV accumulation. Small batches
+// and devices without enough shared memory retain AttentionShortDecode.
+template<int Groups> struct GroupedSwaStorage {
+    __align__(16) BF16 key[128][200], value[128][128];
+    float scores[Groups][128], scratch[Groups / 2][256];
+    float maximum[Groups / 2], denominator[Groups / 2];
+    int physical[128];
+};
+template<int Groups>
+__global__ void GroupedSwaDecode(const BF16 *q, const float *sink, BF16 *out,
+        int heads, int kvHeads, const BatchSwaKeys batch) {
+    constexpr int Threads=Groups*128;
+    const int t=threadIdx.x, row=blockIdx.y, firstHead=blockIdx.x*Groups;
+    const auto &cache=batch.rows[row];
+    const int length=batch.length?batch.length[row]:cache.length, count=min(length,128);
+    if(count<=0) {
+        for(int i=t;i<Groups*128;i+=Threads)out[((size_t)row*heads+firstHead)*128+i]=__float2bfloat16(0.f);
+        return;
+    }
+    extern __shared__ __align__(16) unsigned char memory[];
+    auto &s=*(GroupedSwaStorage<Groups>*)memory;
+    const int kh=firstHead/(heads/kvHeads), first=max(0,length-128), prefix=length-cache.verifyOffset-1;
+    if(t<128) {
+        int logical=first+t;
+        s.physical[t]=t<count?(cache.verifyOffset>=0&&logical>=prefix?128+logical-prefix:logical&127):-1;
+    }
+    __syncthreads();
+    FastllmNaiveKV key(cache.cache?cache.cache[0]:cache.key,nullptr,0,cache.fp8);
+    FastllmNaiveKV value(cache.cache?cache.cache[1]:cache.value,nullptr,0,cache.fp8);
+    for(int i=t;i<128*24;i+=Threads) {
+        int r=s.physical[i/24],d=i%24*8;
+        naive_dsa_decode::Copy<false>(&s.key[i/24][d],key.Row(max(0,r),kvHeads*192)+kh*192+d,r>=0);
+    }
+    for(int i=t;i<128*16;i+=Threads) {
+        int r=s.physical[i/16],d=i%16*8;
+        naive_dsa_decode::Copy<false>(&s.value[i/16][d],value.Row(max(0,r),kvHeads*128)+kh*128+d,r>=0);
+    }
+    const int h=t/128,lane=t%32,warp=(t%128)/32;
+    float qr[6];
+    #pragma unroll
+    for(int d=0;d<6;++d)qr[d]=float(q[((size_t)row*heads+firstHead+h)*192+lane+d*32]);
+    __syncthreads();
+    for(int i=warp;i<count;i+=4) {
+        float dot=0;
+        #pragma unroll
+        for(int d=0;d<6;++d)dot=fmaf(qr[d],float(s.key[i][lane+d*32]),dot);
+        dot=naive_dsa_decode::WarpSum(dot);
+        if(!lane)s.scores[h][i]=RoundBF16(RoundBF16(dot)*rsqrtf(192.f));
+    }
+    __syncthreads();
+    for(int wave=0;wave<2;++wave) {
+        const int group=t/256,head=group+wave*(Groups/2);
+        naive_dsa_decode::Normalize(s.scores[head],s.scores[head],sink,firstHead+head,count,
+            s.scratch[group],s.maximum[group],s.denominator[group],t%256);
+        __syncthreads();
+    }
+    float sum=0;
+    for(int first=0;first<count;first+=8) {
+        float p[8],v[8];
+        #pragma unroll
+        for(int i=0;i<8;++i)if(first+i<count) {
+            p[i]=s.scores[h][first+i];v[i]=float(s.value[first+i][t%128]);
+        }
+        #pragma unroll
+        for(int i=0;i<8;++i)if(first+i<count)sum=fmaf(p[i],v[i],sum);
+    }
+    out[((size_t)row*heads+firstHead+h)*128+t%128]=__float2bfloat16(sum);
 }
 
 // Dispatch by workload shape, independent of TP rank count. All variants retain
@@ -5424,6 +5495,38 @@ bool PrefetchFP4DSAAttention(const fastllm::Data &query, const float *bias,
     return true;
 }
 
+// Small batches keep the scalar reference's rounding while sharing KV across
+// complete GQA groups. Other layouts retain the existing attention paths.
+bool SmallDSAAttention(const fastllm::Data &query, const fastllm::Data &sink,
+        const std::vector<FastllmNaiveDSARow> &rows, int heads, int kvHeads,
+        int dim, int valueDim, FastllmNaiveDecodeScratch &scratch, fastllm::Data &output) {
+    namespace small = naive_attention_small;
+    using namespace fastllm;
+    if (rows.empty() || rows.size() >= 32 || dim != 192 || valueDim != 128 ||
+        heads < 16 || (heads / kvHeads) % 16 != 0) return false;
+    for (const auto &row : rows)
+        if (!row.indices || row.selectedCount != 2048 || row.fp4 || row.keyStride % 8 ||
+            (uintptr_t)row.key % 16 || (uintptr_t)row.value % 16) return false;
+    if (!BulkKernelSupported(small::Scores<16>, sizeof(small::SparseScoreStorage<16>), 90) ||
+        !BulkKernelSupported(small::Values, sizeof(small::ValueStorage), 90)) return false;
+    const int count = rows.size();
+    FastllmNaiveDSABatch batch{};
+    std::copy(rows.begin(), rows.end(), batch.rows);
+    Output(output, BFLOAT16, {1, count, heads * 128});
+    Output(scratch.attentionScores, FLOAT32, {count, heads, 2048});
+    Output(scratch.attentionPartial, FLOAT32, {count, heads, 32, 128});
+    auto *scores = (float *)scratch.attentionScores.cudaData;
+    auto *parts = (float *)scratch.attentionPartial.cudaData;
+    const auto *bias = sink.dims.empty() ? nullptr : (const float *)sink.cudaData;
+    small::Scores<16><<<dim3(heads / 16, 16, count), 512, sizeof(small::SparseScoreStorage<16>)>>>(
+        (const BF16 *)query.cudaData, batch, scores, heads, kvHeads, 2048);
+    naive_dsa_decode::Softmax<<<count * heads, 256>>>(scores, bias, batch, heads, 2048);
+    small::Values<<<dim3(heads / 16, 32, count), 256, sizeof(small::ValueStorage)>>>(
+        scores, batch, parts, heads, kvHeads);
+    small::MergeValues<<<dim3(heads, count), 128>>>(parts, batch, (BF16 *)output.cudaData, heads);
+    return true;
+}
+
 template <int Max, bool Ring>
 bool BulkAttention(const fastllm::Data &query, const float *bias,
         const std::vector<FastllmNaiveDSARow> &rows, int heads, int kvHeads, fastllm::Data &output) {
@@ -5555,6 +5658,9 @@ void FastllmCudaNaiveBatchDSADecode(const fastllm::Data &query,
         hopper = hopper && (uintptr_t)row.value % 16 == 0;
     }
     AssertInFastLLM(count <= 2048, "Batched DSA supports at most 2048 selected keys.");
+    if (SmallDSAAttention(query, sink, rows, heads, kvHeads, dim, valueDim, scratch, output)) {
+        CheckLaunch(); return;
+    }
     // Keep the established small-batch kernels. Eight heads share KV only
     // when the complete GQA group and cache vectors satisfy the MMA layout.
     bool bulk = rows.size() >= 32 && dim == 192 && valueDim == 128 &&
@@ -5665,13 +5771,17 @@ void FastllmCudaNaiveBatchDSADecode(const fastllm::Data &query,
         hopper = found->second;
     }
     Output(output, BFLOAT16, {1, (int)rows.size(), heads * valueDim});
-    // Share the sparse V tile across four heads for this scalar GQA shape.
+    // Share the sparse V tile across complete groups of four query heads.
     // Each head keeps the existing softmax tree and ordered PV accumulation.
     // Other shapes and unsupported compiled images retain their original path.
-    const bool grouped16 = hopper && sparse && heads == 16 && kvHeads == 1 &&
+    const bool groupedSparse = hopper && sparse && heads >= 16 && (heads / kvHeads) % 4 == 0 &&
         rows.size() >= 2 && rows.size() < 32 &&
         BulkKernelSupported(dsa::GroupedValues<2048, 4, 8, true>,
             sizeof(dsa::GroupStorage<2048, 4, 8>), 90);
+    const bool groupedScores = groupedSparse && (heads / kvHeads) % 16 == 0 &&
+        std::all_of(rows.begin(), rows.end(), [](const auto &r) {
+            return r.keyStride % 8 == 0 && (uintptr_t)r.key % 16 == 0;
+        });
     const int chunkSize = std::min((int)rows.size(), FastllmNaiveDSABatchLimit);
     // Reuse the score workspace. Fusion and sparse partials only use shared memory.
     Output(scratch.attentionScores, FLOAT32, {chunkSize, heads, std::max(1, count)});
@@ -5687,7 +5797,10 @@ void FastllmCudaNaiveBatchDSADecode(const fastllm::Data &query,
             const bool sharedHeads = heads == 8 && kvHeads == 1;
             // Larger sparse batches have enough CTAs to amortize a descriptor
             // and page lookup over more keys without changing each dot product.
-            if (grouped16 || (sharedHeads && sparse && batch >= 8))
+            if (groupedScores)
+                dsa::GroupedScores<16, 64><<<dim3(heads / 16, (count + 63) / 64, batch), 512>>>(
+                    q, descriptors, scores, heads, kvHeads, count);
+            else if (groupedSparse || (sharedHeads && sparse && batch >= 8))
                 dsa::DirectScores<16, 4><<<dim3(heads, (count + 63) / 64, batch), 128>>>(
                     q, descriptors, scores, heads, kvHeads, count);
             else if (sharedHeads && sparse && batch >= 2)
@@ -5698,7 +5811,7 @@ void FastllmCudaNaiveBatchDSADecode(const fastllm::Data &query,
                     q, descriptors, scores, heads, kvHeads, count);
             // Share V across heads, with wider output tiles for larger dense
             // batches. Each head retains the original softmax/PV arithmetic.
-            if (grouped16)
+            if (groupedSparse)
                 dsa::GroupedValues<2048, 4, 8, true><<<dim3(heads / 4, 16, batch), 1024,
                     sizeof(dsa::GroupStorage<2048, 4, 8>)>>>(scores, bias, descriptors, out,
                     heads, kvHeads, count);
@@ -5794,6 +5907,41 @@ void FastllmCudaNaiveBatchSWADecode(const fastllm::Data &query,
                         BulkAttention<128, true>(query, bias, descriptors, heads, kvHeads, output))) {
             CheckLaunch(); return;
         }
+    }
+    if (ringRows && rows.size() < 32 && rows.size() * heads >= 512 && (heads / kvHeads) % 8 == 0 &&
+        std::all_of(rows.begin(), rows.end(), [](const auto &r) {
+            return r.key && r.value && (uintptr_t)r.key % 16 == 0 && (uintptr_t)r.value % 16 == 0;
+        }) && BulkKernelSupported(naive_attention_small::Swa, sizeof(naive_attention_small::SwaStorage), 90)) {
+        FastllmNaiveDSABatch descriptors{};
+        for (int i = 0; i < (int)rows.size(); ++i) {
+            auto &r = descriptors.rows[i];
+            r.key = rows[i].key; r.value = rows[i].value; r.cache = rows[i].cache; r.fp8 = rows[i].fp8;
+            r.liveKeys = liveKeys.dims.empty() ? nullptr : (const int *)liveKeys.cudaData + i;
+            r.length = rows[i].length; r.verifyOffset = rows[i].verifyOffset;
+            r.capacity = kSwaWindow; r.keyStride = kvHeads * kSwaQkDim;
+        }
+        const auto *bias = sink.dims.empty() ? nullptr : (const float *)sink.cudaData;
+        naive_attention_small::Swa<<<dim3(rows.size(), heads / 8), 256,
+                                    sizeof(naive_attention_small::SwaStorage)>>>(
+            (const BF16 *)query.cudaData, descriptors, bias, (BF16 *)output.cudaData, heads, kvHeads);
+        CheckLaunch(); return;
+    }
+    if (ringRows && rows.size() * heads >= 256 && (heads / kvHeads) % 4 == 0 &&
+        std::all_of(rows.begin(), rows.end(), [](const auto &r) {
+            return r.key && r.value && (uintptr_t)r.key % 16 == 0 && (uintptr_t)r.value % 16 == 0;
+        }) && BulkKernelSupported(GroupedSwaDecode<4>, sizeof(GroupedSwaStorage<4>), 70)) {
+        const auto *bias = sink.dims.empty() ? nullptr : (const float *)sink.cudaData;
+        for (int first = 0; first < (int)rows.size(); first += kSwaBatchLimit) {
+            const int count = std::min(kSwaBatchLimit, (int)rows.size() - first);
+            BatchSwaKeys descriptors{};
+            std::copy_n(rows.begin() + first, count, descriptors.rows);
+            descriptors.length = liveKeys.dims.empty() ? nullptr : (const int *)liveKeys.cudaData + first;
+            GroupedSwaDecode<4><<<dim3(heads / 4, count), 512, sizeof(GroupedSwaStorage<4>)>>>(
+                (const BF16 *)query.cudaData + (size_t)first * heads * kSwaQkDim, bias,
+                (BF16 *)output.cudaData + (size_t)first * heads * kSwaValueDim,
+                heads, kvHeads, descriptors);
+        }
+        CheckLaunch(); return;
     }
     // Compute all output columns in one CTA instead of repeating QK and
     // softmax for four column tiles. Arithmetic within each output is unchanged.

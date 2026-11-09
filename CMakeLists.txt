@@ -2991,6 +2991,9 @@ if (UNIT_TEST)
         add_test(NAME naive_n05_dsa_batch COMMAND naive_n05_dsa_batch_test)
         set_tests_properties(naive_n05_dsa_batch PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
             PASS_REGULAR_EXPRESSION "BATCH DSA PASS")
+        add_test(NAME naive_n05_dsa_wide_heads COMMAND naive_n05_dsa_batch_test wide_heads)
+        set_tests_properties(naive_n05_dsa_wide_heads PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
+            PASS_REGULAR_EXPRESSION "WIDE HEAD DSA PASS")
 
         add_executable(naive_n05_fp4_vector_test test/basic/test_naive_n05_fp4_vector.cu)
         target_link_libraries(naive_n05_fp4_vector_test PRIVATE fastllm)
@@ -3010,6 +3013,9 @@ if (UNIT_TEST)
         add_test(NAME naive_n05_fp8_kv COMMAND naive_n05_fp8_kv_test)
         set_tests_properties(naive_n05_fp8_kv PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
             PASS_REGULAR_EXPRESSION "ALL FP8 CHECKS PASSED")
+        add_test(NAME naive_n05_fp8_dsa_wide_heads COMMAND naive_n05_fp8_kv_test wide_heads)
+        set_tests_properties(naive_n05_fp8_dsa_wide_heads PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
+            PASS_REGULAR_EXPRESSION "WIDE HEAD FP8 DSA PASS")
 
         add_executable(naive_n05_indexer_context_test test/basic/test_naive_n05_indexer_context.cpp)
         target_link_libraries(naive_n05_indexer_context_test PRIVATE fastllm)

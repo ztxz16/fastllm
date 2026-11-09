@@ -103,7 +103,7 @@ struct PagedTensor {
     }
 };
 static void Test(int batch, int heads, int kvHeads, int dim, int vd, int capacity, bool sparse, bool withSink,
-                 bool unalignedKeys = false, bool mixed = false, bool paged = false) {
+                 bool unalignedKeys = false, bool mixed = false, bool paged = false, bool wideHeads = false) {
     const int stride = kvHeads * dim + 128 + (unalignedKeys ? 1 : 0);
     Data q(BFLOAT16), sink(FLOAT32), live(INT32), output;
     Upload(q, {1, batch, heads * dim}, 31);
@@ -181,6 +181,7 @@ static void Test(int batch, int heads, int kvHeads, int dim, int vd, int capacit
         }
         int different = 0;
         double oldMaxError = 0;
+        double oldSquared = 0, oldNorm = 0;
         FastllmNaiveDecodeScratch oldScratch;
         // Bulk attention has its own rounding path. Paged bulk is compared
         // bit-for-bit with the same dense batch kernel above and FP64 below.
@@ -198,16 +199,26 @@ static void Test(int batch, int heads, int kvHeads, int dim, int vd, int capacit
                 different += got != old[i];
                 double delta = std::abs((double)Float(got) - Float(old[i]));
                 oldMaxError = std::max(oldMaxError, delta);
-                Require(delta <= 0.009 * std::abs(Float(old[i])) + 2e-6,
-                        "DSA differs from original rounding by more than one BF16 ULP");
+                oldSquared += delta * delta;
+                oldNorm += (double)Float(old[i]) * Float(old[i]);
+                Require(wideHeads ? delta <= .004 : delta <= 0.009 * std::abs(Float(old[i])) + 2e-6,
+                        wideHeads ? "wide-head DSA exceeds scalar absolute tolerance" :
+                                    "DSA differs from original rounding by more than one BF16 ULP");
             }
         }
-        if (capacity > 256 && (!paged || batch < 128))
+        if (wideHeads)
+            Require(std::sqrt(oldSquared / std::max(oldNorm, 1e-20)) < .004,
+                    "wide-head DSA exceeds scalar reference relative tolerance");
+        if ((!wideHeads || batch < 32) && capacity > 256 && (!paged || batch < 128))
             Require(different == 0, "Batch DSA differs from original decode");
         std::printf("Original decode comparison different=%d max=%.9g\n", different, oldMaxError);
         double squared = 0, referenceSquared = 0, maxError = 0;
         for (int b = 0; b < batch; ++b)
             for (int h = 0; h < heads; ++h) {
+                // All elements above are checked against the independent scalar
+                // kernel. Also check both ends of every GQA group in FP64.
+                if (wideHeads && ((b != 0 && b != batch / 2 && b != batch - 1) ||
+                    (h % (heads / kvHeads) != 0 && h % (heads / kvHeads) != heads / kvHeads - 1))) continue;
                 bool selected = !hostIndices[b].empty();
                 int kh = h / (heads / kvHeads), count = selected ? 2048 : lengths[b];
                 std::vector<double> scores(count, -INFINITY);
@@ -589,12 +600,25 @@ static void TestCommitSwa(int count) {
     ++checks;
 }
 
-int main() {
+int main(int argc, char **argv) {
     try {
         int devices = 0;
         if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0)
             return 77;
         FastllmCudaSetDevice(0);
+        if (argc > 1 && std::strcmp(argv[1], "wide_heads") == 0) {
+            for (bool fp8 : {false, true})
+                TestRebinding(16, 4097, true, false, true, fp8, 1, 64);
+            for (int heads : {16, 32, 64})
+                for (int batch : {1, 3, 4, 8, 16, 31, 32, 33})
+                    Test(batch, heads, heads / 16, 192, 128, 4097, true, true,
+                         false, false, true, true);
+            Test(16, 64, 4, 192, 128, 127, false, false, false, false, true, true);
+            Test(16, 64, 4, 192, 128, 2047, false, true, false, true, true, true);
+            Test(16, 64, 4, 192, 128, 4097, true, true, true, false, true, true);
+            std::printf("WIDE HEAD DSA PASS %d checks\n", checks);
+            return 0;
+        }
         for (int batch : {63, 64, 312, 313, 339, 340, 512, 640, 651, 652, 768, 1025})
             TestRebinding(batch, 257, true, false, false, true, 1, 16);
         for (int width : {3, 5, 6, 8, 11})
