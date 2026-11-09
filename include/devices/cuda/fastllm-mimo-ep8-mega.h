@@ -30,3 +30,10 @@ bool FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int rank, int laye
     fastllm::Data &output, bool graphDecode, fastllm::Data *residual = nullptr,
     const fastllm::Data *normWeight = nullptr, fastllm::Data *normOutput = nullptr, float eps = 0,
     fastllm::Data *prefillScratch = nullptr, const int *liveKeys = nullptr);
+// Dispatch rank-local token rows and return them in the same local order,
+// without an output AllGather. Every EP rank must pass the same maxRows;
+// local row counts may differ, including zero. Existing world-row dispatch
+// remains available for layouts whose consumers need replicated activations.
+void FastllmCudaRunMimoEp8MegaLocal(FastllmCudaMimoEp8Mega &state, int rank, int layer,
+    const fastllm::Data &input, const fastllm::Data &index, const fastllm::Data &score,
+    fastllm::Data &output, int maxRows, const int *liveKeys = nullptr);

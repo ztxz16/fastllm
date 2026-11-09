@@ -5165,16 +5165,18 @@ void FastllmCudaNaiveMergeDecodeIndexer(const fastllm::Data &liveKeys,
     namespace batch = naive_indexer_batch;
     // Merge uses only live lengths and output pointers. Compact those fields
     // so arbitrary verification widths do not strand a small generic tail.
-    if (contextPageLen && contextRanks == 4 && rows.size() >= 64) {
+    if (contextPageLen && (contextRanks == 4 || contextRanks == 8) && rows.size() >= 64) {
         namespace merge = merge_chunk_screen;
-        constexpr size_t bytes = 6 * naive_topk::kTopK * sizeof(unsigned long long);
-        auto kernel = merge::MergeFourChunked<1024, 4, merge::CompactBatch>;
+        const size_t bytes = (contextRanks + contextRanks / 2) * naive_topk::kTopK * sizeof(unsigned long long);
+        auto kernel = contextRanks == 8 ? merge::MergeChunked<1024, 4, merge::CompactBatch, 8>
+                                        : merge::MergeChunked<1024, 4, merge::CompactBatch>;
         if (BulkKernelSupported(kernel, bytes, 90)) {
             for (int first = 0; first < (int)rows.size(); first += merge::CompactLimit) {
                 const int count = std::min(merge::CompactLimit, (int)rows.size() - first);
                 merge::CompactBatch descriptors{};
                 descriptors.merged = (const unsigned *)exchange.cudaData;
                 descriptors.total = rows.size(); descriptors.first = first; descriptors.page = contextPageLen;
+                descriptors.ranks = contextRanks;
                 for (int i = 0; i < count; ++i) {
                     const auto &source = rows[first + i];
                     descriptors.rows[i] = {(const int *)liveKeys.cudaData + source.sequence,
@@ -5208,8 +5210,8 @@ void FastllmCudaNaiveMergeDecodeIndexer(const fastllm::Data &liveKeys,
                 // keys in the same score/position order. Larger descriptor
                 // batches benefit from more independently active warps.
                 auto kernel = count >= 128
-                    ? merge_chunk_screen::MergeFourChunked<1024, 4>
-                    : merge_chunk_screen::MergeFourChunked<512, 4>;
+                    ? merge_chunk_screen::MergeChunked<1024, 4>
+                    : merge_chunk_screen::MergeChunked<512, 4>;
                 if (BulkKernelSupported(kernel, mergeSharedBytes, 90)) {
                     kernel<<<count, count >= 128 ? 1024 : 512, mergeSharedBytes>>>(descriptors);
                     merged = true;

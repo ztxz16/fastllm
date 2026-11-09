@@ -46,7 +46,7 @@ Attention TP 宽度变化仍会改变 `W_oB` 局部矩阵乘法的 BF16 舍入�
 
 ## Naive / MiMo（Exp18）适配
 
-Naive N0.5 使用同一分组运行时，`--tp 8 --ep 8 --attn-dp-size 2` 表示单实例 Attention DP2×TP4、全局 EP8，`--max_batch` 是整个实例的并发上限。普通推理和批量 DSpark 共用请求归属；各组完成 attention 后恢复全局行序，再执行原有 FFN/MoE 和输出头。主模型 KV 只存在于请求所属组，草稿继续使用原全局 TP。模型训练的 block size 不随 `--dspark` 候选数量变化。
+Naive N0.5 使用同一分组运行时，`--tp 8 --ep 8 --attn-dp-size 2` 表示单实例 Attention DP2×TP4、全局 EP8，`--max_batch` 是整个实例的并发上限。普通推理和批量 DSpark 共用请求归属；通用桥接在各组完成 attention 后恢复全局行序，再执行原有 FFN/MoE 和输出头。主模型 KV 只存在于请求所属组，草稿继续使用原全局 TP。模型训练的 block size 不随 `--dspark` 候选数量变化。
 
 ```sh
 FASTLLM_CUDA_GRAPH=1 ftllm server MODEL --tp 8 --ep 8 --attn-dp-size 2 \
@@ -54,6 +54,8 @@ FASTLLM_CUDA_GRAPH=1 ftllm server MODEL --tp 8 --ep 8 --attn-dp-size 2 \
   --indexer_tp_storage context_shard --max_batch 8 --tokens 65536 \
   --chunked_prefill_size 1024 --cache_history true --dspark 3 --draft DRAFT
 ```
+
+对于 Attention TP1、现有 H20 EP4/EP8 后端，以及首层 dense、后续连续 MoE 的结构，普通 decode 图保留组内 hidden、归一化结果和 MoE 输出。每个逻辑 token 从所属组路由一次，所有 EP rank 使用同一最大局部行数确定 arena 与分块轮数；空组也参与专家计算和同步。只在 dense 首层、最终输出头及草稿特征收集边界恢复全局行序。Attention TP>1、验证和 eager 阶段保留原桥接，不改变 KV 归属或残差/归一化的累加顺序。
 
 支持 BF16 计算、BF16/FP8 KV，以及原模型已有的 GPU MoE 后端；EP4/EP8 的硬件和权重格式约束保持不变。Indexer 可以复制或在 Attention TP 组内按上下文分片；组内 TP1 自动使用普通读写路径。`layer_shard`、FP4 KV 和 CPU KV 暂不接入此适配器，配置时明确报错。
 

@@ -365,7 +365,7 @@ struct NaiveN05PrefixCacheTestAccess : NaiveN05FlashModel {
     }
 };
 } // namespace fastllm
-int main() {
+int main(int argc, char **argv) {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0)
         return 77;
@@ -373,6 +373,18 @@ int main() {
     if (cudaGetDeviceProperties(&properties, 0) != cudaSuccess || properties.major < 8)
         return 77;
     try {
+        if (argc > 1) {
+            for (int ranks : {4, 8})
+                for (int batch : {64, 128, 129})
+                    for (int kind : {0, 1, 2, 3})
+                        ContextCase(8193, 128, ranks, batch, kind, kind == 0, true);
+            for (int capacity : {129, 2049, 4612, 200000})
+                ContextCase(capacity, 128, 8, 128, 1, false, true);
+            for (int block : {3, 5, 7, 8})
+                ContextCase(8193, 128, 8, 129, 1, false, true, block);
+            printf("PASS %d context-shard checks\n", checks);
+            return 0;
+        }
         for (int ranks : {2, 4, 8})
             for (int kind : {0, 1, 2, 3})
                 for (int block : {3, 4, 5, 6, 8, 11})

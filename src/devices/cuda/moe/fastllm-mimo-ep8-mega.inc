@@ -185,6 +185,38 @@ void FastllmCudaMimoEp8PrefillAllGather(FastllmCudaMimoEp8Mega &state, int rank,
     FastllmCudaSyncCurrentThreadStream();
     state.WaitForOutputs();
 }
+void FastllmCudaRunMimoEp8MegaLocal(FastllmCudaMimoEp8Mega &state, int rank, int layer,
+        const fastllm::Data &input, const fastllm::Data &index, const fastllm::Data &score,
+        fastllm::Data &output, int maxRows, const int *liveKeys) {
+    using namespace fastllm;
+    AssertInFastLLM(input.dataType == BFLOAT16 && input.dims.size() == 2 &&
+        input.dims[1] == 4096 && input.dims[0] >= 0 && input.dims[0] <= maxRows && maxRows > 0 &&
+        maxRows <= std::numeric_limits<int>::max() / (int)state.devices.size(),
+        "Invalid local MiMo EP input shape.");
+    const int rows = input.dims[0];
+    AssertInFastLLM(index.dims == std::vector<int>({rows, 8}) && score.dims == index.dims,
+        "Invalid local MiMo EP routing shape.");
+    output.dataType = BFLOAT16;
+    // Empty sources still join the EP barriers. Keep a valid scratch pointer
+    // for their zero-row dispatch; no token payload is read or written.
+    output.Resize({std::max(1, rows), 4096});
+    output.ToDevice(DataDevice::CUDA, {state.devices.at(rank)}, false);
+    output.Allocate(false);
+    output.Resize(input.dims);
+    void *handle = state.ranks.at(rank)->layers.at(layer);
+    AssertInFastLLM(handle != nullptr, "Missing local MiMo EP layer handle.");
+    const int capacity = fastllm_ep8_mega_moe_decode_capacity(maxRows * state.devices.size(), state.devices.size());
+    for (int first = 0; first < maxRows; first += capacity) {
+        const int start = std::min(first, rows), count = std::max(0, std::min(capacity, rows - start));
+        const void *x = rows ? (const uint16_t *)input.cudaData + (size_t)start * 4096 : output.cudaData;
+        void *y = (uint16_t *)output.cudaData + (size_t)start * 4096;
+        const int32_t *idx = rows ? (const int32_t *)index.cudaData + start * 8 : (const int32_t *)output.cudaData;
+        const float *scores = rows ? (const float *)score.cudaData + start * 8 : (const float *)output.cudaData;
+        if (!fastllm_ep8_mega_moe_run_batched(handle, x, y, idx, scores, count, capacity,
+                liveKeys ? liveKeys + start : nullptr))
+            throw std::runtime_error(std::string("Local MiMo EP launch failed: ") + fastllm_ep8_mega_moe_error());
+    }
+}
 bool FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int rank, int layer,
         const fastllm::Data &input, const fastllm::Data &index, const fastllm::Data &score,
         fastllm::Data &output, bool graphDecode, fastllm::Data *residual,
@@ -323,6 +355,10 @@ bool FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int rank, int laye
 }
 #else
 struct FastllmCudaMimoEp8Mega {};
+void FastllmCudaRunMimoEp8MegaLocal(FastllmCudaMimoEp8Mega &, int, int, const fastllm::Data &,
+    const fastllm::Data &, const fastllm::Data &, fastllm::Data &, int, const int *) {
+    throw std::runtime_error("MiMo EP MegaMoE local rows require the SM90 backend.");
+}
 void FastllmCudaMimoEp8PrefillReduceScatter(FastllmCudaMimoEp8Mega &, int, fastllm::Data &) {
     throw std::runtime_error("MiMo EP MegaMoE is unavailable.");
 }

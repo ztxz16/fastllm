@@ -748,7 +748,6 @@ Data NaiveN05FlashModel::RunTarget(
     // Larger chunks dispatch contiguous token shards, including uneven tails.
     const bool shardPrefillRouter = tensorParallel && tpEp8MegaState &&
         !decodeWorkspace && !verifying && length > 64;
-    const bool shardRouter = shardMoe || shardPrefillRouter;
     const int reserveCapacity = CacheReserveCapacity(config);
     const int previousExactThreshold = FastllmCudaGetLinearExactBatchThreshold();
     struct RestoreExactThreshold {
@@ -786,13 +785,11 @@ Data NaiveN05FlashModel::RunTarget(
     TargetWorkspace &buf = workspace ? *workspace : temporary;
     Data *prefillScores = tensorParallel && !tpPrefillScores.empty() ? &tpPrefillScores.at(tpRank) : nullptr;
     Data &hidden = buf.hidden;
-    Data &normed = buf.normed;
     Data &q = buf.q;
     Data &k = buf.k;
     Data &v = buf.v;
     Data &qkv = buf.qkv;
     Data &attn = buf.attn;
-    Data &projected = buf.projected;
     Data &routerInput = buf.routerInput;
     Data &router = buf.router;
     Data &expertIndex = buf.expertIndex;
@@ -802,9 +799,6 @@ Data NaiveN05FlashModel::RunTarget(
     Data &w3 = buf.w3;
     Data &tempInput = buf.tempInput;
     Data &tempOutput = buf.tempOutput;
-    // Attention has consumed projected before MoE starts. Reuse that full
-    // output and its already-registered peer pointer tuple for decode gather.
-    Data &moeOutput = shardMoe ? projected : buf.moeOutput;
     Data &moeInputTemp = buf.moeInputTemp;
     Data &moeOutputTemp = buf.moeOutputTemp;
     Data &positions = buf.positions;
@@ -844,7 +838,39 @@ Data NaiveN05FlashModel::RunTarget(
     // The generic path keeps the dispatcher that transfers weights on demand.
     const bool fusePrefillNorm = tensorParallel && !decodeWorkspace && !verifying && length > 1;
     bool prefillNormReady = false, prefillResidualSharded = false;
+    // Fully data-parallel attention can keep activations local through the
+    // consecutive MoE layers. Hybrid attention-TP and eager layouts retain
+    // the existing world-row path until they can consume local EP outputs.
+    const bool localMoeRows = attentionParallel && AttentionTPSize() == 1 &&
+        tpEp8MegaState && decodeWorkspace && !verifying && block_cnt > 1 && !moeLayers[0] &&
+        std::all_of(moeLayers.begin() + 1, moeLayers.end(), [](bool moe) { return moe; });
+    int maxLocalRows = 0;
+    if (localMoeRows) for (const auto &rows : attentionParallel->rows.localToGlobal)
+        maxLocalRows = std::max(maxLocalRows, (int)rows.size());
+    bool localHiddenReady = false;
     for (int layer = 0; layer < block_cnt; layer++) {
+        const bool localMoe = localMoeRows && moeLayers[layer];
+        auto *localDP = localMoe ? &attentionParallel->ranks[tpRank] : nullptr;
+        const int length = localMoe ? attentionParallel->rows.localToGlobal[tpRank].size() : inputIds.dims[1];
+        Data &hidden = localMoe ? localDP->hidden : buf.hidden;
+        Data &normed = localMoe ? localDP->normalized : buf.normed;
+        Data &projected = localMoe ? localDP->projected : buf.projected;
+        // World-row decode reuses the registered attention projection buffer;
+        // local EP output needs no peer AllGather registration.
+        Data &moeOutput = !localMoe && shardMoe ? buf.projected : buf.moeOutput;
+        const bool shardRouter = !localMoe && (shardMoe || shardPrefillRouter);
+        if (localMoe && !localHiddenReady) {
+            for (Data *data : {&hidden, &normed}) {
+                data->dataType = BFLOAT16; data->UpdateUnitSize();
+                data->Resize({1, length, embed_dim}); data->ToDevice(CUDA, {gpu}, false);
+                if (length) data->Allocate(false);
+            }
+            if (length) {
+                attentionParallel->transfer->Select(tpRank, buf.hidden.cudaData, hidden.cudaData, size_t(embed_dim) * 2);
+                attentionParallel->transfer->Select(tpRank, buf.normed.cudaData, normed.cudaData, size_t(embed_dim) * 2);
+            }
+            localHiddenReady = true;
+        }
         const bool shardPrefillNorm = !attentionParallel && fusePrefillNorm && shardPrefillRouter &&
             moeLayers[layer] && layer + 1 < block_cnt && moeLayers[layer + 1] &&
             (!capture || !capture->collectHidden);
@@ -857,8 +883,8 @@ Data NaiveN05FlashModel::RunTarget(
         if (!tensorParallel) ApplyDeviceMap(deviceMap, layer + 1, block_cnt);
         std::string prefix = "model.layers." + std::to_string(layer);
         std::string ap = prefix + ".self_attn.";
-        // Residual/FFN rows remain in canonical world order. Only attention
-        // consumes the owning DP group's rows; empty groups still join MoE.
+        // Attention consumes its owning DP group's rows. The local MoE path
+        // retains that order; other layouts use the canonical world rows.
         if ((!decodeWorkspace && !prefillNormReady) || layer == 0)
             norm(hidden, localWeight(prefix + ".input_layernorm.weight"), normed);
         const int dpGroup = attentionParallel ? attentionParallel->runtime.Layout().AttentionOwner(tpRank) : 0;
@@ -872,7 +898,7 @@ Data NaiveN05FlashModel::RunTarget(
         Data &projected = attentionParallel ? attentionParallel->ranks[tpRank].projected : buf.projected;
         const int pastLength = batch && !batch->Key(0, 0).dims.empty() ? batch->Key(0, 0).dims[1] :
             (pastKeyValues.empty() || pastKeyValues[0].first.dims.empty() ? 0 : pastKeyValues[0].first.dims[1]);
-        if (attentionParallel) {
+        if (attentionParallel && !localMoe) {
             normed.dataType = BFLOAT16; normed.UpdateUnitSize();
             normed.Resize({1, length, embed_dim}); normed.ToDevice(CUDA, {gpu}, false); normed.Allocate(false);
             attentionParallel->transfer->Select(tpRank, buf.normed.cudaData, normed.cudaData, size_t(embed_dim) * 2);
@@ -1774,7 +1800,7 @@ Data NaiveN05FlashModel::RunTarget(
                 verifySWA && !graphVerify ? eagerLengths : liveKeys, cfg.heads, cfg.kvHeads, attn);
         }
         Linear(attn, localWeight(ap + "o_proj.weight"), Data(), projected);
-        if (attentionParallel) {
+        if (attentionParallel && AttentionTPSize() > 1) {
             auto &runtime = attentionParallel->runtime;
             // Match the existing TP reduction: sum BF16 partials in FP32,
             // then round once. NCCL BF16 may round at intermediate tree nodes.
@@ -1785,14 +1811,14 @@ Data NaiveN05FlashModel::RunTarget(
             ToDataType(sum, projected, BFLOAT16);
         }
         }
-        if (attentionParallel) {
+        if (attentionParallel && !localMoe) {
             projected.dataType = BFLOAT16; projected.UpdateUnitSize();
             projected.Resize({1, length, embed_dim}); projected.ToDevice(CUDA, {gpu}, false); projected.Allocate(false);
             attentionParallel->transfer->Collect(tpRank, attentionParallel->ranks[tpRank].projected.cudaData,
                 projected.cudaData, size_t(embed_dim) * sizeof(uint16_t));
         }
         Data &postAttentionNorm = localWeight(prefix + ".post_attention_layernorm.weight");
-        bool attentionNormReady = false;
+        bool attentionNormReady = localMoe && !length;
         if (shardPrefillNorm && length >= 1024 && length % epRanks == 0) {
             // Only this rank's token shard feeds the following EP Router/MoE.
             // Avoid distributing reduced rows that are never consumed here.
@@ -1829,7 +1855,7 @@ Data NaiveN05FlashModel::RunTarget(
             const std::string name = lastLayer ? "model.norm.weight" :
                 "model.layers." + std::to_string(layer + 1) + ".input_layernorm.weight";
             mlpNormWeight = &localWeight(name);
-            mlpNormOutput = lastLayer ? &buf.last : &normed;
+            mlpNormOutput = lastLayer && !localMoe ? &buf.last : &normed;
         }
         auto addMlpResidual = [&](Data &branch, bool needsReduce) {
             if (!decodeWorkspace) {
@@ -1858,62 +1884,72 @@ Data NaiveN05FlashModel::RunTarget(
         } else {
             // EP ranks route only their contiguous token shard, borrowing
             // the normalized activation until MegaMoE finishes reading it.
-            Data routedInput;
-            if (shardRouter) {
-                const int first = (int)((int64_t)length * tpRank / epRanks);
-                const int end = (int)((int64_t)length * (tpRank + 1) / epRanks);
-                routedInput.Resize({end - first, embed_dim});
-                routedInput.FakeFrom(normed, (size_t)first * embed_dim * normed.unitSize);
-            }
-            Data &routerSource = shardRouter ? routedInput : normed;
-            Data &routerWeight = localWeight(prefix + ".mlp.gate.weight");
-            bool hasRouterProbabilities =
-                FastllmCudaNaiveRouterSigmoid(routerSource, routerWeight, router);
-            if (!hasRouterProbabilities) {
-                Data localRouterInput;
-                if (shardPrefillRouter) {
-                    // Share one backing allocation with the prefill arena;
-                    // only the logical local rows are converted/projected.
-                    routerInput.dataType = FLOAT32;
-                    routerInput.UpdateUnitSize();
-                    const size_t rowBytes = (size_t)embed_dim * sizeof(float);
-                    const size_t arenaBytes = FastllmCudaMimoEp8PrefillWorkspaceBytes(length, tpDevices.size());
-                    const int reserveRows = std::max<size_t>(length,
-                        (arenaBytes + rowBytes - 1) / rowBytes);
-                    routerInput.Resize({reserveRows, embed_dim});
-                    routerInput.ToDevice(normed.dataDevice, normed.dataDeviceIds, false);
-                    routerInput.Allocate(false);
-                    routerInput.Resize({length, embed_dim});
-                    localRouterInput.FakeFrom(routerInput, 0);
-                }
-                Data &fp32Input = shardPrefillRouter ? localRouterInput : routerInput;
-                ToDataType(routerSource, fp32Input, DataType::FLOAT32);
-                Linear(fp32Input, routerWeight, Data(), router);
-            }
-            Data &routerBias = localWeight(prefix + ".mlp.gate.e_score_correction_bias");
             auto &executor = *(Executor *)GetExecutor();
-            bool fusedRouter = false;
-            // Small decode/verify batches already include sigmoid in their shared
-            // router projection. Other multi-row paths fuse it with selection.
-            if (!hasRouterProbabilities && length > 1 && router.dataDevice == DataDevice::CUDA) {
-                DataDict routerData = {{"logits", &router}, {"index", &expertIndex},
-                                       {"score", &expertScore}, {"gateBias", &routerBias}};
-                FloatDict routerFloats = {{"routeScale", routed_scaling_factor}};
-                IntDict routerInts = {{"topk", num_experts_per_tok}, {"needNorm", norm_topk_prob ? 1 : 0}};
-                fusedRouter = executor.CanRunOnFirstDevice(
-                    "FusedSigmoidSelectExpert", routerData, routerFloats, routerInts);
-                if (fusedRouter)
-                    executor.Run("FusedSigmoidSelectExpert", routerData, routerFloats, routerInts);
-            }
-            if (!fusedRouter) {
-                if (!hasRouterProbabilities) Sigmoid(router, router);
-                SelectExpert(router, expertIndex, expertScore, num_experts_per_tok,
-                             norm_topk_prob, routed_scaling_factor, &routerBias);
+            bool hasRouterProbabilities = false;
+            if (!localMoe || length) {
+                Data routedInput;
+                if (shardRouter) {
+                    const int first = (int)((int64_t)length * tpRank / epRanks);
+                    const int end = (int)((int64_t)length * (tpRank + 1) / epRanks);
+                    routedInput.Resize({end - first, embed_dim});
+                    routedInput.FakeFrom(normed, (size_t)first * embed_dim * normed.unitSize);
+                }
+                Data &routerSource = shardRouter ? routedInput : normed;
+                Data &routerWeight = localWeight(prefix + ".mlp.gate.weight");
+                hasRouterProbabilities =
+                    FastllmCudaNaiveRouterSigmoid(routerSource, routerWeight, router);
+                if (!hasRouterProbabilities) {
+                    Data localRouterInput;
+                    if (shardPrefillRouter) {
+                        // Share one backing allocation with the prefill arena;
+                        // only the logical local rows are converted/projected.
+                        routerInput.dataType = FLOAT32;
+                        routerInput.UpdateUnitSize();
+                        const size_t rowBytes = (size_t)embed_dim * sizeof(float);
+                        const size_t arenaBytes = FastllmCudaMimoEp8PrefillWorkspaceBytes(length, tpDevices.size());
+                        const int reserveRows = std::max<size_t>(length,
+                            (arenaBytes + rowBytes - 1) / rowBytes);
+                        routerInput.Resize({reserveRows, embed_dim});
+                        routerInput.ToDevice(normed.dataDevice, normed.dataDeviceIds, false);
+                        routerInput.Allocate(false);
+                        routerInput.Resize({length, embed_dim});
+                        localRouterInput.FakeFrom(routerInput, 0);
+                    }
+                    Data &fp32Input = shardPrefillRouter ? localRouterInput : routerInput;
+                    ToDataType(routerSource, fp32Input, DataType::FLOAT32);
+                    Linear(fp32Input, routerWeight, Data(), router);
+                }
+                Data &routerBias = localWeight(prefix + ".mlp.gate.e_score_correction_bias");
+                bool fusedRouter = false;
+                // Small decode/verify batches already include sigmoid in their shared
+                // router projection. Other multi-row paths fuse it with selection.
+                if (!hasRouterProbabilities && length > 1 && router.dataDevice == DataDevice::CUDA) {
+                    DataDict routerData = {{"logits", &router}, {"index", &expertIndex},
+                                           {"score", &expertScore}, {"gateBias", &routerBias}};
+                    FloatDict routerFloats = {{"routeScale", routed_scaling_factor}};
+                    IntDict routerInts = {{"topk", num_experts_per_tok}, {"needNorm", norm_topk_prob ? 1 : 0}};
+                    fusedRouter = executor.CanRunOnFirstDevice(
+                        "FusedSigmoidSelectExpert", routerData, routerFloats, routerInts);
+                    if (fusedRouter)
+                        executor.Run("FusedSigmoidSelectExpert", routerData, routerFloats, routerInts);
+                }
+                if (!fusedRouter) {
+                    if (!hasRouterProbabilities) Sigmoid(router, router);
+                    SelectExpert(router, expertIndex, expertScore, num_experts_per_tok,
+                                 norm_topk_prob, routed_scaling_factor, &routerBias);
+                }
+            } else {
+                expertIndex.dataType = INT32; expertIndex.UpdateUnitSize(); expertIndex.Resize({0, num_experts_per_tok});
+                expertScore.dataType = FLOAT32; expertScore.UpdateUnitSize(); expertScore.Resize({0, num_experts_per_tok});
             }
             normed.Reshape({length, embed_dim});
             if (!tensorParallel) ApplyMoeDeviceMapForLayer(layer);
             bool moeNormReady = false;
-            if (tensorParallel && tpEp8MegaState) {
+            if (localMoe) {
+                FastllmCudaRunMimoEp8MegaLocal(*tpEp8MegaState, tpRank, layer, normed,
+                    expertIndex, expertScore, moeOutput, maxLocalRows,
+                    (const int *)localDP->liveKeys.cudaData);
+            } else if (tensorParallel && tpEp8MegaState) {
                 moeNormReady = FastllmCudaRunMimoEp8Mega(*tpEp8MegaState, tpRank, layer, normed,
                     expertIndex, expertScore, moeOutput, decodeWorkspace || shardMoe,
                     (shardMoe || shardPrefillNorm) ? &hidden : nullptr,
@@ -1992,20 +2028,34 @@ Data NaiveN05FlashModel::RunTarget(
             }
             if (!tensorParallel) ApplyDeviceMap(deviceMap, layer + 1, block_cnt);
             moeOutput.Reshape(hidden.dims);
-            if (!moeNormReady)
+            if (!moeNormReady && (!localMoe || length))
                 addMlpResidual(moeOutput, !(tensorParallel && tpEp8MegaState));
         }
         prefillNormReady = fusePrefillNorm && mlpNormWeight;
-        if (capture && capture->collectHidden && tpRank <= 0 &&
-            std::find(draftTargetLayers.begin(), draftTargetLayers.end(), layer) != draftTargetLayers.end()) {
+        const bool captureHidden = capture && capture->collectHidden &&
+            std::find(draftTargetLayers.begin(), draftTargetLayers.end(), layer) != draftTargetLayers.end();
+        if (localMoe) {
+            // The vocabulary head and draft feature consumers require world
+            // order. No intermediate attention or MoE layer needs that gather.
+            if (layer + 1 == block_cnt) {
+                buf.last.dataType = BFLOAT16; buf.last.UpdateUnitSize();
+                buf.last.Resize({1, inputIds.dims[1], embed_dim});
+                buf.last.ToDevice(CUDA, {gpu}, false); buf.last.Allocate(false);
+                attentionParallel->transfer->Collect(tpRank, normed.cudaData, buf.last.cudaData, size_t(embed_dim) * 2);
+            }
+            if (captureHidden)
+                attentionParallel->transfer->Collect(tpRank, hidden.cudaData, buf.hidden.cudaData, size_t(embed_dim) * 2);
+        }
+        if (captureHidden && tpRank <= 0) {
+            Data &featureHidden = localMoe ? buf.hidden : hidden;
             if (workspace && capture->borrowOutputs && !capture->verifying) {
                 // Internal prefill consumers finish before the next forward.
                 // Retain the feature storage just like the other TP scratch.
                 auto &backing = buf.features[layer];
-                Copy(hidden, backing);
+                Copy(featureHidden, backing);
                 auto &view = capture->hidden[layer];
                 view.FreeSpace(); view.FakeFrom(backing, 0); view.Resize(backing.dims);
-            } else Copy(hidden, capture->hidden[layer]);
+            } else Copy(featureHidden, capture->hidden[layer]);
         }
     }
     if (isIntermediateChunkedPrefill) return Data();

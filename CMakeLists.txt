@@ -3018,6 +3018,10 @@ if (UNIT_TEST)
         set_tests_properties(naive_n05_indexer_context PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
             PASS_REGULAR_EXPRESSION "PASS [0-9]+ context-shard checks")
 
+        add_test(NAME naive_n05_indexer_context_tree COMMAND naive_n05_indexer_context_test tree)
+        set_tests_properties(naive_n05_indexer_context_tree PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 300
+            PASS_REGULAR_EXPRESSION "PASS [0-9]+ context-shard checks")
+
         add_executable(naive_n05_fp8_conversion_test test/basic/test_naive_n05_fp8_conversion.cu)
         target_link_libraries(naive_n05_fp8_conversion_test PRIVATE fastllm)
         set_target_properties(naive_n05_fp8_conversion_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)

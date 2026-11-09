@@ -15,7 +15,7 @@ struct NaiveN05FlashModel::AttentionParallelState {
         std::unique_ptr<TargetBatch> batch;
     };
     struct Rank {
-        Data normalized, projected, reduction, positions, liveKeys;
+        Data hidden, normalized, projected, reduction, positions, liveKeys;
         TargetWorkspace workspace;
     };
     parallel::CudaRuntime runtime;

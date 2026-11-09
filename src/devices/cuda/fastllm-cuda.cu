@@ -13601,7 +13601,7 @@ bool FastllmCudaSelectExpert(const fastllm::Data &logits, const fastllm::Data *g
         FastllmSelectExpertFixedTopKKernel<false, 384, 6><<<n, 32>>>(
             cudaLogits, cudaBias, cudaIndex, cudaScore,
             hasBias, needNorm, routeScale);
-    } else if (n <= 8 && numExperts == 256 && topk == 8) {
+    } else if (numExperts == 256 && topk == 8) {
         FastllmSelectExpertFixedTopKKernel<false, 256, 8><<<n, 32>>>(
             cudaLogits, cudaBias, cudaIndex, cudaScore,
             hasBias, needNorm, routeScale);
