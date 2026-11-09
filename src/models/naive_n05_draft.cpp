@@ -702,6 +702,7 @@ void NaiveN05FlashModel::CommitTargetCache(std::vector<std::pair<Data, Data>> &k
         int past, int count, bool ringVerify) {
 #ifdef USE_CUDA
     auto commit = [&](int device) {
+        if (device >= 0 && !kv.front().first.multiDeviceDatas.count(device)) return;
         for (int layer = 0; layer < block_cnt; ++layer) {
             const int length = (slidingLayers[layer] ? std::min(past, window - 1) : past) + count;
             auto &pair = kv[layer];
@@ -757,6 +758,7 @@ void NaiveN05FlashModel::CommitTargetCaches(const std::vector<std::vector<std::p
         std::map<int, std::vector<FastllmNaiveCacheCommit>> updates;
         for (size_t i = 0; i < caches.size(); ++i) for (int layer = 0; layer < block_cnt; ++layer) {
             auto &pair = caches[i]->at(layer);
+            if (device >= 0 && !pair.first.multiDeviceDatas.count(device)) continue;
             Data &key = device < 0 ? pair.first : *pair.first.multiDeviceDatas.at(device);
             Data &value = device < 0 ? pair.second : *pair.second.multiDeviceDatas.at(device);
             if (slidingLayers[layer]) updates[key.dataDeviceIds.at(0)].push_back({&key, &value, past[i], counts[i]});

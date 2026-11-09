@@ -1055,7 +1055,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         help = 'Qwen3.5/Qwen3.8启动时加载视觉权重并预分配工作区，再分配KV cache；按processor的图片/视频像素上限预热')
     parser.add_argument('--tp', type = str, default = "", help = '线程级张量并行设备；裸数字X表示使用前X张卡，0表示0号卡，也可写 0,1 或 auto')
     parser.add_argument('--attn-dp-size', type=int, default=1,
-                        help='Attention DP组数；组内TP宽度为--tp总卡数/此值，当前支持DeepSeek V4.1纯GPU路径')
+                        help='Attention DP组数；组内TP宽度为--tp总卡数/此值，支持DeepSeek V4.1及Naive/MiMo GPU路径')
     parser.add_argument('--ep', type = int, choices = (1, 4, 8), default = None,
                         help = '专家并行数；1为原MoE TP路径（默认），4/8为MiMo FP8/H20的专家并行，使用内置MegaMoE W8A8；需配合相同大小的--tp')
     parser.add_argument('--moe_device', type = str, default = "", help = 'moe使用的设备')
@@ -2062,8 +2062,12 @@ def make_normal_llm_model(args, startup_progress = None):
     if attention_dp < 1:
         raise ValueError("--attn-dp-size must be positive")
     if attention_dp > 1:
-        if not is_deepseek_v41_model:
-            raise ValueError("Attention DP currently requires the DeepSeek V4.1 adapter")
+        if not (is_deepseek_v41_model or is_naive_n05_model):
+            raise ValueError("Attention DP requires a DeepSeek V4.1 or Naive/MiMo adapter")
+        if is_naive_n05_model and indexer_storage == "layer_shard":
+            raise ValueError("Naive Attention DP supports replicated or context_shard Indexer storage")
+        if is_naive_n05_model and args.kv_cache_dtype not in ("auto", "bfloat16", "fp8", "fp8_e4m3"):
+            raise ValueError("Naive Attention DP supports BF16 or FP8 KV")
         world = _thread_tp_cuda_device_count(getattr(args, "tp", ""))
         if world < attention_dp or world % attention_dp:
             raise ValueError("--attn-dp-size must divide the total --tp device count")

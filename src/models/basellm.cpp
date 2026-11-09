@@ -1477,16 +1477,16 @@ namespace fastllm {
         bool initialized = false;
         PagedCacheManager *probe = nullptr;
         std::vector<PagedCacheManager *> managers;
-        void Init(basellm *model) {
+        void Init(basellm *model, ResponseContext *ctx) {
             if (initialized) return;
             initialized = true;
             for (int li = 0; li < model->block_cnt && !probe; ++li) {
                 if (model->GetKVCacheRetainedTokens(li) >= 0) continue;
-                for (auto &ref : model->GetPagedKVCacheManagers(li, true))
+                for (auto &ref : model->GetPagedKVCacheManagersForRequest(li, true, ctx))
                     if (ref.second) { probe = ref.second; break; }
             }
             const bool unboundedOnly = probe != nullptr;
-            if (!probe) for (auto &ref : model->GetPagedKVCacheManagers(model->kvCacheId, true))
+            if (!probe) for (auto &ref : model->GetPagedKVCacheManagersForRequest(model->kvCacheId, true, ctx))
                 if (ref.second) { probe = ref.second; break; }
             if (!probe || probe->pageLen <= 0) return;
             std::unordered_set<PagedCacheManager *> queried{probe};
@@ -1494,7 +1494,7 @@ namespace fastllm {
             for (int li = 0; li < model->block_cnt; ++li) {
                 if (unboundedOnly && model->GetKVCacheRetainedTokens(li) >= 0) continue;
                 for (int part = 0; part < 2; ++part)
-                    for (auto &ref : model->GetPagedKVCacheManagers(li, part == 0))
+                    for (auto &ref : model->GetPagedKVCacheManagersForRequest(li, part == 0, ctx))
                         if (ref.second && ref.second->pageLen == probe->pageLen && queried.insert(ref.second).second)
                             managers.push_back(ref.second);
             }
@@ -1517,7 +1517,7 @@ namespace fastllm {
         auto &preview = *ctx->prefillPreview;
         preview.Reset(ctx->currentTokens);
         previewTrace.Next("preview.managers");
-        plan.Init(model);
+        plan.Init(model, ctx);
         auto *probe = plan.probe;
         int length = 0;
         if (probe && probe->pageLen > 0) {
@@ -1556,7 +1556,7 @@ namespace fastllm {
             if (model->GetKVCacheRetainedTokens(li) >= 0) {
                 continue;
             }
-            auto refs = model->GetPagedKVCacheManagers(li, true);
+            auto refs = model->GetPagedKVCacheManagersForRequest(li, true, ctx);
             for (auto &ref : refs) {
                 if (ref.second != nullptr) {
                     probeManager = ref.second;
@@ -1566,8 +1566,8 @@ namespace fastllm {
             }
         }
         if (probeManager == nullptr) {
-            auto probeRefs = model->GetPagedKVCacheManagers(
-                model->kvCacheId, true);
+            auto probeRefs = model->GetPagedKVCacheManagersForRequest(
+                model->kvCacheId, true, ctx);
             for (auto &ref : probeRefs) {
                 if (ref.second != nullptr) {
                     probeManager = ref.second;
@@ -1599,7 +1599,7 @@ namespace fastllm {
                     }
                     for (int keyFlag = 0; keyFlag < 2; keyFlag++) {
                         bool isKey = keyFlag == 0;
-                        auto refs = model->GetPagedKVCacheManagers(li, isKey);
+                        auto refs = model->GetPagedKVCacheManagersForRequest(li, isKey, ctx);
                         for (auto &ref : refs) {
                             PagedCacheManager *manager = ref.second;
                             if (manager == nullptr || manager->pageLen != probeManager->pageLen) {
@@ -1763,13 +1763,13 @@ namespace fastllm {
                     restorePlanReady =
                         buildRestorePlan(
                             kvFirst,
-                            model->GetPagedKVCacheManagers(li, true),
+                            model->GetPagedKVCacheManagersForRequest(li, true, ctx),
                             unbounded && !kvFirst.isLinearAttention) &&
                         restorePlanReady;
                     restorePlanReady =
                         buildRestorePlan(
                             kvSecond,
-                            model->GetPagedKVCacheManagers(li, false),
+                            model->GetPagedKVCacheManagersForRequest(li, false, ctx),
                             unbounded && !kvSecond.isLinearAttention) &&
                         restorePlanReady;
                 }
@@ -2177,7 +2177,7 @@ namespace fastllm {
                                              retainedTokens, state)) {
                         continue;
                     }
-                    auto refs = model->GetPagedKVCacheManagers(li, isKey);
+                    auto refs = model->GetPagedKVCacheManagersForRequest(li, isKey, ctx);
                     for (auto &ref : refs) {
                         addManagerPageNeed(ref.second, 0, 0, appendTokens,
                                            retainedTokens, state);
@@ -3144,7 +3144,6 @@ namespace fastllm {
                     // without allocating and destroying their queues every token.
                     LastTokensManager tokensManager;
                     tokensManager.units.reserve(maxBatch);
-                    DenseIdSet<> protectedPages;
                     PagedPrefixPreviewExecutor prefixPreviewExecutor;
                     while (true) {
                         std::unique_ptr<inference_trace::Step> trace;
@@ -3253,9 +3252,11 @@ namespace fastllm {
                         // Count free/reclaimable physical pages once, not every
                         // request's logical prefix. Shared prefixes may make
                         // the sum of request lengths much larger than the pool.
-                        auto freePagedPages = [&]() -> long long {
-                            std::lock_guard<std::mutex> guard(pagedManager->pageIndexLocker);
-                            return pagedManager->FreePageCount();
+                        auto freePagedPages = [&](PagedCacheManager *manager) -> long long {
+                            AssertInFastLLM(manager != nullptr && manager->pageLen == pageLen,
+                                "Request has no compatible physical KV admission domain");
+                            std::lock_guard<std::mutex> guard(manager->pageIndexLocker);
+                            return manager->FreePageCount();
                         };
                         auto remainingPages = [&](ResponseContext *ctx) -> long long {
                             const Data &root = ctx->pastKeyValues[model->kvCacheId].first;
@@ -3276,12 +3277,12 @@ namespace fastllm {
                             }
                             return extra;
                         };
-                        long long reservedPages = 0;
+                        std::map<PagedCacheManager *, long long> reservedPages;
                         int activeDecode = 0;
                         if (batchPrefill || sharedKvPool) for (auto &entry : model->responseContextDict.dicts) {
                             auto *ctx = entry.second;
                             if (!ctx->isEnding && ctx->curTokens > 0) {
-                                if (sharedKvPool) reservedPages += remainingPages(ctx);
+                                if (sharedKvPool) reservedPages[model->GetPagedKVCacheBudgetManager(ctx)] += remainingPages(ctx);
                                 ++activeDecode;
                             }
                         }
@@ -3298,14 +3299,15 @@ namespace fastllm {
                             model->OnResponseContextCreated(ctx);
                         };
                         auto reserveSharedRequest = [&](ResponseContext *ctx) {
+                            auto *domain = model->GetPagedKVCacheBudgetManager(ctx);
                             const long long needed = remainingPages(ctx);
-                            if (reservedPages + needed > freePagedPages()) {
+                            if (reservedPages[domain] + needed > freePagedPages(domain)) {
                                 // A waiting cache hit must not pin otherwise
                                 // reclaimable pages needed by active decoders.
                                 releasePendingPrefix(ctx);
                                 return false;
                             }
-                            reservedPages += needed;
+                            reservedPages[domain] += needed;
                             return true;
                         };
                         struct ScheduleOrder {
@@ -3358,19 +3360,24 @@ namespace fastllm {
                             // Idle/low-load/zero-wait paths go straight to actual
                             // admission. Preview never owns KV or request slots.
                             if (policy.maxWaitMs > 0 && activeDecode >= std::max(1, policy.minDecodeRequests)) {
-                                long long previewReserved = reservedPages;
-                                const long long available = sharedKvPool ? freePagedPages() : 0;
-                                protectedPages.Reset(sharedKvPool ? pagedManager->maxPages : 0);
-                                ResidentPrefixManagers previewManagers;
+                                auto previewReserved = reservedPages;
+                                std::map<PagedCacheManager *, long long> availablePages;
+                                std::map<PagedCacheManager *, DenseIdSet<>> protectedDomains;
+                                std::map<PagedCacheManager *, ResidentPrefixManagers> previewManagers;
                                 for (auto &order : orders) {
                                     auto *ctx = model->responseContextDict.dicts.at(order.second);
                                     if (ctx->isEnding || ctx->curTokens != 0) continue;
                                     if (ctx->cacheLen + ctx->currentTokens.size() > (size_t)maxTotalLens ||
                                         ctx->cacheLen + ctx->currentTokens.size() > (size_t)maxPromptTokens) continue;
                                     if (candidates >= slots) { capacityLimited = true; break; }
+                                    auto *domain = sharedKvPool ? model->GetPagedKVCacheBudgetManager(ctx) : nullptr;
+                                    if (sharedKvPool && !availablePages.count(domain)) {
+                                        availablePages[domain] = freePagedPages(domain);
+                                        protectedDomains[domain].Reset(domain->maxPages);
+                                    }
                                     std::vector<int> unreferenced;
                                     const int prefix = PreviewResidentPrefix(model, ctx,
-                                        sharedKvPool ? pagedManager : nullptr, unreferenced, previewManagers,
+                                        domain, unreferenced, previewManagers[domain],
                                         prefixPreviewExecutor);
                                     const int count = (int)ctx->currentTokens.size() - prefix;
                                     const bool single = count > prefillChunk || !ctx->multimodalInput.empty();
@@ -3381,14 +3388,15 @@ namespace fastllm {
                                     if (sharedKvPool) {
                                         inference_trace::DetailSpan capacityTrace("capacity_and_dedup", detail);
                                         if (detail) detail->Count("unreferenced_pages", unreferenced.size());
+                                        auto &protectedPages = protectedDomains[domain];
                                         long long pins = 0;
                                         for (int page : unreferenced) pins += !protectedPages.Contains(page);
                                         const long long growth = std::max(0LL, remainingPages(ctx) - prefix / pageLen);
-                                        if (previewReserved + growth + pins > available) {
+                                        if (previewReserved[domain] + growth + pins > availablePages[domain]) {
                                             capacityLimited = true;
-                                            break;
+                                            continue;
                                         }
-                                        previewReserved += growth + pins;
+                                        previewReserved[domain] += growth + pins;
                                         for (int page : unreferenced) protectedPages.Insert(page);
                                     }
                                     ++candidates;
@@ -3439,7 +3447,7 @@ namespace fastllm {
                                         releasePendingPrefix(ctx);
                                         break;
                                     }
-                                    if (sharedKvPool && !reserveSharedRequest(ctx)) break;
+                                    if (sharedKvPool && !reserveSharedRequest(ctx)) continue;
                                     plannedPrefills.insert(order.second);
                                     pendingTokens += count;
                                     if (single || pendingTokens >= policy.targetTokens) break;

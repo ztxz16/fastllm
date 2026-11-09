@@ -2,6 +2,7 @@
 #define FASTLLM_NAIVE_N05_FLASH_H
 
 #include "basellm.h"
+#include "parallel/model.h"
 #include <algorithm>
 #include <atomic>
 #include <memory>
@@ -13,7 +14,7 @@ struct FastllmCudaMimoEp8Mega;
 
 namespace fastllm {
     class CudaWorkspace;
-    class NaiveN05FlashModel : public basellm {
+    class NaiveN05FlashModel : public basellm, public parallel::AttentionParallelModel {
     protected:
         static constexpr int MaxTPDecodeBatch = 512;
         struct TargetCapture;
@@ -23,6 +24,7 @@ namespace fastllm {
         NaiveN05FlashModel();
         ~NaiveN05FlashModel() override;
         void InitParams() override;
+        void ConfigureAttentionParallel(int attentionDP) override;
         void SetIndexerDataType(DataType dataType) override;
         void SetKVCacheDataType(DataType dataType) override;
         void SetIndexerTPStorage(bool shardByLayer, bool shardByContext = false);
@@ -57,6 +59,9 @@ namespace fastllm {
         bool TryRestoreHistoryCache(std::vector<int> &tokens, int &cacheLen) override;
         bool DeferHistoryCacheRestore() const override { return !tpPagedCaches.empty(); }
         PagedCacheManager *GetPagedKVCacheManager(int layer, bool key) const override;
+        PagedCacheManager *GetPagedKVCacheBudgetManager(const ResponseContext *context) const override;
+        std::vector<std::pair<int, PagedCacheManager *>> GetPagedKVCacheManagersForRequest(
+            int layer, bool key, const ResponseContext *context) const override;
         std::vector<std::pair<int, PagedCacheManager *>> GetPagedKVCacheManagers(int layer, bool key) const override;
         bool TryRecordPagedPrefixCacheExtra(ResponseContext *context) override;
         int QueryPagedPrefixCacheExtra(ResponseContext *context, int length) const override;
@@ -137,6 +142,7 @@ namespace fastllm {
         struct PrefixSnapshot {
             std::shared_ptr<PrefixPool> pool;
             int slot = -1, length = 0;
+            int ownerDevice = -1;
             bool draftReady = false;
             std::vector<int> tokens;
             uint64_t tokenHash = 0; // Immutable with tokens after publication.
@@ -361,8 +367,17 @@ namespace fastllm {
                                    std::vector<std::pair<Data, Data>> &kv,
                                    const GenerationConfig &config, TargetCapture *capture = nullptr,
                                    LogitsSelection *selection = nullptr, const TargetBatch *batch = nullptr);
+        struct AttentionParallelState;
+        std::shared_ptr<AttentionParallelState> attentionParallel;
+        int attentionDP = 1;
+        void InitAttentionParallelCache(const std::vector<std::pair<Data *, Data *>> &roots, int group = -1);
+        int AttentionTPSize() const { return tpDevices.size() / attentionDP; }
+        Data ForwardAttentionParallel(const Data &inputIds, const Data &positions,
+            std::vector<std::pair<Data, Data>> &kv, const GenerationConfig &config,
+            TargetCapture *capture, LogitsSelection *selection, const TargetBatch *batch);
         std::vector<int> tpDevices;
         std::map<int, std::shared_ptr<CudaWorkspace>> tpKVPool;
+        int tpSwaCacheCapacity = 0;
         // Separate equal-sized request allocations so prefix restore and cold
         // prefill cannot fragment each other's page tables and SWA windows.
         std::map<std::pair<int, size_t>, std::shared_ptr<CudaWorkspace>> tpRequestKVPool;

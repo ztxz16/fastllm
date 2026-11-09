@@ -556,7 +556,16 @@ namespace fastllm {
         virtual void TryRecordResponseContext(ResponseContext *context);
 
         virtual PagedCacheManager* GetPagedKVCacheManager(int layerIndex, bool isKey) const;
+        // Physical admission domain for one request. TP models share a domain;
+        // attention DP models select the request's owning group.
+        virtual PagedCacheManager *GetPagedKVCacheBudgetManager(const ResponseContext *) const {
+            return GetPagedKVCacheManager(kvCacheId, true);
+        }
         virtual std::vector<std::pair<int, PagedCacheManager*> > GetPagedKVCacheManagers(int layerIndex, bool isKey) const;
+        virtual std::vector<std::pair<int, PagedCacheManager *>> GetPagedKVCacheManagersForRequest(
+                int layer, bool key, const ResponseContext *) const {
+            return GetPagedKVCacheManagers(layer, key);
+        }
         virtual bool TryRecordPagedPrefixCacheExtra(ResponseContext *context);
         virtual int QueryPagedPrefixCacheExtra(ResponseContext *context, int maxCachedLen) const;
         virtual bool RestorePagedPrefixCacheExtra(ResponseContext *context, int cachedLen) const;

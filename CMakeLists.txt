@@ -2408,6 +2408,48 @@ if (UNIT_TEST)
         add_test(NAME naive_n05_tp_model COMMAND naive_n05_tp_model_test)
         add_test(NAME naive_n05_tp_model_2 COMMAND naive_n05_tp_model_test 2)
         add_test(NAME naive_n05_tp_model_4 COMMAND naive_n05_tp_model_test 4)
+        foreach(NAIVE_DP_WORLD 4 8)
+            foreach(NAIVE_DP_GROUPS 2 4)
+                foreach(NAIVE_DP_KV bf16 fp8)
+                    foreach(NAIVE_DP_MODE attention_dp attention_dp_verify attention_dp_pool)
+                        add_test(NAME naive_n05_${NAIVE_DP_MODE}_${NAIVE_DP_WORLD}_${NAIVE_DP_GROUPS}_${NAIVE_DP_KV}
+                            COMMAND naive_n05_tp_model_test ${NAIVE_DP_WORLD} ${NAIVE_DP_MODE} ${NAIVE_DP_GROUPS} ${NAIVE_DP_KV})
+                        set_tests_properties(naive_n05_${NAIVE_DP_MODE}_${NAIVE_DP_WORLD}_${NAIVE_DP_GROUPS}_${NAIVE_DP_KV}
+                            PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
+                            PASS_REGULAR_EXPRESSION "ATTENTION DP.*PASS")
+                    endforeach()
+                endforeach()
+            endforeach()
+        endforeach()
+        foreach(NAIVE_DP_EXTRA indexer kvmem admission prefix)
+            if(NAIVE_DP_EXTRA STREQUAL "indexer" OR NAIVE_DP_EXTRA STREQUAL "kvmem")
+                set(NAIVE_DP_VARIANTS eager graph)
+            elseif(NAIVE_DP_EXTRA STREQUAL "admission")
+                set(NAIVE_DP_VARIANTS single batch)
+            else()
+                set(NAIVE_DP_VARIANTS plain draft)
+            endif()
+            foreach(NAIVE_DP_VARIANT ${NAIVE_DP_VARIANTS})
+                add_test(NAME naive_n05_attention_dp_${NAIVE_DP_EXTRA}_${NAIVE_DP_VARIANT}
+                    COMMAND naive_n05_tp_model_test 8 attention_dp_${NAIVE_DP_EXTRA} 2 ${NAIVE_DP_VARIANT})
+                set_tests_properties(naive_n05_attention_dp_${NAIVE_DP_EXTRA}_${NAIVE_DP_VARIANT}
+                    PROPERTIES LABELS "cuda;naive" RUN_SERIAL TRUE TIMEOUT 300 SKIP_RETURN_CODE 77
+                    PASS_REGULAR_EXPRESSION "ATTENTION DP.*PASS")
+            endforeach()
+        endforeach()
+        add_test(NAME naive_n05_attention_dp_8_8 COMMAND naive_n05_tp_model_test 8 attention_dp 8 fp8)
+        set_tests_properties(naive_n05_attention_dp_8_8
+            PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
+                    PASS_REGULAR_EXPRESSION "ATTENTION DP.*PASS")
+        foreach(NAIVE_DP_DRAFT 3 5 7)
+            foreach(NAIVE_DP_SAMPLING greedy sample)
+                add_test(NAME naive_n05_attention_dp_dspark_${NAIVE_DP_DRAFT}_${NAIVE_DP_SAMPLING}
+                    COMMAND naive_n05_tp_model_test 8 attention_dp_dspark 2 ${NAIVE_DP_DRAFT} ${NAIVE_DP_SAMPLING})
+                set_tests_properties(naive_n05_attention_dp_dspark_${NAIVE_DP_DRAFT}_${NAIVE_DP_SAMPLING}
+                    PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
+                    PASS_REGULAR_EXPRESSION "ATTENTION DP DSPARK PASS")
+            endforeach()
+        endforeach()
         set_tests_properties(naive_n05_tp_model naive_n05_tp_model_2 naive_n05_tp_model_4
             PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
             PASS_REGULAR_EXPRESSION "MODEL SMOKE PASS")
@@ -2455,6 +2497,27 @@ if (UNIT_TEST)
         if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
             add_executable(naive_n05_verify_graph_test test/basic/test_naive_n05_tp_model.cpp)
             target_compile_definitions(naive_n05_verify_graph_test PRIVATE FASTLLM_TEST_VERIFY_GRAPH_HOOKS)
+            foreach(NAIVE_DP_GRAPH_MODE indexer kvmem)
+                add_test(NAME naive_n05_attention_dp_capture_${NAIVE_DP_GRAPH_MODE}
+                    COMMAND naive_n05_verify_graph_test 8 attention_dp_${NAIVE_DP_GRAPH_MODE} 2 graph)
+                set_tests_properties(naive_n05_attention_dp_capture_${NAIVE_DP_GRAPH_MODE}
+                    PROPERTIES LABELS "cuda;naive" RUN_SERIAL TRUE TIMEOUT 300 SKIP_RETURN_CODE 77
+                    PASS_REGULAR_EXPRESSION "ATTENTION DP.*PASS")
+            endforeach()
+            add_test(NAME naive_n05_attention_dp_capture_prefix
+                COMMAND naive_n05_verify_graph_test 8 attention_dp_prefix 2 draft kvmem)
+            set_tests_properties(naive_n05_attention_dp_capture_prefix
+                PROPERTIES LABELS "cuda;naive" RUN_SERIAL TRUE TIMEOUT 300 SKIP_RETURN_CODE 77
+                    PASS_REGULAR_EXPRESSION "ATTENTION DP.*PASS")
+
+            foreach(NAIVE_DP_REJECTION_MODE sample sample_topk)
+                add_test(NAME naive_n05_attention_dp_rejection_${NAIVE_DP_REJECTION_MODE}
+                    COMMAND naive_n05_verify_graph_test 8 attention_dp_dspark 2 3 ${NAIVE_DP_REJECTION_MODE})
+                set_tests_properties(naive_n05_attention_dp_rejection_${NAIVE_DP_REJECTION_MODE}
+                    PROPERTIES LABELS cuda RUN_SERIAL TRUE TIMEOUT 180 SKIP_RETURN_CODE 77
+                    PASS_REGULAR_EXPRESSION "ATTENTION DP DSPARK PASS")
+            endforeach()
+
             add_executable(naive_n05_tp_graph_test test/basic/test_naive_n05_tp_graph.cpp)
             find_library(NAIVE_TP_GRAPH_CUDART cudart HINTS ${CMAKE_CUDA_IMPLICIT_LINK_DIRECTORIES})
             target_link_libraries(naive_n05_tp_graph_test PRIVATE
@@ -2811,6 +2874,22 @@ if (UNIT_TEST)
             endforeach()
             add_test(NAME naive_n05_serving_invalidation
                 COMMAND naive_n05_verify_graph_test 2 serving_invalidation)
+            add_test(NAME naive_n05_swa_dp_heads COMMAND naive_n05_swa_verify_test dp_heads)
+            set_tests_properties(naive_n05_swa_dp_heads PROPERTIES LABELS "cuda;naive" RUN_SERIAL TRUE TIMEOUT 300 SKIP_RETURN_CODE 77)
+            foreach(NAIVE_DP_GROUPS 2 4 8)
+                foreach(NAIVE_DP_KV bf16 fp8)
+                    add_test(NAME naive_n05_attention_dp_ring_${NAIVE_DP_GROUPS}_${NAIVE_DP_KV}
+                        COMMAND naive_n05_verify_graph_test 8 attention_dp_ring ${NAIVE_DP_GROUPS} ${NAIVE_DP_KV})
+                    set_tests_properties(naive_n05_attention_dp_ring_${NAIVE_DP_GROUPS}_${NAIVE_DP_KV}
+                        PROPERTIES LABELS "cuda;naive" RUN_SERIAL TRUE TIMEOUT 300 SKIP_RETURN_CODE 77)
+                endforeach()
+            endforeach()
+            foreach(NAIVE_DP_CASE kvmem failbegin failinstantiate)
+                add_test(NAME naive_n05_attention_dp_ring_${NAIVE_DP_CASE}
+                    COMMAND naive_n05_verify_graph_test 8 attention_dp_ring 8 fp8 ${NAIVE_DP_CASE})
+                set_tests_properties(naive_n05_attention_dp_ring_${NAIVE_DP_CASE}
+                    PROPERTIES LABELS "cuda;naive" RUN_SERIAL TRUE TIMEOUT 300 SKIP_RETURN_CODE 77)
+            endforeach()
             add_test(NAME naive_n05_serving_padding COMMAND naive_n05_verify_graph_test 8 serving_padding)
             set_tests_properties(naive_n05_serving_padding PROPERTIES
                 LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 600
