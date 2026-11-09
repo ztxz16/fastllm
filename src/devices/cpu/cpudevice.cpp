@@ -2351,14 +2351,6 @@ namespace fastllm {
                         finish = true;
                         return;
                     }
-                    static const bool tracedFallback = []() {
-                        if (std::getenv("FASTLLM_NVFP4_BLOCK32_TRACE") != nullptr) {
-                            printf("[Fastllm] NVFP4 block-32: falling back to "
-                                   "dequantise-then-BF16-GEMM.\n");
-                        }
-                        return true;
-                    }();
-                    (void)tracedFallback;
                     std::vector<uint16_t> bf16B_temp(
                         (size_t)(end - st) * m);
                     NVFP4Block32RowsToBFloat16(

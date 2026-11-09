@@ -463,8 +463,7 @@ int main(int argc, char **argv) {
                 // Compare the complete optimized operator byte-for-byte with
                 // its scalar fallback, including non-BF16 clamp thresholds,
                 // zero inputs, signed routes and both FP8 block sizes.
-                RestoreEnv fast("FASTLLM_DSV4_DISABLE_NUMAS_MOE_FAST"),
-                           taskCache("FASTLLM_DSV4_DISABLE_NUMAS_MOE_TASK_CACHE");
+                RestoreEnv fast("FASTLLM_DSV4_DISABLE_NUMAS_MOE_FAST");
                 for (int block : {32, 128}) for (float limit : {0.f, 1.234567f, 10.f}) {
                     for (DataType outputType : {BFLOAT16, FLOAT32}) {
                         Data check(outputType);
@@ -477,15 +476,15 @@ int main(int argc, char **argv) {
                         merge();
                         const std::vector<uint8_t> reference(check.cpuData, check.cpuData + check.GetBytes());
                         unsetenv(fast.key);
-                        for (bool cached : {true, false}) {
-                            if (cached) unsetenv(taskCache.key);
-                            else setenv(taskCache.key, "1", 1);
+                        // Repeat with reused task storage to catch stale input,
+                        // route or partition pointers after the first invocation.
+                        for (int repeat = 0; repeat < 2; ++repeat) {
                             merge();
                             if (memcmp(reference.data(), check.cpuData, reference.size()))
                                 throw std::runtime_error("Q2 decode fast/scalar outputs differ: block=" +
                                     std::to_string(block) + " limit=" + std::to_string(limit) +
                                     " output=" + GetDataTypeName(outputType) +
-                                    " task_cache=" + std::to_string(cached));
+                                    " repeat=" + std::to_string(repeat));
                         }
                     }
                 }

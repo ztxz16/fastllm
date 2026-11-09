@@ -683,6 +683,13 @@ void Exl3MoeCPU(const Data &input, Data &output, const Data &index, const Data &
               result(type, {int(this->selected.size()), k}) {}
     };
     std::vector<std::unique_ptr<Expert>> pending;
+    // Bound scratch in bytes, rather than disabling cross-expert scheduling
+    // above a particular request row count. Also flush once both projections
+    // have enough independent column blocks to occupy the active workers.
+    constexpr size_t scratchBudget = 64 * 1024 * 1024;
+    const auto interval = GetAlivePool()->curActivateThreadInterval;
+    const size_t workers = std::max(1, interval.second - interval.first);
+    size_t pendingBytes = 0, gateBlocks = 0, downBlocks = 0;
     auto run = [&] {
         Data empty;
         std::vector<Projection> plans;
@@ -705,6 +712,7 @@ void Exl3MoeCPU(const Data &input, Data &output, const Data &index, const Data &
             for (int row = 0; row < int(e->selected.size()); ++row) for (int c = 0; c < k; ++c)
                 sum[size_t(e->selected[row]) * k + c] += e->scales[row] * ReadValue(e->result, size_t(row) * k + c);
         pending.clear();
+        pendingBytes = gateBlocks = downBlocks = 0;
     };
     for (int expert = 0; expert < weightsBatch / 2; ++expert) {
         if (!weights[2 * expert] || !weights[2 * expert + 1]) continue;
@@ -719,15 +727,22 @@ void Exl3MoeCPU(const Data &input, Data &output, const Data &index, const Data &
         }
         if (selected.empty()) continue;
         const int count = selected.size(), width = weights[2 * expert]->dims[0] / 2;
+        // Gather/middle/activation/result storage plus the larger rotated
+        // projection input. A single large expert remains a valid work unit.
+        const size_t scratch = size_t(count) *
+            ((size_t(2) * k + size_t(3) * width) * input.unitSize +
+             std::max(size_t(2) * k, size_t(width)) * sizeof(float));
+        if (!pending.empty() && scratch > scratchBudget - std::min(pendingBytes, scratchBudget)) run();
         pending.emplace_back(new Expert(expert, width, k, input.dataType, std::move(selected), std::move(scales)));
+        pendingBytes += scratch;
+        gateBlocks += size_t(2) * width / 128;
+        downBlocks += k / 128;
         auto &e = *pending.back();
         e.gathered.Allocate(false);
         for (int row = 0; row < count; ++row)
             std::memcpy(e.gathered.cpuData + size_t(row) * k * input.unitSize,
                         input.cpuData + size_t(e.selected[row]) * k * input.unitSize, size_t(k) * input.unitSize);
-        // Bound prefill scratch independently of the number of routed experts.
-        // Small batches share the worker pool across experts to fill idle lanes.
-        if (rows > 4) run();
+        if (pendingBytes >= scratchBudget || (gateBlocks >= workers && downBlocks >= workers)) run();
     }
     if (!pending.empty()) run();
     output.Allocate(false);

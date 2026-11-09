@@ -70,7 +70,7 @@ static void CheckFormat(bool gguf, int hidden, int inter) {
     RegisterNumasMoeWeightBatch(pending);
     Require(CanRunNumasMoeDecodeExperts(weights.data(),weights.size()),"decode capability");
     int cases=0;
-    for(int rows:{2,3,5,6,8,1})for(int turn=0;turn<8;++turn)for(float limit:{0.f,.013f,10.f}) {
+    for(int rows:{1,2,3,5,7,9,12,17,24,33,65,129})for(int turn=0;turn<8;++turn)for(float limit:{0.f,.013f,10.f}) {
         CheckBatch(weights.data(),weights.size(),hidden,topk,rows,turn,limit,false,rows==3&&turn==3&&limit==0.f);++cases;
     }
     for(int threads:{4,12,8}) {

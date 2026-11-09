@@ -178,7 +178,7 @@ static void Correctness() {
         std::vector<uint8_t> weights;
         BuildWeights(k, m, weights, rng);
         const size_t rowBytes = Block32RowBytes(m);
-        for (int n : {1, 2, 3, 4, 5, 6, 7, 8, 13, 32}) {
+        for (int n : {1, 2, 3, 4, 5, 6, 7, 8, 13, 32, 33, 65, 129}) {
             std::vector<uint16_t> input((size_t)n * m);
             for (auto &v : input) {
                 v = FloatToBf16(((int)(rng() % 2001) - 1000) / 1000.0f);
@@ -224,6 +224,18 @@ static void Correctness() {
             }
             snprintf(buf, sizeof(buf), "FastllmGemm  m=%d k=%d n=%d maxErr/|terms|=%.3e", m, k, n, gemmRel);
             Check(gemmFinite && gemmRel < 2e-5, buf);
+
+            // The FLOAT32 entry converts activations to BF16 before using the
+            // same packed weights. Exact BF16 inputs must retain identical bits.
+            std::vector<float> floatInput(input.size()), viaFloat(viaGemm.size());
+            for (size_t i = 0; i < input.size(); ++i) floatInput[i] = Bf16ToFloat(input[i]);
+            FastllmGemm(n, m, k,
+                        floatInput.data(), (long)m * sizeof(float),
+                        weights.data(), (long)rowBytes,
+                        viaFloat.data(), (long)k * sizeof(float), 0, k,
+                        DataType::FLOAT32, DataType::NVFP4_BLOCK_32_E8M0, DataType::FLOAT32);
+            snprintf(buf, sizeof(buf), "FastllmGemm FP32/BF16 exact m=%d k=%d n=%d", m, k, n);
+            Check(viaFloat == viaGemm, buf);
         }
     }
 }
@@ -312,7 +324,7 @@ static void StridedCorrectness() {
             // Also exercise E8M0's special subnormal scale encoding.
             if (col % 5 == 0) weights[col * ldb + 16] = 0;
         }
-        for (int n : {1, 2, 3, 4, 5, 6, 7, 8, 13, 32}) {
+        for (int n : {1, 2, 3, 4, 5, 6, 7, 8, 13, 32, 33, 65, 129}) {
             std::vector<uint16_t> input((size_t)n * lda, 0x7fc1);
             for (int row = 0; row < n; row++) {
                 for (int d = 0; d < m; d++) {
