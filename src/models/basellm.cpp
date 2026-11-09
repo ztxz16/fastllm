@@ -1048,7 +1048,7 @@ namespace fastllm {
             std::lock_guard<std::mutex> guard(dictLocker);
             this->isFree = true;
         }
-        dictCV.notify_all();
+        NotifyResponseReady();
 
         std::thread *loop = nullptr;
         {
@@ -1867,7 +1867,7 @@ namespace fastllm {
             fprintf(stderr, "[Fastllm] Prefix restore failed: %s\n", error.what());
             ctx->isEnding = true;
             ctx->error = ResponseContextErrorPromptTooLong;
-            model->dictCV.notify_all();
+            model->NotifyResponseReady();
             return nullptr;
         }
 #endif
@@ -3001,7 +3001,7 @@ namespace fastllm {
                         if (model->verbose) ++genTokens;
                     } while (true);
                 }
-                model->dictCV.notify_all();
+                model->NotifyResponseReady();
                 ReleasePendingResultLogits(logits);
             } else {
                 // 没有任何请求可以调度时，等待新请求
@@ -3811,7 +3811,7 @@ namespace fastllm {
                                         context->error = ResponseContextErrorPromptTooLong;
                                     }
                                 }
-                                model->dictCV.notify_all();
+                                model->NotifyResponseReady();
                                 ReleasePendingResultLogits(logits);
                                 for (auto *mask : attentionMasks) delete mask;
                                 for (auto *position : ownedPositionIds) delete position;
@@ -3899,7 +3899,7 @@ namespace fastllm {
                             }
                             {
                                 inference_trace::DetailSpan notifyTrace("notify_consumers", detail);
-                                model->dictCV.notify_all();
+                                model->NotifyResponseReady();
                             }
                             {
                                 inference_trace::DetailSpan logitsTrace("release_logits", detail);
@@ -4020,7 +4020,7 @@ namespace fastllm {
         dictLocker.unlock();
         // Scheduler and token consumers share this condition variable. A
         // single notification can wake only a consumer and strand new work.
-        dictCV.notify_all();
+        NotifyResponseReady();
         return handleId;
     }
 
@@ -4061,15 +4061,89 @@ namespace fastllm {
     }
 
     void basellm::AbortResponse(int handleId) {
-        std::unique_lock<std::mutex> dictLocker(this->dictLocker);
-        ResponseContext *context = responseContextDict.GetHandle(handleId);
+        AbortResponse(handleId, 0);
+    }
 
-        if (context == nullptr) {
-            return;
-        } else {
+    void basellm::AbortResponse(int handleId, uint64_t generation) {
+        {
+            std::lock_guard<std::mutex> lock(dictLocker);
+            ResponseContext *context = responseContextDict.GetHandle(handleId);
+            if (!context || (generation && context->generation != generation)) return;
             context->isAbort = true;
         }
+        NotifyResponseReady();
+    }
+
+    uint64_t basellm::GetResponseGeneration(int handleId) {
+        std::lock_guard<std::mutex> lock(dictLocker);
+        const auto *context = responseContextDict.GetHandle(handleId);
+        return context ? context->generation : 0;
+    }
+
+    void basellm::WakeResponseOutput() {
+        {
+            std::lock_guard<std::mutex> lock(responseOutputMutex);
+            ++responseOutputVersion;
+        }
+        responseOutputCV.notify_all();
+    }
+
+    void basellm::NotifyResponseReady() {
+        // Preserve the scheduler and old blocking readers' notification semantics.
         dictCV.notify_all();
+        WakeResponseOutput();
+    }
+
+    int basellm::FetchResponses(const int *handles, const uint64_t *generations, int requests,
+                               int maxTokensPerRequest, int *tokens, int tokenCapacity,
+                               int *records, int recordCapacity, int timeoutMs, uint64_t &version) {
+        if (requests < 0 || maxTokensPerRequest <= 0 || tokenCapacity < 0 || recordCapacity < 0 ||
+            (requests && (!handles || !generations)) || (tokenCapacity && !tokens) ||
+            (recordCapacity && !records)) return -2;
+        int written = 0, used = 0;
+        bool retired = false;
+        {
+            std::lock_guard<std::mutex> lock(dictLocker);
+            if (isFree) return -1;
+            for (int i = 0; i < requests && written < recordCapacity; ++i) {
+                auto *context = responseContextDict.GetHandle(handles[i]);
+                int statistics[3] = {-1, -1, -1};
+                int status = 0, count = 0, offset = used;
+                if (!context || !generations[i] || context->generation != generations[i] || context->isAbort) {
+                    status = -1;
+                } else {
+                    CopyResponseStatistics(*context, statistics);
+                    while (!context->resultTokenQueue.empty() &&
+                           count < maxTokensPerRequest && used < tokenCapacity) {
+                        tokens[used++] = context->resultTokenQueue.front();
+                        context->resultTokenQueue.pop();
+                        ++count;
+                    }
+                    if (context->resultTokenQueue.empty() && context->isEnding) {
+                        const auto error = context->error;
+                        status = error == ResponseContextErrorPromptTooLong ? -2 :
+                            error == ResponseContextErrorRuntime ? -3 : -1;
+                        RemoveResponseContext(handles[i]);
+                        retired = true;
+                    }
+                }
+                if (count || status) {
+                    int *record = records + written++ * 7;
+                    record[0] = i; record[1] = offset; record[2] = count; record[3] = status;
+                    std::copy(statistics, statistics + 3, record + 4);
+                }
+            }
+        }
+        if (retired) NotifyResponseReady();
+        // Never hold the output mutex while acquiring dictLocker. A persistent version also
+        // catches a Python registration/cancel/credit wake before this call starts waiting.
+        std::unique_lock<std::mutex> lock(responseOutputMutex);
+        if (!written && timeoutMs > 0 && responseOutputVersion == version) {
+            responseOutputCV.wait_for(lock, std::chrono::milliseconds(timeoutMs),
+                [&] { return responseOutputVersion != version; });
+        }
+        version = responseOutputVersion;
+        return written;
     }
 
     int basellm::FetchResponseTokens(int handleId) {
@@ -4091,7 +4165,7 @@ namespace fastllm {
                         ResponseContextError err = context->error;
                         RemoveResponseContext(handleId);
                         dictLocker.unlock();
-                        dictCV.notify_all();
+                        NotifyResponseReady();
                         if (err == ResponseContextErrorPromptTooLong) {
                             return -2;
                         }
@@ -4143,7 +4217,7 @@ namespace fastllm {
                 ResponseContextError err = context->error;
                 RemoveResponseContext(handleId);
                 dictLocker.unlock();
-                dictCV.notify_all();
+                NotifyResponseReady();
                 return err == ResponseContextErrorPromptTooLong ? -2 :
                        err == ResponseContextErrorRuntime ? -3 : -1;
             }
@@ -4186,7 +4260,7 @@ namespace fastllm {
                     if (context->isEnding) {
                         RemoveResponseContext(handleId);
                         dictLocker.unlock();
-                        dictCV.notify_all();
+                        NotifyResponseReady();
                         return -1;
                     }
                 }

@@ -3286,6 +3286,19 @@ class model:
                 yield cur
 
     async def stream_response_handle_async(self, handle, response_statistics = None):
+        try:
+            from .async_output import open_output_stream
+        except ImportError:
+            from async_output import open_output_stream
+        source = open_output_stream(fastllm_lib, self.model, handle)
+        try:
+            async for text in self._stream_response_handle_async(handle, response_statistics, source):
+                yield text
+        finally:
+            if source is not None:
+                source.close()
+
+    async def _stream_response_handle_async(self, handle, response_statistics, source):
         import time
         is_prefill = True
         start_time = time.time()
@@ -3295,7 +3308,7 @@ class model:
         # Drain a generous bounded batch through one C call and one scheduler
         # mutex acquisition.
         fetch_batch_capacity = 64
-        fetch_batch_buffer = (ctypes.c_int * fetch_batch_capacity)()
+        fetch_batch_buffer = (ctypes.c_int * fetch_batch_capacity)() if source is None else None
         fetch_statistics = (ctypes.c_int * 3)()
 
         def fetch_ready_tokens():
@@ -3305,6 +3318,14 @@ class model:
             if count <= 0:
                 return count, []
             return count, [fetch_batch_buffer[i] for i in range(count)]
+
+        async def fetch_tokens():
+            if source is None:
+                return await asyncio.to_thread(fetch_ready_tokens)
+            count, tokens, statistics = await source.read()
+            for i, value in enumerate(statistics):
+                fetch_statistics[i] = value
+            return count, tokens
 
         def capture_response_statistics():
             # The terminal fetch releases the handle. Only use the snapshot
@@ -3320,7 +3341,7 @@ class model:
             tokens = []
             finished = False
             while not finished:
-                count, ready_tokens = await asyncio.to_thread(fetch_ready_tokens)
+                count, ready_tokens = await fetch_tokens()
                 if count == 0:
                     if (is_prefill and time.time() - start_time > 5):
                         start_time = time.time()
@@ -3368,7 +3389,7 @@ class model:
             pending_tokens = []
             fail_cnt = 0
             while True:
-                count, ready_tokens = await asyncio.to_thread(fetch_ready_tokens)
+                count, ready_tokens = await fetch_tokens()
                 if count == 0:
                     continue
                 capture_response_statistics()
@@ -3516,6 +3537,11 @@ class model:
         fastllm_lib.disable_adapter(self.model)
     
     def release_memory(self):
+        try:
+            from .async_output import close_output_reader
+        except ImportError:
+            from async_output import close_output_reader
+        close_output_reader(fastllm_lib, self.model)
         fastllm_lib.release_memory(self.model)
     
     def set_save_history(self, save: bool):

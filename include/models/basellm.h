@@ -443,6 +443,19 @@ namespace fastllm {
         int FetchResponseTokensBatch(int handleId, int *output,
                                      int maxTokens, int *statistics);
 
+        // Cross-request output drain. Each record contains seven ints:
+        // {request index, token offset, token count, status, cached, missed, generated}.
+        // status is 0 while running, or the same negative terminal code as FetchResponseTokensBatch.
+        // A terminal record may also contain the last tokens. Callers retain no context pointers.
+        uint64_t GetResponseGeneration(int handleId);
+        void AbortResponse(int handleId, uint64_t generation);
+        int FetchResponses(const int *handles, const uint64_t *generations, int requests,
+                           int maxTokensPerRequest, int *tokens, int tokenCapacity,
+                           int *records, int recordCapacity, int timeoutMs, uint64_t &version);
+        // Output/control notifications are separate from the legacy scheduler CV.
+        void WakeResponseOutput();
+        void NotifyResponseReady();
+
         virtual int FetchResponseLogits(int handleId, std::vector <float> &logits); // 获取指定handle的输出Logits
 
         virtual bool GetResponseStatistics(int handleId, int &cachedInputTokens,
@@ -729,6 +742,9 @@ namespace fastllm {
         std::thread *mainLoop = nullptr;
         std::mutex mainLoopLocker, dictLocker, forwardLocker;
         std::condition_variable dictCV;
+        std::mutex responseOutputMutex;
+        std::condition_variable responseOutputCV;
+        uint64_t responseOutputVersion = 0;
 
         std::map <std::string, int> deviceMap;
         std::map <std::string, int> moeDeviceMap;

@@ -790,7 +790,7 @@ void CloverModel::RunModelSpecificScheduler() {
                 }
             }
         }
-        dictCV.notify_all();
+        NotifyResponseReady();
     }
 }
 }

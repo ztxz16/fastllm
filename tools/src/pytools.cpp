@@ -1369,6 +1369,27 @@ extern "C" {
             handleId, output, maxTokens, statistics);
     }
 
+    DLL_EXPORT uint64_t get_response_generation_llm_model(int modelId, int handleId) {
+        return models.GetModel(modelId)->GetResponseGeneration(handleId);
+    }
+
+    DLL_EXPORT void abort_response_generation_llm_model(int modelId, int handleId, uint64_t generation) {
+        if (generation) models.GetModel(modelId)->AbortResponse(handleId, generation);
+    }
+
+    DLL_EXPORT void wake_response_output_llm_model(int modelId) {
+        models.GetModel(modelId)->WakeResponseOutput();
+    }
+
+    DLL_EXPORT int fetch_responses_llm_model(int modelId, const int *handles,
+            const uint64_t *generations, int requests, int maxTokensPerRequest,
+            int *tokens, int tokenCapacity, int *records, int recordCapacity,
+            int timeoutMs, uint64_t *version) {
+        if (!version) return -2;
+        return models.GetModel(modelId)->FetchResponses(handles, generations, requests,
+            maxTokensPerRequest, tokens, tokenCapacity, records, recordCapacity, timeoutMs, *version);
+    }
+
     DLL_EXPORT int fetch_response_logits_llm_model(int modelId, int handleId, float *logits) {
         auto model = models.GetModel(modelId);
         std::vector <float> retLogits;
