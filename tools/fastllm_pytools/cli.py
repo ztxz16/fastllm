@@ -46,6 +46,8 @@ def args_parser():
     parser = _AutoArgumentParser(description = "fastllm")
     subparsers = parser.add_subparsers(dest='command', help='子命令')
 
+    subparsers.add_parser('ops', help='List registered kernel families, capabilities and parameters')
+
     # 创建共享的解析器
     shared_parser = make_normal_parser("fastllm", add_help = False)
 
@@ -169,6 +171,9 @@ def main(argv=None):
     elif args.command in ('chat', 'run'):
         from .chat import fastllm_chat
         fastllm_chat(args)
+    elif args.command == 'ops':
+        from .kernel_policy import print_catalog
+        print_catalog()
     elif args.command in ('benchmark', 'bench'):
         from .benchmark import fastllm_benchmark
         fastllm_benchmark(args)

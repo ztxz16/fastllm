@@ -866,6 +866,8 @@ def _configure_sm120_mxfp4_grouped_triton(args, config) -> str:
     # This flag belongs to model selection, not to the user's environment.
     # Re-evaluate it when a process loads a subsequent model.
     os.environ.pop(auto_env_name, None)
+    if getattr(args, "kernel_tune", "off") != "off":
+        return ""
     if (not getattr(args, "auto", False) or
             not 1 <= getattr(args, "dspark", 0) <= 7 or
             getattr(args, "max_batch", 0) != 1 or
@@ -1020,6 +1022,10 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--kvmem', type=str, default=None,
                         help='启用主机 KV 缓存；JSON 参数，如 {"max_tokens":32768,"retrieval_interval":64}。默认关闭（--auto 可按预算启用 Qwen4 精确换页），Qwen3/3.5 单请求稀疏检索；Qwen4/QSA 混合推理精确换页；MiMo/Naive CUDA TP 支持多请求精确 DSA KV 缓存，需先设置 --max_batch')
     parser.add_argument('--kv_cache_limit', type = str, default = "auto",  help = 'kv缓存最大使用量')
+    parser.add_argument('--kernel-tune', choices=('off', 'quick', 'cache'), default='off',
+                        help='Kernel selection: legacy, bounded warmup measurement, or cached plans')
+    parser.add_argument('--kernel-policy', default='', help='JSON kernel policy: budget_ms, max_l2, force, deny')
+    parser.add_argument('--kernel-profile', default='', help='Read/write measured kernel profile JSON')
     parser.add_argument('--max_batch', type = int, default = -1,  help = '每次最多同时推理的询问数量')
     parser.add_argument('--chunked_prefill_size', type = _integer_or_auto, default = -1, help = '分块 prefill 的切片大小（首块与后续块相同），如8192；auto按混推内存预算选择')
     parser.add_argument('--prefill_batch_tokens', type=int, default=0,
@@ -2193,6 +2199,8 @@ def make_normal_llm_model(args, startup_progress = None):
     # Explicit RoPE options must reach the constructor's capability check.
     legacy_context_limit = (max_context_length > 0 and not rope_scaling and
                             (graph is not None or not os.path.isdir(args.path)))
+    from .kernel_policy import configure as configure_kernels
+    kernel_policy = configure_kernels(args)
     model = None
     try:
         model = llm.model(args.path, dtype = args.dtype, kv_cache_dtype = args.kv_cache_dtype,
@@ -2263,6 +2271,9 @@ def make_normal_llm_model(args, startup_progress = None):
         llm.report_model_load_progress("weights_finalize", 1, 1)
         llm.report_model_load_progress("warmup", 0, 1)
         model.warmup()
+        if kernel_policy is not None:
+            model.kernel_policy = kernel_policy
+            kernel_policy.save()
         llm.report_model_load_progress("warmup", 1, 1)
         effective_max_batch = model.get_max_batch()
         if (mtp > 0 and args.max_batch > 0 and
@@ -2278,6 +2289,8 @@ def make_normal_llm_model(args, startup_progress = None):
             model.configure_pd(**json.loads(args.pd))
         return model
     except Exception:
+        if kernel_policy is not None:
+            kernel_policy.freeze()
         if model is not None:
             model.release_memory()
         raise

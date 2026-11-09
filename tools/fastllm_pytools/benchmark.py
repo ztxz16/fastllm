@@ -329,18 +329,24 @@ def fastllm_benchmark(args):
 
         _print_start(args, generation_args, input_tokens)
 
+        kernel_policy = getattr(model, "kernel_policy", None)
         for warmup_index in range(args.warmup):
             print(f"Warmup {warmup_index + 1}/{args.warmup} ...")
-            _run_batch(model, input_tokens, min(args.output_tokens, 8), 1,
+            _run_batch(model, input_tokens, min(args.output_tokens, 64 if kernel_policy else 8),
+                       args.batch if kernel_policy else 1,
                        generation_args, label="warmup")
         if args.warmup > 0:
             print()
 
+        if kernel_policy:
+            kernel_policy.freeze()
         result = _run_batch(model, input_tokens, args.output_tokens, args.batch,
                             generation_args)
         _print_result(result)
         return result
     finally:
+        if getattr(model, "kernel_policy", None):
+            model.kernel_policy.save()
         model.release_memory()
 
 
