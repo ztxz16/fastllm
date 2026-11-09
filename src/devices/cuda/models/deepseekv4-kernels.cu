@@ -1,3 +1,4 @@
+#include "devices/cuda/fastllm-kernel-benchmark.cuh"
 #include "exl3.h"
 #include "devices/cuda/glm5-next-cuda.cuh"
 #include "fastllm-cuda.cuh"
@@ -10226,6 +10227,14 @@ extern "C" bool FastllmCudaDeepSeekV4SparseAttentionDecodeCachedBatch(
     return ok;
 }
 
+namespace {
+const fastllm::kernels::Family groupedProjectionFamily{2,"linear.grouped.fp8.bf16",__DATE__ " " __TIME__,{
+    {"cuda.grouped_projection.native",json11::Json::object{{"backend","cuda"},{"description","Grouped FP8 projection"},{"graph",true}}},
+    {"cuda.projection.triton",json11::Json::object{{"backend","triton"},{"sm",json11::Json::array{120,121}},{"rows",json11::Json::array{2,16}},{"groups","dynamic"},{"graph",true}}}
+}};
+const bool groupedProjectionRegistered=[] {fastllm::kernels::Register(&groupedProjectionFamily);return true;}();
+}
+
 extern "C" bool FastllmCudaDeepSeekV41CompactWoA(const fastllm::Data &input,
         const fastllm::Data &weight, int groups, int rank, fastllm::Data &output) {
     using namespace fastllm;
@@ -10251,6 +10260,23 @@ extern "C" bool FastllmCudaDeepSeekV41CompactWoA(const fastllm::Data &input,
     if (weight.extraCudaData.empty() || !weight.extraCudaData[0]) return false;
     const float *scales = static_cast<const float *>(weight.extraCudaData[0]);
     if (!DeepSeekV4PrepareCudaOutput(output, BFLOAT16, {input.dims[0], input.dims[1], groups * rank})) return false;
+    if(fastllm::kernels::Enabled()) {
+        struct Context {const Data &input,&weight;int groups,rank,rows;Data &output;
+            static bool Run(void *p,int impl) {
+                auto &c=*static_cast<Context *>(p);
+                if(impl==1)return TryCudaTritonSmallProjectionCandidate(c.input,const_cast<Data &>(c.weight),c.output,c.groups,true);
+                return FastllmCudaDeepSeekV41CompactWoA(c.input,c.weight,c.groups,c.rank,c.output);
+            }
+            static std::string Unsupported(void *p,int impl) {
+                auto &c=*static_cast<Context *>(p);
+                return impl?fastllm::kernels::TritonSupport(c.rows,16,"FASTLLM_CUDA_TRITON_SMALL_PROJECTION"):"";
+            }
+        } context{input,weight,groups,rank,tokens,output};
+        fastllm::kernels::Signature signature{{2,FastllmCudaGetDevice(),FastllmCudaRuntimeArch(),tokens,rank,hidden,groups,32,32,0,0,0}};
+        fastllm::kernels::CudaCase benchmark{&context,Context::Run,Context::Unsupported,output.cudaData,size_t(tokens)*groups*rank,true};
+        const int selected=fastllm::kernels::SelectCuda(groupedProjectionFamily,signature,benchmark);
+        if(selected>=0){fastllm::kernels::Bypass bypass;return fastllm::kernels::LaunchCuda(groupedProjectionFamily,benchmark,selected);}
+    }
     if (tokens == 1) {
         fastllm::cuda::v41_compact::Decode<<<dim3((rank + 7) / 8, groups, tokens), 256, 0, cudaStreamPerThread>>>(
             static_cast<const __nv_bfloat16 *>(input.cudaData), static_cast<const uint8_t *>(weight.cudaData),

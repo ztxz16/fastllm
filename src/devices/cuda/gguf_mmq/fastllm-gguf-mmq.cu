@@ -424,35 +424,30 @@ static void launch_mmq(
 }
 
 template <typename InputType, typename OutputType>
-static bool matmul(
-        const InputType *input, const void *weight, OutputType *output,
-        ggml_type type,
-        int rows, int cols, int output_cols, cudaStream_t stream) {
-    if (!is_supported_type(type) || rows <= 0 || cols <= 0 ||
-        cols % ggml_blck_size(type) != 0 || output_cols <= 0) {
-        return false;
-    }
-    // Only these tile loaders guard a partial K tile. The quantized activation
-    // allocation must include its zero padding as well as the row-tile guard.
-    if (cols % MMQ_ITER_K != 0 &&
-        type != GGML_TYPE_Q2_0 && type != GGML_TYPE_IQ4_NL) return false;
-    const int padded_cols = ((cols + MMQ_ITER_K - 1) / MMQ_ITER_K) * MMQ_ITER_K;
-
+static bool matmul_shared(
+        const InputType *input, const void *const *weights, OutputType *const *outputs,
+        const ggml_type *types, const int *widths, int jobs,
+        int rows, int cols, cudaStream_t stream) {
+    if (jobs <= 0 || rows <= 0 || cols <= 0) return false;
     const int device = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[device].cc;
-    // Small BF16 Q5_K projections use the architecture's INT8 MMA backend.
-    // Keep narrow/grouped projections and other formats on the existing
-    // policy; the 4-row gate/up shape has no measured benefit.
-    const bool smallQ5 = std::is_same_v<InputType, __nv_bfloat16> &&
-        std::is_same_v<OutputType, __nv_bfloat16> && int8_mma_available(cc) &&
-        type == GGML_TYPE_Q5_K && rows >= 4 && rows <= 8 && cols >= 1280 &&
-        output_cols >= (rows == 4 ? 5120 : 4096);
-    const int min_rows = smallQ5 ? 4 : (cc >= 1200 ?
-        kBlackwellMinMmqRows : kDefaultMinMmqRows);
-    if (rows < min_rows || !int8_mma_available(cc)) {
-        return false;
+    if (!int8_mma_available(cc)) return false;
+    const int padded_cols = ((cols + MMQ_ITER_K - 1) / MMQ_ITER_K) * MMQ_ITER_K;
+    int output_cols = 0;
+    std::vector<bool> smallQ5(jobs);
+    for (int j = 0; j < jobs; ++j) {
+        const auto type = types[j];
+        if (!input || !weights[j] || !outputs[j] || !is_supported_type(type) ||
+            cols % ggml_blck_size(type) || widths[j] <= 0 ||
+            (cols % MMQ_ITER_K && type != GGML_TYPE_Q2_0 && type != GGML_TYPE_IQ4_NL)) return false;
+        smallQ5[j] = std::is_same_v<InputType, __nv_bfloat16> &&
+            std::is_same_v<OutputType, __nv_bfloat16> && type == GGML_TYPE_Q5_K &&
+            rows >= 4 && rows <= 8 && cols >= 1280 && widths[j] >= (rows == 4 ? 5120 : 4096);
+        const int minimum = smallQ5[j] ? 4 :
+            (cc >= 1200 ? kBlackwellMinMmqRows : kDefaultMinMmqRows);
+        if (rows < minimum) return false;
+        output_cols = std::max(output_cols, widths[j]);
     }
-
     // Bound activation and FP32 output scratch independently of the prefill
     // length. Reuse it on the caller's stream, like the dense Marlin row loop,
     // instead of sending long inputs to the dequantized GEMM fallback.
@@ -492,33 +487,45 @@ static bool matmul(
     }
 
     mmq_args args{};
-    args.x = static_cast<const char *>(weight);
     args.y = reinterpret_cast<const char *>(quantized);
     args.dst = float_output;
     args.ne00 = padded_cols;
-    args.ne01 = output_cols;
-    args.stride01 = ggml_row_size(type, cols);
     args.ne10 = padded_cols;
-    args.ne0 = output_cols;
-
     ggml_backend_cuda_context context;
-    for (int offset = 0; offset < rows;) {
+    auto sameQuantizer = [&](int a, int b) {
+        return mmq_get_q8_1_ds_layout(types[a]) == mmq_get_q8_1_ds_layout(types[b]) &&
+            smallQ5[a] == smallQ5[b];
+    };
+    for (int offset = 0; offset < rows; offset += chunk_rows) {
         const int count = std::min(chunk_rows, rows - offset);
-        launch_quantize(type, input + static_cast<size_t>(offset) * cols,
-                        quantized, count, cols, padded_cols, stream, smallQ5);
-        // Small final chunks are valid MMQ inputs too: min_rows is only the
-        // admission policy for the complete operation, not a kernel limit.
-        args.ne11 = count;
-        args.stride11 = count;
-        launch_mmq(type, context, args,
-                   output + static_cast<size_t>(offset) * output_cols, stream);
-        offset += count;
+        args.ne11 = count; args.stride11 = count;
+        for (int first = 0; first < jobs; ++first) {
+            bool already = false;
+            for (int j = 0; j < first; ++j) already |= sameQuantizer(first, j);
+            if (already) continue;
+            launch_quantize(types[first], input + size_t(offset) * cols,
+                quantized, count, cols, padded_cols, stream, smallQ5[first]);
+            for (int j = first; j < jobs; ++j) if (sameQuantizer(first, j)) {
+                args.x = static_cast<const char *>(weights[j]);
+                args.ne01 = args.ne0 = widths[j];
+                args.stride01 = ggml_row_size(types[j], cols);
+                launch_mmq(types[j], context, args,
+                    outputs[j] + size_t(offset) * widths[j], stream);
+            }
+        }
     }
 
     FastllmCudaFree(float_output);
     FastllmCudaFree(quantized);
     return true;
 }
+
+template <typename InputType, typename OutputType>
+static bool matmul(const InputType *input, const void *weight, OutputType *output,
+        ggml_type type, int rows, int cols, int output_cols, cudaStream_t stream) {
+    return matmul_shared(input, &weight, &output, &type, &output_cols, 1, rows, cols, stream);
+}
+
 
 
 } // namespace fastllm_gguf_mmq
@@ -613,4 +620,30 @@ bool FastllmCudaHalfGgufGateUpSiluMulMMVQ(
         static_cast<const half *>(input), gate_weight, up_weight,
         static_cast<half *>(output), static_cast<ggml_type>(weight_type),
         n, m, k, reinterpret_cast<cudaStream_t>(stream));
+}
+
+// Share activation quantization between compatible MMQ layouts. Mixed GGUF
+// formats remain separate projection jobs and share only identical quantizers.
+bool FastllmCudaGGUFMMQShared(const fastllm::Data &input,
+        fastllm::Data *const *weights, fastllm::Data *const *outputs, int count) {
+    if (count < 2 || !weights || !outputs) return false;
+    std::vector<const void *> w(count);
+    std::vector<ggml_type> types(count);
+    std::vector<int> widths(count);
+    for (int i = 0; i < count; ++i) {
+        if (weights[i]->forceGGUFFp32Dequant) return false;
+        w[i] = weights[i]->cudaData; types[i] = static_cast<ggml_type>(weights[i]->ggmlType);
+        widths[i] = weights[i]->dims[0];
+    }
+    const int cols = input.dims.back(), rows = input.Count(0) / cols;
+    auto launch = [&](auto *x) {
+        using T = std::remove_pointer_t<decltype(x)>;
+        std::vector<T *> y(count);
+        for (int i = 0; i < count; ++i) y[i] = static_cast<T *>(outputs[i]->cudaData);
+        return fastllm_gguf_mmq::matmul_shared(x, w.data(), y.data(), types.data(), widths.data(),
+            count, rows, cols, cudaStreamPerThread);
+    };
+    if (input.dataType == fastllm::BFLOAT16) return launch(static_cast<__nv_bfloat16 *>(input.cudaData));
+    if (input.dataType == fastllm::FLOAT16) return launch(static_cast<half *>(input.cudaData));
+    return false;
 }

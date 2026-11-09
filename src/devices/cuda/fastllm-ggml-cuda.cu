@@ -94,7 +94,8 @@ bool FastllmCudaGGUFGroupedGemv(const fastllm::Data &input, fastllm::Data &weigh
         int groups, int rows, fastllm::Data &output) {
     using namespace fastllm;
     if (input.dims.size() != 4 || input.dims[0] <= 0 || input.dims[1] <= 0 ||
-        int64_t(input.dims[0])*input.dims[1] > MMVQ_MAX_BATCH_SIZE ||
+        int64_t(input.dims[0])*input.dims[1] > 2 * MMVQ_MAX_BATCH_SIZE ||
+        int64_t(input.dims[0])*input.dims[1]*groups > 65535 ||
         groups <= 0 || rows <= 0 || input.dims[2] % groups ||
         weight.dataType != DATA_GGUF_FORMAT || weight.ggmlType != GGML_TYPE_Q5_K ||
         !input.cudaData || !weight.cudaData ||
@@ -582,15 +583,17 @@ static bool GgufSharedProjectionCanRun(const fastllm::Data &input,
         weight.dataDevice != DataDevice::CUDA || !weight.cudaData || weight.multiDeviceData ||
         (!weight.dataDeviceIds.empty() && (weight.dataDeviceIds.size() != 1 ||
             weight.dataDeviceIds[0] != FastllmCudaGetDevice()))) return false;
-    const int columns = input.dims.back(), rows = input.Count(0)/columns, outputs = weight.dims[0];
-    if (columns % 256 || rows < 1 || rows > 8 || outputs < 1 || weight.dims[1] != columns ||
+    const int columns = input.dims.back(), outputs = weight.dims[0];
+    if (input.Count(0) / columns > INT_MAX) return false;
+    const int rows = input.Count(0) / columns;
+    if (columns % 256 || rows < 1 || (!sharedLinear && rows > MMVQ_MAX_BATCH_SIZE) || outputs < 1 || weight.dims[1] != columns ||
         output.dims.back() != outputs || output.Count(0) != size_t(rows)*outputs ||
         GgufOverlap(input, output) || GgufOverlap(weight, output)) return false;
     const auto type = static_cast<ggml_type>(weight.ggmlType);
     if (bfloat16) {
         // Match the ordinary BF16 MMVQ dispatch, including its reduction
         // order. Extended IQ kernels and large-batch MMQ keep their fallback.
-        if (!get_has_vec_dot_q_cuda(type)) return false;
+        if (rows <= MMVQ_MAX_BATCH_SIZE && !get_has_vec_dot_q_cuda(type)) return false;
     } else {
         switch (type) {
             case GGML_TYPE_IQ3_S: case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ4_XS:
@@ -607,7 +610,7 @@ static bool GgufSharedProjectionCanRun(const fastllm::Data &input,
     const auto *tensor = static_cast<const ggml_tensor *>(weight.ggmlTensor);
     if (!tensor || tensor->type != type || tensor->ne[0] != columns || tensor->ne[1] != outputs ||
         tensor->nb[0] != ggml_type_size(type) || tensor->nb[1] != ggml_row_size(type, columns)) return false;
-    if (rows == 8 && !weight.forceGGUFFp32Dequant) {
+    if (rows == MMVQ_MAX_BATCH_SIZE && !weight.forceGGUFFp32Dequant) {
         int major = 0;
         if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, FastllmCudaGetDevice()) != cudaSuccess ||
             major >= 10) return false;
@@ -1086,6 +1089,8 @@ bool FastllmCudaGGUFLinearShared(const fastllm::Data &input,
         }
     }
     const int columns = input.dims.back(), rows = input.Count(0)/columns;
+    if (rows > MMVQ_MAX_BATCH_SIZE)
+        return FastllmCudaGGUFMMQShared(input, weights, outputs, count);
 #if !defined(USE_ROCM)
     bool planar = input.dataType == fastllm::FLOAT16;
     for (int i = 0; i < count; ++i)

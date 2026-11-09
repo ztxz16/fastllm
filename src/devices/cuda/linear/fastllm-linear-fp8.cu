@@ -1,4 +1,6 @@
+#include "devices/cuda/fastllm-kernel-benchmark.cuh"
 #include <climits>
+#include "devices/cuda/fastllm-fp8-block-batch.cuh"
 #include <stdexcept>
 #include "devices/cuda/fastllm-fp8-small-t.cuh"
 #include "devices/cuda/fastllm-fp8-sm70.cuh"
@@ -2526,6 +2528,63 @@ static void LaunchFastllmGemmBF16FP8E4M3SmallBatch(
                     m, k, blockM, blockK);
 }
 
+// Block-scaled FP8 reuses each decoded weight fragment across an MMA token
+// tile. Keep SIMT for underfilled tiles and shapes with little output parallelism.
+static bool TryFastllmBlockFP8Batch(__nv_bfloat16 *input, uint8_t *weight,
+        __nv_bfloat16 *output, __nv_bfloat16 *bias, float *scales,
+        int rows, int inner, int columns, int blockM, int blockK) {
+#ifdef CUDA_NO_TENSOR_CORE
+    return false;
+#else
+    if (rows <= 4 || rows >= 32 || inner <= 0 || inner % 64 || columns <= 0 ||
+        blockM < 16 || blockM % 16 || blockK <= 0 ||
+        reinterpret_cast<uintptr_t>(weight) % 16 ||
+        reinterpret_cast<uintptr_t>(input) % 4) return false;
+    struct Capability { int multiprocessors; bool supported; bool smallTile; };
+    static thread_local std::map<int, Capability> capabilities;
+    const int device = FastllmCudaGetDevice();
+    auto found = capabilities.find(device);
+    if (found == capabilities.end()) {
+        if (FastllmCudaGraphIsCapturingFast()) return false;
+        cudaDeviceProp properties{};
+        cudaFuncAttributes attributes{};
+        const bool supported = cudaGetDeviceProperties(&properties, device) == cudaSuccess &&
+            properties.major >= 8 && cudaFuncGetAttributes(&attributes,
+                fastllm::fp8block::BlockFp8MmaBatch<16,16>) == cudaSuccess &&
+            attributes.ptxVersion >= 80 && attributes.maxThreadsPerBlock >= 512;
+        if (!supported) (void)cudaGetLastError();
+        found = capabilities.emplace(device, Capability{properties.multiProcessorCount, supported, properties.major == 12 && properties.minor == 0}).first;
+    }
+    if (!found->second.supported) return false;
+    const unsigned outputTiles = (columns + 15) / 16;
+    if (rows <= 8) {
+        // SM120 measurements favor an eight-token tile when it is more than
+        // half full and at least two CTAs per SM can share output work. Other
+        // architectures keep their existing small-batch dispatch.
+        if (!found->second.smallTile ||
+            outputTiles < unsigned(2 * found->second.multiprocessors)) return false;
+        const dim3 grid(outputTiles);
+#define FP8_SMALL_BATCH(W) fastllm::fp8block::BlockFp8MmaBatch<8,W><<<grid,W*32,0,cudaStreamPerThread>>>( \
+        input,weight,scales,bias,output,rows,inner,columns,blockM,blockK)
+        if (inner <= 2048 &&
+                outputTiles >= unsigned(4 * found->second.multiprocessors)) { FP8_SMALL_BATCH(4); }
+        else if (inner > 4096 &&
+                outputTiles < unsigned(4 * found->second.multiprocessors)) { FP8_SMALL_BATCH(16); }
+        else { FP8_SMALL_BATCH(8); }
+#undef FP8_SMALL_BATCH
+        return true;
+    }
+    const dim3 grid(outputTiles, (rows + 15) / 16);
+#define FP8_BLOCK_BATCH(W) fastllm::fp8block::BlockFp8MmaBatch<16,W><<<grid,W*32,0,cudaStreamPerThread>>>( \
+        input,weight,scales,bias,output,rows,inner,columns,blockM,blockK)
+    if (grid.x < unsigned(found->second.multiprocessors)) { FP8_BLOCK_BATCH(16); }
+    else if (inner <= 2048) { FP8_BLOCK_BATCH(4); }
+    else { FP8_BLOCK_BATCH(8); }
+#undef FP8_BLOCK_BATCH
+    return true;
+#endif
+}
+
 void LaunchFastllmGemmBF16FP8E4M3(__nv_bfloat16 *input, uint8_t *weight, __nv_bfloat16 *output, __nv_bfloat16 *bias, float *scales, int n, int m, int k, int blockM, int blockK) {
     if (TryFastllmRowFP8(input, weight, output, bias, scales, n, m, k, blockM, blockK)) {
         return;
@@ -2548,51 +2607,23 @@ void LaunchFastllmGemmBF16FP8E4M3(__nv_bfloat16 *input, uint8_t *weight, __nv_bf
         }
         return;
     }
-    if (n == 1) {
-        LaunchFastllmGemmBF16FP8E4M3SmallBatch<1>(input, weight, output, bias, scales, m, k, blockM, blockK);
-    } else if (n == 2) {
-        LaunchFastllmGemmBF16FP8E4M3SmallBatch<2>(input, weight, output, bias, scales, m, k, blockM, blockK);
-    } else if (n == 3) {
-        LaunchFastllmGemmBF16FP8E4M3SmallBatch<3>(input, weight, output, bias, scales, m, k, blockM, blockK);
-    } else if (n == 4) {
-        LaunchFastllmGemmBF16FP8E4M3SmallBatch<4>(input, weight, output, bias, scales, m, k, blockM, blockK);
-    } else if (n == 5) {
-        LaunchFastllmGemmBF16FP8E4M3SmallBatch<5>(input, weight, output, bias, scales, m, k, blockM, blockK);
-    } else if (n == 6) {
-        LaunchFastllmGemmBF16FP8E4M3SmallBatch<6>(input, weight, output, bias, scales, m, k, blockM, blockK);
-    } else if (n == 7) {
-        LaunchFastllmGemmBF16FP8E4M3SmallBatch<7>(input, weight, output, bias, scales, m, k, blockM, blockK);
-    } else if (n == 8) {
-        LaunchFastllmGemmBF16FP8E4M3SmallBatch<8>(input, weight, output, bias, scales, m, k, blockM, blockK);
-    } else if (n == 9) {
-        FastllmGemvBF16FP8E4M3Kernel1MultiRow<64, 9> <<< k, 64 >>>(input, weight, output, bias, scales, m, k, blockM, blockK);
-    } else if (n == 10) {
-        FastllmGemvBF16FP8E4M3Kernel1MultiRow<64, 10> <<< k, 64 >>>(input, weight, output, bias, scales, m, k, blockM, blockK);
-    } else if (n == 11) {
-        FastllmGemvBF16FP8E4M3Kernel1MultiRow<64, 11> <<< k, 64 >>>(input, weight, output, bias, scales, m, k, blockM, blockK);
-    } else if (n == 12) {
-        FastllmGemvBF16FP8E4M3Kernel1MultiRow<64, 12> <<< k, 64 >>>(input, weight, output, bias, scales, m, k, blockM, blockK);
-    } else if (n == 13) {
-        FastllmGemvBF16FP8E4M3Kernel1MultiRow<64, 13> <<< k, 64 >>>(input, weight, output, bias, scales, m, k, blockM, blockK);
-    } else if (n == 14) {
-        FastllmGemvBF16FP8E4M3Kernel1MultiRow<64, 14> <<< k, 64 >>>(input, weight, output, bias, scales, m, k, blockM, blockK);
-    } else if (n == 15) {
-        FastllmGemvBF16FP8E4M3Kernel1MultiRow<64, 15> <<< k, 64 >>>(input, weight, output, bias, scales, m, k, blockM, blockK);
-    } else {
-        int i = 0;
-        for (; i + 15 < n; i += 16) {
-            FastllmGemvBF16FP8E4M3Kernel1MultiRow<64, 16> <<< k, 64 >>>(input + i * m, weight, output + i * k, bias, scales, m, k, blockM, blockK);
+    if (TryFastllmBlockFP8Batch(input, weight, output, bias, scales,
+            n, m, k, blockM, blockK)) return;
+    // Bound register accumulators per CTA, not the logical batch. Reuse the
+    // same tuned tile for every batch and dispatch its final partial tile.
+    // The caller retains GEMM selection for larger projection workloads.
+    constexpr int tileRows = 8;
+    for (int first = 0; first < n; first += tileRows) {
+        const int rows = std::min(tileRows, n - first);
+        auto *x = input + size_t(first) * m;
+        auto *y = output + size_t(first) * k;
+#define FP8_ROWS(R) case R: LaunchFastllmGemmBF16FP8E4M3SmallBatch<R>( \
+            x, weight, y, bias, scales, m, k, blockM, blockK); break
+        switch (rows) {
+            FP8_ROWS(1); FP8_ROWS(2); FP8_ROWS(3); FP8_ROWS(4);
+            FP8_ROWS(5); FP8_ROWS(6); FP8_ROWS(7); FP8_ROWS(8);
         }
-        for (; i + 7 < n; i += 8) {
-            FastllmGemvBF16FP8E4M3Kernel1MultiRow<64, 8> <<< k, 64 >>>(input + i * m, weight, output + i * k, bias, scales, m, k, blockM, blockK);
-        }
-        for (; i + 3 < n; i += 4) {
-            FastllmGemvBF16FP8E4M3Kernel1MultiRow<64, 4> <<< k, 64 >>>(input + i * m, weight, output + i * k, bias, scales, m, k, blockM, blockK);
-        }
-        for (; i < n; i++) {
-            FastllmGemvBF16FP8E4M3Kernel1MultiRow<64, 1> <<< k, 64 >>>(input + i * m, weight, output + i * k, bias, scales, m, k, blockM, blockK);
-        }
-        return;
+#undef FP8_ROWS
     }
 }
 
@@ -2787,6 +2818,15 @@ extern "C" bool FastllmCudaBFloat16FP8ReplicatedRowSlice(
     return true;
 }
 
+namespace {
+const fastllm::kernels::Family fp8ProjectionFamily{1,"linear.fp8.bf16",__DATE__ " " __TIME__,{
+    {"cuda.projection.native",json11::Json::object{{"backend","cuda"},{"description","Existing FP8 CUDA implementation"},{"format","FP8_E4M3 block32 -> BF16"},{"graph",true}}},
+    {"cuda.projection.triton",json11::Json::object{{"backend","triton"},{"sm",json11::Json::array{120,121}},{"rows",json11::Json::array{2,16}},
+        {"description","Small FP8 projection"},{"parameters",json11::Json::object{{"warps",4},{"stages",3},{"block_n","32 or 64 by specialization"}}},{"graph",true}}}
+}};
+const bool fp8ProjectionRegistered=[] {fastllm::kernels::Register(&fp8ProjectionFamily);return true;}();
+}
+
 bool FastllmCudaBFloat16MatMulFP8E4M3(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
     FastllmCudaFP8E4M3EnsureScalesAndBiasOnDevice(weight, bias, k);
     FastllmCudaFP8E4M3EnsureBFloat16BiasOnDevice(weight, bias, k);
@@ -2795,6 +2835,33 @@ bool FastllmCudaBFloat16MatMulFP8E4M3(const fastllm::Data &input, fastllm::Data 
     __nv_bfloat16 *cudaBF16Bias = bias.dims.size() == 0 ? nullptr : (__nv_bfloat16 *) weight.extraCudaHalfData[0];
     __nv_bfloat16 *cudaInput = (__nv_bfloat16*)FastllmCudaPrepareInput(input);
     __nv_bfloat16 *cudaOutput = (__nv_bfloat16*)FastllmCudaPrepareOutput(output);
+
+    if (fastllm::kernels::Enabled() && bias.dims.empty() && weight.blockM == 32 && weight.blockK == 32 &&
+            input.cudaData == cudaInput && output.cudaData == cudaOutput && !weight.IsRepacked) {
+        struct Context { const fastllm::Data &input; fastllm::Data &weight; const fastllm::Data &bias;
+            fastllm::Data &output; int rows,inner,columns;
+            static bool Run(void *p,int impl) {
+                auto &c=*static_cast<Context *>(p);
+                if(impl==1)return fastllm::TryCudaTritonSmallProjectionCandidate(c.input,c.weight,c.output,1,true);
+                return FastllmCudaBFloat16MatMulFP8E4M3(c.input,c.weight,c.bias,c.output,c.rows,c.inner,c.columns);
+            }
+            static std::string Unsupported(void *p,int impl) {
+                auto &c=*static_cast<Context *>(p);
+                if(!impl)return "";
+                if(c.inner%32||c.columns%32)return "requires complete 32-element blocks";
+                return fastllm::kernels::TritonSupport(c.rows,16,"FASTLLM_CUDA_TRITON_SMALL_PROJECTION");
+            }
+        } context{input,weight,bias,output,n,m,k};
+        fastllm::kernels::Signature signature{{1,FastllmCudaGetDevice(),FastllmCudaRuntimeArch(),n,k,m,1,32,32,0,0,0}};
+        fastllm::kernels::CudaCase benchmark{&context,Context::Run,Context::Unsupported,cudaOutput,size_t(n)*k,true};
+        const int selected=fastllm::kernels::SelectCuda(fp8ProjectionFamily,signature,benchmark);
+        if(selected>=0) {
+            fastllm::kernels::Bypass bypass;
+            const bool ok=fastllm::kernels::LaunchCuda(fp8ProjectionFamily,benchmark,selected);
+            FastllmCudaFinishInput(input,cudaInput);FastllmCudaFinishOutput(output,cudaOutput);
+            return ok;
+        }
+    }
 
     // Measured crossover: retain GEMV for one row and cuBLAS for large M.
     if (n > 1 && n <= 64 && bias.dims.empty() && FastllmCudaTryMarlinBFloat16MatMulFP8E4M3(

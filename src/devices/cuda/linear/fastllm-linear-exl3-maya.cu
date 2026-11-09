@@ -208,6 +208,26 @@ bool FastllmCudaExl3MayaCache(const fastllm::Data &input, const uint8_t *records
     return cudaGetLastError()==cudaSuccess;
 }
 
+// Keep the backend register tile separate from the logical projection batch.
+// Prefill beyond a few tiles retains the existing decode-plus-GEMM crossover.
+static constexpr int kLinearMvTiles = 2;
+static bool Exl3LinearTiles(const maya::MvJob *source, int count, int rows, cudaStream_t stream) {
+    for (int first = 0; first < rows; first += maya::kMaxMvCols) {
+        std::array<maya::MvJob, maya::kMaxMvJobs> jobs;
+        for (int i = 0; i < count; ++i) {
+            jobs[i] = source[i];
+            auto &j = jobs[i];
+            j.ncol = std::min(maya::kMaxMvCols, rows - first);
+            if (j.xf) j.xf += size_t(first) * j.xf_cs;
+            if (j.x16) j.x16 += size_t(first) * j.xf_cs;
+            if (j.y) j.y += size_t(first) * j.y_cs;
+            if (j.y16) j.y16 += size_t(first) * j.y_cs;
+        }
+        if (!maya::mv(jobs.data(), count, stream)) return false;
+    }
+    return true;
+}
+
 bool FastllmCudaExl3MayaLinear(const fastllm::Data &input, fastllm::Data &weight,
                               const fastllm::Data &bias, fastllm::Data &output) {
     using namespace fastllm;
@@ -217,7 +237,7 @@ bool FastllmCudaExl3MayaLinear(const fastllm::Data &input, fastllm::Data &weight
         (output.dataType!=FLOAT32 && output.dataType!=FLOAT16 && output.dataType!=BFLOAT16)) return false;
     int k = weight.dims[1], total = weight.dims[0], rows = input.Count(0)/k;
     // Large prefill retains Fastllm's bounded decode + cuBLAS path.
-    if (rows<1 || rows>maya::kMaxMvCols) return false;
+    if (rows<1 || rows>kLinearMvTiles*maya::kMaxMvCols) return false;
     AssertInFastLLM(input.dims.back()==k && output.dims.back()==total,"EXL3 Maya: linear shape mismatch.");
     Exl3StorageBytes(weight);
     std::array<maya::Mat,maya::kMaxMvJobs> mats;
@@ -233,7 +253,7 @@ bool FastllmCudaExl3MayaLinear(const fastllm::Data &input, fastllm::Data &weight
         j.bias=bias.dims.empty()?nullptr:static_cast<const float *>(bias.cudaData)+p*mats[p].n;
         j.ncol=rows; j.xf_cs=k; j.y_cs=total;
     }
-    AssertInFastLLM(maya::mv(jobs.data(),weight.blockM,stream),"EXL3 Maya: matrix launch rejected.");
+    AssertInFastLLM(Exl3LinearTiles(jobs.data(),weight.blockM,rows,stream),"EXL3 Maya: matrix launch rejected.");
     AssertInFastLLM(cudaGetLastError()==cudaSuccess,"EXL3 Maya: linear CUDA failure.");
     return true;
 }
@@ -245,7 +265,7 @@ bool FastllmCudaExl3MayaLinearShared(const fastllm::Data &input,
         input.dims.empty() || input.dims.back() <= 0 || !input.cudaData ||
         (input.dataType != FLOAT32 && input.dataType != FLOAT16 && input.dataType != BFLOAT16)) return false;
     const int k = input.dims.back(), rows = input.Count(0) / k;
-    if (rows < 1 || rows > maya::kMaxMvCols) return false;
+    if (rows < 1 || rows > kLinearMvTiles * maya::kMaxMvCols) return false;
     std::array<maya::Mat, maya::kMaxMvJobs> mats;
     std::array<maya::MvJob, maya::kMaxMvJobs> jobs;
     int used = 0;
@@ -271,7 +291,7 @@ bool FastllmCudaExl3MayaLinearShared(const fastllm::Data &input,
             j.ncol = rows; j.xf_cs = k; j.y_cs = w.dims[0];
         }
     }
-    AssertInFastLLM(maya::mv(jobs.data(), used, cudaStreamPerThread), "EXL3 shared projection launch rejected.");
+    AssertInFastLLM(Exl3LinearTiles(jobs.data(), used, rows, cudaStreamPerThread), "EXL3 shared projection launch rejected.");
     AssertInFastLLM(cudaGetLastError() == cudaSuccess, "EXL3 shared projection CUDA failure.");
     return true;
 }
@@ -368,7 +388,7 @@ bool FastllmCudaExl3MayaGrouped(const fastllm::Data &input, const fastllm::Data 
     if (!Enabled() || weight.dims.size() != 3) return false;
     const int groups = weight.dims[0], n = weight.dims[1], k = weight.dims[2];
     const int rows = input.Count(0) / (groups * k);
-    if (groups < 1 || groups > maya::kMaxMvJobs || rows < 1 || rows > maya::kMaxMvCols) return false;
+    if (groups < 1 || groups > maya::kMaxMvJobs || rows < 1 || rows > kLinearMvTiles * maya::kMaxMvCols) return false;
     std::array<maya::Mat,maya::kMaxMvJobs> mats;
     std::array<maya::MvJob,maya::kMaxMvJobs> jobs;
     for (int g = 0; g < groups; ++g) {
@@ -384,6 +404,6 @@ bool FastllmCudaExl3MayaGrouped(const fastllm::Data &input, const fastllm::Data 
         else { j.y16 = static_cast<uint16_t *>(output.cudaData) + size_t(g) * n; j.y_bf16 = output.dataType == BFLOAT16; }
         j.ncol = rows; j.xf_cs = groups * k; j.y_cs = groups * n;
     }
-    AssertInFastLLM(maya::mv(jobs.data(),groups,cudaStreamPerThread),"EXL3 Maya: grouped launch rejected");
+    AssertInFastLLM(Exl3LinearTiles(jobs.data(),groups,rows,cudaStreamPerThread),"EXL3 Maya: grouped launch rejected");
     return cudaGetLastError() == cudaSuccess;
 }

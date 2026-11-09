@@ -1,3 +1,4 @@
+#include "utils/kernel_registry.h"
 #include "utils/qwen38_hybrid.h"
 #include "models/deepseekv41-indexer.cuh"
 #include "devices/cuda/fastllm-prefill-workspace.h"
@@ -1282,7 +1283,12 @@ namespace fastllm {
     }
 
     bool TryCudaTritonSmallProjection(const Data &input, Data &weight, Data &output, int groups) {
-        if (!CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON")) return false;
+        return TryCudaTritonSmallProjectionCandidate(input, weight, output, groups, false);
+    }
+
+    bool TryCudaTritonSmallProjectionCandidate(const Data &input, Data &weight, Data &output, int groups, bool tuningCandidate) {
+        if (!tuningCandidate && kernels::bypassDepth) return false;
+        if (!tuningCandidate && !CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON")) return false;
         const char *flag = std::getenv("FASTLLM_CUDA_TRITON_SMALL_PROJECTION");
         if (flag && flag[0] && !CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON_SMALL_PROJECTION")) return false;
         const int arch = CudaTritonRuntimeArch(), device = FastllmCudaGetDevice();

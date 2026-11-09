@@ -4,11 +4,12 @@ namespace fastllm {
 class Data;
 }
 
-// Resident, bias-free FP16/BF16 projections of the same input (1..8 rows).
+// Resident, bias-free FP16/BF16 projections of the same input.
 // Any number of projections >= 2 may share the call-local Q8 workspace.
 // Compatible same-format Q5/Q6/Q8/IQ4_NL jobs also share one MMVQ launch
 // (up to 8 jobs per launch); specialized IQ/planar kernels keep their dispatch.
-// Unsupported types/layouts and MMQ batches return false before any writes.
+// Larger batches share the MMQ quantizer by activation layout and reuse its
+// bounded workspace. Unsupported types/layouts return false before any writes.
 bool FastllmCudaGGUFLinearShared(const fastllm::Data &input, fastllm::Data *const *weights,
                                  fastllm::Data *const *outputs, int count);
 bool FastllmCudaGGUFMixedGateUp(const fastllm::Data &input, fastllm::Data &gate, fastllm::Data &up,
@@ -27,3 +28,7 @@ bool FastllmCudaGGUFExtendedFromQ8(const void *input, const void *weight, void *
 // Small-batch grouped Q5_K WoA, with the ordinary four-warp GEMV reduction order.
 bool FastllmCudaGGUFGroupedGemv(const fastllm::Data &input, fastllm::Data &weight,
                               int groups, int rows, fastllm::Data &output);
+
+// Internal MMQ bridge; caller validates tensor layout, aliases and device ownership.
+bool FastllmCudaGGUFMMQShared(const fastllm::Data &input, fastllm::Data *const *weights,
+                              fastllm::Data *const *outputs, int count);

@@ -6,6 +6,7 @@
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/cuda/fastllm-cuda-linear-shared.h"
 #include <memory>
+#include <array>
 
 static float Read(const Data &d, size_t at) {
     if (d.dataType == FLOAT32) return reinterpret_cast<const float *>(d.cpuData)[at];
@@ -64,7 +65,7 @@ static void Case(int rows, DataType type, int k, const std::vector<int> &widths,
     auto separate = [&] { for (int i = 0; i < count; ++i) Require(FastllmCudaExl3Linear(i < 2 ? input : input32,*weights[i],Data(),*ref[i]),"ordinary EXL3 linear"); };
     auto grouped = [&] {
         bool accepted = FastllmCudaLinearShared(input,weights.data(),outputs.data(),count);
-        Require(accepted != portable,"shared dispatch capability");
+        Require(accepted == (!portable && rows <= 32),"shared dispatch capability");
         if (!accepted) for (int i = 0; i < count; ++i)
             Require(FastllmCudaExl3Linear(input,*weights[i],Data(),*outputs[i]),"portable fallback");
     };
@@ -99,20 +100,47 @@ static void Case(int rows, DataType type, int k, const std::vector<int> &widths,
     for (int i = 0; i < count; ++i) { Data v; CopyBack(*outputs[i],v); Require(!std::memcmp(v.cpuData,before[i].data(),v.GetBytes()),"rejection wrote outputs"); }
     cudaGraphExecDestroy(exec);cudaGraphDestroy(graph);
 }
-int main() {
+static void GroupedCase(int rows, DataType type) {
+    const int groups=3,k=128,n=128;
+    std::mt19937 rng(813+rows+int(type));
+    Data hw;FillWeight(hw,k,groups*n,10,groups,rng);hw.Resize({groups,n,k});
+    Data w;w.CopyFrom(hw);w.ToDevice(CUDA,std::vector<int>{0});
+    Data host(type,{rows,groups,k}),input,output(type,{rows,groups,n});host.Allocate(false);
+    for(size_t i=0;i<host.Count(0);++i)Write(host,i,(int(rng()%127)-63)/32.f);
+    input.CopyFrom(host);input.ToDevice(CUDA,std::vector<int>{0});
+    output.ToDevice(CUDA,std::vector<int>{0},false);output.Allocate(false);
+    auto run=[&]{Require(FastllmCudaExl3Grouped(input,w,output),"strided grouped projection");};
+    run();Require(cudaDeviceSynchronize()==cudaSuccess,"grouped warmup");
+    cudaGraph_t graph;cudaGraphExec_t exec;
+    Require(cudaStreamBeginCapture(cudaStreamPerThread,cudaStreamCaptureModeThreadLocal)==cudaSuccess,"grouped begin");run();
+    Require(cudaStreamEndCapture(cudaStreamPerThread,&graph)==cudaSuccess,"grouped end");
+    Require(cudaGraphInstantiate(&exec,graph,0)==cudaSuccess,"grouped instantiate");
+    for(int repeat=0;repeat<3;++repeat){
+        for(size_t i=0;i<host.Count(0);++i)Write(host,i,(int(rng()%127)-63)/32.f);
+        Require(cudaMemcpy(input.cudaData,host.cpuData,host.GetBytes(),cudaMemcpyHostToDevice)==cudaSuccess,"grouped changed input");
+        Require(cudaGraphLaunch(exec,cudaStreamPerThread)==cudaSuccess,"grouped replay");
+        Data actual,reference(type,output.dims);Exl3GroupedCPU(host,hw,reference);CopyBack(output,actual);
+        const double error=Error(reference,actual);maxCpu=std::max(maxCpu,error);
+        Require(std::isfinite(error)&&error<.008,"grouped CPU oracle");
+    }
+    cudaGraphExecDestroy(exec);cudaGraphDestroy(graph);
+}
+int main(int argc,char **argv) {
     // Test expectation for a library built without the imported CUDA kernels.
     bool portable=argc>1 && std::string(argv[1])=="--portable";
     SetThreads(32); int cases=0;
-    for (auto t : {FLOAT32,FLOAT16,BFLOAT16}) for (int n : {1,3,5,6,8}) {
+    for (auto t : {FLOAT32,FLOAT16,BFLOAT16}) for (int n : {1,3,5,6,8,9,12,15,16,17,24,31,32,33,63,64}) {
+        if (portable && n > 8) continue;
         Case(n,t,256,{256,128,256,128},{10,10,10,10},false,portable); ++cases;
         if (!portable) { Case(n,t,256,{256,128,256},{8,10,12},true,false); ++cases; }
     }
     if (!portable) {
         for (int b : {2,3,4,5,6,7,8,10,12,14,16}) { Case(3,BFLOAT16,256,{128,256},{b,b},false,false);++cases; }
-        for (int n : {1,5,6}) for (int jobs : {2,4}) {
+        for (int n : {1,5,6,9,12,17,24,32,33,64}) for (int jobs : {2,4}) {
             std::vector<int> ns{1280,512};if(jobs==4){ns.push_back(512);ns.push_back(512);}
             Case(n,BFLOAT16,5120,ns,std::vector<int>(jobs,10),false,false);++cases;
         }
     }
+    if(!portable)for(int rows:{3,9,17,24,31,32,33,63})for(auto type:{FLOAT32,FLOAT16,BFLOAT16}){GroupedCase(rows,type);++cases;}
     printf("PASS shared projections: %d cases, max relative L2 separate=%.9f CPU=%.9f, portable=%d\n",cases,maxSeparate,maxCpu,int(portable));
 }

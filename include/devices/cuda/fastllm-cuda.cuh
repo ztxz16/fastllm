@@ -2847,6 +2847,7 @@ struct FastllmCudaDiskMxfp4Scope {
 
 namespace fastllm {
 bool TryCudaTritonSmallProjection(const Data &input, Data &weight, Data &output, int groups = 1);
+bool TryCudaTritonSmallProjectionCandidate(const Data &input, Data &weight, Data &output, int groups, bool tuningCandidate);
 }
 extern "C" bool FastllmCudaTritonSmallProjection(const char *cubin, const char *name, int shared,
     const fastllm::Data &input, const fastllm::Data &weight, fastllm::Data &output,
