@@ -67,14 +67,15 @@ __global__ void GatherAttentionKV(const FastllmV41FullDecodeRequest *requests,
     if (compressed && request.compressedKV) {
         const int k = logical - 128;
         const int visible = ratio ? (request.position + 1) / ratio : 0;
-        const int end = Verify ? requests[0].position + rows : request.position + 1;
+        const int length = request.chunkLength > 0 ? request.chunkLength : rows;
+        const int end = Verify ? requests[request.chunkBegin].position + length : request.position + 1;
         if (k < (ratio ? min(end / ratio, width) : 0)) {
             id = selected[size_t(token) * width + k];
             if (id < 0 || id >= visible) id = -1;
         }
     } else if (!compressed) {
         const int p = request.position - 127 + logical;
-        const int end = Verify ? requests[0].position : request.position;
+        const int end = Verify ? requests[request.chunkBegin].position : request.position;
         if (p >= 0 && p < end) id = p % 128;
     }
     if (!vector) indices[row] = id < 0 ? -1 : row;
@@ -157,8 +158,9 @@ __global__ void MergeCurrent(const bf16 *q, const bf16 *current, const bf16 *par
 // quantization is needed. Keep QK, softmax and the weighted sum in FP32.
 __global__ void MergeVerify(const bf16 *q, const bf16 *chunk, const bf16 *partial, const float *lse,
                             const float *sink, bf16 *output, float scale, int heads, int scratchHeads,
-                            int splits, int length) {
-    const int h = blockIdx.x, rowIndex = blockIdx.y, token = rowIndex % length, t = threadIdx.x;
+                            int splits, int length, const FastllmV41FullDecodeRequest *requests = nullptr) {
+    const int h = blockIdx.x, rowIndex = blockIdx.y, t = threadIdx.x;
+    const int token = requests ? rowIndex - requests[rowIndex].chunkBegin : rowIndex % length;
     const int lane = t & 31, warp = t / 32;
     chunk += size_t(rowIndex - token) * 512;
     q += (size_t(rowIndex) * heads + h) * 512;
@@ -344,7 +346,7 @@ cudaError_t FastllmV41FlashInferRun(void *handle, const FastllmV41FullDecodeBuff
             static_cast<const bf16 *>(b.q), reinterpret_cast<const uint8_t *>(p->decoded), p->decodedIndices,
             p->mid, p->midLse, nullptr, reinterpret_cast<const uint8_t *>(p->decoded), p->decodedIndices + 128,
             nullptr, p->width, 1, 1024, p->batch, p->heads, 128, p->splits, 1, p->scale, 1024,
-            128 + p->width, 128 + p->width, Dsv41Pages{1, false}, nullptr, nullptr, sizeof(void *), nullptr, 0);
+            128 + p->width, 128 + p->width, Dsv41Pages{1, false}, nullptr, nullptr, sizeof(void *), nullptr, 0, nullptr, nullptr);
     } else {
         auto kernel = p->verifying ? AttentionKernel<true>(p->heads, p->width != 0)
                                    : AttentionKernel<false>(p->heads, p->width != 0);
@@ -352,7 +354,8 @@ cudaError_t FastllmV41FlashInferRun(void *handle, const FastllmV41FullDecodeBuff
             static_cast<const bf16 *>(b.q), nullptr, nullptr, p->mid, p->midLse, nullptr, nullptr,
             p->width ? static_cast<const int32_t *>(b.topk) : nullptr, nullptr, p->width, 1, 288, p->batch,
             p->heads, 128, p->splits, 1, p->scale, 528, 128, p->width, Dsv41Pages{1, false}, &request->windowKV,
-            p->width ? &request->compressedKV : nullptr, sizeof(*request), &request->position, p->ratio);
+            p->width ? &request->compressedKV : nullptr, sizeof(*request), &request->position, p->ratio,
+            p->verifying ? &request->chunkBegin : nullptr, p->verifying ? &request->chunkLength : nullptr);
     }
     const cudaError_t status = cudaGetLastError();
     if (status != cudaSuccess)
@@ -362,7 +365,7 @@ cudaError_t FastllmV41FlashInferRun(void *handle, const FastllmV41FullDecodeBuff
         MergeVerify<<<dim3(p->heads, p->batch), 128, 0, stream>>>(
             static_cast<const bf16 *>(b.q), static_cast<const bf16 *>(b.kv), p->mid, p->midLse,
             static_cast<const float *>(b.sink), static_cast<bf16 *>(b.output), p->scale, p->heads,
-            p->scratchHeads, p->splits, p->batch);
+            p->scratchHeads, p->splits, p->batch, p->verifying ? request : nullptr);
     } else {
         MergeCurrent<<<dim3(p->heads, p->batch), 128, 0, stream>>>(
             static_cast<const bf16 *>(b.q), static_cast<const bf16 *>(b.kv), p->mid, p->midLse,
@@ -469,7 +472,7 @@ cudaError_t FastllmV41FlashInferChunkRun(const FastllmV41FlashInferChunkConfig &
             static_cast<const bf16 *>(b.q), reinterpret_cast<const uint8_t *>(decoded), ringIndices, mid, lse, nullptr,
             reinterpret_cast<const uint8_t *>(decoded), ringIndices + 128, nullptr,
             c.topK, 1, 1024, l.tokens, c.heads, 128, l.splits, 1, c.scale, 1024,
-            128 + c.topK, 128 + c.topK, Dsv41Pages{1, false}, nullptr, nullptr, sizeof(void *), nullptr, 0);
+            128 + c.topK, 128 + c.topK, Dsv41Pages{1, false}, nullptr, nullptr, sizeof(void *), nullptr, 0, nullptr, nullptr);
     } else {
         auto *cmpIndices = ringIndices + size_t(l.tokens) * 128;
         PrepareChunkIndices<<<l.tokens, 128, 0, stream>>>(c, static_cast<const int32_t *>(b.topk), ringIndices, cmpIndices);
@@ -480,7 +483,7 @@ cudaError_t FastllmV41FlashInferChunkRun(const FastllmV41FlashInferChunkConfig &
             static_cast<const bf16 *>(b.q), static_cast<const uint8_t *>(ring), ringIndices, mid, lse, nullptr,
             static_cast<const uint8_t *>(compressed), c.topK ? cmpIndices : nullptr, nullptr,
             c.topK, 1, 288, l.tokens, c.heads, 128, l.splits, 1, c.scale, 528, 128, c.topK, Dsv41Pages{1, false},
-            nullptr, nullptr, sizeof(void *), nullptr, 0);
+            nullptr, nullptr, sizeof(void *), nullptr, 0, nullptr, nullptr);
     }
     status = cudaGetLastError();
     if (status != cudaSuccess) return status;

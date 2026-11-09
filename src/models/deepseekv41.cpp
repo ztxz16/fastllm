@@ -954,7 +954,7 @@ namespace fastllm {
         bool V41SharedInputProjections(const Data &input, const std::vector<Data *> &weights,
                 const std::vector<Data *> &outputs, const std::vector<DataType> &types) {
             if (weights.size() < 2 || weights.size() != outputs.size() || outputs.size() != types.size() ||
-                input.dims.empty() || input.dims.back() <= 0 || input.Count(0) / input.dims.back() > 8)
+                input.dims.empty() || input.dims.back() <= 0)
                 return false;
             std::vector<int> devices;
             if (input.multiDeviceData) {
@@ -1177,7 +1177,8 @@ namespace fastllm {
             if (input.dataType != DataType::BFLOAT16 || input.dims.empty() || input.dims.back() <= 0 ||
                 input.dims.back() % 32 || !std::isfinite(eps) || eps < 0) return false;
             const uint64_t rows = input.Count(0) / input.dims.back();
-            if (rows < 1 || rows > 8 || (rows > 1 && !joinedWeight && !separateBatch)) return false;
+            if (rows < 1 || rows > uint64_t(std::numeric_limits<int>::max()) ||
+                (rows > 1 && !joinedWeight && !separateBatch)) return false;
             const bool gguf = qw.dataType == DATA_GGUF_FORMAT && kw.dataType == DATA_GGUF_FORMAT;
             const bool packed = !gguf && rows > 1 && joinedWeight != nullptr;
             if (gguf && input.dims.back() % 256) return false;
@@ -1270,7 +1271,8 @@ namespace fastllm {
                 weight.dataType != DataType::FLOAT32 || bias.dataType != DataType::FLOAT32 ||
                 input.dataType != DataType::BFLOAT16) return false;
             const int rows = input.Count(0) / input.dims.back();
-            if (rows < 5 || rows > 8) return false;
+            // Kernel capability and crossover checks belong to the CUDA dispatcher.
+            if (rows < 5) return false;
             if (!input.multiDeviceData)
                 return FastllmCudaV41RouterSelect(input, weight, bias, temperature, scale, logits, indices, scores);
             if (!input.IsTensorParallelReplicated()) return false;
@@ -2468,6 +2470,7 @@ namespace fastllm {
 
     DeepSeekV41Model::~DeepSeekV41Model() {
         ShutdownRuntime();
+        ReleaseRetiredStates();
         DsparkReportStats();
         // Request-owned draft children borrow their MoE cache owner. Retire
         // those graphs before releasing the caches, including both state keys.
@@ -4029,10 +4032,43 @@ namespace fastllm {
             return;
         }
         std::lock_guard<std::mutex> guard(v41StateMutex);
-        v41States.erase((const void*)&context->pastKeyValues);
-        if (!context->pastKeyValues.empty()) {
-            v41StatesByFirstKey.erase((const void*)&context->pastKeyValues[0].first);
+        auto state = v41States.find((const void*)&context->pastKeyValues);
+        if (state != v41States.end()) {
+            v41RetiredStates.push_back(std::move(state->second));
+            v41States.erase(state);
         }
+        if (!context->pastKeyValues.empty()) {
+            auto first = v41StatesByFirstKey.find((const void*)&context->pastKeyValues[0].first);
+            if (first != v41StatesByFirstKey.end()) {
+                // Also cover states registered through the pointer-only API.
+                v41RetiredStates.push_back(std::move(first->second));
+                v41StatesByFirstKey.erase(first);
+            }
+        }
+    }
+
+    void DeepSeekV41Model::ReleaseRetiredStates() {
+        std::vector<std::shared_ptr<DeepSeekV41RequestState>> retired;
+        {
+            std::lock_guard<std::mutex> guard(v41StateMutex);
+            retired.swap(v41RetiredStates);
+        }
+        // CUDA synchronization and native MoE graph destruction can block.
+        // Release outside the state mutex, on the forward/scheduler thread.
+        retired.clear();
+    }
+
+    void DeepSeekV41Model::OnResponseContextFinished(ResponseContext *context) {
+        ReleaseRetiredStates();
+        std::shared_ptr<DeepSeekV41DsparkState> draft;
+        if (context) {
+            std::lock_guard<std::mutex> guard(v41StateMutex);
+            auto state = v41States.find((const void*)&context->pastKeyValues);
+            if (state != v41States.end()) draft = std::move(state->second->dspark);
+        }
+        // Outputs are already queued. Preserve target KV state for history
+        // snapshots, but release finished draft graphs before new admission.
+        draft.reset();
     }
 
     // ==================== 前缀缓存 ====================
@@ -4481,6 +4517,7 @@ namespace fastllm {
                                                      std::vector<std::vector<float>*> *retLogits,
                                                      const Data *inputEmbeds,
                                                      const std::vector<int> *imageMask, bool prefillCacheOnly) {
+        ReleaseRetiredStates();
         const int seqlen = inputIds.dims[1];
         const int startPos = V41FirstPosition(&positionIds);
         AssertInFastLLM(inputEmbeds == nullptr ||
@@ -4547,6 +4584,7 @@ namespace fastllm {
                                                     const std::vector<GenerationConfig> &generationConfigs,
                                                     const LastTokensManager &lastTokens,
                                                     std::vector<std::vector<float>*> *retLogits) {
+        ReleaseRetiredStates();
         (void)attentionMask;
         AssertInFastLLM(batch >= 1 && (int)seqLens.size() == batch && (int)positionIds.size() == batch &&
                         (int)pastKeyValues.size() == batch * block_cnt &&
@@ -4559,8 +4597,8 @@ namespace fastllm {
         AssertInFastLLM(inputIds.Count(0) == (uint64_t)total,
                         "DeepSeekV41Model::ForwardBatch: inputIds length does not match seqLens.");
 
-        // ---- DSpark：已经校验通过的 token 直接出队，这些请求不参与本次前向 ----
-        // 批量普通前向不生成草稿；返回单请求时从新的目标位置重建草稿窗口。
+        // Accepted tokens belong to each request's queue. Drain them before
+        // scheduling any target/draft work for the remaining requests.
         std::vector<int> pendingRet(batch, -1);
         std::vector<char> isPending(batch, 0);
         int pendingCount = 0;
@@ -4688,14 +4726,22 @@ namespace fastllm {
                 fflush(stdout);
             }
         }
-        // 含长 prefill 片段的混合批次退回为逐个前向，避免一次前向的激活内存过大
+        // Compatible decode requests share one layerwise verification batch.
+        // Other phases/configurations retain the bounded per-request fallback.
+        const bool batchedVerify = v41DsparkEnabled && v41AttentionDP == 1 &&
+            std::all_of(segments.begin(), segments.end(), [&](const DeepSeekV41Segment &seg) {
+                const size_t i = &seg - segments.data();
+                return seg.seqlen == 1 && seg.startPos > 0 && seg.state->dspark &&
+                    !seg.state->dspark->disabled && DsparkSupportsRequest(generationConfigs[i], *seg.state);
+            });
         bool splitBatch = false;
         if (batch > 1) {
             const int chunkLimit = std::max(1, GetChunkedPrefillSize());
-            for (auto &seg : segments) {
-                if (seg.seqlen > chunkLimit) {
-                    splitBatch = true;
-                }
+            for (int i = 0; i < batch; ++i) {
+                const auto &seg = segments[i];
+                const bool speculate = DsparkSupportsRequest(generationConfigs[i], *seg.state) &&
+                    (!seg.state->dspark || !seg.state->dspark->disabled);
+                if (seg.seqlen > chunkLimit || (speculate && !batchedVerify)) splitBatch = true;
             }
         }
         if (splitBatch) {
@@ -4727,7 +4773,7 @@ namespace fastllm {
             }
         } else {
             ret = ForwardSegmentsWithDspark(segments, inputIds, nullptr, nullptr, generationConfigs, lastTokens,
-                                            retLogits, pastKeyValues, batch == 1);
+                                            retLogits, pastKeyValues, batch == 1 || batchedVerify);
         }
         for (int i = 0; i < batch; i++) {
             V41UpdateStubKV(*pastKeyValues[(size_t)i * block_cnt].first, *pastKeyValues[(size_t)i * block_cnt].second,
@@ -5338,7 +5384,7 @@ namespace fastllm {
     void DeepSeekV41Model::ForwardState::BeginHybridStep() {
         if (work->model.executionMode == ExecutionMode::Hybrid) {
             work->moeStep.emplace();
-            work->model.BeginHybridMoeStep(*work->moeStep, work->tp, work->single, work->seqlen,
+            work->model.BeginHybridMoeStep(*work->moeStep, work->tp, work->single, work->seqlen, work->dsparkVerify,
                 work->pipeline ? work->pipeline->firstLayer : -1,
                 work->pipeline ? work->pipeline->endLayer : -1);
         }
@@ -5585,7 +5631,8 @@ namespace fastllm {
 
         const auto &segments = boundedPrefill ? tailSegments : inputSegments;
         single = numSegments == 1;
-        dsparkVerify = single && segments[0].spec != nullptr && segments[0].spec->wantAllTokens;
+        dsparkVerify = std::all_of(segments.begin(), segments.end(),
+            [](const DeepSeekV41Segment &s) { return s.spec && s.spec->wantAllTokens; });
         seqlen = total;   // 当前层实际计算的 token 数；请求长度仍由 inputSegments 保留
         // 图像 token（掩码按拼接后的全局下标）：Engram 置 -1，专家选择改用 gate.bias_vl
         AssertInFastLLM(imageMask == nullptr || (int)imageMask->size() == seqlen,
@@ -5657,7 +5704,8 @@ namespace fastllm {
         // 张量 dump 与逐算子同步都会在捕获中插入 host 侧拷贝 / 同步，直接关掉图。
         const bool decodeBatch = std::all_of(segments.begin(), segments.end(),
             [](const DeepSeekV41Segment &seg) { return seg.seqlen == 1 && seg.startPos > 0; });
-        const bool verifyGraph = dsparkVerify && segments[0].spec->deferWindow && segments[0].startPos > 0;
+        const bool verifyGraph = dsparkVerify && std::all_of(segments.begin(), segments.end(),
+            [](const DeepSeekV41Segment &s) { return s.spec->deferWindow && s.startPos > 0; });
         if (v41MoeCudaGraphCompatible && (decodeBatch || verifyGraph) &&
             (inputEmbeds == nullptr || (v41AttentionRankRuntime && f.attentionGraphParent)) && !hasImageTokens &&
             std::getenv("FASTLLM_DSV41_DUMP_DIR") == nullptr &&
@@ -5672,7 +5720,7 @@ namespace fastllm {
             if (graphLock.owns_lock()) {
                 // Verification and independent requests have different host metadata.
                 const int graphKey = f.pipeline ? V41PipelineGraphKey(f.pipeline->firstLayer, seqlen) :
-                    verifyGraph ? -seqlen : v41AttentionRankRuntime ?
+                    verifyGraph ? -(seqlen + (segments.size() > 1 ? FastllmV41FullDecodeMaxBatch : 0)) : v41AttentionRankRuntime ?
                     seqlen * 3 + (v41AttentionLogicalRows == 1 ? 0 : v41AttentionLogicalRows <= 8 ? 1 : 2) : seqlen;
                 auto found = v41CudaGraphSlots.find(graphKey);
                 if (v41CudaGraphWarmingUp || verifyGraph || found != v41CudaGraphSlots.end()) {
@@ -6428,13 +6476,12 @@ namespace fastllm {
                 }
             }
             if ((attnQuant || weightOnlyQkv) && quantizedLinearNames.count(pre + ".attn.wq_b.weight") && !dumpDebug &&
-                precisionRows <= 8 &&
                 !(v41AttentionRankRuntime && seqlen == 1 && (weightOnlyQkv || weightOnlyQuery))) {
                 qkvPrepared = V41QkvPrepare(attnInput, weight[pre + ".attn.wq_a.weight"],
                     weight[pre + ".attn.wkv.weight"], weight[pre + ".attn.q_norm.weight"],
                     weight[pre + ".attn.kv_norm.weight"], rms_norm_eps, ws->attnInputQuantized,
                     qr, qNorm, ws->qNormQuantized, kv, attentionInputQuantized,
-                    f.graphActive && seqlen > 1 && seqlen <= 8 ?
+                    f.graphActive && seqlen > 1 ?
                         &(*f.graphState->packedQkvWeights)[layer] : nullptr, false, weightOnlyQkv, weightOnlyQuery);
             }
 #endif
@@ -7509,20 +7556,33 @@ namespace fastllm {
                 DsparkProjectHead(normed, allLogits);
                 ToDataType(allLogits, DataType::FLOAT32);
             }
-            segments[0].spec->tokens.resize(seqlen);
-            const GenerationConfig sampling = DsparkSamplingConfig(generationConfigsIn[0]);
-            if (sampling.top_k > 1) {
-                DsparkSampleVerify(*verifyLogits, *segments[0].state->dspark,
-                                    *segments[0].spec, sampling);
-            } else {
-                DsparkMaskToolLogits(*verifyLogits, sampling, segments[0].spec->draftTokens);
-                TopK(*verifyLogits, topk, 1);
-                topk.ToDevice(DataDevice::CPU);
-                const int stride = topk.dims[topk.dims.size() - 1];
-                const float *topkData = (const float*)topk.cpuData;
-                for (int i = 0; i < seqlen; i++) {
-                    segments[0].spec->tokens[i] = (int)(topkData[(uint64_t)i * stride] + 1e-3);
+            std::vector<int> verified(numSegments);
+            for (int i = 0; i < numSegments; ++i) {
+                const auto &seg = segments[i];
+                auto &scratch = *seg.spec;
+                Data localLogits;
+                Data *logits = verifyLogits;
+                if (numSegments > 1) {
+                    const int vocab = verifyLogits->dims.back();
+                    localLogits.FakeFrom(*verifyLogits, (size_t)seg.offset * vocab * verifyLogits->unitSize);
+                    localLogits.Resize({1, seg.seqlen, vocab});
+                    logits = &localLogits;
                 }
+                scratch.tokens.resize(seg.seqlen);
+                const GenerationConfig sampling = DsparkSamplingConfig(generationConfigsIn[i]);
+                if (sampling.top_k > 1) {
+                    DsparkSampleVerify(*logits, *seg.state->dspark, scratch, sampling);
+                } else {
+                    DsparkMaskToolLogits(*logits, sampling, scratch.draftTokens);
+                    TopK(*logits, topk, 1);
+                    topk.ToDevice(DataDevice::CPU);
+                    const int stride = topk.dims.back();
+                    const float *topkData = (const float*)topk.cpuData;
+                    for (int row = 0; row < seg.seqlen; ++row)
+                        scratch.tokens[row] = (int)(topkData[(uint64_t)row * stride] + 1e-3);
+                }
+                const int last = scratch.acceptedDrafts >= 0 ? scratch.acceptedDrafts : seg.seqlen - 1;
+                verified[i] = scratch.tokens[last];
             }
 #ifdef USE_CUDA
             // Both samplers finish with a blocking result readback. Full
@@ -7534,9 +7594,7 @@ namespace fastllm {
             for (auto &seg : segments) {
                 seg.state->totalLen += seg.seqlen;
             }
-            const int last = segments[0].spec->acceptedDrafts >= 0 ?
-                segments[0].spec->acceptedDrafts : seqlen - 1;
-            return std::vector<int>{segments[0].spec->tokens[last]};
+            return verified;
         }
 
         // ---- head（每个片段只取最后一个 token）----
@@ -7792,7 +7850,7 @@ namespace fastllm {
         return DeepSeekV41MoeContext {
             *ws, moeWeights, tpDevices, layer, seqlen,
             tp, single, dsparkVerify, graphActive, dumpDebug, hasSharedExpertOut,
-            single && segments[0].spec != nullptr && segments[0].spec->wantAllTokens,
+            dsparkVerify,
             [this, &f, layer] { RunForwardSharedExpert(f, layer); },
             [this, &f] { auto *ws=f.ws;
                 ReleaseForwardPrefill(f, {&ws->x, &ws->gateInput, &ws->gateLogits,

@@ -54,7 +54,7 @@ namespace fastllm {
     }
 
     void DeepSeekV41Model::BeginHybridMoeStep(
-            HybridMoeDecodeStep &step, bool tp, bool single, int seqlen, int firstLayer, int endLayer) {
+            HybridMoeDecodeStep &step, bool tp, bool single, int seqlen, bool verifying, int firstLayer, int endLayer) {
 #if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
         const bool streamGGUF = !tp && weights[0][2]->dataType == DATA_GGUF_FORMAT;
         bool cpuHost = false;
@@ -191,8 +191,9 @@ namespace fastllm {
         // Native cache requests (including --auto) enable admission directly.
         // The cache adapter decides whether its registered layout supports a
         // policy scope. Decode/verification orchestration is format-independent.
-        const bool cachedVerify = v41DsparkEnabled && seqlen > 1 && seqlen <= 32;
-        if (!tp && single && (seqlen == 1 || cachedVerify) &&
+        const bool cachedVerify = verifying;
+        const bool cachedDecodeBatch = !single && seqlen > 1;
+        if (!tp && ((single && seqlen == 1) || cachedVerify || cachedDecodeBatch) &&
             FastllmCudaMoeCacheRequested() &&
             !V41ReferenceMathEnabled() && GetCudaSharedExpert() &&
             std::getenv("FASTLLM_DSV41_DUMP_DIR") == nullptr &&
@@ -283,11 +284,12 @@ namespace fastllm {
             FastllmCudaCanRunMoeHybrid(moeWeights.data(), (int)moeWeights.size())) {
             streamingStep.Begin(moeWeights.data(), (int)moeWeights.size(), num_experts_per_tok);
         }
-        // Verification runs between graph segments too. Use the same stable
-        // staging as decode, rather than migrating tensors owned by a graph.
-        // Its multi-row scheduler is independent of the single-token step.
-        const bool singleStageCache = graphActive && !tp && single &&
-            (seqlen >= 1 && seqlen < 32) && FastllmCudaMoeCacheRequested() &&
+        // Verification and independent decode rows both run between graph
+        // segments. Borrow the stable input/route buffers; the hybrid backend
+        // owns its scratch and writes the persistent output before post-MoE
+        // replay. Neither path may migrate graph-owned tensors to the CPU.
+        const bool graphStageCache = graphActive && !tp &&
+            seqlen >= 1 && FastllmCudaMoeCacheRequested() &&
             !dumpDebug && !V41ReferenceMathEnabled() &&
             UsesHostMoe(overlapMoeDevice);
         // Concurrent requests arrive as one [rows, hidden] activation with
@@ -299,9 +301,9 @@ namespace fastllm {
         const bool cachedPrefill = seqlen > 1 &&
             FastllmCudaCanRunMoeHybridPrefill(moeWeights.data(), (int)moeWeights.size());
         const bool batchCacheCandidate = !tp && !graphActive && !ctx.pipelineHostExperts &&
-            ((!single && seqlen > 1 && seqlen < 32) || cachedPrefill) && !dumpDebug &&
+            ((!single && seqlen > 1) || cachedPrefill) && !dumpDebug &&
             !V41ReferenceMathEnabled() && UsesHostMoe(overlapMoeDevice);
-        if (((step && *step) || singleStageCache || streamingStep || cooperativeMoe ||
+        if (((step && *step) || graphStageCache || streamingStep || cooperativeMoe ||
              batchCacheCandidate) && hasSharedExpertOut &&
             moeWeights[0] == nullptr && moeWeights[1] == nullptr &&
             ffnInput.dataDevice == DataDevice::CUDA && ffnInput.cudaData &&
@@ -315,7 +317,7 @@ namespace fastllm {
                 // Graph segments and eager PP routing already own valid CUDA
                 // tensors. Borrow them without changing ownership; the hybrid
                 // backend batches its pinned readback on the producing stream.
-                if (((step && *step) || singleStageCache || streamingStep || cooperativeMoe || batchCacheCandidate) &&
+                if (((step && *step) || graphStageCache || streamingStep || cooperativeMoe || batchCacheCandidate) &&
                     source.dataDevice == DataDevice::CUDA &&
                     source.cudaData && !source.multiDeviceData &&
                     GetPointerDeviceId(source.cudaData) == device) return source;

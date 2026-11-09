@@ -305,6 +305,8 @@ namespace fastllm {
         void TryRecordResponseContext(ResponseContext *context) override;
         void OnResponseContextCreated(ResponseContext *context) override;
         void OnResponseContextRemoved(ResponseContext *context) override;
+        void OnResponseContextFinished(ResponseContext *context) override;
+        bool PopPendingResponseToken(ResponseContext *context, int previousToken, int &token) override;
         bool UseGenericHistoryCache() const override { return false; }
         bool UseModelSpecificScheduler() const override { return false; }
 
@@ -324,7 +326,7 @@ namespace fastllm {
         ExecutionMode executionMode = ExecutionMode::Cpu;
         bool v41MoeCudaGraphCompatible = true;
         void InitExecutionMode();
-        void BeginHybridMoeStep(HybridMoeDecodeStep &, bool tp, bool single, int seqlen, int firstLayer = -1, int endLayer = -1);
+        void BeginHybridMoeStep(HybridMoeDecodeStep &, bool tp, bool single, int seqlen, bool verifying, int firstLayer = -1, int endLayer = -1);
         bool RunGpuMoe(DeepSeekV41MoeContext &);
         bool RunHybridMoe(DeepSeekV41MoeContext &, HybridMoeDecodeStep *);
         bool moeExpertCacheAttempted = false;
@@ -577,6 +579,7 @@ namespace fastllm {
                 DeepSeekV41RequestState &state, int startPos);
         // 若队首的候选与本次输入一致，直接返回已经校验过的 token（不做前向），否则返回 -1
         int DsparkTakePending(DeepSeekV41RequestState &state, const Data &inputIds, int seqlen);
+        int DsparkTakePending(DeepSeekV41RequestState &state, int previousToken);
         // 若 state 有可用的候选，把 inputIds 扩展成 [anchor, draft...]，返回 draft 个数
         int DsparkBuildVerifyInput(DeepSeekV41RequestState &state, const Data &inputIds,
                                    int startPos, Data &verifyIds, std::vector<int> &drafts);
@@ -591,8 +594,6 @@ namespace fastllm {
                             std::vector<int> &tokens, std::vector<float> &confidence,
                             const GenerationConfig &config);
         void DsparkBuildMoeWeights();
-        // 调试：把各层缓存长度写到 FASTLLM_DSV41_DEBUG_STATE 指定的文件
-        void DsparkDebugDumpState(const DeepSeekV41RequestState &state, const char *tag);
         void DsparkReportStats();
 
         void LoadEngramMeta();
@@ -618,6 +619,11 @@ namespace fastllm {
         // Immutable draft attention shards are shared by request graphs.
         std::map<int, std::shared_ptr<void>> v41DsparkAttentionWeights;
         bool TryBFloat16HeadLinear(Data &input, Data &output);
+
+        // Consumer threads only detach states. Graphs and device buffers must
+        // retire on the inference thread, outside another request's capture.
+        std::vector<std::shared_ptr<DeepSeekV41RequestState>> v41RetiredStates;
+        void ReleaseRetiredStates();
     };
 }
 

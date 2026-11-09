@@ -4791,7 +4791,8 @@ extern "C" bool FastllmCudaV41QKVNormPacked(const Data &qkv,
     const int qdim = qCount, kdim = kCount, stride = qdim + kdim;
     if (qkv.dims.back() != stride || (uintptr_t)qkv.cudaData % 4) return false;
     const uint64_t tokens = qkv.Count(0) / stride;
-    if (!tokens || tokens > 8 || &qn == qq || &qn == &kn || qq == &kn) return false;
+    if (!tokens || tokens > uint64_t(std::numeric_limits<int>::max() / 2) ||
+        &qn == qq || &qn == &kn || qq == &kn) return false;
     auto overlaps = [](const void *a, size_t na, const void *b, size_t nb) {
         const uintptr_t x = (uintptr_t)a, y = (uintptr_t)b;
         return a && b && (x <= y ? y - x < na : x - y < nb);
@@ -4854,7 +4855,8 @@ extern "C" bool FastllmCudaV41QKVNormQuant(const Data &q, const Data &kv,
     auto kdims = q.dims;
     kdims.back() = kdim;
     const auto tokens = q.Count(0) / qdim;
-    if (tokens < 1 || tokens > 8 || kdims != kv.dims || !std::isfinite(eps) || eps < 0) return false;
+    if (tokens < 1 || tokens > uint64_t(std::numeric_limits<int>::max() / 2) ||
+        kdims != kv.dims || !std::isfinite(eps) || eps < 0) return false;
     if (&qNorm == &qQuant || &qNorm == &kvNorm || &qQuant == &kvNorm || &q == &qNorm ||
         &q == &qQuant || &q == &kvNorm || &kv == &qNorm || &kv == &qQuant) return false;
     auto overlaps = [](const void *a, size_t na, const void *b, size_t nb) {
@@ -4904,7 +4906,9 @@ extern "C" bool FastllmCudaV41RouterSelectTopK(const Data &input, Data &weight,
     const int experts = weight.dims[0];
     const int rows = input.Count(0) / input.dims.back();
     const int arch = FastllmCudaRuntimeArch();
-    if (rows < 5 || rows > 8 || arch < 80) return false;
+    // Keep tall prefill matrices on GEMM; this split-K pipeline targets
+    // batches whose row count is comparable to the small router width.
+    if (rows < 5 || rows > 2 * experts || arch < 80) return false;
     const int device = FastllmCudaGetDevice();
     if (input.dataDeviceIds.empty() || input.dataDeviceIds.front() != device) return false;
     weight.ToDevice(DataDevice::CUDA, {device}, true);
@@ -4928,13 +4932,17 @@ extern "C" bool FastllmCudaV41RouterSelectTopK(const Data &input, Data &weight,
     if (target->second < 80) return false;
     const bool pdl = arch >= 90 && target->second >= 90;
     const bool cluster = pdl && arch < 100 && weight.dims[1] == 5120;
+    // Bound persistent split-K scratch, independently of the logical batch.
+    // Every graph for this thread/device retains the same stable allocation.
+    constexpr size_t partialBudget = 1024 * 1024;
+    const int chunkRows = int(partialBudget / (16 * experts * sizeof(float))) / 8 * 8;
     float *partial = nullptr;
     if (!cluster) {
         static thread_local std::map<int, std::unique_ptr<Data>> scratch;
         auto found = scratch.find(device);
         if (found == scratch.end()) {
             if (FastllmCudaGraphIsCapturingFast()) return false;
-            auto buffer = std::make_unique<Data>(DataType::FLOAT32, std::vector<int>{16, 8, 384});
+            auto buffer = std::make_unique<Data>(DataType::FLOAT32, std::vector<int>{int(partialBudget / sizeof(float))});
             buffer->ToDevice(DataDevice::CUDA, {device}, false); buffer->Allocate(false);
             found = scratch.emplace(device, std::move(buffer)).first;
         }
@@ -4942,13 +4950,18 @@ extern "C" bool FastllmCudaV41RouterSelectTopK(const Data &input, Data &weight,
     }
     const float invTemp = fabsf(temperature - 1.f) > 1e-6f ? 1.f / temperature : 1.f;
     cudaError_t status;
-    if (cluster) status = V41TcLaunchPipeline<8,8,640,1,true>(
-        (const __nv_bfloat16*)input.cudaData, (const __nv_bfloat16*)compact->cudaData,
-        partial, (float*)logits.cudaData, rows, experts, weight.dims[1], invTemp, cudaStreamPerThread, pdl);
-    else status = V41TcLaunchPipeline<4,16,128,2,false>(
-        (const __nv_bfloat16*)input.cudaData, (const __nv_bfloat16*)compact->cudaData,
-        partial, (float*)logits.cudaData, rows, experts, weight.dims[1], invTemp, cudaStreamPerThread, pdl);
-    if (status != cudaSuccess) { cudaGetLastError(); return false; }
+    for (int first = 0; first < rows; first += chunkRows) {
+        const int count = std::min(chunkRows, rows - first);
+        const auto *x = (const __nv_bfloat16*)input.cudaData + size_t(first) * weight.dims[1];
+        auto *y = (float*)logits.cudaData + size_t(first) * experts;
+        if (cluster) status = V41TcLaunchPipeline<8,8,640,1,true>(
+            x, (const __nv_bfloat16*)compact->cudaData, partial, y, count, experts,
+            weight.dims[1], invTemp, cudaStreamPerThread, pdl);
+        else status = V41TcLaunchPipeline<4,16,128,2,false>(
+            x, (const __nv_bfloat16*)compact->cudaData, partial, y, count, experts,
+            weight.dims[1], invTemp, cudaStreamPerThread, pdl);
+        if (status != cudaSuccess) { cudaGetLastError(); return false; }
+    }
     auto select = topk == 3 ? V41TcRouterTopK<128, 3> : V41TcRouterTopK<384, 6>;
 #if CUDART_VERSION >= 12000
     cudaLaunchConfig_t cfg = {}; cfg.gridDim = rows; cfg.blockDim = 32; cfg.stream = cudaStreamPerThread;
@@ -6965,7 +6978,9 @@ __device__ __forceinline__ void V41FullDecodeSetupRow(
         float *indexScores, float *blockScores, float *attentionScores, int tiles,
         int *candidateBlocks, int *candidateCounts) {
     const auto r = requests[i];
-    const int end = c.verifying ? requests[0].position + c.batch : r.position + 1;
+    const int begin = c.verifying ? r.chunkBegin : i;
+    const int length = r.chunkLength > 0 ? r.chunkLength : c.batch;
+    const int end = c.verifying ? requests[begin].position + length : r.position + 1;
     const int count = c.ratio ? end / c.ratio : 0;
     const int blocks = c.ratio ? (count + c.blockSize - 1) / c.blockSize : 0;
     const int maxBlocks = (c.maxKeys + c.blockSize - 1) / c.blockSize;
@@ -7008,8 +7023,8 @@ __device__ __forceinline__ void V41FullDecodeSetupRow(
     }
     V41AttentionDescriptor a{};
     a.q = q;
-    a.chunkKV = c.verifying ? static_cast<const __nv_bfloat16 *>(b.kv) : kv;
-    a.chunkOffset = c.verifying ? i : 0;
+    a.chunkKV = static_cast<const __nv_bfloat16 *>(b.kv) + (size_t)begin * 512;
+    a.chunkOffset = i - begin;
     a.ringKV = static_cast<const __nv_bfloat16 *>(r.windowKV);
     a.compressedKV = static_cast<const __nv_bfloat16 *>(r.compressedKV);
     if (c.ringMode) {
@@ -7127,27 +7142,29 @@ __global__ void V41FullVerifyGather(FastllmV41FullDecodeConfig c,
         FastllmV41FullDecodeBuffers b, const FastllmV41FullDecodeRequest *requests) {
     const int row = blockIdx.x, d = threadIdx.x;
     const auto r = requests[row];
-    const int tail = requests[0].position % c.ratio;
+    const int begin = r.chunkBegin, localRow = row - begin;
+    const int tail = requests[begin].position % c.ratio;
+    const int savedRow = 2 * begin + tail + localRow;
     const float value = static_cast<const float *>(b.rawKV)[(size_t)row * 512 + d];
-    static_cast<float *>(b.savedRawKV)[(size_t)(tail + row) * 512 + d] = value;
+    static_cast<float *>(b.savedRawKV)[(size_t)savedRow * 512 + d] = value;
     if (c.ratio == 1) {
         static_cast<float *>(b.joined)[(size_t)row * 512 + d] = value;
         return;
     }
     const float score = static_cast<const float *>(b.rawScore)[(size_t)row * 512 + d];
     const bool ready = (r.position + 1) % c.ratio == 0;
-    const float previous = row ? static_cast<const float *>(b.rawKV)[(size_t)(row - 1) * 512 + d]
+    const float previous = localRow ? static_cast<const float *>(b.rawKV)[(size_t)(row - 1) * 512 + d]
                                : (tail ? static_cast<const float *>(r.rawTailKV)[d] : value);
-    const float previousScore = row ? static_cast<const float *>(b.rawScore)[(size_t)(row - 1) * 512 + d]
+    const float previousScore = localRow ? static_cast<const float *>(b.rawScore)[(size_t)(row - 1) * 512 + d]
                                     : (tail ? static_cast<const float *>(r.rawTailScore)[d] : score);
     static_cast<float *>(b.joined)[(size_t)row * 1024 + d] = ready ? previous : value;
     static_cast<float *>(b.joined)[(size_t)row * 1024 + 512 + d] = value;
     static_cast<float *>(b.scores)[(size_t)row * 1024 + d] = ready ? previousScore : score;
     static_cast<float *>(b.scores)[(size_t)row * 1024 + 512 + d] = score;
-    static_cast<float *>(b.savedRawScore)[(size_t)(tail + row) * 512 + d] = score;
-    if (row == 0 && tail) {
-        static_cast<float *>(b.savedRawKV)[d] = previous;
-        static_cast<float *>(b.savedRawScore)[d] = previousScore;
+    static_cast<float *>(b.savedRawScore)[(size_t)savedRow * 512 + d] = score;
+    if (localRow == 0 && tail) {
+        static_cast<float *>(b.savedRawKV)[(size_t)(2 * begin) * 512 + d] = previous;
+        static_cast<float *>(b.savedRawScore)[(size_t)(2 * begin) * 512 + d] = previousScore;
     }
 }
 
@@ -7247,7 +7264,7 @@ void *FastllmCudaV41CreateFullDecode(const FastllmV41FullDecodeConfig &c,
         V41MmaKernelReady<V41IndexerScoreDecodeMmaKernel<true, true, false, false, false, true>, 256>();
     if (p->fuseIndexBlocks && p->indexPrefetch &&
         !V41MmaKernelReady<V41IndexerScoreDecodeMmaKernel<true, true, false, false, true, true>, 256>()) p->indexPrefetch = false;
-    p->indexPairs = !c.indexMode && c.verifying && c.batch >= 2 && c.batch <= 8 && c.indexSource &&
+    p->indexPairs = !c.indexMode && c.verifying && !c.segmentedVerify && c.batch >= 2 && c.batch <= 8 && c.indexSource &&
         !c.useCandidates && c.indexHeads <= 32 &&
         V41MmaKernelReady<V41IndexerScorePairKernel<false>, 256, sizeof(V41PairedIndexShared)>() &&
         (!p->fuseIndexBlocks ||
@@ -7338,10 +7355,24 @@ bool V41ValidateFullDecodeRequests(const V41FullDecodePlan *p,
     const auto &c = p->config;
     for (size_t i = 0; i < count; ++i) {
         const auto &r = requests[i];
-        if (c.verifying && (r.position != requests[0].position + (int)i ||
-            r.windowKV != requests[0].windowKV || r.compressedKV != requests[0].compressedKV ||
-            r.indexK != requests[0].indexK || r.rawTailKV != requests[0].rawTailKV ||
-            r.rawTailScore != requests[0].rawTailScore)) return false;
+        if (c.verifying) {
+            const int begin = r.chunkBegin, length = r.chunkLength > 0 ? r.chunkLength : c.batch;
+            if (begin < 0 || begin > (int)i || length < 1 || length > c.batch - begin ||
+                (int)i >= begin + length || (!c.segmentedVerify && (begin || length != c.batch))) return false;
+            const auto &first = requests[begin];
+            if (first.chunkBegin != begin || first.chunkLength != r.chunkLength ||
+                r.position != first.position + (int)i - begin ||
+                r.windowKV != first.windowKV || r.compressedKV != first.compressedKV ||
+                r.indexK != first.indexK || r.rawTailKV != first.rawTailKV ||
+                r.rawTailScore != first.rawTailScore) return false;
+            if ((int)i == begin && begin > 0) {
+                const auto &previous = requests[begin - 1];
+                if (previous.chunkBegin + previous.chunkLength != begin) return false;
+                // Distinct causal chunks cannot write the same ring concurrently.
+                for (int j = 0; j < begin; j += requests[j].chunkLength)
+                    if (requests[j].chunkLength < 1 || requests[j].windowKV == r.windowKV) return false;
+            }
+        }
         if (r.position < 1 || !r.windowKV || (c.ratio &&
             (!r.compressedKV || (r.position + 1LL) / c.ratio > c.maxKeys)) ||
             (c.indexSource && !r.indexK) ||

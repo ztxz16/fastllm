@@ -1144,13 +1144,6 @@ namespace fastllm {
             }
         }
 
-        // FASTLLM_DSV41_DEBUG_STATE：每次前向后把各层缓存的长度写到文件，
-        // 用来对比"开 DSpark（含回滚）"与"不开 DSpark"两条路径的状态是否一致
-        const char *DsDebugStatePath() {
-            static const char *path = std::getenv("FASTLLM_DSV41_DEBUG_STATE");
-            return path != nullptr && path[0] != '\0' ? path : nullptr;
-        }
-
         std::vector<int> DsReadIds(const Data &data) {
             Data cpu;
             const Data *src = &data;
@@ -1663,21 +1656,34 @@ namespace fastllm {
         return state.dspark;
     }
 
+    bool DeepSeekV41Model::PopPendingResponseToken(ResponseContext *context,
+                                                    int previousToken, int &token) {
+        if (!v41DsparkEnabled || !context || context->pastKeyValues.empty()) return false;
+        auto state = GetStateByFirstKey(&context->pastKeyValues[0].first);
+        if (!state) return false;
+        const int next = DsparkTakePending(*state, previousToken);
+        if (next < 0) return false;
+        token = next;
+        return true;
+    }
+
     int DeepSeekV41Model::DsparkTakePending(DeepSeekV41RequestState &state, const Data &inputIds,
                                             int seqlen) {
-        if (!state.dspark || state.dspark->pending.empty()) {
-            return -1;
-        }
+        if (!state.dspark || state.dspark->pending.empty()) return -1;
+        const auto ids = seqlen == 1 ? DsReadIds(inputIds) : std::vector<int>{};
+        return DsparkTakePending(state, ids.size() == 1 ? ids[0] : -1);
+    }
+
+    int DeepSeekV41Model::DsparkTakePending(DeepSeekV41RequestState &state, int previousToken) {
+        if (!state.dspark || state.dspark->pending.empty()) return -1;
         auto &pending = state.dspark->pending;
-        if (seqlen == 1) {
-            std::vector<int> ids = DsReadIds(inputIds);
-            // 调度器可能改写返回的 token（工具约束、停止词等），只在完全一致时出队
-            if (ids.size() == 1 && ids[0] == pending.front().first) {
-                const int ret = pending.front().second;
-                pending.pop_front();
-                DsProfiler().AddPendingHit();
-                return ret;
-            }
+        // Publish through the serving loop's ordinary stop/grammar/history
+        // checks before scheduling another shared verification forward.
+        if (previousToken == pending.front().first) {
+            const int token = pending.front().second;
+            pending.pop_front();
+            DsProfiler().AddPendingHit();
+            return token;
         }
         // 不匹配：丢弃剩余的已校验 token，退回普通解码。缓存里多出来的 token
         // 位置在 state.totalLen 里，下一次前向会因为位置不一致而报错，因此这里
@@ -1759,28 +1765,6 @@ namespace fastllm {
         return count;
     }
 
-    void DeepSeekV41Model::DsparkDebugDumpState(const DeepSeekV41RequestState &state, const char *tag) {
-        const char *path = DsDebugStatePath();
-        if (path == nullptr) {
-            return;
-        }
-        FILE *file = fopen(path, "a");
-        if (file == nullptr) {
-            return;
-        }
-        fprintf(file, "%s total=%d engram=%d", tag, state.totalLen, (int)state.engramHistory.size());
-        for (int layer = 0; layer < (int)state.layers.size(); layer++) {
-            const DeepSeekV41LayerCache &cache = state.layers[layer];
-            fprintf(file, " | L%d len=%d blocks=%d tail=%d ring=%d idx=%d ckv=%d", layer, cache.totalLen,
-                    cache.compressedBlocks, cache.rawTail,
-                    cache.windowKV.dims.size() == 3 ? cache.windowKV.dims[1] : -1,
-                    cache.indexK.dims.size() == 3 ? cache.indexK.dims[1] : -1,
-                    cache.compressedKV.dims.size() == 3 ? cache.compressedKV.dims[1] : -1);
-        }
-        fprintf(file, "\n");
-        fclose(file);
-    }
-
     std::vector<int> DeepSeekV41Model::ForwardSegmentsWithDspark(
             std::vector<DeepSeekV41Segment> &segments,
             const Data &inputIds,
@@ -1792,25 +1776,10 @@ namespace fastllm {
             std::vector<std::pair<Data*, Data*> > &samplingPastKeyValues,
             bool allowSpeculate) {
         const int numSegments = (int)segments.size();
-        if (!v41DsparkEnabled || numSegments > 1) {
-            // Batched verification is not implemented. Do not produce proposals
-            // that the next batch cannot consume, or capture draft features that
-            // would prevent ordinary decode from replaying its full graph.
-            // ForwardBatch has already drained accepted pending tokens. Drop the
-            // remaining draft state: after returning to a single request its
-            // window must start at the new target position, as on a cache hit.
-            if (v41DsparkEnabled) for (auto &seg : segments) {
-                AssertInFastLLM(!seg.state->dspark || seg.state->dspark->pending.empty(),
-                    "DeepSeekV41 DSpark: drain accepted tokens before a batched forward.");
-                seg.state->dspark.reset();
-            }
-            std::vector<int> plain = ForwardSegments(segments, inputIds, inputEmbeds, imageMask,
-                                                     generationConfigs, lastTokens, retLogits,
-                                                     samplingPastKeyValues);
-            for (auto &seg : segments) {
-                DsparkDebugDumpState(*seg.state, "plain");
-            }
-            return plain;
+        if (!v41DsparkEnabled) {
+            return ForwardSegments(segments, inputIds, inputEmbeds, imageMask,
+                                   generationConfigs, lastTokens, retLogits,
+                                   samplingPastKeyValues);
         }
         std::vector<DeepSeekV41SpecScratch> scratches(numSegments);
         std::vector<char> active(numSegments, 0);
@@ -1825,93 +1794,98 @@ namespace fastllm {
             segments[i].spec = &scratches[i];
         }
 
-        // 单片段时把候选拼进输入，一次前向校验 block 个位置
-        std::vector<int> draftTokens;
+        // Flatten all eligible requests into one target forward. Request-local
+        // offsets are consumed by attention, sampling, KV commit and feature views.
+        const auto originalSegments = segments;
+        struct RestoreSegments {
+            std::vector<DeepSeekV41Segment> &segments;
+            const std::vector<DeepSeekV41Segment> &original;
+            ~RestoreSegments() { segments = original; for (auto &s : segments) s.spec = nullptr; }
+        } restore{segments, originalSegments};
+        std::vector<int> draftCounts(numSegments, 0);
         Data verifyIds;
         const Data *idsPtr = &inputIds;
-        int drafts = 0;
-        bool verifyStep = false;
-        const int startPos = numSegments == 1 ? segments[0].startPos : 0;
-        const int seqlen = numSegments == 1 ? segments[0].seqlen : 0;
-        // Capture visual prefill hidden states for the draft window, but only
-        // verify proposals on ordinary text positions. Image masks and embeddings
-        // must retain their original row count through the target forward.
         const bool textOnly = inputEmbeds == nullptr && imageMask == nullptr;
-        if (allowSpeculate && textOnly && numSegments == 1 && active[0] && seqlen == 1 && startPos > 0) {
-            drafts = DsparkBuildVerifyInput(*segments[0].state, inputIds, startPos, verifyIds, draftTokens);
-            const GenerationConfig &config = generationConfigs[0];
-            if (config.output_token_limit > 0 && config.input_token_length > 0) {
-                // The anchor at startPos has already been emitted. Verification
-                // returns accepted drafts plus one correction/bonus token; never
-                // commit inputs beyond what the scheduler is allowed to emit.
-                // Otherwise max_tokens can leave KV ahead of allTokens and make
-                // the completed request ineligible for a prefix snapshot.
-                const int emitted = startPos - config.input_token_length + 1;
-                const int maxDrafts = std::max(0, config.output_token_limit - emitted - 1);
-                if (drafts > maxDrafts) {
-                    drafts = maxDrafts;
-                    draftTokens.resize(drafts);
-                    verifyIds.Resize({1, drafts + 1});
+        bool verifyStep = allowSpeculate && textOnly;
+        for (int i = 0; i < numSegments; ++i)
+            verifyStep &= active[i] && segments[i].seqlen == 1 && segments[i].startPos > 0 &&
+                segments[i].state->dspark != nullptr;
+        if (verifyStep) {
+            const auto anchors = DsReadIds(inputIds);
+            std::vector<float> tokens;
+            for (int i = 0; i < numSegments; ++i) {
+                auto &segment = segments[i];
+                auto &scratch = scratches[i];
+                Data anchor(DataType::FLOAT32, {1, 1}, std::vector<float>{float(anchors[segment.offset])});
+                Data proposalIds;
+                int drafts = DsparkBuildVerifyInput(*segment.state, anchor, segment.startPos,
+                    proposalIds, scratch.draftTokens);
+                const auto &config = generationConfigs[i];
+                if (config.output_token_limit > 0 && config.input_token_length > 0) {
+                    const int emitted = segment.startPos - config.input_token_length + 1;
+                    drafts = std::min(drafts, std::max(0, config.output_token_limit - emitted - 1));
+                    scratch.draftTokens.resize(drafts);
                 }
+                draftCounts[i] = drafts;
+                segment.offset = tokens.size();
+                segment.seqlen = drafts + 1;
+                tokens.push_back(float(anchors[originalSegments[i].offset]));
+                for (int token : scratch.draftTokens) tokens.push_back(float(token));
+                scratch.deferWindow = scratch.wantAllTokens = true;
+                scratch.windowKV.resize(block_cnt);
+                scratch.rawKV.resize(block_cnt);
+                scratch.rawScore.resize(block_cnt);
+                scratch.prevRawTail.assign(block_cnt, 0);
+                scratch.prevBlocks.assign(block_cnt, 0);
             }
-            // An anchor-only step still needs the same target features as
-            // multi-row verification. Both greedy and sampled requests can
-            // reuse its graph and one-row KV commit without any proposal.
-            verifyStep = drafts > 0 || segments[0].state->dspark != nullptr;
-            if (verifyStep) {
-                if (drafts > 0) idsPtr = &verifyIds;
-                segments[0].seqlen = 1 + drafts;
-                scratches[0].deferWindow = true;
-                scratches[0].wantAllTokens = true;
-                scratches[0].draftTokens = draftTokens;
-                scratches[0].windowKV.resize(block_cnt);
-                scratches[0].rawKV.resize(block_cnt);
-                scratches[0].rawScore.resize(block_cnt);
-                scratches[0].prevRawTail.assign(block_cnt, 0);
-                scratches[0].prevBlocks.assign(block_cnt, 0);
-            }
+            verifyIds.CopyFrom(Data(DataType::FLOAT32, {1, int(tokens.size())}, tokens));
+            idsPtr = &verifyIds;
         }
 
         const double forwardStart = DsTick();
         std::vector<int> ret = ForwardSegments(segments, *idsPtr, inputEmbeds, imageMask, generationConfigs,
                                                lastTokens, retLogits, samplingPastKeyValues);
         const double forwardMs = DsElapsed(forwardStart);
-        // 单请求单 token 的普通前向：与校验前向对照，差值就是多校验 N 个候选的边际代价
-        if (drafts == 0 && numSegments == 1 && seqlen == 1 && active[0]) {
+        if (numSegments == 1 && draftCounts[0] == 0 && originalSegments[0].seqlen == 1 && active[0])
             DsProfiler().AddPlainForward(forwardMs);
-        }
 
         if (verifyStep) {
-            DeepSeekV41RequestState &state = *segments[0].state;
-            DeepSeekV41SpecScratch &scratch = scratches[0];
-            AssertInFastLLM((int)scratch.tokens.size() == drafts + 1,
-                            "DeepSeekV41 DSpark: the verifier did not return per-position tokens.");
-            const int accepted = DsparkAcceptedDraftCount(scratch, generationConfigs[0]);
-            scratch.acceptedDrafts = accepted;
-            const int commitCount = accepted + 1;
-            const double commitStart = DsTick();
-            DsparkCommitPrefix(state, scratch, startPos, commitCount, drafts + 1);
-            const double commitMs = DsElapsed(commitStart);
-            if (drafts > 0) DsProfiler().AddVerify(drafts, accepted, forwardMs, commitMs);
-            ret.assign(1, scratch.tokens[0]);
-            for (int j = 1; j <= accepted; j++) {
-                state.dspark->pending.push_back(std::make_pair(scratch.tokens[j - 1], scratch.tokens[j]));
+            ret.resize(numSegments);
+            // Commit every request before starting any draft. Each scratch view
+            // borrows a disjoint slice of the one target graph's persistent data.
+            for (int i = 0; i < numSegments; ++i) {
+                auto &state = *segments[i].state;
+                auto &scratch = scratches[i];
+                const int drafts = draftCounts[i], startPos = segments[i].startPos;
+                AssertInFastLLM((int)scratch.tokens.size() == drafts + 1,
+                    "DeepSeekV41 DSpark: the verifier did not return per-position tokens.");
+                const int accepted = DsparkAcceptedDraftCount(scratch, generationConfigs[i]);
+                scratch.acceptedDrafts = accepted;
+                const double commitStart = DsTick();
+                DsparkCommitPrefix(state, scratch, startPos, accepted + 1, drafts + 1);
+                const double commitMs = DsElapsed(commitStart);
+                if (drafts > 0) DsProfiler().AddVerify(drafts, accepted, forwardMs / numSegments, commitMs);
+                ret[i] = scratch.tokens[0];
+                for (int j = 1; j <= accepted; ++j)
+                    state.dspark->pending.emplace_back(scratch.tokens[j - 1], scratch.tokens[j]);
+                if (drafts > 0) {
+                    const long long round = v41DsparkVerifyRounds.fetch_add(1) + 1;
+                    v41DsparkProposedTokens.fetch_add(drafts);
+                    v41DsparkAcceptedTokens.fetch_add(accepted);
+                    DsRecordStats(round, drafts, accepted);
+                    state.dspark->rounds++;
+                    state.dspark->proposed += drafts;
+                    state.dspark->accepted += accepted;
+                }
             }
-            if (drafts > 0) {
-                const long long round = v41DsparkVerifyRounds.fetch_add(1) + 1;
-                v41DsparkProposedTokens.fetch_add(drafts);
-                v41DsparkAcceptedTokens.fetch_add(accepted);
-                DsRecordStats(round, drafts, accepted);
-                state.dspark->rounds++;
-                state.dspark->proposed += drafts;
-                state.dspark->accepted += accepted;
+            for (int i = 0; i < numSegments; ++i) {
+                auto &scratch = scratches[i];
+                const int anchor = scratch.tokens[scratch.acceptedDrafts];
+                const auto &config = generationConfigs[i];
+                const bool stopped = anchor == eos_token_id || eos_token_ids.count(anchor) || config.stop_token_ids.count(anchor);
+                DsparkAdvance(*segments[i].state, scratch, segments[i].startPos,
+                    segments[i].startPos + scratch.acceptedDrafts + 1, stopped ? -1 : anchor, config);
             }
-            DsparkDebugDumpState(state, drafts > 0 ? "verify" : "plain");
-            const int anchor = scratch.tokens[accepted];
-            const bool stopped = anchor == eos_token_id || eos_token_ids.count(anchor) ||
-                generationConfigs[0].stop_token_ids.count(anchor);
-            DsparkAdvance(state, scratch, startPos, startPos + commitCount, stopped ? -1 : anchor, generationConfigs[0]);
-            segments[0].seqlen = 1;
             return ret;
         }
 
@@ -1922,7 +1896,6 @@ namespace fastllm {
             // prefill 分块的中间结果不是真正的下一个 token，这时只更新滑窗、不生成候选
             const int anchor = allowSpeculate && !isIntermediateChunkedPrefill && textOnly &&
                 segments[i].seqlen == 1 && (int)ret.size() > i ? ret[i] : -1;
-            DsparkDebugDumpState(*segments[i].state, "plain");
             DsparkAdvance(*segments[i].state, scratches[i], segments[i].startPos,
                           segments[i].startPos + segments[i].seqlen, anchor, generationConfigs[i]);
         }

@@ -53,8 +53,14 @@ static void Validate(Data &logits, Data &ids, Data &scores, const std::vector<__
             Check(std::isfinite(got[row * experts + e]), "nonfinite score");
             Check(std::abs(got[row * experts + e] - ref[e]) < 5e-4, "score absolute error");
         }
-        std::stable_sort(order.begin(), order.end(),
-                         [&](int a, int b) { return ref[a] + bias[a] > ref[b] + bias[b]; });
+        // Top-k operates on FP32 corrected scores. FP64 references can
+        // distinguish values that round to the same FP32 score; those ties
+        // must use the smaller expert ID, as the runtime contract requires.
+        std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
+            const float sa = got[row * experts + a] + bias[a];
+            const float sb = got[row * experts + b] + bias[b];
+            return sa > sb;
+        });
         double sum = 0;
         for (int t = 0; t < topk; ++t)
             sum += ref[order[t]];
@@ -75,7 +81,7 @@ int main() {
         for (int experts : {384, 128}) {
             const int topk = experts == 384 ? 6 : 3;
         for (int k : {128, 512, 4096, 5120, 6144})
-            for (int m : {5, 6, 7, 8}) {
+            for (int m : {5, 6, 7, 8, 9, 12, 17, 24, 33, 40, 41, 65, 129}) {
                 std::vector<__nv_bfloat16> x(m * k);
                 std::vector<float> w(experts * k), bias(experts);
                 for (auto &v : x)
@@ -164,6 +170,11 @@ int main() {
             Check(!FastllmCudaV41RouterSelectTopK(input, weight, bias, 1, 1, logits, ids, scores, topk),
                   "wrong input device accepted");
             input.dataDeviceIds = {0};
+            Data tall, tallWeight;
+            Alloc(tall, BFLOAT16, {2 * experts + 1, 128});
+            Alloc(tallWeight, FLOAT32, {experts, 128});
+            Check(!FastllmCudaV41RouterSelectTopK(tall, tallWeight, bias, 1, 1, logits, ids, scores, topk),
+                  "tall prefill must retain GEMM");
         }
         std::cout << "PASS " << cases
                   << " precision cases, generic/SM90, temperature/scale, graph replay, ties, unchanged "
