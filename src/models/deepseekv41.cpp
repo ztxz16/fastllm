@@ -5469,12 +5469,9 @@ namespace fastllm {
         const bool residentPlacement = work->tp
             ? V41DeviceSpecUsesType(moeDevice, "multicuda") && moeDevice == mainDevice
             : V41DeviceSpecUsesType(moeDevice, "cuda") && V41DeviceSpecUsesType(mainDevice, "cuda");
-        const auto residentType = ctx.moeWeights.size() > 2 && ctx.moeWeights[2] ?
-            ctx.moeWeights[2]->dataType : DataType::FLOAT32;
-        const bool residentFormat = residentType == DataType::DATA_GGUF_FORMAT ||
-            residentType == DataType::NVFP4 || residentType == DataType::NVFP4_BLOCK_32_E8M0;
+        // Backend readiness includes the actual format, shape and warmup state.
         ctx.residentGraph = work->graphActive && work->cudaRouteCapturable && residentPlacement &&
-            residentFormat && work->ws->ffnInput.dataType == DataType::BFLOAT16 && ctx.moeWeights.size() > 2;
+            work->ws->ffnInput.dataType == DataType::BFLOAT16 && ctx.moeWeights.size() > 2;
         if (ctx.residentGraph && work->tp) {
             // Expert-parallel ranks own disjoint expert tables. Validate each
             // rank's persistent backend before capturing the shared/routed sum.

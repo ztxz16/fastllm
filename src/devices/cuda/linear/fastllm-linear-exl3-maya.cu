@@ -12,6 +12,8 @@
 #include <memory>
 #include <mutex>
 #include <tuple>
+#include <set>
+#include <thread>
 
 namespace {
 namespace maya = strata::kernels::exl3;
@@ -52,6 +54,8 @@ struct Signature {
 };
 struct Directory {
     std::vector<Signature> signature;
+    std::vector<const Data *> sources;
+    std::set<std::tuple<std::thread::id, int, int>> warmedShapes;
     Data table{INT8}; // [expert descriptors: 3 pointers each][expert-id -> descriptor pointer]
     maya::ExpertLayout lay;
     maya::MixedLayouts mix;
@@ -138,8 +142,9 @@ bool Window(const Data &input, const int *selection, const float *scores, int to
         int mid, float limit, const maya::ExpertLayout &layout, const maya::MixedLayouts &mix,
         bool indirect, const unsigned long long *lookup, int experts, const uint8_t *records,
         const uint64_t *offsets, size_t stride, const int *routeMap, int routeCount,
-        float *output, bool routeOutput, bool preserveMissing, int scratchLane) {
-    const int rows = input.dims[0], k = input.dims[1], capacity = rows * 8;
+        float *output, bool routeOutput, bool preserveMissing, int scratchLane,
+        int firstRow = 0, int tileRows = 0) {
+    const int rows = tileRows ? tileRows : input.dims[0], k = input.dims[1], capacity = rows * 8;
     auto &work = Work(k, mid, rows, -128-16*scratchLane-topk);
     work.plan.Resize({capacity * int(sizeof(unsigned long long))});
     work.scores.Resize({capacity});
@@ -157,7 +162,8 @@ bool Window(const Data &input, const int *selection, const float *scores, int to
     a.T=rows; a.k=topk; a.n_embd=k; a.n_ff=mid; a.limit=limit;
     a.grp_ptr=groupPointers; a.grp_start=starts; a.grp_ent=entries; a.n_groups=groupCount;
     a.plan_ptr=plan; a.plan_w=weights; a.lay=layout; a.mix=mix; a.indirect=indirect;
-    a.x16=static_cast<const uint16_t *>(input.cudaData); a.x_bf16=true; a.x_stride=k;
+    a.x16=static_cast<const uint16_t *>(input.cudaData) + size_t(firstRow)*k;
+    a.x_bf16=true; a.x_stride=k;
     a.h=static_cast<float *>(work.h.cudaData); a.part=static_cast<float *>(work.part.cudaData);
     a.out=output; a.out_stride=k; a.round_bf16=true; a.route_output=routeOutput;
     a.preserve_missing=preserveMissing; a.scratch_lane=scratchLane;
@@ -299,16 +305,32 @@ bool FastllmCudaExl3MayaLinearShared(const fastllm::Data &input,
 void FastllmCudaReleaseExl3Maya(const fastllm::Data *owner) {
     std::lock_guard<std::mutex> lock(DirectoryMutex());
     auto &map=Directories();
-    for(auto it=map.begin();it!=map.end();) { if(it->first.first==owner) it=map.erase(it); else ++it; }
+    for (auto it=map.begin(); it!=map.end();) {
+        const auto &sources = it->second->sources;
+        if (std::find(sources.begin(), sources.end(), owner) != sources.end()) it=map.erase(it);
+        else ++it;
+    }
+}
+
+bool FastllmCudaExl3MayaMoeGraphReady(const fastllm::Data *owner, int rows, int topk) {
+    if (!Enabled()) return false;
+    std::lock_guard<std::mutex> lock(DirectoryMutex());
+    auto it = Directories().find({owner, FastllmCudaGetDevice()});
+    return it != Directories().end() &&
+        it->second->warmedShapes.count({std::this_thread::get_id(), rows, topk}) != 0;
 }
 
 bool FastllmCudaExl3MayaMoe(const fastllm::Data &input, fastllm::Data &output,
                            const fastllm::Data &index, const fastllm::Data &score,
                            fastllm::Data **weights, int count, float limit) {
     using namespace fastllm;
-    if (!Enabled() || input.dataType!=BFLOAT16 || input.dims.size()!=2 || input.dims[0]<1 || input.dims[0]>8 || count<4 || count%2 ||
+    if (!Enabled() || input.dataType!=BFLOAT16 || input.dims.size()!=2 || input.dims[0]<1 || count<4 || count%2 ||
         weights[0] || !weights[2] || weights[2]->dataType!=EXL3 || weights[2]->dims.size()!=2 ||
-        index.dataDevice!=DataDevice::CUDA || score.dataDevice!=DataDevice::CUDA || index.dims.empty() ||
+        input.dataDevice!=DataDevice::CUDA || !input.cudaData ||
+        index.dataDevice!=DataDevice::CUDA || score.dataDevice!=DataDevice::CUDA ||
+        index.dims.size()!=2 || index.dims[0]!=input.dims[0] || score.dims!=index.dims ||
+        !index.cudaData || !score.cudaData ||
+        index.dataDeviceIds!=input.dataDeviceIds || score.dataDeviceIds!=input.dataDeviceIds ||
         index.dataType!=INT32 || score.dataType!=FLOAT32) return false;
     const int k=input.dims[1], mid=weights[2]->dims[0]/2, rows=input.dims[0], topk=index.dims.back();
     const int experts=count/2-1, device=FastllmCudaGetDevice();
@@ -330,8 +352,10 @@ bool FastllmCudaExl3MayaMoe(const fastllm::Data &input, fastllm::Data &output,
         std::lock_guard<std::mutex> lock(DirectoryMutex());
         auto &entry=Directories()[{weights[2],device}];
         if(!entry || entry->k!=k || entry->mid!=mid || entry->signature!=signature) {
+            if (FastllmCudaGraphIsCapturing()) return false;
             entry=std::make_shared<Directory>(); auto &d=*entry;
             d.signature=std::move(signature); d.k=k; d.mid=mid;
+            d.sources.assign(weights+2, weights+count);
             d.table.dataDevice=DataDevice::CUDA; d.table.dataDeviceIds={device};
             d.table.Resize({experts*4*int(sizeof(unsigned long long))}); d.table.Allocate(false);
             std::vector<unsigned long long> data(experts*4);
@@ -354,13 +378,31 @@ bool FastllmCudaExl3MayaMoe(const fastllm::Data &input, fastllm::Data &output,
             FastllmCudaCopyFromHostToDevice(d.table.cudaData,data.data(),d.table.GetBytes());
         }
         dir=entry;
+        if (FastllmCudaGraphIsCapturing() &&
+            !dir->warmedShapes.count({std::this_thread::get_id(), rows, topk})) return false;
     }
+    auto markWarm = [&] {
+        if (!FastllmCudaGraphIsCapturing()) {
+            std::lock_guard<std::mutex> lock(DirectoryMutex());
+            dir->warmedShapes.emplace(std::this_thread::get_id(), rows, topk);
+        }
+    };
     if (rows > 1) {
         if (output.dataType != FLOAT32) { output.FreeSpace(); output.dataType=FLOAT32; }
         output.Resize({rows,k}); output.ToDevice(CUDA,{device},false); output.Allocate(false);
-        return Window(input, static_cast<const int *>(index.cudaData), static_cast<const float *>(score.cudaData),
-            topk, mid, limit, dir->lay, dir->mix, true, dir->lookup, experts,
-            nullptr, nullptr, 0, nullptr, 0, static_cast<float *>(output.cudaData), false, false, 0);
+        // WindowPlan's 64 lanes encode eight rows of eight routes. This is a
+        // physical compute tile, not a logical request/batch admission limit.
+        constexpr int tileCapacity = 64 / 8;
+        for (int first=0; first<rows; first+=tileCapacity) {
+            const int count=std::min(tileCapacity, rows-first);
+            if (!Window(input, static_cast<const int *>(index.cudaData)+size_t(first)*topk,
+                static_cast<const float *>(score.cudaData)+size_t(first)*topk,
+                topk, mid, limit, dir->lay, dir->mix, true, dir->lookup, experts,
+                nullptr, nullptr, 0, nullptr, 0, static_cast<float *>(output.cudaData)+size_t(first)*k,
+                false, false, 0, first, count)) return false;
+        }
+        markWarm();
+        return true;
     }
     auto stream=cudaStreamPerThread;
     auto &work=Work(k,mid,rows,topk);
@@ -380,6 +422,7 @@ bool FastllmCudaExl3MayaMoe(const fastllm::Data &input, fastllm::Data &output,
         maya::moe_down(a,h,nullptr,static_cast<float *>(output.cudaData)+row*k,stream);
     }
     AssertInFastLLM(cudaGetLastError()==cudaSuccess,"EXL3 Maya: MoE CUDA failure.");
+    markWarm();
     return true;
 }
 

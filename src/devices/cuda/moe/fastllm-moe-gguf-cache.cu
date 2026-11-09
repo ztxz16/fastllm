@@ -20,6 +20,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <unordered_map>
 #include <vector>
 
@@ -505,7 +506,13 @@ struct ResidentLayer {
     std::atomic<bool> retired{false};
     // A pointer table built by prefill alone does not establish that the
     // native V4.1 decode path and its scratch shape have been warmed.
-    std::atomic<uint32_t> v41DecodeTopks[32]{};
+    std::mutex warmMutex;
+    std::set<std::pair<int, int>> warmedShapes;
+    void MarkWarm(int rows, int topk) {
+        if (FastllmCudaGraphIsCapturing()) return;
+        std::lock_guard<std::mutex> lock(warmMutex);
+        warmedShapes.emplace(rows, topk);
+    }
     ~ResidentLayer() {
         if (!table) return;
         int previous = -1;
@@ -1359,8 +1366,7 @@ bool FastllmCudaMergeMOEV41GGUFResident(
         output, layer->table, static_cast<const int32_t *>(indices.cudaData),
         static_cast<const float *>(scores.cudaData), layer->gateType, layer->downType,
         hidden, inter, layer->experts, topk, swigluLimit, compactEpRoutes), "V4.1 resident GGUF CUDA launch failed.");
-    if (rows <= 32)
-        layer->v41DecodeTopks[rows - 1].fetch_or(uint32_t(1) << (topk - 1), std::memory_order_release);
+    layer->MarkWarm(rows, topk);
     return true;
 }
 
@@ -1461,19 +1467,20 @@ bool FastllmCudaMergeMOEV41NativeResident(
         static_cast<const float *>(partial.cudaData), ids, table,
         static_cast<float *>(output.cudaData), hidden, layer->experts, topk);
     AssertInFastLLM(cudaGetLastError() == cudaSuccess, "V4.1 native resident launch failed");
-    layer->v41DecodeTopks[rows - 1].fetch_or(uint32_t(1) << (topk - 1), std::memory_order_release);
+    layer->MarkWarm(rows, topk);
     return true;
 }
 
 bool FastllmCudaV41GGUFGraphReady(const fastllm::Data *layerKey, int rows, int topk) {
-    if (!layerKey || rows < 1 || rows > 32 || topk < 1 || topk > 32) return false;
+    if (!layerKey || rows < 1 || topk < 1) return false;
     auto &registry = ResidentLayers();
     std::lock_guard<std::mutex> lock(registry.mutex);
     auto it = registry.layers.find(layerKey);
     if (it == registry.layers.end()) return false;
-    const auto &layer = *it->second;
+    auto &layer = *it->second;
+    std::lock_guard<std::mutex> warmLock(layer.warmMutex);
     return layer.table && !layer.retired.load(std::memory_order_acquire) &&
-        (layer.v41DecodeTopks[rows - 1].load(std::memory_order_acquire) & (uint32_t(1) << (topk - 1)));
+        layer.warmedShapes.count({rows, topk}) != 0;
 }
 
 namespace v41_gguf_cache {

@@ -227,7 +227,7 @@ public:
         }
         SetCudaSharedExpert(true);
         HybridMoeDecodeStep step;
-        BeginHybridMoeStep(step, false, true, 1);
+        BeginHybridMoeStep(step, false, true, 1, false);
         if(gpuPrefix) Check(bool(step),"GPU-resident first layer disabled the host cache scope");
     }
     void Run(Data &input, Data &index, Data &score, Data &output,
@@ -236,7 +236,7 @@ public:
         if (!cooperativeTest) deviceMap = {{"cuda:" + std::to_string(device), 1}};
         ApplyDeviceMap({{"cuda:" + std::to_string(device), 1}}, 0, 1);
         HybridMoeDecodeStep step;
-        BeginHybridMoeStep(step, false, true, rows);
+        BeginHybridMoeStep(step, false, true, rows, rows > 1);
         ws.ffnInput.CopyFrom(input); ws.expertIndex.CopyFrom(index); ws.expertScore.CopyFrom(score);
         if (layer % 2) {
             ws.expertIndex.ToDevice(CPU); ws.expertScore.ToDevice(CPU);
@@ -267,7 +267,7 @@ public:
             transfers[d].dataType=INT8; transfers[d].Resize({int(bytes)});
             transfers[d].ToDevice(CUDA,{d},false);transfers[d].Allocate(false);
         }
-        HybridMoeDecodeStep step; BeginHybridMoeStep(step,false,true,1);
+        HybridMoeDecodeStep step; BeginHybridMoeStep(step,false,true,1,false);
         const std::vector<int> devices{0,1};
         std::vector<Data *> layerWeights;
         for(size_t i=0;i<outputs.size();++i) {
@@ -919,7 +919,7 @@ static int Case(int gt, int dt, int hidden, int inter, int device, bool missing)
             HostPrefill(input, indices, scores, weights, gt, dt, limit, device);
             ++checks; continue;
         }
-        if (pattern == 0 && rows <= 32)
+        if (pattern == 0)
             Check(!FastllmCudaV41GGUFGraphReady(weights[2], rows, topk), "unwarmed decode shape admitted");
         const bool accepted = FastllmCudaMergeMOEV41GGUFResident(input, gate, activation, workspace, output,
             weights.data(), weights.size(), indices, scores, 0.f, limit);
@@ -929,7 +929,7 @@ static int Case(int gt, int dt, int hidden, int inter, int device, bool missing)
             continue;
         }
         Check(accepted, "resident dispatch rejected fixture");
-        if (pattern == 0 && rows <= 32) {
+        if (pattern == 0) {
             Check(FastllmCudaV41GGUFGraphReady(weights[2], rows, topk), "warm decode shape not admitted");
             Check(!FastllmCudaV41GGUFGraphReady(weights[2], rows, topk - 1), "unwarmed top-k admitted");
         }
@@ -1007,10 +1007,11 @@ static int Case(int gt, int dt, int hidden, int inter, int device, bool missing)
 #endif
     if (groupedTest)
         Check(!FastllmCudaV41GGUFGraphReady(weights[2], 1, topk), "prefill alone admitted a decode graph");
-    Check(!FastllmCudaV41GGUFGraphReady(weights[2], 33, topk), "large batch admitted to decode graph");
+    Check(!FastllmCudaV41GGUFGraphReady(weights[2], 37, topk), "unwarmed large batch admitted to graph");
     // Retiring a non-key weight must invalidate the whole layer.
     FastllmCudaReleaseMoeGGUFResident(weights[3]);
-    Check(!FastllmCudaV41GGUFGraphReady(weights[2], 1, topk), "retired resident layer admitted to graph");
+    for (int rows : {1, 33, 64, 129})
+        Check(!FastllmCudaV41GGUFGraphReady(weights[2], rows, topk), "retired resident layer admitted to graph");
     return checks;
 }
 

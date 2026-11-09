@@ -7,6 +7,9 @@
 #include <tuple>
 #include <type_traits>
 #include <mutex>
+#include <set>
+#include <thread>
+#include <climits>
 
 #ifdef FASTLLM_USE_MAYA_EXL3
 bool FastllmCudaExl3MayaGrouped(const fastllm::Data &, const fastllm::Data &, fastllm::Data &);
@@ -15,6 +18,7 @@ bool FastllmCudaExl3MayaLinear(const fastllm::Data &, fastllm::Data &, const fas
 bool FastllmCudaExl3MayaMoe(const fastllm::Data &, fastllm::Data &, const fastllm::Data &, const fastllm::Data &, fastllm::Data **, int, float);
 bool FastllmCudaExl3MayaCache(const fastllm::Data &, const uint8_t *, const int32_t *, const uint64_t *, size_t, size_t, int, int, int, const float *, int, float, float *, int, const int32_t *, int, bool);
 void FastllmCudaReleaseExl3Maya(const fastllm::Data *);
+bool FastllmCudaExl3MayaMoeGraphReady(const fastllm::Data *, int, int);
 #endif
 
 #include "fastllm-exl3-shards.cuh"
@@ -229,6 +233,8 @@ struct Exl3Projection {
 };
 struct ExpertDirectory {
     std::vector<Exl3Projection> host;
+    std::vector<const fastllm::Data *> sources;
+    std::set<std::tuple<std::thread::id, int, int>> warmedShapes;
     fastllm::Data device{fastllm::INT8};
 };
 using DirectoryKey = std::pair<const fastllm::Data *, int>;
@@ -331,8 +337,19 @@ void FastllmCudaReleaseExl3(const fastllm::Data *owner) {
     std::lock_guard<std::mutex> lock(DirectoryMutex());
     auto &directories = Directories();
     for (auto it = directories.begin(); it != directories.end(); ) {
-        if (it->first.first == owner) it = directories.erase(it); else ++it;
+        const auto &sources = it->second->sources;
+        if (std::find(sources.begin(), sources.end(), owner) != sources.end()) it = directories.erase(it);
+        else ++it;
     }
+}
+bool FastllmCudaExl3MoeGraphReady(const fastllm::Data *owner, int rows, int topk) {
+#ifdef FASTLLM_USE_MAYA_EXL3
+    if (FastllmCudaExl3MayaMoeGraphReady(owner, rows, topk)) return true;
+#endif
+    std::lock_guard<std::mutex> lock(DirectoryMutex());
+    auto it = Directories().find({owner, FastllmCudaGetDevice()});
+    return it != Directories().end() &&
+        it->second->warmedShapes.count({std::this_thread::get_id(), rows, topk}) != 0;
 }
 bool FastllmCudaExl3Moe(const fastllm::Data &input, fastllm::Data &output,
                         const fastllm::Data &index, const fastllm::Data &score,
@@ -341,16 +358,32 @@ bool FastllmCudaExl3Moe(const fastllm::Data &input, fastllm::Data &output,
     if (FastllmCudaExl3MayaMoe(input, output, index, score, weights, count, limit)) return true;
 #endif
     using namespace fastllm;
-    if (input.dataType != BFLOAT16 || input.dims.size() != 2 || input.dims[0] > 8 || count < 4 ||
-        weights[0] || !weights[2] || weights[2]->dataType != EXL3 || index.dataDevice != DataDevice::CUDA ||
-        score.dataDevice != DataDevice::CUDA || index.dataType != INT32 || score.dataType != FLOAT32) return false;
+    if (input.dataType != BFLOAT16 || input.dims.size() != 2 || input.dims[0] < 1 || count < 4 || count%2 ||
+        weights[0] || !weights[2] || weights[2]->dataType != EXL3 || weights[2]->dims.size()!=2 ||
+        input.dataDevice != DataDevice::CUDA || !input.cudaData ||
+        index.dataDevice != DataDevice::CUDA || score.dataDevice != DataDevice::CUDA ||
+        index.dataType != INT32 || score.dataType != FLOAT32 ||
+        index.dims.size()!=2 || index.dims[0]!=input.dims[0] || score.dims!=index.dims ||
+        !index.cudaData || !score.cudaData ||
+        index.dataDeviceIds!=input.dataDeviceIds || score.dataDeviceIds!=input.dataDeviceIds) return false;
     const int k = input.dims[1], mid = weights[2]->dims[0] / 2, rows = input.dims[0], topk = index.dims.back();
     const int experts = count / 2 - 1, device = FastllmCudaGetDevice();
+    // CUDA grid.y/grid.z capacity, and signed tensor-dimension arithmetic.
+    if (k<128 || mid<128 || k%128 || mid%128 || topk<1 ||
+        int64_t(topk)*2>65535 || (int64_t(k)+255)/256>65535 ||
+        (int64_t(mid)+255)/256>65535) return false;
+    // Preserve the original scratch bound per compute tile, independently of
+    // logical verification/prefill size. All batches enter this tiled path.
+    const int tileCapacity=std::min(8,65535/(topk*2));
+    const int maxTasks=std::min(rows,tileCapacity)*topk;
+    const int gateSplits=(k+255)/256, downSplits=(mid+255)/256;
+    if (int64_t(maxTasks)*2*gateSplits>INT_MAX || int64_t(maxTasks)*downSplits>INT_MAX) return false;
     std::vector<Exl3Projection> descriptors(experts * 3);
     for (int expert = 0; expert < experts; ++expert) {
         Data *gate = weights[2 + expert * 2], *down = weights[3 + expert * 2];
         if (!gate || !down || gate->dataType != EXL3 || down->dataType != EXL3 ||
             !gate->cudaData || !down->cudaData || gate->dims.size() != 2 || down->dims.size() != 2 ||
+            !Exl3BitRateSupported(gate->blockK) || !Exl3BitRateSupported(down->blockK) ||
             gate->dims[0] != 2 * mid || gate->dims[1] != k || down->dims[0] != k || down->dims[1] != mid || gate->blockM != 2 || down->blockM != 1) return false;
         for (int part = 0; part < 3; ++part) {
             Data &weight = part == 2 ? *down : *gate;
@@ -375,38 +408,51 @@ bool FastllmCudaExl3Moe(const fastllm::Data &input, fastllm::Data &output,
             changed = a.trellis != b.trellis || a.inputScale != b.inputScale || a.outputScale != b.outputScale || a.bits != b.bits;
         }
         if (changed) {
+            if (FastllmCudaGraphIsCapturing()) return false;
+            entry->warmedShapes.clear();
+            entry->sources.assign(weights+2, weights+count);
             entry->host = std::move(descriptors);
             entry->device.dataDevice = DataDevice::CUDA; entry->device.dataDeviceIds = {device};
             entry->device.Resize({int(entry->host.size() * sizeof(Exl3Projection))}); entry->device.Allocate(false);
             FastllmCudaCopyFromHostToDevice(entry->device.cudaData, entry->host.data(), entry->device.GetBytes());
         }
+        if (FastllmCudaGraphIsCapturing() &&
+            !entry->warmedShapes.count({std::this_thread::get_id(), rows, topk})) return false;
     }
     using Key = std::tuple<int,int,int,int,int>;
     static thread_local std::map<Key, std::unique_ptr<MoeWorkspace>> workspaces;
-    auto &owned = workspaces[{device,k,mid,rows,topk}];
-    if (!owned) owned.reset(new MoeWorkspace(device));
-    auto &work = *owned;
-    const int tasks = rows * topk, gateSplits = (k + 255) / 256, downSplits = (mid + 255) / 256;
-    work.input.Resize({tasks * 2, k}); work.input.Allocate(false);
-    work.gate.Resize({tasks * 2 * gateSplits, mid}); work.gate.Allocate(false);
-    work.down.Resize({tasks, mid}); work.down.Allocate(false);
-    work.result.Resize({tasks * downSplits, k}); work.result.Allocate(false);
     if (output.dataType != FLOAT32) { output.FreeSpace(); output.dataType = FLOAT32; }
     output.Resize({rows,k}); output.ToDevice(DataDevice::CUDA, {device}, false); output.Allocate(false);
     const auto *table = static_cast<const Exl3Projection *>(directory->device.cudaData);
-    const auto *routes = static_cast<const int *>(index.cudaData);
     const auto stream = cudaStreamPerThread;
-    MoePrepare<<<dim3(k / 128, topk * 2, rows),128,0,stream>>>(input.cudaData, input.dataType, routes, table,
-        static_cast<float *>(work.input.cudaData),k,topk);
-    MoeProduct<<<dim3(mid / 128, gateSplits, tasks * 2),128,0,stream>>>(static_cast<float *>(work.input.cudaData),
-        routes,table,static_cast<float *>(work.gate.cudaData),k,mid,topk,gateSplits,false);
-    MoeGateAndPrepareDown<<<dim3(mid / 128,tasks),128,0,stream>>>(static_cast<float *>(work.gate.cudaData),routes,table,
-        static_cast<float *>(work.down.cudaData),mid,gateSplits,limit);
-    MoeProduct<<<dim3(k / 128,downSplits,tasks),128,0,stream>>>(static_cast<float *>(work.down.cudaData),routes,table,
-        static_cast<float *>(work.result.cudaData),mid,k,topk,downSplits,true);
-    MoeFinish<<<dim3(k / 128,rows),128,0,stream>>>(static_cast<float *>(work.result.cudaData),routes,
-        static_cast<const float *>(score.cudaData),table,static_cast<float *>(output.cudaData),k,topk,downSplits);
+    for (int first=0; first<rows; first+=tileCapacity) {
+        const int tileRows=std::min(tileCapacity,rows-first), tasks=tileRows*topk;
+        auto &owned = workspaces[{device,k,mid,tileRows,topk}];
+        if (!owned) owned.reset(new MoeWorkspace(device));
+        auto &work = *owned;
+        work.input.Resize({tasks * 2, k}); work.input.Allocate(false);
+        work.gate.Resize({tasks * 2 * gateSplits, mid}); work.gate.Allocate(false);
+        work.down.Resize({tasks, mid}); work.down.Allocate(false);
+        work.result.Resize({tasks * downSplits, k}); work.result.Allocate(false);
+        const auto *routes = static_cast<const int *>(index.cudaData)+size_t(first)*topk;
+        const auto *x = static_cast<const uint16_t *>(input.cudaData)+size_t(first)*k;
+        MoePrepare<<<dim3(k / 128, topk * 2, tileRows),128,0,stream>>>(x, input.dataType, routes, table,
+            static_cast<float *>(work.input.cudaData),k,topk);
+        MoeProduct<<<dim3(mid / 128, gateSplits, tasks * 2),128,0,stream>>>(static_cast<float *>(work.input.cudaData),
+            routes,table,static_cast<float *>(work.gate.cudaData),k,mid,topk,gateSplits,false);
+        MoeGateAndPrepareDown<<<dim3(mid / 128,tasks),128,0,stream>>>(static_cast<float *>(work.gate.cudaData),routes,table,
+            static_cast<float *>(work.down.cudaData),mid,gateSplits,limit);
+        MoeProduct<<<dim3(k / 128,downSplits,tasks),128,0,stream>>>(static_cast<float *>(work.down.cudaData),routes,table,
+            static_cast<float *>(work.result.cudaData),mid,k,topk,downSplits,true);
+        MoeFinish<<<dim3(k / 128,tileRows),128,0,stream>>>(static_cast<float *>(work.result.cudaData),routes,
+            static_cast<const float *>(score.cudaData)+size_t(first)*topk,table,
+            static_cast<float *>(output.cudaData)+size_t(first)*k,k,topk,downSplits);
+    }
     AssertInFastLLM(cudaGetLastError() == cudaSuccess, "EXL3: indexed MoE launch failed.");
+    if (!FastllmCudaGraphIsCapturing()) {
+        std::lock_guard<std::mutex> lock(DirectoryMutex());
+        directory->warmedShapes.emplace(std::this_thread::get_id(), rows, topk);
+    }
     return true;
 }
 

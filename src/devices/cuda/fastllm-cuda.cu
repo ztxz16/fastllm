@@ -325,6 +325,7 @@ bool FastllmCudaV41MoeGraphReady(const fastllm::Data *key, int rows, int topk,
 #ifndef USE_ROCM
     if (!key || rows <= 0 || topk <= 0) return false;
     return FastllmCudaV41GGUFGraphReady(key, rows, topk) ||
+        FastllmCudaExl3MoeGraphReady(key, rows, topk) ||
         (topk <= 16 && FastllmCudaV41MarlinGraphReady(key, rows, prequantizedInput));
 #else
     return false;

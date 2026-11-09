@@ -2452,6 +2452,7 @@ bool FastllmCudaV41MarlinGraphReady(const fastllm::Data *layerKey, int rows,
         const fastllm::Data *prequantizedInput = nullptr);
 // Resident backend admission, independent of checkpoint bit width. Unknown
 // backends and CPU routing fallbacks must not enter a GPU MoE graph.
+bool FastllmCudaExl3MoeGraphReady(const fastllm::Data *key, int rows, int topk);
 bool FastllmCudaV41MoeGraphReady(const fastllm::Data *layerKey, int rows, int topk,
         const fastllm::Data *prequantizedInput = nullptr);
 #ifdef FASTLLM_ENABLE_DSV4_MOE_DEEPGEMM_SM120
