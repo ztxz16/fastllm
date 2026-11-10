@@ -307,7 +307,7 @@ struct NativeMoeMailbox {
             if (layout.weightType == fastllm::DATA_GGUF_FORMAT) {
                 const size_t bytes = standard ? FastllmCudaMoeGGUFCacheBatchWorkspaceBytes(hidden, layout.inter, rows, topk) :
                     FastllmCudaV41CanonicalGGUFCacheWorkspaceBytes(hidden, layout.inter, rows, topk);
-                if (!bytes) return false;
+                if (!bytes || bytes>INT_MAX) return false;
                 // Resident and staged branches execute concurrently. Neither
                 // quantization scratch nor activation storage may alias.
                 for (int branch = 0; branch < 2; ++branch) {
@@ -815,6 +815,43 @@ struct NativeMoeMailbox {
         w.pointers = {input.cudaData, index.cudaData, score.cudaData, output.cudaData};
         return true;
     }
+    void WarmupGGUF(Layer &w,const OffloadLayout &layout) {
+        if (!w.standard || layout.weightType!=fastllm::DATA_GGUF_FORMAT || w.rows<2) return;
+        FastllmCudaMoeGGUFCacheView view{cache.records,w.slots,layout.recordStride,layout.downOffset,
+            layout.gateGgmlType,layout.downGgmlType,w.hidden,layout.inter,
+            w.compute->ggufWorkspace[0].cudaData,size_t(w.compute->ggufWorkspace[0].GetBytes()),cache.slotOffsets};
+        SetStandardGGUFLayout(group,w.table,view);view.exactSubwarp=group.qwen38FlashNext;
+        auto &input=w.compute->quantized;
+        if (!FastllmCudaMoeGGUFCacheNeedsPreparation(input,view,w.topk)) return;
+        // Benchmark only committed records of this layer: mixed-format GGUF
+        // layers can share a cache but not each other's byte interpretation.
+        WaitCacheAdmission(cache);
+        std::vector<int> keys(cache.slots),available;
+        fastllm::kernels::CudaCheck(cudaMemcpyAsync(keys.data(),cache.slotKeys,keys.size()*sizeof(int),
+            cudaMemcpyDeviceToHost,cudaStreamPerThread));
+        fastllm::kernels::CudaCheck(cudaStreamSynchronize(cudaStreamPerThread));
+        for (int i=0;i<cache.slots && available.size()<size_t(w.routes);++i)
+            if (keys[i]>=w.table*layout.experts && keys[i]<(w.table+1)*layout.experts) available.push_back(i);
+        if (available.empty()) return;
+        std::vector<int> slots(w.routes);
+        const int unique=std::min<int>(available.size(),std::max(w.topk,(w.routes+1)/2));
+        for (int i=0;i<w.routes;++i) slots[i]=available[i%unique];
+        std::vector<float> x(size_t(w.rows)*w.hidden),scores(w.routes,1.f/w.topk);
+        for (size_t i=0;i<x.size();++i)x[i]=float(int((i*73)%257)-128)/64;
+        fastllm::Data score(fastllm::FLOAT32,{w.rows,w.topk}),gate,dummy;
+        score.ToDevice(fastllm::CUDA,{cache.device},false);score.Allocate(false);
+        gate.FakeFrom(w.compute->gate,0);gate.Resize({w.routes,layout.inter});
+        auto upload=[&](void *dst,const void *src,size_t bytes) {
+            fastllm::kernels::CudaCheck(cudaMemcpyAsync(dst,src,bytes,cudaMemcpyHostToDevice,cudaStreamPerThread));
+        };
+        upload(input.cudaData,x.data(),x.size()*sizeof(float));
+        upload(w.slots,slots.data(),slots.size()*sizeof(int));
+        upload(score.cudaData,scores.data(),scores.size()*sizeof(float));
+        if (!ComputeGGUFExperts(input,gate,dummy,layout,view,static_cast<float *>(score.cudaData),
+                w.topk,w.compute->partial)) throw std::runtime_error("GGUF kernel warmup rejected");
+        fastllm::kernels::CudaCheck(cudaStreamSynchronize(cudaStreamPerThread));
+    }
+
     Layer *CreateFull(int table, const fastllm::Data &input, const fastllm::Data &index,
             const fastllm::Data &score, fastllm::Data &output, fastllm::Data **weights,
             int weightsBatch, int layer, cudaGraph_t sharedGraph) {
@@ -846,6 +883,7 @@ struct NativeMoeMailbox {
         if (cudaGetDeviceProperties(&prop, cache.device) != cudaSuccess) return nullptr;
         if (layout.weightType == fastllm::NVFP4_BLOCK_32_E8M0) (void)Mxfp4BatchMmaSupported();
         WarmupMxfp4KernelPlan(layout,cache,w.rows,topk);
+        WarmupGGUF(w,layout);
         const auto launch = fastllm::cuda::RecordCopyConfiguration(layout.recordStride, kMaxTopK, prop);
         if (layout.weightType==fastllm::EXL3) {
             if (!PrepareCacheInput(layout,input,w.compute->quantized)) return nullptr;

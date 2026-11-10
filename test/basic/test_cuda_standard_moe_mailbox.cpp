@@ -1,3 +1,4 @@
+#include "utils/kernel_registry.h"
 #include "devices/cuda/fastllm-cuda-moe-prefill.h"
 #include "devices/cuda/cudaworkspace.h"
 #include "utils/hybrid_moe.h"
@@ -199,7 +200,7 @@ static void Run(int gateKind, int downKind, int hidden = 256, int inter = 128, i
     const std::vector<DataType> types = qwenTopk10 ? std::vector<DataType>{FLOAT16}
                                                  : std::vector<DataType>{FLOAT32, FLOAT16, BFLOAT16};
     const std::vector<int> rowCounts = overlapReplay ? std::vector<int>{1, 3} :
-        qwenTopk10 ? std::vector<int>{1, 2, 3, 4, 9, 17} : std::vector<int>{1, 2, 4, 8};
+        qwenTopk10 ? std::vector<int>{1, 2, 3, 4, 9, 17} : std::vector<int>{1, 2, 4, 8, 17, 33, 65};
     for (DataType dtype : types) for (int rows : rowCounts) {
         Data input(dtype, {rows, hidden}), ids[layers], scores[layers], output[layers]; Gpu(input);
         for (int layer = 0; layer < layers; ++layer) {
@@ -378,19 +379,34 @@ int main(int argc, char **argv) {
     try {
         if (!FastllmCudaGetDeviceCount()) return 77;
         SetThreads(4); SetCudaGraph(true);
+        const bool groupedFormats = argc > 1 && std::strcmp(argv[1], "--grouped-formats") == 0;
         const bool largePrefill = argc > 1 && std::strcmp(argv[1], "--large-prefill") == 0;
         const bool workspaceReplay = argc > 1 && std::strcmp(argv[1], "--workspace-replay") == 0;
         const bool overlapReplay = workspaceReplay || (argc > 1 && std::strcmp(argv[1], "--cache-overlap") == 0);
         const bool qwenTopk10 = overlapReplay || (argc > 1 && std::strcmp(argv[1], "--qwen-topk10") == 0);
+        if (groupedFormats || qwenTopk10) {
+            std::string error;
+            Require(kernels::Configure("{\"mode\":\"quick\",\"budget_ms\":60000,\"repeats\":4}",error),
+                "configure grouped kernel validation");
+        }
         const bool modelShape = qwenTopk10 || (argc > 1 && std::strcmp(argv[1], "--model-shape") == 0);
         const bool placementPolicy = argc > 1 && std::strcmp(argv[1], "--placement-policy") == 0;
         if (placementPolicy) setenv("FASTLLM_TEST_PLACEMENT_POLICY", "1", 1);
         const bool ownedPp = argc > 1 && std::strcmp(argv[1], "--owned-pp") == 0;
         Require(!ownedPp || FastllmCudaGetDeviceCount() >= 2, "owned PP test requires two GPUs");
-        const int hidden = modelShape ? 2560 : 256, inter = modelShape ? 640 : largePrefill ? 256 : 128;
+        const int hidden = modelShape ? 2560 : 256, inter = modelShape ? 640 : largePrefill || groupedFormats ? 256 : 128;
+        const std::vector<std::pair<int,int>> formats = groupedFormats
+            ? std::vector<std::pair<int,int>>{{16,20},{17,20},{23,23},{22,42},{21,20},{18,20}}
+            : std::vector<std::pair<int,int>>{{-1,-1},{22,42},{42,42},{21,20},{18,20}};
         for (int device = 0; device < (ownedPp ? 2 : 1); ++device)
-            for (auto pair : {std::pair<int,int>{-1,-1},{22,42},{42,42},{21,20},{18,20}})
-                Run(pair.first,pair.second,hidden,inter,placementPolicy || largePrefill ? 1 : overlapReplay ? 12 : modelShape || ownedPp ? 4 : 40,ownedPp,device,qwenTopk10,overlapReplay,workspaceReplay,largePrefill);
+            for (auto pair : formats)
+                Run(pair.first,pair.second,hidden,inter,placementPolicy || largePrefill ? 1 : overlapReplay ? 12 : modelShape || ownedPp || groupedFormats ? 4 : 40,ownedPp,device,qwenTopk10,overlapReplay,workspaceReplay,largePrefill);
+        if (groupedFormats || qwenTopk10) {
+            const auto report=kernels::Report();
+            Require(report.find("cuda.moe.gguf.grouped")!=std::string::npos,"grouped candidates registered");
+            Require(report.find("relative_l2")!=std::string::npos,"grouped candidates validated");
+            std::printf("KERNEL_POLICY %s\n",report.c_str());
+        }
         std::puts("ALL_PASS"); return 0;
     } catch (const std::exception &e) { std::fprintf(stderr,"FAIL: %s\n",e.what()); return 1; }
 }

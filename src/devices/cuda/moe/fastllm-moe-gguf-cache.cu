@@ -11,6 +11,14 @@
 #include "fastllm-moe-gguf-common.cuh"
 #include "../gguf_mmq/fastllm-gguf-moe-glm5.h"
 #include "fastllm-moe-gguf-q8.cuh"
+#include "fastllm-moe-route-groups.cuh"
+#include "devices/cuda/fastllm-kernel-benchmark.cuh"
+namespace iq2_decode {
+using gguf_cache_q8::get_int_b2;
+using gguf_cache_q8::get_int_b4;
+using gguf_cache_q8::ggml_cuda_dp4a;
+}
+#include "../fastllm-gguf-iq2-dot.cuh"
 #include "fastllm-moe-deepseekv41-cache.cuh"
 #include "fastllm-moe-v41-q8.cuh"
 #include "fastllm-cuda-v41-gguf.h"
@@ -21,6 +29,7 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -37,28 +46,26 @@ namespace {
 #define GGUF_CACHE_Q8_DECODE_TYPES(M) M(IQ3_XXS) M(IQ3_S) M(IQ4_NL) M(IQ4_XS)
 #define GGUF_CACHE_Q8_TYPES(M) GGUF_CACHE_Q8_LEGACY_TYPES(M) GGUF_CACHE_Q8_DECODE_TYPES(M)
 
-bool Q8TypeSupported(int type, bool legacy) {
+bool Q8TypeSupported(int type) {
     switch (static_cast<ggml_type>(type)) {
 #define Q8_SUPPORTED(name) case GGML_TYPE_##name:
-        GGUF_CACHE_Q8_LEGACY_TYPES(Q8_SUPPORTED)
+        GGUF_CACHE_Q8_TYPES(Q8_SUPPORTED)
             return true;
-        GGUF_CACHE_Q8_DECODE_TYPES(Q8_SUPPORTED)
-            return !legacy;
 #undef Q8_SUPPORTED
         default: return false;
     }
 }
 
 // Bits 0/1 select Q8 gate/up and down independently for decode/verifier rows.
-// Keep the existing large-batch dispatch; resident prefill uses grouped MMQ.
+// Keep verifier arithmetic independent of row count; resident prefill uses grouped MMQ.
 // A verifier row must use the same arithmetic as single-token decode.
 int Q8Stages(int gateType, int downType, int hidden, int inter, int rows) {
     if (rows <= 0 || !FastllmCudaMoeGGUFCacheWorkspaceBytes(hidden, inter) ||
         !FastllmCudaMoeGGUFCacheSupported(gateType, hidden) ||
         !FastllmCudaMoeGGUFCacheSupported(downType, inter)) return 0;
-    const bool gate = Q8TypeSupported(gateType, rows > 32);
-    const bool down = Q8TypeSupported(downType, rows > 32);
-    return rows <= 32 ? int(gate) | (int(down) << 1) : (gate && down ? 3 : 0);
+    const bool gate = Q8TypeSupported(gateType);
+    const bool down = Q8TypeSupported(downType);
+    return int(gate) | (int(down) << 1);
 }
 
 int NumaOrdinary(int type) {
@@ -126,9 +133,9 @@ __device__ __forceinline__ bool ActiveRoute(const View &view, int route) {
 }
 
 template<bool IsGate, class View>
-__device__ __forceinline__ int NumaType(const View &) { return -1; }
+__host__ __device__ __forceinline__ int NumaType(const View &) { return -1; }
 template<bool IsGate>
-__device__ __forceinline__ int NumaType(const FastllmCudaMoeGGUFCacheView &view) {
+__host__ __device__ __forceinline__ int NumaType(const FastllmCudaMoeGGUFCacheView &view) {
     return IsGate ? view.numaGateType : view.numaDownType;
 }
 
@@ -419,14 +426,62 @@ __global__ void Down(const T *gateOutput, T *output, View view,
     }
 }
 
+#include "fastllm-moe-gguf-batch.cuh"
+
+bool GroupedIQType(int type) {
+    return type==GGML_TYPE_IQ2_XXS || type==GGML_TYPE_IQ2_XS || type==GGML_TYPE_IQ2_S ||
+        type==GGML_TYPE_IQ3_XXS || type==GGML_TYPE_IQ3_S || type==GGML_TYPE_IQ4_NL || type==GGML_TYPE_IQ4_XS;
+}
+const fastllm::kernels::Family ggufBatchFamily{5,"moe.gguf.gate_swiglu_down",__DATE__ " " __TIME__,{
+    {"cuda.moe.gguf.q8",json11::Json::object{{"backend","cuda"},{"description","Existing Q8_1 expert projections"},{"graph",true}}},
+    {"cuda.moe.gguf.grouped",json11::Json::object{{"backend","cuda"},{"description","Full-batch IQ decoded-weight reuse"},
+        {"formats","IQ2_XXS/XS/S, IQ3_XXS/S, IQ4_NL/XS"},{"route_tile",2},{"row_limit","tensor indexing capacity"},{"graph",true}}},
+    {"cuda.moe.gguf.grouped_shared",json11::Json::object{{"backend","cuda"},{"description","Grouped IQ with shared activation staging"},
+        {"formats","IQ2_XXS/XS/S, IQ3_XXS/S, IQ4_NL/XS"},{"route_tile",2},{"row_limit","tensor indexing capacity"},
+        {"shared_memory","device capacity checked; global input fallback"},{"graph",true}}}
+}};
+const bool ggufBatchRegistered=[] {fastllm::kernels::Register(&ggufBatchFamily);return true;}();
+template<typename View>
+fastllm::kernels::Signature GGUFSignature(const fastllm::Data &input,const View &view,int topk) {
+    const int layout=int(input.dataType) | (ExactSubwarpEnabled(view)?1<<16:0) |
+        (std::is_same<View, FastllmCudaMoeGGUFCacheView>::value ? (1 << 17) : 0);
+    return {{5,FastllmCudaGetDevice(),FastllmCudaRuntimeArch(),input.dims[0],view.hidden,view.inter,topk,
+        view.gateType,view.downType,NumaType<true>(view),NumaType<false>(view),layout}};
+}
+template<typename T,typename View>
+bool Compute(const fastllm::Data &,fastllm::Data &,fastllm::Data &,const View &,const float *,int,float * = nullptr,
+    bool = false,const FastllmCudaMoeStageEvents * = nullptr,int = -1);
+template<typename T,typename View>
+struct GGUFKernelContext {
+    const fastllm::Data &input;fastllm::Data &gate,&output;const View &view;
+    const float *scores;int topk;float *partial;bool prepared;const FastllmCudaMoeStageEvents *events;
+    static bool Run(void *opaque,int implementation) {
+        auto &c=*static_cast<GGUFKernelContext *>(opaque);
+        return Compute<T>(c.input,c.gate,c.output,c.view,c.scores,c.topk,c.partial,c.prepared,c.events,implementation);
+    }
+    static std::string Unsupported(void *,int) {return "";}
+};
+
 template<typename T, typename View>
 bool Compute(const fastllm::Data &input, fastllm::Data &gate, fastllm::Data &output,
-             const View &view, const float *scores, int topk, float *perExpert = nullptr,
-             bool q8InputPrepared = false, const FastllmCudaMoeStageEvents *events = nullptr) {
+             const View &view, const float *scores, int topk, float *perExpert,
+             bool q8InputPrepared, const FastllmCudaMoeStageEvents *events,
+             int implementation) {
     const int rows = input.dims[0], routes = ActiveRoutes(view, rows * topk);
     const int stages = view.workspace && view.workspaceBytes >= Q8WorkspaceBytes(rows, view.hidden, view.inter, topk)
         ? Q8Stages(view.gateType, view.downType, view.hidden, view.inter, rows) : 0;
     if (!NumaStagesSupported(view, stages)) return false;
+    const bool candidate = rows>1 && perExpert && routes==rows*topk && stages &&
+        (GroupedIQType(view.gateType)||GroupedIQType(view.downType));
+    if (implementation<0 && candidate && fastllm::kernels::Enabled()) {
+        GGUFKernelContext<T,View> context{input,gate,output,view,scores,topk,perExpert,q8InputPrepared,events};
+        fastllm::kernels::CudaCase benchmark{&context,GGUFKernelContext<T,View>::Run,GGUFKernelContext<T,View>::Unsupported,
+            perExpert,size_t(routes)*view.hidden,false};
+        const int selected=fastllm::kernels::SelectCuda(ggufBatchFamily,GGUFSignature(input,view,topk),benchmark);
+        if (selected>=0) {fastllm::kernels::Bypass bypass;return fastllm::kernels::LaunchCuda(ggufBatchFamily,benchmark,selected);}
+    }
+    // Unmeasured, disabled and graph-cold signatures retain the reference.
+    const bool grouped=implementation>0;
     const block_q8_1 *qInput = nullptr;
     block_q8_1 *qGate = nullptr;
     float *partial = perExpert;
@@ -436,12 +491,15 @@ bool Compute(const fastllm::Data &input, fastllm::Data &gate, fastllm::Data &out
         if (!partial)
             partial = reinterpret_cast<float *>(reinterpret_cast<uint8_t *>(qGate) + Q8Bytes(routes, view.inter));
     }
+    bool groupedGate = false;
     const auto gateType = static_cast<ggml_type>(view.gateType);
     const auto downType = static_cast<ggml_type>(view.downType);
     if (stages & 1) {
         if (!q8InputPrepared && !PreparedQ8Input(view))
             QuantizeQ8<<<dim3((view.hidden+255)/256, rows), 256, 0, cudaStreamPerThread>>>(
                 static_cast<const T *>(input.cudaData), static_cast<block_q8_1 *>(view.workspace), view.hidden);
+        groupedGate = grouped && TryGGUFGroupedProjection<true>(qInput, static_cast<T *>(gate.cudaData), partial, view, rows, topk, routes, false, implementation==2);
+        if (!groupedGate)
         switch (gateType) {
 #define Q8_GATE(name) case GGML_TYPE_##name: \
             LaunchQ8Gate<GGML_TYPE_##name>(qInput, static_cast<T *>(gate.cudaData), \
@@ -468,6 +526,7 @@ bool Compute(const fastllm::Data &input, fastllm::Data &gate, fastllm::Data &out
     // during the remaining DMA, and keep its wait out of scheduler timings.
     if (events && !FastllmMoeWaitDown(*events)) return false;
     if (stages & 2) {
+        if (!grouped || !TryGGUFGroupedProjection<false>(qGate, static_cast<T *>(gate.cudaData), partial, view, rows, topk, routes, groupedGate, implementation==2))
         switch (downType) {
 #define Q8_DOWN(name) case GGML_TYPE_##name: \
             LaunchQ8Down<GGML_TYPE_##name>(qGate, static_cast<T *>(gate.cudaData), \
@@ -634,7 +693,15 @@ size_t FastllmCudaMoeGGUFCacheWorkspaceBytes(int hidden, int inter) {
 size_t FastllmCudaMoeGGUFCacheBatchWorkspaceBytes(int hidden, int inter, int rows, int topk) {
     if (rows <= 0 || topk <= 0 || topk > 32 || rows > INT_MAX / topk ||
         !FastllmCudaMoeGGUFCacheWorkspaceBytes(hidden, inter)) return 0;
-    return Q8WorkspaceBytes(rows, hidden, inter, topk);
+    const size_t base = (Q8WorkspaceBytes(rows, hidden, inter, topk) + 255) & ~size_t(255);
+    return base + fastllm::moe_routes::Plan::WorkspaceBytes(rows * topk);
+}
+
+bool FastllmCudaMoeGGUFCacheNeedsPreparation(const fastllm::Data &input,
+        const FastllmCudaMoeGGUFCacheView &view,int topk) {
+    return fastllm::kernels::Enabled() && input.dims.size()==2 && input.dims[0]>1 &&
+        (GroupedIQType(view.gateType)||GroupedIQType(view.downType)) &&
+        fastllm::kernels::NeedsPreparation(GGUFSignature(input,view,topk));
 }
 
 bool FastllmCudaMoeGGUFPrepareQ8Input(const fastllm::Data &input, void *destination, size_t bytes) {

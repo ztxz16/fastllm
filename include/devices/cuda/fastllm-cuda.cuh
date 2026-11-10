@@ -2098,6 +2098,8 @@ struct FastllmCudaMoeGGUFCacheView {
     const void *preparedQ8Input = nullptr;
     bool exactSubwarp = false; // Qwen verification; other callers retain warp kernels.
 };
+bool FastllmCudaMoeGGUFCacheNeedsPreparation(const fastllm::Data &input,
+    const FastllmCudaMoeGGUFCacheView &view, int topk);
 bool FastllmCudaMoeGGUFPrepareQ8Input(const fastllm::Data &input, void *destination, size_t bytes);
 bool FastllmCudaMoeGGUFCacheSupported(int type, int columns);
 bool FastllmCudaMoeGGUFCacheNumaSupported(int gateType, int downType,
