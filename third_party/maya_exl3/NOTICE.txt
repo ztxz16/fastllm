@@ -82,3 +82,13 @@ upstream hashes and both MIT license files above remain unchanged.
 - Fastllm's adapter groups repeated expert pointers on the GPU and reuses the
   ordinary hybrid scheduler for verifier and draft rows. No new upstream code
   is imported; both MIT licenses and the pinned import hashes are retained.
+
+2026-11-10 runtime-policy cleanup (Fastllm local changes):
+- Remove imported EXL3/Maya/Strata environment overrides. CUDA and unused HIP
+  branches retain their previous unset-environment defaults and hardware guards.
+- Operator selection belongs to Fastllm's registry/policy. Builds without the
+  imported kernels retain the independent portable implementation.
+- Extend ordinary/shared/grouped projection tiling to arbitrary logical rows;
+  no upstream arithmetic kernel is copied or rewritten by this adapter change.
+The pinned import revision and original file hashes remain historical provenance;
+these local changes do not imply an unmodified upstream source or a new import.
