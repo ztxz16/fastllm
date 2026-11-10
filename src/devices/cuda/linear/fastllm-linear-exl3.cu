@@ -10,6 +10,7 @@
 #include <set>
 #include <thread>
 #include <climits>
+#include "devices/cuda/fastllm-kernel-benchmark.cuh"
 
 #ifdef FASTLLM_USE_MAYA_EXL3
 bool FastllmCudaExl3MayaGrouped(const fastllm::Data &, const fastllm::Data &, fastllm::Data &);
@@ -145,7 +146,7 @@ struct Workspace {
 };
 }
 
-static bool Exl3LinearStrided(const fastllm::Data &input, fastllm::Data &weight,
+static bool Exl3LinearStrided(const fastllm::Data &input, const fastllm::Data &weight,
                               const fastllm::Data &bias, fastllm::Data &output,
                               int inputStride, int outputStride) {
     using namespace fastllm;
@@ -206,6 +207,111 @@ static bool Exl3LinearStrided(const fastllm::Data &input, fastllm::Data &weight,
     AssertInFastLLM(cudaGetLastError() == cudaSuccess, "EXL3: CUDA kernel launch failed.");
     return true;
 }
+
+// This remains the portable implementation and the benchmark alternative for
+// prefill. Both candidates consume the same format, strides and rounding rules.
+bool FastllmCudaExl3ProjectionFallback(const fastllm::Data &input, const fastllm::Data &weight,
+                                     const fastllm::Data &bias, fastllm::Data &output, bool grouped) {
+    using namespace fastllm;
+    if (!grouped) return Exl3LinearStrided(input,weight,bias,output,weight.dims[1],weight.dims[0]);
+    const int groups=weight.dims[0], n=weight.dims[1], k=weight.dims[2];
+    const int rows=input.Count(0)/(groups*k);
+    Data empty;
+    // The row stride is known from the grouped layout. Read and write each
+    // slice in place, avoiding a gather/scatter pair for every prefill group.
+    for (int g = 0; g < groups; ++g) {
+        Data w, x, y;
+        w.FakeFrom(weight, size_t(g) * Exl3PartBytes(n,k,weight.blockK));
+        w.blockK = weight.blockK; w.blockM = 1; w.Resize({n,k});
+        x.FakeFrom(input, size_t(g) * k * input.unitSize); x.Resize({rows,k});
+        y.FakeFrom(output, size_t(g) * n * output.unitSize); y.Resize({rows,n});
+        if (!Exl3LinearStrided(x,w,empty,y,groups*k,groups*n)) return false;
+    }
+    return cudaGetLastError() == cudaSuccess;
+}
+
+#ifdef FASTLLM_USE_MAYA_EXL3
+namespace {
+const fastllm::kernels::Family exl3ProjectionFamily{4,"linear.exl3",__DATE__ " " __TIME__,{
+    {"cuda.exl3.tiles",json11::Json::object{{"backend","cuda"},{"description","Compressed EXL3 projections tiled over arbitrary logical rows; shared-input jobs may fuse"},{"format","EXL3 -> FP32/FP16/BF16"},{"graph",true},{"sm","existing Maya/ExLlama and legacy dispatch"}}},
+    {"cuda.exl3.expand_gemm",json11::Json::object{{"backend","cuda"},{"description","Bounded weight expansion plus cuBLAS; portable prefill alternative"},{"format","EXL3 -> FP32/FP16/BF16"},{"graph",true}}}
+}};
+const bool exl3ProjectionRegistered=[] {fastllm::kernels::Register(&exl3ProjectionFamily);return true;}();
+struct ProjectionCase {
+    const fastllm::Data &input, &weight, &bias;
+    fastllm::Data &output;
+    bool grouped;
+    static bool Run(void *opaque,int impl) {
+        auto &c=*static_cast<ProjectionCase *>(opaque);
+        if (impl==1) return FastllmCudaExl3ProjectionFallback(c.input,c.weight,c.bias,c.output,c.grouped);
+        if (c.grouped) return FastllmCudaExl3MayaGrouped(c.input,c.weight,c.output);
+        // The existing ordinary interface does not modify the weight.
+        return FastllmCudaExl3MayaLinear(c.input,const_cast<fastllm::Data &>(c.weight),c.bias,c.output);
+    }
+    static std::string Unsupported(void *,int) {return "";}
+    static bool Validate(void *opaque,int impl,double &l2,std::string &reason) {
+        auto &c=*static_cast<ProjectionCase *>(opaque);
+        using namespace fastllm;
+        using fastllm::kernels::CudaCheck;
+        const size_t bytes=c.output.GetBytes(), elements=c.output.Count(0);
+        std::vector<unsigned char> saved(bytes),reference(bytes),actual(bytes);
+        auto copy=[&](std::vector<unsigned char> &v,cudaMemcpyKind kind) {
+            void *dst=kind==cudaMemcpyDeviceToHost?static_cast<void *>(v.data()):c.output.cudaData;
+            const void *src=kind==cudaMemcpyDeviceToHost?c.output.cudaData:static_cast<const void *>(v.data());
+            CudaCheck(cudaMemcpyAsync(dst,src,bytes,kind,cudaStreamPerThread));
+            CudaCheck(cudaStreamSynchronize(cudaStreamPerThread));
+        };
+        copy(saved,cudaMemcpyDeviceToHost);
+        bool ok=false;
+        try {
+            ok=Run(opaque,0); if(ok)copy(reference,cudaMemcpyDeviceToHost);
+            if(ok)ok=Run(opaque,impl); if(ok)copy(actual,cudaMemcpyDeviceToHost);
+        } catch(...) {copy(saved,cudaMemcpyHostToDevice);throw;}
+        copy(saved,cudaMemcpyHostToDevice);
+        if(!ok){reason="projection execution rejected";return false;}
+        auto value=[&](const std::vector<unsigned char> &v,size_t i) {
+            float x;
+            if(c.output.dataType==FLOAT32)std::memcpy(&x,v.data()+4*i,4);
+            else {uint16_t h;std::memcpy(&h,v.data()+2*i,2);
+                if(c.output.dataType==FLOAT16)x=__half2float(__ushort_as_half(h));
+                else {uint32_t u=uint32_t(h)<<16;std::memcpy(&x,&u,4);}}
+            return double(x);
+        };
+        double sum=0,error=0;
+        for(size_t i=0;i<elements;++i){double x=value(reference,i),y=value(actual,i);
+            if(!std::isfinite(x)||!std::isfinite(y)){reason="non-finite output";return false;}
+            sum+=x*x;error+=(x-y)*(x-y);
+        }
+        l2=sum>0?std::sqrt(error/sum):std::sqrt(error);return true;
+    }
+};
+}
+
+int FastllmCudaExl3SelectProjection(const fastllm::Data &input,const fastllm::Data &weight,
+                                  const fastllm::Data &bias,fastllm::Data &output,bool grouped,bool preferExpansion) {
+    using namespace fastllm::kernels;
+    // Reference trials always run the compressed candidate. Normal untuned
+    // calls use the same deterministic default as budget/freeze/capture misses.
+    if(bypassDepth)return 0;
+    if(!Enabled())return preferExpansion?1:0;
+    const int k=weight.dims.back(), groups=grouped?weight.dims[0]:1;
+    const int rows=input.Count(0)/(groups*k);
+    ProjectionCase context{input,weight,bias,output,grouped};
+    Signature signature{{4,FastllmCudaGetDevice(),FastllmCudaRuntimeArch(),rows,k,
+        grouped?weight.dims[1]:weight.dims[0],weight.blockM,weight.blockK,
+        input.dataType,output.dataType,!bias.dims.empty(),grouped?groups:0}};
+    CudaCase timing{&context,ProjectionCase::Run,ProjectionCase::Unsupported,nullptr,0,false};
+    // FP16 and BF16 are distinct output formats. Keep validation in this adapter
+    // rather than interpreting both as BF16 in the common timing helper.
+    Call call{&exl3ProjectionFamily,signature,&timing,FastllmCudaGraphIsCapturingFast(),
+        CudaUnsupported,CudaMeasure,
+        [](void *p,int impl,double &l2,std::string &reason) {
+            return ProjectionCase::Validate(static_cast<CudaCase *>(p)->context,impl,l2,reason);
+        },CudaHardware,preferExpansion?1:0};
+    const int selected=Select(call);
+    return selected<0?(preferExpansion?1:0):selected;
+}
+#endif
 
 bool FastllmCudaExl3LinearShared(const fastllm::Data &input, fastllm::Data *const *weights,
                                fastllm::Data *const *outputs, int count) {
@@ -538,18 +644,7 @@ bool FastllmCudaExl3Grouped(const fastllm::Data &input, const fastllm::Data &wei
 #ifdef FASTLLM_USE_MAYA_EXL3
     if (FastllmCudaExl3MayaGrouped(input, weight, output)) return true;
 #endif
-    Data empty;
-    // The row stride is known from the grouped layout. Read and write each
-    // slice in place, avoiding a gather/scatter pair for every prefill group.
-    for (int g = 0; g < groups; ++g) {
-        Data w, x, y;
-        w.FakeFrom(weight, size_t(g) * Exl3PartBytes(n,k,weight.blockK));
-        w.blockK = weight.blockK; w.blockM = 1; w.Resize({n,k});
-        x.FakeFrom(input, size_t(g) * k * input.unitSize); x.Resize({rows,k});
-        y.FakeFrom(output, size_t(g) * n * output.unitSize); y.Resize({rows,n});
-        if (!Exl3LinearStrided(x,w,empty,y,groups*k,groups*n)) return false;
-    }
-    return cudaGetLastError() == cudaSuccess;
+    return FastllmCudaExl3ProjectionFallback(input,weight,Data(),output,true);
 }
 
 void FastllmCudaRestoreExl3Weight(const fastllm::Data &weight, void *destination, void *stream) {

@@ -65,7 +65,7 @@ static void Case(int rows, DataType type, int k, const std::vector<int> &widths,
     auto separate = [&] { for (int i = 0; i < count; ++i) Require(FastllmCudaExl3Linear(i < 2 ? input : input32,*weights[i],Data(),*ref[i]),"ordinary EXL3 linear"); };
     auto grouped = [&] {
         bool accepted = FastllmCudaLinearShared(input,weights.data(),outputs.data(),count);
-        Require(accepted == (!portable && rows <= 32),"shared dispatch capability");
+        Require(accepted == !portable,"shared dispatch capability");
         if (!accepted) for (int i = 0; i < count; ++i)
             Require(FastllmCudaExl3Linear(input,*weights[i],Data(),*outputs[i]),"portable fallback");
     };
@@ -129,18 +129,17 @@ int main(int argc,char **argv) {
     // Test expectation for a library built without the imported CUDA kernels.
     bool portable=argc>1 && std::string(argv[1])=="--portable";
     SetThreads(32); int cases=0;
-    for (auto t : {FLOAT32,FLOAT16,BFLOAT16}) for (int n : {1,3,5,6,8,9,12,15,16,17,24,31,32,33,63,64}) {
-        if (portable && n > 8) continue;
+    for (auto t : {FLOAT32,FLOAT16,BFLOAT16}) for (int n : {1,3,5,6,8,9,12,15,16,17,24,31,32,33,48,63,64,65,97,129}) {
         Case(n,t,256,{256,128,256,128},{10,10,10,10},false,portable); ++cases;
         if (!portable) { Case(n,t,256,{256,128,256},{8,10,12},true,false); ++cases; }
     }
     if (!portable) {
         for (int b : {2,3,4,5,6,7,8,10,12,14,16}) { Case(3,BFLOAT16,256,{128,256},{b,b},false,false);++cases; }
-        for (int n : {1,5,6,9,12,17,24,32,33,64}) for (int jobs : {2,4}) {
+        for (int n : {1,5,6,9,12,17,24,32,33,48,64,65,97,129}) for (int jobs : {2,4}) {
             std::vector<int> ns{1280,512};if(jobs==4){ns.push_back(512);ns.push_back(512);}
             Case(n,BFLOAT16,5120,ns,std::vector<int>(jobs,10),false,false);++cases;
         }
     }
-    if(!portable)for(int rows:{3,9,17,24,31,32,33,63})for(auto type:{FLOAT32,FLOAT16,BFLOAT16}){GroupedCase(rows,type);++cases;}
+    for(int rows:{3,9,17,24,31,32,33,48,63,65,97,129})for(auto type:{FLOAT32,FLOAT16,BFLOAT16}){GroupedCase(rows,type);++cases;}
     printf("PASS shared projections: %d cases, max relative L2 separate=%.9f CPU=%.9f, portable=%d\n",cases,maxSeparate,maxCpu,int(portable));
 }
