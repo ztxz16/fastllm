@@ -1462,7 +1462,7 @@ class NativeQwenMtpEmbeddingTest(unittest.TestCase):
 
 
 class HybridDispatchPolicyTest(unittest.TestCase):
-    def test_unmeasured_backends_and_shapes_keep_existing_policy(self):
+    def test_hybrid_graph_dispatch_uses_single_device_capabilities(self):
         g=memory.Geometry("qwen4",48,262144,2560,512,10,640,[0]*48,[0]*48,4,155648,4096)
         a=types.SimpleNamespace(moe_device="numa",mtp=3)
         t=[memory.Tensor("blk.0.ffn_gate_exps.weight",(512,640,2560),1,"gguf:21")]
@@ -1471,8 +1471,17 @@ class HybridDispatchPolicyTest(unittest.TestCase):
         for field,value in (("family","deepseek_v41"),("layers",47),("hidden",4096),("intermediate",768),("topk",8)):
             changed=copy.copy(g);object.__setattr__(changed,field,value)
             self.assertEqual(auto._qwen_hybrid_defaults(a,changed,t,gpu,True),{})
-        for hw,numa in (({0:{"capability":120}},True),({0:{"capability":75},1:{"capability":89}},True),(gpu,False)):
+        for hw,numa in (({0:{"capability":75},1:{"capability":89}},True),(gpu,False)):
             self.assertEqual(auto._qwen_hybrid_defaults(a,g,t,hw,numa),{})
+        for sm in (60, 70, 75, 80, 86, 89, 90, 100, 120, 121):
+            with self.subTest(sm=sm):
+                single = auto._qwen_hybrid_defaults(a,g,t,{0:{"capability":sm}},True)
+                self.assertEqual(single["FASTLLM_QWEN38_HYBRID_GRAPH"], "1")
+                self.assertNotIn("FASTLLM_QWEN38_OWNED_PP", single)
+                native = [memory.Tensor("model.layers.0.mlp.experts.0.gateup_proj.weight",
+                                        (1280,2560),1,"nvfp4")]
+                if sm != 75:
+                    self.assertEqual(auto._qwen_hybrid_defaults(a,g,native,{0:{"capability":sm}},True), {})
         dual = auto._qwen_hybrid_defaults(a,g,t,{0:{"capability":75},1:{"capability":75}},True)
         self.assertEqual(dual["FASTLLM_QWEN38_OWNED_PP"], "1")
         self.assertEqual(dual["FASTLLM_QWEN38_REMOTE_GRAPH"], "1")

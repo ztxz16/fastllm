@@ -536,18 +536,28 @@ _AUTO_QWEN_ENV_APPLIED = {}
 
 
 def _qwen_hybrid_defaults(args, model, tensors, hardware, numa):
-    # Restrict automatic dispatch to the model shape and one/two-GPU SM75
-    # configuration measured by the hybrid regression suite. Other backends
-    # retain their existing policies; explicit environment values always win.
+    # Single-GPU GGUF hybrid graphs use the backend's runtime capability
+    # checks on every CUDA architecture. Keep the separately measured two-GPU
+    # ownership/remote-graph policy scoped to its original configuration.
+    # Explicit environment values still win.
     if (not numa or len(hardware) not in (1, 2) or
-            any(device.get("capability") != 75 for device in hardware.values()) or
+            (len(hardware) == 2 and any(device.get("capability") != 75 for device in hardware.values())) or
             (model.family, model.layers, model.hidden, model.intermediate,
              model.experts, model.topk) != ("qwen4", 48, 2560, 640, 512, 10) or
             args.moe_device in ("cpu", "disk")):
         return {}
     gguf = any(t.kind.startswith("gguf:") and memory._is_routed_expert(t.name)
                for t in tensors)
+    # The GGUF full graph improves the measured verifier workload. E4M3
+    # batching also benefits the existing segmented graph, while composing it
+    # was not consistently faster; keep native formats on their prior policy.
+    if not gguf and any(device.get("capability") != 75 for device in hardware.values()):
+        return {}
     defaults = {"FASTLLM_QWEN38_HYBRID_GRAPH": "1"}
+    # Prefill dequantization and vision placement remain independently scoped
+    # to their existing measured defaults; enabling graphs need not change them.
+    if any(device.get("capability") != 75 for device in hardware.values()):
+        return defaults
     if len(hardware) == 2:
         defaults.update(FASTLLM_QWEN38_OWNED_PP="1", FASTLLM_QWEN38_REMOTE_GRAPH="1")
     if (getattr(args, "vision_device", None) is None and
