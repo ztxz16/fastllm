@@ -8,6 +8,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <iostream>
+#include <future>
 #include <map>
 #include <mutex>
 #include <stdexcept>
@@ -32,6 +33,7 @@ class SchedulerModel : public basellm {
     std::mutex cacheMutex, gateMutex;
     std::condition_variable gate;
     bool holdForward = false;
+    bool pauseConcurrentDecode = false, insideConcurrentDecode = false;
     int activeCaches = 0;
 public:
     int peakActiveCaches = 0;
@@ -80,6 +82,15 @@ public:
         std::lock_guard<std::mutex> lock(gateMutex);
         holdForward = true;
     }
+    void PauseNextConcurrentDecode() {
+        std::lock_guard<std::mutex> lock(gateMutex);
+        pauseConcurrentDecode = true;
+    }
+    void WaitForConcurrentDecode() {
+        std::unique_lock<std::mutex> lock(gateMutex);
+        Check(gate.wait_for(lock, std::chrono::seconds(10), [&] { return insideConcurrentDecode; }),
+              "fixture did not enter concurrent decode");
+    }
     void Resume() {
         std::lock_guard<std::mutex> lock(gateMutex);
         holdForward = false;
@@ -88,8 +99,18 @@ public:
     int Forward(const Data &ids, const Data &, const Data &,
                 std::vector<std::pair<Data, Data>> &cache,
                 const GenerationConfig &, const LastTokensManager &, std::vector<float> *) override {
+        bool concurrentDecode;
+        {
+            std::lock_guard<std::mutex> lock(cacheMutex);
+            concurrentDecode = activeCaches >= 2 && !cache[0].first.dims.empty();
+        }
         {
             std::unique_lock<std::mutex> lock(gateMutex);
+            if (pauseConcurrentDecode && concurrentDecode) {
+                pauseConcurrentDecode = false;
+                insideConcurrentDecode = holdForward = true;
+                gate.notify_all();
+            }
             Check(gate.wait_for(lock, std::chrono::seconds(10), [&] { return !holdForward; }),
                   "scheduler fixture was not resumed");
         }
@@ -255,6 +276,32 @@ void Concurrent(CacheView view, bool pressure, const basellm *capabilities = nul
     std::cout << "CONCURRENT_PASS view=" << (int)view << " pressure=" << pressure << '\n';
 }
 
+// A slow multi-request Forward must not hold the request dictionary mutex.
+// Exercise cancellation and admission while the scheduler still owns KV.
+void ConcurrentConsumers() {
+    SchedulerModel model(CacheView::Paged, 4096, 128, 4);
+    model.Pause();
+    model.PauseNextConcurrentDecode();
+    const int first = Launch(model, 128, 16), second = Launch(model, 128, 16);
+    model.Resume();
+    model.WaitForConcurrentDecode();
+    auto consumer = std::async(std::launch::async, [&] {
+        int cached, missed, output;
+        Check(model.GetResponseStatistics(first, cached, missed, output), "lost active request");
+        Check(model.CanFetchResponse(first), "published output is unavailable");
+        model.AbortResponse(second);
+        return Launch(model, 128, 9);
+    });
+    const bool responsive = consumer.wait_for(std::chrono::seconds(1)) == std::future_status::ready;
+    model.Resume(); // Always release Forward, including when testing the old bug.
+    const int third = consumer.get();
+    Check(responsive, "concurrent Forward blocked consumers, cancellation or admission");
+    Check(Drain(model, {first, third}) == std::vector<int>({16, 9}),
+          "concurrent cancellation corrupted another request");
+    Check(model.FetchResponseTokens(second) == -1, "aborted request remained active");
+    std::cout << "CONCURRENT_CONSUMERS_PASS\n";
+}
+
 void SharedPoolPressure() {
     SchedulerModel model(CacheView::Paged, 1024, 128, 4);
     model.EnableSharedPool(768);
@@ -290,6 +337,7 @@ int main() {
         CompletePagesOnly();
         OverlappingPageViews();
         SharedPoolPressure();
+        ConcurrentConsumers();
         for (auto view : {CacheView::Contiguous, CacheView::Paged, CacheView::TensorParallel}) {
             Single(view, 500, 128, 256, 244, 244);
         }
