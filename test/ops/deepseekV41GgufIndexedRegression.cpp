@@ -102,6 +102,7 @@ static void HybridAddition(Data &input, Data &indices, Data &scores,
 }
 
 static bool cacheTest = false;
+static bool crossWindowTest = false;
 static bool streamTest = false;
 static bool cooperativeTest = false;
 static void CacheCompute(Data &input, Data &indices, Data &scores, std::vector<Data *> &weights,
@@ -126,7 +127,7 @@ static void CacheCompute(Data &input, Data &indices, Data &scores, std::vector<D
     for (size_t i=0; i<ids.size(); ++i) slots[i] = weights[2*(ids[i]+1)] ? experts-1-ids[i] : -1;
     Data routes(INT32, {rows,topk}, CPU, slots.data());
     Data gpuOffsets(INT8, {int(offsets.size()*sizeof(size_t))}, CPU, offsets.data());
-    Data scratch(INT8, {int(FastllmCudaV41CanonicalGGUFCacheWorkspaceBytes(hidden,inter))});
+    Data scratch(INT8, {int(FastllmCudaV41CanonicalGGUFCacheWorkspaceBytes(hidden,inter,rows,topk))});
     Data partial(FLOAT32, {rows*topk,hidden}), activation;
     for (auto *v : {&records,&routes,&gpuOffsets,&scratch,&partial}) {
         v->ToDevice(CUDA,{device},true); v->Allocate(false);
@@ -145,6 +146,19 @@ static void CacheCompute(Data &input, Data &indices, Data &scores, std::vector<D
         run(); Cuda(cudaStreamEndCapture(cudaStreamPerThread,&graph));
         Cuda(cudaGraphInstantiate(&exec,graph,nullptr,nullptr,0));
         Cuda(cudaGraphLaunch(exec,cudaStreamPerThread));
+        const auto eager = Read(partial);
+        for (int replay = 0; replay < 3; ++replay) {
+            auto changed = slots;
+            for (size_t i=0;i<changed.size();++i)
+                changed[i] = replay == 1 ? -1 : slots[(i+replay+1)%slots.size()];
+            Cuda(cudaMemcpy(routes.cudaData,changed.data(),changed.size()*4,cudaMemcpyHostToDevice));
+            Cuda(cudaGraphLaunch(exec,cudaStreamPerThread));
+            const auto captured = Read(partial); run();
+            Check(Read(partial)==captured,"cache graph did not consume changed expert slots");
+        }
+        Cuda(cudaMemcpy(routes.cudaData,slots.data(),slots.size()*4,cudaMemcpyHostToDevice));
+        Cuda(cudaGraphLaunch(exec,cudaStreamPerThread));
+        Check(Read(partial)==eager,"cache graph retained stale expert groups");
         Cuda(cudaGraphExecDestroy(exec)); Cuda(cudaGraphDestroy(graph));
     }
     const auto values = Read(partial);
@@ -174,6 +188,34 @@ static void CacheCompute(Data &input, Data &indices, Data &scores, std::vector<D
             Check(sum == expected[size_t(row)*hidden+c], "cached canonical experts differ from resident CUDA");
         }
     }
+    if (crossWindowTest && rows==9 && (gt==GGML_TYPE_IQ2_XXS || gt==GGML_TYPE_IQ2_XS || gt==GGML_TYPE_IQ2_S) && gt==dt) {
+        // Native NUMA records interleave gate/up rows and pack four rows per
+        // IQ2 block. Compare that storage directly with canonical cache bytes.
+        std::vector<uint8_t> packed(bytes,0);
+        int storageType[2]={gt,dt};
+        for(int expert=0;expert<experts;++expert)for(int part=0;part<2;++part) {
+            const auto *w=weights[2*(expert+1)+part];if(!w)continue;
+            Data host(DATA_GGUF_FORMAT,part?dt:gt,w->dims);host.Allocate(false);
+            std::vector<uint8_t> canonical(w->GetBytes());
+            Cuda(cudaMemcpy(canonical.data(),w->cudaData,canonical.size(),cudaMemcpyDeviceToHost));
+            const size_t rowBytes=canonical.size()/w->dims[0];
+            for(int row=0;row<w->dims[0];++row) {
+                const int dst=part?row:2*(row%inter)+row/inter;
+                std::memcpy(host.cpuData+dst*rowBytes,canonical.data()+row*rowBytes,rowBytes);
+            }
+            host.Repack();storageType[part]=host.ggmlType;
+            Check(host.GetBytes()==canonical.size(),"IQ2 repack changed record extent");
+            std::memcpy(packed.data()+offsets[experts-1-expert]+(part?downOffset:0),host.cpuData,host.GetBytes());
+        }
+        Check(!get_repack_info(ggml_type(gt)) || (storageType[0]!=gt && storageType[1]!=dt),
+              "R4 fixture did not use the available host repacker");
+        Cuda(cudaMemcpy(records.cudaData,packed.data(),bytes,cudaMemcpyHostToDevice));
+        view.numaGateType=storageType[0];view.numaDownType=storageType[1];
+        view.routeMap=nullptr;view.routeCount=0;view.routeSlots=static_cast<const int32_t *>(routes.cudaData);
+        view.q8InputPrepared=false;run();
+        Check(Read(partial)==values,"IQ2 R4 grouped cache differs from canonical weights");
+    }
+
 }
 
 
@@ -901,7 +943,7 @@ static int Case(int gt, int dt, int hidden, int inter, int device, bool missing)
     }
     Data gate, activation, workspace, output, ref;
     int checks = 0;
-    for (int rows : hostPrefillTest ? std::vector<int>{33,128,2048} : batchGridTest ? std::vector<int>{1,2,5,8} : decodeGridTest ? std::vector<int>{1} : sparseTest ? std::vector<int>{512,1024} : groupedTest ? std::vector<int>{33,64,129} : cacheTest ? std::vector<int>{1,5,8} : std::vector<int>{1,2,8,32}) for (int pattern = 0; pattern < 3; ++pattern) {
+    for (int rows : crossWindowTest ? std::vector<int>{1,9,17,33,65} : hostPrefillTest ? std::vector<int>{33,128,2048} : batchGridTest ? std::vector<int>{1,2,5,8} : decodeGridTest ? std::vector<int>{1} : sparseTest ? std::vector<int>{512,1024} : groupedTest ? std::vector<int>{33,64,129} : cacheTest ? std::vector<int>{1,5,8} : std::vector<int>{1,2,8,32}) for (int pattern = 0; pattern < 3; ++pattern) {
         std::vector<float> x(size_t(rows)*hidden), scales(rows*topk);
         for (size_t i = 0; i < x.size(); ++i)
             x[i] = pattern == 2 ? 0.f : std::ldexp(normal(rng)*30.f, int(i/32%5)-2);
@@ -918,6 +960,21 @@ static int Case(int gt, int dt, int hidden, int inter, int device, bool missing)
         if (hostPrefillTest) {
             HostPrefill(input, indices, scores, weights, gt, dt, limit, device);
             ++checks; continue;
+        }
+        if (crossWindowTest) {
+            std::vector<float> expected;
+            for (int row=0;row<rows;++row) {
+                Data xi,ii,ss;
+                xi.FakeFrom(input,size_t(row)*hidden*2);xi.Resize({1,hidden});
+                ii.FakeFrom(indices,size_t(row)*topk*4);ii.Resize({1,topk});
+                ss.FakeFrom(scores,size_t(row)*topk*4);ss.Resize({1,topk});
+                Check(FastllmCudaMergeMOEV41GGUFResident(xi,gate,activation,workspace,output,
+                    weights.data(),weights.size(),ii,ss,0.f,limit),"per-token oracle rejected");
+                const auto values=Read(output);expected.insert(expected.end(),values.begin(),values.end());
+            }
+            CacheCompute(input,indices,scores,weights,expected,gt,dt,inter,limit,device);
+            printf("CROSS_WINDOW gt=%d dt=%d rows=%d pattern=%d PASS\n",gt,dt,rows,pattern);fflush(stdout);
+            ++checks;continue;
         }
         if (pattern == 0)
             Check(!FastllmCudaV41GGUFGraphReady(weights[2], rows, topk), "unwarmed decode shape admitted");
@@ -1020,6 +1077,17 @@ int main(int argc, char **argv) {
         int devices=0; if(cudaGetDeviceCount(&devices)!=cudaSuccess || devices==0) return 77;
         SetThreads(4);
         const std::string mode = argc>1 ? argv[1] : "";
+        if (mode == "--cross-window") {
+            crossWindowTest = true;
+            int checks=0;
+            for(int type : {GGML_TYPE_IQ2_XXS,GGML_TYPE_IQ2_XS,GGML_TYPE_IQ2_S})
+                checks+=Case(type,type,512,256,0,true);
+            checks+=Case(GGML_TYPE_IQ2_XS,GGML_TYPE_Q3_K,512,256,0,true);
+            checks+=Case(GGML_TYPE_Q8_0,GGML_TYPE_Q8_0,512,256,0,true);
+            checks+=Case(GGML_TYPE_IQ2_XXS,GGML_TYPE_IQ2_XXS,5120,2304,0,true);
+            checks+=Case(GGML_TYPE_IQ2_XS,GGML_TYPE_IQ2_XS,5120,2304,0,true);
+            printf("PASS: GGUF full-route cache (%d cases)\n",checks);return 0;
+        }
         if (mode == "--host-prefill") {
             hostPrefillTest = true;
             int checks = 0;

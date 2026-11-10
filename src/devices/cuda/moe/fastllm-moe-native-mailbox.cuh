@@ -170,13 +170,13 @@ __global__ void ReduceNativeScoredMailbox(const float *cpu, const float *residen
 static int NativeBatchTileRows(const OffloadLayout &layout, int rows) {
     // The route grid uses CUDA's y dimension. Keep its limit independent of
     // the request count and of the number of rows in a speculative proposal.
-    if (layout.weightType == fastllm::EXL3) return rows;
+    if (layout.weightType == fastllm::EXL3 || layout.weightType == fastllm::DATA_GGUF_FORMAT) return rows;
     return std::min(rows, layout.weightType == fastllm::NVFP4_BLOCK_32_E8M0 ? 65535 / kMaxTopK : 8);
 }
 static bool NativeBatchSortRoutes(const OffloadLayout &layout) {
     // Compressed backends that group record identities themselves consume
     // original route IDs; do not repeat a quadratic ranking at publication.
-    return layout.weightType != fastllm::EXL3;
+    return layout.weightType != fastllm::EXL3 && layout.weightType != fastllm::DATA_GGUF_FORMAT;
 }
 __device__ int NativeBatchRouteRank(const int32_t *indices, int r, int rows, int topk, int tileRows = 8) {
     const int first = r / (tileRows * topk) * (tileRows * topk);
@@ -285,7 +285,7 @@ struct NativeMoeMailbox {
     struct ComputeScratch {
         float *partial = nullptr;
         fastllm::Data quantized, gate;
-        fastllm::Data ggufWorkspace[2], ggufActivation[2];
+        fastllm::Data ggufWorkspace[2];
         ~ComputeScratch() { cudaFree(partial); }
         bool Init(const OffloadLayout &layout, int topk, int device, int rows) {
             const bool standard = !layout.deepSeekV41 && !layout.glm5;
@@ -306,7 +306,7 @@ struct NativeMoeMailbox {
             }
             if (layout.weightType == fastllm::DATA_GGUF_FORMAT) {
                 const size_t bytes = standard ? FastllmCudaMoeGGUFCacheBatchWorkspaceBytes(hidden, layout.inter, rows, topk) :
-                    FastllmCudaV41CanonicalGGUFCacheWorkspaceBytes(hidden, layout.inter);
+                    FastllmCudaV41CanonicalGGUFCacheWorkspaceBytes(hidden, layout.inter, rows, topk);
                 if (!bytes) return false;
                 // Resident and staged branches execute concurrently. Neither
                 // quantization scratch nor activation storage may alias.
@@ -314,12 +314,6 @@ struct NativeMoeMailbox {
                     auto &scratch = ggufWorkspace[branch];
                     scratch.dataType = fastllm::INT8; scratch.Resize({int(bytes)});
                     scratch.ToDevice(fastllm::CUDA, {device}, false); scratch.Allocate(false);
-                    if (!standard) {
-                        auto &activation = ggufActivation[branch];
-                        activation.dataType = fastllm::BFLOAT16;
-                        activation.Resize({std::min(rows, 8) * topk, layout.inter});
-                        activation.ToDevice(fastllm::CUDA, {device}, false); activation.Allocate(false);
-                    }
                 }
             }
             return true;
@@ -721,25 +715,15 @@ struct NativeMoeMailbox {
     bool ComputeGGUF(Layer &w, const OffloadLayout &layout, const uint8_t *records,
                      const int32_t *slots, const float *scores, bool resident) {
         const int branch = resident ? 0 : 1;
-        for (int first = 0; first < w.rows; first += 8) {
-            const int rows = std::min(8, w.rows - first), base = first * w.topk;
-            fastllm::Data input;
-            input.FakeFrom(w.compute->quantized, size_t(first) * w.hidden * sizeof(uint16_t));
-            input.Resize({rows, w.hidden});
-            FastllmCudaMoeGGUFCacheView view{records, const_cast<int32_t *>(slots + base),
-                layout.recordStride, layout.downOffset, layout.gateGgmlType, layout.downGgmlType,
-                layout.hidden, layout.inter, w.compute->ggufWorkspace[branch].cudaData,
-                size_t(w.compute->ggufWorkspace[branch].GetBytes()), resident ? cache.slotOffsets : nullptr};
-            view.routeMap = w.routeMap ? w.routeMap + base : nullptr;
-            view.routeCount = rows * w.topk;
-            // Missing routes belong to the other branch (or CPU). Never
-            // overwrite their partials while publishing this branch's rows.
-            view.preserveMissing = true;
-            if (!FastllmCudaMoeV41CanonicalGGUFCacheCompute(input, w.compute->ggufActivation[branch],
-                    view, scores + base, w.topk, layout.swigluLimit,
-                    w.compute->partial + size_t(base) * w.hidden)) return false;
-        }
-        return true;
+        FastllmCudaMoeGGUFCacheView view{records, const_cast<int32_t *>(slots),
+            layout.recordStride, layout.downOffset, layout.gateGgmlType, layout.downGgmlType,
+            layout.hidden, layout.inter, w.compute->ggufWorkspace[branch].cudaData,
+            size_t(w.compute->ggufWorkspace[branch].GetBytes()), resident ? cache.slotOffsets : nullptr};
+        view.routeMap = w.routeMap; view.routeCount = w.routes;
+        // The resident, staged and CPU branches own disjoint routes.
+        view.preserveMissing = true;
+        return FastllmCudaMoeV41CanonicalGGUFCacheCompute(w.compute->quantized,
+            view, scores, w.topk, layout.swigluLimit, w.compute->partial);
     }
     static void Compute(Layer &w, const OffloadLayout &layout, const uint8_t *records,
             const int32_t *slots, const float *scores, cudaStream_t stream, bool resident = false) {

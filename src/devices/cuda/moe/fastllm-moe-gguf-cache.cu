@@ -1581,7 +1581,7 @@ bool FastllmCudaMoeV41GGUFCacheCompute(const fastllm::Data &input, fastllm::Data
         const FastllmCudaMoeGGUFCacheView &view, const float *scores, int topk,
         float swigluLimit, float *perExpert) {
     if (FastllmCudaV41GGUFSupported(view.gateType, view.downType))
-        return FastllmCudaMoeV41CanonicalGGUFCacheCompute(input, activation, view,
+        return FastllmCudaMoeV41CanonicalGGUFCacheCompute(input, view,
             scores, topk, swigluLimit, perExpert);
     if (input.dataType != fastllm::BFLOAT16 || input.dims.size() != 2 || !input.cudaData ||
         input.dims[0] < 1 || input.dims[0] > 8 || input.dims[1] != view.hidden ||

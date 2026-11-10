@@ -80,7 +80,7 @@ struct MailboxMoe {
         DeviceCache *cache = nullptr;
         DecodeOverlapWorkspace copy;
         FastllmCudaMoeExpertParallel::Rank graphs;
-        fastllm::Data activation, scratch, partial, input, metadata;
+        fastllm::Data scratch, partial, input, metadata;
         cudaEvent_t done = nullptr, published = nullptr;
         float *hostResult = nullptr, *mappedResult = nullptr;
         struct Timing {
@@ -232,7 +232,7 @@ struct MailboxMoe {
         key[0] = table;
         key[1] = staged;
         return w.graphs.RunResidentGraph(key, [&] {
-            return FastllmCudaMoeV41CanonicalGGUFCacheCompute(w.input, w.activation, view, local->scores, topk,
+            return FastllmCudaMoeV41CanonicalGGUFCacheCompute(w.input, view, local->scores, topk,
                                                               l.swigluLimit, static_cast<float *>(w.partial.cudaData));
         });
     }
@@ -240,11 +240,9 @@ struct MailboxMoe {
         hidden = group.layout.hidden;
         topk = k;
         size_t stride = 0, scratch = 0;
-        int inter = 0;
         for (const auto &l : group.layerLayouts) {
             if (l.hidden != hidden || !FastllmCudaV41GGUFSupported(l.gateGgmlType, l.downGgmlType)) return false;
             stride = std::max(stride, l.recordStride);
-            inter = std::max(inter, l.inter);
             scratch = std::max(scratch, FastllmCudaV41CanonicalGGUFCacheWorkspaceBytes(hidden, l.inter));
         }
         if (!scratch || !stride) return false;
@@ -273,7 +271,6 @@ struct MailboxMoe {
             if (!w.copy.Init(stride, group.tableKeys.size(), topk, true)) return false;
             Allocate(w.input, fastllm::BFLOAT16, {1, hidden}, w.cache->device);
             Allocate(w.metadata, fastllm::INT8, {int(sizeof(MailboxRoutes))}, w.cache->device);
-            Allocate(w.activation, fastllm::BFLOAT16, {topk, inter}, w.cache->device);
             Allocate(w.scratch, fastllm::INT8, {int(scratch)}, w.cache->device);
             Allocate(w.partial, fastllm::FLOAT32, {topk, hidden}, w.cache->device);
             if (!pin(&w.hostResult, &w.mappedResult, size_t(topk) * hidden * sizeof(float))) return false;

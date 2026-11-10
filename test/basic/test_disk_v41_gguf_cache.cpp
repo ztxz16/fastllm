@@ -88,7 +88,7 @@ struct Fixture {
         fclose(file);
     }
     ~Fixture() { owned.clear(); unlink(path.c_str()); }
-    std::vector<float> Run(bool lazy, int rows, int offset, int device, int topk=6, bool grouped=false, bool gpuIo=false, int lastExpert=-1, float sharedScale=0, float phase=0) {
+    std::vector<float> Run(bool lazy, int rows, int offset, int device, int topk=6, bool grouped=false, bool gpuIo=false, int lastExpert=-1, float sharedScale=0, float phase=0, bool compactReference=false) {
         Data x(BFLOAT16,{rows,hidden}), y(BFLOAT16,{rows,hidden});
         Data ids(INT32,{rows,topk}), scores(FLOAT32,{rows,topk}),a,b,c;
         x.Allocate(false); ids.Allocate(false); scores.Allocate(false);
@@ -121,8 +121,24 @@ struct Fixture {
             DiskMergeMOE op; op.Run("MergeMOE",data,{{"sharedScale",sharedScale},{"swigluLimit",.8f}},ip);
         } else if (grouped) {
             ids.ToDevice(CUDA,{device},true); scores.ToDevice(CUDA,{device},true);
-            Check(FastllmCudaMergeMOEV41GGUFResident(x,a,b,c,y,gpu.data(),gpu.size(),ids,scores,0,.8f),
-                  "resident grouped oracle rejected");
+            if (compactReference) {
+                y.Allocate(false);
+                for (int row = 0; row < rows; ++row) {
+                    Data xi, ii, ss, result;
+                    xi.FakeFrom(x, size_t(row)*hidden*2); xi.Resize({1,hidden});
+                    ii.FakeFrom(ids, size_t(row)*topk*4); ii.Resize({1,topk});
+                    ss.FakeFrom(scores, size_t(row)*topk*4); ss.Resize({1,topk});
+                    Check(FastllmCudaMergeMOEV41GGUFResident(xi,a,b,c,result,gpu.data(),gpu.size(),
+                        ii,ss,0,.8f,true), "compact reference rejected");
+                    result.ToDevice(CPU);
+                    for (int column = 0; column < hidden; ++column)
+                        ((uint16_t *)y.cpuData)[size_t(row)*hidden+column] =
+                            Float32ToBFloat16RNEBits(((float *)result.cpuData)[column]);
+                }
+            } else {
+                Check(FastllmCudaMergeMOEV41GGUFResident(x,a,b,c,y,gpu.data(),gpu.size(),ids,scores,0,.8f),
+                      "resident grouped oracle rejected");
+            }
         } else {
             std::vector<int32_t> orderIds((int32_t *)ids.cpuData,(int32_t *)ids.cpuData+rows*topk);
             ids.ToDevice(CUDA,{device},true); scores.ToDevice(CUDA,{device},true);
@@ -375,7 +391,7 @@ static void TestPrefillWorkingSet(Fixture &f, int device) {
 }
 // Compare the cache adapter with canonical records against the same bytes in
 // NUMA's cross-interleaved layout. Include sparse routes and repeated experts.
-static void TestNativeLayout(Fixture &f, int device, bool compareLegacy = false) {
+static void TestNativeLayout(Fixture &f, int device) {
     FastllmCudaSetDevice(device);
     const size_t downOffset = f.gpu[2]->GetBytes(), stride = f.bytes;
     Data canonical(INT8, {int(stride*2)}), native(INT8, {int(stride*2)}), packed(INT8, {int(stride*2)});
@@ -415,7 +431,7 @@ static void TestNativeLayout(Fixture &f, int device, bool compareLegacy = false)
         constexpr int topk=6;
         const int routes=compact ? rows*topk/2 : rows*topk;
         Data input(BFLOAT16,{rows,f.hidden}), scores(FLOAT32,{rows,topk});
-        Data slots(INT32,{routes}), map(INT32,{routes}), output(FLOAT32,{rows*topk,f.hidden}), activation;
+        Data slots(INT32,{routes}), map(INT32,{routes}), output(FLOAT32,{rows*topk,f.hidden});
         input.Allocate(false); scores.Allocate(false); slots.Allocate(false); map.Allocate(false); output.Allocate(false);
         for (int i=0; i<rows*f.hidden; ++i)
             ((uint16_t*)input.cpuData)[i]=Float32ToBFloat16RNEBits(std::sin(i*.17f)*3.f);
@@ -434,26 +450,24 @@ static void TestNativeLayout(Fixture &f, int device, bool compareLegacy = false)
         view.workspace=scratch.cudaData; view.workspaceBytes=workspaceBytes;
         if (compact) { view.routeMap=(int32_t*)map.cudaData; view.routeCount=routes; }
         std::vector<uint8_t> expected;
-        for (int variant = 0; variant < (compareLegacy ? 4 : 3); ++variant) {
-            const int layout = compareLegacy ? std::max(0, variant-1) : variant;
-            if (compareLegacy) setenv("FASTLLM_V41_GGUF_LEGACY", variant == 0 ? "1" : "0", 1);
+        for (int layout = 0; layout < 3; ++layout) {
             std::fill_n((float*)output.cpuData, rows*topk*f.hidden, 17.f);
             output.ToDevice(CUDA,{device},true);
             view.records=(uint8_t*)(layout == 2 ? packed.cudaData : layout == 1 ? native.cudaData : canonical.cudaData);
             view.numaGateType=layout == 2 ? packedType(view.gateType) : layout == 1 ? view.gateType : -1;
             view.numaDownType=layout == 2 ? packedType(view.downType) : layout == 1 ? view.downType : -1;
-            Check(FastllmCudaMoeV41CanonicalGGUFCacheCompute(input,activation,view,
+            Check(FastllmCudaMoeV41CanonicalGGUFCacheCompute(input,view,
                 (float*)scores.cudaData,topk,.8f,(float*)output.cudaData),"native cache adapter rejected");
             output.ToDevice(CPU);
-            if (variant == 0) expected.assign(output.cpuData,output.cpuData+output.GetBytes());
+            if (layout == 0) expected.assign(output.cpuData,output.cpuData+output.GetBytes());
             else Check(!memcmp(expected.data(),output.cpuData,expected.size()),"native/canonical cache mismatch");
         }
         output.ToDevice(CUDA,{device},true);
         view.numaGateType=GGML_TYPE_Q2_K_R4;
-        Check(!FastllmCudaMoeV41CanonicalGGUFCacheCompute(input,activation,view,
+        Check(!FastllmCudaMoeV41CanonicalGGUFCacheCompute(input,view,
             (float*)scores.cudaData,topk,.8f,(float*)output.cudaData),"R4 native layout accepted");
         view.numaGateType=-1; view.numaDownType=view.downType;
-        Check(!FastllmCudaMoeV41CanonicalGGUFCacheCompute(input,activation,view,
+        Check(!FastllmCudaMoeV41CanonicalGGUFCacheCompute(input,view,
             (float*)scores.cudaData,topk,.8f,(float*)output.cudaData),"partial native layout accepted");
     }
     printf("PASS: V4.1 native/canonical cache device=%d gate=%d down=%d\n",device,f.gpu[2]->ggmlType,f.gpu[3]->ggmlType);
@@ -559,7 +573,7 @@ static void TestSharedResident(Fixture &f, int device) {
 // Exercise cached decode on both GPUs without admitting every miss.
 // Check admitted bytes independently: a staged interleaved record must never
 // be published as canonical, even when its first execution was correct.
-static void TestCooperativeDecode(Fixture &f, bool compareLegacy = false) {
+static void TestCooperativeDecode(Fixture &f, bool residentOracle = false) {
     if (FastllmCudaGetDeviceCount() < 2) return;
     HostMoePlacementScope placement(true);
     constexpr int experts=24;
@@ -593,8 +607,8 @@ static void TestCooperativeDecode(Fixture &f, bool compareLegacy = false) {
     Data oracleGate(BFLOAT16, {1, 2*f.inter}), oracleActivation(BFLOAT16, {1, f.inter});
     Data oracleOutput(FLOAT32, {1, f.hidden});
     const size_t oracleBytes = (size_t(f.hidden/32)+size_t(f.inter/32))*sizeof(block_q8_1) + size_t(f.hidden)*2;
-    Data oracleWorkspace(INT8, {int(oracleBytes)});
-    if (compareLegacy) {
+    Data oracleWorkspace(INT8, {int(((oracleBytes+255)&~size_t(255)) + 3*sizeof(int32_t))});
+    if (residentOracle) {
         FastllmCudaSetDevice(0);
         oraclePointers.Allocate(false);
         for (int i=0; i<2*f.experts; ++i) ((void **)oraclePointers.cpuData)[i]=f.gpu[i+2]->cudaData;
@@ -625,7 +639,6 @@ static void TestCooperativeDecode(Fixture &f, bool compareLegacy = false) {
             hostIds.data(),cpuOwners.data(),(float*)scores.cpuData,topk,0,.8f,true,32);
         // IQ1 CPU Q8_K and GPU Q8_1 are different established contracts.
         // Build each route's two independent results before testing dispatch.
-        if (compareLegacy) setenv("FASTLLM_V41_GGUF_LEGACY", "1", 1);
         FastllmCudaSetDevice(0);
         Data oracleIds(INT32,{rows,topk});oracleIds.Allocate(false);
         for (int i=0; i<rows*topk; ++i) ((int32_t*)oracleIds.cpuData)[i]=hostIds[i]%f.experts;
@@ -635,22 +648,21 @@ static void TestCooperativeDecode(Fixture &f, bool compareLegacy = false) {
             xi.FakeFrom(x,size_t(r)*f.hidden*2);xi.Resize({1,f.hidden});
             ii.FakeFrom(oracleIds,size_t(r*topk+k)*4);ii.Resize({1,1});
             ss.FakeFrom(scores,size_t(r*topk+k)*4);ss.Resize({1,1});
-            if (compareLegacy) {
+            if (residentOracle) {
                 Check(FastllmCudaRunV41GGUF(xi,oracleGate,oracleActivation,oracleWorkspace,oracleOutput,
                     oraclePointers.cudaData,(int32_t *)ii.cudaData,(float *)ss.cudaData,
-                    f.gpu[2]->ggmlType,f.gpu[3]->ggmlType,f.hidden,f.inter,f.experts,1,.8f),
-                    "legacy resident expert oracle rejected");
+                    f.gpu[2]->ggmlType,f.gpu[3]->ggmlType,f.hidden,f.inter,f.experts,1,.8f,true),
+                    "compact resident expert oracle rejected");
             } else {
                 DoCudaMergeMOEV41Fallback(xi,result,ii,ss,f.gpu.data(),f.gpu.size(),0,.8f);
             }
             FastllmCudaCopyFromDeviceToHost(gpuOracle.data()+size_t(r*topk+k)*f.hidden,
-                compareLegacy ? oracleOutput.cudaData : result.cudaData,f.hidden*sizeof(float));
+                residentOracle ? oracleOutput.cudaData : result.cudaData,f.hidden*sizeof(float));
         }
         FastllmCudaSetDevice(device);
         x.ToDevice(CUDA,{device},true);ids.ToDevice(CUDA,{device},true);scores.ToDevice(CUDA,{device},true);
         uint64_t before[2][8]{},after[2][8]{};
         for (int d : {0,1}) Check(fastllm_moe_cuda_cache_route_stats(d,before[d]),"decode stats before");
-        if (compareLegacy) setenv("FASTLLM_V41_GGUF_LEGACY", "0", 1);
         int submitted=0;
         Check(FastllmCudaMergeMOEHybridOnDevices(x,ids,scores,out,weights.data(),weights.size(),0,
             {0,1},[&] { ++submitted; }),"cooperative decode rejected");
@@ -703,21 +715,20 @@ static void TestCooperativeDecode(Fixture &f, bool compareLegacy = false) {
         }
     }
     Check(dual && resident && checkedPayload,"decode missed dual-GPU execution or cache hits");
-    Check(!compareLegacy || totalCpu>0,"tuned hybrid never executed CPU experts");
+    Check(!residentOracle || totalCpu>0,"tuned hybrid never executed CPU experts");
     printf("HYBRID_STATS gate=%d down=%d hidden=%d inter=%d gpu_routes=%llu cpu_routes=%llu hits=%llu admissions=%llu\n",
         f.gpu[2]->ggmlType,f.gpu[3]->ggmlType,f.hidden,f.inter,
         (unsigned long long)totalGpu,(unsigned long long)totalCpu,
         (unsigned long long)totalHits,(unsigned long long)totalAdmissions);
     FastllmCudaReleaseMoeCache(weights.data(),weights.size());
     SetMoeCudaCacheBytes(0);
-    if (compareLegacy) unsetenv("FASTLLM_V41_GGUF_LEGACY");
     std::puts("PASS: V4.1 cached decode, dual GPU, canonical admissions and mixed CPU/GPU output");
 }
 #endif
 
 
 // Regression for the tuned large-matrix decode path: compare with the retained
-// CUDA reference using identical packed weights, routing and rounding policy.
+// compact scalar projections using identical weights, routing and rounding policy.
 static void TestTunedDecode() {
     for (int type : {GGML_TYPE_Q2_0, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K,
                     GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M, GGML_TYPE_IQ2_XXS,
@@ -725,24 +736,21 @@ static void TestTunedDecode() {
         for (auto shape : {std::pair<int,int>{1024,1024}, {5120,2304}}) {
             Fixture f(type,type,0,shape.first,shape.second,6);
             for (int rows : {1,2,3,4,5,6,7,8,9,17,32}) {
-                setenv("FASTLLM_V41_GGUF_LEGACY","1",1);
-                auto reference=f.Run(false,rows,0,0,6,true);
-                setenv("FASTLLM_V41_GGUF_LEGACY","0",1);
+                auto reference=f.Run(false,rows,0,0,6,true,false,-1,0,0,true);
                 auto tuned=f.Run(false,rows,0,0,6,true);
                 printf("TUNED type=%d hidden=%d inter=%d rows=%d ",type,shape.first,shape.second,rows);
                 Compare(tuned,reference,0);
             }
             // Sparse/duplicate routes, compact route maps and NUMA interleaving.
-            TestNativeLayout(f,0,true);
+            TestNativeLayout(f,0);
         }
     }
-    unsetenv("FASTLLM_V41_GGUF_LEGACY");
     puts("PASS: tuned V4.1 GGUF decode");
 }
 
 #ifdef USE_NUMAS
 // Exercise tuned CUDA experts under real cache admissions and adaptive routing.
-// Per-route GPU oracles use the retained legacy kernel; CPU oracles are independent.
+// Per-route GPU oracles use compact scalar projections; CPU oracles are independent.
 static void TestTunedHybrid() {
     for (auto pair : std::vector<std::pair<int, int>>{
             {GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XXS},
@@ -759,7 +767,7 @@ static void TestTunedHybrid() {
             printf("TUNED_HYBRID gate=%d down=%d hidden=%d inter=%d\n",
                    pair.first, pair.second, shape.first, shape.second);
             fflush(stdout);
-            TestNativeLayout(f, 0, true);
+            TestNativeLayout(f, 0);
             TestCooperativeDecode(f, true);
         }
     }
