@@ -3816,21 +3816,27 @@ static bool LaunchNaivePrefillAttention(const fastllm::Data &query,
     Output(output, BFLOAT16, {1, queries, heads * 128});
     // Split the long sparse case to keep full probabilities out of CTA
     // shared memory. Preserve the exact normalized BF16 values and PV order.
-    if (groupedHeads == 16 && count == 2048 &&
-        (uint64_t)queries * heads * 2056 * sizeof(BF16) <= (size_t(512) << 20)) {
+    const size_t probabilityRowBytes = size_t(heads) * 2056 * sizeof(BF16);
+    const int tileRows = std::min<size_t>(queries, (size_t(512) << 20) / probabilityRowBytes);
+    if (groupedHeads == 16 && count == 2048 && tileRows > 0) {
         Data probabilities;
-        Output(probabilities, BFLOAT16, {queries, heads, 2056});
+        Output(probabilities, BFLOAT16, {tileRows, heads, 2056});
         auto *p = (BF16 *)probabilities.cudaData;
         const auto *ids = indices.dims.empty() ? nullptr : (const int *)indices.cudaData;
         const auto *bias = sink.dims.empty() ? nullptr : (const float *)sink.cudaData;
-        mma::SplitQK<2048,0,2><<<dim3(queries,heads/16),256,sizeof(mma::QKStorage<2>)>>>(
-            (const BF16 *)query.cudaData, FastllmNaiveKV(*readKey),
-            ids, p, heads, kvHeads, key.dims[2], keys, count, pastLength, causal, indexTile);
-        mma::SplitNormalize<2048><<<dim3(queries,heads/8),256>>>(p,bias,heads,count);
-        mma::SplitPV<2048,0,2><<<dim3(queries,heads/16),256,sizeof(mma::PVStorage<2>)>>>(
-            p, FastllmNaiveKV(*readValue), ids,
-            (BF16 *)output.cudaData, heads, kvHeads, keys, count,
-            pastLength, causal, indexTile);
+        // KV is staged once above. Keep absolute query/index positions while
+        // reusing a bounded probability tile on the same CUDA stream.
+        for (int first = 0; first < queries; first += tileRows) {
+            const int rows = std::min(tileRows, queries - first);
+            mma::SplitQK<2048,0,2><<<dim3(rows,heads/16),256,sizeof(mma::QKStorage<2>)>>>(
+                (const BF16 *)query.cudaData, FastllmNaiveKV(*readKey),
+                ids, p, heads, kvHeads, key.dims[2], keys, count, pastLength, causal, indexTile, first, queries);
+            mma::SplitNormalize<2048><<<dim3(rows,heads/8),256>>>(p,bias,heads,count);
+            mma::SplitPV<2048,0,2><<<dim3(rows,heads/16),256,sizeof(mma::PVStorage<2>)>>>(
+                p, FastllmNaiveKV(*readValue), ids,
+                (BF16 *)output.cudaData, heads, kvHeads, keys, count,
+                pastLength, causal, indexTile, first, queries);
+        }
         CheckLaunch();
         return true;
     }
@@ -3868,6 +3874,15 @@ void FastllmCudaNaiveAttention(const fastllm::Data &query, const fastllm::Data &
                               const fastllm::Data &sink, int heads, int kvHeads,
                               int dim, int valueDim, int pastLength, int window,
                               fastllm::Data &output, bool causal) {
+    FastllmCudaNaiveAttention(query, key, value, indices, sink, heads, kvHeads,
+        dim, valueDim, pastLength, window, output, causal, nullptr);
+}
+
+void FastllmCudaNaiveAttention(const fastllm::Data &query, const fastllm::Data &key,
+                              const fastllm::Data &value, const fastllm::Data &indices,
+                              const fastllm::Data &sink, int heads, int kvHeads,
+                              int dim, int valueDim, int pastLength, int window,
+                              fastllm::Data &output, bool causal, const fastllm::Data *prefillScratch) {
     using namespace fastllm;
     int queries = query.dims[1], keys = key.dims[1];
     int count = indices.dims.empty() ? (window ? std::min(window + (causal ? 0 : queries - 1), keys) : keys) : indices.dims[1];
@@ -3908,12 +3923,45 @@ void FastllmCudaNaiveAttention(const fastllm::Data &query, const fastllm::Data &
         if (queries >= 1024 && pastLength >= 127 && count == 128 &&
             (int64_t)pastLength + queries <= keys) {
             auto grouped = naive_prefill_mma::SwaQueryTile<4>;
-            const size_t bytes = sizeof(naive_prefill_mma::SwaQueryStorage<4>);
+            size_t bytes = sizeof(naive_prefill_mma::SwaQueryStorage<4>);
+            int queryTile = 4;
+            if (FastllmCudaRuntimeArch() == 90 && (int64_t)queries * heads >= 65536) {
+                auto registers = naive_prefill_mma::SwaRegisterTile<8>;
+                const size_t registerBytes = sizeof(naive_prefill_mma::SwaRegisterStorage<8>);
+                if (BulkKernelSupported(registers, registerBytes, 90)) {
+                    grouped = registers; bytes = registerBytes; queryTile = 8;
+                }
+            }
             if (BulkKernelSupported(grouped, bytes, 80)) {
-                grouped<<<dim3((queries + 3) / 4, heads / 8), 256, bytes>>>(
-                    (const BF16 *)query.cudaData, FastllmNaiveKV(key), FastllmNaiveKV(value),
+                FastllmNaiveKV readKey(key), readValue(value);
+                int readKeys = keys, readPast = pastLength;
+                const int first = pastLength - (kSwaWindow - 1);
+                const int rows = queries + kSwaWindow - 1;
+                const uint64_t stagingBytes = (uint64_t)rows * (key.dims[2] + value.dims[2]) * sizeof(BF16);
+                // The caller can lend a dead activation or reserved scratch.
+                // Its logical size bounds the write; no allocation or resize.
+                if (prefillScratch && !FastllmCudaGraphIsCapturingFast() &&
+                    prefillScratch->dataDevice == DataDevice::CUDA &&
+                    prefillScratch->dataDeviceIds == query.dataDeviceIds &&
+                    (prefillScratch->dataType == FLOAT32 || prefillScratch->dataType == BFLOAT16) &&
+                    prefillScratch->cudaData &&
+                    (uintptr_t)prefillScratch->cudaData % 16 == 0 &&
+                    prefillScratch->cudaData != query.cudaData && prefillScratch->cudaData != key.cudaData &&
+                    prefillScratch->cudaData != value.cudaData && prefillScratch->cudaData != output.cudaData &&
+                    stagingBytes <= (size_t(256) << 20) && stagingBytes <= prefillScratch->GetBytes() &&
+                    !key.kvCacheFp8Indexer && !value.kvCacheFp8Indexer) {
+                    auto *stagedKey = (BF16 *)prefillScratch->cudaData;
+                    auto *stagedValue = stagedKey + (size_t)rows * key.dims[2];
+                    FastllmCudaNaiveReadCache({{&key, stagedKey, first, rows},
+                                             {&value, stagedValue, first, rows}});
+                    readKey = FastllmNaiveKV(stagedKey);
+                    readValue = FastllmNaiveKV(stagedValue);
+                    readKeys = rows; readPast = kSwaWindow - 1;
+                }
+                grouped<<<dim3((queries + queryTile - 1) / queryTile, heads / 8), 256, bytes>>>(
+                    (const BF16 *)query.cudaData, readKey, readValue,
                     sink.dims.empty() ? nullptr : (const float *)sink.cudaData,
-                    (BF16 *)output.cudaData, queries, heads, kvHeads, key.dims[2], keys, pastLength);
+                    (BF16 *)output.cudaData, queries, heads, kvHeads, key.dims[2], readKeys, readPast);
                 CheckLaunch();
                 return;
             }
@@ -4297,7 +4345,9 @@ void FastllmCudaNaiveReadCache(const std::vector<FastllmNaiveKVRead> &slices) {
             int outWidth = data.dims[2];
             if (data.kvCacheFp8Indexer) outWidth += FastllmNaiveIndexerBytes / 2 - FastllmNaiveIndexerBytes / data.unitSize;
             int elements = s.rows * outWidth;
-            vectorized = vectorized && data.dataType == fastllm::FP4_E2M1 &&
+            vectorized = vectorized && (data.dataType == fastllm::FP4_E2M1 ||
+                (data.dataType == fastllm::FP8_E4M3 && (uintptr_t)data.cudaData % 8 == 0 &&
+                 FastllmNaiveKV(data).offset % 8 == 0)) &&
                 !data.kvCacheFp8Indexer && outWidth % 8 == 0 && (uintptr_t)s.target % 16 == 0;
             batch.rows[i] = {FastllmNaiveKV(data), (BF16 *)s.target, s.first, elements, data.dims[2], outWidth};
             maximum = std::max(maximum, elements);

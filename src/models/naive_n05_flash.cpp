@@ -1618,9 +1618,13 @@ Data NaiveN05FlashModel::RunTarget(
                         q, attentionKey, attentionValue, *selected, sink, cfg.heads, cfg.kvHeads,
                         localPast, balancedIndexRanks, attn)) {
                     if (balancedIndexRanks) FastllmCudaNaiveRestoreIndexerRows(*selected, balancedIndexRanks);
+                    // SWA has no Indexer projections. QKV already consumed this
+                    // request's input norm; post-attention RMSNorm overwrites it.
+                    // Reuse only this dead row slice, including without DSpark.
                     FastllmCudaNaiveAttention(q, attentionKey, attentionValue, *selected, sink,
                         cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim,
-                        localPast, slidingLayers[layer] ? window : 0, attn);
+                        localPast, slidingLayers[layer] ? window : 0, attn, true,
+                        slidingLayers[layer] ? &normed : nullptr);
                 }
                 if (slidingLayers[layer] && capture && !capture->prefixes.empty()) {
                     for (const auto &snapshot : capture->prefixes[attentionParallel ?

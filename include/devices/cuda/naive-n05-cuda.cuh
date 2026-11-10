@@ -249,6 +249,17 @@ void FastllmCudaNaiveAttention(const fastllm::Data &query,
                               int pastLength, int window,
                               fastllm::Data &output, bool causal = true);
 
+// Reuse already reserved per-rank prefill scratch for an exact FP8 KV expansion.
+// The caller must keep this scratch independent of the inputs and output.
+void FastllmCudaNaiveAttention(const fastllm::Data &query,
+                              const fastllm::Data &key,
+                              const fastllm::Data &value,
+                              const fastllm::Data &indices,
+                              const fastllm::Data &sink,
+                              int heads, int kvHeads, int dim, int valueDim,
+                              int pastLength, int window,
+                              fastllm::Data &output, bool causal, const fastllm::Data *prefillScratch);
+
 // Small speculative blocks use the same per-position arithmetic as decode.
 // The temporary KV suffix is visible only through each row's causal prefix.
 void FastllmCudaNaiveVerifyIndexer(const fastllm::Data &query,
