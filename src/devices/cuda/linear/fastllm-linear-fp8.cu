@@ -2089,6 +2089,17 @@ __device__ __forceinline__ float FastllmFp8GridToFloat(uint32_t code) {
     return __uint_as_float(__float_as_uint(float(magnitude) * 0x1p-9f) | sign);
 }
 
+__device__ __forceinline__ uint2 FastllmFp8ScaledBFloat16x4(uint32_t packed, float scale) {
+    const __nv_bfloat16 v0 = __float2bfloat16_rn(FastllmFp8GridToFloat(packed & 255u) * scale);
+    const __nv_bfloat16 v1 = __float2bfloat16_rn(FastllmFp8GridToFloat((packed >> 8) & 255u) * scale);
+    const __nv_bfloat16 v2 = __float2bfloat16_rn(FastllmFp8GridToFloat((packed >> 16) & 255u) * scale);
+    const __nv_bfloat16 v3 = __float2bfloat16_rn(FastllmFp8GridToFloat(packed >> 24) * scale);
+    uint2 values;
+    values.x = __bfloat16_as_ushort(v0) | (uint32_t(__bfloat16_as_ushort(v1)) << 16);
+    values.y = __bfloat16_as_ushort(v2) | (uint32_t(__bfloat16_as_ushort(v3)) << 16);
+    return values;
+}
+
 // Block-32 weights use shifts for scale lookup and one vector store per four
 // outputs. Other scale layouts keep the established conversion below.
 __global__ void FastllmCudaFP8E4M32BF16Block32Kernel(
@@ -2100,13 +2111,7 @@ __global__ void FastllmCudaFP8E4M32BF16Block32Kernel(
         const uint32_t packed = *reinterpret_cast<const uint32_t *>(
             input + (size_t)row * columns + i);
         const float scale = rowScales[i / 32];
-        const __nv_bfloat16 v0 = __float2bfloat16_rn(FastllmFp8GridToFloat(packed & 255u) * scale);
-        const __nv_bfloat16 v1 = __float2bfloat16_rn(FastllmFp8GridToFloat((packed >> 8) & 255u) * scale);
-        const __nv_bfloat16 v2 = __float2bfloat16_rn(FastllmFp8GridToFloat((packed >> 16) & 255u) * scale);
-        const __nv_bfloat16 v3 = __float2bfloat16_rn(FastllmFp8GridToFloat(packed >> 24) * scale);
-        uint2 values;
-        values.x = __bfloat16_as_ushort(v0) | (uint32_t(__bfloat16_as_ushort(v1)) << 16);
-        values.y = __bfloat16_as_ushort(v2) | (uint32_t(__bfloat16_as_ushort(v3)) << 16);
+        const uint2 values = FastllmFp8ScaledBFloat16x4(packed, scale);
         *reinterpret_cast<uint2 *>(output + (size_t)row * columns + i) = values;
     }
 }
@@ -3136,11 +3141,22 @@ __global__ void FastllmCudaFP8E4M3PERCHANNEL2BF16Kernel(uint8_t* a, __nv_bfloat1
     size_t perRow = (size_t)m + sizeof(float);
     uint8_t *row = a + (size_t)st * perRow;
     __nv_bfloat16 *out = b + (size_t)st * m;
-    float scale = *(float*)(row + m);
-
-    for (int i = tid; i < m; i += blockDim.x) {
-        float val = FastllmFp8GridToFloat(row[i]) * scale;
-        out[i] = __float2bfloat16_rn(val);
+    // Decode four bytes per load/store without changing scale or BF16 rounding.
+    // Unaligned layouts retain the scalar path, including partial final groups.
+    if (m % 4 == 0 && (reinterpret_cast<uintptr_t>(row) & 3) == 0 &&
+            (reinterpret_cast<uintptr_t>(out) & 7) == 0) {
+        const float scale = *reinterpret_cast<const float *>(row + m);
+        for (int i = tid * 4; i < m; i += blockDim.x * 4) {
+            const uint32_t packed = *reinterpret_cast<const uint32_t *>(row + i);
+            *reinterpret_cast<uint2 *>(out + i) = FastllmFp8ScaledBFloat16x4(packed, scale);
+        }
+    } else {
+        const uint8_t *bytes = row + m;
+        const float scale = __uint_as_float(uint32_t(bytes[0]) | (uint32_t(bytes[1]) << 8) |
+            (uint32_t(bytes[2]) << 16) | (uint32_t(bytes[3]) << 24));
+        for (int i = tid; i < m; i += blockDim.x) {
+            out[i] = __float2bfloat16_rn(FastllmFp8GridToFloat(row[i]) * scale);
+        }
     }
 }
 
@@ -3537,7 +3553,7 @@ bool FastllmCudaBFloat16MatMulFP8E4M3PerChannel(const fastllm::Data &input, fast
 
     for (int kOff = 0; kOff < k; kOff += maxRowsPerChunk) {
         int kc = std::min(maxRowsPerChunk, k - kOff);
-        FastllmCudaFP8E4M3PERCHANNEL2BF16Kernel <<< kc, 256 >>>(
+        FastllmCudaFP8E4M3PERCHANNEL2BF16Kernel <<< kc, 128 >>>(
             (uint8_t*)weight.cudaData + (size_t)kOff * perRow, cudaBF16Weight, m);
 
         status = cublasGemmEx(fastllmCublasHandle,

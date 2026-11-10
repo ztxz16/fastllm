@@ -3498,6 +3498,12 @@ if (UNIT_TEST)
 
 
 
+        add_executable(cuda_fp8_perchannel_test test/basic/test_cuda_fp8_perchannel.cu)
+        target_link_libraries(cuda_fp8_perchannel_test PRIVATE fastllm)
+        set_target_properties(cuda_fp8_perchannel_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        add_test(NAME cuda_fp8_perchannel COMMAND cuda_fp8_perchannel_test)
+        set_tests_properties(cuda_fp8_perchannel PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+
         add_executable(cuda_fp8_row_test test/basic/test_cuda_fp8_row.cu)
         target_link_libraries(cuda_fp8_row_test PRIVATE fastllm)
         set_target_properties(cuda_fp8_row_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
