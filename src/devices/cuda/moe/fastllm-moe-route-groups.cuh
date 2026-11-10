@@ -3,7 +3,6 @@
 #include <cuda_runtime.h>
 #include <cub/device/device_radix_sort.cuh>
 #include <cub/device/device_scan.cuh>
-#include <cub/block/block_radix_sort.cuh>
 #include <cub/block/block_scan.cuh>
 #include <algorithm>
 #include <cstdint>
@@ -34,18 +33,46 @@ static __global__ void GroupRanges(const uint64_t *keys, const int *ids,
 static constexpr int GroupThreads = 256;
 static __global__ void SmallPlan(const uint64_t *keys, const int *routes,
         uint64_t *sorted, int *entries, uint64_t *records, int *starts, int *groups, int count) {
-    using Sort = cub::BlockRadixSort<uint64_t, GroupThreads, 1, int>;
     using Scan = cub::BlockScan<int, GroupThreads>;
-    __shared__ union { typename Sort::TempStorage sort; typename Scan::TempStorage scan; } temporary;
+    __shared__ union {
+        struct { uint64_t keys[GroupThreads]; int entries[GroupThreads], order[GroupThreads]; } sort;
+        typename Scan::TempStorage scan;
+    } temporary;
     const int i = threadIdx.x;
-    uint64_t key[1] = {i < count ? keys[i] : UINT64_MAX};
-    int entry[1] = {i < count ? routes[i] : -1};
-    Sort(temporary.sort).Sort(key,entry);
-    if (i < count) { sorted[i]=key[0]; entries[i]=entry[0]; }
+    uint64_t key = i < count ? keys[i] : UINT64_MAX;
+    int entry = i < count ? routes[i] : -1, order = i;
+    // A fixed CTA sorting network avoids radix passes over all 64 pointer
+    // bits. The original position breaks ties, preserving stable route order.
+#pragma unroll
+    for (int width = 2; width <= GroupThreads; width *= 2) {
+#pragma unroll
+        for (int distance = width / 2; distance; distance /= 2) {
+            uint64_t peerKey;
+            int peerEntry, peerOrder;
+            if (distance < 32) {
+                peerKey = __shfl_xor_sync(0xffffffffu, (unsigned long long)key, distance);
+                peerEntry = __shfl_xor_sync(0xffffffffu, entry, distance);
+                peerOrder = __shfl_xor_sync(0xffffffffu, order, distance);
+            } else {
+                temporary.sort.keys[i] = key;
+                temporary.sort.entries[i] = entry;
+                temporary.sort.order[i] = order;
+                __syncthreads();
+                peerKey = temporary.sort.keys[i ^ distance];
+                peerEntry = temporary.sort.entries[i ^ distance];
+                peerOrder = temporary.sort.order[i ^ distance];
+                __syncthreads();
+            }
+            const bool smaller = peerKey < key || (peerKey == key && peerOrder < order);
+            const bool keepSmall = ((i & width) == 0) == ((i & distance) == 0);
+            if (smaller == keepSmall) { key = peerKey; entry = peerEntry; order = peerOrder; }
+        }
+    }
+    if (i < count) { sorted[i]=key; entries[i]=entry; }
     __syncthreads();
-    const int head = i < count && key[0] && (!i || key[0] != sorted[i-1]);
+    const int head = i < count && key && (!i || key != sorted[i-1]);
     int id; Scan(temporary.scan).InclusiveSum(head,id);
-    if (head) {records[id-1]=key[0];starts[id-1]=i;}
+    if (head) {records[id-1]=key;starts[id-1]=i;}
     if (i == count-1) {*groups=id;starts[id]=count;}
 }
 
