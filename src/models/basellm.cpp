@@ -3357,6 +3357,12 @@ namespace fastllm {
                             int candidates = 0;
                             bool capacityLimited = false;
                             auto oldest = PrefillBatchPolicy::Clock::time_point::max();
+                            PrefillBatchQueue prefillQueue;
+                            for (int i = 0; i < (int)orders.size(); ++i) {
+                                const auto *ctx = orders[i].context;
+                                if (!ctx->isEnding && ctx->curTokens == 0)
+                                    prefillQueue.Push(i, model->GetPrefillBatchGroup(ctx));
+                            }
                             // Idle/low-load/zero-wait paths go straight to actual
                             // admission. Preview never owns KV or request slots.
                             if (policy.maxWaitMs > 0 && activeDecode >= std::max(1, policy.minDecodeRequests)) {
@@ -3364,8 +3370,9 @@ namespace fastllm {
                                 std::map<PagedCacheManager *, long long> availablePages;
                                 std::map<PagedCacheManager *, DenseIdSet<>> protectedDomains;
                                 std::map<PagedCacheManager *, ResidentPrefixManagers> previewManagers;
-                                for (auto &order : orders) {
-                                    auto *ctx = model->responseContextDict.dicts.at(order.second);
+                                auto previewQueue = prefillQueue;
+                                for (int i; (i = previewQueue.Pop()) >= 0;) {
+                                    auto *ctx = orders[i].context;
                                     if (ctx->isEnding || ctx->curTokens != 0) continue;
                                     if (ctx->cacheLen + ctx->currentTokens.size() > (size_t)maxTotalLens ||
                                         ctx->cacheLen + ctx->currentTokens.size() > (size_t)maxPromptTokens) continue;
@@ -3400,6 +3407,7 @@ namespace fastllm {
                                         for (int page : unreferenced) protectedPages.Insert(page);
                                     }
                                     ++candidates;
+                                    previewQueue.AddTokens(std::min(count, prefillChunk));
                                     pendingTokens += std::min(count, prefillChunk);
                                     oldest = std::min(oldest, ctx->queuedAt);
                                     // A long request occupies the entire chunked forward path.
@@ -3426,9 +3434,10 @@ namespace fastllm {
                             // No restoration occurs on a decode-only wait pass.
                             if (!deferPrefill && !(capacityLimited && candidates == 0)) {
                                 pendingTokens = 0;
-                                for (auto &order : orders) {
+                                for (int i; (i = prefillQueue.Pop()) >= 0;) {
                                     if ((int)plannedPrefills.size() >= slots) break;
-                                    auto *ctx = model->responseContextDict.dicts.at(order.second);
+                                    const auto &order = orders[i];
+                                    auto *ctx = order.context;
                                     if (ctx->isEnding || ctx->curTokens != 0) continue;
                                     if (ctx->cacheLen + ctx->currentTokens.size() > (size_t)maxTotalLens ||
                                         ctx->cacheLen + ctx->currentTokens.size() > (size_t)maxPromptTokens) continue;
@@ -3449,6 +3458,7 @@ namespace fastllm {
                                     }
                                     if (sharedKvPool && !reserveSharedRequest(ctx)) continue;
                                     plannedPrefills.insert(order.second);
+                                    prefillQueue.AddTokens(std::min(count, prefillChunk));
                                     pendingTokens += count;
                                     if (single || pendingTokens >= policy.targetTokens) break;
                                 }

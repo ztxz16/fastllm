@@ -52,6 +52,7 @@ namespace fastllm {
                                      int &token) override;
         bool NeedAttentionMask(int, int) override { return false; }
         bool SupportsPrefillBatching() const override;
+        int GetPrefillBatchGroup(const ResponseContext *context) const override;
         // Bound idle TP prefill workspace with the shared pressure-aware pool.
         bool RetainCudaWorkspace() const override { return tpDevices.size() > 1; }
         // Prefix reuse requires both resident full-attention pages and a GPU SWA checkpoint.

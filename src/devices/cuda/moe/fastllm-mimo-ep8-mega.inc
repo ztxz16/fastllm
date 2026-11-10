@@ -185,9 +185,50 @@ void FastllmCudaMimoEp8PrefillAllGather(FastllmCudaMimoEp8Mega &state, int rank,
     FastllmCudaSyncCurrentThreadStream();
     state.WaitForOutputs();
 }
+static int PrepareMimoEpPrefill(FastllmCudaMimoEp8Mega &state, int rank, void *handle,
+        int total, fastllm::Data *prefillScratch, const fastllm::Data &input,
+        const void **prefillPeers) {
+    using namespace fastllm;
+    int capacity = 0;
+    const int ranks = state.devices.size();
+    // Eligibility uses the common input shape so every rank participates even
+    // when one local buffer is unavailable. Router FP32 input is dead here;
+    // its caller releases all peer readers before reusing the arena.
+    if (FastllmCudaMimoEp8PrefillWorkspaceBytes(total, state.devices.size())) {
+        auto &local = *state.ranks[rank];
+        local.prefillScratch = nullptr;
+        int prefillCapacity = 0;
+        if (prefillScratch && !prefillScratch->isFake && prefillScratch->dataType == FLOAT32 &&
+            prefillScratch->dataDevice == DataDevice::CUDA &&
+            prefillScratch->dataDeviceIds == std::vector<int>{state.devices[rank]} &&
+            !prefillScratch->dims.empty() && prefillScratch->dims.back() == 4096 &&
+            prefillScratch->cudaData != input.cudaData) {
+            prefillCapacity = fastllm_ep8_mega_moe_prepare_prefill(
+                handle, prefillScratch->cudaData, prefillScratch->expansionBytes, total);
+            AssertInFastLLM(prefillCapacity >= 0, fastllm_ep8_mega_moe_error());
+            if (prefillCapacity) local.prefillScratch = prefillScratch->cudaData;
+        }
+        FastllmCudaEventRecordCurrentThread(local.prefillReady);
+        state.WaitForOutputs();
+        bool ready = true;
+        for (const auto &peer : state.ranks) ready = ready && peer->prefillScratch;
+        if (ready) {
+            capacity = prefillCapacity;
+            for (int r = 0; r < ranks; ++r) {
+                const auto &peer = state.ranks[r];
+                FastllmCudaCurrentThreadStreamWaitEvent(peer->prefillReady);
+                prefillPeers[r] = peer->prefillScratch;
+            }
+        }
+        // Every wait must capture this generation before a fast worker can
+        // re-record an event during the next layer's preparation.
+        state.WaitForOutputs();
+    }
+    return capacity;
+}
 void FastllmCudaRunMimoEp8MegaLocal(FastllmCudaMimoEp8Mega &state, int rank, int layer,
         const fastllm::Data &input, const fastllm::Data &index, const fastllm::Data &score,
-        fastllm::Data &output, int maxRows, const int *liveKeys) {
+        fastllm::Data &output, int maxRows, const int *liveKeys, fastllm::Data *prefillScratch) {
     using namespace fastllm;
     AssertInFastLLM(input.dataType == BFLOAT16 && input.dims.size() == 2 &&
         input.dims[1] == 4096 && input.dims[0] >= 0 && input.dims[0] <= maxRows && maxRows > 0 &&
@@ -205,16 +246,36 @@ void FastllmCudaRunMimoEp8MegaLocal(FastllmCudaMimoEp8Mega &state, int rank, int
     output.Resize(input.dims);
     void *handle = state.ranks.at(rank)->layers.at(layer);
     AssertInFastLLM(handle != nullptr, "Missing local MiMo EP layer handle.");
-    const int capacity = fastllm_ep8_mega_moe_decode_capacity(maxRows * state.devices.size(), state.devices.size());
+    int capacity = fastllm_ep8_mega_moe_decode_capacity(maxRows * state.devices.size(), state.devices.size());
+    const void *prefillPeers[8]{};
+    if (prefillScratch) {
+        // Use a common maximum, including idle sources and unequal DP loads.
+        // Decode/Graph calls never enter these eager workspace rendezvous.
+        const int prefillCapacity = PrepareMimoEpPrefill(state, rank, handle,
+            maxRows * state.devices.size(), prefillScratch, input, prefillPeers);
+        if (prefillCapacity) capacity = prefillCapacity;
+    }
     for (int first = 0; first < maxRows; first += capacity) {
         const int start = std::min(first, rows), count = std::max(0, std::min(capacity, rows - start));
         const void *x = rows ? (const uint16_t *)input.cudaData + (size_t)start * 4096 : output.cudaData;
         void *y = (uint16_t *)output.cudaData + (size_t)start * 4096;
         const int32_t *idx = rows ? (const int32_t *)index.cudaData + start * 8 : (const int32_t *)output.cudaData;
         const float *scores = rows ? (const float *)score.cudaData + start * 8 : (const float *)output.cudaData;
-        if (!fastllm_ep8_mega_moe_run_batched(handle, x, y, idx, scores, count, capacity,
-                liveKeys ? liveKeys + start : nullptr))
+        const int ok = prefillPeers[0]
+            ? fastllm_ep8_mega_moe_run_prefill(handle, prefillPeers, x, y, idx, scores, count)
+            : fastllm_ep8_mega_moe_run_batched(handle, x, y, idx, scores, count, capacity,
+                liveKeys ? liveKeys + start : nullptr);
+        if (!ok)
             throw std::runtime_error(std::string("Local MiMo EP launch failed: ") + fastllm_ep8_mega_moe_error());
+    }
+    if (prefillPeers[0]) {
+        // The next layer overwrites borrowed router scratch and resets EP
+        // control data. A fast/empty source must not race slower peer readers.
+        FastllmCudaEventRecordCurrentThread(state.ranks[rank]->prefillReady);
+        state.WaitForOutputs();
+        for (const auto &peer : state.ranks)
+            FastllmCudaCurrentThreadStreamWaitEvent(peer->prefillReady);
+        state.WaitForOutputs();
     }
 }
 bool FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int rank, int layer,
@@ -242,40 +303,10 @@ bool FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int rank, int laye
     int capacity = total % ranks == 0 ? fastllm_ep8_mega_moe_decode_capacity(total, ranks)
                                      : fastllm_ep8_mega_moe_max_rows();
     const void *prefillPeers[8]{};
-    // Eligibility uses the common input shape so every rank participates even
-    // when one local buffer is unavailable. Router FP32 input is dead here;
-    // it is overwritten by the next layer's conversion, after AllGather's
-    // final rendezvous has released every remote reader/writer.
-    if (!graphDecode && FastllmCudaMimoEp8PrefillWorkspaceBytes(total, ranks)) {
-        auto &local = *state.ranks[rank];
-        local.prefillScratch = nullptr;
-        int prefillCapacity = 0;
-        if (prefillScratch && !prefillScratch->isFake && prefillScratch->dataType == FLOAT32 &&
-            prefillScratch->dataDevice == DataDevice::CUDA &&
-            prefillScratch->dataDeviceIds == std::vector<int>{state.devices[rank]} &&
-            !prefillScratch->dims.empty() && prefillScratch->dims.back() == 4096 &&
-            prefillScratch->Count(0) == (size_t)total * 4096 &&
-            prefillScratch->cudaData != input.cudaData) {
-            prefillCapacity = fastllm_ep8_mega_moe_prepare_prefill(
-                handle, prefillScratch->cudaData, prefillScratch->expansionBytes, total);
-            AssertInFastLLM(prefillCapacity >= 0, fastllm_ep8_mega_moe_error());
-            if (prefillCapacity) local.prefillScratch = prefillScratch->cudaData;
-        }
-        FastllmCudaEventRecordCurrentThread(local.prefillReady);
-        state.WaitForOutputs();
-        bool ready = true;
-        for (const auto &peer : state.ranks) ready = ready && peer->prefillScratch;
-        if (ready) {
-            capacity = prefillCapacity;
-            for (int r = 0; r < ranks; ++r) {
-                const auto &peer = state.ranks[r];
-                FastllmCudaCurrentThreadStreamWaitEvent(peer->prefillReady);
-                prefillPeers[r] = peer->prefillScratch;
-            }
-        }
-        // Every wait must capture this generation before a fast worker can
-        // re-record an event during the next layer's preparation.
-        state.WaitForOutputs();
+    if (!graphDecode) {
+        const int prefillCapacity = PrepareMimoEpPrefill(state, rank, handle,
+            total, prefillScratch, input, prefillPeers);
+        if (prefillCapacity) capacity = prefillCapacity;
     }
     auto run = [&](int start, int rows) {
         const int routeStart = localRouting ? start - begin : start;
@@ -356,7 +387,7 @@ bool FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int rank, int laye
 #else
 struct FastllmCudaMimoEp8Mega {};
 void FastllmCudaRunMimoEp8MegaLocal(FastllmCudaMimoEp8Mega &, int, int, const fastllm::Data &,
-    const fastllm::Data &, const fastllm::Data &, fastllm::Data &, int, const int *) {
+    const fastllm::Data &, const fastllm::Data &, fastllm::Data &, int, const int *, fastllm::Data *) {
     throw std::runtime_error("MiMo EP MegaMoE local rows require the SM90 backend.");
 }
 void FastllmCudaMimoEp8PrefillReduceScatter(FastllmCudaMimoEp8Mega &, int, fastllm::Data &) {

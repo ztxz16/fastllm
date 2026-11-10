@@ -36,4 +36,5 @@ bool FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int rank, int laye
 // remains available for layouts whose consumers need replicated activations.
 void FastllmCudaRunMimoEp8MegaLocal(FastllmCudaMimoEp8Mega &state, int rank, int layer,
     const fastllm::Data &input, const fastllm::Data &index, const fastllm::Data &score,
-    fastllm::Data &output, int maxRows, const int *liveKeys = nullptr);
+    fastllm::Data &output, int maxRows, const int *liveKeys = nullptr,
+    fastllm::Data *prefillScratch = nullptr);

@@ -333,6 +333,14 @@ PagedCacheManager *NaiveN05FlashModel::GetPagedKVCacheManager(int layer, bool ke
     return tpPagedCaches.front()[layer * 2 + !key].get();
 }
 
+int NaiveN05FlashModel::GetPrefillBatchGroup(const ResponseContext *context) const {
+    if (attentionDP <= 1 || !context || context->pastKeyValues.empty()) return 0;
+    const auto &devices = context->pastKeyValues.front().first.dataDeviceIds;
+    if (devices.empty()) return 0;
+    const auto owner = std::find(tpDevices.begin(), tpDevices.end(), devices.front());
+    return owner == tpDevices.end() ? 0 : (owner - tpDevices.begin()) / AttentionTPSize();
+}
+
 PagedCacheManager *NaiveN05FlashModel::GetPagedKVCacheBudgetManager(const ResponseContext *context) const {
     if (attentionDP == 1 || !context || context->pastKeyValues.empty())
         return GetPagedKVCacheManager(kvCacheId, true);

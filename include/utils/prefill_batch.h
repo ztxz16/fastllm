@@ -1,6 +1,8 @@
 #pragma once
 
 #include <chrono>
+#include <map>
+#include <vector>
 
 namespace fastllm {
 // Per-replica admission policy. Resource accounting and cache ownership stay
@@ -27,4 +29,36 @@ struct PrefillBatchPolicy {
         return "wait";
     }
 };
+// FIFO within each attention DP group; prefer the least loaded group in a
+// prefill batch. Ties use original admission order, so each new batch starts
+// with the oldest request. Only admitted, uncached tokens count as work.
+// The default single group is exactly FIFO. No missing group delays admission.
+class PrefillBatchQueue {
+    struct Group {
+        std::vector<int> requests;
+        size_t next = 0;
+        long long tokens = 0;
+    };
+    std::map<int, Group> groups;
+    int selected = 0;
+public:
+    void Push(int request, int group) { groups[group].requests.push_back(request); }
+    int Pop() {
+        int request = -1;
+        for (auto &entry : groups) {
+            const auto &group = entry.second;
+            if (group.next == group.requests.size()) continue;
+            const int next = group.requests[group.next];
+            if (request < 0 || group.tokens < groups.at(selected).tokens ||
+                (group.tokens == groups.at(selected).tokens && next < request)) {
+                request = next;
+                selected = entry.first;
+            }
+        }
+        if (request >= 0) ++groups.at(selected).next;
+        return request;
+    }
+    void AddTokens(int count) { groups.at(selected).tokens += count; }
+};
+
 }

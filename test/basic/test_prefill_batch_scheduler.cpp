@@ -24,6 +24,10 @@ class SchedulerModel : public basellm {
 public:
     struct Event { std::vector<int> lengths; Clock::time_point time; bool prefill; };
     std::vector<Event> events;
+    bool grouped = false;
+    int GetPrefillBatchGroup(const ResponseContext *ctx) const override {
+        return grouped && !ctx->allTokens.empty() ? ctx->allTokens.back() : 0;
+    }
     std::atomic<int> restores{0};
     mutable std::atomic<int> previews{0};
     std::atomic<bool> holdDecode{false}, decodeBlocked{false};
@@ -313,6 +317,28 @@ int main() {
                   "invalid config accepted");
             Drain(model, {Launch(model, 4096), Launch(model, 4096)});
             Check(model.Events().size() == 2, "unsupported model schedule changed");
+        }
+        // A grouped arrival must fill all available DP owners before taking
+        // another request from one owner; cached prefixes are not work.
+        for (int cached : {0, 3072}) for (int wait : {0, 50}) {
+            SchedulerModel model(true, cached); model.grouped = true;
+            Check(model.SetPrefillBatching(4096, wait, 0, 4), "group config rejected");
+            Seed(model, cached + 8192); Hold(model);
+            const size_t start = model.Events().size();
+            std::vector<int> handles;
+            for (int owner : {0, 0, 0, 1, 1, 1, 3, 3, 3}) {
+                GenerationConfig cfg; cfg.output_token_limit = 1;
+                cfg.add_special_tokens = false; cfg.top_k = 1;
+                std::vector<int> tokens(cached + (owner == 0 ? 2048 : 1024), 1);
+                tokens.back() = owner;
+                handles.push_back(model.LaunchResponseTokens(tokens, cfg));
+            }
+            model.holdDecode = false; Drain(model, handles);
+            auto events = Prefills(model, start);
+            Check(events.size() == 3, "DP group batch count changed");
+            for (const auto &e : events)
+                Check(e.lengths == std::vector<int>({2048, 1024, 1024}),
+                      "DP admission did not balance uncached tokens / preserve FIFO");
         }
         std::cout << "ALL_PASS preview/admission, capacity, requests, idle, cache invalidation, deadlines, decode, cancellation, chunking\n";
         return 0;

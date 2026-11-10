@@ -839,10 +839,17 @@ Data NaiveN05FlashModel::RunTarget(
     const bool fusePrefillNorm = tensorParallel && !decodeWorkspace && !verifying && length > 1;
     bool prefillNormReady = false, prefillResidualSharded = false;
     // Fully data-parallel attention can keep activations local through the
-    // consecutive MoE layers. Hybrid attention-TP and eager layouts retain
-    // the existing world-row path until they can consume local EP outputs.
+    // consecutive MoE layers, for both decode and prefill. Hybrid attention-TP
+    // and unsupported layer layouts retain the existing world-row path.
+    // Preserve prefill router/MoE arithmetic: its existing EP path routes
+    // equal contiguous world-row shards. Unequal DP rows (or replicated small
+    // prompts) change GEMM shapes and can change discrete expert selection.
+    // Decode retains its independently validated uneven-row implementation.
+    const bool localPrefillRows = attentionParallel && fusePrefillNorm && shardPrefillRouter &&
+        std::all_of(attentionParallel->rows.localToGlobal.begin(), attentionParallel->rows.localToGlobal.end(),
+            [&](const auto &rows) { return rows.size() == attentionParallel->rows.localToGlobal.front().size(); });
     const bool localMoeRows = attentionParallel && AttentionTPSize() == 1 &&
-        tpEp8MegaState && decodeWorkspace && !verifying && block_cnt > 1 && !moeLayers[0] &&
+        tpEp8MegaState && (decodeWorkspace || localPrefillRows) && !verifying && block_cnt > 1 && !moeLayers[0] &&
         std::all_of(moeLayers.begin() + 1, moeLayers.end(), [](bool moe) { return moe; });
     int maxLocalRows = 0;
     if (localMoeRows) for (const auto &rows : attentionParallel->rows.localToGlobal)
@@ -1886,6 +1893,18 @@ Data NaiveN05FlashModel::RunTarget(
             // the normalized activation until MegaMoE finishes reading it.
             auto &executor = *(Executor *)GetExecutor();
             bool hasRouterProbabilities = false;
+            // Every local EP source needs the same arena capacity, even an
+            // empty DP group. FP32 router input is dead before MoE dispatch.
+            auto reservePrefillArena = [&]() {
+                const int rows = localMoe ? maxLocalRows * epRanks : length;
+                const size_t rowBytes = (size_t)embed_dim * sizeof(float);
+                const size_t arenaBytes = FastllmCudaMimoEp8PrefillWorkspaceBytes(rows, epRanks);
+                routerInput.dataType = FLOAT32; routerInput.UpdateUnitSize();
+                routerInput.Resize({(int)std::max<size_t>(rows, (arenaBytes + rowBytes - 1) / rowBytes), embed_dim});
+                routerInput.ToDevice(CUDA, {gpu}, false); routerInput.Allocate(false);
+                routerInput.Resize({rows, embed_dim});
+            };
+            if (localMoe && !decodeWorkspace) reservePrefillArena();
             if (!localMoe || length) {
                 Data routedInput;
                 if (shardRouter) {
@@ -1903,16 +1922,7 @@ Data NaiveN05FlashModel::RunTarget(
                     if (shardPrefillRouter) {
                         // Share one backing allocation with the prefill arena;
                         // only the logical local rows are converted/projected.
-                        routerInput.dataType = FLOAT32;
-                        routerInput.UpdateUnitSize();
-                        const size_t rowBytes = (size_t)embed_dim * sizeof(float);
-                        const size_t arenaBytes = FastllmCudaMimoEp8PrefillWorkspaceBytes(length, tpDevices.size());
-                        const int reserveRows = std::max<size_t>(length,
-                            (arenaBytes + rowBytes - 1) / rowBytes);
-                        routerInput.Resize({reserveRows, embed_dim});
-                        routerInput.ToDevice(normed.dataDevice, normed.dataDeviceIds, false);
-                        routerInput.Allocate(false);
-                        routerInput.Resize({length, embed_dim});
+                        if (!localMoe) reservePrefillArena();
                         localRouterInput.FakeFrom(routerInput, 0);
                     }
                     Data &fp32Input = shardPrefillRouter ? localRouterInput : routerInput;
@@ -1948,7 +1958,8 @@ Data NaiveN05FlashModel::RunTarget(
             if (localMoe) {
                 FastllmCudaRunMimoEp8MegaLocal(*tpEp8MegaState, tpRank, layer, normed,
                     expertIndex, expertScore, moeOutput, maxLocalRows,
-                    (const int *)localDP->liveKeys.cudaData);
+                    decodeWorkspace ? (const int *)localDP->liveKeys.cudaData : nullptr,
+                    decodeWorkspace ? nullptr : &routerInput);
             } else if (tensorParallel && tpEp8MegaState) {
                 moeNormReady = FastllmCudaRunMimoEp8Mega(*tpEp8MegaState, tpRank, layer, normed,
                     expertIndex, expertScore, moeOutput, decodeWorkspace || shardMoe,
@@ -2037,13 +2048,16 @@ Data NaiveN05FlashModel::RunTarget(
         if (localMoe) {
             // The vocabulary head and draft feature consumers require world
             // order. No intermediate attention or MoE layer needs that gather.
-            if (layer + 1 == block_cnt) {
+            if (layer + 1 == block_cnt && decodeWorkspace) {
                 buf.last.dataType = BFLOAT16; buf.last.UpdateUnitSize();
                 buf.last.Resize({1, inputIds.dims[1], embed_dim});
                 buf.last.ToDevice(CUDA, {gpu}, false); buf.last.Allocate(false);
                 attentionParallel->transfer->Collect(tpRank, normed.cudaData, buf.last.cudaData, size_t(embed_dim) * 2);
             }
-            if (captureHidden)
+            // Prefill selects each request's last row, then applies model.norm
+            // below. Keep unnormalized hidden rows for that existing contract
+            // and for intermediate DSpark feature capture.
+            if (captureHidden || (layer + 1 == block_cnt && !decodeWorkspace))
                 attentionParallel->transfer->Collect(tpRank, hidden.cudaData, buf.hidden.cudaData, size_t(embed_dim) * 2);
         }
         if (captureHidden && tpRank <= 0) {
