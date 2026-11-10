@@ -170,7 +170,13 @@ __global__ void ReduceNativeScoredMailbox(const float *cpu, const float *residen
 static int NativeBatchTileRows(const OffloadLayout &layout, int rows) {
     // The route grid uses CUDA's y dimension. Keep its limit independent of
     // the request count and of the number of rows in a speculative proposal.
+    if (layout.weightType == fastllm::EXL3) return rows;
     return std::min(rows, layout.weightType == fastllm::NVFP4_BLOCK_32_E8M0 ? 65535 / kMaxTopK : 8);
+}
+static bool NativeBatchSortRoutes(const OffloadLayout &layout) {
+    // Compressed backends that group record identities themselves consume
+    // original route IDs; do not repeat a quadratic ranking at publication.
+    return layout.weightType != fastllm::EXL3;
 }
 __device__ int NativeBatchRouteRank(const int32_t *indices, int r, int rows, int topk, int tileRows = 8) {
     const int first = r / (tileRows * topk) * (tileRows * topk);
@@ -184,16 +190,16 @@ __global__ void PublishNativeBatchMoe(NativeMoeControl *box, uint16_t *hostInput
         const uint16_t *input, const int32_t *indices, const float *scores,
         const int32_t *keys, const int32_t *slotKeys, int32_t *slots, int32_t *routeMap,
         unsigned long long *hits, unsigned long long *misses,
-        int base, int experts, int hidden, int rows, int topk, int tileRows = 8) {
+        int base, int experts, int hidden, int rows, int topk, int tileRows = 8, bool sorted = true) {
     for (int c = threadIdx.x; c < rows * hidden; c += blockDim.x) hostInput[c] = input[c];
     for (int r = threadIdx.x; r < rows * topk; r += blockDim.x) {
         const int expert = indices[r], key = base + expert;
         int slot = expert >= 0 && expert < experts ?
             fastllm::cuda::moe_admission::LoadAdmission(keys + key) : -1;
         if (slot >= 0 && slotKeys[slot] != key) slot = -1;
-        const int at = NativeBatchRouteRank(indices, r, rows, topk, tileRows);
+        const int at = sorted ? NativeBatchRouteRank(indices, r, rows, topk, tileRows) : r;
         slots[at] = slot;
-        routeMap[at] = r % (tileRows * topk);
+        routeMap[at] = sorted ? r % (tileRows * topk) : r;
         box->ids()[r] = expert; box->resident()[r] = slot; box->scores()[r] = scores[r];
         atomicAdd(slot >= 0 ? hits : misses, 1ULL);
     }
@@ -742,18 +748,11 @@ struct NativeMoeMailbox {
             // their captured branches can execute concurrently.
             fastllm::AssertInFastLLM(stream==cudaStreamPerThread && w.owner,
                 "EXL3 mailbox requires the full-graph compute stream");
-            for (int first = 0; first < w.rows; first += 8) {
-                const int rows = std::min(8, w.rows - first), base = first * w.topk;
-                fastllm::Data input;
-                input.FakeFrom(w.compute->quantized, size_t(first) * w.hidden * sizeof(uint16_t));
-                input.Resize({rows, w.hidden});
-                fastllm::AssertInFastLLM(FastllmCudaExl3Cache(input, records, slots + base,
-                    resident ? w.owner->cache.slotOffsets : nullptr, layout.recordStride, layout.downOffset,
-                    layout.inter, layout.gateBlockK, layout.downBlockK, scores + base, w.topk, layout.swigluLimit,
-                    w.compute->partial + (resident ? 0 : size_t(w.routes) * w.hidden) + size_t(base) * w.hidden,
-                    resident ? 0 : 1, w.routeMap ? w.routeMap + base : nullptr, rows * w.topk),
-                    "EXL3 graph expert compute failed");
-            }
+            fastllm::AssertInFastLLM(FastllmCudaExl3Cache(w.compute->quantized, records, slots,
+                resident ? w.owner->cache.slotOffsets : nullptr, layout.recordStride, layout.downOffset,
+                layout.inter, layout.gateBlockK, layout.downBlockK, scores, w.topk, layout.swigluLimit,
+                w.compute->partial + (resident ? 0 : size_t(w.routes) * w.hidden),
+                resident ? 0 : 1, w.routeMap, w.routes), "EXL3 graph expert compute failed");
             return;
         }
         if (resident && w.hidden % 256 == 0 && layout.inter % 32 == 0 && FastllmCudaRuntimeArch() == 120) {
@@ -868,7 +867,7 @@ struct NativeMoeMailbox {
                 reinterpret_cast<uint16_t *>(w.mappedData), static_cast<const uint16_t *>(input.cudaData),
                 static_cast<const int32_t *>(index.cudaData), static_cast<const float *>(score.cudaData),
                 cache.keyToSlot, cache.slotKeys, w.slots, w.routeMap, cache.hitCount, cache.totalMissCount,
-                table * layout.experts, layout.experts, w.hidden, w.rows, topk, NativeBatchTileRows(layout, w.rows));
+                table * layout.experts, layout.experts, w.hidden, w.rows, topk, NativeBatchTileRows(layout, w.rows), NativeBatchSortRoutes(layout));
             else PublishNativeMoe<<<1, w.hidden >= 4096 ? 512 : 256, 0, cudaStreamPerThread>>>(w.mapped, w.mappedData,
                 static_cast<const __nv_bfloat16 *>(input.cudaData), static_cast<const int32_t *>(index.cudaData),
                 static_cast<const float *>(score.cudaData), cache.keyToSlot, cache.slotKeys, w.slots,
@@ -901,7 +900,7 @@ struct NativeMoeMailbox {
                 WaitNativeMoe<<<1, 1, 0, cudaStreamPerThread>>>(&w.mapped->planned);
                 ReadNativeBatchPlan<<<1, 256, 0, cudaStreamPerThread>>>(w.mapped,
                     static_cast<const int32_t *>(index.cudaData), w.slots + w.routes,
-                    w.slots + 2 * w.routes, w.rows, topk, !w.standard, NativeBatchTileRows(layout, w.rows));
+                    w.slots + 2 * w.routes, w.rows, topk, !w.standard && NativeBatchSortRoutes(layout), NativeBatchTileRows(layout, w.rows));
                 if (FastllmCudaStreamGetCaptureDependencies(cudaStreamPerThread, &status, &graph, &deps, &count) != cudaSuccess) return false;
                 residentFork.assign(deps, deps + count);
             }

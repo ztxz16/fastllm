@@ -182,6 +182,11 @@ struct WinArgs {
     // part arrives while the device computes the experts); cpu_flag may be null (no CPU part)
     const unsigned* wait_ptr = nullptr;
     unsigned wait_val = 0;
+    // Fastllm: optional caller-owned scratch for whole-batch expert grouping.
+    // Defaults retain the upstream fixed scratch and call semantics.
+    float* up = nullptr;
+    unsigned* group_counters = nullptr;
+    int group_capacity = 0;
 };
 bool win_experts(const WinArgs& a, cudaStream_t s);
 /// Whether the current device runs the several-activation kernels (win_experts; mv's ncol > 1): every device does

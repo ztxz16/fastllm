@@ -566,14 +566,11 @@ namespace {
 __global__ void CacheDescriptors(const uint8_t *records, const int32_t *slots,
     const uint64_t *offsets, size_t stride, size_t downOffset, int k, int mid,
     int gateBits, int downBits, int count, Exl3Projection *table, int *routes, const int *routeMap, int routeCount) {
-    const int at=threadIdx.x;
-    if (at>=count) return;
-    int selected=at;
-    if (routeMap) {
-        selected=-1;
-        for (int i=0;i<routeCount;++i) if (routeMap[i]==at) {selected=i;break;}
-    }
-    const int slot=selected<0?-1:slots[selected]; routes[at]=slot<0?-1:at;
+    const int selected = blockIdx.x * blockDim.x + threadIdx.x;
+    if (selected >= (routeMap ? routeCount : count)) return;
+    const int at = routeMap ? routeMap[selected] : selected;
+    if (at < 0 || at >= count) return;
+    const int slot = slots[selected]; routes[at] = slot < 0 ? -1 : at;
     if (slot<0) return;
     const auto *record=records+(offsets?offsets[slot]:size_t(slot)*stride);
     for(int part=0;part<3;++part) {
@@ -603,7 +600,7 @@ bool FastllmCudaExl3Cache(const fastllm::Data &input, const uint8_t *records,
         gateBits,downBits,scores,topk,limit,perExpert,workspace,routeMap,routeCount,preserveMissing)) return true;
 #endif
     using namespace fastllm;
-    if(input.dataType!=BFLOAT16 || input.dims.size()!=2 || input.dims[0]<1 || input.dims[0]>8 ||
+    if(input.dataType!=BFLOAT16 || input.dims.size()!=2 || input.dims[0]<1 ||
         topk<1 || topk>8 || !Exl3BitRateSupported(gateBits) || !Exl3BitRateSupported(downBits)) return false;
     const int k=input.dims[1],rows=input.dims[0],tasks=rows*topk,device=FastllmCudaGetDevice();
     using Key=std::tuple<int,int,int,int,int,int>;
@@ -616,17 +613,30 @@ bool FastllmCudaExl3Cache(const fastllm::Data &input, const uint8_t *records,
     for(auto *d:{&work.input,&work.gate,&work.down,&work.result,&work.table,&work.routes})d->Allocate(false);
     auto *table=static_cast<Exl3Projection *>(work.table.cudaData);auto *routes=static_cast<int *>(work.routes.cudaData);
     const auto stream=cudaStreamPerThread;
-    CacheDescriptors<<<1,64,0,stream>>>(records,slots,offsets,stride,downOffset,k,mid,gateBits,downBits,tasks,table,routes,routeMap,routeCount);
-    MoePrepare<<<dim3(k/128,topk*2,rows),128,0,stream>>>(input.cudaData,input.dataType,routes,table,
-        static_cast<float *>(work.input.cudaData),k,topk);
-    MoeProduct<<<dim3(mid/128,gateSplits,tasks*2),128,0,stream>>>(static_cast<float *>(work.input.cudaData),
-        routes,table,static_cast<float *>(work.gate.cudaData),k,mid,topk,gateSplits,false);
-    MoeGateAndPrepareDown<<<dim3(mid/128,tasks),128,0,stream>>>(static_cast<float *>(work.gate.cudaData),routes,table,
-        static_cast<float *>(work.down.cudaData),mid,gateSplits,limit);
-    MoeProduct<<<dim3(k/128,downSplits,tasks),128,0,stream>>>(static_cast<float *>(work.down.cudaData),routes,table,
-        static_cast<float *>(work.result.cudaData),mid,k,topk,downSplits,true);
-    MoeFinish<<<dim3(k/128,rows),128,0,stream>>>(static_cast<float *>(work.result.cudaData),routes,scores,table,
-        nullptr,k,topk,downSplits,perExpert,preserveMissing);
+    const int selected = routeMap ? routeCount : tasks;
+    if (selected < 1 || selected > tasks) return false;
+    cudaMemsetAsync(routes, 0xff, size_t(tasks) * sizeof(int), stream);
+    CacheDescriptors<<<(selected+255)/256,256,0,stream>>>(records,slots,offsets,stride,downOffset,k,mid,
+        gateBits,downBits,tasks,table,routes,routeMap,routeCount);
+    // Only the physical grid.z dimension is bounded. Routing and storage cover
+    // the complete logical batch, including sparse and reordered route maps.
+    const int gridRows = 65535 / (2 * topk);
+    for (int first = 0; first < rows; first += gridRows) {
+        const int batch = std::min(gridRows, rows - first), route = first * topk, count = batch * topk;
+        const int *batchRoutes = routes + route;
+        float *x = static_cast<float *>(work.input.cudaData) + size_t(route) * 2 * k;
+        float *g = static_cast<float *>(work.gate.cudaData) + size_t(route) * 2 * gateSplits * mid;
+        float *d = static_cast<float *>(work.down.cudaData) + size_t(route) * mid;
+        float *y = static_cast<float *>(work.result.cudaData) + size_t(route) * downSplits * k;
+        MoePrepare<<<dim3(k/128,topk*2,batch),128,0,stream>>>(
+            static_cast<const uint16_t *>(input.cudaData) + size_t(first) * k,
+            input.dataType,batchRoutes,table,x,k,topk);
+        MoeProduct<<<dim3(mid/128,gateSplits,count*2),128,0,stream>>>(x,batchRoutes,table,g,k,mid,topk,gateSplits,false);
+        MoeGateAndPrepareDown<<<dim3(mid/128,count),128,0,stream>>>(g,batchRoutes,table,d,mid,gateSplits,limit);
+        MoeProduct<<<dim3(k/128,downSplits,count),128,0,stream>>>(d,batchRoutes,table,y,mid,k,topk,downSplits,true);
+        MoeFinish<<<dim3(k/128,batch),128,0,stream>>>(y,batchRoutes,scores+route,table,
+            nullptr,k,topk,downSplits,perExpert+size_t(route)*k,preserveMissing);
+    }
     return cudaGetLastError()==cudaSuccess;
 }
 

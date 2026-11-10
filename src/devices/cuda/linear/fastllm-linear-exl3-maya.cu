@@ -6,6 +6,8 @@
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "strata/kernels/exl3.hpp"
 #include "utils/kernel_registry.h"
+#include "../moe/fastllm-moe-route-groups.cuh"
+#include <climits>
 #include <cuda_fp16.h>
 #include <algorithm>
 #include <array>
@@ -35,9 +37,9 @@ bool Enabled() {
 #endif
 }
 struct Workspace {
-    Data plan{INT8}, h{FLOAT32}, part{FLOAT32}, groups{INT8}, scores{FLOAT32};
+    Data plan{INT8}, h{FLOAT32}, up{FLOAT32}, part{FLOAT32}, groups{INT8}, scores{FLOAT32}, counters{INT32};
     explicit Workspace(int dev) {
-        for (Data *d : {&plan, &h, &part, &groups, &scores}) { d->dataDevice = DataDevice::CUDA; d->dataDeviceIds = {dev}; }
+        for (Data *d : {&plan, &h, &up, &part, &groups, &scores, &counters}) { d->dataDevice = DataDevice::CUDA; d->dataDeviceIds = {dev}; }
     }
 };
 Workspace &Work(int k, int n, int rows, int topk = 0) {
@@ -98,82 +100,78 @@ __global__ void CachePlan(const uint8_t *records, const int *slots, const uint64
     }
 }
 
-// At most eight rows with eight routes each. Normalize the scheduler's compact
-// route map and group equal device records without a host readback. Padded
-// entries retain the upstream window ABI (token * 8 + top-k slot).
-__global__ void WindowPlan(const int *selection, const float *scores, int rows, int topk,
+// Bind the complete logical batch before grouping. Entries retain the
+// arithmetic kernel's token * 8 + top-k encoding; 8 is the route stride,
+// not the number of tokens admitted by the adapter.
+__global__ void WindowRoutes(const int *selection, const float *scores, int rows, int topk,
         const unsigned long long *lookup, int experts, const uint8_t *records,
-        const uint64_t *offsets, size_t stride, const int *routeMap, int routeCount,
-        unsigned long long *plan, float *weights, unsigned long long *groupPointers,
-        int *starts, int *entries, int *groupCount) {
-    __shared__ unsigned long long pointers[64];
-    __shared__ int leaders[64], counts[64], positions[64];
-    const int e = threadIdx.x, row = e / 8, lane = e % 8;
+        const uint64_t *offsets, size_t stride, const int *routeMap, int count,
+        unsigned long long *plan, float *weights, uint64_t *keys, int *entries) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const int route = routeMap ? routeMap[i] : i;
     unsigned long long ptr = 0;
-    if (row < rows && lane < topk) {
-        const int route = row * topk + lane;
-        int selected = route;
-        if (routeMap) {
-            selected = -1;
-            for (int i = 0; i < routeCount; ++i)
-                if (routeMap[i] == route) { selected = i; break; }
-        }
-        const int id = selected < 0 ? -1 : selection[selected];
+    const int encoded = route >= 0 && route < rows * topk ? route / topk * 8 + route % topk : 0;
+    if (route >= 0 && route < rows * topk) {
+        const int id = selection[i];
         if (id >= 0) {
             if (lookup) ptr = id < experts ? lookup[id] : 0;
             else ptr = reinterpret_cast<unsigned long long>(records + (offsets ? offsets[id] : size_t(id) * stride));
         }
-        weights[e] = scores[route];
-    } else if (row < rows) weights[e] = 0;
-    if (row < rows) plan[e] = ptr;
-    pointers[e] = ptr;
-    __syncthreads();
-    int first = e, rank = 0, count = 0;
-    if (ptr) for (int i = 0; i < rows * 8; ++i) if (pointers[i] == ptr) {
-        first = min(first, i); rank += i < e; ++count;
+        plan[encoded] = ptr;
+        weights[encoded] = scores[route];
     }
-    leaders[e] = ptr ? first : -1;
-    counts[e] = count;
-    __syncthreads();
-    if (e == 0) {
-        int groups = 0, cursor = 0;
-        for (int i = 0; i < rows * 8; ++i) if (leaders[i] == i) {
-            groupPointers[groups] = pointers[i]; starts[groups++] = cursor;
-            positions[i] = cursor; cursor += counts[i];
-        }
-        starts[groups] = cursor; *groupCount = groups;
-    }
-    __syncthreads();
-    if (ptr) entries[positions[first] + rank] = e;
+    keys[i] = ptr;
+    entries[i] = encoded;
 }
 
 bool Window(const Data &input, const int *selection, const float *scores, int topk,
         int mid, float limit, const maya::ExpertLayout &layout, const maya::MixedLayouts &mix,
         bool indirect, const unsigned long long *lookup, int experts, const uint8_t *records,
         const uint64_t *offsets, size_t stride, const int *routeMap, int routeCount,
-        float *output, bool routeOutput, bool preserveMissing, int scratchLane,
-        int firstRow = 0, int tileRows = 0) {
-    const int rows = tileRows ? tileRows : input.dims[0], k = input.dims[1], capacity = rows * 8;
-    auto &work = Work(k, mid, rows, -128-16*scratchLane-topk);
-    work.plan.Resize({capacity * int(sizeof(unsigned long long))});
-    work.scores.Resize({capacity});
-    work.h.Resize({capacity, mid}); work.part.Resize({capacity, k});
-    work.groups.Resize({capacity * int(sizeof(unsigned long long)) + (2*capacity+2) * int(sizeof(int))});
-    for (auto *d : {&work.plan, &work.scores, &work.h, &work.part, &work.groups}) d->Allocate(false);
+        float *output, bool routeOutput, bool preserveMissing, int scratchLane) {
+    using fastllm::moe_routes::Plan;
+    const int rows = input.dims[0], k = input.dims[1];
+    if (rows < 1 || rows > INT_MAX / 8 || topk < 1 || topk > 8) return false;
+    const int count = routeMap ? routeCount : rows * topk, capacity = rows * 8;
+    if (count < 1 || count > rows * topk) return false;
+    // Graphs share capacity classes, not one persistent allocation per exact
+    // row count. Allocate the whole class before capture so later shapes cannot
+    // move addresses referenced by an earlier graph. Total retained storage
+    // grows geometrically with the largest batch rather than quadratically.
+    int workspaceRows = 1;
+    while (workspaceRows < rows && workspaceRows <= INT_MAX/16) workspaceRows *= 2;
+    workspaceRows = std::max(workspaceRows,rows);
+    const int workspaceRoutes = workspaceRows * topk, workspaceEntries = workspaceRows * 8;
+    const size_t scratch = Plan::TemporaryBytes(workspaceRoutes);
+    const size_t bytes = scratch ? Plan(nullptr, workspaceRoutes, scratch).bytes : 0;
+    if (!bytes || bytes > INT_MAX) return false;
+    auto &work = Work(k, mid, workspaceRows, -128-16*scratchLane-topk);
+    work.plan.Resize({workspaceEntries, int(sizeof(unsigned long long))});
+    work.scores.Resize({workspaceEntries});
+    work.h.Resize({workspaceEntries, mid}); work.up.Resize({workspaceEntries, mid});
+    work.part.Resize({workspaceEntries, k}); work.groups.Resize({int(bytes)});
+    work.counters.Resize({workspaceRoutes, mid / 128});
+    for (auto *d : {&work.plan, &work.scores, &work.h, &work.up, &work.part, &work.groups, &work.counters}) d->Allocate(false);
     auto *plan = static_cast<unsigned long long *>(work.plan.cudaData);
-    auto *groupPointers = static_cast<unsigned long long *>(work.groups.cudaData);
-    auto *starts = reinterpret_cast<int *>(groupPointers + capacity);
-    auto *entries = starts + capacity + 1, *groupCount = entries + capacity;
     auto *weights = static_cast<float *>(work.scores.cudaData);
-    WindowPlan<<<1,64,0,cudaStreamPerThread>>>(selection,scores,rows,topk,lookup,experts,records,
-        offsets,stride,routeMap,routeCount,plan,weights,groupPointers,starts,entries,groupCount);
+    Plan grouped(work.groups.cudaData, count, scratch);
+    if (cudaMemsetAsync(plan, 0, size_t(capacity) * sizeof(*plan), cudaStreamPerThread) != cudaSuccess ||
+        cudaMemsetAsync(weights, 0, size_t(capacity) * sizeof(*weights), cudaStreamPerThread) != cudaSuccess ||
+        cudaMemsetAsync(work.counters.cudaData, 0, work.counters.GetBytes(), cudaStreamPerThread) != cudaSuccess) return false;
+    WindowRoutes<<<(count + 255) / 256, 256, 0, cudaStreamPerThread>>>(selection,scores,rows,topk,lookup,experts,records,
+        offsets,stride,routeMap,count,plan,weights,grouped.keys,grouped.routes);
+    if (!grouped.Build(cudaStreamPerThread)) return false;
     maya::WinArgs a;
     a.T=rows; a.k=topk; a.n_embd=k; a.n_ff=mid; a.limit=limit;
-    a.grp_ptr=groupPointers; a.grp_start=starts; a.grp_ent=entries; a.n_groups=groupCount;
+    a.grp_ptr=reinterpret_cast<const unsigned long long *>(grouped.records);
+    a.grp_start=grouped.starts; a.grp_ent=grouped.entries; a.n_groups=grouped.groups;
     a.plan_ptr=plan; a.plan_w=weights; a.lay=layout; a.mix=mix; a.indirect=indirect;
-    a.x16=static_cast<const uint16_t *>(input.cudaData) + size_t(firstRow)*k;
+    a.x16=static_cast<const uint16_t *>(input.cudaData);
     a.x_bf16=true; a.x_stride=k;
     a.h=static_cast<float *>(work.h.cudaData); a.part=static_cast<float *>(work.part.cudaData);
+    a.up=static_cast<float *>(work.up.cudaData);
+    a.group_counters=static_cast<unsigned *>(work.counters.cudaData); a.group_capacity=count;
     a.out=output; a.out_stride=k; a.round_bf16=true; a.route_output=routeOutput;
     a.preserve_missing=preserveMissing; a.scratch_lane=scratchLane;
     return maya::win_experts(a,cudaStreamPerThread) && cudaGetLastError()==cudaSuccess;
@@ -187,7 +185,7 @@ bool FastllmCudaExl3MayaCache(const fastllm::Data &input, const uint8_t *records
     float limit, float *perExpert, int workspace, const int32_t *routeMap, int routeCount, bool preserveMissing) {
     using namespace fastllm;
     if (!Enabled() || input.dataType != BFLOAT16 || input.dims.size() != 2 ||
-        input.dims[0] < 1 || input.dims[0] > 8 || topk < 1 || topk > 8 ||
+        input.dims[0] < 1 || topk < 1 || topk > 8 ||
         !maya::k2_supported(gateBits,2) || !maya::k2_supported(downBits,2)) return false;
     const int k = input.dims[1], rows = input.dims[0];
     if (k < 128 || inter < 128 || k > 8192 || inter > 8192 || k%128 || inter%128) return false;
@@ -439,17 +437,10 @@ bool FastllmCudaExl3MayaMoe(const fastllm::Data &input, fastllm::Data &output,
     if (rows > 1) {
         if (output.dataType != FLOAT32) { output.FreeSpace(); output.dataType=FLOAT32; }
         output.Resize({rows,k}); output.ToDevice(CUDA,{device},false); output.Allocate(false);
-        // WindowPlan's 64 lanes encode eight rows of eight routes. This is a
-        // physical compute tile, not a logical request/batch admission limit.
-        constexpr int tileCapacity = 64 / 8;
-        for (int first=0; first<rows; first+=tileCapacity) {
-            const int count=std::min(tileCapacity, rows-first);
-            if (!Window(input, static_cast<const int *>(index.cudaData)+size_t(first)*topk,
-                static_cast<const float *>(score.cudaData)+size_t(first)*topk,
-                topk, mid, limit, dir->lay, dir->mix, true, dir->lookup, experts,
-                nullptr, nullptr, 0, nullptr, 0, static_cast<float *>(output.cudaData)+size_t(first)*k,
-                false, false, 0, first, count)) return false;
-        }
+        if (!Window(input, static_cast<const int *>(index.cudaData),
+            static_cast<const float *>(score.cudaData), topk, mid, limit,
+            dir->lay, dir->mix, true, dir->lookup, experts, nullptr, nullptr, 0,
+            nullptr, 0, static_cast<float *>(output.cudaData), false, false, 0)) return false;
         markWarm();
         return true;
     }

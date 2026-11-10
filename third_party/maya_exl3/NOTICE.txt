@@ -92,3 +92,13 @@ upstream hashes and both MIT license files above remain unchanged.
   no upstream arithmetic kernel is copied or rewritten by this adapter change.
 The pinned import revision and original file hashes remain historical provenance;
 these local changes do not imply an unmodified upstream source or a new import.
+
+2026-11-10 whole-batch expert grouping (Fastllm local changes):
+- The Fastllm adapter groups record identities across the full route batch,
+  retaining the imported arithmetic kernels and their internal activation tiles.
+- Optional caller-owned up/counter scratch removes the fixed window capacity;
+  physical CUDA grids are chunked without truncating the logical group list.
+  Capacity classes retain stable graph addresses with storage linear in the
+  largest batch, rather than retaining a separate arena for every row count.
+- The new CUDA route planner is Fastllm code. No new upstream code was imported;
+  original provenance, licenses, arithmetic and default API behavior remain.
