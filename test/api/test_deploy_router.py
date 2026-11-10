@@ -109,6 +109,58 @@ class AffinityTests(unittest.TestCase):
 
 
 class TransportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_generation_uses_fresh_connections_without_replaying_posts(self):
+        accepted = []
+        stale_posts = []
+        clients = set()
+        async def backend(reader, writer):
+            clients.add(writer)
+            posts = 0
+            try:
+                while True:
+                    header = await reader.readuntil(b'\r\n\r\n')
+                    method = header.split(b' ', 1)[0]
+                    length = next((int(line.split(b':', 1)[1]) for line in header.split(b'\r\n')
+                                   if line.lower().startswith(b'content-length:')), 0)
+                    body = await reader.readexactly(length)
+                    if method == b'POST':
+                        posts += 1
+                        if posts > 1:
+                            # Reproduce a backend retiring an idle connection
+                            # just as the pool reuses it for a generation POST.
+                            stale_posts.append(body)
+                            break
+                        accepted.append(body)
+                    payload = b'{"data":[]}' if method == b'GET' else body
+                    writer.write(b'HTTP/1.1 200 OK\r\nContent-Length: ' +
+                                 str(len(payload)).encode() + b'\r\nContent-Type: application/json\r\n\r\n' + payload)
+                    await writer.drain()
+            except (asyncio.IncompleteReadError, ConnectionError):
+                pass
+            finally:
+                writer.close()
+                clients.discard(writer)
+        upstream = await asyncio.start_server(backend, '127.0.0.1', 0)
+        base = 'http://127.0.0.1:' + str(upstream.sockets[0].getsockname()[1])
+        with tempfile.TemporaryDirectory() as tmp:
+            router = Router(config([base]), tmp)
+            proxy, url = await serve(router.app())
+            try:
+                async with ClientSession() as client:
+                    for body in (b'{"turn":1}', b'{"turn":2}'):
+                        async with client.post(url+'/v1/messages', data=body) as response:
+                            self.assertEqual(response.status, 200)
+                            self.assertEqual(await response.read(), body)
+                self.assertEqual(accepted, [b'{"turn":1}', b'{"turn":2}'])
+                self.assertEqual(stale_posts, [])
+                self.assertEqual(router.pending, [0])
+            finally:
+                await proxy.cleanup()
+                upstream.close()
+                await upstream.wait_closed()
+                for writer in tuple(clients):
+                    writer.close()
+
     async def test_compressed_request_body_and_encoding_are_preserved(self):
         received = []
         async def backend(request):

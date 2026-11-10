@@ -112,7 +112,9 @@ class Router:
 
     async def lifecycle(self, app):
         timeout = ClientTimeout(total=self.settings['request_timeout_seconds'], sock_connect=15, sock_read=None)
-        async with ClientSession(timeout=timeout, connector=TCPConnector(limit=0), auto_decompress=False,
+        # A backend may retire an idle keep-alive connection while it is being
+        # reused. Generation POSTs cannot safely be replayed after that race.
+        async with ClientSession(timeout=timeout, connector=TCPConnector(limit=0, force_close=True), auto_decompress=False,
                                  trust_env=False) as client:
             self.client = client
             await self.check_health()
@@ -200,6 +202,7 @@ class Router:
                 if request.transport:
                     request.transport.close()
                 return response
+            record['status'] = 502
             raise web.HTTPBadGateway(text='Replica request failed') from error
         finally:
             if acquired:
