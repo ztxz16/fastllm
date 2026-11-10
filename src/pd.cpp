@@ -529,6 +529,12 @@ void PDRuntime::RunPrefill(basellm &model) {
     const size_t prepareBudget = tokenCapacity / 2;
     const size_t page = residentPrefix ? std::max(1, GetPageLen()) : 1;
     const size_t contextLimit = std::max(batchRequests, model.maxBatch > 0 ? model.maxBatch : 1);
+    auto startHostRestore = [&](const Request &request) {
+        auto placement = PDReceivePlacement(request->hostHit.Metadata(), request->hostHit.Payloads(), model.PDDevices());
+        if (placement.empty()) placement.assign(request->hostHit.Payloads(), -1);
+        return hostCache->RestoreAsync(request->hostHit, std::move(placement), request->hostRestore,
+                                       request->cancellation);
+    };
     auto retire = [&](const Request &request) {
         request->SetRemaining(0); request->SetRestoreBytes(0);
         reserved -= request->reservation;
@@ -630,10 +636,7 @@ void PDRuntime::RunPrefill(basellm &model) {
                 try {
                     if (request->restoring) {
                         if (!request->hostRestore.valid()) {
-                            auto placement = PDReceivePlacement(request->hostHit.Metadata(), request->hostHit.Payloads(), model.PDDevices());
-                            if (placement.empty()) placement.assign(request->hostHit.Payloads(), -1);
-                            if (!hostCache->RestoreAsync(request->hostHit, std::move(placement), request->hostRestore,
-                                                         request->cancellation)) { ++it; continue; }
+                            if (!startHostRestore(request)) { ++it; continue; }
                         }
                         if (request->hostRestore.wait_for(std::chrono::seconds(0)) != std::future_status::ready) { ++it; continue; }
                         auto state = request->hostRestore.get();
@@ -723,6 +726,9 @@ void PDRuntime::RunPrefill(basellm &model) {
                         request->restoring = true; request->restoreBegin = restoreBegin;
                         request->SetRestoreBytes(request->hostHit.Bytes());
                         request->SetRemaining(request->input.size() - request->hostHit.Tokens());
+                        // Start the private copy before the next forward. A busy
+                        // cache retries from prepared; import remains on this lane.
+                        startHostRestore(request);
                         prepared.push_back(request); preparedTokens += request->reservation;
                         continue;
                     }
