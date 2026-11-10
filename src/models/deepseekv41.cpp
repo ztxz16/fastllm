@@ -2480,6 +2480,7 @@ namespace fastllm {
             v41StatesByFirstKey.clear();
             v41PendingRestoredState.reset();
         }
+        v41DsparkBatches.clear();
         v41CudaGraphSlots.clear();
         v41AttentionParallel.reset();
         ReleaseMoeCudaCache(weights);
@@ -8235,8 +8236,10 @@ namespace fastllm {
                     if (draft && !draft->disabled) {
                         std::vector<int> proposed;
                         std::vector<float> confidence;
+                        const int valid = std::min({draft->filled, window_size, draft->committed});
                         for (int round = 0; round < 3; ++round)
-                            DsparkRunDraft(*draft, 1, proposed, confidence, configs[0]);
+                            DsparkRunDraft(*draft, {draft->committed}, {1}, {valid},
+                                           proposed, confidence, configs[0]);
                     }
                 } else ForwardSegments(segments, ids, nullptr, nullptr, configs, last, nullptr, past);
                 printf("[Warmup] DeepSeek-V4.1 prefill: %d tokens finished in %.3f s.\n", count,

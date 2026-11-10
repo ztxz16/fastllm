@@ -1277,7 +1277,7 @@ def _v41_runtime_bytes(args, model, mode, mapping, resident, context, batch, chu
                     capacities.append(16)
                 result["staging"][d] += upload_bytes(host_layers, capacities)
             if has_draft:
-                capacities = [min(r["draft_experts"], min(32, model.dspark_block_size) * r["draft_topk"])]
+                capacities = [min(r["draft_experts"], min(32, model.dspark_block_size * (batch if len(mapping) == 1 else 1)) * r["draft_topk"])]
                 if model.dspark_block_size == 1:
                     capacities += [16, r["draft_topk"]]
                 if draft_graphs:
@@ -1329,22 +1329,30 @@ def _v41_runtime_bytes(args, model, mode, mapping, resident, context, batch, chu
             if model.layers - 1 in owners:
                 result["graphs"][d] += page(rows * r["vocab"] * 4) * 3
         if draft_graphs and drafts and model.layers - 1 in owners:
-            # The draft graph is additional to the target verifier slots.
-            rows = model.dspark_block_size
-            result["graphs"][d] += small_q5_workspace(rows, [i for i in owners if i >= model.layers], d)
-            result["graphs"][d] += _workspace_bytes(args, model, rows, context, mode, resident, prefill=False)
-            # Accepted prefixes create separate context-update slots. Those
-            # graphs keep projected features, normalized inputs and Q8 scratch.
+            # Request-owned single drafts coexist with model-owned batch slots.
+            # No request addresses are retained by a batch slot; it owns copied
+            # windows, inputs and conditional proposal probabilities instead.
+            draft_batches = [1] * batch
+            if len(mapping) == 1:
+                draft_batches.extend(range(2, batch + 1))
+            for requests in draft_batches:
+                rows = requests * model.dspark_block_size
+                result["graphs"][d] += small_q5_workspace(rows, [i for i in owners if i >= model.layers], d)
+                result["graphs"][d] += _workspace_bytes(args, model, rows, context, mode, resident, prefill=False)
+                result["graphs"][d] += 3 * page(rows * r["vocab"] * 4)
+                if requests > 1:
+                    result["graphs"][d] += r["draft_layers"] * page(requests * r["window"] * r["head_dim"] * 2)
+                for i in owners:
+                    if i < model.layers or expert_layer(i, model) < resident: continue
+                    routes = rows * r["draft_topk"]
+                    if disk_graphs and (mode != "tp" or d == next(iter(mapping))):
+                        result["host_graphs"][d] += disk_mailbox_bytes(rows, r["draft_experts"], r["draft_topk"])
+                    result["graphs"][d] += page(routes * (4*model.hidden + 4*model.intermediate) + rows*model.hidden*2)
+                    if i in r.get("gguf_layers", ()):
+                        result["graphs"][d] += 2 * gguf_scratch
+            # Accepted-prefix context updates remain private to each request.
             for accepted in range(1, drafts + 2):
-                result["graphs"][d] += page(accepted * model.hidden * (8 + 6*r["draft_layers"]))
-            for i in owners:
-                if i < model.layers or expert_layer(i, model) < resident: continue
-                routes = rows * r["draft_topk"]
-                if disk_graphs and (mode != "tp" or d == next(iter(mapping))):
-                    result["host_graphs"][d] += disk_mailbox_bytes(rows, r["draft_experts"], r["draft_topk"])
-                result["graphs"][d] += page(routes * (4*model.hidden + 4*model.intermediate) + rows*model.hidden*2)
-                if i in r.get("gguf_layers", ()):
-                    result["graphs"][d] += 2 * gguf_scratch
+                result["graphs"][d] += batch * page(accepted * model.hidden * (8 + 6*r["draft_layers"]))
     return result
 
 

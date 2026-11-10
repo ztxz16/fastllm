@@ -78,6 +78,7 @@ static void test(int m,int n,int k){
 int main(){
  int count=0;if(cudaGetDeviceCount(&count)!=cudaSuccess||!count)return 77;FastllmCudaSetDevice(0);
  if(FastllmCudaRuntimeArch()!=120&&FastllmCudaRuntimeArch()!=121)return 77;
- for(int m:{1,2,3,5,7,8,9,16})for(auto shape:std::vector<std::vector<int>>{{32,32},{160,96},{256,1280},{512,5120}})test(m,shape[0],shape[1]);
- puts("DRAFT_HEAD_PASS cases=32 graph_replays=128");
+ for(int m:{1,2,3,5,7,8,9,16,17,24,32,48,65})for(auto shape:std::vector<std::vector<int>>{{32,32},{160,96},{256,1280},{512,5120}})test(m,shape[0],shape[1]);
+ for(int m:{127,128,129,257})for(auto shape:std::vector<std::vector<int>>{{32,32},{160,96}})test(m,shape[0],shape[1]);
+ puts("DRAFT_HEAD_PASS cases=60 graph_replays=240");
 }

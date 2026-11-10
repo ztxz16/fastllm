@@ -49,4 +49,11 @@ bool FastllmCudaDeepSeekV41MarkovFilteredSampleDevice(const fastllm::Data &logit
     int block, float temperature, int topK, float topP,
     fastllm::Data &tokens, fastllm::Data &probs, fastllm::Data &outEmbeds,
     fastllm::Data &samplingWorkspace);
+// Batched chains share launches at each dependent token step. Input/output
+// layout is request-major; token anchors have stride block+1, q has block rows.
+bool FastllmCudaDeepSeekV41MarkovFilteredSampleBatchDevice(const fastllm::Data &logits,
+    const fastllm::Data &embedWeight, const fastllm::Data &headWeight,
+    int block, float temperature, int topK, float topP,
+    fastllm::Data &tokens, fastllm::Data &probs, fastllm::Data &outEmbeds,
+    fastllm::Data &scores, fastllm::Data &samplingWorkspace);
 }

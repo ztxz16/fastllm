@@ -17804,20 +17804,31 @@ bool FastllmCudaMtpSampleDraft(float *logits, float *proposalProbs,
 
 namespace {
 __global__ void PrepareMtpDeviceSampling(float *temperature, int *topK, float *topP,
-        float t, int k, float p) {
-    *temperature = t; *topK = k; *topP = p;
+        float t, int k, float p, int batch) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < batch) { temperature[i] = t; topK[i] = k; topP[i] = p; }
 }
-__global__ void AdvanceMtpDeviceSampling(uint64_t *offset) { ++*offset; }
+__global__ void FinishMtpDeviceSampling(uint64_t *offset, const int *sample,
+        int *output, int stride, int batch) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i == 0) ++*offset;
+    if (i < batch) output[size_t(i) * stride] = sample[i];
+}
 }
 
-bool FastllmCudaMtpSampleDraftDevice(float *logits, float *proposalProbs,
-        float temperature, int topK, float topP, int *output, int vocabSize,
-        fastllm::Data &workspace) {
-    if (!logits || !proposalProbs || !output || vocabSize <= 0 ||
+bool FastllmCudaMtpSampleDraftBatchDevice(float *logits, float *proposalProbs,
+        float temperature, int topK, float topP, int *output, int batch, int vocabSize,
+        int probabilityStride, int tokenStride, fastllm::Data &workspace) {
+    if (!logits || !proposalProbs || !output || batch <= 0 || vocabSize <= 0 ||
+        probabilityStride < vocabSize || tokenStride <= 0 ||
+        uint64_t(batch) * vocabSize > INT_MAX ||
         !std::isfinite(temperature) || temperature <= 0 ||
         !std::isfinite(topP) || topP <= 0 || topP > 1) return false;
-    const size_t row = FastllmCudaAlignBytes(size_t(vocabSize) * sizeof(float), 256);
-    const size_t bytes = 2 * row + 512 + FastllmCudaAlignBytes(sizeof(flashinfer::sampling::RadixRowState), 256);
+    const size_t row = FastllmCudaAlignBytes(size_t(batch) * vocabSize * sizeof(float), 256);
+    const size_t parameter = FastllmCudaAlignBytes(size_t(batch) * sizeof(float), 256);
+    const size_t random = 256; // One advancing counter; FlashInfer uses each row as a Philox subsequence.
+    const size_t stateOffset = 2 * row + 5 * parameter + random;
+    const size_t bytes = stateOffset + FastllmCudaAlignBytes(size_t(batch) * sizeof(flashinfer::sampling::RadixRowState), 256);
     if (bytes > INT_MAX) return false;
     const int device = FastllmCudaGetDevice();
     if (workspace.dataType != fastllm::INT8 || workspace.dims != std::vector<int>{int(bytes)} ||
@@ -17826,41 +17837,53 @@ bool FastllmCudaMtpSampleDraftDevice(float *logits, float *proposalProbs,
         workspace.dataType = fastllm::INT8; workspace.UpdateUnitSize(); workspace.Resize({int(bytes)});
         workspace.ToDevice(fastllm::CUDA, {device}, false); workspace.Allocate(false);
         uint64_t state[2] = {FastllmMtpSamplingSeed(), 0};
-        if (cudaMemcpy(static_cast<uint8_t *>(workspace.cudaData) + 2 * row + 256,
+        if (cudaMemcpy(static_cast<uint8_t *>(workspace.cudaData) + 2 * row + 5 * parameter,
                 state, sizeof(state), cudaMemcpyHostToDevice) != cudaSuccess) return false;
     }
     auto *base = static_cast<uint8_t *>(workspace.cudaData);
     float *a = reinterpret_cast<float *>(base), *b = reinterpret_cast<float *>(base + row);
     auto *t = reinterpret_cast<float *>(base + 2 * row);
-    auto *k = reinterpret_cast<int *>(t + 1);
-    auto *p = t + 2;
-    auto *valid = reinterpret_cast<bool *>(t + 3);
-    auto *seed = reinterpret_cast<uint64_t *>(base + 2 * row + 256);
-    auto *states = reinterpret_cast<flashinfer::sampling::RadixRowState *>(base + 2 * row + 512);
+    auto *k = reinterpret_cast<int *>(base + 2 * row + parameter);
+    auto *p = reinterpret_cast<float *>(base + 2 * row + 2 * parameter);
+    auto *valid = reinterpret_cast<bool *>(base + 2 * row + 3 * parameter);
+    auto *samples = reinterpret_cast<int *>(base + 2 * row + 4 * parameter);
+    auto *seed = reinterpret_cast<uint64_t *>(base + 2 * row + 5 * parameter);
+    auto *offset = seed + 1;
+    auto *states = reinterpret_cast<flashinfer::sampling::RadixRowState *>(base + stateOffset);
     topK = topK <= 0 ? vocabSize : std::min(topK, vocabSize);
     cudaStream_t stream = cudaStreamPerThread;
-    PrepareMtpDeviceSampling<<<1, 1, 0, stream>>>(t, k, p, temperature, topK, topP);
-    FastllmTemperatureSoftmaxKernel<1024><<<1, 1024, 0, stream>>>(logits, a, t, vocabSize);
+    PrepareMtpDeviceSampling<<<(batch + 255) / 256, 256, 0, stream>>>(t, k, p, temperature, topK, topP, batch);
+    FastllmTemperatureSoftmaxKernel<1024><<<batch, 1024, 0, stream>>>(logits, a, t, vocabSize);
     cudaError_t status = cudaGetLastError();
     if (status == cudaSuccess && topP < 1) {
-        status = flashinfer::sampling::TopPRenormProb<float>(a, b, p, 1, 1.0f, vocabSize, stream);
+        status = flashinfer::sampling::TopPRenormProb<float>(a, b, p, batch, 1.0f, vocabSize, stream);
         std::swap(a, b);
     }
     if (status == cudaSuccess && topK < vocabSize) {
-        status = cudaMemsetAsync(states, 0, sizeof(*states), stream);
+        status = cudaMemsetAsync(states, 0, size_t(batch) * sizeof(*states), stream);
         if (status == cudaSuccess) {
             status = flashinfer::sampling::RadixTopKRenormProbMultiCTA<float, int>(
-                a, b, k, 1, 0, vocabSize, states, stream);
+                a, b, k, batch, 0, vocabSize, states, stream);
             std::swap(a, b);
         }
     }
-    if (status == cudaSuccess) status = cudaMemcpyAsync(proposalProbs, a,
-        size_t(vocabSize) * sizeof(float), cudaMemcpyDeviceToDevice, stream);
+    // Save the exact filtered q in each request's row-major chain storage.
+    // Sampling consumes the same contiguous values before scratch is reused.
+    if (status == cudaSuccess) status = cudaMemcpy2DAsync(proposalProbs,
+        size_t(probabilityStride) * sizeof(float), a, size_t(vocabSize) * sizeof(float),
+        size_t(vocabSize) * sizeof(float), batch, cudaMemcpyDeviceToDevice, stream);
     if (status == cudaSuccess) status = flashinfer::sampling::SamplingFromProb<float, int, 1>(
-        proposalProbs, output, valid, nullptr, 1, vocabSize, true, seed, 0, seed + 1, 0, stream);
+        a, samples, valid, nullptr, batch, vocabSize, true, seed, 0, offset, 0, stream);
     if (status != cudaSuccess) return false;
-    AdvanceMtpDeviceSampling<<<1, 1, 0, stream>>>(seed + 1);
+    FinishMtpDeviceSampling<<<(batch + 255) / 256, 256, 0, stream>>>(offset, samples, output, tokenStride, batch);
     return cudaGetLastError() == cudaSuccess;
+}
+
+bool FastllmCudaMtpSampleDraftDevice(float *logits, float *proposalProbs,
+        float temperature, int topK, float topP, int *output, int vocabSize,
+        fastllm::Data &workspace) {
+    return FastllmCudaMtpSampleDraftBatchDevice(logits, proposalProbs, temperature, topK, topP,
+                                              output, 1, vocabSize, vocabSize, 1, workspace);
 }
 
 bool FastllmCudaMtpRejectionSampling(float *logits, float *proposalProbs,

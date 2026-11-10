@@ -56,6 +56,7 @@
 #include <algorithm>
 #include "devices/disk/diskdevice.h"
 #include <cmath>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <atomic>
@@ -83,6 +84,8 @@ namespace fastllm {
         Data input, preMix, indices, position, headHidden, normalized, logits;
         Data markovTokens, markovValues, markovIndices, markovEmbeds;
         Data samplingWorkspace;
+        struct GreedyWorkspace { Data values, indices; };
+        std::vector<GreedyWorkspace> greedyWorkspaces;
         std::shared_ptr<void> markovWorkspace;
         // The graph optimizer may run shared and routed branches concurrently.
         // Their scratch must remain disjoint throughout every replay.
@@ -743,16 +746,16 @@ namespace fastllm {
             std::vector<uint64_t> offerHist;    // 置信度截断后送去校验的候选数 0..blockSize
             uint64_t noProposal = 0;        // 该轮没有可用候选（还没生成 / 锚点不匹配）
             double verifyForward = 0.0, plainForward = 0.0, commit = 0.0;
-            double draftTotal = 0.0, draftMain = 0.0, draftLayers = 0.0;
+            double draftTotal = 0.0, draftLayers = 0.0;
             double draftHead = 0.0, draftMarkov = 0.0, draftConf = 0.0;
             double draftMarkovBias = 0.0, draftMarkovArgmax = 0.0;
             uint64_t draftMarkovFused = 0;
-            uint64_t draftCalls = 0;        // 真正生成了候选的次数
-            double mainOnly = 0.0;          // 只更新草稿滑窗、不生成候选（prefill 分块）
-            uint64_t mainOnlyCalls = 0;
+            uint64_t draftCalls = 0;        // 草稿前向批数，独立请求回退按一请求一批统计
+            double contextMs = 0.0;         // 按请求更新草稿滑窗；前向与采样按兼容请求合批统计
+            uint64_t contextCalls = 0;
         };
 
-        // DsparkRunDraft 把自己的分段耗时放这里，由 DsparkAdvance 取走（避免改函数签名）
+        // DsparkRunDraft 记录当前批的分段耗时，由 DsparkGenerateDrafts 汇总。
         struct DsDraftTiming {
             double layers = 0.0, head = 0.0, markov = 0.0, conf = 0.0;
             // markov 内部再拆：bias 是 embed + [vocab, rank] 投影，argmax 含 TopK 与同步回主机。
@@ -860,7 +863,7 @@ namespace fastllm {
                 }
             }
 
-            void AddDraft(double total, double main, const DsDraftTiming &parts) {
+            void AddDraft(double total, const DsDraftTiming &parts) {
                 if (level == 0) {
                     return;
                 }
@@ -870,7 +873,6 @@ namespace fastllm {
                 }
                 stat.draftCalls++;
                 stat.draftTotal += total;
-                stat.draftMain += main;
                 stat.draftLayers += parts.layers;
                 stat.draftHead += parts.head;
                 stat.draftMarkov += parts.markov;
@@ -880,7 +882,7 @@ namespace fastllm {
                 stat.draftConf += parts.conf;
             }
 
-            void AddMainOnly(double ms) {
+            void AddContext(double ms) {
                 if (level == 0) {
                     return;
                 }
@@ -888,8 +890,8 @@ namespace fastllm {
                 if (!WarmedLocked()) {
                     return;
                 }
-                stat.mainOnlyCalls++;
-                stat.mainOnly += ms;
+                stat.contextCalls++;
+                stat.contextMs += ms;
             }
 
             void AddPlainForward(double ms) {
@@ -1008,9 +1010,9 @@ namespace fastllm {
                        s.verifyRounds > 0 && s.plainRounds > 0 ?
                            s.verifyForward / verify - s.plainForward / plain : 0.0,
                        s.commit / verify);
-                printf("[DSpark %s] 每次草稿 %.3f ms = main %.3f + 三层 %.3f + head %.3f + markov %.3f"
-                       " + confidence %.3f（%llu 次）\n",
-                       tag, s.draftTotal / draft, s.draftMain / draft, s.draftLayers / draft,
+                printf("[DSpark %s] 每批草稿 %.3f ms（三层 %.3f + head %.3f + markov %.3f"
+                       " + confidence %.3f；%llu 批）\n",
+                       tag, s.draftTotal / draft, s.draftLayers / draft,
                        s.draftHead / draft, s.draftMarkov / draft, s.draftConf / draft,
                        (unsigned long long)s.draftCalls);
                 if (s.draftCalls > 0 && s.draftMarkovFused == s.draftCalls) {
@@ -1023,18 +1025,18 @@ namespace fastllm {
                            s.draftMarkovArgmax / draft, blockSize,
                            (unsigned long long)s.draftMarkovFused, (unsigned long long)s.draftCalls);
                 }
-                if (s.mainOnlyCalls > 0) {
-                    printf("[DSpark %s] 只更新草稿滑窗（prefill 分块等）%llu 次，每次 %.3f ms\n",
-                           tag, (unsigned long long)s.mainOnlyCalls,
-                           s.mainOnly / (double)s.mainOnlyCalls);
+                if (s.contextCalls > 0) {
+                    printf("[DSpark %s] 草稿滑窗更新（按请求）%llu 次，每次 %.3f ms\n",
+                           tag, (unsigned long long)s.contextCalls,
+                           s.contextMs / (double)s.contextCalls);
                 }
                 // 每产出一个 token 的实际开销：目标前向 + 草稿 + 回滚
-                const double totalMs = s.verifyForward + s.plainForward + s.draftTotal + s.mainOnly + s.commit;
+                const double totalMs = s.verifyForward + s.plainForward + s.draftTotal + s.contextMs + s.commit;
                 if (outputs > 0) {
                     printf("[DSpark %s] 每个输出 token 合计 %.3f ms（目标前向 %.3f + 草稿 %.3f + 回滚 %.3f）\n",
                            tag, totalMs / (double)outputs,
                            (s.verifyForward + s.plainForward) / (double)outputs,
-                           (s.draftTotal + s.mainOnly) / (double)outputs,
+                           (s.draftTotal + s.contextMs) / (double)outputs,
                            s.commit / (double)outputs);
                 }
                 fflush(stdout);
@@ -1878,17 +1880,29 @@ namespace fastllm {
                     state.dspark->accepted += accepted;
                 }
             }
+            std::vector<DeepSeekV41DsparkState*> draftStates;
+            std::vector<int> draftAnchors;
+            std::vector<GenerationConfig> draftConfigs;
             for (int i = 0; i < numSegments; ++i) {
                 auto &scratch = scratches[i];
                 const int anchor = scratch.tokens[scratch.acceptedDrafts];
                 const auto &config = generationConfigs[i];
                 const bool stopped = anchor == eos_token_id || eos_token_ids.count(anchor) || config.stop_token_ids.count(anchor);
                 DsparkAdvance(*segments[i].state, scratch, segments[i].startPos,
-                    segments[i].startPos + scratch.acceptedDrafts + 1, stopped ? -1 : anchor, config);
+                    segments[i].startPos + scratch.acceptedDrafts + 1);
+                if (!stopped) {
+                    draftStates.push_back(segments[i].state->dspark.get());
+                    draftAnchors.push_back(anchor);
+                    draftConfigs.push_back(DsparkDraftConfig(config, scratch, anchor));
+                }
             }
+            DsparkGenerateDrafts(draftStates, draftAnchors, draftConfigs);
             return ret;
         }
 
+        std::vector<DeepSeekV41DsparkState*> draftStates;
+        std::vector<int> draftAnchors;
+        std::vector<GenerationConfig> draftConfigs;
         for (int i = 0; i < numSegments; i++) {
             if (!active[i]) {
                 continue;
@@ -1897,8 +1911,14 @@ namespace fastllm {
             const int anchor = allowSpeculate && !isIntermediateChunkedPrefill && textOnly &&
                 segments[i].seqlen == 1 && (int)ret.size() > i ? ret[i] : -1;
             DsparkAdvance(*segments[i].state, scratches[i], segments[i].startPos,
-                          segments[i].startPos + segments[i].seqlen, anchor, generationConfigs[i]);
+                          segments[i].startPos + segments[i].seqlen);
+            if (anchor >= 0) {
+                draftStates.push_back(segments[i].state->dspark.get());
+                draftAnchors.push_back(anchor);
+                draftConfigs.push_back(DsparkDraftConfig(generationConfigs[i], scratches[i], anchor));
+            }
         }
+        DsparkGenerateDrafts(draftStates, draftAnchors, draftConfigs);
         return ret;
     }
 
@@ -2068,7 +2088,7 @@ namespace fastllm {
     // ==================== 草稿前向 ====================
 
     void DeepSeekV41Model::DsparkAdvance(DeepSeekV41RequestState &state, DeepSeekV41SpecScratch &scratch,
-                                         int startPos, int committed, int anchorToken, const GenerationConfig &config) {
+                                         int startPos, int committed) {
         if (scratch.mainHiddenStartPos >= 0) {
             startPos = scratch.mainHiddenStartPos;
         }
@@ -2210,44 +2230,136 @@ namespace fastllm {
         dspark.filled = std::min(dspark.filled + rows, window_size);
         const double mainMs = DsElapsed(advanceStart);
 
-        // 3) 生成下一轮的候选
-        if (anchorToken < 0 || dspark.committed <= 0) {
-            // prefill 分块的中间结果不是真正的下一个 token，这一轮只更新滑窗
-            if (DsProfiler().On()) {
-                DsProfiler().AddMainOnly(mainMs);
-            }
-            return;
-        }
-        std::vector<int> tokens;
-        std::vector<float> confidence;
-        DsDraftTimingSlot().Reset();
-        const double draftStart = DsTick();
-        DsparkRunDraft(dspark, anchorToken, tokens, confidence, DsparkDraftConfig(config, scratch, anchorToken));
-        const double draftMs = DsElapsed(draftStart);
-        if (DsProfiler().On()) {
-            DsProfiler().AddDraft(mainMs + draftMs, mainMs, DsDraftTimingSlot());
-        }
-        if (tokens.empty()) {
-            return;
-        }
-        dspark.drafts = tokens;
-        dspark.proposalTokens = tokens;
-        dspark.confidence = confidence;
-        dspark.anchor = anchorToken;
-        dspark.anchorPos = dspark.committed;
+        if (DsProfiler().On()) DsProfiler().AddContext(mainMs);
     }
 
-    void DeepSeekV41Model::DsparkRunDraft(DeepSeekV41DsparkState &dspark, int anchorToken,
-                                          std::vector<int> &tokens, std::vector<float> &confidence,
-                                          const GenerationConfig &config) {
+    void DeepSeekV41Model::DsparkGenerateDrafts(const std::vector<DeepSeekV41DsparkState*> &states,
+            const std::vector<int> &anchors, const std::vector<GenerationConfig> &configs) {
+        AssertInFastLLM(states.size() == anchors.size() && states.size() == configs.size(),
+                       "DeepSeekV41 DSpark: mismatched draft requests.");
+        // Constraints maintain per-request text state; the existing sampler handles those.
+        auto compatible = [&](int a, int b) {
+            const auto &x = configs[a]; const auto &y = configs[b];
+            return !x.tool_call_name_constraint_enabled && !x.tool_call_parameter_name_constraint_enabled &&
+                !y.tool_call_name_constraint_enabled && !y.tool_call_parameter_name_constraint_enabled &&
+                x.top_k == y.top_k && x.top_p == y.top_p && x.temperature == y.temperature;
+        };
+        std::vector<std::vector<int>> groups;
+        for (int i = 0; i < int(states.size()); ++i) {
+            if (!states[i] || states[i]->disabled || anchors[i] < 0 ||
+                std::min({states[i]->filled, window_size, states[i]->committed}) <= 0) continue;
+            auto group = std::find_if(groups.begin(), groups.end(), [&](const auto &g) { return compatible(g.front(), i); });
+            if (group == groups.end()) groups.push_back({i}); else group->push_back(i);
+        }
+        auto publish = [&](int request, const std::vector<int> &tokens, const std::vector<float> &confidence) {
+            if (tokens.empty()) return;
+            auto &state = *states[request];
+            state.drafts = state.proposalTokens = tokens;
+            state.confidence = confidence;
+            state.anchor = anchors[request]; state.anchorPos = state.committed;
+        };
+        for (const auto &group : groups) {
+            DsDraftTimingSlot().Reset();
+            const double begin = DsTick();
+            bool completed = false;
+#ifdef USE_CUDA
+            if (group.size() > 1 && v41DsparkTpDevices.empty() && DsDraftGraphEnabled()) {
+                ApplyDsparkDevice();
+                const int batch = int(group.size()), device = FastllmCudaGetDevice();
+                const std::vector<int> devices{device};
+                bool local = true;
+                for (int request : group) {
+                    local &= int(states[request]->layers.size()) == v41DsparkLayers;
+                    for (const auto &layer : states[request]->layers)
+                        local &= layer.windowKV.dataType == DataType::BFLOAT16 &&
+                            layer.windowKV.dataDevice == DataDevice::CUDA && layer.windowKV.cudaData &&
+                            layer.windowKV.dataDeviceIds == devices && !layer.windowKV.multiDeviceData;
+                }
+                if (local) {
+                    auto &slot = v41DsparkBatches[batch];
+                    if (!slot) slot = std::make_shared<DeepSeekV41DsparkState>();
+                    auto &storage = *slot;
+                    storage.layers.resize(v41DsparkLayers);
+                    for (int layer = 0; layer < v41DsparkLayers; ++layer) {
+                        auto &window = storage.layers[layer].windowKV;
+                        window.dataType = DataType::BFLOAT16; window.UpdateUnitSize();
+                        window.Resize({batch, window_size, head_dim_full});
+                        window.ToDevice(DataDevice::CUDA, devices, false); window.Allocate();
+                        const size_t bytes = size_t(window_size) * head_dim_full * window.unitSize;
+                        for (int b = 0; b < batch; ++b)
+                            FastllmCudaCopyFromDeviceToDevice((char*)window.cudaData + b * bytes,
+                                states[group[b]]->layers[layer].windowKV.cudaData, bytes);
+                    }
+                    std::vector<int> positions, batchAnchors, valid;
+                    for (int request : group) {
+                        positions.push_back(states[request]->committed);
+                        batchAnchors.push_back(anchors[request]);
+                        valid.push_back(std::min({states[request]->filled, window_size, states[request]->committed}));
+                    }
+                    std::vector<int> tokens;
+                    std::vector<float> confidence;
+                    completed = DsparkRunDraft(storage, positions, batchAnchors, valid,
+                                               tokens, confidence, configs[group.front()]);
+                    if (completed) {
+                        const int block = v41DsparkBlockSize;
+                        AssertInFastLLM(tokens.size() == size_t(batch) * block && confidence.size() == tokens.size(),
+                                       "DeepSeekV41 DSpark: invalid batched proposal shape.");
+                        for (int b = 0; b < batch; ++b) {
+                            auto &state = *states[group[b]];
+                            state.sampledProposal = storage.sampledProposal;
+                            if (state.sampledProposal) {
+                                // Each request owns q until its next verification, even if a
+                                // different batch reuses this graph or the request changes slots.
+                                auto &prob = state.proposalProbs;
+                                prob.dataType = DataType::FLOAT32; prob.UpdateUnitSize();
+                                prob.Resize({block, storage.proposalProbs.dims.back()});
+                                prob.ToDevice(DataDevice::CUDA, devices, false); prob.Allocate();
+                                FastllmCudaCopyFromDeviceToDevice(prob.cudaData,
+                                    (char*)storage.proposalProbs.cudaData + b * prob.GetBytes(), prob.GetBytes());
+                            }
+                            publish(group[b], std::vector<int>(tokens.begin() + b * block, tokens.begin() + (b + 1) * block),
+                                std::vector<float>(confidence.begin() + b * block, confidence.begin() + (b + 1) * block));
+                        }
+                    }
+                }
+            }
+#endif
+            if (completed) {
+                if (DsProfiler().On()) DsProfiler().AddDraft(DsElapsed(begin), DsDraftTimingSlot());
+                continue;
+            }
+            for (int request : group) {
+                DsDraftTimingSlot().Reset();
+                const double requestBegin = DsTick();
+                auto &state = *states[request];
+                const int valid = std::min({state.filled, window_size, state.committed});
+                std::vector<int> tokens;
+                std::vector<float> confidence;
+                DsparkRunDraft(state, {state.committed}, {anchors[request]}, {valid},
+                               tokens, confidence, configs[request]);
+                publish(request, tokens, confidence);
+                if (DsProfiler().On()) DsProfiler().AddDraft(DsElapsed(requestBegin), DsDraftTimingSlot());
+            }
+        }
+    }
+
+    bool DeepSeekV41Model::DsparkRunDraft(DeepSeekV41DsparkState &dspark,
+            const std::vector<int> &positions, const std::vector<int> &anchors,
+            const std::vector<int> &validRows, std::vector<int> &tokens,
+            std::vector<float> &confidence, const GenerationConfig &config) {
         tokens.clear();
         confidence.clear();
         const int block = v41DsparkBlockSize;
-        const int startPos = dspark.committed;    // 草稿的 RoPE 位置从 committed 开始
-        const int valid = std::min(std::min(dspark.filled, window_size), startPos);
-        if (block <= 0 || valid <= 0) {
-            return;
-        }
+        // Kernels use signed row/token indices. This is an indexing-capacity
+        // guard, independent of concurrency, draft length and physical tiles.
+        if (block <= 0 || block > INT_MAX - window_size || positions.empty() || anchors.size() != positions.size() ||
+            validRows.size() != positions.size() ||
+            positions.size() > size_t(INT_MAX) / (uint64_t(block) + 1) ||
+            std::any_of(validRows.begin(), validRows.end(), [](int n) { return n <= 0; })) return false;
+        const int batch = int(positions.size()), rows = batch * block;
+        int anchorToken = anchors.front();
+        const int startPos = positions.front();    // 草稿的 RoPE 位置从 committed 开始
+        const int valid = validRows.front();
         DsparkBuildMoeWeights();
         ApplyDsparkDevice();
         const int dim = embed_dim;
@@ -2256,24 +2368,25 @@ namespace fastllm {
         DsRopeParams windowRope = {qk_rope_head_dim, rope_base, 0, rope_factor,
                                    rope_scaling_beta_fast, rope_scaling_beta_slow};
 
-        const int tableRows = window_size + block, width = valid + block - 1;
+        const int tableRows = window_size + block, width = (batch == 1 ? valid : window_size) + block - 1;
         Data embedded, preMix, cmpIdxHost, cmpIdx;
         bool inputsPrepared = false;
         auto prepareInputs = [&]() {
             if (inputsPrepared) return;
             inputsPrepared = true;
             // ---- 输入：[anchor, noise, noise, ...] ----
-            std::vector<float> idValues((uint64_t)block, (float)v41DsparkNoiseTokenId);
-            idValues[0] = (float)anchorToken;
-            Data draftIds(DataType::FLOAT32, {1, block}, idValues);
+            std::vector<float> idValues((uint64_t)rows, (float)v41DsparkNoiseTokenId);
+            for (int b = 0; b < batch; ++b) idValues[b * block] = float(anchors[b]);
+            Data draftIds(DataType::FLOAT32, {batch, block}, idValues);
             DsparkEmbedInput(draftIds, embedded);
+            embedded.Reshape({batch, block, hc_mult, dim});
 
             {
-                std::vector<float> values((uint64_t)block * hc_mult, 0.0f);
-                for (int i = 0; i < block; i++) {
+                std::vector<float> values((uint64_t)rows * hc_mult, 0.0f);
+                for (int i = 0; i < rows; i++) {
                     values[(uint64_t)i * hc_mult] = 1.0f;
                 }
-                preMix.CopyFrom(Data(DataType::FLOAT32, {1, block, hc_mult}, values));
+                preMix.CopyFrom(Data(DataType::FLOAT32, {batch, block, hc_mult}, values));
             }
 
             // ---- 稀疏注意力的 gather 表下标 ----
@@ -2281,11 +2394,11 @@ namespace fastllm {
             // 是全连接（官方 topk_idxs 对每个 query 给出同一张表）。这里把 windowSize 设为 1、
             // startPos 设为 0，让"滑窗"部分只贡献 query 自己那一行，其余位置（环形缓冲里
             // 有效的行 + 块内其它草稿行）通过 compressedKV / cmpIdx 的任意 gather 提供。
-            std::vector<int32_t> idxValues((uint64_t)block * width, -1);
-            for (int i = 0; i < block; i++) {
-                int32_t *row = idxValues.data() + (uint64_t)i * width;
+            std::vector<int32_t> idxValues((uint64_t)rows * width, -1);
+            for (int b = 0; b < batch; ++b) for (int i = 0; i < block; i++) {
+                int32_t *row = idxValues.data() + (uint64_t)(b * block + i) * width;
                 int cursor = 0;
-                for (int p = startPos - valid; p < startPos; p++) {
+                for (int p = positions[b] - validRows[b]; p < positions[b]; p++) {
                     row[cursor++] = p % window_size;
                 }
                 for (int j = 0; j < block; j++) {
@@ -2295,7 +2408,7 @@ namespace fastllm {
                 }
             }
             cmpIdxHost.dataType = DataType::INT32;
-            cmpIdxHost.Resize({1, block, width});
+            cmpIdxHost.Resize({batch, block, width});
             cmpIdxHost.Allocate();
             memcpy(cmpIdxHost.cpuData, idxValues.data(), idxValues.size() * sizeof(int32_t));
             cmpIdx.CopyFrom(cmpIdxHost);
@@ -2330,7 +2443,7 @@ namespace fastllm {
             void *owner = nullptr;
             hybridDraft = !v41DsparkMoeWeights.empty();
             for (auto &table : v41DsparkMoeWeights) {
-                void *next = FastllmCudaNativeMoeGraphOwner(table.data(), int(table.size()), block);
+                void *next = FastllmCudaNativeMoeGraphOwner(table.data(), int(table.size()), rows);
                 hybridDraft &= next && (!owner || owner == next);
                 owner = next;
             }
@@ -2339,7 +2452,7 @@ namespace fastllm {
         // target verification. Add every child during eager warmup, then start
         // that worker only when the complete draft graph is replayed.
         if (!residentDraft && !hybridDraft &&
-                block <= 32 && DsDraftGraphEnabled() && GetCudaSharedExpert()) {
+                rows <= 32 && DsDraftGraphEnabled() && GetCudaSharedExpert()) {
             diskDraft = !v41DsparkMoeWeights.empty();
             for (const auto &table : v41DsparkMoeWeights)
                 diskDraft &= DiskMoeV41Graph::Supports(table);
@@ -2359,7 +2472,7 @@ namespace fastllm {
         auto prepareProposalProbs = [&](int device, int vocabulary) {
             FastllmCudaSetDevice(device);
             dspark.proposalProbs.ToDevice(DataDevice::CUDA, {device}, false);
-            dspark.proposalProbs.Resize({block, vocabulary});
+            dspark.proposalProbs.Resize({rows, vocabulary});
             dspark.proposalProbs.Allocate();
         };
         const bool graphMarkov = markovEmbedWeight.dims.size() == 2 && markovHeadWeight.dims.size() == 2 &&
@@ -2377,7 +2490,7 @@ namespace fastllm {
             !DsEnvFlag("FASTLLM_DSV41_DISABLE_CUDA_ROUTE") && !DsEnvFlag("FASTLLM_DISABLE_NCCL");
         if (graphEligible && randomDraft) prepareProposalProbs(FastllmCudaGetDevice(), vocab);
         const Data &embedding = weight["embed.weight"];
-        const bool deviceInputs = graphEligible && valid == window_size && embedding.dataType == DataType::BFLOAT16 &&
+        const bool deviceInputs = batch == 1 && graphEligible && valid == window_size && embedding.dataType == DataType::BFLOAT16 &&
             embedding.dataDevice == DataDevice::CUDA && embedding.cudaData && !embedding.multiDeviceData &&
             !embedding.dataDeviceIds.empty() && embedding.dataDeviceIds.front() == graphDevices.front() &&
             embedding.dims.size() == 2 && embedding.dims[1] == dim &&
@@ -2427,17 +2540,21 @@ namespace fastllm {
                     FastllmCudaCopyFromHostToDevice(dst.cudaData, const_cast<void*>(data), dst.GetBytes());
                 };
                 const int metadata[2] = {startPos, anchorToken};
-                upload(graphState->position, DataType::INT32, {deviceInputs ? 2 : 1}, metadata);
+                upload(graphState->position, DataType::INT32, {deviceInputs ? 2 : batch},
+                       deviceInputs ? metadata : positions.data());
                 if (!deviceInputs) {
                     graphState->input.CopyFrom(embedded);
                     upload(graphState->preMix, DataType::FLOAT32, preMix.dims, preMix.cpuData);
                     upload(graphState->indices, DataType::INT32, cmpIdxHost.dims, cmpIdxHost.cpuData);
                     if (graphState->markovTokens.dims.empty()) {
                         Data &d = graphState->markovTokens;
-                        d.dataType = DataType::INT32; d.UpdateUnitSize(); d.Resize({block + 1});
+                        d.dataType = DataType::INT32; d.UpdateUnitSize(); d.Resize({batch * (block + 1)});
                         d.ToDevice(DataDevice::CUDA, {graphDevices.front()}, false); d.Allocate();
                     }
-                    FastllmCudaCopyFromHostToDevice(graphState->markovTokens.cudaData, &anchorToken, sizeof(int));
+                    std::vector<int> initialTokens(batch * (block + 1), 0);
+                    for (int b = 0; b < batch; ++b) initialTokens[b * (block + 1)] = anchors[b];
+                    FastllmCudaCopyFromHostToDevice(graphState->markovTokens.cudaData, initialTokens.data(),
+                                                   initialTokens.size() * sizeof(int));
                 }
                 markovEmbedWeight.ToDevice(DataDevice::CUDA);
                 markovHeadWeight.ToDevice(DataDevice::CUDA);
@@ -2458,6 +2575,7 @@ namespace fastllm {
             graphState->disabled = true; graphState = nullptr;
         }
 #endif
+        if (batch > 1 && !graphState) return false;
         if (!graphState) prepareInputs();
         Data eagerLogits;
         Data &logits = graphState ? graphState->logits : eagerLogits;
@@ -2532,12 +2650,12 @@ namespace fastllm {
                 if (!parallelAttention) {
                     LinearWithActivationQuant(qkvPrepared ? qQuant : qNorm, pre + ".attn.wq_b.weight", q,
                                               false, nullptr, qkvPrepared);
-                    q.Reshape({1, block, num_attention_heads, headDim});
+                    q.Reshape({batch, block, num_attention_heads, headDim});
                     if (!qkvPrepared) {
                         LinearWithActivationQuant(attnInput, pre + ".attn.wkv.weight", kv);
                         DsRMSNormBF16(kv, weight[pre + ".attn.kv_norm.weight"], rms_norm_eps, kv);
                     }
-                    kv.Reshape({1, block, headDim});
+                    kv.Reshape({batch, block, headDim});
                     bool rotaryPrepared = false;
 #ifdef USE_CUDA
                     rotaryPrepared = FastllmCudaDeepSeekV41DraftRotaryTable(
@@ -2545,16 +2663,26 @@ namespace fastllm {
                         windowRope.originalSeqLen, windowRope.factor, windowRope.betaFast,
                         windowRope.betaSlow, devicePosition, table);
 #endif
+                    auto rotate = [&](Data &data, bool inverse, int quantMode) {
+                        if (batch == 1) {
+                            DsRotaryQuant(data, windowRope, startPos, 1, inverse, quantMode, 32, -1, devicePosition);
+                        } else for (int b = 0; b < batch; ++b) {
+                            Data view; view.FakeFrom(data, size_t(b) * data.Count(1) * data.unitSize);
+                            auto dims = data.dims; dims[0] = 1; view.Resize(dims);
+                            DsRotaryQuant(view, windowRope, positions[b], 1, inverse, quantMode, 32, -1,
+                                          devicePosition ? devicePosition + b : nullptr);
+                        }
+                    };
                     if (!rotaryPrepared) {
-                        DsRotaryQuant(q, windowRope, startPos, 1, false, 0, 32, -1, devicePosition);
-                        DsRotaryQuant(kv, windowRope, startPos, 1, false, 1, 32, -1, devicePosition);
+                        rotate(q, false, 0);
+                        rotate(kv, false, 1);
                         Cat(dspark.layers[stage].windowKV, kv, 1, table);
                     }
                     AssertInFastLLM(table.dims.size() == 3 && table.dims[1] == tableRows,
                                     "DeepSeekV41 DSpark: draft attention gather table has a wrong size.");
                     DsSparseAttention(q, kv, nullptr, &table, &attentionIndices,
                                       weight[pre + ".attn.attn_sink"], 1, 0, softmaxScale, attnOut);
-                    DsRotaryQuant(attnOut, windowRope, startPos, 1, true, 0, 32, -1, devicePosition);
+                    rotate(attnOut, true, 0);
 
                     DeepSeekV4WoA(attnOut, weight[pre + ".attn.wo_a.weight"], o_groups, o_lora_rank, woAOut);
                     LinearWithActivationQuant(woAOut, pre + ".attn.wo_b.weight", attnProj);
@@ -2576,7 +2704,7 @@ namespace fastllm {
                 }
                 std::swap(curHidden, nextHidden);
                 std::vector<int> ffnDims = ffnInput.dims;
-                ffnInput.Reshape({block, dim});
+                ffnInput.Reshape({rows, dim});
 
                 // 路由：sqrt(softplus(logits))，bias 只参与选择（草稿层 128 专家 top-3）
                 {
@@ -2615,10 +2743,10 @@ namespace fastllm {
                         gateBias.ToDevice(DataDevice::CPU);
                         const float *raw = (const float*)logits.cpuData;
                         const float *bias = (const float*)gateBias.cpuData;
-                        std::vector<int> indices((uint64_t)block * v41DsparkTopk);
-                        std::vector<float> scores((uint64_t)block * v41DsparkTopk);
+                        std::vector<int> indices((uint64_t)rows * v41DsparkTopk);
+                        std::vector<float> scores((uint64_t)rows * v41DsparkTopk);
                         std::vector<float> original(v41DsparkExperts), select(v41DsparkExperts);
-                        for (int t = 0; t < block; t++) {
+                        for (int t = 0; t < rows; t++) {
                             for (int e = 0; e < v41DsparkExperts; e++) {
                                 original[e] = std::sqrt(DsSoftplus(raw[(uint64_t)t * v41DsparkExperts + e]));
                                 select[e] = original[e] + bias[e];
@@ -2644,11 +2772,11 @@ namespace fastllm {
                                 v *= routed_scaling_factor;
                             }
                         }
-                        Data idxData(DataType::INT32, {block, v41DsparkTopk});
+                        Data idxData(DataType::INT32, {rows, v41DsparkTopk});
                         idxData.Allocate();
                         memcpy(idxData.cpuData, indices.data(), indices.size() * sizeof(int));
                         expertIndex.CopyFrom(idxData);
-                        expertScore.CopyFrom(Data(DataType::FLOAT32, {block, v41DsparkTopk}, scores));
+                        expertScore.CopyFrom(Data(DataType::FLOAT32, {rows, v41DsparkTopk}, scores));
                     }
                 }
 
@@ -2740,7 +2868,6 @@ namespace fastllm {
                     }
                     if (!hybrid && hasSharedExpertOut &&
                         ffnInput.dataDevice == DataDevice::CUDA && ffnInput.dims.size() == 2 &&
-                        (ffnInput.dims[0] < 32 || FastllmCudaMoeCacheFullyResident(moeWeights.data(), int(moeWeights.size()))) &&
                         FastllmCudaCanRunMoeHybrid(moeWeights.data(), (int)moeWeights.size())) {
                         expertIndex.ToDevice(DataDevice::CUDA, ffnInput.dataDeviceIds, true);
                         expertScore.ToDevice(DataDevice::CUDA, ffnInput.dataDeviceIds, true);
@@ -2829,13 +2956,37 @@ namespace fastllm {
             if (graphState && !v41DsparkTpDevices.empty() && !v41DsparkHeadWorkspace) graphState->disabled = true;
 #ifdef USE_CUDA
             if (graphState && !shardedMarkov) {
-                const bool ok = randomDraft ? FastllmCudaDeepSeekV41MarkovFilteredSampleDevice(logits,
-                    markovEmbedWeight, markovHeadWeight, block, config.temperature, config.top_k, config.top_p,
-                    graphState->markovTokens, dspark.proposalProbs, markovAll, graphState->samplingWorkspace) :
-                    FastllmCudaDeepSeekV41MarkovChainDevice(logits, markovEmbedWeight, markovHeadWeight,
-                    block, graphState->markovTokens, graphState->markovValues, graphState->markovIndices, markovAll);
-                AssertInFastLLM(ok,
-                    "DeepSeekV41 DSpark device Markov chain rejected input.");
+                if (batch == 1) {
+                    const bool ok = randomDraft ? FastllmCudaDeepSeekV41MarkovFilteredSampleDevice(logits,
+                        markovEmbedWeight, markovHeadWeight, block, config.temperature, config.top_k, config.top_p,
+                        graphState->markovTokens, dspark.proposalProbs, markovAll, graphState->samplingWorkspace) :
+                        FastllmCudaDeepSeekV41MarkovChainDevice(logits, markovEmbedWeight, markovHeadWeight,
+                        block, graphState->markovTokens, graphState->markovValues, graphState->markovIndices, markovAll);
+                    AssertInFastLLM(ok, "DeepSeekV41 DSpark device Markov chain rejected input.");
+                } else if (randomDraft) {
+                    AssertInFastLLM(FastllmCudaDeepSeekV41MarkovFilteredSampleBatchDevice(logits,
+                        markovEmbedWeight, markovHeadWeight, block, config.temperature, config.top_k, config.top_p,
+                        graphState->markovTokens, dspark.proposalProbs, markovAll, graphState->markovValues,
+                        graphState->samplingWorkspace), "DeepSeekV41 DSpark batched sampling rejected input.");
+                } else {
+                    graphState->greedyWorkspaces.resize(batch);
+                    markovAll.dataType = DataType::FLOAT32; markovAll.UpdateUnitSize();
+                    markovAll.Resize({batch, block, markovEmbedWeight.dims[1]});
+                    markovAll.ToDevice(DataDevice::CUDA, graphDevices, false); markovAll.Allocate();
+                    for (int b = 0; b < batch; ++b) {
+                        Data localLogits, localTokens, localEmbeds;
+                        localLogits.FakeFrom(logits, size_t(b) * block * vocab * sizeof(float));
+                        localLogits.Resize({1, block, vocab});
+                        localTokens.FakeFrom(graphState->markovTokens, size_t(b) * (block + 1) * sizeof(int));
+                        localTokens.Resize({block + 1});
+                        localEmbeds.FakeFrom(markovAll, size_t(b) * block * markovEmbedWeight.dims[1] * sizeof(float));
+                        localEmbeds.Resize({1, block, markovEmbedWeight.dims[1]});
+                        auto &sample = graphState->greedyWorkspaces[b];
+                        const bool ok = FastllmCudaDeepSeekV41MarkovChainDevice(localLogits, markovEmbedWeight, markovHeadWeight,
+                            block, localTokens, sample.values, sample.indices, localEmbeds);
+                        AssertInFastLLM(ok, "DeepSeekV41 DSpark batched Markov chain rejected input.");
+                    }
+                }
             }
             if (graphState && confidenceWeight && markovAll.dims.size() == 3)
                 projectConfidence(graphState->confidenceLogits);
@@ -2864,9 +3015,12 @@ namespace fastllm {
             prepareProposalProbs(device, logits.dims.back());
         }
         if (graphState) {
-            tokens.resize(block);
-            FastllmCudaCopyFromDeviceToHost(tokens.data(), (int*)graphState->markovTokens.cudaData + 1,
-                                            block * sizeof(int));
+            std::vector<int> allTokens(batch * (block + 1));
+            FastllmCudaCopyFromDeviceToHost(allTokens.data(), graphState->markovTokens.cudaData,
+                                            allTokens.size() * sizeof(int));
+            tokens.resize(rows);
+            for (int b = 0; b < batch; ++b)
+                std::copy_n(allTokens.begin() + b * (block + 1) + 1, block, tokens.begin() + b * block);
             fusedMarkov = true;
             DsDraftTimingSlot().markovFused = true;
         }
@@ -2954,16 +3108,16 @@ namespace fastllm {
 
         // ---- confidence head：sigmoid(proj(cat(hidden, markov_embed))) ----
         const double confStart = DsTick();
-        confidence.assign(block, 1.0f);
+        confidence.assign(rows, 1.0f);
         if (confidenceWeight && markovAll.dims.size() == 3) {
             Data confLogits;
             std::vector<float> capturedValues;
             const float *values = nullptr;
 #ifdef USE_CUDA
             if (graphState) {
-                capturedValues.resize(block);
+                capturedValues.resize(rows);
                 FastllmCudaCopyFromDeviceToHost(capturedValues.data(), graphState->confidenceLogits.cudaData,
-                    block * sizeof(float));
+                    rows * sizeof(float));
                 values = capturedValues.data();
             } else
 #endif
@@ -2972,12 +3126,13 @@ namespace fastllm {
                 confLogits.ToDevice(DataDevice::CPU);
                 values = (const float*)confLogits.cpuData;
             }
-            for (int i = 0; i < block; i++) {
+            for (int i = 0; i < rows; i++) {
                 float p = DsSigmoid(values[i]);
                 confidence[i] = std::isfinite(p) ? p : 1.0f;
             }
         }
         DsDraftTimingSlot().conf = DsElapsed(confStart);
+        return true;
     }
 
     void DeepSeekV41Model::DsparkReportStats() {

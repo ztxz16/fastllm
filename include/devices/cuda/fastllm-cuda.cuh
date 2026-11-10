@@ -1748,8 +1748,12 @@ bool FastllmCudaMtpDraftSamplerRun(void *sampler, float *logits, float *proposal
 bool FastllmCudaMtpSampleDraft(float *logits, float *proposalProbs,
                               const float *temperatures, const int *topKs,
                               const float *topPs, int *output, int batch, int vocabSize);
-// Graph-safe single-row sampler. Output/proposal are device buffers; workspace
-// owns stable scratch and a device RNG counter for the lifetime of the graph.
+// Graph-safe samplers. Device output/proposal buffers and workspace stay valid
+// for the graph lifetime. Rows use independent RNG subsequences; q and tokens
+// can use strided chain storage.
+bool FastllmCudaMtpSampleDraftBatchDevice(float *logits, float *proposalProbs,
+        float temperature, int topK, float topP, int *output, int batch, int vocabSize,
+        int probabilityStride, int tokenStride, fastllm::Data &workspace);
 bool FastllmCudaMtpSampleDraftDevice(float *logits, float *proposalProbs,
     float temperature, int topK, float topP, int *output, int vocabSize,
     fastllm::Data &workspace);

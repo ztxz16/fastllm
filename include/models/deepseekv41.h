@@ -547,6 +547,8 @@ namespace fastllm {
         std::vector<int> v41DsparkTargetLayerIds;
         std::vector<int> v41DsparkTpDevices;
         std::shared_ptr<void> v41DsparkHeadWorkspace;
+        // Batch graphs own staging buffers; their addresses never depend on request lifetimes.
+        std::map<int, std::shared_ptr<DeepSeekV41DsparkState>> v41DsparkBatches;
         std::vector<char> v41IsDsparkTarget;  // [block_cnt]
         std::vector<std::vector<Data*> > v41DsparkMoeWeights, v41DsparkMoeBiass;
         std::atomic<long long> v41DsparkRounds{0};
@@ -586,13 +588,17 @@ namespace fastllm {
         // 把本次前向的前 accept 个位置提交进各层缓存，其余回滚
         void DsparkCommitPrefix(DeepSeekV41RequestState &state, DeepSeekV41SpecScratch &scratch,
                                 int startPos, int accept, int forwarded);
-        // 用 main hidden 更新草稿滑窗，并为下一轮生成候选
+        // 用已提交的 main hidden 更新草稿滑窗；所有请求更新后再合批生成候选
         void DsparkAdvance(DeepSeekV41RequestState &state, DeepSeekV41SpecScratch &scratch,
-                           int startPos, int committed, int anchorToken, const GenerationConfig &config);
-        // 三层草稿前向 + markov head + confidence head
-        void DsparkRunDraft(DeepSeekV41DsparkState &dspark, int anchorToken,
-                            std::vector<int> &tokens, std::vector<float> &confidence,
-                            const GenerationConfig &config);
+                           int startPos, int committed);
+        void DsparkGenerateDrafts(const std::vector<DeepSeekV41DsparkState*> &states,
+                                 const std::vector<int> &anchors,
+                                 const std::vector<GenerationConfig> &configs);
+        // 单请求和合批共用三层草稿前向、Markov head 和 confidence head。
+        bool DsparkRunDraft(DeepSeekV41DsparkState &storage,
+                           const std::vector<int> &positions, const std::vector<int> &anchors,
+                           const std::vector<int> &validRows, std::vector<int> &tokens,
+                           std::vector<float> &confidence, const GenerationConfig &config);
         void DsparkBuildMoeWeights();
         void DsparkReportStats();
 

@@ -1601,7 +1601,14 @@ namespace {
             int heads, int tokens, int windowRows, int ropeDim, int startPos,
             const int *devicePosition, int qBlocks) {
         constexpr int dim = 512;
-        const int block = blockIdx.x;
+        const int blocksPerRequest = qBlocks + tokens + (windowRows + 7) / 8;
+        const int request = blockIdx.x / blocksPerRequest;
+        const int block = blockIdx.x % blocksPerRequest;
+        q += size_t(request) * tokens * heads * dim;
+        kv += size_t(request) * tokens * dim;
+        window += size_t(request) * windowRows * dim;
+        table += size_t(request) * (windowRows + tokens) * dim;
+        if (devicePosition) devicePosition += request;
         if (block < qBlocks) {
             const int idx = block * blockDim.x + threadIdx.x;
             const int pairs = ropeDim / 2;
@@ -5488,14 +5495,18 @@ extern "C" bool FastllmCudaDeepSeekV41DraftRotaryTable(Data &q, Data &kv, const 
     if (V41LegacyRotary() || V41EnvOn("FASTLLM_DSV41_REFERENCE_MATH") ||
         V41EnvOn("FASTLLM_DSV41_DISABLE_FAKE_QUANT") ||
         q.dims.size() != 4 || kv.dims.size() != 3 || window.dims.size() != 3 ||
-        q.dims[0] != 1 || q.dims[1] < 1 || q.dims[1] > 8 || q.dims[2] < 1 || q.dims[2] > 128 ||
-        q.dims[3] != 512 || kv.dims != std::vector<int>({1, q.dims[1], 512}) ||
-        window.dims[0] != 1 || window.dims[1] < 1 || window.dims[1] > 1024 || window.dims[2] != 512 ||
+        q.dims[0] < 1 || q.dims[1] < 1 || q.dims[2] < 1 || q.dims[2] > 128 ||
+        q.dims[3] != 512 || kv.dims != std::vector<int>({q.dims[0], q.dims[1], 512}) ||
+        window.dims[0] != q.dims[0] || window.dims[1] < 1 || window.dims[1] > 1024 || window.dims[2] != 512 ||
         ropeDim < 2 || ropeDim > 128 || ropeDim % 2 || table.multiDeviceData || table.isFake ||
         (uintptr_t)window.cudaData % 16 || (uintptr_t)table.cudaData % 16) return false;
     const std::vector<int> device{FastllmCudaGetDevice()};
     const Data *inputs[] = {&q, &kv, &window};
-    const uint64_t tableBytes = (uint64_t)(window.dims[1] + q.dims[1]) * 512 * 2;
+    const uint64_t qTasks = uint64_t(q.dims[1]) * q.dims[2] * (ropeDim / 2);
+    const uint64_t qBlocks64 = (qTasks + 511) / 512;
+    const uint64_t blocks = uint64_t(q.dims[0]) * (qBlocks64 + q.dims[1] + (window.dims[1] + 7) / 8);
+    if (qTasks > INT_MAX || blocks > INT_MAX || q.dims[1] > INT_MAX - window.dims[1]) return false;
+    const uint64_t tableBytes = (uint64_t)q.dims[0] * (window.dims[1] + q.dims[1]) * 512 * 2;
     auto overlaps = [](const Data &a, const Data &b, uint64_t bBytes = 0) {
         const uintptr_t x = (uintptr_t)a.cudaData, y = (uintptr_t)b.cudaData;
         return x && y && x < y + (bBytes ? bBytes : b.GetBytes()) && y < x + a.GetBytes();
@@ -5512,10 +5523,10 @@ extern "C" bool FastllmCudaDeepSeekV41DraftRotaryTable(Data &q, Data &kv, const 
         }
         for (int j = 0; j < i; ++j) if (overlaps(x, *inputs[j])) return false;
     }
-    if (!V41PrepareOutput(table, DataType::BFLOAT16, {1, window.dims[1] + q.dims[1], 512})) return false;
+    if (!V41PrepareOutput(table, DataType::BFLOAT16, {q.dims[0], window.dims[1] + q.dims[1], 512})) return false;
     const auto rope = V41BuildRope(ropeDim, ropeBase, originalSeqLen, ropeFactor, betaFast, betaSlow);
-    const int qBlocks = (q.dims[1] * q.dims[2] * (ropeDim / 2) + 511) / 512;
-    V41DraftRotaryTableKernel<<<qBlocks + q.dims[1] + (window.dims[1] + 7) / 8, 512>>>(
+    const int qBlocks = int(qBlocks64);
+    V41DraftRotaryTableKernel<<<unsigned(blocks), 512>>>(
         (__nv_bfloat16*)q.cudaData, (__nv_bfloat16*)kv.cudaData, (const __nv_bfloat16*)window.cudaData,
         (__nv_bfloat16*)table.cudaData, rope, q.dims[2], q.dims[1], window.dims[1], ropeDim,
         startPos, devicePosition, qBlocks);
