@@ -1,5 +1,7 @@
 #include "fastkv/host_cache.h"
 #include "internal.h"
+#include "host_pool.h"
+#include "numa.h"
 #include <algorithm>
 #include <cstring>
 #include <unordered_map>
@@ -28,16 +30,42 @@ class Copier {
         int device;
         cudaStream_t stream = nullptr;
         void *staging = nullptr;
-        explicit Lane(int device, size_t bytes) : device(device) {
+        Buffer storage;
+        bool registered = false;
+        cudaEvent_t ready[2]{};
+        const DeviceNuma &numa;
+        std::unique_ptr<Pool> worker;
+        explicit Lane(int device, size_t bytes, int slots) : device(device), numa(NumaForDevice(device)) {
+            NumaScope affinity(numa);
             Check(cudaSetDevice(device));
+            bytes = CheckedMul(bytes, size_t(slots));
+            storage = AllocateNumaHost(bytes, numa);
+            staging = storage.MutableData();
+            std::memset(staging, 0, bytes);
             Check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-            auto result = cudaHostAlloc(&staging, bytes, cudaHostAllocPortable);
+            auto result = cudaHostRegister(staging, bytes, cudaHostRegisterPortable);
+            registered = result == cudaSuccess;
+            if (!registered) {
+                cudaGetLastError();
+                storage = {};
+                result = cudaHostAlloc(&staging, bytes, cudaHostAllocPortable);
+            }
             if (result != cudaSuccess) { cudaStreamDestroy(stream); Check(result); }
+            try {
+                for (auto &event : ready) Check(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+            } catch (...) {
+                for (auto event : ready) if (event) cudaEventDestroy(event);
+                if (registered) cudaHostUnregister(staging); else cudaFreeHost(staging);
+                cudaStreamDestroy(stream); throw;
+            }
         }
         ~Lane() {
+            worker.reset();
             cudaSetDevice(device);
             cudaStreamSynchronize(stream);
-            cudaFreeHost(staging); cudaStreamDestroy(stream);
+            for (auto event : ready) cudaEventDestroy(event);
+            if (registered) cudaHostUnregister(staging); else cudaFreeHost(staging);
+            cudaStreamDestroy(stream);
         }
     };
     static void Check(cudaError_t result) {
@@ -46,8 +74,9 @@ class Copier {
     std::map<int, std::unique_ptr<Lane>> lanes;
 #endif
     size_t stagingBytes;
+    int stages;
   public:
-    explicit Copier(size_t bytes) : stagingBytes(bytes) {}
+    explicit Copier(size_t bytes) : stagingBytes(std::max(size_t(1), bytes / 2)), stages(bytes > 1 ? 2 : 1) {}
     void Run(const std::vector<Copy> &copies, const std::shared_ptr<Cancellation> &cancel = {}) {
         // Group by device to overlap the independent PCIe links. A staging
         // window gathers/scatters CPU regions but transfers contiguous GPU spans.
@@ -64,66 +93,119 @@ class Copier {
         Require(groups.empty(), "FastKV: CUDA host cache requires FASTKV_CUDA");
 #else
         struct Piece { const Copy *copy; size_t offset, bytes, staging; };
-        struct Cursor { size_t index = 0, offset = 0; std::vector<Piece> pieces; };
-        std::map<int, Cursor> cursors;
+        struct Cursor {
+            size_t index = 0, offset = 0;
+            std::vector<Piece> pieces[2];
+            bool pending[2]{};
+        };
         for (const auto &group : groups)
-            if (!lanes.count(group.first)) lanes[group.first].reset(new Lane(group.first, stagingBytes));
-        bool more = true;
-        try {
-            while (more) {
-                if (cancel && cancel->Cancelled()) throw std::runtime_error("FastKV: restore cancelled");
-                more = false;
-                for (const auto &group : groups) {
-                    auto &cursor = cursors[group.first]; cursor.pieces.clear();
-                    auto &lane = *lanes.at(group.first);
-                    Check(cudaSetDevice(lane.device));
+            if (!lanes.count(group.first)) lanes[group.first].reset(new Lane(group.first, stagingBytes, stages));
+        auto stage = [](const std::vector<Piece> &pieces, char *staging, bool download) {
+            for (size_t i = 0; i < pieces.size();) {
+                const auto &p = pieces[i];
+                if ((p.copy->source.Kind() == MemoryKind::Cuda) != download) { ++i; continue; }
+                const Buffer &host = download ? p.copy->target : p.copy->source;
+                size_t bytes = p.bytes, j = i + 1;
+                for (; j < pieces.size(); ++j) {
+                    const auto &next = pieces[j];
+                    const Buffer &other = download ? next.copy->target : next.copy->source;
+                    if ((next.copy->source.Kind() == MemoryKind::Cuda) != download ||
+                        other.Id() != host.Id() || other.Offset() + next.offset != host.Offset() + p.offset + bytes ||
+                        next.staging != p.staging + bytes) break;
+                    bytes += next.bytes;
+                }
+                // The identical allocation ID and contiguous offsets prove the
+                // combined span stays inside the live allocation, even across
+                // logical KV pages. Do not issue one small memcpy per page.
+                const char *address = static_cast<const char *>(download ? host.MutableData() : host.Data()) + p.offset;
+                std::memcpy(download ? const_cast<char *>(address) : staging + p.staging,
+                            download ? staging + p.staging : address, bytes);
+                i = j;
+            }
+        };
+        auto finish = [&](Lane &lane, Cursor &cursor, int slot) {
+            if (!cursor.pending[slot]) return;
+            Check(cudaEventSynchronize(lane.ready[slot]));
+            stage(cursor.pieces[slot], static_cast<char *>(lane.staging) + slot * stagingBytes, true);
+            cursor.pending[slot] = false;
+            cursor.pieces[slot].clear();
+        };
+        auto run = [&](int device, const std::vector<const Copy *> &group) {
+            auto &lane = *lanes.at(device);
+            NumaScope affinity(lane.numa);
+            Check(cudaSetDevice(lane.device));
+            Cursor cursor;
+            int slot = 0;
+            try {
+                while (cursor.index < group.size()) {
+                    if (cancel && cancel->Cancelled()) throw std::runtime_error("FastKV: restore cancelled");
+                    // Reuse only a completed slot. CPU staging of the next
+                    // window overlaps DMA of the other, within the same budget.
+                    finish(lane, cursor, slot);
+                    auto &pieces = cursor.pieces[slot];
+                    char *staging = static_cast<char *>(lane.staging) + slot * stagingBytes;
                     size_t used = 0;
-                    while (cursor.index < group.second.size() && used < stagingBytes) {
-                        const Copy *copy = group.second[cursor.index];
+                    while (cursor.index < group.size() && used < stagingBytes) {
+                        const Copy *copy = group[cursor.index];
                         const size_t bytes = std::min(stagingBytes - used, copy->source.Size() - cursor.offset);
-                        cursor.pieces.push_back({copy, cursor.offset, bytes, used});
-                        if (copy->source.Kind() == MemoryKind::Host)
-                            std::memcpy(static_cast<char *>(lane.staging) + used,
-                                        static_cast<const char *>(copy->source.Data()) + cursor.offset, bytes);
+                        pieces.push_back({copy, cursor.offset, bytes, used});
                         used += bytes; cursor.offset += bytes;
                         if (cursor.offset == copy->source.Size()) { ++cursor.index; cursor.offset = 0; }
                     }
-                    for (size_t i = 0; i < cursor.pieces.size();) {
-                        const auto &p = cursor.pieces[i];
+                    stage(pieces, staging, false);
+                    for (size_t i = 0; i < pieces.size();) {
+                        const auto &p = pieces[i];
                         const bool download = p.copy->source.Kind() == MemoryKind::Cuda;
                         const Buffer &gpu = download ? p.copy->source : p.copy->target;
                         size_t bytes = p.bytes, j = i + 1;
-                        for (; j < cursor.pieces.size(); ++j) {
-                            const auto &next = cursor.pieces[j];
+                        for (; j < pieces.size(); ++j) {
+                            const auto &next = pieces[j];
                             const Buffer &other = download ? next.copy->source : next.copy->target;
                             if ((next.copy->source.Kind() == MemoryKind::Cuda) != download ||
                                 other.Id() != gpu.Id() || other.Offset() + next.offset != gpu.Offset() + p.offset + bytes) break;
                             bytes += next.bytes;
                         }
-                        void *host = static_cast<char *>(lane.staging) + p.staging;
+                        void *host = staging + p.staging;
                         const void *address = static_cast<const char *>(gpu.Data()) + p.offset;
                         Check(cudaMemcpyAsync(download ? host : const_cast<void *>(address),
                                               download ? address : host, bytes,
                                               download ? cudaMemcpyDeviceToHost : cudaMemcpyHostToDevice, lane.stream));
                         i = j;
                     }
-                    more |= cursor.index < group.second.size();
+                    Check(cudaEventRecord(lane.ready[slot], lane.stream));
+                    cursor.pending[slot] = true;
+                    slot = (slot + 1) % stages;
                 }
+                for (int s = 0; s < stages; ++s) finish(lane, cursor, s);
+            } catch (...) {
+                cudaStreamSynchronize(lane.stream);
+                throw;
+            }
+        };
+        if (groups.size() == 1) run(groups.begin()->first, groups.begin()->second);
+        else {
+            // Persistent bounded workers keep CPU staging for different GPUs
+            // independent as well as their DMA streams. Reuse FastKV's executor.
+            std::vector<std::future<void>> completed;
+            completed.reserve(groups.size());
+            std::exception_ptr error;
+            try {
                 for (const auto &group : groups) {
                     auto &lane = *lanes.at(group.first);
-                    Check(cudaSetDevice(lane.device)); Check(cudaStreamSynchronize(lane.stream));
-                    for (const auto &p : cursors[group.first].pieces)
-                        if (p.copy->source.Kind() == MemoryKind::Cuda)
-                            std::memcpy(static_cast<char *>(p.copy->target.MutableData()) + p.offset,
-                                        static_cast<char *>(lane.staging) + p.staging, p.bytes);
+                    if (!lane.worker) lane.worker.reset(new Pool(1, 1));
+                    auto task = std::make_shared<std::packaged_task<void()>>(
+                        [&, device = group.first] { run(device, groups.at(device)); });
+                    auto future = task->get_future();
+                    Require(lane.worker->TryEnqueue([task] { (*task)(); }), "FastKV: copy lane busy");
+                    completed.push_back(std::move(future));
                 }
+            } catch (...) { error = std::current_exception(); }
+            // A failure/cancellation on one GPU cannot free buffers still in
+            // use by another GPU, including failure partway through submission.
+            for (auto &future : completed) {
+                try { future.get(); } catch (...) { if (!error) error = std::current_exception(); }
             }
-        } catch (...) {
-            // Buffers cannot be released until every previously issued DMA is done.
-            for (auto &lane : lanes) {
-                cudaSetDevice(lane.first); cudaStreamSynchronize(lane.second->stream);
-            }
-            throw;
+            if (error) std::rethrow_exception(error);
         }
 #endif
         if (cancel && cancel->Cancelled()) throw std::runtime_error("FastKV: restore cancelled");
@@ -172,6 +254,8 @@ size_t HostCache::Hit::Payloads() const { return entry ? entry->payloads.size() 
 struct HostCache::Impl {
     Options options;
     Budget budget, inflight;
+    HostPool hostPool;
+    std::mutex allocationMutex;
     std::map<int, std::unique_ptr<Budget>> destinationBudgets;
     mutable std::mutex mutex;
     std::condition_variable changed;
@@ -252,11 +336,29 @@ struct HostCache::Impl {
             if (!Evict()) throw CapacityBusy("FastKV: host cache pinned or full");
         return budget.Reserve(bytes);
     }
-    Buffer Allocate(size_t bytes) {
-        struct Allocation { std::shared_ptr<void> credit; Buffer data; };
-        auto owner = std::make_shared<Allocation>();
-        owner->credit = Reserve(bytes); owner->data = Buffer::Allocate(bytes);
-        return Buffer::Borrow(owner->data.MutableData(), bytes, MemoryKind::Host, -1, owner);
+    Buffer Allocate(size_t bytes, int device) {
+        // Serialize growth, not copying or lease release. Eviction may free
+        // holes in an existing slab, so retry reuse after each evicted entry.
+        std::lock_guard<std::mutex> allocationLock(allocationMutex);
+        const auto &numa = NumaForDevice(device);
+        const size_t preferred = std::max(bytes, std::min(size_t(64) << 20, options.bytes / 16));
+        for (;;) {
+            auto reused = hostPool.TryAllocate(bytes, numa.node);
+            if (reused.Size()) return reused;
+            std::shared_ptr<void> credit;
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                const size_t available = options.bytes - budget.Used();
+                // Do not shrink new slabs to the last few free bytes: that
+                // would recreate unbounded small mappings near a full cache.
+                if (available >= preferred) {
+                    credit = budget.Reserve(preferred);
+                } else if (!Evict()) {
+                    throw CapacityBusy("FastKV: host cache pinned or full");
+                }
+            }
+            if (credit) return hostPool.Add(AllocateNumaHost(preferred, numa), std::move(credit), numa.node, bytes);
+        }
     }
     bool Enqueue(size_t bytes, bool priority, std::function<void(Copier &, std::shared_ptr<void>)> job) {
         std::lock_guard<std::mutex> lock(mutex);
@@ -313,7 +415,7 @@ struct HostCache::Impl {
                             if (description.regions[j].bytes > (2 << 20) - bytes) break;
                             bytes += description.regions[j].bytes;
                         }
-                        arena = Allocate(bytes); used = 0;
+                        arena = Allocate(bytes, source.Device()); used = 0;
                     }
                     auto target = arena.Slice(used, region.bytes); used += region.bytes;
                     AddCopy(copies, source.Slice(region.offset, region.bytes), target);

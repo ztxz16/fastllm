@@ -1,5 +1,6 @@
 #include "fastkv/host_cache.h"
 #include <iostream>
+#include <thread>
 
 using namespace fastkv;
 static void Check(bool ok, const char *message) { if (!ok) throw std::runtime_error(message); }
@@ -73,6 +74,21 @@ int main(int argc, char **argv) {
         pinned = {}; small.PublishAsync("b", {2}, a); small.Drain();
         Check(small.ProbeTokens("a", {1}) == 0 && small.ProbeTokens("b", {2}) == 1, "unpin eviction");
         Check(small.Stats().bytes <= 18000, "physical bound");
+        // Fill and evict repeatedly while the pool contains partly live slabs.
+        // Region versions differ so every new checkpoint writes fresh bytes.
+        {
+            HostCache churn({256 << 10, 1 << 20, 8192, 4, 2});
+            for (int i = 0; i < 100; ++i) {
+                auto snapshot = State(4, device, std::to_string(i) + ":");
+                Check(churn.PublishAsync("churn", {i}, snapshot), "churn publish"); churn.Drain();
+                auto latest = churn.Find("churn", {i});
+                Check(bool(latest), "slab fragmentation prevented publication");
+                Equal(snapshot.state, Restore(churn, latest, device));
+                Check(churn.Stats().bytes <= (256 << 10), "slab physical budget exceeded");
+            }
+            Check(churn.Stats().failures == 0 && churn.Stats().skipped == 0 && churn.Stats().evictions > 0,
+                  "churn did not evict cleanly");
+        }
         // Different recomputations may not inherit the earlier numeric state.
         auto wrong = State(3, device, "different");
         auto changed = Buffer::Allocate(wrong.state.buffers[0].Size(), device);
@@ -92,6 +108,53 @@ int main(int argc, char **argv) {
               "completed but unconsumed restore lost destination credit");
         held = {};
         Equal(a.state, Restore(bounded, limitedHit, device));
+        // Both staging slots cross region boundaries, including a short final
+        // slot. A one-byte budget keeps the same contract without rounding up.
+        for (size_t staging : {size_t(1), size_t(4099), size_t(65537)}) {
+            HostCache odd({1 << 20, 1 << 20, staging, 4, 1});
+            Check(odd.PublishAsync("odd", {1}, a), "odd staging publish"); odd.Drain();
+            Equal(a.state, Restore(odd, odd.Find("odd", {1}), device));
+        }
+        // Larger than every staging window: cancel while DMA is in flight,
+        // then reuse the worker. Never release a source/destination early.
+        if (device >= 0) {
+            auto large = State(1024, device);
+            HostCache streamed({32 << 20, 32 << 20, 8192, 4, 1});
+            Check(streamed.PublishAsync("stream", {1}, large), "stream publish"); streamed.Drain();
+            auto streamHit = streamed.Find("stream", {1});
+            auto mid = std::make_shared<Cancellation>();
+            std::future<Message> work;
+            Check(streamed.RestoreAsync(streamHit, {device,device,device}, work, mid), "stream restore");
+            std::this_thread::sleep_for(std::chrono::milliseconds(1)); mid->Cancel();
+            // Completion may win a cancellation race; either outcome is valid.
+            try { Equal(large.state, work.get()); } catch (const std::runtime_error &e) {
+                Check(std::string(e.what()).find("cancelled") != std::string::npos, "unexpected restore error");
+            }
+            Equal(large.state, Restore(streamed, streamHit, argc > 2 ? std::stoi(argv[2]) : device));
+            std::future<Message> dropped;
+            Check(streamed.RestoreAsync(streamHit, {device,device,device}, dropped), "dropped restore");
+            dropped = {}; streamed.Drain();
+            if (argc > 2) {
+                const int other = std::stoi(argv[2]);
+                auto mixed = State(1024, other);
+                mixed.state.buffers.insert(mixed.state.buffers.end(), large.state.buffers.begin(), large.state.buffers.end());
+                mixed.payloads.insert(mixed.payloads.end(), large.payloads.begin(), large.payloads.end());
+                Check(streamed.PublishAsync("mixed", {2}, mixed), "multi-device publish"); streamed.Drain();
+                auto mixedHit = streamed.Find("mixed", {2});
+                const std::vector<int> placement{device,device,device,other,other,other};
+                std::future<Message> parallel;
+                Check(streamed.RestoreAsync(mixedHit, placement, parallel), "multi-device restore");
+                Equal(mixed.state, parallel.get());
+                auto stop = std::make_shared<Cancellation>();
+                Check(streamed.RestoreAsync(mixedHit, placement, parallel, stop), "multi-device cancellation");
+                std::this_thread::sleep_for(std::chrono::milliseconds(1)); stop->Cancel();
+                try { Equal(mixed.state, parallel.get()); } catch (const std::runtime_error &e) {
+                    Check(std::string(e.what()).find("cancelled") != std::string::npos, "multi-device restore error");
+                }
+                Check(streamed.RestoreAsync(mixedHit, placement, parallel), "multi-device retry");
+                Equal(mixed.state, parallel.get());
+            }
+        }
         std::cout << "Host cache: byte-exact incremental, boundary, eviction, cancellation, namespace PASS device=" << device << '\n';
     } catch (const std::exception &e) { std::cerr << e.what() << '\n'; return 1; }
 }

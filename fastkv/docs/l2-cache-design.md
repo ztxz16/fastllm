@@ -41,9 +41,24 @@ Naive adapter 对 Full KV 和 indexer 使用存储对象、物理页、allocatio
 5. 所有复制完成后返回相同 metadata 和 buffer 边界。模型执行线程校验并导入状态，随后计算未命中的后缀。
 6. 取消或丢弃 future 不会提前释放 DMA 中的源、目标或额度。后台复制排空后释放；缓存停止时排空已接收任务。
 
-CUDA worker 使用每设备私有 non-blocking stream，有限 pinned staging 聚合相邻区域，
-不同设备的 DMA 可同时提交。只等待相应 worker 的流，不调用设备级同步。
+CUDA worker 使用每设备私有 non-blocking stream，将既有 pinned staging 预算分为
+两个轮换窗口，以事件保护窗口复用。连续物理区域的 CPU 复制和 DMA 分别合并，
+逻辑 buffer 边界保持不变。多设备任务复用 FastKV 的有界线程池，每 worker、每设备
+至多一条持久复制线程，使各卡 CPU 搬运与 DMA 独立推进；单设备任务直接在 worker 执行。
+一个设备出错后仍等待其他设备结束，之后才能释放源、目标和额度；不调用设备级同步。
 无 CUDA 构建仍支持 Host 数据的发布、恢复和独立测试。
+
+Linux CUDA 构建通过设备 PCI 地址查询 NUMA 节点，主存 arena 与 staging 优先分配在
+源 GPU 本地节点，恢复线程按目标 GPU 选择本地 CPU，并遵守调用线程原有 CPU 许可范围。
+只在复制期间临时设置线程亲和性，之后恢复；不改变整个进程或系统的策略。
+使用内核接口，无 libnuma 依赖。拓扑未知、策略设置失败或非 Linux 平台保留普通分配路径，
+本地内存不足时允许跨节点分配。staging 注册不受支持时回退 CUDA pinned allocation。
+
+L2 驻留内存按 NUMA 节点使用大块分配、内部切分复用，常规 slab 目标为 64 MiB，
+小缓存按总预算缩小，超大 payload 可单独占用更大的 slab。分配时按空洞大小查找，
+释放时合并相邻空洞；只有最后一个分片 lease 释放后才解除整块映射。
+避免每个小 arena 单独 `mmap/mbind`，防止长期淘汰产生大量 VMA 并触及
+`vm.max_map_count`。不修改系统映射上限，不新增环境变量。
 
 PD 接入在请求准入时取得 L2 lease，并将待恢复字节与未命中计算量分开计费。
 完整 prompt 仍按 GPU 页向上取整预留容量。恢复不能满足目标设备预算的检查点不备份；
@@ -53,7 +68,7 @@ PD 接入在请求准入时取得 L2 lease，并将待恢复字节与未命中�
 
 | 资源 | 约束与释放时机 |
 |---|---|
-| Host 驻留 | `bytes` 约束唯一 Host arena 与核算的元数据；块共享引用释放后才归还额度 |
+| Host 驻留 | `bytes` 约束整块 Host slab（含内部空洞）与核算的元数据；最后一个分片引用释放后归还 slab 额度 |
 | 在途复制 | `inflightBytes` 约束备份源与恢复目标；恢复结果被消费者持有期间继续计费 |
 | 每设备恢复 | `restoreDeviceBytes` 可进一步限制目标设备，额度随结果 buffer 最后一个引用释放 |
 | pinned staging | 每 worker、每使用过的 GPU 最多 `stagingBytes`，默认 8 MiB，与 Host 容量独立 |
@@ -62,6 +77,8 @@ PD 接入在请求准入时取得 L2 lease，并将待恢复字节与未命中�
 L2 独立按完整检查点 LRU 淘汰，活动读取 lease 不可淘汰。共享块按引用释放，
 不会单独删除必需的 SWA/scale 而仍报告完整命中。容量不足且条目被持有时跳过备份。
 Host 预算不是进程 RSS 上限；容器、索引及临时描述仍需预留额外空间。
+淘汰每个检查点后优先重试已有空洞，不能只为了申请新 slab 而忽略刚释放的空间。
+分配器不调用模型接口，缓存销毁后外部仍持有的 `Hit` 或 buffer 保持数据和预算有效。
 
 部署使用每 P 的 `cache_bytes`，默认 0；`cache_workers` 默认 2、范围 1～64。
 多个 P 的容量需要相加核算，不能各自占满整机内存。复制与目标设备预算由已有
@@ -75,18 +92,21 @@ transport staging 额度导出，不增加环境变量或模型专用调试开�
 计数不包含异步 L2 DMA。
 
 独立 `fastkv_host_cache_test` 覆盖字节一致性、命名空间、父版本复用、边界状态、
-淘汰、取消和消费者持有预算；可传 CUDA device ordinal 验证设备复制。
+淘汰、取消和消费者持有预算；可传 CUDA device ordinal 验证设备复制，另传第二个
+device ordinal 验证跨设备放置、并行复制与中途取消后重试。覆盖非整齐窗口和尾部字节。
+`fastkv_host_pool_test` 验证 NUMA 分组隔离、空洞合并、并发分片复用、跨池生命周期和整块预算；
+Linux CUDA 构建在系统允许查询和设置策略时还校验实际 NUMA preferred 节点。
+Host cache 压力用例覆盖持续写入、淘汰、恢复的逐字节一致性。
 `fastkv_routing_test` 覆盖分层代价与路由额度，`pd_state_test` 覆盖模型适配、
 Host 恢复、排队准入和取消清理。模型精度与压力验证应比较相同执行形状下的冷算、
 L1 恢复和 L2 恢复，SWE 长时间吞吐不能替代算子或状态字节正确性测试。
 
 ## 当前边界与后续扩展
 
-当前不自动设置 NUMA CPU/内存亲和性；Host 内存使用系统默认分配策略。
 L2 每实例私有，不提供跨 P 共享目录、持久化或远程存储。恢复先生成私有 GPU
 `Message`，再由 adapter 导入页池，尚非直接 DMA 到活动页表。
 
-后续 NUMA 分配、直接目标恢复、TCP/RDMA 远程缓存和不同 TP 布局重分片，应复用
+后续直接目标恢复、TCP/RDMA 远程缓存和不同 TP 布局重分片，应复用
 现有不可变版本、buffer lease、预算和完整提交契约，显式声明兼容布局。
 这些能力未实现前，不自动转换数据类型或宣称支持任意异构恢复；wide-EP 的计算
 collective 仍由推理系统负责。
