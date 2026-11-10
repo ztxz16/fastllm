@@ -1512,7 +1512,7 @@ static void FastllmCudaFP8E4M3Block128EnsureBFloat16BiasOnDevice(fastllm::Data &
 }
 
 static void FastllmCudaFP8E4M3Block128EnsureBiasOnDevice(fastllm::Data &weight, const fastllm::Data &bias, int k) {
-    if (weight.cudaData == nullptr || weight.extraCudaData.size() == 0) {
+    if (weight.cudaData == nullptr || weight.extraCudaData.empty() || !weight.extraCudaData[0]) {
         cudaError_t state = cudaSuccess;
         float *cudaBiasData;
         state = cudaMalloc(&cudaBiasData, k * sizeof(float));
@@ -1522,7 +1522,8 @@ static void FastllmCudaFP8E4M3Block128EnsureBiasOnDevice(fastllm::Data &weight, 
             state = cudaMemset(cudaBiasData, 0, k * sizeof(float));
         }
         checkCudaErrors("Error: CUDA error when moving bias to device!", state);
-        weight.extraCudaData.push_back((void*)cudaBiasData);
+        if (weight.extraCudaData.empty()) weight.extraCudaData.resize(1, nullptr);
+        weight.extraCudaData[0] = (void*)cudaBiasData;
     }
 }
 
@@ -3538,6 +3539,15 @@ bool FastllmCudaBFloat16MatMulFP8E4M3PerChannel(const fastllm::Data &input, fast
     __nv_bfloat16 *cudaBF16Bias = bias.dims.size() == 0 ? nullptr : (__nv_bfloat16 *) weight.extraCudaHalfData[0];
     __nv_bfloat16 *cudaInput = (__nv_bfloat16*)FastllmCudaPrepareInput(input);
     __nv_bfloat16 *cudaOutput = (__nv_bfloat16*)FastllmCudaPrepareOutput(output);
+
+#ifdef FASTLLM_ENABLE_DEEPGEMM_FP8_SM90
+    if (FastllmCudaPerChannelW8A16(cudaInput, weight, cudaOutput, n, m, k)) {
+        if (cudaBF16Bias) FastllmCudaBiasKernel<<<n, 256>>>(cudaOutput, cudaBF16Bias, k);
+        FastllmCudaFinishInput(input, cudaInput);
+        FastllmCudaFinishOutput(output, cudaOutput);
+        return true;
+    }
+#endif
 
     auto fastllmCublasHandle = getFastllmCublasHandle();
     size_t wsBytes = 0;

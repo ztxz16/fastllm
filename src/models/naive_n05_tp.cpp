@@ -14,6 +14,7 @@
 #ifdef USE_CUDA
 #include "devices/cuda/cudaworkspace.h"
 #include "devices/cuda/fastllm-cuda.cuh"
+#include "devices/cuda/fastllm-fp8-auxiliary.h"
 #include "devices/cuda/fastllm-mimo-ep8-mega.h"
 #include "devices/multicuda/fastllm-multicuda.cuh"
 #endif
@@ -390,6 +391,23 @@ void NaiveN05FlashModel::PrepareTensorParallel() {
         printf("[Naive parallel] world=%d attention_dp=%d attention_tp=%d moe_ep=%d moe_tp=%d dense_tp=%d draft_tp=%d\n",
             ranks, attentionDP, AttentionTPSize(), tpEp8Mega ? ranks : 1,
             tpEp8Mega ? 1 : ranks, ranks, ranks);
+#ifndef USE_ROCM
+    if (dataType == BFLOAT16) {
+        const int previous = FastllmCudaGetDevice();
+        // A DP warmup request exercises only one owner. Prepare W8A16 weights
+        // on every rank before sizing KV, including ranks with no warmup input.
+        // The kernel/preparation API is model-neutral; FP16 models keep their
+        // existing storage instead of paying for an unused BF16-input layout.
+        for (auto &item : weight.weight) {
+            if (item.second.dataType != FP8_E4M3_PERCHANNEL) continue;
+            for (auto &shard : item.second.multiDeviceDatas) {
+                FastllmCudaSetDevice(shard.first);
+                FastllmCudaPreparePerChannelW8A16(*shard.second);
+            }
+        }
+        FastllmCudaSetDevice(previous);
+    }
+#endif
     tpPrepared = true;
 #endif
 }

@@ -869,8 +869,22 @@ fastllm::Data *FastllmCudaExactRouterBFloat16Weight(fastllm::Data &weight) {
     return result;
 }
 
+#ifdef FASTLLM_ENABLE_DEEPGEMM_FP8_SM90
+bool FastllmCudaPreparePerChannelW8A16SM90(fastllm::Data &weight);
+#endif
+bool FastllmCudaPreparePerChannelW8A16(fastllm::Data &weight) {
+#ifdef FASTLLM_ENABLE_DEEPGEMM_FP8_SM90
+    return FastllmCudaPreparePerChannelW8A16SM90(weight);
+#else
+    return false;
+#endif
+}
+
 extern "C" void FastllmCudaReleaseBFloat16FP8Auxiliary(fastllm::Data &weight) {
     if (weight.isFake) return;
+#ifdef FASTLLM_ENABLE_DEEPGEMM_FP8_SM90
+    FastllmCudaReleasePerChannelW8A16(weight);
+#endif
     auto &registry = BFloatFp8Registry();
     BFloatFp8Auxiliary owned;
     std::shared_ptr<fastllm::Data> routerBFloat16;

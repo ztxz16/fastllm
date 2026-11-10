@@ -517,8 +517,10 @@ if (USE_CUDA)
         EXISTS "${FASTLLM_CUTLASS_DIR}/include/cutlass/cutlass.h")
         set(FASTLLM_CUDA_SM90_SOURCES
             src/devices/cuda/linear/fastllm-linear-fp8-sm90.cu
-            src/devices/cuda/linear/fastllm-linear-fp8-decode-sm90.cu)
+            src/devices/cuda/linear/fastllm-linear-fp8-decode-sm90.cu
+            src/devices/cuda/linear/fastllm-linear-fp8-perchannel-sm90.cu)
         set_property(SOURCE src/devices/cuda/cudadevice.cpp
+            src/devices/cuda/linear/fastllm-linear-fp8.cu
             src/devices/cuda/linear/fastllm-linear-fp8-marlin.cu
             APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_DEEPGEMM_FP8_SM90)
         message(STATUS "Hopper SM90 DeepGEMM FP8 linear: ON")
@@ -3497,6 +3499,13 @@ if (UNIT_TEST)
         endif()
 
 
+
+        if ("src/devices/cuda/linear/fastllm-linear-fp8-perchannel-sm90.cu" IN_LIST FASTLLM_CUDA_SM90_SOURCES)
+            add_executable(cuda_fp8_perchannel_w8a16_test test/basic/test_cuda_fp8_perchannel_w8a16.cu)
+            target_link_libraries(cuda_fp8_perchannel_w8a16_test PRIVATE fastllm Threads::Threads)
+            add_test(NAME cuda_fp8_perchannel_w8a16 COMMAND cuda_fp8_perchannel_w8a16_test)
+            set_tests_properties(cuda_fp8_perchannel_w8a16 PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+        endif()
 
         add_executable(cuda_fp8_perchannel_test test/basic/test_cuda_fp8_perchannel.cu)
         target_link_libraries(cuda_fp8_perchannel_test PRIVATE fastllm)
