@@ -11612,7 +11612,11 @@ namespace fastllm {
             totalFixedBytes += item.second.fixed;
         }
         if (totalBytesPerToken == 0) return;
-        long long capacity = std::min(max_positions, std::numeric_limits<int>::max() - lookahead);
+        // max_positions limits each request. The physical pool is shared by
+        // all admitted requests and must honor their aggregate token budget.
+        const long long speculativeSlots = (long long)lookahead * linearSlots;
+        long long capacity = std::min((long long)max_positions * linearSlots,
+            (long long)std::numeric_limits<int>::max() - speculativeSlots);
         if (GetMaxTokens() > 0) capacity = std::min<long long>(capacity, GetMaxTokens());
         if (tokensLimit > 0) capacity = std::min<long long>(capacity, tokensLimit);
         const bool hybridKvMem = executionMode == ExecutionMode::Hybrid && kvMemConfig.enabled;

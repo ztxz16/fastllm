@@ -375,7 +375,8 @@ struct Qwen4PrefixCacheTestAccess {
         model.block_cnt = 2;
         model.linearLayers = {true, false};
         model.maxBatch = 2;
-        model.max_positions = model.tokensLimit = 1024;
+        model.max_positions = 512;
+        model.tokensLimit = 1024;
         model.kvCacheLimit = 0;
         model.indexerHeadDim = 128;
         model.indexerKvHeads = 1;
@@ -388,6 +389,9 @@ struct Qwen4PrefixCacheTestAccess {
         Input(warmup[1].first, warmup[1].second, FLOAT16, 1, 1, 0, device);
         model.ReserveServingCache(warmup);
         Check(warmup.empty() && model.servingCache, "startup pool reservation failed");
+        Check(model.tokensLimit == 1024, "shared KV capacity was capped to one request");
+        Check(model.servingCache->layers[1].first->maxPages * GetPageLen() >= 1024,
+              "shared KV pool cannot hold both request contexts");
         Check(model.servingCache->layers[0].first->maxPages == 2, "linear slot budget mismatch");
         ResponseContext request, restored;
         request.Init(2, FLOAT16, FLOAT16); restored.Init(2, FLOAT16, FLOAT16);
