@@ -2219,6 +2219,14 @@ if (UNIT_TEST)
             endif()
         endif()
 
+        # The native BF16-input FP8 backend is compiled with CUDA 12.8+.
+        if (CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "12.8")
+            add_executable(cuda_fp8_bf16_prefill_test test/basic/test_cuda_fp8_bf16_prefill.cu)
+            target_link_libraries(cuda_fp8_bf16_prefill_test PRIVATE fastllm)
+            add_test(NAME cuda_fp8_bf16_prefill COMMAND cuda_fp8_bf16_prefill_test)
+            set_tests_properties(cuda_fp8_bf16_prefill PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
+        endif()
+
         add_executable(cuda_fp8_cache_tp_test test/basic/test_cuda_fp8_cache_tp.cpp)
         target_link_libraries(cuda_fp8_cache_tp_test PRIVATE fastllm Threads::Threads)
         target_include_directories(cuda_fp8_cache_tp_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})

@@ -3139,8 +3139,7 @@ __global__ void FastllmCudaFP8E4M3PERCHANNEL2BF16Kernel(uint8_t* a, __nv_bfloat1
     float scale = *(float*)(row + m);
 
     for (int i = tid; i < m; i += blockDim.x) {
-        uint16_t bf16_bits = ((row[i] & 0x80) << 8) | ((row[i] & 0x7F) << 4);
-        float val = __bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&bf16_bits)) * scale;
+        float val = FastllmFp8GridToFloat(row[i]) * scale;
         out[i] = __float2bfloat16_rn(val);
     }
 }
@@ -3512,6 +3511,12 @@ bool FastllmCudaBFloat16MatMulFP8E4M3Block128ToFloat(
 }
 
 bool FastllmCudaBFloat16MatMulFP8E4M3PerChannel(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
+    if (input.dataDevice == fastllm::DataDevice::CUDA && weight.dataDevice == fastllm::DataDevice::CUDA &&
+        output.dataDevice == fastllm::DataDevice::CUDA && (bias.dims.empty() ||
+        (bias.dataDevice == fastllm::DataDevice::CUDA && bias.dataType == fastllm::DataType::FLOAT32)) &&
+        fastllm_native_prefill::Fp8BFloat16((const __nv_bfloat16 *)input.cudaData,
+            (const uint8_t *)weight.cudaData, bias.dims.empty() ? nullptr : (const float *)bias.cudaData,
+            (__nv_bfloat16 *)output.cudaData, n, k, m)) return true;
     FastllmCudaFP8E4M3Block128EnsureBFloat16BiasOnDevice(weight, bias, k);
 
     __nv_bfloat16 *cudaBF16Bias = bias.dims.size() == 0 ? nullptr : (__nv_bfloat16 *) weight.extraCudaHalfData[0];
@@ -3526,7 +3531,7 @@ bool FastllmCudaBFloat16MatMulFP8E4M3PerChannel(const fastllm::Data &input, fast
     int maxRowsPerChunk = (int)std::min<size_t>((size_t)k, std::max<size_t>(1, wsBytes / bytesPerRow));
 
     const size_t perRow = (size_t)m + sizeof(float);
-    float h_alpha = exp2f(120.0), h_beta = 0.0f;
+    float h_alpha = 1.0f, h_beta = 0.0f;
     cudaDataType_t AType = CUDA_R_16BF, BType = CUDA_R_16BF, CType = CUDA_R_16BF, ComputeType = CUDA_R_32F;
     cublasStatus_t status = CUBLAS_STATUS_SUCCESS;
 

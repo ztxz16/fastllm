@@ -40,6 +40,21 @@ class NaiveTensorParallelCliTest(unittest.TestCase):
             self.model_options = fake.llm.model.call_args.kwargs
             return args
 
+    def test_fp8_prefill_environment_and_saved_booleans(self):
+        name = 'FASTLLM_CUDA_NATIVE_FP8_PREFILL'
+        self.configure(['--fp8_prefill', 'auto'], environment={name: '1'})
+        self.assertEqual(self.native_env[name], '1')
+        for value in ('true', 'false', True, False):
+            with self.subTest(value=value):
+                self.configure([], saved={'fp8_prefill': value}, environment={name: '1'})
+                self.assertEqual(self.native_env[name], '1' if str(value).lower() == 'true' else '0')
+        self.configure(['--fp8_prefill', 'false'], environment={name: '1'})
+        self.assertEqual(self.native_env[name], '0')
+
+    def test_fp8_prefill_rejects_invalid_saved_value(self):
+        with self.assertRaisesRegex(ValueError, 'fp8_prefill'):
+            self.configure([], saved={'fp8_prefill': 'invalid'})
+
     def test_indexer_tp_storage(self):
         self.configure(['--tp', '8'])
         self.assertEqual(self.model_options['indexer_tp_storage'], 'replicated')

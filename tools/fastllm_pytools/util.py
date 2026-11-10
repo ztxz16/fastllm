@@ -1153,6 +1153,8 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--lora', type = str, default = "", help = '指定lora路径')
     parser.add_argument('--cache_dir', type = str, default = "", help = '指定缓存模型文件的路径')
     parser.add_argument('--dtype_config', type = str, default = "", help = '指定权重类型配置文件')
+    parser.add_argument('--fp8_prefill', choices=['auto', 'true', 'false'], default='auto',
+                        help='FP8 权重的 prefill 激活量化开关；true 启用 W8A8，false 保持权重量化路径，auto 沿用默认策略')
     parser.add_argument('--ori', type = str, default = "", help = '原始模型权重，读取GGUF文件时可以使用')
     parser.add_argument('--mmproj', type = str, default = "", help = '多模态投影GGUF文件（仅在读取GGUF主模型时有效）')
 
@@ -2164,6 +2166,11 @@ def make_normal_llm_model(args, startup_progress = None):
     apply_page_size_default(args)
     if (args.page_size > 0):
         llm.set_page_size(args.page_size)
+    fp8_prefill = str(getattr(args, "fp8_prefill", "auto")).lower()
+    if fp8_prefill not in ("auto", "true", "false"):
+        raise ValueError("fp8_prefill must be auto, true or false")
+    if fp8_prefill != "auto":
+        os.environ["FASTLLM_CUDA_NATIVE_FP8_PREFILL"] = "1" if fp8_prefill == "true" else "0"
     apply_prefix_cache_env(args)
     apply_image_embedding_cache_env(args)
     apply_vision_device_env(args)

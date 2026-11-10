@@ -1814,6 +1814,43 @@ namespace fastllm {
             data.perChannelAxis = 0;
             data.groupCnt = 32;
             data.group = groups;
+        } else if ((oriDataType == DataType::FLOAT32 || oriDataType == DataType::BFLOAT16) &&
+                   dataType == DataType::FP8_E4M3_PERCHANNEL) {
+            AssertInFastLLM(data.dims.size() == 2, "FP8 per-channel quantization requires a matrix.");
+            // E4M3 finite saturation, round-to-nearest-even, including subnormals.
+            auto encode = [](float value) -> uint8_t {
+                uint32_t bits; memcpy(&bits, &value, sizeof(bits));
+                const uint8_t sign = (bits >> 24) & 128;
+                bits &= 0x7fffffff;
+                if (bits > 0x7f800000) return sign | 127;
+                if (bits >= 0x43e00000) return sign | 126; // 448 and infinity
+                if (bits < 0x3c800000) {
+                    float magnitude; memcpy(&magnitude, &bits, sizeof(bits));
+                    float scaled = magnitude * 512.f;
+                    int rounded = (int)scaled;
+                    float tail = scaled - rounded;
+                    rounded += tail > .5f || (tail == .5f && (rounded & 1));
+                    return sign | rounded;
+                }
+                int exponent = int(bits >> 23) - 127 + 7;
+                uint32_t fraction = bits & 0x7fffff;
+                int rounded = (fraction + 0x7ffff + ((fraction >> 20) & 1)) >> 20;
+                return sign | std::min(126, exponent * 8 + rounded);
+            };
+            const int rows = data.dims[0], columns = data.dims[1];
+            auto source = [&](size_t i) { return oriDataType == FLOAT32 ? ((float *)oriData)[i]
+                : BFloat16BitsToFloat32(((uint16_t *)oriData)[i]); };
+            for (int row = 0; row < rows; ++row) {
+                float maximum = 0;
+                for (int col = 0; col < columns; ++col)
+                    maximum = std::max(maximum, std::fabs(source(size_t(row) * columns + col)));
+                const float scale = std::max(maximum / 448.f, 1.e-12f);
+                auto *out = data.cpuData + size_t(row) * (columns + sizeof(float));
+                memcpy(out + columns, &scale, sizeof(scale));
+                for (int col = 0; col < columns; ++col)
+                    out[col] = encode(source(size_t(row) * columns + col) / scale);
+            }
+            data.perChannelAxis = 0;
         } else if ((oriDataType == DataType::FLOAT32 || oriDataType == DataType::BFLOAT16)
                 && dataType == DataType::INT4_GROUP) {
             int bit = (dataType == DataType::INT4_GROUP) ? 4 : 8;

@@ -649,3 +649,24 @@ Graph replay 完成后记录新行，每卡批量暂存后统一下载，不将 
 
 历史归档及恢复包含 CPU/GPU 传输，有固定开销；命中 token 数不等于端到端收益。
 短前缀可能不比重新 prefill 更快，应按实际上下文和命中率测量首 token 延迟及生成速度。
+
+### 可选的普通投影 FP8
+
+普通投影默认保持模型原始精度。使用现有 `--dtype_config projection-fp8.json`
+可显式把主模型的 attention / dense MLP 投影转成逐输出通道 FP8；示例文件内容：
+
+```json
+[
+  {"key": "^model\\.layers\\.\\d+\\.(self_attn|mlp)\\.[^.]*_proj\\.weight$", "dtype": "fp8_e4m3_perchannel"}
+]
+```
+
+再加 `--fp8_prefill true`，支持的 CUDA 设备在 prefill 中使用逐 token FP8 激活和
+FP8 Tensor Core 计算，输出仍为 BF16。此参数复用已有的 native FP8 开关，不新增环境变量。
+`false` 使用 FP8 权重的原有计算路径，`auto` 沿用现有策略；未指定 dtype 配置时，
+不会因此量化 BF16 权重。Naive 的 BF16 激活 W8A8 路径仅在显式启用时使用。
+
+上述规则不包含专家、router、embedding、lm_head 或外挂草稿；也可缩小正则范围只选择部分投影。
+不支持的 CUDA 版本/设备、形状、Graph 捕获及小批量保留原有权重量化实现。
+转换权重和量化激活都会引入数值误差，需要按实际语料评估；关闭激活量化不会还原已量化权重，
+恢复原始精度须移除 dtype 配置后重新加载模型。

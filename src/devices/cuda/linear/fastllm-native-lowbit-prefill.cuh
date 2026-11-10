@@ -2,6 +2,7 @@
 #include <cstdint>
 #include "fastllm-native-prefill-policy.cuh"
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 namespace fastllm_native_prefill {
 bool Enabled(const char *name);
 bool Supported(int bits);
@@ -11,6 +12,9 @@ bool Supported(int bits);
 // writes throw instead of falling back and applying residual a second time.
 bool Fp8(const half *input, const uint8_t *weight, const float *scales, const half *bias, half *output, int m,
          int n, int k, int mode = 0);
+// Packed per-output-channel E4M3 weights; FP32 bias and BF16 output.
+bool Fp8BFloat16(const __nv_bfloat16 *input, const uint8_t *weight, const float *bias,
+                __nv_bfloat16 *output, int m, int n, int k);
 bool Fp4(const half *input, const uint32_t *weight, const uint8_t *scales, const float *global,
          const half *bias, half *output, int m, int n, int packedN, int k, int mode = 0, bool nativeLayout = false);
 } // namespace fastllm_native_prefill

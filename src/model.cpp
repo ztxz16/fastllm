@@ -5361,6 +5361,12 @@ namespace fastllm {
             // draft.  Still let an explicit dtype_config override registered
             // DFlash linear weights, which is useful when both models must fit
             // on a single GPU.
+            // Explicit projection rules may quantize Naive's otherwise BF16
+            // matrices. Keep defaults, router, embeddings and draft unchanged.
+            if (dataType == DataType::BFLOAT16 && model->model_struct == "naive_n05_flash" &&
+                weightName.rfind("model.layers.", 0) == 0 &&
+                weightName.find(".mlp.experts.") == std::string::npos &&
+                StringEndWith(weightName, "_proj.weight")) return true;
             return dataType == DataType::BFLOAT16 &&
                    weightName.rfind("dflash.", 0) == 0 &&
                    model->weight.linearNames.find(weightName) !=
