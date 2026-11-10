@@ -119,7 +119,9 @@ int Select(const Call &call) {
         legal[i]=reason.empty();
         candidates.emplace_back(Json::object{{"id",family.implementations[i].id},{"status",reason.empty()?"eligible":reason}});
     }
-    int selected=0;std::string source="fallback";
+    const int fallback=call.fallback>=0 && size_t(call.fallback)<legal.size() && legal[call.fallback]
+        ? call.fallback : 0;
+    int selected=fallback;std::string source="fallback";
     double caseMs=0;
     // Never select a stale profile based only on an SM number or requested max_batch.
     for(const auto &record:prior) {
@@ -171,11 +173,11 @@ int Select(const Call &call) {
         caseMs=std::chrono::duration<double,std::milli>(Clock::now()-start).count();spentMs+=caseMs;
     }
     if(!legal[selected])throw std::runtime_error("no valid kernel for "+std::string(family.name));
-    if(!forced.empty()&&family.implementations[selected].id!=forced)
+    if(!forced.empty()&&(family.implementations[selected].id!=forced||(source!="forced"&&source!="cache")))
         throw std::runtime_error("forced kernel unavailable, unmeasured or invalid for "+std::string(family.name)+": "+forced);
     Json::object record{{"key",key},{"shape",Fields(call.signature)},{"family",family.name},{"version",family.version},
         {"build_id",buildId},{"hardware",hardware},{"selected",family.implementations[selected].id},
-        {"source",source},{"max_l2",maxL2},{"tuning_ms",caseMs},{"candidates",candidates}};
+        {"source",source},{"default_candidate",family.implementations[fallback].id},{"max_l2",maxL2},{"tuning_ms",caseMs},{"candidates",candidates}};
     if(source=="fallback")record["reason"]=call.capturing?"unmeasured graph capture":frozen?"unmeasured frozen plan":"tuning budget exhausted";
     records[key]=record;plans[call.signature]=selected;local[call.signature]=selected;
     printf("[kernels] %s rows=%lld dimensions=%lld,%lld groups/topk=%lld selected=%s source=%s\n",family.name,

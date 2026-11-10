@@ -35,6 +35,10 @@ struct Call {
     double (*measure)(void *, int, int) = nullptr; // milliseconds per invocation
     bool (*validate)(void *, int, double &, std::string &) = nullptr;
     std::string (*hardware)(void *) = nullptr;
+    // Trusted backend default for an unmeasured shape. It must be supported
+    // without numeric trials or preparation here; policy denial still applies.
+    // This does not relax explicit force or exact-shape profile validation.
+    int fallback = 0;
 };
 
 extern std::atomic<bool> enabled;
@@ -43,7 +47,7 @@ inline bool Enabled() { return enabled.load(std::memory_order_relaxed) && bypass
 // Avoid recursively dispatching a reference implementation or its legacy Triton branch.
 struct Bypass { Bypass() { ++bypassDepth; } ~Bypass() { --bypassDepth; } };
 void Register(const Family *family);
-// Returns -1 for the original path; otherwise a validated implementation index.
+// Returns -1 for the original path; otherwise a validated or trusted fallback index.
 int Select(const Call &call);
 bool NeedsPreparation(const Signature &signature);
 bool CandidateAllowed(const char *id);

@@ -31,6 +31,15 @@ int main(){try{
     config({{"mode","quick"},{"force",Json::object{{"cpu.square","cpu.vector"}}}});CHECK(Select(call)==1);
     config({{"mode","quick"},{"force",Json::object{{"cpu.square","cpu.inaccurate"}}}});bool threw=false;try{Select(call);}catch(const std::runtime_error&){threw=true;}CHECK(threw);
     config({{"mode","quick"},{"budget_ms",0}});measured=c.measures;CHECK(Select(call)==0&&measured==c.measures);
+    call.fallback=1;
+    config({{"mode","quick"},{"budget_ms",0}});ran=c.runs;CHECK(Select(call)==1&&c.runs==ran);
+    config({{"mode","quick"}});Freeze();CHECK(Select(call)==1&&c.runs==ran);
+    config({{"mode","quick"}});call.capturing=true;CHECK(Select(call)==1&&c.runs==ran);call.capturing=false;
+    config({{"mode","quick"},{"budget_ms",0},{"deny",Json::array{"cpu.vector"}}});CHECK(Select(call)==0&&c.runs==ran);
+    config({{"mode","quick"},{"budget_ms",0}});c.supported=false;CHECK(Select(call)==0&&c.runs==ran);c.supported=true;
+    config({{"mode","quick"},{"budget_ms",0},{"force",Json::object{{"cpu.square","cpu.vector"}}}});
+    threw=false;try{Select(call);}catch(const std::runtime_error&){threw=true;}CHECK(threw&&c.runs==ran);
+    config({{"mode","quick"}});CHECK(Select(call)==1);call.fallback=0;
     config({{"mode","quick"}});c.supported=false;CHECK(Select(call)==0);c.supported=true;
     {Bypass b;CHECK(Select(call)==-1);}
     std::string error;CHECK(!Configure("{\"deny\":[\"cpu.reference\"]}",error));CHECK(!Configure("{\"deny\":[\"typo\"]}",error));CHECK(!Configure("{\"typo\":1}",error));
