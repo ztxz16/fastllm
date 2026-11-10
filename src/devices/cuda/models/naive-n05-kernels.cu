@@ -3,6 +3,8 @@
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "utils.h"
 #include "naive-n05-topk.cuh"
+#include "naive-n05-topk-compact-sort.cuh"
+#include "naive-n05-topk-compact-select.cuh"
 #include "devices/cuda/naive-n05-kv.cuh"
 #include "naive-n05-dsa-decode.cuh"
 #include "naive-n05-attention-small.cuh"
@@ -483,9 +485,7 @@ struct IndexerTopKOutput {
     }
 };
 
-__device__ unsigned long long TopKOrder(unsigned scoreBits, int index) {
-    return ((unsigned long long)scoreBits << 32) | (0xffffffffu - (unsigned)index);
-}
+using naive_topk::TopKOrder;
 
 // Sorting the original score bits plus the inverse position preserves the CPU
 // comparator, including +/-0 ties. Separate causal segment ends exclude future
@@ -603,179 +603,27 @@ void SortTopKPairs(const unsigned *input, const int *positions, int count,
     indices.Resize({1, topK});
 }
 
-// Select a bounded superset of the top K before sorting it. A radix prefix can
-// stop as soon as at most capacity entries remain; no possible winner is lost.
-// If equal scores straddle a full candidate buffer, retain the lowest indices.
-template<bool Sampled>
-__device__ __forceinline__ void SelectTopKCompactRow(const float *input, unsigned long long *selected, int *offsets,
-                                  int queries, int count, int topK, int capacity) {
-    constexpr int threads = 256, warps = threads / 32;
-    using Scan = cub::BlockScan<int, threads>;
-    __shared__ typename Scan::TempStorage scan;
-    using SampleSort = cub::BlockRadixSort<unsigned, threads, 4>;
-    __shared__ union {
-        int histogram[warps][256];
-        typename SampleSort::TempStorage sampleSort;
-    } temporary;
-    auto &histogram = temporary.histogram;
-    __shared__ unsigned prefix;
-    __shared__ int rank, candidateCount, selectedCount, tiesSeen;
-    int row = blockIdx.x, t = threadIdx.x, lane = t % 32, warp = t / 32;
-    int keep = min(count, topK);
-    unsigned long long *output = selected + (size_t)row * capacity;
-    if (t == 0) {
-        offsets[row] = row * capacity;
-        prefix = 0; rank = keep; selectedCount = 0; tiesSeen = 0;
-    }
-    __syncthreads();
-    if (count <= capacity) {
-        if (t == 0) offsets[queries + row] = row * capacity + count;
-        for (int col = t; col < count; col += threads)
-            output[col] = TopKOrder(OrderedScoreBits(input[col]), col);
-        return;
-    }
-    // Estimate a threshold cheaply, but never use an approximate TopK.
-    // The full scan must prove that the retained superset fits and has >= K
-    // entries; otherwise discard it and run the original exact radix search.
-    if constexpr (Sampled) if ((int64_t)count >= 4LL * capacity && keep >= 256) {
-        constexpr int sampleCount = threads * 4;
-        unsigned sampled[4];
-        #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            int col = (int)((int64_t)(t * 4 + i) * count / sampleCount);
-            sampled[i] = OrderedScoreBits(input[col]);
-        }
-        // Only estimate a threshold here. Round down after sorting the
-        // high bits; the full scan still proves a bounded exact superset.
-        SampleSort(temporary.sampleSort).SortDescending(sampled, 16, 32);
-        const int sampleRank = max(0, min(sampleCount - 1,
-            (int)(((int64_t)keep + capacity) * sampleCount / (2LL * count)) - 1));
-        if (t == sampleRank / 4) prefix = sampled[sampleRank % 4] & 0xffff0000u;
-        __syncthreads();
-        unsigned threshold = prefix;
-        // One shared reservation per warp and tile, preserving every
-        // candidate and its original index for the exact final sort.
-        constexpr int Items = 8;
-        for (int base = 0; base < count; base += threads * Items) {
-            unsigned bits[Items], ballots[Items];
-            int total = 0;
-            #pragma unroll
-            for (int i = 0; i < Items; ++i) {
-                int col = base + t + i * threads;
-                bits[i] = col < count ? OrderedScoreBits(input[col]) : 0;
-                ballots[i] = __ballot_sync(0xffffffff, col < count && bits[i] >= threshold);
-                total += __popc(ballots[i]);
-            }
-            if (total) {
-                int offset = lane == 0 ? atomicAdd(&selectedCount, total) : 0;
-                offset = __shfl_sync(0xffffffff, offset, 0);
-                #pragma unroll
-                for (int i = 0; i < Items; ++i) {
-                    int pos = offset + __popc(ballots[i] & ((1u << lane) - 1));
-                    if ((ballots[i] & (1u << lane)) && pos < capacity)
-                        output[pos] = TopKOrder(bits[i], base + t + i * threads);
-                    offset += __popc(ballots[i]);
-                }
-            }
-        }
-        __syncthreads();
-        if (selectedCount >= keep && selectedCount <= capacity) {
-            if (t == 0) offsets[queries + row] = row * capacity + selectedCount;
-            return;
-        }
-        if (t == 0) { prefix = 0; rank = keep; selectedCount = 0; tiesSeen = 0; }
-        __syncthreads();
-    }
-    unsigned mask = 0;
-    for (int shift = 24; shift >= 0; shift -= 8) {
-        unsigned wanted = prefix;
-        int target = rank;
-        for (int i = t; i < warps * 256; i += threads) ((int *)histogram)[i] = 0;
-        __syncthreads();
-        for (int base = 0; base < count; base += threads) {
-            int col = base + t;
-            unsigned bits = col < count ? OrderedScoreBits(input[col]) : 0;
-            int bucket = col < count && (bits & mask) == wanted ? int((bits >> shift) & 255) : 256;
-            // Aggregate identical buckets within each warp before its histogram
-            // update, including the common case where all score exponents match.
-            #if __CUDA_ARCH__ >= 700
-            unsigned peers = __match_any_sync(0xffffffff, bucket);
-            if (bucket < 256 && lane == __ffs(peers) - 1)
-                atomicAdd(&histogram[warp][bucket], __popc(peers));
-            #else
-            if (bucket < 256) atomicAdd(&histogram[warp][bucket], 1);
-            #endif
-        }
-        __syncthreads();
-        int bucket = 255 - t, n = 0;
-        #pragma unroll
-        for (int w = 0; w < warps; ++w) n += histogram[w][bucket];
-        int before;
-        Scan(scan).ExclusiveSum(n, before);
-        if (before < target && before + n >= target) {
-            prefix = wanted | ((unsigned)bucket << shift);
-            rank = target - before;
-            candidateCount = keep - rank + n;
-        }
-        __syncthreads();
-        mask |= 255u << shift;
-        if (candidateCount <= capacity) break;
-    }
-    unsigned threshold = prefix;
-    int tiesWanted = rank;
-    if (candidateCount <= capacity) {
-        if (t == 0) offsets[queries + row] = row * capacity + candidateCount;
-        for (int base = 0; base < count; base += threads) {
-            int col = base + t;
-            unsigned bits = col < count ? OrderedScoreBits(input[col]) : 0;
-            bool take = col < count && bits >= threshold;
-            unsigned ballot = __ballot_sync(0xffffffff, take);
-            if (ballot) {
-                int outputBase = 0, leader = __ffs(ballot) - 1;
-                if (lane == leader) outputBase = atomicAdd(&selectedCount, __popc(ballot));
-                outputBase = __shfl_sync(0xffffffff, outputBase, leader);
-                if (take)
-                    output[outputBase + __popc(ballot & ((1u << lane) - 1))] =
-                        TopKOrder(bits, col);
-            }
-        }
-    } else {
-        if (t == 0) offsets[queries + row] = row * capacity + keep;
-        for (int base = 0; base < count; base += threads) {
-            int col = base + t;
-            unsigned bits = col < count ? OrderedScoreBits(input[col]) : 0;
-            int equal = col < count && bits == threshold, equalBefore, equalTotal;
-            Scan(scan).ExclusiveSum(equal, equalBefore, equalTotal);
-            __syncthreads();
-            int take = col < count &&
-                (bits > threshold || (equal && tiesSeen + equalBefore < tiesWanted));
-            int before, total;
-            Scan(scan).ExclusiveSum(take, before, total);
-            __syncthreads();
-            if (take)
-                output[selectedCount + before] = TopKOrder(bits, col);
-            __syncthreads();
-            if (t == 0) { selectedCount += total; tiesSeen += equalTotal; }
-            __syncthreads();
-        }
-    }
-}
+using naive_topk::SelectTopKCompact;
+using naive_topk::SelectTopKCompactRow;
 
-template<bool Sampled>
-__global__ void SelectTopKCompact(const float *scores, unsigned long long *selected, int *offsets, int queries,
-                                  int keys, int queryStart, int topK, int capacity, int partRows = 0, int gap = 0) {
-    int row = blockIdx.x;
-    int count = queryStart + row + 1 + (partRows && row >= partRows ? gap : 0);
-    SelectTopKCompactRow<Sampled>(scores + (size_t)row * keys, selected, offsets, queries, count, topK, capacity);
-}
 // Keep long/short contexts on the original compiled kernel. The sample is
 // useful when its upper tail has enough observations to bracket K reliably.
 void LaunchSelectTopKCompact(const float *scores, unsigned long long *selected, int *offsets,
                             int queries, int keys, int queryStart, int topK, int capacity,
                             int partRows = 0, int gap = 0) {
     if ((int64_t)keys >= 4LL * capacity && (int64_t)keys <= 32LL * capacity && topK >= 256) {
-        SelectTopKCompact<true><<<queries, 256>>>(scores, selected, offsets, queries,
-            keys, queryStart, topK, capacity, partRows, gap);
+        // Narrow margins retain the same 2048 samples on both paths. Large
+        // Hopper batches use a histogram for the sampled threshold and wider
+        // vectorized scans; other shapes/architectures retain the old kernel.
+        if (topK > capacity / 2 && keys >= 32768 && queries >= 128 && FastllmCudaRuntimeArch() == 90)
+            SelectTopKCompact<true, 2, 1024><<<queries, 1024>>>(scores, selected, offsets, queries,
+                keys, queryStart, topK, capacity, partRows, gap);
+        else if (topK > capacity / 2)
+            SelectTopKCompact<true, 4, 512><<<queries, 512>>>(scores, selected, offsets, queries,
+                keys, queryStart, topK, capacity, partRows, gap);
+        else
+            SelectTopKCompact<true><<<queries, 256>>>(scores, selected, offsets, queries,
+                keys, queryStart, topK, capacity, partRows, gap);
     } else {
         SelectTopKCompact<false><<<queries, 256>>>(scores, selected, offsets, queries,
             keys, queryStart, topK, capacity, partRows, gap);
@@ -809,65 +657,9 @@ __global__ void RestoreBalancedRows(int *indices, int tileElements) {
     }
 }
 
-// Hopper benefits from fewer radix passes; retain CUB's original setting
-// on other architectures where the larger digit's resource cost is unmeasured.
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 900
-constexpr int kCompactTopKRadixBits = 6;
-#else
-constexpr int kCompactTopKRadixBits = 4;
-#endif
-template<int Items>
-using CompactTopKSort = cub::BlockRadixSort<unsigned long long, 256, Items,
-    cub::NullType, kCompactTopKRadixBits>;
-
-// Keep all score bits but compress the inverse index to its actual width.
-// Skipping constant index bits reduces radix passes without changing score
-// order or lower-index tie breaking, including signed zero and NaNs.
-template<int Items>
-__device__ void SortTopKCompactRow(const unsigned long long *input, const int *ends,
-        int *indices, int queries, int stride, int topK, int keyCount,
-        typename CompactTopKSort<Items>::TempStorage &storage, int outputRow = -1) {
-    constexpr int Threads = 256;
-    using Sort = CompactTopKSort<Items>;
-    const int row = blockIdx.x, count = ends[queries + row] - row * stride;
-    const int indexBits = 32 - __clz((unsigned)max(1, keyCount - 1));
-    const unsigned mask = 0xffffffffu >> (32 - indexBits);
-    unsigned long long keys[Items];
-    #pragma unroll
-    for (int i = 0; i < Items; ++i) {
-        int col = threadIdx.x + i * Threads;
-        unsigned long long key = col < count ? input[(size_t)row * stride + col] : 0;
-        unsigned index = 0xffffffffu - (unsigned)key;
-        keys[i] = col < count ? ((key >> 32) << indexBits) | (mask - index) : 0;
-    }
-    Sort(storage).SortDescendingBlockedToStriped(keys, 0, 32 + indexBits);
-    #pragma unroll
-    for (int i = 0; i < Items; ++i) {
-        int col = threadIdx.x + i * Threads;
-        if (col < topK)
-            indices[(size_t)(outputRow < 0 ? row : outputRow) * topK + col] = col < count
-                ? (int)(mask - ((unsigned)keys[i] & mask)) : -1;
-    }
-}
-
-// Candidate selection still has 4096 slots. Sort only the populated range;
-// shrinking selection itself would add radix passes on long or tied rows.
-__global__ void SortTopKCompact(const unsigned long long *input, const int *ends,
-        int *indices, int queries, int stride, int topK, int keyCount) {
-    union Storage {
-        CompactTopKSort<8>::TempStorage small;
-        CompactTopKSort<12>::TempStorage medium;
-        CompactTopKSort<16>::TempStorage large;
-    };
-    __shared__ Storage storage;
-    const int count = ends[queries + blockIdx.x] - blockIdx.x * stride;
-    if (count <= 2048)
-        SortTopKCompactRow<8>(input, ends, indices, queries, stride, topK, keyCount, storage.small);
-    else if (count <= 3072)
-        SortTopKCompactRow<12>(input, ends, indices, queries, stride, topK, keyCount, storage.medium);
-    else
-        SortTopKCompactRow<16>(input, ends, indices, queries, stride, topK, keyCount, storage.large);
-}
+using naive_topk::CompactTopKSort;
+using naive_topk::SortTopKCompactRow;
+using naive_topk::SortTopKCompact;
 
 #ifdef FASTLLM_NAIVE_DSA_MMA
 __global__ void SortBatchTopK(naive_dsa_mma::PrefillIndexerBatch batch, const unsigned long long *input,
@@ -3066,7 +2858,7 @@ void FastllmCudaNaiveTopK(const fastllm::Data &scores, int queryStart, int topK,
                 (const float *)scores.cudaData, input, begin, queries, keys, queryStart);
         }
         if (blockSort) {
-            SortTopKCompact<<<queries, 256>>>(input, begin, (int *)indices.cudaData,
+            SortTopKCompact<><<<queries, 256>>>(input, begin, (int *)indices.cudaData,
                 queries, sortStride, topK, keys);
             CheckLaunch();
             return;
@@ -3539,9 +3331,56 @@ void FastllmCudaNaiveRestoreIndexerRows(fastllm::Data &indices, int ranks) {
     CheckLaunch();
 }
 
+#ifdef FASTLLM_ENABLE_NAIVE_INDEXER_SM90
+static unsigned LaunchFP8ShortlistIndexer(const naive_indexer::FP8Entry *entries, int count,
+                                          int *const *outputs) {
+    using namespace fastllm;
+    naive_indexer::FP8Entry eligible[8];
+    if (count < 1 || count > 8) return 0;
+    for (int i = 0; i < count; ++i) {
+        eligible[i] = entries[i];
+        if (entries[i].keys <= 4096) eligible[i].rows = 0;
+    }
+    Data stagedStorage(FP8_E4M3);
+    naive_indexer::FP8Entry staged[8];
+    unsigned mask = naive_indexer::LaunchFP8(eligible, count, stagedStorage, staged);
+    for (int i = 0; i < count; ++i) if (mask & (1u << i)) {
+        const auto &e = staged[i];
+        const BF16 *expanded = nullptr;
+        Data candidates, offsets;
+        const int parts = e.part ? 2 : 1;
+        for (int part = 0; part < parts; ++part) {
+            const int partRows = e.part ? e.part : e.rows;
+            for (int offset = 0; offset < partRows; offset += 512) {
+                const int rows = std::min(512, partRows - offset), first = part * partRows + offset;
+                Output(candidates, INT32, {rows, 4096, 2});
+                Output(offsets, INT32, {2, rows});
+                auto *selected = (unsigned long long *)candidates.cudaData;
+                auto *ends = (int *)offsets.cudaData;
+                // Keep a bounded superset of the FP8 top 3072 before exact
+                // candidate scoring. The original selector proves its size.
+                LaunchSelectTopKCompact(e.scores + (size_t)first * e.keys, selected, ends,
+                    rows, e.keys, e.past + first + (part ? e.gap : 0), 3072, 4096);
+                if (!first && naive_indexer::StageRefinementKeys(e, rows))
+                    expanded = (const BF16 *)e.scores;
+                naive_indexer::FP8Entry tile = e;
+                tile.q += (size_t)first * 2048; tile.scales += first * 16; tile.weights += first * 16;
+                tile.rows = rows; tile.past += first + (part ? e.gap : 0); tile.part = tile.gap = 0;
+                naive_indexer::RefineFP8(tile, selected, ends, 4096, expanded);
+                // LaunchFP8 has already selected Hopper. Other architectures
+                // retain the original BF16 scorer and generic compact sort.
+                SortTopKCompact<true, 128><<<rows, 128>>>(selected, ends, outputs[i] + (size_t)first * 2048,
+                    rows, 4096, 2048, e.keys);
+            }
+        }
+    }
+    return mask;
+}
+#endif
+
 void FastllmCudaNaiveIndexer(const fastllm::Data &query, const fastllm::Data &weights,
                             const fastllm::Data &packedKeys, int heads, int dim,
-                            int queryStart, int topK, bool fp8Query, fastllm::Data &indices, bool peerKeys, fastllm::Data *scoreScratch) {
+                            int queryStart, int topK, bool fp8Query, fastllm::Data &indices, bool peerKeys, fastllm::Data *scoreScratch, bool fp8Compute) {
     using namespace fastllm;
     // Indexer quantization is defined on 128-element blocks. The score kernel
     // has a general head-count path, but a different block width is unsupported.
@@ -3575,12 +3414,13 @@ void FastllmCudaNaiveIndexer(const fastllm::Data &query, const fastllm::Data &we
             tileWeights.FakeFrom(weights, size_t(first) * heads * weights.unitSize);
             tileIndices.FakeFrom(indices, size_t(first) * topK * sizeof(int));
             FastllmCudaNaiveIndexer(tileQuery, tileWeights, packedKeys, heads, dim,
-                queryStart + first, topK, fp8Query, tileIndices, peerKeys, scoreScratch);
+                queryStart + first, topK, fp8Query, tileIndices, peerKeys, scoreScratch, fp8Compute);
             first += count;
         }
         return;
     }
     int stride = packedKeys.dims[2];
+    bool fp8IndicesReady = false;
     bool decodeTopK = queries == 1 && heads == 16;
     int selectBlocks = decodeTopK ? CooperativeTopKBlocks(queryStart + 1, topK) : 0;
     Data q, k, localScores, positions;
@@ -3612,10 +3452,13 @@ void FastllmCudaNaiveIndexer(const fastllm::Data &query, const fastllm::Data &we
         // WGMMA's smaller query tile repeats more K reads. For shared peer KV,
         // use the larger MMA tile below to reduce traffic to the owning GPU.
         else if ([&]() {
-            naive_indexer::ExperimentalEntry entry{FastllmNaiveKV(packedKeys),
+            naive_indexer::FP8Entry entry{FastllmNaiveKV(packedKeys),
                 (const BF16 *)q.cudaData, (const BF16 *)weights.cudaData, (const float *)qScale.cudaData,
                 (float *)scores.cudaData, queries, keys, queryStart, stride};
-            return naive_indexer::LaunchExperimentalFP8(&entry, 1) != 0;
+            if (!fp8Compute || topK != 2048) return false;
+            Output(indices, INT32, {queries, topK});
+            int *output = (int *)indices.cudaData;
+            return fp8IndicesReady = LaunchFP8ShortlistIndexer(&entry, 1, &output) != 0;
         }()) {}
         else if (!peerKeys && naive_indexer::Prepare()) {
             naive_indexer::Launch((const BF16 *)q.cudaData, FastllmNaiveKV(packedKeys),
@@ -3671,6 +3514,7 @@ void FastllmCudaNaiveIndexer(const fastllm::Data &query, const fastllm::Data &we
         }
     }
     CheckLaunch();
+    if (fp8IndicesReady) return;
     // The selector derives positions directly; CUB's fallback uses emitted positions.
     if (selectBlocks) {
         CooperativeTopK((const unsigned *)scores.cudaData, queryStart + 1, selectBlocks, indices);
@@ -3710,7 +3554,7 @@ static bool BalancedIndexerSupported(const fastllm::Data &query, const fastllm::
 // Return false before allocating/writing output for all other shapes.
 bool FastllmCudaNaiveBalancedIndexer(const fastllm::Data &query, const fastllm::Data &weights,
                                      const fastllm::Data &keys, int past, int rank, int ranks, bool fp8Query,
-                                     bool peerKeys, fastllm::Data &indices, fastllm::Data *scoreScratch) {
+                                     bool peerKeys, fastllm::Data &indices, fastllm::Data *scoreScratch, bool fp8Compute) {
 #ifdef FASTLLM_NAIVE_DSA_MMA
     using namespace fastllm;
     if (!BalancedIndexerSupported(query, weights, keys, past, rank, ranks, fp8Query, peerKeys) ||
@@ -3730,21 +3574,22 @@ bool FastllmCudaNaiveBalancedIndexer(const fastllm::Data &query, const fastllm::
     naive_dsa_mma::QuantizeBalancedIndexer<<<rows * 16, 128>>>(
         (const BF16 *)query.cudaData, (const BF16 *)weights.cudaData, (BF16 *)q.cudaData, (float *)scale.cudaData,
         (BF16 *)w.cudaData, part, first, second);
-    bool experimental = false;
 #ifdef FASTLLM_ENABLE_NAIVE_INDEXER_SM90
-    naive_indexer::ExperimentalEntry entry{FastllmNaiveKV(keys), (const BF16 *)q.cudaData,
+    naive_indexer::FP8Entry entry{FastllmNaiveKV(keys), (const BF16 *)q.cudaData,
         (const BF16 *)w.cudaData, (const float *)scale.cudaData, (float *)scores.cudaData,
         rows, count, start, keys.dims[2], part, gap};
-    experimental = naive_indexer::LaunchExperimentalFP8(&entry, 1) != 0;
+    int *output = (int *)indices.cudaData;
+    if (fp8Compute && LaunchFP8ShortlistIndexer(&entry, 1, &output)) {
+        CheckLaunch();
+        return true;
+    }
 #endif
-    if (!experimental) {
     naive_dsa_mma::IndexerScores<true><<<dim3((past + second + part + 63) / 64, (rows + 31) / 32), 128>>>(
         (const BF16 *)q.cudaData, FastllmNaiveKV(keys), (const float *)scale.cudaData, (const BF16 *)w.cudaData,
         (float *)scores.cudaData, rows, count, start, keys.dims[2], part, gap);
-    }
     LaunchSelectTopKCompact((const float *)scores.cudaData, (unsigned long long *)encoded.cudaData,
                                      (int *)offsets.cudaData, rows, count, start, 2048, 4096, part, gap);
-    SortTopKCompact<<<rows, 256>>>((const unsigned long long *)encoded.cudaData, (int *)offsets.cudaData,
+    SortTopKCompact<><<<rows, 256>>>((const unsigned long long *)encoded.cudaData, (int *)offsets.cudaData,
                                    (int *)indices.cudaData, rows, 4096, 2048, count);
     CheckLaunch();
     return true;
@@ -3754,7 +3599,7 @@ bool FastllmCudaNaiveBalancedIndexer(const fastllm::Data &query, const fastllm::
 }
 
 bool FastllmCudaNaiveBatchBalancedIndexer(const std::vector<FastllmNaivePrefillIndexerItem> &items, int rank, int ranks,
-                                          bool fp8Query, bool peerKeys, fastllm::Data *scoreScratch) {
+                                          bool fp8Query, bool peerKeys, fastllm::Data *scoreScratch, bool fp8Compute) {
 #ifdef FASTLLM_NAIVE_DSA_MMA
     using namespace fastllm;
     if (items.empty() || items.size() > 8 ||
@@ -3806,32 +3651,33 @@ bool FastllmCudaNaiveBatchBalancedIndexer(const std::vector<FastllmNaivePrefillI
     Output(offsets, INT32, {2, batch.rows});
     naive_dsa_mma::QuantizeBatchIndexer<<<batch.rows * 16, 128>>>(batch, (BF16 *)q.cudaData, (float *)scale.cudaData,
                                                                   (BF16 *)w.cudaData);
-    unsigned experimentalMask = 0;
+    unsigned fp8Mask = 0;
 #ifdef FASTLLM_ENABLE_NAIVE_INDEXER_SM90
-    naive_indexer::ExperimentalEntry experimentalEntries[8];
+    naive_indexer::FP8Entry fp8Entries[8];
     for (int i = 0; i < batch.count; ++i) {
         const auto &e = batch.entries[i];
-        experimentalEntries[i] = {e.key, (const BF16 *)q.cudaData + (size_t)e.rowOffset * 2048,
+        fp8Entries[i] = {e.key, (const BF16 *)q.cudaData + (size_t)e.rowOffset * 2048,
             (const BF16 *)w.cudaData + e.rowOffset * 16, (const float *)scale.cudaData + e.rowOffset * 16,
             (float *)scores.cudaData + e.scoreOffset, e.rows, e.keys, e.past + e.first, e.stride,
             e.part, e.second - e.first - e.part};
     }
-    experimentalMask = naive_indexer::LaunchExperimentalFP8(experimentalEntries, batch.count);
+    int *outputs[8];
+    for (int i = 0; i < batch.count; ++i) outputs[i] = batch.entries[i].output;
+    if (fp8Compute) fp8Mask = LaunchFP8ShortlistIndexer(fp8Entries, batch.count, outputs);
 #endif
-    if (!experimentalMask) {
+    if (fp8Mask) {
+        for (int i = 0; i < batch.count; ++i) if (!(fp8Mask & (1u << i))) {
+            const auto &item = items[i];
+            AssertInFastLLM(FastllmCudaNaiveBalancedIndexer(*item.query, *item.weights, *item.keys,
+                item.past, rank, ranks, fp8Query, peerKeys, *item.indices, scoreScratch, false),
+                "Validated Indexer batch fallback failed.");
+        }
+        CheckLaunch();
+        return true;
+    }
     naive_dsa_mma::BatchIndexerScores<<<dim3((maxKeys + 63) / 64, (maxRows + 31) / 32, batch.count), 128>>>(
         batch, (const BF16 *)q.cudaData, (const float *)scale.cudaData, (const BF16 *)w.cudaData,
         (float *)scores.cudaData);
-    } else {
-        for (int i = 0; i < batch.count; ++i) if (!(experimentalMask & (1u << i))) {
-            const auto &e = batch.entries[i];
-            naive_dsa_mma::IndexerScores<true><<<dim3((e.past + e.second + e.part + 63) / 64,
-                (e.rows + 31) / 32), 128>>>((const BF16 *)q.cudaData + (size_t)e.rowOffset * 2048,
-                e.key, (const float *)scale.cudaData + e.rowOffset * 16,
-                (const BF16 *)w.cudaData + e.rowOffset * 16, (float *)scores.cudaData + e.scoreOffset,
-                e.rows, e.keys, e.past + e.first, e.stride, e.part, e.second - e.first - e.part);
-        }
-    }
     SelectBatchTopK<<<batch.rows, 256>>>(batch, (const float *)scores.cudaData, (unsigned long long *)encoded.cudaData,
                                          (int *)offsets.cudaData);
     SortBatchTopK<<<batch.rows, 256>>>(batch, (const unsigned long long *)encoded.cudaData,

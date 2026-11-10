@@ -1019,6 +1019,8 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--atype', type = str, default = "auto", help = '推理类型，可使用float32或float16')
     parser.add_argument('--indexer_dtype', choices=['auto', 'fp8', 'fp8_e4m3'], default='auto',
                         help='Naive DSA Indexer 类型；fp8 独立量化 Indexer Q/K 并压缩 K 缓存，auto 保持模型默认路径')
+    parser.add_argument('--indexer_compute_dtype', choices=['auto', 'fp8'], default='auto',
+                        help='Naive Indexer prefill 计算类型；fp8 启用原生 Hopper FP8 打分，需 FP8 Q/K；不支持的设备、形状及解码保持原路径，auto 保持默认计算精度')
     parser.add_argument('--indexer_tp_storage', choices=['replicated', 'layer_shard', 'context_shard'], default='replicated',
                         help='Naive DSA TP Indexer 存储；layer_shard 将各层权重和 K 缓存轮流放到一张卡，广播 TopK，降低显存占用；context_shard 按上下文分片并合并全局 TopK，支持纯显存 KV 和 KVMem；默认各卡复制')
     parser.add_argument('--kv_cache_dtype', type = str, default = "auto", help = 'KV Cache类型，可使用auto、float16、bfloat16、fp8_e4m3（含 Naive N0.5 CUDA）或fp4（Qwen3.5 CUDA、DeepSeek-V4.1，或 Naive TP KVMem 的 DSA KV；Naive SWA/Indexer 保持 FP8）')
@@ -2234,6 +2236,7 @@ def make_normal_llm_model(args, startup_progress = None):
                             max_context_length = -1 if legacy_context_limit else max_context_length,
                             rope_scaling = rope_scaling,
                             indexer_dtype = getattr(args, "indexer_dtype", "auto"),
+                            indexer_compute_dtype = getattr(args, "indexer_compute_dtype", "auto"),
                             indexer_tp_storage = indexer_storage)
         if hybrid_auto_plan is not None:
             model.hybrid_auto_plan = hybrid_auto_plan

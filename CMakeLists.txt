@@ -2219,6 +2219,13 @@ if (UNIT_TEST)
             endif()
         endif()
 
+        if (FASTLLM_CUDA_SM90_SOURCES)
+            add_executable(naive_n05_indexer_fp8_test test/basic/test_naive_n05_indexer_fp8.cu)
+            target_link_libraries(naive_n05_indexer_fp8_test PRIVATE fastllm)
+            add_test(NAME naive_n05_indexer_fp8 COMMAND naive_n05_indexer_fp8_test)
+            set_tests_properties(naive_n05_indexer_fp8 PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+        endif()
+
         # The native BF16-input FP8 backend is compiled with CUDA 12.8+.
         if (CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "12.8")
             add_executable(cuda_fp8_bf16_prefill_test test/basic/test_cuda_fp8_bf16_prefill.cu)

@@ -26,6 +26,7 @@ namespace fastllm {
         void InitParams() override;
         void ConfigureAttentionParallel(int attentionDP) override;
         void SetIndexerDataType(DataType dataType) override;
+        void SetIndexerComputeFP8(bool enabled);
         void SetKVCacheDataType(DataType dataType) override;
         void SetIndexerTPStorage(bool shardByLayer, bool shardByContext = false);
         std::map<std::string, std::vector<std::pair<std::string, DataType>>>
@@ -425,6 +426,7 @@ namespace fastllm {
         float partialRotary = 0.334f, valueScale = 0.707f;
         bool indexFp8 = true;
         bool fp8IndexerCache = false;
+        bool indexerComputeFP8 = false;
         bool indexerLayerSharding = false;
         bool indexerContextSharding = false;
         bool tpIndexerPeerAccess = false;

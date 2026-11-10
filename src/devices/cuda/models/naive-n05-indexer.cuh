@@ -9,11 +9,9 @@ bool Prepare();
 void Launch(const __nv_bfloat16 *q, FastllmNaiveKV keys, const float *scales,
             const __nv_bfloat16 *weights, float *scores,
             int queries, int keyCount, int past, int stride);
-}
 
-// Temporary opt-in FP8 experiment. The accepted source tree is untouched.
-namespace naive_indexer {
-struct ExperimentalEntry {
+// Native Hopper FP8 prefill. Call only for explicitly enabled FP8 compute.
+struct FP8Entry {
     FastllmNaiveKV key;
     const __nv_bfloat16 *q, *weights;
     const float *scales;
@@ -21,6 +19,12 @@ struct ExperimentalEntry {
     int rows, keys, past, stride, part = 0, gap = 0;
 };
 // Bitmask of entries dispatched; zero preserves the caller's original path.
-unsigned LaunchExperimentalFP8(const ExperimentalEntry *entries, int count);
-unsigned long long ExperimentalFP8Launches();
+// Keep staged local K alive across coarse scoring and candidate refinement.
+unsigned LaunchFP8(const FP8Entry *entries, int count, fastllm::Data &scratch, FP8Entry *staged);
+// Reuse consumed coarse-score rows for exact BF16 K expansion when it fits.
+// Remaining score rows must not overlap this region; no allocation is made.
+bool StageRefinementKeys(const FP8Entry &entry, int consumedRows);
+// Rescore the selected candidate IDs with the original BF16 arithmetic.
+void RefineFP8(const FP8Entry &entry, unsigned long long *candidates, const int *ends, int count,
+              const __nv_bfloat16 *expanded);
 }

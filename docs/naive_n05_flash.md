@@ -55,6 +55,18 @@ KV 历史缓存。页表和滑窗按分配大小使用独立的池，避免请�
 CUDA Graph、采样和临时算子工作区有各自的分配策略，不属于这项 KV 保证。
 CPU、按层串行、其他 KV 类型、草稿模型及跳过预热的直接调用保留原路径。
 
+### Indexer prefill 计算精度
+
+`--indexer_compute_dtype fp8` 显式启用 Hopper 上的原生 FP8 prefill 打分，
+与控制 Q/K 量化和缓存存储的 `--indexer_dtype fp8` 分开设置。默认 `auto`
+保留原来的计算路径。内核使用仓库内 CUDA/PTX 实现，不需要额外 Python 包或编译服务。
+FP8 Q/K 的数值及 scale 保持不变，使用原生 FP8 Tensor Core 筛选 3072～4096 个候选，
+再以原来的 BF16 算法重算候选分数并选出 2048 个位置，减小误差逐层放大。
+不做全量 BF16 回算，也不承诺逐位一致；显式启用前应按实际语料检查精度。
+不超过 4096 个 key 时保留原路径。默认 `auto` 不引入这项数值变化。
+非 Hopper、非 FP8 Q/K、不支持的布局、解码和 Graph 捕获保留原计算路径。
+参数须在预热前设置；Python API 对应 `indexer_compute_dtype="fp8"`。
+
 ### DSA FP4 KV（实验性）
 
 Naive/MiMo 的 CUDA TP + KVMem 路径可显式设置 `--kv_cache_dtype fp4`，

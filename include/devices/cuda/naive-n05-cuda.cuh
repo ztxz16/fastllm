@@ -216,7 +216,7 @@ bool FastllmCudaNaiveIndexerKeyNorm(fastllm::Data &input,
 // Output is [front, back] for one rank. Unsupported layouts return false untouched.
 bool FastllmCudaNaiveBalancedIndexer(const fastllm::Data &query, const fastllm::Data &weights,
     const fastllm::Data &keys, int past, int rank, int ranks,
-    bool fp8Query, bool peerKeys, fastllm::Data &indices, fastllm::Data *scoreScratch = nullptr);
+    bool fp8Query, bool peerKeys, fastllm::Data &indices, fastllm::Data *scoreScratch = nullptr, bool fp8Compute = false);
 // All items use the same rank/layout, but query and context lengths may differ.
 // At most eight requests and 512 MiB of scores; rejection leaves outputs untouched.
 struct FastllmNaivePrefillIndexerItem {
@@ -225,13 +225,13 @@ struct FastllmNaivePrefillIndexerItem {
     int past;
 };
 bool FastllmCudaNaiveBatchBalancedIndexer(const std::vector<FastllmNaivePrefillIndexerItem> &items,
-    int rank, int ranks, bool fp8Query, bool peerKeys, fastllm::Data *scoreScratch = nullptr);
+    int rank, int ranks, bool fp8Query, bool peerKeys, fastllm::Data *scoreScratch = nullptr, bool fp8Compute = false);
 
 void FastllmCudaNaiveIndexer(const fastllm::Data &query,
                             const fastllm::Data &weights,
                             const fastllm::Data &packedKeys,
                             int heads, int dim, int queryStart, int topK,
-                            bool fp8Query, fastllm::Data &indices, bool peerKeys = false, fastllm::Data *scoreScratch = nullptr);
+                            bool fp8Query, fastllm::Data &indices, bool peerKeys = false, fastllm::Data *scoreScratch = nullptr, bool fp8Compute = false);
 // Restore front/back-paired query shards after AllGather, in the same allocation.
 void FastllmCudaNaiveRestoreIndexerRows(fastllm::Data &indices, int ranks);
 // Consume front/back-paired Indexer rows directly. False leaves all inputs

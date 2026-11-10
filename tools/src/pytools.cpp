@@ -891,6 +891,20 @@ extern "C" {
         return fastllmPytoolsContextResult.c_str();
     }
 
+    DLL_EXPORT const char *set_model_indexer_compute_dtype(int modelId, const char *dtype) {
+        fastllmPytoolsContextResult.clear();
+        try {
+            const std::string value = dtype ? dtype : "";
+            if (value != "auto" && value != "fp8")
+                throw std::invalid_argument("indexer_compute_dtype must be auto or fp8");
+            auto *model = dynamic_cast<fastllm::NaiveN05FlashModel *>(models.GetModel(modelId));
+            if (!model && value != "auto")
+                throw std::invalid_argument("FP8 Indexer compute requires a Naive DSA model");
+            if (model) model->SetIndexerComputeFP8(value == "fp8");
+        } catch (const std::exception &error) { fastllmPytoolsContextResult = error.what(); }
+        return fastllmPytoolsContextResult.c_str();
+    }
+
     DLL_EXPORT void set_model_indexer_dtype(int modelId, const char *dtype) {
         std::string value = dtype;
         fastllm::AssertInFastLLM(value == "auto" || value == "fp8" || value == "fp8_e4m3",
