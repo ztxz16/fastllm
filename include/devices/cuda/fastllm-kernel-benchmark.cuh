@@ -116,7 +116,9 @@ inline bool LaunchCuda(const Family &family,CudaCase &context,int implementation
     return context.run(context.context,0);
 }
 inline int SelectCuda(const Family &family,const Signature &signature,CudaCase &context) {
-    Call call{&family,signature,&context,FastllmCudaGraphIsCapturingFast(),CudaUnsupported,
+    // Child-graph builders can use CUDA capture directly, outside the fast
+    // wrapper bookkeeping. Always query the stream before admitting a trial.
+    Call call{&family,signature,&context,FastllmCudaGraphIsCapturing(),CudaUnsupported,
         CudaMeasure,CudaValidate,CudaHardware};
     return Select(call);
 }

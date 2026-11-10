@@ -68,6 +68,34 @@ static void run(int rows,int n,int k,int groups,bool fp8,bool graph) {
 
 }
 __global__ void FillPartial(float *values) {if(threadIdx.x<4)values[threadIdx.x]=2;}
+static void checkRawColdCapture() {
+    using namespace fastllm::kernels;
+    static const Family family{95,"test.raw_capture","1",{
+        {"test.capture.reference",json11::Json::object{}},
+        {"test.capture.candidate",json11::Json::object{}}}};
+    Register(&family);
+    CHECK(fastllm_kernel_configure("{\"mode\":\"quick\",\"repeats\":1}"));
+    float *output=nullptr;CHECK(cudaMalloc(&output,4*sizeof(float))==cudaSuccess);
+    auto run=[](void *p,int) {FillPartial<<<1,32,0,cudaStreamPerThread>>>((float*)p);return cudaGetLastError()==cudaSuccess;};
+    auto support=[](void *,int) {return std::string();};
+    CudaCase c{output,run,support,output,4,false};
+    Signature signature{{95,0,0,1,4}};
+    cudaGraph_t graph=nullptr;cudaGraphExec_t exec=nullptr;
+    CHECK(cudaStreamBeginCapture(cudaStreamPerThread,cudaStreamCaptureModeThreadLocal)==cudaSuccess);
+    CHECK(SelectCuda(family,signature,c)==0);
+    CHECK(LaunchCuda(family,c,0));
+    CHECK(cudaStreamEndCapture(cudaStreamPerThread,&graph)==cudaSuccess);
+    CHECK(cudaGraphInstantiate(&exec,graph,nullptr,nullptr,0)==cudaSuccess);
+    CHECK(cudaGraphLaunch(exec,cudaStreamPerThread)==cudaSuccess);
+    CHECK(cudaStreamSynchronize(cudaStreamPerThread)==cudaSuccess);
+    CHECK(NeedsPreparation(signature));
+    CHECK(SelectCuda(family,signature,c)>=0&&!NeedsPreparation(signature));
+    float actual[4];CHECK(cudaMemcpy(actual,output,sizeof(actual),cudaMemcpyDeviceToHost)==cudaSuccess);
+    for(float value:actual)CHECK(value==2);
+    cudaGraphExecDestroy(exec);cudaGraphDestroy(graph);cudaFree(output);
+    CHECK(fastllm_kernel_configure("{\"mode\":\"off\"}"));
+    std::puts("RAW_COLD_CAPTURE_PASS deferred measurement and later eager preparation");
+}
 static void checkPartialOutputPreserved() {
     float *output=nullptr;CHECK(cudaMalloc(&output,16*sizeof(float))==cudaSuccess);
     std::vector<float> original(16),actual(16);for(int i=0;i<16;++i)original[i]=float(i+10);
@@ -111,6 +139,7 @@ int main(int argc, char **argv){
     const bool wideOnly = argc == 2 && std::strcmp(argv[1], "--wide") == 0;
     int count=0;if(cudaGetDeviceCount(&count)!=cudaSuccess||!count)return 77;
     cudaSetDevice(0);FastllmCudaSetDevice(0);
+    checkRawColdCapture();
     checkPartialOutputPreserved();
     if(argc==2&&std::strcmp(argv[1],"--cleanup")==0)return 0;
     if(FastllmCudaRuntimeArch()!=120&&FastllmCudaRuntimeArch()!=121)return 77;
