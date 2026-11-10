@@ -431,6 +431,8 @@ void FastllmCudaNaiveClearExpertPrefill();
 // BF16 input, FP32 4096-column router, including sigmoid. Small batches
 // share weights and retain exact single-row arithmetic when requested by the
 // linear precision policy. Unsupported layouts return false without mutation.
+bool FastllmCudaNaiveRouterFP32(const fastllm::Data &input,
+        const fastllm::Data &weight, fastllm::Data &output);
 bool FastllmCudaNaiveRouterSigmoid(const fastllm::Data &input,
     const fastllm::Data &weight, fastllm::Data &output);
 

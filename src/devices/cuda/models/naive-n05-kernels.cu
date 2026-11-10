@@ -5,6 +5,7 @@
 #include "naive-n05-topk.cuh"
 #include "naive-n05-topk-compact-sort.cuh"
 #include "naive-n05-topk-compact-select.cuh"
+#include "../linear/fastllm-native-lowbit-prefill.cuh"
 #include "devices/cuda/naive-n05-kv.cuh"
 #include "naive-n05-dsa-decode.cuh"
 #include "naive-n05-attention-small.cuh"
@@ -282,7 +283,7 @@ void Output(fastllm::Data &out, fastllm::DataType type, const std::vector<int> &
 }
 // Return zero without touching output when the router fast path is unsupported.
 int RouterRows(const fastllm::Data &input, const fastllm::Data &weight,
-               const fastllm::Data &output) {
+               const fastllm::Data &output, fastllm::DataType type = fastllm::BFLOAT16) {
     using namespace fastllm;
     const int device = FastllmCudaGetDevice();
     auto onDevice = [&](const Data &x) {
@@ -291,7 +292,7 @@ int RouterRows(const fastllm::Data &input, const fastllm::Data &weight,
     };
     if (&input == &output || &weight == &output ||
         (output.cudaData && (output.cudaData == input.cudaData || output.cudaData == weight.cudaData)) ||
-        !onDevice(input) || !onDevice(weight) || input.dataType != BFLOAT16 ||
+        !onDevice(input) || !onDevice(weight) || input.dataType != type ||
         weight.dataType != FLOAT32 || input.dims.empty() || input.dims.back() != 4096 ||
         weight.dims.size() != 2 || weight.dims[1] != 4096 || weight.dims[0] <= 0 ||
         weight.strides.size() != 2 || weight.strides[0] != 4096 || weight.strides[1] != 1 ||
@@ -4238,6 +4239,16 @@ int DecodeTopKBlocks() {
 }
 }
 
+bool FastllmCudaNaiveRouterFP32(const fastllm::Data &input,
+        const fastllm::Data &weight, fastllm::Data &output) {
+    const int rows = RouterRows(input, weight, output, fastllm::FLOAT32);
+    if (rows < 128 || FastllmCudaGraphIsCapturingFast()) return false;
+    auto dims = input.dims; dims.back() = weight.dims[0];
+    Output(output, fastllm::FLOAT32, dims);
+    return fastllm_native_prefill::Fp32((const float *)input.cudaData,
+        (const float *)weight.cudaData, (float *)output.cudaData, rows, weight.dims[0], 4096);
+}
+
 bool FastllmCudaNaiveRouterSigmoid(const fastllm::Data &input,
         const fastllm::Data &weight, fastllm::Data &output) {
     using namespace fastllm;
@@ -4274,6 +4285,16 @@ void FastllmCudaNaiveAddDecodeRMSNorm(fastllm::Data &hidden,
         float eps, fastllm::Data &output) {
     Output(output, fastllm::BFLOAT16, hidden.dims);
     int channels = hidden.dims.back();
+    const int rows = hidden.Count(0) / channels;
+    if (channels == 4096 && rows >= 128 &&
+        ((uintptr_t)hidden.cudaData | (uintptr_t)branch.cudaData | (uintptr_t)output.cudaData) % 4 == 0 &&
+        (uintptr_t)weight.cudaData % 8 == 0) {
+        fastllm::cuda_norm::AddRMSNormPairs<BF16, 4096><<<rows, 128>>>(
+            (BF16 *)hidden.cudaData, (const BF16 *)branch.cudaData,
+            (const float *)weight.cudaData, (BF16 *)output.cudaData, eps);
+        CheckLaunch();
+        return;
+    }
     auto kernel = channels == 4096
         ? fastllm::cuda_norm::AddRMSNorm<BF16, 4096, true, false>
         : fastllm::cuda_norm::AddRMSNorm<BF16, 0, true, false>;

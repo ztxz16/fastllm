@@ -169,13 +169,18 @@ static void TestCache(int window) {
         ++checks;
     }
 }
-static void TestResidualNorm(int channels, int rows = 1) {
+static void TestResidualNorm(int channels, int rows = 1, bool unalignedWeight = false) {
     Data hidden(BFLOAT16), branch(BFLOAT16), weight(FLOAT32), actual(BFLOAT16);
     Data reference(BFLOAT16), expected(BFLOAT16);
     Upload(hidden, {1, rows, channels}, 91);
     Upload(reference, {1, rows, channels}, 91);
     Upload(branch, {1, rows, channels}, 92);
-    Upload(weight, {channels}, 93);
+    Data weightStorage(FLOAT32);
+    if (unalignedWeight) {
+        Upload(weightStorage, {channels + 1}, 93);
+        weight.Resize({channels});
+        weight.FakeFrom(weightStorage, sizeof(float));
+    } else Upload(weight, {channels}, 93);
     Upload(expected, {1, rows, channels}, 94);
     auto original = Read<uint16_t>(hidden);
     auto body = [&]() { FastllmCudaNaiveAddDecodeRMSNorm(hidden, branch, weight, 1e-5f, actual); };
@@ -693,6 +698,9 @@ int main() {
             TestResidualNorm(ch);
         for (int ch : {127, 256, 4096})
             TestResidualNorm(ch, 8);
+        for (int rows : {127, 128, 513, 4096, 32768})
+            TestResidualNorm(4096, rows);
+        TestResidualNorm(4096, 129, true);
         for (int w : {0, 8, 128})
             TestCache(w);
         // Dense decode uses replay-time length, including decreases and the

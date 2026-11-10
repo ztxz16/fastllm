@@ -95,6 +95,51 @@ __global__ void AddRMSNorm(T *residual, const T *input,
         } else output[offset + d] = Cast<T>(x * inv * (weight[d] + (zeroCentered ? 1.f : 0.f)));
     }
 }
+// Two original reduction lanes share one physical thread. Keep their partial
+// sums separate until the last virtual-warp addition, preserving the 256-lane
+// tree and both 16-bit rounding boundaries. No architecture-specific ISA.
+template<typename T, int Width>
+__global__ void AddRMSNormPairs(T *residual, const T *input, const float *weight,
+                               T *output, float eps) {
+    static_assert(Width % 256 == 0, "Pair norm requires complete reduction groups");
+    constexpr int Parts = Width / 256;
+    const int tid = threadIdx.x;
+    const size_t offset = (size_t)blockIdx.x * Width;
+    __shared__ float partial[8];
+    float2 values[Parts], affine[Parts];
+    float even = 0.f, odd = 0.f;
+#pragma unroll
+    for (int j = 0; j < Parts; ++j) {
+        const int d = tid * 2 + j * 256;
+        float2 x = Float2(*reinterpret_cast<const Pair<T> *>(input + offset + d));
+        float2 h = Float2(*reinterpret_cast<const Pair<T> *>(residual + offset + d));
+        x = Float2(Cast2<T>(x.x + h.x, x.y + h.y));
+        values[j] = x;
+        affine[j] = *reinterpret_cast<const float2 *>(weight + d);
+        even += x.x * x.x;
+        odd += x.y * x.y;
+    }
+#pragma unroll
+    for (int step = 8; step; step >>= 1) {
+        even += __shfl_down_sync(0xffffffffu, even, step, 16);
+        odd += __shfl_down_sync(0xffffffffu, odd, step, 16);
+    }
+    if (tid % 16 == 0) partial[tid / 16] = even + odd;
+    __syncthreads();
+    // Every warp consumes the same eight virtual-warp results. This removes
+    // the broadcast barrier without changing the original final sum tree.
+    const float sum = WarpSum(tid % 32 < 8 ? partial[tid % 32] : 0.f);
+    const float inv = rsqrtf(sum / Width + eps);
+#pragma unroll
+    for (int j = 0; j < Parts; ++j) {
+        const int d = tid * 2 + j * 256;
+        float2 x = values[j];
+        *reinterpret_cast<Pair<T> *>(residual + offset + d) = Cast2<T>(x.x, x.y);
+        x = Float2(Cast2<T>(x.x * inv, x.y * inv));
+        *reinterpret_cast<Pair<T> *>(output + offset + d) =
+            Cast2<T>(x.x * affine[j].x, x.y * affine[j].y);
+    }
+}
 // Two adjacent columns per lane preserve the original 256-thread RMS
 // reduction while using vectorized 16-bit accesses and only one CTA barrier.
 template<typename T, bool Add>

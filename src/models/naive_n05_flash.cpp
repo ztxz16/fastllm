@@ -1940,7 +1940,10 @@ Data NaiveN05FlashModel::RunTarget(
                     }
                     Data &fp32Input = shardPrefillRouter ? localRouterInput : routerInput;
                     ToDataType(routerSource, fp32Input, DataType::FLOAT32);
-                    Linear(fp32Input, routerWeight, Data(), router);
+                    const bool prefillRouter = !verifying && !decodeWorkspace && length > 1 &&
+                        (!batch || !batch->Decode());
+                    if (!prefillRouter || !FastllmCudaNaiveRouterFP32(fp32Input, routerWeight, router))
+                        Linear(fp32Input, routerWeight, Data(), router);
                 }
                 Data &routerBias = localWeight(prefix + ".mlp.gate.e_score_correction_bias");
                 bool fusedRouter = false;
