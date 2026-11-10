@@ -25,6 +25,14 @@ int main(){try{
     std::thread thread([&]{CHECK(Select(call)==1);});thread.join();CHECK(c.runs==ran);
     Freeze();call.signature.fields[3]=7;CHECK(Select(call)==0&&c.measures==measured);
     config({{"mode","quick"}});call.capturing=true;CHECK(Select(call)==0&&c.runs==ran);call.capturing=false;
+    CHECK(NeedsPreparation(call.signature));
+    CHECK(Select(call)==1&&!NeedsPreparation(call.signature));
+    measured=c.measures;ran=c.runs;
+    config({{"mode","quick"}});Freeze();call.capturing=true;
+    CHECK(Select(call)==0&&!NeedsPreparation(call.signature)&&c.runs==ran);call.capturing=false;
+    config({{"mode","quick"},{"force",Json::object{{"cpu.square","cpu.vector"}}}});call.capturing=true;
+    bool coldForce=false;try{Select(call);}catch(const std::runtime_error&){coldForce=true;}
+    CHECK(coldForce&&NeedsPreparation(call.signature)&&c.runs==ran);call.capturing=false;
     config({{"mode","cache"},{"profile",report}});call.signature.fields[3]=5;CHECK(Select(call)==1&&c.measures==measured&&c.runs>ran);
     config({{"mode","cache"},{"profile",report}});c.hardware="cpu:different";ran=c.runs;CHECK(Select(call)==0&&c.runs==ran);c.hardware="cpu:test:isa:threads:numa";
     config({{"mode","quick"},{"deny",Json::array{"cpu.vector"}}});CHECK(Select(call)==0);

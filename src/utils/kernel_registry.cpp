@@ -179,7 +179,12 @@ int Select(const Call &call) {
         {"build_id",buildId},{"hardware",hardware},{"selected",family.implementations[selected].id},
         {"source",source},{"default_candidate",family.implementations[fallback].id},{"max_l2",maxL2},{"tuning_ms",caseMs},{"candidates",candidates}};
     if(source=="fallback")record["reason"]=call.capturing?"unmeasured graph capture":frozen?"unmeasured frozen plan":"tuning budget exhausted";
-    records[key]=record;plans[call.signature]=selected;local[call.signature]=selected;
+    // A cold capture cannot measure. Keep its graph on the trusted fallback,
+    // but allow a later eager warmup to prepare this signature. Frozen plans
+    // and exhausted budgets remain stable, and force still requires validation.
+    const bool deferred=source=="fallback"&&call.capturing&&!frozen&&spentMs<budgetMs;
+    records[key]=record;
+    if(!deferred){plans[call.signature]=selected;local[call.signature]=selected;}
     printf("[kernels] %s rows=%lld dimensions=%lld,%lld groups/topk=%lld selected=%s source=%s\n",family.name,
         static_cast<long long>(call.signature.fields[3]),static_cast<long long>(call.signature.fields[4]),
         static_cast<long long>(call.signature.fields[5]),static_cast<long long>(call.signature.fields[6]),
