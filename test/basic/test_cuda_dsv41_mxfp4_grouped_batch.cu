@@ -5,6 +5,7 @@
 #include <random>
 #include <cstring>
 #include <cmath>
+#include <climits>
 #include "../../src/devices/cuda/moe/fastllm-moe-deepseekv41-cache.cuh"
 #include "fastllm-cuda.cuh"
 #define CUDA(x)                                                                                              \
@@ -17,15 +18,96 @@
     } while (0)
 namespace ref = fastllm::cuda::dsv41_cache;
 
+// Logical row storage may exceed grid.y. A launch processes only its route
+// slice; routeMap still addresses the complete input and partial-output batch.
+static int CheckLogicalBatchCapacity(int topk, const uint8_t *records,
+        const uint8_t *planar, size_t stride, size_t down) {
+    constexpr int hidden = 5120, inter = 2304, count = 4;
+    const int rows = fastllm::kCudaTritonMxfp4GroupedMaxRoutes / topk + 1;
+    fastllm::Data input(fastllm::BFLOAT16, {rows, hidden});
+    fastllm::Data activation(fastllm::BFLOAT16, {rows * topk, inter});
+    fastllm::Data referenceActivation(fastllm::BFLOAT16, {rows * topk, inter});
+    fastllm::Data expected(fastllm::FLOAT32, {rows * topk, hidden});
+    fastllm::Data actual(fastllm::FLOAT32, {rows * topk, hidden});
+    fastllm::Data scores(fastllm::FLOAT32, {rows * topk});
+    fastllm::Data slots(fastllm::INT32, {count}), routes(fastllm::INT32, {count});
+    for (auto *d : {&input, &activation, &referenceActivation, &expected, &actual, &scores, &slots, &routes}) {
+        d->ToDevice(fastllm::CUDA, {0}, false);
+        d->Allocate(false);
+    }
+    const int ids[count] = {0, 0, 1, 1};
+    int map[count];
+    for (int i = 0; i < count; ++i) map[i] = (rows - 1 - i) * topk;
+    CUDA(cudaMemcpy(slots.cudaData, ids, sizeof(ids), cudaMemcpyHostToDevice));
+    CUDA(cudaMemcpy(routes.cudaData, map, sizeof(map), cudaMemcpyHostToDevice));
+    auto candidate = [&]() {
+        return fastllm::TryCudaTritonMxfp4GroupedBatchCandidate(input, activation, planar,
+            (int*)slots.cudaData, (int*)routes.cudaData, (float*)scores.cudaData,
+            (float*)actual.cudaData, nullptr, count, hidden, inter, topk, stride, down, 10, true, false);
+    };
+    auto update = [&](int pass) {
+        std::vector<__nv_bfloat16> x(hidden);
+        for (int i = 0; i < count; ++i) {
+            const float score = .125f * (i + 1);
+            for (int j = 0; j < hidden; ++j)
+                x[j] = __float2bfloat16(float((j * 7 + pass * 11 + i * 13) % 127 - 63) / 64);
+            CUDA(cudaMemcpy((__nv_bfloat16*)input.cudaData + size_t(map[i] / topk) * hidden,
+                            x.data(), hidden * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
+            CUDA(cudaMemcpy((float*)scores.cudaData + map[i], &score, sizeof(score), cudaMemcpyHostToDevice));
+        }
+    };
+    update(0);
+    if (!candidate()) return 10;
+    CUDA(cudaDeviceSynchronize());
+    cudaGraph_t graph;
+    cudaGraphExec_t executable;
+    CUDA(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+    if (!candidate()) return 10;
+    CUDA(cudaStreamEndCapture(cudaStreamPerThread, &graph));
+    CUDA(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
+    double worst = 0;
+    for (int pass = 1; pass <= 3; ++pass) {
+        update(pass);
+        CUDA(cudaGraphLaunch(executable, cudaStreamPerThread));
+        ref::Gate<true><<<dim3(inter / 32, count), 512, 0, cudaStreamPerThread>>>(
+            (__nv_bfloat16*)input.cudaData, (int*)slots.cudaData, records, (float*)scores.cudaData,
+            (__nv_bfloat16*)referenceActivation.cudaData, hidden, inter, stride, 10, topk, (int*)routes.cudaData);
+        ref::Down<<<dim3(hidden / 8, count), 128, 0, cudaStreamPerThread>>>(
+            (__nv_bfloat16*)referenceActivation.cudaData, (int*)slots.cudaData, records,
+            (float*)expected.cudaData, hidden, inter, stride, down, (int*)routes.cudaData);
+        CUDA(cudaStreamSynchronize(cudaStreamPerThread));
+        double error = 0, norm = 0;
+        std::vector<float> a(hidden), b(hidden);
+        for (int i = 0; i < count; ++i) {
+            CUDA(cudaMemcpy(a.data(), (float*)actual.cudaData + size_t(map[i]) * hidden,
+                            hidden * sizeof(float), cudaMemcpyDeviceToHost));
+            CUDA(cudaMemcpy(b.data(), (float*)expected.cudaData + size_t(map[i]) * hidden,
+                            hidden * sizeof(float), cudaMemcpyDeviceToHost));
+            for (int j = 0; j < hidden; ++j) {
+                if (!std::isfinite(a[j])) return 11;
+                error += double(a[j] - b[j]) * (a[j] - b[j]);
+                norm += double(b[j]) * b[j];
+            }
+        }
+        worst = std::max(worst, std::sqrt(error / std::max(norm, 1e-20)));
+    }
+    CUDA(cudaGraphExecDestroy(executable));
+    CUDA(cudaGraphDestroy(graph));
+    std::printf("LOGICAL_CAPACITY rows=%d logical_routes=%d launch_routes=%d graph_replays=3 max_l2=%g\n",
+                rows, rows * topk, count, worst);
+    return worst < .004 ? 0 : 12;
+}
+
 // Optional SM12x test: enable FASTLLM_CUDA_TRITON and select a compiler/cache.
 // The CUDA GEMV oracle preserves the original MXFP4 and activation rounding.
 int main(int argc, char **argv) {
-    bool planar = true, draft = false, boundaryOnly = false;
+    bool planar = true, draft = false, boundaryOnly = false, capacityOnly = false;
     for (int i = 1; i < argc; ++i) {
         const std::string option = argv[i];
         if (option == "--planar") planar = true;
         else if (option == "--draft") draft = true;
         else if (option == "--boundary-only") boundaryOnly = true;
+        else if (option == "--capacity-only") capacityOnly = true;
         else {
             std::fprintf(stderr, "Unknown option: %s\n", argv[i]);
             return 1;
@@ -81,6 +163,12 @@ int main(int argc, char **argv) {
     }
     w.clear();
     w.shrink_to_fit();
+    if (capacityOnly) {
+        const int result = CheckLogicalBatchCapacity(K, dw, dwPlanar, stride, down);
+        CUDA(cudaFree(dwPlanar));
+        CUDA(cudaFree(dw));
+        return result;
+    }
     __nv_bfloat16 *x, *a, *b;
     float *y, *z, *scores;
     int *slots, *map;
@@ -152,7 +240,7 @@ int main(int argc, char **argv) {
                 if (admitted(n + 1) || admitted(3) || admitted(fastllm::kCudaTritonMxfp4GroupedMaxRoutes + 1))
                     return 6;
                 if (planar) {
-                    input.dims[0] = fastllm::kCudaTritonMxfp4GroupedMaxRoutes / K + 1;
+                    input.dims[0] = INT_MAX / (K * H) + 1;
                     if (admitted(4)) return 6;
                     input.dims[0] = rows;
                 }

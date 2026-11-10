@@ -90,7 +90,7 @@ EXL3 后端仅通过统一算子策略配置，导入内核不读取第三方工
 ## 本版边界
 
 - Triton 的 SM120/121 和行数容量是现有实现的硬约束，不是测速推断的交叉点。较旧架构继续使用原 CUDA 路径。
-- 原 `cuda.moe.nvfp4.triton` 的 2–8 行入口、8 路计算 tile 和缓存版本保持。新增 `cuda.moe.nvfp4.triton.batch` 使用独立 16 路 tile，支持 planar 布局及 `rows * topk <= 65535`（CUDA grid.y 容量）；它与原 kernel 一起参与预热选择。可在 `--kernel-policy` 的 `deny` 中禁用新候选进行对照，无需修改原路径。
+- 原 `cuda.moe.nvfp4.triton` 的 2–8 行入口、8 路计算 tile 和缓存版本保持。新增 `cuda.moe.nvfp4.triton.batch` 使用独立 16 路 tile，支持 planar 布局；单次 kernel 启动的路由数受 CUDA grid.y 容量约束。全驻留专家入口按整个逻辑批次排序路由、量化输入并分配中间结果，超过 65535 路时只拆分物理启动，继续复用同一批次的权重与输入；它与原 kernel 一起参与预热选择。可在 `--kernel-policy` 的 `deny` 中禁用新候选进行对照，无需修改原路径。
 - 原 CUDA 实现目前作为一个候选，内部现有 MMA/SIMT 参数选择尚未全部拆成独立候选；tile/warp 配置的搜索也未加入。
 - NVFP4 为候选比较采用共享 planar 专家缓存布局；未联合搜索布局转换、PCIe 搬运、专家缓存容量和 CPU/GPU 动态分流策略。新接口没有替换这些调度器。
 - 建图前专家预热使用真实驻留权重和私有输入/输出，构造重复与不重复专家混合的代表性路由。尚未按路由分布分别建模；实际负载仍应以端到端波形校验。

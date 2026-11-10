@@ -56,6 +56,7 @@
 #include <vector>
 
 #include <cuda_bf16.h>
+#include <cub/device/device_radix_sort.cuh>
 #ifndef USE_ROCM
 #include <cuda.h>
 #endif
@@ -3904,7 +3905,7 @@ const fastllm::kernels::Family mxfp4Family{3,"moe.nvfp4.gate_swiglu_down",__DATE
         {"topk",json11::Json::array{3,6}},{"layout","planar"},{"parameters",json11::Json::object{{"warps",4},{"stages",2}}},{"graph",true}}},
     {"cuda.moe.nvfp4.triton.batch",json11::Json::object{{"backend","triton"},{"description","Triton 16-route grouped expert block"},
         {"sm",json11::Json::array{120,121}},{"rows_min",2},{"max_routes",fastllm::kCudaTritonMxfp4GroupedMaxRoutes},
-        {"row_limit","rows * topk <= max_routes"},{"hidden",5120},{"intermediate",2304},
+        {"row_limit","tensor indexing capacity; max_routes applies per launch"},{"hidden",5120},{"intermediate",2304},
         {"topk",json11::Json::array{3,6}},{"layout","planar"},
         {"parameters",json11::Json::object{{"route_tile",16},{"warps",4},{"stages",2}}},{"graph",true}}}
 }};
@@ -3935,7 +3936,7 @@ struct Mxfp4KernelContext {
         if(c.layout.hidden!=5120||c.layout.inter!=2304||!c.layout.planarMxfp4||c.layout.swigluLimit!=10||
            (c.topk!=3&&c.topk!=6)||c.view.routeCount<4||
            c.view.routeCount>(impl==1 ? 48 : fastllm::kCudaTritonMxfp4GroupedMaxRoutes))return "unsupported expert shape/layout";
-        return fastllm::kernels::TritonSupport(c.input.dims[0],impl==1 ? 8 : fastllm::kCudaTritonMxfp4GroupedMaxRoutes/c.topk,
+        return fastllm::kernels::TritonSupport(c.input.dims[0],impl==1 ? 8 : INT_MAX,
             "FASTLLM_CUDA_TRITON_MXFP4_GROUPED");
     }
 };
@@ -4018,16 +4019,17 @@ static int EndMoeFrequencyStep(DeviceCache &cache);
 // Complete immutable native caches do not need a CPU routing round trip.
 // Stable expert ordering groups weight reads while routeMap retains each
 // original token/top-k slot for activation storage and the ordered reduction.
-__global__ void PrepareCompleteNativeRoutes(const int32_t *indices, const int32_t *keys,
-        int32_t *slots, int32_t *routeMap, int base, int experts, int routes) {
-    const int r = threadIdx.x;
+__global__ void InitCompleteNativeRouteOrder(int32_t *order, int routes) {
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r < routes) order[r] = r;
+}
+
+__global__ void BindCompleteNativeRouteSlots(int32_t *experts, const int32_t *keys,
+        int base, int count, int routes) {
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
     if (r >= routes) return;
-    const int expert = indices[r];
-    int rank = 0;
-    for (int j = 0; j < routes; ++j)
-        rank += indices[j] < expert || (indices[j] == expert && j < r);
-    slots[rank] = expert >= 0 && expert < experts ? keys[base + expert] : -1;
-    routeMap[rank] = r;
+    const int expert = experts[r];
+    experts[r] = expert >= 0 && expert < count ? keys[base + expert] : -1;
 }
 
 static bool RunCompleteNativeCache(OffloadGroup &group, DeviceCache &cache, int table,
@@ -4059,38 +4061,52 @@ static bool RunCompleteNativeCache(OffloadGroup &group, DeviceCache &cache, int 
         data.dataType = type; data.Resize(shape);
         data.ToDevice(CUDA, {cache.device}, false); data.Allocate(false);
     };
+    const int topk = index.dims[1], hidden = layout.hidden, rows = input.dims[0];
+    const uint64_t routeCount = uint64_t(rows) * topk;
+    if (routeCount > uint64_t(INT_MAX) / std::max(layout.hidden, layout.inter)) return false;
     allocate(output, BFLOAT16, input.dims);
     if (parallel) { parallel(); FastllmCudaSetDevice(cache.device); }
-    const int topk = index.dims[1], hidden = layout.hidden;
-    // A bounded per-tile workspace supports arbitrary positive row counts,
-    // including draft lengths larger than the grouped kernel's eight rows.
-    for (int first = 0; first < input.dims[0]; first += 8) {
-        const int rows = std::min(8, input.dims[0] - first), routes = rows * topk;
-        Data x, ids, scores, result, quantized, gate, partial, slots, routeMap;
-        x.FakeFrom(input, size_t(first) * hidden * sizeof(uint16_t)); x.Resize({rows, hidden});
-        ids.FakeFrom(index, size_t(first) * topk * sizeof(int)); ids.Resize({rows, topk});
-        scores.FakeFrom(score, size_t(first) * topk * sizeof(float)); scores.Resize({rows, topk});
-        result.FakeFrom(output, size_t(first) * hidden * sizeof(uint16_t)); result.Resize({rows, hidden});
-        allocate(quantized, BFLOAT16, {rows, hidden}); allocate(gate, BFLOAT16, {routes, layout.inter});
-        allocate(partial, FLOAT32, {routes, hidden}); allocate(slots, INT32, {routes});
-        allocate(routeMap, INT32, {routes});
-        PrepareCompleteNativeRoutes<<<1, 256, 0, cudaStreamPerThread>>>(
-            static_cast<const int32_t *>(ids.cudaData), cache.keyToSlot,
-            static_cast<int32_t *>(slots.cudaData), static_cast<int32_t *>(routeMap.cudaData),
-            table * layout.experts, layout.experts, routes);
-        checkCudaErrors("Complete MoE partial reset", cudaMemsetAsync(partial.cudaData, 0,
-            size_t(routes) * hidden * sizeof(float), cudaStreamPerThread));
-        if (!FastllmCudaDeepSeekV41QuantizeActivation(x, quantized)) return false;
+    // Group the complete logical batch once. The arithmetic backends tile
+    // their own work without discarding expert reuse at adapter boundaries.
+    const int routes = int(routeCount);
+    Data quantized, gate, partial, slots, routeMap, order, sorting;
+    allocate(quantized, BFLOAT16, {rows, hidden}); allocate(gate, BFLOAT16, {routes, layout.inter});
+    allocate(partial, FLOAT32, {routes, hidden}); allocate(slots, INT32, {routes});
+    allocate(routeMap, INT32, {routes}); allocate(order, INT32, {routes});
+    InitCompleteNativeRouteOrder<<<(routes + 255) / 256, 256, 0, cudaStreamPerThread>>>(
+        static_cast<int32_t *>(order.cudaData), routes);
+    size_t sortBytes = 0;
+    auto sort = [&](void *workspace) {
+        return cub::DeviceRadixSort::SortPairs(workspace, sortBytes,
+            static_cast<const int32_t *>(index.cudaData), static_cast<int32_t *>(slots.cudaData),
+            static_cast<const int32_t *>(order.cudaData), static_cast<int32_t *>(routeMap.cudaData),
+            routes, 0, 32, cudaStreamPerThread);
+    };
+    checkCudaErrors("Complete MoE route sort workspace", sort(nullptr));
+    if (sortBytes > INT_MAX) return false;
+    allocate(sorting, INT8, {int(sortBytes)});
+    checkCudaErrors("Complete MoE route sort", sort(sorting.cudaData));
+    BindCompleteNativeRouteSlots<<<(routes + 255) / 256, 256, 0, cudaStreamPerThread>>>(
+        static_cast<int32_t *>(slots.cudaData), cache.keyToSlot, table * layout.experts, layout.experts, routes);
+    checkCudaErrors("Complete MoE partial reset", cudaMemsetAsync(partial.cudaData, 0,
+        size_t(routes) * hidden * sizeof(float), cudaStreamPerThread));
+    if (!FastllmCudaDeepSeekV41QuantizeActivation(input, quantized)) return false;
+    // CUDA grid.y is bounded even when tensor indexing and storage can hold
+    // more routes. Keep the global sort and route indices; split only launches.
+    constexpr int maxRoutesPerLaunch = 65535;
+    for (int first = 0; first < routes; first += maxRoutesPerLaunch) {
         FastllmCudaMoeGGUFCacheView view{};
-        view.records = cache.records; view.routeSlots = static_cast<int32_t *>(slots.cudaData);
-        view.routeMap = static_cast<int32_t *>(routeMap.cudaData); view.routeCount = routes;
-        if (!ComputeBatchExperts(quantized, gate, result, layout, view,
-                static_cast<const float *>(scores.cudaData), topk, static_cast<float *>(partial.cudaData), true)) return false;
-        fastllm::cuda::dsv41_cache::Reduce<<<dim3((hidden + 255) / 256, rows), 256, 0, cudaStreamPerThread>>>(
-            static_cast<const float *>(partial.cudaData), static_cast<const float *>(partial.cudaData),
-            static_cast<const int32_t *>(ids.cudaData), static_cast<const int32_t *>(ids.cudaData),
-            static_cast<__nv_bfloat16 *>(result.cudaData), hidden, topk);
+        view.records = cache.records;
+        view.routeSlots = static_cast<int32_t *>(slots.cudaData) + first;
+        view.routeMap = static_cast<int32_t *>(routeMap.cudaData) + first;
+        view.routeCount = std::min(maxRoutesPerLaunch, routes - first);
+        if (!ComputeBatchExperts(quantized, gate, output, layout, view,
+                static_cast<const float *>(score.cudaData), topk, static_cast<float *>(partial.cudaData), true)) return false;
     }
+    fastllm::cuda::dsv41_cache::Reduce<true><<<((hidden + 255) / 256) * rows, 256, 0, cudaStreamPerThread>>>(
+        static_cast<const float *>(partial.cudaData), static_cast<const float *>(partial.cudaData),
+        static_cast<const int32_t *>(index.cudaData), static_cast<const int32_t *>(index.cudaData),
+        static_cast<__nv_bfloat16 *>(output.cudaData), hidden, topk);
     return cudaGetLastError() == cudaSuccess;
 }
 

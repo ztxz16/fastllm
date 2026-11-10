@@ -399,10 +399,12 @@ __global__ void DownReuse(const __nv_bfloat16 *activation, const int32_t *slots,
     }
 }
 
+template <bool flatGrid = false>
 static __global__ void Reduce(const float *cpu, const float *gpu, const int32_t *gpuIndices, const int32_t *indices,
                               __nv_bfloat16 *output, int hidden, int topk) {
-    const int column = blockIdx.x * blockDim.x + threadIdx.x;
-    const int row = blockIdx.y;
+    const int columns = (hidden + blockDim.x - 1) / blockDim.x;
+    const int column = (flatGrid ? blockIdx.x % columns : blockIdx.x) * blockDim.x + threadIdx.x;
+    const int row = flatGrid ? blockIdx.x / columns : blockIdx.y;
     cpu += (size_t)row * topk * hidden;
     gpu += (size_t)row * topk * hidden;
     gpuIndices += row * topk;

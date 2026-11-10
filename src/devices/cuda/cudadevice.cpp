@@ -1409,7 +1409,9 @@ namespace fastllm {
             count > (batch ? kCudaTritonMxfp4GroupedMaxRoutes : 48) || !records ||
             !slots || !routes || !scores || !output || (!planar && !scratch) || input.dataType != BFLOAT16 ||
             input.dataDevice != CUDA || !input.cudaData || input.dims.size() != 2 || input.dims[0] < 2 ||
-            input.dims[0] > (batch ? kCudaTritonMxfp4GroupedMaxRoutes / topk : 8) || input.dims[1] != hidden || activation.dataType != BFLOAT16 ||
+            (!batch && input.dims[0] > 8) ||
+            uint64_t(input.dims[0]) * topk * std::max(hidden, inter) > INT_MAX ||
+            input.dims[1] != hidden || activation.dataType != BFLOAT16 ||
             activation.dataDevice != CUDA || !activation.cudaData ||
             activation.Count(0) < size_t(input.dims[0]) * topk * inter || count > input.dims[0] * topk ||
             input.multiDeviceData || activation.multiDeviceData || input.cudaData == activation.cudaData ||

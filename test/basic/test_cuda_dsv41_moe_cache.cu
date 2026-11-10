@@ -402,7 +402,8 @@ static void CheckCompleteNativeGraphs(std::vector<Data *> &weights, int layer) {
     const int device = FastllmCudaGetDevice();
     Require(FastllmCudaMoeCacheFullyResident(weights.data(), weights.size()), "complete cache not recognized");
     int checks = 0;
-    for (int rows : {1, 2, 3, 5, 7, 8, 9, 16, 31, 32}) for (int topk : {1, 3, 6, 16}) {
+    for (int rows : {1, 2, 3, 5, 7, 8, 9, 16, 31, 32, 40, 65, 129, 4097}) for (int topk : {1, 3, 6, 16}) {
+        if (rows == 4097 && topk != 16) continue; // Cross the physical grid.y capacity.
         Data input(BFLOAT16, {rows, hidden}), ids(INT32, {rows, topk}), scores(FLOAT32, {rows, topk}), output;
         Gpu(input, device); Gpu(ids, device); Gpu(scores, device);
         std::vector<uint16_t> x(rows * hidden), expected(x.size()), actual(x.size());
@@ -444,7 +445,7 @@ static void CheckCompleteNativeGraphs(std::vector<Data *> &weights, int layer) {
         }
         cudaGraphExecDestroy(exec); cudaGraphDestroy(graph); FastllmCudaGraphMemoryPoolRelease(reserved);
     }
-    std::printf("COMPLETE_NATIVE_GRAPH_PASS %d replays, rows 1..32, topk 1/3/6/16\n", checks);
+    std::printf("COMPLETE_NATIVE_GRAPH_PASS %d replays, rows 1..4097, topk 1/3/6/16\n", checks);
 }
 
 static void CheckVerifierMailbox(std::vector<Data *> *weights) {
