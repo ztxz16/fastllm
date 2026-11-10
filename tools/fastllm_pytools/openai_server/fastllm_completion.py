@@ -1420,6 +1420,15 @@ class FastLLmCompletion:
           return json.dumps(content, ensure_ascii = False), media
       return str(content), media
 
+  def _count_launch_input_tokens(self, messages, launch_kwargs):
+      # Count the exact template configuration used for generation. Request
+      # defaults (e.g. tool_choice="auto") need not be forwarded by every model;
+      # a mismatch would discard llm.py's one-shot token IDs before launch.
+      return self._compute_multimodal_input_token_len(
+          messages, **{key: launch_kwargs.get(key) for key in (
+              "enable_thinking", "images", "videos", "tools",
+              "thinking_effort", "tool_choice", "chat_template_kwargs")})
+
   def _compute_multimodal_input_token_len(
       self,
       messages: List[Dict[str, Any]],
@@ -3154,14 +3163,6 @@ class FastLLmCompletion:
       model_videos = media.videos if media.videos else None
 
       def prepare_and_launch_text_request():
-          input_token_len = self._compute_multimodal_input_token_len(
-              messages,
-              enable_thinking = enable_thinking,
-              images = model_images,
-              videos = model_videos,
-              tools = model_tools,
-              thinking_effort = thinking_effort,
-              chat_template_kwargs = template_kwargs)
           launch_kwargs = {
               "max_length": max_length,
               "min_length": 0,
@@ -3190,6 +3191,7 @@ class FastLLmCompletion:
           session_key = headers.get("x-session-id") or headers.get("x-smg-routing-key")
           if session_key:
               launch_kwargs["session_key"] = session_key
+          input_token_len = self._count_launch_input_tokens(messages, launch_kwargs)
           handle = self.model.launch_stream_response(
               messages, **launch_kwargs)
           return input_token_len, handle
@@ -3437,15 +3439,7 @@ class FastLLmCompletion:
           # on one worker thread so llm.py can reuse the one-shot tokenization,
           # while independent HTTP requests prepare concurrently instead of
           # serializing the FastAPI event loop.
-          input_len = self._compute_multimodal_input_token_len(
-              messages,
-              enable_thinking = enable_thinking,
-              images = model_images,
-              videos = model_videos,
-              tools = tools,
-              thinking_effort = thinking_effort,
-              tool_choice = tool_choice,
-              chat_template_kwargs = chat_template_kwargs)
+          input_len = self._count_launch_input_tokens(messages, launch_kwargs)
           headers = getattr(raw_request, "headers", {})
           session_key = headers.get("x-session-id") or headers.get("x-smg-routing-key")
           if session_key:

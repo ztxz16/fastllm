@@ -48,7 +48,8 @@ class InputPreparationTest(unittest.IsolatedAsyncioTestCase):
             def launch_stream_response(self, messages, **kwargs):
                 counted_messages, counted = local.input
                 case.assertEqual(messages, counted_messages)
-                for key in ("tools", "enable_thinking", "chat_template_kwargs"):
+                for key in ("tools", "enable_thinking", "chat_template_kwargs",
+                            "thinking_effort", "tool_choice"):
                     case.assertEqual(counted.get(key), kwargs.get(key))
                 case.assertEqual(trace.get(), messages[-1]["content"])
                 constraint = kwargs["tool_call_constraint"]

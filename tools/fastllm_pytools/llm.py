@@ -1221,44 +1221,37 @@ class TokenizerCache:
             self.caches.append(entry)
     
     def prompt_can_match(self, prompt, cur_len, s):
-        if (cur_len + len(s) > len(prompt)):
-            return False
-        for i in range(len(s)):
-            if (prompt[cur_len + i] != s[i]):
-                return False
-        return True
+        return prompt.startswith(s, cur_len)
     
     def tokenize_with_cache(self, tokenizer, prompt: str):
         max_len = 0
-        use_cahce_prompt = ""
-        use_cache_tokens = []
+        best_tokens = ()
+        best_parts = 0
         # Input preparation and completed streams run on different threads.
         # Keep matching/tokenization outside the short publication lock.
         with self.lock:
             entries = tuple(self.caches)
         for it in entries:
-            cur_tokens = []
-            cur_prompt = ""
             cur_len = 0
-            for i in range(len(it[0])):    
-                if (self.prompt_can_match(prompt, cur_len, it[0][i])):
-                    cur_prompt += it[0][i]
-                    cur_len += len(it[0][i])
-                    cur_tokens += it[1][i]
-                else:
+            parts = 0
+            for segment in it[0]:
+                if not self.prompt_can_match(prompt, cur_len, segment):
                     break
+                cur_len += len(segment)
+                parts += 1
             if cur_len > max_len:
                 max_len = cur_len
-                use_cahce_prompt = cur_prompt
-                import copy
-                use_cache_tokens = copy.deepcopy(cur_tokens)
-        #print("use_cahce_prompt", use_cahce_prompt[:100])
-        #print("use_cache_tokens", use_cache_tokens[:100])
+                best_tokens = it[1]
+                best_parts = parts
 
         if (max_len > 0):
-            #print("real prompt", prompt)
-            #print("decode", tokenizer.decode(use_cache_tokens + tokenizer.encode(prompt[max_len : ], add_special_tokens = False)))
-            return use_cache_tokens + tokenizer.encode(prompt[max_len : ], add_special_tokens = False)
+            # Published token segments are immutable. Materialize only the
+            # winning history once, preserving segment boundaries and tie order.
+            use_cache_tokens = []
+            for part in best_tokens[:best_parts]:
+                use_cache_tokens.extend(part)
+            use_cache_tokens.extend(tokenizer.encode(prompt[max_len : ], add_special_tokens = False))
+            return use_cache_tokens
         else:
             return encode_hf_prompt(tokenizer, prompt)
 

@@ -60,6 +60,30 @@ class TokenizerCacheTest(unittest.TestCase):
         self.assertEqual(cache.tokenize_with_cache(Tokenizer(), 'prefix!'), [1, 2, 33])
         self.assertEqual(cache.tokenize_with_cache(Tokenizer(), 'other'), list(b'other'))
 
+    def test_partial_segment_unicode_empty_segment_and_tie(self):
+        cache = TokenizerCache()
+        cache.add(['中文🙂', '', ' suffix'], [[101], [102], [103]])
+        cache.add(['中文🙂'], [[999]])
+        # Reuse only complete segments; the first equal-length history wins.
+        self.assertEqual(cache.tokenize_with_cache(Tokenizer(), '中文🙂 suf!'),
+                         [101, 102] + list(b' suf!'))
+        self.assertEqual(cache.tokenize_with_cache(Tokenizer(), '中文🙂 suffix!'), [101, 102, 103, 33])
+        self.assertEqual(cache.tokenize_with_cache(Tokenizer(), '中文'), list('中文'.encode()))
+        empty = TokenizerCache()
+        empty.add([''], [[999]])
+        self.assertEqual(empty.tokenize_with_cache(Tokenizer(), ''), [])
+
+    def test_result_mutation_and_eviction_do_not_change_published_tokens(self):
+        cache = TokenizerCache()
+        cache.add(['prefix'], [[101, 102]])
+        output = cache.tokenize_with_cache(Tokenizer(), 'prefix!')
+        output[0] = 999
+        output.append(1000)
+        self.assertEqual(cache.tokenize_with_cache(Tokenizer(), 'prefix!'), [101, 102, 33])
+        for index in range(100):
+            cache.add(['other' + str(index)], [[index]])
+        self.assertEqual(cache.tokenize_with_cache(Tokenizer(), 'prefix!'), list(b'prefix!'))
+
 
 if __name__ == '__main__':
     unittest.main()
