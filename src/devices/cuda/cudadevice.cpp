@@ -1292,7 +1292,8 @@ namespace fastllm {
             output, scratch, count, hidden, inter, topk, stride, down, limit, planar, false);
     }
 
-    bool TryCudaTritonSmallProjectionCandidate(const Data &input, Data &weight, Data &output, int groups, bool tuningCandidate) {
+    bool TryCudaTritonSmallProjectionCandidate(const Data &input, Data &weight, Data &output, int groups, bool tuningCandidate, int blockRows) {
+        if (blockRows != 0 && blockRows != 32 && blockRows != 64) return false;
         if (!tuningCandidate && kernels::bypassDepth) return false;
         if (!tuningCandidate && !CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON")) return false;
         const char *flag = std::getenv("FASTLLM_CUDA_TRITON_SMALL_PROJECTION");
@@ -1309,7 +1310,7 @@ namespace fastllm {
             }
             return true;
         };
-        if ((arch != 120 && arch != 121) || groups <= 0 ||
+        if ((arch != 120 && arch != 121) || groups <= 0 || groups > 65535 ||
             !local(input) || !local(weight) || !local(output) ||
             input.dataType != BFLOAT16 || output.dataType != BFLOAT16 ||
             (weight.dataType != FP8_E4M3 && weight.dataType != BFLOAT16) ||
@@ -1319,7 +1320,7 @@ namespace fastllm {
         if (n <= 0 || k <= 0 || n % 32 || k % 32 || input.Count(0) % width ||
             weight.Count(0) > INT_MAX || input.Count(0) > INT_MAX) return false;
         const uint64_t rows64 = input.Count(0) / width;
-        if (rows64 < 2 || rows64 > 16 || output.Count(0) != rows64 * groups * n) return false;
+        if (rows64 < 2 || (!blockRows && rows64 > 16) || rows64 * groups * n > INT_MAX || output.Count(0) != rows64 * groups * n) return false;
         auto overlaps = [](const Data &a, const Data &b) {
             const uintptr_t x = reinterpret_cast<uintptr_t>(a.cudaData), y = reinterpret_cast<uintptr_t>(b.cudaData);
             return x < y + b.GetBytes() && y < x + a.GetBytes();
@@ -1334,9 +1335,10 @@ namespace fastllm {
         const int bn = groups == 1 && n >= 16384 && k <= 2048 ? 64 : 32;
         const int bk = bn == 64 ? (fp8 ? 128 : 64) : (groups > 1 ? 128 : 256);
         const std::string dir = CudaTritonCacheDir();
-        const std::string base = "small_projection_v1_sm" + std::to_string(arch) + "_fp8" +
+        const std::string op = blockRows ? "batched_projection" : "small_projection";
+        const std::string base = op + "_v1_sm" + std::to_string(arch) + "_fp8" +
             std::to_string(fp8) + "_n" + std::to_string(n) + "_k" + std::to_string(k) +
-            "_bn" + std::to_string(bn) + "_bk" + std::to_string(bk) + "_w4_s3";
+            (blockRows ? "_bm" + std::to_string(blockRows) : "") + "_bn" + std::to_string(bn) + "_bk" + std::to_string(bk) + "_w4_s3";
         const std::string path = CudaTritonJoinPath(dir, base + ".json");
         static std::mutex mutex;
         static std::map<std::string, CudaTritonKernelMeta> cache;
@@ -1352,8 +1354,8 @@ namespace fastllm {
                 auto json = json11::Json::parse(body, error);
                 if (!error.empty() || !json["ok"].bool_value()) {
                     if (!CudaTritonEnsureServer()) return false;
-                    json11::Json request = json11::Json::object{{"op", "small_projection"}, {"arch", arch},
-                        {"cache_dir", dir}, {"n", n}, {"k", k}, {"fp8", fp8}, {"block_n", bn}, {"block_k", bk}};
+                    json11::Json request = json11::Json::object{{"op", op}, {"arch", arch},
+                        {"cache_dir", dir}, {"n", n}, {"k", k}, {"fp8", fp8}, {"block_n", bn}, {"block_k", bk}, {"block_m", blockRows}};
                     int status = 0;
                     if (!CudaTritonHttpRequest("POST", "/compile", request.dump(), &status, body) || status != 200)
                         return false;
@@ -1364,6 +1366,7 @@ namespace fastllm {
                 meta.shared = json["shared"].int_value(); meta.numWarps = json["num_warps"].int_value();
                 if (!error.empty() || !json["ok"].bool_value() || json["version"].int_value() != 1 ||
                     json["arch"].int_value() != arch || json["n"].int_value() != n || json["k"].int_value() != k ||
+                    (blockRows && json["block_m"].int_value() != blockRows) ||
                     json["fp8"].int_value() != fp8 || json["block_n"].int_value() != bn || json["block_k"].int_value() != bk ||
                     meta.kernelName.empty() || meta.shared < 0 || meta.shared > 101376 || meta.numWarps != 4 ||
                     !CudaTritonFileExists(meta.cubinPath)) return false;
@@ -1371,7 +1374,7 @@ namespace fastllm {
             }
         }
         return FastllmCudaTritonSmallProjection(meta.cubinPath.c_str(), meta.kernelName.c_str(), meta.shared,
-                                               input, weight, output, int(rows64), groups, n, bn);
+                                               input, weight, output, int(rows64), groups, n, bn, blockRows);
     }
 
     bool CudaTritonMxfp4GroupedEnabled() {

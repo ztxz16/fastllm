@@ -2848,11 +2848,11 @@ struct FastllmCudaDiskMxfp4Scope {
 
 namespace fastllm {
 bool TryCudaTritonSmallProjection(const Data &input, Data &weight, Data &output, int groups = 1);
-bool TryCudaTritonSmallProjectionCandidate(const Data &input, Data &weight, Data &output, int groups, bool tuningCandidate);
+bool TryCudaTritonSmallProjectionCandidate(const Data &input, Data &weight, Data &output, int groups, bool tuningCandidate, int blockRows = 0);
 }
 extern "C" bool FastllmCudaTritonSmallProjection(const char *cubin, const char *name, int shared,
     const fastllm::Data &input, const fastllm::Data &weight, fastllm::Data &output,
-    int rows, int groups, int columns, int blockN);
+    int rows, int groups, int columns, int blockN, int blockRows = 0);
 
 // Sorted original MXFP4 expert slots, at most eight routes per slot.
 namespace fastllm {

@@ -1619,7 +1619,7 @@ extern "C" bool FastllmCudaTritonDeepSeekV4SparseAttentionDecodeGraph(
 
 extern "C" bool FastllmCudaTritonSmallProjection(const char *cubin, const char *name, int shared,
     const fastllm::Data &input, const fastllm::Data &weight, fastllm::Data &output,
-    int rows, int groups, int columns, int blockN) {
+    int rows, int groups, int columns, int blockN, int blockRows) {
     auto *kernel = LoadTritonKernel(cubin, name, shared, true);
     if (!kernel) return false;
     CUdeviceptr x = (CUdeviceptr)FastllmCudaPrepareInput(input);
@@ -1628,7 +1628,8 @@ extern "C" bool FastllmCudaTritonSmallProjection(const char *cubin, const char *
     CUdeviceptr scales = weight.dataType == fastllm::FP8_E4M3 ? (CUdeviceptr)weight.extraCudaData[0] : w;
     CUdeviceptr globalScratch = 0, profileScratch = 0;
     void *args[] = {&x, &w, &scales, &y, &rows, &groups, &globalScratch, &profileScratch};
-    const CUresult result = LaunchTritonKernel(kernel, (columns + blockN - 1) / blockN, groups, 1,
+    const CUresult result = LaunchTritonKernel(kernel, ((columns + blockN - 1) / blockN) *
+                                               (blockRows ? (rows + blockRows - 1) / blockRows : 1), groups, 1,
                                                128, shared, args, CU_STREAM_PER_THREAD);
     FastllmCudaFinishInput(input, (void *)x);
     FastllmCudaFinishInput(weight, (void *)w);

@@ -2822,7 +2822,9 @@ namespace {
 const fastllm::kernels::Family fp8ProjectionFamily{1,"linear.fp8.bf16",__DATE__ " " __TIME__,{
     {"cuda.projection.native",json11::Json::object{{"backend","cuda"},{"description","Existing FP8 CUDA implementation"},{"format","FP8_E4M3 block32 -> BF16"},{"graph",true}}},
     {"cuda.projection.triton",json11::Json::object{{"backend","triton"},{"sm",json11::Json::array{120,121}},{"rows",json11::Json::array{2,16}},
-        {"description","Small FP8 projection"},{"parameters",json11::Json::object{{"warps",4},{"stages",3},{"block_n","32 or 64 by specialization"}}},{"graph",true}}}
+        {"description","Small FP8 projection"},{"parameters",json11::Json::object{{"warps",4},{"stages",3},{"block_n","32 or 64 by specialization"}}},{"graph",true}}},
+    {"cuda.projection.triton.batch32",json11::Json::object{{"backend","triton"},{"sm",json11::Json::array{120,121}},{"description","Row-tiled FP8/BF16 projection; arbitrary logical rows"},{"parameters",json11::Json::object{{"block_m",32},{"warps",4},{"stages",3}}},{"graph",true}}},
+    {"cuda.projection.triton.batch64",json11::Json::object{{"backend","triton"},{"sm",json11::Json::array{120,121}},{"description","Row-tiled FP8/BF16 projection; arbitrary logical rows"},{"parameters",json11::Json::object{{"block_m",64},{"warps",4},{"stages",3}}},{"graph",true}}}
 }};
 const bool fp8ProjectionRegistered=[] {fastllm::kernels::Register(&fp8ProjectionFamily);return true;}();
 }
@@ -2842,14 +2844,14 @@ bool FastllmCudaBFloat16MatMulFP8E4M3(const fastllm::Data &input, fastllm::Data 
             fastllm::Data &output; int rows,inner,columns;
             static bool Run(void *p,int impl) {
                 auto &c=*static_cast<Context *>(p);
-                if(impl==1)return fastllm::TryCudaTritonSmallProjectionCandidate(c.input,c.weight,c.output,1,true);
+                if(impl>0)return fastllm::TryCudaTritonSmallProjectionCandidate(c.input,c.weight,c.output,1,true,impl==1?0:impl==2?32:64);
                 return FastllmCudaBFloat16MatMulFP8E4M3(c.input,c.weight,c.bias,c.output,c.rows,c.inner,c.columns);
             }
             static std::string Unsupported(void *p,int impl) {
                 auto &c=*static_cast<Context *>(p);
                 if(!impl)return "";
                 if(c.inner%32||c.columns%32)return "requires complete 32-element blocks";
-                return fastllm::kernels::TritonSupport(c.rows,16,"FASTLLM_CUDA_TRITON_SMALL_PROJECTION");
+                return fastllm::kernels::TritonSupport(c.rows,impl==1?16:INT_MAX,"FASTLLM_CUDA_TRITON_SMALL_PROJECTION");
             }
         } context{input,weight,bias,output,n,m,k};
         fastllm::kernels::Signature signature{{1,FastllmCudaGetDevice(),FastllmCudaRuntimeArch(),n,k,m,1,32,32,0,0,0}};

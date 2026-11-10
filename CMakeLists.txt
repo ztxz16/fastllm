@@ -3193,6 +3193,12 @@ if (UNIT_TEST)
         add_test(NAME cuda_small_projection COMMAND cuda_small_projection_test)
         set_tests_properties(cuda_small_projection PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 600)
 
+        add_executable(cuda_projection_batch_test test/basic/test_cuda_projection_batch.cu)
+        target_link_libraries(cuda_projection_batch_test PRIVATE fastllm)
+        set_target_properties(cuda_projection_batch_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        add_test(NAME cuda_projection_batch COMMAND cuda_projection_batch_test)
+        set_tests_properties(cuda_projection_batch PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 600)
+
         add_executable(cuda_dsv41_compact_projections_test test/basic/test_cuda_dsv41_compact_projections.cu)
         target_link_libraries(cuda_dsv41_compact_projections_test PRIVATE fastllm)
         set_target_properties(cuda_dsv41_compact_projections_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)

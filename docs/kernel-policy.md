@@ -60,6 +60,20 @@ ftllm benchmark /path/to/model --auto --moe_device numa --max_batch 4 \
 
 当前签名的前四项为 family ID、device、runtime arch 和实际行数。FP8 投影随后为输出宽度、输入宽度、groups、量化 block 参数；专家随后为 hidden、intermediate、top-k、有效 route 容量、planar 布局、权重类型和激活上限。内部保留固定长度签名是为了低成本查找，不是模型级规则。
 
+## FP8/BF16 批量投影
+
+普通投影和分组 WoA 保留原 `cuda.projection.triton` 小批候选，新增
+`cuda.projection.triton.batch32` 和 `cuda.projection.triton.batch64`。
+32/64 表示每个 CTA 处理的物理行 tile，内核遍历全部 tile，末尾不足部分使用 mask；
+它们不是逻辑批次的最大行数。张量索引、CUDA 启动及显存容量约束仍适用。
+这些 Triton 候选支持 SM120/121，其余架构继续使用原 CUDA 实现。
+
+验证的 compact WoA 和草稿的普通 WoA 都参与同一 family 的预热选择，
+签名区分两种输入语义和权重存储类型。普通 WoA 先完成原有激活量化，再比较投影候选，
+不会因为切换内核跳过 FP8 舍入。不同 tile 与原实现按实际形状测速，未新增行数调优开关。
+可以用 policy 的 `deny` 分别排除候选，或用 `force` 在通过能力、数值校验后指定候选；
+冻结前应预热实际验证和草稿批次，正式计时查看报告中的 `selected` 与 `source`。
+
 ## EXL3 投影
 
 EXL3 后端仅通过统一算子策略配置，导入内核不读取第三方工程的调优环境开关。需要比较实现时使用下面的 policy 候选；未编入导入内核的构建仍走独立 portable 路径。原有数值边界及硬件能力保护保留。
