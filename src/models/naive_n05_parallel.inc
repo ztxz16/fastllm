@@ -79,51 +79,75 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
     Data hostPositions(positions); hostPositions.ToDevice(CPU);
     AssertInFastLLM(hostPositions.dataType == FLOAT32 && hostPositions.Count(0) == (size_t)total,
         "Naive attention DP requires one position per input row");
-    for (auto &group : state.groups) {
-        group.batch.reset(); group.kv.clear(); group.configs.clear();
-        group.lengths.clear(); group.positions.clear(); group.sequenceIndices.clear();
-    }
-    std::vector<int> owners;
-    int offset = 0;
-    for (int seq = 0; seq < sequences; ++seq) {
-        Data &first = key(seq, 0);
-        const int count = batch ? batch->lengths[seq] : total;
-        int group;
-        if (first.multiDeviceData) {
-            auto it = std::find(tpDevices.begin(), tpDevices.end(), first.dataDeviceIds.at(0));
-            AssertInFastLLM(it != tpDevices.end(), "Naive attention DP cache belongs to a different device domain");
-            group = topology.AttentionOwner(it - tpDevices.begin());
-        } else {
-            AssertInFastLLM(first.dims.empty(), "Naive attention DP cannot import an unpartitioned cache");
-            group = state.nextGroup++ % attentionDP;
-        }
-        std::vector<std::pair<Data *, Data *>> roots;
-        for (int layer = 0; layer < block_cnt; ++layer) roots.emplace_back(&key(seq, layer), &value(seq, layer));
-        InitAttentionParallelCache(roots, group);
-        if (sparseKv) AttachSparseKv(roots);
-        auto &local = state.groups[group];
-        local.kv.insert(local.kv.end(), roots.begin(), roots.end());
-        local.lengths.push_back(count);
-        local.sequenceIndices.push_back(seq);
-        local.configs.push_back(batch ? batch->configs[seq] : config);
+    const bool ownedDecode = batch && batch->Decode() && !verifying && !sparseKv &&
+        mainLoop && mainLoop->get_id() == std::this_thread::get_id();
+    auto matchesPlan = [&] {
+        std::lock_guard<std::mutex> guard(tpRequestMutex);
+        return state.plan.Matches(*batch, tpCacheEpoch.load(std::memory_order_relaxed), tpRequestIds);
+    };
+    const bool reusePlan = ownedDecode && state.planValid &&
+        state.planKVType == kvCacheDataType && matchesPlan();
+    // Do not publish a partially rebuilt plan after an exception.
+    state.planValid = false;
+    state.reuseBindings = false;
+    if (reusePlan) {
+        AssertInFastLLM(total == sequences, "Naive attention DP decode row count changed");
         const float *pos = (const float *)hostPositions.cpuData;
-        local.positions.insert(local.positions.end(), pos + offset, pos + offset + count);
-        owners.insert(owners.end(), count, group);
-        offset += count;
+        for (auto &group : state.groups)
+            for (size_t row = 0; row < group.sequenceIndices.size(); ++row) {
+                const int seq = group.sequenceIndices[row];
+                // Sampling/grammar constraints and positions can change without
+                // changing KV ownership. Never cache these request values.
+                group.configs[row] = batch->configs[seq];
+                group.positions[row] = pos[seq];
+            }
+    } else {
+        for (auto &group : state.groups) {
+            group.batch.reset(); group.kv.clear(); group.configs.clear();
+            group.lengths.clear(); group.positions.clear(); group.sequenceIndices.clear();
+        }
+        std::vector<int> owners;
+        int offset = 0;
+        for (int seq = 0; seq < sequences; ++seq) {
+            Data &first = key(seq, 0);
+            const int count = batch ? batch->lengths[seq] : total;
+            int group;
+            if (first.multiDeviceData) {
+                auto it = std::find(tpDevices.begin(), tpDevices.end(), first.dataDeviceIds.at(0));
+                AssertInFastLLM(it != tpDevices.end(), "Naive attention DP cache belongs to a different device domain");
+                group = topology.AttentionOwner(it - tpDevices.begin());
+            } else {
+                AssertInFastLLM(first.dims.empty(), "Naive attention DP cannot import an unpartitioned cache");
+                group = state.nextGroup++ % attentionDP;
+            }
+            std::vector<std::pair<Data *, Data *>> roots;
+            for (int layer = 0; layer < block_cnt; ++layer) roots.emplace_back(&key(seq, layer), &value(seq, layer));
+            InitAttentionParallelCache(roots, group);
+            if (sparseKv) AttachSparseKv(roots);
+            auto &local = state.groups[group];
+            local.kv.insert(local.kv.end(), roots.begin(), roots.end());
+            local.lengths.push_back(count);
+            local.sequenceIndices.push_back(seq);
+            local.configs.push_back(batch ? batch->configs[seq] : config);
+            const float *pos = (const float *)hostPositions.cpuData;
+            local.positions.insert(local.positions.end(), pos + offset, pos + offset + count);
+            owners.insert(owners.end(), count, group);
+            offset += count;
+        }
+        AssertInFastLLM(offset == total, "Naive attention DP row lengths do not match the input");
+        parallel::RowPartition nextRows(attentionDP, owners);
+        if (state.rows.localToGlobal != nextRows.localToGlobal) {
+            // Row-transfer allocations and collective counts are graph operands.
+            // Drop the old graph before changing either; shape misses stay eager.
+            tpDecodeState.reset();
+        }
+        state.rows = std::move(nextRows);
+        if (!state.transfer) state.transfer = std::make_unique<parallel::CudaRowTransfer>(state.runtime, state.rows);
+        else state.transfer->Reset(state.rows);
+        state.transfer->Reserve(size_t(embed_dim) * sizeof(uint16_t));
+        for (auto &group : state.groups)
+            group.batch = std::make_unique<TargetBatch>(TargetBatch{group.kv, group.configs, group.lengths, block_cnt});
     }
-    AssertInFastLLM(offset == total, "Naive attention DP row lengths do not match the input");
-    parallel::RowPartition nextRows(attentionDP, owners);
-    if (state.rows.localToGlobal != nextRows.localToGlobal) {
-        // Row-transfer allocations and collective counts are graph operands.
-        // Drop the old graph before changing either; shape misses stay eager.
-        tpDecodeState.reset();
-    }
-    state.rows = std::move(nextRows);
-    if (!state.transfer) state.transfer = std::make_unique<parallel::CudaRowTransfer>(state.runtime, state.rows);
-    else state.transfer->Reset(state.rows);
-    state.transfer->Reserve(size_t(embed_dim) * sizeof(uint16_t));
-    for (auto &group : state.groups)
-        group.batch = std::make_unique<TargetBatch>(TargetBatch{group.kv, group.configs, group.lengths, block_cnt});
     if (!tpPagedCaches.empty()) {
         // Reserve on every owner before any attention/world collective. Pool
         // exhaustion must fail the step before peers enter NCCL.
@@ -190,8 +214,13 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
     }
     std::vector<int *> cacheLengths;
     LogitsSelection fullLogits;
+    // Page growth and shared-tail COW can invalidate a binding even when the
+    // row partition was reusable. Check identities again after reservation.
+    const bool bindingsUnchanged = reusePlan && matchesPlan();
+    state.reuseBindings = bindingsUnchanged;
     bool graphDecode = PrepareTensorParallelDecode(inputIds, kv, verifying, fullLogits,
         cacheLengths, batch, capture && capture->collectHidden);
+    state.reuseBindings = false;
     // Ring candidates use the same batched SWA/commit kernels as world TP.
     // A cache without the candidate tail retains chronological verification;
     // CommitTargetCaches restores its ring after accepting the chosen rows.
@@ -299,26 +328,42 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
         tpDecodeState->warmed = true;
         if (!std::all_of(tpDecodeState->ranks.begin(), tpDecodeState->ranks.end(),
             [](const auto &r) { return r->ok; })) tpDecodeState->disabled = true;
-        // Each request owns its root and local KV metadata. Reuse the TP
-        // workers after GPU completion; never split one request across workers.
-        ForSequenceRanges(tpWorkers, tpDevices, sequences, true, [&](int begin, int end) {
-            for (int seq = begin; seq < end; ++seq) {
-                const int oldLength = key(seq, 0).dims[1];
-                const int count = batch ? batch->lengths[seq] : total;
-                for (int layer = 0; layer < block_cnt; ++layer) {
-                    const int length = slidingLayers[layer] ?
-                        (verifying ? std::min(oldLength, window - 1) + count :
-                            std::min(oldLength + count, window - 1)) : oldLength + count;
-                    for (Data *root : {&key(seq, layer), &value(seq, layer)})
-                        for (auto &entry : root->multiDeviceDatas) {
-                            FastllmNaiveResizeKVLength(*entry.second, length, entry.second->dims[2]);
-                            if (entry.second->isPagedKVCache)
-                                entry.second->lastPageLen = length ? (length - 1) % entry.second->pageLen + 1 : 0;
-                        }
+    }
+    // Commit local and root metadata together, before recording prefix windows.
+    // Each worker owns whole requests; no root can race another rank's update.
+    ForSequenceRanges(tpWorkers, tpDevices, sequences, graphDecode, [&](int begin, int end) {
+        for (int seq = begin; seq < end; ++seq) {
+            const int oldLength = graphDecode ? key(seq, 0).dims[1] : 0;
+            const int count = batch ? batch->lengths[seq] : total;
+            for (int layer = 0; layer < block_cnt; ++layer) {
+                // A saturated sliding window keeps its descriptor shape. Only
+                // skip it when the owned plan survived reservation unchanged.
+                if (graphDecode && bindingsUnchanged && slidingLayers[layer] && oldLength >= window - 1)
+                    continue;
+                const auto &cfg = slidingLayers[layer] ? sliding : full;
+                const int length = slidingLayers[layer] ?
+                    (verifying ? std::min(oldLength, window - 1) + count :
+                        std::min(oldLength + count, window - 1)) : oldLength + count;
+                for (int part = 0; part < 2; ++part) {
+                    Data &root = part ? value(seq, layer) : key(seq, layer);
+                    if (graphDecode) for (auto &entry : root.multiDeviceDatas) {
+                        FastllmNaiveResizeKVLength(*entry.second, length, entry.second->dims[2]);
+                        if (entry.second->isPagedKVCache)
+                            entry.second->lastPageLen = length ? (length - 1) % entry.second->pageLen + 1 : 0;
+                    }
+                    const auto &local = *root.multiDeviceDatas.at(root.dataDeviceIds.front());
+                    const int width = cfg.kvHeads * (part ? cfg.valueDim : cfg.headDim) +
+                        (!part && !slidingLayers[layer] ? PackedIndexerWidth() : 0);
+                    FastllmNaiveResizeKVLength(root, local.dims[1], width);
+                    if (root.expansionDims.size() == 3) {
+                        root.expansionDims[0] = 1;
+                        root.expansionDims[1] = local.expansionDims[1];
+                        root.expansionDims[2] = width;
+                    } else root.expansionDims = {1, local.expansionDims[1], width};
                 }
             }
-        });
-    }
+        }
+    });
     if (graphDecode && recording) {
         state.runtime.Run([&](int rank, int device) {
             PrefixWindowCopies copies;
@@ -337,24 +382,14 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
     }
     if (recording) for (int seq = 0; seq < sequences; ++seq)
         FinishPrefixSnapshots(key(seq, 0), prefixes[seq], (batch ? batch->lengths[seq] : total) > 1);
-    ForSequenceRanges(tpWorkers, tpDevices, sequences, graphDecode, [&](int begin, int end) {
-        for (int seq = begin; seq < end; ++seq)
-            for (int layer = 0; layer < block_cnt; ++layer) {
-                const auto &cfg = slidingLayers[layer] ? sliding : full;
-                for (int part = 0; part < 2; ++part) {
-                    Data &root = part ? value(seq, layer) : key(seq, layer);
-                    const auto &local = *root.multiDeviceDatas.at(root.dataDeviceIds.front());
-                    const int width = cfg.kvHeads * (part ? cfg.valueDim : cfg.headDim) +
-                        (!part && !slidingLayers[layer] ? PackedIndexerWidth() : 0);
-                    FastllmNaiveResizeKVLength(root, local.dims[1], width);
-                    if (root.expansionDims.size() == 3) {
-                        root.expansionDims[0] = 1;
-                        root.expansionDims[1] = local.expansionDims[1];
-                        root.expansionDims[2] = width;
-                    } else root.expansionDims = {1, local.expansionDims[1], width};
-                }
-            }
-    });
+    if (ownedDecode) {
+        std::lock_guard<std::mutex> guard(tpRequestMutex);
+        state.planKVType = kvCacheDataType;
+        state.planValid = state.plan.Remember(*batch,
+            tpCacheEpoch.load(std::memory_order_relaxed), tpRequestIds);
+        state.validatedGraph = graphDecode && tpDecodeState->captured && !tpDecodeState->disabled
+            ? tpDecodeState : std::shared_ptr<TPDecodeState>();
+    }
     if (capture) {
         capture->ringVerify = ringVerify;
         capture->hidden = std::move(captures.front().hidden);

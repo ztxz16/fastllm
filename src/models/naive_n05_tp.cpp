@@ -1296,6 +1296,19 @@ bool NaiveN05FlashModel::PrepareTensorParallelDecode(const Data &inputIds,
         tpDecodeState->cachePointers.size() == slots && tpDecodeState->cacheCapacities.size() == slots &&
         tpDecodeState->cacheLayouts.size() == slots * 4) {
         const auto &state = *tpDecodeState;
+        // The DP scheduler already checked live request identities after page
+        // reservation. With unchanged descriptors, only the sequence capacity
+        // boundary remains dynamic. Direct forwards retain the full scan below.
+        // DP commits metadata itself and does not consume cacheLengths.
+        if (attentionParallel && attentionParallel->reuseBindings &&
+            attentionParallel->validatedGraph.lock() == tpDecodeState &&
+            state.sequenceCapacities.size() == (size_t)sequences) {
+            bool fits = true;
+            for (int sequence = 0; sequence < sequences; ++sequence)
+                fits = fits && key(sequence, 0).dims[1] + sequenceRows[sequence] <=
+                    state.sequenceCapacities[sequence];
+            if (fits) return tpDecodeState->active = true;
+        }
         cacheLengths.resize(slots + (size_t)sequences * block_cnt * 2);
         std::vector<int> matches(sequences, 1);
         std::vector<Data *> paged(reuseOnly ? slots : 0, nullptr);
