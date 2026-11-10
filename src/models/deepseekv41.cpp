@@ -4885,8 +4885,7 @@ namespace fastllm {
             bool replaying = false;
             bool captureFailed = false;
             int warmupRounds = 0;
-            bool jointVerify = false;
-            uint64_t lastUse = 0;
+            bool verification = false;
             int blockCnt = 0;
             std::string signature;             // 设备布局 / dtype 等，变化时重新捕获
             std::vector<int> devices;          // 参与的 CUDA 设备（单卡时只有一个）
@@ -4898,6 +4897,8 @@ namespace fastllm {
             // Each graph retains the pins even when another slot is invalidated.
             std::shared_ptr<V41SharedGraphPins> parallelPins;
             std::vector<size_t> captureAllocations;
+            std::vector<std::vector<size_t>> segmentAllocations;
+            std::string captureError;
             // 捕获时工作区里各边界张量的设备地址。回放前逐一核对，任何一个搬了家
             // 都说明图里烤死的地址已经失效，销毁重捕获；反复失效就彻底关掉。
             std::vector<const void*> boundaryPointers;
@@ -4977,6 +4978,7 @@ namespace fastllm {
                 captureFailed = false;
                 warmupRounds = 0;
                 captureAllocations.clear();
+                segmentAllocations.clear();
             }
 
             void ResetWorkspace() {
@@ -5177,6 +5179,7 @@ namespace fastllm {
                 body();
                 state.capturing = false;
                 captureOk = !FastllmCudaGetThreadError() && !FastllmCudaGetGraphError();
+                if (!captureOk) state.captureError = FastllmCudaGraphLastError();
             }
 
             if (workersJoined) {
@@ -5243,6 +5246,7 @@ namespace fastllm {
             }
 
             if (!captureOk) {
+                if (state.captureError.empty()) state.captureError = FastllmCudaGraphLastError();
                 for (int index = 0; index < deviceCount; index++) {
                     FastllmCudaSetDevice(state.deviceStates[index].device);
                     if (segment.execs[index] != nullptr) {
@@ -5719,47 +5723,28 @@ namespace fastllm {
                 std::unique_lock<std::mutex>(v41CudaGraphMutex, std::try_to_lock);
             if (graphLock.owns_lock()) {
                 // Verification and independent requests have different host metadata.
-                const int graphKey = f.pipeline ? V41PipelineGraphKey(f.pipeline->firstLayer, seqlen) :
-                    verifyGraph ? -(seqlen + (segments.size() > 1 ? FastllmV41FullDecodeMaxBatch : 0)) : v41AttentionRankRuntime ?
+                const int64_t graphKey = f.pipeline ? V41PipelineGraphKey(f.pipeline->firstLayer, seqlen) :
+                    verifyGraph ? FastllmV41VerificationGraphKey(seqlen, segments.size() > 1) : v41AttentionRankRuntime ?
                     seqlen * 3 + (v41AttentionLogicalRows == 1 ? 0 : v41AttentionLogicalRows <= 8 ? 1 : 2) : seqlen;
                 auto found = v41CudaGraphSlots.find(graphKey);
-                const bool jointVerify = verifyGraph && !f.pipeline && segments.size() > 1;
-                if (jointVerify && found == v41CudaGraphSlots.end()) {
-                    // Shortened proposals can produce every row count up to
-                    // maxBatch * (drafts + 1). Keep a bounded LRU of joint
-                    // shapes; ordinary decode and single-request warmups have
-                    // separate slots. The capacity planner reserves this same
-                    // number of maximum-size workspaces.
-                    const int capacity = std::max(1, this->maxBatch);
-                    for (;;) {
-                        int count = 0;
-                        auto oldest = v41CudaGraphSlots.end();
-                        uint64_t age = UINT64_MAX;
-                        for (auto it = v41CudaGraphSlots.begin(); it != v41CudaGraphSlots.end(); ++it) {
-                            if (!it->second) continue;
-                            auto state = V41GetCudaGraphState(it->second);
-                            if (!state->jointVerify) continue;
-                            ++count;
-                            if (state->lastUse < age) { age = state->lastUse; oldest = it; }
-                        }
-                        if (count < capacity || oldest == v41CudaGraphSlots.end()) break;
-                        // Retirement may release graph-pinned pool addresses.
-                        // Drain their devices before making those addresses
-                        // available to a new shape; warm cache hits never sync.
-                        auto retired = V41GetCudaGraphState(oldest->second);
-                        const int originalDevice = FastllmCudaGetDevice();
-                        for (int device : retired->devices) FastllmCudaSyncDevice(device);
-                        FastllmCudaSetDevice(originalDevice);
-                        v41CudaGraphSlots.erase(oldest);
+                const bool verification = verifyGraph && !f.pipeline;
+                if (verification && found == v41CudaGraphSlots.end()) {
+                    // Serial verification needs one active shape, independent of
+                    // maxBatch. Shortened proposals retire the old graph before
+                    // allocating another workspace. Ordinary decode and pipeline
+                    // stages retain their separate caches.
+                    const int originalDevice = FastllmCudaGetDevice();
+                    for (auto it = v41CudaGraphSlots.begin(); it != v41CudaGraphSlots.end();) {
+                        auto state = it->second ? V41GetCudaGraphState(it->second) : nullptr;
+                        if (!state || !state->verification) { ++it; continue; }
+                        for (int device : state->devices) FastllmCudaSyncDevice(device);
+                        it = v41CudaGraphSlots.erase(it);
                     }
+                    FastllmCudaSetDevice(originalDevice);
                 }
                 if (v41CudaGraphWarmingUp || verifyGraph || found != v41CudaGraphSlots.end()) {
                     graphState = V41GetCudaGraphState(v41CudaGraphSlots[graphKey]);
-                    if (jointVerify) {
-                        static std::atomic<uint64_t> access{0};
-                        graphState->jointVerify = true;
-                        graphState->lastUse = access.fetch_add(1, std::memory_order_relaxed) + 1;
-                    }
+                    graphState->verification = verification;
                 }
             }
             if (!graphState || (graphState->disabled && !f.pipeline)) {
@@ -7977,10 +7962,12 @@ namespace fastllm {
                     FastllmCudaClearLastError();
                 });
             }
+            const std::string error = graphState->captureError.empty() ?
+                FastllmCudaGraphLastError() : graphState->captureError;
             graphState->DestroyCapturedGraph();
             graphState->disabled = true;
             fprintf(stderr, "[Fastllm] DeepSeek-V4.1 decode CUDA graph disabled at %s: %s\n",
-                    stage, FastllmCudaGraphLastError());
+                    stage, error.c_str());
             fflush(stderr);
             FastllmCudaClearThreadError();
             FastllmCudaClearGraphError();
@@ -8090,6 +8077,7 @@ namespace fastllm {
         auto &graphReplay = f.graphReplay;
         auto &graphCapture = f.graphCapture;
         auto &graphPoolOpen = f.graphPoolOpen;
+        FastllmCudaGraphPreparation preparation(f.graphActive && capturable);
         if (graphReplay) {
             // The first segment may be an eager DP bridge; it must also reset composition.
             if (index == 0) graphState->composedThrough = -1;
@@ -8117,7 +8105,14 @@ namespace fastllm {
                 record(graphState->segments.back());
                 return;
             }
-            if (V41CaptureGraphSegment(*graphState, body)) {
+            const bool prepared = graphState->devices.size() != 1 ||
+                (index < (int)graphState->segmentAllocations.size() &&
+                 FastllmCudaReserveGraphWorkspace(graphState->segmentAllocations[index]));
+            if (!prepared) graphState->captureError = "segment workspace reservation failed";
+            // A failed capture executes no device work but its host body may
+            // already have advanced the hidden-state ping-pong pointers.
+            Data *savedHidden = f.curHidden, *savedNext = f.nextHidden, *savedPre = f.preMixPtr;
+            if (prepared && V41CaptureGraphSegment(*graphState, body)) {
                 record(graphState->segments.back());
                 return;
             }
@@ -8126,7 +8121,17 @@ namespace fastllm {
                 graphPoolOpen = false;
             }
             GiveUpForwardGraph(f, "capture");
-            // 捕获时没有真正执行任何 kernel，输入也没被改动，直接逐算子重跑一遍。
+            f.curHidden = savedHidden; f.nextHidden = savedNext; f.preMixPtr = savedPre;
+            // Device inputs are unchanged; rerun with the original host boundaries.
+            body();
+            return;
+        }
+        if (f.allocationRecorder && capturable) {
+            if ((int)graphState->segmentAllocations.size() <= index)
+                graphState->segmentAllocations.resize(index + 1);
+            auto &requests = graphState->segmentAllocations[index];
+            requests.clear();
+            FastllmCudaAllocationRecorder recorder(&requests);
             body();
             return;
         }
@@ -8255,7 +8260,7 @@ namespace fastllm {
             // DP ownership follows KV load, so a real batch can have more
             // than its average number of rows on one attention group.
             if (v41AttentionDP > 1 && limit > 1)
-                limit = std::max(limit, std::min(FastllmV41FullDecodeMaxBatch, limit * 2));
+                limit = limit <= INT_MAX / 2 ? limit * 2 : limit;
             for (int batch = 1; batch <= limit; batch *= 2) {
                 batches.push_back(batch);
                 if (batch > limit / 2) break;
@@ -8291,51 +8296,60 @@ namespace fastllm {
                     BuildFullDecodeGraph(batch, segments);
                 }
                 if (v41DsparkEnabled) {
-                    if (this->maxBatch > 1)
-                        printf("[Warmup] DeepSeek-V4.1 joint verify graph cache: %d slots, up to %lld rows per slot.\n",
-                               this->maxBatch, (long long)this->maxBatch * (v41DsparkTokens + 1));
+                    printf("[Warmup] DeepSeek-V4.1 verification graph cache: one active shape, up to %lld rows.\n",
+                           (long long)this->maxBatch * (v41DsparkTokens + 1));
                     // Confidence filtering and the output limit can shorten a
                     // proposal. Warm every supported verification shape, using
                     // private KV so no synthetic history enters a real request.
-                    for (int count = 2; count <= std::min(8, v41DsparkTokens + 1); ++count) {
+                    std::vector<std::pair<int, int>> verifyShapes;
+                    for (int count = 2; count <= v41DsparkTokens + 1; ++count)
+                        verifyShapes.emplace_back(1, count);
+                    for (int batch : batches) if (batch > 1 && batch <= this->maxBatch)
+                        verifyShapes.emplace_back(batch, v41DsparkTokens + 1);
+                    for (const auto &shape : verifyShapes) {
+                        const int batch = shape.first, count = shape.second;
+                        AssertInFastLLM(batch <= INT_MAX / count, "verification warmup rows overflow");
+                        const int rows = batch * count;
                         const auto begin = std::chrono::steady_clock::now();
-                        std::vector<DeepSeekV41Segment> segments(1);
-                        auto &seg = segments[0];
-                        seg.state = std::make_shared<DeepSeekV41RequestState>();
-                        seg.state->layers.resize(block_cnt);
-                        seg.seqlen = 1;
-                        std::vector<Data> dummy(2 * block_cnt);
+                        std::vector<DeepSeekV41Segment> segments(batch);
+                        for (int i = 0; i < batch; ++i) {
+                            auto &seg = segments[i];
+                            seg.state = std::make_shared<DeepSeekV41RequestState>();
+                            seg.state->layers.resize(block_cnt);
+                            seg.seqlen = 1; seg.offset = i;
+                        }
+                        std::vector<Data> dummy(size_t(2) * block_cnt * batch);
                         std::vector<std::pair<Data*, Data*>> past;
                         for (size_t i = 0; i < dummy.size(); i += 2)
                             past.emplace_back(&dummy[i], &dummy[i + 1]);
-                        std::vector<GenerationConfig> configs(1);
-                        configs[0].do_sample = false;
-                        configs[0].top_k = 1;
-                        LastTokensManager last(1, 64);
-                        Data first(DataType::FLOAT32, {1, 1}, {1});
+                        std::vector<GenerationConfig> configs(batch);
+                        for (auto &config : configs) { config.do_sample = false; config.top_k = 1; }
+                        LastTokensManager last(batch, 64);
+                        Data first(DataType::FLOAT32, {1, batch}, std::vector<float>(batch, 1));
                         ForwardSegments(segments, first, nullptr, nullptr, configs, last, nullptr, past);
-                        Data ids(DataType::FLOAT32, {1, count}, std::vector<float>(count, 1));
+                        Data ids(DataType::FLOAT32, {1, rows}, std::vector<float>(rows, 1));
                         // Eager warmups, segmented capture, full composition and
                         // one further replay. Commit between forwards just as a
                         // real verifier does; both full and partial prefixes are
                         // exercised without running a draft or counting accepts.
                         for (int step = 0; step < V41DecodeCudaGraphWarmupRounds() + 3; ++step) {
-                            DeepSeekV41SpecScratch scratch;
-                            scratch.captureMain = scratch.deferWindow = scratch.wantAllTokens = true;
-                            scratch.windowKV.resize(block_cnt);
-                            scratch.rawKV.resize(block_cnt);
-                            scratch.rawScore.resize(block_cnt);
-                            scratch.prevRawTail.assign(block_cnt, 0);
-                            scratch.prevBlocks.assign(block_cnt, 0);
-                            seg.startPos = seg.state->totalLen;
-                            seg.seqlen = count;
-                            seg.spec = &scratch;
+                            std::vector<DeepSeekV41SpecScratch> scratch(batch);
+                            for (int i = 0; i < batch; ++i) {
+                                auto &s = scratch[i]; auto &seg = segments[i];
+                                s.captureMain = s.deferWindow = s.wantAllTokens = true;
+                                s.windowKV.resize(block_cnt); s.rawKV.resize(block_cnt); s.rawScore.resize(block_cnt);
+                                s.prevRawTail.assign(block_cnt, 0); s.prevBlocks.assign(block_cnt, 0);
+                                seg.startPos = seg.state->totalLen;
+                                seg.offset = i * count; seg.seqlen = count; seg.spec = &s;
+                            }
                             ForwardSegments(segments, ids, nullptr, nullptr, configs, last, nullptr, past);
-                            DsparkCommitPrefix(*seg.state, scratch, seg.startPos,
-                                               step % 2 ? 1 : count, count);
-                            seg.spec = nullptr;
+                            for (int i = 0; i < batch; ++i) {
+                                auto &seg = segments[i];
+                                DsparkCommitPrefix(*seg.state, scratch[i], seg.startPos, step % 2 ? 1 : count, count);
+                                seg.spec = nullptr;
+                            }
                         }
-                        printf("[Warmup] DeepSeek-V4.1 verify: %d tokens finished in %.3f s.\n", count,
+                        printf("[Warmup] DeepSeek-V4.1 verify: %d requests, %d rows finished in %.3f s.\n", batch, rows,
                             std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count());
                         fflush(stdout);
                     }

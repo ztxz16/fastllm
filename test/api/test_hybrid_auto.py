@@ -1278,23 +1278,28 @@ class HybridAutoTest(unittest.TestCase):
                 self.assertEqual(reserve({"FASTLLM_CUDA_GRAPH": "1", flag: "1"}), eager)
         self.assertEqual(reserve({"FASTLLM_DSV41_REFERENCE_MATH": "0"}), reserve({}))
 
-    def test_joint_verifier_cache_reserves_concurrent_lifetimes(self):
-        g = auto.geometry(self.dspark_metadata(), "fp4", 0, 5)
-        a = args(auto=True, dspark=5, moe_device_layers=-1, max_batch=8)
-        with patch.dict(os.environ, {}, clear=True):
-            one = auto._v41_runtime_bytes(a, g, "pp", {0:1}, 0, 8192, 1, 4096)
-            joint = auto._v41_runtime_bytes(a, g, "pp", {0:1}, 0, 8192, 8, 4096)
-            # The complete LRU can contain eight distinct, nearly full joint
-            # verifiers. Their private route outputs and attention scores
-            # coexist; the previous estimate grew only with decode warmups.
-            private_floor = sum(range(41,49)) * g.layers * 4 * (
-                g.topk * g.hidden + g.runtime["heads"] *
-                (g.runtime["window"] + g.runtime["index_topk"]))
-            self.assertGreaterEqual(joint["graphs"][0] - one["graphs"][0], private_floor)
-            self.assertEqual(joint["prefill_persistent"], one["prefill_persistent"])
-        with patch.dict(os.environ, {"FASTLLM_CUDA_GRAPH":"0"}, clear=True):
-            eager = auto._v41_runtime_bytes(a, g, "pp", {0:1}, 0, 8192, 8, 4096)
-            self.assertEqual(eager["graphs"][0], 0)
+    def test_serial_graph_caches_scale_with_batch_not_shape_history(self):
+        # Different request counts/draft lengths must not reserve all possible
+        # shapes simultaneously. Include odd counts beyond the prior C8 tests.
+        for drafts in (1, 3, 5, 7):
+            g = auto.geometry(self.dspark_metadata(), "fp4", 0, drafts)
+            g.runtime["vocab"] = 129280
+            a = args(auto=True, dspark=drafts, moe_device_layers=-1)
+            with patch.dict(os.environ, {}, clear=True):
+                reserves = {n: auto._v41_runtime_bytes(a, g, "pp", {0:1}, 0, 8192, n, 4096)
+                            for n in (1, 3, 8, 9, 32, 64, 65)}
+            for small, large in ((1, 3), (8, 9), (8, 64), (32, 65)):
+                with self.subTest(drafts=drafts, small=small, large=large):
+                    self.assertGreater(reserves[large]["graphs"][0], reserves[small]["graphs"][0])
+                    self.assertLess(reserves[large]["graphs"][0],
+                                    reserves[small]["graphs"][0] * (large / small + 1))
+                    self.assertEqual(reserves[large]["prefill_persistent"],
+                                     reserves[small]["prefill_persistent"])
+            # Private conditional q survives draft-slot reuse until verification.
+            self.assertGreater(reserves[64]["graphs"][0], 64 * g.dspark_block_size * g.runtime["vocab"] * 4)
+            with patch.dict(os.environ, {"FASTLLM_CUDA_GRAPH":"0"}, clear=True):
+                eager = auto._v41_runtime_bytes(a, g, "pp", {0:1}, 0, 8192, 64, 4096)
+                self.assertEqual(eager["graphs"][0], 0)
 
     def test_v41_new_runtime_reserve_reduces_cache_without_changing_context(self):
         g = auto.geometry(self.dspark_metadata(), "fp4", 0, 7)

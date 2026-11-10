@@ -17,7 +17,7 @@ struct Plan {
     bool verifying = false;
     void *storage = nullptr;
     std::shared_ptr<void> owner;
-    int device = -1;
+    int device = -1, gridY = 0;
     bool gathered = false;
     bf16 *decoded = nullptr;
     int32_t *decodedIndices = nullptr;
@@ -89,8 +89,8 @@ __global__ void GatherAttentionKV(const FastllmV41FullDecodeRequest *requests,
 // Only the final result is rounded to BF16; QK and the weighted sum use FP32.
 __global__ void MergeCurrent(const bf16 *q, const bf16 *current, const bf16 *partial, const float *lse,
                              const float *sink, bf16 *output, float scale, int heads, int scratchHeads,
-                             int splits) {
-    const int h = blockIdx.x, t = threadIdx.x, token = blockIdx.y;
+                             int splits, int rowOffset = 0) {
+    const int h = blockIdx.x, t = threadIdx.x, token = rowOffset + blockIdx.y;
     q += (size_t(token) * heads + h) * 512;
     current += size_t(token) * 512;
     partial += (size_t(token) * scratchHeads + h) * splits * 512;
@@ -158,8 +158,8 @@ __global__ void MergeCurrent(const bf16 *q, const bf16 *current, const bf16 *par
 // quantization is needed. Keep QK, softmax and the weighted sum in FP32.
 __global__ void MergeVerify(const bf16 *q, const bf16 *chunk, const bf16 *partial, const float *lse,
                             const float *sink, bf16 *output, float scale, int heads, int scratchHeads,
-                            int splits, int length, const FastllmV41FullDecodeRequest *requests = nullptr) {
-    const int h = blockIdx.x, rowIndex = blockIdx.y, t = threadIdx.x;
+                            int splits, int length, const FastllmV41FullDecodeRequest *requests = nullptr, int rowOffset = 0) {
+    const int h = blockIdx.x, rowIndex = rowOffset + blockIdx.y, t = threadIdx.x;
     const int token = requests ? rowIndex - requests[rowIndex].chunkBegin : rowIndex % length;
     const int lane = t & 31, warp = t / 32;
     chunk += size_t(rowIndex - token) * 512;
@@ -167,30 +167,31 @@ __global__ void MergeVerify(const bf16 *q, const bf16 *chunk, const bf16 *partia
     partial += (size_t(rowIndex) * scratchHeads + h) * splits * 512;
     lse += (size_t(rowIndex) * scratchHeads + h) * splits;
     output += (size_t(rowIndex) * heads + h) * 512;
-    // Plan creation bounds both the causal chunk and the split count.
+    // The model has a 128-token sliding window, independent of batch/chunk size.
+    const int first = max(0, token - 127), count = token - first + 1;
     __shared__ float prefixWeights[128], splitWeights[18];
-    for (int row = warp; row <= token; row += 4) {
+    for (int local = warp; local < count; local += 4) {
         float dot = 0.f;
 #pragma unroll
         for (int d = lane; d < 512; d += 32)
-            dot = fmaf(float(q[d]), float(chunk[size_t(row) * 512 + d]), dot);
+            dot = fmaf(float(q[d]), float(chunk[size_t(first + local) * 512 + d]), dot);
         for (int s = 16; s; s >>= 1)
             dot += __shfl_down_sync(0xffffffff, dot, s);
         if (!lane)
-            prefixWeights[row] = dot * scale * 1.4426950408889634f;
+            prefixWeights[local] = dot * scale * 1.4426950408889634f;
     }
     __syncthreads();
     if (t < 32) {
         const float sinkScore = sink[h] * 1.4426950408889634f;
         float maximum = sinkScore;
-        for (int row = t; row <= token; row += 32)
+        for (int row = t; row < count; row += 32)
             maximum = fmaxf(maximum, prefixWeights[row]);
         for (int i = t; i < splits; i += 32)
             maximum = fmaxf(maximum, lse[i]);
         for (int s = 16; s; s >>= 1)
             maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, s));
         float denominator = 0.f;
-        for (int row = t; row <= token; row += 32) {
+        for (int row = t; row < count; row += 32) {
             const float w = exp2f(prefixWeights[row] - maximum);
             prefixWeights[row] = w;
             denominator += w;
@@ -203,17 +204,17 @@ __global__ void MergeVerify(const bf16 *q, const bf16 *chunk, const bf16 *partia
         for (int s = 16; s; s >>= 1)
             denominator += __shfl_xor_sync(0xffffffff, denominator, s);
         const float inv = 1.f / (denominator + exp2f(sinkScore - maximum));
-        for (int row = t; row <= token; row += 32)
+        for (int row = t; row < count; row += 32)
             prefixWeights[row] *= inv;
         for (int i = t; i < splits; i += 32)
             splitWeights[i] *= inv;
     }
     __syncthreads();
     float acc[4] = {};
-    for (int row = 0; row <= token; ++row) {
+    for (int row = 0; row < count; ++row) {
 #pragma unroll
         for (int d = 0; d < 4; ++d)
-            acc[d] = fmaf(prefixWeights[row], float(chunk[size_t(row) * 512 + t * 4 + d]), acc[d]);
+            acc[d] = fmaf(prefixWeights[row], float(chunk[size_t(first + row) * 512 + t * 4 + d]), acc[d]);
     }
     for (int i = 0; i < splits; ++i) {
         if (splitWeights[i] == 0.f)
@@ -269,7 +270,7 @@ bool KernelReady(int heads, bool compressed) {
 void *FastllmV41FlashInferCreate(const FastllmV41FullDecodeConfig &c) {
     // Independent decode requests and one contiguous causal verification
     // chunk share the packed-cache kernel. Other cache formats retain native math.
-    if (c.batch < 1 || c.batch > 128 || c.heads < 1 || c.heads > 128 || c.window != 128 ||
+    if (c.batch < 1 || c.heads < 1 || c.heads > 128 || c.window != 128 ||
         c.ringMode != 1 || c.ringRowBytes != 528 || c.cmpMode != 3 || c.cmpRowBytes != 288 || c.ratio < 0 ||
         c.ratio > 2 || c.topK < 1 || c.topK > 1024 || !std::isfinite(c.softmaxScale) || c.softmaxScale <= 0.f)
         return nullptr;
@@ -306,6 +307,9 @@ void *FastllmV41FlashInferCreate(const FastllmV41FullDecodeConfig &c) {
         p->gathered = false;
     }
     cudaGetDevice(&p->device);
+    if (cudaDeviceGetAttribute(&p->gridY, cudaDevAttrMaxGridDimY, p->device) != cudaSuccess || p->gridY < 1) {
+        cudaFree(p->storage); return nullptr;
+    }
     p->owner = std::shared_ptr<void>(p->storage, [device = p->device](void *data) {
         int old = 0; cudaGetDevice(&old); cudaSetDevice(device);
         cudaFree(data); cudaSetDevice(old);
@@ -361,16 +365,20 @@ cudaError_t FastllmV41FlashInferRun(void *handle, const FastllmV41FullDecodeBuff
     if (status != cudaSuccess)
         return status;
     // Keep a single-query graph on the ordinary one-token reduction order.
+    for (int begin = 0; begin < p->batch;) {
+    const int rows = std::min(p->batch - begin, p->gridY);
     if (p->verifying || p->batch == 1) {
-        MergeVerify<<<dim3(p->heads, p->batch), 128, 0, stream>>>(
+        MergeVerify<<<dim3(p->heads, rows), 128, 0, stream>>>(
             static_cast<const bf16 *>(b.q), static_cast<const bf16 *>(b.kv), p->mid, p->midLse,
             static_cast<const float *>(b.sink), static_cast<bf16 *>(b.output), p->scale, p->heads,
-            p->scratchHeads, p->splits, p->batch, p->verifying ? request : nullptr);
+            p->scratchHeads, p->splits, p->batch, p->verifying ? request : nullptr, begin);
     } else {
-        MergeCurrent<<<dim3(p->heads, p->batch), 128, 0, stream>>>(
+        MergeCurrent<<<dim3(p->heads, rows), 128, 0, stream>>>(
             static_cast<const bf16 *>(b.q), static_cast<const bf16 *>(b.kv), p->mid, p->midLse,
             static_cast<const float *>(b.sink), static_cast<bf16 *>(b.output), p->scale, p->heads,
-            p->scratchHeads, p->splits);
+            p->scratchHeads, p->splits, begin);
+    }
+    begin += rows;
     }
     return cudaGetLastError();
 }

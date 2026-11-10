@@ -238,6 +238,14 @@ static bool FastllmCudaGraphCaptureIdentityRegisteredLocked(
 // Called while the owning device-pool lock is held. All pool transitions use
 // the same pool -> graph lock order, so finalization cannot race an allocation
 // or free of the pointer being classified.
+static thread_local bool fastllmCudaGraphPreparation = false;
+bool FastllmCudaGraphPreparationActive() { return fastllmCudaGraphPreparation; }
+bool FastllmCudaSetGraphPreparation(bool active) {
+    const bool previous = fastllmCudaGraphPreparation;
+    fastllmCudaGraphPreparation = active;
+    return previous;
+}
+static thread_local bool fastllmCudaGraphWorkspaceReserving = false;
 static bool FastllmCudaGraphPoolPointerReusableLocked(
         void *ptr, const FastllmCudaGraphCaptureIdentity &identity) {
     int phase = fastllmCudaGraphPoolPhase.load(std::memory_order_acquire);
@@ -251,7 +259,8 @@ static bool FastllmCudaGraphPoolPointerReusableLocked(
     }
     return fastllmCudaGraphPoolPhase.load(std::memory_order_relaxed) ==
                FASTLLM_CUDA_GRAPH_POOL_CAPTURING &&
-           FastllmCudaGraphCaptureIdentityRegisteredLocked(identity);
+           (fastllmCudaGraphWorkspaceReserving ||
+            FastllmCudaGraphCaptureIdentityRegisteredLocked(identity));
 }
 
 static bool FastllmCudaGraphPoolPointerProtectedLocked(void *ptr) {
@@ -5571,22 +5580,42 @@ void FastllmCudaGraphMemoryPoolRelease(const std::vector<void*> &reservedPointer
     }
 }
 
-static thread_local std::vector<size_t> *fastllmCudaAllocationRecorder = nullptr;
-std::vector<size_t> *FastllmCudaSetAllocationRecorder(std::vector<size_t> *requests) {
-    auto *previous = fastllmCudaAllocationRecorder;
-    fastllmCudaAllocationRecorder = requests;
-    return previous;
+struct FastllmCudaAllocationRecording {
+    std::vector<size_t> *requests;
+    FastllmCudaAllocationRecording *previous;
+    std::map<void*, size_t> blocks;
+};
+static thread_local FastllmCudaAllocationRecording *fastllmCudaUniqueAllocationRecorder = nullptr;
+
+void *FastllmCudaBeginAllocationRecording(std::vector<size_t> *requests) {
+    auto *recording = new FastllmCudaAllocationRecording{
+        requests, fastllmCudaUniqueAllocationRecorder, {}};
+    fastllmCudaUniqueAllocationRecorder = recording;
+    return recording;
+}
+
+void FastllmCudaEndAllocationRecording(void *context) {
+    auto *recording = static_cast<FastllmCudaAllocationRecording*>(context);
+    fastllmCudaUniqueAllocationRecorder = recording->previous;
+    delete recording;
+}
+
+static void FastllmCudaRecordAllocation(void *pointer, size_t size) {
+    auto *recording = fastllmCudaUniqueAllocationRecorder;
+    if (!recording || !recording->requests || !pointer || !size) return;
+    auto *requests = recording->requests;
+    const auto entry = recording->blocks.emplace(pointer, requests->size());
+    if (entry.second) requests->push_back(size);
+    else (*requests)[entry.first->second] = std::max((*requests)[entry.first->second], size);
 }
 
 static void *FastllmCudaMallocImpl(
         size_t size, FastllmCudaTryMallocResult *tryResult) {
-    if (fastllmCudaAllocationRecorder && size) {
-        fastllmCudaAllocationRecorder->push_back(size);
-    }
     if (tryResult != nullptr) {
         *tryResult = FASTLLM_CUDA_TRY_MALLOC_ERROR;
     }
     auto allocationSucceeded = [&](void *ret) {
+        FastllmCudaRecordAllocation(ret, size);
         if (tryResult != nullptr) {
             *tryResult = FASTLLM_CUDA_TRY_MALLOC_SUCCESS;
         }
@@ -5680,6 +5709,7 @@ static void *FastllmCudaMallocImpl(
             FastllmCudaPrintPoolRejectStateLocked(id, size, view.bigBuffers, view.smallBuffers);
         }
         if (capturePoolOnly) {
+            fastllmCudaGraphLastError = "capture workspace exhausted: " + std::to_string(size) + " bytes on device " + std::to_string(id);
             FastllmCudaSetThreadError();
             return nullptr;
         }
@@ -5781,6 +5811,7 @@ static void *FastllmCudaMallocImpl(
         FastllmCudaPrintPoolRejectStateLocked(id, size, view.bigBuffers, view.smallBuffers);
     }
     if (capturePoolOnly) {
+        fastllmCudaGraphLastError = "capture workspace exhausted: " + std::to_string(size) + " bytes on device " + std::to_string(id);
         FastllmCudaSetThreadError();
         return nullptr;
     }
@@ -5839,6 +5870,11 @@ FastllmCudaTryMallocResult FastllmCudaTryMalloc(
 bool FastllmCudaReserveGraphWorkspace(const std::vector<size_t> &requests) {
     if (FastllmCudaGraphIsCapturingFast()) return false;
     FastllmCudaAllocationRecorder suspend(nullptr);
+    struct Reservation {
+        bool previous = fastllmCudaGraphWorkspaceReserving;
+        Reservation() { fastllmCudaGraphWorkspaceReserving = true; }
+        ~Reservation() { fastllmCudaGraphWorkspaceReserving = previous; }
+    } reservation;
     std::vector<void *> blocks;
     blocks.reserve(requests.size());
     bool ok = true;

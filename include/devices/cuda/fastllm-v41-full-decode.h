@@ -2,8 +2,12 @@
 
 #include <cstddef>
 #include <atomic>
+#include <cstdint>
 
-constexpr int FastllmV41FullDecodeMaxBatch = 128;
+// Separate causal layouts without a fixed batch-size offset or key collision.
+inline int64_t FastllmV41VerificationGraphKey(int rows, bool segmented) {
+    return -(int64_t(rows) * 2 + int(segmented));
+}
 
 // Fixed tensor addresses and launch shapes; request-dependent values are
 // uploaded separately before replay. The caller owns all tensor buffers.
@@ -59,7 +63,7 @@ struct FastllmV41VerifyCommitLayer {
     int window = 128, ratio = 0, ringRowBytes = 1024;
 };
 bool FastllmCudaV41CommitVerifiedPrefix(const FastllmV41VerifyCommitLayer *layers,
-                                      int layerCount, int accepted, int forwarded, int rowOffset = 0);
+                                      int layerCount, int accepted, int forwarded, int rowOffset = 0, int batchRows = 0);
 
 // Create/destroy and upload run outside capture. Prepare/Finish contain only
 // fixed-shape GPU work, and can be captured exactly once during startup.

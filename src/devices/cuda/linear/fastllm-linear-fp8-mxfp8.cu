@@ -9,6 +9,7 @@
  */
 
 #include "fastllm-cuda.cuh"
+#include "devices/cuda/fastllm-cuda-graph-workspace.h"
 #include "fastllm.h"
 #include "devices/cuda/fastllm-draft-head.cuh"
 
@@ -403,7 +404,7 @@ extern "C" bool FastllmCudaTryFp8DraftHead(const fastllm::Data &input,
 extern "C" bool FastllmCudaTryMxfp8QuantizedLinear(const fastllm::Data &input,
         fastllm::Data &weight, fastllm::Data &output) {
     if (!Mxfp8EnvEnabled() || &input == &output || &weight == &output ||
-        FastllmCudaGraphIsCapturingFast() ||
+        (FastllmCudaGraphIsCapturingFast() || FastllmCudaGraphPreparationActive()) ||
         FastllmCudaRuntimeArch() < 120 || FastllmCudaRuntimeArch() > 121 ||
         input.multiDeviceData || weight.multiDeviceData || output.multiDeviceData ||
         input.dataType != fastllm::DataType::BFLOAT16 || input.dims.empty() ||
@@ -491,7 +492,7 @@ extern "C" bool FastllmCudaTryMxfp8WoA(const fastllm::Data &input,
         const fastllm::Data &weight, int groups, int rank, fastllm::Data &output) {
     const char *disable = std::getenv("FASTLLM_DSV4_DISABLE_CUDA_WOA_GEMM");
     if (!Mxfp8EnvEnabled() || &input == &output || &weight == &output ||
-        FastllmCudaGraphIsCapturingFast() ||
+        (FastllmCudaGraphIsCapturingFast() || FastllmCudaGraphPreparationActive()) ||
         (disable && std::strcmp(disable, "0")) ||
         FastllmCudaRuntimeArch() < 120 || FastllmCudaRuntimeArch() > 121 ||
         input.dataType != fastllm::DataType::BFLOAT16 || input.dims.size() != 4 ||

@@ -123,6 +123,7 @@ static void CompareAttention(const Data &all, const Data &one, int begin) {
     for (size_t i=0;i<b.size()/2;++i) { double u=__bfloat162float(x[i]),v=__bfloat162float(y[i]);
         Check(std::isfinite(u)&&std::isfinite(v),"nonfinite attention");error+=(u-v)*(u-v);norm+=v*v; }
     const double l2=std::sqrt(error/std::max(norm,1e-30));worstAttentionL2=std::max(worstAttentionL2,l2);
+    if(l2>=.0032)std::cerr<<"attention mismatch begin="<<begin<<" rows="<<one.dims[1]<<" l2="<<l2<<" error="<<error<<" norm="<<norm<<std::endl;
     Check(l2<.0032,"segmented attention L2");
 }
 static void Run(int packed,int ratio,int heads,int total) {
@@ -136,7 +137,10 @@ static void Run(int packed,int ratio,int heads,int total) {
         std::vector<int> lengths;
         if(total==12) lengths=replay%2?std::vector<int>{1,4,2,5}:std::vector<int>{6,6};
         else if(total==24) lengths=replay%2?std::vector<int>{5,7,8,4}:std::vector<int>{6,6,6,6};
-        else lengths=replay%2?std::vector<int>{1,3}:std::vector<int>{2,2};
+        else if(total==4) lengths=replay%2?std::vector<int>{1,3}:std::vector<int>{2,2};
+        else for (int left=total, i=0; left; ++i) {
+            const int n=std::min(left,1+(i*5+replay*3)%8);lengths.push_back(n);left-=n;
+        }
         batch.CopyInputs(initial,0,total);
         std::vector<std::unique_ptr<Cache>> cache;
         std::vector<FastllmV41FullDecodeRequest> requests;
@@ -178,8 +182,8 @@ static void Run(int packed,int ratio,int heads,int total) {
                 batch.saved.cudaData,batch.savedRaw.cudaData,batch.savedScore.cudaData,128,ratio,bytes};
             void *desc=nullptr;Cuda(cudaMalloc(&desc,sizeof(descriptor)));Cuda(cudaMemcpy(desc,&descriptor,sizeof(descriptor),cudaMemcpyHostToDevice));
             for (int invalidOffset : {-1, 2147483647})
-                Check(!FastllmCudaV41CommitVerifiedPrefix(static_cast<const FastllmV41VerifyCommitLayer*>(desc),1,accept,single.batch,invalidOffset),"invalid commit offset accepted");
-            Check(FastllmCudaV41CommitVerifiedPrefix(static_cast<const FastllmV41VerifyCommitLayer*>(desc),1,accept,single.batch,begin),"commit");
+                Check(!FastllmCudaV41CommitVerifiedPrefix(static_cast<const FastllmV41VerifyCommitLayer*>(desc),1,accept,single.batch,invalidOffset,total),"invalid commit offset accepted");
+            Check(FastllmCudaV41CommitVerifiedPrefix(static_cast<const FastllmV41VerifyCommitLayer*>(desc),1,accept,single.batch,begin,total),"commit");
             Check(Read(cache[i]->ring)==ring&&Read(cache[i]->tail)==tail&&Read(cache[i]->score)==tailScore,"independent prefix commit");
             Cuda(cudaFree(desc));FastllmCudaV41DestroyFullDecode(rp);begin+=single.batch;
         }
@@ -187,10 +191,46 @@ static void Run(int packed,int ratio,int heads,int total) {
     }
     Cuda(cudaGraphExecDestroy(exec));Cuda(cudaGraphDestroy(graph));FastllmCudaV41DestroyFullDecode(plan);
 }
+// Cross the device's physical grid.y boundary without changing the logical
+// causal chunk. Zero values have an exact attention result for any query.
+static void LargeGrid(bool packed) {
+    int gridY=0;Cuda(cudaDeviceGetAttribute(&gridY,cudaDevAttrMaxGridDimY,0));
+    FastllmV41FullDecodeConfig c;c.batch=gridY+1;c.heads=1;c.ratio=0;c.verifying=true;
+    c.window=128;c.maxKeys=512;c.topK=512;
+    if(packed){c.ringMode=1;c.ringRowBytes=528;c.cmpMode=3;c.cmpRowBytes=288;c.indexMode=2;c.indexRowBytes=68;}
+    std::vector<void*> storage;
+    auto alloc=[&](size_t n) {void *p=nullptr;Cuda(cudaMalloc(&p,n));storage.push_back(p);Cuda(cudaMemset(p,0,n));return p;};
+    const size_t bytes=size_t(c.batch)*512*2;
+    FastllmV41FullDecodeBuffers b;b.q=alloc(bytes);b.kv=alloc(bytes);b.output=alloc(bytes);
+    b.savedKV=alloc(packed?size_t(c.batch)*528:bytes);b.sink=alloc(sizeof(float));b.requests=alloc(size_t(c.batch)*sizeof(FastllmV41FullDecodeRequest));
+    void *ring=alloc(size_t(c.window)*(packed?528:1024));
+    std::vector<FastllmV41FullDecodeRequest> requests(c.batch);
+    for(int i=0;i<c.batch;++i){requests[i].windowKV=ring;requests[i].position=i+1;requests[i].chunkLength=c.batch;}
+    void *plan=FastllmCudaV41CreateFullDecode(c,b);Check(plan,"large grid plan");
+    Check(FastllmCudaV41UploadFullDecodeBatch(b.requests,&plan,1,requests.data(),requests.size()),"large grid upload");
+    Check(FastllmCudaV41PrepareFullDecode(plan)&&FastllmCudaV41FinishFullDecode(plan),"large grid warm");Cuda(cudaDeviceSynchronize());
+    cudaGraph_t graph=nullptr;cudaGraphExec_t exec=nullptr;
+    Cuda(cudaStreamBeginCapture(cudaStreamPerThread,cudaStreamCaptureModeThreadLocal));
+    Check(FastllmCudaV41PrepareFullDecode(plan)&&FastllmCudaV41FinishFullDecode(plan),"large grid capture");
+    Cuda(cudaStreamEndCapture(cudaStreamPerThread,&graph));Cuda(cudaGraphInstantiate(&exec,graph,0));
+    for(int replay=0;replay<2;++replay){
+        std::vector<__nv_bfloat16> q(size_t(c.batch)*512,__float2bfloat16(replay?.125f:.0625f));
+        Cuda(cudaMemcpy(b.q,q.data(),bytes,cudaMemcpyHostToDevice));Cuda(cudaMemset(b.output,0x7f,bytes));
+        Cuda(cudaGraphLaunch(exec,cudaStreamPerThread));Cuda(cudaDeviceSynchronize());
+        Cuda(cudaMemcpy(q.data(),b.output,bytes,cudaMemcpyDeviceToHost));
+        for(auto v:q)Check(__bfloat162float(v)==0,"large grid row skipped or incorrect");
+    }
+    Cuda(cudaGraphExecDestroy(exec));Cuda(cudaGraphDestroy(graph));FastllmCudaV41DestroyFullDecode(plan);
+    for(void *p:storage)Cuda(cudaFree(p));
+    std::cout<<"PASS physical grid boundary rows="<<c.batch<<std::endl;
+}
 int main() {try {SetThreads(4);Cuda(cudaSetDevice(0));int cases=0;
     for(int packed:{0,1,3})for(int ratio:{0,1,2})for(int heads:{8,32})for(int total:{4,12,24}) {
         Run(packed,ratio,heads,total);++cases;
         std::cout<<"PASS packed="<<packed<<" ratio="<<ratio<<" heads="<<heads<<" rows="<<total<<std::endl;
     }
+    for (int rows : {65,129,384,513}) {Run(3,2,8,rows);++cases;std::cout<<"PASS expanded rows="<<rows<<std::endl;}
+    Run(0,0,8,257);++cases;Run(1,1,8,193);++cases;
+    LargeGrid(false);LargeGrid(true);
     std::cout<<"PASS cases="<<cases<<" replays="<<cases*4<<" worst_attention_l2="<<worstAttentionL2<<std::endl;return 0;
 }catch(const std::exception &e){std::cerr<<"FAIL "<<e.what()<<std::endl;return 1;}}

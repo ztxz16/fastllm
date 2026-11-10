@@ -1205,22 +1205,15 @@ def _v41_runtime_bytes(args, model, mode, mapping, resident, context, batch, chu
     host = args.moe_device == "numa" or (args.moe_device == "cpu" and getattr(args, "_host_moe_shared", False))
     drafts = max(0, getattr(args, "dspark", 0))
     topk = max(model.topk, args.moe_experts)
-    # Ordinary decode warms powers of two plus the requested maximum. Every
-    # possible shortened verifier can get its own slot, also with adaptation off
-    # (the output limit may shorten the final proposal).
+    # Ordinary decode retains warmed powers of two. Verification replaces its
+    # previous shape before allocation, so reserve one maximum-sized workspace,
+    # not max_batch independent copies of that workspace.
     shapes = list(dict.fromkeys([1 << i for i in range(batch.bit_length())] + [batch]))
-    if hybrid and mode == "pp" and len(mapping) > 1 and drafts:
-        shapes = []  # PP DSpark captures verifier stages, not ordinary one-token forwards.
+    pipeline = mode == "pp" and len(mapping) > 1
+    if hybrid and pipeline and drafts:
+        shapes = []  # PP DSpark captures independent verifier stages.
     if drafts:
-        # A final one-token verifier has a separate slot from ordinary decode.
-        shapes.extend(range(1, drafts + 2))
-    if drafts and batch > 1 and (mode != "pp" or len(mapping) == 1):
-        # Joint verification has its own bounded LRU, with max_batch slots.
-        # Budget every slot at the largest possible aggregate row count: mixed
-        # output limits/confidence filtering can leave several near-maximum
-        # shapes resident at once. These coexist with the single-request and
-        # ordinary decode slots above, including after their requests finish.
-        shapes.extend([batch * (drafts + 1)] * batch)
+        shapes.extend(range(1, drafts + 2) if pipeline else [batch * (drafts + 1)])
     page_bytes = 64 * 1024
 
     def page(n):
@@ -1329,12 +1322,9 @@ def _v41_runtime_bytes(args, model, mode, mapping, resident, context, batch, chu
             if model.layers - 1 in owners:
                 result["graphs"][d] += page(rows * r["vocab"] * 4) * 3
         if draft_graphs and drafts and model.layers - 1 in owners:
-            # Request-owned single drafts coexist with model-owned batch slots.
-            # No request addresses are retained by a batch slot; it owns copied
-            # windows, inputs and conditional proposal probabilities instead.
-            draft_batches = [1] * batch
-            if len(mapping) == 1:
-                draft_batches.extend(range(2, batch + 1))
+            # Single-GPU requests share one model-owned draft shape, including
+            # batch=1. Other topologies retain their request-local draft graphs.
+            draft_batches = [batch] if len(mapping) == 1 else [1] * batch
             for requests in draft_batches:
                 rows = requests * model.dspark_block_size
                 result["graphs"][d] += small_q5_workspace(rows, [i for i in owners if i >= model.layers], d)
@@ -1350,6 +1340,10 @@ def _v41_runtime_bytes(args, model, mode, mapping, resident, context, batch, chu
                     result["graphs"][d] += page(routes * (4*model.hidden + 4*model.intermediate) + rows*model.hidden*2)
                     if i in r.get("gguf_layers", ()):
                         result["graphs"][d] += 2 * gguf_scratch
+            if len(mapping) == 1:
+                # Every request retains its own q through target verification,
+                # independent of the shared draft slot and later shape changes.
+                result["graphs"][d] += batch * page(model.dspark_block_size * r["vocab"] * 4)
             # Accepted-prefix context updates remain private to each request.
             for accepted in range(1, drafts + 2):
                 result["graphs"][d] += batch * page(accepted * model.hidden * (8 + 6*r["draft_layers"]))

@@ -142,6 +142,13 @@ namespace fastllm {
 #endif
     };
 
+    DeepSeekV41DsparkState::~DeepSeekV41DsparkState() {
+        // Graph executables retain pointers into layers and proposalProbs.
+        // Retire them before member destruction returns those buffers to pools.
+        workspace.reset();
+        contextWorkspaces.clear();
+    }
+
     namespace {
 #ifdef USE_CUDA
         thread_local bool dsparkCapturing = false;
@@ -187,6 +194,7 @@ namespace fastllm {
             };
             if (!state.execs.empty()) { launch(); return true; }
             if (state.disabled) return false;
+            FastllmCudaGraphPreparation preparation;
             body(); // Resolve weights, collective buffers and all kernel workspaces.
             if (state.disabled) return true; // Warmup already produced valid eager outputs.
             const int count = state.devices.size();
@@ -2263,7 +2271,7 @@ namespace fastllm {
             const double begin = DsTick();
             bool completed = false;
 #ifdef USE_CUDA
-            if (group.size() > 1 && v41DsparkTpDevices.empty() && DsDraftGraphEnabled()) {
+            if (v41DsparkTpDevices.empty() && DsDraftGraphEnabled() && compatible(group.front(), group.front())) {
                 ApplyDsparkDevice();
                 const int batch = int(group.size()), device = FastllmCudaGetDevice();
                 const std::vector<int> devices{device};
@@ -2276,8 +2284,15 @@ namespace fastllm {
                             layer.windowKV.dataDeviceIds == devices && !layer.windowKV.multiDeviceData;
                 }
                 if (local) {
+                    if (!v41DsparkBatches.count(batch)) {
+                        // Finish pending q copies before recycling the old
+                        // shape; its destructor destroys graphs before KV/q.
+                        if (!v41DsparkBatches.empty()) FastllmCudaSyncDevice(device);
+                        v41DsparkBatches.clear();
+                    }
                     auto &slot = v41DsparkBatches[batch];
                     if (!slot) slot = std::make_shared<DeepSeekV41DsparkState>();
+                    for (int request : group) states[request]->workspace.reset();
                     auto &storage = *slot;
                     storage.layers.resize(v41DsparkLayers);
                     for (int layer = 0; layer < v41DsparkLayers; ++layer) {

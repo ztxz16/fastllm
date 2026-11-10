@@ -433,7 +433,7 @@ void V41FullBindVerify(const std::shared_ptr<V41FullGraph> &owner, const DeepSee
         const bool submitted = V41FullDispatch(graph, [&](int rank, int) {
             ok[rank] = FastllmCudaV41CommitVerifiedPrefix(
                 static_cast<const FastllmV41VerifyCommitLayer *>(graph.commitDescriptors[rank].cudaData),
-                graph.endLayer - graph.firstLayer, accepted, rows, offset);
+                graph.endLayer - graph.firstLayer, accepted, rows, offset, graph.batch);
         });
         AssertInFastLLM(submitted && std::all_of(ok.begin(), ok.end(), [](int v) { return v != 0; }),
                         "full verifier KV commit failed");
@@ -474,8 +474,7 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
     // Decode and segmented verification share the attention backend's batch
     // capacity, including packed FP4/FP8 KV. Causality comes from each request's
     // chunk metadata, not a smaller verification-only scheduling limit.
-    const int batchLimit = FastllmV41FullDecodeMaxBatch;
-    if (batch < 1 || batch > batchLimit || (!hybrid && executionMode != ExecutionMode::Gpu) ||
+    if (batch < 1 || (!hybrid && executionMode != ExecutionMode::Gpu) ||
         (!verifying && std::any_of(segments.begin(), segments.end(),
             [](const DeepSeekV41Segment &seg) { return seg.spec != nullptr; })) ||
         (!hybrid && !distributedAttention && !attentionOnly && verifying &&
@@ -487,7 +486,7 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
         V41EnvFlag("FASTLLM_DSV41_LEGACY_ATTN") || V41EnvFlag("FASTLLM_DSV41_LEGACY_INDEXER") ||
         V41EnvFlag("FASTLLM_DSV41_LEGACY_TOPK") || V41EnvFlag("FASTLLM_DSV41_LEGACY_ROTARY"))
         return;
-    auto slot = v41CudaGraphSlots.find(verifying && !pipeline ? -(batch + (segments.size() > 1 ? FastllmV41FullDecodeMaxBatch : 0)) : graphKey);
+    auto slot = v41CudaGraphSlots.find(verifying && !pipeline ? FastllmV41VerificationGraphKey(batch, segments.size() > 1) : graphKey);
     if (slot == v41CudaGraphSlots.end())
         return;
     auto state = V41GetCudaGraphState(slot->second);
@@ -549,7 +548,7 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
                 model.v41AttentionLogicalRows = batch;
                 const int count = rows.localToGlobal[runtime.Layout().AttentionOwner(rank)].size();
                 model.BuildFullDecodeGraph(count, local[rank]);
-                const int key = verifying ? -count : count * 3 + (batch == 1 ? 0 : batch <= 8 ? 1 : 2);
+                const int64_t key = verifying ? FastllmV41VerificationGraphKey(count, local[rank].size() > 1) : int64_t(count) * 3 + (batch == 1 ? 0 : batch <= 8 ? 1 : 2);
                 auto found = model.v41CudaGraphSlots.find(key);
                 if (found == model.v41CudaGraphSlots.end()) return;
                 auto state = V41GetCudaGraphState(found->second);

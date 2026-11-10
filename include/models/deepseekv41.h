@@ -91,6 +91,7 @@ namespace fastllm {
 
     struct DeepSeekV41DsparkWorkspace;
     struct DeepSeekV41DsparkState {
+        ~DeepSeekV41DsparkState();
         std::shared_ptr<DeepSeekV41DsparkWorkspace> workspace;
         std::map<int, std::shared_ptr<DeepSeekV41DsparkWorkspace>> contextWorkspaces;
         std::vector<DeepSeekV41DsparkLayerCache> layers;
@@ -402,10 +403,10 @@ namespace fastllm {
         DeepSeekV41HistoryCacheManager v41HistoryCache;
 
         // -------- decode / DSpark 校验的 CUDA Graph --------
-        // 每种 token 数一份图与工作区，跨请求复用；KV 更新与回滚留在图外。
+        // 普通 decode 按行数缓存图；单卡验证只保留当前形状。KV 更新与回滚留在图外。
         // 捕获和回放共用互斥量，抢不到锁的前向退回逐算子。
         std::mutex v41CudaGraphMutex;
-        std::map<int, std::shared_ptr<void>> v41CudaGraphSlots;
+        std::map<int64_t, std::shared_ptr<void>> v41CudaGraphSlots;
         std::mutex v41PpDecodeMutex;
         bool v41CudaGraphWarmingUp = false;
         // One bounded eager verifier workspace, protected by v41CudaGraphMutex.
@@ -547,7 +548,8 @@ namespace fastllm {
         std::vector<int> v41DsparkTargetLayerIds;
         std::vector<int> v41DsparkTpDevices;
         std::shared_ptr<void> v41DsparkHeadWorkspace;
-        // Batch graphs own staging buffers; their addresses never depend on request lifetimes.
+        // One active draft shape, including single-request execution. Request
+        // KV and proposal probabilities remain private after each replay.
         std::map<int, std::shared_ptr<DeepSeekV41DsparkState>> v41DsparkBatches;
         std::vector<char> v41IsDsparkTarget;  // [block_cnt]
         std::vector<std::vector<Data*> > v41DsparkMoeWeights, v41DsparkMoeBiass;
