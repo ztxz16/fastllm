@@ -346,6 +346,65 @@ static void CheckPlannedQueryAgainstTokenQuery() {
     planned.EvictTrieSubtree(planned.trieRoot); planned.trieRoot = nullptr;
 }
 
+static void CheckCompanionCheckpointEviction() {
+    PagedCacheManager pool; pool.pageLen = 128; pool.SetMaxPages(16);
+    const auto useful = Tokens(1), orphan = Tokens(2000);
+    auto a = Publish(pool, useful);
+    const auto generation = pool.pageTimestamp[a.back()];
+    pool.RegisterPrefixCheckpoint(a.back(), generation);
+    pool.RegisterPrefixCheckpoint(a.back(), generation);
+    auto b = Publish(pool, orphan);
+    pool.RegisterPrefixCheckpoint(b.back(), pool.pageTimestamp[b.back()]);
+    pool.ReleasePrefixCheckpoint(b.back(), pool.pageTimestamp[b.back()]);
+    pool.ReleasePrefixCheckpoint(a.back(), generation); // Another snapshot still owns the boundary.
+    auto pressure = Allocate(pool, 4);
+    Require(Match(pool, useful) == 1024, "orphan suffix evicted a usable companion checkpoint");
+    Require(Match(pool, orphan) == 512, "unrestorable suffix was not reclaimed first");
+    CheckPoolPartition(pool);
+    pool.ReleasePageIndices(pressure);
+    pool.ReleasePrefixCheckpoint(a.back(), generation);
+    // A stale snapshot release must not erase a new checkpoint on a reused page.
+    pool.SetMaxPages(16);
+    auto fresh = Publish(pool, useful);
+    Require(fresh.back() == a.back(), "generation test did not reuse the physical page");
+    pool.RegisterPrefixCheckpoint(fresh.back(), pool.pageTimestamp[fresh.back()]);
+    pool.ReleasePrefixCheckpoint(a.back(), generation);
+    Publish(pool, orphan);
+    auto reclaimed = Allocate(pool, 4);
+    Require(Match(pool, useful) == 1024, "stale release removed a newer checkpoint");
+    auto pinned = fresh; pool.Pick(pinned);
+    pool.ReleasePrefixCheckpoint(fresh.back(), pool.pageTimestamp[fresh.back()]);
+    Require(Match(pool, useful) == 1024, "releasing a checkpoint removed referenced KV");
+    pool.ReleasePageIndices(pinned);
+    pool.ReleasePageIndices(reclaimed);
+    CheckPoolPartition(pool);
+    pool.EvictTrieSubtree(pool.trieRoot); pool.trieRoot = nullptr;
+}
+
+static void CheckRecentCheckpointAndPreparedLease() {
+    for (bool held : {false, true}) {
+        PagedCacheManager pool; pool.pageLen = 128; pool.SetMaxPages(1024);
+        const auto cold = Tokens(1, 32768), hot = Tokens(1000000, 98304);
+        auto old = Publish(pool, cold), recent = Publish(pool, hot);
+        pool.RegisterPrefixCheckpoint(old.back(), pool.pageTimestamp[old.back()]);
+        for (int n : {256, 752, 768})
+            pool.RegisterPrefixCheckpoint(recent[n-1], pool.pageTimestamp[recent[n-1]]);
+        // A short allocation must reclaim old idle history before destroying
+        // both recent boundaries and forcing 98K -> 32K recomputation.
+        Require(Match(pool, hot) == 98304, "missing recent fixture");
+        if (held) pool.Pick(recent);
+        auto pressure = Allocate(pool, held ? 256 : 17);
+        Require(Match(pool, hot) == 98304 &&
+                pool.IsCachedPage(recent.back(), pool.pageTimestamp[recent.back()]),
+                "idle history displaced a recent/prepared recovery point");
+        if (held) pool.ReleasePageIndices(recent);
+        pool.ReleasePageIndices(pressure);
+        Require(pool.FreePageCount() == 1024, "prepared reference was not released");
+        CheckPoolPartition(pool);
+        pool.EvictTrieSubtree(pool.trieRoot); pool.trieRoot = nullptr;
+    }
+}
+
 int main() {
     try {
         CheckPressure(false); CheckPressure(true);
@@ -355,6 +414,8 @@ int main() {
         CheckReboundPrefixPath();
         CheckPrefixPathAcrossPools();
         CheckSparsePagePicksAndReplacement();
+        CheckCompanionCheckpointEviction();
+        CheckRecentCheckpointAndPreparedLease();
         std::cout << "PAGED CACHE LRU PASS" << std::endl;
     } catch (const std::exception &error) {
         std::cerr << error.what() << std::endl;

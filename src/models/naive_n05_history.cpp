@@ -1,5 +1,6 @@
 #include "models/naive_n05_flash.h"
 #include <algorithm>
+#include <climits>
 #include "utils/inference_trace.h"
 #ifdef USE_CUDA
 #include "devices/cuda/fastllm-cuda.cuh"
@@ -105,13 +106,39 @@ NaiveN05FlashModel::PrefixSnapshots NaiveN05FlashModel::BeginPrefixSnapshots(
         for (const auto &entry : active->second.prefill) exists |= entry->length == boundary;
         if (active->second.decode) exists |= active->second.decode->length == boundary;
         if (exists) continue;
-        auto *replace = length == 1 ? &active->second.decode :
-            active->second.prefill.size() + result.size() >= MaxPrefillSnapshots
-                ? &active->second.prefill.front() : nullptr;
+        PrefixSnapshots *replaceList = nullptr;
+        size_t replaceIndex = 0;
+        auto *replace = length == 1 ? &active->second.decode : nullptr;
+        if (length > 1 && active->second.prefill.size() + result.size() >= MaxPrefillSnapshots) {
+            // Keep the newest boundary and spread the remaining checkpoints.
+            // Retaining only the last few pages makes a small tail eviction
+            // invalidate every SWA checkpoint of a long resident prefix.
+            std::vector<int> lengths;
+            for (const auto &entry : active->second.prefill) lengths.push_back(entry->length);
+            for (const auto &entry : result) lengths.push_back(entry->length);
+            int bestGap = INT_MAX;
+            size_t victim = 0;
+            for (size_t i = 0; i < lengths.size(); ++i) {
+                // Exact page-aligned repeats must leave a token for logits.
+                // Keep the preceding boundary as well as the new endpoint.
+                if (boundary == end && lengths[i] == end - page) continue;
+                std::vector<int> retained{0, boundary};
+                for (size_t j = 0; j < lengths.size(); ++j)
+                    if (j != i) retained.push_back(lengths[j]);
+                std::sort(retained.begin(), retained.end());
+                int gap = 0;
+                for (size_t j = 1; j < retained.size(); ++j)
+                    gap = std::max(gap, retained[j] - retained[j - 1]);
+                if (gap < bestGap) { bestGap = gap; victim = i; }
+            }
+            replaceList = victim < active->second.prefill.size() ? &active->second.prefill : &result;
+            replaceIndex = victim < active->second.prefill.size() ? victim : victim - active->second.prefill.size();
+            replace = &replaceList->at(replaceIndex);
+        }
         auto retire = [&]() {
             if (!replace) return;
             RetirePrefixSnapshot(*replace);
-            if (length > 1) active->second.prefill.erase(active->second.prefill.begin());
+            if (replaceList) replaceList->erase(replaceList->begin() + replaceIndex);
             replace = nullptr;
         };
         auto takeSlot = [&]() {
@@ -134,7 +161,11 @@ NaiveN05FlashModel::PrefixSnapshots NaiveN05FlashModel::BeginPrefixSnapshots(
             // Reclaim orphan windows before evicting a usable, recently used
             // checkpoint. Full KV and window pools share no physical copies.
             prefixHistory.erase(std::remove_if(prefixHistory.begin(), prefixHistory.end(),
-                [](const auto &entry) { return !entry->HasResidentPrefix(); }), prefixHistory.end());
+                [&](const auto &entry) {
+                    if (entry->HasResidentPrefix()) return false;
+                    ++prefixPool->orphanWindows;
+                    return true;
+                }), prefixHistory.end());
             slot = takeSlot();
         }
         // A continuation pins one checkpoint, but its previous request may
@@ -154,6 +185,7 @@ NaiveN05FlashModel::PrefixSnapshots NaiveN05FlashModel::BeginPrefixSnapshots(
         };
         for (auto it = prefixHistory.begin(); slot < 0 && it != prefixHistory.end();) {
             if (it->use_count() != 1 || !overlapsActivePrefix(*it)) { ++it; continue; }
+            ++prefixPool->recycledWindows;
             it = prefixHistory.erase(it);
             slot = takeSlot();
         }
@@ -161,10 +193,11 @@ NaiveN05FlashModel::PrefixSnapshots NaiveN05FlashModel::BeginPrefixSnapshots(
             // Evict only entries whose history reference owns the slot alone.
             // Erasing pinned entries loses valid hits without freeing memory.
             if (it->use_count() != 1) { ++it; continue; }
+            ++prefixPool->evictedWindows;
             it = prefixHistory.erase(it);
             slot = takeSlot();
         }
-        if (slot < 0) break; // All remaining checkpoints are held by live users.
+        if (slot < 0) { ++prefixPool->noWindowSlots; break; }
         // Keep a shared old checkpoint if no replacement could be allocated.
         retire();
         auto snapshot = std::make_shared<PrefixSnapshot>();
@@ -274,19 +307,31 @@ void NaiveN05FlashModel::TryRecordResponseContext(ResponseContext *context) {
         recordTrace.Next("history.snapshot_pool");
         if (!snapshot->fullPool) {
             for (int layer = 0; layer < block_cnt; ++layer) {
-                auto *manager = GetPagedKVCacheManager(layer, true);
-                if (!manager) continue;
-                const Data &root = context->pastKeyValues[layer].first;
-                auto local = root.multiDeviceDatas.find(tpDevices.front());
-                const Data &cache = local == root.multiDeviceDatas.end() ? root : *local->second;
-                const int index = snapshot->length / manager->pageLen - 1;
-                if (index >= 0 && index < (int)cache.pageIndex.size()) {
-                    std::lock_guard<std::mutex> lock(manager->pageIndexLocker);
-                    snapshot->fullPage = cache.pageIndex[index];
-                    snapshot->fullGeneration = manager->pageTimestamp[snapshot->fullPage];
-                    snapshot->fullPool = manager;
+                for (int part = 0; part < 2; ++part) {
+                    const Data &root = part ? context->pastKeyValues[layer].second : context->pastKeyValues[layer].first;
+                    for (auto [device, manager] : GetPagedKVCacheManagers(layer, !part)) {
+                        if (!manager) continue;
+                        auto local = root.multiDeviceDatas.find(device);
+                        const Data &cache = local == root.multiDeviceDatas.end() ? root : *local->second;
+                        const int index = snapshot->length / manager->pageLen - 1;
+                        if (index < 0 || index >= (int)cache.pageIndex.size()) continue;
+                        const int page = cache.pageIndex[index];
+                        long long generation;
+                        {
+                            std::lock_guard<std::mutex> lock(manager->pageIndexLocker);
+                            generation = manager->pageTimestamp[page];
+                        }
+                        // Register every layer/rank so allocation and preview
+                        // use the same policy across all TP cache pools.
+                        snapshot->checkpointPages.push_back({manager, page, generation});
+                        manager->RegisterPrefixCheckpoint(page, generation);
+                        if (!snapshot->fullPool) {
+                            snapshot->fullPool = manager;
+                            snapshot->fullPage = page;
+                            snapshot->fullGeneration = generation;
+                        }
+                    }
                 }
-                break;
             }
         }
         // A checkpoint is immutable after publication. Repeated calls refresh
@@ -298,6 +343,20 @@ void NaiveN05FlashModel::TryRecordResponseContext(ResponseContext *context) {
                                          entry->tokens == snapshot->tokens);
         }), prefixHistory.end());
         prefixHistory.push_back(snapshot);
+    }
+    if (verbose) {
+        PagedCacheManager::CacheStatistics stats;
+        for (int layer = 0; layer < block_cnt; ++layer) {
+            if (auto *pool = GetPagedKVCacheManager(layer, true)) { stats = pool->CacheStats(); break; }
+        }
+        std::cout << "[Naive prefix cache] full_capacity_pages=" << stats.capacityPages
+                  << " full_free_pages=" << stats.freePages << " full_unused_pages=" << stats.unusedCachedPages
+                  << " full_evicted_pages=" << stats.pressureEvictedPages
+                  << " window_entries=" << prefixHistory.size()
+                  << " window_evictions=" << prefixPool->evictedWindows
+                  << " orphan_windows=" << prefixPool->orphanWindows
+                  << " recycled_windows=" << prefixPool->recycledWindows
+                  << " no_window_slots=" << prefixPool->noWindowSlots << std::endl;
     }
 }
 

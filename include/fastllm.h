@@ -862,17 +862,31 @@ namespace fastllm {
             // This may evict unreferenced cache entries, but never reserves pages.
             void PreviewUnusedPageIndices(int count, std::vector<int> &pages);
             bool IsCachedPage(int pageIndex, long long generation);
+            // Models with bounded companion state register exact restorable
+            // boundaries. Prefer reclaiming unused suffixes beyond those
+            // boundaries; ordinary paged caches retain their existing LRU.
+            void RegisterPrefixCheckpoint(int pageIndex, long long generation);
+            void ReleasePrefixCheckpoint(int pageIndex, long long generation);
+            struct CacheStatistics {
+                size_t capacityPages = 0, freePages = 0, unusedCachedPages = 0;
+                uint64_t pressureEvictedPages = 0;
+            };
+            CacheStatistics CacheStats();
 
         private:
             uint64_t nextTrieNodeId = 0;
             uint64_t prefixBindingVersion = 0;
             CacheTrieNode *FindPrefixLocked(const std::vector<uint64_t> &hashes, PagedPrefixMatch &match);
             std::set<std::pair<long long, int>> evictableLeaves;
+            std::set<std::pair<long long, int>> unrestorableLeaves;
+            std::unordered_map<int, int> prefixCheckpoints;
+            bool requirePrefixCheckpoints = false;
             void UpdateEvictableLeaf(CacheTrieNode *node);
             void TouchTrieNode(CacheTrieNode *node, long long access);
             void RemoveTriePage(int pageIndex);
             void ReleasePageIndexLocked(int pageIndex);
             void PrepareFreePages(int count);
+            uint64_t pressureEvictedPages = 0;
     };
 
     struct PartitionLinkNode {

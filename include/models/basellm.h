@@ -712,6 +712,8 @@ namespace fastllm {
         virtual std::vector<int> PDDevices() const;
         virtual bool HasPDResidentPrefixCache() const { return false; }
         int RestorePDResidentPrefix(ResponseContext *context);
+        // Metadata-only routing hint; does not pin pages or restore GPU state.
+        int PreviewPDResidentPrefix(const std::vector<int> &tokens);
         fastkv::BufferPool *PDExportPool() const;
         virtual fastkv::Message ExportPDState(ResponseContext &context);
         virtual void ImportPDState(ResponseContext &context, const fastkv::Message &state);

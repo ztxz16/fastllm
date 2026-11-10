@@ -127,6 +127,7 @@ namespace fastllm {
             size_t DraftOffset(int slot) const { return size_t(slot / draftStorage.size()) * draftSlotBytes; }
             // Serialized by historyMutex. Metadata previews never own slots.
             uint64_t historyVersion = 0;
+            uint64_t orphanWindows = 0, evictedWindows = 0, recycledWindows = 0, noWindowSlots = 0;
             int SlotCount(int requests, int64_t budget) const {
                 if (!slotBytes) return 0;
                 // Reserve all active checkpoints before spending spare budget
@@ -148,10 +149,18 @@ namespace fastllm {
             PagedCacheManager *fullPool = nullptr;
             int fullPage = -1;
             long long fullGeneration = 0;
+            struct CheckpointPage {
+                PagedCacheManager *pool;
+                int page;
+                long long generation;
+            };
+            std::vector<CheckpointPage> checkpointPages;
             bool HasResidentPrefix() const {
                 return fullPool && fullPool->IsCachedPage(fullPage, fullGeneration);
             }
             ~PrefixSnapshot() {
+                for (const auto &entry : checkpointPages)
+                    entry.pool->ReleasePrefixCheckpoint(entry.page, entry.generation);
                 if (pool && slot >= 0) {
                     std::lock_guard<std::mutex> lock(pool->mutex);
                     pool->freeSlots.push_back(slot);

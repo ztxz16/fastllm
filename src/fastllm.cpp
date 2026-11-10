@@ -6027,6 +6027,8 @@ namespace fastllm {
         this->maxPages = maxPages;
         freePages.clear(); triePages.clear();
         evictableLeaves.clear();
+        unrestorableLeaves.clear();
+        prefixCheckpoints.clear();
         pageToTrieNode.assign(maxPages, nullptr);
         freePageFlags.assign(maxPages, 1);
         freePages.reserve(maxPages);
@@ -6037,20 +6039,32 @@ namespace fastllm {
         pageRefCount.assign(maxPages, 0);
         // Keep generations monotonic across pool resets as well as page reuse.
         trieRoot = new CacheTrieNode();
+        pressureEvictedPages = 0;
     }
 
     void PagedCacheManager::UpdateEvictableLeaf(CacheTrieNode *node) {
         if (!node || node->pageId < 0) return;
-        if (node->evictable) evictableLeaves.erase({node->lastAccess, node->pageId});
+        if (node->evictable) {
+            evictableLeaves.erase({node->lastAccess, node->pageId});
+            unrestorableLeaves.erase({node->lastAccess, node->pageId});
+        }
         node->evictable = pageRefCount[node->pageId] == 0 && !node->HasChildren();
-        if (node->evictable)
+        if (node->evictable) {
             evictableLeaves.insert({node->lastAccess, node->pageId});
+            if (requirePrefixCheckpoints && !prefixCheckpoints.count(node->pageId))
+                unrestorableLeaves.insert({node->lastAccess, node->pageId});
+        }
     }
 
     void PagedCacheManager::TouchTrieNode(CacheTrieNode *node, long long access) {
         // Matching changes recency, not references or trie topology. Internal
         // nodes need no leaf-set work; retain the allocation for an actual leaf.
         if (node->evictable) {
+            auto unrestorable = unrestorableLeaves.extract({node->lastAccess, node->pageId});
+            if (!unrestorable.empty()) {
+                unrestorable.value().first = access;
+                unrestorableLeaves.insert(std::move(unrestorable));
+            }
             auto entry = evictableLeaves.extract({node->lastAccess, node->pageId});
             entry.value().first = access;
             evictableLeaves.insert(std::move(entry));
@@ -6076,7 +6090,11 @@ namespace fastllm {
         } else if (node->singleChild) EvictTrieSubtree(node->singleChild);
         const int pid = node->pageId;
         if (pid >= 0) {
-            if (node->evictable) evictableLeaves.erase({node->lastAccess, pid});
+            if (node->evictable) {
+                evictableLeaves.erase({node->lastAccess, pid});
+                unrestorableLeaves.erase({node->lastAccess, pid});
+            }
+            prefixCheckpoints.erase(pid);
             RemoveTriePage(pid);
             pageToTrieNode[pid] = nullptr;
             pageTimestamp[pid] = ++currentTimestamp;
@@ -6093,7 +6111,9 @@ namespace fastllm {
             if (triePages.empty())
                 ErrorInFastLLM("PagedCacheManager: no unused page available.\n");
             CacheTrieNode *node = nullptr;
-            if (!evictableLeaves.empty()) {
+            if (!unrestorableLeaves.empty()) {
+                node = pageToTrieNode.at(unrestorableLeaves.begin()->second);
+            } else if (!evictableLeaves.empty()) {
                 node = pageToTrieNode.at(evictableLeaves.begin()->second);
             } else {
                 // Defensive fallback for callers retaining only a suffix of a
@@ -6106,9 +6126,16 @@ namespace fastllm {
             }
             CacheTrieNode *parent = node->parent;
             if (parent) parent->EraseChild(node->edgeHash);
+            const size_t cachedBefore = triePages.size();
             EvictTrieSubtree(node);
+            pressureEvictedPages += cachedBefore - triePages.size();
             UpdateEvictableLeaf(parent);
         }
+    }
+
+    PagedCacheManager::CacheStatistics PagedCacheManager::CacheStats() {
+        std::lock_guard<std::mutex> guard(pageIndexLocker);
+        return {size_t(maxPages), freePages.size(), triePages.size(), pressureEvictedPages};
     }
 
     int PagedCacheManager::GetUnusedPageIndex(bool pick) {
@@ -6119,6 +6146,7 @@ namespace fastllm {
             freePages.pop_back();
             freePageFlags[pageIndex] = 0;
             pageRefCount[pageIndex] = 1;
+            prefixCheckpoints.erase(pageIndex);
             pageTimestamp[pageIndex] = ++currentTimestamp;
         }
         return pageIndex;
@@ -6135,6 +6163,30 @@ namespace fastllm {
         std::lock_guard<std::mutex> guard(pageIndexLocker);
         auto *node = pageIndex >= 0 && pageIndex < maxPages ? pageToTrieNode[pageIndex] : nullptr;
         return node && pageTimestamp[pageIndex] == generation && node->timestamp == generation;
+    }
+
+    void PagedCacheManager::RegisterPrefixCheckpoint(int pageIndex, long long generation) {
+        std::lock_guard<std::mutex> guard(pageIndexLocker);
+        AssertInFastLLM(pageIndex >= 0 && pageIndex < maxPages && generation > 0 &&
+                       pageTimestamp[pageIndex] == generation && !freePageFlags[pageIndex],
+                       "Invalid prefix checkpoint page.\n");
+        if (!requirePrefixCheckpoints) {
+            requirePrefixCheckpoints = true;
+            unrestorableLeaves = evictableLeaves;
+        }
+        ++prefixCheckpoints[pageIndex];
+        UpdateEvictableLeaf(pageToTrieNode[pageIndex]);
+    }
+
+    void PagedCacheManager::ReleasePrefixCheckpoint(int pageIndex, long long generation) {
+        std::lock_guard<std::mutex> guard(pageIndexLocker);
+        // A snapshot can outlive eviction, rebinding, or a pool reset. Never
+        // remove a checkpoint belonging to a later use of the physical page.
+        if (pageIndex < 0 || pageIndex >= maxPages || pageTimestamp[pageIndex] != generation) return;
+        auto it = prefixCheckpoints.find(pageIndex);
+        if (it == prefixCheckpoints.end()) return;
+        if (--it->second == 0) prefixCheckpoints.erase(it);
+        UpdateEvictableLeaf(pageToTrieNode[pageIndex]);
     }
 
     void PagedCacheManager::ReleasePageIndexLocked(int pageIndex) {
@@ -6240,7 +6292,10 @@ namespace fastllm {
                 cur->AddChild(child);
                 UpdateEvictableLeaf(cur);
             } else {
-                if (child->evictable) evictableLeaves.erase({child->lastAccess, child->pageId});
+                if (child->evictable) {
+                    evictableLeaves.erase({child->lastAccess, child->pageId});
+                    unrestorableLeaves.erase({child->lastAccess, child->pageId});
+                }
                 child->evictable = false;
                 if (child->pageId >= 0 && child->pageId != pid) {
                     // Identical prefix contents can move to another physical

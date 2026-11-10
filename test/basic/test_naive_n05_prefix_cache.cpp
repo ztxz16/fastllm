@@ -288,6 +288,85 @@ struct NaiveN05PrefixCacheTestAccess : NaiveN05FlashModel {
         }
     }
 
+    static void PressureTelemetry() {
+        for (bool fullPressure : {false, true}) {
+            NaiveN05PrefixCacheTestAccess model(3);
+            auto *pool = model.GetPagedKVCacheManager(0, true);
+            if (fullPressure) pool->SetMaxPages(66);
+            auto first = model.Request(1);
+            model.Checkpoint(*first, 0, 8192); model.Checkpoint(*first, 8192, 200);
+            model.Publish(*first); model.Drain(*first);
+            const auto refs = pool->pageRefCount;
+            Require(model.PreviewPDResidentPrefix(first->currentTokens) == 8320,
+                    "PD resident preview did not include window boundary");
+            Require(pool->pageRefCount == refs, "PD routing preview acquired KV references");
+            auto second = model.Request(2);
+            model.Checkpoint(*second, 0, 8192); model.Checkpoint(*second, 8192, 200);
+            model.Publish(*second); model.Drain(*second);
+            if (fullPressure) {
+                Require(pool->CacheStats().pressureEvictedPages == 66 && model.prefixPool->orphanWindows > 0,
+                        "full KV pressure was not distinguished from window eviction");
+                Require(model.PreviewPDResidentPrefix(first->currentTokens) == 0, "routing revived evicted KV");
+            } else {
+                Require(pool->CacheStats().pressureEvictedPages == 0 && model.prefixPool->evictedWindows > 0,
+                        "window-only pressure changed full KV eviction metrics");
+            }
+        }
+    }
+
+    static void AlignedExactRepeat() {
+        for (int length : {12288, 16384, 65536}) {
+            NaiveN05PrefixCacheTestAccess model(3);
+            auto c = model.Request(1);
+            auto *pool = model.GetPagedKVCacheManager(0, true);
+            c->allTokens.resize(length, 101); c->currentTokens = c->allTokens;
+            auto &pages = c->pastKeyValues[0].first.pageIndex;
+            while ((int)pages.size() < length / 128) pages.push_back(pool->GetUnusedPageIndex(true));
+            for (int past = 0; past < length; past += 4096) model.Checkpoint(*c, past, 4096);
+            model.Publish(*c); model.Drain(*c);
+            Require(model.PreviewPDResidentPrefix(c->currentTokens) == length - 128,
+                    "aligned repeat lost the boundary needed for logits");
+        }
+    }
+
+    static void PartialTailEviction() {
+        NaiveN05PrefixCacheTestAccess model(3);
+        auto *pool = model.GetPagedKVCacheManager(0, true);
+        pool->SetMaxPages(66);
+        auto c = model.Request(1);
+        model.Checkpoint(*c, 0, 4096);
+        model.Checkpoint(*c, 4096, 4096);
+        model.Checkpoint(*c, 8192, 200);
+        model.Publish(*c); model.Drain(*c);
+        Require(model.FullHit(*c) == 8448 && model.WindowHit(*c) == 8320, "initial checkpoint changed");
+        std::vector<int> allocated;
+        for (int i = 0; i < 4; ++i) allocated.push_back(pool->GetUnusedPageIndex(true));
+        Require(model.FullHit(*c) == 7936, "tail eviction removed too much full KV");
+        Require(model.WindowHit(*c) >= 3968 && model.PreviewPDResidentPrefix(c->currentTokens) >= 3968,
+                "small tail eviction invalidated every recovery checkpoint");
+        Require(model.prefixHistory.size() <= 3, "checkpoint retention increased GPU slot budget");
+        pool->ReleasePageIndices(allocated);
+    }
+
+    static void RetiredWindowReclaimsUnusablePages() {
+        NaiveN05PrefixCacheTestAccess model(8);
+        auto *pool = model.GetPagedKVCacheManager(0, true);
+        pool->SetMaxPages(132);
+        auto old = model.Request(1);
+        model.Checkpoint(*old, 0, 8192); model.Publish(*old); model.Drain(*old);
+        auto orphan = model.Request(2);
+        model.Checkpoint(*orphan, 0, 8192); model.Publish(*orphan); model.Drain(*orphan);
+        model.prefixHistory.erase(std::remove_if(model.prefixHistory.begin(), model.prefixHistory.end(),
+            [&](const auto &entry) { return entry->tokens.front() == orphan->allTokens.front(); }), model.prefixHistory.end());
+        std::vector<int> allocated;
+        for (int i = 0; i < 16; ++i) allocated.push_back(pool->GetUnusedPageIndex(true));
+        Require(model.PreviewPDResidentPrefix(old->currentTokens) == 8192,
+                "newer unusable full KV displaced an older recoverable conversation");
+        Require(model.PreviewPDResidentPrefix(orphan->currentTokens) == 0,
+                "restored a prefix whose companion state was retired");
+        pool->ReleasePageIndices(allocated);
+    }
+
     static void RollingConversations() {
         for (int count : {2, 8, 400}) {
             NaiveN05PrefixCacheTestAccess model(count * 4);
@@ -349,6 +428,10 @@ int main() {
         fastllm::NaiveN05PrefixCacheTestAccess::EvictCompletedOnly();
         fastllm::NaiveN05PrefixCacheTestAccess::SharedReplacement();
         fastllm::NaiveN05PrefixCacheTestAccess::RollingConversations();
+        fastllm::NaiveN05PrefixCacheTestAccess::PressureTelemetry();
+        fastllm::NaiveN05PrefixCacheTestAccess::AlignedExactRepeat();
+        fastllm::NaiveN05PrefixCacheTestAccess::PartialTailEviction();
+        fastllm::NaiveN05PrefixCacheTestAccess::RetiredWindowReclaimsUnusablePages();
         std::cout << "PREFIX CACHE PASS: capacity, pinned pressure, 400 independent prefixes, completed LRU\n";
     } catch (const std::exception &e) {
         std::cerr << e.what() << "\n";

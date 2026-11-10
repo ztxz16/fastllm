@@ -1862,6 +1862,28 @@ namespace fastllm {
         return context->cacheLen;
     }
 
+    int basellm::PreviewPDResidentPrefix(const std::vector<int> &tokens) {
+        if (!HasPDResidentPrefixCache() || tokens.empty()) return 0;
+        // Topology is fixed before PD starts. Each manager and companion-state
+        // query takes its own metadata lock; no GPU work or forward lock here.
+        ResidentPrefixManagers plan;
+        plan.Init(this);
+        if (!plan.probe || plan.probe->pageLen <= 0) return 0;
+        ResponseContext context;
+        context.currentTokens = tokens;
+        PrefillPrefixPreview preview;
+        preview.Reset(tokens);
+        const int page = plan.probe->pageLen;
+        const auto &hashes = preview.Hashes(page);
+        int pages = (tokens.size() - 1) / page;
+        for (auto *manager : plan.managers) {
+            pages = std::min(pages, manager->PreviewPrefix(hashes, preview.matches[manager]));
+            if (!pages) return 0;
+        }
+        return std::max(0, std::min(pages * page,
+            PreviewPagedPrefixCacheExtra(&context, pages * page, preview))) / page * page;
+    }
+
     static PagedCacheManager *RestoreResidentPrefix(basellm *model, ResponseContext *ctx) {
 #ifdef USE_CUDA
         try {
