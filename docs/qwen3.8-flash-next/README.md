@@ -171,6 +171,18 @@ ftllm server "$MODEL" "${COMMON[@]}" \
 
 MTP 需要模型目录中包含匹配的 MTP 权重，主干运行在 CUDA，专家可使用 CUDA 或 NUMA。`--mtp` 最大为 8；可以先使用 3，实际收益取决于任务和草稿接受情况。双卡 TP 示例使用贪婪采样，即 `--temperature 0 --top_k 1 --repeat_penalty 1`。
 
+### 并发与批量验证
+
+单卡 GGUF 的 `--auto` 会启用完整混推图的准备流程，由后端检查设备及算子能力，不再仅限 SM75；不可用的图仍保留原回退。NVFP4 的整图收益在本轮并发实测中不稳定，批量专家优化可用于分段图，自动图策略保留原条件。双卡分工及 prefill 策略保持各自原有条件。
+
+混合推理中的 NVFP4（16 元素块、E4M3 缩放）把一次 MTP 验证的多行专家投影合并启动；受支持的 GGUF IQ 专家还可按专家分组，跨验证行复用权重解码。驻留与动态分流分支使用独立工作区，保持原有量化、归约和 NUMA 计算语义；不需要额外的调优环境变量。物理 tile 大小不限制逻辑验证行数。
+
+GGUF 可用 `--kernel-tune quick` 在捕图前按格式、形状和设备测速并校验；默认 `off` 保留原核。算子族 `moe.gguf.gate_swiglu_down` 提供 `cuda.moe.gguf.q8`、`cuda.moe.gguf.grouped` 和 `cuda.moe.gguf.grouped_shared`，分别为原 Q8 路径、分组复用、分组并暂存激活。启动日志输出选择结果；策略参数及保存、禁用、强制选项见[算子自动调优](../kernel-policy.md)。较小批量可能继续选用原核，较大批量是否获益由实测决定。预热使用当前层已驻留的专家记录及固定输入，不消耗请求采样状态。
+
+`--max_batch` 控制同时接纳的请求数，`--max_context_length` 控制单请求上限，`--tokens` 控制共享 KV 池的总 token 预算。例如 `--max_batch 4 --max_context_length 8192 --tokens 32768` 为四个请求规划总容量，实际仍受可用显存限制。需要固定为 48 层 NUMA 专家混推时，可显式指定 `--moe_device numa --moe_device_layers 48`。
+
+当前 Flash-Next 按请求执行前向和 MTP；多个请求的验证尚未合并成一次模型前向。因此提高并发不保证吞吐同比增长。评测时应区分所有请求同时 decode 的吞吐、包含其他请求 prefill 等待的流式总耗时，以及单轮验证耗时。
+
 ### 内存与上下文
 
 主机内存紧张时使用 `--ngram_device disk`。显存不足时，先减小专家缓存或 GPU 驻留层数，再根据请求长度调整 KV 预算、分块大小和并发数。

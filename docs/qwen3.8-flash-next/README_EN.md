@@ -169,6 +169,18 @@ Fixed placement allocates VRAM for every expert in selected layers. Dynamic cach
 
 MTP requires matching MTP weights in the model directory and a CUDA backbone. Experts may run on CUDA or NUMA. The maximum `--mtp` value is 8; start with 3 and adjust for your workload. Speed depends on draft acceptance. The two-GPU TP examples use greedy sampling: `--temperature 0 --top_k 1 --repeat_penalty 1`.
 
+### Concurrency and batched verification
+
+For GGUF on one GPU, `--auto` prepares full hybrid graphs using backend capability checks, without an SM75-only gate. Unavailable graphs retain the existing fallback. Full-graph NVFP4 gains were inconsistent in these concurrency measurements, so native formats retain their previous automatic graph policy while benefiting from batched experts in segmented graphs. Two-GPU ownership and prefill policies keep their independent conditions.
+
+Hybrid NVFP4 experts (16-element blocks with E4M3 scales) launch expert projections for the whole MTP verification batch together. Supported GGUF IQ experts offer grouped candidates that reuse decoded weights across verifier rows. Resident and dynamically staged branches have separate workspaces and preserve existing quantization, reduction and NUMA arithmetic. No extra tuning environment variable is required. Physical tile sizes do not cap the logical verifier row count.
+
+For GGUF, `--kernel-tune quick` benchmarks and validates each format, shape and device before capture; the default `off` retains the existing kernel. Family `moe.gguf.gate_swiglu_down` offers `cuda.moe.gguf.q8`, `cuda.moe.gguf.grouped` and `cuda.moe.gguf.grouped_shared`: the reference Q8 path, decoded-weight reuse, and reuse with staged activations. Startup logs report the selection. See [kernel tuning](../kernel-policy.md) for policy, profile, deny and force options. Small batches may retain the reference; gains at larger batches depend on measurements. Warmup uses resident experts from the current layer and fixed inputs without consuming request sampling state.
+
+`--max_batch` controls concurrent admission, `--max_context_length` bounds each request, and `--tokens` sets the aggregate shared KV token budget. For example, `--max_batch 4 --max_context_length 8192 --tokens 32768` plans capacity for four requests, subject to available VRAM. To keep all 48 expert layers on the NUMA hybrid path, set `--moe_device numa --moe_device_layers 48` explicitly.
+
+Flash-Next currently executes forward and MTP per request; it does not combine verification from multiple requests into one model forward. Higher concurrency therefore does not guarantee proportional throughput growth. Report shared decode throughput separately from stream duration that includes other requests' prefill waits and from verification latency per round.
+
 ### Memory and context length
 
 Use `--ngram_device disk` when host memory is limited. If VRAM is insufficient, reduce the expert cache or GPU-resident layer count, then adjust KV capacity, chunk size, and concurrency for your requests.
