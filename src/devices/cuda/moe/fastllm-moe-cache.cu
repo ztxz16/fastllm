@@ -2093,6 +2093,8 @@ bool SupportsNVFP4WideDecode(const OffloadLayout &l) {
         l.downBlockM == 16 && l.hidden % 128 == 0 && l.inter % 128 == 0;
 }
 
+#include "fastllm-moe-nvfp4-batch.cuh"
+
 template <typename T>
 bool LaunchNVFP4Cache(const fastllm::Data &input, fastllm::Data &gateOutput,
                        fastllm::Data &output, const OffloadLayout &layout,
@@ -3946,6 +3948,8 @@ struct Mxfp4KernelContext {
 static bool ComputeBatchExperts(const fastllm::Data &input, fastllm::Data &activation,
         fastllm::Data &output, const OffloadLayout &layout, const FastllmCudaMoeGGUFCacheView &view,
         const float *scores, int topk, float *perExpert, bool grouped = false) {
+    if (layout.weightType == fastllm::NVFP4_BLOCK_16_E4M3)
+        return ComputeNVFP4Batch(input, activation, layout, view, topk, perExpert);
     if (layout.weightType == fastllm::EXL3)
         return FastllmCudaExl3Cache(input, view.records, view.routeSlots, view.slotOffsets,
             layout.recordStride, layout.downOffset, layout.inter, layout.gateBlockK, layout.downBlockK,

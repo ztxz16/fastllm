@@ -199,7 +199,7 @@ static void Run(int gateKind, int downKind, int hidden = 256, int inter = 128, i
     const std::vector<DataType> types = qwenTopk10 ? std::vector<DataType>{FLOAT16}
                                                  : std::vector<DataType>{FLOAT32, FLOAT16, BFLOAT16};
     const std::vector<int> rowCounts = overlapReplay ? std::vector<int>{1, 3} :
-        qwenTopk10 ? std::vector<int>{1, 2, 3, 4, 9} : std::vector<int>{1, 2, 4, 8};
+        qwenTopk10 ? std::vector<int>{1, 2, 3, 4, 9, 17} : std::vector<int>{1, 2, 4, 8};
     for (DataType dtype : types) for (int rows : rowCounts) {
         Data input(dtype, {rows, hidden}), ids[layers], scores[layers], output[layers]; Gpu(input);
         for (int layer = 0; layer < layers; ++layer) {
@@ -220,7 +220,7 @@ static void Run(int gateKind, int downKind, int hidden = 256, int inter = 128, i
             handles[layer] = FastllmCudaCreateNativeMoeFullGraph(layer ? output[0] : input,
                 ids[layer], scores[layer], output[layer], weights[layer].data(), weights[layer].size(), layer,
                 nullptr, &children[layer]);
-            Require(handles[layer] && children[layer], "create Standard mailbox child");
+            Require(handles[layer] && children[layer], ("create Standard mailbox child dtype=" + std::to_string(dtype) + " rows=" + std::to_string(rows)).c_str());
         }
         HybridMoeGraph managed;
         if (qwenTopk10) {
@@ -317,10 +317,19 @@ static void Run(int gateKind, int downKind, int hidden = 256, int inter = 128, i
                     auto &oracle = native ? referenceWeights[layer] : weights[layer];
                     // The candidate is already captured; keep the eager GPU
                     // oracle on its original full-warp projection.
-                    Require(FastllmCudaMergeMOECache(referenceInput,gate,result,oracle.data(),
-                        oracle.size(),static_cast<int32_t*>(ids[layer].cudaData),
-                        static_cast<float*>(referenceScores.cudaData),topk),"GPU expert oracle");
-                    Cuda(cudaMemcpy(values.data(),result.cudaData,values.size()*4,cudaMemcpyDeviceToHost));
+                    // The legacy eager cache entry has a bounded verifier
+                    // workspace. Use independent one-row oracle calls so the
+                    // graph regression can exercise arbitrary batch lengths.
+                    for (int row=0;row<rows;++row) {
+                        Data oneInput;
+                        oneInput.FakeFrom(referenceInput,size_t(row)*hidden*sizeof(float));
+                        oneInput.Resize({1,hidden});
+                        Require(FastllmCudaMergeMOECache(oneInput,gate,result,oracle.data(),
+                            oracle.size(),static_cast<int32_t*>(ids[layer].cudaData)+row*topk,
+                            static_cast<float*>(referenceScores.cudaData)+row*topk,topk),"GPU expert oracle");
+                        Cuda(cudaMemcpy(values.data()+size_t(row)*hidden,result.cudaData,
+                            size_t(hidden)*sizeof(float),cudaMemcpyDeviceToHost));
+                    }
                     for (int row=0;row<rows;++row)
                         std::copy_n(values.data()+row*hidden,hidden,gpu.data()+(row*topk+k)*hidden);
                 }

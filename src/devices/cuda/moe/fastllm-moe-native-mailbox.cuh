@@ -636,6 +636,19 @@ struct NativeMoeMailbox {
     bool ComputeStandard(Layer &w, const OffloadLayout &layout, const uint8_t *records,
             const int32_t *slots, const float *scores, bool resident) {
         const int branch = resident ? 0 : 1;
+        if (layout.weightType == fastllm::NVFP4_BLOCK_16_E4M3 && w.rows > 1 &&
+                SupportsNVFP4WideDecode(layout)) {
+            fastllm::Data gate;
+            gate.FakeFrom(w.compute->gate, size_t(branch) * w.routes * layout.inter * sizeof(float));
+            gate.Resize({w.routes, layout.inter});
+            FastllmCudaMoeGGUFCacheView view{};
+            view.records = records; view.routeSlots = slots;
+            view.recordStride = layout.recordStride; view.downOffset = layout.downOffset;
+            view.hidden = w.hidden; view.inter = layout.inter; view.routeCount = w.routes;
+            view.slotOffsets = resident ? cache.slotOffsets : nullptr;
+            return ComputeNVFP4Batch(w.compute->quantized, gate, layout, view, w.topk,
+                w.compute->partial + size_t(branch) * w.routes * w.hidden);
+        }
         if (layout.weightType == fastllm::DATA_GGUF_FORMAT && w.rows > 1) {
             // Keep verifier rows in the same projection launch. Splitting
             // them into single-row graphs repeats quantization and dispatch
