@@ -15,6 +15,7 @@ class CapturingModel(FakeQwen35Model):
 
     def launch_stream_response(self, *args, **kwargs):
         self.captured_launch_kwargs = dict(kwargs)
+        kwargs.pop("session_key", None)
         return super().launch_stream_response(*args, **kwargs)
 
 
@@ -32,6 +33,19 @@ class CompletionTokenLimitTest(unittest.TestCase):
     def request(self, **fields):
         return self.client.post('/v1/chat/completions', json={
             'model': 'qwen3.5', 'messages': [{'role': 'user', 'content': 'hello'}], **fields})
+
+    def test_session_metadata_reaches_launch_without_leaking(self):
+        for route, body in (
+            ('/v1/chat/completions', {'messages': [{'role': 'user', 'content': 'hello'}]}),
+            ('/v1/responses', {'input': 'hello'}),
+            ('/v1/messages', {'messages': [{'role': 'user', 'content': 'hello'}], 'max_tokens': 16}),
+        ):
+            for headers, expected in (({'X-Session-Id': 'a'}, 'a'),
+                                      ({'X-SMG-Routing-Key': 'b'}, 'b'), ({}, None)):
+                with self.subTest(route=route, expected=expected):
+                    response = self.client.post(route, headers=headers, json={'model': 'qwen3.5', **body})
+                    self.assertEqual(response.status_code, 200, response.text)
+                    self.assertEqual(self.model.captured_launch_kwargs.get('session_key'), expected)
 
     def test_modern_and_legacy_fields_reach_native_generation(self):
         for stream in (False, True):

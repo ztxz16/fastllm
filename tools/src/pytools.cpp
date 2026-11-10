@@ -1020,10 +1020,10 @@ extern "C" {
         return string_to_chars(s);
     }
 
-    DLL_EXPORT int launch_response_str_llm_model(int modelId, char *content,
+    DLL_EXPORT int launch_response_str_llm_model_with_session(int modelId, char *content,
                                       int max_length, int min_length, bool do_sample, float top_p, int top_k,
                                       float temperature, float repeat_penalty, bool output_logits,
-                                      int stop_token_len, int * stop_token_ids) {
+                                      int stop_token_len, int * stop_token_ids, const char *session_key) {
         auto model = models.GetModel(modelId);
         std::vector <int> tokens;
         auto v = model->weight.tokenizer.Encode(content);
@@ -1037,7 +1037,15 @@ extern "C" {
         {
             config.stop_token_ids.insert(stop_token_ids[i]);
         }
-        return model->LaunchResponseTokens(tokens, config);
+        return model->LaunchResponseTokens(tokens, config, {}, {session_key ? session_key : ""});
+    }
+
+    DLL_EXPORT int launch_response_str_llm_model(int modelId, char *content,
+                                      int max_length, int min_length, bool do_sample, float top_p, int top_k,
+                                      float temperature, float repeat_penalty, bool output_logits,
+                                      int stop_token_len, int * stop_token_ids) {
+        return launch_response_str_llm_model_with_session(modelId, content, max_length, min_length, do_sample, top_p, top_k,
+            temperature, repeat_penalty, output_logits, stop_token_len, stop_token_ids, nullptr);
     }
 
     // 尝试fetch，如果能fetch成功则返回true（后续需要fetch一下)，用于异步操作
@@ -1123,10 +1131,10 @@ extern "C" {
         } catch (const std::exception &e) { fastllmPytoolsCloverError = e.what(); return -1; }
     }
 
-    DLL_EXPORT int launch_response_llm_model(int modelId, int len, int *values,
+    DLL_EXPORT int launch_response_llm_model_with_session(int modelId, int len, int *values,
                                   int max_length, int min_length, bool do_sample, float top_p, int top_k,
                                   float temperature, float repeat_penalty, bool output_logits,
-                                  int stop_token_len, int * stop_token_ids) {
+                                  int stop_token_len, int * stop_token_ids, const char *session_key) {
         std::vector <int> input;
         for (int i = 0; i < len; i++) {
             input.push_back(values[i]);
@@ -1139,7 +1147,15 @@ extern "C" {
         }
         config.input_token_length = input.size();
         auto model = models.GetModel(modelId);
-        return model->LaunchResponseTokens(input, config);
+        return model->LaunchResponseTokens(input, config, {}, {session_key ? session_key : ""});
+    }
+
+    DLL_EXPORT int launch_response_llm_model(int modelId, int len, int *values,
+                                  int max_length, int min_length, bool do_sample, float top_p, int top_k,
+                                  float temperature, float repeat_penalty, bool output_logits,
+                                  int stop_token_len, int * stop_token_ids) {
+        return launch_response_llm_model_with_session(modelId, len, values, max_length, min_length, do_sample, top_p, top_k,
+            temperature, repeat_penalty, output_logits, stop_token_len, stop_token_ids, nullptr);
     }
 
     DLL_EXPORT int launch_response_llm_model_multimodal(int modelId, int len, int *values, 

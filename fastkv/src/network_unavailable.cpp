@@ -14,7 +14,7 @@ void Service::Start(const std::string &, Handler) {
 void Service::StartAsync(const std::string &, AsyncHandler) {
     throw std::runtime_error("FastKV transport unavailable");
 }
-void Service::StartAsync(const std::string &, CancellableHandler) {
+void Service::StartAsync(const std::string &, CancellableHandler, ControlHandler) {
     throw std::runtime_error("FastKV transport unavailable");
 }
 void Service::Stop() {}

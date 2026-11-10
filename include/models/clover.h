@@ -46,7 +46,8 @@ public:
     void RunModelSpecificScheduler() override;
     int LaunchResponseTokens(const std::vector<int> &tokens,
         const GenerationConfig &config = GenerationConfig(),
-        const std::map<std::string, std::vector<Data *>> &multimodal = {}) override;
+        const std::map<std::string, std::vector<Data *>> &multimodal = {},
+        const RequestMetadata &metadata = {}) override;
     int LaunchClover(const std::vector<int> &tokens, const json11::Json &config);
     void ConfigureClover(const json11::Json &config);
     void OnResponseContextCreated(ResponseContext *context) override;

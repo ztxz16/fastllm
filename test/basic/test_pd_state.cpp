@@ -20,6 +20,8 @@ class StateModel : public basellm {
   public:
     std::atomic<int> forwards{0};
     int historyRecords = 0;
+    std::string observedSession;
+    void OnResponseContextCreated(ResponseContext *context) override { observedSession = context->requestMetadata.sessionKey; }
     bool residentHistory = false;
     bool HasPDResidentPrefixCache() const override { return residentHistory; }
     void TryRecordResponseContext(ResponseContext *) override { ++historyRecords; }
@@ -59,7 +61,7 @@ class StateModel : public basellm {
     }
 };
 
-class BatchStateModel final : public StateModel {
+class BatchStateModel : public StateModel {
   public:
     std::atomic<int> batches{0}, largest{0}, live{0}, peakTokens{0}, liveTokens{0};
     std::atomic<bool> fail{false}, entered{false}, hold{false};
@@ -68,6 +70,9 @@ class BatchStateModel final : public StateModel {
     ~BatchStateModel() override { hold = false; ShutdownRuntime(); }
     bool SupportsPrefillBatching() const override { return true; }
     void OnResponseContextCreated(ResponseContext *context) override {
+        if (!context->requestMetadata.sessionKey.empty())
+            Check(context->requestMetadata.sessionKey == "queued-" + std::to_string(context->allTokens.front()),
+                  "concurrent PD requests mixed session metadata");
         ++live;
         const int tokens = (liveTokens += context->inputTokens);
         peakTokens = std::max(peakTokens.load(), tokens);
@@ -98,6 +103,124 @@ class BatchStateModel final : public StateModel {
         return std::vector<int>(batch, 0);
     }
 };
+
+static void TestPreparedPrefill() {
+    class PreparedModel final : public BatchStateModel {
+      public:
+        std::atomic<int> enteredSteps{0}, permits{0};
+        std::mutex createdMutex;
+        std::vector<int> created;
+        void OnResponseContextCreated(ResponseContext *context) override {
+            BatchStateModel::OnResponseContextCreated(context);
+            std::lock_guard<std::mutex> lock(createdMutex);
+            created.push_back(context->allTokens.front());
+        }
+        std::vector<int> ForwardBatch(int batch, const Data &ids, const std::vector<Data *> &masks,
+                const std::vector<Data *> &positions, const std::vector<int> &lengths,
+                std::vector<std::pair<Data *, Data *>> &kv, const std::vector<GenerationConfig> &configs,
+                const LastTokensManager &last, std::vector<std::vector<float> *> *logits) override {
+            const int step = ++enteredSteps;
+            while (permits < step) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            return BatchStateModel::ForwardBatch(batch, ids, masks, positions, lengths, kv, configs, last, logits);
+        }
+    } model;
+    // Four-token page credits, including partial final pages. Active: 2*8;
+    // prepared: floor((48/2)/8)=3; max_batch allows more but cannot overbook.
+    SetPageLen(4); SetMaxTokens(48);
+    model.maxBatch = 8; model.residentHistory = true;
+    Check(model.SetPrefillBatching(4, 100, 2, 2), "configure prepared queue");
+    fastkv::Service port;
+    port.Start("127.0.0.1:0", [](const fastkv::Message &m) { return m; });
+    const auto endpoint = port.Address(); port.Stop();
+    model.ConfigurePD(json11::Json::object{{"role","prefill"},{"model_id","prepared"},
+        {"transport","tcp"},{"listen",endpoint},{"chunk_tokens",2}});
+    fastkv::Options options; options.workers = 8;
+    fastkv::Service client(options), control;
+    std::vector<std::future<fastkv::Message>> results;
+    std::vector<std::shared_ptr<fastkv::Cancellation>> cancellations;
+    auto submit = [&](int i) {
+        fastkv::Writer w; w.U32(1); w.String("prepared:gpu-state-v2:test-recurrent-state-v1");
+        w.Ints(std::vector<int>(7, 100+i));
+        cancellations.push_back(std::make_shared<fastkv::Cancellation>());
+        std::future<fastkv::Message> result;
+        fastkv::Message request{std::move(w.bytes),{}};
+        Check(client.TrySubmit(endpoint, request, result, cancellations.back()),
+              "prepared fixture exhausted client admission");
+        results.push_back(std::move(result));
+    };
+    auto wait = [&](auto predicate, const char *message) {
+        for (int i = 0; i < 3000 && !predicate(); ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        Check(predicate(), message);
+    };
+    try {
+        submit(0); submit(1);
+        wait([&] { return model.enteredSteps == 1; }, "prepared fixture did not enter forward");
+        for (int i = 2; i < 8; ++i) submit(i);
+        fastkv::Writer query; query.U32(2); query.String("prepared:gpu-state-v2:test-recurrent-state-v1");
+        query.Ints({1});
+        wait([&] {
+            auto reply = control.Call(endpoint, {query.bytes,{}});
+            fastkv::Reader r(reply.metadata); r.U32(); r.U64();
+            return r.U64() == 56;
+        }, "unprotected queued work was undercounted");
+        model.permits = 1;
+        wait([&] { return model.enteredSteps == 2; }, "prepared queue stalled forward");
+        Check(model.live == 5 && model.liveTokens == 35,
+              "prepared requests did not obey half-pool/page-rounded reservation");
+        int cancelled;
+        { std::lock_guard<std::mutex> lock(model.createdMutex); cancelled = model.created.back() - 100; }
+        cancellations[cancelled]->Cancel();
+        model.permits = 10000;
+        for (size_t i = 0; i < results.size(); ++i) {
+            Check(results[i].wait_for(std::chrono::seconds(5)) == std::future_status::ready,
+                  "prepared cancellation stranded a request");
+            bool failed = false;
+            try {
+                auto reply = results[i].get();
+                PDStateReader reader(reply); Check(reader.metadata.U32() == 7, "prepared state length");
+                Data state; reader.Tensor(state); reader.End();
+                Check(((float *)state.cpuData)[0] == (100+i)*28,
+                      "prepared request changed recurrent state");
+            } catch (const std::exception &) { failed = true; if (int(i) != cancelled) throw; }
+            Check((int(i) == cancelled) == failed, "cancelled prepared request succeeded");
+        }
+        Check(model.live == 0 && model.liveTokens == 0 && model.peakTokens <= 35,
+              "prepared cancellation leaked state or capacity");
+
+        // Stop while active, prepared and raw work coexist. Completed forward
+        // must retire all three states without leaving a future or lease alive.
+        model.enteredSteps = 0; model.permits = 0;
+        results.clear(); cancellations.clear();
+        submit(0); submit(1);
+        wait([&] { return model.enteredSteps == 1; }, "shutdown fixture did not enter forward");
+        for (int i = 2; i < 8; ++i) submit(i);
+        wait([&] {
+            auto reply = control.Call(endpoint, {query.bytes,{}});
+            fastkv::Reader r(reply.metadata); r.U32(); r.U64();
+            return r.U64() == 56;
+        }, "shutdown fixture lost queued work");
+        model.permits = 1;
+        wait([&] { return model.enteredSteps == 2; }, "shutdown fixture did not prepare requests");
+        Check(model.live == 5, "shutdown fixture did not own prepared contexts");
+        auto stopped = std::async(std::launch::async, [&] { model.StopPD(); });
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        model.permits = 10000;
+        Check(stopped.wait_for(std::chrono::seconds(5)) == std::future_status::ready,
+              "prepared shutdown deadlocked");
+        stopped.get();
+        for (auto &result : results) {
+            Check(result.wait_for(std::chrono::seconds(5)) == std::future_status::ready,
+                  "prepared shutdown stranded a waiter");
+            bool failed = false;
+            try { result.get(); } catch (const std::exception &) { failed = true; }
+            Check(failed, "shutdown request succeeded unexpectedly");
+        }
+        Check(model.live == 0 && model.liveTokens == 0, "prepared shutdown leaked state");
+    } catch (...) { model.permits = 10000; model.StopPD(); throw; }
+    SetPageLen(128);
+    std::cout << "PASS PD bounded prepared queue, page credits, cancellation and exact state\n";
+}
 
 static void TestPrefillBatch() {
     auto endpoint = [] {
@@ -213,6 +336,7 @@ static void TestQueuedTransfers() {
         context.Init(1, FLOAT32, FLOAT32);
         context.generationConfig.output_token_limit = 1;
         context.currentTokens = context.allTokens = {i + 1, i + 2, i + 3};
+        context.requestMetadata.sessionKey = "queued-" + std::to_string(context.allTokens.front());
         context.inputTokens = 3;
         decode.BeginPD(&context);
         decode.PollPD(&context);
@@ -220,8 +344,10 @@ static void TestQueuedTransfers() {
     }
     // A timeout wave must cancel both P work and the caller's transfer. New
     // model requests may wait for draining leases but must never become 500s.
-    for (int i = 0; i < 2000 && !prefill.entered; ++i)
+    for (int i = 0; i < 2000 && !prefill.entered; ++i) {
+        for (auto &request : requests) decode.PollPD(request.get());
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
     Check(prefill.entered, "queued cancellation did not reach held P work");
     requests.clear();
     for (int i = 0; i < 128; ++i) {
@@ -230,15 +356,20 @@ static void TestQueuedTransfers() {
         context.Init(1, FLOAT32, FLOAT32);
         context.generationConfig.output_token_limit = 1;
         context.currentTokens = context.allTokens = {i + 1001, i + 1002, i + 1003};
+        context.requestMetadata.sessionKey = "queued-" + std::to_string(context.allTokens.front());
         context.inputTokens = 3;
         decode.BeginPD(&context);
         decode.PollPD(&context);
         admitted &= !context.isEnding;
     }
     prefill.hold = false;
+    std::vector<bool> completed(requests.size(), false);
+    for (int i = 0; i < 5000 && std::find(completed.begin(), completed.end(), false) != completed.end(); ++i) {
+        for (size_t j = 0; j < requests.size(); ++j)
+            if (!completed[j]) completed[j] = requests[j]->isEnding || decode.PollPD(requests[j].get());
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
     for (auto &request : requests) {
-        for (int i = 0; i < 5000 && !request->isEnding && !decode.PollPD(request.get()); ++i)
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         admitted &= !request->isEnding && request->preTokens == 2;
         if (!request->isEnding && request->preTokens == 2) {
             const float expected = request->allTokens[0] + 2 * request->allTokens[1];
@@ -252,6 +383,54 @@ static void TestQueuedTransfers() {
     Check(admitted, "admitted requests must fit the transfer queue");
     Check(prefill.live == 0 && prefill.liveTokens == 0, "cancel/replacement wave leaked P states");
     std::cout << "PASS PD 128-request cancel/replacement wave, admission and state correctness\n";
+}
+
+static void TestLoadAwareRouting() {
+    auto endpoint = [] {
+        fastkv::Service temporary;
+        temporary.Start("127.0.0.1:0", [](const fastkv::Message &m) { return m; });
+        return temporary.Address();
+    };
+    const auto a = endpoint(), b = endpoint();
+    SetMaxTokens(65536);
+    BatchStateModel p0, p1;
+    p0.maxBatch = p1.maxBatch = 2;
+    Check(p0.SetPrefillBatching(4, 50, 2) && p1.SetPrefillBatching(4, 50, 2), "routing P batching");
+    for (auto pair : {std::make_pair(&p0, a), std::make_pair(&p1, b)})
+        pair.first->ConfigurePD(json11::Json::object{{"role","prefill"},{"model_id","routing"},
+            {"transport","tcp"},{"listen",pair.second},{"cache_bytes",65536},{"chunk_tokens",2}});
+    fastkv::Service client;
+    auto submit = [&](const std::string &peer, const std::vector<int> &tokens) {
+        fastkv::Writer w; w.U32(1); w.String("routing:gpu-state-v2:test-recurrent-state-v1"); w.Ints(tokens);
+        return client.Submit(peer, {std::move(w.bytes), {}});
+    };
+    (void)submit(a, {3,4}).get(); // P0 owns the only reusable prefix.
+    StateModel decode;
+    decode.ConfigurePD(json11::Json::object{{"role","decode"},{"model_id","routing"},
+        {"transport","tcp"},{"prefill",json11::Json::array{a,b}}});
+    auto run = [&] {
+        ResponseContext context; context.Init(1,FLOAT32,FLOAT32);
+        context.currentTokens = context.allTokens = {3,4,5}; context.inputTokens = 3;
+        context.generationConfig.output_token_limit = 1;
+        decode.BeginPD(&context);
+        for (int i = 0; i < 4000 && !context.isEnding && !decode.PollPD(&context); ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        Check(!context.isEnding && context.preTokens == 2, "routing stranded a request");
+        Check(((float *)context.pastKeyValues[0].first.cpuData)[0] == 11, "routing changed KV state");
+    };
+    run();
+    Check(p1.forwards == 0 && p1.batches == 0, "routing ignored P0 resident cache");
+    p0.hold = true;
+    auto first = submit(a, std::vector<int>(2048, 11)), second = submit(a, std::vector<int>(2048, 21));
+    for (int i = 0; i < 3000 && !p0.entered; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    Check(p0.entered, "routing fixture did not saturate P0");
+    try { run(); } catch (...) { p0.hold = false; throw; }
+    Check(p1.forwards + p1.batches > 0, "warm affinity blocked behind saturated P0");
+    p0.hold = false; (void)first.get(); (void)second.get();
+    decode.StopPD(); p0.StopPD(); p1.StopPD();
+    Check(p0.live == 0 && p1.live == 0, "routing leaked producer contexts");
+    std::cout << "PASS PD live-prefix routing, saturated producer bypass and cross-peer state correctness\n";
 }
 
 static void TestGPUState() {
@@ -341,8 +520,47 @@ static void TestGPUState() {
 #endif
 }
 
+static void CheckLegacySessionPeer(bool sessionProtocol = false) {
+    fastkv::Service legacy;
+    int executions = 0;
+    legacy.Start("127.0.0.1:0", [&](const fastkv::Message &request) {
+        fastkv::Reader reader(request.metadata);
+        const auto kind = reader.U32();
+        Check(reader.String() == "legacy:gpu-state-v2:test-recurrent-state-v1", "legacy identity");
+        const auto tokens = reader.Ints();
+        if (kind == 3 && sessionProtocol) Check(reader.String(512) == "legacy-session", "legacy session lost");
+        reader.End();
+        if (kind == 2 || (kind == 4 && sessionProtocol)) {
+            fastkv::Writer writer; writer.U32(kind); writer.U64(0); writer.U64(0); writer.U64(10000);
+            return fastkv::Message{std::move(writer.bytes), {}};
+        }
+        Check(kind == 1 || (kind == 3 && sessionProtocol), "legacy peer rejects session protocol");
+        ++executions;
+        float value = 0; for (size_t i = 0; i < tokens.size(); ++i) value += tokens[i] * (i + 1);
+        Data state(FLOAT32, {1}, std::vector<float>{value});
+        PDStateWriter writer; writer.metadata.U32(tokens.size()); writer.Tensor(state);
+        return writer.Finish();
+    });
+    StateModel decode;
+    decode.ConfigurePD(json11::Json::object{{"role", "decode"}, {"model_id", "legacy"},
+        {"transport", "tcp"}, {"prefill", json11::Json::array{legacy.Address()}}});
+    ResponseContext context; context.Init(1, FLOAT32, FLOAT32);
+    context.currentTokens = context.allTokens = {3, 7, 11}; context.inputTokens = 3;
+    context.generationConfig.output_token_limit = 1;
+    context.requestMetadata.sessionKey = "legacy-session";
+    decode.BeginPD(&context);
+    for (int i = 0; i < 5000 && !decode.PollPD(&context); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    Check(!context.isEnding && context.preTokens == 2 && executions == 1,
+          "session negotiation retried model work or broke a legacy peer");
+    Check(((float *)context.pastKeyValues[0].first.cpuData)[0] == 17, "legacy fallback changed state");
+    decode.StopPD(); legacy.Stop();
+}
+
 int main() {
     try {
+        CheckLegacySessionPeer();
+        CheckLegacySessionPeer(true);
         // Packed FP4 rows include E4M3 scales. Transfer all stored bytes
         // without expanding or re-quantizing their values.
         Data fp4(FP4_E2M1, {1, 3, 192});
@@ -408,6 +626,7 @@ int main() {
         context.generationConfig.output_token_limit = 1;
         context.currentTokens = context.allTokens = {3, 7, 11, 19, 23, 29};
         context.inputTokens = 6;
+        context.requestMetadata.sessionKey = "session-transport-test";
         decode.BeginPD(&context);
         for (int i = 0; i < 3000 && !decode.PollPD(&context); ++i)
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -417,6 +636,37 @@ int main() {
         Check(((float *)context.pastKeyValues[0].first.cpuData)[0] == 3 + 14 + 33 + 76 + 115,
               "chunk position/state correctness");
         Check(prefill.forwards == 3, "three prefill chunks");
+        Check(prefill.observedSession == "session-transport-test", "session metadata did not reach P before restore");
+        {
+            fastkv::Service control;
+            fastkv::Writer query; query.U32(6); query.String("test:gpu-state-v2:test-recurrent-state-v1");
+            query.Ints({3,7,11,19,23}); query.String("session-transport-test");
+            auto placement = [&] {
+                auto reply = control.Submit(endpoint, {query.bytes,{}}).get();
+                fastkv::Reader reader(reply.metadata);
+                Check(reader.U32() == 6, "placement capability reply");
+                reader.U64(); reader.U64(); reader.U64();
+                fastkv::SessionDirectory::Record record{reader.U64(), reader.String()};
+                reader.End();
+                return record;
+            };
+            for (int i = 0; i < 3000 && !placement().version; ++i) {
+                decode.PollPD(&context);
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            Check(placement().version == 1 && placement().owner == endpoint,
+                  "another decoder cannot discover committed session ownership");
+            auto announce = [&](uint64_t version, bool owned) {
+                fastkv::Writer writer; writer.U32(7); writer.String("test:gpu-state-v2:test-recurrent-state-v1");
+                writer.String("session-transport-test"); writer.U64(version); writer.String(endpoint); writer.U32(owned);
+                control.Submit(endpoint, {writer.bytes,{}}).get();
+            };
+            announce(2, false); announce(1, true);
+            Check(placement().version == 2,
+                  "delayed placement announcement resurrected a retired owner");
+            announce(3, true);
+            Check(placement().version == 3, "new placement was not committed");
+        }
         context.TryRecord(&decode);
         Check(decode.historyRecords == 0, "PD decode retained an unused host snapshot");
         decode.residentHistory = true;
@@ -503,7 +753,9 @@ int main() {
         prefill.StopPD();
         TestGPUState();
         TestPrefillBatch();
+        TestPreparedPrefill();
         TestQueuedTransfers();
+        TestLoadAwareRouting();
         std::cout << "PASS PD tensor packing, chunk positions, handoff, rejection "
                      "and cancellation\n";
     } catch (const std::exception &error) {

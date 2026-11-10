@@ -248,28 +248,65 @@ struct PDPending {
     struct Admission { std::shared_ptr<void> slot, tokens; };
     std::future<fastkv::Message> result;
     fastkv::Message request;
-    std::string peer;
+    std::string peer, sessionKey;
     std::shared_ptr<Admission> admission;
+    std::shared_ptr<void> route;
+    std::vector<std::future<fastkv::Message>> probes;
+    std::vector<std::shared_ptr<fastkv::Cancellation>> probeCancellations;
+    std::vector<fastkv::PrefillRouter::Estimate> estimates;
+    std::vector<bool> probed;
+    fastkv::Message probeRequest;
+    std::vector<uint32_t> probeKinds;
+    std::vector<bool> sessionCapable, placementCapable;
+    fastkv::SessionDirectory::Record placement;
     std::shared_ptr<fastkv::Cancellation> cancellation = std::make_shared<fastkv::Cancellation>();
     int length = 0;
     size_t reservation = 0;
     bool committed = false;
     std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
-    ~PDPending() { cancellation->Cancel(); }
+    ~PDPending() {
+        cancellation->Cancel();
+        for (const auto &probe : probeCancellations) if (probe) probe->Cancel();
+    }
 };
 struct PDRuntime {
+    struct Workload {
+        std::atomic<uint64_t> tokens{0};
+        std::atomic<double> tokensPerSecond{10000};
+    };
     struct PrefillRequest {
         std::vector<int> input;
+        RequestMetadata metadata;
         std::promise<fastkv::Message> result;
         std::shared_ptr<fastkv::Cancellation> cancellation;
         std::unique_ptr<ResponseContext> context;
-        bool reserved = false;
+        size_t reservation = 0;
+        std::shared_ptr<Workload> work;
+        size_t remaining = 0;
+        void SetRemaining(size_t value) {
+            if (value > remaining) work->tokens.fetch_add(value - remaining);
+            else work->tokens.fetch_sub(remaining - value);
+            remaining = value;
+        }
+        ~PrefillRequest() { if (work) work->tokens.fetch_sub(remaining); }
         std::chrono::steady_clock::time_point queued = std::chrono::steady_clock::now();
     };
     std::unique_ptr<fastkv::Service> service;
+    std::unique_ptr<fastkv::Service> probes;
+    std::unique_ptr<fastkv::PrefillRouter> router;
+    std::unique_ptr<fastkv::SessionDirectory> sessions;
+    struct Announcement {
+        fastkv::SessionDirectory::Record record;
+        std::vector<bool> complete;
+        std::vector<unsigned> attempts;
+        std::vector<std::future<fastkv::Message>> replies;
+    };
+    std::mutex announceMutex;
+    std::map<std::string, Announcement> announcements;
+    size_t sessionCapacity = 0;
+    std::shared_ptr<Workload> workload = std::make_shared<Workload>();
     std::string role, identity;
     std::vector<std::string> peers;
-    std::atomic<uint64_t> next{0};
     std::atomic<bool> stopping{false};
     int chunk = 2048;
     size_t tokenCapacity = 0;
@@ -277,8 +314,6 @@ struct PDRuntime {
     std::unique_ptr<fastkv::PrefixCache> cache;
     std::unique_ptr<fastkv::BufferPool> exportPool;
     bool residentPrefix = false;
-    // Routing stores only token keys and an endpoint, never KV payloads.
-    std::unique_ptr<fastkv::PrefixCache> routes;
     std::mutex prefillMutex, prefillStopMutex;
     std::condition_variable prefillCV;
     std::deque<std::shared_ptr<PrefillRequest>> waiting;
@@ -287,6 +322,7 @@ struct PDRuntime {
 
     ~PDRuntime() {
         StopPrefill();
+        if (probes) probes->Stop();
         if (service) service->Stop(); // callbacks capture this runtime
     }
     void StopPrefill() {
@@ -299,11 +335,20 @@ struct PDRuntime {
         prefillCV.notify_all();
         if (prefillThread.joinable()) prefillThread.join();
     }
+    size_t CachedTokens(basellm &model, const std::vector<int> &input) {
+        return residentPrefix ? model.PreviewPDResidentPrefix(input) :
+               cache ? cache->ProbeTokens(identity, input) : 0;
+    }
     std::future<fastkv::Message> Prefill(std::vector<int> input,
-                                       std::shared_ptr<fastkv::Cancellation> cancellation) {
+                                       std::shared_ptr<fastkv::Cancellation> cancellation, RequestMetadata metadata = {}) {
         auto request = std::make_shared<PrefillRequest>();
         request->input = std::move(input);
+        request->metadata = std::move(metadata);
         request->cancellation = std::move(cancellation);
+        request->work = workload;
+        // A probe does not own the prefix. Until the execution lane restores
+        // and holds it, count the complete input rather than stale cache hits.
+        request->SetRemaining(request->input.size());
         auto result = request->result.get_future();
         {
             std::lock_guard<std::mutex> lock(prefillMutex);
@@ -314,17 +359,157 @@ struct PDRuntime {
         return result;
     }
     void RunPrefill(basellm &model);
+    void FlushAnnouncements() {
+        if (!probes) return;
+        std::lock_guard<std::mutex> lock(announceMutex);
+        unsigned submitted = 0;
+        for (auto it = announcements.begin(); it != announcements.end();) {
+            auto &a = it->second;
+            for (size_t i = 0; i < peers.size(); ++i) {
+                auto &reply = a.replies[i];
+                if (reply.valid()) {
+                    if (reply.wait_for(std::chrono::seconds(0)) != std::future_status::ready) continue;
+                    try {
+                        auto message = reply.get(); fastkv::Reader reader(message.metadata);
+                        Check(message.buffers.empty() && reader.U32() == 7, "invalid placement acknowledgment");
+                        reader.End(); a.complete[i] = true;
+                    } catch (const std::exception &) { if (a.attempts[i] >= 3) a.complete[i] = true; }
+                }
+                if (a.complete[i] || submitted >= 16) continue;
+                fastkv::Writer writer; writer.U32(7); writer.String(identity); writer.String(it->first);
+                writer.U64(a.record.version); writer.String(a.record.owner);
+                writer.U32(peers[i] == a.record.owner);
+                fastkv::Message message{std::move(writer.bytes), {}};
+                if (probes->TrySubmit(peers[i], message, reply)) { ++a.attempts[i]; ++submitted; }
+            }
+            if (std::find(a.complete.begin(), a.complete.end(), false) == a.complete.end())
+                it = announcements.erase(it);
+            else ++it;
+        }
+    }
+    void CommitPlacement(const PDPending &pending) {
+        if (pending.sessionKey.empty() || !pending.placement.version) return;
+        if (!sessions->Update(pending.sessionKey, pending.placement)) return;
+        std::lock_guard<std::mutex> lock(announceMutex);
+        if (announcements.size() >= sessionCapacity && !announcements.count(pending.sessionKey)) return;
+        auto &a = announcements[pending.sessionKey]; a = {};
+        a.record = pending.placement;
+        a.complete.resize(peers.size()); a.attempts.resize(peers.size()); a.replies.resize(peers.size());
+        for (size_t i = 0; i < peers.size(); ++i) a.complete[i] = !pending.placementCapable[i];
+    }
+    bool SelectPeer(PDPending &pending, bool verbose) {
+        if (!pending.peer.empty()) return true;
+        if (!pending.probes.empty()) {
+            bool submissionBusy = false;
+            for (size_t i = 0; i < peers.size(); ++i) {
+                auto &future = pending.probes[i];
+                if (future.valid()) {
+                    if (future.wait_for(std::chrono::seconds(0)) != std::future_status::ready) continue;
+                    try {
+                        const auto reply = future.get();
+                        Check(reply.buffers.empty(), "routing reply contains payload");
+                        fastkv::Reader reader(reply.metadata);
+                        const auto kind = pending.probeKinds[i];
+                        Check(reader.U32() == kind, "invalid routing reply");
+                        auto &e = pending.estimates[i];
+                        e.cachedTokens = reader.U64(); e.pendingTokens = reader.U64();
+                        e.tokensPerSecond = reader.U64();
+                        if (kind == 6) {
+                            fastkv::SessionDirectory::Record record;
+                            record.version = reader.U64(); record.owner = reader.String(512);
+                            if (record.version && std::find(peers.begin(), peers.end(), record.owner) != peers.end())
+                                sessions->Update(pending.sessionKey, record);
+                        }
+                        reader.End();
+                        Check(e.cachedTokens <= size_t(pending.length) && e.tokensPerSecond > 0,
+                              "invalid routing estimate");
+                        e.available = true; pending.probed[i] = true;
+                        pending.sessionCapable[i] = kind >= 4;
+                        pending.placementCapable[i] = kind == 6;
+                    } catch (const std::exception &) {
+                        if (pending.probeKinds[i] > 2)
+                            pending.probeKinds[i] -= 2; // Retry metadata only, never model work.
+                        else { pending.probed[i] = true; pending.estimates[i].available = false; }
+                    }
+                }
+                if (pending.probed[i] || submissionBusy) continue;
+                // Retain an unsubmitted message across admission retries;
+                // never repeatedly copy a long prompt while control is full.
+                if (pending.probeRequest.metadata.empty() || pending.probeRequest.metadata[0] != pending.probeKinds[i]) {
+                    pending.probeRequest.metadata = pending.request.metadata;
+                    pending.probeRequest.metadata[0] = pending.probeKinds[i];
+                    if (pending.probeKinds[i] == 6) {
+                        fastkv::Writer suffix; suffix.String(pending.sessionKey);
+                        pending.probeRequest.metadata.insert(pending.probeRequest.metadata.end(), suffix.bytes.begin(), suffix.bytes.end());
+                    }
+                }
+                // A failed capability query cancels its transport operation.
+                // Keep it isolated from model work and other peers; cancelling
+                // the parent still cancels every outstanding query explicitly.
+                auto cancellation = std::make_shared<fastkv::Cancellation>();
+                if (probes->TrySubmit(peers[i], pending.probeRequest, future, cancellation, pending.admission))
+                    pending.probeCancellations[i] = std::move(cancellation);
+                else submissionBusy = true;
+            }
+            if (std::find(pending.probed.begin(), pending.probed.end(), false) != pending.probed.end()) return false;
+        }
+        bool available = false;
+        for (const auto &e : pending.estimates) available |= e.available;
+        // Older producers have no metadata query. Keep a bounded least-work
+        // fallback; a routing hint never changes the model/state protocol.
+        if (!available) for (auto &e : pending.estimates) e = {};
+        // All D ranks discover committed placement from producer probes. Only
+        // new sessions or expired metadata fall back to rendezvous hashing.
+        size_t preferred = SIZE_MAX;
+        uint64_t highest = 0;
+        if (!pending.sessionKey.empty()) for (size_t i = 0; i < peers.size(); ++i) {
+            uint64_t hash = 14695981039346656037ULL;
+            for (unsigned char c : pending.sessionKey + std::string(1, '\0') + peers[i])
+                hash = (hash ^ c) * 1099511628211ULL;
+            if (preferred == SIZE_MAX || hash > highest) { preferred = i; highest = hash; }
+        }
+        auto placement = sessions->Get(pending.sessionKey);
+        auto owner = std::find(peers.begin(), peers.end(), placement.owner);
+        const bool owned = placement.version && owner != peers.end();
+        if (owned) preferred = owner - peers.begin();
+        auto chosen = router->Reserve(pending.length, pending.estimates, preferred, owned);
+        if (!pending.sessionKey.empty() && pending.placementCapable[chosen.peer]) {
+            Check(placement.version < UINT64_MAX, "session placement version exhausted");
+            pending.placement = placement.owner == peers[chosen.peer] ? placement :
+                fastkv::SessionDirectory::Record{placement.version + 1, peers[chosen.peer]};
+        }
+        if (!pending.sessionKey.empty() && pending.sessionCapable[chosen.peer]) {
+            pending.request.metadata[0] = 3;
+            fastkv::Writer suffix; suffix.String(pending.sessionKey);
+            pending.request.metadata.insert(pending.request.metadata.end(), suffix.bytes.begin(), suffix.bytes.end());
+        }
+        pending.peer = peers[chosen.peer]; pending.route = std::move(chosen.lease);
+        if (verbose && peers.size() > 1) {
+            const auto &e = pending.estimates[chosen.peer];
+            std::cout << "[FastKV PD route] peer=" << pending.peer << " cached_tokens=" << e.cachedTokens
+                      << " pending_tokens=" << e.pendingTokens << " estimated_new_tokens=" << chosen.uncachedTokens
+                      << " probe_fallback=" << !available << std::endl;
+        }
+        pending.probes.clear(); pending.probeCancellations.clear(); pending.probed.clear();
+        pending.estimates.clear(); pending.probeRequest = {};
+        return true;
+    }
 };
 
 void PDRuntime::RunPrefill(basellm &model) {
     using Request = std::shared_ptr<PrefillRequest>;
-    std::deque<Request> active;
-    size_t reserved = 0;
+    // Raw RPCs own no cache. Prepared contexts own the same immutable page
+    // references and private companion state as active contexts, but have not
+    // entered forward yet. Both use one token budget and one retirement path.
+    std::deque<Request> active, prepared;
+    size_t reserved = 0, preparedTokens = 0;
+    const size_t prepareBudget = tokenCapacity / 2;
+    const size_t page = residentPrefix ? std::max(1, GetPageLen()) : 1;
+    const size_t contextLimit = std::max(batchRequests, model.maxBatch > 0 ? model.maxBatch : 1);
     auto retire = [&](const Request &request) {
-        if (request->reserved) {
-            reserved -= request->input.size();
-            request->reserved = false;
-        }
+        request->SetRemaining(0);
+        reserved -= request->reservation;
+        request->reservation = 0;
         auto context = std::move(request->context);
         if (context) {
             context->isAbort = true;
@@ -334,10 +519,9 @@ void PDRuntime::RunPrefill(basellm &model) {
     const auto cancelled = std::make_exception_ptr(std::runtime_error("FastKV PD: request cancelled"));
     try {
         while (true) {
-            std::vector<Request> admitted;
             {
                 std::unique_lock<std::mutex> lock(prefillMutex);
-                if (active.empty()) {
+                if (active.empty() && prepared.empty()) {
                     prefillCV.wait(lock, [&] { return stopping || !waiting.empty(); });
                     if (!stopping && waitMs > 0) {
                         const auto deadline = waiting.front()->queued + std::chrono::milliseconds(waitMs);
@@ -356,13 +540,6 @@ void PDRuntime::RunPrefill(basellm &model) {
                         it = waiting.erase(it);
                     } else ++it;
                 }
-                while (!waiting.empty() && int(active.size() + admitted.size()) < batchRequests &&
-                       waiting.front()->input.size() <= tokenCapacity - reserved) {
-                    auto request = waiting.front(); waiting.pop_front();
-                    reserved += request->input.size();
-                    request->reserved = true;
-                    admitted.push_back(std::move(request));
-                }
             }
             // Only the model execution lane touches contexts and GPU state.
             // RPC handlers return futures immediately; network workers never
@@ -377,7 +554,37 @@ void PDRuntime::RunPrefill(basellm &model) {
                     it = active.erase(it);
                 } else ++it;
             }
-            for (const auto &request : admitted) {
+            for (auto it = prepared.begin(); it != prepared.end();) {
+                if ((*it)->cancellation->Cancelled()) {
+                    preparedTokens -= (*it)->reservation;
+                    retire(*it);
+                    (*it)->result.set_exception(cancelled);
+                    it = prepared.erase(it);
+                } else ++it;
+            }
+            while (!prepared.empty() && int(active.size()) < batchRequests) {
+                preparedTokens -= prepared.front()->reservation;
+                active.push_back(std::move(prepared.front()));
+                prepared.pop_front();
+            }
+            while (active.size() + prepared.size() < contextLimit) {
+                const bool lookahead = int(active.size()) >= batchRequests;
+                if (lookahead && !residentPrefix) break;
+                Request request;
+                {
+                    std::lock_guard<std::mutex> lock(prefillMutex);
+                    if (stopping || waiting.empty()) break;
+                    const size_t count = std::min(tokenCapacity,
+                        ((waiting.front()->input.size() + page - 1) / page) * page);
+                    // Reserve the FULL final prompt, not merely its cached
+                    // portion. This leaves room to finish every admitted
+                    // request and bounds queued retention independently.
+                    if (count > tokenCapacity - reserved ||
+                        (lookahead && count > prepareBudget - preparedTokens)) break;
+                    request = std::move(waiting.front()); waiting.pop_front();
+                    reserved += count;
+                    request->reservation = count;
+                }
                 try {
                     if (request->cancellation->Cancelled()) std::rethrow_exception(cancelled);
                     const auto restoreBegin = std::chrono::steady_clock::now();
@@ -391,6 +598,7 @@ void PDRuntime::RunPrefill(basellm &model) {
                     request->context.reset(new ResponseContext);
                     auto &context = *request->context;
                     context.Init(model.block_cnt, model.dataType, model.kvCacheDataType);
+                    context.requestMetadata = request->metadata;
                     context.currentTokens = context.allTokens = request->input;
                     context.inputTokens = request->input.size();
                     context.generationConfig.top_k = 1;
@@ -408,17 +616,22 @@ void PDRuntime::RunPrefill(basellm &model) {
                         context.preTokens = hit.tokens;
                         context.allTokens = request->input;
                     }
+                    request->SetRemaining(request->input.size() - context.preTokens);
                     if (model.verbose) {
                         const auto stats = cache ? cache->Stats() : fastkv::PrefixCache::Statistics{};
                         std::cout << "[FastKV PD] prefix_hit=" << hit.tokens << " prompt=" << request->input.size()
                                   << " cache_entries=" << stats.entries << " cache_bytes=" << stats.bytes
                                   << " cache_logical_bytes=" << stats.logicalBytes
+                                  << " cache_evictions=" << stats.evictions
                                   << " resident_gpu=" << residentPrefix << std::endl;
                         std::cout << "[FastKV PD timing] restore_ms="
                                   << std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - restoreBegin).count()
                                   << std::endl;
                     }
-                    active.push_back(request);
+                    if (lookahead) {
+                        prepared.push_back(request);
+                        preparedTokens += request->reservation;
+                    } else active.push_back(request);
                 } catch (...) {
                     auto error = std::current_exception();
                     retire(request);
@@ -486,14 +699,22 @@ void PDRuntime::RunPrefill(basellm &model) {
                     else model.ForwardV2(batch, inputIds, maskRefs, positionRefs, lengths, past, configs, last);
                 } else model.ForwardBatch(batch, inputIds, maskRefs, positionRefs, lengths, past, configs, last);
             }
+            const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
+            if (seconds > 0) workload->tokensPerSecond.store(
+                0.9 * workload->tokensPerSecond.load() + 0.1 * (batchTokens - budget) / seconds);
             if (model.verbose) {
-                const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
+                size_t queued;
+                { std::lock_guard<std::mutex> lock(prefillMutex); queued = waiting.size(); }
                 std::cout << "[FastKV PD] prefill_batch=" << batch << " tokens=" << batchTokens - budget
-                          << " forward_ms=" << seconds * 1000 << std::endl;
+                          << " forward_ms=" << seconds * 1000
+                          << " active=" << active.size() << " prepared=" << prepared.size()
+                          << " queued=" << queued << " reserved_tokens=" << reserved
+                          << " prepared_tokens=" << preparedTokens << std::endl;
             }
             for (int i = 0; i < batch; ++i) {
                 auto request = active.front(); active.pop_front();
                 request->context->preTokens += lengths[i];
+                request->SetRemaining(request->input.size() - request->context->preTokens);
                 if (request->cancellation->Cancelled()) {
                     retire(request);
                     request->result.set_exception(cancelled);
@@ -548,6 +769,10 @@ void PDRuntime::RunPrefill(basellm &model) {
             retire(request);
             request->result.set_exception(error);
         }
+        for (const auto &request : prepared) {
+            retire(request);
+            request->result.set_exception(error);
+        }
     }
 }
 
@@ -574,6 +799,7 @@ bool basellm::IsPDDecode() const { return pdRuntime && pdRuntime->role == "decod
 void basellm::StopPD() {
     if (pdRuntime) {
         pdRuntime->StopPrefill();
+        if (pdRuntime->probes) pdRuntime->probes->Stop();
         pdRuntime->service->Stop();
     }
 }
@@ -589,6 +815,8 @@ void basellm::ConfigurePD(const json11::Json &config) {
     Check(!UseModelSpecificScheduler(), "PD requires a supported common scheduler");
     Check(!kvMemConfig.enabled, "the sparse/offloaded KV adapter is not implemented");
     const int concurrent = maxBatch > 0 ? maxBatch : 1;
+    runtime->sessionCapacity = size_t(concurrent) * 4;
+    runtime->sessions.reset(new fastkv::SessionDirectory(runtime->sessionCapacity));
     runtime->tokenCapacity =
         GetMaxTokens() > 0 ? size_t(GetMaxTokens()) : size_t(max_positions) * concurrent;
     if (tokensLimit > 0)
@@ -652,7 +880,12 @@ void basellm::ConfigurePD(const json11::Json &config) {
     }
     if (runtime->role == "decode") {
         Check(!runtime->peers.empty(), "decode needs a prefill execution group");
-        runtime->routes.reset(new fastkv::PrefixCache(64 << 20, std::max(64, concurrent * 4)));
+        runtime->router.reset(new fastkv::PrefillRouter(runtime->peers.size()));
+        {
+            auto control = options;
+            control.workers = 2; control.queueDepth = 16; control.timeoutMs = 2000;
+            runtime->probes.reset(new fastkv::Service(control));
+        }
         runtime->slots.reset(new fastkv::Budget(concurrent, "decode request slots"));
         runtime->tokens.reset(new fastkv::Budget(runtime->tokenCapacity, "decode token budget"));
     } else {
@@ -686,14 +919,49 @@ void basellm::ConfigurePD(const json11::Json &config) {
                 [this, raw = runtime.get()](fastkv::Message request,
                                            std::shared_ptr<fastkv::Cancellation> cancellation) {
                 fastkv::Reader reader(request.metadata);
-                Check(reader.U32() == 1 && reader.String() == raw->identity,
+                const auto kind = reader.U32();
+                Check((kind == 1 || kind == 3) && reader.String() == raw->identity,
                       "incompatible checkpoint or state layout");
                 auto tokens = reader.Ints(size_t(max_positions));
+                RequestMetadata metadata;
+                if (kind == 3) metadata.sessionKey = reader.String(512);
                 reader.End();
                 Check(request.buffers.empty() && !tokens.empty() && tokens.size() < size_t(max_positions),
                       "invalid prefill request");
                 Check(tokens.size() <= raw->tokenCapacity, "prompt exceeds the prefill token pool");
-                return raw->Prefill(std::move(tokens), std::move(cancellation));
+                return raw->Prefill(std::move(tokens), std::move(cancellation), std::move(metadata));
+            }, [this, raw = runtime.get()](const fastkv::Message &request, fastkv::Message &reply) {
+                if (request.metadata.size() < 4) return false;
+                fastkv::Reader reader(request.metadata);
+                const auto kind = reader.U32();
+                if (kind != 2 && kind != 4 && kind != 6 && kind != 7) return false;
+                Check(reader.String() == raw->identity, "incompatible routing identity");
+                if (kind == 7) {
+                    const auto session = reader.String(512);
+                    fastkv::SessionDirectory::Record record;
+                    record.version = reader.U64(); record.owner = reader.String(512);
+                    const auto owned = reader.U32(); reader.End();
+                    Check(owned <= 1 && request.buffers.empty(), "invalid placement announcement");
+                    // Keep the wire field for older peers. Placement is a
+                    // routing hint, never a model-cache eviction priority.
+                    raw->sessions->Update(session, record);
+                    fastkv::Writer writer; writer.U32(7); reply.metadata = std::move(writer.bytes);
+                    return true;
+                }
+                const auto tokens = reader.Ints(size_t(max_positions));
+                const auto session = kind == 6 ? reader.String(512) : std::string(); reader.End();
+                Check(!tokens.empty() && tokens.size() < size_t(max_positions), "invalid routing prompt");
+                Check(tokens.size() <= raw->tokenCapacity, "prompt exceeds routing peer capacity");
+                fastkv::Writer writer;
+                writer.U32(kind); writer.U64(raw->CachedTokens(*this, tokens));
+                writer.U64(raw->workload->tokens.load());
+                writer.U64(uint64_t(std::max(1.0, raw->workload->tokensPerSecond.load())));
+                if (kind == 6) {
+                    const auto record = raw->sessions->Get(session);
+                    writer.U64(record.version); writer.String(record.owner);
+                }
+                reply.metadata = std::move(writer.bytes);
+                return true;
             });
         }
     } catch (...) {
@@ -715,6 +983,9 @@ void basellm::BeginPD(ResponseContext *context) {
     writer.Ints(prefix);
     auto pending = std::make_shared<PDPending>();
     pending->length = prefix.size();
+    pending->sessionKey = context->requestMetadata.sessionKey;
+    pending->sessionCapable.resize(pdRuntime->peers.size(), false);
+    pending->placementCapable.resize(pdRuntime->peers.size(), false);
     const int output = context->generationConfig.output_token_limit;
     pending->reservation = output > 0
                                ? std::min(size_t(max_positions), context->allTokens.size() + size_t(output))
@@ -726,19 +997,20 @@ void basellm::BeginPD(ResponseContext *context) {
     const size_t page = std::max(1, GetPageLen());
     pending->reservation =
         std::min(pdRuntime->tokenCapacity, ((pending->reservation + page - 1) / page) * page);
-    auto route = pdRuntime->routes->Find(pdRuntime->identity, prefix, prefix.size());
-    if (route.state) {
-        fastkv::Reader chosen(route.state->metadata);
-        pending->peer = chosen.String(); chosen.End();
-    } else pending->peer = pdRuntime->peers[pdRuntime->next.fetch_add(1) % pdRuntime->peers.size()];
-    fastkv::Writer chosen; chosen.String(pending->peer);
-    try { pdRuntime->routes->Publish(pdRuntime->identity, prefix, {std::move(chosen.bytes), {}}); }
-    catch (const std::runtime_error &) { /* Routing history is an optional bounded hint. */ }
+    pending->estimates.resize(pdRuntime->peers.size());
+    if (pdRuntime->peers.size() > 1 || !pending->sessionKey.empty()) {
+        pending->probes.resize(pdRuntime->peers.size());
+        pending->probeCancellations.resize(pdRuntime->peers.size());
+        pending->probed.resize(pdRuntime->peers.size(), false);
+        pending->probeKinds.resize(pdRuntime->peers.size(), pending->sessionKey.empty() ? 2 : 6);
+        for (auto &e : pending->estimates) e.available = false;
+    }
     pending->request.metadata = std::move(writer.bytes);
     context->pdPending = std::move(pending);
 }
 
 bool basellm::PollPD(ResponseContext *context) {
+    if (pdRuntime) pdRuntime->FlushAnnouncements();
     if (!context->pdPending)
         return true;
     auto pending = context->pdPending;
@@ -758,10 +1030,13 @@ bool basellm::PollPD(ResponseContext *context) {
             return false;
         }
         try {
+            if (!pdRuntime->SelectPeer(*pending, verbose)) return false;
             // Transient transport pressure must preserve the prompt for retry.
             // The Exchange also holds admission until cancellation/I/O drains.
+            auto lifetime = std::make_shared<std::pair<std::shared_ptr<PDPending::Admission>,
+                                                       std::shared_ptr<void>>>(pending->admission, pending->route);
             pdRuntime->service->TrySubmit(pending->peer, pending->request, pending->result,
-                                          pending->cancellation, pending->admission);
+                                          pending->cancellation, std::move(lifetime));
         } catch (const std::exception &error) {
             std::cerr << "[FastKV PD] admission failed: " << error.what() << std::endl;
             context->error = ResponseContextErrorRuntime;
@@ -774,6 +1049,7 @@ bool basellm::PollPD(ResponseContext *context) {
         return false;
     try {
         auto state = pending->result.get();
+        pending->route.reset();
         std::lock_guard<std::mutex> lock(forwardLocker);
         const auto importBegin = std::chrono::steady_clock::now();
         ImportPDState(*context, state);
@@ -796,6 +1072,8 @@ bool basellm::PollPD(ResponseContext *context) {
                       << " handoff_ms=" << ms << std::endl;
         }
         pending->committed = true;
+        pdRuntime->CommitPlacement(*pending);
+        pdRuntime->FlushAnnouncements();
     } catch (const std::exception &error) {
         std::cerr << "[FastKV PD] request failed: " << error.what() << std::endl;
         context->error = ResponseContextErrorRuntime;

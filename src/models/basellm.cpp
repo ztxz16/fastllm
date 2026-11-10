@@ -3056,7 +3056,10 @@ namespace fastllm {
 
     int basellm::LaunchResponseTokens(const std::vector<int> &inputTokens,
                                       const fastllm::GenerationConfig &generationConfig,
-                                      const std::map <std::string, std::vector <Data*> > &multimodalInput) {
+                                      const std::map <std::string, std::vector <Data*> > &multimodalInput,
+                                      const RequestMetadata &metadata) {
+        if (metadata.sessionKey.size() > 512)
+            throw std::invalid_argument("session key exceeds 512 bytes");
         if (kvMemConfig.enabled && !multimodalInput.empty()) {
             throw std::invalid_argument("KVMem currently supports text-only requests");
         }
@@ -3982,6 +3985,7 @@ namespace fastllm {
         int handleId = responseContextDict.CreateHandle();
         ResponseContext *context = responseContextDict.GetHandle(handleId);
         context->Init(this->block_cnt, this->dataType, this->kvCacheDataType);
+        context->requestMetadata = metadata;
         context->inputTokens = (int)inputTokens.size();
         context->currentTokens = inputTokens;
         context->allTokens = inputTokens;

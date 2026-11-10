@@ -169,6 +169,9 @@ class Service {
     using AsyncHandler = std::function<std::future<Message>(Message)>;
     using CancellableHandler =
         std::function<std::future<Message>(Message, std::shared_ptr<Cancellation>)>;
+    // Metadata-only queries bypass producer admission, but still use bounded
+    // connection/worker queues. Return false for an ordinary request.
+    using ControlHandler = std::function<bool(const Message &, Message &)>;
     explicit Service(Options options = {});
     ~Service();
     Service(const Service &) = delete;
@@ -177,7 +180,8 @@ class Service {
     // Return a promise-backed future promptly; long computation belongs to
     // the caller's executor. Stop does not wait for an unfulfilled promise.
     void StartAsync(const std::string &listenAddress, AsyncHandler handler);
-    void StartAsync(const std::string &listenAddress, CancellableHandler handler);
+    void StartAsync(const std::string &listenAddress, CancellableHandler handler,
+                    ControlHandler control = {});
     void Stop();
     std::string Address() const;
     Message Call(const std::string &peer, const Message &request);
@@ -257,6 +261,7 @@ class PrefixCache {
     };
     struct Statistics {
         uint64_t lookups = 0, hits = 0, inputTokens = 0, hitTokens = 0;
+        uint64_t evictions = 0;
         size_t entries = 0, bytes = 0, logicalBytes = 0;
     };
     // Zero maxEntries uses only the byte budget, including checkpoint metadata.
@@ -266,9 +271,49 @@ class PrefixCache {
     ~PrefixCache();
     void Publish(const std::string &nameSpace, const std::vector<int> &tokens, Message state);
     Hit Find(const std::string &nameSpace, const std::vector<int> &tokens, size_t maxTokens);
+    // Observe current residency without materializing payloads, pinning entries,
+    // refreshing LRU or counting a speculative query as an actual cache hit.
+    size_t ProbeTokens(const std::string &nameSpace, const std::vector<int> &tokens) const;
     size_t BytesUsed() const;
     Statistics Stats() const;
 
+  private:
+    struct Impl;
+    std::unique_ptr<Impl> impl;
+};
+
+// Model/transport-independent routing of prefill work. Estimates are hints;
+// the producer must revalidate cache residency before restoring any state.
+class PrefillRouter {
+  public:
+    struct Estimate {
+        bool available = true;
+        size_t cachedTokens = 0, pendingTokens = 0;
+        double tokensPerSecond = 10000;
+    };
+    struct Route {
+        size_t peer = 0, uncachedTokens = 0;
+        std::shared_ptr<void> lease;
+    };
+    explicit PrefillRouter(size_t peers);
+    Route Reserve(size_t tokens, const std::vector<Estimate> &estimates, size_t preferred = SIZE_MAX,
+                  bool owned = false);
+    std::vector<size_t> Pending() const;
+  private:
+    struct State;
+    std::shared_ptr<State> state;
+};
+
+// Bounded, convergent placement hints shared by producers and consumers.
+// A hint never authorizes reuse of KV; normal token/generation checks still apply.
+class SessionDirectory {
+  public:
+    struct Record { uint64_t version = 0; std::string owner; };
+    explicit SessionDirectory(size_t capacity);
+    ~SessionDirectory();
+    Record Get(const std::string &key) const;
+    bool Update(const std::string &key, const Record &record);
+    static bool Newer(const Record &a, const Record &b);
   private:
     struct Impl;
     std::unique_ptr<Impl> impl;

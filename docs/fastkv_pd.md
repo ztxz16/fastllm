@@ -59,7 +59,7 @@ ftllm router stop --config pd.json
 
 `start` 表示进程已创建，模型仍可能在加载。`status` 区分 `running` 和 `ready`。HTTP `/health` 检查 D 以及它的 P 依赖。部署记录包含 PID、启动时间和 boot ID，停止时核实进程身份，不按进程名称批量终止。
 
-可以配置多个 P 和多个 D。D 默认轮转使用所有 P，也可以用执行组的 `prefill` 字段指定 endpoint 子集。HTTP router 负责 D 的队列与会话亲和性，KV 不经过 HTTP router。D 记录已路由的完整 token 前缀与 P 的对应关系，续接请求优先回到原 P，首次请求轮转分配。该提示不保证 P 计算已经完成或缓存仍然存在，也不是实时负载均衡；多个 P 的缓存不共享。当前静态分配要求某个 D 的全部 P 依赖都在线；不支持运行中自动变更拓扑。
+可以配置多个 P 和多个 D。D 默认在所有 P 中根据可恢复前缀与负载选择目标，也可以用执行组的 `prefill` 字段指定 endpoint 子集。HTTP router 负责 D 的队列与会话亲和性，KV 不经过 HTTP router。多个 P 的缓存不共享；查询结果不保证请求接纳时缓存仍然存在。当前静态分配要求某个 D 的全部 P 依赖都在线；不支持运行中自动变更拓扑。
 
 ## 调度和线程归属
 
@@ -81,13 +81,16 @@ P 的单个请求在恢复或导出失败时只返回该请求的错误；批量
 - P 的网络请求先进入同一个模型执行队列。支持 prefill 合批的模型按请求数和总 token 预算合并 chunk，再调用批量前向；每条请求保留独立的位置、KV 和交接结果。未声明合批能力的模型保留单请求前向。DeepSeek V4.1 仅在纯 GPU 模式启用，Naive 使用已有的普通 TP 合批能力。
 - P 复用 `--max_batch`、`--prefill_batch_tokens`、`--prefill_batch_requests`、`--prefill_max_requests` 和 `--prefill_max_wait_ms`。 `--max_batch` 还影响模型预分配的请求/前缀状态容量，不等于每次前向的合批数；大并发多轮会话可提高 P 的 `--max_batch`，同时用 `--prefill_max_requests` 限制活动计算请求、`--prefill_batch_requests` 限制目标合批，避免小计算批次把缓存容量也限制得过小。`chunk_tokens` 是每请求每轮上限；按请求依次消耗总 token 预算，尽量保留完整 chunk，未完成请求移到队尾按轮推进，不将预算平分给全部活动请求。P 返回异步结果，计算等待不占通信线程，合批请求数不再受通信 worker 数限制。`--tokens` 同时约束活动 P 请求的总 prompt 长度，未获额度的请求排队。
 - 传输线程可在 router 的 `transport.transfer_workers` 中设置，P/D group 的同名字段可覆盖全局值；原生 `--pd` JSON 也支持 `transfer_workers`。取值为 1～64，省略时沿用 `max(4, min(max_batch, 16))`。它控制每个请求/回复方向工作池的 worker 数，不改变 GPU 线程数或模型合批上限。P 的 handler/待发送结果准入上限为 `max_batch`；传输队列由 router 根据关联 D 的 `max_inflight` 推导，接收暂存仍受 `max_inflight_bytes` 约束。线程更多不保证更快，应使用独立 probe 测量。
-- P/D 的网络请求和回复分池调度，等待慢 P 计算的 D 请求不占通信 worker，其他 P 的请求及已就绪结果可以继续推进。当前使用静态 peer 列表和前缀亲和性，没有全局负载迁移；GPU 状态整理、缓存发布和模型导入/导出仍有成本，异步传输不等于 GPU 页池直传。
+- P/D 的网络请求和回复分池调度，等待慢 P 计算的 D 请求不占通信 worker，其他 P 的请求及已就绪结果可以继续推进。当前使用静态 peer 列表，D 根据 P 的缓存与负载选择未提交请求的目标，不迁移已在执行的请求；GPU 状态整理、缓存发布和模型导入/导出仍有成本，异步传输不等于 GPU 页池直传。
 - 例如 P 的 DP8/TP1/EP8 部署可使用 `--max_batch 16 --chunked_prefill_size 4096 --prefill_batch_tokens 32768 --prefill_batch_requests 8 --prefill_max_requests 16 --prefill_max_wait_ms 2`，并将 P 配置的 `chunk_tokens` 设为 `4096`。只改拓扑或增加网络并发不能替代模型合批。`[FastKV PD] prefill_batch` 日志记录实际进入一次前向的请求数、token 数和前向耗时。
 - D 在发起远端 prefill 前预留请求槽位和按 KV 页大小向上取整的 token 额度，避免大量已完成 P 的请求挤占 D 显存。未获额度的请求排队，不分配活动模型 KV。
 - 传输只含逻辑状态，不含模型权重、GPU 地址、allocator page ID、graph 或 scratch buffer。数据完整接收并验证后才由模型 adapter 提交。
 - P 默认不创建主存 KV 缓存。模型声明支持 GPU 常驻前缀恢复时直接复用模型页池和状态检查点（Naive），不再建立第二份 FastKV payload 缓存；容量和淘汰仍由模型已有缓存策略管理。其他 adapter 默认使用总计 1 GiB、保留源 GPU 归属的不可变检查点，可用 `device_cache_bytes` 调整或设为 `0` 关闭。此通用 GPU 缓存不做 CPU payload 哈希和跨版本数据块去重。仅在没有模型常驻缓存且显式设置 `cache_bytes > 0` 时启用旧的主存缓存。前缀只在模型可恢复的边界复用，淘汰不使已取得的读取 lease 失效。
 - `max_inflight_bytes` 限制接收 staging；模型预热后再按每张卡剩余显存的一半收紧 GPU staging 预算，保留余量给计算 workspace。P 导出使用独立的有界 GPU arena 池。暂时没有空闲 arena 时等待 lease 释放，单条状态超过预算则明确报错，不自动回退 CPU。各池独立计费，这不是进程全部显存的总上限；P 缓存额度、D 的 `--tokens` 和 HTTP `max_inflight` 也是不同的限制，不应混淆。
 - `ftllm serve` 默认开启模型 verbose 日志；Python API 可用 `model.set_verbose()` 控制。`[FastKV PD] prefix_hit` 记录 P 的前缀复用（未命中为 0），`resident_gpu=1` 表示复用模型 GPU 前缀缓存，此时 FastKV 缓存条目/字节为 0，不代表没有缓存；其他模式记录 FastKV 条目和字节；`handoff_ms` 包含排队、P 计算、打包、传输和导入，不是纯网络耗时。D 保留模型声明支持的 GPU 常驻缓存；对于没有此能力的模型，D 已不使用主存历史恢复，因此也跳过无用的完成请求主存快照。D 的 API `cached_tokens` 当前不把远端 P 命中计入本地缓存统计。`[FastKV PD timing]` 分别记录恢复、记录检查点、导出、发布、释放和导入耗时；累计 `kv_d2h_bytes/kv_h2d_bytes` 只统计 FastKV payload 搬运，不代表模型前向的全部 CUDA 拷贝。
+- D 配置多个 P 时，在提交前异步查询各 P 当前可恢复的前缀、待计算 token 和近期 forward 速度，选择目标时同时计入预计完成时间和放弃更长可用前缀产生的额外重算成本，避免为很小的排队收益反复复制大前缀；过载节点仍可分流。查询不复制 KV、不获取页引用，模型页池匹配会刷新命中页的访问顺序；计算准入已满时仍可处理查询；实际恢复必须重新检查状态，查询不预留缓存。D 的有界查询队列和本地在途工作量避免瞬时请求同时涌向同一个 P；单 P 直接发送。旧 P 不支持查询或所有查询失败时，退回本地在途工作量最少的节点，实际传输仍使用原有严格校验及错误语义。`[FastKV PD route]` 记录所选 peer、缓存估计、待计算量和是否使用查询回退。
+- Naive 的完整 KV 与 SWA 状态需要同时可恢复。每条活动请求仍最多保留三个 prefill 检查点，保留最新边界并分散较早恢复点；整页对齐时在这三个检查点内保留前一页边界以重算 logits。模型把检查点端页注册到各层、各 TP rank 的页池，容量不足时优先回收没有可恢复检查点的闲置后缀，再按 LRU 淘汰；活动页引用仍受保护。普通模型不注册检查点时沿用原页淘汰策略，不增加 GPU 快照槽位或主存 KV 缓存。
+- Naive 的 `[Naive prefix cache]` 分别记录完整 KV 页池容量、空闲/可淘汰页和容量淘汰页数，以及窗口快照淘汰、完整 KV 已失效的孤立窗口、同会话旧窗口回收和全部窗口被持有时的分配失败。完整 KV 页计数来自首个完整注意力 K 页池，不重复累计 TP rank、K/V 或层数；窗口计数是 checkpoint 个数。通用 FastKV checkpoint 缓存的容量淘汰由 `cache_evictions` 记录。
 
 `forward_ms` 是模型前向调用的 CPU 墙钟耗时，不是 CUDA event 计时；D 的 `Decode Speed` 是解码段内的日志速度，遇到新请求的 Prompt 计算会重新计时。评估端到端吞吐时，应在同一时间窗口对照 P 新计算 token、D 稳态样本和 API 输出 token，不能将日志速度与 API 吞吐的差值直接视为传输耗时。
 
@@ -133,3 +136,39 @@ GPU 状态在协议中携带逻辑 rank，由接收方映射到本地 GPU；网�
 - Naive：`naive_n05_verify_graph_test 2 batch_prefill_nosample`，检查不采样的批量 prefill 后 decode 结果。该入口需要 `FASTLLM_TEST_VERIFY_GRAPH_HOOKS`，普通 `naive_n05_tp_model_test` 不包含此模式。
 - Naive 状态交接：`ctest --test-dir build -R '^naive_n05_pd_' --output-on-failure`，需要 4 张空闲 CUDA GPU，覆盖 BF16/FP8/FP4、replicated/layer_shard Indexer、页边界、滑窗回绕以及 eager/Graph 导入后 logits 一致性；不替代双机传输测试。
 - 部署控制：`python -m unittest discover -s test -p test_pd_router.py`，检查参数生成和 P 依赖健康检查；两份示例另用 `ftllm router render --config example/pd/<模板>.json` 验证。
+
+### 路由、缓存和排队的职责
+
+请求可通过 `X-Session-Id`（优先）或 `X-SMG-Routing-Key` 提供最多 512 字节的会话标识。
+会话标识只用于路由，不赋予 KV 或 SWA 快照额外的淘汰优先级；缓存恢复仍校验
+实际 token、模型布局、页 generation 及配套状态。无会话标识的请求使用相同缓存规则。
+多模态请求仍遵循已有的缓存隔离规则。
+
+缓存只有两种所有权：正在使用的状态由请求持有，空闲历史按 LRU 淘汰。
+Naive 复用完整 KV 页引用与 GPU SWA 检查点，优先回收不能恢复的尾部；
+请求持有的共享快照不可覆盖，最后一个引用释放后才允许回收。
+不为已完成会话单独保留永久保底点，也不维护另一套会话缓存索引。
+
+P 的请求按以下生命周期推进，只有模型执行线程创建和释放 GPU 状态：
+
+| 状态 | 缓存所有权 | 预算与处理 |
+|---|---|---|
+| RPC 等待 | 无；路由探测只读元数据 | 按完整输入计入待处理工作，避免把可能失效的命中当成已完成工作 |
+| 已准备 | 恢复并持有完整 KV 与配套状态，尚未执行 forward | 按完整最终 prompt、向上取整到 KV 页预留 token；此队列最多占总 token 容量的一半 |
+| 正在执行 | 继续使用同一个请求上下文 | 与已准备请求共享总 token 容量和 `max_batch` 上限；forward 并行数另受 `prefill_max_requests` 约束 |
+| 完成或取消 | 释放请求引用 | 完成状态可转为空闲历史；取消、异常和停机复用同一释放路径 |
+
+等待请求按到达顺序准入；活跃请求的 chunk 轮转执行。已准备请求优先补入执行队列，
+再准备新的等待请求。准入为完整 prompt 预留空间，避免保留命中前缀后却无法完成新增 token。
+预备额度由现有总 token 容量导出，不增加环境变量或部署参数。仅使用原生驻留前缀缓存
+的模型启用提前准备；其他 adapter 保持原批处理与缓存行为。超大请求不能提前准备时，
+仍可在执行额度释放后正常准入。此机制缩短排队期间的缓存失效窗口，但不保证超出预算
+的等待请求或长期空闲会话必然命中。
+
+多个 P/D 使用有界 `SessionDirectory` 传播已提交的归属。新会话用确定性映射和负载
+选择 P；已建立的归属计入前缀重建成本，并按重建时间判断持续过载，减少瞬时负载波动
+造成的搬迁。持续明显过载、节点不可用，或原 P 已丢失前缀而另一 P 可恢复时允许转移。
+D 成功导入后才公布新归属；通知只更新路由提示，不删除 KV，也不改变模型缓存策略。
+版本号和端点排序使并发、迟到通知收敛；异步通知有界重试，目录淘汰或通知失败不影响
+计算正确性。这不是分布式锁或持久化共识。旧 P 经能力协商继续使用原协议，
+不因提示不受支持而重试已执行的 prefill。

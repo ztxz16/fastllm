@@ -3186,6 +3186,10 @@ class FastLLmCompletion:
           if parser_request is not None:
               self._attach_tool_call_constraint_if_supported(
                   launch_kwargs, parser_request)
+          headers = getattr(raw_request, "headers", {})
+          session_key = headers.get("x-session-id") or headers.get("x-smg-routing-key")
+          if session_key:
+              launch_kwargs["session_key"] = session_key
           handle = self.model.launch_stream_response(
               messages, **launch_kwargs)
           return input_token_len, handle
@@ -3442,6 +3446,10 @@ class FastLLmCompletion:
               thinking_effort = thinking_effort,
               tool_choice = tool_choice,
               chat_template_kwargs = chat_template_kwargs)
+          headers = getattr(raw_request, "headers", {})
+          session_key = headers.get("x-session-id") or headers.get("x-smg-routing-key")
+          if session_key:
+              launch_kwargs["session_key"] = session_key
           launched_handle = self.model.launch_stream_response(
               messages, **launch_kwargs)
           return input_len, launched_handle

@@ -90,7 +90,13 @@ namespace fastllm {
         }
     };
 
+    struct RequestMetadata {
+        // Routing hint only; never substitutes for exact prefix validation.
+        std::string sessionKey;
+    };
+
     struct ResponseContext {
+        RequestMetadata requestMetadata;
         std::shared_ptr<PDPending> pdPending;
         uint64_t generation = 0; // Distinguish a reused handle while a consumer waits.
         std::unique_ptr<PrefillPrefixPreview> prefillPreview;
@@ -418,7 +424,8 @@ namespace fastllm {
 
         virtual int LaunchResponseTokens(const std::vector <int> &inputTokens,
                                          const GenerationConfig &generationConfig = GenerationConfig(),
-                                         const std::map <std::string, std::vector <Data*> > &multimodalInput = {}); // 启动一个response任务，返回分配的handleId
+                                         const std::map <std::string, std::vector <Data*> > &multimodalInput = {},
+                                         const RequestMetadata &metadata = {}); // 启动一个response任务，返回分配的handleId
         
         // A speculative forward may have already verified more than one token.
         // Publish these through the normal per-token stop/grammar/history path

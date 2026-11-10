@@ -451,12 +451,12 @@ void CloverModel::ValidateRequest(const std::vector<int> &tokens, const Generati
 }
 
 int CloverModel::LaunchResponseTokens(const std::vector<int> &tokens, const GenerationConfig &c,
-        const std::map<std::string, std::vector<Data *>> &multimodal) {
+        const std::map<std::string, std::vector<Data *>> &multimodal, const RequestMetadata &metadata) {
     std::lock_guard<std::mutex> guard(launchLocker);
     Require(multimodal.empty(), "only text requests are supported");
     launchingOptions = defaults;
     ValidateRequest(tokens, c, launchingOptions);
-    return basellm::LaunchResponseTokens(tokens, c);
+    return basellm::LaunchResponseTokens(tokens, c, multimodal, metadata);
 }
 
 int CloverModel::LaunchClover(const std::vector<int> &tokens, const json11::Json &j) {

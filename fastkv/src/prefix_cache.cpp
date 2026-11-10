@@ -131,6 +131,7 @@ struct PrefixCache::Impl {
         }
         if (victim == entries.end())
             return false;
+        ++stats.evictions;
         Erase(victim->first);
         return true;
     }
@@ -343,6 +344,11 @@ PrefixCache::Hit PrefixCache::Find(const std::string &name, const std::vector<in
     ++p.stats.hits;
     p.stats.hitTokens += entry.state->tokens.size();
     return {entry.state->tokens.size(), std::move(state)};
+}
+size_t PrefixCache::ProbeTokens(const std::string &name, const std::vector<int> &tokens) const {
+    std::lock_guard<std::mutex> lock(impl->mutex);
+    const auto id = impl->Match(name, tokens, tokens.size());
+    return id ? impl->entries.at(id).state->tokens.size() : 0;
 }
 size_t PrefixCache::BytesUsed() const { return impl->budget.Used(); }
 PrefixCache::Statistics PrefixCache::Stats() const {

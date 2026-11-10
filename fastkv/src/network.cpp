@@ -256,6 +256,7 @@ struct Service::Impl {
     Pool servers, clients, sendReplies, receiveReplies;
     Socket listener;
     CancellableHandler handler;
+    ControlHandler control;
     std::thread acceptor, progress;
     std::condition_variable wake;
     enum class Stage { Connect, ReceiveRequest, IdleRequest, Admit, Handler, Reply, Drain };
@@ -594,6 +595,23 @@ struct Service::Impl {
             } else ++reusedConnections;
             c->request = ReceiveMessage(c->channel->socket, c->channel->rdma.get(), c->deadline);
             c->stage = Stage::Admit;
+            if (control && c->request.buffers.empty()) {
+                std::promise<Message> ready;
+                Message reply;
+                bool handled = false;
+                try {
+                    handled = control(c->request, reply);
+                    if (handled) {
+                        Require(reply.buffers.empty(), "FastKV: control reply must be metadata-only");
+                        ready.set_value(std::move(reply));
+                    }
+                } catch (...) { handled = true; ready.set_exception(std::current_exception()); }
+                if (handled) {
+                    c->request = {};
+                    c->result = ready.get_future();
+                    c->stage = Stage::Handler;
+                }
+            }
             Park(c);
         } catch (...) { Fail(c, std::current_exception()); }
     }
@@ -755,9 +773,10 @@ void Service::StartAsync(const std::string &address, AsyncHandler h) {
         return h(std::move(request));
     });
 }
-void Service::StartAsync(const std::string &address, CancellableHandler h) {
+void Service::StartAsync(const std::string &address, CancellableHandler h, ControlHandler control) {
     Require(!impl->stopped && !impl->acceptor.joinable() && bool(h), "FastKV: invalid service start");
     impl->handler = std::move(h);
+    impl->control = std::move(control);
     impl->listener = Open(address, true, std::chrono::steady_clock::now() + std::chrono::seconds(30));
     impl->acceptor = std::thread([this] {
         while (!impl->stopped) {

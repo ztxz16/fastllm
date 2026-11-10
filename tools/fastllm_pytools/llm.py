@@ -472,11 +472,18 @@ fastllm_lib.response_str_llm_model.argtypes = [ctypes.c_int, ctypes.c_char_p,
                                                ctypes.c_float, ctypes.c_float, ctypes.c_bool]
 fastllm_lib.response_str_llm_model.restype = ctypes.c_char_p
 
-fastllm_lib.launch_response_str_llm_model.argtype = [ctypes.c_int, ctypes.c_char_p,
+fastllm_lib.launch_response_str_llm_model.argtypes = [ctypes.c_int, ctypes.c_char_p,
                                                      ctypes.c_int, ctypes.c_int, ctypes.c_bool, ctypes.c_float, ctypes.c_int,
                                                      ctypes.c_float, ctypes.c_float, ctypes.c_bool,
                                                      ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
 fastllm_lib.launch_response_str_llm_model.restype = ctypes.c_int
+
+for _launch_name in ("launch_response_llm_model", "launch_response_str_llm_model"):
+    if hasattr(fastllm_lib, _launch_name + "_with_session"):
+        _old_launch = getattr(fastllm_lib, _launch_name)
+        _new_launch = getattr(fastllm_lib, _launch_name + "_with_session")
+        _new_launch.argtypes = _old_launch.argtypes + [ctypes.c_char_p]
+        _new_launch.restype = ctypes.c_int
 
 fastllm_lib.fetch_response_str_llm_model.argtypes = [ctypes.c_int, ctypes.c_int]
 fastllm_lib.fetch_response_str_llm_model.restype = ctypes.c_char_p
@@ -2825,7 +2832,16 @@ class model:
                         thinking_effort = None, tool_choice = None,
                         chat_template_kwargs = None,
                         tool_call_constraint: Optional[Dict[str, Any]] = None,
-                        clover_options: Optional[Dict[str, Any]] = None):
+                        clover_options: Optional[Dict[str, Any]] = None,
+                        session_key: Optional[str] = None):
+        session_bytes = (session_key or "").encode("utf-8")
+        if len(session_bytes) > 512 or b"\0" in session_bytes:
+            raise ValueError("session key must contain at most 512 UTF-8 bytes without NUL")
+        def launch_text(name, *args):
+            extended = getattr(fastllm_lib, name + "_with_session", None)
+            if session_bytes and extended is not None:
+                return extended(*args, session_bytes)
+            return getattr(fastllm_lib, name)(*args)
         is_clover = self._is_clover()
         sampling_defaults = (self.default_generation_config if is_clover else
                              dict(do_sample=True, top_p=0.8, top_k=1, temperature=1.0, repetition_penalty=1.0))
@@ -3130,7 +3146,7 @@ class model:
                 handle = self._launch_clover(input, max_length, min_length, do_sample, top_p,
                     top_k, temperature, repeat_penalty, stop_token_ids, clover_options)
             else:
-                handle = fastllm_lib.launch_response_llm_model(self.model, len(input), (ctypes.c_int * len(input))(*input),
+                handle = launch_text("launch_response_llm_model", self.model, len(input), (ctypes.c_int * len(input))(*input),
                                                             max_length, min_length, do_sample, top_p, top_k, temperature, repeat_penalty,
                                                             False, stop_token_len, stop_token_list)
             if (self.save_history):
@@ -3165,13 +3181,13 @@ class model:
                     top_k, temperature, repeat_penalty, stop_token_ids, clover_options)
             if (self.save_history):
                 input = self.tokenizer_cache.tokenize_with_cache(self, prompt)
-                handle = fastllm_lib.launch_response_llm_model(self.model, len(input), (ctypes.c_int * len(input))(*input),
+                handle = launch_text("launch_response_llm_model", self.model, len(input), (ctypes.c_int * len(input))(*input),
                                                             ctypes.c_int(max_length), ctypes.c_int(min_length), ctypes.c_bool(do_sample), ctypes.c_float(top_p), ctypes.c_int(top_k),
                                                             ctypes.c_float(temperature), ctypes.c_float(repeat_penalty), ctypes.c_bool(False),
                                                             stop_token_len, stop_token_list)
                 self.current_tokenizer_cache[handle] = [[prompt], [input]]
             else:
-                handle = fastllm_lib.launch_response_str_llm_model(self.model, prompt.encode(),
+                handle = launch_text("launch_response_str_llm_model", self.model, prompt.encode(),
                                                                 ctypes.c_int(max_length), ctypes.c_int(min_length), ctypes.c_bool(do_sample), ctypes.c_float(top_p), ctypes.c_int(top_k),
                                                                 ctypes.c_float(temperature), ctypes.c_float(repeat_penalty), ctypes.c_bool(False),
                                                                 stop_token_len, stop_token_list)
