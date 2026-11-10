@@ -72,6 +72,7 @@ namespace fastllm {
         std::vector<int> PDDevices() const override { return tpDevices; }
         bool HasPDResidentPrefixCache() const override { return saveHistoryChat && !tpPagedCaches.empty(); }
         fastkv::Message ExportPDState(ResponseContext &context) override;
+        fastkv::CacheSnapshot DescribePDCache(ResponseContext &context, const fastkv::Message &state) override;
         void ImportPDState(ResponseContext &context, const fastkv::Message &state) override;
         void AddPromptCache(const std::vector<int> &tokens) override;
         int GetKVCacheRetainedTokens(int layer) const override;

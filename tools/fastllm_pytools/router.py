@@ -67,6 +67,10 @@ def load_config(path):
                 pd['listen'] = group.get('listen', group['endpoint'])
                 pd['chunk_tokens'] = group.get('chunk_tokens', 2048)
                 pd['cache_bytes'] = group.get('cache_bytes', 0)
+                if 'cache_workers' in group:
+                    if type(group['cache_workers']) is not int or not 1 <= group['cache_workers'] <= 64:
+                        raise ValueError('cache_workers must be an integer in [1, 64]')
+                    pd['cache_workers'] = group['cache_workers']
                 if 'device_cache_bytes' in group:
                     pd['device_cache_bytes'] = group['device_cache_bytes']
             else:

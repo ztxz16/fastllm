@@ -19,6 +19,13 @@ int main() {
         quotes[0].pendingTokens = 10000;
         Check(router.Reserve(1000, quotes).peer == 1, "affinity stranded work behind a busy producer");
         quotes[0] = {}; quotes[1] = {};
+        quotes[0].hostCachedTokens = 9900; quotes[0].restoreSeconds = .02;
+        Check(router.Reserve(10000, quotes).peer == 0, "L2 hit treated as a full recompute");
+        quotes[1].cachedTokens = 9900;
+        Check(router.Reserve(10000, quotes).peer == 1, "L1 ignored restore cost");
+        quotes[1] = {}; quotes[0].pendingRestoreSeconds = 10;
+        Check(router.Reserve(10000, quotes).peer == 1, "L2 transfer queue ignored");
+        quotes[0] = {}; quotes[1] = {};
         quotes[0].cachedTokens = 9000;
         quotes[0].pendingTokens = 11000;
         Check(router.Reserve(10000, quotes).peer == 0,

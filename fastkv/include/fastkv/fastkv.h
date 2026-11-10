@@ -290,6 +290,8 @@ class PrefillRouter {
         bool available = true;
         size_t cachedTokens = 0, pendingTokens = 0;
         double tokensPerSecond = 10000;
+        size_t hostCachedTokens = 0;
+        double restoreSeconds = 0, pendingRestoreSeconds = 0;
     };
     struct Route {
         size_t peer = 0, uncachedTokens = 0;

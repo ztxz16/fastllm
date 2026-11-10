@@ -20,7 +20,7 @@ cmake -S fastkv -B build-fastkv \
 cmake --build build-fastkv -j
 ```
 
-嵌入其他 CMake 项目时，可以使用 `add_subdirectory(fastkv)`，然后链接 `fastkv` target。公共头文件为 `fastkv/fastkv.h`。
+嵌入其他 CMake 项目时，可以使用 `add_subdirectory(fastkv)`，然后链接 `fastkv` target。公共头文件为 `fastkv/fastkv.h`；异步主存缓存接口为 `fastkv/host_cache.h`。
 
 诊断工具在每批计时窗口后校验每一个返回的 payload 字节。`seconds` 包含计时批次的连接、分配、注册和传输；`wall_seconds` 还包含预热和客户端校验。`--warmup N` 可在计时前预热 N 次调用；不指定时包含冷启动。校验期间暂停打流，因此这里测的是传输批次带宽，不是包含校验的持续业务吞吐。并发下的 `amortized_call_ms` 是摊销耗时，不是单请求延迟。
 
@@ -65,12 +65,19 @@ flowchart LR
 | `Budget` | RAII 字节或槽位额度；最后一个 lease 释放后归还额度。 |
 | `PlanCopies` | 同一逻辑表示下的多维分片交集，支持源副本去重，拒绝覆盖缺口和歧义。 |
 | `ObjectStore` | 完整对象的不可变发布、LRU 淘汰、读取 lease；被读取的对象不会提前释放。 |
+| `HostCache` | 完整检查点的异步 CPU L2；不可变区域增量备份、pageable 驻留与有界 pinned 暂存、后台恢复、取消、预算与统计。 |
 | `PrefixCache` | 命名空间隔离的边界状态缓存；共享不可变数据块，命中前比较完整 token 序列，数据块复用前比较完整字节。 |
 | `PrefillRouter` | 根据当前缓存、待计算 token 和处理速度选择 P；本地在途 lease 覆盖远端统计尚未更新的请求，取消/完成后归还。 |
 
 `PrefixCache` 以 64 KiB 数据块共享不同版本的相同 payload；窗口、压缩尾部和循环状态发生变化时保存独立内容。只恢复调用者实际发布过的 token 边界，不推断任意中间位置的模型状态。默认按唯一数据块和 checkpoint 元数据的字节预算限制容量；可选的 `maxEntries` 仅是额外条目上限。容量不足时优先淘汰已有后继的旧版本，再按访问时间淘汰叶子，正在读取的状态受 lease 保护。
 
 命中后按原有 tensor 边界重建只读 `Message`，不改变模型 adapter 或传输协议。这个活动读取副本属于请求的临时内存，不计入驻留缓存预算；同时读取同一 checkpoint 会复用该副本。上述行为用于默认 Host 分块缓存。`storageDevice=-2` 改为保留各 buffer 源设备的独立不可变快照，不读回 CPU、不做 payload 哈希或块去重，命中直接持有 GPU 快照 lease，所有 payload 仍计入同一字节预算。两种模式都不等于 GPU 页池零拷贝或 P/D 增量传输。
+
+`HostCache` 不调用模型对象，不解释编码、量化 scale 或循环状态。`CacheSnapshot` 的 `Message` 描述完整状态，`CachePayload` 按原 buffer 顺序描述无重叠、完整覆盖的 `CacheRegion`。身份非空的区域必须是该命名空间中不可变的同一字节版本；空身份适用于 SWA/SSM 等边界状态。只有调用方实际恢复过的 `Hit` 才可作为 `restoredParent`，且仅 `prefixRange` 区域允许继承，不能混用独立重算产生的数值版本。
+
+`PublishAsync` 要求源 buffer 已就绪、不可变且持有生命周期。队列忙时返回 `false`；后续备份失败保留旧检查点并计入统计。目录只在所有区域复制完成后原子发布。`Find` 固定完整 checkpoint，`ProbeTokens` 只查元数据；`RestoreAsync` 返回后台产生的 future，消费者得到相同 metadata 和 buffer 边界。设备放置由调用者提供。提交返回 `false` 表示暂时的额度/队列压力；不可能满足的目标放置明确报错。取消或丢弃 future 不会提前释放 DMA 中的内存。
+
+`Options.bytes` 约束唯一物理 Host arena 与元数据，读取 lease 仍计费；`inflightBytes` 约束源/目标在途字节，恢复完成后的目标缓冲区继续持有额度到消费者释放。可用 `restoreDeviceBytes` 进一步限制各目标设备。每 worker 每设备的 pinned 暂存上限是 `stagingBytes`，不随 Host 缓存容量增长。采用私有 non-blocking CUDA stream，每轮不同 GPU 的 DMA 同时提交；只等待本 worker 的流，无 `cudaDeviceSynchronize`。目前不自动绑定 NUMA，也不直接写模型页表；详见 [设计与实现边界](docs/l2-cache-design.md)。
 
 命名空间由调用者给出，应覆盖 checkpoint、adapter 布局以及租户/媒体等隔离身份。同一命名空间和完整 token 序列只发布一次；调用者改变计算语义时必须换命名空间。内容哈希仅用于筛选候选：token 完整比较决定前缀命中，payload 完整字节比较决定数据块共享。物理 64 KiB 数据块不是模型的 KV token 页，也不代表能在该处恢复循环或压缩状态。
 

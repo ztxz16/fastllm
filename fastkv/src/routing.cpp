@@ -28,10 +28,15 @@ PrefillRouter::Route PrefillRouter::Reserve(size_t tokens, const std::vector<Est
     };
     auto lease = std::make_shared<Lease>();
     std::lock_guard<std::mutex> lock(state->mutex);
+    auto useHost = [](const Estimate &e) {
+        return e.hostCachedTokens > e.cachedTokens && e.tokensPerSecond > 0 &&
+            e.restoreSeconds < double(e.hostCachedTokens - e.cachedTokens) / e.tokensPerSecond;
+    };
+    auto cached = [&](const Estimate &e) { return useHost(e) ? e.hostCachedTokens : e.cachedTokens; };
     size_t bestMiss = tokens;
     for (const auto &e : estimates) {
         if (e.available && std::isfinite(e.tokensPerSecond) && e.tokensPerSecond > 0)
-            bestMiss = std::min(bestMiss, std::max(size_t(1), tokens - std::min(tokens, e.cachedTokens)));
+            bestMiss = std::min(bestMiss, std::max(size_t(1), tokens - std::min(tokens, cached(e))));
     }
     size_t best = estimates.size(), cost = 0;
     double score = std::numeric_limits<double>::infinity();
@@ -40,8 +45,10 @@ PrefillRouter::Route PrefillRouter::Reserve(size_t tokens, const std::vector<Est
     for (size_t i = 0; i < estimates.size(); ++i) {
         const size_t peer = (state->next + i) % estimates.size();
         const auto &e = estimates[peer];
-        if (!e.available || !std::isfinite(e.tokensPerSecond) || e.tokensPerSecond <= 0) continue;
-        const size_t miss = std::max(size_t(1), tokens - std::min(tokens, e.cachedTokens));
+        if (!e.available || !std::isfinite(e.tokensPerSecond) || e.tokensPerSecond <= 0 ||
+            !std::isfinite(e.restoreSeconds) || e.restoreSeconds < 0 ||
+            !std::isfinite(e.pendingRestoreSeconds) || e.pendingRestoreSeconds < 0) continue;
+        const size_t miss = std::max(size_t(1), tokens - std::min(tokens, cached(e)));
         // Local leases cover bursts not yet visible in remote queue telemetry.
         // max avoids counting the same submitted work twice.
         // A small queue advantage must not repeatedly duplicate a resident
@@ -49,7 +56,7 @@ PrefillRouter::Route PrefillRouter::Reserve(size_t tokens, const std::vector<Est
         // their cache capacity. Charge the extra recomputation once beyond this
         // request's ETA. A sufficiently overloaded warm producer can still spill.
         const double seconds = (double(std::max(e.pendingTokens, state->pending[peer])) + miss + (miss - bestMiss)) /
-                               e.tokensPerSecond;
+                               e.tokensPerSecond + (useHost(e) ? e.pendingRestoreSeconds + e.restoreSeconds : 0);
         if (peer == preferred) { preferredScore = seconds; preferredCost = miss; }
         if (seconds < score) { best = peer; cost = miss; score = seconds; }
     }
@@ -69,7 +76,7 @@ PrefillRouter::Route PrefillRouter::Reserve(size_t tokens, const std::vector<Est
         // for future turns. Its benefit must cover both costs, and remain
         // visible for at least one rebuild rather than a single batch wave.
         const double margin = std::max(2.0, 2.0 * rebuild);
-        const bool lostPrefix = estimates[preferred].cachedTokens < tokens / 4 && bestMiss < tokens / 4;
+        const bool lostPrefix = std::max(estimates[preferred].cachedTokens, estimates[preferred].hostCachedTokens) < tokens / 4 && bestMiss < tokens / 4;
         if (lostPrefix || preferredScore <= score + margin) since = {};
         else if (since == std::chrono::steady_clock::time_point{}) since = now;
         if (!lostPrefix && (since == std::chrono::steady_clock::time_point{} ||

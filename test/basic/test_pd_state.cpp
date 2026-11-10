@@ -614,6 +614,7 @@ int main() {
                                                  {"transport", "tcp"},
                                                  {"listen", endpoint},
                                                  {"cache_bytes", 16384},
+                                                 {"device_cache_bytes", 0},
                                                  {"chunk_tokens", 2}});
         SetMaxTokens(4096);
         decode.tokensLimit = 130;

@@ -85,12 +85,17 @@ P 的单个请求在恢复或导出失败时只返回该请求的错误；批量
 - 例如 P 的 DP8/TP1/EP8 部署可使用 `--max_batch 16 --chunked_prefill_size 4096 --prefill_batch_tokens 32768 --prefill_batch_requests 8 --prefill_max_requests 16 --prefill_max_wait_ms 2`，并将 P 配置的 `chunk_tokens` 设为 `4096`。只改拓扑或增加网络并发不能替代模型合批。`[FastKV PD] prefill_batch` 日志记录实际进入一次前向的请求数、token 数和前向耗时。
 - D 在发起远端 prefill 前预留请求槽位和按 KV 页大小向上取整的 token 额度，避免大量已完成 P 的请求挤占 D 显存。未获额度的请求排队，不分配活动模型 KV。
 - 传输只含逻辑状态，不含模型权重、GPU 地址、allocator page ID、graph 或 scratch buffer。数据完整接收并验证后才由模型 adapter 提交。
-- P 默认不创建主存 KV 缓存。模型声明支持 GPU 常驻前缀恢复时直接复用模型页池和状态检查点（Naive），不再建立第二份 FastKV payload 缓存；容量和淘汰仍由模型已有缓存策略管理。其他 adapter 默认使用总计 1 GiB、保留源 GPU 归属的不可变检查点，可用 `device_cache_bytes` 调整或设为 `0` 关闭。此通用 GPU 缓存不做 CPU payload 哈希和跨版本数据块去重。仅在没有模型常驻缓存且显式设置 `cache_bytes > 0` 时启用旧的主存缓存。前缀只在模型可恢复的边界复用，淘汰不使已取得的读取 lease 失效。
+- P 的 L1 仍复用模型已有 GPU 页池与状态检查点（Naive）；其他 adapter 默认使用总计 1 GiB 的通用 GPU 检查点，可用 `device_cache_bytes` 调整或关闭。在 prefill group 设置 `cache_bytes > 0` 可启用 FastKV 的异步 CPU L2，默认 `0` 关闭。`cache_workers` 控制后台复制线程数，默认 `2`、范围 `[1,64]`。缓存核心不识别模型和 dtype，保存完整检查点及不可变字节区域；Naive 提供页分配版本，使 Full KV 与 indexer 增量备份，SWA 独立保存到同一边界。
+- L2 驻留数据使用普通主存，默认每 worker、每使用过的 GPU 仅分配 8 MiB pinned 暂存；线程数增加也会增加这部分预算。备份队列有界，繁忙或容量不足时跳过备份，不阻塞 forward。恢复保留 lease 到 DMA 和消费者全部结束，完整恢复后才由模型线程提交。L1 已覆盖大部分前缀时比较新增命中收益与整段恢复成本，避免为少量尾部 token 做全量 H2D。
+- L2 在途总预算取运行时收紧后的 `max_inflight_bytes` 一半，每 GPU 恢复预算取该设备 transport staging 预算一半；两者都独立于 Host 驻留容量。单条检查点不能恢复时不保留这份备份，暂时繁忙则排队重试。路由区分 L1、L2 和重算，已取得 L2 lease 的排队请求只计剩余计算量；GPU token 容量仍按完整请求预留。协议支持向旧 probe 降级。
+- L2 当前为每个 P 实例私有，恢复沿用原 PD 表示与 TP 布局；不提供跨 P 共享目录、TP 重分片、量化转换或持久化存储。Host → 私有 GPU message 后仍由现有 adapter scatter 到模型页池，并非直接 DMA 到活动页表。详见 [L2 契约与后续扩展](../fastkv/docs/l2-cache-design.md)。
 - `max_inflight_bytes` 限制接收 staging；模型预热后再按每张卡剩余显存的一半收紧 GPU staging 预算，保留余量给计算 workspace。P 导出使用独立的有界 GPU arena 池。暂时没有空闲 arena 时等待 lease 释放，单条状态超过预算则明确报错，不自动回退 CPU。各池独立计费，这不是进程全部显存的总上限；P 缓存额度、D 的 `--tokens` 和 HTTP `max_inflight` 也是不同的限制，不应混淆。
 - `ftllm serve` 默认开启模型 verbose 日志；Python API 可用 `model.set_verbose()` 控制。`[FastKV PD] prefix_hit` 记录 P 的前缀复用（未命中为 0），`resident_gpu=1` 表示复用模型 GPU 前缀缓存，此时 FastKV 缓存条目/字节为 0，不代表没有缓存；其他模式记录 FastKV 条目和字节；`handoff_ms` 包含排队、P 计算、打包、传输和导入，不是纯网络耗时。D 保留模型声明支持的 GPU 常驻缓存；对于没有此能力的模型，D 已不使用主存历史恢复，因此也跳过无用的完成请求主存快照。D 的 API `cached_tokens` 当前不把远端 P 命中计入本地缓存统计。`[FastKV PD timing]` 分别记录恢复、记录检查点、导出、发布、释放和导入耗时；累计 `kv_d2h_bytes/kv_h2d_bytes` 只统计 FastKV payload 搬运，不代表模型前向的全部 CUDA 拷贝。
-- D 配置多个 P 时，在提交前异步查询各 P 当前可恢复的前缀、待计算 token 和近期 forward 速度，选择目标时同时计入预计完成时间和放弃更长可用前缀产生的额外重算成本，避免为很小的排队收益反复复制大前缀；过载节点仍可分流。查询不复制 KV、不获取页引用，模型页池匹配会刷新命中页的访问顺序；计算准入已满时仍可处理查询；实际恢复必须重新检查状态，查询不预留缓存。D 的有界查询队列和本地在途工作量避免瞬时请求同时涌向同一个 P；单 P 直接发送。旧 P 不支持查询或所有查询失败时，退回本地在途工作量最少的节点，实际传输仍使用原有严格校验及错误语义。`[FastKV PD route]` 记录所选 peer、缓存估计、待计算量和是否使用查询回退。
+- D 配置多个 P 时，在提交前异步查询各 P 当前可恢复的前缀、待计算 token 和近期 forward 速度，选择目标时同时计入预计完成时间和放弃更长可用前缀产生的额外重算成本，避免为很小的排队收益反复复制大前缀；过载节点仍可分流。查询不复制 KV、不获取页引用，模型页池匹配会刷新命中页的访问顺序；计算准入已满时仍可处理查询；实际恢复必须重新检查状态，查询不预留缓存。D 的有界查询队列和本地在途工作量避免瞬时请求同时涌向同一个 P；单 P 同样查询协议能力，以协商会话元数据和 L2 信息。旧 P 不支持查询或所有查询失败时，退回本地在途工作量最少的节点，实际传输仍使用原有严格校验及错误语义。`[FastKV PD route]` 记录所选 peer、缓存估计、待计算量和是否使用查询回退。
 - Naive 的完整 KV 与 SWA 状态需要同时可恢复。每条活动请求仍最多保留三个 prefill 检查点，保留最新边界并分散较早恢复点；整页对齐时在这三个检查点内保留前一页边界以重算 logits。模型把检查点端页注册到各层、各 TP rank 的页池，容量不足时优先回收没有可恢复检查点的闲置后缀，再按 LRU 淘汰；活动页引用仍受保护。普通模型不注册检查点时沿用原页淘汰策略，不增加 GPU 快照槽位或主存 KV 缓存。
 - Naive 的 `[Naive prefix cache]` 分别记录完整 KV 页池容量、空闲/可淘汰页和容量淘汰页数，以及窗口快照淘汰、完整 KV 已失效的孤立窗口、同会话旧窗口回收和全部窗口被持有时的分配失败。完整 KV 页计数来自首个完整注意力 K 页池，不重复累计 TP rank、K/V 或层数；窗口计数是 checkpoint 个数。通用 FastKV checkpoint 缓存的容量淘汰由 `cache_evictions` 记录。
+
+L1 和 L2 共用 `[FastKV PD] prefix_hit`，L2 附带 `cache_tier=l2`，只在完整恢复并提交后计数；已有监控可直接统计有效前缀命中。`[FastKV L2 cache]` 单独统计备份、恢复、复用字节与跳过/失败；异步 L2 DMA 不计入同步 `Buffer::Traffic()` 的旧计数。
 
 `forward_ms` 是模型前向调用的 CPU 墙钟耗时，不是 CUDA event 计时；D 的 `Decode Speed` 是解码段内的日志速度，遇到新请求的 Prompt 计算会重新计时。评估端到端吞吐时，应在同一时间窗口对照 P 新计算 token、D 稳态样本和 API 输出 token，不能将日志速度与 API 吞吐的差值直接视为传输耗时。
 

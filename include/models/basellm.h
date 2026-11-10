@@ -25,7 +25,7 @@ using RuntimeResult = std::function<void(int index, const char* content)>;
 using RuntimeResultBatch = std::function<void(int index, std::vector <std::string> &contents)>;
 #endif
 
-namespace fastkv { struct Message; class BufferPool; }
+namespace fastkv { struct Message; struct CacheSnapshot; class BufferPool; }
 
 namespace fastllm {
     struct PDRuntime;
@@ -723,6 +723,8 @@ namespace fastllm {
         int PreviewPDResidentPrefix(const std::vector<int> &tokens);
         fastkv::BufferPool *PDExportPool() const;
         virtual fastkv::Message ExportPDState(ResponseContext &context);
+        // Opaque immutable regions; policy, storage and transfers belong to FastKV.
+        virtual fastkv::CacheSnapshot DescribePDCache(ResponseContext &context, const fastkv::Message &state);
         virtual void ImportPDState(ResponseContext &context, const fastkv::Message &state);
         std::shared_ptr<PDRuntime> pdRuntime;
 

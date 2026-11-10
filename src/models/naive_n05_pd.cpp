@@ -1,5 +1,6 @@
 #include "models/naive_n05_flash.h"
 #include "pd.h"
+#include "fastkv/host_cache.h"
 #include <algorithm>
 #include <stdexcept>
 #ifdef USE_CUDA
@@ -153,6 +154,48 @@ fastkv::Message NaiveN05FlashModel::ExportPDState(ResponseContext &context) {
     }
     return writer.Finish(devices);
 #endif
+}
+
+fastkv::CacheSnapshot NaiveN05FlashModel::DescribePDCache(ResponseContext &context, const fastkv::Message &wire) {
+    auto snapshot = basellm::DescribePDCache(context, wire);
+#ifdef USE_CUDA
+    const auto devices = tpDevices.empty() ? std::vector<int>{FastllmCudaGetDevice()} : tpDevices;
+    size_t index = 0;
+    auto describe = [&](const Data &key, const Data &storage, int rows, bool range) {
+        auto &payload = snapshot.payloads.at(index++);
+        if (!range || !key.isPagedKVCache || !key.pagedKVCacheData) return;
+        auto &owner = *key.pagedKVCacheData;
+        const size_t rowBytes = GetDataBytes(storage.dataType, 1, storage.dims.back());
+        CheckPD(size_t(rows) * rowBytes == wire.buffers[index - 1].Size(), "cache region shape mismatch");
+        payload.prefixRange = true; payload.regions.clear();
+        std::lock_guard<std::mutex> lock(owner.pageIndexLocker);
+        for (int at = 0; at < rows; at += key.pageLen) {
+            const int page = key.pageIndex.at(at / key.pageLen);
+            const size_t bytes = size_t(std::min(key.pageLen, rows - at)) * rowBytes;
+            // Pool lifetime equals model/cache lifetime. Allocation generation
+            // distinguishes a recycled page; length distinguishes mutable tails.
+            const std::string identity = std::to_string(reinterpret_cast<uintptr_t>(&storage)) + ":" +
+                std::to_string(page) + ":" + std::to_string(owner.pageTimestamp.at(page)) + ":" + std::to_string(bytes);
+            payload.regions.push_back({size_t(at) * rowBytes, bytes, identity});
+        }
+    };
+    for (size_t rank = 0; rank < devices.size(); ++rank) {
+        for (int layer = 0; layer < block_cnt; ++layer) {
+            for (int part = 0; part < 2; ++part) {
+                const auto &root = part ? context.pastKeyValues[layer].second : context.pastKeyValues[layer].first;
+                const auto &cache = devices.size() > 1 ? *root.multiDeviceDatas.at(devices[rank]) : root;
+                describe(cache, cache.pagedKVCacheData ? *cache.pagedKVCacheData : cache,
+                         context.preTokens, !slidingLayers[layer]);
+            }
+            if (HasSeparateIndexer() && HasLocalIndexer(layer, rank)) {
+                const auto &key = *context.pastKeyValues[layer].first.multiDeviceDatas.at(devices[rank]);
+                describe(key, IndexerStorage(layer, rank), context.preTokens, true);
+            }
+        }
+    }
+    // Optional draft/recurrent state keeps the generic boundary-local descriptor.
+#endif
+    return snapshot;
 }
 
 void NaiveN05FlashModel::ImportPDState(ResponseContext &context, const fastkv::Message &wire) {
