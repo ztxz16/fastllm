@@ -10,6 +10,9 @@ NCCL 初始化和标量 SUM 自检、心跳、超时、退出与故障回收。
 “自定义 AllReduce”和“跨请求前缀缓存”各节为准。
 构建选项 `BUILD_PROCESS_TP` 默认关闭，显式开启后才构建进程产物。
 
+新增的 **DP 第一步仅提供参数检查与 GPU 分配预览**，详见文末“DP 参数与 GPU 分配”。
+尚未启动多个模型副本，不能把预览通过当作 DP 推理验收通过。
+
 ## 运行条件
 
 - Linux 5.3+，内核与容器策略允许 `pidfd_open`、`pidfd_send_signal`。
@@ -987,3 +990,66 @@ python3 -m ftllm.cli chat /home/models/Qwen3-1.7B \
   --tp_backend process --tp 2 --prefix-cache true --cuda-graph --custom-allreduce \
   --max-new-tokens 32
 ```
+
+## DP 参数与 GPU 分配（第一步）
+
+新增 `--dp`（完整模型副本数，默认 1）和 `--parallel-plan`（仅输出设备分配 JSON）。
+预览不要求模型目录、原生可执行文件、PyTorch 或 Transformers，不加载模型、不启动推理 worker。
+真实枚举通过 CUDA Driver API 查询可见逻辑设备、UUID 和名称，不创建 CUDA context，
+也不使用 `nvidia-smi` 的物理序号推算分配。需要 Linux 和可加载的 NVIDIA 驱动，不需要编译。
+
+- `DP>1` 必须指定 `--tp-backend process`；此时 `--tp` 为每副本卡数，省略代表 1，范围 1..64。
+  纯 DP 为 `--dp 2 --tp 1`，DP+TP 为 `--dp 2 --tp 2`，分别需要 2、4 张 GPU。
+- 按 CUDA 可见逻辑顺序连续分配，副本间不重复用卡；多余 GPU 不参与分配。
+  用 `CUDA_VISIBLE_DEVICES` 选择或排列设备；多副本暂不接受 `--tp auto`、设备列表或加权配置。
+  卡数不足、重复设备、与 `--device`/`--moe_device` 冲突均报错，不裁剪、不回退。
+  显式可见列表的条目数与驱动实际枚举不一致时也拒绝，防止无效或重复选择器导致静默截断。
+- `DP=1` 的正常执行保持旧行为，不增加驱动查询；原有线程/进程 TP 参数继续有效。
+  单副本预览支持裸卡数、简单编号列表和 `auto`，进程后端沿用原有显式 `--tp` 要求；
+  线程后端的加权设备配置不在本次预览范围内，且预览不会像旧线程路径那样静默裁剪卡数。
+- `--custom-allreduce` 在预览中只允许每副本 `TP=2`，这一步只校验配置，不验证 P2P 连通性。
+- CLI 在 `chat/run/server/serve` 中输出预览后退出。JSON 配置支持 `dp` 和布尔型
+  `parallel_plan`，也接受 `parallel-plan` 别名，但不能同时提供两个别名；配置文件保持原有覆盖 CLI 的顺序。
+  JSON 中 `dp: true`、浮点数或字符串都拒绝，不能绕过正整数校验。
+- 没有 `--parallel-plan` 时，`DP>1` 在配置与设备检查后明确报“多副本执行尚未接入”。
+  模型工厂和直接进程后端同样拒绝，不能静默启动一个副本。
+- 返回的 JSON 包含 `dp_size`、`tp_size`、`total_gpus`、`visible_device_count` 和 `replicas`。
+  每个副本包含 `dp_rank` 和设备的 `logical_id`、`uuid`、`name`。
+  `driver_cuda_version` 是驱动支持的 CUDA 版本编码，不是所安装 Toolkit 的版本；
+  `preview_only: true`、`multi_replica_execution_available: false` 明确本阶段能力边界。
+
+以下命令在仓库根目录直接使用当前源码的正式 CLI，无需更新旧构建包或重新编译。
+先在两卡服务器检查纯 DP：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 PYTHONPATH="$PWD/tools${PYTHONPATH:+:$PYTHONPATH}" \
+  python3 -m fastllm_pytools.cli serve \
+  --tp-backend process --dp 2 --tp 1 --parallel-plan
+```
+
+若有四张 GPU，再预览 DP+TP（两张卡不能通过这项实际设备检查）：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 PYTHONPATH="$PWD/tools${PYTHONPATH:+:$PYTHONPATH}" \
+  python3 -m fastllm_pytools.cli serve \
+  --tp-backend process --dp 2 --tp 2 --parallel-plan
+```
+
+带报告的验收入口：
+
+```bash
+# 无 GPU 的 Python 回归：CUDA 查询和原生进程使用测试替身；不会编译。
+python3 test/distributed/run_parallel_config.py
+
+# 两卡服务器：上述回归，加上正式 CLI 的真实 CUDA 设备预览。
+CUDA_VISIBLE_DEVICES=0,1 python3 test/distributed/run_parallel_config.py --real-cuda --dp 2 --tp 1
+
+# 四卡服务器：上述回归，加上 DP+TP 的实际设备预览。
+CUDA_VISIBLE_DEVICES=0,1,2,3 python3 test/distributed/run_parallel_config.py --real-cuda --dp 2 --tp 2
+```
+
+每次生成独立的 `test/distributed/results/*_parallel_config_*` 目录，包含
+`summary.json`、`summary.md`、`summary.csv`、`summary.xlsx` 和原始测试日志；
+实际 GPU 用例另存完整 CLI 命令及 stdout/stderr。任一失败返回非零，中途失败保留已执行部分。
+报告区分模拟与真实驱动路径，记录 Git/命令/设备及 CUDA 来源；未执行真实查询时 GPU/CUDA 为 null，
+编译架构为不适用。此阶段不加载真实模型，不包含模型精度或吞吐性能结论。
