@@ -118,9 +118,9 @@ static void CheckLargePrefill(std::vector<Data *> &weights, int hidden) {
 
 static void Run(int gateKind, int downKind, int hidden = 256, int inter = 128, int passes = 40,
                 bool ownedPp = false, int device = 0, bool qwenTopk10 = false, bool overlapReplay = false,
-                bool workspaceReplay = false, bool largePrefill = false) {
+                bool workspaceReplay = false, bool largePrefill = false, bool batchEntry = false) {
     constexpr int experts = 64, layers = 2;
-    const int topk = qwenTopk10 ? 10 : 6;
+    const int topk = qwenTopk10 || batchEntry ? 10 : 6;
     Cuda(cudaSetDevice(device));
     const int cacheLayers = layers + int(ownedPp);
     std::vector<std::unique_ptr<Data>> owned;
@@ -199,7 +199,9 @@ static void Run(int gateKind, int downKind, int hidden = 256, int inter = 128, i
     // sweep separate so exhaustive placement enumeration remains bounded.
     const std::vector<DataType> types = qwenTopk10 ? std::vector<DataType>{FLOAT16}
                                                  : std::vector<DataType>{FLOAT32, FLOAT16, BFLOAT16};
-    const std::vector<int> rowCounts = overlapReplay ? std::vector<int>{1, 3} :
+    std::unique_ptr<HybridMoeBatch> eager[layers];
+    for (auto &entry : eager) entry = std::make_unique<HybridMoeBatch>();
+    const std::vector<int> rowCounts = batchEntry ? std::vector<int>{1, 3, 16, 5, 33, 1, 17} : overlapReplay ? std::vector<int>{1, 3} :
         qwenTopk10 ? std::vector<int>{1, 2, 3, 4, 9, 17} : std::vector<int>{1, 2, 4, 8, 17, 33, 65};
     for (DataType dtype : types) for (int rows : rowCounts) {
         Data input(dtype, {rows, hidden}), ids[layers], scores[layers], output[layers]; Gpu(input);
@@ -217,14 +219,16 @@ static void Run(int gateKind, int downKind, int hidden = 256, int inter = 128, i
         }
         FastllmCudaEndMoeDecode(scope);
         void *handles[layers]{}, *children[layers]{}, *graph = nullptr, *exec = nullptr, *replay = nullptr;
-        for (int layer = 0; layer < layers; ++layer) {
+        for (int layer = 0; !batchEntry && layer < layers; ++layer) {
             handles[layer] = FastllmCudaCreateNativeMoeFullGraph(layer ? output[0] : input,
                 ids[layer], scores[layer], output[layer], weights[layer].data(), weights[layer].size(), layer,
                 nullptr, &children[layer]);
             Require(handles[layer] && children[layer], ("create Standard mailbox child dtype=" + std::to_string(dtype) + " rows=" + std::to_string(rows)).c_str());
         }
         HybridMoeGraph managed;
-        if (qwenTopk10) {
+        if (batchEntry) {
+            // The eager wrapper owns shape changes, stable inputs and handles.
+        } else if (qwenTopk10) {
             Require(managed.Compose(std::vector<const void *>(children, children + layers),
                 std::vector<void *>(handles, handles + layers)), "compose managed Standard mailbox");
         } else {
@@ -282,7 +286,14 @@ static void Run(int gateKind, int downKind, int hidden = 256, int inter = 128, i
                 if (overlapReplay) for (int layer = 0; layer < layers; ++layer)
                     Require(FastllmCudaNativeMoeGraphOwner(weights[layer].data(),
                         weights[layer].size(), rows) == scope, "hot replay changed cache owner");
-                Require(qwenTopk10 ? managed.Launch() :
+                if (batchEntry) {
+                    int branches = 0;
+                    for (int layer = 0; layer < layers; ++layer)
+                        Require(eager[layer]->Run(layer ? output[0] : input, ids[layer], scores[layer],
+                            output[layer], weights[layer].data(), weights[layer].size(), layer,
+                            [&] { ++branches; }), "shape-sized eager batch entry rejected valid rows");
+                    Require(branches == layers, "eager batch repeated or lost shared branch");
+                } else Require(qwenTopk10 ? managed.Launch() :
                     FastllmCudaLaunchNativeMoeFullGraph(pass%3 ? replay : exec,handles,layers,pass%3==0), "Standard full replay");
                 if (overlapReplay) for (int layer = 0; layer < layers; ++layer)
                     Cuda(cudaMemcpyAsync(static_cast<float *>(snapshots[layer].cudaData) + replayIndex*rows*hidden,
@@ -360,7 +371,9 @@ static void Run(int gateKind, int downKind, int hidden = 256, int inter = 128, i
                 }
             }
         }
-        if (qwenTopk10) {
+        if (batchEntry) {
+            // Retain the same wrappers through the next shape and dtype.
+        } else if (qwenTopk10) {
             managed.Reset();
             Require(!managed && !managed.Launch(), "managed graph reset");
         } else {
@@ -368,6 +381,7 @@ static void Run(int gateKind, int downKind, int hidden = 256, int inter = 128, i
             for (void *handle : handles) FastllmCudaReleaseNativeMoeFullGraph(handle);
         }
     }
+    for (auto &entry : eager) entry.reset();
     if (native) FastllmCudaReleaseMoeCache(referenceWeights[0].data(), referenceWeights[0].size());
     FastllmCudaReleaseMoeCache(weights[0].data(),weights[0].size()); ClearNumasMoeRuntimeCache();
     for (const auto &w : referenceOwned) ReleaseNumasMoeWeightArena(w.get());
@@ -379,6 +393,7 @@ int main(int argc, char **argv) {
     try {
         if (!FastllmCudaGetDeviceCount()) return 77;
         SetThreads(4); SetCudaGraph(true);
+        const bool batchEntry = argc > 1 && std::strcmp(argv[1], "--batch-entry") == 0;
         const bool groupedFormats = argc > 1 && std::strcmp(argv[1], "--grouped-formats") == 0;
         const bool largePrefill = argc > 1 && std::strcmp(argv[1], "--large-prefill") == 0;
         const bool workspaceReplay = argc > 1 && std::strcmp(argv[1], "--workspace-replay") == 0;
@@ -400,7 +415,7 @@ int main(int argc, char **argv) {
             : std::vector<std::pair<int,int>>{{-1,-1},{22,42},{42,42},{21,20},{18,20}};
         for (int device = 0; device < (ownedPp ? 2 : 1); ++device)
             for (auto pair : formats)
-                Run(pair.first,pair.second,hidden,inter,placementPolicy || largePrefill ? 1 : overlapReplay ? 12 : modelShape || ownedPp || groupedFormats ? 4 : 40,ownedPp,device,qwenTopk10,overlapReplay,workspaceReplay,largePrefill);
+                Run(pair.first,pair.second,hidden,inter,batchEntry ? 2 : placementPolicy || largePrefill ? 1 : overlapReplay ? 12 : modelShape || ownedPp || groupedFormats ? 4 : 40,ownedPp,device,qwenTopk10,overlapReplay,workspaceReplay,largePrefill,batchEntry);
         if (groupedFormats || qwenTopk10) {
             const auto report=kernels::Report();
             Require(report.find("cuda.moe.gguf.grouped")!=std::string::npos,"grouped candidates registered");

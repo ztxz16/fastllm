@@ -147,6 +147,24 @@ private:
     std::map<int, HybridMoeDecodeStep> steps;
 };
 
+// Shape-sized eager entry to the same native mailbox used by full graphs.
+// All rows share one expert plan, cache lookup and NUMA batch. One workspace
+// retains only its current shape, so changing concurrency cannot accumulate
+// graph variants. Keep weights/cache owners alive until this object is released.
+class HybridMoeBatch {
+public:
+    HybridMoeBatch();
+    ~HybridMoeBatch();
+    HybridMoeBatch(const HybridMoeBatch &) = delete;
+    HybridMoeBatch &operator=(const HybridMoeBatch &) = delete;
+    bool Run(const Data &input, const Data &index, const Data &score, Data &output,
+             Data **weights, int count, int layer,
+             const std::function<void()> &launchParallel = {});
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl;
+};
+
 // Device/shape eligibility is centralized; model code only supplies placement,
 // the requested layer and whether it is running a pipelined prefill.
 void HybridMoePrefetch(std::vector<std::vector<Data *>> &weights,

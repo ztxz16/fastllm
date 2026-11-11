@@ -210,6 +210,76 @@ bool HybridMoeCachePlan::Prepare(const std::function<void()> &registerNumaWeight
 #endif
 }
 
+struct HybridMoeBatch::Impl {
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+    int device = -1;
+    Data **weights = nullptr;
+    int count = 0, layer = -1;
+    void *owner = nullptr;
+    Data input, index, score, output;
+    HybridMoeGraph graph; // Destroy before the storage and cache handle it uses.
+    ~Impl() {
+        const int previous = FastllmCudaGetDevice();
+        if (device >= 0) FastllmCudaSetDevice(device);
+        if (graph) FastllmCudaSyncCurrentThreadStream();
+        graph.Reset();
+        FastllmCudaSetDevice(previous);
+    }
+#endif
+};
+HybridMoeBatch::HybridMoeBatch() = default;
+HybridMoeBatch::~HybridMoeBatch() = default;
+bool HybridMoeBatch::Run(const Data &input, const Data &index, const Data &score,
+                        Data &output, Data **weights, int count, int layer,
+                        const std::function<void()> &launchParallel) {
+#if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
+    if (FastllmCudaGraphIsCapturingFast() || input.dims.size() != 2 || input.dims[0] < 1 ||
+        input.dataDevice != CUDA || input.dataDeviceIds.size() != 1 ||
+        index.dataDevice != CUDA || score.dataDevice != CUDA ||
+        index.dataDeviceIds != input.dataDeviceIds || score.dataDeviceIds != input.dataDeviceIds ||
+        index.dims.size() != 2 || index.dims[0] != input.dims[0] || score.dims != index.dims ||
+        index.dataType != INT32 || score.dataType != FLOAT32) return false;
+    const int device = input.dataDeviceIds.front();
+    if (FastllmCudaGetDevice() != device) return false;
+    auto *owner = FastllmCudaNativeMoeGraphOwner(weights, count, input.dims[0]);
+    if (!owner) return false;
+    HostMoePlacementScope placement(weights && count >= 4 ? weights[2] : nullptr);
+    if (!impl || impl->owner != owner || impl->device != device || impl->weights != weights ||
+        impl->count != count || impl->layer != layer || impl->input.dims != input.dims ||
+        impl->index.dims != index.dims || impl->input.dataType != input.dataType) {
+        impl.reset();
+        auto next = std::make_unique<Impl>();
+        next->device = device; next->weights = weights; next->count = count;
+        next->owner = owner; next->layer = layer;
+        next->input.CopyFrom(input); next->index.CopyFrom(index); next->score.CopyFrom(score);
+        void *child = nullptr;
+        void *handle = FastllmCudaCreateNativeMoeFullGraph(next->input, next->index, next->score,
+            next->output, weights, count, layer, nullptr, &child);
+        if (!handle || !child) {
+            if (handle) FastllmCudaReleaseNativeMoeFullGraph(handle);
+            return false;
+        }
+        if (!next->graph.Compose({child}, {handle})) return false;
+        impl = std::move(next);
+    } else {
+        for (auto pair : {std::make_pair(&impl->input, &input),
+                          std::make_pair(&impl->index, &index),
+                          std::make_pair(&impl->score, &score)})
+            AssertInFastLLM(FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(
+                pair.first->cudaData, pair.second->cudaData, pair.second->GetBytes()),
+                "Hybrid batch input transfer failed");
+    }
+    // The caller's branch is submitted once, only after eligibility succeeds.
+    // The mailbox graph owns the routed CPU/GPU join and any staged uploads.
+    if (launchParallel) launchParallel();
+    AssertInFastLLM(impl->graph.Launch(), "Hybrid batch expert replay failed");
+    output.CopyFrom(impl->output);
+    return true;
+#else
+    return false;
+#endif
+}
+
 HybridMoeDecodeStep::~HybridMoeDecodeStep() { Finish(); }
 void HybridMoeDecodeStep::Begin(Data **weights, int count, int topk,
                                const std::vector<int> *devices) {
