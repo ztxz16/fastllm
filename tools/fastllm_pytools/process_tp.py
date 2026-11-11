@@ -64,6 +64,9 @@ def native_binary(value, name):
 def validate_options(args):
     """进程后端仅接受已实现的参数；拒绝线程后端专用配置，绝不静默忽略。"""
     from .util import make_normal_parser, add_server_args
+    from .parallel_config import prepare_parallel_entry
+
+    prepare_parallel_entry(args)
 
     parser = make_normal_parser('process validation')
     add_server_args(parser)
@@ -125,6 +128,9 @@ class ProcessTPModel:
     backend = BACKEND
 
     def __init__(self, args):
+        from .util import load_model_args
+
+        load_model_args(args)
         validate_options(args)
         self.devices = process_devices(getattr(args, 'tp', ''))
         self.model_path = Path(getattr(args, 'path', '') or args.model or '').expanduser().resolve()
