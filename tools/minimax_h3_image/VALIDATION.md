@@ -106,3 +106,40 @@ Reviewed on `master` at `5cc1d98cfdd7e123da55f86a87cee35670504f75`, with the vid
 - `ldd` confirmed no Torch/Python runtime dependency. Test resources were released, and the existing launcher service was left running. `git diff --check` passed; no commit or push was performed.
 
 Review logs and the final patch/manifest are under `/workspace2/experiments/minimax-h3-native/image-native-20261111/commit-readiness-20261111`. These checks support committing the two features separately; workload and release-packaging limitations above still apply.
+
+
+## Persistent inference and batched image VAE optimization (2026-11-11)
+
+Base: `43758adf012978d42d9ce369c3d1204ddbc42dac`. Single RTX PRO 5000 72 GB, physical GPU 4, 2048×2048, six BF16 steps, seed 42, same prompts and reference as the prior SGLang comparison. Each case ran four times; the table reports the median of the last three requests. Initialization and PNG encoding/writes are excluded. Stage boundaries synchronize CUDA and include weight preparation/movement. These are warm persistent-process results, not cold CLI latency.
+
+| Stage (seconds) | Before T2I | After T2I | Before edit | After edit |
+| --- | ---: | ---: | ---: | ---: |
+| Text encoding | 20.8589 | 0.9295 | 21.4042 | 1.0370 |
+| Reference VAE encoding | 0.0000 | 0.0000 | 3.8583 | 4.1234 |
+| AdaLN preparation | 3.2029 | 0.0000 | 3.2409 | 0.0000 |
+| Six DiT steps / preparation | 10.5484 | 6.1116 | 20.5773 | 16.0591 |
+| VAE decoding | 0.8305 | 0.3203 | 0.8193 | 0.3191 |
+| Other | 0.3648 | 0.0043 | 0.5221 | 0.1555 |
+| Total | 35.8276 | 7.3659 | 50.4109 | 21.7064 |
+
+- Reuse the bounded CPU text-weight cache and fixed AdaLN tables across requests. With at least 60 GiB initially available (or an explicit budget of that size), keep DiT and VAE decoder weights resident; retain the existing stage/layer unloading path below that threshold. Text embeddings and reference latents are still recomputed on every request. Reuse the tokenizer as well.
+- Batch independent VAE tile sequences, repack native interleaved QKV weights once, and use the existing native packed attention/QK-norm/RoPE kernels. Memory-aware batches are capped at 128 tiles. Low-memory and FP32 paths retain sequential tile decoding and the original overlap blending order. No new Torch or Triton runtime dependency.
+- T2I improves from 35.8276 to 7.3659 seconds (4.86×); single-reference editing from 50.4109 to 21.7064 seconds (2.32×). The prior same-protocol SGLang default/lossless result was 9.4139 seconds, and strict/exact was 9.9875 seconds. SGLang was not rerun here. Its previously observed edit correctness failure means edit timings are not equivalent-quality cross-engine comparisons.
+- Warm post-request GPU usage was 42,450 MiB for T2I and 43,222 MiB for editing, including the CUDA pool/context; weights remain allocated while the service is idle. Peak process RSS was 48,873/50,090 MiB, within the shared host-cache policy. Explicit memory limits remain the way to trade cached speed for capacity.
+- Checkpoint-dependent `minimax_h3_image_decode` tests compare sequential and batched outputs for 16×16 and 5×11 latent tiles, batch sizes 2/3/8/128, all 24 decoder blocks for small batches, and changing tile shapes. Maximum relative L2 was 0.00619592, below the BF16 threshold 0.01. This is an operator/decoder check; pixel identity is not promised for arbitrary shapes.
+- For both 2K benchmark inputs, all four optimized PNGs were byte-identical to their previous native baselines. The edit remains a snowy winter scene; visually checked.
+- `minimax_h3_image_state` verifies T2I → different-seed/reference/dimensions → T2I reuse, cancellation in text/AdaLN/denoise/decode, release of accounted CPU caches after failure, and byte-identical output after recovery.
+- One 4096×4096 generation completed with 441 tiles, including multiple batches and a tail batch. Cold process inference time was 63.7281 seconds; sampled peak GPU memory 45,115 MiB and process RSS 49,102 MiB. This is a capacity/correctness smoke test, not a warm 4K speed comparison.
+- In a real 4 GiB RAM/no-swap container with an independent allocation leaving only 5 GiB initially free VRAM, automatic policy selected layer streaming and zero host weight cache. Native 2K inference completed in 65.7708 seconds with 809 MiB peak process RSS and a byte-identical PNG. The recorded 69,850 MiB GPU monitor peak includes the deliberate reservation and is not model memory usage.
+- Under the same 4 GiB RAM container limit, the HTTP service with explicit 4 GiB GPU / 2 GiB host budgets correctly reported a deliberately oversized job as failed, handled cancellation, then completed a 2K two-reference edit. Sampled GPU peak was 3,573 MiB and process RSS 895 MiB; the service remained ready.
+- Fresh CUDA 13 / SM120 build and CTest image-memory / native-HTTP / model-source checks passed (3/3, including five HTTP checks). The CLI/server still link no Torch or Python runtime. Full release-wheel build and 16-reference maximum workloads remain untested.
+
+Model-dependent checks are explicit targets, rather than default tests requiring a 135 GB checkpoint:
+
+```bash
+cmake --build build --target minimax_h3_image_decode minimax_h3_image_state
+build/src/models/minimax_h3/minimax_h3_image_decode /path/to/MiniMax-H3-Image
+build/src/models/minimax_h3/minimax_h3_image_state /path/to/MiniMax-H3-Image reference.png
+```
+
+The existing image demo profile was switched to the new `speed-opt-20261111/build` server through the launcher API after verifying that no jobs were active. The launcher address/authentication and all five saved outputs were preserved; native health is ready. The old build remains available. First use after restart still includes weight loading.

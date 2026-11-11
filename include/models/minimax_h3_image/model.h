@@ -36,7 +36,8 @@ class Transformer {
                    Trace = {}, const Conditioning * = nullptr);
     const std::vector<float> &sigmas() const { return sigmas_; }
     void setMemoryPolicy(const MemoryPolicy &);
-    void unload();
+    // keepPrepared retains timestep tables and budgeted host weights, releasing GPU weights.
+    void unload(bool keepPrepared = false);
 
   private:
     Tensor attention(const Tensor &, const std::string &, const Tensor * = nullptr, const Tensor * = nullptr);
@@ -55,6 +56,8 @@ class VAE {
     VAE(Runtime &compute, Runtime &fp32, const std::string &model);
     // Unnormalized latent pixels in HWC order; returns patch rows [H*W,3*16*16].
     Tensor decodeTile(const Tensor &, int height, int width, Trace = {});
+    // Independent tile sequences sharing the row-wise projections.
+    Tensor decodeTiles(const Tensor &, int height, int width, int batch, Trace = {});
     Image decode(const std::vector<float> &normalizedPackedLatents, int height, int width, Progress = {});
     // ImageNet pixels -> sampled, FP16-rounded, normalized CHW reference latent.
     minimax_h3::VideoTensor encode(const Image &, std::mt19937 &, Progress = {}, Trace = {});
@@ -67,6 +70,10 @@ class VAE {
     std::vector<float> mean_, std_;
     bool lowMemory_ = false;
     std::shared_ptr<nomas::HostMemoryBudget> hostBudget_;
+    std::vector<std::pair<Tensor, Tensor>> packedQkv_;
+    std::pair<Tensor, Tensor> rope_;
+    std::pair<int, int> ropeShape_{};
+    Tensor zero_;
 };
 
 struct Options {
@@ -93,5 +100,9 @@ class Pipeline {
     std::string model_;
     Runtime rt_, full_, vaeRt_;
     MemoryPolicy memory_;
+    std::unique_ptr<minimax_h3::TextEncoder> textEncoder_;
+    std::unique_ptr<Transformer> transformer_;
+    std::unique_ptr<VAE> decoder_;
+    std::unique_ptr<nomas::QwenTokenizer> tokenizer_;
 };
 } // namespace fastllm::minimax_h3_image

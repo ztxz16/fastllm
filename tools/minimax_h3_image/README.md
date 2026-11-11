@@ -18,7 +18,7 @@ CUDA_VISIBLE_DEVICES=3 build/src/models/minimax_h3/minimax_h3_image_generate \
   --width 2048 --height 2048 --seed 42 --output red-panda.png
 ```
 
-Select an available GPU before running. `--device` addresses the visible CUDA devices, so it defaults to `0` after setting `CUDA_VISIBLE_DEVICES`. The tested device is an RTX PRO 5000 Blackwell with 72 GB memory; smaller GPUs and tensor parallelism are not implemented for this image backend.
+Select an available GPU before running. `--device` addresses the visible CUDA devices, so it defaults to `0` after setting `CUDA_VISIBLE_DEVICES`. The tested device is an RTX PRO 5000 Blackwell with 72 GB memory, including constrained-memory runs described below. Tensor parallelism is not implemented for this image backend.
 
 The model directory must contain:
 
@@ -27,7 +27,7 @@ The model directory must contain:
 - `pdd_config.json` and `pdd_fused_heads.safetensors`.
 - `tokenizer/` and the original MiniMax-H3 `text_encoder/`. A symlink to an existing text encoder is supported.
 
-Defaults are BF16 transformer/VAE compute, FP32 timestep/input/output projections, six steps and a 2048×2048 canvas. `--vae-precision fp32` provides a slower diagnostic alternative. The text encoder reads hidden state 50, takes the prompt verbatim and streams its weights; text, DiT and VAE weights are released between stages. Single-use DiT AdaLN weights are released after all six timestep tables are prepared.
+Defaults are BF16 transformer/VAE compute, FP32 timestep/input/output projections, six steps and a 2048×2048 canvas. `--vae-precision fp32` provides a slower diagnostic alternative. The text encoder reads hidden state 50, takes the prompt verbatim and streams its GPU weights while retaining a budgeted CPU weight cache. Fixed AdaLN timestep tables are reused across requests; their large source matrices are released after preparation. With sufficient free VRAM, DiT and VAE decoder weights stay resident between requests. Low-memory mode unloads DiT weights between stages. VAE decode batches independent tiles when memory allows, retaining the original sequential path for low-memory and FP32 diagnostics.
 
 Native checkpoint details handled here include per-head interleaved QKV, gate-first FFNs, three modality AdaLN rows, one FP32 PDD head per step, velocity-form Euler updates, 2D VAE rotary positions and register tokens, overlapping 256-pixel VAE tiles, ImageNet pixel denormalization and truncating RGB quantization.
 
@@ -62,9 +62,9 @@ minimax_h3_image_server --model /path/to/MiniMax-H3-Image \
   --gpu-memory-limit 4 --host-memory-limit 2 --port 8009
 ```
 
-With no GPU limit (or `0`), startup checks free device memory: below 60 GiB, DiT and VAE weights stream layer by layer; otherwise the DiT stays resident during denoising. Text weights always stream. An explicit limit must exceed 1 GiB. It reserves a persistent CUDA pool of `limit - 1 GiB`, leaving 1 GiB for the CUDA context/library workspace. A limit below 60 GiB selects layer streaming. Reserved pages remain allocated while the service is idle, including after cancellation or failure, and are reused by later requests. Insufficient activation space produces a failed job; precision, resolution and the six-step sampler are never silently reduced. Larger canvases or many references can require a larger budget.
+With no GPU limit (or `0`), startup checks free device memory: below 60 GiB, DiT and VAE weights stream layer by layer; otherwise the DiT stays resident across requests, including while the service is idle. Text GPU weights always stream. Cancelling or failing a request drops the prepared model state so that a later request can rebuild it safely. An explicit limit must exceed 1 GiB. It reserves a persistent CUDA pool of `limit - 1 GiB`, leaving 1 GiB for the CUDA context/library workspace. A limit below 60 GiB selects layer streaming. Reserved pages remain allocated while the service is idle, including after cancellation or failure, and are reused by later requests. Insufficient activation space produces a failed job; precision, resolution and the six-step sampler are never silently reduced. Larger canvases or many references can require a larger budget.
 
-With no host limit (or `0`), a shared weight cache uses at most one quarter of available host/container memory minus a 2 GiB working allowance, capped at 64 GiB. Detection respects the process's cgroup v1/v2 quota and visible parent quotas, including sibling usage. Explicit host limits must be at least 2 GiB: `2` disables weight caching; larger values allow caching within the remaining quota. Text, vision, reference encoding, DiT and VAE share the quota and load uncached tensors in at most 16 MiB chunks without whole-weight mmap reads. VAE output tiles are combined a row at a time. The host option bounds **weight caching**, not total process RSS: image buffers, queued uploads, tokenizer, CUDA runtime and filesystem cache also need memory. Low budgets trade speed for capacity.
+With no host limit (or `0`), a shared weight cache uses at most one quarter of available host/container memory minus a 2 GiB working allowance, capped at 64 GiB. Detection respects the process's cgroup v1/v2 quota and visible parent quotas, including sibling usage. Explicit host limits must be at least 2 GiB: `2` disables weight caching; larger values allow caching within the remaining quota. Text, vision, reference encoding, DiT and VAE share the quota and load uncached tensors in at most 16 MiB chunks without whole-weight mmap reads. VAE output tiles are decoded in bounded batches (one tile in low-memory mode) and combined a row at a time. The host option bounds **weight caching**, not total process RSS: image buffers, queued uploads, tokenizer, CUDA runtime and filesystem cache also need memory. Low budgets trade speed for capacity.
 
 `GET /health` reports `gpu_memory_limit_gib`, `host_memory_limit_gib`, `gpu_memory_reserved`, `layer_streaming` and `host_weight_cache_gib`. A reported limit of zero means automatic policy; the cache field reports its effective capacity. CLI VAE diagnostics use the same policy. Inference remains native C++/CUDA, without a Torch dependency.
 
@@ -101,7 +101,7 @@ curl http://127.0.0.1:8009/v1/images/edits \
 
 For background execution, send the same multipart body to `/v1/images/jobs` and poll the returned job ID. Job metadata includes the requested `size`, actual `canvas_size`, mode, reference count and each reference’s decoded dimensions. Image order is significant; do not mix `image` and `image[]` names in one request. Reference URLs, masks and unsupported parameters are rejected explicitly.
 
-The queue allows up to four pending/running jobs. Up to 128 recent jobs are kept in memory. Completed PNGs and JSON metadata are saved atomically in the output directory and reloaded on restart; pending jobs do not survive process termination. Output files are retained until manually removed. Model weights are released between stages and after each request.
+The queue allows up to four pending/running jobs. Up to 128 recent jobs are kept in memory. Completed PNGs and JSON metadata are saved atomically in the output directory and reloaded on restart; pending jobs do not survive process termination. Output files are retained until manually removed. Immutable weights and fixed timestep tables are reused according to the memory policy above. Prompt embeddings and reference encodings are recomputed for every request; they are not cached.
 
 ## ftllm launch
 

@@ -57,6 +57,14 @@ if(MAKE_WHL_X86)
 endif()
 if(UNIT_TEST)
     enable_testing()
+    # Explicit targets: these checks require the full image checkpoint.
+    foreach(check decode state)
+        add_executable(minimax_h3_image_${check} EXCLUDE_FROM_ALL
+            ${PROJECT_SOURCE_DIR}/test/minimax_h3_image/test_${check}.cpp)
+        target_link_libraries(minimax_h3_image_${check} PRIVATE fastllm_minimax_h3)
+        set_target_properties(minimax_h3_image_${check} PROPERTIES
+            CXX_STANDARD 17 BUILD_RPATH_USE_ORIGIN TRUE)
+    endforeach()
     add_executable(minimax_h3_image_memory
         ${PROJECT_SOURCE_DIR}/test/minimax_h3_image/test_memory.cpp ../minimax_h3_image/memory.cpp)
     set_target_properties(minimax_h3_image_memory PROPERTIES CXX_STANDARD 17)

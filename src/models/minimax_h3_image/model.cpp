@@ -287,13 +287,15 @@ Tensor Transformer::forward(const Tensor &latent, const Tensor &text, int h, int
     auto b = bias.rowSlice(step, 1);
     return full_.linear(rt_.cast(x, DType::FP32), weight.rowSlice(step * 96, 96), &b);
 }
-void Transformer::unload() {
+void Transformer::unload(bool keepPrepared) {
     weights_.clear();
     fullWeights_.clear();
     heads_.clear();
-    weights_.enableHostCache(0);
-    modulation_.clear();
-    finalModulation_ = {};
+    if (!keepPrepared) {
+        weights_.enableHostCache(0);
+        modulation_.clear();
+        finalModulation_ = {};
+    }
 }
 
 VAE::VAE(Runtime &rt, Runtime &full, const std::string &dir)
@@ -385,6 +387,99 @@ Tensor VAE::decodeTile(const Tensor &latent, int h, int w, Trace trace) {
                    &fullWeights_.get("decoder.norm_out.bias"), 1e-5f);
     return weights_.linear(rt_.cast(x, rt_.dtype()), "decoder.proj_out");
 }
+Tensor VAE::decodeTiles(const Tensor &latent, int h, int w, int batch, Trace trace) {
+    if (h < 1 || w < 1 || batch < 1 || int64_t(h) * w + 5 > INT32_MAX / batch ||
+        latent.rows != int64_t(h) * w * batch || latent.cols != 24)
+        throw std::invalid_argument("invalid VAE tile batch");
+    const int n = h * w, sequence = n + 5;
+    if (batch == 1 || rt_.isFloat32() || lowMemory_) {
+        std::vector<Tensor> outputs;
+        for (int i = 0; i < batch; ++i)
+            outputs.push_back(decodeTile(latent.rowSlice(i * n, n), h, w, trace));
+        return batch == 1 ? outputs[0] : rt_.concat(outputs);
+    }
+    auto x = weights_.linear(weights_.linear(rt_.cast(latent, rt_.dtype()), "post_quant_conv"),
+                             "decoder.x_embedder");
+    auto registers = weights_.get("decoder.register_tokens");
+    registers.rows = 4;
+    registers.cols = 1024;
+    if (!zero_.data) {
+        std::vector<float> zero(1024);
+        zero_ = rt_.upload(zero.data(), 1, 1024);
+    }
+    std::vector<Tensor> inputs;
+    for (int i = 0; i < batch; ++i) {
+        inputs.push_back(x.rowSlice(i * n, n));
+        inputs.push_back(registers);
+        inputs.push_back(zero_);
+    }
+    x = rt_.cast(rt_.concat(inputs), DType::FP32);
+    if (!rope_.first.data || ropeShape_ != std::make_pair(h, w)) {
+        std::vector<float> cs(size_t(sequence) * 32, 1.f), sn(cs.size());
+        for (int y = 0; y < h; ++y)
+            for (int z = 0; z < w; ++z)
+                for (int a = 0; a < 2; ++a) {
+                    float position = 2.f * (((a ? z : y) + .5f) / (a ? w : h)) - 1.f;
+                    for (int f = 0; f < 8; ++f) {
+                        float angle = (2.f * float(M_PI) * position) * (1.f / std::pow(100.f, f / 8.f));
+                        for (int half = 0; half < 2; ++half) {
+                            auto i = size_t(y * w + z) * 32 + half * 16 + a * 8 + f;
+                            cs[i] = std::cos(angle);
+                            sn[i] = std::sin(angle);
+                        }
+                    }
+                }
+        rope_ = {full_.upload(cs.data(), sequence, 32), full_.upload(sn.data(), sequence, 32)};
+        ropeShape_ = {h, w};
+    }
+    if (packedQkv_.empty())
+        packedQkv_.resize(24);
+    if (trace)
+        trace("input", x);
+    for (int i = 0; i < 24; ++i) {
+        const auto p = "decoder.transformer_blocks." + std::to_string(i);
+        auto y = rt_.videoRms(x, fullWeights_.get(p + ".norm1.weight"));
+        auto &packed = packedQkv_[i];
+        if (!packed.first.data) {
+            // Convert native [head,Q/K/V,dim] rows to [Q/K/V,head,dim] once.
+            // Packed attention keeps each tile independent without Q/K/V copies.
+            std::vector<int> order;
+            for (int part = 0; part < 3; ++part)
+                for (int head = 0; head < 16; ++head)
+                    for (int d = 0; d < 64; ++d)
+                        order.push_back(head * 192 + part * 64 + d);
+            auto indices = rt_.indices(order);
+            packed.first = rt_.gather(weights_.get(p + ".attn.to_qkv.weight"), indices);
+            if (auto bias = weights_.optional(p + ".attn.to_qkv.bias")) {
+                auto rows = *bias;
+                rows.rows = 3072;
+                rows.cols = 1;
+                packed.second = rt_.gather(rows, indices);
+                packed.second.rows = 1;
+                packed.second.cols = 3072;
+            }
+            weights_.erasePrefix(p + ".attn.to_qkv.");
+        }
+        auto qkv = rt_.linear(y, packed.first, packed.second.data ? &packed.second : nullptr);
+        rt_.videoQkvNormRotaryInPlace(qkv, rope_.first, rope_.second);
+        y = weights_.linear(rt_.packedSelfAttention(qkv, 16, batch), p + ".attn.to_out");
+        x = rt_.scaledResidual(x, y, fullWeights_.get(p + ".scale1"));
+        y = rt_.videoRms(x, fullWeights_.get(p + ".norm2.weight"));
+        y = weights_.linear(gated(rt_, weights_.linear(y, p + ".ff.w1")), p + ".ff.w2");
+        x = rt_.scaledResidual(x, y, fullWeights_.get(p + ".scale2"));
+        if (trace)
+            trace("block." + std::to_string(i), x);
+    }
+    std::vector<int> pixels;
+    pixels.reserve(size_t(n) * batch);
+    for (int i = 0; i < batch; ++i)
+        for (int row = 0; row < n; ++row)
+            pixels.push_back(i * sequence + row);
+    x = rt_.gather(x, rt_.indices(pixels));
+    x = full_.norm(x, false, &fullWeights_.get("decoder.norm_out.weight"),
+                   &fullWeights_.get("decoder.norm_out.bias"), 1e-5f);
+    return weights_.linear(rt_.cast(x, rt_.dtype()), "decoder.proj_out");
+}
 Image VAE::decode(const std::vector<float> &packed, int height, int width, Progress progress) {
     if (height < 32 || width < 32 || height % 32 || width % 32 ||
         packed.size() != size_t(height / 16) * (width / 16) * 24)
@@ -408,18 +503,42 @@ Image VAE::decode(const std::vector<float> &packed, int height, int width, Progr
         float alpha = round(round(float(i)) / extent);
         return round(round(a * round(1.f - alpha)) + round(b * alpha));
     };
-    const size_t nx = xs.starts.size();
+    const size_t nx = xs.starts.size(), tileCount = nx * ys.starts.size();
+    size_t capacity = 1;
+    if (!lowMemory_ && !rt_.isFloat32()) {
+        size_t free = 0, total = 0;
+        auto status = cudaMemGetInfo(&free, &total);
+        if (status != cudaSuccess)
+            throw std::runtime_error(cudaGetErrorString(status));
+        constexpr size_t reserve = size_t(2) << 30, perTile = size_t(16) << 20;
+        if (free > reserve)
+            capacity = std::clamp((free - reserve) / perTile, size_t(1), size_t(128));
+    }
+    std::vector<float> batchPixels;
+    size_t batchStart = tileCount, batchSize = 0;
     // Entries before ix hold this row; the rest still hold the original row above.
     std::vector<std::vector<float>> previous(nx);
     for (size_t iy = 0; iy < ys.starts.size(); ++iy)
         for (size_t ix = 0; ix < nx; ++ix) {
             int th = ys.lengths[iy] / 16, tw = xs.lengths[ix] / 16;
-            std::vector<float> tile(size_t(th) * tw * 24);
-            for (int y = 0; y < th; ++y) {
-                auto src = latent.data() + (size_t(ys.starts[iy] / 16 + y) * lw + xs.starts[ix] / 16) * 24;
-                std::copy_n(src, tw * 24, tile.data() + size_t(y) * tw * 24);
+            const size_t index = iy * nx + ix;
+            if (index >= batchStart + batchSize || batchStart == tileCount) {
+                batchStart = index;
+                batchSize = std::min(capacity, tileCount - index);
+                std::vector<float> values(batchSize * th * tw * 24);
+                for (size_t item = 0; item < batchSize; ++item) {
+                    size_t yi = (index + item) / nx, xi = (index + item) % nx;
+                    for (int y = 0; y < th; ++y) {
+                        auto src = latent.data() + (size_t(ys.starts[yi] / 16 + y) * lw + xs.starts[xi] / 16) * 24;
+                        auto dst = values.data() + (item * th + y) * tw * 24;
+                        std::copy_n(src, tw * 24, dst);
+                    }
+                }
+                batchPixels = rt_.download(decodeTiles(full_.upload(values.data(), int(batchSize) * th * tw, 24),
+                                                       th, tw, int(batchSize)));
             }
-            auto pixels = rt_.download(decodeTile(full_.upload(tile.data(), th * tw, 24), th, tw));
+            const float *pixels = batchPixels.data() + (index - batchStart) * th * tw * 768;
+            std::vector<float> tile;
             tile.resize(size_t(th * 16) * (tw * 16) * 3);
             for (int y = 0; y < th * 16; ++y)
                 for (int z = 0; z < tw * 16; ++z)
@@ -550,7 +669,11 @@ Image Pipeline::generate(const Options &o, Progress progress, Trace trace,
     try {
         return generateImpl(o, progress, trace, textInput, noise, decode);
     } catch (...) {
-        // generateImpl's stage-local tensors and caches have now unwound.
+        // A cancelled or failed prepare may have only partially populated its tables.
+        // Drop persistent state as well as the stage-local tensors before retrying.
+        textEncoder_.reset();
+        transformer_.reset();
+        decoder_.reset();
         // Drain queued frees before a subsequent HTTP request reuses the pool.
         rt_.synchronize();
         throw;
@@ -562,13 +685,18 @@ Image Pipeline::generateImpl(const Options &o, Progress progress, Trace trace,
     o.validate();
     const auto canvas = o.canvas();
     const int height = canvas.second, width = canvas.first;
-    Transformer transformer(rt_, full_, model_);
-    transformer.setMemoryPolicy(memory_);
+    if (!transformer_) {
+        transformer_ = std::make_unique<Transformer>(rt_, full_, model_);
+        transformer_->setMemoryPolicy(memory_);
+    }
+    auto &transformer = *transformer_;
     Conditioning condition;
     std::vector<Image> references;
     std::vector<minimax_h3::VisionInput> visual;
     std::vector<int> ids;
-    nomas::QwenTokenizer tokenizer(model_ + "/tokenizer");
+    if (!tokenizer_)
+        tokenizer_ = std::make_unique<nomas::QwenTokenizer>(model_ + "/tokenizer");
+    auto &tokenizer = *tokenizer_;
     auto label = [&](const std::string &value) {
         auto tokens = tokenizer.encode(value);
         if (tokens.size() > 4096)
@@ -612,10 +740,13 @@ Image Pipeline::generateImpl(const Options &o, Progress progress, Trace trace,
     } else {
         if (progress)
             progress("text", 0, 50);
-        minimax_h3::TextEncoder encoder(rt_, model_ + "/text_encoder");
-        encoder.setLowMemory(true);
-        encoder.setMemoryPool(memory_.pool);
-        encoder.setHostMemoryBudget(memory_.host);
+        if (!textEncoder_) {
+            textEncoder_ = std::make_unique<minimax_h3::TextEncoder>(rt_, model_ + "/text_encoder");
+            textEncoder_->setLowMemory(memory_.layerStreaming);
+            textEncoder_->setMemoryPool(memory_.pool);
+            textEncoder_->setHostMemoryBudget(memory_.host);
+        }
+        auto &encoder = *textEncoder_;
         text = encoder.encodeVisual(ids, visual, [&](const std::string &name, const Tensor &) {
             if (progress && name.compare(0, 6, "layer.") == 0)
                 progress("text", std::stoi(name.substr(6)) + 1, 50);
@@ -696,7 +827,10 @@ Image Pipeline::generateImpl(const Options &o, Progress progress, Trace trace,
         if (progress)
             progress("denoise", step + 1, 6);
     }
-    transformer.unload();
+    // Resident mode has room for the DiT alongside the streamed text layers and VAE.
+    // Keep these immutable weights on-device; constrained devices still swap stages.
+    if (memory_.layerStreaming)
+        transformer.unload(true);
     text = {};
     referenceRows = {};
     if (trace)
@@ -705,9 +839,13 @@ Image Pipeline::generateImpl(const Options &o, Progress progress, Trace trace,
         return {};
     auto host = full_.download(latent);
     latent = {};
-    VAE vae(vaeRt_, full_, model_);
-    vae.setMemoryPolicy(memory_);
-    auto image = vae.decode(host, height, width, progress);
+    if (!decoder_) {
+        decoder_ = std::make_unique<VAE>(vaeRt_, full_, model_);
+        decoder_->setMemoryPolicy(memory_);
+    }
+    auto image = decoder_->decode(host, height, width, progress);
+    if (memory_.layerStreaming)
+        decoder_.reset();
     return qwen_image::resizeImage(image, o.width, o.height, qwen_image::ImageResizeFilter::Lanczos, 8192);
 }
 } // namespace fastllm::minimax_h3_image
