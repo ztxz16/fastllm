@@ -28,10 +28,15 @@ struct MemoryPolicy {
 };
 
 // Native MiniMax-H3-Image checkpoint: no Diffusers weight conversion required.
+class SequenceAttentionPipeline;
 class Transformer {
   public:
-    Transformer(Runtime &, Runtime &fp32, const std::string &model);
+    Transformer(Runtime &, Runtime &fp32, const std::string &model, nomas::ParallelContext = {},
+                bool sequenceParallel = false);
     void prepare(Progress = {});
+    // Valid only within one request; recomputed for each new prompt/reference set.
+    void prepareText(const Tensor &);
+    void clearText();
     Tensor forward(const Tensor &packedLatents, const Tensor &text, int height, int width, int step,
                    Trace = {}, const Conditioning * = nullptr);
     const std::vector<float> &sigmas() const { return sigmas_; }
@@ -45,10 +50,15 @@ class Transformer {
     Tensor refine(const Tensor &);
     Runtime &rt_, &full_;
     Weights weights_, fullWeights_, heads_;
+    nomas::ParallelContext parallel_;
     std::vector<float> times_, sigmas_;
     std::vector<Tensor> modulation_;
-    Tensor finalModulation_;
+    Tensor finalModulation_, refinedText_;
+    std::unordered_map<std::string, std::pair<Tensor, Tensor>> packedQkv_;
+    std::shared_ptr<SequenceAttentionPipeline> attentionPipeline_;
     bool lowMemory_ = false;
+    bool sequenceParallel_ = false;
+    int sequenceRows_ = 0;
 };
 
 class VAE {
@@ -62,6 +72,8 @@ class VAE {
     // ImageNet pixels -> sampled, FP16-rounded, normalized CHW reference latent.
     minimax_h3::VideoTensor encode(const Image &, std::mt19937 &, Progress = {}, Trace = {});
     void setMemoryPolicy(const MemoryPolicy &);
+    using TileRunner = std::function<Tensor(const Tensor &, int, int, int)>;
+    void setTileRunner(TileRunner runner) { tileRunner_ = std::move(runner); }
 
   private:
     std::string model_;
@@ -74,6 +86,7 @@ class VAE {
     std::pair<Tensor, Tensor> rope_;
     std::pair<int, int> ropeShape_{};
     Tensor zero_;
+    TileRunner tileRunner_;
 };
 
 struct Options {
@@ -86,11 +99,16 @@ struct Options {
     std::pair<int, int> canvas() const; // Width, height.
 };
 
+class ParallelModel;
 class Pipeline {
   public:
     Pipeline(const std::string &model, int device = 0, DType vaeType = DType::BF16, double gpuMemoryLimit = 0,
-             double hostMemoryLimit = 0);
+             double hostMemoryLimit = 0, const std::vector<int> &devices = {},
+             nomas::RowReduction reduction = nomas::RowReduction::Activation,
+             const std::string &parallelMode = "auto");
+    ~Pipeline();
     const MemoryPolicy &memoryPolicy() const { return memory_; }
+    bool sequenceParallel() const { return sequenceParallel_; }
     Image generate(const Options &, Progress = {}, Trace = {}, const std::vector<float> *text = nullptr,
                    const std::vector<float> *noise = nullptr, bool decode = true);
 
@@ -104,5 +122,10 @@ class Pipeline {
     std::unique_ptr<Transformer> transformer_;
     std::unique_ptr<VAE> decoder_;
     std::unique_ptr<nomas::QwenTokenizer> tokenizer_;
+    std::vector<int> devices_;
+    double gpuMemoryLimit_ = 0;
+    nomas::RowReduction reduction_;
+    bool sequenceParallel_ = false;
+    std::unique_ptr<ParallelModel> parallel_;
 };
 } // namespace fastllm::minimax_h3_image

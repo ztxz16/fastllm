@@ -56,6 +56,11 @@ struct Tensor {
     Tensor rowSlice(int first, int count) const;
 };
 
+// Grant peer access to this native tensor's allocation pool. Pool permissions
+// are independent of cudaDeviceEnablePeerAccess; views retain the same owner.
+// Only the explicitly supplied, peer-capable devices are mapped.
+void enableTensorPeerAccess(const Tensor &, const std::vector<int> &devices);
+
 struct RopeTable { Tensor cos, sin; };
 
 class Runtime {
@@ -70,6 +75,9 @@ public:
     Runtime(int device, DType dtype);
     Runtime(int device, DType dtype, Numerics numerics);
     void activate();
+    // Opt-in for resident BF16 models. Tune two FP32-accumulating GEMM
+    // candidates once per large aligned shape; other callers retain cuBLAS.
+    void setLinearAutotuning(bool enabled) { tuneLinear_ = enabled; }
     bool isFloat32() const { return dtype_ == DType::FP32; }
     DType dtype() const { return dtype_; }
     ~Runtime();
@@ -158,6 +166,7 @@ private:
     int device_;
     DType dtype_;
     Numerics numerics_;
+    bool tuneLinear_ = false;
 };
 
 // One quota shared by all components and TP ranks of an inference service.

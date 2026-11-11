@@ -1,5 +1,6 @@
 #include "models/minimax_h3_image/model.h"
 #include "models/minimax_h3_image/ops.h"
+#include "models/minimax_h3_image/parallel.h"
 #include "json11.hpp"
 #include "memory.h"
 #include <algorithm>
@@ -92,10 +93,33 @@ MemoryPolicy::MemoryPolicy(Runtime &rt, double gpuGiB, double hostGiB) {
     host = std::make_shared<nomas::HostMemoryBudget>(cacheBytes);
 }
 
-Transformer::Transformer(Runtime &rt, Runtime &full, const std::string &dir)
+Transformer::Transformer(Runtime &rt, Runtime &full, const std::string &dir, nomas::ParallelContext parallel,
+                           bool sequenceParallel)
     : rt_(rt), full_(full), weights_(rt, minimax_h3::componentWeights(dir + "/transformer")),
       fullWeights_(full, minimax_h3::componentWeights(dir + "/transformer")),
-      heads_(full, dir + "/pdd_fused_heads.safetensors") {
+      heads_(full, dir + "/pdd_fused_heads.safetensors"), parallel_(parallel),
+      sequenceParallel_(sequenceParallel && parallel.size() > 1) {
+    if (sequenceParallel_ && rt_.dtype() != DType::BF16)
+        throw std::invalid_argument("image sequence parallelism requires BF16");
+    if (56 % parallel_.size() || 14336 % parallel_.size())
+        throw std::invalid_argument("image attention heads and FFN width must divide TP size");
+    auto partition = [&](const std::string &p) {
+        if (sequenceParallel_)
+            return;
+        // Native Q/K/V rows are interleaved per head: shard whole heads.
+        parallel_.columnWeights(weights_, p + ".attn.qkv_proj");
+        parallel_.rowWeights(weights_, p + ".attn.out_proj");
+        parallel_.columnWeights(weights_, p + ".mlp.fc1", 2);
+        parallel_.rowWeights(weights_, p + ".mlp.fc2");
+    };
+    for (int i = 0; i < 50; ++i) {
+        const auto p = "blocks." + std::to_string(i);
+        partition(p);
+        parallel_.columnWeights(weights_, p + ".adaln_proj.linear");
+    }
+    for (int i = 0; i < 2; ++i)
+        partition("token_refiner.blocks." + std::to_string(i));
+    parallel_.columnWeights(weights_, "final_layer.adaln_proj.linear");
     auto j = config(dir + "/transformer/config.json");
     for (auto item : std::vector<std::pair<std::string, int>>{{"hidden_size", 5376},
                                                               {"num_layers", 50},
@@ -151,6 +175,8 @@ void Transformer::prepare(Progress progress) {
         std::vector<Tensor> rows;
         for (const auto &input : inputs) {
             auto x = weights_.linear(input, p, true);
+            if (parallel_.size() > 1)
+                x = parallel_.group->gatherColumns(x, parallel_.rank);
             x.rows *= 3;
             x.cols /= 3;
             rows.push_back(x);
@@ -161,8 +187,12 @@ void Transformer::prepare(Progress progress) {
             progress("prepare", i + 1, 50);
     }
     std::vector<Tensor> rows;
-    for (const auto &input : inputs)
-        rows.push_back(weights_.linear(input, "final_layer.adaln_proj.linear", true));
+    for (const auto &input : inputs) {
+        auto x = weights_.linear(input, "final_layer.adaln_proj.linear", true);
+        if (parallel_.size() > 1)
+            x = parallel_.group->gatherColumns(x, parallel_.rank);
+        rows.push_back(std::move(x));
+    }
     finalModulation_ = rt_.concat(rows);
     weights_.erasePrefix("final_layer.adaln_proj.");
     // Do not cache the large, single-use AdaLN matrices on the host.
@@ -170,14 +200,64 @@ void Transformer::prepare(Progress progress) {
         weights_.enableHostCache(size_t(48) << 30);
 }
 void Transformer::setMemoryPolicy(const MemoryPolicy &memory) {
+    if (sequenceParallel_ && memory.layerStreaming)
+        throw std::invalid_argument("image sequence parallelism requires resident GPU weights");
     unload();
     lowMemory_ = memory.layerStreaming;
     weights_.setHostMemoryBudget(memory.host);
     fullWeights_.setHostMemoryBudget(memory.host);
     heads_.setHostMemoryBudget(memory.host);
 }
+void Transformer::clearText() {
+    refinedText_ = {};
+    if (attentionPipeline_) attentionPipeline_->release();
+}
 Tensor Transformer::attention(const Tensor &x, const std::string &p, const Tensor *cs, const Tensor *sn) {
-    auto qkv = splitQKV(rt_, weights_.linear(x, p + ".qkv_proj"), 56, 128);
+    const int heads = sequenceParallel_ ? 56 : 56 / parallel_.size();
+    auto project = [&](const Tensor &y) {
+        if (sequenceParallel_)
+            return weights_.linear(y, p + ".out_proj");
+        return parallel_.row(rt_, weights_, y, p + ".out_proj");
+    };
+    if (!lowMemory_ && x.dtype == DType::BF16) {
+        auto &packed = packedQkv_[p];
+        if (!packed.first.data) {
+            std::vector<int> order;
+            for (int part = 0; part < 3; ++part)
+                for (int head = 0; head < heads; ++head)
+                    for (int d = 0; d < 128; ++d)
+                        order.push_back(head * 384 + part * 128 + d);
+            auto indices = rt_.indices(order);
+            packed.first = rt_.gather(weights_.get(p + ".qkv_proj.weight"), indices);
+            if (auto bias = weights_.optional(p + ".qkv_proj.bias")) {
+                auto rows = *bias;
+                rows.rows = heads * 384;
+                rows.cols = 1;
+                packed.second = rt_.gather(rows, indices);
+                packed.second.rows = 1;
+                packed.second.cols = heads * 384;
+            }
+            weights_.erasePrefix(p + ".qkv_proj.");
+        }
+        auto qkv = rt_.linear(x, packed.first, packed.second.data ? &packed.second : nullptr);
+        if (sequenceRows_) {
+            if (!attentionPipeline_)
+                attentionPipeline_ = std::make_shared<SequenceAttentionPipeline>();
+            const int perRank = (sequenceRows_ + parallel_.size() - 1) / parallel_.size();
+            // Use the common padded shard length: an odd sequence may straddle
+            // a dispatch threshold, but all ranks must gather identical groups.
+            const int groups = attentionPipeline_->groups(perRank, parallel_.size());
+            auto kv = prepareSequenceQkv(qkv, weights_.get(p + ".q_norm.weight"),
+                weights_.get(p + ".k_norm.weight"), *cs, *sn, groups,
+                perRank * parallel_.size(), perRank * parallel_.rank);
+            auto output = attentionPipeline_->forward(qkv, kv, sequenceRows_, groups, parallel_);
+            return project(output);
+        }
+        qkvNormRotaryInPlace(qkv, weights_.get(p + ".q_norm.weight"),
+                              weights_.get(p + ".k_norm.weight"), cs, sn);
+        return project(rt_.packedSelfAttention(qkv, heads));
+    }
+    auto qkv = splitQKV(rt_, weights_.linear(x, p + ".qkv_proj"), heads, 128);
     if (cs) {
         auto qk = rt_.qkNormRotary(qkv[0], qkv[1], weights_.get(p + ".q_norm.weight"),
                                    weights_.get(p + ".k_norm.weight"), 1e-5f, *cs, *sn, 128);
@@ -187,20 +267,35 @@ Tensor Transformer::attention(const Tensor &x, const std::string &p, const Tenso
         qkv[0] = rt_.rms(qkv[0], weights_.get(p + ".q_norm.weight"), 1e-5f, 128);
         qkv[1] = rt_.rms(qkv[1], weights_.get(p + ".k_norm.weight"), 1e-5f, 128);
     }
-    return weights_.linear(rt_.selfAttention(qkv[0], qkv[1], qkv[2], 56), p + ".out_proj");
+    return project(rt_.selfAttention(qkv[0], qkv[1], qkv[2], heads));
 }
 Tensor Transformer::feedForward(const Tensor &x, const std::string &p) {
-    Tensor out(x.rows, 5376, x.dtype);
+    const int chunk = sequenceParallel_ ? 8192 : 4096;
+    const bool sharded = !sequenceParallel_ && parallel_.size() > 1, overlap = sharded && x.rows > chunk;
+    Tensor out(x.rows, 5376, sharded ? parallel_.partialType(x.dtype) : x.dtype);
+    Tensor reduced = overlap ? (out.dtype == x.dtype ? out : Tensor(x.rows, 5376, x.dtype)) : Tensor{};
     for (int first = 0; first < x.rows;) {
-        int n = std::min(4096, x.rows - first);
-        if (n > 512)
+        int n = std::min(chunk, x.rows - first);
+        if (!sequenceParallel_ && n > 512)
             n -= n % 512;
         auto y = gatedSilu(weights_.linear(x.rowSlice(first, n), p + ".fc1"));
         auto target = out.rowSlice(first, n);
-        weights_.linear(y, p + ".fc2", false, &target);
+        if (sharded) {
+            parallel_.rowPartial(rt_, weights_, y, p + ".fc2", target);
+            if (overlap) {
+                auto result = reduced.rowSlice(first, n);
+                parallel_.finishRowAsync(rt_, weights_, target, p + ".fc2", result);
+            }
+        } else {
+            weights_.linear(y, p + ".fc2", false, &target);
+        }
         first += n;
     }
-    return out;
+    if (overlap) {
+        parallel_.group->wait(parallel_.rank);
+        return reduced;
+    }
+    return sharded ? parallel_.finishRow(rt_, weights_, std::move(out), p + ".fc2", x.dtype) : out;
 }
 Tensor Transformer::refine(const Tensor &text) {
     auto x = weights_.linear(rt_.cast(text, rt_.dtype()), "condition_proj");
@@ -213,19 +308,27 @@ Tensor Transformer::refine(const Tensor &text) {
     }
     return rt_.rms(x, weights_.get("token_refiner.final_norm.weight"), 1e-5f);
 }
+void Transformer::prepareText(const Tensor &text) {
+    refinedText_ = {};
+    sequenceRows_ = 0;
+    refinedText_ = refine(text);
+}
 Tensor Transformer::forward(const Tensor &latent, const Tensor &text, int h, int w, int step, Trace trace,
                             const Conditioning *condition) {
+    sequenceRows_ = 0;
     int referenceRows = 0;
     if (condition)
         for (auto grid : condition->grids)
             referenceRows += grid.first / 2 * (grid.second / 2);
     if (modulation_.size() != 50 || step < 0 || step >= 6 || h % 32 || w % 32 ||
+        (refinedText_.data && refinedText_.rows != text.rows) ||
         latent.rows != referenceRows + (h / 32) * (w / 32) || latent.cols != 96 || text.rows < 1 ||
         text.cols != 5120 || (condition && condition->textTags.size() != size_t(text.rows)))
         throw std::invalid_argument("invalid image transformer input");
     const int nt = text.rows, rows = nt + latent.rows, targetRows = h / 32 * (w / 32);
     auto x =
-        rt_.concat({refine(text), rt_.cast(fullWeights_.linear(latent, "video_patch_proj"), rt_.dtype())});
+        rt_.concat({refinedText_.data ? refinedText_ : refine(text),
+                    rt_.cast(fullWeights_.linear(latent, "video_patch_proj"), rt_.dtype())});
     std::vector<float> positions(size_t(rows) * 3);
     std::vector<int> adaln(rows, step * 3);
     for (int i = 0; i < nt; ++i) {
@@ -258,23 +361,60 @@ Tensor Transformer::forward(const Tensor &latent, const Tensor &text, int h, int
     frame(h / 16, w / 16, false);
     auto rope = rt_.ropeTable(positions, 16, 10000.f);
     auto idx = rt_.indices(adaln);
-    if (trace)
-        trace("input", x);
+    const int shardRows = (rows + parallel_.size() - 1) / parallel_.size();
+    const bool partitionSequence = sequenceParallel_ && rows > (parallel_.size() - 1) * shardRows;
+    const int start = partitionSequence ? parallel_.rank * shardRows : 0;
+    if (partitionSequence) {
+        const int count = std::min(shardRows, rows - start);
+        x = x.rowSlice(start, count);
+        rope.first = rope.first.rowSlice(start, count);
+        rope.second = rope.second.rowSlice(start, count);
+        idx = idx.rowSlice(start, count);
+        sequenceRows_ = rows;
+    }
+    auto emit = [&](const std::string &name) {
+        if (!trace)
+            return;
+        if (sequenceRows_) {
+            auto gathered = parallel_.gatherRows(rt_, x, rows);
+            trace(name, gathered);
+            // Also supports diagnostic callbacks which replace an activation
+            // with the oracle before comparing the next block's operator.
+            x = gathered.rowSlice(start, x.rows);
+        } else {
+            trace(name, x);
+        }
+    };
+    emit("input");
     for (int i = 0; i < 50; ++i) {
         const auto p = "blocks." + std::to_string(i);
-        auto y = rt_.rmsModulateRows(x, weights_.get(p + ".norm1.weight"), 1e-5f, modulation_[i], idx, 0, 1);
+        const bool fused = !lowMemory_ && x.dtype == DType::BF16;
+        auto y = fused ? rmsModulate(x, weights_.get(p + ".norm1.weight"), modulation_[i], idx, 0, 1)
+                       : rt_.rmsModulateRows(x, weights_.get(p + ".norm1.weight"), 1e-5f, modulation_[i], idx, 0, 1);
         y = attention(y, p + ".attn", &rope.first, &rope.second);
-        x = rt_.residualRows(x, y, modulation_[i], idx, 2);
-        y = rt_.rmsModulateRows(x, weights_.get(p + ".norm2.weight"), 1e-5f, modulation_[i], idx, 3, 4);
+        if (fused) {
+            auto result = residualRmsModulate(x, y, weights_.get(p + ".norm2.weight"), modulation_[i], idx, 2, 3, 4);
+            x = std::move(result.first);
+            y = std::move(result.second);
+        } else {
+            x = rt_.residualRows(x, y, modulation_[i], idx, 2);
+            y = rt_.rmsModulateRows(x, weights_.get(p + ".norm2.weight"), 1e-5f, modulation_[i], idx, 3, 4);
+        }
         x = rt_.residualRows(x, feedForward(y, p + ".mlp"), modulation_[i], idx, 5);
-        if (trace)
-            trace("block." + std::to_string(i), x);
+        emit("block." + std::to_string(i));
         if (lowMemory_)
             weights_.erasePrefix(p + ".");
     }
-    x = rt_.rmsModulateRows(x.rowSlice(nt + referenceRows, targetRows),
-                            weights_.get("final_layer.norm.weight"), 1e-5f, finalModulation_,
-                            rt_.indices(std::vector<int>(targetRows, step)), 0, 1);
+    const bool localProjection = sequenceRows_ != 0;
+    sequenceRows_ = 0;
+    // Project local hidden rows to the 96-wide PDD velocity before gathering.
+    // This avoids exchanging 5376-wide hidden states at every denoising step.
+    // Reference/text rows are discarded after gathering; their projections are
+    // row-independent and cannot affect the target image rows.
+    if (!localProjection)
+        x = x.rowSlice(nt + referenceRows, targetRows);
+    x = rt_.rmsModulateRows(x, weights_.get("final_layer.norm.weight"), 1e-5f, finalModulation_,
+                            rt_.indices(std::vector<int>(x.rows, step)), 0, 1);
     auto weight = heads_.get("video_out.weight");
     weight.rows = 6 * 96;
     weight.cols = 5376;
@@ -282,9 +422,13 @@ Tensor Transformer::forward(const Tensor &latent, const Tensor &text, int h, int
     bias.rows = 6;
     bias.cols = 96;
     auto b = bias.rowSlice(step, 1);
-    return full_.linear(rt_.cast(x, DType::FP32), weight.rowSlice(step * 96, 96), &b);
+    auto velocity = full_.linear(rt_.cast(x, DType::FP32), weight.rowSlice(step * 96, 96), &b);
+    return localProjection ? parallel_.gatherRows(full_, velocity, rows).rowSlice(nt + referenceRows, targetRows)
+                           : velocity;
 }
 void Transformer::unload(bool keepPrepared) {
+    clearText();
+    packedQkv_.clear();
     weights_.clear();
     fullWeights_.clear();
     heads_.clear();
@@ -458,7 +602,7 @@ Tensor VAE::decodeTiles(const Tensor &latent, int h, int w, int batch, Trace tra
             weights_.erasePrefix(p + ".attn.to_qkv.");
         }
         auto qkv = rt_.linear(y, packed.first, packed.second.data ? &packed.second : nullptr);
-        rt_.videoQkvNormRotaryInPlace(qkv, rope_.first, rope_.second);
+        vaeQkvNormRotaryInPlace(qkv, rope_.first, rope_.second);
         y = weights_.linear(rt_.packedSelfAttention(qkv, 16, batch), p + ".attn.to_out");
         x = rt_.scaledResidual(x, y, fullWeights_.get(p + ".scale1"));
         y = rt_.videoRms(x, fullWeights_.get(p + ".norm2.weight"));
@@ -502,7 +646,8 @@ Image VAE::decode(const std::vector<float> &packed, int height, int width, Progr
     };
     const size_t nx = xs.starts.size(), tileCount = nx * ys.starts.size();
     size_t capacity = 1;
-    if (!lowMemory_ && !rt_.isFloat32()) {
+    const bool gpuStitch = !lowMemory_ && !rt_.isFloat32();
+    if (gpuStitch) {
         size_t free = 0, total = 0;
         auto status = cudaMemGetInfo(&free, &total);
         if (status != cudaSuccess)
@@ -512,6 +657,13 @@ Image VAE::decode(const std::vector<float> &packed, int height, int width, Progr
             capacity = std::clamp((free - reserve) / perTile, size_t(1), size_t(128));
     }
     std::vector<float> batchPixels;
+    Tensor devicePixels, deviceRgba, invalid;
+    std::vector<Tensor> devicePrevious(nx);
+    if (gpuStitch) {
+        deviceRgba = Tensor(height, width, DType::FP32);
+        const float zero = 0;
+        invalid = full_.upload(&zero, 1, 1);
+    }
     size_t batchStart = tileCount, batchSize = 0;
     // Entries before ix hold this row; the rest still hold the original row above.
     std::vector<std::vector<float>> previous(nx);
@@ -532,8 +684,26 @@ Image VAE::decode(const std::vector<float> &packed, int height, int width, Progr
                         std::copy_n(src, tw * 24, dst);
                     }
                 }
-                batchPixels = rt_.download(decodeTiles(full_.upload(values.data(), int(batchSize) * th * tw, 24),
-                                                       th, tw, int(batchSize)));
+                auto input = full_.upload(values.data(), int(batchSize) * th * tw, 24);
+                auto decoded = tileRunner_ && gpuStitch ? tileRunner_(input, th, tw, int(batchSize))
+                                                         : decodeTiles(input, th, tw, int(batchSize));
+                if (gpuStitch)
+                    devicePixels = std::move(decoded);
+                else
+                    batchPixels = rt_.download(decoded);
+            }
+            if (gpuStitch) {
+                auto tile = devicePixels.rowSlice(int(index - batchStart) * th * tw, th * tw);
+                ImageTile spec{th * 16, tw * 16, ys.starts[iy], xs.starts[ix],
+                               iy ? ys.overlaps[iy - 1] : 0, ix ? xs.overlaps[ix - 1] : 0,
+                               th * 16 - (iy + 1 < ys.starts.size() ? ys.overlaps[iy] : 0),
+                               tw * 16 - (ix + 1 < nx ? xs.overlaps[ix] : 0)};
+                stitchImageTile(tile, iy ? &devicePrevious[ix] : nullptr,
+                                  ix ? &devicePrevious[ix - 1] : nullptr, spec, deviceRgba, invalid);
+                devicePrevious[ix] = std::move(tile);
+                if (progress)
+                    progress("decode", index + 1, tileCount);
+                continue;
             }
             const float *pixels = batchPixels.data() + (index - batchStart) * th * tw * 768;
             std::vector<float> tile;
@@ -584,6 +754,20 @@ Image VAE::decode(const std::vector<float> &packed, int height, int width, Progr
             if (progress)
                 progress("decode", iy * nx + ix + 1, ys.starts.size() * nx);
         }
+    if (gpuStitch) {
+        int bad = 0;
+        auto status = cudaMemcpyAsync(&bad, invalid.data, sizeof(bad), cudaMemcpyDeviceToHost,
+                                      cudaStreamPerThread);
+        if (status == cudaSuccess)
+            status = cudaMemcpyAsync(out.rgba.data(), deviceRgba.data, out.rgba.size(), cudaMemcpyDeviceToHost,
+                                      cudaStreamPerThread);
+        if (status == cudaSuccess)
+            status = cudaStreamSynchronize(cudaStreamPerThread);
+        if (status != cudaSuccess)
+            throw std::runtime_error(cudaGetErrorString(status));
+        if (bad)
+            throw std::runtime_error("nonfinite decoded image");
+    }
     return out;
 }
 minimax_h3::VideoTensor VAE::encode(const Image &image, std::mt19937 &generator, Progress progress,
@@ -657,9 +841,43 @@ void Options::validate() const {
         throw std::invalid_argument("combined references exceed 64 megapixels");
 }
 Pipeline::Pipeline(const std::string &model, int device, DType vaeType, double gpuMemoryLimit,
-                   double hostMemoryLimit)
-    : model_(model), rt_(device), full_(device, true), vaeRt_(device, vaeType),
-      memory_(rt_, gpuMemoryLimit, hostMemoryLimit) {}
+                   double hostMemoryLimit, const std::vector<int> &devices, nomas::RowReduction reduction,
+                   const std::string &parallelMode)
+    : model_(model), rt_(devices.empty() ? device : devices.front()),
+      full_(devices.empty() ? device : devices.front(), true),
+      vaeRt_(devices.empty() ? device : devices.front(), vaeType),
+      memory_(rt_, gpuMemoryLimit, hostMemoryLimit), devices_(devices),
+      gpuMemoryLimit_(gpuMemoryLimit), reduction_(reduction) {
+    if (parallelMode != "auto" && parallelMode != "tp" && parallelMode != "sp")
+        throw std::invalid_argument("image parallel mode must be auto, tp or sp");
+    if (!devices.empty() && (56 % devices.size() || 8 % devices.size()))
+        throw std::invalid_argument("image tensor parallelism supports 1, 2, 4 or 8 devices");
+    if (devices_.size() > 1) {
+        if (!gpuMemoryLimit) {
+            for (int gpu : devices_) {
+                size_t free = 0, total = 0;
+                if (cudaSetDevice(gpu) != cudaSuccess || cudaMemGetInfo(&free, &total) != cudaSuccess)
+                    throw std::runtime_error("cannot query parallel CUDA memory");
+                memory_.layerStreaming = memory_.layerStreaming || free < (size_t(60) << 30);
+            }
+            rt_.activate();
+        }
+        if (parallelMode == "sp" && memory_.layerStreaming)
+            throw std::invalid_argument("image SP requires at least 60 GiB available per GPU");
+        if (parallelMode == "sp" && rt_.dtype() != DType::BF16)
+            throw std::invalid_argument("image SP requires BF16 transformer compute");
+        sequenceParallel_ = parallelMode != "tp" && !memory_.layerStreaming && rt_.dtype() == DType::BF16;
+        parallel_ = std::make_unique<ParallelModel>(model_, devices_, memory_, gpuMemoryLimit_, reduction_, sequenceParallel_);
+        rt_.activate();
+    }
+}
+Pipeline::~Pipeline() {
+    parallel_.reset();
+    try {
+        rt_.activate();
+    } catch (...) {
+    }
+}
 Image Pipeline::generate(const Options &o, Progress progress, Trace trace,
                          const std::vector<float> *textInput, const std::vector<float> *noise, bool decode) {
     rt_.activate();
@@ -672,6 +890,8 @@ Image Pipeline::generate(const Options &o, Progress progress, Trace trace,
         textEncoder_.reset();
         transformer_.reset();
         decoder_.reset();
+        parallel_.reset();
+        rt_.activate();
         // Drain queued frees before a subsequent HTTP request reuses the pool.
         rt_.synchronize();
         throw;
@@ -683,11 +903,14 @@ Image Pipeline::generateImpl(const Options &o, Progress progress, Trace trace,
     o.validate();
     const auto canvas = o.canvas();
     const int height = canvas.second, width = canvas.first;
-    if (!transformer_) {
+    if (devices_.size() > 1 && !parallel_) {
+        parallel_ = std::make_unique<ParallelModel>(model_, devices_, memory_, gpuMemoryLimit_, reduction_, sequenceParallel_);
+        rt_.activate();
+    }
+    if (!parallel_ && !transformer_) {
         transformer_ = std::make_unique<Transformer>(rt_, full_, model_);
         transformer_->setMemoryPolicy(memory_);
     }
-    auto &transformer = *transformer_;
     Conditioning condition;
     std::vector<Image> references;
     std::vector<minimax_h3::VisionInput> visual;
@@ -738,18 +961,22 @@ Image Pipeline::generateImpl(const Options &o, Progress progress, Trace trace,
     } else {
         if (progress)
             progress("text", 0, 50);
-        if (!textEncoder_) {
-            textEncoder_ = std::make_unique<minimax_h3::TextEncoder>(rt_, model_ + "/text_encoder");
-            textEncoder_->setLowMemory(memory_.layerStreaming);
-            textEncoder_->setMemoryPool(memory_.pool);
-            textEncoder_->setHostMemoryBudget(memory_.host);
-        }
-        auto &encoder = *textEncoder_;
-        text = encoder.encodeVisual(ids, visual, [&](const std::string &name, const Tensor &) {
+        auto textProgress = [&](const std::string &name, const Tensor &) {
             if (progress && name.compare(0, 6, "layer.") == 0)
                 progress("text", std::stoi(name.substr(6)) + 1, 50);
-        });
-        encoder.unload();
+        };
+        if (parallel_) {
+            text = parallel_->encode(ids, visual, textProgress);
+        } else {
+            if (!textEncoder_) {
+                textEncoder_ = std::make_unique<minimax_h3::TextEncoder>(rt_, model_ + "/text_encoder");
+                textEncoder_->setLowMemory(memory_.layerStreaming);
+                textEncoder_->setMemoryPool(memory_.pool);
+                textEncoder_->setHostMemoryBudget(memory_.host);
+            }
+            text = textEncoder_->encodeVisual(ids, visual, textProgress);
+            textEncoder_->unload();
+        }
         if (progress)
             progress("text", 50, 50);
     }
@@ -808,7 +1035,15 @@ Image Pipeline::generateImpl(const Options &o, Progress progress, Trace trace,
     encoded.clear();
     if (trace && referenceRows.rows)
         trace("reference_rows", referenceRows);
-    transformer.prepare(progress);
+    if (parallel_)
+        parallel_->prepare(progress);
+    else
+        transformer_->prepare(progress);
+    if (parallel_)
+        parallel_->prepareText(text);
+    else
+        transformer_->prepareText(text);
+    const auto &sigmas = parallel_ ? parallel_->sigmas() : transformer_->sigmas();
     for (int step = 0; step < 6; ++step) {
         Trace nested;
         if (trace)
@@ -816,10 +1051,11 @@ Image Pipeline::generateImpl(const Options &o, Progress progress, Trace trace,
                 trace("step." + std::to_string(step) + "." + name, x);
             };
         auto input = referenceRows.rows ? full_.concat({referenceRows, latent}) : latent;
-        auto velocity = transformer.forward(input, text, height, width, step, nested, &condition);
+        auto velocity = parallel_ ? parallel_->forward(input, text, height, width, step, nested, &condition)
+                                  : transformer_->forward(input, text, height, width, step, nested, &condition);
         // Image PDD uses velocity Euler, not H3's denoised interpolation form.
         latent = full_.add(
-            latent, full_.affine(velocity, transformer.sigmas()[step] - transformer.sigmas()[step + 1]));
+            latent, full_.affine(velocity, sigmas[step] - sigmas[step + 1]));
         if (trace)
             trace("latent." + std::to_string(step), latent);
         if (progress)
@@ -827,8 +1063,12 @@ Image Pipeline::generateImpl(const Options &o, Progress progress, Trace trace,
     }
     // Resident mode has room for the DiT alongside the streamed text layers and VAE.
     // Keep these immutable weights on-device; constrained devices still swap stages.
-    if (memory_.layerStreaming)
-        transformer.unload(true);
+    if (parallel_)
+        parallel_->releaseStreamedWeights();
+    else {
+        transformer_->clearText();
+        if (memory_.layerStreaming) transformer_->unload(true);
+    }
     text = {};
     referenceRows = {};
     if (trace)
@@ -840,6 +1080,10 @@ Image Pipeline::generateImpl(const Options &o, Progress progress, Trace trace,
     if (!decoder_) {
         decoder_ = std::make_unique<VAE>(vaeRt_, full_, model_);
         decoder_->setMemoryPolicy(memory_);
+        if (parallel_ && !memory_.layerStreaming && vaeRt_.dtype() == DType::BF16)
+            decoder_->setTileRunner([&](const Tensor &x, int h, int w, int batch) {
+                return parallel_->decodeTiles(x, h, w, batch);
+            });
     }
     auto image = decoder_->decode(host, height, width, progress);
     if (memory_.layerStreaming)

@@ -34,6 +34,9 @@ int main(int argc, char **argv) {
         std::string model, output = "image.png", textPath, noisePath, tracePath, vaePath, latentPath,
                            encodePath, vaeType = "bf16";
         int device = 0;
+        std::vector<int> devices;
+        std::string parallelMode = "auto";
+        auto reduction = fastllm::nomas::RowReduction::Activation;
         double gpuMemoryLimit = 0, hostMemoryLimit = 0;
         bool skipDecode = false, traceBlocks = false;
         for (int i = 1; i < argc; ++i) {
@@ -61,7 +64,17 @@ int main(int argc, char **argv) {
                 options.seed = std::stoull(value());
             else if (arg == "--device")
                 device = std::stoi(value());
-            else if (arg == "--gpu-memory-limit")
+            else if (arg == "--devices")
+                devices = fastllm::nomas::parseParallelDevices(value());
+            else if (arg == "--parallel-mode")
+                parallelMode = value();
+            else if (arg == "--tp-reduction") {
+                auto mode = value();
+                if (mode != "fp32" && mode != "activation")
+                    throw std::invalid_argument("TP reduction must be fp32 or activation");
+                reduction = mode == "fp32" ? fastllm::nomas::RowReduction::FP32
+                                           : fastllm::nomas::RowReduction::Activation;
+            } else if (arg == "--gpu-memory-limit")
                 gpuMemoryLimit = fastllm::minimax_h3::parseGpuMemoryLimit(value());
             else if (arg == "--host-memory-limit")
                 hostMemoryLimit = fastllm::minimax_h3::parseHostMemoryLimit(value());
@@ -88,6 +101,7 @@ int main(int argc, char **argv) {
                     << "minimax_h3_image_generate --model DIR --prompt TEXT --output image.png\n"
                        "  [--width 2048 --height 2048 --seed 42 --device 0 --vae-precision bf16|fp32]\n"
                        "  [--gpu-memory-limit GiB --host-memory-limit GiB] (0: automatic)\n"
+                       "  [--devices 0,1 --parallel-mode auto|tp|sp --tp-reduction fp32|activation]\n"
                        "Reference editing: --image FILE [--image FILE ...], up to 16 PNG/JPEG/WebP files.\n"
                        "  --min-generation-area 4194304 generates small outputs on a 2K canvas.\n"
                        "Diagnostics: --text-in F32 --noise-in F32 --trace DIR --trace-blocks --skip-decode\n"
@@ -100,6 +114,8 @@ int main(int argc, char **argv) {
         }
         if (model.empty())
             throw std::invalid_argument("--model is required");
+        if (!devices.empty())
+            device = devices.front();
         const auto dtype = fastllm::minimax_h3::parseVideoPrecision(vaeType);
         if (dtype == DType::FP16)
             throw std::invalid_argument("image VAE supports bf16 or fp32");
@@ -122,6 +138,8 @@ int main(int argc, char **argv) {
         auto start = std::chrono::steady_clock::now();
         Image result;
         const bool diagnostic = !encodePath.empty() || !vaePath.empty() || !latentPath.empty();
+        if (diagnostic && devices.size() > 1)
+            throw std::invalid_argument("standalone VAE diagnostics use one device");
         auto memory =
             diagnostic ? std::make_unique<MemoryPolicy>(full, gpuMemoryLimit, hostMemoryLimit) : nullptr;
         auto scope = memory && memory->pool
@@ -154,7 +172,7 @@ int main(int argc, char **argv) {
             write(output, png.data(), png.size());
         } else {
             auto text = read(textPath), noise = read(noisePath);
-            Pipeline pipeline(model, device, dtype, gpuMemoryLimit, hostMemoryLimit);
+            Pipeline pipeline(model, device, dtype, gpuMemoryLimit, hostMemoryLimit, devices, reduction, parallelMode);
             result = pipeline.generate(options, progress, trace, textPath.empty() ? nullptr : &text,
                                        noisePath.empty() ? nullptr : &noise, !skipDecode);
             if (!skipDecode) {

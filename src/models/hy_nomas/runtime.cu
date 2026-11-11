@@ -49,6 +49,22 @@ struct MemoryPool {
     int device;
     size_t cacheLimit=0,cachedBytes=0,maxBytes=0;
     std::mutex cacheMutex;
+    std::mutex peerMutex;
+    std::vector<int> peerDevices;
+    void enablePeers(const std::vector<int> &devices) {
+        std::lock_guard<std::mutex> lock(peerMutex);
+        for(int peer:devices) {
+            if(peer==device || std::find(peerDevices.begin(),peerDevices.end(),peer)!=peerDevices.end()) continue;
+            int access=0; check(cudaDeviceCanAccessPeer(&access,peer,device));
+            if(!access) continue;
+            cudaMemAccessDesc desc{};
+            desc.location.type=cudaMemLocationTypeDevice;
+            desc.location.id=peer;
+            desc.flags=cudaMemAccessFlagsProtReadWrite;
+            check(cudaMemPoolSetAccess(handle,&desc,1));
+            peerDevices.push_back(peer);
+        }
+    }
     using FreeBlocks=std::map<size_t,std::vector<void *>>;
     std::unordered_map<uint64_t,FreeBlocks> freeBlocks;
     void *reuse(size_t bytes) {
@@ -126,6 +142,19 @@ std::shared_ptr<MemoryPool> memoryPool(int device) {
     }
     return pool;
 }
+struct TensorAllocation {
+    int device;
+    std::shared_ptr<MemoryPool> pool;
+    size_t bytes;
+    uint64_t owner;
+    void operator()(void *x) const {
+        int previous=device; cudaGetDevice(&previous);
+        if(previous==device && activePool==pool && owner==allocationThread() && pool->recycle(x,bytes)) return;
+        cudaSetDevice(device);
+        cudaFreeAsync(x,cudaStreamPerThread);
+        cudaSetDevice(previous);
+    }
+};
 std::shared_ptr<void> allocate(size_t bytes) {
     require(bytes > 0, "empty CUDA allocation");
     int device; check(cudaGetDevice(&device));
@@ -142,14 +171,7 @@ std::shared_ptr<void> allocate(size_t bytes) {
         }
         check(status);
     }
-    auto owner=allocationThread();
-    return {p, [device,pool,bytes,owner](void *x) {
-        int previous = device; cudaGetDevice(&previous);
-        if(previous==device && activePool==pool && owner==allocationThread() && pool->recycle(x,bytes)) return;
-        cudaSetDevice(device);
-        cudaFreeAsync(x,cudaStreamPerThread);
-        cudaSetDevice(previous);
-    }};
+    return {p,TensorAllocation{device,pool,bytes,allocationThread()}};
 }
 template<class T> T *as(const Tensor &x) { return reinterpret_cast<T *>(x.data); }
 B *ptr(const Tensor &x) { return reinterpret_cast<B *>(x.data); }
@@ -456,6 +478,10 @@ template<class T> __global__ void textRopeKernel(const T *x,T *y,size_t n,int co
 }
 }
 
+void enableTensorPeerAccess(const Tensor &tensor,const std::vector<int> &devices) {
+    if(auto owner=std::get_deleter<TensorAllocation>(tensor.storage)) owner->pool->enablePeers(devices);
+}
+
 TensorPool::TensorPool(int device,size_t cacheBytes,size_t maxBytes,bool reserve)
     :pool_(std::make_shared<MemoryPool>(device,maxBytes && !reserve?0:UINT64_MAX,maxBytes)) {
     require(!maxBytes || cacheBytes<=maxBytes,"tensor cache exceeds memory pool limit");
@@ -504,6 +530,7 @@ struct Runtime::LtState {
         cublasLtMatrixLayout_t a=nullptr,b=nullptr,c=nullptr;
         cublasLtMatmulPreference_t preference=nullptr;
         cublasLtMatmulAlgo_t algorithm;
+        bool fallback = false;
         ~Plan() { if(op) cublasLtMatmulDescDestroy(op); if(a) cublasLtMatrixLayoutDestroy(a); if(b) cublasLtMatrixLayoutDestroy(b); if(c) cublasLtMatrixLayoutDestroy(c); if(preference) cublasLtMatmulPreferenceDestroy(preference); }
     };
     // Fixed workspaces keep the BF16 algorithm choice reproducible. cuBLASLt
@@ -611,32 +638,73 @@ void Runtime::linearInto(const Tensor &x,const Tensor &w,Tensor &out,const Tenso
         check(cudaGetLastError()); return;
     }
     auto scalarType=x.dtype==DType::FP16 ? CUDA_R_16F : CUDA_R_16BF;
-    if(bias) {
-        auto key=std::to_string(int(x.dtype))+":"+std::to_string(x.rows)+":"+std::to_string(x.cols)+":"+std::to_string(w.rows);
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    bool tune = tuneLinear_ && !bias && x.dtype==DType::BF16 && out.dtype==x.dtype &&
+        x.rows>=1024 && x.cols>=4096 && w.rows>=4096 && x.cols%256==0 && w.rows%256==0 &&
+        ((uintptr_t(x.data)|uintptr_t(w.data)|uintptr_t(out.data))%256==0);
+    if(tune) { check(cudaStreamIsCapturing(cudaStreamPerThread,&capture)); tune=capture==cudaStreamCaptureStatusNone; }
+    if(bias || tune) {
+        const size_t workspaceBytes = tune ? size_t(32)<<20 : lt_->workspaceBytes;
+        void *workspace = tune ? lt_->blasWorkspace.get() : lt_->workspace.get();
+        auto key=std::string(tune ? "tuned:" : "bias:")+std::to_string(int(x.dtype))+":"+std::to_string(x.rows)+":"+std::to_string(x.cols)+":"+std::to_string(w.rows);
         auto &plan=lt_->plans[key];
         if(!plan) {
             auto p=std::make_unique<LtState::Plan>();
             check(cublasLtMatmulDescCreate(&p->op,CUBLAS_COMPUTE_32F,CUDA_R_32F));
             cublasOperation_t trans=CUBLAS_OP_T; check(cublasLtMatmulDescSetAttribute(p->op,CUBLASLT_MATMUL_DESC_TRANSA,&trans,sizeof(trans)));
-            cublasLtEpilogue_t epilogue=CUBLASLT_EPILOGUE_BIAS;
-            check(cublasLtMatmulDescSetAttribute(p->op,CUBLASLT_MATMUL_DESC_EPILOGUE,&epilogue,sizeof(epilogue)));
-            check(cublasLtMatmulDescSetAttribute(p->op,CUBLASLT_MATMUL_DESC_BIAS_POINTER,&bias->data,sizeof(void *)));
+            if(bias) {
+                cublasLtEpilogue_t epilogue=CUBLASLT_EPILOGUE_BIAS;
+                check(cublasLtMatmulDescSetAttribute(p->op,CUBLASLT_MATMUL_DESC_EPILOGUE,&epilogue,sizeof(epilogue)));
+                check(cublasLtMatmulDescSetAttribute(p->op,CUBLASLT_MATMUL_DESC_BIAS_POINTER,&bias->data,sizeof(void *)));
+            }
             check(cublasLtMatrixLayoutCreate(&p->a,scalarType,w.cols,w.rows,w.cols));
             check(cublasLtMatrixLayoutCreate(&p->b,scalarType,x.cols,x.rows,x.cols));
             check(cublasLtMatrixLayoutCreate(&p->c,scalarType,w.rows,x.rows,w.rows));
             check(cublasLtMatmulPreferenceCreate(&p->preference));
-            check(cublasLtMatmulPreferenceSetAttribute(p->preference,CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,&lt_->workspaceBytes,sizeof(size_t)));
+            check(cublasLtMatmulPreferenceSetAttribute(p->preference,CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,&workspaceBytes,sizeof(size_t)));
             uint32_t reduction=CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE|CUBLASLT_REDUCTION_SCHEME_NONE,alignment=256;
             check(cublasLtMatmulPreferenceSetAttribute(p->preference,CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK,&reduction,sizeof(reduction)));
             for(auto attr:{CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES,CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_B_BYTES,CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_C_BYTES,CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_D_BYTES})
                 check(cublasLtMatmulPreferenceSetAttribute(p->preference,attr,&alignment,sizeof(alignment)));
-            int count=0; cublasLtMatmulHeuristicResult_t choice{};
-            check(cublasLtMatmulAlgoGetHeuristic(reinterpret_cast<cublasLtHandle_t>(blas_),p->op,p->a,p->b,p->c,p->c,p->preference,1,&choice,&count));
-            require(count>0,"no cuBLASLt 16-bit linear algorithm"); p->algorithm=choice.algo; plan=std::move(p);
+            int count=0; cublasLtMatmulHeuristicResult_t choices[2]{};
+            check(cublasLtMatmulAlgoGetHeuristic(reinterpret_cast<cublasLtHandle_t>(blas_),p->op,p->a,p->b,p->c,p->c,p->preference,tune?2:1,choices,&count));
+            require(tune || count>0,"no cuBLASLt 16-bit linear algorithm");
+            p->fallback = count==0;
+            if(count) p->algorithm=choices[0].algo;
+            if(tune && count>1) {
+                struct Events {
+                    cudaEvent_t start=nullptr,stop=nullptr;
+                    ~Events() { if(start) cudaEventDestroy(start); if(stop) cudaEventDestroy(stop); }
+                } events;
+                check(cudaEventCreate(&events.start)); check(cudaEventCreate(&events.stop));
+                float timings[2]{};
+                // Alternate order and discard the first round: initial weight
+                // loading can leave GPU clocks low and bias a one-shot choice.
+                for(int round=0;round<3;++round) for(int j=0;j<count;++j) {
+                    int candidate=round%2 ? count-1-j : j;
+                    auto call=[&] { return cublasLtMatmul(reinterpret_cast<cublasLtHandle_t>(blas_),p->op,&one,
+                        w.data,p->a,x.data,p->b,&zero,out.data,p->c,out.data,p->c,&choices[candidate].algo,
+                        workspace,workspaceBytes,cudaStreamPerThread); };
+                    check(call());
+                    check(cudaEventRecord(events.start,cudaStreamPerThread));
+                    for(int repeat=0;repeat<3;++repeat) check(call());
+                    check(cudaEventRecord(events.stop,cudaStreamPerThread));
+                    check(cudaEventSynchronize(events.stop));
+                    float milliseconds=0;check(cudaEventElapsedTime(&milliseconds,events.start,events.stop));
+                    if(round) timings[candidate]+=milliseconds;
+                }
+                // Keep the first heuristic for differences within timing noise.
+                if(timings[1]<timings[0]*.99f) p->algorithm=choices[1].algo;
+            }
+            plan=std::move(p);
         }
-        check(cublasLtMatmulDescSetAttribute(plan->op,CUBLASLT_MATMUL_DESC_BIAS_POINTER,&bias->data,sizeof(void *)));
-        check(cublasLtMatmul(reinterpret_cast<cublasLtHandle_t>(blas_),plan->op,&one,w.data,plan->a,x.data,plan->b,&zero,
-            out.data,plan->c,out.data,plan->c,&plan->algorithm,lt_->workspace.get(),lt_->workspaceBytes,cudaStreamPerThread));
+        if(bias) check(cublasLtMatmulDescSetAttribute(plan->op,CUBLASLT_MATMUL_DESC_BIAS_POINTER,&bias->data,sizeof(void *)));
+        if(plan->fallback) {
+            check(cublasGemmEx(static_cast<cublasHandle_t>(blas_),CUBLAS_OP_T,CUBLAS_OP_N,
+                w.rows,x.rows,x.cols,&one,w.data,scalarType,w.cols,x.data,scalarType,x.cols,
+                &zero,out.data,scalarType,w.rows,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT));
+        } else check(cublasLtMatmul(reinterpret_cast<cublasLtHandle_t>(blas_),plan->op,&one,w.data,plan->a,x.data,plan->b,&zero,
+            out.data,plan->c,out.data,plan->c,&plan->algorithm,workspace,workspaceBytes,cudaStreamPerThread));
     } else {
         check(cublasGemmEx(static_cast<cublasHandle_t>(blas_),CUBLAS_OP_T,CUBLAS_OP_N,
             w.rows,x.rows,x.cols,&one,w.data,scalarType,w.cols,x.data,scalarType,x.cols,

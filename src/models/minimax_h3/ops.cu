@@ -199,7 +199,8 @@ __global__ void qkNormRope128(const B *q, const B *k, const B *qw, const B *kw, 
         }
     }
 }
-// VAE Q/K normalization accumulates in FP32 and rounds only its output.
+// VAE Q/K statistics accumulate in FP32. Norm and rotary arithmetic retain
+// the activation dtype's eager rounding boundaries.
 // A warp owns a 64-wide head, preserving normKernel's 32,16,...,1 reduction tree.
 template <class T, bool packed = false, class Index = size_t>
 __global__ void videoQkNormRope64(const T *q, const T *k, const float *cs, const float *sn,

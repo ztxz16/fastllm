@@ -17,6 +17,12 @@ public:
     Tensor broadcast(const Tensor &root, int rank);
     // Async gathers retain their buffers; wait() before consuming the result.
     Tensor gatherColumns(const Tensor &, int rank, int groups = 1, bool async = false);
+    // Equal contiguous chunks, gathered rank-major within each chunk. Copies
+    // are queued together; consume enqueues work on the caller stream as each is ready.
+    // Side-stream consumers must retain their gathered tensor until they join back.
+    // inPlace: input has [chunk, rank, local rows], with this rank already filled.
+    void gatherChunks(const Tensor &, int chunks, int rank,
+                      const std::function<void(int, const Tensor &)> &consume, bool inPlace = false);
     void sum(Tensor &, int rank);
     // In-place AllReduce on the communication stream; wait() before consuming.
     void sumAsync(const Tensor &, int rank);

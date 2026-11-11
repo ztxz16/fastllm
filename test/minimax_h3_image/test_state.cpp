@@ -5,9 +5,15 @@ using namespace fastllm::minimax_h3_image;
 
 int main(int argc, char **argv) {
     try {
-        if (argc != 3)
-            throw std::invalid_argument("usage: minimax_h3_image_state MODEL REFERENCE_IMAGE");
-        Pipeline pipeline(argv[1]);
+        if (argc < 3 || argc > 5)
+            throw std::invalid_argument(
+                "usage: minimax_h3_image_state MODEL REFERENCE_IMAGE [DEVICES] [tp|sp]");
+        auto devices = argc >= 4 ? fastllm::nomas::parseParallelDevices(argv[3]) : std::vector<int>{};
+        const std::string mode = argc == 5 ? argv[4] : "tp";
+        if (mode != "tp" && mode != "sp")
+            throw std::invalid_argument("parallel mode must be tp or sp");
+        Pipeline pipeline(argv[1], 0, DType::BF16, 0, 0, devices, fastllm::nomas::RowReduction::Activation,
+                          mode);
         Options options;
         options.prompt = "A red panda beside a mountain stream, autumn forest";
         options.width = 64;
@@ -34,11 +40,11 @@ int main(int argc, char **argv) {
             try {
                 pipeline.generate(std::string(stage) == "reference" ? edit : options,
                                   [&](const std::string &name, int done, int) {
-                    if (name == stage && done >= (name == "decode" ? 1 : 2)) {
-                        cancelled = true;
-                        throw std::runtime_error("test cancellation");
-                    }
-                });
+                                      if (name == stage && done >= (name == "decode" ? 1 : 2)) {
+                                          cancelled = true;
+                                          throw std::runtime_error("test cancellation");
+                                      }
+                                  });
             } catch (const std::runtime_error &error) {
                 if (std::string(error.what()) != "test cancellation")
                     throw;
