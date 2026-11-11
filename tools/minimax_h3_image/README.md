@@ -18,7 +18,42 @@ CUDA_VISIBLE_DEVICES=3 build/src/models/minimax_h3/minimax_h3_image_generate \
   --width 2048 --height 2048 --seed 42 --output red-panda.png
 ```
 
-Select an available GPU before running. `--device` addresses the visible CUDA devices, so it defaults to `0` after setting `CUDA_VISIBLE_DEVICES`. The tested device is an RTX PRO 5000 Blackwell with 72 GB memory, including constrained-memory runs described below. Tensor parallelism is not implemented for this image backend.
+Select available GPUs before running. `--device` addresses the visible CUDA devices, so it defaults to `0` after setting `CUDA_VISIBLE_DEVICES`. The tested device is an RTX PRO 5000 Blackwell with 72 GB memory, including constrained-memory runs described below.
+
+Both CLI and HTTP server accept `--devices 0,1`. Text encoding uses tensor parallelism.
+With `--parallel-mode auto` (default), resident DiT weights use sequence parallelism: each
+GPU handles a contiguous token partition, with head-group K/V exchange overlapped with
+attention. Each rank writes its local K/V directly into the exchange buffer; only peer
+segments are copied. Large aligned BF16 projections tune two cuBLASLt candidates once per
+shape, keeping FP32 accumulation; this changes cold-start timing and may change rounding.
+On two SM120 devices, padded local sequences of 512–8192 rows use seven head groups
+across two persistent attention streams. CUDA events order each group after its K/V
+transfer and join both streams before the output projection. The scratch arena is reused
+within DiT and released before VAE batching; the attention math is unchanged. Other
+architectures, rank counts and sequence sizes retain serial group execution. Native tensor
+pools explicitly grant access to participating peer-capable devices for direct peer copies.
+Low-memory mode uses tensor-parallel weight shards and layer streaming instead.
+`--parallel-mode tp|sp` selects either mode explicitly; SP requires at least 60 GiB available
+per device. The final PDD projection runs on local rows before gathering the 96-wide velocity, avoiding a full hidden-state exchange. The reference VAE encoder and sampler use the first device. Resident BF16 VAE
+decoding splits independent tiles across devices, preserving tile order and blend boundaries.
+The build must find NCCL (`FASTLLM_NCCL_INCLUDE_DIR` and `FASTLLM_NCCL_LIBRARY` can point
+to a nonstandard installation). Inference remains native C++/CUDA/NCCL without Torch.
+
+```bash
+CUDA_VISIBLE_DEVICES=4,5 build/src/models/minimax_h3/minimax_h3_image_generate \
+  --model /path/to/MiniMax-H3-Image --devices 0,1 \
+  --prompt "A red panda beside a mountain stream, autumn forest" \
+  --width 2048 --height 2048 --seed 42 --output red-panda.png
+```
+
+In TP mode, `--tp-reduction activation` is the default: it rounds DiT row-projection partials to BF16 before
+reduction to reduce communication. `--tp-reduction fp32` retains FP32 partials until after their
+sum. Both retain FP32 accumulation in GEMMs; text-encoder reductions always use FP32.
+Changing rank count or reduction precision can change generated pixels. Checkpoint tests compare
+each block with identical input tensors using relative L2, and report accumulated drift separately.
+The GPU limit applies to **each device**; all ranks share one host-cache budget. The launcher maps
+selected GPUs to logical indices automatically. Device counts 1/2/4/8 satisfy the model dimensions;
+the multi-device validation currently covers two GPUs.
 
 The model directory must contain:
 
@@ -27,9 +62,9 @@ The model directory must contain:
 - `pdd_config.json` and `pdd_fused_heads.safetensors`.
 - `tokenizer/` and the original MiniMax-H3 `text_encoder/`. A symlink to an existing text encoder is supported.
 
-Defaults are BF16 transformer/VAE compute, FP32 timestep/input/output projections, six steps and a 2048×2048 canvas. `--vae-precision fp32` provides a slower diagnostic alternative. The text encoder reads hidden state 50, takes the prompt verbatim and streams its GPU weights while retaining a budgeted CPU weight cache. Fixed AdaLN timestep tables are reused across requests; their large source matrices are released after preparation. With sufficient free VRAM, DiT and VAE decoder weights stay resident between requests. Low-memory mode unloads DiT weights between stages. VAE decode batches independent tiles when memory allows, retaining the original sequential path for low-memory and FP32 diagnostics.
+Defaults are BF16 transformer/VAE compute, FP32 timestep/input/output projections, six steps and a 2048×2048 canvas. `--vae-precision fp32` provides a slower diagnostic alternative. The text encoder reads hidden state 50, takes the prompt verbatim and streams its GPU weights while retaining a budgeted CPU weight cache. Fixed AdaLN timestep tables are reused across requests; their large source matrices are released after preparation. With sufficient free VRAM, DiT and VAE decoder weights stay resident between requests. Low-memory mode unloads DiT weights between stages. VAE decode batches independent tiles when memory allows, retaining the original sequential path for low-memory and FP32 diagnostics. The two text-refiner blocks run once within each request; their result is reused across its six steps and discarded afterward. Each new request recomputes its prompt and reference conditioning.
 
-Reference VAE encoding has a single-image fast path: it removes the two zero causal frames from each convolution, batches independent 256-pixel tiles (up to eight, bounded by free VRAM), and uses cuBLAS TF32 products with FP32 accumulation on Ampere or newer GPUs. Activations, normalization, residuals and posterior moments remain FP32. Low-memory mode and `--vae-precision fp32` keep the original FP32 encoder. This is checked with relative L2 error, so reference edits need not be pixel-identical to the original implementation. Gate-first FFNs use a fused CUDA activation that preserves the existing rounding, without changing their 4096-row chunk limit.
+Reference VAE encoding has a single-image fast path: it removes the two zero causal frames from each convolution, batches independent 256-pixel tiles (up to eight, bounded by free VRAM), and uses cuBLAS TF32 products with FP32 accumulation on Ampere or newer GPUs. Activations, normalization, residuals and posterior moments remain FP32. Low-memory mode and `--vae-precision fp32` keep the original FP32 encoder. This is checked with relative L2 error, so reference edits need not be pixel-identical to the original implementation. Gate-first FFNs use a fused CUDA activation with BF16 approximate exponential, retaining the SiLU-before-multiply rounding boundary and checking relative L2. FP16/FP32 keep the original exponential. FFNs use 4096-row TP chunks and 8192-row local SP chunks.
 
 Native checkpoint details handled here include per-head interleaved QKV, gate-first FFNs, three modality AdaLN rows, one FP32 PDD head per step, velocity-form Euler updates, 2D VAE rotary positions and register tokens, overlapping 256-pixel VAE tiles, ImageNet pixel denormalization and truncating RGB quantization.
 
@@ -53,7 +88,7 @@ Output dimensions are 32–8192 per side, up to 20 Mi pixels. Generation uses a 
 
 References accept 8-bit non-interlaced PNG, JPEG and WebP, 32–8192 per side, up to 20 Mi pixels each, aspect ratios 1:4–4:1 and 64 Mi pixels combined. HTTP requests are limited to 32 MiB including multipart overhead. The demo recompresses large PNGs losslessly before upload, so generated PNGs can be reused as references. The CLI accepts files up to 96 MiB. JPEG EXIF rotation is applied during decoding. Reference preparation uses the released model’s size bounds: a 1024-pixel short edge for vision conditioning, and 1024–2048 for VAE encoding.
 
-The model has six distilled steps, guidance scale 1 and one output per request. Masks/inpainting regions, a strength slider, negative prompts/CFG, arbitrary step counts, and tensor parallelism are not implemented. The optional official MiniMax-H3-Image-PE prompt expander is a separate model and is not included here.
+The model has six distilled steps, guidance scale 1 and one output per request. Masks/inpainting regions, a strength slider, negative prompts/CFG and arbitrary step counts are not implemented. The optional official MiniMax-H3-Image-PE prompt expander is a separate model and is not included here.
 
 ## Low VRAM and host-memory operation
 
@@ -68,7 +103,7 @@ With no GPU limit (or `0`), startup checks free device memory: below 60 GiB, DiT
 
 With no host limit (or `0`), a shared weight cache uses at most one quarter of available host/container memory minus a 2 GiB working allowance, capped at 64 GiB. Detection respects the process's cgroup v1/v2 quota and visible parent quotas, including sibling usage. Explicit host limits must be at least 2 GiB: `2` disables weight caching; larger values allow caching within the remaining quota. Text, vision, reference encoding, DiT and VAE share the quota and load uncached tensors in at most 16 MiB chunks without whole-weight mmap reads. VAE output tiles are decoded in bounded batches (one tile in low-memory mode) and combined a row at a time. The host option bounds **weight caching**, not total process RSS: image buffers, queued uploads, tokenizer, CUDA runtime and filesystem cache also need memory. Low budgets trade speed for capacity.
 
-`GET /health` reports `gpu_memory_limit_gib`, `host_memory_limit_gib`, `gpu_memory_reserved`, `layer_streaming` and `host_weight_cache_gib`. A reported limit of zero means automatic policy; the cache field reports its effective capacity. CLI VAE diagnostics use the same policy. Inference remains native C++/CUDA, without a Torch dependency.
+`GET /health` reports `gpu_memory_limit_gib`, `host_memory_limit_gib`, `gpu_memory_reserved`, `layer_streaming`, `host_weight_cache_gib`, `tensor_parallel_size` (text encoder), `sequence_parallel_size` and `dit_parallel_mode`. A reported limit of zero means automatic policy; the cache field reports its effective capacity. CLI VAE diagnostics use the same policy. Inference remains native C++/CUDA, without a Torch dependency.
 
 ## Web demo and HTTP API
 
@@ -107,7 +142,7 @@ The queue allows up to four pending/running jobs. Up to 128 recent jobs are kept
 
 ## ftllm launch
 
-Launch the current source/wheel with `ftllm launch`. Under **启动服务 → 增加启动项**, choose **图像（MiniMax H3 Image）**, set the model directory, port, output directory and one available GPU, then start the profile. Click **图像 Demo**, or open **工作室 → 图像生成**, to generate, edit or combine images, monitor progress, cancel, preview and download. The image backend can run alongside chat and video services; its requests pass through the launcher's authenticated service proxy.
+Launch the current source/wheel with `ftllm launch`. Under **启动服务 → 增加启动项**, choose **图像（MiniMax H3 Image）**, set the model directory, port, output directory and available GPUs, then start the profile. Click **图像 Demo**, or open **工作室 → 图像生成**, to generate, edit or combine images, monitor progress, cancel, preview and download. The image backend can run alongside chat and video services; its requests pass through the launcher's authenticated service proxy.
 
 The launcher locates `minimax_h3_image_server` from the profile's binary field, `FTLLM_H3_IMAGE_SERVER`, the installed wheel, PATH or the source build directory, in that order. For a separate build directory:
 
@@ -115,7 +150,7 @@ The launcher locates `minimax_h3_image_server` from the profile's binary field, 
 FTLLM_H3_IMAGE_SERVER=/absolute/build/src/models/minimax_h3/minimax_h3_image_server ftllm launch
 ```
 
-GPU indices in the launcher refer to its visible GPU list. If a container exposes physical GPU 3 only, select logical GPU 0. This image backend validates that only one GPU is selected. CUDA wheel packaging includes both image executables, OpenAPI, the standalone demo and its shared JS/CSS assets. A full release wheel has not been built in this experiment.
+GPU indices in the launcher refer to its visible GPU list. If a container exposes physical GPU 3 only, select logical GPU 0. Select 1, 2, 4 or 8 GPUs; two-device inference has been validated. The backend selects SP or streamed TP automatically from the per-device memory budget. CUDA wheel packaging includes both image executables, OpenAPI, the standalone demo and its shared JS/CSS assets. A full release wheel has not been built in this experiment.
 
 ## Numerical validation
 
@@ -141,6 +176,16 @@ python test/minimax_h3_image/compare_dit.py \
 The VAE test compares all 24 decoder blocks and an asymmetric output tile; `--tiled` also compares the complete overlapping-tile PNG path. The DiT test runs all 50 blocks and six different PDD heads with fixed text and initial noise, comparing the six-step trajectory to the official scheduler. It releases the reference model before starting the C++ process.
 
 With `-DUNIT_TEST=ON`, build `minimax_h3_image_condition` and pass its executable as `--condition-binary` to `compare_dit.py`. This runs the real-weight 50-layer, six-step comparison with mixed text/vision tags and two asymmetric reference grids.
+
+The native two-GPU checkpoint test compares same-input operators/blocks with relative L2
+below `0.01`, and reports full-trajectory drift separately. Its SP mode also requires
+bitwise equality between concurrent and serial head groups, including uneven shards,
+dispatch boundaries, scratch release and allocator reuse:
+
+```bash
+CUDA_VISIBLE_DEVICES=4,5 build/src/models/minimax_h3/minimax_h3_image_parallel /path/to/MiniMax-H3-Image sp
+CUDA_VISIBLE_DEVICES=4,5 build/src/models/minimax_h3/minimax_h3_image_parallel /path/to/MiniMax-H3-Image activation
+```
 
 The HTTP regression suite does not load a model or use a GPU. It checks authenticated history restoration beyond 128 results, invalid/incomplete sidecars and the packaged demo asset layout. The frontend state test checks exact output aspect ratios, overlapping uploads and submitting/reusing while references are being prepared.
 

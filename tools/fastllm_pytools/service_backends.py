@@ -255,6 +255,9 @@ class H3ImageBackend:
         command = [self.executable(config), "--model", os.path.expanduser(config.model.strip()),
                    "--host", config.host.strip(), "--port", config.port.strip(), "--device", "0",
                    "--output", os.path.expanduser(output)]
+        count = len([gpu for gpu in config.visible_gpus.split(",") if gpu.strip()])
+        if count > 1:
+            command.extend(("--devices", ",".join(str(i) for i in range(count))))
         package = Path(__file__).resolve().parent
         for demo in (package / "h3_image_assets/demo.html", package.parent / "minimax_h3_image/demo.html"):
             if demo.is_file():
@@ -278,8 +281,9 @@ class H3ImageBackend:
             add("请选择已存在的 MiniMax H3 Image 模型目录。", "model")
         if not shutil.which(self.executable(config)):
             add("找不到 minimax_h3_image_server；请编译图像服务或设置 FTLLM_H3_IMAGE_SERVER。", "server_binary")
-        if len(config.visible_gpus.split(",")) > 1:
-            add("MiniMax H3 Image 当前仅支持单卡，请只选择一张 GPU。", "visible_gpus")
+        count = len([gpu for gpu in config.visible_gpus.split(",") if gpu.strip()])
+        if count not in {0, 1, 2, 4, 8}:
+            add("MiniMax H3 Image 支持 1、2、4 或 8 张 GPU。", "visible_gpus")
         try:
             if not 1 <= int(config.port) <= 65535:
                 raise ValueError()

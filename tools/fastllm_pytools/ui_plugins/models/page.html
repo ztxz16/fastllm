@@ -111,7 +111,7 @@
                     </label>
                     <label class="field span-2"><span>限制可用 GPU（可选）</span>
                       <input data-field="visible_gpus" type="text" placeholder="例如 0 或 1,2，支持 GPU UUID" spellcheck="false">
-                      <small>填写 Launcher 可见的卡号或 UUID，以逗号分隔。模型内部重新编号为 0、1…；图像仅支持单卡，视频可使用多卡。留空时继承可见范围，图像和视频默认使用第 0 张卡。</small>
+                      <small>填写 Launcher 可见的卡号或 UUID，以逗号分隔。模型内部重新编号为 0、1…；图像支持 1、2、4 或 8 张卡，视频可使用多卡。留空时继承可见范围，图像和视频默认使用第 0 张卡。</small>
                     </label>
                     <div id="gpu-choices" class="gpu-choices span-2" role="group" aria-label="可用 GPU"></div>
                     <label class="field" data-inference-setting>

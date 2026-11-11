@@ -355,7 +355,7 @@
           },
           "gpu_memory_limit_gib": {
             "type": "number",
-            "description": "Startup --gpu-memory-limit; zero selects automatic policy."
+            "description": "Per-device startup --gpu-memory-limit; zero selects automatic policy."
           },
           "host_memory_limit_gib": {
             "type": "number",
@@ -370,6 +370,24 @@
           "host_weight_cache_gib": {
             "type": "number",
             "description": "Effective shared weight-cache capacity after the 2 GiB working allowance."
+          },
+          "tensor_parallel_size": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Text encoder tensor-parallel rank count."
+          },
+          "sequence_parallel_size": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "DiT sequence-parallel rank count, or 1 in TP mode."
+          },
+          "dit_parallel_mode": {
+            "type": "string",
+            "enum": [
+              "tp",
+              "sp"
+            ],
+            "description": "Effective DiT mode selected at startup."
           }
         }
       }

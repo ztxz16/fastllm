@@ -98,8 +98,10 @@ Json metadata(const std::shared_ptr<Job> &j) {
 class Service {
   public:
     Service(const std::string &model, std::string output, int device, DType vaeType, double gpuLimit,
-            double hostLimit)
-        : output_(std::move(output)), gpuLimit_(gpuLimit), hostLimit_(hostLimit) {
+            double hostLimit, const std::vector<int> &devices, fastllm::nomas::RowReduction reduction,
+            const std::string &parallelMode)
+        : output_(std::move(output)), gpuLimit_(gpuLimit), hostLimit_(hostLimit),
+          parallelSize_(devices.empty() ? 1 : int(devices.size())) {
         std::filesystem::create_directories(output_);
         for (auto &entry : std::filesystem::directory_iterator(output_)) {
             auto name = entry.path().filename().string();
@@ -129,7 +131,7 @@ class Service {
             } catch (const std::exception &) { /* Ignore incomplete/stale result metadata. */
             }
         }
-        worker_ = std::thread([this, model, device, vaeType] {
+        worker_ = std::thread([this, model, device, vaeType, devices, reduction, parallelMode] {
             try {
                 // Validate model configs and checkpoint indexes before advertising readiness.
                 {
@@ -140,7 +142,8 @@ class Service {
                     if (!std::filesystem::is_regular_file(model + "/text_encoder/config.json"))
                         throw std::runtime_error("missing text_encoder/config.json");
                 }
-                Pipeline pipeline(model, device, vaeType, gpuLimit_, hostLimit_);
+                Pipeline pipeline(model, device, vaeType, gpuLimit_, hostLimit_, devices, reduction, parallelMode);
+                sequenceParallel_ = pipeline.sequenceParallel();
                 streaming_ = pipeline.memoryPolicy().layerStreaming;
                 hostCacheGiB_ = double(pipeline.memoryPolicy().host->limit()) / (size_t(1) << 30);
                 ready_ = true;
@@ -239,6 +242,9 @@ class Service {
                             {"error", startupError_.empty() ? Json() : Json(startupError_)},
                             {"gpu_memory_limit_gib", gpuLimit_},
                             {"host_memory_limit_gib", hostLimit_},
+                            {"tensor_parallel_size", parallelSize_},
+                            {"sequence_parallel_size", sequenceParallel_.load() ? parallelSize_ : 1},
+                            {"dit_parallel_mode", sequenceParallel_.load() ? "sp" : "tp"},
                             {"gpu_memory_reserved", ready_.load() && gpuLimit_ > 0},
                             {"layer_streaming", streaming_.load()},
                             {"host_weight_cache_gib", hostCacheGiB_.load()}};
@@ -334,11 +340,13 @@ class Service {
     std::string output_, startupError_;
     std::atomic<bool> ready_{false}, stopping_{false};
     const double gpuLimit_, hostLimit_;
+    const int parallelSize_;
     std::atomic<bool> streaming_{false};
     std::atomic<double> hostCacheGiB_{0};
     std::atomic<int> pending_{0};
     uint64_t sequence_ = 0;
     std::mutex mutex_;
+    std::atomic<bool> sequenceParallel_{false};
     std::condition_variable available_;
     std::thread worker_;
     std::deque<std::shared_ptr<Job>> queue_;
@@ -350,13 +358,17 @@ int main(int argc, char **argv) {
         std::string model, output = "./minimax-h3-image-output", host = "127.0.0.1", key,
                            demo = "tools/minimax_h3_image/demo.html", precision = "bf16";
         int port = 8009, device = 0;
+        std::vector<int> devices;
+        std::string parallelMode = "auto";
+        auto reduction = fastllm::nomas::RowReduction::Activation;
         double gpuMemoryLimit = 0, hostMemoryLimit = 0;
         for (int i = 1; i < argc; ++i) {
             std::string arg = argv[i];
             if (arg == "--help") {
                 std::cout << "minimax_h3_image_server --model DIR [--host 127.0.0.1 --port 8009 --device 0 "
                              "--output DIR --demo FILE --api-key KEY --vae-precision bf16|fp32]\n"
-                             "  [--gpu-memory-limit GiB --host-memory-limit GiB] (0: automatic)\n";
+                             "  [--gpu-memory-limit GiB --host-memory-limit GiB] (0: automatic)\n"
+                             "  [--devices 0,1 --parallel-mode auto|tp|sp --tp-reduction fp32|activation]\n";
                 return 0;
             }
             if (++i >= argc)
@@ -372,7 +384,16 @@ int main(int argc, char **argv) {
                 port = std::stoi(value);
             else if (arg == "--device")
                 device = std::stoi(value);
-            else if (arg == "--api-key")
+            else if (arg == "--devices")
+                devices = fastllm::nomas::parseParallelDevices(value);
+            else if (arg == "--parallel-mode")
+                parallelMode = value;
+            else if (arg == "--tp-reduction") {
+                if (value != "fp32" && value != "activation")
+                    throw std::invalid_argument("TP reduction must be fp32 or activation");
+                reduction = value == "fp32" ? fastllm::nomas::RowReduction::FP32
+                                            : fastllm::nomas::RowReduction::Activation;
+            } else if (arg == "--api-key")
                 key = value;
             else if (arg == "--demo")
                 demo = value;
@@ -385,12 +406,14 @@ int main(int argc, char **argv) {
             else
                 throw std::invalid_argument("unknown option: " + arg);
         }
+        if (!devices.empty())
+            device = devices.front();
         if (model.empty() || port < 1 || port > 65535 || device < 0)
             throw std::invalid_argument("invalid model, port or device");
         if (precision != "bf16" && precision != "fp32")
             throw std::invalid_argument("VAE precision must be bf16 or fp32");
         Service service(model, output, device, precision == "fp32" ? DType::FP32 : DType::BF16,
-                        gpuMemoryLimit, hostMemoryLimit);
+                        gpuMemoryLimit, hostMemoryLimit, devices, reduction, parallelMode);
         httplib::Server server;
         server.new_task_queue = [] { return new httplib::ThreadPool(8); };
         server.set_payload_max_length(32 * 1024 * 1024);

@@ -155,7 +155,7 @@ class ServiceTest(unittest.TestCase):
         command = build_fastllm_argv(config)
         self.assertEqual(command[command.index("--devices") + 1], "0,1")
 
-    def test_image_backend_discovery_single_gpu_and_command(self):
+    def test_image_backend_discovery_and_gpu_commands(self):
         from fastllm_pytools import service_backends
         binary = self.directory / "minimax_h3_image_server"
         binary.touch()
@@ -174,8 +174,14 @@ class ServiceTest(unittest.TestCase):
         self.assertEqual(command[command.index("--gpu-memory-limit") + 1], "4")
         self.assertEqual(command[command.index("--host-memory-limit") + 1], "2")
         self.assertEqual(validate_config(config), [])
+        dual = config_from_dict(self.profile("minimax_h3_image", visible_gpus="0,1"))
+        with patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "4,5"}):
+            self.assertEqual(validate_config(dual), [])
+            self.assertEqual(build_fastllm_env(dual)["CUDA_VISIBLE_DEVICES"], "4,5")
+        command = build_fastllm_argv(dual)
+        self.assertEqual(command[command.index("--devices") + 1], "0,1")
         fields = []
-        validate_config(config_from_dict(self.profile("minimax_h3_image", visible_gpus="0,1")), fields)
+        validate_config(config_from_dict(self.profile("minimax_h3_image", visible_gpus="0,1,2")), fields)
         self.assertTrue(any("visible_gpus" in item["fields"] for item in fields))
 
     def test_image_memory_budget_validation(self):

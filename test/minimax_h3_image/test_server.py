@@ -112,6 +112,9 @@ class ServerTest(unittest.TestCase):
         self.assertFalse(data['gpu_memory_reserved'])
         self.assertIn('host_weight_cache_gib', data)
         self.assertIn('layer_streaming', data)
+        self.assertEqual(data['tensor_parallel_size'], 1)
+        self.assertEqual(data['sequence_parallel_size'], 1)
+        self.assertEqual(data['dit_parallel_mode'], 'tp')
 
     def test_reject_invalid_memory_budgets_before_startup(self):
         for flag, values in (('--gpu-memory-limit', ('1', '1.0000000001', '-1', 'nan', 'inf', '4GiB', '1048577')),

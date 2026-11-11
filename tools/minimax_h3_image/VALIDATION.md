@@ -63,7 +63,7 @@ The running experiment uses launcher port 18095 and image server port 18096, bot
 
 The launcher regression suite had one transient failure in an existing Pi test when its generated bridge token began with `-` and argparse treated it as an option; rerunning the unchanged suite passed all 15 enabled tests. This unrelated pre-existing issue was not modified.
 
-Current coverage is native single-GPU text generation, single-reference editing and two-reference composition through CLI/API/demo. The interface accepts up to 16 references, but a 16-image quality/memory workload has not been tested. Tensor parallelism, masks/strength/negative prompts and the separate prompt-expander model are not implemented. CUDA wheel packaging includes the new binaries and shared demo assets; a complete release wheel was not built during this experiment.
+At this initial checkpoint, coverage was native single-GPU text generation, single-reference editing and two-reference composition through CLI/API/demo. The interface accepts up to 16 references, but a 16-image quality/memory workload has not been tested. Multi-GPU TP/SP was added in the later dual-GPU validation below. Masks/strength/negative prompts and the separate prompt-expander model remain unimplemented. CUDA wheel packaging includes the new binaries and shared demo assets; a complete release wheel was not built during this experiment.
 
 ## Commit-readiness cleanup
 
@@ -223,3 +223,180 @@ No blocking issue was found for this scope. Suggested boundaries are persistent 
 decoding, followed by reference-encoder/gate acceleration, each with its own build rules,
 tests and documentation. No commit or push was made. Review logs are in
 `image-native-20261111/commit-review-20261112`; the existing studio build was left running.
+
+## Dual GPU and operator optimization (2026-11-12)
+
+The preceding reviewed single-GPU changes were committed on local and remote `master` as
+`8476d9c0` (persistent caches/batched decoding) and `9217c932` (reference encoder/gate).
+The dual-GPU changes below are a subsequent, uncommitted candidate based on `9217c932`.
+No push or live studio deployment was performed for this candidate.
+
+Two physical RTX PRO 5000 72 GiB cards (4 and 5), PCIe NODE without NVLink, CUDA 13/SM120.
+Same 2048x2048 inputs, BF16, six steps, seed 42. Each case ran four requests; discard the
+first and report the median of three warm requests, excluding initialization and PNG
+encoding/writes. Native timing synchronizes stage boundaries. SGLang uses its internal
+`metrics.total_duration_ms`, not outer save-to-file wall time. SGLang revision is
+`23a45fd33921164fa440fd7c28cc63341259c28c`, speed mode, no condition cache, torch.compile,
+CUDA Graph or FSDP. Its fastest tested configuration is SP2/Ulysses2 with TP1.
+
+| Configuration | T2I seconds | Single-reference edit seconds |
+| --- | ---: | ---: |
+| Native single GPU, FP32 row reduction | 7.134661 | 18.352077 |
+| Initial native TP2, FP32 reduction | 4.159608 | 11.081382 |
+| Initial native TP2, BF16 reduction | 3.795151 | 10.459433 |
+| Final native SP2 / text TP2 | 3.288426 | 9.553525 |
+| SGLang TP2 | 3.628137 | 11.020111 |
+| SGLang SP2, initial | 3.260060 | 9.761293 |
+| SGLang SP2, repeat | 3.244474 | 9.768764 |
+
+The final candidate is 2.17x/1.92x faster than the native single-GPU baseline. Against the
+SGLang SP2 repeat it is **1.35% slower for T2I and 2.20% faster for editing**: it has not
+surpassed SGLang for every workload/operator. An earlier one-shot tuning version measured
+3.2996/9.4869 seconds; these results are retained separately, not mixed with the final
+version's best values. Three warm requests do not establish a confidence interval.
+SGLang's edit still produced an oversaturated autumn scene instead of the requested winter
+scene; native produced the requested snow scene. Thus edit timings compare execution time,
+not equivalent output quality. The cause of the SGLang quality failure is not established.
+
+The candidate adds a separate image parallel implementation, per-device GPU/shared host
+budgets, automatic resident SP versus streaming TP, and CLI/API/launcher integration.
+Optimizations include packed QKV, vector QK norm/RoPE, local K/V scatter into
+exchange buffers with peer-only chunk copies, overlapping communication and grouped
+attention, fused modulation/residual RMS, per-request refiner reuse, local final projection
+before gathering 96-wide velocities, SP-specific BF16 cuBLASLt candidate tuning, parallel
+VAE tiles, and GPU tile blending/RGB conversion. BF16 gate uses an approximate exponential;
+FP16/FP32 gate arithmetic and BF16 SiLU-before-multiply rounding remain unchanged.
+
+CUDA-event profiling covers the main DiT and decoder operators; text and reference encoder
+are compared at stage granularity. Rank-0 totals for one warmed request include:
+
+| Region, milliseconds | Native T2I | SGLang T2I | Native edit | SGLang edit |
+| --- | ---: | ---: | ---: | ---: |
+| DiT QKV | 731.542 | 723.839 | 1592.280 | 1630.773 |
+| DiT QK norm / exchange / attention | 671.797 | 583.450 | 2251.585 | 2145.725 |
+| DiT output projection | 240.283 | 241.515 | 520.454 | 563.437 |
+| DiT FF up | 966.527 | 962.129 | 2046.597 | 2157.754 |
+| DiT gate | 37.065 | 37.996 | 98.789 | 93.872 |
+| DiT FF down | 500.423 | 507.258 | 1112.949 | 1138.113 |
+| DiT RMS / modulation / residual | 31.441 | 31.911 | 79.961 | 76.795 |
+| VAE QK norm / RoPE | 2.407 | 2.504 | 2.446 | 2.520 |
+| VAE attention | 3.949 | 5.499 | 4.032 | 5.548 |
+
+Fusion boundaries differ, so related regions are combined. These event intervals include
+dependencies and submission gaps; communication overlaps attention, and intervals cannot
+be added into wall latency. Small 1–3% single-profile differences are not conclusive.
+Native local DiT token counts are 2053/4622; SGLang pads them to 2064/4632. VAE work matches
+at 61/60 tiles across ranks. Full rank-0/1 tables are in `operator-comparison.csv`.
+
+Validation:
+
+- Native CUDA build, nine CTest targets, plus shared H3 fused ops with one visible GPU all
+  passed. Image ops/shared parallel and the real-checkpoint SP comparison passed again
+  after the final stable GEMM candidate-selection change. No-NCCL parallel compilation passed.
+- SP and BF16 TP each passed 156 same-input checkpoint comparisons, maximum relative L2
+  `0.000526287` / `0.00762061`, against the native single-GPU reference. Threshold `0.01`
+  applies to individual blocks/operators with identical inputs, not accumulated final output.
+- Text encoder relative L2 `0.000584518`; VAE batch 1/3/121 maximum `0.00236291`. The new
+  vector VAE QK kernel's standalone maximum was `0.00000529499`, with V unchanged.
+- Full 50-block accumulated velocity relative L2 is reported separately. For the three test
+  cases SP gives `1.91e-7`, `4.57e-7`, `0.070501`; TP gives `0.134882`, `0.0147643`, `0.0401633`.
+  The third case uses repeated checkpoint text rows, mixed tags and 4096 reference rows.
+  These accumulated values are not presented as passing the `0.01` operator criterion.
+- T2I/edit/T2I reuse and cancellation at reference/text/prepare/denoise/decode passed,
+  including host-cache release and byte-identical output after recovery. Final stable-tuning
+  benchmark PNGs are byte-identical to the preceding final-kernel version; native edits
+  were visually checked for the requested snow, subject and composition.
+- HTTP with 3 GiB/GPU and 2 GiB host budgets selected TP2, layer streaming and zero host
+  weight cache. Budget exhaustion and cancellation were followed by a successful 256x256
+  two-reference edit: sampled GPU peak 3127 MiB, process RSS 1557 MiB, final health ready.
+  At 2 GiB/GPU the text temporary tensor correctly exceeded the pool. At 4 GiB/GPU the
+  5120x4096 fixture intended to exhaust memory instead completed (GPU 4151 MiB/RSS 1865 MiB).
+  Both earlier attempts are preserved. Limits reserve workspace but do not hard-cap total
+  context/library usage. The dual-GPU container had a 256 GiB RAM limit: these are explicit
+  budget tests, not repeats of the earlier 4 GiB cgroup/no-swap test.
+- Launcher: 18 passed, one optional Playwright case skipped. Workspace JS, Python/JSON
+  syntax and `git diff --check` passed. Native `ldd` has no Torch, C10 or Python runtime
+  dependency and no missing libraries; inference remains C++/CUDA/cuBLAS/NCCL.
+
+Only two SM120 GPUs were exercised; four/eight-GPU execution, other architectures, release
+wheels and the maximum sixteen-reference workload remain untested. The existing GPU 3
+studio stays on its previously validated build. Reproduction drivers, rejected experiments,
+raw timing/profile/numerical logs, final patch and manifests are in
+`/workspace2/experiments/minimax-h3-native/image-native-20261111/dual-gpu-20261112`.
+
+## Dual-GPU attention pipeline follow-up (2026-11-12)
+
+Native tensor pools now explicitly grant participating peers access. Dual SM120 SP
+uses seven head groups and two persistent attention streams for padded local lengths
+512–8192; events order K/V transfer, attention, and the output projection. Scratch is
+reused within DiT and released before VAE batching. NCCL fallback buffers survive until
+all attention consumers join. Common padded lengths keep both ranks' group selection
+consistent at odd-sequence dispatch boundaries. Other configurations retain serial groups.
+
+Same GPU 4/5, 2048² BF16 six-step seed-42 workloads as above. Final native measurements
+use ABBA process order, four requests/process, discarding only request zero; medians cover
+all six warm samples/version. No initialization or PNG writing is included. SGLang SP2
+was rerun at the same pinned revision/settings, taking three warm internal-duration samples.
+
+| Workload | Previous native (s) | Final native (s) | Reduction | SGLang SP2 (s) |
+|---|---:|---:|---:|---:|
+| T2I | 3.317096 | 3.240128 | 2.32% | 3.245344 |
+| Reference edit | 9.598166 | 9.474461 | 1.29% | 9.758389 |
+
+T2I is effectively tied with SGLang, not a conclusive win. The SGLang edit still has the
+previously recorded winter-prompt quality failure (unchanged output hash); its timing is
+not an equal-quality comparison. All 16 final native PNGs match the previous native output
+byte-for-byte; all 16 interleaved baseline PNGs match as well.
+
+Final Nsight 2026.5.1 sampling confirms two attention compute streams and direct peer
+copies. Rank-0 main-DiT 300-block totals below use interval union for concurrent kernels,
+or the span from the first preparation activity to the next projection for the whole region.
+Baseline/SGLang operator traces are from the preceding `operator-gap-20261112` experiment;
+these profiled intervals are not a decomposition of the unprofiled ABBA requests above.
+
+| Workload / interval (ms) | Previous native | Final native | SGLang |
+|---|---:|---:|---:|
+| t2i / Attention core | 487.255 | 445.142 | 410.295 |
+| t2i / Attention region incl. dependencies | 727.145 | 566.469 | 591.746 |
+| edit / Attention core | 1887.426 | 1825.260 | 1998.596 |
+| edit / Attention region incl. dependencies | 2333.502 | 2098.966 | 2197.953 |
+
+This improves the attention/communication region, not every individual operator. T2I
+attention core and QK/V preparation still have headroom. Summed concurrent kernel time
+cannot be substituted for interval union or added to whole-request latency.
+
+Validation: both direct peer and forced NCCL fallback pass 36 strict-equality pipeline
+cases (eight replays, scratch release/reuse, odd shards and dispatch boundaries). Final
+SP checkpoint comparisons, cancellation/state recovery and nine CTests pass without skips.
+SP/TP same-input maxima remain `0.000526287`/`0.00762061`; accumulated velocity drift is
+unchanged and is reported separately in the preceding section. TP, shared single-GPU H3
+fused ops, and 3 GiB/GPU + 2 GiB host OOM/cancel/two-reference recovery passed before the
+last SP-only lifetime guard; those paths are unchanged. Low-memory sampled peaks were
+3127 MiB GPU and 1583.6 MiB RSS, with final health ready. Native `ldd` has no Torch/C10/Python
+dependency or missing libraries. Only dual SM120 was exercised; the GPU 3 studio is unchanged.
+
+Reproduction drivers, rejected/intermediate results, final traces, timing/numerical logs,
+patches and manifests are in
+`/workspace2/experiments/minimax-h3-native/image-native-20261111/attention-opt-20261112`.
+
+## Pre-commit cleanup review (2026-11-12)
+
+Cleanup clarifies asynchronous gather buffer ownership, rejects invalid parallel modes in
+the state test, adds the launcher GPU-count validation translation, and normalizes formatting.
+Production C++/CUDA tokens are unchanged from the preceding validated attention-pipeline
+snapshot; the existing inference libraries were reused, while the server, generation CLI,
+state test and parallel test were rebuilt successfully.
+
+Fresh checks on GPU 4/5: direct peer and forced NCCL each pass 36 bitwise-equality pipeline
+cases; all nine selected CTests pass without skips; the rebuilt server passes five HTTP
+tests. Launcher media tests report 18 passes and one optional Playwright skip; the launcher
+asset test, local Node workspace checks, Python/JSON parsing and `git diff --check` pass.
+The native server dependency check still finds no Torch/C10/Python or missing libraries.
+The container lacks Node, so JS checks ran locally on the identical source. Launcher tests
+use `PYTHONPATH=/src/tools/ftllm_agent_runtime/src` for the bundled companion package.
+
+Full-checkpoint numerics, cancellation/low-memory recovery and timings are reused from the
+source-equivalent preceding snapshot, not rerun in this cleanup. Their accumulated-drift,
+SGLang edit-quality and dual-SM120-only limitations above still apply. Review logs, the cleanup
+patch, final source hashes and proposed commit groups are recorded separately in
+`/workspace2/experiments/minimax-h3-native/image-native-20261111/dual-commit-review-20261112`.
