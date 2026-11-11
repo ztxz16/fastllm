@@ -99,7 +99,7 @@ namespace fastllm {
     void Qwen4ExpModel::RunHybridMoE(const MoEExecutionPlan &plan, const Data &input, Data &output,
                                      bool reduceOutput, PrefillStageContext *prefill,
                                      MoEPrepared *prepared,
-                                     const std::function<void()> &sharedGraph) {
+                                     const std::function<void()> &sharedGraph, HybridMoeBatch *batchWorkspace) {
         const int deviceLayer = plan.deviceLayer;
         const std::string &mlp = plan.mlpPrefix;
         auto &moeWeights = *plan.weights;
@@ -225,6 +225,16 @@ namespace fastllm {
             if (reduceOutput)
                 ThreadTpAllReduce(output);
         };
+        if (batchWorkspace && runRoutedExperts && IsSharedHostMoeDevice(moeDevice) &&
+            !prefill && !prepared && threadTpRank < 0) {
+            selectExperts();
+            if (batchWorkspace->Run(flattened, expertIndex, expertScore, output,
+                    moeWeights.data(), moeWeights.size(), deviceLayer,
+                    [&] { runSharedExpert(sharedOutput); })) {
+                finishHybrid();
+                return;
+            }
+        }
 #if defined(USE_NUMAS)
         if (!prefill && threadTpRank < 0 && sharedHostMoe &&
             batch * sequence <= FASTLLM_CUDA_MOE_CACHE_MAX_BATCH &&

@@ -43,6 +43,14 @@ Resource limits are planning budgets, not runtime memory caps. `--auto` alone do
 
 The following commands are manual examples for fixed layouts and troubleshooting. Their thread counts and cache sizes are specific examples, not requirements for automatic mode.
 
+## Cross-request decode batching
+
+With `--max_batch 4`, ready requests share attention input/output projections, HyperConnection operations, routing and expert execution during ordinary decode and MTP verification. Each MTP draft step also batches its projections and experts. Accepted output blocks are published consecutively before requests enter the next verifier round. Sampling keeps each request's temperature, proposal distribution and rejection state.
+
+KV, QSA, GDN, PLE histories and accepted-prefix rollback remain request-owned. Different context lengths, acceptance lengths, request completion and batch reordering are supported without fixed concurrency or verifier-row dispatch limits. The shape-sized hybrid expert entry uses the shared GPU cache, dynamic CPU/GPU routing and NUMA batch scheduler beyond the old single-request verifier width.
+
+Single requests retain their existing CUDA Graph path. Multiple requests share projections and MoE while attention state updates run per segment. Expert batches can reuse their own graphs; **complete cross-request verification and draft graphs are not implemented yet**. Prefill, TP, multimodal/KVMem and reusable single-request slots retain their original entry points. Single-GPU NVFP4 and IQ3_S were tested; other architectures and placements need separate validation, and throughput depends on acceptance and routing overlap.
+
 ## Manual configuration reference
 
 Run the backbone on one GPU and the experts on the CPU NUMA backend:

@@ -23,6 +23,7 @@
 namespace fastllm {
     class CudaChunkedPrefillPipeline;
     class HybridMoePeerRuntime;
+    class HybridMoeBatch;
     struct HybridMoeRemoteWorkspace;
     class Qwen4ExpModel : public Qwen3NextModel {
     public:
@@ -97,7 +98,21 @@ namespace fastllm {
         bool TryRestoreHistoryCache(std::vector<int> &inputTokens,
                                     int &cacheLen) override;
         void OnResponseContextCreated(ResponseContext *context) override;
+        std::vector<int> ForwardRequests(
+                const Data &inputIds, const std::vector<Data*> &attentionMasks,
+                const std::vector<Data*> &positionIds, const std::vector<int> &seqLens,
+                const std::vector<std::vector<std::pair<Data, Data>>*> &caches,
+                const std::vector<GenerationConfig> &generationConfigs,
+                const LastTokensManager &lastTokens,
+                std::vector<std::vector<float>*> *logits);
+        std::vector<int> ForwardBatch(int batch, const Data &inputIds,
+                const std::vector<Data*> &attentionMasks, const std::vector<Data*> &positionIds,
+                const std::vector<int> &seqLens, std::vector<std::pair<Data*, Data*>> &pastKeyValues,
+                const std::vector<GenerationConfig> &generationConfigs,
+                const LastTokensManager &lastTokens, std::vector<std::vector<float>*> *logits) override;
         void OnResponseContextRemoved(ResponseContext *context) override;
+        bool PopPendingResponseToken(ResponseContext *context, int previousToken,
+                                     int &token) override;
         bool UseGenericHistoryCache() const override { return false; }
 
     private:
@@ -158,7 +173,11 @@ namespace fastllm {
                 std::vector<std::vector<float> *> *logits,
                 const Data *precomputedEmbedding = nullptr);
 
+        struct RequestBatchState;
         struct RequestState {
+            std::shared_ptr<RequestBatchState> batchState;
+            // Non-owning scheduler cache vector; its lifetime spans Forward.
+            std::vector<std::pair<Data, Data>> *cacheOwner = nullptr;
             bool reusableGraphRequest = false;
             bool decodeGraphsFrozen = false;
             // Keep the model's preallocated pools alive while this request uses them.
@@ -531,6 +550,15 @@ namespace fastllm {
                           bool fixedCausalWidth = false);
         void MaterializeQsaHostHistory(int layer, int length,
                                        RequestState &state);
+        struct FullAttentionProjections { Data *queryGate, *key, *value; };
+        struct LinearAttentionProjections { Data *qkv, *z, *beta, *alpha; };
+        void ProjectFullAttention(const std::string &attention, Data &input,
+                                  FullAttentionProjections &projections);
+        void ProjectLinearAttention(int layer, Data &input,
+                                    LinearAttentionProjections &projections);
+        // Prepared projections allow unrelated request segments to share the
+        // weight reads. Optional output captures defer only the final Linear;
+        // cache updates and recurrent math still belong to each request.
         void RunFullAttention(int layer, const Data &input,
                               const Data &attentionMask,
                               const Data &positionIds,
@@ -538,7 +566,9 @@ namespace fastllm {
                               Data &pastKey, Data &pastValue,
                               RequestState &state, Data &output,
                               Data *qsaRawKeyCapture = nullptr,
-                              int decodeReserveTokens = 0);
+                              int decodeReserveTokens = 0,
+                              const FullAttentionProjections *projections = nullptr,
+                              Data *outputProjectionInput = nullptr);
 #ifdef USE_CUDA
         // Shared by target decode/verification and the MTP draft. Storage
         // preparation never commits a token; graph replay owns all GPU work.
@@ -560,14 +590,18 @@ namespace fastllm {
                               Data &pastKey, Data &pastValue,
                               RequestState &state, Data &output,
                               Data *qsaRawKeyCapture = nullptr,
-                              int decodeReserveTokens = 0);
+                              int decodeReserveTokens = 0,
+                              const FullAttentionProjections *projections = nullptr,
+                              Data *outputProjectionInput = nullptr);
         void RunLinearAttention(int layer, const Data &input,
                                 Data &pastConv, Data &pastRecurrent,
                                 Data &output,
                                 Data *convInputCapture = nullptr,
                                 Data *alphaCapture = nullptr,
                                 Data *betaCapture = nullptr,
-                                Data *recurrentStateOutput = nullptr);
+                                Data *recurrentStateOutput = nullptr,
+                                const LinearAttentionProjections *projections = nullptr,
+                                Data *outputProjectionInput = nullptr);
         struct MoEExecutionPlan {
             ExecutionMode backend = ExecutionMode::Cpu;
             int deviceLayer = 0;
@@ -608,11 +642,11 @@ namespace fastllm {
         void RunMoE(int layer, const Data &input, Data &output,
                    bool reduceOutput = true, PrefillStageContext *prefill = nullptr,
                    MoEPrepared *prepared = nullptr,
-                   const std::function<void()> &sharedGraph = {});
+                   const std::function<void()> &sharedGraph = {}, HybridMoeBatch *batchWorkspace = nullptr);
         void RunMoE(const MoEExecutionPlan &plan, const Data &input, Data &output,
                     bool reduceOutput = true, PrefillStageContext *prefill = nullptr,
                     MoEPrepared *prepared = nullptr,
-                    const std::function<void()> &sharedGraph = {});
+                    const std::function<void()> &sharedGraph = {}, HybridMoeBatch *batchWorkspace = nullptr);
 
         bool HasMtpWeights() const;
         bool MtpSupportsGenerationConfig(
@@ -668,6 +702,13 @@ namespace fastllm {
             const TargetRuntimeCheckpoint &checkpoint,
             TargetVerificationCapture &capture);
         struct ForwardState;
+        struct BatchedRequest;
+        std::vector<std::vector<int>> ForwardTargetBatch(const std::vector<ForwardState*> &frames);
+        std::vector<int> RunMtpDraftBatch(const std::vector<BatchedRequest*> &requests,
+                                        const std::vector<Data*> &hidden,
+                                        std::vector<Data> &nextHidden, std::vector<float> &probabilities);
+        void ForwardMtpBatch(const std::vector<BatchedRequest*> &requests);
+        void GenerateMtpProposalBatch(const std::vector<BatchedRequest*> &requests);
         struct ForwardWorkspace;
         ExecutionMode executionMode = ExecutionMode::Cpu;
         void InitExecutionMode();
@@ -727,7 +768,7 @@ namespace fastllm {
             MoEPrepared *prepared, const std::function<void()> &sharedGraph);
         void RunHybridMoE(const MoEExecutionPlan &plan,
             const Data &input, Data &output, bool reduceOutput, PrefillStageContext *prefill,
-            MoEPrepared *prepared, const std::function<void()> &sharedGraph);
+            MoEPrepared *prepared, const std::function<void()> &sharedGraph, HybridMoeBatch *batchWorkspace);
 
         std::vector<int> ForwardTarget(
             int batch,

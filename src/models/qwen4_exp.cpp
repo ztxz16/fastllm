@@ -1576,9 +1576,9 @@ namespace fastllm {
     }
 
     Qwen4ExpModel::Qwen4ExpModel() : Qwen3NextModel() {
-        this->canDoBatchForward = false;
-        // The legacy scheduler rotates request-local KV, recurrent and MTP
-        // state through the single-request Forward path.
+        this->canDoBatchForward = true;
+        // Decode batches share projections and experts while each segment
+        // retains its own KV, recurrent state and MTP acceptance history.
         this->canDoConcurrentForward = true;
         this->model_type = "qwen4_exp";
         this->model_struct = "qwen4_exp";
@@ -5286,6 +5286,82 @@ namespace fastllm {
         ToDataType(maskFloat, qsaMask, input.dataType);
     }
 
+    void Qwen4ExpModel::ProjectFullAttention(const std::string &attention, Data &input,
+                                             FullAttentionProjections &projections) {
+        auto &qGate = *projections.queryGate;
+        auto &key = *projections.key;
+        auto &value = *projections.value;
+        Data &qWeight = this->weight[attention + "q_proj.weight"];
+        Data &kWeight = this->weight[attention + "k_proj.weight"];
+        Data &vWeight = this->weight[attention + "v_proj.weight"];
+        bool fusedQkvProjections = false;
+#ifdef USE_CUDA
+        // Small decode batches are launch-bound, especially in the MTP
+        // draft/verification path. Join the three independent projection
+        // grids into one launch without concatenating or repacking weights.
+        // Each CTA still owns one output row and therefore keeps the native
+        // compensated reduction and FP16 rounding order. Unsupported shapes,
+        // types and devices retain the ordinary Linear path below.
+        if (input.dims[1] == 1 || qwen4MtpDecodeEquivalentTarget) {
+            const Data *weights[] = {&qWeight, &kWeight, &vWeight};
+            Data *outputs[] = {&qGate, &key, &value};
+            fusedQkvProjections = Qwen4TryExactCudaMultiLinear(
+                input, weights, outputs, 3);
+        }
+#endif
+        if (!fusedQkvProjections) {
+            Linear(input, qWeight, Data(), qGate);
+            Linear(input, kWeight, Data(), key);
+            Linear(input, vWeight, Data(), value);
+        }
+    }
+
+    void Qwen4ExpModel::ProjectLinearAttention(int layer, Data &input,
+                                               LinearAttentionProjections &projections) {
+        const std::string linear = languagePrefix + "layers." + std::to_string(layer) + ".linear_attn.";
+        auto &qkv = *projections.qkv;
+        auto &z = *projections.z;
+        auto &beta = *projections.beta;
+        auto &alpha = *projections.alpha;
+        Data &qkvWeight = this->weight[linear + "in_proj_qkv.weight"];
+        Data &zWeight = this->weight[linear + "in_proj_z.weight"];
+        Data &betaWeight = this->weight[linear + "in_proj_b.weight"];
+        Data &alphaWeight = this->weight[linear + "in_proj_a.weight"];
+        bool fusedInputProjections = false;
+#ifdef USE_CUDA
+        // All four projections consume the same small decode batch. Joining
+        // their output-row grids removes three launches while each CTA keeps
+        // the native GEMV's products, compensated reduction tree and FP16
+        // rounding. Unsupported types/devices retain the ordinary operations.
+        if (input.dims[1] == 1 || qwen4MtpDecodeEquivalentTarget) {
+            const Data *weights[] = {
+                &qkvWeight, &zWeight, &betaWeight, &alphaWeight};
+            Data *outputs[] = {&qkv, &z, &beta, &alpha};
+            fusedInputProjections = Qwen4TryExactCudaMultiLinear(
+                input, weights, outputs, 4);
+        }
+#endif
+        bool fusedGateProjections = false;
+        if (!fusedInputProjections) {
+            Linear(input, qkvWeight, Data(), qkv);
+            Linear(input, zWeight, Data(), z);
+#ifdef USE_CUDA
+            // Keep the narrower two-grid fusion as a fallback when the larger
+            // projection group is unavailable for this device or data type.
+            if (qwen4MtpDecodeEquivalentTarget) {
+                const Data *weights[] = {&betaWeight, &alphaWeight};
+                Data *outputs[] = {&beta, &alpha};
+                fusedGateProjections = Qwen4TryExactCudaMultiLinear(
+                    input, weights, outputs, 2);
+            }
+#endif
+            if (!fusedGateProjections) {
+                Linear(input, betaWeight, Data(), beta);
+                Linear(input, alphaWeight, Data(), alpha);
+            }
+        }
+    }
+
     void Qwen4ExpModel::RunFullAttention(int layer,
                                           const Data &input,
                                           const Data &attentionMask,
@@ -5296,14 +5372,16 @@ namespace fastllm {
                                           RequestState &state,
                                           Data &output,
                                           Data *qsaRawKeyCapture,
-                                          int decodeReserveTokens) {
+                                          int decodeReserveTokens,
+                                          const FullAttentionProjections *projections,
+                                          Data *outputProjectionInput) {
         RunFullAttentionWithPrefix(
             layer,
             languagePrefix + "layers." + std::to_string(layer) +
                 ".self_attn.",
             input, attentionMask, positionIds,
             qsaDeviceCompatibleMask, pastKey, pastValue, state, output,
-            qsaRawKeyCapture, decodeReserveTokens);
+            qsaRawKeyCapture, decodeReserveTokens, projections, outputProjectionInput);
     }
 
     void Qwen4ExpModel::RunFullAttentionWithPrefix(
@@ -5318,7 +5396,9 @@ namespace fastllm {
                                           RequestState &state,
                                           Data &output,
                                           Data *qsaRawKeyCapture,
-                                          int decodeReserveTokens) {
+                                          int decodeReserveTokens,
+                                          const FullAttentionProjections *projections,
+                                          Data *outputProjectionInput) {
         const int batch = input.dims[0];
         const int sequence = input.dims[1];
         const int previousLength = pastKey.dims.empty() ? 0 : pastKey.dims[1];
@@ -5334,28 +5414,13 @@ namespace fastllm {
 
         Data qGate, query, key, value, gate;
         Qwen4PrefillTemporaries({&qGate, &query, &key, &value, &gate});
-        Data &qWeight = this->weight[attention + "q_proj.weight"];
-        Data &kWeight = this->weight[attention + "k_proj.weight"];
-        Data &vWeight = this->weight[attention + "v_proj.weight"];
-        bool fusedQkvProjections = false;
-#ifdef USE_CUDA
-        // Small decode batches are launch-bound, especially in the MTP
-        // draft/verification path. Join the three independent projection
-        // grids into one launch without concatenating or repacking weights.
-        // Each CTA still owns one output row and therefore keeps the native
-        // compensated reduction and FP16 rounding order. Unsupported shapes,
-        // types and devices retain the ordinary Linear path below.
-        if (sequence == 1 || qwen4MtpDecodeEquivalentTarget) {
-            const Data *weights[] = {&qWeight, &kWeight, &vWeight};
-            Data *outputs[] = {&qGate, &key, &value};
-            fusedQkvProjections = Qwen4TryExactCudaMultiLinear(
-                typedInput, weights, outputs, 3);
-        }
-#endif
-        if (!fusedQkvProjections) {
-            Linear(typedInput, qWeight, Data(), qGate);
-            Linear(typedInput, kWeight, Data(), key);
-            Linear(typedInput, vWeight, Data(), value);
+        if (projections) {
+            qGate.CopyFrom(*projections->queryGate);
+            key.CopyFrom(*projections->key);
+            value.CopyFrom(*projections->value);
+        } else {
+            FullAttentionProjections prepared{&qGate, &key, &value};
+            ProjectFullAttention(attention, typedInput, prepared);
         }
         // Reserve using the final head-major shape before preparing Q/K/V.
         // This lets the fused path write K/V directly into the existing cache.
@@ -5533,6 +5598,10 @@ namespace fastllm {
             PermuteSelf(context, {1, 0, 2});
             SigmoidMulTo(context, gate);
         }
+        if (outputProjectionInput) {
+            outputProjectionInput->CopyFrom(fusedOutput ? gatedContext : context);
+            return;
+        }
         Linear(fusedOutput ? gatedContext : context,
                this->weight[attention + "o_proj.weight"], Data(), output);
         ThreadTpAllReduce(output);
@@ -5546,7 +5615,9 @@ namespace fastllm {
                                             Data *convInputCapture,
                                             Data *alphaCapture,
                                             Data *betaCapture,
-                                            Data *recurrentStateOutput) {
+                                            Data *recurrentStateOutput,
+                                            const LinearAttentionProjections *projections,
+                                            Data *outputProjectionInput) {
         const std::string linear = languagePrefix + "layers." +
             std::to_string(layer) + ".linear_attn.";
         const int batch = input.dims[0];
@@ -5580,42 +5651,12 @@ namespace fastllm {
         // does not free and change the dtype of a persistent graph output.
         Data &beta = betaCapture == nullptr ? localBeta : *betaCapture;
         Data &alpha = alphaCapture == nullptr ? localAlpha : *alphaCapture;
-        Data &qkvWeight = this->weight[linear + "in_proj_qkv.weight"];
-        Data &zWeight = this->weight[linear + "in_proj_z.weight"];
-        Data &betaWeight = this->weight[linear + "in_proj_b.weight"];
-        Data &alphaWeight = this->weight[linear + "in_proj_a.weight"];
-        bool fusedInputProjections = false;
-#ifdef USE_CUDA
-        // All four projections consume the same small decode batch. Joining
-        // their output-row grids removes three launches while each CTA keeps
-        // the native GEMV's products, compensated reduction tree and FP16
-        // rounding. Unsupported types/devices retain the ordinary operations.
-        if (sequence == 1 || qwen4MtpDecodeEquivalentTarget) {
-            const Data *weights[] = {
-                &qkvWeight, &zWeight, &betaWeight, &alphaWeight};
-            Data *outputs[] = {&qkv, &z, &beta, &alpha};
-            fusedInputProjections = Qwen4TryExactCudaMultiLinear(
-                typedInput, weights, outputs, 4);
-        }
-#endif
-        bool fusedGateProjections = false;
-        if (!fusedInputProjections) {
-            Linear(typedInput, qkvWeight, Data(), qkv);
-            Linear(typedInput, zWeight, Data(), z);
-#ifdef USE_CUDA
-            // Keep the narrower two-grid fusion as a fallback when the larger
-            // projection group is unavailable for this device or data type.
-            if (qwen4MtpDecodeEquivalentTarget) {
-                const Data *weights[] = {&betaWeight, &alphaWeight};
-                Data *outputs[] = {&beta, &alpha};
-                fusedGateProjections = Qwen4TryExactCudaMultiLinear(
-                    typedInput, weights, outputs, 2);
-            }
-#endif
-            if (!fusedGateProjections) {
-                Linear(typedInput, betaWeight, Data(), beta);
-                Linear(typedInput, alphaWeight, Data(), alpha);
-            }
+        if (projections) {
+            qkv.CopyFrom(*projections->qkv); z.CopyFrom(*projections->z);
+            beta.CopyFrom(*projections->beta); alpha.CopyFrom(*projections->alpha);
+        } else {
+            LinearAttentionProjections prepared{&qkv, &z, &beta, &alpha};
+            ProjectLinearAttention(layer, typedInput, prepared);
         }
         const bool fusedDecode = sequence == 1;
         // Speculative target verification evaluates only a handful of new
@@ -5737,7 +5778,11 @@ namespace fastllm {
                         this->weight[linear + "A_log"], this->weight[linear + "dt_bias"],
                         this->weight[linear + "norm.weight"], z, pastRecurrent, gated,
                         this->num_k_heads, this->num_v_heads, 1e-6f,
-                        this->rms_norm_eps, GdnOutputUsesTiledLayout(projection))) {
+                        this->rms_norm_eps, !outputProjectionInput && GdnOutputUsesTiledLayout(projection))) {
+                    if (outputProjectionInput) {
+                        outputProjectionInput->CopyFrom(gated);
+                        return;
+                    }
                     Linear(gated, projection, Data(), output);
                     ThreadTpAllReduce(output);
                     return;
@@ -5804,6 +5849,10 @@ namespace fastllm {
             }
             outputCore->Reshape({batch, sequence,
                                  this->num_v_heads * this->head_v_dim});
+            if (outputProjectionInput) {
+                outputProjectionInput->CopyFrom(*outputCore);
+                return;
+            }
             RunGdnOutputProjection(*outputCore,
                    this->weight[linear + "out_proj.weight"], output);
             ThreadTpAllReduce(output);
@@ -6002,6 +6051,10 @@ namespace fastllm {
         // gate; Qwen3-Next's default SiLU here would noticeably change logits.
         SigmoidMulTo(allCore, z);
         allCore.Reshape({batch, sequence, valueDimension});
+        if (outputProjectionInput) {
+            outputProjectionInput->CopyFrom(allCore);
+            return;
+        }
         RunGdnOutputProjection(allCore, this->weight[linear + "out_proj.weight"], output);
         ThreadTpAllReduce(output);
     }
@@ -9568,6 +9621,10 @@ namespace fastllm {
                         "Qwen4-Exp currently runs one request per Forward call.");
         AssertInFastLLM((int)pastKeyValues.size() >= this->block_cnt,
                         "Qwen4-Exp received too few cache slots.");
+        {
+            std::lock_guard<std::mutex> guard(stateMutex);
+            requestStates[&pastKeyValues.front().first].cacheOwner = &pastKeyValues;
+        }
         std::vector<int> result;
         WithDecodeServingCache(pastKeyValues, [&](auto &cache) {
             result = ForwardBatchInternal(batch, inputIds, attentionMask, positionIds,
@@ -10269,6 +10326,7 @@ namespace fastllm {
         bool hasCarriedAttentionProjection = false;
         bool hasFinalHyperNorm = false;
         bool usedDecodeCudaGraph = false;
+        bool logitsReady = false;
         Data logits;
         int qsaPreviousLength = 0;
         std::unique_ptr<Data> fallbackCausalMask;
@@ -11148,7 +11206,7 @@ namespace fastllm {
             MaybeRecordPrefixSnapshot(pastKeyValues, *requestState);
         }
 
-        if (!usedDecodeCudaGraph) {
+        if (!usedDecodeCudaGraph && !f.logitsReady) {
             Data finalHidden;
             AssertInFastLLM(hasFinalHyperNorm,
                             "Qwen4-Exp final hyper norm was not produced.");
@@ -11361,6 +11419,8 @@ namespace fastllm {
         return {token};
     }
 
+#include "qwen4_exp_batch.inc"
+
     std::vector<int> Qwen4ExpModel::ForwardTarget(
             int batch,
             const Data &inputIds,
@@ -11418,6 +11478,11 @@ namespace fastllm {
             restored = RestorePrefixSnapshot(context, snapshot);
         }
         if (restored) {
+            {
+                std::lock_guard<std::mutex> guard(stateMutex);
+                requestStates[&context->pastKeyValues.front().first].cacheOwner =
+                    &context->pastKeyValues;
+            }
             // The legacy scheduler classifies preTokens == 0 as a new
             // prefill.  A restored request already owns cache storage, so
             // classifying it as a new prefill makes it count itself against a
@@ -11477,6 +11542,7 @@ namespace fastllm {
             if (!context->pastKeyValues.empty()) {
                 auto &state = this->requestStates[&context->pastKeyValues[0].first];
                 state = RequestState();
+                state.cacheOwner = &context->pastKeyValues;
                 state.hasMultimodalInput = !context->multimodalInput.empty();
 #ifdef USE_CUDA
                 // One text-only serving slot owns fixed KV across all PP stages.

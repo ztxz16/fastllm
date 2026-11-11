@@ -26,17 +26,17 @@ namespace fastllm {
 
     void Qwen4ExpModel::RunMoE(int layer, const Data &input, Data &output, bool reduceOutput,
                                PrefillStageContext *prefill, MoEPrepared *prepared,
-                               const std::function<void()> &sharedGraph) {
-        RunMoE(targetMoePlans[layer], input, output, reduceOutput, prefill, prepared, sharedGraph);
+                               const std::function<void()> &sharedGraph, HybridMoeBatch *batchWorkspace) {
+        RunMoE(targetMoePlans[layer], input, output, reduceOutput, prefill, prepared, sharedGraph, batchWorkspace);
     }
 
     void Qwen4ExpModel::RunMoE(const MoEExecutionPlan &plan, const Data &input, Data &output,
                                bool reduceOutput, PrefillStageContext *prefill,
-                               MoEPrepared *prepared, const std::function<void()> &sharedGraph) {
+                               MoEPrepared *prepared, const std::function<void()> &sharedGraph, HybridMoeBatch *batchWorkspace) {
         if (plan.backend == ExecutionMode::Gpu) {
             RunGpuMoE(plan, input, output, reduceOutput, prefill, prepared, sharedGraph);
         } else {
-            RunHybridMoE(plan, input, output, reduceOutput, prefill, prepared, sharedGraph);
+            RunHybridMoE(plan, input, output, reduceOutput, prefill, prepared, sharedGraph, batchWorkspace);
         }
     }
     void Qwen4ExpModel::SelectMoEExperts(Data &routerLogits, Data &expertIndex, Data &expertScore) {
