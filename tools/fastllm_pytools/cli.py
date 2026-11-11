@@ -1,4 +1,5 @@
 import argparse
+import json
 from .util import make_normal_parser
 import readline
 import os
@@ -108,6 +109,11 @@ def main():
     if hasattr(args, 'tp_backend'):
         from .util import load_model_args
         load_model_args(args)
+        from .parallel_config import prepare_parallel_entry
+        parallel_plan = prepare_parallel_entry(args, allow_preview=True)
+        if parallel_plan is not None:
+            print(json.dumps(parallel_plan, ensure_ascii=False, indent=2))
+            return 0
         if args.tp_backend == 'process':
             if args.command in ('chat', 'run'):
                 from .process_tp import run_chat

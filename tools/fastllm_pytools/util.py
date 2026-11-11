@@ -499,6 +499,10 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--max_batch', type = int, default = -1,  help = '每次最多同时推理的询问数量')
     parser.add_argument('--chunked_prefill_size', type = int, default = -1, help = '分块 prefill 的切片大小（首块与后续块相同），如 8192')
     parser.add_argument('--device', type = str, help = '使用的设备')
+    parser.add_argument('--dp', type=_positive_int, default=1,
+                        help='完整模型副本数；大于1时要求进程后端，目前仅支持分配预览')
+    parser.add_argument('--parallel-plan', action='store_true',
+                        help='仅输出DP/TP的CUDA设备分配JSON，不加载模型或启动worker')
     parser.add_argument('--tp', type = str, default = "", help = '张量并行设备；裸数字X表示使用前X张卡，0表示0号卡，也可写 0,1 或 auto')
     parser.add_argument('--tp_backend', '--tp-backend', choices = ['thread', 'process'], default = 'thread',
                         help = 'TP后端；默认thread。process支持Linux CUDA上的稠密Qwen3 FP16推理')
@@ -613,6 +617,10 @@ def load_model_args(args):
                     raise ValueError('model options must be a JSON object without private keys')
                 if set(args_config) & {'command', 'version'}:
                     raise ValueError('model options cannot override the CLI command or version flag')
+                if 'parallel-plan' in args_config:
+                    if 'parallel_plan' in args_config:
+                        raise ValueError('model options cannot contain both parallel-plan and parallel_plan')
+                    args_config['parallel_plan'] = args_config.pop('parallel-plan')
                 for it in args_config.keys():
                     if (it == "FASTLLM_ACTIVATE_NUMA" or it == "FASTLLM_NUMA_THREADS"):
                         os.environ[it] = str(args_config[it])
@@ -624,6 +632,9 @@ def make_normal_llm_model(args, startup_progress = None):
     if startup_progress is not None:
         startup_progress.progress("initializing", 0, 1)
     load_model_args(args)
+
+    from .parallel_config import prepare_parallel_entry
+    prepare_parallel_entry(args)
 
     tp_backend = getattr(args, "tp_backend", "thread")
     if tp_backend not in ("thread", "process"):
