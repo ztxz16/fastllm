@@ -119,7 +119,7 @@ run "$CMAKE" -S "$SOURCE_DIR" -B "$BUILD_DIR/cuda" "${COMMON[@]}" \
     -DCMAKE_CUDA_HOST_COMPILER="$CXX" -DCMAKE_CUDA_COMPILER="$CUDA_COMPILER" \
     -DFASTLLM_CUDA_COMPRESSION="$COMPRESSION" \
     "-DCMAKE_CUDA_FLAGS=--threads=$NVCC_THREADS --split-compile=$NVCC_SPLIT_COMPILE"
-run "$CMAKE" --build "$BUILD_DIR/cuda" --target fastllm_tools minimax_h3_server minimax_h3_generate --parallel "$CUDA_JOBS"
+run "$CMAKE" --build "$BUILD_DIR/cuda" --target fastllm_tools minimax_h3_server minimax_h3_generate minimax_h3_image_server minimax_h3_image_generate --parallel "$CUDA_JOBS"
 printf 'CUDA build: %s seconds\n' "$((SECONDS - CUDA_START_SECONDS))"
 run "$PYTHON" "$SOURCE_DIR/tools/wheel/package_wheel.py" \
     --source-dir "$SOURCE_DIR" --build-dir "$BUILD_DIR" --output-dir "$OUTPUT_DIR" --max-glibc "$MAX_GLIBC" \

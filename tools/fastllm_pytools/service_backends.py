@@ -188,7 +188,93 @@ class H3Backend:
                              "num_inference_steps": 6 if state["modelName"] == "pika-h3-flex" else 50}}
 
 
-BACKENDS = {backend.id: backend for backend in (ChatBackend(), H3Backend())}
+class H3ImageBackend:
+    id = "minimax_h3_image"
+    kind = "image"
+    label = "图像 · MiniMax H3 Image"
+    capabilities = ("image.generate", "image.edit")
+    health_path = "/health"
+
+    @staticmethod
+    def media_path(method, path):
+        if ((method in {"GET", "POST"} and path == "images/jobs") or
+                (method == "POST" and path in {"images/generations", "images/edits"}) or
+                (method == "GET" and re.fullmatch(r"images/jobs/image_[0-9]+_[0-9]+(?:/content)?", path)) or
+                (method == "POST" and re.fullmatch(r"images/jobs/image_[0-9]+_[0-9]+/cancel", path))):
+            return "/v1/" + path
+        return None
+
+    def model_name(self, config):
+        return "minimax-h3-image"
+
+    @staticmethod
+    def executable(config):
+        explicit = config.server_binary.strip() or os.environ.get("FTLLM_H3_IMAGE_SERVER", "")
+        if explicit:
+            return os.path.expanduser(explicit)
+        name = "minimax_h3_image_server"
+        bundled = Path(__file__).resolve().parent / name
+        if bundled.is_file():
+            return str(bundled)
+        found = shutil.which(name)
+        if found:
+            return found
+        repository = Path(__file__).resolve().parents[2]
+        for build in ("build", "build-cuda"):
+            candidate = repository / build / "src/models/minimax_h3" / name
+            if candidate.is_file():
+                return str(candidate)
+        return name
+
+    def argv(self, config):
+        output = config.output_dir.strip() or str(Path.home() / ".local/share/fastllm/images" / config.port)
+        command = [self.executable(config), "--model", os.path.expanduser(config.model.strip()),
+                   "--host", config.host.strip(), "--port", config.port.strip(), "--device", "0",
+                   "--output", os.path.expanduser(output)]
+        package = Path(__file__).resolve().parent
+        for demo in (package / "h3_image_assets/demo.html", package.parent / "minimax_h3_image/demo.html"):
+            if demo.is_file():
+                command.extend(("--demo", str(demo)))
+                break
+        if config.api_key.strip():
+            command.extend(("--api-key", config.api_key.strip()))
+        return command
+
+    def validate(self, config):
+        errors = []
+        def add(message, *fields):
+            errors.append({"message": message, "fields": list(fields)})
+        if config.command != "server":
+            add("图像模型需要使用 API Server 启动方式。", "command")
+        if not config.model.strip() or not Path(config.model).expanduser().is_dir():
+            add("请选择已存在的 MiniMax H3 Image 模型目录。", "model")
+        if not shutil.which(self.executable(config)):
+            add("找不到 minimax_h3_image_server；请编译图像服务或设置 FTLLM_H3_IMAGE_SERVER。", "server_binary")
+        if len(config.visible_gpus.split(",")) > 1:
+            add("MiniMax H3 Image 当前仅支持单卡，请只选择一张 GPU。", "visible_gpus")
+        try:
+            if not 1 <= int(config.port) <= 65535:
+                raise ValueError()
+        except ValueError:
+            add("端口必须在 1-65535 之间。", "port")
+        if not config.host.strip():
+            add("监听地址不能为空。", "host")
+        return errors
+
+    def api_contract(self, state):
+        base = state["endpoint"].rstrip("/") + "/v1/images/jobs"
+        return {"kind": self.kind, "capabilities": list(self.capabilities), "endpoint": base,
+                "create": "POST " + base, "status": "GET " + base + "/{id}",
+                "content": "GET " + base + "/{id}/content", "cancel": "POST " + base + "/{id}/cancel",
+                "request": {"model": state["modelName"], "prompt": "A red panda beside a mountain stream, autumn forest",
+                            "size": "2048x2048", "num_inference_steps": 6},
+                "edit": "POST " + state["endpoint"].rstrip("/") + "/v1/images/edits",
+                "references": {"format": "multipart/form-data", "field": "image[]", "max_count": 16,
+                               "types": ["image/png", "image/jpeg", "image/webp"], "prompt_labels": "<Picture 1>, <Picture 2>, ..."},
+                "defaults": {"size": "2048x2048", "num_inference_steps": 6}}
+
+
+BACKENDS = {backend.id: backend for backend in (ChatBackend(), H3Backend(), H3ImageBackend())}
 
 
 def get_backend(config):

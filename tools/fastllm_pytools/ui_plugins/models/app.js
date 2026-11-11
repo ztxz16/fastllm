@@ -144,9 +144,14 @@ function renderProfilePresentation() {
     : t("Edit all settings, or click Automatic configuration to choose a mode.");
   elements.configurationModeDescription.textContent = configurationModeDescription(mode);
   const video = config.backend === "minimax_h3";
-  elements.launchForm.classList.toggle("video-profile", video);
-  document.getElementById("video-backend-fields").classList.toggle("hidden", !video);
+  const image = config.backend === "minimax_h3_image";
+  elements.launchForm.classList.toggle("video-profile", video || image);
+  document.getElementById("video-backend-fields").classList.toggle("hidden", !video && !image);
+  for (const field of elements.launchForm.querySelectorAll("[data-video-only]")) field.classList.toggle("hidden", !video);
+  elements.launchForm.querySelector('[data-field="server_binary"]').placeholder = image ? "/path/to/minimax_h3_image_server" : "/path/to/minimax_h3_server";
+  elements.launchForm.querySelector('[data-field="output_dir"]').placeholder = image ? "~/.local/share/fastllm/images/port" : "~/.local/share/fastllm/videos/port";
   if (video) elements.profileEditorDescription.textContent = t("Start a video API alongside your chat models. Pika is detected automatically.");
+  if (image) elements.profileEditorDescription.textContent = t("MiniMax H3 Image · single GPU, text-to-image and reference editing. Select a GPU with enough free memory.");
 }
 
 function configurationModeDescription(mode) {
@@ -860,6 +865,7 @@ function profileActionButton(action, index, label, variant = "") {
 function profileDeviceLabel(profile) {
   if (profile.visible_gpus) return `GPU ${profile.visible_gpus}`;
   if (profile.backend === "minimax_h3") return t("Video generation");
+  if (profile.backend === "minimax_h3_image") return t("Image generation");
   if (profile.config_mode === "auto") return t("Automatic configuration");
   const devices = {
     auto: t("Auto device"),

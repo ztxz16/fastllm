@@ -1,4 +1,5 @@
 import {state, request, t, showToast, friendlyError} from "../../assets/app.js";
+import {renderImageStudio, selectImageService} from "./image.js";
 
 let mode = null, initialized = false, polling = false, submitting = false;
 let selectedService = "", jobSignature = "", refreshAvailability;
@@ -32,12 +33,19 @@ export function openVideoService(sessionId) {
   pollJobs();
 }
 
+export function openImageService(sessionId) {
+  mode = "image";
+  selectImageService(sessionId);
+  refreshAvailability();
+}
+
 export function renderStudioMedia(onChange) {
   refreshAvailability = onChange;
   if (!initialized) {
     initialized = true;
     $("studio-chat-tab").onclick = () => { mode = "chat"; refreshAvailability(); };
     $("studio-video-tab").onclick = () => { mode = "video"; refreshAvailability(); pollJobs(); };
+    $("studio-image-tab").onclick = () => { mode = "image"; refreshAvailability(); };
     $("studio-chat-select").onchange = event => { state.studioChatId = event.target.value; refreshAvailability(); };
     $("video-service").onchange = () => { selectedService = ""; renderStudioMedia(refreshAvailability); };
     $("video-form").onsubmit = generate;
@@ -49,12 +57,15 @@ export function renderStudioMedia(onChange) {
   const previous = $("video-service").value;
   options($("video-service"), videos, previous);
   options($("studio-chat-select"), services().filter(item => ready(item) && (item.kind || "llm") === "llm"), chat?.sessionId);
-  if (mode === null) mode = chat ? "chat" : videos.length ? "video" : null;
+  const images = services().filter(item => item.capabilities?.includes("image.generate"));
+  if (mode === null) mode = chat ? "chat" : videos.length ? "video" : images.length ? "image" : null;
   const videoMode = mode === "video";
+  const mediaMode = videoMode || mode === "image";
+  const imageReady = renderImageStudio(mode === "image");
   $("video-studio").classList.toggle("hidden", !videoMode);
-  $("studio-chat-select-label").classList.toggle("hidden", videoMode);
+  $("studio-chat-select-label").classList.toggle("hidden", mediaMode);
   $("studio-video-tab").classList.toggle("selected", videoMode);
-  $("studio-chat-tab").classList.toggle("selected", !videoMode);
+  $("studio-chat-tab").classList.toggle("selected", !mediaMode);
   const service = videos.find(item => item.sessionId === $("video-service").value);
   $("video-generate").disabled = submitting || !ready(service);
   $("video-service-status").textContent = !service ? t("Start a video model in Model management first.")
@@ -67,7 +78,7 @@ export function renderStudioMedia(onChange) {
     jobSignature = ""; clearResults(); $("video-jobs").replaceChildren();
     if (ready(service)) pollJobs();
   }
-  return {videoMode, ready: Boolean(chat || videos.some(ready))};
+  return {mediaMode, ready: Boolean(chat || videos.some(ready) || imageReady)};
 }
 
 function clearResults() {

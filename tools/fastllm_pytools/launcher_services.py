@@ -201,7 +201,7 @@ class LauncherServicePool:
         except urllib.error.HTTPError as error:
             response = error
         except (OSError, urllib.error.URLError) as error:
-            raise LauncherError("无法连接视频服务：" + str(error)) from error
+            raise LauncherError("无法连接生成服务：" + str(error)) from error
         with response:
             body = response.read(MEDIA_RESULT_LIMIT + 1)
             if len(body) > MEDIA_RESULT_LIMIT:

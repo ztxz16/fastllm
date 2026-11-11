@@ -316,7 +316,7 @@
     "视频输出目录（可选）": "Video output directory (optional)",
     "限制可用 GPU（可选）": "Restrict visible GPUs (optional)",
     "例如 0 或 1,2，支持 GPU UUID": "For example 0 or 1,2; GPU UUIDs also supported",
-    "填写 Launcher 可见的卡号或 UUID，以逗号分隔。模型内部重新编号为 0、1…；视频使用所选全部卡进行并行推理。留空时继承可见范围，视频默认使用第 0 张卡。": "Comma-separated launcher-visible indices or UUIDs. Renumbered to 0,1… inside the model process. Video uses all selected GPUs in parallel; with no selection it uses logical GPU 0.",
+    "填写 Launcher 可见的卡号或 UUID，以逗号分隔。模型内部重新编号为 0、1…；图像仅支持单卡，视频可使用多卡。留空时继承可见范围，图像和视频默认使用第 0 张卡。": "Comma-separated launcher-visible indices or UUIDs, renumbered to 0,1… in the model process. Images support one GPU; video can use multiple GPUs. With no selection, image and video use logical GPU 0.",
     "当前服务": "Selected service",
     "生成 API · 创建 / 查询 / 下载 / 取消": "Generation API · Create / status / download / cancel",
     "对话 / 工作区": "Chat / workspace",
@@ -354,7 +354,12 @@
     "草稿数量": "Draft token count",
     "每轮最多使用的草稿 token 数；auto 使用模型默认值。": "Maximum draft tokens per round; auto uses the model default.",
     "草稿阈值": "Draft threshold",
-    "仅对 DSpark 生效；留空为 0.5，0 表示不按置信度提前截短草稿。": "DSpark only. Default: 0.5. Set 0 to disable confidence-based truncation."
+    "仅对 DSpark 生效；留空为 0.5，0 表示不按置信度提前截短草稿。": "DSpark only. Default: 0.5. Set 0 to disable confidence-based truncation.",
+    "图像（MiniMax H3 Image）": "Image (MiniMax H3 Image)",
+    "留空使用对应的内置生成后端；也可填写自定义路径。": "Leave blank to use the bundled generation backend, or enter a custom path.",
+    "生成结果目录（可选）": "Output directory (optional)",
+    "图像生成": "Image generation",
+    "图像生成工作室": "Image generation studio"
   },
   "messages": {
     "Pi Agent": "Pi Agent",
@@ -635,7 +640,11 @@
     "视频内存预算须为至少 2 的 GiB 数值，或填 0 使用默认策略。": "Video host memory budget must be at least 2 GiB, or use 0 for the default policy.",
     "草稿阈值必须是 0 到 1 之间的数字；留空使用默认值 0.5。": "Draft threshold must be between 0 and 1; leave empty for the default of 0.5.",
     "启用外挂草稿文件后必须选择草稿模型文件或目录。": "Select a draft model file or folder when external draft is enabled.",
-    "Enable an external draft to configure its file, token count and threshold.": "Enable an external draft to configure its file, token count and threshold."
+    "Enable an external draft to configure its file, token count and threshold.": "Enable an external draft to configure its file, token count and threshold.",
+    "Image demo": "Image demo",
+    "cancelling": "cancelling",
+    "Image generation": "Image generation",
+    "MiniMax H3 Image · single GPU, text-to-image and reference editing. Select a GPU with enough free memory.": "MiniMax H3 Image · single GPU, text-to-image and reference editing. Select a GPU with enough free memory."
   },
   "patterns": [
     {

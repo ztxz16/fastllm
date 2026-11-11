@@ -26,12 +26,16 @@ from fastllm_pytools.tui import DeployConfig, build_fastllm_env, build_fastllm_a
 
 
 WORKER = r'''
-import argparse, json, os, time
+import argparse, base64, json, os, time
+from email.parser import BytesParser
+from email.policy import default
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 p=argparse.ArgumentParser()
 p.add_argument('--port',type=int); p.add_argument('--host'); p.add_argument('--api-key',default='')
 p.add_argument('--api_key',default=''); p.add_argument('--kind',default='video')
+p.add_argument('--device')
 args,_=p.parse_known_args(); jobs={}; started=time.monotonic()
+if args.device is not None: args.kind='image'
 class H(BaseHTTPRequestHandler):
  def log_message(self,*args): pass
  def answer(self,value,status=200,mime='application/json'):
@@ -45,15 +49,25 @@ class H(BaseHTTPRequestHandler):
   if self.path=='/health': return self.answer({'ready':time.monotonic()-started>float(os.environ.get('READY_DELAY','.4'))},200 if time.monotonic()-started>float(os.environ.get('READY_DELAY','.4')) else 503)
   if not self.auth(): return
   if self.path=='/v1/models': return self.answer({'data':[{'id':'stub-'+args.kind}], 'visible':os.environ.get('CUDA_VISIBLE_DEVICES')})
-  if self.path=='/v1/videos': return self.answer({'data':list(jobs.values())})
-  if self.path.endswith('/content'): return self.answer(b'fake-mp4',mime='video/mp4')
+  if self.path in ('/v1/videos','/v1/images/jobs'): return self.answer({'data':list(jobs.values())})
+  if self.path.endswith('/content'):
+   if args.kind=='image': return self.answer(base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a5WQAAAAASUVORK5CYII='),mime='image/png')
+   return self.answer(b'fake-mp4',mime='video/mp4')
   return self.answer(jobs[self.path.split('/')[-1]])
  def do_POST(self):
   if not self.auth(): return
   if self.path.endswith('/cancel'):
    job=jobs[self.path.split('/')[-2]]; job['status']='cancelled'; return self.answer(job)
-  data=json.loads(self.rfile.read(int(self.headers.get('Content-Length','0'))))
-  job=dict(data,id='video_1_'+str(len(jobs)),status='queued' if data['prompt']=='hold' else 'completed',created_at=time.time(),progress=100,stage='done',current=6,total=6,error=None)
+  raw=self.rfile.read(int(self.headers.get('Content-Length','0')))
+  if self.headers.get('Content-Type','').startswith('multipart/form-data'):
+   message=BytesParser(policy=default).parsebytes(('Content-Type: '+self.headers['Content-Type']+'\r\n\r\n').encode()+raw)
+   data={'references':[]}
+   for part in message.iter_parts():
+    name=part.get_param('name',header='content-disposition'); content=part.get_payload(decode=True)
+    if name=='image[]': data['references'].append({'name':part.get_filename(),'type':part.get_content_type(),'data':base64.b64encode(content).decode()})
+    else: data[name]=content.decode()
+  else: data=json.loads(raw)
+  job=dict(data,id=args.kind+'_1_'+str(len(jobs)),status='queued' if data['prompt']=='hold' else 'completed',created_at=time.time(),progress=100,stage='done',current=6,total=6,error=None)
   jobs[job['id']]=job; return self.answer(job)
 ThreadingHTTPServer((args.host,args.port),H).serve_forever()
 '''
@@ -140,6 +154,65 @@ class ServiceTest(unittest.TestCase):
         config = config_from_dict(self.profile("minimax_h3", visible_gpus="0,1"))
         command = build_fastllm_argv(config)
         self.assertEqual(command[command.index("--devices") + 1], "0,1")
+
+    def test_image_backend_discovery_single_gpu_and_command(self):
+        from fastllm_pytools import service_backends
+        binary = self.directory / "minimax_h3_image_server"
+        binary.touch()
+        config = SimpleNamespace(server_binary="")
+        with patch.object(service_backends, "__file__", str(self.directory / "service_backends.py")), \
+                patch.dict(os.environ, {"FTLLM_H3_IMAGE_SERVER": ""}), \
+                patch.object(service_backends.shutil, "which", return_value=None):
+            self.assertEqual(service_backends.H3ImageBackend.executable(config), str(binary))
+            config.server_binary = str(self.worker)
+            self.assertEqual(service_backends.H3ImageBackend.executable(config), str(self.worker))
+        config = config_from_dict(self.profile("minimax_h3_image", video_gpu_memory_limit="4", base_model="unused"))
+        command = build_fastllm_argv(config)
+        self.assertEqual(command[command.index("--device") + 1], "0")
+        self.assertNotIn("--devices", command)
+        self.assertNotIn("--base-model", command)
+        self.assertNotIn("--gpu-memory-limit", command)
+        self.assertEqual(validate_config(config), [])
+        fields = []
+        validate_config(config_from_dict(self.profile("minimax_h3_image", visible_gpus="0,1")), fields)
+        self.assertTrue(any("visible_gpus" in item["fields"] for item in fields))
+
+    def test_image_api_contract_authenticated_proxy_and_cancellation(self):
+        image = self.start("minimax_h3_image")
+        info = self.client.get("/api/runtime/api-info", headers=self.headers).json()
+        self.assertEqual(info["kind"], "image")
+        self.assertEqual(info["request"]["model"], "minimax-h3-image")
+        self.assertEqual(info["defaults"]["num_inference_steps"], 6)
+        self.assertEqual(self.pool.catalog()[0]["capabilities"], ["image.generate", "image.edit"])
+        self.assertTrue(info["edit"].endswith("/v1/images/edits"))
+        self.assertEqual(info["references"]["max_count"], 16)
+        path = "/api/media/" + image + "/images/jobs"
+        self.assertEqual(self.client.get(path).status_code, 403)
+        job = self.client.post(path, headers=self.headers, json={"prompt": "test image", "size": "2048x2048"}).json()
+        self.assertEqual(self.client.get(path, headers=self.headers).json()["data"][0]["id"], job["id"])
+        content = self.client.get(path + "/" + job["id"] + "/content", headers=self.headers)
+        self.assertEqual(content.headers["content-type"], "image/png")
+        self.assertTrue(content.content.startswith(b"\x89PNG\r\n\x1a\n"))
+        held = self.client.post(path, headers=self.headers, json={"prompt": "hold"}).json()
+        cancelled = self.client.post(path + "/" + held["id"] + "/cancel", headers=self.headers)
+        self.assertEqual(cancelled.json()["status"], "cancelled")
+        self.assertEqual(self.client.post("/api/media/" + image + "/videos", headers=self.headers, json={}).status_code, 400)
+        self.assertEqual(self.client.get("/api/media/" + image + "/images/jobs/not-an-id/content", headers=self.headers).status_code, 400)
+
+    def test_image_multipart_proxy_preserves_reference_order_and_bytes(self):
+        import base64
+        image = self.start("minimax_h3_image")
+        files = [("image[]", ("first.jpg", b"jpeg fixture\x00\xff", "image/jpeg")),
+                 ("image[]", ("second.webp", b"webp fixture\x00\x80", "image/webp"))]
+        for route in ("images/jobs", "images/edits"):
+            path = "/api/media/" + image + "/" + route
+            response = self.client.post(path, headers=self.headers,
+                data={"prompt": "Compose <Picture 1> and <Picture 2>", "size": "2048x2048"}, files=files)
+            self.assertEqual(response.status_code, 200, response.text)
+            result = response.json()
+            self.assertEqual(result["prompt"], "Compose <Picture 1> and <Picture 2>")
+            self.assertEqual([(r["name"], base64.b64decode(r["data"]), r["type"]) for r in result["references"]],
+                             [item[1] for item in files])
 
     def test_services_run_and_stop_independently_with_separate_gpu_environments(self):
         with patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "6,7"}):

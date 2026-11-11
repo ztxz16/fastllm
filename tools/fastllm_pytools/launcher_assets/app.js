@@ -23,7 +23,7 @@ import {
   renderAgentRuntime, refreshAgentRuntime, installAgentRuntime, renderWebUIAvailability,
   openEmbeddedWebUI
 } from "../ui_plugins/studio/launcher.js";
-import {openVideoService} from "../ui_plugins/studio/video.js";
+import {openVideoService, openImageService} from "../ui_plugins/studio/video.js";
 
 import {
   mountPluginHost
@@ -776,7 +776,7 @@ function renderRuntime() {
   elements.openApiInfo.disabled = !runtime.ready || isWebui;
   if (elements.apiInfoDialog.open && (!runtime.ready || isWebui
       || elements.apiInfoDialog.dataset.sessionId !== runtime.sessionId)) elements.apiInfoDialog.close();
-  elements.openEndpoint.textContent = runtime.kind === "video" ? t("Video demo") : isWebui ? t("Open WebUI") : t("Open API documentation");
+  elements.openEndpoint.textContent = runtime.kind === "image" ? t("Image demo") : runtime.kind === "video" ? t("Video demo") : isWebui ? t("Open WebUI") : t("Open API documentation");
   renderInferenceSpeed();
   renderContextWindow();
   renderWebUIAvailability();
@@ -788,7 +788,7 @@ function renderRuntime() {
 
 function renderInferenceSpeed() {
   const runtime = state.runtime || {};
-  const visible = runtime.kind !== "video" && runtime.command === "server" && runtime.phase === "running" && runtime.ready;
+  const visible = (runtime.kind || "llm") === "llm" && runtime.command === "server" && runtime.phase === "running" && runtime.ready;
   elements.inferenceStatusBar.classList.toggle("hidden", !visible);
   if (!visible || state.inferenceSpeedSession !== runtime.sessionId) {
     state.inferenceSpeedSamples = {};
@@ -870,6 +870,11 @@ function basename(value) {
 
 function openEndpoint() {
   if (!state.runtime?.endpoint || !state.runtime.ready) return;
+  if (state.runtime.kind === "image") {
+    openImageService(state.runtime.sessionId);
+    switchView("webui");
+    return;
+  }
   if (state.runtime.kind === "video") {
     openVideoService(state.runtime.sessionId);
     switchView("webui");
@@ -889,8 +894,9 @@ async function openApiInfo() {
     elements.apiInfoModel.value = info.model;
     elements.apiInfoKey.value = info.apiKey;
     const contract = document.getElementById("api-contract");
-    document.getElementById("api-contract-field").classList.toggle("hidden", info.kind !== "video");
-    contract.value = info.kind === "video" ? [info.create, info.status, info.content, info.cancel,
+    const media = info.kind === "video" || info.kind === "image";
+    document.getElementById("api-contract-field").classList.toggle("hidden", !media);
+    contract.value = media ? [info.create, info.status, info.content, info.cancel, ...(info.edit ? [info.edit, JSON.stringify(info.references, null, 2)] : []),
       "", JSON.stringify(info.request, null, 2), "", t("Create a job, poll until completed, then download its content.")].join("\n") : "";
     elements.apiInfoKey.placeholder = t("No API Key required");
     elements.apiInfoKey.type = "password";
