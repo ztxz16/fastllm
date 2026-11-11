@@ -38,7 +38,12 @@ namespace {
     }
 }
 
+#include "qwen4_exp_batch_graph.inc"
 struct Qwen4ExpModel::RequestBatchState {
+#ifdef USE_CUDA
+    std::shared_ptr<BatchGraph> target;
+    std::map<int, std::shared_ptr<BatchGraph>> drafts;
+#endif
     std::map<int, HybridMoeBatch> experts;
 };
 
@@ -54,6 +59,8 @@ struct Qwen4ExpModel::BatchedRequest {
     bool verify = false;
     int resultIndex = 0;
 };
+
+#include "qwen4_exp_batch_graph_prepare.inc"
 
 bool Qwen4ExpModel::PopPendingResponseToken(ResponseContext *context, int, int &token) {
     if (!context || context->pastKeyValues.empty() || threadTpState || threadTpRank >= 0)
@@ -188,22 +195,60 @@ std::vector<std::vector<int>> Qwen4ExpModel::ForwardTargetBatch(
         initial.push_back(f.hiddenStates);
     }
     Data hidden[2], carriedNorm, finalNorm;
+#ifdef USE_CUDA
+    auto &ownedGraph = frames.front()->work->requestState->batchState->target;
+    BatchGraph *graph = PrepareBatchGraph(ownedGraph, frames, {}, initial) ? ownedGraph.get() : nullptr;
+#else
+    constexpr bool graph = false;
+#endif
     HybridMoeDecodeGroup expertSteps;
-    Qwen4BatchPack(initial, hidden[0]);
+    if (!graph) Qwen4BatchPack(initial, hidden[0]);
+    Data logits;
+#ifdef USE_CUDA
+    if (graph && graph->complete) {
+        for (auto &table : weights)
+            if (expertSteps.Begin(FastllmCudaGetDevice(), table.data(), table.size(), num_experts_per_tok)) break;
+        AssertInFastLLM(graph->complete.Launch(), "Qwen cross-request target graph replay failed");
+    } else
+#endif
+    {
+#ifdef USE_CUDA
+    if (graph) graph->Begin();
+#endif
     int current = 0;
     bool hasCarriedNorm = false;
     for (int layer = 0; layer < block_cnt; ++layer) {
         ApplyDeviceMap(deviceMap, layer + 1, block_cnt);
-        auto &residual = hidden[current];
-        auto &next = hidden[1 - current];
+        Data localInput, localInjection, localOutput;
+#ifdef USE_CUDA
+        auto &residual = graph ? (layer ? graph->layers[layer-1].residual : graph->hidden) : hidden[current];
+        auto &next = graph ? graph->layers[layer].afterAttention : hidden[1-current];
+        auto &mlpInput = graph ? graph->layers[layer].input : localInput;
+        auto &mlpInjection = graph ? graph->layers[layer].injection : localInjection;
+        auto &mlpOutput = graph ? graph->layers[layer].output : localOutput;
+#else
+        auto &residual = hidden[current]; auto &next = hidden[1-current];
+        auto &mlpInput = localInput; auto &mlpInjection = localInjection; auto &mlpOutput = localOutput;
+#endif
+        auto dense = [&] {
         if (layer == pleLayer) {
             for (size_t i = 0; i < frames.size(); ++i) {
                 auto &f = *frames[i]->work;
                 Data part, ple;
                 Qwen4BatchView(part, residual, starts[i], f.inputIds.dims[1]);
-                if (f.verificationCapture) f.verificationCapture->pleInput.CopyFrom(part);
+#ifdef USE_CUDA
+                auto *capture = graph && f.verificationCapture
+                    ? &graph->requests[i]->attention.verification : f.verificationCapture;
+                if (capture) capture->pleInput.CopyFrom(part);
+                if (graph) RunPLEProjection(graph->requests[i]->ple, part, *f.requestState, ple,
+                    capture ? &capture->pleNormalized : nullptr, true);
+                else
+#else
+                auto *capture = f.verificationCapture;
+                if (capture) capture->pleInput.CopyFrom(part);
+#endif
                 RunPLE(part, f.inputIds, *f.requestState, ple, f.hostInputTokens,
-                    &f.plePrefetch, f.verificationCapture ? &f.verificationCapture->pleNormalized : nullptr);
+                    &f.plePrefetch, capture ? &capture->pleNormalized : nullptr);
                 AddTo(part, ple);
             }
             hasCarriedNorm = false;
@@ -212,8 +257,17 @@ std::vector<std::vector<int>> Qwen4ExpModel::ForwardTargetBatch(
         const std::string attn = prefix + "attn_hyper_connection.";
         const std::string mlp = prefix + "mlp_hyper_connection.";
         Data norm, attentionInput, injection, attentionOutput;
-        if (!hasCarriedNorm) GroupedRMSNorm(residual, weight[attn + "hc_norm.weight"], norm);
-        HyperMixNormalized(hasCarriedNorm ? carriedNorm : norm, attn, attentionInput, &injection);
+#ifdef USE_CUDA
+        if (graph) {
+            if (layer && layer != pleLayer) { norm.FakeFrom(graph->layers[layer-1].norm, 0); norm.Resize(graph->layers[layer-1].norm.dims); }
+            else GroupedRMSNorm(residual, weight[attn + "hc_norm.weight"], norm);
+            HyperMixNormalized(norm, attn, attentionInput, &injection);
+        } else
+#endif
+        {
+            if (!hasCarriedNorm) GroupedRMSNorm(residual, weight[attn + "hc_norm.weight"], norm);
+            HyperMixNormalized(hasCarriedNorm ? carriedNorm : norm, attn, attentionInput, &injection);
+        }
         hasCarriedNorm = false;
         Data typedInput, projectionValues[4];
         ToDataType(attentionInput, typedInput, dataType);
@@ -231,6 +285,9 @@ std::vector<std::vector<int>> Qwen4ExpModel::ForwardTargetBatch(
         for (size_t i = 0; i < frames.size(); ++i) {
             auto &f = *frames[i]->work;
             auto *capture = f.verificationCapture;
+#ifdef USE_CUDA
+            if (graph && capture) capture = &graph->requests[i]->attention.verification;
+#endif
             const int sequence = f.inputIds.dims[1];
             Data part;
             Qwen4BatchView(part, attentionInput, starts[i], sequence);
@@ -249,15 +306,26 @@ std::vector<std::vector<int>> Qwen4ExpModel::ForwardTargetBatch(
                     &projections, &attentionParts[i]);
             } else {
                 Data causal, positions;
-                positions.CopyFrom(f.positionIds);
-                positions.ToDevice(part.dataDevice, part.dataDeviceIds);
+                if (!graph) {
+                    positions.CopyFrom(f.positionIds);
+                    positions.ToDevice(part.dataDevice, part.dataDeviceIds);
+                }
                 const Data *mask = &f.attentionMask;
-                if (sequence > 1 && mask->dims.empty() &&
+                if (!graph && sequence > 1 && mask->dims.empty() &&
                     !(part.dataDevice == CUDA && f.qsaPreviousLength >= indexerBudget)) {
                     causal.CopyFrom(Qwen4BuildCausalMask(f.qsaPreviousLength, sequence));
                     mask = &causal;
                 }
                 FullAttentionProjections projections{&slices[0], &slices[1], &slices[2]};
+#ifdef USE_CUDA
+                if (graph) {
+                    auto &a = *graph->requests[i];
+                    AssertInFastLLM(RunFullAttentionGraph(layer, prefix + "self_attn.", part,
+                        kv.first, kv.second, *f.requestState, &a.attention, graph->device, a.width,
+                        false, true, &a.attention.verification, unusedOutput, &projections, &attentionParts[i]),
+                        "Qwen batch target graph attention failed");
+                } else
+#endif
                 RunFullAttention(layer, part, *mask, positions, f.qsaDeviceCompatibleMask,
                     kv.first, kv.second, *f.requestState, unusedOutput,
                     capture ? &capture->qsaRawKeys[layer] : nullptr, f.decodeReserveTokens,
@@ -270,10 +338,18 @@ std::vector<std::vector<int>> Qwen4ExpModel::ForwardTargetBatch(
         if (linearLayer)
             RunGdnOutputProjection(unprojected, weight[prefix + "linear_attn.out_proj.weight"], attentionOutput);
         else Linear(unprojected, weight[prefix + "self_attn.o_proj.weight"], Data(), attentionOutput);
-        Data mlpNorm, mlpInput, mlpInjection, mlpOutput;
+        Data mlpNorm;
         HyperCombineRMSNorm(residual, attentionOutput, injection, weight[mlp + "hc_norm.weight"], next, mlpNorm);
-        current = 1 - current;
         HyperMixNormalized(mlpNorm, mlp, mlpInput, &mlpInjection);
+#ifdef USE_CUDA
+        if (graph) graph->Route(*this, targetMoePlans[layer], graph->layers[layer]);
+#endif
+        };
+#ifdef USE_CUDA
+        if (graph) graph->Dense(layer*3, dense); else
+#endif
+        dense();
+        current = 1 - current;
 #if defined(USE_CUDA) && !defined(USE_ROCM)
         if (executionMode == ExecutionMode::Hybrid && mlpInput.dataDevice == CUDA)
             expertSteps.Begin(FastllmCudaGetDevice(), weights[layer].data(),
@@ -281,8 +357,28 @@ std::vector<std::vector<int>> Qwen4ExpModel::ForwardTargetBatch(
 #endif
         // One route and expert invocation for every request segment. Cache
         // admission, dynamic routing and NUMA small-batch dispatch see all rows.
+#ifdef USE_CUDA
+        if (graph) graph->Experts(*this, layer*3+1, targetMoePlans[layer], graph->layers[layer],
+            frames.front()->work->requestState->batchState->experts[layer]); else
+#endif
         RunMoE(layer, mlpInput, mlpOutput, true, nullptr, nullptr, {},
             &frames.front()->work->requestState->batchState->experts[layer]);
+        auto tail = [&] {
+#ifdef USE_CUDA
+        if (graph) {
+            graph->Join(graph->layers[layer]);
+            if (layer + 1 == pleLayer) {
+                HyperCombine(next, mlpOutput, mlpInjection, graph->layers[layer].residual);
+                return;
+            }
+            const std::string normWeight = layer + 1 == block_cnt
+                ? languagePrefix + "hyper_connection_mixer.hc_norm.weight"
+                : languagePrefix + "layers." + std::to_string(layer + 1) + ".attn_hyper_connection.hc_norm.weight";
+            HyperCombineRMSNorm(next, mlpOutput, mlpInjection, weight[normWeight],
+                graph->layers[layer].residual, graph->layers[layer].norm);
+            return;
+        }
+#endif
         if (layer + 1 == block_cnt) {
             HyperCombineRMSNorm(hidden[current], mlpOutput, mlpInjection,
                 weight[languagePrefix + "hyper_connection_mixer.hc_norm.weight"],
@@ -297,19 +393,48 @@ std::vector<std::vector<int>> Qwen4ExpModel::ForwardTargetBatch(
         } else {
             HyperCombine(hidden[current], mlpOutput, mlpInjection, hidden[1 - current]);
         }
+        };
+#ifdef USE_CUDA
+        if (graph) graph->Dense(layer*3+2, tail); else
+#endif
+        tail();
         current = 1 - current;
     }
-    Data finalHidden, logits;
-    HyperMixNormalized(finalNorm, languagePrefix + "hyper_connection_mixer.", finalHidden, nullptr);
-    Linear(finalHidden, weight["lm_head.weight"], Data(), logits);
-    ToDataType(logits, FLOAT32);
+    auto head = [&] {
+#ifdef USE_CUDA
+        Data &norm = graph ? graph->layers[block_cnt - 1].norm : finalNorm;
+        Data &output = graph ? graph->logits : logits;
+#else
+        Data &norm = finalNorm, &output = logits;
+#endif
+        Data finalHidden;
+        HyperMixNormalized(norm, languagePrefix + "hyper_connection_mixer.", finalHidden, nullptr);
+        Linear(finalHidden, weight["lm_head.weight"], Data(), output);
+        ToDataType(output, FLOAT32);
+    };
+#ifdef USE_CUDA
+    if (graph) {
+        graph->Dense(block_cnt*3, head);
+        const bool verifying = std::any_of(frames.begin(), frames.end(),
+            [](const ForwardState *frame) { return frame->work->verificationCapture != nullptr; });
+        graph->Seal(verifying ? "verify" : "decode", rows);
+    } else
+#endif
+    head();
+    }
+#ifdef USE_CUDA
+    if (graph) {
+        FinishBatchGraph(*graph, frames, {});
+        logits.CopyFrom(graph->logits); hidden[0].CopyFrom(graph->layers[block_cnt-1].residual);
+    }
+#endif
     std::vector<std::vector<int>> results;
     for (size_t i = 0; i < frames.size(); ++i) {
         auto &f = *frames[i]->work;
         const int sequence = f.inputIds.dims[1];
         Split(logits, 1, starts[i], starts[i] + sequence, f.logits);
         if (f.targetMultiHidden)
-            Split(hidden[current], 1, starts[i], starts[i] + sequence, *f.targetMultiHidden);
+            Split(hidden[0], 1, starts[i], starts[i] + sequence, *f.targetMultiHidden);
         // Share sampling/EOS handling without running a second projection.
         f.logitsReady = true;
         results.push_back(frames[i]->Finish());
@@ -407,9 +532,65 @@ std::vector<int> Qwen4ExpModel::RunMtpDraftBatch(
         starts.push_back(rows); rows += r->tokens.size();
         tokens.insert(tokens.end(), r->tokens.begin(), r->tokens.end());
     }
-    Data targetHidden, embeddings, tokenIds(FLOAT32, {1, rows}, tokens);
-    Qwen4BatchPack(hidden, targetHidden);
-    Embedding(tokenIds, weight[languagePrefix + "embed_tokens.weight"], embeddings);
+    Data localHidden, localEmbeddings;
+#ifdef USE_CUDA
+    for (auto *r : requests) {
+        Data position(FLOAT32, {1, (int)r->positions.size()},
+            std::vector<float>(r->positions.begin(), r->positions.end()));
+        r->position.CopyFrom(position);
+    }
+    auto &ownedGraph = requests.front()->state->batchState->drafts[requests.front()->state->mtpState->proposals.size()];
+    BatchGraph *graph = PrepareBatchGraph(ownedGraph, {}, requests, hidden) ? ownedGraph.get() : nullptr;
+    auto &targetHidden = graph ? graph->hidden : localHidden;
+    auto &embeddings = graph ? graph->embeddings : localEmbeddings;
+#else
+    constexpr bool graph = false;
+    auto &targetHidden = localHidden; auto &embeddings = localEmbeddings;
+#endif
+#ifdef USE_CUDA
+    if (graph) {
+        rows = 0; tokens.clear(); starts.clear();
+        for (size_t i = 0; i < requests.size(); ++i) {
+            starts.push_back(rows); rows += graph->requests[i]->rows;
+            auto &source = requests[i]->tokens;
+            tokens.insert(tokens.end(), source.begin(), source.end());
+            tokens.resize(rows, source.back());
+        }
+    }
+#endif
+    Data tokenIds(FLOAT32, {1, rows}, tokens);
+    if (!graph) Qwen4BatchPack(hidden, targetHidden);
+    Embedding(tokenIds, weight[languagePrefix + "embed_tokens.weight"], localEmbeddings);
+#ifdef USE_CUDA
+    if (graph) AssertInFastLLM(Qwen4PrepareDecodeGraphTensor(embeddings, localEmbeddings, graph->device),
+        "Qwen batch draft embedding staging failed");
+#endif
+    Data localAfter, localInput, localInjection, localOutput, localMultiHidden, localLogits;
+#ifdef USE_CUDA
+    auto &afterAttention = graph ? graph->layers[block_cnt].afterAttention : localAfter;
+    auto &mlpInput = graph ? graph->layers[block_cnt].input : localInput;
+    auto &mlpInjection = graph ? graph->layers[block_cnt].injection : localInjection;
+    auto &mlpOutput = graph ? graph->layers[block_cnt].output : localOutput;
+    auto &multiHidden = graph ? graph->finalHidden : localMultiHidden;
+    auto &logits = graph ? graph->logits : localLogits;
+#else
+    auto &afterAttention = localAfter; auto &mlpInput = localInput;
+    auto &mlpInjection = localInjection; auto &mlpOutput = localOutput;
+    auto &multiHidden = localMultiHidden; auto &logits = localLogits;
+#endif
+    PrepareMtpDraftLmHeadWeight();
+    HybridMoeDecodeGroup expertStep;
+#ifdef USE_CUDA
+    if (graph && graph->complete) {
+        expertStep.Begin(graph->device, draftMoePlan.weights->data(), draftMoePlan.weights->size(), num_experts_per_tok);
+        AssertInFastLLM(graph->complete.Launch(), "Qwen cross-request draft graph replay failed");
+    } else
+#endif
+    {
+#ifdef USE_CUDA
+    if (graph) graph->Begin();
+#endif
+    auto prefixBody = [&] {
     Data normalizedEmbeds, projectedEmbeds, normalizedHidden, projectedHidden, attentionNorm;
     RMSNorm(embeddings, weight["mtp.pre_fc_norm_embedding.weight"], rms_norm_eps, normalizedEmbeds);
     Linear(normalizedEmbeds, weight["mtp.fc_embedding.weight"], Data(), projectedEmbeds);
@@ -434,30 +615,60 @@ std::vector<int> Qwen4ExpModel::RunMtpDraftBatch(
     for (size_t i = 0; i < requests.size(); ++i) {
         auto &r = *requests[i];
         auto &mtp = *r.state->mtpState;
+#ifdef USE_CUDA
+        const int sequence = graph ? graph->requests[i]->rows : r.tokens.size();
+#else
         const int sequence = r.tokens.size();
+#endif
         Data part, output;
         Qwen4BatchView(part, attentionInput, starts[i], sequence);
-        Data position(FLOAT32, {1, sequence}, std::vector<float>(r.positions.begin(), r.positions.end()));
-        position.ToDevice(part.dataDevice, part.dataDeviceIds);
+        Data position;
+        if (!graph) {
+            Data hostPosition(FLOAT32, {1, sequence}, std::vector<float>(r.positions.begin(), r.positions.end()));
+            position.CopyFrom(hostPosition); position.ToDevice(part.dataDevice, part.dataDeviceIds);
+        }
         const int previous = mtp.key.dims.empty() ? 0 : mtp.key.dims[1];
         Data mask;
-        if (sequence > 1 && !(executionMode == ExecutionMode::Hybrid &&
+        if (!graph && sequence > 1 && !(executionMode == ExecutionMode::Hybrid &&
             part.dataDevice == CUDA && previous + sequence > indexerBudget))
             mask.CopyFrom(Qwen4BuildCausalMask(previous, sequence));
         Data slices[3], unprojected;
         for (int j = 0; j < 3; ++j)
             Qwen4BatchView(slices[j], projectionValues[j], starts[i], sequence);
         FullAttentionProjections prepared{&slices[0], &slices[1], &slices[2]};
+#ifdef USE_CUDA
+        if (graph) {
+            auto &a = *graph->requests[i];
+            AssertInFastLLM(RunFullAttentionGraph(block_cnt, prefix + "self_attn.", part,
+                mtp.key, mtp.value, mtp.attentionState, &a.attention, graph->device, a.width,
+                false, true, &a.attention.verification, output, &prepared, &unprojected),
+                "Qwen batch draft graph attention failed");
+        } else
+#endif
         RunFullAttentionWithPrefix(block_cnt, prefix + "self_attn.", part, mask, position,
             true, mtp.key, mtp.value, mtp.attentionState, output, nullptr, 0, &prepared, &unprojected);
+#ifdef USE_CUDA
+        if (graph) {
+            const auto *validRows = (const int32_t*)graph->requests[i]->attention.decodeMeta.cudaData + 1;
+            Data projectedView, injectionView;
+            Qwen4BatchView(projectedView, projectedHidden, starts[i], sequence);
+            Qwen4BatchView(injectionView, attentionInjection, starts[i], sequence);
+            AssertInFastLLM(FastllmCudaQwen4LastValidRow(projectedView, validRows, projectedParts[i]) &&
+                FastllmCudaQwen4LastValidRow(injectionView, validRows, injectionParts[i]) &&
+                FastllmCudaQwen4LastValidRow(unprojected, validRows, attentionParts[i]),
+                "Qwen batch draft last-row gather failed");
+        } else
+#endif
+        {
         Qwen4BatchView(projectedParts[i], projectedHidden, starts[i] + sequence - 1, 1);
         Qwen4BatchView(injectionParts[i], attentionInjection, starts[i] + sequence - 1, 1);
         Split(unprojected, 1, sequence - 1, sequence, attentionParts[i]);
+        }
         projectedPointers.push_back(&projectedParts[i]);
         attentionPointers.push_back(&attentionParts[i]);
         injectionPointers.push_back(&injectionParts[i]);
     }
-    Data projected, attention, injection, afterAttention, mlpNorm, mlpInput, mlpInjection, mlpOutput;
+    Data projected, attention, injection, mlpNorm;
     Qwen4BatchPack(projectedPointers, projected);
     Data unprojected;
     Qwen4BatchPack(attentionPointers, unprojected);
@@ -466,19 +677,47 @@ std::vector<int> Qwen4ExpModel::RunMtpDraftBatch(
     HyperCombineRMSNorm(projected, attention, injection, weight[prefix + "mlp_hyper_connection.hc_norm.weight"],
         afterAttention, mlpNorm);
     HyperMixNormalized(mlpNorm, prefix + "mlp_hyper_connection.", mlpInput, &mlpInjection);
+#ifdef USE_CUDA
+    if (graph) graph->Route(*this, draftMoePlan, graph->layers[block_cnt]);
+#endif
+    };
+#ifdef USE_CUDA
+    if (graph) graph->Dense(0, prefixBody); else
+#endif
+    prefixBody();
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+    if (mlpInput.dataDevice == CUDA)
+        expertStep.Begin(FastllmCudaGetDevice(), draftMoePlan.weights->data(), draftMoePlan.weights->size(), num_experts_per_tok);
+#endif
+#ifdef USE_CUDA
+    if (graph) graph->Experts(*this, 1, draftMoePlan, graph->layers[block_cnt],
+        requests.front()->state->batchState->experts[block_cnt]); else
+#endif
     RunMoE(draftMoePlan, mlpInput, mlpOutput, true, nullptr, nullptr, {},
         &requests.front()->state->batchState->experts[block_cnt]);
-    Data multiHidden, finalNorm, sampleHidden, halfHeadInput, headLogits, logits;
+    auto tail = [&] {
+#ifdef USE_CUDA
+    if (graph) graph->Join(graph->layers[block_cnt]);
+#endif
+    Data finalNorm, sampleHidden, halfHeadInput, headLogits;
     HyperCombineRMSNorm(afterAttention, mlpOutput, mlpInjection,
         weight["mtp.hyper_connection_mixer.hc_norm.weight"], multiHidden, finalNorm);
     HyperMixNormalized(finalNorm, "mtp.hyper_connection_mixer.", sampleHidden, nullptr);
-    PrepareMtpDraftLmHeadWeight();
     Data *headInput = &sampleHidden;
     if (mtpDraftLmHeadReady && sampleHidden.dataType == FLOAT32) {
         ToDataType(sampleHidden, halfHeadInput, FLOAT16); headInput = &halfHeadInput;
     }
     Linear(*headInput, mtpDraftLmHeadReady ? mtpDraftLmHeadWeight : weight["lm_head.weight"], Data(), headLogits);
     ToDataType(headLogits, logits, FLOAT32);
+    };
+#ifdef USE_CUDA
+    if (graph) { graph->Dense(2, tail); graph->Seal("draft", rows); } else
+#endif
+    tail();
+    }
+#ifdef USE_CUDA
+    if (graph) FinishBatchGraph(*graph, {}, requests);
+#endif
     std::vector<int> result(requests.size(), -1);
     nextHidden.resize(requests.size()); probabilities.assign(requests.size(), 1);
     for (size_t i = 0; i < requests.size(); ++i) {

@@ -878,6 +878,28 @@ bool FastllmCudaQwen4QSAAppendCompress4Graph(
         fastllm::Data &tailPositions,
         fastllm::Data &compressedKeys,
         float eps);
+// Ragged graph rows update persistent QSA state only for the device-side valid prefix.
+bool FastllmCudaQwen4QSAAppendRaggedGraph(
+        const fastllm::Data &rawKey, const fastllm::Data &position,
+        const int32_t *decodeMeta, int tokenOffset, int compressRatio,
+        fastllm::Data &tailKeys, fastllm::Data &tailPositions, const int32_t *validRows);
+bool FastllmCudaQwen4QSACommitRaggedGraph(
+        const fastllm::Data &compressedKey, const int32_t *decodeMeta,
+        int tokenOffset, int compressRatio,
+        fastllm::Data &compressedKeys, const int32_t *validRows);
+bool FastllmCudaQwen4QSAAppendCompress4RaggedGraph(
+        const fastllm::Data &rawKeys,
+        const fastllm::Data &positions,
+        const fastllm::Data &normWeight,
+        float ropeTheta,
+        const int32_t *decodeMeta,
+        fastllm::Data &tailKeys,
+        fastllm::Data &tailPositions,
+        fastllm::Data &compressedKeys,
+        float eps, const int32_t *validRows);
+bool FastllmCudaQwen4LastValidRow(const fastllm::Data &input,
+        const int32_t *validRows, fastllm::Data &output);
+
 bool FastllmCudaQwen4QSASelectGraph(
         const fastllm::Data &query, const fastllm::Data &compressedKeys,
         const int32_t *decodeMeta, fastllm::Data &scores,
@@ -916,6 +938,10 @@ bool FastllmCudaQwen4GatherKV(const fastllm::Data &key,
                              const fastllm::Data &indices,
                              fastllm::Data &compactKey,
                              fastllm::Data &compactValue);
+// Registered multi-row indexed FP16 attention; causal lengths come from decodeMeta.
+bool FastllmCudaQwen4SparseBatchGraph(const fastllm::Data &query,const fastllm::Data &key,
+        const fastllm::Data &value,const fastllm::Data &indices,fastllm::Data &output,
+        int groups,float scale,const int32_t *decodeMeta);
 // Indexed FP16 single-query attention; decodeMeta supplies the graph replay position.
 bool FastllmCudaQwen4SparseDecode(const fastllm::Data &query, const fastllm::Data &key,
                                  const fastllm::Data &value, const fastllm::Data &indices,
@@ -1660,6 +1686,11 @@ bool FastllmCudaLlamaRotatePosition2D(fastllm::Data &data, const fastllm::Data &
                                  const fastllm::Data &sinData, const fastllm::Data &cosData, int rotaryDim);
 bool FastllmCudaLlamaRotatePosition2DPart(fastllm::Data &data, const fastllm::Data &positionIds,
                                  const fastllm::Data &sinData, const fastllm::Data &cosData, int rotaryDim, int part);
+// Fused contiguous head-wise FP16 RMSNorm + RoPE. Returns false for layouts
+// not covered by this fast path; callers retain the ordinary operators.
+bool FastllmCudaRMSNormRope(fastllm::Data &input, fastllm::Data &weight,
+        const fastllm::Data &positions, float eps, int rotateDim,
+        float theta, float ropeScale, bool preciseFreq = false);
 bool FastllmCudaRopeEncoding(fastllm::Data &data, const fastllm::Data &positionIds, int rotaryDim, float ropeTheta, float ropeScale, bool preciseFreq = false);
 bool FastllmCudaLlama3RopeEncoding(fastllm::Data &data, const fastllm::Data &positionIds, int rotaryDim,
                                    float ropeTheta, float factor, float originalMaxPosition,
@@ -1903,10 +1934,10 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches
 // Explicit opt-in for models whose routing requires FP32 reductions.
 bool FastllmCudaHalfMatMulFloat16Fp32(const void *input, const void *weight, void *output, int n, int m, int k);
 bool FastllmCudaHalfMatMulFloat16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k, bool addTo = false);
-// Runs up to four independent no-bias FP16 linears that share the same one-to-
-// eight-row input. Each output row keeps the native compensated reduction
-// order; only the CUDA launch is shared.
-bool FastllmCudaHalfMultiLinearExact(
+// Runs up to four no-bias FP16 projections sharing a dense input. The registry
+// selects cuBLAS or tiled native reductions for the actual shape; physical tile
+// sizes do not limit logical rows. Off mode retains the original selection.
+bool FastllmCudaHalfMultiLinear(
     const fastllm::Data &input, const fastllm::Data *const *weights,
     fastllm::Data *const *outputs, int count);
 enum FastllmCudaLinearFp16Path {

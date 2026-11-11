@@ -1,4 +1,5 @@
 #include "utils/qwen38_hybrid.h"
+#include <climits>
 //
 // Qwen4-Exp / Qwen3.8-Flash-Next text model.
 //
@@ -27,6 +28,7 @@
 
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
+#include "utils/kernel_registry.h"
 #include "devices/cuda/fastllm-cuda-graph-workspace.h"
 #include "devices/cuda/fastllm-prefill-workspace.h"
 #include "fastllm-cuda-mtp.cuh"
@@ -970,7 +972,7 @@ namespace fastllm {
 #endif
 
 #ifdef USE_CUDA
-    bool Qwen4TryExactCudaMultiLinear(const Data &input, const Data *const *weights,
+    bool Qwen4TryCudaMultiLinear(const Data &input, const Data *const *weights,
                                       Data *const *outputs, int count) {
         if (weights == nullptr || outputs == nullptr ||
             count < 2 || count > 4 ||
@@ -982,8 +984,9 @@ namespace fastllm {
         }
         const int columns = input.dims.back();
         const uint64_t inputCount = input.Count(0);
+        if (inputCount / columns > INT_MAX) return false;
         const int rows = (int)(inputCount / columns);
-        if (rows < 1 || rows > 8 ||
+        if (rows < 1 ||
             inputCount != (uint64_t)rows * columns) {
             return false;
         }
@@ -1012,7 +1015,7 @@ namespace fastllm {
                 return false;
             }
         }
-        return FastllmCudaHalfMultiLinearExact(
+        return FastllmCudaHalfMultiLinear(
             input, weights, outputs, count);
     }
 #endif
@@ -3297,6 +3300,11 @@ namespace fastllm {
             Qwen4PrefillTemporaries({&gatedData, &localNormalized});
             Data &normalized = normalizedCapture != nullptr
                 ? *normalizedCapture : localNormalized;
+            // The residual may be half precision while PLE projections use
+            // float32. Preserve the rounded norm values and keep the gate on
+            // CUDA instead of silently falling back to a host conversion.
+            ToDataType(queryNormed, keyNormed.dataType);
+            ToDataType(value, keyNormed.dataType);
             fastllm::Qwen4PLEGate(
                 keyNormed, queryNormed, value,
                 this->hcCount, gatedData);
@@ -5296,16 +5304,12 @@ namespace fastllm {
         Data &vWeight = this->weight[attention + "v_proj.weight"];
         bool fusedQkvProjections = false;
 #ifdef USE_CUDA
-        // Small decode batches are launch-bound, especially in the MTP
-        // draft/verification path. Join the three independent projection
-        // grids into one launch without concatenating or repacking weights.
-        // Each CTA still owns one output row and therefore keeps the native
-        // compensated reduction and FP16 rounding order. Unsupported shapes,
-        // types and devices retain the ordinary Linear path below.
-        if (input.dims[1] == 1 || qwen4MtpDecodeEquivalentTarget) {
+        // The common registry validates and measures merged native grids and
+        // cuBLAS projections. Off mode preserves the established decode path.
+        if (input.dims[1] == 1 || qwen4MtpDecodeEquivalentTarget || kernels::Enabled()) {
             const Data *weights[] = {&qWeight, &kWeight, &vWeight};
             Data *outputs[] = {&qGate, &key, &value};
-            fusedQkvProjections = Qwen4TryExactCudaMultiLinear(
+            fusedQkvProjections = Qwen4TryCudaMultiLinear(
                 input, weights, outputs, 3);
         }
 #endif
@@ -5329,15 +5333,12 @@ namespace fastllm {
         Data &alphaWeight = this->weight[linear + "in_proj_a.weight"];
         bool fusedInputProjections = false;
 #ifdef USE_CUDA
-        // All four projections consume the same small decode batch. Joining
-        // their output-row grids removes three launches while each CTA keeps
-        // the native GEMV's products, compensated reduction tree and FP16
-        // rounding. Unsupported types/devices retain the ordinary operations.
-        if (input.dims[1] == 1 || qwen4MtpDecodeEquivalentTarget) {
+        // Share the same measured dispatch for GDN, QSA, verifier and draft.
+        if (input.dims[1] == 1 || qwen4MtpDecodeEquivalentTarget || kernels::Enabled()) {
             const Data *weights[] = {
                 &qkvWeight, &zWeight, &betaWeight, &alphaWeight};
             Data *outputs[] = {&qkv, &z, &beta, &alpha};
-            fusedInputProjections = Qwen4TryExactCudaMultiLinear(
+            fusedInputProjections = Qwen4TryCudaMultiLinear(
                 input, weights, outputs, 4);
         }
 #endif
@@ -5351,7 +5352,7 @@ namespace fastllm {
             if (qwen4MtpDecodeEquivalentTarget) {
                 const Data *weights[] = {&betaWeight, &alphaWeight};
                 Data *outputs[] = {&beta, &alpha};
-                fusedGateProjections = Qwen4TryExactCudaMultiLinear(
+                fusedGateProjections = Qwen4TryCudaMultiLinear(
                     input, weights, outputs, 2);
             }
 #endif

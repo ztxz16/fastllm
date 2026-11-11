@@ -482,6 +482,34 @@ struct FastllmCublasState {
 // another operator or graph family may be using.
 static std::map<std::pair<int, bool>, std::unique_ptr<FastllmCublasState>> s_fastllmCublasHandleMap;
 static std::mutex s_fastllmCublasHandleMapMutex;
+static void PrepareFastllmCublasGraphWorkspace(FastllmCublasState *state, int id) {
+    if (state->workspace || !fastllm::GetFastllmEnv().cudaGraph) return;
+    cudaStreamCaptureStatus capture;
+    if (cudaStreamIsCapturing(cudaStreamPerThread, &capture) != cudaSuccess ||
+        capture != cudaStreamCaptureStatusNone) return;
+    // Graphs can be enabled after an eager warmup created this handle.
+    // Bind before capture so cuBLAS emits no allocation nodes in child graphs.
+    static const size_t graphWorkspaceBytes = []() {
+        const char *env = std::getenv("FASTLLM_CUBLAS_GRAPH_WORKSPACE_MB");
+        int workspaceMb = env == nullptr || env[0] == '\0' ?
+            32 : std::max(0, std::min(256, std::atoi(env)));
+        return (size_t)workspaceMb * 1024 * 1024;
+    }();
+    if (graphWorkspaceBytes == 0) return;
+    void *workspace = FastllmCudaDirectMalloc(graphWorkspaceBytes);
+    if (workspace == nullptr) return;
+    const auto stat = cublasSetWorkspace(state->handle, workspace, graphWorkspaceBytes);
+    if (stat == CUBLAS_STATUS_SUCCESS) {
+        state->workspace = workspace;
+    } else {
+        FastllmCudaDirectFree(workspace);
+        std::fprintf(stderr,
+            "Warning: failed to configure the CUDA Graph cuBLAS workspace on device %d "
+            "(state %d); graph callers will use their eager fallback.\n", id, stat);
+        std::fflush(stderr);
+    }
+}
+
 static cublasHandle_t GetFastllmCublasHandle(bool fp32Reduction) {
     int id = -1;
     cudaGetDevice(&id);
@@ -497,6 +525,7 @@ static cublasHandle_t GetFastllmCublasHandle(bool fp32Reduction) {
     }
     std::lock_guard<std::mutex> guard(state->mutex);
     if (state->handle != nullptr) {
+        PrepareFastllmCublasGraphWorkspace(state, id);
         // Every FastLLM CUDA operator uses the per-thread default stream, and
         // the symbolic cudaStreamPerThread handle remains valid when the
         // cublas handle is subsequently used by a persistent worker thread.
@@ -534,34 +563,8 @@ static cublasHandle_t GetFastllmCublasHandle(bool fp32Reduction) {
             return nullptr;
         }
 #endif
-        if (fastllm::GetFastllmEnv().cudaGraph) {
-            static size_t graphWorkspaceBytes = []() {
-                const char *env = std::getenv("FASTLLM_CUBLAS_GRAPH_WORKSPACE_MB");
-                int workspaceMb = env == nullptr || env[0] == '\0' ?
-                    32 : std::max(0, std::min(256, std::atoi(env)));
-                return (size_t)workspaceMb * 1024 * 1024;
-            }();
-            if (graphWorkspaceBytes > 0) {
-                void *workspace = FastllmCudaDirectMalloc(graphWorkspaceBytes);
-                if (workspace != nullptr) {
-                    stat = cublasSetWorkspace(
-                        handler, workspace, graphWorkspaceBytes);
-                    if (stat == CUBLAS_STATUS_SUCCESS) {
-                        state->workspace = workspace;
-                    } else {
-                        FastllmCudaDirectFree(workspace);
-                        std::fprintf(
-                            stderr,
-                            "Warning: failed to configure the CUDA Graph "
-                            "cuBLAS workspace on device %d (state %d); "
-                            "graph callers will use their eager fallback.\n",
-                            id, stat);
-                        std::fflush(stderr);
-                    }
-                }
-            }
-        }
         state->handle = handler;
+        PrepareFastllmCublasGraphWorkspace(state, id);
     }
 
     return handler;
@@ -3413,6 +3416,90 @@ __global__ void FastllmRMSNormKernelInner1(float *input, float *weight, float *o
     for (int i = tail_start + tid; i < channels; i += THREAD_PER_BLOCK) {
         output[i] = input[i] * s * __ldg(&weight[i]);
     }
+}
+
+// Preserve the ordinary FP16 RMSNorm reduction and intermediate rounding,
+// then apply the same RoPE helper without writing the normalized row to DRAM.
+// One CTA owns a complete head; request/sequence counts only affect the grid.
+__global__ void FastllmRMSNormRopeHalfKernel(
+        half *data, const float *weight, const float *positions,
+        int channels, int heads, int sequence, int positionStride,
+        int rotateDim, float eps, float theta, float ropeScale,
+        bool preciseFreq) {
+    __shared__ float warpSums[2];
+    __shared__ float scale;
+    __shared__ half normalized[512];
+    const int tid = threadIdx.x, lane = tid & 31;
+    half *row = data + size_t(blockIdx.x) * channels;
+    const half2 *pairs = reinterpret_cast<const half2 *>(row);
+    float sum = 0;
+    for (int i = tid; i < channels / 2; i += 64) {
+        const float2 v = __half22float2(pairs[i]);
+        sum += v.x * v.x + v.y * v.y;
+    }
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down_sync(0xffffffffu, sum, offset);
+    if (lane == 0) warpSums[tid / 32] = sum;
+    __syncthreads();
+    if (tid < 32) {
+        float value = lane < 2 ? warpSums[lane] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1)
+            value += __shfl_down_sync(0xffffffffu, value, offset);
+        if (lane == 0) scale = rsqrtf(value / channels + eps);
+    }
+    __syncthreads();
+    for (int i = tid; i < channels / 2; i += 64) {
+        const float2 v = __half22float2(pairs[i]);
+        float2 result;
+        result.x = v.x * scale * __ldg(weight + 2 * i);
+        result.y = v.y * scale * __ldg(weight + 2 * i + 1);
+        reinterpret_cast<half2 *>(normalized)[i] = __float22half2_rn(result);
+    }
+    __syncthreads();
+    const int token = blockIdx.x / heads;
+    const int position = int(positions[(token / sequence) * positionStride + token % sequence]);
+    const float scaledPosition = float(position) / ropeScale;
+    for (int j = tid; j < rotateDim / 2; j += 64) {
+        const float angle = preciseFreq
+            ? FastllmPreciseRopeAngle(scaledPosition, j, rotateDim, theta)
+            : scaledPosition / powf(theta, float(2 * j) / rotateDim);
+        FastllmRopePair(normalized[j], normalized[j + rotateDim / 2],
+            cosf(angle), sinf(angle), row[j], row[j + rotateDim / 2]);
+    }
+    for (int j = rotateDim + tid; j < channels; j += 64)
+        row[j] = normalized[j];
+}
+
+bool FastllmCudaRMSNormRope(fastllm::Data &input, fastllm::Data &weight,
+        const fastllm::Data &positions, float eps, int rotateDim,
+        float theta, float ropeScale, bool preciseFreq) {
+    using namespace fastllm;
+    if (input.dims.size() != 4 || input.dataType != DataType::FLOAT16 ||
+        weight.dataType != DataType::FLOAT32 || positions.dataType != DataType::FLOAT32 ||
+        positions.dims.size() != 2 || input.dims.back() >= 512 ||
+        (input.dims.back() & 1) || input.dims.back() < 2 ||
+        rotateDim <= 0 || (rotateDim & 1) || rotateDim > input.dims.back() ||
+        positions.dims[0] < input.dims[0] || positions.dims[1] < input.dims[1] ||
+        weight.Count(0) != input.dims.back()) return false;
+    const Data *operands[] = {&input, &weight, &positions};
+    for (const Data *v : operands) {
+        if (v->dataDevice != DataDevice::CUDA || !v->cudaData ||
+            v->multiDeviceData || v->dataDeviceIds != input.dataDeviceIds ||
+            v->strides.size() != v->dims.size()) return false;
+        uint64_t stride = 1;
+        for (int i = int(v->dims.size()) - 1; i >= 0; --i) {
+            if (v->dims[i] <= 0 || v->strides[i] != stride) return false;
+            stride *= v->dims[i];
+        }
+    }
+    if (reinterpret_cast<uintptr_t>(input.cudaData) % alignof(half2)) return false;
+    const uint64_t rows = input.Count(0) / input.dims.back();
+    if (rows > 2147483647u) return false;
+    FastllmRMSNormRopeHalfKernel<<<rows, 64>>>(
+        (half *)input.cudaData, (const float *)weight.cudaData,
+        (const float *)positions.cudaData, input.dims[3], input.dims[2],
+        input.dims[1], positions.dims[1], rotateDim, eps, theta, ropeScale, preciseFreq);
+    return true;
 }
 
 template <int THREAD_PER_BLOCK>
@@ -25431,6 +25518,9 @@ extern "C" bool FastllmCudaGraphCompose(const void *const *children, int count,
     if (result != cudaSuccess) {
         if (exec) cudaGraphExecDestroy(exec);
         if (graph) cudaGraphDestroy(graph);
+        // Composition is optional. Consume its CUDA error before the caller
+        // resumes ordinary kernels, which check the thread's last error.
+        cudaGetLastError();
         return false;
     }
     *outGraph = graph;

@@ -19,6 +19,17 @@ namespace fastllm {
     void FastllmCudaMergeMOEClearGraphUnsafeFallbackFlag();
     bool FastllmCudaMergeMOEUsedGraphUnsafeFallback();
 #endif
+#ifdef USE_CUDA
+    static void Qwen4GraphRMSNormRope(Data &input, Data &weight,
+            const Data &positions, float eps, int rotateDim, float theta) {
+        weight.ToDevice(DataDevice::CUDA, input.dataDeviceIds);
+        if (!FastllmCudaRMSNormRope(input, weight, positions,
+                eps, rotateDim, theta, 1.0f, true)) {
+            RMSNorm(input, weight, eps, input);
+            RopeEncoding(input, positions, rotateDim, theta, 1.0f, true);
+        }
+    }
+#endif
     void Qwen4ExpModel::DecodeCudaGraphState::DestroyGraphs() {
 #ifdef USE_CUDA
         const int previousDevice = FastllmCudaGetDevice();
@@ -118,13 +129,15 @@ namespace fastllm {
             Data &pastKey, Data &pastValue, RequestState &requestState,
             DecodeCudaGraphState *graphState, int device, int wholeGraphSparseWidth,
             bool wholeDenseGraph, bool mtpTargetGraph,
-            TargetVerificationCapture *verificationCapture, Data &output) {
+            TargetVerificationCapture *verificationCapture, Data &output,
+            const FullAttentionProjections *projections, Data *outputProjectionInput) {
         const std::string indexer = attention + "indexer.";
         constexpr int batch = 1;
         const int sequence = input.dims[1];
         const int ratio = this->indexerCompressRatio;
         const int32_t *decodeMeta =
             reinterpret_cast<const int32_t *>(graphState->decodeMeta.cudaData);
+        const int32_t *validRows = graphState->decodeMeta.Count(0) > 1 ? decodeMeta + 1 : nullptr;
 
         auto tailKeysIt = requestState.indexerTailKeyTensors.find(layer);
         auto tailPositionsIt = requestState.indexerTailPositionTensors.find(layer);
@@ -160,10 +173,8 @@ namespace fastllm {
               queryColumns + this->indexerKvHeads * this->indexerHeadDim, currentRawKeys);
         indexQuery.Reshape({batch, sequence, this->indexerHeads, this->indexerHeadDim});
         currentRawKeys.Reshape({batch, sequence, this->indexerHeadDim});
-        RMSNorm(indexQuery, this->weight[indexer + "q_layernorm.weight"], this->rms_norm_eps,
-                indexQuery);
-        RopeEncoding(indexQuery, graphState->positionIds, this->rotary_dim, this->rope_base,
-                     1.0f, true);
+        Qwen4GraphRMSNormRope(indexQuery, this->weight[indexer + "q_layernorm.weight"],
+            graphState->positionIds, this->rms_norm_eps, this->rotary_dim, this->rope_base);
 
         Data currentKeysFloat;
         ToDataType(currentRawKeys, currentKeysFloat, DataType::FLOAT32);
@@ -197,10 +208,10 @@ namespace fastllm {
             // Short draft warmup may not have completed its first QSA group;
             // eager attention has therefore never uploaded this norm yet.
             this->weight[indexer + "k_layernorm.weight"].ToDevice(CUDA, std::vector<int>{device});
-            const bool compressed = FastllmCudaQwen4QSAAppendCompress4Graph(
+            const bool compressed = FastllmCudaQwen4QSAAppendCompress4RaggedGraph(
                 currentKeysFloat, graphState->positionIds,
                 this->weight[indexer + "k_layernorm.weight"], this->rope_base, decodeMeta,
-                tailKeys, tailPositions, blockCache, this->rms_norm_eps);
+                tailKeys, tailPositions, blockCache, this->rms_norm_eps, validRows);
             if (!compressed) {
                 return false;
             }
@@ -219,8 +230,8 @@ namespace fastllm {
                 Split(graphState->positionIds, 1, token, token + 1, tokenPosition);
                 tokenKey.Reshape({1, this->indexerHeadDim});
                 tokenPosition.Reshape({1});
-                if (!FastllmCudaQwen4QSAAppendGraph(tokenKey, tokenPosition, decodeMeta, token,
-                                                    ratio, tailKeys, tailPositions)) {
+                if (!FastllmCudaQwen4QSAAppendRaggedGraph(tokenKey, tokenPosition, decodeMeta, token,
+                                                    ratio, tailKeys, tailPositions, validRows)) {
                     return false;
                 }
                 // Preserve the established float32 pooling/RMSNorm/RoPE
@@ -246,8 +257,8 @@ namespace fastllm {
                 RopeEncoding(normalized, firstPosition, this->rotary_dim, this->rope_base, 1.0f,
                              true);
                 normalized.Reshape({1, this->indexerHeadDim});
-                if (!FastllmCudaQwen4QSACommitGraph(normalized, decodeMeta, token, ratio,
-                                                    blockCache)) {
+                if (!FastllmCudaQwen4QSACommitRaggedGraph(normalized, decodeMeta, token, ratio,
+                                                    blockCache, validRows)) {
                     return false;
                 }
             }
@@ -276,17 +287,11 @@ namespace fastllm {
         }
 
         Data qGate, query, key, value, gate;
-        const Data *projectionWeights[] = {&this->weight[attention + "q_proj.weight"],
-                                           &this->weight[attention + "k_proj.weight"],
-                                           &this->weight[attention + "v_proj.weight"]};
-        Data *projectionOutputs[] = {&qGate, &key, &value};
-        const bool fusedProjections =
-            (sequence == 1 || qwen4MtpDecodeEquivalentTarget) &&
-            Qwen4TryExactCudaMultiLinear(typedInput, projectionWeights, projectionOutputs, 3);
-        if (!fusedProjections) {
-            Linear(typedInput, this->weight[attention + "q_proj.weight"], Data(), qGate);
-            Linear(typedInput, this->weight[attention + "k_proj.weight"], Data(), key);
-            Linear(typedInput, this->weight[attention + "v_proj.weight"], Data(), value);
+        if (projections) {
+            qGate.CopyFrom(*projections->queryGate); key.CopyFrom(*projections->key); value.CopyFrom(*projections->value);
+        } else {
+            FullAttentionProjections prepared{&qGate, &key, &value};
+            ProjectFullAttention(attention, typedInput, prepared);
         }
         qGate.Reshape({batch, sequence, -1, this->head_dim * 2});
         Split(qGate, -1, 0, this->head_dim, query);
@@ -294,12 +299,10 @@ namespace fastllm {
         gate.Reshape({batch, sequence, -1});
         key.Reshape({batch, sequence, -1, this->head_dim});
         value.Reshape({batch, sequence, -1, this->head_dim});
-        RMSNorm(query, this->weight[attention + "q_norm.weight"], this->rms_norm_eps, query);
-        RMSNorm(key, this->weight[attention + "k_norm.weight"], this->rms_norm_eps, key);
-        RopeEncoding(query, graphState->positionIds, this->rotary_dim, this->rope_base, 1.0f,
-                     true);
-        RopeEncoding(key, graphState->positionIds, this->rotary_dim, this->rope_base, 1.0f,
-                     true);
+        Qwen4GraphRMSNormRope(query, this->weight[attention + "q_norm.weight"],
+            graphState->positionIds, this->rms_norm_eps, this->rotary_dim, this->rope_base);
+        Qwen4GraphRMSNormRope(key, this->weight[attention + "k_norm.weight"],
+            graphState->positionIds, this->rms_norm_eps, this->rotary_dim, this->rope_base);
         PermuteSelf(query, {0, 2, 1, 3});
         PermuteSelf(key, {0, 2, 1, 3});
         PermuteSelf(value, {0, 2, 1, 3});
@@ -316,26 +319,15 @@ namespace fastllm {
         Data context;
         const int attentionGroup = query.dims[0] / pastKey.dims[0];
         const float attentionScale = 1.0f / std::sqrt((float)this->head_dim);
-        const bool sparseDecode =
-            sequence == 1 && !wholeDenseGraph &&
-            FastllmCudaQwen4SparseDecode(query, pastKey, pastValue, qsaIndices, context,
-                                         attentionGroup, attentionScale, decodeMeta);
-        if (!sparseDecode && sequence == 1 && !wholeDenseGraph) {
-            Data compactKey(key.dataType,
-                            {pastKey.dims[0], wholeGraphSparseWidth, this->head_dim});
-            Data compactValue(value.dataType,
-                              {pastValue.dims[0], wholeGraphSparseWidth, this->head_dim});
-            compactKey.ToDevice(DataDevice::CUDA, std::vector<int>({device}));
-            compactValue.ToDevice(DataDevice::CUDA, std::vector<int>({device}));
-            compactKey.Allocate(false);
-            compactValue.Allocate(false);
-            if (!FastllmCudaQwen4GatherKVGraph(pastKey, pastValue, qsaIndices, decodeMeta,
-                                               compactKey, compactValue)) {
-                return false;
-            }
-            Attention(query, compactKey, compactValue, Data(), context, attentionGroup,
-                      attentionScale, 1);
-        } else if (!sparseDecode) {
+        const bool sparseDecode = !wholeDenseGraph && (sequence == 1
+            ? FastllmCudaQwen4SparseDecode(query, pastKey, pastValue, qsaIndices, context,
+                                          attentionGroup, attentionScale, decodeMeta)
+            : FastllmCudaQwen4SparseBatchGraph(query, pastKey, pastValue, qsaIndices, context,
+                                              attentionGroup, attentionScale, decodeMeta));
+        if (!sparseDecode) {
+            // Fixed-width sparse selections include invalid padding even for
+            // one row. Mask it on every fallback; zero K/V values alone still
+            // change the softmax denominator when the fused kernel is absent.
             const int queryHeads = query.dims[0];
             const int keyHeads = pastKey.dims[0];
             Data packedQuery(query.dataType, {sequence * queryHeads, 1, this->head_dim});
@@ -372,6 +364,10 @@ namespace fastllm {
             context.Reshape({sequence, batch, -1});
             PermuteSelf(context, {1, 0, 2});
             SigmoidMulTo(context, gate);
+        }
+        if (outputProjectionInput) {
+            outputProjectionInput->CopyFrom(fusedOutput ? gatedContext : context);
+            return true;
         }
         Linear(fusedOutput ? gatedContext : context, this->weight[attention + "o_proj.weight"],
                Data(), output);

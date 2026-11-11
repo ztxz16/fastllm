@@ -173,7 +173,17 @@ namespace fastllm {
                 std::vector<std::vector<float> *> *logits,
                 const Data *precomputedEmbedding = nullptr);
 
+        struct ForwardState;
+        struct BatchedRequest;
+        struct BatchGraph;
         struct RequestBatchState;
+#ifdef USE_CUDA
+        bool PrepareBatchGraph(std::shared_ptr<BatchGraph> &graph,
+            const std::vector<ForwardState*> &frames,
+            const std::vector<BatchedRequest*> &drafts, const std::vector<Data*> &hidden);
+        void FinishBatchGraph(BatchGraph &graph, const std::vector<ForwardState*> &frames,
+                              const std::vector<BatchedRequest*> &drafts);
+#endif
         struct RequestState {
             std::shared_ptr<RequestBatchState> batchState;
             // Non-owning scheduler cache vector; its lifetime spans Forward.
@@ -578,7 +588,8 @@ namespace fastllm {
         bool RunFullAttentionGraph(int layer, const std::string &attention, const Data &input,
             Data &pastKey, Data &pastValue, RequestState &requestState,
             DecodeCudaGraphState *graphState, int device, int sparseWidth, bool dense,
-            bool verification, TargetVerificationCapture *capture, Data &output);
+            bool verification, TargetVerificationCapture *capture, Data &output,
+            const FullAttentionProjections *projections = nullptr, Data *outputProjectionInput = nullptr);
 #endif
         void RunFullAttentionWithPrefix(
                               int stateLayer,
@@ -701,8 +712,6 @@ namespace fastllm {
             RequestState &state,
             const TargetRuntimeCheckpoint &checkpoint,
             TargetVerificationCapture &capture);
-        struct ForwardState;
-        struct BatchedRequest;
         std::vector<std::vector<int>> ForwardTargetBatch(const std::vector<ForwardState*> &frames);
         std::vector<int> RunMtpDraftBatch(const std::vector<BatchedRequest*> &requests,
                                         const std::vector<Data*> &hidden,

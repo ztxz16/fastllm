@@ -27,8 +27,6 @@ namespace fastllm {
     void Qwen4BorrowCudaStorage(Data &destination, const Data &source);
     bool Qwen4BorrowCudaTensor(const Data &source, Data &destination, bool linear,
                                bool sharePages = true);
-    bool Qwen4TryExactCudaMultiLinear(const Data &input, const Data *const *weights,
-                                      Data *const *outputs, int count);
 #endif
     // Forward orchestration depends on this interface, not on graph/KV internals.
     struct Qwen4ExpModel::ForwardState {
