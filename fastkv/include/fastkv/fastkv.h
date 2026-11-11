@@ -61,6 +61,9 @@ class Buffer {
     static Buffer Allocate(size_t bytes, int cudaDevice = -1);
     static Buffer Borrow(void *data, size_t bytes, MemoryKind kind, int device, std::shared_ptr<void> owner);
     Buffer Slice(size_t offset, size_t count) const;
+    // Retain a logical page reservation without changing allocation identity
+    // or its cached memory registrations.
+    Buffer WithLease(std::shared_ptr<void> owner) const;
     const void *Data() const;
     void *MutableData() const;
     Buffer ReadOnly() const;
@@ -110,6 +113,15 @@ struct Message {
     Bytes metadata;
     std::vector<Buffer> buffers;
 };
+
+// Optional reply placement into caller-reserved storage. Each outer entry
+// corresponds to one wire buffer; its ordered spans must cover exactly that
+// buffer. Spans own leases and must be private until the returned future is
+// ready. The callback validates metadata, but must not publish live state.
+// The reply contains these spans flattened in wire order (not compact tensors).
+// Both transports retain the leases through completion or QP teardown.
+using ReceiveTarget = std::function<std::vector<std::vector<Buffer>>(
+    const Bytes &, const std::vector<size_t> &)>;
 
 // Cancellation is cooperative: GPU work finishes its current step, and
 // transport buffers remain pinned until I/O has stopped and QPs are retired.
@@ -190,7 +202,8 @@ class Service {
     // lifetime retains caller admission/resources through transfer teardown,
     // even if the caller drops its future. Cancel explicitly before dropping.
     bool TrySubmit(const std::string &peer, Message &request, std::future<Message> &result,
-                   std::shared_ptr<Cancellation> cancellation = {}, std::shared_ptr<void> lifetime = {});
+                   std::shared_ptr<Cancellation> cancellation = {}, std::shared_ptr<void> lifetime = {},
+                   ReceiveTarget target = {});
     Metrics Stats() const;
     static bool HasRdma();
     static bool HasCuda();

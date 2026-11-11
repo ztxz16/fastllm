@@ -6388,6 +6388,48 @@ bool FastllmCudaMemcpy2DDeviceToDeviceAsyncCurrentThread(
 }
 
 namespace {
+struct BatchCopy2DParams {
+    const uint8_t *src[64];
+    uint8_t *dst[64];
+    size_t srcPitch[64], dstPitch[64], width[64], height[64];
+};
+__global__ void BatchCopy2DKernel(BatchCopy2DParams p) {
+    const int i = blockIdx.x / 8;
+    const size_t start = size_t(blockIdx.x % 8) * blockDim.x + threadIdx.x;
+    const bool vectorized = ((uintptr_t(p.src[i]) | uintptr_t(p.dst[i]) |
+                              p.srcPitch[i] | p.dstPitch[i] | p.width[i]) & 15) == 0;
+    const size_t unit = vectorized ? 16 : 1, columns = p.width[i] / unit;
+    for (size_t at = start; at < columns * p.height[i]; at += 8 * blockDim.x) {
+        const size_t row = at / columns, column = at % columns;
+        const auto *src = p.src[i] + row * p.srcPitch[i] + column * unit;
+        auto *dst = p.dst[i] + row * p.dstPitch[i] + column * unit;
+        if (vectorized) *reinterpret_cast<uint4 *>(dst) = *reinterpret_cast<const uint4 *>(src);
+        else *dst = *src;
+    }
+}
+}
+bool FastllmCudaBatchCopy2DAsyncCurrentThread(
+        void *const *dsts, const void *const *srcs, const size_t *dstPitch,
+        const size_t *srcPitch, const size_t *widths, const size_t *heights, int count) {
+    if (count < 0 || (count && (!dsts || !srcs || !dstPitch || !srcPitch || !widths || !heights))) return false;
+    for (int begin = 0; begin < count; begin += 64) {
+        BatchCopy2DParams p{};
+        const int n = std::min(64, count - begin);
+        for (int j = 0; j < n; ++j) {
+            const int i = begin + j;
+            if (!srcs[i] || !dsts[i] || !widths[i] || widths[i] > srcPitch[i] || widths[i] > dstPitch[i] ||
+                heights[i] > SIZE_MAX / widths[i]) return false;
+            p.src[j] = static_cast<const uint8_t *>(srcs[i]); p.dst[j] = static_cast<uint8_t *>(dsts[i]);
+            p.srcPitch[j] = srcPitch[i]; p.dstPitch[j] = dstPitch[i];
+            p.width[j] = widths[i]; p.height[j] = heights[i];
+        }
+        BatchCopy2DKernel<<<n * 8, 256, 0, cudaStreamPerThread>>>(p);
+        if (cudaGetLastError() != cudaSuccess) return false;
+    }
+    return true;
+}
+
+namespace {
     constexpr int FASTLLM_CUDA_BATCH_COPY_MAX_SEGMENTS = 128;
     constexpr int FASTLLM_CUDA_BATCH_COPY_BLOCKS_PER_SEGMENT = 8;
 

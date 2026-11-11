@@ -81,7 +81,7 @@ flowchart LR
 
 命名空间由调用者给出，应覆盖 checkpoint、adapter 布局以及租户/媒体等隔离身份。同一命名空间和完整 token 序列只发布一次；调用者改变计算语义时必须换命名空间。内容哈希仅用于筛选候选：token 完整比较决定前缀命中，payload 完整字节比较决定数据块共享。物理 64 KiB 数据块不是模型的 KV token 页，也不代表能在该处恢复循环或压缩状态。
 
-调用者负责在借用 GPU buffer 前完成生产者的写入，并提供真实的生命周期 owner。`Read`、`Write`、`CopyFrom` 是同步接口。网络接收使用私有 staging；传输完成且可见后才交付给调用者。向模型的提交和 GPU graph 的执行由模型拥有者负责。
+调用者负责在借用 GPU buffer 前完成生产者的写入，并提供真实的生命周期 owner。`Read`、`Write`、`CopyFrom` 是同步接口。网络接收使用私有 staging 或调用方预留的目标区；传输完成且可见后才交付给调用者。向模型的提交和 GPU graph 的执行由模型拥有者负责。
 
 RDMA 使用 RC QP。Host 数据跨配置的 NIC 分条发送；GPU 数据优先使用 PCIe 路径最近的 NIC，拓扑不可见时使用全部配置的 NIC。不同 buffer 按块交错投递，避免一个 GPU 的大 tensor 阻塞其他 GPU/NIC。注册缓存挂在 allocation lease 上；QP/CQ 先销毁，随后释放在途 buffer 和 MR。协议先交换长度并预留接收额度，再传 payload，最后确认完成。请求失败不会将部分 buffer 发布为可用状态。
 
@@ -108,7 +108,7 @@ RDMA 使用 RC QP。Host 数据跨配置的 NIC 分条发送；GPU 数据优先�
 ## 生命周期与背压
 
 1. 发送方完成 producer 写入，构造持有 allocation lease 的 `Message`。模型页池仍归模型管理，不能把即将复用的地址当成有效 owner。
-2. 接收方校验协议长度并预留 `Budget`，分配私有 staging，只有完整接收后才返回消息。handler 失败或传输异常返回错误，不发布半成品。
+2. 接收方校验协议长度并预留 `Budget`，取得私有 staging 或带租约的目标区，只有完整接收后才返回消息。handler 失败或传输异常返回错误，不发布半成品。
 3. RDMA 注册与 allocation ID 绑定；完成事件和可见性检查结束后，使用者才可读取数据。TCP 的 CUDA buffer 通过主存分块传输。
 4. 模型 adapter 校验 checkpoint、布局和状态边界，再由拥有者线程恢复本地状态。该阶段属于调用者，不由网络工作池执行 GPU 图或修改请求页表。
 5. 缓存发布复制为不可变内容。读取 lease 保证淘汰或缓存析构不会让仍在使用的数据失效；最后一个 owner 释放后归还预算和内存。
@@ -131,3 +131,11 @@ RDMA 使用 RC QP。Host 数据跨配置的 NIC 分条发送；GPU 数据优先�
 新增传输后端应复用长度校验、预算和 buffer 生命周期规则，再接入握手协商与数据发送/接收，不在模型代码中分支实现 socket 或 RDMA。异构 P/D 先由 adapter 明确定义可交换的表示，再用 `PlanCopies` 计算分片交集；目前模型交接路径使用各自 adapter 的恢复逻辑，尚未把所有模型自动接到通用 reshard 执行器。多个 P 配多个 D 已可配置，多机 wide-EP D 仍需计算层提供分布式执行组，组件本身不启动或编排 collective rank。
 
 FastLLM 的模型接入、部署与目前的模型限制见 [PD 部署文档](../docs/fastkv_pd.md)。
+
+### 接收端预留目标
+
+`Service::TrySubmit` 的可选 `ReceiveTarget` 回调按回复元数据和逻辑 buffer 长度返回目标：每个逻辑 buffer 对应一组有序 `Buffer` span。span 长度之和必须精确等于源长度；接收端在确认接收前校验数量、长度及可写性。调用方负责保留互不重叠的私有区域，不能让模型同时访问它们。
+
+TCP 和 RDMA 共用此接口。接收确认携带 span 长度，发送端据此切分原 buffer 的视图，注册复用仍按底层 allocation 进行；不因页分散而复制源数据。默认不传回调时保留原有 arena 接收方式。分段接收要求两端均支持该接口。
+
+定向接收返回的 `Message.buffers` 是目标 spans 按逻辑 buffer 顺序展开的列表，不再是一块 buffer 对应一个完整 tensor。应用应由自己预留目标的对象负责提交，不能直接将其交给要求 compact tensor 的解码器。`Buffer::WithLease` 可在不改变 allocation ID/MR 的情况下增加页预留租约。租约覆盖 I/O、QP teardown 及返回结果的生命周期；回调不发布活动页表，应用只在 future 成功后提交。

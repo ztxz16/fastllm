@@ -408,8 +408,9 @@ static void TestLoadAwareRouting() {
     StateModel decode;
     decode.ConfigurePD(json11::Json::object{{"role","decode"},{"model_id","routing"},
         {"transport","tcp"},{"prefill",json11::Json::array{a,b}}});
-    auto run = [&] {
+    auto run = [&](const std::string &session = std::string()) {
         ResponseContext context; context.Init(1,FLOAT32,FLOAT32);
+        context.requestMetadata.sessionKey = session;
         context.currentTokens = context.allTokens = {3,4,5}; context.inputTokens = 3;
         context.generationConfig.output_token_limit = 1;
         decode.BeginPD(&context);
@@ -418,7 +419,7 @@ static void TestLoadAwareRouting() {
         Check(!context.isEnding && context.preTokens == 2, "routing stranded a request");
         Check(((float *)context.pastKeyValues[0].first.cpuData)[0] == 11, "routing changed KV state");
     };
-    run();
+    run("queued-3");
     Check(p1.forwards == 0 && p1.batches == 0, "routing ignored P0 resident cache");
     p0.hold = true;
     auto first = submit(a, std::vector<int>(2048, 11)), second = submit(a, std::vector<int>(2048, 21));
@@ -428,9 +429,13 @@ static void TestLoadAwareRouting() {
     try { run(); } catch (...) { p0.hold = false; throw; }
     Check(p1.forwards + p1.batches > 0, "warm affinity blocked behind saturated P0");
     p0.hold = false; (void)first.get(); (void)second.get();
+    p0.StopPD();
+    // The old owner is unreachable. The live peer may satisfy this entirely
+    // from its prefix cache, so require correct completion, not extra forward.
+    run("queued-3");
     decode.StopPD(); p0.StopPD(); p1.StopPD();
     Check(p0.live == 0 && p1.live == 0, "routing leaked producer contexts");
-    std::cout << "PASS PD live-prefix routing, saturated producer bypass and cross-peer state correctness\n";
+    std::cout << "PASS PD live-prefix routing, saturated/dead producer bypass and cross-peer state correctness\n";
 }
 
 static void TestGPUState() {

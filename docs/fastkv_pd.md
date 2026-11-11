@@ -1,6 +1,6 @@
 # Fast KV Manager 与 PD 部署
 
-`ftllm router` 管理 P/D 执行组与 HTTP 入口。每个执行组运行一个 `ftllm serve` 进程，可以使用模型已经支持的 TP、attention DP、EP 拓扑；每张 GPU 的模型计算仍由原有持久工作线程负责。网络线程只管理独立 staging buffer，不操作活动请求的页表或 CUDA graph。
+`ftllm router` 管理 P/D 执行组与 HTTP 入口。每个执行组运行一个 `ftllm serve` 进程，可以使用模型已经支持的 TP、attention DP、EP 拓扑；每张 GPU 的模型计算仍由原有持久工作线程负责。网络线程只写独立 staging buffer 或接收端预留且尚未发布的页，不操作活动请求的页表或 CUDA graph。
 
 ```mermaid
 sequenceDiagram
@@ -105,13 +105,37 @@ DeepSeek V4.1 的 adapter 交接窗口、压缩 KV、indexer、未完成的压�
 
 Attention DP 模式在导入阶段分配请求归属，由对应 GPU 的持久线程恢复本地 KV；导入完成不会推进 token 位置。请求进入 decode 批次前已经具备整图需要的窗口和压缩状态，不需要先执行一次逐层前向。大于 8 行的不规则普通 decode 批次可以匹配已预热的更大整图：按各 attention group 的行数补齐，补齐行只使用预热时保留的私有 KV，执行后回退其元数据，不推进真实请求。没有适用图时仍保留普通前向回退。分组同时考虑 KV 长度与请求数，避免短请求集中后超过已预热图的行容量；本地前缀恢复复用相同的准备路径。
 
-Naive N0.5 的 adapter 交接各 TP rank 的逻辑 KV、完整注意力的分页内容和滑窗的时间顺序。远端页号不会直接用作本地页号。普通 GPU 分页池支持 BF16、FP8 和 FP4 KV，以及 replicated/layer_shard Indexer；FP4 的独立 FP8 Indexer 随主 KV 一起传输，payload 和 scale 均按原字节恢复，不重新量化。FP4 使用 v2 布局，BF16/FP8 保持 v1。
+Naive N0.5 的 adapter 交接各 TP rank 的逻辑 KV、完整注意力的分页内容和滑窗的时间顺序。远端页号不会直接用作本地页号。支持 BF16、FP8 和 FP4 KV，以及 replicated/layer_shard Indexer；FP4 的独立 FP8 Indexer 随主 KV 一起传输，payload 和 scale 均按原字节恢复，不重新量化。TP 交接统一使用 v3 布局。
 
-Naive 部署使用 [Naive 模板](../example/pd/naive_n05.json)，两端保持一致的 TP、激活、KV dtype 和 Indexer 配置。使用 FP4 时，两端将 `--kv_cache_dtype` 设为 `fp4`，保持 BF16 计算、TP >= 2、关闭 draft，且不设置 `--kvmem`。当前稀疏/offload KV、Indexer context sharding 和 draft TP 会明确拒绝；P/D 的不同 TP 或缓存布局也不能直接交接。这里的稀疏 KV 指 KVMem/offload 存储后端，不是模型原有的 DSA 稀疏注意力。
+Naive 部署使用 [Naive 模板](../example/pd/naive_n05.json)，两端保持一致的 TP、激活、KV dtype 和 Indexer 配置。使用 FP4 时，两端将 `--kv_cache_dtype` 设为 `fp4`，保持 BF16 计算、TP >= 2、关闭 draft。Naive 支持 P 使用普通 GPU KV、D 使用 KVMem 的异构存储部署。Indexer context sharding、P 端 KVMem、KVMem 与 PD draft 同时启用，以及 P/D 不同 TP 或 KV 精度仍明确拒绝。
+
+### Naive：GPU prefill → KVMem decode
+
+P 保持原来的纯 GPU 参数；仅在 D 的 `command` 中增加 `--kvmem`，并在它之前设置 `--max_batch`。例如：
+
+```sh
+--tp 4 --ep 4 --max_batch 256 --tokens 16777216 \
+--atype bfloat16 --kv_cache_dtype fp8_e4m3 \
+--indexer_dtype fp8 --indexer_tp_storage layer_shard --dspark 0 \
+--max_context_length 200000 \
+--kvmem '{"max_tokens":200000,"resident_tokens":4096,"prefill_tokens":4096,"host_mib":196608}'
+```
+
+此处容量只是配置示例，启动时仍按实际模型检查主存、完整 GPU Indexer、热 KV、SWA 和工作区预算。`--tokens` 是共享物理 token 池，`max_tokens` 是每请求长度上限；二者独立。D 的 `max_inflight` 应与所需请求上限一致。两端保持同一模型、TP、KV dtype 和 Indexer 配置，D 的 KVMem 只改变存储位置，不改变 DSA TopK 或量化字节。
+
+状态按原字节导入，但 KVMem 与普通 GPU 分页使用各自的注意力执行路径，不承诺两种后端的逐 token 贪婪输出一致。导入正确性需要与同一 KVMem 后端直接构建的状态对照，跨后端的数值一致性另行评估。
+
+Naive TP 使用 v3 状态表示，将主 KV、Indexer 和 SWA 分开传输。两端需使用支持 v3 的版本；旧版本因布局标识不一致而拒绝交接。纯 GPU → 纯 GPU 仍使用原 GPU 页池，导入时重建其本地 packed K/Indexer 布局。
+
+D 在模型调度线程中预留私有主存页及对应 Indexer 页，随后发起 P 请求。RDMA 将完整 DSA K/V 直接写入 KVMem 的 pinned 主存页、Indexer 直接写入 GPU 页；TCP 沿用相同目标描述，但 GPU 数据需要 TCP 的主机中转。SWA 接收到有界 GPU 暂存，提交时复制到请求的环形窗口。完整主 KV 不在 D 建立 GPU 中转副本，也不复制 P 的热缓存；D 按原有 TopK 精确装入自己的热 KV。
+
+网络完成后，模型线程绑定请求槽、重置热缓存映射、发布固定地址页表并恢复 SWA，全部完成才允许 decode。传输和返回结果持有页租约；错误或取消必须等 I/O 完成或 QP 销毁后才能归还页。容量不足时排队，不提前回收在途页。P 的 GPU 前缀缓存和 FastKV L2 继续使用已有机制，D 的活动 KVMem 主存池与 P 的 L2 是不同预算。
+
+回归入口：`naive_n05_pd_*` 和 `naive_n05_pd_kvmem_*`；后者覆盖 BF16/FP8/FP4、两种 Indexer 存储、页边界、超过热缓存长度的历史及导入后的 eager/Graph 解码。独立传输测试 `fastkv_receive_target_test [--rdma [GPU]]` 检查分段写入、Host/CUDA 落点、非法描述拒绝和租约回收。
 
 当前部署路径支持文本请求。多模态 PD 需要继续补充媒体身份与状态 adapter，目前明确拒绝，不能通过仅传 token 冒充多模态交接。DeepSeek 可开启 DSpark 5。当前只有单请求路径执行草稿和验证；多请求批次先排出已接受 token，随后使用普通 target decode，丢弃不能继续使用的草稿状态。请求回到单请求路径后从当前 target 边界重建草稿窗口。P 的中间 prefill 不生成候选；P/D 的 DSpark 开关需要保持一致。Naive 的 draft TP 暂不支持，使用 `--dspark 0`。
 
-GPU 状态在协议中携带逻辑 rank，由接收方映射到本地 GPU；网络线程只写私有 GPU staging，完成 RDMA 可见性处理后交给模型拥有者。Naive 在拥有者 stream 上批量整理/恢复页和滑窗，避免逐页 CUDA API 调用以及额外的导入副本。小 buffer 合并到有界 arena，复用内存、MR 和连接。RDMA 默认路径不经主存 KV；TCP 兼容路径仍经主存分块搬运。当前仍有 GPU gather/scatter、完整状态传输和导入结束同步，不是最终页池地址直传，也不是增量交接。
+GPU 状态在协议中携带逻辑 rank，由接收方映射到本地 GPU；网络线程只写私有 staging 或接收端预留的目标区，完成 RDMA 可见性处理后交给模型拥有者。Naive 在拥有者 stream 上批量整理/恢复页和滑窗，避免逐页 CUDA API 调用以及额外的导入副本。小 buffer 合并到有界 arena，复用内存、MR 和连接。纯 GPU 的 RDMA 路径不经主存 KV；KVMem 定向接收按上述规则直达预留页，TCP 兼容路径仍经主存分块搬运。普通 GPU 接收仍需从 staging 恢复到本地页池；当前各路径仍有状态整理、完整状态传输和导入结束同步，尚不支持增量交接。
 
 新增模型需要实现 `PDLayout`、`ExportPDState`、`ImportPDState`；多 GPU adapter 用 `PDDevices` 声明逻辑 rank 的设备顺序。可选的 `HasPDResidentPrefixCache` 只应用于确实支持 GPU 常驻恢复的模型，未实现时使用通用检查点缓存。接入测试应覆盖全量交接、前缀续接、页边界、并发、取消和错误布局测试。逻辑分片规划独立于通信后端；未来多机 wide-EP 的进程组与 collective 属于计算层，需要单独接入，不能仅靠增加 router 的 D 节点来替代。
 

@@ -173,7 +173,7 @@ void NaiveN05FlashModel::InitSparseKv() {
             sc.keyRowBytes = GetDataBytes(kvCacheDataType, 1, heads * cfg.headDim);
             sc.valueRowBytes = GetDataBytes(kvCacheDataType, 1, heads * cfg.valueDim);
             sc.hostBudgetBytes = size_t(tokensLimit) * (sc.keyRowBytes + sc.valueRowBytes);
-            r->layers[layer] = std::make_unique<KvMemSparseCache>(sc);
+            r->layers[layer] = std::make_shared<KvMemSparseCache>(sc);
             hostBytes += r->layers[layer]->HostBytes();
             measured += r->layers[layer]->DeviceBytes();
             for (int part = 0; part < 2; ++part) {
@@ -189,7 +189,7 @@ void NaiveN05FlashModel::InitSparseKv() {
                 managers[layer * 2 + part] = std::move(manager);
             }
             if (HasLocalIndexer(layer, rank)) {
-                auto index = std::make_unique<PagedCacheManager>();
+                auto index = std::make_shared<PagedCacheManager>();
                 index->pageLen = indexPage; index->maxPages = pages;
                 index->kvCacheFp8Indexer = fp8IndexerCache;
                 index->dataType = AuxiliaryKVType(); index->UpdateUnitSize();

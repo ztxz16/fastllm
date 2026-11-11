@@ -7,6 +7,11 @@
 #endif
 
 namespace fastkv {
+Buffer Buffer::WithLease(std::shared_ptr<void> owner) const {
+    Buffer result = *this;
+    result.lease = std::make_shared<std::pair<std::shared_ptr<void>, std::shared_ptr<void>>>(lease, std::move(owner));
+    return result;
+}
 namespace { std::atomic<uint64_t> deviceToHostBytes{0}, hostToDeviceBytes{0}; }
 Buffer::CopyTraffic Buffer::Traffic() {
     return {deviceToHostBytes.load(std::memory_order_relaxed), hostToDeviceBytes.load(std::memory_order_relaxed)};

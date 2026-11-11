@@ -30,6 +30,7 @@ namespace fastkv { struct Message; struct CacheSnapshot; class BufferPool; }
 namespace fastllm {
     struct PDRuntime;
     struct PDPending;
+    class PDReceiveState;
     using ChatMessages = std::vector <std::pair <std::string, std::string> >;
 
     enum ResponseContextError {
@@ -716,6 +717,8 @@ namespace fastllm {
         void BeginPD(ResponseContext *context);
         bool PollPD(ResponseContext *context);
         virtual std::string PDLayout() const;
+        virtual bool SupportsPDKvMemDecode() const { return false; }
+        virtual std::shared_ptr<PDReceiveState> PreparePDReceive(ResponseContext &context) { return {}; }
         virtual std::vector<int> PDDevices() const;
         virtual bool HasPDResidentPrefixCache() const { return false; }
         int RestorePDResidentPrefix(ResponseContext *context);

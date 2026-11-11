@@ -583,7 +583,7 @@ if (USE_CUDA)
 
     # These C++ units include CUDA runtime/driver headers without going through nvcc.
     set_property(SOURCE src/devices/cuda/models/glm5-next-dsa.cpp src/models/clover.cpp src/models/clover_parallel.cpp
-        src/models/naive_n05_flash.cpp src/models/naive_n05_tp.cpp src/models/naive_n05_kvmem.cpp
+        src/models/naive_n05_flash.cpp src/models/naive_n05_tp.cpp src/models/naive_n05_kvmem.cpp src/models/naive_n05_pd.cpp
         APPEND PROPERTY INCLUDE_DIRECTORIES "${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}")
 
     # GLM53 prefill uses architecture-specific register and matrix-load
@@ -2455,6 +2455,11 @@ if (UNIT_TEST)
                 foreach(NAIVE_PD_STORAGE replicated layer_shard)
                     add_test(NAME naive_n05_pd_${NAIVE_PD_KV}_${NAIVE_PD_STORAGE}
                         COMMAND naive_n05_verify_graph_test 4 pd_state ${NAIVE_PD_KV} ${NAIVE_PD_STORAGE})
+                    add_test(NAME naive_n05_pd_kvmem_${NAIVE_PD_KV}_${NAIVE_PD_STORAGE}
+                        COMMAND naive_n05_verify_graph_test 4 pd_kvmem ${NAIVE_PD_KV} ${NAIVE_PD_STORAGE})
+                    set_tests_properties(naive_n05_pd_kvmem_${NAIVE_PD_KV}_${NAIVE_PD_STORAGE} PROPERTIES
+                        LABELS "cuda;multigpu" RUN_SERIAL TRUE TIMEOUT 300 SKIP_RETURN_CODE 77
+                        PASS_REGULAR_EXPRESSION "NAIVE PD STATE PASS")
                     set_tests_properties(naive_n05_pd_${NAIVE_PD_KV}_${NAIVE_PD_STORAGE} PROPERTIES
                         LABELS "cuda;multigpu" RUN_SERIAL TRUE TIMEOUT 180 SKIP_RETURN_CODE 77
                         PASS_REGULAR_EXPRESSION "NAIVE PD STATE PASS")

@@ -5,6 +5,17 @@
 
 namespace fastllm {
 
+struct ResponseContext;
+// Prepared by the model scheduler. Transfer workers only fill its private
+// ranges; Commit runs under forwardLocker after successful transfer.
+class PDReceiveState {
+  public:
+    virtual ~PDReceiveState() = default;
+    virtual std::vector<std::vector<fastkv::Buffer>> Targets(
+        const fastkv::Bytes &metadata, const std::vector<size_t> &sizes) = 0;
+    virtual void Commit(ResponseContext &context) = 0;
+};
+
 // Logical payload metadata contains placement ranks, never allocator pointers.
 // The receiving model resolves those ranks to its own device map.
 fastkv::Message PDStatePayload(const fastkv::Message &message);

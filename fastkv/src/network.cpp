@@ -13,6 +13,7 @@
 
 namespace fastkv {
 static constexpr uint32_t Magic = 0x314b5646, Version = 2;
+static constexpr uint32_t ReceiveTargetFormat = 0x31544753;
 static constexpr size_t Chunk = 1 << 20;
 static std::runtime_error SystemError(const char *s) {
     return std::runtime_error(std::string("FastKV ") + s + ": " + std::strerror(errno));
@@ -282,6 +283,7 @@ struct Service::Impl {
         std::shared_ptr<void> lifetime;
         std::shared_ptr<Cancellation> cancellation = std::make_shared<Cancellation>();
         Message request;
+        ReceiveTarget target;
         std::future<Message> result;
         std::promise<Message> completion;
         std::string peer;
@@ -392,14 +394,33 @@ struct Service::Impl {
         }
         Require(total <= options.maxPayloadBytes, "FastKV: payload limit exceeded");
         s.SendFrame(w.bytes, deadline);
-        auto ack = s.ReceiveFrame(65536, deadline);
+        auto ack = s.ReceiveFrame(16 << 20, deadline);
         Reader r(ack);
         uint32_t accepted = r.U32();
         if (!accepted)
             throw std::runtime_error("FastKV receiver: " + r.String());
+        std::vector<Buffer> spans;
+        const bool targeted = r.Remaining() != 0;
+        if (targeted) {
+            Require(r.U32() == ReceiveTargetFormat, "FastKV: unknown receive target format");
+            size_t count = 0;
+            for (const auto &buffer : message.buffers) {
+                const size_t n = r.U32();
+                count = CheckedAdd(count, n);
+                Require(count <= (1u << 20), "FastKV: too many receive spans");
+                size_t offset = 0;
+                for (size_t i = 0; i < n; ++i) {
+                    const uint64_t bytes = r.U64();
+                    Require(bytes && bytes <= buffer.Size() - offset, "FastKV: invalid receive span");
+                    if (rdma) spans.push_back(buffer.Slice(offset, size_t(bytes)));
+                    offset += size_t(bytes);
+                }
+                Require(offset == buffer.Size(), "FastKV: incomplete receive target");
+            }
+        }
         r.End();
         if (rdma) {
-            auto prepared = PrepareSend(*rdma, message.buffers);
+            auto prepared = PrepareSend(*rdma, targeted ? spans : message.buffers);
             rdma->Send(s, prepared, deadline);
             rdmaBytes += total;
         } else {
@@ -424,7 +445,7 @@ struct Service::Impl {
         done.End();
         if (rdma) rdma->Complete();
     }
-    Message ReceiveMessage(const Socket &s, RdmaConnection *rdma, Deadline deadline) {
+    Message ReceiveMessage(const Socket &s, RdmaConnection *rdma, Deadline deadline, const ReceiveTarget &target = {}) {
         auto b = s.ReceiveFrame(
             CheckedAdd(options.maxMetadataBytes, CheckedAdd(16, options.maxBuffers * 8)), deadline);
         Reader r(b);
@@ -446,53 +467,81 @@ struct Service::Impl {
         }
         r.End();
         Writer ready;
+        std::shared_ptr<void> targetCredit;
         try {
             Require(total <= options.maxPayloadBytes, "FastKV: payload limit exceeded");
-            auto devices = options.receivePlacement ? options.receivePlacement(m.metadata, sizes)
-                                                    : std::vector<int>{};
-            if (devices.empty()) devices.assign(sizes.size(), options.receiveDevice);
-            Require(devices.size() == sizes.size(), "FastKV: invalid receive placement count");
-            for (int device : devices) Require(device >= -1, "FastKV: invalid receive device");
-            struct Arena { size_t begin, end, bytes; int device; };
-            std::vector<Arena> plan;
-            std::vector<std::pair<int, size_t>> allocations;
-            for (size_t start = 0; start < sizes.size();) {
-                size_t end = start, bytes = 0;
-                constexpr size_t arenaBytes = 64 << 20;
-                while (end < sizes.size()) {
-                    if (end > start && (devices[end] != devices[start] ||
-                                        bytes >= arenaBytes || sizes[end] > arenaBytes - bytes)) break;
-                    bytes = CheckedAdd(bytes, sizes[end++]);
+            if (target) {
+                // Caller pages are already reserved. Count transfer pressure,
+                // without charging these pages to our staging arena pool.
+                for (;;) {
+                    s.CheckRunning(deadline);
+                    try { targetCredit = budget.Reserve(total); break; }
+                    catch (const CapacityBusy &) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); }
                 }
-                plan.push_back({start, end, bytes, devices[start]});
-                allocations.emplace_back(devices[start], bytes);
-                start = end;
-            }
-            receiveBuffers.CheckCapacity(allocations);
-            // Reserve a complete message, not competing partial messages. Only
-            // transfer workers wait here; the model can consume earlier replies.
-            std::unique_lock<std::timed_mutex> allocationLock(receiveAllocationMutex, std::defer_lock);
-            while (!allocationLock.try_lock_for(std::chrono::milliseconds(5))) s.CheckRunning(deadline);
-            for (;;) {
-                s.CheckRunning(deadline);
-                try {
-                    auto credit = budget.Reserve(total);
-                    for (const auto &part : plan) {
-                        auto arena = receiveBuffers.Acquire(part.bytes, part.device, credit);
-                        size_t offset = 0;
-                        for (size_t i = part.begin; i < part.end; ++i) {
-                            m.buffers.push_back(arena.Slice(offset, sizes[i]));
-                            offset += sizes[i];
-                        }
+                auto destinations = target(m.metadata, sizes);
+                Require(destinations.size() == sizes.size(), "FastKV: receive target count mismatch");
+                ready.U32(1); ready.U32(ReceiveTargetFormat);
+                size_t count = 0;
+                for (size_t i = 0; i < sizes.size(); ++i) {
+                    count = CheckedAdd(count, destinations[i].size());
+                    Require(count <= (1u << 20), "FastKV: too many receive spans");
+                    ready.U32(uint32_t(destinations[i].size()));
+                    size_t bytes = 0;
+                    for (auto &span : destinations[i]) {
+                        Require(span.Size() && span.MutableData(), "FastKV: empty receive span");
+                        bytes = CheckedAdd(bytes, span.Size());
+                        ready.U64(span.Size()); m.buffers.push_back(span.WithLease(targetCredit));
                     }
-                    break;
-                } catch (const CapacityBusy &) {
-                    m.buffers.clear();
-                    receiveBuffers.WaitForRelease();
+                    Require(bytes == sizes[i], "FastKV: receive target size mismatch");
                 }
+            } else {
+                auto devices = options.receivePlacement ? options.receivePlacement(m.metadata, sizes)
+                                                        : std::vector<int>{};
+                if (devices.empty()) devices.assign(sizes.size(), options.receiveDevice);
+                Require(devices.size() == sizes.size(), "FastKV: invalid receive placement count");
+                for (int device : devices) Require(device >= -1, "FastKV: invalid receive device");
+                struct Arena { size_t begin, end, bytes; int device; };
+                std::vector<Arena> plan;
+                std::vector<std::pair<int, size_t>> allocations;
+                for (size_t start = 0; start < sizes.size();) {
+                    size_t end = start, bytes = 0;
+                    constexpr size_t arenaBytes = 64 << 20;
+                    while (end < sizes.size()) {
+                        if (end > start && (devices[end] != devices[start] ||
+                                            bytes >= arenaBytes || sizes[end] > arenaBytes - bytes)) break;
+                        bytes = CheckedAdd(bytes, sizes[end++]);
+                    }
+                    plan.push_back({start, end, bytes, devices[start]});
+                    allocations.emplace_back(devices[start], bytes);
+                    start = end;
+                }
+                receiveBuffers.CheckCapacity(allocations);
+                // Reserve a complete message, not competing partial messages. Only
+                // transfer workers wait here; the model can consume earlier replies.
+                std::unique_lock<std::timed_mutex> allocationLock(receiveAllocationMutex, std::defer_lock);
+                while (!allocationLock.try_lock_for(std::chrono::milliseconds(5))) s.CheckRunning(deadline);
+                for (;;) {
+                    s.CheckRunning(deadline);
+                    try {
+                        auto credit = budget.Reserve(total);
+                        for (const auto &part : plan) {
+                            auto arena = receiveBuffers.Acquire(part.bytes, part.device, credit);
+                            size_t offset = 0;
+                            for (size_t i = part.begin; i < part.end; ++i) {
+                                m.buffers.push_back(arena.Slice(offset, sizes[i]));
+                                offset += sizes[i];
+                            }
+                        }
+                        break;
+                    } catch (const CapacityBusy &) {
+                        m.buffers.clear();
+                        receiveBuffers.WaitForRelease();
+                    }
+                }
+                ready.U32(1);
             }
-            ready.U32(1);
         } catch (const std::exception &e) {
+            ready.bytes.clear();
             ready.U32(0);
             ready.String(e.what());
             s.SendFrame(ready.bytes, deadline);
@@ -652,7 +701,7 @@ struct Service::Impl {
     }
     void ReceiveReply(const std::shared_ptr<Exchange> &c) {
         try {
-            auto reply = ReceiveMessage(c->channel->socket, c->channel->rdma.get(), c->deadline);
+            auto reply = ReceiveMessage(c->channel->socket, c->channel->rdma.get(), c->deadline, c->target);
             ++calls;
             c->channel->socket.cancellation.reset();
             if (c->channel->reusable) {
@@ -843,7 +892,7 @@ std::future<Message> Service::Submit(const std::string &peer, Message m) {
     return result;
 }
 bool Service::TrySubmit(const std::string &peer, Message &request, std::future<Message> &result,
-                        std::shared_ptr<Cancellation> cancellation, std::shared_ptr<void> lifetime) {
+                        std::shared_ptr<Cancellation> cancellation, std::shared_ptr<void> lifetime, ReceiveTarget target) {
     Require(!impl->stopped, "FastKV: service stopped");
     Require(!result.valid(), "FastKV: result already holds a submission");
     std::shared_ptr<void> slot;
@@ -852,6 +901,7 @@ bool Service::TrySubmit(const std::string &peer, Message &request, std::future<M
     auto c = std::make_shared<Impl::Exchange>(*impl, false, std::move(slot));
     if (cancellation) c->cancellation = std::move(cancellation);
     c->lifetime = std::move(lifetime);
+    c->target = std::move(target);
     c->peer = peer;
     auto future = c->completion.get_future();
     {

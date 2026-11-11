@@ -69,6 +69,8 @@ namespace fastllm {
         void OnResponseContextFinished(ResponseContext *context) override;
         bool SetSaveHistoryChat(bool save) override;
         std::string PDLayout() const override;
+        bool SupportsPDKvMemDecode() const override { return true; }
+        std::shared_ptr<PDReceiveState> PreparePDReceive(ResponseContext &context) override;
         std::vector<int> PDDevices() const override { return tpDevices; }
         bool HasPDResidentPrefixCache() const override { return saveHistoryChat && !tpPagedCaches.empty(); }
         fastkv::Message ExportPDState(ResponseContext &context) override;
@@ -318,6 +320,7 @@ namespace fastllm {
         void RestoreTensorParallelCache(ResponseContext *context);
         void RecycleTensorParallelCache(ResponseContext *context);
         struct SparseKvState;
+        struct SparsePDReceive;
         std::shared_ptr<SparseKvState> sparseKv;
         void InitSparseKv();
         void AttachSparseKv(const std::vector<std::pair<Data *, Data *>> &roots);

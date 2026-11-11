@@ -3,6 +3,7 @@
 #include "devices/multicuda/fastllm-multicuda.cuh"
 #include "models/naive_n05_flash.h"
 #include "pd.h"
+#include "fastkv/host_cache.h"
 #include "../../src/models/naive_n05_tp.h"
 #include "models/speculative_sampling.h"
 #include "utils/utils.h"
@@ -712,10 +713,54 @@ class Fixture : public NaiveN05FlashModel {
         return result;
     }
 #endif
-    void PDStateChecks() {
+    void PDStateChecks(bool kvmem = false, bool rdma = false, bool layerShard = false) {
         maxBatch = 4; SetMaxTokens(16384); SetChunkedPrefillSize(4096);
         WarmUp();
-        for (int length : {1, 127, 129, 257, 3073}) {
+        std::unique_ptr<Fixture> decode;
+        if (kvmem) {
+            decode.reset(new Fixture(ranks, false, true, true, true));
+            decode->SetKVCacheDataType(kvCacheDataType);
+            decode->SetIndexerDataType(FP8_E4M3); decode->SetIndexerTPStorage(layerShard);
+            decode->maxBatch = 4; SetMaxTokens(16384); decode->SetChunkedPrefillSize(4096);
+            KvMemConfig cfg; cfg.enabled = true; cfg.maxTokens = 8192; cfg.residentTokens = 2048;
+            cfg.prefillTokens = 4096; cfg.hostBytes = 1ULL << 30;
+            decode->ConfigureKvMem(cfg); decode->WarmUp();
+        }
+        Fixture &destination = decode ? *decode : *this;
+        fastkv::Options options; options.transport = rdma ? fastkv::Transport::Rdma : fastkv::Transport::Tcp;
+        fastkv::Service server(options), client(options);
+        fastkv::Message wire;
+        server.Start("127.0.0.1:0", [&](const fastkv::Message &) { return wire; });
+        if (!kvmem && kvCacheDataType == FP8_E4M3) {
+            // 96 K rows and 128 Indexer rows have equal byte counts and share
+            // a physical page. L2 must never reuse one component for the other.
+            ResponseContext context;
+            context.Init(block_cnt, dataType, kvCacheDataType);
+            context.generationConfig.top_k = 1;
+            context.generationConfig.input_token_length = 129;
+            OnResponseContextCreated(&context);
+            std::map<std::string, size_t> identities;
+            isIntermediateChunkedPrefill = true;
+            for (int end : {96, 128}) {
+                const int start = context.preTokens, count = end - start;
+                std::vector<float> ids(count), positions(count);
+                for (int i = 0; i < count; ++i) { ids[i] = (start + i) % 251; positions[i] = start + i; }
+                Forward(Data(FLOAT32,{1,count},ids),Data(),Data(FLOAT32,{1,count},positions),
+                        context.pastKeyValues,context.generationConfig);
+                context.preTokens = end;
+                auto state = ExportPDState(context);
+                auto snapshot = DescribePDCache(context,state);
+                for (size_t i = 0; i < snapshot.payloads.size(); ++i)
+                    for (const auto &region : snapshot.payloads[i].regions) if (!region.identity.empty()) {
+                        auto entry = identities.emplace(region.identity,i);
+                        if (!entry.second && entry.first->second != i)
+                            throw std::runtime_error("PD L2 component identities collide");
+                    }
+            }
+            isIntermediateChunkedPrefill = false;
+            OnResponseContextRemoved(&context);
+        }
+        for (int length : {1, 127, 129, 257, 3073, 4097}) {
             ResponseContext reference, imported;
             for (auto *context : {&reference, &imported}) {
                 context->Init(block_cnt, dataType, kvCacheDataType);
@@ -725,18 +770,70 @@ class Fixture : public NaiveN05FlashModel {
                 context->generationConfig.input_token_length = length + 1;
                 for (int i = 0; i < length; ++i) context->allTokens.push_back((i * 17 + 3) % 256);
                 context->inputTokens = length + 1;
-                OnResponseContextCreated(context);
+                (context == &reference ? *this : destination).OnResponseContextCreated(context);
             }
             std::vector<float> ids(reference.allTokens.begin(), reference.allTokens.end()), positions(length);
             std::iota(positions.begin(), positions.end(), 0.f);
             isIntermediateChunkedPrefill = true;
-            Forward(Data(FLOAT32, {1, length}, ids), Data(), Data(FLOAT32, {1, length}, positions),
-                    reference.pastKeyValues, reference.generationConfig);
+            // Match the P server: no logits, including a warm one-token tail.
+            // output_logits=true previously forced the safe prefill branch and
+            // concealed the DSpark phase-dispatch bug.
+            reference.generationConfig.output_logits = false;
+            for (int start = 0; start < length;) {
+                const int count = std::min(length == 129 ? 128 : 4096, length - start);
+                Forward(Data(FLOAT32, {1, count}, std::vector<float>(ids.begin() + start, ids.begin() + start + count)),
+                        Data(), Data(FLOAT32, {1, count}, std::vector<float>(positions.begin() + start, positions.begin() + start + count)),
+                        reference.pastKeyValues, reference.generationConfig);
+                start += count;
+            }
+            reference.generationConfig.output_logits = true;
             isIntermediateChunkedPrefill = false;
             reference.preTokens = length;
             auto message = ExportPDState(reference);
             imported.allTokens.push_back(42);
-            ImportPDState(imported, message);
+            if (kvmem) {
+                // Dropping an unsubmitted reservation must return every page.
+                auto abandoned = destination.PreparePDReceive(imported); abandoned.reset();
+                auto receive = destination.PreparePDReceive(imported);
+                wire = message;
+                fastkv::Message request; std::future<fastkv::Message> result;
+                if (!client.TrySubmit(server.Address(), request, result, {}, {},
+                        [receive](const fastkv::Bytes &m, const std::vector<size_t> &sizes) { return receive->Targets(m, sizes); }))
+                    throw std::runtime_error("PD test admission failed");
+                auto arrived = result.get();
+                size_t span = 0;
+                for (const auto &source : wire.buffers) {
+                    std::vector<uint8_t> expectedBytes(source.Size()), actualBytes(source.Size());
+                    source.Read(expectedBytes.data(), 0, source.Size());
+                    size_t offset = 0;
+                    while (offset < source.Size()) {
+                        if (span >= arrived.buffers.size() || arrived.buffers[span].Size() > source.Size() - offset)
+                            throw std::runtime_error("PD receive span coverage mismatch");
+                        const auto &buffer = arrived.buffers[span++];
+                        buffer.Read(actualBytes.data() + offset, 0, buffer.Size()); offset += buffer.Size();
+                    }
+                    if (expectedBytes != actualBytes) throw std::runtime_error("PD receive bytes differ");
+                }
+                if (span != arrived.buffers.size()) throw std::runtime_error("PD receive spans left over");
+                size_t host = 0;
+                for (const auto &buffer : arrived.buffers) if (buffer.Kind() == fastkv::MemoryKind::Host) host += buffer.Size();
+                if (!host) throw std::runtime_error("KVMem main KV did not land on host");
+                receive->Commit(imported);
+            } else {
+                // Exercise the ordinary transport placement path too. Logical
+                // rank IDs must land each draft shard on its receiving GPU.
+                wire = message;
+                fastkv::Options receiveOptions = options;
+                auto devices = destination.PDDevices();
+                if (devices.empty()) devices.push_back(FastllmCudaGetDevice());
+                receiveOptions.receivePlacement = [devices](const fastkv::Bytes &metadata,
+                                                            const std::vector<size_t> &sizes) {
+                    return PDReceivePlacement(metadata, sizes.size(), devices);
+                };
+                fastkv::Service receiver(receiveOptions);
+                auto arrived = receiver.Submit(server.Address(), {}).get();
+                destination.ImportPDState(imported, arrived);
+            }
             imported.preTokens = length;
             // Both eager and captured decode must read the restored Indexer,
             // FP4 scales and the SWA ring at the same logical positions.
@@ -745,15 +842,82 @@ class Fixture : public NaiveN05FlashModel {
                 Data token(FLOAT32, {1, 1}, {float(42 + step)}), pos(FLOAT32, {1, 1}, {float(length + step)});
                 std::vector<float> expected, actual;
                 Forward(token, Data(), pos, reference.pastKeyValues, reference.generationConfig, LastTokensManager(), &expected);
-                Forward(token, Data(), pos, imported.pastKeyValues, imported.generationConfig, LastTokensManager(), &actual);
-                if (expected.empty() || expected != actual ||
+                destination.Forward(token, Data(), pos, imported.pastKeyValues, imported.generationConfig, LastTokensManager(), &actual);
+                if (expected.empty() || actual.size() != expected.size() ||
                     !std::all_of(actual.begin(), actual.end(), [](float x) { return std::isfinite(x); }))
-                    throw std::runtime_error("PD restored logits differ");
+                    throw std::runtime_error("PD restored logits invalid");
+                if (kvmem) RequireCloseLogits(actual.data(), expected, "PD KVMem logits differ");
+                else if (expected != actual) throw std::runtime_error("PD restored logits differ");
             }
             OnResponseContextRemoved(&reference);
-            OnResponseContextRemoved(&imported);
+            destination.OnResponseContextRemoved(&imported);
         }
-        std::cout << "NAIVE PD STATE PASS ranks=" << ranks << " dtype=" << kvCacheDataType << std::endl;
+        if (kvmem) {
+            std::vector<std::unique_ptr<ResponseContext>> references(4), restored(4);
+            std::vector<int> past{127, 257, 2050, 4097};
+            for (int row = 0; row < 4; ++row) {
+                for (auto *group : {&references, &restored}) {
+                    auto &c = (*group)[row]; c.reset(new ResponseContext());
+                    c->Init(block_cnt, dataType, kvCacheDataType);
+                    c->generationConfig.top_k = 1; c->generationConfig.output_logits = true;
+                    c->generationConfig.input_token_length = past[row] + 1;
+                    c->generationConfig.output_token_limit = 16;
+                    for (int i = 0; i < past[row]; ++i) c->allTokens.push_back((i * 17 + row + 3) % 251);
+                    c->inputTokens = past[row] + 1;
+                    (group == &references ? *this : destination).OnResponseContextCreated(c.get());
+                }
+                auto &reference = *references[row]; auto &actual = *restored[row];
+                std::vector<float> ids(reference.allTokens.begin(), reference.allTokens.end()), positions(past[row]);
+                std::iota(positions.begin(), positions.end(), 0.f);
+                isIntermediateChunkedPrefill = true;
+                Forward(Data(FLOAT32, {1,past[row]},ids),Data(),Data(FLOAT32,{1,past[row]},positions),
+                        reference.pastKeyValues,reference.generationConfig);
+                isIntermediateChunkedPrefill = false; reference.preTokens = past[row];
+                wire = ExportPDState(reference); actual.allTokens.push_back(42);
+                auto receive = destination.PreparePDReceive(actual);
+                fastkv::Message request; std::future<fastkv::Message> result;
+                if (!client.TrySubmit(server.Address(),request,result,{}, {},
+                    [receive](const fastkv::Bytes &m,const std::vector<size_t> &sizes) { return receive->Targets(m,sizes); }))
+                    throw std::runtime_error("batch PD receive admission");
+                auto arrived = result.get(); receive->Commit(actual); actual.preTokens = past[row];
+            }
+            int step = 0;
+            for (const std::vector<int> order : {std::vector<int>{3,0,2,1}, {1,3}, {1,0,3,2}}) {
+                std::vector<float> ids;
+                std::vector<Data> positions; positions.reserve(order.size());
+                std::vector<Data *> pos;
+                std::vector<std::pair<Data *,Data *>> caches;
+                std::vector<GenerationConfig> configs;
+                std::vector<std::vector<float>> expected(order.size()), actual(order.size());
+                std::vector<std::vector<float> *> outputs;
+                SetCudaGraph(false);
+                for (size_t i = 0; i < order.size(); ++i) {
+                    const int row = order[i]; ids.push_back(43 + row + step);
+                    positions.emplace_back(FLOAT32,std::vector<int>{1,1},std::vector<float>{float(past[row])});
+                    pos.push_back(&positions.back()); configs.push_back(restored[row]->generationConfig);
+                    for (auto &pair : restored[row]->pastKeyValues) caches.emplace_back(&pair.first,&pair.second);
+                    outputs.push_back(&actual[i]);
+                    Forward(Data(FLOAT32,{1,1},{ids.back()}),Data(),positions.back(),references[row]->pastKeyValues,
+                            references[row]->generationConfig,LastTokensManager(),&expected[i]);
+                }
+                SetCudaGraph(step != 0);
+                destination.ForwardBatch(order.size(),Data(FLOAT32,{1,int(order.size())},ids),{},pos,
+                    std::vector<int>(order.size(),1),caches,configs,LastTokensManager(),&outputs);
+                for (size_t i = 0; i < order.size(); ++i) {
+                    if (actual[i].size() != expected[i].size()) throw std::runtime_error("missing batch PD logits");
+                    RequireCloseLogits(actual[i].data(),expected[i],"ragged PD KVMem batch logits");
+                    ++past[order[i]];
+                }
+                ++step;
+            }
+            for (int row = 0; row < 4; ++row) {
+                OnResponseContextRemoved(references[row].get());
+                destination.OnResponseContextRemoved(restored[row].get());
+            }
+        }
+        client.Stop(); server.Stop(); wire = {};
+        std::cout << "NAIVE PD STATE PASS ranks=" << ranks << " dtype=" << kvCacheDataType << " kvmem=" << kvmem
+                  << " max_relative=" << largestLogitRelative << " max_abs=" << largestLogitAbsolute << std::endl;
     }
     mutable int pagedRestores = 0, lastPrefixLength = 0;
     mutable bool failPrefixRestore = false;
@@ -3509,14 +3673,15 @@ int main(int argc, char **argv) {
             DraftFixture fixture(true, 2, 0, 5); fixture.PrefillCommitChecks(); return 0;
         }
 #endif
-        if (argc > 2 && std::string(argv[2]) == "pd_state") {
+        if (argc > 2 && (std::string(argv[2]) == "pd_state" || std::string(argv[2]) == "pd_kvmem")) {
             SetCudaEmbedding(true); SetCudaGraph(true);
             Fixture fixture(ranks, false, true, true, true);
             if (argc > 3 && std::string(argv[3]) == "fp4") fixture.SetKVCacheDataType(FP4_E2M1);
             if (argc > 3 && std::string(argv[3]) == "fp8") fixture.SetKVCacheDataType(FP8_E4M3);
             fixture.SetIndexerTPStorage(argc > 4 && std::string(argv[4]) == "layer_shard");
             fixture.SetIndexerDataType(FP8_E4M3);
-            fixture.PDStateChecks(); return 0;
+            fixture.PDStateChecks(std::string(argv[2]) == "pd_kvmem", argc > 5 && std::string(argv[5]) == "rdma",
+                                  argc > 4 && std::string(argv[4]) == "layer_shard"); return 0;
         }
         if (argc > 2 && std::string(argv[2]) == "draft_prefix") {
             SetCudaEmbedding(true); SetCudaGraph(!(argc > 4 && std::string(argv[4]) == "eager"));

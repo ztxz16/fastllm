@@ -517,6 +517,9 @@ bool FastllmCudaMemcpy2DDeviceToDeviceAsyncCurrentThread(
     size_t widthBytes, size_t height);
 bool FastllmCudaBatchCopyFromDeviceToDeviceAsyncCurrentThread(
     void *const *dsts, const void *const *srcs, const size_t *sizes, int count);
+bool FastllmCudaBatchCopy2DAsyncCurrentThread(
+    void *const *dsts, const void *const *srcs, const size_t *dstPitch,
+    const size_t *srcPitch, const size_t *widths, const size_t *heights, int count);
 
 void *FastllmCudaHostMalloc(size_t size);
 void FastllmCudaHostFree(void *ptr);

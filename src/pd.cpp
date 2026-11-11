@@ -249,6 +249,7 @@ struct PDPending {
     struct Admission { std::shared_ptr<void> slot, tokens; };
     std::future<fastkv::Message> result;
     fastkv::Message request;
+    std::shared_ptr<PDReceiveState> receiver;
     std::string peer, sessionKey;
     std::shared_ptr<Admission> admission;
     std::shared_ptr<void> route;
@@ -934,7 +935,8 @@ void basellm::ConfigurePD(const json11::Json &config) {
           "model_id must identify the same checkpoint on P and D");
     runtime->identity = config["model_id"].string_value() + ":gpu-state-v2:" + PDLayout();
     Check(!UseModelSpecificScheduler(), "PD requires a supported common scheduler");
-    Check(!kvMemConfig.enabled, "the sparse/offloaded KV adapter is not implemented");
+    Check(!kvMemConfig.enabled || (runtime->role == "decode" && SupportsPDKvMemDecode()),
+          "KVMem PD requires a supported decode adapter; prefill must use GPU KV");
     const int concurrent = maxBatch > 0 ? maxBatch : 1;
     runtime->sessionCapacity = size_t(concurrent) * 4;
     runtime->sessions.reset(new fastkv::SessionDirectory(runtime->sessionCapacity));
@@ -990,7 +992,9 @@ void basellm::ConfigurePD(const json11::Json &config) {
             stagingCapacity += limit;
         }
     }
-    if (stagingCapacity) options.maxInflightBytes = std::min(options.maxInflightBytes, stagingCapacity);
+    // Direct KVMem receive uses its reserved host pages; only SWA staging is GPU-backed.
+    if (stagingCapacity && !kvMemConfig.enabled)
+        options.maxInflightBytes = std::min(options.maxInflightBytes, stagingCapacity);
 #endif
     runtime->service.reset(new fastkv::Service(options));
     runtime->exportPool.reset(new fastkv::BufferPool(options.maxInflightBytes, options.deviceBufferBytes));
@@ -1167,12 +1171,23 @@ bool basellm::PollPD(ResponseContext *context) {
         }
         try {
             if (!pdRuntime->SelectPeer(*pending, verbose)) return false;
+            if (!pending->receiver) {
+                std::lock_guard<std::mutex> lock(forwardLocker);
+                pending->receiver = PreparePDReceive(*context);
+            }
+            fastkv::ReceiveTarget target;
+            if (pending->receiver) target = [receiver = pending->receiver](const fastkv::Bytes &metadata,
+                                                                          const std::vector<size_t> &sizes) {
+                return receiver->Targets(metadata, sizes);
+            };
             // Transient transport pressure must preserve the prompt for retry.
             // The Exchange also holds admission until cancellation/I/O drains.
             auto lifetime = std::make_shared<std::pair<std::shared_ptr<PDPending::Admission>,
                                                        std::shared_ptr<void>>>(pending->admission, pending->route);
             pdRuntime->service->TrySubmit(pending->peer, pending->request, pending->result,
-                                          pending->cancellation, std::move(lifetime));
+                                          pending->cancellation, std::move(lifetime), std::move(target));
+        } catch (const fastkv::CapacityBusy &) {
+            return false;
         } catch (const std::exception &error) {
             std::cerr << "[FastKV PD] admission failed: " << error.what() << std::endl;
             context->error = ResponseContextErrorRuntime;
@@ -1188,7 +1203,9 @@ bool basellm::PollPD(ResponseContext *context) {
         pending->route.reset();
         std::lock_guard<std::mutex> lock(forwardLocker);
         const auto importBegin = std::chrono::steady_clock::now();
-        ImportPDState(*context, state);
+        if (pending->receiver) pending->receiver->Commit(*context);
+        else ImportPDState(*context, state);
+        pending->receiver.reset();
         if (verbose) std::cout << "[FastKV PD timing] import_ms="
             << std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - importBegin).count()
             << " kv_d2h_bytes=" << fastkv::Buffer::Traffic().deviceToHost

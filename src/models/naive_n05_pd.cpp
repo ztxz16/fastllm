@@ -1,5 +1,6 @@
 #include "models/naive_n05_flash.h"
 #include "pd.h"
+#include "naive_n05_kvmem.h"
 #include "fastkv/host_cache.h"
 #include <algorithm>
 #include <stdexcept>
@@ -21,6 +22,15 @@ struct StateCopies {
     std::vector<void *> dst;
     std::vector<const void *> src;
     std::vector<size_t> bytes;
+    std::vector<void *> dst2;
+    std::vector<const void *> src2;
+    std::vector<size_t> dp, sp, widths, heights;
+    void Rows(void *to, size_t toPitch, const void *from, size_t fromPitch, size_t width, size_t rows) {
+        if (!width || !rows) return;
+        if (toPitch == width && fromPitch == width) { Add(to, from, width * rows); return; }
+        dst2.push_back(to); src2.push_back(from); dp.push_back(toPitch); sp.push_back(fromPitch);
+        widths.push_back(width); heights.push_back(rows);
+    }
     void Add(void *to, const void *from, size_t n) {
         if (!n || to == from) return;
         if (!bytes.empty() && (char *)dst.back() + bytes.back() == to &&
@@ -28,34 +38,242 @@ struct StateCopies {
         else { dst.push_back(to); src.push_back(from); bytes.push_back(n); }
     }
     void Submit() {
-        CheckPD(FastllmCudaBatchCopyFromDeviceToDeviceAsyncCurrentThread(
-                    dst.data(), src.data(), bytes.data(), bytes.size()), "state copy failed");
+        const bool copied = FastllmCudaBatchCopyFromDeviceToDeviceAsyncCurrentThread(
+            dst.data(), src.data(), bytes.data(), bytes.size());
+        const bool strided = FastllmCudaBatchCopy2DAsyncCurrentThread(dst2.data(), src2.data(), dp.data(), sp.data(),
+            widths.data(), heights.data(), widths.size());
+        // Even an unsuccessful partial submission must finish before borrowed
+        // transport buffers can be released.
         FastllmCudaSyncCurrentThreadStream();
+        CheckPD(copied && strided, "state copy failed");
     }
 };
 // Indexer sidecars share K's physical page IDs, but have their own row width.
-void CopyPagedRows(Data &compact, const Data &key, const PagedCacheManager &pool, bool restore, StateCopies &copies) {
+void CopyPagedRows(Data &compact, const Data &key, const PagedCacheManager &pool, bool restore, StateCopies &copies, int column = 0) {
     CheckPD(key.isPagedKVCache && key.pageLen > 0 && pool.pageLen == key.pageLen &&
-                pool.dataType == compact.dataType && pool.dims.back() == compact.dims[2],
+                pool.dataType == compact.dataType && column >= 0 && pool.dims.back() >= column + compact.dims[2],
             "incompatible page storage");
     const int rows = compact.dims[1];
     const size_t rowBytes = GetDataBytes(compact.dataType, 1, compact.dims[2]);
+    const size_t pitch = GetDataBytes(pool.dataType, 1, pool.dims.back());
+    const size_t offset = GetDataBytes(pool.dataType, 1, column);
     for (int at = 0; at < rows; at += key.pageLen) {
         const int page = key.pageIndex.at(at / key.pageLen);
         CheckPD(page >= 0 && page < pool.maxPages, "invalid physical page");
         void *dense = (char *)compact.cudaData + size_t(at) * rowBytes;
-        void *paged = (char *)pool.cudaData + size_t(page) * key.pageLen * rowBytes;
-        copies.Add(restore ? paged : dense, restore ? dense : paged,
-            size_t(std::min(key.pageLen, rows - at)) * rowBytes);
+        void *paged = (char *)pool.cudaData + size_t(page) * key.pageLen * pitch + offset;
+        copies.Rows(restore ? paged : dense, restore ? pitch : rowBytes,
+                    restore ? dense : paged, restore ? rowBytes : pitch, rowBytes,
+                    std::min(key.pageLen, rows - at));
     }
 }
 #endif
 } // namespace
 
+#ifdef USE_CUDA
+struct NaiveN05FlashModel::SparsePDReceive : PDReceiveState {
+    struct Reservation {
+        std::shared_ptr<SparseKvState> storage;
+        ResponseContext state;
+    };
+    NaiveN05FlashModel &model;
+    std::shared_ptr<Reservation> reservation = std::make_shared<Reservation>();
+    std::vector<std::vector<fastkv::Buffer>> targets;
+    std::vector<std::vector<fastkv::Buffer>> windows;
+    fastkv::Bytes expected;
+    int length;
+    bool received = false, committed = false;
+
+    SparsePDReceive(NaiveN05FlashModel &model, int length) : model(model), length(length) {
+        reservation->storage = model.sparseKv;
+        auto &state = reservation->state;
+        state.Init(model.block_cnt, model.dataType, model.kvCacheDataType);
+        const int ranks = model.tpDevices.size(), rows = std::min(length, model.window - 1);
+        fastkv::Writer metadata;
+        metadata.String(model.PDLayout()); metadata.U32(length);
+        for (int layer = 0; layer < model.block_cnt; ++layer) {
+            const bool swa = model.slidingLayers[layer];
+            const auto &cfg = swa ? model.sliding : model.full;
+            for (int part = 0; part < 2; ++part) {
+                const int width = cfg.kvHeads * (part ? cfg.valueDim : cfg.headDim);
+                auto &root = part ? state.pastKeyValues[layer].second : state.pastKeyValues[layer].first;
+                root.dataType = model.LayerKVType(layer); root.UpdateUnitSize();
+                root.Resize({1, swa ? rows : length, width});
+                root.multiDeviceData = true;
+                // The source's root metadata describes its packed GPU layout.
+                metadata.Ints({1, swa ? rows : length, width + (!swa && !part &&
+                    model.kvCacheDataType != FP4_E2M1 ? model.IndexerCacheWidth(model.AuxiliaryKVType()) : 0)});
+                for (int device : model.tpDevices) root.multiDeviceDatas[device] = new Data(root.dataType);
+            }
+        }
+        windows.resize(ranks);
+        for (int rank = 0; rank < ranks; ++rank) {
+            const int device = model.tpDevices[rank];
+            FastllmCudaSetDevice(device);
+            auto &storage = *model.sparseKv->ranks[rank];
+            storage.pdKeys.resize(model.block_cnt); storage.pdValues.resize(model.block_cnt);
+            storage.pdIndexers.resize(model.block_cnt);
+            fastkv::Writer descriptors;
+            const size_t begin = targets.size();
+            size_t windowBytes = 0;
+            for (int layer = 0; layer < model.block_cnt; ++layer) if (model.slidingLayers[layer])
+                windowBytes += size_t(rows) * std::max(1, model.sliding.kvHeads / ranks) *
+                    (model.sliding.headDim + model.sliding.valueDim) *
+                    (model.AuxiliaryKVType() == FP8_E4M3 ? 1 : 2);
+            fastkv::Buffer arena;
+            if (windowBytes) arena = model.PDExportPool() ? model.PDExportPool()->Acquire(windowBytes, device)
+                                                         : fastkv::Buffer::Allocate(windowBytes, device);
+            size_t windowOffset = 0;
+            windows[rank].resize(model.block_cnt * 2);
+            auto add = [&](DataType type, int count, int width, bool fp8, std::vector<fastkv::Buffer> spans) {
+                descriptors.U32(type); descriptors.Ints({1, count, width}); descriptors.U32(fp8);
+                descriptors.U64(GetDataBytes(type, count, width)); targets.push_back(std::move(spans));
+            };
+            auto pages = [&](const Data &key, const fastkv::Buffer &base, size_t rowBytes) {
+                std::vector<fastkv::Buffer> spans;
+                // Coalesce adjacent physical pages; retain fragmented spans.
+                int first = 0;
+                while (first < length) {
+                    const int page = key.pageIndex.at(first / key.pageLen);
+                    int count = std::min(key.pageLen, length - first);
+                    while (first + count < length && count % key.pageLen == 0 &&
+                           key.pageIndex.at((first + count) / key.pageLen) == page + count / key.pageLen)
+                        count += std::min(key.pageLen, length - first - count);
+                    spans.push_back(base.Slice(size_t(page) * key.pageLen * rowBytes, size_t(count) * rowBytes));
+                    first += count;
+                }
+                return spans;
+            };
+            for (int layer = 0; layer < model.block_cnt; ++layer) {
+                const bool swa = model.slidingLayers[layer];
+                const auto &cfg = swa ? model.sliding : model.full;
+                for (int part = 0; part < 2; ++part) {
+                    auto &root = part ? state.pastKeyValues[layer].second : state.pastKeyValues[layer].first;
+                    auto &local = *root.multiDeviceDatas.at(device);
+                    const int width = std::max(1, cfg.kvHeads / ranks) * (part ? cfg.valueDim : cfg.headDim);
+                    const auto type = model.LayerKVType(layer);
+                    local.Resize({1, swa ? rows : length, width});
+                    const size_t rowBytes = GetDataBytes(type, 1, width);
+                    if (swa) {
+                        auto view = arena.Slice(windowOffset, rows * rowBytes); windowOffset += view.Size();
+                        windows[rank][layer * 2 + part] = view;
+                        add(type, rows, width, false, {view});
+                        continue;
+                    }
+                    auto &manager = *model.tpPagedCaches[rank][layer * 2 + part];
+                    local.isKVCache = local.isPagedKVCache = true;
+                    local.pagedKVCacheData = &manager; local.pageLen = manager.pageLen;
+                    const int pageCount = (length + manager.pageLen - 1) / manager.pageLen;
+                    { std::lock_guard<std::mutex> lock(manager.pageIndexLocker);
+                      if (manager.FreePageCount() < pageCount) throw fastkv::CapacityBusy("KVMem receive pages exhausted"); }
+                    local.pageIndex.reserve(pageCount);
+                    for (int at = 0; at < length; at += manager.pageLen) {
+                        const int page = manager.GetUnusedPageIndex(true);
+                        CheckPD(page >= 0, "KVMem receive pages exhausted");
+                        local.pageIndex.push_back(page);
+                    }
+                    // These pages are private and uninitialized: choose logical
+                    // order by physical address to maximize direct RDMA spans.
+                    std::sort(local.pageIndex.begin(), local.pageIndex.end());
+                    local.lastPageLen = (length - 1) % local.pageLen + 1;
+                    auto &base = part ? storage.pdValues[layer] : storage.pdKeys[layer];
+                    if (!base.Size()) base = fastkv::Buffer::Borrow(
+                        part ? storage.layers[layer]->HostValue(0) : storage.layers[layer]->HostKey(0),
+                        size_t(manager.maxPages) * manager.pageLen * rowBytes,
+                        fastkv::MemoryKind::Host, -1, storage.layers[layer]);
+                    add(type, length, width, false, pages(local, base, rowBytes));
+                }
+                if (model.HasLocalIndexer(layer, rank)) {
+                    auto &index = *storage.indexers[layer];
+                    auto &base = storage.pdIndexers[layer];
+                    if (!base.Size()) base = fastkv::Buffer::Borrow(index.cudaData, index.GetBytes(),
+                        fastkv::MemoryKind::Cuda, device, storage.indexers[layer]);
+                    const auto &key = *state.pastKeyValues[layer].first.multiDeviceDatas.at(device);
+                    add(index.dataType, length, index.dims.back(), model.fp8IndexerCache,
+                        pages(key, base, GetDataBytes(index.dataType, 1, index.dims.back())));
+                }
+            }
+            metadata.Blob(descriptors.bytes.data(), descriptors.bytes.size());
+            metadata.U32(targets.size() - begin);
+        }
+        metadata.U32(0); expected = std::move(metadata.bytes);
+    }
+    std::vector<std::vector<fastkv::Buffer>> Targets(const fastkv::Bytes &metadata,
+                                                   const std::vector<size_t> &sizes) override {
+        CheckPD(!received && sizes.size() == targets.size(), "invalid KVMem receive payload count");
+        fastkv::Message wire; wire.metadata = metadata; wire.buffers.resize(sizes.size());
+        CheckPD(PDStatePayload(wire).metadata == expected, "incompatible KVMem state metadata");
+        (void)PDReceivePlacement(metadata, sizes.size(), model.tpDevices);
+        size_t index = 0;
+        auto result = targets;
+        for (auto &spans : result) {
+            size_t bytes = 0;
+            for (auto &span : spans) { bytes += span.Size(); span = span.WithLease(reservation); }
+            CheckPD(bytes == sizes[index++], "invalid KVMem state bytes");
+        }
+        received = true;
+        return result;
+    }
+    void Commit(ResponseContext &context) override {
+        CheckPD(received && !committed, "KVMem transfer not ready");
+        for (const auto &pair : context.pastKeyValues)
+            CheckPD(pair.first.dims.empty() && pair.second.dims.empty(), "KVMem import needs an empty context");
+        CheckPD(context.pastKeyValues.size() == reservation->state.pastKeyValues.size(), "invalid KVMem context");
+        // Request identities and prefix bookkeeping use root descriptor
+        // addresses. Move rank ownership without replacing that root vector.
+        for (int layer = 0; layer < model.block_cnt; ++layer) for (int part = 0; part < 2; ++part) {
+            auto &source = part ? reservation->state.pastKeyValues[layer].second : reservation->state.pastKeyValues[layer].first;
+            auto &target = part ? context.pastKeyValues[layer].second : context.pastKeyValues[layer].first;
+            target.dataType = source.dataType; target.UpdateUnitSize(); target.Resize(source.dims);
+            target.dataDevice = CUDA; target.dataDeviceIds = model.tpDevices;
+            target.multiDeviceData = true; target.multiDeviceDatas.swap(source.multiDeviceDatas);
+            source.multiDeviceData = false;
+        }
+        std::vector<std::pair<Data *, Data *>> roots;
+        for (auto &pair : context.pastKeyValues) roots.emplace_back(&pair.first, &pair.second);
+        model.AttachSparseKv(roots); // Reset hot mappings and publish fixed device page tables.
+        std::vector<std::exception_ptr> errors(model.tpDevices.size());
+        model.tpWorkers.Run(model.tpDevices, [&](int rank) {
+            FastllmCudaSetDevice(model.tpDevices[rank]);
+            StateCopies copies;
+            for (int layer = 0; layer < model.block_cnt; ++layer) if (model.slidingLayers[layer])
+                for (int part = 0; part < 2; ++part) {
+                    auto &root = part ? context.pastKeyValues[layer].second : context.pastKeyValues[layer].first;
+                    auto &local = *root.multiDeviceDatas.at(model.tpDevices[rank]);
+                    const int rows = std::min(length, model.window - 1);
+                    const size_t rowBytes = GetDataBytes(local.dataType, 1, local.dims.back());
+                    const int first = model.tpSwaRingCache ? (length - rows) % model.window : 0;
+                    const int count = std::min(rows, model.window - first);
+                    const auto *source = static_cast<const char *>(windows[rank][layer * 2 + part].Data());
+                    copies.Add(static_cast<char *>(local.cudaData) + first * rowBytes, source, count * rowBytes);
+                    if (count < rows) copies.Add(local.cudaData, source + count * rowBytes, (rows - count) * rowBytes);
+                }
+            copies.Submit();
+        }, errors);
+        for (auto error : errors) if (error) std::rethrow_exception(error);
+        model.tpCacheEpoch.fetch_add(1, std::memory_order_relaxed);
+        committed = true;
+    }
+};
+#endif
+
+std::shared_ptr<PDReceiveState> NaiveN05FlashModel::PreparePDReceive(ResponseContext &context) {
+#ifdef USE_CUDA
+    if (sparseKv) {
+        CheckPD(!draftEnabled && !indexerContextSharding && tpDevices.size() > 1,
+                "KVMem PD requires TP, replicated/layer_shard Indexer and no draft");
+        CheckPD(context.allTokens.size() > 1 && context.allTokens.size() <= size_t(max_positions), "invalid KVMem prompt");
+        return std::make_shared<SparsePDReceive>(*this, context.allTokens.size() - 1);
+    }
+#endif
+    return {};
+}
+
 std::string NaiveN05FlashModel::PDLayout() const {
-    CheckPD(!sparseKv && !indexerContextSharding, "sparse/offloaded KV needs a separate state adapter");
+    CheckPD(!indexerContextSharding, "Indexer context sharding needs a separate state adapter");
+    CheckPD(!(sparseKv && draftEnabled), "KVMem PD draft state transfer is not implemented");
     CheckPD(!draftTP, "draft TP state transfer is not implemented");
-    return std::string(kvCacheDataType == FP4_E2M1 ? "naive-n05-state-v2:" : "naive-n05-state-v1:") +
+    return std::string(tpDevices.size() > 1 ? "naive-n05-state-v3:" : "naive-n05-state-v1:") +
            std::to_string(block_cnt) + ":" +
            std::to_string(std::max(size_t(1), tpDevices.size())) + ":" + std::to_string(dataType) + ":" +
            std::to_string(kvCacheDataType) + ":" + std::to_string(fp8IndexerCache) + ":" +
@@ -66,6 +284,7 @@ fastkv::Message NaiveN05FlashModel::ExportPDState(ResponseContext &context) {
 #ifndef USE_CUDA
     throw std::runtime_error("FastKV Naive requires CUDA");
 #else
+    CheckPD(!sparseKv, "PD prefill requires GPU KV storage");
     CheckPD(context.preTokens > 0, "empty prefill state");
     const auto devices = tpDevices.empty() ? std::vector<int>{FastllmCudaGetDevice()} : tpDevices;
     const bool tp = tpDevices.size() > 1;
@@ -90,12 +309,14 @@ fastkv::Message NaiveN05FlashModel::ExportPDState(ResponseContext &context) {
                         "invalid local cache");
                 const int rows =
                     slidingLayers[layer] ? std::min(context.preTokens, window - 1) : context.preTokens;
-                const int width = cache.dims[2];
+                const auto &cfg = slidingLayers[layer] ? sliding : full;
+                const int width = tp ? std::max(1, cfg.kvHeads / int(devices.size())) *
+                    (part ? cfg.valueDim : cfg.headDim) : cache.dims[2];
                 CheckPD(cache.dims[1] == rows, "cache length mismatch");
                 Data compact(cache.dataType, {1, rows, width});
                 compact.dataDevice = CUDA;
                 compact.dataDeviceIds = {devices[rank]};
-                compact.kvCacheFp8Indexer = cache.kvCacheFp8Indexer;
+                compact.kvCacheFp8Indexer = !tp && cache.kvCacheFp8Indexer;
                 output.AllocateTensor(compact);
                 const size_t rowBytes = GetDataBytes(cache.dataType, 1, width);
                 if (cache.isPagedKVCache) {
@@ -113,16 +334,17 @@ fastkv::Message NaiveN05FlashModel::ExportPDState(ResponseContext &context) {
                                                           cache.cudaData, size_t(rows - count) * rowBytes);
                 }
             }
-            if (HasSeparateIndexer() && HasLocalIndexer(layer, rank)) {
+            if (tp && HasLocalIndexer(layer, rank)) {
                 const auto &root = context.pastKeyValues[layer].first;
                 const auto &key = *root.multiDeviceDatas.at(devices[rank]);
-                const auto &pool = IndexerStorage(layer, rank);
-                Data compact(pool.dataType, {1, context.preTokens, pool.dims[3]});
+                const auto &pool = HasSeparateIndexer() ? IndexerStorage(layer, rank) : *key.pagedKVCacheData;
+                Data compact(pool.dataType, {1, context.preTokens, IndexerCacheWidth(AuxiliaryKVType())});
                 compact.dataDevice = CUDA;
                 compact.dataDeviceIds = {devices[rank]};
-                compact.kvCacheFp8Indexer = pool.kvCacheFp8Indexer;
+                compact.kvCacheFp8Indexer = fp8IndexerCache;
                 output.AllocateTensor(compact);
-                CopyPagedRows(compact, key, pool, false, copies);
+                CopyPagedRows(compact, key, pool, false, copies, HasSeparateIndexer() ? 0 :
+                    std::max(1, full.kvHeads / int(devices.size())) * full.headDim);
             }
         }
         copies.Submit();
@@ -161,20 +383,22 @@ fastkv::CacheSnapshot NaiveN05FlashModel::DescribePDCache(ResponseContext &conte
 #ifdef USE_CUDA
     const auto devices = tpDevices.empty() ? std::vector<int>{FastllmCudaGetDevice()} : tpDevices;
     size_t index = 0;
-    auto describe = [&](const Data &key, const Data &storage, int rows, bool range) {
+    auto describe = [&](const Data &key, const Data &storage, int rows, bool range, int width) {
         auto &payload = snapshot.payloads.at(index++);
         if (!range || !key.isPagedKVCache || !key.pagedKVCacheData) return;
         auto &owner = *key.pagedKVCacheData;
-        const size_t rowBytes = GetDataBytes(storage.dataType, 1, storage.dims.back());
+        const size_t rowBytes = GetDataBytes(storage.dataType, 1, width);
         CheckPD(size_t(rows) * rowBytes == wire.buffers[index - 1].Size(), "cache region shape mismatch");
         payload.prefixRange = true; payload.regions.clear();
         std::lock_guard<std::mutex> lock(owner.pageIndexLocker);
         for (int at = 0; at < rows; at += key.pageLen) {
             const int page = key.pageIndex.at(at / key.pageLen);
             const size_t bytes = size_t(std::min(key.pageLen, rows - at)) * rowBytes;
-            // Pool lifetime equals model/cache lifetime. Allocation generation
-            // distinguishes a recycled page; length distinguishes mutable tails.
+            // K and Indexer can share one physical allocation. Their component
+            // IDs must differ even when different tail lengths have equal bytes.
+            // Generation distinguishes recycled pages; length distinguishes tails.
             const std::string identity = std::to_string(reinterpret_cast<uintptr_t>(&storage)) + ":" +
+                std::to_string(index - 1) + ":" +
                 std::to_string(page) + ":" + std::to_string(owner.pageTimestamp.at(page)) + ":" + std::to_string(bytes);
             payload.regions.push_back({size_t(at) * rowBytes, bytes, identity});
         }
@@ -185,11 +409,14 @@ fastkv::CacheSnapshot NaiveN05FlashModel::DescribePDCache(ResponseContext &conte
                 const auto &root = part ? context.pastKeyValues[layer].second : context.pastKeyValues[layer].first;
                 const auto &cache = devices.size() > 1 ? *root.multiDeviceDatas.at(devices[rank]) : root;
                 describe(cache, cache.pagedKVCacheData ? *cache.pagedKVCacheData : cache,
-                         context.preTokens, !slidingLayers[layer]);
+                         context.preTokens, !slidingLayers[layer],
+                         devices.size() > 1 ? std::max(1, full.kvHeads / int(devices.size())) *
+                             (part ? full.valueDim : full.headDim) : cache.dims.back());
             }
-            if (HasSeparateIndexer() && HasLocalIndexer(layer, rank)) {
+            if (devices.size() > 1 && HasLocalIndexer(layer, rank)) {
                 const auto &key = *context.pastKeyValues[layer].first.multiDeviceDatas.at(devices[rank]);
-                describe(key, IndexerStorage(layer, rank), context.preTokens, true);
+                describe(key, HasSeparateIndexer() ? IndexerStorage(layer, rank) : *key.pagedKVCacheData,
+                         context.preTokens, true, IndexerCacheWidth(AuxiliaryKVType()));
             }
         }
     }
@@ -202,6 +429,7 @@ void NaiveN05FlashModel::ImportPDState(ResponseContext &context, const fastkv::M
 #ifndef USE_CUDA
     throw std::runtime_error("FastKV Naive requires CUDA");
 #else
+    CheckPD(!sparseKv, "KVMem import requires a prepared receive target");
     const auto message = PDStatePayload(wire);
     fastkv::Reader metadata(message.metadata);
     CheckPD(metadata.String() == PDLayout(), "incompatible state layout or TP size");
@@ -260,8 +488,8 @@ void NaiveN05FlashModel::ImportPDState(ResponseContext &context, const fastkv::M
                 const auto &cfg = slidingLayers[layer] ? sliding : full;
                 const int expected =
                     std::max(1, cfg.kvHeads / int(devices.size())) * (part ? cfg.valueDim : cfg.headDim) +
-                    (!part && !slidingLayers[layer]
-                         ? (tp ? LocalIndexerCacheWidth(layer, rank) : PackedIndexerWidth())
+                    (!tp && !part && !slidingLayers[layer]
+                         ? PackedIndexerWidth()
                          : 0);
                 CheckPD(value.dataType == LayerKVType(layer) &&
                             value.dims == std::vector<int>({1, rows, expected}),
@@ -271,7 +499,8 @@ void NaiveN05FlashModel::ImportPDState(ResponseContext &context, const fastkv::M
                 cache.dataType = value.dataType;
                 cache.UpdateUnitSize();
                 cache.kvCacheFp8Indexer = value.kvCacheFp8Indexer;
-                const int width = expected;
+                const int width = expected + (tp && !part && !slidingLayers[layer] ? LocalIndexerCacheWidth(layer, rank) : 0);
+                if (tp) cache.kvCacheFp8Indexer = !part && !slidingLayers[layer] && !HasSeparateIndexer() && fp8IndexerCache && HasLocalIndexer(layer, rank);
                 const size_t rowBytes = GetDataBytes(cache.dataType, 1, width);
                 // Placement and scatter belong to the persistent owner worker.
                 // Network workers never mutate this request's live page table.
@@ -300,19 +529,20 @@ void NaiveN05FlashModel::ImportPDState(ResponseContext &context, const fastkv::M
                 cache.Resize({1, rows, width});
                 cache.isKVCache = true;
             }
-            if (HasSeparateIndexer() && HasLocalIndexer(layer, rank)) {
+            if (tp && HasLocalIndexer(layer, rank)) {
                 imported.emplace_back(new Data());
                 Data &value = *imported.back();
                 reader.Tensor(value, true);
                 const auto &root = context.pastKeyValues[layer].first;
                 const auto &key = *root.multiDeviceDatas.at(devices[rank]);
-                const auto &pool = IndexerStorage(layer, rank);
+                const auto &pool = HasSeparateIndexer() ? IndexerStorage(layer, rank) : *key.pagedKVCacheData;
                 CheckPD(value.dataType == pool.dataType &&
-                            value.dims == std::vector<int>({1, length, pool.dims[3]}) &&
-                            value.kvCacheFp8Indexer == pool.kvCacheFp8Indexer,
+                            value.dims == std::vector<int>({1, length, IndexerCacheWidth(AuxiliaryKVType())}) &&
+                            value.kvCacheFp8Indexer == fp8IndexerCache,
                         "local Indexer shape mismatch");
                 value.ToDevice(CUDA, std::vector<int>{devices[rank]});
-                CopyPagedRows(value, key, pool, true, copies);
+                CopyPagedRows(value, key, pool, true, copies, HasSeparateIndexer() ? 0 :
+                    std::max(1, full.kvHeads / int(devices.size())) * full.headDim);
             }
         }
         reader.End();
