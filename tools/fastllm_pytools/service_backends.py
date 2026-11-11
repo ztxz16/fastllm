@@ -12,6 +12,12 @@ import subprocess
 from pathlib import Path
 
 
+def media_body_limit(path):
+    """Match native video uploads while keeping other media requests at 32 MiB."""
+    video = re.fullmatch(r"(?:/api/media/[^/]+/)?videos", path)
+    return (256 if video else 32) * 1024 * 1024
+
+
 def visible_gpu_environment(value, environment=None):
     """Resolve launcher-visible indices against an inherited CUDA mask.
 
@@ -90,6 +96,8 @@ class H3Backend:
 
     @staticmethod
     def media_path(method, path):
+        if method == "GET" and path == "health":
+            return "/health"
         if ((method in {"GET", "POST"} and path == "videos") or
                 (method == "GET" and re.fullmatch(r"videos/[A-Za-z0-9_-]+(?:/content)?", path)) or
                 (method == "POST" and re.fullmatch(r"videos/[A-Za-z0-9_-]+/cancel", path))):
@@ -182,6 +190,18 @@ class H3Backend:
                 "status": "GET " + base + "/{id}",
                 "content": "GET " + base + "/{id}/content",
                 "cancel": "POST " + base + "/{id}/cancel",
+                "modes": ["t2va", "first_frame", "last_frame", "first_last", "ref2va"],
+                "conditioning_health": "GET " + state["endpoint"].rstrip("/") + "/health",
+                "keyframes": {"format": "multipart/form-data", "fields": ["first_frame", "last_frame"],
+                              "first_frame_alias": "input_reference"},
+                "references": {"format": "multipart/form-data", "field": "reference", "ordered": True,
+                               "types": ["image/*", "video/*", "audio/*"],
+                               "max_images": 9, "max_videos": 3, "max_audio": 3, "max_count": 12,
+                               "clip_seconds": [2, 15], "total_video_seconds": 15, "total_audio_seconds": 15,
+                               "requires_visual": True, "exclusive_with_keyframes": True,
+                               "requires": "transformer_ref", "availability_field": "reference_model_available",
+                               "prompt_labels": ["Picture 1", "Video 1", "Audio 1"]},
+                "uploads": {"max_file_bytes": 128 * 1024 * 1024, "max_request_bytes": media_body_limit("videos")},
                 "request": {"model": state["modelName"], "prompt": "A cat walking through a sunny garden",
                             "size": "640x384", "seconds": 5},
                 "defaults": {"size": "640x384", "seconds": 5,

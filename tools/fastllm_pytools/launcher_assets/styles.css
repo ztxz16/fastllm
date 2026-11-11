@@ -487,19 +487,9 @@ code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospac
 .studio-toolbar select { max-width: 260px; }
 .studio-toolbar .selected { outline: 2px solid var(--primary); }
 .image-studio { overflow: auto; flex: 1; width: 100%; }
-.video-studio { overflow: auto; padding: 24px; flex: 1; }
-.video-studio form { max-width: 860px; margin: 0 auto; }
-.video-studio form > p { margin: 8px 0 20px; color: var(--muted); line-height: 1.6; }
-.video-studio form > .video-job-actions { margin-top: 16px; }
+.video-studio { overflow: auto; flex: 1; width: 100%; }
 .gpu-choices { display: flex; flex-wrap: wrap; gap: 8px 16px; }
 .gpu-choices label { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; }
-.video-studio textarea { min-height: 100px; resize: vertical; }
-.video-jobs { max-width: 860px; margin: 24px auto; display: grid; gap: 16px; }
-.video-job { border: 1px solid var(--line); border-radius: 12px; padding: 16px; display: grid; gap: 10px; background: var(--surface); }
-.video-job video { width: 100%; max-height: 480px; border-radius: 8px; background: #111; }
-.video-job progress { width: 100%; }
-.video-job-actions { display: flex; gap: 12px; align-items: center; }
-.video-job p { white-space: pre-wrap; overflow-wrap: anywhere; }
 #api-contract { width: 100%; font-family: monospace; resize: vertical; }
 .runtime-auto-profile .editor-navigation,
 .runtime-auto-profile #editor-hybrid,
@@ -914,7 +904,6 @@ code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospac
   .studio-toolbar label { display: flex; gap: 6px; align-items: center; min-width: 0; }
   .studio-toolbar select { max-width: 200px; min-width: 0; }
   .service-selector-label select { flex: 1; max-width: none; min-width: 0; }
-  .video-studio { padding: 16px; }
   .app-shell { grid-template-columns: 1fr; grid-template-rows: auto minmax(0, 1fr); }
   .sidebar { padding: 12px 16px 9px; border-right: 0; border-bottom: 1px solid var(--line); }
   .brand { padding: 0; gap: 8px; }

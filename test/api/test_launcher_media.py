@@ -46,7 +46,7 @@ class H(BaseHTTPRequestHandler):
    self.answer({'error':{'message':'unauthorized'}},401); return False
   return True
  def do_GET(self):
-  if self.path=='/health': return self.answer({'ready':time.monotonic()-started>float(os.environ.get('READY_DELAY','.4'))},200 if time.monotonic()-started>float(os.environ.get('READY_DELAY','.4')) else 503)
+  if self.path=='/health': return self.answer({'ready':time.monotonic()-started>float(os.environ.get('READY_DELAY','.4')), 'reference_model_available':True},200 if time.monotonic()-started>float(os.environ.get('READY_DELAY','.4')) else 503)
   if not self.auth(): return
   if self.path=='/v1/models': return self.answer({'data':[{'id':'stub-'+args.kind}], 'visible':os.environ.get('CUDA_VISIBLE_DEVICES')})
   if self.path in ('/v1/videos','/v1/images/jobs'): return self.answer({'data':list(jobs.values())})
@@ -64,7 +64,7 @@ class H(BaseHTTPRequestHandler):
    data={'references':[]}
    for part in message.iter_parts():
     name=part.get_param('name',header='content-disposition'); content=part.get_payload(decode=True)
-    if name=='image[]': data['references'].append({'name':part.get_filename(),'type':part.get_content_type(),'data':base64.b64encode(content).decode()})
+    if name in ('image[]','reference'): data['references'].append({'name':part.get_filename(),'type':part.get_content_type(),'data':base64.b64encode(content).decode()})
     else: data[name]=content.decode()
   else: data=json.loads(raw)
   job=dict(data,id=args.kind+'_1_'+str(len(jobs)),status='queued' if data['prompt']=='hold' else 'completed',created_at=time.time(),progress=100,stage='done',current=6,total=6,error=None)
@@ -261,6 +261,10 @@ class ServiceTest(unittest.TestCase):
         info = self.client.get("/api/runtime/api-info", headers=self.headers).json()
         self.assertEqual(info["kind"], "video")
         self.assertEqual(info["request"]["model"], "minimax-h3")
+        self.assertIn("ref2va", info["modes"])
+        self.assertEqual(info["references"]["field"], "reference")
+        self.assertEqual(info["references"]["max_count"], 12)
+        self.assertEqual(info["uploads"]["max_request_bytes"], 256 * 1024 * 1024)
         self.assertNotIn("test-service-key", json.dumps(self.pool.catalog()))
         path = "/api/media/" + video + "/videos"
         self.assertEqual(self.client.get(path).status_code, 403)
@@ -278,6 +282,47 @@ class ServiceTest(unittest.TestCase):
         active_port = self.pool.state()["endpoint"].rsplit(":", 1)[1]
         with self.assertRaises(LauncherError):
             self.pool.start(self.profile(port="0" + active_port))
+
+    def test_video_mixed_references_preserve_order_bytes_and_health(self):
+        import base64
+        video = self.start("minimax_h3")
+        path = "/api/media/" + video
+        health = self.client.get(path + "/health", headers=self.headers)
+        self.assertTrue(health.json()["reference_model_available"])
+        self.assertEqual(self.client.get(path + "/health").status_code, 403)
+        self.assertEqual(self.client.post(path + "/health", headers=self.headers).status_code, 400)
+        refs = [("scene.png", b"\x00\xffimage-one", "image/png"),
+                ("motion.mp4", b"\x00\xf0video", "video/mp4"),
+                ("person.jpg", b"\xff\xd8image-two", "image/jpeg"),
+                ("sound.wav", b"RIFF\x00audio", "audio/wav")]
+        result = self.client.post(path + "/videos", headers=self.headers,
+            data={"prompt": "Picture 2 moves like Video 1 in Picture 1, with Audio 1."},
+            files=[("reference", item) for item in refs])
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual([(r["name"], base64.b64decode(r["data"]), r["type"])
+                          for r in result.json()["references"]], refs)
+
+    def test_media_upload_limits_cover_headers_streams_and_direct_calls(self):
+        from fastllm_pytools.service_backends import media_body_limit
+        video = self.start("minimax_h3")
+        path = "/api/media/" + video + "/videos"
+        self.assertEqual(media_body_limit(path), 256 * 1024 * 1024)
+        self.assertEqual(media_body_limit("videos"), 256 * 1024 * 1024)
+        self.assertEqual(media_body_limit("/api/media/id/images/edits"), 32 * 1024 * 1024)
+        # The middleware accepts video lengths above the former 32 MiB cap.
+        response = self.client.post(path, headers={**self.headers, "Content-Length": str(33 * 1024 * 1024)},
+                                    json={"prompt": "hello"})
+        self.assertEqual(response.status_code, 200, response.text)
+        response = self.client.post(path, headers={**self.headers, "Content-Length": str(256 * 1024 * 1024 + 1)},
+                                    content=b"{}")
+        self.assertEqual(response.status_code, 413)
+        # A missing or misleading length cannot bypass the streamed-body check.
+        with patch("fastllm_pytools.launcher_services.media_body_limit", return_value=128):
+            response = self.client.post(path, headers={**self.headers, "Content-Length": "0"},
+                                        content=b"x" * 129)
+            self.assertEqual(response.status_code, 413)
+            with self.assertRaises(LauncherError):
+                self.pool.media_request(video, "POST", "videos", b"x" * 129)
 
     def test_shared_history_excludes_concurrent_writes_but_stops_only_its_owner(self):
         first = self.start()
@@ -472,15 +517,16 @@ class ServiceTest(unittest.TestCase):
             expect(page.locator(".video-job")).to_have_count(1)
             expect(page.locator(".video-job p")).to_have_text("A cat walking")
             page.get_by_role("button", name="Preview and download").click()
-            expect(page.locator(".video-job video")).to_have_count(1)
+            expect(page.locator("#video-player")).to_be_visible()
             expect(page.get_by_role("link", name="Download video")).to_be_visible()
             page.locator("#video-prompt").fill("A second video")
             page.locator("#video-generate").click()
             expect(page.locator(".video-job")).to_have_count(2)
             expect(page.locator(".video-job p").first).to_have_text("A second video")
+            page.locator(".video-job").filter(has_text="A cat walking").click()
             page.locator("#language-select").select_option("zh-CN")
             expect(page.get_by_role("link", name="下载视频")).to_be_visible()
-            expect(page.locator(".video-job video")).to_have_count(1)
+            expect(page.locator("#video-player")).to_be_visible()
             page.locator("#language-select").select_option("en-US")
             page.locator("#studio-chat-tab").click()
             expect(page.locator("#webui-content")).to_be_visible()

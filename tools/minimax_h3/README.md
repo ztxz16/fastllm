@@ -321,6 +321,13 @@ curl http://127.0.0.1:8009/v1/videos \
 15 秒；视频自带音轨归属于该视频。每个上传文件最多 128 MiB，请求最多 256 MiB。
 不接受服务端路径或远程 URL。任务返回 `mode` 和 `reference_count`；Demo 提供模式选择、上传和参考顺序调整。
 
+`ftllm launch` 视频工作室的「参考素材」模式支持混合上传、媒体预览、排序及点击编号插入提示词。
+`Picture 1`、`Video 1`、`Audio 1` 按各自媒体类型分别编号；排序后请检查提示词中的对应关系。
+工作室通过 `GET /api/media/{service_id}/health` 检查 `reference_model_available`，缺少参考权重时禁用该模式。
+上传使用 `POST /api/media/{service_id}/videos`，同样重复传入 `reference` 字段，按原始顺序和字节透传。
+启动台视频请求上限为 256 MiB；工作室将素材限制为 255 MiB，为表单参数预留空间。其他媒体请求仍为 32 MiB。
+`/api/runtime/api-info` 和媒体服务发现结果包含 `modes`、`keyframes`、`references`、`uploads` 接口约定。
+
 | 方法与路径 | 功能 |
 |---|---|
 | `GET /health` | 服务初始化状态 |

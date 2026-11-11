@@ -2012,6 +2012,7 @@ def create_launcher_app(
     launcher_addresses: Optional[List[Dict[str, str]]] = None,
     launcher_host: str = "127.0.0.1",
 ):
+    from .service_backends import media_body_limit
     try:
         from fastapi import FastAPI, Request
         from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
@@ -2053,7 +2054,7 @@ def create_launcher_app(
         if request.url.path.startswith("/api/"):
             content_length = request.headers.get("content-length", "0")
             try:
-                limit = 32 * 1024 * 1024 if request.url.path.startswith("/api/media/") else REQUEST_BODY_LIMIT
+                limit = media_body_limit(request.url.path) if request.url.path.startswith("/api/media/") else REQUEST_BODY_LIMIT
                 if int(content_length or "0") > limit:
                     return JSONResponse(
                         {"error": "Request body is too large."}, status_code=413
