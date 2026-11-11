@@ -1352,7 +1352,8 @@ class NativeQwenMtpEmbeddingTest(unittest.TestCase):
             self.assertNotIn("FASTLLM_QWEN4_VISION_DEVICE", auto._qwen_hybrid_defaults(args,model,tensors,hardware,True))
         args.vision_device = None
         self.assertNotIn("FASTLLM_QWEN4_VISION_DEVICE", auto._qwen_hybrid_defaults(args,model,[],hardware,True))
-        self.assertEqual(auto._qwen_hybrid_defaults(args,model,tensors,{0:{"capability":89}},True), {})
+        self.assertEqual(auto._qwen_hybrid_defaults(args,model,tensors,{0:{"capability":89}},True),
+                         {"FASTLLM_QWEN38_HYBRID_GRAPH": "1"})
 
     def test_independent_q8_defaults_and_explicit_choices(self):
         config = json.dumps([dict(key=r"^lm_head\.weight$", dtype="ggml_q8_0")])
@@ -1480,8 +1481,9 @@ class HybridDispatchPolicyTest(unittest.TestCase):
                 self.assertNotIn("FASTLLM_QWEN38_OWNED_PP", single)
                 native = [memory.Tensor("model.layers.0.mlp.experts.0.gateup_proj.weight",
                                         (1280,2560),1,"nvfp4")]
-                if sm != 75:
-                    self.assertEqual(auto._qwen_hybrid_defaults(a,g,native,{0:{"capability":sm}},True), {})
+                native_defaults = auto._qwen_hybrid_defaults(a,g,native,{0:{"capability":sm}},True)
+                self.assertEqual(native_defaults["FASTLLM_QWEN38_HYBRID_GRAPH"], "1")
+                self.assertNotIn("FASTLLM_QWEN38_OWNED_PP", native_defaults)
         dual = auto._qwen_hybrid_defaults(a,g,t,{0:{"capability":75},1:{"capability":75}},True)
         self.assertEqual(dual["FASTLLM_QWEN38_OWNED_PP"], "1")
         self.assertEqual(dual["FASTLLM_QWEN38_REMOTE_GRAPH"], "1")

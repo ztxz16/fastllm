@@ -536,7 +536,7 @@ _AUTO_QWEN_ENV_APPLIED = {}
 
 
 def _qwen_hybrid_defaults(args, model, tensors, hardware, numa):
-    # Single-GPU GGUF hybrid graphs use the backend's runtime capability
+    # Single-GPU hybrid graphs use the backend's runtime capability
     # checks on every CUDA architecture. Keep the separately measured two-GPU
     # ownership/remote-graph policy scoped to its original configuration.
     # Explicit environment values still win.
@@ -548,11 +548,8 @@ def _qwen_hybrid_defaults(args, model, tensors, hardware, numa):
         return {}
     gguf = any(t.kind.startswith("gguf:") and memory._is_routed_expert(t.name)
                for t in tensors)
-    # The GGUF full graph improves the measured verifier workload. E4M3
-    # batching also benefits the existing segmented graph, while composing it
-    # was not consistently faster; keep native formats on their prior policy.
-    if not gguf and any(device.get("capability") != 75 for device in hardware.values()):
-        return {}
+    # Native and GGUF weights share the complete single-GPU graph path.
+    # Expert operators retain their runtime capability checks and fallbacks.
     defaults = {"FASTLLM_QWEN38_HYBRID_GRAPH": "1"}
     # Prefill dequantization and vision placement remain independently scoped
     # to their existing measured defaults; enabling graphs need not change them.

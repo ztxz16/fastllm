@@ -49,7 +49,11 @@ With `--max_batch 4`, ready requests share attention input/output projections, H
 
 KV, QSA, GDN, PLE histories and accepted-prefix rollback remain request-owned. Different context lengths, acceptance lengths, request completion and batch reordering are supported without fixed concurrency or verifier-row dispatch limits. The shape-sized hybrid expert entry uses the shared GPU cache, dynamic CPU/GPU routing and NUMA batch scheduler beyond the old single-request verifier width.
 
-Single requests retain their existing CUDA Graph path. Multiple requests share projections and MoE while attention state updates run per segment. Expert batches can reuse their own graphs; **complete cross-request verification and draft graphs are not implemented yet**. Prefill, TP, multimodal/KVMem and reusable single-request slots retain their original entry points. Single-GPU NVFP4 and IQ3_S were tested; other architectures and placements need separate validation, and throughput depends on acceptance and routing overlap.
+Single-GPU ordinary batched decode and batched MTP with sparse QSA contexts support complete CUDA graphs: one backbone replay per ordinary decode step or verification round, and one complete draft replay per proposal step. NVFP4 and GGUF share the graph entry; ordinary decode does not retain speculative rollback outputs. Shared hybrid expert graphs retain the GPU expert cache, dynamic CPU/GPU routing, and NUMA batch dispatch. The first draft step reserves space according to the configured draft length; device-side valid-row counts control QSA state commits and final-row selection, avoiding graph variants for every combination of accepted lengths. Input preparation, independent sampling, and accepted-prefix rollback remain outside the model graph.
+
+Single-GPU `--auto` prepares full graphs for NVFP4 and GGUF hybrid inference through backend device/operator capability checks, without an SM75-only gate or additional environment settings.
+
+Each batch retains only its current target backbone graph and one graph per draft step. Changes to the request set or cache addresses/capacities trigger warmup and capture. `Qwen cross-request decode/verify/draft full graph ready` reports successful composition. Short contexts, prefill, TP, multimodal/KVMem and reusable single-request slots retain their original paths; operators that cannot safely capture retain eager fallback. Single-GPU NVFP4 and IQ3_S were tested; other architectures and placements need separate validation, and throughput depends on acceptance and routing overlap.
 
 ## Manual configuration reference
 
@@ -179,15 +183,27 @@ MTP requires matching MTP weights in the model directory and a CUDA backbone. Ex
 
 ### Concurrency and batched verification
 
-For GGUF on one GPU, `--auto` prepares full hybrid graphs using backend capability checks, without an SM75-only gate. Unavailable graphs retain the existing fallback. Full-graph NVFP4 gains were inconsistent in these concurrency measurements, so native formats retain their previous automatic graph policy while benefiting from batched experts in segmented graphs. Two-GPU ownership and prefill policies keep their independent conditions.
-
 Hybrid NVFP4 experts (16-element blocks with E4M3 scales) launch expert projections for the whole MTP verification batch together. Supported GGUF IQ experts offer grouped candidates that reuse decoded weights across verifier rows. Resident and dynamically staged branches have separate workspaces and preserve existing quantization, reduction and NUMA arithmetic. No extra tuning environment variable is required. Physical tile sizes do not cap the logical verifier row count.
 
-For GGUF, `--kernel-tune quick` benchmarks and validates each format, shape and device before capture; the default `off` retains the existing kernel. Family `moe.gguf.gate_swiglu_down` offers `cuda.moe.gguf.q8`, `cuda.moe.gguf.grouped` and `cuda.moe.gguf.grouped_shared`: the reference Q8 path, decoded-weight reuse, and reuse with staged activations. Startup logs report the selection. See [kernel tuning](../kernel-policy.md) for policy, profile, deny and force options. Small batches may retain the reference; gains at larger batches depend on measurements. Warmup uses resident experts from the current layer and fixed inputs without consuming request sampling state.
+For GGUF, `--kernel-tune quick` benchmarks and validates each format, shape and device before capture; the default `off` retains the existing kernel. Family `moe.gguf.gate_swiglu_down` offers `q8`, `grouped`, `grouped_shared`, `q8_tiles_8` and `q8_tiles_16` (prefix `cuda.moe.gguf.`): the reference Q8 path, decoded-weight reuse, reuse with staged activations, and two output tilings that preserve the reference reduction order. Startup logs report the selection. See [kernel tuning](../kernel-policy.md) for policy, profile, deny and force options. Small batches may retain the reference; gains at larger batches depend on measurements. Warmup uses resident experts from the current layer and fixed inputs without consuming request sampling state.
 
 `--max_batch` controls concurrent admission, `--max_context_length` bounds each request, and `--tokens` sets the aggregate shared KV token budget. For example, `--max_batch 4 --max_context_length 8192 --tokens 32768` plans capacity for four requests, subject to available VRAM. To keep all 48 expert layers on the NUMA hybrid path, set `--moe_device numa --moe_device_layers 48` explicitly.
 
-Flash-Next currently executes forward and MTP per request; it does not combine verification from multiple requests into one model forward. Higher concurrency therefore does not guarantee proportional throughput growth. Report shared decode throughput separately from stream duration that includes other requests' prefill waits and from verification latency per round.
+Higher concurrency does not guarantee proportional throughput; report simultaneous decode throughput, verification time, each draft step and prefill waits separately.
+
+`--kernel-tune quick` also selects shared FP16 projections and QSA for both NVFP4 and GGUF models. `off` preserves the established choices.
+
+| Family | Candidate IDs | Selection |
+|---|---|---|
+| `linear.multi.fp16` | `reference`, `cublas`, `tile4`, `tile8`, prefixed by `cuda.linear.multi.fp16.` | Shared-input projections, measured for the actual row count, widths and device |
+| `linear.hyper_project.fp16` | `reference`, `tile4`, `tile8`, `gemm_epilogue`, prefixed by `cuda.hyper_project.` | HC Down/Injection; the GEMM candidate merges output promotion and activations |
+| `attention.indexed.fp16` | `gather`, `split_pv`, `cublas_qk`, prefixed by `cuda.attention.indexed.` | Materialized gather, direct indexed KV, or cuBLAS QK with direct indexed V; direct indexing requires CUDA SM75+ and supported FP16 layouts |
+
+Candidates must pass a separate L2 check for every output before timing. Unsupported or numerically rejected candidates retain the reference. Capture never performs trials, and an existing graph keeps its selected implementation. Tile sizes describe physical blocks, not logical row limits. Direct QSA supports head dimensions up to 256 in multiples of 16, 1–32 query heads per KV head and sparse widths 128–3072; other shapes retain the original path. Warm actual verifier and draft shapes before capture, rather than deriving them from `max_batch`. `--kernel-profile FILE` records choices, timings and errors; existing `--kernel-policy` force/deny settings can override the selection. No new tuning environment variable is required.
+
+GGUF expert tuning waits for the required weights before cold trials; actual inference retains compute/upload overlap. IQ3_S has passed `--kernel-tune quick` warmup and non-speculative 1/2/4-request regression with physical GPU availability capped at 32 GiB.
+
+Record `nsys --version` when profiling. On the tested SM120 system, the same NVFP4 binary reproduced CUDA 719/Xid 31 during a two-to-four-request transition with Nsight Systems 2025.3.1 node tracing, but passed with 2026.5.1 (CUPTI 13.4, hardware tracing). The exact cause in the older profiling configuration remains unidentified. Use the validated 2026.5.1 with `--trace=cuda,nvtx --cuda-graph-trace=node`, and check CUDA API errors and actual verifier/draft graph-node records.
 
 ### Memory and context length
 

@@ -51,7 +51,11 @@ ftllm server /data/models/Qwen3.8-Flash-Next-GSQ-RCO/Q2_0/Qwen3.8-Flash-Next-GSQ
 
 KV、QSA、GDN、PLE 历史及接受前缀回滚仍独立保存。不同上下文长度、不同接受长度、请求退出和批量重排均可合批；没有按 2/4 并发或某个验证行数写死分派。混推的合批专家入口按实际形状使用公共 GPU 缓存、动态分流和 NUMA 批量调度，超过旧单请求验证宽度也不会因此绕过缓存。
 
-当前单请求保留原 CUDA Graph 路径，多请求共享投影和 MoE，但注意力状态更新仍按请求分段执行。合批专家可复用自己的 CUDA 图；**整轮跨请求验证和草稿尚未捕获为完整图**。Prefill、TP、多模态、KVMem 和已有单请求复用槽继续使用原入口。该版本已实测单卡 NVFP4/IQ3_S；其他架构和设备组合应分别验证，吞吐也取决于接受率及路由重叠。
+单卡、稀疏 QSA 上下文的普通合批解码和合批 MTP 均支持完整 CUDA 图：无推测每步回放一次完整主干图，MTP 每轮验证回放一次完整主干图，每一步草稿回放一次完整草稿图。NVFP4 和 GGUF 共用图入口；普通解码不保存推测验证的回滚输出。公共混推专家图保留 GPU 专家缓存、动态分流和 NUMA 批量入口。第一步草稿按配置的草稿长度预留空间，设备端有效行数决定 QSA 状态提交和末行选择；不同接受长度不需要缓存各自的图组合。输入准备、独立采样及接受前缀回滚仍在模型图之外。
+
+单卡 `--auto` 为 NVFP4 与 GGUF 混推启用整图准备，由后端检查设备及算子能力，不限于 SM75；无需额外设置环境变量。
+
+每个批次只保留当前请求集合的目标主干图及各草稿步骤的图；请求集合或缓存地址/容量变化时重新预热和捕获。日志中的 `Qwen cross-request decode/verify/draft full graph ready` 表示该阶段已完成整图拼接。短上下文、Prefill、TP、多模态、KVMem 和已有单请求复用槽继续使用原入口；无法安全捕获的算子保留逐算子回退。该版本已实测单卡 NVFP4/IQ3_S；其他架构和设备组合应分别验证，吞吐也取决于接受率及路由重叠。
 
 ## 手动配置参考
 
@@ -181,15 +185,27 @@ MTP 需要模型目录中包含匹配的 MTP 权重，主干运行在 CUDA，专
 
 ### 并发与批量验证
 
-单卡 GGUF 的 `--auto` 会启用完整混推图的准备流程，由后端检查设备及算子能力，不再仅限 SM75；不可用的图仍保留原回退。NVFP4 的整图收益在本轮并发实测中不稳定，批量专家优化可用于分段图，自动图策略保留原条件。双卡分工及 prefill 策略保持各自原有条件。
-
 混合推理中的 NVFP4（16 元素块、E4M3 缩放）把一次 MTP 验证的多行专家投影合并启动；受支持的 GGUF IQ 专家还可按专家分组，跨验证行复用权重解码。驻留与动态分流分支使用独立工作区，保持原有量化、归约和 NUMA 计算语义；不需要额外的调优环境变量。物理 tile 大小不限制逻辑验证行数。
 
-GGUF 可用 `--kernel-tune quick` 在捕图前按格式、形状和设备测速并校验；默认 `off` 保留原核。算子族 `moe.gguf.gate_swiglu_down` 提供 `cuda.moe.gguf.q8`、`cuda.moe.gguf.grouped` 和 `cuda.moe.gguf.grouped_shared`，分别为原 Q8 路径、分组复用、分组并暂存激活。启动日志输出选择结果；策略参数及保存、禁用、强制选项见[算子自动调优](../kernel-policy.md)。较小批量可能继续选用原核，较大批量是否获益由实测决定。预热使用当前层已驻留的专家记录及固定输入，不消耗请求采样状态。
+GGUF 可用 `--kernel-tune quick` 在捕图前按格式、形状和设备测速并校验；默认 `off` 保留原核。算子族 `moe.gguf.gate_swiglu_down` 提供 `q8`、`grouped`、`grouped_shared`、`q8_tiles_8`、`q8_tiles_16`（统一前缀 `cuda.moe.gguf.`），对应原 Q8 路径、分组复用、分组并暂存激活，以及两种保持原归约顺序的输出分块。启动日志输出选择结果；策略参数及保存、禁用、强制选项见[算子自动调优](../kernel-policy.md)。较小批量可能继续选用原核，较大批量是否获益由实测决定。预热使用当前层已驻留的专家记录及固定输入，不消耗请求采样状态。
 
 `--max_batch` 控制同时接纳的请求数，`--max_context_length` 控制单请求上限，`--tokens` 控制共享 KV 池的总 token 预算。例如 `--max_batch 4 --max_context_length 8192 --tokens 32768` 为四个请求规划总容量，实际仍受可用显存限制。需要固定为 48 层 NUMA 专家混推时，可显式指定 `--moe_device numa --moe_device_layers 48`。
 
-当前 Flash-Next 按请求执行前向和 MTP；多个请求的验证尚未合并成一次模型前向。因此提高并发不保证吞吐同比增长。评测时应区分所有请求同时 decode 的吞吐、包含其他请求 prefill 等待的流式总耗时，以及单轮验证耗时。
+提高并发不保证吞吐同比增长：评测时应分别记录同时 decode 的吞吐、单轮验证、各草稿步以及 prefill 等待。
+
+`--kernel-tune quick` 也用于 NVFP4/GGUF 模型中共用的 FP16 投影和 QSA；`off` 保持原选择。新增算子族：
+
+| 算子族 | 候选实现 | 选择依据 |
+|---|---|---|
+| `linear.multi.fp16` | `reference`、`cublas`、`tile4`、`tile8`（前缀 `cuda.linear.multi.fp16.`） | 同输入的多个投影按实际行数、输入/输出宽度和设备测速 |
+| `linear.hyper_project.fp16` | `reference`、`tile4`、`tile8`、`gemm_epilogue`（前缀 `cuda.hyper_project.`） | HC Down/Injection；GEMM 版本合并 FP16→FP32 转换与激活 |
+| `attention.indexed.fp16` | `gather`、`split_pv`、`cublas_qk`（前缀 `cuda.attention.indexed.`） | 保留原 gather 路径，直接索引 KV，或保留 cuBLAS QK 并直接索引 V；直接索引候选要求 CUDA SM75+ 及支持的 FP16 布局 |
+
+候选必须先通过每个输出张量的 L2 检查，再按实测决定；数值超限或设备/布局不支持时继续使用参考实现。图捕获内不测速，已捕获图的选择保持固定。tile 数字描述物理分块，不限制逻辑行数。QSA 直接索引候选支持 head dimension ≤256 且为 16 的倍数、每 KV head 1–32 个 query heads、稀疏宽度 128–3072；其他形状走原路径。验证与草稿各自的实际形状需要在捕获前预热，不能仅用 `max_batch` 推导选择。选择、候选耗时和误差记录在 `--kernel-profile FILE` 中，可用已有 `--kernel-policy` 的 `force`/`deny` 调整，不新增调优环境变量。
+
+GGUF 专家在首次测速前等待所需权重就绪，正式推理保留计算与上传重叠。IQ3_S 已在实际 32 GiB 可用显存限制下通过 `--kernel-tune quick` 预热及无推测的 1/2/4 请求回归。
+
+抓波形请记录 `nsys --version`。本机 SM120 上，相同 NVFP4 二进制在 Nsight Systems 2025.3.1 节点跟踪中切换双请求→四请求曾出现 CUDA 719/Xid 31；2026.5.1（CUPTI 13.4，硬件跟踪）通过了该切换。旧版抓图配置触发错误的具体原因仍未确定。建议使用已验证的 2026.5.1，参数为 `--trace=cuda,nvtx --cuda-graph-trace=node`，并检查 CUDA API 错误及验证、草稿的实际图节点。
 
 ### 内存与上下文
 
