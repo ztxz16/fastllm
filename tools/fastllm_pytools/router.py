@@ -123,10 +123,10 @@ def create_router(config, directory):
             self.prefill_health = dict(await asyncio.gather(*(check(n) for n in config['prefill'])))
             for index, node in enumerate(config['decode']):
                 peers = node.get('prefill', self.prefill_health)
-                # Native scheduling rotates through this static set. Until
-                # membership changes are supported, every assigned P must be
-                # ready before this D group can safely accept new requests.
-                self.healthy[index] &= all(self.prefill_health[peer] for peer in peers)
+                # Native routing probes the assigned peers and excludes failed
+                # probes. A live alternative can rebuild a failed owner's
+                # prefix; one unavailable producer must not remove every D.
+                self.healthy[index] &= any(self.prefill_health[peer] for peer in peers)
 
         async def health(self, request):
             ready = all(self.healthy)

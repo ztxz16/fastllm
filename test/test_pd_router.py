@@ -143,6 +143,29 @@ class ReadinessTest(unittest.IsolatedAsyncioTestCase):
                     await router.check_health()
                     self.assertEqual(router.healthy, [True, True])
                     self.assertEqual((await router.health(None)).status, 200)
+                    # Shared P pools are alternatives, not an all-or-nothing
+                    # dependency. Native routing must still exclude dead peers.
+                    for node in config['decode']:
+                        node['prefill'] = ['127.0.0.1:19000', '127.0.0.1:19010']
+                    path.write_text(json.dumps(config))
+                    shared = create_router(load_config(path), Path(directory) / 'shared')
+                    shared.client = router.client
+                    readiness['p1'] = False
+                    await shared.check_health()
+                    self.assertEqual(shared.healthy, [True, True])
+                    self.assertEqual((await shared.health(None)).status, 200)
+                    readiness['p2'] = False
+                    await shared.check_health()
+                    self.assertEqual(shared.healthy, [False, False])
+                    with self.assertRaises(web.HTTPServiceUnavailable):
+                        shared.select()
+                    readiness['p1'] = True
+                    await shared.check_health()
+                    self.assertEqual(shared.healthy, [True, True])
+                    readiness['d1'] = False
+                    await shared.check_health()
+                    self.assertEqual(shared.healthy, [False, True])
+                    self.assertEqual(shared.select(), 1)
         finally:
             for runner in runners:
                 await runner.cleanup()
