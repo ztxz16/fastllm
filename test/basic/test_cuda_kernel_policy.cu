@@ -4,6 +4,7 @@
 #include "fastllm.h"
 #include <cuda_runtime.h>
 #include <cuda_fp8.h>
+#include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <algorithm>
 #include <cmath>
@@ -68,6 +69,55 @@ static void run(int rows,int n,int k,int groups,bool fp8,bool graph) {
 
 }
 __global__ void FillPartial(float *values) {if(threadIdx.x<4)values[threadIdx.x]=2;}
+__global__ void FillMixedOutputs(float *projection, half *gate, __nv_bfloat16 *other, int implementation) {
+    if (threadIdx.x < 4) {
+        projection[threadIdx.x] = implementation == 4 ? NAN : 4096;
+        gate[threadIdx.x] = __float2half_rn(implementation == 1 ? 2.f : 1.f);
+        other[threadIdx.x] = __float2bfloat16_rn(1.f);
+    }
+}
+static void checkMixedOutputsPreserved() {
+    using namespace fastllm::kernels;
+    Data projection, gate, other;
+    std::vector<float> originalProjection(16, 17), actualProjection(16);
+    std::vector<half> originalGate(16, __float2half_rn(19.f)), actualGate(16);
+    std::vector<__nv_bfloat16> originalOther(16, __float2bfloat16_rn(23.f)), actualOther(16);
+    allocate(projection, FLOAT32, {16}, originalProjection.data());
+    allocate(gate, FLOAT16, {16}, originalGate.data());
+    allocate(other, BFLOAT16, {16}, originalOther.data());
+    struct Outputs { float *projection; half *gate; __nv_bfloat16 *other; } outputs{
+        (float *)projection.cudaData, (half *)gate.cudaData, (__nv_bfloat16 *)other.cudaData};
+    auto run = [](void *p, int implementation) {
+        auto &c = *static_cast<Outputs *>(p);
+        FillMixedOutputs<<<1,32,0,cudaStreamPerThread>>>(c.projection, c.gate, c.other, implementation);
+        CudaCheck(cudaGetLastError());
+        if (implementation == 3) throw std::runtime_error("injected fusion failure");
+        return implementation != 2;
+    };
+    CudaOutputsCase c{{&outputs, run, nullptr, nullptr, 0, false}, {
+        {projection.cudaData, 16, FLOAT32}, {gate.cudaData, 16, FLOAT16}, {other.cudaData, 16, BFLOAT16}}};
+    for (int implementation : {0, 1, 2, 3, 4}) {
+        double l2 = -1;
+        std::string reason;
+        bool accepted = false, caught = false;
+        try { accepted = CudaOutputsValidate(&c, implementation, l2, reason); }
+        catch (const std::runtime_error &e) {
+            caught = true;
+            CHECK(std::string(e.what()) == "injected fusion failure");
+        }
+        CHECK(caught == (implementation == 3));
+        CHECK(accepted == (implementation <= 1));
+        // A small gate's error must not be hidden by the large projection.
+        if (accepted) CHECK(l2 == double(implementation));
+        CHECK(cudaMemcpy(actualProjection.data(), projection.cudaData, projection.GetBytes(), cudaMemcpyDeviceToHost) == cudaSuccess);
+        CHECK(cudaMemcpy(actualGate.data(), gate.cudaData, gate.GetBytes(), cudaMemcpyDeviceToHost) == cudaSuccess);
+        CHECK(cudaMemcpy(actualOther.data(), other.cudaData, other.GetBytes(), cudaMemcpyDeviceToHost) == cudaSuccess);
+        CHECK(actualProjection == originalProjection);
+        CHECK(std::memcmp(actualGate.data(), originalGate.data(), gate.GetBytes()) == 0);
+        CHECK(std::memcmp(actualOther.data(), originalOther.data(), other.GetBytes()) == 0);
+    }
+    std::puts("MIXED_OUTPUT_PRESERVED_PASS per-output L2, inactive entries, rejection, exception and non-finite output");
+}
 static void checkRawColdCapture() {
     using namespace fastllm::kernels;
     static const Family family{95,"test.raw_capture","1",{
@@ -80,6 +130,14 @@ static void checkRawColdCapture() {
     auto support=[](void *,int) {return std::string();};
     CudaCase c{output,run,support,output,4,false};
     Signature signature{{95,0,0,1,4}};
+    // A composite capture can own the scratch pool between raw stream
+    // captures. A benchmark must not start a nested graph in that interval.
+    CHECK(FastllmCudaGraphMemoryPoolBegin());
+    CHECK(SelectCuda(family,signature,c)==0);
+    CHECK(NeedsPreparation(signature));
+    CHECK(FastllmCudaGraphMemoryPoolActive());
+    FastllmCudaGraphMemoryPoolAbort();
+    CHECK(!FastllmCudaGraphMemoryPoolActive());
     cudaGraph_t graph=nullptr;cudaGraphExec_t exec=nullptr;
     CHECK(cudaStreamBeginCapture(cudaStreamPerThread,cudaStreamCaptureModeThreadLocal)==cudaSuccess);
     CHECK(SelectCuda(family,signature,c)==0);
@@ -135,12 +193,32 @@ static void checkPartialOutputPreserved() {
     cudaFree(output);
     std::printf("PARTIAL_OUTPUT_PRESERVED_PASS success, rejection, exception and capture cleanup\n");
 }
+static void checkInvalidCaptureCleanup() {
+    using namespace fastllm::kernels;
+    CudaCase c{nullptr, [](void *, int) {
+        // Model an optional implementation that accidentally synchronizes
+        // during its timing capture. Its failure must not poison fallback.
+        return cudaStreamSynchronize(cudaStreamPerThread) == cudaSuccess;
+    }, nullptr, nullptr, 0, false};
+    bool rejected = false;
+    try { CudaMeasure(&c, 1, 2); }
+    catch (const std::runtime_error &) { rejected = true; }
+    CHECK(rejected);
+    CHECK(cudaGetLastError() == cudaSuccess);
+    cudaStreamCaptureStatus status;
+    CHECK(cudaStreamIsCapturing(cudaStreamPerThread, &status) == cudaSuccess);
+    CHECK(status == cudaStreamCaptureStatusNone);
+    CHECK(cudaStreamSynchronize(cudaStreamPerThread) == cudaSuccess);
+    std::puts("INVALID_CAPTURE_CLEANUP_PASS no sticky capture error");
+}
 int main(int argc, char **argv){
     const bool wideOnly = argc == 2 && std::strcmp(argv[1], "--wide") == 0;
     int count=0;if(cudaGetDeviceCount(&count)!=cudaSuccess||!count)return 77;
     cudaSetDevice(0);FastllmCudaSetDevice(0);
     checkRawColdCapture();
     checkPartialOutputPreserved();
+    checkMixedOutputsPreserved();
+    checkInvalidCaptureCleanup();
     if(argc==2&&std::strcmp(argv[1],"--cleanup")==0)return 0;
     if(FastllmCudaRuntimeArch()!=120&&FastllmCudaRuntimeArch()!=121)return 77;
     unsetenv("FASTLLM_CUDA_TRITON");
