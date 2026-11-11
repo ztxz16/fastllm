@@ -59,7 +59,8 @@ class ServerTest(unittest.TestCase):
         cls.addClassCleanup(cls.log.close)
         cls.process = subprocess.Popen([BINARY, '--model', str(cls.directory / 'missing-model'),
             '--host', '127.0.0.1', '--port', str(port), '--output', str(cls.output),
-            '--demo', str(cls.assets / 'demo.html'), '--api-key', 'test-image-key'],
+            '--demo', str(cls.assets / 'demo.html'), '--api-key', 'test-image-key',
+            '--gpu-memory-limit', '4.5', '--host-memory-limit', '2'],
             env=dict(os.environ, CUDA_VISIBLE_DEVICES=''), stdout=cls.log, stderr=subprocess.STDOUT)
         cls.addClassCleanup(cls.stop)
         deadline = time.monotonic() + 20
@@ -101,6 +102,25 @@ class ServerTest(unittest.TestCase):
             response = error
         with response:
             return response.status, response.read(), response.headers
+
+    def test_memory_policy_health_without_gpu(self):
+        code, body, _ = self.request('/health', None)
+        self.assertEqual(code, 503)
+        data = json.loads(body)
+        self.assertEqual(data['gpu_memory_limit_gib'], 4.5)
+        self.assertEqual(data['host_memory_limit_gib'], 2)
+        self.assertFalse(data['gpu_memory_reserved'])
+        self.assertIn('host_weight_cache_gib', data)
+        self.assertIn('layer_streaming', data)
+
+    def test_reject_invalid_memory_budgets_before_startup(self):
+        for flag, values in (('--gpu-memory-limit', ('1', '1.0000000001', '-1', 'nan', 'inf', '4GiB', '1048577')),
+                             ('--host-memory-limit', ('1.99', '-1', 'nan', 'inf', '2GiB', '1048577'))):
+            for value in values:
+                result = subprocess.run([BINARY, '--model', '/unused', flag, value],
+                                        capture_output=True, text=True, timeout=5)
+                self.assertNotEqual(result.returncode, 0, (flag, value))
+                self.assertIn(flag.lstrip('-'), result.stderr)
 
     def test_restart_keeps_newest_128_complete_results(self):
         code, data, _ = self.request('/v1/images/jobs')

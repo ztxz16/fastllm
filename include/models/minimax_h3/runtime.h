@@ -216,6 +216,8 @@ class VideoVAE {
     bool lowMemory_ = false;
 };
 DType parseVideoPrecision(const std::string &name, bool fp32 = false);
+double validateGpuMemoryLimit(double gib);
+double validateHostMemoryLimit(double gib);
 double parseGpuMemoryLimit(const std::string &gib);
 double parseHostMemoryLimit(const std::string &gib);
 const char *precisionName(DType);

@@ -71,7 +71,7 @@ int main() {
         check(parseGpuMemoryLimit("4.5") == 4.5, "fractional GiB budget lost");
         for (const char *value : {"-1", "nan", "inf", "1048577"})
             reject([&] { parseGpuMemoryLimit(value); }, "finite GiB");
-        for (const char *value : {"0.5", "1"})
+        for (const char *value : {"0.5", "1", "1.0000000001"})
             reject([&] { parseGpuMemoryLimit(value); }, "reserve");
         reject([&] { parseGpuMemoryLimit("4GB"); }, "GiB number");
         reject([&] { parseGpuMemoryLimit("abc"); }, "GiB number");

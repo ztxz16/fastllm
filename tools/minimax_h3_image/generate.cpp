@@ -34,6 +34,7 @@ int main(int argc, char **argv) {
         std::string model, output = "image.png", textPath, noisePath, tracePath, vaePath, latentPath,
                            encodePath, vaeType = "bf16";
         int device = 0;
+        double gpuMemoryLimit = 0, hostMemoryLimit = 0;
         bool skipDecode = false, traceBlocks = false;
         for (int i = 1; i < argc; ++i) {
             std::string arg = argv[i];
@@ -60,6 +61,10 @@ int main(int argc, char **argv) {
                 options.seed = std::stoull(value());
             else if (arg == "--device")
                 device = std::stoi(value());
+            else if (arg == "--gpu-memory-limit")
+                gpuMemoryLimit = fastllm::minimax_h3::parseGpuMemoryLimit(value());
+            else if (arg == "--host-memory-limit")
+                hostMemoryLimit = fastllm::minimax_h3::parseHostMemoryLimit(value());
             else if (arg == "--vae-precision")
                 vaeType = value();
             else if (arg == "--text-in")
@@ -82,6 +87,7 @@ int main(int argc, char **argv) {
                 std::cout
                     << "minimax_h3_image_generate --model DIR --prompt TEXT --output image.png\n"
                        "  [--width 2048 --height 2048 --seed 42 --device 0 --vae-precision bf16|fp32]\n"
+                       "  [--gpu-memory-limit GiB --host-memory-limit GiB] (0: automatic)\n"
                        "Reference editing: --image FILE [--image FILE ...], up to 16 PNG/JPEG/WebP files.\n"
                        "  --min-generation-area 4194304 generates small outputs on a 2K canvas.\n"
                        "Diagnostics: --text-in F32 --noise-in F32 --trace DIR --trace-blocks --skip-decode\n"
@@ -115,15 +121,23 @@ int main(int argc, char **argv) {
         };
         auto start = std::chrono::steady_clock::now();
         Image result;
+        const bool diagnostic = !encodePath.empty() || !vaePath.empty() || !latentPath.empty();
+        auto memory =
+            diagnostic ? std::make_unique<MemoryPolicy>(full, gpuMemoryLimit, hostMemoryLimit) : nullptr;
+        auto scope = memory && memory->pool
+                         ? std::make_unique<fastllm::nomas::TensorPool::Scope>(*memory->pool)
+                         : nullptr;
         if (!encodePath.empty()) {
             Runtime compute(device, dtype);
             VAE vae(compute, full, model);
+            vae.setMemoryPolicy(*memory);
             std::mt19937 generator(uint32_t(options.seed));
             auto latent = vae.encode(readImage(encodePath), generator, progress, trace);
             write(output, latent.values.data(), latent.values.size() * 4);
         } else if (!vaePath.empty()) {
             Runtime compute(device, dtype);
             VAE vae(compute, full, model);
+            vae.setMemoryPolicy(*memory);
             auto latent = read(vaePath);
             int h = options.height / 16, w = options.width / 16;
             if (options.height % 16 || options.width % 16 || h < 1 || w < 1 ||
@@ -134,12 +148,13 @@ int main(int argc, char **argv) {
         } else if (!latentPath.empty()) {
             Runtime compute(device, dtype);
             VAE vae(compute, full, model);
+            vae.setMemoryPolicy(*memory);
             result = vae.decode(read(latentPath), options.height, options.width, progress);
             auto png = fastllm::qwen_image::encodePNG(result);
             write(output, png.data(), png.size());
         } else {
             auto text = read(textPath), noise = read(noisePath);
-            Pipeline pipeline(model, device, dtype);
+            Pipeline pipeline(model, device, dtype, gpuMemoryLimit, hostMemoryLimit);
             result = pipeline.generate(options, progress, trace, textPath.empty() ? nullptr : &text,
                                        noisePath.empty() ? nullptr : &noise, !skipDecode);
             if (!skipDecode) {

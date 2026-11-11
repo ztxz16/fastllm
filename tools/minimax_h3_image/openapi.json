@@ -2,7 +2,7 @@
   "openapi": "3.0.3",
   "info": {
     "title": "FastLLM MiniMax-H3-Image",
-    "version": "1.1",
+    "version": "1.2",
     "description": "Native text-to-image, single-image editing and multi-reference composition (up to 16 ordered PNG/JPEG/WebP images). Detailed English prompts are recommended. Six fixed steps, guidance 1. No negative prompt, strength slider, masks or prompt-expander model. JPEG/WebP decoding requires FFmpeg. Request body limit 32 MiB; up to 20 MP per reference and 64 MP combined. URLs are relative to this API origin."
   },
   "security": [
@@ -16,7 +16,24 @@
         "summary": "Readiness",
         "responses": {
           "200": {
-            "description": "Successful response"
+            "description": "Ready; memory policy is configured at service startup.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Health"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Loading or failed startup.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Health"
+                }
+              }
+            }
           }
         },
         "security": []
@@ -318,6 +335,41 @@
               "format": "binary"
             },
             "description": "Ordered reference files, addressed as <Picture 1>, <Picture 2>, etc. Repeated image fields are accepted too; do not mix field names."
+          }
+        }
+      },
+      "Health": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "loading",
+              "ready",
+              "failed"
+            ]
+          },
+          "error": {
+            "type": "string",
+            "nullable": true
+          },
+          "gpu_memory_limit_gib": {
+            "type": "number",
+            "description": "Startup --gpu-memory-limit; zero selects automatic policy."
+          },
+          "host_memory_limit_gib": {
+            "type": "number",
+            "description": "Startup --host-memory-limit; zero selects automatic policy. Bounds weight cache, not total RSS."
+          },
+          "gpu_memory_reserved": {
+            "type": "boolean"
+          },
+          "layer_streaming": {
+            "type": "boolean"
+          },
+          "host_weight_cache_gib": {
+            "type": "number",
+            "description": "Effective shared weight-cache capacity after the 2 GiB working allowance."
           }
         }
       }

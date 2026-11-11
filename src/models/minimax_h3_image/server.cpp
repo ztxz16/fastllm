@@ -97,8 +97,9 @@ Json metadata(const std::shared_ptr<Job> &j) {
 }
 class Service {
   public:
-    Service(const std::string &model, std::string output, int device, DType vaeType)
-        : output_(std::move(output)) {
+    Service(const std::string &model, std::string output, int device, DType vaeType, double gpuLimit,
+            double hostLimit)
+        : output_(std::move(output)), gpuLimit_(gpuLimit), hostLimit_(hostLimit) {
         std::filesystem::create_directories(output_);
         for (auto &entry : std::filesystem::directory_iterator(output_)) {
             auto name = entry.path().filename().string();
@@ -139,7 +140,9 @@ class Service {
                     if (!std::filesystem::is_regular_file(model + "/text_encoder/config.json"))
                         throw std::runtime_error("missing text_encoder/config.json");
                 }
-                Pipeline pipeline(model, device, vaeType);
+                Pipeline pipeline(model, device, vaeType, gpuLimit_, hostLimit_);
+                streaming_ = pipeline.memoryPolicy().layerStreaming;
+                hostCacheGiB_ = double(pipeline.memoryPolicy().host->limit()) / (size_t(1) << 30);
                 ready_ = true;
                 for (;;) {
                     std::shared_ptr<Job> job;
@@ -233,7 +236,12 @@ class Service {
         return Json::object{{"status", ready_                  ? "ready"
                                        : startupError_.empty() ? "loading"
                                                                : "failed"},
-                            {"error", startupError_.empty() ? Json() : Json(startupError_)}};
+                            {"error", startupError_.empty() ? Json() : Json(startupError_)},
+                            {"gpu_memory_limit_gib", gpuLimit_},
+                            {"host_memory_limit_gib", hostLimit_},
+                            {"gpu_memory_reserved", ready_.load() && gpuLimit_ > 0},
+                            {"layer_streaming", streaming_.load()},
+                            {"host_weight_cache_gib", hostCacheGiB_.load()}};
     }
     static Options options(const Json &j) {
         Options o;
@@ -325,6 +333,9 @@ class Service {
     }
     std::string output_, startupError_;
     std::atomic<bool> ready_{false}, stopping_{false};
+    const double gpuLimit_, hostLimit_;
+    std::atomic<bool> streaming_{false};
+    std::atomic<double> hostCacheGiB_{0};
     std::atomic<int> pending_{0};
     uint64_t sequence_ = 0;
     std::mutex mutex_;
@@ -339,11 +350,13 @@ int main(int argc, char **argv) {
         std::string model, output = "./minimax-h3-image-output", host = "127.0.0.1", key,
                            demo = "tools/minimax_h3_image/demo.html", precision = "bf16";
         int port = 8009, device = 0;
+        double gpuMemoryLimit = 0, hostMemoryLimit = 0;
         for (int i = 1; i < argc; ++i) {
             std::string arg = argv[i];
             if (arg == "--help") {
                 std::cout << "minimax_h3_image_server --model DIR [--host 127.0.0.1 --port 8009 --device 0 "
-                             "--output DIR --demo FILE --api-key KEY --vae-precision bf16|fp32]\n";
+                             "--output DIR --demo FILE --api-key KEY --vae-precision bf16|fp32]\n"
+                             "  [--gpu-memory-limit GiB --host-memory-limit GiB] (0: automatic)\n";
                 return 0;
             }
             if (++i >= argc)
@@ -363,6 +376,10 @@ int main(int argc, char **argv) {
                 key = value;
             else if (arg == "--demo")
                 demo = value;
+            else if (arg == "--gpu-memory-limit")
+                gpuMemoryLimit = fastllm::minimax_h3::parseGpuMemoryLimit(value);
+            else if (arg == "--host-memory-limit")
+                hostMemoryLimit = fastllm::minimax_h3::parseHostMemoryLimit(value);
             else if (arg == "--vae-precision")
                 precision = value;
             else
@@ -372,7 +389,8 @@ int main(int argc, char **argv) {
             throw std::invalid_argument("invalid model, port or device");
         if (precision != "bf16" && precision != "fp32")
             throw std::invalid_argument("VAE precision must be bf16 or fp32");
-        Service service(model, output, device, precision == "fp32" ? DType::FP32 : DType::BF16);
+        Service service(model, output, device, precision == "fp32" ? DType::FP32 : DType::BF16,
+                        gpuMemoryLimit, hostMemoryLimit);
         httplib::Server server;
         server.new_task_queue = [] { return new httplib::ThreadPool(8); };
         server.set_payload_max_length(32 * 1024 * 1024);
@@ -431,8 +449,8 @@ int main(int argc, char **argv) {
                 std::vector<Image> images;
                 if (r.is_multipart_form_data()) {
                     if (r.files.count("image") && r.files.count("image[]"))
-                        throw std::invalid_argument(
-                            "use either image or image[] consistently to preserve reference order");
+                        throw std::invalid_argument("use either image or image[] consistently to preserve "
+                                                    "reference order");
                     Json::object fields;
                     size_t pixels = 0;
                     for (const auto &part : r.files) {

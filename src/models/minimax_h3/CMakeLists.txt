@@ -12,7 +12,7 @@ set_target_properties(fastllm_continuous PROPERTIES CUDA_RUNTIME_LIBRARY Shared)
 add_library(fastllm_minimax_h3 SHARED
     ops.cu encode.cu conditioning.cpp transformer.cpp audio.cpp video.cpp
     text.cpp parallel.cpp pipeline.cpp pika.cpp model_source.cpp media.cpp media_input.cpp
-    ../minimax_h3_image/model.cpp ../minimax_h3_image/input.cpp)
+    ../minimax_h3_image/model.cpp ../minimax_h3_image/input.cpp ../minimax_h3_image/memory.cpp)
 target_link_libraries(fastllm_minimax_h3 PUBLIC fastllm_continuous pthread)
 target_include_directories(fastllm_minimax_h3 PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
 target_compile_options(fastllm_minimax_h3 PRIVATE
@@ -57,6 +57,10 @@ if(MAKE_WHL_X86)
 endif()
 if(UNIT_TEST)
     enable_testing()
+    add_executable(minimax_h3_image_memory
+        ${PROJECT_SOURCE_DIR}/test/minimax_h3_image/test_memory.cpp ../minimax_h3_image/memory.cpp)
+    set_target_properties(minimax_h3_image_memory PROPERTIES CXX_STANDARD 17)
+    add_test(NAME minimax_h3_image_memory COMMAND minimax_h3_image_memory)
     add_executable(minimax_h3_image_condition EXCLUDE_FROM_ALL
         ${PROJECT_SOURCE_DIR}/test/minimax_h3_image/condition_fixture.cpp)
     target_link_libraries(minimax_h3_image_condition PRIVATE fastllm_minimax_h3)

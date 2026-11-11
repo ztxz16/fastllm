@@ -342,7 +342,7 @@
     "~/.local/share/fastllm/videos/端口": "~/.local/share/fastllm/videos/port",
     "可用 GPU": "Available GPUs",
     "每卡显存预算（GiB，可选）": "GPU memory budget per device (GiB, optional)",
-    "留空或 0 保留原有速度；预算充足时权重驻留，较小时逐层加载。启动时预留显存。": "Empty or 0 preserves the original speed. Large budgets retain weights; smaller budgets stream layers. GPU memory is reserved at startup.",
+    "留空或 0 使用默认策略；预算充足时权重驻留，较小时逐层加载。指定预算后启动时预留显存。": "Empty or 0 uses the default policy. Large budgets retain weights; smaller budgets stream layers. An explicit budget reserves GPU memory at startup.",
     "主机内存预算（GiB，可选）": "Host memory budget (GiB, optional)",
     "留空或 0 使用默认缓存；2 表示从磁盘分块读取，较大预算用于缓存权重。另需为系统和媒体处理留出内存。": "Empty or 0 uses the default cache; 2 streams weights from disk in chunks. Larger budgets cache weights. Leave additional RAM for the system and media processing.",
     "推测解码（可选）": "Speculative decoding (optional)",
@@ -644,7 +644,9 @@
     "Image demo": "Image demo",
     "cancelling": "cancelling",
     "Image generation": "Image generation",
-    "MiniMax H3 Image · single GPU, text-to-image and reference editing. Select a GPU with enough free memory.": "MiniMax H3 Image · single GPU, text-to-image and reference editing. Select a GPU with enough free memory."
+    "MiniMax H3 Image · single GPU, text-to-image and reference editing. Select a GPU with enough free memory.": "MiniMax H3 Image · single GPU, text-to-image and reference editing. Select a GPU with enough free memory.",
+    "图像显存预算须为大于 1 的 GiB 数值，或填 0 使用默认策略。": "Image GPU memory budget must exceed 1 GiB, or use 0 for the default policy.",
+    "图像内存预算须为至少 2 的 GiB 数值，或填 0 使用默认策略。": "Image host memory budget must be at least 2 GiB, or use 0 for the default policy."
   },
   "patterns": [
     {

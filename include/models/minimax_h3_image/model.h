@@ -18,6 +18,15 @@ struct Conditioning {
 Image readImage(const std::string &path);
 Image decodeImage(const std::string &bytes);
 
+// Shared by every stage, including the standalone VAE diagnostics. Explicit
+// budgets use the same 1 GiB device / 2 GiB host allowances as the video model.
+struct MemoryPolicy {
+    MemoryPolicy(Runtime &, double gpuGiB = 0, double hostGiB = 0);
+    bool layerStreaming = false;
+    std::shared_ptr<nomas::TensorPool> pool;
+    std::shared_ptr<nomas::HostMemoryBudget> host;
+};
+
 // Native MiniMax-H3-Image checkpoint: no Diffusers weight conversion required.
 class Transformer {
   public:
@@ -26,6 +35,7 @@ class Transformer {
     Tensor forward(const Tensor &packedLatents, const Tensor &text, int height, int width, int step,
                    Trace = {}, const Conditioning * = nullptr);
     const std::vector<float> &sigmas() const { return sigmas_; }
+    void setMemoryPolicy(const MemoryPolicy &);
     void unload();
 
   private:
@@ -37,6 +47,7 @@ class Transformer {
     std::vector<float> times_, sigmas_;
     std::vector<Tensor> modulation_;
     Tensor finalModulation_;
+    bool lowMemory_ = false;
 };
 
 class VAE {
@@ -47,12 +58,15 @@ class VAE {
     Image decode(const std::vector<float> &normalizedPackedLatents, int height, int width, Progress = {});
     // ImageNet pixels -> sampled, FP16-rounded, normalized CHW reference latent.
     minimax_h3::VideoTensor encode(const Image &, std::mt19937 &, Progress = {}, Trace = {});
+    void setMemoryPolicy(const MemoryPolicy &);
 
   private:
     std::string model_;
     Runtime &rt_, &full_;
     Weights weights_, fullWeights_;
     std::vector<float> mean_, std_;
+    bool lowMemory_ = false;
+    std::shared_ptr<nomas::HostMemoryBudget> hostBudget_;
 };
 
 struct Options {
@@ -67,12 +81,17 @@ struct Options {
 
 class Pipeline {
   public:
-    Pipeline(const std::string &model, int device = 0, DType vaeType = DType::BF16);
+    Pipeline(const std::string &model, int device = 0, DType vaeType = DType::BF16, double gpuMemoryLimit = 0,
+             double hostMemoryLimit = 0);
+    const MemoryPolicy &memoryPolicy() const { return memory_; }
     Image generate(const Options &, Progress = {}, Trace = {}, const std::vector<float> *text = nullptr,
                    const std::vector<float> *noise = nullptr, bool decode = true);
 
   private:
+    Image generateImpl(const Options &, Progress, Trace, const std::vector<float> *,
+                       const std::vector<float> *, bool);
     std::string model_;
     Runtime rt_, full_, vaeRt_;
+    MemoryPolicy memory_;
 };
 } // namespace fastllm::minimax_h3_image

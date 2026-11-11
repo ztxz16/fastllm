@@ -166,16 +166,28 @@ class ServiceTest(unittest.TestCase):
             self.assertEqual(service_backends.H3ImageBackend.executable(config), str(binary))
             config.server_binary = str(self.worker)
             self.assertEqual(service_backends.H3ImageBackend.executable(config), str(self.worker))
-        config = config_from_dict(self.profile("minimax_h3_image", video_gpu_memory_limit="4", base_model="unused"))
+        config = config_from_dict(self.profile("minimax_h3_image", video_gpu_memory_limit="4", video_host_memory_limit="2", base_model="unused"))
         command = build_fastllm_argv(config)
         self.assertEqual(command[command.index("--device") + 1], "0")
         self.assertNotIn("--devices", command)
         self.assertNotIn("--base-model", command)
-        self.assertNotIn("--gpu-memory-limit", command)
+        self.assertEqual(command[command.index("--gpu-memory-limit") + 1], "4")
+        self.assertEqual(command[command.index("--host-memory-limit") + 1], "2")
         self.assertEqual(validate_config(config), [])
         fields = []
         validate_config(config_from_dict(self.profile("minimax_h3_image", visible_gpus="0,1")), fields)
         self.assertTrue(any("visible_gpus" in item["fields"] for item in fields))
+
+    def test_image_memory_budget_validation(self):
+        for field, values in (("video_gpu_memory_limit", ("-1", "1", "1.0000000001", "nan", "inf", "1048577")),
+                              ("video_host_memory_limit", ("-1", "1.99", "nan", "inf", "1048577"))):
+            for value in values:
+                fields = []
+                validate_config(config_from_dict(self.profile("minimax_h3_image", **{field: value})), fields)
+                self.assertTrue(any(field in error["fields"] for error in fields), (field, value))
+        for gpu, host in (("", ""), ("0", "0"), ("4.5", "2"), ("64", "16")):
+            self.assertEqual(validate_config(config_from_dict(self.profile("minimax_h3_image",
+                video_gpu_memory_limit=gpu, video_host_memory_limit=host))), [])
 
     def test_image_api_contract_authenticated_proxy_and_cancellation(self):
         image = self.start("minimax_h3_image")
@@ -238,7 +250,7 @@ class ServiceTest(unittest.TestCase):
         saved = self.pool.save_profile(None, payload)
         self.assertEqual(saved["profile"]["video_host_memory_limit"], "2")
         self.assertEqual(saved["profile"]["video_gpu_memory_limit"], "4.5")
-        for invalid in ("-1", "1", "nan", "inf", "4GB", "1048577"):
+        for invalid in ("-1", "1", "1.0000000001", "nan", "inf", "4GB", "1048577"):
             fields = []
             validate_config(config_from_dict(dict(payload, video_gpu_memory_limit=invalid)), fields)
             self.assertTrue(any("video_gpu_memory_limit" in item["fields"] for item in fields), invalid)
@@ -498,6 +510,11 @@ class ServiceTest(unittest.TestCase):
             expect(page.locator('[data-field="video_host_memory_limit"]')).to_be_visible()
             page.locator('[data-field="video_host_memory_limit"]').fill("2.5")
             self.assertTrue(page.locator('[data-field="video_host_memory_limit"]').evaluate("input => input.checkValidity()"))
+            page.locator("#model-backend").select_option("minimax_h3_image")
+            expect(page.locator('[data-field="video_gpu_memory_limit"]')).to_be_visible()
+            expect(page.locator('[data-field="video_host_memory_limit"]')).to_be_visible()
+            expect(page.locator('[data-field="base_model"]')).not_to_be_visible()
+            page.locator("#model-backend").select_option("minimax_h3")
             page.locator('#gpu-choices input[value="1"]').check()
             expect(page.locator('[data-field="visible_gpus"]')).to_have_value("1")
             expect(page.locator("#configuration-mode-settings")).not_to_be_visible()

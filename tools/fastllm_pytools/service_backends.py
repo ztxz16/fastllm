@@ -87,6 +87,23 @@ class ChatBackend:
                 "endpoint": state["endpoint"].rstrip("/") + "/v1/chat/completions"}
 
 
+def _validate_memory_limits(config, add, label):
+    if config.video_gpu_memory_limit.strip():
+        try:
+            limit = float(config.video_gpu_memory_limit)
+            if not math.isfinite(limit) or not (limit == 0 or (1 + 1 / 2**30 <= limit <= 1048576)):
+                raise ValueError()
+        except ValueError:
+            add(f"{label}显存预算须为大于 1 的 GiB 数值，或填 0 使用默认策略。", "video_gpu_memory_limit")
+    if config.video_host_memory_limit.strip():
+        try:
+            limit = float(config.video_host_memory_limit)
+            if not math.isfinite(limit) or not (limit == 0 or 2 <= limit <= 1048576):
+                raise ValueError()
+        except ValueError:
+            add(f"{label}内存预算须为至少 2 的 GiB 数值，或填 0 使用默认策略。", "video_host_memory_limit")
+
+
 class H3Backend:
     id = "minimax_h3"
     kind = "video"
@@ -167,20 +184,7 @@ class H3Backend:
             add("端口必须在 1-65535 之间。", "port")
         if not config.host.strip():
             add("监听地址不能为空。", "host")
-        if config.video_gpu_memory_limit.strip():
-            try:
-                limit = float(config.video_gpu_memory_limit)
-                if not math.isfinite(limit) or not (limit == 0 or 1 < limit <= 1048576):
-                    raise ValueError()
-            except ValueError:
-                add("视频显存预算须为大于 1 的 GiB 数值，或填 0 使用默认策略。", "video_gpu_memory_limit")
-        if config.video_host_memory_limit.strip():
-            try:
-                limit = float(config.video_host_memory_limit)
-                if not math.isfinite(limit) or not (limit == 0 or 2 <= limit <= 1048576):
-                    raise ValueError()
-            except ValueError:
-                add("视频内存预算须为至少 2 的 GiB 数值，或填 0 使用默认策略。", "video_host_memory_limit")
+        _validate_memory_limits(config, add, "视频")
         return errors
 
     def api_contract(self, state):
@@ -258,6 +262,10 @@ class H3ImageBackend:
                 break
         if config.api_key.strip():
             command.extend(("--api-key", config.api_key.strip()))
+        for flag, value in (("--gpu-memory-limit", config.video_gpu_memory_limit),
+                            ("--host-memory-limit", config.video_host_memory_limit)):
+            if value.strip():
+                command.extend((flag, value.strip()))
         return command
 
     def validate(self, config):
@@ -279,6 +287,7 @@ class H3ImageBackend:
             add("端口必须在 1-65535 之间。", "port")
         if not config.host.strip():
             add("监听地址不能为空。", "host")
+        _validate_memory_limits(config, add, "图像")
         return errors
 
     def api_contract(self, state):

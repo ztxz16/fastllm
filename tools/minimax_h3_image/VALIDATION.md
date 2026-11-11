@@ -63,7 +63,7 @@ The running experiment uses launcher port 18095 and image server port 18096, bot
 
 The launcher regression suite had one transient failure in an existing Pi test when its generated bridge token began with `-` and argparse treated it as an option; rerunning the unchanged suite passed all 15 enabled tests. This unrelated pre-existing issue was not modified.
 
-Current coverage is native single-GPU text generation, single-reference editing and two-reference composition through CLI/API/demo. The interface accepts up to 16 references, but a 16-image quality/memory workload has not been tested. Tensor parallelism, smaller-memory GPU execution, masks/strength/negative prompts and the separate prompt-expander model are not implemented. CUDA wheel packaging includes the new binaries and shared demo assets; a complete release wheel was not built during this experiment.
+Current coverage is native single-GPU text generation, single-reference editing and two-reference composition through CLI/API/demo. The interface accepts up to 16 references, but a 16-image quality/memory workload has not been tested. Tensor parallelism, masks/strength/negative prompts and the separate prompt-expander model are not implemented. CUDA wheel packaging includes the new binaries and shared demo assets; a complete release wheel was not built during this experiment.
 
 ## Commit-readiness cleanup
 
@@ -77,3 +77,32 @@ Current coverage is native single-GPU text generation, single-reference editing 
 - `git diff --check` passed. Changes remain uncommitted on `master`; no commit or push was performed.
 
 These checks support committing the documented single-GPU feature. They do not replace the release-wheel build or broaden the model workload coverage listed above.
+
+## Memory adaptation (2026-11-11)
+
+Physical GPU 4 (RTX PRO 5000, 72 GiB), BF16 VAE, seed 42, prompt `A red panda beside a mountain stream, autumn forest`, full text encoding and 2048×2048 output:
+
+| Policy | Peak GPU memory | Peak process RSS | Native time |
+| --- | ---: | ---: | ---: |
+| Previous resident implementation | 42,429 MiB | 96,549 MiB | 42.04 s |
+| `--gpu-memory-limit 4 --host-memory-limit 2` | 3,613 MiB | 872 MiB | 72.47 s |
+
+The text features, all six denoising latents, final latent and PNG are byte-identical. RSS includes mapped checkpoint pages in the old implementation; OS filesystem cache is not included in process RSS. GPU figures are sampled with `nvidia-smi`, RSS with `/proc/PID/status` (`VmHWM`), every 300 ms. These are measurements of this input, not universal minimum budgets.
+
+Automatic mode was also tested without either memory flag in a container limited to **4 GiB RAM with no swap**, while an independent CUDA allocation left **5 GiB free VRAM** before model startup. `/health` selected `layer_streaming=true`, `host_weight_cache_gib=0`, and no explicit GPU pool reservation. Full 2K generation completed in 71.81 s with 808 MiB process RSS and produced the same PNG bytes. The temporary CUDA allocation was freed after testing; its memory is excluded from the table above.
+
+The HTTP service at 4 GiB GPU / 2 GiB host budget also survived a deliberate pool exhaustion and an in-progress cancellation, then completed a two-reference 2048×2048 edit in the same 4 GiB RAM container (3,573 MiB peak GPU memory, 920 MiB peak RSS). No precision, step count or canvas fallback was used. Model-source/parser regression, HTTP memory flag validation, readiness fields and launcher budget argument/validation tests cover the integration. Inference binaries continue to link only the native CUDA/C++ runtime, with no Torch dependency.
+
+Reproduction logs, traces and outputs are under `/workspace2/experiments/minimax-h3-native/image-native-20261111/image-memory-20261111` on the test machine.
+
+## Memory and video workspace commit review
+
+Reviewed on `master` at `5cc1d98cfdd7e123da55f86a87cee35670504f75`, with the video workspace/reference integration and image memory changes still uncommitted.
+
+- Extracted host availability detection into an internal, CPU-testable helper. It resolves the process's cgroup v1/v2 membership through mount metadata and applies every visible ancestor quota, including sibling usage. Fixtures cover nested groups, bind-mounted roots, private namespaces, escaped mount paths, host limits and exhausted quotas; passed on Linux and macOS with compiler warnings treated as errors.
+- Aligned GPU budget validation across native parsers and launcher backends: a nonzero budget must leave at least one byte after the 1 GiB reserve. Values that would round to a zero-byte pool now fail validation before allocation.
+- Fresh CUDA 13 / SM120 build passed for image CLI/server and native tests. CTest passed `minimax_h3_image_memory`, `minimax_h3_image_http` (5 Python cases) and `minimax_h3_model_source`. Launcher suites passed 107 cases, with 1 optional Playwright case skipped. Image/video JavaScript suites passed. Shared studio assets are covered by the existing wheel package-data glob; a full release wheel was not built.
+- Repeated automatic 2K generation using the final native build on physical GPU 4, in the 4 GiB RAM/no-swap container with initially 5 GiB free VRAM. Health selected layer streaming and zero host weight cache; output was byte-identical to the resident baseline, with 808 MiB peak process RSS and 64.46 s native runtime. The monitor's GPU total includes the separate temporary allocation used to constrain free VRAM and is not the model's memory usage.
+- `ldd` confirmed no Torch/Python runtime dependency. Test resources were released, and the existing launcher service was left running. `git diff --check` passed; no commit or push was performed.
+
+Review logs and the final patch/manifest are under `/workspace2/experiments/minimax-h3-native/image-native-20261111/commit-readiness-20261111`. These checks support committing the two features separately; workload and release-packaging limitations above still apply.

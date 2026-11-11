@@ -1,8 +1,10 @@
 #include "models/minimax_h3_image/model.h"
 #include "json11.hpp"
+#include "memory.h"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <cuda_runtime.h>
 #include <fstream>
 #include <numeric>
 #include <stdexcept>
@@ -71,6 +73,27 @@ float bf16(float x) {
     return x;
 }
 } // namespace
+
+MemoryPolicy::MemoryPolicy(Runtime &rt, double gpuGiB, double hostGiB) {
+    minimax_h3::validateGpuMemoryLimit(gpuGiB);
+    minimax_h3::validateHostMemoryLimit(hostGiB);
+    rt.activate();
+    size_t free = 0, total = 0;
+    int device = 0;
+    if (cudaMemGetInfo(&free, &total) != cudaSuccess || cudaGetDevice(&device) != cudaSuccess)
+        throw std::runtime_error("cannot query CUDA memory");
+    constexpr size_t GiB = size_t(1) << 30;
+    layerStreaming = (gpuGiB ? gpuGiB * GiB : double(free)) < 60. * GiB;
+    if (gpuGiB)
+        pool = std::make_shared<nomas::TensorPool>(device, 0, size_t((gpuGiB - 1) * GiB), true);
+    const size_t hostBytes = hostGiB ? size_t(hostGiB * GiB) : detail::availableHostMemory() / 4;
+    // Always install a shared budget, even when its cache capacity is zero:
+    // this selects bounded reads instead of faulting whole mmap'ed weights.
+    size_t cacheBytes = hostBytes > 2 * GiB ? hostBytes - 2 * GiB : 0;
+    if (!hostGiB)
+        cacheBytes = std::min(cacheBytes, size_t(64) * GiB);
+    host = std::make_shared<nomas::HostMemoryBudget>(cacheBytes);
+}
 
 Transformer::Transformer(Runtime &rt, Runtime &full, const std::string &dir)
     : rt_(rt), full_(full), weights_(rt, minimax_h3::componentWeights(dir + "/transformer")),
@@ -145,6 +168,16 @@ void Transformer::prepare(Progress progress) {
         rows.push_back(weights_.linear(input, "final_layer.adaln_proj.linear", true));
     finalModulation_ = rt_.concat(rows);
     weights_.erasePrefix("final_layer.adaln_proj.");
+    // Do not cache the large, single-use AdaLN matrices on the host.
+    if (lowMemory_)
+        weights_.enableHostCache(size_t(48) << 30);
+}
+void Transformer::setMemoryPolicy(const MemoryPolicy &memory) {
+    unload();
+    lowMemory_ = memory.layerStreaming;
+    weights_.setHostMemoryBudget(memory.host);
+    fullWeights_.setHostMemoryBudget(memory.host);
+    heads_.setHostMemoryBudget(memory.host);
 }
 Tensor Transformer::attention(const Tensor &x, const std::string &p, const Tensor *cs, const Tensor *sn) {
     auto qkv = splitQKV(rt_, weights_.linear(x, p + ".qkv_proj"), 56, 128);
@@ -178,6 +211,8 @@ Tensor Transformer::refine(const Tensor &text) {
         auto p = "token_refiner.blocks." + std::to_string(i);
         x = rt_.add(x, attention(rt_.rms(x, weights_.get(p + ".norm1.weight"), 1e-5f), p + ".attn"));
         x = rt_.add(x, feedForward(rt_.rms(x, weights_.get(p + ".norm2.weight"), 1e-5f), p + ".mlp"));
+        if (lowMemory_)
+            weights_.erasePrefix(p + ".");
     }
     return rt_.rms(x, weights_.get("token_refiner.final_norm.weight"), 1e-5f);
 }
@@ -237,6 +272,8 @@ Tensor Transformer::forward(const Tensor &latent, const Tensor &text, int h, int
         x = rt_.residualRows(x, feedForward(y, p + ".mlp"), modulation_[i], idx, 5);
         if (trace)
             trace("block." + std::to_string(i), x);
+        if (lowMemory_)
+            weights_.erasePrefix(p + ".");
     }
     x = rt_.rmsModulateRows(x.rowSlice(nt + referenceRows, targetRows),
                             weights_.get("final_layer.norm.weight"), 1e-5f, finalModulation_,
@@ -254,6 +291,7 @@ void Transformer::unload() {
     weights_.clear();
     fullWeights_.clear();
     heads_.clear();
+    weights_.enableHostCache(0);
     modulation_.clear();
     finalModulation_ = {};
 }
@@ -289,6 +327,14 @@ VAE::VAE(Runtime &rt, Runtime &full, const std::string &dir)
             throw std::runtime_error("invalid VAE scale");
     if (rt.dtype() != DType::BF16 && rt.dtype() != DType::FP32)
         throw std::invalid_argument("image VAE supports bf16 or fp32");
+}
+void VAE::setMemoryPolicy(const MemoryPolicy &memory) {
+    lowMemory_ = memory.layerStreaming;
+    hostBudget_ = memory.host;
+    weights_.setHostMemoryBudget(memory.host);
+    fullWeights_.setHostMemoryBudget(memory.host);
+    if (lowMemory_)
+        weights_.enableHostCache(size_t(12) << 30);
 }
 Tensor VAE::decodeTile(const Tensor &latent, int h, int w, Trace trace) {
     const int n = h * w;
@@ -330,6 +376,10 @@ Tensor VAE::decodeTile(const Tensor &latent, int h, int w, Trace trace) {
         x = rt_.scaledResidual(x, y, fullWeights_.get(p + ".scale2"));
         if (trace)
             trace("block." + std::to_string(i), x);
+        if (lowMemory_) {
+            weights_.erasePrefix(p + ".");
+            fullWeights_.erasePrefix(p + ".");
+        }
     }
     x = full_.norm(x.rowSlice(0, n), false, &fullWeights_.get("decoder.norm_out.weight"),
                    &fullWeights_.get("decoder.norm_out.bias"), 1e-5f);
@@ -348,9 +398,21 @@ Image VAE::decode(const std::vector<float> &packed, int height, int width, Progr
                 latent[(size_t(y) * lw + z) * 24 + c] = packed[src] * std_[c] + mean_[c];
             }
     auto ys = splitTiles(height), xs = splitTiles(width);
-    std::vector<std::vector<float>> tiles;
+    Image out;
+    out.width = width;
+    out.height = height;
+    out.rgba.resize(size_t(width) * height * 4);
+    // Match released tiling: blend with original neighbours, vertical then horizontal.
+    auto round = [&](float x) { return rt_.dtype() == DType::BF16 ? bf16(x) : x; };
+    auto blend = [&](float a, float b, int i, int extent) {
+        float alpha = round(round(float(i)) / extent);
+        return round(round(a * round(1.f - alpha)) + round(b * alpha));
+    };
+    const size_t nx = xs.starts.size();
+    // Entries before ix hold this row; the rest still hold the original row above.
+    std::vector<std::vector<float>> previous(nx);
     for (size_t iy = 0; iy < ys.starts.size(); ++iy)
-        for (size_t ix = 0; ix < xs.starts.size(); ++ix) {
+        for (size_t ix = 0; ix < nx; ++ix) {
             int th = ys.lengths[iy] / 16, tw = xs.lengths[ix] / 16;
             std::vector<float> tile(size_t(th) * tw * 24);
             for (int y = 0; y < th; ++y) {
@@ -364,25 +426,9 @@ Image VAE::decode(const std::vector<float> &packed, int height, int width, Progr
                     for (int c = 0; c < 3; ++c)
                         tile[(size_t(y) * tw * 16 + z) * 3 + c] =
                             pixels[(size_t(y / 16) * tw + z / 16) * 768 + c * 256 + y % 16 * 16 + z % 16];
-            tiles.push_back(std::move(tile));
-            if (progress)
-                progress("decode", tiles.size(), ys.starts.size() * xs.starts.size());
-        }
-    Image out;
-    out.width = width;
-    out.height = height;
-    out.rgba.resize(size_t(width) * height * 4);
-    // Match released tiling: blend with original neighbours, vertical then horizontal.
-    auto round = [&](float x) { return rt_.dtype() == DType::BF16 ? bf16(x) : x; };
-    auto blend = [&](float a, float b, int i, int extent) {
-        float alpha = round(round(float(i)) / extent);
-        return round(round(a * round(1.f - alpha)) + round(b * alpha));
-    };
-    const size_t nx = xs.starts.size();
-    for (size_t iy = 0; iy < ys.starts.size(); ++iy)
-        for (size_t ix = 0; ix < nx; ++ix) {
-            const int th = ys.lengths[iy], tw = xs.lengths[ix];
-            auto tile = tiles[iy * nx + ix];
+            auto original = tile;
+            th *= 16;
+            tw *= 16;
             if (iy)
                 for (int y = 0; y < ys.overlaps[iy - 1]; ++y)
                     for (int z = 0; z < tw; ++z)
@@ -390,8 +436,7 @@ Image VAE::decode(const std::vector<float> &packed, int height, int width, Progr
                             auto dst = (size_t(y) * tw + z) * 3 + c;
                             auto src =
                                 (size_t(ys.lengths[iy - 1] - ys.overlaps[iy - 1] + y) * tw + z) * 3 + c;
-                            tile[dst] =
-                                blend(tiles[(iy - 1) * nx + ix][src], tile[dst], y, ys.overlaps[iy - 1]);
+                            tile[dst] = blend(previous[ix][src], tile[dst], y, ys.overlaps[iy - 1]);
                         }
             if (ix)
                 for (int y = 0; y < th; ++y)
@@ -402,8 +447,7 @@ Image VAE::decode(const std::vector<float> &packed, int height, int width, Progr
                                         xs.overlaps[ix - 1] + z) *
                                            3 +
                                        c;
-                            tile[dst] =
-                                blend(tiles[iy * nx + ix - 1][src], tile[dst], z, xs.overlaps[ix - 1]);
+                            tile[dst] = blend(previous[ix - 1][src], tile[dst], z, xs.overlaps[ix - 1]);
                         }
             const int ch = th - (iy + 1 < ys.starts.size() ? ys.overlaps[iy] : 0);
             const int cw = tw - (ix + 1 < nx ? xs.overlaps[ix] : 0);
@@ -419,6 +463,9 @@ Image VAE::decode(const std::vector<float> &packed, int height, int width, Progr
                     }
                     out.rgba[dst + 3] = 255;
                 }
+            previous[ix] = std::move(original);
+            if (progress)
+                progress("decode", iy * nx + ix + 1, ys.starts.size() * nx);
         }
     return out;
 }
@@ -434,6 +481,8 @@ minimax_h3::VideoTensor VAE::encode(const Image &image, std::mt19937 &generator,
                     (image.rgba[(size_t(y) * image.width + x) * 4 + c] / 255.f - pixelMean[c]) / pixelStd[c];
     // The image checkpoint uses the same causal CNN encoder, run on one frame.
     minimax_h3::VideoVAE encoder(full_, full_, model_ + "/vae");
+    encoder.setLowMemory(lowMemory_);
+    encoder.setHostMemoryBudget(hostBudget_);
     auto moments = encoder.encodeMoments(pixels, [&](int i, int n) {
         if (progress)
             progress("reference", i, n);
@@ -490,14 +539,31 @@ void Options::validate() const {
     if (pixels > 64 * 1024 * 1024)
         throw std::invalid_argument("combined references exceed 64 megapixels");
 }
-Pipeline::Pipeline(const std::string &model, int device, DType vaeType)
-    : model_(model), rt_(device), full_(device, true), vaeRt_(device, vaeType) {}
+Pipeline::Pipeline(const std::string &model, int device, DType vaeType, double gpuMemoryLimit,
+                   double hostMemoryLimit)
+    : model_(model), rt_(device), full_(device, true), vaeRt_(device, vaeType),
+      memory_(rt_, gpuMemoryLimit, hostMemoryLimit) {}
 Image Pipeline::generate(const Options &o, Progress progress, Trace trace,
                          const std::vector<float> *textInput, const std::vector<float> *noise, bool decode) {
+    rt_.activate();
+    auto scope = memory_.pool ? std::make_unique<nomas::TensorPool::Scope>(*memory_.pool) : nullptr;
+    try {
+        return generateImpl(o, progress, trace, textInput, noise, decode);
+    } catch (...) {
+        // generateImpl's stage-local tensors and caches have now unwound.
+        // Drain queued frees before a subsequent HTTP request reuses the pool.
+        rt_.synchronize();
+        throw;
+    }
+}
+Image Pipeline::generateImpl(const Options &o, Progress progress, Trace trace,
+                             const std::vector<float> *textInput, const std::vector<float> *noise,
+                             bool decode) {
     o.validate();
     const auto canvas = o.canvas();
     const int height = canvas.second, width = canvas.first;
     Transformer transformer(rt_, full_, model_);
+    transformer.setMemoryPolicy(memory_);
     Conditioning condition;
     std::vector<Image> references;
     std::vector<minimax_h3::VisionInput> visual;
@@ -548,6 +614,8 @@ Image Pipeline::generate(const Options &o, Progress progress, Trace trace,
             progress("text", 0, 50);
         minimax_h3::TextEncoder encoder(rt_, model_ + "/text_encoder");
         encoder.setLowMemory(true);
+        encoder.setMemoryPool(memory_.pool);
+        encoder.setHostMemoryBudget(memory_.host);
         text = encoder.encodeVisual(ids, visual, [&](const std::string &name, const Tensor &) {
             if (progress && name.compare(0, 6, "layer.") == 0)
                 progress("text", std::stoi(name.substr(6)) + 1, 50);
@@ -563,6 +631,7 @@ Image Pipeline::generate(const Options &o, Progress progress, Trace trace,
     std::vector<minimax_h3::VideoTensor> encoded;
     if (!references.empty()) {
         VAE vae(vaeRt_, full_, model_);
+        vae.setMemoryPolicy(memory_);
         for (size_t i = 0; i < references.size(); ++i) {
             encoded.push_back(vae.encode(references[i], generator, progress,
                                          trace ? Trace([&, i](const std::string &name, const Tensor &value) {
@@ -637,6 +706,7 @@ Image Pipeline::generate(const Options &o, Progress progress, Trace trace,
     auto host = full_.download(latent);
     latent = {};
     VAE vae(vaeRt_, full_, model_);
+    vae.setMemoryPolicy(memory_);
     auto image = vae.decode(host, height, width, progress);
     return qwen_image::resizeImage(image, o.width, o.height, qwen_image::ImageResizeFilter::Lanczos, 8192);
 }

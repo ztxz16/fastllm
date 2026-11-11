@@ -10,11 +10,10 @@
 
 namespace fastllm {
 namespace minimax_h3 {
-namespace {
 double validateGpuMemoryLimit(double gib) {
     if (!std::isfinite(gib) || gib < 0 || gib > 1048576)
         throw std::invalid_argument("gpu-memory-limit must be a finite GiB value between 0 and 1048576");
-    if (gib != 0 && gib <= 1)
+    if (gib != 0 && (gib - 1) * double(uint64_t(1) << 30) < 1)
         throw std::invalid_argument("gpu-memory-limit must exceed the 1 GiB CUDA/library reserve");
     return gib;
 }
@@ -23,6 +22,7 @@ double validateHostMemoryLimit(double gib) {
         throw std::invalid_argument("host-memory-limit must be 0 or a finite GiB number of at least 2");
     return gib;
 }
+namespace {
 double parseMemoryLimit(const std::string &value, const std::string &name) {
     size_t used = 0;
     double gib = 0;

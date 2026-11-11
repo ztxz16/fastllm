@@ -51,7 +51,22 @@ Output dimensions are 32–8192 per side, up to 20 Mi pixels. Generation uses a 
 
 References accept 8-bit non-interlaced PNG, JPEG and WebP, 32–8192 per side, up to 20 Mi pixels each, aspect ratios 1:4–4:1 and 64 Mi pixels combined. HTTP requests are limited to 32 MiB including multipart overhead. The demo recompresses large PNGs losslessly before upload, so generated PNGs can be reused as references. The CLI accepts files up to 96 MiB. JPEG EXIF rotation is applied during decoding. Reference preparation uses the released model’s size bounds: a 1024-pixel short edge for vision conditioning, and 1024–2048 for VAE encoding.
 
-The model has six distilled steps, guidance scale 1 and one output per request. Masks/inpainting regions, a strength slider, negative prompts/CFG, arbitrary step counts, tensor parallelism and smaller-GPU weight streaming are not implemented. The optional official MiniMax-H3-Image-PE prompt expander is a separate model and is not included here.
+The model has six distilled steps, guidance scale 1 and one output per request. Masks/inpainting regions, a strength slider, negative prompts/CFG, arbitrary step counts, and tensor parallelism are not implemented. The optional official MiniMax-H3-Image-PE prompt expander is a separate model and is not included here.
+
+## Low VRAM and host-memory operation
+
+Both native executables accept `--gpu-memory-limit GiB` and `--host-memory-limit GiB`, also available in the image profile's launcher settings. These are service startup settings and apply to text generation and reference editing alike; individual HTTP jobs cannot change them.
+
+```bash
+minimax_h3_image_server --model /path/to/MiniMax-H3-Image \
+  --gpu-memory-limit 4 --host-memory-limit 2 --port 8009
+```
+
+With no GPU limit (or `0`), startup checks free device memory: below 60 GiB, DiT and VAE weights stream layer by layer; otherwise the DiT stays resident during denoising. Text weights always stream. An explicit limit must exceed 1 GiB. It reserves a persistent CUDA pool of `limit - 1 GiB`, leaving 1 GiB for the CUDA context/library workspace. A limit below 60 GiB selects layer streaming. Reserved pages remain allocated while the service is idle, including after cancellation or failure, and are reused by later requests. Insufficient activation space produces a failed job; precision, resolution and the six-step sampler are never silently reduced. Larger canvases or many references can require a larger budget.
+
+With no host limit (or `0`), a shared weight cache uses at most one quarter of available host/container memory minus a 2 GiB working allowance, capped at 64 GiB. Detection respects the process's cgroup v1/v2 quota and visible parent quotas, including sibling usage. Explicit host limits must be at least 2 GiB: `2` disables weight caching; larger values allow caching within the remaining quota. Text, vision, reference encoding, DiT and VAE share the quota and load uncached tensors in at most 16 MiB chunks without whole-weight mmap reads. VAE output tiles are combined a row at a time. The host option bounds **weight caching**, not total process RSS: image buffers, queued uploads, tokenizer, CUDA runtime and filesystem cache also need memory. Low budgets trade speed for capacity.
+
+`GET /health` reports `gpu_memory_limit_gib`, `host_memory_limit_gib`, `gpu_memory_reserved`, `layer_streaming` and `host_weight_cache_gib`. A reported limit of zero means automatic policy; the cache field reports its effective capacity. CLI VAE diagnostics use the same policy. Inference remains native C++/CUDA, without a Torch dependency.
 
 ## Web demo and HTTP API
 

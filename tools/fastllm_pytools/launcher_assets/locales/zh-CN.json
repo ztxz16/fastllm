@@ -342,7 +342,7 @@
     "~/.local/share/fastllm/videos/端口": "~/.local/share/fastllm/videos/端口",
     "可用 GPU": "可用 GPU",
     "每卡显存预算（GiB，可选）": "每卡显存预算（GiB，可选）",
-    "留空或 0 保留原有速度；预算充足时权重驻留，较小时逐层加载。启动时预留显存。": "留空或 0 保留原有速度；预算充足时权重驻留，较小时逐层加载。启动时预留显存。",
+    "留空或 0 使用默认策略；预算充足时权重驻留，较小时逐层加载。指定预算后启动时预留显存。": "留空或 0 使用默认策略；预算充足时权重驻留，较小时逐层加载。指定预算后启动时预留显存。",
     "主机内存预算（GiB，可选）": "主机内存预算（GiB，可选）",
     "留空或 0 使用默认缓存；2 表示从磁盘分块读取，较大预算用于缓存权重。另需为系统和媒体处理留出内存。": "留空或 0 使用默认缓存；2 表示从磁盘分块读取，较大预算用于缓存权重。另需为系统和媒体处理留出内存。",
     "推测解码（可选）": "推测解码（可选）",
@@ -834,7 +834,9 @@
     "Image demo": "图像 Demo",
     "cancelling": "正在取消",
     "Image generation": "图像生成",
-    "MiniMax H3 Image · single GPU, text-to-image and reference editing. Select a GPU with enough free memory.": "MiniMax H3 Image · 单卡文生图与参考图编辑。请选择显存充足的 GPU。"
+    "MiniMax H3 Image · single GPU, text-to-image and reference editing. Select a GPU with enough free memory.": "MiniMax H3 Image · 单卡文生图与参考图编辑。请选择显存充足的 GPU。",
+    "图像显存预算须为大于 1 的 GiB 数值，或填 0 使用默认策略。": "图像显存预算须为大于 1 的 GiB 数值，或填 0 使用默认策略。",
+    "图像内存预算须为至少 2 的 GiB 数值，或填 0 使用默认策略。": "图像内存预算须为至少 2 的 GiB 数值，或填 0 使用默认策略。"
   },
   "patterns": [
     {
