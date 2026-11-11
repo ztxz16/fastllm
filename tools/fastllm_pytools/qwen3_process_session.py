@@ -42,7 +42,7 @@ class GenerationObserverError(RuntimeError):
 class Qwen3ProcessSession:
     """同步会话；线程调用串行化，超时或协议错误后整组回收，不自动重试请求。"""
 
-    def __init__(self, binary, worker, model, devices, output, *, timeout=1800, trace=False, cuda_graph=False, custom_allreduce=False, prefix_cache=False):
+    def __init__(self, binary, worker, model, devices, output, *, timeout=1800, trace=False, cuda_graph=False, custom_allreduce=False, prefix_cache=False, environment=None):
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("session timeout must be finite and positive")
         device_ids = [int(value) for value in devices.split(",")]
@@ -50,6 +50,7 @@ class Qwen3ProcessSession:
             raise ValueError("devices must be distinct nonnegative indices")
         self.binary, self.worker, self.model = (Path(value).resolve() for value in (binary, worker, model))
         self.devices = device_ids
+        self.environment = dict(environment) if environment is not None else None
         self.output = Path(output).resolve()
         if type(cuda_graph) is not bool:
             raise ValueError("cuda_graph must be boolean")
@@ -199,7 +200,8 @@ class Qwen3ProcessSession:
                 stdout = self._stack.enter_context((self.output / "native.stdout.log").open("wb"))
                 stderr = self._stack.enter_context((self.output / "native.stderr.log").open("wb"))
                 self._process = self._stack.enter_context(isolated_process(
-                    command, pass_fds=(child.fileno(), cancel_child.fileno()), stdout=stdout, stderr=stderr))
+                    command, pass_fds=(child.fileno(), cancel_child.fileno()), stdout=stdout, stderr=stderr,
+                    env=self.environment))
                 child.close()
                 cancel_child.close()
                 self.ready = self._read(time.monotonic() + self.timeout)

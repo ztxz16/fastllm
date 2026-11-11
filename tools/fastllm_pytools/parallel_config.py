@@ -182,7 +182,7 @@ def build_parallel_plan(args):
         raise ValueError('--custom-allreduce requires process TP=2 within each replica')
 
     return {'dp_size': dp, 'tp_size': tp, 'total_gpus': dp * tp, 'tp_backend': getattr(args, 'tp_backend', 'thread'),
-            'preview_only': True, 'multi_replica_execution_available': False,
+            'preview_only': True, 'multi_replica_execution_available': True,
             'cuda_visible_devices': visible, 'driver_cuda_version': inventory['driver_cuda_version'],
             'visible_device_count': available,
             'replicas': [{'dp_rank': rank, 'devices': [dict(devices[index]) for index in ids]}
@@ -194,15 +194,11 @@ def prepare_parallel_entry(args, *, allow_preview=False):
      * 为正式 CLI、模型工厂及直接进程后端入口提供同一启动边界。
      * @param args 已展开配置的参数。
      * @param allow_preview 仅 CLI 允许返回预览；模型工厂不得把计划当模型返回。
-     * @return 预览时返回分配字典；旧单副本执行返回 None。多副本执行尚未接入时
-     *         完成配置与设备校验后明确报错，防止退回单副本执行。
+     * @return 预览时返回分配字典；正常执行返回 None，模型工厂负责分配和启动。
      */"""
-    dp = validate_parallel_options(args)
+    validate_parallel_options(args)
     if getattr(args, 'parallel_plan', False):
         if not allow_preview:
             raise ValueError('--parallel-plan is a CLI preview; use build_parallel_plan for a programmatic plan')
         return build_parallel_plan(args)
-    if dp > 1:
-        build_parallel_plan(args)
-        raise NotImplementedError('DP>1 多副本执行尚未接入；使用 --parallel-plan 预览 GPU 分配')
     return None

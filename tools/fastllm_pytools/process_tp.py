@@ -1,6 +1,7 @@
 """FastLLM 正式入口的进程 TP 适配层；权重、采样和前向仍由 C++/CUDA 执行。"""
 
 from datetime import datetime, timezone
+from contextlib import contextmanager
 import json
 import math
 import os
@@ -8,6 +9,7 @@ from pathlib import Path
 import queue
 import re
 import shutil
+import signal
 import sys
 import threading
 import uuid
@@ -61,17 +63,19 @@ def native_binary(value, name):
     return path
 
 
-def validate_options(args):
+def validate_options(args, *, allow_dp=False):
     """进程后端仅接受已实现的参数；拒绝线程后端专用配置，绝不静默忽略。"""
     from .util import make_normal_parser, add_server_args
     from .parallel_config import prepare_parallel_entry
 
     prepare_parallel_entry(args)
+    if getattr(args, 'dp', 1) > 1 and not allow_dp:
+        raise ValueError('DP>1 requires the model factory or ProcessDPModel, not ProcessTPModel')
 
     parser = make_normal_parser('process validation')
     add_server_args(parser)
     defaults = vars(parser.parse_args([]))
-    allowed = {'model', 'path', 'tp', 'tp_backend', 'tp_binary', 'tp_worker', 'tp_output', 'tp_timeout',
+    allowed = {'model', 'path', 'dp', 'tp', 'tp_backend', 'tp_binary', 'tp_worker', 'tp_output', 'tp_timeout',
                'tp_request_timeout', 'tp_queue_size', 'host', 'port', 'model_name', 'cuda_graph', 'custom_allreduce'}
     compatible = {'dtype': ('auto', 'float16'), 'atype': ('auto', 'float16'),
                   'kv_cache_dtype': ('auto', 'float16'), 'kv_cache_layout': ('auto', 'continuous'),
@@ -127,12 +131,19 @@ class ProcessTPModel:
     tp_backend = 'process'
     backend = BACKEND
 
-    def __init__(self, args):
+    def __init__(self, args, *, _device_ids=None, _environment=None):
         from .util import load_model_args
 
         load_model_args(args)
         validate_options(args)
         self.devices = process_devices(getattr(args, 'tp', ''))
+        if _device_ids is not None:
+            # DP 内部分配传递逻辑编号，不能重新按裸数字卡数解析单卡编号 1。
+            if (not isinstance(_device_ids, (list, tuple)) or not 1 <= len(_device_ids) <= 64 or
+                    any(type(i) is not int or not 0 <= i <= 2147483647 for i in _device_ids) or
+                    len(set(_device_ids)) != len(_device_ids)):
+                raise ValueError('invalid allocated replica devices')
+            self.devices = ','.join(map(str, _device_ids))
         self.model_path = Path(getattr(args, 'path', '') or args.model or '').expanduser().resolve()
         if not self.model_path.is_dir() or not (self.model_path / 'config.json').is_file():
             raise ValueError('process TP requires a local HF Qwen3 model directory; no automatic download')
@@ -156,7 +167,8 @@ class ProcessTPModel:
                                           self.output / 'session', timeout=getattr(args, 'tp_timeout', 180),
                                           cuda_graph=getattr(args, 'cuda_graph', False),
                                           custom_allreduce=getattr(args, 'custom_allreduce', False),
-                                          prefix_cache=getattr(args, 'prefix_cache', '') == 'true')
+                                          prefix_cache=getattr(args, 'prefix_cache', '') == 'true',
+                                          environment=_environment)
         self.session.__enter__()
         args.path = str(self.model_path)
 
@@ -278,11 +290,28 @@ class ProcessTPModel:
         self.close()
 
 
+@contextmanager
+def process_termination_scope():
+    """/** CLI 主线程在模型加载/执行期间将 SIGTERM 转为异常，保证上下文回收副本。 */"""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+
+    def terminate(signum, _):
+        raise SystemExit(128 + signum)
+
+    previous = signal.signal(signal.SIGTERM, terminate)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
 def run_chat(args):
     """正式 chat/run 命令；沿用聊天历史语义，每次请求重算历史，不宣称前缀缓存。"""
     from .util import make_normal_llm_model
 
-    with make_normal_llm_model(args) as model:
+    with process_termination_scope(), make_normal_llm_model(args) as model:
         print(f'backend={model.backend}, devices={model.devices}, logs={model.output}', file=sys.stderr)
         if args.prompt is not None:
             print(model.response(args.prompt, max_length=args.max_new_tokens))
@@ -319,7 +348,7 @@ def run_server(args):
     from .util import make_normal_llm_model
     from .qwen3_process_server import serve_model
 
-    with make_normal_llm_model(args) as model:
+    with process_termination_scope(), make_normal_llm_model(args) as model:
         return serve_model(model, model.hf_tokenizer, model.model_path, args.model_name or str(model.model_path),
                            model.output, host=args.host, port=args.port, queue_size=args.tp_queue_size,
                            request_timeout=args.tp_request_timeout)
