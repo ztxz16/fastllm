@@ -10,8 +10,8 @@ NCCL 初始化和标量 SUM 自检、心跳、超时、退出与故障回收。
 “自定义 AllReduce”和“跨请求前缀缓存”各节为准。
 构建选项 `BUILD_PROCESS_TP` 默认关闭，显式开启后才构建进程产物。
 
-新增的 **DP 第一步仅提供参数检查与 GPU 分配预览**，详见文末“DP 参数与 GPU 分配”。
-尚未启动多个模型副本，不能把预览通过当作 DP 推理验收通过。
+新增的 **完整模型 DP 已接入正式工厂与 CLI**，支持纯 DP 和副本内部 TP；
+设备预览与实际执行分别验收，详见文末“DP 参数与 GPU 分配”和“DP 多副本执行”。
 
 ## 运行条件
 
@@ -1011,12 +1011,12 @@ python3 -m ftllm.cli chat /home/models/Qwen3-1.7B \
 - CLI 在 `chat/run/server/serve` 中输出预览后退出。JSON 配置支持 `dp` 和布尔型
   `parallel_plan`，也接受 `parallel-plan` 别名，但不能同时提供两个别名；配置文件保持原有覆盖 CLI 的顺序。
   JSON 中 `dp: true`、浮点数或字符串都拒绝，不能绕过正整数校验。
-- 没有 `--parallel-plan` 时，`DP>1` 在配置与设备检查后明确报“多副本执行尚未接入”。
-  模型工厂和直接进程后端同样拒绝，不能静默启动一个副本。
+- 没有 `--parallel-plan` 时，`DP>1` 由正式模型工厂进入多副本池；直接构造单副本
+  `ProcessTPModel` 仍拒绝 `DP>1`，不能静默启动一个副本。
 - 返回的 JSON 包含 `dp_size`、`tp_size`、`total_gpus`、`visible_device_count` 和 `replicas`。
   每个副本包含 `dp_rank` 和设备的 `logical_id`、`uuid`、`name`。
   `driver_cuda_version` 是驱动支持的 CUDA 版本编码，不是所安装 Toolkit 的版本；
-  `preview_only: true`、`multi_replica_execution_available: false` 明确本阶段能力边界。
+  `preview_only: true` 表示本次调用只预览，`multi_replica_execution_available: true` 表示支持另行执行。
 
 以下命令在仓库根目录直接使用当前源码的正式 CLI，无需更新旧构建包或重新编译。
 先在两卡服务器检查纯 DP：
@@ -1053,3 +1053,79 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python3 test/distributed/run_parallel_config.py --r
 实际 GPU 用例另存完整 CLI 命令及 stdout/stderr。任一失败返回非零，中途失败保留已执行部分。
 报告区分模拟与真实驱动路径，记录 Git/命令/设备及 CUDA 来源；未执行真实查询时 GPU/CUDA 为 null，
 编译架构为不适用。此阶段不加载真实模型，不包含模型精度或吞吐性能结论。
+
+## DP 多副本执行（第二步）
+
+正式模型工厂及 `ftllm run/chat/server/serve` 支持完整模型副本 DP：
+
+| 参数 | 执行方式 | GPU 分配 |
+| --- | --- | --- |
+| `--dp 2` | 纯 DP，省略 TP 等价于每副本一张卡 | `[0]`、`[1]` |
+| `--dp 4 --tp 1` | 四个完整模型副本 | `[0]`、`[1]`、`[2]`、`[3]` |
+| `--dp 2 --tp 2` | 两个完整模型副本，每副本内部 TP2 | `[0,1]`、`[2,3]` |
+
+以上均要求 `--tp-backend process`。每个副本启动独立 C++ 协调器和 TP worker，
+只在自己的 GPU 集合内做 NCCL/可选自定义 AllReduce。权重、前向、采样、Graph 与 KV
+仍由既有 C++/CUDA 路径执行；Python 仅负责 tokenizer、生命周期和分发。
+GPU 编号是 CUDA 可见逻辑编号；子进程继承启动时的环境快照，不修改父进程的可见设备列表。
+
+- 全部副本就绪后才接受请求，启动期间任一失败都会回收已成功启动的副本。
+- 按空闲副本轮转，一次请求只提交到一个副本，不重试、不复制请求。
+  每副本一次处理一个请求，多个副本可以同时运行；本步不包含 continuous batching 或缓存感知分发。
+- 模型工厂的 `generate` 返回 `dp_rank` 和池内唯一的 `dp_request_id`；原生 `id` 仍属于该副本自己的会话。
+  `response`/`stream_response` 保持文本接口。HTTP 消费线程数等于 DP 副本数，队列容量仍是全局等待请求数。
+  `/health` 增加 `active_request_ids`、`dp_size` 和 `replicas`，`workers` 中包含 `dp_rank`。
+- 取消、消费者提前关闭文本流、超时、原生协议错误均复用 TP 清理语义；故障副本不能继续分配。
+  本阶段发生致命副本故障时停止整个池的新分配，由关闭流程回收所有副本；尚无自动重启或降级服务。
+- Prefix Cache/Graph/自定义规约的资源和计数各副本独立；清空前缀缓存会暂停新分配、等待旧调用结束，
+  再清理全部副本。没有跨副本 KV 迁移或共享缓存。
+- 正常退出、Ctrl-C、CLI SIGTERM 和启动失败均经过回收路径。程序接口应使用上下文管理器或显式 `close()`。
+  关闭会取消原生在途请求，并回收全部进程，不依赖客户端继续读取暂停的文本迭代器。
+- 支持范围沿用进程 TP：Linux NVIDIA CUDA、本地未量化稠密 Qwen3、FP16 执行、Prompt 最多 128 token。
+  纯 DP 可使用 Graph 和 Prefix Cache；自定义 AllReduce 只允许副本内部 TP2，必须满足 GPU P2P 条件。
+
+示例（在仓库根目录，使用已有产物）：
+
+```bash
+export USE_TORCH=0
+export PYTHONPATH="$PWD/tools${PYTHONPATH:+:$PYTHONPATH}"
+CUDA_VISIBLE_DEVICES=0,1 python3 -m fastllm_pytools.cli run /home/models/Qwen3-1.7B \
+  --tp-backend process --dp 2 \
+  --tp-binary build-process-tp-cu126/fastllm_tp_generate \
+  --tp-worker build-process-tp-cu126/fastllm_tp_worker \
+  --prompt '请用一句话介绍你自己。' --max-new-tokens 32
+
+CUDA_VISIBLE_DEVICES=0,1,2,3 python3 -m fastllm_pytools.cli serve /home/models/Qwen3-1.7B \
+  --tp-backend process --dp 2 --tp 2 \
+  --tp-binary build-process-tp-cu126/fastllm_tp_generate \
+  --tp-worker build-process-tp-cu126/fastllm_tp_worker \
+  --host 127.0.0.1 --port 8000
+```
+
+本地仅 Python 检查（CUDA/原生协议使用测试替身，不编译）：
+
+```bash
+python3 test/distributed/run_parallel_config.py --execution-tests
+```
+
+覆盖 DP1 兼容、DP2/4 单卡副本、DP2×TP2、真实子进程协议并发、启动回滚、运行故障、取消、
+流式关闭、SIGTERM 清理、HTTP 多请求、Graph/IPC/Prefix 组合，以及验收器成功与部分失败报告。
+
+新的 Ubuntu 24.04 / 四卡 V100 服务器（Vast 镜像已配置 NVIDIA apt 仓库）执行：
+
+```bash
+# 首次准备：并行安装 CUDA 12.6 工具链，切换并固定配套 NCCL，创建 Python venv，下载模型。
+# 此步骤会安装系统依赖并下载文件；不会编译项目。已有完整环境可跳过。
+bash test/distributed/prepare_process_dp_v100.sh
+
+# 服务器构建及五组验收；默认使用 CUDA_VISIBLE_DEVICES=0,1,2,3。
+bash test/distributed/run_qwen3_dp_v100.sh /home/models/Qwen3-1.7B
+```
+
+五组包含：Python/真实设备回归；DP2×TP1；DP4×TP1 Graph+Prefix；DP2×TP2；
+DP2×TP2 Graph+Prefix+IPC。后四组每组 10 个功能 case，使用正式工厂做同 TP 大小的 DP=1 基线，
+检查精确 Token ID、请求归属、并发、取消、缓存清空、文本流、HTTP 和退出回收。
+CLI case 在同一验收进程调用正式 `cli.main`，保留等价终端命令与原始输出；不会绕过模型工厂。
+严格检查实际 Graph/规约/Prefix 路径；不支持的 P2P 或执行设置直接 FAIL，不静默回退。
+每组独立保存 Markdown、CSV、JSON、XLSX 和原始日志，失败返回非零且保留部分报告。
+这轮验证功能正确性，不包含吞吐提升、延迟或调度最优性的结论。

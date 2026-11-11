@@ -32,13 +32,21 @@ def fixture():
     channel = socket.socket(fileno=int(args["--session-fd"]))
     cancellation = socket.socket(fileno=int(args["--cancel-fd"]))
     # 使用真正的第二个 PID，避免 getpid()+1 偶然撞上并行测试的活进程。
-    peer = subprocess.Popen([sys.executable, '-c', 'import sys; sys.stdin.buffer.read()'], stdin=subprocess.PIPE)
+    devices = list(map(int, args['--devices'].split(',')))
+    if mode == 'dp_startup_failure':
+        (Path(args['--model']) / f'launch-{devices[0]}.json').write_text(json.dumps(dict(pid=os.getpid())))
+        if devices[0] != 0:
+            return
+    peers = [subprocess.Popen([sys.executable, '-c', 'import sys; sys.stdin.buffer.read()'], stdin=subprocess.PIPE)
+             for _ in devices[1:]]
     def close_peer():
-        peer.stdin.close()
-        peer.wait(timeout=5)
+        for peer in peers:
+            peer.stdin.close()
+            peer.wait(timeout=5)
     atexit.register(close_peer)
-    workers = [dict(rank=i, device=i, pid=pid) for i, pid in enumerate((os.getpid(), peer.pid))]
-    cache = [EMPTY.copy(), EMPTY.copy()]
+    workers = [dict(rank=i, device=device, pid=pid)
+               for i, (device, pid) in enumerate(zip(devices, [os.getpid()] + [p.pid for p in peers]))]
+    cache = [EMPTY.copy() for _ in devices]
     graph_enabled = args.get("--cuda-graph") == "1"
     graph = dict(enabled=graph_enabled, active=False, captures=0, replays=0, warmups=0, eager_decodes=0, workspace_bytes=0)
     custom_enabled = args.get('--custom-allreduce') == '1'
@@ -104,7 +112,7 @@ def fixture():
                 for key in ('captures', 'replays', 'warmups', 'eager_decodes', 'workspace_bytes'):
                     state[key] = float(state[key])
             value['execution'] = 'decode_cuda_graph' if graph_enabled else 'eager'
-            value['graph_after_unload' if event == 'shutdown' else 'graph'] = [dict(state), dict(state)]
+            value['graph_after_unload' if event == 'shutdown' else 'graph'] = [dict(state) for _ in devices]
         data = json.dumps(value, indent=2).encode()
         framed = struct.pack("!I", len(data)) + data
         # 验证读取可以正确组装分段 header/body，多行 JSON 不依赖 stdout。
@@ -122,7 +130,8 @@ def fixture():
 
     print("NCCL INFO simulated noisy stdout", flush=True)
     send(dict(event="ready", status="PASS", protocol=1, backend=BACKEND,
-              model_load_count=1, workers=workers, cache=cache, cancellation="request_id_datagram", token_events=True))
+              model_load_count=1, workers=workers, cache=cache, cancellation="request_id_datagram", token_events=True,
+              visible_devices=os.environ.get('CUDA_VISIBLE_DEVICES')))
     while True:
         try:
             message = json.loads(read(struct.unpack("!I", read(4))[0]))
@@ -138,6 +147,14 @@ def fixture():
             send(dict(event='prefix_cache_cleared', id=message['id'], status='PASS', cache=cache))
             continue
         request = message["request"]
+        if mode == 'dp_overlap':
+            model = Path(args['--model'])
+            (model / f'started-{devices[0]}').touch()
+            deadline = time.monotonic() + 3
+            while len(list(model.glob('started-*'))) < 2:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError('DP requests did not overlap')
+                time.sleep(0.01)
         if mode == "timeout":
             child = subprocess.Popen([sys.executable, "-c", "import signal; signal.raise_signal(signal.SIGSTOP)"])
             Path(args["--model"]).with_suffix(".pids.json").write_text(json.dumps([os.getpid(), child.pid]))
@@ -154,7 +171,7 @@ def fixture():
                       workers=workers, reusable=True, request=request, token_ids=[request["token_ids"][0]],
                       finish_reason="eos" if request["token_ids"][0] in request.get("eos_token_ids", []) else "length",
                       cache_after_generate=cache)
-        if (mode in ('graph_normal', 'graph_stale') or mode.startswith(('ar_', 'prefix_'))) and request.get('max_new_tokens', 0) > 0:
+        if (mode in ('graph_normal', 'graph_stale', 'dp_smoke') or mode.startswith(('ar_', 'prefix_'))) and request.get('max_new_tokens', 0) > 0:
             result['token_ids'] *= request['max_new_tokens']
             result['steps'] = [dict(token_id=token) for token in result['token_ids']]
         if message.get("stream_tokens"):
@@ -173,7 +190,7 @@ def fixture():
                 result["token_ids"] = [token+1]
             if mode == "stream_error_float":
                 result.update(status="FAIL", steps=[dict(token_id=float(token))], cache_after_error=cache)
-            if mode in ("stream_burst", "stream_eos"):
+            if mode in ("stream_burst", "stream_eos", "dp_smoke"):
                 count = request.get("max_new_tokens", 1)
                 if mode == "stream_eos":
                     count = 1
@@ -182,7 +199,7 @@ def fixture():
                     send(dict(event="token", id=message["id"], index=index, token_id=token))
                 result["token_ids"] = [token]*count
                 result["steps"] = [dict(token_id=token)]*count
-        if mode == "cancel" and request.get("max_new_tokens", 1) > 1:
+        if (mode == "cancel" and request.get("max_new_tokens", 1) > 1) or (mode == 'dp_smoke' and request.get('max_new_tokens') == 128):
             while True:
                 if select.select([cancellation], [], [], 5)[0]:
                     cancelled_id = struct.unpack("!I", cancellation.recv(4))[0]
