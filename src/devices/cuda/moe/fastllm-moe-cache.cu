@@ -2088,6 +2088,47 @@ __global__ void FastllmNVFP4OffloadDownExactWideKernel(
     }
 }
 
+// Hybrid execution publishes each expert independently; its final router
+// reduction is a separate operator. Map a half-warp to an output, without
+// allocating inactive expert warps or synchronizing unrelated routes.
+template <typename T, int Rows = 16>
+__global__ void FastllmNVFP4DownExpertsKernel(const T *input,
+        const int32_t *routeSlots, const uint8_t *records, float *output,
+        int inter, int hidden, int scaleCols, size_t recordStride,
+        size_t downOffset, size_t scalesOffset,
+        const int32_t *routeMap = nullptr, const uint64_t *slotOffsets = nullptr,
+        const int32_t *activeRouteCount = nullptr, int firstRoute = 0) {
+    const int row = blockIdx.x * Rows + threadIdx.x / 16;
+    const int lane = threadIdx.x & 15;
+    const int route = firstRoute + blockIdx.y;
+    if (row >= hidden || (activeRouteCount && route >= *activeRouteCount)) return;
+    const int slot = routeSlots[route];
+    float low0 = 0, high0 = 0, low1 = 0, high1 = 0;
+    if (slot >= 0) {
+        const uint8_t *record = records + (slotOffsets ? slotOffsets[slot] : size_t(slot) * recordStride);
+        const float scale = reinterpret_cast<const float *>(record + scalesOffset)[2];
+        for (int word = lane; word < (inter >> 3); word += 32) {
+            AccumulateCompactE4M3WordPair(input + size_t(route) * inter, word,
+                record + downOffset, row, hidden, inter, scaleCols, scale, low0, high0);
+            if (word + 16 < (inter >> 3))
+                AccumulateCompactE4M3WordPair(input + size_t(route) * inter, word + 16,
+                    record + downOffset, row, hidden, inter, scaleCols, scale, low1, high1);
+        }
+    }
+    const unsigned mask = __activemask();
+    for (int offset = 8; offset > 0; offset >>= 1) {
+        low0 += __shfl_down_sync(mask, low0, offset, 16);
+        high0 += __shfl_down_sync(mask, high0, offset, 16);
+        low1 += __shfl_down_sync(mask, low1, offset, 16);
+        high1 += __shfl_down_sync(mask, high1, offset, 16);
+    }
+    if (lane == 0) {
+        const float value = (low0 + high0) + (low1 + high1);
+        output[size_t(routeMap ? routeMap[route] : route) * hidden + row] = ActivationTraits<T>::ToFloat(
+            ActivationTraits<T>::FromFloat(value));
+    }
+}
+
 bool SupportsNVFP4WideDecode(const OffloadLayout &l) {
     return l.gateBlockK == 1 && l.downBlockK == 1 && l.gateBlockM == 16 &&
         l.downBlockM == 16 && l.hidden % 128 == 0 && l.inter % 128 == 0;
@@ -2113,14 +2154,25 @@ bool LaunchNVFP4Cache(const fastllm::Data &input, fastllm::Data &gateOutput,
             layout.hidden, layout.inter, layout.gateScaleCols,
             layout.recordStride, layout.scalesOffset);
         if (!FastllmMoeWaitDown(events)) return false;
-        FastllmNVFP4OffloadDownExactWideKernel<T, kMaxTopK>
-            <<<layout.hidden, topk * 32, 0, cudaStreamPerThread>>>(
-            reinterpret_cast<const T *>(gateOutput.cudaData),
-            cache.routeSlots, cache.records,
-            reinterpret_cast<T *>(output.cudaData), scores, topk,
-            layout.inter, layout.hidden, layout.downScaleCols,
-            layout.recordStride, layout.downOffset,
-            layout.scalesOffset, perExpert);
+        if (perExpert != nullptr) {
+            constexpr int outputRows = 16;
+            FastllmNVFP4DownExpertsKernel<T, outputRows>
+                <<<dim3((layout.hidden + outputRows - 1) / outputRows, topk),
+                   outputRows * 16, 0, cudaStreamPerThread>>>(
+                reinterpret_cast<const T *>(gateOutput.cudaData), cache.routeSlots,
+                cache.records, perExpert, layout.inter, layout.hidden,
+                layout.downScaleCols, layout.recordStride, layout.downOffset,
+                layout.scalesOffset);
+        } else {
+            FastllmNVFP4OffloadDownExactWideKernel<T, kMaxTopK>
+                <<<layout.hidden, topk * 32, 0, cudaStreamPerThread>>>(
+                reinterpret_cast<const T *>(gateOutput.cudaData),
+                cache.routeSlots, cache.records,
+                reinterpret_cast<T *>(output.cudaData), scores, topk,
+                layout.inter, layout.hidden, layout.downScaleCols,
+                layout.recordStride, layout.downOffset,
+                layout.scalesOffset);
+        }
     } else {
         const dim3 gateGrid(layout.inter, topk);
         FastllmNVFP4OffloadGateKernel<T, 64>

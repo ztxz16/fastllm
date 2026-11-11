@@ -369,8 +369,8 @@ inline cudaError_t CopyNativeRecords(const Record &layout, void *const *pointers
         uint8_t *destination, cudaStream_t stream,
         const int32_t *experts = nullptr, const int32_t *slots = nullptr,
         const int32_t *count = nullptr, const uint64_t *slotOffsets = nullptr,
-        int fixedExpert = 0, const uint8_t *promoted = nullptr, int promotedExpert = -1) {
-    NativeRecords<<<dim3(48, 1, 2), 256, 0, stream>>>(layout, pointers, destination,
+        int fixedExpert = 0, const uint8_t *promoted = nullptr, int promotedExpert = -1, int blocks = 48) {
+    NativeRecords<<<dim3(blocks, 1, 2), 256, 0, stream>>>(layout, pointers, destination,
         experts, slots, count, slotOffsets, fixedExpert, promoted, promotedExpert);
     return cudaGetLastError();
 }

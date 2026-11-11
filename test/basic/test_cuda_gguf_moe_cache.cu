@@ -1,3 +1,4 @@
+#include "utils/kernel_registry.h"
 #include "fastllm.h"
 #include "fastllm-cuda.cuh"
 #include "devices/cuda/fastllm-cuda-moe-policy.h"
@@ -571,8 +572,9 @@ template<class T> static void RunSubwarp(ggml_type type, ggml_type downType,
     }
 }
 
-template<class T> static void RunSplitUpload(ggml_type type, fastllm::DataType dtype, bool numa) {
+template<class T> static void RunSplitUpload(ggml_type type, fastllm::DataType dtype, bool numa, bool tune = false) {
     using namespace fastllm;
+    if (tune) { std::string error; Require(kernels::Configure("{\"mode\":\"off\"}",error),"reset tuning"); }
     constexpr int hidden = 2560, inter = 640;
     auto g = Weight(type, 2*inter, hidden, 1, true);
     auto d = Weight(GGML_TYPE_Q2_0, hidden, inter, 2, true);
@@ -608,6 +610,19 @@ template<class T> static void RunSplitUpload(ggml_type type, fastllm::DataType d
         Require(FastllmCudaMoeGGUFCacheCompute(input,gate,output,view,
             static_cast<float *>(scores.cudaData),1,static_cast<float *>(partial.cudaData)),"split reference rejected");
         Cuda(cudaMemcpy(reference.data(),partial.cudaData,hidden*sizeof(float),cudaMemcpyDeviceToHost));
+        if (tune && pass == 0) {
+            std::string error;
+            Require(kernels::Configure("{\"mode\":\"quick\",\"repeats\":2,\"force\":{"
+                "\"moe.gguf.gate_swiglu_down\":\"cuda.moe.gguf.q8\"}}", error), "configure staged tuning");
+            Require(FastllmCudaMoeGGUFCacheNeedsPreparation(input,view,1), "expected cold staged signature");
+            Cuda(cudaEventRecord(upload.downReady,upload.stream));
+            Require(FastllmCudaMoeGGUFCacheComputeStaged(input,gate,output,view,
+                static_cast<float *>(scores.cudaData),1,static_cast<float *>(partial.cudaData),
+                {upload.downReady,upload.gateDone,upload.downStart}),"cold staged tuning rejected");
+            Require(!FastllmCudaMoeGGUFCacheNeedsPreparation(input,view,1), "staged tuning did not prepare");
+            Cuda(cudaStreamSynchronize(cudaStreamPerThread));
+            Cuda(cudaGetLastError());
+        }
         Cuda(cudaMemset(records.cudaData,0xff,stride));
         Cuda(cudaDeviceSynchronize());
         Cuda(cudaMemcpyAsync(records.cudaData,upload.host,offset,cudaMemcpyHostToDevice,upload.stream));
@@ -1274,7 +1289,7 @@ static void RunSharedGGUFRecords() {
             Cuda(cudaMemcpy(uploaded, host + 2 * layout.stride, layout.stride, cudaMemcpyHostToDevice));
             // Cover host restoration, device-selected batches, D2D promotion,
             // empty requests, and restoration after a DMA upload.
-            for (auto mode : {Mode::FixedExpert, Mode::Batch, Mode::Promotion, Mode::PackedPromotion, Mode::Empty, Mode::Uploaded, Mode::Background}) {
+            for (int copyBlocks : {1, 24, 64}) for (auto mode : {Mode::FixedExpert, Mode::Batch, Mode::Promotion, Mode::PackedPromotion, Mode::Empty, Mode::Uploaded, Mode::Background}) {
                 std::fill(expected.begin(), expected.end(), 0xa5);
                 metadata[6] = mode == Mode::Empty ? 0 : experts;
                 Cuda(cudaMemcpy(promoted, mode == Mode::PackedPromotion ? host : canonical.data(),
@@ -1288,7 +1303,7 @@ static void RunSharedGGUFRecords() {
                     Cuda(CopyRecords(layout, fromUpload ? nullptr : pointers, output, cudaStreamPerThread,
                         nullptr, nullptr, nullptr, nullptr, fromUpload ? 0 : 2,
                         nullptr, -1, fromUpload ? uploaded : nullptr, false,
-                        mode == Mode::Background ? 16 : 64));
+                        mode == Mode::Background ? 16 : copyBlocks));
                 } else {
                     for (int i = 0; i < metadata[6]; ++i)
                         std::memcpy(expected.data() + offsets[metadata[experts + i]],
@@ -1296,7 +1311,7 @@ static void RunSharedGGUFRecords() {
                     Cuda(CopyRecords(layout, pointers, output, cudaStreamPerThread,
                         ids, ids + experts, ids + 2 * experts, slotOffsets, 0,
                         mode == Mode::Promotion || mode == Mode::PackedPromotion ? promoted : nullptr, 0,
-                        nullptr, mode == Mode::PackedPromotion));
+                        nullptr, mode == Mode::PackedPromotion, copyBlocks));
                 }
                 Cuda(cudaMemcpy(actual.data(), output, outputBytes, cudaMemcpyDeviceToHost));
                 if (actual != expected) {
@@ -1310,11 +1325,12 @@ static void RunSharedGGUFRecords() {
             // of the GEMV implementation. Exercise dynamic counts and slot
             // permutations on replay, including empty and D2D-promoted requests.
             Cuda(cudaMemcpy(promoted, host, layout.stride, cudaMemcpyHostToDevice));
+            for (int copyBlocks : {1, 24, 48}) {
             cudaGraph_t nativeGraph = nullptr;
             cudaGraphExec_t nativeExec = nullptr;
             Cuda(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
             Cuda(CopyNativeRecords(layout, pointers, output, cudaStreamPerThread,
-                ids, ids+experts, ids+2*experts, slotOffsets, 0, promoted, 0));
+                ids, ids+experts, ids+2*experts, slotOffsets, 0, promoted, 0, copyBlocks));
             Cuda(cudaStreamEndCapture(cudaStreamPerThread, &nativeGraph));
             Cuda(cudaGraphInstantiate(&nativeExec, nativeGraph, nullptr, nullptr, 0));
             for (int replay = 0; replay < 4; ++replay) {
@@ -1338,6 +1354,7 @@ static void RunSharedGGUFRecords() {
                 Require(actual == expected, "native GGUF graph transfer changed payload or padding");
             }
             Cuda(cudaGraphExecDestroy(nativeExec)); Cuda(cudaGraphDestroy(nativeGraph));
+            }
             Cuda(cudaFree(pointers)); Cuda(cudaFree(ids)); Cuda(cudaFree(slotOffsets));
             Cuda(cudaFree(output)); Cuda(cudaFree(promoted)); Cuda(cudaFree(uploaded)); Cuda(cudaFreeHost(host));
         }
@@ -1831,6 +1848,14 @@ int main(int argc, char **argv) {
                 }
             std::puts("PASS: exact subwarp, old-kernel oracle and changing graph inputs"); return 0;
         }
+        if (argc > 1 && std::strcmp(argv[1], "--tune-split-upload") == 0) {
+            for (bool numa : {false,true}) {
+                RunSplitUpload<float>(GGML_TYPE_IQ3_S,fastllm::FLOAT32,numa,true);
+                RunSplitUpload<half>(GGML_TYPE_IQ3_S,fastllm::FLOAT16,numa,true);
+                RunSplitUpload<__nv_bfloat16>(GGML_TYPE_IQ3_S,fastllm::BFLOAT16,numa,true);
+            }
+            std::puts("PASS: cold staged GGUF tuning and retained upload overlap"); return 0;
+        }
         if (argc > 1 && std::strcmp(argv[1], "--split-upload") == 0) {
             for (auto type : {GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_F16})
                 for (bool numa : {false,true}) {
@@ -1865,6 +1890,29 @@ int main(int argc, char **argv) {
             Require(!FastllmCudaMoeGGUFCacheNumaSupported(GGML_TYPE_Q4_K_R4,
                 GGML_TYPE_IQ4_NL, 256, 256, 1), "unsupported R4 should retain restore fallback");
             std::puts("PASS: direct NUMA GGUF layout"); return 0;
+        }
+        const int tileLanes = argc > 1 && std::strcmp(argv[1], "--q8-tiles-8") == 0 ? 8 :
+            argc > 1 && std::strcmp(argv[1], "--q8-tiles-16") == 0 ? 16 : 0;
+        if (tileLanes) {
+            std::string error;
+            const std::string config = "{\"mode\":\"quick\",\"budget_ms\":60000,\"repeats\":4,\"force\":{"
+                "\"moe.gguf.gate_swiglu_down\":\"cuda.moe.gguf.q8_tiles_" + std::to_string(tileLanes) + "\"}}";
+            Require(fastllm::kernels::Configure(config,error), "configure forced Q8 tile validation");
+            for (int rows : {1, 2, 4, 17, 65})
+                for (auto type : {GGML_TYPE_Q2_0, GGML_TYPE_IQ1_M, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS,
+                        GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S,
+                        GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_Q4_K}) {
+                    RunRoutedBatch<float>(type, GGML_TYPE_Q2_0, fastllm::FLOAT32, rows);
+                    RunRoutedBatch<half>(type, GGML_TYPE_IQ4_NL, fastllm::FLOAT16, rows);
+                    RunRoutedBatch<__nv_bfloat16>(type, type, fastllm::BFLOAT16, rows);
+                }
+            for (int rows : {1, 2, 4, 17}) {
+                RunResident<half>(GGML_TYPE_Q2_0, fastllm::FLOAT16, 0, 2560, 640, rows, GGML_TYPE_Q2_0);
+                RunResident<float>(GGML_TYPE_IQ3_S, fastllm::FLOAT32, 0, 256, 256, rows, GGML_TYPE_IQ4_NL);
+                RunResident<__nv_bfloat16>(GGML_TYPE_IQ2_S, fastllm::BFLOAT16, 0, 256, 256, rows, GGML_TYPE_IQ2_S);
+            }
+            std::printf("KERNEL_POLICY %s\n",fastllm::kernels::Report().c_str());
+            std::puts("PASS: forced Q8 output tiles, compact routes and dynamic graph replay"); return 0;
         }
         if (argc > 1 && std::strcmp(argv[1], "--routed-batch") == 0) {
             for (int rows : {1, 2, 3, 4, 5, 8, 17, 32}) {

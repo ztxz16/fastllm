@@ -214,11 +214,11 @@ __global__ void QuantizeQ8(const T *input, block_q8_1 *output, int columns,
 
 template<ggml_type Type, typename T, bool IsGate, typename View, int ThreadsPerRow = 32, bool ExactWarp = false>
 __global__ void Q8Projection(const block_q8_1 *input, T *gate, float *partial,
-                            View view, int topk, size_t rowBytes) {
+                            View view, int topk, size_t rowBytes, int firstRoute = 0) {
     using F = gguf_cache_q8::Format<Type>;
     __shared__ uint64_t grid[F::gridSize ? F::gridSize : 1];
     extern __shared__ uint32_t activation[];
-    const int route = blockIdx.y;
+    const int route = firstRoute + blockIdx.y;
     if (!ActiveRoute(view, route)) return;
     const int columns = IsGate ? view.hidden : view.inter;
     const auto *x = input + size_t(IsGate ? OriginalRoute(view, route)/topk : route)*(columns/32);
@@ -260,6 +260,24 @@ __global__ void Q8Projection(const block_q8_1 *input, T *gate, float *partial,
     }
 }
 
+// Split physical grid.y only; the logical route batch has no tuning cutoff.
+template<ggml_type Type, typename T, bool IsGate, typename View,
+         int ThreadsPerRow = 32, bool ExactWarp = false>
+void LaunchQ8Projection(const block_q8_1 *input, T *gate, float *partial,
+        const View &view, int topk, int routes, size_t rowBytes) {
+    constexpr int outputRows = 256 / ThreadsPerRow;
+    const int outputs = IsGate ? view.inter : view.hidden;
+    const int columns = IsGate ? view.hidden : view.inter;
+    for (int first = 0; first < routes;) {
+        const int count = std::min(65535, routes - first);
+        Q8Projection<Type, T, IsGate, View, ThreadsPerRow, ExactWarp>
+            <<<dim3((outputs + outputRows - 1) / outputRows, count), 256,
+               columns / 32 * sizeof(block_q8_1), cudaStreamPerThread>>>(
+                input, gate, partial, view, topk, rowBytes, first);
+        first += count;
+    }
+}
+
 template<class View> bool ExactSubwarpEnabled(const View &) { return false; }
 bool ExactSubwarpEnabled(const FastllmCudaMoeGGUFCacheView &view) { return view.exactSubwarp; }
 
@@ -267,14 +285,10 @@ template<ggml_type Type, typename T, typename View>
 void LaunchQ8Gate(const block_q8_1 *input, T *gate, float *partial,
                   const View &view, int topk, int routes, size_t rowBytes) {
     if (view.hidden == 2560 && view.inter == 640 && ExactSubwarpEnabled(view)) {
-        Q8Projection<Type, T, true, View, 16, true><<<dim3((view.inter+15)/16, routes), 256,
-            view.hidden/32*sizeof(block_q8_1), cudaStreamPerThread>>>(
-                input, gate, partial, view, topk, rowBytes);
+        LaunchQ8Projection<Type, T, true, View, 16, true>(input, gate, partial, view, topk, routes, rowBytes);
         return;
     }
-    Q8Projection<Type, T, true><<<dim3((view.inter+7)/8, routes), 256,
-        view.hidden/32*sizeof(block_q8_1), cudaStreamPerThread>>>(
-            input, gate, partial, view, topk, rowBytes);
+    LaunchQ8Projection<Type, T, true, View>(input, gate, partial, view, topk, routes, rowBytes);
 }
 
 template<ggml_type Type, typename T, typename View>
@@ -283,40 +297,23 @@ void LaunchQ8Down(const block_q8_1 *input, T *gate, float *partial,
     if constexpr (Type == GGML_TYPE_IQ4_NL || Type == GGML_TYPE_IQ4_XS) {
         if constexpr (Type == GGML_TYPE_IQ4_NL) {
             if (view.hidden == 2560 && view.inter == 640 && ExactSubwarpEnabled(view)) {
-                Q8Projection<Type, T, false, View, 8, true><<<dim3((view.hidden+31)/32, routes), 256,
-                    view.inter/32*sizeof(block_q8_1), cudaStreamPerThread>>>(
-                        input, gate, partial, view, topk, rowBytes);
+                LaunchQ8Projection<Type, T, false, View, 8, true>(input, gate, partial, view, topk, routes, rowBytes);
                 return;
             }
         }
         if (view.inter <= 1024) {
-            Q8Projection<Type, T, false, View, 16><<<dim3((view.hidden+15)/16, routes), 256,
-                view.inter/32*sizeof(block_q8_1), cudaStreamPerThread>>>(
-                    input, gate, partial, view, topk, rowBytes);
+            LaunchQ8Projection<Type, T, false, View, 16>(input, gate, partial, view, topk, routes, rowBytes);
             return;
         }
     }
     if constexpr (Type == GGML_TYPE_Q2_0) {
         if (view.hidden == 2560 && view.inter == 640 && ExactSubwarpEnabled(view)) {
-            Q8Projection<Type, T, false, View, 8, true><<<dim3((view.hidden+31)/32, routes), 256,
-                view.inter/32*sizeof(block_q8_1), cudaStreamPerThread>>>(
-                    input, gate, partial, view, topk, rowBytes);
+            LaunchQ8Projection<Type, T, false, View, 8, true>(input, gate, partial, view, topk, routes, rowBytes);
             return;
         }
-        // Eight lanes reproduce the original 32-lane sum for up to sixteen
-        // Q8 blocks, and let one CTA cover 32 rather than eight output rows.
-        // Select the smaller subgroup for prefill batches. Keep the existing
-        // launch for decode/verifier batches, whose end-to-end gain is unstable.
-        if (view.inter <= 512 && routes > 8*topk) {
-            Q8Projection<Type, T, false, View, 8><<<dim3((view.hidden+31)/32, routes), 256,
-                view.inter/32*sizeof(block_q8_1), cudaStreamPerThread>>>(
-                    input, gate, partial, view, topk, rowBytes);
-            return;
-        }
+
     }
-    Q8Projection<Type, T, false><<<dim3((view.hidden+7)/8, routes), 256,
-        view.inter/32*sizeof(block_q8_1), cudaStreamPerThread>>>(
-            input, gate, partial, view, topk, rowBytes);
+    LaunchQ8Projection<Type, T, false, View>(input, gate, partial, view, topk, routes, rowBytes);
 }
 
 template<typename T>
@@ -438,7 +435,13 @@ const fastllm::kernels::Family ggufBatchFamily{5,"moe.gguf.gate_swiglu_down",__D
         {"formats","IQ2_XXS/XS/S, IQ3_XXS/S, IQ4_NL/XS"},{"route_tile",2},{"row_limit","tensor indexing capacity"},{"graph",true}}},
     {"cuda.moe.gguf.grouped_shared",json11::Json::object{{"backend","cuda"},{"description","Grouped IQ with shared activation staging"},
         {"formats","IQ2_XXS/XS/S, IQ3_XXS/S, IQ4_NL/XS"},{"route_tile",2},{"row_limit","tensor indexing capacity"},
-        {"shared_memory","device capacity checked; global input fallback"},{"graph",true}}}
+        {"shared_memory","device capacity checked; global input fallback"},{"graph",true}}},
+    {"cuda.moe.gguf.q8_tiles_8",json11::Json::object{{"backend","cuda"},
+        {"description","Q8 projection with exact virtual-warp output tiles"},
+        {"gate_lanes",16},{"down_lanes",8},{"row_limit","tensor indexing capacity"},{"graph",true}}},
+    {"cuda.moe.gguf.q8_tiles_16",json11::Json::object{{"backend","cuda"},
+        {"description","Q8 projection with exact half-warp output tiles"},
+        {"gate_lanes",16},{"down_lanes",16},{"row_limit","tensor indexing capacity"},{"graph",true}}}
 }};
 const bool ggufBatchRegistered=[] {fastllm::kernels::Register(&ggufBatchFamily);return true;}();
 template<typename View>
@@ -459,7 +462,14 @@ struct GGUFKernelContext {
         auto &c=*static_cast<GGUFKernelContext *>(opaque);
         return Compute<T>(c.input,c.gate,c.output,c.view,c.scores,c.topk,c.partial,c.prepared,c.events,implementation);
     }
-    static std::string Unsupported(void *,int) {return "";}
+    static std::string Unsupported(void *opaque, int implementation) {
+        auto &c = *static_cast<GGUFKernelContext *>(opaque);
+        if ((implementation == 1 || implementation == 2) &&
+                (c.input.dims[0] < 2 || ActiveRoutes(c.view, c.input.dims[0] * c.topk) != c.input.dims[0] * c.topk ||
+                 !(GroupedIQType(c.view.gateType) || GroupedIQType(c.view.downType))))
+            return "grouped reuse requires full multi-row IQ routes";
+        return "";
+    }
 };
 
 template<typename T, typename View>
@@ -471,17 +481,32 @@ bool Compute(const fastllm::Data &input, fastllm::Data &gate, fastllm::Data &out
     const int stages = view.workspace && view.workspaceBytes >= Q8WorkspaceBytes(rows, view.hidden, view.inter, topk)
         ? Q8Stages(view.gateType, view.downType, view.hidden, view.inter, rows) : 0;
     if (!NumaStagesSupported(view, stages)) return false;
-    const bool candidate = rows>1 && perExpert && routes==rows*topk && stages &&
-        (GroupedIQType(view.gateType)||GroupedIQType(view.downType));
+    // Warmup needs a full output set for numerical validation. Compact route
+    // fragments retain their exact fallback; row count is not restricted.
+    const bool candidate = stages && (perExpert || (stages & 2)) && routes == rows * topk;
     if (implementation<0 && candidate && fastllm::kernels::Enabled()) {
-        GGUFKernelContext<T,View> context{input,gate,output,view,scores,topk,perExpert,q8InputPrepared,events};
+        const auto signature = GGUFSignature(input,view,topk);
+        // Stage events belong to the live upload, not to an isolated timing
+        // graph. Settle its down weights before numeric/timing trials, without
+        // recording over the live scheduler's gate/down timing events.
+        if (events && events->downReady && fastllm::kernels::NeedsPreparation(signature) &&
+            !FastllmCudaGraphIsCapturing() && !FastllmCudaGraphMemoryPoolActive())
+            fastllm::kernels::CudaCheck(cudaEventSynchronize(static_cast<cudaEvent_t>(events->downReady)));
+        GGUFKernelContext<T,View> context{input,gate,output,view,scores,topk,perExpert,q8InputPrepared,nullptr};
+        // Resident experts keep FP32 per-route sums in the ordinary Q8
+        // workspace before the unchanged weighted reduction. Validate those
+        // sums for every activation dtype, just like the hybrid path.
+        float *checkedOutput = perExpert ? perExpert : reinterpret_cast<float *>(
+            static_cast<uint8_t *>(view.workspace) + Q8Bytes(rows, view.hidden) + Q8Bytes(routes, view.inter));
         fastllm::kernels::CudaCase benchmark{&context,GGUFKernelContext<T,View>::Run,GGUFKernelContext<T,View>::Unsupported,
-            perExpert,size_t(routes)*view.hidden,false};
-        const int selected=fastllm::kernels::SelectCuda(ggufBatchFamily,GGUFSignature(input,view,topk),benchmark);
+            checkedOutput,size_t(routes)*view.hidden,false};
+        const int selected=fastllm::kernels::SelectCuda(ggufBatchFamily,signature,benchmark);
+        context.events = events; // Actual execution keeps upload/compute overlap.
         if (selected>=0) {fastllm::kernels::Bypass bypass;return fastllm::kernels::LaunchCuda(ggufBatchFamily,benchmark,selected);}
     }
     // Unmeasured, disabled and graph-cold signatures retain the reference.
-    const bool grouped=implementation>0;
+    const bool grouped=implementation==1 || implementation==2;
+    const int downLanes = implementation == 3 ? 8 : implementation == 4 ? 16 : 0;
     const block_q8_1 *qInput = nullptr;
     block_q8_1 *qGate = nullptr;
     float *partial = perExpert;
@@ -502,7 +527,10 @@ bool Compute(const fastllm::Data &input, fastllm::Data &gate, fastllm::Data &out
         if (!groupedGate)
         switch (gateType) {
 #define Q8_GATE(name) case GGML_TYPE_##name: \
-            LaunchQ8Gate<GGML_TYPE_##name>(qInput, static_cast<T *>(gate.cudaData), \
+            if (downLanes) LaunchQ8Projection<GGML_TYPE_##name, T, true, View, 16, true>( \
+                qInput, static_cast<T *>(gate.cudaData), partial, view, topk, routes, \
+                ggml_row_size(gateType, view.hidden)); \
+            else LaunchQ8Gate<GGML_TYPE_##name>(qInput, static_cast<T *>(gate.cudaData), \
                 partial, view, topk, routes, ggml_row_size(gateType, view.hidden)); break;
             GGUF_CACHE_Q8_TYPES(Q8_GATE)
 #undef Q8_GATE
@@ -529,7 +557,13 @@ bool Compute(const fastllm::Data &input, fastllm::Data &gate, fastllm::Data &out
         if (!grouped || !TryGGUFGroupedProjection<false>(qGate, static_cast<T *>(gate.cudaData), partial, view, rows, topk, routes, groupedGate, implementation==2))
         switch (downType) {
 #define Q8_DOWN(name) case GGML_TYPE_##name: \
-            LaunchQ8Down<GGML_TYPE_##name>(qGate, static_cast<T *>(gate.cudaData), \
+            if (downLanes == 8) LaunchQ8Projection<GGML_TYPE_##name, T, false, View, 8, true>( \
+                qGate, static_cast<T *>(gate.cudaData), partial, view, topk, routes, \
+                ggml_row_size(downType, view.inter)); \
+            else if (downLanes == 16) LaunchQ8Projection<GGML_TYPE_##name, T, false, View, 16, true>( \
+                qGate, static_cast<T *>(gate.cudaData), partial, view, topk, routes, \
+                ggml_row_size(downType, view.inter)); \
+            else LaunchQ8Down<GGML_TYPE_##name>(qGate, static_cast<T *>(gate.cudaData), \
                 partial, view, topk, routes, ggml_row_size(downType, view.inter)); break;
             GGUF_CACHE_Q8_TYPES(Q8_DOWN)
 #undef Q8_DOWN
@@ -699,8 +733,8 @@ size_t FastllmCudaMoeGGUFCacheBatchWorkspaceBytes(int hidden, int inter, int row
 
 bool FastllmCudaMoeGGUFCacheNeedsPreparation(const fastllm::Data &input,
         const FastllmCudaMoeGGUFCacheView &view,int topk) {
-    return fastllm::kernels::Enabled() && input.dims.size()==2 && input.dims[0]>1 &&
-        (GroupedIQType(view.gateType)||GroupedIQType(view.downType)) &&
+    return fastllm::kernels::Enabled() && input.dims.size()==2 && input.dims[0]>0 &&
+        Q8Stages(view.gateType,view.downType,view.hidden,view.inter,input.dims[0]) &&
         fastllm::kernels::NeedsPreparation(GGUFSignature(input,view,topk));
 }
 

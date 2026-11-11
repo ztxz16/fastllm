@@ -816,11 +816,11 @@ struct NativeMoeMailbox {
         return true;
     }
     void WarmupGGUF(Layer &w,const OffloadLayout &layout) {
-        if (!w.standard || layout.weightType!=fastllm::DATA_GGUF_FORMAT || w.rows<2) return;
+        if (!w.standard || layout.weightType!=fastllm::DATA_GGUF_FORMAT || w.rows<1) return;
         FastllmCudaMoeGGUFCacheView view{cache.records,w.slots,layout.recordStride,layout.downOffset,
             layout.gateGgmlType,layout.downGgmlType,w.hidden,layout.inter,
             w.compute->ggufWorkspace[0].cudaData,size_t(w.compute->ggufWorkspace[0].GetBytes()),cache.slotOffsets};
-        SetStandardGGUFLayout(group,w.table,view);view.exactSubwarp=group.qwen38FlashNext;
+        SetStandardGGUFLayout(group,w.table,view);view.exactSubwarp=group.qwen38FlashNext && w.rows>1;
         auto &input=w.compute->quantized;
         if (!FastllmCudaMoeGGUFCacheNeedsPreparation(input,view,w.topk)) return;
         // Benchmark only committed records of this layer: mixed-format GGUF
@@ -954,11 +954,16 @@ struct NativeMoeMailbox {
                 auto *pointers = cache.numaPointers + size_t(table) * layout.experts * 2 * source.shards;
                 // Device IDs select immutable mapped NUMA shards. Restore the
                 // canonical record losslessly, including per-layer IQ/R4 types.
+                // The launch budget covers both matrices, as it does for
+                // shared NVFP4 records; it must not double via grid.z.
+                const int matrixBlocks = std::max(1, launch.blocks / 2);
                 const auto copied = NativeStandardGGUFRecords(group)
                     ? fastllm_gguf_restore::CopyNativeRecords(source, pointers, fullCopy->records,
-                        cudaStreamPerThread, stagedExperts, stagedSlots, stagedCount)
+                        cudaStreamPerThread, stagedExperts, stagedSlots, stagedCount,
+                        nullptr, 0, nullptr, -1, matrixBlocks)
                     : fastllm_gguf_restore::CopyRecords(source, pointers, fullCopy->records,
-                        cudaStreamPerThread, stagedExperts, stagedSlots, stagedCount);
+                        cudaStreamPerThread, stagedExperts, stagedSlots, stagedCount,
+                        nullptr, 0, nullptr, -1, nullptr, false, matrixBlocks);
                 if (copied != cudaSuccess) return false;
             } else if (group.sharedLayout.shards) {
                 const auto &shared = group.sharedLayout;

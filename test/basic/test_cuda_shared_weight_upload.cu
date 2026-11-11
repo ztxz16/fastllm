@@ -207,6 +207,16 @@ int main(int argc, char **argv) {
         }
         if (auxiliary) for (unsigned shards : {1u, 2u, 4u, 8u})
             Run(2560, 640, shards, false, 0, true, true);
+        if (auxiliary) {
+            // Odd packed strides, skewed borrowed bases, shard ends and
+            // mapped routing IDs must survive dynamic graph replay exactly.
+            for (unsigned skew : {0u, 1u, 2u, 3u})
+                for (unsigned records : {3u, 7u, 16u, 33u})
+                    Run(96, 160, 2, false, skew, true, true, false,
+                        records, {7, 256}, true);
+            Run(16, 16, 4, false, 3, true, true, false, 3, {1, 128}, true);
+            Run(2560, 640, 2, false, 0, true, true, false, 3, {48, 1024}, true);
+        }
         if (planar) for (unsigned skew : {1u, 2u, 3u}) Run(128, 96, 2, true, skew);
         if (planar) {
             // Uneven tiles, sparse outputs, repeated sources and multiple

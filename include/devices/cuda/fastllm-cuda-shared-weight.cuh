@@ -230,17 +230,66 @@ __device__ inline size_t SourceOffset(const SharedWeightView &view, uint32_t off
         size_t(block) * view.blockStride + column - block * view.blockBytes;
 }
 
+// Packed source blocks need not have the destination's alignment. Rebuild
+// aligned destination words without reading outside a borrowed shard. This
+// is the same bounded word-load strategy used by block32 planar restoration,
+// applied to ordinary strided payloads rather than one quantization format.
 template<class Unit>
+__device__ __forceinline__ Unit LoadUnaligned(const uint8_t *source, size_t address,
+                                             size_t bytes) {
+    constexpr unsigned words = sizeof(Unit) / sizeof(uint32_t);
+    static_assert(sizeof(Unit) == 4 || sizeof(Unit) == 8, "word payload expected");
+    const uintptr_t begin = reinterpret_cast<uintptr_t>(source);
+    const uintptr_t pointer = begin + address;
+    const uintptr_t aligned = pointer & ~uintptr_t(3);
+    const unsigned shift = (pointer & 3) * 8;
+    union { Unit value; uint32_t word[words]; } result;
+    if (aligned >= begin && aligned + (words + unsigned(shift != 0)) * 4 <= begin + bytes) {
+        const auto *input = reinterpret_cast<const uint32_t *>(aligned);
+        uint32_t low = input[0];
+        #pragma unroll
+        for (unsigned i = 0; i < words; ++i) {
+            const uint32_t high = i + 1 < words || shift ? input[i + 1] : 0;
+            result.word[i] = shift ? __funnelshift_r(low, high, shift) : low;
+            low = high;
+        }
+    } else {
+        // A skewed base or a final partial word can straddle the declared
+        // source boundary. Only this edge keeps the exact byte fallback.
+        auto *output = reinterpret_cast<uint8_t *>(&result.value);
+        #pragma unroll
+        for (unsigned i = 0; i < sizeof(Unit); ++i) output[i] = source[address + i];
+    }
+    return result.value;
+}
+
+inline uintptr_t PayloadAlignment(const SharedExpertLayout &layout,
+                                  const uint8_t *auxiliary, const uint8_t *destination) {
+    uintptr_t alignment = layout.recordBytes | layout.auxiliaryBytes |
+        reinterpret_cast<uintptr_t>(auxiliary) | reinterpret_cast<uintptr_t>(destination);
+    for (const auto &view : layout.weights) {
+        // A vector must stay in one payload block/row. Source strides may
+        // be odd; LoadUnaligned handles those without weakening bounds.
+        alignment |= view.rowBytes | view.blockBytes | view.destinationOffset |
+                     uint32_t(view.block32Planar);
+    }
+    for (const auto &span : layout.auxiliary)
+        alignment |= span.sourceOffset | span.destinationOffset | span.bytes;
+    return alignment;
+}
+
+template<class Unit, bool Unaligned = false>
 __device__ Unit Load(const SharedWeightView &view, void *const *pointers,
                      uint32_t offset, const uint8_t *contiguous = nullptr) {
     uint32_t shard;
     const size_t address = SourceOffset(view, offset, shard);
     const auto *source = pointers ? static_cast<const uint8_t *>(pointers[shard]) :
         contiguous + size_t(shard) * view.shardBytes;
-    return *reinterpret_cast<const Unit *>(source + address);
+    if constexpr (Unaligned) return LoadUnaligned<Unit>(source, address, view.shardBytes);
+    else return *reinterpret_cast<const Unit *>(source + address);
 }
 
-template<class Unit>
+template<class Unit, bool Unaligned = false>
 __global__ void CopyRecord(SharedExpertLayout layout, const uint8_t *gate,
         const uint8_t *down, const uint8_t *auxiliary, uint8_t *destination,
         void *const *pointers, int stage) {
@@ -253,7 +302,7 @@ __global__ void CopyRecord(SharedExpertLayout layout, const uint8_t *gate,
             const auto &view = layout.weights[part];
             if (offset >= view.destinationOffset && offset - view.destinationOffset < view.rows * view.rowBytes) {
                 const auto local = offset - view.destinationOffset;
-                value = Load<Unit>(view, pointers ? pointers + part * layout.shards : nullptr,
+                value = Load<Unit, Unaligned>(view, pointers ? pointers + part * layout.shards : nullptr,
                     local, part ? down : gate);
                 write = true;
             }
@@ -269,7 +318,7 @@ __global__ void CopyRecord(SharedExpertLayout layout, const uint8_t *gate,
     }
 }
 
-template<class Unit>
+template<class Unit, bool Unaligned = false>
 __global__ void Copy(SharedExpertLayout layout, void *const *pointers,
                      const uint8_t *auxiliary, uint8_t *destination,
                      const int32_t *sourceIds, const int32_t *destinationIds,
@@ -278,17 +327,25 @@ __global__ void Copy(SharedExpertLayout layout, void *const *pointers,
     const int records = *count;
     if (records <= 0) return;
     const uint32_t total = records * units;
+    uint32_t previous = ~0u;
+    int expert = 0, slot = 0;
     for (size_t flat = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
          flat < total; flat += size_t(gridDim.x) * blockDim.x) {
         const uint32_t request = uint32_t(flat) / units, offset = (uint32_t(flat) % units) * sizeof(Unit);
-        const int expert = sourceIds[request];
+        // IDs can live in the host mailbox. Cache them while this monotonic
+        // traversal stays in one expert, as in the planar restore path.
+        if (request != previous) {
+            expert = sourceIds[request];
+            slot = destinationIds[request];
+            previous = request;
+        }
         Unit value{};
         #pragma unroll
         for (int part = 0; part < 2; ++part) {
             const auto &view = layout.weights[part];
             if (offset >= view.destinationOffset &&
                 offset - view.destinationOffset < view.rows * view.rowBytes)
-                value = Load<Unit>(view, pointers + (expert * 2 + part) * layout.shards,
+                value = Load<Unit, Unaligned>(view, pointers + (expert * 2 + part) * layout.shards,
                                    offset - view.destinationOffset);
         }
         #pragma unroll
@@ -298,7 +355,7 @@ __global__ void Copy(SharedExpertLayout layout, void *const *pointers,
                     size_t(expert) * layout.auxiliaryBytes + span.sourceOffset + offset - span.destinationOffset);
         }
         *reinterpret_cast<Unit *>(destination +
-            size_t(destinationIds[request]) * layout.recordBytes + offset) = value;
+            size_t(slot) * layout.recordBytes + offset) = value;
     }
 }
 __device__ inline void ScatterWord(const SharedWeightView &view, uint32_t shard,
@@ -443,7 +500,16 @@ inline bool CopySharedExpertRecord(const SharedExpertLayout &layout, void *const
         shared_weight_detail::CopyRecord<Unit><<<blocks, 256, 0, stream>>>(layout, gate, down, auxiliary, destination, pointers, stage)
     if (!(alignment & 15)) { FASTLLM_RECORD_COPY(uint4); }
     else if (!(alignment & 3)) { FASTLLM_RECORD_COPY(uint32_t); }
-    else { FASTLLM_RECORD_COPY(uint8_t); }
+    else {
+        const auto payload = shared_weight_detail::PayloadAlignment(layout, auxiliary, destination);
+        if (!(payload & 7))
+            shared_weight_detail::CopyRecord<uint2, true><<<blocks, 256, 0, stream>>>(
+                layout, gate, down, auxiliary, destination, pointers, stage);
+        else if (!(payload & 3))
+            shared_weight_detail::CopyRecord<uint32_t, true><<<blocks, 256, 0, stream>>>(
+                layout, gate, down, auxiliary, destination, pointers, stage);
+        else { FASTLLM_RECORD_COPY(uint8_t); }
+    }
     #undef FASTLLM_RECORD_COPY
     return cudaGetLastError() == cudaSuccess;
 }
@@ -526,7 +592,19 @@ inline bool CopySharedExpertRecords(const SharedExpertLayout &layout,
             layout, pointers, auxiliary, destination, sourceIds, destinationIds, count)
     if (!(alignment & 15)) { FASTLLM_SHARED_COPY(uint4); }
     else if (!(alignment & 3)) { FASTLLM_SHARED_COPY(uint32_t); }
-    else { FASTLLM_SHARED_COPY(uint8_t); }
+    else {
+        const auto payload = shared_weight_detail::PayloadAlignment(layout, auxiliary, destination);
+        // Keep one CTA budget for all records. Word gathering needs fewer
+        // threads than byte gathering, leaving room for resident experts.
+        const int threads = std::min(launch.threads, 256);
+        if (!(payload & 7))
+            shared_weight_detail::Copy<uint2, true><<<launch.blocks, threads, 0, stream>>>(
+                layout, pointers, auxiliary, destination, sourceIds, destinationIds, count);
+        else if (!(payload & 3))
+            shared_weight_detail::Copy<uint32_t, true><<<launch.blocks, threads, 0, stream>>>(
+                layout, pointers, auxiliary, destination, sourceIds, destinationIds, count);
+        else { FASTLLM_SHARED_COPY(uint8_t); }
+    }
     #undef FASTLLM_SHARED_COPY
     return cudaGetLastError() == cudaSuccess;
 }
