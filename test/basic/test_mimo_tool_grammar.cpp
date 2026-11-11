@@ -40,6 +40,21 @@ static void CheckIndexedMasks() {
         auto check = [&](int state) {
             if (state < 0 || !visited.insert(state).second) return;
             auto mask = grammar.Mask(state);
+            const auto compiled = grammar.Compile(state);
+            const auto &program = *compiled.first;
+            const int words = (program.vocab + 31) / 32;
+            const uint32_t *deviceMask = program.masks.data() + (size_t)program.maskIds[compiled.second] * words;
+            Check(std::equal(mask->begin(), mask->end(), deviceMask), "compiled mask differs from CPU");
+            for (int token = 0; token < program.vocab; ++token) {
+                int next = compiled.second;
+                if (!(deviceMask[token / 32] & (uint32_t(1) << (token % 32)))) next = -1;
+                else if (!program.stopTokens[token])
+                    for (int i = program.tokenOffsets[token]; i < program.tokenOffsets[token+1] && next >= 0; ++i)
+                        next = program.transitions[(size_t)next * 256 + program.tokenBytes[i]];
+                const int cpuNext = grammar.AdvanceToken(state, token);
+                Check((next < 0) == (cpuNext < 0), "compiled transition legality differs");
+                if (cpuNext >= 0) Check(next == grammar.Compile(cpuNext).second, "compiled transition state differs");
+            }
             for (int id = 0; id < (int)tokens->size(); ++id)
                 Check(bool(((*mask)[id / 32] >> (id % 32)) & 1) == (grammar.AdvanceToken(state, id) >= 0),
                       "indexed mask differs from byte-walking oracle");
@@ -55,6 +70,10 @@ static void CheckIndexedMasks() {
                 check(state);
             }
         }
+        MimoToolGrammar sibling(tools, required, single); sibling.Bind(indexed, stops);
+        int otherState = sibling.Advance(0, "<tool_call><function=B>");
+        Check(otherState >= 0 && sibling.Compile(otherState).first == grammar.Compile(0).first,
+              "requests using the same grammar must share compiled tables");
         bool changed = false;
         try { grammar.Bind(indexed, {}); } catch (const std::logic_error &) { changed = true; }
         Check(changed, "bound stop policy cannot change");
@@ -117,7 +136,7 @@ int main() {
         Check(required.CanEnd(done), "required call completed");
         Check(required.Advance(done, "<tool_call>") < 0, "parallel=false blocks a second call");
         bool invalid = false;
-        try { MimoToolGrammar bad({{"bad>name", {}}}); } catch (const std::invalid_argument &) { invalid = true; }
+        try { MimoToolGrammar bad(std::map<std::string, std::vector<std::string>>{{"bad>name", {}}}); } catch (const std::invalid_argument &) { invalid = true; }
         Check(invalid, "unrepresentable names fail explicitly");
         std::cout << "ALL_PASS MiMo tool grammar\n";
     } catch (const std::exception &e) { std::cerr << e.what() << '\n'; return 1; }

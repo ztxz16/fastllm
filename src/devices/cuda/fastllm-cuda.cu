@@ -7,6 +7,7 @@
 
 #define FASTLLM_CUDA_NO_MALLOC_CHECK_MACRO
 #include "fastllm-cuda.cuh"
+#include "devices/cuda/fastllm-cuda-token-constraint.h"
 #include "devices/cuda/fastllm-cuda-v41-gguf.h"
 #include "devices/cuda/fastllm-cuda-graph-workspace.h"
 #include "devices/cuda/fastllm-cuda-gdn.h"
@@ -25437,4 +25438,160 @@ void FastllmCudaApplyTokenMask(float *logits, const uint32_t *mask, int vocab) {
     FastllmApplyTokenMaskKernel<<<(vocab + 255) / 256, 256, 0, cudaStreamPerThread>>>(
         logits, (const uint32_t *)storage.cudaData, vocab);
     checkCudaErrors("Error applying tool token mask", cudaGetLastError());
+}
+
+namespace {
+struct TokenConstraintDeviceView {
+    const int *next = nullptr, *maskIds = nullptr, *offsets = nullptr;
+    const uint32_t *masks = nullptr;
+    const uint8_t *bytes = nullptr, *stops = nullptr;
+    int states = 0;
+};
+struct TokenConstraintDeviceProgram {
+    std::shared_ptr<const fastllm::TokenConstraintProgram> source;
+    fastllm::Data next, maskIds, masks, offsets, bytes, stops;
+    TokenConstraintDeviceView view;
+    explicit TokenConstraintDeviceProgram(std::shared_ptr<const fastllm::TokenConstraintProgram> p)
+        : source(std::move(p)) {
+        auto upload = [](fastllm::Data &data, const void *src, size_t size) {
+            data.dataType = fastllm::INT32; data.UpdateUnitSize();
+            data.Resize({(int)((size + 3) / 4 + 1)});
+            data.ToDevice(fastllm::DataDevice::CUDA, std::vector<int>{FastllmCudaGetDevice()}, false);
+            data.Allocate(false);
+            if (size) FastllmCudaCopyFromHostToDevice(data.cudaData, const_cast<void *>(src), size);
+        };
+        upload(next, source->transitions.data(), source->transitions.size() * sizeof(int));
+        upload(maskIds, source->maskIds.data(), source->maskIds.size() * sizeof(int));
+        upload(masks, source->masks.data(), source->masks.size() * sizeof(uint32_t));
+        upload(offsets, source->tokenOffsets.data(), source->tokenOffsets.size() * sizeof(int));
+        upload(bytes, source->tokenBytes.data(), source->tokenBytes.size());
+        upload(stops, source->stopTokens.data(), source->stopTokens.size());
+        view = {(int *)next.cudaData, (int *)maskIds.cudaData, (int *)offsets.cudaData,
+            (uint32_t *)masks.cudaData, (uint8_t *)bytes.cudaData, (uint8_t *)stops.cudaData,
+            (int)source->maskIds.size()};
+    }
+};
+struct TokenConstraintBatch {
+    int capacity, steps, count = 0, vocab = 0, device;
+    fastllm::Data descriptors, states;
+    std::vector<std::shared_ptr<TokenConstraintDeviceProgram>> leases;
+    TokenConstraintBatch(int capacity, int steps) : capacity(capacity), steps(steps), device(FastllmCudaGetDevice()) {
+        fastllm::AssertInFastLLM(capacity > 0 && steps > 0, "Invalid constraint batch capacity.");
+        auto allocate = [&](fastllm::Data &data, size_t bytes) {
+            data.dataType = fastllm::INT32; data.UpdateUnitSize(); data.Resize({(int)((bytes + 3) / 4)});
+            data.ToDevice(fastllm::DataDevice::CUDA, std::vector<int>{device}, false); data.Allocate(false);
+        };
+        allocate(descriptors, capacity * sizeof(TokenConstraintDeviceView));
+        allocate(states, (size_t)capacity * (steps + 1) * sizeof(int));
+    }
+};
+__device__ uint32_t TokenConstraintWord(const TokenConstraintDeviceView &p, int state, int word, int words) {
+    if (!p.next) return ~uint32_t(0);
+    if (state < 0 || state >= p.states) return 0;
+    return p.masks[(size_t)p.maskIds[state] * words + word];
+}
+__global__ void TokenConstraintMaskKernel(const TokenConstraintDeviceView *programs,
+        const int *states, uint32_t *mask, int rows, int words) {
+    int row = blockIdx.y, word = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row < rows && word < words) mask[(size_t)row * words + word] =
+        TokenConstraintWord(programs[row], states[row], word, words);
+}
+__global__ void TokenConstraintAdvanceKernel(const TokenConstraintDeviceView *programs,
+        const int *before, int *after, float *tokens, int rows, int vocab, bool finalStep) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= rows) return;
+    auto p = programs[row]; int state = before[row];
+    float value = tokens[row];
+    if (!(value >= 0 && value < vocab) || value != (int)value) state = -1;
+    else if (p.next) {
+        int token = (int)value;
+        if (!(TokenConstraintWord(p, state, token / 32, (vocab + 31) / 32) & (uint32_t(1) << (token % 32)))) state = -1;
+        else if (!p.stops[token]) for (int i = p.offsets[token]; i < p.offsets[token + 1] && state >= 0; ++i)
+            state = p.next[(size_t)state * 256 + p.bytes[i]];
+    }
+    after[row] = state;
+    // Do not feed an invalid sampled ID to a later embedding in this graph.
+    // The terminal sentinel is checked by the existing bulk result readback.
+    if (state < 0) tokens[row] = finalStep ? -1.f : 0.f;
+}
+__global__ void TokenConstraintApplyKernel(const TokenConstraintDeviceView *programs,
+        const int *states, float *logits, int rows, int steps, int stride, int vocab) {
+    int r = blockIdx.y, row = r / (steps + 1), step = r % (steps + 1);
+    int word = blockIdx.x * blockDim.x + threadIdx.x, words = (vocab + 31) / 32;
+    if (row >= rows) return;
+    uint32_t rejected = word < words ?
+        ~TokenConstraintWord(programs[row], states[(size_t)step * stride + row], word, words) : 0;
+    // Skip unrestricted words. For restrictive masks each warp cooperates on
+    // one word at a time, keeping stores coalesced even when almost all tokens
+    // are forbidden (tool/function/parameter names).
+    int lane = threadIdx.x % 32;
+    uint32_t active = __ballot_sync(0xffffffffu, rejected != 0);
+    while (active) {
+        int owner = __ffs(active) - 1;
+        uint32_t bits = __shfl_sync(0xffffffffu, rejected, owner);
+        int token = (word - lane + owner) * 32 + lane;
+        if (token < vocab && (bits & (uint32_t(1) << lane))) logits[(size_t)r * vocab + token] = -CUDART_INF_F;
+        active &= active - 1;
+    }
+}
+}
+std::shared_ptr<void> FastllmCudaCreateTokenConstraintBatch(int capacity, int steps) {
+    return std::make_shared<TokenConstraintBatch>(capacity, steps);
+}
+void FastllmCudaPrepareTokenConstraintBatch(void *handle,
+        const std::vector<std::shared_ptr<const fastllm::TokenConstraintProgram>> &programs,
+        const std::vector<int> &states, int vocab) {
+    auto &b = *static_cast<TokenConstraintBatch *>(handle);
+    fastllm::AssertInFastLLM(FastllmCudaGetDevice() == b.device && !programs.empty() &&
+        programs.size() == states.size() && programs.size() <= (size_t)b.capacity && vocab > 0,
+        "Invalid constraint batch inputs.");
+    // Per-worker/device bounded cache. Active descriptors retain their own
+    // leases, so eviction cannot invalidate captured graph inputs.
+    static thread_local std::map<int, std::vector<std::shared_ptr<TokenConstraintDeviceProgram>>> caches;
+    auto &cache = caches[b.device];
+    b.leases.clear(); b.count = programs.size(); b.vocab = vocab;
+    std::vector<TokenConstraintDeviceView> views;
+    for (size_t row = 0; row < programs.size(); ++row) {
+        const auto &source = programs[row];
+        if (!source) { views.emplace_back(); continue; }
+        fastllm::AssertInFastLLM(source->vocab == vocab && states[row] >= 0 &&
+            states[row] < (int)source->maskIds.size(), "Invalid compiled constraint state.");
+        auto it = std::find_if(cache.begin(), cache.end(), [&](const auto &p) { return p->source == source; });
+        std::shared_ptr<TokenConstraintDeviceProgram> program;
+        if (it == cache.end()) program = std::make_shared<TokenConstraintDeviceProgram>(source);
+        else { program = *it; cache.erase(it); }
+        cache.push_back(program); b.leases.push_back(program); views.push_back(program->view);
+    }
+    size_t bytes = 0;
+    for (const auto &p : cache) bytes += p->source->Bytes();
+    while (cache.size() > 1 && bytes > 128 * 1024 * 1024) {
+        bytes -= cache.front()->source->Bytes(); cache.erase(cache.begin());
+    }
+    FastllmCudaCopyFromHostToDevice(b.descriptors.cudaData, views.data(), views.size() * sizeof(views[0]));
+    FastllmCudaCopyFromHostToDevice(b.states.cudaData, const_cast<int *>(states.data()), states.size() * sizeof(int));
+}
+void FastllmCudaTokenConstraintMask(void *handle, int step, uint32_t *mask) {
+    auto &b = *static_cast<TokenConstraintBatch *>(handle);
+    fastllm::AssertInFastLLM(step >= 0 && step <= b.steps, "Constraint step out of bounds.");
+    int words = (b.vocab + 31) / 32;
+    TokenConstraintMaskKernel<<<dim3((words + 255) / 256, b.count), 256, 0, cudaStreamPerThread>>>(
+        (TokenConstraintDeviceView *)b.descriptors.cudaData, (int *)b.states.cudaData + (size_t)step * b.capacity,
+        mask, b.count, words);
+    checkCudaErrors("Constraint mask", cudaGetLastError());
+}
+void FastllmCudaTokenConstraintAdvance(void *handle, int step, float *tokens, bool finalStep) {
+    auto &b = *static_cast<TokenConstraintBatch *>(handle);
+    fastllm::AssertInFastLLM(step >= 0 && step < b.steps, "Constraint advance out of bounds.");
+    TokenConstraintAdvanceKernel<<<(b.count + 127) / 128, 128, 0, cudaStreamPerThread>>>(
+        (TokenConstraintDeviceView *)b.descriptors.cudaData, (int *)b.states.cudaData + (size_t)step * b.capacity,
+        (int *)b.states.cudaData + (size_t)(step + 1) * b.capacity, tokens, b.count, b.vocab, finalStep);
+    checkCudaErrors("Constraint advance", cudaGetLastError());
+}
+void FastllmCudaTokenConstraintApply(void *handle, float *logits, int steps) {
+    auto &b = *static_cast<TokenConstraintBatch *>(handle);
+    fastllm::AssertInFastLLM(steps >= 0 && steps <= b.steps, "Constraint verification out of bounds.");
+    TokenConstraintApplyKernel<<<dim3(((b.vocab + 31) / 32 + 255) / 256, b.count * (steps + 1)), 256, 0, cudaStreamPerThread>>>(
+        (TokenConstraintDeviceView *)b.descriptors.cudaData, (int *)b.states.cudaData,
+        logits, b.count, steps, b.capacity, b.vocab);
+    checkCudaErrors("Constraint verification mask", cudaGetLastError());
 }

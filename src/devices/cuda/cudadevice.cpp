@@ -8364,6 +8364,7 @@ namespace fastllm {
         int topk = intParams.find("topk") != intParams.end() ? intParams.find("topk")->second : 1;
 
         AssertInFastLLM(input.dataType == DataType::FLOAT32, "TopK error: Data's type should be float32.\n");
+        if (input.dims.empty()) throw std::invalid_argument("TopK input shape is empty.");
         
         int dimsLen = input.dims.size();
         std::vector<int> dims = input.dims;

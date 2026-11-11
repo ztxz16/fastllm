@@ -2,6 +2,7 @@
 #include "models/mimo_tool_grammar.h"
 #include "models/speculative_sampling.h"
 #include "fastllm-cuda.cuh"
+#include "devices/cuda/fastllm-cuda-token-constraint.h"
 #include "naive-n05-cuda.cuh"
 #include <cuda_runtime.h>
 #include <iostream>
@@ -98,6 +99,21 @@ int main() {
             next.tool_call_token_mask = grammar.Mask(grammar.AdvanceToken(state, proposals[b]));
             ApplyToolTokenMask(p, b*2+1, next);
         }
+        std::vector<float> expected((float *)p.cpuData, (float *)p.cpuData + batch * 2 * v);
+        std::copy(pRaw.begin(), pRaw.end(), (float *)p.cpuData);
+        p.ToDevice(DataDevice::CUDA, std::vector<int>{0});
+        auto compiled = grammar.Compile(state);
+        auto constraints = FastllmCudaCreateTokenConstraintBatch(batch, 1);
+        FastllmCudaPrepareTokenConstraintBatch(constraints.get(),
+            std::vector<std::shared_ptr<const TokenConstraintProgram>>(batch, compiled.first),
+            std::vector<int>(batch, compiled.second), v);
+        std::vector<float> proposalIds(proposals.begin(), proposals.end());
+        Data deviceIds(FLOAT32, {batch}, proposalIds); deviceIds.ToDevice(DataDevice::CUDA, std::vector<int>{0});
+        FastllmCudaTokenConstraintAdvance(constraints.get(), 0, (float *)deviceIds.cudaData);
+        FastllmCudaTokenConstraintApply(constraints.get(), (float *)p.cudaData, 1);
+        p.ToDevice(DataDevice::CPU);
+        Check(std::equal((float *)p.cpuData, (float *)p.cpuData + batch * 2 * v, expected.data()),
+            "GPU speculative states/masks differ from CPU before rejection");
         p.ToDevice(DataDevice::CUDA, std::vector<int>{0});
         Check(FastllmCudaMtpRejectionSampling((float *)p.cudaData, (float *)q.cudaData,
             temperatures.data(), topKs.data(), topPs.data(), proposals.data(), sampled.data(),

@@ -1,5 +1,6 @@
 #include "models/naive_n05_flash.h"
 #include "models/speculative_sampling.h"
+#include "models/mimo_tool_grammar.h"
 #include "pd.h"
 #include "json11.hpp"
 #include "executor.h"
@@ -12,6 +13,7 @@
 #ifdef USE_CUDA
 #include "devices/cuda/naive-n05-cuda.cuh"
 #include "devices/cuda/fastllm-cuda.cuh"
+#include "devices/cuda/fastllm-cuda-token-constraint.h"
 #include "devices/multicuda/fastllm-multicuda.cuh"
 #endif
 
@@ -110,9 +112,11 @@ struct NaiveN05FlashModel::DraftWorkspace {
     struct SamplingProposal {
         std::vector<Graph> graphs;
         std::array<void *, 3> inputs{};
-        Data logits, ids, latent, bias, row, mask;
+        Data logits, ids, latent, bias, row, mask, plainMask;
         Data base, probabilities, stepProbabilities, target, verifyProposal;
         int rows = 1, steps = 0;
+        std::shared_ptr<void> constraints;
+        bool constrained = false;
         void *sampler = nullptr;
         bool ownsSampler = true;
         float temperature = -1, topP = -1;
@@ -123,6 +127,7 @@ struct NaiveN05FlashModel::DraftWorkspace {
             graphs.clear();
             if (ownsSampler) FastllmCudaMtpDestroyDraftSampler(sampler);
             sampler = nullptr;
+            constraints.reset(); constrained = false;
         }
     } sampling;
     struct ContextLayer { Data raw, key, value; };
@@ -1771,6 +1776,7 @@ struct NaiveN05FlashModel::DraftRound {
     bool greedy = false;
     int sampledAccepted = -1, sampledNext = -1;
     bool targetCommitted = false, draftCommitted = false;
+    bool standalone = false; // Only this round may borrow the shared sampling arena.
     LogitsSelection selection;
     std::vector<int> proposed;
     std::vector<std::vector<float>> q;
@@ -1815,6 +1821,21 @@ void NaiveN05FlashModel::PrepareDraftRound(DraftRound &round, const Data *prepar
         return RunDraftHead(selected);
     }();
     const int vocab = round.vocab = baseLogits.dims.back();
+#ifdef USE_CUDA
+    if (round.standalone && config.tool_call_grammar && draftConfidenceThreshold == 0 && baseLogits.dataDevice == DataDevice::CUDA &&
+            baseLogits.dataType == BFLOAT16 && baseLogits.dims.size() == 3) {
+        std::vector<std::unique_ptr<DraftRound>> batch;
+        batch.emplace_back(new DraftRound(*this, context, config, round.lastTokens, anchor, limit));
+        if (PrepareDraftBatchGraph(batch, baseLogits)) {
+            auto &r = *batch.front();
+            round.greedy = r.greedy; round.selection = r.selection; round.proposed = std::move(r.proposed);
+            round.proposalOwner = r.proposalOwner;
+            round.batchProbabilities.FakeFrom(r.batchProbabilities, 0);
+            round.batchProbabilities.Resize(r.batchProbabilities.dims);
+            return;
+        }
+    }
+#endif
     GenerationConfig samplingConfig = config;
     samplingConfig.tool_call_token_mask.reset();
     const bool greedy = round.greedy = samplingConfig.IsSimpleGreedy() && config.output_token_least <= 0;
@@ -1953,10 +1974,12 @@ void NaiveN05FlashModel::PrepareDraftSamplingMemory(int count, int steps, int vo
     allocate(shared.bias, BFLOAT16, {1, rows, vocab});
     allocate(shared.latent, BFLOAT16, {1, rows, latentWidth});
     allocate(shared.mask, INT32, {rows, words});
+    allocate(shared.plainMask, INT32, {rows, words});
+    shared.constraints = FastllmCudaCreateTokenConstraintBatch(rows, steps);
     allocate(shared.target, FLOAT32, {rows * (steps + 1), vocab});
     allocate(shared.verifyProposal, FLOAT32, {rows * steps, vocab});
     std::vector<uint32_t> mask((size_t)rows * words, ~uint32_t(0));
-    FastllmCudaCopyFromHostToDevice(shared.mask.cudaData, mask.data(), mask.size() * sizeof(uint32_t));
+    FastllmCudaCopyFromHostToDevice(shared.plainMask.cudaData, mask.data(), mask.size() * sizeof(uint32_t));
 #endif
 }
 
@@ -1966,12 +1989,15 @@ bool NaiveN05FlashModel::PrepareDraftBatchGraph(
     const int count = rounds.size(), steps = rounds.front()->limit, vocab = baseLogits.dims.back();
     if (!GetFastllmEnv().cudaGraph || steps < 1 || baseLogits.dims[1] != count * steps || vocab >= (1 << 24)) return false;
     std::vector<float> temperatures;
+    bool constrained = false;
     for (auto &owner : rounds) {
         const auto &r = *owner;
-        if (r.limit != steps || r.config.IsSimpleGreedy() || r.config.output_token_least > 0 ||
-            r.config.tool_call_grammar || r.config.tool_call_token_mask ||
+        auto samplingConfig = r.config; samplingConfig.tool_call_token_mask.reset();
+        if (r.limit != steps || samplingConfig.IsSimpleGreedy() || r.config.output_token_least > 0 ||
+            (r.config.tool_call_token_mask && !r.config.tool_call_grammar) ||
             !SelectLogits(r.config).cudaSampling) return false;
         temperatures.push_back(r.config.temperature);
+        constrained |= bool(r.config.tool_call_grammar);
     }
     ApplyDraftDevice();
 #ifndef USE_ROCM
@@ -1987,7 +2013,7 @@ bool NaiveN05FlashModel::PrepareDraftBatchGraph(
     auto found = std::find_if(draftProposalWorkspaces.begin(), draftProposalWorkspaces.end(),
         [&](const std::shared_ptr<DraftWorkspace> &s) {
             const auto &p = s->sampling;
-            return s->device == device && s->inputs == inputs && p.rows == count && p.steps == steps &&
+            return s->device == device && s->inputs == inputs && p.rows == count && p.steps == steps && p.constrained == constrained &&
                 p.base.dims == baseLogits.dims;
         });
     if (found != draftProposalWorkspaces.end()) {
@@ -1996,6 +2022,7 @@ bool NaiveN05FlashModel::PrepareDraftBatchGraph(
         state = std::make_shared<DraftWorkspace>(); state->device = device; state->inputs = inputs;
         auto &p = state->sampling;
         p.rows = count; p.steps = steps;
+        p.constrained = constrained; p.constraints = shared.constraints;
         auto view = [](Data &dst, Data &src, const std::vector<int> &dims) {
             dst.FakeFrom(src, 0); dst.Resize(dims);
         };
@@ -2005,7 +2032,7 @@ bool NaiveN05FlashModel::PrepareDraftBatchGraph(
         view(p.logits, shared.logits, {count, vocab});
         view(p.bias, shared.bias, {1, count, vocab});
         view(p.latent, shared.latent, {1, count, w1.dims.back()});
-        view(p.mask, shared.mask, {count, words});
+        view(p.mask, constrained ? shared.mask : shared.plainMask, {count, words});
         // Proposals retain the full temperature-softmax distribution for rejection sampling.
         p.sampler = shared.sampler;
         p.ownsSampler = false;
@@ -2016,6 +2043,19 @@ bool NaiveN05FlashModel::PrepareDraftBatchGraph(
     if (draftProposalWorkspaces.size() > 4) draftProposalWorkspaces.erase(draftProposalWorkspaces.begin());
     auto &p = state->sampling;
     if (p.disabled) return false;
+    if (constrained) {
+        std::vector<std::shared_ptr<const TokenConstraintProgram>> programs;
+        std::vector<int> states;
+        for (auto &r : rounds) {
+            if (r->config.tool_call_grammar) {
+                auto config = r->config;
+                PrepareToolCallConstraint(config);
+                auto compiled = config.tool_call_grammar->Compile(config.tool_call_grammar_state);
+                programs.push_back(compiled.first); states.push_back(compiled.second);
+            } else { programs.push_back(nullptr); states.push_back(0); }
+        }
+        FastllmCudaPrepareTokenConstraintBatch(p.constraints.get(), programs, states, vocab);
+    }
     std::vector<int> topKs(count, 0);
     std::vector<float> topPs(count, 1.f);
     // Temperatures are replay inputs; only the shape selects a graph variant.
@@ -2031,10 +2071,13 @@ bool NaiveN05FlashModel::PrepareDraftBatchGraph(
         for (int step = 0; step < steps; ++step) {
             Data ids(FLOAT32, {1, count}); ids.FakeFrom(p.ids, (size_t)step * count * sizeof(float));
             EmbeddingDirect(ids, w1, p.latent); DraftLinear(p.latent, w2, p.bias);
+            if (p.constrained) FastllmCudaTokenConstraintMask(p.constraints.get(), step, (uint32_t *)p.mask.cudaData);
             FastllmCudaNaiveBatchDraftSamplingLogits(p.base, p.bias, p.mask, p.logits, step, steps);
             AssertInFastLLM(FastllmCudaMtpDraftSamplerRunBatch(p.sampler, (float *)p.logits.cudaData,
                 (float *)p.stepProbabilities.cudaData, (float *)p.ids.cudaData + (size_t)(step + 1) * count,
                 (uint64_t)step * 4), "Graph batch draft sampling failed.");
+            if (p.constrained) FastllmCudaTokenConstraintAdvance(p.constraints.get(), step,
+                (float *)p.ids.cudaData + (size_t)(step + 1) * count, step == steps - 1);
             std::vector<void *> dst; std::vector<const void *> src; std::vector<size_t> bytes;
             for (int row = 0; row < count; ++row) {
                 dst.push_back((float *)p.probabilities.cudaData + (size_t)(row * steps + step) * vocab);
@@ -2201,11 +2244,17 @@ void NaiveN05FlashModel::PrepareDraftAcceptance(std::vector<std::unique_ptr<Draf
     auto &packing = draftProposalStorage->sampling;
     std::vector<int> offsets;
     std::map<std::pair<bool, int>, std::vector<int>> groups;
+    auto owner = rounds.front()->proposalOwner;
+    const bool deviceMasks = owner && owner->sampling.constrained && owner->sampling.rows == (int)rounds.size() &&
+        owner->sampling.steps == steps && std::all_of(rounds.begin(), rounds.end(), [&](const auto &r) {
+            return r->proposalOwner == owner && (int)r->proposed.size() == steps;
+        });
+    if (deviceMasks) FastllmCudaTokenConstraintApply(owner->sampling.constraints.get(), (float *)logits.cudaData, steps);
     int offset = 0;
     for (int i = 0; i < (int)rounds.size(); ++i) {
         auto &r = *rounds[i]; offsets.push_back(offset); offset += r.proposed.size() + 1;
         if (r.vocab != vocab || (!r.greedy && !r.selection.cudaLogits)) continue;
-        if (r.config.tool_call_grammar) {
+        if (r.config.tool_call_grammar && !deviceMasks) {
             auto config = r.config;
             for (int row = 0; row <= (int)r.proposed.size(); ++row) {
                 PrepareToolCallConstraint(config); ApplyToolTokenMask(logits, offsets[i] + row, config);
@@ -2291,7 +2340,17 @@ int NaiveN05FlashModel::FinishDraftRound(DraftRound &round, Data &logits,
     // Row i predicts after the emitted anchor and proposals [0, i). Never
     // publish a speculative state: the scheduler advances only emitted tokens.
     std::vector<GenerationConfig> verifyConfigs;
-    if (round.sampledAccepted < 0 && config.tool_call_grammar) {
+    bool deviceMasks = false;
+#ifdef USE_CUDA
+    if (round.sampledAccepted < 0 && round.proposalOwner && round.proposalOwner->sampling.constrained &&
+            round.proposalOwner->sampling.rows == 1 && logits.dataDevice == DataDevice::CUDA && logits.dataType == FLOAT32) {
+        ApplyDraftDevice();
+        FastllmCudaTokenConstraintApply(round.proposalOwner->sampling.constraints.get(),
+            (float *)logits.cudaData, proposed.size());
+        deviceMasks = true;
+    }
+#endif
+    if (round.sampledAccepted < 0 && config.tool_call_grammar && !deviceMasks) {
         verifyConfigs.resize(proposed.size() + 1);
         GenerationConfig stepConfig = config;
         for (int row = 0; row <= (int)proposed.size(); ++row) {
@@ -2745,6 +2804,7 @@ int NaiveN05FlashModel::ForwardDraft(
     }
     LastTokensUnit history = lastTokens.units.empty() ? LastTokensUnit(config.last_n) : lastTokens.units[0];
     DraftRound round(*this, context, config, history, anchor, limit);
+    round.standalone = true;
     PrepareDraftRound(round);
     auto &proposed = round.proposed;
     auto &selection = round.selection;

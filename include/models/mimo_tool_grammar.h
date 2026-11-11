@@ -1,7 +1,9 @@
 #ifndef FASTLLM_MIMO_TOOL_GRAMMAR_H
 #define FASTLLM_MIMO_TOOL_GRAMMAR_H
 
+#include "token_constraint.h"
 #include <algorithm>
+#include <deque>
 #include <array>
 #include <cstdint>
 #include <initializer_list>
@@ -173,7 +175,76 @@ class MimoToolGrammar {
     bool EndAllowed(int state) const {
         return nodes.at(state).state.phase == Text && (!required || nodes[state].state.called);
     }
+    struct Compiled {
+        std::shared_ptr<const TokenConstraintProgram> program;
+        std::map<StateKey, int> states;
+        // Keep tokenizer identity alive while cached.
+        std::shared_ptr<const MimoToolVocabulary> vocabulary;
+    };
+    std::shared_ptr<Compiled> compiledProgram;
 public:
+    // CPU request states remain untouched. Canonical compiled IDs are private
+    // speculative cursors, so differently explored CPU branches can share tables.
+    std::pair<std::shared_ptr<const TokenConstraintProgram>, int> Compile(int state) {
+        std::lock_guard<std::mutex> guard(mutex);
+        if (!vocabulary || state < 0) throw std::logic_error("Unbound MiMo grammar.");
+        if (compiledProgram) return {compiledProgram->program,
+            compiledProgram->states.at(nodes.at(state).state.Key())};
+        using Key = std::tuple<const MimoToolVocabulary *, std::vector<std::string>,
+            std::vector<std::vector<std::string>>, std::set<int>, bool, bool>;
+        struct Entry { Key key; std::shared_ptr<Compiled> value; };
+        static std::mutex cacheMutex;
+        static std::deque<Entry> cache;
+        std::lock_guard<std::mutex> cacheGuard(cacheMutex);
+        Key key{vocabulary.get(), names, bodies, stops, required, single};
+        std::shared_ptr<Compiled> compiled;
+        for (auto it = cache.begin(); it != cache.end(); ++it) if (it->key == key) {
+            compiled = it->value; cache.erase(it); break;
+        }
+        if (!compiled) {
+            std::map<std::string, std::vector<std::string>> tools;
+            for (size_t i = 0; i < names.size(); ++i) {
+                auto &parameters = tools[names[i]];
+                for (size_t j = 1; j < bodies[i].size(); ++j)
+                    parameters.push_back(bodies[i][j].substr(11, bodies[i][j].size() - 12));
+            }
+            MimoToolGrammar canonical(tools, required, single);
+            canonical.Bind(vocabulary, stops);
+            auto program = std::make_shared<TokenConstraintProgram>();
+            program->vocab = vocabulary->tokens->size();
+            // Close the byte DFA before building masks: Mask must not change IDs.
+            for (size_t i = 0; i < canonical.nodes.size(); ++i)
+                for (int c = 0; c < 256; ++c) canonical.Step(i, (unsigned char)c);
+            std::map<std::vector<uint32_t>, int> masks;
+            for (size_t i = 0; i < canonical.nodes.size(); ++i) {
+                const auto bits = canonical.Mask(i, false);
+                auto found = masks.emplace(*bits, masks.size());
+                if (found.second) program->masks.insert(program->masks.end(), bits->begin(), bits->end());
+                program->maskIds.push_back(found.first->second);
+                const auto &next = canonical.nodes[i].next;
+                program->transitions.insert(program->transitions.end(), next.begin(), next.end());
+            }
+            program->tokenOffsets.push_back(0);
+            program->stopTokens.resize(program->vocab, 0);
+            for (int token = 0; token < program->vocab; ++token) {
+                const auto &bytes = (*vocabulary->tokens)[token];
+                program->tokenBytes.insert(program->tokenBytes.end(), bytes.begin(), bytes.end());
+                program->tokenOffsets.push_back(program->tokenBytes.size());
+                program->stopTokens[token] = stops.count(token) != 0;
+            }
+            compiled = std::make_shared<Compiled>();
+            compiled->program = program; compiled->states = std::move(canonical.states);
+            compiled->vocabulary = vocabulary;
+        }
+        cache.push_back({std::move(key), compiled});
+        size_t bytes = 0;
+        for (const auto &entry : cache) bytes += entry.value->program->Bytes();
+        while (cache.size() > 1 && (bytes > 128 * 1024 * 1024 || cache.size() > 32)) {
+            bytes -= cache.front().value->program->Bytes(); cache.pop_front();
+        }
+        compiledProgram = compiled;
+        return {compiled->program, compiled->states.at(nodes.at(state).state.Key())};
+    }
     explicit MimoToolGrammar(const std::map<std::string, std::vector<std::string>> &tools,
                              bool requireCall = false, bool singleCall = false)
         : required(requireCall), single(singleCall) {
@@ -213,7 +284,7 @@ public:
         if ((*vocabulary->tokens)[token].empty()) return -1;
         return AdvanceBytes(state, (*vocabulary->tokens)[token]);
     }
-    std::shared_ptr<const std::vector<uint32_t>> Mask(int state) {
+    std::shared_ptr<const std::vector<uint32_t>> Mask(int state, bool requireToken = true) {
         std::lock_guard<std::mutex> guard(mutex);
         if (!vocabulary || state < 0) throw std::logic_error("Invalid MiMo grammar state.");
         if (nodes.at(state).mask) return nodes[state].mask;
@@ -249,7 +320,7 @@ public:
         // Stop tokens override their textual spelling, including empty entries.
         for (int token : stops) if (token >= 0 && token < (int)tokens.size())
             allow(token, EndAllowed(state));
-        if (std::none_of(mask->begin(), mask->end(), [](uint32_t word) { return word != 0; }))
+        if (requireToken && std::none_of(mask->begin(), mask->end(), [](uint32_t word) { return word != 0; }))
             throw std::runtime_error("MiMo grammar has no legal token; refusing unconstrained fallback.");
         nodes[state].mask = mask;
         return mask;
