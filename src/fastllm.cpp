@@ -2481,7 +2481,11 @@ namespace fastllm {
             }
         }
 
-        uint64_t oldBytes = GetBytes();
+        // Logical zero-length views can retain reserved storage (for example
+        // a speculative QSA tail after rollback). There is nothing to copy,
+        // and Count(axis) can be zero even though expansionBytes is nonzero.
+        const bool hasValues = std::all_of(this->dims.begin(), this->dims.end(),
+                                          [](int size) { return size > 0; });
         int input1Stride = this->Count(axis);
 
         this->strides.resize(dims.size(), 1);
@@ -2494,7 +2498,7 @@ namespace fastllm {
             if (this->dataDevice == DataDevice::CPU) {
                 uint8_t *old = this->cpuData;
                 MallocSpace(this->strides[0] * std::max(this->dims[0], dims[0]));
-                int outer = this->Count(0) / this->Count(axis);
+                int outer = hasValues ? this->Count(0) / this->Count(axis) : 0;
                 int input0Stride = this->Count(axis);
                 int inner = this->strides[axis];
                 int unitSize = this->unitSize;
@@ -2509,12 +2513,14 @@ namespace fastllm {
                 uint8_t *old = (uint8_t*)this->cudaData;
                 bool oldBorrowed = this->cudaDataBorrowed;
                 MallocSpace(this->strides[0] * std::max(this->dims[0], dims[0]));
-                int outer = this->Count(0) / this->Count(axis);
+                int outer = hasValues ? this->Count(0) / this->Count(axis) : 0;
                 int input0Stride = this->Count(axis);
                 int inner = this->strides[axis];
                 int unitSize = this->unitSize;
-                FastllmCudaMemcpy2DDeviceToDevice((uint8_t*)this->cudaData, input0Stride * unitSize,
-                                            (uint8_t*)old, input1Stride * unitSize, this->dims[axis] * inner * unitSize, outer);
+                if (outer > 0) {
+                    FastllmCudaMemcpy2DDeviceToDevice((uint8_t*)this->cudaData, input0Stride * unitSize,
+                                                (uint8_t*)old, input1Stride * unitSize, this->dims[axis] * inner * unitSize, outer);
+                }
                 if (!oldBorrowed) {
                     CudaFreeForData(*this, old);
                 }
