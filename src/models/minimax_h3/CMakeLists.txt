@@ -11,7 +11,8 @@ set(CMAKE_CUDA_RUNTIME_LIBRARY Shared)
 set_target_properties(fastllm_continuous PROPERTIES CUDA_RUNTIME_LIBRARY Shared)
 add_library(fastllm_minimax_h3 SHARED
     ops.cu encode.cu conditioning.cpp transformer.cpp audio.cpp video.cpp
-    text.cpp parallel.cpp pipeline.cpp pika.cpp model_source.cpp media.cpp media_input.cpp)
+    text.cpp parallel.cpp pipeline.cpp pika.cpp model_source.cpp media.cpp media_input.cpp
+    ../minimax_h3_image/model.cpp ../minimax_h3_image/input.cpp)
 target_link_libraries(fastllm_minimax_h3 PUBLIC fastllm_continuous pthread)
 target_include_directories(fastllm_minimax_h3 PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
 target_compile_options(fastllm_minimax_h3 PRIVATE
@@ -22,6 +23,13 @@ set_target_properties(fastllm_minimax_h3 PROPERTIES CUDA_STANDARD 17 CXX_STANDAR
 add_executable(minimax_h3_generate ${PROJECT_SOURCE_DIR}/tools/minimax_h3/generate.cpp)
 target_link_libraries(minimax_h3_generate PRIVATE fastllm_minimax_h3)
 set_target_properties(minimax_h3_generate PROPERTIES CXX_STANDARD 17 BUILD_RPATH_USE_ORIGIN TRUE)
+add_executable(minimax_h3_image_generate ${PROJECT_SOURCE_DIR}/tools/minimax_h3_image/generate.cpp)
+target_link_libraries(minimax_h3_image_generate PRIVATE fastllm_minimax_h3)
+set_target_properties(minimax_h3_image_generate PROPERTIES CXX_STANDARD 17 BUILD_RPATH_USE_ORIGIN TRUE)
+add_executable(minimax_h3_image_server ../minimax_h3_image/server.cpp)
+target_include_directories(minimax_h3_image_server PRIVATE ${PROJECT_SOURCE_DIR}/example/webui)
+target_link_libraries(minimax_h3_image_server PRIVATE fastllm_minimax_h3)
+set_target_properties(minimax_h3_image_server PROPERTIES CXX_STANDARD 17 BUILD_RPATH_USE_ORIGIN TRUE)
 add_executable(minimax_h3_server server.cpp)
 target_include_directories(minimax_h3_server PRIVATE ${PROJECT_SOURCE_DIR}/example/webui)
 target_link_libraries(minimax_h3_server PRIVATE fastllm_minimax_h3)
@@ -44,11 +52,22 @@ if(MAKE_WHL_X86)
         CUDA_ARCHITECTURES "${FASTLLM_VIDEO_CUDA_ARCHITECTURES}")
     # Wheel executables and the shared library live together in ftllm/.
     # Resolve pip's CUDA dependencies without requiring LD_LIBRARY_PATH.
-    set_target_properties(fastllm_minimax_h3 minimax_h3_server minimax_h3_generate PROPERTIES
+    set_target_properties(fastllm_minimax_h3 minimax_h3_server minimax_h3_generate minimax_h3_image_server minimax_h3_image_generate PROPERTIES
         INSTALL_RPATH "$ORIGIN;$ORIGIN/../nvidia/cuda_runtime/lib;$ORIGIN/../nvidia/cublas/lib;$ORIGIN/../nvidia/nccl/lib")
 endif()
 if(UNIT_TEST)
     enable_testing()
+    add_executable(minimax_h3_image_condition EXCLUDE_FROM_ALL
+        ${PROJECT_SOURCE_DIR}/test/minimax_h3_image/condition_fixture.cpp)
+    target_link_libraries(minimax_h3_image_condition PRIVATE fastllm_minimax_h3)
+    set_target_properties(minimax_h3_image_condition PROPERTIES CXX_STANDARD 17 BUILD_RPATH_USE_ORIGIN TRUE)
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME minimax_h3_image_http
+            COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/test/minimax_h3_image/test_server.py
+                    --binary $<TARGET_FILE:minimax_h3_image_server>)
+        set_tests_properties(minimax_h3_image_http PROPERTIES TIMEOUT 30)
+    endif()
     add_executable(minimax_h3_model_source ${PROJECT_SOURCE_DIR}/test/minimax_h3/test_model_source.cpp)
     target_link_libraries(minimax_h3_model_source PRIVATE fastllm_minimax_h3)
     set_target_properties(minimax_h3_model_source PROPERTIES CXX_STANDARD 17)

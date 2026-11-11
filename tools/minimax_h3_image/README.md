@@ -1,0 +1,137 @@
+# MiniMax-H3-Image native generation and editing
+
+This backend loads the original [MiniMaxAI/MiniMax-H3-Image](https://huggingface.co/MiniMaxAI/MiniMax-H3-Image) weights directly. It runs the image model's six distilled PDD steps in C++/CUDA and writes a PNG. No Torch, Diffusers, Python inference runtime or converted transformer checkpoint is required. The Python launcher manages processes and HTTP proxying only. PNG decoding is native C++; JPEG/WebP decoding uses FFmpeg/ffprobe executables, without invoking Python.
+
+The independent model implementation is `include/models/minimax_h3_image/model.h` and `src/models/minimax_h3_image/model.cpp`. It reuses the H3 CUDA runtime and Qwen3-VL text encoder, with a separate image transformer, 2D ViT VAE and sampling pipeline. The shared H3 VAE encoder accepts the image checkpoint’s key names while preserving the video checkpoint path.
+
+## Build and run
+
+```bash
+cmake -S . -B build -DUSE_CUDA=ON -DCUDA_ARCH=120 \
+  -DBUILD_HY_NOMAS=ON -DBUILD_QWEN_IMAGE=ON -DBUILD_MINIMAX_H3=ON \
+  -DPY_API=OFF -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target minimax_h3_image_generate minimax_h3_image_server -j8
+
+CUDA_VISIBLE_DEVICES=3 build/src/models/minimax_h3/minimax_h3_image_generate \
+  --model /workspace2/hfmodels/MiniMax-H3-Image \
+  --prompt 'A red panda beside a mountain stream, autumn forest, natural wildlife photograph.' \
+  --width 2048 --height 2048 --seed 42 --output red-panda.png
+```
+
+Select an available GPU before running. `--device` addresses the visible CUDA devices, so it defaults to `0` after setting `CUDA_VISIBLE_DEVICES`. The tested device is an RTX PRO 5000 Blackwell with 72 GB memory; smaller GPUs and tensor parallelism are not implemented for this image backend.
+
+The model directory must contain:
+
+- `transformer/config.json`, `model.safetensors.index.json` and its native shards.
+- `vae/config.json` and `diffusion_pytorch_model.safetensors`.
+- `pdd_config.json` and `pdd_fused_heads.safetensors`.
+- `tokenizer/` and the original MiniMax-H3 `text_encoder/`. A symlink to an existing text encoder is supported.
+
+Defaults are BF16 transformer/VAE compute, FP32 timestep/input/output projections, six steps and a 2048×2048 canvas. `--vae-precision fp32` provides a slower diagnostic alternative. The text encoder reads hidden state 50, takes the prompt verbatim and streams its weights; text, DiT and VAE weights are released between stages. Single-use DiT AdaLN weights are released after all six timestep tables are prepared.
+
+Native checkpoint details handled here include per-head interleaved QKV, gate-first FFNs, three modality AdaLN rows, one FP32 PDD head per step, velocity-form Euler updates, 2D VAE rotary positions and register tokens, overlapping 256-pixel VAE tiles, ImageNet pixel denormalization and truncating RGB quantization.
+
+The implementation processes one request at a time. It supports:
+
+- Text-to-image.
+- Single-reference editing: change a background, change an object or restyle the whole image.
+- Multiple-reference composition, identity/subject preservation and style/color transfer, with up to 16 references in upload order.
+
+Use `<Picture 1>`, `<Picture 2>`, etc. in the prompt to identify references. Describe the desired complete scene; detailed English prompts usually work best. Reference edits use both the native Qwen3-VL vision encoder and the image VAE encoder. References remain fixed during denoising, with their own grids and timestep `0.999`; only the target rows are updated.
+
+```bash
+CUDA_VISIBLE_DEVICES=3 build/src/models/minimax_h3/minimax_h3_image_generate \
+  --model /workspace2/hfmodels/MiniMax-H3-Image \
+  --image subject.jpg --image scene.webp \
+  --prompt 'Place the subject from <Picture 1> into the scene from <Picture 2>. Match the lighting and preserve the subject’s identity.' \
+  --width 2048 --height 2048 --seed 42 --output composition.png
+```
+
+Output dimensions are 32–8192 per side, up to 20 Mi pixels. Generation uses a canvas rounded to multiples of 32, followed by Lanczos resize to the exact requested dimensions. HTTP defaults to `min_generation_area=4194304`, so small outputs are generated on an approximately 2K canvas. The CLI defaults to `1024` for direct small numerical fixtures; set `--min-generation-area 4194304` for the HTTP behavior. The demo offers 2K/4K and five aspect ratios. Both 2048² and 4096² generation were tested on the selected 72 GB card.
+
+References accept 8-bit non-interlaced PNG, JPEG and WebP, 32–8192 per side, up to 20 Mi pixels each, aspect ratios 1:4–4:1 and 64 Mi pixels combined. HTTP requests are limited to 32 MiB including multipart overhead. The demo recompresses large PNGs losslessly before upload, so generated PNGs can be reused as references. The CLI accepts files up to 96 MiB. JPEG EXIF rotation is applied during decoding. Reference preparation uses the released model’s size bounds: a 1024-pixel short edge for vision conditioning, and 1024–2048 for VAE encoding.
+
+The model has six distilled steps, guidance scale 1 and one output per request. Masks/inpainting regions, a strength slider, negative prompts/CFG, arbitrary step counts, tensor parallelism and smaller-GPU weight streaming are not implemented. The optional official MiniMax-H3-Image-PE prompt expander is a separate model and is not included here.
+
+## Web demo and HTTP API
+
+Run from the repository root:
+
+```bash
+CUDA_VISIBLE_DEVICES=3 build/src/models/minimax_h3/minimax_h3_image_server \
+  --model /workspace2/hfmodels/MiniMax-H3-Image \
+  --host 127.0.0.1 --port 8009 --output ./h3-image-output \
+  --demo tools/minimax_h3_image/demo.html
+```
+
+Open `http://127.0.0.1:8009/demo` for text generation, single-image editing and multi-reference composition. The shared studio includes drag-and-drop reference upload, reordering, prompt presets, 2K/4K sizes, seeds, progress, cancellation, recent jobs, a large preview, PNG download, API examples and reuse of a result as the next reference. An optional `--api-key KEY` protects all `/v1` endpoints with bearer authentication; enter it under the demo's connection settings. `/health` and the demo assets remain public. Bind a suitable address and configure authentication before sharing the service outside localhost.
+
+- `POST /v1/images/jobs` accepts JSON for text generation or multipart data for reference edits; returns HTTP 202 and a job ID. Common fields: `prompt`, optional `model: "minimax-h3-image"`, `size`, `seed`, `n: 1`, `num_inference_steps: 6`, `guidance_scale: 1` and `min_generation_area`.
+- `GET /v1/images/jobs` lists recent jobs; `GET /v1/images/jobs/{id}` reports progress.
+- `POST /v1/images/jobs/{id}/cancel` requests cancellation at the next progress boundary. Cancelling a running stage may take time.
+- `GET /v1/images/jobs/{id}/content` downloads a completed PNG.
+- `POST /v1/images/generations` waits for completion and returns `data[0].url` (relative to this server) or `data[0].b64_json` when requested.
+- `POST /v1/images/edits` accepts multipart `image[]` (or repeated `image`, consistently), with the same scalar fields, and waits for completion. It returns the same URL/base64 response as generations.
+- `/openapi.json` describes the API; `/v1/models` reports the model ID.
+
+For example, a two-reference synchronous edit (omit the auth header when no key is configured):
+
+```bash
+curl http://127.0.0.1:8009/v1/images/edits \
+  -H "Authorization: Bearer $FASTLLM_API_KEY" \
+  -F 'image[]=@subject.jpg' -F 'image[]=@scene.webp' \
+  -F 'prompt=Place the subject from <Picture 1> into the scene from <Picture 2>.' \
+  -F size=2048x2048 -F seed=42 -F response_format=b64_json
+```
+
+For background execution, send the same multipart body to `/v1/images/jobs` and poll the returned job ID. Job metadata includes the requested `size`, actual `canvas_size`, mode, reference count and each reference’s decoded dimensions. Image order is significant; do not mix `image` and `image[]` names in one request. Reference URLs, masks and unsupported parameters are rejected explicitly.
+
+The queue allows up to four pending/running jobs. Up to 128 recent jobs are kept in memory. Completed PNGs and JSON metadata are saved atomically in the output directory and reloaded on restart; pending jobs do not survive process termination. Output files are retained until manually removed. Model weights are released between stages and after each request.
+
+## ftllm launch
+
+Launch the current source/wheel with `ftllm launch`. Under **启动服务 → 增加启动项**, choose **图像（MiniMax H3 Image）**, set the model directory, port, output directory and one available GPU, then start the profile. Click **图像 Demo**, or open **工作室 → 图像生成**, to generate, edit or combine images, monitor progress, cancel, preview and download. The image backend can run alongside chat and video services; its requests pass through the launcher's authenticated service proxy.
+
+The launcher locates `minimax_h3_image_server` from the profile's binary field, `FTLLM_H3_IMAGE_SERVER`, the installed wheel, PATH or the source build directory, in that order. For a separate build directory:
+
+```bash
+FTLLM_H3_IMAGE_SERVER=/absolute/build/src/models/minimax_h3/minimax_h3_image_server ftllm launch
+```
+
+GPU indices in the launcher refer to its visible GPU list. If a container exposes physical GPU 3 only, select logical GPU 0. This image backend validates that only one GPU is selected. CUDA wheel packaging includes both image executables, OpenAPI, the standalone demo and its shared JS/CSS assets. A full release wheel has not been built in this experiment.
+
+## Numerical validation
+
+Tests require PyTorch, NumPy, Pillow, safetensors and a Diffusers checkout containing the MiniMax-H3-Image classes and converter. The native runtime itself does not need them. The reference used during development is Diffusers commit `f598e6e6a99528858b962c1399c45b59a6c25484`.
+
+```bash
+export CUDA_VISIBLE_DEVICES=3
+export PYTHONPATH=/path/to/diffusers/src
+python test/minimax_h3_image/compare_vae.py \
+  --model /workspace2/hfmodels/MiniMax-H3-Image \
+  --binary build/src/models/minimax_h3/minimax_h3_image_generate \
+  --diffusers /path/to/diffusers --output /tmp/h3-image-vae --precision fp32 --tiled
+python test/minimax_h3_image/compare_encoder.py \
+  --model /workspace2/hfmodels/MiniMax-H3-Image \
+  --binary build/src/models/minimax_h3/minimax_h3_image_generate \
+  --diffusers /path/to/diffusers --output /tmp/h3-image-encoder
+python test/minimax_h3_image/compare_dit.py \
+  --model /workspace2/hfmodels/MiniMax-H3-Image \
+  --binary build/src/models/minimax_h3/minimax_h3_image_generate \
+  --diffusers /path/to/diffusers --output /tmp/h3-image-dit
+```
+
+The VAE test compares all 24 decoder blocks and an asymmetric output tile; `--tiled` also compares the complete overlapping-tile PNG path. The DiT test runs all 50 blocks and six different PDD heads with fixed text and initial noise, comparing the six-step trajectory to the official scheduler. It releases the reference model before starting the C++ process.
+
+With `-DUNIT_TEST=ON`, build `minimax_h3_image_condition` and pass its executable as `--condition-binary` to `compare_dit.py`. This runs the real-weight 50-layer, six-step comparison with mixed text/vision tags and two asymmetric reference grids.
+
+The HTTP regression suite does not load a model or use a GPU. It checks authenticated history restoration beyond 128 results, invalid/incomplete sidecars and the packaged demo asset layout. The frontend state test checks exact output aspect ratios, overlapping uploads and submitting/reusing while references are being prepared.
+
+```bash
+python3 test/minimax_h3_image/test_server.py --binary build/src/models/minimax_h3/minimax_h3_image_server
+node test/minimax_h3_image/test_workspace.mjs
+# Also registered with CTest when UNIT_TEST and a Python interpreter are available:
+ctest --test-dir build -R minimax_h3_image_http --output-on-failure
+```
+
+Diagnostics: `--encode-image FILE` writes sampled, FP16-rounded and normalized CHW reference latents as FP32; it deliberately omits reference resizing for encoder comparisons. `--trace DIR` saves text, initial noise, step inputs and latents as raw row-major FP32 with `.shape` sidecars. `--trace-blocks` additionally saves all DiT block outputs and can use substantial disk space. `--text-in` accepts `[tokens,5120]`, `--noise-in` accepts `[height/32*width/32,96]`, and `--skip-decode` stops after the six steps. `--decode-latents` turns normalized packed latents into a PNG; `--vae-tile` accepts unnormalized HWC latents and writes FP32 patch rows for decoder comparisons.

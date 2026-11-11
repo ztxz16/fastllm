@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Image Studio · MiniMax H3</title>
+    <style>
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        background: #f7f9f3;
+        font-family:
+          Inter,
+          -apple-system,
+          BlinkMacSystemFont,
+          "Segoe UI",
+          sans-serif;
+        color: #26392c;
+      }
+      header {
+        height: 74px;
+        padding: 0 max(28px, calc((100vw - 1504px) / 2));
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        border-bottom: 1px solid #e4e9dc;
+        background: #fcfdf9;
+      }
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 11px;
+        font-size: 15px;
+        font-weight: 600;
+        letter-spacing: -0.3px;
+      }
+      .brand i {
+        font-style: normal;
+        background: #315f47;
+        color: #f0f5e9;
+        padding: 8px 9px;
+        border-radius: 9px;
+        font-size: 14px;
+      }
+      .brand span {
+        font-size: 10px;
+        font-weight: 400;
+        color: #8b9880;
+        margin-left: 10px;
+        letter-spacing: 1.2px;
+      }
+      .connection {
+        display: flex;
+        align-items: center;
+        gap: 18px;
+        font-size: 10px;
+        color: #87967a;
+      }
+      .connection details {
+        position: relative;
+      }
+      .connection summary {
+        cursor: pointer;
+        color: #829177;
+      }
+      .connection .key {
+        position: absolute;
+        right: 0;
+        top: 24px;
+        background: #fff;
+        border: 1px solid #dce5d2;
+        border-radius: 10px;
+        padding: 15px;
+        z-index: 9;
+        width: 260px;
+        box-shadow: 0 10px 30px #20302015;
+      }
+      .key label {
+        display: block;
+        margin-bottom: 8px;
+      }
+      .key input {
+        width: 100%;
+        padding: 9px;
+        border: 1px solid #dbe3d2;
+        border-radius: 6px;
+      }
+      .key a {
+        display: block;
+        color: #628451;
+        margin-top: 12px;
+      }
+      .dot {
+        display: inline-block;
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        background: #839d6a;
+        margin-right: 6px;
+      }
+      #workspace {
+        padding-top: 38px;
+      }
+      .h3-layout {
+        grid-template-columns: minmax(300px, 370px) minmax(0, 1fr);
+      }
+      footer {
+        max-width: 1504px;
+        margin: 0 auto;
+        padding: 6px 28px 25px;
+        display: flex;
+        justify-content: space-between;
+        color: #a0ab94;
+        font-size: 9px;
+        letter-spacing: 1px;
+      }
+      @media (max-width: 760px) {
+        header {
+          padding: 0 18px;
+        }
+        .brand span {
+          display: none;
+        }
+        .connection {
+          gap: 10px;
+        }
+        #workspace {
+          padding-top: 25px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div class="brand"><i>F</i>FastLLM <span>IMAGE STUDIO</span></div>
+      <div class="connection">
+        <span id="health" role="status">连接服务中</span>
+        <details>
+          <summary>连接设置</summary>
+          <div class="key">
+            <label for="key">API Key（可选）</label
+            ><input id="key" type="password" autocomplete="off" placeholder="服务密钥" /><a
+              href="/openapi.json"
+              target="_blank"
+              rel="noopener"
+              >OpenAPI 接口定义 ↗</a
+            >
+          </div>
+        </details>
+      </div>
+    </header>
+    <main id="workspace"></main>
+    <footer><span>MINIMAX H3 IMAGE</span><span>CREATE · REFINE · REIMAGINE</span></footer>
+    <script type="module">
+      import { ImageWorkspace } from "/assets/image-workspace.js";
+      const key = document.getElementById("key"),
+        health = document.getElementById("health");
+      const workspace = new ImageWorkspace(document.getElementById("workspace"), {
+        id: "standalone",
+        endpoint: () => location.origin,
+        request: async (path, options = {}) => {
+          const headers = new Headers();
+          if (key.value) headers.set("Authorization", "Bearer " + key.value);
+          if (options.body && !(options.body instanceof FormData))
+            headers.set("Content-Type", "application/json");
+          const response = await fetch("/v1" + path, { ...options, headers });
+          if (options.stream && response.ok) return response;
+          const data = await response.json();
+          if (!response.ok) throw Error(data.error?.message || "请求失败");
+          return data;
+        },
+      });
+      async function connect() {
+        try {
+          const response = await fetch("/health"),
+            data = await response.json(),
+            ready = data.status === "ready";
+          health.textContent = ready
+            ? "● 本地服务已连接"
+            : data.status === "failed"
+              ? "模型加载失败"
+              : "模型准备中";
+          workspace.update({ services: [{ id: "local", name: "MiniMax H3 Image", ready }] });
+          if (data.status === "failed") workspace.error(data.error || "模型加载失败");
+        } catch (e) {
+          health.textContent = "服务未连接";
+          workspace.update({ services: [{ id: "local", name: "MiniMax H3 Image", ready: false }] });
+        }
+      }
+      key.onchange = () => {
+        workspace.error("");
+        connect().then(() => workspace.poll());
+      };
+      connect();
+      setInterval(connect, 5000);
+    </script>
+  </body>
+</html>

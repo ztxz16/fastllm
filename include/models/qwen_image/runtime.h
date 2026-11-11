@@ -111,6 +111,7 @@ class Pipeline {
 std::string componentWeights(const std::string &directory);
 std::vector<uint8_t> encodePNG(const Image &);
 Image decodePNG(const std::string &);
+Image decodePNG(const std::string &, size_t maxPixels);
 enum class ImageResizeFilter { Lanczos, Bicubic, TorchBicubic };
 Image resizeImage(const Image &, int width, int height, ImageResizeFilter filter = ImageResizeFilter::Lanczos,
                   int maximum = 4096);

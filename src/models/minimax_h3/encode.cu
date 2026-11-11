@@ -100,9 +100,21 @@ Tensor VideoVAE::encodeTile(const Tensor &pixels, int frames, int height, int wi
         width % 16 || int64_t(frames) * height * width != pixels.rows)
         throw std::invalid_argument("invalid H3 VAE encoder pixels");
     int t = frames, h = height, w = width;
+    const bool nativeImageEncoderNames = fullWeights_.optional("encoder.down.0.block.0.norm1.weight") != nullptr;
+    auto encoderKey = [&](std::string name) {
+        if (nativeImageEncoderNames) {
+            for (auto pair : {std::pair<const char *, const char *>{"encoder.down_blocks.", "encoder.down."},
+                              {".resnets.", ".block."}, {".downsamplers.0.", ".downsample."},
+                              {".conv_shortcut.", ".nin_shortcut."}}) {
+                auto pos = name.find(pair.first);
+                if (pos != std::string::npos) name.replace(pos, std::string(pair.first).size(), pair.second);
+            }
+        }
+        return name;
+    };
     auto conv = [&](const Tensor &input, const std::string &name, int kernel, int st = 1, int ss = 1) {
-        const auto &weight = fullWeights_.get(name + ".weight");
-        const auto *bias = fullWeights_.optional(name + ".bias");
+        const auto &weight = fullWeights_.get(encoderKey(name + ".weight"));
+        const auto *bias = fullWeights_.optional(encoderKey(name + ".bias"));
         int pad = kernel == 3 && ss == 1 ? 1 : 0;
         int ot = (t - 1) / st + 1, oh = ss == 2 ? h / 2 : h, ow = ss == 2 ? w / 2 : w;
         int kc = input.cols * kernel * kernel * kernel, rows = ot * oh * ow;
@@ -131,8 +143,8 @@ Tensor VideoVAE::encodeTile(const Tensor &pixels, int frames, int height, int wi
         return output;
     };
     auto norm = [&](const Tensor &input, const std::string &name) {
-        const auto &weight = fullWeights_.get(name + ".weight");
-        const auto &bias = fullWeights_.get(name + ".bias");
+        const auto &weight = fullWeights_.get(encoderKey(name + ".weight"));
+        const auto &bias = fullWeights_.get(encoderKey(name + ".bias"));
         if (input.cols % 32 || weight.size() != size_t(input.cols) || bias.size() != weight.size())
             throw std::runtime_error("H3 encoder normalization shape mismatch: " + name);
         Tensor planar(input.rows, input.cols, DType::FP32), stats(t * 32, 2, DType::FP32);
@@ -161,7 +173,7 @@ Tensor VideoVAE::encodeTile(const Tensor &pixels, int frames, int height, int wi
             auto skip = x;
             auto y = conv(norm(x, p + ".norm1"), p + ".conv1", 3);
             y = conv(norm(y, p + ".norm2"), p + ".conv2", 3);
-            if (fullWeights_.optional(p + ".conv_shortcut.weight"))
+            if (fullWeights_.optional(encoderKey(p + ".conv_shortcut.weight")))
                 skip = conv(skip, p + ".conv_shortcut", 1);
             x = full_.add(skip, y);
             emit(p, x);
