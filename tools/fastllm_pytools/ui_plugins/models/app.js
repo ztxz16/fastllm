@@ -813,8 +813,10 @@ function renderProfiles() {
 
     const actions = document.createElement("div");
     actions.className = "project-actions";
-    const start = profileActionButton("start", index, t("Start"), "start");
-    start.disabled = running;
+    const primaryActions = document.createElement("div");
+    primaryActions.className = "project-action-group";
+    const secondaryActions = document.createElement("div");
+    secondaryActions.className = "project-action-group secondary";
     if (running) {
       const phaseLabels = {
         starting: t("Starting"),
@@ -825,26 +827,29 @@ function renderProfiles() {
       status.className = `profile-live-status ${service.phase || "running"}`;
       status.textContent = phaseLabels[service.phase] || t("Running");
       titleRow.append(status);
-      start.textContent = phaseLabels[service.phase] || t("Running");
     }
     if (running) {
       for (const [action, label] of [["select", t("Manage")], ["stop", t("Stop")]]) {
         const button = document.createElement("button");
-        button.type = "button"; button.className = "project-action"; button.textContent = label;
+        button.type = "button";
+        button.className = `project-action ${action === "select" ? "manage" : ""}`.trim();
+        button.textContent = label;
         button.addEventListener("click", async () => {
           try {
             state.runtime = await request(`/api/services/${service.sessionId}/${action}`, {method: "POST"});
             renderRuntime();
           } catch (error) { showToast(friendlyError(error), "error"); }
         });
-        actions.append(button);
+        primaryActions.append(button);
       }
+    } else {
+      primaryActions.append(profileActionButton("start", index, t("Start"), "start"));
     }
-    actions.append(
-      start,
+    secondaryActions.append(
       profileActionButton("edit", index, t("Edit"), "edit"),
       profileActionButton("delete", index, t("Delete"), "delete danger")
     );
+    actions.append(primaryActions, secondaryActions);
     item.append(avatar, copy, actions);
 
     if (running && service.sessionId === state.runtime?.sessionId) item.append(renderProfileRuntime());

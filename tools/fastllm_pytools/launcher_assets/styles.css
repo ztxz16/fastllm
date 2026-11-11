@@ -603,8 +603,11 @@ code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospac
 .profile-metadata { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; margin-left: -44px; }
 .profile-metadata span { display: inline-flex; padding: 5px 7px; border: 1px solid #e9eeea; border-radius: 5px; background: var(--surface-soft); color: var(--muted); font-size: 10px; }
 .profile-path { display: block; margin-top: 6px; overflow: hidden; color: var(--subtle); font-family: "SFMono-Regular", Consolas, monospace; font-size: 10px; line-height: 1.5; text-overflow: ellipsis; white-space: nowrap; }
-.project-actions { grid-column: 1 / -1; display: flex; align-items: center; gap: 7px; padding-top: 10px; border-top: 1px solid var(--line); }
-.project-action { display: inline-flex; min-height: 30px; align-items: center; justify-content: center; gap: 6px; padding: 0 11px; border: 1px solid var(--line); border-radius: 7px; background: white; color: var(--muted); cursor: pointer; font-size: 11px; font-weight: 550; }
+.project-actions { grid-column: 1 / -1; display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding-top: 10px; border-top: 1px solid var(--line); }
+.project-action-group { display: flex; flex: 0 0 auto; align-items: center; gap: 7px; }
+.project-action-group.secondary { margin-left: auto; }
+.project-action { display: inline-flex; flex: 0 0 auto; min-height: 32px; align-items: center; justify-content: center; gap: 6px; padding: 0 11px; border: 1px solid var(--line); border-radius: 7px; background: white; color: var(--muted); cursor: pointer; font-size: 11px; font-weight: 550; line-height: 1.4; white-space: nowrap; }
+.project-action.manage { border-color: var(--line-strong); background: var(--primary-soft); color: var(--primary); }
 .project-action:hover:not(:disabled) { border-color: #b1c8ba; background: var(--surface-soft); color: var(--ink); }
 .project-action.start { margin-right: auto; padding: 0 15px; border-color: var(--primary); background: var(--primary); color: white; }
 .project-action.start::before { content: ""; width: 0; height: 0; border-top: 4px solid transparent; border-bottom: 4px solid transparent; border-left: 6px solid currentColor; }
@@ -612,8 +615,6 @@ code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospac
 .project-action.delete { border-color: transparent; background: transparent; }
 .project-action.danger:hover:not(:disabled) { border-color: #efc9cd; background: var(--danger-soft); color: var(--danger); }
 .project-action:disabled { cursor: not-allowed; opacity: .45; }
-.profile-item.running .project-action.start { border-color: var(--line); background: var(--primary-soft); color: var(--success); opacity: 1; }
-.profile-item.running .project-action.start::before { border: 0; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
 .project-runtime { grid-column: 1 / -1; min-width: 0; padding: 12px; border-radius: 8px; background: var(--primary-soft); }
 .project-runtime-status { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: var(--primary); font-size: 11px; line-height: 1.5; }
 .project-runtime-status strong { flex: 0 0 auto; }
