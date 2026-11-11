@@ -1,4 +1,5 @@
 #include "models/minimax_h3_image/model.h"
+#include "models/minimax_h3_image/ops.h"
 #include "json11.hpp"
 #include "memory.h"
 #include <algorithm>
@@ -39,10 +40,6 @@ std::array<Tensor, 3> splitQKV(Runtime &rt, Tensor x, int heads, int dim) {
         out[i].cols = heads * dim;
     }
     return out;
-}
-Tensor gated(Runtime &rt, const Tensor &x) {
-    // The native layout is [gate; value], unlike Diffusers' [value; gate].
-    return rt.siluMultiply(rt.columns(x, 0, x.cols / 2), rt.columns(x, x.cols / 2, x.cols / 2));
 }
 struct Tiles {
     std::vector<int> starts, lengths, overlaps;
@@ -198,7 +195,7 @@ Tensor Transformer::feedForward(const Tensor &x, const std::string &p) {
         int n = std::min(4096, x.rows - first);
         if (n > 512)
             n -= n % 512;
-        auto y = gated(rt_, weights_.linear(x.rowSlice(first, n), p + ".fc1"));
+        auto y = gatedSilu(weights_.linear(x.rowSlice(first, n), p + ".fc1"));
         auto target = out.rowSlice(first, n);
         weights_.linear(y, p + ".fc2", false, &target);
         first += n;
@@ -374,7 +371,7 @@ Tensor VAE::decodeTile(const Tensor &latent, int h, int w, Trace trace) {
         y = weights_.linear(rt_.selfAttention(qk.first, qk.second, qkv[2], 16), p + ".attn.to_out");
         x = rt_.scaledResidual(x, y, fullWeights_.get(p + ".scale1"));
         y = rt_.videoRms(x, fullWeights_.get(p + ".norm2.weight"));
-        y = weights_.linear(gated(rt_, weights_.linear(y, p + ".ff.w1")), p + ".ff.w2");
+        y = weights_.linear(gatedSilu(weights_.linear(y, p + ".ff.w1")), p + ".ff.w2");
         x = rt_.scaledResidual(x, y, fullWeights_.get(p + ".scale2"));
         if (trace)
             trace("block." + std::to_string(i), x);
@@ -465,7 +462,7 @@ Tensor VAE::decodeTiles(const Tensor &latent, int h, int w, int batch, Trace tra
         y = weights_.linear(rt_.packedSelfAttention(qkv, 16, batch), p + ".attn.to_out");
         x = rt_.scaledResidual(x, y, fullWeights_.get(p + ".scale1"));
         y = rt_.videoRms(x, fullWeights_.get(p + ".norm2.weight"));
-        y = weights_.linear(gated(rt_, weights_.linear(y, p + ".ff.w1")), p + ".ff.w2");
+        y = weights_.linear(gatedSilu(weights_.linear(y, p + ".ff.w1")), p + ".ff.w2");
         x = rt_.scaledResidual(x, y, fullWeights_.get(p + ".scale2"));
         if (trace)
             trace("block." + std::to_string(i), x);
@@ -523,6 +520,7 @@ Image VAE::decode(const std::vector<float> &packed, int height, int width, Progr
             int th = ys.lengths[iy] / 16, tw = xs.lengths[ix] / 16;
             const size_t index = iy * nx + ix;
             if (index >= batchStart + batchSize || batchStart == tileCount) {
+                // splitTiles() keeps all tiles the same shape, including the tail batch.
                 batchStart = index;
                 batchSize = std::min(capacity, tileCount - index);
                 std::vector<float> values(batchSize * th * tw * 24);
@@ -605,7 +603,7 @@ minimax_h3::VideoTensor VAE::encode(const Image &image, std::mt19937 &generator,
     auto moments = encoder.encodeMoments(pixels, [&](int i, int n) {
         if (progress)
             progress("reference", i, n);
-    });
+    }, !rt_.isFloat32());
     encoder.unload();
     const size_t cells = size_t(moments.height) * moments.width;
     auto noise = minimax_h3::normalNoise(generator, cells * 24);

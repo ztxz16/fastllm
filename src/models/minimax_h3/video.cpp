@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
+#include <cuda_runtime.h>
 
 namespace fastllm {
 namespace minimax_h3 {
@@ -196,11 +197,26 @@ VideoTensor crop(const VideoTensor &x, int t, int count, int y, int h, int z, in
     return out;
 }
 } // namespace
-VideoTensor VideoVAE::encodeMoments(const VideoTensor &pixels, std::function<void(int, int)> progress) {
+VideoTensor VideoVAE::encodeMoments(const VideoTensor &pixels, std::function<void(int, int)> progress,
+                                   bool independentImages) {
     if (pixels.channels != 3 || pixels.frames < 1 || pixels.height < 32 || pixels.width < 32 ||
         pixels.height % 16 || pixels.width % 16 ||
         pixels.values.size() != size_t(pixels.frames) * pixels.height * pixels.width * 3)
         throw std::invalid_argument("invalid H3 VAE encoder input");
+    if (independentImages && pixels.frames != 1)
+        throw std::invalid_argument("image encoder requires exactly one frame");
+    // Explicit small budgets keep the original bounded-memory implementation.
+    independentImages = independentImages && !lowMemory_;
+    size_t capacity = 1;
+    if (independentImages) {
+        size_t free = 0, totalBytes = 0;
+        auto status = cudaMemGetInfo(&free, &totalBytes);
+        if (status != cudaSuccess)
+            throw std::runtime_error(cudaGetErrorString(status));
+        constexpr size_t reserve = size_t(2) << 30, perTile = size_t(256) << 20;
+        if (free > reserve)
+            capacity = std::clamp((free - reserve) / perTile, size_t(1), size_t(8));
+    }
     auto ys = split(pixels.height, 256, 64, 16), xs = split(pixels.width, 256, 64, 16);
     int chunks = pixels.frames == 1 ? 1 : (pixels.frames + 16) / 17;
     int clipFrames = pixels.frames == 1 ? 1 : 17, latentFrames = pixels.frames == 1 ? 1 : 5;
@@ -221,12 +237,38 @@ VideoTensor VideoVAE::encodeMoments(const VideoTensor &pixels, std::function<voi
         };
         std::vector<Tensor> encoded;
         size_t count = ys.start.size() * xs.start.size();
-        if (tileRunner_ && count > 1)
+        if (tileRunner_ && count > 1 && !independentImages)
             encoded = tileRunner_(count, encode);
+        Tensor batch;
+        size_t batchStart = 0, batchSize = 0;
         for (size_t yi = 0; yi < ys.start.size(); ++yi)
             for (size_t xi = 0; xi < xs.start.size(); ++xi) {
                 size_t job = yi * xs.start.size() + xi;
-                auto moments = encoded.empty() ? encode(*this, job) : encoded[job];
+                Tensor moments;
+                if (independentImages) {
+                    const int th = ys.length[yi], tw = xs.length[xi], rows = th / 16 * (tw / 16);
+                    if (job >= batchStart + batchSize) {
+                        // split() keeps a uniform tile size on each axis, including the tail.
+                        batch = {};
+                        batchStart = job;
+                        batchSize = std::min(capacity, count - job);
+                        std::vector<float> values;
+                        values.reserve(batchSize * th * tw * 3);
+                        for (size_t i = job; i < job + batchSize; ++i) {
+                            auto input = crop(pixels, 0, 1, ys.start[i / xs.start.size()], th,
+                                              xs.start[i % xs.start.size()], tw);
+                            values.insert(values.end(), input.values.begin(), input.values.end());
+                        }
+                        batch = encodeImageTiles(full_.upload(values.data(), int(batchSize) * th * tw, 3),
+                                                  th, tw, int(batchSize),
+                                                  [&](const std::string &, const Tensor &) {
+                                                      if (progress) progress(done, total);
+                                                  });
+                    }
+                    moments = batch.rowSlice(int(job - batchStart) * rows, rows);
+                } else {
+                    moments = encoded.empty() ? encode(*this, job) : encoded[job];
+                }
                 VideoTensor tile(latentFrames, ys.length[yi] / 16, xs.length[xi] / 16, 48);
                 tile.values = full_.download(moments);
                 // Blend against the original neighbouring tiles, before cropping overlaps.

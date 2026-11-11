@@ -187,7 +187,11 @@ class VideoVAE {
     }
     // ImageNet-normalized THWC pixels -> FP32 posterior moments (mean, log variance).
     Tensor encodeTile(const Tensor &, int frames, int height, int width, Trace trace = {});
-    VideoTensor encodeMoments(const VideoTensor &, std::function<void(int, int)> progress = {});
+    // Single-frame convolutions omit the two zero causal frames; batches never mix images.
+    // Ampere+ uses TF32 products with FP32 accumulation; encodeTile retains FP32 math.
+    Tensor encodeImageTiles(const Tensor &, int height, int width, int batch, Trace trace = {});
+    VideoTensor encodeMoments(const VideoTensor &, std::function<void(int, int)> progress = {},
+                              bool independentImages = false);
     Tensor decodeTile(const Tensor &, int frames, int height, int width, Trace trace = {});
     VideoTensor decode(const VideoTensor &, std::function<void(int, int)> progress = {});
     std::vector<uint8_t> decodeRGB(const VideoTensor &, std::function<void(int, int)> progress = {},
@@ -196,17 +200,23 @@ class VideoVAE {
         weights_.clear();
         fullWeights_.clear();
         qkv_.clear();
+        imageConvolutions_.clear();
+        imageEncoder_.reset();
         rope_ = {};
         zero_ = {};
     }
 
   private:
+    struct ImageEncoderState;
+    std::shared_ptr<ImageEncoderState> imageEncoder_;
+    Tensor encodeTiles(const Tensor &, int frames, int height, int width, bool independentImages, Trace);
     Tensor decodeTiles(const Tensor &, int frames, int height, int width, int batch, Trace trace = {});
     Tensor decodeClip(const VideoTensor &, std::function<void()> checkpoint = {});
     Tensor decodeDevice(const VideoTensor &, std::function<void(int, int)> progress,
                          std::function<void(const Tensor &)> onFrames = {});
     Runtime &rt_, &full_;
     Weights weights_, fullWeights_;
+    std::unordered_map<std::string, Tensor> imageConvolutions_;
     std::vector<std::pair<Tensor, Tensor>> qkv_;
     std::array<int, 3> ropeShape_{};
     std::pair<Tensor, Tensor> rope_;

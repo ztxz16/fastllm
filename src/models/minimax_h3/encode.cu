@@ -1,5 +1,6 @@
 #include "models/minimax_h3/runtime.h"
 #include <cuda_runtime.h>
+#include <cublas_v2.h>
 #include <algorithm>
 #include <stdexcept>
 
@@ -16,6 +17,31 @@ void check() {
 }
 __device__ int reflect(int x, int n) {
     return x < 0 ? -x : x >= n ? 2 * n - 2 - x : x;
+}
+// Compact O,I,H,W weights for the last (and only nonzero) causal input frame.
+__global__ void imageConvWeights(const float *x, float *out, size_t count, int channels) {
+    for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < count;
+         i += size_t(gridDim.x) * blockDim.x) {
+        size_t o = i / (channels * 9), k = i % (channels * 9);
+        out[i] = x[o * channels * 27 + k / 9 * 27 + 18 + k % 9];
+    }
+}
+__global__ void imageColumns(const float *x, float *out, int rows, int channels, int height, int width,
+                            int stride, int pad, int outH, int outW, int start) {
+    const int kc = channels * 9;
+    for (int row = blockIdx.x; row < rows; row += gridDim.x) {
+        int pixel = start + row, batch = pixel / (outH * outW);
+        int y0 = pixel / outW % outH * stride - pad, x0 = pixel % outW * stride - pad;
+        for (int k = blockIdx.y * blockDim.x + threadIdx.x; k < kc; k += gridDim.y * blockDim.x) {
+            int c = k / 9, y = reflect(y0 + k / 3 % 3, height), z = reflect(x0 + k % 3, width);
+            out[size_t(row) * kc + k] = x[((size_t(batch) * height + y) * width + z) * channels + c];
+        }
+    }
+}
+__global__ void imageConvBias(float *x, const float *bias, size_t count, int channels) {
+    for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < count;
+         i += size_t(gridDim.x) * blockDim.x)
+        x[i] += bias[i % channels];
 }
 // Checkpoints store O,I,T,H,W kernels; activations are contiguous T,H,W,C.
 __global__ void causalColumns(const float *x, float *out, int rows, int channels, int height, int width,
@@ -95,11 +121,44 @@ __global__ void frameGroupSilu(const float *x, float *out, const float *stats, c
 }
 } // namespace
 
+// A private handle prevents the image encoder's math mode affecting DiT, video,
+// or other models sharing a Runtime. Inputs, outputs, norms and residuals stay FP32.
+struct VideoVAE::ImageEncoderState {
+    cublasHandle_t blas = nullptr;
+    bool tensorCores = false;
+    ImageEncoderState() {
+        int device = 0, major = 0;
+        if (cudaGetDevice(&device) != cudaSuccess ||
+            cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess)
+            throw std::runtime_error("cannot query image encoder device");
+        tensorCores = major >= 8;
+        if (cublasCreate(&blas) != CUBLAS_STATUS_SUCCESS)
+            throw std::runtime_error("cannot create image encoder cuBLAS handle");
+        if (cublasSetStream(blas, cudaStreamPerThread) != CUBLAS_STATUS_SUCCESS) {
+            cublasDestroy(blas);
+            throw std::runtime_error("cannot set image encoder cuBLAS stream");
+        }
+    }
+    ~ImageEncoderState() {
+        if (blas)
+            cublasDestroy(blas);
+    }
+};
+
 Tensor VideoVAE::encodeTile(const Tensor &pixels, int frames, int height, int width, Trace trace) {
+    return encodeTiles(pixels, frames, height, width, false, std::move(trace));
+}
+Tensor VideoVAE::encodeImageTiles(const Tensor &pixels, int height, int width, int batch, Trace trace) {
+    return encodeTiles(pixels, batch, height, width, true, std::move(trace));
+}
+Tensor VideoVAE::encodeTiles(const Tensor &pixels, int frames, int height, int width,
+                             bool independentImages, Trace trace) {
     if (!pixels.isFloat32() || pixels.cols != 3 || frames < 1 || height < 32 || width < 32 || height % 16 ||
         width % 16 || int64_t(frames) * height * width != pixels.rows)
         throw std::invalid_argument("invalid H3 VAE encoder pixels");
     int t = frames, h = height, w = width;
+    if (independentImages && !imageEncoder_)
+        imageEncoder_ = std::make_shared<ImageEncoderState>();
     const bool nativeImageEncoderNames = fullWeights_.optional("encoder.down.0.block.0.norm1.weight") != nullptr;
     auto encoderKey = [&](std::string name) {
         if (nativeImageEncoderNames) {
@@ -113,14 +172,32 @@ Tensor VideoVAE::encodeTile(const Tensor &pixels, int frames, int height, int wi
         return name;
     };
     auto conv = [&](const Tensor &input, const std::string &name, int kernel, int st = 1, int ss = 1) {
-        const auto &weight = fullWeights_.get(encoderKey(name + ".weight"));
+        auto key = encoderKey(name + ".weight");
+        const Tensor *weight = nullptr;
+        if (independentImages && kernel == 3) {
+            auto &compact = imageConvolutions_[key];
+            if (!compact.data) {
+                const auto &original = fullWeights_.get(key);
+                if (original.cols != input.cols * 27)
+                    throw std::runtime_error("H3 image convolution shape mismatch: " + name);
+                compact = Tensor(original.rows, input.cols * 9, DType::FP32);
+                imageConvWeights<<<std::min<size_t>((compact.size() + 255) / 256, 4096), 256, 0,
+                                   cudaStreamPerThread>>>(ptr(original), ptr(compact), compact.size(), input.cols);
+                check();
+                fullWeights_.erasePrefix(key);
+            }
+            weight = &compact;
+        } else {
+            weight = &fullWeights_.get(key);
+        }
         const auto *bias = fullWeights_.optional(encoderKey(name + ".bias"));
         int pad = kernel == 3 && ss == 1 ? 1 : 0;
-        int ot = (t - 1) / st + 1, oh = ss == 2 ? h / 2 : h, ow = ss == 2 ? w / 2 : w;
-        int kc = input.cols * kernel * kernel * kernel, rows = ot * oh * ow;
-        if (weight.cols != kc || input.rows != t * h * w)
+        int ot = independentImages ? t : (t - 1) / st + 1;
+        int oh = ss == 2 ? h / 2 : h, ow = ss == 2 ? w / 2 : w;
+        int kc = input.cols * kernel * kernel * (independentImages ? 1 : kernel), rows = ot * oh * ow;
+        if (weight->cols != kc || input.rows != t * h * w)
             throw std::runtime_error("H3 encoder convolution shape mismatch: " + name);
-        Tensor output(rows, weight.rows, DType::FP32);
+        Tensor output(rows, weight->rows, DType::FP32);
         for (int first = 0; first < rows;) {
             // Bound im2col scratch and retain the original sub-512 tail shape.
             int count = std::min(8192, rows - first);
@@ -132,12 +209,30 @@ Tensor VideoVAE::encodeTile(const Tensor &pixels, int frames, int height, int wi
             else {
                 columns = Tensor(count, kc, DType::FP32);
                 dim3 blocks(std::min(count, 2048), std::min((kc + 255) / 256, 4));
-                causalColumns<<<blocks, 256, 0, cudaStreamPerThread>>>(
-                    ptr(input), ptr(columns), count, input.cols, h, w, st, ss, pad, oh, ow, first);
+                if (independentImages)
+                    imageColumns<<<blocks, 256, 0, cudaStreamPerThread>>>(
+                        ptr(input), ptr(columns), count, input.cols, h, w, ss, pad, oh, ow, first);
+                else
+                    causalColumns<<<blocks, 256, 0, cudaStreamPerThread>>>(
+                        ptr(input), ptr(columns), count, input.cols, h, w, st, ss, pad, oh, ow, first);
                 check();
             }
             auto target = output.rowSlice(first, count);
-            full_.linearInto(columns, weight, target, bias);
+            if (independentImages && imageEncoder_->tensorCores) {
+                const float one = 1, zero = 0;
+                auto status = cublasGemmEx(imageEncoder_->blas, CUBLAS_OP_T, CUBLAS_OP_N,
+                                          weight->rows, count, kc, &one, weight->data, CUDA_R_32F, kc,
+                                          columns.data, CUDA_R_32F, kc, &zero, target.data, CUDA_R_32F,
+                                          target.cols, CUBLAS_COMPUTE_32F_FAST_TF32, CUBLAS_GEMM_DEFAULT);
+                if (status != CUBLAS_STATUS_SUCCESS)
+                    throw std::runtime_error("image encoder cuBLAS convolution failed: " + name);
+                if (bias)
+                    imageConvBias<<<std::min<size_t>((target.size() + 255) / 256, 4096), 256, 0,
+                                    cudaStreamPerThread>>>(ptr(target), ptr(*bias), target.size(), target.cols);
+                check();
+            } else {
+                full_.linearInto(columns, *weight, target, bias);
+            }
             first += count;
         }
         return output;
@@ -181,7 +276,8 @@ Tensor VideoVAE::encodeTile(const Tensor &pixels, int frames, int height, int wi
         if (block < 4) {
             int st = block == 1 || block == 2 ? 2 : 1;
             x = conv(x, prefix + ".downsamplers.0.conv", 3, st, 2);
-            t = (t - 1) / st + 1;
+            if (!independentImages)
+                t = (t - 1) / st + 1;
             h /= 2;
             w /= 2;
         }

@@ -107,7 +107,6 @@ Reviewed on `master` at `5cc1d98cfdd7e123da55f86a87cee35670504f75`, with the vid
 
 Review logs and the final patch/manifest are under `/workspace2/experiments/minimax-h3-native/image-native-20261111/commit-readiness-20261111`. These checks support committing the two features separately; workload and release-packaging limitations above still apply.
 
-
 ## Persistent inference and batched image VAE optimization (2026-11-11)
 
 Base: `43758adf012978d42d9ce369c3d1204ddbc42dac`. Single RTX PRO 5000 72 GB, physical GPU 4, 2048×2048, six BF16 steps, seed 42, same prompts and reference as the prior SGLang comparison. Each case ran four times; the table reports the median of the last three requests. Initialization and PNG encoding/writes are excluded. Stage boundaries synchronize CUDA and include weight preparation/movement. These are warm persistent-process results, not cold CLI latency.
@@ -143,3 +142,84 @@ build/src/models/minimax_h3/minimax_h3_image_state /path/to/MiniMax-H3-Image ref
 ```
 
 The existing image demo profile was switched to the new `speed-opt-20261111/build` server through the launcher API after verifying that no jobs were active. The launcher address/authentication and all five saved outputs were preserved; native health is ready. The old build remains available. First use after restart still includes weight loading.
+
+## Reference-edit optimization (2026-11-11)
+
+Continued on `master`, after the persistent-cache optimization above. The image encoder now
+removes the two zero causal frames from single-frame convolutions, batches up to eight
+independent tiles, and uses a private cuBLAS TF32 handle with FP32 accumulation. Normalization,
+residuals and posterior moments remain FP32. Low-memory and FP32 diagnostic paths retain the
+previous encoder. A separate image CUDA file fuses gate-first SiLU/multiply without changing
+its rounding or the existing 4096-row FFN chunk limit. The 16384-row candidate was slower and
+used more VRAM, so it was discarded.
+
+Same physical RTX PRO 5000 72 GB, 2048-square input/output, six steps, seed 42; four consecutive
+requests per case, first excluded, median of the remaining three. Stage timings include
+weight preparation/transfers and CUDA synchronization, but exclude initialization/PNG writing.
+
+| Stage, seconds | Previous optimized edit | Current edit |
+| --- | ---: | ---: |
+| Text | 1.0370 | 1.0266 |
+| Reference VAE | 4.1234 | 1.2129 |
+| DiT | 16.0591 | 15.6642 |
+| VAE decode | 0.3191 | 0.2986 |
+| Total | 21.7064 | 18.3817 |
+
+Edit latency fell 15.32%; reference encoding is 3.40 times faster. T2I is 7.1240 seconds versus
+7.3659 previously. This is warm-request performance, not cold process startup. Current warm
+post-request VRAM is 41974 MiB for edits / 41522 MiB for T2I, including the retained CUDA pool;
+peak process RSS is 50095 / 48889 MiB. SGLang was not rerun; its earlier edit-quality issue remains.
+
+Validation:
+
+- Real checkpoint encoder comparisons cover 32x48, 48x80, 256x256; batches 1/2/3/8; every emitted
+  layer; overlapping tiles; unload/reuse; and low-memory fallback. Maximum relative L2 is
+  `0.0011612 < 0.01`; blended posterior moments have relative L2 `0.000208622`.
+- Gate fusion is exact for BF16, FP16 and FP32, including scalar/vector widths and large tensors.
+- All four T2I PNGs match the previous version byte-for-byte. All four edits match one another;
+  versus the previous edit, RGB relative L2 is `0.012239746`, MAE `0.987/255`. The acceptance
+  threshold applies to operators/encoder tensors, not final RGB. Edits are not pixel-identical;
+  visual inspection confirmed the intended snowy forest and preserved subject/composition.
+- Original shared-video encoding, one and seventeen frames at 32x48, through both `encodeTile`
+  and `encodeMoments`, produces byte-identical outputs with the old/new binaries.
+- CTest passes image ops/memory/HTTP, model source and shared H3 fused ops (5/5).
+- T2I/edit/T2I state recovery passes. Reference/text/prepare/denoise/decode cancellation releases
+  host cache and allows a subsequent identical T2I request.
+- Actual 4 GiB RAM/no-swap container, explicit 4 GiB GPU / 2 GiB host budget: oversized job fails
+  cleanly, cancellation succeeds, then a two-reference 2K edit completes. Peak GPU 3573 MiB,
+  peak server RSS 848 MiB; final health ready.
+- Native CUDA13/SM120 builds and `ldd` checks pass; no Torch/Python runtime library dependency.
+  Full release wheels, other GPU architectures and the maximum 16-reference workload were not tested.
+
+Model-dependent encoder check: build `minimax_h3_image_encode` with `UNIT_TEST=ON`, then run it
+with the checkpoint directory and a reference PNG. `minimax_h3_image_ops` is a CUDA CTest target.
+Experiment records and drivers are in `image-native-20261111/edit-opt-20261111`; production sources
+contain no timing hooks. Do not overwrite the existing experiment outputs when reproducing.
+
+## Optimization commit review (2026-11-12)
+
+Reviewed the combined changes against `43758adf012978d42d9ce369c3d1204ddbc42dac` on `master`.
+Consolidated checkpoint-test build rules, clarified tile-shape and precision invariants, and
+made encoder fallback/cache comparisons require exact equality. The checkpoint encoder test
+now switches the same VAE instance from fast image encoding back to one- and seventeen-frame
+video encoding, through both tile and tiled-moments entry points. Runtime cleanup changed only
+comments, formatting and an explicit standard-library include; inference calculations and
+memory policies are unchanged from the preceding optimization.
+
+- A fresh CUDA 13 / SM120 build of CLI/server and all relevant test targets passed.
+- CTest image ops/memory/HTTP, model source and shared H3 fused ops passed (5/5, 37.42 seconds).
+- Real-checkpoint encoder comparisons passed (118 comparisons, maximum relative L2 `0.00120415`).
+  Image-to-video switching, unload/reuse and low-memory fallback were exactly equal to their
+  respective references. Decoder comparisons passed (80 comparisons, maximum relative L2
+  `0.00619592`). Both are below the `0.01` operator tolerance; this does not promise lossless RGB.
+- Pipeline T2I/edit/T2I recovery and cancellation at reference/text/prepare/denoise/decode all
+  passed, including release of accounted host caches and identical output after recovery.
+- Native dependency checks found no Torch/Python libraries or unresolved runtime libraries.
+- The previous constrained-RAM/GPU and timing results remain the evidence for those workloads;
+  they were not rerun for this non-numerical cleanup. Release-wheel builds, other architectures
+  and the maximum sixteen-reference workload remain outside the tested scope.
+
+No blocking issue was found for this scope. Suggested boundaries are persistent caches/batched
+decoding, followed by reference-encoder/gate acceleration, each with its own build rules,
+tests and documentation. No commit or push was made. Review logs are in
+`image-native-20261111/commit-review-20261112`; the existing studio build was left running.
