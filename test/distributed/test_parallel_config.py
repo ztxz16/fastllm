@@ -61,7 +61,7 @@ class ParallelConfigTests(unittest.TestCase):
                 self.assertEqual((result['dp_size'], result['tp_size'], result['total_gpus']), (count, 1, count))
                 self.assertEqual([[d['logical_id'] for d in r['devices']] for r in result['replicas']],
                                  [[i] for i in range(count)])
-                self.assertFalse(result['multi_replica_execution_available'])
+                self.assertTrue(result['multi_replica_execution_available'])
                 self.assertTrue(result['preview_only'])
 
     def test_dp_tp_combination_uses_disjoint_replicas(self):
@@ -172,17 +172,16 @@ class ParallelConfigTests(unittest.TestCase):
             self.preview()
 
     def test_dp_inference_cannot_silently_execute_one_replica(self):
-        for entry in (make_normal_llm_model, process_tp.ProcessTPModel):
-            with self.subTest(entry=entry.__name__), self.assertRaisesRegex(NotImplementedError, '多副本执行尚未接入'):
-                entry(self.args('--dp', '2'))
-        with mock.patch.object(sys, 'argv', ['ftllm', 'serve', 'missing', '--tp-backend', 'process', '--dp', '2']):
-            with self.assertRaisesRegex(NotImplementedError, '多副本执行尚未接入'):
-                cli.main()
+        with mock.patch('fastllm_pytools.process_dp.ProcessDPModel') as pool:
+            self.assertIs(make_normal_llm_model(self.args('--dp', '2')), pool.return_value)
+            pool.assert_called_once()
+        with self.assertRaisesRegex(ValueError, 'requires the model factory'):
+            process_tp.ProcessTPModel(self.args('--dp', '2'))
         self.factory.assert_not_called()
         self.session.assert_not_called()
 
     def test_invalid_config_precedes_model_lookup(self):
-        for entry in (make_normal_llm_model, process_tp.ProcessTPModel):
+        for entry in (make_normal_llm_model,):
             with self.subTest(entry=entry.__name__), self.assertRaisesRegex(ValueError, 'needs 8, found 4'):
                 entry(self.args('--dp', '4', '--tp', '2'))
         self.factory.assert_not_called()

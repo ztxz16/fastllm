@@ -98,6 +98,8 @@ class Job:
     status: int = 0
     response: dict = field(default_factory=dict)
     native_id: int | None = None
+    dp_rank: int | None = None
+    dp_request_id: int | None = None
     created: int = field(default_factory=lambda: int(time.time()))
     events: queue.Queue = field(default_factory=lambda: queue.Queue(maxsize=64))
 
@@ -126,7 +128,7 @@ class IncrementalTextDecoder:
 
 
 class ChatService:
-    """唯一消费线程持有会话与 tokenizer；HTTP 线程只入队、查询或设置取消标志。"""
+    """/** 消费线程数等于模型并发槽数；共享有界队列，分离 tokenizer 与生成锁。 */"""
 
     def __init__(self, session, tokenizer, model, model_name, output, *, queue_size=8, request_timeout=120):
         if (type(queue_size) is not int or queue_size < 1 or
@@ -141,11 +143,22 @@ class ChatService:
         self.queue_size, self.request_timeout = queue_size, request_timeout
         self._condition = threading.Condition()
         self._queue, self._jobs = deque(), {}
-        self._active = None
+        self._active = {}
+        self._tokenizer_lock = threading.Lock()
         self._stopping = False
         self.failure = None
-        self._thread = threading.Thread(target=self._run, name="qwen3-http-scheduler")
-        self._thread.start()
+        self._threads = []
+        self._remaining = 0
+        try:
+            with self._condition:
+                for rank in range(getattr(session, 'concurrency', 1)):
+                    thread = threading.Thread(target=self._run, name=f"qwen3-http-scheduler-{rank}")
+                    thread.start()
+                    self._threads.append(thread)
+                    self._remaining += 1
+        except BaseException:
+            self.close()
+            raise
 
     def submit(self, payload, request_id=None):
         validate_payload(payload, self.model_name)
@@ -170,7 +183,8 @@ class ChatService:
         # 调用者持有 condition；先落盘再唤醒 HTTP，不能将日志失败伪装为成功。
         try:
             path = self.output / ("http-" + uuid.uuid4().hex + ".json")
-            path.write_text(json.dumps(dict(id=job.id, native_id=job.native_id, request=job.payload, status=status, response=response),
+            path.write_text(json.dumps(dict(id=job.id, native_id=job.native_id, dp_rank=job.dp_rank,
+                                           dp_request_id=job.dp_request_id, request=job.payload, status=status, response=response),
                                        ensure_ascii=False, allow_nan=False, indent=2))
         except Exception as error:
             self.failure = f"cannot persist HTTP result: {error}"
@@ -187,7 +201,7 @@ class ChatService:
             if not job.cancel.is_set():
                 job.cancel_status, job.cancel_reason = status, reason
                 job.cancel.set()
-            if job is not self._active:
+            if self._active.get(job.id) is not job:
                 self._queue.remove(job)
                 self._finish(job, job.cancel_status, error_body(job.cancel_reason))
             return True
@@ -196,9 +210,11 @@ class ChatService:
         with self._condition:
             ready = not self._stopping and self.failure is None and self.session.state == "ready"
             return dict(status="ready" if ready else "unavailable", backend=BACKEND, model=self.model_name,
-                        active_request_id=self._active.id if self._active else None,
+                        active_request_id=next(iter(self._active), None), active_request_ids=list(self._active),
                         queued_request_ids=[job.id for job in self._queue], queue_capacity=self.queue_size,
-                        workers=self.session.ready["workers"], model_load_count=1)
+                        workers=self.session.ready["workers"], model_load_count=self.session.ready.get('model_load_count', 1),
+                        dp_size=getattr(self.session, 'dp_size', 1),
+                        replicas=self.session.ready.get('replicas', []))
 
     def _emit(self, job, text):
         # 回调不能阻塞原生事件读取；慢客户端取消当前请求并继续读取原生取消确认。
@@ -211,29 +227,40 @@ class ChatService:
 
     def _generate(self, job):
         payload = job.payload
-        request = prepare_request(self.model, self.tokenizer, None, messages=payload["messages"],
-            max_new_tokens=payload.get("max_tokens", 32), temperature=payload.get("temperature", 0.0),
-            top_k=payload.get("top_k", 0), top_p=payload.get("top_p", 1.0), seed=payload.get("seed", 0))
+        with self._tokenizer_lock:
+            request = prepare_request(self.model, self.tokenizer, None, messages=payload["messages"],
+                max_new_tokens=payload.get("max_tokens", 32), temperature=payload.get("temperature", 0.0),
+                top_k=payload.get("top_k", 0), top_p=payload.get("top_p", 1.0), seed=payload.get("seed", 0))
         if job.cancel.is_set() or time.monotonic() >= job.deadline:
             raise HTTPError(job.cancel_status if job.cancel.is_set() else 504,
                             job.cancel_reason if job.cancel.is_set() else "request deadline exceeded")
         timer = threading.Timer(max(0, job.deadline - time.monotonic()), self.cancel,
                                 args=(job.id, 504, "request deadline exceeded"), kwargs=dict(expected_job=job))
         decoder = IncrementalTextDecoder(self.tokenizer) if payload.get("stream") else None
+
+        def on_token(token):
+            with self._tokenizer_lock:
+                text = decoder.push(token)
+            self._emit(job, text)
+
         timer.start()
         try:
             report = self.session.generate(request, cancel_event=job.cancel,
-                on_token=(lambda token: self._emit(job, decoder.push(token))) if decoder else None)
+                on_token=on_token if decoder else None)
             job.native_id = report["id"]
+            job.dp_rank, job.dp_request_id = report.get('dp_rank'), report.get('dp_request_id')
         except (GenerationRejected, GenerationObserverError) as error:
             job.native_id = error.report["id"]
+            job.dp_rank, job.dp_request_id = error.report.get('dp_rank'), error.report.get('dp_request_id')
             raise
         finally:
             timer.cancel()
             timer.join()
         if decoder:
             try:
-                self._emit(job, decoder.finish())
+                with self._tokenizer_lock:
+                    tail = decoder.finish()
+                self._emit(job, tail)
             except ValueError as error:
                 raise HTTPError(500, f"final text decoding failed: {error}") from error
             text = decoder.text
@@ -241,7 +268,8 @@ class ChatService:
                 # 取消期间可能丢弃过增量；即使原生恰好已完成，也不能发送成功 DONE。
                 raise HTTPError(job.cancel_status, job.cancel_reason)
         else:
-            text = self.tokenizer.decode(report["token_ids"], skip_special_tokens=True, clean_up_tokenization_spaces=False)
+            with self._tokenizer_lock:
+                text = self.tokenizer.decode(report["token_ids"], skip_special_tokens=True, clean_up_tokenization_spaces=False)
         return dict(id="chatcmpl-" + job.id, object="chat.completion", created=job.created, model=self.model_name,
                     choices=[dict(index=0, message=dict(role="assistant", content=text),
                                   finish_reason="stop" if report["finish_reason"] == "eos" else "length")],
@@ -249,6 +277,7 @@ class ChatService:
                                total_tokens=len(request["token_ids"]) + len(report["token_ids"])))
 
     def _run(self):
+        job = None
         try:
             while True:
                 with self._condition:
@@ -256,7 +285,7 @@ class ChatService:
                     if self._stopping:
                         break
                     job = self._queue.popleft()
-                    self._active = job
+                    self._active[job.id] = job
                 try:
                     if self.failure is not None:
                         raise HTTPError(503, "model service unavailable")
@@ -280,20 +309,28 @@ class ChatService:
                     status, response = 503, error_body("generation failed; inspect server logs")
                 with self._condition:
                     self._finish(job, status, response)
-                    self._active = None
+                    self._active.pop(job.id, None)
+                    job = None
+                    if self.failure is not None:
+                        break
         except BaseException as error:
             self.failure = str(error)
         finally:
             with self._condition:
                 self._stopping = True
-                for job in list(self._jobs.values()):
-                    self._finish(job, 503, error_body("model service stopped"))
-                self._queue.clear()
-                self._active = None
-            try:
-                self.session.close()
-            except BaseException as error:
-                self.failure = f"session cleanup failed: {error}"
+                if job is not None and job.id in self._active:
+                    self._finish(job, 503, error_body('scheduler failed'))
+                    self._active.pop(job.id, None)
+                for request_id in list(self._jobs):
+                    self.cancel(request_id, 503, 'model service stopped')
+                self._remaining -= 1
+                last = self._remaining == 0
+                self._condition.notify_all()
+            if last:
+                try:
+                    self.session.close()
+                except BaseException as error:
+                    self.failure = f"session cleanup failed: {error}"
 
     def close(self):
         with self._condition:
@@ -302,9 +339,13 @@ class ChatService:
                 self.cancel(request_id, 503, "server shutting down")
             self._condition.notify_all()
         # 取消不强行打断 NCCL；会话总超时负责失败时回收整个进程组。
-        self._thread.join(self.session.timeout + 40)
-        if self._thread.is_alive():
+        deadline = time.monotonic() + self.session.timeout + 40
+        for thread in self._threads:
+            thread.join(max(0, deadline - time.monotonic()))
+        if any(thread.is_alive() for thread in self._threads):
             raise RuntimeError("scheduler did not stop within session timeout")
+        if not self._threads:
+            self.session.close()
         if self.failure is not None or self.session.state != "closed":
             raise RuntimeError(self.failure or "session did not close cleanly")
 

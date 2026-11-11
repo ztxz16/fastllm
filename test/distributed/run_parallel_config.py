@@ -102,7 +102,7 @@ def real_cuda_case(output, dp, tp, metadata):
             uuid.UUID(device['uuid'])
             if not device['name']:
                 raise AssertionError('missing GPU name')
-        if plan['preview_only'] is not True or plan['multi_replica_execution_available'] is not False:
+        if plan['preview_only'] is not True or plan['multi_replica_execution_available'] is not True:
             raise AssertionError('wrong preview/execution capability')
         metadata.update(gpu=devices, cuda=plan['driver_cuda_version'])
         row['status'] = 'PASS'
@@ -115,6 +115,7 @@ def main():
     """/** 运行配置验收并持续写入四种格式报告；任一失败或提前中断返回非零。 */"""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--real-cuda', action='store_true', help='增加实际 GPU 的正式 CLI 预览验收；仅在 GPU 服务器使用')
+    parser.add_argument('--execution-tests', action='store_true', help='增加 DP 执行、会话及 HTTP 的纯 Python 协议回归')
     parser.add_argument('--dp', type=int, default=2)
     parser.add_argument('--tp', type=int, default=1)
     parser.add_argument('--output', type=Path, default=ROOT / 'test/distributed/results')
@@ -135,8 +136,10 @@ def main():
                                       '不执行真实模型推理或性能测试；非数值配置检查的误差字段为 n/a。'}
     rows = []
     try:
-        suite = unittest.defaultTestLoader.loadTestsFromNames(
-            ['test_parallel_config', 'test_process_tp_options', 'test_process_tp_entrypoint'])
+        modules = ['test_parallel_config', 'test_process_tp_options', 'test_process_tp_entrypoint']
+        if args.execution_tests:
+            modules += ['test_process_dp', 'test_qwen3_session', 'test_qwen3_http']
+        suite = unittest.defaultTestLoader.loadTestsFromNames(modules)
         metadata['expected_case_count'] = suite.countTestCases() + int(args.real_cuda)
         save_report(output, rows, metadata)
         with (output / 'unittest.stdout.log').open('w', encoding='utf-8') as stdout, \
