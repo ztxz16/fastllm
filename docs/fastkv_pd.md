@@ -133,7 +133,11 @@ D 在模型调度线程中预留私有主存页及对应 Indexer 页，随后发
 
 回归入口：`naive_n05_pd_*` 和 `naive_n05_pd_kvmem_*`；后者覆盖 BF16/FP8/FP4、两种 Indexer 存储、页边界、超过热缓存长度的历史及导入后的 eager/Graph 解码。独立传输测试 `fastkv_receive_target_test [--rdma [GPU]]` 检查分段写入、Host/CUDA 落点、非法描述拒绝和租约回收。
 
-当前部署路径支持文本请求。多模态 PD 需要继续补充媒体身份与状态 adapter，目前明确拒绝，不能通过仅传 token 冒充多模态交接。DeepSeek 可开启 DSpark 5。当前只有单请求路径执行草稿和验证；多请求批次先排出已接受 token，随后使用普通 target decode，丢弃不能继续使用的草稿状态。请求回到单请求路径后从当前 target 边界重建草稿窗口。P 的中间 prefill 不生成候选；P/D 的 DSpark 开关需要保持一致。Naive 的 draft TP 暂不支持，使用 `--dspark 0`。
+当前部署路径支持文本请求。多模态 PD 需要继续补充媒体身份与状态 adapter，目前明确拒绝，不能通过仅传 token 冒充多模态交接。DeepSeek 可开启 DSpark 5。当前只有单请求路径执行草稿和验证；多请求批次先排出已接受 token，随后使用普通 target decode，丢弃不能继续使用的草稿状态。请求回到单请求路径后从当前 target 边界重建草稿窗口。P 的中间 prefill 不生成候选；P/D 的 DSpark 开关需要保持一致。
+
+Naive 纯 GPU PD 支持 DSpark，包括单卡草稿、完整草稿 TP 和仅 MLP TP，以及 D 端合批、Graph、贪婪与 rejection sampling。P/D 都配置相同的 `--draft <草稿模型目录>`、`--dspark 5`，并在节点 `env` 中设置相同的 `FASTLLM_DSPARK_TP`（例如 `4` 或 `mlp:4`）；主模型需使用 BF16/FP8 KV。草稿 TP 使用主模型 TP 的前 N 个 rank，N 不超过主模型 TP。`model_id` 应同时标识 target 与 draft 检查点。
+
+草稿状态使用 `draft-v2` 布局：按逻辑 rank 传输已提交窗口的 K/V 和前缀检查点所需的归一化输入尾部。D 复用本地草稿缓冲区，预留候选空间后才允许执行；采样队列和 Graph 不跨节点传输。两端草稿结构、TP 大小及分片策略必须一致，旧草稿布局或不兼容配置会在交接前被拒绝。不启用 DSpark 时不附加草稿状态。
 
 GPU 状态在协议中携带逻辑 rank，由接收方映射到本地 GPU；网络线程只写私有 staging 或接收端预留的目标区，完成 RDMA 可见性处理后交给模型拥有者。Naive 在拥有者 stream 上批量整理/恢复页和滑窗，避免逐页 CUDA API 调用以及额外的导入副本。小 buffer 合并到有界 arena，复用内存、MR 和连接。纯 GPU 的 RDMA 路径不经主存 KV；KVMem 定向接收按上述规则直达预留页，TCP 兼容路径仍经主存分块搬运。普通 GPU 接收仍需从 staging 恢复到本地页池；当前各路径仍有状态整理、完整状态传输和导入结束同步，尚不支持增量交接。
 

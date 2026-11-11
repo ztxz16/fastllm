@@ -1,5 +1,6 @@
 #include "models/naive_n05_flash.h"
 #include "models/speculative_sampling.h"
+#include "pd.h"
 #include "json11.hpp"
 #include "executor.h"
 #include <algorithm>
@@ -16,6 +17,10 @@
 
 namespace fastllm {
 namespace {
+    void CheckDraftPD(bool ok, const char *message) {
+        if (!ok) throw std::runtime_error(std::string("FastKV Naive draft: ") + message);
+    }
+
     void ClearDraftPrefixHidden(Data &hidden) {
         // Data's default assignment would discard the owning GPU pointer.
         hidden.FreeSpace();
@@ -295,10 +300,8 @@ bool NaiveN05FlashModel::PrepareDraftTP() {
     return true;
 }
 
-bool NaiveN05FlashModel::AppendDraftContextTP(Data &hidden, int start, DraftContext &context) {
-    if (!PrepareDraftTP()) return false;
+void NaiveN05FlashModel::PrepareDraftContextTP(DraftContext &context) {
     auto &tp = *draftTP;
-    ApplyDraftDevice();
     if (!context.workspace) {
         context.workspace = std::make_shared<DraftWorkspace>();
         context.workspace->device = tp.devices.front();
@@ -309,6 +312,14 @@ bool NaiveN05FlashModel::AppendDraftContextTP(Data &hidden, int start, DraftCont
             context.workspace->tpRanks.push_back(std::move(rank));
         }
     }
+    context.kv.resize(draftLayers);
+}
+
+bool NaiveN05FlashModel::AppendDraftContextTP(Data &hidden, int start, DraftContext &context) {
+    if (!PrepareDraftTP()) return false;
+    auto &tp = *draftTP;
+    ApplyDraftDevice();
+    PrepareDraftContextTP(context);
     if (!draftContextStorage) {
         draftContextStorage = std::make_shared<DraftWorkspace>();
         draftContextStorage->device = tp.devices.front();
@@ -322,7 +333,6 @@ bool NaiveN05FlashModel::AppendDraftContextTP(Data &hidden, int start, DraftCont
         FastllmCudaSetDevice(tp.devices.front());
     }
     auto &ws = *draftContextStorage;
-    context.kv.resize(draftLayers);
     const int begin = std::max(0, hidden.dims[1] - draftWindow + 1);
     // The usual commit input is already dense on rank 0. Its stream waits
     // for all other ranks below before the caller can overwrite/reuse this storage.
@@ -385,6 +395,113 @@ bool NaiveN05FlashModel::AppendDraftContextTP(Data &hidden, int start, DraftCont
 }
 
 #endif
+
+std::string NaiveN05FlashModel::DraftPDLayout() const {
+    if (!draftEnabled) return {};
+    int ranks = 1, divisor = 1;
+#ifdef USE_CUDA
+    if (draftTP) {
+        ranks = draftTP->devices.size(); divisor = draftTP->attentionDivisor;
+        // The generic PD placement map is the target's device group. Draft
+        // subgroups use its first N ranks, including nonzero physical devices.
+        CheckDraftPD(tpDevices.size() >= size_t(ranks) &&
+            std::equal(draftTP->devices.begin(), draftTP->devices.end(), tpDevices.begin()),
+            "Naive PD draft TP requires a subgroup of target TP.");
+    }
+#endif
+    std::string layout = ":draft-v2";
+    for (int value : {draftLayers, draftBlock, draftHeads, draftKvHeads, draftHeadDim,
+                      draftWindow, ranks, divisor}) layout += ":" + std::to_string(value);
+    return layout;
+}
+
+void NaiveN05FlashModel::ExportDraftPDState(PDStateWriter &writer, const DraftContext &context, int length) {
+#ifdef USE_CUDA
+    CheckDraftPD(context.pending.empty() && context.committed == length,
+        "Naive PD requires a committed draft prefix.");
+    const int ranks = draftTP ? draftTP->devices.size() : 1;
+    const int divisor = draftTP ? draftTP->attentionDivisor : 1;
+    const int width = std::max(1, draftKvHeads / divisor) * draftHeadDim;
+    const std::vector<int> shape{1, std::min(length, draftWindow - 1), width};
+    CheckDraftPD(!draftTP || (context.workspace && context.workspace->tpRanks.size() == size_t(ranks)),
+        "Naive PD draft rank state is missing.");
+    // Finish all owner streams before FastKV snapshots their committed KV.
+    if (draftTP) draftTP->Run([](int) { FastllmCudaSyncCurrentThreadStream(); });
+    else FastllmCudaSyncCurrentThreadStream();
+    writer.metadata.U32(context.committed);
+    writer.metadata.U32(draftLayers); writer.metadata.U32(ranks);
+    for (int rank = 0; rank < ranks; ++rank) {
+        const auto &kv = rank ? context.workspace->tpRanks[rank]->tpKV : context.kv;
+        CheckDraftPD(kv.size() == size_t(draftLayers), "Naive PD draft layer state is missing.");
+        for (const auto &pair : kv) for (const Data *cache : {&pair.first, &pair.second}) {
+            CheckDraftPD(cache->dataType == BFLOAT16 && cache->dims == shape,
+                "Naive PD draft KV shape mismatch.");
+            writer.Tensor(*cache);
+        }
+    }
+    // Normalized prefill tails are needed by aligned prefix checkpoints on D.
+    // Proposal distributions, RNG and graph workspaces are local to decode.
+    writer.metadata.U32(!context.prefixHidden.dims.empty());
+    if (!context.prefixHidden.dims.empty()) writer.Tensor(context.prefixHidden);
+#endif
+}
+
+std::shared_ptr<NaiveN05FlashModel::DraftContext> NaiveN05FlashModel::ImportDraftPDState(
+        PDStateReader &reader, int length) {
+    std::shared_ptr<DraftContext> context;
+    {
+        std::lock_guard<std::mutex> guard(historyMutex);
+        context = CreateDraftContext();
+    }
+#ifdef USE_CUDA
+    ApplyDraftDevice();
+    const auto devices = draftTP ? draftTP->devices : std::vector<int>{FastllmCudaGetDevice()};
+    const int divisor = draftTP ? draftTP->attentionDivisor : 1;
+    const int width = std::max(1, draftKvHeads / divisor) * draftHeadDim;
+    const std::vector<int> shape{1, std::min(length, draftWindow - 1), width};
+    const int committed = reader.metadata.U32();
+    const auto layers = reader.metadata.U32(), ranks = reader.metadata.U32();
+    CheckDraftPD(committed == length && layers == size_t(draftLayers) && ranks == devices.size(),
+        "Naive PD draft prefix or TP size mismatch.");
+    if (draftTP) PrepareDraftContextTP(*context);
+    else context->kv.resize(draftLayers);
+    for (size_t rank = 0; rank < devices.size(); ++rank) {
+        auto &kv = rank ? context->workspace->tpRanks[rank]->tpKV : context->kv;
+        FastllmCudaSetDevice(devices[rank]);
+        for (auto &pair : kv) for (Data *cache : {&pair.first, &pair.second}) {
+            Data value;
+            reader.Tensor(value, true);
+            CheckDraftPD(value.dataType == BFLOAT16 && value.dims == shape && !value.kvCacheFp8Indexer,
+                "Naive PD draft KV shape mismatch.");
+            value.ToDevice(CUDA, {devices[rank]});
+            cache->dataType = BFLOAT16; cache->UpdateUnitSize();
+            cache->ToDevice(CUDA, {devices[rank]}, false);
+            // Verification appends candidates after the retained window. The
+            // imported compact payload must reserve that space before graphs
+            // bind its pointers, even when the prompt is shorter than a window.
+            if (cache->expansionDims.empty() || cache->expansionDims[1] < draftWindow + draftBlock)
+                cache->Expansion({1, draftWindow + draftBlock, width});
+            cache->Resize(shape); cache->SetKVCache();
+            // Retain warmup/recycled addresses and copy directly from the
+            // borrowed transport tensor into its final draft allocation.
+            const bool copied = FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(
+                cache->cudaData, value.cudaData, value.GetBytes());
+            FastllmCudaSyncCurrentThreadStream();
+            CheckDraftPD(copied, "KV restore copy failed.");
+        }
+    }
+    FastllmCudaSetDevice(devices.front());
+    if (reader.metadata.U32()) reader.Tensor(context->prefixHidden);
+    const auto &tail = context->prefixHidden;
+    CheckDraftPD(tail.dims.empty() || (tail.dataType == BFLOAT16 && tail.dims.size() == 3 &&
+        tail.dims[0] == 1 && tail.dims[1] > 0 && tail.dims[1] <= std::min(length, draftWindow + GetPageLen() - 1) &&
+        tail.dims[2] == embed_dim), "Naive PD draft prefix tail shape mismatch.");
+    if (!tail.dims.empty()) context->prefixHidden.ToDevice(CUDA, {devices.front()});
+    reader.End();
+    context->committed = length;
+#endif
+    return context;
+}
 
 std::shared_ptr<NaiveN05FlashModel::DraftContext> NaiveN05FlashModel::CreateDraftContext() {
     // The request lifecycle and caller hold historyMutex. Reuse storage only;
@@ -2279,7 +2396,9 @@ std::vector<int> NaiveN05FlashModel::ForwardDraftBatch(int batch, const Data &in
                 }
         }
     }
-    bool prefill = false;
+    // A warm one-token PD/chunked-prefill tail is still prefill. Its target
+    // intentionally omits logits, so it must never enter speculative decode.
+    bool prefill = isIntermediateChunkedPrefill;
     for (int i = 0; i < batch; ++i) {
         AssertInFastLLM(caches[i] && owners[i] && positionIds[i],
                        "DSpark request has no registered draft context.");
@@ -2585,6 +2704,8 @@ int NaiveN05FlashModel::ForwardDraft(
     ids.CopyFrom(inputIds);
     ids.ToDevice(DataDevice::CPU);
     const int anchor = (int)((float *)ids.cpuData)[0];
+    if (isIntermediateChunkedPrefill && !context.pending.empty())
+        throw std::logic_error("Naive prefill cannot consume pending speculative output.");
     if (!context.pending.empty()) {
         AssertInFastLLM(inputIds.dims[1] == 1 && anchor == context.pending.front().first,
                         "Naive speculative output queue is out of sync.");
@@ -2602,7 +2723,8 @@ int NaiveN05FlashModel::ForwardDraft(
     int limit = std::min(draftTokens, max_positions - oldLength - 1);
     if (config.output_token_limit > 0)
         limit = std::min(limit, config.output_token_limit - (oldLength - config.input_token_length) - 1);
-    if (context.committed == 0 || context.kv.empty() || inputIds.dims[1] != 1 || config.output_logits || constrained || limit <= 0) {
+    if (isIntermediateChunkedPrefill || context.committed == 0 || context.kv.empty() ||
+        inputIds.dims[1] != 1 || config.output_logits || constrained || limit <= 0) {
         TargetCapture capture;
         // Only the final draft window is used; there is no CPU prefix archive.
         // Preserve absolute position accounting while skipping invisible

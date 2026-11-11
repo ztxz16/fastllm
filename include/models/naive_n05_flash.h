@@ -13,6 +13,8 @@ struct FastllmCudaMimoEp8Mega;
 
 namespace fastllm {
     class CudaWorkspace;
+    class PDStateWriter;
+    class PDStateReader;
     class NaiveN05FlashModel : public basellm {
     protected:
         static constexpr int MaxTPDecodeBatch = 512;
@@ -260,6 +262,10 @@ namespace fastllm {
                                 std::vector<std::pair<Data, Data>> &kv);
         std::shared_ptr<DraftContext> CreateDraftContext();
         bool PrepareDraftTP();
+        void PrepareDraftContextTP(DraftContext &context);
+        std::string DraftPDLayout() const;
+        void ExportDraftPDState(PDStateWriter &writer, const DraftContext &context, int length);
+        std::shared_ptr<DraftContext> ImportDraftPDState(PDStateReader &reader, int length);
         bool AppendDraftContextTP(Data &hidden, int start, DraftContext &context);
         bool RunDraftGraph(int anchor, DraftContext &context, Data &output);
         bool RunDraftSamplingStep(int previous, int step, const Data &baseLogits,

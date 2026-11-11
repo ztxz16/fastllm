@@ -272,12 +272,11 @@ std::shared_ptr<PDReceiveState> NaiveN05FlashModel::PreparePDReceive(ResponseCon
 std::string NaiveN05FlashModel::PDLayout() const {
     CheckPD(!indexerContextSharding, "Indexer context sharding needs a separate state adapter");
     CheckPD(!(sparseKv && draftEnabled), "KVMem PD draft state transfer is not implemented");
-    CheckPD(!draftTP, "draft TP state transfer is not implemented");
     return std::string(tpDevices.size() > 1 ? "naive-n05-state-v3:" : "naive-n05-state-v1:") +
            std::to_string(block_cnt) + ":" +
            std::to_string(std::max(size_t(1), tpDevices.size())) + ":" + std::to_string(dataType) + ":" +
            std::to_string(kvCacheDataType) + ":" + std::to_string(fp8IndexerCache) + ":" +
-           std::to_string(indexerLayerSharding) + ":" + std::to_string(draftEnabled);
+           std::to_string(indexerLayerSharding) + ":" + std::to_string(draftEnabled) + DraftPDLayout();
 }
 
 fastkv::Message NaiveN05FlashModel::ExportPDState(ResponseContext &context) {
@@ -366,13 +365,7 @@ fastkv::Message NaiveN05FlashModel::ExportPDState(ResponseContext &context) {
     if (draftEnabled) {
         auto it = draftContexts.find(&context.pastKeyValues);
         CheckPD(it != draftContexts.end() && it->second->pending.empty(), "missing committed draft state");
-        const auto &draft = *it->second;
-        writer.metadata.U32(draft.committed);
-        writer.metadata.U32(draft.kv.size());
-        for (const auto &pair : draft.kv) {
-            writer.Tensor(pair.first);
-            writer.Tensor(pair.second);
-        }
+        ExportDraftPDState(writer, *it->second, context.preTokens);
     }
     return writer.Finish(devices);
 #endif
@@ -511,7 +504,9 @@ void NaiveN05FlashModel::ImportPDState(ResponseContext &context, const fastkv::M
                     cache.lastPageLen = (rows - 1) % cache.pageLen + 1;
                 } else {
                     const bool ring = tp && tpSwaRingCache && slidingLayers[layer];
-                    const int capacity = (std::max(rows, ring ? window : rows) + 127) / 128 * 128;
+                    // Use the same fixed request slot as native prefill. DSpark
+                    // stages verification candidates immediately after the ring.
+                    const int capacity = (std::max(rows, ring ? window + (draftEnabled ? draftBlock : 0) : rows) + 127) / 128 * 128;
                     if (!tp) {
                         cache.dims.clear();
                         cache.expansionDims.clear();
@@ -559,22 +554,13 @@ void NaiveN05FlashModel::ImportPDState(ResponseContext &context, const fastkv::M
     const bool hasDraft = metadata.U32();
     CheckPD(hasDraft == draftEnabled, "draft mode mismatch");
     if (hasDraft) {
-        auto draft = std::make_shared<DraftContext>();
-        draft->committed = metadata.U32();
-        const size_t layers = metadata.U32();
-        CheckPD(layers == size_t(draftLayers) && draft->committed == length, "invalid draft prefix");
-        draft->kv.resize(layers);
         // Remaining metadata and payload belong to the draft adapter.
         fastkv::Message rest;
         const size_t consumed = message.metadata.size() - metadata.Remaining();
         rest.metadata.assign(message.metadata.begin() + consumed, message.metadata.end());
         rest.buffers.assign(message.buffers.begin() + offset, message.buffers.end());
         PDStateReader reader(rest);
-        for (auto &pair : draft->kv) {
-            reader.Tensor(pair.first);
-            reader.Tensor(pair.second);
-        }
-        reader.End();
+        auto draft = ImportDraftPDState(reader, length);
         draftContexts[&context.pastKeyValues] = std::move(draft);
     } else {
         metadata.End();

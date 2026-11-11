@@ -713,9 +713,23 @@ class Fixture : public NaiveN05FlashModel {
         return result;
     }
 #endif
-    void PDStateChecks(bool kvmem = false, bool rdma = false, bool layerShard = false) {
-        maxBatch = 4; SetMaxTokens(16384); SetChunkedPrefillSize(4096);
+    void PDStateChecks(bool kvmem = false, bool rdma = false, bool layerShard = false, bool draft = false) {
+        if (draft) {
+            draftEnabled = canDoConcurrentForward = true;
+            draftLayers = 2; draftBlock = 7; draftTokens = 5;
+            draftHeads = 8; draftKvHeads = 2; draftHeadDim = 32; draftWindow = 1024;
+            draftConfidenceThreshold = 0; draftTargetLayers = {0, 1};
+            AddDraftTestWeights(weight, draftLayers, draftKvHeads, 256, true);
+            SetSaveHistoryChat(true);
+        }
+        // The batched oracle keeps four reference and four candidate requests
+        // alive together, in addition to graph scratch page descriptors.
+        maxBatch = draft ? 16 : 4; SetMaxTokens(16384); SetChunkedPrefillSize(4096);
         WarmUp();
+        if (draft) {
+            DraftPrefillOracle(true);
+            SetSaveHistoryChat(true);
+        }
         std::unique_ptr<Fixture> decode;
         if (kvmem) {
             decode.reset(new Fixture(ranks, false, true, true, true));
@@ -785,6 +799,11 @@ class Fixture : public NaiveN05FlashModel {
                         Data(), Data(FLOAT32, {1, count}, std::vector<float>(positions.begin() + start, positions.begin() + start + count)),
                         reference.pastKeyValues, reference.generationConfig);
                 start += count;
+                if (draft) {
+                    const auto &state = *draftContexts.at(&reference.pastKeyValues);
+                    if (state.committed != start || state.rounds || !state.pending.empty())
+                        throw std::runtime_error("PD prefill advanced speculative decoding");
+                }
             }
             reference.generationConfig.output_logits = true;
             isIntermediateChunkedPrefill = false;
@@ -835,6 +854,55 @@ class Fixture : public NaiveN05FlashModel {
                 destination.ImportPDState(imported, arrived);
             }
             imported.preTokens = length;
+            if (draft) {
+                auto original = draftContexts.at(&reference.pastKeyValues);
+                auto restored = draftContexts.at(&imported.pastKeyValues);
+                if (length == 1) {
+                    PDStateWriter writer;
+                    ExportDraftPDState(writer, *original, length);
+                    auto state = PDStatePayload(writer.Finish(PDDevices()));
+                    for (int failure = 0; failure < 3; ++failure) {
+                        auto invalid = state;
+                        if (failure < 2) invalid.metadata[failure ? 8 : 0] ^= 0x40;
+                        else invalid.buffers.pop_back();
+                        bool rejected = false;
+                        try {
+                            PDStateReader reader(invalid);
+                            ImportDraftPDState(reader, length);
+                        } catch (const std::exception &) { rejected = true; }
+                        if (!rejected) throw std::runtime_error("invalid PD draft state was accepted");
+                    }
+                }
+                auto read = [](Data value) {
+                    if (value.dims.empty()) return std::vector<uint8_t>{};
+                    value.ToDevice(CPU);
+                    return std::vector<uint8_t>(value.cpuData, value.cpuData + value.GetBytes());
+                };
+                for (bool graph : {false, true, true}) {
+                    SetCudaGraph(graph);
+                    const auto expected = read(RunDraft(42, *original));
+                    if (read(RunDraft(42, *restored)) != expected)
+                        throw std::runtime_error("PD restored draft backbone differs");
+                }
+                if (read(original->prefixHidden) != read(restored->prefixHidden))
+                    throw std::runtime_error("PD restored draft checkpoint tail differs");
+#ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+                const int draftLaunches = verifyGraphLaunches;
+#endif
+                for (int replay = 0; replay < 2; ++replay) {
+                    Data batch;
+                    if (!RunDraftBatch({42,42}, {original.get(),restored.get()}, batch))
+                        throw std::runtime_error("PD restored draft lost its batch path");
+                    auto bytes = read(std::move(batch));
+                    if (bytes.size() % 2 || !std::equal(bytes.begin(), bytes.begin()+bytes.size()/2,
+                                                       bytes.begin()+bytes.size()/2))
+                        throw std::runtime_error("PD restored draft batch rows differ");
+                }
+#ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+                if (verifyGraphLaunches == draftLaunches)
+                    throw std::runtime_error("PD restored draft batch did not replay a graph");
+#endif
+            }
             // Both eager and captured decode must read the restored Indexer,
             // FP4 scales and the SWA ring at the same logical positions.
             for (int step = 0; step < 3; ++step) {
@@ -848,6 +916,30 @@ class Fixture : public NaiveN05FlashModel {
                     throw std::runtime_error("PD restored logits invalid");
                 if (kvmem) RequireCloseLogits(actual.data(), expected, "PD KVMem logits differ");
                 else if (expected != actual) throw std::runtime_error("PD restored logits differ");
+            }
+            if (draft) {
+                auto original = draftContexts.at(&reference.pastKeyValues);
+                auto restored = draftContexts.at(&imported.pastKeyValues);
+                original->random.seed(123); restored->random.seed(123);
+                int anchor = 45;
+                for (int topK : {1, 0}) {
+                    reference.generationConfig.output_logits = imported.generationConfig.output_logits = false;
+                    reference.generationConfig.output_token_limit = imported.generationConfig.output_token_limit = 128;
+                    reference.generationConfig.top_k = imported.generationConfig.top_k = topK;
+                    reference.generationConfig.top_p = imported.generationConfig.top_p = .9f;
+                    reference.generationConfig.temperature = imported.generationConfig.temperature = .8f;
+                    for (int step = 0; step < 12 || !original->pending.empty(); ++step) {
+                        Data token(FLOAT32,{1,1},{float(anchor)}), pos(FLOAT32,{1,1},{float(original->committed)});
+                        int expected = Forward(token,Data(),pos,reference.pastKeyValues,reference.generationConfig);
+                        int actual = Forward(token,Data(),pos,imported.pastKeyValues,imported.generationConfig);
+                        if (expected != actual || original->committed != restored->committed ||
+                            original->pending != restored->pending || original->accepted != restored->accepted)
+                            throw std::runtime_error("PD restored speculative sampling or commit differs");
+                        anchor = expected;
+                    }
+                }
+                if (!original->rounds || !original->proposed)
+                    throw std::runtime_error("PD test did not execute speculative verification");
             }
             OnResponseContextRemoved(&reference);
             destination.OnResponseContextRemoved(&imported);
@@ -1039,7 +1131,7 @@ class Fixture : public NaiveN05FlashModel {
                   << " max_abs=" << largestLogitAbsolute << std::endl;
     }
 #endif
-    void DraftPrefillOracle() {
+    void DraftPrefillOracle(bool pd = false) {
         SetSaveHistoryChat(false);
         auto scores = [&](DraftContext &context) {
             Data hidden = RunDraft(17, context), head = RunDraftHead(hidden), owned(head);
@@ -1047,7 +1139,7 @@ class Fixture : public NaiveN05FlashModel {
             return std::vector<float>((float *)owned.cpuData, (float *)owned.cpuData + owned.Count(0));
         };
         int checks = 0;
-        for (int count : {2, 4, 8, 16, 24}) {
+        for (int count : pd ? std::vector<int>{2, 4} : std::vector<int>{2, 4, 8, 16, 24}) {
             std::vector<std::unique_ptr<ResponseContext>> reference(count), actual(count);
             for (int i = 0; i < count; ++i) for (auto *group : {&reference, &actual}) {
                 auto &ctx = (*group)[i]; ctx.reset(new ResponseContext());
@@ -1069,6 +1161,7 @@ class Fixture : public NaiveN05FlashModel {
                     // append after a short prefill all share the same batch.
                     const int choices[] = {1, 31, 257, 1023};
                     lengths[i] = round == 0 ? choices[i % 4] : round == 1 ? 1 + i % 5 : 129;
+                    if (pd && round == 1) lengths[i] = 1;
                     if (count == 2 && round == 0) lengths[i] = 1;
                     auto &config = configs[i];
                     config.input_token_length = past[i] + lengths[i];
@@ -1086,19 +1179,39 @@ class Fixture : public NaiveN05FlashModel {
                     pos.push_back(&positions[i]); outputs.push_back(&observed[i]);
                     for (auto &layer : actual[i]->pastKeyValues) caches.emplace_back(&layer.first, &layer.second);
                 }
+                auto actualConfigs = configs;
+                if (pd) for (auto &config : actualConfigs) {
+                    config.output_logits = false;
+                    config.top_k = 1;
+                    config.output_token_limit = 1;
+                }
+                isIntermediateChunkedPrefill = pd;
                 ForwardBatch(count, Data(FLOAT32, {1, (int)packed.size()}, packed), {}, pos, lengths,
-                    caches, configs, LastTokensManager(), &outputs);
+                    caches, actualConfigs, LastTokensManager(), &outputs);
+                isIntermediateChunkedPrefill = false;
                 for (int i = 0; i < count; ++i) {
                     past[i] += lengths[i];
-                    if (observed[i].size() != expected[i].size()) throw std::runtime_error("prefill logits count");
-                    RequireCloseLogits(observed[i].data(), expected[i], "batched prefill target logits");
+                    if (!pd) {
+                        if (observed[i].size() != expected[i].size()) throw std::runtime_error("prefill logits count");
+                        RequireCloseLogits(observed[i].data(), expected[i], "batched prefill target logits");
+                    } else if (!observed[i].empty()) throw std::runtime_error("PD prefill unexpectedly produced logits");
                     auto draft = draftContexts.at(&actual[i]->pastKeyValues);
-                    if (!draft || draft->committed != past[i] || !draft->pending.empty())
+                    if (!draft || draft->committed != past[i] || !draft->pending.empty() || draft->rounds)
                         throw std::runtime_error("batched prefill draft position or pending queue");
                     auto actualDraft = scores(*draft);
                     RequireCloseLogits(actualDraft.data(), draftExpected[i], "batched prefill draft logits");
                     ++checks;
                 }
+            }
+            if (pd) for (int i = 0; i < count; ++i) {
+                GenerationConfig config;
+                config.output_logits = true; config.input_token_length = past[i] + 1;
+                std::vector<float> expected, observed;
+                Data ids(FLOAT32, {1, 1}, {17}), pos(FLOAT32, {1, 1}, {(float)past[i]});
+                Forward(ids, Data(), pos, reference[i]->pastKeyValues, config, LastTokensManager(), &expected);
+                Forward(ids, Data(), pos, actual[i]->pastKeyValues, config, LastTokensManager(), &observed);
+                if (observed.size() != expected.size()) throw std::runtime_error("PD tail logits count");
+                RequireCloseLogits(observed.data(), expected, "PD tail target continuation logits");
             }
             for (auto *group : {&reference, &actual}) for (auto &ctx : *group) OnResponseContextRemoved(ctx.get());
         }
@@ -1106,7 +1219,7 @@ class Fixture : public NaiveN05FlashModel {
         ResponseContext cancelled; cancelled.Init(block_cnt, dataType, kvCacheDataType);
         OnResponseContextCreated(&cancelled); OnResponseContextRemoved(&cancelled);
         if (draftContexts.count(&cancelled.pastKeyValues)) throw std::runtime_error("cancelled prefill retained draft owner");
-        std::cout << "DSPARK PREFILL ORACLE PASS cases=" << checks
+        std::cout << "DSPARK PREFILL ORACLE PASS pd=" << pd << " cases=" << checks
                   << " max_relative=" << largestLogitRelative << " max_abs=" << largestLogitAbsolute << std::endl;
     }
 
@@ -3673,7 +3786,8 @@ int main(int argc, char **argv) {
             DraftFixture fixture(true, 2, 0, 5); fixture.PrefillCommitChecks(); return 0;
         }
 #endif
-        if (argc > 2 && (std::string(argv[2]) == "pd_state" || std::string(argv[2]) == "pd_kvmem")) {
+        if (argc > 2 && (std::string(argv[2]) == "pd_state" || std::string(argv[2]) == "pd_kvmem" ||
+                        std::string(argv[2]) == "pd_draft")) {
             SetCudaEmbedding(true); SetCudaGraph(true);
             Fixture fixture(ranks, false, true, true, true);
             if (argc > 3 && std::string(argv[3]) == "fp4") fixture.SetKVCacheDataType(FP4_E2M1);
@@ -3681,7 +3795,8 @@ int main(int argc, char **argv) {
             fixture.SetIndexerTPStorage(argc > 4 && std::string(argv[4]) == "layer_shard");
             fixture.SetIndexerDataType(FP8_E4M3);
             fixture.PDStateChecks(std::string(argv[2]) == "pd_kvmem", argc > 5 && std::string(argv[5]) == "rdma",
-                                  argc > 4 && std::string(argv[4]) == "layer_shard"); return 0;
+                                  argc > 4 && std::string(argv[4]) == "layer_shard",
+                                  std::string(argv[2]) == "pd_draft"); return 0;
         }
         if (argc > 2 && std::string(argv[2]) == "draft_prefix") {
             SetCudaEmbedding(true); SetCudaGraph(!(argc > 4 && std::string(argv[4]) == "eager"));

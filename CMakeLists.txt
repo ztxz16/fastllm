@@ -2465,6 +2465,17 @@ if (UNIT_TEST)
                         PASS_REGULAR_EXPRESSION "NAIVE PD STATE PASS")
                 endforeach()
             endforeach()
+            foreach(NAIVE_PD_DRAFT_TP 1 2 4 mlp:4)
+                foreach(NAIVE_PD_DRAFT_KV bf16 fp8)
+                    string(REPLACE ":" "_" NAIVE_PD_DRAFT_NAME ${NAIVE_PD_DRAFT_TP})
+                    add_test(NAME naive_n05_pd_draft_${NAIVE_PD_DRAFT_NAME}_${NAIVE_PD_DRAFT_KV}
+                        COMMAND naive_n05_verify_graph_test 4 pd_draft ${NAIVE_PD_DRAFT_KV} layer_shard)
+                    set_tests_properties(naive_n05_pd_draft_${NAIVE_PD_DRAFT_NAME}_${NAIVE_PD_DRAFT_KV} PROPERTIES
+                        LABELS "cuda;multigpu" RUN_SERIAL TRUE TIMEOUT 300 SKIP_RETURN_CODE 77
+                        ENVIRONMENT "FASTLLM_DSPARK_TP=${NAIVE_PD_DRAFT_TP}"
+                        PASS_REGULAR_EXPRESSION "NAIVE PD STATE PASS")
+                endforeach()
+            endforeach()
             foreach(NAIVE_SPARSE_DRAFT_KV bf16 fp8)
                 add_test(NAME naive_n05_kvmem_draft_${NAIVE_SPARSE_DRAFT_KV}
                     COMMAND naive_n05_verify_graph_test 2 kvmem_draft ${NAIVE_SPARSE_DRAFT_KV} 5 16384)
