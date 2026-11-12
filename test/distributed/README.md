@@ -1599,3 +1599,50 @@ DP+TP 则将 profile 改为 `dp2_tp2`。启动器默认监听 127.0.0.1，输出
 并回收 worker；常驻服务与短时验证脚本的生命周期不同。每次启动生成新的日志子目录。
 追加 `--print-command` 仅打印 profile、建议客户端并发和正式 CLI 命令 JSON，不查询 GPU、
 不加载模型、不启动 worker。进程服务仍只支持当前已实现的稠密 Qwen3 路径。
+
+## Attention DP＋EP：配置与设备规划（阶段 1）
+
+本节是新增 Qwen MoE 进程模式的阶段记录。**当前仅接入参数检查和设备预览，
+多 rank MoE 推理尚未接入**；正常推理会在模型加载及 worker 启动前明确拒绝。
+后续依次验收权重与单层、Eager 联合推理、Graph/缓存、正式服务、四卡完整模型。
+现有稠密 Qwen3 的完整副本 DP/TP 语义保持不变。
+
+- `--attention-dp` 和 `--ep` 默认均为 1；第一版要求两者相等且为 1、2 或 4。
+- 新模式要求 `--tp-backend process --dp 1 --tp 1`；省略 TP 视为 1，拒绝
+  `auto`、设备列表、`0`、布尔值及小数。设备选择、排序统一用 `CUDA_VISIBLE_DEVICES`。
+- Attention rank 与 EP rank 一一对应、共用设备；4/4 只用四卡。
+  Attention TP 组分别为 `[0] [1] [2] [3]`，EP 组为 `[0,1,2,3]`。
+- 新轴大于 1 时即选择新模式。两轴均为 1 时，进程后端依据本地
+  `config.json` 的 `model_type=qwen2_moe` 识别单 rank MoE；仅读取模型元数据。
+  没有 MoE 配置时保持旧 DP/TP 模式，因此包含默认值的旧配置导出可以往返加载。
+- CLI、JSON、工厂和直接进程入口共用校验。JSON 接受 `attention_dp` 或
+  `attention-dp`，但同时出现两种拼写会拒绝；沿用 JSON 覆盖 CLI 的原有加载顺序。
+- `--dp-routing prefix` 可以用于 Attention rank，仍要求 `--prefix-cache true`。
+  `--custom-allreduce` 被拒绝；新模式的通信基线为 NCCL AllGather/ReduceScatter。
+- 预览增加 `mode`、`attention_dp_size`、`ep_size`、`ranks`、`attention_groups`、
+  `ep_groups`；`total_gpus` 是 EP 组大小。当前
+  `attention_ep_execution_available=false`，不把规划能力标为推理能力。
+- 官方模型固定为 `Qwen/Qwen1.5-MoE-A2.7B-Chat` revision
+  `ec052fda178e241c7c443468d2fa1db6618996be`。真实模型后续仅做四卡 V100 验收；
+  1/2 rank 的数值验收使用缩小模型。本阶段不下载模型，也不编译。
+
+本地仅 Python 检查（CUDA 枚举及原生会话使用替身）：
+
+```bash
+python3 test/distributed/run_parallel_config.py --execution-tests --benchmark-tests
+```
+
+服务器在 `master` 包含本阶段提交后运行；沿用已修复的 Python 环境。
+下面只读 CUDA Driver API，不创建 CUDA context、不加载模型、不启动推理 worker。
+每次生成独立的 Markdown、CSV、JSON、XLSX 和原始日志；给出完整 GPU UUID 时，
+额外把实际枚举身份与指定顺序逐项比较。脚本默认使用本轮 Vast 的四个 UUID，
+已有 `CUDA_VISIBLE_DEVICES` 时保留用户顺序；可通过 `ATTENTION_EP_PYTHON` 替换 Python。
+先验收 4/4、2/2，再反转四卡可见顺序验收 4/4，任一失败立即非零退出：
+
+```bash
+cd /home/project/vllm_fastllm
+bash test/distributed/run_attention_ep_config_v100.sh
+```
+
+阶段 1 的配置检查通过不代表 MoE 权重、数值、Graph 或服务通过；服务器真实枚举结果
+也必须保留在本阶段报告中，再进入阶段 2 的单层验收。

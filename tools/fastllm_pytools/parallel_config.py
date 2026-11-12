@@ -1,7 +1,9 @@
 """DP/TP 配置和 CUDA 设备分配；本模块不加载模型或启动推理进程。"""
 
 import ctypes
+import json
 import os
+from pathlib import Path
 import re
 import sys
 import uuid
@@ -9,6 +11,29 @@ import uuid
 
 class _CUuuid(ctypes.Structure):
     _fields_ = [('bytes', ctypes.c_ubyte * 16)]
+
+
+def is_attention_ep(args):
+    """/**
+     * 识别共享设备的 Attention DP/EP；1/1 由本地模型类型消除与旧模式的歧义。
+     * 只读 config.json，不导入模型库、读取权重或建立 CUDA context。
+     * @param args 已完成整数类型检查的并行参数。
+     * @return 新轴大于 1 或进程后端的本地模型为 qwen2_moe 时返回 True。
+     */"""
+    if getattr(args, 'attention_dp', 1) > 1 or getattr(args, 'ep', 1) > 1:
+        return True
+    if getattr(args, 'tp_backend', 'thread') != 'process':
+        return False
+    model = getattr(args, 'path', '') or getattr(args, 'model', '')
+    if not model:
+        return False
+    config = Path(model).expanduser() / 'config.json'
+    if not config.is_file():
+        return False
+    value = json.loads(config.read_text(encoding='utf-8'))
+    if not isinstance(value, dict):
+        raise ValueError('model config.json must be an object')
+    return value.get('model_type') == 'qwen2_moe'
 
 
 def cuda_inventory():
@@ -77,6 +102,11 @@ def validate_parallel_options(args, *, planning=False):
     dp = getattr(args, 'dp', 1)
     if type(dp) is not int or dp < 1:
         raise ValueError('--dp must be a positive integer (JSON booleans/floats are not integers)')
+    for name in ('attention_dp', 'ep'):
+        value = getattr(args, name, 1)
+        if type(value) is not int or value not in (1, 2, 4):
+            raise ValueError(f'--{name.replace("_", "-")} must be an integer in {{1,2,4}}')
+    attention_ep = is_attention_ep(args)
     preview = getattr(args, 'parallel_plan', False)
     if type(preview) is not bool:
         raise ValueError('--parallel-plan must be boolean')
@@ -86,14 +116,24 @@ def validate_parallel_options(args, *, planning=False):
     routing = getattr(args, 'dp_routing', 'round_robin')
     if type(routing) is not str or routing not in ('round_robin', 'prefix'):
         raise ValueError('--dp-routing must be round_robin or prefix')
-    if routing == 'prefix' and (dp <= 1 or backend != 'process' or getattr(args, 'prefix_cache', '') != 'true'):
-        raise ValueError('--dp-routing prefix requires DP>1, --tp-backend process and --prefix-cache true')
+    if routing == 'prefix' and ((dp <= 1 and not attention_ep) or backend != 'process' or getattr(args, 'prefix_cache', '') != 'true'):
+        raise ValueError('--dp-routing prefix requires DP>1 or Attention DP/EP, --tp-backend process and --prefix-cache true')
     request_log = getattr(args, 'tp_request_log', 'on')
     if request_log not in ('on', 'off'):
         raise ValueError('--tp-request-log must be on or off')
     if request_log != 'on' and backend != 'process':
         raise ValueError('--tp-request-log off requires --tp-backend process')
-    if dp == 1 and not preview and not planning:
+    if attention_ep:
+        if backend != 'process' or dp != 1:
+            raise ValueError('Attention DP/EP requires --tp-backend process and --dp 1')
+        if getattr(args, 'attention_dp', 1) != getattr(args, 'ep', 1):
+            raise ValueError('Attention DP/EP requires attention_dp == ep in {1,2,4}')
+        tp = getattr(args, 'tp', '')
+        if not (type(tp) is int and tp == 1 or type(tp) is str and tp.strip() in ('', '1') or tp is None):
+            raise ValueError('Attention DP/EP requires --tp 1; select GPUs with CUDA_VISIBLE_DEVICES')
+        if getattr(args, 'custom_allreduce', False):
+            raise ValueError('Attention DP/EP uses NCCL AllGather/ReduceScatter; --custom-allreduce is unsupported')
+    if dp == 1 and not attention_ep and not preview and not planning:
         return dp
 
     command = getattr(args, 'command', None)
@@ -175,6 +215,22 @@ def build_parallel_plan(args):
                          'check invalid/duplicate selectors or a visibility change after CUDA initialization')
     if len({device['uuid'] for device in devices}) != available:
         raise ValueError('duplicate CUDA device UUIDs; replicas must use distinct devices')
+    if is_attention_ep(args):
+        count = getattr(args, 'ep', 1)
+        if count > available:
+            raise ValueError(f'not enough visible CUDA devices: Attention DP={count}, EP={count} needs {count}, found {available}')
+        selected = [dict(device) for device in devices[:count]]
+        ranks = [{'rank': rank, 'attention_rank': rank, 'ep_rank': rank, 'tp_rank': 0,
+                  'device': device} for rank, device in enumerate(selected)]
+        return {'mode': 'attention_dp_ep', 'dp_size': 1, 'tp_size': 1,
+                'attention_dp_size': count, 'ep_size': count, 'total_gpus': count,
+                'tp_backend': 'process', 'dp_routing': getattr(args, 'dp_routing', 'round_robin'),
+                'preview_only': True, 'attention_ep_execution_available': False,
+                'cuda_visible_devices': visible, 'driver_cuda_version': inventory['driver_cuda_version'],
+                'visible_device_count': available, 'ranks': ranks,
+                'attention_groups': [[rank] for rank in range(count)], 'ep_groups': [list(range(count))],
+                'expert_assignment': 'expert_id % ep_size',
+                'replicas': [{'dp_rank': 0, 'devices': selected}]}
     if dp > 1:
         tp = _dp_tp_size(args)
         needed = dp * tp
@@ -191,7 +247,8 @@ def build_parallel_plan(args):
     if getattr(args, 'custom_allreduce', False) and (getattr(args, 'tp_backend', 'thread') != 'process' or tp != 2):
         raise ValueError('--custom-allreduce requires process TP=2 within each replica')
 
-    return {'dp_size': dp, 'tp_size': tp, 'total_gpus': dp * tp, 'tp_backend': getattr(args, 'tp_backend', 'thread'),
+    return {'mode': 'replica_dp_tp', 'attention_dp_size': 1, 'ep_size': 1,
+            'dp_size': dp, 'tp_size': tp, 'total_gpus': dp * tp, 'tp_backend': getattr(args, 'tp_backend', 'thread'),
             'dp_routing': getattr(args, 'dp_routing', 'round_robin'),
             'preview_only': True, 'multi_replica_execution_available': True,
             'cuda_visible_devices': visible, 'driver_cuda_version': inventory['driver_cuda_version'],
@@ -212,4 +269,7 @@ def prepare_parallel_entry(args, *, allow_preview=False):
         if not allow_preview:
             raise ValueError('--parallel-plan is a CLI preview; use build_parallel_plan for a programmatic plan')
         return build_parallel_plan(args)
+    if is_attention_ep(args):
+        build_parallel_plan(args)
+        raise NotImplementedError('Attention DP/EP: 参数与设备规划已接入，多 rank MoE 执行尚未接入')
     return None
