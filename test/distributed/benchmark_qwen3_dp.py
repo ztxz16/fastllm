@@ -220,6 +220,8 @@ def statistics_row(samples, requests, tokens, gpus):
 def save_benchmark(output, rows, metadata):
     """/** 保存原始精度JSON和三位展示精度MD/CSV/XLSX；缺项或失败不能报告总体PASS。 */"""
     complete = len(rows) == metadata['expected_case_count']
+    if 'expected_waves' in metadata:
+        complete = complete and metadata.get('completed_waves') == metadata['expected_waves']
     status = 'PASS' if complete and rows and all(row['status'] == 'PASS' for row in rows) else 'FAIL'
     (output / 'summary.json').write_text(json.dumps(dict(status=status, complete=complete, metadata=metadata, cases=rows),
                                                    ensure_ascii=False, indent=2))
@@ -230,6 +232,8 @@ def save_benchmark(output, rows, metadata):
               'backend', 'execution', 'allreduce', 'prefix_cache', 'reference_cache_state',
               'cold_warm_token_mismatches', 'cold_warm_first_divergence_token_1based',
               'max_abs_error', 'mean_abs_error', 'failed_elements', 'reason']
+    if any('throughput_ratio_vs_c1' in row for row in rows):
+        fields.append('throughput_ratio_vs_c1')
     sample_fields = ['case', 'repeat', 'elapsed_s', 'output_tokens_per_s', 'request_index', 'latency_ms', 'ttft_ms', 'dp_rank']
     sample_rows = []
     for row in rows:
@@ -247,12 +251,14 @@ def save_benchmark(output, rows, metadata):
             writer = csv.writer(handle)
             writer.writerow(headers)
             writer.writerows([[display(v) for v in row] for row in data])
-    lines = [f'# Qwen3 DP performance: {status}', '',
-             '正式模型工厂的固定工作量闭环测试，包含排队、IPC、原生KV创建/释放和生成；不含模型加载、预热、分词、测试校验或报告落盘。',
+    lines = [f'# {metadata.get("report_title", "Qwen3 DP performance")}: {status}', '',
+             metadata.get('report_description',
+                          '正式模型工厂的固定工作量闭环测试，包含排队、IPC、原生KV创建/释放和生成；不含模型加载、预热、分词、测试校验或报告落盘。'),
              'TTFT包含正式入口排队；ITL为客户端Token事件间隔。请求P95不是batch P95。输出Token ID误差仅表示同配置DP一致性。',
              'optimized先通过公开清理和串行请求为全部副本建立前缀，再进行热缓存预热和计时；冷/热分别对照DP1。',
              'cold_warm字段仅记录两种基线的Token差异，不作为数值精度结论；数值诊断需单独执行。',
-             'speedup_vs_dp1 = 同profile、TP和并发的DP=1 Median批耗时 / 当前Median批耗时；不同profile之间不计算加速比。', '',
+             metadata.get('comparison_description',
+                          'speedup_vs_dp1 = 同profile、TP和并发的DP=1 Median批耗时 / 当前Median批耗时；不同profile之间不计算加速比。'), '',
              '| ' + ' | '.join(fields) + ' |', '| ' + ' | '.join(['---'] * len(fields)) + ' |']
     lines.extend('| ' + ' | '.join(display(v).replace('|', '\\|').replace('\n', ' ') for v in row) + ' |' for row in values)
     lines.extend(['', '```json', json.dumps(metadata, ensure_ascii=False, indent=2), '```'])
