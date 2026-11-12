@@ -424,11 +424,11 @@ static void TestNativeLayout(Fixture &f, int device) {
         } else memcpy(packed.cpuData+offset,native.cpuData+offset,w.GetBytes());
     }
     canonical.ToDevice(CUDA,{device},true); native.ToDevice(CUDA,{device},true); packed.ToDevice(CUDA,{device},true);
-    const size_t workspaceBytes = FastllmCudaV41CanonicalGGUFCacheWorkspaceBytes(f.hidden,f.inter);
-    Data scratch(INT8,{int(workspaceBytes)});
-    scratch.ToDevice(CUDA,{device},false); scratch.Allocate(false);
-    for (int rows : {1,2,3,4,5,6,7,8}) for (bool compact : {false,true}) {
+    for (int rows : {1,2,3,4,5,6,7,8,9,17,33}) for (bool compact : {false,true}) {
         constexpr int topk=6;
+        const size_t workspaceBytes = FastllmCudaV41CanonicalGGUFCacheWorkspaceBytes(f.hidden,f.inter,rows,topk);
+        Data scratch(INT8,{int(workspaceBytes)}), prepared(INT8,{int(workspaceBytes)});
+        for (Data *d : {&scratch,&prepared}) { d->ToDevice(CUDA,{device},false);d->Allocate(false); }
         const int routes=compact ? rows*topk/2 : rows*topk;
         Data input(BFLOAT16,{rows,f.hidden}), scores(FLOAT32,{rows,topk});
         Data slots(INT32,{routes}), map(INT32,{routes}), output(FLOAT32,{rows*topk,f.hidden});
@@ -449,8 +449,14 @@ static void TestNativeLayout(Fixture &f, int device) {
         view.hidden=f.hidden; view.inter=f.inter;
         view.workspace=scratch.cudaData; view.workspaceBytes=workspaceBytes;
         if (compact) { view.routeMap=(int32_t*)map.cudaData; view.routeCount=routes; }
+        Check(FastllmCudaV41GGUFPrepareQ8Input(input,prepared.cudaData,workspaceBytes),"prepare canonical shared Q8");
+        const size_t qbytes=size_t(rows)*ggml_row_size(GGML_TYPE_Q8_1,f.hidden);
+        std::vector<uint8_t> q(qbytes),again(qbytes);
+        FastllmCudaCopyFromDeviceToHost(q.data(),prepared.cudaData,qbytes);
         std::vector<uint8_t> expected;
-        for (int layout = 0; layout < 3; ++layout) {
+        for (int pass = 0; pass < 6; ++pass) {
+            const int layout=pass%3;
+            view.preparedQ8Input=pass>=3 ? prepared.cudaData : nullptr;
             std::fill_n((float*)output.cpuData, rows*topk*f.hidden, 17.f);
             output.ToDevice(CUDA,{device},true);
             view.records=(uint8_t*)(layout == 2 ? packed.cudaData : layout == 1 ? native.cudaData : canonical.cudaData);
@@ -459,8 +465,10 @@ static void TestNativeLayout(Fixture &f, int device) {
             Check(FastllmCudaMoeV41CanonicalGGUFCacheCompute(input,view,
                 (float*)scores.cudaData,topk,.8f,(float*)output.cudaData),"native cache adapter rejected");
             output.ToDevice(CPU);
-            if (layout == 0) expected.assign(output.cpuData,output.cpuData+output.GetBytes());
+            if (pass == 0) expected.assign(output.cpuData,output.cpuData+output.GetBytes());
             else Check(!memcmp(expected.data(),output.cpuData,expected.size()),"native/canonical cache mismatch");
+            FastllmCudaCopyFromDeviceToHost(again.data(),pass>=3 ? prepared.cudaData : scratch.cudaData,qbytes);
+            Check(again==q,"shared Q8 differs from ordinary conversion or was overwritten");
         }
         output.ToDevice(CUDA,{device},true);
         view.numaGateType=GGML_TYPE_Q2_K_R4;
@@ -907,6 +915,12 @@ static void TestDiskFullGraph(bool large = false) {
 int main(int argc, char **argv) { try {
     if (FastllmCudaGetDeviceCount()<1) return 77;
     SetThreads(4);
+    if (argc > 1 && !strcmp(argv[1], "--shared-q8")) {
+        for(int type:{GGML_TYPE_IQ2_XXS,GGML_TYPE_IQ2_XS,GGML_TYPE_Q4_K}) {
+            Fixture f(type,type,0);TestNativeLayout(f,0);
+        }
+        puts("PASS: canonical shared Q8 immutable input and original output bitwise equal");return 0;
+    }
     if (argc > 1 && !strcmp(argv[1], "--large-prefill")) { TestLargeStreamedPrefill(); return 0; }
     if(argc>1 && !strcmp(argv[1],"--full-graph")){TestDiskFullGraph();return 0;}
     if(argc>1 && !strcmp(argv[1],"--full-graph-large")){TestDiskFullGraph(true);return 0;}

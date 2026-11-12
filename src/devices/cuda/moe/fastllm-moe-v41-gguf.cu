@@ -766,6 +766,18 @@ size_t FastllmCudaV41CanonicalGGUFCacheWorkspaceBytes(int hidden, int inter, int
 size_t FastllmCudaV41CanonicalGGUFCacheWorkspaceBytes(int hidden, int inter) {
     return FastllmCudaV41CanonicalGGUFCacheWorkspaceBytes(hidden, inter, 8, 16);
 }
+bool FastllmCudaV41GGUFPrepareQ8Input(const fastllm::Data &input, void *destination, size_t bytes) {
+    if (!destination || input.dataType != fastllm::BFLOAT16 || input.dataDevice != fastllm::CUDA ||
+        !input.cudaData || input.dims.size() != 2 || input.dims[0] <= 0 || input.dims[1] <= 0 ||
+        input.dims[1] % 32 || bytes < size_t(input.dims[0]) * (input.dims[1] / 32) * sizeof(block_q8_1))
+        return false;
+    const size_t elements = size_t(input.dims[0]) * input.dims[1];
+    V41CacheQuantize<<<(elements + 255) / 256, 256, 0, cudaStreamPerThread>>>(
+        static_cast<const __nv_bfloat16 *>(input.cudaData), static_cast<block_q8_1 *>(destination),
+        input.dims[1], elements);
+    return cudaGetLastError() == cudaSuccess;
+}
+
 bool FastllmCudaMoeV41CanonicalGGUFCacheCompute(
         const fastllm::Data &input,
         const FastllmCudaMoeGGUFCacheView &view, const float *scores,
@@ -786,13 +798,13 @@ bool FastllmCudaMoeV41CanonicalGGUFCacheCompute(
     const size_t scratch = fastllm::moe_routes::Plan::TemporaryBytes(routes);
     fastllm::moe_routes::Plan grouped(static_cast<uint8_t *>(view.workspace)+bytes, routes, scratch);
     if (!scratch || view.workspaceBytes < bytes+grouped.bytes) return false;
-    auto *qInput = static_cast<block_q8_1 *>(view.workspace);
-    auto *qGate = qInput + size_t(rows)*(hidden/32);
+    auto *localInput = static_cast<block_q8_1 *>(view.workspace);
+    const auto *qInput = view.preparedQ8Input ? static_cast<const block_q8_1 *>(view.preparedQ8Input) : localInput;
+    auto *qGate = localInput + size_t(rows)*(hidden/32);
     auto *gateData = reinterpret_cast<__nv_bfloat16 *>(qGate + size_t(routes)*(inter/32));
     auto *partial = gateData + size_t(routes)*inter;
-    if (!view.q8InputPrepared)
-        V41CacheQuantize<<<(size_t(rows)*hidden+255)/256,256,0,cudaStreamPerThread>>>(
-            static_cast<const __nv_bfloat16 *>(input.cudaData),qInput,hidden,size_t(rows)*hidden);
+    if (!view.preparedQ8Input && !view.q8InputPrepared &&
+        !FastllmCudaV41GGUFPrepareQ8Input(input, localInput, view.workspaceBytes)) return false;
     if (view.routeMap) {
         auto *selectedScores = reinterpret_cast<float *>(partial + size_t(routes)*hidden);
         V41CacheScores<<<(routes+255)/256, 256, 0, cudaStreamPerThread>>>(

@@ -733,6 +733,7 @@ struct NativeMoeMailbox {
             layout.hidden, layout.inter, w.compute->ggufWorkspace[branch].cudaData,
             size_t(w.compute->ggufWorkspace[branch].GetBytes()), resident ? cache.slotOffsets : nullptr};
         view.routeMap = w.routeMap; view.routeCount = w.routes;
+        if (w.sharedQ8Input) view.preparedQ8Input = w.compute->ggufWorkspace[0].cudaData;
         // The resident, staged and CPU branches own disjoint routes.
         view.preserveMissing = true;
         return FastllmCudaMoeV41CanonicalGGUFCacheCompute(w.compute->quantized,
@@ -869,9 +870,10 @@ struct NativeMoeMailbox {
             return nullptr;
         fullScratch[scratchKey] = fresh->compute;
         auto &w = *fresh;
-        w.sharedQ8Input = group.qwen38FlashNext && w.standard &&
-            layout.weightType == fastllm::DATA_GGUF_FORMAT &&
-            FastllmCudaMoeGGUFCacheQ8Supported(layout.gateGgmlType, layout.downGgmlType, w.hidden, layout.inter);
+        w.sharedQ8Input = layout.weightType == fastllm::DATA_GGUF_FORMAT &&
+            (w.standard ? group.qwen38FlashNext &&
+                FastllmCudaMoeGGUFCacheQ8Supported(layout.gateGgmlType, layout.downGgmlType, w.hidden, layout.inter) :
+                FastllmCudaV41GGUFSupported(layout.gateGgmlType, layout.downGgmlType));
         w.owner = this; w.table = table; w.modelLayer = layer;
         w.weights.assign(weights, weights + weightsBatch);
         auto measured = layers.find(table);
@@ -923,8 +925,11 @@ struct NativeMoeMailbox {
             // Both graph branches consume one immutable quantized activation.
             // Record it before saving the fork dependencies so staged misses
             // cannot read a previous token while resident kernels are running.
-            if (w.sharedQ8Input && !FastllmCudaMoeGGUFPrepareQ8Input(w.compute->quantized,
-                    w.compute->ggufWorkspace[0].cudaData, w.compute->ggufWorkspace[0].GetBytes())) return false;
+            if (w.sharedQ8Input) {
+                const auto prepare = w.standard ? FastllmCudaMoeGGUFPrepareQ8Input : FastllmCudaV41GGUFPrepareQ8Input;
+                if (!prepare(w.compute->quantized, w.compute->ggufWorkspace[0].cudaData,
+                        w.compute->ggufWorkspace[0].GetBytes())) return false;
+            }
             if (FastllmCudaStreamGetCaptureDependencies(cudaStreamPerThread, &status, &graph, &deps, &count) != cudaSuccess) return false;
             std::vector<cudaGraphNode_t> fork(deps, deps + count);
             std::vector<cudaGraphNode_t> residentFork = fork;
