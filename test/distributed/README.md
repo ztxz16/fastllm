@@ -1204,3 +1204,28 @@ XLSX 包含 Cases/Samples/Metadata；展示浮点数统一三位，JSON 保存�
 ```bash
 python3 test/distributed/run_parallel_config.py --execution-tests --benchmark-tests
 ```
+
+### 冷/热前缀输出分歧诊断
+
+若 optimized 在预热时出现 Token 不一致，先保留失败报告。`diagnose_qwen3_prefix.py` 读取该报告的
+`request.json`，原样保留 Prompt、输出长度、EOS 和采样配置；通过正式 `Qwen3ProcessSession` 在单卡上
+依次运行 Eager 和 Decode Graph，各自检查冷请求、热请求、热请求重复，以及清空前缀后的冷请求。
+只使用已有 generate/worker，启用原生 logits trace，不编译或下载。该工具限贪心、无 EOS 的请求，
+Prompt/输出长度至少为 2，完整 trace 不得超过原生 8M logits 上限；超限报错，不截断输入。
+
+```bash
+# 在已配置 CUDA/Python 环境的服务器上运行；替换为实际失败报告目录。
+python3 test/distributed/diagnose_qwen3_prefix.py \
+  --model /home/models/Qwen3-1.7B \
+  --generate build-process-tp-cu126/fastllm_tp_generate \
+  --worker build-process-tp-cu126/fastllm_tp_worker \
+  --build-cache build-process-tp-cu126/CMakeCache.txt \
+  --request-file test/distributed/results/实际失败报告目录/request.json
+```
+
+诊断只比较输入历史相同的步骤，包含首次选词分歧的那一步；后续输入已经不同，不能再直接比较 logits。
+沿用真实模型前缀验收的 `atol=0.05, rtol=0.01`，报告首次分歧位置及两侧前两名 Token、分数和分差。
+相同缓存状态的重复请求还必须输出完全相同的 Token。生成完整的 MD/CSV/JSON/XLSX 汇总和原始响应，
+任一数值超差、路径错误或重复不一致返回非零，失败也保留报告。
+PASS 仅说明所比较步骤在既有容差内；它不表示冷热输出完全相同、分歧后数值已验证或独立数学正确性。
+这是定位工具，不计时、不提供性能结论，也不会修改或放宽性能验收标准。
