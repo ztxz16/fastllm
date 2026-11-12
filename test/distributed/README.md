@@ -1339,3 +1339,61 @@ bash test/distributed/run_qwen3_dp_routing_v100.sh \
   test/distributed/results/20261112T065746Z_dp_perf_ab619d18/request.json
 )
 ```
+
+## DP HTTP/SSE 持续稳定性验收（第五步）
+
+`run_qwen3_dp_service.py` 在独立 Linux Python 子进程中调用正式 `ftllm serve` CLI，使用端口 0，
+从正式 ready 文件获取监听地址。客户端通过真实 loopback HTTP/1.1 socket 请求服务；模型工厂、
+tokenizer、队列、DP 路由、取消、KV 和停服流程均使用正式实现。服务器运行需要第四步已经构建的
+原生产物，本步骤不改变原生协议，不执行编译或安装。
+
+每组固定同一中文 Prompt，混合普通 HTTP 与 SSE、8/32 个输出 Token 上限；聊天模板、seed=0、
+贪心采样及模型 EOS 策略保持一致，实际输出可能因 EOS 提前结束。每个请求验证原生 Token ID、
+最终文本、请求归属、usage、结束原因，以及 SSE 的角色、增量拼接、唯一终帧与 `[DONE]`。
+同 TP 的 DP1 独立建立冷、热输出基准，按原生实际复用长度选择基准，不把冷热输出差异判为错误。
+严格检查实际 Graph、自定义 AllReduce（TP2）及 Prefix Cache 路径。
+
+默认并发数和等待队列容量均为 `2 × DP`，先做一轮预热，再连续执行五轮，每轮至少 30 秒，轮间
+只校验与保存证据，不清空缓存或重启模型。每轮保存所有 HTTP/SSE 响应，验证 worker 身份和模型
+加载次数不变、请求 KV 已释放、队列和活动请求归零，并只读记录本服务进程树的 RSS、线程数和 FD 数。
+资源样本用于后续观察变化，不将一次采样或有限时长 PASS 解释为不存在任何内存泄漏。
+
+随后使用 1024 Token 输出上限的真实长 SSE 占满副本，收到内容且确认请求仍在活动后执行：
+
+- 队列满时返回 429，重复活动请求 ID 返回 409；被拒绝的请求不能生成审计完成记录。
+- 排队取消返回 499，且没有原生请求号；活动取消必须有原生取消确认及空请求 KV。
+- 普通 HTTP 主动断连、SSE 收到内容后断连；随后重新请求并校验实际输出。
+- 同时存在活动请求、排队请求及慢请求体时发送 SIGTERM。慢请求先等待真实 `100 Continue`，
+  确认服务已接收请求头；检查取消审计、原生卸载后的 KV/Prefix Cache、正式关闭报告及所有原进程消失。
+  停服时网络连接允许提前结束，原生取消和清理必须有完整证据。
+
+如果模型在制造压力前已 EOS，测试明确失败并记录无法确认重叠，不修改 EOS、不挂起服务执行来制造通过。
+普通 HTTP 断连可能发生在正式分发之前，此时记录为分发前取消；活动 SSE 取消单独要求原生确认。
+
+这是功能与持续稳定性验收，保留正式请求日志和 HTTP 审计落盘，**不作为性能基准**。
+`elapsed_s` 只记录持续时间，不与第三、四步吞吐混算加速比。各组产生唯一 `*_dp_service_*` 目录，
+包含 `summary.md/csv/json/xlsx`、独立基准、服务器命令/输出、全部原始请求响应、每轮资源快照及
+正式原生日志。Token 差异记录最大/平均绝对误差和失败元素数量；不适用数值误差的生命周期检查为 n/a。
+任意 case 失败或验收器中断返回非零，尽可能保存部分报告并有界回收本次启动的进程。
+
+本地回归仅以 Python 子进程替代原生协议，并替换 CUDA 枚举和 tokenizer；其余 CLI、真实 HTTP/SSE、
+取消和停服实现不替换。覆盖纯 DP/轮转、DP+TP/前缀路由的完整流程，以及文本错误、Token 错误、
+SSE 截断、验收器 SIGTERM 的失败报告和进程清理，不能替代 GPU 服务器验收。
+
+在 sk 合入 master 后，现有四卡 V100 服务器执行：
+
+```bash
+(
+set -euo pipefail
+cd /home/project/vllm_fastllm
+git switch master
+git pull --ff-only origin master
+export CUDA_VISIBLE_DEVICES="GPU-a88c9669-989e-a8dd-22a0-94a45b467c49,GPU-0310107f-031e-6fcd-eb65-6dfa45981711,GPU-f0a99453-777f-8b16-89a3-bab78019f23d,GPU-081484a6-9730-453b-59a2-32bd75ab6c2c"
+bash test/distributed/run_qwen3_dp_service_v100.sh /home/models/Qwen3-1.7B
+)
+```
+
+脚本先做 Python 回归，再依次运行轮转/前缀路由各自的 DP4×TP1 和 DP2×TP2，共四组。
+仅持续负载阶段合计至少 10 分钟，另加模型加载、基准和异常场景时间。无需再次下载模型或重新编译。
+每组应完成 12 个 case 并输出 PASS；可直接运行 Python 验收器调整 `--round-seconds` 延长观察，
+报告会记录实际时长和请求数。
