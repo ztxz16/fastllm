@@ -102,12 +102,11 @@ namespace fastllm {
         ApplyDeviceMap(model.deviceMap, layer + 1, model.block_cnt);
         const std::string attentionHyperPrefix =
             model.languagePrefix + "layers." + std::to_string(layer) + ".attn_hyper_connection.";
-        Data attentionNorm;
+        Data input, injection, output;
         const bool runPle = layer == model.pleLayer && graphState->pleEmbedding.cudaData;
         if (layer == graphStartLayer) {
-            if (!runPle) model.GroupedRMSNorm(graphState->hiddenStates[0],
-                                 model.weight[attentionHyperPrefix + "hc_norm.weight"],
-                                 attentionNorm);
+            if (!runPle) model.HyperRead(graphState->hiddenStates[0],
+                attentionHyperPrefix, input, &injection,nullptr,nullptr,nullptr,model.dataType);
         } else {
             // Join the shared branch with the routed result in the next
             // dense submission, before the ordinary TP reduction.
@@ -121,11 +120,9 @@ namespace fastllm {
                 model.HyperCombine(graphState->hiddenStates[1],
                     graphState->hybridBoundaries[layer - 1].output,
                     graphState->hybridBoundaries[layer - 1].injection, graphState->hiddenStates[0]);
-            } else model.HyperCombineRMSNorm(graphState->hiddenStates[1],
-                                      graphState->hybridBoundaries[layer - 1].output,
-                                      graphState->hybridBoundaries[layer - 1].injection,
-                                      model.weight[attentionHyperPrefix + "hc_norm.weight"],
-                                      graphState->hiddenStates[0], attentionNorm);
+            } else model.HyperRead(graphState->hiddenStates[1], attentionHyperPrefix,
+                input, &injection, &previous.output, &previous.injection,
+                &graphState->hiddenStates[0],model.dataType);
         }
         if (runPle) {
             Data pleOutput;
@@ -133,12 +130,8 @@ namespace fastllm {
             model.RunPLEProjection(graphState->pleEmbedding, graphState->hiddenStates[0],
                 requestState, pleOutput, verificationCapture ? &verificationCapture->pleNormalized : nullptr, true);
             AddTo(graphState->hiddenStates[0], pleOutput);
-            model.GroupedRMSNorm(graphState->hiddenStates[0],
-                model.weight[attentionHyperPrefix + "hc_norm.weight"], attentionNorm);
+            model.HyperRead(graphState->hiddenStates[0], attentionHyperPrefix, input, &injection,nullptr,nullptr,nullptr,model.dataType);
         }
-        Data input, injection, output;
-        model.HyperMixNormalized(attentionNorm, attentionHyperPrefix, input, &injection);
-        attentionNorm.FreeSpace();
         if (model.IsLinearAttentionLayer(layer)) {
             model.RunLinearAttention(
                 layer, input, pastKeyValues[layer].first, pastKeyValues[layer].second, output,
@@ -147,7 +140,8 @@ namespace fastllm {
                 verificationCapture ? &verificationCapture->linearBetas[layer] : nullptr,
                 mtpTargetGraph && verificationCapture->runtimeCheckpoint
                     ? &verificationCapture->runtimeCheckpoint->linearSecond[layer]
-                    : nullptr);
+                    : nullptr, nullptr, nullptr,
+                verificationCapture ? &verificationCapture->linearUpdates[layer] : nullptr);
             if (FastllmCudaGetThreadError())
                 return;
         } else if (hybridEagerAttention) {
@@ -166,12 +160,9 @@ namespace fastllm {
         }
         const std::string mlpHyperPrefix =
             model.languagePrefix + "layers." + std::to_string(layer) + ".mlp_hyper_connection.";
-        Data mlpNorm;
-        model.HyperCombineRMSNorm(graphState->hiddenStates[0], output, injection,
-                                  model.weight[mlpHyperPrefix + "hc_norm.weight"],
-                                  graphState->hiddenStates[1], mlpNorm);
-        model.HyperMixNormalized(mlpNorm, mlpHyperPrefix, graphState->hybridBoundaries[layer].input,
-                                 &graphState->hybridBoundaries[layer].injection);
+        model.HyperRead(graphState->hiddenStates[0], mlpHyperPrefix,
+            graphState->hybridBoundaries[layer].input, &graphState->hybridBoundaries[layer].injection,
+            &output, &injection, &graphState->hiddenStates[1]);
         auto &boundary = graphState->hybridBoundaries[layer];
         model.PrepareMoERouting(layer, boundary.input, boundary.moe);
 #ifndef USE_ROCM
@@ -194,12 +185,9 @@ namespace fastllm {
             return;
         }
         const std::string prefix = model.languagePrefix + "hyper_connection_mixer.";
-        Data normalized, finalHidden;
-        model.HyperCombineRMSNorm(
-            graphState->hiddenStates[1], graphState->hybridBoundaries[model.block_cnt - 1].output,
-            graphState->hybridBoundaries[model.block_cnt - 1].injection,
-            model.weight[prefix + "hc_norm.weight"], graphState->hiddenStates[0], normalized);
-        model.HyperMixNormalized(normalized, prefix, finalHidden, nullptr);
+        Data finalHidden;
+        model.HyperRead(graphState->hiddenStates[1], prefix, finalHidden, nullptr,
+            &last.output, &last.injection, &graphState->hiddenStates[0]);
         Linear(finalHidden, model.weight["lm_head.weight"], Data(), graphState->logits);
         ToDataType(graphState->logits, DataType::FLOAT32);
     }

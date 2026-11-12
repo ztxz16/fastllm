@@ -1,7 +1,7 @@
 #ifdef USE_CUDA
-// Graph storage belongs to live request batches, never to a transient Forward.
-// Each stage keeps one current shape. Invalidating a graph precedes replacing
-// its captured storage; request departure invalidates the complete composition.
+// Graph storage belongs to persistent serving slots or caller-owned requests.
+// The stage cache retains bounded shape/slot combinations across Forward calls.
+// Slot release invalidates compositions before captured storage is destroyed.
 struct Qwen4ExpModel::BatchGraph {
     struct Request {
         DecodeCudaGraphState attention;
@@ -9,7 +9,7 @@ struct Qwen4ExpModel::BatchGraph {
         int previous = 0, rows = 0, validRows = 0, width = 0;
     };
     struct Layer {
-        Data input, injection, output, afterAttention, residual, norm;
+        Data input, injection, output, afterAttention, residual, readInput, readInjection;
         MoEPrepared moe;
     };
     int device = -1;
@@ -50,10 +50,10 @@ struct Qwen4ExpModel::BatchGraph {
         }
         auto &shared = recorder.segments[key];
         auto sharedBody = [&] {
-            Data x, gate, mid, scale;
+            Data x, gate, mid, scale, projected;
             x.FakeFrom(layer.input, 0); x.Resize({layer.input.dims[1], m.embed_dim});
-            m.RunSharedExpert(plan.mlpPrefix, x, gate, mid, scale, layer.moe.result.sharedOutput);
-            ToDataType(layer.moe.result.sharedOutput, FLOAT32);
+            m.RunSharedExpert(plan.mlpPrefix, x, gate, mid, scale, projected);
+            ToDataType(projected, layer.moe.result.sharedOutput, FLOAT32);
         };
         recorder.RunPrefix(shared, sharedBody, true);
         Data x; x.FakeFrom(layer.input, 0); x.Resize({layer.input.dims[1], m.embed_dim});

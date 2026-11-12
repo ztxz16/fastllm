@@ -27,7 +27,7 @@ namespace fastllm {
 #ifdef USE_CUDA
     void Qwen4ExpModel::DecodeGraphExecution::RunGpuSegmentBody(int startLayer, int nextFullLayer,
                                                                 bool firstAttentionReady) {
-        Data carriedAttentionNorm;
+        Data carriedInput, carriedInjection;
         for (int layer = startLayer; layer < nextFullLayer; layer++) {
             ApplyDeviceMap(model.deviceMap, layer + 1, model.block_cnt);
             const std::string layerPrefix =
@@ -43,17 +43,13 @@ namespace fastllm {
                 currentAttentionInjection = &graphState->attentionInjection;
             } else {
                 const std::string attentionHyperPrefix = layerPrefix + "attn_hyper_connection.";
-                Data attentionNorm;
-                Data *normalizedAttention = &carriedAttentionNorm;
                 if (layer == startLayer) {
-                    model.GroupedRMSNorm(graphState->hiddenStates[0],
-                                         model.weight[attentionHyperPrefix + "hc_norm.weight"],
-                                         attentionNorm);
-                    normalizedAttention = &attentionNorm;
+                    model.HyperRead(graphState->hiddenStates[0],attentionHyperPrefix,
+                        linearAttentionInput,&linearAttentionInjection,nullptr,nullptr,nullptr,model.dataType);
+                } else {
+                    linearAttentionInput.FakeFrom(carriedInput,0);linearAttentionInput.Resize(carriedInput.dims);
+                    linearAttentionInjection.FakeFrom(carriedInjection,0);linearAttentionInjection.Resize(carriedInjection.dims);
                 }
-                model.HyperMixNormalized(*normalizedAttention, attentionHyperPrefix,
-                                         linearAttentionInput, &linearAttentionInjection);
-                normalizedAttention->FreeSpace();
                 AssertInFastLLM(
                     model.IsLinearAttentionLayer(layer),
                     "Qwen4 decode graph can only enter before a linear-attention layer.");
@@ -71,53 +67,39 @@ namespace fastllm {
                             layer >=
                                 (int)verificationCapture->runtimeCheckpoint->linearSecond.size()
                         ? nullptr
-                        : &verificationCapture->runtimeCheckpoint->linearSecond[layer]);
+                        : &verificationCapture->runtimeCheckpoint->linearSecond[layer], nullptr, nullptr,
+                    verificationCapture ? &verificationCapture->linearUpdates[layer] : nullptr);
                 currentAttentionOutput = &linearAttentionOutput;
                 currentAttentionInjection = &linearAttentionInjection;
             }
 
             const std::string mlpHyperPrefix = layerPrefix + "mlp_hyper_connection.";
-            Data mlpNorm;
-            model.HyperCombineRMSNorm(graphState->hiddenStates[0], *currentAttentionOutput,
-                                      *currentAttentionInjection,
-                                      model.weight[mlpHyperPrefix + "hc_norm.weight"],
-                                      graphState->hiddenStates[1], mlpNorm);
-
             Data mlpInput, mlpInjection, mlpOutput;
-            model.HyperMixNormalized(mlpNorm, mlpHyperPrefix, mlpInput, &mlpInjection);
-            mlpNorm.FreeSpace();
+            model.HyperRead(graphState->hiddenStates[0],mlpHyperPrefix,mlpInput,&mlpInjection,
+                currentAttentionOutput,currentAttentionInjection,&graphState->hiddenStates[1]);
             model.RunMoE(layer, mlpInput, mlpOutput);
 
             if (layer + 1 == model.block_cnt) {
                 const std::string finalHyperPrefix =
                     model.languagePrefix + "hyper_connection_mixer.";
-                Data finalHyperNorm;
-                model.HyperCombineRMSNorm(graphState->hiddenStates[1], mlpOutput, mlpInjection,
-                                          model.weight[finalHyperPrefix + "hc_norm.weight"],
-                                          graphState->hiddenStates[0], finalHyperNorm);
                 Data finalHidden;
-                model.HyperMixNormalized(finalHyperNorm, finalHyperPrefix, finalHidden, nullptr);
-                finalHyperNorm.FreeSpace();
+                model.HyperRead(graphState->hiddenStates[1],finalHyperPrefix,finalHidden,nullptr,
+                    &mlpOutput,&mlpInjection,&graphState->hiddenStates[0]);
                 Linear(finalHidden, model.weight["lm_head.weight"], Data(), graphState->logits);
                 ToDataType(graphState->logits, DataType::FLOAT32);
             } else {
                 const std::string nextAttentionHyperPrefix = model.languagePrefix + "layers." +
                                                              std::to_string(layer + 1) +
                                                              ".attn_hyper_connection.";
-                model.HyperCombineRMSNorm(graphState->hiddenStates[1], mlpOutput, mlpInjection,
-                                          model.weight[nextAttentionHyperPrefix + "hc_norm.weight"],
-                                          graphState->hiddenStates[0], carriedAttentionNorm);
+                model.HyperRead(graphState->hiddenStates[1],nextAttentionHyperPrefix,carriedInput,&carriedInjection,
+                    &mlpOutput,&mlpInjection,&graphState->hiddenStates[0],model.dataType);
             }
         }
 
         if (nextFullLayer < model.block_cnt) {
             ApplyDeviceMap(model.deviceMap, nextFullLayer + 1, model.block_cnt);
-            const std::string attentionHyperPrefix = model.languagePrefix + "layers." +
-                                                     std::to_string(nextFullLayer) +
-                                                     ".attn_hyper_connection.";
-            model.HyperMixNormalized(carriedAttentionNorm, attentionHyperPrefix,
-                                     graphState->attentionInput, &graphState->attentionInjection);
-            carriedAttentionNorm.FreeSpace();
+            graphState->attentionInput.CopyFrom(carriedInput);
+            graphState->attentionInjection.CopyFrom(carriedInjection);
         }
     }
     void Qwen4ExpModel::DecodeGraphExecution::RunGpuWholeBody() {

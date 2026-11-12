@@ -25,6 +25,9 @@ namespace fastllm {
     class HybridMoePeerRuntime;
     class HybridMoeBatch;
     struct HybridMoeRemoteWorkspace;
+    struct Qwen4RuntimeTensorCopies;
+    struct Qwen4RuntimeTensorTransfer;
+    struct Qwen4TargetCommitPlan;
     class Qwen4ExpModel : public Qwen3NextModel {
     public:
         Qwen4ExpModel();
@@ -133,13 +136,21 @@ namespace fastllm {
         struct HybridTpState;
         struct ThreadTpState;
         struct DecodeServingSlot;
+        struct RequestBatchState;
         struct RequestState;
         struct PrefillStageContext;
         std::map<const Data *, std::unique_ptr<DecodeServingSlot>> decodeServingSlots;
-        std::unique_ptr<DecodeServingSlot> idleDecodeServingSlot;
+        std::vector<std::unique_ptr<DecodeServingSlot>> idleDecodeServingSlots;
+        uint64_t nextDecodeServingSlot = 0;
+        std::shared_ptr<RequestBatchState> servingBatchState;
         std::mutex decodeServingMutex;
         void ReleaseDecodeServingSlot(std::unique_ptr<DecodeServingSlot> &slot);
         void RemoveDecodeServingRequest(const Data *key, bool reusable);
+        void InvalidateServingBatchGraphs(const Data *key);
+        std::vector<std::pair<Data, Data>> &BindDecodeServingCache(
+            std::vector<std::pair<Data, Data>> &cache);
+        void PublishDecodeServingCache(std::vector<std::pair<Data, Data>> &cache,
+            std::vector<std::pair<Data, Data>> &source);
         void ResetDecodeServingState(RequestState &state, bool freezeGraphs = false);
         bool WithDecodeServingCache(std::vector<std::pair<Data, Data>> &cache,
                 const std::function<bool(std::vector<std::pair<Data, Data>> &)> &forward);
@@ -176,7 +187,6 @@ namespace fastllm {
         struct ForwardState;
         struct BatchedRequest;
         struct BatchGraph;
-        struct RequestBatchState;
 #ifdef USE_CUDA
         bool PrepareBatchGraph(std::shared_ptr<BatchGraph> &graph,
             const std::vector<ForwardState*> &frames,
@@ -189,6 +199,8 @@ namespace fastllm {
             // Non-owning scheduler cache vector; its lifetime spans Forward.
             std::vector<std::pair<Data, Data>> *cacheOwner = nullptr;
             bool reusableGraphRequest = false;
+            // Non-owning: the bounded serving pool outlives this request state.
+            DecodeServingSlot *servingSlot = nullptr;
             bool decodeGraphsFrozen = false;
             // Keep the model's preallocated pools alive while this request uses them.
             std::shared_ptr<ServingCache> servingCache;
@@ -311,12 +323,21 @@ namespace fastllm {
             std::vector<Data> linearFirst;
             std::vector<Data> linearSecond;
             RequestRuntimeCheckpoint request;
+#ifdef USE_CUDA
+            // Last member: outstanding copies finish before tensor destruction.
+            std::shared_ptr<Qwen4RuntimeTensorTransfer> transfer;
+#endif
         };
 
         struct TargetVerificationCapture {
             std::vector<Data> linearConvInputs;
             std::vector<Data> linearAlphas;
             std::vector<Data> linearBetas;
+            // Per-token key, innovation and decay: O(rows * heads * head_dim).
+            std::vector<Data> linearUpdates;
+#ifdef USE_CUDA
+            std::shared_ptr<Qwen4TargetCommitPlan> commitPlan;
+#endif
             // Non-owning destination for verifier-time recurrent outputs.
             // The live caches remain the replay baseline while the existing
             // checkpoint buffers provide stable CUDA graph output pointers.
@@ -351,6 +372,7 @@ namespace fastllm {
             bool sampleProposal = false;
             int proposalCount = 0;
             std::shared_ptr<MtpDraftCudaGraphState> draftGraphState;
+            std::shared_ptr<void> verificationSampler;
             std::vector<int> proposals;
             std::deque<int> pendingOutputTokens;
             Data deferredTargetHidden;
@@ -516,6 +538,11 @@ namespace fastllm {
             Data &adjustedPositionIds);
 
         void GroupedRMSNorm(const Data &input, Data &normWeight, Data &output);
+        void HyperRead(const Data &input, const std::string &prefix,
+                       Data &mixedInput, Data *injectionWeights,
+                       const Data *blockOutput = nullptr,
+                       const Data *previousInjection = nullptr,
+                       Data *residual = nullptr, DataType mixedType = FLOAT32);
         void HyperMixNormalized(Data &normalized,
                                 const std::string &prefix,
                                 Data &mixedInput,
@@ -561,11 +588,22 @@ namespace fastllm {
         void MaterializeQsaHostHistory(int layer, int length,
                                        RequestState &state);
         struct FullAttentionProjections { Data *queryGate, *key, *value; };
-        struct LinearAttentionProjections { Data *qkv, *z, *beta, *alpha; };
+        struct LinearAttentionConvolution {
+            Data values;
+            bool mixedPrefill = false, sequential = false;
+        };
+        struct LinearAttentionProjections {
+            Data *qkv, *z, *beta, *alpha;
+            LinearAttentionConvolution *convolution = nullptr;
+        };
         void ProjectFullAttention(const std::string &attention, Data &input,
                                   FullAttentionProjections &projections);
         void ProjectLinearAttention(int layer, Data &input,
-                                    LinearAttentionProjections &projections);
+                                    LinearAttentionProjections &projections,
+                                    const std::function<void()> &qkvReady = {});
+        void ConvolveLinearAttention(int layer, Data &qkv, Data &pastConv,
+                                     LinearAttentionConvolution &convolution,
+                                     Data *convInputCapture = nullptr);
         // Prepared projections allow unrelated request segments to share the
         // weight reads. Optional output captures defer only the final Linear;
         // cache updates and recurrent math still belong to each request.
@@ -590,6 +628,16 @@ namespace fastllm {
             DecodeCudaGraphState *graphState, int device, int sparseWidth, bool dense,
             bool verification, TargetVerificationCapture *capture, Data &output,
             const FullAttentionProjections *projections = nullptr, Data *outputProjectionInput = nullptr);
+        struct FullAttentionGraphRequest {
+            Data *key, *value;
+            RequestState *state;
+            DecodeCudaGraphState *graph;
+            TargetVerificationCapture *capture;
+            int rows;
+        };
+        bool RunFullAttentionBatchGraph(int layer, const std::string &attention,
+            const Data &input, const std::vector<FullAttentionGraphRequest> &requests,
+            FullAttentionProjections projections, Data &unprojected, bool projectionsReady = true);
 #endif
         void RunFullAttentionWithPrefix(
                               int stateLayer,
@@ -612,7 +660,8 @@ namespace fastllm {
                                 Data *betaCapture = nullptr,
                                 Data *recurrentStateOutput = nullptr,
                                 const LinearAttentionProjections *projections = nullptr,
-                                Data *outputProjectionInput = nullptr);
+                                Data *outputProjectionInput = nullptr,
+                                Data *recurrentUpdates = nullptr);
         struct MoEExecutionPlan {
             ExecutionMode backend = ExecutionMode::Cpu;
             int deviceLayer = 0;
@@ -672,7 +721,8 @@ namespace fastllm {
         bool TryRunMtpDraftFullGraph(MtpRuntimeState &state, const Data &targetHidden,
             const Data &inputEmbeds, const Data &positions, int segmentKey, bool deviceSampling,
             Data *sampledTokenIds, Data *sampledTokenValues, int sampledTokenOffset,
-            Data *nextMultiHidden, float *topProbability, int &token);
+            Data *nextMultiHidden, float *topProbability, int &token,
+            const Data *tokenIds = nullptr);
 #endif
         int RunMtpDraft(MtpRuntimeState &state,
                         const Data &targetHiddenStates,
@@ -689,20 +739,22 @@ namespace fastllm {
         void CaptureRequestRuntimeCheckpoint(
             RequestState &state,
             const std::map<int, int> &qsaLengths,
-            RequestRuntimeCheckpoint &checkpoint);
+            RequestRuntimeCheckpoint &checkpoint,
+            Qwen4RuntimeTensorCopies *pendingCopies = nullptr);
         void RestoreRequestRuntimeCheckpoint(
             RequestState &state,
             const RequestRuntimeCheckpoint &checkpoint,
-            bool restoreQsa = true);
+            bool restoreQsa = true,
+            bool synchronize = true);
+        void PrepareTargetCommitPlan(std::vector<std::pair<Data, Data>> &pastKeyValues,
+                                     TargetVerificationCapture &capture);
         void CaptureTargetRuntimeCheckpoint(
             std::vector<std::pair<Data, Data>> &pastKeyValues,
             RequestState &state,
             TargetRuntimeCheckpoint &checkpoint,
             bool synchronize = true,
-            bool captureLinearRecurrent = true);
-        void CommitTargetRecurrentState(
-            std::vector<std::pair<Data, Data>> &pastKeyValues,
-            const TargetRuntimeCheckpoint &checkpoint);
+            bool captureLinearRecurrent = true,
+            bool commitRecurrent = false);
         void CommitTargetVerificationPrefix(
             const Data &candidateIds,
             const Data &candidatePositionIds,
@@ -711,7 +763,8 @@ namespace fastllm {
             std::vector<std::pair<Data, Data>> &pastKeyValues,
             RequestState &state,
             const TargetRuntimeCheckpoint &checkpoint,
-            TargetVerificationCapture &capture);
+            TargetVerificationCapture &capture,
+            bool synchronize = true);
         std::vector<std::vector<int>> ForwardTargetBatch(const std::vector<ForwardState*> &frames);
         std::vector<int> RunMtpDraftBatch(const std::vector<BatchedRequest*> &requests,
                                         const std::vector<Data*> &hidden,
