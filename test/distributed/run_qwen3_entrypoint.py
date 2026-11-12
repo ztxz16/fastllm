@@ -135,7 +135,7 @@ def main():
             def reject_recover():
                 before = model.session._next_id
                 try:
-                    model.generate(dict(request, token_ids=[request['token_ids'][0]] * 129))
+                    model.generate(dict(request, token_ids=[request['token_ids'][0]] * 2049))
                 except ValueError:
                     pass
                 else:

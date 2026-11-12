@@ -44,13 +44,15 @@ def payload(tokens=8, stream=False):
     return value
 
 
-def exchange(address, data, request_id, on_content=None):
+def exchange(address, data, request_id, on_content=None, timeout=180):
     """/** 使用真实HTTP连接，保留完整响应；SSE按帧读取，回调可模拟客户端主动断连。 */"""
-    connection = http.client.HTTPConnection(*address, timeout=180)
+    connection = http.client.HTTPConnection(*address, timeout=timeout)
     response = None
     result = dict(id=request_id, payload=data, status=None, body=None, error=None)
+    encoded = json.dumps(data).encode()
+    result.update(start=time.monotonic(), first_content=None)
     try:
-        connection.request('POST', '/v1/chat/completions', json.dumps(data).encode(),
+        connection.request('POST', '/v1/chat/completions', encoded,
                            {'Content-Type': 'application/json', 'X-Request-ID': request_id})
         response = connection.getresponse()
         result['status'] = response.status
@@ -64,6 +66,9 @@ def exchange(address, data, request_id, on_content=None):
                 if event is None:
                     break
                 events.append(event)
+                if (result['first_content'] is None and isinstance(event, dict) and event.get('choices')
+                        and event['choices'][0]['delta'].get('content')):
+                    result['first_content'] = time.monotonic()
                 if on_content and isinstance(event, dict) and event.get('choices') and event['choices'][0]['delta'].get('content'):
                     callback, on_content = on_content, None
                     if callback() == 'disconnect':
@@ -74,6 +79,7 @@ def exchange(address, data, request_id, on_content=None):
         if response is not None:
             response.close()
         connection.close()
+        result['end'] = time.monotonic()
     return result
 
 
@@ -192,6 +198,12 @@ class ServiceRun:
         replica = self.ready['replicas'][record['dp_rank']]
         return json.loads((Path(replica['output']) / 'session' / f'request-{record["native_id"]:06d}.response.json').read_text())
 
+    def reference_for(self, result, report):
+        """/** 单Prompt验收按实际复用长度选择基准；多Prompt验收可提供独立映射。 */"""
+        reused = report['graph'][0]['prefix_cache']['last_reused_tokens']
+        require(reused in (0, len(report['request']['token_ids'])-1), 'unexpected partial prefix')
+        return self.references[result['payload']['max_tokens']]['warm' if reused else 'cold']
+
     def check(self, result):
         """/** 比较实际Token、文本、usage及SSE终帧；按实际冷热状态选取独立DP1基准。 */"""
         require(result['error'] is None and result['status'] == 200, f'HTTP failure: {result}')
@@ -201,10 +213,8 @@ class ServiceRun:
         graph = report['graph']
         validate_graph(graph, self.args.tp, True)
         validate_allreduce(graph, self.args.tp, self.args.tp == 2, require_progress=self.args.tp == 2)
-        validate_prefix(graph, self.args.tp, True)
-        reused = graph[0]['prefix_cache']['last_reused_tokens']
-        require(reused in (0, len(report['request']['token_ids'])-1), 'unexpected partial prefix')
-        reference = self.references[result['payload']['max_tokens']]['warm' if reused else 'cold']
+        validate_prefix(graph, self.args.tp, getattr(self.args, 'prefix_cache', True))
+        reference = self.reference_for(result, report)
         verify_native(report, reference)
         require(report['status'] == 'PASS' and report['workers'] == self.ready['replicas'][record['dp_rank']]['ready']['workers'],
                 'native backend/workers/status mismatch')

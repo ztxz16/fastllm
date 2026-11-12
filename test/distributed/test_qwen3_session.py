@@ -468,7 +468,7 @@ class SessionTests(unittest.TestCase):
         model.mkdir()
         (model / "config.json").write_text(json.dumps(dict(model_type="qwen3", vocab_size=17, eos_token_id=16)))
         tokenizer = mock.Mock(chat_template="template", eos_token_id=16)
-        tokenizer.apply_chat_template.side_effect = [[1, 2], [1]*129, [3, 4]]
+        tokenizer.apply_chat_template.side_effect = [[1, 2], [1]*2049, [3, 4]]
         tokenizer.decode.side_effect = ["回答一", "回答二"]
         transformers = mock.Mock()
         transformers.AutoTokenizer.from_pretrained.return_value = tokenizer

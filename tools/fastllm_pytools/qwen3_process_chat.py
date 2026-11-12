@@ -11,6 +11,7 @@ import shlex
 import sys
 import uuid
 
+from .qwen3_limits import MAX_CONTEXT_TOKENS, MAX_PROMPT_TOKENS
 from .tp_process_utils import isolated_process, wait_case
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -24,9 +25,9 @@ def validate_request(request, vocab):
         if type(value) is not int or not 0 <= value <= 4294967295:
             raise ValueError(f"{name} must be uint32")
     ids = request["token_ids"]
-    if not 1 <= len(ids) <= 128:
-        raise ValueError(f"Prompt contains {len(ids)} tokens including chat template; supported range is 1..128")
-    if request["max_new_tokens"] < 1 or len(ids) + request["max_new_tokens"] - 1 > 2048:
+    if not 1 <= len(ids) <= MAX_PROMPT_TOKENS:
+        raise ValueError(f"Prompt contains {len(ids)} tokens including chat template; supported range is 1..{MAX_PROMPT_TOKENS}")
+    if request["max_new_tokens"] < 1 or len(ids) + request["max_new_tokens"] - 1 > MAX_CONTEXT_TOKENS:
         raise ValueError("max_new_tokens must be positive and prompt + max_new_tokens - 1 <= 2048")
     for token in ids + request["eos_token_ids"]:
         if type(token) is not int or not 0 <= token < vocab:

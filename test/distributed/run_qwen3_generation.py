@@ -95,7 +95,7 @@ def cases():
         ("sample_top_k_one", dict(temperature=0.8, top_k=1)),
         ("reject_zero_length", dict(reject={"max_new_tokens": 0}, error="generation length")),
         ("reject_capacity", dict(reject={"max_new_tokens": 2048}, error="generation length")),
-        ("reject_prompt", dict(tokens=129, error="generation length")),
+        ("reject_prompt", dict(tokens=2049, error="generation length")),
         ("reject_temperature", dict(reject={"temperature": -1}, error="sampling parameters")),
         ("reject_top_p", dict(reject={"top_p": 0}, error="sampling parameters")),
         ("reject_eos", dict(reject={"eos_token_ids": [17]}, error="EOS token outside vocabulary"))]
@@ -106,18 +106,28 @@ def main():
     for name in ("generate", "sampling-check", "decode-check", "worker", "build-cache"):
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--model", type=Path)
+    parser.add_argument("--long-context", action="store_true", help="长Prompt初始化KV、后续Decode和容量拒绝验证")
     parser.add_argument("--devices", default="0,1")
     parser.add_argument("--output", type=Path, default=ROOT / "test/distributed/results")
     args = parser.parse_args()
+    if args.long_context and args.model:
+        parser.error('--long-context requires generated models for independent CPU verification')
     args.devices = [int(x) for x in args.devices.split(",")]
     if len(args.devices) != 2 or min(args.devices) < 0 or len(set(args.devices)) != 2:
         parser.error("requires two distinct logical GPUs")
     output = args.output.resolve() / (datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "_generation_" + uuid.uuid4().hex[:8])
     output.mkdir(parents=True)
     selected = [("real_greedy", {})] if args.model else cases()
+    if args.long_context:
+        small = dict(layers=1, hidden=4, head_dim=2, heads=2, kv=1)
+        selected = [('prompt129_decode', dict(small, tokens=129, max_new_tokens=4)),
+                    ('prompt2047_decode', dict(small, tokens=2047, max_new_tokens=2)),
+                    ('prompt2048', dict(small, tokens=2048, max_new_tokens=1)),
+                    ('reject_context_overflow', dict(small, tokens=2048, max_new_tokens=2, error='generation length'))]
     metadata = dict(command=shlex.join([sys.executable, *sys.argv]), git=capture(["git", "rev-parse", "HEAD"]),
         git_status=capture(["git", "status", "--short"]), seed=123, warmup=0, iterations=1, repeats=1,
         gpu=capture(["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv,noheader"]),
+        cuda=capture(['nvcc', '--version']),
         cuda_visible_devices=os.environ.get("CUDA_VISIBLE_DEVICES"), devices=args.devices,
         expected_case_count=len(selected)+1, execution="eager", prefix_cache=False, kv_cache="FP16 request-local",
         report_title="Qwen3 generation correctness", report_description="正式生成入口；相同生成前缀在单卡重放，小模型另对照CPU。非性能测试。")
@@ -140,6 +150,7 @@ def main():
         save_report(output, rows, metadata)
 
         for name, spec in selected:
+            print('RUN: ' + name, flush=True)
             directory = output / name
             directory.mkdir()
             metrics = dict(max=0.0, sum=0.0, count=0, failed=0)

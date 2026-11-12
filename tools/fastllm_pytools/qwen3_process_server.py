@@ -101,6 +101,8 @@ class Job:
     dp_rank: int | None = None
     dp_request_id: int | None = None
     created: int = field(default_factory=lambda: int(time.time()))
+    enqueued_at: float | None = None
+    dequeued_at: float | None = None
     events: queue.Queue = field(default_factory=lambda: queue.Queue(maxsize=64))
 
 
@@ -175,6 +177,7 @@ class ChatService:
             if len(self._queue) >= self.queue_size:
                 raise HTTPError(429, "request queue is full")
             self._jobs[request_id] = job
+            job.enqueued_at = time.monotonic()
             self._queue.append(job)
             self._condition.notify()
         return job
@@ -182,9 +185,15 @@ class ChatService:
     def _finish(self, job, status, response):
         # 调用者持有 condition；先落盘再唤醒 HTTP，不能将日志失败伪装为成功。
         try:
+            finished = time.monotonic()
+            queue_end = finished if job.dequeued_at is None else job.dequeued_at
+            timing = dict(enqueued_at=job.enqueued_at, dequeued_at=job.dequeued_at, finished_at=finished,
+                          queue_ms=1000 * (queue_end - job.enqueued_at),
+                          service_ms=None if job.dequeued_at is None else 1000 * (finished - job.dequeued_at))
             path = self.output / ("http-" + uuid.uuid4().hex + ".json")
             path.write_text(json.dumps(dict(id=job.id, native_id=job.native_id, dp_rank=job.dp_rank,
-                                           dp_request_id=job.dp_request_id, request=job.payload, status=status, response=response),
+                                           dp_request_id=job.dp_request_id, request=job.payload, status=status,
+                                           response=response, timing=timing),
                                        ensure_ascii=False, allow_nan=False, indent=2))
         except Exception as error:
             self.failure = f"cannot persist HTTP result: {error}"
@@ -286,6 +295,7 @@ class ChatService:
                     if self._stopping:
                         break
                     job = self._queue.popleft()
+                    job.dequeued_at = time.monotonic()
                     self._active[job.id] = job
                 try:
                     if self.failure is not None:

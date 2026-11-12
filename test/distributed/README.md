@@ -273,7 +273,7 @@ FP32 规约，整体转 FP16 后与残差相加。RMSNorm 归一化后转 FP16 �
 RoPE 使用 FP16 sin/cos 与乘法舍入；Attention 的 score/softmax/V 累加为 FP32。
 这是明确的 eager 正确性基线，不是速度或完整 HF 模型一致性的验收结论。
 
-边界：token 数 1..128、hidden<=65536、偶数 head_dim<=256、本地融合 QKV
+边界：token 数 1..2048、hidden<=65536、偶数 head_dim<=256、本地融合 QKV
 宽度<=65536、本地 MLP 宽度<=262144，临时缓冲总上限 256 MiB；单个请求仍受
 1 MiB 控制帧限制（24 字节任务头 + T*H*4 字节输入）。连续位置起点<=1048576，
 只影响 RoPE，不意味着 KV 已存在。非 SiLU、rope scaling/rope_parameters、
@@ -337,7 +337,7 @@ SUM，复用单层入口的全部计算与通信逻辑。工作区在请求内�
 在该历史阶段，Python `--tp_backend process` 仍拒绝启动服务；最新接入状态见文末。
 
 支持未量化 F16/BF16/F32 源权重，GPU 统一 FP16；支持 tied embedding、非均匀
-词表分片及已有 QKV/O/Down bias。序列长度 1..128，position 起点 0..1048576；
+词表分片及已有 QKV/O/Down bias。序列长度 1..2048，position 起点 0..1048576；
 head/hidden 等限制沿用单层入口。总词表上限 1048576，每 rank 至多 262138 个词表
 元素（24 字节头和 FP32 logits 必须放入 1 MiB 帧），工作区总上限 256 MiB。
 不支持量化、RoPE scaling、滑窗及非 SiLU 配置，明确拒绝，不做 CPU fallback。
@@ -426,7 +426,7 @@ End 同步并释放 KV，可以重复调用；卸载模型和正常 Stop 也释�
 
 本轮边界：
 
-- Prompt 长度 1..128；请求总容量 1..2048，包含 Prompt 和后续送入的 token。
+- Prompt 长度 1..2048；请求总容量 1..2048，包含 Prompt 和后续送入的 token。
 - `positionBegin + capacity - 1 <= 1048576`；Decode 的位置由已缓存长度自动推进。
 - 返回最后输入 token 对应的完整 FP32 词表 logits；调用者选择下一个输入 token。
   不含 tokenizer、采样、EOS 停止、连续批处理或完整聊天服务。
@@ -511,7 +511,7 @@ AutoTokenizer 分词和解码，不加载 PyTorch 模型；worker 各自加载�
 
 - 模型限已有稠密 Qwen3；源 F16/BF16/F32 统一按既有 FP16 GPU 路径执行。
 - 使用模型自带聊天模板，默认 `enable_thinking=False`。`--thinking` 显式打开；
-  `--raw` 跳过模板。模板展开后的 Prompt 仍限 1..128 token，超长报错，不截断。
+  `--raw` 跳过模板。模板展开后的 Prompt 仍限 1..2048 token，超长报错，不截断。
 - 协调器只采样一次并向所有 rank 发送同一 token。temperature=0 为贪心，
   同分取最小 token ID；正温度按 temperature → top-k → top-p → 重归一化采样。
   top-k=0 不截断，top-p=1 不截断；默认 seed=0，使用明确的 53-bit mt19937_64 随机数。
@@ -645,7 +645,7 @@ python3 tools/qwen3_process_chat.py \
   `top_p`、`top_k`、`seed`、`stream`，以及流式专用 `stream_options.include_usage`。模型默认名 `qwen3`；采样默认贪心，关闭 thinking。
   文本 messages 可以带首条 system，然后 user/assistant 交替且以 user 结束；完整历史
   每次通过同一聊天模板编码，不自动保存服务端对话历史。
-- Prompt 含模板及历史仍限制 1..128 token；`prompt+max_tokens-1<=2048`。超限拒绝，
+- Prompt 含模板及历史仍限制 1..2048 token；`prompt+max_tokens-1<=2048`。超限拒绝，
   不静默截断。请求体上限 64 KiB；未知字段、工具、多模态、chunked 请求均拒绝。
   每次响应后关闭连接；不支持 HTTP 请求流水化。连接线程总数也有上限。
 - 原生 `--cancel-fd` 为独立 SOCK_DGRAM 通道，网络字节序 uint32 对应 session 请求 ID。
@@ -756,7 +756,7 @@ curl -N -sS http://127.0.0.1:8000/v1/chat/completions \
 
 - 仅 Linux + NVIDIA CUDA，本轮验收模型为官方未量化 `Qwen/Qwen3-1.7B`。
   源权重 F16/BF16/F32 由既有读取器转换为 FP16，KV 也是 FP16；不支持 BF16 计算或量化权重。
-- Prompt（含模板及历史）1..128 token，`prompt + max_new_tokens - 1 <= 2048`。
+- Prompt（含模板及历史）1..2048 token，`prompt + max_new_tokens - 1 <= 2048`。
   单活动请求，HTTP 有界排队，无连续批处理。文本生成默认关闭 thinking，最大输出默认 32。
 - `--tp 2` 表示可见设备中的前两张卡；`--tp 0,1` 为逻辑编号；`--tp 0` 为单卡 0。
   `--tp auto` 要求显式设置 `CUDA_VISIBLE_DEVICES`。不做卡数静默裁剪，不接受线程 TP 的比例配置。
@@ -943,7 +943,7 @@ python3 -m ftllm.cli run /home/models/Qwen3-1.7B \
   reused_tokens、last_reused_tokens、last_computed_tokens、evictions、clears。计数是整数；
   显式清缓存只增加 clears 并清空资源，不清零历史计数；卸载模型全部清零。
   各卡 KV 头数可以不同，因此资源字节不强制相等，匹配/淘汰/执行长度必须一致。
-- 原限制保持：未量化稠密 Qwen3，FP16 计算/KV，Prompt 最长 128 token，总请求容量最多 2048，
+- 原限制保持：未量化稠密 Qwen3，FP16 计算/KV，Prompt 最长 2048 token，总请求容量最多 2048，
   单活动请求；没有分页缓存、跨模型/跨进程组共享或连续批处理。命中只减少 Prefill 后缀工作量，
   复制及一致性检查有开销；尚未做吞吐/延迟基准，不据此宣称加速比。
 
@@ -1082,7 +1082,7 @@ GPU 编号是 CUDA 可见逻辑编号；子进程继承启动时的环境快照�
   再清理全部副本。没有跨副本 KV 迁移或共享缓存。
 - 正常退出、Ctrl-C、CLI SIGTERM 和启动失败均经过回收路径。程序接口应使用上下文管理器或显式 `close()`。
   关闭会取消原生在途请求，并回收全部进程，不依赖客户端继续读取暂停的文本迭代器。
-- 支持范围沿用进程 TP：Linux NVIDIA CUDA、本地未量化稠密 Qwen3、FP16 执行、Prompt 最多 128 token。
+- 支持范围沿用进程 TP：Linux NVIDIA CUDA、本地未量化稠密 Qwen3、FP16 执行、Prompt 最多 2048 token。
   纯 DP 可使用 Graph 和 Prefix Cache；自定义 AllReduce 只允许副本内部 TP2，必须满足 GPU P2P 条件。
 
 示例（在仓库根目录，使用已有产物）：
@@ -1143,7 +1143,7 @@ CLI case 在同一验收进程调用正式 `cli.main`，保留等价终端命令
 只运行已编译的协调器和 worker，不构建、不下载、不加载旧 Python 推理库。
 默认比较 DP1×TP1、DP2×TP1、DP4×TP1、DP1×TP2、DP2×TP2；每种分别测并发 1 和 4。
 每轮固定 8 个请求，每请求输出 32 token，关闭 EOS 提前结束，使用同一份实际 Prompt Token ID、
-贪心采样参数与 seed=0；Prompt 仍受正式后端最多 128 token 限制。
+贪心采样参数与 seed=0；Prompt 仍受正式后端最多 2048 token 限制。
 每个 case 预热 1 轮，正式执行 5 次独立工作轮，模型权重始终驻留。optimized 在预热前额外通过公开接口
 清空前缀，并串行执行 DP 个冷请求，确认所有副本都已建立相同前缀；这一步不计入预热轮数或正式计时。
 默认共 20 个 case。
@@ -1397,3 +1397,57 @@ bash test/distributed/run_qwen3_dp_service_v100.sh /home/models/Qwen3-1.7B
 仅持续负载阶段合计至少 10 分钟，另加模型加载、基准和异常场景时间。无需再次下载模型或重新编译。
 每组应完成 12 个 case 并输出 PASS；可直接运行 Python 验收器调整 `--round-seconds` 延长观察，
 报告会记录实际时长和请求数。
+
+## DP 长Prompt与混合长度诊断（第六步）
+
+进程后端现在统一接受包含聊天模板在内的 1..2048 个 Prompt Token，并继续要求
+`prompt_tokens + max_new_tokens - 1 <= 2048`。2048 Token 输入最多生成一个输出 Token；
+最后输出不再送入 KV。Python、协调器、worker、Attention 和 Prefix Cache 目录使用相同上限。
+这仍是有限容量的完整 Prefill，不是分块 Prefill 或无限上下文；原有工作区、请求 KV 各
+256 MiB 和 Prefix Cache 64 MiB 预算不变，较大模型可能先触发显存预算拒绝。
+**必须重新构建协调器、worker 和进程 Python 包。**
+
+`diagnose_qwen3_dp_lengths_v100.sh` 依次执行 Python 回归、服务器编译、三组独立数值/边界验证，
+最后运行 DP4×TP1 和 DP2×TP2 的正式 HTTP/SSE 诊断。数值验证包括：127/128/129、512、1024、
+2047/2048/2049 的 Prefill 边界，BF16/F32 源权重和 bias，长Prompt初始化 KV 后 Decode、
+总容量超限拒绝，以及长前缀目录的命中与清理；合成小模型对照独立 CPU 数学参考和单卡，
+保留误差和完整原始数据。CPU 参考计算期间可能暂时没有新输出，开始每个 case 都会打印 RUN。
+
+服务诊断默认构造接近 64/512/1024 Token 的三种文本，经过模型的正式聊天模板，不截断
+Token；实际长度与完整 ID 保存到 `inputs.json`。每种输入分别配 16/96 输出上限和 HTTP/SSE，
+共 12 个请求，每轮相同工作量、固定 seed=0；模型 EOS 不变，吞吐按实际输出数计算。
+每种 Prompt/输出上限独立建立同 TP 的 DP1 精确 Token 基准，校验实际路径、文本、usage、
+SSE 完整性和 KV 回收。CUDA Graph 开启；TP2 开启自定义 AllReduce，长Prefill超出该规约容量
+时仍使用正式 NCCL 路径。**本轮使用轮转路由并关闭 Prefix Cache**，不把部分前缀复用造成的
+数值差异混入长度诊断；不声明已覆盖带缓存的真实模型混合长度负载。
+
+每种并发先预热一轮，再交替运行 C1 和 C=`2×DP`，各五轮，保存 Median/P95/CV、实际吞吐及
+逐输入类型延迟。`speedup_vs_c1 = 同一DP/TP配置C1 Median轮耗时 / 当前Median轮耗时`，
+它是并发工作量的时间比，不是 DP 扩展比或其它框架的加速比。计时包含真实 HTTP、服务分词、
+排队、生产日志、推理及响应读取；测试校验、测试报告落盘、模型加载和输入构造均在计时外。
+每条正式 HTTP 审计新增单调时钟 `timing`：`queue_ms` 从入队到取出，不包含分词；
+`service_ms` 从取出到完成，不含最终 HTTP 审计写盘。SSE 的 `first_content_ms` 是客户端
+首个非空文本块延迟，包含排队，不冒充原生首 Token 时间；普通 HTTP 不提供此指标。
+
+以 0.5 秒周期通过 nvidia-smi 查询整卡显存，并在每轮结束保存本服务进程 RSS/FD/线程数。
+显存统计按 UUID 保存到 `memory.json` 和汇总 metadata，可能包含其它进程，且会漏掉瞬时峰值；
+不得将观测最大值解释为本服务精确峰值，也不能仅凭有限采样断言无内存泄漏。
+采样失败、输出错误、请求失败或清理失败均返回非零；保留部分汇总与失败轮原始响应。
+每组输出独立 `*_dp_lengths_*` 目录，包含 `summary.md/csv/json/xlsx`、`inputs.csv`、
+输入与 DP1 基准、逐轮原始响应和显存采样。XLSX 同时包含逐请求与逐输入类型统计。
+
+sk 合入 master 后，在现有四卡 V100 服务器执行（无需下载模型）：
+
+```bash
+(
+set -euo pipefail
+cd /home/project/vllm_fastllm
+git switch master
+git pull --ff-only origin master
+export CUDA_VISIBLE_DEVICES="GPU-a88c9669-989e-a8dd-22a0-94a45b467c49,GPU-0310107f-031e-6fcd-eb65-6dfa45981711,GPU-f0a99453-777f-8b16-89a3-bab78019f23d,GPU-081484a6-9730-453b-59a2-32bd75ab6c2c"
+bash test/distributed/diagnose_qwen3_dp_lengths_v100.sh /home/models/Qwen3-1.7B
+)
+```
+
+默认应得到六个报告：Python 回归、长Prefill、长生成、长Prefix Cache、DP4×TP1、DP2×TP2。
+这些服务器结果尚需实际运行确认；本地 Python 协议替身不能替代 CUDA 编译和 GPU 数值验收。

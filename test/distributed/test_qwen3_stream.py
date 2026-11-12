@@ -107,7 +107,7 @@ class StreamTests(unittest.TestCase):
         self.assertEqual(self.ctx.call()[0], 200)
 
     def test_bad_prompt_returns_http_error_before_sse(self):
-        self.ctx.tokenizer.apply_chat_template.return_value = [1]*129
+        self.ctx.tokenizer.apply_chat_template.return_value = [1]*2049
         response = self.open_stream()
         self.assertEqual(response.status, 400)
         self.assertIn("application/json", response.getheader("Content-Type"))
