@@ -70,8 +70,8 @@ class ProcessEntryTests(unittest.TestCase):
             for kwargs in ({'repeat_penalty': 1.1}, {'max_length': 0}, {'temperature': float('nan')}):
                 with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                     model.response('你好', **kwargs)
-            self.tokenizer.apply_chat_template.return_value = [1] * 129
-            with self.assertRaisesRegex(ValueError, 'Prompt contains 129'):
+            self.tokenizer.apply_chat_template.return_value = [1] * 2049
+            with self.assertRaisesRegex(ValueError, 'Prompt contains 2049'):
                 model.response('超长')
             self.assertEqual(model.session._next_id, 1)
 

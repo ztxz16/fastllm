@@ -69,7 +69,7 @@ class PrefixCacheTests(unittest.TestCase):
         validate_prefix(unequal, 2, True)
         for update in (dict(enabled=1), dict(hits=True), dict(entries=9), dict(device_bytes=0),
                        dict(device_bytes=64*1024*1024+1), dict(lookups=-1), dict(hits=3),
-                       dict(last_reused_tokens=128), dict(last_computed_tokens=0), dict(hits=0)):
+                       dict(last_reused_tokens=2048), dict(last_computed_tokens=0), dict(hits=0)):
             bad = states()
             bad[1]['prefix_cache'].update(update)
             with self.subTest(update=update), self.assertRaises(RuntimeError):

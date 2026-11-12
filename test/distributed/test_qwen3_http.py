@@ -102,6 +102,15 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(self.call("DELETE", "/v1/requests/active")[0], 202)
         self.assertEqual(active.result()[0], 499)
         self.assertEqual(next_job.result()[0], 200)
+        audits = {r['id']: r for r in (json.loads(p.read_text()) for p in self.root.glob('http-*.json'))}
+        for rid in ('active', 'next'):
+            timing = audits[rid]['timing']
+            self.assertLessEqual(timing['enqueued_at'], timing['dequeued_at'])
+            self.assertLessEqual(timing['dequeued_at'], timing['finished_at'])
+            self.assertAlmostEqual(timing['queue_ms'], 1000*(timing['dequeued_at']-timing['enqueued_at']))
+        self.assertIsNone(audits['waiter']['timing']['dequeued_at'])
+        self.assertIsNone(audits['waiter']['timing']['service_ms'])
+        self.assertGreaterEqual(audits['waiter']['timing']['queue_ms'], 0)
         self.assertEqual(self.session.state, "ready")
         self.assertEqual(self.call("DELETE", "/v1/requests/active")[0], 404)
 
@@ -211,7 +220,7 @@ class HTTPTests(unittest.TestCase):
             self.assertTrue((directory / f"summary.{suffix}").is_file())
 
     def test_long_prompt_rejected_and_recovery(self):
-        self.tokenizer.apply_chat_template.side_effect = [[1]*129, [1, 2]]
+        self.tokenizer.apply_chat_template.side_effect = [[1]*2049, [1, 2]]
         self.assertEqual(self.call()[0], 400)
         self.assertEqual(self.call()[0], 200)
 

@@ -48,7 +48,7 @@ uint32_t SampleQwen3(const std::vector<float> &logits,
  * Begin 后统一广播每个采样 ID；EOS 或长度上限结束时释放请求 KV。
  * 首个输出来自 Prefill；最后一个输出不再计算，capacity=prompt+maxNewTokens-1。
  * @param group 已就绪、已加载模型的进程组，不允许并发访问。
- * @param prompt Prompt ID，长度 1..128，容量不能超过 2048。
+ * @param prompt Prompt ID，长度 1..2048，容量不能超过 2048。
  * @param options 长度必须为正；EOS ID 必须落在模型词表内。
  * @param observer 可选同步观察回调，收到实际选中的 ID 和对应完整 logits；
  *                 引用仅在调用期间有效，异常将中止生成并尝试释放请求。

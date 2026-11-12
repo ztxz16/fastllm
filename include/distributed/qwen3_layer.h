@@ -32,7 +32,7 @@ public:
      * 临时缓冲总上限 256 MiB，每次成功调用后释放；失败后必须终止 worker。
      * 不含 embedding、最终 Norm、lm_head 或采样；独立阶段与 Full 共用全部算子。
      * @param layer 模型层号。
-     * @param tokens 序列长度，范围 1..128。
+     * @param tokens 序列长度，范围 1..2048。
      * @param hidden 模型隐藏维度。
      * @param positionBegin 连续位置起点，仅影响 RoPE，不表示已有 KV。
      * @param stage Full、Attention 或 Mlp，均包含对应残差。
@@ -46,7 +46,7 @@ public:
      * 运行完整无 KV prefill，复用单层执行路径和同一 stream，仅读回本 rank 的末 token logits。
      *
      * 输入、隐藏状态和工作区在一次请求内复用；成功后释放，失败必须终止 worker。
-     * @param tokenIds 非空 token ID，长度至多 128，不能超出词表。
+     * @param tokenIds 非空 token ID，长度至多 2048，不能超出词表。
      * @param positionBegin 连续位置起点，范围 0..1048576。
      * @return 本 rank 的 [vocabCount] FP32 logits，词表起点由权重 Plan 指定。
      */
@@ -55,7 +55,7 @@ public:
     /**
      * 分配单请求各层 FP16 KV；可选复制最长前缀后计算后缀，成功后保存 Prompt 快照。
      * 至少重算末 token，失败必须终止 worker；快照不包含后续 Decode token。
-     * @param tokenIds 1..128 个合法 ID。
+     * @param tokenIds 1..2048 个合法 ID。
      * @param capacity 1..2048，覆盖 Prompt 和后续 token；每 rank KV 总上限 256 MiB。
      * @param positionBegin 起点，容量末位置不得超过 1048576。
      * @return 本 rank 末 token 的 FP32 词表分片。
@@ -81,7 +81,7 @@ public:
 private:
     /**
      * 复用完整模型计算，成功同步并释放临时工作区后才提交缓存有效长度。
-     * @param tokenIds 1..128 个输入 ID，Decode 仅传一个；入口检查词表边界。
+     * @param tokenIds 1..2048 个输入 ID，Decode 仅传一个；入口检查词表边界。
      * @param positionBegin 当前输入的 RoPE 起点，缓存模式必须紧接历史位置。
      * @param cached true 时读取并追加各层 FP16 KV；false 不接触活动请求缓存。
      * @return 本 rank 的 FP32 词表分片，出现异常后必须终止 worker。

@@ -26,6 +26,18 @@ class RoutingTests(unittest.TestCase):
     def args(self, *extra):
         return self.fixture.args('--prefix-cache', 'true', '--dp-routing', 'prefix', *extra)
 
+    def test_long_prompt_directory_reuse_clear_and_capacity(self):
+        with make_normal_llm_model(self.args()) as model:
+            for size in (129, 512, 2048):
+                model.clear_prefix_cache()
+                request = dict(self.request, token_ids=[1]*size)
+                first, second = model.generate(request), model.generate(request)
+                self.assertEqual(second['token_ids'], first['token_ids'])
+                self.assertEqual(second['dp_routing']['estimated_reused_tokens'], size-1)
+                self.assertEqual(second['graph'][0]['prefix_cache']['last_reused_tokens'], size-1)
+            with self.assertRaises(ValueError):
+                model.generate(dict(self.request, token_ids=[1]*2049))
+
     def test_affinity_partial_prefix_and_dp_tp_sizes(self):
         for dp, tp in ((2, 1), (4, 1), (2, 2)):
             with self.subTest(dp=dp, tp=tp), make_normal_llm_model(self.args('--dp', str(dp), '--tp', str(tp))) as model:

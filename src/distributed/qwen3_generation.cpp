@@ -1,3 +1,4 @@
+#include "distributed/qwen3_limits.h"
 #include "distributed/qwen3_generation.h"
 
 #include <algorithm>
@@ -81,9 +82,9 @@ Qwen3GenerationResult GenerateQwen3(ProcessGroup &group, const std::vector<uint3
     const std::function<void(uint32_t, const std::vector<float>&)> &observer,
     const std::function<bool()> &cancelled) {
     ValidateSampling(options);
-    if (prompt.empty() || prompt.size() > 128 || options.maxNewTokens == 0 ||
-        uint64_t(prompt.size()) + options.maxNewTokens - 1 > 2048) {
-        throw std::runtime_error("invalid Qwen3 generation length (prompt 1..128, capacity <=2048)");
+    if (prompt.empty() || prompt.size() > kQwen3MaxPromptTokens || options.maxNewTokens == 0 ||
+        uint64_t(prompt.size()) + options.maxNewTokens - 1 > kQwen3MaxContextTokens) {
+        throw std::runtime_error("invalid Qwen3 generation length (prompt 1..2048, capacity <=2048)");
     }
     for (const auto &state : group.Qwen3Requests()) {
         if (state.active) {

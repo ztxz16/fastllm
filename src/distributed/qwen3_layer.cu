@@ -1,3 +1,4 @@
+#include "distributed/qwen3_limits.h"
 #include "distributed/qwen3_layer.h"
 #include "process_protocol.h"
 
@@ -143,7 +144,7 @@ __global__ void AppendKV(const half *qkv, half *cache, int count, int width, int
 __global__ void Attention(const half *qkv, half *context, int qHeads, int kvHeads, int dim,
                           int qBegin, int kvBegin, int groupSize, const half *cache, int past, const uint32_t *decodeMeta = nullptr) {
     if (decodeMeta) past = decodeMeta[0];
-    __shared__ float probabilities[2048];
+    __shared__ float probabilities[kQwen3MaxContextTokens];
     int head = blockIdx.x % qHeads, token = blockIdx.x / qHeads;
     int kv = (qBegin + head) / groupSize - kvBegin;
     int stride = (qHeads + 2 * kvHeads) * dim;
@@ -299,7 +300,7 @@ struct Qwen3LayerExecutor::Impl {
      *
      * 各 rank 在进入层间规约前用 NCCL 核对复用长度；不一致即失败，不能静默降级。
      * 模型/布局由执行器生命周期隔离，键另外包含完整 ID 前缀和 RoPE 起点。
-     * @param ids 已验证的 1..128 个 Prompt ID。
+     * @param ids 已验证的 1..2048 个 Prompt ID。
      * @param position 当前 Prompt 的 RoPE 起点。
      * @return 实际复制的 token 数；复制到独立请求 KV，不共享可写地址。
      */
@@ -389,7 +390,7 @@ struct Qwen3LayerExecutor::Impl {
     void Validate(uint32_t layer, uint32_t tokens, uint32_t hidden, uint32_t positionBegin,
                   Qwen3LayerStage stage) const {
         const auto &p = weights.Plan();
-        if (!blas || layer >= p.layerCount || !tokens || tokens > 128 || hidden != p.hiddenSize ||
+        if (!blas || layer >= p.layerCount || !tokens || tokens > kQwen3MaxPromptTokens || hidden != p.hiddenSize ||
             !hidden || hidden > 65536 || positionBegin > 1048576 ||
             uint32_t(stage) > 2 || p.headDim % 2 || p.headDim > 256 || !p.headDim ||
             (p.queryHeadCount + 2 * p.kvHeadCount) * p.headDim > 65536 || p.intermediateCount > 262144) {
@@ -420,7 +421,7 @@ struct Qwen3LayerExecutor::Impl {
     /**
      * 在 GPU 原地更新一层隐藏状态；单层检查与全模型共用此计算和通信路径。
      * @param layer 层号，调用方已验证。
-     * @param tokens 序列长度，范围 1..128。
+     * @param tokens 序列长度，范围 1..2048。
      * @param positionBegin 连续位置起点。
      * @param stage 指定 Attention、MLP 或完整层。
      * @param x FP16 [tokens,hidden] 行主序输入/输出，不读回 CPU。
@@ -610,7 +611,7 @@ std::vector<float> Qwen3LayerExecutor::RunTokens(const std::vector<uint32_t> &to
                                                uint32_t positionBegin, bool cached) {
     auto &r = *impl;
     const auto &p = r.weights.Plan();
-    if (tokenIds.empty() || tokenIds.size() > 128) {
+    if (tokenIds.empty() || tokenIds.size() > kQwen3MaxPromptTokens) {
         throw std::runtime_error("invalid Qwen3 prefill token count");
     }
     r.Validate(0, tokenIds.size(), p.hiddenSize, positionBegin, Qwen3LayerStage::Full);
@@ -663,7 +664,7 @@ std::vector<float> Qwen3LayerExecutor::BeginRequest(const std::vector<uint32_t> 
     if (r.request.active) {
         throw std::runtime_error("Qwen3 request already active");
     }
-    if (!capacity || capacity > 2048 || tokenIds.empty() || tokenIds.size() > 128 ||
+    if (!capacity || capacity > kQwen3MaxContextTokens || tokenIds.empty() || tokenIds.size() > kQwen3MaxPromptTokens ||
         tokenIds.size() > capacity || positionBegin > 1048576 || capacity - 1 > 1048576 - positionBegin) {
         throw std::runtime_error("invalid Qwen3 request capacity/position");
     }

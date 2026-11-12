@@ -89,7 +89,7 @@ def make_tasks(config, spec):
         elif reject == "empty":
             actions[0]["token_ids"] = []
         elif reject == "too_many_prompt":
-            actions[0].update(token_ids=[1] * 129, capacity=256)
+            actions[0].update(token_ids=[1] * 2049, capacity=2048)
         return [dict(action, name=f"reject-{i}-{action['op']}") for i, action in enumerate(actions)]
 
     tasks = [dict(name="initial", op="query")]

@@ -1,6 +1,9 @@
 """校验原生执行证据；开启 Graph 后不接受旧产物、静默回退或资源泄漏。"""
 
 
+from .qwen3_limits import MAX_PROMPT_TOKENS
+
+
 def validate_graph(states, world, enabled, *, clean=True):
     if not isinstance(states, list) or len(states) != world:
         raise RuntimeError('missing CUDA Graph diagnostics; rebuild native binaries')
@@ -67,7 +70,7 @@ def validate_prefix_directory(prefix, *, required=False):
             raise RuntimeError('invalid prefix directory entry')
         position, ids = entry['position_begin'], entry['token_ids']
         if (type(position) is not int or not 0 <= position <= 1048576 or not isinstance(ids, list) or
-                not 1 <= len(ids) <= 128 or position + len(ids) - 1 > 1048576 or
+                not 1 <= len(ids) <= MAX_PROMPT_TOKENS or position + len(ids) - 1 > 1048576 or
                 any(type(token) is not int or not 0 <= token <= 4294967295 for token in ids)):
             raise RuntimeError('invalid prefix directory tokens/position')
         key = (position, tuple(ids))
@@ -91,8 +94,8 @@ def validate_prefix(states, world, enabled, *, previous=None, reset=False, clear
             raise RuntimeError('invalid prefix cache diagnostics')
         if (p['entries'] > 8 or p['device_bytes'] > 64 * 1024 * 1024 or
                 bool(p['entries']) != bool(p['device_bytes']) or p['hits'] > p['lookups'] or
-                p['reused_tokens'] < p['hits'] or p['last_reused_tokens'] > 127 or
-                p['last_computed_tokens'] > 128 or p['last_reused_tokens'] + p['last_computed_tokens'] > 128 or
+                p['reused_tokens'] < p['hits'] or p['last_reused_tokens'] >= MAX_PROMPT_TOKENS or
+                p['last_computed_tokens'] > MAX_PROMPT_TOKENS or p['last_reused_tokens'] + p['last_computed_tokens'] > MAX_PROMPT_TOKENS or
                 (p['lookups'] and not p['last_computed_tokens']) or
                 ((reset or not enabled) and any(p[k] for k in integers)) or
                 (cleared and (p['entries'] or p['device_bytes']))):

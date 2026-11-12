@@ -1,3 +1,4 @@
+#include "distributed/qwen3_limits.h"
 #include "distributed/process_group.h"
 #include "process_protocol.h"
 
@@ -375,7 +376,7 @@ struct ProcessGroup::Impl {
                 for (uint32_t i = 0; i < entries; ++i) {
                     const uint32_t position = Get32(bytes, offset), length = Get32(bytes, offset + 4);
                     offset += 8;
-                    if (!length || length > 128 || position > 1048576 || length - 1 > 1048576 - position ||
+                    if (!length || length > kQwen3MaxPromptTokens || position > 1048576 || length - 1 > 1048576 - position ||
                         offset > bytes.size() || length > (bytes.size() - offset) / 4) {
                         throw std::runtime_error("invalid Qwen3 prefix directory entry");
                     }
@@ -392,7 +393,7 @@ struct ProcessGroup::Impl {
                 const auto &ar = info.allReduce;
                 const auto &g = info.graph;
                 bool invalid = info.active ?
-                    (end || !info.tokens || info.tokens > info.capacity || info.capacity > 2048 ||
+                    (end || !info.tokens || info.tokens > info.capacity || info.capacity > kQwen3MaxContextTokens ||
                      info.positionBegin > 1048576 || info.capacity - 1 > 1048576 - info.positionBegin ||
                      !info.deviceBytes || info.deviceBytes > 256ULL * 1024 * 1024) :
                     (info.tokens || info.capacity || info.positionBegin || info.deviceBytes);
@@ -406,8 +407,8 @@ struct ProcessGroup::Impl {
                 invalid = invalid || prefix.enabled != options.prefixCache || prefix.entries > 8 ||
                     prefix.deviceBytes > 64ULL * 1024 * 1024 || bool(prefix.entries) != bool(prefix.deviceBytes) ||
                     prefix.hits > prefix.lookups || prefix.reusedTokens < prefix.hits ||
-                    prefix.lastReusedTokens > 127 || prefix.lastComputedTokens > 128 ||
-                    prefix.lastReusedTokens + prefix.lastComputedTokens > 128 ||
+                    prefix.lastReusedTokens >= kQwen3MaxPromptTokens || prefix.lastComputedTokens > kQwen3MaxPromptTokens ||
+                    prefix.lastReusedTokens + prefix.lastComputedTokens > kQwen3MaxPromptTokens ||
                     (prefix.lookups && !prefix.lastComputedTokens) ||
                     (clearPrefix && (prefix.entries || prefix.deviceBytes)) ||
                     (!prefix.enabled && (prefix.entries || prefix.deviceBytes || prefix.lookups || prefix.hits ||
@@ -759,7 +760,7 @@ void ProcessGroup::UnloadQwen3() {
 std::vector<std::vector<float>> ProcessGroup::ForwardQwen3Layer(uint32_t layer, uint32_t tokens,
         uint32_t hidden, uint32_t positionBegin, Qwen3LayerStage stage, const std::vector<float> &input,
         int timeoutMs) {
-    if (!tokens || tokens > 128 || !hidden || uint64_t(tokens) * hidden != input.size() ||
+    if (!tokens || tokens > kQwen3MaxPromptTokens || !hidden || uint64_t(tokens) * hidden != input.size() ||
         input.size() > (kMaxPayload - 24) / 4 || positionBegin > 1048576 || uint32_t(stage) > 2 || timeoutMs <= 0) {
         throw std::invalid_argument("invalid Qwen3 layer request shape/stage/position/timeout");
     }
@@ -806,7 +807,7 @@ std::vector<std::vector<float>> ProcessGroup::ForwardQwen3Layer(uint32_t layer, 
 
 std::vector<float> ProcessGroup::PrefillQwen3(const std::vector<uint32_t> &tokenIds,
                                             uint32_t positionBegin, int timeoutMs) {
-    if (tokenIds.empty() || tokenIds.size() > 128 || positionBegin > 1048576 || timeoutMs <= 0) {
+    if (tokenIds.empty() || tokenIds.size() > kQwen3MaxPromptTokens || positionBegin > 1048576 || timeoutMs <= 0) {
         throw std::invalid_argument("invalid Qwen3 prefill request count/position/timeout");
     }
     std::vector<uint8_t> payload;
@@ -821,7 +822,7 @@ std::vector<float> ProcessGroup::PrefillQwen3(const std::vector<uint32_t> &token
 
 std::vector<float> ProcessGroup::BeginQwen3Request(const std::vector<uint32_t> &tokenIds,
                                                  uint32_t capacity, uint32_t positionBegin, int timeoutMs) {
-    if (tokenIds.empty() || tokenIds.size() > 128 || !capacity || capacity > 2048 ||
+    if (tokenIds.empty() || tokenIds.size() > kQwen3MaxPromptTokens || !capacity || capacity > kQwen3MaxContextTokens ||
         tokenIds.size() > capacity || positionBegin > 1048576 ||
         capacity - 1 > 1048576 - positionBegin || timeoutMs <= 0) {
         throw std::invalid_argument("invalid Qwen3 request capacity/position/timeout");

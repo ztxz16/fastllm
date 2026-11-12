@@ -51,7 +51,7 @@ def compare_logits(actual, expected, metrics, label, atol, rtol):
 def make_model(directory, spec):
     config, tensors = fixture(directory, dtype=spec.get("dtype", "F16"), bias=spec.get("bias", False),
         tied=spec.get("tied", False), hidden_size=spec.get("hidden", 16), head_dim=spec.get("head_dim", 4),
-        num_hidden_layers=spec.get("layers", 3), num_attention_heads=6,
+        num_hidden_layers=spec.get("layers", 3), num_attention_heads=spec.get("heads", 6),
         num_key_value_heads=spec.get("kv", 3), intermediate_size=19, vocab_size=17)
     config.update(rms_norm_eps=1e-6, rope_theta=10000.0, hidden_act="silu")
     config.update(spec.get("config", {}))
@@ -137,7 +137,7 @@ def cases():
         ("max_position", dict(position=1048576)),
         ("reload", dict(scenario="reload")),
         ("reject_empty", dict(tokens=0, reason="invalid Qwen3 prefill request", group_failed=False)),
-        ("reject_tokens", dict(tokens=129, reason="invalid Qwen3 prefill request", group_failed=False)),
+        ("reject_tokens", dict(tokens=2049, reason="invalid Qwen3 prefill request", group_failed=False)),
         ("reject_position", dict(position=1048577, reason="invalid Qwen3 prefill request", group_failed=False)),
         ("reject_id", dict(bad_id=True, reason="token ID outside vocabulary", group_failed=True)),
         ("reject_activation", dict(config=dict(hidden_act="gelu"), reason="unsupported Qwen3 forward configuration", group_failed=True)),
@@ -153,18 +153,27 @@ def main():
     parser.add_argument("--devices", default="0,1")
     parser.add_argument("--build-cache", type=Path, required=True)
     parser.add_argument("--model", type=Path, help="可选真实模型目录；仅验证单卡/双卡一致性，无独立 HF 基准")
+    parser.add_argument("--long-context", action="store_true", help="小模型长Prefill边界与CPU数学对照")
     parser.add_argument("--output", type=Path, default=ROOT / "test/distributed/results")
     args = parser.parse_args()
+    if args.long_context and args.model:
+        parser.error('--long-context uses generated fixtures with an independent CPU reference')
     devices = [int(part) for part in args.devices.split(",")]
     if len(devices) != 2 or len(set(devices)) != 2 or min(devices) < 0:
         parser.error("requires exactly two distinct logical GPUs")
     output = args.output.resolve() / (datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "_prefill_" + uuid.uuid4().hex[:8])
     output.mkdir(parents=True)
     selected = [("real_model", {})] if args.model else cases()
+    if args.long_context:
+        small = dict(layers=1, hidden=4, head_dim=2, heads=2, kv=1)
+        selected = [(f'length_{n}', dict(small, tokens=n)) for n in (127, 128, 129, 512, 1024, 2047, 2048)]
+        selected += [(f'length129_{dtype}_bias', dict(small, tokens=129, dtype=dtype, bias=True)) for dtype in ('BF16', 'F32')]
+        selected += [('reject_2049', dict(small, tokens=2049, reason='invalid Qwen3 prefill request', group_failed=False))]
     atol, rtol = (0.05, 0.01) if args.model else (0.008, 0.008)
     metadata = dict(command=shlex.join([sys.executable, *sys.argv]), git=capture(["git", "rev-parse", "HEAD"]),
         git_status=capture(["git", "status", "--short"]), seed=0, warmup=0, iterations=1, repeats=1,
         gpu=capture(["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv,noheader"]),
+        cuda=capture(['nvcc', '--version']),
         cuda_visible_devices=os.environ.get("CUDA_VISIBLE_DEVICES"), devices=devices, atol=atol, rtol=rtol,
         model=str(args.model.resolve()) if args.model else "generated", kv_cache="none", prefix_cache=False,
         execution="eager", output_tokens=0, sampling="none", eos="no stopping", logits="last input token, full vocabulary",
@@ -177,6 +186,7 @@ def main():
         metadata["compile_architecture"] = [line for line in metadata["build_cache"].splitlines()
             if line.startswith(("CUDA_ARCH:", "CMAKE_CUDA_ARCHITECTURES:"))]
         for name, spec in selected:
+            print('RUN: ' + name, flush=True)
             directory = output / name
             directory.mkdir()
             metrics = dict(max=0.0, sum=0.0, count=0, failed=0)

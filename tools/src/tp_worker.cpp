@@ -1,3 +1,4 @@
+#include "distributed/qwen3_limits.h"
 #include "distributed/process_protocol.h"
 
 #include <algorithm>
@@ -262,7 +263,7 @@ struct DeviceRuntime {
         const bool decode = kind == Kind::DecodeQwen3, begin = kind == Kind::BeginQwen3Request;
         const size_t header = begin ? 12 : 8;
         const bool valid = decode ? payload.size() == 8 :
-            (payload.size() >= header + 4 && payload.size() <= header + 128 * 4 && (payload.size() - header) % 4 == 0);
+            (payload.size() >= header + 4 && payload.size() <= header + fastllm::distributed::kQwen3MaxPromptTokens * 4 && (payload.size() - header) % 4 == 0);
         if (controlOnly || !valid || !Get32(payload, 4) || Get32(payload, 4) > INT_MAX) {
             throw std::runtime_error("invalid Qwen3 prefill payload/state");
         }

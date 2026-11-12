@@ -129,7 +129,7 @@ def main():
               ("large_position", dict(position=65536)),
               ("max_position", dict(position=1048576)),
               ("reject_zero_tokens", dict(tokens=0, reason="invalid Qwen3 layer request", group_failed=False)),
-              ("reject_tokens", dict(tokens=129, reason="invalid Qwen3 layer request", group_failed=False)),
+              ("reject_tokens", dict(tokens=2049, reason="invalid Qwen3 layer request", group_failed=False)),
               ("reject_position", dict(position=1048577, reason="invalid Qwen3 layer request", group_failed=False)),
               ("reject_stage", dict(bad_stage=True, reason="invalid Qwen3 layer request", group_failed=False)),
               ("reject_odd_head_dim", dict(head_dim=3, reason="invalid/unsupported Qwen3 layer", group_failed=True)),

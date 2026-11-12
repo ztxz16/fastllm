@@ -147,7 +147,7 @@ public:
      * 内部 FP16 激活、FP32 GEMM 累加及 NCCL SUM，结果转回 FP32 仅用于控制面传输。
      * Full 执行 Attention+残差和 MLP+残差；另外两个阶段复用相同生产算子。
      * @param layer 从零开始的层号。
-     * @param tokens 输入 token 数，范围 1..128。
+     * @param tokens 输入 token 数，范围 1..2048。
      * @param hidden 隐藏维度，必须匹配模型。
      * @param positionBegin 连续 RoPE 位置起点，最大 1048576，不表示已有 KV。
      * @param stage 执行阶段。
@@ -164,7 +164,7 @@ public:
      *
      * Embedding、全部 Decoder 层、最终 RMSNorm 和分片 lm_head 均在 worker GPU 执行。
      * 激活保持 FP16，末层投影输出 FP32；不建立 KV cache、不采样、不返回所有 token。
-     * @param tokenIds 单请求 token ID，长度 1..128；每个 ID 必须小于模型词表大小。
+     * @param tokenIds 单请求 token ID，长度 1..2048；每个 ID 必须小于模型词表大小。
      * @param positionBegin 连续位置起点，范围 0..1048576，不表示已有 KV。
      * @param timeoutMs 包括通信与读回的整组截止时间，必须为正。
      * @return 按全局词表顺序排列的有限 FP32 logits；分片不连续或 worker 出错终止整组。
@@ -178,7 +178,7 @@ public:
      * 可选跨请求前缀快照，复制命中 KV 后仅计算后缀；至少重算末 token 以取得 logits。
      * 无分页或并发调度；请求结束必须调用 EndQwen3Request，卸载也会释放。
      * 每 rank KV 上限 256 MiB，独立于临时工作区；任一 worker 失败终止整组。
-     * @param tokenIds Prompt ID，长度 1..128，不能超过 capacity。
+     * @param tokenIds Prompt ID，长度 1..2048，不能超过 capacity。
      * @param capacity Prompt 加后续输入 token 的总容量，范围 1..2048。
      * @param positionBegin RoPE 起点，整个容量的位置必须不超过 1048576。
      * @param timeoutMs 整组截止时间，必须为正。

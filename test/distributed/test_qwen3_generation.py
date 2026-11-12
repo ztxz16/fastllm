@@ -77,7 +77,7 @@ class GenerationTests(unittest.TestCase):
         self.assertTrue(self.tokenizer.apply_chat_template.call_args.kwargs["enable_thinking"])
 
     def test_limits_not_silently_truncated(self):
-        for change in (dict(token_ids=[]), dict(token_ids=[1]*129), dict(token_ids=[17]),
+        for change in (dict(token_ids=[]), dict(token_ids=[1]*2049), dict(token_ids=[17]),
                        dict(max_new_tokens=0), dict(max_new_tokens=2048), dict(seed=-1),
                        dict(top_k=True), dict(top_p=0), dict(top_p=float("nan")),
                        dict(temperature=float("inf")), dict(temperature=-1), dict(eos_token_ids=[-1])):
@@ -85,6 +85,10 @@ class GenerationTests(unittest.TestCase):
                 validate_request(dict(self.request, **change), 17)
         validate_request(dict(self.request, token_ids=[1], max_new_tokens=2048), 17)
         validate_request(dict(self.request, token_ids=[1]*128, max_new_tokens=1), 17)
+        for count in (127, 129, 512, 1024, 2047, 2048):
+            validate_request(dict(self.request, token_ids=[1]*count, max_new_tokens=2049-count), 17)
+            with self.assertRaises(ValueError):
+                validate_request(dict(self.request, token_ids=[1]*count, max_new_tokens=2050-count), 17)
 
     def test_non_qwen3_rejected(self):
         (self.model / "config.json").write_text(json.dumps(dict(model_type="qwen3_moe")))

@@ -55,6 +55,14 @@ def make_tasks(kind='normal'):
         request('valid-prefix', [1,4,7], decode_steps=1)
         tasks.append(dict(name='invalid-suffix', op='begin', token_ids=[1,4,17], position_begin=0, capacity=3))
         return tasks
+    if kind == 'long':
+        request('long-cold', [1]*512, decode_steps=2)
+        request('long-hit', [1]*512, decode_steps=2)
+        request('long-max', [2]*2048)
+        request('long-max-hit', [2]*2048)
+        tasks.append(dict(name='long-clear', op='clear_prefix'))
+        request('long-after-clear', [1]*129)
+        return tasks
 
     a = [1, 4, 7, 9]
     request('cold', a, decode_steps=2)
@@ -139,11 +147,14 @@ def main():
     for name in ('check', 'worker', 'build-cache'):
         parser.add_argument('--'+name, type=Path, required=True)
     parser.add_argument('--model', type=Path)
+    parser.add_argument('--long-context', action='store_true')
     parser.add_argument('--devices', default='0,1')
     parser.add_argument('--cuda-graph', action='store_true')
     parser.add_argument('--custom-allreduce', action='store_true')
     parser.add_argument('--output', type=Path, default=ROOT/'test/distributed/results')
     args = parser.parse_args()
+    if args.long_context and args.model:
+        parser.error('--long-context uses generated models for independent CPU verification')
     devices = [int(v) for v in args.devices.split(',')]
     if len(devices) != 2 or len(set(devices)) != 2 or min(devices) < 0:
         parser.error('requires two distinct GPUs')
@@ -155,6 +166,8 @@ def main():
         ('oversize', dict(hidden=4, layers=257, head_dim=256, kv=2, kind='oversize', gpu_reference=True)),
         ('wide', dict(hidden=1024, layers=1, kind='wide', gpu_reference=True)),
         ('bad_suffix', dict(kind='bad_suffix'))]
+    if args.long_context:
+        specs = [('long_prefix', dict(kind='long', layers=1, hidden=4, head_dim=2, heads=2, kv=1))]
     metadata = dict(command=shlex.join([sys.executable, *sys.argv]), git=capture(['git', 'rev-parse', 'HEAD']),
         git_status=capture(['git', 'status', '--short']), seed=0, warmup=0, iterations=1, repeats=1,
         gpu=capture(['nvidia-smi', '--query-gpu=name,driver_version', '--format=csv,noheader']),
@@ -168,6 +181,7 @@ def main():
         metadata['build_cache'] = args.build_cache.read_text()
         metadata['compile_architecture'] = [s for s in metadata['build_cache'].splitlines() if s.startswith(('CUDA_ARCH:', 'CMAKE_CUDA_ARCHITECTURES:'))]
         for name, spec in specs:
+            print('RUN: ' + name, flush=True)
             directory = output / name
             directory.mkdir()
             row = dict(case=name, status='FAIL', reason='', backend='qwen3_process/prefix/'+metadata['execution'],
