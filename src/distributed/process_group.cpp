@@ -34,14 +34,73 @@ namespace {
 constexpr uint32_t kMagic = 0x46545031;
 
 /**
- * 在共同截止时间内传输完整帧片段，拒绝 EOF 和超时。
+ * 报告实际退出的 worker，并尽力保留 socket 中已经完整到达的错误回复。
+ *
+ * 只窥读当前事务的完整错误帧，不等待补齐消息、不消费数据，也不回收进程。
+ * 错误消息尚未发完或不属于当前事务时，仅报告退出 rank。
+ * @param worker 已由 pidfd 确认退出的 worker。
+ * @param context 受进程组互斥锁保护的本次事务。
+ */
+[[noreturn]] void ThrowWorkerExited(const WorkerWatch &worker, const WaitContext &context) {
+    std::string reason = "rank " + std::to_string(worker.rank) + " exited during process TP control";
+    std::vector<uint8_t> header(32);
+    ssize_t count = recv(worker.fd, header.data(), header.size(), MSG_PEEK | MSG_DONTWAIT);
+    if (count == static_cast<ssize_t>(header.size()) && Get32(header, 0) == kMagic &&
+        Get32(header, 4) == kVersion && Get32(header, 8) == static_cast<uint32_t>(Kind::Error) &&
+        Get64(header, 16) == context.session && Get64(header, 24) == context.sequence) {
+        uint32_t length = Get32(header, 12);
+        // 正式 worker 的错误文本上限为 4096 字节；诊断路径不得分配任意大小的帧。
+        if (length <= 4096) {
+            std::vector<uint8_t> frame(32 + length);
+            count = recv(worker.fd, frame.data(), frame.size(), MSG_PEEK | MSG_DONTWAIT);
+            if (count == static_cast<ssize_t>(frame.size())) {
+                reason += "; worker: " + std::string(frame.begin() + 32, frame.end());
+            }
+        }
+    }
+    throw WorkerExited(reason);
+}
+
+/**
+ * 检查退出监听事件；句柄异常和进程退出均终止当前事务。
+ * @param worker 被监听的 worker，不转移其句柄所有权。
+ * @param events poll 返回的事件位。
+ * @return true 表示进程已退出；无退出事件返回 false；无效句柄抛出异常。
+ */
+bool HasExited(const WorkerWatch &worker, short events) {
+    if (events & (POLLERR | POLLNVAL)) {
+        throw WorkerExited("rank " + std::to_string(worker.rank) + " process TP pidfd poll error");
+    }
+    return events & (POLLIN | POLLHUP);
+}
+
+/**
+ * 在共同截止时间内传输完整帧片段，同时响应整组 worker 的退出。
+ *
+ * 持锁借用退出句柄，所有退出异常仍由上层统一清理。当前接收端退出后允许
+ * 读完已经缓冲的数据，以保留错误回复；遇到 EOF 或需要继续等待时立即失败。
  * @param fd 非阻塞 Unix socket。
  * @param bytes 待发送或接收的字节数组。
  * @param size 数组长度，不解释张量或指针。
  * @param sending true 发送，false 接收。
  * @param deadline 整个操作共用的单调时钟截止时间。
+ * @param context 父进程的退出监听集合；worker 收发和正常关闭时传 nullptr。
  */
-void Transfer(int fd, uint8_t *bytes, size_t size, bool sending, Deadline deadline) {
+void Transfer(int fd, uint8_t *bytes, size_t size, bool sending, Deadline deadline,
+              const WaitContext *context) {
+    if (size == 0) {
+        return;
+    }
+    pollfd item{fd, static_cast<short>(sending ? POLLOUT : POLLIN), 0};
+    std::vector<pollfd> items;
+    if (context) {
+        items.reserve(context->workers.size() + 1);
+        items.push_back(item);
+        for (const auto &worker : context->workers) {
+            items.push_back({worker.pidfd, POLLIN, 0});
+        }
+    }
+
     size_t done = 0;
     while (done < size) {
         auto now = Clock::now();
@@ -50,8 +109,7 @@ void Transfer(int fd, uint8_t *bytes, size_t size, bool sending, Deadline deadli
         }
         auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
         int timeout = static_cast<int>(std::min<int64_t>(INT_MAX, std::max<int64_t>(1, remaining)));
-        pollfd item{fd, static_cast<short>(sending ? POLLOUT : POLLIN), 0};
-        int ready = poll(&item, 1, timeout);
+        int ready = poll(context ? items.data() : &item, context ? items.size() : 1, timeout);
         if (ready < 0 && errno == EINTR) {
             continue;
         }
@@ -61,9 +119,30 @@ void Transfer(int fd, uint8_t *bytes, size_t size, bool sending, Deadline deadli
         if (ready == 0) {
             continue;
         }
+
+        const WorkerWatch *exitedReader = nullptr;
+        if (context) {
+            for (size_t i = 0; i < context->workers.size(); ++i) {
+                const auto &worker = context->workers[i];
+                if (HasExited(worker, items[i + 1].revents)) {
+                    if (!sending && worker.fd == fd) {
+                        exitedReader = &worker;
+                    } else {
+                        ThrowWorkerExited(worker, *context);
+                    }
+                }
+            }
+        }
+
         ssize_t count = sending ? send(fd, bytes + done, size - done, MSG_NOSIGNAL | MSG_DONTWAIT)
                                 : recv(fd, bytes + done, size - done, MSG_DONTWAIT);
-        if (count < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
+        if (count < 0 && errno == EINTR) {
+            continue;
+        }
+        if (count <= 0 && exitedReader) {
+            ThrowWorkerExited(*exitedReader, *context);
+        }
+        if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
             continue;
         }
         if (count <= 0) {
@@ -101,7 +180,7 @@ uint64_t Get64(const std::vector<uint8_t> &bytes, size_t offset) {
     return uint64_t(Get32(bytes, offset)) | (uint64_t(Get32(bytes, offset + 4)) << 32);
 }
 
-void Send(int fd, const Message &message, Deadline deadline) {
+void Send(int fd, const Message &message, Deadline deadline, const WaitContext *context) {
     if (message.payload.size() > kMaxPayload) {
         throw std::runtime_error("process TP payload exceeds limit");
     }
@@ -112,14 +191,14 @@ void Send(int fd, const Message &message, Deadline deadline) {
                           static_cast<uint32_t>(message.sequence), static_cast<uint32_t>(message.sequence >> 32)}) {
         Put32(header, value);
     }
-    Transfer(fd, header.data(), header.size(), true, deadline);
+    Transfer(fd, header.data(), header.size(), true, deadline, context);
     // send 不会修改输入；统一传输函数的接收方向需要可写缓冲。
-    Transfer(fd, const_cast<uint8_t*>(message.payload.data()), message.payload.size(), true, deadline);
+    Transfer(fd, const_cast<uint8_t*>(message.payload.data()), message.payload.size(), true, deadline, context);
 }
 
-Message Receive(int fd, Deadline deadline) {
+Message Receive(int fd, Deadline deadline, const WaitContext *context) {
     std::vector<uint8_t> header(32);
-    Transfer(fd, header.data(), header.size(), false, deadline);
+    Transfer(fd, header.data(), header.size(), false, deadline, context);
     if (Get32(header, 0) != kMagic || Get32(header, 4) != kVersion) {
         throw std::runtime_error("process TP protocol magic/version mismatch");
     }
@@ -131,8 +210,32 @@ Message Receive(int fd, Deadline deadline) {
                     Get32(header, 16) | (uint64_t(Get32(header, 20)) << 32),
                     Get32(header, 24) | (uint64_t(Get32(header, 28)) << 32), {}};
     message.payload.resize(length);
-    Transfer(fd, message.payload.data(), message.payload.size(), false, deadline);
+    Transfer(fd, message.payload.data(), message.payload.size(), false, deadline, context);
     return message;
+}
+
+/**
+ * 在事务返回成功前检查已回复的 worker 是否也发生了退出。
+ * @param context 当前事务的退出监听集合；必须在进程组锁保护下调用。
+ */
+void CheckWorkerExits(const WaitContext &context) {
+    std::vector<pollfd> items;
+    items.reserve(context.workers.size());
+    for (const auto &worker : context.workers) {
+        items.push_back({worker.pidfd, POLLIN, 0});
+    }
+    int ready;
+    do {
+        ready = poll(items.data(), items.size(), 0);
+    } while (ready < 0 && errno == EINTR);
+    if (ready < 0) {
+        throw std::runtime_error(std::string("process TP pidfd poll: ") + strerror(errno));
+    }
+    for (size_t i = 0; i < items.size(); ++i) {
+        if (HasExited(context.workers[i], items[i].revents)) {
+            ThrowWorkerExited(context.workers[i], context);
+        }
+    }
 }
 
 std::string ErrorText(const Message &message) {
@@ -266,6 +369,21 @@ struct ProcessGroup::Impl {
     }
 
     /**
+     * 在持锁期间为本次事务借用全组退出句柄，清理前必须结束使用。
+     * @return 包含 rank、socket、pidfd 及当前消息标识的上下文，不拥有句柄。
+     */
+    WaitContext WatchWorkers() const {
+        WaitContext context;
+        context.session = session;
+        context.sequence = sequence;
+        context.workers.reserve(children.size());
+        for (const auto &child : children) {
+            context.workers.push_back({child.info.rank, child.fd, child.pidfd});
+        }
+        return context;
+    }
+
+    /**
      * 向整组发送相同命令并按 rank 收集响应。
      *
      * 先发送全部请求再接收，允许 worker 同时进入 NCCL；整个批次共用截止时间。
@@ -278,9 +396,14 @@ struct ProcessGroup::Impl {
     std::vector<Message> Exchange(Kind kind, Kind reply, const std::vector<uint8_t> &payload,
                                   Deadline deadline) {
         ++sequence;
+        auto context = WatchWorkers();
+        // Shutdown 的 Bye 后退出是预期行为，由 Stop 验证回复并回收。
+        const auto *watch = kind == Kind::Shutdown ? nullptr : &context;
         for (auto &child : children) {
             try {
-                Send(child.fd, {kind, session, sequence, payload}, deadline);
+                Send(child.fd, {kind, session, sequence, payload}, deadline, watch);
+            } catch (const WorkerExited &) {
+                throw;
             } catch (const std::exception &e) {
                 throw std::runtime_error("rank " + std::to_string(child.info.rank) + ": " + e.what());
             }
@@ -288,12 +411,17 @@ struct ProcessGroup::Impl {
         std::vector<Message> results;
         for (auto &child : children) {
             try {
-                auto message = Receive(child.fd, deadline);
+                auto message = Receive(child.fd, deadline, watch);
                 Validate(message, reply, session, sequence);
                 results.push_back(std::move(message));
+            } catch (const WorkerExited &) {
+                throw;
             } catch (const std::exception &e) {
                 throw std::runtime_error("rank " + std::to_string(child.info.rank) + ": " + e.what());
             }
+        }
+        if (watch) {
+            CheckWorkerExits(*watch);
         }
         return results;
     }
@@ -589,9 +717,10 @@ void ProcessGroup::Start(const ProcessGroupOptions &options) {
         for (size_t rank = 0; rank < options.devices.size(); rank++) {
             impl->children.push_back(impl->Spawn(static_cast<int>(rank)));
         }
+        auto startupWatch = impl->WatchWorkers();
         std::set<std::vector<uint8_t>> deviceUuids;
         for (auto &child : impl->children) {
-            auto hello = Receive(child.fd, deadline);
+            auto hello = Receive(child.fd, deadline, &startupWatch);
             Validate(hello, Kind::Hello, impl->session, 0);
             if (hello.payload.size() < 40 || hello.payload.size() > 512 ||
                 Get32(hello.payload, 0) != uint32_t(child.info.rank) ||
@@ -612,8 +741,9 @@ void ProcessGroup::Start(const ProcessGroupOptions &options) {
         std::vector<uint8_t> id;
         if (!options.controlOnly) {
             ++impl->sequence;
-            Send(impl->children[0].fd, {Kind::CreateId, impl->session, impl->sequence, {}}, deadline);
-            auto reply = Receive(impl->children[0].fd, deadline);
+            startupWatch.sequence = impl->sequence;
+            Send(impl->children[0].fd, {Kind::CreateId, impl->session, impl->sequence, {}}, deadline, &startupWatch);
+            auto reply = Receive(impl->children[0].fd, deadline, &startupWatch);
             Validate(reply, Kind::UniqueId, impl->session, impl->sequence);
             id = std::move(reply.payload);
         }
