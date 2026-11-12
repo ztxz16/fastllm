@@ -1488,3 +1488,93 @@ bash test/distributed/diagnose_qwen3_dp_lengths_v100.sh /home/models/Qwen3-1.7B 
 数值边界验收。此模式输出三个独立报告：Python 回归、DP4×TP1、DP2×TP2。后两份报告分别
 必须包含三个并发 case 且每个完成五轮才可整体 PASS；失败时保存已完成样本和失败轮原始响应。
 新实例或尚未完成长Prompt原生产物验收时，应先运行上一节不带该选项的完整流程。
+
+## 固定服务配置与JSONL请求验证（第八步）
+
+固定两套配置供已有四卡 V100 / Qwen3-1.7B 实例使用：
+
+| profile | DP | TP | 建议客户端并发 | 服务端等待队列容量 |
+| --- | --- | --- | --- | --- |
+| dp4_tp1 | 4 | 1 | 4 | 8 |
+| dp2_tp2 | 2 | 2 | 2 | 4 |
+
+两套均使用正式进程后端、FP16 KV、CUDA Graph、轮转路由、关闭 Prefix Cache、开启请求日志，
+TP2 启用自定义 AllReduce，并保留正式路径的 NCCL 使用条件。客户端并发指同一时间在途的请求数，
+由调用方控制；等待队列容量不是服务端全局并发上限，也不会约束其它客户端的在途请求数。
+生产启动器与请求验证器共用 `fastllm_pytools.dp_baseline` 构造的参数，经过正式 CLI、模型工厂
+和 HTTP/SSE 路径，不调用独立的推理实现。
+
+选择依据来自第七步服务器报告 `20261112T133217Z_dp_lengths_728d2163` 和
+`20261112T133613Z_dp_lengths_132f3c35`（服务器 Git `2d89fc35`，各五轮）：
+
+纯 DP 的 C4/C8 吞吐分别为 147.945/144.643 Token/s，排队 P95 为 0.720/1243.060 ms；
+DP+TP 的 C2/C4 吞吐分别为 105.596/112.963 Token/s，排队 P95 为 0.142/1653.806 ms。
+原始全精度 JSON、逐轮样本、XLSX、GPU/CUDA/编译元数据均在上述服务器报告目录；这里仅摘录
+配置选择依据，未复制或重新生成原始报告。纯 DP 两档吞吐基本相当；TP2 的 C2 是优先降低提交后
+响应延迟的取舍。包含客户端等待的整体完成 P95 并未在 C=DP 下全面更低，不能推广为所有负载的
+最优配置。这些记录不是下面通用中文示例的测试结果。
+
+### 先验证请求集
+
+`data/qwen3_requests_example.jsonl` 包含通用中文摘要、信息提取、翻译和多轮问答，共八条请求，
+HTTP/SSE 各四条；没有实际业务数据。sk 合入 master 后，在之前的四卡 UUID 顺序下执行：
+
+```bash
+(
+set -euo pipefail
+cd /home/project/vllm_fastllm
+git switch master
+git pull --ff-only origin master
+export CUDA_VISIBLE_DEVICES="GPU-a88c9669-989e-a8dd-22a0-94a45b467c49,GPU-0310107f-031e-6fcd-eb65-6dfa45981711,GPU-f0a99453-777f-8b16-89a3-bab78019f23d,GPU-081484a6-9730-453b-59a2-32bd75ab6c2c"
+bash test/distributed/run_qwen3_dp_requests_v100.sh /home/models/Qwen3-1.7B
+)
+```
+
+脚本不编译、不安装、不下载。先做 Python 回归，再顺序验证两套 profile；每套测 C1 和建议的
+C=DP，各预热一轮、正式五轮，启动并在结束后关闭本次正式服务。不要与已有占用同一组 GPU
+的推理服务同时运行。每种完整对话及采样参数分别建立同 TP 的 DP1 Token 参考，HTTP/SSE 可
+共享参考；校验输出、文本、usage、路径和退出后的 KV 回收，不评价摘要/翻译等回答质量。
+
+预期输出三个报告目录：Python 回归和两份 `*_dp_requests_*`。后两份必须各完成两个 case 才能
+整体 PASS；请求、采样或清理失败均返回非零并保留部分报告。报告保留 `summary.md/csv/json/xlsx`、
+逐请求和逐输入统计、显存采样、完整响应；新增 `requests.jsonl` 原文及 SHA256、`inputs.json`
+正式 Token ID 和 `reference_texts.json` 单副本回答文本，供人工检查质量。所有输入在整轮开始
+时就绪，沿用固定客户端通道，输入顺序按 seed=0 打乱；包含客户端等待的完成时间只表示该有限
+请求集合的完成情况。吞吐按实际生成 Token 数统计，不固定或忽略 EOS。
+
+### 替换JSONL
+
+第二个位置参数可指定自己的脱敏请求文件，例如：
+
+```bash
+bash test/distributed/run_qwen3_dp_requests_v100.sh /home/models/Qwen3-1.7B /home/requests/my_requests.jsonl
+```
+
+每行一个对象，外层只允许 `name` 和 `request`：
+
+```json
+{"name":"summary_01","request":{"messages":[{"role":"user","content":"请用一句话总结这段文字：……"}],"max_tokens":96,"stream":true}}
+```
+
+`name` 必须唯一，且为 1..64 位字母、数字、下划线或连字符；`request` 使用正式聊天请求字段。
+默认 `model=qwen3`、`max_tokens=96`、`stream=false`；本轮一致性验证固定 greedy：temperature=0、
+top_k=0、top_p=1、seed=0。SSE 默认补充 `stream_options.include_usage=true`，明确指定 false
+会被拒绝。支持正式服务已有的 system/user/assistant 文本多轮语义，未知字段、工具、多模态、
+不支持的采样设置、重名或空文件均失败。完整聊天模板后的输入和生成容量仍受 2048 Token 上限
+约束，不截断、不重复请求来凑负载。两套 profile 一起验证至少需要四条请求。
+
+### 常驻服务
+
+两套配置各使用四张 GPU，应择一运行。确认上述请求验证通过后，可在设置好同样 UUID 顺序的
+终端中启动纯 DP：
+
+```bash
+bash tools/run_qwen3_dp_baseline_v100.sh /home/models/Qwen3-1.7B dp4_tp1 --port 8080
+```
+
+DP+TP 则将 profile 改为 `dp2_tp2`。启动器默认监听 127.0.0.1，输出 ready JSON 后服务可用；
+模型 API 名称为 `qwen3`，聊天路径为 `/v1/chat/completions`，健康检查为 `/health`。
+使用已有 SSH 8080 端口转发即可从本机连接。Ctrl+C 或 SIGTERM 走正式有界停服路径，取消请求
+并回收 worker；常驻服务与短时验证脚本的生命周期不同。每次启动生成新的日志子目录。
+追加 `--print-command` 仅打印 profile、建议客户端并发和正式 CLI 命令 JSON，不查询 GPU、
+不加载模型、不启动 worker。进程服务仍只支持当前已实现的稠密 Qwen3 路径。

@@ -25,6 +25,7 @@ from run_qwen3_entrypoint import verify_native
 from run_qwen3_http import call, read_event, verify_stream_error, wait_for
 from run_qwen3_prefill import require
 from fastllm_pytools import cli
+from fastllm_pytools.dp_baseline import server_flags
 from fastllm_pytools.qwen3_process_chat import prepare_request
 from fastllm_pytools.qwen3_process_session import BACKEND, EMPTY
 from fastllm_pytools.tp_graph import validate_graph, validate_allreduce, validate_prefix
@@ -137,10 +138,14 @@ class ServiceRun:
 
     def start(self):
         """/** 使用端口0避免冲突，从正式ready文件取得监听地址并核对工厂/副本。 */"""
-        flags = self.flags + ['--dp', str(self.args.dp), '--dp-routing', self.args.routing,
-                             '--tp-output', str(self.output / 'server'), '--host', '127.0.0.1', '--port', '0',
-                             '--model_name', 'qwen3', '--tp-queue-size', str(2*self.args.dp),
-                             '--tp-request-timeout', str(self.args.timeout)]
+        if getattr(self.args, 'profile', None):
+            flags = server_flags(self.args.profile, self.args.model, self.args.generate, self.args.worker,
+                                 self.output / 'server', self.args.timeout, port=0)
+        else:
+            flags = self.flags + ['--dp', str(self.args.dp), '--dp-routing', self.args.routing,
+                                 '--tp-output', str(self.output / 'server'), '--host', '127.0.0.1', '--port', '0',
+                                 '--model_name', 'qwen3', '--tp-queue-size', str(2*self.args.dp),
+                                 '--tp-request-timeout', str(self.args.timeout)]
         (self.output / 'server.command.txt').write_text(shlex.join([sys.executable, '-m', 'fastllm_pytools.cli', 'serve', *flags]))
         self.process = multiprocessing.get_context('fork').Process(target=launch_cli, args=(flags, self.output))
         self.process.start()

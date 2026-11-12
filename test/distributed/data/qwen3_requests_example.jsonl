@@ -1,0 +1,8 @@
+{"name":"summary_http","request":{"messages":[{"role":"user","content":"请将以下记录概括成两句话：今天上午，仓库完成120箱商品入库，其中80箱为办公用品，40箱为清洁用品。抽检发现2箱外包装破损，已隔离并通知供应商。其余商品已上架，下午安排盘点。"}],"max_tokens":96}}
+{"name":"summary_sse","request":{"messages":[{"role":"user","content":"请将以下记录概括成两句话：今天上午，仓库完成120箱商品入库，其中80箱为办公用品，40箱为清洁用品。抽检发现2箱外包装破损，已隔离并通知供应商。其余商品已上架，下午安排盘点。"}],"max_tokens":96,"stream":true}}
+{"name":"extract_http","request":{"messages":[{"role":"system","content":"你是信息整理助手，只提取给定文本中明确出现的内容。"},{"role":"user","content":"从这段记录提取姓名、会议日期和地点，输出一个JSON对象：张明约定于2026年11月15日在杭州滨江会议室讨论下一季度采购计划。"}],"max_tokens":64}}
+{"name":"extract_sse","request":{"messages":[{"role":"system","content":"你是信息整理助手，只提取给定文本中明确出现的内容。"},{"role":"user","content":"从这段记录提取姓名、会议日期和地点，输出一个JSON对象：张明约定于2026年11月15日在杭州滨江会议室讨论下一季度采购计划。"}],"max_tokens":64,"stream":true}}
+{"name":"translate_http","request":{"messages":[{"role":"user","content":"请将下面的通知翻译成英文，保持礼貌和简洁：您好，您的订单已经发货，预计三天内送达。如需修改收货地址，请尽快联系我们。"}],"max_tokens":96}}
+{"name":"translate_sse","request":{"messages":[{"role":"user","content":"请将下面的通知翻译成英文，保持礼貌和简洁：您好，您的订单已经发货，预计三天内送达。如需修改收货地址，请尽快联系我们。"}],"max_tokens":96,"stream":true}}
+{"name":"dialogue_http","request":{"messages":[{"role":"user","content":"我要安排一次半天的团队交流活动，一共8人，预算800元。"},{"role":"assistant","content":"可以考虑会议室交流搭配简餐，或者户外散步搭配小组讨论。"},{"role":"user","content":"如果下雨，选室内方案。请给出三条具体安排，并确保总预算不超过800元。"}],"max_tokens":96}}
+{"name":"dialogue_sse","request":{"messages":[{"role":"user","content":"我要安排一次半天的团队交流活动，一共8人，预算800元。"},{"role":"assistant","content":"可以考虑会议室交流搭配简餐，或者户外散步搭配小组讨论。"},{"role":"user","content":"如果下雨，选室内方案。请给出三条具体安排，并确保总预算不超过800元。"}],"max_tokens":96,"stream":true}}
