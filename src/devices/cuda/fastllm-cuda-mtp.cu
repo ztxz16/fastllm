@@ -8,6 +8,8 @@
 #include <cmath>
 #include <cstdint>
 #include <map>
+#include <tuple>
+#include <climits>
 #include <memory>
 #include <random>
 #include <vector>
@@ -204,7 +206,7 @@ __global__ void AcceptKernel(const float *p, const float *logits, const float *l
     for (int i = 0; i <= drafts; ++i) result[offset + i] = -1;
     curandStatePhilox4_32_10_t rng;
     // Keep acceptance uniforms disjoint from both draft and residual Gumbels.
-    curand_init(seed ^ 0xd2b74407b1ce6e93ULL, b, *counter * 16, &rng);
+    curand_init(seed ^ 0xd2b74407b1ce6e93ULL, b, *counter * (((uint64_t)drafts + 15) / 16 * 16), &rng);
     for (int i = 0; i < drafts; ++i) {
         int token = ids[i];
         if (token < 0 || token >= vocab) break;
@@ -406,5 +408,161 @@ bool FastllmCudaMtpRejectionFromProbsBatch(const float *p,
     for (int b = 0; b < batch; ++b)
         for (int i = 0; i <= accepted[b]; ++i)
             if (output[b * (drafts + 1) + i] < 0 || output[b * (drafts + 1) + i] >= vocab) return false;
+    return true;
+}
+
+namespace {
+struct VerifierShape {
+    int device, batch, drafts, vocab;
+    bool operator<(const VerifierShape &o) const {
+        return std::tie(device, batch, drafts, vocab) < std::tie(o.device, o.batch, o.drafts, o.vocab);
+    }
+};
+struct VerifierState {
+    VerifierShape shape;
+    Workspace ws;
+    void *distribution = nullptr;
+    cudaEvent_t done = nullptr;
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t exec = nullptr;
+    float *boundLogits = nullptr;
+    bool pending = false, graphUnavailable = false, descriptorsReady = false;
+    FastllmMtpProposalView *pinnedProposals = nullptr;
+    explicit VerifierState(VerifierShape shape) : shape(shape) {}
+    void ResetGraph() {
+        if (exec) cudaGraphExecDestroy(exec);
+        if (graph) cudaGraphDestroy(graph);
+        exec = nullptr; graph = nullptr; graphUnavailable = false;
+    }
+    ~VerifierState() {
+        int previous; cudaGetDevice(&previous); cudaSetDevice(shape.device);
+        if (pending) cudaEventSynchronize(done);
+        ResetGraph();
+        if (done) cudaEventDestroy(done);
+        cudaFreeHost(pinnedProposals);
+        FastllmCudaMtpDestroyTargetDistribution(distribution);
+        cudaSetDevice(previous);
+    }
+    bool Prepare(const FastllmMtpProposalView *views) {
+        const int blocks = (shape.vocab + Tile - 1) / Tile;
+        const size_t descriptorBytes = size_t(shape.batch) * sizeof(*views);
+        if (!distribution) distribution = FastllmCudaMtpCreateTargetDistribution(
+            shape.batch * (shape.drafts + 1), shape.vocab);
+        if (!distribution || !ws.Prepare(size_t(shape.batch) * blocks,
+                size_t(shape.batch) * (shape.drafts + 2))) return false;
+        if (!done && cudaEventCreateWithFlags(&done, cudaEventDisableTiming) != cudaSuccess) return false;
+        if (!pinnedProposals && cudaMallocHost(&pinnedProposals, descriptorBytes) != cudaSuccess) return false;
+        if (!ws.descriptors && cudaMalloc(&ws.descriptors, descriptorBytes) != cudaSuccess) return false;
+        ws.descriptorCapacity = descriptorBytes;
+        bool changed = !descriptorsReady;
+        if (!changed) for (int b = 0; b < shape.batch; ++b)
+            changed |= views[b].logits != pinnedProposals[b].logits ||
+                views[b].logsumexp != pinnedProposals[b].logsumexp ||
+                views[b].tokens != pinnedProposals[b].tokens;
+        if (changed) {
+            // The resolved request owns this pinned cache; a second host copy
+            // is unnecessary. Publish it only after successful submission.
+            descriptorsReady = false;
+            std::copy_n(views, shape.batch, pinnedProposals);
+            if (cudaMemcpyAsync(ws.descriptors, pinnedProposals, descriptorBytes,
+                    cudaMemcpyHostToDevice, cudaStreamPerThread) != cudaSuccess) return false;
+            descriptorsReady = true;
+        }
+        return true;
+    }
+    bool Run(float *logits) {
+        float *p = nullptr;
+        if (!FastllmCudaMtpNormalizeTargetDistribution(distribution, logits, &p)) return false;
+        const int batch = shape.batch, drafts = shape.drafts, vocab = shape.vocab;
+        const int blocks = (vocab + Tile - 1) / Tile;
+        auto *views = static_cast<const FastllmMtpProposalView *>(ws.descriptors);
+        AcceptKernel<true><<<batch, 32, 0, cudaStreamPerThread>>>(p, nullptr, nullptr, nullptr,
+            ws.results, drafts, vocab, batch, ws.seed, ws.counter, views);
+        ResidualKernel<true><<<dim3(blocks, batch), Threads, 0, cudaStreamPerThread>>>(
+            p, nullptr, nullptr, ws.results, ws.partials, drafts, vocab, batch, blocks, ws.seed, ws.counter, views);
+        FinishResidualKernel<<<batch, Threads, 0, cudaStreamPerThread>>>(
+            ws.partials, ws.results, drafts, batch, blocks, ws.counter);
+        return cudaGetLastError() == cudaSuccess && cudaMemcpyAsync(ws.hostResults,
+            ws.results, size_t(batch) * (drafts + 2) * sizeof(int), cudaMemcpyDeviceToHost,
+            cudaStreamPerThread) == cudaSuccess;
+    }
+};
+struct VerifierPlan {
+    std::map<VerifierShape, std::unique_ptr<VerifierState>> shapes;
+    VerifierState *active = nullptr;
+};
+}
+
+void *FastllmCudaMtpCreateVerifier() { return new VerifierPlan; }
+void FastllmCudaMtpDestroyVerifier(void *plan) { delete static_cast<VerifierPlan *>(plan); }
+
+bool FastllmCudaMtpVerifierEnqueue(void *opaque, float *logits,
+        const FastllmMtpProposalView *proposals, const float *temperatures,
+        const int *topKs, const float *topPs, int batch, int drafts, int vocab, bool useGraph) {
+    if (!opaque || !logits || !proposals || !temperatures || !topKs || !topPs ||
+        batch <= 0 || drafts <= 0 || vocab <= 0 ||
+        uint64_t(batch) * (uint64_t(drafts) + 2) > INT_MAX) return false;
+    auto &plan = *static_cast<VerifierPlan *>(opaque);
+    if (plan.active) return false;
+    for (int b = 0; b < batch; ++b)
+        if (!proposals[b].logits || !proposals[b].logsumexp || !proposals[b].tokens) return false;
+    for (int row = 0; row < batch * (drafts + 1); ++row)
+        if (!std::isfinite(temperatures[row]) || temperatures[row] <= 0 ||
+            !std::isfinite(topPs[row]) || topPs[row] <= 0 || topPs[row] > 1) return false;
+    int device; if (cudaGetDevice(&device) != cudaSuccess) return false;
+    VerifierShape shape{device, batch, drafts, vocab};
+    auto &owned = plan.shapes[shape];
+    if (!owned) owned.reset(new VerifierState(shape));
+    auto &state = *owned;
+    bool changed = false;
+    auto fail = [&] { cudaStreamSynchronize(cudaStreamPerThread); return false; };
+    if (!state.Prepare(proposals) || !FastllmCudaMtpPrepareTargetDistribution(
+            state.distribution, temperatures, topKs, topPs, &changed)) return fail();
+    if (changed) state.ResetGraph();
+    if (state.boundLogits != logits) {
+        if (state.exec && !FastllmCudaMtpRebindTargetDistribution(state.graph, state.exec, logits))
+            state.ResetGraph();
+        state.boundLogits = logits;
+    }
+    if (useGraph && !state.exec && !state.graphUnavailable) {
+        bool captured = cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal) == cudaSuccess;
+        if (captured) {
+            bool ran = state.Run(logits);
+            cudaError_t ended = cudaStreamEndCapture(cudaStreamPerThread, &state.graph);
+            captured = ran && ended == cudaSuccess && state.graph &&
+                cudaGraphInstantiate(&state.exec, state.graph, nullptr, nullptr, 0) == cudaSuccess;
+        }
+        if (!captured) {
+            state.ResetGraph(); state.graphUnavailable = true;
+            cudaGetLastError(); // Failed capture submitted no sampling/RNG work.
+        }
+    }
+    const bool launched = useGraph && state.exec
+        ? cudaGraphLaunch(state.exec, cudaStreamPerThread) == cudaSuccess : state.Run(logits);
+    if (!launched) return fail();
+    if (cudaEventRecord(state.done, cudaStreamPerThread) != cudaSuccess) return fail();
+    state.pending = true; plan.active = &state;
+    return true;
+}
+
+bool FastllmCudaMtpVerifierResolve(void *opaque, int *output, int *accepted) {
+    if (!opaque || !output || !accepted) return false;
+    auto &plan = *static_cast<VerifierPlan *>(opaque);
+    if (!plan.active) return false;
+    auto &state = *plan.active;
+    int previous; cudaGetDevice(&previous);
+    cudaSetDevice(state.shape.device);
+    const cudaError_t completed = cudaEventSynchronize(state.done);
+    cudaSetDevice(previous);
+    if (completed != cudaSuccess) return false;
+    state.pending = false; plan.active = nullptr;
+    const int batch = state.shape.batch, drafts = state.shape.drafts;
+    std::copy_n(state.ws.hostResults, size_t(batch) * (drafts + 1), output);
+    std::copy_n(state.ws.hostResults + size_t(batch) * (drafts + 1), batch, accepted);
+    for (int b = 0; b < batch; ++b) {
+        if (accepted[b] < 0 || accepted[b] > drafts) return false;
+        for (int i = 0; i <= accepted[b]; ++i)
+            if (output[b * (drafts + 1) + i] < 0 || output[b * (drafts + 1) + i] >= state.shape.vocab) return false;
+    }
     return true;
 }

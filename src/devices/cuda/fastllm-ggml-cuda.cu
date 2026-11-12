@@ -32,8 +32,8 @@
 
 #define CUDA_QUANTIZE_BLOCK_SIZE     256
 
-template <typename T, bool Permuted = false, bool Grouped = false>
-static __global__ void quantize_q8_1(const T * __restrict__ x, void * __restrict__ vy, const int64_t kx, const int64_t kx0_padded, int keyHeads = 0, int groups = 0, int headDim = 0, int groupRows = 1) {
+template <typename T, bool Permuted = false, bool Grouped = false, bool Planar = false>
+static __global__ void quantize_q8_1(const T * __restrict__ x, void * __restrict__ vy, const int64_t kx, const int64_t kx0_padded, int keyHeads = 0, int groups = 0, int headDim = 0, int groupRows = 1, void *planar = nullptr) {
     const int64_t ix0 = (int64_t)blockDim.x*blockIdx.x + threadIdx.x;
 
     if (ix0 >= kx0_padded) {
@@ -68,6 +68,24 @@ static __global__ void quantize_q8_1(const T * __restrict__ x, void * __restrict
     const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
 
     y[ib].qs[iqs] = q;
+
+    // One read/reduction prepares both layouts when parallel projections use
+    // different MMVQ families. The packed Q8 representation stays unchanged.
+    if constexpr (Planar) {
+        auto *qs = static_cast<int8_t *>(planar);
+        auto *ds = reinterpret_cast<half2 *>(qs + int64_t(gridDim.y) * kx0_padded);
+        auto *sums = reinterpret_cast<short2 *>(ds + int64_t(gridDim.y) * kx0_padded / QK8_1);
+        qs[i_padded] = q;
+        int partial = q;
+#pragma unroll
+        for (int mask = 8; mask; mask >>= 1)
+            partial += __shfl_xor_sync(0xffffffff, partial, mask);
+        const int hi = __shfl_sync(0xffffffff, partial, 16);
+        if (iqs == 0) {
+            ds[ib] = __floats2half2_rn(d, sum);
+            sums[ib] = make_short2(partial, hi);
+        }
+    }
 
     if (iqs > 0) {
         return;
@@ -1078,7 +1096,7 @@ static void GgufProjectSharedQ8(const block_q8_1 *input, fastllm::Data *const *w
 }
 }
 
-bool FastllmCudaGGUFLinearShared(const fastllm::Data &input,
+static bool GgufSharedInputsValid(const fastllm::Data &input,
         fastllm::Data *const *weights, fastllm::Data *const *outputs, int count) {
     if (count < 2 || !weights || !outputs) return false;
     for (int i = 0; i < count; ++i) {
@@ -1088,6 +1106,12 @@ bool FastllmCudaGGUFLinearShared(const fastllm::Data &input,
             if (j < i && GgufOverlap(*outputs[i], *outputs[j])) return false;
         }
     }
+    return true;
+}
+
+bool FastllmCudaGGUFLinearShared(const fastllm::Data &input,
+        fastllm::Data *const *weights, fastllm::Data *const *outputs, int count) {
+    if (!GgufSharedInputsValid(input, weights, outputs, count)) return false;
     const int columns = input.dims.back(), rows = input.Count(0)/columns;
     if (rows > MMVQ_MAX_BATCH_SIZE)
         return FastllmCudaGGUFMMQShared(input, weights, outputs, count);
@@ -1123,6 +1147,74 @@ bool FastllmCudaGGUFLinearShared(const fastllm::Data &input,
         GgufProjectSharedQ8<half>(q8, weights, outputs, count, rows, columns, stream);
     }
     FastllmCudaFree(q8);
+    return true;
+}
+
+bool FastllmCudaGGUFLinearShared(const fastllm::Data &input,
+        fastllm::Data *const *weights, fastllm::Data *const *outputs, int count,
+        const FastllmCudaGGUFProjectionHooks &hooks) {
+    if (!GgufSharedInputsValid(input, weights, outputs, count)) return false;
+    const int columns = input.dims.back(), rows = input.Count(0) / columns;
+    if (rows > MMVQ_MAX_BATCH_SIZE) {
+        // MMQ bounds scratch by chunking rows and may reorder jobs by layout.
+        // Keep that scheduler and notify consumers once all outputs are ready.
+        if (!FastllmCudaGGUFMMQShared(input, weights, outputs, count)) return false;
+        if (hooks.preparing) hooks.preparing();
+        if (hooks.prepared) hooks.prepared();
+        if (hooks.projected) for (int i = 0; i < count; ++i) hooks.projected(i);
+        return true;
+    }
+    std::vector<bool> planar(count, false);
+    bool needPlanar = false, needPacked = false;
+    for (int i = 0; i < count; ++i) {
+        planar[i] = input.dataType == fastllm::FLOAT16 &&
+            GgufPlanarProjectionShape(weights[i]->ggmlType, rows, columns, weights[i]->dims[0]);
+        needPlanar |= planar[i]; needPacked |= !planar[i];
+    }
+    block_q8_1 *packed = nullptr;
+    void *planes = nullptr;
+    if (needPacked && FastllmCudaTryMalloc(reinterpret_cast<void **>(&packed),
+            size_t(rows) * (columns / QK8_1) * sizeof(block_q8_1)) !=
+            FASTLLM_CUDA_TRY_MALLOC_SUCCESS) return false;
+    if (needPlanar && FastllmCudaTryMalloc(&planes, FastllmGgufPlanarBytes(rows, columns)) !=
+            FASTLLM_CUDA_TRY_MALLOC_SUCCESS) {
+        if (packed) FastllmCudaFree(packed);
+        return false;
+    }
+    if (hooks.preparing) hooks.preparing();
+    const auto stream = cudaStreamPerThread;
+    if (needPlanar && needPacked) {
+        quantize_q8_1<half, false, false, true><<<dim3((columns+255)/256, rows), 256, 0, stream>>>(
+            static_cast<const half *>(input.cudaData), packed, columns, columns, 0, 0, 0, 1, planes);
+    } else if (needPlanar) {
+        FastllmGgufQuantizePlanar(input.cudaData, 1, planes, rows, columns, stream);
+    } else if (input.dataType == fastllm::BFLOAT16) {
+        quantize_row_q8_1_cuda(static_cast<const __nv_bfloat16 *>(input.cudaData), packed,
+            columns, rows, 1, columns, GGML_TYPE_Q8_1, stream);
+    } else {
+        quantize_row_q8_1_cuda(static_cast<const half *>(input.cudaData), packed,
+            columns, rows, 1, columns, GGML_TYPE_Q8_1, stream);
+    }
+    if (hooks.prepared) hooks.prepared();
+    ggml_backend_cuda_context ctx;
+    for (int i = 0; i < count; ++i) {
+        if (planar[i]) {
+            FastllmGgufProjectPlanar(weights[i]->ggmlType, 0, weights[i]->cudaData, nullptr,
+                planes, outputs[i]->cudaData, rows, columns, weights[i]->dims[0], weights[i]->dims[0], stream);
+        } else if (input.dataType == fastllm::BFLOAT16) {
+            ggml_cuda_op_mul_mat_vec_q_impl(ctx, (ggml_type)weights[i]->ggmlType,
+                columns, weights[i]->dims[0], 1, 0, 0, 0, 0,
+                (const char *)weights[i]->cudaData, (const char *)packed,
+                static_cast<__nv_bfloat16 *>(outputs[i]->cudaData), nullptr,
+                0, weights[i]->dims[0], rows, columns, stream);
+        } else {
+            GgufProjectFromQ8<0>(packed, *weights[i], static_cast<half *>(outputs[i]->cudaData), rows, columns, stream);
+        }
+        if (hooks.projected) hooks.projected(i);
+    }
+    // The caller has joined every consumer before shared scratch is recycled.
+    if (packed) FastllmCudaFree(packed);
+    if (planes) FastllmCudaFree(planes);
     return true;
 }
 

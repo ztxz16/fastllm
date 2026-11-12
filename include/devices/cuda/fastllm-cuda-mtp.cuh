@@ -51,3 +51,26 @@ bool FastllmCudaMtpRejectionSamplingLogitsBatch(float *targetLogits,
     const FastllmMtpProposalView *proposals, const float *temperatures,
     const int *topKs, const float *topPs, int *output, int *accepted,
     int batch, int drafts, int vocab);
+
+// Request-owned target sampling, with stable normalization/scratch storage.
+// Enqueue borrows logits/proposals until Resolve and may replay a CUDA graph.
+// Resolve is the only host-result fence. A plan must not have overlapping calls;
+// distinct requests own distinct plans, including across scheduler workers.
+void *FastllmCudaMtpCreateVerifier();
+void FastllmCudaMtpDestroyVerifier(void *plan);
+bool FastllmCudaMtpVerifierEnqueue(void *plan, float *targetLogits,
+    const FastllmMtpProposalView *proposals, const float *temperatures,
+    const int *topKs, const float *topPs, int batch, int drafts, int vocab,
+    bool useGraph);
+bool FastllmCudaMtpVerifierResolve(void *plan, int *output, int *accepted);
+
+// Shared implementation between the normalization and rejection CUDA units.
+void *FastllmCudaMtpCreateTargetDistribution(int rows, int vocab);
+void FastllmCudaMtpDestroyTargetDistribution(void *distribution);
+bool FastllmCudaMtpPrepareTargetDistribution(void *distribution,
+    const float *temperatures, const int *topKs, const float *topPs, bool *changed);
+bool FastllmCudaMtpNormalizeTargetDistribution(void *distribution,
+    float *logits, float **probabilities);
+
+// Retarget only the input-reading normalization nodes; all scratch stays owned.
+bool FastllmCudaMtpRebindTargetDistribution(void *graph, void *exec, float *logits);

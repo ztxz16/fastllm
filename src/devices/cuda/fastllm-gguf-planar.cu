@@ -1,5 +1,6 @@
 #include "fastllm-cuda-gguf-planar.h"
 #include "fastllm-gguf-planar.cuh"
+#include "fastllm-kernel-benchmark.cuh"
 
 namespace fastllm_gguf_planar {
 template <typename Input, bool Permuted>
@@ -39,13 +40,15 @@ void QuantizeInput(const void *input, void *workspace, int tokens, int k, cudaSt
     auto *qs = static_cast<int8_t *>(workspace);
     auto *ds = reinterpret_cast<half2 *>(qs + size_t(tokens) * k);
     auto *sums = reinterpret_cast<short2 *>(ds + size_t(tokens) * (k / 32));
-    const dim3 grid((k + 255) / 256, tokens);
-    if (keyHeads) {
-        Quantize<Input, true><<<grid, 256, 0, stream>>>(static_cast<const Input *>(input), qs, ds, sums, k,
-                                                        keyHeads, groups, headDim);
-    } else {
-        Quantize<Input, false>
-            <<<grid, 256, 0, stream>>>(static_cast<const Input *>(input), qs, ds, sums, k, 0, 0, 0);
+    // Grid-y is a hardware launch limit, not a logical batch limit.
+    for (int64_t first = 0; first < tokens; first += 65535) {
+        const dim3 grid((k + 255) / 256, std::min<int64_t>(tokens-first,65535));
+        const auto *x = static_cast<const Input *>(input)+first*k;
+        auto *q=qs+first*k; auto *d=ds+first*(k/32); auto *s=sums+first*(k/32);
+        if (keyHeads)
+            Quantize<Input,true><<<grid,256,0,stream>>>(x,q,d,s,k,keyHeads,groups,headDim);
+        else
+            Quantize<Input,false><<<grid,256,0,stream>>>(x,q,d,s,k,0,0,0);
     }
 }
 
@@ -164,8 +167,8 @@ void DispatchRows(const void *w, const void *up, const void *workspace, half *y,
     const auto *sums = reinterpret_cast<const short2 *>(ds + size_t(tokens) * (k / 32));
     // Larger verification batches reuse one quantization and process at most
     // eight rows per launch; no padding and no extra activation conversion.
-    for (int first = 0; first < tokens; first += 8) {
-        const int tile = std::min(tokens - first, 8);
+    for (int64_t first = 0; first < tokens; first += 8) {
+        const int tile = std::min<int64_t>(tokens - first, 8);
 #define ROWS(T)                                                                                              \
     case T:                                                                                                  \
         Launch<Type, T, Mode>(w, up, qs + size_t(first) * k, ds + size_t(first) * (k / 32),                  \
@@ -203,8 +206,10 @@ void DispatchMode(int mode, const void *w, const void *up, const void *workspace
 }
 } // namespace fastllm_gguf_planar
 
+#include "fastllm-gguf-planar-tuner.cuh"
+
 size_t FastllmGgufPlanarBytes(int tokens, int columns) {
-    if (tokens < 1 || tokens > 16 || columns < 256 || columns % 256)
+    if (tokens < 1 || columns < 256 || columns % 256)
         return 0;
     return size_t(tokens) * columns + size_t(tokens) * (columns / 32) * (sizeof(half2) + sizeof(short2));
 }
@@ -257,6 +262,11 @@ bool FastllmGgufProjectPlanar(int type, int mode, const void *weight, const void
         (reinterpret_cast<uintptr_t>(workspace) & 15) || outputStride < outputRows || mode < 0 || mode > 3 ||
         (mode == 3 && !upWeight))
         return false;
+    if (mode == 0 && (type == GGML_TYPE_Q4_K || type == GGML_TYPE_IQ4_XS)) {
+        fastllm_gguf_planar::SelectProjection({weight,workspace,static_cast<half *>(output),
+            type,tokens,columns,outputRows,outputStride,static_cast<cudaStream_t>(stream)});
+        return true;
+    }
 #define TYPE(T)                                                                                              \
     case T:                                                                                                  \
         fastllm_gguf_planar::DispatchMode<T>(mode, weight, upWeight, workspace, static_cast<half *>(output), \

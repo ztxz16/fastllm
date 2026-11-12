@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "qwen4-kvmem.cuh"
+#include "causal-conv-decode.cuh"
 
 namespace {
     // FP32 sequence recurrence with independent column tiles and register state.
@@ -807,7 +808,7 @@ namespace {
         activated[index] = Qwen4HyperActivatedValue(input[index], groups);
     }
 
-    template <typename T, int THREADS>
+    template <typename T, int THREADS, bool PARALLEL = false>
     __global__ void Qwen4PLEGateKernel(
             const T *key, const T *query, const T *value,
             float *output, int rows, int groups, int groupChannels) {
@@ -822,15 +823,28 @@ namespace {
                               (uint64_t)group * groupChannels;
 
         __shared__ float probability;
-        if (threadIdx.x == 0) {
-            // This score feeds MoE routing after PLE. Even a few ULPs from a
-            // parallel reduction can change an expert tie and amplify across
-            // later layers, so preserve the reference's left-to-right sum.
-            float dot = 0.0f;
-            for (int channel = 0; channel < groupChannels; channel++) {
-                dot += Qwen4CudaToFloat(key[base + channel]) *
-                       Qwen4CudaToFloat(query[base + channel]);
+        float dot = 0.0f;
+        if constexpr (PARALLEL) {
+            for (int channel = threadIdx.x; channel < groupChannels; channel += THREADS)
+                dot += Qwen4CudaToFloat(key[base + channel]) * Qwen4CudaToFloat(query[base + channel]);
+            for (int shift = 16; shift; shift >>= 1)
+                dot += __shfl_down_sync(0xffffffffu, dot, shift);
+            __shared__ float sums[THREADS / 32];
+            const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+            if (!lane) sums[warp] = dot;
+            __syncthreads();
+            if (!warp) {
+                dot = lane < THREADS / 32 ? sums[lane] : 0.0f;
+                for (int shift = 16; shift; shift >>= 1)
+                    dot += __shfl_down_sync(0xffffffffu, dot, shift);
             }
+        } else if (threadIdx.x == 0) {
+            // The original left-to-right reduction remains selectable when
+            // exact legacy routing/rounding is required.
+            for (int channel = 0; channel < groupChannels; ++channel)
+                dot += Qwen4CudaToFloat(key[base + channel]) * Qwen4CudaToFloat(query[base + channel]);
+        }
+        if (threadIdx.x == 0) {
             // Match RunPLE's host expression exactly.  rsqrtf differs by one
             // ULP on this model and that is enough to perturb a later MoE tie.
             const float inverseSqrt = 1.0f / sqrtf((float)groupChannels);
@@ -1185,18 +1199,20 @@ namespace {
         }
     }
 
+    template<bool OUT_OF_PLACE_STATE>
     __global__ void CausalDepthwiseConv1DDecodeKernel(
             const void *input, int inputType, const float *weight,
             float *state, float *output, int total, int channels,
-            int kernel, bool silu) {
+            int kernel, bool silu, float *nextState) {
         const int item = blockIdx.x * blockDim.x + threadIdx.x;
         if (item >= total) {
             return;
         }
         const int channel = item % channels;
-        float *stateRow = state + (uint64_t)item * kernel;
+        const float *previous = state + (uint64_t)item * kernel;
+        float *stateRow = (OUT_OF_PLACE_STATE ? nextState : state) + (uint64_t)item * kernel;
         for (int tap = 0; tap + 1 < kernel; tap++) {
-            stateRow[tap] = stateRow[tap + 1];
+            stateRow[tap] = previous[tap + 1];
         }
         stateRow[kernel - 1] =
             Qwen4CudaLoadActivation(input, inputType, item);
@@ -1371,7 +1387,21 @@ namespace {
     static_assert(sizeof(Qwen4LinearReplayPointers) == 12 * sizeof(void*),
                   "Qwen4 replay pointer table must not contain padding");
 
-    template <typename T, bool OUT_OF_PLACE_STATE, bool FUSE_OUTPUT = false>
+    struct Qwen4GdnDecodePointers {
+        const float *qkv;
+        const half *alpha, *beta, *gate;
+        float *state, *nextState;
+        half *output;
+    };
+    struct Qwen4GdnDecodeBatch {
+        // A launch argument tile, not a limit on requests. Fits the 4 KiB
+        // parameter space on older CUDA devices without device allocations.
+        static constexpr int CAPACITY = 32;
+        Qwen4GdnDecodePointers requests[CAPACITY];
+    };
+    struct Qwen4NoGdnDecodeBatch {};
+
+    template <typename T, bool OUT_OF_PLACE_STATE, bool FUSE_OUTPUT = false, bool BATCHED = false>
     __global__ __launch_bounds__(128) void Qwen4GatedDeltaRuleDecodeKernel(
             const float *qkv, const T *alpha, const T *beta,
             const float *aLog, const float *dtBias, float *state,
@@ -1379,7 +1409,16 @@ namespace {
             int keyHeads, int valueHeads,
             int sequence, float recurrentEps, float inverseHead,
             const float *normWeight = nullptr, const half *outputGate = nullptr,
-            float outputNormEps = 0.0f, bool tiledOutput = false) {
+            float outputNormEps = 0.0f, bool tiledOutput = false,
+            typename std::conditional<BATCHED, Qwen4GdnDecodeBatch, Qwen4NoGdnDecodeBatch>::type requests = {}) {
+        if constexpr (BATCHED) {
+            static_assert(FUSE_OUTPUT && std::is_same<T,half>::value);
+            const auto &request = requests.requests[blockIdx.y];
+            qkv = request.qkv; alpha = request.alpha; beta = request.beta;
+            state = request.state; stateOutput = request.nextState;
+            output = reinterpret_cast<float *>(request.output);
+            outputGate = request.gate;
+        }
         constexpr int KEY_DIM = 128;
         constexpr int VALUE_DIM = 128;
         const int item = blockIdx.x;
@@ -1523,6 +1562,8 @@ namespace {
         }
     }
 
+    #include "strata-gdn.cuh"
+
     struct Qwen4LinearReplaySequenceBatch {
         static constexpr int MAX_LAYERS = 32;
         Qwen4LinearReplayPointers layers[MAX_LAYERS];
@@ -1534,7 +1575,7 @@ namespace {
     // K reduction order.  Four independent blocks per value head expose the
     // same 128 lanes to four times as many SMs while caching each state tile
     // across all speculative tokens.
-    template <typename T, bool OUT_OF_PLACE_STATE, bool BATCHED_REPLAY = false>
+    template <typename T, bool OUT_OF_PLACE_STATE, bool BATCHED_REPLAY = false, bool CAPTURE_UPDATES = false>
     __global__ __launch_bounds__(32)
     void Qwen4GatedDeltaRuleSequenceValueTileKernel(
             const float *qkv, const T *alpha, const T *beta,
@@ -1544,7 +1585,7 @@ namespace {
             int sequence, float recurrentEps, float inverseHead,
             typename std::conditional<BATCHED_REPLAY,
                 Qwen4LinearReplaySequenceBatch, Qwen4NoLinearReplayBatch>::type
-                layers = {}) {
+                layers = {}, float *updates = nullptr) {
         static_assert(!BATCHED_REPLAY || !OUT_OF_PLACE_STATE);
         if constexpr (BATCHED_REPLAY) {
             const auto &layer = layers.layers[blockIdx.y];
@@ -1669,6 +1710,15 @@ namespace {
             }
             const float delta =
                 (value[valueChannel] - memory) * gateValues[0];
+            if constexpr (CAPTURE_UPDATES) {
+                float *record = updates + (row * valueHeads + valueHead) * (KEY_DIM + VALUE_DIM + 1);
+                record[KEY_DIM + valueChannel] = delta;
+                if (tile == 0) {
+                    for (int channel = lane; channel < KEY_DIM; channel += 32)
+                        record[channel] = keyNorm[channel];
+                    if (lane == 0) record[KEY_DIM + VALUE_DIM] = gateValues[1];
+                }
+            }
             float core = 0.0f;
 #pragma unroll
             for (int keyChannel = 0; keyChannel < KEY_DIM; keyChannel++) {
@@ -2241,28 +2291,11 @@ namespace {
     // compaction. Each warp owns a contiguous block range and reads adjacent
     // scores in each iteration. cachedItems == 0 handles arbitrary row sizes.
     template <int cachedItems, int threads = 256>
-    __global__ __launch_bounds__(threads) void Qwen4QSARadixSelectKernel(
-            const float *scores, int32_t *selectedBlocks,
-            int rows, int blocks, int selectedK,
-            int queryStart, int compressRatio,
-            const int32_t *decodeMeta) {
-        const int rowIndex = blockIdx.x;
-        if (rowIndex >= rows) {
-            return;
-        }
+    __device__ __forceinline__ void Qwen4QSARadixSelectRow(
+            const float *row, int32_t *output, int rowBlocks, int selectedK) {
         constexpr int warps = threads / 32;
         const int lane = threadIdx.x % 32;
         const int warp = threadIdx.x / 32;
-        const float *row = scores + (uint64_t)rowIndex * blocks;
-        int32_t *output = selectedBlocks +
-                          (uint64_t)rowIndex * selectedK;
-        const int dynamicQueryStart =
-            queryStart == -2 && decodeMeta != nullptr
-                ? decodeMeta[0] : queryStart;
-        const int rowBlocks = dynamicQueryStart >= 0
-            ? (dynamicQueryStart + rowIndex + 1) / compressRatio
-            : (decodeMeta == nullptr
-                ? blocks : (decodeMeta[0] + 1) / compressRatio);
         if (rowBlocks <= selectedK) {
             for (int block = threadIdx.x; block < selectedK;
                  block += blockDim.x) {
@@ -2404,6 +2437,29 @@ namespace {
             outputOffset += __popc(chosenMask);
             pivotRemaining -= min(pivotRemaining, (uint32_t)__popc(equalMask));
         }
+    }
+
+    template <int cachedItems, int threads = 256>
+    __global__ __launch_bounds__(threads) void Qwen4QSARadixSelectKernel(
+            const float *scores, int32_t *selectedBlocks,
+            int rows, int blocks, int selectedK,
+            int queryStart, int compressRatio,
+            const int32_t *decodeMeta) {
+        const int rowIndex = blockIdx.x;
+        if (rowIndex >= rows) {
+            return;
+        }
+        const float *row = scores + (uint64_t)rowIndex * blocks;
+        int32_t *output = selectedBlocks +
+                          (uint64_t)rowIndex * selectedK;
+        const int dynamicQueryStart =
+            queryStart == -2 && decodeMeta != nullptr
+                ? decodeMeta[0] : queryStart;
+        const int rowBlocks = dynamicQueryStart >= 0
+            ? (dynamicQueryStart + rowIndex + 1) / compressRatio
+            : (decodeMeta == nullptr
+                ? blocks : (decodeMeta[0] + 1) / compressRatio);
+        Qwen4QSARadixSelectRow<cachedItems, threads>(row, output, rowBlocks, selectedK);
     }
 
     __global__ void Qwen4QSAExpandIndicesKernel(
@@ -3151,6 +3207,37 @@ bool FastllmCudaQwen4GroupedRMSNorm(
     return cudaGetLastError() == cudaSuccess;
 }
 
+namespace {
+struct PLEGateCase {
+    const fastllm::Data *key, *query, *value;
+    fastllm::Data *output;
+    int rows, groups, width;
+};
+const fastllm::kernels::Family pleGateFamily{10, "qwen4.ple_gate", "2", {
+    {"cuda.ple_gate.serial", json11::Json::object{{"backend","cuda"},{"reduction","reference left-to-right"},{"rows","arbitrary"}}},
+    {"cuda.ple_gate.block256", json11::Json::object{{"backend","cuda"},{"reduction","parallel FP32 block/warp"},{"rows","arbitrary"},{"architecture","portable CUDA, no tensor cores"}}}
+}};
+const bool pleGateRegistered = [] { fastllm::kernels::Register(&pleGateFamily); return true; }();
+bool RunPLEGate(void *opaque, int implementation) {
+    const auto &c = *static_cast<PLEGateCase *>(opaque);
+    auto launch = [&](auto scalar) {
+        using T = decltype(scalar);
+        if (implementation == 1)
+            Qwen4PLEGateKernel<T, 256, true><<<c.rows*c.groups,256,0,cudaStreamPerThread>>>(
+                (const T*)c.key->cudaData,(const T*)c.query->cudaData,(const T*)c.value->cudaData,
+                (float*)c.output->cudaData,c.rows,c.groups,c.width);
+        else
+            Qwen4PLEGateKernel<T, 512, false><<<c.rows*c.groups,512,0,cudaStreamPerThread>>>(
+                (const T*)c.key->cudaData,(const T*)c.query->cudaData,(const T*)c.value->cudaData,
+                (float*)c.output->cudaData,c.rows,c.groups,c.width);
+    };
+    if (c.key->dataType == fastllm::FLOAT32) launch(float{});
+    else if (c.key->dataType == fastllm::FLOAT16) launch(half{});
+    else launch(__nv_bfloat16{});
+    return cudaPeekAtLastError() == cudaSuccess;
+}
+}
+
 bool FastllmCudaQwen4PLEGate(
         const fastllm::Data &key, const fastllm::Data &query,
         const fastllm::Data &value, fastllm::Data &output, int groups) {
@@ -3173,28 +3260,16 @@ bool FastllmCudaQwen4PLEGate(
         output.dims != key.dims) {
         return false;
     }
-    constexpr int threads = 512;
-    const int blocks = rows * groups;
-    if (key.dataType == fastllm::DataType::FLOAT32) {
-        Qwen4PLEGateKernel<float, threads><<<
-            blocks, threads, 0, cudaStreamPerThread>>>(
-            (const float*)key.cudaData, (const float*)query.cudaData,
-            (const float*)value.cudaData, (float*)output.cudaData,
-            rows, groups, groupChannels);
-    } else if (key.dataType == fastllm::DataType::FLOAT16) {
-        Qwen4PLEGateKernel<half, threads><<<
-            blocks, threads, 0, cudaStreamPerThread>>>(
-            (const half*)key.cudaData, (const half*)query.cudaData,
-            (const half*)value.cudaData, (float*)output.cudaData,
-            rows, groups, groupChannels);
-    } else {
-        Qwen4PLEGateKernel<__nv_bfloat16, threads><<<
-            blocks, threads, 0, cudaStreamPerThread>>>(
-            (const __nv_bfloat16*)key.cudaData,
-            (const __nv_bfloat16*)query.cudaData,
-            (const __nv_bfloat16*)value.cudaData,
-            (float*)output.cudaData, rows, groups, groupChannels);
+    PLEGateCase operation{&key, &query, &value, &output, rows, groups, groupChannels};
+    int selected = 1;
+    if (fastllm::kernels::Enabled()) {
+        fastllm::kernels::Signature signature{{10, FastllmCudaRuntimeArch(), FastllmCudaGetDevice(),
+            rows, groups, groupChannels, int(key.dataType)}};
+        fastllm::kernels::CudaOutputsCase benchmark{{&operation, RunPLEGate, [](void *, int) { return std::string{}; }, nullptr, 0, false},
+            {{output.cudaData, output.Count(0), fastllm::FLOAT32}}};
+        selected = fastllm::kernels::SelectCudaOutputs(pleGateFamily, signature, benchmark, 1);
     }
+    if (!RunPLEGate(&operation, selected < 0 ? 0 : selected)) return false;
     DeviceSync();
     return cudaGetLastError() == cudaSuccess;
 }
@@ -4123,12 +4198,12 @@ static bool Qwen4AttentionCudaData(const fastllm::Data &data, int device,
 
 static void Qwen4AttentionAllocate(fastllm::Data &data,
                                    const fastllm::Data &reference,
-                                   const std::vector<int> &shape) {
+                                   const std::vector<int> &shape, bool initialize = true) {
     data.dataType = reference.dataType;
     data.UpdateUnitSize();
     data.Resize(shape);
     data.ToDevice(fastllm::DataDevice::CUDA, reference.dataDeviceIds, false);
-    data.Allocate();
+    data.Allocate(initialize);
 }
 
 bool FastllmCudaQwen4AttentionPrepare(
@@ -4211,7 +4286,8 @@ bool FastllmCudaQwen4AttentionOutput(
         context.strides[2] != 1 || context.strides[1] != (uint64_t)context.dims[2] ||
         context.strides[0] < (uint64_t)context.dims[1] * context.dims[2] ||
         &output == &context || &output == &gate) return false;
-    Qwen4AttentionAllocate(output, gate, gate.dims);
+    // The gate kernel writes every element, including every row on replay.
+    Qwen4AttentionAllocate(output, gate, gate.dims, false);
     const uint64_t count = gate.Count(0);
     const int blocks = std::min<uint64_t>(65535, (count + 255) / 256);
     auto launch = [&](auto scalar) {
@@ -4658,6 +4734,103 @@ bool FastllmCudaQwen4UnpackSparseBatch(
     return cudaGetLastError() == cudaSuccess;
 }
 
+namespace {
+struct CausalConvDecodeCase {
+    const void *input;
+    const float *weight;
+    float *state, *nextState, *output;
+    int inputType,total,channels,kernel;
+    bool silu;
+};
+const fastllm::kernels::Family causalConvDecodeFamily{13,"conv.causal_depthwise.decode","1",{
+    {"cuda.conv.decode.reference",json11::Json::object{{"backend","cuda"},{"kernel_size","arbitrary"},{"state","FP32"}}},
+    {"cuda.conv.decode.vec4.block64",json11::Json::object{{"backend","cuda"},{"kernel_size",4},{"inputs","FP32/FP16/BF16"},{"state","FP32, 16-byte aligned"},{"threads",64},{"rows","arbitrary"},{"architecture","portable CUDA, no tensor cores"}}},
+    {"cuda.conv.decode.vec4.block128",json11::Json::object{{"backend","cuda"},{"kernel_size",4},{"inputs","FP32/FP16/BF16"},{"state","FP32, 16-byte aligned"},{"threads",128},{"rows","arbitrary"},{"architecture","portable CUDA, no tensor cores"}}},
+    {"cuda.conv.decode.vec4.block256",json11::Json::object{{"backend","cuda"},{"kernel_size",4},{"inputs","FP32/FP16/BF16"},{"state","FP32, 16-byte aligned"},{"threads",256},{"rows","arbitrary"},{"architecture","portable CUDA, no tensor cores"}}}
+}};
+const bool causalConvDecodeRegistered=[] {fastllm::kernels::Register(&causalConvDecodeFamily);return true;}();
+std::string CausalConvDecodeSupport(void *opaque,int implementation) {
+    const auto &c=*static_cast<CausalConvDecodeCase*>(opaque);
+    if(!implementation)return {};
+    if(c.kernel!=4)return "requires four convolution taps";
+    if((reinterpret_cast<uintptr_t>(c.weight)|reinterpret_cast<uintptr_t>(c.state)|
+        reinterpret_cast<uintptr_t>(c.nextState))&15)return "requires 16-byte-aligned weights and state";
+    return {};
+}
+bool RunCausalConvDecode(void *opaque,int implementation) {
+    const auto &c=*static_cast<CausalConvDecodeCase*>(opaque);
+    if(!implementation) {
+        auto launch=[&](auto separateState) {
+            CausalDepthwiseConv1DDecodeKernel<decltype(separateState)::value><<<
+                (c.total+255)/256,256,0,cudaStreamPerThread>>>(c.input,c.inputType,c.weight,
+                c.state,c.output,c.total,c.channels,c.kernel,c.silu,c.nextState);
+        };
+        if(c.state==c.nextState)launch(std::false_type{});else launch(std::true_type{});
+    } else {
+        auto launch=[&](auto scalar,auto threads) {
+            using T=decltype(scalar);constexpr int block=decltype(threads)::value;
+            fastllm_causal_conv::Decode4<T,block><<<
+                (c.total+block-1)/block,block,0,cudaStreamPerThread>>>(
+                (const T*)c.input,(const float4*)c.weight,(const float4*)c.state,
+                (float4*)c.nextState,c.output,c.total,c.channels,c.silu);
+        };
+        auto dispatch=[&](auto scalar) {
+            if(implementation==1)launch(scalar,std::integral_constant<int,64>{});
+            else if(implementation==2)launch(scalar,std::integral_constant<int,128>{});
+            else launch(scalar,std::integral_constant<int,256>{});
+        };
+        if(c.inputType==fastllm::FLOAT32)dispatch(float{});
+        else if(c.inputType==fastllm::FLOAT16)dispatch(half{});
+        else dispatch(__nv_bfloat16{});
+    }
+    return cudaPeekAtLastError()==cudaSuccess;
+}
+double MeasureCausalConvDecode(void *opaque,int implementation,int repeats) {
+    auto &benchmark=*static_cast<fastllm::kernels::CudaOutputsCase*>(opaque);
+    auto &trial=*static_cast<CausalConvDecodeCase*>(benchmark.operation.context);
+    float *checkpoint=trial.state;
+    try {
+        fastllm::kernels::CudaCheck(cudaMemcpyAsync(trial.nextState,checkpoint,
+            size_t(trial.total)*trial.kernel*sizeof(float),cudaMemcpyDeviceToDevice,cudaStreamPerThread));
+        trial.state=trial.nextState;
+        const double ms=fastllm::kernels::CudaOutputsMeasure(opaque,implementation,repeats);
+        trial.state=checkpoint;return ms;
+    }catch(...){trial.state=checkpoint;throw;}
+}
+void SelectAndRunCausalConvDecode(CausalConvDecodeCase &operation) {
+    using namespace fastllm;
+    int selected=0;
+    if(kernels::Enabled()) {
+        const int aligned=CausalConvDecodeSupport(&operation,1).empty();
+        kernels::Signature signature{{13,FastllmCudaRuntimeArch(),FastllmCudaGetDevice(),
+            operation.total/operation.channels,operation.channels,operation.kernel,
+            operation.inputType,operation.silu,aligned}};
+        CausalConvDecodeCase trial=operation;
+        Data stateScratch(FLOAT32),outputScratch(FLOAT32);
+        kernels::CudaOutputsCase benchmark{{&trial,RunCausalConvDecode,
+            CausalConvDecodeSupport,nullptr,0,false},{}};
+        if(!FastllmCudaGraphIsCapturing() && !FastllmCudaGraphMemoryPoolActive() &&
+                kernels::NeedsPreparation(signature)) {
+            stateScratch.Resize({operation.total,operation.kernel});
+            outputScratch.Resize({operation.total});
+            for(Data *d:{&stateScratch,&outputScratch}) {
+                d->ToDevice(CUDA,{FastllmCudaGetDevice()},false);d->Allocate(false);
+            }
+            trial.nextState=(float*)stateScratch.cudaData;trial.output=(float*)outputScratch.cudaData;
+            benchmark.outputs={{trial.nextState,stateScratch.Count(0),FLOAT32},
+                               {trial.output,outputScratch.Count(0),FLOAT32}};
+        }
+        selected=kernels::Select({&causalConvDecodeFamily,signature,&benchmark,
+            FastllmCudaGraphIsCapturing() || FastllmCudaGraphMemoryPoolActive(),
+            kernels::CudaOutputsUnsupported,MeasureCausalConvDecode,
+            kernels::CudaOutputsValidate,kernels::CudaHardware,0});
+    }
+    // A submitted history update cannot be retried through another kernel.
+    AssertInFastLLM(RunCausalConvDecode(&operation,selected<0?0:selected),
+                   "Causal depthwise decode launch failed.");
+}
+} // namespace
+
 bool FastllmCudaCausalDepthwiseConv1DDecode(
         const fastllm::Data &input, const fastllm::Data &weight,
         fastllm::Data &state, fastllm::Data &output,
@@ -4684,14 +4857,10 @@ bool FastllmCudaCausalDepthwiseConv1DDecode(
     if (initializeState) {
         FastllmCudaMemset0(state.cudaData, state.GetBytes());
     }
-    const int total = batch * channels;
-    constexpr int threads = 256;
-    const int blocks = (total + threads - 1) / threads;
-    CausalDepthwiseConv1DDecodeKernel<<<
-        blocks, threads, 0, cudaStreamPerThread>>>(
-        input.cudaData, (int)input.dataType, (const float*)weight.cudaData,
-        (float*)state.cudaData, (float*)output.cudaData,
-        total, channels, kernel, silu);
+    CausalConvDecodeCase operation{input.cudaData,(const float*)weight.cudaData,
+        (float*)state.cudaData,(float*)state.cudaData,(float*)output.cudaData,
+        int(input.dataType),batch*channels,channels,kernel,silu};
+    SelectAndRunCausalConvDecode(operation);
     DeviceSync();
     return cudaGetLastError() == cudaSuccess;
 }
@@ -4852,7 +5021,130 @@ bool FastllmCudaQwen4GatedDeltaRuleDecode(
     return cudaGetLastError() == cudaSuccess;
 }
 
-bool FastllmCudaQwen4GatedDeltaRuleDecodeOutput(
+namespace {
+struct GdnDecodeCase {
+    std::vector<fastllm_strata_gdn::Request> requests;
+    const float *aLog, *dtBias, *normWeight;
+    int keyHeads, valueHeads;
+    float recurrentEps, normEps;
+    bool tiledOutput;
+};
+const fastllm::kernels::Family gdnDecodeFamily{12,"gdn.decode.fp16","1",{
+    {"cuda.gdn.reference",json11::Json::object{{"backend","cuda"},{"arithmetic","original serial FP32 recurrence"}}},
+    {"cuda.gdn.register.rg1",json11::Json::object{{"backend","cuda"},{"source","Strata MIT, 9f7d977d"},{"state","FP32, head x 128 x 128"},{"activation","FP16"},{"row_groups",1},{"requests","arbitrary"},{"architecture","portable CUDA, no tensor cores"}}},
+    {"cuda.gdn.register.rg2",json11::Json::object{{"backend","cuda"},{"source","Strata MIT, 9f7d977d"},{"state","FP32, head x 128 x 128"},{"activation","FP16"},{"row_groups",2},{"requests","arbitrary"},{"architecture","portable CUDA, no tensor cores"}}},
+    {"cuda.gdn.register.rg4",json11::Json::object{{"backend","cuda"},{"source","Strata MIT, 9f7d977d"},{"state","FP32, head x 128 x 128"},{"activation","FP16"},{"row_groups",4},{"requests","arbitrary"},{"architecture","portable CUDA, no tensor cores"}}}
+}};
+const bool gdnDecodeRegistered=[] {fastllm::kernels::Register(&gdnDecodeFamily);return true;}();
+bool RunGdnDecode(void *opaque,int implementation) {
+    const auto &c=*static_cast<GdnDecodeCase*>(opaque);
+    constexpr int capacity=fastllm_strata_gdn::Requests::CAPACITY;
+    for(size_t first=0;first<c.requests.size();first+=capacity) {
+        const int count=std::min<size_t>(capacity,c.requests.size()-first);
+        if(!implementation) {
+            Qwen4GdnDecodeBatch tile{};
+            for(int i=0;i<count;++i) {
+                const auto &r=c.requests[first+i];
+                tile.requests[i]={r.qkv,r.alpha,r.beta,r.gate,
+                    const_cast<float*>(r.state),r.nextState,r.output};
+            }
+            auto launch=[&](auto separateState) {
+                constexpr bool separate=decltype(separateState)::value;
+                Qwen4GatedDeltaRuleDecodeKernel<half,separate,true,true><<<
+                    dim3(c.valueHeads,count),128,0,cudaStreamPerThread>>>(
+                    nullptr,nullptr,nullptr,c.aLog,c.dtBias,nullptr,nullptr,nullptr,
+                    c.keyHeads,c.valueHeads,1,c.recurrentEps,1.f/std::sqrt(128.f),
+                    c.normWeight,nullptr,c.normEps,c.tiledOutput,tile);
+            };
+            if(c.requests[first].state==c.requests[first].nextState)
+                launch(std::false_type{});
+            else launch(std::true_type{});
+        } else {
+            fastllm_strata_gdn::Requests tile{};
+            for(int i=0;i<count;++i)tile.items[i]=c.requests[first+i];
+            auto launch=[&](auto groups) {
+                constexpr int rg=decltype(groups)::value;
+                fastllm_strata_gdn::step_norm_kernel<rg><<<
+                    dim3(c.valueHeads,count),dim3(128,rg),0,cudaStreamPerThread>>>(
+                    tile,c.aLog,c.dtBias,c.normWeight,c.keyHeads,c.valueHeads,
+                    c.recurrentEps,c.normEps,1.f/std::sqrt(128.f),c.tiledOutput);
+            };
+            if(implementation==1)launch(std::integral_constant<int,1>{});
+            else if(implementation==2)launch(std::integral_constant<int,2>{});
+            else launch(std::integral_constant<int,4>{});
+        }
+        if(cudaPeekAtLastError()!=cudaSuccess)return false;
+    }
+    return true;
+}
+double MeasureGdnDecode(void *opaque,int implementation,int repeats) {
+    auto &benchmark=*static_cast<fastllm::kernels::CudaOutputsCase*>(opaque);
+    auto &trial=*static_cast<GdnDecodeCase*>(benchmark.operation.context);
+    const auto original=trial.requests;
+    // Numeric validation reads an immutable checkpoint. Timing instead uses
+    // private in-place states, matching inference for every candidate. Copy
+    // the checkpoint once, outside the measured graph, never per iteration.
+    try {
+        for(auto &r:trial.requests) {
+            fastllm::kernels::CudaCheck(cudaMemcpyAsync(r.nextState,r.state,
+                size_t(trial.valueHeads)*128*128*sizeof(float),
+                cudaMemcpyDeviceToDevice,cudaStreamPerThread));
+            r.state=r.nextState;
+        }
+        const double ms=fastllm::kernels::CudaOutputsMeasure(opaque,implementation,repeats);
+        trial.requests=original;
+        return ms;
+    } catch(...) {trial.requests=original;throw;}
+}
+void SelectAndRunGdnDecode(GdnDecodeCase &operation) {
+    using namespace fastllm;
+    int selected=0;
+    if(kernels::Enabled()) {
+        uint32_t re,ne;
+        std::memcpy(&re,&operation.recurrentEps,4);
+        std::memcpy(&ne,&operation.normEps,4);
+        kernels::Signature signature{{12,FastllmCudaRuntimeArch(),FastllmCudaGetDevice(),
+            int64_t(operation.requests.size()),operation.keyHeads,operation.valueHeads,
+            128,re,ne,operation.tiledOutput}};
+        // Validation clears its outputs and timing replays the operation.
+        // Trial writes must never touch live recurrent states. Read the current
+        // state as an immutable checkpoint and direct every trial to scratch.
+        GdnDecodeCase trial=operation;
+        Data stateScratch(FLOAT32),outputScratch(FLOAT16);
+        kernels::CudaOutputsCase benchmark{{&trial,RunGdnDecode,
+            [](void*,int){return std::string{};},nullptr,0,false},{}};
+        if(!FastllmCudaGraphIsCapturing() && !FastllmCudaGraphMemoryPoolActive() &&
+                kernels::NeedsPreparation(signature)) {
+            const int count=int(operation.requests.size());
+            stateScratch.Resize({count,operation.valueHeads,128,128});
+            outputScratch.Resize({count,operation.valueHeads,128});
+            for(Data *d:{&stateScratch,&outputScratch}) {
+                d->ToDevice(CUDA,{FastllmCudaGetDevice()},false);d->Allocate(false);
+            }
+            for(int i=0;i<count;++i) {
+                trial.requests[i].nextState=(float*)stateScratch.cudaData+
+                    size_t(i)*operation.valueHeads*128*128;
+                trial.requests[i].output=(half*)outputScratch.cudaData+
+                    size_t(i)*operation.valueHeads*128;
+                benchmark.outputs.push_back({trial.requests[i].nextState,
+                    size_t(operation.valueHeads)*128*128,FLOAT32});
+                benchmark.outputs.push_back({trial.requests[i].output,
+                    size_t(operation.valueHeads)*128,FLOAT16});
+            }
+        }
+        selected=kernels::Select({&gdnDecodeFamily,signature,&benchmark,
+            FastllmCudaGraphIsCapturing() || FastllmCudaGraphMemoryPoolActive(),
+            kernels::CudaOutputsUnsupported,MeasureGdnDecode,
+            kernels::CudaOutputsValidate,kernels::CudaHardware,0});
+    }
+    // A failed launch may already have updated some state tiles. Never retry
+    // the recurrence; report the error just as for the original fused path.
+    AssertInFastLLM(RunGdnDecode(&operation,selected<0?0:selected),
+                   "GDN decode launch failed.");
+}
+} // namespace
+
+static bool Qwen4CanRunGdnDecodeOutput(
         const fastllm::Data &qkv, const fastllm::Data &alpha,
         const fastllm::Data &beta, const fastllm::Data &aLog,
         const fastllm::Data &dtBias, const fastllm::Data &normWeight,
@@ -4887,19 +5179,85 @@ bool FastllmCudaQwen4GatedDeltaRuleDecodeOutput(
             return false;
         }
     }
-    const int blocks = qkv.dims[0] * valueHeads;
-    const float inverseHead = 1.0f / std::sqrt(128.0f);
-    Qwen4GatedDeltaRuleDecodeKernel<half, false, true><<<
-        blocks, 128, 0, cudaStreamPerThread>>>(
-            (const float*)qkv.cudaData, (const half*)alpha.cudaData,
-            (const half*)beta.cudaData, (const float*)aLog.cudaData,
-            (const float*)dtBias.cudaData, (float*)state.cudaData, nullptr,
-            (float*)output.cudaData, keyHeads, valueHeads, 1,
-            recurrentEps, inverseHead, (const float*)normWeight.cudaData,
-            (const half*)gate.cudaData, normEps, tiledOutput);
+    return true;
+}
+
+bool FastllmCudaQwen4GatedDeltaRuleDecodeOutput(
+        const fastllm::Data &qkv, const fastllm::Data &alpha,
+        const fastllm::Data &beta, const fastllm::Data &aLog,
+        const fastllm::Data &dtBias, const fastllm::Data &normWeight,
+        const fastllm::Data &gate, fastllm::Data &state,
+        fastllm::Data &output, int keyHeads, int valueHeads,
+        float recurrentEps, float normEps, bool tiledOutput) {
+    if (!Qwen4CanRunGdnDecodeOutput(qkv,alpha,beta,aLog,dtBias,normWeight,gate,state,
+            output,keyHeads,valueHeads,recurrentEps,normEps,tiledOutput)) return false;
+    GdnDecodeCase operation{{}, (const float*)aLog.cudaData,
+        (const float*)dtBias.cudaData, (const float*)normWeight.cudaData,
+        keyHeads, valueHeads, recurrentEps, normEps, tiledOutput};
+    for (int i=0; i<qkv.dims[0]; ++i) {
+        float *current=(float*)state.cudaData+size_t(i)*valueHeads*128*128;
+        operation.requests.push_back({(const float*)qkv.cudaData+size_t(i)*(2*keyHeads+valueHeads)*128,
+            (const half*)alpha.cudaData+size_t(i)*valueHeads,
+            (const half*)beta.cudaData+size_t(i)*valueHeads,
+            (const half*)gate.cudaData+size_t(i)*valueHeads*128,
+            current,current,(half*)output.cudaData+size_t(i)*valueHeads*128});
+    }
+    SelectAndRunGdnDecode(operation);
     // A submitted state update must never be retried through the fallback.
     fastllm::AssertInFastLLM(cudaGetLastError() == cudaSuccess,
                            "Qwen4 fused GDN decode launch failed.");
+    DeviceSync();
+    return true;
+}
+
+bool FastllmCudaQwen4GatedDeltaRuleDecodeOutputBatch(
+        const std::vector<FastllmCudaQwen4GdnDecodeRequest> &requests,
+        const fastllm::Data &aLog, const fastllm::Data &dtBias,
+        const fastllm::Data &normWeight, int keyHeads, int valueHeads,
+        float recurrentEps, float normEps) {
+    using namespace fastllm;
+    if (requests.empty()) return false;
+    // Validate the entire batch before any recurrent state is updated.
+    // Dense independent request states retain the original arithmetic and
+    // are selected with blockIdx.y, so graph replay needs no pointer upload.
+    std::vector<const Data *> reads{&aLog,&dtBias,&normWeight}, writes;
+    auto dense = [](const Data &d) {
+        if (d.dims.empty() || d.strides.size() != d.dims.size()) return false;
+        uint64_t stride=1;
+        for (int i=int(d.dims.size())-1;i>=0;--i) {
+            if (d.dims[i]<=0 || (d.dims[i]>1 && uint64_t(d.strides[i])!=stride)) return false;
+            stride*=d.dims[i];
+        }
+        return true;
+    };
+    for (const auto &r:requests) {
+        if (!r.qkv || !r.alpha || !r.beta || !r.gate || !r.state || !r.output ||
+            r.qkv->dims.empty() || r.qkv->dims[0]!=1 ||
+            !Qwen4CanRunGdnDecodeOutput(*r.qkv,*r.alpha,*r.beta,aLog,dtBias,normWeight,
+                *r.gate,*r.state,*r.output,keyHeads,valueHeads,recurrentEps,normEps,false)) return false;
+        for (const Data *d:{r.qkv,r.alpha,r.beta,r.gate}) reads.push_back(d);
+        writes.push_back(r.state); writes.push_back(r.output);
+    }
+    for (const Data *d:reads) if (!dense(*d)) return false;
+    auto overlap=[](const Data &a,const Data &b) {
+        uintptr_t x=reinterpret_cast<uintptr_t>(a.cudaData),y=reinterpret_cast<uintptr_t>(b.cudaData);
+        return x<y+b.GetBytes() && y<x+a.GetBytes();
+    };
+    for (size_t i=0;i<writes.size();++i) {
+        if (!dense(*writes[i])) return false;
+        for (const Data *d:reads) if (overlap(*writes[i],*d)) return false;
+        for (size_t j=0;j<i;++j) if (overlap(*writes[i],*writes[j])) return false;
+    }
+    GdnDecodeCase operation{{}, (const float*)aLog.cudaData,
+        (const float*)dtBias.cudaData, (const float*)normWeight.cudaData,
+        keyHeads, valueHeads, recurrentEps, normEps, false};
+    for (const auto &r:requests) {
+        operation.requests.push_back({(const float*)r.qkv->cudaData,
+            (const half*)r.alpha->cudaData,(const half*)r.beta->cudaData,
+            (const half*)r.gate->cudaData,(const float*)r.state->cudaData,
+            (float*)r.state->cudaData,(half*)r.output->cudaData});
+    }
+    SelectAndRunGdnDecode(operation);
     DeviceSync();
     return true;
 }
@@ -4950,6 +5308,154 @@ bool FastllmCudaQwen4GdnOutputGateExact(
         (half*)output.cudaData, eps);
     DeviceSync();
     return cudaGetLastError() == cudaSuccess;
+}
+
+namespace {
+bool Qwen4DenseCudaTensor(const fastllm::Data &data, int device) {
+    if (data.dataDevice != fastllm::CUDA || !data.cudaData || data.multiDeviceData ||
+        (!data.dataDeviceIds.empty() && data.dataDeviceIds != std::vector<int>{device}) ||
+        data.dims.empty() || data.strides.size() != data.dims.size()) return false;
+    uint64_t stride = 1;
+    for (int i = int(data.dims.size()) - 1; i >= 0; --i) {
+        if (data.dims[i] <= 0 || (data.dims[i] > 1 && data.strides[i] != stride)) return false;
+        stride *= data.dims[i];
+    }
+    return true;
+}
+struct Qwen4LinearCommitBatch {
+    // A launch-argument tile, not a limit on layer or request count.
+    static constexpr int CAPACITY = 32;
+    FastllmCudaQwen4LinearUpdate layers[CAPACITY];
+};
+__global__ void Qwen4CommitLinearUpdatesKernel(Qwen4LinearCommitBatch batch, int committed) {
+    const auto &p = batch.layers[blockIdx.y];
+    const uint64_t begin = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    const uint64_t stride = uint64_t(gridDim.x) * blockDim.x;
+    const uint64_t vectors = uint64_t(p.batch) * p.heads * 128 * 32;
+    for (uint64_t i = begin; i < vectors; i += stride) {
+        const int head = i / (128 * 32);
+        const int request = head / p.heads, valueHead = head % p.heads;
+        const int key = (i / 32) % 128, value = (i % 32) * 4;
+        float4 state = reinterpret_cast<const float4 *>(p.recurrentCheckpoint)[i];
+        for (int token = 0; token < committed; ++token) {
+            const float *u = p.updates + ((uint64_t(request) * p.rows + token) * p.heads + valueHead) * 257;
+            const float k = u[key], decay = u[256];
+            // Preserve the verifier's rounded decay then rank-one update.
+            state.x = state.x * decay; state.x = state.x + k * u[128 + value];
+            state.y = state.y * decay; state.y = state.y + k * u[129 + value];
+            state.z = state.z * decay; state.z = state.z + k * u[130 + value];
+            state.w = state.w * decay; state.w = state.w + k * u[131 + value];
+        }
+        reinterpret_cast<float4 *>(p.recurrentState)[i] = state;
+    }
+    const uint64_t conv = uint64_t(p.batch) * p.channels * p.kernel;
+    for (uint64_t i = begin; i < conv; i += stride) {
+        const int tap = i % p.kernel, channel = (i / p.kernel) % p.channels;
+        const int request = i / (uint64_t(p.kernel) * p.channels);
+        const int token = committed + tap - p.kernel;
+        float value;
+        if (token < 0) value = p.convCheckpoint[i + committed];
+        else {
+            const uint64_t source = (uint64_t(request) * p.rows + token) * p.channels + channel;
+            if (p.inputType == int(fastllm::FLOAT32)) value = static_cast<const float *>(p.input)[source];
+            else if (p.inputType == int(fastllm::FLOAT16)) value = Qwen4CudaToFloat(static_cast<const half *>(p.input)[source]);
+            else value = Qwen4CudaToFloat(static_cast<const __nv_bfloat16 *>(p.input)[source]);
+        }
+        p.convState[i] = value;
+    }
+}
+}
+
+bool FastllmCudaQwen4GatedDeltaRuleCaptureUpdates(
+        const fastllm::Data &qkv, const fastllm::Data &alpha, const fastllm::Data &beta,
+        const fastllm::Data &aLog, const fastllm::Data &dtBias, fastllm::Data &state,
+        fastllm::Data &nextState, fastllm::Data &output, fastllm::Data &updates,
+        int keyHeads, int valueHeads, float recurrentEps) {
+    using namespace fastllm;
+    if (!Qwen4CanRunGatedDeltaRule(qkv, alpha, beta, aLog, dtBias, state, output,
+            keyHeads, valueHeads, 128, 128, FLOAT32) || !(recurrentEps > 0)) return false;
+    const int device = FastllmCudaGetDevice(), rows = qkv.dims[1], batch = qkv.dims[0];
+    for (const Data *d : {&qkv, &alpha, &beta, &aLog, &dtBias,
+                         static_cast<const Data *>(&state), static_cast<const Data *>(&nextState),
+                         static_cast<const Data *>(&output), static_cast<const Data *>(&updates)})
+        if (!Qwen4DenseCudaTensor(*d, device)) return false;
+    if (nextState.dataType != FLOAT32 || nextState.dims != state.dims ||
+        nextState.cudaData == state.cudaData || updates.dataType != FLOAT32 ||
+        updates.dims != std::vector<int>({batch, rows, valueHeads, 257}) ||
+        output.dims != std::vector<int>({batch, rows, valueHeads * 128})) return false;
+    const float inverseHead = 1.0f / std::sqrt(128.0f);
+    auto launch = [&](auto *typedAlpha) {
+        using T = std::remove_cv_t<std::remove_pointer_t<decltype(typedAlpha)>>;
+        Qwen4GatedDeltaRuleSequenceValueTileKernel<T, true, false, true><<<
+            batch * valueHeads * 4, 32, 0, cudaStreamPerThread>>>(
+            static_cast<const float *>(qkv.cudaData), typedAlpha,
+            static_cast<const T *>(beta.cudaData), static_cast<const float *>(aLog.cudaData),
+            static_cast<const float *>(dtBias.cudaData), static_cast<float *>(state.cudaData),
+            static_cast<float *>(nextState.cudaData), static_cast<float *>(output.cudaData),
+            keyHeads, valueHeads, rows, recurrentEps, inverseHead, {}, static_cast<float *>(updates.cudaData));
+    };
+    if (alpha.dataType == FLOAT32) launch(static_cast<const float *>(alpha.cudaData));
+    else if (alpha.dataType == FLOAT16) launch(static_cast<const half *>(alpha.cudaData));
+    else launch(static_cast<const __nv_bfloat16 *>(alpha.cudaData));
+    AssertInFastLLM(cudaGetLastError() == cudaSuccess, "Qwen4 recurrent update capture failed.");
+    DeviceSync();
+    return true;
+}
+
+bool FastllmCudaQwen4PrepareLinearUpdates(
+        const std::vector<FastllmCudaQwen4LinearCommitItem> &items, int committedInputs,
+        std::vector<FastllmCudaQwen4LinearUpdate> &prepared) {
+    using namespace fastllm;
+    if (items.empty() || committedInputs <= 0) return false;
+    const int device = FastllmCudaGetDevice();
+    // Validate all sources before submitting any state mutation.
+    for (const auto &p : items) {
+        for (const Data *d : {p.convInput, p.convCheckpoint, p.recurrentCheckpoint, p.updates,
+                static_cast<const Data *>(p.convState), static_cast<const Data *>(p.recurrentState)})
+            if (!d || !Qwen4DenseCudaTensor(*d, device)) return false;
+        const auto &s = *p.recurrentState, &c = *p.convState, &u = *p.updates, &input = *p.convInput;
+        if (s.dataType != FLOAT32 || s.dims.size() != 4 || s.dims[2] != 128 || s.dims[3] != 128 ||
+            p.recurrentCheckpoint->dataType != FLOAT32 || p.recurrentCheckpoint->dims != s.dims ||
+            c.dataType != FLOAT32 || c.dims.size() != 3 || c.dims[0] != s.dims[0] ||
+            p.convCheckpoint->dataType != FLOAT32 || p.convCheckpoint->dims != c.dims ||
+            p.convCheckpoint->cudaData == c.cudaData || u.dataType != FLOAT32 ||
+            u.dims.size() != 4 || u.dims[0] != s.dims[0] || u.dims[1] < committedInputs ||
+            u.dims[2] != s.dims[1] || u.dims[3] != 257 ||
+            !Qwen4CudaActivationType(input.dataType) ||
+            input.dims != std::vector<int>({s.dims[0], u.dims[1], c.dims[1]}) ||
+            ((uintptr_t(s.cudaData) | uintptr_t(p.recurrentCheckpoint->cudaData)) & 15)) return false;
+    }
+    prepared.clear(); prepared.reserve(items.size());
+    for (const auto &p : items) {
+        const auto &c = *p.convState, &s = *p.recurrentState;
+        prepared.push_back({p.convInput->cudaData,
+            static_cast<const float *>(p.convCheckpoint->cudaData),
+            static_cast<const float *>(p.recurrentCheckpoint->cudaData),
+            static_cast<const float *>(p.updates->cudaData), static_cast<float *>(c.cudaData),
+            static_cast<float *>(s.cudaData), s.dims[0], s.dims[1], c.dims[1],
+            p.updates->dims[1], c.dims[2], int(p.convInput->dataType)});
+    }
+    return true;
+}
+
+void FastllmCudaQwen4LaunchLinearUpdates(
+        const std::vector<FastllmCudaQwen4LinearUpdate> &prepared, int committedInputs, void *stream) {
+    for (size_t begin = 0; begin < prepared.size(); begin += Qwen4LinearCommitBatch::CAPACITY) {
+        Qwen4LinearCommitBatch batch{};
+        const int count = int(std::min(size_t(Qwen4LinearCommitBatch::CAPACITY), prepared.size() - begin));
+        std::copy_n(prepared.data() + begin, count, batch.layers);
+        Qwen4CommitLinearUpdatesKernel<<<dim3(32, count), 256, 0,
+            stream ? static_cast<cudaStream_t>(stream) : cudaStreamPerThread>>>(batch, committedInputs);
+        fastllm::AssertInFastLLM(cudaGetLastError() == cudaSuccess, "Qwen4 recurrent update commit failed.");
+    }
+}
+
+bool FastllmCudaQwen4CommitLinearUpdates(
+        const std::vector<FastllmCudaQwen4LinearCommitItem> &items, int committedInputs) {
+    std::vector<FastllmCudaQwen4LinearUpdate> prepared;
+    if (!FastllmCudaQwen4PrepareLinearUpdates(items, committedInputs, prepared)) return false;
+    FastllmCudaQwen4LaunchLinearUpdates(prepared, committedInputs, nullptr);
+    return true;
 }
 
 bool FastllmCudaQwen4ReplayLinearAttentionBatch(
@@ -5663,3 +6169,8 @@ bool FastllmCudaQwen4LastValidRow(const fastllm::Data &input,
         (const uint8_t*)input.cudaData, (uint8_t*)output.cudaData, validRows, bytes);
     return cudaGetLastError() == cudaSuccess;
 }
+
+#include "strata-hyper-read.cuh"
+#include "qwen4-hyper-read.cuh"
+
+#include "qwen4-qsa-batch.cuh"
