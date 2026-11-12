@@ -42,7 +42,7 @@ class GenerationObserverError(RuntimeError):
 class Qwen3ProcessSession:
     """同步会话；线程调用串行化，超时或协议错误后整组回收，不自动重试请求。"""
 
-    def __init__(self, binary, worker, model, devices, output, *, timeout=1800, trace=False, cuda_graph=False, custom_allreduce=False, prefix_cache=False, environment=None):
+    def __init__(self, binary, worker, model, devices, output, *, timeout=1800, trace=False, cuda_graph=False, custom_allreduce=False, prefix_cache=False, environment=None, request_log=True):
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("session timeout must be finite and positive")
         device_ids = [int(value) for value in devices.split(",")]
@@ -52,6 +52,9 @@ class Qwen3ProcessSession:
         self.devices = device_ids
         self.environment = dict(environment) if environment is not None else None
         self.output = Path(output).resolve()
+        if type(request_log) is not bool:
+            raise ValueError('request_log must be boolean')
+        self.request_log = request_log
         if type(cuda_graph) is not bool:
             raise ValueError("cuda_graph must be boolean")
         if type(custom_allreduce) is not bool or (custom_allreduce and len(device_ids) != 2):
@@ -246,7 +249,8 @@ class Qwen3ProcessSession:
             if len(json.dumps(message, ensure_ascii=False).encode("utf-8")) > 1024 * 1024:
                 raise ValueError("session request exceeds 1 MiB")
             path = self.output / f"request-{self._next_id:06d}"
-            path.with_suffix(".json").write_text(json.dumps(request, ensure_ascii=False, indent=2))
+            if self.request_log:
+                path.with_suffix(".json").write_text(json.dumps(request, ensure_ascii=False, indent=2))
             tokens = []
 
             def on_event(event):
@@ -267,7 +271,8 @@ class Qwen3ProcessSession:
             try:
                 self._cancel_event, self._cancel_sent = cancel_event, False
                 result = self._exchange(message, on_event if on_token is not None else None)
-                path.with_suffix(".response.json").write_text(json.dumps(result, ensure_ascii=False, indent=2))
+                if self.request_log:
+                    path.with_suffix(".response.json").write_text(json.dumps(result, ensure_ascii=False, indent=2))
                 if (result.get("event") != "result" or result.get("backend") != BACKEND or
                     result.get("workers") != self._workers or result.get("reusable") is not True):
                     raise RuntimeError(f"session failed: {result.get('error', 'invalid response')}")

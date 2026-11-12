@@ -83,6 +83,11 @@ def validate_parallel_options(args, *, planning=False):
     backend = getattr(args, 'tp_backend', 'thread')
     if backend not in ('thread', 'process'):
         raise ValueError('tp_backend must be thread or process')
+    request_log = getattr(args, 'tp_request_log', 'on')
+    if request_log not in ('on', 'off'):
+        raise ValueError('--tp-request-log must be on or off')
+    if request_log != 'on' and backend != 'process':
+        raise ValueError('--tp-request-log off requires --tp-backend process')
     if dp == 1 and not preview and not planning:
         return dp
 

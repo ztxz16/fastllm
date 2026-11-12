@@ -1129,3 +1129,78 @@ CLI case 在同一验收进程调用正式 `cli.main`，保留等价终端命令
 严格检查实际 Graph/规约/Prefix 路径；不支持的 P2P 或执行设置直接 FAIL，不静默回退。
 每组独立保存 Markdown、CSV、JSON、XLSX 和原始日志，失败返回非零且保留部分报告。
 这轮验证功能正确性，不包含吞吐提升、延迟或调度最优性的结论。
+
+2026-11-12 用户四卡 V100 / Qwen3-1.7B 实测：四种模型配置均 PASS。
+前三份服务器报告为 `20261112T030604Z_dp_bfd599a5`、`20261112T030733Z_dp_8ff6997e`、
+`20261112T031013Z_dp_d9a32c84`。组合配置先因 GPU 配对不满足双向 P2P/原生原子检查失败，
+按 UUID 将可见顺序调整为物理 GPU 0、3、1、2 后，通过报告为 `20261112T032047Z_dp_4a333ee6`。
+这台机器的 0+3 是 NV2，1+2 是 NV1；此配对不适用于其它机器，运行前须检查各自拓扑。
+
+## DP 吞吐与延迟对照（第三步）
+
+`benchmark_qwen3_dp.py` 使用当前源码的正式 `make_normal_llm_model` 与 `generate`，
+只运行已编译的协调器和 worker，不构建、不下载、不加载旧 Python 推理库。
+默认比较 DP1×TP1、DP2×TP1、DP4×TP1、DP1×TP2、DP2×TP2；每种分别测并发 1 和 4。
+每轮固定 8 个请求，每请求输出 32 token，关闭 EOS 提前结束，使用同一份实际 Prompt Token ID、
+贪心采样参数与 seed=0；Prompt 仍受正式后端最多 128 token 限制。
+每个 case 预热 1 轮，正式执行 5 次独立工作轮，模型权重始终驻留。默认共 20 个 case。
+
+两个 profile 分别报告：
+
+- `common`：所有配置都使用 Eager、关闭 Prefix Cache；TP2 使用 NCCL，TP1 无跨卡规约。
+- `optimized`：所有配置都使用 Decode Graph、预热相同 Prompt 的 Prefix Cache；TP2 使用已经验收的
+  自定义 AllReduce。每个副本都必须完成预热，正式请求必须实际复用整个可复用前缀。
+  这是当前已支持优化的统一组合，不表示已搜索出每种硬件/负载下的最佳配置。
+
+每种配置按顺序执行，避免不同模型争抢 GPU。并发是固定数量的客户端线程，每个客户端结束一个请求后
+才提交下一个；这是有限工作量的闭环测试，不代表无限队列饱和吞吐或开放到达率下的服务容量。
+并发 1 时 DP 通常不能提高吞吐；并发 4 用于观察多个副本同时处理请求的效果。
+单副本内部仍为单请求执行，没有 continuous batching。
+
+计时范围与报告口径：
+
+- 模型加载、分词、测试线程及计时缓冲区创建、测试预热、输出对照、报告/样本保存都在计时外。
+  计时包含公开模型入口的排队、协议校验、IPC、前向、采样、流式事件以及正式 KV 生命周期。
+  正式路径每请求的 KV/Graph 分配、捕获、warmup 和释放仍然保留；不会为测速单独省略。
+  所有配置都以同步生成接口完成为边界，不额外插入逐 kernel CUDA 同步。
+- 新的公开参数 `--tp-request-log on|off` 默认 `on`，JSON 配置同样校验。
+  `off` 关闭逐请求输入/结果 JSON 及 DP dispatch 文件；仍保留启动、退出、分配和原生错误日志，
+  不改变校验、取消、缓存、调度或故障处理。测速使用 `off`，返回的原始结果在停止计时后写到 `raw/`。
+  该参数仅适用于进程后端；线程后端拒绝 `off`。
+- 每次重复的 batch 时间是全部固定请求完成的墙钟时间；吞吐为实际固定输出 token 总量除以该时间。
+  `--iterations N` 会在一次重复内执行 N 轮，累计各轮有效计时，不计轮间检查和落盘。
+  Median/P95 batch 延迟和 CV 使用各次重复样本；请求延迟/TTFT 的 Median/P95 使用所有请求样本。
+  TTFT 从调用公开生成接口前开始，包含等待可用副本；ITL 是客户端相邻 Token 事件间隔，包含 IPC。
+  这不是单个 GPU kernel 的延迟，也不包含 HTTP 网络层。
+- `speedup_vs_dp1` 仅为同 profile、同 TP 大小、同并发的 DP1 Median batch 时间除以当前时间。
+  增加 GPU 的扩展收益与每卡效率分别通过总吞吐和 `output_tokens_per_s_per_gpu` 展示。
+  不跨 profile、不同缓存状态或不同 TP 计算 DP 加速比。
+- 每轮停止计时后检查实际执行证据，以及同 profile/同 TP 的 DP1 Token ID 精确一致性。
+  最大/平均绝对误差和失败元素数作用于 Token ID，不能当作独立数学精度结论。
+  任一输出错误、冷热状态不一致、路径回退、请求失败或中断都返回非零，保留已完成样本与部分报告。
+
+服务器已完成第二步构建时，更新源码后直接运行（无需重新编译）：
+
+```bash
+# 按实际机器的设备身份/拓扑设置；本例对应已验收的四卡 V100。
+export CUDA_VISIBLE_DEVICES="GPU-a88c9669-989e-a8dd-22a0-94a45b467c49,"\
+"GPU-0310107f-031e-6fcd-eb65-6dfa45981711,"\
+"GPU-f0a99453-777f-8b16-89a3-bab78019f23d,"\
+"GPU-081484a6-9730-453b-59a2-32bd75ab6c2c"
+bash test/distributed/benchmark_qwen3_dp_v100.sh /home/models/Qwen3-1.7B
+
+# 可选：只跑公共配置；其它参数原样传给 Python 入口。
+bash test/distributed/benchmark_qwen3_dp_v100.sh /home/models/Qwen3-1.7B --profiles common
+```
+
+每次创建唯一的 `test/distributed/results/*_dp_perf_*` 目录，包含 `summary.md`、`summary.csv`、
+`summary.json`、`summary.xlsx`、`samples.csv`、输入 Token ID、原始逐轮响应和各模型生命周期日志。
+XLSX 包含 Cases/Samples/Metadata；展示浮点数统一三位，JSON 保存原始精度和全部 Token 时间戳。
+报告记录 GPU/UUID/拓扑、CUDA、编译架构、Git、完整命令、模型参数、预热/迭代/重复次数和实际分配。
+服务器吞吐数值须以实测报告为准。
+
+无 GPU 的检查命令（协议使用替身，结果不属于真实性能报告）：
+
+```bash
+python3 test/distributed/run_parallel_config.py --execution-tests --benchmark-tests
+```

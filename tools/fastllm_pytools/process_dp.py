@@ -39,6 +39,7 @@ class ProcessDPModel:
         self.dp_size = self.concurrency = self.plan['dp_size']
         self.tp_size = self.plan['tp_size']
         self.timeout = getattr(args, 'tp_timeout', 180)
+        self.request_log = getattr(args, 'tp_request_log', 'on') == 'on'
         self.output = Path(getattr(args, 'tp_output', 'process-tp-results')).resolve() / (
             datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ') + '_dp_' + uuid.uuid4().hex[:8])
         self.output.mkdir(parents=True, exist_ok=False)
@@ -131,8 +132,9 @@ class ProcessDPModel:
                 try:
                     if self._status == 'ready' and self.replicas[rank].state != 'ready':
                         self._failure = f'replica {rank} is {self.replicas[rank].state}'
-                    (self.output / f'dispatch-{request_id:06d}.json').write_text(
-                        json.dumps(record, ensure_ascii=False, indent=2))
+                    if self.request_log:
+                        (self.output / f'dispatch-{request_id:06d}.json').write_text(
+                            json.dumps(record, ensure_ascii=False, indent=2))
                 except Exception as error:
                     self._failure = f'cannot persist DP dispatch: {error}'
                     raise
