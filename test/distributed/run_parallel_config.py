@@ -116,6 +116,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--real-cuda', action='store_true', help='增加实际 GPU 的正式 CLI 预览验收；仅在 GPU 服务器使用')
     parser.add_argument('--execution-tests', action='store_true', help='增加 DP 执行、会话及 HTTP 的纯 Python 协议回归')
+    parser.add_argument('--benchmark-tests', action='store_true', help='增加测速统计、失败报告和正式工厂协议回归；不测真实GPU')
     parser.add_argument('--dp', type=int, default=2)
     parser.add_argument('--tp', type=int, default=1)
     parser.add_argument('--output', type=Path, default=ROOT / 'test/distributed/results')
@@ -139,6 +140,8 @@ def main():
         modules = ['test_parallel_config', 'test_process_tp_options', 'test_process_tp_entrypoint']
         if args.execution_tests:
             modules += ['test_process_dp', 'test_qwen3_session', 'test_qwen3_http']
+        if args.benchmark_tests:
+            modules += ['test_benchmark_qwen3_dp']
         suite = unittest.defaultTestLoader.loadTestsFromNames(modules)
         metadata['expected_case_count'] = suite.countTestCases() + int(args.real_cuda)
         save_report(output, rows, metadata)
