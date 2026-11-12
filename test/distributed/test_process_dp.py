@@ -72,6 +72,37 @@ class ProcessDPTests(unittest.TestCase):
             self.assertEqual([r.ready['visible_devices'] for r in model.replicas], ['3,2,1,0'] * 2)
             self.assertEqual([r.devices for r in model.replicas], ['0', '1'])
 
+    def test_request_log_off_preserves_outputs_and_recovery_without_writes(self):
+        for dp in (1, 2):
+            with self.subTest(dp=dp), make_normal_llm_model(self.args('--dp', str(dp), '--tp-request-log', 'off')) as model:
+                replicas = model.replicas if dp > 1 else [model]
+                self.assertTrue(all(not replica.session.request_log for replica in replicas))
+                # 启动和关闭可以保存诊断；计时主流程不得通过其它位置偷写请求文件。
+                with mock.patch.object(Path, 'write_text', side_effect=AssertionError('request disk write')):
+                    for _ in range(dp):
+                        self.assertEqual(model.generate(self.request)['token_ids'], [1])
+                    event = threading.Event()
+                    with self.assertRaises(GenerationCancelled):
+                        model.generate(dict(self.request, max_new_tokens=16), cancel_event=event,
+                                       on_token=lambda _: event.set())
+                    self.assertEqual(model.generate(self.request)['token_ids'], [1])
+                self.assertFalse(list(model.output.rglob('request-*.json')))
+                self.assertFalse(list(model.output.glob('dispatch-*.json')))
+                self.assertTrue(all((replica.output / 'session/ready.json').exists() for replica in replicas))
+            self.assertTrue(all((replica.output / 'session/shutdown.json').exists() for replica in replicas))
+
+    def test_request_log_json_validation_before_worker_start(self):
+        config = self.root / 'log-options.json'
+        for value in (False, 0, None, 'invalid'):
+            config.write_text(json.dumps(dict(vars(self.args()), tp_request_log=value)))
+            with self.subTest(value=value), mock.patch.object(process_tp, 'Qwen3ProcessSession') as session:
+                with self.assertRaisesRegex(ValueError, 'tp-request-log'):
+                    make_normal_llm_model(make_normal_parser('test').parse_args([str(config)]))
+                session.assert_not_called()
+        args = make_normal_parser('test').parse_args(['missing-model', '--tp-request-log', 'off'])
+        with self.assertRaisesRegex(ValueError, 'process'):
+            make_normal_llm_model(args)
+
     def test_actual_requests_overlap_on_two_processes(self):
         self.rename_model('dp_overlap')
         with make_normal_llm_model(self.args()) as model, ThreadPoolExecutor(2) as pool:

@@ -511,6 +511,8 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--tp-binary', default='', help='进程TP协调器路径；默认从包目录或PATH查找')
     parser.add_argument('--tp-worker', default='', help='进程TP worker路径；默认从包目录或PATH查找')
     parser.add_argument('--tp-output', default='process-tp-results', help='进程TP日志根目录，每次创建独立子目录')
+    parser.add_argument('--tp-request-log', choices=['on', 'off'], default='on',
+                        help='进程后端逐请求JSON和DP分配日志；off保留启动、退出和原生错误日志')
     parser.add_argument('--tp-timeout', type=float, default=180, help='进程TP启动/单次请求超时秒数')
     parser.add_argument('--tp-request-timeout', type=float, default=120, help='进程TP HTTP排队及生成总超时秒数')
     parser.add_argument('--tp-queue-size', type=int, default=8, help='进程TP HTTP最大等待请求数')

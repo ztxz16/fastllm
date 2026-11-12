@@ -76,7 +76,7 @@ def validate_options(args, *, allow_dp=False):
     add_server_args(parser)
     defaults = vars(parser.parse_args([]))
     allowed = {'model', 'path', 'dp', 'tp', 'tp_backend', 'tp_binary', 'tp_worker', 'tp_output', 'tp_timeout',
-               'tp_request_timeout', 'tp_queue_size', 'host', 'port', 'model_name', 'cuda_graph', 'custom_allreduce'}
+               'tp_request_timeout', 'tp_queue_size', 'tp_request_log', 'host', 'port', 'model_name', 'cuda_graph', 'custom_allreduce'}
     compatible = {'dtype': ('auto', 'float16'), 'atype': ('auto', 'float16'),
                   'kv_cache_dtype': ('auto', 'float16'), 'kv_cache_layout': ('auto', 'continuous'),
                   'device': (None, ''), 'FASTLLM_ACTIVATE_NUMA': ('OFF',), 'FASTLLM_NUMA_THREADS': (27,),
@@ -168,6 +168,7 @@ class ProcessTPModel:
                                           cuda_graph=getattr(args, 'cuda_graph', False),
                                           custom_allreduce=getattr(args, 'custom_allreduce', False),
                                           prefix_cache=getattr(args, 'prefix_cache', '') == 'true',
+                                          request_log=getattr(args, 'tp_request_log', 'on') == 'on',
                                           environment=_environment)
         self.session.__enter__()
         args.path = str(self.model_path)
