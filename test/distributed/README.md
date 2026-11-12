@@ -1236,3 +1236,37 @@ python3 test/distributed/diagnose_qwen3_prefix.py \
 任一数值超差、路径错误或重复不一致返回非零，失败也保留报告。
 PASS 仅说明所比较步骤在既有容差内；它不表示冷热输出完全相同、分歧后数值已验证或独立数学正确性。
 这是定位工具，不计时、不提供性能结论，也不会修改或放宽性能验收标准。
+
+### TP并发下降的交替诊断
+
+`diagnose_qwen3_tp_concurrency.py` 专门检查同一DP1模型在并发1/4下的吞吐差异，默认TP2、optimized。
+读取已有性能报告的 `request.json`，原样使用Prompt Token、输出长度、EOS和采样配置。
+只加载一个正式模型，先建立前缀并分别预热，再以ABBA（1、4、4、1）、BAAB（4、1、1、4）交替顺序
+执行5组；每个并发共10个正式样本，每轮仍为相同的8个请求。模型、设备、热缓存和执行后端保持相同，
+不通过重启模型或修改频率来制造差异；计时、流式事件和严格Token检查复用正式DP测速入口。
+
+```bash
+# 使用已经验收的双向P2P/原生原子GPU对；本机原GPU0与GPU3。
+export CUDA_VISIBLE_DEVICES="GPU-a88c9669-989e-a8dd-22a0-94a45b467c49,GPU-0310107f-031e-6fcd-eb65-6dfa45981711"
+bash test/distributed/diagnose_qwen3_tp_concurrency_v100.sh \
+  /home/models/Qwen3-1.7B test/distributed/results/实际性能报告目录/request.json
+```
+
+默认每秒由独立Python进程只读采集GPU UUID、频率、功耗、温度、利用率和时钟限制原因，以及测试进程
+及后代的累计CPU时间、CPU使用率、亲和性和可用的cgroup v2 CPU计数。采样进程不导入模型或创建CUDA
+上下文；测试失败或中断时回收。时钟原因字段不支持时明确记录降级，基础GPU查询失败或观察进程提前退出
+会使诊断失败。cgroup路径和不可用信息原样保存，不能把缺失信息理解为没有CPU配额或没有限流。
+GPU字段含义见 [NVIDIA nvidia-smi文档](https://docs.nvidia.com/deploy/nvidia-smi/index.html)。
+
+报告包含 `summary.md/csv/json/xlsx`、全部原始生成结果、`telemetry.jsonl`、`timeline.json` 和
+`observations.xlsx`（Timeline/GPU/CPU/Cgroup四张表及对应CSV）。主线程的采样校验和报告IO在计时外；
+观察进程与生成同时运行，可能带来观察开销。CPU使用率100%表示占用一个逻辑CPU，进程总量可以超过100%。
+CPU表的 `cpu_interval_start/end` 标出两次CPU快照之间的实际区间，`cpu_overlapping_sequences` 标出
+该区间涉及的测量轮次；首次快照没有CPU使用率，不能把累计区间误当成当前GPU查询窗口。
+GPU利用率有自己的采样周期，时间窗口重叠和相关性不能单独证明因果。GPU汇总只纳入采集窗口完整落在
+对应计时内的目标UUID样本，边界样本仍保留在原始表格中。所有浮点展示保留三位，JSON保留原始精度。
+
+`throughput_ratio_vs_c1` 是同一TP/profile下C1 Median批耗时除以当前并发Median批耗时；
+`within_block_c4_over_c1_ratios` 用各组同等工作量的累计耗时计算。它们用于分析并发变化，不是DP扩展收益。
+可追加 `--no-telemetry` 检查观察开销，或 `--tp 1` / `--profile common` 做单独控制实验；不同profile
+或不同采样状态的结果必须分别标识，不能混算加速比。脚本不安装依赖、不重新编译、不改变GPU或CPU设置。
