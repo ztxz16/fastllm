@@ -29,12 +29,100 @@ int ParseInt(const std::string &text) {
 }
 
 /**
+ * 通过公开控制接口验证等待其他 rank 时的退出唤醒、诊断和正常关闭。
+ *
+ * 专用 Python worker 通过文件屏障决定退出顺序，避免用随机睡眠猜测执行阶段。
+ * 返回耗时包含故障发现和整组回收，不将其标记为纯检测延迟或推理性能。
+ * @param options 必须使用 controlOnly 和两个逻辑设备，不初始化 CUDA。
+ * @param caseName watch_ 前缀的故障夹具场景。
+ * @param report 记录任务截止时间、错误原因、返回耗时及实际回收状态。
+ */
+void RunWatchCase(ProcessGroupOptions options, const std::string &caseName, json11::Json::object &report) {
+    Require(options.controlOnly && options.devices.size() == 2, "watch cases require control-only TP=2");
+    const std::string mode = caseName.substr(6);
+    const bool startup = mode == "startup_peer_exit", stall = mode == "stall";
+    const bool shutdown = mode == "shutdown_order";
+    options.startupTimeoutMs = 30000;
+    options.operationTimeoutMs = stall ? 1000 : 30000;
+    options.shutdownTimeoutMs = 1000;
+    // 确保故障由被测公开调用触发，而非空闲心跳抢先执行 Ping。
+    options.heartbeatIntervalMs = 60000;
+    report["operation_timeout_ms"] = startup ? options.startupTimeoutMs : options.operationTimeoutMs;
+    report["shape"] = "control-only TP=2; protocol fixture; no tensor output";
+
+    ProcessGroup group;
+    auto started = std::chrono::steady_clock::now();
+    bool rejected = false;
+    bool startupComplete = false;
+    try {
+        group.Start(options);
+        startupComplete = true;
+        started = std::chrono::steady_clock::now();
+        group.Ping();
+    } catch (const std::exception &e) {
+        rejected = true;
+        report["observed_error"] = e.what();
+    }
+    double elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+    report["failure_return_ms"] = elapsed;
+    report["failure_phase"] = startupComplete ? "ping" : "startup";
+    Require(startupComplete != startup, "failure occurred outside the intended phase");
+
+    if (shutdown) {
+        Require(!rejected, "normal fixture failed before shutdown: " + group.LastError());
+        group.Stop();
+        Require(group.LastError().empty(), "normal peer exit was treated as a crash: " + group.LastError());
+        group.Stop();
+        // 验证上下文未持有上一次启动的失效句柄。
+        group.Start(options);
+        group.Ping();
+        group.Stop();
+        Require(group.LastError().empty(), "restart shutdown failed: " + group.LastError());
+    } else {
+        Require(rejected && group.State() == ProcessGroupState::Failed, "watch case did not fail the group");
+        const std::string error = group.LastError();
+        if (stall) {
+            Require(error.find("timeout") != std::string::npos && elapsed >= 900,
+                    "live stalled worker did not follow the original deadline: " + error);
+        } else {
+            int rank = (mode == "current_error_exit" || mode == "reply_then_exit") ? 0 : 1;
+            report["fault_rank"] = rank;
+            Require(error.rfind("rank " + std::to_string(rank), 0) == 0,
+                    "reported waiting rank instead of failed rank: " + error);
+            Require(error.find("timeout") == std::string::npos, "worker exit fell through to timeout: " + error);
+            if (mode == "buffered_error_exit" || mode == "current_error_exit") {
+                Require(error.find("injected worker failure before exit") != std::string::npos,
+                        "lost complete worker error: " + error);
+            }
+            if (mode == "stale_error_exit" || mode == "partial_error_exit") {
+                Require(error.find("injected worker failure") == std::string::npos,
+                        "accepted stale or incomplete diagnostic: " + error);
+            }
+        }
+        Require(elapsed < 5000, "failure response waited too long (includes cleanup)");
+        Require(group.Workers().empty(), "failed group left unreaped workers");
+        bool commandRejected = false;
+        try { group.Ping(); } catch (const std::exception &) { commandRejected = true; }
+        Require(commandRejected, "failed group accepted another command");
+        group.Stop();
+        group.Stop();
+        Require(group.LastError() == error, "cleanup overwrote the original failure");
+    }
+    Require(group.State() == ProcessGroupState::Stopped && group.Workers().empty(), "watch case leaked workers");
+    report["workers_reaped"] = true;
+}
+
+/**
  * 通过公开 ProcessGroup 接口验证结果及生命周期，不加载模型。
  * @param options 与正式进程底座共用的启动参数。
  * @param caseName 正常运行、重启或故障注入场景名。
  * @param report 保存实际返回值、误差和实际 worker 元数据，异常时保留部分结果。
  */
 void Run(ProcessGroupOptions options, const std::string &caseName, json11::Json::object &report) {
+    if (caseName.rfind("watch_", 0) == 0) {
+        RunWatchCase(options, caseName, report);
+        return;
+    }
     ProcessGroup group;
     if (caseName == "invalid_devices") {
         options.devices = {0, 0};
