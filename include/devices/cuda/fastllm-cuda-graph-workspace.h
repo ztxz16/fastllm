@@ -37,4 +37,19 @@ public:
 // transaction: reservation never reads/writes them. Other graph owners stay pinned.
 // A capacity failure preserves live allocations and CUDA error flags.
 bool FastllmCudaReserveGraphWorkspace(const std::vector<size_t> &requests);
+// Captures in one group may alias transient scratch. The caller must execute
+// those graphs serially (or establish stream dependencies), prepare persistent
+// outputs before capture, and keep the identity alive until all graphs die.
+// Only reservation/capture can borrow pinned scratch; eager/prefill allocations
+// and live Data storage remain isolated. Nested scopes restore the prior group.
+const void *FastllmCudaSetGraphScratchGroup(const void *group);
+class FastllmCudaGraphScratchGroup {
+    const void *previous;
+public:
+    explicit FastllmCudaGraphScratchGroup(const void *group)
+        : previous(FastllmCudaSetGraphScratchGroup(group)) {}
+    ~FastllmCudaGraphScratchGroup() { FastllmCudaSetGraphScratchGroup(previous); }
+    FastllmCudaGraphScratchGroup(const FastllmCudaGraphScratchGroup &) = delete;
+    FastllmCudaGraphScratchGroup &operator=(const FastllmCudaGraphScratchGroup &) = delete;
+};
 #endif

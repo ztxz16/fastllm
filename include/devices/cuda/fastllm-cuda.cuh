@@ -285,6 +285,13 @@ bool FastllmCudaGraphQwen35MoeSelfTest();
 // compatibility.
 // Callers must keep persistent branch buffers disjoint. Within a graph pool,
 // temporary reuse and collectives in both branches retain serial dependencies.
+// Begin an independent two-branch region in an owned capture pool. The
+// negative id is unique in this capture; warmup records branch scratch needs.
+// Zero means neither capture nor allocation recording is active.
+// Unlike the conservative legacy markers, second-branch temporary allocations
+// cannot reuse first-branch scratch until the join. Persistent inputs/outputs
+// must still be disjoint; shared library workspaces retain serial dependencies.
+int FastllmCudaGraphBeginIndependentRegion();
 void FastllmCudaGraphRecordCollective();
 inline bool FastllmCudaGraphSetParallelMarkersEnabled(bool enabled) {
     return FastllmCudaGraphSetQwen35MoeMarkersEnabled(enabled);
@@ -515,6 +522,10 @@ bool FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(
 bool FastllmCudaMemcpy2DDeviceToDeviceAsyncCurrentThread(
     void *dst, size_t dstPitch, const void *src, size_t srcPitch,
     size_t widthBytes, size_t height);
+// Explicit-stream variant; the caller owns source/destination lifetime and dependencies.
+bool FastllmCudaBatchCopyFromDeviceToDeviceAsync(
+    void *const *dsts, const void *const *srcs,
+    const size_t *sizes, int count, void *stream);
 bool FastllmCudaBatchCopyFromDeviceToDeviceAsyncCurrentThread(
     void *const *dsts, const void *const *srcs, const size_t *sizes, int count);
 
@@ -840,6 +851,23 @@ bool FastllmCudaQwen4TopProbability(const float *logits, float *output,
 // Preserve TopK's token id and compute confidence without a host round trip.
 bool FastllmCudaQwen4TopProbabilityFromTopK(const float *logits, float *output,
                                            int vocabulary, const float *top);
+// Independent request storage with packed projection rows. Device metadata is
+// [previous_length, valid_rows]; the second field is optional for ordinary decode.
+struct FastllmCudaQwen4QSARequest {
+    fastllm::Data *key, *value, *tailKeys, *tailPositions, *blocks;
+    const fastllm::Data *positions, *meta;
+    fastllm::Data *scores, *selected, *rawKeyCapture;
+    int rows;
+};
+bool FastllmCudaQwen4QSABatchGraph(
+    const std::vector<FastllmCudaQwen4QSARequest> &requests,
+    const fastllm::Data &queryGate, const fastllm::Data &key, const fastllm::Data &value,
+    const fastllm::Data &indexProjection, const fastllm::Data &queryNorm,
+    const fastllm::Data &keyNorm, const fastllm::Data &indexQueryNorm,
+    const fastllm::Data &indexKeyNorm, fastllm::Data &output,
+    int heads, int keyHeads, int headDim, int indexHeads, int indexDim,
+    int ratio, int budget, int rotaryDim, float theta, float eps);
+
 bool FastllmCudaQwen4QSASelect(const fastllm::Data &query,
                                const fastllm::Data &compressedKeys,
                                fastllm::Data &indices, int keyLength,
@@ -1003,6 +1031,17 @@ bool FastllmCudaQwen4GatedDeltaRuleDecodeOutput(
         const fastllm::Data &gate, fastllm::Data &state,
         fastllm::Data &output, int keyHeads, int valueHeads,
         float recurrentEps, float normEps, bool tiledOutput);
+// Independent single-token requests share one launch per bounded argument
+// tile. Any request count is supported; validation failure changes no state.
+struct FastllmCudaQwen4GdnDecodeRequest {
+    const fastllm::Data *qkv, *alpha, *beta, *gate;
+    fastllm::Data *state, *output;
+};
+bool FastllmCudaQwen4GatedDeltaRuleDecodeOutputBatch(
+        const std::vector<FastllmCudaQwen4GdnDecodeRequest> &requests,
+        const fastllm::Data &aLog, const fastllm::Data &dtBias,
+        const fastllm::Data &normWeight, int keyHeads, int valueHeads,
+        float recurrentEps, float normEps);
 // Exact verifier tail for Qwen4 GDN: FP32->FP16 (round-to-zero), RMSNorm,
 // FP16 sigmoid and FP16 multiply retain the same boundaries as the four
 // standard operations while sharing one launch. Unsupported layouts return
@@ -1025,6 +1064,34 @@ struct FastllmCudaQwen4LinearReplayItem {
     fastllm::Data *recurrentState = nullptr;
     fastllm::Data *coreOutput = nullptr;
 };
+
+// Record the already computed rank-one recurrent updates during verification.
+// Each record contains normalized key[128], innovation[128], and decay[1].
+// Unsupported layouts return false before modifying any state.
+bool FastllmCudaQwen4GatedDeltaRuleCaptureUpdates(
+    const fastllm::Data &qkv, const fastllm::Data &alpha, const fastllm::Data &beta,
+    const fastllm::Data &aLog, const fastllm::Data &dtBias, fastllm::Data &state,
+    fastllm::Data &nextState, fastllm::Data &output, fastllm::Data &updates,
+    int keyHeads, int valueHeads, float recurrentEps);
+struct FastllmCudaQwen4LinearCommitItem {
+    const fastllm::Data *convInput, *convCheckpoint, *recurrentCheckpoint, *updates;
+    fastllm::Data *convState, *recurrentState;
+};
+struct FastllmCudaQwen4LinearUpdate {
+    const void *input;
+    const float *convCheckpoint, *recurrentCheckpoint, *updates;
+    float *convState, *recurrentState;
+    int batch, heads, channels, rows, kernel, inputType;
+};
+// Preparation validates every tensor before any mutation. Prepared pointers
+// remain borrowed until launch completion; the caller owns their lifetime.
+bool FastllmCudaQwen4PrepareLinearUpdates(
+    const std::vector<FastllmCudaQwen4LinearCommitItem> &items, int committedInputs,
+    std::vector<FastllmCudaQwen4LinearUpdate> &prepared);
+void FastllmCudaQwen4LaunchLinearUpdates(
+    const std::vector<FastllmCudaQwen4LinearUpdate> &prepared, int committedInputs, void *stream);
+bool FastllmCudaQwen4CommitLinearUpdates(
+    const std::vector<FastllmCudaQwen4LinearCommitItem> &items, int committedInputs);
 
 // Replays independent linear-attention cache transitions after a rejected
 // speculative suffix.  Every item has the same Qwen GDN geometry, allowing
@@ -2937,4 +3004,23 @@ bool FastllmCudaCreateNativeMoeReplayGraph(void *graph, void *const *handles, in
 // Host bitset, applied before temperature/top-k/top-p on the calling stream.
 void FastllmCudaApplyTokenMask(float *logits, const uint32_t *mask, int vocab);
 
+
+// Fused HC read. Unsupported geometry/layout returns false before any write.
+bool FastllmCudaQwen4HyperRead(const fastllm::Data &input,
+    const fastllm::Data *block, const fastllm::Data *previousInjection,
+    const fastllm::Data &norm, const fastllm::Data &down, const fastllm::Data &up,
+    const fastllm::Data *inject, fastllm::Data *residual, fastllm::Data &mixed,
+    fastllm::Data *injection, int groups, float eps, int rowTile = 4, int columns = 16, bool planar = false);
+
+// The callback is the existing model arithmetic, also used as the tuner oracle.
+bool FastllmCudaQwen4SelectHyperRead(const fastllm::Data &input,
+    const fastllm::Data *block, const fastllm::Data *previousInjection,
+    const fastllm::Data &norm, const fastllm::Data &down, const fastllm::Data &up,
+    const fastllm::Data *inject, fastllm::Data *residual, fastllm::Data &mixed,
+    fastllm::Data *injection, int groups, float eps, bool referenceMode,
+    const std::function<void()> &reference);
+
 #endif // FASTLLM_CUDA_CUH
+
+// Device alias for mapped pinned storage, or nullptr when unavailable.
+void *FastllmCudaHostDevicePointer(void *pointer);

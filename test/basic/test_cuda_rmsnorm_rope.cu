@@ -13,30 +13,30 @@ static void Check(cudaError_t e) { if (e != cudaSuccess) throw std::runtime_erro
 static void Allocate(Data &d) { d.dataDevice=DataDevice::CUDA; d.dataDeviceIds={0}; d.Allocate(false); }
 static double maxRelativeL2 = 0, maxAbsolute = 0;
 static size_t totalMismatches = 0;
-static void Compare(int batch, int sequence, int heads, int dim, int rotate, bool precise) {
+static void Compare(int batch, int sequence, int heads, int dim, int rotate, bool precise, float theta=1000000.f, float ropeScale=1.f) {
     Data input(FLOAT16,{batch,sequence,heads,dim}), reference(FLOAT16,input.dims), original(FLOAT16,input.dims);
     Data weight(FLOAT32,{dim}), positions(FLOAT32,{batch,sequence+2});
     for (Data *p : {&input,&reference,&original,&weight,&positions}) Allocate(*p);
     std::mt19937 rng(943+dim+sequence); std::vector<half>x(input.Count(0)); std::vector<float>w(dim),p(positions.Count(0));
     for (auto &v:x) v=__float2half((int(rng()%4001)-2000)/997.f);
     for (auto &v:w) v=(int(rng()%2001)-500)/1000.f;
-    for (auto &v:p) v=rng()%262144;
+    for (auto &v:p) v=rng()%2097152;
     Check(cudaMemcpy(original.cudaData,x.data(),x.size()*sizeof(half),cudaMemcpyHostToDevice));
     Check(cudaMemcpy(weight.cudaData,w.data(),w.size()*4,cudaMemcpyHostToDevice));
     Check(cudaMemcpy(positions.cudaData,p.data(),p.size()*4,cudaMemcpyHostToDevice));
     auto restore=[&]{Check(cudaMemcpyAsync(input.cudaData,original.cudaData,input.GetBytes(),cudaMemcpyDeviceToDevice,cudaStreamPerThread));};
     restore();
-    if (!FastllmCudaRMSNormRope(input,weight,positions,1e-6f,rotate,1000000.f,1.f,precise)) throw std::runtime_error("fused declined");
+    if (!FastllmCudaRMSNormRope(input,weight,positions,1e-6f,rotate,theta,ropeScale,precise)) throw std::runtime_error("fused declined");
     Check(cudaDeviceSynchronize());
     cudaGraph_t graph; cudaGraphExec_t exec;
     Check(cudaStreamBeginCapture(cudaStreamPerThread,cudaStreamCaptureModeThreadLocal));
-    restore(); FastllmCudaRMSNormRope(input,weight,positions,1e-6f,rotate,1000000.f,1.f,precise);
+    restore(); FastllmCudaRMSNormRope(input,weight,positions,1e-6f,rotate,theta,ropeScale,precise);
     Check(cudaStreamEndCapture(cudaStreamPerThread,&graph)); Check(cudaGraphInstantiate(&exec,graph,nullptr,nullptr,0));
     for (int replay=0;replay<3;++replay) {
-        for (auto &v:p) v=rng()%262144;
+        for (auto &v:p) v=rng()%2097152;
         Check(cudaMemcpy(positions.cudaData,p.data(),p.size()*4,cudaMemcpyHostToDevice));
         FastllmCudaRMSNorm(original,weight,reference,1e-6f);
-        FastllmCudaRopeEncoding(reference,positions,rotate,1000000.f,1.f,precise);
+        FastllmCudaRopeEncoding(reference,positions,rotate,theta,ropeScale,precise);
         Check(cudaGraphLaunch(exec,cudaStreamPerThread)); Check(cudaDeviceSynchronize());
         std::vector<half>a(x.size()),b(x.size());
         Check(cudaMemcpy(a.data(),input.cudaData,input.GetBytes(),cudaMemcpyDeviceToHost));
@@ -63,6 +63,9 @@ extern "C" int main(int argc,char **argv) {try {
     int count=0;
     for (int dim : {64,128,192,256,384,510}) for (int rows : {1,2,4,7,17}) for(bool precise : {false,true}) {
         Compare(rows,1,3,dim,64,precise); Compare(3,rows,2,dim,dim,precise);count+=2;
+    }
+    for (float theta : {10000.f, 500000.f, 1000000.f}) for (float scale : {1.f, 2.f, 8.f}) {
+        Compare(2,3,4,128,64,true,theta,scale); ++count;
     }
     Data bad(FLOAT32,{1,1,1,128}),w(FLOAT32,{128}),p(FLOAT32,{1,1});
     if(FastllmCudaRMSNormRope(bad,w,p,1e-6f,64,10000.f,1.f,true)) throw std::runtime_error("unsupported dtype accepted");
