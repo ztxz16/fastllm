@@ -139,7 +139,7 @@ def main():
     try:
         modules = ['test_parallel_config', 'test_process_tp_options', 'test_process_tp_entrypoint']
         if args.execution_tests:
-            modules += ['test_process_dp', 'test_qwen3_session', 'test_qwen3_http']
+            modules += ['test_process_dp', 'test_dp_routing', 'test_qwen3_session', 'test_qwen3_http']
         if args.benchmark_tests:
             modules += ['test_benchmark_qwen3_dp', 'test_diagnose_qwen3_prefix', 'test_tp_concurrency_diagnostic']
         suite = unittest.defaultTestLoader.loadTestsFromNames(modules)

@@ -13,7 +13,7 @@ import threading
 import time
 
 from .tp_process_utils import isolated_process, wait_case
-from .tp_graph import validate_graph, validate_allreduce, validate_prefix
+from .tp_graph import validate_graph, validate_allreduce, validate_prefix, validate_prefix_directory
 
 BACKEND = "qwen3_process_generate_cublas_nccl"
 EMPTY = dict(active=False, tokens=0, capacity=0, device_bytes=0)
@@ -313,6 +313,13 @@ class Qwen3ProcessSession:
             self._cancel_event = None
             self._observer_error = None
             self._lock.release()
+
+    def prefix_directory(self):
+        """/** 返回最近一次已校验的原生目录副本；调用方独占副本时使用，不查询GPU或推测缓存。 */"""
+        if self.state != 'ready' or not self.prefix_cache or not self._graph_state:
+            raise RuntimeError('prefix directory requires a ready prefix-cache session')
+        directory = validate_prefix_directory(self._graph_state[0]['prefix_cache'], required=True)
+        return copy.deepcopy(directory)
 
     def clear_prefix_cache(self):
         """串行等待当前请求结束后清空 GPU 快照，保留模型、规约器及累计计数。"""

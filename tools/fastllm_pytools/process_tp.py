@@ -75,7 +75,7 @@ def validate_options(args, *, allow_dp=False):
     parser = make_normal_parser('process validation')
     add_server_args(parser)
     defaults = vars(parser.parse_args([]))
-    allowed = {'model', 'path', 'dp', 'tp', 'tp_backend', 'tp_binary', 'tp_worker', 'tp_output', 'tp_timeout',
+    allowed = {'model', 'path', 'dp', 'dp_routing', 'tp', 'tp_backend', 'tp_binary', 'tp_worker', 'tp_output', 'tp_timeout',
                'tp_request_timeout', 'tp_queue_size', 'tp_request_log', 'host', 'port', 'model_name', 'cuda_graph', 'custom_allreduce'}
     compatible = {'dtype': ('auto', 'float16'), 'atype': ('auto', 'float16'),
                   'kv_cache_dtype': ('auto', 'float16'), 'kv_cache_layout': ('auto', 'continuous'),
@@ -223,11 +223,16 @@ class ProcessTPModel:
 
     def stream_response(self, query, history=None, max_length=32, top_k=0, top_p=1.0,
                         temperature=0.0, repeat_penalty=1.0, seed=0):
-        """有界增量输出；提前关闭迭代器时取消、排空原生响应并释放 KV 后再返回。"""
+        """/** 将文本转换为请求，复用有界流的取消、排空和KV清理语义。 */"""
+        with self._text_lock:
+            request = self._request(query, history, max_length, top_k, top_p, temperature, repeat_penalty, seed)
+        yield from self._stream_request(request)
+
+    def _stream_request(self, request):
+        """/** 执行已分词的正式请求；DP在分发前准备相同Token，提前关闭流仍取消并等待回收。 */"""
         from .qwen3_process_server import IncrementalTextDecoder
 
         with self._text_lock:
-            request = self._request(query, history, max_length, top_k, top_p, temperature, repeat_penalty, seed)
             events, cancel, done, errors = queue.Queue(maxsize=64), threading.Event(), threading.Event(), []
             decoder = IncrementalTextDecoder(self.hf_tokenizer)
 

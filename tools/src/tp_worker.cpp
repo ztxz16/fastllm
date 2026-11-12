@@ -341,6 +341,13 @@ struct DeviceRuntime {
         Put64(result, info.prefix.lastComputedTokens);
         Put64(result, info.prefix.evictions);
         Put64(result, info.prefix.clears);
+        Put32(result, 1); // 前缀目录协议版本；必须与协调器一起更新。
+        Put32(result, info.prefix.snapshots.size());
+        for (const auto &snapshot : info.prefix.snapshots) {
+            Put32(result, snapshot.first);
+            Put32(result, snapshot.second.size());
+            for (auto token : snapshot.second) Put32(result, token);
+        }
         return result;
 #else
         throw std::runtime_error("worker built without CUDA");

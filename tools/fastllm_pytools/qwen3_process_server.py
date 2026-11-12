@@ -214,6 +214,7 @@ class ChatService:
                         queued_request_ids=[job.id for job in self._queue], queue_capacity=self.queue_size,
                         workers=self.session.ready["workers"], model_load_count=self.session.ready.get('model_load_count', 1),
                         dp_size=getattr(self.session, 'dp_size', 1),
+                        dp_routing=getattr(self.session, 'routing', 'round_robin'),
                         replicas=self.session.ready.get('replicas', []))
 
     def _emit(self, job, text):

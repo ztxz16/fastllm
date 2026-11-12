@@ -13,6 +13,13 @@ inline json11::Json::array GraphState(fastllm::distributed::ProcessGroup &group)
     json11::Json::array states;
     for (const auto &info : group.Qwen3Requests()) {
         const auto &g = info.graph;
+        json11::Json::array snapshots;
+        for (const auto &snapshot : info.prefix.snapshots) {
+            json11::Json::array ids;
+            for (auto token : snapshot.second) ids.push_back(static_cast<long long>(token));
+            snapshots.push_back(json11::Json::object{{"position_begin", static_cast<long long>(snapshot.first)},
+                {"token_ids", ids}});
+        }
         // json11 的 double 会输出带小数点的数字；计数/字节必须走整数重载，
         // 否则 Python 解码为 float，启动阶段的严格协议检查就会拒绝。
         states.push_back(json11::Json::object{{"enabled", g.enabled}, {"active", g.active},
@@ -32,7 +39,8 @@ inline json11::Json::array GraphState(fastllm::distributed::ProcessGroup &group)
                 {"last_reused_tokens", static_cast<long long>(info.prefix.lastReusedTokens)},
                 {"last_computed_tokens", static_cast<long long>(info.prefix.lastComputedTokens)},
                 {"evictions", static_cast<long long>(info.prefix.evictions)},
-                {"clears", static_cast<long long>(info.prefix.clears)}}}});
+                {"clears", static_cast<long long>(info.prefix.clears)},
+                {"directory_version", 1}, {"snapshots", snapshots}}}});
     }
     return states;
 }
