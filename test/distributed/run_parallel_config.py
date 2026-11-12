@@ -139,11 +139,13 @@ def main():
     try:
         modules = ['test_parallel_config', 'test_process_tp_options', 'test_process_tp_entrypoint']
         if args.execution_tests:
-            modules += ['test_process_dp', 'test_dp_routing', 'test_dp_service_stability', 'test_qwen3_session', 'test_qwen3_http']
+            modules += ['test_process_dp', 'test_dp_routing', 'test_dp_service_stability', 'test_qwen3_session',
+                        'test_qwen3_http', 'test_qwen3_generation', 'test_qwen3_prefix_cache', 'test_qwen3_decode_runner']
         if args.benchmark_tests:
-            modules += ['test_benchmark_qwen3_dp', 'test_benchmark_dp_routing', 'test_diagnose_qwen3_prefix', 'test_tp_concurrency_diagnostic']
+            modules += ['test_benchmark_qwen3_dp', 'test_benchmark_dp_routing', 'test_diagnose_qwen3_prefix', 'test_tp_concurrency_diagnostic', 'test_dp_lengths']
         suite = unittest.defaultTestLoader.loadTestsFromNames(modules)
         metadata['expected_case_count'] = suite.countTestCases() + int(args.real_cuda)
+        print(f'RUN: {metadata["expected_case_count"]} Python cases; logs: {output}', flush=True)
         save_report(output, rows, metadata)
         with (output / 'unittest.stdout.log').open('w', encoding='utf-8') as stdout, \
                 (output / 'unittest.stderr.log').open('w', encoding='utf-8') as stderr:
