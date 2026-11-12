@@ -39,6 +39,9 @@ class DPLengthTests(unittest.TestCase):
     def test_real_http_mixed_lengths_tp_and_reports(self):
         code, output, report = self.invoke()
         self.assertEqual((code, report['status'], report['complete']), (0, 'PASS', True), report)
+        self.assertEqual([r['concurrency'] for r in report['cases']], [1, 2, 4])
+        self.assertEqual(report['metadata']['repeat_orders'], [[1, 2, 4], [2, 4, 1], [4, 1, 2], [1, 2, 4], [2, 4, 1]])
+        inputs = json.loads((output / 'inputs.json').read_text())
         for row in report['cases']:
             self.assertEqual(len(row['samples']), 5)
             self.assertEqual(row['requests'], 60)
@@ -49,28 +52,57 @@ class DPLengthTests(unittest.TestCase):
             for sample in row['samples']:
                 self.assertEqual({r['prompt_tokens'] for r in sample['records']}, {64, 256, 512})
                 self.assertEqual({r['generated_tokens'] for r in sample['records']}, {2, 4})
+                self.assertEqual([r['payload'] for r in sample['records']], [item['payload'] for item in inputs])
+                for record in sample['records']:
+                    latency = 1000*(record['end']-record['start'])
+                    self.assertGreaterEqual(record['client_wait_ms'], 0)
+                    self.assertAlmostEqual(record['completion_ms'], record['client_wait_ms'] + latency)
+                    self.assertLessEqual(record['completion_ms'], sample['elapsed_s']*1000)
         self.assertEqual(report['cases'][0]['speedup_vs_c1'], 1)
         for suffix in ('json', 'csv', 'md', 'xlsx'):
             self.assertTrue((output / ('summary.' + suffix)).is_file())
         self.assertEqual(report['metadata']['gpu_memory_observed'][0]['max_used_mib'], 123.5)
+        self.assertIn('p95_completion_ms', (output / 'summary.csv').read_text().splitlines()[0])
+        self.assertIn('p95_client_wait_ms', (output / 'inputs.csv').read_text().splitlines()[0])
+
+        # 即使另外两档已经PASS，缺少C=DP也不能生成整体PASS报告。
+        rows = [row for row in report['cases'] if row['concurrency'] != 2]
+        self.assertEqual(runner.save(output, rows, report['metadata']), 'FAIL')
+        self.assertFalse(json.loads((output / 'summary.json').read_text())['complete'])
 
     def test_real_http_pure_dp(self):
         code, _, report = self.invoke('--dp', '4', '--tp', '1')
         self.assertEqual(code, 0, report)
-        self.assertEqual(report['cases'][1]['concurrency'], 8)
+        self.assertEqual([r['concurrency'] for r in report['cases']], [1, 4, 8])
 
     def test_wrong_native_output_fails_with_raw_evidence(self):
         original = runner.MixedService.native
         def corrupt(service, record):
             value = original(service, record)
-            if record['id'].startswith('r0-'):
+            if record['id'].startswith('r0-dp2_tp2_c2-'):
                 value['token_ids'][0] += 1
             return value
         with mock.patch.object(runner.MixedService, 'native', corrupt):
             code, output, report = self.invoke()
         self.assertEqual((code, report['status'], report['complete']), (1, 'FAIL', False))
-        self.assertEqual(report['cases'][0]['failed_elements'], 1)
-        self.assertTrue((output / 'raw/r0-dp2_tp2_c1.json').is_file())
+        self.assertEqual(len(report['cases'][0]['samples']), 1)
+        self.assertEqual(report['cases'][1]['failed_elements'], 1)
+        self.assertEqual(report['cases'][2]['samples'], [])
+        self.assertTrue((output / 'raw/r0-dp2_tp2_c2.json').is_file())
+
+    def test_completion_statistics_include_client_wait(self):
+        samples = [dict(elapsed_s=4, records=[
+            dict(start=11, end=11.5, first_content=None, generated_tokens=2, queue_ms=100, service_ms=300,
+                 client_wait_ms=1000, completion_ms=1500),
+            dict(start=13, end=14, first_content=13.2, generated_tokens=4, queue_ms=200, service_ms=700,
+                 client_wait_ms=3000, completion_ms=4000)])]
+        metrics = runner.stats(samples)
+        self.assertEqual(metrics['median_request_ms'], 750)
+        self.assertEqual(metrics['median_client_wait_ms'], 2000)
+        self.assertEqual(metrics['median_completion_ms'], 2750)
+        self.assertEqual(metrics['p95_completion_ms'], 3875)
+        self.assertEqual(metrics['output_tokens_per_s'], 1.5)
+        self.assertAlmostEqual(metrics['median_first_content_ms'], 200)
 
     def test_sampling_error_cannot_be_hidden_by_successful_requests(self):
         original = runner.MemorySampler.sample

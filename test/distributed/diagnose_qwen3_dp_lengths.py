@@ -110,7 +110,7 @@ class MemorySampler:
 
 
 def run_wave(service, inputs, concurrency, label):
-    """/** 固定相同工作量并发提交；计时不含分词、模型加载、测试校验和测试文件写入。 */"""
+    """/** 固定工作量按客户端通道提交；计时包含服务分词，测试输入构造、校验和落盘在计时外。 */"""
     barrier = threading.Barrier(concurrency + 1)
     records, lock = [], threading.Lock()
     def client(lane):
@@ -145,7 +145,9 @@ def run_wave(service, inputs, concurrency, label):
         result.update(queue_ms=timing['queue_ms'], service_ms=timing['service_ms'], dp_rank=audit['dp_rank'],
                       generated_tokens=audit['response']['usage']['completion_tokens'],
                       prompt_tokens=audit['response']['usage']['prompt_tokens'])
-        require(result['end'] >= result['start'], 'invalid client clock order')
+        require(start <= result['start'] <= result['end'] <= end, 'invalid client clock order')
+        # 同一轮的输入均已就绪；单独记录尚未提交的等待，避免将排队移到客户端误判为改善。
+        result.update(client_wait_ms=1000*(result['start']-start), completion_ms=1000*(result['end']-start))
         if result['payload']['stream'] and audit['response']['choices'][0]['message']['content']:
             require(result['first_content'] is not None, 'missing first content timestamp')
     service.idle()
@@ -163,6 +165,8 @@ def stats(samples):
                   output_tokens_per_s=statistics.median(sum(r['generated_tokens'] for r in s['records'])/s['elapsed_s'] for s in samples),
                   requests=len(records))
     for name, values in [('request', [1000*(r['end']-r['start']) for r in records]),
+                         ('client_wait', [r['client_wait_ms'] for r in records]),
+                         ('completion', [r['completion_ms'] for r in records]),
                          ('queue', [r['queue_ms'] for r in records]),
                          ('service', [r['service_ms'] for r in records]),
                          ('first_content', [1000*(r['first_content']-r['start']) for r in records if r['first_content'] is not None])]:
@@ -173,13 +177,15 @@ def stats(samples):
 
 FIELDS = ['case', 'status', 'dp', 'tp', 'concurrency', 'requests', 'median_batch_ms', 'p95_batch_ms', 'batch_cv_pct',
           'median_request_ms', 'p95_request_ms', 'median_queue_ms', 'p95_queue_ms', 'median_service_ms', 'p95_service_ms',
+          'median_client_wait_ms', 'p95_client_wait_ms', 'median_completion_ms', 'p95_completion_ms',
           'median_first_content_ms', 'p95_first_content_ms', 'output_tokens_per_s', 'speedup_vs_c1',
           'max_abs_error', 'mean_abs_error', 'failed_elements', 'backend', 'reason']
 
 
 def save(output, rows, metadata):
     """/** 即使失败也保存四种报告和原始样本；未完成五轮不能报告整体PASS。 */"""
-    complete = len(rows) == 2 and all(len(r['samples']) == metadata['repeats'] for r in rows)
+    complete = ([r['concurrency'] for r in rows] == metadata['concurrency_levels'] and
+                all(len(r['samples']) == metadata['repeats'] for r in rows))
     status = 'PASS' if complete and all(r['status'] == 'PASS' for r in rows) else 'FAIL'
     (output / 'summary.json').write_text(json.dumps(dict(status=status, complete=complete, metadata=metadata, cases=rows), ensure_ascii=False, indent=2))
     def display(value):
@@ -194,11 +200,14 @@ def save(output, rows, metadata):
     lines += ['| ' + ' | '.join(v.replace('|', '\\|').replace('\n', ' ') for v in row) + ' |' for row in values]
     lines += ['', '```json', json.dumps(metadata, ensure_ascii=False, indent=2), '```']
     (output / 'summary.md').write_text('\n'.join(lines))
-    sample_fields = ['case', 'repeat', 'input', 'prompt_tokens', 'output_tokens', 'latency_ms', 'queue_ms', 'service_ms', 'first_content_ms', 'dp_rank']
+    sample_fields = ['case', 'repeat', 'input', 'prompt_tokens', 'output_tokens', 'latency_ms', 'queue_ms', 'service_ms',
+                     'client_wait_ms', 'completion_ms', 'first_content_ms', 'dp_rank']
     samples = [[row['case'], i, r['input_name'], r['prompt_tokens'], r['generated_tokens'], 1000*(r['end']-r['start']),
-                r['queue_ms'], r['service_ms'], None if r['first_content'] is None else 1000*(r['first_content']-r['start']), r['dp_rank']]
+                r['queue_ms'], r['service_ms'], r['client_wait_ms'], r['completion_ms'],
+                None if r['first_content'] is None else 1000*(r['first_content']-r['start']), r['dp_rank']]
                for row in rows for i, sample in enumerate(row['samples']) for r in sample['records']]
     group_fields = ['case', 'input', 'requests', 'median_request_ms', 'p95_request_ms', 'median_queue_ms', 'p95_queue_ms',
+                    'median_client_wait_ms', 'p95_client_wait_ms', 'median_completion_ms', 'p95_completion_ms',
                     'median_service_ms', 'p95_service_ms', 'median_first_content_ms', 'p95_first_content_ms']
     groups = [[row['case'], group, *[metrics[k] for k in group_fields[2:]]]
               for row in rows for group, metrics in row.get('by_input', {}).items()]
@@ -236,6 +245,9 @@ def parse_args(argv):
 
 def main(argv=None):
     args = parse_args(argv)
+    levels = [1, args.dp, 2*args.dp]
+    # 轮换执行位置，避免新增的C=DP始终夹在另两组之间；完整顺序写入报告。
+    orders = [levels[i % len(levels):] + levels[:i % len(levels)] for i in range(args.repeats)]
     output = args.output.resolve() / (datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ') + '_dp_lengths_' + uuid.uuid4().hex[:8])
     (output / 'raw').mkdir(parents=True)
     print(f'REPORT: {output}', flush=True)
@@ -243,14 +255,18 @@ def main(argv=None):
         git=capture(['git', 'rev-parse', 'HEAD']), gpu=capture(['nvidia-smi', '-L']), cuda=capture(['nvcc', '--version']),
         cuda_visible_devices=os.environ.get('CUDA_VISIBLE_DEVICES'), seed=0, warmup=1, iterations=1, repeats=args.repeats,
         dp=args.dp, tp=args.tp, prompt_targets=args.prompt_lengths, output_limits=args.output_lengths,
+        concurrency_levels=levels, expected_case_count=len(levels), repeat_orders=orders,
+        client_dispatch='fixed lanes: shuffled input indices lane, lane+C, ...; all inputs ready at wave start',
         dtype='FP16', kv_cache='FP16', prefix_cache=False, cuda_graph=True, custom_allreduce=args.tp == 2,
         routing=args.routing, request_log='on', eos='formal model config unchanged',
         scope='正式HTTP/SSE端到端诊断，含生产分词/排队/日志，不含测试校验与落盘。SSE首内容延迟不是原生首Token时间；'
-              'queue_ms仅为正式HTTP等待队列，service_ms含分词及生成、不含最终审计落盘。每轮相同输入交替C1/2DP，'
+              'queue_ms仅为正式HTTP等待队列，service_ms含分词及生成、不含最终审计落盘。每轮相同输入轮换C1/DP/2DP，'
+              'client_wait_ms为整轮开始到客户端提交的时间，completion_ms为整轮开始到该请求完整接收的时间，'
+              '后者含客户端等待，适用于本轮同时就绪的固定请求集合，不代表线上独立到达流量的响应延迟。'
               'speedup_vs_c1为同配置C1 Median轮耗时/当前耗时，不是DP扩展比。'
               '整卡显存是0.5秒周期采样的观测最大值，可能含其他进程且会漏掉瞬时峰值，不证明无泄漏。')
     rows = [dict(case=f'dp{args.dp}_tp{args.tp}_c{c}', status='FAIL', reason='not completed', backend=BACKEND,
-                 dp=args.dp, tp=args.tp, concurrency=c, samples=[]) for c in (1, 2*args.dp)]
+                 dp=args.dp, tp=args.tp, concurrency=c, samples=[]) for c in levels]
     service, memory = None, MemorySampler()
     current = rows[0]
     def interrupt(*_):
@@ -287,8 +303,9 @@ def main(argv=None):
                 current = row
                 print('WARMUP: ' + row['case'], flush=True)
                 run_wave(service, inputs, row['concurrency'], 'warmup-' + row['case'])
-            for repeat in range(args.repeats):
-                for row in (rows if repeat % 2 == 0 else rows[::-1]):
+            for repeat, order in enumerate(orders):
+                for concurrency in order:
+                    row = next(row for row in rows if row['concurrency'] == concurrency)
                     current = row
                     print(f'RUN: {row["case"]} {repeat+1}/{args.repeats}', flush=True)
                     wave = run_wave(service, inputs, row['concurrency'], f'r{repeat}-' + row['case'])
@@ -326,7 +343,11 @@ def main(argv=None):
             for values in [[g for s in memory.samples for g in s['gpu'] if g['uuid'] == uid]]]
         status = save(output, rows, metadata)
     for row in rows:
-        print(json.dumps({k: row.get(k) for k in ('case', 'status', 'reason', 'p95_queue_ms', 'p95_request_ms', 'p95_first_content_ms', 'output_tokens_per_s')}, ensure_ascii=False), flush=True)
+        summary = {k: row.get(k) for k in ('case', 'status', 'reason', 'batch_cv_pct', 'p95_queue_ms', 'p95_request_ms',
+                                         'p95_client_wait_ms', 'p95_completion_ms', 'p95_first_content_ms', 'output_tokens_per_s')}
+        summary['short_requests'] = {name: {k: value[k] for k in ('p95_queue_ms', 'p95_request_ms', 'p95_client_wait_ms', 'p95_completion_ms')}
+                                     for name, value in row.get('by_input', {}).items() if name.startswith(f'p{min(args.prompt_lengths)}_')}
+        print(json.dumps(summary, ensure_ascii=False), flush=True)
     print(f'{status}: {output}', flush=True)
     return 0 if status == 'PASS' else 1
 
