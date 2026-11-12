@@ -1421,13 +1421,17 @@ SSE 完整性和 KV 回收。CUDA Graph 开启；TP2 开启自定义 AllReduce�
 时仍使用正式 NCCL 路径。**本轮使用轮转路由并关闭 Prefix Cache**，不把部分前缀复用造成的
 数值差异混入长度诊断；不声明已覆盖带缓存的真实模型混合长度负载。
 
-每种并发先预热一轮，再交替运行 C1 和 C=`2×DP`，各五轮，保存 Median/P95/CV、实际吞吐及
+每种并发先预热一轮，再轮换运行 C1、C=`DP` 和 C=`2×DP`，各五轮，保存 Median/P95/CV、实际吞吐及
 逐输入类型延迟。`speedup_vs_c1 = 同一DP/TP配置C1 Median轮耗时 / 当前Median轮耗时`，
 它是并发工作量的时间比，不是 DP 扩展比或其它框架的加速比。计时包含真实 HTTP、服务分词、
 排队、生产日志、推理及响应读取；测试校验、测试报告落盘、模型加载和输入构造均在计时外。
 每条正式 HTTP 审计新增单调时钟 `timing`：`queue_ms` 从入队到取出，不包含分词；
 `service_ms` 从取出到完成，不含最终 HTTP 审计写盘。SSE 的 `first_content_ms` 是客户端
 首个非空文本块延迟，包含排队，不冒充原生首 Token 时间；普通 HTTP 不提供此指标。
+各客户端保留固定请求通道：第 lane 个客户端按乱序后的索引 lane、lane+C、lane+2C 顺序提交。
+所有输入在整轮开始时均已就绪，因此另外记录 `client_wait_ms`（整轮开始到实际客户端提交）和
+`completion_ms`（整轮开始到该请求完整响应接收完毕）。后者包含尚未提交的等待，不能把降低
+并发后仅服务端排队减少解读为整体完成时间改善，也不代表线上独立到达请求的响应延迟。
 
 以 0.5 秒周期通过 nvidia-smi 查询整卡显存，并在每轮结束保存本服务进程 RSS/FD/线程数。
 显存统计按 UUID 保存到 `memory.json` 和汇总 metadata，可能包含其它进程，且会漏掉瞬时峰值；
@@ -1451,3 +1455,36 @@ bash test/distributed/diagnose_qwen3_dp_lengths_v100.sh /home/models/Qwen3-1.7B
 
 默认应得到六个报告：Python 回归、长Prefill、长生成、长Prefix Cache、DP4×TP1、DP2×TP2。
 这些服务器结果尚需实际运行确认；本地 Python 协议替身不能替代 CUDA 编译和 GPU 数值验收。
+
+## 并发数等于副本数的混合长度对照（第七步）
+
+用于已完成第六步长Prompt编译、数值边界及服务验收的实例。增加 C=`DP` 对照后，同一服务、
+同一组请求下测三档：DP4×TP1 的 C1/C4/C8，DP2×TP2 的 C1/C2/C4；每档预热一轮、正式五轮。
+保留原有固定客户端通道与输入构造方式，正式 HTTP FIFO 调度、轮转路由、缓存状态和数值检查
+均不改变。执行顺序逐轮轮换并写入 `metadata.repeat_orders`，减少固定位置造成的时间漂移；
+五轮不能做到三种执行位置完全均衡，不将小幅差异直接认定为稳定收益。
+
+重点同时比较吞吐、轮耗时 Median/P95/CV、短输入/短输出请求的队列 P95、提交后响应 P95，
+以及包含客户端等待的完成时间 P95。各并发档每轮输入集合、Token ID、输出上限和 EOS 策略
+完全相同，但请求提交时序不同；这是同一有限请求集合的并发对照，不是固定到达率的线上
+延迟测试，也不是生产调度优化后的性能结果。报告额外保留逐请求 `client_wait_ms` 和
+`completion_ms`，在 Markdown/CSV/XLSX 和原始精度 JSON 中汇总；终端直接打印各档 CV 和
+最短输入各变体的尾延迟。P95 不能相减来估算各阶段贡献。
+
+已有第六步服务器产物时，sk 合入 master 后执行以下命令，**无需编译或下载模型**：
+
+```bash
+(
+set -euo pipefail
+cd /home/project/vllm_fastllm
+git switch master
+git pull --ff-only origin master
+export CUDA_VISIBLE_DEVICES="GPU-a88c9669-989e-a8dd-22a0-94a45b467c49,GPU-0310107f-031e-6fcd-eb65-6dfa45981711,GPU-f0a99453-777f-8b16-89a3-bab78019f23d,GPU-081484a6-9730-453b-59a2-32bd75ab6c2c"
+bash test/distributed/diagnose_qwen3_dp_lengths_v100.sh /home/models/Qwen3-1.7B --reuse-build
+)
+```
+
+`--reuse-build` 缺少协调器、worker 或编译配置时立即失败，不会隐式编译；不再重复长Prompt
+数值边界验收。此模式输出三个独立报告：Python 回归、DP4×TP1、DP2×TP2。后两份报告分别
+必须包含三个并发 case 且每个完成五轮才可整体 PASS；失败时保存已完成样本和失败轮原始响应。
+新实例或尚未完成长Prompt原生产物验收时，应先运行上一节不带该选项的完整流程。
