@@ -50,6 +50,7 @@
 
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
+#include "devices/cuda/fastllm-cuda-sampling.h"
 #include "fastllm-multicuda.cuh"
 #endif
 
@@ -3557,75 +3558,118 @@ namespace fastllm {
             if (!config.AllowsToolToken(token)) values[token] = -INFINITY;
     }
 
+#ifdef USE_CUDA
+    // Keep the existing top-p arithmetic and RNG on the host. Only selection
+    // moves to the GPU, so ordinary sampling reads back at most 64 candidates.
+    static bool CudaSamplingCandidates(Data &logits, int offset,
+            const GenerationConfig &config, std::vector<std::pair<float,int>> &values) {
+        if (logits.dataDevice != CUDA || logits.dataType != FLOAT32 || !logits.cudaData ||
+            logits.multiDeviceData || logits.dims.empty() || logits.dims.back() <= 0 || offset < 0 ||
+            (uint64_t(offset)+1)*logits.dims.back() > logits.Count(0) ||
+            config.tool_call_token_mask || !config.tool_call_allowed_token_ids.empty() ||
+            fabs(config.repeat_penalty - 1.0) > 1e-6) return false;
+        const int vocab = logits.dims.back();
+        const int k = std::max(1,std::min(vocab,config.top_k));
+        const float inverse = 1.0f / config.temperature;
+        if (k > FastllmCudaLogitsTopKCapacity || !std::isfinite(inverse) || inverse <= 0.f ||
+            FastllmCudaGraphIsCapturing()) return false;
+        const int device = logits.dataDeviceIds.empty() ? FastllmCudaGetDevice() : logits.dataDeviceIds[0];
+        FastllmCudaSetDevice(device);
+        struct Workspace { Data scratch, selected; };
+        static thread_local std::map<int,Workspace> workspaces;
+        auto &w = workspaces[device];
+        const size_t bytes = FastllmCudaLogitsTopKWorkspaceBytes(1,vocab);
+        if (!bytes || (bytes+3)/4 > size_t(INT_MAX)) return false;
+        auto allocate = [&](Data &data, int count) {
+            data.dataType = INT32; data.Resize({count});
+            data.ToDevice(CUDA,std::vector<int>{device},false); data.Allocate(false);
+        };
+        allocate(w.scratch,(bytes+3)/4);
+        allocate(w.selected,FastllmCudaLogitsTopKCapacity*sizeof(FastllmCudaTopKCandidate)/sizeof(int));
+        FastllmCudaTopKRow row{static_cast<const float *>(logits.cudaData)+size_t(offset)*vocab,inverse};
+        if (!FastllmCudaLogitsTopK(&row,1,vocab,
+                static_cast<FastllmCudaTopKCandidate *>(w.selected.cudaData),w.scratch.cudaData,bytes)) return false;
+        FastllmCudaTopKCandidate selected[FastllmCudaLogitsTopKCapacity];
+        FastllmCudaCopyFromDeviceToHost(selected,w.selected.cudaData,k*sizeof(selected[0]));
+        if (selected[0].token < 0) return false;
+        values.reserve(k);
+        for (int i=0;i<k;++i) values.emplace_back(selected[i].score,selected[i].token);
+        return true;
+    }
+#endif
+
     int LLMSampling(Data &logits, int outerOffset,
                     const GenerationConfig &config, const LastTokensUnit &tokens) {
-        logits.ToDevice(DataDevice::CPU);
-        int vocabSize = logits.dims.back();
-        float *base = ((float*)logits.cpuData) + outerOffset * vocabSize;
+        const int vocabSize = logits.dims.back();
+        int topk = std::max(1, std::min(vocabSize, config.top_k));
+        std::vector<std::pair<float,int>> v;
+        const bool hasToolMask = config.tool_call_token_mask || !config.tool_call_allowed_token_ids.empty();
+        bool selected = false;
+#ifdef USE_CUDA
+        selected = CudaSamplingCandidates(logits, outerOffset, config, v);
+#endif
+        if (!selected) {
+            logits.ToDevice(DataDevice::CPU);
+            float *base = ((float*)logits.cpuData) + outerOffset * vocabSize;
 
-        if (fabs(config.repeat_penalty - 1.0) > 1e-6) {
-            std::multiset<int>::iterator begin = tokens.tokenSet.begin();
-            std::multiset<int>::iterator end = tokens.tokenSet.end();
-            std::set<int> unique(tokens.tokenSet.begin(), tokens.tokenSet.end());
-            if (config.last_n <= 0) {
-                begin = unique.begin();
-                end = unique.end();
-            }
-            for (std::multiset<int>::iterator iter = begin; iter != end; ++iter) {
-                int id = *iter;
-                base[id] = (base[id] < 0 ? base[id] * config.repeat_penalty : base[id] / config.repeat_penalty);
-            }
-        }
-        float invTemp = 1.0f / config.temperature;
-        int topk = std::min(vocabSize, config.top_k);
-        if (topk <= 0) {
-            topk = 1;
-        }
-        std::vector <std::pair <float, int> > v;
-        bool hasToolMask = config.tool_call_token_mask || !config.tool_call_allowed_token_ids.empty();
-        if (topk <= 64) {
-            v.reserve(topk);
-            auto betterThan = [](const std::pair<float, int> &a,
-                                  const std::pair<float, int> &b) {
-                return a.first > b.first || (a.first == b.first && a.second < b.second);
-            };
-            std::priority_queue<
-                std::pair<float, int>,
-                std::vector<std::pair<float, int> >,
-                decltype(betterThan)> heap(betterThan);
-            for (int i = 0; i < vocabSize; i++) {
-                if (hasToolMask && !config.AllowsToolToken(i)) {
-                    continue;
+            if (fabs(config.repeat_penalty - 1.0) > 1e-6) {
+                std::multiset<int>::iterator begin = tokens.tokenSet.begin();
+                std::multiset<int>::iterator end = tokens.tokenSet.end();
+                std::set<int> unique(tokens.tokenSet.begin(), tokens.tokenSet.end());
+                if (config.last_n <= 0) {
+                    begin = unique.begin();
+                    end = unique.end();
                 }
-                std::pair<float, int> cur = std::make_pair(base[i] * invTemp, i);
-                if ((int)heap.size() < topk) {
-                    heap.push(cur);
-                    continue;
+                for (std::multiset<int>::iterator iter = begin; iter != end; ++iter) {
+                    int id = *iter;
+                    base[id] = (base[id] < 0 ? base[id] * config.repeat_penalty : base[id] / config.repeat_penalty);
                 }
-                if (betterThan(cur, heap.top())) {
+            }
+            float invTemp = 1.0f / config.temperature;
+            if (topk <= 64) {
+                v.reserve(topk);
+                auto betterThan = [](const std::pair<float, int> &a,
+                                      const std::pair<float, int> &b) {
+                    return a.first > b.first || (a.first == b.first && a.second < b.second);
+                };
+                std::priority_queue<
+                    std::pair<float, int>,
+                    std::vector<std::pair<float, int> >,
+                    decltype(betterThan)> heap(betterThan);
+                for (int i = 0; i < vocabSize; i++) {
+                    if (hasToolMask && !config.AllowsToolToken(i)) {
+                        continue;
+                    }
+                    std::pair<float, int> cur = std::make_pair(base[i] * invTemp, i);
+                    if ((int)heap.size() < topk) {
+                        heap.push(cur);
+                        continue;
+                    }
+                    if (betterThan(cur, heap.top())) {
+                        heap.pop();
+                        heap.push(cur);
+                    }
+                }
+                while (!heap.empty()) {
+                    v.push_back(heap.top());
                     heap.pop();
-                    heap.push(cur);
                 }
-            }
-            while (!heap.empty()) {
-                v.push_back(heap.top());
-                heap.pop();
-            }
-            std::sort(v.begin(), v.end(), betterThan);
-        } else {
-            v.reserve(vocabSize);
-            for (int i = 0; i < vocabSize; i++) {
-                if (hasToolMask && !config.AllowsToolToken(i)) {
-                    continue;
+                std::sort(v.begin(), v.end(), betterThan);
+            } else {
+                v.reserve(vocabSize);
+                for (int i = 0; i < vocabSize; i++) {
+                    if (hasToolMask && !config.AllowsToolToken(i)) {
+                        continue;
+                    }
+                    v.push_back(std::make_pair(-base[i] * invTemp, i));
                 }
-                v.push_back(std::make_pair(-base[i] * invTemp, i));
-            }
-            topk = std::min(topk, (int)v.size());
-            if (topk > 0) {
-                std::partial_sort(v.begin(), v.begin() + topk, v.end());
-            }
-            for (int i = 0; i < topk; i++) {
-                v[i].first = -v[i].first;
+                topk = std::min(topk, (int)v.size());
+                if (topk > 0) {
+                    std::partial_sort(v.begin(), v.begin() + topk, v.end());
+                }
+                for (int i = 0; i < topk; i++) {
+                    v[i].first = -v[i].first;
+                }
             }
         }
         AssertInFastLLM(!config.tool_call_token_mask || !v.empty(), "Empty tool grammar sampling support.");

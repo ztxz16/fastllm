@@ -42,6 +42,11 @@ Json Fields(const Signature &s) {
     for (auto value:s.fields) out.emplace_back(double(value));
     return out;
 }
+bool Included(const Family &family) {
+    if(configuration["families"].is_null())return true;
+    for(const auto &name:configuration["families"].array_items())if(name.string_value()==family.name)return true;
+    return false;
+}
 bool Disabled(const std::string &id) {
     for (const auto &x:configuration["deny"].array_items()) if(x.string_value()==id)return true;
     return false;
@@ -60,6 +65,7 @@ void Register(const Family *family) {
 }
 
 bool Configure(const std::string &text,std::string &error) {
+    error.clear();
     std::lock_guard<std::mutex> lock(Mutex());
     try {
         auto config=Json::parse(text,error); Require(error.empty()&&config.is_object(),"kernel policy must be an object");
@@ -67,7 +73,7 @@ bool Configure(const std::string &text,std::string &error) {
         Require(mode=="off"||mode=="quick"||mode=="cache","kernel mode must be off, quick or cache");
         for(const auto &kv:config.object_items())
             Require(kv.first=="mode"||kv.first=="budget_ms"||kv.first=="repeats"||kv.first=="samples"||
-                    kv.first=="max_l2"||kv.first=="build_id"||kv.first=="deny"||kv.first=="force"||kv.first=="profile",
+                    kv.first=="families"||kv.first=="max_l2"||kv.first=="build_id"||kv.first=="deny"||kv.first=="force"||kv.first=="profile",
                     "unknown kernel policy option");
         double budget=config["budget_ms"].is_null()?30000:config["budget_ms"].number_value();
         double tolerance=config["max_l2"].is_null()?.0032:config["max_l2"].number_value();
@@ -78,6 +84,13 @@ bool Configure(const std::string &text,std::string &error) {
         Require(repeat>0&&repeat<=1000&&sample>=3&&sample<=31,"invalid kernel measurement repetitions");
         Require(config["deny"].is_null()||config["deny"].is_array(),"deny must be an array");
         Require(config["force"].is_null()||config["force"].is_object(),"force must map family names to implementation IDs");
+        Require(config["families"].is_null()||config["families"].is_array(),"families must be an array of family names");
+        for(const auto &name:config["families"].array_items()) {
+            Require(name.is_string(),"families entries must be names");
+            bool found=false;
+            for(const auto &family:Families())if(name.string_value()==family.second->name)found=true;
+            Require(found,"unknown tuning family");
+        }
         for(const auto &x:config["deny"].array_items()) {
             Require(x.is_string(),"deny entries must be IDs");
             bool found=false;
@@ -92,6 +105,11 @@ bool Configure(const std::string &text,std::string &error) {
             for(const auto &f:Families())if(kv.first==f.second->name)
                 for(const auto &impl:f.second->implementations)if(kv.second.string_value()==impl.id)found=true;
             Require(found,"unknown forced kernel family/implementation");
+            if(!config["families"].is_null()) {
+                bool included=false;
+                for(const auto &name:config["families"].array_items())if(name.string_value()==kv.first)included=true;
+                Require(included,"forced family is excluded by families");
+            }
         }
         configuration=config;budgetMs=budget;maxL2=tolerance;repeats=repeat;samples=sample;spentMs=0;
         buildId=config["build_id"].is_null()?std::string(__DATE__ " " __TIME__):config["build_id"].string_value();
@@ -103,6 +121,9 @@ bool Configure(const std::string &text,std::string &error) {
 
 int Select(const Call &call) {
     if(!Enabled())return -1;
+    // A policy can tune one family without perturbing the trusted defaults
+    // of others. The family filter is immutable while a model is active.
+    if(!Included(*call.family))return call.fallback;
     const auto gen=generation.load(std::memory_order_acquire);
     if(localGeneration!=gen){local.clear();localGeneration=gen;}
     if(auto it=local.find(call.signature);it!=local.end())return it->second;
@@ -194,12 +215,17 @@ int Select(const Call &call) {
 
 bool NeedsPreparation(const Signature &signature) {
     if(!Enabled())return false;
-    std::lock_guard<std::mutex> lock(Mutex());return plans.find(signature)==plans.end();
+    std::lock_guard<std::mutex> lock(Mutex());
+    auto it=Families().find(int(signature.fields[0]));
+    return it!=Families().end() && Included(*it->second) && plans.find(signature)==plans.end();
 }
 bool CandidateAllowed(const char *id) {
     if(!enabled.load(std::memory_order_relaxed))return false;
     // Policy is configured before model loading and immutable while a model is active.
-    return !Disabled(id);
+    if(Disabled(id))return false;
+    for(const auto &family:Families())for(const auto &impl:family.second->implementations)
+        if(std::string(impl.id)==id)return Included(*family.second);
+    return false;
 }
 void Freeze(){std::lock_guard<std::mutex> lock(Mutex());frozen=true;}
 std::string Catalog() {
