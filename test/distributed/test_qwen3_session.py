@@ -225,7 +225,7 @@ def fixture():
                 result["token_ids"] = [token+1]
             if mode == "stream_error_float":
                 result.update(status="FAIL", steps=[dict(token_id=float(token))], cache_after_error=cache)
-            if mode in ("stream_burst", "stream_eos", "dp_smoke") or (mode.startswith('dp_routing') and request.get('max_new_tokens') != 128):
+            if mode in ("stream_burst", "stream_eos", "dp_smoke") or (mode.startswith('dp_routing') and request.get('max_new_tokens', 1) < 128):
                 count = request.get("max_new_tokens", 1)
                 if mode == "stream_eos":
                     count = 1
@@ -234,7 +234,7 @@ def fixture():
                     send(dict(event="token", id=message["id"], index=index, token_id=token))
                 result["token_ids"] = [token]*count
                 result["steps"] = [dict(token_id=token)]*count
-        if (mode == "cancel" and request.get("max_new_tokens", 1) > 1) or ((mode == 'dp_smoke' or mode.startswith('dp_routing')) and request.get('max_new_tokens') == 128):
+        if (mode == "cancel" and request.get("max_new_tokens", 1) > 1) or (mode == 'dp_smoke' and request.get('max_new_tokens') == 128) or (mode.startswith('dp_routing') and request.get('max_new_tokens', 1) >= 128):
             while True:
                 if select.select([cancellation], [], [], 5)[0]:
                     cancelled_id = struct.unpack("!I", cancellation.recv(4))[0]

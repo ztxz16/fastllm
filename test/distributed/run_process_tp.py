@@ -43,7 +43,8 @@ def save_report(output, rows, metadata):
     (output / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     fields = ["case", "backend", "status", "max_abs_error", "mean_abs_error", "failed_elements", "reason"]
     for key in ('custom_calls', 'nccl_calls', 'prefix_hits', 'reused_tokens', 'evictions', 'prefix_bytes',
-                'token_mismatches', 'compared_steps', 'first_divergence_token_1based'):
+                'token_mismatches', 'compared_steps', 'first_divergence_token_1based',
+                'requests', 'generated_tokens', 'elapsed_s', 'http_requests', 'sse_requests', 'reaped_processes'):
         if any(key in row for row in rows):
             fields.append(key)
 
