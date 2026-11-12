@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <vector>
 
@@ -31,6 +32,26 @@ std::filesystem::path normalized(std::filesystem::path path) {
     return path;
 }
 } // namespace
+
+size_t textCacheReserve(size_t quantizedBytes, size_t imageRows, size_t textRows, bool references) {
+    if (!quantizedBytes)
+        return 0;
+    // Includes auxiliary DiT weights, staging layers and VAE workspaces.
+    // Reference vision/VAE encoding needs additional space. Larger requests
+    // leave more headroom without adding a user-facing cache setting.
+    constexpr size_t GiB = size_t(1) << 30;
+    const size_t base = (references ? 20 : 10) * GiB;
+    const size_t limit = std::numeric_limits<size_t>::max();
+    size_t reserve = quantizedBytes > limit - base ? limit : quantizedBytes + base;
+    for (size_t rows : {imageRows > 8192 ? imageRows - 8192 : 0,
+                        textRows > 4096 ? textRows - 4096 : 0}) {
+        // Nearby prompt lengths share a budget instead of discarding the GPU
+        // cache for every additional token in a multi-reference request.
+        const size_t blocks = rows / 4096 + (rows % 4096 != 0);
+        reserve = blocks > (limit - reserve) / GiB ? limit : reserve + blocks * GiB;
+    }
+    return reserve;
+}
 
 size_t availableHostMemory(const std::string &procRoot) {
     namespace fs = std::filesystem;

@@ -36,6 +36,7 @@ class Transformer {
     Transformer(Runtime &, Runtime &fp32, const std::string &model, nomas::ParallelContext = {},
                 bool sequenceParallel = false, const std::string &fp8Weights = "");
     void prepare(Progress = {});
+    bool prepared() const { return modulation_.size() == 50; }
     // Valid only within one request; recomputed for each new prompt/reference set.
     void prepareText(const Tensor &);
     void clearText();
@@ -123,6 +124,7 @@ class Pipeline {
     Runtime rt_, full_, vaeRt_;
     MemoryPolicy memory_;
     std::unique_ptr<minimax_h3::TextEncoder> textEncoder_;
+    size_t textCacheReserve_ = 0;
     std::unique_ptr<Transformer> transformer_;
     std::unique_ptr<VAE> decoder_;
     std::unique_ptr<nomas::QwenTokenizer> tokenizer_;

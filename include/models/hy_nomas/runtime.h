@@ -202,9 +202,12 @@ public:
     // Optional lossless host cache for callers that swap model stages.
     void offload();
     // Retain checkpoint BF16 tensors for resident inference or streamed FP32
-    // expansion. Use at most half the free memory, leaving reserveBytes.
+    // expansion. By default use half the free memory, leaving reserveBytes.
     // clear() releases both representations; clear(true) retains this cache.
     void enablePackedCache(size_t reserveBytes);
+    // An explicit cap can use more of the remaining memory. Returns true when
+    // a new cache needs population; callers must serialize its first fill.
+    bool enablePackedCache(size_t reserveBytes, size_t maxBytes);
     // Same rank/partition; cache population must be serialized, as for host caches.
     void sharePackedCache(const Weights &source);
     // Retain immutable CPU checkpoint bytes across clear(), preferring pinned

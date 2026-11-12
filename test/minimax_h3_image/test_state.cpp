@@ -33,6 +33,16 @@ int main(int argc, char **argv) {
         edit.seed = 17;
         pipeline.generate(edit);
         same();
+        // Cross the text-cache workspace bucket, then return to the original
+        // request. Reference slots plus the capped 4096 prompt tokens cross
+        // the bucket; a text-only prompt cannot exceed that token limit.
+        // Retained weights must not pin a budget chosen for old inputs.
+        Options longPrompt = edit;
+        longPrompt.prompt.clear();
+        for (int i = 0; i < 5000; ++i)
+            longPrompt.prompt += "tree ";
+        pipeline.generate(longPrompt);
+        same();
         for (const char *stage : {"reference", "text", "prepare", "denoise", "decode"}) {
             // A prepare cancellation needs an uncached schedule. The preceding
             // text cancellation has already dropped the persistent components.

@@ -1464,8 +1464,11 @@ void Weights::shareHostCache(const Weights &source) {
     }
 }
 void Weights::enablePackedCache(size_t reserveBytes) {
+    enablePackedCache(reserveBytes, 0);
+}
+bool Weights::enablePackedCache(size_t reserveBytes, size_t maxBytes) {
     auto &i=*impl_;
-    if(i.packed) return;
+    if(i.packed) return false;
     i.rt.activate();
     size_t available=0,total=0; check(cudaMemGetInfo(&available,&total));
     if(activePool && activePool->maxBytes) {
@@ -1476,11 +1479,12 @@ void Weights::enablePackedCache(size_t reserveBytes) {
             available=activePool->maxBytes>used?activePool->maxBytes-used:0;
         }
     }
-    if(available<=reserveBytes) return;
+    if(available<=reserveBytes) return false;
     i.packed=std::make_shared<Impl::PackedCache>();
-    i.packed->budget=std::min(available/2,available-reserveBytes);
+    i.packed->budget=std::min(maxBytes ? maxBytes : available/2,available-reserveBytes);
     // A single budget is shared by every shard, including those already opened.
     for(auto &shard:i.shards) shard.second->impl_->packed=i.packed;
+    return true;
 }
 void Weights::sharePackedCache(const Weights &source) {
     impl_->checkCacheSource(*source.impl_);

@@ -541,3 +541,44 @@ SGLang performance measurements are retained as prior evidence, not rerun here.
 
 The cleanup patch, environment audit, source/binary hashes and commit-readiness
 report are in `fp8-cleanup-20261112` under the same pro5000 experiment directory.
+
+
+## Single-GPU quantized text-weight residency (2026-11-12)
+
+The single-GPU FP8 path retains immutable text/vision checkpoint weights within
+an automatic device-cache budget. It leaves room for the DiT and request
+workspaces, rebuilds when the input-size bucket changes, and serializes its first
+fill before prefetching. Low-memory streaming and the shared host-cache quota
+remain in effect. There are no new inference flags, environment variables or
+math changes.
+
+The mainline FP8 before/after resident check produces eight byte-identical 256²
+PNGs. Request-state tests pass after reference/long-prompt budget changes and
+cancellation in all five stages. Device-cache capacity, retention and rebuilding,
+TensorPool, norm/modulate, image ops, FP8/source loaders, HTTP contracts and host
+memory/cgroup tests pass. With 3 GiB GPU / 2 GiB host settings, FP8 HTTP recovers
+from controlled OOM and cancellation before completing a two-reference edit.
+The HTTP process samples 2549 MiB GPU and 847.31 MiB peak RSS. Native dependencies
+contain no Torch/C10/Python libraries.
+
+The isolated NVFP4 driver exercises the same cache policy: single-GPU warm T2I
+improves from 3.464526 to 2.570106 seconds and reference editing from 9.881654 to
+9.224084 seconds, with byte-identical outputs. These are experimental FP4 results,
+not mainline FP8 timings; FP4 is not exposed through the API or studio. Complete
+BF16 model performance was not rerun. Source diffs, build commands, raw requests,
+PNG hashes and regression logs are in `fp4-single-opt-20261112`; subsequent native
+and SGLang dual-GPU measurements are in `fp4-dual-after-cache-20261112` and
+`fp4-dual-sglang-20261112` under the pro5000 image-model experiment directory.
+SGLang's reference-edit color/instruction failure remains an equal-quality
+comparison limitation.
+
+After code cleanup, a fresh CMake build of the image/video libraries, CLIs and
+servers passes all 13 relevant CTests (the fused-op test requires one visible
+GPU and is run separately). Mainline FP8 single/dual-GPU request-state tests pass,
+including reference/long-prompt changes and five-stage cancellation/recovery.
+The 3 GiB GPU / 2 GiB host HTTP test recovers from OOM and cancellation and
+completes a two-reference edit, peaking at 2551 MiB GPU and 847.34 MiB RSS.
+Four new resident 256² outputs match the eight preceding before/after PNGs
+byte-for-byte. No Torch/C10/Python libraries are linked. This is a correctness
+and build check, not a new performance run; logs and hashes are retained in
+`image-cache-cleanup-20261112` under the same experiment directory.

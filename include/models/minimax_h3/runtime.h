@@ -157,6 +157,9 @@ class TextEncoder {
     void setLowMemory(bool enabled) { lowMemory_ = enabled; }
     void setMemoryPool(const std::shared_ptr<nomas::TensorPool> &p) { memoryPool_ = p; }
     void setHostMemoryBudget(const std::shared_ptr<nomas::HostMemoryBudget> &);
+    // Retain immutable BF16 weights while leaving reserveBytes for other stages.
+    // Without an explicit cap, use at most half the available memory.
+    void cacheWeights(size_t reserveBytes, size_t maxBytes = 0);
     void unload(bool keepPackedCache = false) {
         weights_.clear(keepPackedCache);
         if (prefetchedWeights_)
@@ -167,7 +170,7 @@ class TextEncoder {
     Runtime &rt_;
     Weights weights_;
     std::unique_ptr<Weights> prefetchedWeights_;
-    bool hostCacheWarm_ = false;
+    bool cacheWarm_ = false;
     std::shared_ptr<nomas::TensorPool> memoryPool_;
     bool lowMemory_ = false;
     nomas::ParallelContext parallel_;

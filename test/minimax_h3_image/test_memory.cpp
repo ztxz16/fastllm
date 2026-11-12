@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <random>
 #include <stdexcept>
 
@@ -62,6 +63,24 @@ struct Fixture {
 } // namespace
 int main() {
     try {
+        using fastllm::minimax_h3_image::detail::textCacheReserve;
+        auto normal = textCacheReserve(12 * GiB, 8192, 4096, true);
+        check(textCacheReserve(0, 8192, 4096, true) == 0, "unquantized single GPU must keep streaming");
+        check(normal >= 32 * GiB && normal < 60 * GiB, "ordinary edits must leave workspace headroom");
+        check(textCacheReserve(12 * GiB, 4096, 64, false) < normal,
+              "text-to-image may retain more weights than reference editing");
+        check(textCacheReserve(24 * GiB, 8192, 4096, true) > normal,
+              "larger quantized weights must reduce the text cache");
+        check(textCacheReserve(12 * GiB, 32768, 4096, true) > normal &&
+                  textCacheReserve(12 * GiB, 8192, 32768, true) > normal,
+              "larger images and longer prompts must reduce the text cache");
+        check(textCacheReserve(12 * GiB, 8192, 4097, true) ==
+                  textCacheReserve(12 * GiB, 8192, 5000, true),
+              "nearby prompt lengths must share a cache budget");
+        const size_t maximum = std::numeric_limits<size_t>::max();
+        check(textCacheReserve(maximum, 1, 1, true) == maximum &&
+                  textCacheReserve(1, maximum, maximum, true) == maximum,
+              "overflow must disable caching rather than remove workspace headroom");
         Fixture f;
         check(f.available() == 64 * GiB, "missing cgroup metadata must preserve host availability");
         f.layout(true, "/user.slice/session.scope");

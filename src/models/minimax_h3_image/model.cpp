@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstring>
 #include <cuda_runtime.h>
+#include <filesystem>
 #include <fstream>
 #include <numeric>
 #include <stdexcept>
@@ -164,7 +165,7 @@ Transformer::Transformer(Runtime &rt, Runtime &full, const std::string &dir, nom
     sigmas_.push_back(0.f);
 }
 void Transformer::prepare(Progress progress) {
-    if (modulation_.size() == 50)
+    if (prepared())
         return;
     std::vector<Tensor> inputs;
     auto timesteps = times_;
@@ -339,7 +340,7 @@ Tensor Transformer::forward(const Tensor &latent, const Tensor &text, int h, int
     if (condition)
         for (auto grid : condition->grids)
             referenceRows += grid.first / 2 * (grid.second / 2);
-    if (modulation_.size() != 50 || step < 0 || step >= 6 || h % 32 || w % 32 ||
+    if (!prepared() || step < 0 || step >= 6 || h % 32 || w % 32 ||
         (refinedText_.data && refinedText_.rows != text.rows) ||
         latent.rows != referenceRows + (h / 32) * (w / 32) || latent.cols != 96 || text.rows < 1 ||
         text.cols != 5120 || (condition && condition->textTags.size() != size_t(text.rows)))
@@ -922,6 +923,7 @@ Image Pipeline::generate(const Options &o, Progress progress, Trace trace,
         // A cancelled or failed prepare may have only partially populated its tables.
         // Drop persistent state as well as the stage-local tensors before retrying.
         textEncoder_.reset();
+        textCacheReserve_ = 0;
         transformer_.reset();
         decoder_.reset();
         parallel_.reset();
@@ -991,6 +993,12 @@ Image Pipeline::generateImpl(const Options &o, Progress progress, Trace trace,
         if (textInput->empty() || textInput->size() % 5120 || textInput->size() / 5120 > 65536 ||
             (!o.images.empty() && textInput->size() / 5120 != ids.size()))
             throw std::invalid_argument("invalid text fixture");
+        // Fixture-driven requests do not use the text encoder; release its
+        // device cache before accepting a potentially larger latent grid.
+        if (textEncoder_) {
+            textEncoder_->unload();
+            textCacheReserve_ = 0;
+        }
         text = rt_.upload(textInput->data(), textInput->size() / 5120, 5120);
         if (o.images.empty())
             condition.textTags.assign(text.rows, 1);
@@ -1011,8 +1019,30 @@ Image Pipeline::generateImpl(const Options &o, Progress progress, Trace trace,
                 textEncoder_->setMemoryPool(memory_.pool);
                 textEncoder_->setHostMemoryBudget(memory_.host);
             }
+            size_t reserve = 0, quantizedBytes = 0;
+            if (!memory_.layerStreaming && !source_.fp8Weights.empty()) {
+                size_t rows = size_t(height / 32) * (width / 32);
+                for (const auto &image : references)
+                    rows += size_t(image.height / 32) * (image.width / 32);
+                quantizedBytes = std::filesystem::file_size(source_.fp8Weights);
+                reserve = detail::textCacheReserve(quantizedBytes, rows, ids.size(), !references.empty());
+            }
+            if (reserve != textCacheReserve_) {
+                // A larger canvas/reference set must not inherit a cache sized
+                // for a smaller request. Keep the budgeted host cache intact.
+                textEncoder_->unload();
+                rt_.synchronize();
+                textCacheReserve_ = reserve;
+            }
+            if (reserve) {
+                // After a successful resident request, the DiT already counts
+                // against cudaMemGetInfo/the pool's live bytes. Reserve only
+                // future workspaces when rebuilding the cache for new inputs.
+                const size_t resident = transformer_->prepared() ? quantizedBytes : 0;
+                textEncoder_->cacheWeights(reserve - resident, size_t(48) << 30);
+            }
             text = textEncoder_->encodeVisual(ids, visual, textProgress);
-            textEncoder_->unload();
+            textEncoder_->unload(reserve != 0);
         }
         if (progress)
             progress("text", 50, 50);
