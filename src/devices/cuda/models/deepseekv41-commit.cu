@@ -3,8 +3,7 @@
 #include <cstdint>
 
 namespace {
-__global__ void V41CommitVerifiedPrefix(const FastllmV41VerifyCommitLayer *layers, int accepted, int rowOffset) {
-    const auto layer = layers[blockIdx.x];
+__device__ void CommitPrefix(const FastllmV41VerifyCommitLayer &layer, int accepted, int rowOffset) {
     const auto request = layer.requests[rowOffset];
     const auto *input = static_cast<const uint8_t *>(layer.savedKV) + (size_t)rowOffset * layer.ringRowBytes;
     auto *window = static_cast<uint8_t *>(request.windowKV);
@@ -30,6 +29,16 @@ __global__ void V41CommitVerifiedPrefix(const FastllmV41VerifyCommitLayer *layer
         }
     }
 }
+__global__ void V41CommitVerifiedPrefix(const FastllmV41VerifyCommitLayer *layers, int accepted, int rowOffset) {
+    CommitPrefix(layers[blockIdx.x], accepted, rowOffset);
+}
+__global__ void V41CommitVerifiedBatch(const FastllmV41VerifyCommitLayer *layers,
+        int layerCount, const int *spans, int batchRows) {
+    const int request = blockIdx.x / layerCount;
+    const int accepted = spans[2 * request], offset = spans[2 * request + 1];
+    if (accepted > 0 && offset >= 0 && offset <= batchRows - accepted)
+        CommitPrefix(layers[blockIdx.x % layerCount], accepted, offset);
+}
 } // namespace
 
 bool FastllmCudaV41CommitVerifiedPrefix(const FastllmV41VerifyCommitLayer *layers, int layerCount,
@@ -39,5 +48,14 @@ bool FastllmCudaV41CommitVerifiedPrefix(const FastllmV41VerifyCommitLayer *layer
         accepted < 1 || accepted > forwarded || rowOffset < 0 || rowOffset > batchRows - forwarded)
         return false;
     V41CommitVerifiedPrefix<<<layerCount, 256, 0, cudaStreamPerThread>>>(layers, accepted, rowOffset);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool FastllmCudaV41CommitVerifiedBatch(const FastllmV41VerifyCommitLayer *layers,
+        int layerCount, const int *spans, int requests, int batchRows) {
+    if (!layers || !spans || layerCount <= 0 || requests <= 0 || batchRows < requests ||
+        uint64_t(layerCount) * requests > INT32_MAX) return false;
+    V41CommitVerifiedBatch<<<layerCount * requests, 256, 0, cudaStreamPerThread>>>(
+        layers, layerCount, spans, batchRows);
     return cudaGetLastError() == cudaSuccess;
 }

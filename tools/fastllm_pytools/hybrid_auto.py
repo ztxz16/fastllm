@@ -1183,7 +1183,7 @@ def _v41_runtime_bytes(args, model, mode, mapping, resident, context, batch, chu
     be recycled by a subsequent prompt. Prefill itself is never graph-captured.
     """
     result = {name: dict.fromkeys(mapping, 0) for name in
-              ("graphs", "staging", "prefill_persistent", "host_graphs")}
+              ("graphs", "sampling", "staging", "prefill_persistent", "host_graphs")}
     r = model.runtime
     if not r or args.atype not in ("auto", "bfloat16"):
         return result
@@ -1205,15 +1205,16 @@ def _v41_runtime_bytes(args, model, mode, mapping, resident, context, batch, chu
     host = args.moe_device == "numa" or (args.moe_device == "cpu" and getattr(args, "_host_moe_shared", False))
     drafts = max(0, getattr(args, "dspark", 0))
     topk = max(model.topk, args.moe_experts)
-    # Ordinary decode retains warmed powers of two. Verification replaces its
-    # previous shape before allocation, so reserve one maximum-sized workspace,
-    # not max_batch independent copies of that workspace.
-    shapes = list(dict.fromkeys([1 << i for i in range(batch.bit_length())] + [batch]))
+    # Graph caches retain geometric warm capacities and one transient layout.
+    # Total retained rows stay O(max_batch), including non-power-of-two limits.
+    warm_batches = list(dict.fromkeys([1 << i for i in range(batch.bit_length())] + [batch]))
+    shapes = list(warm_batches)
     pipeline = mode == "pp" and len(mapping) > 1
     if hybrid and pipeline and drafts:
         shapes = []  # PP DSpark captures independent verifier stages.
     if drafts:
-        shapes.extend(range(1, drafts + 2) if pipeline else [batch * (drafts + 1)])
+        shapes.extend(range(1, drafts + 2) if pipeline else
+                      [(b * (drafts + 1)) for b in warm_batches + [batch]])
     page_bytes = 64 * 1024
 
     def page(n):
@@ -1321,15 +1322,28 @@ def _v41_runtime_bytes(args, model, mode, mapping, resident, context, batch, chu
                                                        8*r["heads"]*4 + keys + 4))
             if model.layers - 1 in owners:
                 result["graphs"][d] += page(rows * r["vocab"] * 4) * 3
+        if drafts and model.layers - 1 in owners:
+            # Persistent batched rejection keeps at most two peak-sized shape
+            # sets, each with two FP32 target-distribution buffers. The older
+            # per-request sampler borrowed temporary scratch instead. This storage
+            # also persists without capture, so it is not part of graph reserve.
+            verifier_rows = batch * (drafts + 1)
+            result["sampling"][d] += 4 * page(verifier_rows * r["vocab"] * 4)
         if draft_graphs and drafts and model.layers - 1 in owners:
-            # Single-GPU requests share one model-owned draft shape, including
-            # batch=1. Other topologies retain their request-local draft graphs.
-            draft_batches = [batch] if len(mapping) == 1 else [1] * batch
+            # Same bounded shape policy as target verification. Other topologies
+            # retain their request-local draft graphs.
+            draft_batches = warm_batches + [batch] if len(mapping) == 1 else [1] * batch
             for requests in draft_batches:
                 rows = requests * model.dspark_block_size
                 result["graphs"][d] += small_q5_workspace(rows, [i for i in owners if i >= model.layers], d)
                 result["graphs"][d] += _workspace_bytes(args, model, rows, context, mode, resident, prefill=False)
                 result["graphs"][d] += 3 * page(rows * r["vocab"] * 4)
+                if len(mapping) == 1:
+                    # Context graphs use verifier capacity with dynamic accepted
+                    # counts: regular shape plus one transient, independent of
+                    # the history of accepted prefix lengths.
+                    result["graphs"][d] += 2 * page(requests * (drafts + 1) * model.hidden *
+                                                       (8 + 6 * r["draft_layers"]))
                 if requests > 1:
                     result["graphs"][d] += r["draft_layers"] * page(requests * r["window"] * r["head_dim"] * 2)
                 for i in owners:
@@ -1344,7 +1358,8 @@ def _v41_runtime_bytes(args, model, mode, mapping, resident, context, batch, chu
                 # Every request retains its own q through target verification,
                 # independent of the shared draft slot and later shape changes.
                 result["graphs"][d] += batch * page(model.dspark_block_size * r["vocab"] * 4)
-            # Accepted-prefix context updates remain private to each request.
+            # Preserve private accepted-prefix workspaces for requests that
+            # cannot use the batched context path (for example, TP/PP layouts).
             for accepted in range(1, drafts + 2):
                 result["graphs"][d] += batch * page(accepted * model.hidden * (8 + 6*r["draft_layers"]))
     return result

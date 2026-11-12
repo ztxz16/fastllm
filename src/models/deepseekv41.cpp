@@ -2480,7 +2480,10 @@ namespace fastllm {
             v41StatesByFirstKey.clear();
             v41PendingRestoredState.reset();
         }
+        v41DsparkVerifier.reset();
+        v41DsparkContextReady.reset();
         v41DsparkBatches.clear();
+        v41DsparkFreeStates.clear();
         v41CudaGraphSlots.clear();
         v41AttentionParallel.reset();
         ReleaseMoeCudaCache(weights);
@@ -4056,6 +4059,7 @@ namespace fastllm {
         }
         // CUDA synchronization and native MoE graph destruction can block.
         // Release outside the state mutex, on the forward/scheduler thread.
+        for (auto &state : retired) if (state) RetireDsparkState(std::move(state->dspark));
         retired.clear();
     }
 
@@ -4067,9 +4071,9 @@ namespace fastllm {
             auto state = v41States.find((const void*)&context->pastKeyValues);
             if (state != v41States.end()) draft = std::move(state->second->dspark);
         }
-        // Outputs are already queued. Preserve target KV state for history
-        // snapshots, but release finished draft graphs before new admission.
-        draft.reset();
+        // Outputs are queued and no further forward reads this draft. Preserve
+        // its graph-owned addresses in the bounded scheduler slot pool.
+        RetireDsparkState(std::move(draft));
     }
 
     // ==================== 前缀缓存 ====================
@@ -4886,6 +4890,7 @@ namespace fastllm {
             bool captureFailed = false;
             int warmupRounds = 0;
             bool verification = false;
+            bool retainedVerification = false;
             int blockCnt = 0;
             std::string signature;             // 设备布局 / dtype 等，变化时重新捕获
             std::vector<int> devices;          // 参与的 CUDA 设备（单卡时只有一个）
@@ -5729,14 +5734,13 @@ namespace fastllm {
                 auto found = v41CudaGraphSlots.find(graphKey);
                 const bool verification = verifyGraph && !f.pipeline;
                 if (verification && found == v41CudaGraphSlots.end()) {
-                    // Serial verification needs one active shape, independent of
-                    // maxBatch. Shortened proposals retire the old graph before
-                    // allocating another workspace. Ordinary decode and pipeline
-                    // stages retain their separate caches.
+                    // Keep the geometric warm shapes and at most one transient
+                    // layout. Tail/drain work must not evict the hot verifier.
+                    // The matching auto budget accounts for both sets.
                     const int originalDevice = FastllmCudaGetDevice();
                     for (auto it = v41CudaGraphSlots.begin(); it != v41CudaGraphSlots.end();) {
                         auto state = it->second ? V41GetCudaGraphState(it->second) : nullptr;
-                        if (!state || !state->verification) { ++it; continue; }
+                        if (!state || !state->verification || state->retainedVerification) { ++it; continue; }
                         for (int device : state->devices) FastllmCudaSyncDevice(device);
                         it = v41CudaGraphSlots.erase(it);
                     }
@@ -5745,6 +5749,10 @@ namespace fastllm {
                 if (v41CudaGraphWarmingUp || verifyGraph || found != v41CudaGraphSlots.end()) {
                     graphState = V41GetCudaGraphState(v41CudaGraphSlots[graphKey]);
                     graphState->verification = verification;
+                    graphState->retainedVerification |= verification && RetainDsparkBatch(segments.size()) &&
+                        std::all_of(segments.begin(), segments.end(), [&](const DeepSeekV41Segment &s) {
+                            return s.seqlen == v41DsparkTokens + 1;
+                        });
                 }
             }
             if (!graphState || (graphState->disabled && !f.pipeline)) {
@@ -7577,9 +7585,14 @@ namespace fastllm {
                 ToDataType(allLogits, DataType::FLOAT32);
             }
             std::vector<int> verified(numSegments);
+            const bool batchSampled = DsparkSampleVerifyBatch(*verifyLogits, segments, generationConfigsIn);
             for (int i = 0; i < numSegments; ++i) {
                 const auto &seg = segments[i];
                 auto &scratch = *seg.spec;
+                if (batchSampled) {
+                    verified[i] = scratch.tokens[scratch.acceptedDrafts];
+                    continue;
+                }
                 Data localLogits;
                 Data *logits = verifyLogits;
                 if (numSegments > 1) {
@@ -8296,15 +8309,13 @@ namespace fastllm {
                     BuildFullDecodeGraph(batch, segments);
                 }
                 if (v41DsparkEnabled) {
-                    printf("[Warmup] DeepSeek-V4.1 verification graph cache: one active shape, up to %lld rows.\n",
+                    printf("[Warmup] DeepSeek-V4.1 verification graph cache: geometric warm shapes + one transient, peak %lld rows.\n",
                            (long long)this->maxBatch * (v41DsparkTokens + 1));
-                    // Confidence filtering and the output limit can shorten a
-                    // proposal. Warm every supported verification shape, using
-                    // private KV so no synthetic history enters a real request.
+                    // Warm common capacities. Shortened proposals use the
+                    // bounded transient slot without evicting these graphs or
+                    // changing the arithmetic shape through padding.
                     std::vector<std::pair<int, int>> verifyShapes;
-                    for (int count = 2; count <= v41DsparkTokens + 1; ++count)
-                        verifyShapes.emplace_back(1, count);
-                    for (int batch : batches) if (batch > 1 && batch <= this->maxBatch)
+                    for (int batch : batches) if (batch <= this->maxBatch)
                         verifyShapes.emplace_back(batch, v41DsparkTokens + 1);
                     for (const auto &shape : verifyShapes) {
                         const int batch = shape.first, count = shape.second;

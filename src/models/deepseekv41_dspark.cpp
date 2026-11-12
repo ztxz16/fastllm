@@ -46,6 +46,7 @@
 #include "fastllm-cuda.cuh"
 #include "fastllm-cuda-graph-workspace.h"
 #include "devices/cuda/fastllm-cuda-dspark.h"
+#include "devices/cuda/fastllm-cuda-mtp.cuh"
 #include "devices/cuda/fastllm-draft-head.cuh"
 #include "devices/cuda/fastllm-fp8-auxiliary.h"
 #include "devices/cuda/fastllm-v41-decode.cuh"
@@ -147,6 +148,33 @@ namespace fastllm {
         // Retire them before member destruction returns those buffers to pools.
         workspace.reset();
         contextWorkspaces.clear();
+    }
+
+    void DeepSeekV41DsparkState::ClearProposal() {
+        drafts.clear();
+        confidence.clear();
+        proposalTokens.clear();
+        sampledProposal = false;
+        anchor = -1;
+        anchorPos = -1;
+    }
+
+    void DeepSeekV41DsparkState::Reset(int startPos) {
+        committed = startPos;
+        filled = 0;
+        disabled = false;
+        contextRequests.clear();
+        ClearProposal();
+        pending.clear();
+        rounds = proposed = accepted = 0;
+        // Retain storage, not validity: only the freshly filled prefix can be
+        // attended, and proposalProbs is unreadable until a new draft publishes q.
+    }
+
+    void DeepSeekV41Model::RetireDsparkState(std::shared_ptr<DeepSeekV41DsparkState> state) {
+        if (v41DsparkEnabled && state && state.use_count() == 1 &&
+            v41DsparkFreeStates.size() < size_t(std::max(1, maxBatch)))
+            v41DsparkFreeStates.push_back(std::move(state));
     }
 
     namespace {
@@ -1572,6 +1600,79 @@ namespace fastllm {
         }
     }
 
+    bool DeepSeekV41Model::DsparkSampleVerifyBatch(Data &logits,
+            const std::vector<DeepSeekV41Segment> &segments, const std::vector<GenerationConfig> &configs) {
+#ifdef USE_CUDA
+        const int batch = segments.size();
+        if (!batch || configs.size() != segments.size() || logits.dataType != FLOAT32 ||
+            logits.dataDevice != CUDA || !logits.cudaData || logits.dims.empty() ||
+            logits.multiDeviceData || logits.dataDeviceIds.size() != 1) return false;
+        const int rows = segments.front().seqlen, drafts = rows - 1, vocab = logits.dims.back();
+        if (drafts <= 0 || uint64_t(batch) * rows > INT_MAX ||
+            logits.Count(0) != uint64_t(batch) * rows * vocab) return false;
+        std::vector<GenerationConfig> sampling;
+        sampling.reserve(batch);
+        for (int b = 0; b < batch; ++b) {
+            const auto &s = segments[b];
+            if (!s.spec || !s.state || !s.state->dspark || s.seqlen != rows || s.offset != b * rows)
+                return false;
+            sampling.push_back(DsparkSamplingConfig(configs[b]));
+            const auto &c = sampling.back(); const auto &proposal = *s.state->dspark;
+            const auto &q = proposal.proposalProbs;
+            if (c.top_k <= 1 || c.tool_call_name_constraint_enabled || c.tool_call_parameter_name_constraint_enabled ||
+                !proposal.sampledProposal || q.dataType != FLOAT32 || q.dataDevice != CUDA || !q.cudaData ||
+                q.multiDeviceData || q.dataDeviceIds != logits.dataDeviceIds || q.dims.size() != 2 ||
+                q.dims[0] < drafts || q.dims[1] != vocab || s.spec->draftTokens.size() != size_t(drafts) ||
+                proposal.proposalTokens.size() < size_t(drafts)) return false;
+            for (int i = 0; i < drafts; ++i) {
+                const int token = s.spec->draftTokens[i];
+                AssertInFastLLM(token >= 0 && token < vocab && token == proposal.proposalTokens[i],
+                    "DeepSeekV41 DSpark: batched proposal is out of sync.");
+            }
+        }
+        struct Workspace {
+            void *plan = FastllmCudaMtpCreateVerifier();
+            Data ids{INT32};
+            std::vector<int> hostIds, topKs, output, accepted;
+            std::vector<float> temperatures, topPs;
+            std::vector<FastllmMtpProposalView> proposals;
+            ~Workspace() { FastllmCudaMtpDestroyVerifier(plan); }
+        };
+        if (!v41DsparkVerifier) v41DsparkVerifier = std::make_shared<Workspace>();
+        auto &w = *std::static_pointer_cast<Workspace>(v41DsparkVerifier);
+        FastllmCudaSetDevice(logits.dataDeviceIds.front());
+        w.ids.Resize({batch, drafts}); w.ids.ToDevice(CUDA, logits.dataDeviceIds, false); w.ids.Allocate(false);
+        w.hostIds.resize(size_t(batch) * drafts); w.proposals.resize(batch);
+        w.temperatures.resize(size_t(batch) * rows); w.topPs.resize(w.temperatures.size());
+        w.topKs.resize(w.temperatures.size()); w.output.resize(w.temperatures.size()); w.accepted.resize(batch);
+        for (int b = 0; b < batch; ++b) {
+            const auto &proposal = *segments[b].state->dspark;
+            std::copy_n(segments[b].spec->draftTokens.data(), drafts, w.hostIds.data() + b * drafts);
+            w.proposals[b] = {(const float *)proposal.proposalProbs.cudaData, nullptr,
+                             (const int *)w.ids.cudaData + b * drafts};
+            std::fill_n(w.temperatures.data() + b * rows, rows, sampling[b].temperature);
+            std::fill_n(w.topKs.data() + b * rows, rows, sampling[b].top_k);
+            std::fill_n(w.topPs.data() + b * rows, rows, sampling[b].top_p);
+        }
+        FastllmCudaCopyFromHostToDevice(w.ids.cudaData, w.hostIds.data(), w.hostIds.size() * sizeof(int));
+        if (!FastllmCudaMtpVerifierEnqueueProbabilities(w.plan, (float *)logits.cudaData, w.proposals.data(),
+                w.temperatures.data(), w.topKs.data(), w.topPs.data(), batch, drafts, vocab,
+                GetFastllmEnv().cudaGraph)) return false;
+        AssertInFastLLM(FastllmCudaMtpVerifierResolve(w.plan, w.output.data(), w.accepted.data()),
+            "DeepSeekV41 DSpark: batched rejection sampling failed.");
+        for (int b = 0; b < batch; ++b) {
+            auto &scratch = *segments[b].spec;
+            scratch.tokens.assign(w.output.begin() + b * rows, w.output.begin() + (b + 1) * rows);
+            scratch.acceptedDrafts = w.accepted[b];
+            for (int i = 0; i < w.accepted[b]; ++i)
+                AssertInFastLLM(scratch.tokens[i] == scratch.draftTokens[i],
+                    "DeepSeekV41 DSpark: invalid batched accepted token.");
+        }
+        return true;
+#endif
+        return false;
+    }
+
     void DeepSeekV41Model::DsparkSampleVerify(Data &logits, const DeepSeekV41DsparkState &proposal,
             DeepSeekV41SpecScratch &scratch, const GenerationConfig &config) {
 #ifdef USE_CUDA
@@ -1656,12 +1757,14 @@ namespace fastllm {
     std::shared_ptr<DeepSeekV41DsparkState> DeepSeekV41Model::GetOrCreateDsparkState(
             DeepSeekV41RequestState &state, int startPos) {
         if (!state.dspark) {
-            state.dspark = std::make_shared<DeepSeekV41DsparkState>();
+            if (!v41DsparkFreeStates.empty()) {
+                state.dspark = std::move(v41DsparkFreeStates.back());
+                v41DsparkFreeStates.pop_back();
+            } else state.dspark = std::make_shared<DeepSeekV41DsparkState>();
             state.dspark->layers.resize(v41DsparkLayers);
             // 前缀缓存恢复出来的前缀没有草稿侧的滑窗（main hidden 无法从目标缓存反推），
             // committed 从恢复长度开始，filled 从 0 重新累积。
-            state.dspark->committed = startPos;
-            state.dspark->filled = 0;
+            state.dspark->Reset(startPos);
         }
         return state.dspark;
     }
@@ -1861,16 +1964,19 @@ namespace fastllm {
 
         if (verifyStep) {
             ret.resize(numSegments);
+            for (int i = 0; i < numSegments; ++i) {
+                AssertInFastLLM((int)scratches[i].tokens.size() == draftCounts[i] + 1,
+                    "DeepSeekV41 DSpark: the verifier did not return per-position tokens.");
+                scratches[i].acceptedDrafts = DsparkAcceptedDraftCount(scratches[i], generationConfigs[i]);
+            }
+            DsparkCommitBatch(segments);
             // Commit every request before starting any draft. Each scratch view
             // borrows a disjoint slice of the one target graph's persistent data.
             for (int i = 0; i < numSegments; ++i) {
                 auto &state = *segments[i].state;
                 auto &scratch = scratches[i];
                 const int drafts = draftCounts[i], startPos = segments[i].startPos;
-                AssertInFastLLM((int)scratch.tokens.size() == drafts + 1,
-                    "DeepSeekV41 DSpark: the verifier did not return per-position tokens.");
-                const int accepted = DsparkAcceptedDraftCount(scratch, generationConfigs[i]);
-                scratch.acceptedDrafts = accepted;
+                const int accepted = scratch.acceptedDrafts;
                 const double commitStart = DsTick();
                 DsparkCommitPrefix(state, scratch, startPos, accepted + 1, drafts + 1);
                 const double commitMs = DsElapsed(commitStart);
@@ -1891,12 +1997,13 @@ namespace fastllm {
             std::vector<DeepSeekV41DsparkState*> draftStates;
             std::vector<int> draftAnchors;
             std::vector<GenerationConfig> draftConfigs;
+            const bool advancedBatch = DsparkAdvanceBatch(segments);
             for (int i = 0; i < numSegments; ++i) {
                 auto &scratch = scratches[i];
                 const int anchor = scratch.tokens[scratch.acceptedDrafts];
                 const auto &config = generationConfigs[i];
                 const bool stopped = anchor == eos_token_id || eos_token_ids.count(anchor) || config.stop_token_ids.count(anchor);
-                DsparkAdvance(*segments[i].state, scratch, segments[i].startPos,
+                if (!advancedBatch) DsparkAdvance(*segments[i].state, scratch, segments[i].startPos,
                     segments[i].startPos + scratch.acceptedDrafts + 1);
                 if (!stopped) {
                     draftStates.push_back(segments[i].state->dspark.get());
@@ -1932,6 +2039,24 @@ namespace fastllm {
 
     // ==================== 回滚 / 提交 ====================
 
+    bool DeepSeekV41Model::DsparkCommitBatch(const std::vector<DeepSeekV41Segment> &segments) {
+        if (segments.size() < 2 || !segments.front().spec || !segments.front().spec->commitBatchKV)
+            return false;
+        auto &first = *segments.front().spec;
+        std::vector<std::pair<int, int>> spans;
+        int end = 0;
+        for (const auto &s : segments) {
+            if (!s.spec || s.spec->commitGroup != first.commitGroup || !s.spec->commitKV ||
+                s.spec->kvCommitted || s.spec->acceptedDrafts < 0 ||
+                s.spec->acceptedDrafts >= s.seqlen || s.offset < end) return false;
+            spans.emplace_back(s.spec->acceptedDrafts + 1, s.offset);
+            end = s.offset + s.seqlen;
+        }
+        first.commitBatchKV(spans);
+        for (const auto &s : segments) s.spec->kvCommitted = true;
+        return true;
+    }
+
     void DeepSeekV41Model::DsparkCommitPrefix(DeepSeekV41RequestState &state,
                                               DeepSeekV41SpecScratch &scratch,
                                               int startPos, int accept, int forwarded) {
@@ -1949,7 +2074,7 @@ namespace fastllm {
 #ifdef USE_CUDA
         ScopedTpDispatch commitDispatch(v41DsparkTpDevices.size() > 1, v41DsparkTpDevices);
         if (scratch.commitKV) {
-            scratch.commitKV(accept);
+            if (!scratch.kvCommitted) scratch.commitKV(accept);
             batchedWindows = batchedTails = true;
         } else if (v41DsparkTpDevices.size() > 1 && startPos >= 0 && window_size > 0 && accept <= window_size) {
             std::vector<MultiCudaReplicatedCopyRange> ranges;
@@ -2095,6 +2220,146 @@ namespace fastllm {
 
     // ==================== 草稿前向 ====================
 
+    std::shared_ptr<DeepSeekV41DsparkState> DeepSeekV41Model::GetDsparkBatch(int batch, int device) {
+        if (!v41DsparkBatches.count(batch)) {
+            for (auto it = v41DsparkBatches.begin(); it != v41DsparkBatches.end();) {
+                if (RetainDsparkBatch(it->first)) ++it;
+                else it = v41DsparkBatches.erase(it);
+            }
+        }
+        auto &slot = v41DsparkBatches[batch];
+        if (!slot) slot = std::make_shared<DeepSeekV41DsparkState>();
+        slot->layers.resize(v41DsparkLayers);
+        for (auto &layer : slot->layers) {
+            auto &window = layer.windowKV;
+            window.dataType = DataType::BFLOAT16; window.UpdateUnitSize();
+            window.Resize({batch, window_size, head_dim_full});
+            window.ToDevice(DataDevice::CUDA, {device}, false); window.Allocate();
+        }
+        return slot;
+    }
+
+    bool DeepSeekV41Model::DsparkAdvanceBatch(const std::vector<DeepSeekV41Segment> &segments) {
+        v41DsparkContextReady.reset();
+#ifdef USE_CUDA
+        if (segments.empty() || !v41DsparkTpDevices.empty() || !DsDraftGraphEnabled()) return false;
+        const int batch = segments.size(), rows = segments.front().seqlen;
+        if (rows <= 0 || uint64_t(batch) * rows > INT_MAX) return false;
+        const auto *first = segments.front().spec;
+        if (!first || !first->commitGroup || first->mainHidden.size() != v41DsparkTargetLayerIds.size() ||
+            first->mainHidden.empty()) return false;
+        const auto devices = first->mainHidden.front().dataDeviceIds;
+        if (devices.size() != 1) return false;
+        for (int b = 0; b < batch; ++b) {
+            const auto &s = segments[b];
+            const auto *x = s.spec;
+            if (!x || x->commitGroup != first->commitGroup || x->mainHiddenStartPos >= 0 ||
+                s.seqlen != rows || s.offset != b * rows || x->acceptedDrafts < 0 || x->acceptedDrafts >= rows ||
+                !s.state || !s.state->dspark || s.state->dspark->disabled ||
+                s.state->dspark->layers.size() != size_t(v41DsparkLayers) ||
+                x->mainHidden.size() != first->mainHidden.size()) return false;
+            for (size_t l = 0; l < x->mainHidden.size(); ++l) {
+                const auto &h = x->mainHidden[l];
+                const auto &base = first->mainHidden[l];
+                if (h.dataDevice != CUDA || h.dataType != BFLOAT16 || !h.cudaData || h.multiDeviceData ||
+                    h.dataDeviceIds != devices || h.dims.size() != 3 ||
+                    h.dims[0] != 1 || h.dims[1] != rows || h.dims[2] != embed_dim ||
+                    h.strides.size() != 3 || h.strides[1] != uint64_t(embed_dim) || h.strides[2] != 1 ||
+                    (const char *)h.cudaData != (const char *)base.cudaData + size_t(b) * rows * embed_dim * 2)
+                    return false;
+            }
+            for (const auto &layer : s.state->dspark->layers) {
+                const auto &window = layer.windowKV;
+                if (window.dataDevice != CUDA || window.dataType != BFLOAT16 || !window.cudaData ||
+                    window.multiDeviceData || window.dataDeviceIds != devices || window.dims.size() != 3 ||
+                    window.dims[0] != 1 || window.dims[1] != window_size || window.dims[2] != head_dim_full)
+                    return false;
+            }
+        }
+        std::unique_lock<std::mutex> lock(v41CudaGraphMutex, std::try_to_lock);
+        if (!lock.owns_lock()) return false;
+        ApplyDsparkDevice(true);
+        auto storage = GetDsparkBatch(batch, devices.front());
+        // Only the regular verifier capacity and one transient context shape
+        // are retained. Accepted lengths are metadata, not graph cache keys.
+        if (!storage->contextWorkspaces.count(rows)) {
+            for (auto it = storage->contextWorkspaces.begin(); it != storage->contextWorkspaces.end();) {
+                if (it->first == v41DsparkTokens + 1) ++it;
+                else it = storage->contextWorkspaces.erase(it);
+            }
+        }
+        auto &owned = storage->contextWorkspaces[rows];
+        if (!owned) { owned = std::make_shared<DeepSeekV41DsparkWorkspace>(); owned->devices = devices; }
+        auto &context = *owned;
+        std::vector<Data> views(first->mainHidden.size());
+        std::vector<const Data *> inputs;
+        inputs.reserve(views.size());
+        for (size_t l = 0; l < views.size(); ++l) {
+            views[l].FakeFrom(first->mainHidden[l], 0);
+            views[l].Resize({1, batch * rows, embed_dim});
+            inputs.push_back(&views[l]);
+        }
+        if (!FastllmCudaNaiveDraftConcat(inputs, batch * rows, context.input)) return false;
+        std::vector<int> metadata(2 * batch);
+        storage->contextRequests.clear();
+        storage->contextRequests.reserve(batch);
+        for (int b = 0; b < batch; ++b) {
+            metadata[b] = segments[b].startPos;
+            metadata[batch + b] = segments[b].spec->acceptedDrafts + 1;
+            storage->contextRequests.push_back(segments[b].state->dspark.get());
+        }
+        auto &position = context.position;
+        position.dataType = INT32; position.UpdateUnitSize(); position.Resize({2 * batch});
+        position.ToDevice(CUDA, devices, false); position.Allocate();
+        FastllmCudaCopyFromHostToDevice(position.cudaData, metadata.data(), metadata.size() * sizeof(int));
+        const size_t bytes = size_t(window_size) * head_dim_full * 2;
+        for (int l = 0; l < v41DsparkLayers; ++l) for (int b = 0; b < batch; ++b)
+            FastllmCudaCopyFromDeviceToDevice((char *)storage->layers[l].windowKV.cudaData + b * bytes,
+                storage->contextRequests[b]->layers[l].windowKV.cudaData, bytes);
+        auto body = [&] {
+            Data projected, main;
+            LinearWithActivationQuant(context.input, "mtp.0.main_proj.weight", projected);
+            DsRMSNormBF16(projected, weight["mtp.0.main_norm.weight"], rms_norm_eps, main);
+            main.Reshape({1, batch * rows, embed_dim});
+            DsRopeParams rope = {qk_rope_head_dim, rope_base, 0, rope_factor, rope_scaling_beta_fast, rope_scaling_beta_slow};
+            const auto *positions = (const int *)position.cudaData;
+            for (int l = 0; l < v41DsparkLayers; ++l) {
+                const std::string prefix = "mtp." + std::to_string(l);
+                Data kv;
+                LinearWithActivationQuant(main, prefix + ".attn.wkv.weight", kv);
+                DsRMSNormBF16(kv, weight[prefix + ".attn.kv_norm.weight"], rms_norm_eps, kv);
+                kv.Reshape({batch, rows, head_dim_full});
+                for (int b = 0; b < batch; ++b) {
+                    Data view; view.FakeFrom(kv, size_t(b) * rows * head_dim_full * 2);
+                    view.Resize({1, rows, head_dim_full});
+                    DsRotaryQuant(view, rope, 0, 1, false, 1, 32, -1, positions + b);
+                }
+                AssertInFastLLM(FastllmCudaDeepSeekV41WindowStoreBatchPrefix(kv,
+                    storage->layers[l].windowKV, window_size, positions, positions + batch),
+                    "DeepSeekV41 DSpark batched context store failed.");
+            }
+        };
+        if (!DsRunDraftGraph(context, body)) body();
+        for (int b = 0; b < batch; ++b) {
+            auto &state = *storage->contextRequests[b];
+            if (state.committed != metadata[b]) state.filled = 0;
+            state.ClearProposal();
+            state.committed = metadata[b] + metadata[batch + b];
+            state.filled = std::min(window_size, state.filled + metadata[batch + b]);
+            for (int l = 0; l < v41DsparkLayers; ++l)
+                FastllmCudaCopyFromDeviceToDevice(state.layers[l].windowKV.cudaData,
+                    (char *)storage->layers[l].windowKV.cudaData + b * bytes, bytes);
+        }
+        // The immediately following draft may consume this same slot without
+        // copying all request windows back in. Private copies preserve fallback
+        // and regrouping correctness; q remains request-owned until verified.
+        v41DsparkContextReady = storage;
+        return true;
+#else
+        return false;
+#endif
+    }
+
     void DeepSeekV41Model::DsparkAdvance(DeepSeekV41RequestState &state, DeepSeekV41SpecScratch &scratch,
                                          int startPos, int committed) {
         if (scratch.mainHiddenStartPos >= 0) {
@@ -2102,12 +2367,7 @@ namespace fastllm {
         }
         auto dsparkPtr = GetOrCreateDsparkState(state, startPos);
         DeepSeekV41DsparkState &dspark = *dsparkPtr;
-        dspark.drafts.clear();
-        dspark.confidence.clear();
-        dspark.sampledProposal = false;
-        dspark.proposalTokens.clear();
-        dspark.anchor = -1;
-        dspark.anchorPos = -1;
+        dspark.ClearProposal();
         if (dspark.disabled) {
             return;
         }
@@ -2243,6 +2503,7 @@ namespace fastllm {
 
     void DeepSeekV41Model::DsparkGenerateDrafts(const std::vector<DeepSeekV41DsparkState*> &states,
             const std::vector<int> &anchors, const std::vector<GenerationConfig> &configs) {
+        auto contextReady = std::move(v41DsparkContextReady);
         AssertInFastLLM(states.size() == anchors.size() && states.size() == configs.size(),
                        "DeepSeekV41 DSpark: mismatched draft requests.");
         // Constraints maintain per-request text state; the existing sampler handles those.
@@ -2284,22 +2545,14 @@ namespace fastllm {
                             layer.windowKV.dataDeviceIds == devices && !layer.windowKV.multiDeviceData;
                 }
                 if (local) {
-                    if (!v41DsparkBatches.count(batch)) {
-                        // Finish pending q copies before recycling the old
-                        // shape; its destructor destroys graphs before KV/q.
-                        if (!v41DsparkBatches.empty()) FastllmCudaSyncDevice(device);
-                        v41DsparkBatches.clear();
-                    }
-                    auto &slot = v41DsparkBatches[batch];
-                    if (!slot) slot = std::make_shared<DeepSeekV41DsparkState>();
+                    auto slot = GetDsparkBatch(batch, device);
                     for (int request : group) states[request]->workspace.reset();
                     auto &storage = *slot;
-                    storage.layers.resize(v41DsparkLayers);
-                    for (int layer = 0; layer < v41DsparkLayers; ++layer) {
+                    bool reuseContext = contextReady == slot && storage.contextRequests.size() == group.size();
+                    for (size_t b = 0; reuseContext && b < group.size(); ++b)
+                        reuseContext = storage.contextRequests[b] == states[group[b]];
+                    if (!reuseContext) for (int layer = 0; layer < v41DsparkLayers; ++layer) {
                         auto &window = storage.layers[layer].windowKV;
-                        window.dataType = DataType::BFLOAT16; window.UpdateUnitSize();
-                        window.Resize({batch, window_size, head_dim_full});
-                        window.ToDevice(DataDevice::CUDA, devices, false); window.Allocate();
                         const size_t bytes = size_t(window_size) * head_dim_full * window.unitSize;
                         for (int b = 0; b < batch; ++b)
                             FastllmCudaCopyFromDeviceToDevice((char*)window.cudaData + b * bytes,

@@ -64,6 +64,10 @@ struct FastllmV41VerifyCommitLayer {
 };
 bool FastllmCudaV41CommitVerifiedPrefix(const FastllmV41VerifyCommitLayer *layers,
                                       int layerCount, int accepted, int forwarded, int rowOffset = 0, int batchRows = 0);
+// Device spans are [request, {accepted, rowOffset}]. The caller validates
+// disjoint request ranges and keeps both descriptors alive until completion.
+bool FastllmCudaV41CommitVerifiedBatch(const FastllmV41VerifyCommitLayer *layers,
+                                     int layerCount, const int *spans, int requests, int batchRows);
 
 // Create/destroy and upload run outside capture. Prepare/Finish contain only
 // fixed-shape GPU work, and can be captured exactly once during startup.

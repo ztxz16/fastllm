@@ -1301,6 +1301,28 @@ class HybridAutoTest(unittest.TestCase):
                 eager = auto._v41_runtime_bytes(a, g, "pp", {0:1}, 0, 8192, 64, 4096)
                 self.assertEqual(eager["graphs"][0], 0)
 
+    def test_v41_verifier_storage_survives_capture_disable(self):
+        # Persistent rejection plans are also used by eager verification.
+        # Turning capture off must free graph reserve, not omit these buffers.
+        for drafts in (1, 5, 17):
+            g = auto.geometry(self.dspark_metadata(), "fp4", 0, drafts)
+            g.runtime["vocab"] = 129280
+            a = args(auto=True, dspark=drafts, moe_device_layers=-1)
+            for batch in (1, 3, 9):
+                with self.subTest(drafts=drafts, batch=batch):
+                    reserves = []
+                    for graph in ("0", "1"):
+                        with patch.dict(os.environ, {"FASTLLM_CUDA_GRAPH": graph}, clear=True):
+                            reserves.append(auto._v41_runtime_bytes(
+                                a, g, "pp", {3: 1, 7: 1}, 0, 8192, batch, 4096))
+                    eager, captured = reserves
+                    self.assertEqual(eager["graphs"], {3: 0, 7: 0})
+                    self.assertEqual(eager["sampling"], captured["sampling"])
+                    self.assertEqual(eager["sampling"][3], 0)
+                    # Two retained distributions with raw and normalized p.
+                    self.assertGreaterEqual(eager["sampling"][7],
+                                            4 * batch * (drafts + 1) * 129280 * 4)
+
     def test_v41_new_runtime_reserve_reduces_cache_without_changing_context(self):
         g = auto.geometry(self.dspark_metadata(), "fp4", 0, 7)
         costs = ([4 * GiB] * len(g.kv), [MiB] * len(g.kv), 0, 0, MiB, False)

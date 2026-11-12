@@ -4673,13 +4673,15 @@ __global__ void V41QuantizeActivationVectorKernel(const __nv_bfloat16 *input, __
     // ---------------- WindowStore ----------------
 
     __global__ void V41WindowStoreKernel(const uint8_t *chunk, uint8_t *ring, int seqlen, int rowBytes,
-                                         int startPos, int windowSize, int firstRow, const int *devicePosition) {
-        const int b = blockIdx.y;
-        const int i = firstRow + blockIdx.x;
-        if (i >= seqlen) {
+                                         int startPos, int windowSize, int firstRow, const int *devicePosition,
+                                         const int *deviceCounts, bool batchMetadata) {
+        const int b = batchMetadata ? blockIdx.x / seqlen : blockIdx.y;
+        const int i = firstRow + (batchMetadata ? blockIdx.x % seqlen : blockIdx.x);
+        const int accepted = deviceCounts ? deviceCounts[b] : seqlen;
+        if (i >= accepted || (batchMetadata && i < accepted - windowSize)) {
             return;
         }
-        const int slot = ((devicePosition ? *devicePosition : startPos) + i) % windowSize;
+        const int slot = ((int64_t)(devicePosition ? devicePosition[batchMetadata ? b : 0] : startPos) + i) % windowSize;
         const uint8_t *src = chunk + ((uint64_t)b * seqlen + i) * rowBytes;
         uint8_t *dst = ring + ((uint64_t)b * windowSize + slot) * rowBytes;
         for (int k = threadIdx.x; k < rowBytes; k += blockDim.x) {
@@ -6580,11 +6582,14 @@ extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, co
 }
 
 static bool V41WindowStore(const fastllm::Data &chunk, fastllm::Data &ring, int startPos,
-                           int windowSize, const int *devicePosition, int rowCount) {
+                           int windowSize, const int *devicePosition, int rowCount,
+                           const int *deviceCounts = nullptr, bool batchMetadata = false) {
     if (!V41OnCuda(chunk) || chunk.dims.size() != 3 || windowSize <= 0) {
         return false;
     }
     int bsz = chunk.dims[0], seqlen = chunk.dims[1], dim = chunk.dims[2];
+    if (bsz <= 0 || seqlen <= 0 || (batchMetadata &&
+        (!devicePosition || !deviceCounts || uint64_t(bsz) * seqlen > INT32_MAX))) return false;
     if (rowCount == -1) rowCount = seqlen;
     if (rowCount < 0 || rowCount > seqlen) return false;
     if (rowCount == 0) return true;
@@ -6596,16 +6601,21 @@ static bool V41WindowStore(const fastllm::Data &chunk, fastllm::Data &ring, int 
         cudaMemset(ring.cudaData, 0, (size_t)ring.Count(0) * ring.unitSize / ring.unitSizeDiv);
     }
     int rowBytes = dim * chunk.unitSize;
-    int firstRow = std::max(0, rowCount - windowSize);
-    dim3 grid(rowCount - firstRow, bsz);
+    int firstRow = batchMetadata ? 0 : std::max(0, rowCount - windowSize);
+    dim3 grid(batchMetadata ? bsz * seqlen : rowCount - firstRow, batchMetadata ? 1 : bsz);
     V41WindowStoreKernel<<<grid, 256>>>((const uint8_t*)chunk.cudaData, (uint8_t*)ring.cudaData, seqlen, rowBytes,
-                                        startPos, windowSize, firstRow, devicePosition);
+                                        startPos, windowSize, firstRow, devicePosition, deviceCounts, batchMetadata);
     return V41CheckLaunch("WindowStore");
 }
 
 extern "C" bool FastllmCudaDeepSeekV41WindowStorePosition(const fastllm::Data &chunk, fastllm::Data &ring,
                                                         int startPos, int windowSize, const int *devicePosition) {
     return V41WindowStore(chunk, ring, startPos, windowSize, devicePosition, -1);
+}
+
+extern "C" bool FastllmCudaDeepSeekV41WindowStoreBatchPrefix(const fastllm::Data &chunk, fastllm::Data &ring,
+        int windowSize, const int *devicePositions, const int *deviceCounts) {
+    return V41WindowStore(chunk, ring, 0, windowSize, devicePositions, -1, deviceCounts, true);
 }
 
 extern "C" bool FastllmCudaDeepSeekV41WindowStore(const fastllm::Data &chunk, fastllm::Data &ring,

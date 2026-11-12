@@ -2050,6 +2050,12 @@ if (UNIT_TEST)
         add_test(NAME deepseek_v41_cache_readers COMMAND deepseek_v41_cache_readers_test)
         set_tests_properties(deepseek_v41_cache_readers PROPERTIES
                              LABELS cuda TIMEOUT 120 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+        add_executable(cuda_v41_commit_batch_test test/basic/test_cuda_v41_commit_batch.cpp)
+        target_include_directories(cuda_v41_commit_batch_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        target_link_libraries(cuda_v41_commit_batch_test PRIVATE fastllm)
+        add_test(NAME cuda_v41_commit_batch COMMAND cuda_v41_commit_batch_test)
+        set_tests_properties(cuda_v41_commit_batch PROPERTIES
+                             LABELS cuda TIMEOUT 120 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
         add_executable(deepseek_v41_indexer_fp4_test test/basic/test_deepseek_v41_indexer_fp4.cpp)
         target_include_directories(deepseek_v41_indexer_fp4_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
         target_link_libraries(deepseek_v41_indexer_fp4_test PRIVATE fastllm)

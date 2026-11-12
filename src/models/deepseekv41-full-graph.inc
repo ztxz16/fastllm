@@ -147,6 +147,8 @@ struct V41FullGraph {
     std::map<int, Data> mainHidden;
     std::vector<void *> ready;
     std::vector<Data> commitDescriptors;
+    Data commitSpans;
+    std::vector<int> hostCommitSpans;
     std::vector<std::vector<FastllmV41FullDecodeRequest>> hostRequests;
     std::vector<std::vector<void *>> hostPlans;
     std::shared_ptr<DeepSeekV41CudaGraphState> pieces;
@@ -438,6 +440,24 @@ void V41FullBindVerify(const std::shared_ptr<V41FullGraph> &owner, const DeepSee
         AssertInFastLLM(submitted && std::all_of(ok.begin(), ok.end(), [](int v) { return v != 0; }),
                         "full verifier KV commit failed");
     };
+    if (!pipeline && !g.attentionRuntime && !g.tensorParallel && g.devices.size() == 1) {
+        scratch.commitGroup = owner.get();
+        scratch.commitBatchKV = [owner](const std::vector<std::pair<int, int>> &spans) {
+            auto &graph = *owner;
+            FastllmCudaSetDevice(graph.devices.front());
+            graph.hostCommitSpans.resize(2 * spans.size());
+            for (size_t i = 0; i < spans.size(); ++i) {
+                graph.hostCommitSpans[2 * i] = spans[i].first;
+                graph.hostCommitSpans[2 * i + 1] = spans[i].second;
+            }
+            FastllmCudaCopyFromHostToDevice(graph.commitSpans.cudaData,
+                graph.hostCommitSpans.data(), graph.hostCommitSpans.size() * sizeof(int));
+            AssertInFastLLM(FastllmCudaV41CommitVerifiedBatch(
+                static_cast<const FastllmV41VerifyCommitLayer *>(graph.commitDescriptors.front().cudaData),
+                graph.endLayer, static_cast<const int *>(graph.commitSpans.cudaData), spans.size(), graph.batch),
+                "full verifier batched KV commit failed");
+        };
+    }
     if (scratch.captureMain) {
         scratch.mainHidden.resize(targetLayers.size());
         for (size_t i = 0; i < targetLayers.size(); ++i)
@@ -1165,6 +1185,13 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
                 throw std::runtime_error("TP full graph timing removal failed");
         }
         if (verifying && !distributedAttention) {
+            if (!g->tensorParallel && g->devices.size() == 1) {
+                g->commitSpans.dataType = DataType::INT32;
+                g->commitSpans.UpdateUnitSize();
+                g->commitSpans.Resize({g->batch, 2});
+                g->commitSpans.ToDevice(DataDevice::CUDA, g->devices, false);
+                g->commitSpans.Allocate();
+            }
             g->commitDescriptors.resize(g->devices.size());
             for (size_t rank = 0; rank < g->devices.size(); ++rank) {
                 const int device = g->devices[rank];

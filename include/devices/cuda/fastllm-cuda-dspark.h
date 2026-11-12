@@ -30,6 +30,11 @@ bool FastllmCudaDeepSeekV41DraftInput(const fastllm::Data &embedding,
     fastllm::Data &hidden, fastllm::Data &preMix, fastllm::Data &indices, fastllm::Data &tokens);
 bool FastllmCudaDeepSeekV41WindowStorePosition(const fastllm::Data &chunk, fastllm::Data &ring,
                                               int startPos, int windowSize, const int *devicePosition);
+// Fixed-capacity [batch, rows, dim] input; only each device-side accepted
+// prefix is stored. Positions and counts have batch entries and may change
+// between graph replays without changing the input/window addresses.
+bool FastllmCudaDeepSeekV41WindowStoreBatchPrefix(const fastllm::Data &chunk, fastllm::Data &ring,
+    int windowSize, const int *devicePositions, const int *deviceCounts);
 // tokens[0] is the device-side anchor; tokens[1..block] are produced in order.
 bool FastllmCudaDeepSeekV41MarkovChainDevice(const fastllm::Data &logits,
     const fastllm::Data &embedWeight, const fastllm::Data &headWeight, int block,
