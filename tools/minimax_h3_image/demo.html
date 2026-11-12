@@ -178,11 +178,11 @@
             data = await response.json(),
             ready = data.status === "ready";
           health.textContent = ready
-            ? "● 本地服务已连接"
+            ? `● 本地服务已连接 · ${(data.dit_precision || "bf16").toUpperCase()}`
             : data.status === "failed"
               ? "模型加载失败"
               : "模型准备中";
-          workspace.update({ services: [{ id: "local", name: "MiniMax H3 Image", ready }] });
+          workspace.update({ services: [{ id: "local", name: `MiniMax H3 Image · ${(data.dit_precision || "bf16").toUpperCase()}`, ready }] });
           if (data.status === "failed") workspace.error(data.error || "模型加载失败");
         } catch (e) {
           health.textContent = "服务未连接";

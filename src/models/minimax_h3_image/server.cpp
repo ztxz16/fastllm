@@ -136,13 +136,15 @@ class Service {
                 // Validate model configs and checkpoint indexes before advertising readiness.
                 {
                     Runtime rt(device), full(device, true), vae(device, vaeType);
-                    Transformer transformer(rt, full, model);
-                    VAE decoder(vae, full, model);
-                    fastllm::nomas::QwenTokenizer tokenizer(model + "/tokenizer");
-                    if (!std::filesystem::is_regular_file(model + "/text_encoder/config.json"))
+                    auto source = resolveModelSource(model);
+                    Transformer transformer(rt, full, source.directory, {}, false, source.fp8Weights);
+                    VAE decoder(vae, full, source.directory);
+                    fastllm::nomas::QwenTokenizer tokenizer(source.directory + "/tokenizer");
+                    if (!std::filesystem::is_regular_file(source.directory + "/text_encoder/config.json"))
                         throw std::runtime_error("missing text_encoder/config.json");
                 }
                 Pipeline pipeline(model, device, vaeType, gpuLimit_, hostLimit_, devices, reduction, parallelMode);
+                fp8Enabled_ = pipeline.fp8();
                 sequenceParallel_ = pipeline.sequenceParallel();
                 streaming_ = pipeline.memoryPolicy().layerStreaming;
                 hostCacheGiB_ = double(pipeline.memoryPolicy().host->limit()) / (size_t(1) << 30);
@@ -240,6 +242,7 @@ class Service {
                                        : startupError_.empty() ? "loading"
                                                                : "failed"},
                             {"error", startupError_.empty() ? Json() : Json(startupError_)},
+                            {"dit_precision", fp8Enabled_ ? "fp8" : "bf16"},
                             {"gpu_memory_limit_gib", gpuLimit_},
                             {"host_memory_limit_gib", hostLimit_},
                             {"tensor_parallel_size", parallelSize_},
@@ -344,6 +347,7 @@ class Service {
     std::atomic<bool> streaming_{false};
     std::atomic<double> hostCacheGiB_{0};
     std::atomic<int> pending_{0};
+    std::atomic<bool> fp8Enabled_{false};
     uint64_t sequence_ = 0;
     std::mutex mutex_;
     std::atomic<bool> sequenceParallel_{false};
@@ -365,10 +369,12 @@ int main(int argc, char **argv) {
         for (int i = 1; i < argc; ++i) {
             std::string arg = argv[i];
             if (arg == "--help") {
-                std::cout << "minimax_h3_image_server --model DIR [--host 127.0.0.1 --port 8009 --device 0 "
-                             "--output DIR --demo FILE --api-key KEY --vae-precision bf16|fp32]\n"
-                             "  [--gpu-memory-limit GiB --host-memory-limit GiB] (0: automatic)\n"
-                             "  [--devices 0,1 --parallel-mode auto|tp|sp --tp-reduction fp32|activation]\n";
+                std::cout
+                    << "minimax_h3_image_server --model DIR [--host 127.0.0.1 --port 8009 --device 0 "
+                       "--output DIR --demo FILE --api-key KEY --vae-precision bf16|fp32]\n"
+                       "  --model accepts a complete directory or FP8 safetensors file (auto-detected).\n"
+                       "  [--gpu-memory-limit GiB --host-memory-limit GiB] (0: automatic)\n"
+                       "  [--devices 0,1 --parallel-mode auto|tp|sp --tp-reduction fp32|activation]\n";
                 return 0;
             }
             if (++i >= argc)

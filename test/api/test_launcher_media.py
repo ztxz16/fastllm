@@ -184,6 +184,15 @@ class ServiceTest(unittest.TestCase):
         validate_config(config_from_dict(self.profile("minimax_h3_image", visible_gpus="0,1,2")), fields)
         self.assertTrue(any("visible_gpus" in item["fields"] for item in fields))
 
+    def test_image_fp8_uses_existing_model_path(self):
+        checkpoint = self.directory / "arbitrary.safetensors"
+        checkpoint.touch()
+        config = config_from_dict(self.profile("minimax_h3_image", model=str(checkpoint)))
+        self.assertEqual(validate_config(config), [])
+        command = build_fastllm_argv(config)
+        self.assertEqual(command[command.index("--model") + 1], str(checkpoint))
+        self.assertNotIn("--fp8-weights", command)
+
     def test_image_memory_budget_validation(self):
         for field, values in (("video_gpu_memory_limit", ("-1", "1", "1.0000000001", "nan", "inf", "1048577")),
                               ("video_host_memory_limit", ("-1", "1.99", "nan", "inf", "1048577"))):

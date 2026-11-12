@@ -400,3 +400,59 @@ source-equivalent preceding snapshot, not rerun in this cleanup. Their accumulat
 SGLang edit-quality and dual-SM120-only limitations above still apply. Review logs, the cleanup
 patch, final source hashes and proposed commit groups are recorded separately in
 `/workspace2/experiments/minimax-h3-native/image-native-20261111/dual-commit-review-20261112`.
+
+## Native FP8 integration (2026-11-12)
+
+The existing model path selects BF16 or FP8 by inspecting safetensors matrix dtypes.
+No additional precision flag is required. Tests cover ambiguous checkpoints, missing
+or ambiguous bases, and U8 Comfy metadata alongside actual FP8 weights. Native CUDA
+fixtures cover original head-interleaved versus Comfy packed QKV layouts, scalar/per-channel scales, FC1 half ordering, padded and zero rows,
+multiple model instances, cache release/reload and malformed inputs.
+
+On physical GPUs 4/5 (SM120, 72 GiB each), 2048², six steps, seed 42, the same Unsloth
+E4M3 weights were compared with SGLang revision `23a45fd33921164fa440fd7c28cc63341259c28c`.
+Each workload has six warm samples per implementation (two processes, discard request
+zero from four per process). Timings exclude initialization and PNG writing.
+
+| Workload | Native FP8 | SGLang FP8 | Native latency difference |
+|---|---:|---:|---:|
+| Text-to-image | 2.305785 s | 1.956908 s | +17.83% |
+| One-reference edit | 7.377160 s | 6.896687 s | +6.97% |
+
+The gap is concentrated in denoising: 2.171874 vs 1.796475 s for text-to-image,
+5.631709 vs 4.969281 s for editing. Native uses cuBLAS 13.2.1.1 to avoid the
+multi-device FP8 issue; SGLang's Torch 2.14.0+cu130 environment uses cuBLAS 13.1.1.3
+and its existing CUTLASS FP8 implementation. This compares the actual framework stacks.
+SGLang runs SP2/TP1, speed mode, lossless quality, without compilation, graphs, FSDP
+or conditioning caches. Both retain native auxiliary weights and quantize the same
+200 main projections; SGLang receives a lossless layout conversion of the downloaded file.
+
+An isolated SGLang copy required loader compatibility fixes for rowwise metadata,
+unaltered AdaLN reconstruction, and one-dimensional QKV scales (which must be reordered
+with the weight rows). Its compute kernels were unchanged. Initialization audits
+recorded 200 FP8 layers per rank and exact payload/scale matches for the first and last
+blocks. Failed loader attempts and outputs before the scale fix are excluded from timing.
+SGLang text-to-image is visually coherent after the fix, but its edit still has severe
+color distortion and does not follow the requested winter change. The edit latency is
+therefore **not an equal-quality comparison**. Native produces the intended snowy edit.
+
+Native FP8 outputs match the preceding validated FP8 experiment byte-for-byte; original
+BF16 text-to-image and edit outputs also match the preceding BF16 baseline. The earlier
+same-input quantized projection relative L2 maxima were 0.04564226 / 0.04475079; FP8 is
+accepted as a separate approximate model and is not claimed to satisfy the 1% BF16 gate.
+
+Eleven native CTests pass without skips. Launcher tests pass 19 checks with one optional
+browser check disabled; workspace state and syntax checks pass. Actual SP cancellation
+at reference/text/prepare/denoise/decode releases host cache and produces byte-identical
+repeats afterward. A 3 GiB-per-device/2 GiB-host FP8 HTTP run recovers from budget
+exhaustion and cancellation, then completes a two-reference 256² edit; sampled peak
+GPU usage is 3407 MiB and RSS 1565.55 MiB (budgets constrain allocation pools/caches,
+not all process overhead). Single-device constrained-memory generation also passes.
+The downloaded LSDJesus scalar-scaled E4M3 file completes a separate 2048² dual-device
+text-to-image smoke after honoring its packed-QKV metadata; its edit quality/performance was not evaluated. The earlier scalar-layout noise image is retained as a failed attempt. A final Unsloth rerun after this compatibility fix produces the same pixels as the timed build. Other architectures,
+4/8 devices, FP8 TP and maximum-reference-count requests were not exercised.
+
+Evidence: `fp8-mainline-20261112` under the existing image experiment directory on
+pro5000. It includes all warm samples, stage timings, image hashes, source/binary
+manifests, loader adapters, cancellation/low-memory logs and a standalone report.
+The GPU3 live studio was not replaced during validation.

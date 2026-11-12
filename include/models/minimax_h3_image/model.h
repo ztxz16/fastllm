@@ -1,5 +1,7 @@
 #pragma once
 #include "models/minimax_h3/runtime.h"
+#include "models/minimax_h3_image/fp8.h"
+#include "models/minimax_h3_image/source.h"
 
 namespace fastllm::minimax_h3_image {
 using minimax_h3::DType;
@@ -32,7 +34,7 @@ class SequenceAttentionPipeline;
 class Transformer {
   public:
     Transformer(Runtime &, Runtime &fp32, const std::string &model, nomas::ParallelContext = {},
-                bool sequenceParallel = false);
+                bool sequenceParallel = false, const std::string &fp8Weights = "");
     void prepare(Progress = {});
     // Valid only within one request; recomputed for each new prompt/reference set.
     void prepareText(const Tensor &);
@@ -50,6 +52,7 @@ class Transformer {
     Tensor refine(const Tensor &);
     Runtime &rt_, &full_;
     Weights weights_, fullWeights_, heads_;
+    std::unique_ptr<Fp8Weights> fp8_;
     nomas::ParallelContext parallel_;
     std::vector<float> times_, sigmas_;
     std::vector<Tensor> modulation_;
@@ -109,13 +112,14 @@ class Pipeline {
     ~Pipeline();
     const MemoryPolicy &memoryPolicy() const { return memory_; }
     bool sequenceParallel() const { return sequenceParallel_; }
+    bool fp8() const { return !source_.fp8Weights.empty(); }
     Image generate(const Options &, Progress = {}, Trace = {}, const std::vector<float> *text = nullptr,
                    const std::vector<float> *noise = nullptr, bool decode = true);
 
   private:
     Image generateImpl(const Options &, Progress, Trace, const std::vector<float> *,
                        const std::vector<float> *, bool);
-    std::string model_;
+    ModelSource source_;
     Runtime rt_, full_, vaeRt_;
     MemoryPolicy memory_;
     std::unique_ptr<minimax_h3::TextEncoder> textEncoder_;

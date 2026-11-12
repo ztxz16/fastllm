@@ -12,11 +12,11 @@ struct ParallelModel::Rank {
     std::unique_ptr<VAE> decoder;
 
     Rank(const std::string &dir, int device, nomas::ParallelContext context, const MemoryPolicy &root,
-         double gpuLimit, bool sequenceParallel)
+         double gpuLimit, bool sequenceParallel, const std::string &fp8Weights)
         : directory(dir), rt(device), full(device, true),
           memory(context.rank ? MemoryPolicy(rt, gpuLimit, 2) : root),
           text(rt, dir + "/text_encoder", {context.group, context.rank}),
-          transformer(rt, full, dir, context, sequenceParallel) {
+          transformer(rt, full, dir, context, sequenceParallel, fp8Weights) {
         // One host-cache budget shared by all ranks; GPU limits apply per card.
         memory.host = root.host;
         rt.setLinearAutotuning(sequenceParallel);
@@ -33,12 +33,12 @@ struct ParallelModel::Rank {
 
 ParallelModel::ParallelModel(const std::string &dir, const std::vector<int> &devices,
                              const MemoryPolicy &root, double gpuLimit, nomas::RowReduction reduction,
-                             bool sequenceParallel)
+                             bool sequenceParallel, const std::string &fp8Weights)
     : group_(devices), ranks_(devices.size()) {
     group_.run([&](int rank) {
         ranks_[rank] =
             std::make_unique<Rank>(dir, devices[rank], nomas::ParallelContext{&group_, rank, reduction}, root,
-                                   gpuLimit, sequenceParallel);
+                                   gpuLimit, sequenceParallel, fp8Weights);
     });
 }
 ParallelModel::~ParallelModel() {

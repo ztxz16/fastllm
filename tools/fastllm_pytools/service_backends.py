@@ -277,8 +277,9 @@ class H3ImageBackend:
             errors.append({"message": message, "fields": list(fields)})
         if config.command != "server":
             add("图像模型需要使用 API Server 启动方式。", "command")
-        if not config.model.strip() or not Path(config.model).expanduser().is_dir():
-            add("请选择已存在的 MiniMax H3 Image 模型目录。", "model")
+        model = Path(config.model.strip()).expanduser()
+        if not config.model.strip() or not (model.is_dir() or (model.is_file() and model.suffix == ".safetensors")):
+            add("请选择完整 MiniMax H3 Image 模型目录或 FP8 safetensors 文件；权重类型会自动识别。", "model")
         if not shutil.which(self.executable(config)):
             add("找不到 minimax_h3_image_server；请编译图像服务或设置 FTLLM_H3_IMAGE_SERVER。", "server_binary")
         count = len([gpu for gpu in config.visible_gpus.split(",") if gpu.strip()])

@@ -834,7 +834,7 @@
     "Image demo": "图像 Demo",
     "cancelling": "正在取消",
     "Image generation": "图像生成",
-    "MiniMax H3 Image · text-to-image and reference editing. Supports multiple GPUs.": "MiniMax H3 Image · 文生图与参考图编辑，支持多卡。",
+    "MiniMax H3 Image · text-to-image and reference editing. Select a model directory or FP8 safetensors; precision is detected automatically.": "MiniMax H3 Image · 文生图与参考图编辑；选择模型目录或 FP8 safetensors 文件，自动识别权重类型。",
     "MiniMax H3 Image 支持 1、2、4 或 8 张 GPU。": "MiniMax H3 Image 支持 1、2、4 或 8 张 GPU。",
     "图像显存预算须为大于 1 的 GiB 数值，或填 0 使用默认策略。": "图像显存预算须为大于 1 的 GiB 数值，或填 0 使用默认策略。",
     "图像内存预算须为至少 2 的 GiB 数值，或填 0 使用默认策略。": "图像内存预算须为至少 2 的 GiB 数值，或填 0 使用默认策略。"
