@@ -67,6 +67,27 @@ PYTHONDONTWRITEBYTECODE=1 python3 test/distributed/run_process_tp.py --frontend-
 再通过公开进程底座完成 worker 启动、Ping 和正常退出。缺少命令或权限时记 FAIL，不静默跳过。
 该项默认不启用，不能把普通控制面通过当成 PID 1 场景已验证。
 
+### 双 V100 退出监控完整验收
+
+在 CUDA 12.6 服务器上运行以下脚本；它会构建所需产物，再运行五组 NCCL 验收：
+进程退出/通信、Eager/Graph Decode，以及 Eager/Graph 正式入口（Graph 同时开启 Prefix Cache）。
+所有默认路径均使用 NCCL，不要求自定义规约所需的双向 P2P/native atomics。
+
+```bash
+bash test/distributed/run_process_tp_exit_v100.sh /home/models/Qwen3-1.7B
+```
+
+脚本保留已有的 `CUDA_VISIBLE_DEVICES`，未设置时使用 `0,1`；TP 始终选可见列表中的
+前两张卡。V100 型号本身不能保证所选 GPU 对满足自定义规约条件。只有需要额外验收
+自定义通信时，才设置 `TP_EXIT_CUSTOM_ALLREDUCE=1`，追加通信底座、Graph Decode 和
+Graph 正式入口三组测试。该模式仍严格检查实际路径，能力不足时失败，不静默回退：
+
+```bash
+TP_EXIT_CUSTOM_ALLREDUCE=1 bash test/distributed/run_process_tp_exit_v100.sh /home/models/Qwen3-1.7B
+```
+
+默认成功仅代表 NCCL 配置通过，自定义 AllReduce 会明确显示为“未启用、未验收”。
+
 ## 检查内容与报告
 
 - 通过公开 `ProcessGroup` 接口验证正常启停、三次重启和幂等 Stop。
