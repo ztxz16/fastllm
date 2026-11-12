@@ -62,6 +62,13 @@ bool FastllmCudaMtpVerifierEnqueue(void *plan, float *targetLogits,
     const FastllmMtpProposalView *proposals, const float *temperatures,
     const int *topKs, const float *topPs, int batch, int drafts, int vocab,
     bool useGraph);
+// Same persistent plan with exact, already-normalized proposal probabilities.
+// views.logits points to q; views.logsumexp is unused. Device token arrays and
+// all q rows remain borrowed until Resolve. No draft-count specialization limit.
+bool FastllmCudaMtpVerifierEnqueueProbabilities(void *plan, float *targetLogits,
+    const FastllmMtpProposalView *proposals, const float *temperatures,
+    const int *topKs, const float *topPs, int batch, int drafts, int vocab,
+    bool useGraph);
 bool FastllmCudaMtpVerifierResolve(void *plan, int *output, int *accepted);
 
 // Shared implementation between the normalization and rejection CUDA units.

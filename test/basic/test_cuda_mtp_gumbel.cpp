@@ -75,7 +75,7 @@ std::vector<double> TargetOracle(const std::vector<float> &values, float tempera
     return probs;
 }
 void ChainCase(const char *label, const std::vector<float> &p, const std::vector<float> &q,
-        float temperature = 1, int topK = 32, float topP = 1, bool indirect = false, int planned = 0) {
+        float temperature = 1, int topK = 32, float topP = 1, bool indirect = false, int planned = 0, bool probability = false) {
     const int batch = 16384, drafts = 3, vocab = 32;
     const std::vector<float> bonus{.1f, .2f, .7f};
     const auto expected = TargetOracle(p, temperature, topK, topP);
@@ -97,13 +97,18 @@ void ChainCase(const char *label, const std::vector<float> &p, const std::vector
     Require(FastllmCudaMtpSampleDraftLogits(qlogits.p, saved.p, lse.p, ids.p, nullptr,
         qt.data(), batch * drafts, vocab), "chain draft failed");
     auto cache = saved.Read();
+    if (probability) {
+        const auto normalizers = lse.Read();
+        for (size_t i=0;i<cache.size();++i) cache[i]=std::exp(cache[i]-normalizers[i/vocab]);
+        Check(cudaMemcpy(saved.p,cache.data(),cache.size()*sizeof(float),cudaMemcpyHostToDevice));
+    }
     if (planned) {
         std::vector<FastllmMtpProposalView> views(batch);
         for (int b = 0; b < batch; ++b)
-            views[b] = {saved.p + size_t(b) * drafts * vocab, lse.p + b * drafts, ids.p + b * drafts};
+            views[b] = {saved.p + size_t(b) * drafts * vocab, probability ? nullptr : lse.p + b * drafts, ids.p + b * drafts};
         std::unique_ptr<void, decltype(&FastllmCudaMtpDestroyVerifier)> plan(
             FastllmCudaMtpCreateVerifier(), FastllmCudaMtpDestroyVerifier);
-        Require(FastllmCudaMtpVerifierEnqueue(plan.get(), target.p, views.data(), pt.data(), pk.data(), pp.data(),
+        Require((probability ? FastllmCudaMtpVerifierEnqueueProbabilities : FastllmCudaMtpVerifierEnqueue)(plan.get(), target.p, views.data(), pt.data(), pk.data(), pp.data(),
             batch, drafts, vocab, planned == 2), "planned chain enqueue");
         Require(FastllmCudaMtpVerifierResolve(plan.get(), output.data(), accepted.data()), "planned chain resolve");
     } else if (indirect) {
@@ -180,15 +185,16 @@ void LargeVocabAndGraphCase() {
     cudaEventDestroy(start); cudaEventDestroy(end); cudaGraphExecDestroy(exec); cudaGraphDestroy(graph);
 }
 
-void PlanLifecycle() {
+void PlanLifecycle(bool probability = false) {
     const int vocab = 257, batch = 4, drafts = 17, rows = batch * (drafts + 1);
     std::vector<float> target(size_t(rows) * vocab, -INFINITY), saved(size_t(batch)*drafts*vocab, -INFINITY);
     for (int row = 0; row < rows; ++row) { target[size_t(row)*vocab] = std::log(.7f); target[size_t(row)*vocab+1] = std::log(.3f); }
     for (int row = 0; row < batch * drafts; ++row) saved[size_t(row)*vocab+2] = 0;
+    if (probability) for (float &x:saved) x=std::exp(x);
     Buffer<float> p(target), q(saved), lse(std::vector<float>(batch*drafts,0));
     Buffer<int> ids(std::vector<int>(batch*drafts,2));
     std::vector<FastllmMtpProposalView> views(batch);
-    for (int b=0;b<batch;++b) views[b]={q.p+size_t(b)*drafts*vocab,lse.p+b*drafts,ids.p+b*drafts};
+    for (int b=0;b<batch;++b) views[b]={q.p+size_t(b)*drafts*vocab,probability ? nullptr : lse.p+b*drafts,ids.p+b*drafts};
     std::vector<float> ts(rows,1), ps(rows,1);
     std::vector<int> ks(rows,vocab), output(rows), accepted(batch);
     void *plan=FastllmCudaMtpCreateVerifier();
@@ -201,9 +207,9 @@ void PlanLifecycle() {
             std::fill(ps.begin(),ps.end(),iteration%4==1?.5f:1.f);
             ts[0]=iteration%2?.8f:1.f;
             if (iteration%3==0) std::reverse(views.begin(),views.end());
-            Require(FastllmCudaMtpVerifierEnqueue(plan,p.p,views.data(),ts.data(),ks.data(),ps.data(),
+            Require((probability ? FastllmCudaMtpVerifierEnqueueProbabilities : FastllmCudaMtpVerifierEnqueue)(plan,p.p,views.data(),ts.data(),ks.data(),ps.data(),
                 batch,drafts,vocab,iteration%8!=0),"plan enqueue/reconfigure");
-            Require(!FastllmCudaMtpVerifierEnqueue(plan,p.p,views.data(),ts.data(),ks.data(),ps.data(),
+            Require(!(probability ? FastllmCudaMtpVerifierEnqueueProbabilities : FastllmCudaMtpVerifierEnqueue)(plan,p.p,views.data(),ts.data(),ks.data(),ps.data(),
                 batch,drafts,vocab,true),"overlapping plan accepted");
             Require(FastllmCudaMtpVerifierResolve(plan,output.data(),accepted.data()),"plan resolve/handoff");
             for (int b=0;b<batch;++b) {
@@ -226,7 +232,7 @@ void PlanLifecycle() {
     Buffer<float> p2(alternate);
     std::fill(ts.begin(),ts.end(),1.f);std::fill(ps.begin(),ps.end(),1.f);std::fill(ks.begin(),ks.end(),vocab);
     for(int i=0;i<12;++i) {
-        Require(FastllmCudaMtpVerifierEnqueue(plan,i%2?p.p:p2.p,views.data(),ts.data(),ks.data(),ps.data(),
+        Require((probability ? FastllmCudaMtpVerifierEnqueueProbabilities : FastllmCudaMtpVerifierEnqueue)(plan,i%2?p.p:p2.p,views.data(),ts.data(),ks.data(),ps.data(),
             batch,drafts,vocab,true),"plan input retarget");
         Require(FastllmCudaMtpVerifierResolve(plan,output.data(),accepted.data()),"plan retarget resolve");
         for(int b=0;b<batch;++b) Require(accepted[b]==0 && (i%2 ? output[b*(drafts+1)]<=1 : output[b*(drafts+1)]==3),
@@ -234,10 +240,51 @@ void PlanLifecycle() {
     }
 
     ts[0]=0;
-    Require(!FastllmCudaMtpVerifierEnqueue(plan,p.p,views.data(),ts.data(),ks.data(),ps.data(),batch,drafts,vocab,true),
+    Require(!(probability ? FastllmCudaMtpVerifierEnqueueProbabilities : FastllmCudaMtpVerifierEnqueue)(plan,p.p,views.data(),ts.data(),ks.data(),ps.data(),batch,drafts,vocab,true),
         "invalid parameters accepted");
     FastllmCudaMtpDestroyVerifier(plan);
     std::puts("owned verifier lifecycle: parameter changes, graph/eager, 17 drafts, descriptor reorder, fresh workers, RNG: PASS");
+}
+
+void ProbabilityPrefixes() {
+    const int vocab=257, guard=7;
+    std::unique_ptr<void,decltype(&FastllmCudaMtpDestroyVerifier)> plan(
+        FastllmCudaMtpCreateVerifier(),FastllmCudaMtpDestroyVerifier);
+    for(int batch:{1,2,3,5,9}) for(int drafts:{1,5,9,17}) {
+        const int rows=batch*(drafts+1), pitch=drafts+guard;
+        std::vector<float> q(size_t(batch)*pitch*vocab,123.f);
+        std::vector<int> ids(batch*pitch,-7);
+        for(int b=0;b<batch;++b) for(int d=0;d<drafts;++d) {
+            std::fill_n(q.data()+size_t(b*pitch+d)*vocab,vocab,0.f);
+            q[size_t(b*pitch+d)*vocab+b%3]=1;ids[b*pitch+d]=b%3;
+        }
+        Buffer<float> probabilities(q), target(size_t(rows)*vocab);
+        Buffer<int> tokens(ids);
+        std::vector<FastllmMtpProposalView> views(batch);
+        std::vector<float> logits(size_t(rows)*vocab), temperatures(rows,1), ps(rows,1);
+        std::vector<int> ks(rows,vocab), output(rows), accepted(batch);
+        for(int step=0;step<=drafts;++step) {
+            std::fill(logits.begin(),logits.end(),-INFINITY);
+            for(int b=0;b<batch;++b) {
+                const int source=(b+step)%batch, prefix=(b+step)%(drafts+1), token=source%3;
+                views[b]={probabilities.p+size_t(source)*pitch*vocab,nullptr,tokens.p+source*pitch};
+                for(int d=0;d<=drafts;++d)
+                    logits[size_t(b*(drafts+1)+d)*vocab+(d<prefix?token:token+3)]=0;
+            }
+            Check(cudaMemcpy(target.p,logits.data(),logits.size()*sizeof(float),cudaMemcpyHostToDevice));
+            Require(FastllmCudaMtpVerifierEnqueueProbabilities(plan.get(),target.p,views.data(),
+                temperatures.data(),ks.data(),ps.data(),batch,drafts,vocab,step%2),"probability prefix enqueue");
+            Require(FastllmCudaMtpVerifierResolve(plan.get(),output.data(),accepted.data()),"probability prefix resolve");
+            for(int b=0;b<batch;++b) {
+                const int prefix=(b+step)%(drafts+1), token=((b+step)%batch)%3;
+                Require(accepted[b]==prefix,"wrong probability prefix length");
+                for(int d=0;d<=drafts;++d) Require(output[b*(drafts+1)+d]==
+                    (d<prefix?token:d==prefix?token+3:-1),"probability suffix/support mismatch");
+            }
+        }
+        Require(q==probabilities.Read()&&ids==tokens.Read(),"probability verifier mutated borrowed input/guards");
+    }
+    std::puts("probability verifier: all prefixes, irregular batches, 17 drafts, descriptor remap, bounded shape reuse: PASS");
 }
 
 void IndirectBatchCase(int batch, int drafts, bool owned = false) {
@@ -332,6 +379,11 @@ int main() {
             ChainCase("owned verifier residual", {.1f,.2f,.7f}, {.6f,.3f,.1f}, 1, 32, 1, false, mode);
             ChainCase("owned verifier constraints", {.6f,.3f,.1f}, {.2f,.3f,.5f}, 1.5f, 2, .95f, false, mode);
         }
+        ChainCase("probability plan equal", {.2f,.3f,.5f}, {.2f,.3f,.5f},1,32,1,true,2,true);
+        ChainCase("probability plan disjoint", {0,1,0}, {1,0,0},1,32,1,true,2,true);
+        ChainCase("probability plan filtered", {.15f,.35f,.5f}, {.4f,.3f,.3f},.8f,2,.85f,true,2,true);
+        PlanLifecycle(true);
+        ProbabilityPrefixes();
         PlanLifecycle();
         for (int batch : {1, 2, 4, 32}) for (int drafts : {1, 3, 17})
             IndirectBatchCase(batch, drafts, true);
