@@ -456,3 +456,88 @@ Evidence: `fp8-mainline-20261112` under the existing image experiment directory 
 pro5000. It includes all warm samples, stage timings, image hashes, source/binary
 manifests, loader adapters, cancellation/low-memory logs and a standalone report.
 The GPU3 live studio was not replaced during validation.
+
+## FP8 projection optimization (2026-11-12)
+
+SM120 builds now use a native CUTLASS FP8 GEMM with row/channel scales fused into
+the BF16 output epilogue. Aligned BF16 loads, register reuse and paired FP8 stores
+speed up activation quantization. Three shape-selected GEMM tiles are internal;
+the checkpoint still determines precision automatically. Other architectures and
+builds retain the cuBLAS path. No Torch dependency or user option was added.
+
+Fresh interleaved old-native/new-native/SGLang runs used the same dual-SM120,
+2048², six-step protocol and stack versions described above. Each number is the
+median of six warm requests, excluding initialization and PNG writing.
+
+| Workload | Previous native | Optimized native | SGLang | Native reduction |
+|---|---:|---:|---:|---:|
+| Text-to-image | 2.308882 s | 1.952967 s | 1.964085 s | 15.42% |
+| One-reference edit | 7.390615 s | 6.595090 s | 6.921824 s | 10.76% |
+
+Text-to-image is effectively tied with SGLang; editing takes 4.72% less time.
+The SGLang edit output is unchanged and still fails the winter instruction, so
+this remains an execution-speed comparison, not an equal-quality comparison.
+Native outputs are repeatable and the winter edit remains visually coherent.
+
+Four fresh Nsight captures cover all 300 main blocks on each rank. Rank 0's
+activation-quantization kernel sum is 17.12/72.57 ms for text/edit versus SGLang's
+21.96/95.48 ms. The 1,200 separate output-scaling launches per rank are eliminated.
+The remaining output-projection gap is about 6.6/6.2 ms per request (kernel sums);
+not every individual projection is faster. These sums are not additive latency
+savings. Warm and cold-cache microbenchmarks of six tile candidates are retained.
+
+Fusing scales removes an intermediate BF16 rounding step. Same-input comparisons
+against the previous native FP8 path checked all 200 projections on both ranks
+at the first denoising step for each workload: 800 checks, maximum relative L2
+0.00415827 (text) and 0.00428721 (edit), below the 0.01 gate. This measures the
+optimization's error against previous FP8, not FP8 error against original BF16.
+Independent CPU E4M3 fixtures also cover all three vectorized input widths,
+non-aligned row counts, zero/tiny values and channel scales.
+
+Eleven native CTests pass without skips. The actual checkpoint passes SP
+cancellation/repeatability, two-reference HTTP editing after budget exhaustion
+and cancellation, and single-GPU constrained-memory generation. The HTTP run
+uses 3 GiB per GPU and 2 GiB host budgets, with sampled peaks of 3407 MiB GPU and
+1614.21 MiB RSS; budgets limit pools/caches rather than total process memory.
+SM80 and SM89 fallback translation units compile, and the SM89 PTX fallback test
+passes on SM120. This is not runtime validation on those older GPUs.
+Compute Sanitizer reports zero errors for the FP8 fixtures and 36 full-width
+GEMM cases covering all three tiles, row-boundary dispatch and output guards.
+
+Evidence, source/binary hashes, raw trace locations and reproduction scripts:
+`/workspace2/experiments/minimax-h3-native/image-native-20261111/fp8-opt-20261112`.
+
+## FP8 cleanup and default-library validation (2026-11-12)
+
+The SM120 CUTLASS path no longer requires an override to load cuBLAS 13.2.1.
+Device validation and dispatch share the same backend predicate; only the actual
+cuBLAS FP8 fallback retains the multi-Blackwell version guard. Fresh dual-SM120
+runs with `LD_LIBRARY_PATH` and `LD_PRELOAD` unset load system cuBLAS 13.1.1 and
+complete generation, editing and low-memory recovery. An independently compiled
+fallback rejects 13.1.1 and accepts 13.2.1 as intended. GPU selection and the
+launcher's existing custom-executable setting remain deployment options; there
+are no FP8 tuning environment variables or separate FP8 model-path flags.
+
+Cleanup removes the obsolete launcher FP8 field, duplicate pipeline path state,
+the redundant packed-QKV argument, an unused quantization argument, duplicate
+GEMM output strides and stale localization entries. New native files follow the
+surrounding formatting. CUDA kernel bodies and the CUTLASS configuration are
+token-equivalent to the preceding optimization, excluding the unused argument.
+
+All eight 2048² FP8 generation/edit outputs match the preceding optimized build
+byte-for-byte. Eleven CTests pass without skips; launcher tests pass 19 checks
+with one optional browser test skipped, and the packaged-asset check passes.
+Workspace state tests, JS syntax, Python/JSON parsing and `git diff --check` pass.
+Compute Sanitizer reports zero errors for the FP8 fixtures and 36 GEMM shape
+cases. The SM80/SM89 fallback translation units compile, and the SM89 PTX fixtures
+pass on SM120 with cuBLAS 13.2.1; older GPU hardware was not exercised.
+
+Five-stage cancellation/repeatability, two-reference editing after budget
+exhaustion and cancellation, and single-GPU low-memory generation all pass in
+the default library environment. The 3 GiB-per-GPU/2 GiB-host HTTP test samples
+3127 MiB GPU and 1573.45 MiB RSS, ending ready. Native dependencies contain no
+Torch, C10 or Python library. The preceding 800 same-input FP8 comparisons and
+SGLang performance measurements are retained as prior evidence, not rerun here.
+
+The cleanup patch, environment audit, source/binary hashes and commit-readiness
+report are in `fp8-cleanup-20261112` under the same pro5000 experiment directory.

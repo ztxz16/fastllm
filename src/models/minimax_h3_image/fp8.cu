@@ -1,17 +1,20 @@
-#include "models/minimax_h3_image/fp8.h"
 #include "json11.hpp"
+#include "models/minimax_h3_image/fp8.h"
 #include <cuda_runtime.h>
 #if CUDART_VERSION >= 11080
-#include <cuda_bf16.h>
-#include <cuda_fp8.h>
-#include <cublasLt.h>
 #include <algorithm>
 #include <cmath>
+#include <cublasLt.h>
+#include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <fstream>
 #include <map>
 #include <stdexcept>
-#include <vector>
 #include <tuple>
+#include <vector>
+#ifdef FASTLLM_IMAGE_FP8_SM120
+#include "fp8_scaled.h"
+#endif
 namespace fastllm::minimax_h3_image {
 using minimax_h3::DType;
 using minimax_h3::Tensor;
@@ -27,11 +30,19 @@ void checked(cublasStatus_t x, int line) {
                                  std::to_string(int(x)));
 }
 #define ck(call) checked((call), __LINE__)
+bool usesScaledSm120(const cudaDeviceProp &properties) {
+#ifdef FASTLLM_IMAGE_FP8_SM120
+    return properties.major == 12 && properties.minor == 0;
+#else
+    (void)properties;
+    return false;
+#endif
+}
 void require(bool x, const std::string &message) {
     if (!x)
         throw std::runtime_error(message);
 }
-__global__ void quantize(const B *x, uint8_t *q, float *scales, int rows, int cols, int padded) {
+__global__ void quantize(const B *x, uint8_t *q, float *scales, int rows, int cols) {
     int row = blockIdx.x;
     float largest = 0;
     for (int c = threadIdx.x; c < cols; c += blockDim.x)
@@ -54,6 +65,56 @@ __global__ void quantize(const B *x, uint8_t *q, float *scales, int rows, int co
     for (int c = threadIdx.x; c < cols; c += blockDim.x) {
         float v = row < rows ? float(x[size_t(row) * cols + c]) / scale : 0;
         q[size_t(row) * cols + c] = __nv_cvt_float_to_fp8(v, __NV_SATFINITE, __NV_E4M3);
+    }
+}
+// Keep each row's input in registers across the reduction. Aligned vector
+// loads and paired FP8 conversions avoid the scalar kernel's second read.
+template <int Cols> __global__ void quantizeVector(const B *x, uint8_t *q, float *scales, int rows) {
+    constexpr int chunks = (Cols + 2047) / 2048;
+    const int row = blockIdx.x;
+    uint4 values[chunks];
+    float largest = 0;
+#pragma unroll
+    for (int c = 0; c < chunks; ++c) {
+        const int column = c * 2048 + threadIdx.x * 8;
+        values[c] = row < rows && column < Cols
+                        ? *reinterpret_cast<const uint4 *>(x + size_t(row) * Cols + column)
+                        : make_uint4(0, 0, 0, 0);
+        const auto *v = reinterpret_cast<const B *>(&values[c]);
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+            largest = fmaxf(largest, fabsf(float(v[j])));
+    }
+    for (int mask = 16; mask; mask /= 2)
+        largest = fmaxf(largest, __shfl_xor_sync(0xffffffff, largest, mask));
+    __shared__ float maxima[8];
+    if (threadIdx.x % 32 == 0)
+        maxima[threadIdx.x / 32] = largest;
+    __syncthreads();
+    largest = threadIdx.x < 8 ? maxima[threadIdx.x] : 0;
+    for (int mask = 16; mask; mask /= 2)
+        largest = fmaxf(largest, __shfl_xor_sync(0xffffffff, largest, mask));
+    if (threadIdx.x == 0)
+        maxima[0] = fmaxf(largest / 448.f, 1e-12f);
+    __syncthreads();
+    const float scale = maxima[0], inverse = 1.f / scale;
+    if (threadIdx.x == 0)
+        scales[row] = scale;
+#pragma unroll
+    for (int c = 0; c < chunks; ++c) {
+        const int column = c * 2048 + threadIdx.x * 8;
+        if (column < Cols) {
+            const auto *v = reinterpret_cast<const B *>(&values[c]);
+            uint32_t packed[2]{};
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                auto pair = __nv_cvt_float2_to_fp8x2(
+                    make_float2(float(v[j * 2]) * inverse, float(v[j * 2 + 1]) * inverse), __NV_SATFINITE,
+                    __NV_E4M3);
+                packed[j / 2] |= uint32_t(pair) << ((j % 2) * 16);
+            }
+            *reinterpret_cast<uint2 *>(q + size_t(row) * Cols + column) = make_uint2(packed[0], packed[1]);
+        }
     }
 }
 __global__ void finish(const B *raw, const float *xs, const float *ws, B *out, size_t count, int cols) {
@@ -100,6 +161,8 @@ struct Fp8Weights::Impl {
     json11::Json quantMetadata;
     cublasLtHandle_t handle = nullptr;
     Tensor workspace, one;
+    int device = -1, multiprocessors = 0;
+    bool scaledSm120 = false;
     std::map<std::string, Weight> weights;
     std::map<std::string, std::unique_ptr<Plan>> plans;
     explicit Impl(const std::string &path) : file(path, std::ios::binary) {
@@ -172,7 +235,7 @@ struct Fp8Weights::Impl {
             pos += n;
         }
     }
-    Weight &get(const std::string &name, bool packed) {
+    Weight &get(const std::string &name) {
         auto found = weights.find(name);
         if (found != weights.end())
             return found->second;
@@ -218,7 +281,7 @@ struct Fp8Weights::Impl {
         }
         require(w.cols % 16 == 0 && w.rows % 16 == 0, "unaligned FP8 matrix");
         if (qkv)
-            require(packed && w.rows == 21504 && w.cols == 5376, "FP8 QKV layout");
+            require(w.rows == 21504 && w.cols == 5376, "FP8 QKV layout");
         w.bytes = Tensor(w.rows, w.cols / 2);
         size_t offset = 0;
         for (auto &d : matrices) {
@@ -252,25 +315,51 @@ struct Fp8Weights::Impl {
         ck(cudaStreamSynchronize(cudaStreamPerThread));
         return weights.emplace(name, std::move(w)).first->second;
     }
-    Tensor run(const Tensor &x, const std::string &name, bool packed, Tensor *destination) {
-        if (!handle) {
-            ck(cublasLtCreate(&handle));
+    Tensor run(const Tensor &x, const std::string &name, Tensor *destination) {
+        if (device < 0) {
+            ck(cudaGetDevice(&device));
+            cudaDeviceProp properties{};
+            ck(cudaGetDeviceProperties(&properties, device));
+            multiprocessors = properties.multiProcessorCount;
+            scaledSm120 = usesScaledSm120(properties);
+        }
+        if (!workspace.data)
             workspace = Tensor(1, (32 << 20) / 2);
+        if (!scaledSm120 && !handle) {
+            ck(cublasLtCreate(&handle));
             one = Tensor(1, 1, true);
             float value = 1;
             ck(cudaMemcpyAsync(one.data, &value, 4, cudaMemcpyHostToDevice, cudaStreamPerThread));
             ck(cudaStreamSynchronize(cudaStreamPerThread));
         }
-        auto &w = get(name, packed);
+        auto &w = get(name);
         require(x.dtype == DType::BF16 && x.cols == w.cols, "FP8 input dtype/shape");
         int padded = (x.rows + 15) / 16 * 16;
-        Tensor q(padded, x.cols / 2), scale(1, padded, true), raw(padded, w.rows);
+        Tensor q(padded, x.cols / 2), scale(1, padded, true);
         Tensor out = destination ? *destination : Tensor(x.rows, w.rows);
         require(out.rows == x.rows && out.cols == w.rows && out.dtype == DType::BF16, "FP8 output shape");
-        quantize<<<padded, 256, 0, cudaStreamPerThread>>>(
-            reinterpret_cast<B *>(x.data), reinterpret_cast<uint8_t *>(q.data),
-            reinterpret_cast<float *>(scale.data), x.rows, x.cols, padded);
+        auto *input = reinterpret_cast<const B *>(x.data);
+        auto *quantized = reinterpret_cast<uint8_t *>(q.data);
+        auto *scales = reinterpret_cast<float *>(scale.data);
+        if (x.cols == 5376)
+            quantizeVector<5376><<<padded, 256, 0, cudaStreamPerThread>>>(input, quantized, scales, x.rows);
+        else if (x.cols == 7168)
+            quantizeVector<7168><<<padded, 256, 0, cudaStreamPerThread>>>(input, quantized, scales, x.rows);
+        else if (x.cols == 14336)
+            quantizeVector<14336><<<padded, 256, 0, cudaStreamPerThread>>>(input, quantized, scales, x.rows);
+        else
+            quantize<<<padded, 256, 0, cudaStreamPerThread>>>(input, quantized, scales, x.rows, x.cols);
         ck(cudaGetLastError());
+#ifdef FASTLLM_IMAGE_FP8_SM120
+        if (scaledSm120) {
+            detail::fp8ScaledSm120(q.data, w.bytes.data, scales,
+                                   reinterpret_cast<const float *>(w.scales.data), out.data, x.rows, w.rows,
+                                   x.cols, device, multiprocessors, workspace.data, workspace.bytes(),
+                                   cudaStreamPerThread);
+            return out;
+        }
+#endif
+        Tensor raw(padded, w.rows);
         auto key = std::to_string(padded) + ":" + std::to_string(w.rows) + ":" + std::to_string(w.cols);
         auto &plan = plans[key];
         if (!plan) {
@@ -317,9 +406,12 @@ void Fp8Weights::validateDevice(int device, bool multipleDevices) {
     ck(cudaGetDeviceProperties(&properties, device));
     require(properties.major * 10 + properties.minor >= 89,
             "image FP8 requires an SM89 or newer CUDA device");
-    // CUDA 13.0's cuBLAS can fail FP8 launches across Blackwell devices (CUB-9487).
-    require(!multipleDevices || properties.major < 12 || cublasLtGetVersion() >= 130201,
-            "multi-GPU Blackwell FP8 requires cuBLAS 13.2.1 or newer; update the cuBLAS runtime libraries");
+    // Older cuBLAS can fail FP8 launches across Blackwell devices (CUB-9487).
+    // The fused CUTLASS path does not issue cuBLAS FP8 calls.
+    require(!multipleDevices || properties.major < 12 || usesScaledSm120(properties) ||
+                cublasLtGetVersion() >= 130201,
+            "multi-GPU Blackwell cuBLAS FP8 requires cuBLAS 13.2.1 or newer; update the "
+            "cuBLAS runtime libraries");
 }
 void Fp8Weights::validateModel() const {
     for (int layer = 0; layer < 50; ++layer) {
@@ -369,7 +461,7 @@ void Fp8Weights::validateModel() const {
     }
 }
 Tensor Fp8Weights::linear(const Tensor &x, const std::string &name, Tensor *output) {
-    return impl_->run(x, name, true, output);
+    return impl_->run(x, name, output);
 }
 void Fp8Weights::erasePrefix(const std::string &prefix) {
     for (auto i = impl_->weights.begin(); i != impl_->weights.end();)
@@ -400,8 +492,7 @@ Fp8Weights::Fp8Weights(const std::string &) { unavailable(); }
 Fp8Weights::~Fp8Weights() = default;
 void Fp8Weights::validateDevice(int, bool) { unavailable(); }
 void Fp8Weights::validateModel() const { unavailable(); }
-minimax_h3::Tensor Fp8Weights::linear(const minimax_h3::Tensor &, const std::string &,
-                                      minimax_h3::Tensor *) {
+minimax_h3::Tensor Fp8Weights::linear(const minimax_h3::Tensor &, const std::string &, minimax_h3::Tensor *) {
     unavailable();
     return {};
 }

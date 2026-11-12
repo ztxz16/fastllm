@@ -32,13 +32,21 @@ CUDA_VISIBLE_DEVICES=4,5 build/src/models/minimax_h3/minimax_h3_image_server \
   --devices 0,1 --port 8009
 ```
 
-FP8 needs CUDA 11.8+ and SM89+. Dual Blackwell requires cuBLAS 13.2.1+ to avoid
-CUB-9487; the loader checks the loaded library version. Multi-GPU FP8 uses SP
+FP8 needs CUDA 11.8+ and SM89+. The fused SM120 CUTLASS backend uses the normal
+CUDA library environment. Only the cuBLAS FP8 fallback on multiple Blackwell GPUs
+requires cuBLAS 13.2.1+ to avoid CUB-9487; the loader checks that path's library version. Multi-GPU FP8 uses SP
 (`auto` selects it); explicit TP is unsupported. Existing GPU/host budgets apply,
 including layer streaming. FP8 file reads use bounded staging and no persistent CPU
 weight cache. `/health` reports `dit_precision`; the studio displays it. Text-to-image,
 single-reference edits and multi-reference requests use the same API in either precision.
-Inference remains C++/CUDA/cuBLAS/NCCL with no Torch dependency.
+SM120 builds with CUDA 12.8+ and the bundled CUTLASS use an FP32-accumulating
+FP8 GEMM whose epilogue applies both activation and weight scales directly to
+BF16 output. Shape-based tile selection and vectorized activation quantization
+are automatic; no additional model or precision flags are needed. Other GPU
+architectures retain the cuBLASLt path. The fused epilogue removes an intermediate
+BF16 rounding boundary, so its outputs need not be pixel-identical to the previous
+FP8 implementation; operator validation uses relative L2 error.
+Inference remains C++/CUDA/CUTLASS/cuBLAS/NCCL with no Torch dependency.
 
 ## Build and run
 

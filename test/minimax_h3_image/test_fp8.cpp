@@ -1,8 +1,9 @@
-#include "models/minimax_h3_image/fp8.h"
 #include "json11.hpp"
-#include <cuda_runtime.h>
+#include "models/minimax_h3_image/fp8.h"
+#include <algorithm>
 #include <cmath>
-#include <cstring>
+#include <cstdint>
+#include <cuda_runtime.h>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -62,7 +63,8 @@ void fixture(const fs::path &path, bool unsloth, float multiplier, bool badScale
     f << header;
     f.write(payload.data(), payload.size());
 }
-// Full H3 QKV dimensions exercise layout metadata, independently of model weights.
+// Full H3 QKV dimensions exercise layout metadata, independently of model
+// weights.
 void checkQkvLayout(const fs::path &path, Runtime &rt, bool comfy) {
     constexpr int rows = 21504, cols = 5376;
     std::vector<uint8_t> data(size_t(rows) * cols);
@@ -103,6 +105,86 @@ void checkQkvLayout(const fs::path &path, Runtime &rt, bool comfy) {
         require(out[row] == x[source % cols] * scale);
     }
 }
+float roundE4m3(float x) {
+    if (x == 0)
+        return 0;
+    float a = std::min(std::abs(x), 448.f);
+    float step = std::ldexp(1.f, std::max(-9, std::ilogb(a) - 3));
+    return std::copysign(std::nearbyint(a / step) * step, x);
+}
+// Exercise the actual vectorized input widths against an independent CPU
+// E4M3 reference, including partial tiles, zero/tiny rows and nonuniform
+// scales.
+void checkProjection(const fs::path &path, Runtime &rt, int cols) {
+    constexpr int outputs = 32;
+    std::vector<uint8_t> w(outputs * cols);
+    std::vector<float> scale(outputs), decoded(outputs * cols);
+    for (int n = 0; n < outputs; ++n) {
+        scale[n] = .0031f * (n % 5 + 1);
+        for (int k = 0; k < cols; ++k) {
+            unsigned h = unsigned(n * cols + k) * 1664525u + 1013904223u;
+            h ^= h >> 13;
+            int exponent = (h >> 10) % 3;
+            w[n * cols + k] = uint8_t(0x30 + 8 * exponent + ((h & 1) ? 0x80 : 0));
+            decoded[n * cols + k] = std::ldexp((h & 1) ? -1.f : 1.f, exponent - 1);
+        }
+    }
+    const std::string key = "transformer_blocks.0.ff.net.2";
+    json11::Json::object header{
+        {"transformer_blocks.0.attn.to_q._weight_qdata", json11::Json::object{}},
+        {key + "._weight_qdata",
+         json11::Json::object{{"dtype", "F8_E4M3"},
+                              {"shape", json11::Json::array{outputs, cols}},
+                              {"data_offsets", json11::Json::array{0, double(w.size())}}}},
+        {key + "._weight_scale",
+         json11::Json::object{
+             {"dtype", "F32"},
+             {"shape", json11::Json::array{outputs}},
+             {"data_offsets", json11::Json::array{double(w.size()), double(w.size() + scale.size() * 4)}}}}};
+    {
+        std::string text = json11::Json(header).dump();
+        uint64_t size = text.size();
+        std::ofstream file(path, std::ios::binary);
+        file.write(reinterpret_cast<char *>(&size), 8);
+        file << text;
+        file.write(reinterpret_cast<char *>(w.data()), w.size());
+        file.write(reinterpret_cast<char *>(scale.data()), scale.size() * 4);
+    }
+    Fp8Weights weights(path.string());
+    for (int rows : {1, 29, 129}) {
+        std::vector<float> x(rows * cols);
+        for (int r = 0; r < rows; ++r)
+            for (int k = 0; k < cols; ++k)
+                x[r * cols + k] = r % 7 == 3 ? 0.f
+                                             : std::sin(float(r * 37 + k) * .137f) *
+                                                   (r % 7 == 2 ? 1e-9f : float(r % 5 + 1));
+        auto input = rt.upload(x.data(), rows, cols);
+        x = rt.download(input);
+        auto actual = rt.download(weights.linear(input, "blocks.0.mlp.fc2"));
+        double error = 0, norm = 0;
+        std::vector<float> quantized(cols);
+        for (int r = 0; r < rows; ++r) {
+            float largest = 0;
+            for (int k = 0; k < cols; ++k)
+                largest = std::max(largest, std::abs(x[r * cols + k]));
+            float xs = std::max(largest / 448.f, 1e-12f);
+            for (int k = 0; k < cols; ++k)
+                quantized[k] = roundE4m3(x[r * cols + k] / xs);
+            for (int n = 0; n < outputs; ++n) {
+                double sum = 0;
+                for (int k = 0; k < cols; ++k)
+                    sum += double(quantized[k]) * decoded[n * cols + k];
+                double expected = sum * xs * scale[n], value = actual[r * outputs + n];
+                require(std::isfinite(value));
+                error += (value - expected) * (value - expected);
+                norm += expected * expected;
+            }
+        }
+        double l2 = std::sqrt(error / std::max(norm, 1e-30));
+        std::cout << "FP8 CPU oracle " << rows << 'x' << cols << " relative_l2=" << l2 << '\n';
+        require(l2 < .01);
+    }
+}
 int main() {
     int count = 0;
     if (cudaGetDeviceCount(&count) != cudaSuccess || !count)
@@ -135,8 +217,7 @@ int main() {
                         for (int which = 0; which < 2; ++which) {
                             Tensor destination(rows, 32);
                             auto &w = which ? wb : wa;
-                            auto output =
-                                w.linear(input, std::string("blocks.0.mlp.") + name, &destination);
+                            auto output = w.linear(input, std::string("blocks.0.mlp.") + name, &destination);
                             require(output.data == destination.data);
                             auto values = rt.download(output);
                             for (int r = 0; r < rows; ++r)
@@ -161,6 +242,8 @@ int main() {
         }
         for (bool comfy : {false, true})
             checkQkvLayout(root / "qkv.safetensors", rt, comfy);
+        for (int cols : {5376, 7168, 14336})
+            checkProjection(root / "projection.safetensors", rt, cols);
         fixture(root / "bad.safetensors", false, 1, true);
         Fp8Weights bad((root / "bad.safetensors").string());
         std::vector<float> x(32, 1);
@@ -169,7 +252,8 @@ int main() {
         std::ofstream(root / "truncated.safetensors") << "bad";
         rejects([&] { Fp8Weights invalid((root / "truncated.safetensors").string()); });
         fs::remove_all(root);
-        std::cout << "FP8 scaling, padding, FC1 order, instance isolation and release passed\n";
+        std::cout << "FP8 scaling, padding, FC1 order, instance isolation and "
+                     "release passed\n";
     } catch (const std::exception &e) {
         fs::remove_all(root);
         std::cerr << e.what() << '\n';

@@ -21,6 +21,25 @@ target_compile_options(fastllm_minimax_h3 PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-ffp-contract=off>)
 set_target_properties(fastllm_minimax_h3 PROPERTIES CUDA_STANDARD 17 CXX_STANDARD 17
     CUDA_ARCHITECTURES "${FASTLLM_CUDA_ARCHITECTURES}" LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+# Keep SM120-only CUTLASS instantiations out of legacy architecture builds.
+# The ordinary FP8 translation unit retains the cuBLAS fallback.
+if(FASTLLM_CUTLASS_FP8_SM120_ENABLED AND NOT CUDA_NO_TENSOR_CORE AND
+   CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "12.8" AND
+   EXISTS "${FASTLLM_CUTLASS_DIR}/include/cutlass/cutlass.h")
+    add_library(fastllm_image_fp8_sm120 OBJECT ../minimax_h3_image/fp8_scaled.cu)
+    if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "13.0")
+        set(image_fp8_arch "120f")
+    else()
+        set(image_fp8_arch "120a")
+    endif()
+    set_target_properties(fastllm_image_fp8_sm120 PROPERTIES
+        CUDA_STANDARD 17 CUDA_ARCHITECTURES "${image_fp8_arch}" POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(fastllm_image_fp8_sm120 PRIVATE
+        "${FASTLLM_CUTLASS_DIR}/include" "${FASTLLM_CUTLASS_DIR}/tools/util/include")
+    target_compile_options(fastllm_image_fp8_sm120 PRIVATE --expt-relaxed-constexpr --fmad=false)
+    target_compile_definitions(fastllm_minimax_h3 PRIVATE FASTLLM_IMAGE_FP8_SM120)
+    target_sources(fastllm_minimax_h3 PRIVATE $<TARGET_OBJECTS:fastllm_image_fp8_sm120>)
+endif()
 add_executable(minimax_h3_generate ${PROJECT_SOURCE_DIR}/tools/minimax_h3/generate.cpp)
 target_link_libraries(minimax_h3_generate PRIVATE fastllm_minimax_h3)
 set_target_properties(minimax_h3_generate PROPERTIES CXX_STANDARD 17 BUILD_RPATH_USE_ORIGIN TRUE)
