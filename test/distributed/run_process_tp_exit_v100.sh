@@ -2,6 +2,12 @@
 # 双 V100 / CUDA 12.6 服务器验收：本脚本会编译，禁止在未获授权的本地运行。
 set -euo pipefail
 
+# 自定义规约依赖所选 GPU 对的互联能力，不能仅凭 V100 型号默认开启。
+TP_EXIT_CUSTOM_ALLREDUCE="${TP_EXIT_CUSTOM_ALLREDUCE:-0}"
+case "$TP_EXIT_CUSTOM_ALLREDUCE" in
+    0|1) ;;
+    *) echo "TP_EXIT_CUSTOM_ALLREDUCE 只接受 0 或 1" >&2; exit 2 ;;
+esac
 TP_EXIT_MODEL="$(cd -- "${1:-/home/models/Qwen3-1.7B}" && pwd -P)"
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 [[ -f "$TP_EXIT_MODEL/config.json" ]] || { echo "缺少模型 config.json：$TP_EXIT_MODEL" >&2; exit 1; }
@@ -10,10 +16,12 @@ export CUDA_HOME=/usr/local/cuda-12.6
 export CUDACXX="$CUDA_HOME/bin/nvcc"
 export PATH="$CUDA_HOME/bin:$PATH"
 export LD_LIBRARY_PATH="$CUDA_HOME/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-export CUDA_VISIBLE_DEVICES=0,1
+# 保留调用者选定的物理卡或 UUID；下面的 --devices 始终使用可见卡的逻辑编号。
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES-0,1}"
 export USE_TORCH=0
 hash -r
 
+echo "退出监控验收：CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES；TP_EXIT_CUSTOM_ALLREDUCE=$TP_EXIT_CUSTOM_ALLREDUCE"
 "$CUDACXX" --version
 nvidia-smi
 git log -1 --oneline
@@ -23,22 +31,32 @@ cmake --build "$TP_EXIT_BUILD" --target fastllm_process_tp_package fastllm_tp_ch
 
 TP_EXIT_COMMON=(--worker "$TP_EXIT_BUILD/fastllm_tp_worker" --devices 0,1
                 --build-cache "$TP_EXIT_BUILD/CMakeCache.txt")
-# 两轮都覆盖 11 个控制面退出用例；GPU 部分分别走 NCCL 和生产自定义规约。
+# 默认走 NCCL，覆盖 11 个控制面退出用例及真实 GPU 通信/生命周期检查。
 python3 test/distributed/run_process_tp.py "${TP_EXIT_COMMON[@]}" --cuda \
-    --check "$TP_EXIT_BUILD/fastllm_tp_check"
-python3 test/distributed/run_process_tp.py "${TP_EXIT_COMMON[@]}" --cuda --custom-allreduce \
     --check "$TP_EXIT_BUILD/fastllm_tp_check"
 
 # 合法输出、非法输入错误文本及生命周期回归。
 python3 test/distributed/run_qwen3_decode.py "${TP_EXIT_COMMON[@]}" --check "$TP_EXIT_BUILD/fastllm_tp_decode_check"
 python3 test/distributed/run_qwen3_decode.py "${TP_EXIT_COMMON[@]}" --check "$TP_EXIT_BUILD/fastllm_tp_decode_check" \
-    --cuda-graph --custom-allreduce
+    --cuda-graph
 
 # 真实模型从正式入口验证两种执行配置，检查输出及服务/进程清理。
 TP_EXIT_ENTRY=(--generate "$TP_EXIT_BUILD/fastllm_tp_generate" --model "$TP_EXIT_MODEL"
                --package-root "$TP_EXIT_BUILD/process-tp-python")
 python3 test/distributed/run_qwen3_entrypoint.py "${TP_EXIT_COMMON[@]}" "${TP_EXIT_ENTRY[@]}"
 python3 test/distributed/run_qwen3_entrypoint.py "${TP_EXIT_COMMON[@]}" "${TP_EXIT_ENTRY[@]}" \
-    --cuda-graph --custom-allreduce --prefix-cache
+    --cuda-graph --prefix-cache
 
-echo "退出监控验收完成；六组报告路径见各自 PASS 输出，包含 Markdown、CSV、JSON 和 XLSX。"
+if [[ "$TP_EXIT_CUSTOM_ALLREDUCE" == 1 ]]; then
+    # 显式开启后仍严格验证能力与实际通信路径；失败直接退出，不降级为 NCCL。
+    python3 test/distributed/run_process_tp.py "${TP_EXIT_COMMON[@]}" --cuda --custom-allreduce \
+        --check "$TP_EXIT_BUILD/fastllm_tp_check"
+    python3 test/distributed/run_qwen3_decode.py "${TP_EXIT_COMMON[@]}" --check "$TP_EXIT_BUILD/fastllm_tp_decode_check" \
+        --cuda-graph --custom-allreduce
+    python3 test/distributed/run_qwen3_entrypoint.py "${TP_EXIT_COMMON[@]}" "${TP_EXIT_ENTRY[@]}" \
+        --cuda-graph --custom-allreduce --prefix-cache
+    echo "退出监控验收完成：NCCL 五组、自定义 AllReduce 三组。"
+else
+    echo "退出监控验收完成：NCCL 五组；自定义 AllReduce 未启用、未验收。"
+fi
+echo "报告路径见各自 PASS 输出，包含 Markdown、CSV、JSON 和 XLSX。"
