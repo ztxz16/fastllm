@@ -141,7 +141,7 @@ def main():
         if args.execution_tests:
             modules += ['test_process_dp', 'test_qwen3_session', 'test_qwen3_http']
         if args.benchmark_tests:
-            modules += ['test_benchmark_qwen3_dp']
+            modules += ['test_benchmark_qwen3_dp', 'test_diagnose_qwen3_prefix']
         suite = unittest.defaultTestLoader.loadTestsFromNames(modules)
         metadata['expected_case_count'] = suite.countTestCases() + int(args.real_cuda)
         save_report(output, rows, metadata)
