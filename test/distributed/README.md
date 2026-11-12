@@ -1143,7 +1143,9 @@ CLI case 在同一验收进程调用正式 `cli.main`，保留等价终端命令
 默认比较 DP1×TP1、DP2×TP1、DP4×TP1、DP1×TP2、DP2×TP2；每种分别测并发 1 和 4。
 每轮固定 8 个请求，每请求输出 32 token，关闭 EOS 提前结束，使用同一份实际 Prompt Token ID、
 贪心采样参数与 seed=0；Prompt 仍受正式后端最多 128 token 限制。
-每个 case 预热 1 轮，正式执行 5 次独立工作轮，模型权重始终驻留。默认共 20 个 case。
+每个 case 预热 1 轮，正式执行 5 次独立工作轮，模型权重始终驻留。optimized 在预热前额外通过公开接口
+清空前缀，并串行执行 DP 个冷请求，确认所有副本都已建立相同前缀；这一步不计入预热轮数或正式计时。
+默认共 20 个 case。
 
 两个 profile 分别报告：
 
@@ -1175,7 +1177,12 @@ CLI case 在同一验收进程调用正式 `cli.main`，保留等价终端命令
 - `speedup_vs_dp1` 仅为同 profile、同 TP 大小、同并发的 DP1 Median batch 时间除以当前时间。
   增加 GPU 的扩展收益与每卡效率分别通过总吞吐和 `output_tokens_per_s_per_gpu` 展示。
   不跨 profile、不同缓存状态或不同 TP 计算 DP 加速比。
-- 每轮停止计时后检查实际执行证据，以及同 profile/同 TP 的 DP1 Token ID 精确一致性。
+- 每轮停止计时后检查实际执行证据，以及同 profile/同 TP/同缓存状态的 DP1 Token ID 精确一致性。
+  optimized 的冷请求对照 DP1 冷基准，预热及正式请求对照 DP1 热基准；只有 DP1 能建立基准，多副本
+  不能用自己的首个输出作为基准。建立前缀的串行请求和预热轮都必须覆盖全部副本。
+  每个请求必须实际处于指定的冷/热状态，部分前缀复用不允许冒充完整的热缓存。
+  JSON 保存两种 Token 基准和前缀建立记录，MD/CSV/XLSX/JSON 记录 `cold_warm_token_mismatches` 与
+  `cold_warm_first_divergence_token_1based`；这些字段描述冷热差异，不判断两种路径的数值等价性。
   最大/平均绝对误差和失败元素数作用于 Token ID，不能当作独立数学精度结论。
   任一输出错误、冷热状态不一致、路径回退、请求失败或中断都返回非零，保留已完成样本与部分报告。
 

@@ -115,7 +115,7 @@ class BenchmarkDPTests(unittest.TestCase):
         original = bench.check_wave
 
         def corrupt(wave, *args, **kwargs):
-            if kwargs.get('hot'):
+            if kwargs.get('cache_state') == 'warm':
                 wave = copy.deepcopy(wave)
                 for state in wave['records'][0]['report']['graph']:
                     state['prefix_cache']['last_reused_tokens'] = 0
@@ -125,6 +125,99 @@ class BenchmarkDPTests(unittest.TestCase):
             status, _, report = self.invoke('--configurations', '1x1', '--profiles', 'optimized', '--concurrency', '1')
         self.assertEqual(status, 1)
         self.assertIn('warm prefix', report['cases'][0]['reason'])
+
+    def test_distinct_cold_warm_references_cover_all_replicas_and_concurrency_orders(self):
+        original = bench.run_wave
+
+        def different_by_cache(*args, **kwargs):
+            wave = original(*args, **kwargs)
+            # 合成冷热分歧，只验证测速器的基线选择；不作为模型数值正确性结果。
+            for record in wave['records']:
+                if record['report']['graph'][0]['prefix_cache']['last_reused_tokens']:
+                    record['report']['token_ids'] = [2, 2]
+            return wave
+
+        with mock.patch.object(bench, 'run_wave', side_effect=different_by_cache):
+            status, output, report = self.invoke('--profiles', 'optimized', '--concurrency', '4', '1')
+        self.assertEqual((status, len(report['cases'])), (0, 10), report)
+        for row in report['cases']:
+            self.assertEqual(row['reference_token_ids_by_cache_state'], {'cold': [1, 1], 'warm': [2, 2]})
+            self.assertEqual((row['reference_cache_state'], row['reference_token_ids']), ('warm', [2, 2]))
+            self.assertEqual((row['cold_warm_token_mismatches'], row['cold_warm_first_divergence_token_1based']), (2, 1))
+            self.assertEqual((len(row['samples']), row['failed_elements']), (5, 0))
+            prime = json.loads((output / 'raw' / (row['case'] + '_prime.json')).read_text())
+            self.assertEqual(len(prime['records']), row['dp'])
+            self.assertEqual(row['priming']['dp_ranks'], list(range(row['dp'])))
+            self.assertTrue(all(r['report']['graph'][0]['prefix_cache']['last_reused_tokens'] == 0 for r in prime['records']))
+            warmup = json.loads((output / 'raw' / (row['case'] + '_warmup0.json')).read_text())
+            self.assertTrue(all(r['report']['graph'][0]['prefix_cache']['last_reused_tokens'] == row['prompt_tokens'] - 1
+                                for r in warmup['records']))
+
+    def test_dp_replica_cold_and_warm_corruption_fail_against_existing_dp1_reference(self):
+        original = bench.run_wave
+        for cache_state in ('cold', 'warm'):
+            # 每次调用创建独立报告目录，保证读取本轮的失败证据。
+            self.base[-1] = str(self.root / cache_state)
+
+            def corrupt(model, request, count, concurrency):
+                wave = original(model, request, count, concurrency)
+                for record in wave['records']:
+                    report = record['report']
+                    warm = bool(report['graph'][0]['prefix_cache']['last_reused_tokens'])
+                    if report.get('dp_rank') == 1 and warm == (cache_state == 'warm'):
+                        report['token_ids'][0] += 1
+                return wave
+
+            with self.subTest(cache_state=cache_state), mock.patch.object(bench, 'run_wave', side_effect=corrupt), \
+                    mock.patch.object(bench, 'capture', return_value='Python protocol fixture; no GPU'), \
+                    redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                status = bench.main(self.base + ['--configurations', '1x1', '2x1', '--profiles', 'optimized', '--concurrency', '1'])
+                output = next((self.root / cache_state).iterdir())
+                report = json.loads((output / 'summary.json').read_text())
+                failed = report['cases'][-1]
+                self.assertEqual((status, failed['case'], len(failed['samples'])), (1, 'optimized_dp2_tp1_c1', 0))
+                self.assertGreater(failed['failed_elements'], 0)
+                self.assertIn(f'/{cache_state} DP=1 baseline', failed['reason'])
+                self.assertIn("'dp_rank': 1", failed['reason'])
+                self.assertEqual(report['cases'][0]['status'], 'PASS')
+
+    def test_cold_priming_rejects_partial_prefix_reuse(self):
+        original = bench.check_wave
+
+        def corrupt(wave, *args, **kwargs):
+            if kwargs['cache_state'] == 'cold':
+                wave = copy.deepcopy(wave)
+                record = wave['records'][0]
+                for state in record['report']['graph']:
+                    state['prefix_cache'].update(last_reused_tokens=1, reused_tokens=1, hits=1,
+                                                last_computed_tokens=len(record['report']['request']['token_ids']) - 1)
+            return original(wave, *args, **kwargs)
+
+        with mock.patch.object(bench, 'check_wave', side_effect=corrupt):
+            status, _, report = self.invoke('--configurations', '1x1', '--profiles', 'optimized', '--concurrency', '1')
+        self.assertEqual(status, 1)
+        self.assertIn('cold prefix cache state mismatch', report['cases'][0]['reason'])
+
+    def test_cold_priming_must_cover_every_replica(self):
+        original = bench.run_wave
+
+        def corrupt(*args, **kwargs):
+            wave = original(*args, **kwargs)
+            for record in wave['records']:
+                if 'dp_rank' in record['report'] and not record['report']['graph'][0]['prefix_cache']['last_reused_tokens']:
+                    record['report']['dp_rank'] = 0
+            return wave
+
+        with mock.patch.object(bench, 'run_wave', side_effect=corrupt):
+            status, _, report = self.invoke('--configurations', '1x1', '2x1', '--profiles', 'optimized', '--concurrency', '1')
+        self.assertEqual(status, 1)
+        self.assertIn('cold priming did not execute every DP replica', report['cases'][-1]['reason'])
+
+    def test_dp_cannot_establish_its_own_missing_cache_state_reference(self):
+        references = {'cold': [1, 1]}
+        with self.assertRaisesRegex(RuntimeError, 'missing DP=1 warm baseline'):
+            bench.check_reference_wave({}, {}, references, 2, 1, 'optimized', 'warm')
+        self.assertEqual(references, {'cold': [1, 1]})
 
     def test_startup_failure_saves_partial_report(self):
         with mock.patch.object(bench, 'make_normal_llm_model', side_effect=RuntimeError('test startup failure')):
