@@ -13,7 +13,8 @@ add_library(fastllm_minimax_h3 SHARED
     ops.cu encode.cu conditioning.cpp transformer.cpp audio.cpp video.cpp
     text.cpp parallel.cpp pipeline.cpp pika.cpp model_source.cpp media.cpp media_input.cpp
     ../minimax_h3_image/model.cpp ../minimax_h3_image/ops.cu ../minimax_h3_image/parallel.cpp
-    ../minimax_h3_image/input.cpp ../minimax_h3_image/memory.cpp ../minimax_h3_image/fp8.cu ../minimax_h3_image/source.cpp)
+    ../minimax_h3_image/input.cpp ../minimax_h3_image/memory.cpp ../minimax_h3_image/fp8.cu ../minimax_h3_image/source.cpp
+    ../minimax_h3_image/quantized.cpp ../minimax_h3_image/int8.cu ../minimax_h3_image/nvfp4.cu)
 target_link_libraries(fastllm_minimax_h3 PUBLIC fastllm_continuous pthread)
 target_include_directories(fastllm_minimax_h3 PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
 target_compile_options(fastllm_minimax_h3 PRIVATE
@@ -26,7 +27,7 @@ set_target_properties(fastllm_minimax_h3 PROPERTIES CUDA_STANDARD 17 CXX_STANDAR
 if(FASTLLM_CUTLASS_FP8_SM120_ENABLED AND NOT CUDA_NO_TENSOR_CORE AND
    CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "12.8" AND
    EXISTS "${FASTLLM_CUTLASS_DIR}/include/cutlass/cutlass.h")
-    add_library(fastllm_image_fp8_sm120 OBJECT ../minimax_h3_image/fp8_scaled.cu)
+    add_library(fastllm_image_fp8_sm120 OBJECT ../minimax_h3_image/fp8_scaled.cu ../minimax_h3_image/nvfp4_scaled.cu)
     if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "13.0")
         set(image_fp8_arch "120f")
     else()
@@ -37,8 +38,19 @@ if(FASTLLM_CUTLASS_FP8_SM120_ENABLED AND NOT CUDA_NO_TENSOR_CORE AND
     target_include_directories(fastllm_image_fp8_sm120 PRIVATE
         "${FASTLLM_CUTLASS_DIR}/include" "${FASTLLM_CUTLASS_DIR}/tools/util/include")
     target_compile_options(fastllm_image_fp8_sm120 PRIVATE --expt-relaxed-constexpr --fmad=false)
-    target_compile_definitions(fastllm_minimax_h3 PRIVATE FASTLLM_IMAGE_FP8_SM120)
+    target_compile_definitions(fastllm_minimax_h3 PRIVATE FASTLLM_IMAGE_FP8_SM120 FASTLLM_IMAGE_NVFP4_SM120)
     target_sources(fastllm_minimax_h3 PRIVATE $<TARGET_OBJECTS:fastllm_image_fp8_sm120>)
+endif()
+# The fused INT8 epilogue uses mma.sync and is available from Ampere onward.
+if(NOT CUDA_NO_TENSOR_CORE AND CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "11.8" AND
+   EXISTS "${FASTLLM_CUTLASS_DIR}/include/cutlass/epilogue/threadblock/fusion/visitors.hpp")
+    add_library(fastllm_image_int8_scaled OBJECT ../minimax_h3_image/int8_scaled.cu)
+    set_target_properties(fastllm_image_int8_scaled PROPERTIES
+        CUDA_STANDARD 17 CUDA_ARCHITECTURES "80" POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(fastllm_image_int8_scaled PRIVATE "${FASTLLM_CUTLASS_DIR}/include")
+    target_compile_options(fastllm_image_int8_scaled PRIVATE --expt-relaxed-constexpr --fmad=false)
+    target_compile_definitions(fastllm_minimax_h3 PRIVATE FASTLLM_IMAGE_INT8_SCALED)
+    target_sources(fastllm_minimax_h3 PRIVATE $<TARGET_OBJECTS:fastllm_image_int8_scaled>)
 endif()
 add_executable(minimax_h3_generate ${PROJECT_SOURCE_DIR}/tools/minimax_h3/generate.cpp)
 target_link_libraries(minimax_h3_generate PRIVATE fastllm_minimax_h3)
@@ -87,7 +99,7 @@ if(UNIT_TEST)
     endforeach()
     target_include_directories(minimax_h3_image_parallel PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
     target_link_libraries(minimax_h3_image_parallel PRIVATE cudart)
-    foreach(check fp8 source)
+    foreach(check fp8 int8 nvfp4 source)
         add_executable(minimax_h3_image_${check} ${PROJECT_SOURCE_DIR}/test/minimax_h3_image/test_${check}.cpp)
         target_include_directories(minimax_h3_image_${check} PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
         target_link_libraries(minimax_h3_image_${check} PRIVATE fastllm_minimax_h3 cudart)

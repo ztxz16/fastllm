@@ -4,26 +4,40 @@ This backend loads the original [MiniMaxAI/MiniMax-H3-Image](https://huggingface
 
 The independent model implementation is `include/models/minimax_h3_image/model.h` and `src/models/minimax_h3_image/model.cpp`. It reuses the H3 CUDA runtime and Qwen3-VL text encoder, with a separate image transformer, 2D ViT VAE and sampling pipeline. The shared H3 VAE encoder accepts the image checkpoint’s key names while preserving the video checkpoint path.
 
-## Automatic FP8 selection
+## Automatic quantization selection
 
 Use the existing `--model` argument, or the launcher's model path. A complete native
-model directory keeps BF16. Selecting an FP8 `.safetensors` file automatically enables
-native E4M3 projections; no precision or extra checkpoint flag is needed. The loader
+model directory keeps BF16. Selecting an FP8, INT8 ConvRot or NVFP4 `.safetensors` file automatically enables
+the corresponding native quantized projections; no precision or extra checkpoint flag is needed. The loader
 reads tensor dtypes and shapes, not the filename. A quantized directory with multiple
 checkpoints requires selecting the exact file.
 
 The tested checkpoint is `unsloth/MiniMax-H3-Image-FP8`'s
 `MiniMax-H3-Image-FP8.safetensors` (per-output-channel scales). Native H3 E4M3 tensors
-with scalar scales are also recognized; Comfy quantization metadata identifies its already-packed QKV layout. INT8 and FP4 checkpoints return a clear error;
-they are not silently dequantized or treated as FP8.
+with scalar scales are also recognized; Comfy quantization metadata identifies its already-packed QKV layout.
+
+INT8 supports Comfy H256 ConvRot exports and the Unsloth H3 `Int8Tensor` layout.
+The loader validates each projection's marker, scales and dimensions. Unmarked
+Unsloth exports are checked against sampled rows of every projection in the
+matching BF16 base before enabling H256; incompatible rotation/layouts are rejected.
+INT8 needs CUDA 11.8+ and SM80+ for the BF16 model stages. It uses W8A8, per-row
+dynamic activation scales, INT32 accumulation and BF16 output.
+On SM80+ with bundled CUTLASS, H256 rotation and activation quantization share one
+kernel and the GEMM epilogue applies both scales. Smaller/streamed requests keep
+bounded FFN chunks; resident INT8 requests combine chunks up to 16384 rows.
+
+NVFP4 supports Comfy `nvfp4` checkpoints with group size 16, packed E2M1 weights,
+blocked E4M3 scales and a global F32 scale, including the LSDJesus H3 export.
+It is W4A4: both weights and dynamically quantized activations use FP4, with FP32
+accumulation and BF16 output. Native NVFP4 requires CUDA 12.8+, bundled CUTLASS
+and SM120. Other packed four-bit formats are rejected.
 
 These files contain the DiT only. Keep the original complete `MiniMax-H3-Image` base
 beside the quantized repository, or provide a `base_model` directory/symlink inside it.
 The loader searches locally up to two parent directories; it rejects missing or
 ambiguous bases and does not download anything. Text encoder, VAE, AdaLN, refiners and
 PDD heads use the original base. Only the 50 main blocks' QKV/output and FC1/FC2
-projections use FP8 weights and dynamic per-token FP8 activations, with FP32 GEMM
-accumulation and BF16 output. Quantization changes pixels and exceeds the BF16
+projections use the selected quantized weights and matching dynamic activation format. Quantization changes pixels and exceeds the BF16
 operator-alignment tolerance; it is an explicitly selected model, not a BF16 fallback.
 
 ```bash
@@ -34,11 +48,11 @@ CUDA_VISIBLE_DEVICES=4,5 build/src/models/minimax_h3/minimax_h3_image_server \
 
 FP8 needs CUDA 11.8+ and SM89+. The fused SM120 CUTLASS backend uses the normal
 CUDA library environment. Only the cuBLAS FP8 fallback on multiple Blackwell GPUs
-requires cuBLAS 13.2.1+ to avoid CUB-9487; the loader checks that path's library version. Multi-GPU FP8 uses SP
+requires cuBLAS 13.2.1+ to avoid CUB-9487; the loader checks that path's library version. Multi-GPU quantized DiT uses SP
 (`auto` selects it); explicit TP is unsupported. Existing GPU/host budgets apply,
-including layer streaming. FP8 file reads use bounded staging and no persistent CPU
+including layer streaming. Quantized file reads use bounded staging and no persistent CPU
 weight cache. `/health` reports `dit_precision`; the studio displays it. Text-to-image,
-single-reference edits and multi-reference requests use the same API in either precision.
+single-reference edits and multi-reference requests use the same API in every supported precision.
 SM120 builds with CUDA 12.8+ and the bundled CUTLASS use an FP32-accumulating
 FP8 GEMM whose epilogue applies both activation and weight scales directly to
 BF16 output. Shape-based tile selection and vectorized activation quantization
@@ -145,7 +159,7 @@ minimax_h3_image_server --model /path/to/MiniMax-H3-Image \
 
 With no GPU limit (or `0`), startup checks free device memory: below 60 GiB, DiT and VAE weights stream layer by layer; otherwise the DiT stays resident across requests, including while the service is idle.
 
-On a single GPU with an FP8 DiT, spare VRAM retains immutable text/vision weights between requests, with headroom for the checkpoint and the current canvas, prompt and reference inputs. Changing that workspace budget rebuilds the device cache; the first fill is serialized before layer prefetching resumes. Uncached weights still stream. Low-memory mode keeps text weights streamed, and uses the existing host-cache budget. No extra cache option is needed.
+On a single GPU with a quantized DiT, spare VRAM retains immutable text/vision weights between requests, with headroom for the checkpoint and the current canvas, prompt and reference inputs. Changing that workspace budget rebuilds the device cache; the first fill is serialized before layer prefetching resumes. Uncached weights still stream. Low-memory mode keeps text weights streamed, and uses the existing host-cache budget. No extra cache option is needed.
 
 Cancelling or failing a request drops the prepared model state so that a later request can rebuild it safely. An explicit limit must exceed 1 GiB. It reserves a persistent CUDA pool of `limit - 1 GiB`, leaving 1 GiB for the CUDA context/library workspace. A limit below 60 GiB selects layer streaming. Reserved pages remain allocated while the service is idle, including after cancellation or failure, and are reused by later requests. Insufficient activation space produces a failed job; precision, resolution and the six-step sampler are never silently reduced. Larger canvases or many references can require a larger budget.
 

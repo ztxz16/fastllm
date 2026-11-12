@@ -1,4 +1,4 @@
-#include "json11.hpp"
+#include "quantized_checkpoint.h"
 #include "models/minimax_h3_image/fp8.h"
 #include <cuda_runtime.h>
 #if CUDART_VERSION >= 11080
@@ -7,7 +7,6 @@
 #include <cublasLt.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
-#include <fstream>
 #include <map>
 #include <stdexcept>
 #include <tuple>
@@ -153,10 +152,7 @@ struct Weight {
     int rows = 0, cols = 0;
 };
 } // namespace
-struct Fp8Weights::Impl {
-    std::ifstream file;
-    json11::Json header;
-    uint64_t base = 0, length = 0;
+struct Fp8Weights::Impl : detail::QuantizedCheckpoint {
     bool unsloth = false, nativePackedQkv = false;
     json11::Json quantMetadata;
     cublasLtHandle_t handle = nullptr;
@@ -165,20 +161,8 @@ struct Fp8Weights::Impl {
     bool scaledSm120 = false;
     std::map<std::string, Weight> weights;
     std::map<std::string, std::unique_ptr<Plan>> plans;
-    explicit Impl(const std::string &path) : file(path, std::ios::binary) {
-        require(bool(file), "cannot open FP8 checkpoint");
-        file.seekg(0, std::ios::end);
-        length = uint64_t(file.tellg());
-        file.seekg(0);
-        uint64_t n = 0;
-        file.read(reinterpret_cast<char *>(&n), 8);
-        require(n > 0 && n < (16 << 20) && n + 8 < length, "invalid FP8 header size");
-        std::string data(n, '\0'), error;
-        file.read(data.data(), n);
-        require(bool(file), "truncated FP8 header");
-        header = json11::Json::parse(data, error);
-        require(error.empty() && header.is_object(), "invalid FP8 JSON");
-        base = n + 8;
+    explicit Impl(const std::string &path) : QuantizedCheckpoint(path) {
+        std::string error;
         unsloth = header["transformer_blocks.0.attn.to_q._weight_qdata"].is_object();
         const auto metadata = header["__metadata__"]["_quantization_metadata"].string_value();
         if (!unsloth && !metadata.empty()) {
@@ -195,45 +179,6 @@ struct Fp8Weights::Impl {
         plans.clear();
         if (handle)
             cublasLtDestroy(handle);
-    }
-    json11::Json descriptor(const std::string &name, const std::string &dtype) const {
-        auto d = header[name];
-        require(d.is_object() && d["dtype"].string_value() == dtype, "invalid FP8 tensor " + name);
-        auto offsets = d["data_offsets"].array_items();
-        require(offsets.size() == 2 && offsets[0].is_number() && offsets[1].is_number() &&
-                    offsets[0].number_value() >= 0 &&
-                    std::floor(offsets[0].number_value()) == offsets[0].number_value() &&
-                    std::floor(offsets[1].number_value()) == offsets[1].number_value() &&
-                    offsets[1].number_value() >= offsets[0].number_value() &&
-                    offsets[1].number_value() <= double(length - base),
-                "invalid offsets " + name);
-        return d;
-    }
-    void read(const json11::Json &d, void *dest, size_t bytes) {
-        auto offsets = d["data_offsets"].array_items();
-        require(size_t(offsets[1].number_value() - offsets[0].number_value()) == bytes,
-                "FP8 tensor byte size mismatch");
-        file.clear();
-        file.seekg(base + uint64_t(offsets[0].number_value()));
-        file.read(static_cast<char *>(dest), bytes);
-        require(bool(file), "truncated FP8 payload");
-    }
-    void upload(const json11::Json &d, void *dest, size_t bytes) {
-        auto offsets = d["data_offsets"].array_items();
-        require(size_t(offsets[1].number_value() - offsets[0].number_value()) == bytes,
-                "FP8 matrix byte size mismatch");
-        file.clear();
-        file.seekg(base + uint64_t(offsets[0].number_value()));
-        std::vector<char> buffer(std::min(bytes, size_t(8) << 20));
-        for (size_t pos = 0; pos < bytes;) {
-            size_t n = std::min(buffer.size(), bytes - pos);
-            file.read(buffer.data(), n);
-            require(bool(file), "truncated FP8 matrix");
-            ck(cudaMemcpyAsync(static_cast<char *>(dest) + pos, buffer.data(), n, cudaMemcpyHostToDevice,
-                               cudaStreamPerThread));
-            ck(cudaStreamSynchronize(cudaStreamPerThread));
-            pos += n;
-        }
     }
     Weight &get(const std::string &name) {
         auto found = weights.find(name);
@@ -399,7 +344,8 @@ struct Fp8Weights::Impl {
         return out;
     }
 };
-Fp8Weights::Fp8Weights(const std::string &path) : impl_(std::make_unique<Impl>(path)) {}
+Fp8Weights::Fp8Weights(const std::string &path)
+    : QuantizedWeights(WeightFormat::FP8), impl_(std::make_unique<Impl>(path)) {}
 Fp8Weights::~Fp8Weights() = default;
 void Fp8Weights::validateDevice(int device, bool multipleDevices) {
     cudaDeviceProp properties{};
@@ -436,26 +382,13 @@ void Fp8Weights::validateModel() const {
                         "inconsistent Comfy FP8 layout: " + name);
             auto d = impl_->descriptor(name + (impl_->unsloth ? "._weight_qdata" : ".weight"), "F8_E4M3");
             require(d["shape"].array_items().size() == 2 && d["shape"][0].number_value() == rows &&
-                        d["shape"][1].number_value() == cols &&
-                        d["data_offsets"][1].number_value() - d["data_offsets"][0].number_value() ==
-                            double(rows) * cols,
+                        d["shape"][1].number_value() == cols,
                     "invalid H3 Image FP8 matrix: " + name);
             auto scale =
                 impl_->descriptor(name + (impl_->unsloth ? "._weight_scale" : ".weight_scale"), "F32");
             require(scale["shape"].is_array() && scale["shape"].array_items().size() <= 2,
                     "invalid FP8 scale rank: " + name);
-            size_t elements = 1;
-            for (const auto &dimension : scale["shape"].array_items()) {
-                require(dimension.is_number() && dimension.number_value() >= 1 &&
-                            dimension.number_value() <= rows &&
-                            std::floor(dimension.number_value()) == dimension.number_value() &&
-                            elements <= size_t(rows) / size_t(dimension.number_value()),
-                        "invalid FP8 scale shape: " + name);
-                elements *= size_t(dimension.number_value());
-            }
-            require(elements == size_t(impl_->unsloth ? rows : 1) &&
-                        scale["data_offsets"][1].number_value() - scale["data_offsets"][0].number_value() ==
-                            elements * 4,
+            require(impl_->payloadBytes(scale) == size_t(impl_->unsloth ? rows : 1) * sizeof(float),
                     "invalid H3 Image FP8 scales: " + name);
         }
     }
@@ -488,7 +421,7 @@ struct Fp8Weights::Impl {};
 namespace {
 void unavailable() { throw std::runtime_error("image FP8 requires a build with CUDA 11.8 or newer"); }
 } // namespace
-Fp8Weights::Fp8Weights(const std::string &) { unavailable(); }
+Fp8Weights::Fp8Weights(const std::string &) : QuantizedWeights(WeightFormat::FP8) { unavailable(); }
 Fp8Weights::~Fp8Weights() = default;
 void Fp8Weights::validateDevice(int, bool) { unavailable(); }
 void Fp8Weights::validateModel() const { unavailable(); }

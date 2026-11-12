@@ -95,17 +95,17 @@ MemoryPolicy::MemoryPolicy(Runtime &rt, double gpuGiB, double hostGiB) {
 }
 
 Transformer::Transformer(Runtime &rt, Runtime &full, const std::string &dir, nomas::ParallelContext parallel,
-                         bool sequenceParallel, const std::string &fp8Weights)
+                         bool sequenceParallel, const std::string &quantizedWeights)
     : rt_(rt), full_(full), weights_(rt, minimax_h3::componentWeights(dir + "/transformer")),
       fullWeights_(full, minimax_h3::componentWeights(dir + "/transformer")),
       heads_(full, dir + "/pdd_fused_heads.safetensors"), parallel_(parallel),
       sequenceParallel_(sequenceParallel && parallel.size() > 1) {
-    if (!fp8Weights.empty()) {
+    if (!quantizedWeights.empty()) {
         if (parallel.size() > 1 && !sequenceParallel_)
             throw std::invalid_argument(
-                "image FP8 supports multi-GPU SP, not TP; use --parallel-mode auto or sp");
-        fp8_ = std::make_unique<Fp8Weights>(fp8Weights);
-        fp8_->validateModel();
+                "quantized image DiT supports multi-GPU SP, not TP; use --parallel-mode auto or sp");
+        quantized_ = QuantizedWeights::load(quantizedWeights);
+        quantized_->validateModel();
     }
     if (sequenceParallel_ && rt_.dtype() != DType::BF16)
         throw std::invalid_argument("image sequence parallelism requires BF16");
@@ -208,7 +208,7 @@ void Transformer::prepare(Progress progress) {
         weights_.enableHostCache(size_t(48) << 30);
 }
 void Transformer::setMemoryPolicy(const MemoryPolicy &memory) {
-    if (sequenceParallel_ && memory.layerStreaming && !fp8_)
+    if (sequenceParallel_ && memory.layerStreaming && !quantized_)
         throw std::invalid_argument("image sequence parallelism requires resident GPU weights");
     unload();
     lowMemory_ = memory.layerStreaming;
@@ -222,10 +222,10 @@ void Transformer::clearText() {
 }
 Tensor Transformer::attention(const Tensor &x, const std::string &p, const Tensor *cs, const Tensor *sn) {
     const int heads = sequenceParallel_ ? 56 : 56 / parallel_.size();
-    const bool quantized = fp8_ && p.compare(0, 7, "blocks.") == 0;
+    const bool quantized = quantized_ && p.compare(0, 7, "blocks.") == 0;
     auto project = [&](const Tensor &y) {
         if (quantized)
-            return fp8_->linear(y, p + ".out_proj");
+            return quantized_->linear(y, p + ".out_proj");
         if (sequenceParallel_)
             return weights_.linear(y, p + ".out_proj");
         return parallel_.row(rt_, weights_, y, p + ".out_proj");
@@ -233,7 +233,7 @@ Tensor Transformer::attention(const Tensor &x, const std::string &p, const Tenso
     if ((!lowMemory_ || quantized) && x.dtype == DType::BF16) {
         Tensor qkv;
         if (quantized) {
-            qkv = fp8_->linear(x, p + ".qkv_proj");
+            qkv = quantized_->linear(x, p + ".qkv_proj");
         } else {
             auto &packed = packedQkv_[p];
             if (!packed.first.data) {
@@ -286,17 +286,21 @@ Tensor Transformer::attention(const Tensor &x, const std::string &p, const Tenso
     return project(rt_.selfAttention(qkv[0], qkv[1], qkv[2], heads));
 }
 Tensor Transformer::feedForward(const Tensor &x, const std::string &p) {
-    const int chunk = sequenceParallel_ ? 8192 : 4096;
+    const bool quantized = quantized_ && p.compare(0, 7, "blocks.") == 0;
+    const bool rowwiseInt8 = quantized && quantized_->format() == WeightFormat::INT8;
+    // INT8 scales are per row, so combining FFN chunks does not change the
+    // quantization. Resident requests already reserve activation headroom;
+    // streaming keeps the existing bound. Global-scale FP4 retains its chunks.
+    const int chunk = rowwiseInt8 && !lowMemory_ ? 16384 : (sequenceParallel_ ? 8192 : 4096);
     const bool sharded = !sequenceParallel_ && parallel_.size() > 1, overlap = sharded && x.rows > chunk;
     Tensor out(x.rows, 5376, sharded ? parallel_.partialType(x.dtype) : x.dtype);
     Tensor reduced = overlap ? (out.dtype == x.dtype ? out : Tensor(x.rows, 5376, x.dtype)) : Tensor{};
-    const bool quantized = fp8_ && p.compare(0, 7, "blocks.") == 0;
     for (int first = 0; first < x.rows;) {
         int n = std::min(chunk, x.rows - first);
-        if (!sequenceParallel_ && n > 512)
+        if (!sequenceParallel_ && !rowwiseInt8 && n > 512)
             n -= n % 512;
         const auto part = x.rowSlice(first, n);
-        auto y = gatedSilu(quantized ? fp8_->linear(part, p + ".fc1") : weights_.linear(part, p + ".fc1"));
+        auto y = gatedSilu(quantized ? quantized_->linear(part, p + ".fc1") : weights_.linear(part, p + ".fc1"));
         auto target = out.rowSlice(first, n);
         if (sharded) {
             parallel_.rowPartial(rt_, weights_, y, p + ".fc2", target);
@@ -305,7 +309,7 @@ Tensor Transformer::feedForward(const Tensor &x, const std::string &p) {
                 parallel_.finishRowAsync(rt_, weights_, target, p + ".fc2", result);
             }
         } else if (quantized) {
-            fp8_->linear(y, p + ".fc2", &target);
+            quantized_->linear(y, p + ".fc2", &target);
         } else {
             weights_.linear(y, p + ".fc2", false, &target);
         }
@@ -424,8 +428,8 @@ Tensor Transformer::forward(const Tensor &latent, const Tensor &text, int h, int
         emit("block." + std::to_string(i));
         if (lowMemory_) {
             weights_.erasePrefix(p + ".");
-            if (fp8_)
-                fp8_->erasePrefix(p + ".");
+            if (quantized_)
+                quantized_->erasePrefix(p + ".");
         }
     }
     const bool localProjection = sequenceRows_ != 0;
@@ -451,8 +455,8 @@ Tensor Transformer::forward(const Tensor &latent, const Tensor &text, int h, int
 }
 void Transformer::unload(bool keepPrepared) {
     clearText();
-    if (fp8_)
-        fp8_->clear();
+    if (quantized_)
+        quantized_->clear();
     packedQkv_.clear();
     weights_.clear();
     fullWeights_.clear();
@@ -875,12 +879,12 @@ Pipeline::Pipeline(const std::string &model, int device, DType vaeType, double g
       reduction_(reduction) {
     if (parallelMode != "auto" && parallelMode != "tp" && parallelMode != "sp")
         throw std::invalid_argument("image parallel mode must be auto, tp or sp");
-    if (!source_.fp8Weights.empty()) {
+    if (!source_.quantizedWeights.empty()) {
         if (devices_.size() > 1 && parallelMode == "tp")
             throw std::invalid_argument(
-                "image FP8 supports multi-GPU SP, not TP; use --parallel-mode auto or sp");
+                "quantized image DiT supports multi-GPU SP, not TP; use --parallel-mode auto or sp");
         for (int gpu : devices_.empty() ? std::vector<int>{device} : devices_)
-            Fp8Weights::validateDevice(gpu, devices_.size() > 1);
+            QuantizedWeights::validateDevice(source_.format, gpu, devices_.size() > 1);
     }
     if (!devices.empty() && (56 % devices.size() || 8 % devices.size()))
         throw std::invalid_argument("image tensor parallelism supports 1, 2, 4 or 8 devices");
@@ -894,15 +898,15 @@ Pipeline::Pipeline(const std::string &model, int device, DType vaeType, double g
             }
             rt_.activate();
         }
-        if (parallelMode == "sp" && memory_.layerStreaming && source_.fp8Weights.empty())
+        if (parallelMode == "sp" && memory_.layerStreaming && source_.quantizedWeights.empty())
             throw std::invalid_argument("image SP requires at least 60 GiB available per GPU");
         if (parallelMode == "sp" && rt_.dtype() != DType::BF16)
             throw std::invalid_argument("image SP requires BF16 transformer compute");
         sequenceParallel_ = parallelMode != "tp" &&
-                            (!memory_.layerStreaming || !source_.fp8Weights.empty()) &&
+                            (!memory_.layerStreaming || !source_.quantizedWeights.empty()) &&
                             rt_.dtype() == DType::BF16;
         parallel_ = std::make_unique<ParallelModel>(source_.directory, devices_, memory_, gpuMemoryLimit_,
-                                                    reduction_, sequenceParallel_, source_.fp8Weights);
+                                                    reduction_, sequenceParallel_, source_.quantizedWeights);
         rt_.activate();
     }
 }
@@ -941,12 +945,12 @@ Image Pipeline::generateImpl(const Options &o, Progress progress, Trace trace,
     const int height = canvas.second, width = canvas.first;
     if (devices_.size() > 1 && !parallel_) {
         parallel_ = std::make_unique<ParallelModel>(source_.directory, devices_, memory_, gpuMemoryLimit_,
-                                                    reduction_, sequenceParallel_, source_.fp8Weights);
+                                                    reduction_, sequenceParallel_, source_.quantizedWeights);
         rt_.activate();
     }
     if (!parallel_ && !transformer_) {
         transformer_ = std::make_unique<Transformer>(rt_, full_, source_.directory, nomas::ParallelContext{},
-                                                     false, source_.fp8Weights);
+                                                     false, source_.quantizedWeights);
         transformer_->setMemoryPolicy(memory_);
     }
     Conditioning condition;
@@ -1020,11 +1024,11 @@ Image Pipeline::generateImpl(const Options &o, Progress progress, Trace trace,
                 textEncoder_->setHostMemoryBudget(memory_.host);
             }
             size_t reserve = 0, quantizedBytes = 0;
-            if (!memory_.layerStreaming && !source_.fp8Weights.empty()) {
+            if (!memory_.layerStreaming && !source_.quantizedWeights.empty()) {
                 size_t rows = size_t(height / 32) * (width / 32);
                 for (const auto &image : references)
                     rows += size_t(image.height / 32) * (image.width / 32);
-                quantizedBytes = std::filesystem::file_size(source_.fp8Weights);
+                quantizedBytes = std::filesystem::file_size(source_.quantizedWeights);
                 reserve = detail::textCacheReserve(quantizedBytes, rows, ids.size(), !references.empty());
             }
             if (reserve != textCacheReserve_) {

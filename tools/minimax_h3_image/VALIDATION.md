@@ -582,3 +582,141 @@ Four new resident 256² outputs match the eight preceding before/after PNGs
 byte-for-byte. No Torch/C10/Python libraries are linked. This is a correctness
 and build check, not a new performance run; logs and hashes are retained in
 `image-cache-cleanup-20261112` under the same experiment directory.
+
+## INT8 optimization and quantized mainline integration (2026-11-12)
+
+Base `master`: `333ee804b57ab27c17f5ff6119550d69142d6623`. The previously isolated
+INT8 and optimized NVFP4 implementations now use the normal `QuantizedWeights`
+interface and separate native CUDA files. CLI, HTTP and the launcher's studio
+select BF16/FP8/INT8/NVFP4 from checkpoint data, without extra precision flags or
+tuning environment variables. Existing host/GPU budgets and quantized DiT SP
+apply to both new formats. NVFP4 is W4A4; INT8 ConvRot is W8A8. Inference remains
+C++/CUDA with no Torch, C10 or Python runtime library dependency.
+
+INT8 now keeps H256 rotation and per-row activation quantization in one kernel,
+applies activation/weight scales in the CUTLASS GEMM epilogue, and combines
+resident FFN chunks up to 16384 rows. Streaming retains bounded chunks. INT8
+Comfy and Unsloth layouts are supported; the latter's unmarked rotation is
+verified against sampled BF16 rows of every projection before loading. Other
+quantization layouts are rejected. NVFP4 retains the validated group-16 E2M1
+packing, blocked E4M3 scales and native SM120 block-scaled GEMM.
+
+Fresh timing runs used physical GPU 4, RTX PRO 5000 72 GB, CUDA 13, 2048x2048,
+six steps, seed 42 and batch one. Each engine/task ran in two fresh processes,
+four requests each; the table is the median of the six warm requests. Native
+uses synchronized `Pipeline.generate`; SGLang uses `metrics.total_duration_ms`.
+Initialization, first requests and PNG output encoding/writes are excluded.
+Native reference-PNG reading is outside the timer; SGLang's is inside it.
+
+| Task | Native before | Native mainline | SGLang rerun | Native reduction |
+| --- | ---: | ---: | ---: | ---: |
+| Text to image | 4.408871 s | 3.676742 s | 3.893854 s | 16.61% |
+| One-reference edit | 13.222265 s | 11.522244 s | 12.078937 s | 12.86% |
+
+Mainline latency is 5.58% / 4.61% below this SGLang run. SGLang is pinned to
+`23a45fd33921164fa440fd7c28cc63341259c28c`, with the same prepared INT8 payload
+and isolated loader adapters as the previous comparison. DiT/VAE are resident;
+text weights use permanent layerwise residency, 32 layers per stack, prefetch two.
+Conditioning caching, torch compilation and CUDA graphs are disabled. SGLang's
+edit still has severe color artifacts and fails the winter-forest instruction,
+so its edit timing is not an equivalent-quality comparison.
+
+Nsight captures attribute all 300 main blocks, with no unmatched launches or
+unexpected CUDA API errors. T2I/edit rotation-plus-quantization kernel sums fall
+from 419/993 ms to 164/358 ms. Separate output scaling falls from 400/898 ms to
+zero; GEMM launch counts fall from 1800/3000 to 1200/1200. Main-block GPU spans
+fall from 4086/11427 ms to 3366/9707 ms; pinned SGLang traces show 3422/9942 ms.
+Rotation/quantization, output projection and FFN down still lag SGLang; the
+overall result also benefits from faster native attention. These are one warm
+capture per engine/task, not the endpoint timing samples above. Native/SGLang
+sequence padding differs slightly: 4106/4128 T2I rows and 9244/9264 edit rows.
+
+The full-size repeatability check exposed reference-encoder batch changes from
+eight tiles to seven when pending frees or retained CUDA-pool pages distorted
+raw free-memory queries. `Runtime::availableMemory()` settles its stream and
+counts reusable CUDA-pool pages within the active budget before the batch
+decision. Exact-size host caches remain accounted as allocations. This restores
+eight identical PNGs per INT8 task across both processes, matching the previous
+native cold reference; four repeated FP8 edits are also identical. No blanket
+stage synchronization or encoder math change was introduced.
+
+Validation:
+
+- Fresh native image/video library, CLI and server builds pass. Nine relevant
+  CTests pass, plus final-binary INT8 and tensor-pool regressions.
+- Independent dense-H256 INT8 fixtures cover widths 256/5376/7168/14336,
+  row counts 1/17/129, both checkpoint layouts, FC1 row/scale permutations,
+  zero inputs, destination reuse and repeated calls: relative L2 is zero.
+- Independent C++ NVFP4 conversion/matmul and malformed-checkpoint fixtures
+  pass. Nine separate NumPy fixtures have maximum relative L2 `9.57532e-5`,
+  matching the frozen optimized FP4 behavior. Both formats pass CUDA memcheck
+  with zero errors.
+- Launcher media tests pass 19 cases, with one optional browser case skipped.
+  Real API tests for each format cover deliberate budget exhaustion,
+  cancellation, subsequent two-reference 256x256 editing, demo content and
+  `dit_precision`. With 3 GiB GPU / 2 GiB host settings, both sample 2549 MiB
+  peak GPU usage; peak RSS is 846.59 MiB for INT8 and 853.94 MiB for NVFP4.
+- Real unmarked Unsloth INT8 loads, verifies rotation and generates a PNG.
+  Four-request mainline NVFP4 runs remain identical within each case: warm
+  single-GPU T2I/edit medians are 2.575564/9.212392 s. Dual-GPU INT8 T2I is
+  2.012464 s and NVFP4 edit is 5.561719 s, using text TP2 and DiT SP2. These are
+  integration checks, not new multi-GPU SGLang comparisons.
+
+Source changes are in the local and pro5000 `master` working trees. The live
+GPU 3 studio binary was not restarted. A release wheel, other GPU architectures,
+and maximum-reference workloads were not tested. Commands, raw samples,
+hashes, sanitizer logs, plots and the patch are retained in
+`quantized-mainline-20261112` under the pro5000 image experiment directory.
+
+## Quantized mainline cleanup and commit review (2026-11-12)
+
+FP8 now reuses the bounded checkpoint reader already used by INT8/NVFP4. This
+removes duplicate header, payload and transfer code while retaining dtype,
+integral-shape, offset, byte-count and scale validation. The always-true INT8
+ConvRot flag, unused internal workspace arguments, NVFP4 forwarding wrapper and
+unused includes are removed. NVFP4's static scheduler and epilogue require zero
+global workspace, so its unused 32 MiB allocation is removed with an explicit
+workspace-size guard. The cleanup reduces implementation/test code by 94 lines;
+the nine CUDA kernel bodies and CUTLASS math/tile configurations are unchanged.
+
+Review also found that converting `group_size` to an integer accepted `16.5` as
+16. NVFP4 now checks the numeric value exactly. The new regression fails against
+the preceding frozen library and passes against the cleaned build.
+
+The model sources have no runtime tuning environment-variable hooks. Backend
+selection remains based on checkpoint data. Compile-time capability macros,
+the launcher's executable override and standard CUDA/NCCL/library configuration
+retain their existing purposes; benchmark/profiling scripts stay outside the
+repository.
+
+Validation used a separate fresh CUDA 13 build on the same SM120 machine:
+
+- Image/video libraries, CLIs and servers build; all 13 relevant CTests pass.
+  FP8, INT8 and NVFP4 each pass CUDA memcheck with zero errors.
+- The no-CUTLASS FP8 SM89-PTX and INT8 SM80-PTX paths compile and pass their
+  operator fixtures on SM120. The unavailable-NVFP4 translation unit compiles.
+  This does not constitute testing older physical GPUs or older CUDA toolkits.
+- Launcher media tests pass 19 cases, with one optional browser case skipped.
+  JS/Python/JSON checks and `git diff --check` pass. Native dependencies contain
+  no Torch, C10 or Python runtime library.
+- All 24 full-size outputs match the preceding build byte-for-byte: FP8 single
+  GPU editing; INT8 single GPU generation/editing; NVFP4 single GPU
+  generation/editing and dual GPU editing. Each case includes four requests.
+- FP8/INT8/NVFP4 HTTP services each recover from deliberate budget exhaustion
+  and cancellation, then complete two-reference 256x256 editing. Demo content,
+  health precision and PNG retrieval pass. At 3 GiB GPU / 2 GiB host settings,
+  all sample 2549 MiB GPU peak; RSS peaks are 847.52/833.57/840.09 MiB.
+
+Default-memory edit timings varied during the functional runs. A separate
+before/after check fixes the existing host budget to 64 GiB (62 GiB cache cap),
+with automatic GPU mode, on the same card. Each library runs four requests;
+the final three INT8 2048-square edit requests have medians 11.420793 s before
+and 11.483222 s after (+0.55%), with identical PNGs. This is a cleanup regression
+check, not a new SGLang benchmark or a cold-loading comparison.
+
+The reviewed working tree remains on `master`, without a commit or push.
+Suggested boundaries are the independent reference-VAE memory accounting fix,
+then quantized model integration with its tests/API/docs. A release wheel and
+maximum-reference workloads remain untested. Build commands, regression logs,
+before/after output hashes, environment/kernel audits and the cleanup patch are
+in `quantized-cleanup-20261112` under the pro5000 image experiment directory.

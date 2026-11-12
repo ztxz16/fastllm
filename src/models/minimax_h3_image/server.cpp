@@ -137,14 +137,14 @@ class Service {
                 {
                     Runtime rt(device), full(device, true), vae(device, vaeType);
                     auto source = resolveModelSource(model);
-                    Transformer transformer(rt, full, source.directory, {}, false, source.fp8Weights);
+                    Transformer transformer(rt, full, source.directory, {}, false, source.quantizedWeights);
                     VAE decoder(vae, full, source.directory);
                     fastllm::nomas::QwenTokenizer tokenizer(source.directory + "/tokenizer");
                     if (!std::filesystem::is_regular_file(source.directory + "/text_encoder/config.json"))
                         throw std::runtime_error("missing text_encoder/config.json");
                 }
                 Pipeline pipeline(model, device, vaeType, gpuLimit_, hostLimit_, devices, reduction, parallelMode);
-                fp8Enabled_ = pipeline.fp8();
+                weightFormat_ = pipeline.weightFormat();
                 sequenceParallel_ = pipeline.sequenceParallel();
                 streaming_ = pipeline.memoryPolicy().layerStreaming;
                 hostCacheGiB_ = double(pipeline.memoryPolicy().host->limit()) / (size_t(1) << 30);
@@ -242,7 +242,7 @@ class Service {
                                        : startupError_.empty() ? "loading"
                                                                : "failed"},
                             {"error", startupError_.empty() ? Json() : Json(startupError_)},
-                            {"dit_precision", fp8Enabled_ ? "fp8" : "bf16"},
+                            {"dit_precision", weightFormatName(weightFormat_.load())},
                             {"gpu_memory_limit_gib", gpuLimit_},
                             {"host_memory_limit_gib", hostLimit_},
                             {"tensor_parallel_size", parallelSize_},
@@ -347,7 +347,7 @@ class Service {
     std::atomic<bool> streaming_{false};
     std::atomic<double> hostCacheGiB_{0};
     std::atomic<int> pending_{0};
-    std::atomic<bool> fp8Enabled_{false};
+    std::atomic<WeightFormat> weightFormat_{WeightFormat::BF16};
     uint64_t sequence_ = 0;
     std::mutex mutex_;
     std::atomic<bool> sequenceParallel_{false};
@@ -372,7 +372,7 @@ int main(int argc, char **argv) {
                 std::cout
                     << "minimax_h3_image_server --model DIR [--host 127.0.0.1 --port 8009 --device 0 "
                        "--output DIR --demo FILE --api-key KEY --vae-precision bf16|fp32]\n"
-                       "  --model accepts a complete directory or FP8 safetensors file (auto-detected).\n"
+                       "  --model accepts a complete directory or FP8/INT8/NVFP4 safetensors file (auto-detected).\n"
                        "  [--gpu-memory-limit GiB --host-memory-limit GiB] (0: automatic)\n"
                        "  [--devices 0,1 --parallel-mode auto|tp|sp --tp-reduction fp32|activation]\n";
                 return 0;

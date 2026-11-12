@@ -7,7 +7,7 @@ namespace fastllm::minimax_h3_image {
 class ParallelModel {
   public:
     ParallelModel(const std::string &, const std::vector<int> &, const MemoryPolicy &, double gpuLimit,
-                  nomas::RowReduction, bool sequenceParallel = false, const std::string &fp8Weights = "");
+                  nomas::RowReduction, bool sequenceParallel = false, const std::string &quantizedWeights = "");
     ~ParallelModel();
     Tensor encode(const std::vector<int> &, const std::vector<minimax_h3::VisionInput> &, Trace);
     void prepare(Progress);

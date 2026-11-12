@@ -151,7 +151,7 @@ function renderProfilePresentation() {
   elements.launchForm.querySelector('[data-field="server_binary"]').placeholder = image ? "/path/to/minimax_h3_image_server" : "/path/to/minimax_h3_server";
   elements.launchForm.querySelector('[data-field="output_dir"]').placeholder = image ? "~/.local/share/fastllm/images/port" : "~/.local/share/fastllm/videos/port";
   if (video) elements.profileEditorDescription.textContent = t("Start a video API alongside your chat models. Pika is detected automatically.");
-  if (image) elements.profileEditorDescription.textContent = t("MiniMax H3 Image · text-to-image and reference editing. Select a model directory or FP8 safetensors; precision is detected automatically.");
+  if (image) elements.profileEditorDescription.textContent = t("MiniMax H3 Image · text-to-image and reference editing. Select a model directory or FP8 / INT8 / NVFP4 safetensors; precision is detected automatically.");
 }
 
 function configurationModeDescription(mode) {

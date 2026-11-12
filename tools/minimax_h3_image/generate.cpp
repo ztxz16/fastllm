@@ -100,7 +100,7 @@ int main(int argc, char **argv) {
                 std::cout
                     << "minimax_h3_image_generate --model DIR --prompt TEXT --output image.png\n"
                        "  [--width 2048 --height 2048 --seed 42 --device 0 --vae-precision bf16|fp32]\n"
-                       "  --model accepts a complete directory or FP8 safetensors file (auto-detected).\n"
+                       "  --model accepts a complete directory or FP8/INT8/NVFP4 safetensors file (auto-detected).\n"
                        "  [--gpu-memory-limit GiB --host-memory-limit GiB] (0: automatic)\n"
                        "  [--devices 0,1 --parallel-mode auto|tp|sp --tp-reduction fp32|activation]\n"
                        "Reference editing: --image FILE [--image FILE ...], up to 16 PNG/JPEG/WebP files.\n"
