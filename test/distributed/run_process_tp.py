@@ -44,7 +44,9 @@ def save_report(output, rows, metadata):
     fields = ["case", "backend", "status", "max_abs_error", "mean_abs_error", "failed_elements", "reason"]
     for key in ('custom_calls', 'nccl_calls', 'prefix_hits', 'reused_tokens', 'evictions', 'prefix_bytes',
                 'token_mismatches', 'compared_steps', 'first_divergence_token_1based',
-                'requests', 'generated_tokens', 'elapsed_s', 'http_requests', 'sse_requests', 'reaped_processes'):
+                'requests', 'generated_tokens', 'elapsed_s', 'http_requests', 'sse_requests', 'reaped_processes',
+                'operation_timeout_ms', 'failure_return_ms', 'failure_phase', 'fault_rank',
+                'workers_reaped', 'observed_error'):
         if any(key in row for row in rows):
             fields.append(key)
 
@@ -238,6 +240,11 @@ def main():
         rows.append(run_case("frontend_options", [sys.executable, str(ROOT / "test/distributed/test_process_tp_options.py")],
                              output, 30, parse_json=False))
         rows.append(run_cleanup_checks(output))
+        fixture_check = run_case("exit_fixture_protocol",
+                                [sys.executable, str(ROOT / "test/distributed/test_control_exit_worker.py")],
+                                output, 60, parse_json=False)
+        fixture_check["backend"] = "python/control-exit-fixture"
+        rows.append(fixture_check)
         if not args.frontend_only:
             base = [str(args.check.resolve()), "--worker", str(args.worker.resolve()), "--devices", args.devices]
             for name in ("smoke", "restart", "crash", "stall", "invalid_devices", "missing_worker", "startup_exit"):
@@ -252,6 +259,20 @@ def main():
                            "--control-only", "--case", name, "--startup-timeout-ms", "2000"]
                 environment = dict(os.environ, FASTLLM_TEST_STARTUP_FAULT="timeout" if name == "startup_timeout" else name)
                 rows.append(run_case("control_" + name, command, output, 20, environment=environment))
+            exit_fixture = output / "control_exit_worker"
+            exit_fixture.write_text((ROOT / "test/distributed/control_exit_worker.py").read_text(encoding="utf-8"), encoding="utf-8")
+            exit_fixture.chmod(0o700)
+            for mode in ("wait_peer_exit", "partial_header_peer_exit", "partial_payload_peer_exit",
+                         "buffered_error_exit", "current_error_exit", "partial_error_exit", "stale_error_exit",
+                         "startup_peer_exit", "reply_then_exit", "stall", "shutdown_order"):
+                name = "watch_" + mode
+                barrier_dir = output / name
+                barrier_dir.mkdir()
+                command = [str(args.check.resolve()), "--worker", str(exit_fixture.resolve()),
+                           "--devices", "0,1", "--control-only", "--case", name]
+                environment = dict(os.environ, FASTLLM_TEST_EXIT_MODE=mode,
+                                   FASTLLM_TEST_EXIT_DIR=str(barrier_dir.resolve()))
+                rows.append(run_case("control_" + name, command, output, 45, environment=environment))
             rows.append(parent_death_case(base + ["--control-only", "--case", "hold"], 90, output))
             if args.pid_namespace:
                 command = ["unshare", "--user", "--map-root-user", "--pid", "--fork", "--kill-child=SIGKILL"]
