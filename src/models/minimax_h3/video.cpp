@@ -209,10 +209,10 @@ VideoTensor VideoVAE::encodeMoments(const VideoTensor &pixels, std::function<voi
     independentImages = independentImages && !lowMemory_;
     size_t capacity = 1;
     if (independentImages) {
-        size_t free = 0, totalBytes = 0;
-        auto status = cudaMemGetInfo(&free, &totalBytes);
-        if (status != cudaSuccess)
-            throw std::runtime_error(cudaGetErrorString(status));
+        // Pending frees and retained pool blocks are available to this stream.
+        // Using raw cudaMemGetInfo here made identical image requests change
+        // convolution batch shapes with host/GPU scheduling (e.g. 8 -> 7).
+        const size_t free = full_.availableMemory();
         constexpr size_t reserve = size_t(2) << 30, perTile = size_t(256) << 20;
         if (free > reserve)
             capacity = std::clamp((free - reserve) / perTile, size_t(1), size_t(8));

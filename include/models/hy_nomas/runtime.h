@@ -159,6 +159,9 @@ public:
                            int queryChunk = 128, int kvHeads = 0, bool causal = false,
                            int tile = 0, int gridHeight = 0, int gridWidth = 0);
     void synchronize();
+    // Settle this stream before memory-dependent shape decisions. Includes
+    // reusable storage in its pool and respects an active GPU memory budget.
+    size_t availableMemory();
 private:
     struct LtState;
     std::unique_ptr<LtState> lt_;

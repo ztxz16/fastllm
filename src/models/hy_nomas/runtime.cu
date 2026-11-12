@@ -1089,6 +1089,21 @@ Tensor Runtime::attentionScaled(const Tensor &q,const Tensor &k,const Tensor &v,
     return out;
 }
 void Runtime::synchronize() { check(cudaDeviceSynchronize()); }
+size_t Runtime::availableMemory() {
+    activate();
+    check(cudaStreamSynchronize(cudaStreamPerThread));
+    auto pool=memoryPool(device_);
+    size_t free=0,total=0; check(cudaMemGetInfo(&free,&total));
+    uint64_t reserved=0,used=0;
+    check(cudaMemPoolGetAttribute(pool->handle,cudaMemPoolAttrReservedMemCurrent,&reserved));
+    check(cudaMemPoolGetAttribute(pool->handle,cudaMemPoolAttrUsedMemCurrent,&used));
+    // Host-side exact-size caches remain CUDA allocations: they cannot be
+    // assumed reusable by a different future shape. Only free CUDA pool pages
+    // are generally available without changing the cache's retention policy.
+    size_t available=free+(reserved>used?reserved-used:0);
+    if(pool->maxBytes) available=std::min(available,pool->maxBytes>used?pool->maxBytes-used:0);
+    return available;
+}
 
 bool HostMemoryBudget::acquire(size_t bytes) {
     size_t current=used_.load();
