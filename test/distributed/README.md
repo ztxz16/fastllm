@@ -1070,8 +1070,9 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python3 test/distributed/run_parallel_config.py --r
 GPU 编号是 CUDA 可见逻辑编号；子进程继承启动时的环境快照，不修改父进程的可见设备列表。
 
 - 全部副本就绪后才接受请求，启动期间任一失败都会回收已成功启动的副本。
-- 按空闲副本轮转，一次请求只提交到一个副本，不重试、不复制请求。
-  每副本一次处理一个请求，多个副本可以同时运行；本步不包含 continuous batching 或缓存感知分发。
+- 默认按空闲副本轮转，一次请求只提交到一个副本，不重试、不复制请求。
+  每副本一次处理一个请求，多个副本可以同时运行；不包含 continuous batching。
+  可选的前缀感知策略见文末“DP 空闲优先与前缀缓存路由”。
 - 模型工厂的 `generate` 返回 `dp_rank` 和池内唯一的 `dp_request_id`；原生 `id` 仍属于该副本自己的会话。
   `response`/`stream_response` 保持文本接口。HTTP 消费线程数等于 DP 副本数，队列容量仍是全局等待请求数。
   `/health` 增加 `active_request_ids`、`dp_size` 和 `replicas`，`workers` 中包含 `dp_rank`。
@@ -1270,3 +1271,71 @@ GPU利用率有自己的采样周期，时间窗口重叠和相关性不能单�
 `within_block_c4_over_c1_ratios` 用各组同等工作量的累计耗时计算。它们用于分析并发变化，不是DP扩展收益。
 可追加 `--no-telemetry` 检查观察开销，或 `--tp 1` / `--profile common` 做单独控制实验；不同profile
 或不同采样状态的结果必须分别标识，不能混算加速比。脚本不安装依赖、不重新编译、不改变GPU或CPU设置。
+
+## DP 空闲优先与前缀缓存路由（第四步）
+
+新增 `--dp-routing round_robin|prefix`，默认仍为 `round_robin`。`prefix` 要求
+`DP>1`、`--tp-backend process` 和 `--prefix-cache true`；CLI、JSON 配置和模型工厂统一校验。
+纯 DP 和 DP+TP 使用同一分发规则：
+
+1. 只比较当前空闲副本中可复用的 Prompt Token 数，选择最长匹配。
+2. 匹配长度相同或全部未命中时，保持轮转顺序；至少保留最后一个 Prompt Token 重算。
+3. 持有缓存的副本正忙时，使用其他空闲副本；全部忙时沿用可取消、可超时的等待。
+
+路由依据 worker 实际保留的快照目录，不把历史请求当作仍存在的缓存。原生反馈新增
+`prefix_cache.directory_version=1` 和 `snapshots`；每个快照只有 RoPE 起点与 Token ID，
+没有 GPU 指针。协调器检查各 TP rank 的目录一致性，Python 在请求完成、取消及清理后更新记录。
+取消可能保留已完成 Prefill 的有效快照，因此由原生目录决定能否复用。淘汰、清空、关闭与故障均会
+更新或作废对应记录；部分副本清缓存失败会停止新分发，等待超时且尚未开始清理时保留原状态。
+
+文本和流式入口在分配前分词一次，复用正式 TP 请求构造与执行流程；HTTP 走同一模型工厂。
+`ready`、设备预览及 `/health` 包含策略名称，生成结果与 dispatch 日志中的 `dp_routing` 包含
+`policy`、分配时的 `idle_ranks`、`estimated_reused_tokens`、`wait_ms`。轮转模式不估算前缀，
+对应估算字段为 `null`。保留每副本单活动请求、独立权重和 KV 的限制，不迁移或共享跨副本 KV。
+
+需要同时重新编译协调器与 worker；混用新旧原生产物明确失败。新 Python 配合成套旧原生产物时，
+默认轮转仍兼容，但启用 `prefix` 会因缺少目录明确拒绝，不会静默回退。
+
+更新产物后，可在前述纯 DP 或 DP+TP 的 `run/chat/serve` 命令中追加：
+
+```bash
+--prefix-cache true --dp-routing prefix
+```
+
+### 混合请求验收
+
+`benchmark_qwen3_dp_routing.py` 通过正式工厂对比两种路由，分别测并发 1 和 4。每轮 24 个请求，
+包含六种互不共享首 Token 的 64-token Prompt，每种重复四次，输出长度依次为 8、32、8、32，
+共 480 个输出 Token。固定 Token ID、贪心采样、seed=0、空 EOS 集合、FP16 KV 和 Decode Graph；
+TP2 使用已验收 GPU 对的自定义 AllReduce。
+
+两种策略在每个预热及正式轮开始前调用公开清缓存接口并验证目录为空；随后缓存如何演化是策略的
+比较对象。同 TP 的 DP1 独立建立每个请求的冷、热输出基准，按实际复用长度验证，不能将冷、热
+输出不同直接判为错误。另以相同请求历史的 DP1 基准验证部分命中、八条目上限后的淘汰和清空，
+并验证取消后有效缓存复用及忙副本避让。所有功能 case 均检查实际输出。
+
+默认一轮预热、至少五轮正式测量。计时只含正式入口排队、IPC、生成、KV 生命周期和生产协议校验；
+清缓存、测试校验、原始样本及汇总文件写入均在计时外，逐请求落盘使用正式参数关闭。
+报告包含 Median/P95 批耗时、请求延迟、TTFT、ITL、CV、吞吐、实际执行路径、命中率与复用 Token 数。
+`speedup_vs_round_robin = 同 DP/TP/并发的轮转 Median 批耗时 / 当前策略 Median 批耗时`。
+路由策略依次运行，报告记录顺序；应结合波动判断结果，不能仅凭一次加速比断言稳定收益。
+
+每次生成独立的 `*_dp_routing_*` 目录，保存 `requests.json`、`references.json`、全部原始轮次，
+以及性能和 `functional/` 各自的 `summary.md/csv/json/xlsx`。任意 case 失败返回非零，并保存部分报告。
+本地仅运行 Python 子进程协议替身与报告回归，不据此宣称 GPU 功能或性能已验收。
+
+在 sk 合入远端 master 后，四卡 V100 服务器执行下列命令。脚本重建正式产物，先验证默认轮转，
+再分别验收 DP4×TP1、DP2×TP2 的新路由；不重新下载模型。UUID 顺序对应本机已验收的物理卡 0、3、1、2。
+
+```bash
+(
+set -euo pipefail
+cd /home/project/vllm_fastllm
+git switch master
+git pull --ff-only origin master
+export CUDA_VISIBLE_DEVICES="GPU-a88c9669-989e-a8dd-22a0-94a45b467c49,GPU-0310107f-031e-6fcd-eb65-6dfa45981711,GPU-f0a99453-777f-8b16-89a3-bab78019f23d,GPU-081484a6-9730-453b-59a2-32bd75ab6c2c"
+bash test/distributed/run_qwen3_dp_routing_v100.sh \
+  /home/models/Qwen3-1.7B \
+  test/distributed/results/20261112T065746Z_dp_perf_ab619d18/request.json
+)
+```

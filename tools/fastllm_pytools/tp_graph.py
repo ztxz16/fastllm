@@ -53,6 +53,30 @@ def validate_allreduce(states, world, enabled, *, previous=None, require_progres
     return observed
 
 
+def validate_prefix_directory(prefix, *, required=False):
+    """/** 校验原生快照目录的版本、边界与唯一性；旧产物仅在未要求缓存路由时兼容。 */"""
+    if not required and 'directory_version' not in prefix and 'snapshots' not in prefix:
+        return None
+    snapshots = prefix.get('snapshots')
+    if (type(prefix.get('directory_version')) is not int or prefix['directory_version'] != 1 or
+            not isinstance(snapshots, list) or len(snapshots) != prefix['entries']):
+        raise RuntimeError('missing/invalid prefix directory; rebuild native generate and worker binaries')
+    seen = set()
+    for entry in snapshots:
+        if not isinstance(entry, dict) or set(entry) != {'position_begin', 'token_ids'}:
+            raise RuntimeError('invalid prefix directory entry')
+        position, ids = entry['position_begin'], entry['token_ids']
+        if (type(position) is not int or not 0 <= position <= 1048576 or not isinstance(ids, list) or
+                not 1 <= len(ids) <= 128 or position + len(ids) - 1 > 1048576 or
+                any(type(token) is not int or not 0 <= token <= 4294967295 for token in ids)):
+            raise RuntimeError('invalid prefix directory tokens/position')
+        key = (position, tuple(ids))
+        if key in seen:
+            raise RuntimeError('duplicate prefix directory entry')
+        seen.add(key)
+    return snapshots
+
+
 def validate_prefix(states, world, enabled, *, previous=None, reset=False, cleared=False, prompt_tokens=None):
     """检查 worker 实际复用长度、资源上限和跨 rank 一致性；卸载必须清零。"""
     counters = ('lookups', 'hits', 'reused_tokens', 'evictions', 'clears')
@@ -75,10 +99,15 @@ def validate_prefix(states, world, enabled, *, previous=None, reset=False, clear
             raise RuntimeError('prefix cache fallback, invalid counters or leaked snapshots')
         if observed and any(p[k] != observed[0][k] for k in integers if k != 'device_bytes'):
             raise RuntimeError('inconsistent prefix cache ranks')
+        directory = validate_prefix_directory(p)
+        if observed and directory != observed[0].get('snapshots'):
+            raise RuntimeError('inconsistent prefix directory ranks')
         observed.append(p)
     if previous is not None and not reset:
         old = validate_prefix(previous, world, enabled)[0]
         p = observed[0]
+        if 'snapshots' in old:
+            validate_prefix_directory(p, required=True)
         if any(p[k] < old[k] for k in counters):
             raise RuntimeError('prefix cache counters regressed')
         if cleared:

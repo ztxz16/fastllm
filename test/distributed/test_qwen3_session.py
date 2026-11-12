@@ -56,13 +56,39 @@ def fixture():
     prefix = dict(enabled=prefix_enabled, entries=0, device_bytes=0, lookups=0, hits=0,
                   reused_tokens=0, last_reused_tokens=0, last_computed_tokens=0, evictions=0, clears=0)
     saved_prompt = []
+    snapshots = []
+
+    def cache_request(request):
+        nonlocal snapshots
+        ids = request['token_ids']
+        matches = []
+        for saved in snapshots:
+            common = 0
+            for left, right in zip(saved, ids[:-1]):
+                if left != right:
+                    break
+                common += 1
+            matches.append(common)
+        reused = max(matches, default=0)
+        if reused:
+            snapshots.append(snapshots.pop(matches.index(reused)))
+        if ids in snapshots:
+            snapshots.remove(ids)
+        elif len(snapshots) == 8:
+            snapshots.pop(0)
+            prefix['evictions'] += 1
+        snapshots.append(ids[:])
+        prefix.update(entries=len(snapshots), device_bytes=sum(len(ids)*16 for ids in snapshots),
+                      lookups=prefix['lookups']+1, hits=prefix['hits']+int(reused > 0),
+                      reused_tokens=prefix['reused_tokens']+reused, last_reused_tokens=reused,
+                      last_computed_tokens=len(ids)-reused)
 
     def send(value):
         nonlocal saved_prompt
         if value['event'] != 'token' and mode != 'graph_missing':
             event = value['event']
             if event == 'result' and value['status'] == 'PASS':
-                if prefix_enabled:
+                if prefix_enabled and not mode.startswith('dp_routing'):
                     ids = value['request']['token_ids']
                     reused = 0
                     while reused < min(len(saved_prompt), len(ids)-1) and saved_prompt[reused] == ids[reused]:
@@ -90,6 +116,12 @@ def fixture():
                     state['prefix_cache']['enabled'] = False
                 if mode == 'prefix_stale' and event == 'result':
                     state['prefix_cache'].update(lookups=0, hits=0, reused_tokens=0)
+                if mode.startswith('dp_routing') and mode != 'dp_routing_missing':
+                    entries = snapshots if event != 'shutdown' else []
+                    state['prefix_cache'].update(directory_version=1,
+                        snapshots=[dict(position_begin=0, token_ids=ids[:]) for ids in entries])
+                    if mode == 'dp_routing_corrupt' and event == 'result':
+                        state['prefix_cache']['snapshots'] = []
             if mode != 'ar_missing':
                 state['allreduce'] = dict(ar)
                 if mode == 'ar_float_' + event:
@@ -143,10 +175,13 @@ def fixture():
             return
         if message['op'] == 'clear_prefix_cache':
             saved_prompt = []
+            snapshots = []
             prefix.update(entries=0, device_bytes=0, clears=prefix['clears'] + int(prefix_enabled))
             send(dict(event='prefix_cache_cleared', id=message['id'], status='PASS', cache=cache))
             continue
         request = message["request"]
+        if mode.startswith('dp_routing') and prefix_enabled and request.get('max_new_tokens', 0) > 0:
+            cache_request(request)
         if mode == 'dp_overlap':
             model = Path(args['--model'])
             (model / f'started-{devices[0]}').touch()
@@ -171,7 +206,7 @@ def fixture():
                       workers=workers, reusable=True, request=request, token_ids=[request["token_ids"][0]],
                       finish_reason="eos" if request["token_ids"][0] in request.get("eos_token_ids", []) else "length",
                       cache_after_generate=cache)
-        if (mode in ('graph_normal', 'graph_stale', 'dp_smoke') or mode.startswith(('ar_', 'prefix_'))) and request.get('max_new_tokens', 0) > 0:
+        if (mode in ('graph_normal', 'graph_stale', 'dp_smoke') or mode.startswith(('ar_', 'prefix_', 'dp_routing'))) and request.get('max_new_tokens', 0) > 0:
             result['token_ids'] *= request['max_new_tokens']
             result['steps'] = [dict(token_id=token) for token in result['token_ids']]
         if message.get("stream_tokens"):
@@ -190,7 +225,7 @@ def fixture():
                 result["token_ids"] = [token+1]
             if mode == "stream_error_float":
                 result.update(status="FAIL", steps=[dict(token_id=float(token))], cache_after_error=cache)
-            if mode in ("stream_burst", "stream_eos", "dp_smoke"):
+            if mode in ("stream_burst", "stream_eos", "dp_smoke") or (mode.startswith('dp_routing') and request.get('max_new_tokens') != 128):
                 count = request.get("max_new_tokens", 1)
                 if mode == "stream_eos":
                     count = 1
@@ -199,7 +234,7 @@ def fixture():
                     send(dict(event="token", id=message["id"], index=index, token_id=token))
                 result["token_ids"] = [token]*count
                 result["steps"] = [dict(token_id=token)]*count
-        if (mode == "cancel" and request.get("max_new_tokens", 1) > 1) or (mode == 'dp_smoke' and request.get('max_new_tokens') == 128):
+        if (mode == "cancel" and request.get("max_new_tokens", 1) > 1) or ((mode == 'dp_smoke' or mode.startswith('dp_routing')) and request.get('max_new_tokens') == 128):
             while True:
                 if select.select([cancellation], [], [], 5)[0]:
                     cancelled_id = struct.unpack("!I", cancellation.recv(4))[0]

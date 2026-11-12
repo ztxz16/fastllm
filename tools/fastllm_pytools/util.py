@@ -501,6 +501,8 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--device', type = str, help = '使用的设备')
     parser.add_argument('--dp', type=_positive_int, default=1,
                         help='完整模型副本数；大于1时要求进程后端，tp表示每副本卡数')
+    parser.add_argument('--dp-routing', choices=['round_robin', 'prefix'], default='round_robin',
+                        help='DP空闲副本分发策略；prefix要求DP>1、进程后端及--prefix-cache true')
     parser.add_argument('--parallel-plan', action='store_true',
                         help='仅输出DP/TP的CUDA设备分配JSON，不加载模型或启动worker')
     parser.add_argument('--tp', type = str, default = "", help = '张量并行设备；裸数字X表示使用前X张卡，0表示0号卡，也可写 0,1 或 auto')

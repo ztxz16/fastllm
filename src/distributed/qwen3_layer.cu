@@ -781,6 +781,9 @@ Qwen3RequestInfo Qwen3LayerExecutor::RequestInfo() const {
     info.graph.active = impl->graphExec != nullptr;
     info.graph.workspaceBytes = impl->graphAllocated;
     info.prefix = impl->prefixInfo;
+    for (const auto &entry : impl->prefixes) {
+        info.prefix.snapshots.emplace_back(entry.position, entry.ids);
+    }
     return info;
 }
 

@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace fastllm {
@@ -59,6 +60,8 @@ struct Qwen3PrefixInfo {
     uint32_t entries = 0;
     uint64_t deviceBytes = 0, lookups = 0, hits = 0, reusedTokens = 0;
     uint64_t lastReusedTokens = 0, lastComputedTokens = 0, evictions = 0, clears = 0;
+    // 原生实际保留的快照目录：(RoPE起点, Prompt Token ID)。不暴露或共享GPU指针。
+    std::vector<std::pair<uint32_t, std::vector<uint32_t>>> snapshots;
 };
 
 struct Qwen3RequestInfo {

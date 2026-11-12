@@ -353,10 +353,10 @@ struct ProcessGroup::Impl {
             std::vector<Qwen3RequestInfo> result;
             for (const auto &reply : replies) {
                 const auto &bytes = reply.payload;
-                if (bytes.size() != 176 || Get32(bytes, 0) > 1 || Get32(bytes, 104) > 1 ||
+                if (bytes.size() < 184 || Get32(bytes, 176) != 1 || Get32(bytes, 0) > 1 || Get32(bytes, 104) > 1 ||
                     Get32(bytes, 24) > 1 || Get32(bytes, 28) > 1 ||
                     Get32(bytes, 72) > 1 || Get32(bytes, 76) > 1) {
-                    throw std::runtime_error("invalid Qwen3 request state header");
+                    throw std::runtime_error("invalid Qwen3 request state header; rebuild coordinator and worker together");
                 }
                 Qwen3RequestInfo info{Get32(bytes, 0) != 0, Get32(bytes, 4), Get32(bytes, 8),
                                       Get32(bytes, 12), Get64(bytes, 16)};
@@ -367,6 +367,27 @@ struct ProcessGroup::Impl {
                 info.prefix = {Get32(bytes, 104) != 0, Get32(bytes, 108), Get64(bytes, 112),
                     Get64(bytes, 120), Get64(bytes, 128), Get64(bytes, 136), Get64(bytes, 144),
                     Get64(bytes, 152), Get64(bytes, 160), Get64(bytes, 168)};
+                const uint32_t entries = Get32(bytes, 180);
+                if (entries > 8 || entries != info.prefix.entries) {
+                    throw std::runtime_error("invalid Qwen3 prefix directory count");
+                }
+                size_t offset = 184;
+                for (uint32_t i = 0; i < entries; ++i) {
+                    const uint32_t position = Get32(bytes, offset), length = Get32(bytes, offset + 4);
+                    offset += 8;
+                    if (!length || length > 128 || position > 1048576 || length - 1 > 1048576 - position ||
+                        offset > bytes.size() || length > (bytes.size() - offset) / 4) {
+                        throw std::runtime_error("invalid Qwen3 prefix directory entry");
+                    }
+                    std::vector<uint32_t> ids;
+                    for (uint32_t j = 0; j < length; ++j, offset += 4) ids.push_back(Get32(bytes, offset));
+                    auto snapshot = std::make_pair(position, ids);
+                    if (std::find(info.prefix.snapshots.begin(), info.prefix.snapshots.end(), snapshot) != info.prefix.snapshots.end()) {
+                        throw std::runtime_error("duplicate Qwen3 prefix directory entry");
+                    }
+                    info.prefix.snapshots.push_back(std::move(snapshot));
+                }
+                if (offset != bytes.size()) throw std::runtime_error("trailing Qwen3 prefix directory bytes");
                 const auto &prefix = info.prefix;
                 const auto &ar = info.allReduce;
                 const auto &g = info.graph;
@@ -404,7 +425,7 @@ struct ProcessGroup::Impl {
                     invalid = invalid || prefix.entries != f.entries || prefix.lookups != f.lookups ||
                         prefix.hits != f.hits || prefix.reusedTokens != f.reusedTokens ||
                         prefix.lastReusedTokens != f.lastReusedTokens || prefix.lastComputedTokens != f.lastComputedTokens ||
-                        prefix.evictions != f.evictions || prefix.clears != f.clears;
+                        prefix.evictions != f.evictions || prefix.clears != f.clears || prefix.snapshots != f.snapshots;
                 }
                 if (invalid) {
                     throw std::runtime_error("invalid/inconsistent Qwen3 request state");

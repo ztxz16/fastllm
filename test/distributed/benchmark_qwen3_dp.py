@@ -76,14 +76,20 @@ def model_flags(args, output, dp, tp, profile):
 
 
 def run_wave(model, request, count, concurrency):
+    """/** 将同一请求重复为固定工作量，复用混合请求计时入口。 */"""
+    return run_requests(model, [request] * count, concurrency)
+
+
+def run_requests(model, requests, concurrency):
     """/**
      * 运行固定客户端数的闭环请求轮，计入正式排队、IPC、生成和KV生命周期。
      * 线程/输入/计时槽预先创建；Token回调只记录时间，输出校验和落盘由调用者在返回后执行。
      * @return 总墙钟秒数、每请求耗时/Token时间戳/原生结果；单请求异常保留在记录中。
      */"""
     gate = threading.Event()
+    count = len(requests)
     ready = threading.Barrier(concurrency + 1, timeout=30)
-    records = [dict(index=i, token_times=[None] * request['max_new_tokens'], report=None, error=None) for i in range(count)]
+    records = [dict(index=i, token_times=[None] * request['max_new_tokens'], report=None, error=None) for i, request in enumerate(requests)]
 
     def client(lane):
         ready.wait()
@@ -99,7 +105,7 @@ def run_wave(model, request, count, concurrency):
 
             record['start'] = time.perf_counter()
             try:
-                record['report'] = model.generate(request, on_token=on_token)
+                record['report'] = model.generate(requests[index], on_token=on_token)
             except Exception as error:
                 record['error'] = f'{type(error).__name__}: {error}'
                 record['report'] = getattr(error, 'report', None)
@@ -234,6 +240,9 @@ def save_benchmark(output, rows, metadata):
               'max_abs_error', 'mean_abs_error', 'failed_elements', 'reason']
     if any('throughput_ratio_vs_c1' in row for row in rows):
         fields.append('throughput_ratio_vs_c1')
+    if any('routing_policy' in row for row in rows):
+        fields += ['routing_policy', 'output_tokens_per_wave', 'reused_prompt_tokens', 'computed_prompt_tokens',
+                   'prefix_hit_rate_pct', 'speedup_vs_round_robin']
     sample_fields = ['case', 'repeat', 'elapsed_s', 'output_tokens_per_s', 'request_index', 'latency_ms', 'ttft_ms', 'dp_rank']
     sample_rows = []
     for row in rows:
@@ -255,7 +264,8 @@ def save_benchmark(output, rows, metadata):
              metadata.get('report_description',
                           '正式模型工厂的固定工作量闭环测试，包含排队、IPC、原生KV创建/释放和生成；不含模型加载、预热、分词、测试校验或报告落盘。'),
              'TTFT包含正式入口排队；ITL为客户端Token事件间隔。请求P95不是batch P95。输出Token ID误差仅表示同配置DP一致性。',
-             'optimized先通过公开清理和串行请求为全部副本建立前缀，再进行热缓存预热和计时；冷/热分别对照DP1。',
+             metadata.get('cache_description',
+                          'optimized先通过公开清理和串行请求为全部副本建立前缀，再进行热缓存预热和计时；冷/热分别对照DP1。'),
              'cold_warm字段仅记录两种基线的Token差异，不作为数值精度结论；数值诊断需单独执行。',
              metadata.get('comparison_description',
                           'speedup_vs_dp1 = 同profile、TP和并发的DP=1 Median批耗时 / 当前Median批耗时；不同profile之间不计算加速比。'), '',

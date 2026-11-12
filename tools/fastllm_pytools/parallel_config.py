@@ -83,6 +83,11 @@ def validate_parallel_options(args, *, planning=False):
     backend = getattr(args, 'tp_backend', 'thread')
     if backend not in ('thread', 'process'):
         raise ValueError('tp_backend must be thread or process')
+    routing = getattr(args, 'dp_routing', 'round_robin')
+    if type(routing) is not str or routing not in ('round_robin', 'prefix'):
+        raise ValueError('--dp-routing must be round_robin or prefix')
+    if routing == 'prefix' and (dp <= 1 or backend != 'process' or getattr(args, 'prefix_cache', '') != 'true'):
+        raise ValueError('--dp-routing prefix requires DP>1, --tp-backend process and --prefix-cache true')
     request_log = getattr(args, 'tp_request_log', 'on')
     if request_log not in ('on', 'off'):
         raise ValueError('--tp-request-log must be on or off')
@@ -187,6 +192,7 @@ def build_parallel_plan(args):
         raise ValueError('--custom-allreduce requires process TP=2 within each replica')
 
     return {'dp_size': dp, 'tp_size': tp, 'total_gpus': dp * tp, 'tp_backend': getattr(args, 'tp_backend', 'thread'),
+            'dp_routing': getattr(args, 'dp_routing', 'round_robin'),
             'preview_only': True, 'multi_replica_execution_available': True,
             'cuda_visible_devices': visible, 'driver_cuda_version': inventory['driver_cuda_version'],
             'visible_device_count': available,
