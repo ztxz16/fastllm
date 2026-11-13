@@ -37,6 +37,8 @@ def apply_model_defaults(args, metadata):
         return
     if family not in ("deepseek_v41", "deepseek_v41_text"):
         return
+    if "speculative_dspark_confidence_threshold" not in explicit:
+        args.speculative_dspark_confidence_threshold = 0.0
     if not explicit & speculation and not (args.mtp or args.dspark or args.speculative_algorithm or
                                            args.speculative_draft_model_path) and (
             config.get("gguf_architecture") != "deepseek41" or

@@ -29,7 +29,7 @@ ftllm server /path/to/model-00001-of-00002.gguf --auto \
 
 旧布局的 Engram 文件名和来源需与主干元数据一致。ISTA 六分片新版需保留主干的第 1–5 分片，以及同目录的 `DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf`；该文件作为第 6 分片，既可使用原名，也可建立 `...-00006-of-00006.gguf` 链接。新旧布局的 Engram 文件头不同，应分别保留匹配的文件。多个相同布局的量化版本可以共享一份匹配的 Engram 文件。HF 模型保留自己的 Engram 权重与配置。`--ngram_device disk` 控制 Engram 按需读取，与专家是否使用磁盘后端分别设置。
 
-自动模式默认单请求、最多 1M 原生窗口、FP4 KV 和快速 Prefill。带内置 DSpark 权重时默认使用 DSpark 5；没有草稿权重的 GGUF 不会自动开启。设备、chunk 和专家缓存以 `[auto]` 日志为准。显卡和主存能容纳专家时优先避免磁盘专家，Engram 仍可独立使用磁盘。
+自动模式默认单请求、最多 1M 原生窗口、FP4 KV 和快速 Prefill。带内置 DSpark 权重时默认使用 DSpark 5；没有草稿权重的 GGUF 不会自动开启。DSpark 置信度阈值默认 `0`，不提前截短候选，适用于 HF/NVFP4、EXL3 和 GGUF 搭配外置草稿；显式 CLI 或 JSON 阈值仍优先，CLI 可覆盖 JSON。设备、chunk 和专家缓存以 `[auto]` 日志为准。显卡和主存能容纳专家时优先避免磁盘专家，Engram 仍可独立使用磁盘。
 
 `--auto` 默认启用 `--kernel-tune quick`，在实际算子形状首次预热时校验并选择已注册的合法候选，包含普通/分组投影及专家计算；适用于单请求和并发，不按某个固定行数强制选择 Triton。不支持的架构或格式保留原实现。使用 `--kernel-tune off` 可关闭，详见[算子注册与预热选择](kernel-policy.md)。
 
@@ -48,7 +48,7 @@ ftllm server /path/to/model-00001-of-00002.gguf --auto \
 | 固定输入分块或 CPU 线程 | `--chunked_prefill_size 4096 --threads 32` |
 | 关闭推测解码 | `--speculative_algorithm off` |
 | 使用 5 个内置 DSpark 草稿 | `--dspark 5`，需要对应草稿权重 |
-| 调整 DSpark 阈值 | `--speculative_dspark_confidence_threshold 0.5`；`0` 关闭阈值 |
+| 调整 DSpark 阈值 | `--speculative_dspark_confidence_threshold 0.5`；自动模式默认 `0`，不按置信度截短候选 |
 | 开启 / 关闭快速 Prefill | `--fast_prefill` / `--no_fast_prefill` |
 | 关闭算子自动测速 | `--kernel-tune off`；删除此参数恢复 `quick` |
 | 强制启用 / 禁止低显存模式 | `--low_gpu_mem` / `--no-low-gpu-mem`；删除参数恢复自动规划 |

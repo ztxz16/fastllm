@@ -1146,7 +1146,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         help = "外置 DSpark 的训练 block size 校验值；必须与 draft config 一致，候选数使用 --draft_tokens")
     parser.add_argument("--speculative_dspark_confidence_threshold", "--speculative-dspark-confidence-threshold",
                         dest = "speculative_dspark_confidence_threshold", type = float, default = 0.5,
-                        help = "DSpark confidence 前缀阈值，范围 [0,1]；0 表示不按置信度提前截短候选")
+                        help = "DSpark confidence 前缀阈值，范围 [0,1]；0 表示不按置信度提前截短候选；DeepSeek V4.1 --auto 默认0，其余默认0.5")
     parser.add_argument("--triton", action = "store_true", help = "启用Triton CUDA算子")
     
     parser.add_argument('--custom', type = str, default = "", help = '指定描述自定义模型的python文件')
@@ -1643,8 +1643,9 @@ def make_normal_llm_model(args, startup_progress = None):
             if is_deepseek_v41_model and getattr(args, "auto", False):
                 from .auto_config import apply_model_defaults
                 apply_model_defaults(args, config)
-                if args.dspark != dspark_tokens:
-                    dspark_tokens = args.dspark
+                dspark_tokens = args.dspark
+                if dspark_tokens > 0:
+                    # Also refresh defaults for explicit --dspark / GGUF drafts.
                     speculative_algorithm = args.speculative_algorithm
                     _configure_embedded_dspark(args)
             if speculative_algorithm == "dspark":

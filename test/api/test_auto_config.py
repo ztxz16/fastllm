@@ -879,20 +879,29 @@ class AutoConfigTest(unittest.TestCase):
             a = self.args(*options)
             auto.apply_model_defaults(a, md)
             self.assertEqual((a.dspark, a.fast_prefill), (drafts, fast))
+            self.assertEqual(a.speculative_dspark_confidence_threshold, 0.0)
         for family in ('qwen4_exp', 'glm5_next'):
             a = self.args()
             auto.apply_model_defaults(a, {'model_type': family})
             self.assertEqual((a.dspark, a.fast_prefill), (0, False))
+            self.assertEqual(a.speculative_dspark_confidence_threshold, .5)
         a = make_normal_parser('test').parse_args(['model'])
         auto.apply_model_defaults(a, md)
         self.assertEqual((a.dspark, a.fast_prefill), (0, False))
+        self.assertEqual(a.speculative_dspark_confidence_threshold, .5)
 
     def test_deepseek_auto_defaults_reach_planner_and_runtime_with_cli_json_precedence(self):
-        cases = [({}, [], 5, True, .5),
+        cases = [({}, [], 5, True, 0),
+                 ({}, ['--dspark', '5'], 5, True, 0),
                  ({}, ['--dspark', '3', '--speculative_dspark_confidence_threshold', '.2'], 3, True, .2),
-                 ({}, ['--speculative_algorithm', 'off', '--no_fast_prefill'], 0, False, .5),
-                 ({'dspark': 0, 'fast_prefill': False}, [], 0, False, .5),
-                 ({'dspark': 0, 'fast_prefill': False}, ['--dspark', '7', '--fast_prefill'], 7, True, .5)]
+                 ({'speculative_dspark_confidence_threshold': .5}, [], 5, True, .5),
+                 ({'speculative_dspark_confidence_threshold': .5},
+                  ['--speculative-dspark-confidence-threshold', '0'], 5, True, 0),
+                 ({'speculative_dspark_confidence_threshold': 0},
+                  ['--speculative_dspark_confidence_threshold', '.5'], 5, True, .5),
+                 ({}, ['--speculative_algorithm', 'off', '--no_fast_prefill'], 0, False, 0),
+                 ({'dspark': 0, 'fast_prefill': False}, [], 0, False, 0),
+                 ({'dspark': 0, 'fast_prefill': False}, ['--dspark', '7', '--fast_prefill'], 7, True, 0)]
         for saved, cli, drafts, fast, threshold in cases:
             with self.subTest(saved=saved, cli=cli), tempfile.TemporaryDirectory() as d:
                 Path(d, 'config.json').write_text(json.dumps({'model_type': 'deepseek_v41',
@@ -923,6 +932,40 @@ class AutoConfigTest(unittest.TestCase):
                         patch.dict(sys.modules, {'ftllm': types.SimpleNamespace(llm=runtime)}), \
                         patch.dict(os.environ, {}, clear=True), redirect_stdout(io.StringIO()):
                     self.assertIs(make_normal_llm_model(a), model)
+
+    def test_deepseek_gguf_auto_threshold_reaches_external_draft_runtime(self):
+        class Planned(Exception):
+            pass
+
+        for cli, threshold in [([], 0), (['--speculative-dspark-confidence-threshold', '.5'], .5)]:
+            with self.subTest(cli=cli), tempfile.TemporaryDirectory() as d:
+                target, draft = Path(d, 'target.gguf'), Path(d, 'draft.gguf')
+                target.touch()
+                draft.touch()
+                a = make_normal_parser('test').parse_args(
+                    [str(target), '--auto', '--draft', str(draft), '--draft_tokens', '5', *cli])
+                config = {'model_type': 'deepseek_v41', 'gguf_architecture': 'deepseek41'}
+                draft_config = {'dspark_block_size': 5, 'dspark_target_layer_ids': [2, 3],
+                                'dspark_noise_token_id': 100}
+
+                def resolve(args, query):
+                    self.assertEqual(args.dspark, 5)
+                    self.assertEqual(args.speculative_algorithm, 'dspark')
+                    self.assertEqual(args.speculative_dspark_confidence_threshold, threshold)
+                    self.assertEqual(os.environ['FASTLLM_DSPARK_TOKENS'], '5')
+                    self.assertEqual(args.speculative_draft_model_path, str(draft))
+                    self.assertEqual(float(os.environ['FASTLLM_DSPARK_CONFIDENCE_THRESHOLD']), threshold)
+                    raise Planned
+
+                with patch('fastllm_pytools.util.read_gguf_metadata',
+                           return_value={'general.architecture': 'dflash'}), \
+                        patch('fastllm_pytools.util.get_gguf_model_config', return_value=config), \
+                        patch('fastllm_pytools.deepseek_v41_gguf.dspark_config', return_value=draft_config), \
+                        patch.object(auto, 'resolve', side_effect=resolve), \
+                        patch.dict(sys.modules, {'ftllm': types.SimpleNamespace(llm=MagicMock())}), \
+                        patch.dict(os.environ, {}, clear=True), redirect_stdout(io.StringIO()):
+                    with self.assertRaises(Planned):
+                        make_normal_llm_model(a)
 
     def streaming_fixture(self):
         self.g.context = 262144
