@@ -559,6 +559,31 @@ class AutoConfigTest(unittest.TestCase):
         self.assertEqual(p['threads'], 6)
         self.assertEqual(p['automatic']['cpu_thread_benchmark'], detail)
 
+    def test_v41_packed_fp4_and_exl3_use_native_numa_batches(self):
+        from fastllm_pytools import cpu_tuning
+        self.g.family, self.g.hidden, self.g.intermediate, self.g.topk = 'deepseek_v41', 5120, 2304, 6
+        for kind, scale_kind, block in ((1009, 'F8_E8M0', 32), (-1, 'F8_E4M3', 16), (-6, None, None)):
+            tensors = []
+            for part, rows, columns in (('w1', 2304, 5120), ('w2', 5120, 2304)):
+                name = 'layers.0.ffn.experts.0.' + part + '.weight'
+                if scale_kind:
+                    tensors.extend([memory.Tensor(name, (rows, columns//2), rows*columns//2, 'I8'),
+                                    memory.Tensor(name[:-len('.weight')] + '.scale',
+                                                  (rows, columns//block), rows*columns//block, scale_kind)])
+                else:
+                    tensors.append(memory.Tensor(name, (rows, columns), rows*columns*3//8 + 2*(rows+columns), 'EXL3'))
+            for batch, drafts in ((1, 0), (1, 5), (4, 5), (8, 7)):
+                args = self.args('--max_batch', str(batch), '--dspark', str(drafts))
+                with self.subTest(kind=kind, batch=batch, drafts=drafts), \
+                        patch.object(memory, 'model_inputs', return_value=({'model_type': 'deepseek_v41'}, tensors, self.g)), \
+                        patch.object(auto, 'cpu_threads', return_value=124), \
+                        patch.dict(os.environ, {}, clear=True), \
+                        patch.object(cpu_tuning, 'select_threads', side_effect=RuntimeError('dispatch')) as calibrate:
+                    with self.assertRaisesRegex(RuntimeError, 'dispatch'):
+                        auto.resolve(args, self.gpu.__getitem__, hardware=self.hardware, ram=self.ram, use_numa=True)
+                calibrate.assert_called_once_with(5120, 2304, kind, 124,
+                                                 numa=True, rows=batch*(drafts+1), topk=6)
+
     def test_explicit_parameters_override_policy_even_when_equal_to_defaults(self):
         a = self.args('--device', 'cuda:1', '--tp', 'off', '--moe_cuda_cache', '0',
                       '--moe_cpu_cache', '0', '--moe_device_layers', '-1', '--ngram_device', 'cpu',

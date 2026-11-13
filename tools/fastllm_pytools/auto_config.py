@@ -514,8 +514,9 @@ def standard_moe_calibration_pair(tensors, model):
             pairs[pair] = pairs.get(pair, 0) + gate.bytes + up.bytes + down.bytes
     if pairs:
         return max(pairs, key=pairs.get)
-    # Native NVFP4 E4M3 has a separate host arithmetic/packing adapter.
-    nvfp4 = set()
+    # Keep block-16 E4M3 and block-32 E8M0 encodings distinct. The latter
+    # uses the native NVFP4_BLOCK_32_E8M0 probe (1009), not a GGUF type.
+    packed_fp4 = {-1: set(), 1009: set()}
     for weight in tensors:
         if (weight.kind not in ('U8', 'I8') or not weight.name.endswith('.weight') or
                 not memory._is_routed_expert(weight.name) or len(weight.shape) < 2):
@@ -523,10 +524,13 @@ def standard_moe_calibration_pair(tensors, model):
         prefix = weight.name[:-len('.weight')]
         scale = next((by_name[n] for n in (weight.name + '_scale_inv', weight.name + '_scale',
                      prefix + '.scale_inv', prefix + '.scale') if n in by_name), None)
-        if (scale and scale.kind == 'F8_E4M3' and len(scale.shape) == len(weight.shape) and
-                scale.shape[:-1] == weight.shape[:-1] and scale.shape[-1] * 8 == weight.shape[-1]):
-            nvfp4.add(weight.shape[-1] * 2)
-    return (-1, -1) if {model.hidden, model.intermediate} <= nvfp4 else None
+        if not (scale and len(scale.shape) == len(weight.shape) and scale.shape[:-1] == weight.shape[:-1]):
+            continue
+        for probe, scale_kind, ratio in ((-1, 'F8_E4M3', 8), (1009, 'F8_E8M0', 16)):
+            if scale.kind == scale_kind and scale.shape[-1] * ratio == weight.shape[-1]:
+                packed_fp4[probe].add(weight.shape[-1] * 2)
+    return next(((probe, probe) for probe, columns in packed_fp4.items()
+                 if {model.hidden, model.intermediate} <= columns), None)
 
 
 _QWEN_HYBRID_ENV = (
@@ -648,11 +652,17 @@ def _resolve_impl(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
         # selection; a generic padded Q4_K GEMV undersizes the hybrid pool.
         # Other model/hardware policies retain their original calibration.
         pair = (standard_moe_calibration_pair(tensors, model)
-                if use_numa_calibration and hybrid_defaults else None)
+                if use_numa_calibration and (hybrid_defaults or model.family == "deepseek_v41") else None)
+        if model.family == "deepseek_v41" and pair not in ((-1, -1), (1009, 1009)):
+            pair = None  # The existing V4.1 GGUF probe uses its dominant encoding.
+        # Native NVFP4 uses the same packed weights with the model's own
+        # activation/SwiGLU profile, rather than a Q4_K GEMV approximation.
+        numa_calibration = numa_calibration or (
+            use_numa_calibration and model.family == "deepseek_v41" and pair in ((-1, -1), (1009, 1009)))
         kind = pair[0] if pair else int(dominant[5:]) if numa_calibration else (16 if 'gguf:16' in kinds else 12)
         workload = ({"numa": True, "rows": max(1, base.max_batch) * (max(base.mtp, base.dspark) + 1),
                      "topk": model.topk} if numa_calibration or pair else {})
-        if pair:
+        if pair and model.family != "deepseek_v41":
             workload['down_type'] = pair[1]
         probes = {}
         for tensor in tensors:
@@ -661,7 +671,8 @@ def _resolve_impl(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
                 probes[probe] = probes.get(probe, 0) + tensor.bytes
         if probes:
             kind = max(probes, key=probes.get)
-            workload = {}
+            workload = ({"numa": True, "rows": max(1, base.max_batch) * (max(base.mtp, base.dspark) + 1),
+                         "topk": model.topk} if use_numa_calibration and model.family == "deepseek_v41" else {})
         base.threads, base._cpu_thread_benchmark = select_threads(
             model.hidden, model.intermediate, kind, base.threads, **workload)
     # Dense Qwen3's graph warmup currently hits stream-capture-unsupported

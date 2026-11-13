@@ -83,6 +83,54 @@ class CpuTuningTest(unittest.TestCase):
         self.assertEqual(chosen, 28)
         self.assertEqual(detail['fallback'], 'ValueError')
 
+    def test_budget_limited_numa_sweep_keeps_measured_large_counts(self):
+        result = {'samples_ms': {'124': 2, '64': 1, '32': 1.03},
+                  'measurement_order': 'descending', 'budget_exhausted': True,
+                  'unmeasured_threads': [2, 4, 8, 16]}
+        with patch.object(tuning, 'numa_node_count', return_value=2), \
+                patch.object(tuning, '_measure', return_value=result):
+            chosen, detail = tuning.select_threads(5120, 2304, 17, 124, numa=True, rows=48, topk=6)
+        self.assertEqual(chosen, 32)
+        self.assertNotIn('fallback', detail)
+        self.assertTrue(detail['budget_exhausted'])
+
+    def test_budget_limited_sweep_cannot_skip_an_unmeasured_large_count(self):
+        result = {'samples_ms': {'124': 2, '32': 1},
+                  'measurement_order': 'descending', 'budget_exhausted': True,
+                  'unmeasured_threads': [2, 4, 8, 16, 64]}
+        with patch.object(tuning, 'numa_node_count', return_value=2), \
+                patch.object(tuning, '_measure', return_value=result):
+            chosen, detail = tuning.select_threads(5120, 2304, 17, 124, numa=True, rows=48, topk=6)
+        self.assertEqual(chosen, 124)
+        self.assertEqual(detail['fallback'], 'ValueError')
+
+    def test_worker_failures_preserve_actionable_diagnostics(self):
+        error = subprocess.CalledProcessError(-11, ['worker'], output='binding workers',
+                                             stderr='native shard setup failed')
+        with patch.object(tuning, '_measure', side_effect=error):
+            chosen, detail = tuning.select_threads(5120, 2304, 17, 124)
+        self.assertEqual(chosen, 124)
+        self.assertEqual(detail['returncode'], -11)
+        self.assertIn('native shard setup failed', detail['stderr_tail'])
+        self.assertEqual(detail['stdout_tail'], 'binding workers')
+        self.assertIn('error', detail)
+
+    def test_timeout_diagnostics_accept_bytes_and_bound_log_size(self):
+        error = subprocess.TimeoutExpired('worker', 10, output=b'x' * 4096,
+                                          stderr=b'last native diagnostic')
+        with patch.object(tuning, '_measure', side_effect=error):
+            _, detail = tuning.select_threads(5120, 2304, 17, 124)
+        self.assertEqual(len(detail['stdout_tail']), 2048)
+        self.assertEqual(detail['stderr_tail'], 'last native diagnostic')
+
+    def test_numa_batch_is_not_truncated_to_a_fixed_row_limit(self):
+        for rows in (1, 6, 24, 48, 257):
+            with self.subTest(rows=rows), patch.object(tuning, 'numa_node_count', return_value=2), \
+                    patch.object(tuning, '_measure', return_value={'samples_ms': {'2': 1, '4': .5}}) as probe:
+                _, detail = tuning.select_threads(5120, 2304, -6, 4, numa=True, rows=rows, topk=6)
+            probe.assert_called_once_with(5120, 2304, -6, (2, 4), rows, 6)
+            self.assertEqual(detail['rows'], rows)
+
     def test_invalid_candidate_requires_fallback(self):
         for invalid in (0, -1, float('inf'), float('nan')):
             result = {'samples_ms': {'1': 4, '2': 2, '4': invalid}}
@@ -172,6 +220,15 @@ class CpuTuningTest(unittest.TestCase):
             tuning._worker(json.dumps([5120, 2304, 16, [1, 2], 1000, 0, 1]))
         self.assertEqual(json.loads(output.getvalue())['samples_ms'], value['samples_ms'])
         cdll.assert_called_once_with(str(library))
+
+    def test_worker_propagates_native_error_instead_of_empty_samples(self):
+        native = Mock()
+        native.benchmark_cpu_moe_threads.return_value = b'{"error":"unsupported MoE calibration shard shape"}'
+        with patch('ctypes.CDLL', return_value=native), \
+                patch.object(Path, 'glob', return_value=[Path('/native/libfastllm_tools.so')]), \
+                patch.dict(tuning.os.environ, {}, clear=True):
+            with self.assertRaisesRegex(ValueError, 'unsupported MoE calibration shard shape'):
+                tuning._worker(json.dumps([5120, 2304, 17, [2, 4], 1000, 48, 6]))
 
 
 if __name__ == '__main__':

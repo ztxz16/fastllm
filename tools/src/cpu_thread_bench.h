@@ -82,6 +82,8 @@ static std::string BenchmarkCpuExl3Threads(int hidden, int intermediate, int bit
 // synthetic weights and cache state do not affect the inference process.
 static std::string BenchmarkCpuLinearThreads(int hidden, int intermediate, int kind,
                                             const int *counts, int count, int budgetMs) {
+    if (kind == -1 || kind == fastllm::NVFP4_BLOCK_32_E8M0)
+        throw std::runtime_error("packed FP4 thread calibration requires the NUMA MoE probe");
     if (kind < 0) return BenchmarkCpuExl3Threads(hidden, intermediate, -kind, counts, count, budgetMs);
     using namespace fastllm;
     using Clock = std::chrono::steady_clock;
@@ -165,7 +167,10 @@ static std::string BenchmarkCpuMoeThreads(int hidden, int intermediate, int kind
     using Clock = std::chrono::steady_clock;
     const auto started = Clock::now();
     auto elapsed = [&] { return std::chrono::duration<double, std::milli>(Clock::now() - started).count(); };
-    const bool nvfp4 = standard && kind == -1 && downKind == -1;
+    const bool nvfp4 = kind == -1 && (downKind == -1 || downKind == -2);
+    const bool mxfp4 = kind == NVFP4_BLOCK_32_E8M0 && (downKind == kind || downKind == -2);
+    const bool exl3 = kind < -1;
+    const int exl3Bits = -kind;
     const auto type = static_cast<ggml_type>(kind);
     const auto downType = static_cast<ggml_type>(downKind == -2 ? kind : downKind);
     auto supported = [&](ggml_type t) {
@@ -181,15 +186,22 @@ static std::string BenchmarkCpuMoeThreads(int hidden, int intermediate, int kind
         default: return false;
         }
     };
-    if (!nvfp4 && (!supported(type) || !supported(downType)))
+    if (!nvfp4 && !mxfp4 && !exl3 && (!supported(type) || !supported(downType)))
         throw std::runtime_error("unsupported MoE calibration format");
+    if (exl3 && (!Exl3BitRateSupported(exl3Bits) || hidden % 128 || intermediate % 128))
+        throw std::runtime_error("unsupported EXL3 MoE calibration shape/bitrate");
+    // Bound scratch by bytes, never truncate the requested verifier batch.
+    if (double(rows) * hidden * (topk + 2) * sizeof(float) > (512ull << 20))
+        throw std::runtime_error("NUMA calibration activation/output scratch exceeds 512 MiB");
     SetThreads(counts[count - 1]);
     const int nodes = GetNumasMoeShardCount();
-    if (nodes < 1 || hidden % (nvfp4 ? 16 : ggml_blck_size(type)) ||
-        intermediate % (nvfp4 ? 16 : ggml_blck_size(downType)) ||
+    if (nodes < 1 || hidden % (exl3 ? 128 : mxfp4 ? 32 : nvfp4 ? 16 : ggml_blck_size(type)) ||
+        intermediate % (exl3 ? 128 : mxfp4 ? 32 : nvfp4 ? 16 : ggml_blck_size(downType)) ||
         hidden % (4 * nodes) || intermediate % (4 * nodes))
         throw std::runtime_error("unsupported MoE calibration shard shape");
-    const size_t pairBytes = nvfp4 ? size_t(3) * hidden * intermediate * 9 / 16 :
+    const size_t pairBytes = exl3 ? 2 * Exl3PartBytes(intermediate, hidden, exl3Bits) +
+        Exl3PartBytes(hidden, intermediate, exl3Bits) : mxfp4 ? size_t(3) * hidden * intermediate * 17 / 32 :
+        nvfp4 ? size_t(3) * hidden * intermediate * 9 / 16 :
         ggml_row_size(type, hidden) * (2 * intermediate) + ggml_row_size(downType, intermediate) * hidden;
     // Rotate a substantial expert set instead of repeatedly timing one hot GEMV.
     const int experts = std::max(topk, std::min(standard ? 256 : 64, int(((512ull << 20) + pairBytes - 1) / pairBytes)));
@@ -207,15 +219,32 @@ static std::string BenchmarkCpuMoeThreads(int hidden, int intermediate, int kind
         const int weightRows = part ? hidden : 2 * intermediate;
         const auto weightType = part ? downType : type;
         std::unique_ptr<Data> w;
-        if (nvfp4) {
-            w = std::make_unique<Data>(NVFP4_BLOCK_16_E4M3, std::vector<int>{weightRows, columns});
-            w->blockK = 1; w->blockM = 16;
+        if (exl3) {
+            w = std::make_unique<Data>(EXL3);
+            w->blockK = exl3Bits; w->blockM = part ? 1 : 2;
+            w->Resize({weightRows, columns}); w->Allocate(false);
+            const int n = part ? hidden : intermediate;
+            const size_t trellis = size_t(columns) * n * exl3Bits / 16;
+            const size_t stride = Exl3PartBytes(n, columns, exl3Bits);
+            uint32_t random = 9127 + expert * 2 + part;
+            for (int projection = 0; projection < w->blockM; ++projection) {
+                auto *data = w->cpuData + projection * stride;
+                for (size_t at = 0; at < trellis; at += 4) {
+                    random = random * 1664525u + 1013904223u;
+                    std::memcpy(data + at, &random, sizeof(random));
+                }
+                std::fill_n(reinterpret_cast<uint16_t *>(data + trellis), columns + n, uint16_t(0x2800));
+            }
+        } else if (nvfp4 || mxfp4) {
+            w = std::make_unique<Data>(mxfp4 ? NVFP4 : NVFP4_BLOCK_16_E4M3,
+                std::vector<int>{weightRows, columns});
+            w->blockK = 1; w->blockM = mxfp4 ? 32 : 16;
             w->Allocate();
             const size_t packed = GetNVFP4WeightBytes(weightRows, columns);
             for (size_t byte = 0; byte < packed; ++byte)
                 w->cpuData[byte] = uint8_t(0x21 + (byte + expert) % 6);
-            std::memset(w->cpuData + packed, 0x30, size_t(weightRows) * columns / 16);
-            w->scales = part ? std::vector<float>{.03125f} : std::vector<float>{.03125f, .0625f};
+            std::memset(w->cpuData + packed, mxfp4 ? 0x78 : 0x30, size_t(weightRows) * columns / w->blockM);
+            if (nvfp4) w->scales = part ? std::vector<float>{.03125f} : std::vector<float>{.03125f, .0625f};
         } else {
             w = std::make_unique<Data>(DATA_GGUF_FORMAT, weightType, std::vector<int>{weightRows, columns});
             // Standard host inference uses the NUMA backend's normal packing.
@@ -250,8 +279,8 @@ static std::string BenchmarkCpuMoeThreads(int hidden, int intermediate, int kind
         input[i] = uint16_t(bits >> 16); // exactly representable BF16 and FP16 values
         standardInput[i] = value;
     }
-    std::vector<int32_t> indices(rows * topk), gpuIndices(rows * topk, -1);
-    std::vector<float> scores(rows * topk, 1.f / topk);
+    std::vector<int32_t> indices(size_t(rows) * topk), gpuIndices(size_t(rows) * topk, -1);
+    std::vector<float> scores(size_t(rows) * topk, 1.f / topk);
     std::vector<float> output(size_t(rows) * topk * hidden), reference;
     auto pass = [&](int step) {
         for (int row = 0; row < rows; ++row) for (int k = 0; k < topk; ++k)
@@ -263,24 +292,22 @@ static std::string BenchmarkCpuMoeThreads(int hidden, int intermediate, int kind
     };
     const double setupMs = elapsed();
     std::ostringstream samples;
-    bool first = true;
+    bool first = true, exhausted = false;
     double maxL2 = 0;
-    int nextStep = 1;
     for (int i = 0; i < count; ++i) {
         const int threads = counts[i];
         if (threads < nodes || threads % nodes || (i && threads <= counts[i - 1]))
             throw std::runtime_error("invalid NUMA thread candidate");
+    }
+    std::vector<int> measured;
+    std::ostringstream sampleCounts;
+    // Cover wide pools first: slow tiny pools must not consume the whole
+    // budget before any plausible full-model configuration is measured.
+    for (int i = count - 1; i >= 0; --i) {
+        const int threads = counts[i];
+        if (elapsed() - setupMs >= budgetMs) { exhausted = true; break; }
         SetThreads(threads);
         pass(0); // bind resized workers and warm dispatch outside the timer
-        std::vector<double> times;
-        for (int repeat = 0; repeat < 5; ++repeat) {
-            if (elapsed() - setupMs >= budgetMs)
-                throw std::runtime_error("incomplete NUMA calibration samples");
-            const auto begin = Clock::now();
-            pass(standard ? nextStep++ : repeat + 1);
-            times.push_back(std::chrono::duration<double, std::milli>(Clock::now() - begin).count());
-        }
-        if (standard) pass(0); // same untimed correctness probe at every thread count
         double error = 0, norm = 0, outputNorm = 0;
         for (size_t j = 0; j < output.size(); ++j) {
             if (!std::isfinite(output[j])) throw std::runtime_error("nonfinite NUMA calibration output");
@@ -295,20 +322,41 @@ static std::string BenchmarkCpuMoeThreads(int hidden, int intermediate, int kind
         const double l2 = std::sqrt(error / std::max(norm, 1e-30));
         if (l2 > 1e-6) throw std::runtime_error("NUMA thread count changed calibration output");
         maxL2 = std::max(maxL2, l2);
+        std::vector<double> times;
+        for (int repeat = 0; repeat < 3; ++repeat) {
+            if (elapsed() - setupMs >= budgetMs) { exhausted = true; break; }
+            const auto begin = Clock::now();
+            pass(repeat + 1); // identical rotating routes for every candidate
+            times.push_back(std::chrono::duration<double, std::milli>(Clock::now() - begin).count());
+        }
+        if (times.empty()) break;
         std::sort(times.begin(), times.end());
-        if (!first) samples << ',';
+        if (!first) { samples << ','; sampleCounts << ','; }
         first = false;
         samples << '"' << threads << "\":" << times[times.size() / 2];
+        sampleCounts << '"' << threads << "\":" << times.size();
+        measured.push_back(threads);
     }
+    std::ostringstream unmeasured;
+    for (int i = 0; i < count - int(measured.size()); ++i) {
+        if (i) unmeasured << ',';
+        unmeasured << counts[i];
+    }
+    const char *format = exl3 ? "exl3" : mxfp4 ? "mxfp4_e8m0" : nvfp4 ? "nvfp4_e4m3" : ggml_type_name(type);
+    const char *downFormat = exl3 ? "exl3" : mxfp4 ? "mxfp4_e8m0" : nvfp4 ? "nvfp4_e4m3" : ggml_type_name(downType);
     std::ostringstream out;
     out << "{\"samples_ms\":{" << samples.str() << "},\"setup_ms\":" << setupMs
+        << ",\"sample_counts\":{" << sampleCounts.str() << "},\"measurement_order\":\"descending\""
+        << ",\"budget_exhausted\":" << (exhausted ? "true" : "false")
+        << ",\"unmeasured_threads\":[" << unmeasured.str() << ']'
         << ",\"native_elapsed_ms\":" << elapsed() << ",\"hidden\":" << hidden
         << ",\"intermediate\":" << intermediate << ",\"numa_nodes\":" << nodes
         << ",\"rows\":" << rows << ",\"topk\":" << topk << ",\"experts\":" << experts
         << ",\"math_profile\":\"" << (standard ? "standard" : "deepseek_v41")
-        << "\",\"gguf_type\":\"" << (nvfp4 ? "nvfp4_e4m3" : ggml_type_name(type))
-        << "\",\"down_type\":\"" << (nvfp4 ? "nvfp4_e4m3" : ggml_type_name(downType))
+        << "\",\"gguf_type\":\"" << format << "\",\"kernel_type\":\"" << format
+        << "\",\"down_type\":\"" << downFormat
         << "\",\"weight_bytes\":" << pairBytes * experts
+        << ",\"twice_bits\":" << (exl3 ? exl3Bits : 0)
         << ",\"thread_output_l2\":" << maxL2 << '}';
     return out.str();
 }
