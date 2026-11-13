@@ -1646,3 +1646,84 @@ bash test/distributed/run_attention_ep_config_v100.sh
 
 阶段 1 的配置检查通过不代表 MoE 权重、数值、Graph 或服务通过；服务器真实枚举结果
 也必须保留在本阶段报告中，再进入阶段 2 的单层验收。
+
+## Attention DP＋EP：MoE 权重与单层（阶段 2）
+
+本阶段增加公开原生 `ProcessGroup::LoadQwenMoe` 和 `ForwardQwenMoeLayer`，
+复用已有 worker、stream、权重读取/FP16 上传及 Attention 算子。**仅交付权重与
+无历史 KV 的单层执行；完整生成、联合请求调度、Graph、Prefix Cache 和 HTTP/SSE
+仍在后续阶段。** CLI 的 `attention_ep_execution_available=false` 保持不变，
+不能把单层验收当成完整模型推理。新增接口声明与现有进程组接口放在同一头文件中。
+
+- 显式选择 `qwen2_moe`，支持 EP=1/2/4，Attention TP=1。Embedding、lm_head、
+  Attention、Router、共享专家及 Norm 完整复制；路由专家按 `expert_id % ep_size`
+  驻留。检查全部权重元数据，仅读取本 rank 的专家 payload。
+- 支持 F16/BF16/F32 未量化源权重，上传为 FP16；支持 QKV bias、无 bias、tied
+  embedding 和 safetensors 索引。拒绝量化、混合稠密/MoE 层、非法 Top-K、缺失
+  或额外张量、部分 QKV bias、非有限权重和设备/CPU 配额不足。
+- Qwen2 MoE Attention 不执行 Q/K Norm，不执行稠密 TP Attention AllReduce。
+  Router 使用全部专家上的 FP32 softmax、Top-K，再按 `norm_topk_prob` 决定是否
+  重归一化，最后转 FP16；相同概率时以较小专家 ID 优先。共享专家按独立 sigmoid
+  门控后与路由贡献相加，最后加残差。
+- 每轮按最大本地 Token 数 padding；三次 AllGather 分别交换归一化激活、专家 ID、
+  路由概率，ID=-1 是无效行掩码。所有 rank 都执行相同集合通信，即使本地没有请求、
+  没有专家或没有命中专家。ReduceScatter 使用 FP32 Sum 返回所属 rank 的贡献。
+- Prefill 在设备建立每专家索引，读回计数后只对有效聚合 Token 调用 cuBLAS。
+  全组每 rank 至多一个 Token 时使用设备路由索引 CUDA 专家内核，不读回路由计数。
+  这只是后续 Decode/Graph 的算子基础，本阶段没有 Graph 捕获或 KV 生命周期。
+- 专家输出和路由乘法按 FP16 舍入，跨专家贡献以 FP32 累加/通信，再转 FP16。
+  不要求与 Transformers 的逐专家 FP16 累加逐位相等，按固定数值容差验收。
+- 每 rank 临时工作区上限 512 MiB；正常单层结束同步释放，模型正常卸载释放全部权重。
+  失败通过现有进程组路径终止所有 worker。Graph、Prefix Cache、custom AllReduce
+  在新加载入口显式拒绝；稠密生成入口也拒绝已加载的 MoE 权重。
+- 单层诊断接口接收各 rank 独立的 FP32 `[T,hidden]` 输入，T=0..2048。
+  控制请求和每 rank 响应分别限 1 MiB；这是诊断传输限制，后续整模型执行应在设备
+  保留激活。返回实际输出、Router logits、Top-K ID/权重、路由/共享专家输出、
+  本 rank 专家 Token 数和通信计数。该接口有诊断读回，不用于性能结论。
+
+模型语义依据固定模型 revision `ec052fda178e241c7c443468d2fa1db6618996be`，
+以及 [Transformers v4.40.0 Qwen2 MoE 实现](https://github.com/huggingface/transformers/blob/v4.40.0/src/transformers/models/qwen2_moe/modeling_qwen2_moe.py#L706)。
+首版实际模型仍为 `Qwen/Qwen1.5-MoE-A2.7B-Chat`；本阶段服务器检查器只接收自动生成的
+小模型，GPU 权重导出限每 rank 32 MiB，避免误把诊断入口用于完整权重导出。
+
+### 服务器验收
+
+无需下载模型。服务器 `master` 包含本阶段提交后，四张 V100、CUDA 12.6 和 NCCL
+环境中执行；**脚本会编译 C++/CUDA，仅供服务器运行**：
+
+```bash
+cd /home/project/vllm_fastllm
+git switch master
+git pull --ff-only origin master
+# 沿用已确认的四卡顺序；未设置时脚本默认 0,1,2,3。
+export ATTENTION_EP_PYTHON=/home/venvs/fastllm-dp/bin/python3
+bash test/distributed/run_qwen_moe_layer_v100.sh
+```
+
+脚本先运行配置/协议及数学参考的 Python 检查、四卡实际分配预览，再编译 worker 和
+检查器。随后回归稠密 Qwen3 的 CPU 权重读取、GPU 上传、单层计算，最后执行 MoE
+1/2/4 rank 的完整矩阵。`ATTENTION_EP_BUILD` 可指定构建目录，`ATTENTION_EP_JOBS`
+可指定构建并发数；不修改用户的 GPU 顺序。
+
+已有正确构建产物时可以单独运行 MoE 检查，不编译：
+
+```bash
+/home/venvs/fastllm-dp/bin/python3 test/distributed/run_qwen_moe_layer.py \
+  --check build-process-tp-cu126/fastllm_moe_layer_check \
+  --worker build-process-tp-cu126/fastllm_tp_worker \
+  --devices 0,1,2,3 --build-cache build-process-tp-cu126/CMakeCache.txt
+```
+
+验收以独立 CPU 完整层数学参考为准，`atol=0.008, rtol=0.008`，不自动放宽。
+每项保存实际 GPU 权重二进制、任务输入、原始 stdout/stderr、完整命令；数值成功比较后
+保存 CPU 中间量。检查所有 rank 的张量清单与逐元素数值，确认没有加载外部专家，
+同时核对 Router、Top-K、专家加权/共享输出、Attention、整层、因果性及重复执行。
+覆盖源 dtype、bias、归一化开关、60 专家/Top-4、小于 rank 数的专家、热点、空闲 rank、
+整组空闲、变长序列、2048/2049 Token、非法配置、加载配额、卸载后调用、重复加载，
+以及成功卸载/重载和有限权重导致的 Router FP16 溢出。默认 33 类用例分别执行
+1/2/4 rank，共 99 项。所有路径仍需服务器真实执行，Python 自测不代表 CUDA 已验证。
+
+每次创建唯一报告目录，生成 Markdown、CSV、JSON、XLSX；展示浮点三位小数，JSON
+保留原始精度，记录误差、失败元素、GPU/CUDA/NCCL、架构、Git、命令和原始样本。
+本阶段是功能检查（warmup=0、iterations=1、repeats=1），不报告性能加速比。
+任一 case 失败返回非零，已执行部分仍生成报告。服务器全部通过后才推进阶段 3。
