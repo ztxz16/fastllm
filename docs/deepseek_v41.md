@@ -31,9 +31,11 @@ ftllm server /path/to/model-00001-of-00002.gguf --auto \
 
 自动模式默认单请求、最多 1M 原生窗口、FP4 KV 和快速 Prefill。带内置 DSpark 权重时默认使用 DSpark 5；没有草稿权重的 GGUF 不会自动开启。设备、chunk 和专家缓存以 `[auto]` 日志为准。显卡和主存能容纳专家时优先避免磁盘专家，Engram 仍可独立使用磁盘。
 
-对于 SM120 上的单卡、单请求 HF 原生 FP4 模型，`--auto` 在 DSpark 1–7、CPU/NUMA 专家缓存开启且当前 Python 环境可用 Triton 时，自动选择 MXFP4 grouped MoE。当前形状范围是 hidden 5120、MoE intermediate 2304、主模型 top-6、草稿 top-3、SwiGLU limit 10，以及 block-32 UE8M0 专家权重。只自动启用该算子；SM121 可手动使用 `--triton`，暂不自动启用。
+`--auto` 默认启用 `--kernel-tune quick`，在实际算子形状首次预热时校验并选择已注册的合法候选，包含普通/分组投影及专家计算；适用于单请求和并发，不按某个固定行数强制选择 Triton。不支持的架构或格式保留原实现。使用 `--kernel-tune off` 可关闭，详见[算子注册与预热选择](kernel-policy.md)。
 
-启动日志会显示 `SM120 MXFP4 grouped MoE enabled automatically`。单张可见 GPU 且现有专家缓存预算允许时，缓存策略优先容纳完整草稿专家。算子不支持当前输入或编译／加载失败时回退到原 CUDA 实现。设置 `FASTLLM_CUDA_TRITON_MXFP4_GROUPED=0` 可关闭该算子，`FASTLLM_CUDA_TRITON=0` 可关闭 Triton 自动选择；显式环境设置优先。
+显式使用 `--kernel-tune off` 时，仍保留原有 SM120 单卡、单请求 HF 原生 FP4 自动路径：DSpark 1–7、CPU/NUMA 专家缓存开启且当前 Python 环境可用 Triton 时，自动选择 MXFP4 grouped MoE。此兼容路径的形状范围是 hidden 5120、MoE intermediate 2304、主模型 top-6、草稿 top-3、SwiGLU limit 10，以及 block-32 UE8M0 专家权重。它只自动启用该算子，SM121 不自动启用此兼容路径。
+
+此兼容路径的启动日志会显示 `SM120 MXFP4 grouped MoE enabled automatically`。单张可见 GPU 且现有专家缓存预算允许时，缓存策略优先容纳完整草稿专家。算子不支持当前输入或编译／加载失败时回退到原 CUDA 实现。设置 `FASTLLM_CUDA_TRITON_MXFP4_GROUPED=0` 可关闭该算子，`FASTLLM_CUDA_TRITON=0` 可关闭 Triton 自动选择；显式环境设置优先。
 
 上下文长度和内存预算允许时，自动规划先保证 chunk 1024，再争取每卡 3 GiB 专家缓存，之后按预计延迟选择更大的 chunk 或缓存。流式 GGUF 磁盘专家路径优先争取 chunk 4096。预算不足时允许缩小 chunk，显式指定的 chunk 和缓存参数仍优先。
 
@@ -48,6 +50,8 @@ ftllm server /path/to/model-00001-of-00002.gguf --auto \
 | 使用 5 个内置 DSpark 草稿 | `--dspark 5`，需要对应草稿权重 |
 | 调整 DSpark 阈值 | `--speculative_dspark_confidence_threshold 0.5`；`0` 关闭阈值 |
 | 开启 / 关闭快速 Prefill | `--fast_prefill` / `--no_fast_prefill` |
+| 关闭算子自动测速 | `--kernel-tune off`；删除此参数恢复 `quick` |
+| 强制启用 / 禁止低显存模式 | `--low_gpu_mem` / `--no-low-gpu-mem`；删除参数恢复自动规划 |
 
 如果需要突破自动检测的主存上限，可改用 `--force_ddr_limit 114g`：最终按 114 GiB 规划，不再扣除 CMA 或自动预留。它与 `--auto_host_memory_limit` 互斥，仅影响规划，不改变系统／容器硬限制；详见[主存预算说明](hybrid-auto.md)。
 

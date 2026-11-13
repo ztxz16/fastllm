@@ -95,9 +95,18 @@ class KernelPolicy:
         return report
 
 
+def resolve_mode(args):
+    """Resolve an omitted mode without overriding explicit CLI/JSON choices."""
+    mode = getattr(args, "kernel_tune", None)
+    if mode is None:
+        mode = "quick" if getattr(args, "auto", False) else "off"
+    args.kernel_tune = mode
+    return mode
+
+
 def configure(args):
     global _active
-    mode = getattr(args, "kernel_tune", "off")
+    mode = resolve_mode(args)
     policy = getattr(args, "kernel_policy", "")
     profile = getattr(args, "kernel_profile", "")
     if mode == "off":

@@ -20,6 +20,10 @@ GiB = 1 << 30
 
 class AutoConfigTest(unittest.TestCase):
     def setUp(self):
+        # These fixtures mock model loading and do not load the kernel runtime.
+        kernels = patch('fastllm_pytools.kernel_policy.configure', return_value=None)
+        kernels.start()
+        self.addCleanup(kernels.stop)
         self.g = memory.Geometry('qwen4', 4, 65536, 128, 8, 2, 64,
                                  [1024] * 4, [1 << 20] * 4, 4, 1024, 1024)
         self.costs = ([GiB] * 4, [1 << 20] * 4, 1 << 20, 1 << 20, GiB, False)
@@ -1053,8 +1057,7 @@ class AutoConfigTest(unittest.TestCase):
             self.resolve(a)
             self.assertEqual(a.low_gpu_mem, extra == ('--low_gpu_mem',))
             self.assertEqual(a.cuda_embedding, extra == ('--cuda_embedding',))
-        a = self.args(*options)
-        a._auto_explicit.append('low_gpu_mem')  # an explicit JSON false is an opt-out
+        a = self.args(*options, '--no-low-gpu-mem')
         self.resolve(a)
         self.assertFalse(a.low_gpu_mem)
 

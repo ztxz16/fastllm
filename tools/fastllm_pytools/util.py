@@ -1007,8 +1007,12 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('-p', '--path', type = str, required = False, default = '', help = '模型路径，fastllm模型文件或HF模型文件夹')
     parser.add_argument('-t', '--threads', type = int, default = -1,  help = '线程数量')
     parser.add_argument('-l', '--low', action = 'store_true', help = '是否使用低内存模式')
-    parser.add_argument('--low_gpu_mem', action = 'store_true',
+    gpu_memory_mode = parser.add_mutually_exclusive_group()
+    gpu_memory_mode.add_argument('--low_gpu_mem', action = 'store_true', default=False,
                         help = '降低显存占用：强制关闭CUDA embedding和GPU token handoff，保留原有CUDA Graph策略；优先于--cuda_embedding及handoff环境变量')
+    gpu_memory_mode.add_argument('--no-low-gpu-mem', '--no_low_gpu_mem',
+                        dest='low_gpu_mem', action='store_false', default=False,
+                        help='禁止自动选择低显存模式；保留正常CUDA embedding和GPU token handoff策略，并按实际显存需求规划')
     parser.add_argument('--dtype', type = str, default = "auto", help = '权重类型（读取HF模型时有效；auto默认使用float16，带缩放因子的FP8源权重保持FP8）')
     parser.add_argument('--moe_dtype', type = str, default = "", help = 'MOE层使用的权重类型（读取HF模型时有效）')
     parser.add_argument('--moe_atype', type = str, default = "", help = 'MOE层激活类型，可使用auto、float32、float16或bfloat16')
@@ -1022,8 +1026,8 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--kvmem', type=str, default=None,
                         help='启用主机 KV 缓存；JSON 参数，如 {"max_tokens":32768,"retrieval_interval":64}。默认关闭（--auto 可按预算启用 Qwen4 精确换页），Qwen3/3.5 单请求稀疏检索；Qwen4/QSA 混合推理精确换页；MiMo/Naive CUDA TP 支持多请求精确 DSA KV 缓存，需先设置 --max_batch')
     parser.add_argument('--kv_cache_limit', type = str, default = "auto",  help = 'kv缓存最大使用量')
-    parser.add_argument('--kernel-tune', choices=('off', 'quick', 'cache'), default='off',
-                        help='Kernel selection: legacy, bounded warmup measurement, or cached plans')
+    parser.add_argument('--kernel-tune', choices=('off', 'quick', 'cache'), default=None,
+                        help='Kernel selection: off, bounded warmup measurement (quick), or cached plans; default quick with --auto, otherwise off')
     parser.add_argument('--kernel-policy', default='', help='JSON kernel policy: budget_ms, max_l2, force, deny')
     parser.add_argument('--kernel-profile', default='', help='Read/write measured kernel profile JSON')
     parser.add_argument('--max_batch', type = int, default = -1,  help = '每次最多同时推理的询问数量')
@@ -1229,6 +1233,10 @@ def make_normal_llm_model(args, startup_progress = None):
 
     if getattr(args, "autotune", False):
         args.auto = True
+
+    # Resolve after saved JSON/CLI precedence, before model-specific fast paths.
+    from .kernel_policy import resolve_mode
+    resolve_mode(args)
 
     if getattr(args, "engram_path", None):
         os.environ["FASTLLM_DSV41_ENGRAM_PATH"] = os.path.abspath(os.path.expanduser(args.engram_path))
