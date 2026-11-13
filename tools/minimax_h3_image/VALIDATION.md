@@ -720,3 +720,155 @@ then quantized model integration with its tests/API/docs. A release wheel and
 maximum-reference workloads remain untested. Build commands, regression logs,
 before/after output hashes, environment/kernel audits and the cleanup patch are
 in `quantized-cleanup-20261112` under the pro5000 image experiment directory.
+
+## Initial native GGUF image support (2026-11-13)
+
+All five Abiray image variants (Q2_K, Q3_K_M, Q4_K_S, Q4_K_M and Q5_K_M)
+were downloaded at revision `fec7ec774db49d0c785bdc2174a488576b7396dd`.
+Their 53,012,508,800 bytes match the upstream LFS SHA-256 hashes. Downloads
+are separate from the original base and safetensors; those files were not modified.
+
+An independent bounded GGUF reader validates metadata, tensor shapes, block
+sizes, offsets and the image-specific six-step PDD schedule. All 208 projections
+in the main and token-refiner blocks use GGUF. Comfy QKV/FC1 layouts were checked
+against original BF16 rows. Protected/non-projection tensors, PDD heads, text
+encoder and VAE still use the matching original base. CUDA decodes compressed
+weights into at most 56 MiB of temporary BF16 storage, followed by cuBLAS FP32
+accumulation. There is no persistent expanded weight cache, second weight
+quantization, Torch runtime, or new precision/environment option. Existing
+safetensors backends retain their math and format enum values.
+
+Validation used a separate CUDA 13 build on RTX PRO 5000 Blackwell (SM120):
+
+- Image/video libraries, CLIs and servers build; all 14 relevant CTests pass.
+  GGUF CUDA memcheck reports zero errors. Parser rejection, ten tensor types,
+  the 2048-row chunk boundary, output slices and cache release are covered.
+- An independent gguf-py 0.19.0/NumPy oracle checks ten synthetic types and
+  three projection samples from each of the five real checkpoints. All 25
+  decoded BF16 comparisons have relative L2 error zero. This measures decoder
+  agreement, not quantization error relative to the original model.
+- Launcher media tests pass 20 cases with one optional browser case skipped,
+  including direct GGUF file selection. JS/Python/JSON and whitespace checks pass.
+- Seven whole-model GGUF cases produce 14 full-size 2048-square PNGs: all five
+  variants generate, and Q4_K_M edits on one and two GPUs. Both requests within
+  each case are byte-identical. Dual GPU uses text TP2 and DiT SP2.
+- All 24 FP8/INT8/NVFP4 regression PNGs match the preceding build byte-for-byte.
+  BF16 generation/editing each run twice on the old and new builds; the eight
+  outputs match between builds.
+- The GGUF HTTP service recovers from deliberate GPU budget exhaustion and
+  cancellation, then completes two-reference 256-square editing. Demo content,
+  health format and PNG retrieval pass. At 3 GiB GPU / 2 GiB host settings,
+  sampled GPU peak is 2557 MiB and peak RSS is 847.38 MiB.
+
+Functional timing samples include one cold and one warm request per GGUF case.
+Q4_K_M warm generation/editing take 6.537394/18.661272 seconds on one GPU;
+dual-GPU editing takes 10.010974 seconds. These are single warm samples, not
+statistical benchmarks, and no new SGLang comparison was performed.
+
+Q3_K_M, Q4_K_S, Q4_K_M and Q5_K_M sample images look normal. Q2_K produces
+severe noise and detail loss despite passing the decoder oracle; its quality is
+not accepted. The cause has not been independently reproduced in another
+whole-model backend. Start with Q4_K_M; these samples do not establish quality
+across prompts. Other physical GPUs, older CUDA, release wheels, maximum-reference
+workloads, arbitrary auxiliary fine-tunes and GGUF text encoders are not covered.
+
+Downloads, hashes, commands, oracle fixtures, regression
+logs, sample timings, source patch and build dependency records are retained in
+`gguf-native-20261113` under the pro5000 image experiment directory.
+
+## Reused GGUF MMQ and automatic dispatch (2026-11-13)
+
+The image backend now reuses the existing GGUF Q8 activation packing and
+`mul_mat_q_xy` INT8 Tensor Core kernels for Q4_0, Q8_0 and Q2_K through Q6_K.
+The shared quantizer was extracted without changing its arithmetic; its original
+LLM translation unit also compiles. The MMQ tile/math headers remain unchanged.
+A separate image adapter owns scratch through the image TensorPool, rather than
+the LLM allocator. Q8 and FP32 staging are each capped at 64 MiB, including the
+partial-row guard. There is no Torch dependency, converted checkpoint, persistent
+expanded weight cache, new CLI flag or runtime environment variable.
+
+Direct MMQ and Stream-K were compared at tile widths 32/64/128; an experimental
+FMA-enabled build was also measured. None beat the existing BF16 path for the
+4096-token H3 projections. Direct MMQ's QKV/out/FC1/FC2 times were
+6.192/2.103/8.431/4.174 ms versus 4.472/1.472/5.937/3.152 ms for BF16 decoding
+plus cuBLAS. Full 2048-square generation with forced MMQ took 7.813 seconds.
+Conversely, the 32–512-token probes favored MMQ; 768/1024 were mixed and 2048
+was slower. Production therefore selects MMQ only for 8–512 input rows with
+256-aligned K. Other shapes and unquantized tensors retain bounded BF16/cuBLAS.
+This cutoff is based on SM120 measurements, not a claim about every architecture.
+
+Same Q4_K_M checkpoint, RTX PRO 5000 72 GB Blackwell, CUDA 13, seed 42, six
+steps, 64 GiB host limit and automatic GPU budget. Each case uses a fresh process,
+one cold request and three warm requests; the table reports warm medians and
+excludes PNG encoding. Editing uses one reference of the stated canvas size.
+Dual GPU uses text TP2 and DiT SP2. Small differences in the large-image cases
+should not be attributed to MMQ kernel speed, since those GEMMs retain cuBLAS.
+
+| Workload | Before, seconds | Automatic MMQ/BF16, seconds |
+| --- | ---: | ---: |
+| 512-square generation, one GPU | 0.924774 | 0.755216 |
+| 512-square editing, one GPU | 4.707030 | 4.630997 |
+| 2048-square generation, one GPU | 6.656760 | 6.373640 |
+| 2048-square editing, one GPU | 18.303334 | 18.095412 |
+| 2048-square editing, two GPUs | 10.106966 | 10.089118 |
+
+Native validation executes 14 CTests successfully; the fixture-dependent video
+fused-op test is skipped. GGUF memcheck reports zero errors across 29 MMQ
+cases, a large-row BF16 fallback, ten exact decode oracles, partial input/output
+tiles, a 64 MiB staging boundary, output views and cache reloads. Twenty real
+projection comparisons across all five checkpoints use deterministic Gaussian
+BF16 inputs; forced-MMQ relative L2 versus the previous GGUF backend is at most
+0.013918205 (under the test's 0.02 threshold). This measures implementation
+agreement, not checkpoint quality relative to the original BF16 model.
+Launcher tests pass 20 cases with one optional browser case skipped. `ldd -r`
+finds no unresolved symbols and no Torch, C10 or Python runtime dependency.
+
+All 40 GGUF benchmark PNGs repeat byte-for-byte within their own case. The
+32 BF16/FP8/INT8/NVFP4 regression PNGs also match the preceding build exactly.
+Single-GPU generation/editing and dual-GPU editing complete; inspected
+2048-square Q4 samples have no obvious new corruption. This is a limited sample check, not a
+broad image-quality validation. The earlier Q2_K quality warning still applies.
+
+The 2048-square Q4 low-memory probes still pass at 2.5 GiB GPU for generation
+and 2.75 GiB for editing, both with a 2 GiB host setting and CPU weight cache
+disabled. Sampled GPU peaks remain 2045/2301 MiB; RSS peaks are 873.3/879.3 MiB.
+These are runtime budget tests, not a fresh hard-container-RAM minimum search.
+A separate 3 GiB GPU / 2 GiB host HTTP process recovers from intentional budget
+exhaustion and cancellation, then completes two-reference 256-square editing;
+peak GPU/RSS are 2557/835.1 MiB. Low-memory checks ran on the second idle GPU
+while the first checked legacy output hashes, after all GGUF timings finished.
+
+Artifacts, source snapshots, operator/tile sweeps, per-request timings and PNGs
+are in `gguf-mmq-20261113` under the pro5000 image experiment directory. The
+initial overlapping tile-32/direct and editing runs were excluded from final
+comparisons. No new SGLang benchmark was run. Validation is limited to SM120;
+older GPUs/toolkits and release wheels were not exercised.
+
+## GGUF cleanup and commit validation (2026-11-13)
+
+The shared header contains only the Q8 packing kernel and its block-size
+constant. The LLM-specific dynamic launcher stays in its original translation
+unit; both its body and the shared kernel arithmetic match the pre-GGUF code.
+The image adapter retains compile-time layout selection without linking GGML's
+LLM error/allocator paths. All MMQ eligibility checks now live in the adapter,
+including the unchanged 8–512-row cutoff. Redundant metadata-array state,
+conditional declarations and an unused test-fixture field were removed.
+No inference environment variables or CLI options were added; the image sources
+have no runtime tuning environment-variable hooks.
+
+CUDA 13 / SM120 validation passes all 15 selected native CTests. GGUF memcheck
+reports zero errors across ten decode types and 32 GEMM cases, including the
+512/513-row cutoff, bounded staging, output guards and metadata-array parsing.
+Launcher media tests pass 20 cases, with one optional browser test skipped.
+The original LLM MMQ translation unit compiles; `ldd -r` reports no unresolved
+symbols and no Torch, C10 or Python runtime dependency.
+
+Against the saved pre-cleanup library, 28 real projection comparisons across all
+five downloaded variants and the dispatch boundary have relative L2 error zero.
+Twelve Q4_K_M PNGs from 512-square generation/editing and two-GPU 2048-square
+editing match their pre-cleanup outputs byte-for-byte. The existing BF16,
+FP8, INT8 and NVFP4 math is unchanged; their native operator regressions pass.
+Older GPUs/toolkits, release wheels and broader image-quality coverage remain
+outside this validation. The earlier Q2_K quality limitation still applies.
+Detailed commands, source snapshots, logs and the proposed two-commit grouping
+are in `gguf-cleanup-20261113` under the pro5000 image experiment directory.

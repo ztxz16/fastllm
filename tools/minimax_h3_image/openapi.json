@@ -3,7 +3,7 @@
   "info": {
     "title": "FastLLM MiniMax-H3-Image",
     "version": "1.3",
-    "description": "Native text-to-image, single-image editing and multi-reference composition (up to 16 ordered PNG/JPEG/WebP images). Detailed English prompts are recommended. Six fixed steps, guidance 1. No negative prompt, strength slider, masks or prompt-expander model. JPEG/WebP decoding requires FFmpeg. Request body limit 32 MiB; up to 20 MP per reference and 64 MP combined. URLs are relative to this API origin. Main DiT precision is detected from the --model directory or selected FP8, INT8 ConvRot or NVFP4 safetensors file; request schemas and reference-image modes are unchanged. Quantization can change image details."
+    "description": "Native text-to-image, single-image editing and multi-reference composition (up to 16 ordered PNG/JPEG/WebP images). Detailed English prompts are recommended. Six fixed steps, guidance 1. No negative prompt, strength slider, masks or prompt-expander model. JPEG/WebP decoding requires FFmpeg. Request body limit 32 MiB; up to 20 MP per reference and 64 MP combined. URLs are relative to this API origin. Main DiT precision is detected from the --model directory or selected FP8, INT8 ConvRot or NVFP4 safetensors file, or GGUF DiT file; request schemas and reference-image modes are unchanged. Quantization can change image details."
   },
   "security": [
     {
@@ -395,7 +395,8 @@
               "bf16",
               "fp8",
               "int8",
-              "nvfp4"
+              "nvfp4",
+              "gguf"
             ],
             "description": "Main DiT projection precision selected at startup; text, VAE and sensitive projections retain native precision."
           }

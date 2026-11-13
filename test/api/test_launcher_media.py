@@ -132,6 +132,15 @@ class ServiceTest(unittest.TestCase):
             config.server_binary = str(self.worker)
             self.assertEqual(service_backends.H3Backend.executable(config), str(self.worker))
 
+    def test_image_gguf_path_reaches_native_service_without_precision_flags(self):
+        model = self.directory / "image-Q4_K_M.gguf"
+        model.write_bytes(b"GGUF")  # Payload validation belongs to the native loader.
+        session = self.start("minimax_h3_image", model=str(model))
+        self.assertTrue(self.pool.service(session).state()["ready"])
+        argv = self.commands[-1][0]
+        self.assertEqual(argv[argv.index("--model") + 1], str(model))
+        self.assertNotIn("--precision", argv)
+
     def test_gpu_mask_is_composed_and_auto_configuration_preserves_it(self):
         self.assertEqual(visible_gpu_environment("1,0", {"CUDA_VISIBLE_DEVICES": "6,7"}), {"CUDA_VISIBLE_DEVICES": "7,6"})
         self.assertEqual(visible_gpu_environment("1", {"CUDA_VISIBLE_DEVICES": "GPU-a,GPU-b"}), {"CUDA_VISIBLE_DEVICES": "GPU-b"})

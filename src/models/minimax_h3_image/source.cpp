@@ -1,5 +1,6 @@
 #include "models/minimax_h3_image/source.h"
 #include "json11.hpp"
+#include "gguf_checkpoint.h"
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -18,6 +19,14 @@ bool base(const fs::path &p) {
 }
 WeightFormat kind(const fs::path &p) {
     std::ifstream f(p, std::ios::binary);
+    char magic[4]{};
+    f.read(magic, 4);
+    if (std::string(magic, 4) == "GGUF") {
+        detail::GgufCheckpoint checkpoint(p.string());
+        return WeightFormat::GGUF;
+    }
+    f.clear();
+    f.seekg(0);
     uint64_t n = 0;
     f.read(reinterpret_cast<char *>(&n), 8);
     if (!f || n == 0 || n > (16u << 20) || n + 8 >= fs::file_size(p))
@@ -84,6 +93,8 @@ const char *weightFormatName(WeightFormat format) {
         return "int8";
     case WeightFormat::NVFP4:
         return "nvfp4";
+    case WeightFormat::GGUF:
+        return "gguf";
     default:
         return "bf16";
     }
@@ -100,25 +111,27 @@ ModelSource resolveModelSource(const std::string &input) {
             if (!fs::is_directory(dir))
                 continue;
             for (const auto &entry : fs::directory_iterator(dir))
-                if (entry.is_regular_file() && entry.path().extension() == ".safetensors" &&
+                if (entry.is_regular_file() &&
+                    (entry.path().extension() == ".safetensors" || entry.path().extension() == ".gguf") &&
                     kind(entry.path()) != WeightFormat::BF16)
                     candidates.push_back(entry.path());
         }
         if (candidates.size() > 1)
             throw std::invalid_argument("image directory contains multiple quantized checkpoints; select one "
-                                        ".safetensors file as the model path");
+                                        ".safetensors or .gguf file as the model path");
         if (candidates.empty()) {
             if (!base(path))
                 throw std::invalid_argument("expected a complete MiniMax-H3-Image directory or a quantized "
-                                            ".safetensors file");
+                                            ".safetensors or .gguf file");
             return {path.string(), {}};
         }
         quant = candidates.front();
-    } else if (fs::is_regular_file(path) && path.extension() == ".safetensors") {
+    } else if (fs::is_regular_file(path) &&
+               (path.extension() == ".safetensors" || path.extension() == ".gguf")) {
         quant = path;
     } else {
-        throw std::invalid_argument("image model path does not exist or is not a safetensors checkpoint: " +
-                                    input);
+        throw std::invalid_argument(
+            "image model path does not exist or is not a safetensors/GGUF checkpoint: " + input);
     }
     auto format = kind(quant);
     if (format == WeightFormat::BF16)

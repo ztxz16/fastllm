@@ -1,7 +1,7 @@
 #pragma once
 #include <string>
 namespace fastllm::minimax_h3_image {
-enum class WeightFormat { BF16, FP8, INT8, NVFP4 };
+enum class WeightFormat { BF16, FP8, INT8, NVFP4, GGUF };
 const char *weightFormatName(WeightFormat);
 // Matrix payloads and quantization metadata determine the format, never filenames.
 WeightFormat inspectWeightFormat(const std::string &path);

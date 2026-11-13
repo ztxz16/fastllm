@@ -12,6 +12,8 @@ std::unique_ptr<QuantizedWeights> QuantizedWeights::load(const std::string &path
         return detail::loadInt8(path);
     case WeightFormat::NVFP4:
         return detail::loadNvfp4(path);
+    case WeightFormat::GGUF:
+        return detail::loadGguf(path);
     default:
         throw std::invalid_argument("expected an H3 Image quantized checkpoint");
     }
@@ -26,6 +28,9 @@ void QuantizedWeights::validateDevice(WeightFormat format, int device, bool mult
         return;
     case WeightFormat::NVFP4:
         detail::validateNvfp4Device(device);
+        return;
+    case WeightFormat::GGUF:
+        detail::validateGgufDevice(device);
         return;
     default:
         throw std::invalid_argument("expected an H3 Image quantized format");

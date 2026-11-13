@@ -222,7 +222,9 @@ void Transformer::clearText() {
 }
 Tensor Transformer::attention(const Tensor &x, const std::string &p, const Tensor *cs, const Tensor *sn) {
     const int heads = sequenceParallel_ ? 56 : 56 / parallel_.size();
-    const bool quantized = quantized_ && p.compare(0, 7, "blocks.") == 0;
+    const bool quantized = quantized_ &&
+        (p.compare(0, 7, "blocks.") == 0 ||
+         (quantized_->format() == WeightFormat::GGUF && p.compare(0, 21, "token_refiner.blocks.") == 0));
     auto project = [&](const Tensor &y) {
         if (quantized)
             return quantized_->linear(y, p + ".out_proj");
@@ -286,7 +288,9 @@ Tensor Transformer::attention(const Tensor &x, const std::string &p, const Tenso
     return project(rt_.selfAttention(qkv[0], qkv[1], qkv[2], heads));
 }
 Tensor Transformer::feedForward(const Tensor &x, const std::string &p) {
-    const bool quantized = quantized_ && p.compare(0, 7, "blocks.") == 0;
+    const bool quantized = quantized_ &&
+        (p.compare(0, 7, "blocks.") == 0 ||
+         (quantized_->format() == WeightFormat::GGUF && p.compare(0, 21, "token_refiner.blocks.") == 0));
     const bool rowwiseInt8 = quantized && quantized_->format() == WeightFormat::INT8;
     // INT8 scales are per row, so combining FFN chunks does not change the
     // quantization. Resident requests already reserve activation headroom;
@@ -327,8 +331,11 @@ Tensor Transformer::refine(const Tensor &text) {
         auto p = "token_refiner.blocks." + std::to_string(i);
         x = rt_.add(x, attention(rt_.rms(x, weights_.get(p + ".norm1.weight"), 1e-5f), p + ".attn"));
         x = rt_.add(x, feedForward(rt_.rms(x, weights_.get(p + ".norm2.weight"), 1e-5f), p + ".mlp"));
-        if (lowMemory_)
+        if (lowMemory_) {
             weights_.erasePrefix(p + ".");
+            if (quantized_ && quantized_->format() == WeightFormat::GGUF)
+                quantized_->erasePrefix(p + ".");
+        }
     }
     return rt_.rms(x, weights_.get("token_refiner.final_norm.weight"), 1e-5f);
 }

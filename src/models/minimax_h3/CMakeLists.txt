@@ -14,6 +14,7 @@ add_library(fastllm_minimax_h3 SHARED
     text.cpp parallel.cpp pipeline.cpp pika.cpp model_source.cpp media.cpp media_input.cpp
     ../minimax_h3_image/model.cpp ../minimax_h3_image/ops.cu ../minimax_h3_image/parallel.cpp
     ../minimax_h3_image/input.cpp ../minimax_h3_image/memory.cpp ../minimax_h3_image/fp8.cu ../minimax_h3_image/source.cpp
+    ../minimax_h3_image/gguf_checkpoint.cpp ../minimax_h3_image/gguf.cu
     ../minimax_h3_image/quantized.cpp ../minimax_h3_image/int8.cu ../minimax_h3_image/nvfp4.cu)
 target_link_libraries(fastllm_minimax_h3 PUBLIC fastllm_continuous pthread)
 target_include_directories(fastllm_minimax_h3 PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
@@ -22,6 +23,20 @@ target_compile_options(fastllm_minimax_h3 PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-ffp-contract=off>)
 set_target_properties(fastllm_minimax_h3 PROPERTIES CUDA_STANDARD 17 CXX_STANDARD 17
     CUDA_ARCHITECTURES "${FASTLLM_CUDA_ARCHITECTURES}" LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+# Reuse GGUF MMQ kernels without linking the separate LLM runtime/allocator.
+if(NOT CUDA_NO_TENSOR_CORE)
+    add_library(fastllm_image_gguf_mmq OBJECT ../minimax_h3_image/gguf_mmq.cu)
+    set_target_properties(fastllm_image_gguf_mmq PROPERTIES
+        CUDA_STANDARD 17 CUDA_ARCHITECTURES "${FASTLLM_CUDA_ARCHITECTURES}" POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(fastllm_image_gguf_mmq PRIVATE
+        ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/include/devices/cuda
+        ${PROJECT_SOURCE_DIR}/include/utils ${PROJECT_SOURCE_DIR}/include/models ${PROJECT_SOURCE_DIR}/include/blocks
+        ${PROJECT_SOURCE_DIR}/third_party/json11 ${PROJECT_SOURCE_DIR}/third_party/gguf
+        ${PROJECT_SOURCE_DIR}/src/devices/cuda/gguf_mmq)
+    target_compile_options(fastllm_image_gguf_mmq PRIVATE --expt-relaxed-constexpr --fmad=false)
+    target_compile_definitions(fastllm_minimax_h3 PRIVATE FASTLLM_IMAGE_GGUF_MMQ)
+    target_sources(fastllm_minimax_h3 PRIVATE $<TARGET_OBJECTS:fastllm_image_gguf_mmq>)
+endif()
 # Keep SM120-only CUTLASS instantiations out of legacy architecture builds.
 # The ordinary FP8 translation unit retains the cuBLAS fallback.
 if(FASTLLM_CUTLASS_FP8_SM120_ENABLED AND NOT CUDA_NO_TENSOR_CORE AND
@@ -82,6 +97,10 @@ if(MAKE_WHL_X86)
     endif()
     set_target_properties(fastllm_continuous fastllm_minimax_h3 PROPERTIES
         CUDA_ARCHITECTURES "${FASTLLM_VIDEO_CUDA_ARCHITECTURES}")
+    if(TARGET fastllm_image_gguf_mmq)
+        set_target_properties(fastllm_image_gguf_mmq PROPERTIES
+            CUDA_ARCHITECTURES "${FASTLLM_VIDEO_CUDA_ARCHITECTURES}")
+    endif()
     # Wheel executables and the shared library live together in ftllm/.
     # Resolve pip's CUDA dependencies without requiring LD_LIBRARY_PATH.
     set_target_properties(fastllm_minimax_h3 minimax_h3_server minimax_h3_generate minimax_h3_image_server minimax_h3_image_generate PROPERTIES
@@ -99,7 +118,7 @@ if(UNIT_TEST)
     endforeach()
     target_include_directories(minimax_h3_image_parallel PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
     target_link_libraries(minimax_h3_image_parallel PRIVATE cudart)
-    foreach(check fp8 int8 nvfp4 source)
+    foreach(check fp8 int8 nvfp4 gguf source)
         add_executable(minimax_h3_image_${check} ${PROJECT_SOURCE_DIR}/test/minimax_h3_image/test_${check}.cpp)
         target_include_directories(minimax_h3_image_${check} PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
         target_link_libraries(minimax_h3_image_${check} PRIVATE fastllm_minimax_h3 cudart)

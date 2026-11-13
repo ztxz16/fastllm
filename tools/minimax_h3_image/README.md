@@ -62,6 +62,48 @@ BF16 rounding boundary, so its outputs need not be pixel-identical to the previo
 FP8 implementation; operator validation uses relative L2 error.
 Inference remains C++/CUDA/CUTLASS/cuBLAS/NCCL with no Torch dependency.
 
+### GGUF image checkpoints
+
+Selecting a `.gguf` file enables a separate native GGUF reader and CUDA backend.
+The tested layout is [Abiray/MiniMax-H3-Image-GGUF](https://huggingface.co/Abiray/MiniMax-H3-Image-GGUF):
+Q2_K, Q3_K_M, Q4_K_S, Q4_K_M and Q5_K_M. Select the exact file when a directory
+contains several variants. Keep the same complete original image base alongside
+it, as for safetensors. No conversion, Torch dependency or precision flag is needed.
+Start with Q4_K_M: the tested Q2_K checkpoint produced severe noise and lost
+detail despite passing the decode oracle. Runtime support is not a quality guarantee.
+
+GGUF metadata, dimensions, block sizes, payload bounds and the image-specific
+six-step PDD configuration are checked before inference. The supported tensor
+types are F32/F16/BF16, Q4_0/Q8_0 and Q2_K through Q6_K; unrelated architectures,
+video checkpoints, other quantization types and incompatible layouts are rejected.
+The Comfy layout stores QKV as `[all Q, all K, all V]` and FC1 as `[gate, value]`.
+Both the 50 main blocks and the two token-refiner blocks use the GGUF projections.
+Protected/non-projection tensors, PDD heads, text encoder and VAE use the matching
+original base. This is not a loader for standalone text-encoder GGUFs or arbitrary
+fine-tuned auxiliary tensors.
+
+Compressed weights stay on the GPU when the budget allows. Quantized projections
+with 8–512 input tokens reuse FastLLM's GGUF MMQ kernels: activations are packed
+as Q8, then INT8 Tensor Cores multiply the compressed weights directly. This adds
+activation quantization error; Q4_K is not native NVFP4 W4A4. Large-token GEMMs,
+small/unaligned inputs and unquantized tensors use bounded BF16 decoding plus
+cuBLAS FP32 accumulation. The automatic cutoff follows SM120 measurements: MMQ
+wins on small matrices but loses to cuBLAS on the 2048-square main DiT workload.
+No tuning flag or environment variable is needed.
+
+Both paths use the image TensorPool. MMQ's Q8 and FP32 staging buffers are each
+bounded to 64 MiB; BF16 decoding uses at most 56 MiB for this model. There is no
+persistent expanded weight cache or second weight quantization. Existing layer
+streaming, host-memory limits and multi-GPU SP apply. Text-to-image,
+single/multiple reference editing, cancellation and the studio use the existing
+API; `/health` reports `dit_precision: "gguf"`.
+
+```bash
+minimax_h3_image_server \
+  --model /workspace2/hfmodels/Abiray--MiniMax-H3-Image-GGUF/MiniMax-H3-Image-Pruned-Q4_K_M.gguf \
+  --devices 0 --port 8009
+```
+
 ## Build and run
 
 ```bash
