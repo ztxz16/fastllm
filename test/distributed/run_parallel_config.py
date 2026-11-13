@@ -164,9 +164,10 @@ def main():
                                       '不执行真实模型推理或性能测试；非数值配置检查的误差字段为 n/a。'}
     rows = []
     try:
-        modules = ['test_parallel_config', 'test_attention_ep_config', 'test_process_tp_options', 'test_process_tp_entrypoint']
+        modules = ['test_qwen_moe_reference', 'test_parallel_config', 'test_attention_ep_config', 'test_process_tp_options', 'test_process_tp_entrypoint']
         if args.execution_tests:
-            modules += ['test_process_dp', 'test_dp_routing', 'test_dp_service_stability', 'test_qwen3_session',
+            modules += ['test_qwen3_shard_runner', 'test_qwen3_device_weights_runner', 'test_qwen3_layer_runner',
+                        'test_process_dp', 'test_dp_routing', 'test_dp_service_stability', 'test_qwen3_session',
                         'test_qwen3_http', 'test_qwen3_generation', 'test_qwen3_prefix_cache', 'test_qwen3_decode_runner']
         if args.benchmark_tests:
             modules += ['test_benchmark_qwen3_dp', 'test_benchmark_dp_routing', 'test_diagnose_qwen3_prefix', 'test_tp_concurrency_diagnostic', 'test_dp_lengths', 'test_dp_baseline']

@@ -804,6 +804,16 @@ std::vector<float> ProcessGroup::CheckAllReduce(uint32_t count, uint32_t salt) {
 
 std::vector<ProcessModelInfo> ProcessGroup::LoadQwen3(const std::string &directory,
         uint64_t maxTensorBytes, uint64_t maxDeviceBytes, int timeoutMs) {
+    return LoadModel(directory, maxTensorBytes, maxDeviceBytes, timeoutMs, false);
+}
+
+std::vector<ProcessModelInfo> ProcessGroup::LoadQwenMoe(const std::string &directory,
+        uint64_t maxTensorBytes, uint64_t maxDeviceBytes, int timeoutMs) {
+    return LoadModel(directory, maxTensorBytes, maxDeviceBytes, timeoutMs, true);
+}
+
+std::vector<ProcessModelInfo> ProcessGroup::LoadModel(const std::string &directory,
+        uint64_t maxTensorBytes, uint64_t maxDeviceBytes, int timeoutMs, bool moe) {
     if (directory.empty() || directory.find('\0') != std::string::npos ||
         !maxTensorBytes || !maxDeviceBytes || timeoutMs <= 0) {
         throw std::invalid_argument("invalid Qwen3 loading options");
@@ -822,7 +832,10 @@ std::vector<ProcessModelInfo> ProcessGroup::LoadQwen3(const std::string &directo
         throw std::runtime_error("Qwen3 loading requires a ready CUDA process TP group");
     }
     try {
-        auto replies = impl->Exchange(Kind::LoadQwen3, Kind::ModelLoaded, payload,
+        if (moe && (impl->options.cudaGraph || impl->options.prefixCache || impl->options.customAllReduce)) {
+            throw std::invalid_argument("MoE layer stage requires Eager, no prefix cache and NCCL");
+        }
+        auto replies = impl->Exchange(moe ? Kind::LoadQwenMoe : Kind::LoadQwen3, Kind::ModelLoaded, payload,
                                       Clock::now() + std::chrono::milliseconds(timeoutMs));
         std::vector<ProcessModelInfo> results;
         for (const auto &reply : replies) {
@@ -927,6 +940,79 @@ std::vector<std::vector<float>> ProcessGroup::ForwardQwen3Layer(uint32_t layer, 
                 }
             }
             results.push_back(std::move(output));
+        }
+        return results;
+    } catch (const std::exception &error) {
+        impl->Fail(error.what());
+        throw std::runtime_error(impl->error);
+    }
+}
+
+std::vector<QwenMoeLayerResult> ProcessGroup::ForwardQwenMoeLayer(uint32_t layer, uint32_t hidden,
+        Qwen3LayerStage stage, const std::vector<QwenMoeLayerInput> &inputs, int timeoutMs) {
+    std::lock_guard<std::mutex> lock(impl->mutex);
+    if (impl->state != ProcessGroupState::Ready || impl->options.controlOnly) {
+        throw std::runtime_error("MoE layer requires ready CUDA workers");
+    }
+    if (!hidden || inputs.size() != impl->children.size() || uint32_t(stage) > 2 || timeoutMs <= 0) {
+        throw std::invalid_argument("invalid MoE layer shape/stage/timeout");
+    }
+    std::vector<uint8_t> payload;
+    for (uint32_t field : {layer, hidden, uint32_t(stage), uint32_t(inputs.size()), uint32_t(timeoutMs)}) {
+        Put32(payload, field);
+    }
+    for (const auto &input : inputs) {
+        const auto count = input.hidden.size();
+        if (count % hidden || count / hidden > kQwen3MaxPromptTokens || input.positionBegin > 1048576 ||
+            count > (kMaxPayload - 8) / 4 || payload.size() > kMaxPayload - 8 - count * 4) {
+            throw std::invalid_argument("invalid MoE layer input/protocol size");
+        }
+        Put32(payload, count / hidden);
+        Put32(payload, input.positionBegin);
+        for (float value : input.hidden) {
+            if (!std::isfinite(value) || std::fabs(value) > 65504) {
+                throw std::invalid_argument("MoE input outside finite FP16 range");
+            }
+            uint32_t bits;
+            memcpy(&bits, &value, sizeof(bits));
+            Put32(payload, bits);
+        }
+    }
+
+    try {
+        auto replies = impl->Exchange(Kind::ForwardMoeLayer, Kind::MoeLayerOutput, payload,
+                                      Clock::now() + std::chrono::milliseconds(timeoutMs));
+        std::vector<QwenMoeLayerResult> results;
+        for (size_t rank = 0; rank < replies.size(); ++rank) {
+            const auto &bytes = replies[rank].payload;
+            QwenMoeLayerResult result;
+            result.allGatherCalls = Get32(bytes, 0);
+            result.reduceScatterCalls = Get32(bytes, 4);
+            result.indexedDecode = Get32(bytes, 8) != 0;
+            size_t offset = 12;
+            for (auto target : {&result.output, &result.routerLogits, &result.routingWeights,
+                                &result.routedOutput, &result.sharedOutput}) {
+                uint32_t count = Get32(bytes, offset);
+                offset += 4;
+                if (count > (bytes.size() - offset) / 4) throw std::runtime_error("invalid MoE float response");
+                target->resize(count);
+                for (float &value : *target) {
+                    uint32_t bits = Get32(bytes, offset);
+                    offset += 4;
+                    memcpy(&value, &bits, sizeof(bits));
+                    if (!std::isfinite(value)) throw std::runtime_error("nonfinite MoE response");
+                }
+            }
+            for (auto target : {&result.selectedExperts, &result.expertTokens}) {
+                uint32_t count = Get32(bytes, offset);
+                offset += 4;
+                if (count > (bytes.size() - offset) / 4) throw std::runtime_error("invalid MoE index response");
+                for (uint32_t i = 0; i < count; ++i, offset += 4) target->push_back(Get32(bytes, offset));
+            }
+            if (offset != bytes.size() || result.output.size() != inputs[rank].hidden.size()) {
+                throw std::runtime_error("invalid MoE response length");
+            }
+            results.push_back(std::move(result));
         }
         return results;
     } catch (const std::exception &error) {

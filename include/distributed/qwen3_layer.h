@@ -43,6 +43,19 @@ public:
         uint32_t positionBegin, Qwen3LayerStage stage, const std::vector<float> &input);
 
     /**
+     * 执行本 rank 的 MoE 单层，与其他 rank 共同进行 EP 集合通信。
+     * @param layer 已加载模型的层号。
+     * @param tokens 本 rank 有效 Token 数；0 表示空闲。
+     * @param capacity 本轮各 rank 最大 Token 数，至少 1；固定 NCCL 分块长度。
+     * @param positionBegin 本地序列 RoPE 起点；不表示历史 KV。
+     * @param stage Full/Attention/Mlp；同阶段在所有 rank 一致。
+     * @param input FP32 [tokens,hidden]；转换后在 worker stream 计算。
+     * @return 真实 FP16 输出及中间量；同步失败或非法状态抛异常，必须退出 worker。
+     */
+    QwenMoeLayerResult ForwardMoe(uint32_t layer, uint32_t tokens, uint32_t capacity,
+        uint32_t positionBegin, Qwen3LayerStage stage, const std::vector<float> &input);
+
+    /**
      * 运行完整无 KV prefill，复用单层执行路径和同一 stream，仅读回本 rank 的末 token logits。
      *
      * 输入、隐藏状态和工作区在一次请求内复用；成功后释放，失败必须终止 worker。

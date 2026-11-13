@@ -75,6 +75,20 @@ struct Qwen3RequestInfo {
 
 enum class Qwen3LayerStage : uint32_t { Full = 0, Attention = 1, Mlp = 2 };
 
+/** 单个 Attention rank 的单层输入；空 input 表示本轮只参与 EP 通信。 */
+struct QwenMoeLayerInput {
+    uint32_t positionBegin = 0;
+    std::vector<float> hidden;
+};
+
+/** 单层实际输出及计算中间量；诊断读回发生在计算完成后，不是性能接口。 */
+struct QwenMoeLayerResult {
+    std::vector<float> output, routerLogits, routingWeights, routedOutput, sharedOutput;
+    std::vector<uint32_t> selectedExperts, expertTokens;
+    uint32_t allGatherCalls = 0, reduceScatterCalls = 0;
+    bool indexedDecode = false;
+};
+
 // Linux 单机控制面。Ready 仅代表 worker/通信就绪，不代表模型已加载。
 class ProcessGroup {
 public:
@@ -123,6 +137,30 @@ public:
     std::vector<ProcessModelInfo> LoadQwen3(const std::string &directory,
         uint64_t maxTensorBytes = 1073741824ULL, uint64_t maxDeviceBytes = 8589934592ULL,
         int timeoutMs = 300000);
+
+    /**
+     * 加载 Attention TP=1 的 Qwen2 MoE，复用有界读取与 FP16 上传路径。
+     * @param directory 本地 HF 目录；非专家权重复制，路由专家按 ID 取模分配。
+     * @param maxTensorBytes 单个源张量 CPU 上限。
+     * @param maxDeviceBytes 每 rank GPU 权重上限，默认 12 GiB，不含工作区/KV。
+     * @param timeoutMs 整组截止时间；任一失败终止全部 worker。
+     * @return 各 rank 的实际张量数和读取/驻留字节；卸载和读回复用现有接口。
+     */
+    std::vector<ProcessModelInfo> LoadQwenMoe(const std::string &directory,
+        uint64_t maxTensorBytes = 1073741824ULL, uint64_t maxDeviceBytes = 12884901888ULL,
+        int timeoutMs = 300000);
+
+    /**
+     * 联合执行一个无历史 KV 的 MoE Decoder 层，各 rank 可接收不同长度的序列。
+     * @param layer 层号。
+     * @param hidden 模型隐藏维度；输入为有限 FP32 [T,hidden]，计算转为 FP16。
+     * @param stage Full/Attention/Mlp；单阶段仍使用相同正式算子。
+     * @param inputs 按 rank 排列的输入；允许空 rank 和整组空闲，T 不超过 2048。
+     * @param timeoutMs 整组截止时间；控制消息总量不超过 1 MiB，失败终止组。
+     * @return 各 rank 实际输出、路由和通信证据；本阶段不创建请求 KV 或执行生成。
+     */
+    std::vector<QwenMoeLayerResult> ForwardQwenMoeLayer(uint32_t layer, uint32_t hidden,
+        Qwen3LayerStage stage, const std::vector<QwenMoeLayerInput> &inputs, int timeoutMs = 60000);
 
     /**
      * 从指定 worker 的真实 GPU 权重读回连续字节，用于加载正确性验收。
@@ -218,6 +256,9 @@ public:
     std::vector<ProcessWorkerInfo> Workers() const;
 
 private:
+    /** 统一加载事务；模型类型必须由公开入口明确选择，失败终止通信组。 */
+    std::vector<ProcessModelInfo> LoadModel(const std::string &directory,
+        uint64_t maxTensorBytes, uint64_t maxDeviceBytes, int timeoutMs, bool moe);
     struct Impl;
     std::unique_ptr<Impl> impl;
 };

@@ -24,7 +24,12 @@ struct ShardTensorPlan {
     bool zeroFill = false; // 行并行输出偏置仅 rank 0 读取，其他 rank 为零。
 };
 
+enum class ShardModel { DenseQwen3, Qwen2Moe };
+
 struct Qwen3ShardPlan {
+    ShardModel model = ShardModel::DenseQwen3;
+    uint64_t expertCount = 0, expertsPerToken = 0, sharedIntermediateSize = 0;
+    bool normTopkProb = false;
     int rank = 0, worldSize = 1;
     uint64_t hiddenSize = 0, layerCount = 0, headDim = 0;
     uint64_t queryHeads = 0, kvHeads = 0, vocabSize = 0;
@@ -57,9 +62,12 @@ public:
      * 未知权重、量化、重复 JSON 字段或非法布局抛异常。
      * @param directory 包含 config.json 和 safetensors 文件/索引的本地目录。
      * @param rank 当前进程 rank，范围 [0, worldSize)。
-     * @param worldSize TP 进程数；必须能给每个 rank 分配至少一个 Q 头、MLP 通道和词表行。
+     * @param worldSize 稠密模式为 TP 数；MoE 模式为 1/2/4 个 EP rank，Attention TP=1。
+     * @param model 显式选择模型语义；Qwen2Moe 复制非专家权重，按 expert_id % worldSize
+     *              读取本 rank 专家，验证其他专家元数据但不读取其 payload。
      */
-    Qwen3ShardLoader(const std::string &directory, int rank, int worldSize);
+    Qwen3ShardLoader(const std::string &directory, int rank, int worldSize,
+                     ShardModel model = ShardModel::DenseQwen3);
     ~Qwen3ShardLoader();
     Qwen3ShardLoader(const Qwen3ShardLoader&) = delete;
     Qwen3ShardLoader &operator=(const Qwen3ShardLoader&) = delete;
