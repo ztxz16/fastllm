@@ -542,27 +542,24 @@ _AUTO_QWEN_ENV_APPLIED = {}
 
 
 def _qwen_hybrid_defaults(args, model, tensors, hardware, numa):
-    # Single-GPU hybrid graphs use the backend's runtime capability
-    # checks on every CUDA architecture. Keep the separately measured two-GPU
-    # ownership/remote-graph policy scoped to its original configuration.
-    # Explicit environment values still win.
+    # Graph availability follows placement and backend capability checks,
+    # independently of CUDA architecture. Explicit environment values win.
     if (not numa or len(hardware) not in (1, 2) or
-            (len(hardware) == 2 and any(device.get("capability") != 75 for device in hardware.values())) or
             (model.family, model.layers, model.hidden, model.intermediate,
              model.experts, model.topk) != ("qwen4", 48, 2560, 640, 512, 10) or
             args.moe_device in ("cpu", "disk")):
         return {}
     gguf = any(t.kind.startswith("gguf:") and memory._is_routed_expert(t.name)
                for t in tensors)
-    # Native and GGUF weights share the complete single-GPU graph path.
+    # Native and GGUF weights share the hybrid graph paths.
     # Expert operators retain their runtime capability checks and fallbacks.
     defaults = {"FASTLLM_QWEN38_HYBRID_GRAPH": "1"}
+    if len(hardware) == 2:
+        defaults.update(FASTLLM_QWEN38_OWNED_PP="1", FASTLLM_QWEN38_REMOTE_GRAPH="1")
     # Prefill dequantization and vision placement remain independently scoped
     # to their existing measured defaults; enabling graphs need not change them.
     if any(device.get("capability") != 75 for device in hardware.values()):
         return defaults
-    if len(hardware) == 2:
-        defaults.update(FASTLLM_QWEN38_OWNED_PP="1", FASTLLM_QWEN38_REMOTE_GRAPH="1")
     if (getattr(args, "vision_device", None) is None and
             any(t.name.startswith("model.visual.") for t in tensors)):
         defaults["FASTLLM_QWEN4_VISION_DEVICE"] = "cpu"

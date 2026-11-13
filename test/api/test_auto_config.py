@@ -1534,7 +1534,7 @@ class NativeQwenMtpEmbeddingTest(unittest.TestCase):
 
 
 class HybridDispatchPolicyTest(unittest.TestCase):
-    def test_hybrid_graph_dispatch_uses_single_device_capabilities(self):
+    def test_hybrid_graph_dispatch_is_independent_of_architecture(self):
         g=memory.Geometry("qwen4",48,262144,2560,512,10,640,[0]*48,[0]*48,4,155648,4096)
         a=types.SimpleNamespace(moe_device="numa",mtp=3)
         t=[memory.Tensor("blk.0.ffn_gate_exps.weight",(512,640,2560),1,"gguf:21")]
@@ -1543,7 +1543,7 @@ class HybridDispatchPolicyTest(unittest.TestCase):
         for field,value in (("family","deepseek_v41"),("layers",47),("hidden",4096),("intermediate",768),("topk",8)):
             changed=copy.copy(g);object.__setattr__(changed,field,value)
             self.assertEqual(auto._qwen_hybrid_defaults(a,changed,t,gpu,True),{})
-        for hw,numa in (({0:{"capability":75},1:{"capability":89}},True),(gpu,False)):
+        for hw,numa in (({},True),({i:{"capability":75} for i in range(3)},True),(gpu,False)):
             self.assertEqual(auto._qwen_hybrid_defaults(a,g,t,hw,numa),{})
         for sm in (60, 70, 75, 80, 86, 89, 90, 100, 120, 121):
             with self.subTest(sm=sm):
@@ -1555,6 +1555,14 @@ class HybridDispatchPolicyTest(unittest.TestCase):
                 native_defaults = auto._qwen_hybrid_defaults(a,g,native,{0:{"capability":sm}},True)
                 self.assertEqual(native_defaults["FASTLLM_QWEN38_HYBRID_GRAPH"], "1")
                 self.assertNotIn("FASTLLM_QWEN38_OWNED_PP", native_defaults)
+        for left, right in ((75,75),(75,89),(80,80),(89,89),(90,90),(120,120),(121,121)):
+            for weights in (t,native):
+                with self.subTest(architectures=(left,right),kind=weights[0].kind):
+                    dual = auto._qwen_hybrid_defaults(a,g,weights,
+                        {0:{"capability":left},1:{"capability":right}},True)
+                    for key in ("FASTLLM_QWEN38_HYBRID_GRAPH", "FASTLLM_QWEN38_OWNED_PP",
+                                "FASTLLM_QWEN38_REMOTE_GRAPH"):
+                        self.assertEqual(dual[key], "1")
         dual = auto._qwen_hybrid_defaults(a,g,t,{0:{"capability":75},1:{"capability":75}},True)
         self.assertEqual(dual["FASTLLM_QWEN38_OWNED_PP"], "1")
         self.assertEqual(dual["FASTLLM_QWEN38_REMOTE_GRAPH"], "1")
