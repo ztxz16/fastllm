@@ -23,6 +23,7 @@ REQUIRED = {"cuda-nvcc-12-6", "cuda-cudart-dev-12-6", "libcublas-dev-12-6",
             "libnccl2", "libnccl-dev"}
 EXTRA = {"aria2", "build-essential", "cmake", "ninja-build", "make", "gcc", "g++",
          "git", "libnuma-dev", "pkg-config", "ca-certificates"}
+CUDA_PACKAGE = re.compile(r"(?:cuda-.+-12-6|cuda-toolkit(?:-12(?:-6)?)?-config-common|libcublas(?:-dev)?-12-6|libnccl(?:2|-dev))")
 
 
 def run(command, **kwargs):
@@ -90,7 +91,7 @@ def fetch_debs(specs, destination, caches, resolve=False):
         planning = destination / "apt-plan"
         planning.mkdir()
         command += ["-o", "Dir::Cache::archives=" + str(planning),
-                    "--yes", "--download-only", "--reinstall", "--no-install-recommends",
+                    "--yes", "--download-only", "--no-install-recommends",
                     "--no-remove", "--allow-downgrades", "--allow-change-held-packages", "install"]
     else:
         command += ["download"]
@@ -150,9 +151,9 @@ def selected_packages():
         raise RuntimeError("尚未完整安装 CUDA 12.6 / NCCL 开发包")
     if any(installed[name] != NCCL_VERSION for name in ("libnccl2", "libnccl-dev")):
         raise RuntimeError("NCCL 尚未切换到已验收的 " + NCCL_VERSION)
-    pattern = r"(?:cuda-.+-12-6|cuda-toolkit(?:-12(?:-6)?)?-config-common|libcublas(?:-dev)?-12-6|libnccl(?:2|-dev)|(?:lib)?python3(?:\.12)?(?:-.*)?)"
     selected = {name: version for name, version in installed.items()
-                if name in EXTRA or re.fullmatch(pattern, name)}
+                if name in EXTRA or CUDA_PACKAGE.fullmatch(name)
+                or re.fullmatch(r"(?:lib)?python3(?:\.12)?(?:-.*)?", name)}
     return selected, output
 
 
@@ -190,7 +191,11 @@ def export(args):
     (context / "system-packages.txt").write_text(system_listing)
     print("导出目录（中断后可用 --output 此路径重试）：" + str(context), flush=True)
 
-    records = fetch_debs(specs, context / "debs", args.cache_dir)
+    # 相同基础镜像中的 Python/构建工具可直接复用，避免强制下载已下架的旧版本。
+    # 这些版本仍在锁中，构建时只在确有差异或缺失时解析并补齐。
+    deb_specs = [name + "=" + version for name, version in sorted(packages.items())
+                 if CUDA_PACKAGE.fullmatch(name)]
+    records = fetch_debs(deb_specs, context / "debs", args.cache_dir)
     archive = context / "python-env.tar.gz"
     print("打包 /venv/main（保留 Linux 权限、软链接和绝对安装位置）", flush=True)
     run(["tar", "-C", "/", "-czf", str(archive) + ".partial", "venv/main"])
@@ -235,7 +240,7 @@ def restore(context):
     with tempfile.TemporaryDirectory(prefix="fastllm-local-debs.") as temporary:
         destination = Path(temporary)
         fetch_debs(specs, destination, [context / "debs", Path("/var/cache/apt/archives")], resolve=True)
-        # 独立校验导出的目标包，保证版本锁中每个包都进入安装集合。
+        # 独立校验导出的 CUDA/NCCL 包，保证导出的每个包都进入安装集合。
         for record in manifest["debs"]:
             source = context / "debs" / record["name"]
             if not matches(source, record):

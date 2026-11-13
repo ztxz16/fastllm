@@ -37,6 +37,8 @@ export PYTHONNOUSERSITE=1
 
 APT 只用于解析地址。安装包优先从 `/tmp/nccl-cu12-download` 和
 `/var/cache/apt/archives` 校验后复用，缺少的文件通过 aria2 下载。
+导出阶段预下载 CUDA/NCCL 包；Python 和构建工具的系统包只记录版本锁，
+由同一基础镜像复用，构建时仅补齐有差异的包，避免无故重新下载旧版系统包。
 Python 环境归档可能较大，导出目录需有足够剩余空间。
 
 ## Windows：传输和构建

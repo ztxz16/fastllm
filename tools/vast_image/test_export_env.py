@@ -82,6 +82,15 @@ class ExportTests(unittest.TestCase):
         self.assertIn("--print-uris", command)
         self.assertIn("--no-remove", command)
 
+    def test_existing_exact_version_does_not_force_reinstallation(self):
+        """/** 基础镜像已有锁定版本时，不要求软件源再次提供旧安装包。 */"""
+        with patch.object(env, "capture", return_value="") as capture, \
+                patch.object(env, "run") as run:
+            records = env.fetch_debs(["cmake=old-installed-version"], self.root / "out", [], resolve=True)
+        self.assertEqual(records, [])
+        self.assertNotIn("--reinstall", capture.call_args.args[0])
+        run.assert_not_called()
+
     def test_package_selection_preserves_native_architecture(self):
         """/** i386 包不能覆盖同名 amd64 包的锁定版本，CUDA 13 包不纳入目标。 */"""
         versions = {name: "1" for name in env.REQUIRED}
