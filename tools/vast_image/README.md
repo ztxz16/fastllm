@@ -41,12 +41,63 @@ APT 只用于解析地址。安装包优先从 `/tmp/nccl-cu12-download` 和
 由同一基础镜像复用，构建时仅补齐有差异的包，避免无故重新下载旧版系统包。
 Python 环境归档可能较大，导出目录需有足够剩余空间。
 
-## Windows：传输和构建
+## 传输：Direct SSH + aria2
 
-使用已连接 Vast 的 MobaXterm 左侧 SFTP 面板，将整个导出目录传到
-`C:\fastllm-cu126-image`。这是通过已有 SSH 身份认证的文件传输；无需开放 HTTP
-端口。不要在 Windows 解压目录内的 `python-env.tar.gz`，Linux 权限和软链接
-由 Docker 构建时恢复。
+大文件优先通过 Vast 的 Direct SSH 建立通道，再由 Windows aria2 下载。
+代理 SSH 可能限制速度；aria2 的多个 HTTP 请求仍共用一条 SSH 连接，不能保证
+比已有直连 SFTP 更快。下载工具只依赖 Python 标准库，仅监听回环地址，支持
+HTTP Range 和 SHA256 校验，不需要新增公网端口，也不提供目录浏览。
+
+原 Vast 服务器执行（替换第一行的导出目录）：
+
+```bash
+(
+set -euo pipefail
+image_export=/home/models/fastllm-cu126-image.XXXXXXXX
+image_archive="${image_export}.tar"
+# 导出目录保持不变；已打包完成则复用，避免中断下载后重新打包。
+if [ ! -s "$image_archive" ]; then
+  tar -cf "${image_archive}.part" -C "$image_export" .
+  mv "${image_archive}.part" "$image_archive"
+fi
+cd /home/project/vllm_fastllm
+python3 tools/vast_image/serve_archive.py "$image_archive"
+)
+```
+
+看到“下载服务已启动”后，保留这个终端。归档会占用约一份导出目录的额外空间。
+如果导出内容发生变化，需另建归档和下载文件名，不能沿用旧的断点文件。
+
+Windows 第一个 PowerShell 窗口执行，用实例的 Direct SSH IP 和端口替换占位值：
+
+```powershell
+ssh -p <直连端口> -N -T -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -L 127.0.0.1:18765:127.0.0.1:18765 root@<公网IP>
+```
+
+如果 MobaXterm 使用指定私钥，在 `ssh` 后加 `-i "私钥完整路径"`；OpenSSH
+需要它支持的私钥格式，不能直接使用 PuTTY 的 `.ppk` 文件。连接后没有输出是
+正常的，保留窗口。首次连接需核对服务器主机密钥。此处复用已有 SSH 身份认证。
+
+Windows 第二个 PowerShell 窗口执行：
+
+```powershell
+$ErrorActionPreference = "Stop"
+$imageDownload = Join-Path $env:USERPROFILE "Downloads\fastllm-image-transfer"
+New-Item -ItemType Directory -Force $imageDownload | Out-Null
+$imageMeta = Invoke-RestMethod "http://127.0.0.1:18765/metadata"
+aria2c -c -x 16 -s 16 -k 1M --file-allocation=none --auto-file-renaming=false --no-proxy=127.0.0.1 --check-integrity=true "--checksum=sha-256=$($imageMeta.sha256)" -d "$imageDownload" -o fastllm-cu126-image.tar "http://127.0.0.1:18765/archive.tar"
+if ($LASTEXITCODE -ne 0) { throw "下载未完成；保留归档和 .aria2 文件，修复连接后重跑。" }
+New-Item -ItemType Directory -Force C:\fastllm-cu126-image | Out-Null
+tar -xf (Join-Path $imageDownload "fastllm-cu126-image.tar") -C C:\fastllm-cu126-image
+if ($LASTEXITCODE -ne 0) { throw "归档解包失败。" }
+```
+
+Windows 尚无 aria2 时，先用 `winget install --id aria2.aria2 --exact --source winget`
+引导安装，再重新打开 PowerShell。仅此次引导安装使用其他下载方式。
+完成后可在服务器下载服务和 SSH 通道窗口按 Ctrl+C 停止。只解包外层 `.tar`；
+目录内的 `python-env.tar.gz` 保留原样，Linux 权限和软链接由 Docker 构建恢复。
+
+## Windows：构建
 
 在 Windows PowerShell 中执行：
 
