@@ -222,8 +222,11 @@ struct Qwen3ShardLoader::Impl {
     }
 
     /** 根据配置构造所有目标权重，先验证完整模型再允许任何 payload 读取。 */
-    void Build(const Json &config, int rank, int world) {
-        Require(config["model_type"].string_value() == "qwen3", "only dense model_type=qwen3 is supported");
+    void Build(const Json &config, int rank, int world, ShardModel model) {
+        const bool moe = model == ShardModel::Qwen2Moe;
+        Require(config["model_type"].string_value() == (moe ? "qwen2_moe" : "qwen3"),
+                moe ? "expected model_type=qwen2_moe" : "only dense model_type=qwen3 is supported");
+        plan.model = model;
         Require(config["quantization_config"].is_null(), "quantized checkpoints require scale-layout support");
         auto positive = [&](const std::string &key) {
             uint64_t n = Integer(config[key], key);
@@ -232,7 +235,26 @@ struct Qwen3ShardLoader::Impl {
         };
         uint64_t layers = positive("num_hidden_layers"), hidden = positive("hidden_size");
         uint64_t qHeads = positive("num_attention_heads"), kvHeads = positive("num_key_value_heads");
-        uint64_t intermediate = positive("intermediate_size"), vocab = positive("vocab_size");
+        uint64_t intermediate = positive(moe ? "moe_intermediate_size" : "intermediate_size");
+        uint64_t vocab = positive("vocab_size");
+        if (moe) {
+            Require(world == 1 || world == 2 || world == 4, "EP size must be 1, 2 or 4");
+            plan.expertCount = positive("num_experts");
+            plan.expertsPerToken = positive("num_experts_per_tok");
+            plan.sharedIntermediateSize = positive("shared_expert_intermediate_size");
+            Require(plan.expertsPerToken <= plan.expertCount && plan.expertCount <= 256 &&
+                    intermediate <= 262144 && plan.sharedIntermediateSize <= 262144,
+                    "unsupported MoE expert dimensions");
+            Require(config["norm_topk_prob"].is_null() || config["norm_topk_prob"].is_bool(),
+                    "invalid norm_topk_prob");
+            plan.normTopkProb = config["norm_topk_prob"].bool_value();
+            Require(config["decoder_sparse_step"].is_null() ||
+                    Integer(config["decoder_sparse_step"], "decoder_sparse_step") == 1,
+                    "only all-MoE layers (decoder_sparse_step=1) are supported");
+            Require(config["mlp_only_layers"].is_null() ||
+                    (config["mlp_only_layers"].is_array() && config["mlp_only_layers"].array_items().empty()),
+                    "dense mlp_only_layers are unsupported");
+        }
         Require(qHeads % kvHeads == 0, "Q heads must be divisible by KV heads");
         Require(!config["head_dim"].is_null() || hidden % qHeads == 0, "head_dim is required");
         uint64_t headDim = config["head_dim"].is_null() ? hidden / qHeads : positive("head_dim");
@@ -262,7 +284,7 @@ struct Qwen3ShardLoader::Impl {
             return static_cast<float>(value);
         };
         plan.rmsNormEps = forwardNumber("rms_norm_eps", 1e-6f);
-        plan.ropeTheta = forwardNumber("rope_theta", 1000000.0f);
+        plan.ropeTheta = forwardNumber("rope_theta", moe ? 10000.0f : 1000000.0f);
         if ((!config["hidden_act"].is_null() && config["hidden_act"].string_value() != "silu") ||
             !config["rope_scaling"].is_null() || !config["rope_parameters"].is_null() ||
             (!config["use_sliding_window"].is_null() &&
@@ -281,12 +303,15 @@ struct Qwen3ShardLoader::Impl {
                 }
             }
         }
-        auto mlp = Partition(intermediate, rank, world);
-        auto vocabulary = Partition(vocab, rank, world);
-        Partition(qHeads, rank, world);
+        auto mlp = Partition(intermediate, moe ? 0 : rank, moe ? 1 : world);
+        auto vocabulary = Partition(vocab, moe ? 0 : rank, moe ? 1 : world);
+        Partition(qHeads, moe ? 0 : rank, moe ? 1 : world);
         uint64_t group = qHeads / kvHeads;
         std::pair<uint64_t, uint64_t> q, kv;
-        if (static_cast<uint64_t>(world) <= kvHeads) {
+        if (moe) {
+            q = {0, qHeads};
+            kv = {0, kvHeads};
+        } else if (static_cast<uint64_t>(world) <= kvHeads) {
             kv = Partition(kvHeads, rank, world);
             q = {kv.first * group, kv.second * group};
         } else {
@@ -361,8 +386,10 @@ struct Qwen3ShardLoader::Impl {
             std::string attn = prefix + "self_attn.", mlpPrefix = prefix + "mlp.";
             replicate(prefix + "input_layernorm.weight", {hidden});
             replicate(prefix + "post_attention_layernorm.weight", {hidden});
-            replicate(attn + "q_norm.weight", {headDim});
-            replicate(attn + "k_norm.weight", {headDim});
+            if (!moe) {
+                replicate(attn + "q_norm.weight", {headDim});
+                replicate(attn + "k_norm.weight", {headDim});
+            }
 
             for (const std::string suffix : {"weight", "bias"}) {
                 bool bias = suffix == "bias";
@@ -391,6 +418,31 @@ struct Qwen3ShardLoader::Impl {
             check(attn + "o_proj.weight", {hidden, qWidth});
             add(attn + "o_proj.weight", {hidden, plan.queryHeadCount * headDim},
                 {{attn + "o_proj.weight", 0, hidden, q.first * headDim, q.second * headDim}});
+            if (moe) {
+                replicate(mlpPrefix + "gate.weight", {plan.expertCount, hidden});
+                replicate(mlpPrefix + "shared_expert_gate.weight", {1, hidden});
+                // 所有专家先验证布局；只有归属本 rank 的专家才进入目标计划。
+                for (uint64_t expert = 0; expert <= plan.expertCount; ++expert) {
+                    bool shared = expert == plan.expertCount;
+                    uint64_t width = shared ? plan.sharedIntermediateSize : intermediate;
+                    std::string name = mlpPrefix + (shared ? "shared_expert." :
+                        "experts." + std::to_string(expert) + ".");
+                    check(name + "gate_proj.weight", {width, hidden});
+                    check(name + "up_proj.weight", {width, hidden});
+                    check(name + "down_proj.weight", {hidden, width});
+                    if (shared || expert % world == uint64_t(rank)) {
+                        add(name + "gateup_proj.weight", {2 * width, hidden}, {
+                            {name + "gate_proj.weight", 0, width, 0, hidden},
+                            {name + "up_proj.weight", 0, width, 0, hidden}});
+                        replicate(name + "down_proj.weight", {hidden, width});
+                    }
+                }
+                if (sources.count(attn + "o_proj.bias")) {
+                    replicate(attn + "o_proj.bias", {hidden});
+                }
+                continue;
+            }
+
             std::vector<ShardSlice> gateUp;
             for (const std::string projection : {"gate_proj.weight", "up_proj.weight"}) {
                 check(mlpPrefix + projection, {intermediate, hidden});
@@ -415,14 +467,14 @@ struct Qwen3ShardLoader::Impl {
     }
 };
 
-Qwen3ShardLoader::Qwen3ShardLoader(const std::string &directory, int rank, int worldSize)
+Qwen3ShardLoader::Qwen3ShardLoader(const std::string &directory, int rank, int worldSize, ShardModel model)
     : impl(new Impl) {
     Require(worldSize > 0 && rank >= 0 && rank < worldSize, "invalid rank/world size");
     // 保存绝对路径，调用方后续切换工作目录不能改变分片的来源文件。
     const fs::path root = fs::absolute(directory);
     Json config = ReadJson(root / "config.json");
     impl->IndexDirectory(root);
-    impl->Build(config, rank, worldSize);
+    impl->Build(config, rank, worldSize, model);
 }
 
 Qwen3ShardLoader::~Qwen3ShardLoader() = default;

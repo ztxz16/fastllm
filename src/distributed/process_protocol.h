@@ -23,7 +23,8 @@ enum class Kind : uint32_t {
     LoadQwen3, ModelLoaded, ReadWeight, WeightData, UnloadQwen3, ModelUnloaded,
     ForwardLayer, LayerOutput, PrefillQwen3, PrefillLogits,
     BeginQwen3Request, DecodeQwen3, EndQwen3Request, Qwen3RequestEnded,
-    QueryQwen3Request, Qwen3RequestState, ClearQwen3Prefix, Qwen3PrefixCleared
+    QueryQwen3Request, Qwen3RequestState, ClearQwen3Prefix, Qwen3PrefixCleared,
+    LoadQwenMoe, ForwardMoeLayer, MoeLayerOutput
 };
 struct Message {
     Kind kind;

@@ -144,11 +144,12 @@ struct DeviceRuntime {
     /**
      * 按控制消息创建本 rank 的 GPU 权重，任何失败交由主循环终止进程。
      * @param rank 本 worker 的 rank。
-     * @param world TP 进程数。
+     * @param world TP 或 EP 进程数。
      * @param payload 两个 uint64 配额及不含 NUL 的模型路径。
+     * @param moe true 选择 Qwen2 MoE 专家分片；false 保持稠密 Qwen3 TP。
      * @return 张量数、GPU 字节数、源读取字节数；不是前向就绪标志。
      */
-    std::vector<uint8_t> LoadWeights(int rank, int world, const std::vector<uint8_t> &payload) {
+    std::vector<uint8_t> LoadWeights(int rank, int world, const std::vector<uint8_t> &payload, bool moe = false) {
         if (controlOnly) {
             throw std::runtime_error("Qwen3 weights require CUDA");
         }
@@ -163,7 +164,11 @@ struct DeviceRuntime {
         if (directory.find('\0') != std::string::npos) {
             throw std::runtime_error("invalid Qwen3 path");
         }
-        fastllm::distributed::Qwen3ShardLoader loader(directory, rank, world);
+        if (moe && (cudaGraph || prefixCache || customAllReduce)) {
+            throw std::runtime_error("MoE layer requires Eager and NCCL without prefix cache");
+        }
+        fastllm::distributed::Qwen3ShardLoader loader(directory, rank, world,
+            moe ? fastllm::distributed::ShardModel::Qwen2Moe : fastllm::distributed::ShardModel::DenseQwen3);
         weights = std::make_unique<fastllm::distributed::Qwen3DeviceWeights>(
             loader, stream, Get64(payload, 0), Get64(payload, 8));
         std::vector<uint8_t> result;
@@ -214,6 +219,76 @@ struct DeviceRuntime {
             weights->Clear();
             weights.reset();
         }
+#endif
+    }
+
+    /**
+     * 解码整轮 MoE 输入，仅把本 rank 激活送入执行器；空闲 rank 仍参加 NCCL。
+     * @param rank 当前 Attention/EP rank。
+     * @param world 同一通信组的 rank 数。
+     * @param payload 五个头字段及逐 rank 的 Token 数、位置和 FP32 激活。
+     * @return 有界中间量与实际通信计数；协议或计算失败退出 worker。
+     */
+    std::vector<uint8_t> ForwardMoe(int rank, int world, const std::vector<uint8_t> &payload) {
+        if (controlOnly || payload.size() < 20 || Get32(payload, 12) != uint32_t(world) ||
+            !Get32(payload, 16) || Get32(payload, 16) > INT_MAX) {
+            throw std::runtime_error("invalid MoE layer payload/state");
+        }
+#ifdef FASTLLM_PROCESS_TP_CUDA
+        if (!weights || weights->Plan().model != fastllm::distributed::ShardModel::Qwen2Moe) {
+            throw std::runtime_error("MoE weights not loaded");
+        }
+        uint32_t hidden = Get32(payload, 4), capacity = 1, tokens = 0, position = 0;
+        if (hidden != weights->Plan().hiddenSize) throw std::runtime_error("invalid MoE hidden size");
+        std::vector<float> input;
+        size_t offset = 20;
+        for (int peer = 0; peer < world; ++peer) {
+            uint32_t count = Get32(payload, offset), begin = Get32(payload, offset + 4);
+            offset += 8;
+            uint64_t elements = uint64_t(count) * hidden;
+            if (count > 2048 || begin > 1048576 || elements > (payload.size() - offset) / 4) {
+                throw std::runtime_error("invalid MoE rank input");
+            }
+            capacity = std::max(capacity, count);
+            if (peer == rank) {
+                tokens = count;
+                position = begin;
+                for (uint64_t i = 0; i < elements; ++i) {
+                    uint32_t bits = Get32(payload, offset + i * 4);
+                    float value;
+                    memcpy(&value, &bits, sizeof(bits));
+                    input.push_back(value);
+                }
+            }
+            offset += elements * 4;
+        }
+        if (offset != payload.size()) throw std::runtime_error("trailing MoE payload");
+        if (!layerExecutor) {
+            layerExecutor = std::make_unique<fastllm::distributed::Qwen3LayerExecutor>(
+                *weights, stream, comm, *allReduce);
+        }
+        auto output = layerExecutor->ForwardMoe(Get32(payload, 0), tokens, capacity, position,
+            static_cast<fastllm::distributed::Qwen3LayerStage>(Get32(payload, 8)), input);
+        std::vector<uint8_t> result;
+        Put32(result, output.allGatherCalls);
+        Put32(result, output.reduceScatterCalls);
+        Put32(result, output.indexedDecode);
+        for (const auto *values : {&output.output, &output.routerLogits, &output.routingWeights,
+                                   &output.routedOutput, &output.sharedOutput}) {
+            Put32(result, values->size());
+            for (float value : *values) {
+                uint32_t bits;
+                memcpy(&bits, &value, sizeof(bits));
+                Put32(result, bits);
+            }
+        }
+        for (const auto *values : {&output.selectedExperts, &output.expertTokens}) {
+            Put32(result, values->size());
+            for (uint32_t value : *values) Put32(result, value);
+        }
+        return result;
+#else
+        throw std::runtime_error("worker built without CUDA");
 #endif
     }
 
@@ -455,6 +530,7 @@ int main(int argc, char **argv) {
             Kind response;
             std::vector<uint8_t> payload;
             if (message.kind != Kind::Initialize && message.kind != Kind::LoadQwen3 &&
+                message.kind != Kind::LoadQwenMoe && message.kind != Kind::ForwardMoeLayer &&
                 message.kind != Kind::ReadWeight && message.kind != Kind::ForwardLayer &&
                 message.kind != Kind::PrefillQwen3 && message.kind != Kind::BeginQwen3Request &&
                 message.kind != Kind::DecodeQwen3 && message.kind != Kind::AllReduce && !message.payload.empty()) {
@@ -487,11 +563,17 @@ int main(int argc, char **argv) {
                     payload = runtime.ForwardLayer(message.payload);
                     response = Kind::LayerOutput;
                     break;
+                case Kind::ForwardMoeLayer:
+                    if (!initialized) throw std::runtime_error("MoE forward before Initialize");
+                    payload = runtime.ForwardMoe(rank, world, message.payload);
+                    response = Kind::MoeLayerOutput;
+                    break;
+                case Kind::LoadQwenMoe:
                 case Kind::LoadQwen3:
                     if (!initialized) {
                         throw std::runtime_error("LoadQwen3 before Initialize");
                     }
-                    payload = runtime.LoadWeights(rank, world, message.payload);
+                    payload = runtime.LoadWeights(rank, world, message.payload, message.kind == Kind::LoadQwenMoe);
                     response = Kind::ModelLoaded;
                     break;
                 case Kind::ReadWeight:
@@ -550,6 +632,7 @@ int main(int argc, char **argv) {
             }
             auto responseTimeout = message.kind == Kind::ForwardLayer ?
                 std::chrono::milliseconds(Get32(message.payload, 20)) :
+                message.kind == Kind::ForwardMoeLayer ? std::chrono::milliseconds(Get32(message.payload, 16)) :
                 (message.kind == Kind::PrefillQwen3 || message.kind == Kind::BeginQwen3Request || message.kind == Kind::DecodeQwen3) ?
                 std::chrono::milliseconds(Get32(message.payload, 4)) :
                 std::chrono::milliseconds(10000);
