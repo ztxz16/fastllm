@@ -2985,6 +2985,9 @@ extern "C" bool FastllmCudaTritonMxfp4Grouped(
 // Return the owning cache only when a complete layer can use a native child
 // at the requested row count. Equal non-null owners can share one launch.
 void *FastllmCudaNativeMoeGraphOwner(fastllm::Data **weights, int count, int rows);
+// Prepare optional expert plans before opening the parent graph memory pool.
+// Unsupported formats and unavailable records keep their ordinary fallback.
+void FastllmCudaPrepareNativeMoeKernelPlan(fastllm::Data **weights, int count, int rows, int topk);
 bool FastllmCudaGraphAppendChild(const void *child);
 // Release only after all parent graphs and executables referencing this child.
 void FastllmCudaReleaseNativeMoeFullGraph(void *handle);

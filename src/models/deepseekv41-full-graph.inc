@@ -791,6 +791,19 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
     if (verifying) V41Assign(initialHidden, ws.hiddenStates, g->devices);
     bool poolOpen = false;
     try {
+        // Expert children are built between captured attention segments. Their
+        // private benchmark must finish before the shared allocation transaction
+        // opens; it is intentionally forbidden while that pool is active.
+        if (hybrid && !attentionOnly) {
+            for (int l = firstLayer; l < endLayer; ++l) {
+                if (state->segments[l * 4 + 3].containsGpuMoe || weights[l][2]->isDiskWeight) continue;
+                const size_t owner = g->tensorParallel ? size_t(l) * g->devices.size() / block_cnt : 0;
+                FastllmCudaSetDevice(g->devices[owner]);
+                auto routed = weights[l]; routed[0] = routed[1] = nullptr;
+                FastllmCudaPrepareNativeMoeKernelPlan(routed.data(), routed.size(), batch, num_experts_per_tok);
+            }
+            FastllmCudaSetDevice(g->devices.front());
+        }
         std::vector<std::vector<const void *>> children(g->devices.size());
         auto capture = [&](const std::function<void()> &body) {
             std::vector<size_t> allocations;

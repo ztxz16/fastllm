@@ -6129,6 +6129,22 @@ void FastllmCudaReleaseNativeMoeFullGraph(void *handle) {
 #endif
 }
 
+void FastllmCudaPrepareNativeMoeKernelPlan(fastllm::Data **weights, int count, int rows, int topk) {
+#if defined(USE_NUMAS) && !defined(USE_ROCM) && CUDART_VERSION >= 11070
+    if (!fastllm::kernels::Enabled() || rows < 2 || topk < 1 || topk > kMaxTopK ||
+        FastllmCudaGraphIsCapturing() || FastllmCudaGraphMemoryPoolActive()) return;
+    auto *cache = static_cast<DeviceCache *>(FastllmCudaNativeMoeGraphOwner(weights, count, rows));
+    int table = -1;
+    auto *group = cache ? FindHybridGroup(weights, count, &table) : nullptr;
+    if (!group) return;
+    const auto &layout = group->LayerLayout(table);
+    const int tileRows = NativeBatchTileRows(layout, rows);
+    // Match the compute adapter's launch tiles, including a final partial tile.
+    for (int first = 0; first < rows; first += tileRows)
+        WarmupMxfp4KernelPlan(layout, *cache, std::min(tileRows, rows - first), topk);
+#endif
+}
+
 void *FastllmCudaCreateNativeMoeFullGraph(const fastllm::Data &input, const fastllm::Data &index,
         const fastllm::Data &score, fastllm::Data &output, fastllm::Data **weights, int weightsBatch,
         int layer, const void *sharedGraph, void **graph) {
