@@ -359,7 +359,12 @@
     "留空使用对应的内置生成后端；也可填写自定义路径。": "Leave blank to use the bundled generation backend, or enter a custom path.",
     "生成结果目录（可选）": "Output directory (optional)",
     "图像生成": "Image generation",
-    "图像生成工作室": "Image generation studio"
+    "图像生成工作室": "Image generation studio",
+    "视频多卡并行": "Video multi-GPU parallelism",
+    "自动选择": "Automatic",
+    "TP · 分摊权重显存": "TP · Split model weights",
+    "SP · 分摊序列计算": "SP · Split sequence computation",
+    "权重精度自动识别。多卡量化模型默认使用 SP；显存较小时可选择 TP。": "Weight precision is detected automatically. Multi-GPU quantized models default to SP; select TP to reduce weight memory per GPU."
   },
   "messages": {
     "Pi Agent": "Pi Agent",

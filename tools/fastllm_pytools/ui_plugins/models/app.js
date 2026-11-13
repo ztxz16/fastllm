@@ -89,7 +89,7 @@ function fillForm(config) {
   state.speculativeCountField = initialSpeculativeTokenField(config || {});
   if (config.use_external_draft) document.getElementById("editor-speculative").open = true;
   for (const input of elements.launchForm.querySelectorAll("[data-field]")) {
-    const value = config?.[input.dataset.field];
+    const value = config?.[input.dataset.field] ?? (input.dataset.field === "video_parallel_mode" ? "auto" : undefined);
     if (input.type === "checkbox") {
       input.checked = Boolean(value);
     } else {

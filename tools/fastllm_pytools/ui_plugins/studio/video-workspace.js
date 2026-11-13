@@ -32,6 +32,7 @@ export class VideoWorkspace {
     this.addingReferences = false;
     this.referenceAvailable = null;
     this.healthService = "";
+    this.health = null;
     this.loading = new Set();
     this.cancelling = new Set();
     this.polling = false;
@@ -63,6 +64,7 @@ export class VideoWorkspace {
           <div class="h3-service">
             <label for="video-service" data-copy="model"></label
             ><select id="video-service"></select>
+            <div id="video-runtime" class="h3-runtime" role="status" hidden></div>
           </div>
           <div class="h3-modes" role="group" data-label="mode">
             <button type="button" data-mode="text" data-copy="textMode"></button
@@ -366,6 +368,7 @@ export class VideoWorkspace {
     if (active) this.poll();
   }
   availability() {
+    this.showRuntime();
     const service = this.services.find((item) => item.id === this.service);
     this.$("generate").disabled =
       this.submitting ||
@@ -396,6 +399,7 @@ export class VideoWorkspace {
     ++this.revision;
     this.service = id;
     this.healthService = "";
+    this.health = null;
     this.referenceAvailable = null;
     this.showReferenceAvailability();
     this.jobs = [];
@@ -420,6 +424,7 @@ export class VideoWorkspace {
     try {
       const health = await this.options.request(id, "/health");
       if (this.disposed || this.service !== id) return;
+      this.health = health;
       this.referenceAvailable = health.reference_model_available !== false;
       this.showReferenceAvailability();
       this.availability();
@@ -430,6 +435,21 @@ export class VideoWorkspace {
   showReferenceAvailability() {
     this.root.querySelector('[data-mode="reference"]').disabled = this.referenceAvailable === false;
     this.$("reference-unavailable").hidden = this.referenceAvailable !== false;
+  }
+  showRuntime() {
+    const root = this.$("runtime"), health = this.health;
+    root.replaceChildren();
+    const precision = this.mode === "reference" ? health?.reference_dit_precision : health?.dit_precision;
+    root.hidden = !precision;
+    if (!precision) return;
+    const mode = health.dit_parallel_mode || "single";
+    const count = mode === "sp" ? health.dit_sequence_parallel_size : health.dit_tensor_parallel_size;
+    const values = [precision.toUpperCase(), mode === "single" ? this.tr("单卡", "Single GPU") : `${mode.toUpperCase()} × ${count || 1}`];
+    for (const value of values) {
+      const badge = document.createElement("span");
+      badge.textContent = value;
+      root.append(badge);
+    }
   }
   error(message) {
     this.$("error").textContent = message;

@@ -72,6 +72,7 @@ class DeployConfig:
     output_dir: str = ""
     video_gpu_memory_limit: str = ""
     video_host_memory_limit: str = ""
+    video_parallel_mode: str = "auto"
     command: str = "server"
     model: str = ""
     model_name: str = ""

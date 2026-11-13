@@ -5,6 +5,7 @@ probe, capabilities and public API contract. No inference implementation lives
 in the launcher or in the studio.
 """
 import os
+import json
 import math
 import re
 import shutil
@@ -123,6 +124,15 @@ class H3Backend:
 
     def model_name(self, config):
         root = Path(config.model).expanduser()
+        manifest = root / "h3_quantization.json" if root.is_dir() else root
+        if manifest.name == "h3_quantization.json" and manifest.is_file():
+            try:
+                with manifest.open(encoding="utf-8") as stream:
+                    source = json.loads(stream.read(65537))
+                if isinstance(source, dict) and source.get("pika"):
+                    return "pika-h3-flex"
+            except (OSError, ValueError):
+                pass  # The native loader reports malformed model manifests.
         return "pika-h3-flex" if any((root / task / name).exists()
             for task in ("fl2va", "ref2va")
             for name in ("manifest.json", "adapter.safetensors")) else "minimax-h3"
@@ -162,6 +172,8 @@ class H3Backend:
             command.extend(("--gpu-memory-limit", config.video_gpu_memory_limit.strip()))
         if config.video_host_memory_limit.strip():
             command.extend(("--host-memory-limit", config.video_host_memory_limit.strip()))
+        if config.video_parallel_mode != "auto":
+            command.extend(("--parallel-mode", config.video_parallel_mode))
         return command
 
     def validate(self, config):
@@ -170,8 +182,12 @@ class H3Backend:
             errors.append({"message": message, "fields": list(fields)})
         if config.command != "server":
             add("视频模型需要使用 API Server 启动方式。", "command")
-        if not Path(config.model).expanduser().is_dir() or not config.model.strip():
-            add("请选择已存在的 MiniMax H3 或 Pika H3 模型目录。", "model")
+        model = Path(config.model).expanduser()
+        if not config.model.strip() or not (model.is_dir() or
+                (model.is_file() and model.name == "h3_quantization.json")):
+            add("请选择 MiniMax H3、Pika H3 模型目录或 h3_quantization.json。", "model")
+        if config.video_parallel_mode not in {"auto", "tp", "sp"}:
+            add("视频并行方式须为 auto、tp 或 sp。", "video_parallel_mode")
         if config.base_model.strip() and not Path(config.base_model).expanduser().is_dir():
             add("MiniMax H3 基座目录不存在。", "base_model")
         executable = self.executable(config)

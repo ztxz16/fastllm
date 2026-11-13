@@ -46,7 +46,7 @@ class H(BaseHTTPRequestHandler):
    self.answer({'error':{'message':'unauthorized'}},401); return False
   return True
  def do_GET(self):
-  if self.path=='/health': return self.answer({'ready':time.monotonic()-started>float(os.environ.get('READY_DELAY','.4')), 'reference_model_available':True},200 if time.monotonic()-started>float(os.environ.get('READY_DELAY','.4')) else 503)
+  if self.path=='/health': return self.answer({'ready':time.monotonic()-started>float(os.environ.get('READY_DELAY','.4')), 'reference_model_available':True, 'dit_precision':'fp8', 'reference_dit_precision':'gguf', 'dit_parallel_mode':'sp', 'dit_sequence_parallel_size':2, 'dit_tensor_parallel_size':1},200 if time.monotonic()-started>float(os.environ.get('READY_DELAY','.4')) else 503)
   if not self.auth(): return
   if self.path=='/v1/models': return self.answer({'data':[{'id':'stub-'+args.kind}], 'visible':os.environ.get('CUDA_VISIBLE_DEVICES')})
   if self.path in ('/v1/videos','/v1/images/jobs'): return self.answer({'data':list(jobs.values())})
@@ -140,6 +140,28 @@ class ServiceTest(unittest.TestCase):
         argv = self.commands[-1][0]
         self.assertEqual(argv[argv.index("--model") + 1], str(model))
         self.assertNotIn("--precision", argv)
+
+    def test_quantized_video_manifest_and_parallel_mode(self):
+        from fastllm_pytools import service_backends
+        view = self.directory / "quantized-video"
+        view.mkdir()
+        manifest = view / "h3_quantization.json"
+        manifest.write_text(json.dumps({"format_version": 1, "base_model": "../base",
+                                        "pika": "../adapter", "fl2va": "../weights.safetensors"}))
+        for model in (str(view), str(manifest)):
+            config = config_from_dict(self.profile("minimax_h3", model=model, video_parallel_mode="tp", visible_gpus="4,5"))
+            command = build_fastllm_argv(config)
+            self.assertEqual(command[command.index("--parallel-mode") + 1], "tp")
+            self.assertEqual(command[command.index("--devices") + 1], "0,1")
+            self.assertEqual(service_backends.H3Backend().model_name(config), "pika-h3-flex")
+            self.assertNotIn("--precision", command)
+            self.assertEqual(validate_config(config), [])
+        config.video_parallel_mode = "invalid"
+        fields = []
+        validate_config(config, fields)
+        self.assertTrue(any("video_parallel_mode" in item["fields"] for item in fields))
+        manifest.write_text("{}")
+        self.assertEqual(service_backends.H3Backend().model_name(config), "minimax-h3")
 
     def test_gpu_mask_is_composed_and_auto_configuration_preserves_it(self):
         self.assertEqual(visible_gpu_environment("1,0", {"CUDA_VISIBLE_DEVICES": "6,7"}), {"CUDA_VISIBLE_DEVICES": "7,6"})
@@ -553,6 +575,11 @@ class ServiceTest(unittest.TestCase):
             page.locator("#open-endpoint").click()
             expect(page.locator("#video-service")).to_have_value(video)
             expect(page.locator("#video-studio")).to_be_visible()
+            expect(page.locator("#video-runtime")).to_contain_text("FP8")
+            expect(page.locator("#video-runtime")).to_contain_text("SP × 2")
+            page.locator('#video-studio [data-mode="reference"]').click()
+            expect(page.locator("#video-runtime")).to_contain_text("GGUF")
+            page.locator('#video-studio [data-mode="text"]').click()
             page.locator("#video-prompt").fill("A cat walking")
             page.locator("#video-generate").click()
             expect(page.locator(".video-job")).to_have_count(1)
