@@ -1696,9 +1696,15 @@ cd /home/project/vllm_fastllm
 git switch master
 git pull --ff-only origin master
 # 沿用已确认的四卡顺序；未设置时脚本默认 0,1,2,3。
-export ATTENTION_EP_PYTHON=/home/venvs/fastllm-dp/bin/python3
+# 默认使用当前环境的 python3；清除旧服务器遗留的解释器路径。
+unset ATTENTION_EP_PYTHON
 bash test/distributed/run_qwen_moe_layer_v100.sh
 ```
+
+脚本默认从当前 `PATH` 选择 `python3`，兼容已激活的 Conda/venv 环境，不要求
+存在 `/home/venvs/fastllm-dp`。需要固定解释器时，在运行前设置
+`export ATTENTION_EP_PYTHON=/实际环境/bin/python3`（替换为服务器上的有效路径）。
+启动时打印实际解释器并检查 Python 3.10+；显式指定无效路径时直接报错，不自动换环境。
 
 脚本先运行配置/协议及数学参考的 Python 检查、四卡实际分配预览，再编译 worker 和
 检查器。随后回归稠密 Qwen3 的 CPU 权重读取、GPU 上传、单层计算，最后执行 MoE
@@ -1708,7 +1714,7 @@ bash test/distributed/run_qwen_moe_layer_v100.sh
 已有正确构建产物时可以单独运行 MoE 检查，不编译：
 
 ```bash
-/home/venvs/fastllm-dp/bin/python3 test/distributed/run_qwen_moe_layer.py \
+"${ATTENTION_EP_PYTHON:-python3}" test/distributed/run_qwen_moe_layer.py \
   --check build-process-tp-cu126/fastllm_moe_layer_check \
   --worker build-process-tp-cu126/fastllm_tp_worker \
   --devices 0,1,2,3 --build-cache build-process-tp-cu126/CMakeCache.txt
