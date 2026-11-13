@@ -4,9 +4,24 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 
 moe_build="${ATTENTION_EP_BUILD:-build-process-tp-cu126}"
-moe_python="${ATTENTION_EP_PYTHON:-/home/venvs/fastllm-dp/bin/python3}"
 unset PYTHONHOME PYTHONPATH LD_PRELOAD
 export PYTHONNOUSERSITE=1
+
+# 默认沿用当前已激活的 Python 环境；显式指定无效路径时直接报错。
+if ! moe_python="$(command -v -- "${ATTENTION_EP_PYTHON:-python3}")" || [[ ! -f "$moe_python" || ! -x "$moe_python" ]]; then
+    echo "找不到可执行的 Python：${ATTENTION_EP_PYTHON:-python3}" >&2
+    echo '请激活 Python 3.10+ 环境，或将 ATTENTION_EP_PYTHON 设为有效的解释器路径；unset ATTENTION_EP_PYTHON 可恢复自动选择。' >&2
+    exit 1
+fi
+if ! "$moe_python" -c 'import sys
+if sys.version_info < (3, 10):
+    sys.exit("需要 Python 3.10+，实际版本：" + sys.version)
+print("验收 Python：" + sys.executable + " (" + sys.version.split()[0] + ")", flush=True)
+'; then
+    echo 'Python 启动或版本检查失败，请通过 ATTENTION_EP_PYTHON 指定可用的 Python 3.10+。' >&2
+    exit 1
+fi
+
 export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-12.6}"
 export CUDACXX="$CUDA_HOME/bin/nvcc"
 export PATH="$CUDA_HOME/bin:$PATH"
