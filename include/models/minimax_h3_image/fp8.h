@@ -8,6 +8,7 @@ namespace fastllm::minimax_h3_image {
 class Fp8Weights final : public QuantizedWeights {
   public:
     explicit Fp8Weights(const std::string &path);
+    Fp8Weights(const std::string &path, const ProjectionOptions &);
     ~Fp8Weights() override;
     Fp8Weights(const Fp8Weights &) = delete;
     Fp8Weights &operator=(const Fp8Weights &) = delete;

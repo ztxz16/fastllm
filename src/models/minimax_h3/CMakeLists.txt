@@ -42,7 +42,8 @@ endif()
 if(FASTLLM_CUTLASS_FP8_SM120_ENABLED AND NOT CUDA_NO_TENSOR_CORE AND
    CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "12.8" AND
    EXISTS "${FASTLLM_CUTLASS_DIR}/include/cutlass/cutlass.h")
-    add_library(fastllm_image_fp8_sm120 OBJECT ../minimax_h3_image/fp8_scaled.cu ../minimax_h3_image/nvfp4_scaled.cu)
+    add_library(fastllm_image_fp8_sm120 OBJECT ../minimax_h3_image/fp8_scaled.cu ../minimax_h3_image/nvfp4_scaled.cu
+        ../minimax_h3_image/nvfp4_scaled_fp32.cu)
     if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "13.0")
         set(image_fp8_arch "120f")
     else()

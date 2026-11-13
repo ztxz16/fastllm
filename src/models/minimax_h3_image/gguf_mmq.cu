@@ -107,10 +107,15 @@ bool ggufMmq(const Tensor &input, const Tensor &packed, Tensor &output, uint32_t
         }
 #undef MMQ_CASE
         const size_t count = size_t(rows)*output.cols;
-        convert<<<int(std::min(size_t(4096), (count+255)/256)), 256, 0, cudaStreamPerThread>>>(
-            reinterpret_cast<const float *>(accumulator.data),
-            reinterpret_cast<B *>(output.data)+size_t(offset)*output.cols, count);
-        check(cudaGetLastError());
+        if(output.isFloat32())
+            check(cudaMemcpyAsync(reinterpret_cast<float *>(output.data)+size_t(offset)*output.cols,
+                                  accumulator.data,count*sizeof(float),cudaMemcpyDeviceToDevice,cudaStreamPerThread));
+        else {
+            convert<<<int(std::min(size_t(4096), (count+255)/256)), 256, 0, cudaStreamPerThread>>>(
+                reinterpret_cast<const float *>(accumulator.data),
+                reinterpret_cast<B *>(output.data)+size_t(offset)*output.cols, count);
+            check(cudaGetLastError());
+        }
     }
     return true;
 }

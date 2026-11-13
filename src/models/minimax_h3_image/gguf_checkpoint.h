@@ -23,6 +23,7 @@ class GgufCheckpoint {
     const GgufTensor &tensor(const std::string &name) const;
     void read(const GgufTensor &, uint64_t offset, void *out, size_t bytes);
     void validateModel() const;
+    void validateVideoModel() const;
 
   private:
     std::ifstream file_;
@@ -34,5 +35,6 @@ class GgufCheckpoint {
     uint64_t integer(unsigned bytes);
     std::string string();
     void skipValue(uint32_t type);
+    void validateProjections() const;
 };
 } // namespace fastllm::minimax_h3_image::detail

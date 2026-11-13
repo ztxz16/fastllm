@@ -1,5 +1,6 @@
 #pragma once
 #include "json11.hpp"
+#include "quantized_partition.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -91,6 +92,38 @@ class QuantizedCheckpoint {
         auto result = json11::Json::parse(text, error);
         requireCheckpoint(error.empty() && result.is_object(), "invalid quantization marker JSON");
         return result;
+    }
+    // FP8/INT8 share byte-wise uploads. Image exports may store Q/K/V
+    // separately; video TP slices one packed projection before upload.
+    void uploadByteMatrices(const std::vector<json11::Json> &matrices, void *dest,
+                            const ProjectionSlice &slice) {
+        if (slice.size > 1) {
+            requireCheckpoint(matrices.size() == 1, "packed video projection expected");
+            uploadSlice(matrices.front(), dest, slice, size_t(slice.fullCols), size_t(slice.cols),
+                        size_t(slice.firstColumn()));
+            return;
+        }
+        size_t offset = 0;
+        for (const auto &matrix : matrices) {
+            const size_t bytes = size_t(matrix["shape"][0].int_value()) * slice.cols;
+            upload(matrix, static_cast<char *>(dest) + offset, bytes);
+            offset += bytes;
+        }
+    }
+    void uploadSlice(const json11::Json &d, void *dest, const ProjectionSlice &slice,
+                     size_t sourceStride, size_t targetStride, size_t firstByte,
+                     int rowUnit = 1, bool positiveE4m3 = false) {
+        if (slice.size == 1) {
+            upload(d, dest, size_t(slice.rows/rowUnit)*targetStride, positiveE4m3);
+            return;
+        }
+        slice.transfer([&](size_t offset, void *host, size_t bytes) { readRange(d,offset,host,bytes); },
+            [&](size_t offset, const void *host, size_t bytes) {
+                auto e=cudaMemcpyAsync(static_cast<char *>(dest)+offset,host,bytes,
+                                       cudaMemcpyHostToDevice,cudaStreamPerThread);
+                if(e==cudaSuccess) e=cudaStreamSynchronize(cudaStreamPerThread);
+                if(e!=cudaSuccess) throw std::runtime_error(cudaGetErrorString(e));
+            }, sourceStride,targetStride,firstByte,rowUnit,positiveE4m3);
     }
     void upload(const json11::Json &d, void *dest, size_t bytes, bool positiveE4m3 = false) {
         requireCheckpoint(payloadBytes(d) == bytes, "quantized matrix byte size mismatch");

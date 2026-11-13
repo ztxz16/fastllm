@@ -84,7 +84,7 @@ __global__ void swapNibbles(uint8_t *p, size_t n) {
 }
 class Nvfp4Weights final : public QuantizedWeights {
   public:
-    explicit Nvfp4Weights(const std::string &path);
+    Nvfp4Weights(const std::string &path, const ProjectionOptions &);
     ~Nvfp4Weights() override;
     void validateModel() const override;
     Tensor linear(const Tensor &, const std::string &, Tensor *) override;
@@ -96,6 +96,7 @@ class Nvfp4Weights final : public QuantizedWeights {
     std::unique_ptr<Impl> impl_;
 };
 struct Nvfp4Weights::Impl : detail::QuantizedCheckpoint {
+    ProjectionOptions options;
     struct Weight {
         Tensor q, s;
         int n = 0, k = 0;
@@ -103,7 +104,7 @@ struct Nvfp4Weights::Impl : detail::QuantizedCheckpoint {
     };
     json11::Json metadata;
     std::map<std::string, Weight> weights;
-    explicit Impl(const std::string &path) : QuantizedCheckpoint(path) {
+    Impl(const std::string &path, const ProjectionOptions &o) : QuantizedCheckpoint(path), options(o) {
         std::string error;
         metadata =
             json11::Json::parse(header["__metadata__"]["_quantization_metadata"].string_value(), error);
@@ -113,8 +114,9 @@ struct Nvfp4Weights::Impl : detail::QuantizedCheckpoint {
     void validate(const std::string &name, int n, int k) const {
         const auto d = metadata["layers"][name];
         require(d["format"].string_value() == "nvfp4" && d["group_size"].number_value() == 16 &&
-                    d["orig_shape"].array_items().size() == 2 && d["orig_shape"][0].number_value() == n &&
-                    d["orig_shape"][1].number_value() == k && n > 0 && n % 128 == 0 && k > 0 && k % 64 == 0,
+                    ((options.comfyVideo && d["orig_shape"].is_null()) ||
+                     (d["orig_shape"].array_items().size() == 2 && d["orig_shape"][0].number_value() == n &&
+                      d["orig_shape"][1].number_value() == k)) && n > 0 && n % 128 == 0 && k > 0 && k % 64 == 0,
                 "invalid NVFP4 layer metadata: " + name);
         auto q = desc(name + ".weight", "U8", size_t(n) * k / 2);
         auto scale = desc(name + ".weight_scale", "F8_E4M3", size_t(n) * k / 16);
@@ -132,11 +134,26 @@ struct Nvfp4Weights::Impl : detail::QuantizedCheckpoint {
         auto shape = metadata["layers"][name]["orig_shape"];
         w.n = shape[0].int_value();
         w.k = shape[1].int_value();
+        if(options.comfyVideo && shape.is_null()) {
+            const auto packed = descriptor(name+".weight","U8")["shape"];
+            require(packed.array_items().size()==2 && packed[1].number_value()<=INT32_MAX/2,
+                    "invalid NVFP4 logical shape");
+            w.n=packed[0].int_value(); w.k=packed[1].int_value()*2;
+        }
         validate(name, w.n, w.k);
+        detail::ProjectionSlice slice(name,w.n,w.k,options);
+        require(slice.rows%128==0 && slice.cols%64==0 && slice.firstColumn()%64==0,
+                "NVFP4 TP partition must align to scale tiles");
+        const auto matrix=desc(name+".weight","U8",size_t(w.n)*w.k/2);
+        const auto scales=desc(name+".weight_scale","F8_E4M3",size_t(w.n)*w.k/16);
+        w.n=slice.rows; w.k=slice.cols;
         w.q = Tensor(w.n, w.k / 4);
         w.s = Tensor(w.n, w.k / 32);
-        upload(desc(name + ".weight", "U8", w.q.bytes()), w.q.data, w.q.bytes());
-        upload(desc(name + ".weight_scale", "F8_E4M3", w.s.bytes()), w.s.data, w.s.bytes(), true);
+        uploadSlice(matrix,w.q.data,slice,slice.fullCols/2,slice.cols/2,slice.firstColumn()/2);
+        // Comfy NVFP4 scales already use 128x4-group CUTLASS tiles. Slice
+        // whole tiles and retain the intra-tile permutation, not logical rows.
+        uploadSlice(scales,w.s.data,slice,size_t(slice.fullCols/64)*512,size_t(slice.cols/64)*512,
+                    size_t(slice.firstColumn()/64)*512,128,true);
         auto d = desc(name + ".weight_scale_2", "F32", 4);
         read(d, &w.global, 4);
         require(std::isfinite(w.global) && w.global > 0, "NVFP4 global scale");
@@ -152,19 +169,24 @@ struct Nvfp4Weights::Impl : detail::QuantizedCheckpoint {
         int padded = (x.rows + 127) / 128 * 128;
         Tensor q(padded, w.k / 4), s(padded, w.k / 32), global(1, 2, true),
             out = dst ? *dst : Tensor(x.rows, w.n);
-        require(out.rows == x.rows && out.cols == w.n && out.dtype == DType::BF16, "NVFP4 output shape");
+        require(out.rows == x.rows && out.cols == w.n &&
+                (out.dtype == DType::BF16 || out.dtype == DType::FP32), "NVFP4 output shape");
         ck(cudaMemsetAsync(global.data, 0, 8, cudaStreamPerThread));
         maximum<<<256, 256, 0, cudaStreamPerThread>>>((B *)x.data, (float *)global.data, x.size());
+        if(options.activationMaximum) {
+            Tensor amax=global; amax.cols=1;
+            options.activationMaximum(amax);
+        }
         quant<<<4096, 256, 0, cudaStreamPerThread>>>((B *)x.data, (uint8_t *)q.data, (uint8_t *)s.data,
                                                      (float *)global.data, w.global, x.rows, padded, w.k);
         ck(cudaGetLastError());
         detail::nvfp4Gemm(out.data, q.data, w.q.data, s.data, w.s.data, (float *)global.data + 1, x.rows, w.n,
-                          w.k, cudaStreamPerThread);
+                          w.k, cudaStreamPerThread, out.isFloat32());
         return out;
     }
 };
-Nvfp4Weights::Nvfp4Weights(const std::string &path)
-    : QuantizedWeights(WeightFormat::NVFP4), impl_(std::make_unique<Impl>(path)) {}
+Nvfp4Weights::Nvfp4Weights(const std::string &path, const ProjectionOptions &options)
+    : QuantizedWeights(WeightFormat::NVFP4), impl_(std::make_unique<Impl>(path,options)) {}
 Nvfp4Weights::~Nvfp4Weights() = default;
 void detail::validateNvfp4Device(int device) {
     cudaDeviceProp p{};
@@ -192,8 +214,8 @@ void Nvfp4Weights::erasePrefix(const std::string &p) {
             ++i;
 }
 void Nvfp4Weights::clear() { impl_->weights.clear(); }
-std::unique_ptr<QuantizedWeights> detail::loadNvfp4(const std::string &path) {
-    return std::make_unique<Nvfp4Weights>(path);
+std::unique_ptr<QuantizedWeights> detail::loadNvfp4(const std::string &path, const ProjectionOptions &options) {
+    return std::make_unique<Nvfp4Weights>(path, options);
 }
 } // namespace fastllm::minimax_h3_image
 #else
@@ -202,7 +224,7 @@ namespace fastllm::minimax_h3_image::detail {
 void validateNvfp4Device(int) {
     throw std::runtime_error("image NVFP4 requires CUDA 12.8+ and the SM120 CUTLASS backend");
 }
-std::unique_ptr<QuantizedWeights> loadNvfp4(const std::string &) {
+std::unique_ptr<QuantizedWeights> loadNvfp4(const std::string &, const ProjectionOptions &) {
     validateNvfp4Device(0);
     return {};
 }

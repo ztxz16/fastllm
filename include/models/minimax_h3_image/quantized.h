@@ -3,12 +3,23 @@
 #include "models/minimax_h3_image/source.h"
 
 namespace fastllm::minimax_h3_image {
+// The video adapter validates the complete model before selecting a backend
+// per projection. Comfy QKV is packed, and TP slices checkpoint bytes before
+// upload. Default options preserve the image loaders' existing contracts.
+struct ProjectionOptions {
+    bool comfyVideo = false;
+    int rank = 0, size = 1;
+    // Optional global amax for NVFP4 activation scaling across TP/SP ranks.
+    std::function<void(minimax_h3::Tensor &)> activationMaximum;
+};
 // One instance belongs to one runtime/stream. QKV is always [all Q, all K, all
 // V]. Allocations follow the caller's TensorPool and release with the model.
 class QuantizedWeights {
   public:
     virtual ~QuantizedWeights() = default;
     static std::unique_ptr<QuantizedWeights> load(const std::string &path);
+    static std::unique_ptr<QuantizedWeights> load(const std::string &path, WeightFormat,
+                                                 const ProjectionOptions &);
     static void validateDevice(WeightFormat, int device, bool multipleDevices = false);
     virtual void validateModel() const = 0;
     virtual minimax_h3::Tensor linear(const minimax_h3::Tensor &, const std::string &,

@@ -116,10 +116,11 @@ template <int Cols> __global__ void quantizeVector(const B *x, uint8_t *q, float
         }
     }
 }
-__global__ void finish(const B *raw, const float *xs, const float *ws, B *out, size_t count, int cols) {
+template<class Input, class Output>
+__global__ void finish(const Input *raw, const float *xs, const float *ws, Output *out, size_t count, int cols) {
     for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < count;
          i += size_t(blockDim.x) * gridDim.x)
-        out[i] = B(float(raw[i]) * xs[i / cols] * ws[i % cols]);
+        out[i] = Output(float(raw[i]) * xs[i / cols] * ws[i % cols]);
 }
 __global__ void packQkv(const uint32_t *src, uint32_t *dst, int rows, int words) {
     for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < size_t(rows) * words;
@@ -153,6 +154,7 @@ struct Weight {
 };
 } // namespace
 struct Fp8Weights::Impl : detail::QuantizedCheckpoint {
+    ProjectionOptions options;
     bool unsloth = false, nativePackedQkv = false;
     json11::Json quantMetadata;
     cublasLtHandle_t handle = nullptr;
@@ -161,7 +163,7 @@ struct Fp8Weights::Impl : detail::QuantizedCheckpoint {
     bool scaledSm120 = false;
     std::map<std::string, Weight> weights;
     std::map<std::string, std::unique_ptr<Plan>> plans;
-    explicit Impl(const std::string &path) : QuantizedCheckpoint(path) {
+    Impl(const std::string &path, const ProjectionOptions &o) : QuantizedCheckpoint(path), options(o) {
         std::string error;
         unsloth = header["transformer_blocks.0.attn.to_q._weight_qdata"].is_object();
         const auto metadata = header["__metadata__"]["_quantization_metadata"].string_value();
@@ -172,6 +174,10 @@ struct Fp8Weights::Impl : detail::QuantizedCheckpoint {
             // Original H3 matrices interleave Q/K/V inside each head instead.
             nativePackedQkv =
                 quantMetadata["layers"]["blocks.0.attn.qkv_proj"]["format"].string_value() == "float8_e4m3fn";
+        }
+        if(options.comfyVideo) {
+            require(!unsloth, "video projections require the validated Comfy layout");
+            nativePackedQkv = true;
         }
     }
     ~Impl() {
@@ -227,13 +233,11 @@ struct Fp8Weights::Impl : detail::QuantizedCheckpoint {
         require(w.cols % 16 == 0 && w.rows % 16 == 0, "unaligned FP8 matrix");
         if (qkv)
             require(w.rows == 21504 && w.cols == 5376, "FP8 QKV layout");
+        detail::ProjectionSlice slice(name, w.rows, w.cols, options);
+        w.rows=slice.rows; w.cols=slice.cols;
+        if(options.size>1) scales=slice.scales(scales);
         w.bytes = Tensor(w.rows, w.cols / 2);
-        size_t offset = 0;
-        for (auto &d : matrices) {
-            size_t bytes = size_t(d["shape"][0].int_value()) * w.cols;
-            upload(d, reinterpret_cast<char *>(w.bytes.data) + offset, bytes);
-            offset += bytes;
-        }
+        uploadByteMatrices(matrices, w.bytes.data, slice);
         // Diffusers stores [value, gate]; the original H3 uses [gate, value].
         // Apply the identical row permutation to both payload and per-row scales.
         if (unsloth && name.find(".fc1") != std::string::npos) {
@@ -282,7 +286,7 @@ struct Fp8Weights::Impl : detail::QuantizedCheckpoint {
         int padded = (x.rows + 15) / 16 * 16;
         Tensor q(padded, x.cols / 2), scale(1, padded, true);
         Tensor out = destination ? *destination : Tensor(x.rows, w.rows);
-        require(out.rows == x.rows && out.cols == w.rows && out.dtype == DType::BF16, "FP8 output shape");
+        require(out.rows == x.rows && out.cols == w.rows && (out.dtype == DType::BF16 || out.dtype == DType::FP32), "FP8 output shape");
         auto *input = reinterpret_cast<const B *>(x.data);
         auto *quantized = reinterpret_cast<uint8_t *>(q.data);
         auto *scales = reinterpret_cast<float *>(scale.data);
@@ -300,12 +304,12 @@ struct Fp8Weights::Impl : detail::QuantizedCheckpoint {
             detail::fp8ScaledSm120(q.data, w.bytes.data, scales,
                                    reinterpret_cast<const float *>(w.scales.data), out.data, x.rows, w.rows,
                                    x.cols, device, multiprocessors, workspace.data, workspace.bytes(),
-                                   cudaStreamPerThread);
+                                   cudaStreamPerThread, out.isFloat32());
             return out;
         }
 #endif
-        Tensor raw(padded, w.rows);
-        auto key = std::to_string(padded) + ":" + std::to_string(w.rows) + ":" + std::to_string(w.cols);
+        Tensor raw(padded, w.rows, out.dtype);
+        auto key = std::to_string(padded) + ":" + std::to_string(w.rows) + ":" + std::to_string(w.cols) + (out.isFloat32() ? ":fp32" : "");
         auto &plan = plans[key];
         if (!plan) {
             auto p = std::make_unique<Plan>();
@@ -320,7 +324,7 @@ struct Fp8Weights::Impl : detail::QuantizedCheckpoint {
                                               sizeof(unit)));
             ck(cublasLtMatrixLayoutCreate(&p->a, CUDA_R_8F_E4M3, w.cols, w.rows, w.cols));
             ck(cublasLtMatrixLayoutCreate(&p->b, CUDA_R_8F_E4M3, x.cols, padded, x.cols));
-            ck(cublasLtMatrixLayoutCreate(&p->c, CUDA_R_16BF, w.rows, padded, w.rows));
+            ck(cublasLtMatrixLayoutCreate(&p->c, out.isFloat32() ? CUDA_R_32F : CUDA_R_16BF, w.rows, padded, w.rows));
             ck(cublasLtMatmulPreferenceCreate(&p->pref));
             size_t bytes = workspace.bytes();
             ck(cublasLtMatmulPreferenceSetAttribute(p->pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &bytes,
@@ -337,6 +341,10 @@ struct Fp8Weights::Impl : detail::QuantizedCheckpoint {
         ck(cublasLtMatmul(handle, plan->op, &alpha, w.bytes.data, plan->a, q.data, plan->b, &beta, raw.data,
                           plan->c, raw.data, plan->c, &plan->algorithm, workspace.data, workspace.bytes(),
                           cudaStreamPerThread));
+        if(out.isFloat32())
+            finish<<<4096,256,0,cudaStreamPerThread>>>((float *)raw.data,(float *)scale.data,
+                (float *)w.scales.data,(float *)out.data,out.size(),w.rows);
+        else
         finish<<<4096, 256, 0, cudaStreamPerThread>>>(
             reinterpret_cast<B *>(raw.data), reinterpret_cast<float *>(scale.data),
             reinterpret_cast<float *>(w.scales.data), reinterpret_cast<B *>(out.data), out.size(), w.rows);
@@ -344,8 +352,9 @@ struct Fp8Weights::Impl : detail::QuantizedCheckpoint {
         return out;
     }
 };
-Fp8Weights::Fp8Weights(const std::string &path)
-    : QuantizedWeights(WeightFormat::FP8), impl_(std::make_unique<Impl>(path)) {}
+Fp8Weights::Fp8Weights(const std::string &path) : Fp8Weights(path,{}) {}
+Fp8Weights::Fp8Weights(const std::string &path, const ProjectionOptions &options)
+    : QuantizedWeights(WeightFormat::FP8), impl_(std::make_unique<Impl>(path,options)) {}
 Fp8Weights::~Fp8Weights() = default;
 void Fp8Weights::validateDevice(int device, bool multipleDevices) {
     cudaDeviceProp properties{};
@@ -422,6 +431,7 @@ namespace {
 void unavailable() { throw std::runtime_error("image FP8 requires a build with CUDA 11.8 or newer"); }
 } // namespace
 Fp8Weights::Fp8Weights(const std::string &) : QuantizedWeights(WeightFormat::FP8) { unavailable(); }
+Fp8Weights::Fp8Weights(const std::string &path, const ProjectionOptions &) : Fp8Weights(path) {}
 Fp8Weights::~Fp8Weights() = default;
 void Fp8Weights::validateDevice(int, bool) { unavailable(); }
 void Fp8Weights::validateModel() const { unavailable(); }

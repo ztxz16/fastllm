@@ -112,10 +112,11 @@ __global__ void rotateQuantize(const B *x, int8_t *q, float *scales, int rows, i
         }
     }
 }
-__global__ void finish(const int32_t *raw, const float *xs, const float *ws, B *out, size_t count, int cols) {
+template<class Output>
+__global__ void finish(const int32_t *raw, const float *xs, const float *ws, Output *out, size_t count, int cols) {
     for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < count;
          i += size_t(blockDim.x) * gridDim.x)
-        out[i] = B(float(raw[i]) * xs[i / cols] * ws[i % cols]);
+        out[i] = Output(float(raw[i]) * xs[i / cols] * ws[i % cols]);
 }
 struct Plan {
     cublasLtMatmulDesc_t op = nullptr;
@@ -142,7 +143,7 @@ struct Weight {
 } // namespace
 class Int8Weights final : public QuantizedWeights {
   public:
-    explicit Int8Weights(const std::string &path);
+    Int8Weights(const std::string &path, const ProjectionOptions &);
     ~Int8Weights() override;
     void validateModel() const override;
     Tensor linear(const Tensor &, const std::string &, Tensor *) override;
@@ -154,6 +155,7 @@ class Int8Weights final : public QuantizedWeights {
     std::unique_ptr<Impl> impl_;
 };
 struct Int8Weights::Impl : detail::QuantizedCheckpoint {
+    ProjectionOptions options;
     bool unsloth = false, rotationVerified = false;
     std::string checkpointPath;
     cublasLtHandle_t handle = nullptr;
@@ -162,8 +164,9 @@ struct Int8Weights::Impl : detail::QuantizedCheckpoint {
     bool fusedGemm = false;
     std::map<std::string, Weight> weights;
     std::map<std::string, std::unique_ptr<Plan>> plans;
-    explicit Impl(const std::string &path) : QuantizedCheckpoint(path), checkpointPath(path) {
+    Impl(const std::string &path, const ProjectionOptions &o) : QuantizedCheckpoint(path), options(o), checkpointPath(path) {
         unsloth = header["transformer_blocks.0.attn.to_q._weight_qdata"].is_object();
+        require(!options.comfyVideo || !unsloth, "video projections require the validated Comfy layout");
     }
     ~Impl() {
         cudaStreamSynchronize(cudaStreamPerThread);
@@ -319,13 +322,11 @@ struct Int8Weights::Impl : detail::QuantizedCheckpoint {
         require(w.cols % 16 == 0 && w.rows % 16 == 0, "unaligned INT8 matrix");
         if (qkv)
             require(w.rows == 21504 && w.cols == 5376, "INT8 QKV layout");
+        detail::ProjectionSlice slice(name, w.rows, w.cols, options);
+        w.rows=slice.rows; w.cols=slice.cols;
+        if(options.size>1) scales=slice.scales(scales);
         w.bytes = Tensor(w.rows, w.cols / 2);
-        size_t offset = 0;
-        for (auto &d : matrices) {
-            size_t bytes = size_t(d["shape"][0].int_value()) * w.cols;
-            upload(d, reinterpret_cast<char *>(w.bytes.data) + offset, bytes);
-            offset += bytes;
-        }
+        uploadByteMatrices(matrices, w.bytes.data, slice);
         // Diffusers stores [value, gate]; the original H3 uses [gate, value].
         // Apply the identical row permutation to both payload and per-row scales.
         if (unsloth && name.find(".fc1") != std::string::npos) {
@@ -358,7 +359,7 @@ struct Int8Weights::Impl : detail::QuantizedCheckpoint {
         int padded = (x.rows + 15) / 16 * 16;
         Tensor q(padded, x.cols / 2), scale(1, padded, true);
         Tensor out = destination ? *destination : Tensor(x.rows, w.rows);
-        require(out.rows == x.rows && out.cols == w.rows && out.dtype == DType::BF16, "INT8 output shape");
+        require(out.rows == x.rows && out.cols == w.rows && (out.dtype == DType::BF16 || out.dtype == DType::FP32), "INT8 output shape");
         auto *input = reinterpret_cast<const B *>(x.data);
         auto *quantized = reinterpret_cast<int8_t *>(q.data);
         auto *scales = reinterpret_cast<float *>(scale.data);
@@ -368,6 +369,9 @@ struct Int8Weights::Impl : detail::QuantizedCheckpoint {
         case 1:
             rotateQuantize<1>
                 <<<padded, 256, 0, cudaStreamPerThread>>>(input, quantized, scales, x.rows, x.cols);
+            break;
+        case 2:
+            rotateQuantize<2><<<padded,256,0,cudaStreamPerThread>>>(input,quantized,scales,x.rows,x.cols);
             break;
         case 3:
             rotateQuantize<3>
@@ -389,7 +393,7 @@ struct Int8Weights::Impl : detail::QuantizedCheckpoint {
         if (fusedGemm) {
             detail::int8ScaledGemm(out.data, q.data, w.bytes.data, scales,
                                    reinterpret_cast<const float *>(w.scales.data), x.rows, w.rows, w.cols,
-                                   cudaStreamPerThread);
+                                   cudaStreamPerThread, out.isFloat32());
             return out;
         }
 #endif
@@ -425,6 +429,10 @@ struct Int8Weights::Impl : detail::QuantizedCheckpoint {
         ck(cublasLtMatmul(handle, plan->op, &alpha, w.bytes.data, plan->a, q.data, plan->b, &beta, raw.data,
                           plan->c, raw.data, plan->c, &plan->algorithm, workspace.data, workspace.bytes(),
                           cudaStreamPerThread));
+        if(out.isFloat32())
+            finish<<<4096,256,0,cudaStreamPerThread>>>((int32_t *)raw.data,(float *)scale.data,
+                (float *)w.scales.data,(float *)out.data,out.size(),w.rows);
+        else
         finish<<<4096, 256, 0, cudaStreamPerThread>>>(
             reinterpret_cast<int32_t *>(raw.data), reinterpret_cast<float *>(scale.data),
             reinterpret_cast<float *>(w.scales.data), reinterpret_cast<B *>(out.data), out.size(), w.rows);
@@ -432,8 +440,8 @@ struct Int8Weights::Impl : detail::QuantizedCheckpoint {
         return out;
     }
 };
-Int8Weights::Int8Weights(const std::string &path)
-    : QuantizedWeights(WeightFormat::INT8), impl_(std::make_unique<Impl>(path)) {}
+Int8Weights::Int8Weights(const std::string &path, const ProjectionOptions &options)
+    : QuantizedWeights(WeightFormat::INT8), impl_(std::make_unique<Impl>(path,options)) {}
 Int8Weights::~Int8Weights() = default;
 void detail::validateInt8Device(int device) {
     cudaDeviceProp properties{};
@@ -493,15 +501,15 @@ void Int8Weights::clear() {
         impl_->handle = nullptr;
     }
 }
-std::unique_ptr<QuantizedWeights> detail::loadInt8(const std::string &path) {
-    return std::make_unique<Int8Weights>(path);
+std::unique_ptr<QuantizedWeights> detail::loadInt8(const std::string &path, const ProjectionOptions &options) {
+    return std::make_unique<Int8Weights>(path, options);
 }
 } // namespace fastllm::minimax_h3_image
 #else
 #include <stdexcept>
 namespace fastllm::minimax_h3_image::detail {
 void validateInt8Device(int) { throw std::runtime_error("image INT8 requires CUDA 11.8 or newer"); }
-std::unique_ptr<QuantizedWeights> loadInt8(const std::string &) {
+std::unique_ptr<QuantizedWeights> loadInt8(const std::string &, const ProjectionOptions &) {
     validateInt8Device(0);
     return {};
 }

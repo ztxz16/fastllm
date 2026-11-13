@@ -1,5 +1,6 @@
 #include "gguf_checkpoint.h"
 #include "quantized_backends.h"
+#include "quantized_partition.h"
 #include <algorithm>
 #include <climits>
 #include <cublas_v2.h>
@@ -113,6 +114,7 @@ class GgufWeights final : public QuantizedWeights {
         size_t rowBytes;
     };
     GgufCheckpoint checkpoint_;
+    ProjectionOptions options_;
     std::map<std::string, Weight> weights_;
     cublasHandle_t handle_ = nullptr;
     Tensor workspace_;
@@ -127,9 +129,23 @@ class GgufWeights final : public QuantizedWeights {
         w.cols = int(d.dimensions[0]);
         w.rows = int(d.dimensions[1]);
         w.type = d.type;
-        w.rowBytes = size_t(d.bytes / w.rows);
+        const ProjectionSlice slice(name,w.rows,w.cols,options_);
+        const auto block=ggufBlock(w.type);
+        require(slice.cols%block.values==0 && slice.firstColumn()%block.values==0,
+                "GGUF TP partition must align to quantization blocks; use TP2/TP4 or SP");
+        const size_t sourceStride=size_t(d.bytes/w.rows);
+        w.rows=slice.rows; w.cols=slice.cols;
+        w.rowBytes = size_t(w.cols/block.values)*block.bytes;
         require(w.rowBytes % 2 == 0 && w.rowBytes / 2 <= size_t(INT_MAX), "GGUF packed row size");
         w.packed = Tensor(w.rows, int(w.rowBytes / 2));
+        if(options_.size>1) {
+            slice.transfer([&](size_t offset,void *host,size_t bytes) {checkpoint_.read(d,offset,host,bytes);},
+                [&](size_t offset,const void *host,size_t bytes) {
+                    check(cudaMemcpyAsync(reinterpret_cast<char *>(w.packed.data)+offset,host,bytes,
+                                          cudaMemcpyHostToDevice,cudaStreamPerThread));
+                    check(cudaStreamSynchronize(cudaStreamPerThread));
+                },sourceStride,w.rowBytes,size_t(slice.firstColumn()/block.values)*block.bytes);
+        } else {
         std::vector<char> staging(std::min(d.bytes, uint64_t(8) << 20));
         for (uint64_t offset = 0; offset < d.bytes;) {
             const size_t n = std::min(uint64_t(staging.size()), d.bytes - offset);
@@ -139,11 +155,13 @@ class GgufWeights final : public QuantizedWeights {
             check(cudaStreamSynchronize(cudaStreamPerThread));
             offset += n;
         }
+        }
         return weights_.emplace(name, std::move(w)).first->second;
     }
 
   public:
-    explicit GgufWeights(const std::string &path) : QuantizedWeights(WeightFormat::GGUF), checkpoint_(path) {}
+    GgufWeights(const std::string &path, const ProjectionOptions &options)
+        : QuantizedWeights(WeightFormat::GGUF), checkpoint_(path), options_(options) {}
     ~GgufWeights() override {
         if (device_ >= 0)
             cudaSetDevice(device_);
@@ -152,7 +170,10 @@ class GgufWeights final : public QuantizedWeights {
             cublasDestroy(handle_);
         }
     }
-    void validateModel() const override { checkpoint_.validateModel(); }
+    void validateModel() const override {
+        if(options_.comfyVideo) checkpoint_.validateVideoModel();
+        else checkpoint_.validateModel();
+    }
     Tensor linear(const Tensor &x, const std::string &name, Tensor *destination) override {
         int device = 0;
         check(cudaGetDevice(&device));
@@ -164,7 +185,8 @@ class GgufWeights final : public QuantizedWeights {
         auto &w = get(name);
         require(x.data && x.rows > 0 && x.dtype == DType::BF16 && x.cols == w.cols, "GGUF input shape/dtype");
         Tensor out = destination ? *destination : Tensor(x.rows, w.rows);
-        require(out.data && out.rows == x.rows && out.cols == w.rows && out.dtype == DType::BF16 &&
+        require(out.data && out.rows == x.rows && out.cols == w.rows &&
+                    (out.dtype == DType::BF16 || out.dtype == DType::FP32) &&
                     out.storage != x.storage && out.storage != w.packed.storage,
                 "GGUF output shape/alias");
 #ifdef FASTLLM_IMAGE_GGUF_MMQ
@@ -189,8 +211,10 @@ class GgufWeights final : public QuantizedWeights {
                        w.type);
             float one = 1, zero = 0;
             check(cublasGemmEx(handle_, CUBLAS_OP_T, CUBLAS_OP_N, n, x.rows, x.cols, &one, decoded.data,
-                               CUDA_R_16BF, w.cols, x.data, CUDA_R_16BF, x.cols, &zero, out.data + row,
-                               CUDA_R_16BF, out.cols, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                               CUDA_R_16BF, w.cols, x.data, CUDA_R_16BF, x.cols, &zero,
+                               reinterpret_cast<char *>(out.data)+size_t(row)*(out.isFloat32()?4:2),
+                               out.isFloat32()?CUDA_R_32F:CUDA_R_16BF, out.cols,
+                               CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
         }
         return out;
     }
@@ -212,7 +236,7 @@ void validateGgufDevice(int device) {
     check(cudaGetDeviceProperties(&p, device));
     require(p.major >= 8, "GGUF image inference requires SM80+ for BF16 stages");
 }
-std::unique_ptr<QuantizedWeights> loadGguf(const std::string &path) {
-    return std::make_unique<GgufWeights>(path);
+std::unique_ptr<QuantizedWeights> loadGguf(const std::string &path, const ProjectionOptions &options) {
+    return std::make_unique<GgufWeights>(path, options);
 }
 } // namespace fastllm::minimax_h3_image::detail

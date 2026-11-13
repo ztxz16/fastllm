@@ -5,15 +5,22 @@
 
 namespace fastllm::minimax_h3_image {
 std::unique_ptr<QuantizedWeights> QuantizedWeights::load(const std::string &path) {
-    switch (inspectWeightFormat(path)) {
+    return load(path, inspectWeightFormat(path), {});
+}
+std::unique_ptr<QuantizedWeights> QuantizedWeights::load(const std::string &path, WeightFormat format,
+                                                       const ProjectionOptions &options) {
+    if (options.size < 1 || options.rank < 0 || options.rank >= options.size ||
+        (!options.comfyVideo && options.size != 1))
+        throw std::invalid_argument("invalid quantized projection partition");
+    switch (format) {
     case WeightFormat::FP8:
-        return std::make_unique<Fp8Weights>(path);
+        return std::make_unique<Fp8Weights>(path, options);
     case WeightFormat::INT8:
-        return detail::loadInt8(path);
+        return detail::loadInt8(path, options);
     case WeightFormat::NVFP4:
-        return detail::loadNvfp4(path);
+        return detail::loadNvfp4(path, options);
     case WeightFormat::GGUF:
-        return detail::loadGguf(path);
+        return detail::loadGguf(path, options);
     default:
         throw std::invalid_argument("expected an H3 Image quantized checkpoint");
     }

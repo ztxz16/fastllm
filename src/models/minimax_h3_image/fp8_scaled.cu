@@ -16,7 +16,8 @@ using namespace cute;
 using namespace cutlass::epilogue::fusion;
 using F8 = cutlass::float_e4m3_t;
 using BF = cutlass::bfloat16_t;
-template <int M, int N, int K> struct Config {
+template <int M, int N, int K, class O = BF> struct Config {
+    using ElementOutput = O;
     using Tile = Shape<Int<M>, Int<N>, Int<K>>;
     using Cluster = Shape<_1, _1, _1>;
     using WScale = Sm90RowBroadcast<0, Tile, float, float, Stride<_0, _1, _0>>;
@@ -25,12 +26,12 @@ template <int M, int N, int K> struct Config {
         Sm90EVT<Sm90Compute<cutlass::multiplies, float, float, cutlass::FloatRoundStyle::round_to_nearest>,
                 WScale, Sm90AccFetch>;
     using Output =
-        Sm90EVT<Sm90Compute<cutlass::multiplies, BF, float, cutlass::FloatRoundStyle::round_to_nearest>,
+        Sm90EVT<Sm90Compute<cutlass::multiplies, O, float, cutlass::FloatRoundStyle::round_to_nearest>,
                 XScale, ScaledAccumulator>;
     using Epilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
         cutlass::arch::Sm120, cutlass::arch::OpClassTensorOp, Tile, Cluster,
-        cutlass::epilogue::collective::EpilogueTileAuto, float, float, void, cutlass::layout::RowMajor, 8, BF,
-        cutlass::layout::RowMajor, 8, cutlass::epilogue::collective::EpilogueScheduleAuto,
+        cutlass::epilogue::collective::EpilogueTileAuto, float, float, void, cutlass::layout::RowMajor, 8, O,
+        cutlass::layout::RowMajor, 16 / sizeof(O), cutlass::epilogue::collective::EpilogueScheduleAuto,
         Output>::CollectiveOp;
     using Mainloop = typename cutlass::gemm::collective::CollectiveBuilder<
         cutlass::arch::Sm120, cutlass::arch::OpClassTensorOp, F8, cutlass::layout::RowMajor, 16, F8,
@@ -60,7 +61,7 @@ void launch(const void *x, const void *w, const float *xs, const float *ws, void
     typename Gemm::Arguments args{cutlass::gemm::GemmUniversalMode::kGemm,
                                   {m, n, k, 1},
                                   {static_cast<const F8 *>(x), sa, static_cast<const F8 *>(w), sb},
-                                  {scale, nullptr, outputStride, static_cast<BF *>(y), outputStride},
+                                  {scale, nullptr, outputStride, static_cast<typename C::ElementOutput *>(y), outputStride},
                                   hardware};
     check(Gemm::can_implement(args));
     if (Gemm::get_workspace_size(args) > workspaceBytes)
@@ -71,20 +72,27 @@ void launch(const void *x, const void *w, const float *xs, const float *ws, void
 }
 } // namespace
 
-void fp8ScaledSm120(const void *x, const void *w, const float *xs, const float *ws, void *y, int m, int n,
+template<class Output>
+void dispatch(const void *x, const void *w, const float *xs, const float *ws, void *y, int m, int n,
                     int k, int device, int multiprocessors, void *workspace, size_t workspaceBytes,
                     cudaStream_t stream) {
     // H3's wide QKV/FC1 projections benefit from a wider N tile. Narrow
     // projections use a shorter K tile where it improves SM120 throughput.
     // Small shapes retain the general kernel, including low-memory requests.
     if (m >= 1024 && n >= 16384)
-        launch<Config<128, 256, 64>>(x, w, xs, ws, y, m, n, k, device, multiprocessors, workspace,
+        launch<Config<128, 256, 64, Output>>(x, w, xs, ws, y, m, n, k, device, multiprocessors, workspace,
                                      workspaceBytes, stream);
     else if (m >= 1024 && n <= 8192 && (m <= 3072 || k <= 8192))
-        launch<Config<128, 128, 64>>(x, w, xs, ws, y, m, n, k, device, multiprocessors, workspace,
+        launch<Config<128, 128, 64, Output>>(x, w, xs, ws, y, m, n, k, device, multiprocessors, workspace,
                                      workspaceBytes, stream);
     else
-        launch<Config<128, 128, 128>>(x, w, xs, ws, y, m, n, k, device, multiprocessors, workspace,
+        launch<Config<128, 128, 128, Output>>(x, w, xs, ws, y, m, n, k, device, multiprocessors, workspace,
                                       workspaceBytes, stream);
+}
+void fp8ScaledSm120(const void *x,const void *w,const float *xs,const float *ws,void *y,int m,int n,
+                    int k,int device,int multiprocessors,void *workspace,size_t workspaceBytes,
+                    cudaStream_t stream,bool fp32Output) {
+    if(fp32Output) dispatch<float>(x,w,xs,ws,y,m,n,k,device,multiprocessors,workspace,workspaceBytes,stream);
+    else dispatch<BF>(x,w,xs,ws,y,m,n,k,device,multiprocessors,workspace,workspaceBytes,stream);
 }
 } // namespace fastllm::minimax_h3_image::detail

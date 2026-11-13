@@ -79,6 +79,13 @@ int main() {
             std::vector<int> devices(ranks);
             for(int rank=0;rank<ranks;++rank) devices[rank]=rank;
             ParallelGroup activationGroup(devices);
+            activationGroup.run([&](int rank) {
+                Runtime rt(rank,DType::FP32);
+                float values[]={1.f-rank,-5.f+rank,2.f*rank};
+                auto x=rt.upload(values,1,3);
+                activationGroup.maximum(x,rank);
+                near(rt.download(x),{1.f,float(ranks-6),float(2*(ranks-1))},0);
+            });
             for(auto dtype:{DType::BF16,DType::FP16}) {
                 Runtime root(0,dtype); Weights full(root,path);
                 for(int rows:{67,8193}) {
@@ -395,6 +402,20 @@ int main() {
             Runtime rt(rank,true); float value=float(rank+1);
             auto x=rt.upload(&value,1,1); group.sum(x,rank);
             require(rt.download(x)[0]==3,"communicator did not recover");
+        });
+        failed=false;
+        try {
+            group.run([&](int rank) {
+                if(rank==0) throw std::runtime_error("injected calibration cancellation");
+                Runtime rt(rank,true);float value=1;
+                auto x=rt.upload(&value,1,1);group.maximum(x,rank);
+            });
+        } catch(const std::exception &) {failed=true;}
+        require(failed,"calibration cancellation not propagated");
+        group.run([&](int rank) {
+            Runtime rt(rank,true);float value=float(rank+1);
+            auto x=rt.upload(&value,1,1);group.maximum(x,rank);
+            require(rt.download(x)[0]==2,"calibration communicator did not recover");
         });
         failed=false;
         try {

@@ -215,6 +215,13 @@ void ParallelGroup::sum(Tensor &x,int rank) {
     check(ncclAllReduce(x.data,x.data,x.size(),type(x.dtype),ncclSum,i.comms[rank],cudaStreamPerThread));
     i.boundary(rank,NcclSubmitRendezvous::After,x,1);
 }
+void ParallelGroup::maximum(Tensor &x,int rank) {
+    auto &i=*impl_;
+    if(size()==1) return;
+    i.boundary(rank,NcclSubmitRendezvous::Before,x,10);
+    check(ncclAllReduce(x.data,x.data,x.size(),type(x.dtype),ncclMax,i.comms[rank],cudaStreamPerThread));
+    i.boundary(rank,NcclSubmitRendezvous::After,x,10);
+}
 void ParallelGroup::sumAsync(const Tensor &x,int rank) {
     if(size()==1) return;
     if(!x.data) throw std::invalid_argument("empty asynchronous reduction");
@@ -420,6 +427,7 @@ void ParallelGroup::run(const std::function<void(int)> &task) {
 Tensor ParallelGroup::broadcast(const Tensor &x,int) { return x; }
 Tensor ParallelGroup::gatherColumns(const Tensor &x,int,int,bool) { return x; }
 void ParallelGroup::sum(Tensor &,int) {}
+void ParallelGroup::maximum(Tensor &,int) {}
 void ParallelGroup::sumAsync(const Tensor &,int) {}
 Tensor ParallelGroup::sumCast(Runtime &rt,Tensor partial,const Tensor *bias,DType output,int) {
     if(bias) partial=rt.bias(partial,*bias);

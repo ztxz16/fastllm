@@ -99,6 +99,9 @@ public:
     // its address must retain the cuBLASLt plan's 256-byte alignment.
     // Without bias, FP32 output also preserves partial sums for tensor parallelism.
     void linearInto(const Tensor &x, const Tensor &weight, Tensor &out, const Tensor *bias = nullptr);
+    // Accumulate x @ weight.T into a contiguous column range of out, using
+    // FP32 accumulation and a single final dtype rounding. Inputs cannot alias out.
+    void linearAddInto(const Tensor &x, const Tensor &weight, Tensor &out, int firstColumn = 0);
     Tensor norm(const Tensor &x, bool rms, const Tensor *weight = nullptr,
                 const Tensor *bias = nullptr, float eps = 1e-6f, int width = 0);
     Tensor activation(const Tensor &x, bool gelu = false);
@@ -108,6 +111,7 @@ public:
     Tensor siluMultiply(const Tensor &gate, const Tensor &up);
     // Packed columns are [up, gate]; no intermediate slices or copies.
     Tensor siluMultiply(const Tensor &upAndGate);
+    Tensor siluMultiply(const Tensor &packed, bool gateFirst);
     // FP32 residual/output and scale; branch may be FP32/BF16/FP16.
     // Scale is [1,cols] or [rows,cols]. Product and sum round separately.
     Tensor scaledResidual(const Tensor &fp32Residual, const Tensor &branch, const Tensor &fp32Scale);

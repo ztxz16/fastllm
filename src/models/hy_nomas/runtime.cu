@@ -283,12 +283,12 @@ template<class T, bool FusedAffine=true, bool Modulate=false> __global__ void no
 }
 template<class T,int Pack> struct alignas(sizeof(T)*Pack) ElementPack { T value[Pack]; };
 template<class T,class Index,int Pack=1>
-__global__ void packedSiluMultiply(const T *x,T *out,Index n,int width) {
+__global__ void packedSiluMultiply(const T *x,T *out,Index n,int width,bool gateFirst) {
     auto input=reinterpret_cast<const ElementPack<T,Pack> *>(x);
     auto output=reinterpret_cast<ElementPack<T,Pack> *>(out);
     for(Index i=Index(blockIdx.x)*blockDim.x+threadIdx.x;i<n;i+=Index(gridDim.x)*blockDim.x) {
         Index p=(i/width)*(Index(2)*width)+i%width;
-        auto hidden=input[p], gates=input[p+width];
+        auto hidden=input[p+(gateFirst?width:0)], gates=input[p+(gateFirst?0:width)];
         ElementPack<T,Pack> result;
 #pragma unroll
         for(int j=0;j<Pack;++j) {
@@ -712,6 +712,24 @@ void Runtime::linearInto(const Tensor &x,const Tensor &w,Tensor &out,const Tenso
     }
     check(cudaGetLastError());
 }
+void Runtime::linearAddInto(const Tensor &x,const Tensor &w,Tensor &out,int firstColumn) {
+    require(x.data && w.data && out.data && x.rows>0 && x.cols>0 && w.rows>0 && x.cols==w.cols &&
+            out.rows==x.rows && firstColumn>=0 && firstColumn<=out.cols && w.rows<=out.cols-firstColumn,
+            "linear accumulation shape mismatch");
+    require(x.dtype==w.dtype && out.dtype==x.dtype,"linear accumulation dtype mismatch");
+    require(out.storage!=x.storage && out.storage!=w.storage,"linear accumulation must not share input storage");
+    float one=1;
+    if(x.isFloat32()) {
+        check(cublasSgemm(static_cast<cublasHandle_t>(blas_),CUBLAS_OP_T,CUBLAS_OP_N,w.rows,x.rows,x.cols,
+            &one,as<float>(w),w.cols,as<float>(x),x.cols,&one,as<float>(out)+firstColumn,out.cols));
+    } else {
+        auto scalarType=x.dtype==DType::FP16?CUDA_R_16F:CUDA_R_16BF;
+        check(cublasGemmEx(static_cast<cublasHandle_t>(blas_),CUBLAS_OP_T,CUBLAS_OP_N,w.rows,x.rows,x.cols,
+            &one,w.data,scalarType,w.cols,x.data,scalarType,x.cols,&one,out.data+firstColumn,scalarType,
+            out.cols,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT));
+    }
+    check(cudaGetLastError());
+}
 Tensor Runtime::norm(const Tensor &x,bool rms,const Tensor *w,const Tensor *bias,float eps,int width) {
     if(!width) width=x.cols;
     require(width>0 && x.cols%width==0,"norm dimension mismatch");
@@ -754,6 +772,9 @@ Tensor Runtime::siluMultiply(const Tensor &x,const Tensor &y) {
 }
 
 Tensor Runtime::siluMultiply(const Tensor &x) {
+    return siluMultiply(x,false);
+}
+Tensor Runtime::siluMultiply(const Tensor &x,bool gateFirst) {
     require(x.cols%2==0,"invalid packed SiLU width");
     Tensor out(x.rows,x.cols/2,x.dtype);
     // Vectorize 16-bit loads/stores without changing the scalar FP32 arithmetic or
@@ -761,16 +782,16 @@ Tensor Runtime::siluMultiply(const Tensor &x) {
     DISPATCH_TENSOR(x.dtype, T,
         if(sizeof(T)==2 && out.cols%8==0 && uintptr_t(as<T>(x))%16==0 && out.size()<=size_t(INT32_MAX)) {
             packedSiluMultiply<T,uint32_t,8><<<grid(out.size()/8),256,0,cudaStreamPerThread>>>(
-                as<T>(x),as<T>(out),uint32_t(out.size()/8),out.cols/8);
+                as<T>(x),as<T>(out),uint32_t(out.size()/8),out.cols/8,gateFirst);
         } else if(sizeof(T)==2 && out.cols%2==0 && uintptr_t(as<T>(x))%4==0 && out.size()<=size_t(INT32_MAX)) {
             packedSiluMultiply<T,uint32_t,2><<<grid(out.size()/2),256,0,cudaStreamPerThread>>>(
-                as<T>(x),as<T>(out),uint32_t(out.size()/2),out.cols/2);
+                as<T>(x),as<T>(out),uint32_t(out.size()/2),out.cols/2,gateFirst);
         } else if(out.size()<=size_t(INT32_MAX)) {
             packedSiluMultiply<T,uint32_t><<<grid(out.size()),256,0,cudaStreamPerThread>>>(
-                as<T>(x),as<T>(out),uint32_t(out.size()),out.cols);
+                as<T>(x),as<T>(out),uint32_t(out.size()),out.cols,gateFirst);
         } else {
             packedSiluMultiply<T,size_t><<<grid(out.size()),256,0,cudaStreamPerThread>>>(
-                as<T>(x),as<T>(out),out.size(),out.cols);
+                as<T>(x),as<T>(out),out.size(),out.cols,gateFirst);
         });
     check(cudaGetLastError()); return out;
 }

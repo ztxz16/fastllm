@@ -24,6 +24,8 @@ public:
     void gatherChunks(const Tensor &, int chunks, int rank,
                       const std::function<void(int, const Tensor &)> &consume, bool inPlace = false);
     void sum(Tensor &, int rank);
+    // Shared scalar/range calibration for partitioned activation quantization.
+    void maximum(Tensor &, int rank);
     // In-place AllReduce on the communication stream; wait() before consuming.
     void sumAsync(const Tensor &, int rank);
     // Sum FP32 partials before rounding. Reduce-scatter in FP32, then gather

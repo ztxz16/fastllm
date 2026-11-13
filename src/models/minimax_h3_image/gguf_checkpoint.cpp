@@ -193,6 +193,22 @@ void GgufCheckpoint::validateModel() const {
         const auto &t = tensor(item.first);
         require(t.type == 0 && t.bytes == item.second * 4, "image protected tensor " + item.first);
     }
+    validateProjections();
+}
+void GgufCheckpoint::validateVideoModel() const {
+    require(architecture_=="wan" || architecture_=="minimax_h3", "expected Comfy H3 video layout");
+    for (const auto &item : std::vector<std::pair<std::string,uint64_t>>{
+             {"video_patch_proj.weight",5376u*96}, {"audio_patch_proj.weight",5376u*32},
+             {"final_layer.video_out.weight",96u*5376}, {"final_layer.audio_out.weight",32u*5376}}) {
+        const auto &t=tensor(item.first);
+        const auto block=ggufBlock(t.type);
+        uint64_t count=1;
+        for(auto dim:t.dimensions) count*=dim;
+        require(count==item.second && t.bytes==count/block.values*block.bytes,"video head "+item.first);
+    }
+    validateProjections();
+}
+void GgufCheckpoint::validateProjections() const {
     for (int i = 0; i < 52; ++i) {
         auto p = i < 50 ? "blocks." + std::to_string(i) : "token_refiner.blocks." + std::to_string(i - 50);
         for (const auto &item : std::vector<std::pair<std::string, std::vector<uint64_t>>>{
