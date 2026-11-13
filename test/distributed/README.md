@@ -1698,6 +1698,9 @@ git pull --ff-only origin master
 # 沿用已确认的四卡顺序；未设置时脚本默认 0,1,2,3。
 # 默认使用当前环境的 python3；清除旧服务器遗留的解释器路径。
 unset ATTENTION_EP_PYTHON
+# 固定 Toolkit，并为首次切换 CUDA 版本使用新的构建目录。
+export ATTENTION_EP_CUDA_HOME=/usr/local/cuda-12.6
+export ATTENTION_EP_BUILD=build-process-tp-cu126-v100
 bash test/distributed/run_qwen_moe_layer_v100.sh
 ```
 
@@ -1706,8 +1709,19 @@ bash test/distributed/run_qwen_moe_layer_v100.sh
 `export ATTENTION_EP_PYTHON=/实际环境/bin/python3`（替换为服务器上的有效路径）。
 启动时打印实际解释器并检查 Python 3.10+；显式指定无效路径时直接报错，不自动换环境。
 
-脚本先运行配置/协议及数学参考的 Python 检查、四卡实际分配预览，再编译 worker 和
-检查器。随后回归稠密 Qwen3 的 CPU 权重读取、GPU 上传、单层计算，最后执行 MoE
+脚本默认选择 `/usr/local/cuda-12.6`，不继承通用 `CUDA_HOME`；其他 Toolkit 安装位置
+通过 `ATTENTION_EP_CUDA_HOME` 指定。启动时打印实际 nvcc 路径和版本，并查询
+`--list-gpu-arch` 确认包含 `compute_70`。CUDA 13 已移除 Volta 离线编译支持，
+本验收使用支持 V100 的 CUDA 12.x；缺少 Toolkit 时需先安装，脚本不会自动安装或修改系统软链接。
+参考 [NVIDIA CUDA 13 发行说明](https://docs.nvidia.com/cuda/archive/13.0.3/cuda-toolkit-release-notes/index.html#deprecated-architectures)。
+
+已有构建缓存若记录了其他 nvcc 路径，脚本会在编译前拒绝复用，并提示设置
+`ATTENTION_EP_BUILD` 为新目录；旧目录和产物保留。目录名字包含 `cu126` 并不能证明
+其中缓存的编译器是 CUDA 12.6，不能沿用曾用 CUDA 13 配置的目录。
+
+脚本先检查 Python/CUDA 环境和构建缓存，再运行配置/协议及数学参考的 Python 检查、
+四卡实际分配预览，之后编译 worker 和检查器。随后回归稠密 Qwen3 的 CPU 权重读取、
+GPU 上传、单层计算，最后执行 MoE
 1/2/4 rank 的完整矩阵。`ATTENTION_EP_BUILD` 可指定构建目录，`ATTENTION_EP_JOBS`
 可指定构建并发数；不修改用户的 GPU 顺序。
 
@@ -1715,9 +1729,9 @@ bash test/distributed/run_qwen_moe_layer_v100.sh
 
 ```bash
 "${ATTENTION_EP_PYTHON:-python3}" test/distributed/run_qwen_moe_layer.py \
-  --check build-process-tp-cu126/fastllm_moe_layer_check \
-  --worker build-process-tp-cu126/fastllm_tp_worker \
-  --devices 0,1,2,3 --build-cache build-process-tp-cu126/CMakeCache.txt
+  --check "${ATTENTION_EP_BUILD:-build-process-tp-cu126}/fastllm_moe_layer_check" \
+  --worker "${ATTENTION_EP_BUILD:-build-process-tp-cu126}/fastllm_tp_worker" \
+  --devices 0,1,2,3 --build-cache "${ATTENTION_EP_BUILD:-build-process-tp-cu126}/CMakeCache.txt"
 ```
 
 验收以独立 CPU 完整层数学参考为准，`atol=0.008, rtol=0.008`，不自动放宽。
