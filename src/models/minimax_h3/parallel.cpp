@@ -1,4 +1,5 @@
 #include "models/minimax_h3/parallel.h"
+#include "models/minimax_h3/model_source.h"
 #include <cuda_runtime_api.h>
 #include <stdexcept>
 
@@ -16,6 +17,8 @@ struct ParallelModel::Rank {
     std::shared_ptr<nomas::TensorPool> pool;
     std::shared_ptr<nomas::HostMemoryBudget> hostBudget;
     bool streaming=false;
+    bool sequenceParallel=false;
+    ModelSource source;
     std::unique_ptr<nomas::TensorPool::Scope> memoryScope() {
         return pool ? std::make_unique<nomas::TensorPool::Scope>(*pool) : nullptr;
     }
@@ -43,6 +46,19 @@ ParallelModel::ParallelModel(const std::string &dir,const std::vector<int> &devi
 ParallelModel::~ParallelModel() {
     // Release device caches on their owning streams before stopping workers.
     try { group_.run([&](int rank) { ranks_[rank].reset(); }); } catch(...) {}
+}
+void ParallelModel::configureSource(const ModelSource &source,bool sequenceParallel) {
+    group_.run([&](int rank) {
+        auto &r=*ranks_[rank];
+        r.transformer.reset(); r.source=source; r.sequenceParallel=sequenceParallel;
+    });
+}
+void ParallelModel::setStreaming(bool enabled) {
+    group_.run([&](int rank) {
+        auto &r=*ranks_[rank]; r.streaming=enabled;
+        r.text.setLowMemory(enabled); r.video->setLowMemory(enabled);
+        if(r.transformer) r.transformer->setLowMemory(enabled);
+    });
 }
 void ParallelModel::setMemoryLimit(size_t bytes,const std::shared_ptr<nomas::TensorPool> &rootPool,bool streaming) {
     unload();
@@ -94,7 +110,8 @@ void ParallelModel::prepare(const std::vector<std::vector<float>> &plans,bool re
         if(r.transformer && r.reference!=reference) r.transformer.reset();
         if(!r.transformer) {
             r.transformer=std::make_unique<Transformer>(r.rt,r.full,
-                r.directory+(reference?"/transformer_ref":"/transformer"),r.context);
+                r.directory+(reference?"/transformer_ref":"/transformer"),r.context,r.sequenceParallel);
+            r.transformer->setQuantizedWeights(reference?r.source.referenceWeights:r.source.transformerWeights);
             r.reference=reference;
         }
         r.transformer->setLowMemory(r.streaming);
@@ -105,12 +122,15 @@ void ParallelModel::prepare(const std::vector<std::vector<float>> &plans,bool re
     });
 }
 std::pair<Tensor,Tensor> ParallelModel::forward(const Tensor &video,const Tensor &audio,const Tensor &text,
-                                              const PackedLayout &layout,Trace trace) {
+                                              const PackedLayout &layout,Trace trace,std::function<void()> checkpoint) {
     std::pair<Tensor,Tensor> result;
     group_.run([&](int rank) {
         auto scope=ranks_[rank]->memoryScope();
         auto v=group_.broadcast(video,rank),a=group_.broadcast(audio,rank),t=group_.broadcast(text,rank);
-        auto x=ranks_[rank]->transformer->forward(v,a,t,layout,rank==0?trace:Trace{});
+        Trace rankTrace=trace?Trace([&](const std::string &name,const Tensor &x) {
+            if(rank==0) trace(name,x);
+        }):Trace{};
+        auto x=ranks_[rank]->transformer->forward(v,a,t,layout,rankTrace,rank==0?checkpoint:std::function<void()>{});
         if(rank==0) result=std::move(x);
     });
     return result;

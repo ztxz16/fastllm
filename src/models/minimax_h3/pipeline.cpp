@@ -1,5 +1,6 @@
 #include "models/minimax_h3/runtime.h"
 #include "models/minimax_h3/parallel.h"
+#include "models/minimax_h3/model_source.h"
 #include "json11.hpp"
 #include <cuda_runtime_api.h>
 #include <algorithm>
@@ -129,6 +130,7 @@ Pipeline::Pipeline(const std::string &dir, int device, bool fp32, DType videoPre
       tokenizer_(dir + "/tokenizer"), text_(rt_, dir + "/text_encoder"),
       transformer_(rt_, full_, dir + "/transformer"), video_(videoRuntime_, full_, dir + "/vae"),
       audio_(full_, dir + "/audio_vae"), directory_(dir) {
+    devices_={device};
     auto stats = [&](const std::string &path, int channels, std::vector<float> &mean,
                      std::vector<float> &std) {
         std::ifstream file(path + "/config.json");
@@ -159,6 +161,7 @@ Pipeline::Pipeline(const std::string &dir, const std::vector<int> &devices, bool
                    nomas::RowReduction ditReduction)
     : Pipeline(dir, devices.empty() ? throw std::invalid_argument("empty CUDA device list") : devices[0],
                fp32, videoPrecision) {
+    devices_=devices;
     if (devices.size() > 1) {
         parallel_ = std::make_unique<ParallelModel>(dir, devices, fp32, videoPrecision, video_, ditReduction);
         video_.setTileRunner([this](size_t count, const std::function<Tensor(VideoVAE &,size_t)> &task) {
@@ -168,6 +171,46 @@ Pipeline::Pipeline(const std::string &dir, const std::vector<int> &devices, bool
     rt_.activate();
 }
 Pipeline::~Pipeline() = default;
+void Pipeline::configureSource(const ModelSource &source,const std::string &mode) {
+    if(sourceConfigured_ || memoryPool_ || hostBudget_)
+        throw std::invalid_argument("configure model source once, before memory budgets");
+    if(mode!="auto" && mode!="tp" && mode!="sp") throw std::invalid_argument("parallel-mode must be auto, tp or sp");
+    if(source.baseDirectory!=directory_) throw std::invalid_argument("resolved source/base mismatch");
+    const bool quantized=!source.transformerWeights.empty() || !source.referenceWeights.empty();
+    if((quantized || mode=="sp") && rt_.dtype()!=DType::BF16)
+        throw std::invalid_argument("quantized video and sequence parallelism require BF16 activations");
+    sequenceParallel_=devices_.size()>1 && (mode=="sp" || (mode=="auto" && quantized));
+    transformer_.setQuantizedWeights(source.transformerWeights);
+    if(!source.referenceWeights.empty()) {
+        if(!referenceTransformer_) referenceTransformer_=std::make_unique<Transformer>(rt_,full_,directory_+"/transformer_ref");
+        referenceTransformer_->setQuantizedWeights(source.referenceWeights);
+    } else if(referenceTransformer_) referenceTransformer_->setQuantizedWeights({});
+    if(parallel_) parallel_->configureSource(source,sequenceParallel_);
+    if(quantized) {
+        // A mode without a quantized checkpoint retains its BF16 base.
+        const size_t bf16=size_t(38)<<30;
+        residentWeightBytes_=std::max(source.transformerBytes?size_t(source.transformerBytes):bf16,
+                                      source.referenceBytes?size_t(source.referenceBytes):bf16);
+        if(!sequenceParallel_) residentWeightBytes_=(residentWeightBytes_+devices_.size()-1)/devices_.size();
+        // Keep room for conditioning, tables, LoRA, activations and decode.
+        size_t available=rt_.availableMemory();
+        for(int device:devices_) {
+            if(cudaSetDevice(device)!=cudaSuccess) throw std::runtime_error("cannot select video device");
+            size_t free=0,total=0;
+            auto status=cudaMemGetInfo(&free,&total);
+            if(status!=cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
+            available=std::min(available,free);
+        }
+        rt_.activate();
+        lowMemory_=available<residentWeightBytes_+(size_t(12)<<30);
+        retainWeights_=!lowMemory_ && videoRuntime_.dtype()!=DType::FP32;
+        text_.setLowMemory(lowMemory_); transformer_.setLowMemory(lowMemory_);
+        if(referenceTransformer_) referenceTransformer_->setLowMemory(lowMemory_);
+        video_.setLowMemory(lowMemory_);
+        if(parallel_) parallel_->setStreaming(lowMemory_);
+    }
+    sourceConfigured_=true;
+}
 void Pipeline::setGpuMemoryLimit(double gib) {
     validateGpuMemoryLimit(gib);
     if (gib == 0) return;
@@ -182,7 +225,9 @@ void Pipeline::setGpuMemoryLimit(double gib) {
     // A generous budget keeps the original resident/prefetched execution path.
     // Conservative headroom covers the supported H3/Pika working shapes; a
     // request that exceeds it still fails against the same physical pool cap.
-    lowMemory_ = rt_.isFloat32() || videoRuntime_.isFloat32() || gib < (parallel_ ? 48 : 60);
+    const double resident=residentWeightBytes_?double(residentWeightBytes_)/double(size_t(1)<<30)+12:
+                                                 double(parallel_?48:60);
+    lowMemory_ = rt_.isFloat32() || videoRuntime_.isFloat32() || gib < resident;
     text_.unload();
     text_.setMemoryPool(memoryPool_);
     text_.setLowMemory(lowMemory_);
@@ -490,11 +535,11 @@ Generation Pipeline::generateImpl(const GenerateOptions &o, Progress progress, T
             for (int row = 0; row < audioConditionRows; ++row)
                 layout.timeIndices[layout.audio[row]] = aci;
             tick("denoise", i, vs.size() - 1);
-            auto denoiseProgress = [&](const std::string &, const Tensor &) {
+            auto denoiseProgress = [&] {
                 tick("denoise", i, vs.size() - 1);
             };
-            auto velocity = parallel_ ? parallel_->forward(v, a, text, layout, denoiseProgress)
-                                      : denoiser->forward(v, a, text, layout, denoiseProgress);
+            auto velocity = parallel_ ? parallel_->forward(v, a, text, layout, {}, denoiseProgress)
+                                      : denoiser->forward(v, a, text, layout, {}, denoiseProgress);
             auto advance = [&](const Tensor &sample, const Tensor &velocity, float sigma, float next,
                                const std::string &modality) {
                 if (!pika) return full_.step(sample, velocity, 1.f - sigma, sigma, next);

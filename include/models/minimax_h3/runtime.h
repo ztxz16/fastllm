@@ -9,6 +9,7 @@
 
 namespace fastllm {
 namespace minimax_h3 {
+struct ModelSource;
 using Tensor = nomas::Tensor;
 using DType = nomas::DType;
 using Weights = nomas::Weights;
@@ -38,6 +39,9 @@ class Runtime : public nomas::Runtime {
     std::pair<Tensor, Tensor> qkNormRotary(const Tensor &q, const Tensor &k, const Tensor &qWeight,
                                          const Tensor &kWeight, float eps, const Tensor &cos,
                                          const Tensor &sin, int headDim);
+    // BF16, 128-wide heads in [Q,K,V] rows. Null cos/sin normalizes refiner Q/K only.
+    void qkvNormRotaryInPlace(Tensor &, const Tensor &qWeight, const Tensor &kWeight, float eps,
+                              const Tensor *cos = nullptr, const Tensor *sin = nullptr);
     std::pair<Tensor, Tensor> ropeTable(const std::vector<float> &positions, int frequencies, float theta);
     Tensor timestepEmbedding(const std::vector<float> &times, int dimensions);
     Tensor selfAttention(const Tensor &q, const Tensor &k, const Tensor &v, int heads);
@@ -66,10 +70,14 @@ struct PackedLayout {
     std::vector<float> positions;
     void validate(int timeCount) const;
 };
+class VideoProjections;
 
 class Transformer {
   public:
     Transformer(Runtime &, Runtime &fp32, const std::string &directory, nomas::ParallelContext = {});
+    Transformer(Runtime &, Runtime &fp32, const std::string &directory, nomas::ParallelContext,
+                bool sequenceParallel);
+    void setQuantizedWeights(const std::string &);
     const TransformerConfig &config() const { return config_; }
     void setLowMemory(bool enabled);
     void setHostMemoryBudget(const std::shared_ptr<nomas::HostMemoryBudget> &);
@@ -84,11 +92,12 @@ class Transformer {
     // Identical plans reuse the exact tables until unload(), independent of the prompt.
     void prepare(const std::vector<std::vector<float>> &plans, std::function<void(int, int)> progress = {});
     std::pair<Tensor, Tensor> forward(const Tensor &video, const Tensor &audio, const Tensor &text,
-                                      const PackedLayout &, Trace trace = {});
+                                      const PackedLayout &, Trace trace = {}, std::function<void()> checkpoint = {});
     void unload();
 
   private:
     Tensor linear(const Tensor &, const std::string &);
+    Tensor addLora(const Tensor &, const std::string &, Tensor);
     Tensor rowLinear(const Tensor &, const std::string &);
     Tensor attention(const Tensor &, const std::string &, const Tensor *cos = nullptr,
                      const Tensor *sin = nullptr, Trace trace = {});
@@ -97,6 +106,7 @@ class Transformer {
     Runtime &rt_, &fp32_;
     Weights weights_, fullWeights_;
     std::unique_ptr<Weights> lora_;
+    std::shared_ptr<VideoProjections> quantized_;
     std::string loraDirectory_;
     TransformerConfig config_;
     nomas::ParallelContext parallel_;
@@ -104,6 +114,8 @@ class Transformer {
     Tensor outputModulation_;
     std::vector<std::vector<float>> plans_;
     bool lowMemory_ = false, hostCacheEnabled_ = false;
+    bool sequenceParallel_ = false;
+    int sequenceRows_ = 0;
     std::shared_ptr<nomas::HostMemoryBudget> hostBudget_;
 };
 std::string componentWeights(const std::string &directory);
@@ -281,6 +293,10 @@ class Pipeline {
     Pipeline(const std::string &directory, const std::vector<int> &devices, bool fp32, DType videoPrecision,
              nomas::RowReduction ditReduction);
     ~Pipeline();
+    // Configure a resolved local quantized source once, before generation/budgets.
+    // auto selects SP for quantized multi-GPU DiT, otherwise the existing TP.
+    void configureSource(const ModelSource &, const std::string &parallelMode = "auto");
+    const char *parallelMode() const { return devices_.size()==1?"single":sequenceParallel_?"sp":"tp"; }
     // Per-device GiB target. Reserves 1 GiB for CUDA/cuBLAS/NCCL outside the
     // bounded tensor pool. Small budgets stream weights layer by layer.
     // Configure before generation; zero preserves the default resident path.
@@ -316,6 +332,10 @@ class Pipeline {
     std::vector<float> videoMean_, videoStd_, audioMean_, audioStd_;
     bool retainWeights_ = false;
     bool lowMemory_ = false;
+    std::vector<int> devices_;
+    bool sequenceParallel_ = false;
+    size_t residentWeightBytes_ = 0;
+    bool sourceConfigured_ = false;
     std::shared_ptr<nomas::TensorPool> memoryPool_;
     std::shared_ptr<nomas::HostMemoryBudget> hostBudget_;
     std::unique_ptr<ParallelModel> parallel_;

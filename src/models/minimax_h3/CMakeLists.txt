@@ -11,7 +11,7 @@ set(CMAKE_CUDA_RUNTIME_LIBRARY Shared)
 set_target_properties(fastllm_continuous PROPERTIES CUDA_RUNTIME_LIBRARY Shared)
 add_library(fastllm_minimax_h3 SHARED
     ops.cu encode.cu conditioning.cpp transformer.cpp audio.cpp video.cpp
-    text.cpp parallel.cpp pipeline.cpp pika.cpp model_source.cpp media.cpp media_input.cpp
+    text.cpp parallel.cpp pipeline.cpp pika.cpp model_source.cpp quantized.cpp media.cpp media_input.cpp
     ../minimax_h3_image/model.cpp ../minimax_h3_image/ops.cu ../minimax_h3_image/parallel.cpp
     ../minimax_h3_image/input.cpp ../minimax_h3_image/memory.cpp ../minimax_h3_image/fp8.cu ../minimax_h3_image/source.cpp
     ../minimax_h3_image/gguf_checkpoint.cpp ../minimax_h3_image/gguf.cu
@@ -149,6 +149,10 @@ if(UNIT_TEST)
                     --binary $<TARGET_FILE:minimax_h3_image_server>)
         set_tests_properties(minimax_h3_image_http PROPERTIES TIMEOUT 30)
     endif()
+    add_executable(minimax_h3_quantized_source ${PROJECT_SOURCE_DIR}/test/minimax_h3/test_quantized_source.cpp)
+    target_link_libraries(minimax_h3_quantized_source PRIVATE fastllm_minimax_h3)
+    set_target_properties(minimax_h3_quantized_source PROPERTIES CXX_STANDARD 17)
+    add_test(NAME minimax_h3_quantized_source COMMAND minimax_h3_quantized_source)
     add_executable(minimax_h3_model_source ${PROJECT_SOURCE_DIR}/test/minimax_h3/test_model_source.cpp)
     target_link_libraries(minimax_h3_model_source PRIVATE fastllm_minimax_h3)
     set_target_properties(minimax_h3_model_source PROPERTIES CXX_STANDARD 17)
@@ -165,6 +169,10 @@ if(UNIT_TEST)
     set_target_properties(minimax_h3_fused_ops PROPERTIES CXX_STANDARD 17)
     add_test(NAME minimax_h3_fused_ops COMMAND minimax_h3_fused_ops)
     set_tests_properties(minimax_h3_fused_ops PROPERTIES LABELS cuda TIMEOUT 180 SKIP_RETURN_CODE 77)
+    add_executable(minimax_h3_quantized_parallel EXCLUDE_FROM_ALL ${PROJECT_SOURCE_DIR}/test/minimax_h3/test_quantized_parallel.cpp)
+    target_include_directories(minimax_h3_quantized_parallel PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+    target_link_libraries(minimax_h3_quantized_parallel PRIVATE fastllm_minimax_h3 cudart)
+    set_target_properties(minimax_h3_quantized_parallel PROPERTIES CXX_STANDARD 17)
     add_executable(minimax_h3_pika_parallel EXCLUDE_FROM_ALL ${PROJECT_SOURCE_DIR}/test/minimax_h3/test_pika_parallel.cpp)
     target_include_directories(minimax_h3_pika_parallel PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
     target_link_libraries(minimax_h3_pika_parallel PRIVATE fastllm_minimax_h3 cudart)

@@ -59,6 +59,61 @@ MiniMax-H3/
 
 加载本地 safetensors / JSON 文件，无联网下载、转换脚本或额外权重副本。
 
+## 量化视频权重
+
+支持 Comfy 视频投影的 FP8 E4M3、INT8 H256 ConvRot、混合 NVFP4 / INT8 / BF16，以及
+GGUF Q4_K_M。按每个张量的 dtype、shape 和量化元数据选择原生 CUDA 算子，无需精度参数，
+不将完整量化主干展开为 BF16。FP8 使用 W8A8；INT8 使用 W8A8 + H256 旋转；NVFP4 张量
+使用 W4A4，混合文件的其余张量保留原精度；GGUF 复用 MMQ，其他形状使用分块解码 GEMM。
+NVFP4 要求 SM120；FP8 要求支持 FP8 的 NVIDIA GPU。量化主干的激活保持 BF16。
+
+量化文件只替换 attention / FFN 的 208 个投影，包括两个文本 refiner。文本编码器、VAE、
+归一化、时间调制和输出头继续读取匹配的完整 H3 基座，**仍需保留基座**。没有修改或覆盖旧权重。
+视频的排列与 Image PDD 不同，不能把图像 checkpoint 交给此入口。
+
+在单独模型目录保存 `h3_quantization.json`：
+
+```json
+{
+  "format_version": 1,
+  "base_model": "../MiniMax-H3",
+  "fl2va": "../Comfy-Org--MiniMax-H3/diffusion_models/minimax_h3_fl2va_pruned_fp8_scaled.safetensors",
+  "ref2va": "../Comfy-Org--MiniMax-H3/diffusion_models/minimax_h3_ref2va_pruned_fp8_scaled.safetensors"
+}
+```
+
+路径相对清单所在目录，也接受绝对路径。`fl2va` 对应文字/首尾帧，`ref2va` 对应参考素材；
+两者形状相同，所以清单显式绑定用途，不依据文件名猜测。至少指定其中一项，未指定的模式
+沿用 BF16 基座。添加 `"pika": "../Pika-H3-Flex"` 即可复用未合并的官方 LoRA 和六步采样。
+混合 NVFP4 或 GGUF 只需更换文件路径。Pika 的 LoRA 保持 BF16，TP 行分支仍以 FP32
+跨卡累加；FP8／INT8／GGUF 主干将 LoRA B 的 GEMM 与基座输出相加融合，省去完整 delta 的读写和一次
+中间 BF16 舍入。单卡／TP 的 QKV 保持打包布局，SP 主干仍展开 K/V 供跨卡通信；
+FC1 直接消费权重的 gate/value 顺序，无需开关。含 NVFP4 的权重自动保留原投影路径，
+避免改变 LoRA 舍入后放大跨卡激活校准误差。
+
+```bash
+CUDA_VISIBLE_DEVICES=4,5 build-h3/src/models/minimax_h3/minimax_h3_server \
+  --model /workspace2/hfmodels/Pika-H3-Flex-FP8 --devices 0,1 \
+  --host 127.0.0.1 --port 8009 --output ./h3-output
+```
+
+`--model` 可传目录或清单文件。`--parallel-mode auto|tp|sp` 默认为 auto：多卡量化模型
+使用 SP，原 BF16 模型保留 TP；单卡不做切分。SP 每卡保存完整量化投影，分摊序列计算并
+交换 K/V；TP 真正切分量化字节、scale 和 LoRA，并对输出做归约，可降低每卡权重占用。
+INT8 / GGUF 的 TP 分片需满足 H256 / 块边界，H3 支持 TP2/TP4；TP8 应改用 SP。
+
+量化路径复用 `--gpu-memory-limit` / `--host-memory-limit`。默认根据空闲显存与实际投影
+字节数选择驻留或逐层加载；显式预算仍由统一内存池约束，取消或异常清空设备缓存。
+
+`ftllm launch` 选择视频后端和模型目录即可；多卡方式可保留自动。视频工作室、独立 Demo
+随文字/参考模式展示对应精度和实际并行方式，生成请求参数与 BF16 完全相同。
+`/health` 新增 `dit_precision`、`reference_dit_precision`、`dit_parallel_mode`、
+`dit_tensor_parallel_size`、`dit_sequence_parallel_size`。原 `tensor_parallel_size` 继续表示
+文本编码器 TP，不能用于判断 DiT 是否采用 TP。
+
+四种格式已通过双卡逐层相对 L2 和实际 API 生成检查；多卡量化仍会累积数值误差，
+不保证完整生成与单卡一致。测试范围、误差和旧权重回归见 [验证记录](VALIDATION.md#量化视频pika-与-tpsp2026-11-13)。
+
 ## Pika H3 Flex
 
 Pika 复用指定版本的 H3 基座（`42ed227ee7df40d41602854ae760620d6eb651fe`）。
@@ -87,15 +142,18 @@ Pika 发布的是适配器，仍需本地 MiniMax-H3 基座。默认依次查找
 缺失或损坏的基座会报错，不会自动下载或退回原版模型。原来的
 `--model BASE --pika PIKA` 写法继续兼容，但不与 `--base-model` 混用。
 C++ 可调用 `resolveModelSource`（`models/minimax_h3/model_source.h`）取得基座与适配器路径，
-以基座构造 Pipeline，再执行 `pipeline.loadPika(adapterRoot)`，并设置 `GenerateOptions.steps = 6`。
+以基座构造 Pipeline，先执行 `pipeline.configureSource(source)`，再设置内存预算并调用
+`pipeline.loadPika(source.pikaDirectory)`，同时设置 `GenerateOptions.steps = 6`。
+`configureSource` 会接入清单中的量化权重和默认并行方式，应在设置预算、生成视频之前调用一次。
 
-实现保留独立 LoRA 分支：FP32 文件加载为 BF16，两个低秩 GEMM 和基座结果相加时
-遵循 BF16 舍入；没有离线合并权重。使用 `[1000,750,500,250,100,40,0]` 网格、
+实现保留独立 LoRA 分支：FP32 文件加载为 BF16，没有离线合并权重。BF16／NVFP4 基座保留两个
+低秩 GEMM 及输出加法各自的 BF16 舍入；FP8／INT8／GGUF 使用上文的融合输出累加，以逐算子相对
+L2 验证误差。使用 `[1000,750,500,250,100,40,0]` 网格、
 视频 shift=12／音频 shift=3，每步先计算 `x0 = x + sigma * velocity`，再用新噪声
 形成下一步输入；最后一步直接返回 x0。FL2VA 条件潜变量在加噪前舍入到 BF16，
 Ref2VA 保留 FP32。初始噪声、重新加噪、条件增强分别使用独立的随机数流。
 
-当前 Pika 路径支持 BF16 主干，已验证单卡和双卡；拒绝 FP32 主干配置。双卡使用
+当前 Pika 路径使用 BF16 激活，支持 BF16 及上述量化主干，已验证单卡和双卡；拒绝 FP32 主干配置。双卡使用
 `--devices 0,1` 并需要 NCCL，设备限制与下文的 H3 张量并行相同。例如：
 
 ```bash

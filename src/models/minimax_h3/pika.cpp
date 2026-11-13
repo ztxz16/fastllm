@@ -1,6 +1,7 @@
 #include "models/minimax_h3/runtime.h"
 #include "models/minimax_h3/parallel.h"
 #include "models/minimax_h3/model_source.h"
+#include "quantized.h"
 #include "json11.hpp"
 #include <cmath>
 #include <fstream>
@@ -74,12 +75,12 @@ void Transformer::loadPikaAdapter(const std::string &dir, bool reference) {
     auto weights = std::make_unique<Weights>(rt_, dir + "/adapter.safetensors");
     auto column = [&](const std::string &p, int groups = 1) {
         // A sees the replicated input; B follows the base output partition.
-        parallel_.columnWeights(*weights, p + ".lora_B.default", groups);
+        if(!sequenceParallel_) parallel_.columnWeights(*weights, p + ".lora_B.default", groups);
     };
     auto row = [&](const std::string &p) {
         // A consumes the local input shard. Its rank-128 output is summed
         // before BF16 rounding; B then runs on the replicated low-rank result.
-        parallel_.rowWeights(*weights, p + ".lora_A.default");
+        if(!sequenceParallel_) parallel_.rowWeights(*weights, p + ".lora_A.default");
     };
     auto block = [&](const std::string &p) {
         for (const char *q : {"to_q", "to_k", "to_v"}) column(p + ".attn." + q);
@@ -96,28 +97,45 @@ void Transformer::loadPikaAdapter(const std::string &dir, bool reference) {
     loraDirectory_ = dir;
 }
 Tensor Transformer::linear(const Tensor &x, const std::string &p) {
-    auto out = weights_.linear(x, p);
+    return addLora(x,p,quantized_?quantized_->linear(x,p):weights_.linear(x,p));
+}
+Tensor Transformer::addLora(const Tensor &x,const std::string &p,Tensor out) {
     if (lora_) {
-        // Match PEFT: round A, B and both GEMMs to BF16, then round the sum.
-        // alpha/rank is exactly one for the supported release.
+        // alpha/rank is exactly one. FP8/INT8/GGUF fuse B with the output add;
+        // BF16 and NVFP4 retain PEFT's separate delta rounding.
         auto a = rt_.linear(x, lora_->get(p + ".lora_A.default.weight"));
-        auto b = rt_.linear(a, lora_->get(p + ".lora_B.default.weight"));
-        out = rt_.add(out, b);
+        const auto &b = lora_->get(p + ".lora_B.default.weight");
+        if (quantized_ && quantized_->fusedProjections()) {
+            if(p.size()>=14 && p.compare(p.size()-14,14,".ff.net.0.proj")==0) {
+                // Adapter rows are [value, gate]; the quantized base is [gate,
+                // value]. Row views avoid both a full activation swap and a
+                // second cached copy of the adapter weights, including under TP.
+                const int half=b.rows/2;
+                rt_.linearAddInto(a,b.rowSlice(half,half),out,0);
+                rt_.linearAddInto(a,b.rowSlice(0,half),out,half);
+            } else rt_.linearAddInto(a,b,out);
+        } else out = rt_.add(out, rt_.linear(a,b));
     }
     return out;
 }
 Tensor Transformer::rowLinear(const Tensor &x, const std::string &p) {
-    if (parallel_.size() == 1) return linear(x, p);
+    if (parallel_.size() == 1 || sequenceParallel_) return linear(x, p);
     // Keep both branches' sums in FP32 until all input partitions contribute.
     // Rounding each base partial to BF16 first would introduce an extra
     // precision boundary absent from the released unmerged LoRA calculation.
     auto projection = parallel_;
-    projection.rowReduction = nomas::RowReduction::FP32;
-    auto out = projection.row(rt_, weights_, x, p);
+    if(lora_) projection.rowReduction = nomas::RowReduction::FP32;
+    Tensor out;
+    if(quantized_) {
+        auto partial=quantized_->linear(x,p,projection.partialType(x.dtype));
+        if(partial.isFloat32()) out=projection.group->sumCast(rt_,partial,nullptr,x.dtype,projection.rank);
+        else { projection.group->sum(partial,projection.rank); out=std::move(partial); }
+    } else out=projection.row(rt_,weights_,x,p);
     if (lora_) {
         auto a = projection.row(rt_, *lora_, x, p + ".lora_A.default");
-        auto b = rt_.linear(a, lora_->get(p + ".lora_B.default.weight"));
-        out = rt_.add(out, b);
+        const auto &b = lora_->get(p + ".lora_B.default.weight");
+        if(quantized_ && quantized_->fusedProjections()) rt_.linearAddInto(a,b,out);
+        else out = rt_.add(out, rt_.linear(a,b));
     }
     return out;
 }

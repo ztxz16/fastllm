@@ -51,6 +51,46 @@ void validatePikaManifest(const std::string &dir, bool reference) {
 ModelSource resolveModelSource(const std::string &model, const std::string &base,
                                const std::string &legacyPika) {
     if (model.empty()) throw std::invalid_argument("--model is required");
+    const fs::path input=fs::absolute(model).lexically_normal();
+    const fs::path manifest=fs::is_directory(input)?input/"h3_quantization.json":input;
+    if(fs::is_regular_file(manifest) && manifest.filename()=="h3_quantization.json") {
+        std::ifstream f(manifest,std::ios::binary|std::ios::ate);
+        require(bool(f) && f.tellg()>0 && f.tellg()<=65536,"invalid quantized model manifest");
+        std::string text(size_t(f.tellg()),'\0'),error;
+        f.seekg(0); f.read(text.data(),text.size());
+        const auto j=json11::Json::parse(text,error);
+        require(bool(f) && error.empty() && j.is_object() && j["format_version"].number_value()==1,
+                "invalid quantized model manifest");
+        for(const auto &entry:j.object_items())
+            require(entry.first=="format_version" || entry.first=="base_model" || entry.first=="pika" ||
+                    entry.first=="fl2va" || entry.first=="ref2va","unknown quantized model field: "+entry.first);
+        auto path=[&](const char *key) {
+            if(j[key].is_null()) return std::string{};
+            require(j[key].is_string() && !j[key].string_value().empty(),std::string("invalid path: ")+key);
+            return (manifest.parent_path()/j[key].string_value()).lexically_normal().string();
+        };
+        ModelSource source;
+        source.baseDirectory=base.empty()?path("base_model"):base;
+        require(hasBase(source.baseDirectory),"quantized video requires its complete matching H3 base");
+        source.pikaDirectory=path("pika");
+        require(legacyPika.empty() || source.pikaDirectory.empty(),"duplicate Pika adapter");
+        if(!legacyPika.empty()) source.pikaDirectory=legacyPika;
+        if(!source.pikaDirectory.empty()) {
+            validatePikaManifest(source.pikaDirectory+"/fl2va",false);
+            validatePikaManifest(source.pikaDirectory+"/ref2va",true);
+        }
+        source.transformerWeights=path("fl2va"); source.referenceWeights=path("ref2va");
+        require(!source.transformerWeights.empty() || !source.referenceWeights.empty(),"no video quantized weights");
+        if(!source.transformerWeights.empty()) {
+            auto info=inspectVideoWeights(source.transformerWeights);
+            source.transformerPrecision=info.precision; source.transformerBytes=info.bytes;
+        }
+        if(!source.referenceWeights.empty()) {
+            auto info=inspectVideoWeights(source.referenceWeights);
+            source.referencePrecision=info.precision; source.referenceBytes=info.bytes;
+        }
+        return source;
+    }
     if (!legacyPika.empty() && !base.empty())
         throw std::invalid_argument("use --model PIKA --base-model BASE, or --model BASE --pika PIKA");
     if (legacyPika.empty() && !hasAdapter(model)) {

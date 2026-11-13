@@ -163,20 +163,29 @@ __global__ void positionsToRope(const float *pos, const float *inv, float *cs, f
 }
 // One warp per 128-wide head. Match rmsFused's reduction tree and all eager
 // BF16 rounding boundaries, including the norm result before applying RoPE.
+template<bool Packed=false>
 __global__ void qkNormRope128(const B *q, const B *k, const B *qw, const B *kw, const float *cs,
                             const float *sn, B *qo, B *ko, size_t heads, int headsPerToken,
                             int rotaryDim, float eps) {
+    __shared__ B saved[8*128];
     int lane = threadIdx.x % 32;
     for (size_t h = size_t(blockIdx.x) * 8 + threadIdx.x / 32; h < 2 * heads;
          h += size_t(gridDim.x) * 8) {
         bool isQ = h < heads;
         size_t head = isQ ? h : h - heads, offset = head * 128;
-        const B *x = (isQ ? q : k) + offset, *w = isQ ? qw : kw;
-        B *out = (isQ ? qo : ko) + offset;
+        if constexpr(Packed)
+            offset=(head/headsPerToken*3*headsPerToken+(isQ?0:headsPerToken)+head%headsPerToken)*128;
+        const B *x = (Packed?q:(isQ ? q : k)) + offset, *w = isQ ? qw : kw;
+        B *out = (Packed?qo:(isQ ? qo : ko)) + offset;
         float v[4];
 #pragma unroll
-        for (int j = 0; j < 4; ++j)
+        for (int j = 0; j < 4; ++j) {
             v[j] = value(x[lane + j * 32]);
+            if constexpr(Packed) saved[threadIdx.x/32*128+lane+j*32]=x[lane+j*32];
+        }
+        // RoPE reads the other half of each head after some output lanes have
+        // already been written. Preserve the original head before in-place stores.
+        if constexpr(Packed) {__syncwarp();x=saved+threadIdx.x/32*128;}
         float sum = (v[0] * v[0] + v[2] * v[2]) + (v[1] * v[1] + v[3] * v[3]);
 #pragma unroll
         for (int step = 16; step; step /= 2)
@@ -197,6 +206,7 @@ __global__ void qkNormRope128(const B *q, const B *k, const B *qw, const B *kw, 
             }
             out[d] = B(normalized);
         }
+        if constexpr(Packed) __syncwarp();
     }
 }
 // VAE Q/K statistics accumulate in FP32. Norm and rotary arithmetic retain
@@ -459,11 +469,26 @@ std::pair<Tensor, Tensor> Runtime::qkNormRotary(const Tensor &q, const Tensor &k
                 rotary(rms(k, kw, eps, headDim), cs, sn, headDim)};
     Tensor qo(q.rows, q.cols, q.dtype), ko(k.rows, k.cols, k.dtype);
     size_t heads = q.size() / 128;
-    qkNormRope128<<<std::min<size_t>((2 * heads + 7) / 8, 4096), 256, 0, cudaStreamPerThread>>>(
+    qkNormRope128<false><<<std::min<size_t>((2 * heads + 7) / 8, 4096), 256, 0, cudaStreamPerThread>>>(
         ptr<B>(q), ptr<B>(k), ptr<B>(qw), ptr<B>(kw), ptr<float>(cs), ptr<float>(sn), ptr<B>(qo),
         ptr<B>(ko), heads, q.cols / 128, cs.cols, eps);
     check(cudaGetLastError());
     return {qo, ko};
+}
+void Runtime::qkvNormRotaryInPlace(Tensor &qkv,const Tensor &qw,const Tensor &kw,float eps,
+                                  const Tensor *cs,const Tensor *sn) {
+    require(qkv.data && qkv.rows>0 && qkv.cols>0 && qkv.cols%(3*128)==0 && qkv.dtype==DType::BF16 &&
+            qw.dtype==qkv.dtype && kw.dtype==qkv.dtype && qw.size()==128 && kw.size()==128 &&
+            std::isfinite(eps) && eps>0 && bool(cs)==bool(sn),"invalid packed H3 QK norm shape/dtype");
+    require(!cs || (cs->isFloat32() && sn->isFloat32() && cs->rows==qkv.rows && sn->rows==qkv.rows &&
+            cs->cols==sn->cols && cs->cols>0 && cs->cols<=128 && cs->cols%2==0),
+            "invalid packed H3 RoPE shape/dtype");
+    const int headsPerToken=qkv.cols/(3*128);
+    const size_t heads=size_t(qkv.rows)*headsPerToken;
+    qkNormRope128<true><<<std::min<size_t>((2*heads+7)/8,4096),256,0,cudaStreamPerThread>>>(
+        ptr<B>(qkv),nullptr,ptr<B>(qw),ptr<B>(kw),cs?ptr<float>(*cs):nullptr,sn?ptr<float>(*sn):nullptr,
+        ptr<B>(qkv),nullptr,heads,headsPerToken,cs?cs->cols:0,eps);
+    check(cudaGetLastError());
 }
 Tensor Runtime::gather(const Tensor &x, const Tensor &idx) {
     require(idx.isFloat32() && idx.cols == 1, "invalid H3 row indices");
