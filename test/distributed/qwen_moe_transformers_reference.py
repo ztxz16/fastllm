@@ -132,22 +132,36 @@ def moe_routing_observer(torch):
     return Observer()
 
 
-def layer_reference(model, torch):
+def layer_reference(model, torch, sequences=None, split_stages=False):
     """/**
      * 用HF真实完整前向记录各层输入、实际路由、共享/路由专家和层输出。
      * 支持Linear gate与ModuleList专家的逐专家index_add_路径；拒绝未识别布局。
      * 仅观察实际算子输出，不在CPU重选专家；退出或异常时卸载全部hook与观察器。
      * @param model 已分配设备的HF参考模型，所有Decoder层均须为MoE。
      * @param torch 参考环境的PyTorch模块。
-     * @return 四个短序列的逐层参考，以及供正式单层公开入口使用的同一输入。
+     * @param sequences 四个rank的Token ID列表；默认使用原短序列，空列表表示空闲rank。
+     * @param split_stages 是否额外采集Attention残差边界，生成Attention/独立MoE任务。
+     * @return 逐层参考和同一输入；独立MoE使用HF的Attention后输入，不混入上游误差。
      */"""
+    sequences = ([1, 2], [2, 3, 4], [3], [4, 5, 6, 7]) if sequences is None else sequences
+    if len(sequences) != 4 or not any(sequences) or any(
+            not isinstance(ids, (list, tuple)) or len(ids) > 2048 or any(
+                type(token) is not int or token < 0 for token in ids) for ids in sequences):
+        raise ValueError('layer reference requires four valid token sequences, at least one nonempty')
     layers = model.model.layers
     for index, layer in enumerate(layers):
         if not isinstance(getattr(layer.mlp, 'gate', None), torch.nn.Linear) or not isinstance(
                 getattr(layer.mlp, 'experts', None), torch.nn.ModuleList):
             raise RuntimeError(f'layer={index}: reference requires HF Linear gate and ModuleList experts')
+        if split_stages and not hasattr(layer, 'post_attention_layernorm'):
+            raise RuntimeError(f'layer={index}: missing Attention residual boundary')
     references = [[] for _ in layers]
-    for rank, ids in enumerate(([1, 2], [2, 3, 4], [3], [4, 5, 6, 7])):
+    for rank, ids in enumerate(sequences):
+        if not ids:
+            for rows in references:
+                rows.append({key: [] for key in ('input', 'output', 'router_logits', 'selected_experts',
+                            'routing_weights', 'routed_output', 'shared_output', 'attention_input')})
+            continue
         records = [dict() for _ in layers]
         observer = moe_routing_observer(torch)
         with ExitStack() as hooks, observer, torch.inference_mode():
@@ -157,6 +171,9 @@ def layer_reference(model, torch):
                 def before(module, args, kwargs, record=record):
                     value = args[0] if args else kwargs['hidden_states']
                     record['input'] = value.detach().clone()
+                def after_attention(module, args, kwargs, record=record):
+                    value = args[0] if args else kwargs['hidden_states']
+                    record['attention_input'] = value.detach().clone()
                 def output(module, args, value, record=record):
                     record['output'] = (value[0] if isinstance(value, tuple) else value).detach().clone()
                 def gate(module, args, value, record=record, label=label):
@@ -169,6 +186,9 @@ def layer_reference(model, torch):
                         record[name] = value.detach().clone()
                     return hook
                 hooks.callback(layer.register_forward_pre_hook(before, with_kwargs=True).remove)
+                if split_stages:
+                    hooks.callback(layer.post_attention_layernorm.register_forward_pre_hook(
+                        after_attention, with_kwargs=True).remove)
                 hooks.callback(layer.register_forward_hook(output).remove)
                 hooks.callback(layer.mlp.gate.register_forward_hook(gate).remove)
                 hooks.callback(layer.mlp.shared_expert.register_forward_hook(save('shared', record)).remove)
@@ -178,10 +198,16 @@ def layer_reference(model, torch):
             model(input_ids=torch.tensor([ids], device=model.get_input_embeddings().weight.device), use_cache=False)
         for index, record in enumerate(records):
             references[index].append({key: value.detach().cpu().reshape(-1).tolist() for key, value in record.items()})
-    return [dict(layer=i, hidden=model.config.hidden_size, stage=0, name=f'real_layer_{i}',
-                 inputs=[dict(position_begin=0, hidden=r['input']) for r in rows],
-                 reference=[{k: v for k, v in r.items() if k != 'input'} for r in rows])
-            for i, rows in enumerate(references)]
+    tasks = []
+    stages = ((0, 'full'), (1, 'attention'), (2, 'moe')) if split_stages else ((0, 'full'),)
+    for i, rows in enumerate(references):
+        for stage, name in stages:
+            tasks.append(dict(layer=i, hidden=model.config.hidden_size, stage=stage,
+                name=f'real_layer_{i}_{name}' if split_stages else f'real_layer_{i}',
+                inputs=[dict(position_begin=0, hidden=r['attention_input' if stage == 2 else 'input']) for r in rows],
+                reference=[dict(output=r['attention_input']) if stage == 1 else
+                           {k: v for k, v in r.items() if k not in ('input', 'attention_input')} for r in rows]))
+    return tasks
 
 
 def main():
@@ -190,6 +216,8 @@ def main():
     parser.add_argument('--model', required=True)
     parser.add_argument('--inputs', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--layer-inputs', type=Path,
+                        help='可选的四rank Token列表；启用同输入Attention/MoE/完整层定位')
     args = parser.parse_args()
     os.environ.pop('USE_TORCH', None)
     import torch
@@ -216,7 +244,8 @@ def main():
             rows.append(dict(ids=ids, logits=out.logits[0, -1].float().cpu().tolist()))
         print(f'Reference history {index + 1}/{len(histories)}: tokens={len(ids)}', flush=True)
     print('Reference: collecting per-layer intermediates', flush=True)
-    intermediate = layer_reference(model, torch)
+    sequences = json.loads(args.layer_inputs.read_text()) if args.layer_inputs else None
+    intermediate = layer_reference(model, torch, sequences, split_stages=args.layer_inputs is not None)
     args.output.write_text(json.dumps(dict(rows=rows, layers=intermediate, metadata=dict(
         torch=torch.__version__, transformers=transformers.__version__, dtype='float16',
         attention='eager', use_cache=False, device_map=model.hf_device_map, checked_devices=devices,

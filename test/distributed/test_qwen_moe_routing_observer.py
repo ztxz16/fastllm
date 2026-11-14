@@ -64,10 +64,12 @@ class RoutingObserverTests(unittest.TestCase):
                 """/** 保持正式层的MoE子模块入口与残差相加。 */"""
                 super().__init__()
                 self.mlp = Moe()
+                self.post_attention_layernorm = torch.nn.Identity()
 
             def forward(self, hidden):
                 """/** 返回包含残差的真实层输出，供逐层采集入口验证。 */"""
-                return (hidden + self.mlp(hidden)[0],)
+                hidden = hidden + 0.25
+                return (hidden + self.mlp(self.post_attention_layernorm(hidden))[0],)
 
         class Model(torch.nn.Module):
             def __init__(self):
@@ -133,6 +135,44 @@ class RoutingObserverTests(unittest.TestCase):
             layer_reference(model, torch)
         self.assert_no_hooks(model)
         self.assertIs(_get_current_function_mode(), previous)
+
+    def test_split_stages_use_actual_attention_boundary_and_idle_ranks(self):
+        """/** 自定义失败历史只送目标rank；Attention与独立MoE输入取真实边界而非重算。 */"""
+        model = self.model(self.torch.float16, True)
+        sequences = [[], [], [1, 2, 3, 4, 5], []]
+        report = layer_reference(model, self.torch, sequences, split_stages=True)
+        self.assertEqual(len(report), 6)
+        for start in (0, 3):
+            full, attention, moe = report[start:start+3]
+            self.assertEqual([full['stage'], attention['stage'], moe['stage']], [0, 1, 2])
+            self.assertEqual(full['inputs'], attention['inputs'])
+            self.assertEqual(moe['reference'], full['reference'])
+            for rank in range(4):
+                boundary = attention['reference'][rank]['output']
+                self.assertEqual(moe['inputs'][rank]['hidden'], boundary)
+                if rank == 2:
+                    original = self.torch.tensor(full['inputs'][rank]['hidden'], dtype=self.torch.float16)
+                    self.assertEqual(boundary, (original + 0.25).tolist())
+                    self.assertEqual(len(boundary), 15)
+                else:
+                    self.assertEqual(boundary, [])
+                    self.assertTrue(all(not values for values in full['reference'][rank].values()))
+        self.assert_no_hooks(model)
+
+    def test_split_stage_failure_cleans_extra_hooks(self):
+        """/** 额外的Attention边界hook也必须在中途失败时释放。 */"""
+        model = self.model(self.torch.float16, True, fail=True)
+        with self.assertRaisesRegex(RuntimeError, 'injected expert failure'):
+            layer_reference(model, self.torch, [[1, 2], [], [], []], split_stages=True)
+        self.assert_no_hooks(model)
+
+    def test_invalid_custom_sequences_rejected(self):
+        """/** 拒绝全空、错rank数、负ID与布尔ID，避免产生貌似通过的空诊断。 */"""
+        model = self.model(self.torch.float16, True)
+        for sequences in ([[], [], [], []], [[1]], [[-1], [], [], []], [[True], [], [], []]):
+            with self.subTest(sequences=sequences), self.assertRaises(ValueError):
+                layer_reference(model, self.torch, sequences, split_stages=True)
+        self.assert_no_hooks(model)
 
     def test_observation_rejects_changed_moe_composition(self):
         """/** 模型输出含未捕获贡献时必须拒绝，不能把错误中间量作为参考。 */"""
