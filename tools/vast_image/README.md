@@ -41,29 +41,6 @@ APT 只用于解析地址。安装包优先从 `/tmp/nccl-cu12-download` 和
 由同一基础镜像复用，构建时仅补齐有差异的包，避免无故重新下载旧版系统包。
 Python 环境归档可能较大，导出目录需有足够剩余空间。
 
-## 传输：Hugging Face Bucket + aria2
-
-已经通过 Vast Cloud Copy 将导出目录备份到 Hugging Face Bucket 时，可在 Windows
-直接下载。上传的是镜像构建目录；完成下方 Docker 构建及推送后才有可供 Vast 拉取的镜像。
-
-Windows 先准备 `aria2c`（尚未安装时用 `winget install --id aria2.aria2 --exact --source winget`
-引导安装并重新打开 PowerShell）。取得本仓库 `tools/vast_image/download_hf.ps1` 后执行：
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\download_hf.ps1 -Bucket devilson/fastllm-backup -Prefix fastllm-cu126-image -Destination C:\fastllm-cu126-image
-if ($LASTEXITCODE -ne 0) { throw "备份下载或校验失败。" }
-```
-
-提示时输入有该桶读取权限的 Hugging Face Token（`hf_` 开头，输入不回显）。不是
-Vast API Key、Docker Hub Token 或 S3 Access Key。Token 只用于向 Hugging Face
-请求下载地址，不写入脚本、命令行或磁盘，也不发送到 CDN。aria2 接收短期签名地址，
-分段下载并校验 `SHA256SUMS` 中的每个文件；完整缓存直接复用，中断后重跑即可。
-只有在全部文件通过校验后，才继续下方 Docker 构建。无需解压 `python-env.tar.gz`。
-
-脚本要求桶内目录直接包含导出时生成的 `SHA256SUMS`、`Dockerfile`、`manifest.json`
-等文件及 `debs/`。如果备份时多嵌套了一层目录，须相应调整 `-Prefix`。HF 的 Xet
-内容哈希不能当作文件 SHA256；本流程始终使用导出时生成的 SHA256 清单。
-
 ## 传输：Direct SSH + aria2
 
 大文件优先通过 Vast 的 Direct SSH 建立通道，再由 Windows aria2 下载。
