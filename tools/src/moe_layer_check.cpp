@@ -78,7 +78,8 @@ Json DumpWeights(ProcessGroup &group, const std::string &model, const fs::path &
 /**
  * 通过公开 ProcessGroup MoE 接口验证权重和单层；不执行完整模型生成或性能计时。
  * @param argc 参数数量。
- * @param argv 必填 --worker、--model、--tasks、--output、--devices；--case 用于拒绝路径。
+ * @param argv 必填 --worker、--model、--tasks、--output、--devices；--case 用于拒绝路径；
+ *             --dump-weights 0 仅关闭诊断权重落盘，真实模型层检查仍走相同正式计算路径。
  * @return 成功 0，任一失败 1；stdout JSON 保留已完成任务及通信组回收证据。
  */
 int main(int argc, char **argv) {
@@ -86,7 +87,7 @@ int main(int argc, char **argv) {
     ProcessGroup group;
     try {
         std::map<std::string, std::string> args;
-        const std::vector<std::string> allowed = {"--worker", "--model", "--tasks", "--output", "--devices", "--case"};
+        const std::vector<std::string> allowed = {"--worker", "--model", "--tasks", "--output", "--devices", "--case", "--dump-weights"};
         for (int i = 1; i < argc; i += 2) {
             if (i + 1 == argc || std::find(allowed.begin(), allowed.end(), argv[i]) == allowed.end() ||
                 !args.emplace(argv[i], argv[i + 1]).second) throw std::runtime_error("invalid checker argument");
@@ -126,7 +127,10 @@ int main(int argc, char **argv) {
         if (!fs::create_directory(output)) throw std::runtime_error("output directory must be new");
         auto infos = group.LoadQwenMoe(model, scenario == "source_limit" ? 1 : 1073741824ULL,
                                       scenario == "device_limit" ? 1 : 12884901888ULL);
-        report["weights"] = DumpWeights(group, model, output, infos);
+        const auto dump = args.count("--dump-weights") ? args.at("--dump-weights") : "1";
+        if (dump != "0" && dump != "1") throw std::runtime_error("dump-weights must be 0 or 1");
+        if (dump == "1") report["weights"] = DumpWeights(group, model, output, infos);
+        report["weight_dump_enabled"] = dump == "1";
         if (scenario == "unloaded") group.UnloadQwen3();
         if (scenario == "double_load") group.LoadQwenMoe(model);
         Json::array results;

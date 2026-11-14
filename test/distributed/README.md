@@ -1602,8 +1602,9 @@ DP+TP 则将 profile 改为 `dp2_tp2`。启动器默认监听 127.0.0.1，输出
 
 ## Attention DP＋EP：配置与设备规划（阶段 1）
 
-本节是新增 Qwen MoE 进程模式的阶段记录。**当前仅接入参数检查和设备预览，
-多 rank MoE 推理尚未接入**；正常推理会在模型加载及 worker 启动前明确拒绝。
+本节是新增 Qwen MoE 进程模式的阶段记录。**阶段 1 仅接入参数检查和设备预览，
+当时未接入多 rank MoE 推理**。阶段 3～6 已新增联合执行、Graph、前缀缓存与正式服务入口，
+当前构建及验收步骤见 [ATTENTION_EP.md](ATTENTION_EP.md)；GPU 验收仍需在服务器实际执行。
 后续依次验收权重与单层、Eager 联合推理、Graph/缓存、正式服务、四卡完整模型。
 现有稠密 Qwen3 的完整副本 DP/TP 语义保持不变。
 
@@ -1650,10 +1651,10 @@ bash test/distributed/run_attention_ep_config_v100.sh
 ## Attention DP＋EP：MoE 权重与单层（阶段 2）
 
 本阶段增加公开原生 `ProcessGroup::LoadQwenMoe` 和 `ForwardQwenMoeLayer`，
-复用已有 worker、stream、权重读取/FP16 上传及 Attention 算子。**仅交付权重与
+复用已有 worker、stream、权重读取/FP16 上传及 Attention 算子。**阶段 2 仅交付权重与
 无历史 KV 的单层执行；完整生成、联合请求调度、Graph、Prefix Cache 和 HTTP/SSE
-仍在后续阶段。** CLI 的 `attention_ep_execution_available=false` 保持不变，
-不能把单层验收当成完整模型推理。新增接口声明与现有进程组接口放在同一头文件中。
+在阶段 3～6 接入。** 当前 CLI 的 `attention_ep_execution_available=true` 表示有执行入口，
+仍不能把单层验收当成完整模型验收。完整验收见 [ATTENTION_EP.md](ATTENTION_EP.md)。
 
 - 显式选择 `qwen2_moe`，支持 EP=1/2/4，Attention TP=1。Embedding、lm_head、
   Attention、Router、共享专家及 Norm 完整复制；路由专家按 `expert_id % ep_size`
@@ -1674,8 +1675,8 @@ bash test/distributed/run_attention_ep_config_v100.sh
 - 专家输出和路由乘法按 FP16 舍入，跨专家贡献以 FP32 累加/通信，再转 FP16。
   不要求与 Transformers 的逐专家 FP16 累加逐位相等，按固定数值容差验收。
 - 每 rank 临时工作区上限 512 MiB；正常单层结束同步释放，模型正常卸载释放全部权重。
-  失败通过现有进程组路径终止所有 worker。Graph、Prefix Cache、custom AllReduce
-  在新加载入口显式拒绝；稠密生成入口也拒绝已加载的 MoE 权重。
+  失败通过现有进程组路径终止所有 worker。无历史单层诊断拒绝 Graph 和 Prefix Cache；
+  完整 MoE 接口支持这两个选项，仍拒绝 custom AllReduce；稠密生成入口拒绝 MoE 权重。
 - 单层诊断接口接收各 rank 独立的 FP32 `[T,hidden]` 输入，T=0..2048。
   控制请求和每 rank 响应分别限 1 MiB；这是诊断传输限制，后续整模型执行应在设备
   保留激活。返回实际输出、Router logits、Top-K ID/权重、路由/共享专家输出、
@@ -1683,8 +1684,9 @@ bash test/distributed/run_attention_ep_config_v100.sh
 
 模型语义依据固定模型 revision `ec052fda178e241c7c443468d2fa1db6618996be`，
 以及 [Transformers v4.40.0 Qwen2 MoE 实现](https://github.com/huggingface/transformers/blob/v4.40.0/src/transformers/models/qwen2_moe/modeling_qwen2_moe.py#L706)。
-首版实际模型仍为 `Qwen/Qwen1.5-MoE-A2.7B-Chat`；本阶段服务器检查器只接收自动生成的
-小模型，GPU 权重导出限每 rank 32 MiB，避免误把诊断入口用于完整权重导出。
+首版实际模型仍为 `Qwen/Qwen1.5-MoE-A2.7B-Chat`；默认单层验收使用自动生成的
+小模型，GPU 权重导出限每 rank 32 MiB。真实模型的单层比较使用 `--dump-weights 0`
+关闭权重落盘，见阶段 3～6 的完整验收脚本。
 
 ### 服务器验收
 

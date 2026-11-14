@@ -144,3 +144,16 @@ def forward(config, tensors, task, input_):
         x = [[half(a + half(half(r) + s)) for a, r, s in zip(row, rrow, srow)] for row, rrow, srow in zip(x, routed, shared)]
     result["output"] = flatten(x)
     return result
+
+
+def full_logits(config, tensors, token_ids):
+    """/** 从完整 Token 历史独立重算两层/多层模型；不读取原生 KV、路由或前缀状态。 */"""
+    embedding = matrix(tensors['model.embed_tokens.weight'])
+    h = config['hidden_size']
+    hidden = [x for token in token_ids for x in embedding[token]]
+    for layer in range(config['num_hidden_layers']):
+        hidden = forward(config, tensors, dict(layer=layer, stage=0),
+                         dict(hidden=hidden, position_begin=0))['output']
+    row = norm(hidden[-h:], matrix(tensors['model.norm.weight']), config['rms_norm_eps'])
+    head = tensors.get('lm_head.weight', tensors['model.embed_tokens.weight'])
+    return linear([row], matrix(head), rounded=False)[0]
