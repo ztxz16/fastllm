@@ -96,6 +96,28 @@ max/mean绝对误差、失败数、最坏元素及实际/参考值；阈值保�
 四种报告均包含`saved_full_model_logits`原失败，所以总体FAIL/非零退出是预期的，
 不能将局部子层PASS解释为原问题已修复。诊断目录不会覆盖原验收报告。
 
+### Router一个FP16间隔差异的独立定位
+
+针对已保存诊断中的第1、9、14、17、22层，可仅读取这些层的Norm/Gate权重，
+对同一输入比较HF归一化顺序与原生256线程归约顺序的张量模拟，再分别调用
+PyTorch Linear和与已有worker链接相同cuBLAS库、相同参数的FP32_PEDANTIC GEMM。
+第22层额外使用已保存的原生Attention输出，分离上游输入变化的影响。
+这是独立数值实验，不加载完整模型、不编译，不代表正式后端验收或性能结果。
+
+```bash
+/venv/fastllm-reference-cu126/bin/python3 test/distributed/probe_qwen_moe_router_precision.py \
+  --diagnostic test/distributed/results/20261114T154834Z_moe_precision_b7cc418d \
+  --model /home/models/Qwen1.5-MoE-A2.7B-Chat \
+  --worker build-attention-ep-cu126/fastllm_tp_worker
+```
+
+每组显示Norm差异数、四种组合与已保存HF/原生router输出的精确差异数和最大误差。
+零容差用于定位一个FP16间隔的差异，不改变完整模型验收阈值；存在差异时总体FAIL
+和非零退出是预期现象。`raw.json`保存全部模拟中间量和分数，四种summary报告保存
+比较结果及库版本。归约模拟未直接采集原生Norm输出；若模拟组合无法复现原生日志，
+不能据此断言原生Norm已定位或排除，还需采集真实中间量。PyTorch对照也须先检查
+能否复现已保存HF输出，不能把库版本或执行环境差异归因给单个生产算子。
+
 ## 正式运行示例
 
 ```bash
