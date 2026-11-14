@@ -733,7 +733,7 @@ std::vector<int> Qwen4ExpModel::RunMtpDraftBatch(
 #endif
     Data tokenIds(FLOAT32, {1, rows}, tokens);
     if (!graph) Qwen4BatchPack(hidden, targetHidden);
-    Embedding(tokenIds, weight[languagePrefix + "embed_tokens.weight"], localEmbeddings);
+    RunMtpEmbedding(tokenIds, localEmbeddings);
 #ifdef USE_CUDA
     if (graph) AssertInFastLLM(Qwen4PrepareDecodeGraphTensor(embeddings, localEmbeddings, graph->device),
         "Qwen batch draft embedding staging failed");

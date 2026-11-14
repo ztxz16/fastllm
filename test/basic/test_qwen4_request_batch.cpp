@@ -26,7 +26,12 @@ void Equal(const Data &a, const Data &b, const char *name, double tolerance = 0.
     Check(a.dims == b.dims, name);
     if (a.dims.empty()) return;
     auto materialize=[](const Data &source, Data &result) {
-        if (!Qwen4IsPagedKV(source)) { ToDataType(source,result,FLOAT32); result.ToDevice(CPU); return; }
+        if (!Qwen4IsPagedKV(source)) {
+            // The assertion must not migrate the live request's tensor to the
+            // executor's current device when inspecting a different PP stage.
+            Data copy; copy.CopyFrom(source); copy.ToDevice(CPU);
+            ToDataType(copy,result,FLOAT32); result.ToDevice(CPU); return;
+        }
         // A paged cache's cudaData is its page table, not its KV payload.
         // Gather logical rows independently from the pool's physical pages.
         const auto &pool=*source.pagedKVCacheData;
@@ -64,6 +69,7 @@ void Equal(const Data &a, const Data &b, const char *name, double tolerance = 0.
 }
 }
 namespace fastllm {
+    static bool pipelineTests = false;
 struct Qwen4GGUFTestAccess {
     static void LinearUpdatePrefixes() {
         SetCudaGraph(false); FastllmCudaSetDevice(0);
@@ -232,13 +238,18 @@ struct Qwen4GGUFTestAccess {
         m.pleMultipliers={23703573157769ULL,20109073645365ULL,8052911324071ULL};
         m.pleHeadOffsets={0,17}; m.pleHeadVocabSizes={17,19}; m.eosToken=1;
         m.eos_token_id=1; m.dataType=FLOAT16; m.kvCacheDataType=FLOAT16;
-        m.executionMode=ExecutionMode::Gpu; m.deviceMap={{"cuda:0",1}}; m.moeDeviceMap={{"cuda:0",1}};
+        m.executionMode=ExecutionMode::Gpu; m.deviceMap={{"cuda:0",1}};
+        if (pipelineTests) m.deviceMap["cuda:1"] = 1;
+        m.moeDeviceMap=m.deviceMap;
         m.maxBatch=7; m.saveHistoryChat=false;
         unsigned seed=97;
         auto put=[&](const std::string &name, std::vector<int> dims, DataType type=FLOAT16, float constant=999.f) {
             int n=1; for(int d:dims)n*=d; std::vector<float> v(n);
             for(int i=0;i<n;++i) { seed=1664525u*seed+1013904223u; v[i]=constant==999.f ? (float(int(seed>>16)-32768)/32768)*.025f : constant; }
-            Data value(FLOAT32,dims,v); ToDataType(value,type); m.weight[name].CopyFrom(value);
+            Data value(FLOAT32,dims,v); ToDataType(value,type);
+            // Match model loading: weights start on CPU, then each PP stage
+            // places its own experts. Do not inherit the previous test's GPU.
+            value.ToDevice(CPU); m.weight[name].CopyFrom(value);
             const bool attentionProjection = quantizedAttention &&
                 (name.find("in_proj_qkv.") != std::string::npos || name.find("in_proj_z.") != std::string::npos ||
                  name.find(".self_attn.") != std::string::npos &&
@@ -300,6 +311,26 @@ struct Qwen4GGUFTestAccess {
         // differences. Quantized operator accuracy is tested independently.
         m.mtpDraftLmHeadAttempted=true;
         m.PrepareWeights(); return p;
+    }
+    static void MtpEmbeddingPlacement() {
+        SetCudaGraph(false); SetCudaEmbedding(true);
+        auto model=Model(true);auto &m=*model;
+        auto &weight=m.weight[m.languagePrefix+"embed_tokens.weight"];
+        for (int rows : {1,3,17}) {
+            std::vector<float> tokens(rows);std::iota(tokens.begin(),tokens.end(),2.f);
+            Data ids(FLOAT32,{1,rows},tokens),expected,actual;
+            ApplyDeviceMap({{"cuda:0",1}},1,1);FastllmCudaSetDevice(0);
+            Embedding(ids,weight,expected);
+            const void *storage=weight.cudaData;
+            ApplyDeviceMap({{"cuda:1",1}},1,1);FastllmCudaSetDevice(1);
+            ids.ToDevice(CUDA,std::vector<int>{1});
+            Data borrowed;borrowed.FakeFrom(ids,0);borrowed.Resize(ids.dims);
+            m.RunMtpEmbedding(borrowed,actual);
+            Check(weight.cudaData==storage && weight.dataDeviceIds==std::vector<int>{0},"MTP migrated shared embedding weights");
+            Check(actual.dataDeviceIds==std::vector<int>{1},"MTP embedding output on wrong device");
+            Equal(actual,expected,"cross-device embedding rows",0);
+        }
+        std::cout<<"PASS MTP embedding ownership: 1/3/17 borrowed device tokens, exact rows, unchanged weight allocation\n";
     }
     static void ServingReuse() {
         SetCudaGraph(false); SetDeviceMap({{"cuda:0",1}}); SetMoeDeviceMap({{"cuda:0",1}});
@@ -722,6 +753,12 @@ struct Qwen4GGUFTestAccess {
 };
 }
 int main(int argc,char **argv) { try {SetThreads(2);FastllmCudaSetDevice(0);const bool tuned=argc>1 && std::string(argv[1])=="--tuned-sparse";
+if (argc>1 && std::string(argv[1])=="--embedding-only") {
+    int devices=0;Check(cudaGetDeviceCount(&devices)==cudaSuccess && devices>=2,"pipeline regression requires two GPUs");
+    pipelineTests=true;
+    Qwen4GGUFTestAccess::MtpEmbeddingPlacement();
+    return 0;
+}
 Qwen4GGUFTestAccess::MirrorHandoff();
 if (argc>1 && std::string(argv[1])=="--mirror-only") return 0;
 Qwen4GGUFTestAccess::LinearUpdatePrefixes();

@@ -8246,6 +8246,39 @@ namespace fastllm {
     }
 #endif
 
+    void Qwen4ExpModel::RunMtpEmbedding(const Data &tokenIds, Data &embeddings) {
+        auto &embeddingWeight = this->weight[languagePrefix + "embed_tokens.weight"];
+#ifdef USE_CUDA
+        // Target and draft share the embedding table. Query its resident PP
+        // device, then transfer only the selected rows to the draft device.
+        // Moving the table here makes every verification move it back again.
+        if (!threadTpState && threadTpRank < 0 && deviceMap.size() > 1 &&
+            embeddingWeight.dataDevice == CUDA && embeddingWeight.cudaData &&
+            !embeddingWeight.multiDeviceData && embeddingWeight.dataDeviceIds.size() == 1) {
+            std::map<int, int> ratios;
+            const auto placement = SelectDeviceFromMap(deviceMap, block_cnt, block_cnt);
+            const auto devices = ParseDeviceIds(placement, "cuda", ratios);
+            if (devices.size() == 1 && devices.front() != embeddingWeight.dataDeviceIds.front()) {
+                const int owner = embeddingWeight.dataDeviceIds.front(), draft = devices.front();
+                // Device-generated token IDs can be borrowed slices. Own the
+                // tiny input before transferring it across devices.
+                Data ids;
+                ids.CopyFrom(tokenIds);
+                ids.ToDevice(CPU);
+                ApplyDeviceMap({{"cuda:" + std::to_string(owner), 1}}, 1, 1);
+                FastllmCudaSetDevice(owner);
+                Embedding(ids, embeddingWeight, embeddings);
+                FastllmCudaSyncCurrentThreadStream();
+                embeddings.ToDevice(CUDA, std::vector<int>{draft});
+                ApplyDeviceMap(deviceMap, block_cnt, block_cnt);
+                FastllmCudaSetDevice(draft);
+                return;
+            }
+        }
+#endif
+        Embedding(tokenIds, embeddingWeight, embeddings);
+    }
+
     int Qwen4ExpModel::RunMtpDraft(
             MtpRuntimeState &state,
             const Data &targetHiddenStates,
@@ -8381,10 +8414,7 @@ namespace fastllm {
             // The draft and the first PP stage share the CPU embedding pool.
             std::unique_lock<std::mutex> lock;
             if (embeddingMutex) lock = std::unique_lock<std::mutex>(*embeddingMutex);
-            Embedding(
-                *tokenIds,
-                this->weight[languagePrefix + "embed_tokens.weight"],
-                inputEmbeds);
+            RunMtpEmbedding(*tokenIds, inputEmbeds);
         }
 
 #ifdef USE_CUDA

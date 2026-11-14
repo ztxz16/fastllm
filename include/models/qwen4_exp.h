@@ -770,6 +770,7 @@ namespace fastllm {
                                         const std::vector<Data*> &hidden,
                                         std::vector<Data> &nextHidden, std::vector<float> &probabilities);
         void ForwardMtpBatch(const std::vector<BatchedRequest*> &requests);
+        void RunMtpEmbedding(const Data &tokenIds, Data &embeddings);
         void GenerateMtpProposalBatch(const std::vector<BatchedRequest*> &requests);
         struct ForwardWorkspace;
         ExecutionMode executionMode = ExecutionMode::Cpu;
