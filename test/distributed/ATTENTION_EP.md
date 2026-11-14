@@ -22,20 +22,22 @@
 
 ## 服务器执行顺序
 
-先更新 `sk`，保留服务器自己的未提交改动；如 Git 拒绝更新，先贴出报错，不执行强制重置。
+本地修复推送到 `sk`，由用户在远端合并到 `master` 后，服务器再更新 `master`。
+保留服务器自己的未提交改动；如 Git 拒绝更新，先贴出报错，不执行强制重置。
 
 ```bash
 cd /home/project/vllm_fastllm
 git status --short
 git fetch origin
-git switch sk
-git pull --ff-only origin sk
+git switch master
+git pull --ff-only origin master
 ```
 
 固定环境并编译。本脚本使用新构建目录，避免与 CUDA 13 或其他旧 CMake 缓存混用。
 
 ```bash
 export ATTENTION_EP_PYTHON=/venv/main/bin/python3
+export ATTENTION_EP_REFERENCE_PYTHON=/venv/fastllm-reference-cu126/bin/python3
 export ATTENTION_EP_CUDA_HOME=/usr/local/cuda-12.6
 export ATTENTION_EP_BUILD=build-attention-ep-cu126
 export CUDA_VISIBLE_DEVICES=0,1,2,3
@@ -57,6 +59,12 @@ bash test/distributed/run_attention_ep_v100.sh performance
 参考进程需要已安装支持该模型的 PyTorch、Transformers、Accelerate；脚本不安装、不下载。
 如另有参考虚拟环境，设置 `ATTENTION_EP_REFERENCE_PYTHON=/该环境/bin/python3`。
 参考模型按连续层显式分配到四卡，避免自动放置把权重全部放在一张 32 GiB 卡上。
+Embedding与RoPE在GPU 0，最终Norm在GPU 3，绑定的LM Head与Embedding同卡。
+设备映射不包含根模块兜底，首次前向前检查全部参数、buffer和子模块执行hook是否同卡。
+服务器参考环境当前为 `/venv/fastllm-reference-cu126/bin/python3`：PyTorch 2.7.1+cu126、
+Transformers 4.57.6、Accelerate 1.12.0。主环境仅用于分词，不能用其Transformers版本替代参考环境。
+`reference.log` 记录设备检查和逐历史进度；参考失败时终端显示退出码与日志路径，
+`setup.traceback.log` 保存主验收脚本的异常栈。仅修改这些Python脚本时无需重新编译原生产物。
 
 `regression` 会在独立结果目录生成稠密小模型和 tokenizer，然后调用原有 DP2×TP1、DP4×TP1、
 DP2×TP2 验收以及 TP Decode Eager/Graph 验收，不需要另下载稠密模型。
