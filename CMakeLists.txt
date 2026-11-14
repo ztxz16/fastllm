@@ -1200,6 +1200,11 @@ if (UNIT_TEST)
     fastllm_add_checked_test(v41_pipeline_graph_keys v41_pipeline_graph_keys_test
         "PASS: [0-9]+ independent PP graph layouts" 60)
 
+    add_executable(v41_dspark_tail_test test/basic/test_v41_dspark_tail.cpp)
+    target_link_libraries(v41_dspark_tail_test PRIVATE fastllm)
+    fastllm_add_checked_test(v41_dspark_tail v41_dspark_tail_test
+        "PASS: [0-9]+ DSpark tail prefixes" 60)
+
     add_executable(cpu_moe_cache_layout_test test/basic/test_cpu_moe_cache_layout.cpp)
     target_include_directories(cpu_moe_cache_layout_test PRIVATE include)
     fastllm_add_checked_test(cpu_moe_cache_layout cpu_moe_cache_layout_test "PASS: cache size classes" 60)

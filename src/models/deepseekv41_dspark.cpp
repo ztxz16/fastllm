@@ -1522,12 +1522,20 @@ namespace fastllm {
     }
 
     int DeepSeekV41Model::DsparkAcceptedDraftCount(const DeepSeekV41SpecScratch &scratch,
-            const GenerationConfig &config) const {
+            const GenerationConfig &config, int startPos) const {
         int accepted = scratch.acceptedDrafts;
         if (accepted < 0) {
             accepted = 0;
             while (accepted < (int)scratch.draftTokens.size() &&
                    scratch.tokens[accepted] == scratch.draftTokens[accepted]) ++accepted;
+        }
+        // Keep the verifier's existing proposal shape at the output limit.
+        // Only the publishable prefix may advance KV/history or enter pending;
+        // evaluating later causal rows must not extend the request's state.
+        if (startPos >= 0 && config.output_token_limit > 0 && config.input_token_length > 0) {
+            const int64_t emitted = int64_t(startPos) - config.input_token_length + 1;
+            const int64_t remaining = std::max<int64_t>(0, int64_t(config.output_token_limit) - emitted - 1);
+            accepted = int(std::min<int64_t>(accepted, remaining));
         }
         // EOS/stop is returned to the scheduler, but is not appended to
         // allTokens. Commit only the inputs preceding that output. Otherwise
@@ -1933,10 +1941,12 @@ namespace fastllm {
                 Data proposalIds;
                 int drafts = DsparkBuildVerifyInput(*segment.state, anchor, segment.startPos,
                     proposalIds, scratch.draftTokens);
-                const auto &config = generationConfigs[i];
-                if (config.output_token_limit > 0 && config.input_token_length > 0) {
-                    const int emitted = segment.startPos - config.input_token_length + 1;
-                    drafts = std::min(drafts, std::max(0, config.output_token_limit - emitted - 1));
+                // Output limits constrain commit, not the verification shape.
+                // Context capacity is still a hard bound on speculative reads.
+                int64_t capacity = max_positions;
+                if (tokensLimit > 0 && (capacity <= 0 || tokensLimit < capacity)) capacity = tokensLimit;
+                if (capacity > 0) {
+                    drafts = int(std::min<int64_t>(drafts, std::max<int64_t>(0, capacity - segment.startPos - 1)));
                     scratch.draftTokens.resize(drafts);
                 }
                 draftCounts[i] = drafts;
@@ -1967,7 +1977,7 @@ namespace fastllm {
             for (int i = 0; i < numSegments; ++i) {
                 AssertInFastLLM((int)scratches[i].tokens.size() == draftCounts[i] + 1,
                     "DeepSeekV41 DSpark: the verifier did not return per-position tokens.");
-                scratches[i].acceptedDrafts = DsparkAcceptedDraftCount(scratches[i], generationConfigs[i]);
+                scratches[i].acceptedDrafts = DsparkAcceptedDraftCount(scratches[i], generationConfigs[i], segments[i].startPos);
             }
             DsparkCommitBatch(segments);
             // Commit every request before starting any draft. Each scratch view

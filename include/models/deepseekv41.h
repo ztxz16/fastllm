@@ -595,7 +595,7 @@ namespace fastllm {
         void DsparkMaskToolLogits(Data &logits, const GenerationConfig &config,
                                   const std::vector<int> &prefixTokens);
         int DsparkAcceptedDraftCount(const DeepSeekV41SpecScratch &scratch,
-                                     const GenerationConfig &config) const;
+                                     const GenerationConfig &config, int startPos = -1) const;
         GenerationConfig DsparkDraftConfig(const GenerationConfig &config,
                                           const DeepSeekV41SpecScratch &scratch, int anchorToken);
         void DsparkSampleVerify(Data &logits, const DeepSeekV41DsparkState &proposal,
