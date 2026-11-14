@@ -122,6 +122,10 @@ TP_EXIT_CUSTOM_ALLREDUCE=1 bash test/distributed/run_process_tp_exit_v100.sh /ho
 CUDA_VISIBLE_DEVICES=0,1 bash test/distributed/run_process_tp_monitor_v100.sh
 ```
 
+脚本会检查最终 CMake 缓存中的 CUDA、进程 TP、NUMA 和 SM70 选项。旧构建目录切换
+CUDA 编译器可能导致 CMake 清空缓存并恢复默认选项；检测到这种情况后会重新应用一次
+完整配置，仍不符合要求则停止，不继续构建缺失的目标。配置命令本身失败时直接退出。
+
 所选 GPU 对具备双向 P2P/native atomics 时，可设置 `TP_MONITOR_CUSTOM=1`，在 NCCL 验收后
 追加自定义规约配置。需要正式模型 Eager/Graph 回归时，继续使用上面的
 `run_process_tp_exit_v100.sh`；它也会运行本节新增 case。

@@ -22,8 +22,28 @@ export USE_TORCH=0
 nvidia-smi
 git log -1 --oneline
 
-cmake -S . -B "$TP_MONITOR_BUILD" -DUSE_CUDA=ON -DUSE_NUMAS=OFF -DBUILD_PROCESS_TP=ON \
-    -DCMAKE_CUDA_COMPILER="$CUDACXX" -DCUDA_ARCH=70
+TP_MONITOR_CONFIGURE=(-S . -B "$TP_MONITOR_BUILD" -DUSE_CUDA=ON -DUSE_NUMAS=OFF
+                      -DBUILD_PROCESS_TP=ON "-DCMAKE_CUDA_COMPILER=$CUDACXX" -DCUDA_ARCH=70)
+# 旧目录切换编译器时，CMake 可能清空缓存并按默认选项重新配置，但仍返回成功。
+# 检查最终缓存，必要时重新应用一次全部参数；不能在 CPU/非 TP 配置上继续构建。
+for TP_MONITOR_ATTEMPT in 1 2; do
+    cmake "${TP_MONITOR_CONFIGURE[@]}"
+    if awk -F= '
+        $1 ~ /^USE_CUDA:/ { cuda = ($2 == "ON") }
+        $1 ~ /^USE_NUMAS:/ { numas = ($2 == "OFF") }
+        $1 ~ /^BUILD_PROCESS_TP:/ { tp = ($2 == "ON") }
+        $1 ~ /^CUDA_ARCH:/ { arch = ($2 == "70") }
+        END { exit !(cuda && numas && tp && arch) }
+    ' "$TP_MONITOR_BUILD/CMakeCache.txt"; then
+        break
+    fi
+    if [[ "$TP_MONITOR_ATTEMPT" == 2 ]]; then
+        echo "CMake 配置仍不符合 CUDA/TP/SM70 要求，停止构建；请检查 $TP_MONITOR_BUILD/CMakeCache.txt" >&2
+        exit 1
+    fi
+    echo "CMake 最终缓存与请求不一致，重新应用 CUDA/TP/SM70 配置。" >&2
+done
+
 # 同时更新正式入口及打包目录，避免测试产物已更新但推理入口仍链接旧进程底座。
 cmake --build "$TP_MONITOR_BUILD" --target fastllm_process_tp_package fastllm_tp_check -j 4
 

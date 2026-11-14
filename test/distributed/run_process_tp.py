@@ -250,6 +250,11 @@ def main():
                                 output, 60, parse_json=False)
         fixture_check["backend"] = "python/control-exit-fixture"
         rows.append(fixture_check)
+        script_check = run_case("monitor_build_script",
+                                [sys.executable, str(ROOT / "test/distributed/test_monitor_build_script.py")],
+                                output, 30, parse_json=False)
+        script_check["backend"] = "python/shell-fixture (no compilation)"
+        rows.append(script_check)
         if not args.frontend_only:
             base = [str(args.check.resolve()), "--worker", str(args.worker.resolve()), "--devices", args.devices]
             for name in ("smoke", "restart", "crash", "stall", "invalid_devices", "missing_worker", "startup_exit"):
