@@ -90,6 +90,44 @@ TP_EXIT_CUSTOM_ALLREDUCE=1 bash test/distributed/run_process_tp_exit_v100.sh /ho
 
 ## 检查内容与报告
 
+### 空闲退出事件与心跳回归
+
+空闲监控现在同时等待 worker 的 pidfd、停止管道和下一次心跳到期。退出事件可直接
+唤醒监控线程；心跳到期仍通过正式 Ping/Pong 检查进程响应。停止或前台失败关闭唤醒
+管道写端；监控线程持有独立 pidfd 副本，避免前台清理关闭原句柄时发生复用竞态。
+正常 Stop 会先停止并 join 监控线程，再发送 Shutdown，正常 worker 退出不应误报故障。
+
+以下 case 全部调用正式 `ProcessGroup` 接口。`control_` 表示纯控制面，`cuda_` 表示
+真实 CUDA/NCCL 或显式开启的自定义规约配置；CUDA 场景在故障前及重启后检查实际 SUM 输出。
+
+| 新增 case 后缀 | 执行范围 | 验证内容 |
+| --- | --- | --- |
+| `monitor_idle_exit_first` | control / cuda | 60 秒心跳下杀掉首 rank；不再发前台命令，5 秒内失败并回收整组，报告正确 rank；重启可工作 |
+| `monitor_idle_exit_last` | control / cuda | 同上，杀掉末 rank，确认监听整组而非仅第一个 worker |
+| `monitor_heartbeat_timeout` | control / cuda | SIGSTOP 后进程仍存活；100 毫秒心跳及 1 秒操作超时仍能发现不响应并清理 |
+| `monitor_stop_restart` | control / cuda | 60 秒心跳下连续启停 8 次，含启动后立即停止；Stop 不等心跳，幂等停止，无句柄泄漏 |
+| `monitor_destructor` | control / cuda | 60 秒心跳下由析构关闭，线程及时结束，worker 已回收，句柄数量恢复 |
+| `monitor_group_isolation` | control | 同一父进程管理两组；一组崩溃及重启不影响另一组的 Ping/关闭 |
+| `monitor_heartbeat_healthy` | control 夹具 | 两个 worker 实际收到至少 3 轮后台心跳并回复；前台 Ping 和正常关闭继续成功 |
+| `monitor_stop_heartbeat` | control 夹具 | 两个 worker 已收到后台心跳但不回复时调用 Stop；按原操作超时完成失败清理，关闭不死锁 |
+
+已有 `watch_*` 场景继续覆盖前台等待、半包、完整/过期错误、启动失败和正常退出顺序，
+并增加前台失败后 Stop 的返回耗时断言。测试记录实际故障原因、rank、完成耗时、句柄数和
+回收状态；JSON 保留原始精度，Markdown/CSV/XLSX 浮点值保留 3 位。5 秒上限包含调度和
+整组回收，只是功能断言，不是纯退出检测延迟或性能比较。原生 case 需要服务器重新编译后验收。
+
+服务器双 V100 / CUDA 12.6 的无模型验收（会编译；不依赖 PyTorch）：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 bash test/distributed/run_process_tp_monitor_v100.sh
+```
+
+所选 GPU 对具备双向 P2P/native atomics 时，可设置 `TP_MONITOR_CUSTOM=1`，在 NCCL 验收后
+追加自定义规约配置。需要正式模型 Eager/Graph 回归时，继续使用上面的
+`run_process_tp_exit_v100.sh`；它也会运行本节新增 case。
+
+### 既有验收范围
+
 - 通过公开 `ProcessGroup` 接口验证正常启停、三次重启和幂等 Stop。
 - 在临时线程内启动进程组，线程退出后继续 Ping，检查 worker 生命周期不依赖启动线程。
 - 启动失败、握手超时、协议版本错误、会话错误、重复设备、worker 崩溃和 SIGSTOP 卡死。

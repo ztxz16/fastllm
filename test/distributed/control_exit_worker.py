@@ -77,6 +77,7 @@ def main():
 
     hello = struct.pack("<IIIIII", rank, int(args["--device"]), os.getpid(), 0, 0, 0)
     connection.sendall(frame(HELLO, session, 0, hello + bytes(16) + b"control exit fixture"))
+    ping_count = 0
     while True:
         kind, message_session, sequence, payload = receive(connection)
         if message_session != session or payload:
@@ -91,7 +92,13 @@ def main():
             connection.sendall(frame(BYE, session, sequence))
             return
         elif kind == PING:
-            if mode == "shutdown_order":
+            ping_count += 1
+            if mode in ("heartbeat_healthy", "stop_heartbeat"):
+                (root / f"heartbeat.{ping_count}.{rank}").touch()
+                if mode == "heartbeat_healthy":
+                    connection.sendall(frame(PONG, session, sequence))
+                # stop_heartbeat 保持进程存活但不回复，用于关闭与心跳超时的竞态。
+            elif mode == "shutdown_order":
                 connection.sendall(frame(PONG, session, sequence))
             elif mode == "current_error_exit" and rank == 0:
                 connection.sendall(frame(ERROR, session, sequence, ERROR_TEXT))

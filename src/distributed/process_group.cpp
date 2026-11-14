@@ -6,7 +6,6 @@
 #include <cerrno>
 #include <climits>
 #include <cmath>
-#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <dirent.h>
@@ -271,7 +270,8 @@ struct ProcessGroup::Impl {
     // lifecycle 串行化 Start/Stop；所有 socket 和 waitpid 由 mutex 串行化。
     std::mutex lifecycle;
     mutable std::mutex mutex;
-    std::condition_variable wake;
+    int monitorWakeRead = -1;
+    int monitorWakeWrite = -1;
     std::thread monitor;
     ProcessGroupOptions options;
     ProcessGroupState state = ProcessGroupState::Stopped;
@@ -283,6 +283,12 @@ struct ProcessGroup::Impl {
     bool moeModel = false;
 
     ~Impl() {
+        if (monitorWakeRead >= 0) {
+            close(monitorWakeRead);
+        }
+        if (monitorWakeWrite >= 0) {
+            close(monitorWakeWrite);
+        }
         for (auto &child : children) {
             if (child.fd >= 0) {
                 close(child.fd);
@@ -360,10 +366,22 @@ struct ProcessGroup::Impl {
         return false;
     }
 
+    /**
+     * 请求退出监控线程，并通过关闭管道写端唤醒阻塞中的 poll。
+     * 必须持有 mutex；读端在监控线程 join 后关闭，重复调用无副作用。
+     */
+    void RequestMonitorStop() {
+        stopMonitor = true;
+        if (monitorWakeWrite >= 0) {
+            close(monitorWakeWrite);
+            monitorWakeWrite = -1;
+        }
+    }
+
     void Fail(const std::string &reason) {
         state = ProcessGroupState::Failed;
         error = reason;
-        stopMonitor = true;
+        RequestMonitorStop();
         if (!ReapAll(true)) {
             error += "; worker reap timeout";
         }
@@ -655,21 +673,73 @@ struct ProcessGroup::Impl {
         return {{rank, options.devices[rank], static_cast<int>(pid)}, sockets[0], pidfd, false};
     }
 
+    /**
+     * 阻塞等待 worker 退出或停止通知，并在心跳截止时间到达后检查响应。
+     *
+     * 等待期间释放 mutex，允许前台命令和 Stop 执行。独立持有 pidfd 副本，
+     * 防止前台故障清理关闭原句柄后，poll 观察到复用的文件描述符。
+     * 恢复锁后先检查停止请求，再处理退出或心跳；所有协议操作仍由 mutex 串行化。
+     * EINTR 不重置心跳截止时间，等待或通信失败沿用整组终止与回收逻辑。
+     */
     void Monitor() {
         std::unique_lock<std::mutex> lock(mutex);
-        while (!wake.wait_for(lock, std::chrono::milliseconds(options.heartbeatIntervalMs),
-                              [&]() { return stopMonitor; })) {
-            try {
-                for (auto &child : children) {
-                    if (Reap(child)) {
-                        throw std::runtime_error("rank " + std::to_string(child.info.rank) + " exited");
-                    }
+        struct Handles {
+            std::vector<pollfd> items;
+            /** 仅释放监控线程拥有的 pidfd 副本；管道读端由 Stop 在 join 后释放。 */
+            ~Handles() {
+                for (size_t i = 1; i < items.size(); ++i) {
+                    close(items[i].fd);
                 }
-                Exchange(Kind::Ping, Kind::Pong, {},
-                         Clock::now() + std::chrono::milliseconds(options.operationTimeoutMs));
-            } catch (const std::exception &e) {
-                Fail(e.what());
+            }
+        } handles;
+
+        try {
+            if (stopMonitor) {
                 return;
+            }
+            handles.items.reserve(children.size() + 1);
+            handles.items.push_back({monitorWakeRead, POLLIN, 0});
+            for (const auto &child : children) {
+                int fd = fcntl(child.pidfd, F_DUPFD_CLOEXEC, 0);
+                if (fd < 0) {
+                    throw std::runtime_error(std::string("duplicate monitor pidfd: ") + strerror(errno));
+                }
+                handles.items.push_back({fd, POLLIN, 0});
+            }
+
+            auto heartbeat = Clock::now() + std::chrono::milliseconds(options.heartbeatIntervalMs);
+            while (!stopMonitor) {
+                auto remaining = std::chrono::ceil<std::chrono::milliseconds>(heartbeat - Clock::now()).count();
+                int timeout = static_cast<int>(std::min<int64_t>(INT_MAX, std::max<int64_t>(0, remaining)));
+                lock.unlock();
+                int ready = poll(handles.items.data(), handles.items.size(), timeout);
+                int pollError = errno;
+                lock.lock();
+
+                // Stop 或前台 Fail 已接管清理；不能把正常关闭误报为 worker 崩溃。
+                if (stopMonitor) {
+                    return;
+                }
+                if (ready < 0) {
+                    if (pollError == EINTR) {
+                        continue;
+                    }
+                    throw std::runtime_error(std::string("monitor poll: ") + strerror(pollError));
+                }
+                if (handles.items[0].revents) {
+                    throw std::runtime_error("unexpected monitor wake pipe event");
+                }
+                // 此处重新取得原句柄集合时持有锁；退出诊断与前台事务保持一致。
+                CheckWorkerExits(WatchWorkers());
+                if (Clock::now() >= heartbeat) {
+                    Exchange(Kind::Ping, Kind::Pong, {},
+                             Clock::now() + std::chrono::milliseconds(options.operationTimeoutMs));
+                    heartbeat = Clock::now() + std::chrono::milliseconds(options.heartbeatIntervalMs);
+                }
+            }
+        } catch (const std::exception &e) {
+            if (!stopMonitor) {
+                Fail(e.what());
             }
         }
     }
@@ -722,6 +792,13 @@ void ProcessGroup::Start(const ProcessGroupOptions &options) {
         if (signalResult != 0) {
             throw std::runtime_error("process TP requires pidfd_send_signal permission");
         }
+        int wakePipe[2];
+        if (pipe2(wakePipe, O_CLOEXEC | O_NONBLOCK) != 0) {
+            throw std::runtime_error(std::string("monitor wake pipe: ") + strerror(errno));
+        }
+        impl->monitorWakeRead = wakePipe[0];
+        impl->monitorWakeWrite = wakePipe[1];
+
         auto deadline = Clock::now() + std::chrono::milliseconds(options.startupTimeoutMs);
         impl->children.reserve(options.devices.size());
         for (size_t rank = 0; rank < options.devices.size(); rank++) {
@@ -1143,14 +1220,17 @@ void ProcessGroup::Stop() {
     std::lock_guard<std::mutex> lifecycleLock(impl->lifecycle);
     {
         std::lock_guard<std::mutex> lock(impl->mutex);
-        impl->stopMonitor = true;
-        impl->wake.notify_all();
+        impl->RequestMonitorStop();
     }
     if (impl->monitor.joinable()) {
         impl->monitor.join();
     }
 
     std::lock_guard<std::mutex> lock(impl->mutex);
+    if (impl->monitorWakeRead >= 0) {
+        close(impl->monitorWakeRead);
+        impl->monitorWakeRead = -1;
+    }
     bool graceful = impl->state == ProcessGroupState::Ready;
     impl->state = ProcessGroupState::Stopping;
     if (graceful) {

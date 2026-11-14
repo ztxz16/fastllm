@@ -125,6 +125,30 @@ class ExitFixtureTest(unittest.TestCase):
                 connections[0].recv(1)
             self.assertTrue(all(process.poll() is None for process in processes))
 
+    def test_healthy_heartbeats_and_shutdown(self):
+        with workers("heartbeat_healthy") as (connections, processes):
+            self.initialize(connections, processes)
+            for sequence in range(2, 6):
+                for connection in connections:
+                    connection.sendall(fixture.frame(6, 123, sequence))
+                for connection in connections:
+                    self.assertEqual(fixture.receive(connection), (7, 123, sequence, b""))
+            for connection in connections:
+                connection.sendall(fixture.frame(8, 123, 6))
+            for connection in connections:
+                self.assertEqual(fixture.receive(connection), (9, 123, 6, b""))
+            self.assertTrue(all(process.wait(timeout=3) == 0 for process in processes))
+
+    def test_heartbeat_stall_keeps_both_workers_alive(self):
+        with workers("stop_heartbeat") as (connections, processes):
+            self.initialize(connections, processes)
+            self.ping(connections)
+            for connection in connections:
+                connection.settimeout(0.05)
+                with self.assertRaises(socket.timeout):
+                    connection.recv(1)
+            self.assertTrue(all(process.poll() is None for process in processes))
+
     def test_shutdown_other_worker_exits_before_first_reply(self):
         with workers("shutdown_order") as (connections, processes):
             self.initialize(connections, processes)

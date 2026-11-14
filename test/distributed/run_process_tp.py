@@ -46,6 +46,7 @@ def save_report(output, rows, metadata):
                 'token_mismatches', 'compared_steps', 'first_divergence_token_1based',
                 'requests', 'generated_tokens', 'elapsed_s', 'http_requests', 'sse_requests', 'reaped_processes',
                 'operation_timeout_ms', 'failure_return_ms', 'failure_phase', 'fault_rank',
+                'heartbeat_interval_ms', 'stop_return_ms', 'restarts', 'fd_count_before', 'fd_count_after',
                 'workers_reaped', 'observed_error', 'median_ms', 'p95_ms', 'cv', 'tokens_per_second',
                 'speedup', 'concurrency', 'repeats', 'ttft_median_ms', 'itl_median_ms', 'queue_median_ms',
                 'reserved_kv_bytes', 'graph_workspace_bytes'):
@@ -254,6 +255,9 @@ def main():
             for name in ("smoke", "restart", "crash", "stall", "invalid_devices", "missing_worker", "startup_exit"):
                 command = base + ["--control-only", "--case", name, "--operation-timeout-ms", "1000"]
                 rows.append(run_case("control_" + name, command, output, 90))
+            for mode in ("idle_exit_first", "idle_exit_last", "heartbeat_timeout", "stop_restart", "destructor", "group_isolation"):
+                name = "monitor_" + mode
+                rows.append(run_case("control_" + name, base + ["--control-only", "--case", name], output, 90))
             fixture = output / "startup_timeout_worker"
             source = (ROOT / "test/distributed/startup_timeout_worker.py").read_text(encoding="utf-8")
             fixture.write_text(source, encoding="utf-8")
@@ -277,6 +281,15 @@ def main():
                 environment = dict(os.environ, FASTLLM_TEST_EXIT_MODE=mode,
                                    FASTLLM_TEST_EXIT_DIR=str(barrier_dir.resolve()))
                 rows.append(run_case("control_" + name, command, output, 45, environment=environment))
+            for mode in ("heartbeat_healthy", "stop_heartbeat"):
+                name = "monitor_" + mode
+                barrier_dir = output / name
+                barrier_dir.mkdir()
+                command = [str(args.check.resolve()), "--worker", str(exit_fixture.resolve()),
+                           "--devices", "0,1", "--control-only", "--case", name]
+                environment = dict(os.environ, FASTLLM_TEST_EXIT_MODE=mode,
+                                   FASTLLM_TEST_EXIT_DIR=str(barrier_dir.resolve()))
+                rows.append(run_case("control_" + name, command, output, 45, environment=environment))
             rows.append(parent_death_case(base + ["--control-only", "--case", "hold"], 90, output))
             if args.pid_namespace:
                 command = ["unshare", "--user", "--map-root-user", "--pid", "--fork", "--kill-child=SIGKILL"]
@@ -284,6 +297,9 @@ def main():
             if args.cuda:
                 cuda_base = base + (["--custom-allreduce", "1"] if args.custom_allreduce else [])
                 for name in ("smoke", "restart", "crash", "stall", "allreduce_boundaries", "collective_crash"):
+                    rows.append(run_case("cuda_" + name, cuda_base + ["--case", name], output, 240))
+                for mode in ("idle_exit_first", "idle_exit_last", "heartbeat_timeout", "stop_restart", "destructor"):
+                    name = "monitor_" + mode
                     rows.append(run_case("cuda_" + name, cuda_base + ["--case", name], output, 240))
                 if args.custom_allreduce:
                     rows.append(run_case("custom_invalid_world", cuda_base + ["--case", "custom_invalid_world"], output, 30))

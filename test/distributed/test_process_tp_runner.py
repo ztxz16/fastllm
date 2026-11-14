@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """用真实 Python 子进程验证验收器清理；不加载推理库，不编译。"""
 
+import csv
 import json
 import os
 from pathlib import Path
@@ -10,6 +11,7 @@ import sys
 import tempfile
 import time
 import unittest
+import zipfile
 from unittest import mock
 
 import run_process_tp as runner
@@ -244,6 +246,26 @@ class RunnerCleanupTest(unittest.TestCase):
         row = runner.run_case("missing", [str(self.output / "does-not-exist")], self.output, 5)
         self.assertEqual(row["status"], "FAIL")
         self.assertIn("No such file", row["reason"])
+
+    def test_monitor_report_preserves_metrics_and_failure(self):
+        row = {"case": "control_monitor_idle_exit_last", "status": "FAIL", "fault_rank": 1,
+               "heartbeat_interval_ms": 60000, "failure_return_ms": 12.345678,
+               "stop_return_ms": 1.234567, "fd_count_before": 4, "fd_count_after": 5,
+               "workers_reaped": True, "reason": "monitor handles were not released"}
+        self.assertEqual(runner.save_report(self.output, [row], {"command": "fixture"}), "FAIL")
+        summary = json.loads((self.output / "summary.json").read_text())
+        self.assertEqual(summary["cases"][0], row)
+        with (self.output / "summary.csv").open(newline="") as handle:
+            displayed = next(csv.DictReader(handle))
+        self.assertEqual(displayed["failure_return_ms"], "12.346")
+        self.assertEqual(displayed["stop_return_ms"], "1.235")
+        self.assertEqual(displayed["fd_count_after"], "5")
+        self.assertIn("monitor handles were not released", (self.output / "summary.md").read_text())
+        with zipfile.ZipFile(self.output / "summary.xlsx") as workbook:
+            self.assertIsNone(workbook.testzip())
+            text = "".join(workbook.read(name).decode() for name in workbook.namelist() if name.endswith(".xml"))
+            self.assertIn("failure_return_ms", text)
+            self.assertIn("12.346", text)
 
 
 def run_tests():

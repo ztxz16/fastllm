@@ -4,12 +4,18 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cerrno>
 #include <cmath>
+#include <cstdlib>
+#include <dirent.h>
 #include <exception>
+#include <filesystem>
 #include <iostream>
 #include <signal.h>
 #include <sstream>
 #include <stdexcept>
+#include <sys/syscall.h>
+#include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
 
@@ -45,7 +51,7 @@ void RunWatchCase(ProcessGroupOptions options, const std::string &caseName, json
     options.startupTimeoutMs = 30000;
     options.operationTimeoutMs = stall ? 1000 : 30000;
     options.shutdownTimeoutMs = 1000;
-    // 确保故障由被测公开调用触发，而非空闲心跳抢先执行 Ping。
+    // 禁止空闲心跳抢先发 Ping；退出监听始终有效，协议故障由夹具收到命令后触发。
     options.heartbeatIntervalMs = 60000;
     report["operation_timeout_ms"] = startup ? options.startupTimeoutMs : options.operationTimeoutMs;
     report["shape"] = "control-only TP=2; protocol fixture; no tensor output";
@@ -104,12 +110,266 @@ void RunWatchCase(ProcessGroupOptions options, const std::string &caseName, json
         bool commandRejected = false;
         try { group.Ping(); } catch (const std::exception &) { commandRejected = true; }
         Require(commandRejected, "failed group accepted another command");
+        auto stopping = std::chrono::steady_clock::now();
         group.Stop();
+        report["stop_return_ms"] = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - stopping).count();
+        Require(report["stop_return_ms"].number_value() < 5000, "failed monitor did not wake for Stop");
         group.Stop();
         Require(group.LastError() == error, "cleanup overwrote the original failure");
     }
     Require(group.State() == ProcessGroupState::Stopped && group.Workers().empty(), "watch case leaked workers");
     report["workers_reaped"] = true;
+}
+
+/**
+ * 统计协调器的打开句柄，检查重复启停是否遗留监控管道或 pidfd 副本。
+ * @return 当前 /proc/self/fd 条目数；目录打开失败时抛出异常。
+ */
+int OpenFdCount() {
+    DIR *directory = opendir("/proc/self/fd");
+    Require(directory != nullptr, "cannot inspect coordinator file descriptors");
+    int count = 0;
+    while (auto *entry = readdir(directory)) {
+        if (entry->d_name[0] != '.') {
+            ++count;
+        }
+    }
+    closedir(directory);
+    return count;
+}
+
+/**
+ * 验证 worker 的退出状态已被协调器回收，而不仅是从内部列表移除。
+ * @param workers 故障或关闭前从公开接口取得的 worker 身份。
+ */
+void RequireReaped(const std::vector<ProcessWorkerInfo> &workers) {
+    for (const auto &worker : workers) {
+        int status = 0;
+        errno = 0;
+        auto result = waitpid(worker.pid, &status, WNOHANG);
+        Require(result == -1 && errno == ECHILD, "worker is still alive or was not reaped");
+    }
+}
+
+/**
+ * 使用稳定的进程句柄注入故障，避免停止竞态中裸 PID 被复用。
+ * @param worker 仍由当前测试进程组管理的 worker。
+ * @param signal 要发送的 SIGKILL 或 SIGSTOP。
+ */
+void SignalWorker(const ProcessWorkerInfo &worker, int signal) {
+    int fd = static_cast<int>(syscall(SYS_pidfd_open, worker.pid, 0));
+    Require(fd >= 0, "cannot open fault-injection pidfd");
+    int result = static_cast<int>(syscall(SYS_pidfd_send_signal, fd, signal, nullptr, 0));
+    close(fd);
+    Require(result == 0, "cannot inject worker signal");
+}
+
+/**
+ * 通过正式接口验证控制通信；CUDA 场景同时验证真实 FP32 SUM 输出。
+ * @param group 已就绪的进程组。
+ * @param options 本次启动配置，决定是否验证 GPU 数值。
+ * @param report 保存最近一次求和输出、误差及实际 worker 元数据。
+ */
+void CheckMonitorWork(ProcessGroup &group, const ProcessGroupOptions &options, json11::Json::object &report) {
+    group.Ping();
+    json11::Json::array identities;
+    for (const auto &worker : group.Workers()) {
+        identities.push_back(json11::Json::object{{"rank", worker.rank}, {"pid", worker.pid},
+            {"device", worker.device}, {"gpu", worker.deviceName},
+            {"cuda_runtime_version", worker.cudaRuntimeVersion}, {"nccl_version", worker.ncclVersion}});
+    }
+    report["workers"] = identities;
+    if (options.controlOnly) {
+        return;
+    }
+
+    auto values = group.CheckAllReduce();
+    double expected = double(options.devices.size()) * (options.devices.size() + 1) / 2;
+    double maximum = 0, sum = 0;
+    int failed = 0;
+    json11::Json::array actual;
+    for (float value : values) {
+        actual.push_back(double(value));
+        double error = std::isfinite(value) ? std::abs(value - expected) : expected + 1;
+        maximum = std::max(maximum, error);
+        sum += error;
+        failed += error != 0;
+    }
+    report["actual"] = actual;
+    report["expected"] = expected;
+    report["max_abs_error"] = maximum;
+    report["mean_abs_error"] = values.empty() ? 0 : sum / values.size();
+    report["failed_elements"] = failed;
+    Require(values.size() == options.devices.size() && failed == 0, "monitor lifecycle SUM output mismatch");
+
+    auto states = group.Qwen3Requests();
+    Require(states.size() == options.devices.size(), "missing AllReduce path diagnostics");
+    for (const auto &state : states) {
+        const auto &info = state.allReduce;
+        Require(options.customAllReduce ? (info.active && info.customCalls > 0 && info.ncclCalls == 0) :
+                                         (!info.enabled && info.ncclCalls > 0 && info.customCalls == 0),
+                "monitor lifecycle used unexpected AllReduce path");
+    }
+    report["custom_calls"] = static_cast<long long>(states.front().allReduce.customCalls);
+    report["nccl_calls"] = static_cast<long long>(states.front().allReduce.ncclCalls);
+}
+
+/**
+ * 验证空闲退出唤醒、心跳及停止/重启生命周期，避免只验证操作中的退出监听。
+ *
+ * 退出与停止场景使用 60 秒心跳和 5 秒完成上限，旧的定时检查不能通过。
+ * 耗时包含调度、整组清理及回收，仅用于功能断言，不代表纯检测延迟或性能结果。
+ * @param options 正式 worker 配置；夹具场景仅允许 controlOnly TP=2。
+ * @param caseName monitor_ 前缀的场景名。
+ * @param report 保存配置、实际诊断、生命周期耗时和数值验证结果。
+ */
+void RunMonitorCase(ProcessGroupOptions options, const std::string &caseName, json11::Json::object &report) {
+    using Clock = std::chrono::steady_clock;
+    const std::string mode = caseName.substr(8);
+    const bool heartbeat = mode == "heartbeat_timeout" || mode == "heartbeat_healthy" || mode == "stop_heartbeat";
+    const bool fixture = mode == "heartbeat_healthy" || mode == "stop_heartbeat";
+    Require(mode == "idle_exit_first" || mode == "idle_exit_last" || mode == "heartbeat_timeout" ||
+            mode == "stop_restart" || mode == "destructor" || mode == "group_isolation" || fixture,
+            "unknown monitor case: " + mode);
+    Require(!fixture || (options.controlOnly && options.devices.size() == 2), "monitor fixture requires control-only TP=2");
+    options.heartbeatIntervalMs = heartbeat ? 100 : 60000;
+    options.operationTimeoutMs = heartbeat ? 1000 : 30000;
+    options.shutdownTimeoutMs = 3000;
+    report["heartbeat_interval_ms"] = options.heartbeatIntervalMs;
+    report["operation_timeout_ms"] = options.operationTimeoutMs;
+    report["shape"] = options.controlOnly ? "process lifecycle; no tensor output" : "one FP32 scalar per rank";
+    const int baselineFds = OpenFdCount();
+
+    if (mode == "destructor") {
+        std::vector<ProcessWorkerInfo> workers;
+        auto stopping = Clock::now();
+        {
+            ProcessGroup scoped;
+            scoped.Start(options);
+            CheckMonitorWork(scoped, options, report);
+            workers = scoped.Workers();
+            // 留出后台线程进入空闲等待的调度机会，耗时断言从真正开始析构时计算。
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            stopping = Clock::now();
+        }
+        report["stop_return_ms"] = std::chrono::duration<double, std::milli>(Clock::now() - stopping).count();
+        Require(report["stop_return_ms"].number_value() < 5000, "destructor waited for long heartbeat");
+        RequireReaped(workers);
+    } else {
+        ProcessGroup group;
+        group.Start(options);
+        if (!fixture) {
+            CheckMonitorWork(group, options, report);
+            if (!heartbeat) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+        }
+        auto workers = group.Workers();
+        if (mode == "stop_restart") {
+            double maximum = 0;
+            for (int iteration = 0; iteration < 8; ++iteration) {
+                if (iteration != 0) {
+                    group.Start(options);
+                    workers = group.Workers();
+                    // 交替覆盖启动后立即 Stop，以及正常通信后的 Stop。
+                    if (iteration % 2 == 0) {
+                        CheckMonitorWork(group, options, report);
+                        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    }
+                }
+                auto stopping = Clock::now();
+                group.Stop();
+                maximum = std::max(maximum, std::chrono::duration<double, std::milli>(Clock::now() - stopping).count());
+                Require(maximum < 5000, "Stop waited for long heartbeat");
+                Require(group.LastError().empty(), "normal shutdown misclassified as crash: " + group.LastError());
+                RequireReaped(workers);
+                group.Stop();
+                Require(OpenFdCount() == baselineFds, "monitor descriptors leaked across restart");
+            }
+            report["stop_return_ms"] = maximum;
+            report["restarts"] = 7;
+        } else if (fixture) {
+            const char *directory = std::getenv("FASTLLM_TEST_EXIT_DIR");
+            Require(directory && *directory, "missing monitor fixture directory");
+            const auto root = std::filesystem::path(directory);
+            const auto prefix = mode == "heartbeat_healthy" ? "heartbeat.3." : "heartbeat.1.";
+            auto deadline = Clock::now() + std::chrono::seconds(5);
+            while (!std::filesystem::exists(root / (std::string(prefix) + "0")) ||
+                   !std::filesystem::exists(root / (std::string(prefix) + "1"))) {
+                Require(Clock::now() < deadline, "background heartbeat did not reach both workers");
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            if (mode == "heartbeat_healthy") {
+                CheckMonitorWork(group, options, report);
+            }
+            auto stopping = Clock::now();
+            group.Stop();
+            report["stop_return_ms"] = std::chrono::duration<double, std::milli>(Clock::now() - stopping).count();
+            Require(report["stop_return_ms"].number_value() < 5000, "Stop hung during heartbeat");
+            Require(mode == "heartbeat_healthy" ? group.LastError().empty() :
+                    group.LastError().find("timeout") != std::string::npos, "wrong heartbeat outcome: " + group.LastError());
+            report["observed_error"] = group.LastError();
+            RequireReaped(workers);
+        } else {
+            ProcessGroup survivor;
+            if (mode == "group_isolation") {
+                survivor.Start(options);
+                CheckMonitorWork(survivor, options, report);
+            }
+            const auto &victim = mode == "idle_exit_first" ? workers.front() : workers.back();
+            report["fault_rank"] = victim.rank;
+            auto started = Clock::now();
+            SignalWorker(victim, mode == "heartbeat_timeout" ? SIGSTOP : SIGKILL);
+            // 不发送前台命令：故障必须由后台监控独立发现。
+            while (group.State() == ProcessGroupState::Ready && Clock::now() - started < std::chrono::seconds(5)) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            double elapsed = std::chrono::duration<double, std::milli>(Clock::now() - started).count();
+            report["failure_return_ms"] = elapsed;
+            report["failure_phase"] = "idle_monitor";
+            report["observed_error"] = group.LastError();
+            Require(elapsed < 5000 && group.State() == ProcessGroupState::Failed && group.Workers().empty(),
+                    "idle monitor did not fail and reap the group before heartbeat deadline");
+            const auto error = group.LastError();
+            if (mode == "heartbeat_timeout") {
+                Require(error.find("timeout") != std::string::npos && elapsed >= 900,
+                        "live stalled worker did not follow heartbeat timeout: " + error);
+            } else {
+                Require(error.rfind("rank " + std::to_string(victim.rank), 0) == 0 && error.find("timeout") == std::string::npos,
+                        "idle exit lost fault rank or fell through to timeout: " + error);
+            }
+            RequireReaped(workers);
+            bool rejected = false;
+            try { group.Ping(); } catch (const std::exception &) { rejected = true; }
+            Require(rejected, "failed group accepted a command");
+            auto stopping = Clock::now();
+            group.Stop();
+            report["stop_return_ms"] = std::chrono::duration<double, std::milli>(Clock::now() - stopping).count();
+            Require(report["stop_return_ms"].number_value() < 5000 && group.LastError() == error,
+                    "failure cleanup hung or overwrote diagnostic");
+            group.Stop();
+            group.Start(options);
+            CheckMonitorWork(group, options, report);
+            workers = group.Workers();
+            group.Stop();
+            Require(group.LastError().empty(), "restart inherited failed monitor state");
+            RequireReaped(workers);
+            if (mode == "group_isolation") {
+                CheckMonitorWork(survivor, options, report);
+                auto survivors = survivor.Workers();
+                survivor.Stop();
+                Require(survivor.LastError().empty(), "one group's failure affected another group");
+                RequireReaped(survivors);
+            }
+        }
+        group.Stop();
+        Require(group.State() == ProcessGroupState::Stopped && group.Workers().empty(), "monitor case leaked workers");
+    }
+    report["workers_reaped"] = true;
+    report["fd_count_before"] = baselineFds;
+    report["fd_count_after"] = OpenFdCount();
+    Require(report["fd_count_after"].int_value() == baselineFds, "monitor handles were not released");
 }
 
 /**
@@ -119,6 +379,10 @@ void RunWatchCase(ProcessGroupOptions options, const std::string &caseName, json
  * @param report 保存实际返回值、误差和实际 worker 元数据，异常时保留部分结果。
  */
 void Run(ProcessGroupOptions options, const std::string &caseName, json11::Json::object &report) {
+    if (caseName.rfind("monitor_", 0) == 0) {
+        RunMonitorCase(options, caseName, report);
+        return;
+    }
     if (caseName.rfind("watch_", 0) == 0) {
         RunWatchCase(options, caseName, report);
         return;
@@ -138,6 +402,7 @@ void Run(ProcessGroupOptions options, const std::string &caseName, json11::Json:
     }
     if (caseName == "missing_worker" || caseName == "startup_exit" || caseName == "startup_timeout" ||
         caseName == "protocol_version" || caseName == "protocol_session") {
+        const int baselineFds = OpenFdCount();
         if (caseName == "missing_worker") {
             options.workerPath += ".does-not-exist";
         } else if (caseName == "startup_exit") {
@@ -162,6 +427,9 @@ void Run(ProcessGroupOptions options, const std::string &caseName, json11::Json:
                     "wrong protocol rejection reason: " + group.LastError());
         }
         group.Stop();
+        report["fd_count_before"] = baselineFds;
+        report["fd_count_after"] = OpenFdCount();
+        Require(report["fd_count_after"].int_value() == baselineFds, "startup failure leaked monitor handles");
         return;
     }
     if (caseName == "custom_invalid_world") {
