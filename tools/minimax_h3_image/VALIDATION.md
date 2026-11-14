@@ -879,7 +879,8 @@ Implemented directly on `master`, starting from `e4261060b4c81db3d8b44ac8d92a717
 Tests use only idle physical GPUs 6/7 (RTX PRO 5000 Blackwell, CUDA 13). The existing
 GPU 3 image service was not restarted. FP8/INT8/NVFP4/GGUF weight types remain
 automatically detected. Explicit `--parallel-mode tp` now shards image projections;
-quantized `auto` retains SP.
+quantized `auto` retains SP. The launcher exposes the existing parallel selector
+for images, without adding another profile field or environment variable.
 
 Real-checkpoint tests cover all 50 blocks with identical oracle inputs, two
 asymmetric reference grids and a two-block 4096-row FFN tail. Both ranks produce
@@ -904,8 +905,9 @@ BF16-partial attention variant reached 0.0656588 maximum stage relative L2.
 No single-GPU/SP arithmetic or video projection behavior is changed.
 
 The 12 selected H3 native CTests and the continuous parallel runtime test pass.
-Video FP8/INT8 TP2 real-checkpoint regressions pass.
-`ldd -r` finds no unresolved symbols or Torch/C10/Python runtime
+Video FP8/INT8 TP2 real-checkpoint regressions pass. Launcher media tests pass
+23 cases with the browser test enabled; the browser also verifies the image
+parallel selector. `ldd -r` finds no unresolved symbols or Torch/C10/Python runtime
 dependency. The inference path remains C++/CUDA/NCCL.
 
 HTTP checks pass repeated deterministic 512-square TP2 generation for all four
@@ -966,8 +968,8 @@ are unchanged. No experimental environment switch remains in the image native
 code; existing GPU visibility and server executable lookup settings are retained.
 HTTP regression now checks both explicit DiT rank-count fields.
 
-The rebuilt sources pass 13 native CTests, the image workspace state test,
-eight real-checkpoint image
+The rebuilt sources pass 13 native CTests, all 23 launcher media tests including
+the browser test, the image workspace state test, eight real-checkpoint image
 TP2 cases and video FP8/INT8 TP2 regressions. All eight maximum stage-relative-L2
 values above are unchanged. Seven complete 2K generations match pre-cleanup PNG
 SHA256 values: BF16/FP8/INT8/NVFP4/GGUF TP2, FP8 single GPU and NVFP4 SP2.
@@ -978,5 +980,7 @@ old/new-library check with two warmups and four measured requests gives medians
 of 2.339 s before and 2.345 s after (+0.25%), with identical PNGs. NVFP4 TP2 remains
 2.215 s versus 2.218 s in the earlier run. No steady-state regression is observed.
 Full samples, environment audit, source hashes and proposed commit grouping are
-in `image-tp-cleanup-20261114`.
+in `image-tp-cleanup-20261114`. Launcher tests use the source companion runtime
+on `PYTHONPATH`; a fresh test environment without that package first produced
+import failures, then all tests passed with the complete source package available.
 The earlier multi-GPU-count, platform and release-wheel validation limits still apply.

@@ -263,7 +263,7 @@ The launcher locates `minimax_h3_image_server` from the profile's binary field, 
 FTLLM_H3_IMAGE_SERVER=/absolute/build/src/models/minimax_h3/minimax_h3_image_server ftllm launch
 ```
 
-GPU indices in the launcher refer to its visible GPU list. If a container exposes physical GPU 3 only, select logical GPU 0. Select 1, 2, 4 or 8 GPUs; two-device inference has been validated. The backend selects SP or streamed TP automatically from the per-device memory budget. CUDA wheel packaging includes both image executables, OpenAPI, the standalone demo and its shared JS/CSS assets. A full release wheel has not been built in this experiment.
+GPU indices in the launcher refer to its visible GPU list. If a container exposes physical GPU 3 only, select logical GPU 0. Select 1, 2, 4 or 8 GPUs; two-device inference has been validated. The image profile exposes the same auto/TP/SP selector as video. BF16 auto selects SP or streamed TP from the per-device memory budget; quantized auto keeps SP. Select TP explicitly to shard quantized weights. CUDA wheel packaging includes both image executables, OpenAPI, the standalone demo and its shared JS/CSS assets. A full release wheel has not been built in this experiment.
 
 ## Numerical validation
 

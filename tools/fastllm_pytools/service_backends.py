@@ -285,6 +285,8 @@ class H3ImageBackend:
                             ("--host-memory-limit", config.video_host_memory_limit)):
             if value.strip():
                 command.extend((flag, value.strip()))
+        if config.video_parallel_mode != "auto":
+            command.extend(("--parallel-mode", config.video_parallel_mode))
         return command
 
     def validate(self, config):
@@ -302,6 +304,8 @@ class H3ImageBackend:
         count = len([gpu for gpu in config.visible_gpus.split(",") if gpu.strip()])
         if count not in {0, 1, 2, 4, 8}:
             add("MiniMax H3 Image 支持 1、2、4 或 8 张 GPU。", "visible_gpus")
+        if config.video_parallel_mode not in {"auto", "tp", "sp"}:
+            add("图像并行方式须为 auto、tp 或 sp。", "video_parallel_mode")
         try:
             if not 1 <= int(config.port) <= 65535:
                 raise ValueError()

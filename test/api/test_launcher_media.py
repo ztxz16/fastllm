@@ -163,6 +163,27 @@ class ServiceTest(unittest.TestCase):
         manifest.write_text("{}")
         self.assertEqual(service_backends.H3Backend().model_name(config), "minimax-h3")
 
+    def test_quantized_image_parallel_mode(self):
+        for mode in ("auto", "tp", "sp"):
+            config = config_from_dict(self.profile("minimax_h3_image", video_parallel_mode=mode,
+                                                   visible_gpus="6,7"))
+            command = build_fastllm_argv(config)
+            self.assertEqual(command[command.index("--devices") + 1], "0,1")
+            if mode == "auto":
+                self.assertNotIn("--parallel-mode", command)
+            else:
+                self.assertEqual(command[command.index("--parallel-mode") + 1], mode)
+            self.assertEqual(validate_config(config), [])
+        config.video_parallel_mode = "invalid"
+        fields = []
+        validate_config(config, fields)
+        self.assertTrue(any("video_parallel_mode" in item["fields"] for item in fields))
+        self.start("minimax_h3_image", video_parallel_mode="tp", visible_gpus="6,7")
+        command, environment = self.commands[-1]
+        self.assertEqual(command[command.index("--parallel-mode") + 1], "tp")
+        self.assertEqual(command[command.index("--devices") + 1], "0,1")
+        self.assertEqual(environment["CUDA_VISIBLE_DEVICES"], "6,7")
+
     def test_gpu_mask_is_composed_and_auto_configuration_preserves_it(self):
         self.assertEqual(visible_gpu_environment("1,0", {"CUDA_VISIBLE_DEVICES": "6,7"}), {"CUDA_VISIBLE_DEVICES": "7,6"})
         self.assertEqual(visible_gpu_environment("1", {"CUDA_VISIBLE_DEVICES": "GPU-a,GPU-b"}), {"CUDA_VISIBLE_DEVICES": "GPU-b"})
@@ -557,6 +578,9 @@ class ServiceTest(unittest.TestCase):
             page.locator('[data-field="video_host_memory_limit"]').fill("2.5")
             self.assertTrue(page.locator('[data-field="video_host_memory_limit"]').evaluate("input => input.checkValidity()"))
             page.locator("#model-backend").select_option("minimax_h3_image")
+            expect(page.locator('[data-field="video_parallel_mode"]')).to_be_visible()
+            page.locator('[data-field="video_parallel_mode"]').select_option("tp")
+            expect(page.locator('[data-field="video_parallel_mode"]')).to_have_value("tp")
             expect(page.locator('[data-field="video_gpu_memory_limit"]')).to_be_visible()
             expect(page.locator('[data-field="video_host_memory_limit"]')).to_be_visible()
             expect(page.locator('[data-field="base_model"]')).not_to_be_visible()
