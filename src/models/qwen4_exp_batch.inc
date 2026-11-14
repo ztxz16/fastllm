@@ -56,12 +56,25 @@ struct Qwen4ExpModel::RequestBatchState {
         // entry bound tied to admitted requests. This limits retention only;
         // every valid shape can still capture and run.
         size_t retained = 0;
-        for (const auto &item : variants) retained += item.second.rows;
+        auto largest = variants.end();
+        for (auto it = variants.begin(); it != variants.end(); ++it) {
+            retained += it->second.rows;
+            if (it->second.rows == peakRows[phase] &&
+                (largest == variants.end() || it->second.used > largest->second.used)) largest = it;
+        }
+        // Draining requests create many smaller slot combinations. Retain the
+        // most recently used largest batch so those tails do not evict the
+        // steady serving graph before the next wave. Keep the same bounds.
+        const bool retainLargest = rows < peakRows[phase] && capacity > 1;
         if (!variants.count(key)) while (!variants.empty() &&
                 (variants.size() >= size_t(std::max(1, capacity)) ||
                  retained + rows > 2 * peakRows[phase])) {
-            auto oldest = std::min_element(variants.begin(), variants.end(),
-                [](const auto &a, const auto &b) { return a.second.used < b.second.used; });
+            auto oldest = variants.end();
+            for (auto it = variants.begin(); it != variants.end(); ++it) {
+                if (retainLargest && it == largest) continue;
+                if (oldest == variants.end() || it->second.used < oldest->second.used) oldest = it;
+            }
+            AssertInFastLLM(oldest != variants.end(), "Qwen batch graph retention exceeded its bounds");
             retained -= oldest->second.rows; variants.erase(oldest);
         }
         auto &entry = variants[key]; entry.used = ++clock; entry.rows = rows;

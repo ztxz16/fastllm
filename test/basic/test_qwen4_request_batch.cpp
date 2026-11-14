@@ -386,19 +386,25 @@ struct Qwen4GGUFTestAccess {
                     Check(m.decodeServingSlots.at(&c.pastKeyValues.front().first).get()==oldSlot,"replacement client did not reuse its idle slot");
                     positions[3]=132;
                 }
-                std::vector<float> ids; std::vector<Data> pos(n); std::vector<Data*> ptrs,masks(n,nullptr);
-                std::vector<Cache*> caches; std::vector<GenerationConfig> configs(n,cfg);
-                std::vector<std::vector<float>> expected(n),actual(n);std::vector<std::vector<float>*> out;
-                for(int j=0;j<n;++j) {
-                    int slot=(step%2)?n-1-j:j; int token=(wave*9+slot*11+step)%120+2;
+                std::vector<int> order(n);std::iota(order.begin(),order.end(),0);
+                if(step%2)std::reverse(order.begin(),order.end());
+                // Four different partial bindings must not evict the full
+                // batch from the bounded graph cache before it returns.
+                if(n==4 && step>=3 && step<7) order.erase(order.begin()+step-3);
+                const int live=order.size();
+                std::vector<float> ids; std::vector<Data> pos(live); std::vector<Data*> ptrs,masks(live,nullptr);
+                std::vector<Cache*> caches; std::vector<GenerationConfig> configs(live,cfg);
+                std::vector<std::vector<float>> expected(live),actual(live);std::vector<std::vector<float>*> out;
+                for(int j=0;j<live;++j) {
+                    int slot=order[j]; int token=(wave*9+slot*11+step)%120+2;
                     ids.push_back(token);pos[j].CopyFrom(Data(FLOAT32,{1,1},{float(positions[slot])}));
                     SetCudaGraph(false);oracle->Forward(Data(FLOAT32,{1,1},{float(token)}),Data(),pos[j],serial[slot],cfg,LastTokensManager(),&expected[j]);
                     ptrs.push_back(&pos[j]); caches.push_back(&clients[slot]->pastKeyValues);out.push_back(&actual[j]);
                 }
                 SetCudaGraph(true);
-                m.ForwardRequests(Data(FLOAT32,{1,n},ids),masks,ptrs,std::vector<int>(n,1),caches,configs,LastTokensManager(),&out);
-                for(int j=0;j<n;++j) {
-                    int slot=(step%2)?n-1-j:j;
+                m.ForwardRequests(Data(FLOAT32,{1,live},ids),masks,ptrs,std::vector<int>(live,1),caches,configs,LastTokensManager(),&out);
+                for(int j=0;j<live;++j) {
+                    int slot=order[j];
                     Equal(Data(FLOAT32,{int(actual[j].size())},actual[j]),Data(FLOAT32,{int(expected[j].size())},expected[j]),"reused slot logits");
                     // Scheduler tensors are borrowed metadata; recurrent content
                     // is still owned and reset by the persistent slot.
@@ -658,7 +664,7 @@ struct Qwen4GGUFTestAccess {
         for(int round=0;round<(uniformHead ? 72 : 16);++round) {
             std::vector<int> order={3,0,4,2,1};if((round/24)%2)std::reverse(order.begin(),order.end());
             SetCudaGraph(false);
-            if(round==7)order.resize(3);
+            if (round>=7 && round<=10) order.resize(round-6);
             const int live=order.size();
             std::vector<float> ids;std::vector<Data> pos(live);std::vector<Data*> masks(live,nullptr),ptrs;
             std::vector<Cache*> caches;std::vector<GenerationConfig> configs;std::vector<int> lens(live,1),expected;
