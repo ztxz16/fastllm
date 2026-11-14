@@ -12,6 +12,20 @@ SCRIPT = Path(__file__).with_name("benchmark_allreduce.py")
 
 
 class PlanTests(unittest.TestCase):
+    def test_missing_peer_result_cannot_be_reported_as_pass(self):
+        from allreduce_bench.execution import collect
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            job = dict(stage="smoke", backend="ft", mode="eager", devices=[0, 1],
+                       cases=[dict(case="one", n=4), dict(case="two", n=8)])
+            first = dict(case="one", path="ft_custom", status="PASS", max_abs_error=0,
+                         mean_abs_error=0, failed_elements=0)
+            second = dict(first, case="two")
+            (root / "rank0.jsonl").write_text(json.dumps(first) + "\n" + json.dumps(second) + "\n")
+            (root / "rank1.jsonl").write_text(json.dumps(first) + "\n")
+            rows = collect(job, root)
+            self.assertEqual([row["status"] for row in rows], ["PASS", "FAIL"])
+
     def test_preflight_start_failure_keeps_all_report_formats(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "failed"

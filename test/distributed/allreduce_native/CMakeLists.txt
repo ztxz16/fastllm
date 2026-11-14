@@ -1,0 +1,26 @@
+cmake_minimum_required(VERSION 3.18)
+project(fastllm_allreduce_adapter LANGUAGES CXX CUDA)
+
+find_package(CUDAToolkit REQUIRED)
+set(NCCL_ROOT "" CACHE PATH "NCCL headers and library prefix used by the server Python environment")
+find_path(NCCL_INCLUDE_DIR nccl.h HINTS "${NCCL_ROOT}/include")
+find_library(NCCL_LIBRARY nccl HINTS "${NCCL_ROOT}/lib" "${NCCL_ROOT}/lib64")
+if(NOT NCCL_INCLUDE_DIR OR NOT NCCL_LIBRARY)
+    message(FATAL_ERROR "Set NCCL_ROOT or NCCL_INCLUDE_DIR/NCCL_LIBRARY to the installed NCCL")
+endif()
+if(NOT CMAKE_CUDA_ARCHITECTURES)
+    message(FATAL_ERROR "Specify CMAKE_CUDA_ARCHITECTURES explicitly (V100: 70)")
+endif()
+
+get_filename_component(FT_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../.." ABSOLUTE)
+add_library(fastllm_allreduce_adapter SHARED adapter.cpp
+    "${FT_ROOT}/src/distributed/process_allreduce.cu")
+target_include_directories(fastllm_allreduce_adapter PRIVATE "${FT_ROOT}/include" "${NCCL_INCLUDE_DIR}")
+target_link_libraries(fastllm_allreduce_adapter PRIVATE CUDA::cudart "${NCCL_LIBRARY}")
+set_target_properties(fastllm_allreduce_adapter PROPERTIES
+    CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+target_compile_options(fastllm_allreduce_adapter PRIVATE -O2)
+string(REPLACE ";" "," AR_ARCH_STRING "${CMAKE_CUDA_ARCHITECTURES}")
+target_compile_definitions(fastllm_allreduce_adapter PRIVATE AR_BUILD_ARCH="${AR_ARCH_STRING}")
+get_filename_component(NCCL_LIBRARY_DIR "${NCCL_LIBRARY}" DIRECTORY)
+set_target_properties(fastllm_allreduce_adapter PROPERTIES BUILD_RPATH "${NCCL_LIBRARY_DIR}")

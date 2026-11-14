@@ -1,0 +1,104 @@
+"""正式算子薄适配；不在本文件导入时加载 CUDA。"""
+
+import ctypes
+from pathlib import Path
+
+
+class Native:
+    def __init__(self, path, device, stream, rank, group, mode=1):
+        import torch.distributed as dist
+
+        self.library = ctypes.CDLL(str(Path(path).resolve()))
+        lib = self.library
+        lib.ar_error.restype = ctypes.c_char_p
+        lib.ar_build_arch.restype = ctypes.c_char_p
+        lib.ar_id_size.restype = ctypes.c_size_t
+        lib.ar_unique_id.argtypes = [ctypes.c_void_p]
+        lib.ar_create.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                  ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+        lib.ar_sum.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
+        lib.ar_info.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulonglong),
+                               ctypes.POINTER(ctypes.c_ulonglong)]
+        lib.ar_destroy.argtypes = [ctypes.c_void_p]
+        lib.ar_versions.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)]
+        self.handle = ctypes.c_void_p()
+        self.device, self.mode = device, mode
+        uid = ctypes.create_string_buffer(lib.ar_id_size())
+        if rank == 0:
+            self.check(lib.ar_unique_id(uid))
+        shared = [uid.raw if rank == 0 else None]
+        dist.broadcast_object_list(shared, src=0, group=group)
+        ctypes.memmove(uid, shared[0], len(shared[0]))
+        self.check(lib.ar_create(device, dist.get_world_size(group), rank, mode, uid,
+                                 stream.cuda_stream, ctypes.byref(self.handle)))
+
+    def check(self, code):
+        if code:
+            raise RuntimeError(self.library.ar_error().decode())
+
+    def __call__(self, tensor):
+        import torch
+
+        if tensor.dtype != torch.float32 or not tensor.is_contiguous() or tensor.device.index != self.device:
+            raise ValueError("native adapter requires local contiguous FP32")
+        self.check(self.library.ar_sum(self.handle, tensor.data_ptr(), tensor.numel()))
+        return tensor
+
+    def path(self, n):
+        return "ft_custom" if self.mode == 1 and n <= 65536 else "nccl"
+
+    def info(self):
+        if self.mode == 0:
+            return None
+        custom, nccl = ctypes.c_ulonglong(), ctypes.c_ulonglong()
+        self.check(self.library.ar_info(self.handle, ctypes.byref(custom), ctypes.byref(nccl)))
+        return {"custom": custom.value, "nccl": nccl.value}
+
+    def metadata(self):
+        runtime, nccl = ctypes.c_int(), ctypes.c_int()
+        self.check(self.library.ar_versions(ctypes.byref(runtime), ctypes.byref(nccl)))
+        return {"cuda_runtime": runtime.value, "nccl_version": nccl.value,
+                "compile_architecture": self.library.ar_build_arch().decode()}
+
+    def close(self):
+        self.check(self.library.ar_destroy(self.handle))
+        self.handle = ctypes.c_void_p()
+
+
+class Vllm:
+    def __init__(self, device, group, mode):
+        from vllm.distributed.device_communicators.custom_all_reduce import CustomAllreduce
+        from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+
+        self.custom = CustomAllreduce(group, device, register_graph_buffers=mode != "graph_copy")
+        if self.custom.disabled:
+            raise RuntimeError("vLLM 自定义算子未启用；严格比较不接受静默回退")
+        self.fallback = PyNcclCommunicator(group, device)
+        if self.fallback.disabled:
+            raise RuntimeError("vLLM PyNccl fallback unavailable")
+        self.last_path = None
+
+    def __call__(self, tensor):
+        result = self.custom.custom_all_reduce(tensor)
+        if result is not None:
+            self.last_path = "vllm_custom"
+            return result
+        self.last_path = "nccl"
+        result = self.fallback.all_reduce(tensor)
+        if result is None:
+            raise RuntimeError("vLLM NCCL fallback returned no output")
+        return result
+
+    def path(self, n):
+        return self.last_path
+
+    def info(self):
+        return None
+
+    def metadata(self):
+        import vllm
+        return {"vllm_version": vllm.__version__, "vllm_module": str(Path(vllm.__file__).resolve()),
+                "max_size": self.custom.max_size, "registered_graph": self.custom._capture_registered}
+
+    def close(self):
+        self.custom.close()

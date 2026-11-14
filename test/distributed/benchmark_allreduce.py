@@ -12,12 +12,14 @@ from allreduce_bench.reporting import metadata, write_report
 
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("stage", choices=["plan", "preflight"])
+    p.add_argument("stage", choices=["plan", "preflight", "smoke"])
     p.add_argument("--output", required=True, help="新目录；已存在时拒绝覆盖")
     p.add_argument("--devices", default="0,1,2,3")
     p.add_argument("--python", default=sys.executable, help="服务器已有 CUDA/vLLM 环境的 Python")
     p.add_argument("--vllm-root", default="/home/project/vllm")
     p.add_argument("--timeout", type=float, default=180)
+    p.add_argument("--pair", default="0,1")
+    p.add_argument("--native", default="build-allreduce-cu126/libfastllm_allreduce_adapter.so")
     return p
 
 
@@ -38,9 +40,13 @@ def main():
             rows = plan.plan_rows()
             meta["manifest"] = spec
             status = "PLANNED"
-        else:
+        elif args.stage == "preflight":
             from allreduce_bench.preflight import run
             rows = run(args, output, meta)
+            status = "PASS" if rows and all(r["status"] == "PASS" for r in rows) else "FAIL"
+        else:
+            from allreduce_bench.execution import smoke
+            rows = smoke(args, output, meta)
             status = "PASS" if rows and all(r["status"] == "PASS" for r in rows) else "FAIL"
     except Exception as exc:
         rows.append(dict(case=args.stage, stage=args.stage, status="FAIL", reason=str(exc)))
