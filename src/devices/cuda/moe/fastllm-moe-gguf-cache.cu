@@ -1474,7 +1474,7 @@ bool FastllmCudaMergeMOEV41GGUFResident(
 namespace v41_native_resident {
 __global__ void Gate(const __nv_bfloat16 *input, const int32_t *ids, const float *scores,
         const uint8_t *const *weights, __nv_bfloat16 *activation,
-        int rows, int hidden, int inter, int experts, int topk, float limit) {
+        int rows, int hidden, int inter, int experts, int topk, float limit, const float *siluTable) {
     const int route = blockIdx.y, expert = ids[route];
     if (expert < 0 || expert >= experts || !weights[2 * expert]) return;
     const int column = blockIdx.x * 32 + threadIdx.x / 16;
@@ -1484,7 +1484,7 @@ __global__ void Gate(const __nv_bfloat16 *input, const int32_t *ids, const float
     const float2 pair = DotGateUp<true>(input + size_t(route / topk) * hidden,
         gate + size_t(column) * (hidden / 2), gate + size_t(column + inter) * (hidden / 2), hidden,
         scale + size_t(column) * (hidden / 32), scale + size_t(column + inter) * (hidden / 32));
-    StoreGate(pair, scores[route], activation, route, inter, limit);
+    StoreGate(pair, scores[route], activation, route, inter, limit, siluTable);
 }
 __global__ void Down(const __nv_bfloat16 *activation, const int32_t *ids,
         const uint8_t *const *weights, float *partial, int hidden, int inter, int experts) {
@@ -1537,6 +1537,8 @@ bool FastllmCudaMergeMOEV41NativeResident(
     for (const Data *d : {&input, &indices, &scores})
         if (d->dataDevice != CUDA || !d->cudaData || d->multiDeviceData ||
             d->dataDeviceIds != std::vector<int>{device}) return false;
+    const float *siluTable = FastllmCudaBFloat16SiluTable();
+    if (!siluTable) return false;
     auto layer = GetResidentLayer(weights, weightsBatch, device, true);
     if (!layer || layer->hidden != input.dims[1]) return false;
     const int rows = input.dims[0], topk = indices.dims[1], hidden = layer->hidden, inter = layer->inter;
@@ -1560,7 +1562,7 @@ bool FastllmCudaMergeMOEV41NativeResident(
     const auto *ids = static_cast<const int32_t *>(indices.cudaData);
     v41_native_resident::Gate<<<dim3(inter / 32, rows * topk), 512, 0, cudaStreamPerThread>>>(
         static_cast<const __nv_bfloat16 *>(quantized.cudaData), ids, static_cast<const float *>(scores.cudaData),
-        table, static_cast<__nv_bfloat16 *>(activation.cudaData), rows, hidden, inter, layer->experts, topk, swigluLimit);
+        table, static_cast<__nv_bfloat16 *>(activation.cudaData), rows, hidden, inter, layer->experts, topk, swigluLimit, siluTable);
     v41_native_resident::Down<<<dim3(hidden / 8, rows * topk), 128, 0, cudaStreamPerThread>>>(
         static_cast<const __nv_bfloat16 *>(activation.cudaData), ids, table,
         static_cast<float *>(partial.cudaData), hidden, inter, layer->experts);

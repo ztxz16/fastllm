@@ -1,4 +1,5 @@
 #include "devices/cuda/fastllm-kernel-benchmark.cuh"
+#include "../fastllm-bfloat16-silu.cuh"
 #include "exl3.h"
 #include "devices/cuda/glm5-next-cuda.cuh"
 #include "fastllm-cuda.cuh"
@@ -1076,7 +1077,7 @@ __global__ void DeepSeekV4PrepareMoeDownInputKernel(
         const __nv_bfloat16 *__restrict__ gateUp,
         __nv_bfloat16 *__restrict__ downInput,
         const float *__restrict__ routeScales,
-        int intermediateDimension, float swigluLimit, bool quantize) {
+        int intermediateDimension, float swigluLimit, bool quantize, const float *siluTable) {
     __shared__ float warpMax[4];
     __shared__ float quantScale;
     const int blocksPerRow = intermediateDimension / QuantBlock;
@@ -1097,8 +1098,8 @@ __global__ void DeepSeekV4PrepareMoeDownInputKernel(
     // Keep the expert's observable multiplication order: SwiGLU forms h
     // first, then the routed score is applied before the BF16 boundary.
     // Reassociating this as (score * silu) * up can change the final BF16 bit.
-    float h = (gate / (1.0f + expf(-gate))) * up;
-    float value = routeScales[row] * h;
+    float h = __fmul_rn(FastllmCudaBFloat16Silu(gate, siluTable), up);
+    float value = __fmul_rn(routeScales[row], h);
     // The expert contract has a BF16 boundary before act_quant.
     value = __bfloat162float(__float2bfloat16_rn(value));
     if (!quantize) {
@@ -1148,6 +1149,8 @@ bool DeepSeekV4PrepareMoeDownInputImpl(
         gateUp.dims[1] <= 0 || (gateUp.dims[1] & 1) != 0) {
         return false;
     }
+    const float *siluTable = FastllmCudaBFloat16SiluTable();
+    if (!siluTable) return false;
     const int rows = gateUp.dims[0];
     const int intermediateDimension = gateUp.dims[1] / 2;
     if ((activationQuantBlock != 32 && activationQuantBlock != 128) ||
@@ -1161,11 +1164,11 @@ bool DeepSeekV4PrepareMoeDownInputImpl(
     if (activationQuantBlock == 32) {
         DeepSeekV4PrepareMoeDownInputKernel<32><<<blocks, 32>>>(
             (const __nv_bfloat16*)gateUp.cudaData, (__nv_bfloat16*)downInput.cudaData,
-            routeScales, intermediateDimension, swigluLimit, quantize);
+            routeScales, intermediateDimension, swigluLimit, quantize, siluTable);
     } else {
         DeepSeekV4PrepareMoeDownInputKernel<128><<<blocks, 128>>>(
             (const __nv_bfloat16*)gateUp.cudaData, (__nv_bfloat16*)downInput.cudaData,
-            routeScales, intermediateDimension, swigluLimit, quantize);
+            routeScales, intermediateDimension, swigluLimit, quantize, siluTable);
     }
     return cudaGetLastError() == cudaSuccess;
 }

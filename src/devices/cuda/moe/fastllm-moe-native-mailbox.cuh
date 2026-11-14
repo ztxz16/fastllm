@@ -758,16 +758,16 @@ struct NativeMoeMailbox {
                 fastllm::cuda::dsv41_cache::GateResident<true><<<dim3(layout.inter / 32, w.topk), 512, 0, stream>>>(
                     static_cast<const __nv_bfloat16 *>(w.compute->quantized.cudaData), slots, records, scores,
                     static_cast<__nv_bfloat16 *>(w.compute->gate.cudaData), w.hidden, layout.inter,
-                    layout.recordStride, layout.swigluLimit);
+                    layout.recordStride, layout.swigluLimit, FastllmCudaBFloat16SiluTable());
             else
                 fastllm::cuda::dsv41_cache::GateResident<false><<<dim3(layout.inter / 32, w.topk), 512, 0, stream>>>(
                     static_cast<const __nv_bfloat16 *>(w.compute->quantized.cudaData), slots, records, scores,
                     static_cast<__nv_bfloat16 *>(w.compute->gate.cudaData), w.hidden, layout.inter,
-                    layout.recordStride, layout.swigluLimit);
+                    layout.recordStride, layout.swigluLimit, FastllmCudaBFloat16SiluTable());
         } else fastllm::cuda::dsv41_cache::Gate<<<dim3(layout.inter / 32, w.topk), 512, 0, stream>>>(
             static_cast<const __nv_bfloat16 *>(w.compute->quantized.cudaData), slots, records,
             scores, static_cast<__nv_bfloat16 *>(w.compute->gate.cudaData),
-            w.hidden, layout.inter, layout.recordStride, layout.swigluLimit, 1, nullptr, layout.planarMxfp4);
+            w.hidden, layout.inter, layout.recordStride, layout.swigluLimit, 1, nullptr, layout.planarMxfp4, nullptr, FastllmCudaBFloat16SiluTable());
         fastllm::cuda::dsv41_cache::Down<<<dim3(w.hidden / 8, w.topk), 128, 0, stream>>>(
             static_cast<const __nv_bfloat16 *>(w.compute->gate.cudaData), slots, records, w.compute->partial,
             w.hidden, layout.inter, layout.recordStride, layout.downOffset, nullptr, layout.planarMxfp4);

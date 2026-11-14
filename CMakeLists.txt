@@ -3240,6 +3240,13 @@ if (UNIT_TEST)
             set_tests_properties(cuda_dsv41_hc_graph PROPERTIES LABELS cuda RUN_SERIAL TRUE)
         endif()
 
+        add_executable(cuda_bfloat16_silu_test test/basic/test_cuda_bfloat16_silu.cu)
+        target_link_libraries(cuda_bfloat16_silu_test PRIVATE fastllm)
+        set_target_properties(cuda_bfloat16_silu_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        fastllm_add_checked_test(cuda_bfloat16_silu cuda_bfloat16_silu_test
+            "PASS device=0 BF16 values=65536" 180)
+        set_tests_properties(cuda_bfloat16_silu PROPERTIES LABELS "cuda;moe" RUN_SERIAL TRUE)
+
         if (USE_NUMAS)
             add_executable(cuda_dsv41_moe_cache_test test/basic/test_cuda_dsv41_moe_cache.cu)
             target_link_libraries(cuda_dsv41_moe_cache_test PRIVATE fastllm)

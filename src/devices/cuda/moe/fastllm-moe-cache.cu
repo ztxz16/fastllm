@@ -1423,6 +1423,8 @@ DeviceCache *GetDeviceCache(OffloadGroup &group, bool waitForAdmission = true) {
     if (cudaGetDevice(&device) != cudaSuccess || device < 0) {
         return nullptr;
     }
+    if (group.layout.weightType == fastllm::NVFP4_BLOCK_32_E8M0 &&
+        !FastllmCudaBFloat16SiluTable()) return nullptr;
     std::lock_guard<std::mutex> guard(group.mutex);
     std::unique_ptr<DeviceCache> &entry = group.deviceCaches[device];
     if (!entry) {
@@ -2877,7 +2879,7 @@ bool ComputeV41Cache(const fastllm::Data &input, fastllm::Data &activation,
     using namespace fastllm::cuda::dsv41_cache;
     Gate<><<<dim3(layout.inter / 32, topk), 512, 0, cudaStreamPerThread>>>(
         (const __nv_bfloat16*)input.cudaData, cache.routeSlots, cache.records, scores,
-        (__nv_bfloat16*)activation.cudaData, layout.hidden, layout.inter, layout.recordStride, layout.swigluLimit, 1, nullptr, layout.planarMxfp4);
+        (__nv_bfloat16*)activation.cudaData, layout.hidden, layout.inter, layout.recordStride, layout.swigluLimit, 1, nullptr, layout.planarMxfp4, nullptr, FastllmCudaBFloat16SiluTable());
     Down<<<dim3(layout.hidden / 8, topk), 128, 0, cudaStreamPerThread>>>(
         (const __nv_bfloat16*)activation.cudaData, cache.routeSlots, cache.records, perExpert,
         layout.hidden, layout.inter, layout.recordStride, layout.downOffset, nullptr, layout.planarMxfp4);
@@ -4040,11 +4042,11 @@ static bool ComputeBatchExperts(const fastllm::Data &input, fastllm::Data &activ
         GateReuse<true><<<dim3(layout.inter / 32, view.routeCount), 512, 0, cudaStreamPerThread>>>(
             (const __nv_bfloat16 *)input.cudaData, view.routeSlots, view.records, scores,
             (__nv_bfloat16 *)activation.cudaData, layout.hidden, layout.inter,
-            layout.recordStride, layout.swigluLimit, topk, view.routeMap, view.routeCount, layout.planarMxfp4);
+            layout.recordStride, layout.swigluLimit, topk, view.routeMap, view.routeCount, layout.planarMxfp4, FastllmCudaBFloat16SiluTable());
         GateMmaBatch<<<dim3(layout.inter / 32, tiles), 512, 0, cudaStreamPerThread>>>(
             (const __nv_bfloat16 *)input.cudaData, view.routeSlots, view.records, scores,
             (__nv_bfloat16 *)activation.cudaData, layout.hidden, layout.inter,
-            layout.recordStride, layout.swigluLimit, topk, view.routeMap, view.routeCount, layout.planarMxfp4);
+            layout.recordStride, layout.swigluLimit, topk, view.routeMap, view.routeCount, layout.planarMxfp4, FastllmCudaBFloat16SiluTable());
         DownReuse<true><<<dim3(layout.hidden / 8, view.routeCount), 128, 0, cudaStreamPerThread>>>(
             (const __nv_bfloat16 *)activation.cudaData, view.routeSlots, view.records, perExpert,
             layout.hidden, layout.inter, layout.recordStride, layout.downOffset,
@@ -4057,7 +4059,7 @@ static bool ComputeBatchExperts(const fastllm::Data &input, fastllm::Data &activ
         GateReuse<<<dim3(layout.inter / 32, view.routeCount), 512, 0, cudaStreamPerThread>>>(
             (const __nv_bfloat16 *)input.cudaData, view.routeSlots, view.records, scores,
             (__nv_bfloat16 *)activation.cudaData, layout.hidden, layout.inter,
-            layout.recordStride, layout.swigluLimit, topk, view.routeMap, view.routeCount, layout.planarMxfp4);
+            layout.recordStride, layout.swigluLimit, topk, view.routeMap, view.routeCount, layout.planarMxfp4, FastllmCudaBFloat16SiluTable());
         DownReuse<<<dim3(layout.hidden / 8, view.routeCount), 128, 0, cudaStreamPerThread>>>(
             (const __nv_bfloat16 *)activation.cudaData, view.routeSlots, view.records, perExpert,
             layout.hidden, layout.inter, layout.recordStride, layout.downOffset,
@@ -4066,7 +4068,7 @@ static bool ComputeBatchExperts(const fastllm::Data &input, fastllm::Data &activ
         Gate<true><<<dim3(layout.inter / 32, view.routeCount), 512, 0, cudaStreamPerThread>>>(
             (const __nv_bfloat16 *)input.cudaData, view.routeSlots, view.records, scores,
             (__nv_bfloat16 *)activation.cudaData, layout.hidden, layout.inter,
-            layout.recordStride, layout.swigluLimit, topk, view.routeMap, layout.planarMxfp4);
+            layout.recordStride, layout.swigluLimit, topk, view.routeMap, layout.planarMxfp4, nullptr, FastllmCudaBFloat16SiluTable());
         Down<<<dim3(layout.hidden / 8, view.routeCount), 128, 0, cudaStreamPerThread>>>(
             (const __nv_bfloat16 *)activation.cudaData, view.routeSlots, view.records, perExpert,
             layout.hidden, layout.inter, layout.recordStride, layout.downOffset, view.routeMap, layout.planarMxfp4);

@@ -1,4 +1,5 @@
 #include "fastllm-cuda.cuh"
+#include "fastllm-bfloat16-silu.cuh"
 #include "fastllm.h"
 
 #include <cuda.h>
@@ -1642,6 +1643,8 @@ extern "C" bool FastllmCudaTritonMxfp4Grouped(const char *const *cubins, const c
                                               fastllm::Data &activation, const unsigned char *records,
                                               const int *slots, const int *routes, const float *scores,
                                               float *output, void *scratch, int count, bool planar) {
+    CUdeviceptr silu = (CUdeviceptr)FastllmCudaBFloat16SiluTable();
+    if (!silu) return false;
     LoadedTritonKernel *kernels[3] = {};
     for (int i = 0; i < (planar ? 2 : 3); ++i) {
         kernels[i] = LoadTritonKernel(cubins[i], names[i], shared[i]);
@@ -1656,15 +1659,15 @@ extern "C" bool FastllmCudaTritonMxfp4Grouped(const char *const *cubins, const c
     CUdeviceptr globalScratch = 0, profileScratch = 0;
     CUresult result;
     if (planar) {
-        void *fusedGate[] = {&x, &w, &s, &r, &score, &a, &count, &globalScratch, &profileScratch};
-        void *fusedDown[] = {&a, &w, &s, &r, &score, &out, &count, &globalScratch, &profileScratch};
+        void *fusedGate[] = {&x, &w, &s, &r, &score, &a, &count, &silu, &globalScratch, &profileScratch};
+        void *fusedDown[] = {&a, &w, &s, &r, &score, &out, &count, &silu, &globalScratch, &profileScratch};
         result = LaunchTritonKernel(kernels[0], 72, count, 1, 128, shared[0], fusedGate, CU_STREAM_PER_THREAD);
         if (result == CUDA_SUCCESS)
             result = LaunchTritonKernel(kernels[1], 80, count, 1, 128, shared[1], fusedDown, CU_STREAM_PER_THREAD);
     } else {
         CUdeviceptr raw = (CUdeviceptr)scratch;
         void *gateArgs[] = {&x, &w, &s, &r, &raw, &count, &globalScratch, &profileScratch};
-        void *actArgs[] = {&raw, &r, &score, &a, &globalScratch, &profileScratch};
+        void *actArgs[] = {&raw, &r, &score, &a, &silu, &globalScratch, &profileScratch};
         void *downArgs[] = {&a, &w, &s, &r, &out, &count, &globalScratch, &profileScratch};
         result = LaunchTritonKernel(kernels[0], 72, count, 1, 128, shared[0], gateArgs, CU_STREAM_PER_THREAD);
         if (result == CUDA_SUCCESS)

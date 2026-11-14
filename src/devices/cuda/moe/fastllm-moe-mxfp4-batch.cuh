@@ -29,7 +29,7 @@ __device__ inline void Mma(uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
 __device__ __forceinline__ void GateMmaBatchBody(const __nv_bfloat16 *input, const int32_t *slots,
         const uint8_t *records, const float *scores, __nv_bfloat16 *activation,
         int hidden, int inter, size_t stride, float limit, int topk,
-        const int32_t *routeMap, int selected, int count, bool planar) {
+        const int32_t *routeMap, int selected, int count, bool planar, const float *siluTable = nullptr) {
 #if __CUDA_ARCH__ >= 800 && !defined(CUDA_NO_TENSOR_CORE)
     using namespace batch_mma;
     const uint8_t *record = records + size_t(slots[selected]) * stride;
@@ -78,7 +78,7 @@ __device__ __forceinline__ void GateMmaBatchBody(const __nv_bfloat16 *input, con
         gate = BFloat(gate); up = BFloat(up);
         if (limit > 0) { gate=fminf(gate,limit);up=fmaxf(-limit,fminf(up,limit)); }
         const int route = routeMap ? routeMap[selected+warp] : selected+warp;
-        const float value = BFloat(__fmul_rn(__fmul_rn(gate/(1.f+expf(-gate)),up),scores[route]));
+        const float value = BFloat(__fmul_rn(__fmul_rn(FastllmCudaBFloat16Silu(gate,siluTable),up),scores[route]));
         float amax = fmaxf(1e-4f,fabsf(value));
         for(int d=16;d;d>>=1)amax=fmaxf(amax,__shfl_xor_sync(0xffffffff,amax,d));
         const unsigned bits=__float_as_uint(amax/448.f);
@@ -143,14 +143,14 @@ __device__ __forceinline__ void DownMmaBatchBody(const __nv_bfloat16 *activation
 __global__ void GateMmaBatch(const __nv_bfloat16 *input, const int32_t *slots,
         const uint8_t *records, const float *scores, __nv_bfloat16 *activation,
         int hidden, int inter, size_t stride, float limit, int topk,
-        const int32_t *routeMap, int routes, bool planar) {
+        const int32_t *routeMap, int routes, bool planar, const float *siluTable = nullptr) {
     constexpr int capacity = batch_mma::Tokens;
     const int end = min(routes, int(blockIdx.y + 1) * capacity);
     for (int selected = blockIdx.y * capacity; selected < end;) {
         const int count = ExpertRouteTile<capacity>(slots, selected, routes);
         if (count > 1) {
             GateMmaBatchBody(input,slots,records,scores,activation,hidden,inter,
-                stride,limit,topk,routeMap,selected,count,planar);
+                stride,limit,topk,routeMap,selected,count,planar,siluTable);
             __syncthreads();
         }
         selected += max(count,1);

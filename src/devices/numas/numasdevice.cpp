@@ -1,4 +1,5 @@
 #include "exl3.h"
+#include "utils/bfloat16_silu.h"
 //
 // Created by huangyuyang on 10/15/24.
 //
@@ -821,20 +822,6 @@ namespace fastllm {
                weight.dataType == DataType::NVFP4_BLOCK_32_E8M0;
     }
 
-    static const std::array<float, 65536> &
-    GetDeepSeekV4BFloat16SiluLookup() {
-        static const std::array<float, 65536> lookup = []() {
-            std::array<float, 65536> values {};
-            for (uint32_t bits = 0; bits < values.size(); bits++) {
-                float gate = BFloat16BitsToFloat32((uint16_t)bits);
-                values[bits] =
-                    gate / (1.0f + std::exp(-gate));
-            }
-            return values;
-        }();
-        return lookup;
-    }
-
     static void QuantizeDeepSeekV4FP8ActivationBFloat16(
         uint16_t *values, int len, int blockSize = 128
     ) {
@@ -1054,7 +1041,7 @@ namespace fastllm {
             activationQuantBlock(activationQuantBlock) {}
 
         void Run() override {
-            const auto &siluLookup = GetDeepSeekV4BFloat16SiluLookup();
+            const auto &siluLookup = GetBFloat16SiluLookup();
             const bool prepareQ8K = IsQ8KActivationType(downInputType);
             // One complete Q8_K block per task, containing whole FP8 blocks.
             // Keep the model's BF16 boundary in bounded worker-local scratch.
@@ -7414,7 +7401,7 @@ namespace fastllm {
         int columns, start, end;
         void Run() override {
             const size_t rowBytes = GetDataBytes(DataType::FP8_E4M3_BLOCK_128, 1, columns);
-            const auto *silu = swiglu ? &GetDeepSeekV4BFloat16SiluLookup() : nullptr;
+            const auto *silu = swiglu ? &GetBFloat16SiluLookup() : nullptr;
             for (int row = start; row < end; ++row) {
                 const float *values = source + (size_t)row * columns;
                 if (swiglu) {
@@ -7450,7 +7437,7 @@ namespace fastllm {
                                int columns, float *swiglu = nullptr) {
         // A task owns complete 128-element scale blocks. Reuse the existing
         // workers while the controller waits; no extra thread pool or casts.
-        if (swiglu) GetDeepSeekV4BFloat16SiluLookup();
+        if (swiglu) GetBFloat16SiluLookup();
         const int threads = rows < 8 ? 1 : std::min(rows, GetNumaConfig()->threads);
         std::vector<EagerFP8PrepareOp> tasks(threads);
         auto *pool = GetHostMoePool();
@@ -7971,7 +7958,7 @@ namespace fastllm {
         if (bf16ExpertMode) {
             // Native BF16 projections round before SwiGLU, then the complete
             // activation rounds once. Do not round SiLU or apply scores here.
-            const auto &silu = GetDeepSeekV4BFloat16SiluLookup();
+            const auto &silu = GetBFloat16SiluLookup();
             for (size_t i = 0; i < (size_t)totalLines * interDim; ++i) {
                 const uint16_t gate = Float32ToBFloat16RNEBits(gateUpOutput[i * 2]);
                 const float up = RoundFloat32ToBFloat16RNE(gateUpOutput[i * 2 + 1]);
@@ -8521,7 +8508,7 @@ namespace fastllm {
         thread_local std::vector<float> perRoute;
         perRoute.resize((size_t)n * topk * hidden);
         float *results = perRoute.data();
-        const float *silu = GetDeepSeekV4BFloat16SiluLookup().data();
+        const float *silu = GetBFloat16SiluLookup().data();
         // vector<bool> would pack independently written worker flags together.
         std::vector<int> gpuOk(devices.size(), 1);
         std::vector<std::thread> workers;

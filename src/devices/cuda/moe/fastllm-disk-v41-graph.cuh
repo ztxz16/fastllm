@@ -133,6 +133,8 @@ FastllmCudaDiskV41Graph::Create(const fastllm::Data &input, const fastllm::Data 
     cudaDeviceProp prop{};
     if (cudaGetDeviceProperties(&prop, device) != cudaSuccess || prop.major < 7 || !prop.canMapHostMemory)
         return {};
+    const float *siluTable = native ? FastllmCudaBFloat16SiluTable() : nullptr;
+    if (native && !siluTable) return {};
     auto p = std::make_unique<Impl>();
     p->device = device;
     p->rows = input.dims[0];
@@ -216,7 +218,7 @@ FastllmCudaDiskV41Graph::Create(const fastllm::Data &input, const fastllm::Data 
                 static_cast<const int32_t *>(p->slots.cudaData), nullptr,
                 static_cast<const float *>(score.cudaData),
                 static_cast<__nv_bfloat16 *>(p->activation.cudaData), p->hidden, inter, recordBytes, limit,
-                p->topk, nullptr, false, host.records);
+                p->topk, nullptr, false, host.records, siluTable);
             Down<true><<<dim3(p->hidden / 8, p->rows * p->topk), 128, 0, cudaStreamPerThread>>>(
                 static_cast<const __nv_bfloat16 *>(p->activation.cudaData),
                 static_cast<const int32_t *>(p->slots.cudaData), nullptr,

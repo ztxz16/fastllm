@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
+#include "../fastllm-bfloat16-silu.cuh"
 
 namespace fastllm {
 namespace cuda {
@@ -110,7 +111,7 @@ __device__ inline float2 DotGateUp(const __nv_bfloat16 *input, const uint8_t *ga
 }
 // Shared activation epilogue for ordinary and tiled single-token projections.
 __device__ inline void StoreGate(float2 pair, float score, __nv_bfloat16 *activation,
-        int route, int inter, float limit) {
+        int route, int inter, float limit, const float *siluTable) {
     float gate = BFloat(pair.x), up = BFloat(pair.y);
     __shared__ float values[32];
     if ((threadIdx.x & 15) == 0) {
@@ -118,7 +119,7 @@ __device__ inline void StoreGate(float2 pair, float score, __nv_bfloat16 *activa
             gate = fminf(gate, limit);
             up = fmaxf(-limit, fminf(up, limit));
         }
-        float value = __fmul_rn(gate / (1.0f + expf(-gate)), up);
+        float value = __fmul_rn(FastllmCudaBFloat16Silu(gate, siluTable), up);
         values[threadIdx.x / 16] = BFloat(__fmul_rn(value, score));
     }
     __syncthreads();
@@ -139,7 +140,7 @@ template <bool Batched = false, bool Disk = false>
 __global__ void Gate(const __nv_bfloat16 *input, const int32_t *slots, const uint8_t *records, const float *scores,
                      __nv_bfloat16 *activation, int hidden, int inter, size_t stride, float limit, int topk = 1,
                      const int32_t *routeMap = nullptr, bool planar = false,
-                     const uint8_t *const *recordPointers = nullptr) {
+                     const uint8_t *const *recordPointers = nullptr, const float *siluTable = nullptr) {
     const int selected = blockIdx.y, route = routeMap ? routeMap[selected] : selected;
     const int slot = slots[selected];
     if constexpr (Batched)
@@ -156,7 +157,7 @@ __global__ void Gate(const __nv_bfloat16 *input, const int32_t *slots, const uin
         scales + (column + inter) * spitch) :
         DotGateUp(input, record + (Disk ? 2*column : column) * pitch,
             record + (Disk ? 2*column+1 : column+inter) * pitch, hidden);
-    StoreGate(pair, scores[route], activation, route, inter, limit);
+    StoreGate(pair, scores[route], activation, route, inter, limit, siluTable);
 }
 // Coalesced weight staging avoids repeatedly fetching small fragments of
 // block-32 records from VRAM. Two stages overlap the next tile's copies with
@@ -258,7 +259,7 @@ __device__ inline float2 DotGateUpTiled(const __nv_bfloat16 *input,
 template <bool Planar = false>
 static __global__ void GateResident(const __nv_bfloat16 *input, const int32_t *slots,
         const uint8_t *records, const float *scores, __nv_bfloat16 *activation,
-        int hidden, int inter, size_t stride, float limit) {
+        int hidden, int inter, size_t stride, float limit, const float *siluTable = nullptr) {
     const int route = blockIdx.y, slot = slots[route];
     if (slot < 0) return;
     const size_t pitch = size_t(hidden / 32) * (Planar ? 16 : 17);
@@ -269,7 +270,7 @@ static __global__ void GateResident(const __nv_bfloat16 *input, const int32_t *s
         size_t(blockIdx.x * 32) * (hidden / 32) : nullptr;
     const float2 pair = DotGateUpTiled<Planar>(input, gate, up, hidden, scale,
         Planar ? scale + size_t(inter) * (hidden / 32) : nullptr);
-    StoreGate(pair, scores[route], activation, route, inter, limit);
+    StoreGate(pair, scores[route], activation, route, inter, limit, siluTable);
 }
 template<bool Indirect = false>
 static __global__ void Down(const __nv_bfloat16 *activation, const int32_t *slots, const uint8_t *records,
@@ -313,7 +314,7 @@ template<bool SmallOnly = false>
 __global__ void GateReuse(const __nv_bfloat16 *input, const int32_t *slots,
         const uint8_t *records, const float *scores, __nv_bfloat16 *activation,
         int hidden, int inter, size_t stride, float limit, int topk,
-        const int32_t *routeMap, int routes, bool planar) {
+        const int32_t *routeMap, int routes, bool planar, const float *siluTable = nullptr) {
     const int selected = blockIdx.y;
     if constexpr (SmallOnly) if (ExpertRouteTile<kExpertMmaRouteTile>(slots,selected,routes) != 1) return;
     const int count = ExpertRouteTile(slots, selected, routes);
@@ -334,7 +335,7 @@ __global__ void GateReuse(const __nv_bfloat16 *input, const int32_t *slots,
         const auto *a=reinterpret_cast<const __nv_bfloat16 *>(x[0]);
         const float2 value=planar ? DotGateUp<true>(a,g,u,hidden,scales+size_t(column)*blocks,
             scales+size_t(column+inter)*blocks) : DotGateUp(a,g,u,hidden);
-        StoreGate(value,scores[route[0]],activation,route[0],inter,limit);return;
+        StoreGate(value,scores[route[0]],activation,route[0],inter,limit,siluTable);return;
     }
 #pragma unroll 4
     for(int b=0;b<blocks;++b){
@@ -355,7 +356,7 @@ __global__ void GateReuse(const __nv_bfloat16 *input, const int32_t *slots,
             gs[r]=__fadd_rn(gs[r],__shfl_down_sync(0xffffffff,gs[r],delta,16));
             us[r]=__fadd_rn(us[r],__shfl_down_sync(0xffffffff,us[r],delta,16));
         }
-        StoreGate(make_float2(gs[r],us[r]),scores[route[r]],activation,route[r],inter,limit);
+        StoreGate(make_float2(gs[r],us[r]),scores[route[r]],activation,route[r],inter,limit,siluTable);
         __syncthreads();
     }
 }

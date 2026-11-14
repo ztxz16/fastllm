@@ -168,7 +168,7 @@ if triton is not None:
 
     @triton.jit
     def fastllm_mxfp4_grouped_activate(
-        Raw, Routes, Scores, Y, I: tl.constexpr, LIMIT: tl.constexpr, B: tl.constexpr
+        Raw, Routes, Scores, Y, Silu, I: tl.constexpr, LIMIT: tl.constexpr, B: tl.constexpr
     ):
         route = tl.load(Routes + tl.program_id(1))
         c = tl.program_id(0) * B + tl.arange(0, B)
@@ -177,7 +177,7 @@ if triton is not None:
         if LIMIT > 0:
             g = tl.minimum(g, LIMIT)
             u = tl.maximum(-LIMIT, tl.minimum(u, LIMIT))
-        val = ((g / (1 + libdevice.exp(-g)) * u) * tl.load(Scores + route)).to(tl.bfloat16).to(tl.float32)
+        val = ((tl.load(Silu + (g.to(tl.uint32, bitcast=True) >> 16)) * u) * tl.load(Scores + route)).to(tl.bfloat16).to(tl.float32)
         blocks = tl.reshape(tl.abs(val), (B // 32, 32))
         amax = tl.maximum(tl.max(blocks, 1), 1e-4) / 448.0
         bits = amax.to(tl.uint32, bitcast=True)
@@ -212,7 +212,7 @@ if triton is not None:
 
 
     @triton.jit
-    def fastllm_mxfp4_planar_grouped(X, W, Slots, Routes, Scores, Y, COUNT,
+    def fastllm_mxfp4_planar_grouped(X, W, Slots, Routes, Scores, Y, COUNT, Silu,
                                    H: tl.constexpr, I: tl.constexpr, TOPK: tl.constexpr,
                                    STRIDE: tl.constexpr, DOWN: tl.constexpr,
                                    GATE: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
@@ -256,7 +256,7 @@ if triton is not None:
                 u = up.to(tl.bfloat16).to(tl.float32)
                 value = tl.minimum(value, 10.0)
                 u = tl.maximum(-10.0, tl.minimum(u, 10.0))
-                value = ((value / (1.0 + libdevice.exp(-value)) * u) *
+                value = ((tl.load(Silu + (value.to(tl.uint32, bitcast=True) >> 16)) * u) *
                          tl.load(Scores + route)[:, None]).to(tl.bfloat16).to(tl.float32)
                 blocks = tl.reshape(tl.abs(value), (16, BN // 32, 32))
                 amax = tl.maximum(tl.max(blocks, 2), 1e-4) / 448.0
@@ -270,7 +270,7 @@ if triton is not None:
 
 
     @triton.jit
-    def fastllm_mxfp4_planar_grouped_batch(X, W, Slots, Routes, Scores, Y, COUNT,
+    def fastllm_mxfp4_planar_grouped_batch(X, W, Slots, Routes, Scores, Y, COUNT, Silu,
                                    H: tl.constexpr, I: tl.constexpr, TOPK: tl.constexpr,
                                    STRIDE: tl.constexpr, DOWN: tl.constexpr,
                                    GATE: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
@@ -320,7 +320,7 @@ if triton is not None:
                 u = up.to(tl.bfloat16).to(tl.float32)
                 value = tl.minimum(value, 10.0)
                 u = tl.maximum(-10.0, tl.minimum(u, 10.0))
-                value = ((value / (1.0 + libdevice.exp(-value)) * u) *
+                value = ((tl.load(Silu + (value.to(tl.uint32, bitcast=True) >> 16)) * u) *
                          tl.load(Scores + route)[:, None]).to(tl.bfloat16).to(tl.float32)
                 blocks = tl.reshape(tl.abs(value), (16, BN // 32, 32))
                 amax = tl.maximum(tl.max(blocks, 2), 1e-4) / 448.0
@@ -4865,7 +4865,7 @@ def mxfp4_grouped_batch_cache_paths(payload):
         raise ValueError("unsupported grouped MXFP4 topk")
     if not planar:
         raise ValueError("grouped MXFP4 batch requires planar layout")
-    base = f"mxfp4_grouped_batch_v1_planar_sm{arch}_h5120_i2304_k{topk}_m16_n32_64_k256_w4_s2"
+    base = f"mxfp4_grouped_batch_v2_planar_sm{arch}_h5120_i2304_k{topk}_m16_n32_64_k256_w4_s2"
     root = Path(payload["cache_dir"])
     return {
         name: root / f"{base}_{name}.cubin" for name in ("gate", "down")
@@ -4889,12 +4889,12 @@ def compile_mxfp4_grouped_batch(payload):
     for name, bn in (("gate", 32), ("down", 64)):
         infos[name] = _compile_cubin(fastllm_mxfp4_planar_grouped_batch,
             dict(X="*bf16", W="*u8", Slots="*i32", Routes="*i32", Scores="*fp32",
-                 Y="*bf16" if name == "gate" else "*fp32", COUNT="i32",
+                 Y="*bf16" if name == "gate" else "*fp32", COUNT="i32", Silu="*fp32",
                  H="constexpr", I="constexpr", TOPK="constexpr", STRIDE="constexpr",
                  DOWN="constexpr", GATE="constexpr", BN="constexpr", BK="constexpr"),
             dict(H=h, I=i, TOPK=topk, STRIDE=stride, DOWN=down, GATE=name == "gate", BN=bn, BK=256),
             arch, 4, 2, paths[name], enable_fp_fusion=False)
-    meta = dict(ok=True, op="mxfp4_grouped_batch", version=1, planar=True, batch=True,
+    meta = dict(ok=True, op="mxfp4_grouped_batch", version=2, planar=True, batch=True,
                 arch=arch, topk=topk,
                 kernels={k: dict(cubin=str(paths[k]), kernel=v.metadata.name,
                                  shared=int(v.metadata.shared), num_warps=int(v.metadata.num_warps))
@@ -4912,8 +4912,8 @@ def mxfp4_grouped_cache_paths(payload):
     topk = payload.get("topk", 6)
     if type(topk) is not int or topk not in ((3, 6) if planar else (6,)):
         raise ValueError("unsupported grouped MXFP4 topk")
-    base = (f"mxfp4_grouped_v6_planar_sm{arch}_h5120_i2304_k{topk}_n32_64_k256_w4_s2" if planar else
-            f"mxfp4_grouped_v3_sm{arch}_h5120_i2304_k6_n64_k128_w4_s3")
+    base = (f"mxfp4_grouped_v7_planar_sm{arch}_h5120_i2304_k{topk}_n32_64_k256_w4_s2" if planar else
+            f"mxfp4_grouped_v4_sm{arch}_h5120_i2304_k6_n64_k128_w4_s3")
     root = Path(payload["cache_dir"])
     return {
         name: root / f"{base}_{name}.cubin" for name in (("gate", "down") if planar else ("gate", "activate", "down"))
@@ -4938,12 +4938,12 @@ def compile_mxfp4_grouped(payload):
         for name, bn in (("gate", 32), ("down", 64)):
             infos[name] = _compile_cubin(fastllm_mxfp4_planar_grouped,
                 dict(X="*bf16", W="*u8", Slots="*i32", Routes="*i32", Scores="*fp32",
-                     Y="*bf16" if name == "gate" else "*fp32", COUNT="i32",
+                     Y="*bf16" if name == "gate" else "*fp32", COUNT="i32", Silu="*fp32",
                      H="constexpr", I="constexpr", TOPK="constexpr", STRIDE="constexpr",
                      DOWN="constexpr", GATE="constexpr", BN="constexpr", BK="constexpr"),
                 dict(H=h, I=i, TOPK=topk, STRIDE=stride, DOWN=down, GATE=name == "gate", BN=bn, BK=256),
                 arch, 4, 2, paths[name], enable_fp_fusion=False)
-        meta = dict(ok=True, op="mxfp4_grouped", version=6, planar=True, arch=arch, topk=topk,
+        meta = dict(ok=True, op="mxfp4_grouped", version=7, planar=True, arch=arch, topk=topk,
                     kernels={k: dict(cubin=str(paths[k]), kernel=v.metadata.name,
                                      shared=int(v.metadata.shared), num_warps=int(v.metadata.num_warps))
                              for k,v in infos.items()})
@@ -4983,6 +4983,7 @@ def compile_mxfp4_grouped(payload):
         fastllm_mxfp4_grouped_activate,
         dict(
             Raw="*bf16",
+            Silu="*fp32",
             Routes="*i32",
             Scores="*fp32",
             Y="*bf16",
@@ -5000,7 +5001,7 @@ def compile_mxfp4_grouped(payload):
     meta = dict(
         ok=True,
         op="mxfp4_grouped",
-        version=3,
+        version=4,
         arch=arch,
         kernels={
             k: dict(

@@ -12,6 +12,8 @@
 #include "devices/cuda/fastllm-cuda-gdn.h"
 #include "fastllm-cuda-rope.cuh"
 #include "fastllm-cuda-activation.cuh"
+#include "fastllm-bfloat16-silu.cuh"
+#include "utils/bfloat16_silu.h"
 #include "fastllm-cuda-gdn-step.cuh"
 #include "devices/cuda/cudaworkspace.h"
 #include "fastllm-cuda-mtp.cuh"
@@ -46,6 +48,34 @@
 #include <cuda_fp8.h>
 #include "attention/fastllm-fp4-kv.cuh"
 #include "sampling.cuh"
+
+const float *FastllmCudaBFloat16SiluTable() {
+    const int device = FastllmCudaGetDevice();
+    static thread_local std::map<int, const float *> local;
+    auto found = local.find(device);
+    if (found != local.end()) return found->second;
+    static std::mutex mutex;
+    static std::map<int, const float *> tables;
+    std::lock_guard<std::mutex> guard(mutex);
+    auto shared = tables.find(device);
+    if (shared != tables.end()) return local.emplace(device, shared->second).first->second;
+    cudaStreamCaptureStatus capture;
+    if (cudaStreamIsCapturing(cudaStreamPerThread, &capture) != cudaSuccess ||
+        capture != cudaStreamCaptureStatusNone) return nullptr;
+    const auto &host = fastllm::GetBFloat16SiluLookup();
+    float *table = nullptr;
+    if (cudaMalloc(&table, sizeof(host)) != cudaSuccess) return nullptr;
+    if (cudaMemcpyAsync(table, host.data(), sizeof(host), cudaMemcpyHostToDevice,
+                        cudaStreamPerThread) != cudaSuccess ||
+        cudaStreamSynchronize(cudaStreamPerThread) != cudaSuccess) {
+        cudaFree(table);
+        return nullptr;
+    }
+    // Graphs retain this address; immutable tables live for the CUDA context.
+    tables.emplace(device, table);
+    local.emplace(device, table);
+    return table;
+}
 
 extern "C" bool FastllmNcclGraphPeerCopy(int dstDevice, void *dst,
                                           int srcDevice, const void *src,
