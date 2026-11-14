@@ -24,6 +24,9 @@
 #include "fastllm-native-lowbit-prefill.cuh"
 #include "devices/cuda/fastllm-cuda-native-prefill.h"
 #include "../fastllm-hybrid-prefill.cuh"
+#ifndef USE_ROCM
+#include "../fastllm-mxfp4-math.cuh"
+#endif
 
 #ifdef __CUDACC__
 #include <cuda_bf16.h>
@@ -4821,6 +4824,45 @@ bool FastllmCudaBFloat16MatMulNVFP4Block16(const fastllm::Data &input, fastllm::
     return true;
 }
 
+#ifndef USE_ROCM
+// Tile rows internally without changing dot/reduction order. This also
+// shares weight decoding across rows; request/verification size is unrestricted.
+template<int tileRows>
+static __global__ void FastllmMxfp4BFloat16LinearSmall(
+        const __nv_bfloat16 *input, const uint8_t *weight, __nv_bfloat16 *output,
+        const __nv_bfloat16 *bias, int rows, int columns, int outputs, size_t pitch) {
+    const int col = blockIdx.x * 8 + threadIdx.x / 16;
+    const int lane = threadIdx.x & 15;
+    const int first = blockIdx.y * tileRows;
+    // Keep both half-warps active for the shared shuffle mask on column tails.
+    const uint8_t *w = weight + size_t(min(col, outputs - 1)) * pitch;
+    float sums[tileRows] = {};
+#pragma unroll 4
+    for (int block = 0; block < columns / 32; ++block) {
+        const float2 pair = fastllm::cuda::mxfp4::FP4Pair(w[block * 17 + lane], w[block * 17 + 16]);
+#pragma unroll
+        for (int r = 0; r < tileRows; ++r) if (first + r < rows) {
+            const unsigned x = reinterpret_cast<const unsigned *>(input + size_t(first + r) * columns)[block * 16 + lane];
+            const float product = __fadd_rn(__fmul_rn(__uint_as_float(x << 16), pair.x),
+                                           __fmul_rn(__uint_as_float(x & 0xffff0000u), pair.y));
+            sums[r] = __fadd_rn(sums[r], product);
+        }
+    }
+#pragma unroll
+    for (int delta = 8; delta; delta >>= 1)
+#pragma unroll
+        for (int r = 0; r < tileRows; ++r)
+            sums[r] = __fadd_rn(sums[r], __shfl_down_sync(0xffffffff, sums[r], delta, 16));
+    if (lane == 0 && col < outputs) {
+#pragma unroll
+        for (int r = 0; r < tileRows; ++r) if (first + r < rows)
+            output[size_t(first + r) * outputs + col] = __float2bfloat16_rn(
+                bias ? __fadd_rn(sums[r], __bfloat162float(bias[col])) : sums[r]);
+    }
+}
+
+#endif
+
 bool FastllmCudaBFloat16MatMulNVFP4Block16E8M0(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
 #ifndef USE_ROCM
     // Ordinary CUDA weights keep their existing dispatch. Cache-owned weights
@@ -4845,6 +4887,19 @@ bool FastllmCudaBFloat16MatMulNVFP4Block16E8M0(const fastllm::Data &input, fastl
     const size_t packedBytesPerRow =
         FastllmCudaNVFP4Block16E8M0BytesPerRow(m, block32);
     if (FastllmCudaNVFP4UseGemv(n)) {
+#ifndef USE_ROCM
+        if (block32 && m % 32 == 0) {
+            // Use the smallest power-of-two row tile that is useful. Every
+            // specialization handles arbitrary counts, including the last tile.
+#define FASTLLM_MXFP4_LINEAR_TILE(R) \
+            FastllmMxfp4BFloat16LinearSmall<R><<<dim3((k + 7) / 8, (n + R - 1) / R), 128>>>( \
+                cudaInput, (uint8_t*)weight.cudaData, cudaOutput, cudaBiasData, n, m, k, packedBytesPerRow)
+            if (n < 2) { FASTLLM_MXFP4_LINEAR_TILE(1); }
+            else if (n < 3) { FASTLLM_MXFP4_LINEAR_TILE(2); }
+            else { FASTLLM_MXFP4_LINEAR_TILE(4); }
+#undef FASTLLM_MXFP4_LINEAR_TILE
+        } else
+#endif
         if (block32) {
             LaunchFastllmGemmNVFP4Block16<true, true>(
                 cudaInput, (uint8_t*)weight.cudaData, cudaOutput,

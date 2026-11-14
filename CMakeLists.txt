@@ -3247,6 +3247,13 @@ if (UNIT_TEST)
             "PASS device=0 BF16 values=65536" 180)
         set_tests_properties(cuda_bfloat16_silu PROPERTIES LABELS "cuda;moe" RUN_SERIAL TRUE)
 
+        add_executable(cuda_mxfp4_linear_test test/basic/test_cuda_mxfp4_linear.cu)
+        target_link_libraries(cuda_mxfp4_linear_test PRIVATE fastllm)
+        set_target_properties(cuda_mxfp4_linear_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        fastllm_add_checked_test(cuda_mxfp4_linear cuda_mxfp4_linear_test
+            "PASS MXFP4 linear CPU/CUDA exact" 180)
+        set_tests_properties(cuda_mxfp4_linear PROPERTIES LABELS "cuda;moe" RUN_SERIAL TRUE)
+
         if (USE_NUMAS)
             add_executable(cuda_dsv41_moe_cache_test test/basic/test_cuda_dsv41_moe_cache.cu)
             target_link_libraries(cuda_dsv41_moe_cache_test PRIVATE fastllm)
