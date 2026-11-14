@@ -21,6 +21,10 @@
 - 任意 worker 故障使全组不可复用，回收整个进程树；不自动重试已执行请求。
 - MoE Attention保留HF FP16 Eager的中间张量精度：QK点积先转FP16，缩放后再转FP16，
   softmax以FP32计算后转FP16再与V相乘。单层、Eager及Graph使用同一路径；dense分支保持原语义。
+- MoE共享Linear使用`CUBLAS_COMPUTE_32F + CUBLAS_GEMM_DEFAULT_TENSOR_OP`，覆盖
+  Attention投影、Router、使用cuBLAS的专家投影和LM Head；沿用现有输出类型及舍入边界。
+  Dense Qwen3仍使用PEDANTIC。该选择与PyTorch 2.7.1常规FP16 GEMM配置对齐，
+  不保证不同矩阵形状、融合布局或自定义Decode kernel与HF逐位一致，必须重跑完整模型验收。
 
 ## 服务器执行顺序
 
@@ -100,7 +104,7 @@ max/mean绝对误差、失败数、最坏元素及实际/参考值；阈值保�
 
 针对已保存诊断中的第1、9、14、17、22层，可仅读取这些层的Norm/Gate权重，
 对同一输入比较HF归一化顺序与原生256线程归约顺序的张量模拟，再分别调用
-PyTorch Linear和与已有worker链接相同cuBLAS库、相同参数的FP32_PEDANTIC GEMM。
+PyTorch Linear和使用已有worker链接的cuBLAS库、修复前参数的FP32_PEDANTIC GEMM。
 第22层额外使用已保存的原生Attention输出，分离上游输入变化的影响。
 这是独立数值实验，不加载完整模型、不编译，不代表正式后端验收或性能结果。
 
@@ -117,6 +121,12 @@ PyTorch Linear和与已有worker链接相同cuBLAS库、相同参数的FP32_PEDA
 比较结果及库版本。归约模拟未直接采集原生Norm输出；若模拟组合无法复现原生日志，
 不能据此断言原生Norm已定位或排除，还需采集真实中间量。PyTorch对照也须先检查
 能否复现已保存HF输出，不能把库版本或执行环境差异归因给单个生产算子。
+
+服务器历史诊断`20261114T162200Z_router_probe_21e073d6`显示：五个相同HF输入的
+重点层均有`norm_different=0`，PyTorch GEMM逐位复现已保存HF分数，旧PEDANTIC
+配置逐位复现已保存FastLLM分数。第22层换成原生Attention输入后仍存在上游差异。
+该证据支持修复MoE GEMM配置，不能视为修复后验收。上述探针刻意保留旧PEDANTIC
+路径用于历史归因；新二进制应通过`synthetic`、`regression`、`real`验证实际输出。
 
 ## 正式运行示例
 
