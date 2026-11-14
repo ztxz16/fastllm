@@ -15,6 +15,7 @@
 #include "devices/cuda/fastllm-cuda-graph-workspace.h"
 #include "devices/cuda/fastllm-cuda-moe-policy.h"
 #include "devices/cuda/fastllm-cuda-hybrid-prefill.h"
+#include "devices/cuda/fastllm-v41-full-decode.h"
 #include "devices/multicuda/fastllm-multicuda.cuh"
 #endif
 
@@ -331,8 +332,9 @@ namespace fastllm {
             input.FakeFrom(ffnInput, 0);
             input.Resize({seqlen, dim});
             input.dataDeviceIds = {device};
+            // Eager warmup must honor the same fixed PP cache ownership as replay.
             if ((streamingStep || cooperativeMoe || batchCacheCandidate) &&
-                !ctx.pipelineHostExperts && hybridMoeDevices.size() > 1)
+                !ctx.pipelineHostExperts && !hybridMoeStageOwned && hybridMoeDevices.size() > 1)
                 singleCacheHandled = fastllm::RunHybridMoeOnDevices(
                     input, routeIndex, routeScore, ffnOut, moeWeights.data(),
                     (int)moeWeights.size(), layer, hybridMoeDevices, runSharedSegment);
@@ -638,13 +640,14 @@ namespace fastllm {
         // Stage-local graphs use the existing arithmetic, with explicit ownership
         // at the boundary. Unsupported splits retain ordinary serial PP.
         std::vector<CudaPrefillStage> stages;
-        const bool verify = inputSegments.size() == 1 && inputSegments[0].spec &&
-            inputSegments[0].spec->wantAllTokens && inputSegments[0].spec->deferWindow &&
-            inputSegments[0].seqlen >= 2 && inputSegments[0].seqlen <= 32;
-        const bool decode = inputSegments.size() == 1 && !v41DsparkEnabled &&
-            inputSegments[0].seqlen == 1 && !inputSegments[0].spec;
+        const bool verify = !inputSegments.empty() && std::all_of(inputSegments.begin(), inputSegments.end(),
+            [](const DeepSeekV41Segment &s) { return s.spec && s.spec->wantAllTokens &&
+                s.spec->deferWindow && s.seqlen > 0 && s.startPos > 0; });
+        const bool decode = !inputSegments.empty() && std::all_of(inputSegments.begin(), inputSegments.end(),
+            [](const DeepSeekV41Segment &s) { return !s.spec && s.seqlen == 1 && s.startPos > 0; });
+        const int rows = inputIds.Count(0);
         bool pipeline = GetFastllmEnv().cudaGraph && v41MoeCudaGraphCompatible &&
-            (decode || verify) && inputSegments[0].startPos > 0 && !inputEmbeds && !imageMask &&
+            (decode || verify) && !inputEmbeds && !imageMask &&
             FastllmCudaMoeCacheRequested() && GetCudaSharedExpert() &&
             !V41ReferenceMathEnabled() && !GetFastllmEnv().cudaSync && !GetFastllmEnv().printProfile &&
             !std::getenv("FASTLLM_DSV41_DUMP_DIR") && BuildCudaPrefillStages(deviceMap, block_cnt, stages);
@@ -664,7 +667,7 @@ namespace fastllm {
                 }
                 // Ordinary requests require warm graph workspaces. Warmup is
                 // the sole creator, and cannot expose partially built stages.
-                const int key = V41PipelineGraphKey(stage.firstLayer, inputSegments[0].seqlen);
+                const int64_t key = FastllmV41PipelineGraphKey(stage.firstLayer, rows, verify, inputSegments.size() > 1);
                 pipeline &= v41CudaGraphWarmingUp || verify || v41CudaGraphSlots.count(key);
             }
         }
@@ -693,7 +696,11 @@ namespace fastllm {
             // together. Full stages expose the same borrowed KV views as eager.
             if (verify && !std::all_of(contexts.begin(), contexts.end(),
                     [](const HybridDecodeStage &stage) { return stage.fullVerify; }))
-                inputSegments[0].spec->commitKV = {};
+                for (const auto &s : inputSegments) {
+                    s.spec->commitKV = {};
+                    s.spec->commitBatchKV = {};
+                    s.spec->commitGroup = nullptr;
+                }
             // Last-stage sampling has joined the whole chain. Only now may
             // cache admissions or CPU result buffers be recycled.
             for (auto &ctx : contexts) if (ctx.step) ctx.step->Finish();

@@ -707,7 +707,7 @@ int main(int argc, char **argv) {
         int devices = 0;
         Check(cudaGetDeviceCount(&devices));
         if (option("--resident-budget-only") && devices < 2) return 77;
-        Require((!dual && !option("--pp-fullgraph")) || devices >= 2, "--dual requires two CUDA devices");
+        if ((dual || option("--pp-fullgraph")) && devices < 2) return 77;
         unsetenv("FASTLLM_MOE_CUDA_CACHE_BYTES_0");
         unsetenv("FASTLLM_MOE_CUDA_CACHE_BYTES_1");
         unsetenv("FASTLLM_DSV41_MOE_CACHE_MODE");

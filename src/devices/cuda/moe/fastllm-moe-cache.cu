@@ -3216,6 +3216,10 @@ static void PrepareFrequencyPolicy(OffloadGroup *group, DeviceCache *cache) {
             config.replacementFactor, config.minimumResidence, config.prefillPrior, int(config.rankByBytes));
     }
     if (cache->frequencyResidencyDirty) {
+        // A native decode may overlap admissions on another stream. A host
+        // snapshot must observe the complete payload/residency publication,
+        // including when the caller deliberately skipped the ordinary wait.
+        WaitCacheAdmission(*cache);
         std::vector<int> owners(cache->slots);
         if (!owners.empty()) checkCudaErrors("MoE frequency residency", cudaMemcpyAsync(owners.data(), cache->slotKeys,
             owners.size() * sizeof(int), cudaMemcpyDeviceToHost, cudaStreamPerThread));

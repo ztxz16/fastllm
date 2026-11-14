@@ -9,6 +9,13 @@ inline int64_t FastllmV41VerificationGraphKey(int rows, bool segmented) {
     return -(int64_t(rows) * 2 + int(segmented));
 }
 
+// PP stages retain independent workspaces for decode and both causal layouts.
+// Reserve all positive int row counts instead of a fixed stride per layer.
+inline int64_t FastllmV41PipelineGraphKey(int firstLayer, int rows, bool verifying, bool segmented) {
+    return (int64_t(1) << 62) | (int64_t(firstLayer) << 33) |
+        (int64_t(rows) << 2) | (verifying ? 1 + int(segmented) : 0);
+}
+
 // Fixed tensor addresses and launch shapes; request-dependent values are
 // uploaded separately before replay. The caller owns all tensor buffers.
 struct FastllmV41FullDecodeConfig {

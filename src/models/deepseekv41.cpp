@@ -4891,6 +4891,7 @@ namespace fastllm {
             int warmupRounds = 0;
             bool verification = false;
             bool retainedVerification = false;
+            int pipelineFirstLayer = -1;
             int blockCnt = 0;
             std::string signature;             // 设备布局 / dtype 等，变化时重新捕获
             std::vector<int> devices;          // 参与的 CUDA 设备（单卡时只有一个）
@@ -5728,19 +5729,21 @@ namespace fastllm {
                 std::unique_lock<std::mutex>(v41CudaGraphMutex, std::try_to_lock);
             if (graphLock.owns_lock()) {
                 // Verification and independent requests have different host metadata.
-                const int64_t graphKey = f.pipeline ? V41PipelineGraphKey(f.pipeline->firstLayer, seqlen) :
+                const int64_t graphKey = f.pipeline ? FastllmV41PipelineGraphKey(
+                    f.pipeline->firstLayer, seqlen, verifyGraph, segments.size() > 1) :
                     verifyGraph ? FastllmV41VerificationGraphKey(seqlen, segments.size() > 1) : v41AttentionRankRuntime ?
                     seqlen * 3 + (v41AttentionLogicalRows == 1 ? 0 : v41AttentionLogicalRows <= 8 ? 1 : 2) : seqlen;
                 auto found = v41CudaGraphSlots.find(graphKey);
-                const bool verification = verifyGraph && !f.pipeline;
-                if (verification && found == v41CudaGraphSlots.end()) {
+                const int pipelineFirstLayer = f.pipeline ? f.pipeline->firstLayer : -1;
+                if (verifyGraph && found == v41CudaGraphSlots.end()) {
                     // Keep the geometric warm shapes and at most one transient
                     // layout. Tail/drain work must not evict the hot verifier.
                     // The matching auto budget accounts for both sets.
                     const int originalDevice = FastllmCudaGetDevice();
                     for (auto it = v41CudaGraphSlots.begin(); it != v41CudaGraphSlots.end();) {
                         auto state = it->second ? V41GetCudaGraphState(it->second) : nullptr;
-                        if (!state || !state->verification || state->retainedVerification) { ++it; continue; }
+                        if (!state || !state->verification || state->retainedVerification ||
+                            state->pipelineFirstLayer != pipelineFirstLayer) { ++it; continue; }
                         for (int device : state->devices) FastllmCudaSyncDevice(device);
                         it = v41CudaGraphSlots.erase(it);
                     }
@@ -5748,8 +5751,9 @@ namespace fastllm {
                 }
                 if (v41CudaGraphWarmingUp || verifyGraph || found != v41CudaGraphSlots.end()) {
                     graphState = V41GetCudaGraphState(v41CudaGraphSlots[graphKey]);
-                    graphState->verification = verification;
-                    graphState->retainedVerification |= verification && RetainDsparkBatch(segments.size()) &&
+                    graphState->verification = verifyGraph;
+                    graphState->pipelineFirstLayer = pipelineFirstLayer;
+                    graphState->retainedVerification |= verifyGraph && RetainDsparkBatch(segments.size()) &&
                         std::all_of(segments.begin(), segments.end(), [&](const DeepSeekV41Segment &s) {
                             return s.seqlen == v41DsparkTokens + 1;
                         });

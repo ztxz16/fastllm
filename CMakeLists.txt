@@ -1194,6 +1194,12 @@ if (UNIT_TEST)
     set_target_properties(moe_decode_policy_test PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
     fastllm_add_checked_test(moe_decode_policy moe_decode_policy_test "ALL_PASS" 60)
 
+    add_executable(v41_pipeline_graph_keys_test test/basic/test_v41_pipeline_graph_keys.cpp)
+    target_include_directories(v41_pipeline_graph_keys_test PRIVATE include)
+    set_target_properties(v41_pipeline_graph_keys_test PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+    fastllm_add_checked_test(v41_pipeline_graph_keys v41_pipeline_graph_keys_test
+        "PASS: [0-9]+ independent PP graph layouts" 60)
+
     add_executable(cpu_moe_cache_layout_test test/basic/test_cpu_moe_cache_layout.cpp)
     target_include_directories(cpu_moe_cache_layout_test PRIVATE include)
     fastllm_add_checked_test(cpu_moe_cache_layout cpu_moe_cache_layout_test "PASS: cache size classes" 60)
@@ -3255,6 +3261,11 @@ if (UNIT_TEST)
                     "MAILBOX_CHAIN_PASS" 180 --mailbox)
                 fastllm_add_checked_test(cuda_dsv41_moe_fullgraph cuda_dsv41_moe_cache_test
                     "FULL_GRAPH_CHAIN_PASS" 180 --fullgraph)
+                fastllm_add_checked_test(cuda_dsv41_moe_pp_fullgraph cuda_dsv41_moe_cache_test
+                    "PP_MAILBOX_GRAPH_PASS" 180 --pp-fullgraph)
+                set_tests_properties(cuda_dsv41_moe_pp_fullgraph PROPERTIES
+                    LABELS "cuda;moe;numa;multigpu" RUN_SERIAL TRUE
+                    ENVIRONMENT "OMP_NUM_THREADS=1;FT_NUMAS=1;FT_THREADS=8")
                 fastllm_add_checked_test(cuda_dsv41_moe_pageable_fullgraph cuda_dsv41_moe_cache_test
                     "FULL_GRAPH_CHAIN_PASS" 240 --fullgraph --pageable)
                 set_tests_properties(cuda_dsv41_moe_pageable_fullgraph PROPERTIES

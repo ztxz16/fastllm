@@ -440,9 +440,10 @@ void V41FullBindVerify(const std::shared_ptr<V41FullGraph> &owner, const DeepSee
         AssertInFastLLM(submitted && std::all_of(ok.begin(), ok.end(), [](int v) { return v != 0; }),
                         "full verifier KV commit failed");
     };
-    if (!pipeline && !g.attentionRuntime && !g.tensorParallel && g.devices.size() == 1) {
+    if (!g.attentionRuntime && !g.tensorParallel && g.devices.size() == 1) {
         scratch.commitGroup = owner.get();
-        scratch.commitBatchKV = [owner](const std::vector<std::pair<int, int>> &spans) {
+        scratch.commitBatchKV = [owner, previous = std::move(scratch.commitBatchKV)](const std::vector<std::pair<int, int>> &spans) {
+            if (previous) previous(spans);
             auto &graph = *owner;
             FastllmCudaSetDevice(graph.devices.front());
             graph.hostCommitSpans.resize(2 * spans.size());
@@ -454,7 +455,7 @@ void V41FullBindVerify(const std::shared_ptr<V41FullGraph> &owner, const DeepSee
                 graph.hostCommitSpans.data(), graph.hostCommitSpans.size() * sizeof(int));
             AssertInFastLLM(FastllmCudaV41CommitVerifiedBatch(
                 static_cast<const FastllmV41VerifyCommitLayer *>(graph.commitDescriptors.front().cudaData),
-                graph.endLayer, static_cast<const int *>(graph.commitSpans.cudaData), spans.size(), graph.batch),
+                graph.endLayer - graph.firstLayer, static_cast<const int *>(graph.commitSpans.cudaData), spans.size(), graph.batch),
                 "full verifier batched KV commit failed");
         };
     }
@@ -471,24 +472,23 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
     int batch, const std::vector<DeepSeekV41Segment> &segments, int firstLayer, int endLayer) {
     const bool distributedAttention = v41AttentionDP > 1;
     const bool attentionOnly = v41AttentionRankRuntime != nullptr;
-    if (firstLayer < 0 && executionMode == ExecutionMode::Hybrid &&
-        V41DeviceMapCudaDeviceCount(deviceMap) > 1 && !V41DeviceMapUsesMultiCuda(deviceMap)) {
-        std::vector<CudaPrefillStage> stages;
-        const bool verify = segments.size() == 1 && segments[0].spec && segments[0].spec->deferWindow;
-        if ((verify || (batch == 1 && !v41DsparkEnabled)) && BuildCudaPrefillStages(deviceMap, block_cnt, stages))
-            for (const auto &stage : stages)
-                BuildFullDecodeGraph(batch, segments, stage.firstLayer, stage.endLayer);
-        return;
-    }
-    const bool pipeline = firstLayer >= 0;
-    const int graphKey = pipeline ? V41PipelineGraphKey(firstLayer, batch) : attentionOnly ?
-        batch * 3 + (v41AttentionLogicalRows == 1 ? 0 : v41AttentionLogicalRows <= 8 ? 1 : 2) : batch;
-    if (!pipeline) { firstLayer = 0; endLayer = block_cnt; }
     const bool verifying = !segments.empty() && std::all_of(segments.begin(), segments.end(),
         [](const DeepSeekV41Segment &s) { return s.spec && s.spec->deferWindow && s.spec->wantAllTokens; });
     const bool independentDecode = int(segments.size()) == batch &&
         std::all_of(segments.begin(), segments.end(),
             [](const DeepSeekV41Segment &s) { return s.seqlen == 1 && !s.spec; });
+    if (firstLayer < 0 && executionMode == ExecutionMode::Hybrid &&
+        V41DeviceMapCudaDeviceCount(deviceMap) > 1 && !V41DeviceMapUsesMultiCuda(deviceMap)) {
+        std::vector<CudaPrefillStage> stages;
+        if ((verifying || independentDecode) && BuildCudaPrefillStages(deviceMap, block_cnt, stages))
+            for (const auto &stage : stages)
+                BuildFullDecodeGraph(batch, segments, stage.firstLayer, stage.endLayer);
+        return;
+    }
+    const bool pipeline = firstLayer >= 0;
+    const int64_t graphKey = pipeline ? FastllmV41PipelineGraphKey(firstLayer, batch, verifying, segments.size() > 1) : attentionOnly ?
+        batch * 3 + (v41AttentionLogicalRows == 1 ? 0 : v41AttentionLogicalRows <= 8 ? 1 : 2) : batch;
+    if (!pipeline) { firstLayer = 0; endLayer = block_cnt; }
     const bool hybrid = executionMode == ExecutionMode::Hybrid &&
         (verifying || independentDecode) && FastllmCudaMoeCacheRequested();
     // Decode and segmented verification share the attention backend's batch
