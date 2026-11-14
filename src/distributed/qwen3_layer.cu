@@ -237,12 +237,14 @@ struct Qwen3LayerExecutor::Impl {
     uint32_t *graphIds = nullptr, *graphMeta = nullptr;
     half *graphX = nullptr;
     float *graphLogits = nullptr;
+    uint64_t reservedKVBytes = 0;
 
     void *Allocate(size_t bytes, bool persistent = false) {
         auto &pool = persistent ? graphBuffers : buffers;
         auto &used = persistent ? graphAllocated : allocated;
         const size_t budget = (weights.Plan().model == ShardModel::Qwen2Moe ? 512ULL : 256ULL) * 1024 * 1024;
-        if (bytes > budget - used) {
+        const size_t total = weights.Plan().model == ShardModel::Qwen2Moe ? graphAllocated + allocated : used;
+        if (total > budget || bytes > budget - total) {
             throw std::runtime_error(weights.Plan().model == ShardModel::Qwen2Moe ?
                 "MoE layer workspace exceeds 512 MiB" : "Qwen3 layer workspace exceeds 256 MiB");
         }
@@ -301,7 +303,7 @@ struct Qwen3LayerExecutor::Impl {
     /**
      * 恢复最长公共前缀，至少留下一个 token 重算末位置 logits。
      *
-     * 各 rank 在进入层间规约前用 NCCL 核对复用长度；不一致即失败，不能静默降级。
+     * dense TP 用 NCCL 核对复用长度；Attention DP 的目录与命中长度彼此独立。
      * 模型/布局由执行器生命周期隔离，键另外包含完整 ID 前缀和 RoPE 起点。
      * @param ids 已验证的 1..2048 个 Prompt ID。
      * @param position 当前 Prompt 的 RoPE 起点。
@@ -321,16 +323,18 @@ struct Qwen3LayerExecutor::Impl {
         }
 
         const auto &p = weights.Plan();
-        auto local = static_cast<uint32_t*>(Allocate(sizeof(uint32_t)));
-        auto peers = static_cast<uint32_t*>(Allocate(p.worldSize * sizeof(uint32_t)));
-        Cuda(cudaMemcpyAsync(local, &reused, sizeof(reused), cudaMemcpyHostToDevice, stream));
-        Nccl(ncclAllGather(local, peers, 1, ncclUint32, comm, stream));
-        std::vector<uint32_t> decisions(p.worldSize);
-        Cuda(cudaMemcpyAsync(decisions.data(), peers, decisions.size() * sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
-        Synchronize();
-        ReleaseBuffers();
-        for (auto decision : decisions) {
-            if (decision != reused) throw std::runtime_error("inconsistent Qwen3 prefix cache ranks");
+        if (p.model == ShardModel::DenseQwen3) {
+            auto local = static_cast<uint32_t*>(Allocate(sizeof(uint32_t)));
+            auto peers = static_cast<uint32_t*>(Allocate(p.worldSize * sizeof(uint32_t)));
+            Cuda(cudaMemcpyAsync(local, &reused, sizeof(reused), cudaMemcpyHostToDevice, stream));
+            Nccl(ncclAllGather(local, peers, 1, ncclUint32, comm, stream));
+            std::vector<uint32_t> decisions(p.worldSize);
+            Cuda(cudaMemcpyAsync(decisions.data(), peers, decisions.size() * sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
+            Synchronize();
+            ReleaseBuffers();
+            for (auto decision : decisions) {
+                if (decision != reused) throw std::runtime_error("inconsistent Qwen3 prefix cache ranks");
+            }
         }
 
         if (reused) {
@@ -366,7 +370,7 @@ struct Qwen3LayerExecutor::Impl {
             }
         }
         const auto &p = weights.Plan();
-        constexpr uint64_t budget = 64ULL * 1024 * 1024;
+        const uint64_t budget = (p.model == ShardModel::Qwen2Moe ? 512ULL : 64ULL) * 1024 * 1024;
         const uint64_t charge = 2 * p.kvHeads * p.headDim * sizeof(half) * p.layerCount;
         if (ids.size() > budget / charge) return;
         uint64_t tokens = ids.size();
@@ -422,37 +426,39 @@ struct Qwen3LayerExecutor::Impl {
     }
 
     struct MoeWorkspace {
-        half *logits, *prob, *shared, *sharedGate;
-        int *ids, *counts;
-        float *routed;
+        half *logits = nullptr, *prob = nullptr, *shared = nullptr, *sharedGate = nullptr;
+        int *ids = nullptr, *counts = nullptr;
+        float *routed = nullptr;
+        half *norm = nullptr, *gathered = nullptr, *allProb = nullptr;
+        half *packed = nullptr, *gateup = nullptr, *activated = nullptr, *expertOutput = nullptr;
+        int *allIds = nullptr, *map = nullptr;
+        float *partial = nullptr;
     };
+    MoeWorkspace graphMoe;
 
     /**
-     * 计算归一化后的 MoE 与残差；所有 rank 按相同顺序执行三次 AllGather 和一次 ReduceScatter。
-     * @param layer 已验证的模型层号。
-     * @param tokens 本地有效行数，可为零。
+     * 分配 FP16 激活、路由索引及 FP32 专家累加缓冲，不执行前向。
      * @param capacity 全组最大行数，至少一；等于一时使用设备路由专家内核。
-     * @param x 本地隐藏状态，原地更新；共享专家仅对本地有效行计算。
-     * @return 中间缓冲指针，仅在本次工作区释放前有效；不在此处读回诊断结果。
+     * @param persistent true 使用 Graph 固定地址池，false 使用本轮临时池。
+     * @return 缓冲视图，生命周期由对应池管理；超出预算或分配失败抛异常。
      */
-    MoeWorkspace RunMoe(uint32_t layer, int tokens, int capacity, half *x) {
+    MoeWorkspace PrepareMoe(int capacity, bool persistent = false) {
         const auto &p = weights.Plan();
         const int h = p.hiddenSize, e = p.expertCount, k = p.expertsPerToken;
         const int m = p.intermediateCount, sharedWidth = p.sharedIntermediateSize;
         const int rows = capacity * p.worldSize;
-        const std::string prefix = "model.layers." + std::to_string(layer) + ".";
-        auto allocHalf = [&](size_t count) { return static_cast<half*>(Allocate(count * sizeof(half))); };
+        auto allocHalf = [&](size_t count) { return static_cast<half*>(Allocate(count * sizeof(half), persistent)); };
         auto norm = allocHalf(size_t(capacity) * h);
         auto gathered = allocHalf(size_t(rows) * h);
         auto logits = allocHalf(size_t(capacity) * e);
         auto prob = allocHalf(size_t(capacity) * k);
         auto allProb = allocHalf(size_t(rows) * k);
-        auto ids = static_cast<int*>(Allocate(size_t(capacity) * k * sizeof(int)));
-        auto allIds = static_cast<int*>(Allocate(size_t(rows) * k * sizeof(int)));
-        auto counts = static_cast<int*>(Allocate(size_t(e) * sizeof(int)));
-        auto map = static_cast<int*>(Allocate(size_t(e) * rows * sizeof(int)));
-        auto partial = static_cast<float*>(Allocate(size_t(rows) * h * sizeof(float)));
-        auto routed = static_cast<float*>(Allocate(size_t(capacity) * h * sizeof(float)));
+        auto ids = static_cast<int*>(Allocate(size_t(capacity) * k * sizeof(int), persistent));
+        auto allIds = static_cast<int*>(Allocate(size_t(rows) * k * sizeof(int), persistent));
+        auto counts = static_cast<int*>(Allocate(size_t(e) * sizeof(int), persistent));
+        auto map = static_cast<int*>(Allocate(size_t(e) * rows * sizeof(int), persistent));
+        auto partial = static_cast<float*>(Allocate(size_t(rows) * h * sizeof(float), persistent));
+        auto routed = static_cast<float*>(Allocate(size_t(capacity) * h * sizeof(float), persistent));
         const size_t channels = std::max(size_t(rows) * m, size_t(capacity) * sharedWidth);
         auto packed = allocHalf(size_t(rows) * h);
         auto gateup = allocHalf(2 * channels);
@@ -460,6 +466,34 @@ struct Qwen3LayerExecutor::Impl {
         auto expertOutput = allocHalf(size_t(rows) * h);
         auto shared = allocHalf(size_t(capacity) * h);
         auto sharedGate = allocHalf(capacity);
+
+        return {logits, prob, shared, sharedGate, ids, counts, routed, norm, gathered,
+                allProb, packed, gateup, activated, expertOutput, allIds, map, partial};
+    }
+
+    /**
+     * 复用工作区执行 MoE，单层、Eager 和 Graph 共用本计算及通信路径。
+     * @param layer 模型层号。
+     * @param tokens 本地 Token 数；Graph 固定为一并通过 meta 屏蔽空闲 rank。
+     * @param capacity 整组共同的 padded 行数。
+     * @param x FP16 [tokens,hidden] 隐藏状态，原地加残差。
+     * @param prepared 可空的预分配空间；单层诊断为空时分配临时空间。
+     * @param meta 可空的设备 [past,position,active]，用于 Graph 动态路由。
+     * @return 工作区视图；CUDA/NCCL 失败须退出 worker。
+     */
+    MoeWorkspace RunMoe(uint32_t layer, int tokens, int capacity, half *x,
+                        const MoeWorkspace *prepared = nullptr, const uint32_t *meta = nullptr) {
+        const auto &p = weights.Plan();
+        const int h = p.hiddenSize, e = p.expertCount, k = p.expertsPerToken;
+        const int m = p.intermediateCount, sharedWidth = p.sharedIntermediateSize;
+        const int rows = capacity * p.worldSize;
+        const std::string prefix = "model.layers." + std::to_string(layer) + ".";
+        auto w = prepared ? *prepared : PrepareMoe(capacity);
+        auto norm = w.norm, gathered = w.gathered, logits = w.logits, prob = w.prob, allProb = w.allProb;
+        auto packed = w.packed, gateup = w.gateup, activated = w.activated, expertOutput = w.expertOutput;
+        auto shared = w.shared, sharedGate = w.sharedGate;
+        auto ids = w.ids, allIds = w.allIds, counts = w.counts, map = w.map;
+        auto partial = w.partial, routed = w.routed;
 
         Cuda(cudaMemsetAsync(norm, 0, size_t(capacity) * h * sizeof(half), stream));
         Cuda(cudaMemsetAsync(logits, 0, size_t(capacity) * e * sizeof(half), stream));
@@ -469,7 +503,7 @@ struct Qwen3LayerExecutor::Impl {
                 norm, h, h, 1, 0, p.rmsNormEps);
             Linear(norm, Weight(prefix + "mlp.gate.weight", {p.expertCount, p.hiddenSize}), logits, tokens, e, h, false);
         }
-        moe::Route<<<capacity,1,0,stream>>>(logits, ids, prob, tokens, capacity, e, k, p.normTopkProb);
+        moe::Route<<<capacity,1,0,stream>>>(logits, ids, prob, tokens, capacity, e, k, p.normTopkProb, meta);
         Nccl(ncclAllGather(norm, gathered, size_t(capacity) * h, ncclHalf, comm, stream));
         Nccl(ncclAllGather(ids, allIds, size_t(capacity) * k, ncclInt32, comm, stream));
         Nccl(ncclAllGather(prob, allProb, size_t(capacity) * k, ncclHalf, comm, stream));
@@ -507,10 +541,10 @@ struct Qwen3LayerExecutor::Impl {
             Linear(activated, Weight(name + "down_proj.weight", {p.hiddenSize, uint64_t(sharedWidth)}),
                 shared, tokens, h, sharedWidth, false);
             Linear(norm, Weight(prefix + "mlp.shared_expert_gate.weight", {1, p.hiddenSize}), sharedGate, tokens, 1, h, false);
-            moe::Finish<<<(tokens*h+255)/256,256,0,stream>>>(x, sharedGate, shared, routed, tokens*h, h);
+            moe::Finish<<<(tokens*h+255)/256,256,0,stream>>>(x, sharedGate, shared, routed, tokens*h, h, prob, k);
         }
         Cuda(cudaGetLastError());
-        return {logits, prob, shared, sharedGate, ids, counts, routed};
+        return w;
     }
 
     /**
@@ -574,6 +608,54 @@ struct Qwen3LayerExecutor::Impl {
             Residual<<<(t*h+255)/256,256,0,r.stream>>>(x, partial, t*h);
         }
         Cuda(cudaGetLastError());
+    }
+
+    /**
+     * 提交完整 MoE 模型；激活始终留在设备，同层专家缓冲在各层复用。
+     * @param ids GPU uint32[t] 输入，空闲 Eager 不读取。
+     * @param x FP16 [max(t,1),hidden] 工作区。
+     * @param attention 预分配 Attention 工作区。
+     * @param experts 预分配整组 EP 工作区。
+     * @param logits FP32 [vocab] 输出；空闲 Eager 不写。
+     * @param t 本地计算行数；Graph 为一，空闲掩码来自 meta。
+     * @param capacity 整组统一的 EP 行数。
+     * @param position 本轮绝对位置。
+     * @param meta 可空的 GPU [past,position,active]。
+     */
+    void EnqueueMoe(const uint32_t *ids, half *x, const Workspace &attention,
+                    const MoeWorkspace &experts, float *logits, int t, int capacity,
+                    uint32_t position, const uint32_t *meta = nullptr) {
+        const auto &p = weights.Plan();
+        const int h = p.hiddenSize;
+        if (t) Embed<<<(t*h+255)/256,256,0,stream>>>(ids,
+            Weight("model.embed_tokens.weight", {p.vocabSize, p.hiddenSize}), x, t*h, h);
+        for (uint32_t layer = 0; layer < p.layerCount; ++layer) {
+            if (t) RunLayer(layer, t, position, Qwen3LayerStage::Attention, x, attention, true, meta);
+            RunMoe(layer, t, capacity, x, &experts, meta);
+        }
+        if (t) {
+            Norm<<<1,256,0,stream>>>(x + size_t(t-1)*h, Weight("model.norm.weight", {p.hiddenSize}),
+                attention.norm, h, h, 1, 0, p.rmsNormEps);
+            Linear(attention.norm, Weight("lm_head.weight", {p.vocabSize, p.hiddenSize}),
+                   logits, 1, p.vocabSize, h, true);
+        }
+        Cuda(cudaGetLastError());
+    }
+
+    /** 固定地址 KV 按模型预留，供 Graph 跨请求复用；分配失败由 worker 退出回收。 */
+    void ReserveMoeKV() {
+        if (!kvCache.empty()) return;
+        const auto &p = weights.Plan();
+        const uint64_t bytes = kQwen3MaxContextTokens * KVTokenBytes();
+        if (!bytes || bytes > 512ULL*1024*1024 || p.layerCount > (512ULL*1024*1024)/bytes) {
+            throw std::runtime_error("MoE reserved KV exceeds 512 MiB");
+        }
+        kvCache.resize(p.layerCount, nullptr);
+        for (auto &cache : kvCache) {
+            Cuda(cudaMalloc(reinterpret_cast<void**>(&cache), bytes));
+            Cuda(cudaMemsetAsync(cache, 0, bytes, stream));
+            reservedKVBytes += bytes;
+        }
     }
 
     /**
@@ -932,9 +1014,128 @@ std::vector<float> Qwen3LayerExecutor::DecodeGraph(uint32_t tokenId) {
     return result;
 }
 
+std::vector<float> Qwen3LayerExecutor::StepMoe(const QwenMoeStep &step, bool graph) {
+    auto &r = *impl;
+    const auto &p = r.weights.Plan();
+    const bool begin = step.action == QwenMoeAction::Begin;
+    const bool decode = step.action == QwenMoeAction::Decode;
+    if (p.model != ShardModel::Qwen2Moe || uint32_t(step.action) > 3 ||
+        (graph && (!r.graphInfo.enabled || begin)) || p.vocabSize > (protocol::kMaxPayload - 4) / 4) {
+        throw std::runtime_error("invalid MoE round mode/model/vocabulary");
+    }
+    r.Validate(0, 1, p.hiddenSize, step.positionBegin, Qwen3LayerStage::Attention);
+    std::vector<uint32_t> ids = step.tokenIds;
+    for (auto id : ids) if (id >= p.vocabSize) throw std::runtime_error("MoE token outside vocabulary");
+    if ((!begin && !decode && !ids.empty()) || (decode && ids.size() != 1)) {
+        throw std::runtime_error("invalid MoE round token count");
+    }
+    if (step.action == QwenMoeAction::End) EndRequest();
+    if (step.action == QwenMoeAction::Idle && r.request.active) {
+        throw std::runtime_error("active MoE request cannot silently idle");
+    }
+
+    if (begin) {
+        if (r.request.active || ids.empty() || ids.size() > kQwen3MaxPromptTokens ||
+            !step.capacity || step.capacity > kQwen3MaxContextTokens || ids.size() > step.capacity ||
+            step.positionBegin > 1048576 || step.capacity - 1 > 1048576 - step.positionBegin) {
+            throw std::runtime_error("invalid MoE request admission");
+        }
+        r.ReserveMoeKV();
+        r.request.active = true;
+        r.request.capacity = step.capacity;
+        r.request.positionBegin = step.positionBegin;
+        r.request.deviceBytes = uint64_t(step.capacity) * r.KVTokenBytes() * p.layerCount;
+        r.request.tokens = r.RestorePrefix(ids, step.positionBegin);
+        ids.erase(ids.begin(), ids.begin() + r.request.tokens);
+    }
+    if (decode && (!r.request.active || r.request.tokens >= r.request.capacity)) {
+        throw std::runtime_error("MoE decode requires active request with capacity");
+    }
+
+    // 前缀命中后，各 rank 的后缀长度不同；统一集合通信尺寸，空闲 rank 也参与。
+    const uint32_t local = ids.size();
+    auto counts = static_cast<uint32_t*>(r.Allocate((p.worldSize + 1) * sizeof(uint32_t)));
+    Cuda(cudaMemcpyAsync(counts, &local, sizeof(local), cudaMemcpyHostToDevice, r.stream));
+    Nccl(ncclAllGather(counts, counts + 1, 1, ncclUint32, r.comm, r.stream));
+    std::vector<uint32_t> peers(p.worldSize);
+    Cuda(cudaMemcpyAsync(peers.data(), counts + 1, peers.size() * sizeof(uint32_t), cudaMemcpyDeviceToHost, r.stream));
+    r.Synchronize();
+    r.ReleaseBuffers();
+    const auto capacity = *std::max_element(peers.begin(), peers.end());
+    if (!capacity) return {};
+    if (capacity > kQwen3MaxPromptTokens || (graph && capacity != 1)) {
+        throw std::runtime_error("invalid joint MoE capacity");
+    }
+    r.ReserveMoeKV();
+    const uint32_t position = local ? r.request.positionBegin + r.request.tokens : 0;
+    std::vector<float> result(local ? p.vocabSize : 0);
+
+    if (graph) {
+        const uint32_t token = local ? ids[0] : 0;
+        const uint32_t meta[] = {local ? r.request.tokens : 0, position, local};
+        if (!r.graphExec) {
+            r.graphIds = static_cast<uint32_t*>(r.Allocate(sizeof(token), true));
+            r.graphMeta = static_cast<uint32_t*>(r.Allocate(sizeof(meta), true));
+            r.graphX = static_cast<half*>(r.Allocate(p.hiddenSize * sizeof(half), true));
+            r.graphLogits = static_cast<float*>(r.Allocate(p.vocabSize * sizeof(float), true));
+            r.graphWorkspace = r.Prepare(1, p.hiddenSize, Qwen3LayerStage::Attention, true);
+            r.graphMoe = r.PrepareMoe(1, true);
+            constexpr size_t bytes = 4 * 1024 * 1024;
+            Blas(cublasSetWorkspace(r.blas, r.Allocate(bytes, true), bytes));
+        }
+        Cuda(cudaMemcpyAsync(r.graphIds, &token, sizeof(token), cudaMemcpyHostToDevice, r.stream));
+        Cuda(cudaMemcpyAsync(r.graphMeta, meta, sizeof(meta), cudaMemcpyHostToDevice, r.stream));
+        auto enqueue = [&]() {
+            r.EnqueueMoe(r.graphIds, r.graphX, r.graphWorkspace, r.graphMoe,
+                         r.graphLogits, 1, 1, 0, r.graphMeta);
+        };
+        if (!r.graphExec) {
+            enqueue();
+            r.Synchronize();
+            ++r.graphInfo.warmups;
+            Cuda(cudaStreamBeginCapture(r.stream, cudaStreamCaptureModeThreadLocal));
+            try { enqueue(); }
+            catch (...) {
+                cudaGraph_t abandoned = nullptr;
+                cudaStreamEndCapture(r.stream, &abandoned);
+                if (abandoned) cudaGraphDestroy(abandoned);
+                throw;
+            }
+            Cuda(cudaStreamEndCapture(r.stream, &r.graph));
+            Cuda(cudaGraphInstantiate(&r.graphExec, r.graph, nullptr, nullptr, 0));
+            ++r.graphInfo.captures;
+        }
+        Cuda(cudaGraphLaunch(r.graphExec, r.stream));
+        if (local) Cuda(cudaMemcpyAsync(result.data(), r.graphLogits, result.size() * sizeof(float), cudaMemcpyDeviceToHost, r.stream));
+        r.Synchronize();
+        ++r.graphInfo.replays;
+    } else {
+        const size_t rows = std::max<uint32_t>(1, local);
+        auto input = static_cast<uint32_t*>(r.Allocate(rows * sizeof(uint32_t)));
+        auto x = static_cast<half*>(r.Allocate(rows * p.hiddenSize * sizeof(half)));
+        auto logits = static_cast<float*>(r.Allocate(p.vocabSize * sizeof(float)));
+        auto attention = r.Prepare(rows, p.hiddenSize, Qwen3LayerStage::Attention);
+        auto experts = r.PrepareMoe(capacity);
+        if (local) Cuda(cudaMemcpyAsync(input, ids.data(), ids.size() * sizeof(uint32_t), cudaMemcpyHostToDevice, r.stream));
+        r.EnqueueMoe(input, x, attention, experts, logits, local, capacity, position);
+        if (local) Cuda(cudaMemcpyAsync(result.data(), logits, result.size() * sizeof(float), cudaMemcpyDeviceToHost, r.stream));
+        r.Synchronize();
+        r.ReleaseBuffers();
+        if (decode) ++r.graphInfo.eagerDecodes;
+    }
+    for (float value : result) if (!std::isfinite(value)) throw std::runtime_error("nonfinite MoE logits");
+    r.request.tokens += local;
+    if (begin) r.SavePrefix(step.tokenIds, step.positionBegin);
+    return result;
+}
+
 void Qwen3LayerExecutor::EndRequest() {
     auto &r = *impl;
     r.Synchronize();
+    if (r.weights.Plan().model == ShardModel::Qwen2Moe) {
+        r.request = {};
+        return;
+    }
     r.ReleaseGraph();
     for (auto &cache : r.kvCache) {
         Cuda(cudaFree(cache));
@@ -950,6 +1151,7 @@ Qwen3RequestInfo Qwen3LayerExecutor::RequestInfo() const {
     info.graph.active = impl->graphExec != nullptr;
     info.graph.workspaceBytes = impl->graphAllocated;
     info.prefix = impl->prefixInfo;
+    info.reservedKVBytes = impl->reservedKVBytes;
     for (const auto &entry : impl->prefixes) {
         info.prefix.snapshots.emplace_back(entry.position, entry.ids);
     }
@@ -958,6 +1160,9 @@ Qwen3RequestInfo Qwen3LayerExecutor::RequestInfo() const {
 
 void Qwen3LayerExecutor::ClearPrefixCache() {
     auto &r = *impl;
+    if (r.weights.Plan().model == ShardModel::Qwen2Moe && r.request.active) {
+        throw std::runtime_error("cannot clear MoE prefix cache during an active request");
+    }
     r.Synchronize();
     while (!r.prefixes.empty()) r.ErasePrefix(0);
     if (r.prefixInfo.enabled) ++r.prefixInfo.clears;
@@ -966,6 +1171,10 @@ void Qwen3LayerExecutor::ClearPrefixCache() {
 void Qwen3LayerExecutor::Clear() {
     EndRequest();
     ClearPrefixCache();
+    impl->ReleaseGraph();
+    for (auto cache : impl->kvCache) Cuda(cudaFree(cache));
+    impl->kvCache.clear();
+    impl->reservedKVBytes = 0;
     impl->ReleaseBuffers();
     if (impl->blas) {
         Blas(cublasDestroy(impl->blas));

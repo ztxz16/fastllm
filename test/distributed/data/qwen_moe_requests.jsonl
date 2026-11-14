@@ -1,0 +1,8 @@
+{"messages":[{"role":"user","content":"请用一句话介绍北京。"}],"max_new_tokens":8}
+{"messages":[{"role":"user","content":"计算 17 加 25，只输出结果。"}],"max_new_tokens":6}
+{"messages":[{"role":"user","content":"解释为什么需要GPU并行推理。"}],"max_new_tokens":10}
+{"messages":[{"role":"user","content":"请把‘你好，世界’翻译成英文。"}],"max_new_tokens":8}
+{"messages":[{"role":"user","content":"写一个包含城市和国家两个字段的JSON对象。"}],"max_new_tokens":12}
+{"messages":[{"role":"user","content":"什么是注意力机制？"}],"max_new_tokens":10}
+{"messages":[{"role":"user","content":"给出三个不同的水果名称。"}],"max_new_tokens":8}
+{"messages":[{"role":"user","content":"请简短解释前缀缓存的作用。"}],"max_new_tokens":12}

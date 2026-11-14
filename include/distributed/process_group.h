@@ -24,7 +24,7 @@ struct ProcessGroupOptions {
     // 组内全部 worker 使用相同 Decode Graph 模式；不支持与 controlOnly 组合。
     bool cudaGraph = false;
     bool customAllReduce = false; // 严格要求双卡 P2P；大消息显式走 NCCL。
-    bool prefixCache = false; // 模型内跨请求 Prompt 快照；至多 8 条、每 rank 64 MiB。
+    bool prefixCache = false; // 至多 8 条快照；dense TP 每 rank 64 MiB，MoE 每 rank 512 MiB。
 };
 
 struct ProcessWorkerInfo {
@@ -42,7 +42,7 @@ struct ProcessModelInfo {
     uint64_t sourceBytesRead = 0;
 };
 
-/** 单个模型生命周期内的执行证据；请求结束释放图，卸载模型清零计数。 */
+/** 单模型执行证据；dense 请求结束释放图，MoE 图跨请求复用，卸载模型清零。 */
 struct Qwen3GraphInfo {
     bool enabled = false, active = false;
     uint64_t captures = 0, replays = 0, warmups = 0, eagerDecodes = 0, workspaceBytes = 0;
@@ -71,6 +71,17 @@ struct Qwen3RequestInfo {
     Qwen3GraphInfo graph;
     ProcessAllReduceInfo allReduce;
     Qwen3PrefixInfo prefix;
+    // MoE 固定地址 KV 预留；与活动请求逻辑字节分开统计，模型卸载时释放。
+    uint64_t reservedKVBytes = 0;
+};
+
+/** 一轮联合调度的本地操作；Idle 仍参加专家通信，End 在轮次边界释放活动状态。 */
+enum class QwenMoeAction : uint32_t { Idle = 0, Begin = 1, Decode = 2, End = 3 };
+
+struct QwenMoeStep {
+    QwenMoeAction action = QwenMoeAction::Idle;
+    uint32_t capacity = 0, positionBegin = 0;
+    std::vector<uint32_t> tokenIds;
 };
 
 enum class Qwen3LayerStage : uint32_t { Full = 0, Attention = 1, Mlp = 2 };
@@ -161,6 +172,16 @@ public:
      */
     std::vector<QwenMoeLayerResult> ForwardQwenMoeLayer(uint32_t layer, uint32_t hidden,
         Qwen3LayerStage stage, const std::vector<QwenMoeLayerInput> &inputs, int timeoutMs = 60000);
+
+    /**
+     * 按共同轮次执行完整 MoE 模型，各 Attention rank 独立持有请求及 KV。
+     * @param steps 每 rank 一个操作；Begin 可以与其他 rank 的 Decode 混合。
+     * @param graph 本轮是否整组使用 Decode Graph；包含 Begin 时必须为 false。
+     * @param timeoutMs 包含所有 worker 的整轮截止时间。
+     * @return 各 rank 的完整 FP32 词表 logits；Idle/End 返回空数组，失败终止整组。
+     */
+    std::vector<std::vector<float>> StepQwenMoe(const std::vector<QwenMoeStep> &steps,
+        bool graph = false, int timeoutMs = 60000);
 
     /**
      * 从指定 worker 的真实 GPU 权重读回连续字节，用于加载正确性验收。

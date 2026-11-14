@@ -46,7 +46,9 @@ def save_report(output, rows, metadata):
                 'token_mismatches', 'compared_steps', 'first_divergence_token_1based',
                 'requests', 'generated_tokens', 'elapsed_s', 'http_requests', 'sse_requests', 'reaped_processes',
                 'operation_timeout_ms', 'failure_return_ms', 'failure_phase', 'fault_rank',
-                'workers_reaped', 'observed_error'):
+                'workers_reaped', 'observed_error', 'median_ms', 'p95_ms', 'cv', 'tokens_per_second',
+                'speedup', 'concurrency', 'repeats', 'ttft_median_ms', 'itl_median_ms', 'queue_median_ms',
+                'reserved_kv_bytes', 'graph_workspace_bytes'):
         if any(key in row for row in rows):
             fields.append(key)
 
@@ -64,8 +66,10 @@ def save_report(output, rows, metadata):
     description = metadata.get("report_description", "无数值输出的生命周期检查，误差字段为 n/a。所有原始结果见 summary.json。")
     if expected is not None:
         description += f" 已完成 {len(rows)}/{expected} 个用例。"
-    lines = [f"# {title}: {status}", "",
-             "功能检查；通过范围仅限本报告实际执行的配置与用例，不代表性能结果。",
+    scope = ("功能与性能结果；性能比较仅适用于报告所列相同输入、计时边界和缓存配置。" if
+             any('median_ms' in row for row in rows) else
+             "功能检查；通过范围仅限本报告实际执行的配置与用例，不代表性能结果。")
+    lines = [f"# {title}: {status}", "", scope,
              description, "",
              "| " + " | ".join(fields) + " |", "| " + " | ".join(["---"] * len(fields)) + " |"]
     lines.extend("| " + " | ".join(item.replace("|", "\\|").replace("\n", " ") for item in row) + " |"

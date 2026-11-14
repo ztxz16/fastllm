@@ -280,6 +280,7 @@ struct ProcessGroup::Impl {
     uint64_t session = 0;
     uint64_t sequence = 0;
     bool stopMonitor = false;
+    bool moeModel = false;
 
     ~Impl() {
         for (auto &child : children) {
@@ -516,6 +517,8 @@ struct ProcessGroup::Impl {
                     }
                     info.prefix.snapshots.push_back(std::move(snapshot));
                 }
+                info.reservedKVBytes = Get64(bytes, offset);
+                offset += 8;
                 if (offset != bytes.size()) throw std::runtime_error("trailing Qwen3 prefix directory bytes");
                 const auto &prefix = info.prefix;
                 const auto &ar = info.allReduce;
@@ -523,17 +526,19 @@ struct ProcessGroup::Impl {
                 bool invalid = info.active ?
                     (end || !info.tokens || info.tokens > info.capacity || info.capacity > kQwen3MaxContextTokens ||
                      info.positionBegin > 1048576 || info.capacity - 1 > 1048576 - info.positionBegin ||
-                     !info.deviceBytes || info.deviceBytes > 256ULL * 1024 * 1024) :
+                     !info.deviceBytes || info.deviceBytes > (moeModel ? 512ULL : 256ULL) * 1024 * 1024) :
                     (info.tokens || info.capacity || info.positionBegin || info.deviceBytes);
                 invalid = invalid || ar.enabled != options.customAllReduce || ar.active != ar.enabled ||
                     !ar.workspaceBytes || ar.workspaceBytes > 3ULL * 1024 * 1024 ||
                     (!ar.enabled && ar.customCalls) || g.enabled != options.cudaGraph ||
                     g.captures != g.warmups || g.replays < g.captures ||
-                    g.active != (g.workspaceBytes != 0) || g.workspaceBytes > 256ULL * 1024 * 1024 ||
-                    (g.active && (!info.active || !g.captures)) ||
-                    (g.enabled ? g.eagerDecodes != 0 : (g.active || g.captures || g.replays || g.warmups));
+                    g.active != (g.workspaceBytes != 0) || g.workspaceBytes > (moeModel ? 512ULL : 256ULL) * 1024 * 1024 ||
+                    (g.active && ((!moeModel && !info.active) || !g.captures)) ||
+                    (g.enabled ? (!moeModel && g.eagerDecodes != 0) : (g.active || g.captures || g.replays || g.warmups)) ||
+                    info.reservedKVBytes > 512ULL * 1024 * 1024 || (!moeModel && info.reservedKVBytes) ||
+                    (moeModel && info.deviceBytes > info.reservedKVBytes);
                 invalid = invalid || prefix.enabled != options.prefixCache || prefix.entries > 8 ||
-                    prefix.deviceBytes > 64ULL * 1024 * 1024 || bool(prefix.entries) != bool(prefix.deviceBytes) ||
+                    prefix.deviceBytes > (moeModel ? 512ULL : 64ULL) * 1024 * 1024 || bool(prefix.entries) != bool(prefix.deviceBytes) ||
                     prefix.hits > prefix.lookups || prefix.reusedTokens < prefix.hits ||
                     prefix.lastReusedTokens >= kQwen3MaxPromptTokens || prefix.lastComputedTokens > kQwen3MaxPromptTokens ||
                     prefix.lastReusedTokens + prefix.lastComputedTokens > kQwen3MaxPromptTokens ||
@@ -541,7 +546,12 @@ struct ProcessGroup::Impl {
                     (clearPrefix && (prefix.entries || prefix.deviceBytes)) ||
                     (!prefix.enabled && (prefix.entries || prefix.deviceBytes || prefix.lookups || prefix.hits ||
                         prefix.reusedTokens || prefix.lastReusedTokens || prefix.lastComputedTokens || prefix.evictions || prefix.clears));
-                if (!result.empty()) {
+                if (moeModel && !result.empty()) {
+                    const auto &first = result.front().graph;
+                    invalid = invalid || g.active != first.active || g.captures != first.captures ||
+                        g.replays != first.replays || g.warmups != first.warmups;
+                }
+                if (!moeModel && !result.empty()) {
                     const auto &first = result.front();
                     invalid = invalid || info.active != first.active || info.tokens != first.tokens ||
                               info.capacity != first.capacity || info.positionBegin != first.positionBegin ||
@@ -832,8 +842,8 @@ std::vector<ProcessModelInfo> ProcessGroup::LoadModel(const std::string &directo
         throw std::runtime_error("Qwen3 loading requires a ready CUDA process TP group");
     }
     try {
-        if (moe && (impl->options.cudaGraph || impl->options.prefixCache || impl->options.customAllReduce)) {
-            throw std::invalid_argument("MoE layer stage requires Eager, no prefix cache and NCCL");
+        if (moe && impl->options.customAllReduce) {
+            throw std::invalid_argument("MoE execution requires NCCL");
         }
         auto replies = impl->Exchange(moe ? Kind::LoadQwenMoe : Kind::LoadQwen3, Kind::ModelLoaded, payload,
                                       Clock::now() + std::chrono::milliseconds(timeoutMs));
@@ -844,6 +854,7 @@ std::vector<ProcessModelInfo> ProcessGroup::LoadModel(const std::string &directo
             }
             results.push_back({Get32(reply.payload, 0), Get64(reply.payload, 4), Get64(reply.payload, 12)});
         }
+        impl->moeModel = moe;
         return results;
     } catch (const std::exception &e) {
         impl->Fail(e.what());
@@ -894,6 +905,7 @@ void ProcessGroup::UnloadQwen3() {
                 throw std::runtime_error("invalid Qwen3 unload response");
             }
         }
+        impl->moeModel = false;
     } catch (const std::exception &e) {
         impl->Fail(e.what());
         throw std::runtime_error(impl->error);
@@ -1015,6 +1027,58 @@ std::vector<QwenMoeLayerResult> ProcessGroup::ForwardQwenMoeLayer(uint32_t layer
             results.push_back(std::move(result));
         }
         return results;
+    } catch (const std::exception &error) {
+        impl->Fail(error.what());
+        throw std::runtime_error(impl->error);
+    }
+}
+
+std::vector<std::vector<float>> ProcessGroup::StepQwenMoe(const std::vector<QwenMoeStep> &steps,
+                                                       bool graph, int timeoutMs) {
+    std::lock_guard<std::mutex> lock(impl->mutex);
+    if (impl->state != ProcessGroupState::Ready || !impl->moeModel || steps.size() != impl->children.size() ||
+        timeoutMs <= 0 || (graph && !impl->options.cudaGraph)) {
+        throw std::invalid_argument("invalid joint MoE round state");
+    }
+    std::vector<uint8_t> payload;
+    Put32(payload, steps.size());
+    Put32(payload, graph);
+    Put32(payload, timeoutMs);
+    for (const auto &step : steps) {
+        const bool begin = step.action == QwenMoeAction::Begin, decode = step.action == QwenMoeAction::Decode;
+        if (uint32_t(step.action) > 3 || step.tokenIds.size() > kQwen3MaxPromptTokens ||
+            (begin && (graph || step.tokenIds.empty() || !step.capacity || step.capacity > kQwen3MaxContextTokens ||
+                       step.tokenIds.size() > step.capacity || step.positionBegin > 1048576 ||
+                       step.capacity - 1 > 1048576 - step.positionBegin)) ||
+            (decode && step.tokenIds.size() != 1) || (!begin && !decode && !step.tokenIds.empty()) ||
+            (!begin && (step.capacity || step.positionBegin))) {
+            throw std::invalid_argument("invalid joint MoE rank operation");
+        }
+        for (uint32_t value : {uint32_t(step.action), step.capacity, step.positionBegin, uint32_t(step.tokenIds.size())}) Put32(payload, value);
+        for (auto id : step.tokenIds) Put32(payload, id);
+    }
+    if (payload.size() > kMaxPayload) throw std::invalid_argument("MoE round exceeds protocol limit");
+    try {
+        auto replies = impl->Exchange(Kind::StepMoe, Kind::MoeLogits, payload,
+            Clock::now() + std::chrono::milliseconds(timeoutMs));
+        std::vector<std::vector<float>> result;
+        uint32_t vocabulary = 0;
+        for (size_t rank = 0; rank < replies.size(); ++rank) {
+            const auto &bytes = replies[rank].payload;
+            const uint32_t count = Get32(bytes, 0);
+            const bool active = steps[rank].action == QwenMoeAction::Begin || steps[rank].action == QwenMoeAction::Decode;
+            if (bool(count) != active || count > (kMaxPayload - 4)/4 || bytes.size() != 4ULL + count*4ULL ||
+                (count && vocabulary && vocabulary != count)) throw std::runtime_error("invalid MoE logits response");
+            if (count) vocabulary = count;
+            std::vector<float> logits(count);
+            for (size_t i = 0; i < count; ++i) {
+                uint32_t bits = Get32(bytes, 4 + i*4);
+                memcpy(&logits[i], &bits, sizeof(bits));
+                if (!std::isfinite(logits[i])) throw std::runtime_error("nonfinite joint MoE logits");
+            }
+            result.push_back(std::move(logits));
+        }
+        return result;
     } catch (const std::exception &error) {
         impl->Fail(error.what());
         throw std::runtime_error(impl->error);

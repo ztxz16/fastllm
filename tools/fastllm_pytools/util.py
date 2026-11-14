@@ -650,6 +650,10 @@ def make_normal_llm_model(args, startup_progress = None):
     if tp_backend not in ("thread", "process"):
         raise ValueError("tp_backend must be thread or process")
     if tp_backend == "process":
+        from .parallel_config import is_attention_ep
+        if is_attention_ep(args):
+            from .process_moe import ProcessMoeModel
+            return ProcessMoeModel(args)
         if getattr(args, 'dp', 1) > 1:
             from .process_dp import ProcessDPModel
             return ProcessDPModel(args)

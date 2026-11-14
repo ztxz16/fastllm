@@ -225,7 +225,7 @@ def build_parallel_plan(args):
         return {'mode': 'attention_dp_ep', 'dp_size': 1, 'tp_size': 1,
                 'attention_dp_size': count, 'ep_size': count, 'total_gpus': count,
                 'tp_backend': 'process', 'dp_routing': getattr(args, 'dp_routing', 'round_robin'),
-                'preview_only': True, 'attention_ep_execution_available': False,
+                'preview_only': True, 'attention_ep_execution_available': True,
                 'cuda_visible_devices': visible, 'driver_cuda_version': inventory['driver_cuda_version'],
                 'visible_device_count': available, 'ranks': ranks,
                 'attention_groups': [[rank] for rank in range(count)], 'ep_groups': [list(range(count))],
@@ -269,7 +269,4 @@ def prepare_parallel_entry(args, *, allow_preview=False):
         if not allow_preview:
             raise ValueError('--parallel-plan is a CLI preview; use build_parallel_plan for a programmatic plan')
         return build_parallel_plan(args)
-    if is_attention_ep(args):
-        build_parallel_plan(args)
-        raise NotImplementedError('Attention DP/EP: 参数与设备规划已接入，多 rank MoE 执行尚未接入')
     return None

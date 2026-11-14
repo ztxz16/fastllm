@@ -705,6 +705,9 @@ if (BUILD_PROCESS_TP)
     add_executable(fastllm_tp_generate tools/src/tp_generate.cpp third_party/json11/json11.cpp)
     target_include_directories(fastllm_tp_generate PRIVATE ${PROJECT_SOURCE_DIR}/third_party/json11)
     target_link_libraries(fastllm_tp_generate PRIVATE fastllm_process_tp)
+    add_executable(fastllm_moe_generate tools/src/moe_generate.cpp third_party/json11/json11.cpp)
+    target_include_directories(fastllm_moe_generate PRIVATE ${PROJECT_SOURCE_DIR}/third_party/json11)
+    target_link_libraries(fastllm_moe_generate PRIVATE fastllm_process_tp)
     add_executable(fastllm_tp_sampling_check tools/src/tp_sampling_check.cpp third_party/json11/json11.cpp)
     target_include_directories(fastllm_tp_sampling_check PRIVATE ${PROJECT_SOURCE_DIR}/third_party/json11)
     target_link_libraries(fastllm_tp_sampling_check PRIVATE fastllm_process_tp)
@@ -768,15 +771,15 @@ if (BUILD_PROCESS_TP)
         target_include_directories(fastllm_tp_decode_check PRIVATE ${PROJECT_SOURCE_DIR}/third_party/json11)
         target_link_libraries(fastllm_tp_decode_check PRIVATE fastllm_process_tp)
     endif()
-    install(TARGETS fastllm_tp_worker fastllm_tp_check fastllm_tp_generate RUNTIME DESTINATION bin)
+    install(TARGETS fastllm_tp_worker fastllm_tp_check fastllm_tp_generate fastllm_moe_generate RUNTIME DESTINATION bin)
     # 独立打包进程后端，不要求构建旧线程后端的完整共享库。
     add_custom_target(fastllm_process_tp_package
         COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/process-tp-python/ftllm
         COMMAND ${CMAKE_COMMAND} -E copy_directory ${PROJECT_SOURCE_DIR}/tools/fastllm_pytools
             ${CMAKE_BINARY_DIR}/process-tp-python/ftllm
-        COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:fastllm_tp_generate>
+        COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:fastllm_tp_generate> $<TARGET_FILE:fastllm_moe_generate>
             $<TARGET_FILE:fastllm_tp_worker> ${CMAKE_BINARY_DIR}/process-tp-python/ftllm/
-        DEPENDS fastllm_tp_generate fastllm_tp_worker
+        DEPENDS fastllm_tp_generate fastllm_moe_generate fastllm_tp_worker
         VERBATIM
         COMMENT "Stage the process TP Python package and native executables")
 endif()
@@ -866,12 +869,12 @@ add_library(fastllm_tools SHARED ${FASTLLM_CXX_SOURCES} ${FASTLLM_CUDA_SOURCES} 
 target_link_libraries(fastllm_tools PUBLIC ${FASTLLM_LINKED_LIBS})
 
 if (BUILD_PROCESS_TP)
-    add_dependencies(fastllm_tools fastllm_tp_worker fastllm_tp_check fastllm_tp_generate)
+    add_dependencies(fastllm_tools fastllm_tp_worker fastllm_tp_check fastllm_tp_generate fastllm_moe_generate)
     add_custom_command(TARGET fastllm_tools POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/tools/ftllm
         COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:fastllm_tp_worker> ${CMAKE_BINARY_DIR}/tools/ftllm/
         COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:fastllm_tp_check> ${CMAKE_BINARY_DIR}/tools/ftllm/
-        COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:fastllm_tp_generate> ${CMAKE_BINARY_DIR}/tools/ftllm/)
+        COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:fastllm_tp_generate> $<TARGET_FILE:fastllm_moe_generate> ${CMAKE_BINARY_DIR}/tools/ftllm/)
 endif()
 
 set(BUILD_INFO_USE_CUDA "false")
