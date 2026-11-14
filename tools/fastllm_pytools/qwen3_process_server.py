@@ -136,7 +136,7 @@ class ChatService:
         if (type(queue_size) is not int or queue_size < 1 or
                 not math.isfinite(request_timeout) or request_timeout <= 0):
             raise ValueError("queue_size and request_timeout must be positive")
-        if session.ready.get("cancellation") != "request_id_datagram":
+        if session.ready.get("cancellation") not in ("request_id_datagram", "round_boundary"):
             raise ValueError("native cancellation support required; rebuild fastllm_tp_generate")
         if session.ready.get("token_events") is not True:
             raise ValueError("native token events required; rebuild fastllm_tp_generate")
@@ -218,11 +218,13 @@ class ChatService:
     def health(self):
         with self._condition:
             ready = not self._stopping and self.failure is None and self.session.state == "ready"
-            return dict(status="ready" if ready else "unavailable", backend=BACKEND, model=self.model_name,
+            return dict(status="ready" if ready else "unavailable", backend=self.session.ready.get('backend', BACKEND), model=self.model_name,
                         active_request_id=next(iter(self._active), None), active_request_ids=list(self._active),
                         queued_request_ids=[job.id for job in self._queue], queue_capacity=self.queue_size,
                         workers=self.session.ready["workers"], model_load_count=self.session.ready.get('model_load_count', 1),
                         dp_size=getattr(self.session, 'dp_size', 1),
+                        attention_dp_size=getattr(self.session, 'attention_dp_size', 1),
+                        ep_size=getattr(self.session, 'ep_size', 1),
                         dp_routing=getattr(self.session, 'routing', 'round_robin'),
                         replicas=self.session.ready.get('replicas', []))
 

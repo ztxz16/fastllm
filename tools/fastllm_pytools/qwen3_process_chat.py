@@ -42,8 +42,8 @@ def prepare_request(model, tokenizer, prompt, *, raw=False, thinking=False, max_
                     messages=None):
     """复用本地模型的聊天模板和 EOS 配置，保存实际送入模型的完整 token ID。"""
     config = json.loads((model / "config.json").read_text())
-    if config.get("model_type") != "qwen3":
-        raise ValueError("only dense Qwen3 (model_type=qwen3) is supported")
+    if config.get("model_type") not in ('qwen3', 'qwen2_moe'):
+        raise ValueError('only dense Qwen3 and Qwen2 MoE are supported')
     if raw:
         ids = tokenizer.encode(prompt, add_special_tokens=False)
     else:

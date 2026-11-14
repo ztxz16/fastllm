@@ -47,7 +47,7 @@ class AttentionEPConfigTests(unittest.TestCase):
         self.assertEqual(p['ep_groups'], [[0, 1, 2, 3]])
         self.assertEqual([(r['rank'], r['attention_rank'], r['ep_rank'], r['tp_rank'], r['device']['logical_id'])
                           for r in p['ranks']], [(i, i, i, 0, i) for i in range(4)])
-        self.assertFalse(p['attention_ep_execution_available'])
+        self.assertTrue(p['attention_ep_execution_available'])
         self.assertEqual(len(p['replicas']), 1)
 
     def test_two_ranks_leave_other_devices_unused(self):
@@ -136,10 +136,12 @@ class AttentionEPConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'both attention-dp and attention_dp'):
             make_normal_llm_model(self.parser.parse_args([str(path)]))
 
-    def test_execution_rejected_before_native_or_dense_fallback(self):
-        for entry in (make_normal_llm_model, process_tp.ProcessTPModel):
-            with self.subTest(entry=entry.__name__), self.assertRaisesRegex(NotImplementedError, 'MoE 执行尚未接入'):
-                entry(self.args())
+    def test_execution_uses_moe_factory_and_rejects_dense_adapter(self):
+        with mock.patch('fastllm_pytools.process_moe.ProcessMoeModel') as model:
+            self.assertIs(make_normal_llm_model(self.args()), model.return_value)
+            model.assert_called_once()
+        with self.assertRaisesRegex(ValueError, 'requires ProcessMoeModel'):
+            process_tp.ProcessTPModel(self.args())
         self.binary.assert_not_called()
         self.session.assert_not_called()
 

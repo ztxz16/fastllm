@@ -75,7 +75,7 @@ def validate_options(args, *, allow_dp=False):
     parser = make_normal_parser('process validation')
     add_server_args(parser)
     defaults = vars(parser.parse_args([]))
-    allowed = {'model', 'path', 'dp', 'dp_routing', 'tp', 'tp_backend', 'tp_binary', 'tp_worker', 'tp_output', 'tp_timeout',
+    allowed = {'model', 'path', 'dp', 'attention_dp', 'ep', 'dp_routing', 'tp', 'tp_backend', 'tp_binary', 'tp_worker', 'tp_output', 'tp_timeout',
                'tp_request_timeout', 'tp_queue_size', 'tp_request_log', 'host', 'port', 'model_name', 'cuda_graph', 'custom_allreduce'}
     compatible = {'dtype': ('auto', 'float16'), 'atype': ('auto', 'float16'),
                   'kv_cache_dtype': ('auto', 'float16'), 'kv_cache_layout': ('auto', 'continuous'),
@@ -133,9 +133,13 @@ class ProcessTPModel:
 
     def __init__(self, args, *, _device_ids=None, _environment=None):
         from .util import load_model_args
+        from .parallel_config import is_attention_ep
 
         load_model_args(args)
         validate_options(args)
+        moe = self.backend == 'qwen_moe_attention_dp_ep'
+        if is_attention_ep(args) != moe:
+            raise ValueError('Attention DP/EP requires ProcessMoeModel through the model factory')
         self.devices = process_devices(getattr(args, 'tp', ''))
         if _device_ids is not None:
             # DP 内部分配传递逻辑编号，不能重新按裸数字卡数解析单卡编号 1。
@@ -148,9 +152,11 @@ class ProcessTPModel:
         if not self.model_path.is_dir() or not (self.model_path / 'config.json').is_file():
             raise ValueError('process TP requires a local HF Qwen3 model directory; no automatic download')
         self.config = json.loads((self.model_path / 'config.json').read_text())
-        if self.config.get('model_type') != 'qwen3' or self.config.get('quantization_config'):
-            raise ValueError('process TP only supports unquantized dense Qwen3')
-        binary = native_binary(getattr(args, 'tp_binary', ''), 'fastllm_tp_generate')
+        expected_type = 'qwen2_moe' if moe else 'qwen3'
+        if self.config.get('model_type') != expected_type or self.config.get('quantization_config'):
+            raise ValueError('process backend requires unquantized Qwen2 MoE' if moe else
+                             'process TP only supports unquantized dense Qwen3')
+        binary = native_binary(getattr(args, 'tp_binary', ''), 'fastllm_moe_generate' if moe else 'fastllm_tp_generate')
         worker = native_binary(getattr(args, 'tp_worker', ''), 'fastllm_tp_worker')
         os.environ.setdefault('USE_TORCH', '0')
         from transformers import AutoTokenizer
@@ -160,16 +166,25 @@ class ProcessTPModel:
             datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ') + '_' + uuid.uuid4().hex[:8])
         self.output.mkdir(parents=True)
         self._text_lock = threading.Lock()
+        self._stream_lock = self._text_lock
         self._lifecycle_lock = threading.Lock()
         self._pending_cancels = []
         self._closing = False
-        self.session = Qwen3ProcessSession(binary, worker, self.model_path, self.devices,
+        session_class = Qwen3ProcessSession
+        session_options = dict(custom_allreduce=getattr(args, 'custom_allreduce', False))
+        if moe:
+            from contextlib import nullcontext
+            from .qwen_moe_process_session import QwenMoeProcessSession
+            session_class = QwenMoeProcessSession
+            session_options = dict(routing=getattr(args, 'dp_routing', 'round_robin'),
+                                   queue_size=getattr(args, 'tp_queue_size', 8))
+            self._stream_lock = nullcontext()
+        self.session = session_class(binary, worker, self.model_path, self.devices,
                                           self.output / 'session', timeout=getattr(args, 'tp_timeout', 180),
                                           cuda_graph=getattr(args, 'cuda_graph', False),
-                                          custom_allreduce=getattr(args, 'custom_allreduce', False),
                                           prefix_cache=getattr(args, 'prefix_cache', '') == 'true',
                                           request_log=getattr(args, 'tp_request_log', 'on') == 'on',
-                                          environment=_environment)
+                                          environment=_environment, **session_options)
         self.session.__enter__()
         args.path = str(self.model_path)
 
@@ -232,7 +247,7 @@ class ProcessTPModel:
         """/** 执行已分词的正式请求；DP在分发前准备相同Token，提前关闭流仍取消并等待回收。 */"""
         from .qwen3_process_server import IncrementalTextDecoder
 
-        with self._text_lock:
+        with self._stream_lock:
             events, cancel, done, errors = queue.Queue(maxsize=64), threading.Event(), threading.Event(), []
             decoder = IncrementalTextDecoder(self.hf_tokenizer)
 
