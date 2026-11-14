@@ -65,7 +65,8 @@ void fixture(const fs::path &path, bool unsloth, float multiplier, bool badScale
 }
 // Full H3 QKV dimensions exercise layout metadata, independently of model
 // weights.
-void checkQkvLayout(const fs::path &path, Runtime &rt, bool comfy) {
+void checkQkvLayout(const fs::path &path, Runtime &rt, int layout) {
+    const bool comfy = layout == 1, unsloth = layout == 2;
     constexpr int rows = 21504, cols = 5376;
     std::vector<uint8_t> data(size_t(rows) * cols);
     for (int row = 0; row < rows; ++row)
@@ -84,25 +85,50 @@ void checkQkvLayout(const fs::path &path, Runtime &rt, bool comfy) {
         h["__metadata__"] =
             json11::Json::object{{"_quantization_metadata",
                                   R"({"layers":{"blocks.0.attn.qkv_proj":{"format":"float8_e4m3fn"}}})"}};
+    std::vector<float> scales(unsloth ? rows : 1, .5f);
+    if (unsloth) {
+        h.clear();
+        for (int row = 0; row < rows; ++row) scales[row] = .25f * (row % 3 + 1);
+        for (int part = 0; part < 3; ++part) {
+            const std::string key = std::string("transformer_blocks.0.attn.to_") + "qkv"[part];
+            const size_t first = size_t(part) * (rows / 3) * cols, bytes = size_t(rows / 3) * cols;
+            const size_t scaleFirst = data.size() + size_t(part) * (rows / 3) * 4;
+            h[key + "._weight_qdata"] = json11::Json::object{
+                {"dtype", "F8_E4M3"}, {"shape", json11::Json::array{rows / 3, cols}},
+                {"data_offsets", json11::Json::array{double(first), double(first + bytes)}}};
+            h[key + "._weight_scale"] = json11::Json::object{
+                {"dtype", "F32"}, {"shape", json11::Json::array{rows / 3}},
+                {"data_offsets", json11::Json::array{double(scaleFirst), double(scaleFirst + rows / 3 * 4)}}};
+        }
+    }
     std::string header = json11::Json(h).dump();
     uint64_t n = header.size();
-    float scale = .5f;
     {
         std::ofstream f(path, std::ios::binary);
         f.write(reinterpret_cast<char *>(&n), 8);
         f << header;
         f.write(reinterpret_cast<char *>(data.data()), data.size());
-        f.write(reinterpret_cast<char *>(&scale), 4);
+        f.write(reinterpret_cast<char *>(scales.data()), scales.size() * 4);
     }
-    Fp8Weights weights(path.string());
     std::vector<float> x(cols);
-    for (int i = 0; i < cols; ++i)
-        x[i] = i % 5 ? 224 : 448;
-    auto out = rt.download(weights.linear(rt.upload(x.data(), 1, cols), "blocks.0.attn.qkv_proj"));
-    for (int row = 0; row < rows; ++row) {
-        int within = row % 7168;
-        int source = comfy ? row : (within / 128) * 384 + (row / 7168) * 128 + within % 128;
-        require(out[row] == x[source % cols] * scale);
+    for (int i = 0; i < cols; ++i) x[i] = i % 5 ? 224 : 448;
+    auto input = rt.upload(x.data(), 1, cols);
+    // Virtual ranks on one GPU check every shard against the CPU layout;
+    // this catches permutations which a sum-only TP test would miss.
+    for (int size : {1, 2, 4, 8}) {
+        for (int rank = 0; rank < size; ++rank) {
+            Fp8Weights weights(path.string(), {false, rank, size});
+            auto out = rt.download(weights.linear(input, "blocks.0.attn.qkv_proj"));
+            require(out.size() == size_t(rows / size));
+            const int width = 7168 / size;
+            for (int row = 0; row < rows / size; ++row) {
+                const int logical = row / width * 7168 + rank * width + row % width;
+                const int within = logical % 7168;
+                const int source = comfy || unsloth ? logical
+                    : (within / 128) * 384 + (logical / 7168) * 128 + within % 128;
+                require(out[row] == x[source % cols] * scales[unsloth ? logical : 0]);
+            }
+        }
     }
 }
 float roundE4m3(float x) {
@@ -235,13 +261,26 @@ int main() {
                             wa.clear();
                     }
             }
+            for (int rank = 0; rank < 2; ++rank) {
+                Fp8Weights shard(a.string(), {false, rank, 2});
+                std::vector<float> x(32);
+                for (int c = 0; c < 32; ++c) x[c] = c % 3 ? 224 : 448;
+                auto output = rt.download(shard.linear(rt.upload(x.data(), 1, 32), "blocks.0.mlp.fc1"));
+                require(output.size() == 16);
+                for (int c = 0; c < 16; ++c) {
+                    const int logical = c / 8 * 16 + rank * 8 + c % 8;
+                    const int source = unsloth ? (logical + 16) % 32 : logical;
+                    require(output[c] == x[source] * (source % 2 ? -1 : 1) * .25f *
+                                             (unsloth ? (1 << (source % 3)) : 1));
+                }
+            }
             wa.clear();
             wb.clear();
             pool.trim();
             require(pool.reusableBytes() == 0);
         }
-        for (bool comfy : {false, true})
-            checkQkvLayout(root / "qkv.safetensors", rt, comfy);
+        for (int layout : {0, 1, 2})
+            checkQkvLayout(root / "qkv.safetensors", rt, layout);
         for (int cols : {5376, 7168, 14336})
             checkProjection(root / "projection.safetensors", rt, cols);
         fixture(root / "bad.safetensors", false, 1, true);

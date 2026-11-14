@@ -872,3 +872,111 @@ Older GPUs/toolkits, release wheels and broader image-quality coverage remain
 outside this validation. The earlier Q2_K quality limitation still applies.
 Detailed commands, source snapshots, logs and the proposed two-commit grouping
 are in `gguf-cleanup-20261113` under the pro5000 image experiment directory.
+
+## Quantized image tensor parallelism (2026-11-14)
+
+Implemented directly on `master`, starting from `e4261060b4c81db3d8b44ac8d92a71794a2fe2c2`.
+Tests use only idle physical GPUs 6/7 (RTX PRO 5000 Blackwell, CUDA 13). The existing
+GPU 3 image service was not restarted. FP8/INT8/NVFP4/GGUF weight types remain
+automatically detected. Explicit `--parallel-mode tp` now shards image projections;
+quantized `auto` retains SP.
+
+Real-checkpoint tests cover all 50 blocks with identical oracle inputs, two
+asymmetric reference grids and a two-block 4096-row FFN tail. Both ranks produce
+identical outputs. Maximum relative L2 across the input/refiner and block stages:
+
+| Image weights | TP2 activation reduction, resident | TP2 FP32 reduction, streamed |
+| --- | ---: | ---: |
+| Unsloth FP8 | 0.0403632 | 0.0403053 |
+| Comfy INT8 ConvRot | 0.0170969 | 0.0169071 |
+| LSDJesus NVFP4 | 0.00421647 | 0.00223572 |
+| Abiray GGUF Q4_K_M | 0.0187920 | 0.00283423 |
+
+All pass the video quantized tests' comparison bounds of 0.05 per stage and 0.01
+for the output head. These are same-input comparisons against the same
+single-GPU quantized checkpoint, not BF16 or full-trajectory equivalence.
+The tests separately report accumulated drift; changing TP degree can change pixels.
+
+NVFP4 attention output retains FP32 partials until after summation, even with
+activation reduction selected; its FFN output retains the selected precision.
+This avoids perturbing the next FFN's global activation scale. The original
+BF16-partial attention variant reached 0.0656588 maximum stage relative L2.
+No single-GPU/SP arithmetic or video projection behavior is changed.
+
+The 12 selected H3 native CTests and the continuous parallel runtime test pass.
+Video FP8/INT8 TP2 real-checkpoint regressions pass.
+`ldd -r` finds no unresolved symbols or Torch/C10/Python runtime
+dependency. The inference path remains C++/CUDA/NCCL.
+
+HTTP checks pass repeated deterministic 512-square TP2 generation for all four
+quantized formats, INT8/NVFP4 two-reference editing, and FP8 with an 8 GiB budget
+per GPU and 2 GiB host weight budget (cache disabled). The constrained service
+recovers after cancellation during preparation, then completes two identical
+requests. The budget test is not a claim about minimum possible memory or total RSS.
+
+Full 2048-square TP2 generation passes for FP8, INT8, NVFP4 and GGUF Q4_K_M.
+The four samples were visually inspected, with coherent subjects/backgrounds
+and no obvious tile seams; this is a smoke check, not a broad quality evaluation.
+Legacy single-GPU BF16/FP8/INT8/NVFP4 reference-edit PNGs and the GGUF generation
+PNG match their saved pre-change outputs byte-for-byte. FP8 and NVFP4 two-GPU
+SP-mode generation also matches the saved pre-change library byte-for-byte.
+FP8 projection fixtures also check original interleaved, Comfy packed and Unsloth
+separate Q/K/V layouts on virtual 1/2/4/8-way shards, plus gate/value and scale order.
+
+Commands, logs, checkpoint paths, error diagnostics and outputs are in
+`image-quant-tp-20261114` under the pro5000 image experiment directory.
+Only two-GPU execution on SM120 is validated. INT8/GGUF require H256/block-aligned
+input shards and reject TP8; use TP2/TP4 or SP. Four/eight-GPU execution, older
+architectures/toolkits and release wheels have not been exercised.
+
+### Resident single-GPU, SP2 and TP2 timing
+
+RTX PRO 5000 72 GB, physical GPUs 6/7 on the same NUMA node, PCIe 5 x16;
+2048x2048, batch 1, six PDD steps, seed 42, BF16 VAE, 64 GiB host budget and
+automatic GPU budgets. Prompt: `A red panda beside a mountain stream, autumn forest`.
+Each fresh process runs one warmup request and three measured requests; the table
+shows medians in seconds as **complete generation / DiT**. Text is encoded on
+every request. Complete generation includes text, preparation, DiT, VAE and CPU
+image processing, excluding initial loading, PNG encoding, file writes and HTTP.
+
+| Image weights | Single GPU | SP2 | TP2 |
+| --- | ---: | ---: | ---: |
+| BF16 | 6.916 / 5.799 | 3.266 / 3.134 | 3.511 / 3.365 |
+| Unsloth FP8 | 3.567 / 3.231 | 1.952 / 1.822 | 2.334 / 2.205 |
+| Comfy INT8 ConvRot | 3.641 / 3.296 | 2.009 / 1.878 | 2.429 / 2.297 |
+| LSDJesus NVFP4 | 2.555 / 2.317 | 1.463 / 1.333 | 2.218 / 2.086 |
+| Abiray GGUF Q4_K_M | 6.352 / 6.113 | 3.629 / 3.498 | 3.668 / 3.530 |
+
+These measurements favor SP for latency and support retaining the current auto
+selection. TP reduces per-device weight storage: FP8's post-request device usage
+falls from about 47 GiB with SP2 to 37 GiB with TP2. These are cache-inclusive
+snapshots, not peak usage or minimum-memory requirements. Results apply to this
+text-to-image workload; they do not establish equal quality between formats.
+All repeated outputs within each mode are byte-identical. An untimed original
+library cross-check measured FP8 TP2 at 2.352 s (0.76% from the timed run), with
+identical PNG output. Reproduction scripts and full samples are in
+`image-quant-tp-speed-20261114` under the pro5000 image experiment directory.
+
+### Pre-commit cleanup and regression
+
+The shared checkpoint reader now uses one bounded-buffer upload helper, the FFN
+uses one quantized output branch, and parallel test targets share their CUDA
+link configuration. CUDA copy ordering, synchronization and numerical operations
+are unchanged. No experimental environment switch remains in the image native
+code; existing GPU visibility and server executable lookup settings are retained.
+HTTP regression now checks both explicit DiT rank-count fields.
+
+The rebuilt sources pass 13 native CTests, the image workspace state test,
+eight real-checkpoint image
+TP2 cases and video FP8/INT8 TP2 regressions. All eight maximum stage-relative-L2
+values above are unchanged. Seven complete 2K generations match pre-cleanup PNG
+SHA256 values: BF16/FP8/INT8/NVFP4/GGUF TP2, FP8 single GPU and NVFP4 SP2.
+Dependency checks again find no unresolved symbols or Torch/C10/Python runtime.
+
+An initial FP8 retest had a 16.37 s transient after the first warmup. A paired
+old/new-library check with two warmups and four measured requests gives medians
+of 2.339 s before and 2.345 s after (+0.25%), with identical PNGs. NVFP4 TP2 remains
+2.215 s versus 2.218 s in the earlier run. No steady-state regression is observed.
+Full samples, environment audit, source hashes and proposed commit grouping are
+in `image-tp-cleanup-20261114`.
+The earlier multi-GPU-count, platform and release-wheel validation limits still apply.

@@ -93,14 +93,38 @@ class QuantizedCheckpoint {
         requireCheckpoint(error.empty() && result.is_object(), "invalid quantization marker JSON");
         return result;
     }
-    // FP8/INT8 share byte-wise uploads. Image exports may store Q/K/V
-    // separately; video TP slices one packed projection before upload.
+    // Slice the logical [Q, K, V] layout before uploading. Image checkpoints
+    // can store three tensors or interleave whole heads in a single tensor.
     void uploadByteMatrices(const std::vector<json11::Json> &matrices, void *dest,
-                            const ProjectionSlice &slice) {
+                            const ProjectionSlice &slice, bool interleavedQkv = false) {
         if (slice.size > 1) {
-            requireCheckpoint(matrices.size() == 1, "packed video projection expected");
-            uploadSlice(matrices.front(), dest, slice, size_t(slice.fullCols), size_t(slice.cols),
-                        size_t(slice.firstColumn()));
+            if (matrices.size() == 1 && !interleavedQkv) {
+                uploadSlice(matrices.front(), dest, slice, size_t(slice.fullCols), size_t(slice.cols),
+                            size_t(slice.firstColumn()));
+                return;
+            }
+            std::vector<size_t> offsets{0};
+            for (const auto &matrix : matrices) {
+                requireCheckpoint(matrix["shape"][1].int_value() == slice.fullCols,
+                                  "inconsistent quantized matrix width");
+                offsets.push_back(offsets.back() + payloadBytes(matrix));
+            }
+            requireCheckpoint(offsets.back() == size_t(slice.fullRows) * slice.fullCols,
+                              "quantized matrix partition size mismatch");
+            requireCheckpoint(!interleavedQkv ||
+                                  (matrices.size() == 1 && slice.groups == 3 && slice.fullRows % 384 == 0),
+                              "invalid interleaved QKV partition");
+            slice.transfer([&](size_t offset, void *host, size_t bytes) {
+                if (interleavedQkv) {
+                    const size_t row = offset / slice.fullCols, width = slice.fullRows / 3;
+                    const size_t source = (row % width / 128) * 384 + row / width * 128 + row % 128;
+                    offset = source * slice.fullCols + offset % slice.fullCols;
+                }
+                const size_t index = std::upper_bound(offsets.begin(), offsets.end(), offset) - offsets.begin() - 1;
+                readRange(matrices.at(index), offset - offsets[index], host, bytes);
+            }, [&](size_t offset, const void *host, size_t bytes) {
+                uploadBuffer(static_cast<char *>(dest) + offset, host, bytes);
+            }, size_t(slice.fullCols), size_t(slice.cols), size_t(slice.firstColumn()));
             return;
         }
         size_t offset = 0;
@@ -119,10 +143,7 @@ class QuantizedCheckpoint {
         }
         slice.transfer([&](size_t offset, void *host, size_t bytes) { readRange(d,offset,host,bytes); },
             [&](size_t offset, const void *host, size_t bytes) {
-                auto e=cudaMemcpyAsync(static_cast<char *>(dest)+offset,host,bytes,
-                                       cudaMemcpyHostToDevice,cudaStreamPerThread);
-                if(e==cudaSuccess) e=cudaStreamSynchronize(cudaStreamPerThread);
-                if(e!=cudaSuccess) throw std::runtime_error(cudaGetErrorString(e));
+                uploadBuffer(static_cast<char *>(dest) + offset, host, bytes);
             }, sourceStride,targetStride,firstByte,rowUnit,positiveE4m3);
     }
     void upload(const json11::Json &d, void *dest, size_t bytes, bool positiveE4m3 = false) {
@@ -134,17 +155,20 @@ class QuantizedCheckpoint {
             if (positiveE4m3)
                 for (size_t i = 0; i < count; ++i)
                     requireCheckpoint(uint8_t(buffer[i]) <= 126, "invalid NVFP4 block scale");
-            auto status = cudaMemcpyAsync(static_cast<char *>(dest) + offset, buffer.data(), count,
-                                          cudaMemcpyHostToDevice, cudaStreamPerThread);
-            if (status == cudaSuccess)
-                status = cudaStreamSynchronize(cudaStreamPerThread);
-            if (status != cudaSuccess)
-                throw std::runtime_error(cudaGetErrorString(status));
+            uploadBuffer(static_cast<char *>(dest) + offset, buffer.data(), count);
             offset += count;
         }
     }
 
   private:
+    // Synchronize before reusing the bounded host staging buffer.
+    static void uploadBuffer(void *dest, const void *host, size_t bytes) {
+        auto status = cudaMemcpyAsync(dest, host, bytes, cudaMemcpyHostToDevice, cudaStreamPerThread);
+        if (status == cudaSuccess)
+            status = cudaStreamSynchronize(cudaStreamPerThread);
+        if (status != cudaSuccess)
+            throw std::runtime_error(cudaGetErrorString(status));
+    }
     static bool integer(const json11::Json &v, uint64_t upper) {
         return v.is_number() && std::isfinite(v.number_value()) && v.number_value() >= 0 &&
                std::floor(v.number_value()) == v.number_value() && v.number_value() <= double(upper);

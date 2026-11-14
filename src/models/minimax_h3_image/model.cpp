@@ -100,17 +100,27 @@ Transformer::Transformer(Runtime &rt, Runtime &full, const std::string &dir, nom
       fullWeights_(full, minimax_h3::componentWeights(dir + "/transformer")),
       heads_(full, dir + "/pdd_fused_heads.safetensors"), parallel_(parallel),
       sequenceParallel_(sequenceParallel && parallel.size() > 1) {
+    if (56 % parallel_.size() || 14336 % parallel_.size())
+        throw std::invalid_argument("image attention heads and FFN width must divide TP size");
     if (!quantizedWeights.empty()) {
-        if (parallel.size() > 1 && !sequenceParallel_)
-            throw std::invalid_argument(
-                "quantized image DiT supports multi-GPU SP, not TP; use --parallel-mode auto or sp");
-        quantized_ = QuantizedWeights::load(quantizedWeights);
+        const auto format = inspectWeightFormat(quantizedWeights);
+        ProjectionOptions options;
+        if (!sequenceParallel_) {
+            options.rank = parallel_.rank;
+            options.size = parallel_.size();
+            if ((format == WeightFormat::INT8 || format == WeightFormat::GGUF) &&
+                (7168 / options.size) % 256)
+                throw std::invalid_argument("image TP input shard is not H256/block aligned; use TP2/TP4 or SP");
+            if (options.size > 1 && format == WeightFormat::NVFP4)
+                options.activationMaximum = [parallel](Tensor &x) {
+                    parallel.group->maximum(x, parallel.rank);
+                };
+        }
+        quantized_ = QuantizedWeights::load(quantizedWeights, format, options);
         quantized_->validateModel();
     }
     if (sequenceParallel_ && rt_.dtype() != DType::BF16)
         throw std::invalid_argument("image sequence parallelism requires BF16");
-    if (56 % parallel_.size() || 14336 % parallel_.size())
-        throw std::invalid_argument("image attention heads and FFN width must divide TP size");
     auto partition = [&](const std::string &p) {
         if (sequenceParallel_)
             return;
@@ -226,6 +236,17 @@ Tensor Transformer::attention(const Tensor &x, const std::string &p, const Tenso
         (p.compare(0, 7, "blocks.") == 0 ||
          (quantized_->format() == WeightFormat::GGUF && p.compare(0, 21, "token_refiner.blocks.") == 0));
     auto project = [&](const Tensor &y) {
+        if (quantized && !sequenceParallel_ && parallel_.size() > 1) {
+            auto reduction = parallel_;
+            // Rounding NVFP4 attention partials before summation perturbs the
+            // next FFN's global scale. Keep this intermediate reduction FP32;
+            // the FFN output still uses the selected communication precision.
+            if (quantized_->format() == WeightFormat::NVFP4)
+                reduction.rowReduction = nomas::RowReduction::FP32;
+            Tensor partial(y.rows, 5376, reduction.partialType(y.dtype));
+            quantized_->linear(y, p + ".out_proj", &partial);
+            return reduction.finishRow(rt_, weights_, std::move(partial), p + ".out_proj", y.dtype);
+        }
         if (quantized)
             return quantized_->linear(y, p + ".out_proj");
         if (sequenceParallel_)
@@ -306,16 +327,16 @@ Tensor Transformer::feedForward(const Tensor &x, const std::string &p) {
         const auto part = x.rowSlice(first, n);
         auto y = gatedSilu(quantized ? quantized_->linear(part, p + ".fc1") : weights_.linear(part, p + ".fc1"));
         auto target = out.rowSlice(first, n);
-        if (sharded) {
-            parallel_.rowPartial(rt_, weights_, y, p + ".fc2", target);
-            if (overlap) {
-                auto result = reduced.rowSlice(first, n);
-                parallel_.finishRowAsync(rt_, weights_, target, p + ".fc2", result);
-            }
-        } else if (quantized) {
+        if (quantized) {
             quantized_->linear(y, p + ".fc2", &target);
+        } else if (sharded) {
+            parallel_.rowPartial(rt_, weights_, y, p + ".fc2", target);
         } else {
             weights_.linear(y, p + ".fc2", false, &target);
+        }
+        if (overlap) {
+            auto result = reduced.rowSlice(first, n);
+            parallel_.finishRowAsync(rt_, weights_, target, p + ".fc2", result);
         }
         first += n;
     }
@@ -887,9 +908,6 @@ Pipeline::Pipeline(const std::string &model, int device, DType vaeType, double g
     if (parallelMode != "auto" && parallelMode != "tp" && parallelMode != "sp")
         throw std::invalid_argument("image parallel mode must be auto, tp or sp");
     if (!source_.quantizedWeights.empty()) {
-        if (devices_.size() > 1 && parallelMode == "tp")
-            throw std::invalid_argument(
-                "quantized image DiT supports multi-GPU SP, not TP; use --parallel-mode auto or sp");
         for (int gpu : devices_.empty() ? std::vector<int>{device} : devices_)
             QuantizedWeights::validateDevice(source_.format, gpu, devices_.size() > 1);
     }

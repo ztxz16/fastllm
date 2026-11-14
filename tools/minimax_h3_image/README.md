@@ -48,8 +48,8 @@ CUDA_VISIBLE_DEVICES=4,5 build/src/models/minimax_h3/minimax_h3_image_server \
 
 FP8 needs CUDA 11.8+ and SM89+. The fused SM120 CUTLASS backend uses the normal
 CUDA library environment. Only the cuBLAS FP8 fallback on multiple Blackwell GPUs
-requires cuBLAS 13.2.1+ to avoid CUB-9487; the loader checks that path's library version. Multi-GPU quantized DiT uses SP
-(`auto` selects it); explicit TP is unsupported. Existing GPU/host budgets apply,
+requires cuBLAS 13.2.1+ to avoid CUB-9487; the loader checks that path's library version. Multi-GPU quantized DiT supports SP and TP. `auto` keeps SP as the default;
+`--parallel-mode tp` shards the compressed projection weights across devices. Existing GPU/host budgets apply,
 including layer streaming. Quantized file reads use bounded staging and no persistent CPU
 weight cache. `/health` reports `dit_precision`; the studio displays it. Text-to-image,
 single-reference edits and multi-reference requests use the same API in every supported precision.
@@ -94,7 +94,7 @@ No tuning flag or environment variable is needed.
 Both paths use the image TensorPool. MMQ's Q8 and FP32 staging buffers are each
 bounded to 64 MiB; BF16 decoding uses at most 56 MiB for this model. There is no
 persistent expanded weight cache or second weight quantization. Existing layer
-streaming, host-memory limits and multi-GPU SP apply. Text-to-image,
+streaming, host-memory limits and multi-GPU TP/SP apply. Text-to-image,
 single/multiple reference editing, cancellation and the studio use the existing
 API; `/health` reports `dit_precision: "gguf"`.
 
@@ -134,7 +134,13 @@ architectures, rank counts and sequence sizes retain serial group execution. Nat
 pools explicitly grant access to participating peer-capable devices for direct peer copies.
 BF16 low-memory mode uses tensor-parallel weight shards and layer streaming instead.
 `--parallel-mode tp|sp` selects either mode explicitly; BF16 SP requires at least 60 GiB available
-per device. The final PDD projection runs on local rows before gathering the 96-wide velocity, avoiding a full hidden-state exchange. The reference VAE encoder and sampler use the first device. Resident BF16 VAE
+per device. Quantized FP8 and NVFP4 TP support 2/4/8-way partitions; INT8
+and GGUF TP support 2/4 because their input shards must remain H256/block aligned
+(use SP for eight devices). Two-device execution is validated; four/eight-device
+execution has not been tested. QKV partitions split each Q/K/V group, and FFN
+partitions split gate/value together. NVFP4 TP shares the activation maximum across
+ranks before quantization. Refiners keep native precision except for GGUF.
+The final PDD projection runs on local rows before gathering the 96-wide velocity, avoiding a full hidden-state exchange. The reference VAE encoder and sampler use the first device. Resident BF16 VAE
 decoding splits independent tiles across devices, preserving tile order and blend boundaries.
 The build must find NCCL (`FASTLLM_NCCL_INCLUDE_DIR` and `FASTLLM_NCCL_LIBRARY` can point
 to a nonstandard installation). Inference remains native C++/CUDA/NCCL without Torch.
@@ -148,7 +154,9 @@ CUDA_VISIBLE_DEVICES=4,5 build/src/models/minimax_h3/minimax_h3_image_generate \
 
 In TP mode, `--tp-reduction activation` is the default: it rounds DiT row-projection partials to BF16 before
 reduction to reduce communication. `--tp-reduction fp32` retains FP32 partials until after their
-sum. Both retain FP32 accumulation in GEMMs; text-encoder reductions always use FP32.
+sum. NVFP4 attention output always reduces in FP32 to keep the following FFN
+activation scale stable; its FFN output still uses the selected reduction precision.
+Both retain FP32 accumulation in GEMMs; text-encoder reductions always use FP32.
 Changing rank count or reduction precision can change generated pixels. Checkpoint tests compare
 each block with identical input tensors using relative L2, and report accumulated drift separately.
 The GPU limit applies to **each device**; all ranks share one host-cache budget. The launcher maps
@@ -207,7 +215,8 @@ Cancelling or failing a request drops the prepared model state so that a later r
 
 With no host limit (or `0`), a shared weight cache uses at most one quarter of available host/container memory minus a 2 GiB working allowance, capped at 64 GiB. Detection respects the process's cgroup v1/v2 quota and visible parent quotas, including sibling usage. Explicit host limits must be at least 2 GiB: `2` disables weight caching; larger values allow caching within the remaining quota. Text, vision, reference encoding, DiT and VAE share the quota and load uncached tensors in at most 16 MiB chunks without whole-weight mmap reads. VAE output tiles are decoded in bounded batches (one tile in low-memory mode) and combined a row at a time. The host option bounds **weight caching**, not total process RSS: image buffers, queued uploads, tokenizer, CUDA runtime and filesystem cache also need memory. Low budgets trade speed for capacity.
 
-`GET /health` reports `gpu_memory_limit_gib`, `host_memory_limit_gib`, `gpu_memory_reserved`, `layer_streaming`, `host_weight_cache_gib`, `tensor_parallel_size` (text encoder), `sequence_parallel_size` and `dit_parallel_mode`. A reported limit of zero means automatic policy; the cache field reports its effective capacity. CLI VAE diagnostics use the same policy. Inference remains native C++/CUDA, without a Torch dependency.
+`GET /health` reports `gpu_memory_limit_gib`, `host_memory_limit_gib`, `gpu_memory_reserved`, `layer_streaming`, `host_weight_cache_gib`, `tensor_parallel_size` (text encoder), `sequence_parallel_size`, `dit_parallel_mode`,
+`dit_tensor_parallel_size` and `dit_sequence_parallel_size`. A reported limit of zero means automatic policy; the cache field reports its effective capacity. CLI VAE diagnostics use the same policy. Inference remains native C++/CUDA, without a Torch dependency.
 
 ## Web demo and HTTP API
 
@@ -289,6 +298,17 @@ dispatch boundaries, scratch release and allocator reuse:
 ```bash
 CUDA_VISIBLE_DEVICES=4,5 build/src/models/minimax_h3/minimax_h3_image_parallel /path/to/MiniMax-H3-Image sp
 CUDA_VISIBLE_DEVICES=4,5 build/src/models/minimax_h3/minimax_h3_image_parallel /path/to/MiniMax-H3-Image activation
+```
+
+Build `minimax_h3_image_quantized_parallel` for real quantized-checkpoint tests.
+It checks all 50 blocks on identical inputs against single-GPU execution, including
+two asymmetric references, plus a two-block 4096-row FFN boundary check. Both
+reduction precisions and streaming reloads are covered. The per-block relative L2 bound is `0.05`, output heads `0.01`;
+uncorrected accumulated drift is reported separately. BF16 tests retain `0.01`.
+
+```bash
+CUDA_VISIBLE_DEVICES=6,7 build/src/models/minimax_h3/minimax_h3_image_quantized_parallel /path/to/image.safetensors tp activation resident
+CUDA_VISIBLE_DEVICES=6,7 build/src/models/minimax_h3/minimax_h3_image_quantized_parallel /path/to/image.gguf tp fp32 stream
 ```
 
 The HTTP regression suite does not load a model or use a GPU. It checks authenticated history restoration beyond 128 results, invalid/incomplete sidecars and the packaged demo asset layout. The frontend state test checks exact output aspect ratios, overlapping uploads and submitting/reusing while references are being prepared.

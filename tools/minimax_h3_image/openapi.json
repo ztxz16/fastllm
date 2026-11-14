@@ -399,6 +399,16 @@
               "gguf"
             ],
             "description": "Main DiT projection precision selected at startup; text, VAE and sensitive projections retain native precision."
+          },
+          "dit_tensor_parallel_size": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "DiT tensor-parallel rank count, or 1 in SP mode."
+          },
+          "dit_sequence_parallel_size": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "DiT sequence-parallel rank count; same as sequence_parallel_size."
           }
         }
       }

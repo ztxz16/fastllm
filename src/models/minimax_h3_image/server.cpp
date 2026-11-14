@@ -248,6 +248,8 @@ class Service {
                             {"tensor_parallel_size", parallelSize_},
                             {"sequence_parallel_size", sequenceParallel_.load() ? parallelSize_ : 1},
                             {"dit_parallel_mode", sequenceParallel_.load() ? "sp" : "tp"},
+                            {"dit_tensor_parallel_size", sequenceParallel_.load() ? 1 : parallelSize_},
+                            {"dit_sequence_parallel_size", sequenceParallel_.load() ? parallelSize_ : 1},
                             {"gpu_memory_reserved", ready_.load() && gpuLimit_ > 0},
                             {"layer_streaming", streaming_.load()},
                             {"host_weight_cache_gib", hostCacheGiB_.load()}};

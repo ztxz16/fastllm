@@ -237,7 +237,8 @@ struct Fp8Weights::Impl : detail::QuantizedCheckpoint {
         w.rows=slice.rows; w.cols=slice.cols;
         if(options.size>1) scales=slice.scales(scales);
         w.bytes = Tensor(w.rows, w.cols / 2);
-        uploadByteMatrices(matrices, w.bytes.data, slice);
+        const bool interleavedQkv = qkv && !unsloth && !nativePackedQkv;
+        uploadByteMatrices(matrices, w.bytes.data, slice, interleavedQkv);
         // Diffusers stores [value, gate]; the original H3 uses [gate, value].
         // Apply the identical row permutation to both payload and per-row scales.
         if (unsloth && name.find(".fc1") != std::string::npos) {
@@ -250,7 +251,7 @@ struct Fp8Weights::Impl : detail::QuantizedCheckpoint {
             w.bytes = std::move(ordered);
             std::rotate(scales.begin(), scales.begin() + w.rows / 2, scales.end());
         }
-        if (qkv && !unsloth && !nativePackedQkv) {
+        if (interleavedQkv && options.size == 1) {
             Tensor ordered(w.rows, w.cols / 2);
             packQkv<<<4096, 256, 0, cudaStreamPerThread>>>(reinterpret_cast<uint32_t *>(w.bytes.data),
                                                            reinterpret_cast<uint32_t *>(ordered.data), w.rows,

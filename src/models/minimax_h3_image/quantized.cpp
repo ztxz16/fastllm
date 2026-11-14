@@ -9,8 +9,7 @@ std::unique_ptr<QuantizedWeights> QuantizedWeights::load(const std::string &path
 }
 std::unique_ptr<QuantizedWeights> QuantizedWeights::load(const std::string &path, WeightFormat format,
                                                        const ProjectionOptions &options) {
-    if (options.size < 1 || options.rank < 0 || options.rank >= options.size ||
-        (!options.comfyVideo && options.size != 1))
+    if (options.size < 1 || options.rank < 0 || options.rank >= options.size)
         throw std::invalid_argument("invalid quantized projection partition");
     switch (format) {
     case WeightFormat::FP8:

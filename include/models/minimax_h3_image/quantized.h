@@ -3,9 +3,9 @@
 #include "models/minimax_h3_image/source.h"
 
 namespace fastllm::minimax_h3_image {
-// The video adapter validates the complete model before selecting a backend
-// per projection. Comfy QKV is packed, and TP slices checkpoint bytes before
-// upload. Default options preserve the image loaders' existing contracts.
+// TP slices checkpoint bytes before upload for both image and video models.
+// The video adapter validates its mixed projections separately; image readers
+// retain their format-specific validation and QKV/FFN layout conversions.
 struct ProjectionOptions {
     bool comfyVideo = false;
     int rank = 0, size = 1;
