@@ -47,3 +47,16 @@ python3 test/distributed/benchmark_allreduce.py smoke --python "$AR_PYTHON" \
 process_allreduce.cu，不构建模型或复制 CUDA kernel。vLLM 使用已有 Python/扩展
 正式入口；需要本地对应版本支持 register_graph_buffers 参数。不修改已安装 vLLM。
 所有 worker 运行于独立进程组，超时或退出后有界终止和回收整组。
+
+第四步（数值验证，三种模式分别建立通信组）：
+
+```bash
+python3 test/distributed/benchmark_allreduce.py correctness --python "$AR_PYTHON" \
+  --pair 0,1 --timeout 900 --output "$AR_RUN/04-correctness"
+```
+
+输入由同一份纯 CPU 代码按固定种子生成，两后端收到相同 FP32 字节。
+普通输入先用 CPU FP64 求和，再舍入为 FP32，逐元素要求相等；报告中的绝对误差
+仍相对 FP64 值计算，因此 PASS 时可能有正常的 FP32 舍入误差。NaN/Inf 单独按类别
+比较，不进入有限值误差均值。每张卡均检查实际输出，记录输入指纹和首批失败元素。
+Graph capture/warmup 位于计数检查区间外；重放更新 GPU 同步序号，不重建通信组。

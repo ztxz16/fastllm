@@ -11,6 +11,7 @@ def rank_main(rank, job):
     import torch
     import torch.distributed as dist
     from .backends import Native, Vllm
+    from .operation import validate
 
     directory = Path(job["directory"])
     result_file = directory / f"rank{rank}.jsonl"
@@ -22,11 +23,26 @@ def rank_main(rank, job):
     group = dist.group.WORLD
     stream = torch.cuda.Stream(device=device)
     with torch.cuda.stream(stream):
-        if job["backend"] == "vllm":
-            backend = Vllm(device, group, job["mode"])
-        else:
-            backend = Native(job["native"], device, stream, rank, group,
-                             mode=1 if job["backend"] == "ft" else 0)
+        try:
+            if job["backend"] == "vllm":
+                backend = Vllm(device, group, job["mode"])
+            else:
+                backend = Native(job["native"], device, stream, rank, group,
+                                 mode=1 if job["backend"] == "ft" else 0)
+        except Exception as exc:
+            if "expected_init_error" not in job:
+                raise
+            passed = job["expected_init_error"] in str(exc)
+            row = dict(stage=job["stage"], case=job["cases"][0]["case"], n=0, rank=rank,
+                       devices=job["devices"], backend=job["backend"], mode=job["mode"],
+                       status="PASS" if passed else "FAIL", reason=str(exc), path="rejected")
+            result_file.write_text(json.dumps(row) + "\n")
+            if not passed:
+                raise
+            dist.destroy_process_group()
+            return
+        if "expected_init_error" in job:
+            raise RuntimeError("非法配置未按约定拒绝")
         meta = {"rank": rank, "device": device, "device_name": torch.cuda.get_device_name(device),
                 "torch": torch.__version__, "cuda": torch.version.cuda,
                 "torch_nccl": torch.cuda.nccl.version(), "backend": backend.metadata()}
@@ -35,27 +51,27 @@ def rank_main(rank, job):
             if meta["backend"]["nccl_version"] != major * 10000 + minor * 100 + patch:
                 raise RuntimeError("native adapter 与 PyTorch 的 NCCL 版本不一致")
         (directory / f"rank{rank}.metadata.json").write_text(json.dumps(meta, indent=2))
+        cache = {}
         with result_file.open("w", buffering=1) as results:
             for case in job["cases"]:
                 row = dict(stage=job["stage"], case=case["case"], n=case["n"], rank=rank,
                            devices=job["devices"], backend=job["backend"], mode=job["mode"])
                 try:
-                    data = torch.full((case["n"],), rank + 1, dtype=torch.float32, device=device)
-                    before = backend.info()
-                    output = backend(data)
-                    actual = output.cpu()
-                    expected = len(job["devices"]) * (len(job["devices"]) + 1) / 2
-                    error = (actual.double() - expected).abs()
-                    row.update(max_abs_error=float(error.max()), mean_abs_error=float(error.mean()),
-                               failed_elements=int((error != 0).sum()), path=backend.path(case["n"]),
-                               counters_before=before, counters_after=backend.info())
-                    if before is not None:
-                        after = row["counters_after"]
-                        if after["custom"] - before["custom"] != 1 or after["nccl"] != before["nccl"]:
-                            raise RuntimeError("FT GPU 计数没有证明一次自定义调用")
-                    row["status"] = "PASS" if not row["failed_elements"] else "FAIL"
-                    if row["path"] != ("nccl" if job["backend"] == "nccl" else job["backend"] + "_custom"):
-                        raise RuntimeError("smoke 没有执行要求的自定义路径")
+                    if case.get("action") == "reject_zero":
+                        before = backend.info()
+                        try:
+                            backend(torch.empty(0, dtype=torch.float32, device=device))
+                        except RuntimeError as exc:
+                            if "invalid AllReduce input" not in str(exc):
+                                raise
+                        else:
+                            raise RuntimeError("零长度没有被拒绝")
+                        if backend.info() != before:
+                            raise RuntimeError("拒绝路径修改了 GPU 通信计数")
+                        row.update(status="PASS", path="rejected", max_abs_error=0.0,
+                                   mean_abs_error=0.0, failed_elements=0)
+                    else:
+                        row.update(validate(case, job, backend, cache, device, rank, stream))
                 except Exception as exc:
                     row.update(status="FAIL", reason=str(exc))
                     results.write(json.dumps(row, allow_nan=False) + "\n")
@@ -65,6 +81,9 @@ def rank_main(rank, job):
                     raise RuntimeError("AllReduce output mismatch")
         stream.synchronize()
         dist.barrier(group=group)
+        for operation in cache.values():
+            operation.close()
+        cache.clear()
         backend.close()
     dist.destroy_process_group()
 

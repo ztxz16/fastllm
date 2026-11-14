@@ -12,6 +12,20 @@ SCRIPT = Path(__file__).with_name("benchmark_allreduce.py")
 
 
 class PlanTests(unittest.TestCase):
+    def test_reference_detects_stale_results_and_nonfinite_corruption(self):
+        from array import array
+        from allreduce_bench.data import compare, inputs
+        first = inputs(32, "changed", 12, 0)
+        second = inputs(32, "changed", 12, 1)
+        old_output = array("f", [a + b for a, b in zip(*first)])
+        self.assertEqual(compare(old_output, first)["failed_elements"], 0)
+        self.assertEqual(compare(old_output, second)["failed_elements"], 32)
+        special = inputs(14, "special", 12)
+        output = array("f", [a + b for a, b in zip(*special)])
+        self.assertEqual(compare(output, special)["failed_elements"], 0)
+        output[0] = 0
+        self.assertEqual(compare(output, special)["failed_elements"], 1)
+
     def test_missing_peer_result_cannot_be_reported_as_pass(self):
         from allreduce_bench.execution import collect
         with tempfile.TemporaryDirectory() as directory:

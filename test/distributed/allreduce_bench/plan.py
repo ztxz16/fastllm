@@ -59,3 +59,23 @@ def plan_rows():
     ]
     return [dict(case=name, stage=stage, status="PLANNED", reason=reason)
             for name, stage, reason in specs]
+
+
+def correctness_cases(mode, stress_iterations=10000):
+    result = []
+    for pattern in ("zeros", "known", "alternating", "cancel", "near_cancel", "mixed"):
+        for n in (4, 256, 4096, 65536):
+            result.append(dict(case=f"{pattern}_n{n}", n=n, pattern=pattern))
+    for n in CORE_SIZES:
+        result.append(dict(case=f"random_n{n}", n=n, pattern="random"))
+    for prefix, sizes in (("boundary", BOUNDARY_SIZES), ("unaligned", UNALIGNED_SIZES)):
+        for n in sizes:
+            result.append(dict(case=f"{prefix}_n{n}", n=n, pattern="random"))
+    result.append(dict(case="special_n256", n=256, pattern="special"))
+    result.append(dict(case="repeat_changed_input", n=256, pattern="changed", changes=stress_iterations))
+    result.append(dict(case="repeat_vary_shapes", n=65540, pattern="changed", changes=18,
+                       lengths=[4, 4096, 256, 65536, 65540, 16]))
+    if mode != "eager":
+        for n in (4, 4096, 65536):
+            result.append(dict(case=f"graph_new_input_n{n}", n=n, pattern="random", changes=5))
+    return result
