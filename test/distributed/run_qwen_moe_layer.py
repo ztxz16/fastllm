@@ -7,6 +7,7 @@ import json
 import math
 import os
 from pathlib import Path
+import random
 import shlex
 import sys
 import uuid
@@ -76,6 +77,7 @@ def cases():
               ("hotspot", dict(hotspot=True, topk=1)),
               ("topk_all", dict(experts=5, topk=5, normalize=True)),
               ("official_expert_counts", dict(experts=60, topk=4)),
+              ("attention_fp16_rounding", dict(bias=False, attention_rounding=True)),
               ("context_boundary", dict(boundary=True))]
     for name, patch, reason in [
         ("quantized", {"quantization_config": {}}, "quantized checkpoints"),
@@ -110,6 +112,17 @@ def make_case(directory, spec, world):
     config, tensors = fixture(directory / "model", **options)
     config.update(spec.get("config", {}))
     tasks = tasks_for(world, spec.get("hotspot", False))
+    if spec.get("attention_rounding"):
+        # 放大有限Q/K和V/O投影，令缺失FP16舍入的Attention在既定阈值下可被检出。
+        for name, tensor in tensors.items():
+            scale = 8 if name.endswith(('q_proj.weight', 'k_proj.weight')) else (
+                16 if name.endswith(('v_proj.weight', 'o_proj.weight')) else 1)
+            tensor['data'] = encode([x*scale for x in decode(tensor['data'], tensor['dtype'])], tensor['dtype'])
+        rng = random.Random(20261114)
+        inputs = [dict(position_begin=0, hidden=[rng.uniform(-1, 1) for _ in range(count*8)])
+                  for count in (17, 0, 1, 9)]
+        tasks = [dict(name=f'attention_rounding_stage{stage}', layer=0, hidden=8, stage=stage,
+                      inputs=copy.deepcopy(inputs[:world])) for stage in (1, 0)]
     if spec.get("missing"):
         del tensors["model.layers.0.mlp.experts.4.down_proj.weight"]
     if spec.get("nan_weight"):

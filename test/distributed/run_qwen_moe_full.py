@@ -59,11 +59,61 @@ def compare_trace(report, reference, metrics, atol, rtol, label):
             metrics['count'] += 1
             metrics['failed'] += int(mismatch)
             bad += int(mismatch)
-        require(not bad, f'{label} step={index} input_length={len(ids)} backend={step["execution"]}: {bad} failed logits')
+        if bad:
+            errors = [abs(a-b) if math.isfinite(a) and math.isfinite(b) else float('inf')
+                      for a, b in zip(actual, expected)]
+            worst = max(range(len(errors)), key=errors.__getitem__)
+            raise AssertionError(f'{label} step={index} input_length={len(ids)} backend={step["execution"]}: '
+                                 f'{bad} failed logits; max_abs={errors[worst]:.9g} '
+                                 f'mean_abs={sum(errors)/len(errors):.9g}; worst_vocab_id={worst} '
+                                 f'actual={actual[worst]:.9g} expected={expected[worst]:.9g}')
         require(step['token_id'] == max(range(len(actual)), key=lambda i: actual[i]), f'{label}: invalid greedy token')
         forced = report.get('teacher_forced_tokens')
         if index < len(report['steps']) - 1:
             ids.append(forced[index] if forced is not None else step['token_id'])
+
+
+def align_tied_routing(actual, expected, tokens, experts, topk):
+    """/**
+     * 仅为同分专家的槽位置换对齐比较权重，不修改任何后端的路由或原始证据。
+     * 两侧必须选择相同且无重复的专家集合，置换槽位在两侧各自的router logits
+     * 中均须严格同分。不同集合、非同分换序、非法ID或形状立即拒绝。
+     * @param actual FastLLM层的原始诊断字段。
+     * @param expected HF层的原始参考字段。
+     * @param tokens 本rank真实Token数。
+     * @param experts 模型专家数。
+     * @param topk 每Token选择数。
+     * @return 按参考专家顺序排列的实际权重副本，以及同分置换槽位数。
+     */"""
+    require(tokens >= 0 and 1 <= topk <= experts, 'invalid routing dimensions')
+    for name, values in (('actual', actual), ('reference', expected)):
+        for field, size in (('selected_experts', tokens*topk), ('routing_weights', tokens*topk),
+                            ('router_logits', tokens*experts)):
+            require(len(values[field]) == size, f'{name}/{field}: shape mismatch')
+        for expert in values['selected_experts']:
+            require(isinstance(expert, (int, float)) and not isinstance(expert, bool)
+                    and math.isfinite(expert) and int(expert) == expert and 0 <= expert < experts,
+                    f'{name}/selected_experts: invalid ID {expert}')
+        require(all(math.isfinite(value) for value in values['router_logits']),
+                f'{name}/router_logits: nonfinite value')
+
+    aligned, permutations = [], 0
+    for token in range(tokens):
+        start = token*topk
+        a = [int(x) for x in actual['selected_experts'][start:start+topk]]
+        b = [int(x) for x in expected['selected_experts'][start:start+topk]]
+        require(len(set(a)) == topk and len(set(b)) == topk,
+                f'token={token}/selected_experts: duplicate expert')
+        require(set(a) == set(b), f'token={token}/selected_experts: different sets actual={a} reference={b}')
+        for left, right in zip(a, b):
+            if left != right:
+                require(all(values['router_logits'][token*experts+left] ==
+                            values['router_logits'][token*experts+right]
+                            for values in (actual, expected)),
+                        f'token={token}/selected_experts: non-tied permutation actual={a} reference={b}')
+                permutations += 1
+        aligned.extend(actual['routing_weights'][start+a.index(expert)] for expert in b)
+    return aligned, permutations
 
 
 class Suite:
@@ -239,6 +289,7 @@ class Suite:
         """/** 同一HF层输入送入正式单层路径，比较全部层的Router/专家/隐藏输出。 */"""
         directory = self.output / 'real-layers'
         directory.mkdir()
+        config = json.loads((model / 'config.json').read_text())
         tasks = [{k: v for k, v in row.items() if k != 'reference'} for row in layers]
         (directory / 'tasks.json').write_text(json.dumps(tasks))
         def run(metrics):
@@ -253,16 +304,29 @@ class Suite:
             report = parse_report((directory / 'stdout.log').read_text())
             require(code == 0 and report['status'] == 'PASS' and report.get('workers_reaped'), 'real layer process failed')
             require(len(report['results']) == len(layers), 'missing real layer results')
-            failures = []
+            failures, permutations = [], 0
             for layer, actual in zip(layers, report['results']):
                 require(actual['task'] == layer['name'] and len(actual['ranks']) == 4, 'layer/rank mismatch')
                 for rank, (values, ref) in enumerate(zip(actual['ranks'], layer['reference'])):
+                    aligned_weights = None
+                    try:
+                        aligned_weights, moved = align_tied_routing(values, ref,
+                            len(layer['inputs'][rank]['hidden']) // layer['hidden'],
+                            config['num_experts'], config['num_experts_per_tok'])
+                        permutations += moved
+                    except AssertionError as error:
+                        failures.append(f'{layer["name"]}/rank{rank}/{error}')
+                        metrics['failed'] += 1
                     for field, expected in ref.items():
+                        # 专家ID是类别，不能把ID相减计入浮点张量的max/mean误差。
+                        if field == 'selected_experts':
+                            continue
                         require(len(values[field]) == len(expected), f'{layer["name"]} rank{rank} {field} shape')
+                        observed = aligned_weights if field == 'routing_weights' and aligned_weights is not None else values[field]
                         bad = 0
-                        for a, b in zip(values[field], expected):
+                        for a, b in zip(observed, expected):
                             error = abs(a-b) if math.isfinite(a) and math.isfinite(b) else float('inf')
-                            wrong = not math.isfinite(error) or error > (0 if field == 'selected_experts' else .05 + .01*abs(b))
+                            wrong = not math.isfinite(error) or error > .05 + .01*abs(b)
                             bad += int(wrong)
                             metrics['max'] = max(metrics['max'], error)
                             metrics['sum'] += error
@@ -271,7 +335,8 @@ class Suite:
                         if bad:
                             failures.append(f'{layer["name"]}/rank{rank}/{field}: {bad}')
             require(not failures, '; '.join(failures))
-            return dict(tasks=len(layers), native_report=str(directory / 'stdout.log'), workers=report['workers'])
+            return dict(tasks=len(layers), native_report=str(directory / 'stdout.log'), workers=report['workers'],
+                        tied_routing_slots=permutations)
         self.case('real_all_layers_router_experts_outputs', run)
 
     def performance(self, model):

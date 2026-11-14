@@ -127,7 +127,9 @@ __global__ void AppendKV(const half *qkv, half *cache, int count, int width, int
 /**
  * 计算一个 token/head 的 causal attention，支持请求内 KV 与无缓存重算。
  *
- * QK 点积、softmax、加权 V 均 FP32 累加，输出 FP16。按全局 Q 头编号映射 KV，
+ * QK 点积、softmax、加权 V 均 FP32 累加，输出 FP16。MoE 另保留 HF Eager 的
+ * 点积、缩放和概率 FP16 舍入边界，避免更高精度的中间值改变后续专家路由。
+ * 按全局 Q 头编号映射 KV，
  * 支持 KV 头复制及不均匀 Q 分片。共享内存只存 <=2048 个概率，不创建 T*T*H 张量。
  * @param qkv FP16 [T,(qHeads+2*kvHeads)*dim]，Q/K 已归一化并旋转。
  * @param context FP16 [T,qHeads*dim] 输出。
@@ -139,10 +141,12 @@ __global__ void AppendKV(const half *qkv, half *cache, int count, int width, int
  * @param groupSize 全局 Q 头数除以全局 KV 头数。
  * @param cache 可空的 FP16 [capacity,2,kvHeads,dim]；非空时当前 token 的 KV 已追加。
  * @param past 当前输入之前已缓存的长度；无缓存时为零。
+ * @param fp16Attention true 对齐 Qwen2 MoE Eager 的 FP16 中间张量；false 保留 dense 路径。
  * @param decodeMeta 可空的 GPU uint32[2]；Graph 重放时读取实际历史长度。
  */
 __global__ void Attention(const half *qkv, half *context, int qHeads, int kvHeads, int dim,
-                          int qBegin, int kvBegin, int groupSize, const half *cache, int past, const uint32_t *decodeMeta = nullptr) {
+                          int qBegin, int kvBegin, int groupSize, const half *cache, int past,
+                          bool fp16Attention, const uint32_t *decodeMeta = nullptr) {
     if (decodeMeta) past = decodeMeta[0];
     __shared__ float probabilities[kQwen3MaxContextTokens];
     int head = blockIdx.x % qHeads, token = blockIdx.x / qHeads;
@@ -157,7 +161,13 @@ __global__ void Attention(const half *qkv, half *context, int qHeads, int kvHead
             dot += __half2float(qkv[token * stride + head * dim + d]) *
                    __half2float(keys[key * kvStride + kv * dim + d]);
         }
-        probabilities[key] = dot * rsqrtf(float(dim));
+        if (fp16Attention) {
+            // HF 先得到 FP16 matmul 结果，再执行独立缩放；不能合并两次舍入。
+            dot = __half2float(__float2half_rn(dot));
+            probabilities[key] = __half2float(__float2half_rn(dot * rsqrtf(float(dim))));
+        } else {
+            probabilities[key] = dot * rsqrtf(float(dim));
+        }
     }
     __syncthreads();
     if (threadIdx.x == 0) {
@@ -171,6 +181,7 @@ __global__ void Attention(const half *qkv, half *context, int qHeads, int kvHead
         }
         for (int i = 0; i <= last; ++i) {
             probabilities[i] /= total;
+            if (fp16Attention) probabilities[i] = __half2float(__float2half_rn(probabilities[i]));
         }
     }
     __syncthreads();
@@ -586,7 +597,8 @@ struct Qwen3LayerExecutor::Impl {
                 AppendKV<<<(t*2*kw+255)/256,256,0,r.stream>>>(qkv, cache, t*2*kw, 2*kw, qw, past, decodeMeta);
             }
             Attention<<<t*qh,256,0,r.stream>>>(qkv, context, qh, kh, d, p.queryHeadBegin, p.kvHeadBegin,
-                                              p.queryHeads / p.kvHeads, cache, past, decodeMeta);
+                                              p.queryHeads / p.kvHeads, cache, past,
+                                              p.model == ShardModel::Qwen2Moe, decodeMeta);
             r.Linear(context, r.Weight(prefix + "self_attn.o_proj.weight", {hidden, uint64_t(qw)}), partial, t, h, qw, true);
             if (auto bias = r.Weight(prefix + "self_attn.o_proj.bias", {hidden}, true)) {
                 Bias<<<(t*h+255)/256,256,0,r.stream>>>(partial, bias, t*h, h);
