@@ -2,6 +2,7 @@
 """独立参考进程，仅加载本地权重，FP16/四卡按层分配；不导入FastLLM或修改其结果。"""
 
 import argparse
+from contextlib import ExitStack
 import json
 from pathlib import Path
 import os
@@ -64,64 +65,119 @@ def check_reference_placement(model, placement):
     return evidence
 
 
+def moe_routing_observer(torch):
+    """/**
+     * 创建仅观察HF MoE实际算子返回值的线程局部上下文，不重算Top-K。
+     * 每次调用原算子恰好一次并原样返回结果；保存实际专家ID、转型后的路由权重
+     * 和index_add_后的累加值。算子序列或共享专家合成关系不符时拒绝生成参考。
+     * @param torch 参考进程的PyTorch模块；主验收环境无需导入PyTorch。
+     * @return 需配合with使用的观察器，支持gate处begin与MoE输出处finish。
+     */"""
+    from torch.overrides import TorchFunctionMode
+
+    class Observer(TorchFunctionMode):
+        def __init__(self):
+            """/** 初始无活动MoE层，状态仅在一次完整MoE前向期间有效。 */"""
+            super().__init__()
+            self.active = None
+
+        def begin(self, record, label):
+            """/** 关联本层记录；拒绝嵌套或上层未结束的采集。 */"""
+            if self.active is not None:
+                raise RuntimeError(f'{label}: previous MoE observation did not finish')
+            self.active = dict(record=record, label=label, weights=None, topk=0, cast=0, adds=0)
+
+        def __torch_function__(self, func, types, args=(), kwargs=None):
+            """/** 原样执行一次公开算子，复制所需输出；不改动输入、返回值或累加精度。 */"""
+            result = func(*args, **(kwargs or {}))
+            state = self.active
+            if state is None:
+                return result
+
+            record = state['record']
+            if func is torch.topk:
+                state['topk'] += 1
+                state['weights'] = result[0]
+                record['selected_experts'] = result[1].detach().clone()
+            elif func is torch.Tensor.to and args and args[0] is state['weights']:
+                state['cast'] += 1
+                record['routing_weights'] = result.detach().clone()
+            elif func is torch.Tensor.index_add_:
+                state['adds'] += 1
+                record['routed_output'] = result.detach().clone()
+            return result
+
+        def finish(self, output):
+            """/** 核对实际路由覆盖与MoE合成结果，未识别的实现报出具体层及采集计数。 */"""
+            state, self.active = self.active, None
+            if state is None:
+                raise RuntimeError('MoE output observed without router input')
+            record, label = state['record'], state['label']
+            if state['topk'] != 1 or state['cast'] != 1 or state['adds'] == 0:
+                raise RuntimeError(f'{label}: unsupported HF routing operations: '
+                                   f'topk={state["topk"]}, cast={state["cast"]}, index_add={state["adds"]}')
+            expected_calls = record['selected_experts'].unique().numel()
+            if state['adds'] != expected_calls:
+                raise RuntimeError(f'{label}: expert accumulation count={state["adds"]}, expected={expected_calls}')
+
+            # 在模型实际执行设备和dtype上合成共享专家，避免CPU sigmoid的舍入差异。
+            shared = torch.sigmoid(record.pop('shared_gate')) * record.pop('shared')
+            record['shared_output'] = shared
+            actual = output[0] if isinstance(output, tuple) else output
+            combined = (record['routed_output'] + shared).reshape_as(actual)
+            if not torch.equal(combined, actual):
+                raise RuntimeError(f'{label}: captured routed/shared outputs do not reconstruct HF MoE output; '
+                                   f'shape={tuple(actual.shape)}, device={actual.device}, dtype={actual.dtype}')
+
+    return Observer()
+
+
 def layer_reference(model, torch):
     """/**
-     * 用HF真实完整前向的hook记录每层输入、Router、共享/路由专家及层输出。
-     * 兼容ModuleList专家与新版集合专家；只读观察，不替换forward或修改输入。
+     * 用HF真实完整前向记录各层输入、实际路由、共享/路由专家和层输出。
+     * 支持Linear gate与ModuleList专家的逐专家index_add_路径；拒绝未识别布局。
+     * 仅观察实际算子输出，不在CPU重选专家；退出或异常时卸载全部hook与观察器。
+     * @param model 已分配设备的HF参考模型，所有Decoder层均须为MoE。
+     * @param torch 参考环境的PyTorch模块。
      * @return 四个短序列的逐层参考，以及供正式单层公开入口使用的同一输入。
      */"""
     layers = model.model.layers
+    for index, layer in enumerate(layers):
+        if not isinstance(getattr(layer.mlp, 'gate', None), torch.nn.Linear) or not isinstance(
+                getattr(layer.mlp, 'experts', None), torch.nn.ModuleList):
+            raise RuntimeError(f'layer={index}: reference requires HF Linear gate and ModuleList experts')
     references = [[] for _ in layers]
     for rank, ids in enumerate(([1, 2], [2, 3, 4], [3], [4, 5, 6, 7])):
         records = [dict() for _ in layers]
-        handles = []
-        for index, layer in enumerate(layers):
-            record = records[index]
-            def before(module, args, kwargs, record=record):
-                value = args[0] if args else kwargs['hidden_states']
-                record['input'] = value.detach().cpu()
-            def output(module, args, value, record=record):
-                record['output'] = (value[0] if isinstance(value, tuple) else value).detach().cpu()
-            def gate(module, args, value, record=record):
-                logits = (value[0] if isinstance(value, tuple) else value).detach().cpu()
-                probs = torch.softmax(logits.float(), dim=-1)
-                selected, expert_ids = torch.topk(probs, model.config.num_experts_per_tok, dim=-1)
-                if model.config.norm_topk_prob:
-                    selected = selected / selected.sum(dim=-1, keepdim=True)
-                record.update(router_logits=logits, routing_weights=selected.half(), selected_experts=expert_ids)
-            def save(name, record):
-                def hook(module, args, value):
-                    record[name] = value.detach().cpu()
-                return hook
-            handles.append(layer.register_forward_pre_hook(before, with_kwargs=True))
-            handles.append(layer.register_forward_hook(output))
-            handles.append(layer.mlp.gate.register_forward_hook(gate))
-            handles.append(layer.mlp.shared_expert.register_forward_hook(save('shared', record)))
-            handles.append(layer.mlp.shared_expert_gate.register_forward_hook(save('shared_gate', record)))
-            if isinstance(layer.mlp.experts, torch.nn.ModuleList):
-                record['routed_output'] = torch.zeros(len(ids), model.config.hidden_size, dtype=torch.float32)
-                for expert_id, expert in enumerate(layer.mlp.experts):
-                    def expert_output(module, args, value, record=record, expert_id=expert_id):
-                        slot, token = torch.where(record['selected_experts'].T == expert_id)
-                        values = value.detach().cpu()
-                        if len(values) != len(token):
-                            raise RuntimeError('HF expert token order/shape changed')
-                        weighted = (values * record['routing_weights'][token, slot, None]).half().float()
-                        record['routed_output'].index_add_(0, token, weighted)
-                    handles.append(expert.register_forward_hook(expert_output))
-            else:
-                handles.append(layer.mlp.experts.register_forward_hook(save('routed_output', record)))
-        try:
-            with torch.inference_mode():
-                model(input_ids=torch.tensor([ids], device=model.get_input_embeddings().weight.device), use_cache=False)
-        finally:
-            for handle in handles:
-                handle.remove()
+        observer = moe_routing_observer(torch)
+        with ExitStack() as hooks, observer, torch.inference_mode():
+            for index, layer in enumerate(layers):
+                record = records[index]
+                label = f'layer={index} rank={rank} tokens={len(ids)}'
+                def before(module, args, kwargs, record=record):
+                    value = args[0] if args else kwargs['hidden_states']
+                    record['input'] = value.detach().clone()
+                def output(module, args, value, record=record):
+                    record['output'] = (value[0] if isinstance(value, tuple) else value).detach().clone()
+                def gate(module, args, value, record=record, label=label):
+                    observer.begin(record, label)
+                    record['router_logits'] = value.detach().clone()
+                def moe_output(module, args, value):
+                    observer.finish(value)
+                def save(name, record):
+                    def hook(module, args, value):
+                        record[name] = value.detach().clone()
+                    return hook
+                hooks.callback(layer.register_forward_pre_hook(before, with_kwargs=True).remove)
+                hooks.callback(layer.register_forward_hook(output).remove)
+                hooks.callback(layer.mlp.gate.register_forward_hook(gate).remove)
+                hooks.callback(layer.mlp.shared_expert.register_forward_hook(save('shared', record)).remove)
+                hooks.callback(layer.mlp.shared_expert_gate.register_forward_hook(save('shared_gate', record)).remove)
+                hooks.callback(layer.mlp.register_forward_hook(moe_output).remove)
+
+            model(input_ids=torch.tensor([ids], device=model.get_input_embeddings().weight.device), use_cache=False)
         for index, record in enumerate(records):
-            shared = (torch.sigmoid(record['shared_gate']) * record['shared']).half()
-            record['shared_output'] = shared
-            references[index].append({key: value.reshape(-1).tolist() for key, value in record.items()
-                                      if key not in ('shared', 'shared_gate')})
+            references[index].append({key: value.detach().cpu().reshape(-1).tolist() for key, value in record.items()})
     return [dict(layer=i, hidden=model.config.hidden_size, stage=0, name=f'real_layer_{i}',
                  inputs=[dict(position_begin=0, hidden=r['input']) for r in rows],
                  reference=[{k: v for k, v in r.items() if k != 'input'} for r in rows])
@@ -163,7 +219,8 @@ def main():
     intermediate = layer_reference(model, torch)
     args.output.write_text(json.dumps(dict(rows=rows, layers=intermediate, metadata=dict(
         torch=torch.__version__, transformers=transformers.__version__, dtype='float16',
-        attention='eager', use_cache=False, device_map=model.hf_device_map, checked_devices=devices)), allow_nan=False))
+        attention='eager', use_cache=False, device_map=model.hf_device_map, checked_devices=devices,
+        routing_capture='HF actual topk, dtype cast and index_add_; no CPU rerouting')), allow_nan=False))
     print(f'PASS: reference saved to {args.output}', flush=True)
 
 
