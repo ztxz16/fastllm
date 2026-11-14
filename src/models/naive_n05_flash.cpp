@@ -1059,7 +1059,9 @@ Data NaiveN05FlashModel::RunTarget(
             Linear(normed, localWeight(ip + "weights_proj.weight"), Data(), indexWeights);
             Mul(indexWeights, 1.0f / std::sqrt((float)indexHeads), indexWeights);
         };
-        const bool batchVerifyIndex = batchVerifyDSA && batch &&
+        // SWA has no Indexer: neither stage an unused TopK buffer nor enter
+        // the two-phase Indexer/broadcast schedule for its verification rows.
+        const bool batchVerifyIndex = !slidingLayers[layer] && batchVerifyDSA && batch &&
             indexHeads == 16 && indexDim == 128 && indexTopK == 2048;
         std::vector<FastllmNaiveVerifyIndexerItem> verifyIndexItems;
         const bool batchIndexPrepared = batchRopePrepared && batchNeedsIndex && localIndexer;

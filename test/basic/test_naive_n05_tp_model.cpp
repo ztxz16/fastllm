@@ -20,6 +20,12 @@
 #include <atomic>
 #include <dlfcn.h>
 static std::atomic<int> verifyGraphLaunches{0}, verifyGraphCaptures{0};
+static std::atomic<int> verifyIndexerBroadcasts{0};
+extern "C" void FastllmNcclBroadcast(void *data, int count, int type, int root, int device) {
+    if (type == fastllm::INT32) ++verifyIndexerBroadcasts;
+    static auto fn = (void (*)(void *, int, int, int, int))dlsym(RTLD_NEXT, "FastllmNcclBroadcast");
+    fn(data, count, type, root, device);
+}
 static std::atomic<int> directAllocations{0};
 static std::mutex draftPrefixAllocationMutex;
 static std::set<void *> draftPrefixAllocations;
@@ -2611,7 +2617,8 @@ class Fixture : public NaiveN05FlashModel {
         return out;
     }
 
-    void VerifyBatches() {
+    void VerifyBatches(bool layerSharding = false) {
+        if (layerSharding) SetIndexerTPStorage(true);
         draftTargetLayers = {0, 1};
         GenerationConfig cfg;
         for (std::vector<int> past : {std::vector<int>{257, 2307, 43, 511, 2043, 4089, 31, 3007},
@@ -2665,10 +2672,13 @@ class Fixture : public NaiveN05FlashModel {
             Cache unused;
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
             const int launches = verifyGraphLaunches, captures = verifyGraphCaptures;
+            const int broadcasts = verifyIndexerBroadcasts;
 #endif
             Data logits = RunDraftTarget(Data(FLOAT32, {1, (int)ids.size()}, ids),
                 Data(FLOAT32, {1, (int)positions.size()}, positions), unused, cfg, capture, &requests);
             #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+            if (layerSharding && checks == 0 && verifyIndexerBroadcasts - broadcasts != ranks)
+                throw std::runtime_error("verification broadcast an unused SWA Indexer buffer");
             if (checks == 4 && !failVerifyBegin && !failVerifyInstantiate &&
                 verifyGraphLaunches - launches != ranks)
                 throw std::runtime_error("multi-request verification did not replay one graph per rank");
@@ -3824,7 +3834,7 @@ int main(int argc, char **argv) {
 #endif
             Fixture fixture(ranks, false, true, true, true);
             if (argc > 3 && std::string(argv[3]) == "fp8") fixture.SetKVCacheDataType(FP8_E4M3);
-            fixture.VerifyBatches();
+            fixture.VerifyBatches(argc > 5 && std::string(argv[5]) == "layer_shard");
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
             if (!verifyGraphCaptures || ((failVerifyBegin || failVerifyInstantiate) && verifyGraphLaunches))
                 throw std::runtime_error("batch graph capture/fallback was not exercised");

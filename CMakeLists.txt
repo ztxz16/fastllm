@@ -2631,6 +2631,11 @@ if (UNIT_TEST)
                 set_tests_properties(naive_n05_verify_batch_${NAIVE_BATCH_KV} PROPERTIES
                     LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240
                     PASS_REGULAR_EXPRESSION "VERIFY BATCH PASS")
+                add_test(NAME naive_n05_verify_batch_layer_shard_${NAIVE_BATCH_KV}
+                    COMMAND naive_n05_verify_graph_test 4 verify_batch ${NAIVE_BATCH_KV} normal layer_shard)
+                set_tests_properties(naive_n05_verify_batch_layer_shard_${NAIVE_BATCH_KV} PROPERTIES
+                    LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240
+                    PASS_REGULAR_EXPRESSION "VERIFY BATCH PASS")
             endforeach()
             foreach(NAIVE_BATCH_DRAFT split merged)
                 add_test(NAME naive_n05_draft_batch_${NAIVE_BATCH_DRAFT}
