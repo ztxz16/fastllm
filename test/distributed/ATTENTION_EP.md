@@ -92,6 +92,9 @@ HTTP 将 `run` 改为 `serve`，去掉 `--prompt`、`--max-new-tokens`，添加
 - 真实权重使用固定中文 JSONL 请求，独立 Transformers FP16 重算完整历史的末位置 logits。
   另外使用四个固定短序列记录全部层的真实输入、Router、共享/路由专家贡献和层输出，
   经正式单层接口进行四 rank 对照；单层检查关闭权重落盘，避免再次输出几十 GB 权重。
+  专家ID、路由权重和路由累加值直接观察HF实际Top-K、dtype转换与index_add_的返回值，
+  不在CPU重新选专家，也不将HF的FP16累加改成FP32。支持Linear gate与ModuleList专家；
+  算子序列不符或中间量无法精确还原HF MoE输出时失败，退出时清理全部观察器与hook。
   初始阈值保持小模型 `atol=rtol=0.008`，真实模型 `atol=0.05, rtol=0.01`。
   不会因失败自动放宽阈值。
 - 跨模式诊断使用相同教师强制 Token 历史。该参数只在 trace 会话开放，不向 HTTP 暴露，
