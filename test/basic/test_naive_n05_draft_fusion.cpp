@@ -179,6 +179,55 @@ static void BatchDraft(int count, int rows, int dim, int heads, int window, int 
             scores, output), "eager attention rejected");
         Require(Bits(output) == replay, "dynamic draft attention graph differs");
         FastllmCudaGraphExecDestroy(exec); FastllmCudaGraphDestroy(graph);
+
+        // Rebind every request's cache while replaying the SAME QKV+attention
+        // graph. The captured descriptors still contain the original pointers;
+        // only the device binding table may select the new request slots.
+        Data bindings(INT32, {count, 4}); bindings.ToDevice(DataDevice::CUDA, {0}, false); bindings.Allocate(false);
+        std::vector<uint64_t> addresses(count * 2);
+        auto bind = [&](int rotation) {
+            for (int b = 0; b < count; ++b) {
+                addresses[b * 2] = (uint64_t)keys[(b + rotation) % count].cudaData;
+                addresses[b * 2 + 1] = (uint64_t)values[(b + rotation) % count].cudaData;
+            }
+            Require(cudaMemcpy(bindings.cudaData, addresses.data(), addresses.size() * sizeof(uint64_t),
+                cudaMemcpyHostToDevice) == cudaSuccess, "update draft KV table");
+        };
+        auto dynamic = [&] {
+            Require(FastllmCudaNaiveBatchDraftQKV(raw, qn, kn, descriptors, query, heads, kh,
+                dim, window, 1e-5, 10000, &qkvDescriptors, &bindings), "dynamic QKV rejected");
+            Require(FastllmCudaNaiveBatchDraftAttention(query, descriptors, heads, kh, dim, window,
+                scores, output, &bindings), "dynamic attention rejected");
+        };
+        bind(0); dynamic();
+        Require(FastllmCudaGraphBeginCapture(), "dynamic KV graph capture"); dynamic();
+        Require(FastllmCudaGraphEndCapture(&graph), "dynamic KV graph end capture");
+        Require(FastllmCudaGraphInstantiate(graph, &exec), "dynamic KV graph instantiate");
+        for (int rotation : {1, 3, 0}) {
+            bind(rotation);
+            Require(FastllmCudaGraphLaunch(exec), "dynamic KV graph replay");
+            auto actual = Bits(output);
+            std::vector<std::vector<uint16_t>> actualK, actualV;
+            for (int b = 0; b < count; ++b) {
+                actualK.push_back(Bits(keys[b], (size_t)cap * kw));
+                actualV.push_back(Bits(values[b], (size_t)cap * kw));
+            }
+            auto reference = descriptors;
+            for (int b = 0; b < count; ++b) {
+                reference[b].key = &keys[(b + rotation) % count];
+                reference[b].value = &values[(b + rotation) % count];
+            }
+            Require(FastllmCudaNaiveBatchDraftQKV(raw, qn, kn, reference, query, heads, kh,
+                dim, window, 1e-5, 10000, &qkvDescriptors), "rebound reference QKV rejected");
+            Require(FastllmCudaNaiveBatchDraftAttention(query, reference, heads, kh, dim, window,
+                scores, output), "rebound reference attention rejected");
+            Require(Bits(output) == actual, "rebound draft graph output differs");
+            for (int b = 0; b < count; ++b) {
+                Require(Bits(keys[b], (size_t)cap * kw) == actualK[b], "rebound graph K differs");
+                Require(Bits(values[b], (size_t)cap * kw) == actualV[b], "rebound graph V differs");
+            }
+        }
+        FastllmCudaGraphExecDestroy(exec); FastllmCudaGraphDestroy(graph);
         std::cout << "DRAFT FLASH PASS batch=" << count << " rows=" << rows << '\n';
     }
     auto before = Bits(keys[0], (size_t)cap * kw);

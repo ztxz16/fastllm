@@ -2502,7 +2502,21 @@ bool DescriptorWorkspaceAliases(const fastllm::Data *workspace, const fastllm::D
     return workspace && (workspace->isFake || workspace->multiDeviceData ||
         workspace == &data || (workspace->cudaData && workspace->cudaData == data.cudaData));
 }
-struct DeviceDraftBatch { const DraftBatchRow *rows; };
+struct DeviceDraftBatch {
+    const DraftBatchRow *rows;
+    const uint64_t *cacheBindings = nullptr;
+};
+__device__ __forceinline__ DraftBatchRow DraftRow(const DraftBatch &batch, int index) {
+    return batch.rows[index];
+}
+__device__ __forceinline__ DraftBatchRow DraftRow(const DeviceDraftBatch &batch, int index) {
+    auto row = batch.rows[index];
+    if (batch.cacheBindings) {
+        row.key = (BF16 *)batch.cacheBindings[index * 2];
+        row.value = (BF16 *)batch.cacheBindings[index * 2 + 1];
+    }
+    return row;
+}
 #ifdef FASTLLM_NAIVE_SWA_FLASHINFER
 // Reuse the existing FlashInfer device primitive with independent KV pointers.
 // Request lengths are read on device so a captured graph remains reusable.
@@ -2522,7 +2536,7 @@ using DraftFlashTraits = flashinfer::KernelTraits<flashinfer::MaskMode::kNone,
     64, 1, 2, 8, 8, 4, 1, flashinfer::PosEncodingMode::kNone,
     BF16, BF16, BF16, float, int, DraftFlashAttention, false>;
 __global__ __launch_bounds__(128) void BatchDraftFlash(DeviceDraftBatch batch, DraftFlashParams p) {
-    const auto &r = batch.rows[blockIdx.y];
+    const auto r = DraftRow(batch, blockIdx.y);
     p.q = const_cast<BF16 *>(r.input); p.k = r.key; p.v = r.value; p.o = r.output;
     p.kv_len = min(*r.live - 1, p.window_left) + p.qo_len;
     extern __shared__ uint8_t smem[];
@@ -2535,7 +2549,7 @@ __global__ __launch_bounds__(128) void BatchDraftFlash(DeviceDraftBatch batch, D
 template<class Batch>
 __global__ void BatchDraftQKV(Batch batch, const float *qNorm, const float *kNorm,
         int rows, int heads, int kvHeads, int dim, int window, float eps, float theta) {
-    const auto &r = batch.rows[blockIdx.y / rows];
+    const auto r = DraftRow(batch, blockIdx.y / rows);
     DraftQKVNormRopeBody(r.input, qNorm, kNorm, r.positions, r.live,
         r.key, r.value, r.query, heads, kvHeads, dim, window, 0, eps, theta,
         blockIdx.x, blockIdx.y % rows, 0, 1);
@@ -2696,16 +2710,31 @@ bool FastllmCudaNaiveDraftQKV(const fastllm::Data &raw,
     return true;
 }
 
+bool FastllmCudaNaiveDraftCacheBindingsSupported(int count, int rows,
+        int heads, int kvHeads, int dim, int window) {
+#ifdef FASTLLM_NAIVE_SWA_FLASHINFER
+    return count >= 8 && rows > 1 && rows < 32 && heads > 0 && kvHeads > 0 &&
+        heads % kvHeads == 0 && heads / kvHeads <= 32 && dim == 128 && window >= rows &&
+        BulkKernelSupported(BatchDraftFlash, sizeof(DraftFlashTraits::SharedStorageSingle), 80);
+#else
+    return false;
+#endif
+}
+
 bool FastllmCudaNaiveBatchDraftQKV(const fastllm::Data &raw,
         const fastllm::Data &qNorm, const fastllm::Data &kNorm,
         const std::vector<FastllmNaiveDraftRow> &requests, fastllm::Data &query,
         int heads, int kvHeads, int dim, int window, float eps, float theta,
-        fastllm::Data *descriptorsWorkspace) {
+        fastllm::Data *descriptorsWorkspace, const fastllm::Data *cacheBindings) {
     using namespace fastllm;
     const int count = requests.size();
     if (!count || !DraftDense(raw, BFLOAT16) || raw.dims.size() != 3 ||
         raw.dims[0] != 1 || raw.dims[1] % count) return false;
     const int rows = raw.dims[1] / count;
+    if (cacheBindings && (!descriptorsWorkspace || !DraftDense(*cacheBindings, INT32) ||
+        cacheBindings->dataDeviceIds != raw.dataDeviceIds ||
+        cacheBindings->dims != std::vector<int>({count, 4}) ||
+        DescriptorWorkspaceAliases(descriptorsWorkspace, *cacheBindings))) return false;
     for (const auto *data : {&raw, &qNorm, &kNorm, (const Data *)&query})
         if (DescriptorWorkspaceAliases(descriptorsWorkspace, *data)) return false;
     std::vector<DraftBatchRow> descriptors;
@@ -2724,8 +2753,9 @@ bool FastllmCudaNaiveBatchDraftQKV(const fastllm::Data &raw,
     }
     Output(query, BFLOAT16, {1, raw.dims[1], heads * dim});
     for (int i = 0; i < count; ++i) descriptors[i].query = (BF16 *)query.cudaData + (size_t)i * rows * heads * dim;
-    if (descriptorsWorkspace && count > kDraftBatchLimit) {
-        DeviceDraftBatch batch{DeviceDescriptors(descriptors, *descriptorsWorkspace)};
+    if (descriptorsWorkspace && (count > kDraftBatchLimit || cacheBindings)) {
+        DeviceDraftBatch batch{DeviceDescriptors(descriptors, *descriptorsWorkspace),
+            cacheBindings ? (const uint64_t *)cacheBindings->cudaData : nullptr};
         BatchDraftQKV<<<dim3(heads + kvHeads, rows * count), 256, 0, cudaStreamPerThread>>>(batch,
             (const float *)qNorm.cudaData, (const float *)kNorm.cudaData,
             rows, heads, kvHeads, dim, window, eps, theta);
@@ -2745,7 +2775,8 @@ bool FastllmCudaNaiveBatchDraftQKV(const fastllm::Data &raw,
 
 bool FastllmCudaNaiveBatchDraftAttention(const fastllm::Data &query,
         const std::vector<FastllmNaiveDraftRow> &requests,
-        int heads, int kvHeads, int dim, int window, fastllm::Data &scores, fastllm::Data &output) {
+        int heads, int kvHeads, int dim, int window, fastllm::Data &scores, fastllm::Data &output,
+        const fastllm::Data *cacheBindings) {
     using namespace fastllm;
     const int count = requests.size();
     if (!count || heads <= 0 || kvHeads <= 0 || heads % kvHeads || dim <= 0 || dim > 256 || dim % 4 || window < 2 ||
@@ -2753,6 +2784,12 @@ bool FastllmCudaNaiveBatchDraftAttention(const fastllm::Data &query,
         query.dims[1] % count || query.dims[2] != heads * dim) return false;
     const int rows = query.dims[1] / count, capacity = window + rows - 1;
     if (rows <= 1 || rows >= 32) return false;
+    const bool fused = FastllmCudaNaiveDraftCacheBindingsSupported(count, rows, heads, kvHeads, dim, window);
+    if (cacheBindings && (!fused || !DraftDense(*cacheBindings, INT32) ||
+        cacheBindings->dataDeviceIds != query.dataDeviceIds ||
+        cacheBindings->dims != std::vector<int>({count, 4}) ||
+        DescriptorWorkspaceAliases(&scores, *cacheBindings) ||
+        DescriptorWorkspaceAliases(&output, *cacheBindings))) return false;
     std::vector<DraftBatchRow> descriptors;
     for (int i = 0; i < count; ++i) {
         const auto &r = requests[i];
@@ -2772,9 +2809,7 @@ bool FastllmCudaNaiveBatchDraftAttention(const fastllm::Data &query,
     Output(output, BFLOAT16, query.dims);
 
 #ifdef FASTLLM_NAIVE_SWA_FLASHINFER
-    if (count >= 8 && dim == 128 && heads / kvHeads <= 32 &&
-        window >= rows && BulkKernelSupported(BatchDraftFlash,
-            sizeof(DraftFlashTraits::SharedStorageSingle), 80)) {
+    if (fused) {
         constexpr size_t shared = sizeof(DraftFlashTraits::SharedStorageSingle);
         static_assert(shared <= 49152 && !DraftFlashTraits::IsInvalid());
         DraftFlashParams params(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
@@ -2782,7 +2817,8 @@ bool FastllmCudaNaiveBatchDraftAttention(const fastllm::Data &query,
             dim, window - 1, 0.f, 1.f / sqrtf(float(dim)), 1.f, 10000.f);
         for (int i = 0; i < count; ++i)
             descriptors[i].output = (BF16 *)output.cudaData + (size_t)i * rows * heads * dim;
-        DeviceDraftBatch batch{DeviceDescriptors(descriptors, scores)};
+        DeviceDraftBatch batch{DeviceDescriptors(descriptors, scores),
+            cacheBindings ? (const uint64_t *)cacheBindings->cudaData : nullptr};
         BatchDraftFlash<<<dim3((rows * (heads / kvHeads) + 63) / 64, count, kvHeads),
             dim3(32, 4, 1), shared, cudaStreamPerThread>>>(batch, params);
         CheckLaunch(); return true;

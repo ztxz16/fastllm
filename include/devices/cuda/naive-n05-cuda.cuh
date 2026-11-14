@@ -107,14 +107,20 @@ struct FastllmNaiveDraftRow {
     const fastllm::Data *positions, *liveKeys;
     bool shortAttention = false;
 };
+// Dynamic KV bindings are an INT32 [requests, 4] GPU tensor containing two
+// uint64 pointers (K, V) per request. Update it before replay; the graph owns
+// neither the pointed-to caches nor their request lifetimes.
+bool FastllmCudaNaiveDraftCacheBindingsSupported(int count, int rows,
+    int heads, int kvHeads, int dim, int window);
 bool FastllmCudaNaiveBatchDraftQKV(const fastllm::Data &raw,
     const fastllm::Data &qNorm, const fastllm::Data &kNorm,
     const std::vector<FastllmNaiveDraftRow> &requests, fastllm::Data &query,
     int heads, int kvHeads, int dim, int window, float eps, float theta,
-    fastllm::Data *descriptorsWorkspace = nullptr);
+    fastllm::Data *descriptorsWorkspace = nullptr, const fastllm::Data *cacheBindings = nullptr);
 bool FastllmCudaNaiveBatchDraftAttention(const fastllm::Data &query,
     const std::vector<FastllmNaiveDraftRow> &requests,
-    int heads, int kvHeads, int dim, int window, fastllm::Data &scores, fastllm::Data &output);
+    int heads, int kvHeads, int dim, int window, fastllm::Data &scores, fastllm::Data &output,
+    const fastllm::Data *cacheBindings = nullptr);
 // Unlike generic SwiGLU, round SiLU to BF16 before multiplication, matching
 // the draft's separate Silu + MulTo operations.
 void FastllmCudaNaiveDraftSwiGLU(const fastllm::Data &gateUp, fastllm::Data &output);

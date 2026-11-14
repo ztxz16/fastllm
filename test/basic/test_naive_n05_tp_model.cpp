@@ -3500,15 +3500,27 @@ class DraftFixture : public NaiveN05FlashModel {
             std::vector<int> reordered;
             std::vector<DraftContext*> selected;
             for (int i=0;i<count;++i) {int at=(i*37+11)%count;reordered.push_back(anchors[at]);selected.push_back(contexts[at]);}
+            const int permutationCaptures = verifyGraphCaptures;
             Data permuted;
             if (!RunDraftBatch(reordered,selected,permuted)) throw std::runtime_error("wide reordered draft fallback");
+            if (verifyGraphCaptures != permutationCaptures) throw std::runtime_error("request churn recaptured the draft graph");
             auto values=read(permuted);
+            SetCudaGraph(false); Data permutedEager;
+            if (!RunDraftBatch(reordered, selected, permutedEager)) throw std::runtime_error("reordered eager fallback");
+            equal(values, read(permutedEager), "rebound draft graph/eager exceeds FP32 reduction tolerance");
+            SetCudaGraph(true);
             const size_t width=draftBlock*embed_dim;
             for(int i=0;i<count;++i) {
                 int at=(i*37+11)%count;
-                equal(std::vector<uint16_t>(values.begin()+i*width,values.begin()+(i+1)*width),
-                    std::vector<uint16_t>(expected.begin()+at*width,expected.begin()+(at+1)*width),
-                    "wide draft request permutation differs");
+                // Reordering GEMM rows can change BF16 rounding even without
+                // graphs. Use the model oracle for that comparison, while the
+                // identical-order graph/eager check above keeps its tight bound.
+                std::vector<float> actualRow, expectedRow;
+                for (size_t j = 0; j < width; ++j) {
+                    actualRow.push_back(BFloat16BitsToFloat32(values[i * width + j]));
+                    expectedRow.push_back(BFloat16BitsToFloat32(expected[at * width + j]));
+                }
+                RequireCloseLogits(actualRow.data(), expectedRow, "wide draft request permutation differs");
                 ++checks;
             }
             for (auto &anchor : anchors) anchor=(anchor+17)%256;

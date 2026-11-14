@@ -135,7 +135,7 @@ struct NaiveN05FlashModel::DraftWorkspace {
     bool disabled = false, warmed = false;
     std::vector<void *> inputs;
     std::vector<bool> shortRows;
-    Data id, live, positions, hidden, normalized;
+    Data id, live, positions, hidden, normalized, batchKV;
     Data combined, projected, committedHidden, contextAll, prefixStorage, contextSelected, contextRaw, contextPointers;
     std::vector<Layer> layers;
     std::vector<ContextLayer> contextLayers;
@@ -144,7 +144,7 @@ struct NaiveN05FlashModel::DraftWorkspace {
     void *ready = nullptr, *done = nullptr;
     std::vector<void *> Pointers() const {
         std::vector<void *> out;
-        for (const Data *p : {&id, &live, &positions, &hidden, &normalized, &combined}) out.push_back(p->isFake ? nullptr : p->cudaData);
+        for (const Data *p : {&id, &live, &positions, &hidden, &normalized, &combined, &batchKV}) out.push_back(p->isFake ? nullptr : p->cudaData);
         for (const auto &l : layers)
             for (const Data *p : {&l.normed, &l.q, &l.k, &l.v, &l.qkv, &l.query, &l.packed,
                     &l.attention, &l.output, &l.reduced, &l.gate, &l.up, &l.gateUp, &l.scores}) out.push_back(p->isFake ? nullptr : p->cudaData);
@@ -1506,10 +1506,21 @@ bool NaiveN05FlashModel::RunDraftBatch(const std::vector<int> &anchors,
         for (auto &pair : context->kv) for (Data *cache : {&pair.first, &pair.second}) state.inputs.push_back(cache->cudaData);
         state.layers.resize(draftLayers); state.contextLayers.resize(draftLayers);
     }
+    // A stable device table decouples graph lifetime from request KV lifetime.
+    // The fused attention path reads both lengths and KV pointers on device;
+    // other layouts keep their existing address/short-attention keyed fallback.
+    bool dynamicKV = true;
+    for (int gpu : devices) {
+        FastllmCudaSetDevice(gpu);
+        dynamicKV = FastllmCudaNaiveDraftCacheBindingsSupported(contexts.size(), draftBlock,
+            heads, kvHeads, draftHeadDim, draftWindow) && dynamicKV;
+    }
+    FastllmCudaSetDevice(device);
     std::vector<void *> inputs{embedding.cudaData, mask.cudaData};
     std::vector<bool> shortRows;
     for (auto *context : contexts) {
-        shortRows.push_back(std::min(context->committed, draftWindow - 1) + draftBlock <= 256);
+        shortRows.push_back(!dynamicKV && std::min(context->committed, draftWindow - 1) + draftBlock <= 256);
+        if (dynamicKV) continue;
         for (int rank = 0; rank < ranks; ++rank) for (int layer = 0; layer < draftLayers; ++layer)
         for (Data *cache : {&cacheAt(*context, rank, layer).first, &cacheAt(*context, rank, layer).second})
             inputs.push_back(cache->cudaData);
@@ -1565,6 +1576,19 @@ bool NaiveN05FlashModel::RunDraftBatch(const std::vector<int> &anchors,
         };
         copy(r.id, FLOAT32, tokenIds.data(), {1, (int)anchors.size()});
         copy(r.live, INT32, lengths.data(), {(int)anchors.size()});
+        if (dynamicKV) {
+            std::vector<uint64_t> bindings;
+            bindings.reserve(draftLayers * contexts.size() * 2);
+            for (int layer = 0; layer < draftLayers; ++layer) for (auto *context : contexts) {
+                auto &cache = cacheAt(*context, rank, layer);
+                bindings.push_back((uint64_t)cache.first.cudaData);
+                bindings.push_back((uint64_t)cache.second.cudaData);
+            }
+            r.batchKV.dataType = INT32; r.batchKV.UpdateUnitSize();
+            r.batchKV.Resize({draftLayers, std::max(maxBatch, (int)contexts.size()), 4});
+            r.batchKV.ToDevice(DataDevice::CUDA, {devices[rank]}, false); r.batchKV.Allocate(false);
+            FastllmCudaCopyFromHostToDevice(r.batchKV.cudaData, bindings.data(), bindings.size() * sizeof(uint64_t));
+        }
     };
     auto body = [&](int rank, bool reduce = true) {
 #ifndef USE_ROCM
@@ -1628,11 +1652,14 @@ bool NaiveN05FlashModel::RunDraftBatch(const std::vector<int> &anchors,
             }
             std::vector<FastllmNaiveDraftRow> descriptors;
             for (size_t row = 0; row < contexts.size(); ++row) {
-                auto &cache = cacheAt(*contexts[row], rank, layer);
+                auto *context = contexts[row];
+                auto &cache = cacheAt(*context, rank, layer);
                 descriptors.push_back({&cache.first, &cache.second, &requests[row].positions,
-                    &requests[row].live, std::min(contexts[row]->committed, draftWindow - 1) + draftBlock <= 256});
+                    &requests[row].live, !dynamicKV && std::min(context->committed, draftWindow - 1) + draftBlock <= 256});
             }
             Data &packed = l.packed, &query = l.query, &scores = l.scores;
+            Data bindings(INT32, {(int)contexts.size(), 4});
+            if (dynamicKV) bindings.FakeFrom(r.batchKV, (size_t)layer * contexts.size() * 2 * sizeof(uint64_t));
             if (!merged) {
                 Data qk;
                 Cat(qs, ks, -1, qk); Cat(qk, vs, -1, packed);
@@ -1640,10 +1667,11 @@ bool NaiveN05FlashModel::RunDraftBatch(const std::vector<int> &anchors,
             const bool batchedAttention = FastllmCudaNaiveBatchDraftQKV(merged ? qkv : packed,
                     w(p + "self_attn.q_norm.weight"), w(p + "self_attn.k_norm.weight"),
                     descriptors, query, heads, kvHeads, draftHeadDim, draftWindow, draftEps, draftTheta,
-                    &localState(rank).layers[layer].descriptors) &&
+                    &localState(rank).layers[layer].descriptors, dynamicKV ? &bindings : nullptr) &&
                 FastllmCudaNaiveBatchDraftAttention(query, descriptors, heads, kvHeads,
-                    draftHeadDim, draftWindow, scores, attention);
+                    draftHeadDim, draftWindow, scores, attention, dynamicKV ? &bindings : nullptr);
             if (!batchedAttention) {
+                AssertInFastLLM(!dynamicKV, "Naive draft dynamic KV layout changed after validation.");
                 for (size_t row = 0; row < contexts.size(); ++row) {
                     auto &r = requests[row]; auto &cache = cacheAt(*contexts[row], rank, layer);
                     Data raw, q, k, v, scores, part;
