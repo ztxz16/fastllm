@@ -42,6 +42,8 @@ __global__ void V41TcRouterPipeline(const __nv_bfloat16 *x, const __nv_bfloat16 
 #if __CUDA_ARCH__ >= 800
     const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32, group = lane / 4, pair = lane % 4;
     const int expert = blockIdx.y * 16, split = blockIdx.x;
+    const int first = blockIdx.z * 8, tileRows = min(8, rows - first);
+    x += size_t(first) * k;
 #if __CUDA_ARCH__ >= 900
     if constexpr (Cluster)
         cooperative_groups::this_cluster().barrier_arrive();
@@ -56,9 +58,9 @@ __global__ void V41TcRouterPipeline(const __nv_bfloat16 *x, const __nv_bfloat16 
     int count = ((k + KTile - 1) / KTile + Splits - 1 - split) / Splits;
     float c0 = 0, c1 = 0, c2 = 0, c3 = 0;
     for (int i = 0; i < Stages - 1; ++i)
-        V41TcRouterCopy<KTile, Warps>(x, w, tiles[i], rows, n, k, expert, (split + i * Splits) * KTile);
+        V41TcRouterCopy<KTile, Warps>(x, w, tiles[i], tileRows, n, k, expert, (split + i * Splits) * KTile);
     for (int it = 0; it < count; ++it) {
-        V41TcRouterCopy<KTile, Warps>(x, w, tiles[(it + Stages - 1) % Stages], rows, n, k, expert,
+        V41TcRouterCopy<KTile, Warps>(x, w, tiles[(it + Stages - 1) % Stages], tileRows, n, k, expert,
                                       (split + (it + Stages - 1) * Splits) * KTile);
         asm volatile("cp.async.wait_group %0;" ::"n"(Stages - 1) : "memory");
         __syncthreads();
@@ -90,6 +92,12 @@ __global__ void V41TcRouterPipeline(const __nv_bfloat16 *x, const __nv_bfloat16 
     sums[warp][idx + 64] = c2;
     sums[warp][idx + 65] = c3;
     __syncthreads();
+    // Empty split-K CTAs never enter the activation-copy wait above. They
+    // must still wait before reusing scratch or publishing completion to the
+    // next chunk's finish/top-k kernels under programmatic dependencies.
+#if __CUDA_ARCH__ >= 900
+    cudaGridDependencySynchronize();
+#endif
     for (int i = tid; i < 128; i += Warps * 32) {
         float v = 0;
 #pragma unroll
@@ -97,8 +105,8 @@ __global__ void V41TcRouterPipeline(const __nv_bfloat16 *x, const __nv_bfloat16 
             v += sums[z][i];
         if constexpr (Cluster)
             parts[split][i] = v;
-        else if (expert + i / 8 < n && i % 8 < rows)
-            y[((size_t)split * rows + i % 8) * n + expert + i / 8] = v;
+        else if (expert + i / 8 < n && i % 8 < tileRows)
+            y[((size_t)split * rows + first + i % 8) * n + expert + i / 8] = v;
     }
     if constexpr (Cluster) {
 #if __CUDA_ARCH__ >= 900
@@ -121,13 +129,13 @@ __global__ void V41TcRouterPipeline(const __nv_bfloat16 *x, const __nv_bfloat16 
         cluster.sync();
         if (split == 0)
             for (int i = tid; i < 128; i += Warps * 32)
-                if (expert + i / 8 < n && i % 8 < rows) {
+                if (expert + i / 8 < n && i % 8 < tileRows) {
                     float v = 0;
 #pragma unroll
                     for (int z = 0; z < Splits; ++z)
                         v += parts[z][i];
                     v *= invTemp;
-                    y[(size_t)(i % 8) * n + expert + i / 8] = V41TcRouterTransform(v);
+                    y[(size_t)(first + i % 8) * n + expert + i / 8] = V41TcRouterTransform(v);
                 }
 #endif
     }
@@ -156,7 +164,7 @@ cudaError_t V41TcLaunchPipeline(const __nv_bfloat16 *x, const __nv_bfloat16 *w, 
                                 int n, int k, float invTemp, cudaStream_t stream, bool pdl) {
 #if CUDART_VERSION >= 12000
     cudaLaunchConfig_t cfg = {};
-    cfg.gridDim = dim3(Splits, (n + 15) / 16);
+    cfg.gridDim = dim3(Splits, (n + 15) / 16, (m + 7) / 8);
     cfg.blockDim = Warps * 32;
     cfg.stream = stream;
     cudaLaunchAttribute attrs[2] = {};
@@ -183,7 +191,7 @@ cudaError_t V41TcLaunchPipeline(const __nv_bfloat16 *x, const __nv_bfloat16 *w, 
         return cudaErrorNotSupported;
     else {
         V41TcRouterPipeline<Warps, Splits, KTile, Stages, false>
-            <<<dim3(Splits, (n + 15) / 16), Warps * 32, 0, stream>>>(x, w, p, m, n, k, invTemp);
+            <<<dim3(Splits, (n + 15) / 16, (m + 7) / 8), Warps * 32, 0, stream>>>(x, w, p, m, n, k, invTemp);
         V41TcRouterFinish<Splits><<<(m * n + 255) / 256, 256, 0, stream>>>(p, y, m * n, invTemp);
         return cudaGetLastError();
     }

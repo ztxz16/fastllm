@@ -147,6 +147,8 @@ struct V41FullGraph {
     std::map<int, Data> mainHidden;
     std::vector<void *> ready;
     std::vector<Data> commitDescriptors;
+    Data commitSpans;
+    std::vector<int> hostCommitSpans;
     std::vector<std::vector<FastllmV41FullDecodeRequest>> hostRequests;
     std::vector<std::vector<void *>> hostPlans;
     std::shared_ptr<DeepSeekV41CudaGraphState> pieces;
@@ -257,11 +259,15 @@ void V41FullReserveRows(V41FullGraph &g, Data &data, DataType type, int width, i
 // All allocations happen before graph launch. Moving a cache is safe because
 // graph kernels load its current pointer from request metadata on every replay.
 bool V41FullReserve(V41FullGraph &g, const std::vector<DeepSeekV41Segment> &segments) {
-    if ((int)segments.size() != (g.verifying ? 1 : g.batch))
-        return false;
+    int totalRows = 0;
+    for (const auto &s : segments) {
+        if (s.offset != totalRows || s.seqlen < 1) return false;
+        totalRows += s.seqlen;
+    }
+    if (totalRows != g.batch || (!g.verifying && (int)segments.size() != g.batch)) return false;
     for (const auto &s : segments) {
         const bool validMode = g.verifying
-            ? s.spec && s.spec->deferWindow && s.spec->wantAllTokens && s.seqlen == g.batch
+            ? s.spec && s.spec->deferWindow && s.spec->wantAllTokens
             : !s.spec && s.seqlen == 1;
         if (!s.state || !validMode || s.startPos < 1 ||
             (int)s.state->layers.size() != (int)g.layers.size())
@@ -322,12 +328,15 @@ bool V41FullUploadRank(V41FullGraph &g, const std::vector<DeepSeekV41Segment> &s
         const auto &layer = *g.layers[l];
         if (layer.plans.empty())
             continue;
+        size_t segmentIndex = 0;
         for (int i = 0; i < g.batch; ++i) {
-            const auto &segment = segments[g.verifying ? 0 : i];
+            while (i >= segments[segmentIndex].offset + segments[segmentIndex].seqlen) ++segmentIndex;
+            const auto &segment = segments[segmentIndex];
             auto &cache = segment.state->layers[l];
             auto &source = segment.state->layers[layer.source < 0 ? l : layer.source];
             requests[l * g.batch + i] = {ptr(cache.windowKV), ptr(source.compressedKV), ptr(source.indexK),
-                ptr(cache.rawTailKV), ptr(cache.rawTailScore), segment.startPos + (g.verifying ? i : 0)};
+                ptr(cache.rawTailKV), ptr(cache.rawTailScore), segment.startPos + i - segment.offset,
+                g.verifying ? segment.offset : 0, g.verifying ? segment.seqlen : 0};
         }
         plans[l] = layer.plans[rank];
     }
@@ -383,15 +392,15 @@ void V41FullBindVerify(const std::shared_ptr<V41FullGraph> &owner, const DeepSee
     auto &g = *owner;
     // Scratch views borrow graph buffers until commit/draft completes,
     // before the next target forward can overwrite them.
-    auto borrow = [&](Data &view, const Data &source, int rows) {
+    auto borrow = [&](Data &view, const Data &source, int rows, int offset) {
         if (g.tensorParallel) {
-            AssertInFastLLM(V41DecodeSliceView(view, source, 0, g.devices, rows),
+            AssertInFastLLM(V41DecodeSliceView(view, source, offset, g.devices, rows),
                             "full verify buffer view failed");
         } else {
             AssertInFastLLM(!source.multiDeviceData && source.cudaData &&
-                source.dims.size() >= 3 && source.dims[0] == 1 && source.dims[1] >= rows,
+                source.dims.size() >= 3 && source.dims[0] == 1 && source.dims[1] >= offset + rows,
                 "full verify local buffer view failed");
-            view.FakeFrom(source, 0);
+            view.FakeFrom(source, (size_t)offset * source.Count(2) * source.unitSize);
             auto dims = source.dims; dims[1] = rows;
             view.Resize(dims);
         }
@@ -409,33 +418,52 @@ void V41FullBindVerify(const std::shared_ptr<V41FullGraph> &owner, const DeepSee
     for (int l = g.firstLayer; l < g.endLayer; ++l) {
         if (!g.layers[l]) continue;
         const auto &layer = *g.layers[l];
-        if (pipeline) borrow(scratch.windowKV[l], layer.savedKV, g.batch);
+        if (pipeline) borrow(scratch.windowKV[l], layer.savedKV, segment.seqlen, segment.offset);
         if (!layer.config.kvSource) continue;
         if (pipeline) {
-            const int rawRows = segment.startPos % layer.config.ratio + g.batch;
-            borrow(scratch.rawKV[l], layer.savedRawKV, rawRows);
-            if (layer.config.ratio == 2) borrow(scratch.rawScore[l], layer.savedRawScore, rawRows);
+            const int rawRows = segment.startPos % layer.config.ratio + segment.seqlen;
+            borrow(scratch.rawKV[l], layer.savedRawKV, rawRows, 2 * segment.offset);
+            if (layer.config.ratio == 2) borrow(scratch.rawScore[l], layer.savedRawScore, rawRows, 2 * segment.offset);
         }
         scratch.prevRawTail[l] = segment.startPos % layer.config.ratio;
         scratch.prevBlocks[l] = segment.startPos / layer.config.ratio;
     }
-    if (!g.attentionRuntime) scratch.commitKV = [owner, previous = std::move(scratch.commitKV)](int accepted) {
+    if (!g.attentionRuntime) scratch.commitKV = [owner, offset = segment.offset, rows = segment.seqlen, previous = std::move(scratch.commitKV)](int accepted) {
         if (previous) previous(accepted);
         const auto &graph = *owner;
         std::vector<int> ok(graph.devices.size(), 0);
         const bool submitted = V41FullDispatch(graph, [&](int rank, int) {
             ok[rank] = FastllmCudaV41CommitVerifiedPrefix(
                 static_cast<const FastllmV41VerifyCommitLayer *>(graph.commitDescriptors[rank].cudaData),
-                graph.endLayer - graph.firstLayer, accepted, graph.batch);
+                graph.endLayer - graph.firstLayer, accepted, rows, offset, graph.batch);
         });
         AssertInFastLLM(submitted && std::all_of(ok.begin(), ok.end(), [](int v) { return v != 0; }),
                         "full verifier KV commit failed");
     };
+    if (!g.attentionRuntime && !g.tensorParallel && g.devices.size() == 1) {
+        scratch.commitGroup = owner.get();
+        scratch.commitBatchKV = [owner, previous = std::move(scratch.commitBatchKV)](const std::vector<std::pair<int, int>> &spans) {
+            if (previous) previous(spans);
+            auto &graph = *owner;
+            FastllmCudaSetDevice(graph.devices.front());
+            graph.hostCommitSpans.resize(2 * spans.size());
+            for (size_t i = 0; i < spans.size(); ++i) {
+                graph.hostCommitSpans[2 * i] = spans[i].first;
+                graph.hostCommitSpans[2 * i + 1] = spans[i].second;
+            }
+            FastllmCudaCopyFromHostToDevice(graph.commitSpans.cudaData,
+                graph.hostCommitSpans.data(), graph.hostCommitSpans.size() * sizeof(int));
+            AssertInFastLLM(FastllmCudaV41CommitVerifiedBatch(
+                static_cast<const FastllmV41VerifyCommitLayer *>(graph.commitDescriptors.front().cudaData),
+                graph.endLayer - graph.firstLayer, static_cast<const int *>(graph.commitSpans.cudaData), spans.size(), graph.batch),
+                "full verifier batched KV commit failed");
+        };
+    }
     if (scratch.captureMain) {
         scratch.mainHidden.resize(targetLayers.size());
         for (size_t i = 0; i < targetLayers.size(); ++i)
             if (targetLayers[i] >= g.firstLayer && targetLayers[i] < g.endLayer)
-                borrow(scratch.mainHidden[i], g.mainHidden.at(targetLayers[i]), g.batch);
+                borrow(scratch.mainHidden[i], g.mainHidden.at(targetLayers[i]), segment.seqlen, segment.offset);
     }
 }
 } // namespace
@@ -444,28 +472,29 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
     int batch, const std::vector<DeepSeekV41Segment> &segments, int firstLayer, int endLayer) {
     const bool distributedAttention = v41AttentionDP > 1;
     const bool attentionOnly = v41AttentionRankRuntime != nullptr;
+    const bool verifying = !segments.empty() && std::all_of(segments.begin(), segments.end(),
+        [](const DeepSeekV41Segment &s) { return s.spec && s.spec->deferWindow && s.spec->wantAllTokens; });
+    const bool independentDecode = int(segments.size()) == batch &&
+        std::all_of(segments.begin(), segments.end(),
+            [](const DeepSeekV41Segment &s) { return s.seqlen == 1 && !s.spec; });
     if (firstLayer < 0 && executionMode == ExecutionMode::Hybrid &&
         V41DeviceMapCudaDeviceCount(deviceMap) > 1 && !V41DeviceMapUsesMultiCuda(deviceMap)) {
         std::vector<CudaPrefillStage> stages;
-        const bool verify = segments.size() == 1 && segments[0].spec && segments[0].spec->deferWindow;
-        if ((verify || (batch == 1 && !v41DsparkEnabled)) && BuildCudaPrefillStages(deviceMap, block_cnt, stages))
+        if ((verifying || independentDecode) && BuildCudaPrefillStages(deviceMap, block_cnt, stages))
             for (const auto &stage : stages)
                 BuildFullDecodeGraph(batch, segments, stage.firstLayer, stage.endLayer);
         return;
     }
     const bool pipeline = firstLayer >= 0;
-    const int graphKey = pipeline ? V41PipelineGraphKey(firstLayer, batch) : attentionOnly ?
+    const int64_t graphKey = pipeline ? FastllmV41PipelineGraphKey(firstLayer, batch, verifying, segments.size() > 1) : attentionOnly ?
         batch * 3 + (v41AttentionLogicalRows == 1 ? 0 : v41AttentionLogicalRows <= 8 ? 1 : 2) : batch;
     if (!pipeline) { firstLayer = 0; endLayer = block_cnt; }
-    const bool verifying = segments.size() == 1 && segments[0].spec && segments[0].spec->deferWindow;
     const bool hybrid = executionMode == ExecutionMode::Hybrid &&
-        (verifying || (batch == 1 && !v41DsparkEnabled)) && FastllmCudaMoeCacheRequested();
-    // Decode rows are independent requests, including packed FP4/FP8 KV.
-    // Use the dynamic kernel's batch bound; verification retains its causal
-    // chunk bound. Each attention group is bounded by the same decode limit.
-    const int batchLimit = verifying ? (hybrid ? 32 : 8) :
-        FastllmV41FullDecodeMaxBatch;
-    if (batch < 1 || batch > batchLimit || (!hybrid && executionMode != ExecutionMode::Gpu) ||
+        (verifying || independentDecode) && FastllmCudaMoeCacheRequested();
+    // Decode and segmented verification share the attention backend's batch
+    // capacity, including packed FP4/FP8 KV. Causality comes from each request's
+    // chunk metadata, not a smaller verification-only scheduling limit.
+    if (batch < 1 || (!hybrid && executionMode != ExecutionMode::Gpu) ||
         (!verifying && std::any_of(segments.begin(), segments.end(),
             [](const DeepSeekV41Segment &seg) { return seg.spec != nullptr; })) ||
         (!hybrid && !distributedAttention && !attentionOnly && verifying &&
@@ -477,7 +506,7 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
         V41EnvFlag("FASTLLM_DSV41_LEGACY_ATTN") || V41EnvFlag("FASTLLM_DSV41_LEGACY_INDEXER") ||
         V41EnvFlag("FASTLLM_DSV41_LEGACY_TOPK") || V41EnvFlag("FASTLLM_DSV41_LEGACY_ROTARY"))
         return;
-    auto slot = v41CudaGraphSlots.find(verifying && !pipeline ? -batch : graphKey);
+    auto slot = v41CudaGraphSlots.find(verifying && !pipeline ? FastllmV41VerificationGraphKey(batch, segments.size() > 1) : graphKey);
     if (slot == v41CudaGraphSlots.end())
         return;
     auto state = V41GetCudaGraphState(slot->second);
@@ -539,7 +568,7 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
                 model.v41AttentionLogicalRows = batch;
                 const int count = rows.localToGlobal[runtime.Layout().AttentionOwner(rank)].size();
                 model.BuildFullDecodeGraph(count, local[rank]);
-                const int key = verifying ? -count : count * 3 + (batch == 1 ? 0 : batch <= 8 ? 1 : 2);
+                const int64_t key = verifying ? FastllmV41VerificationGraphKey(count, local[rank].size() > 1) : int64_t(count) * 3 + (batch == 1 ? 0 : batch <= 8 ? 1 : 2);
                 auto found = model.v41CudaGraphSlots.find(key);
                 if (found == model.v41CudaGraphSlots.end()) return;
                 auto state = V41GetCudaGraphState(found->second);
@@ -629,6 +658,7 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
             c.indexMode = fp4 ? 2 : 1; c.indexRowBytes = fp4 ? 68 : 132;
         }
         c.verifying = verifying;
+        c.segmentedVerify = verifying && segments.size() > 1;
         c.heads = num_attention_heads / g->devices.size();
         c.indexHeads = index_n_heads;
         c.ratio = compress_ratios[l];
@@ -656,9 +686,9 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
             alloc(layer->savedKV, c.ringMode ? DataType::INT8 : DataType::BFLOAT16,
                   {1, batch, c.ringMode ? c.ringRowBytes : 512});
             if (verifying && c.kvSource) {
-                alloc(layer->savedRawKV, DataType::FLOAT32, {1, batch + c.ratio - 1, 512});
+                alloc(layer->savedRawKV, DataType::FLOAT32, {1, 2 * batch, 512});
                 if (c.ratio == 2)
-                    alloc(layer->savedRawScore, DataType::FLOAT32, {1, batch + c.ratio - 1, 512});
+                    alloc(layer->savedRawScore, DataType::FLOAT32, {1, 2 * batch, 512});
             }
         }
         if (c.kvSource) {
@@ -746,6 +776,14 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
         FastllmCudaCopyFromHostToDevice(V41FullLocal(g->inputIds, g->devices.front()).cudaData,
                                       g->hostTokens.data(), batch * sizeof(float));
     }
+    if (verifying && ws.dsparkPreMix.dims != std::vector<int>({1, batch, hc_mult})) {
+        alloc(ws.dsparkPreMix, DataType::FLOAT32, {1, batch, hc_mult});
+        std::vector<float> uniform(size_t(batch) * hc_mult, 1.0f / hc_mult);
+        V41FullDispatch(*g, [&](int, int device) {
+            FastllmCudaCopyFromHostToDevice(V41FullLocal(ws.dsparkPreMix, device).cudaData,
+                uniform.data(), uniform.size() * sizeof(float));
+        });
+    }
     // Lazy verification capture runs after this call's embedding. The warm
     // Engram children modify hiddenStates; restore its contents (not address)
     // before replay, including the fallback path.
@@ -753,6 +791,19 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
     if (verifying) V41Assign(initialHidden, ws.hiddenStates, g->devices);
     bool poolOpen = false;
     try {
+        // Expert children are built between captured attention segments. Their
+        // private benchmark must finish before the shared allocation transaction
+        // opens; it is intentionally forbidden while that pool is active.
+        if (hybrid && !attentionOnly) {
+            for (int l = firstLayer; l < endLayer; ++l) {
+                if (state->segments[l * 4 + 3].containsGpuMoe || weights[l][2]->isDiskWeight) continue;
+                const size_t owner = g->tensorParallel ? size_t(l) * g->devices.size() / block_cnt : 0;
+                FastllmCudaSetDevice(g->devices[owner]);
+                auto routed = weights[l]; routed[0] = routed[1] = nullptr;
+                FastllmCudaPrepareNativeMoeKernelPlan(routed.data(), routed.size(), batch, num_experts_per_tok);
+            }
+            FastllmCudaSetDevice(g->devices.front());
+        }
         std::vector<std::vector<const void *>> children(g->devices.size());
         auto capture = [&](const std::function<void()> &body) {
             std::vector<size_t> allocations;
@@ -1147,6 +1198,13 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
                 throw std::runtime_error("TP full graph timing removal failed");
         }
         if (verifying && !distributedAttention) {
+            if (!g->tensorParallel && g->devices.size() == 1) {
+                g->commitSpans.dataType = DataType::INT32;
+                g->commitSpans.UpdateUnitSize();
+                g->commitSpans.Resize({g->batch, 2});
+                g->commitSpans.ToDevice(DataDevice::CUDA, g->devices, false);
+                g->commitSpans.Allocate();
+            }
             g->commitDescriptors.resize(g->devices.size());
             for (size_t rank = 0; rank < g->devices.size(); ++rank) {
                 const int device = g->devices[rank];
@@ -1434,7 +1492,8 @@ bool DeepSeekV41Model::TryFullDecodeGraph(ForwardWorkspace &f, bool inputsPrepar
         // Root sampling reads peer-written vocabulary shards after every rank.
         FastllmCudaSetDevice(g->devices.front());
         for (void *event : g->ready) FastllmCudaCurrentThreadStreamWaitEvent(event);
-        V41FullBindVerify(g, f.inputSegments[0], v41DsparkTargetLayerIds);
+        for (const auto &segment : f.inputSegments)
+            V41FullBindVerify(g, segment, v41DsparkTargetLayerIds);
         if (g->attentionRuntime) g->attentionRuntime->Run([&](int rank, int) {
             if (g->attentionGraphs[rank])
                 V41FullBindVerify(g->attentionGraphs[rank], attentionSegments[rank][0], {});

@@ -9,6 +9,7 @@
  */
 
 #include "fastllm-cuda.cuh"
+#include "devices/cuda/fastllm-cuda-graph-workspace.h"
 #include "fastllm.h"
 #include "devices/cuda/fastllm-draft-head.cuh"
 
@@ -349,7 +350,8 @@ extern "C" bool FastllmCudaTryFp8DraftHead(const fastllm::Data &input,
         (reinterpret_cast<uintptr_t>(input.cudaData) & 15) || (reinterpret_cast<uintptr_t>(weight.cudaData) & 15)) return false;
     const int n = weight.dims[0], k = weight.dims[1];
     const uint64_t rows = input.Count(0) / k;
-    if (rows < 1 || rows > 16 || weight.Count(0) > INT_MAX) return false;
+    if (rows < 1 || rows * uint64_t(k) > INT_MAX || rows * uint64_t(n) > INT_MAX ||
+        weight.Count(0) > INT_MAX) return false;
     auto dense = [](const Data &d) {
         if (d.strides.size() != d.dims.size()) return false;
         uint64_t stride = 1;
@@ -372,7 +374,8 @@ extern "C" bool FastllmCudaTryFp8DraftHead(const fastllm::Data &input,
     size_t workspaceBytes = 0;
     try { workspaceBytes = Mxfp8DispatchWorkspace<float>(config, int(rows), n, k); }
     catch (...) { FastllmCudaClearThreadError(); return false; }
-    const size_t quantBytes = rows * k, scaleBytes = size_t((k + 127) / 128) * 512;
+    const size_t quantBytes = rows * k;
+    const size_t scaleBytes = size_t((rows + 127) / 128) * size_t((k + 127) / 128) * 512;
     const size_t totalBytes = quantBytes + scaleBytes + workspaceBytes;
     if (totalBytes > INT_MAX) return false;
     // A shared temporary buffer can grow after capture and invalidate replay
@@ -401,7 +404,7 @@ extern "C" bool FastllmCudaTryFp8DraftHead(const fastllm::Data &input,
 extern "C" bool FastllmCudaTryMxfp8QuantizedLinear(const fastllm::Data &input,
         fastllm::Data &weight, fastllm::Data &output) {
     if (!Mxfp8EnvEnabled() || &input == &output || &weight == &output ||
-        FastllmCudaGraphIsCapturingFast() ||
+        (FastllmCudaGraphIsCapturingFast() || FastllmCudaGraphPreparationActive()) ||
         FastllmCudaRuntimeArch() < 120 || FastllmCudaRuntimeArch() > 121 ||
         input.multiDeviceData || weight.multiDeviceData || output.multiDeviceData ||
         input.dataType != fastllm::DataType::BFLOAT16 || input.dims.empty() ||
@@ -489,7 +492,7 @@ extern "C" bool FastllmCudaTryMxfp8WoA(const fastllm::Data &input,
         const fastllm::Data &weight, int groups, int rank, fastllm::Data &output) {
     const char *disable = std::getenv("FASTLLM_DSV4_DISABLE_CUDA_WOA_GEMM");
     if (!Mxfp8EnvEnabled() || &input == &output || &weight == &output ||
-        FastllmCudaGraphIsCapturingFast() ||
+        (FastllmCudaGraphIsCapturingFast() || FastllmCudaGraphPreparationActive()) ||
         (disable && std::strcmp(disable, "0")) ||
         FastllmCudaRuntimeArch() < 120 || FastllmCudaRuntimeArch() > 121 ||
         input.dataType != fastllm::DataType::BFLOAT16 || input.dims.size() != 4 ||

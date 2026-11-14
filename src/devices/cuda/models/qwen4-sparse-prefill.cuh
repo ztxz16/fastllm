@@ -15,7 +15,7 @@ __global__ void Qwen4SparseQK(const half *query, const half *key, const int32_t 
     auto *k = q + 16 * pitch;
     auto *dots = reinterpret_cast<float *>(k + 64 * pitch);
     const int row = DECODE ? 0 : blockIdx.y + rowStart;
-    if (DECODE && decodeMeta) length = decodeMeta[0] + 1;
+    if (decodeMeta) length = decodeMeta[0] + row + 1;
     const int headTiles = (groups + 15) / 16;
     const int kvHead = blockIdx.z / headTiles;
     const int firstHead = kvHead * groups + (blockIdx.z % headTiles) * 16;
@@ -63,7 +63,7 @@ __global__ void Qwen4SparseQK(const half *query, const half *key, const int32_t 
 #endif
 }
 
-template <bool DECODE = false, typename Output = half, bool STAGED = false>
+template <bool DECODE = false, typename Output = half, bool STAGED = false, bool BATCHED_SPLIT = false>
 __global__ void Qwen4SparsePV(const half *probabilities, const half *value, const int32_t *indices,
                               Output *output, int sequence, int queryHeads, int groups, int length,
                               int dim, int width, int rowStart, uint64_t valueStride,
@@ -73,8 +73,10 @@ __global__ void Qwen4SparsePV(const half *probabilities, const half *value, cons
     using namespace nvcuda;
     __shared__ __align__(32) half p[16 * 24], v[16 * 72];
     __shared__ __align__(32) float result[4 * 16 * 16];
-    const int row = DECODE ? 0 : blockIdx.y + rowStart;
-    if (DECODE && decodeMeta) length = decodeMeta[0] + 1;
+    const int splits = (width + 127) / 128;
+    const int localRow = BATCHED_SPLIT ? blockIdx.y / splits : blockIdx.y;
+    const int row = DECODE ? 0 : localRow + rowStart;
+    if (decodeMeta) length = decodeMeta[0] + row + 1;
     const int headTiles = (groups + 15) / 16;
     const int kvHead = blockIdx.z / headTiles;
     const int firstHead = kvHead * groups + (blockIdx.z % headTiles) * 16;
@@ -86,14 +88,14 @@ __global__ void Qwen4SparsePV(const half *probabilities, const half *value, cons
     wmma::fill_fragment(c, 0.0f);
     // Decode splits the selected tokens across CTAs. Prefill has enough query
     // rows to keep the GPU busy and retains its original accumulation order.
-    const int begin = DECODE ? blockIdx.y * 128 : 0;
-    const int end = DECODE ? min(width, begin + 128) : width;
+    const int begin = BATCHED_SPLIT ? (blockIdx.y % splits) * 128 : DECODE ? blockIdx.y * 128 : 0;
+    const int end = (DECODE || BATCHED_SPLIT) ? min(width, begin + 128) : width;
     for (int selected = begin; selected < end; selected += 16) {
         for (int i = threadIdx.x; i < 256; i += blockDim.x) {
             const int h = i / 16, column = selected + i % 16;
             p[h * 24 + i % 16] =
                 h < heads && column < width
-                    ? probabilities[(uint64_t(DECODE ? 0 : blockIdx.y) * queryHeads + firstHead + h) * width +
+                    ? probabilities[(uint64_t(DECODE ? 0 : localRow) * queryHeads + firstHead + h) * width +
                                     column]
                     : half(0);
         }
@@ -119,7 +121,7 @@ __global__ void Qwen4SparsePV(const half *probabilities, const half *value, cons
     for (int i = lane; i < 256; i += 32) {
         const int h = i / 16, col = blockIdx.x * 64 + warp * 16 + i % 16;
         if (h < heads && col < dim) {
-            const uint64_t offset = DECODE
+            const uint64_t offset = (DECODE || BATCHED_SPLIT)
                 ? (uint64_t(blockIdx.y) * queryHeads + firstHead + h) * dim + col
                 : (uint64_t(firstHead + h) * sequence + row) * dim + col;
             output[offset] = Output(result[warp * 256 + i]);
@@ -135,5 +137,19 @@ __global__ void Qwen4SparseDecodeReduce(const float *partials, half *output, int
         for (int split = 0; split < splits; ++split)
             sum += partials[uint64_t(split) * count + i];
         output[i] = __float2half_rn(sum);
+    }
+}
+
+// Row chunks only bound physical launch dimensions; output keeps head-major
+// model layout and all requests' sequence rows remain independent.
+__global__ void Qwen4SparseBatchReduce(const float *partials,half *output,
+        int count,int splits,int sequence,int rows,int first,int dim) {
+    for(uint64_t i=uint64_t(blockIdx.x)*blockDim.x+threadIdx.x;
+        i<uint64_t(rows)*count;i+=uint64_t(gridDim.x)*blockDim.x) {
+        const int row=i/count,element=i%count;
+        float sum=0;
+        for(int split=0;split<splits;++split)sum+=partials[(uint64_t(row)*splits+split)*count+element];
+        const int head=element/dim,column=element%dim;
+        output[(uint64_t(head)*sequence+first+row)*dim+column]=__float2half_rn(sum);
     }
 }

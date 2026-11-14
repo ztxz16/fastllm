@@ -3157,6 +3157,7 @@ namespace fastllm {
                         std::vector <int> seqLens;
                         int prefillTokens = 0;
                         std::vector <int> handles;
+                        std::vector<ResponseContext *> selectedContexts;
                         std::vector <GenerationConfig> generationConfigs;
                         std::vector <std::vector <float>* > logits;
                         attentionMasks.reserve(maxBatch);
@@ -3584,6 +3585,7 @@ namespace fastllm {
                                 SetSamplingHistory(tokensManager, handles.size(),
                                                    generationConfigs.back(), it.second->tokens);
                                 handles.push_back(it.first);
+                                selectedContexts.push_back(it.second);
 
                                 if (it.second->preTokens == 0) {
                                     it.second->intParams["add_special_tokens"] = it.second->cacheLen > 0 ? false : it.second->generationConfig.add_special_tokens;
@@ -3712,7 +3714,10 @@ namespace fastllm {
 #endif
                             if (seqLens.size() > 1) {
                                 if (!model->canDoBatchForward) {
-                                    dictLocker.lock();
+                                    // Capture request owners under dictLocker above, as
+                                    // the single-request and batched paths already do.
+                                    // Forward must not block token consumers, new
+                                    // requests or cancellation behind GPU/NUMA work.
                                     for (int i = 0; i < handles.size(); i++) {
                                         Data inputIdNow = Data(DataType::FLOAT32, {1, 1}, {ids[i]});
                                         LastTokensManager singleTokens;
@@ -3720,10 +3725,9 @@ namespace fastllm {
                                         ret.push_back(model->Forward(inputIdNow,
                                                             attentionMasks[i] == nullptr ? Data() : *attentionMasks[i],
                                                             *positionIds[i],
-                                                            model->responseContextDict.dicts[handles[i]]->pastKeyValues,
+                                                            selectedContexts[i]->pastKeyValues,
                                                             generationConfigs[i], singleTokens, logits[i]));
                                     }
-                                    dictLocker.unlock();
                                 } else {
                                     ret = model->ForwardBatch(seqLens.size(), inputIds, attentionMasks,
                                                             positionIds, seqLens, pastKeyValues, generationConfigs,

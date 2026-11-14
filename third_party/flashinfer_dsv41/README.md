@@ -76,3 +76,5 @@ Selected-KV reuse:
   relative L2 0.002665). Existing 1,156 decode/verification/ordinary cases pass;
   192 paired configurations, including absent caches and workspace-budget
   fallback, match the previous packed path bitwise with zero memcheck errors.
+
+FastLLM 的请求索引适配还支持验证批次中的独立因果片段：可选行范围元数据用于隔离各请求的窗口和压缩 KV，可接受不同候选长度；未修改 FlashInfer 的注意力数值计算。

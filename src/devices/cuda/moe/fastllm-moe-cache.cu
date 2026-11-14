@@ -1,3 +1,4 @@
+#include "devices/cuda/fastllm-kernel-benchmark.cuh"
 //
 // Graph-capturable GGUF, FP8 and compact NVFP4 expert cache.
 //
@@ -18,6 +19,7 @@
 #include "fastllm.h"
 #include "moe_cache_config.h"
 #include "utils.h"
+#include "exl3.h"
 #include "devices/cuda/fastllm-cuda-mapped-host.h"
 #include "gguf.h"
 #include "fastllm-moe-gguf-restore.cuh"
@@ -54,10 +56,12 @@
 #include <vector>
 
 #include <cuda_bf16.h>
+#include <cub/device/device_radix_sort.cuh>
 #ifndef USE_ROCM
 #include <cuda.h>
 #endif
 #include "fastllm-moe-deepseekv41-cache.cuh"
+#include "fastllm-moe-mxfp4-batch.cuh"
 #include "fastllm-moe-cache-publication.cuh"
 #include "fastllm-moe-glm5-cache.cuh"
 #include "fastllm-moe-fp8-scored.cuh"
@@ -119,6 +123,7 @@ struct OffloadLayout {
 };
 
 const char *FormatName(fastllm::DataType type) {
+    if (type == fastllm::DataType::EXL3) return "EXL3";
     if (type == fastllm::DataType::DATA_GGUF_FORMAT) return "GGUF";
     if (type == fastllm::DataType::NVFP4_BLOCK_32_E8M0) return "DeepSeek-V4.1 NVFP4 block32";
     if (type == fastllm::DataType::FP8_E4M3) return "FP8 E4M3";
@@ -404,6 +409,8 @@ struct OffloadGroup {
     std::vector<const fastllm::Data *> tableKeys;
     // When NUMA storage is shared, hostRecords contains only original metadata.
     // The weight shards are borrowed from the model's prefill backend.
+    // Canonical opaque CPU matrices: borrowed, never duplicated or repacked.
+    std::vector<const fastllm::Data *> rawHostWeights;
     std::vector<void *> numaPointers;
     bool mappedWeights = true;
     bool cpuDecodeReady = false;
@@ -429,6 +436,24 @@ struct OffloadGroup {
         return layerLayouts.empty() ? layout : layerLayouts[tableId];
     }
 };
+
+// This source adapter is format-independent: the cache owns only GPU copies.
+void CopyRawHostExpert(const OffloadGroup &group, int table, int expert,
+                      uint8_t *destination, cudaStream_t stream) {
+    const auto &l=group.LayerLayout(table);
+    const size_t key=(size_t(table)*l.experts+expert)*2;
+    checkCudaErrors("Opaque expert gate upload",fastllm::cuda::UploadImmutableHostWeight(
+        destination,group.rawHostWeights[key]->cpuData,l.gateBytes,false,stream));
+    checkCudaErrors("Opaque expert down upload",fastllm::cuda::UploadImmutableHostWeight(
+        destination+l.downOffset,group.rawHostWeights[key+1]->cpuData,l.downBytes,false,stream));
+}
+bool PrepareCacheInput(const OffloadLayout &layout, const fastllm::Data &input, fastllm::Data &output) {
+    if (layout.weightType==fastllm::EXL3) {
+        if (!output.isFake) output.FreeSpace();
+        output.FakeFrom(input,0); output.Resize(input.dims); return true;
+    }
+    return FastllmCudaDeepSeekV41QuantizeActivation(input,output);
+}
 
 // A native record can be copied by DMA directly from the sole NUMA owner.
 // Layouts that gather columns, scales or row groups retain their adapters.
@@ -491,7 +516,7 @@ void CopyNativeGGUFExpert(const OffloadGroup &group, int table, int expert,
     const size_t base = (size_t(table) * group.layout.experts + expert) * 2 * source.shards;
     for (int part = 0; part < 2; ++part) {
         const auto &weight = source.weights[part];
-        const size_t bytes = weight.rows * weight.rowBytes / source.shards;
+        const size_t bytes = weight.Bytes() / source.shards;
         for (int node = 0; node < source.shards; ++node)
             checkCudaErrors("MoE native GGUF admission", fastllm::cuda::UploadImmutableHostWeight(
                 destination + (part ? group.LayerLayout(table).downOffset : 0) + node * bytes,
@@ -517,7 +542,7 @@ void CopyNativeSharedExpert(const OffloadGroup &group, int table, int expert,
 void DecodeOverlapWorkspace::ConfigureLayout(const OffloadGroup &group, int table, int rows) {
     numaGateType = numaDownType = -1;
     const auto &layout = group.LayerLayout(table);
-    if (group.ggufSources.empty()) return;
+    if (group.ggufSources.empty() || layout.weightType != fastllm::DATA_GGUF_FORMAT) return;
     const auto &source = group.ggufSources[table];
     // Keep native NUMA records when the projection can decode their packing
     // directly, including IQ2 R4; persistent cache admission stays canonical.
@@ -540,7 +565,9 @@ void DecodeOverlapWorkspace::CopyExpert(const OffloadGroup &group, int table,
     const auto &layout = group.LayerLayout(table);
     auto *destination = records + size_t(i) * layout.recordStride;
     if (i == 0) checkCudaErrors("MoE PCIe start", cudaEventRecord(copyStart, copyStream));
-    if (NativeSharedRecords(group)) {
+    if (!group.rawHostWeights.empty()) {
+        CopyRawHostExpert(group,table,expert,destination,copyStream);
+    } else if (NativeSharedRecords(group)) {
         CopyNativeSharedExpert(group, table, expert, destination, copyStream);
     } else if (group.sharedLayout.shards) {
         auto shared = group.sharedLayout;
@@ -596,7 +623,7 @@ void DecodeOverlapWorkspace::CopyExpert(const OffloadGroup &group, int table,
         const size_t base = (size_t(table) * layout.experts + expert) * 2 * source.shards;
         for (int part = 0; part < 2; ++part) {
             const auto &weight = source.weights[part];
-            const size_t bytes = weight.rows * weight.rowBytes / source.shards;
+            const size_t bytes = weight.Bytes() / source.shards;
             for (int node = 0; node < source.shards; ++node)
                 checkCudaErrors("MoE NUMA expert DMA", fastllm::cuda::UploadImmutableHostWeight(
                     target + (part ? source.downOffset : 0) + node * bytes,
@@ -629,12 +656,18 @@ struct SharedCacheStorage {
     bool (*bind)(const OffloadLayout &, const fastllm::Data &, int, fastllm::cuda::SharedWeightView &);
 };
 
+bool RunExl3CachedPrefill(const fastllm::Data &, const fastllm::Data &,
+    const fastllm::Data &, fastllm::Data &, fastllm::Data **, int,
+    const std::function<void()> &);
+
 struct ExpertCacheBackend {
     fastllm::DataType type;
     bool (*supportsHybrid)(const OffloadLayout &);
     const SharedCacheStorage *storage;
     bool (*compute)(const fastllm::Data &, fastllm::Data &, fastllm::Data &,
                     const OffloadLayout &, const DeviceCache &, const float *, int, float *);
+    bool (*prefill)(const fastllm::Data &, const fastllm::Data &, const fastllm::Data &,
+                    fastllm::Data &, fastllm::Data **, int, const std::function<void()> &) = nullptr;
 };
 const ExpertCacheBackend *FindExpertCacheBackend(fastllm::DataType type);
 
@@ -847,7 +880,7 @@ bool CanShareGGUFWeights(const FastllmCudaMoeCacheLayer *layers, int count) {
 #endif
 }
 
-bool BindGGUFWeights(OffloadGroup &group, const std::vector<fastllm::Data *> &weights) {
+bool BindPackedHostWeights(OffloadGroup &group, const std::vector<fastllm::Data *> &weights) {
     const int nodes = weights.front()->numasData.size();
     if (nodes <= 0) return false;
     group.numaPointers.reserve(weights.size() * nodes);
@@ -863,6 +896,16 @@ bool BindGGUFWeights(OffloadGroup &group, const std::vector<fastllm::Data *> &we
                 const int rows = part ? layout.hidden : 2 * layout.inter;
                 const int columns = part ? layout.inter : layout.hidden;
                 const size_t bytes = part ? layout.downBytes : layout.gateBytes;
+                if (weight.dataType == fastllm::EXL3) {
+                    if (weight.numasData.size() != size_t(nodes) || weight.cpuData ||
+                        weight.GetBytes() != bytes || weight.dims != std::vector<int>({rows, columns}) ||
+                        weight.blockM != (part ? 1 : 2) || rows / weight.blockM % (16 * nodes) ||
+                        columns % (16 * nodes)) return false;
+                    if (!expert) source.weights[part] = {-1, rows, columns, 0, weight.blockK, weight.blockM};
+                    else if (source.weights[part].exl3Bits != weight.blockK) return false;
+                    if (!AppendNumaPointers(weight, group.numaPointers, group.mappedWeights)) return false;
+                    continue;
+                }
                 if (weight.numasData.size() != size_t(nodes) || rows % nodes ||
                     weight.cpuData || weight.GetBytes() != bytes ||
                     weight.dims.size() != 2 || weight.dims[0] != rows || weight.dims[1] != columns ||
@@ -972,6 +1015,26 @@ bool ValidateV41CanonicalGGUFPair(fastllm::Data *gate, fastllm::Data *down,
 bool ValidateWeightPair(fastllm::Data *gate, fastllm::Data *down,
                         const OffloadLayout *expected,
                         OffloadLayout &observed) {
+    if (gate && gate->dataType==fastllm::EXL3) {
+        if (!down || down->dataType!=fastllm::EXL3 || gate->isDiskWeight || down->isDiskWeight ||
+            (!gate->cpuData && gate->numasData.empty()) || (!down->cpuData && down->numasData.empty()) ||
+            gate->dataDevice!=fastllm::CPU || down->dataDevice!=fastllm::CPU ||
+            gate->dims.size()!=2 || down->dims.size()!=2 || gate->blockM!=2 || down->blockM!=1 ||
+            gate->dims[0]!=2*down->dims[1] || gate->dims[1]!=down->dims[0] ||
+            gate->dims[1]<=0 || down->dims[1]<=0 || gate->dims[1]%128 || down->dims[1]%128 ||
+            gate->dims[1]>8192 || down->dims[1]>8192 ||
+            !fastllm::Exl3BitRateSupported(gate->blockK) || !fastllm::Exl3BitRateSupported(down->blockK)) return false;
+        observed.weightType=fastllm::EXL3; observed.hidden=gate->dims[1]; observed.inter=down->dims[1];
+        observed.gateBlockK=gate->blockK; observed.downBlockK=down->blockK;
+        observed.gateBlockM=2; observed.downBlockM=1;
+        observed.gateBytes=gate->GetBytes(); observed.downBytes=down->GetBytes();
+        observed.downOffset=AlignUp(observed.gateBytes,16);
+        observed.scalesOffset=observed.downOffset+observed.downBytes;
+        observed.recordStride=AlignUp(observed.scalesOffset,128);
+        return !expected || (expected->weightType==observed.weightType && expected->hidden==observed.hidden &&
+            expected->inter==observed.inter && expected->gateBlockK==observed.gateBlockK &&
+            expected->downBlockK==observed.downBlockK && expected->recordStride==observed.recordStride);
+    }
     const int gateType = GGUFCacheType(gate), downType = GGUFCacheType(down);
     if (gateType >= 0 && downType >= 0) {
         if (gate->dataDevice != fastllm::DataDevice::CPU ||
@@ -1360,6 +1423,8 @@ DeviceCache *GetDeviceCache(OffloadGroup &group, bool waitForAdmission = true) {
     if (cudaGetDevice(&device) != cudaSuccess || device < 0) {
         return nullptr;
     }
+    if (group.layout.weightType == fastllm::NVFP4_BLOCK_32_E8M0 &&
+        !FastllmCudaBFloat16SiluTable()) return nullptr;
     std::lock_guard<std::mutex> guard(group.mutex);
     std::unique_ptr<DeviceCache> &entry = group.deviceCaches[device];
     if (!entry) {
@@ -2025,10 +2090,53 @@ __global__ void FastllmNVFP4OffloadDownExactWideKernel(
     }
 }
 
+// Hybrid execution publishes each expert independently; its final router
+// reduction is a separate operator. Map a half-warp to an output, without
+// allocating inactive expert warps or synchronizing unrelated routes.
+template <typename T, int Rows = 16>
+__global__ void FastllmNVFP4DownExpertsKernel(const T *input,
+        const int32_t *routeSlots, const uint8_t *records, float *output,
+        int inter, int hidden, int scaleCols, size_t recordStride,
+        size_t downOffset, size_t scalesOffset,
+        const int32_t *routeMap = nullptr, const uint64_t *slotOffsets = nullptr,
+        const int32_t *activeRouteCount = nullptr, int firstRoute = 0) {
+    const int row = blockIdx.x * Rows + threadIdx.x / 16;
+    const int lane = threadIdx.x & 15;
+    const int route = firstRoute + blockIdx.y;
+    if (row >= hidden || (activeRouteCount && route >= *activeRouteCount)) return;
+    const int slot = routeSlots[route];
+    float low0 = 0, high0 = 0, low1 = 0, high1 = 0;
+    if (slot >= 0) {
+        const uint8_t *record = records + (slotOffsets ? slotOffsets[slot] : size_t(slot) * recordStride);
+        const float scale = reinterpret_cast<const float *>(record + scalesOffset)[2];
+        for (int word = lane; word < (inter >> 3); word += 32) {
+            AccumulateCompactE4M3WordPair(input + size_t(route) * inter, word,
+                record + downOffset, row, hidden, inter, scaleCols, scale, low0, high0);
+            if (word + 16 < (inter >> 3))
+                AccumulateCompactE4M3WordPair(input + size_t(route) * inter, word + 16,
+                    record + downOffset, row, hidden, inter, scaleCols, scale, low1, high1);
+        }
+    }
+    const unsigned mask = __activemask();
+    for (int offset = 8; offset > 0; offset >>= 1) {
+        low0 += __shfl_down_sync(mask, low0, offset, 16);
+        high0 += __shfl_down_sync(mask, high0, offset, 16);
+        low1 += __shfl_down_sync(mask, low1, offset, 16);
+        high1 += __shfl_down_sync(mask, high1, offset, 16);
+    }
+    if (lane == 0) {
+        const float value = (low0 + high0) + (low1 + high1);
+        output[size_t(routeMap ? routeMap[route] : route) * hidden + row] = ActivationTraits<T>::ToFloat(
+            ActivationTraits<T>::FromFloat(value));
+    }
+}
+
 bool SupportsNVFP4WideDecode(const OffloadLayout &l) {
     return l.gateBlockK == 1 && l.downBlockK == 1 && l.gateBlockM == 16 &&
         l.downBlockM == 16 && l.hidden % 128 == 0 && l.inter % 128 == 0;
 }
+
+#include "fastllm-moe-nvfp4-batch.cuh"
 
 template <typename T>
 bool LaunchNVFP4Cache(const fastllm::Data &input, fastllm::Data &gateOutput,
@@ -2048,14 +2156,25 @@ bool LaunchNVFP4Cache(const fastllm::Data &input, fastllm::Data &gateOutput,
             layout.hidden, layout.inter, layout.gateScaleCols,
             layout.recordStride, layout.scalesOffset);
         if (!FastllmMoeWaitDown(events)) return false;
-        FastllmNVFP4OffloadDownExactWideKernel<T, kMaxTopK>
-            <<<layout.hidden, topk * 32, 0, cudaStreamPerThread>>>(
-            reinterpret_cast<const T *>(gateOutput.cudaData),
-            cache.routeSlots, cache.records,
-            reinterpret_cast<T *>(output.cudaData), scores, topk,
-            layout.inter, layout.hidden, layout.downScaleCols,
-            layout.recordStride, layout.downOffset,
-            layout.scalesOffset, perExpert);
+        if (perExpert != nullptr) {
+            constexpr int outputRows = 16;
+            FastllmNVFP4DownExpertsKernel<T, outputRows>
+                <<<dim3((layout.hidden + outputRows - 1) / outputRows, topk),
+                   outputRows * 16, 0, cudaStreamPerThread>>>(
+                reinterpret_cast<const T *>(gateOutput.cudaData), cache.routeSlots,
+                cache.records, perExpert, layout.inter, layout.hidden,
+                layout.downScaleCols, layout.recordStride, layout.downOffset,
+                layout.scalesOffset);
+        } else {
+            FastllmNVFP4OffloadDownExactWideKernel<T, kMaxTopK>
+                <<<layout.hidden, topk * 32, 0, cudaStreamPerThread>>>(
+                reinterpret_cast<const T *>(gateOutput.cudaData),
+                cache.routeSlots, cache.records,
+                reinterpret_cast<T *>(output.cudaData), scores, topk,
+                layout.inter, layout.hidden, layout.downScaleCols,
+                layout.recordStride, layout.downOffset,
+                layout.scalesOffset);
+        }
     } else {
         const dim3 gateGrid(layout.inter, topk);
         FastllmNVFP4OffloadGateKernel<T, 64>
@@ -2147,11 +2266,13 @@ bool FastllmCudaPrepareMoeCacheWithBudgets(
     const bool canonicalGlmGGUF = layers[0].glm5 && layers[0].weights[2] &&
         layers[0].weights[2]->dataType == fastllm::DataType::DATA_GGUF_FORMAT;
     if ((layers[0].deepSeekV41 || layers[0].glm5) && !registerNumaWeights) return false;
-    const bool registerBeforeSnapshot = layers[0].deepSeekV41 ||
+    const bool opaqueFormat = layers[0].weights[2]->dataType==fastllm::EXL3;
+    const bool registerBeforeSnapshot = opaqueFormat || layers[0].deepSeekV41 ||
         (layers[0].glm5 && !canonicalGlmGGUF);
     if (registerBeforeSnapshot) {
         registerNumaWeights();
     }
+    const bool rawHost = opaqueFormat && layers[0].weights[2]->numasData.empty();
     // Preserve the native R4 fast path for its original uniform Q2_K/Q4_K
     // group. Mixed V4.1 groups use canonical records with per-layer layouts.
     bool canonicalV41GGUF = false;
@@ -2205,7 +2326,7 @@ bool FastllmCudaPrepareMoeCacheWithBudgets(
             const bool scoredFp8 = (layers[0].deepSeekV41 || layers[0].glm5) &&
                 observed.weightType == fastllm::DataType::FP8_E4M3_BLOCK_128;
             if (layers[0].deepSeekV41 !=
-                (observed.weightType == fastllm::DataType::NVFP4_BLOCK_32_E8M0 || v41GGUF ||
+                (observed.weightType == fastllm::DataType::NVFP4_BLOCK_32_E8M0 || observed.weightType == fastllm::EXL3 || v41GGUF ||
                  (layers[0].deepSeekV41 && scoredFp8))) return false;
             const bool glmGGUF = layers[0].glm5 &&
                 observed.weightType == fastllm::DataType::DATA_GGUF_FORMAT;
@@ -2228,9 +2349,9 @@ bool FastllmCudaPrepareMoeCacheWithBudgets(
                 observed.swigluLimit = layers[0].swigluLimit;
                 layout = observed;
                 first = false;
-            } else if (observed.weightType == fastllm::DataType::DATA_GGUF_FORMAT &&
-                       (!layers[0].deepSeekV41 || canonicalV41GGUF)) {
-                if (layout.weightType != observed.weightType || (canonicalV41GGUF &&
+            } else if (opaqueFormat || (observed.weightType == fastllm::DataType::DATA_GGUF_FORMAT &&
+                       (!layers[0].deepSeekV41 || canonicalV41GGUF))) {
+                if (layout.weightType != observed.weightType || ((canonicalV41GGUF || opaqueFormat) &&
                     (layout.hidden != observed.hidden || layout.inter != observed.inter))) return false;
                 layout.recordStride = std::max(layout.recordStride, observed.recordStride);
             } else {
@@ -2259,10 +2380,10 @@ bool FastllmCudaPrepareMoeCacheWithBudgets(
     for (int layer = 0; layer < layerCount; ++layer)
         group->cacheDevices.push_back(layers[layer].cacheDevice);
     group->allowStreaming = allowStreaming && registerNumaWeights &&
-        (layout.weightType == fastllm::DATA_GGUF_FORMAT ||
+        (opaqueFormat || layout.weightType == fastllm::DATA_GGUF_FORMAT ||
          (layout.glm5 && (layout.weightType == fastllm::NVFP4_BLOCK_16_E4M3_PACKED ||
                          layout.weightType == fastllm::FP8_E4M3_BLOCK_128)));
-    if (layout.weightType == fastllm::DataType::DATA_GGUF_FORMAT) {
+    if (opaqueFormat || layout.weightType == fastllm::DataType::DATA_GGUF_FORMAT) {
         group->layerLayouts = std::move(layerLayouts);
     }
     if (static_cast<size_t>(layerCount) >
@@ -2296,19 +2417,19 @@ bool FastllmCudaPrepareMoeCacheWithBudgets(
     const auto *storage = backend ? backend->storage : nullptr;
     // Borrow supported NUMA layouts; snapshot only formats whose CPU packing
     // cannot yet be restored. GPU records always retain canonical GGUF bytes.
-    const bool shareNuma = bool(registerNumaWeights) &&
+    const bool shareNuma = !opaqueFormat && bool(registerNumaWeights) &&
                           (layout.weightType != fastllm::DataType::DATA_GGUF_FORMAT ||
                            (layout.deepSeekV41 && !canonicalV41GGUF));
     const bool shareGGUF = bool(registerNumaWeights) &&
-        layout.weightType == fastllm::DATA_GGUF_FORMAT &&
-        (canonicalV41GGUF || (!layout.deepSeekV41 && CanShareGGUFWeights(layers, layerCount)));
+        ((opaqueFormat && !rawHost) || (layout.weightType == fastllm::DATA_GGUF_FORMAT &&
+        (canonicalV41GGUF || (!layout.deepSeekV41 && CanShareGGUFWeights(layers, layerCount)))));
     if (shareNuma && (!storage || layout.recordStride > UINT32_MAX / kMaxTopK ||
                       !storage->plan(layout, group->sharedLayout))) return false;
     const size_t hostStride = shareNuma ? group->sharedLayout.auxiliaryBytes : layout.recordStride;
     size_t hostBytes = 0;
     for (int layer = 0; layer < layerCount; ++layer) {
         group->layerHostOffsets.push_back(hostBytes);
-        hostBytes += size_t(experts) * (shareGGUF ? 0 :
+        hostBytes += size_t(experts) * ((rawHost || shareGGUF) ? 0 :
             (shareNuma ? hostStride : group->LayerLayout(layer).recordStride));
     }
     void *host = nullptr;
@@ -2351,7 +2472,11 @@ bool FastllmCudaPrepareMoeCacheWithBudgets(
             uint8_t *record = hostBytes ? group->hostRecords +
                 group->layerHostOffsets[layer] + size_t(expert) *
                     (shareNuma ? hostStride : recordLayout.recordStride) : nullptr;
-            if (shareNuma || shareGGUF) {
+            if (rawHost) {
+                group->rawHostWeights.push_back(gate); group->rawHostWeights.push_back(down);
+                gate->hostMoeUnbound = gate->numasData.empty();
+                down->hostMoeUnbound = down->numasData.empty();
+            } else if (shareNuma || shareGGUF) {
                 expertWeights.push_back(gate);
                 expertWeights.push_back(down);
                 if (shareNuma) storage->snapshot(layout, *gate, *down, record);
@@ -2369,12 +2494,16 @@ bool FastllmCudaPrepareMoeCacheWithBudgets(
     }
     if (shareGGUF) {
         if (!registerBeforeSnapshot) registerNumaWeights();
-        if (!BindGGUFWeights(*group, expertWeights)) return false;
+        if (!BindPackedHostWeights(*group, expertWeights)) return false;
         size_t sharedBytes = 0;
         for (const auto &l : group->layerLayouts) sharedBytes += size_t(experts) * l.recordStride;
-        std::fprintf(stderr, "[Fastllm] GGUF expert cache shares %d NUMA shards per weight; "
+        std::fprintf(stderr, "[Fastllm] Packed expert cache shares %d NUMA shards per weight; "
             "avoiding a %.3f GiB host weight snapshot.\n",
             group->ggufSources.front().shards, double(sharedBytes) / (1ULL << 30));
+    }
+    if (rawHost) {
+        group->mappedWeights=false;
+        fprintf(stderr,"[Fastllm] Opaque expert cache borrows %zu CPU matrices; bounded upload staging, no host weight snapshot.\n",group->rawHostWeights.size());
     }
     if (shareNuma) {
         if (!registerBeforeSnapshot) registerNumaWeights();
@@ -2451,8 +2580,14 @@ bool FastllmCudaCanRunMoeHybrid(fastllm::Data **weights, int weightsBatch) {
     return FindHybridGroup(weights, weightsBatch) != nullptr;
 }
 
+bool FastllmCudaCanRunMoeHybridPrefill(fastllm::Data **weights, int weightsBatch) {
+    const auto *group = FindHybridGroup(weights, weightsBatch);
+    const auto *backend = group ? FindExpertCacheBackend(group->layout.weightType) : nullptr;
+    return backend && backend->prefill;
+}
+
 static bool SharedMoePrefillSupported(const OffloadGroup &group) {
-    if (NativeSharedRecords(group) || NativeGlmGGUFRecords(group)) return true;
+    if (!group.rawHostWeights.empty() || (group.layout.weightType == fastllm::EXL3 && !group.ggufSources.empty()) || NativeSharedRecords(group) || NativeGlmGGUFRecords(group)) return true;
     if (!group.sharedLayout.shards) return false;
     return group.layout.weightType == fastllm::NVFP4_BLOCK_32_E8M0 ||
            group.layout.weightType == fastllm::NVFP4_BLOCK_16_E4M3 ||
@@ -2496,7 +2631,7 @@ bool FastllmCudaGetMoePrefillResidents(fastllm::Data **weights, int experts,
     view.gateType = layout.gateGgmlType; view.downType = layout.downGgmlType;
     view.hidden = layout.hidden; view.inter = layout.inter;
     view.ownerRank = cache.prefillOwnerRank; view.ownerCount = cache.prefillOwnerCount;
-    view.nativeWeights = NativeSharedRecords(*group) || NativeGlmGGUFRecords(*group);
+    view.nativeWeights = layout.weightType == fastllm::EXL3 || !group->rawHostWeights.empty() || NativeSharedRecords(*group) || NativeGlmGGUFRecords(*group);
     view.sharedWeights = SharedMoePrefillSupported(*group);
     view.nativeGlm = layout.glm5 && view.nativeWeights;
     view.nativeGGUF = view.nativeGlm || NativeStandardGGUFRecords(*group);
@@ -2541,6 +2676,7 @@ bool FastllmCudaCanRunMoeCacheSmallBatch(
     OffloadGroup *group = FindGroup(weights, weightsBatch, &tableId);
     if (!group || (!FastllmCudaMoeCacheRequested() && !group->allowStreaming)) return false;
     const auto &layout = group->LayerLayout(tableId);
+    if (layout.weightType == fastllm::EXL3 && index.dims[1] > 8) return false;
     // Reject incompatible arithmetic before allocating or changing a cache.
     if (input.dims[1] != layout.hidden ||
         ((layout.deepSeekV41 || layout.glm5) &&
@@ -2710,6 +2846,10 @@ bool ComputeV41Cache(const fastllm::Data &input, fastllm::Data &activation,
 bool ComputeStagedNativeExpert(const fastllm::Data &input, fastllm::Data &gate,
         fastllm::Data &output, const OffloadLayout &layout, const DecodeOverlapWorkspace &work,
         int32_t *slot, const float *score, float *perExpert, const FastllmCudaMoeStageEvents &events) {
+    if (layout.weightType==fastllm::EXL3)
+        return FastllmCudaExl3Cache(input,work.records,slot,nullptr,layout.recordStride,
+            layout.downOffset,layout.inter,layout.gateBlockK,layout.downBlockK,score,1,layout.swigluLimit,perExpert);
+
     const bool v41 = layout.deepSeekV41 &&
         layout.weightType == fastllm::NVFP4_BLOCK_32_E8M0 && input.dataType == fastllm::BFLOAT16;
     const bool scoredFp8 = (layout.glm5 || layout.deepSeekV41) &&
@@ -2739,7 +2879,7 @@ bool ComputeV41Cache(const fastllm::Data &input, fastllm::Data &activation,
     using namespace fastllm::cuda::dsv41_cache;
     Gate<><<<dim3(layout.inter / 32, topk), 512, 0, cudaStreamPerThread>>>(
         (const __nv_bfloat16*)input.cudaData, cache.routeSlots, cache.records, scores,
-        (__nv_bfloat16*)activation.cudaData, layout.hidden, layout.inter, layout.recordStride, layout.swigluLimit, 1, nullptr, layout.planarMxfp4);
+        (__nv_bfloat16*)activation.cudaData, layout.hidden, layout.inter, layout.recordStride, layout.swigluLimit, 1, nullptr, layout.planarMxfp4, nullptr, FastllmCudaBFloat16SiluTable());
     Down<<<dim3(layout.hidden / 8, topk), 128, 0, cudaStreamPerThread>>>(
         (const __nv_bfloat16*)activation.cudaData, cache.routeSlots, cache.records, perExpert,
         layout.hidden, layout.inter, layout.recordStride, layout.downOffset, nullptr, layout.planarMxfp4);
@@ -2803,6 +2943,16 @@ bool ComputeGGUFCache(const fastllm::Data &input, fastllm::Data &gateOutput,
     return ComputeGGUFExperts(input, gateOutput, output, layout, view, scores, topk, perExpert);
 }
 
+bool Exl3HybridShape(const OffloadLayout &layout) {
+    return layout.deepSeekV41 && layout.hidden%128==0 && layout.inter%128==0;
+}
+bool ComputeExl3Cache(const fastllm::Data &input, fastllm::Data &, fastllm::Data &,
+    const OffloadLayout &layout, const DeviceCache &cache, const float *scores, int topk, float *perExpert) {
+    return FastllmCudaExl3Cache(input,cache.records,cache.routeSlots,cache.slotOffsets,
+        layout.recordStride,layout.downOffset,layout.inter,layout.gateBlockK,layout.downBlockK,
+        scores,topk,layout.swigluLimit,perExpert);
+}
+
 const ExpertCacheBackend *FindExpertCacheBackend(fastllm::DataType type) {
     static const SharedCacheStorage nvfp4{PlanSharedNVFP4, SnapshotNVFP4Metadata, BindSharedNVFP4};
     static const SharedCacheStorage v41{PlanSharedV41, SnapshotV41, BindSharedV41};
@@ -2810,6 +2960,7 @@ const ExpertCacheBackend *FindExpertCacheBackend(fastllm::DataType type) {
     static const SharedCacheStorage fp8{PlanSharedFP8, SnapshotFP8Metadata, BindSharedFP8};
     static const SharedCacheStorage v41GGUF{PlanSharedV41GGUF, SnapshotV41GGUF, BindSharedV41GGUF};
     static const ExpertCacheBackend backends[] = {
+        {fastllm::EXL3, Exl3HybridShape, nullptr, ComputeExl3Cache, RunExl3CachedPrefill},
         {fastllm::DataType::DATA_GGUF_FORMAT, GGUFHybridShape, &v41GGUF, ComputeGGUFCache},
         {fastllm::DataType::NVFP4_BLOCK_32_E8M0, FP8HybridShape, &v41, ComputeV41Cache},
         {fastllm::DataType::NVFP4_BLOCK_16_E4M3, SupportsNVFP4WideDecode, &nvfp4, ComputeNVFP4Cache},
@@ -3067,6 +3218,10 @@ static void PrepareFrequencyPolicy(OffloadGroup *group, DeviceCache *cache) {
             config.replacementFactor, config.minimumResidence, config.prefillPrior, int(config.rankByBytes));
     }
     if (cache->frequencyResidencyDirty) {
+        // A native decode may overlap admissions on another stream. A host
+        // snapshot must observe the complete payload/residency publication,
+        // including when the caller deliberately skipped the ordinary wait.
+        WaitCacheAdmission(*cache);
         std::vector<int> owners(cache->slots);
         if (!owners.empty()) checkCudaErrors("MoE frequency residency", cudaMemcpyAsync(owners.data(), cache->slotKeys,
             owners.size() * sizeof(int), cudaMemcpyDeviceToHost, cudaStreamPerThread));
@@ -3431,6 +3586,8 @@ void FastllmCudaMoePrefillCache::Upload(int slot, void *streamPointer) {
                 if (weight->cpuData) {
                     checkCudaErrors("MoE prefill pageable upload", fastllm::cuda::UploadImmutableHostWeight(
                         weight->cudaData, weight->cpuData, weight->GetBytes(), false, stream));
+                } else if (weight->dataType == fastllm::EXL3) {
+                    FastllmCudaRestoreExl3Weight(*weight, weight->cudaData, stream);
                 } else {
                     const size_t bytes = weight->GetBytes() / weight->numasData.size();
                     for (size_t node = 0; node < weight->numasData.size(); ++node)
@@ -3445,6 +3602,17 @@ void FastllmCudaMoePrefillCache::Upload(int slot, void *streamPointer) {
     if (s.resident.nativeWeights) {
         if (at < int(s.admission.weights.size()) && s.admission.weights[at]) {
             const auto &source = *s.source[slot];
+            if (!s.group->rawHostWeights.empty()) {
+                checkCudaErrors("MoE prefill opaque upload", fastllm::cuda::UploadImmutableHostWeight(
+                    weight->cudaData, source.cpuData, source.GetBytes(), false, stream));
+                s.cache->prefillStats[6] += source.GetBytes();
+                return;
+            }
+            if (source.dataType == fastllm::EXL3) {
+                FastllmCudaRestoreExl3Weight(source, weight->cudaData, stream);
+                s.cache->prefillStats[6] += source.GetBytes();
+                return;
+            }
             const size_t bytes = source.GetBytes() / source.numasData.size();
             for (size_t node = 0; node < source.numasData.size(); ++node)
                 checkCudaErrors("MoE prefill native upload", fastllm::cuda::UploadImmutableHostWeight(
@@ -3766,11 +3934,84 @@ bool FastllmCudaMoeExpertParallelReadback(FastllmCudaMoeExpertParallel &state, i
     return true;
 }
 
+static bool Mxfp4BatchMmaSupported() {
+#if defined(CUDA_NO_TENSOR_CORE) || defined(USE_ROCM)
+    return false;
+#else
+    static thread_local std::map<int, bool> supported;
+    const int device = FastllmCudaGetDevice();
+    auto found = supported.find(device);
+    if (found != supported.end()) return found->second;
+    if (FastllmCudaGraphIsCapturingFast()) return false;
+    cudaDeviceProp properties{};
+    cudaFuncAttributes gate{}, down{};
+    using namespace fastllm::cuda::dsv41_cache;
+    const bool ok = cudaGetDeviceProperties(&properties, device) == cudaSuccess &&
+        properties.major >= 8 &&
+        cudaFuncGetAttributes(&gate, GateMmaBatch) == cudaSuccess &&
+        cudaFuncGetAttributes(&down, DownMmaBatch) == cudaSuccess &&
+        gate.ptxVersion >= 80 && down.ptxVersion >= 80 &&
+        gate.maxThreadsPerBlock >= 512 && down.maxThreadsPerBlock >= 256;
+    if (!ok) (void)cudaGetLastError();
+    supported.emplace(device, ok);
+    return ok;
+#endif
+}
+
+const fastllm::kernels::Family mxfp4Family{3,"moe.nvfp4.gate_swiglu_down",__DATE__ " " __TIME__,{
+    {"cuda.moe.nvfp4.native",json11::Json::object{{"backend","cuda"},{"description","CUDA grouped fused expert block"},{"layout","interleaved or planar"},{"graph",true}}},
+    {"cuda.moe.nvfp4.triton",json11::Json::object{{"backend","triton"},{"description","Triton grouped gate/SwiGLU/down block"},
+        {"sm",json11::Json::array{120,121}},{"rows",json11::Json::array{2,8}},{"hidden",5120},{"intermediate",2304},
+        {"topk",json11::Json::array{3,6}},{"layout","planar"},{"parameters",json11::Json::object{{"warps",4},{"stages",2}}},{"graph",true}}},
+    {"cuda.moe.nvfp4.triton.batch",json11::Json::object{{"backend","triton"},{"description","Triton 16-route grouped expert block"},
+        {"sm",json11::Json::array{120,121}},{"rows_min",2},{"max_routes",fastllm::kCudaTritonMxfp4GroupedMaxRoutes},
+        {"row_limit","tensor indexing capacity; max_routes applies per launch"},{"hidden",5120},{"intermediate",2304},
+        {"topk",json11::Json::array{3,6}},{"layout","planar"},
+        {"parameters",json11::Json::object{{"route_tile",16},{"warps",4},{"stages",2}}},{"graph",true}}}
+}};
+const bool mxfp4Registered=[] {fastllm::kernels::Register(&mxfp4Family);return true;}();
+fastllm::kernels::Signature Mxfp4Signature(const OffloadLayout &layout,int rows,int topk,int routes) {
+    return {{3,FastllmCudaGetDevice(),FastllmCudaRuntimeArch(),rows,layout.hidden,layout.inter,topk,routes,
+        int(layout.planarMxfp4),int(layout.weightType),int(layout.swigluLimit*1000),0}};
+}
+static bool ComputeBatchExperts(const fastllm::Data &,fastllm::Data &,fastllm::Data &,const OffloadLayout &,
+        const FastllmCudaMoeGGUFCacheView &,const float *,int,float *,bool);
+struct Mxfp4KernelContext {
+    const fastllm::Data &input;fastllm::Data &activation,&output;
+    const OffloadLayout &layout;const FastllmCudaMoeGGUFCacheView &view;
+    const float *scores;int topk;float *perExpert;
+    static bool Run(void *p,int impl) {
+        auto &c=*static_cast<Mxfp4KernelContext *>(p);
+        if(impl==1)return fastllm::TryCudaTritonMxfp4GroupedCandidate(c.input,c.activation,c.view.records,c.view.routeSlots,
+            c.view.routeMap,c.scores,c.perExpert,c.view.workspace,c.view.routeCount,c.layout.hidden,c.layout.inter,
+            c.topk,c.layout.recordStride,c.layout.downOffset,c.layout.swigluLimit,c.layout.planarMxfp4,true);
+        if(impl==2)return fastllm::TryCudaTritonMxfp4GroupedBatchCandidate(c.input,c.activation,c.view.records,c.view.routeSlots,
+            c.view.routeMap,c.scores,c.perExpert,c.view.workspace,c.view.routeCount,c.layout.hidden,c.layout.inter,
+            c.topk,c.layout.recordStride,c.layout.downOffset,c.layout.swigluLimit,c.layout.planarMxfp4,true);
+        return ComputeBatchExperts(c.input,c.activation,c.output,c.layout,c.view,c.scores,c.topk,c.perExpert,true);
+    }
+    static std::string Unsupported(void *p,int impl) {
+        if(!impl)return "";
+        auto &c=*static_cast<Mxfp4KernelContext *>(p);
+        if(c.layout.hidden!=5120||c.layout.inter!=2304||!c.layout.planarMxfp4||c.layout.swigluLimit!=10||
+           (c.topk!=3&&c.topk!=6)||c.view.routeCount<4||
+           c.view.routeCount>(impl==1 ? 48 : fastllm::kCudaTritonMxfp4GroupedMaxRoutes))return "unsupported expert shape/layout";
+        return fastllm::kernels::TritonSupport(c.input.dims[0],impl==1 ? 8 : INT_MAX,
+            "FASTLLM_CUDA_TRITON_MXFP4_GROUPED");
+    }
+};
+
 // Shared batch arithmetic adapter; scheduling and transport are independent
 // of the model's activation boundary and ordered expert reduction.
 static bool ComputeBatchExperts(const fastllm::Data &input, fastllm::Data &activation,
         fastllm::Data &output, const OffloadLayout &layout, const FastllmCudaMoeGGUFCacheView &view,
         const float *scores, int topk, float *perExpert, bool grouped = false) {
+    if (layout.weightType == fastllm::NVFP4_BLOCK_16_E4M3)
+        return ComputeNVFP4Batch(input, activation, layout, view, topk, perExpert);
+    if (layout.weightType == fastllm::EXL3)
+        return FastllmCudaExl3Cache(input, view.records, view.routeSlots, view.slotOffsets,
+            layout.recordStride, layout.downOffset, layout.inter, layout.gateBlockK, layout.downBlockK,
+            scores, topk, layout.swigluLimit, perExpert, 0, view.routeMap, view.routeCount, true);
     if (layout.weightType == fastllm::DATA_GGUF_FORMAT)
         return ComputeGGUFExperts(input, activation, output, layout, view, scores, topk, perExpert);
     if (layout.glm5)
@@ -3780,18 +4021,58 @@ static bool ComputeBatchExperts(const fastllm::Data &input, fastllm::Data &activ
         return ComputeScoredFP8Experts(input, activation, layout, view.records, view.routeSlots,
             scores, topk, perExpert, view.routeMap, view.routeCount);
     if (layout.weightType != fastllm::NVFP4_BLOCK_32_E8M0) return false;
+    if(grouped && view.routeMap && fastllm::kernels::Enabled()) {
+        Mxfp4KernelContext context{input,activation,output,layout,view,scores,topk,perExpert};
+        auto signature=Mxfp4Signature(layout,input.dims[0],topk,view.routeCount);
+        fastllm::kernels::CudaCase benchmark{&context,Mxfp4KernelContext::Run,Mxfp4KernelContext::Unsupported,
+            perExpert,size_t(input.dims[0])*topk*layout.hidden,false};
+        const int selected=fastllm::kernels::SelectCuda(mxfp4Family,signature,benchmark);
+        if(selected>=0){fastllm::kernels::Bypass bypass;return fastllm::kernels::LaunchCuda(mxfp4Family,benchmark,selected);}
+    }
     if (grouped && fastllm::TryCudaTritonMxfp4Grouped(input, activation,
             view.records, view.routeSlots, view.routeMap, scores, perExpert,
             view.workspace, view.routeCount, layout.hidden, layout.inter,
             topk, layout.recordStride, layout.downOffset, layout.swigluLimit, layout.planarMxfp4)) return true;
     using namespace fastllm::cuda::dsv41_cache;
-    Gate<true><<<dim3(layout.inter / 32, view.routeCount), 512, 0, cudaStreamPerThread>>>(
-        (const __nv_bfloat16 *)input.cudaData, view.routeSlots, view.records, scores,
-        (__nv_bfloat16 *)activation.cudaData, layout.hidden, layout.inter,
-        layout.recordStride, layout.swigluLimit, topk, view.routeMap, layout.planarMxfp4);
-    Down<<<dim3(layout.hidden / 8, view.routeCount), 128, 0, cudaStreamPerThread>>>(
-        (const __nv_bfloat16 *)activation.cudaData, view.routeSlots, view.records, perExpert,
-        layout.hidden, layout.inter, layout.recordStride, layout.downOffset, view.routeMap, layout.planarMxfp4);
+    if (grouped && view.routeMap && layout.hidden % 32 == 0 && layout.inter % 32 == 0 &&
+            Mxfp4BatchMmaSupported()) {
+        // Select by actual expert reuse on device. One/two-route groups retain
+        // the existing SIMT geometry; larger groups share decoded MMA fragments.
+        const int tiles = (view.routeCount + batch_mma::Tokens - 1) / batch_mma::Tokens;
+        GateReuse<true><<<dim3(layout.inter / 32, view.routeCount), 512, 0, cudaStreamPerThread>>>(
+            (const __nv_bfloat16 *)input.cudaData, view.routeSlots, view.records, scores,
+            (__nv_bfloat16 *)activation.cudaData, layout.hidden, layout.inter,
+            layout.recordStride, layout.swigluLimit, topk, view.routeMap, view.routeCount, layout.planarMxfp4, FastllmCudaBFloat16SiluTable());
+        GateMmaBatch<<<dim3(layout.inter / 32, tiles), 512, 0, cudaStreamPerThread>>>(
+            (const __nv_bfloat16 *)input.cudaData, view.routeSlots, view.records, scores,
+            (__nv_bfloat16 *)activation.cudaData, layout.hidden, layout.inter,
+            layout.recordStride, layout.swigluLimit, topk, view.routeMap, view.routeCount, layout.planarMxfp4, FastllmCudaBFloat16SiluTable());
+        DownReuse<true><<<dim3(layout.hidden / 8, view.routeCount), 128, 0, cudaStreamPerThread>>>(
+            (const __nv_bfloat16 *)activation.cudaData, view.routeSlots, view.records, perExpert,
+            layout.hidden, layout.inter, layout.recordStride, layout.downOffset,
+            view.routeMap, view.routeCount, layout.planarMxfp4);
+        DownMmaBatch<<<dim3(layout.hidden / 16, tiles), 256, 0, cudaStreamPerThread>>>(
+            (const __nv_bfloat16 *)activation.cudaData, view.routeSlots, view.records, perExpert,
+            layout.hidden, layout.inter, layout.recordStride, layout.downOffset,
+            view.routeMap, view.routeCount, layout.planarMxfp4);
+    } else if (grouped && view.routeMap) {
+        GateReuse<<<dim3(layout.inter / 32, view.routeCount), 512, 0, cudaStreamPerThread>>>(
+            (const __nv_bfloat16 *)input.cudaData, view.routeSlots, view.records, scores,
+            (__nv_bfloat16 *)activation.cudaData, layout.hidden, layout.inter,
+            layout.recordStride, layout.swigluLimit, topk, view.routeMap, view.routeCount, layout.planarMxfp4, FastllmCudaBFloat16SiluTable());
+        DownReuse<<<dim3(layout.hidden / 8, view.routeCount), 128, 0, cudaStreamPerThread>>>(
+            (const __nv_bfloat16 *)activation.cudaData, view.routeSlots, view.records, perExpert,
+            layout.hidden, layout.inter, layout.recordStride, layout.downOffset,
+            view.routeMap, view.routeCount, layout.planarMxfp4);
+    } else {
+        Gate<true><<<dim3(layout.inter / 32, view.routeCount), 512, 0, cudaStreamPerThread>>>(
+            (const __nv_bfloat16 *)input.cudaData, view.routeSlots, view.records, scores,
+            (__nv_bfloat16 *)activation.cudaData, layout.hidden, layout.inter,
+            layout.recordStride, layout.swigluLimit, topk, view.routeMap, layout.planarMxfp4, nullptr, FastllmCudaBFloat16SiluTable());
+        Down<<<dim3(layout.hidden / 8, view.routeCount), 128, 0, cudaStreamPerThread>>>(
+            (const __nv_bfloat16 *)activation.cudaData, view.routeSlots, view.records, perExpert,
+            layout.hidden, layout.inter, layout.recordStride, layout.downOffset, view.routeMap, layout.planarMxfp4);
+    }
     return cudaGetLastError() == cudaSuccess;
 }
 
@@ -3800,16 +4081,17 @@ static int EndMoeFrequencyStep(DeviceCache &cache);
 // Complete immutable native caches do not need a CPU routing round trip.
 // Stable expert ordering groups weight reads while routeMap retains each
 // original token/top-k slot for activation storage and the ordered reduction.
-__global__ void PrepareCompleteNativeRoutes(const int32_t *indices, const int32_t *keys,
-        int32_t *slots, int32_t *routeMap, int base, int experts, int routes) {
-    const int r = threadIdx.x;
+__global__ void InitCompleteNativeRouteOrder(int32_t *order, int routes) {
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r < routes) order[r] = r;
+}
+
+__global__ void BindCompleteNativeRouteSlots(int32_t *experts, const int32_t *keys,
+        int base, int count, int routes) {
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
     if (r >= routes) return;
-    const int expert = indices[r];
-    int rank = 0;
-    for (int j = 0; j < routes; ++j)
-        rank += indices[j] < expert || (indices[j] == expert && j < r);
-    slots[rank] = expert >= 0 && expert < experts ? keys[base + expert] : -1;
-    routeMap[rank] = r;
+    const int expert = experts[r];
+    experts[r] = expert >= 0 && expert < count ? keys[base + expert] : -1;
 }
 
 static bool RunCompleteNativeCache(OffloadGroup &group, DeviceCache &cache, int table,
@@ -3841,38 +4123,52 @@ static bool RunCompleteNativeCache(OffloadGroup &group, DeviceCache &cache, int 
         data.dataType = type; data.Resize(shape);
         data.ToDevice(CUDA, {cache.device}, false); data.Allocate(false);
     };
+    const int topk = index.dims[1], hidden = layout.hidden, rows = input.dims[0];
+    const uint64_t routeCount = uint64_t(rows) * topk;
+    if (routeCount > uint64_t(INT_MAX) / std::max(layout.hidden, layout.inter)) return false;
     allocate(output, BFLOAT16, input.dims);
     if (parallel) { parallel(); FastllmCudaSetDevice(cache.device); }
-    const int topk = index.dims[1], hidden = layout.hidden;
-    // A bounded per-tile workspace supports arbitrary positive row counts,
-    // including draft lengths larger than the grouped kernel's eight rows.
-    for (int first = 0; first < input.dims[0]; first += 8) {
-        const int rows = std::min(8, input.dims[0] - first), routes = rows * topk;
-        Data x, ids, scores, result, quantized, gate, partial, slots, routeMap;
-        x.FakeFrom(input, size_t(first) * hidden * sizeof(uint16_t)); x.Resize({rows, hidden});
-        ids.FakeFrom(index, size_t(first) * topk * sizeof(int)); ids.Resize({rows, topk});
-        scores.FakeFrom(score, size_t(first) * topk * sizeof(float)); scores.Resize({rows, topk});
-        result.FakeFrom(output, size_t(first) * hidden * sizeof(uint16_t)); result.Resize({rows, hidden});
-        allocate(quantized, BFLOAT16, {rows, hidden}); allocate(gate, BFLOAT16, {routes, layout.inter});
-        allocate(partial, FLOAT32, {routes, hidden}); allocate(slots, INT32, {routes});
-        allocate(routeMap, INT32, {routes});
-        PrepareCompleteNativeRoutes<<<1, 256, 0, cudaStreamPerThread>>>(
-            static_cast<const int32_t *>(ids.cudaData), cache.keyToSlot,
-            static_cast<int32_t *>(slots.cudaData), static_cast<int32_t *>(routeMap.cudaData),
-            table * layout.experts, layout.experts, routes);
-        checkCudaErrors("Complete MoE partial reset", cudaMemsetAsync(partial.cudaData, 0,
-            size_t(routes) * hidden * sizeof(float), cudaStreamPerThread));
-        if (!FastllmCudaDeepSeekV41QuantizeActivation(x, quantized)) return false;
+    // Group the complete logical batch once. The arithmetic backends tile
+    // their own work without discarding expert reuse at adapter boundaries.
+    const int routes = int(routeCount);
+    Data quantized, gate, partial, slots, routeMap, order, sorting;
+    allocate(quantized, BFLOAT16, {rows, hidden}); allocate(gate, BFLOAT16, {routes, layout.inter});
+    allocate(partial, FLOAT32, {routes, hidden}); allocate(slots, INT32, {routes});
+    allocate(routeMap, INT32, {routes}); allocate(order, INT32, {routes});
+    InitCompleteNativeRouteOrder<<<(routes + 255) / 256, 256, 0, cudaStreamPerThread>>>(
+        static_cast<int32_t *>(order.cudaData), routes);
+    size_t sortBytes = 0;
+    auto sort = [&](void *workspace) {
+        return cub::DeviceRadixSort::SortPairs(workspace, sortBytes,
+            static_cast<const int32_t *>(index.cudaData), static_cast<int32_t *>(slots.cudaData),
+            static_cast<const int32_t *>(order.cudaData), static_cast<int32_t *>(routeMap.cudaData),
+            routes, 0, 32, cudaStreamPerThread);
+    };
+    checkCudaErrors("Complete MoE route sort workspace", sort(nullptr));
+    if (sortBytes > INT_MAX) return false;
+    allocate(sorting, INT8, {int(sortBytes)});
+    checkCudaErrors("Complete MoE route sort", sort(sorting.cudaData));
+    BindCompleteNativeRouteSlots<<<(routes + 255) / 256, 256, 0, cudaStreamPerThread>>>(
+        static_cast<int32_t *>(slots.cudaData), cache.keyToSlot, table * layout.experts, layout.experts, routes);
+    checkCudaErrors("Complete MoE partial reset", cudaMemsetAsync(partial.cudaData, 0,
+        size_t(routes) * hidden * sizeof(float), cudaStreamPerThread));
+    if (!FastllmCudaDeepSeekV41QuantizeActivation(input, quantized)) return false;
+    // CUDA grid.y is bounded even when tensor indexing and storage can hold
+    // more routes. Keep the global sort and route indices; split only launches.
+    constexpr int maxRoutesPerLaunch = 65535;
+    for (int first = 0; first < routes; first += maxRoutesPerLaunch) {
         FastllmCudaMoeGGUFCacheView view{};
-        view.records = cache.records; view.routeSlots = static_cast<int32_t *>(slots.cudaData);
-        view.routeMap = static_cast<int32_t *>(routeMap.cudaData); view.routeCount = routes;
-        if (!ComputeBatchExperts(quantized, gate, result, layout, view,
-                static_cast<const float *>(scores.cudaData), topk, static_cast<float *>(partial.cudaData), true)) return false;
-        fastllm::cuda::dsv41_cache::Reduce<<<dim3((hidden + 255) / 256, rows), 256, 0, cudaStreamPerThread>>>(
-            static_cast<const float *>(partial.cudaData), static_cast<const float *>(partial.cudaData),
-            static_cast<const int32_t *>(ids.cudaData), static_cast<const int32_t *>(ids.cudaData),
-            static_cast<__nv_bfloat16 *>(result.cudaData), hidden, topk);
+        view.records = cache.records;
+        view.routeSlots = static_cast<int32_t *>(slots.cudaData) + first;
+        view.routeMap = static_cast<int32_t *>(routeMap.cudaData) + first;
+        view.routeCount = std::min(maxRoutesPerLaunch, routes - first);
+        if (!ComputeBatchExperts(quantized, gate, output, layout, view,
+                static_cast<const float *>(score.cudaData), topk, static_cast<float *>(partial.cudaData), true)) return false;
     }
+    fastllm::cuda::dsv41_cache::Reduce<true><<<((hidden + 255) / 256) * rows, 256, 0, cudaStreamPerThread>>>(
+        static_cast<const float *>(partial.cudaData), static_cast<const float *>(partial.cudaData),
+        static_cast<const int32_t *>(index.cudaData), static_cast<const int32_t *>(index.cudaData),
+        static_cast<__nv_bfloat16 *>(output.cudaData), hidden, topk);
     return cudaGetLastError() == cudaSuccess;
 }
 
@@ -4277,7 +4573,7 @@ bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int 
         const Data *gpuInput = expertInput;
         if (v41Batch && gpuCount) {
             allocate(work.quantizedInput, BFLOAT16, {rows, hidden});
-            AssertInFastLLM(FastllmCudaDeepSeekV41QuantizeActivation(input, work.quantizedInput),
+            AssertInFastLLM(PrepareCacheInput(layout, input, work.quantizedInput),
                 "Scored batch input quantization failed.");
             gpuInput = &work.quantizedInput;
         }
@@ -4683,7 +4979,8 @@ void *FastllmCudaBeginMoeDecode(fastllm::Data **weights, int weightsBatch, int t
     // Both native V4.1 layouts support cached and temporary GPU experts.
     // Auto-configured caches must not require a separate environment opt-in.
     const bool v41FrequencyScope = group->layout.deepSeekV41 &&
-        (group->layout.weightType == fastllm::NVFP4_BLOCK_32_E8M0 ||
+        (group->layout.weightType == fastllm::EXL3 ||
+         group->layout.weightType == fastllm::NVFP4_BLOCK_32_E8M0 ||
          group->layout.weightType == fastllm::FP8_E4M3_BLOCK_128 ||
          (group->layout.weightType == fastllm::DATA_GGUF_FORMAT &&
           !group->ggufSources.empty()));
@@ -4819,7 +5116,9 @@ static int EndMoeFrequencyStep(DeviceCache &cache) {
         const auto &layout = group.LayerLayout(table);
         auto *destination = cache.records + (cache.hostSlotOffsets.empty() ?
             size_t(a.slot) * layout.recordStride : cache.hostSlotOffsets[a.slot]);
-        if (NativeGlmGGUFRecords(group) || NativeStandardGGUFRecords(group)) {
+        if (!group.rawHostWeights.empty()) {
+            CopyRawHostExpert(group,table,expert,destination,stream);
+        } else if (NativeGlmGGUFRecords(group) || NativeStandardGGUFRecords(group)) {
             CopyNativeGGUFExpert(group, table, expert, destination, stream);
         } else if (NativeSharedRecords(group)) {
             CopyNativeSharedExpert(group, table, expert, destination, stream);
@@ -4958,6 +5257,42 @@ namespace { void WaitMailboxMoe(OffloadGroup &group); }
 #include "fastllm-moe-cooperative.cuh"
 #include "fastllm-moe-mailbox.cuh"
 #endif
+// A graph cannot benchmark kernels. Prepare each new expert signature on private
+// buffers before capture, using resident model records and deterministic, reused
+// routes. This does not touch request KV, sampler state or expert-cache ownership.
+static void WarmupMxfp4KernelPlan(const OffloadLayout &layout,DeviceCache &cache,int rows,int topk) {
+    using namespace fastllm;
+    if(!kernels::Enabled()||rows<2||layout.weightType!=NVFP4_BLOCK_32_E8M0||cache.slots<=0)return;
+    const int routes=rows*topk;
+    if(!kernels::NeedsPreparation(Mxfp4Signature(layout,rows,topk,routes)))return;
+    std::vector<int> keys(cache.slots);
+    kernels::CudaCheck(cudaMemcpyAsync(keys.data(),cache.slotKeys,keys.size()*sizeof(int),cudaMemcpyDeviceToHost,cudaStreamPerThread));
+    kernels::CudaCheck(cudaStreamSynchronize(cudaStreamPerThread));
+    std::vector<int> available;
+    for(int i=0;i<cache.slots&&available.size()<size_t(routes);++i)if(keys[i]>=0)available.push_back(i);
+    if(available.empty())return;
+    Data input(BFLOAT16,{rows,layout.hidden}),activation(BFLOAT16,{routes,layout.inter}),partial(FLOAT32,{routes,layout.hidden});
+    Data slots(INT32,{routes}),mapping(INT32,{routes}),scores(FLOAT32,{routes});
+    for(auto *d:{&input,&activation,&partial,&slots,&mapping,&scores}){d->dataDevice=CUDA;d->dataDeviceIds={cache.device};d->Allocate(false);}
+    std::vector<uint16_t> x(input.Count(0));std::vector<float> weights(routes,1.0f/topk);
+    std::vector<int> slot(routes),route(routes);
+    for(size_t i=0;i<x.size();++i){float f=float(int((i*73)%257)-128)/64;uint32_t bits;memcpy(&bits,&f,4);x[i]=uint16_t(bits>>16);}
+    // Mix repeated experts and distinct experts; sorted slots match the grouped contract.
+    for(int i=0;i<routes;++i)route[i]=i;
+    const int unique=std::min<int>(available.size(),std::max(topk,(routes+1)/2));
+    std::stable_sort(route.begin(),route.end(),[&](int a,int b){return a%unique<b%unique;});
+    for(int i=0;i<routes;++i)slot[i]=available[route[i]%unique];
+    auto upload=[&](void *dst,const void *src,size_t bytes){kernels::CudaCheck(cudaMemcpyAsync(dst,src,bytes,cudaMemcpyHostToDevice,cudaStreamPerThread));};
+    upload(input.cudaData,x.data(),x.size()*2);upload(slots.cudaData,slot.data(),routes*4);
+    upload(mapping.cudaData,route.data(),routes*4);upload(scores.cudaData,weights.data(),routes*4);
+    FastllmCudaMoeGGUFCacheView view{};view.records=cache.records;view.routeSlots=(int32_t*)slots.cudaData;
+    view.routeMap=(int32_t*)mapping.cudaData;view.routeCount=routes;
+    Data dummy;
+    if(!ComputeBatchExperts(input,activation,dummy,layout,view,(float*)scores.cudaData,topk,(float*)partial.cudaData,true))
+        throw std::runtime_error("kernel warmup expert plan rejected");
+    kernels::CudaCheck(cudaStreamSynchronize(cudaStreamPerThread));
+}
+
 #include "fastllm-moe-native-mailbox.cuh"
 
 void FastllmCudaWaitMoeDecodeCpu(void *state) {
@@ -5009,7 +5344,7 @@ static bool MergeMOEHybrid(const fastllm::Data &input,
         if (!SupportedCacheInput(input)) return false;
         int table = -1;
         auto *group = FindHybridGroup(weights, weightsBatch, &table);
-        if (!group) return false;
+        if (!group || (group->layout.weightType==fastllm::EXL3 && (input.dims[0]>8 || index.dims.back()>8))) return false;
         if (group->layout.glm5 && group->layout.weightType == fastllm::DATA_GGUF_FORMAT) {
             auto *cache = GetDeviceCache(*group);
             return cache && TryCooperativeMoe(*group, *cache, table,
@@ -5107,7 +5442,7 @@ static bool MergeMOEHybrid(const fastllm::Data &input,
         work.quantizedInput.dataDevice = input.dataDevice;
         work.quantizedInput.dataDeviceIds = input.dataDeviceIds;
         work.quantizedInput.Resize(input.dims);
-        fastllm::AssertInFastLLM(FastllmCudaDeepSeekV41QuantizeActivation(input, work.quantizedInput),
+        fastllm::AssertInFastLLM(PrepareCacheInput(layout, input, work.quantizedInput),
                                "Pure V4.1 cache input quantization failed.\n");
         auto &gateOutput = work.gateOutput;
         gateOutput.dataType = input.dataType;
@@ -5317,7 +5652,7 @@ static bool MergeMOEHybrid(const fastllm::Data &input,
                 work.quantizedInput.dataDevice = input.dataDevice;
                 work.quantizedInput.dataDeviceIds = input.dataDeviceIds;
                 work.quantizedInput.Resize(input.dims);
-                fastllm::AssertInFastLLM(FastllmCudaDeepSeekV41QuantizeActivation(input, work.quantizedInput),
+                fastllm::AssertInFastLLM(PrepareCacheInput(layout, input, work.quantizedInput),
                                        "V4.1 cache input quantization failed.\n");
             }
             const double dispatchStart = frequency ? 0 : HybridNowUs();
@@ -5482,14 +5817,22 @@ static bool MergeMOEHybrid(const fastllm::Data &input,
 #endif
 }
 
+#include "fastllm-moe-exl3-prefill.cuh"
+
 bool FastllmCudaMergeMOEHybrid(const fastllm::Data &input,
         const fastllm::Data &index, const fastllm::Data &score,
         fastllm::Data &output, fastllm::Data **weights, int weightsBatch, int layer,
         const std::function<void()> &launchParallel) {
-    // Bound scratch to the existing verifier capacity. Each row keeps its
-    // activation quantization and reduction; short prefill tails need not use
-    // the CPU-only backend just because they exceed the verifier row count.
-    if (input.dims.size() == 2 && input.dims[0] > 8 && input.dims[0] < 32 &&
+    if (weights && weightsBatch >= 4 && weights[2] && input.dims.size() == 2 && input.dims[0] > 1 &&
+        (routePhase != FastllmMoeRoutePhase::Verify && routePhase != FastllmMoeRoutePhase::Draft)) {
+        const auto *backend = FindExpertCacheBackend(weights[2]->dataType);
+        if (backend && backend->prefill)
+            return backend->prefill(input, index, score, output, weights, weightsBatch, launchParallel);
+    }
+    // Tile the eager adapter's bounded math workspace without imposing a
+    // scheduling limit on the logical batch. Full graphs group all rows once
+    // through their dynamically sized mailbox and tile only GPU computation.
+    if (input.dims.size() == 2 && input.dims[0] > 8 &&
         !FastllmCudaMoeCacheFullyResident(weights, weightsBatch) &&
         input.dataDevice == fastllm::DataDevice::CUDA && index.dataDevice == fastllm::DataDevice::CUDA &&
         score.dataDevice == fastllm::DataDevice::CUDA && input.dataType == fastllm::BFLOAT16 &&
@@ -5751,13 +6094,17 @@ extern "C" bool fastllm_moe_cuda_cache_prefill_stats(int device, uint64_t *value
 void *FastllmCudaNativeMoeGraphOwner(fastllm::Data **weights, int weightsBatch, int rows) {
 #if defined(USE_NUMAS) && !defined(USE_ROCM) && CUDART_VERSION >= 11070
     const char *mode = std::getenv("FASTLLM_DSV41_MOE_CACHE_MODE");
-    if ((mode && std::strcmp(mode, "gpu") == 0) || rows < 1 || rows > kNativeMoeMaxRows ||
+    if ((mode && std::strcmp(mode, "gpu") == 0) || rows < 1 || rows > std::numeric_limits<int>::max() / kMaxTopK ||
         FastllmCudaGraphIsCapturingFast()) return nullptr;
     int table = -1;
     auto *group = FindHybridGroup(weights, weightsBatch, &table);
     if (!group || !group->cpuDecodeReady || !group->expertDevices.empty() ||
         group->tensorParallelRequested) return nullptr;
     const auto &layout = group->LayerLayout(table);
+    // Math kernels use signed 32-bit element offsets. Check that capacity from
+    // the actual weight dimensions rather than choosing a scheduling row limit.
+    const int width = std::max(layout.hidden, layout.inter);
+    if (width <= 0 || rows > std::numeric_limits<int>::max() / kMaxTopK / width / 2) return nullptr;
     const bool supportedGGUF = layout.weightType == fastllm::DATA_GGUF_FORMAT &&
         FastllmCudaV41GGUFSupported(layout.gateGgmlType, layout.downGgmlType) &&
         FastllmCudaV41CanonicalGGUFCacheWorkspaceBytes(layout.hidden, layout.inter) != 0;
@@ -5766,7 +6113,8 @@ void *FastllmCudaNativeMoeGraphOwner(fastllm::Data **weights, int weightsBatch, 
          (layout.weightType == fastllm::DATA_GGUF_FORMAT && GGUFHybridShape(layout)));
     if (!standard && (!layout.deepSeekV41 ||
         (layout.weightType != fastllm::NVFP4_BLOCK_32_E8M0 &&
-         layout.weightType != fastllm::FP8_E4M3_BLOCK_128 && !supportedGGUF))) return nullptr;
+         layout.weightType != fastllm::FP8_E4M3_BLOCK_128 &&
+         !(layout.weightType==fastllm::EXL3 && Exl3HybridShape(layout)) && !supportedGGUF))) return nullptr;
     // Preserve the existing readiness fence for non-Qwen models.
     auto *cache = GetDeviceCache(*group, !standard);
     if (!cache || !NativeMailboxOwnsLayer(*group, *cache, table)) return nullptr;
@@ -5784,6 +6132,22 @@ void FastllmCudaReleaseNativeMoeFullGraph(void *handle) {
     if (!handle) return;
     auto *layer = static_cast<NativeMoeMailbox::Layer *>(handle);
     layer->owner->ReleaseFull(layer);
+#endif
+}
+
+void FastllmCudaPrepareNativeMoeKernelPlan(fastllm::Data **weights, int count, int rows, int topk) {
+#if defined(USE_NUMAS) && !defined(USE_ROCM) && CUDART_VERSION >= 11070
+    if (!fastllm::kernels::Enabled() || rows < 2 || topk < 1 || topk > kMaxTopK ||
+        FastllmCudaGraphIsCapturing() || FastllmCudaGraphMemoryPoolActive()) return;
+    auto *cache = static_cast<DeviceCache *>(FastllmCudaNativeMoeGraphOwner(weights, count, rows));
+    int table = -1;
+    auto *group = cache ? FindHybridGroup(weights, count, &table) : nullptr;
+    if (!group) return;
+    const auto &layout = group->LayerLayout(table);
+    const int tileRows = NativeBatchTileRows(layout, rows);
+    // Match the compute adapter's launch tiles, including a final partial tile.
+    for (int first = 0; first < rows; first += tileRows)
+        WarmupMxfp4KernelPlan(layout, *cache, std::min(tileRows, rows - first), topk);
 #endif
 }
 
@@ -5805,7 +6169,7 @@ void *FastllmCudaCreateNativeMoeFullGraph(const fastllm::Data &input, const fast
         input.dataDeviceIds != device || index.dataDeviceIds != device || score.dataDeviceIds != device ||
         input.multiDeviceData || index.multiDeviceData || score.multiDeviceData || output.multiDeviceData ||
         &output == &input || &output == &index || &output == &score ||
-        input.dims[0] < 1 || input.dims[0] > kNativeMoeMaxRows ||
+        input.dims[0] < 1 || input.dims[0] > std::numeric_limits<int>::max() / kMaxTopK ||
         (input.dataType != fastllm::BFLOAT16 && input.dataType != fastllm::FLOAT16 && input.dataType != fastllm::FLOAT32) ||
         index.dims[0] != input.dims[0] || index.dataType != fastllm::INT32 ||
         score.dims != index.dims || score.dataType != fastllm::FLOAT32 ||
@@ -5815,6 +6179,7 @@ void *FastllmCudaCreateNativeMoeFullGraph(const fastllm::Data &input, const fast
     if (!cache) return nullptr;
     int table = -1;
     auto *group = FindHybridGroup(weights, weightsBatch, &table);
+    if (group && group->LayerLayout(table).weightType==fastllm::EXL3 && index.dims.back()>8) return nullptr;
     if (!group || !cache->frequency || input.dims[1] != group->LayerLayout(table).hidden ||
         (group->layout.deepSeekV41 && input.dataType != fastllm::BFLOAT16)) return nullptr;
     if (!cache->nativeMailbox) cache->nativeMailbox = std::make_shared<NativeMoeMailbox>(*group, *cache);

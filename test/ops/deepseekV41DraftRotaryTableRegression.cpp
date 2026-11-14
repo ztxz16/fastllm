@@ -168,6 +168,45 @@ static void Run(int dev, int m, int heads, int windowRows, int ropeDim) {
           "host kv");
     Check(Read(q) == Read(oq) && Read(kv) == Read(ok), "host position changed bits");
 }
+static void Batch(int batch, int tokens, int heads, int history) {
+    Data q, kv, ring, table, rq, rk, rt, positions;
+    Alloc(q,BFLOAT16,{batch,tokens,heads,512},0); Alloc(rq,BFLOAT16,q.dims,0);
+    Alloc(kv,BFLOAT16,{batch,tokens,512},0); Alloc(rk,BFLOAT16,kv.dims,0);
+    Alloc(ring,BFLOAT16,{batch,history,512},0); Alloc(rt,BFLOAT16,{batch,history+tokens,512},0);
+    Alloc(positions,INT32,{batch},0);
+    std::mt19937 rng(batch*131+tokens);
+    auto random=[&](const Data &d){std::vector<uint16_t>x(d.Count(0));for(auto &v:x)v=BF(float(int(rng()%10000)-5000)/1024);return x;};
+    auto qv=random(q),kvv=random(kv),rv=random(ring);
+    std::vector<int> pos(batch);
+    auto upload=[&](int step){
+        for(int b=0;b<batch;++b)pos[b]=(b*511+step*127)%8192;
+        std::rotate(qv.begin(),qv.begin()+17,qv.end());
+        std::rotate(kvv.begin(),kvv.begin()+13,kvv.end());
+        std::rotate(rv.begin(),rv.begin()+7,rv.end());
+        Upload(q,qv);Upload(rq,qv);Upload(kv,kvv);Upload(rk,kvv);Upload(ring,rv);
+        Cuda(cudaMemcpyAsync(positions.cudaData,pos.data(),batch*4,cudaMemcpyHostToDevice,cudaStreamPerThread));
+    };
+    auto call=[&]{Check(FastllmCudaDeepSeekV41DraftRotaryTable(q,kv,ring,128,10000,0,4096,8,32,1,
+                     (int*)positions.cudaData,table),"batch fused rejected");};
+    auto reference=[&]{
+        for(int b=0;b<batch;++b){
+            Data a,c;a.FakeFrom(rq,size_t(b)*tokens*heads*512*2);a.Resize({1,tokens,heads,512});
+            c.FakeFrom(rk,size_t(b)*tokens*512*2);c.Resize({1,tokens,512});
+            Check(FastllmCudaDeepSeekV41RotaryQuantPosition(a,128,10000,0,1,false,4096,8,32,1,0,512,32,(int*)positions.cudaData+b),"q oracle");
+            Check(FastllmCudaDeepSeekV41RotaryQuantPosition(c,128,10000,0,1,false,4096,8,32,1,1,512,32,(int*)positions.cudaData+b),"kv oracle");
+            auto* dst=(char*)rt.cudaData+size_t(b)*(history+tokens)*512*2;
+            Cuda(cudaMemcpyAsync(dst,(char*)ring.cudaData+size_t(b)*history*512*2,size_t(history)*512*2,cudaMemcpyDeviceToDevice,cudaStreamPerThread));
+            Cuda(cudaMemcpyAsync(dst+size_t(history)*512*2,c.cudaData,c.GetBytes(),cudaMemcpyDeviceToDevice,cudaStreamPerThread));
+        }
+        Check(Read(q)==Read(rq),"batch q mismatch");Check(Read(kv)==Read(rk),"batch kv mismatch");
+        Check(Read(table)==Read(rt),"batch table mismatch");Check(Read(ring)==rv,"ring overwritten");
+    };
+    upload(0);call();reference();
+    void *g=nullptr,*e=nullptr;Check(FastllmCudaGraphBeginCapture(),"capture");call();
+    Check(FastllmCudaGraphEndCapture(&g)&&FastllmCudaGraphInstantiate(g,&e),"instantiate");
+    for(int step=1;step<=4;++step){upload(step);Check(FastllmCudaGraphLaunch(e),"replay");reference();}
+    FastllmCudaGraphExecDestroy(e);FastllmCudaGraphDestroy(g);
+}
 int main(int argc, char **) {
     try {
         int devices = 0, cases = 0;
@@ -189,6 +228,10 @@ int main(int argc, char **) {
                     ++cases;
                 }
         }
+        FastllmCudaSetDevice(0);
+        for (int batch : {1,2,3,4,8,17}) for (int tokens : {1,5,8,9,17})
+            for (int history : {1,17,512}) { Batch(batch,tokens,8,history); ++cases; }
+        for (int batch : {2,4,8}) { Batch(batch,8,64,512); ++cases; }
         std::cout << "PASS " << cases
                   << " cases; eager and x3 changing-input graph replay bitwise; position, window, "
                      "alias, device and dtype checks"

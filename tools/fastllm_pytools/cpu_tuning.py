@@ -130,34 +130,56 @@ def select_threads(hidden, intermediate, gguf_type, limit, *, numa=False, rows=1
     counts = candidates(limit)
     if nodes:
         counts = tuple(sorted({n // nodes * nodes for n in counts if n >= nodes}))
-    numa_rows = min(32, max(1, rows)) if nodes and counts else 0
+    numa_rows = max(1, rows) if nodes and counts else 0
     if not counts:
         counts = candidates(limit)
     started = time.monotonic()
     detail = {'method': 'numa-moe' if numa_rows else 'quantized-gemv', 'candidates': list(counts), 'thread_limit': limit,
               'quota_cores': cpu_quota(), 'budget_ms': _BENCHMARK_BUDGET_MS,
-              'timeout_s': _WORKER_TIMEOUT_S}
+              'timeout_s': _WORKER_TIMEOUT_S, 'hidden': hidden, 'intermediate': intermediate,
+              'kind': gguf_type, 'requested_rows': rows, 'rows': numa_rows or 1, 'topk': topk}
+    if down_type is not None:
+        detail['down_kind'] = down_type
     try:
+        if not 1 <= rows <= 2147483647:
+            raise ValueError('calibration rows must fit a positive native integer')
         result = (_measure(hidden, intermediate, gguf_type, counts, numa_rows, topk, down_type)
                   if numa_rows and down_type is not None else
                   _measure(hidden, intermediate, gguf_type, counts, numa_rows, topk) if numa_rows
                   else _measure(hidden, intermediate, gguf_type, counts))
+        detail.update(result)
         samples = {int(k): float(v) for k, v in result['samples_ms'].items()}
+        expected = set(samples)
         samples = {k: v for k, v in samples.items() if k in counts and math.isfinite(v) and v > 0}
-        # Candidates run in ascending order. A truncated run must not choose a
-        # small count merely because the larger counts were never measured.
+        if set(samples) != expected or not samples:
+            raise ValueError('invalid CPU calibration samples')
+        # Bounded NUMA sweeps start at the largest count. A budget-limited
+        # descending prefix can select among measured candidates, while an
+        # incomplete legacy ascending sweep must retain the original limit.
         if set(samples) != set(counts):
-            raise ValueError('incomplete CPU calibration samples')
+            measured = set(counts[-len(samples):])
+            if not (numa_rows and result.get('measurement_order') == 'descending' and
+                    result.get('budget_exhausted') is True and set(samples) == measured and
+                    set(result.get('unmeasured_threads', [])) == set(counts) - measured):
+                raise ValueError('incomplete CPU calibration samples')
         best = min(samples.values())
         # Prefer fewer workers when throughput is within 5% of the best.
         chosen = min(k for k, value in samples.items() if value <= best * 1.05)
-        detail.update(result)
         detail['selected'] = chosen
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         # Failure is not evidence that fewer threads are faster. Keep the
         # original limit, already bounded by affinity and cgroup CPU quota.
         chosen = limit
-        detail.update(selected=chosen, fallback=type(error).__name__)
+        detail.update(selected=chosen, fallback=type(error).__name__, error=str(error))
+        if isinstance(error, subprocess.CalledProcessError):
+            detail['returncode'] = error.returncode
+        if isinstance(error, (subprocess.CalledProcessError, subprocess.TimeoutExpired)):
+            for key in ('stdout', 'stderr'):
+                value = getattr(error, key, None)
+                if value:
+                    if isinstance(value, bytes):
+                        value = value.decode('utf-8', errors='replace')
+                    detail[key + '_tail'] = value[-2048:]
     detail['elapsed_ms'] = round(1000 * (time.monotonic() - started), 3)
     print('[auto] CPU thread calibration: ' + json.dumps(detail, sort_keys=True), flush=True)
     return chosen, detail
@@ -190,6 +212,8 @@ def _worker(request):
     if not raw:
         raise RuntimeError('native CPU calibration failed')
     result = json.loads(raw.decode())
+    if 'error' in result:
+        raise ValueError(result['error'])
     result['library_load_ms'] = round(load_ms, 3)
     if numa_rows:
         ctypes.CDLL(None).fflush(None)  # finish NUMA binding logs before the JSON record

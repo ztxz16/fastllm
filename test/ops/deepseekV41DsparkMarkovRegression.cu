@@ -31,8 +31,9 @@ template<typename T> static std::vector<T> Read(const Data &data) {
                        cudaMemcpyDeviceToHost) == cudaSuccess, "read failed");
     return values;
 }
-template<typename T> static void Check(DataType type, int vocab, int rank, int block, bool tied = false) {
-    std::vector<T> embed(size_t(vocab) * rank), head(embed.size());
+template<typename T, typename H = T> static void Check(DataType type, int vocab, int rank, int block, bool tied = false, int headType = -1) {
+    std::vector<T> embed(size_t(vocab) * rank);
+    std::vector<H> head(embed.size());
     std::vector<float> logits(size_t(block) * vocab);
     uint32_t rng = 271828u;
     auto random = [&]() {
@@ -41,10 +42,10 @@ template<typename T> static void Check(DataType type, int vocab, int rank, int b
     };
     for (size_t i = 0; i < embed.size(); ++i) {
         embed[i] = Convert<T>(random() * .5f);
-        head[i] = Convert<T>(tied ? 0.f : random() * .5f);
+        head[i] = Convert<H>(tied ? 0.f : random() * .5f);
     }
     for (float &v : logits) v = tied ? 0.f : random() * 2.f;
-    Data e(type, {vocab, rank}), h(type, {vocab, rank});
+    Data e(type, {vocab, rank}), h(headType < 0 ? type : DataType(headType), {vocab, rank});
     Data l(FLOAT32, {1, block, vocab}), tokens(INT32, {block + 1}), values, indices, embeds;
     Upload(e, embed); Upload(h, head); Upload(l, logits);
     std::vector<int> initial(block + 1, 0);
@@ -101,8 +102,8 @@ template<typename T> static void Check(DataType type, int vocab, int rank, int b
         }
     }
     cudaGraphExecDestroy(exec); cudaGraphDestroy(graph);
-    std::printf("type=%d vocab=%d rank=%d block=%d tied=%d max_scaled=%.9g eager+graph PASS\n",
-                int(type), vocab, rank, block, tied, maxScaled);
+    std::printf("type=%d head=%d vocab=%d rank=%d block=%d tied=%d max_scaled=%.9g eager+graph PASS\n",
+                int(type), int(h.dataType), vocab, rank, block, tied, maxScaled);
 }
 int main() {
     try {
@@ -115,6 +116,12 @@ int main() {
         Check<__nv_bfloat16>(BFLOAT16, 1023, 512, 5);
         Check<half>(FLOAT16, 33001, 256, 5);
         Check<float>(FLOAT32, 1023, 64, 5);
+        Check<__nv_bfloat16, half>(BFLOAT16, 129280, 256, 5, false, FLOAT16);
+        Check<__nv_bfloat16, float>(BFLOAT16, 1023, 64, 5, false, FLOAT32);
+        Check<half, __nv_bfloat16>(FLOAT16, 32769, 256, 5, false, BFLOAT16);
+        Check<half, float>(FLOAT16, 1023, 64, 5, false, FLOAT32);
+        Check<float, __nv_bfloat16>(FLOAT32, 32769, 256, 5, false, BFLOAT16);
+        Check<float, half>(FLOAT32, 1023, 64, 5, false, FLOAT16);
         std::puts("DSpark Markov regression PASS");
     } catch (const std::exception &e) {
         std::fprintf(stderr, "%s\n", e.what()); return 1;

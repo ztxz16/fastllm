@@ -2,8 +2,19 @@
 
 #include <cstddef>
 #include <atomic>
+#include <cstdint>
 
-constexpr int FastllmV41FullDecodeMaxBatch = 128;
+// Separate causal layouts without a fixed batch-size offset or key collision.
+inline int64_t FastllmV41VerificationGraphKey(int rows, bool segmented) {
+    return -(int64_t(rows) * 2 + int(segmented));
+}
+
+// PP stages retain independent workspaces for decode and both causal layouts.
+// Reserve all positive int row counts instead of a fixed stride per layer.
+inline int64_t FastllmV41PipelineGraphKey(int firstLayer, int rows, bool verifying, bool segmented) {
+    return (int64_t(1) << 62) | (int64_t(firstLayer) << 33) |
+        (int64_t(rows) << 2) | (verifying ? 1 + int(segmented) : 0);
+}
 
 // Fixed tensor addresses and launch shapes; request-dependent values are
 // uploaded separately before replay. The caller owns all tensor buffers.
@@ -16,9 +27,10 @@ struct FastllmV41FullDecodeConfig {
     int ringRowBytes = 1024, cmpRowBytes = 1024, indexRowBytes = 256;
     int ropeDim = 64, originalSeqLen = 4096, betaFast = 32, betaSlow = 1;
     float ropeBase = 10000.f, ropeFactor = 1.f, normEps = 1e-6f, softmaxScale = 1.f;
-    // A verification plan treats batch rows as one causal chunk. Ring writes
-    // remain deferred until acceptance; the saved raw stream supports rollback.
+    // Verification rows belong to explicit causal chunks. Ring writes remain
+    // deferred until each request accepts its prefix.
     bool verifying = false;
+    bool segmentedVerify = false; // disables optimizations that share one request's keys
     bool vectorUnpack = false; // resolved from the existing unpack policy at plan creation
     bool kvSource = false, indexSource = false;
     bool writeCandidates = false, useCandidates = false;
@@ -45,6 +57,9 @@ struct FastllmV41FullDecodeRequest {
     void *windowKV = nullptr, *compressedKV = nullptr, *indexK = nullptr;
     void *rawTailKV = nullptr, *rawTailScore = nullptr;
     int position = 0;
+    // Row range of this request in a verification batch. A zero length retains
+    // the original single-chunk API. Saved raw streams start at 2 * chunkBegin.
+    int chunkBegin = 0, chunkLength = 0;
 };
 
 // Immutable per-layer pointers to a full verifier's saved rows and dynamic
@@ -55,7 +70,11 @@ struct FastllmV41VerifyCommitLayer {
     int window = 128, ratio = 0, ringRowBytes = 1024;
 };
 bool FastllmCudaV41CommitVerifiedPrefix(const FastllmV41VerifyCommitLayer *layers,
-                                      int layerCount, int accepted, int forwarded);
+                                      int layerCount, int accepted, int forwarded, int rowOffset = 0, int batchRows = 0);
+// Device spans are [request, {accepted, rowOffset}]. The caller validates
+// disjoint request ranges and keeps both descriptors alive until completion.
+bool FastllmCudaV41CommitVerifiedBatch(const FastllmV41VerifyCommitLayer *layers,
+                                     int layerCount, const int *spans, int requests, int batchRows);
 
 // Create/destroy and upload run outside capture. Prepare/Finish contain only
 // fixed-shape GPU work, and can be captured exactly once during startup.

@@ -91,8 +91,13 @@ namespace fastllm {
 
     struct DeepSeekV41DsparkWorkspace;
     struct DeepSeekV41DsparkState {
+        ~DeepSeekV41DsparkState();
+        void Reset(int startPos);
+        void ClearProposal();
         std::shared_ptr<DeepSeekV41DsparkWorkspace> workspace;
         std::map<int, std::shared_ptr<DeepSeekV41DsparkWorkspace>> contextWorkspaces;
+        // Only model-owned batched storage uses this immediate handoff list.
+        std::vector<DeepSeekV41DsparkState *> contextRequests;
         std::vector<DeepSeekV41DsparkLayerCache> layers;
         int committed = 0;            // 已写入草稿滑窗的位置数（== 目标模型的 totalLen）
         int filled = 0;               // 滑窗中连续有效的位置数（前缀缓存恢复后从 0 开始重新累积）
@@ -125,6 +130,9 @@ namespace fastllm {
         // Full verifier graphs retain their own buffers and request descriptors.
         // This callback commits an accepted prefix without materializing per-layer views.
         std::function<void(int)> commitKV;
+        const void *commitGroup = nullptr;
+        std::function<void(const std::vector<std::pair<int, int>> &)> commitBatchKV;
+        bool kvCommitted = false;
         // Attention DP: target KV and rollback scratch belong to the request's
         // TP ranks. The parent alone owns sampling and draft/main features.
         std::vector<std::shared_ptr<DeepSeekV41SpecScratch>> attentionRanks;
@@ -305,6 +313,8 @@ namespace fastllm {
         void TryRecordResponseContext(ResponseContext *context) override;
         void OnResponseContextCreated(ResponseContext *context) override;
         void OnResponseContextRemoved(ResponseContext *context) override;
+        void OnResponseContextFinished(ResponseContext *context) override;
+        bool PopPendingResponseToken(ResponseContext *context, int previousToken, int &token) override;
         bool UseGenericHistoryCache() const override { return false; }
         bool UseModelSpecificScheduler() const override { return false; }
 
@@ -324,7 +334,7 @@ namespace fastllm {
         ExecutionMode executionMode = ExecutionMode::Cpu;
         bool v41MoeCudaGraphCompatible = true;
         void InitExecutionMode();
-        void BeginHybridMoeStep(HybridMoeDecodeStep &, bool tp, bool single, int seqlen, int firstLayer = -1, int endLayer = -1);
+        void BeginHybridMoeStep(HybridMoeDecodeStep &, bool tp, bool single, int seqlen, bool verifying, int firstLayer = -1, int endLayer = -1);
         bool RunGpuMoe(DeepSeekV41MoeContext &);
         bool RunHybridMoe(DeepSeekV41MoeContext &, HybridMoeDecodeStep *);
         bool moeExpertCacheAttempted = false;
@@ -400,12 +410,17 @@ namespace fastllm {
         DeepSeekV41HistoryCacheManager v41HistoryCache;
 
         // -------- decode / DSpark 校验的 CUDA Graph --------
-        // 每种 token 数一份图与工作区，跨请求复用；KV 更新与回滚留在图外。
+        // Geometric warm shapes plus one transient shape bound retained storage
+        // linearly in maxBatch, without evicting the common graphs during drain.
         // 捕获和回放共用互斥量，抢不到锁的前向退回逐算子。
         std::mutex v41CudaGraphMutex;
-        std::map<int, std::shared_ptr<void>> v41CudaGraphSlots;
+        std::map<int64_t, std::shared_ptr<void>> v41CudaGraphSlots;
         std::mutex v41PpDecodeMutex;
         bool v41CudaGraphWarmingUp = false;
+        bool RetainDsparkBatch(int batch) const {
+            return batch > 0 && batch <= std::max(1, maxBatch) &&
+                ((batch & (batch - 1)) == 0 || batch == maxBatch);
+        }
         // One bounded eager verifier workspace, protected by v41CudaGraphMutex.
         // No graph captures these buffers, so candidate counts can share them.
         std::shared_ptr<DeepSeekV41DecodeWorkspace> v41TpVerifyWorkspace;
@@ -545,6 +560,18 @@ namespace fastllm {
         std::vector<int> v41DsparkTargetLayerIds;
         std::vector<int> v41DsparkTpDevices;
         std::shared_ptr<void> v41DsparkHeadWorkspace;
+        // Bounded common shapes plus one transient. Request KV and proposal
+        // probabilities remain private after each replay.
+        std::map<int, std::shared_ptr<DeepSeekV41DsparkState>> v41DsparkBatches;
+        std::shared_ptr<DeepSeekV41DsparkState> v41DsparkContextReady;
+        std::shared_ptr<DeepSeekV41DsparkState> GetDsparkBatch(int batch, int device);
+        // Scheduler-owned free slots retain KV addresses and context graphs.
+        // Only logical request state is reset when a slot is acquired again.
+        std::vector<std::shared_ptr<DeepSeekV41DsparkState>> v41DsparkFreeStates;
+        void RetireDsparkState(std::shared_ptr<DeepSeekV41DsparkState> state);
+        std::shared_ptr<void> v41DsparkVerifier;
+        bool DsparkSampleVerifyBatch(Data &logits, const std::vector<DeepSeekV41Segment> &segments,
+                                    const std::vector<GenerationConfig> &configs);
         std::vector<char> v41IsDsparkTarget;  // [block_cnt]
         std::vector<std::vector<Data*> > v41DsparkMoeWeights, v41DsparkMoeBiass;
         std::atomic<long long> v41DsparkRounds{0};
@@ -568,7 +595,7 @@ namespace fastllm {
         void DsparkMaskToolLogits(Data &logits, const GenerationConfig &config,
                                   const std::vector<int> &prefixTokens);
         int DsparkAcceptedDraftCount(const DeepSeekV41SpecScratch &scratch,
-                                     const GenerationConfig &config) const;
+                                     const GenerationConfig &config, int startPos = -1) const;
         GenerationConfig DsparkDraftConfig(const GenerationConfig &config,
                                           const DeepSeekV41SpecScratch &scratch, int anchorToken);
         void DsparkSampleVerify(Data &logits, const DeepSeekV41DsparkState &proposal,
@@ -577,22 +604,27 @@ namespace fastllm {
                 DeepSeekV41RequestState &state, int startPos);
         // 若队首的候选与本次输入一致，直接返回已经校验过的 token（不做前向），否则返回 -1
         int DsparkTakePending(DeepSeekV41RequestState &state, const Data &inputIds, int seqlen);
+        int DsparkTakePending(DeepSeekV41RequestState &state, int previousToken);
         // 若 state 有可用的候选，把 inputIds 扩展成 [anchor, draft...]，返回 draft 个数
         int DsparkBuildVerifyInput(DeepSeekV41RequestState &state, const Data &inputIds,
                                    int startPos, Data &verifyIds, std::vector<int> &drafts);
         // 把本次前向的前 accept 个位置提交进各层缓存，其余回滚
+        bool DsparkCommitBatch(const std::vector<DeepSeekV41Segment> &segments);
         void DsparkCommitPrefix(DeepSeekV41RequestState &state, DeepSeekV41SpecScratch &scratch,
                                 int startPos, int accept, int forwarded);
-        // 用 main hidden 更新草稿滑窗，并为下一轮生成候选
+        // 用已提交的 main hidden 更新草稿滑窗；所有请求更新后再合批生成候选
         void DsparkAdvance(DeepSeekV41RequestState &state, DeepSeekV41SpecScratch &scratch,
-                           int startPos, int committed, int anchorToken, const GenerationConfig &config);
-        // 三层草稿前向 + markov head + confidence head
-        void DsparkRunDraft(DeepSeekV41DsparkState &dspark, int anchorToken,
-                            std::vector<int> &tokens, std::vector<float> &confidence,
-                            const GenerationConfig &config);
+                           int startPos, int committed);
+        bool DsparkAdvanceBatch(const std::vector<DeepSeekV41Segment> &segments);
+        void DsparkGenerateDrafts(const std::vector<DeepSeekV41DsparkState*> &states,
+                                 const std::vector<int> &anchors,
+                                 const std::vector<GenerationConfig> &configs);
+        // 单请求和合批共用三层草稿前向、Markov head 和 confidence head。
+        bool DsparkRunDraft(DeepSeekV41DsparkState &storage,
+                           const std::vector<int> &positions, const std::vector<int> &anchors,
+                           const std::vector<int> &validRows, std::vector<int> &tokens,
+                           std::vector<float> &confidence, const GenerationConfig &config);
         void DsparkBuildMoeWeights();
-        // 调试：把各层缓存长度写到 FASTLLM_DSV41_DEBUG_STATE 指定的文件
-        void DsparkDebugDumpState(const DeepSeekV41RequestState &state, const char *tag);
         void DsparkReportStats();
 
         void LoadEngramMeta();
@@ -618,6 +650,11 @@ namespace fastllm {
         // Immutable draft attention shards are shared by request graphs.
         std::map<int, std::shared_ptr<void>> v41DsparkAttentionWeights;
         bool TryBFloat16HeadLinear(Data &input, Data &output);
+
+        // Consumer threads only detach states. Graphs and device buffers must
+        // retire on the inference thread, outside another request's capture.
+        std::vector<std::shared_ptr<DeepSeekV41RequestState>> v41RetiredStates;
+        void ReleaseRetiredStates();
     };
 }
 

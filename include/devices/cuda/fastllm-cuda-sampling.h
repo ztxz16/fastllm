@@ -22,6 +22,19 @@ struct FastllmCudaSamplingRow {
 };
 struct FastllmCudaSamplingResult { int token, error; };
 
+// Exact small-top-k selection for ordinary, unmasked sampling. Each row
+// returns 64 candidates, descending score then ascending token ID. Padding
+// has token=-1. A negative first token reports invalid/all-infinite logits.
+// Scaling uses the caller's FP32 reciprocal to preserve CPU sampling scores.
+// Only the physical work tile is bounded; logical batches are unrestricted.
+constexpr int FastllmCudaLogitsTopKCapacity = 64;
+struct FastllmCudaTopKRow { const float *logits; float inverseTemperature; };
+struct FastllmCudaTopKCandidate { float score; int token; };
+std::size_t FastllmCudaLogitsTopKWorkspaceBytes(int batch, int vocab);
+bool FastllmCudaLogitsTopK(const FastllmCudaTopKRow *rows, int batch, int vocab,
+    FastllmCudaTopKCandidate *output, void *workspace, std::size_t workspaceBytes,
+    void *stream = nullptr);
+
 // Stable descending score order, ascending token-id ties. Apply top-k first
 // (optionally retaining cutoff ties), then top-p, retaining its boundary token. Logits
 // remain unchanged. Invalid logits produce error=1, token=-1 for that row.

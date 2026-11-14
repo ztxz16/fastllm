@@ -2013,16 +2013,6 @@ namespace fastllm {
         if (n <= 0 || m <= 0 || st >= end) {
             return true;
         }
-        // One-shot confirmation that a deployment really picked the fused
-        // path; the routed-expert GEMM is called millions of times, so this
-        // is a single predictable branch after the first call.
-        static const bool traced = []() {
-            if (std::getenv("FASTLLM_NVFP4_BLOCK32_TRACE") != nullptr) {
-                printf("[Fastllm] NVFP4 block-32: using the fused AVX2 kernel.\n");
-            }
-            return true;
-        }();
-        (void)traced;
 #define FASTLLM_RUN_NVFP4_BLOCK32_AVX2(ROWS) \
         FastllmGemmBFloat16NVFP4Block32E8M0_AVX2_Run<ROWS>( \
             A, lda, B, ldb, C, ldc, m, st, end); \

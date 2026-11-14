@@ -1,4 +1,5 @@
 #include "fastllm-cuda.cuh"
+#include "fastllm-bfloat16-silu.cuh"
 #include "fastllm.h"
 
 #include <cuda.h>
@@ -1619,7 +1620,7 @@ extern "C" bool FastllmCudaTritonDeepSeekV4SparseAttentionDecodeGraph(
 
 extern "C" bool FastllmCudaTritonSmallProjection(const char *cubin, const char *name, int shared,
     const fastllm::Data &input, const fastllm::Data &weight, fastllm::Data &output,
-    int rows, int groups, int columns, int blockN) {
+    int rows, int groups, int columns, int blockN, int blockRows) {
     auto *kernel = LoadTritonKernel(cubin, name, shared, true);
     if (!kernel) return false;
     CUdeviceptr x = (CUdeviceptr)FastllmCudaPrepareInput(input);
@@ -1628,7 +1629,8 @@ extern "C" bool FastllmCudaTritonSmallProjection(const char *cubin, const char *
     CUdeviceptr scales = weight.dataType == fastllm::FP8_E4M3 ? (CUdeviceptr)weight.extraCudaData[0] : w;
     CUdeviceptr globalScratch = 0, profileScratch = 0;
     void *args[] = {&x, &w, &scales, &y, &rows, &groups, &globalScratch, &profileScratch};
-    const CUresult result = LaunchTritonKernel(kernel, (columns + blockN - 1) / blockN, groups, 1,
+    const CUresult result = LaunchTritonKernel(kernel, ((columns + blockN - 1) / blockN) *
+                                               (blockRows ? (rows + blockRows - 1) / blockRows : 1), groups, 1,
                                                128, shared, args, CU_STREAM_PER_THREAD);
     FastllmCudaFinishInput(input, (void *)x);
     FastllmCudaFinishInput(weight, (void *)w);
@@ -1641,6 +1643,8 @@ extern "C" bool FastllmCudaTritonMxfp4Grouped(const char *const *cubins, const c
                                               fastllm::Data &activation, const unsigned char *records,
                                               const int *slots, const int *routes, const float *scores,
                                               float *output, void *scratch, int count, bool planar) {
+    CUdeviceptr silu = (CUdeviceptr)FastllmCudaBFloat16SiluTable();
+    if (!silu) return false;
     LoadedTritonKernel *kernels[3] = {};
     for (int i = 0; i < (planar ? 2 : 3); ++i) {
         kernels[i] = LoadTritonKernel(cubins[i], names[i], shared[i]);
@@ -1655,15 +1659,15 @@ extern "C" bool FastllmCudaTritonMxfp4Grouped(const char *const *cubins, const c
     CUdeviceptr globalScratch = 0, profileScratch = 0;
     CUresult result;
     if (planar) {
-        void *fusedGate[] = {&x, &w, &s, &r, &score, &a, &count, &globalScratch, &profileScratch};
-        void *fusedDown[] = {&a, &w, &s, &r, &score, &out, &count, &globalScratch, &profileScratch};
+        void *fusedGate[] = {&x, &w, &s, &r, &score, &a, &count, &silu, &globalScratch, &profileScratch};
+        void *fusedDown[] = {&a, &w, &s, &r, &score, &out, &count, &silu, &globalScratch, &profileScratch};
         result = LaunchTritonKernel(kernels[0], 72, count, 1, 128, shared[0], fusedGate, CU_STREAM_PER_THREAD);
         if (result == CUDA_SUCCESS)
             result = LaunchTritonKernel(kernels[1], 80, count, 1, 128, shared[1], fusedDown, CU_STREAM_PER_THREAD);
     } else {
         CUdeviceptr raw = (CUdeviceptr)scratch;
         void *gateArgs[] = {&x, &w, &s, &r, &raw, &count, &globalScratch, &profileScratch};
-        void *actArgs[] = {&raw, &r, &score, &a, &globalScratch, &profileScratch};
+        void *actArgs[] = {&raw, &r, &score, &a, &silu, &globalScratch, &profileScratch};
         void *downArgs[] = {&a, &w, &s, &r, &out, &count, &globalScratch, &profileScratch};
         result = LaunchTritonKernel(kernels[0], 72, count, 1, 128, shared[0], gateArgs, CU_STREAM_PER_THREAD);
         if (result == CUDA_SUCCESS)

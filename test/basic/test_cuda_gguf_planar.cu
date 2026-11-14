@@ -88,7 +88,7 @@ template <typename Input, int Kind> static void QuantizeFormats() {
     Check(!FastllmGgufProjectPlanar(GGML_TYPE_Q8_0, 0, dx.p, nullptr, dq.p, dq.p, t, k, 1, 1,
                                     cudaStreamPerThread),
           "invalid type accepted");
-    Check(FastllmGgufPlanarBytes(0, k) == 0 && FastllmGgufPlanarBytes(17, k) == 0 &&
+    Check(FastllmGgufPlanarBytes(0, k) == 0 && FastllmGgufPlanarBytes(17, k) > 0 &&
               FastllmGgufPlanarBytes(1, 255) == 0,
           "invalid workspace shape accepted");
     Cuda(cudaMemcpy(actual.data(), dq.p, actual.size(), cudaMemcpyDeviceToHost));

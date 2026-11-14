@@ -1,0 +1,104 @@
+EXL3 kernels based on ExLlamaV3, adapted via Project Maya for Fastllm
+
+Primary algorithm reference: ExLlamaV3 by Turboderp
+https://github.com/turboderp-org/exllamav3
+Copyright (c) 2025 Turboderp; MIT license: LICENSE.exllamav3.
+
+ExLlamaV3 is the source of the EXL3 format, codebooks, trellis-window arithmetic
+and tensor-core tile decoding used by these adapted kernels. Its relevant
+sources are exllamav3/exllamav3_ext/quant/codebook.cuh, exl3_dq.cuh and
+hadamard_inner.cuh. The imported Maya files do not record an exact ExLlamaV3
+revision. They are not unmodified ExLlamaV3 source files: Maya supplies its own
+kernel organization, split scheduling, activation handling and workspaces;
+Fastllm adds the integration and local changes listed below.
+
+Provenance: ExLlamaV3 -> Project Maya/Strata -> Fastllm.
+The direct import remains pinned to the Maya revision below; its original
+hashes and both projects' copyright and permission notices are retained.
+
+Imported from Project Maya v1.1.44, commit
+5d20b0e8fd7c15fde2a9f2b4eac5e9776883690b
+https://github.com/mw00/project-maya/tree/5d20b0e8fd7c15fde2a9f2b4eac5e9776883690b
+
+Source paths: src/kernels/cuda/exl3.cu, src/kernels/cuda/exl3_legacy.cu,
+include/strata/kernels/exl3.hpp and include/strata/kernels/dp4a.hpp.
+Original file hashes are recorded in UPSTREAM.json.
+
+Project Maya/Strata: MIT, copyright (c) 2026 Peasant Smith and the Project Maya
+contributors; copyright (c) 2026 Niko1221 and Strata contributors.
+The complete upstream license is LICENSE.
+The upstream comments credit the EXL3 format, tensor-core tile decoding and
+fused MoE design to ExLlamaV3 (Turboderp). Its MIT license is preserved as
+LICENSE.exllamav3. See https://github.com/turboderp-org/exllamav3 .
+
+Local changes for Fastllm:
+- optional indirect gate/up/down pointers for existing independent allocations;
+- optional BF16 rounding at Fastllm MoE tensor boundaries;
+- distinct workspaces for host threads using CUDA per-thread default streams;
+- optional native F16/BF16 activation loads and output stores in modern and legacy
+  decode kernels, preserving F32 accumulation and the existing rounding boundary;
+- exl3_io.cuh is a Fastllm-authored storage-conversion helper, not an upstream file.
+  This removes separate adapter cast kernels and their temporary buffers.
+All options default to the upstream semantics. The Fastllm adapter lives in
+src/devices/cuda/linear/fastllm-linear-exl3-maya.cu. CPU operators and fallback
+CUDA operators are Fastllm's independent implementation, not imported Maya code.
+
+2026-11-07 Fastllm hybrid-cache extension (local changes, not upstream Maya):
+- Optional MoeArgs::route_output preserves the existing decode/rotation and
+  BF16 boundaries while returning one weighted FP32 output per route.
+- This mode omits the upstream cross-expert counter/reduction and disables
+  split-input down projection. Fastllm combines resident, streamed and CPU
+  experts in its own deterministic reducer. Existing callers default off.
+- Optional scratch_lane separates shared, resident and staged graph branches
+  on one captured stream. Default lane 0 retains the upstream workspace key.
+2026-11-07 grouped output-projection adapter:
+- Fastllm submits the independent EXL3 WoA slices through the existing upstream
+  multi-job mv API, with separate input/output offsets and row strides.
+- This adapter change does not modify the upstream matrix kernels or their
+  split policy. Portable CUDA and CPU grouped fallbacks are Fastllm code.
+
+2026-11-07 single-token BF16 specialization (Fastllm local changes):
+- Enable the existing single-row scratch/accumulator specialization for CUDA.
+- Specialize mul1 jobs with BF16 input and output at compile time, removing
+  unused F32/F16/q8 input paths from those kernels. Other jobs keep the generic
+  I/O path; multi-row jobs and the input-split planner are unchanged.
+- Preserve FP32 accumulation, split reduction order, BF16 output rounding,
+  all supported CUDA architectures.
+No new upstream code is imported by this optimization. The import revision,
+upstream hashes and both MIT license files above remain unchanged.
+
+2026-11-07 cleanup (Fastllm local changes):
+- Select single-row specialization and legacy/modern CUDA decode automatically.
+- Keep the legacy gate/up scratch-capacity fallback without an A/B environment
+  switch. Existing architecture and numerical fallback kernels remain available.
+- Name ExLlamaV3 as the primary algorithm reference while retaining the Maya
+  import provenance, local modifications and both MIT license files.
+
+2026-11-07 multi-row verification and draft integration (Fastllm local changes):
+- Reuse the imported grouped-window MoE kernels for multi-row activations,
+  including native BF16 input, indirect matrix pointers and BF16 boundaries.
+- Add compact weighted per-route outputs and optional missing-route preservation;
+  keep resident/staged window scratch independent during graph replay.
+- Fastllm's adapter groups repeated expert pointers on the GPU and reuses the
+  ordinary hybrid scheduler for verifier and draft rows. No new upstream code
+  is imported; both MIT licenses and the pinned import hashes are retained.
+
+2026-11-10 runtime-policy cleanup (Fastllm local changes):
+- Remove imported EXL3/Maya/Strata environment overrides. CUDA and unused HIP
+  branches retain their previous unset-environment defaults and hardware guards.
+- Operator selection belongs to Fastllm's registry/policy. Builds without the
+  imported kernels retain the independent portable implementation.
+- Extend ordinary/shared/grouped projection tiling to arbitrary logical rows;
+  no upstream arithmetic kernel is copied or rewritten by this adapter change.
+The pinned import revision and original file hashes remain historical provenance;
+these local changes do not imply an unmodified upstream source or a new import.
+
+2026-11-10 whole-batch expert grouping (Fastllm local changes):
+- The Fastllm adapter groups record identities across the full route batch,
+  retaining the imported arithmetic kernels and their internal activation tiles.
+- Optional caller-owned up/counter scratch removes the fixed window capacity;
+  physical CUDA grids are chunked without truncating the logical group list.
+  Capacity classes retain stable graph addresses with storage linear in the
+  largest batch, rather than retaining a separate arena for every row count.
+- The new CUDA route planner is Fastllm code. No new upstream code was imported;
+  original provenance, licenses, arithmetic and default API behavior remain.

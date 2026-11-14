@@ -12,6 +12,8 @@
 #include "devices/cuda/fastllm-cuda-gdn.h"
 #include "fastllm-cuda-rope.cuh"
 #include "fastllm-cuda-activation.cuh"
+#include "fastllm-bfloat16-silu.cuh"
+#include "utils/bfloat16_silu.h"
 #include "fastllm-cuda-gdn-step.cuh"
 #include "devices/cuda/cudaworkspace.h"
 #include "fastllm-cuda-mtp.cuh"
@@ -46,6 +48,34 @@
 #include <cuda_fp8.h>
 #include "attention/fastllm-fp4-kv.cuh"
 #include "sampling.cuh"
+
+const float *FastllmCudaBFloat16SiluTable() {
+    const int device = FastllmCudaGetDevice();
+    static thread_local std::map<int, const float *> local;
+    auto found = local.find(device);
+    if (found != local.end()) return found->second;
+    static std::mutex mutex;
+    static std::map<int, const float *> tables;
+    std::lock_guard<std::mutex> guard(mutex);
+    auto shared = tables.find(device);
+    if (shared != tables.end()) return local.emplace(device, shared->second).first->second;
+    cudaStreamCaptureStatus capture;
+    if (cudaStreamIsCapturing(cudaStreamPerThread, &capture) != cudaSuccess ||
+        capture != cudaStreamCaptureStatusNone) return nullptr;
+    const auto &host = fastllm::GetBFloat16SiluLookup();
+    float *table = nullptr;
+    if (cudaMalloc(&table, sizeof(host)) != cudaSuccess) return nullptr;
+    if (cudaMemcpyAsync(table, host.data(), sizeof(host), cudaMemcpyHostToDevice,
+                        cudaStreamPerThread) != cudaSuccess ||
+        cudaStreamSynchronize(cudaStreamPerThread) != cudaSuccess) {
+        cudaFree(table);
+        return nullptr;
+    }
+    // Graphs retain this address; immutable tables live for the CUDA context.
+    tables.emplace(device, table);
+    local.emplace(device, table);
+    return table;
+}
 
 extern "C" bool FastllmNcclGraphPeerCopy(int dstDevice, void *dst,
                                           int srcDevice, const void *src,
@@ -169,7 +199,7 @@ static std::set<std::pair<int, unsigned long long>>
 // retain its serial edge when markers are removed; pinning the allocation
 // until graph destruction alone does not make concurrent reuse safe.
 struct FastllmCudaGraphParallelResources {
-    bool second = false, serial = false, collective = false;
+    bool second = false, serial = false, collective = false, isolateTemporaries = false;
     std::set<void*> firstPointers;
 };
 static std::map<std::pair<int, unsigned long long>,
@@ -238,6 +268,20 @@ static bool FastllmCudaGraphCaptureIdentityRegisteredLocked(
 // Called while the owning device-pool lock is held. All pool transitions use
 // the same pool -> graph lock order, so finalization cannot race an allocation
 // or free of the pointer being classified.
+static thread_local bool fastllmCudaGraphPreparation = false;
+bool FastllmCudaGraphPreparationActive() { return fastllmCudaGraphPreparation; }
+bool FastllmCudaSetGraphPreparation(bool active) {
+    const bool previous = fastllmCudaGraphPreparation;
+    fastllmCudaGraphPreparation = active;
+    return previous;
+}
+static thread_local bool fastllmCudaGraphWorkspaceReserving = false;
+static thread_local const void *fastllmCudaGraphScratchGroup = nullptr;
+const void *FastllmCudaSetGraphScratchGroup(const void *group) {
+    const void *previous = fastllmCudaGraphScratchGroup;
+    fastllmCudaGraphScratchGroup = group;
+    return previous;
+}
 static bool FastllmCudaGraphPoolPointerReusableLocked(
         void *ptr, const FastllmCudaGraphCaptureIdentity &identity) {
     int phase = fastllmCudaGraphPoolPhase.load(std::memory_order_acquire);
@@ -245,13 +289,22 @@ static bool FastllmCudaGraphPoolPointerReusableLocked(
         return true;
     }
     std::lock_guard<std::mutex> guard(fastllmCudaGraphPoolMutex);
+    const auto regions = fastllmCudaGraphParallelResources.find({identity.device, identity.id});
+    if (regions != fastllmCudaGraphParallelResources.end()) {
+        for (const auto &entry : regions->second) {
+            const auto &region = entry.second;
+            if (region.isolateTemporaries && region.second && region.firstPointers.count(ptr))
+                return false;
+        }
+    }
     if (fastllmCudaGraphPoolTouchedDuringCapture.find(ptr) ==
             fastllmCudaGraphPoolTouchedDuringCapture.end()) {
         return true;
     }
     return fastllmCudaGraphPoolPhase.load(std::memory_order_relaxed) ==
                FASTLLM_CUDA_GRAPH_POOL_CAPTURING &&
-           FastllmCudaGraphCaptureIdentityRegisteredLocked(identity);
+           (fastllmCudaGraphWorkspaceReserving ||
+            FastllmCudaGraphCaptureIdentityRegisteredLocked(identity));
 }
 
 static bool FastllmCudaGraphPoolPointerProtectedLocked(void *ptr) {
@@ -304,6 +357,26 @@ void FastllmCudaGraphRecordCollective() {
     }
 }
 
+static int FastllmCudaRecordedParallelRegion();
+static void FastllmCudaRecordParallelStage(int region, int stage);
+
+// If warmup underestimates a branch's scratch, retain a correct serial graph
+// instead of requiring another allocation inside capture.
+static bool FastllmCudaGraphRelaxParallelScratch(const FastllmCudaGraphCaptureIdentity &identity) {
+    if (!identity.valid) return false;
+    std::lock_guard<std::mutex> guard(fastllmCudaGraphPoolMutex);
+    const auto found = fastllmCudaGraphParallelResources.find({identity.device, identity.id});
+    if (found == fastllmCudaGraphParallelResources.end()) return false;
+    bool changed = false;
+    for (auto &entry : found->second) {
+        auto &region = entry.second;
+        if (region.second && region.isolateTemporaries) {
+            region.serial = true; region.isolateTemporaries = false; changed = true;
+        }
+    }
+    return changed;
+}
+
 static bool FastllmCudaGraphParallelStage(int region, int stage) {
     const auto identity = FastllmCudaGraphCurrentCaptureIdentity();
     if (!identity.valid) return false;
@@ -325,6 +398,7 @@ bool FastllmCudaV41MoeGraphReady(const fastllm::Data *key, int rows, int topk,
 #ifndef USE_ROCM
     if (!key || rows <= 0 || topk <= 0) return false;
     return FastllmCudaV41GGUFGraphReady(key, rows, topk) ||
+        FastllmCudaExl3MoeGraphReady(key, rows, topk) ||
         (topk <= 16 && FastllmCudaV41MarlinGraphReady(key, rows, prequantizedInput));
 #else
     return false;
@@ -380,7 +454,8 @@ static void FastllmCudaPrintMallocStack(size_t size, const char *file, int line,
     fflush(stderr);
 }
 
-cudaError_t FastllmCudaCheckedMalloc(void **ret, size_t size, const char *file, int line) {
+// Pool internals already hold their device lock and perform their own recovery.
+static cudaError_t FastllmCudaCheckedMallocRaw(void **ret, size_t size, const char *file, int line) {
     if (ret != nullptr) {
         *ret = nullptr;
     }
@@ -471,6 +546,43 @@ struct FastllmCublasState {
 // another operator or graph family may be using.
 static std::map<std::pair<int, bool>, std::unique_ptr<FastllmCublasState>> s_fastllmCublasHandleMap;
 static std::mutex s_fastllmCublasHandleMapMutex;
+static void PrepareFastllmCublasGraphWorkspace(FastllmCublasState *state, int id) {
+    if (state->workspace || !fastllm::GetFastllmEnv().cudaGraph) return;
+    cudaStreamCaptureStatus capture;
+    if (cudaStreamIsCapturing(cudaStreamPerThread, &capture) != cudaSuccess ||
+        capture != cudaStreamCaptureStatusNone) return;
+    // Graphs can be enabled after an eager warmup created this handle.
+    // Bind before capture so cuBLAS emits no allocation nodes in child graphs.
+    static const size_t graphWorkspaceBytes = []() {
+        const char *env = std::getenv("FASTLLM_CUBLAS_GRAPH_WORKSPACE_MB");
+        int workspaceMb = env == nullptr || env[0] == '\0' ?
+            32 : std::max(0, std::min(256, std::atoi(env)));
+        return (size_t)workspaceMb * 1024 * 1024;
+    }();
+    if (graphWorkspaceBytes == 0) return;
+    void *workspace = FastllmCudaDirectMalloc(graphWorkspaceBytes);
+    if (workspace == nullptr) return;
+    const auto stat = cublasSetWorkspace(state->handle, workspace, graphWorkspaceBytes);
+    if (stat == CUBLAS_STATUS_SUCCESS) {
+        state->workspace = workspace;
+    } else {
+        FastllmCudaDirectFree(workspace);
+        std::fprintf(stderr,
+            "Warning: failed to configure the CUDA Graph cuBLAS workspace on device %d "
+            "(state %d); graph callers will use their eager fallback.\n", id, stat);
+        std::fflush(stderr);
+    }
+}
+
+// cuBLAS handles retain a persistent workspace outside the temporary pool.
+// Its captured users must remain ordered even with isolated branch scratch.
+static void FastllmCudaGraphRecordSharedResource(void *resource) {
+    const auto identity = FastllmCudaGraphCurrentCaptureIdentity();
+    if (!identity.valid) return;
+    std::lock_guard<std::mutex> guard(fastllmCudaGraphPoolMutex);
+    FastllmCudaGraphRecordPoolResourceLocked(resource, identity);
+}
+
 static cublasHandle_t GetFastllmCublasHandle(bool fp32Reduction) {
     int id = -1;
     cudaGetDevice(&id);
@@ -485,7 +597,9 @@ static cublasHandle_t GetFastllmCublasHandle(bool fp32Reduction) {
         state = entry.get();
     }
     std::lock_guard<std::mutex> guard(state->mutex);
+    FastllmCudaGraphRecordSharedResource(state);
     if (state->handle != nullptr) {
+        PrepareFastllmCublasGraphWorkspace(state, id);
         // Every FastLLM CUDA operator uses the per-thread default stream, and
         // the symbolic cudaStreamPerThread handle remains valid when the
         // cublas handle is subsequently used by a persistent worker thread.
@@ -523,34 +637,8 @@ static cublasHandle_t GetFastllmCublasHandle(bool fp32Reduction) {
             return nullptr;
         }
 #endif
-        if (fastllm::GetFastllmEnv().cudaGraph) {
-            static size_t graphWorkspaceBytes = []() {
-                const char *env = std::getenv("FASTLLM_CUBLAS_GRAPH_WORKSPACE_MB");
-                int workspaceMb = env == nullptr || env[0] == '\0' ?
-                    32 : std::max(0, std::min(256, std::atoi(env)));
-                return (size_t)workspaceMb * 1024 * 1024;
-            }();
-            if (graphWorkspaceBytes > 0) {
-                void *workspace = FastllmCudaDirectMalloc(graphWorkspaceBytes);
-                if (workspace != nullptr) {
-                    stat = cublasSetWorkspace(
-                        handler, workspace, graphWorkspaceBytes);
-                    if (stat == CUBLAS_STATUS_SUCCESS) {
-                        state->workspace = workspace;
-                    } else {
-                        FastllmCudaDirectFree(workspace);
-                        std::fprintf(
-                            stderr,
-                            "Warning: failed to configure the CUDA Graph "
-                            "cuBLAS workspace on device %d (state %d); "
-                            "graph callers will use their eager fallback.\n",
-                            id, stat);
-                        std::fflush(stderr);
-                    }
-                }
-            }
-        }
         state->handle = handler;
+        PrepareFastllmCublasGraphWorkspace(state, id);
     }
 
     return handler;
@@ -1127,6 +1215,7 @@ bool FastllmCudaGraphSetQwen35MoeMarkersEnabled(bool enabled) {
 }
 
 void FastllmCudaGraphMarkQwen35MoeFork(int layer) {
+    if (layer < 0) FastllmCudaRecordParallelStage(layer, 0);
     if (fastllmCudaGraphQwen35MoeMarkersEnabled &&
         FastllmCudaGraphIsCapturingCurrentThread()) {
         FastllmCudaGraphParallelStage(layer, 0);
@@ -1142,6 +1231,7 @@ void FastllmCudaGraphMarkQwen35MoeSharedDone(int layer) {
 }
 
 void FastllmCudaGraphMarkQwen35MoeRoutedBegin(int layer) {
+    if (layer < 0) FastllmCudaRecordParallelStage(layer, 1);
     if (fastllmCudaGraphQwen35MoeMarkersEnabled &&
         FastllmCudaGraphIsCapturingCurrentThread()) {
         FastllmCudaGraphParallelStage(layer, 1);
@@ -1150,11 +1240,33 @@ void FastllmCudaGraphMarkQwen35MoeRoutedBegin(int layer) {
 }
 
 void FastllmCudaGraphMarkQwen35MoeJoin(int layer) {
+    if (layer < 0) FastllmCudaRecordParallelStage(layer, 2);
     if (fastllmCudaGraphQwen35MoeMarkersEnabled &&
         FastllmCudaGraphIsCapturingCurrentThread()) {
         const bool serial = FastllmCudaGraphParallelStage(layer, 2);
         FastllmCudaQwen35MoeJoinMarkerKernel<<<1, 1, 0, cudaStreamPerThread>>>(layer, serial);
     }
+}
+
+int FastllmCudaGraphBeginIndependentRegion() {
+    if (!fastllmCudaGraphQwen35MoeMarkersEnabled) return 0;
+    const auto identity = FastllmCudaGraphCurrentCaptureIdentity();
+    if (!identity.valid) {
+        const int region = FastllmCudaRecordedParallelRegion();
+        if (region) FastllmCudaGraphMarkParallelFork(region);
+        return region;
+    }
+    static thread_local unsigned long long captureId = 0;
+    static thread_local int captureDevice = -1, next = -1;
+    if (captureId != identity.id || captureDevice != identity.device) {
+        captureId = identity.id; captureDevice = identity.device; next = -1;
+    }
+    if (next == std::numeric_limits<int>::min()) return 0;
+    const int region = next--;
+    FastllmCudaGraphMarkParallelFork(region);
+    std::lock_guard<std::mutex> guard(fastllmCudaGraphPoolMutex);
+    fastllmCudaGraphParallelResources[{identity.device, identity.id}][region].isolateTemporaries = true;
+    return region;
 }
 
 int FastllmCudaGraphOptimizeQwen35Moe(void *graph) {
@@ -1258,65 +1370,50 @@ int FastllmCudaGraphOptimizeQwen35Moe(void *graph) {
         return -1;
     }
 
-    std::set<std::pair<cudaGraphNode_t, cudaGraphNode_t> > desiredEdges;
-    std::vector<cudaGraphNode_t> markerNodes;
-    markerNodes.reserve(markerCount);
-    int parallelRegions = 0;
-    for (auto &it : markers) {
-        auto &m = it.second;
-        if (m.fork == nullptr || m.sharedDone == nullptr ||
-            m.routedBegin == nullptr || m.join == nullptr) {
-            fastllmCudaGraphLastError = "Qwen3.5 MoE graph is missing a marker for layer " +
-                                        std::to_string(it.first);
-            return -1;
-        }
-        std::vector<cudaGraphNode_t> forkDependencies, sharedRoots;
-        std::vector<cudaGraphNode_t> sharedTails, routedRoots;
-        std::vector<cudaGraphNode_t> routedTails, joinRoots;
-        if (!FastllmCudaGraphGetAdjacentNodes(m.fork, false, forkDependencies) ||
-            !FastllmCudaGraphGetAdjacentNodes(m.fork, true, sharedRoots) ||
-            !FastllmCudaGraphGetAdjacentNodes(m.sharedDone, false, sharedTails) ||
-            !FastllmCudaGraphGetAdjacentNodes(m.routedBegin, true, routedRoots) ||
-            !FastllmCudaGraphGetAdjacentNodes(m.join, false, routedTails) ||
-            !FastllmCudaGraphGetAdjacentNodes(m.join, true, joinRoots)) {
-            return -1;
-        }
-        // A fork may be the graph root. Destroying its marker then makes
-        // both independent branches roots; no incoming edge is required.
-        if (sharedRoots.empty() || sharedTails.empty() ||
-            routedRoots.empty() || routedTails.empty() || joinRoots.empty()) {
-            fastllmCudaGraphLastError = "Qwen3.5 MoE graph marker adjacency is empty for layer " +
-                                        std::to_string(it.first);
-            return -1;
-        }
-        for (cudaGraphNode_t dependency : forkDependencies) {
-            for (cudaGraphNode_t root : sharedRoots) {
-                desiredEdges.insert({dependency, root});
-            }
-        }
-        // Resource conflicts keep the original first -> second edge. This
-        // still removes marker kernels and retains a usable serial graph.
-        for (cudaGraphNode_t dependency : m.serial ? sharedTails : forkDependencies) {
-            for (cudaGraphNode_t root : routedRoots) {
-                desiredEdges.insert({dependency, root});
-            }
-        }
-        if (!m.serial) ++parallelRegions;
-        for (cudaGraphNode_t tail : sharedTails) {
-            for (cudaGraphNode_t root : joinRoots) {
-                desiredEdges.insert({tail, root});
-            }
-        }
-        for (cudaGraphNode_t tail : routedTails) {
-            for (cudaGraphNode_t root : joinRoots) {
-                desiredEdges.insert({tail, root});
-            }
-        }
-        markerNodes.push_back(m.fork);
-        markerNodes.push_back(m.sharedDone);
-        markerNodes.push_back(m.routedBegin);
-        markerNodes.push_back(m.join);
+    // Build the dependency graph before removing markers. Nested independent
+    // regions (and adjacent regions with no intervening kernel) must retain
+    // transitive dependencies through other markers.
+    std::map<cudaGraphNode_t, std::vector<cudaGraphNode_t>> adjacency;
+    for (auto node : nodes) {
+        if (!FastllmCudaGraphGetAdjacentNodes(node, true, adjacency[node])) return -1;
     }
+    std::set<cudaGraphNode_t> markerSet;
+    int parallelRegions = 0;
+    for (auto &entry : markers) {
+        const auto &m = entry.second;
+        if (!m.fork || !m.sharedDone || !m.routedBegin || !m.join) {
+            fastllmCudaGraphLastError = "Incomplete parallel graph region";
+            return -1;
+        }
+        // The API places these boundary markers consecutively. Unexpected
+        // external work between them requires the safe unmodified recapture.
+        if (adjacency[m.sharedDone] != std::vector<cudaGraphNode_t>{m.routedBegin})
+            return FASTLLM_CUDA_GRAPH_MOE_RECAPTURE_WITHOUT_MARKERS;
+        markerSet.insert({m.fork, m.sharedDone, m.routedBegin, m.join});
+        if (!m.serial) {
+            adjacency[m.sharedDone] = {m.join};
+            adjacency[m.fork].push_back(m.routedBegin);
+            ++parallelRegions;
+        }
+    }
+    std::set<std::pair<cudaGraphNode_t, cudaGraphNode_t>> desiredEdges;
+    for (auto source : nodes) {
+        if (markerSet.count(source)) continue;
+        const auto &direct = adjacency[source];
+        std::vector<cudaGraphNode_t> pending;
+        for (auto target : direct) if (markerSet.count(target)) pending.push_back(target);
+        std::set<cudaGraphNode_t> visited;
+        while (!pending.empty()) {
+            auto marker = pending.back(); pending.pop_back();
+            if (!visited.insert(marker).second) continue;
+            for (auto target : adjacency[marker]) {
+                if (markerSet.count(target)) pending.push_back(target);
+                else if (std::find(direct.begin(), direct.end(), target) == direct.end())
+                    desiredEdges.insert({source, target});
+            }
+        }
+    }
+    std::vector<cudaGraphNode_t> markerNodes(markerSet.begin(), markerSet.end());
 
     std::vector<cudaGraphNode_t> from;
     std::vector<cudaGraphNode_t> to;
@@ -3404,6 +3501,102 @@ __global__ void FastllmRMSNormKernelInner1(float *input, float *weight, float *o
     }
 }
 
+// Preserve the ordinary FP16 RMSNorm reduction and intermediate rounding,
+// then apply the same RoPE helper without writing the normalized row to DRAM.
+// One CTA owns a complete head; request/sequence counts only affect the grid.
+struct FastllmRopeFrequencies {
+    float inverse[256]{};
+};
+
+// A captured kernel owns this small value argument. Frequencies depend only
+// on the rotary shape/base, so no device allocation, position table or replay
+// update is needed. Preserve the FP32 exponent and inverse rounding used by
+// FastllmPreciseRopeAngle and by the original host table.
+static const FastllmRopeFrequencies &FastllmPreciseRopeFrequencies(int rotaryDim, float theta) {
+    uint32_t thetaBits;
+    std::memcpy(&thetaBits, &theta, sizeof(thetaBits));
+    static thread_local std::map<std::pair<int, uint32_t>, FastllmRopeFrequencies> cache;
+    const auto key = std::make_pair(rotaryDim, thetaBits);
+    auto found = cache.find(key);
+    if (found != cache.end()) return found->second;
+    FastllmRopeFrequencies frequencies;
+    for (int j = 0; j < rotaryDim / 2; ++j) {
+        const float exponent = float(2 * j) / rotaryDim;
+        frequencies.inverse[j] = float(1.0 / std::pow(double(theta), double(exponent)));
+    }
+    return cache.emplace(key, frequencies).first->second;
+}
+
+__global__ void FastllmRMSNormRopeHalfKernel(
+        half *data, const float *weight, const float *positions,
+        int channels, int heads, int sequence, int positionStride,
+        int rotateDim, float eps, float theta, float ropeScale,
+        bool preciseFreq, FastllmRopeFrequencies frequencies) {
+    __shared__ float warpSums[2];
+    const int tid = threadIdx.x, lane = tid & 31;
+    half *row = data + size_t(blockIdx.x) * channels;
+    const half2 *pairs = reinterpret_cast<const half2 *>(row);
+    float sum = 0;
+    for (int i = tid; i < channels / 2; i += 64) {
+        const float2 v = __half22float2(pairs[i]);
+        sum += v.x * v.x + v.y * v.y;
+    }
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down_sync(0xffffffffu, sum, offset);
+    if (lane == 0) warpSums[tid / 32] = sum;
+    __syncthreads();
+    const float scale = rsqrtf((warpSums[0] + warpSums[1]) / channels + eps);
+    // Keep each rotation pair in registers. The preceding barrier completes
+    // every reduction read before any lane overwrites its disjoint pair.
+    const int token = blockIdx.x / heads;
+    const int position = int(positions[(token / sequence) * positionStride + token % sequence]);
+    const float scaledPosition = float(position) / ropeScale;
+    for (int j = tid; j < rotateDim / 2; j += 64) {
+        const float angle = preciseFreq
+            ? __fmul_rn(scaledPosition, frequencies.inverse[j])
+            : scaledPosition / powf(theta, float(2 * j) / rotateDim);
+        const int other = j + rotateDim / 2;
+        const half left = __float2half_rn(__half2float(row[j]) * scale * __ldg(weight + j));
+        const half right = __float2half_rn(__half2float(row[other]) * scale * __ldg(weight + other));
+        FastllmRopePair(left, right, cosf(angle), sinf(angle), row[j], row[other]);
+    }
+    for (int j = rotateDim + tid; j < channels; j += 64)
+        row[j] = __float2half_rn(__half2float(row[j]) * scale * __ldg(weight + j));
+}
+
+bool FastllmCudaRMSNormRope(fastllm::Data &input, fastllm::Data &weight,
+        const fastllm::Data &positions, float eps, int rotateDim,
+        float theta, float ropeScale, bool preciseFreq) {
+    using namespace fastllm;
+    if (input.dims.size() != 4 || input.dataType != DataType::FLOAT16 ||
+        weight.dataType != DataType::FLOAT32 || positions.dataType != DataType::FLOAT32 ||
+        positions.dims.size() != 2 || input.dims.back() >= 512 ||
+        (input.dims.back() & 1) || input.dims.back() < 2 ||
+        rotateDim <= 0 || (rotateDim & 1) || rotateDim > input.dims.back() ||
+        positions.dims[0] < input.dims[0] || positions.dims[1] < input.dims[1] ||
+        weight.Count(0) != input.dims.back()) return false;
+    const Data *operands[] = {&input, &weight, &positions};
+    for (const Data *v : operands) {
+        if (v->dataDevice != DataDevice::CUDA || !v->cudaData ||
+            v->multiDeviceData || v->dataDeviceIds != input.dataDeviceIds ||
+            v->strides.size() != v->dims.size()) return false;
+        uint64_t stride = 1;
+        for (int i = int(v->dims.size()) - 1; i >= 0; --i) {
+            if (v->dims[i] <= 0 || v->strides[i] != stride) return false;
+            stride *= v->dims[i];
+        }
+    }
+    if (reinterpret_cast<uintptr_t>(input.cudaData) % alignof(half2)) return false;
+    const uint64_t rows = input.Count(0) / input.dims.back();
+    if (rows > 2147483647u) return false;
+    FastllmRMSNormRopeHalfKernel<<<rows, 64>>>(
+        (half *)input.cudaData, (const float *)weight.cudaData,
+        (const float *)positions.cudaData, input.dims[3], input.dims[2],
+        input.dims[1], positions.dims[1], rotateDim, eps, theta, ropeScale, preciseFreq,
+        preciseFreq ? FastllmPreciseRopeFrequencies(rotateDim, theta) : FastllmRopeFrequencies{});
+    return true;
+}
+
 template <int THREAD_PER_BLOCK>
 __global__ void FastllmRMSNormKernelInner1(half *input, float *weight, half *output, int outer, int channels, float eps) {
     int o = blockIdx.x;
@@ -4572,6 +4765,7 @@ struct CudaMemoryBuffer {
     size_t size;
     bool busy;
     int graphPins;
+    const void *graphScratchGroup = nullptr;
     cudaEvent_t reuseReadyEvent;
     bool reusePending;
 
@@ -4582,6 +4776,27 @@ struct CudaMemoryBuffer {
             data(data), size(size), busy(busy), graphPins(0),
             reuseReadyEvent(nullptr), reusePending(false) {}
 };
+
+static bool FastllmCudaGraphScratchReusable(const CudaMemoryBuffer &buffer) {
+    return buffer.graphPins == 0 ||
+        (fastllmCudaGraphScratchGroup && buffer.graphScratchGroup == fastllmCudaGraphScratchGroup &&
+         (fastllmCudaGraphWorkspaceReserving ||
+          fastllmCudaGraphPoolPhase.load(std::memory_order_relaxed) == FASTLLM_CUDA_GRAPH_POOL_CAPTURING));
+}
+static void FastllmCudaPinGraphBuffer(CudaMemoryBuffer &buffer) {
+    if (buffer.graphPins && buffer.graphScratchGroup && buffer.busy &&
+        buffer.graphScratchGroup == fastllmCudaGraphScratchGroup) {
+        // Publishing borrowed scratch as persistent Data would let a later
+        // graph overwrite live state. This is a caller contract violation.
+        std::fprintf(stderr, "FastLLM graph scratch escaped capture; prepare persistent storage before sharing scratch.\n");
+        std::abort();
+    }
+    if (buffer.graphPins == 0)
+        buffer.graphScratchGroup = buffer.busy ? nullptr : fastllmCudaGraphScratchGroup;
+    else if (buffer.graphScratchGroup != fastllmCudaGraphScratchGroup)
+        buffer.graphScratchGroup = nullptr;
+    ++buffer.graphPins;
+}
 
 static bool FastllmCudaBufferReadyForReuseLocked(
         CudaMemoryBuffer &buffer, bool synchronizedGraphCapture = false) {
@@ -4744,7 +4959,7 @@ static cudaError_t FastllmCudaCheckedMallocWithIdlePoolRetry(
     if (ret != nullptr) {
         *ret = nullptr;
     }
-    cudaError_t state = FastllmCudaCheckedMalloc(ret, size, file, line);
+    cudaError_t state = FastllmCudaCheckedMallocRaw(ret, size, file, line);
     if (cudaSuccess == state || state != cudaErrorMemoryAllocation ||
         fastllmCudaMallocDisabled.load(std::memory_order_relaxed)) {
         return state;
@@ -4754,7 +4969,25 @@ static cudaError_t FastllmCudaCheckedMallocWithIdlePoolRetry(
     if (released == 0) {
         return state;
     }
-    return FastllmCudaCheckedMalloc(ret, size, file, line);
+    return FastllmCudaCheckedMallocRaw(ret, size, file, line);
+}
+
+static void FastllmCudaReleaseIdleCachedBuffersForDevice(int device);
+cudaError_t FastllmCudaCheckedMalloc(void **ret, size_t size, const char *file, int line) {
+    // Direct operator allocations must be able to reclaim eager scratch too.
+    // Keep the common successful allocation free of pool locks, and never
+    // release graph-owned memory or attempt cudaFree during capture.
+    cudaError_t state = FastllmCudaCheckedMallocRaw(ret, size, file, line);
+    if (state != cudaErrorMemoryAllocation || FastllmCudaGraphIsCapturingFast() ||
+        FastllmCudaGraphMemoryPoolActive() ||
+        fastllmCudaMallocDisabled.load(std::memory_order_relaxed)) return state;
+    int device = -1;
+    if (cudaGetDevice(&device) != cudaSuccess || device < 0) return state;
+    auto view = FastllmGetCudaMemPoolView(device);
+    std::lock_guard<std::mutex> lock(*view.lock);
+    cudaGetLastError();
+    FastllmCudaReleaseIdleCachedBuffersForDevice(device);
+    return FastllmCudaCheckedMallocRaw(ret, size, file, line);
 }
 
 static size_t fastllmCudaMemPoolAllocated = 0;
@@ -5401,7 +5634,7 @@ static bool FastllmCudaRetryMallocAfterReleasingIdle(
     }
     cudaGetLastError();
     FastllmCudaReleaseIdleCachedBuffersForDevice(id);
-    cudaError_t state = FastllmCudaCheckedMalloc(ret, size, file, line);
+    cudaError_t state = FastllmCudaCheckedMallocRaw(ret, size, file, line);
     if (failureState != nullptr) {
         *failureState = state;
     }
@@ -5454,7 +5687,7 @@ bool FastllmCudaGraphMemoryPoolEnd(std::vector<void*> &reservedPointers) {
                 continue;
             }
             remaining.erase(it);
-            buffer.graphPins++;
+            FastllmCudaPinGraphBuffer(buffer);
             reservedPointers.push_back(buffer.data);
         }
         for (auto &buffer : *view.bigBuffers) {
@@ -5463,7 +5696,7 @@ bool FastllmCudaGraphMemoryPoolEnd(std::vector<void*> &reservedPointers) {
                 continue;
             }
             remaining.erase(it);
-            buffer.graphPins++;
+            FastllmCudaPinGraphBuffer(buffer);
             reservedPointers.push_back(buffer.data);
         }
         *view.noBusy = 0;
@@ -5516,6 +5749,7 @@ void FastllmCudaGraphMemoryPoolRelease(const std::vector<void*> &reservedPointer
             }
             if (buffer.graphPins > 0) {
                 buffer.graphPins--;
+                if (!buffer.graphPins) buffer.graphScratchGroup = nullptr;
                 if (buffer.graphPins == 0 && !buffer.busy) {
                     *view.minId = std::min(*view.minId, i);
                 }
@@ -5531,6 +5765,7 @@ void FastllmCudaGraphMemoryPoolRelease(const std::vector<void*> &reservedPointer
             }
             if (buffer.graphPins > 0) {
                 buffer.graphPins--;
+                if (!buffer.graphPins) buffer.graphScratchGroup = nullptr;
             } else {
                 FastllmCudaSetThreadError();
             }
@@ -5551,22 +5786,64 @@ void FastllmCudaGraphMemoryPoolRelease(const std::vector<void*> &reservedPointer
     }
 }
 
-static thread_local std::vector<size_t> *fastllmCudaAllocationRecorder = nullptr;
-std::vector<size_t> *FastllmCudaSetAllocationRecorder(std::vector<size_t> *requests) {
-    auto *previous = fastllmCudaAllocationRecorder;
-    fastllmCudaAllocationRecorder = requests;
-    return previous;
+struct FastllmCudaAllocationRecording {
+    std::vector<size_t> *requests;
+    FastllmCudaAllocationRecording *previous;
+    std::map<std::pair<void*, std::vector<int>>, size_t> blocks;
+    std::vector<std::pair<int, int>> branches;
+    int nextRegion = -1;
+};
+static thread_local FastllmCudaAllocationRecording *fastllmCudaUniqueAllocationRecorder = nullptr;
+
+static int FastllmCudaRecordedParallelRegion() {
+    auto *r = fastllmCudaUniqueAllocationRecorder;
+    return r && r->requests && r->nextRegion > std::numeric_limits<int>::min() ? r->nextRegion-- : 0;
+}
+static void FastllmCudaRecordParallelStage(int region, int stage) {
+    auto *r = fastllmCudaUniqueAllocationRecorder;
+    if (!r || !r->requests) return;
+    if (stage == 0) r->branches.emplace_back(region, 0);
+    else if (!r->branches.empty() && r->branches.back().first == region) {
+        if (stage == 1) r->branches.back().second = 1;
+        else r->branches.pop_back();
+    }
+}
+
+void *FastllmCudaBeginAllocationRecording(std::vector<size_t> *requests) {
+    auto *recording = new FastllmCudaAllocationRecording{
+        requests, fastllmCudaUniqueAllocationRecorder, {}};
+    fastllmCudaUniqueAllocationRecorder = recording;
+    return recording;
+}
+
+void FastllmCudaEndAllocationRecording(void *context) {
+    auto *recording = static_cast<FastllmCudaAllocationRecording*>(context);
+    fastllmCudaUniqueAllocationRecorder = recording->previous;
+    delete recording;
+}
+
+static void FastllmCudaRecordAllocation(void *pointer, size_t size) {
+    auto *recording = fastllmCudaUniqueAllocationRecorder;
+    if (!recording || !recording->requests || !pointer || !size) return;
+    auto *requests = recording->requests;
+    // Distinguish concurrent branch lifetimes, not sequential region ids.
+    // Repeated layers still reserve their peak reusable scratch, rather than
+    // adding every layer's temporaries to the graph memory budget.
+    std::vector<int> branch;
+    for (const auto &entry : recording->branches) branch.push_back(entry.second);
+    while (!branch.empty() && branch.back() == 0) branch.pop_back();
+    const auto entry = recording->blocks.emplace(std::make_pair(pointer, branch), requests->size());
+    if (entry.second) requests->push_back(size);
+    else (*requests)[entry.first->second] = std::max((*requests)[entry.first->second], size);
 }
 
 static void *FastllmCudaMallocImpl(
         size_t size, FastllmCudaTryMallocResult *tryResult) {
-    if (fastllmCudaAllocationRecorder && size) {
-        fastllmCudaAllocationRecorder->push_back(size);
-    }
     if (tryResult != nullptr) {
         *tryResult = FASTLLM_CUDA_TRY_MALLOC_ERROR;
     }
     auto allocationSucceeded = [&](void *ret) {
+        FastllmCudaRecordAllocation(ret, size);
         if (tryResult != nullptr) {
             *tryResult = FASTLLM_CUDA_TRY_MALLOC_SUCCESS;
         }
@@ -5599,13 +5876,15 @@ static void *FastllmCudaMallocImpl(
         return nullptr;
     }
     const bool useAnyFittingPooledBuffer = capturePoolOnly ||
+        (fastllmCudaGraphWorkspaceReserving && fastllmCudaGraphScratchGroup) ||
         fastllmCudaMallocDisabled.load(std::memory_order_relaxed);
     std::lock_guard<std::mutex> lock(*view.lock);
+retryPoolAllocation:
     if (size > 1024 * 1024) {
         auto &bigBuffers = *view.bigBuffers;
         int selId = -1;
         for (int i = 0; i < bigBuffers.size(); i++) {
-            if (!bigBuffers[i].busy && bigBuffers[i].graphPins == 0 &&
+            if (!bigBuffers[i].busy && FastllmCudaGraphScratchReusable(bigBuffers[i]) &&
                 FastllmCudaBufferReadyForReuseLocked(
                     bigBuffers[i], captureIdentity.valid) &&
                 FastllmCudaGraphPoolPointerReusableLocked(
@@ -5627,7 +5906,7 @@ static void *FastllmCudaMallocImpl(
         }
         if (useAnyFittingPooledBuffer) {
             for (int i = 0; i < bigBuffers.size(); i++) {
-                if (!bigBuffers[i].busy && bigBuffers[i].graphPins == 0 &&
+                if (!bigBuffers[i].busy && FastllmCudaGraphScratchReusable(bigBuffers[i]) &&
                     FastllmCudaBufferReadyForReuseLocked(
                         bigBuffers[i], captureIdentity.valid) &&
                     bigBuffers[i].size >= size &&
@@ -5649,6 +5928,8 @@ static void *FastllmCudaMallocImpl(
             }
         }
 
+        if (capturePoolOnly && FastllmCudaGraphRelaxParallelScratch(captureIdentity))
+            goto retryPoolAllocation;
         void * ret = nullptr;
         if (tryResult != nullptr &&
             (capturePoolOnly || fastllmCudaMallocDisabled.load(
@@ -5660,10 +5941,11 @@ static void *FastllmCudaMallocImpl(
             FastllmCudaPrintPoolRejectStateLocked(id, size, view.bigBuffers, view.smallBuffers);
         }
         if (capturePoolOnly) {
+            fastllmCudaGraphLastError = "capture workspace exhausted: " + std::to_string(size) + " bytes on device " + std::to_string(id);
             FastllmCudaSetThreadError();
             return nullptr;
         }
-        state = FastllmCudaCheckedMalloc(&ret, size, __FILE__, __LINE__);
+        state = FastllmCudaCheckedMallocRaw(&ret, size, __FILE__, __LINE__);
         if (state == cudaErrorMemoryAllocation &&
             FastllmCudaRetryMallocAfterReleasingIdle(
                 size, &ret, id, __FILE__, __LINE__, &state)) {
@@ -5695,9 +5977,9 @@ static void *FastllmCudaMallocImpl(
     }
     auto &cudaBuffers = *view.smallBuffers;
     int selectedSmall = -1;
-    for (int i = *view.minId; i < cudaBuffers.size(); i++) {
+    for (int i = fastllmCudaGraphScratchGroup ? 0 : *view.minId; i < cudaBuffers.size(); i++) {
         if (cudaBuffers[i].size >= size && !cudaBuffers[i].busy &&
-            cudaBuffers[i].graphPins == 0 &&
+            FastllmCudaGraphScratchReusable(cudaBuffers[i]) &&
             FastllmCudaBufferReadyForReuseLocked(
                 cudaBuffers[i], captureIdentity.valid) &&
             FastllmCudaGraphPoolPointerReusableLocked(
@@ -5715,7 +5997,7 @@ static void *FastllmCudaMallocImpl(
         auto &buffer = cudaBuffers[selectedSmall];
         buffer.busy = true;
         FastllmCudaGraphPoolAfterAllocLocked(buffer.data, captureIdentity);
-        *view.noBusy -= buffer.size;
+        if (buffer.graphPins == 0) *view.noBusy -= buffer.size;
         while (*view.minId < cudaBuffers.size() &&
                (cudaBuffers[*view.minId].busy || cudaBuffers[*view.minId].graphPins > 0)) {
             (*view.minId)++;
@@ -5729,7 +6011,7 @@ static void *FastllmCudaMallocImpl(
         auto &bigBuffers = *view.bigBuffers;
         int selId = -1;
         for (int i = 0; i < bigBuffers.size(); i++) {
-            if (!bigBuffers[i].busy && bigBuffers[i].graphPins == 0 &&
+            if (!bigBuffers[i].busy && FastllmCudaGraphScratchReusable(bigBuffers[i]) &&
                 FastllmCudaBufferReadyForReuseLocked(
                     bigBuffers[i], captureIdentity.valid) &&
                 bigBuffers[i].size >= size &&
@@ -5750,6 +6032,8 @@ static void *FastllmCudaMallocImpl(
             return allocationSucceeded(bigBuffers[selId].data);
         }
     }
+    if (capturePoolOnly && FastllmCudaGraphRelaxParallelScratch(captureIdentity))
+        goto retryPoolAllocation;
     void * ret = nullptr;
     if (tryResult != nullptr &&
         (capturePoolOnly || fastllmCudaMallocDisabled.load(
@@ -5761,10 +6045,11 @@ static void *FastllmCudaMallocImpl(
         FastllmCudaPrintPoolRejectStateLocked(id, size, view.bigBuffers, view.smallBuffers);
     }
     if (capturePoolOnly) {
+        fastllmCudaGraphLastError = "capture workspace exhausted: " + std::to_string(size) + " bytes on device " + std::to_string(id);
         FastllmCudaSetThreadError();
         return nullptr;
     }
-    state = FastllmCudaCheckedMalloc(&ret, size, __FILE__, __LINE__);
+    state = FastllmCudaCheckedMallocRaw(&ret, size, __FILE__, __LINE__);
     if (state == cudaErrorMemoryAllocation &&
         FastllmCudaRetryMallocAfterReleasingIdle(
             size, &ret, id, __FILE__, __LINE__, &state)) {
@@ -5819,6 +6104,11 @@ FastllmCudaTryMallocResult FastllmCudaTryMalloc(
 bool FastllmCudaReserveGraphWorkspace(const std::vector<size_t> &requests) {
     if (FastllmCudaGraphIsCapturingFast()) return false;
     FastllmCudaAllocationRecorder suspend(nullptr);
+    struct Reservation {
+        bool previous = fastllmCudaGraphWorkspaceReserving;
+        Reservation() { fastllmCudaGraphWorkspaceReserving = true; }
+        ~Reservation() { fastllmCudaGraphWorkspaceReserving = previous; }
+    } reservation;
     std::vector<void *> blocks;
     blocks.reserve(requests.size());
     bool ok = true;
@@ -6155,7 +6445,7 @@ int FastllmCudaTryMallocBigBuffers(size_t size, int count) {
         // ordinary OOM retry here: that retry releases existing idle blocks and
         // could turn a partially successful reserve into one final block while
         // still reporting success to the caller.
-        state = FastllmCudaCheckedMalloc(&ret, size, __FILE__, __LINE__);
+        state = FastllmCudaCheckedMallocRaw(&ret, size, __FILE__, __LINE__);
         if (state == cudaSuccess && ret == nullptr) {
             state = cudaErrorMemoryAllocation;
         }
@@ -6426,9 +6716,9 @@ namespace {
     }
 }
 
-bool FastllmCudaBatchCopyFromDeviceToDeviceAsyncCurrentThread(
+bool FastllmCudaBatchCopyFromDeviceToDeviceAsync(
         void *const *dsts, const void *const *srcs,
-        const size_t *sizes, int count) {
+        const size_t *sizes, int count, void *stream) {
     if (count < 0 ||
         (count > 0 && (dsts == nullptr || srcs == nullptr || sizes == nullptr))) {
         return false;
@@ -6436,7 +6726,7 @@ bool FastllmCudaBatchCopyFromDeviceToDeviceAsyncCurrentThread(
 
     // Keep the by-value kernel parameter bounded, but allow callers to submit
     // an arbitrary number of independent state tensors.  Large requests are
-    // split into a few launches on the same per-thread stream, preserving
+    // split into a few launches on the same stream, preserving
     // ordering without falling back to one cudaMemcpy per tensor.
     for (int begin = 0; begin < count;) {
         int end = begin + std::min(
@@ -6462,7 +6752,7 @@ bool FastllmCudaBatchCopyFromDeviceToDeviceAsyncCurrentThread(
 
         int blocks = params.count * FASTLLM_CUDA_BATCH_COPY_BLOCKS_PER_SEGMENT;
         FastllmCudaBatchCopyKernel<<<
-            blocks, 256, 0, cudaStreamPerThread>>>(params);
+            blocks, 256, 0, static_cast<cudaStream_t>(stream)>>>(params);
         cudaError_t state = cudaGetLastError();
         checkCudaErrors("Error: CUDA error when launching batched device copy!", state);
         if (state != cudaSuccess) {
@@ -6470,6 +6760,13 @@ bool FastllmCudaBatchCopyFromDeviceToDeviceAsyncCurrentThread(
         }
     }
     return true;
+}
+
+bool FastllmCudaBatchCopyFromDeviceToDeviceAsyncCurrentThread(
+        void *const *dsts, const void *const *srcs,
+        const size_t *sizes, int count) {
+    return FastllmCudaBatchCopyFromDeviceToDeviceAsync(
+        dsts, srcs, sizes, count, cudaStreamPerThread);
 }
 
 void *FastllmCudaHostMalloc(size_t size) {
@@ -17541,7 +17838,10 @@ struct FastllmMtpSamplingWorkspace {
     const int vocab, capacity;
     int rows;
     uint8_t *scratch = nullptr;
-    bool own = false, dedicated = false, needTopP = false, needTopK = false;
+    bool own = false, dedicated = false, resident = false, needTopP = false, needTopK = false;
+    uint32_t *pinnedParameters = nullptr;
+    std::vector<uint32_t> savedParameters;
+    uint64_t parameterVersion = 0;
     bool uniformTemperature = true;
     float scalarTemperature = 1.0f;
     float *a, *bufferA, *bufferB, *temperatures, *topPs;
@@ -17553,8 +17853,8 @@ struct FastllmMtpSamplingWorkspace {
     int softmaxTiles;
     FastllmMtpTopPState *topPState = nullptr;
     float2 *topPCuts = nullptr;
-    explicit FastllmMtpSamplingWorkspace(int rows, int vocab, bool dedicated = false)
-        : vocab(vocab), capacity(rows), rows(rows), dedicated(dedicated) {
+    explicit FastllmMtpSamplingWorkspace(int rows, int vocab, bool dedicated = false, bool resident = false)
+        : vocab(vocab), capacity(rows), rows(rows), dedicated(dedicated), resident(resident) {
         size_t need = 0;
         auto reserve = [&](size_t bytes) {
             size_t offset = need;
@@ -17579,7 +17879,7 @@ struct FastllmMtpSamplingWorkspace {
         size_t tp = compactTopP ? reserve(rows * sizeof(FastllmMtpTopPState)) : 0;
         size_t tc = compactTopP ? reserve(rows * sizeof(float2)) : 0;
         size_t bytes = 0;
-        if (dedicated) {
+        if (dedicated || resident) {
             if (cudaMalloc(&scratch, need) == cudaSuccess) bytes = need;
         } else {
             scratch = (uint8_t*)FastllmBorrowDequantScratch(need, &bytes, &own);
@@ -17603,8 +17903,9 @@ struct FastllmMtpSamplingWorkspace {
         }
     }
     ~FastllmMtpSamplingWorkspace() {
-        if (dedicated) cudaFree(scratch);
+        if (dedicated || resident) cudaFree(scratch);
         else FastllmReleaseDequantScratch(scratch, own);
+        cudaFreeHost(pinnedParameters);
     }
     bool UploadParameters(const float *hostTemperatures,
                  const int *hostTopKs, const float *hostTopPs, int rows, int vocab) {
@@ -17628,7 +17929,18 @@ struct FastllmMtpSamplingWorkspace {
             needTopP |= hostTopPs[i] < 1;
             needTopK |= topK < vocab;
         }
-        if (dedicated) {
+        if (resident) {
+            if (params == savedParameters) return true;
+            if (!pinnedParameters && cudaMallocHost(&pinnedParameters,
+                    size_t(capacity) * 3 * sizeof(uint32_t)) != cudaSuccess) return false;
+            // The owning verifier resolves its previous event before reusing
+            // this request's pinned parameters, even on another host worker.
+            std::copy(params.begin(), params.end(), pinnedParameters);
+            if (cudaMemcpyAsync(temperatures, pinnedParameters, params.size() * sizeof(uint32_t),
+                    cudaMemcpyHostToDevice, cudaStreamPerThread) != cudaSuccess) return false;
+            savedParameters = std::move(params);
+            ++parameterVersion;
+        } else if (dedicated) {
             FastllmCudaCopyFromHostToDevice(temperatures, params.data(), params.size() * sizeof(uint32_t));
         } else {
             // Preserve the ordinary sampler's uniform-temperature fast path.
@@ -17784,20 +18096,31 @@ bool FastllmCudaMtpSampleDraft(float *logits, float *proposalProbs,
 
 namespace {
 __global__ void PrepareMtpDeviceSampling(float *temperature, int *topK, float *topP,
-        float t, int k, float p) {
-    *temperature = t; *topK = k; *topP = p;
+        float t, int k, float p, int batch) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < batch) { temperature[i] = t; topK[i] = k; topP[i] = p; }
 }
-__global__ void AdvanceMtpDeviceSampling(uint64_t *offset) { ++*offset; }
+__global__ void FinishMtpDeviceSampling(uint64_t *offset, const int *sample,
+        int *output, int stride, int batch) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i == 0) ++*offset;
+    if (i < batch) output[size_t(i) * stride] = sample[i];
+}
 }
 
-bool FastllmCudaMtpSampleDraftDevice(float *logits, float *proposalProbs,
-        float temperature, int topK, float topP, int *output, int vocabSize,
-        fastllm::Data &workspace) {
-    if (!logits || !proposalProbs || !output || vocabSize <= 0 ||
+bool FastllmCudaMtpSampleDraftBatchDevice(float *logits, float *proposalProbs,
+        float temperature, int topK, float topP, int *output, int batch, int vocabSize,
+        int probabilityStride, int tokenStride, fastllm::Data &workspace) {
+    if (!logits || !proposalProbs || !output || batch <= 0 || vocabSize <= 0 ||
+        probabilityStride < vocabSize || tokenStride <= 0 ||
+        uint64_t(batch) * vocabSize > INT_MAX ||
         !std::isfinite(temperature) || temperature <= 0 ||
         !std::isfinite(topP) || topP <= 0 || topP > 1) return false;
-    const size_t row = FastllmCudaAlignBytes(size_t(vocabSize) * sizeof(float), 256);
-    const size_t bytes = 2 * row + 512 + FastllmCudaAlignBytes(sizeof(flashinfer::sampling::RadixRowState), 256);
+    const size_t row = FastllmCudaAlignBytes(size_t(batch) * vocabSize * sizeof(float), 256);
+    const size_t parameter = FastllmCudaAlignBytes(size_t(batch) * sizeof(float), 256);
+    const size_t random = 256; // One advancing counter; FlashInfer uses each row as a Philox subsequence.
+    const size_t stateOffset = 2 * row + 5 * parameter + random;
+    const size_t bytes = stateOffset + FastllmCudaAlignBytes(size_t(batch) * sizeof(flashinfer::sampling::RadixRowState), 256);
     if (bytes > INT_MAX) return false;
     const int device = FastllmCudaGetDevice();
     if (workspace.dataType != fastllm::INT8 || workspace.dims != std::vector<int>{int(bytes)} ||
@@ -17806,41 +18129,53 @@ bool FastllmCudaMtpSampleDraftDevice(float *logits, float *proposalProbs,
         workspace.dataType = fastllm::INT8; workspace.UpdateUnitSize(); workspace.Resize({int(bytes)});
         workspace.ToDevice(fastllm::CUDA, {device}, false); workspace.Allocate(false);
         uint64_t state[2] = {FastllmMtpSamplingSeed(), 0};
-        if (cudaMemcpy(static_cast<uint8_t *>(workspace.cudaData) + 2 * row + 256,
+        if (cudaMemcpy(static_cast<uint8_t *>(workspace.cudaData) + 2 * row + 5 * parameter,
                 state, sizeof(state), cudaMemcpyHostToDevice) != cudaSuccess) return false;
     }
     auto *base = static_cast<uint8_t *>(workspace.cudaData);
     float *a = reinterpret_cast<float *>(base), *b = reinterpret_cast<float *>(base + row);
     auto *t = reinterpret_cast<float *>(base + 2 * row);
-    auto *k = reinterpret_cast<int *>(t + 1);
-    auto *p = t + 2;
-    auto *valid = reinterpret_cast<bool *>(t + 3);
-    auto *seed = reinterpret_cast<uint64_t *>(base + 2 * row + 256);
-    auto *states = reinterpret_cast<flashinfer::sampling::RadixRowState *>(base + 2 * row + 512);
+    auto *k = reinterpret_cast<int *>(base + 2 * row + parameter);
+    auto *p = reinterpret_cast<float *>(base + 2 * row + 2 * parameter);
+    auto *valid = reinterpret_cast<bool *>(base + 2 * row + 3 * parameter);
+    auto *samples = reinterpret_cast<int *>(base + 2 * row + 4 * parameter);
+    auto *seed = reinterpret_cast<uint64_t *>(base + 2 * row + 5 * parameter);
+    auto *offset = seed + 1;
+    auto *states = reinterpret_cast<flashinfer::sampling::RadixRowState *>(base + stateOffset);
     topK = topK <= 0 ? vocabSize : std::min(topK, vocabSize);
     cudaStream_t stream = cudaStreamPerThread;
-    PrepareMtpDeviceSampling<<<1, 1, 0, stream>>>(t, k, p, temperature, topK, topP);
-    FastllmTemperatureSoftmaxKernel<1024><<<1, 1024, 0, stream>>>(logits, a, t, vocabSize);
+    PrepareMtpDeviceSampling<<<(batch + 255) / 256, 256, 0, stream>>>(t, k, p, temperature, topK, topP, batch);
+    FastllmTemperatureSoftmaxKernel<1024><<<batch, 1024, 0, stream>>>(logits, a, t, vocabSize);
     cudaError_t status = cudaGetLastError();
     if (status == cudaSuccess && topP < 1) {
-        status = flashinfer::sampling::TopPRenormProb<float>(a, b, p, 1, 1.0f, vocabSize, stream);
+        status = flashinfer::sampling::TopPRenormProb<float>(a, b, p, batch, 1.0f, vocabSize, stream);
         std::swap(a, b);
     }
     if (status == cudaSuccess && topK < vocabSize) {
-        status = cudaMemsetAsync(states, 0, sizeof(*states), stream);
+        status = cudaMemsetAsync(states, 0, size_t(batch) * sizeof(*states), stream);
         if (status == cudaSuccess) {
             status = flashinfer::sampling::RadixTopKRenormProbMultiCTA<float, int>(
-                a, b, k, 1, 0, vocabSize, states, stream);
+                a, b, k, batch, 0, vocabSize, states, stream);
             std::swap(a, b);
         }
     }
-    if (status == cudaSuccess) status = cudaMemcpyAsync(proposalProbs, a,
-        size_t(vocabSize) * sizeof(float), cudaMemcpyDeviceToDevice, stream);
+    // Save the exact filtered q in each request's row-major chain storage.
+    // Sampling consumes the same contiguous values before scratch is reused.
+    if (status == cudaSuccess) status = cudaMemcpy2DAsync(proposalProbs,
+        size_t(probabilityStride) * sizeof(float), a, size_t(vocabSize) * sizeof(float),
+        size_t(vocabSize) * sizeof(float), batch, cudaMemcpyDeviceToDevice, stream);
     if (status == cudaSuccess) status = flashinfer::sampling::SamplingFromProb<float, int, 1>(
-        proposalProbs, output, valid, nullptr, 1, vocabSize, true, seed, 0, seed + 1, 0, stream);
+        a, samples, valid, nullptr, batch, vocabSize, true, seed, 0, offset, 0, stream);
     if (status != cudaSuccess) return false;
-    AdvanceMtpDeviceSampling<<<1, 1, 0, stream>>>(seed + 1);
+    FinishMtpDeviceSampling<<<(batch + 255) / 256, 256, 0, stream>>>(offset, samples, output, tokenStride, batch);
     return cudaGetLastError() == cudaSuccess;
+}
+
+bool FastllmCudaMtpSampleDraftDevice(float *logits, float *proposalProbs,
+        float temperature, int topK, float topP, int *output, int vocabSize,
+        fastllm::Data &workspace) {
+    return FastllmCudaMtpSampleDraftBatchDevice(logits, proposalProbs, temperature, topK, topP,
+                                              output, 1, vocabSize, vocabSize, 1, workspace);
 }
 
 bool FastllmCudaMtpRejectionSampling(float *logits, float *proposalProbs,
@@ -17886,6 +18221,33 @@ bool FastllmCudaMtpRejectionSampling(float *logits, float *proposalProbs,
             if (output[b * (draftTokens + 1) + i] < 0 ||
                 output[b * (draftTokens + 1) + i] >= vocabSize) return false;
     }
+    return true;
+}
+
+void *FastllmCudaMtpCreateTargetDistribution(int rows, int vocab) {
+    if (rows <= 0 || vocab <= 0) return nullptr;
+    auto *ws = new FastllmMtpSamplingWorkspace(rows, vocab, false, true);
+    if (!ws->scratch) { delete ws; return nullptr; }
+    return ws;
+}
+void FastllmCudaMtpDestroyTargetDistribution(void *distribution) {
+    delete static_cast<FastllmMtpSamplingWorkspace *>(distribution);
+}
+bool FastllmCudaMtpPrepareTargetDistribution(void *distribution,
+        const float *temperatures, const int *topKs, const float *topPs, bool *changed) {
+    if (!distribution || !temperatures || !topKs || !topPs || !changed) return false;
+    auto &ws = *static_cast<FastllmMtpSamplingWorkspace *>(distribution);
+    const auto previous = ws.parameterVersion;
+    if (!ws.UploadParameters(temperatures, topKs, topPs, ws.rows, ws.vocab)) return false;
+    *changed = previous != ws.parameterVersion;
+    return true;
+}
+bool FastllmCudaMtpNormalizeTargetDistribution(void *distribution,
+        float *logits, float **probabilities) {
+    if (!distribution || !logits || !probabilities) return false;
+    auto &ws = *static_cast<FastllmMtpSamplingWorkspace *>(distribution);
+    if (!ws.Normalize(logits, ws.rows, ws.vocab)) return false;
+    *probabilities = ws.a;
     return true;
 }
 
@@ -25352,6 +25714,9 @@ extern "C" bool FastllmCudaGraphCompose(const void *const *children, int count,
     if (result != cudaSuccess) {
         if (exec) cudaGraphExecDestroy(exec);
         if (graph) cudaGraphDestroy(graph);
+        // Composition is optional. Consume its CUDA error before the caller
+        // resumes ordinary kernels, which check the thread's last error.
+        cudaGetLastError();
         return false;
     }
     *outGraph = graph;
@@ -25395,4 +25760,46 @@ void FastllmCudaApplyTokenMask(float *logits, const uint32_t *mask, int vocab) {
     FastllmApplyTokenMaskKernel<<<(vocab + 255) / 256, 256, 0, cudaStreamPerThread>>>(
         logits, (const uint32_t *)storage.cudaData, vocab);
     checkCudaErrors("Error applying tool token mask", cudaGetLastError());
+}
+
+#ifndef USE_ROCM
+bool FastllmCudaMtpRebindTargetDistribution(void *graph, void *exec, float *logits) {
+    size_t count = 0;
+    if (cudaGraphGetNodes(static_cast<cudaGraph_t>(graph), nullptr, &count) != cudaSuccess) return false;
+    std::vector<cudaGraphNode_t> nodes(count);
+    if (cudaGraphGetNodes(static_cast<cudaGraph_t>(graph), nodes.data(), &count) != cudaSuccess) return false;
+    int updated = 0;
+    for (auto node : nodes) {
+        cudaGraphNodeType type;
+        if (cudaGraphNodeGetType(node, &type) != cudaSuccess) return false;
+        if (type != cudaGraphNodeTypeKernel) continue;
+        cudaKernelNodeParams params{};
+        if (cudaGraphKernelNodeGetParams(node, &params) != cudaSuccess) return false;
+        // These are the only normalization kernels that read target logits.
+        // Their first argument is the input pointer. GetParams owns the
+        // argument storage; change its value without replacing that storage.
+        if (params.func != (void *)FastllmTemperatureSoftmaxPartialKernel<256, 4096> &&
+            params.func != (void *)FastllmTemperatureSoftmaxNormalizeKernel<256, 4096> &&
+            params.func != (void *)FastllmMtpSoftmaxPartialKernel &&
+            params.func != (void *)FastllmMtpSoftmaxNormalizeKernel &&
+            params.func != (void *)FastllmTemperatureSoftmaxKernel<1024>) continue;
+        if (!params.kernelParams || !params.kernelParams[0]) return false;
+        std::memcpy(params.kernelParams[0], &logits, sizeof(logits));
+        if (cudaGraphExecKernelNodeSetParams(static_cast<cudaGraphExec_t>(exec), node, &params) != cudaSuccess)
+            return false;
+        ++updated;
+    }
+    return updated != 0;
+}
+#else
+bool FastllmCudaMtpRebindTargetDistribution(void *, void *, float *) { return false; }
+#endif
+
+void *FastllmCudaHostDevicePointer(void *pointer) {
+    void *device = nullptr;
+    if (cudaHostGetDevicePointer(&device, pointer, 0) != cudaSuccess) {
+        cudaGetLastError();
+        return nullptr;
+    }
+    return device;
 }

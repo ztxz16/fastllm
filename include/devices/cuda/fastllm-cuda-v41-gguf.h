@@ -39,11 +39,15 @@ bool FastllmCudaV41GGUFGroupedProjection(
 
 // Canonical packed records restored from NUMA shards, with per-layer slot offsets.
 struct FastllmCudaMoeGGUFCacheView;
+// Canonical expert activation contract: BF16 -> block-32 FP8 -> BF16 -> Q8_1.
+// Shared input is immutable until both resident/staged branches complete.
+bool FastllmCudaV41GGUFPrepareQ8Input(const fastllm::Data &input, void *destination, size_t bytes);
 bool FastllmCudaMoeV41CanonicalGGUFCacheCompute(
-    const fastllm::Data &input, fastllm::Data &activation,
+    const fastllm::Data &input,
     const FastllmCudaMoeGGUFCacheView &view, const float *scores,
     int topk, float swigluLimit, float *perExpert);
 size_t FastllmCudaV41CanonicalGGUFCacheWorkspaceBytes(int hidden, int inter);
+size_t FastllmCudaV41CanonicalGGUFCacheWorkspaceBytes(int hidden, int inter, int rows, int topk);
 bool FastllmCudaV41GGUFSupported(int gateType, int downType);
 bool FastllmCudaV41GGUFNumaSupported(int gateType, int downType, int numaGateType, int numaDownType);
 

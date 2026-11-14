@@ -4,6 +4,7 @@
 
 #include "fastllm-cuda.cuh"
 #include "fastllm.h"
+#include "fastllm-kernel-benchmark.cuh"
 #if !defined(USE_ROCM) && !defined(CUDA_NO_TENSOR_CORE)
 #include "fastllm-bf16-lt.cuh"
 #endif
@@ -274,7 +275,9 @@ namespace {
             half *output2, half *output3,
             int outputRows0, int outputRows1,
             int outputRows2, int outputRows3,
-            int columns) {
+            int columns, int rows) {
+        const int first = blockIdx.y * PART;
+        input += (size_t)first * columns;
         __shared__ float partial[PART][256];
         const int tid = threadIdx.x;
         const int globalRow = blockIdx.x;
@@ -306,6 +309,7 @@ namespace {
             weightBase = weight3;
             output = output3;
         }
+        output += (size_t)first * outputRows;
         const half *weight = weightBase + (size_t)row * columns;
 
         float accumulators[PART];
@@ -323,8 +327,8 @@ namespace {
                     weight + column);
 #pragma unroll
                 for (int item = 0; item < PART; item++) {
-                    packedInput.in = *reinterpret_cast<const uint4 *>(
-                        input + (size_t)item * columns + column);
+                    packedInput.in = first + item < rows ? *reinterpret_cast<const uint4 *>(
+                        input + (size_t)item * columns + column) : make_uint4(0,0,0,0);
                     float sum = 0.0f;
                     sum += __low2float(packedInput.out2[0]) *
                            __low2float(packedWeight.out2[0]);
@@ -354,7 +358,7 @@ namespace {
                 for (int item = 0; item < PART; item++) {
                     accumulators[item] = __fadd_rn(
                         accumulators[item],
-                        (float)input[(size_t)item * columns + column] *
+                        (first + item < rows ? (float)input[(size_t)item * columns + column] : 0.0f) *
                             weightValue);
                 }
             }
@@ -410,7 +414,7 @@ namespace {
             if (tid == 0) {
 #pragma unroll
                 for (int item = 0; item < PART; item++) {
-                    output[row + (size_t)outputRows * item] =
+                    if (first + item < rows) output[row + (size_t)outputRows * item] =
                         (half)values[item];
                 }
             }
@@ -418,7 +422,62 @@ namespace {
     }
 }
 
-bool FastllmCudaHalfMultiLinearExact(
+namespace {
+using KernelJson = json11::Json;
+const fastllm::kernels::Family halfMultiLinearFamily{6,"linear.multi.fp16",__DATE__ " " __TIME__,{
+    {"cuda.linear.multi.fp16.reference",KernelJson::object{{"backend","cuda"},{"operation","independent FP16 projections"},{"rows","arbitrary; legacy GEMV/GEMM reference"}}},
+    {"cuda.linear.multi.fp16.cublas",KernelJson::object{{"backend","cuda"},{"operation","independent cuBLAS projections"},{"rows","arbitrary"}}},
+    {"cuda.linear.multi.fp16.tile4",KernelJson::object{{"backend","cuda"},{"operation","merged projection grid; 4-row register tile"},{"rows","arbitrary, masked tail"}}},
+    {"cuda.linear.multi.fp16.tile8",KernelJson::object{{"backend","cuda"},{"operation","merged projection grid; 8-row register tile"},{"rows","arbitrary, masked tail"}}}
+}};
+const bool halfMultiLinearRegistered=[] {fastllm::kernels::Register(&halfMultiLinearFamily);return true;}();
+struct HalfMultiLinearCase {
+    const half *input;
+    const half *weights[FASTLLM_HALF_MULTI_LINEAR_MAX];
+    half *outputs[FASTLLM_HALF_MULTI_LINEAR_MAX];
+    int widths[FASTLLM_HALF_MULTI_LINEAR_MAX];
+    int rows,columns,count,total;
+};
+std::string HalfMultiLinearUnsupported(void *,int) {return "";}
+template<int TILE> void LaunchHalfMultiLinear(const HalfMultiLinearCase &c) {
+    // Only physical grid.y is bounded. Large logical batches use more tiles.
+    for(int first=0;first<c.rows;) {
+        const int rows=std::min(c.rows-first,65535*TILE);
+        FastllmHalfMultiLinearExactKernel<TILE><<<dim3(c.total,(rows+TILE-1)/TILE),256,0,cudaStreamPerThread>>>(
+            c.input+size_t(first)*c.columns,c.weights[0],c.weights[1],c.weights[2],c.weights[3],
+            c.outputs[0]+size_t(first)*c.widths[0],c.outputs[1]?c.outputs[1]+size_t(first)*c.widths[1]:nullptr,
+            c.outputs[2]?c.outputs[2]+size_t(first)*c.widths[2]:nullptr,c.outputs[3]?c.outputs[3]+size_t(first)*c.widths[3]:nullptr,
+            c.widths[0],c.widths[1],c.widths[2],c.widths[3],c.columns,rows);
+        first+=rows;
+    }
+}
+bool RunHalfMultiLinear(void *opaque,int impl) {
+    const auto &c=*static_cast<HalfMultiLinearCase *>(opaque);
+    if(impl==1 || (impl==0 && c.rows>8)) {
+        const half alpha=__float2half_rn(1),beta=__float2half_rn(0);
+        for(int i=0;i<c.count;++i) {
+            auto status=cublasGemmEx(getFastllmCublasHandle(),CUBLAS_OP_T,CUBLAS_OP_N,
+                c.widths[i],c.rows,c.columns,&alpha,c.weights[i],CUDA_R_16F,c.columns,
+                c.input,CUDA_R_16F,c.columns,&beta,c.outputs[i],CUDA_R_16F,c.widths[i],
+                CUDA_R_16F,static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
+            if(status!=CUBLAS_STATUS_SUCCESS)return false;
+        }
+    } else if(impl==2) LaunchHalfMultiLinear<4>(c);
+    else if(impl==3) LaunchHalfMultiLinear<8>(c);
+    else {
+        switch(c.rows) {
+#define FASTLLM_MULTI_CASE(N) case N: LaunchHalfMultiLinear<N>(c);break
+            FASTLLM_MULTI_CASE(1);FASTLLM_MULTI_CASE(2);FASTLLM_MULTI_CASE(3);FASTLLM_MULTI_CASE(4);
+            FASTLLM_MULTI_CASE(5);FASTLLM_MULTI_CASE(6);FASTLLM_MULTI_CASE(7);FASTLLM_MULTI_CASE(8);
+#undef FASTLLM_MULTI_CASE
+            default:return false;
+        }
+    }
+    return cudaPeekAtLastError()==cudaSuccess;
+}
+}
+
+bool FastllmCudaHalfMultiLinear(
         const fastllm::Data &input,
         const fastllm::Data *const *weights,
         fastllm::Data *const *outputs, int count) {
@@ -432,18 +491,17 @@ bool FastllmCudaHalfMultiLinearExact(
     }
     const int columns = input.dims.back();
     const uint64_t inputCount = input.Count(0);
-    const int rows = columns > 0 ? (int)(inputCount / columns) : 0;
+    if (columns <= 0 || inputCount / columns > INT_MAX) return false;
+    const int rows = (int)(inputCount / columns);
     const int inputDevice = input.dataDeviceIds.empty()
         ? FastllmCudaGetDevice() : input.dataDeviceIds[0];
-    if (columns <= 0 || inputCount != (uint64_t)rows * columns ||
-        rows < 1 || rows > 8) {
+    if (inputCount != (uint64_t)rows * columns ||
+        rows < 1) {
         return false;
     }
 
-    const half *cudaWeights[FASTLLM_HALF_MULTI_LINEAR_MAX]{};
-    half *cudaOutputs[FASTLLM_HALF_MULTI_LINEAR_MAX]{};
-    int outputRows[FASTLLM_HALF_MULTI_LINEAR_MAX]{};
-    int totalOutputRows = 0;
+    HalfMultiLinearCase operation{reinterpret_cast<const half *>(input.cudaData),
+        {}, {}, {}, rows, columns, count, 0};
     for (int i = 0; i < count; i++) {
         const fastllm::Data *weight = weights[i];
         fastllm::Data *output = outputs[i];
@@ -470,37 +528,23 @@ bool FastllmCudaHalfMultiLinearExact(
         if (output->dims != expectedDims) {
             return false;
         }
-        cudaWeights[i] = reinterpret_cast<const half *>(
-            weight->cudaData);
-        cudaOutputs[i] = reinterpret_cast<half *>(output->cudaData);
-        outputRows[i] = weight->dims[0];
-        totalOutputRows += weight->dims[0];
+        operation.weights[i] = reinterpret_cast<const half *>(weight->cudaData);
+        operation.outputs[i] = reinterpret_cast<half *>(output->cudaData);
+        operation.widths[i] = weight->dims[0];
+        if (operation.total > INT_MAX - weight->dims[0]) return false;
+        operation.total += weight->dims[0];
     }
-    if (totalOutputRows <= 0) {
-        return false;
+    int selected=0;
+    if (fastllm::kernels::Enabled()) {
+        using namespace fastllm::kernels;
+        Signature sig{{6,FastllmCudaRuntimeArch(),inputDevice,rows,columns,count,
+            operation.widths[0],operation.widths[1],operation.widths[2],operation.widths[3]}};
+        CudaOutputsCase c{{&operation,RunHalfMultiLinear,HalfMultiLinearUnsupported,nullptr,0,false},{}};
+        for(int i=0;i<count;++i)c.outputs.push_back({operation.outputs[i],size_t(rows)*operation.widths[i],fastllm::FLOAT16});
+        selected=SelectCudaOutputs(halfMultiLinearFamily,sig,c);
+        if(selected<0)selected=0;
     }
-
-#define FASTLLM_HALF_MULTI_LINEAR_LAUNCH(PART) \
-    FastllmHalfMultiLinearExactKernel<PART><<< \
-        totalOutputRows, 256, 0, cudaStreamPerThread>>>( \
-            reinterpret_cast<const half *>(input.cudaData), \
-            cudaWeights[0], cudaWeights[1], cudaWeights[2], cudaWeights[3], \
-            cudaOutputs[0], cudaOutputs[1], cudaOutputs[2], cudaOutputs[3], \
-            outputRows[0], outputRows[1], outputRows[2], outputRows[3], \
-            columns)
-    switch (rows) {
-        case 1: FASTLLM_HALF_MULTI_LINEAR_LAUNCH(1); break;
-        case 2: FASTLLM_HALF_MULTI_LINEAR_LAUNCH(2); break;
-        case 3: FASTLLM_HALF_MULTI_LINEAR_LAUNCH(3); break;
-        case 4: FASTLLM_HALF_MULTI_LINEAR_LAUNCH(4); break;
-        case 5: FASTLLM_HALF_MULTI_LINEAR_LAUNCH(5); break;
-        case 6: FASTLLM_HALF_MULTI_LINEAR_LAUNCH(6); break;
-        case 7: FASTLLM_HALF_MULTI_LINEAR_LAUNCH(7); break;
-        case 8: FASTLLM_HALF_MULTI_LINEAR_LAUNCH(8); break;
-        default: return false;
-    }
-#undef FASTLLM_HALF_MULTI_LINEAR_LAUNCH
-    return cudaGetLastError() == cudaSuccess;
+    return RunHalfMultiLinear(&operation,selected);
 }
 
 // Batch-1 projection specialization for the two input widths used by Qwen3.5
@@ -977,12 +1021,16 @@ void FastllmGemvFp32Fp16M2560WarpRowsKernel(const float *A, const half *B, float
 // lane mapping or compensated reduction tree used by the regular FP32xFP16
 // path.  This kernel uses only portable CUDA primitives; unsupported batch
 // sizes retain the regular two-Linear executor path below.
-template <int THREAD_PER_BLOCK, int PART, int FIXED_INPUT_SIZE = 0>
+template <int THREAD_PER_BLOCK, int PART, int FIXED_INPUT_SIZE = 0, bool TILED = false>
 __global__ void FastllmGemvFp32Fp16HyperProjectKernel(
         const float *A, const half *downWeight, const half *injectionWeight,
         float *activated, float *injection,
         const float *downBias, const float *injectionBias,
-        int m, int downRows, int injectionRows, int groups) {
+        int m, int downRows, int injectionRows, int groups, int rows = PART) {
+    const int first = TILED ? blockIdx.y * PART : 0;
+    A += (size_t)first*m;
+    activated += (size_t)first*downRows;
+    injection += (size_t)first*injectionRows;
     __shared__ float sdata[PART][THREAD_PER_BLOCK];
     const unsigned int tid = threadIdx.x;
     const int combinedRow = blockIdx.x;
@@ -1009,9 +1057,8 @@ __global__ void FastllmGemvFp32Fp16HyperProjectKernel(
                 *reinterpret_cast<const uint2 *>(baseWeight + i);
 #pragma unroll
             for (int x = 0; x < PART; ++x) {
-                const float4 packedInput =
-                    *reinterpret_cast<const float4 *>(
-                        A + x * FIXED_INPUT_SIZE + i);
+                const float4 packedInput = first+x<rows ?
+                    *reinterpret_cast<const float4 *>(A+x*FIXED_INPUT_SIZE+i) : make_float4(0,0,0,0);
                 float sum = 0.0f;
                 sum += packedInput.x * __low2float(packedWeight.out2[0]);
                 sum += packedInput.y * __high2float(packedWeight.out2[0]);
@@ -1028,8 +1075,8 @@ __global__ void FastllmGemvFp32Fp16HyperProjectKernel(
                 *reinterpret_cast<const uint2 *>(baseWeight + i);
 #pragma unroll
             for (int x = 0; x < PART; ++x) {
-                const float4 packedInput =
-                    *reinterpret_cast<const float4 *>(A + x * m + i);
+                const float4 packedInput = first+x<rows ?
+                    *reinterpret_cast<const float4 *>(A+x*m+i) : make_float4(0,0,0,0);
                 float sum = 0.0f;
                 sum += packedInput.x * __low2float(packedWeight.out2[0]);
                 sum += packedInput.y * __high2float(packedWeight.out2[0]);
@@ -1042,7 +1089,7 @@ __global__ void FastllmGemvFp32Fp16HyperProjectKernel(
         for (int i = tid; i < m; i += THREAD_PER_BLOCK) {
 #pragma unroll
             for (int x = 0; x < PART; ++x) {
-                sdata[x][tid] += A[i + x * m] * (float)baseWeight[i];
+                sdata[x][tid] += (first+x<rows ? A[i+x*m] : 0.0f) * (float)baseWeight[i];
             }
         }
     }
@@ -1094,6 +1141,7 @@ __global__ void FastllmGemvFp32Fp16HyperProjectKernel(
                 : __ldg(downBias + row);
 #pragma unroll
             for (int x = 0; x < PART; ++x) {
+                if (first+x>=rows) continue;
                 // __fadd_rn retains the materialized Linear output's rounding
                 // boundary before applying either activation.
                 const float projected = __fadd_rn(values[x], bias);
@@ -1852,7 +1900,7 @@ bool FastllmCudaQwen4HyperMixProjected(
 #endif
 }
 
-bool FastllmCudaQwen4HyperProject(
+static bool Qwen4HyperProjectReference(
         const fastllm::Data &input, fastllm::Data &downWeight,
         fastllm::Data &injectionWeight, fastllm::Data &activated,
         fastllm::Data &injection, int groups) {
@@ -1990,6 +2038,109 @@ bool FastllmCudaQwen4HyperProject(
     FastllmCudaFinishOutput(injection, cudaInjection);
     return cudaGetLastError() == cudaSuccess;
 }
+namespace {
+// Keep the vendor GEMM's FP16 output boundary, then promote and apply both
+// nonlinear epilogues in one launch without FP32 projection temporaries.
+__global__ void FastllmHyperProjectHalfActivate(const half *down,const half *inject,
+        float *activated,float *injection,int rows,int downRows,int groups) {
+    const int total=downRows+groups;
+    for(size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;i<size_t(rows)*total;i+=size_t(gridDim.x)*blockDim.x) {
+        const int row=i/total,col=i%total;
+        if(col<downRows) {
+            const float scaled=__fmul_rn(__half2float(down[size_t(row)*downRows+col]),1.0f/groups);
+            activated[size_t(row)*downRows+col]=scaled/(1.0+expf(-scaled));
+        } else {
+            const float scaled=__half2float(inject[size_t(row)*groups+col-downRows])/groups;
+            injection[size_t(row)*groups+col-downRows]=(1.0/(1.0+expf(-scaled)))*2.0f;
+        }
+    }
+}
+
+struct HyperProjectCase {const fastllm::Data *input;fastllm::Data *down,*inject,*activated,*injection;int groups;};
+const fastllm::kernels::Family hyperProjectFamily{7,"linear.hyper_project.fp16",__DATE__ " " __TIME__,{
+    {"cuda.hyper_project.reference",KernelJson::object{{"backend","cuda"},{"operation","down/injection + activations reference"},{"rows","arbitrary"}}},
+    {"cuda.hyper_project.tile4",KernelJson::object{{"backend","cuda"},{"operation","fused down/injection/Silu/Sigmoid; 4-row tile"},{"rows","arbitrary, masked tail"}}},
+    {"cuda.hyper_project.tile8",KernelJson::object{{"backend","cuda"},{"operation","fused down/injection/Silu/Sigmoid; 8-row tile"},{"rows","arbitrary, masked tail"}}},
+    {"cuda.hyper_project.gemm_epilogue",KernelJson::object{{"backend","cuda"},{"operation","shared FP16 input + cuBLAS projections + fused promotion/activation"},{"rows","arbitrary"}}}
+}};
+const bool hyperProjectRegistered=[] {fastllm::kernels::Register(&hyperProjectFamily);return true;}();
+std::string HyperProjectUnsupported(void *opaque,int impl) {
+    auto &c=*static_cast<HyperProjectCase *>(opaque);
+    if(impl && c.input->dataType!=fastllm::FLOAT32)return "candidate needs FP32 input";
+#if defined(CUDA_NO_TENSOR_CORE)
+    if(impl==3)return "reference uses FP32 GEMM output without tensor cores";
+#endif
+    return "";
+}
+template<int TILE> void LaunchHyperProjectRows(HyperProjectCase &c) {
+    int m=c.input->dims.back(),rows=c.input->Count(0)/m,down=c.down->dims[0],inject=c.inject->dims[0];
+    for(int first=0;first<rows;) {
+        int count=std::min(rows-first,65535*TILE);
+        FastllmGemvFp32Fp16HyperProjectKernel<256,TILE,0,true><<<dim3(down+inject,(count+TILE-1)/TILE),256,0,cudaStreamPerThread>>>(
+            (const float*)c.input->cudaData+size_t(first)*m,(const half*)c.down->cudaData,(const half*)c.inject->cudaData,
+            (float*)c.activated->cudaData+size_t(first)*down,(float*)c.injection->cudaData+size_t(first)*inject,
+            (const float*)c.down->extraCudaData[0],(const float*)c.inject->extraCudaData[0],m,down,inject,c.groups,count);
+        first+=count;
+    }
+}
+bool RunHyperProject(void *opaque,int impl) {
+    auto &c=*static_cast<HyperProjectCase *>(opaque);
+    if(!impl)return Qwen4HyperProjectReference(*c.input,*c.down,*c.inject,*c.activated,*c.injection,c.groups);
+    if(impl==1)LaunchHyperProjectRows<4>(c);
+    else if(impl==2)LaunchHyperProjectRows<8>(c);
+    else {
+        using namespace fastllm;
+        const int rows=c.input->Count(0)/c.input->dims.back(),inner=c.input->dims.back(),down=c.down->dims[0];
+        // Bound only the launch/API integer products; no logical batch cap.
+        const int chunk=std::min(rows,INT_MAX/std::max(inner,down+c.groups));
+        Data input(FLOAT16,{chunk,inner}),projected(FLOAT16,{chunk,down}),gate(FLOAT16,{chunk,c.groups});
+        for(Data *v:{&input,&projected,&gate}) {v->dataDevice=CUDA;v->dataDeviceIds=c.input->dataDeviceIds;v->Allocate(false);}
+        const half alpha=__float2half_rn(1),beta=__float2half_rn(0);
+        for(int first=0;first<rows;) {
+            const int count=std::min(rows-first,chunk),elements=count*inner;
+            FastllmCudaFloat2HalfKernel<<<(elements+255)/256,256,0,cudaStreamPerThread>>>(
+                (float*)c.input->cudaData+size_t(first)*inner,(half*)input.cudaData,elements);
+            auto project=[&](Data *weight,Data &out,int width) {
+                return cublasGemmEx(getFastllmCublasHandle(),CUBLAS_OP_T,CUBLAS_OP_N,width,count,inner,
+                    &alpha,weight->cudaData,CUDA_R_16F,inner,input.cudaData,CUDA_R_16F,inner,
+                    &beta,out.cudaData,CUDA_R_16F,width,CUDA_R_16F,CUBLAS_GEMM_DEFAULT)==CUBLAS_STATUS_SUCCESS;
+            };
+            if(!project(c.down,projected,down)||!project(c.inject,gate,c.groups))return false;
+            FastllmHyperProjectHalfActivate<<<std::min<uint64_t>(65535,(uint64_t(count)*(down+c.groups)+255)/256),256,0,cudaStreamPerThread>>>(
+                (half*)projected.cudaData,(half*)gate.cudaData,(float*)c.activated->cudaData+size_t(first)*down,
+                (float*)c.injection->cudaData+size_t(first)*c.groups,count,down,c.groups);
+            first+=count;
+        }
+    }
+    return cudaPeekAtLastError()==cudaSuccess;
+}
+}
+bool FastllmCudaQwen4HyperProject(const fastllm::Data &input,fastllm::Data &downWeight,
+        fastllm::Data &injectionWeight,fastllm::Data &activated,fastllm::Data &injection,int groups) {
+    using namespace fastllm;
+    if(!kernels::Enabled() || input.dataType!=FLOAT32 || input.dataDevice!=CUDA ||
+       input.dims.empty() || input.dims.back()<=0 || downWeight.dataDevice!=CUDA ||
+       injectionWeight.dataDevice!=CUDA || downWeight.dataType!=FLOAT16 || injectionWeight.dataType!=FLOAT16 ||
+       downWeight.dims.size()!=2 || injectionWeight.dims.size()!=2 || groups<=0 ||
+       downWeight.dims[1]!=input.dims.back() || injectionWeight.dims[1]!=input.dims.back() ||
+       injectionWeight.dims[0]!=groups || activated.dataType!=FLOAT32 || injection.dataType!=FLOAT32 ||
+       activated.dataDevice!=CUDA || injection.dataDevice!=CUDA || !input.cudaData ||
+       !downWeight.cudaData || !injectionWeight.cudaData || !activated.cudaData || !injection.cudaData)
+        return Qwen4HyperProjectReference(input,downWeight,injectionWeight,activated,injection,groups);
+    const uint64_t rows=input.Count(0)/input.dims.back();
+    if(!rows || rows>INT_MAX || activated.Count(0)!=rows*downWeight.dims[0] || injection.Count(0)!=rows*groups)return false;
+    Data emptyBias;
+    FastllmCudaFP16EnsureBiasOnDevice(downWeight,emptyBias,downWeight.dims[0]);
+    FastllmCudaFP16EnsureBiasOnDevice(injectionWeight,emptyBias,groups);
+    HyperProjectCase operation{&input,&downWeight,&injectionWeight,&activated,&injection,groups};
+    kernels::Signature sig{{7,FastllmCudaRuntimeArch(),FastllmCudaGetDevice(),(int64_t)rows,
+        input.dims.back(),downWeight.dims[0],groups}};
+    kernels::CudaOutputsCase c{{&operation,RunHyperProject,HyperProjectUnsupported,nullptr,0,false},
+        {{activated.cudaData,activated.Count(0),FLOAT32},{injection.cudaData,injection.Count(0),FLOAT32}}};
+    const int selected=kernels::SelectCudaOutputs(hyperProjectFamily,sig,c);
+    return RunHyperProject(&operation,selected<0?0:selected);
+}
+
 
 static bool TryFastllmCudaHopperFp16Head(half *input, half *weight, half *output,
                                         half *bias, int n, int m, int k, bool addTo) {

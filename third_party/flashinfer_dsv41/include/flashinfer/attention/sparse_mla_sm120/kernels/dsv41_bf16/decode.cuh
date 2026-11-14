@@ -24,7 +24,8 @@ __global__ void __launch_bounds__(Dsv41Bf16Resources::BLOCK_THREADS, 1)
         size_t indices_stride_elems, size_t extra_indices_stride_elems, Dsv41Pages pages,
         void* const* kv_cache_ptr = nullptr, void* const* extra_kv_cache_ptr = nullptr,
         size_t kv_ptr_stride_bytes = sizeof(void*),
-        const int* position_ptr = nullptr, int compression_ratio = 0) {
+        const int* position_ptr = nullptr, int compression_ratio = 0,
+        const int* chunk_begin_ptr = nullptr, const int* chunk_length_ptr = nullptr) {
   // FastLLM adaptation: graph replays may select a different request's cache.
   // Optional request indices also fold the adapter's validity preparation into
   // this gather. Attention arithmetic is unchanged.
@@ -76,6 +77,12 @@ __global__ void __launch_bounds__(Dsv41Bf16Resources::BLOCK_THREADS, 1)
       if (tidx < R::CANDIDATES) {
         const int pos = *reinterpret_cast<const int*>(
             reinterpret_cast<const char*>(position_ptr) + size_t(t) * kv_ptr_stride_bytes);
+        const int begin = chunk_begin_ptr ? *reinterpret_cast<const int*>(
+            reinterpret_cast<const char*>(chunk_begin_ptr) + size_t(t) * kv_ptr_stride_bytes) : 0;
+        const int chunk_start = VERIFY ? *reinterpret_cast<const int*>(
+            reinterpret_cast<const char*>(position_ptr) + size_t(begin) * kv_ptr_stride_bytes) : pos;
+        const int chunk_length = chunk_length_ptr ? *reinterpret_cast<const int*>(
+            reinterpret_cast<const char*>(chunk_length_ptr) + size_t(t) * kv_ptr_stride_bytes) : 0;
         const int logical = start + tidx;
         int id = -1;
         if (logical < n) {
@@ -83,7 +90,7 @@ __global__ void __launch_bounds__(Dsv41Bf16Resources::BLOCK_THREADS, 1)
             const int count = compression_ratio ? (pos + 1) / compression_ratio : 0;
             // Verification indices span the complete chunk's compressed
             // cache. Mask by the query's causal count, not by index-list rank.
-            const int end = VERIFY ? *position_ptr + num_tokens : pos + 1;
+            const int end = VERIFY ? chunk_start + (chunk_length > 0 ? chunk_length : num_tokens) : pos + 1;
             const int list_count = compression_ratio ? end / compression_ratio : 0;
             if (logical < min(list_count, extra_topk)) {
               id = extra_indices[size_t(t) * extra_indices_stride_elems + logical];
@@ -92,7 +99,7 @@ __global__ void __launch_bounds__(Dsv41Bf16Resources::BLOCK_THREADS, 1)
           } else {
             const int p = pos - 127 + logical;
             // Deferred verification rows remain BF16 outside this ring.
-            const int ring_end = VERIFY ? *position_ptr : pos;
+            const int ring_end = VERIFY ? chunk_start : pos;
             if (p >= 0 && p < ring_end) id = p % 128;
           }
         }

@@ -4,6 +4,7 @@
 
 #define _USE_MATH_DEFINES
 #include "devices/cpu/cpudevice.h"
+#include "exl3.h"
 #include "devices/cpu/deepseekv41-reference-math.h"
 #include "executor.h"
 #ifdef USE_NUMAS
@@ -2350,14 +2351,6 @@ namespace fastllm {
                         finish = true;
                         return;
                     }
-                    static const bool tracedFallback = []() {
-                        if (std::getenv("FASTLLM_NVFP4_BLOCK32_TRACE") != nullptr) {
-                            printf("[Fastllm] NVFP4 block-32: falling back to "
-                                   "dequantise-then-BF16-GEMM.\n");
-                        }
-                        return true;
-                    }();
-                    (void)tracedFallback;
                     std::vector<uint16_t> bf16B_temp(
                         (size_t)(end - st) * m);
                     NVFP4Block32RowsToBFloat16(
@@ -3485,6 +3478,16 @@ namespace fastllm {
 
     void CpuMergeMOE::Run(const std::string &opType, const fastllm::DataDict &datas,
                     const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        auto **exl3Weights = reinterpret_cast<Data **>(datas.at("weights"));
+        const int exl3Count = intParams.at("weights___batch");
+        if (exl3Count > 2 && exl3Weights[2] && exl3Weights[2]->dataType == DataType::EXL3) {
+            AssertInFastLLM(!intParams.count("gateType") || intParams.at("gateType") == (int)MoeGateSwiglu,
+                            "EXL3 MoE currently requires SwiGLU.");
+            Exl3MoeCPU(*datas.at("input"), *datas.at("output"), *datas.at("index"), *datas.at("score"),
+                exl3Weights, exl3Count, floatParams.count("sharedScale") ? floatParams.at("sharedScale") : 1.0f,
+                floatParams.count("swigluLimit") ? floatParams.at("swigluLimit") : 0.0f);
+            return;
+        }
 #ifdef USE_NUMAS
         if (CanRunHostMoe(datas, intParams)) {
             RegisterUnboundHostMoe(reinterpret_cast<Data **>(datas.at("weights")),
@@ -7390,6 +7393,7 @@ ops += (long long)lines * inputDim * interDim * 2;
     }
 
     void DoCpuLinear(Data &input, Data &weight, const Data &bias, Data &output) {
+        if (weight.dataType == DataType::EXL3) { Exl3LinearCPU(input, weight, bias, output); return; }
 //auto st = std::chrono::system_clock::now();
         output.Allocate();
         int n = input.Count(0) / input.dims.back();

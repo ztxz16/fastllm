@@ -37,6 +37,8 @@ def apply_model_defaults(args, metadata):
         return
     if family not in ("deepseek_v41", "deepseek_v41_text"):
         return
+    if "speculative_dspark_confidence_threshold" not in explicit:
+        args.speculative_dspark_confidence_threshold = 0.0
     if not explicit & speculation and not (args.mtp or args.dspark or args.speculative_algorithm or
                                            args.speculative_draft_model_path) and (
             config.get("gguf_architecture") != "deepseek41" or
@@ -512,8 +514,9 @@ def standard_moe_calibration_pair(tensors, model):
             pairs[pair] = pairs.get(pair, 0) + gate.bytes + up.bytes + down.bytes
     if pairs:
         return max(pairs, key=pairs.get)
-    # Native NVFP4 E4M3 has a separate host arithmetic/packing adapter.
-    nvfp4 = set()
+    # Keep block-16 E4M3 and block-32 E8M0 encodings distinct. The latter
+    # uses the native NVFP4_BLOCK_32_E8M0 probe (1009), not a GGUF type.
+    packed_fp4 = {-1: set(), 1009: set()}
     for weight in tensors:
         if (weight.kind not in ('U8', 'I8') or not weight.name.endswith('.weight') or
                 not memory._is_routed_expert(weight.name) or len(weight.shape) < 2):
@@ -521,10 +524,13 @@ def standard_moe_calibration_pair(tensors, model):
         prefix = weight.name[:-len('.weight')]
         scale = next((by_name[n] for n in (weight.name + '_scale_inv', weight.name + '_scale',
                      prefix + '.scale_inv', prefix + '.scale') if n in by_name), None)
-        if (scale and scale.kind == 'F8_E4M3' and len(scale.shape) == len(weight.shape) and
-                scale.shape[:-1] == weight.shape[:-1] and scale.shape[-1] * 8 == weight.shape[-1]):
-            nvfp4.add(weight.shape[-1] * 2)
-    return (-1, -1) if {model.hidden, model.intermediate} <= nvfp4 else None
+        if not (scale and len(scale.shape) == len(weight.shape) and scale.shape[:-1] == weight.shape[:-1]):
+            continue
+        for probe, scale_kind, ratio in ((-1, 'F8_E4M3', 8), (1009, 'F8_E8M0', 16)):
+            if scale.kind == scale_kind and scale.shape[-1] * ratio == weight.shape[-1]:
+                packed_fp4[probe].add(weight.shape[-1] * 2)
+    return next(((probe, probe) for probe, columns in packed_fp4.items()
+                 if {model.hidden, model.intermediate} <= columns), None)
 
 
 _QWEN_HYBRID_ENV = (
@@ -536,20 +542,24 @@ _AUTO_QWEN_ENV_APPLIED = {}
 
 
 def _qwen_hybrid_defaults(args, model, tensors, hardware, numa):
-    # Restrict automatic dispatch to the model shape and one/two-GPU SM75
-    # configuration measured by the hybrid regression suite. Other backends
-    # retain their existing policies; explicit environment values always win.
+    # Graph availability follows placement and backend capability checks,
+    # independently of CUDA architecture. Explicit environment values win.
     if (not numa or len(hardware) not in (1, 2) or
-            any(device.get("capability") != 75 for device in hardware.values()) or
             (model.family, model.layers, model.hidden, model.intermediate,
              model.experts, model.topk) != ("qwen4", 48, 2560, 640, 512, 10) or
             args.moe_device in ("cpu", "disk")):
         return {}
     gguf = any(t.kind.startswith("gguf:") and memory._is_routed_expert(t.name)
                for t in tensors)
+    # Native and GGUF weights share the hybrid graph paths.
+    # Expert operators retain their runtime capability checks and fallbacks.
     defaults = {"FASTLLM_QWEN38_HYBRID_GRAPH": "1"}
     if len(hardware) == 2:
         defaults.update(FASTLLM_QWEN38_OWNED_PP="1", FASTLLM_QWEN38_REMOTE_GRAPH="1")
+    # Prefill dequantization and vision placement remain independently scoped
+    # to their existing measured defaults; enabling graphs need not change them.
+    if any(device.get("capability") != 75 for device in hardware.values()):
+        return defaults
     if (getattr(args, "vision_device", None) is None and
             any(t.name.startswith("model.visual.") for t in tensors)):
         defaults["FASTLLM_QWEN4_VISION_DEVICE"] = "cpu"
@@ -639,12 +649,27 @@ def _resolve_impl(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
         # selection; a generic padded Q4_K GEMV undersizes the hybrid pool.
         # Other model/hardware policies retain their original calibration.
         pair = (standard_moe_calibration_pair(tensors, model)
-                if use_numa_calibration and hybrid_defaults else None)
+                if use_numa_calibration and (hybrid_defaults or model.family == "deepseek_v41") else None)
+        if model.family == "deepseek_v41" and pair not in ((-1, -1), (1009, 1009)):
+            pair = None  # The existing V4.1 GGUF probe uses its dominant encoding.
+        # Native NVFP4 uses the same packed weights with the model's own
+        # activation/SwiGLU profile, rather than a Q4_K GEMV approximation.
+        numa_calibration = numa_calibration or (
+            use_numa_calibration and model.family == "deepseek_v41" and pair in ((-1, -1), (1009, 1009)))
         kind = pair[0] if pair else int(dominant[5:]) if numa_calibration else (16 if 'gguf:16' in kinds else 12)
         workload = ({"numa": True, "rows": max(1, base.max_batch) * (max(base.mtp, base.dspark) + 1),
                      "topk": model.topk} if numa_calibration or pair else {})
-        if pair:
+        if pair and model.family != "deepseek_v41":
             workload['down_type'] = pair[1]
+        probes = {}
+        for tensor in tensors:
+            probe = tensor.calibration_override
+            if probe is not None and memory._is_routed_expert(tensor.name):
+                probes[probe] = probes.get(probe, 0) + tensor.bytes
+        if probes:
+            kind = max(probes, key=probes.get)
+            workload = ({"numa": True, "rows": max(1, base.max_batch) * (max(base.mtp, base.dspark) + 1),
+                         "topk": model.topk} if use_numa_calibration and model.family == "deepseek_v41" else {})
         base.threads, base._cpu_thread_benchmark = select_threads(
             model.hidden, model.intermediate, kind, base.threads, **workload)
     # Dense Qwen3's graph warmup currently hits stream-capture-unsupported
@@ -654,7 +679,7 @@ def _resolve_impl(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
     if disable_qwen3_graph:
         graph_enabled = False
     if (model.family == "deepseek_v41" and "cuda_slab" not in explicit and
-            any(t.kind.startswith("gguf:") and memory._is_routed_expert(t.name) for t in tensors)):
+            any(t.preserve_source and memory._is_routed_expert(t.name) for t in tensors)):
         # Thousands of standalone GGUF expert allocations waste CUDA pages.
         # Reuse the existing persistent weight slabs; explicit zero still wins.
         base.cuda_slab = 64
@@ -699,14 +724,20 @@ def _resolve_impl(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
             os.environ[key] = "1"
             _AUTO_QWEN_ENV_APPLIED[key] = "1"
     ram = ram if ram is not None else memory.host_memory()
-    base._host_moe_shared = numa
+    host_shared = numa
+    base._host_moe_shared = host_shared
     if model.family == "qwen35":
         return _resolve_dense_qwen35(args, base, explicit, metadata, tensors, model,
                                      info, gpu, ram, numa)
-    backends = ["numa" if numa else "cpu", "disk"]
+    disk_supported = all(t.supports_disk for t in tensors if memory._is_routed_expert(t.name))
+    backends = ["numa" if numa else "cpu"]
+    if disk_supported:
+        backends.append("disk")
     if model.family == "deepseek_v41" and numa:
         backends.insert(1, "cpu")
     if "moe_device" in explicit and base.moe_device:
+        if not disk_supported and base.moe_device == "disk":
+            raise ValueError("Expert storage format requires CPU, NUMA or resident CUDA storage")
         backends = [base.moe_device]
     elif getattr(base, "draft_gpu_resident", None) == 1:
         # Disk experts use a separate cache allocator. Do not replace the

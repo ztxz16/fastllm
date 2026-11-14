@@ -3,6 +3,8 @@
 
 #include "model.h"
 #include "fastllm.h"
+#include "weights/safetensors_source.h"
+#include "weights/row_concat.h"
 #include "executor.h"
 #ifdef USE_NUMAS
 #include "devices/numas/numasdevice.h"
@@ -1127,7 +1129,8 @@ namespace fastllm {
         uint64_t len, bytes;
         uint8_t *buffer = nullptr;
         float *minsBuffer = nullptr, *scalesBuffer = nullptr;
-        int blockK, blockM;
+        int blockK = -1, blockM = -1;
+        std::shared_ptr<const TensorSource> source;
 
         SafeTensorItem() {} 
 
@@ -1710,6 +1713,11 @@ namespace fastllm {
         }
 
         void CreateBuffer(DataType dstType) {
+            if (source) {
+                ClearBuffer();
+                buffer = source->Read(dstType);
+                return;
+            }
             //printf("read %s from %s [%llu %llu] (%f M)\n", this->tensorName.c_str(), this->fileName.c_str(), this->data_offsets[0], this->data_offsets[0] + this->bytes, (float)this->bytes / 1e6);
             FILE *fi = fopen(this->fileName.c_str(), "rb");
             int ret;
@@ -4734,24 +4742,7 @@ namespace fastllm {
                                 for (auto &it : rule.rules) {
                                     for (auto input : it.inputs) {
                                         if (model->weight[input].dims.size() == 2) {
-                                            if (model->weight[input].groupCnt != -1 &&
-                                                model->weight[input].dims[1] % model->weight[input].groupCnt != 0) {
-                                                canMerge = false;
-                                                break;
-                                            }
-                                            if (model->weight[input].blockK != -1 &&
-                                                model->weight[input].dims[0] % model->weight[input].blockK != 0) {
-                                                canMerge = false;
-                                                break;
-                                            }
-                                            if (model->weight[input].blockM != -1 &&
-                                                model->weight[input].dims[1] % model->weight[input].blockM != 0) {
-                                                canMerge = false;
-                                                break;
-                                            }
-                                            if (model->weight[input].dataType != model->weight[it.inputs[0]].dataType ||
-                                                model->weight[input].ggmlType != model->weight[it.inputs[0]].ggmlType ||
-                                                model->weight[input].dims[1] != model->weight[it.inputs[0]].dims[1]) {
+                                            if (!CanConcatWeightRows(model->weight[input], model->weight[it.inputs[0]])) {
                                                 canMerge = false;
                                                 break;
                                             }
@@ -5122,6 +5113,43 @@ namespace fastllm {
         // 2. 创建网络基本信息
         std::string configFile = path + "config.json";
         auto config = weightOnly ? json11::Json() : json11::Json::parse(ReadAllFile(configFile), error);
+        // Publishers may keep the large Engram lookup tables separate.
+        // Import only those tables; unrelated weights in their shards must not
+        // replace projections from the selected checkpoint.
+        std::string engramPath = config["engram_table_dir"].string_value();
+        if (const char *env = std::getenv("FASTLLM_DSV41_ENGRAM_PATH"))
+            if (*env) engramPath = env;
+        if (!engramPath.empty()) {
+            if (engramPath.back() != '/' && engramPath.back() != '\\') engramPath += '/';
+            std::set<std::string> files;
+            const std::string indexFile = engramPath + "model.safetensors.index.json";
+            if (FileExists(indexFile)) {
+                std::string parseError;
+                auto index = json11::Json::parse(ReadAllFile(indexFile), parseError)["weight_map"];
+                AssertInFastLLM(parseError.empty(), "Invalid Engram safetensors index.");
+                for (const auto &entry : index.object_items())
+                    if (entry.first.find(".engram.embed.") != std::string::npos)
+                        files.insert(engramPath + entry.second.string_value());
+            } else {
+                for (const auto &entry : fs::directory_iterator(engramPath))
+                    if (fs::is_regular_file(entry) && entry.path().extension() == ".safetensors")
+                        files.insert(entry.path().string());
+            }
+            AssertInFastLLM(!files.empty(), "Engram path has no safetensors tables: " + engramPath);
+            SafeTensors external(files);
+            for (const auto &entry : external.itmeDict)
+                if (entry.first.find(".engram.embed.") != std::string::npos)
+                    safeTensors.itmeDict[entry.first] = entry.second;
+        }
+        NormalizeSafeTensorSources(config["quantization_config"]["quant_method"].string_value(), safeTensors.itmeDict);
+        {
+            const auto &textConfig = config["text_config"].is_object() ? config["text_config"] : config;
+            for (const auto &layer : textConfig["engram_layer_ids"].array_items()) {
+                const std::string name = "layers." + std::to_string(layer.int_value()) + ".engram.embed.";
+                AssertInFastLLM(safeTensors.itmeDict.count(name + "weight") && safeTensors.itmeDict.count(name + "scale"),
+                    "Checkpoint is missing Engram tables; supply --engram-path or FASTLLM_DSV41_ENGRAM_PATH.");
+            }
+        }
         bool isAwqModel = false;
         int awqGroupCnt = 128;
         std::string modelType = "";
@@ -5421,6 +5449,8 @@ namespace fastllm {
                 if (isPackedInt4Group) {
                     dataType = packedInt4Info.dataType;
                 }
+                if (tensor.source && tensor.source->StoredType() != DATA_AUTO_NONE)
+                    dataType = oriDataType = tensor.source->StoredType();
                 if (tensor.dtype == "I64") {
                     dataType = DataType::INT32PARAM;
                 }
@@ -5447,6 +5477,8 @@ namespace fastllm {
                 }
             }
 
+            if (tensor.source) for (const auto &target : tensorMap[tensorName])
+                tensor.source->Configure(model->weight[target.first]);
             totalBytes += tensor.bytes;
             int current = ++cur;
             printf("Load %d \r", current * 100 / prepareTotal);
@@ -5684,9 +5716,13 @@ namespace fastllm {
                                 }
                             }
 
+                            if (tensor.source && tensor.source->StoredType() != DATA_AUTO_NONE)
+                                dataType = oriDataType = tensor.source->StoredType();
                             WeightType diskLazyWeightType = GetDiskLazyWeightType(
                                 model, weightName, tensor.bytes, mergeIndex);
                             bool diskLazyWeight = diskLazyWeightType != WeightType::NONE;
+                            AssertInFastLLM(!diskLazyWeight || !tensor.source,
+                                "Compound source disk execution is not supported; choose CPU, NUMA or CUDA expert storage.");
                             if (diskLazyWeight) {
                                 if (packedInt4Info.isAffine) {
                                     ErrorInFastLLM(
@@ -5917,23 +5953,7 @@ namespace fastllm {
                                 for (auto &it : rule.rules) {
                                     for (auto input : it.inputs) {
                                         if (model->weight[input].dims.size() == 2) {
-                                            if (model->weight[input].groupCnt != -1 && 
-                                                model->weight[input].dims[1] % model->weight[input].groupCnt != 0) {
-                                                canMerge = false;
-                                                break;
-                                            }
-                                            if (model->weight[input].blockK != -1 && 
-                                                model->weight[input].dims[0] % model->weight[input].blockK != 0) {
-                                                canMerge = false;
-                                                break;
-                                            }
-                                            if (model->weight[input].blockM != -1 && 
-                                                model->weight[input].dims[1] % model->weight[input].blockM != 0) {
-                                                canMerge = false;
-                                                break;
-                                            }
-                                            if (model->weight[input].dataType != model->weight[it.inputs[0]].dataType ||
-                                                model->weight[input].dims[1] != model->weight[it.inputs[0]].dims[1]) {
+                                            if (!CanConcatWeightRows(model->weight[input], model->weight[it.inputs[0]])) {
                                                 canMerge = false;
                                                 break;
                                             }
@@ -5990,6 +6010,10 @@ namespace fastllm {
                                         mergeData.groupCnt = model->weight[input0].groupCnt;
                                         mergeData.blockK = model->weight[input0].blockK;
                                         mergeData.blockM = model->weight[input0].blockM;
+                                        std::vector<const Data *> parts;
+                                        for (const auto &input : it.inputs) parts.push_back(&model->weight[input]);
+                                        ConfigureWeightRowConcat(mergeData, parts);
+
 
                                         if (AllInputsAreDiskWeights(model->weight.weight, it.inputs)) {
                                             MergeDiskWeightMeta(model->weight.weight, it.inputs, mergeData);
