@@ -9558,8 +9558,9 @@ namespace fastllm {
         }
 
         if (deepSeekV41Mode) {
-            AssertInFastLLM(input.dataType == DataType::BFLOAT16 && output.dataType == DataType::BFLOAT16,
-                            "V4.1 NUMA GPU prefill requires BF16 activations.");
+            AssertInFastLLM(input.dataType == DataType::BFLOAT16 &&
+                            (output.dataType == DataType::BFLOAT16 || output.dataType == DataType::FLOAT32),
+                            "V4.1 NUMA GPU prefill requires BF16 input and BF16/FP32 output.");
             tempFloatOutput.dataType = DataType::FLOAT32;
             tempFloatOutput.Resize(output.dims);
             tempFloatOutput.ToDevice(DataDevice::CUDA, {curDeviceId}, false);
@@ -9569,6 +9570,8 @@ namespace fastllm {
             floatOutput.ToDevice(DataDevice::CUDA, {curDeviceId}, false);
             floatOutput.Allocate(false);
             if (setZero) FastllmCudaMemset0(floatOutput.cudaData, floatOutput.GetBytes());
+            else if (output.dataType == DataType::FLOAT32)
+                FastllmCudaCopyFromDeviceToDevice(floatOutput.cudaData, output.cudaData, output.GetBytes());
             else FastllmBF16ToFloat(output.cudaData, floatOutput.cudaData, output.Count(0));
         }
 
@@ -9739,9 +9742,9 @@ namespace fastllm {
         if (cachedPrefill) prefillCache.Finish();
 #endif
         if (accurateFp8Moe || deepSeekV41Mode) {
-            FastllmFloatToBF16(
-                floatOutput.cudaData, output.cudaData,
-                output.Count(0));
+            if (output.dataType == DataType::FLOAT32)
+                FastllmCudaCopyFromDeviceToDevice(output.cudaData, floatOutput.cudaData, output.GetBytes());
+            else FastllmFloatToBF16(floatOutput.cudaData, output.cudaData, output.Count(0));
         }
         FastllmCudaEventDestroy(computeDoneEvent);
         FastllmCudaStreamDestroy(copyStream);

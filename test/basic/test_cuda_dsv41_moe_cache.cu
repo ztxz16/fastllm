@@ -372,9 +372,8 @@ static void CheckNumasPrefill(std::vector<Data *> *weights, int tables) {
         input.CopyFrom(cpuInput);
         input.ToDevice(CUDA, std::vector<int>{0});
         Data expected[3], actual[3];
-        // Use the same CPU/GPU partition and BF16 rounding in the reference,
-        // with an explicit device barrier after each layer. An all-CPU result
-        // has a different partial-sum rounding boundary in mixed execution.
+        // Check stream dependencies independently of the partition arithmetic,
+        // with an explicit device barrier after each reference layer.
         for (int layer = 0; layer < 3; ++layer) {
             RunNumasMoe(layer ? expected[layer - 1] : input, index, scores,
                         expected[layer], weights[layer % tables], layer);
@@ -391,6 +390,17 @@ static void CheckNumasPrefill(std::vector<Data *> *weights, int tables) {
                 std::memcmp(expected[layer].cpuData, actual[layer].cpuData, actual[layer].GetBytes()) == 0,
                 "NUMA hybrid prefill chain differs from serialized output bits");
             ++cases;
+        }
+        if (weights[0][2]->dataType == NVFP4_BLOCK_32_E8M0) {
+            Data oracle[3];
+            for (int layer = 0; layer < 3; ++layer) {
+                RunNumasMoe(layer ? oracle[layer - 1] : cpuInput, index, scores,
+                            oracle[layer], weights[layer % tables], layer);
+                oracle[layer].ToDevice(CPU);
+                const bool exact = oracle[layer].GetBytes() == actual[layer].GetBytes() &&
+                    std::memcmp(oracle[layer].cpuData, actual[layer].cpuData, actual[layer].GetBytes()) == 0;
+                Require(exact, "NVFP4 prefill partition changed BF16 rounding");
+            }
         }
         // Also drain asynchronous reduction before shape changes / teardown.
         ClearNumasMoeRuntimeCache();

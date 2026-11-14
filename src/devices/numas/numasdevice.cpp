@@ -2598,6 +2598,7 @@ namespace fastllm {
             std::vector<NumasMoeTaskList> decodeWorkers;
             std::vector<int> activeDecodeWorkers;
             std::vector<std::vector<MultiThreadDeepSeekV41NumasDecodeOp>> fusedDecodeTasks;
+            Data prefillFloatOutput;
             std::vector <float, alignedAllocator<float, 64> > gateUpOutput, swigluOutput, downOutput, reduceOutput;
             std::vector <float, alignedAllocator<float, 64> > inputFloat32;  // 当 input 非 FLOAT32 时暂存转成 float32 的数据
             std::vector <uint8_t, alignedAllocator<uint8_t, 64> > realInput, expandInput, downInput;
@@ -10753,6 +10754,20 @@ namespace fastllm {
                 gpuExperts.erase(e);
                 cpuExperts.insert(e);
             }
+            // Keep device/CPU partial sums in FP32. Casting each partition to
+            // BF16 makes the numerical result depend on the adaptive split.
+            // The native V4.1 path already rounds each expert before reduction.
+            const bool floatPartials = gpuPrefill && !gpuExperts.empty() &&
+                deepSeekV4Mode && activationQuantBlock == 32 &&
+                input.dataType == BFLOAT16 && output.dataType == BFLOAT16 &&
+                weights[2] && (weights[2]->dataType == NVFP4_BLOCK_32_E8M0 ||
+                               weights[2]->dataType == NVFP4);
+            Data &partialOutput = floatPartials ? fastllmMoeDataManagerNumas.prefillFloatOutput : output;
+            if (floatPartials) {
+                partialOutput.dataType = FLOAT32;
+                partialOutput.UpdateUnitSize();
+                partialOutput.Resize(output.dims);
+            }
             uint8_t *cpuOutputPinned = nullptr;
 #ifdef USE_CUDA
             int gpuId = -1;
@@ -10775,7 +10790,7 @@ namespace fastllm {
                 int gpuWorkerCount = (int)cudaInputReplicas.size();
                 assistReduceTargets.assign(gpuWorkerCount, nullptr);
                 assistPartialEvents.assign(gpuWorkerCount, nullptr);
-                const size_t outputBytes = output.GetBytes();
+                const size_t outputBytes = partialOutput.GetBytes();
                 gpuExpertSets.resize(gpuWorkerCount);
                 gpuExpertLoads.assign(gpuWorkerCount, 0);
 
@@ -10828,12 +10843,12 @@ namespace fastllm {
 
                 gpuId = cudaInputReplicas.front().deviceId;
                 FastllmCudaSetDevice(gpuId);
-                output.ToDevice(
+                partialOutput.ToDevice(
                     DataDevice::CUDA, std::vector<int>{gpuId}, false);
-                output.Allocate(false);
+                partialOutput.Allocate(false);
                 AssertInFastLLM(
-                    output.cudaData != nullptr &&
-                    GetPointerDeviceId(output.cudaData) == gpuId,
+                    partialOutput.cudaData != nullptr &&
+                    GetPointerDeviceId(partialOutput.cudaData) == gpuId,
                     "NumasMergeMOE failed to allocate the root GPU partial output.");
 
                 gpuInputAliases.reserve(gpuWorkerCount);
@@ -10851,14 +10866,14 @@ namespace fastllm {
 
                     if (i == 0) {
                         std::unique_ptr<Data> outputAlias(new Data(
-                            output.dataType, output.dims,
-                            DataDevice::CUDA, output.cudaData));
+                            partialOutput.dataType, partialOutput.dims,
+                            DataDevice::CUDA, partialOutput.cudaData));
                         outputAlias->cudaDataBorrowed = true;
                         outputAlias->dataDeviceIds = {replica.deviceId};
                         gpuOutputPartials.push_back(std::move(outputAlias));
                     } else {
                         std::unique_ptr<Data> outputPartial(
-                            new Data(output.dataType, output.dims));
+                            new Data(partialOutput.dataType, partialOutput.dims));
                         outputPartial->dataDevice = DataDevice::CUDA;
                         outputPartial->dataDeviceIds = {replica.deviceId};
                         FastllmCudaSetDevice(replica.deviceId);
@@ -10912,7 +10927,7 @@ namespace fastllm {
                 gpuThreads.reserve(gpuWorkerCount);
                 for (int i = 0; i < gpuWorkerCount; i++) {
                     int workerDevice = cudaInputReplicas[i].deviceId;
-                    // 尺寸在主线程算好传进去：worker 里不再读 input / output
+                    // 尺寸在主线程算好传进去：worker 里不再读 input / partialOutput
                     // 的 dims，避免与主线程的 CPU 分支并发访问同一个 Data。
                     const size_t workerInputBytes = input.GetBytes();
                     const size_t workerOutputBytes = outputBytes;
@@ -11064,14 +11079,14 @@ namespace fastllm {
                 if (!cpuExperts.empty()) {
 #ifdef USE_CUDA
                     if (gpuPrefill && !gpuExperts.empty()) {
-                        cpuOutputPinned = fastllmMoeDataManagerNumas.EnsurePinnedOutput(output.GetBytes());
+                        cpuOutputPinned = fastllmMoeDataManagerNumas.EnsurePinnedOutput(partialOutput.GetBytes());
                     }
 #endif
                     const auto cpuExpertStart = speedTracker
                         ? std::chrono::steady_clock::now()
                         : std::chrono::steady_clock::time_point{};
                     DoNumasMergeMOEOnCPU(
-                        input, output, index, score, weights, biass,
+                        input, partialOutput, index, score, weights, biass,
                         sharedScale, weightsBatch, topk, cpuExperts, fastllmMoeDataManagerNumas,
                         cpuOutputPinned, swigluLimit, deepSeekV4Mode, activationQuantBlock, quantizeSharedExpert
                     );
@@ -11090,7 +11105,7 @@ namespace fastllm {
                     // CPU partial 直接写入 pinned buffer，再异步搬到复用的 GPU staging buffer。
                     if (gpuPrefill && !gpuExperts.empty() && cpuOutputPinned != nullptr) {
                         FastllmCudaSetDevice(gpuId);
-                        size_t outputBytes = output.GetBytes();
+                        size_t outputBytes = partialOutput.GetBytes();
                         cpuOutputStaging = fastllmMoeDataManagerNumas.EnsureGpuOutputStaging(outputBytes, gpuId);
                         cpuOutputCopyStream = fastllmMoeDataManagerNumas.EnsureGpuOutputCopyStream(gpuId);
                         FastllmCudaCopyFromPinnedHostToDeviceAsync(
@@ -11119,7 +11134,7 @@ namespace fastllm {
                     }
                 }, errors);
                 // Drain both sides before propagating errors: every task borrows
-                // this layer's input, output and routing metadata.
+                // this layer's input, partialOutput and routing metadata.
                 for (const auto &error : errors) if (error) {
                     FastllmCudaSetDevice(cudaInputReplicas[0].deviceId);
                     FastllmCudaEventSynchronize(assistPartialEvents[0]);
@@ -11141,8 +11156,8 @@ namespace fastllm {
                 FastllmCudaSetDevice(gpuId);
                 if (persistentPrefill) FastllmCudaCurrentThreadStreamWaitEvent(assistPartialEvents[0]);
                 Data gpuOutputAlias(
-                    output.dataType, output.dims,
-                    DataDevice::CUDA, output.cudaData);
+                    partialOutput.dataType, partialOutput.dims,
+                    DataDevice::CUDA, partialOutput.cudaData);
                 const bool pipelineOutput = (numasMoePipelineWorkspace >= 0 || persistentPrefill) &&
                     gpuOutputPartials.size() == 1;
                 if (cpuOutputStaging != nullptr) {
@@ -11152,7 +11167,7 @@ namespace fastllm {
                     } else {
                         FastllmCudaStreamSynchronize(cpuOutputCopyStream);
                     }
-                    Data cpuOutputAlias(output.dataType, output.dims, DataDevice::CUDA, cpuOutputStaging);
+                    Data cpuOutputAlias(partialOutput.dataType, partialOutput.dims, DataDevice::CUDA, cpuOutputStaging);
                     FastllmCudaAddTo(gpuOutputAlias, cpuOutputAlias, 1.0f);
                 }
                 if (gpuOutputPartials.size() > 1) {
@@ -11165,7 +11180,7 @@ namespace fastllm {
                                 assistPartialEvents[i]);
                         }
                         Data reduceAlias(
-                            output.dataType, output.dims,
+                            partialOutput.dataType, partialOutput.dims,
                             DataDevice::CUDA, assistReduceTargets[i]);
                         FastllmCudaAddTo(gpuOutputAlias, reduceAlias, 1.0f);
                     }
@@ -11177,13 +11192,13 @@ namespace fastllm {
                     // same stream. Reuse/free of its private pinned output
                     // already waits for this event in EnsurePinnedOutput and
                     // ClearNumasMoeRuntimeCache, including shape changes.
-                    fastllmMoeDataManagerNumas.RecordDecodeOutputCopy(gpuId);
+                    if (!floatPartials) fastllmMoeDataManagerNumas.RecordDecodeOutputCopy(gpuId);
                 } else if (cpuOutputStaging != nullptr ||
                            gpuOutputPartials.size() > 1) {
                     FastllmCudaSyncCurrentThreadStream();
                 }
-                output.dataDevice = DataDevice::CUDA;
-                output.dataDeviceIds = {gpuId};
+                partialOutput.dataDevice = DataDevice::CUDA;
+                partialOutput.dataDeviceIds = {gpuId};
                 for (int i = 1;
                      i < (int)gpuOutputPartials.size(); i++) {
                     FastllmCudaSetDevice(
@@ -11191,6 +11206,15 @@ namespace fastllm {
                     gpuOutputPartials[i].reset();
                 }
                 FastllmCudaSetDevice(gpuId);
+            }
+            if (floatPartials) {
+                FastllmCudaSetDevice(gpuId);
+                output.ToDevice(DataDevice::CUDA, {gpuId}, false);
+                output.Allocate(false);
+                FastllmFloatToBF16(partialOutput.cudaData, output.cudaData, output.Count(0));
+                // Clear/resize must also wait for the final cast to consume
+                // the persistent FP32 scratch, including an all-GPU split.
+                fastllmMoeDataManagerNumas.RecordDecodeOutputCopy(gpuId);
             }
 #endif
             phaseLap(phaseReduceMs);
