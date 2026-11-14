@@ -3,6 +3,7 @@
 
 import os
 from pathlib import Path
+import signal
 import socket
 import struct
 import sys
@@ -66,13 +67,17 @@ def main():
     connection = socket.socket(fileno=int(args["--control-fd"]))
     connection.setblocking(True)
 
-    if mode == "startup_peer_exit":
+    if mode in ("startup_peer_exit", "startup_nonzero_exit", "startup_signal_exit"):
         if rank == 0:
             marker.touch()
             # 等待父进程关闭连接；不发送 Hello，令其阻塞在 rank 0。
             receive(connection)
         else:
             wait_for(marker.exists)
+            if mode == "startup_nonzero_exit":
+                os._exit(23)
+            if mode == "startup_signal_exit":
+                os.kill(os.getpid(), signal.SIGKILL)
         return
 
     hello = struct.pack("<IIIIII", rank, int(args["--device"]), os.getpid(), 0, 0, 0)
@@ -122,6 +127,10 @@ def main():
                 connection.sendall(frame(PONG, session, sequence))
             else:
                 wait_for(marker.exists)
+                if mode == "nonzero_exit":
+                    os._exit(23)
+                if mode == "signal_exit":
+                    os.kill(os.getpid(), signal.SIGKILL)
                 if mode in ("buffered_error_exit", "partial_error_exit", "stale_error_exit"):
                     reply = frame(ERROR, session, sequence + (mode == "stale_error_exit"), ERROR_TEXT)
                     connection.sendall(reply[:-4] if mode == "partial_error_exit" else reply)

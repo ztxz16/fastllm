@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <climits>
+#include <cstdio>
 #include <cstring>
 #include <iostream>
 #include <map>
@@ -505,6 +506,9 @@ uint64_t ParseUnsigned(const std::string &text) {
 int main(int argc, char **argv) {
     uint64_t session = 0;
     uint64_t sequence = 0;
+    int rank = -1;
+    uint32_t command = 0;
+    const char *phase = "arguments";
     bool canReport = false;
     try {
         std::map<std::string, uint64_t> args;
@@ -524,30 +528,43 @@ int main(int argc, char **argv) {
             throw std::runtime_error("invalid worker identity");
         }
         session = args.at("--session");
+        rank = static_cast<int>(args.at("--rank"));
         pid_t parentPid = static_cast<pid_t>(args.at("--parent-pid"));
+        phase = "parent_watch";
         if (getppid() != parentPid) {
             throw std::runtime_error("worker parent is unavailable");
         }
         canReport = true;
         // 不用 PR_SET_PDEATHSIG：它跟随创建线程退出，可能误杀仍有效的进程组。
         // 独立监控可在主线程阻塞于 CUDA/NCCL 时响应父进程死亡或控制连接关闭。
-        std::thread([parentPid]() {
+        std::thread([parentPid, rank]() {
             while (true) {
                 pollfd item{kWorkerFd, POLLRDHUP, 0};
                 int result = poll(&item, 1, 250);
-                if (getppid() != parentPid ||
+                pid_t observedParent = getppid();
+                if (observedParent != parentPid ||
                     (result > 0 && (item.revents & (POLLRDHUP | POLLHUP | POLLERR | POLLNVAL)))) {
+                    // 单次短写避免多 worker 日志交错；不依赖可能被主线程占用的 iostream 锁。
+                    char message[256];
+                    int length = snprintf(message, sizeof(message),
+                        "fastllm_tp_worker: rank=%d pid=%d parent_watch exit_code=1 expected_parent=%d "
+                        "observed_parent=%d poll_revents=0x%x\n", rank, int(getpid()), int(parentPid),
+                        int(observedParent), static_cast<unsigned>(item.revents));
+                    if (length > 0) {
+                        (void)write(STDERR_FILENO, message, std::min<size_t>(length, sizeof(message) - 1));
+                    }
                     _exit(1);
                 }
             }
         }).detach();
-        int rank = static_cast<int>(args.at("--rank"));
         int world = static_cast<int>(args.at("--world-size"));
         int device = static_cast<int>(args.at("--device"));
         DeviceRuntime runtime{args.at("--control-only") != 0, args.at("--cuda-graph") != 0,
                               args.at("--custom-allreduce") != 0, args.at("--prefix-cache") != 0};
+        phase = "device_bind";
         runtime.Bind(device);
 
+        phase = "hello";
         std::vector<uint8_t> hello;
         for (uint32_t value : {uint32_t(rank), uint32_t(device), uint32_t(getpid()), uint32_t(!runtime.controlOnly)}) {
             Put32(hello, value);
@@ -575,11 +592,14 @@ int main(int argc, char **argv) {
         bool initialized = false;
         bool idCreated = false;
         while (true) {
+            phase = "receive";
             auto message = Receive(kWorkerFd, Deadline::max());
             if (message.session != session || message.sequence <= sequence) {
                 throw std::runtime_error("worker session/sequence mismatch");
             }
             sequence = message.sequence;
+            command = static_cast<uint32_t>(message.kind);
+            phase = "execute";
             Kind response;
             std::vector<uint8_t> payload;
             if (message.kind != Kind::Initialize && message.kind != Kind::LoadQwen3 &&
@@ -696,9 +716,15 @@ int main(int argc, char **argv) {
                 (message.kind == Kind::PrefillQwen3 || message.kind == Kind::BeginQwen3Request || message.kind == Kind::DecodeQwen3) ?
                 std::chrono::milliseconds(Get32(message.payload, 4)) :
                 std::chrono::milliseconds(10000);
+            phase = "reply";
             Send(kWorkerFd, {response, session, sequence, payload}, Clock::now() + responseTimeout);
         }
     } catch (const std::exception &e) {
+        // 先保存本地原因；协调器收到错误帧后可能立即终止其余 worker。
+        std::string diagnostic = "fastllm_tp_worker: rank=" + std::to_string(rank) +
+            " pid=" + std::to_string(getpid()) + " sequence=" + std::to_string(sequence) +
+            " phase=" + phase + " command=" + std::to_string(command) + ": " + e.what() + "\n";
+        (void)write(STDERR_FILENO, diagnostic.data(), diagnostic.size());
         if (canReport) {
             try {
                 std::string reason = e.what();
@@ -708,7 +734,6 @@ int main(int argc, char **argv) {
             } catch (...) {
             }
         }
-        std::cerr << "fastllm_tp_worker: " << e.what() << std::endl;
         // 避免 CUDA/NCCL 异常退出时静态析构再次阻塞；父进程负责回收。
         _exit(1);
     }

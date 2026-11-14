@@ -4,6 +4,7 @@
 from contextlib import contextmanager
 import os
 from pathlib import Path
+import signal
 import socket
 import struct
 import subprocess
@@ -114,6 +115,18 @@ class ExitFixtureTest(unittest.TestCase):
             self.ping(connections)
             self.assertEqual(fixture.receive(connections[1]), (7, 123, 2, b""))
             self.assertEqual(processes[0].wait(timeout=3), 0)
+
+    def test_exit_status_distinguishes_nonzero_exit_and_signal(self):
+        for startup in (False, True):
+            for mode, code in (("nonzero_exit", 23), ("signal_exit", -signal.SIGKILL)):
+                mode = ("startup_" if startup else "") + mode
+                with self.subTest(mode=mode), workers(mode) as (connections, processes):
+                    if not startup:
+                        self.initialize(connections, processes)
+                        self.ping(connections)
+                    self.assertEqual(processes[1].wait(timeout=3), code)
+                    self.assertIsNone(processes[0].poll())
+                    self.assertEqual(connections[1].recv(1), b"")
 
     def test_live_stall_has_no_exit(self):
         with workers("stall") as (connections, processes):

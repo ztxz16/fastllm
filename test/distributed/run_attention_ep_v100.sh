@@ -44,6 +44,11 @@ PY
             --worker "$moe_build/fastllm_tp_worker" --devices 0,1,2,3 --build-cache "$moe_build/CMakeCache.txt"
         "$moe_python" test/distributed/run_qwen_moe_full.py "${moe_common[@]}"
         ;;
+    reproduce)
+        [[ $# -ge 2 ]] || { echo 'reproduce需要小模型case名称及可选重复次数' >&2; exit 2; }
+        "$moe_python" test/distributed/run_qwen_moe_full.py "${moe_common[@]}" \
+            --synthetic-case "$2" --repeat "${3:-10}"
+        ;;
     real)
         "$moe_python" test/distributed/run_qwen_moe_full.py "${moe_common[@]}" --model "$moe_model" \
             --reference-python "${ATTENTION_EP_REFERENCE_PYTHON:-$moe_python}"
@@ -61,6 +66,10 @@ PY
         "$moe_python" test/distributed/run_qwen3_decode.py --check "$moe_build/fastllm_tp_decode_check" "${moe_dense[@]}" --cuda-graph
         "$moe_python" test/distributed/run_attention_ep_dense_regression.py --build "$moe_build"
         ;;
-    *) echo 'usage: bash test/distributed/run_attention_ep_v100.sh {build|synthetic|real|http|performance|regression}' >&2; exit 2 ;;
+    *) echo 'usage: bash test/distributed/run_attention_ep_v100.sh {build|synthetic|reproduce CASE [REPEAT]|real|http|performance|regression}' >&2; exit 2 ;;
 esac
-echo "PASS: $moe_stage；GPU验收结果以本次生成的summary.json为准。"
+if [[ "$moe_stage" == reproduce ]]; then
+    echo 'PASS: reproduce（仅定向复现，不代表完整验收通过）；结果见本次summary.json。'
+else
+    echo "PASS: $moe_stage；GPU验收结果以本次生成的summary.json为准。"
+fi

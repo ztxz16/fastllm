@@ -46,7 +46,7 @@ int ParseInt(const std::string &text) {
 void RunWatchCase(ProcessGroupOptions options, const std::string &caseName, json11::Json::object &report) {
     Require(options.controlOnly && options.devices.size() == 2, "watch cases require control-only TP=2");
     const std::string mode = caseName.substr(6);
-    const bool startup = mode == "startup_peer_exit", stall = mode == "stall";
+    const bool startup = mode.rfind("startup_", 0) == 0, stall = mode == "stall";
     const bool shutdown = mode == "shutdown_order";
     options.startupTimeoutMs = 30000;
     options.operationTimeoutMs = stall ? 1000 : 30000;
@@ -96,6 +96,15 @@ void RunWatchCase(ProcessGroupOptions options, const std::string &caseName, json
             Require(error.rfind("rank " + std::to_string(rank), 0) == 0,
                     "reported waiting rank instead of failed rank: " + error);
             Require(error.find("timeout") == std::string::npos, "worker exit fell through to timeout: " + error);
+            if (mode == "nonzero_exit" || mode == "startup_nonzero_exit" ||
+                mode == "signal_exit" || mode == "startup_signal_exit") {
+                const bool signaled = mode.find("signal_exit") != std::string::npos;
+                Require(error.find(signaled ? "; signal=9; core_dumped=0" : "; exit_code=23") != std::string::npos,
+                        "lost original worker exit status: " + error);
+                Require(error.find("; pid=") != std::string::npos &&
+                        error.find("; sequence=" + std::to_string(startup ? 0 : 2)) != std::string::npos,
+                        "lost worker identity or transaction: " + error);
+            }
             if (mode == "buffered_error_exit" || mode == "current_error_exit") {
                 Require(error.find("injected worker failure before exit") != std::string::npos,
                         "lost complete worker error: " + error);

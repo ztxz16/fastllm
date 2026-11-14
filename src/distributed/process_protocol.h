@@ -38,6 +38,7 @@ struct WorkerWatch {
     int rank;
     int fd;
     int pidfd;
+    int pid;
 };
 
 /** 单次控制事务的退出监控上下文；session/sequence 用于识别退出前留下的错误回复。 */
