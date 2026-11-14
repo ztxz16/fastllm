@@ -71,6 +71,31 @@ Transformers 4.57.6、Accelerate 1.12.0。主环境仅用于分词，不能用�
 `regression` 会在独立结果目录生成稠密小模型和 tokenizer，然后调用原有 DP2×TP1、DP4×TP1、
 DP2×TP2 验收以及 TP Decode Eager/Graph 验收，不需要另下载稠密模型。
 
+## 失败历史的分层定位
+
+固定短序列的逐层检查通过，不保证中文请求的长历史没有数值差异。可从已保存的请求中
+自动提取首次logits超差的真实Token历史，分别检查全部层的Attention、独立MoE、完整层。
+独立MoE使用HF实际Attention残差输出作为双方共同输入；不累积FastLLM上游层误差。
+该诊断仅激活失败请求所在DP rank，其他rank空闲但参与EP通信；不重放原始并发调度，
+不验证Graph/Prefix/最终Norm与LM Head，也不能替代完整模型验收。
+
+更新Python脚本后可直接运行已有服务器产物，不需要重新编译。保持前文CUDA环境设置：
+
+```bash
+/venv/main/bin/python3 test/distributed/run_qwen_moe_precision_diagnostic.py \
+  --result-dir test/distributed/results/20261114T151715Z_moe_full_f844ff43 \
+  --request session-0002/request-000001.json \
+  --model /home/models/Qwen1.5-MoE-A2.7B-Chat \
+  --build build-attention-ep-cu126 \
+  --reference-python /venv/fastllm-reference-cu126/bin/python3
+```
+
+HF和FastLLM进程分开加载，任务按已有checker文件大小与数量限制分块，原始日志保留。
+逐层数值失败继续记录剩余任务；进程或参考生成失败时保存已完成部分。每字段记录
+max/mean绝对误差、失败数、最坏元素及实际/参考值；阈值保持`atol=0.05, rtol=0.01`。
+四种报告均包含`saved_full_model_logits`原失败，所以总体FAIL/非零退出是预期的，
+不能将局部子层PASS解释为原问题已修复。诊断目录不会覆盖原验收报告。
+
 ## 正式运行示例
 
 ```bash
