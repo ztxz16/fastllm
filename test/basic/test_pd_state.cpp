@@ -61,6 +61,92 @@ class StateModel : public basellm {
     }
 };
 
+static void TestAdmissionLifetime() {
+    class DecodeModel final : public StateModel {
+      public:
+        bool failImport = false;
+        bool stateReleasedBeforeAdmission = true;
+        std::weak_ptr<void> stateOwner;
+        void ImportPDState(ResponseContext &context, const fastkv::Message &message) override {
+            StateModel::ImportPDState(context, message);
+            std::weak_ptr<void> admission = context.pdAdmission;
+            auto owner = std::shared_ptr<int>(new int(1), [this, admission](int *value) {
+                if (admission.expired()) stateReleasedBeforeAdmission = false;
+                delete value;
+            });
+            stateOwner = owner;
+            context.pastKeyValues[0].first.kvStorageOwner = std::move(owner);
+            if (failImport) throw std::runtime_error("injected partial import failure");
+        }
+    } decode;
+    StateModel prefill;
+    fastkv::Service port;
+    port.Start("127.0.0.1:0", [](const fastkv::Message &m) { return m; });
+    const auto endpoint = port.Address(); port.Stop();
+    SetPageLen(128); SetMaxTokens(65536);
+    prefill.ConfigurePD(json11::Json::object{{"role", "prefill"}, {"model_id", "lifetime"},
+        {"transport", "tcp"}, {"listen", endpoint}, {"chunk_tokens", 2}});
+    decode.maxBatch = 1;
+    decode.ConfigurePD(json11::Json::object{{"role", "decode"}, {"model_id", "lifetime"},
+        {"transport", "tcp"}, {"prefill", json11::Json::array{endpoint}}});
+    auto begin = [&](ResponseContext &context) {
+        context.Init(1, FLOAT32, FLOAT32);
+        context.currentTokens = context.allTokens = {3, 7, 11};
+        context.inputTokens = 3;
+        context.generationConfig.output_token_limit = 1;
+        decode.BeginPD(&context);
+    };
+    auto imported = [&](ResponseContext &context) {
+        for (int i = 0; i < 3000 && !context.isEnding && !decode.PollPD(&context); ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    };
+    // The scheduler retires PD transport state before a slow consumer drains
+    // output. Admission must still cover retained KV, including failed imports.
+    for (int mode = 0; mode < 3; ++mode) {
+        decode.failImport = mode == 1;
+        const int handle = decode.responseContextDict.CreateHandle();
+        auto *context = decode.responseContextDict.GetHandle(handle);
+        begin(*context); imported(*context);
+        const auto owner = decode.stateOwner;
+        Check(!owner.expired(), "lifetime fixture did not import state");
+        Check(context->error == (mode == 1 ? ResponseContextErrorRuntime : ResponseContextErrorNone),
+              "unexpected admission fixture import failure");
+        context->isEnding = true;
+        context->resultTokenQueue.push(42);
+        context->pdPending.reset();
+        decode.OnResponseContextFinished(context);
+        ResponseContext queued; begin(queued);
+        const int forwards = prefill.forwards;
+        for (int i = 0; i < 20; ++i) {
+            Check(!decode.PollPD(&queued) && queued.preTokens == 0 && !queued.isEnding,
+                  "PD admission released while completed request still owns KV");
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        Check(prefill.forwards == forwards && !owner.expired(),
+              "queued request started P work before old KV was released");
+        if (mode == 2) {
+            decode.AbortResponse(handle);
+            decode.RemoveResponseContext(handle);
+        } else {
+            int token = -1;
+            Check(decode.FetchResponseTokensBatch(handle, &token, 1) == 1 && token == 42,
+                  "retired request lost buffered output");
+            Check(!owner.expired(), "buffered output unexpectedly destroyed the context");
+            Check(decode.FetchResponseTokensBatch(handle, &token, 1) == (mode == 1 ? -3 : -1),
+                  "terminal fetch lost the completion/error status");
+        }
+        Check(owner.expired(), "completed/cancelled request leaked KV");
+        Check(decode.stateReleasedBeforeAdmission, "admission was destroyed before retained KV");
+        decode.failImport = false;
+        imported(queued);
+        Check(!queued.isEnding && queued.preTokens == 2 &&
+                  ((float *)queued.pastKeyValues[0].first.cpuData)[0] == 17,
+              "released admission did not resume queued request correctly");
+    }
+    decode.StopPD(); prefill.StopPD();
+    std::cout << "PASS PD admission lifetime: buffered output, partial import failure and cancellation\n";
+}
+
 class BatchStateModel : public StateModel {
   public:
     std::atomic<int> batches{0}, largest{0}, live{0}, peakTokens{0}, liveTokens{0};
@@ -564,6 +650,7 @@ static void CheckLegacySessionPeer(bool sessionProtocol = false) {
 
 int main() {
     try {
+        TestAdmissionLifetime();
         CheckLegacySessionPeer();
         CheckLegacySessionPeer(true);
         // Packed FP4 rows include E4M3 scales. Transfer all stored bytes
@@ -627,7 +714,8 @@ int main() {
                                                 {"model_id", "test"},
                                                 {"transport", "tcp"},
                                                 {"prefill", json11::Json::array{endpoint}}});
-        ResponseContext context;
+        auto contextOwner = std::make_unique<ResponseContext>();
+        auto &context = *contextOwner;
         context.Init(1, FLOAT32, FLOAT32);
         context.generationConfig.output_token_limit = 1;
         context.currentTokens = context.allTokens = {3, 7, 11, 19, 23, 29};
@@ -681,7 +769,8 @@ int main() {
         decode.residentHistory = false;
         context.TryRecord(&prefill);
         Check(prefill.historyRecords == 1, "non-decode history policy changed");
-        ResponseContext queued;
+        auto queuedOwner = std::make_unique<ResponseContext>();
+        auto &queued = *queuedOwner;
         queued.Init(1, FLOAT32, FLOAT32);
         queued.allTokens = {1, 2, 3};
         queued.generationConfig.output_token_limit = 1;
@@ -692,11 +781,11 @@ int main() {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
         Check(prefill.forwards == 3, "blocked admission must not start P work");
-        context.pdPending.reset();
+        contextOwner.reset();
         for (int i = 0; i < 3000 && !decode.PollPD(&queued); ++i)
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         Check(!queued.isEnding && queued.preTokens == 2, "released page credit admits queued request");
-        queued.pdPending.reset();
+        queuedOwner.reset();
         const int afterAdmission = prefill.forwards;
 
         for (int extended = 0; extended < 2; ++extended) {

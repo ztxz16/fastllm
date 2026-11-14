@@ -98,6 +98,10 @@ namespace fastllm {
 
     struct ResponseContext {
         RequestMetadata requestMetadata;
+        // Admission covers retained KV, not just pending transport/forward.
+        // Declare before pdPending and pastKeyValues so their resources are
+        // destroyed before returning slot/token credits to another request.
+        std::shared_ptr<void> pdAdmission;
         std::shared_ptr<PDPending> pdPending;
         uint64_t generation = 0; // Distinguish a reused handle while a consumer waits.
         std::unique_ptr<PrefillPrefixPreview> prefillPreview;

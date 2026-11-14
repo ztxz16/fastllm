@@ -1164,6 +1164,7 @@ bool basellm::PollPD(ResponseContext *context) {
                 auto admission = std::make_shared<PDPending::Admission>();
                 admission->slot = pdRuntime->slots->Reserve(1);
                 admission->tokens = pdRuntime->tokens->Reserve(pending->reservation);
+                context->pdAdmission = admission;
                 pending->admission = std::move(admission);
             }
         } catch (const fastkv::CapacityBusy &) {
