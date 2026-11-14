@@ -276,12 +276,33 @@ struct Qwen3LayerExecutor::Impl {
         return static_cast<const half*>(tensor->data);
     }
 
-    /** 执行 Y[T,N]=X[T,K]*W[N,K]^T；FP16 输入/权重，FP32 累加，输出类型由调用方指定。 */
+    /**
+     * 执行行主序线性计算 Y[T,N]=X[T,K]*W[N,K]^T。
+     *
+     * Qwen2 MoE 使用与 HF/PyTorch 常规 FP16 GEMM 一致的 FP32 计算类型和
+     * Tensor Op 算法选项。PEDANTIC 的不同累加路径会令 router 分数产生一个
+     * FP16 间隔的差异，并改变 Top-K 边界。此策略覆盖 MoE 的所有 Linear，
+     * 包括上游 Attention 投影；单层、Eager 与 Graph 共用本入口。
+     * Dense Qwen3 保留 PEDANTIC 策略。复用执行器的 handle、stream 和工作区，
+     * 不在此处同步或修改输出舍入边界；cuBLAS 失败直接上抛，不切换算法重试。
+     *
+     * @param x 连续 FP16 激活 [T,K]。
+     * @param w 连续 FP16 权重 [N,K]。
+     * @param y 连续输出 [T,N]，类型由 fp32 指定。
+     * @param t Token 行数 T，由调用方验证为正数。
+     * @param n 输出通道数 N。
+     * @param k 输入通道数 K。
+     * @param fp32 true 输出 FP32，用于投影中间值或 logits；false 输出 FP16。
+     */
     void Linear(const half *x, const half *w, void *y, int t, int n, int k, bool fp32) {
+        const bool moe = weights.Plan().model == ShardModel::Qwen2Moe;
+        const auto computeType = moe ? CUBLAS_COMPUTE_32F : CUBLAS_COMPUTE_32F_PEDANTIC;
+        const auto algorithm = moe ? CUBLAS_GEMM_DEFAULT_TENSOR_OP : CUBLAS_GEMM_DEFAULT;
         const float alpha = 1, beta = 0;
+
         Blas(cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, n, t, k, &alpha,
             w, CUDA_R_16F, k, x, CUDA_R_16F, k, &beta, y, fp32 ? CUDA_R_32F : CUDA_R_16F,
-            n, CUBLAS_COMPUTE_32F_PEDANTIC, CUBLAS_GEMM_DEFAULT));
+            n, computeType, algorithm));
     }
 
     struct Workspace {

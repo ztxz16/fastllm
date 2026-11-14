@@ -60,7 +60,7 @@ def linked_cublas(worker):
 
 
 class PedanticGemm:
-    """/** 独立cuBLAS handle调用相同GemmEx参数，只做对照，不加载FastLLM或修改其结果。 */"""
+    """/** 独立handle重放修复前的PEDANTIC配置，供历史日志对照，不代表当前MoE策略。 */"""
 
     def __init__(self, library, stream):
         """/** 绑定已有CUDA库、独立handle及调用方当前stream；配置失败立即释放handle。 */"""
@@ -105,7 +105,7 @@ class PedanticGemm:
 
     def linear(self, torch, x, weight):
         """/**
-         * 执行FP16 Y[T,N]=X[T,K]*W[N,K]^T，参数与正式Linear的FP16输出分支一致。
+         * 执行FP16 Y[T,N]=X[T,K]*W[N,K]^T，保留修复前Linear的FP16输出分支参数。
          * 使用已分配的连续CUDA张量和同一stream，FP32_PEDANTIC累加，禁止编译。
          * @param torch 已安装的PyTorch，仅提供张量、设备内存与stream。
          * @param x 连续FP16 CUDA [T,K]。
