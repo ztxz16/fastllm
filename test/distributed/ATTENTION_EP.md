@@ -128,6 +128,26 @@ PyTorch Linear和使用已有worker链接的cuBLAS库、修复前参数的FP32_P
 该证据支持修复MoE GEMM配置，不能视为修复后验收。上述探针刻意保留旧PEDANTIC
 路径用于历史归因；新二进制应通过`synthetic`、`regression`、`real`验证实际输出。
 
+## 启动阶段异常的定向复现
+
+若`ready.json`尚未产生、请求数为0，故障发生在进程组初始化或模型加载阶段，
+不能仅凭case名称中的Graph标记归因于图执行。退出监控会在统一回收前读取
+原始`exit_code`或`signal`，同时保存PID和事务sequence；读取状态不会提前回收
+进程。worker异常会先写stderr，再发送协议错误；父进程/控制连接守护退出也会
+记录父PID和poll事件。其他worker的守护退出可能只是整组清理的后果，应先看
+协调器记录的首个故障rank。`signal=9`本身不能证明发生了OOM。
+
+重新构建后可只重复失败的小模型case，默认10轮：
+
+```bash
+bash test/distributed/run_attention_ep_v100.sh reproduce f16_bias_ep4_graph1_prefix0 10
+```
+
+每轮新建正式会话并保留单独的启动/请求/关闭日志，沿用完整logits误差检查、
+冷热两次请求及Graph捕获/重放检查。任一轮失败，四格式汇总和进程退出码仍为
+失败，后续成功不会覆盖原失败。报告标记`focused_synthetic`，不代表跨模式、
+完整小模型矩阵或真实模型验收通过。定向通过后仍需运行完整验收。
+
 ## 正式运行示例
 
 ```bash

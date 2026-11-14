@@ -23,6 +23,18 @@ from fastllm_pytools.qwen_moe_process_session import QwenMoeProcessSession, BACK
 from fastllm_pytools.qwen3_process_session import GenerationCancelled, GenerationObserverError
 
 
+SYNTHETIC_FIXTURES = {
+    'f16_bias': {}, 'bf16_no_bias': dict(dtype='BF16', bias=False),
+    'f32_tied_normalized': dict(dtype='F32', tied=True, normalize=True),
+    'zero_experts': dict(experts=3, topk=1), 'hotspot': dict(hotspot=True, topk=1),
+}
+SYNTHETIC_CASES = {
+    f'{name}_ep{world}_graph{int(graph)}_prefix{int(prefix)}': (name, world, graph, prefix)
+    for name in SYNTHETIC_FIXTURES for world in (1, 2, 4)
+    for graph in (False, True) for prefix in (False, True)
+}
+
+
 def require(value, message):
     """/** 验收条件失败立即记录具体原因，不放宽误差或隐式跳过路径。 */"""
     if not value:
@@ -162,13 +174,16 @@ class Suite:
             cuda_graph=graph, prefix_cache=prefix, routing=routing, timeout=self.args.timeout,
             trace=trace, request_log=trace, queue_size=16)
 
-    def correctness(self, model, world, reference, real=False, baseline=None, requests=None):
+    def correctness(self, model, world, reference, real=False, baseline=None, requests=None,
+                    modes=None, case_suffix=''):
         """/** 覆盖变长、空闲、跨请求图复用、冷热前缀及rank独立KV，逐步比对参考。 */"""
         vocab = json.loads((model / 'config.json').read_text())['vocab_size']
         requests = requests or [request([(i*7+j+1) % vocab for j in range(2+i%4)], 3+i%5) for i in range(8)]
         for graph in (False, True):
             for prefix in (False, True):
-                name = f'{model.name}_ep{world}_graph{int(graph)}_prefix{int(prefix)}'
+                if modes is not None and (graph, prefix) not in modes:
+                    continue
+                name = f'{model.name}_ep{world}_graph{int(graph)}_prefix{int(prefix)}{case_suffix}'
                 def run(metrics):
                     nonlocal baseline
                     with self.session(model, world, graph, prefix) as session:
@@ -198,6 +213,30 @@ class Suite:
                     evidence['shutdown'] = session.shutdown
                     return evidence
                 self.case(name, run)
+
+    def synthetic(self):
+        """/**
+         * 运行完整小模型矩阵，或重复一个明确选择的用例以诊断间歇故障。
+         * 定向模式仍走相同会话、完整logits比较及Graph/Prefix检查；每轮独立
+         * 进程和输出，不重试掩盖失败，也不宣称覆盖跨模式及完整生命周期验收。
+         */"""
+        if self.args.synthetic_case:
+            name, world, graph, prefix = SYNTHETIC_CASES[self.args.synthetic_case]
+            self.metadata.update(scope='focused_synthetic', selected_case=self.args.synthetic_case,
+                                 repeats=self.args.repeat, expected_case_count=self.args.repeat,
+                                 report_title='Attention DP + EP focused synthetic reproduction')
+            model = self.output / name
+            config, tensors = fixture(model, **SYNTHETIC_FIXTURES[name])
+            for index in range(self.args.repeat):
+                self.correctness(model, world, lambda ids: full_logits(config, tensors, ids),
+                                 modes=[(graph, prefix)], case_suffix=f'_repeat{index+1:03d}')
+        else:
+            for name, options in SYNTHETIC_FIXTURES.items():
+                model = self.output / name
+                config, tensors = fixture(model, **options)
+                for world in (1, 2, 4):
+                    self.correctness(model, world, lambda ids: full_logits(config, tensors, ids))
+            self.lifecycle(self.output / 'f16_bias')
 
     def lifecycle(self, model):
         """/** 覆盖EOS、非法输入、取消后复用、关闭与真实worker故障；失败不能假装PASS。 */"""
@@ -408,9 +447,16 @@ def main():
     parser.add_argument('--requests', type=Path, default=ROOT / 'test/distributed/data/qwen_moe_requests.jsonl')
     parser.add_argument('--reference-python', default=sys.executable, help='独立Transformers参考环境的Python路径')
     parser.add_argument('--performance', action='store_true')
+    parser.add_argument('--synthetic-case', choices=sorted(SYNTHETIC_CASES),
+                        help='只复现指定小模型用例；不代表完整验收通过')
+    parser.add_argument('--repeat', type=int, default=1, help='定向用例独立执行次数；任何一轮失败则总体失败')
     parser.add_argument('--timeout', type=float, default=1800)
     parser.add_argument('--output', type=Path, default=ROOT / 'test/distributed/results')
     args = parser.parse_args()
+    if args.repeat < 1 or (args.repeat != 1 and not args.synthetic_case):
+        parser.error('--repeat必须为正整数，重复执行必须指定--synthetic-case')
+    if args.synthetic_case and (args.model or args.performance):
+        parser.error('--synthetic-case不能与--model或--performance混用')
     suite = Suite(args)
     try:
         if args.model:
@@ -453,14 +499,7 @@ def main():
             suite.real_layers(args.model, reference['layers'])
             suite.correctness(args.model, 4, record, real=True, baseline=[r['token_ids'] for r in traces], requests=prompts)
         else:
-            for name, options in [('f16_bias', {}), ('bf16_no_bias', dict(dtype='BF16', bias=False)),
-                                  ('f32_tied_normalized', dict(dtype='F32', tied=True, normalize=True)),
-                                  ('zero_experts', dict(experts=3, topk=1)), ('hotspot', dict(hotspot=True, topk=1))]:
-                model = suite.output / name
-                config, tensors = fixture(model, **options)
-                for world in (1, 2, 4):
-                    suite.correctness(model, world, lambda ids: full_logits(config, tensors, ids))
-            suite.lifecycle(suite.output / 'f16_bias')
+            suite.synthetic()
         if args.performance:
             suite.performance(args.model or suite.output / 'f16_bias')
     except BaseException as error:
