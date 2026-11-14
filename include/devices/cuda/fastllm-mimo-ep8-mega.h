@@ -21,7 +21,8 @@ void FastllmCudaMimoEp8PrefillAllGather(FastllmCudaMimoEp8Mega &state, int rank,
 // row offset; other rows are not valid collective outputs.
 void FastllmCudaMimoEp8PrefillReduceScatter(FastllmCudaMimoEp8Mega &state, int rank,
                                           fastllm::Data &output);
-// Routing may cover the full input or this rank's equal contiguous token shard.
+// Routing may cover the full input or this rank's contiguous token shard;
+// owner boundaries are floor(total * rank / ranks), including uneven batches.
 // Sharded results are gathered in-place, unless the optional residual/RMSNorm
 // fusion succeeds. True means residual and normOutput are ready; in that case
 // output only contains this rank's slice and must not be consumed as a full tensor.

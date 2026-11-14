@@ -1,7 +1,7 @@
 // MiMo EP4/EP8 keeps one full copy of each expert across the participating ranks.
 // Attention uses the same TP group. Large inputs are partitioned into disjoint token
 // ranges before EP dispatch, then merged in-place into the existing output.
-// Small or uneven decode batches and verification retain replicated dispatch.
+// Batches smaller than the rank count retain replicated dispatch.
 #include "devices/cuda/fastllm-mimo-ep8-mega.h"
 #include "devices/cuda/fastllm-mimo-ep8-mega-kernel.h"
 #if defined(FASTLLM_ENABLE_MIMO_EP8_MEGA) && !defined(_WIN32) && !defined(USE_ROCM)
@@ -197,7 +197,7 @@ bool FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int rank, int laye
     const int total = input.dims[0];
     const int begin = (int)((int64_t)total * rank / ranks);
     const int shard = (int)((int64_t)total * (rank + 1) / ranks) - begin;
-    const bool localRouting = total >= ranks && (!graphDecode || total % ranks == 0) &&
+    const bool localRouting = total >= ranks &&
         index.dims == std::vector<int>({shard, 8});
     AssertInFastLLM((localRouting || index.dims == std::vector<int>({total, 8})) &&
         score.dims == index.dims, "Invalid MiMo EP routing shape.");
@@ -207,8 +207,7 @@ bool FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int rank, int laye
     output.Allocate(false);
     void *handle = state.ranks.at(rank)->layers.at(layer);
     AssertInFastLLM(handle != nullptr, "Missing MiMo EP layer handle.");
-    int capacity = total % ranks == 0 ? fastllm_ep8_mega_moe_decode_capacity(total, ranks)
-                                     : fastllm_ep8_mega_moe_max_rows();
+    int capacity = fastllm_ep8_mega_moe_decode_capacity(total, ranks);
     const void *prefillPeers[8]{};
     // Eligibility uses the common input shape so every rank participates even
     // when one local buffer is unavailable. Router FP32 input is dead here;
@@ -262,13 +261,6 @@ bool FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int rank, int laye
         return false;
     }
 
-    // Uneven decode batches can replay bounded replicated chunks without
-    // padding. Equal shards use graph-compatible AllGather below.
-    if (graphDecode && total % ranks != 0) {
-        for (int first = 0; first < total; first += capacity)
-            run(first, std::min(capacity, total - first));
-        return false;
-    }
     // Dispatch each token from one rank, using the selected bounded arena.
     // All ranks execute the same number of rounds, including empty shards.
     const int rounds = (int)(((int64_t)total + ranks * capacity - 1) / (ranks * capacity));
@@ -289,15 +281,27 @@ bool FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int rank, int laye
                     (const float *)normWeight->cudaData, normOutput->cudaData,
                     total * 4096, 4096, eps, BFLOAT16, state.devices[rank])) return true;
         }
-        if (localRouting && FastllmCudaCustomAllGatherRows(output.cudaData,
+        if (localRouting && total % ranks == 0 && FastllmCudaCustomAllGatherRows(output.cudaData,
                 total * 4096, 4096, BFLOAT16, state.devices[rank]))
             return false;
         // Each rank has written its slice in-place. NCCL records the exchange
         // on the same stream, using the persistent bounded MoE workspace.
-        AssertInFastLLM(FastllmNcclAllGather(
-            (const uint16_t *)output.cudaData + (size_t)begin * 4096,
-            output.cudaData, shard * 4096, BFLOAT16, state.devices[rank]),
-            "MiMo EP decode AllGather failed.");
+        if (total % ranks == 0) {
+            AssertInFastLLM(FastllmNcclAllGather(
+                (const uint16_t *)output.cudaData + (size_t)begin * 4096,
+                output.cudaData, shard * 4096, BFLOAT16, state.devices[rank]),
+                "MiMo EP decode AllGather failed.");
+        } else {
+            // Graph-safe fallback for unequal owner slices. All ranks enqueue
+            // the same broadcasts; no host rendezvous or temporary tensor.
+            for (int peer = 0; peer < ranks; ++peer) {
+                const int first = (int64_t)total * peer / ranks;
+                const int count = (int64_t)total * (peer + 1) / ranks - first;
+                if (count) FastllmNcclBroadcast(
+                    (uint16_t *)output.cudaData + (size_t)first * 4096,
+                    count * 4096, BFLOAT16, state.devices[peer], state.devices[rank]);
+            }
+        }
         return false;
     }
     if (localRouting && residual && normWeight && normOutput) {

@@ -1160,8 +1160,11 @@ void FastllmCustomAllGatherRMSNormKernel(CustomArRankData *data,
     // slots. Each group keeps the same 256-lane RMSNorm reduction tree.
     const int t = threadIdx.x % 256, slot = threadIdx.x / 256;
     const int row = blockIdx.x * RowsPerBlock + slot;
+    // The owner ranges are [floor(N*r/R), floor(N*(r+1)/R)). This also
+    // handles N < R without reading an empty owner's allocation.
+    const int owner = ((int64_t)(row + 1) * Ranks - 1) / rows;
     const auto *branch = row < rows
-        ? (const CustomArNormBF16 *)pointers.ptrs[row / (rows / Ranks)] + row * 4096 : nullptr;
+        ? (const CustomArNormBF16 *)pointers.ptrs[owner] + row * 4096 : nullptr;
     float value[16], affine[16], partial = 0;
     if (row < rows) {
 #pragma unroll
@@ -1199,25 +1202,33 @@ void FastllmCustomAllGatherRMSNormKernel(CustomArRankData *data,
 template <int Ranks>
 __global__ void FastllmCustomAllGatherResidualKernel(CustomArRankData *data,
         CustomArRankSignals signals, CustomArSignal *self,
-        CustomArNormBF16 *hidden, int rank, int part) {
+        CustomArNormBF16 *hidden, int rank, int rows) {
     CustomArRankData pointers = *data;
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
 #endif
     CustomArBarrierStart<Ranks>(signals, self, rank);
+    const int maxPart = ((rows + Ranks - 1) / Ranks) * (4096 / 8);
     for (int offset = blockIdx.x * blockDim.x + threadIdx.x;
-         offset < part; offset += gridDim.x * blockDim.x) {
+         offset < maxPart; offset += gridDim.x * blockDim.x) {
         CustomArNormPacketType values[Ranks], residuals[Ranks];
 #pragma unroll
         for (int peer = 0; peer < Ranks; ++peer) {
-            int i = peer * part + offset;
-            values[peer] = ((const CustomArNormPacketType *)pointers.ptrs[peer])[i];
-            residuals[peer] = ((const CustomArNormPacketType *)hidden)[i];
+            const int first = (int64_t)rows * peer / Ranks * (4096 / 8);
+            const int end = (int64_t)rows * (peer + 1) / Ranks * (4096 / 8);
+            if (first + offset < end) {
+                values[peer] = ((const CustomArNormPacketType *)pointers.ptrs[peer])[first + offset];
+                residuals[peer] = ((const CustomArNormPacketType *)hidden)[first + offset];
+            }
         }
 #pragma unroll
         for (int peer = 0; peer < Ranks; ++peer) {
-            CustomArAddPacket<CustomArNormBF16>(values[peer], residuals[peer]);
-            ((CustomArNormPacketType *)hidden)[peer * part + offset] = values[peer];
+            const int first = (int64_t)rows * peer / Ranks * (4096 / 8);
+            const int end = (int64_t)rows * (peer + 1) / Ranks * (4096 / 8);
+            if (first + offset < end) {
+                CustomArAddPacket<CustomArNormBF16>(values[peer], residuals[peer]);
+                ((CustomArNormPacketType *)hidden)[first + offset] = values[peer];
+            }
         }
     }
     CustomArBarrierFinal<Ranks>(signals, self, rank);
@@ -3305,7 +3316,7 @@ bool FastllmCudaCustomAllGatherAddRMSNorm(void *data, void *residual,
         uintptr_t x = (uintptr_t)a, y = (uintptr_t)b;
         return (x > y ? x - y : y - x) >= (size_t)count * 2;
     };
-    const bool eligible = aligned && rows % ranks == 0 && FastllmCudaRuntimeArch() == 90 &&
+    const bool eligible = aligned && FastllmCudaRuntimeArch() == 90 &&
         disjoint(data, residual) && disjoint(data, output) && disjoint(residual, output);
     CustomArRankData *pointers = nullptr;
     if (!FindOrRegisterCustomArPointers(state, rank, data, count, dataType,
@@ -3317,7 +3328,7 @@ bool FastllmCudaCustomAllGatherAddRMSNorm(void *data, void *residual,
     // the peer reads and residual stores, then let PDL launch one Norm CTA per
     // row. Both paths use the same 256-thread reduction and existing buffers.
     const bool splitNorm = rows > 4 * kCustomArMaxBlocks;
-    const int part = count / (ranks * 8);
+    const int part = ((rows + ranks - 1) / ranks) * (channels / 8);
     const int blocks = std::min(splitNorm ? (part + 511) / 512 :
                                (rows + rowsPerBlock - 1) / rowsPerBlock, kCustomArMaxBlocks);
 #define CUSTOM_AG_NORM_RANK_CASE(RANKS)                                      \
@@ -3326,7 +3337,7 @@ bool FastllmCudaCustomAllGatherAddRMSNorm(void *data, void *residual,
             FastllmCustomAllGatherResidualKernel<RANKS>                      \
             <<<blocks, 512, 0, cudaStreamPerThread>>>(                       \
                 pointers, state.allSignals, state.allSignals.signals[rank], \
-                hidden, rank, part);                                       \
+                hidden, rank, rows);                                       \
         else if (rowsPerBlock == 1)                                         \
             FastllmCustomAllGatherRMSNormKernel<RANKS, 1>                    \
             <<<blocks, 256, 0, cudaStreamPerThread>>>(                       \

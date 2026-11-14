@@ -73,7 +73,8 @@ bool FastllmCudaCustomAllGatherRows(void* data, int count,
 // Returns false before launching work on unsupported shapes/topologies.
 bool FastllmCudaCustomAllReduceAndGather(void *routed, void *dest,
     void *shared, int count, int deviceId);
-// Hopper BF16, width 4096: consume equal row shards directly, add to residual,
+// Hopper BF16, width 4096: rank r owns rows [floor(N*r/R), floor(N*(r+1)/R)).
+// Consume those possibly unequal shards directly, add to residual,
 // and apply Kimi-style RMSNorm without materializing the gathered tensor.
 // data stays unchanged; data/residual/output must be disjoint. False leaves
 // tensors untouched so the ordinary gather and norm remain the fallback.

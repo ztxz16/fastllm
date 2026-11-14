@@ -67,10 +67,15 @@ struct Case {
         Reset();
         // Independent NCCL gather reference also covers batches beyond the
         // ordinary custom gather's bounded message policy.
-        Require(gather ? FastllmNcclAllGather((BF *)input.cudaData + rank * (count / ranks),
-                    input.cudaData, count / ranks, BFLOAT16, rank)
-            : FastllmCudaCustomAllReduceRows(input.cudaData, input.cudaData, count, 4096, BFLOAT16, rank),
-            "reference collective rejected");
+        if (gather) {
+            for (int peer = 0; peer < ranks; ++peer) {
+                const int first = rows * peer / ranks;
+                const int n = rows * (peer + 1) / ranks - first;
+                if (n) FastllmNcclBroadcast((BF *)input.cudaData + first * 4096,
+                    n * 4096, BFLOAT16, peer, rank);
+            }
+        } else Require(FastllmCudaCustomAllReduceRows(input.cudaData, input.cudaData,
+            count, 4096, BFLOAT16, rank), "reference collective rejected");
         FastllmCudaNaiveAddDecodeRMSNorm(hidden, input, weight, 1e-5f, output);
         if (gather)
             Check(cudaMemcpyAsync(referenceNorm.cudaData, output.cudaData, count * 2,
@@ -146,6 +151,8 @@ int main(int argc, char **argv) {
     if (gather) {
         shapes.clear();
         for (int n = ranks; n <= 256; n += ranks) shapes.push_back(n);
+        for (int n : {1, 3, 5, 7, 9, 31, 33, 63, 65, 127, 129, 253, 254, 255,
+                      257, 509, 510, 511, 513, 1023, 1025}) shapes.push_back(n);
         shapes.push_back(512 / ranks * ranks);
         shapes.push_back(1024 / ranks * ranks);
         // First shard-aligned size above 8 MiB, C380/DS3 and larger windows.
@@ -169,8 +176,8 @@ int main(int argc, char **argv) {
             c.Validate(deviceErrors);
             if (gather) {
                 Require(!FastllmCudaCustomAllGatherAddRMSNorm(c.input.cudaData, c.hidden.cudaData,
-                    (const float *)c.weight.cudaData, c.output.cudaData, c.count - 4096, 4096,
-                    1e-5f, BFLOAT16, rank), "unequal row shards accepted");
+                    (const float *)c.weight.cudaData, c.output.cudaData, c.count - 1, 4096,
+                    1e-5f, BFLOAT16, rank), "partial row accepted");
                 c.Validate(deviceErrors);
             }
             c.Run(deviceErrors); Check(cudaStreamSynchronize(cudaStreamPerThread));

@@ -732,10 +732,11 @@ Data NaiveN05FlashModel::RunTarget(
     };
     int length = inputIds.dims[1];
     const int epRanks = tensorParallel ? (int)tpDevices.size() : 1;
-    // Shard balanced token blocks by their actual row count, including eager
-    // multi-request verification. Uneven blocks retain the replicated fallback.
+    // Keep one owner per token, including uneven multi-request verification.
+    // Every rank uses [floor(N*r/R), floor(N*(r+1)/R)); the gather consumes
+    // those same complete-row ranges without replicated expert dispatch.
     const bool shardMoe = tensorParallel && tpEp8MegaState && (decodeWorkspace || verifying) &&
-        length >= epRanks && length % epRanks == 0;
+        length >= epRanks;
     // Small prefill chunks use MegaMoE's replicated (up to 64 rows) path.
     // Larger chunks dispatch contiguous token shards, including uneven tails.
     const bool shardPrefillRouter = tensorParallel && tpEp8MegaState &&
