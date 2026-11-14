@@ -76,3 +76,17 @@ python3 test/distributed/benchmark_allreduce.py performance --python "$AR_PYTHON
 校验计时区最后一次调用的真实输出，而不是另跑一次后将结果当作计时区正确性证据。
 每次通信取两 rank 时间较大值；逐次原始时间保存在 JSON 中。calls_per_second 是
 由算子延迟折算的调用率，不是包含输入准备的应用墙钟吞吐。
+
+第六步（两组分别运行，再共同起跑；根据拓扑修改配对）：
+
+```bash
+python3 test/distributed/benchmark_allreduce.py concurrent --python "$AR_PYTHON" \
+  --pair 0,1 --groups '0,1;2,3' --correctness "$AR_RUN/04-correctness" \
+  --warmup 100 --iterations 1000 --repeats 5 --timeout 900 --output "$AR_RUN/06-concurrent"
+```
+
+每个 case 四个 worker 全部完成预热后才释放共同起跑门槛。若两组批次时间窗口的
+交集不足较短窗口的 50%，该项判 FAIL，不能将错开的执行计为并发结果。
+第二组逐项验证实际输出后才计时，核对与主组相同的软件指纹；不声称已完成其全部
+边界测试。wall_calls_per_second 按两组总完成次数/共同墙钟区间计算，包含双方一致
+的输入恢复和主机提交；与排除输入恢复的 CUDA event 延迟分开报告。

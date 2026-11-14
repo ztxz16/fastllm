@@ -2,6 +2,7 @@
 
 import math
 import statistics
+import time
 
 from .data import compare, inputs
 
@@ -43,12 +44,17 @@ def measure(case, job, backend, operation, stream, group):
     dist.barrier(group=group)
     starts = [torch.cuda.Event(enable_timing=True) for _ in range(job["iterations"])]
     ends = [torch.cuda.Event(enable_timing=True) for _ in range(job["iterations"])]
+    if job.get("gate"):
+        from .concurrency import gate_wait
+        gate_wait(job, case, dist.get_rank(group))
+    batch_start = time.monotonic_ns()
     for start, end in zip(starts, ends):
         operation.reset()
         start.record(stream)
         operation.run()
         end.record(stream)
     stream.synchronize()
+    batch_end = time.monotonic_ns()
     samples = [start.elapsed_time(end) * 1000 for start, end in zip(starts, ends)]
     statistics_for(samples)  # 拒绝空样本、零时间或非有限时间。
 
@@ -65,4 +71,5 @@ def measure(case, job, backend, operation, stream, group):
             raise RuntimeError("计时区 FT GPU 调用计数与 warmup/iterations 不一致")
     return {"samples_us": samples, "timed_output": metrics, "path": operation.path,
             "timed_counters_before": before, "timed_counters_after": after,
+            "batch_start_ns": batch_start, "batch_end_ns": batch_end,
             "warmup": job["warmup"], "iterations": job["iterations"], "repeat": job["repeat"]}

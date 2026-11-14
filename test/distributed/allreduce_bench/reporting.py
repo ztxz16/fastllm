@@ -13,9 +13,10 @@ ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "test" / "nvfp4"))
 from xlsx_report import write_xlsx
 
-FIELDS = ["stage", "case", "backend", "mode", "devices", "n", "status", "path",
+FIELDS = ["stage", "case", "backend", "mode", "devices", "n", "scenario", "repeat", "status", "path",
           "max_abs_error", "mean_abs_error", "failed_elements", "median_us",
-          "p95_us", "cv_percent", "calls_per_second", "speedup", "reason"]
+          "p95_us", "cv_percent", "calls_per_second", "speedup", "slowdown",
+          "overlap_ratio", "wall_calls_per_second", "reason"]
 
 
 def capture(command, timeout=15):

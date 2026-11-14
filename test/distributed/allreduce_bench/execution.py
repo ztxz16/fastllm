@@ -68,7 +68,7 @@ def run_job(job, args, directory):
 
 
 def checkpoint(output, rows, meta):
-    meta["worker_metadata"] = [json.loads(p.read_text()) for p in sorted(output.glob("*/rank*.metadata.json"))]
+    meta["worker_metadata"] = [json.loads(p.read_text()) for p in sorted(output.rglob("rank*.metadata.json"))]
     write_report(output, rows, meta, status="RUNNING")
 
 

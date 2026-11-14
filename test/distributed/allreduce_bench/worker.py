@@ -50,14 +50,20 @@ def rank_main(rank, job):
         major, minor, patch = torch.cuda.nccl.version()
         if meta["backend"]["nccl_version"] != major * 10000 + minor * 100 + patch:
             raise RuntimeError("算子与 PyTorch 的 NCCL 版本不一致")
-        if job.get("expected_runtime") and meta not in job["expected_runtime"]:
-            raise RuntimeError("软件/算子扩展或设备信息与准确性验证时不同，需要重新验证")
+        if job.get("expected_runtime"):
+            def software(item):
+                return {key: value for key, value in item.items() if key not in ("rank", "device", "device_name")}
+            matched = meta in job["expected_runtime"] if job.get("runtime_device_match", True) else (
+                software(meta) in [software(item) for item in job["expected_runtime"]])
+            if not matched:
+                raise RuntimeError("软件/算子扩展或设备信息与准确性验证时不同，需要重新验证")
         (directory / f"rank{rank}.metadata.json").write_text(json.dumps(meta, indent=2))
         cache = {}
         with result_file.open("w", buffering=1) as results:
             for case in job["cases"]:
                 row = dict(stage=job["stage"], case=case["case"], n=case["n"], rank=rank,
-                           devices=job["devices"], backend=job["backend"], mode=job["mode"])
+                           devices=job["devices"], backend=job["backend"], mode=job["mode"],
+                           scenario=job.get("scenario", "single"))
                 try:
                     if case.get("action") == "reject_zero":
                         before = backend.info()

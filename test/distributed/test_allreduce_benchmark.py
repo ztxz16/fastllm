@@ -12,6 +12,14 @@ SCRIPT = Path(__file__).with_name("benchmark_allreduce.py")
 
 
 class PlanTests(unittest.TestCase):
+    def test_disjoint_batch_windows_have_zero_overlap(self):
+        from allreduce_bench.concurrency import overlap_metrics
+        rows = [dict(iterations=10, ranks=[dict(batch_start_ns=10, batch_end_ns=20)]),
+                dict(iterations=10, ranks=[dict(batch_start_ns=30, batch_end_ns=40)])]
+        self.assertEqual(overlap_metrics(rows)["overlap_ratio"], 0)
+        rows[1]["ranks"][0].update(batch_start_ns=15, batch_end_ns=25)
+        self.assertEqual(overlap_metrics(rows)["overlap_ratio"], 0.5)
+
     def test_timing_uses_slowest_rank_and_rejects_missing_samples(self):
         from allreduce_bench.timing import rank_max_samples, statistics_for
         values = rank_max_samples([{"samples_us": [1, 10, 3]}, {"samples_us": [4, 2, 6]}])
