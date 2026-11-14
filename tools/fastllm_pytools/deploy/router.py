@@ -67,17 +67,29 @@ class Router:
             rank = self.entries[session]['rank']
             if not self.healthy[rank]:
                 raise web.HTTPServiceUnavailable(text='Session replica is unavailable')
+            # Keep active sessions together. Between turns, prefer a free
+            # replica over queueing behind an overloaded cache owner.
+            free = [i for i, health in enumerate(self.healthy)
+                    if health and self.pending[i] < self.capacities[i]]
+            if (not self.references.get(session) and
+                    self.pending[rank] >= self.capacities[rank] and free):
+                rank = min(free, key=lambda i: (self.pending[i]/self.capacities[i],
+                           (i-self.cursor) % len(self.backends)))
+                self.entries[session]['rank'] = rank
+                self.cursor = (rank+1) % len(self.backends)
+                self.persist()
             self.entries[session]['last_seen'] = time.time()
             return rank
         candidates = [i for i, health in enumerate(self.healthy) if health]
         if not candidates:
             raise web.HTTPServiceUnavailable(text='No healthy replicas')
-        # New sessions and unkeyed requests can use any available replica.
-        # Existing sessions above retain affinity even when their queue is full.
+        # Avoid queueing new work while another healthy replica has a free slot.
         candidates = [i for i in candidates if self.pending[i] <
                       self.capacities[i] + self.settings['queue_limit_per_replica']]
         if not candidates:
             raise web.HTTPTooManyRequests(text='All replica queues are full', headers={'Retry-After': '1'})
+        free = [i for i in candidates if self.pending[i] < self.capacities[i]]
+        candidates = free or candidates
         if session:
             while len(self.entries) >= self.settings['max_sessions']:
                 idle = [s for s in self.entries if not self.references.get(s)]
@@ -165,7 +177,18 @@ class Router:
         self.pending[rank] += 1
         if session:
             self.references[session] = self.references.get(session, 0) + 1
-        response, acquired = None, False
+        response, acquired, pending = None, False, True
+
+        def completed():
+            nonlocal acquired, pending
+            if acquired:
+                self.active[rank] -= 1
+                self.slots[rank].release()
+                acquired = False
+            if pending:
+                self.pending[rank] -= 1
+                pending = False
+
         record = {'start': time.time(), 'replica': self.config['replicas'][rank]['name'],
                   'path': request.path, 'status': None, 'bytes': 0}
         try:
@@ -188,6 +211,7 @@ class Router:
                 async for chunk in upstream.content.iter_any():
                     await response.write(chunk)
                     record['bytes'] += len(chunk)
+                completed()
                 await response.write_eof()
                 return response
         except asyncio.CancelledError:
@@ -205,10 +229,7 @@ class Router:
             record['status'] = 502
             raise web.HTTPBadGateway(text='Replica request failed') from error
         finally:
-            if acquired:
-                self.active[rank] -= 1
-                self.slots[rank].release()
-            self.pending[rank] -= 1
+            completed()
             if session:
                 self.references[session] -= 1
                 if not self.references[session]:

@@ -92,12 +92,43 @@ class AffinityTests(unittest.TestCase):
             router.healthy = [True, True]
             rank = router.select('sticky')
             router.pending[rank] = 2
+            router.references['sticky'] = 1
             self.assertEqual(router.select(), 1-rank)
             self.assertEqual(router.select('sticky'), rank)
             router.healthy[rank] = False
             self.assertEqual(router.select(), 1-rank)
             with self.assertRaises(web.HTTPServiceUnavailable):
                 router.select('sticky')
+
+    def test_idle_affinity_moves_only_when_full_and_destination_is_available(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = config(['http://a', 'http://b', 'http://c'], 2)
+            settings['replicas'][2]['max_inflight'] = 4
+            router = Router(settings, tmp)
+            router.healthy = [True, True, True]
+            self.assertEqual(router.select('session'), 0)
+            router.pending = [1, 0, 0]
+            self.assertEqual(router.select('session'), 0)
+            router.pending = [2, 1, 1]
+            self.assertEqual(router.select('session'), 2)
+            restored = Router(settings, tmp)
+            self.assertEqual(restored.entries['session']['rank'], 2)
+            router.pending = [0, 0, 4]
+            router.references['session'] = 1
+            self.assertEqual(router.select('session'), 2)
+            router.references.clear()
+            router.pending = [2, 2, 4]
+            self.assertEqual(router.select('session'), 2)
+
+    def test_new_session_prefers_free_slot_over_fewer_assigned_sessions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            router = Router(config(['http://a', 'http://b'], 1), tmp)
+            router.healthy = [True, True]
+            router.entries['busy'] = {'rank': 0, 'last_seen': 0}
+            router.references['busy'] = 1
+            router.pending = [1, 0]
+            for i in range(4):
+                self.assertEqual(router.select(str(i)), 1)
 
     def test_session_cache_is_not_lifetime_generation_capacity(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -109,6 +140,45 @@ class AffinityTests(unittest.TestCase):
 
 
 class TransportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_upstream_completion_releases_slot_before_downstream_eof(self):
+        output = b'data: first\n\ndata: [DONE]\n\n'
+        async def backend(request):
+            return web.Response(body=output, content_type='text/event-stream')
+        upstream, base = await serve(backend_app(backend))
+        entered, unblock = asyncio.Event(), asyncio.Event()
+        original_write = web.StreamResponse.write_eof
+
+        async def slow_write(response, chunk=b''):
+            if response.headers.get('X-FastLLM-Replica'):
+                entered.set()
+                await unblock.wait()
+            return await original_write(response, chunk)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            router = Router(config([base], 1), tmp)
+            proxy, url = await serve(router.app())
+            try:
+                with patch.object(web.StreamResponse, 'write_eof', slow_write):
+                    async with ClientSession() as client:
+                        response = await client.post(url+'/v1/messages', json={})
+                        await asyncio.wait_for(entered.wait(), 2)
+                        for _ in range(100):
+                            if router.pending == [0]:
+                                break
+                            await asyncio.sleep(.001)
+                        self.assertEqual(router.pending, [0])
+                        self.assertEqual(router.active, [0])
+                        self.assertEqual(router.slots[0]._value, 1)
+                        unblock.set()
+                        self.assertEqual(await response.read(), output)
+                        response.release()
+                await asyncio.sleep(.01)
+                self.assertEqual(router.slots[0]._value, 1)
+            finally:
+                unblock.set()
+                await proxy.cleanup()
+                await upstream.cleanup()
+
     async def test_generation_uses_fresh_connections_without_replaying_posts(self):
         accepted = []
         stale_posts = []
