@@ -10,6 +10,18 @@
 #include <thread>
 #include <memory>
 
+#if defined(__linux__) && !defined(USE_ROCM)
+#include <dlfcn.h>
+static int captureBegins = 0;
+extern "C" cudaError_t cudaStreamBeginCapture(cudaStream_t stream, cudaStreamCaptureMode mode) {
+    using Begin = cudaError_t (*)(cudaStream_t, cudaStreamCaptureMode);
+    static const auto begin = reinterpret_cast<Begin>(dlsym(RTLD_NEXT, "cudaStreamBeginCapture_ptsz"));
+    if (!begin) return cudaErrorNotSupported;
+    ++captureBegins;
+    return begin(stream, mode);
+}
+#endif
+
 namespace {
 void Require(bool ok, const char *why) { if (!ok) throw std::runtime_error(why); }
 void Check(cudaError_t e) { if (e != cudaSuccess) throw std::runtime_error(cudaGetErrorString(e)); }
@@ -246,6 +258,50 @@ void PlanLifecycle(bool probability = false) {
     std::puts("owned verifier lifecycle: parameter changes, graph/eager, 17 drafts, descriptor reorder, fresh workers, RNG: PASS");
 }
 
+void DrainShapeCache() {
+    const int vocab = 257;
+    for (int maximum : {4, 8, 9, 16}) for (int drafts : {1, 5, 17}) {
+        const int rows = maximum * (drafts + 1);
+        std::vector<float> logits(size_t(rows) * vocab, -INFINITY);
+        std::vector<float> probs(size_t(maximum) * drafts * vocab, 0);
+        for (int row = 0; row < rows; ++row) logits[size_t(row) * vocab] = 0;
+        for (int row = 0; row < maximum * drafts; ++row) probs[size_t(row) * vocab] = 1;
+        Buffer<float> p(logits), q(probs);
+        Buffer<int> ids(std::vector<int>(maximum * drafts, 0));
+        std::vector<FastllmMtpProposalView> views(maximum);
+        for (int b = 0; b < maximum; ++b)
+            views[b] = {q.p + size_t(b) * drafts * vocab, nullptr, ids.p + b * drafts};
+        std::vector<float> ts(rows, 1), ps(rows, 1);
+        std::vector<int> ks(rows, vocab), output(rows), accepted(maximum);
+        std::unique_ptr<void, decltype(&FastllmCudaMtpDestroyVerifier)> plan(
+            FastllmCudaMtpCreateVerifier(), FastllmCudaMtpDestroyVerifier);
+        auto run = [&](int batch, bool warm) {
+#if defined(__linux__) && !defined(USE_ROCM)
+            const int before = captureBegins;
+#endif
+            Require(FastllmCudaMtpVerifierEnqueueProbabilities(plan.get(), p.p, views.data(),
+                ts.data(), ks.data(), ps.data(), batch, drafts, vocab, true), "drain verifier enqueue");
+            Require(FastllmCudaMtpVerifierResolve(plan.get(), output.data(), accepted.data()), "drain verifier resolve");
+            for (int b = 0; b < batch; ++b) {
+                Require(accepted[b] == drafts, "drain changed acceptance");
+                for (int i = 0; i <= drafts; ++i) Require(output[b * (drafts + 1) + i] == 0, "drain changed output");
+            }
+#if defined(__linux__) && !defined(USE_ROCM)
+            if (warm) Require(captureBegins == before + 1, "initial verifier graph capture was not observed");
+            if (!warm && ((batch & (batch - 1)) == 0 || batch == maximum))
+                Require(captureBegins == before, "drain evicted a warmed regular verifier graph");
+#endif
+        };
+        for (int batch = 1; batch <= maximum; batch *= 2) run(batch, true);
+        if ((maximum & (maximum - 1)) != 0) run(maximum, true);
+        for (int wave = 0; wave < 3; ++wave) {
+            for (int batch = maximum; batch >= 1; --batch) run(batch, false);
+            run(maximum, false);
+        }
+    }
+    std::puts("verifier cache: geometric/odd maximum and repeated drain preserve hot graphs: PASS");
+}
+
 void ProbabilityPrefixes() {
     const int vocab=257, guard=7;
     std::unique_ptr<void,decltype(&FastllmCudaMtpDestroyVerifier)> plan(
@@ -382,6 +438,7 @@ int main() {
         ChainCase("probability plan equal", {.2f,.3f,.5f}, {.2f,.3f,.5f},1,32,1,true,2,true);
         ChainCase("probability plan disjoint", {0,1,0}, {1,0,0},1,32,1,true,2,true);
         ChainCase("probability plan filtered", {.15f,.35f,.5f}, {.4f,.3f,.3f},.8f,2,.85f,true,2,true);
+        DrainShapeCache();
         PlanLifecycle(true);
         ProbabilityPrefixes();
         PlanLifecycle();

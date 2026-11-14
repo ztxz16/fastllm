@@ -1323,12 +1323,11 @@ def _v41_runtime_bytes(args, model, mode, mapping, resident, context, batch, chu
             if model.layers - 1 in owners:
                 result["graphs"][d] += page(rows * r["vocab"] * 4) * 3
         if drafts and model.layers - 1 in owners:
-            # Persistent batched rejection keeps at most two peak-sized shape
-            # sets, each with two FP32 target-distribution buffers. The older
-            # per-request sampler borrowed temporary scratch instead. This storage
-            # also persists without capture, so it is not part of graph reserve.
+            # Match VerifierPlan::Trim: at most four peak-sized working sets,
+            # each with two FP32 target-distribution buffers. This storage also
+            # persists without capture, so it is separate from graph reserve.
             verifier_rows = batch * (drafts + 1)
-            result["sampling"][d] += 4 * page(verifier_rows * r["vocab"] * 4)
+            result["sampling"][d] += 8 * page(verifier_rows * r["vocab"] * 4)
         if draft_graphs and drafts and model.layers - 1 in owners:
             # Same bounded shape policy as target verification. Other topologies
             # retain their request-local draft graphs.

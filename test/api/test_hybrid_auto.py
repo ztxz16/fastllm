@@ -1319,9 +1319,9 @@ class HybridAutoTest(unittest.TestCase):
                     self.assertEqual(eager["graphs"], {3: 0, 7: 0})
                     self.assertEqual(eager["sampling"], captured["sampling"])
                     self.assertEqual(eager["sampling"][3], 0)
-                    # Two retained distributions with raw and normalized p.
+                    # Bounded regular/drain shape cache, two buffers per working set.
                     self.assertGreaterEqual(eager["sampling"][7],
-                                            4 * batch * (drafts + 1) * 129280 * 4)
+                                            8 * batch * (drafts + 1) * 129280 * 4)
 
     def test_v41_new_runtime_reserve_reduces_cache_without_changing_context(self):
         g = auto.geometry(self.dspark_metadata(), "fp4", 0, 7)

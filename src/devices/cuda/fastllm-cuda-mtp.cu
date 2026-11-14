@@ -506,11 +506,18 @@ struct VerifierPlan {
         peak = std::max(peak, incoming.Weight());
         uint64_t retained = incoming.Weight();
         for (const auto &s : shapes) retained += s.first.Weight();
-        // Distribution storage is linear in rows*vocabulary. Retain at most
-        // two peak-sized working sets, independent of shape history.
-        while (retained > 2 * peak && !shapes.empty()) {
-            auto oldest = std::min_element(shapes.begin(), shapes.end(), [](const auto &a, const auto &b) {
-                return a.second->lastUse < b.second->lastUse;
+        // Geometric batches sum to less than two peak working sets. Leave
+        // room for a non-geometric maximum and a drain shape as well; otherwise
+        // 4 -> 3 -> 2 -> 1 can evict the hot 4-request graph before the next wave.
+        // Bound storage independently of shape history and discard transient
+        // shapes first. Different draft/vocabulary families still share the cap.
+        auto retainedShape = [&](const VerifierShape &s) {
+            return (s.batch & (s.batch - 1)) == 0 || s.Weight() == peak;
+        };
+        while (retained > 4 * peak && !shapes.empty()) {
+            auto oldest = std::min_element(shapes.begin(), shapes.end(), [&](const auto &a, const auto &b) {
+                const bool keepA = retainedShape(a.first), keepB = retainedShape(b.first);
+                return keepA != keepB ? !keepA : a.second->lastUse < b.second->lastUse;
             });
             retained -= oldest->first.Weight(); shapes.erase(oldest);
         }
