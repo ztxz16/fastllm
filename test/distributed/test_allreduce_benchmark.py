@@ -12,6 +12,19 @@ SCRIPT = Path(__file__).with_name("benchmark_allreduce.py")
 
 
 class PlanTests(unittest.TestCase):
+    def test_preflight_start_failure_keeps_all_report_formats(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "failed"
+            command = [sys.executable, str(SCRIPT), "preflight", "--output", str(output),
+                       "--python", "/nonexistent/allreduce-python"]
+            result = subprocess.run(command, capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            report = json.loads((output / "summary.json").read_text())
+            self.assertEqual(report["status"], "FAIL")
+            self.assertIn("allreduce-python", report["cases"][0]["reason"])
+            for suffix in ("json", "md", "csv", "xlsx"):
+                self.assertTrue((output / f"summary.{suffix}").is_file())
+
     def test_plan_is_not_gpu_pass_and_never_overwrites_history(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "plan"

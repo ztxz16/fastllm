@@ -20,3 +20,16 @@ case 单独记录实际路径，不能把 FT 的 NCCL 回退计为 FT 自定义 
 计时保留正式算子所需复制和同步，排除输入恢复、初始化、校验、日志及进程控制。
 Graph 分为双方都保留 staging copy 的共同配置，以及各自支持的注册输入配置。
 所有性能 case 先验证输出和路径，再测至少五轮；加速比定义为对比后端耗时/FT耗时。
+
+第二步（服务器现有 CUDA/vLLM 环境，无安装或编译）：
+
+```bash
+export AR_PYTHON="$(command -v python3)" # 若使用 venv，改成该环境 Python 的绝对路径
+python3 test/distributed/benchmark_allreduce.py preflight --python "$AR_PYTHON" \
+  --devices 0,1,2,3 --output "$AR_RUN/02-preflight"
+```
+
+预检执行已有 PyTorch CUDA kernel、加载已有 vLLM 自定义扩展，并记录每张卡的
+SM/UVA、每对卡的双向 P2P/native atomics、已加载库路径和版本、vLLM 源码指纹。
+候选卡对不等于已通过跨卡算子测试；第三步才验证实际执行。V100 为 SM70，不能
+默认任意新版 PyTorch/vLLM 预编译包都能运行；预检失败时先处理兼容环境。
