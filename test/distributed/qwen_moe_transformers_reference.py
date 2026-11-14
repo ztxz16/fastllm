@@ -7,6 +7,63 @@ from pathlib import Path
 import os
 
 
+def reference_device_map(config):
+    """/**
+     * 将完整Decoder层连续分配到四卡，显式覆盖Embedding、RoPE与输出层。
+     * 不使用根模块兜底映射，避免Accelerate递归保留GPU 0的子模块执行hook。
+     * 绑定的Embedding与LM Head必须同卡；不足四层时拒绝生成分配方案。
+     * @param config 本地Qwen2 MoE配置，提供层数与权重绑定标志。
+     * @return 互不包含的模块路径到CUDA逻辑设备编号的映射。
+     */"""
+    count = config.num_hidden_layers
+    if count < 4:
+        raise ValueError('real reference requires at least four decoder layers')
+
+    placement = {'model.embed_tokens': 0, 'model.rotary_emb': 0}
+    placement.update({f'model.layers.{i}': i * 4 // count for i in range(count)})
+    placement.update({'model.norm': 3, 'lm_head': 0 if config.tie_word_embeddings else 3})
+    return placement
+
+
+def check_reference_placement(model, placement):
+    """/**
+     * 在首次前向前核对所有参考权重、buffer与Accelerate执行hook的设备。
+     * 只读检查，不迁移Tensor、不替换hook；设备冲突或未覆盖的Tensor立即报错。
+     * @param model 已由Transformers与Accelerate完成分配的参考模型。
+     * @param placement 互不包含的模块到CUDA逻辑设备编号的预期映射。
+     * @return 已通过检查的模块设备记录，供日志与参考JSON保存。
+     */"""
+    for name, tensor in list(model.named_parameters()) + list(model.named_buffers()):
+        owners = [key for key in placement if name.startswith(key + '.')]
+        if len(owners) != 1:
+            raise RuntimeError(f'reference tensor {name}: expected one device-map owner, got {owners}')
+        expected = f'cuda:{placement[owners[0]]}'
+        if str(tensor.device) != expected:
+            raise RuntimeError(f'reference tensor {name}: device={tensor.device}, expected={expected}')
+
+    evidence = []
+    for name, device in placement.items():
+        block = model.get_submodule(name)
+        expected = f'cuda:{device}'
+        if getattr(block, '_hf_hook', None) is None:
+            raise RuntimeError(f'reference module {name}: missing Accelerate device hook')
+        for suffix, module in block.named_modules():
+            pending = [getattr(module, '_hf_hook', None)]
+            while pending:
+                hook = pending.pop()
+                pending.extend(getattr(hook, 'hooks', ()))
+                execution = getattr(hook, 'execution_device', None)
+                if execution is not None:
+                    execution = f'cuda:{execution}' if isinstance(execution, int) else str(execution)
+                    if execution != expected:
+                        path = name + ('.' + suffix if suffix else '')
+                        raise RuntimeError(f'reference hook {path}: execution_device={execution}, expected={expected}')
+                if getattr(hook, 'offload', False):
+                    raise RuntimeError(f'reference module {name}: CPU/disk offload is not allowed')
+        evidence.append(dict(module=name, device=expected))
+    return evidence
+
+
 def layer_reference(model, torch):
     """/**
      * 用HF真实完整前向的hook记录每层输入、Router、共享/路由专家及层输出。
@@ -83,25 +140,31 @@ def main():
     import transformers
 
     config = transformers.AutoConfig.from_pretrained(args.model, local_files_only=True, trust_remote_code=False)
-    if torch.cuda.device_count() < 4 or config.num_hidden_layers < 4:
-        raise RuntimeError('real reference requires four GPUs and at least four layers')
-    # 显式按连续层分到四卡，避免auto在32GiB卡上将全部权重塞进单卡。
-    placement = {'': 0, 'model.norm': 3, 'lm_head': 0 if config.tie_word_embeddings else 3}
-    placement.update({f'model.layers.{i}': i*4//config.num_hidden_layers for i in range(config.num_hidden_layers)})
+    if torch.cuda.device_count() < 4:
+        raise RuntimeError('real reference requires four GPUs')
+    placement = reference_device_map(config)
+    print('Reference device map: ' + json.dumps(placement), flush=True)
     model = transformers.AutoModelForCausalLM.from_pretrained(args.model, config=config, local_files_only=True,
         trust_remote_code=False, torch_dtype=torch.float16, attn_implementation='eager',
         device_map=placement).eval()
     if any(str(v) in ('cpu', 'disk') for v in model.hf_device_map.values()):
         raise RuntimeError('reference must fit on four GPUs without CPU/disk offload')
+    devices = check_reference_placement(model, placement)
+    print('PASS: reference weights/buffers/execution hooks agree on all four GPUs', flush=True)
+
     rows = []
-    for ids in json.loads(args.inputs.read_text()):
+    histories = json.loads(args.inputs.read_text())
+    for index, ids in enumerate(histories):
         with torch.inference_mode():
             out = model(input_ids=torch.tensor([ids], device=model.get_input_embeddings().weight.device), use_cache=False)
             rows.append(dict(ids=ids, logits=out.logits[0, -1].float().cpu().tolist()))
+        print(f'Reference history {index + 1}/{len(histories)}: tokens={len(ids)}', flush=True)
+    print('Reference: collecting per-layer intermediates', flush=True)
     intermediate = layer_reference(model, torch)
     args.output.write_text(json.dumps(dict(rows=rows, layers=intermediate, metadata=dict(
         torch=torch.__version__, transformers=transformers.__version__, dtype='float16',
-        attention='eager', use_cache=False, device_map=model.hf_device_map)), allow_nan=False))
+        attention='eager', use_cache=False, device_map=model.hf_device_map, checked_devices=devices)), allow_nan=False))
+    print(f'PASS: reference saved to {args.output}', flush=True)
 
 
 if __name__ == '__main__':

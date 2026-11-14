@@ -14,6 +14,7 @@ import statistics
 import sys
 import threading
 import time
+import traceback
 import uuid
 
 from run_process_tp import ROOT, capture, save_report, case_process, wait_case, parse_report
@@ -349,7 +350,7 @@ def main():
     try:
         if args.model:
             # 先在CPU保存请求，再分开加载两个后端，避免彼此争用显存。
-            # 真实参考使用自动分布的FP16模型，仅在FastLLM会话关闭后运行。
+            # 真实参考使用显式按层分布的FP16模型，仅在FastLLM会话关闭后运行。
             cached = {}
             def record(ids):
                 key = tuple(ids)
@@ -379,7 +380,8 @@ def main():
                        '--model', str(args.model.resolve()), '--inputs', str(inputs), '--output', str(reference_path)]
             (suite.output / 'reference.command.txt').write_text(shlex.join(command))
             with (suite.output / 'reference.log').open('wb') as log, case_process(command, stdout=log, stderr=log) as process:
-                require(wait_case(process, args.timeout) == 0, 'Transformers reference failed; inspect reference.log')
+                code = wait_case(process, args.timeout)
+                require(code == 0, f'Transformers reference exited {code}; inspect {suite.output / "reference.log"}')
             reference = json.loads(reference_path.read_text())
             cached.update({tuple(row['ids']): row['logits'] for row in reference['rows']})
             suite.metadata['reference'] = reference['metadata']
@@ -397,7 +399,9 @@ def main():
         if args.performance:
             suite.performance(args.model or suite.output / 'f16_bias')
     except BaseException as error:
+        (suite.output / 'setup.traceback.log').write_text(traceback.format_exc())
         suite.rows.append(dict(case='suite_setup', backend=BACKEND, status='FAIL', reason=str(error), failed_elements=1))
+        print(f'FAIL: suite_setup: {error}', file=sys.stderr, flush=True)
         if isinstance(error, (KeyboardInterrupt, SystemExit)):
             raise
     finally:
