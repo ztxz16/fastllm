@@ -277,7 +277,8 @@ def main():
             exit_fixture.chmod(0o700)
             for mode in ("wait_peer_exit", "partial_header_peer_exit", "partial_payload_peer_exit",
                          "buffered_error_exit", "current_error_exit", "partial_error_exit", "stale_error_exit",
-                         "startup_peer_exit", "reply_then_exit", "stall", "shutdown_order"):
+                         "startup_peer_exit", "nonzero_exit", "signal_exit", "startup_nonzero_exit",
+                         "startup_signal_exit", "reply_then_exit", "stall", "shutdown_order"):
                 name = "watch_" + mode
                 barrier_dir = output / name
                 barrier_dir.mkdir()

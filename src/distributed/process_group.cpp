@@ -35,13 +35,34 @@ constexpr uint32_t kMagic = 0x46545031;
 /**
  * 报告实际退出的 worker，并尽力保留 socket 中已经完整到达的错误回复。
  *
- * 只窥读当前事务的完整错误帧，不等待补齐消息、不消费数据，也不回收进程。
- * 错误消息尚未发完或不属于当前事务时，仅报告退出 rank。
+ * 持锁查看尚未回收的子进程状态；WNOWAIT 保留原有统一回收路径，不增加
+ * P_PIDFD 对内核版本的要求。只窥读当前事务的完整错误帧，不等待补齐消息。
+ * 无法读取退出状态时保留原因，不能用诊断失败覆盖原来的退出错误。
  * @param worker 已由 pidfd 确认退出的 worker。
  * @param context 受进程组互斥锁保护的本次事务。
  */
 [[noreturn]] void ThrowWorkerExited(const WorkerWatch &worker, const WaitContext &context) {
     std::string reason = "rank " + std::to_string(worker.rank) + " exited during process TP control";
+    reason += "; pid=" + std::to_string(worker.pid) + "; sequence=" + std::to_string(context.sequence);
+    siginfo_t info{};
+    int result;
+    // 进程组互斥锁保证此子进程尚未被回收，因此 PID 在此期间不会被复用。
+    do {
+        result = waitid(P_PID, static_cast<id_t>(worker.pid), &info, WEXITED | WNOHANG | WNOWAIT);
+    } while (result < 0 && errno == EINTR);
+    if (result < 0) {
+        reason += "; exit_status_unavailable=" + std::string(strerror(errno));
+    } else if (info.si_pid == 0) {
+        reason += "; exit_status_unavailable=no waitable exit";
+    } else if (info.si_code == CLD_EXITED) {
+        reason += "; exit_code=" + std::to_string(info.si_status);
+    } else if (info.si_code == CLD_KILLED || info.si_code == CLD_DUMPED) {
+        reason += "; signal=" + std::to_string(info.si_status);
+        reason += info.si_code == CLD_DUMPED ? "; core_dumped=1" : "; core_dumped=0";
+    } else {
+        reason += "; exit_status_unavailable=unexpected si_code " + std::to_string(info.si_code);
+    }
+
     std::vector<uint8_t> header(32);
     ssize_t count = recv(worker.fd, header.data(), header.size(), MSG_PEEK | MSG_DONTWAIT);
     if (count == static_cast<ssize_t>(header.size()) && Get32(header, 0) == kMagic &&
@@ -397,7 +418,7 @@ struct ProcessGroup::Impl {
         context.sequence = sequence;
         context.workers.reserve(children.size());
         for (const auto &child : children) {
-            context.workers.push_back({child.info.rank, child.fd, child.pidfd});
+            context.workers.push_back({child.info.rank, child.fd, child.pidfd, child.info.pid});
         }
         return context;
     }
