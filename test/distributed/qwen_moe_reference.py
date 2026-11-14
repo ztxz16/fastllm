@@ -110,9 +110,10 @@ def forward(config, tensors, task, input_):
             row = []
             for head in range(qh):
                 kv = head // (qh // kh)
-                scores = [math.fsum(a*b for a, b in zip(q[token][head], k[key][kv])) / math.sqrt(d) for key in range(token+1)]
+                scores = [half(half(math.fsum(a*b for a, b in zip(q[token][head], k[key][kv]))) / math.sqrt(d))
+                          for key in range(token+1)]
                 probs = [math.exp(value - max(scores)) for value in scores]
-                probs = [value / sum(probs) for value in probs]
+                probs = [half(value / sum(probs)) for value in probs]
                 row.extend(half(math.fsum(probs[key]*v[key][kv][dim] for key in range(token+1))) for dim in range(d))
             context.append(row)
         x = residual(x, linear(context, weight("self_attn.o_proj.weight"), bias("self_attn.o_proj.bias"), rounded=False))
