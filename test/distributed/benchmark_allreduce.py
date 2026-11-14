@@ -4,6 +4,7 @@
 import argparse
 import json
 from pathlib import Path
+import signal
 import sys
 
 from allreduce_bench import plan
@@ -12,7 +13,7 @@ from allreduce_bench.reporting import metadata, write_report
 
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("stage", choices=["plan", "preflight", "smoke", "correctness", "performance", "concurrent"])
+    p.add_argument("stage", choices=["plan", "preflight", "smoke", "correctness", "performance", "concurrent", "report"])
     p.add_argument("--output", required=True, help="新目录；已存在时拒绝覆盖")
     p.add_argument("--devices", default="0,1,2,3")
     p.add_argument("--python", default=sys.executable, help="服务器已有 CUDA/vLLM 环境的 Python")
@@ -26,6 +27,8 @@ def parser():
     p.add_argument("--iterations", type=int, default=1000)
     p.add_argument("--repeats", type=int, default=5)
     p.add_argument("--groups", default="0,1;2,3")
+    p.add_argument("--input-root", help="汇总本次 01-plan 到 06-concurrent 的目录")
+    p.add_argument("--no-plots", action="store_true", help="明确只生成数值报告，不绘制曲线")
     return p
 
 
@@ -36,6 +39,10 @@ def main():
     output.mkdir(parents=True, exist_ok=False)
     meta, rows = metadata(args), []
     status = "FAIL"
+    def interrupted(signum, frame):
+        raise InterruptedError(f"runner received signal {signum}")
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(signum, interrupted)
     try:
         if args.timeout <= 0:
             raise ValueError("timeout 必须为正数")
@@ -53,8 +60,9 @@ def main():
         else:
             from allreduce_bench.execution import smoke, correctness, performance
             from allreduce_bench.concurrency import run as concurrent
+            from allreduce_bench.summary import run as summary
             rows = {"smoke": smoke, "correctness": correctness, "performance": performance,
-                    "concurrent": concurrent}[args.stage](args, output, meta)
+                    "concurrent": concurrent, "report": summary}[args.stage](args, output, meta)
             status = "PASS" if rows and all(r["status"] == "PASS" for r in rows) else "FAIL"
     except Exception as exc:
         partial = output / "summary.json"

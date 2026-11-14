@@ -15,7 +15,8 @@ def rank_main(rank, job):
 
     directory = Path(job["directory"])
     result_file = directory / f"rank{rank}.jsonl"
-    device = job["devices"][rank]
+    # 每个组共同可见所选卡，组内可见序号为 0..world-1；vLLM 的 P2P 检查按 rank 查询。
+    device = rank
     torch.cuda.set_device(device)
     dist.init_process_group("gloo", init_method=(directory / "gloo.store").as_uri(),
                             rank=rank, world_size=len(job["devices"]),
@@ -43,7 +44,9 @@ def rank_main(rank, job):
             return
         if "expected_init_error" in job:
             raise RuntimeError("非法配置未按约定拒绝")
-        meta = {"rank": rank, "device": device, "device_name": torch.cuda.get_device_name(device),
+        meta = {"rank": rank, "device": job["devices"][rank], "visible_device": device,
+                "device_name": torch.cuda.get_device_name(device),
+                "device_uuid": str(getattr(torch.cuda.get_device_properties(device), "uuid", "unknown")),
                 "torch": torch.__version__, "cuda": torch.version.cuda,
                 "torch_nccl": list(torch.cuda.nccl.version()), "backend": backend.metadata(),
                 "backend_name": job["backend"], "mode": job["mode"]}
@@ -52,7 +55,8 @@ def rank_main(rank, job):
             raise RuntimeError("算子与 PyTorch 的 NCCL 版本不一致")
         if job.get("expected_runtime"):
             def software(item):
-                return {key: value for key, value in item.items() if key not in ("rank", "device", "device_name")}
+                return {key: value for key, value in item.items()
+                        if key not in ("rank", "device", "device_name", "device_uuid")}
             matched = meta in job["expected_runtime"] if job.get("runtime_device_match", True) else (
                 software(meta) in [software(item) for item in job["expected_runtime"]])
             if not matched:
@@ -96,7 +100,11 @@ def rank_main(rank, job):
             operation.close()
         cache.clear()
         backend.close()
-    dist.destroy_process_group()
+    if job["backend"] == "vllm":
+        from vllm.distributed.parallel_state import destroy_distributed_environment
+        destroy_distributed_environment()
+    else:
+        dist.destroy_process_group()
 
 
 def main():

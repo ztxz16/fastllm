@@ -1,6 +1,7 @@
 """隔离每个测试组并有界回收全部后代；控制面时间不作为算子延迟。"""
 
 import json
+import os
 from pathlib import Path
 import sys
 
@@ -8,6 +9,21 @@ from .reporting import ROOT, artifact_signature, write_report
 
 sys.path.insert(0, str(ROOT / "tools"))
 from tp_process_utils import isolated_process, wait_case
+
+
+def worker_environment(job, environment=None):
+    env = dict(os.environ if environment is None else environment)
+    visible = env.get("CUDA_VISIBLE_DEVICES")
+    if visible is None:
+        selected = [str(device) for device in job["devices"]]
+    else:
+        tokens = visible.split(",")
+        if max(job["devices"]) >= len(tokens) or any(not token.strip() for token in tokens):
+            raise ValueError("卡对超出 CUDA_VISIBLE_DEVICES 的可见编号")
+        selected = [tokens[device].strip() for device in job["devices"]]
+    env["CUDA_VISIBLE_DEVICES"] = ",".join(selected)
+    job["visible_device_map"] = selected
+    return env
 
 
 def collect(job, directory):
@@ -48,16 +64,20 @@ def collect(job, directory):
 def run_job(job, args, directory):
     directory.mkdir(parents=True, exist_ok=False)
     job["directory"] = str(directory.resolve())
+    environment = worker_environment(job)
     path = directory / "job.json"
     path.write_text(json.dumps(job, indent=2))
     command = [args.python, "-m", "allreduce_bench.worker", str(path.resolve())]
     failure = None
     with (directory / "stdout.log").open("w") as stdout, (directory / "stderr.log").open("w") as stderr:
         try:
-            with isolated_process(command, cwd=ROOT / "test/distributed", stdout=stdout, stderr=stderr) as process:
+            with isolated_process(command, cwd=ROOT / "test/distributed", env=environment,
+                                  stdout=stdout, stderr=stderr) as process:
                 code = wait_case(process, args.timeout)
                 if code:
                     failure = f"worker group exit {code}"
+        except InterruptedError:
+            raise
         except Exception as exc:
             failure = str(exc)
     rows = collect(job, directory)
@@ -171,6 +191,8 @@ def performance(args, output, meta):
                            expected_runtime=meta["correctness_runtime"])
                 rows.extend(run_job(job, args, output / f"r{repeat}_{backend}_{mode}"))
                 checkpoint(output, rows, meta)
+                if any(row["status"] != "PASS" for row in rows):
+                    return rows
     meta["timing_notes"] = ["CUDA event intervals include the complete operator GPU path and may include host submission gaps",
                             "input reset is outside each event interval; one synchronization after the measured batch",
                             "calls_per_second is latency-derived operator rate, not application wall-clock throughput"]

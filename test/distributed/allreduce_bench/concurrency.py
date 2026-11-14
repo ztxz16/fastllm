@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 import time
 
-from .execution import checkpoint, collect, isolated_process, require_correctness, run_job, wait_case
+from .execution import checkpoint, collect, isolated_process, require_correctness, run_job, wait_case, worker_environment
 from .reporting import ROOT
 
 
@@ -47,12 +47,13 @@ def run_parallel(jobs, args, directory):
             child.mkdir()
             directories.append(child)
             job.update(directory=str(child.resolve()), gate=str(gate.resolve()), group_index=index)
+            environment = worker_environment(job)
             path = child / "job.json"
             path.write_text(json.dumps(job, indent=2))
             stdout = stack.enter_context((child / "stdout.log").open("w"))
             stderr = stack.enter_context((child / "stderr.log").open("w"))
             command = [args.python, "-m", "allreduce_bench.worker", str(path.resolve())]
-            process = stack.enter_context(isolated_process(command, cwd=ROOT / "test/distributed",
+            process = stack.enter_context(isolated_process(command, cwd=ROOT / "test/distributed", env=environment,
                                                              stdout=stdout, stderr=stderr))
             processes.append(process)
         try:
@@ -118,6 +119,8 @@ def run(args, output, meta):
                     isolated.extend(run_job(job, args, output / f"r{repeat}_{backend}_{mode}_solo{index}"))
                 rows.extend(isolated)
                 checkpoint(output, rows, meta)
+                if any(row["status"] != "PASS" for row in isolated):
+                    return rows
                 for job in jobs:
                     job["scenario"] = "concurrent"
                 together = run_parallel(jobs, args, output / f"r{repeat}_{backend}_{mode}_together")
@@ -128,6 +131,8 @@ def run(args, output, meta):
                         row["slowdown"] = row["median_us"] / reference["median_us"]
                 rows.extend(together)
                 checkpoint(output, rows, meta)
+                if any(row["status"] != "PASS" for row in together):
+                    return rows
     meta["concurrency_notes"] = ["two independent TP2 groups, not one TP4 collective",
                                   "both groups validate each measured shape before timing",
                                   "wall throughput includes identical input reset and host submission; distinct from event latency",

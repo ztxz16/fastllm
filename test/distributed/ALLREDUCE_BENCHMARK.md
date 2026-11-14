@@ -33,6 +33,8 @@ python3 test/distributed/benchmark_allreduce.py preflight --python "$AR_PYTHON" 
 SM/UVA、每对卡的双向 P2P/native atomics、已加载库路径和版本、vLLM 源码指纹。
 候选卡对不等于已通过跨卡算子测试；第三步才验证实际执行。V100 为 SM70，不能
 默认任意新版 PyTorch/vLLM 预编译包都能运行；预检失败时先处理兼容环境。
+实际比较对象是 AR_PYTHON 环境中加载的 vLLM 算子，报告保存安装路径、版本和扩展
+指纹。旁边 vLLM 源码目录的 Git 提交单独记录，不能冒充已安装扩展的构建提交。
 
 第三步（只在 V100 服务器编译，随后三方各执行两项实际求和）：
 
@@ -47,6 +49,9 @@ python3 test/distributed/benchmark_allreduce.py smoke --python "$AR_PYTHON" \
 process_allreduce.cu，不构建模型或复制 CUDA kernel。vLLM 使用已有 Python/扩展
 正式入口；需要本地对应版本支持 register_graph_buffers 参数。不修改已安装 vLLM。
 所有 worker 运行于独立进程组，超时或退出后有界终止和回收整组。
+启动器将所选卡对映射为组内可见编号 0、1，保留外层 CUDA_VISIBLE_DEVICES 的映射
+及顺序；两边采用相同映射，避免第二组的 vLLM 按 rank 检查到第一组设备。
+原生库内嵌编译时的源码/头文件 SHA256、架构和 Git 提交，旧产物不能冒充当前源码。
 
 第四步（数值验证，三种模式分别建立通信组）：
 
@@ -90,3 +95,27 @@ python3 test/distributed/benchmark_allreduce.py concurrent --python "$AR_PYTHON"
 第二组逐项验证实际输出后才计时，核对与主组相同的软件指纹；不声称已完成其全部
 边界测试。wall_calls_per_second 按两组总完成次数/共同墙钟区间计算，包含双方一致
 的输入恢复和主机提交；与排除输入恢复的 CUDA event 延迟分开报告。
+
+第七步（CPU 汇总，无编译或 GPU 调用）：
+
+```bash
+"$AR_PYTHON" test/distributed/benchmark_allreduce.py report \
+  --input-root "$AR_RUN" --output "$AR_RUN/07-report"
+```
+
+默认使用当前解释器的 matplotlib 输出 PNG/SVG 延迟曲线；缺少绘图库时保留数值
+结果并报告失败。若只要数值报告，可显式传 --no-plots。汇总要求各组完整的独立五轮，
+以五个轮次 Median 的 Median 为主值，P95 使用合并后的逐次样本，CV 使用轮次 Median。
+加速比只在卡对、模式、输入长度、采样配置与场景一致时计算；结果保留实际路径。
+并发两行的 wall_calls_per_second 是同一个双组总吞吐，不能再次相加。
+
+也可在服务器一次执行七步（此命令明确包含编译；不会自动安装任何依赖）：
+
+```bash
+AR_PYTHON="$(command -v python3)" AR_CUDA=/usr/local/cuda-12.6 \
+  bash test/distributed/run_allreduce_v100.sh
+```
+
+通过 AR_PAIR、AR_GROUPS、AR_DEVICES 选择卡号，AR_RUN 指定新的报告根目录。
+任一步失败会停止后续 GPU 测试，并尽可能生成已有结果汇总，整体返回非零。
+若先逐步检查过环境，继续执行第三步及之后的分步命令，不要复用同目录重复运行。

@@ -13,6 +13,15 @@ if(NOT CMAKE_CUDA_ARCHITECTURES)
 endif()
 
 get_filename_component(FT_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../.." ABSOLUTE)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${FT_ROOT}/src/distributed/process_allreduce.cu" "${FT_ROOT}/include/distributed/process_allreduce.h")
+file(SHA256 "${FT_ROOT}/src/distributed/process_allreduce.cu" AR_SOURCE_SHA)
+file(SHA256 "${FT_ROOT}/include/distributed/process_allreduce.h" AR_HEADER_SHA)
+execute_process(COMMAND git -C "${FT_ROOT}" rev-parse HEAD OUTPUT_VARIABLE AR_BUILD_GIT
+    OUTPUT_STRIP_TRAILING_WHITESPACE RESULT_VARIABLE AR_GIT_RESULT)
+if(NOT AR_GIT_RESULT EQUAL 0)
+    message(FATAL_ERROR "Cannot record source Git revision")
+endif()
 add_library(fastllm_allreduce_adapter SHARED adapter.cpp
     "${FT_ROOT}/src/distributed/process_allreduce.cu")
 target_include_directories(fastllm_allreduce_adapter PRIVATE "${FT_ROOT}/include" "${NCCL_INCLUDE_DIR}")
@@ -22,5 +31,7 @@ set_target_properties(fastllm_allreduce_adapter PROPERTIES
 target_compile_options(fastllm_allreduce_adapter PRIVATE -O2)
 string(REPLACE ";" "," AR_ARCH_STRING "${CMAKE_CUDA_ARCHITECTURES}")
 target_compile_definitions(fastllm_allreduce_adapter PRIVATE AR_BUILD_ARCH="${AR_ARCH_STRING}")
+target_compile_definitions(fastllm_allreduce_adapter PRIVATE
+    AR_SOURCE_SHA="${AR_SOURCE_SHA}" AR_HEADER_SHA="${AR_HEADER_SHA}" AR_BUILD_GIT="${AR_BUILD_GIT}")
 get_filename_component(NCCL_LIBRARY_DIR "${NCCL_LIBRARY}" DIRECTORY)
 set_target_properties(fastllm_allreduce_adapter PROPERTIES BUILD_RPATH "${NCCL_LIBRARY_DIR}")

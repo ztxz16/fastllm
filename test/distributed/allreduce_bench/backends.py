@@ -13,6 +13,11 @@ class Native:
         lib = self.library
         lib.ar_error.restype = ctypes.c_char_p
         lib.ar_build_arch.restype = ctypes.c_char_p
+        try:
+            for name in ("ar_source_sha", "ar_header_sha", "ar_build_git"):
+                getattr(lib, name).restype = ctypes.c_char_p
+        except AttributeError as exc:
+            raise RuntimeError("原生适配库较旧，请在服务器重新执行 build_allreduce_adapter.sh") from exc
         lib.ar_id_size.restype = ctypes.c_size_t
         lib.ar_unique_id.argtypes = [ctypes.c_void_p]
         lib.ar_create.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
@@ -56,10 +61,19 @@ class Native:
         return {"custom": custom.value, "nccl": nccl.value}
 
     def metadata(self):
+        from .reporting import ROOT
+
         runtime, nccl = ctypes.c_int(), ctypes.c_int()
         self.check(self.library.ar_versions(ctypes.byref(runtime), ctypes.byref(nccl)))
+        source = self.library.ar_source_sha().decode()
+        header = self.library.ar_header_sha().decode()
+        if source != hashlib.sha256((ROOT / "src/distributed/process_allreduce.cu").read_bytes()).hexdigest() or (
+                header != hashlib.sha256((ROOT / "include/distributed/process_allreduce.h").read_bytes()).hexdigest()):
+            raise RuntimeError("已编译算子与当前生产源码不一致，请在服务器重新构建")
         return {"cuda_runtime": runtime.value, "nccl_version": nccl.value,
                 "compile_architecture": self.library.ar_build_arch().decode(),
+                "build_git": self.library.ar_build_git().decode(), "source_sha256": source,
+                "header_sha256": header,
                 "library_sha256": hashlib.sha256(Path(self.library._name).read_bytes()).hexdigest()}
 
     def close(self):
@@ -69,9 +83,14 @@ class Native:
 
 class Vllm:
     def __init__(self, device, group, mode):
+        import torch.distributed as dist
+        from vllm.distributed.parallel_state import init_distributed_environment
         from vllm.distributed.device_communicators.custom_all_reduce import CustomAllreduce
         from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
 
+        # 正式 P2P 检查依赖 vLLM world group；只创建分布式环境，不初始化模型或 TP 层。
+        init_distributed_environment(world_size=dist.get_world_size(group), rank=dist.get_rank(group),
+                                     local_rank=device, backend="gloo")
         self.custom = CustomAllreduce(group, device, register_graph_buffers=mode != "graph_copy")
         if self.custom.disabled:
             raise RuntimeError("vLLM 自定义算子未启用；严格比较不接受静默回退")
@@ -112,3 +131,4 @@ class Vllm:
 
     def close(self):
         self.custom.close()
+        self.fallback.destroy()

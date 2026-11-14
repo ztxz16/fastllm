@@ -4,6 +4,7 @@ import argparse
 import ctypes
 import hashlib
 import itertools
+import inspect
 import json
 from pathlib import Path
 import subprocess
@@ -72,6 +73,10 @@ def gpu_probe(device_ids, result):
     # 只加载现有扩展；真正的跨卡自定义调用在 smoke 阶段验证。
     import vllm
     from vllm import _custom_ops  # noqa: F401
+    from vllm.distributed.device_communicators.custom_all_reduce import CustomAllreduce
+    from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+    if "register_graph_buffers" not in inspect.signature(CustomAllreduce).parameters or not hasattr(PyNcclCommunicator, "destroy"):
+        raise RuntimeError("已安装 vLLM 算子接口与本次比较不匹配，需要包含 Graph 注册选项和通信器销毁接口的版本")
     for op in ("init_custom_ar", "all_reduce", "register_buffer"):
         str(getattr(torch.ops._C_custom_ar, op).default._schema)
     root = Path(vllm.__file__).resolve().parent

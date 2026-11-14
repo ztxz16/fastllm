@@ -12,6 +12,45 @@ SCRIPT = Path(__file__).with_name("benchmark_allreduce.py")
 
 
 class PlanTests(unittest.TestCase):
+    def test_pair_mapping_preserves_outer_visibility_and_rank_order(self):
+        from allreduce_bench.execution import worker_environment
+        job = {"devices": [2, 0]}
+        environment = {"CUDA_VISIBLE_DEVICES": "5,3,1,7", "UNCHANGED": "yes"}
+        child = worker_environment(job, environment)
+        self.assertEqual(child["CUDA_VISIBLE_DEVICES"], "1,5")
+        self.assertEqual(environment["CUDA_VISIBLE_DEVICES"], "5,3,1,7")
+        self.assertEqual(job["visible_device_map"], ["1", "5"])
+        with self.assertRaises(ValueError):
+            worker_environment({"devices": [0, 4]}, environment)
+
+    def test_report_speedup_direction_and_incomplete_round_rejection(self):
+        from allreduce_bench.summary import aggregate
+        rows = []
+        for backend, value in (("ft", 4.0), ("vllm", 8.0)):
+            for repeat in range(5):
+                rows.append(dict(stage="performance", case="perf_n4", backend=backend,
+                                 mode="eager", devices=[0, 1], n=4, scenario="single", status="PASS",
+                                 repeat=repeat, samples_us=[value, value], median_us=value,
+                                 warmup=100, iterations=2, path=backend + "_custom",
+                                 max_abs_error=0.0, mean_abs_error=0.0, failed_elements=0))
+        result = aggregate(rows, 5)
+        self.assertEqual(next(r for r in result if r["backend"] == "vllm")["speedup"], 2.0)
+        result = aggregate(rows[:-1], 5)
+        self.assertEqual(next(r for r in result if r["backend"] == "vllm")["status"], "FAIL")
+        for row in rows[5:]:
+            row["mode"] = "graph_registered"
+        self.assertNotIn("speedup", next(r for r in aggregate(rows, 5) if r["backend"] == "vllm"))
+
+    def test_report_of_missing_stages_fails_and_preserves_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "report"
+            result = subprocess.run([sys.executable, str(SCRIPT), "report", "--input-root", directory,
+                                     "--output", str(output), "--no-plots"], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            report = json.loads((output / "summary.json").read_text())
+            self.assertEqual(len(report["cases"]), 6)
+            self.assertTrue(all(row["status"] == "FAIL" for row in report["cases"]))
+
     def test_disjoint_batch_windows_have_zero_overlap(self):
         from allreduce_bench.concurrency import overlap_metrics
         rows = [dict(iterations=10, ranks=[dict(batch_start_ns=10, batch_end_ns=20)]),

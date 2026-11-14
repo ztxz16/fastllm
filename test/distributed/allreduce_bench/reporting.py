@@ -35,8 +35,9 @@ def metadata(args):
             "python": sys.version, "options": vars(args),
             "environment": {key: value for key, value in os.environ.items()
                             if key.startswith("NCCL_") or key in (
-                                "CUDA_VISIBLE_DEVICES", "CUDA_MODULE_LOADING", "PYTORCH_CUDA_ALLOC_CONF",
-                                "VLLM_CUSTOM_ALLREDUCE_ALGO", "VLLM_BATCH_INVARIANT")}}
+                                "CUDA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER", "CUDA_MODULE_LOADING", "PYTORCH_CUDA_ALLOC_CONF",
+                                "VLLM_CUSTOM_ALLREDUCE_ALGO", "VLLM_BATCH_INVARIANT",
+                                "VLLM_SKIP_P2P_CHECK", "VLLM_DISTRIBUTED_USE_SPLIT_GROUP")}}
 
 
 def artifact_signature(args):
@@ -77,7 +78,8 @@ def write_report(output, rows, meta, status=None):
     lines += ["", "```json", json.dumps(meta, ensure_ascii=False, indent=2), "```"]
     (output / "summary.md").write_text("\n".join(lines), encoding="utf-8")
     write_xlsx(output / "summary.xlsx", [
-        ("Cases", FIELDS, display),
+        ("Cases", FIELDS, [[row.get(key) if isinstance(row.get(key), (int, float))
+                            else cell(row.get(key)) for key in FIELDS] for row in rows]),
         ("Metadata", ["key", "value"], [[k, cell(v)] for k, v in meta.items()]),
     ])
     return status
