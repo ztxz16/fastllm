@@ -1,18 +1,20 @@
 #ifdef USE_CUDA
 bool Qwen4ExpModel::PrepareBatchGraph(std::shared_ptr<BatchGraph> &owned,
         const std::vector<ForwardState*> &frames, const std::vector<BatchedRequest*> &drafts,
-        const std::vector<Data*> &hidden) {
+        const std::vector<Data*> &hidden, int firstLayer, int endLayer) {
     if (!GetFastllmEnv().cudaGraph || GetKVCacheInCPU() || threadTpState || threadTpRank >= 0 ||
         kvMemConfig.enabled || !Qwen4CudaOnlyDeviceMap(deviceMap) || hidden.empty()) return false;
     const char *hybridGraph = std::getenv("FASTLLM_QWEN38_HYBRID_GRAPH");
     if (executionMode == ExecutionMode::Hybrid && hybridGraph && std::strcmp(hybridGraph, "1") != 0)
         return false;
+    const bool draft = !drafts.empty();
+    if (draft) { firstLayer = block_cnt; endLayer = block_cnt + 1; }
+    else if (endLayer < 0) endLayer = block_cnt;
     const int device = FastllmCudaGetDevice();
-    for (int layer = 0; layer < block_cnt; ++layer) {
-        auto name = SelectDeviceFromMap(deviceMap, layer + 1, block_cnt);
+    for (int layer = firstLayer; layer < endLayer; ++layer) {
+        auto name = SelectDeviceFromMap(deviceMap, std::min(layer + 1, block_cnt), block_cnt);
         if (name != "cuda" && name != "cuda:" + std::to_string(device)) return false;
     }
-    const bool draft = !drafts.empty();
     const size_t count = draft ? drafts.size() : frames.size();
     AssertInFastLLM(hidden.size() == count, "Qwen batch graph input count mismatch");
     for (size_t i = 0; i < count; ++i) {
@@ -34,7 +36,8 @@ bool Qwen4ExpModel::PrepareBatchGraph(std::shared_ptr<BatchGraph> &owned,
         for (size_t i = 0; i < count; ++i) g.requests.emplace_back(new BatchGraph::Request);
     }
     g.device = device; g.recorder.device = device;
-    std::vector<uint64_t> signature{uint64_t(device), uint64_t(count), uint64_t(draft)};
+    g.firstLayer = firstLayer; g.endLayer = endLayer;
+    std::vector<uint64_t> signature{uint64_t(device), uint64_t(count), uint64_t(draft), uint64_t(firstLayer), uint64_t(endLayer)};
     auto address = [&](const void *p) { signature.push_back(uint64_t(uintptr_t(p))); };
     std::vector<void*> tailDestinations;
     std::vector<const void*> tailSources;
@@ -58,7 +61,7 @@ bool Qwen4ExpModel::PrepareBatchGraph(std::shared_ptr<BatchGraph> &owned,
         auto *capture = draft ? nullptr : frames[i]->work->verificationCapture;
         signature.push_back(capture != nullptr);
         graph.verification.runtimeCheckpoint = capture ? capture->runtimeCheckpoint : nullptr;
-        for (int layer = draft ? block_cnt : 0; layer < (draft ? block_cnt + 1 : block_cnt); ++layer) {
+        for (int layer = firstLayer; layer < endLayer; ++layer) {
             auto &key = draft ? drafts[i]->state->mtpState->key : frames[i]->work->pastKeyValues[layer].first;
             auto &value = draft ? drafts[i]->state->mtpState->value : frames[i]->work->pastKeyValues[layer].second;
             if (!draft && IsLinearAttentionLayer(layer)) {
@@ -89,7 +92,7 @@ bool Qwen4ExpModel::PrepareBatchGraph(std::shared_ptr<BatchGraph> &owned,
                 tailSizes.push_back(size_t(tail) * sizeof(float));
             }
         }
-        if (!draft && pleLayer >= 0 && pleLayer < block_cnt) {
+        if (!draft && pleLayer >= firstLayer && pleLayer < endLayer) {
             // Rollback can select either history buffer. Normalize the active
             // address so accepted prefixes do not invalidate the whole graph.
             if (state.pleConvHistoryIndex == 1 && state.pleConvHistoryTensors[0] && state.pleConvHistoryTensors[1]) {
@@ -162,7 +165,7 @@ bool Qwen4ExpModel::PrepareBatchGraph(std::shared_ptr<BatchGraph> &owned,
     }
     for (size_t i = 0; !draft && i < count; ++i) {
         auto &f = *frames[i]->work;
-        if (pleLayer >= 0 && pleLayer < block_cnt) {
+        if (pleLayer >= firstLayer && pleLayer < endLayer) {
             Data &embedding = g.requests[i]->ple;
             AssertInFastLLM(Qwen4PrepareDecodeGraphWorkspace(embedding, FLOAT32,
                 {1, f.inputIds.dims[1], ngramHeads * ngramHeadDim}, device),
@@ -183,7 +186,7 @@ void Qwen4ExpModel::FinishBatchGraph(BatchGraph &g, const std::vector<ForwardSta
         auto &state = draft ? drafts[i]->state->mtpState->attentionState : *frames[i]->work->requestState;
         const int length = a.previous + a.validRows, oldTail = a.previous % indexerCompressRatio;
         const int completed = (oldTail + a.validRows) / indexerCompressRatio * indexerCompressRatio;
-        for (int layer = draft ? block_cnt : 0; layer < (draft ? block_cnt + 1 : block_cnt); ++layer) {
+        for (int layer = g.firstLayer; layer < g.endLayer; ++layer) {
             if (!draft && IsLinearAttentionLayer(layer)) continue;
             auto &key = draft ? drafts[i]->state->mtpState->key : frames[i]->work->pastKeyValues[layer].first;
             auto &value = draft ? drafts[i]->state->mtpState->value : frames[i]->work->pastKeyValues[layer].second;
@@ -217,10 +220,10 @@ void Qwen4ExpModel::FinishBatchGraph(BatchGraph &g, const std::vector<ForwardSta
                 if (dst.cudaDataBorrowed) dst.FreeSpace();
                 dst.CopyFrom(src);
             };
-            if (pleLayer >= 0 && pleLayer < block_cnt) {
+            if (pleLayer >= g.firstLayer && pleLayer < g.endLayer) {
                 copy(dst.pleInput, graph.verification.pleInput); copy(dst.pleNormalized, graph.verification.pleNormalized);
             }
-            for (int layer = 0; layer < block_cnt; ++layer) {
+            for (int layer = g.firstLayer; layer < g.endLayer; ++layer) {
                 if (IsLinearAttentionLayer(layer)) {
                     copy(dst.linearConvInputs[layer], graph.verification.linearConvInputs[layer]);
                     copy(dst.linearAlphas[layer], graph.verification.linearAlphas[layer]);

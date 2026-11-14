@@ -348,7 +348,6 @@ struct Qwen4GGUFTestAccess {
         // Repeated clients, varying batch sizes and arrival/removal order must
         // retain bounded slots and isolate every history from the prior wave.
         const int counts[]={1,1,2,2,4,4,2,1};
-        std::vector<const Data*> firstSlots;
         for(int wave=0;wave<8;++wave) {
             const int n=counts[wave];
             std::vector<std::unique_ptr<ResponseContext>> clients;
@@ -752,11 +751,15 @@ struct Qwen4GGUFTestAccess {
     }
 };
 }
-int main(int argc,char **argv) { try {SetThreads(2);FastllmCudaSetDevice(0);const bool tuned=argc>1 && std::string(argv[1])=="--tuned-sparse";
-if (argc>1 && std::string(argv[1])=="--embedding-only") {
+int main(int argc,char **argv) { try {setenv("FASTLLM_PREFIX_CACHE","0",1);SetThreads(2);FastllmCudaSetDevice(0);const bool tuned=argc>1 && std::string(argv[1])=="--tuned-sparse";
+if (argc>1 && (std::string(argv[1])=="--pipeline" || std::string(argv[1])=="--pipeline-serving-only" || std::string(argv[1])=="--embedding-only")) {
     int devices=0;Check(cudaGetDeviceCount(&devices)==cudaSuccess && devices>=2,"pipeline regression requires two GPUs");
     pipelineTests=true;
     Qwen4GGUFTestAccess::MtpEmbeddingPlacement();
+    if (std::string(argv[1])=="--embedding-only") return 0;
+    if (std::string(argv[1])=="--pipeline") Qwen4GGUFTestAccess::Run(true);
+    Qwen4GGUFTestAccess::ServingReuse();
+    Qwen4GGUFTestAccess::ServingMtpBatchHandoff();
     return 0;
 }
 Qwen4GGUFTestAccess::MirrorHandoff();

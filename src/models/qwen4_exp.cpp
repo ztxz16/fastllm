@@ -10111,7 +10111,7 @@ namespace fastllm {
         // PLE is part of the captured backbone. Keep its owned history
         // addresses across requests, but erase both buffers before reusing
         // the slot so neither ordinary decode nor MTP sees prior tokens.
-        if (UseFullHybridGraph()) {
+        if (UseFullHybridGraph() || state.batchState) {
             for (int index = 0; index < 2; ++index) {
                 auto &history = state.pleConvHistoryTensors[index];
                 if (history && history->dataDevice == CUDA && history->cudaData &&
@@ -10405,6 +10405,14 @@ namespace fastllm {
         std::optional<HybridExecutionScope> hybridScope;
         if (executionMode == ExecutionMode::Hybrid && !prefill) hybridScope.emplace(*this, inputIds, false, true);
 #endif
+
+        // Resident decode shares the same graph, checkpoint and sampling
+        // implementation as a scheduler batch. Unsupported contexts retain the
+        // established scalar path, including prefill and tensor parallelism.
+        int batchedToken;
+        if (!prefill && TryForwardDecodeBatch(inputIds, attentionMask, positionIds,
+                pastKeyValues, *requestState, generationConfig, lastTokens, retLogits, batchedToken))
+            return {batchedToken};
 
         if (requestState->mtpDisabled ||
             !MtpSupportsGenerationConfig(generationConfig)) {

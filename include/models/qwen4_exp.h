@@ -190,7 +190,8 @@ namespace fastllm {
 #ifdef USE_CUDA
         bool PrepareBatchGraph(std::shared_ptr<BatchGraph> &graph,
             const std::vector<ForwardState*> &frames,
-            const std::vector<BatchedRequest*> &drafts, const std::vector<Data*> &hidden);
+            const std::vector<BatchedRequest*> &drafts, const std::vector<Data*> &hidden,
+            int firstLayer = 0, int endLayer = -1);
         void FinishBatchGraph(BatchGraph &graph, const std::vector<ForwardState*> &frames,
                               const std::vector<BatchedRequest*> &drafts);
 #endif
@@ -770,6 +771,11 @@ namespace fastllm {
                                         const std::vector<Data*> &hidden,
                                         std::vector<Data> &nextHidden, std::vector<float> &probabilities);
         void ForwardMtpBatch(const std::vector<BatchedRequest*> &requests);
+        bool TryForwardDecodeBatch(const Data &inputIds, const Data &attentionMask,
+            const Data &positionIds, std::vector<std::pair<Data, Data>> &cache,
+            RequestState &state, const GenerationConfig &config,
+            const LastTokensManager &lastTokens, std::vector<std::vector<float>*> *logits,
+            int &token);
         void RunMtpEmbedding(const Data &tokenIds, Data &embeddings);
         void GenerateMtpProposalBatch(const std::vector<BatchedRequest*> &requests);
         struct ForwardWorkspace;

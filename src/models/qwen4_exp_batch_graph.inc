@@ -12,7 +12,7 @@ struct Qwen4ExpModel::BatchGraph {
         Data input, injection, output, afterAttention, residual, readInput, readInjection;
         MoEPrepared moe;
     };
-    int device = -1;
+    int device = -1, firstLayer = 0, endLayer = 0;
     std::vector<uint64_t> signature;
     std::vector<std::unique_ptr<Request>> requests;
     std::map<int, Layer> layers;

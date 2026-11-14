@@ -103,6 +103,43 @@ struct Qwen4ExpModel::BatchedRequest {
 
 #include "qwen4_exp_batch_graph_prepare.inc"
 
+bool Qwen4ExpModel::TryForwardDecodeBatch(const Data &inputIds, const Data &attentionMask,
+        const Data &positionIds, std::vector<std::pair<Data, Data>> &cache,
+        RequestState &state, const GenerationConfig &config,
+        const LastTokensManager &lastTokens, std::vector<std::vector<float>*> *logits,
+        int &token) {
+#ifndef USE_CUDA
+    return false;
+#else
+    // Hybrid scalar decode already owns its cache/NUMA graph lifecycle.
+    // Resident decode previously missed that entry; share the batch backend.
+    if (executionMode != ExecutionMode::Gpu || !GetFastllmEnv().cudaGraph ||
+        threadTpState || threadTpRank >= 0 || kvMemConfig.enabled ||
+        state.hasMultimodalInput || GetKVCacheInCPU() ||
+        !Qwen4CudaOnlyDeviceMap(deviceMap) || inputIds.dims != std::vector<int>({1, 1}) ||
+        cache.empty() || cache.front().first.dims.empty()) return false;
+    const bool mtp = !state.mtpDisabled && MtpSupportsGenerationConfig(config);
+    if (mtp && (!state.mtpState || state.mtpState->proposals.empty())) return false;
+    if (!mtp && state.mtpState) {
+        state.mtpState->proposals.clear();
+        state.mtpState->targetCheckpointPrepared = false;
+    }
+    BatchedRequest request;
+    request.cache = &cache;
+    request.config = &config;
+    request.state = &state;
+    request.input.CopyFrom(inputIds);
+    request.mask.CopyFrom(attentionMask);
+    request.position.CopyFrom(positionIds);
+    request.lastTokens = lastTokens;
+    if (logits) request.logits = *logits;
+    request.verify = mtp;
+    ForwardMtpBatch({&request});
+    token = request.output.front();
+    return true;
+#endif
+}
+
 bool Qwen4ExpModel::PopPendingResponseToken(ResponseContext *context, int, int &token) {
     if (!context || context->pastKeyValues.empty() || threadTpState || threadTpRank >= 0)
         return false;
@@ -257,25 +294,72 @@ std::vector<std::vector<int>> Qwen4ExpModel::ForwardTargetBatch(
         starts.push_back(rows); rows += f.inputIds.dims[1];
         initial.push_back(f.hiddenStates);
     }
-    Data hidden[2], carriedInput, carriedInjection, finalHidden;
+    Data hidden[2], carriedInput, carriedInjection, finalHidden, logits;
+    Qwen4BatchPack(initial, hidden[0]);
+    HybridMoeDecodeGroup expertSteps;
 #ifdef USE_CUDA
+    BatchGraph *lastGraph = nullptr;
     RequestBatchState::Key graphKey;
     for (auto *frame : frames) {
         graphKey.push_back(uint64_t(uintptr_t(frame->work->requestState)));
         graphKey.push_back(frame->work->inputIds.dims[1]);
     }
-    auto &ownedGraph = frames.front()->work->requestState->batchState->Select(-1, graphKey, maxBatch);
-    BatchGraph *graph = PrepareBatchGraph(ownedGraph, frames, {}, initial) ? ownedGraph.get() : nullptr;
-#else
-    constexpr bool graph = false;
 #endif
-    HybridMoeDecodeGroup expertSteps;
-    if (!graph) Qwen4BatchPack(initial, hidden[0]);
-    Data logits;
+    // Captured pointers never migrate between devices. Each PP stage owns its
+    // input/output and cache capture; only the residual crosses stage boundaries.
+    std::vector<std::unique_ptr<Data>> stageInputs;
+    for (int firstLayer = 0; firstLayer < block_cnt;) {
+        const auto placement = SelectDeviceFromMap(deviceMap, firstLayer + 1, block_cnt);
+        int endLayer = firstLayer + 1;
+        while (endLayer < block_cnt &&
+            SelectDeviceFromMap(deviceMap, endLayer + 1, block_cnt) == placement) ++endLayer;
+        ApplyDeviceMap(deviceMap, firstLayer + 1, block_cnt);
+        Data *stageInput = &hidden[0];
+#ifdef USE_CUDA
+        // Executor placement and CUDA's current device are separate state.
+        const bool cudaStage = placement.empty() ? hidden[0].dataDevice == CUDA
+            : placement == "cuda" || placement.rfind("cuda:", 0) == 0;
+        const int stageDevice = placement.rfind("cuda:", 0) == 0
+            ? std::stoi(placement.substr(5)) : FastllmCudaGetDevice();
+        if (cudaStage && (hidden[0].dataDevice != CUDA ||
+            hidden[0].dataDeviceIds != std::vector<int>{stageDevice})) {
+            if (hidden[0].dataDevice == CUDA && !hidden[0].dataDeviceIds.empty()) {
+                FastllmCudaSetDevice(hidden[0].dataDeviceIds.front());
+                FastllmCudaSyncCurrentThreadStream();
+            }
+            // Graph outputs are borrowed views. Give the peer transfer owned
+            // storage without moving or invalidating the preceding graph.
+            stageInputs.emplace_back(new Data);
+            stageInput = stageInputs.back().get();
+            stageInput->CopyFrom(hidden[0]);
+            stageInput->ToDevice(CUDA, std::vector<int>{stageDevice});
+        }
+        if (cudaStage) FastllmCudaSetDevice(stageDevice);
+#endif
+        std::vector<Data> parts(frames.size());
+        initial.clear();
+        for (size_t i = 0; i < frames.size(); ++i) {
+            Qwen4BatchView(parts[i], *stageInput, starts[i], frames[i]->work->inputIds.dims[1]);
+            initial.push_back(&parts[i]);
+        }
+#ifdef USE_CUDA
+        auto &ownedGraph = frames.front()->work->requestState->batchState->Select(-1 - firstLayer, graphKey, maxBatch);
+        BatchGraph *graph = PrepareBatchGraph(ownedGraph, frames, {}, initial, firstLayer, endLayer)
+            ? ownedGraph.get() : nullptr;
+        lastGraph = graph;
+#else
+        constexpr bool graph = false;
+#endif
+        if (!graph && stageInput != &hidden[0]) {
+            hidden[0].FreeSpace();
+            hidden[0].CopyFrom(*stageInput);
+        }
 #ifdef USE_CUDA
     if (graph && graph->complete) {
-        for (auto &table : weights)
-            if (expertSteps.Begin(FastllmCudaGetDevice(), table.data(), table.size(), num_experts_per_tok)) break;
+        for (int layer = firstLayer; layer < endLayer; ++layer) {
+            auto &table = weights[layer];
+            if (expertSteps.Begin(graph->device, table.data(), table.size(), num_experts_per_tok)) break;
+        }
         AssertInFastLLM(graph->complete.Launch(), "Qwen cross-request target graph replay failed");
     } else
 #endif
@@ -285,11 +369,11 @@ std::vector<std::vector<int>> Qwen4ExpModel::ForwardTargetBatch(
 #endif
     int current = 0;
     bool hasCarriedRead = false;
-    for (int layer = 0; layer < block_cnt; ++layer) {
+    for (int layer = firstLayer; layer < endLayer; ++layer) {
         ApplyDeviceMap(deviceMap, layer + 1, block_cnt);
         Data localInput, localInjection, localOutput;
 #ifdef USE_CUDA
-        auto &residual = graph ? (layer ? graph->layers[layer-1].residual : graph->hidden) : hidden[current];
+        auto &residual = graph ? (layer > firstLayer ? graph->layers[layer-1].residual : graph->hidden) : hidden[current];
         auto &next = graph ? graph->layers[layer].afterAttention : hidden[1-current];
         auto &mlpInput = graph ? graph->layers[layer].input : localInput;
         auto &mlpInjection = graph ? graph->layers[layer].injection : localInjection;
@@ -327,7 +411,7 @@ std::vector<std::vector<int>> Qwen4ExpModel::ForwardTargetBatch(
         Data attentionInput, injection, attentionOutput;
         auto borrow = [](Data &out, Data &in) {out.FakeFrom(in,0);out.Resize(in.dims);};
 #ifdef USE_CUDA
-        if (graph && layer && layer != pleLayer) {
+        if (graph && layer > firstLayer && layer != pleLayer) {
             borrow(attentionInput, graph->layers[layer-1].readInput);
             borrow(injection, graph->layers[layer-1].readInjection);
         } else
@@ -394,7 +478,7 @@ std::vector<std::vector<int>> Qwen4ExpModel::ForwardTargetBatch(
                 Qwen4CudaDeviceGuard deviceGuard(typedInput.dataDeviceIds);
                 std::vector<Data> gates(frames.size()), alphas(frames.size()), betas(frames.size());
                 std::vector<FastllmCudaQwen4GdnDecodeRequest> requests;
-                for (size_t i=0;i<frames.size();++i) {
+                for (size_t i = 0; i < frames.size(); ++i) {
                     Qwen4BatchView(gates[i],projectionValues[1],starts[i],1);
                     Qwen4BatchView(betas[i],projectionValues[2],starts[i],1);
                     Qwen4BatchView(alphas[i],projectionValues[3],starts[i],1);
@@ -500,7 +584,7 @@ std::vector<std::vector<int>> Qwen4ExpModel::ForwardTargetBatch(
 #ifdef USE_CUDA
         if (graph) {
             graph->Join(graph->layers[layer]);
-            if (layer + 1 == pleLayer) {
+            if (layer + 1 == pleLayer || (layer + 1 == endLayer && endLayer < block_cnt)) {
                 HyperCombine(next, mlpOutput, mlpInjection, graph->layers[layer].residual);
                 return;
             }
@@ -545,13 +629,13 @@ std::vector<std::vector<int>> Qwen4ExpModel::ForwardTargetBatch(
     };
 #ifdef USE_CUDA
     if (graph) {
-        graph->Dense(block_cnt*3, head);
+        if (endLayer == block_cnt) graph->Dense(block_cnt*3, head);
         const bool verifying = std::any_of(frames.begin(), frames.end(),
             [](const ForwardState *frame) { return frame->work->verificationCapture != nullptr; });
         graph->Seal(verifying ? "verify" : "decode", rows);
     } else
 #endif
-    head();
+    if (endLayer == block_cnt) head();
     }
 #ifdef USE_CUDA
     if (graph) {
@@ -561,17 +645,20 @@ std::vector<std::vector<int>> Qwen4ExpModel::ForwardTargetBatch(
         const bool sampledVerification = std::any_of(frames.begin(), frames.end(), [](const ForwardState *frame) {
             return frame->work->verificationAccepted && !frame->work->generationConfig.IsSimpleGreedy();
         });
-        if (sampledVerification) {
+        if (sampledVerification && endLayer == block_cnt) {
             for (auto *frame : frames)
-                frame->work->samplingSubmitted = [&] { expertSteps.Finish(graph->device); };
+                frame->work->samplingSubmitted = [&expertSteps, device = graph->device] { expertSteps.Finish(device); };
         } else expertSteps.Finish(graph->device);
         FinishBatchGraph(*graph, frames, {});
-        Qwen4BorrowCudaStorage(logits, graph->logits);
-        if (std::any_of(frames.begin(), frames.end(), [](const ForwardState *frame) {
-                return frame->work->targetMultiHidden != nullptr;
-            }))
-            Qwen4BorrowCudaStorage(hidden[0], graph->layers[block_cnt-1].residual);
+        if (endLayer == block_cnt) Qwen4BorrowCudaStorage(logits, graph->logits);
+        hidden[0].FreeSpace();
+        Qwen4BorrowCudaStorage(hidden[0], graph->layers[endLayer - 1].residual);
     }
+#endif
+        firstLayer = endLayer;
+    }
+#ifdef USE_CUDA
+    auto *graph = lastGraph;
 #endif
     std::vector<std::vector<int>> results;
     for (size_t i = 0; i < frames.size(); ++i) {
