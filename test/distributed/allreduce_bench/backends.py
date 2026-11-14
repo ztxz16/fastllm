@@ -1,6 +1,7 @@
 """正式算子薄适配；不在本文件导入时加载 CUDA。"""
 
 import ctypes
+import hashlib
 from pathlib import Path
 
 
@@ -58,7 +59,8 @@ class Native:
         runtime, nccl = ctypes.c_int(), ctypes.c_int()
         self.check(self.library.ar_versions(ctypes.byref(runtime), ctypes.byref(nccl)))
         return {"cuda_runtime": runtime.value, "nccl_version": nccl.value,
-                "compile_architecture": self.library.ar_build_arch().decode()}
+                "compile_architecture": self.library.ar_build_arch().decode(),
+                "library_sha256": hashlib.sha256(Path(self.library._name).read_bytes()).hexdigest()}
 
     def close(self):
         self.check(self.library.ar_destroy(self.handle))
@@ -97,8 +99,16 @@ class Vllm:
 
     def metadata(self):
         import vllm
+        root = Path(vllm.__file__).resolve().parent
+        sources = [root / "distributed/device_communicators/custom_all_reduce.py",
+                   root / "distributed/device_communicators/pynccl.py"]
+        libraries = sorted({Path(line.split()[-1]) for line in Path("/proc/self/maps").read_text().splitlines()
+                            if "/vllm/" in line and ".so" in line and line.split()[-1].startswith("/")})
         return {"vllm_version": vllm.__version__, "vllm_module": str(Path(vllm.__file__).resolve()),
-                "max_size": self.custom.max_size, "registered_graph": self.custom._capture_registered}
+                "max_size": self.custom.max_size, "registered_graph": self.custom._capture_registered,
+                "nccl_version": self.fallback.nccl_version,
+                "source_hashes": {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in sources},
+                "extension_hashes": {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in libraries}}
 
     def close(self):
         self.custom.close()

@@ -2,6 +2,8 @@
 
 import csv
 import json
+import hashlib
+import os
 from pathlib import Path
 import shlex
 import subprocess
@@ -29,7 +31,18 @@ def metadata(args):
     return {"command": shlex.join([sys.executable, *sys.argv]),
             "git": capture(["git", "-C", str(ROOT), "rev-parse", "HEAD"]),
             "git_dirty": capture(["git", "-C", str(ROOT), "status", "--short"]),
-            "python": sys.version, "options": vars(args)}
+            "python": sys.version, "options": vars(args),
+            "environment": {key: value for key, value in os.environ.items()
+                            if key.startswith("NCCL_") or key in (
+                                "CUDA_VISIBLE_DEVICES", "CUDA_MODULE_LOADING", "PYTORCH_CUDA_ALLOC_CONF",
+                                "VLLM_CUSTOM_ALLREDUCE_ALGO", "VLLM_BATCH_INVARIANT")}}
+
+
+def artifact_signature(args):
+    native = Path(args.native).resolve()
+    return {"native_sha256": hashlib.sha256(native.read_bytes()).hexdigest(),
+            "ft_source_sha256": hashlib.sha256((ROOT / "src/distributed/process_allreduce.cu").read_bytes()).hexdigest(),
+            "data_generator_sha256": hashlib.sha256(Path(__file__).with_name("data.py").read_bytes()).hexdigest()}
 
 
 def cell(value):

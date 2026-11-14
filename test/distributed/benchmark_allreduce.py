@@ -12,7 +12,7 @@ from allreduce_bench.reporting import metadata, write_report
 
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("stage", choices=["plan", "preflight", "smoke", "correctness"])
+    p.add_argument("stage", choices=["plan", "preflight", "smoke", "correctness", "performance"])
     p.add_argument("--output", required=True, help="新目录；已存在时拒绝覆盖")
     p.add_argument("--devices", default="0,1,2,3")
     p.add_argument("--python", default=sys.executable, help="服务器已有 CUDA/vLLM 环境的 Python")
@@ -21,6 +21,10 @@ def parser():
     p.add_argument("--pair", default="0,1")
     p.add_argument("--native", default="build-allreduce-cu126/libfastllm_allreduce_adapter.so")
     p.add_argument("--stress-iterations", type=int, default=10000)
+    p.add_argument("--correctness", help="同一产物和卡对的准确性报告目录")
+    p.add_argument("--warmup", type=int, default=100)
+    p.add_argument("--iterations", type=int, default=1000)
+    p.add_argument("--repeats", type=int, default=5)
     return p
 
 
@@ -46,8 +50,8 @@ def main():
             rows = run(args, output, meta)
             status = "PASS" if rows and all(r["status"] == "PASS" for r in rows) else "FAIL"
         else:
-            from allreduce_bench.execution import smoke, correctness
-            rows = {"smoke": smoke, "correctness": correctness}[args.stage](args, output, meta)
+            from allreduce_bench.execution import smoke, correctness, performance
+            rows = {"smoke": smoke, "correctness": correctness, "performance": performance}[args.stage](args, output, meta)
             status = "PASS" if rows and all(r["status"] == "PASS" for r in rows) else "FAIL"
     except Exception as exc:
         partial = output / "summary.json"

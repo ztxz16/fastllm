@@ -60,3 +60,19 @@ python3 test/distributed/benchmark_allreduce.py correctness --python "$AR_PYTHON
 仍相对 FP64 值计算，因此 PASS 时可能有正常的 FP32 舍入误差。NaN/Inf 单独按类别
 比较，不进入有限值误差均值。每张卡均检查实际输出，记录输入指纹和首批失败元素。
 Graph capture/warmup 位于计数检查区间外；重放更新 GPU 同步序号，不重建通信组。
+
+第五步（先验证报告和产物指纹，再测速）：
+
+```bash
+python3 test/distributed/benchmark_allreduce.py performance --python "$AR_PYTHON" \
+  --pair 0,1 --correctness "$AR_RUN/04-correctness" --warmup 100 --iterations 1000 \
+  --repeats 5 --timeout 900 --output "$AR_RUN/05-performance"
+```
+
+每个样本在同一 stream 依次提交「恢复输入、start event、完整算子、end event」。
+输入恢复不在事件区间内；所有实现均在批次结束后同步并读取事件，不能逐次同步一方。
+保留双方生产 staging copy 和内核同步。Eager 事件区间可能包含主机提交间隙，因此
+这是完整算子路径的事件延迟，不是 profiler 中单个 kernel 的硬件持续时间。
+校验计时区最后一次调用的真实输出，而不是另跑一次后将结果当作计时区正确性证据。
+每次通信取两 rank 时间较大值；逐次原始时间保存在 JSON 中。calls_per_second 是
+由算子延迟折算的调用率，不是包含输入准备的应用墙钟吞吐。

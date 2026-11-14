@@ -12,6 +12,16 @@ SCRIPT = Path(__file__).with_name("benchmark_allreduce.py")
 
 
 class PlanTests(unittest.TestCase):
+    def test_timing_uses_slowest_rank_and_rejects_missing_samples(self):
+        from allreduce_bench.timing import rank_max_samples, statistics_for
+        values = rank_max_samples([{"samples_us": [1, 10, 3]}, {"samples_us": [4, 2, 6]}])
+        self.assertEqual(values, [4, 10, 6])
+        self.assertEqual(statistics_for(values)["median_us"], 6)
+        with self.assertRaises(ValueError):
+            rank_max_samples([{"samples_us": [1, 2]}, {"samples_us": [3]}])
+        with self.assertRaises(ValueError):
+            statistics_for([0, 1])
+
     def test_reference_detects_stale_results_and_nonfinite_corruption(self):
         from array import array
         from allreduce_bench.data import compare, inputs

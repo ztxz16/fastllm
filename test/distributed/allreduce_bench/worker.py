@@ -45,11 +45,13 @@ def rank_main(rank, job):
             raise RuntimeError("非法配置未按约定拒绝")
         meta = {"rank": rank, "device": device, "device_name": torch.cuda.get_device_name(device),
                 "torch": torch.__version__, "cuda": torch.version.cuda,
-                "torch_nccl": torch.cuda.nccl.version(), "backend": backend.metadata()}
-        if job["backend"] != "vllm":
-            major, minor, patch = torch.cuda.nccl.version()
-            if meta["backend"]["nccl_version"] != major * 10000 + minor * 100 + patch:
-                raise RuntimeError("native adapter 与 PyTorch 的 NCCL 版本不一致")
+                "torch_nccl": list(torch.cuda.nccl.version()), "backend": backend.metadata(),
+                "backend_name": job["backend"], "mode": job["mode"]}
+        major, minor, patch = torch.cuda.nccl.version()
+        if meta["backend"]["nccl_version"] != major * 10000 + minor * 100 + patch:
+            raise RuntimeError("算子与 PyTorch 的 NCCL 版本不一致")
+        if job.get("expected_runtime") and meta not in job["expected_runtime"]:
+            raise RuntimeError("软件/算子扩展或设备信息与准确性验证时不同，需要重新验证")
         (directory / f"rank{rank}.metadata.json").write_text(json.dumps(meta, indent=2))
         cache = {}
         with result_file.open("w", buffering=1) as results:
@@ -72,6 +74,9 @@ def rank_main(rank, job):
                                    mean_abs_error=0.0, failed_elements=0)
                     else:
                         row.update(validate(case, job, backend, cache, device, rank, stream))
+                        if job.get("measure") and row["status"] == "PASS":
+                            from .timing import measure
+                            row.update(measure(case, job, backend, cache[case["n"]], stream, group))
                 except Exception as exc:
                     row.update(status="FAIL", reason=str(exc))
                     results.write(json.dumps(row, allow_nan=False) + "\n")

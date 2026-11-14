@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 import sys
 
-from .reporting import ROOT, write_report
+from .reporting import ROOT, artifact_signature, write_report
 
 sys.path.insert(0, str(ROOT / "tools"))
 from tp_process_utils import isolated_process, wait_case
@@ -37,6 +37,10 @@ def collect(job, directory):
         row["status"] = "PASS" if all(r["status"] == "PASS" for r in records) else "FAIL"
         if len({r.get("path") for r in records}) != 1:
             row.update(status="FAIL", reason="各 rank 的实际执行路径不一致")
+        if job.get("measure") and row["status"] == "PASS":
+            from .timing import rank_max_samples, statistics_for
+            samples = rank_max_samples(records)
+            row.update(statistics_for(samples), samples_us=samples)
         results.append(row)
     return results
 
@@ -96,6 +100,7 @@ def correctness(args, output, meta):
         raise ValueError("correctness 要求两卡和正数 stress-iterations")
     if not Path(args.native).is_file():
         raise FileNotFoundError(args.native)
+    meta["artifacts"] = artifact_signature(args)
     rows = []
     for group in ([pair[0]], devices(args.devices)):
         if len(group) == 2:
@@ -119,4 +124,54 @@ def correctness(args, output, meta):
             checkpoint(output, rows, meta)
     meta["scope"] = "TP2 FP32; independent CPU reference; all ranks checked"
     meta["worker_metadata"] = [json.loads(p.read_text()) for p in sorted(output.glob("*/rank*.metadata.json"))]
+    return rows
+
+
+def require_correctness(args, meta):
+    from .plan import BACKENDS, CORE_SIZES, MODES, devices
+
+    if not args.correctness:
+        raise ValueError("测速前必须通过 --correctness 指定准确性报告目录")
+    report = json.loads((Path(args.correctness) / "summary.json").read_text())
+    if report["status"] != "PASS" or report["metadata"]["options"]["stage"] != "correctness":
+        raise ValueError("准确性报告未通过，拒绝发布性能成绩")
+    signature = artifact_signature(args)
+    if report["metadata"].get("artifacts") != signature:
+        raise ValueError("准确性验证后的算子产物或输入生成逻辑已改变，需要重新验证")
+    if report["metadata"].get("environment") != meta["environment"]:
+        raise ValueError("通信相关环境变量与准确性验证时不同")
+    pair = devices(args.pair)
+    checked = {(row.get("backend"), row.get("mode"), row.get("n")) for row in report["cases"]
+               if row["status"] == "PASS" and row.get("devices") == pair and row["case"].startswith("random_n")}
+    required = {(backend, mode, n) for backend in BACKENDS for mode in MODES for n in CORE_SIZES}
+    if not required <= checked:
+        raise ValueError("准确性报告没有覆盖当前卡对和三种模式的共同长度")
+    meta["artifacts"] = signature
+    meta["correctness_report"] = str(Path(args.correctness).resolve())
+    meta["correctness_runtime"] = report["metadata"]["worker_metadata"]
+
+
+def performance(args, output, meta):
+    from .plan import BACKENDS, CORE_SIZES, MODES, ROUTE_SIZES, SEED, devices
+
+    if args.repeats < 5 or args.iterations < 1 or args.warmup < 1:
+        raise ValueError("性能测试要求至少 5 轮、正数 warmup 和 iterations")
+    require_correctness(args, meta)
+    cases = [dict(case=f"perf_n{n}", n=n, pattern="random") for n in sorted(set(CORE_SIZES + ROUTE_SIZES))]
+    rows = []
+    for repeat in range(args.repeats):
+        # 每轮轮换后端次序，降低固定顺序下温度、频率变化的偏差。
+        backends = BACKENDS[repeat % 3:] + BACKENDS[:repeat % 3]
+        for mode in MODES:
+            for backend in backends:
+                job = dict(stage="performance", backend=backend, mode=mode, devices=devices(args.pair),
+                           native=str(Path(args.native).resolve()), timeout=args.timeout, seed=SEED,
+                           strict_sizes=CORE_SIZES, cases=cases, measure=True, warmup=args.warmup,
+                           iterations=args.iterations, repeat=repeat,
+                           expected_runtime=meta["correctness_runtime"])
+                rows.extend(run_job(job, args, output / f"r{repeat}_{backend}_{mode}"))
+                checkpoint(output, rows, meta)
+    meta["timing_notes"] = ["CUDA event intervals include the complete operator GPU path and may include host submission gaps",
+                            "input reset is outside each event interval; one synchronization after the measured batch",
+                            "calls_per_second is latency-derived operator rate, not application wall-clock throughput"]
     return rows
