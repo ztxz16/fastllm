@@ -5,13 +5,13 @@
 #include <stdexcept>
 
 /**
- * 从 worker 查询实际 Graph 路径及累计次数；不以启动参数代替执行证据。
- * @param group 已就绪的 CUDA 进程组，允许尚未加载或已经卸载模型。
- * @return 按 rank 排列的状态；通信失败或状态不一致时抛异常并终止整组。
+ * 序列化已查询并验证的 Graph 路径与累计次数，不以启动参数代替执行证据。
+ * @param infos 按 rank 排列的原生请求状态，允许尚未加载或已经卸载模型。
+ * @return 包含 Graph、通信与前缀目录的 JSON 数组。
  */
-inline json11::Json::array GraphState(fastllm::distributed::ProcessGroup &group) {
+inline json11::Json::array GraphState(const std::vector<fastllm::distributed::Qwen3RequestInfo> &infos) {
     json11::Json::array states;
-    for (const auto &info : group.Qwen3Requests()) {
+    for (const auto &info : infos) {
         const auto &g = info.graph;
         json11::Json::array snapshots;
         for (const auto &snapshot : info.prefix.snapshots) {
@@ -43,6 +43,11 @@ inline json11::Json::array GraphState(fastllm::distributed::ProcessGroup &group)
                 {"directory_version", 1}, {"snapshots", snapshots}}}});
     }
     return states;
+}
+
+/** 查询一次原生状态并序列化，避免同一轮重复查询改变计时范围。 */
+inline json11::Json::array GraphState(fastllm::distributed::ProcessGroup &group) {
+    return GraphState(group.Qwen3Requests());
 }
 
 /**

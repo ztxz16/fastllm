@@ -10,7 +10,7 @@ import time
 
 
 MAGIC = 0x46545031
-VERSION = 4
+VERSION = 5
 HEADER = struct.Struct("<IIIIQQ")
 HELLO, INITIALIZE, READY, PING, PONG, SHUTDOWN, BYE, ERROR = 1, 4, 5, 6, 7, 8, 9, 10
 ERROR_TEXT = b"injected worker failure before exit"

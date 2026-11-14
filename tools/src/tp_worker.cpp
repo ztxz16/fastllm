@@ -164,8 +164,8 @@ struct DeviceRuntime {
         if (directory.find('\0') != std::string::npos) {
             throw std::runtime_error("invalid Qwen3 path");
         }
-        if (moe && (cudaGraph || prefixCache || customAllReduce)) {
-            throw std::runtime_error("MoE layer requires Eager and NCCL without prefix cache");
+        if (moe && customAllReduce) {
+            throw std::runtime_error("MoE execution requires NCCL");
         }
         fastllm::distributed::Qwen3ShardLoader loader(directory, rank, world,
             moe ? fastllm::distributed::ShardModel::Qwen2Moe : fastllm::distributed::ShardModel::DenseQwen3);
@@ -230,6 +230,9 @@ struct DeviceRuntime {
      * @return 有界中间量与实际通信计数；协议或计算失败退出 worker。
      */
     std::vector<uint8_t> ForwardMoe(int rank, int world, const std::vector<uint8_t> &payload) {
+        if (cudaGraph || prefixCache) {
+            throw std::runtime_error("MoE single-layer diagnostic requires Eager without prefix cache");
+        }
         if (controlOnly || payload.size() < 20 || Get32(payload, 12) != uint32_t(world) ||
             !Get32(payload, 16) || Get32(payload, 16) > INT_MAX) {
             throw std::runtime_error("invalid MoE layer payload/state");
@@ -285,6 +288,55 @@ struct DeviceRuntime {
         for (const auto *values : {&output.selectedExperts, &output.expertTokens}) {
             Put32(result, values->size());
             for (uint32_t value : *values) Put32(result, value);
+        }
+        return result;
+#else
+        throw std::runtime_error("worker built without CUDA");
+#endif
+    }
+
+    /**
+     * 解码整组联合操作，每个 worker 只执行本 rank 请求但共同参加专家通信。
+     * @param rank 当前 Attention/EP rank。
+     * @param world 共同通信组大小。
+     * @param payload 轮次头及逐 rank 的动作、容量、位置和 Token ID。
+     * @return 本 rank FP32 logits；空闲为零长度，失败终止 worker。
+     */
+    std::vector<uint8_t> StepMoe(int rank, int world, const std::vector<uint8_t> &payload) {
+        if (controlOnly || payload.size() < 12 || Get32(payload, 0) != uint32_t(world) ||
+            Get32(payload, 4) > 1 || !Get32(payload, 8) || Get32(payload, 8) > INT_MAX) {
+            throw std::runtime_error("invalid joint MoE payload");
+        }
+#ifdef FASTLLM_PROCESS_TP_CUDA
+        using namespace fastllm::distributed;
+        if (!weights || weights->Plan().model != ShardModel::Qwen2Moe) throw std::runtime_error("MoE weights not loaded");
+        const bool graph = Get32(payload, 4);
+        QwenMoeStep local;
+        size_t offset = 12;
+        for (int peer = 0; peer < world; ++peer) {
+            QwenMoeStep step;
+            step.action = static_cast<QwenMoeAction>(Get32(payload, offset));
+            step.capacity = Get32(payload, offset + 4);
+            step.positionBegin = Get32(payload, offset + 8);
+            const uint32_t count = Get32(payload, offset + 12);
+            offset += 16;
+            if (uint32_t(step.action) > 3 || count > 2048 || offset > payload.size() ||
+                count > (payload.size() - offset)/4 || (graph && step.action == QwenMoeAction::Begin)) {
+                throw std::runtime_error("invalid joint MoE rank payload");
+            }
+            for (uint32_t i = 0; i < count; ++i, offset += 4) step.tokenIds.push_back(Get32(payload, offset));
+            if (peer == rank) local = std::move(step);
+        }
+        if (offset != payload.size()) throw std::runtime_error("trailing joint MoE payload");
+        if (!layerExecutor) layerExecutor = std::make_unique<Qwen3LayerExecutor>(
+            *weights, stream, comm, *allReduce, cudaGraph, prefixCache);
+        auto logits = layerExecutor->StepMoe(local, graph);
+        std::vector<uint8_t> result;
+        Put32(result, logits.size());
+        for (float value : logits) {
+            uint32_t bits;
+            memcpy(&bits, &value, sizeof(bits));
+            Put32(result, bits);
         }
         return result;
 #else
@@ -424,6 +476,7 @@ struct DeviceRuntime {
             Put32(result, snapshot.second.size());
             for (auto token : snapshot.second) Put32(result, token);
         }
+        Put64(result, info.reservedKVBytes);
         return result;
 #else
         throw std::runtime_error("worker built without CUDA");
@@ -531,12 +584,18 @@ int main(int argc, char **argv) {
             std::vector<uint8_t> payload;
             if (message.kind != Kind::Initialize && message.kind != Kind::LoadQwen3 &&
                 message.kind != Kind::LoadQwenMoe && message.kind != Kind::ForwardMoeLayer &&
+                message.kind != Kind::StepMoe &&
                 message.kind != Kind::ReadWeight && message.kind != Kind::ForwardLayer &&
                 message.kind != Kind::PrefillQwen3 && message.kind != Kind::BeginQwen3Request &&
                 message.kind != Kind::DecodeQwen3 && message.kind != Kind::AllReduce && !message.payload.empty()) {
                 throw std::runtime_error("unexpected worker command payload");
             }
             switch (message.kind) {
+                case Kind::StepMoe:
+                    if (!initialized) throw std::runtime_error("MoE round before Initialize");
+                    payload = runtime.StepMoe(rank, world, message.payload);
+                    response = Kind::MoeLogits;
+                    break;
                 case Kind::EndQwen3Request:
                 case Kind::QueryQwen3Request:
                 case Kind::ClearQwen3Prefix:
@@ -633,6 +692,7 @@ int main(int argc, char **argv) {
             auto responseTimeout = message.kind == Kind::ForwardLayer ?
                 std::chrono::milliseconds(Get32(message.payload, 20)) :
                 message.kind == Kind::ForwardMoeLayer ? std::chrono::milliseconds(Get32(message.payload, 16)) :
+                message.kind == Kind::StepMoe ? std::chrono::milliseconds(Get32(message.payload, 8)) :
                 (message.kind == Kind::PrefillQwen3 || message.kind == Kind::BeginQwen3Request || message.kind == Kind::DecodeQwen3) ?
                 std::chrono::milliseconds(Get32(message.payload, 4)) :
                 std::chrono::milliseconds(10000);

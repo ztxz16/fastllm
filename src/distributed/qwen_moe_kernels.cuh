@@ -13,9 +13,11 @@ namespace moe {
  * @param experts 专家数，1..256。
  * @param topk 每 Token 选择数，1..experts。
  * @param normalize 是否归一化被选中的概率；不能忽略模型 norm_topk_prob。
+ * @param meta 可空的设备 [past,position,active]；Graph 用 active 掩蔽空闲 rank。
  */
 __global__ void Route(const half *logits, int *ids, half *prob, int valid, int capacity,
-                      int experts, int topk, bool normalize) {
+                      int experts, int topk, bool normalize, const uint32_t *meta = nullptr) {
+    if (meta) valid = meta[2];
     int row = blockIdx.x;
     if (threadIdx.x || row >= capacity) return;
     if (row >= valid) {
@@ -153,9 +155,16 @@ __global__ void DecodeDown(const half *activated, const half *weight, const int 
 }
 
 /** 共享专家按 sigmoid(gate) 门控；与 ReduceScatter 返回的路由贡献相加，再按 FP16 语义加残差。 */
-__global__ void Finish(half *x, const half *gate, half *shared, const float *routed, int count, int hidden) {
+__global__ void Finish(half *x, const half *gate, half *shared, const float *routed,
+                       int count, int hidden, const half *prob, int topk) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count) return;
+    for (int k = 0; k < topk; ++k) {
+        if (!isfinite(__half2float(prob[(i / hidden) * topk + k]))) {
+            x[i] = __float2half_rn(NAN);
+            return;
+        }
+    }
     float sigmoid = __half2float(__float2half_rn(1 / (1 + expf(-__half2float(gate[i / hidden])))));
     shared[i] = __float2half_rn(sigmoid * __half2float(shared[i]));
     float delta = __half2float(__float2half_rn(__half2float(__float2half_rn(routed[i])) + __half2float(shared[i])));

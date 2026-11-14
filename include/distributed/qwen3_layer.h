@@ -56,6 +56,14 @@ public:
         uint32_t positionBegin, Qwen3LayerStage stage, const std::vector<float> &input);
 
     /**
+     * 执行完整 MoE 联合轮次；所有 rank 必须共同调用，包括空闲 rank。
+     * @param step 本 rank 的准入、Decode、结束或空闲操作。
+     * @param graph 使用整组固定地址 Graph，动态位置与活动掩码在设备更新。
+     * @return 活动请求的 FP32 完整 logits；空闲返回空，失败后必须终止 worker。
+     */
+    std::vector<float> StepMoe(const QwenMoeStep &step, bool graph);
+
+    /**
      * 运行完整无 KV prefill，复用单层执行路径和同一 stream，仅读回本 rank 的末 token logits。
      *
      * 输入、隐藏状态和工作区在一次请求内复用；成功后释放，失败必须终止 worker。
