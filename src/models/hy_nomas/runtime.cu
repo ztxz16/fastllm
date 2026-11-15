@@ -663,6 +663,8 @@ void Runtime::linearInto(const Tensor &x,const Tensor &w,Tensor &out,const Tenso
             check(cublasLtMatmulPreferenceCreate(&p->preference));
             check(cublasLtMatmulPreferenceSetAttribute(p->preference,CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,&workspaceBytes,sizeof(size_t)));
             uint32_t reduction=CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE|CUBLASLT_REDUCTION_SCHEME_NONE,alignment=256;
+            if(tune && numerics_.bf16SplitKReduction && x.cols>w.rows)
+                reduction|=CUBLASLT_REDUCTION_SCHEME_INPLACE|CUBLASLT_REDUCTION_SCHEME_OUTPUT_TYPE;
             check(cublasLtMatmulPreferenceSetAttribute(p->preference,CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK,&reduction,sizeof(reduction)));
             for(auto attr:{CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES,CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_B_BYTES,CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_C_BYTES,CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_D_BYTES})
                 check(cublasLtMatmulPreferenceSetAttribute(p->preference,attr,&alignment,sizeof(alignment)));
@@ -1227,6 +1229,12 @@ struct Weights::Impl {
 };
 Weights::Weights(Runtime &rt,const std::string &path):impl_(new Impl(rt,path)) {}
 Weights::~Weights()=default;
+size_t Weights::loadedBytes() const {
+    size_t bytes=0;
+    for(const auto &entry:impl_->cache) bytes+=entry.second.bytes();
+    for(const auto &entry:impl_->shards) if(entry.second) bytes+=entry.second->loadedBytes();
+    return bytes;
+}
 void Weights::shard(const std::string &name,int axis,int rank,int size,int groups) {
     auto &i=*impl_;
     require((axis==0 || axis==1) && size>0 && rank>=0 && rank<size && groups>0,
