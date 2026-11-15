@@ -2,11 +2,13 @@
 #include "distributed/qwen3_layer.h"
 #include "process_protocol.h"
 #include "qwen_moe_qkv.cuh"
+#include "qwen_moe_trace.cuh"
 
 #include <cuda_fp16.h>
 #include <cublas_v2.h>
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace fastllm {
@@ -271,6 +273,9 @@ struct Qwen3LayerExecutor::Impl {
     cublasHandle_t blas = nullptr;
     cublasLtHandle_t qkvLt = nullptr;
     std::vector<std::unique_ptr<detail::MoeQkvLtPlan>> qkvPlans, graphQkvPlans;
+    std::string forwardTraceDirectory;
+    std::unique_ptr<detail::MoeForwardTrace> forwardTrace;
+    uint64_t forwardTraceRound = 0;
     std::vector<void*> buffers;
     size_t allocated = 0;
     std::vector<half*> kvCache;
@@ -784,21 +789,27 @@ struct Qwen3LayerExecutor::Impl {
      * @param capacity 整组统一的 EP 行数。
      * @param position 本轮绝对位置。
      * @param meta 可空的 GPU [past,position,active]。
+     * @param trace 可空的独立数值诊断快照；仅 Eager Begin 允许，逐阶段同 stream 复制。
      */
     void EnqueueMoe(const uint32_t *ids, half *x, const Workspace &attention,
                     const MoeWorkspace &experts, float *logits, int t, int capacity,
-                    uint32_t position, const uint32_t *meta = nullptr) {
+                    uint32_t position, const uint32_t *meta = nullptr,
+                    detail::MoeForwardTrace *trace = nullptr) {
         const auto &p = weights.Plan();
         const int h = p.hiddenSize;
         if (t) Embed<<<(t*h+255)/256,256,0,stream>>>(ids,
             Weight("model.embed_tokens.weight", {p.vocabSize, p.hiddenSize}), x, t*h, h);
+        if (trace) trace->Capture(x, size_t(t)*h, stream);
         for (uint32_t layer = 0; layer < p.layerCount; ++layer) {
             if (t) RunLayer(layer, t, position, Qwen3LayerStage::Attention, x, attention, true, meta);
+            if (trace) trace->Capture(x, size_t(t)*h, stream);
             RunMoe(layer, t, capacity, x, &experts, meta);
+            if (trace) trace->Capture(x, size_t(t)*h, stream);
         }
         if (t) {
             Norm<<<1,256,0,stream>>>(x + size_t(t-1)*h, Weight("model.norm.weight", {p.hiddenSize}),
                 attention.norm, h, h, 1, 0, p.rmsNormEps);
+            if (trace) trace->Capture(attention.norm, h, stream);
             Linear(attention.norm, Weight("lm_head.weight", {p.vocabSize, p.hiddenSize}),
                    logits, 1, p.vocabSize, h, true);
         }
@@ -888,6 +899,7 @@ struct Qwen3LayerExecutor::Impl {
 
     void ReleaseBuffers() {
         Cuda(cudaStreamSynchronize(stream));
+        forwardTrace.reset();
         qkvPlans.clear();
         for (auto &buffer : buffers) {
             Cuda(cudaFree(buffer));
@@ -905,6 +917,14 @@ Qwen3LayerExecutor::Qwen3LayerExecutor(const Qwen3DeviceWeights &weights, cudaSt
     }
     impl->graphInfo.enabled = cudaGraph;
     impl->prefixInfo.enabled = prefixCache;
+    if (const char *trace = std::getenv("FASTLLM_MOE_TRACE_DIR")) {
+        if (*trace) {
+            if (weights.Plan().model != ShardModel::Qwen2Moe || cudaGraph || prefixCache) {
+                throw std::runtime_error("MoE forward trace requires Eager with Prefix disabled");
+            }
+            impl->forwardTraceDirectory = trace;
+        }
+    }
     Blas(cublasCreate(&impl->blas));
     Blas(cublasSetStream(impl->blas, stream));
     Blas(cublasSetMathMode(impl->blas, CUBLAS_DEFAULT_MATH));
@@ -1192,6 +1212,9 @@ std::vector<float> Qwen3LayerExecutor::StepMoe(const QwenMoeStep &step, bool gra
     const auto &p = r.weights.Plan();
     const bool begin = step.action == QwenMoeAction::Begin;
     const bool decode = step.action == QwenMoeAction::Decode;
+    if (!r.forwardTraceDirectory.empty() && (decode || graph || (begin && step.positionBegin != 0))) {
+        throw std::runtime_error("MoE forward trace supports only fresh Eager Begin at position zero");
+    }
     if (p.model != ShardModel::Qwen2Moe || uint32_t(step.action) > 3 ||
         (graph && (!r.graphInfo.enabled || begin)) || p.vocabSize > (protocol::kMaxPayload - 4) / 4) {
         throw std::runtime_error("invalid MoE round mode/model/vocabulary");
@@ -1289,10 +1312,17 @@ std::vector<float> Qwen3LayerExecutor::StepMoe(const QwenMoeStep &step, bool gra
         auto logits = static_cast<float*>(r.Allocate(p.vocabSize * sizeof(float)));
         auto attention = r.Prepare(rows, p.hiddenSize, Qwen3LayerStage::Attention);
         auto experts = r.PrepareMoe(capacity);
+        if (local && !r.forwardTraceDirectory.empty()) {
+            r.forwardTrace.reset(new detail::MoeForwardTrace(r.forwardTraceDirectory, ids,
+                                                           p.hiddenSize, p.layerCount, p.rank));
+            r.forwardTrace->Attach(r.Allocate(r.forwardTrace->Bytes()));
+        }
         if (local) Cuda(cudaMemcpyAsync(input, ids.data(), ids.size() * sizeof(uint32_t), cudaMemcpyHostToDevice, r.stream));
-        r.EnqueueMoe(input, x, attention, experts, logits, local, capacity, position);
+        r.EnqueueMoe(input, x, attention, experts, logits, local, capacity, position, nullptr, r.forwardTrace.get());
         if (local) Cuda(cudaMemcpyAsync(result.data(), logits, result.size() * sizeof(float), cudaMemcpyDeviceToHost, r.stream));
+        if (r.forwardTrace) r.forwardTrace->Readback(r.stream);
         r.Synchronize();
+        if (r.forwardTrace) r.forwardTrace->Save(++r.forwardTraceRound);
         r.ReleaseBuffers();
         if (decode) ++r.graphInfo.eagerDecodes;
     }
