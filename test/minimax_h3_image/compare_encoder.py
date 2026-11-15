@@ -67,4 +67,3 @@ metrics = {'relative_rms': float(np.linalg.norm(diff) / np.linalg.norm(reference
 (out / 'metrics.json').write_text(json.dumps(metrics, indent=2))
 print(json.dumps(metrics, indent=2))
 assert metrics['relative_rms'] < .002, metrics
-

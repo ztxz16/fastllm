@@ -27,6 +27,9 @@ function fixture(request) {
         nodes.set(id, {
           value: "",
           dataset: {},
+          replaceChildren(...children) {
+            this.children = children;
+          },
           pause() {
             this.pauses = (this.pauses || 0) + 1;
           },
