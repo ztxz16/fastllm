@@ -208,6 +208,41 @@ EP1/2/4、Eager/Graph、Prefix开关和完整logits。CPU检查用独立PyTorch 
 选择差异的`failed_elements`统计Token数，不计算专家ID的数值误差。仍不修改验收容差，
 不重新编译，也不以这些独立实验代替完整模型验收。
 
+诊断`20261115T034534Z_attention_probe_0ca04f43`进一步显示：三层保存的原生
+Attention输出接HF路由后，均精确复现保存的原生完整层router logits。仅替换成
+合并QKV的GemmEx/beta=1投影，也能复现第4层的换序、第13层的专家8→24；
+第7层尚有未复现的换序，不能把全部差异归给同一个投影因素。
+
+下一组仅改变QKV计算，使用`--modes`指定实验，必须以`hf_replay`开始且不重复。
+`--qkv-report`额外记录并打印每个Q/K/V投影对HF的精确差异，保留所有原始中间量。
+
+- `torch_merged_qkv`：PyTorch公开Linear一次计算合并QKV及bias，用于区分矩阵合并与接口变化。
+- `separate_fused_qkv`：三个独立GemmEx/beta=1投影，与HF保持相同Q/K/V矩阵尺寸。
+- `fp32_qkv`：合并GemmEx/beta=1输出FP32，再统一转FP16；其余Attention不变。
+- `lt_qkv`、`lt_separate_qkv`：显式调用已有原生cuBLAS所依赖的Lt库，分别合并或分开
+  QKV；使用32F计算、FP16输入输出、beta=0和BIAS epilogue，不回退到其他接口。
+
+PyTorch 2.7.1的[带bias Linear实现](https://github.com/pytorch/pytorch/blob/v2.7.1/aten/src/ATen/native/Linear.cpp#L53)
+可进入[cuBLASLt分支](https://github.com/pytorch/pytorch/blob/v2.7.1/aten/src/ATen/native/cuda/Blas.cpp#L335)，
+其[gemm_and_bias配置](https://github.com/pytorch/pytorch/blob/v2.7.1/aten/src/ATen/cuda/CUDABlas.cpp#L1189)
+使用epilogue处理bias。因此仅有相同数学公式和FP16输出类型，不能认定与GemmEx逐位相同。
+探针的PyTorch模式保留自身调度，只有`lt_*`模式声明实际强制使用Lt接口；它们仍是独立
+实验，不代表正式后端已实现Lt。调用依据为[CUDA 12.6 Lt接口](https://docs.nvidia.com/cuda/archive/12.6.0/cublas/index.html#cublasltmatmul)。
+
+```bash
+/venv/fastllm-reference-cu126/bin/python3 test/distributed/probe_qwen_moe_attention_precision.py \
+  --diagnostic test/distributed/results/20261115T032151Z_moe_precision_6950e33c \
+  --model /home/models/Qwen1.5-MoE-A2.7B-Chat \
+  --worker build-attention-ep-cu126/fastllm_tp_worker \
+  --layers 13 4 7 --router-replay --qkv-report \
+  --modes hf_replay fused_qkv torch_merged_qkv separate_fused_qkv fp32_qkv lt_separate_qkv lt_qkv
+```
+
+Lt按当前stream执行，私有handle与临时描述在成功及失败路径均释放。使用首个合法heuristic，
+报告保存矩阵尺寸、算法原始字、实际库版本与路径、工作区限制及需求；无算法或执行失败
+直接报错。默认工作区1 MiB；若设置`CUBLASLT_WORKSPACE_SIZE`，按PyTorch的KiB语义读取。
+不修改HF全局后端、计算精度开关或原验收阈值。
+
 ## 失败Decode的缓存与完整历史对照
 
 若真实验收首次超差发生在step大于0的位置，可使用已有构建产物对同一实际Token历史
