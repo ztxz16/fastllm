@@ -5,6 +5,7 @@ project(fastllm LANGUAGES CXX)
 option(USE_NUMAS "use numas" ON)
 
 option(USE_CUDA "use CUDA" OFF)
+option(FASTLLM_LLM_CUDA_PTX "Include PTX fallback in LLM CUDA targets" ON)
 option(CUDA_NO_TENSOR_CORE "Optimize for legacy CUDA GPUs which has Tensor Core." OFF)
 option(CUDA_MEM_DEBUG "Enable CUDA memory pool debug logging" OFF)
 
@@ -286,7 +287,7 @@ if (USE_CUDA)
     add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>)
     if (CMAKE_CUDA_COMPILER_ID STREQUAL "NVIDIA")
         # Preserve legacy compression for normal builds; wheel releases opt in
-        # to CUDA 12.4+ compression. All cubins and PTX are retained.
+        # to CUDA 12.4+ compression. Compression itself retains all images.
         set(FASTLLM_CUDA_COMPRESSION "legacy" CACHE STRING "CUDA fatbinary compression mode")
         set_property(CACHE FASTLLM_CUDA_COMPRESSION PROPERTY STRINGS legacy size speed balance default none)
         if (FASTLLM_CUDA_COMPRESSION STREQUAL "legacy")
@@ -693,6 +694,22 @@ if(BUILD_MINIMAX_H3)
     add_subdirectory(src/models/minimax_h3)
 endif()
 
+# Media targets above keep their own PTX policy: some use PTX to cover GPUs
+# beyond their single native target. Only the LLM targets below opt out.
+set(FASTLLM_LLM_CUDA_ARCH_SUFFIX "")
+if(USE_CUDA AND CMAKE_CUDA_COMPILER_ID STREQUAL "NVIDIA" AND NOT FASTLLM_LLM_CUDA_PTX)
+    set(CMAKE_CUDA_ARCHITECTURES "")
+    foreach(arch IN LISTS FASTLLM_CUDA_ARCHITECTURES)
+        if(NOT arch MATCHES "^([0-9]+[af]?)(-real)?$")
+            message(FATAL_ERROR
+                "FASTLLM_LLM_CUDA_PTX=OFF requires explicit native architectures; "
+                "enable PTX for '${arch}'")
+        endif()
+        list(APPEND CMAKE_CUDA_ARCHITECTURES "${CMAKE_MATCH_1}-real")
+    endforeach()
+    set(FASTLLM_LLM_CUDA_ARCH_SUFFIX "-real")
+endif()
+
 if(USE_ROCM)
     list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/third_party/hipify_torch/cmake")
     include(Hipify)
@@ -792,7 +809,7 @@ endif()
 if (FASTLLM_CUDA_SM90_SOURCES)
     add_library(fastllm_cuda_sm90 OBJECT ${FASTLLM_CUDA_SM90_SOURCES})
     set_target_properties(fastllm_cuda_sm90 PROPERTIES
-        CUDA_ARCHITECTURES "90a" POSITION_INDEPENDENT_CODE ON)
+        CUDA_ARCHITECTURES "90a${FASTLLM_LLM_CUDA_ARCH_SUFFIX}" POSITION_INDEPENDENT_CODE ON)
     target_include_directories(fastllm_cuda_sm90 BEFORE PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/third_party/deep_gemm/include"
         "${CMAKE_CURRENT_SOURCE_DIR}/third_party/trtllm_deep_gemm/include"
@@ -807,7 +824,7 @@ if (FASTLLM_CUDA_SM120_SOURCES)
     # object target so nvcc sees only compute_120f for these translation units.
     add_library(fastllm_cuda_sm120 OBJECT ${FASTLLM_CUDA_SM120_SOURCES})
     set_target_properties(fastllm_cuda_sm120 PROPERTIES
-        CUDA_ARCHITECTURES "120f"
+        CUDA_ARCHITECTURES "120f${FASTLLM_LLM_CUDA_ARCH_SUFFIX}"
         POSITION_INDEPENDENT_CODE ON)
     target_include_directories(fastllm_cuda_sm120 BEFORE PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/third_party"
@@ -819,7 +836,7 @@ if (FASTLLM_MIMO_EP8_MEGA_ENABLED)
     add_library(fastllm_mimo_ep8_mega OBJECT
         src/devices/cuda/moe/fastllm-mimo-ep8-mega.cu)
     set_target_properties(fastllm_mimo_ep8_mega PROPERTIES
-        CUDA_ARCHITECTURES "90a" CUDA_STANDARD 20 POSITION_INDEPENDENT_CODE ON)
+        CUDA_ARCHITECTURES "90a${FASTLLM_LLM_CUDA_ARCH_SUFFIX}" CUDA_STANDARD 20 POSITION_INDEPENDENT_CODE ON)
     target_include_directories(fastllm_mimo_ep8_mega BEFORE PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/third_party/deep_gemm_ep8/include"
         "${FASTLLM_CUTLASS_DIR}/include")
