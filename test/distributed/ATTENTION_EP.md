@@ -128,6 +128,37 @@ PyTorch Linear和使用已有worker链接的cuBLAS库、修复前参数的FP32_P
 该证据支持修复MoE GEMM配置，不能视为修复后验收。上述探针刻意保留旧PEDANTIC
 路径用于历史归因；新二进制应通过`synthetic`、`regression`、`real`验证实际输出。
 
+### Attention投影的独立定位
+
+若同输入独立MoE已通过，而完整层因Attention残差变化发生路由差异，可使用保存的
+分层诊断输入，仅加载目标层Attention权重，对照以下实验：
+
+- `hf_replay`：真实HF eager Attention模块及RMSNorm，先要求精确复现保存的HF残差。
+  无法复现即停止该次归因，保留报告，不能把环境差异归因于原生算子。
+- `split_bias`：Q/K/V分别执行PyTorch无bias Linear，FP16落盘后再加bias。
+- `merged_qkv`：使用已有worker链接的cuBLAS与当前MoE的32F/TENSOR_OP参数，
+  合并QKV GEMM、输出FP16后加bias；该组同时包含矩阵合并和cuBLAS调用策略的变化。
+- `fp32_o`：仅将输出投影替换成当前MoE参数的FP32输出GEMM，再转FP16加残差。
+- `native_norm`：仅替换输入归一化为256线程归约顺序的张量模拟。
+- `combined_projections`：组合上述原生归约顺序模拟、合并QKV和FP32输出投影。
+
+所有实验仍使用HF的RoPE、QK、softmax和PV，**组合实验也不等于原生Attention重放**。
+输出更接近原生日志只能作为下一步定位线索，不能单凭此结果宣布原生根因或模型修复。
+这是独立数值实验，无性能计时，不修改正式推理权重、后端或容差，不编译，不加载完整模型。
+
+```bash
+/venv/fastllm-reference-cu126/bin/python3 test/distributed/probe_qwen_moe_attention_precision.py \
+  --diagnostic test/distributed/results/20261115T011823Z_moe_precision_49509d28 \
+  --model /home/models/Qwen1.5-MoE-A2.7B-Chat \
+  --worker build-attention-ep-cu126/fastllm_tp_worker
+```
+
+默认检查第6、9、16、18、22、23层，可用`--layers`指定唯一层号。脚本限定已记录的
+Transformers 4.57.6接口和默认RoPE、无滑窗、无缓存的单请求prefill。每组打印对已保存
+HF/原生残差的精确差异数和最大误差；零容差FAIL表示数值不同，并非新的完整模型失败。
+原验收`0.05 + 0.01 * abs(reference)`的失败数量另外保存在JSON中。每层原始JSON保存
+归一化、Q/K/V、Attention context、输出投影和残差；summary生成MD/CSV/JSON/XLSX。
+
 ## 启动阶段异常的定向复现
 
 若`ready.json`尚未产生、请求数为0，故障发生在进程组初始化或模型加载阶段，
