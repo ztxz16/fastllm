@@ -79,11 +79,16 @@ def observe_moe(torch, block, norm, x):
     return {name: value.detach().cpu().reshape(-1).tolist() for name, value in record.items()}
 
 
-def hf_pair(model, config, layer, inputs, expected_versions):
+def hf_pair(model, config, layer, inputs, expected_versions, observer=None):
     """/**
      * 仅加载指定层的HF Norm/MoE权重，在原参考设备上执行两种完整输入。
      * 不构造完整模型，不下载或编译；检查参考版本并保存两次真实路由输出。
+     * @param model 本地模型目录，权重分片必须位于该目录内。
+     * @param config 模型配置字典，确定维度和参考层所在设备。
+     * @param layer 从零开始的层索引。
      * @param inputs HF和原生的Attention后FP16激活列表，形状一致。
+     * @param expected_versions 已保存的torch、transformers和dtype版本约束。
+     * @param observer 可选独立诊断观察器；接收torch、MoE、Norm和完整输入，默认沿用原观察器。
      * @return 各输入参考及实际Torch/Transformers/设备信息。
      */"""
     os.environ.pop('USE_TORCH', None)
@@ -120,7 +125,7 @@ def hf_pair(model, config, layer, inputs, expected_versions):
     try:
         for name, values in inputs.items():
             x = torch.tensor(values, device=device, dtype=torch.float16).reshape(1, -1, cfg.hidden_size)
-            result[name] = observe_moe(torch, modules['mlp'], modules['post_attention_layernorm'], x)
+            result[name] = (observer or observe_moe)(torch, modules['mlp'], modules['post_attention_layernorm'], x)
             del x
     finally:
         del modules, state
