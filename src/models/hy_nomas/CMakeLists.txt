@@ -6,6 +6,11 @@ set_directory_properties(PROPERTIES
     COMPILE_DEFINITIONS ""
     INCLUDE_DIRECTORIES "")
 
+# Keep CUDA image compression after isolating the model's arithmetic/stream flags.
+if(FASTLLM_CUDA_COMPRESSION_OPTION)
+    add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:${FASTLLM_CUDA_COMPRESSION_OPTION}>)
+endif()
+
 add_library(fastllm_continuous STATIC
     attention.cu runtime.cu parallel.cu tokenizer.cpp vision.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen_image/image.cpp

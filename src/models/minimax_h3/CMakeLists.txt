@@ -1,4 +1,9 @@
 set_directory_properties(PROPERTIES COMPILE_OPTIONS "" COMPILE_DEFINITIONS "" INCLUDE_DIRECTORIES "")
+
+# Keep CUDA image compression after isolating the model's arithmetic/stream flags.
+if(FASTLLM_CUDA_COMPRESSION_OPTION)
+    add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:${FASTLLM_CUDA_COMPRESSION_OPTION}>)
+endif()
 # Exceptions cross the shared-library/executable boundary. All H3 targets must
 # use the same unwinder even when the wheel statically links libstdc++.
 string(REPLACE "-static-libgcc" "-shared-libgcc" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
