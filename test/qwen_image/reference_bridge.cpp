@@ -13,8 +13,8 @@ struct Handle {
     TextEncoder text;
     DiT dit;
     VAE vae;
-    Handle(const char *dir, int dev)
-        : rt(dev), tokenizer(std::string(dir) + "/processor"), text(rt, std::string(dir) + "/text_encoder"),
+    Handle(const char *dir, int dev, bool fp32)
+        : rt(dev, fp32), tokenizer(std::string(dir) + "/processor"), text(rt, std::string(dir) + "/text_encoder"),
           dit(rt, std::string(dir) + "/transformer"), vae(rt, std::string(dir) + "/vae") {}
 };
 template <class F> int guarded(F f) {
@@ -35,12 +35,12 @@ void copy(Handle &h, const Tensor &x, float *out) {
 }
 } // namespace
 extern "C" {
-void *fastllm_qwen_image_create(const char *dir, int device) {
+void *fastllm_qwen_image_create(const char *dir, int device, int fp32) {
     try {
         lastError.clear();
         if (!dir)
             throw std::invalid_argument("null model path");
-        return new Handle(dir, device);
+        return new Handle(dir, device, fp32 != 0);
     } catch (const std::exception &e) {
         lastError = e.what();
         return nullptr;

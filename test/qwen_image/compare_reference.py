@@ -20,6 +20,7 @@ p.add_argument("--model", required=True)
 p.add_argument("--library", required=True)
 p.add_argument("--stage", choices=["text", "dit", "vae", "all"], default="all")
 p.add_argument("--output", default="qwen-image-accuracy")
+p.add_argument("--precision", choices=["bf16", "fp32"], default="bf16")
 args = p.parse_args()
 assert os.environ.get("CUDA_VISIBLE_DEVICES"), "Explicit GPU selection is required"
 assert torch.cuda.device_count() == 1, "Expose only the permitted GPU"
@@ -28,11 +29,11 @@ out.mkdir(parents=True, exist_ok=True)
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 torch.set_num_threads(8)
-dtype = torch.float32
+dtype = torch.float32 if args.precision == "fp32" else torch.bfloat16
 torch.manual_seed(1234)
 lib = C.CDLL(args.library)
 ptr = C.POINTER(C.c_float)
-lib.fastllm_qwen_image_create.argtypes = [C.c_char_p, C.c_int]
+lib.fastllm_qwen_image_create.argtypes = [C.c_char_p, C.c_int, C.c_int]
 lib.fastllm_qwen_image_create.restype = C.c_void_p
 lib.fastllm_qwen_image_destroy.argtypes = [C.c_void_p]
 lib.fastllm_qwen_image_error.restype = C.c_char_p
@@ -40,7 +41,7 @@ lib.fastllm_qwen_image_tokenize.argtypes = [C.c_void_p, C.c_char_p, C.POINTER(C.
 lib.fastllm_qwen_image_text.argtypes = [C.c_void_p, C.POINTER(C.c_int), C.c_int, ptr]
 lib.fastllm_qwen_image_dit.argtypes = [C.c_void_p, ptr, ptr, C.c_int, C.c_int, C.c_int, C.c_float, ptr]
 lib.fastllm_qwen_image_vae.argtypes = [C.c_void_p, ptr, C.c_int, C.c_int, ptr]
-handle = lib.fastllm_qwen_image_create(args.model.encode(), 0)
+handle = lib.fastllm_qwen_image_create(args.model.encode(), 0, int(args.precision == "fp32"))
 if not handle:
     raise RuntimeError(lib.fastllm_qwen_image_error().decode())
 
@@ -58,10 +59,11 @@ def ap(a):
     return a.ctypes.data_as(ptr)
 
 
-report = {"precision": "fp32", "device": torch.cuda.get_device_name(0), "components": {}}
+report = {"precision": args.precision, "device": torch.cuda.get_device_name(0),
+          "components": {}, "diagnostics": {}}
 
 
-def compare(name, reference, actual):
+def compare(name, reference, actual, group="components"):
     np.save(out / (name + ".reference.npy"), reference)
     np.save(out / (name + ".native.npy"), actual)
     a, b = reference.astype(np.float64).ravel(), actual.astype(np.float64).ravel()
@@ -74,7 +76,7 @@ def compare(name, reference, actual):
         "cosine": float(np.dot(a, b) / max(np.linalg.norm(a) * np.linalg.norm(b), 1e-12)),
         "finite": bool(np.isfinite(actual).all()),
     }
-    report["components"][name] = m
+    report[group][name] = m
     (out / "report.json").write_text(json.dumps(report, indent=2))
     print(name, json.dumps(m), flush=True)
 
@@ -98,7 +100,8 @@ try:
             )
             check(n)
             assert buf[:n].tolist() == tokenizer.encode(prompt), (prompt, buf[:n], tokenizer.encode(prompt))
-        text = "<|im_start|>system\nComprehend and analyze the provided prompt.<|im_end|>\n<|im_start|>user\nA red apple on a wooden table.<|im_end|>\n<|im_start|>assistant\n"
+        system = "<|im_start|>system\nComprehend and analyze the provided prompt.<|im_end|>\n"
+        text = system + "<|im_start|>user\nA red apple on a wooden table.<|im_end|>\n<|im_start|>assistant\n"
         ids = tokenizer.encode(text)
         model = (
             Qwen3VLForConditionalGeneration.from_pretrained(
@@ -126,7 +129,12 @@ try:
                 handle, tokens.ctypes.data_as(C.POINTER(C.c_int)), len(ids), ap(actual)
             )
         )
-        compare("text", ref, actual)
+        # The DiT consumes only rows after the system prefix. Keep the complete
+        # residual as a diagnostic: its unused first token is BF16-sensitive.
+        crop = len(tokenizer.encode(system))
+        report["system_prefix_tokens"] = crop
+        compare("text_full", ref, actual, "diagnostics")
+        compare("text", ref[crop:], actual[crop:])
 
     if args.stage in ("dit", "all"):
         from diffusers import QwenImage21Transformer2DModel
@@ -188,5 +196,8 @@ finally:
     lib.fastllm_qwen_image_destroy(handle)
     (out / "report.json").write_text(json.dumps(report, indent=2))
 
-limit = 3e-4
-assert all(v["finite"] and v["relative_l2"] < limit for v in report["components"].values()), report
+limit = 3e-4 if args.precision == "fp32" else 0.03
+checked = list(report["components"].values())
+if args.precision == "fp32":
+    checked.extend(report["diagnostics"].values())
+assert all(v["finite"] and v["relative_l2"] < limit for v in checked), report

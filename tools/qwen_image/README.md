@@ -2,11 +2,13 @@
 
 支持文生图、单张/多张参考图编辑、RGBA PNG、前缀 KV cache、同步 Images API 和带进度/取消的异步任务。推理与 HTTP 服务均为 C++，不调用 Python、PyTorch、Diffusers 或 Triton。
 
-当前仅支持 FP32，以官方 Diffusers 的 FP32 路径为精度基线。权重直接读取发布的 safetensors，无需转换。文本编码器、DiT、VAE 按阶段加载并释放，单张 RTX PRO 5000 72GB 可运行。当前优先保证精度，未做量化或 BF16 性能优化。
+默认使用 BF16 激活与权重，矩阵乘在块内使用 FP32 累加，大尺寸降维投影允许 BF16 split-K 部分和；归一化归约仍为 FP32。权重直接读取发布的 safetensors，无需转换。每次请求根据空闲显存、输出尺寸和参考图数量估算空间：充足时常驻权重并复用完整 KV 缓冲，不足时按文本编码、DiT、VAE 阶段加载/释放，保留较小的前缀缓存。HTTP 和命令行自动选择，无需精度或显存策略参数。推理仍是纯 C++ / CUDA，不依赖 Torch、Diffusers 或 Python。
+
+常驻只复用模型权重；提示词、参考图和噪声仍逐请求计算。KV、RoPE 和临时张量在请求结束释放；取消或异常同时卸载权重，下一请求重新评估。临时张量在请求内通过有界显存池复用。常驻速度需要预热，不应将热启动耗时当作包含首次权重加载的耗时。
 
 ## 构建
 
-仅需要 C++17、CUDA 12.8+、cuBLAS/cuBLASLt 和 pthread；json11、httplib、FlashInfer 已在仓库中。GPU 架构按实际设备设置，RTX PRO 5000 Blackwell 为 120。
+仅需要 C++17、CUDA 12.8+、cuBLAS/cuBLASLt 和 pthread；json11、httplib、FlashInfer、CUTLASS 已在仓库中。GPU 架构按实际设备设置，RTX PRO 5000 Blackwell 为 120。
 
 ```bash
 cmake -S . -B build-qwen-image \
@@ -76,14 +78,16 @@ GPU 由一个工作线程串行执行。运行中加排队总数最多 4，超�
 - 参考分辨率 256..1024，须为 32 的倍数，默认 1024。按原图长宽比调整到该面积；调整后须至少 65536 像素，极端比例或小面积会明确报错。
 - HTTP 请求最多 20MiB，参考图总计最多 1600 万像素。PNG 接收 8-bit、非 interlace 的灰度、RGB、调色板、灰度 alpha、RGBA；其他格式可用 demo 转换。
 - 暂未实现 mask inpainting、负面提示/CFG、LoRA、远程 URL 输入、视频生成。未知参数返回 400，避免静默忽略。
-- 当前只开放已对齐的 FP32；未验收的 BF16 实验分支不包含在本实现中。
+- 默认 BF16；C++ Runtime / Pipeline 的 `fp32=true` 构造参数保留给数值回归。尚未接入量化或多卡。
 - 相同参数/种子在本原生后端可复现，但随机数生成器与 PyTorch 不同。跨实现精度比较必须共享初始噪声，不能只共享 seed。
 
 ## 算子复用
 
 `fastllm_continuous` 从最新 HY-Nomas 实现抽出共用运行时：cuBLAS/cuBLASLt 线性层、FP32/BF16 attention（含现有 FlashInfer）、RMSNorm/LayerNorm、激活、逐元素运算、embedding、张量切片/拼接、RoPE、显存池、safetensors、Qwen BPE/NFC 分词。HY-Nomas 继续链接同一库。
 
-原有算子的数学实现保持不变；共用层仅增加显式精度构造参数及 Diffusers 分片索引名。Qwen 独有的 MRoPE/视觉 RoPE、zero-centered RMSNorm、调制门、VAE im2col/采样在 `ops.cu`，卷积仍复用共用 GEMM，不引入 cuDNN。PNG 的 DEFLATE 解码、无压缩 PNG 编码和 Pillow 对齐的 Lanczos 缩放为独立 CPU C++ 实现。
+共用算子的默认数值策略保持不变；Qwen 单独启用大尺寸降维投影的 BF16 split-K 候选，由已有自动调优选择。权重类增加已加载显存统计，供常驻决策使用。Qwen 的 `ops.cu` 实现 LayerNorm/调制、QK RMSNorm/RoPE/KV 写入、SiLU/乘法融合与 GPU Euler 更新，保留 BF16 中间舍入点。DiT 的 QKV 和 gate/up 权重仅在加载时拼接，并释放原表示；1×1 VAE 卷积直接走 GEMM，其他 BF16 卷积优先使用 `conv.cu` 中的 CUTLASS implicit GEMM，卷积输出阶段融合 bias 并直接写 BF16；VAE 归一化与 SiLU 按实际通道形状融合。不适用时回退到有界 im2col/GEMM 和通用归一化，不引入 cuDNN。
+
+PNG 的 DEFLATE 解码、无压缩 PNG 编码和 Pillow 对齐的 Lanczos 缩放为独立 CPU C++ 实现。LingBot 的 VAE 显式保留 FP32 基类构造，避免受 Qwen 默认精度切换影响。
 
 ## 验证
 
@@ -95,6 +99,9 @@ cmake -S . -B build-qwen-image -DUNIT_TEST=ON
 cmake --build build-qwen-image --target qwen_image_reference -j4
 python test/qwen_image/compare_reference.py --model /path/to/model \
   --library build-qwen-image/libqwen_image_reference.so --stage all
+# FP32 回归沿用原来的严格阈值；默认 BF16 按实际送入 DiT 的文本特征验收。
+python test/qwen_image/compare_reference.py --model /path/to/model \
+  --library build-qwen-image/libqwen_image_reference.so --stage all --precision fp32
 
 # 原生先导出初始噪声、prompt 和每步 latent，然后官方实现读取相同噪声
 build-qwen-image/src/models/qwen_image/qwen_image_generate --trace /tmp/qwen-trace \

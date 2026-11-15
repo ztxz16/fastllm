@@ -9,7 +9,7 @@ namespace fastllm { namespace lingbot {
 class VAERuntime : public qwen_image::Runtime {
 public:
     explicit VAERuntime(int device, bool bf16 = false)
-        : qwen_image::Runtime(device), low_(bf16 ? new nomas::Runtime(device, false) : nullptr) {}
+        : qwen_image::Runtime(device, true), low_(bf16 ? new nomas::Runtime(device, false) : nullptr) {}
     nomas::Runtime &convolutionRuntime() { return low_ ? *low_ : *this; }
     nomas::Tensor channelNorm(const nomas::Tensor &, const nomas::Tensor &weight);
     // Fuse normalization, optional SiLU and the following convolution's cast.

@@ -3,7 +3,7 @@
   "info": {
     "title": "FastLLM Qwen-Image-2.1",
     "version": "0.1.0",
-    "description": "Native C++/CUDA backend. FP32 inference. Optional Bearer authentication. One GPU worker, queue capacity 4. No remote URL fetching, masks, CFG, or batch n>1."
+    "description": "Native C++/CUDA backend. BF16 activations and weights with FP32 tile accumulation; eligible contraction GEMMs may use BF16 split-K partial sums. Automatic weight residency or stage unloading based on available GPU memory and request shape. Optional Bearer authentication. One GPU worker, queue capacity 4. No remote URL fetching, masks, CFG, or batch n>1."
   },
   "servers": [
     {
