@@ -178,6 +178,39 @@ EP1/2/4、Eager/Graph、Prefix开关和完整logits。CPU检查用独立PyTorch 
 核对期望值，不能代替GPU验收。此修正涉及CUDA代码，需要先重新构建，再执行
 `synthetic`、`regression`和`real`，误差容差保持不变。
 
+## 失败Decode的缓存与完整历史对照
+
+若真实验收首次超差发生在step大于0的位置，可使用已有构建产物对同一实际Token历史
+进行定向对照。`eager`只表示没有使用CUDA Graph；该轮仍可能是缓存Decode，或同时
+有其他rank的Begin。正式trace现在记录`joint_round.actions`（0空闲、1开始、2解码、
+3结束）和`submitted_token_counts`；后者是提交长度，尚未扣除原生Prefix命中。
+
+```bash
+/venv/main/bin/python3 test/distributed/probe_qwen_moe_decode_precision.py \
+  --result-dir test/distributed/results/20261115T023144Z_moe_full_acb8e3ac \
+  --model /home/models/Qwen1.5-MoE-A2.7B-Chat \
+  --build build-attention-ep-cu126 \
+  --reference-python /venv/fastllm-reference-cu126/bin/python3
+```
+
+探针从默认`session-0002/request-000001.json`恢复首次失败历史（可用`--request`指定
+其他请求），保持教师强制Token、模型和原来的`atol=0.05, rtol=0.01`。HF四卡参考先
+完整重算该历史，再从空KV开始运行原prompt并逐Token追加；缓存实现使用
+[Transformers 4.57.6 Qwen2MoE公开forward](https://github.com/huggingface/transformers/blob/v4.57.6/src/transformers/models/qwen2_moe/modeling_qwen2_moe.py)，
+每步检查KV长度。参考子进程退出后，通过正式`QwenMoeProcessSession.generate`分别在
+两个新会话中执行缓存Decode和完整历史Prefill，禁用Graph/Prefix，核验实际联合轮次。
+
+这是仅rank0接收请求、其他rank参加EP的受控对照，**不重放原来的并发准入顺序**；
+Prompt长度、专家GEMM形状和HF缓存/完整计算的舍入差异均需结合结果分析，不能仅凭
+缓存对照有差异就断言KV存储错误，也不能用新增HF缓存参考替换正式验收参考。
+本探针不解释独立层测试的非同分专家排序失败，该项仍需按原标准验收。
+
+输出目录保留HF与原生完整logits、缓存长度、联合轮次、原构建缓存和二进制SHA-256，
+以及JSON/Markdown/CSV/XLSX汇总。JSON另存全部真实超差词表项及各自阈值；终端只打印
+最严重的五项。最大绝对误差项可能仍在相对容差内，不等同于实际超差项。
+即使受控对照通过，报告也保留原失败并返回非零，不能当成完整模型验收通过。
+此探针与trace记录仅涉及Python，更新后无须重新编译。
+
 ## 启动阶段异常的定向复现
 
 若`ready.json`尚未产生、请求数为0，故障发生在进程组初始化或模型加载阶段，
