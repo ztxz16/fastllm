@@ -1459,6 +1459,11 @@ if (UNIT_TEST)
     fastllm_add_checked_test(prefill_batch_scheduler prefill_batch_scheduler_test "ALL_PASS" 30)
     set_tests_properties(prefill_batch_scheduler PROPERTIES RUN_SERIAL TRUE)
 
+    add_executable(naive_prefix_queue_test test/basic/test_naive_prefix_queue.cpp)
+    target_link_libraries(naive_prefix_queue_test PRIVATE fastllm)
+    fastllm_add_checked_test(naive_prefix_queue naive_prefix_queue_test "ALL_PASS" 30)
+    set_tests_properties(naive_prefix_queue PROPERTIES RUN_SERIAL TRUE)
+
     add_executable(pending_response_tokens_test test/basic/test_pending_response_tokens.cpp)
     target_link_libraries(pending_response_tokens_test PRIVATE fastllm)
     fastllm_add_checked_test(pending_response_tokens pending_response_tokens_test "ALL_PASS" 60)
@@ -2441,6 +2446,15 @@ if (UNIT_TEST)
                             PASS_REGULAR_EXPRESSION "ATTENTION DP.*PASS")
                     endforeach()
                 endforeach()
+            endforeach()
+        endforeach()
+        foreach(NAIVE_RESTART_DP 1 2 8)
+            foreach(NAIVE_RESTART_KV bf16 fp8)
+                add_test(NAME naive_n05_paged_cache_restart_${NAIVE_RESTART_DP}_${NAIVE_RESTART_KV}
+                    COMMAND naive_n05_tp_model_test 8 paged_cache_restart ${NAIVE_RESTART_DP} ${NAIVE_RESTART_KV})
+                set_tests_properties(naive_n05_paged_cache_restart_${NAIVE_RESTART_DP}_${NAIVE_RESTART_KV}
+                    PROPERTIES LABELS "cuda;naive" RUN_SERIAL TRUE TIMEOUT 180 SKIP_RETURN_CODE 77
+                    PASS_REGULAR_EXPRESSION "PAGED CACHE RESTART PASS")
             endforeach()
         endforeach()
         foreach(NAIVE_DP_EXTRA indexer kvmem admission prefix)

@@ -29,28 +29,31 @@ bool NaiveN05FlashModel::TryRestoreHistoryCache(std::vector<int> &, int &cacheLe
 
 void NaiveN05FlashModel::OnResponseContextCreated(ResponseContext *context) {
     RestoreTensorParallelCache(context);
+    std::shared_ptr<PrefixSnapshot> queuedPrefix;
+    int group = -1, best = 0;
+    const int preferred = tpNextRequestId % attentionDP;
+    if (saveHistoryChat && context->multimodalInput.empty()) {
+        std::lock_guard<std::mutex> guard(historyMutex);
+        for (const auto &entry : prefixHistory) {
+            if ((draftEnabled && !entry->draftReady) || entry->length < best ||
+                entry->tokens.size() >= context->currentTokens.size() ||
+                !entry->HasResidentPrefix() ||
+                !std::equal(entry->tokens.begin(), entry->tokens.end(), context->currentTokens.begin())) continue;
+            int candidate = 0;
+            if (attentionDP > 1) {
+                auto owner = std::find(tpDevices.begin(), tpDevices.end(), entry->ownerDevice);
+                if (owner == tpDevices.end()) continue;
+                candidate = (owner - tpDevices.begin()) / AttentionTPSize();
+            }
+            if (entry->length > best || candidate == preferred) {
+                group = candidate; best = entry->length; queuedPrefix = entry;
+            }
+        }
+    }
     if (attentionDP > 1) {
         std::vector<std::pair<Data *, Data *>> roots;
         for (auto &layer : context->pastKeyValues) roots.emplace_back(&layer.first, &layer.second);
-        // Keep a continuation on the group holding its longest resident
-        // checkpoint. Equal-length hits prefer the round-robin group.
-        int group = -1, best = 0;
-        const int preferred = tpNextRequestId % attentionDP;
-        if (saveHistoryChat && context->multimodalInput.empty()) {
-            std::lock_guard<std::mutex> guard(historyMutex);
-            for (const auto &entry : prefixHistory) {
-                if ((draftEnabled && !entry->draftReady) || entry->length < best ||
-                    entry->tokens.size() >= context->currentTokens.size() ||
-                    !entry->HasResidentPrefix() ||
-                    !std::equal(entry->tokens.begin(), entry->tokens.end(), context->currentTokens.begin())) continue;
-                auto owner = std::find(tpDevices.begin(), tpDevices.end(), entry->ownerDevice);
-                if (owner == tpDevices.end()) continue;
-                int candidate = (owner - tpDevices.begin()) / AttentionTPSize();
-                if (entry->length > best || candidate == preferred) {
-                    group = candidate; best = entry->length;
-                }
-            }
-        }
+        // Keep continuations on their longest resident prefix; ties prefer RR.
         InitAttentionParallelCache(roots, group);
     }
     if (!context->pastKeyValues.empty()) {
@@ -61,8 +64,13 @@ void NaiveN05FlashModel::OnResponseContextCreated(ResponseContext *context) {
     // Register ownership without touching CUDA. Batched prefill initializes
     // draft state on the inference thread, just like single-request prefill.
     if (draftEnabled) draftContexts.try_emplace(&context->pastKeyValues);
-    if (saveHistoryChat && context->multimodalInput.empty())
-        activePrefixes.try_emplace(&context->pastKeyValues.front().first);
+    if (saveHistoryChat && context->multimodalInput.empty()) {
+        auto &active = activePrefixes[&context->pastKeyValues.front().first];
+        // Unbounded API queues must not pin every slot. Each protected waiter
+        // uses one of the existing per-request checkpoint slots, not full KV.
+        if (activePrefixes.size() <= (size_t)(maxBatch > 0 ? maxBatch : 512))
+            active.queued = std::move(queuedPrefix);
+    }
 }
 
 void NaiveN05FlashModel::OnResponseContextRemoved(ResponseContext *context) {
@@ -119,6 +127,9 @@ NaiveN05FlashModel::PrefixSnapshots NaiveN05FlashModel::BeginPrefixSnapshots(
     std::lock_guard<std::mutex> guard(historyMutex);
     auto active = activePrefixes.find(&key);
     if (!saveHistoryChat || active == activePrefixes.end()) return result;
+    // Admission either restored this checkpoint into active.prefill or fell
+    // back to recomputation. Neither path needs the waiting guard anymore.
+    active->second.queued.reset();
     std::vector<int> boundaries;
     const int last = end / page * page;
     if (length > 1 && last == end && last - page >= past && last > page)
@@ -316,11 +327,13 @@ void NaiveN05FlashModel::TryRecordResponseContext(ResponseContext *context) {
             }
         }
         // A checkpoint is immutable after publication. Repeated calls refresh
-        // its LRU position; an equivalent new checkpoint replaces the old one.
+        // its LRU position. Keep equivalent checkpoints held by live/queued
+        // requests discoverable even if the replacement is later evicted.
         recordTrace.Next("history.dedup_publish");
         prefixHistory.erase(std::remove_if(prefixHistory.begin(), prefixHistory.end(),
             [&](const auto &entry) {
-            return entry == snapshot || (entry->ownerDevice == snapshot->ownerDevice &&
+            return entry == snapshot || (entry.use_count() == 1 &&
+                                         entry->ownerDevice == snapshot->ownerDevice &&
                                          entry->tokenHash == snapshot->tokenHash &&
                                          entry->tokens == snapshot->tokens);
         }), prefixHistory.end());
@@ -399,8 +412,8 @@ int NaiveN05FlashModel::PreviewPagedPrefixCacheExtra(ResponseContext *context, i
     inference_trace::DetailSpan previewTrace("history.preview_lock", detail);
     std::lock_guard<std::mutex> guard(historyMutex);
     previewTrace.Next("history.memo_rebuild");
-    // Do not retain even an SWA checkpoint while waiting for more prompts.
-    // Cache only token equality; residency/generation is checked every pass.
+    // Preview metadata stays weak. Request creation may retain one bounded
+    // SWA checkpoint; full-KV residency/generation is still checked each pass.
     const auto &ownerDevices = context->pastKeyValues.front().first.dataDeviceIds;
     const int ownerDevice = ownerDevices.empty() ? -1 : ownerDevices.front();
     if (!memo.initialized || memo.version != prefixPool->historyVersion || memo.ownerDevice != ownerDevice) {
@@ -555,7 +568,9 @@ bool NaiveN05FlashModel::RestorePagedPrefixCacheExtra(ResponseContext *context, 
     context->intParams["index"] = -1;
     {
         std::lock_guard<std::mutex> guard(historyMutex);
-        self->activePrefixes[&context->pastKeyValues.front().first].prefill = {snapshot};
+        auto &active = self->activePrefixes[&context->pastKeyValues.front().first];
+        active.prefill = {snapshot};
+        active.queued.reset();
     }
     return true;
 #else

@@ -2301,6 +2301,63 @@ class Fixture : public NaiveN05FlashModel {
     }
 #endif
 
+    void PagedCacheRestartChecks(int groups) {
+        ConfigureAttentionParallel(groups);
+        SetIndexerDataType(FP8_E4M3); SetIndexerTPStorage(false, true);
+        maxBatch = 4; max_positions = 4096;
+        SetMaxTokens(32768); SetChunkedPrefillSize(128); WarmUp();
+        GenerationConfig config;
+        config.top_k = 1; config.output_logits = true;
+        config.input_token_length = 2048; config.output_token_limit = 16;
+        auto forward = [&](std::vector<std::pair<Data, Data>> &kv, int length, int past, int salt) {
+            std::vector<float> tokens(length), positions(length), logits;
+            for (int i = 0; i < length; ++i) {
+                tokens[i] = (i + past + salt) * 7 % 251;
+                positions[i] = past + i;
+            }
+            Data input(FLOAT32, {1, length}, tokens), pos(FLOAT32, {1, length}, positions);
+            Forward(input, Data(), pos, kv, config, LastTokensManager(), &logits);
+            return logits;
+        };
+        int checks = 0;
+        for (int previous : {128, 1024, 129}) {
+            std::vector<std::pair<Data, Data>> reused(block_cnt), fresh(block_cnt);
+            forward(reused, previous, 0, 3);
+            std::vector<void *> tables;
+            // ReleasePagedCachePages(..., true) drops each physical reference
+            // once and clears root/local shapes, retaining reusable tables.
+            for (auto &layer : reused) for (Data *root : {&layer.first, &layer.second}) {
+                for (auto &entry : root->multiDeviceDatas) {
+                    Data &local = *entry.second;
+                    if (local.isPagedKVCache) {
+                        local.pagedKVCacheData->ReleasePageIndices(local.pageIndex);
+                        local.pageIndex.clear(); local.lastPageLen = 0;
+                        tables.push_back(local.cudaData);
+                    }
+                    local.dims.clear();
+                }
+                root->pageIndex.clear(); root->lastPageLen = 0; root->dims.clear();
+            }
+            int past = 0;
+            for (int length : {64, 193, 1, 1}) {
+                auto expected = forward(fresh, length, past, 11);
+                auto actual = forward(reused, length, past, 11);
+                if (actual.size() != expected.size()) throw std::runtime_error("re-admission logits shape");
+                RequireCloseLogits(actual.data(), expected, "re-admission cold/warm logits");
+                ++checks; past += length;
+            }
+            size_t table = 0;
+            for (const auto &layer : reused) for (const Data *root : {&layer.first, &layer.second})
+                for (const auto &entry : root->multiDeviceDatas) if (entry.second->isPagedKVCache) {
+                    if (entry.second->cudaData != tables.at(table++) ||
+                        entry.second->dims[1] != past || entry.second->pageIndex.size() != 3)
+                        throw std::runtime_error("re-admission changed table allocation or cache length");
+                }
+        }
+        std::cout << "PAGED CACHE RESTART PASS dp=" << groups << " checks=" << checks
+                  << " relative=" << largestLogitRelative << std::endl;
+    }
+
     void AttentionDPPrefix(int groups, bool draft, bool sparse = false) {
         ConfigureAttentionParallel(groups);
         if (draft) {
@@ -3983,6 +4040,13 @@ int main(int argc, char **argv) {
             }
             std::cout << "ATTENTION DP RING PASS dp=" << groups << " outputs=" << actual.size()
                       << " relative=" << largestLogitRelative << std::endl;
+            return 0;
+        }
+        if (argc > 2 && std::string(argv[2]) == "paged_cache_restart") {
+            SetCudaEmbedding(true); SetCudaGraph(true);
+            Fixture fixture(ranks, false, true, true, true);
+            if (argc > 4 && std::string(argv[4]) == "fp8") fixture.SetKVCacheDataType(FP8_E4M3);
+            fixture.PagedCacheRestartChecks(argc > 3 ? std::stoi(argv[3]) : ranks);
             return 0;
         }
         if (argc > 2 && std::string(argv[2]) == "attention_dp_prefix") {

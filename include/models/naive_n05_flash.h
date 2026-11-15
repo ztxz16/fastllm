@@ -408,6 +408,9 @@ namespace fastllm {
         std::vector<std::vector<std::vector<Data *>>> tpMoeWeights, tpMoeBiases;
         std::vector<std::pair<int, int>> tpVocabRanges;
         struct ActivePrefixes {
+            // One immutable SWA/draft checkpoint for a bounded queued hit.
+            // This never owns full KV pages or request-private GPU storage.
+            std::shared_ptr<PrefixSnapshot> queued;
             PrefixSnapshots prefill;
             std::shared_ptr<PrefixSnapshot> decode;
         };

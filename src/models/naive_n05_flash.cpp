@@ -318,6 +318,10 @@ bool NaiveN05FlashModel::PreparePagedCache(Data &cache, PagedCacheManager &manag
         cache.Resize({1, 0, width});
     }
     AssertInFastLLM(cache.pagedKVCacheData == &manager, "Naive paged KV pool changed.");
+    // Admission rollback releases pages and clears shape while retaining the
+    // table allocation/pool binding. Reinitialize the empty logical cache
+    // before inspecting its length or constructing an Indexer view.
+    if (cache.dims.empty()) cache.Resize({1, 0, width});
     bool changed = !cache.cudaData;
     if (!cache.cudaData) {
         const size_t bytes = (size_t)((capacity + manager.pageLen - 1) / manager.pageLen) * sizeof(int);
