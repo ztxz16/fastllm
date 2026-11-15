@@ -7,7 +7,7 @@ from run_qwen3_shards import encode, decode, save_fixture
 
 
 def fixture(directory, *, dtype="F16", bias=True, normalize=False, experts=5, topk=2,
-            tied=False, indexed=False, hotspot=False):
+            tied=False, indexed=False, hotspot=False, qkv_bias_rounding=False):
     """/** 创建全专家小模型；权重直接按 HF 名称生成，不依赖 C++ 分片计划。 */"""
     config = dict(model_type="qwen2_moe", hidden_size=8, num_hidden_layers=2,
                   num_attention_heads=2, num_key_value_heads=1, head_dim=4,
@@ -47,6 +47,24 @@ def fixture(directory, *, dtype="F16", bias=True, normalize=False, experts=5, to
             add(p + "mlp." + name + ".gate_proj.weight", [width, 8])
             add(p + "mlp." + name + ".up_proj.weight", [width, 8])
             add(p + "mlp." + name + ".down_proj.weight", [8, width])
+
+    if qkv_bias_rounding:
+        if dtype != 'F16' or not bias or tied:
+            raise ValueError('QKV bias rounding fixture requires F16, bias and a separate LM head')
+        # 只保留第一层V投影和O投影，让一次/两次舍入产生可解析的残差差别。
+        for name, tensor in tensors.items():
+            unit = name in ('model.embed_tokens.weight', 'model.norm.weight') or name.endswith('layernorm.weight')
+            value = 1.0 if unit else 0.0
+            tensor['data'] = encode([value]*math.prod(tensor['shape']), dtype)
+        # 单位输入经Norm得到1.0009765625；乘512.5再加(-513)为2^-11，提前转FP16则为0。
+        # O投影放大64倍后，首通道残差分别为1.03125和1；其他层仅保留残差。
+        prefix = 'model.layers.0.'
+        tensors[prefix+'input_layernorm.weight']['data'] = encode([1.0009765625]*8, dtype)
+        tensors[prefix+'self_attn.v_proj.weight']['data'] = encode([512.5 if i % 8 == 0 else 0.0 for i in range(32)], dtype)
+        tensors[prefix+'self_attn.v_proj.bias']['data'] = encode([-513.0]*4, dtype)
+        tensors[prefix+'self_attn.o_proj.weight']['data'] = encode([64.0] + [0.0]*63, dtype)
+        tensors['lm_head.weight']['data'] = encode([4.0] + [0.0]*103, dtype)
+
     directory.mkdir()
     save_fixture(directory, config, tensors, indexed)
     return config, tensors
@@ -99,8 +117,12 @@ def forward(config, tensors, task, input_):
     result = dict(router_logits=[], routing_weights=[], selected_experts=[], routed_output=[], shared_output=[])
     if task["stage"] != 2:
         normalized = [norm(row, weight("input_layernorm.weight"), eps) for row in x]
-        projections = [linear(normalized, weight(f"self_attn.{name}_proj.weight"), bias(f"self_attn.{name}_proj.bias"))
-                       for name in ("q", "k", "v")]
+        # HF Linear的bias在输出FP16转换前相加；Dense参考的旧舍入语义保持独立。
+        projections = []
+        for name in ("q", "k", "v"):
+            values = linear(normalized, weight(f"self_attn.{name}_proj.weight"),
+                            bias(f"self_attn.{name}_proj.bias"), rounded=False)
+            projections.append([[half(value) for value in row] for row in values])
         q, k, v = [[[row[i*d:(i+1)*d] for i in range(len(row)//d)] for row in values] for values in projections]
         for token in range(t):
             for heads in (q, k):

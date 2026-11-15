@@ -27,6 +27,7 @@ SYNTHETIC_FIXTURES = {
     'f16_bias': {}, 'bf16_no_bias': dict(dtype='BF16', bias=False),
     'f32_tied_normalized': dict(dtype='F32', tied=True, normalize=True),
     'zero_experts': dict(experts=3, topk=1), 'hotspot': dict(hotspot=True, topk=1),
+    'qkv_bias_rounding': dict(qkv_bias_rounding=True),
 }
 SYNTHETIC_CASES = {
     f'{name}_ep{world}_graph{int(graph)}_prefix{int(prefix)}': (name, world, graph, prefix)
