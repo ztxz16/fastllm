@@ -3,7 +3,7 @@
   "info": {
     "title": "FastLLM Qwen-Image-2.1",
     "version": "0.1.0",
-    "description": "Native C++/CUDA backend. BF16 activations and weights with FP32 tile accumulation; eligible contraction GEMMs may use BF16 split-K partial sums. Automatic weight residency or stage unloading based on available GPU memory and request shape. Optional Bearer authentication. One GPU worker, queue capacity 4. No remote URL fetching, masks, CFG, or batch n>1."
+    "description": "Native C++/CUDA backend. Quantized formats are experimental; some numerical regression cases exceed validation thresholds. BF16 layer activations; automatically detected BF16, row-scaled E4M3 FP8, ConvRot INT8 or GGUF DiT weights. FP8/INT8 projections dynamically quantize GEMM inputs and return BF16 outputs; GGUF uses native MMQ or bounded CUDA decode with BF16 GEMM; text/vision and VAE remain BF16. BF16 GEMMs use FP32 tile accumulation; eligible contractions may use BF16 split-K partial sums. Automatic weight residency or stage unloading based on available GPU memory and request shape. Optional Bearer authentication. One GPU worker, queue capacity 4. No remote URL fetching, masks, CFG, or batch n>1."
   },
   "servers": [
     {

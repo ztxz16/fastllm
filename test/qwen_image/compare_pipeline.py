@@ -20,7 +20,12 @@ p.add_argument("--reference-resolution", type=int, default=1024)
 p.add_argument("--height", type=int)
 p.add_argument("--steps", type=int, default=4)
 p.add_argument("--precision", choices=["bf16", "fp32"], default="bf16")
+quantized = p.add_mutually_exclusive_group()
+quantized.add_argument("--fp8-checkpoint", help="TorchAO FP8 DiT weights for the reference scaled_mm oracle")
+quantized.add_argument("--quantized-checkpoint", help="Comfy INT8 or GGUF DiT checkpoint for the independent oracle")
 a = p.parse_args()
+if (a.fp8_checkpoint or a.quantized_checkpoint) and (a.precision != "bf16" or a.cpu_offload):
+    p.error("quantized references require --precision bf16 without --cpu-offload")
 assert os.environ.get("CUDA_VISIBLE_DEVICES") and torch.cuda.device_count() == 1
 torch.set_num_threads(8)
 torch.backends.cuda.matmul.allow_tf32 = False
@@ -32,6 +37,12 @@ if a.cpu_offload:
     pipe.enable_model_cpu_offload(gpu_id=0)
 else:
     pipe.to("cuda")
+if a.fp8_checkpoint:
+    from fp8_reference import install_fp8
+    print("FP8 reference projections:", install_fp8(pipe.transformer, a.fp8_checkpoint), flush=True)
+if a.quantized_checkpoint:
+    from quantized_reference import install_quantized
+    print("Quantized reference projections:", install_quantized(pipe.transformer, a.quantized_checkpoint), flush=True)
 latent = np.fromfile(root / "initial_latent.f32", np.float32).reshape(1, -1, 64)
 metrics = {}
 

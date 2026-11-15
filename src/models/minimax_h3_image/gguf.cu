@@ -119,6 +119,15 @@ class GgufWeights final : public QuantizedWeights {
     cublasHandle_t handle_ = nullptr;
     Tensor workspace_;
     int device_ = -1;
+    void bindDevice() {
+        int device = 0;
+        check(cudaGetDevice(&device));
+        require(device_ < 0 || device == device_, "GGUF backend used on a different device");
+        if (device_ < 0) {
+            validateGgufDevice(device);
+            device_ = device;
+        }
+    }
     Weight &get(const std::string &name) {
         auto found = weights_.find(name);
         if (found != weights_.end())
@@ -159,6 +168,32 @@ class GgufWeights final : public QuantizedWeights {
         return weights_.emplace(name, std::move(w)).first->second;
     }
 
+    void decodedLinear(const Tensor &x, const Weight &w, Tensor &out, int firstColumn) {
+        if (!handle_) {
+            check(cublasCreate(&handle_));
+            check(cublasSetStream(handle_, cudaStreamPerThread));
+            check(cublasSetMathMode(handle_, CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION));
+        }
+        if (!workspace_.data) {
+            workspace_ = Tensor(1, (4 << 20) / 2);
+            check(cublasSetWorkspace(handle_, workspace_.data, workspace_.bytes()));
+        }
+        // Keep the decode buffer bounded for all model widths.
+        constexpr int chunk = 2048;
+        for (int row = 0; row < w.rows; row += chunk) {
+            const int n = std::min(chunk, w.rows - row);
+            Tensor decoded(n, w.cols);
+            dequantize(reinterpret_cast<const uint8_t *>(w.packed.data) + size_t(row) * w.rowBytes, decoded,
+                       w.type);
+            float one = 1, zero = 0;
+            check(cublasGemmEx(handle_, CUBLAS_OP_T, CUBLAS_OP_N, n, x.rows, x.cols, &one, decoded.data,
+                               CUDA_R_16BF, w.cols, x.data, CUDA_R_16BF, x.cols, &zero,
+                               reinterpret_cast<char *>(out.data)+size_t(firstColumn+row)*(out.isFloat32()?4:2),
+                               out.isFloat32()?CUDA_R_32F:CUDA_R_16BF, out.cols,
+                               CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        }
+    }
+
   public:
     GgufWeights(const std::string &path, const ProjectionOptions &options)
         : QuantizedWeights(WeightFormat::GGUF), checkpoint_(path), options_(options) {}
@@ -175,13 +210,7 @@ class GgufWeights final : public QuantizedWeights {
         else checkpoint_.validateModel();
     }
     Tensor linear(const Tensor &x, const std::string &name, Tensor *destination) override {
-        int device = 0;
-        check(cudaGetDevice(&device));
-        require(device_ < 0 || device == device_, "GGUF backend used on a different device");
-        if (device_ < 0) {
-            device_ = device;
-            validateGgufDevice(device);
-        }
+        bindDevice();
         auto &w = get(name);
         require(x.data && x.rows > 0 && x.dtype == DType::BF16 && x.cols == w.cols, "GGUF input shape/dtype");
         Tensor out = destination ? *destination : Tensor(x.rows, w.rows);
@@ -193,30 +222,46 @@ class GgufWeights final : public QuantizedWeights {
         if (ggufMmq(x, w.packed, out, w.type))
             return out;
 #endif
-        if (!handle_) {
-            check(cublasCreate(&handle_));
-            check(cublasSetStream(handle_, cudaStreamPerThread));
-            check(cublasSetMathMode(handle_, CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION));
+        decodedLinear(x, w, out, 0);
+        return out;
+    }
+    Tensor linearPacked(const Tensor &x, const std::vector<std::string> &names, Tensor *destination) override {
+        require(!names.empty() && options_.size == 1, "invalid direct GGUF projection list");
+        if (names.size() == 1)
+            return linear(x, names.front(), destination);
+        bindDevice();
+        require(x.data && x.rows > 0 && x.dtype == DType::BF16, "GGUF packed input shape/dtype");
+        int columns = 0;
+        for (const auto &name : names) {
+            const auto &w = get(name);
+            require(w.cols == x.cols && w.rows <= INT_MAX - columns, "inconsistent GGUF packed projection");
+            columns += w.rows;
         }
-        if (!workspace_.data) {
-            workspace_ = Tensor(1, (4 << 20) / 2);
-            check(cublasSetWorkspace(handle_, workspace_.data, workspace_.bytes()));
-        }
-        // At most 56 MiB for H3's widest projection. Keep compressed weights
-        // resident, and reuse a bounded decode buffer even under a GPU budget.
-        for (int row = 0; row < w.rows; row += 2048) {
-            const int n = std::min(2048, w.rows - row);
-            Tensor decoded(n, w.cols);
-            dequantize(reinterpret_cast<const uint8_t *>(w.packed.data) + size_t(row) * w.rowBytes, decoded,
-                       w.type);
-            float one = 1, zero = 0;
-            check(cublasGemmEx(handle_, CUBLAS_OP_T, CUBLAS_OP_N, n, x.rows, x.cols, &one, decoded.data,
-                               CUDA_R_16BF, w.cols, x.data, CUDA_R_16BF, x.cols, &zero,
-                               reinterpret_cast<char *>(out.data)+size_t(row)*(out.isFloat32()?4:2),
-                               out.isFloat32()?CUDA_R_32F:CUDA_R_16BF, out.cols,
-                               CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        Tensor out = destination ? *destination : Tensor(x.rows, columns);
+        require(out.data && out.rows == x.rows && out.cols == columns &&
+                    (out.dtype == DType::BF16 || out.dtype == DType::FP32) && out.storage != x.storage,
+                "GGUF packed destination shape/alias");
+        const size_t element = out.isFloat32() ? 4 : 2;
+        int offset = 0;
+        // Mixed-bit checkpoints may use different GGML types for Q/K/V.
+        // Keep each original block format and concatenate only the outputs.
+        for (const auto &name : names) {
+            const auto &w = get(name);
+            require(out.storage != w.packed.storage, "GGUF packed output/weight alias");
+            Tensor part(x.rows, w.rows, out.dtype);
+            linear(x, name, &part);
+            check(cudaMemcpy2DAsync(reinterpret_cast<char *>(out.data) + size_t(offset)*element,
+                size_t(columns)*element, part.data, size_t(part.cols)*element,
+                size_t(part.cols)*element, x.rows, cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+            offset += w.rows;
         }
         return out;
+    }
+    size_t loadedBytes() const override {
+        size_t bytes = workspace_.bytes();
+        for (const auto &entry : weights_)
+            bytes += entry.second.packed.bytes();
+        return bytes;
     }
     void erasePrefix(const std::string &prefix) override {
         for (auto it = weights_.begin(); it != weights_.end();)

@@ -41,7 +41,12 @@ void require(bool x, const std::string &message) {
     if (!x)
         throw std::runtime_error(message);
 }
-__global__ void quantize(const B *x, uint8_t *q, float *scales, int rows, int cols) {
+__device__ __forceinline__ float activationScale(float largest, bool bf16Scale) {
+    // TorchAO rounds amax / 448 in BF16; H3 retains its FP32-scale policy.
+    return bf16Scale ? float(B(fmaxf(largest, float(B(1e-12f))) / 448.f))
+                     : fmaxf(largest / 448.f, 1e-12f);
+}
+__global__ void quantize(const B *x, uint8_t *q, float *scales, int rows, int cols, bool bf16Scale) {
     int row = blockIdx.x;
     float largest = 0;
     for (int c = threadIdx.x; c < cols; c += blockDim.x)
@@ -56,7 +61,7 @@ __global__ void quantize(const B *x, uint8_t *q, float *scales, int rows, int co
     for (int mask = 16; mask; mask /= 2)
         largest = fmaxf(largest, __shfl_xor_sync(0xffffffff, largest, mask));
     if (threadIdx.x == 0)
-        maxima[0] = fmaxf(largest / 448.f, 1e-12f);
+        maxima[0] = activationScale(largest, bf16Scale);
     __syncthreads();
     float scale = maxima[0];
     if (threadIdx.x == 0)
@@ -68,7 +73,7 @@ __global__ void quantize(const B *x, uint8_t *q, float *scales, int rows, int co
 }
 // Keep each row's input in registers across the reduction. Aligned vector
 // loads and paired FP8 conversions avoid the scalar kernel's second read.
-template <int Cols> __global__ void quantizeVector(const B *x, uint8_t *q, float *scales, int rows) {
+template <int Cols> __global__ void quantizeVector(const B *x, uint8_t *q, float *scales, int rows, bool bf16Scale) {
     constexpr int chunks = (Cols + 2047) / 2048;
     const int row = blockIdx.x;
     uint4 values[chunks];
@@ -94,7 +99,7 @@ template <int Cols> __global__ void quantizeVector(const B *x, uint8_t *q, float
     for (int mask = 16; mask; mask /= 2)
         largest = fmaxf(largest, __shfl_xor_sync(0xffffffff, largest, mask));
     if (threadIdx.x == 0)
-        maxima[0] = fmaxf(largest / 448.f, 1e-12f);
+        maxima[0] = activationScale(largest, bf16Scale);
     __syncthreads();
     const float scale = maxima[0], inverse = 1.f / scale;
     if (threadIdx.x == 0)
@@ -186,13 +191,15 @@ struct Fp8Weights::Impl : detail::QuantizedCheckpoint {
         if (handle)
             cublasLtDestroy(handle);
     }
-    Weight &get(const std::string &name) {
+    Weight &get(const std::string &name, const std::vector<std::string> *direct = nullptr) {
         auto found = weights.find(name);
         if (found != weights.end())
             return found->second;
         std::vector<std::string> keys;
-        bool qkv = name.find(".qkv_proj") != std::string::npos;
-        if (unsloth) {
+        bool qkv = !direct && name.find(".qkv_proj") != std::string::npos;
+        if (direct)
+            keys = *direct;
+        else if (unsloth) {
             auto dot = name.find('.', 7);
             require(dot != std::string::npos, "invalid FP8 layer name");
             auto prefix = "transformer_blocks." + name.substr(7, dot - 7);
@@ -212,7 +219,8 @@ struct Fp8Weights::Impl : detail::QuantizedCheckpoint {
         std::vector<json11::Json> matrices;
         std::vector<float> scales;
         for (auto &key : keys) {
-            auto matrix = descriptor(key + (unsloth ? "._weight_qdata" : ".weight"), "F8_E4M3");
+            bool rowScaled = direct ? header[key + "._weight_qdata"].is_object() : unsloth;
+            auto matrix = descriptor(key + (rowScaled ? "._weight_qdata" : ".weight"), "F8_E4M3");
             auto shape = matrix["shape"].array_items();
             require(shape.size() == 2 && shape[0].int_value() > 0 && shape[1].int_value() > 0,
                     "FP8 matrix shape");
@@ -221,12 +229,12 @@ struct Fp8Weights::Impl : detail::QuantizedCheckpoint {
             w.cols = cols;
             w.rows += rows;
             matrices.push_back(matrix);
-            auto sd = descriptor(key + (unsloth ? "._weight_scale" : ".weight_scale"), "F32");
-            std::vector<float> part(unsloth ? rows : 1);
+            auto sd = descriptor(key + (rowScaled ? "._weight_scale" : ".weight_scale"), "F32");
+            std::vector<float> part(rowScaled ? rows : 1);
             read(sd, part.data(), part.size() * 4);
             for (float v : part)
                 require(std::isfinite(v) && v > 0, "invalid FP8 weight scale");
-            if (!unsloth)
+            if (!rowScaled)
                 part.resize(rows, part[0]);
             scales.insert(scales.end(), part.begin(), part.end());
         }
@@ -241,7 +249,7 @@ struct Fp8Weights::Impl : detail::QuantizedCheckpoint {
         uploadByteMatrices(matrices, w.bytes.data, slice, interleavedQkv);
         // Diffusers stores [value, gate]; the original H3 uses [gate, value].
         // Apply the identical row permutation to both payload and per-row scales.
-        if (unsloth && name.find(".fc1") != std::string::npos) {
+        if (!direct && unsloth && name.find(".fc1") != std::string::npos) {
             Tensor ordered(w.rows, w.cols / 2);
             size_t half = w.bytes.bytes() / 2;
             ck(cudaMemcpyAsync(ordered.data, reinterpret_cast<char *>(w.bytes.data) + half, half,
@@ -265,7 +273,8 @@ struct Fp8Weights::Impl : detail::QuantizedCheckpoint {
         ck(cudaStreamSynchronize(cudaStreamPerThread));
         return weights.emplace(name, std::move(w)).first->second;
     }
-    Tensor run(const Tensor &x, const std::string &name, Tensor *destination) {
+    Tensor run(const Tensor &x, const std::string &name, Tensor *destination,
+               const std::vector<std::string> *direct = nullptr) {
         if (device < 0) {
             ck(cudaGetDevice(&device));
             cudaDeviceProp properties{};
@@ -282,7 +291,7 @@ struct Fp8Weights::Impl : detail::QuantizedCheckpoint {
             ck(cudaMemcpyAsync(one.data, &value, 4, cudaMemcpyHostToDevice, cudaStreamPerThread));
             ck(cudaStreamSynchronize(cudaStreamPerThread));
         }
-        auto &w = get(name);
+        auto &w = get(name, direct);
         require(x.dtype == DType::BF16 && x.cols == w.cols, "FP8 input dtype/shape");
         int padded = (x.rows + 15) / 16 * 16;
         Tensor q(padded, x.cols / 2), scale(1, padded, true);
@@ -291,14 +300,18 @@ struct Fp8Weights::Impl : detail::QuantizedCheckpoint {
         auto *input = reinterpret_cast<const B *>(x.data);
         auto *quantized = reinterpret_cast<uint8_t *>(q.data);
         auto *scales = reinterpret_cast<float *>(scale.data);
-        if (x.cols == 5376)
-            quantizeVector<5376><<<padded, 256, 0, cudaStreamPerThread>>>(input, quantized, scales, x.rows);
+        if (x.cols == 4096)
+            quantizeVector<4096><<<padded, 256, 0, cudaStreamPerThread>>>(input, quantized, scales, x.rows, direct != nullptr);
+        else if (x.cols == 12288)
+            quantizeVector<12288><<<padded, 256, 0, cudaStreamPerThread>>>(input, quantized, scales, x.rows, direct != nullptr);
+        else if (x.cols == 5376)
+            quantizeVector<5376><<<padded, 256, 0, cudaStreamPerThread>>>(input, quantized, scales, x.rows, direct != nullptr);
         else if (x.cols == 7168)
-            quantizeVector<7168><<<padded, 256, 0, cudaStreamPerThread>>>(input, quantized, scales, x.rows);
+            quantizeVector<7168><<<padded, 256, 0, cudaStreamPerThread>>>(input, quantized, scales, x.rows, direct != nullptr);
         else if (x.cols == 14336)
-            quantizeVector<14336><<<padded, 256, 0, cudaStreamPerThread>>>(input, quantized, scales, x.rows);
+            quantizeVector<14336><<<padded, 256, 0, cudaStreamPerThread>>>(input, quantized, scales, x.rows, direct != nullptr);
         else
-            quantize<<<padded, 256, 0, cudaStreamPerThread>>>(input, quantized, scales, x.rows, x.cols);
+            quantize<<<padded, 256, 0, cudaStreamPerThread>>>(input, quantized, scales, x.rows, x.cols, direct != nullptr);
         ck(cudaGetLastError());
 #ifdef FASTLLM_IMAGE_FP8_SM120
         if (scaledSm120) {
@@ -406,6 +419,19 @@ void Fp8Weights::validateModel() const {
 Tensor Fp8Weights::linear(const Tensor &x, const std::string &name, Tensor *output) {
     return impl_->run(x, name, output);
 }
+Tensor Fp8Weights::linearPacked(const Tensor &x, const std::vector<std::string> &prefixes, Tensor *output) {
+    require(!prefixes.empty(), "empty FP8 projection list");
+    std::string key = "packed:";
+    for (const auto &prefix : prefixes)
+        key += std::to_string(prefix.size()) + ":" + prefix;
+    return impl_->run(x, key, output, &prefixes);
+}
+size_t Fp8Weights::loadedBytes() const {
+    size_t bytes = impl_->workspace.bytes() + impl_->one.bytes();
+    for (const auto &entry : impl_->weights)
+        bytes += entry.second.bytes.bytes() + entry.second.scales.bytes();
+    return bytes;
+}
 void Fp8Weights::erasePrefix(const std::string &prefix) {
     for (auto i = impl_->weights.begin(); i != impl_->weights.end();)
         if (i->first.compare(0, prefix.size(), prefix) == 0)
@@ -442,5 +468,8 @@ minimax_h3::Tensor Fp8Weights::linear(const minimax_h3::Tensor &, const std::str
 }
 void Fp8Weights::erasePrefix(const std::string &) {}
 void Fp8Weights::clear() {}
+minimax_h3::Tensor Fp8Weights::linearPacked(const minimax_h3::Tensor &, const std::vector<std::string> &,
+                                          minimax_h3::Tensor *) { unavailable(); return {}; }
+size_t Fp8Weights::loadedBytes() const { return 0; }
 } // namespace fastllm::minimax_h3_image
 #endif

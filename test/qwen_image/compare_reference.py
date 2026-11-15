@@ -21,7 +21,13 @@ p.add_argument("--library", required=True)
 p.add_argument("--stage", choices=["text", "dit", "vae", "all"], default="all")
 p.add_argument("--output", default="qwen-image-accuracy")
 p.add_argument("--precision", choices=["bf16", "fp32"], default="bf16")
+p.add_argument("--native-model", help="Native model directory when different from the reference base")
+quantized = p.add_mutually_exclusive_group()
+quantized.add_argument("--fp8-checkpoint", help="TorchAO FP8 DiT weights for the reference scaled_mm oracle")
+quantized.add_argument("--quantized-checkpoint", help="Comfy INT8 or GGUF DiT checkpoint for the independent oracle")
 args = p.parse_args()
+if (args.fp8_checkpoint or args.quantized_checkpoint) and args.precision != "bf16":
+    p.error("quantized references require --precision bf16")
 assert os.environ.get("CUDA_VISIBLE_DEVICES"), "Explicit GPU selection is required"
 assert torch.cuda.device_count() == 1, "Expose only the permitted GPU"
 out = Path(args.output)
@@ -41,7 +47,7 @@ lib.fastllm_qwen_image_tokenize.argtypes = [C.c_void_p, C.c_char_p, C.POINTER(C.
 lib.fastllm_qwen_image_text.argtypes = [C.c_void_p, C.POINTER(C.c_int), C.c_int, ptr]
 lib.fastllm_qwen_image_dit.argtypes = [C.c_void_p, ptr, ptr, C.c_int, C.c_int, C.c_int, C.c_float, ptr]
 lib.fastllm_qwen_image_vae.argtypes = [C.c_void_p, ptr, C.c_int, C.c_int, ptr]
-handle = lib.fastllm_qwen_image_create(args.model.encode(), 0, int(args.precision == "fp32"))
+handle = lib.fastllm_qwen_image_create((args.native_model or args.model).encode(), 0, int(args.precision == "fp32"))
 if not handle:
     raise RuntimeError(lib.fastllm_qwen_image_error().decode())
 
@@ -146,6 +152,12 @@ try:
             .eval()
             .cuda()
         )
+        if args.fp8_checkpoint:
+            from fp8_reference import install_fp8
+            report["fp8_projections"] = install_fp8(model, args.fp8_checkpoint)
+        if args.quantized_checkpoint:
+            from quantized_reference import install_quantized
+            report["quantized_projections"] = install_quantized(model, args.quantized_checkpoint)
         h, w, nt = 8, 8, 12
         latent = torch.randn(1, h * w, 64, dtype=dtype, device="cuda")
         features = torch.randn(1, nt, 4096, dtype=dtype, device="cuda")

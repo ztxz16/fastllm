@@ -2,7 +2,7 @@
 
 支持文生图、单张/多张参考图编辑、RGBA PNG、前缀 KV cache、同步 Images API 和带进度/取消的异步任务。推理与 HTTP 服务均为 C++，不调用 Python、PyTorch、Diffusers 或 Triton。
 
-默认使用 BF16 激活与权重，矩阵乘在块内使用 FP32 累加，大尺寸降维投影允许 BF16 split-K 部分和；归一化归约仍为 FP32。权重直接读取发布的 safetensors，无需转换。每次请求根据空闲显存、输出尺寸和参考图数量估算空间：充足时常驻权重并复用完整 KV 缓冲，不足时按文本编码、DiT、VAE 阶段加载/释放，保留较小的前缀缓存。HTTP 和命令行自动选择，无需精度或显存策略参数。推理仍是纯 C++ / CUDA，不依赖 Torch、Diffusers 或 Python。
+默认使用 BF16 激活，自动识别 BF16、逐行缩放的 E4M3 FP8、ConvRot INT8 或 GGUF DiT 权重。BF16 矩阵乘在块内使用 FP32 累加，大尺寸降维投影允许 BF16 split-K 部分和；归一化归约仍为 FP32。FP8 投影在 GEMM 前动态逐行量化输入，行缩放值按 TorchAO 的 BF16 舍入边界计算，输出恢复 BF16；文本/视觉编码器与 VAE 保持 BF16。权重直接读取发布的 safetensors / GGUF，无需转换。每次请求根据空闲显存、输出尺寸和参考图数量估算空间：充足时常驻权重并复用完整 KV 缓冲，不足时按文本编码、DiT、VAE 阶段加载/释放，保留较小的前缀缓存。HTTP 和命令行自动选择，无需精度或显存策略参数。
 
 常驻只复用模型权重；提示词、参考图和噪声仍逐请求计算。KV、RoPE 和临时张量在请求结束释放；取消或异常同时卸载权重，下一请求重新评估。临时张量在请求内通过有界显存池复用。常驻速度需要预热，不应将热启动耗时当作包含首次权重加载的耗时。
 
@@ -20,6 +20,28 @@ cmake --build build-qwen-image --target qwen_image_server qwen_image_generate -j
 CUDA 13 的 `120f` 架构需要较新的 CMake。只构建指定目标，无需构建整个 LLM 后端。
 
 模型目录应包含 `transformer/`、`text_encoder/`、`vae/`、`processor/`、`scheduler/`，其中分片索引及所有 safetensors 必须完整。
+
+### FP8 权重
+
+FP8 当前为实验支持：40 步文生图、单图和双图回归通过；随机输入 DiT 分项、双图 4 步仍超出原精度检查线，详见 [验证记录](VALIDATION.md#fp8-接入2026-11-15)。未放宽阈值，也不保证任意提示词或步数的误差上界。
+
+已接入 [Unsloth Qwen-Image-2.1-FP8](https://huggingface.co/unsloth/Qwen-Image-2.1-FP8) 的 `Qwen-Image-2.1-FP8.safetensors`（约 7.12GB，DiT）。创建独立模型目录，在 `transformer/` 保留原模型的 `config.json`，将该文件放置或软链接为 `diffusion_pytorch_model.safetensors`；其余组件目录和 `model_index.json` 可软链接至原 BF16 模型。原 BF16 目录无需修改。
+
+`--model` 指向这个新目录即可；命令行、API、工作室共用同一加载路径，不增加量化参数。通过张量 dtype、逐行 scale 和 TorchAO metadata 判断格式，不依赖模型目录名。支持该发布文件的单文件 E4M3 `._weight_qdata` / `._weight_scale`，其 metadata 指定 `TORCH` 行量化、`hp_value_lb=1e-12`；分片 FP8、blockwise FP8、E5M2 和 FP8 文本编码器不在本次支持范围内。融合 QKV 或 gate/up 内的投影须采用一致格式；不兼容格式明确报错。
+
+FP8 需要支持 FP8 Tensor Core 的 SM89+ GPU；SM120 使用复用自 H3 的 CUTLASS GEMM，其他支持架构使用 cuBLASLt 回退。FP8 权重同样计入自动显存策略，支持常驻、按阶段卸载及取消后释放。部署不需要 TorchAO 或 PyTorch。
+
+### INT8 与 GGUF 权重
+
+支持 [Comfy-Org 的 INT8 ConvRot DiT](https://huggingface.co/Comfy-Org/Qwen-Image-2.1/tree/main/diffusion_models)（`qwen_image_2.1_int8_convrot.safetensors`，约 7.26GB），以及 [Unsloth GGUF](https://huggingface.co/unsloth/Qwen-Image-2.1-GGUF)；实测文件为 `qwen-image-2.1-Q4_K_M.gguf`（约 4.20GB）。均为原版 2.1，不是 Turbo。INT8 / GGUF 当前均为实验支持：两者的 DiT 分项及部分多图用例超过既有相对 L2 检查线，详见验证记录。
+
+与 FP8 一样创建独立模型目录，保留原 BF16 的 `transformer/config.json`、文本/视觉编码器、VAE、processor、scheduler 和 `model_index.json`。INT8 文件放置或软链接为 `transformer/diffusion_pytorch_model.safetensors`；GGUF 文件直接放在 `transformer/`，该目录只保留一个 GGUF 文件，不放另一份 safetensors DiT。`--model` 仍选择模型根目录，API 和工作室不增加量化参数，原 BF16 / FP8 目录无需更改。
+
+- INT8 由 I8 payload、逐输出行 F32 scale 和 `comfy_quant` 的 H256 ConvRot 标记识别。原生 CUDA 旋转与动态逐行量化激活，执行 W8A8 整数 GEMM，输出 BF16；直接支持发布权重的合并 `gate_up`。要求 SM80+；未接入无旋转、非对称、分组 scale 或 INT8 文本编码器。
+- GGUF 按文件魔数和张量块类型读取，支持 F32/F16/BF16、Q4_0、Q8_0、Q2_K、Q3_K、Q4_K、Q5_K、Q6_K，允许同一层混合位宽。兼容无前缀和 `model.diffusion_model.` 前缀、合并或分开的 gate/up。要求 SM80+。小 token GEMM 复用 H3 的 MMQ；大 token 或不适用的形状使用有界 CUDA 解量化与 BF16 GEMM，权重始终以原块格式保存，不做二次量化。默认 MMQ 自动范围为 8..512 个 token；更大尺寸使用有界解量化回退，无需开关。
+- 两种格式均计入常驻显存统计，支持阶段卸载、取消清理及恢复；不要求安装 Torch、GGUF Python 包或额外转换工具。Python 参考仅供开发验证。
+
+量化质量与实现误差的实测范围见 [验证记录](VALIDATION.md)；量化文件更小不保证更快。尚未接入 Qwen 多卡。
 
 ## 启动与单卡隔离
 
@@ -78,7 +100,7 @@ GPU 由一个工作线程串行执行。运行中加排队总数最多 4，超�
 - 参考分辨率 256..1024，须为 32 的倍数，默认 1024。按原图长宽比调整到该面积；调整后须至少 65536 像素，极端比例或小面积会明确报错。
 - HTTP 请求最多 20MiB，参考图总计最多 1600 万像素。PNG 接收 8-bit、非 interlace 的灰度、RGB、调色板、灰度 alpha、RGBA；其他格式可用 demo 转换。
 - 暂未实现 mask inpainting、负面提示/CFG、LoRA、远程 URL 输入、视频生成。未知参数返回 400，避免静默忽略。
-- 默认 BF16；C++ Runtime / Pipeline 的 `fp32=true` 构造参数保留给数值回归。尚未接入量化或多卡。
+- 默认 BF16 激活，支持 BF16 / 上述 FP8 / INT8 / GGUF DiT 权重；C++ Runtime / Pipeline 的 `fp32=true` 构造参数保留给 BF16 权重的数值回归，量化权重不支持此参数。尚未接入多卡。
 - 相同参数/种子在本原生后端可复现，但随机数生成器与 PyTorch 不同。跨实现精度比较必须共享初始噪声，不能只共享 seed。
 
 ## 算子复用
@@ -114,4 +136,34 @@ python test/qwen_image/test_image_codec.py /tmp/image_codec
 python test/qwen_image/test_http.py --url http://127.0.0.1:8008 --image /path/to/reference.png
 ```
 
+FP8 单元测试和独立数值参考：
+
+```bash
+cmake --build build-qwen-image --target qwen_image_fp8_test qwen_image_reference -j4
+ctest --test-dir build-qwen-image -R '^qwen_image_fp8$' --output-on-failure
+python test/qwen_image/compare_reference.py --model /path/to/original-bf16 \
+  --native-model /path/to/fp8-model \
+  --fp8-checkpoint /path/to/fp8-model/transformer/diffusion_pytorch_model.safetensors \
+  --library build-qwen-image/libqwen_image_reference.so --stage all --precision bf16
+# 对 FP8 原生 trace 的完整流程比较也使用原 BF16 目录和同一 FP8 DiT 文件：
+python test/qwen_image/compare_pipeline.py --model /path/to/original-bf16 \
+  --fp8-checkpoint /path/to/fp8-model/transformer/diffusion_pytorch_model.safetensors \
+  --trace /tmp/fp8-trace --precision bf16
+```
+
+FP8 参考仅在测试侧用 PyTorch `scaled_mm` 替换官方 DiT 的量化投影，其余层沿用官方实现；需要支持该算子的 PyTorch/GPU，并在参数中保持 prompt、尺寸、步数和参考图与 trace 一致。FP8 参考暂不支持 `--cpu-offload`。
+
 `--trace` 只在命令行显式指定时保存验证所需的 prompt、条件和每步 latent；HTTP 服务不写调试张量，也不引入 Qwen 专属环境变量。验证记录见 [VALIDATION.md](VALIDATION.md)。
+
+INT8 / GGUF 单元与数值检查：
+
+```bash
+cmake --build build-qwen-image --target qwen_image_quantized_test qwen_image_reference -j4
+ctest --test-dir build-qwen-image -R '^qwen_image_(fp8|quantized)$' --output-on-failure
+python test/qwen_image/compare_reference.py --model /path/to/original-bf16 \
+  --native-model /path/to/quantized-model \
+  --quantized-checkpoint /path/to/quantized-model/transformer/checkpoint.gguf \
+  --library build-qwen-image/libqwen_image_reference.so --stage all --precision bf16
+```
+
+`--quantized-checkpoint` 也接收 Comfy INT8 safetensors，`compare_pipeline.py` 支持同一参数。INT8 参考以独立稠密 Hadamard 和 PyTorch 整数 GEMM 计算；GGUF 参考由 gguf-py 解码同一份权重并用 BF16 GEMM 计算，因此比较包含原生 MMQ 的激活量化误差。以上参数均只属于测试脚本，不属于部署 API。

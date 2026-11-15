@@ -22,6 +22,7 @@ class GgufCheckpoint {
     explicit GgufCheckpoint(const std::string &path);
     const GgufTensor &tensor(const std::string &name) const;
     void read(const GgufTensor &, uint64_t offset, void *out, size_t bytes);
+    const std::map<std::string, GgufTensor> &tensors() const { return tensors_; }
     void validateModel() const;
     void validateVideoModel() const;
 

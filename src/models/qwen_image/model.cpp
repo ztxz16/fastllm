@@ -1,4 +1,5 @@
 #include "models/qwen_image/runtime.h"
+#include "quantized.h"
 #include <array>
 #include <cmath>
 #include <filesystem>
@@ -11,6 +12,15 @@ std::string componentWeights(const std::string &dir) {
     for (const char *name : {"diffusion_pytorch_model.safetensors", "model.safetensors"})
         if (std::filesystem::is_regular_file(dir + "/" + name))
             return dir + "/" + name;
+    if (std::filesystem::is_directory(dir)) {
+        std::string gguf;
+        for (const auto &entry : std::filesystem::directory_iterator(dir))
+            if (entry.is_regular_file() && entry.path().extension() == ".gguf") {
+                if (!gguf.empty()) throw std::invalid_argument("multiple GGUF files in component directory");
+                gguf = entry.path().string();
+            }
+        if (!gguf.empty()) return gguf;
+    }
     return dir;
 }
 TextEncoder::TextEncoder(Runtime &rt, const std::string &dir)
@@ -95,24 +105,51 @@ Tensor TextEncoder::encode(const std::vector<int> &tokens, const std::vector<Ima
     // The diffusion checkpoint consumes the final decoder residual, before norm.
     return x;
 }
-DiT::DiT(Runtime &rt, const std::string &dir) : rt_(rt), weights_(rt, componentWeights(dir)) {}
+DiT::DiT(Runtime &rt, const std::string &dir) : rt_(rt) {
+    const auto checkpoint = componentWeights(dir);
+    quantized_ = QuantizedProjections::load(rt, checkpoint);
+    if (!quantized_ || !quantized_->isGguf())
+        weights_ = std::make_unique<Weights>(rt, checkpoint);
+}
+DiT::~DiT() = default;
+const Tensor &DiT::weight(const std::string &name) {
+    return weights_ ? weights_->get(name) : quantized_->get(name);
+}
+Tensor DiT::linear(const Tensor &x, const std::string &prefix, Tensor *output) {
+    if (quantized_ && quantized_->contains(prefix))
+        return quantized_->linear(x, {prefix}, output);
+    return weights_->linear(x, prefix, false, output);
+}
 void DiT::unload() {
+    if (quantized_)
+        quantized_->clear();
     projections_.clear();
-    weights_.clear();
+    if (weights_) weights_->clear();
 }
 size_t DiT::loadedBytes() const {
-    size_t bytes = weights_.loadedBytes();
+    size_t bytes = (weights_ ? weights_->loadedBytes() : 0) + (quantized_ ? quantized_->loadedBytes() : 0);
     for (const auto &entry : projections_)
         bytes += entry.second.weight.bytes() + entry.second.bias.bytes();
     return bytes;
 }
 Tensor DiT::packedLinear(const Tensor &x, const std::vector<std::string> &prefixes) {
+    if (quantized_ && prefixes.size() == 2) {
+        const auto suffix = std::string("gate_layer");
+        const auto &first = prefixes.front();
+        if (first.size() > suffix.size() && first.substr(first.size() - suffix.size()) == suffix) {
+            const auto stem = first.substr(0, first.size() - suffix.size());
+            if (prefixes[1] == stem + "proj" && quantized_->contains(stem + "gate_up"))
+                return quantized_->linear(x, {stem + "gate_up"});
+        }
+    }
+    if (quantized_ && quantized_->contains(prefixes.front()))
+        return quantized_->linear(x, prefixes);
     auto &projection = projections_[prefixes.front()];
     if (!projection.weight.rows) {
         std::vector<Tensor> weights, biases;
         for (const auto &prefix : prefixes) {
-            weights.push_back(weights_.get(prefix + ".weight"));
-            if (auto bias = weights_.optional(prefix + ".bias"))
+            weights.push_back(weight(prefix + ".weight"));
+            if (auto bias = weights_->optional(prefix + ".bias"))
                 biases.push_back(*bias);
         }
         if (!biases.empty() && biases.size() != weights.size())
@@ -121,7 +158,7 @@ Tensor DiT::packedLinear(const Tensor &x, const std::vector<std::string> &prefix
         if (!biases.empty())
             projection.bias = rt_.concat(biases);
         for (const auto &prefix : prefixes)
-            weights_.erasePrefix(prefix + ".");
+            weights_->erasePrefix(prefix + ".");
     }
     return rt_.linear(x, projection.weight, projection.bias.rows ? &projection.bias : nullptr);
 }
@@ -135,13 +172,17 @@ Tensor DiT::forward(const Tensor &latents, const Condition &cond, float timestep
     bool cached = cache && !cache->keys.empty();
     if (cached && (cache->keys.size() != 32 || cache->values.size() != 32))
         throw std::invalid_argument("invalid prefix cache");
-    auto image = weights_.linear(!cached && cond.latents.rows ? rt_.concat({cond.latents, latents}) : latents,
-                                 "img_in");
+    // Prefix errors persist in every denoising step. Expand GGUF MMQ only
+    // after this request's conditioning cache has been built.
+    if (quantized_)
+        quantized_->setPrefill(!cached);
+    auto image = linear(!cached && cond.latents.rows ? rt_.concat({cond.latents, latents}) : latents,
+                        "img_in");
     Tensor text;
     if (!cached) {
-        text = rt_.specialNorm(cond.features, weights_.get("txt_in.text_norm.weight"), 0);
-        text = weights_.linear(rt_.activation(weights_.linear(text, "txt_in.in_layer"), true),
-                               "txt_in.out_layer");
+        text = rt_.specialNorm(cond.features, weight("txt_in.text_norm.weight"), 0);
+        text = linear(rt_.activation(linear(text, "txt_in.in_layer"), true),
+                      "txt_in.out_layer");
     }
     struct Segment {
         int start, end;
@@ -203,10 +244,10 @@ Tensor DiT::forward(const Tensor &latents, const Condition &cond, float timestep
             embedding[r * 256 + i] = std::cos(angle);
             embedding[r * 256 + 128 + i] = std::sin(angle);
         }
-    auto temb = weights_.linear(rt_.activation(weights_.linear(rt_.upload(embedding.data(), 2, 256),
-                                                               "time_text_embed.timestep_embedder.linear_1")),
-                                "time_text_embed.timestep_embedder.linear_2");
-    auto modulation = weights_.linear(rt_.activation(temb), "modulation.1");
+    auto temb = linear(rt_.activation(linear(rt_.upload(embedding.data(), 2, 256),
+                                           "time_text_embed.timestep_embedder.linear_1")),
+                       "time_text_embed.timestep_embedder.linear_2");
+    auto modulation = linear(rt_.activation(temb), "modulation.1");
     nomas::RopeTable rope;
     if (cached) {
         if (cache->rope.cos.rows != prefix + target || cache->rope.sin.rows != prefix + target)
@@ -246,13 +287,13 @@ Tensor DiT::forward(const Tensor &latents, const Condition &cond, float timestep
         }
         if (!rt_.isFloat32()) {
             auto qkv = packedLinear(nx, {p + "attn.to_q", p + "attn.to_k", p + "attn.to_v"});
-            rt_.qkvNormRope(qkv, weights_.get(p + "attn.norm_q.weight"),
-                            weights_.get(p + "attn.norm_k.weight"), rope, q, k, v);
+            rt_.qkvNormRope(qkv, weight(p + "attn.norm_q.weight"),
+                            weight(p + "attn.norm_k.weight"), rope, q, k, v);
         } else {
-            auto rawQ = weights_.linear(nx, p + "attn.to_q"), rawK = weights_.linear(nx, p + "attn.to_k");
-            weights_.linear(nx, p + "attn.to_v", false, &v);
-            rt_.qkNormRope(rawQ, rawK, weights_.get(p + "attn.norm_q.weight"),
-                           weights_.get(p + "attn.norm_k.weight"), rope, q, k);
+            auto rawQ = linear(nx, p + "attn.to_q"), rawK = linear(nx, p + "attn.to_k");
+            linear(nx, p + "attn.to_v", &v);
+            rt_.qkNormRope(rawQ, rawK, weight(p + "attn.norm_q.weight"),
+                           weight(p + "attn.norm_k.weight"), rope, q, k);
         }
         Tensor a;
         if (cached) {
@@ -281,20 +322,20 @@ Tensor DiT::forward(const Tensor &latents, const Condition &cond, float timestep
             outputs.push_back(rt_.attention(q.rowSlice(prefix, target), k, v, 32));
             a = rt_.concat(outputs);
         }
-        x = rt_.gatedAdd(x, weights_.linear(a, p + "attn.to_out.0"), modulation, cached ? 0 : prefix, 1);
+        x = rt_.gatedAdd(x, linear(a, p + "attn.to_out.0"), modulation, cached ? 0 : prefix, 1);
         nx = rt_.normScale(x, modulation, cached ? 0 : prefix, 2);
         Tensor hidden;
         if (!rt_.isFloat32()) {
             hidden = rt_.siluMultiply(packedLinear(nx, {p + "img_mlp.gate_layer", p + "img_mlp.proj"}), true);
         } else {
-            auto gate = weights_.linear(nx, p + "img_mlp.gate_layer");
-            hidden = rt_.siluMultiply(gate, weights_.linear(nx, p + "img_mlp.proj"));
+            auto gate = linear(nx, p + "img_mlp.gate_layer");
+            hidden = rt_.siluMultiply(gate, linear(nx, p + "img_mlp.proj"));
         }
-        auto mlp = weights_.linear(hidden, p + "img_mlp.out");
+        auto mlp = linear(hidden, p + "img_mlp.out");
         x = rt_.gatedAdd(x, mlp, modulation, cached ? 0 : prefix, 3);
     }
-    auto scale = weights_.linear(rt_.activation(temb), "norm_out.linear");
-    auto out = weights_.linear(rt_.normScale(x, scale, cached ? 0 : prefix, 0), "proj_out");
+    auto scale = linear(rt_.activation(temb), "norm_out.linear");
+    auto out = linear(rt_.normScale(x, scale, cached ? 0 : prefix, 0), "proj_out");
     return cached ? out : out.rowSlice(prefix, target);
 }
 VAE::VAE(Runtime &rt, const std::string &dir) : rt_(rt), weights_(rt, componentWeights(dir)) {}

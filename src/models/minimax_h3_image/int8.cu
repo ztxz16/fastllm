@@ -147,6 +147,8 @@ class Int8Weights final : public QuantizedWeights {
     ~Int8Weights() override;
     void validateModel() const override;
     Tensor linear(const Tensor &, const std::string &, Tensor *) override;
+    Tensor linearPacked(const Tensor &, const std::vector<std::string> &, Tensor *) override;
+    size_t loadedBytes() const override;
     void erasePrefix(const std::string &) override;
     void clear() override;
 
@@ -269,14 +271,18 @@ struct Int8Weights::Impl : detail::QuantizedCheckpoint {
         }
         rotationVerified = true;
     }
-    Weight &get(const std::string &name) {
+    Weight &get(const std::string &name, const std::vector<std::string> *direct = nullptr) {
+        require(!direct || (!unsloth && options.size == 1), "direct INT8 requires unpartitioned Comfy weights");
         verifyUnslothRotation();
         auto found = weights.find(name);
         if (found != weights.end())
             return found->second;
         std::vector<std::string> keys;
         bool qkv = name.find(".qkv_proj") != std::string::npos;
-        if (unsloth) {
+        if (direct) {
+            keys = *direct;
+            qkv = false;
+        } else if (unsloth) {
             auto dot = name.find('.', 7);
             require(dot != std::string::npos, "invalid INT8 layer name");
             auto prefix = "transformer_blocks." + name.substr(7, dot - 7);
@@ -345,7 +351,8 @@ struct Int8Weights::Impl : detail::QuantizedCheckpoint {
         ck(cudaStreamSynchronize(cudaStreamPerThread));
         return weights.emplace(name, std::move(w)).first->second;
     }
-    Tensor run(const Tensor &x, const std::string &name, Tensor *destination) {
+    Tensor run(const Tensor &x, const std::string &name, Tensor *destination,
+               const std::vector<std::string> *direct = nullptr) {
         if (device < 0) {
             ck(cudaGetDevice(&device));
 #ifdef FASTLLM_IMAGE_INT8_SCALED
@@ -354,7 +361,7 @@ struct Int8Weights::Impl : detail::QuantizedCheckpoint {
             fusedGemm = properties.major >= 8;
 #endif
         }
-        auto &w = get(name);
+        auto &w = get(name, direct);
         require(x.dtype == DType::BF16 && x.cols == w.cols, "INT8 input dtype/shape");
         int padded = (x.rows + 15) / 16 * 16;
         Tensor q(padded, x.cols / 2), scale(1, padded, true);
@@ -380,6 +387,9 @@ struct Int8Weights::Impl : detail::QuantizedCheckpoint {
         case 4:
             rotateQuantize<4>
                 <<<padded, 256, 0, cudaStreamPerThread>>>(input, quantized, scales, x.rows, x.cols);
+            break;
+        case 6:
+            rotateQuantize<6><<<padded,256,0,cudaStreamPerThread>>>(input,quantized,scales,x.rows,x.cols);
             break;
         case 7:
             rotateQuantize<7>
@@ -484,6 +494,19 @@ void Int8Weights::validateModel() const {
 }
 Tensor Int8Weights::linear(const Tensor &x, const std::string &name, Tensor *output) {
     return impl_->run(x, name, output);
+}
+Tensor Int8Weights::linearPacked(const Tensor &x, const std::vector<std::string> &names, Tensor *output) {
+    require(!names.empty(), "empty INT8 projection list");
+    std::string key = "packed:";
+    for (const auto &name : names)
+        key += std::to_string(name.size()) + ":" + name;
+    return impl_->run(x, key, output, &names);
+}
+size_t Int8Weights::loadedBytes() const {
+    size_t bytes = impl_->workspace.bytes();
+    for (const auto &entry : impl_->weights)
+        bytes += entry.second.bytes.bytes() + entry.second.scales.bytes();
+    return bytes;
 }
 void Int8Weights::erasePrefix(const std::string &prefix) {
     for (auto i = impl_->weights.begin(); i != impl_->weights.end();)

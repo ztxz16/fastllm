@@ -1,6 +1,7 @@
 #pragma once
 #include "models/minimax_h3/runtime.h"
 #include "models/minimax_h3_image/source.h"
+#include <stdexcept>
 
 namespace fastllm::minimax_h3_image {
 // TP slices checkpoint bytes before upload for both image and video models.
@@ -26,6 +27,18 @@ class QuantizedWeights {
                                       minimax_h3::Tensor *output = nullptr) = 0;
     virtual void erasePrefix(const std::string &) = 0;
     virtual void clear() = 0;
+    // Direct checkpoint names, without H3-specific permutations. Adapters
+    // validate their own model layout before using this optional interface.
+    virtual minimax_h3::Tensor linearPacked(const minimax_h3::Tensor &,
+        const std::vector<std::string> &, minimax_h3::Tensor * = nullptr) {
+        throw std::logic_error("direct packed projections are unavailable for this format");
+    }
+    virtual size_t loadedBytes() const {
+        throw std::logic_error("resident byte accounting is unavailable for this format");
+    }
+    // Adapters with a reusable conditioning prefix can retain conservative
+    // GGUF dispatch while building it. Other formats have no phase policy.
+    virtual void setPrefill(bool) {}
     WeightFormat format() const { return format_; }
 
   protected:

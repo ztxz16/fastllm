@@ -1,5 +1,115 @@
 # 验证记录
 
+## INT8 / GGUF 接入（2026-11-15）
+
+在 `master` 的 `6d26e887` 及此前 FP8 工作区基础上接入；生产推理保持纯 C++ / CUDA，自动识别格式，没有新增部署参数或环境变量。本次使用 pro5000 物理 GPU 6 的独立容器，不改动 GPU 3 服务。
+
+### 发布权重与路径
+
+- [Comfy-Org INT8 ConvRot](https://huggingface.co/Comfy-Org/Qwen-Image-2.1/tree/aacf31a6d48e707f352ecba714cee0680da3479b/diffusion_models)：`qwen_image_2.1_int8_convrot.safetensors`，7,256,783,064 字节，SHA256 `cb74113cb03faecd79611b01fd7fd642f0aa60d6f0b95086abee214d75eaa57d`。192 个量化投影，含合并 gate/up；文本/视觉、VAE 和未量化 DiT 张量保留 BF16。路径 `/workspace2/hfmodels/Qwen-Image-2.1-INT8`。
+- [Unsloth GGUF](https://huggingface.co/unsloth/Qwen-Image-2.1-GGUF/tree/2c31ccd392b367a6637841a143813320a02dff55)：`qwen-image-2.1-Q4_K_M.gguf`，4,199,565,024 字节，SHA256 `631d532e7ca71e8d90a87c71d3699761a812039d22e3370e87498d87754660fe`。265 个张量，实际混用 Q4_K/Q5_K/Q6_K/Q8_0/BF16/F32；保留 `model.diffusion_model.` 命名和原始块格式。路径 `/workspace2/hfmodels/Qwen-Image-2.1-GGUF`。
+- 两个整文件均与发布的 SHA256 一致；通过独立目录复用原文本/视觉编码器、VAE 和配置，原 BF16 / FP8 权重未修改。
+- INT8 复用 H3 的 H256 ConvRot + W8A8 GEMM，扩展 12,288 维输入和直接命名的合并投影。GGUF 复用 H3 的有界 reader、CUDA 解量化及 MMQ；Q/K/V 位宽不同时分别运算后拼接，避免二次量化。
+- 本节接入时 MMQ 沿用 8..512 token 的自动范围（后续调优见文首）；大 token 使用有界解量化 + BF16 cuBLAS。正常 1024² 文生图和 512² 编辑的主要 DiT GEMM 落在后者，不能把这些速度称作全程 MMQ 性能。
+
+### 同卡复测
+
+40 步、seed 1234，1 次预热后 3 次请求取中位数，包含 PNG 编码。文生图 1024×1024，编辑 512×512、参考分辨率 512；与前节使用相同 prompt 和参考图。以下是原生 FastLLM 四种权重的比较，本轮没有重新测 SGLang。
+
+| 权重 | 文生图 | 单图编辑 | 整卡显存采样峰值 |
+|---|---:|---:|---:|
+| BF16 | 13.644 s | 3.504 s | 33957 MiB |
+| FP8 | 8.243 s | 2.062 s | 27173 MiB |
+| INT8 ConvRot | 8.409 s | 2.152 s | 27301 MiB |
+| GGUF Q4_K_M | 14.983 s | 4.948 s | 24461 MiB |
+
+显存按 250ms 采样，非精确分配峰值，也不是最低运行显存。INT8 接近 FP8 速度；GGUF 当前比 BF16 慢，主要优势是减少常驻权重。INT8 / GGUF 小图常驻分别占用约 23,121,100,800 / 20,109,590,528 字节；人为施加显存压力后分别回收 23,117,365,248 / 20,097,531,904 字节，随后恢复常驻与取消恢复的 PNG 均不变。这是此用例的观测，不是最小显存承诺。
+
+### 数值范围：两种格式均为实验支持
+
+所有下表均与**同一份量化权重**的独立参考比较，不是量化模型与原 BF16 权重的质量差异。INT8 参考使用稠密 Hadamard 和 PyTorch 整数 GEMM；GGUF 参考使用 gguf-py 解码后 BF16 GEMM，比较包含 MMQ 的激活量化及舍入误差。PyTorch、gguf-py 只在测试环境运行。
+
+- 六类真实投影 × 2/76/1024 token：INT8 最大相对 L2 **0.0439%**（检查线 0.1%）；GGUF 最大 **1.4380%**（沿用 MMQ 的 2% 检查线）。
+- 文本编码器实际消费行 2.6371%，VAE 0.5374%，均通过原 3% 分项线。
+- 随机输入 32 层 DiT：INT8 **3.3840%**，GGUF **4.2283%**，均超过原 **3%** 分项线。
+- 全流程继续对实际 prompt 行、参考条件和每一步 latent 使用 **5%** 检查线；像素误差只作诊断，不用它替代 latent 验收。
+
+| 用例 | INT8 最大 latent 相对 L2 | GGUF 最大 latent 相对 L2 | INT8 / GGUF 验收 |
+|---|---:|---:|---|
+| 文生图 1024²，40 步 | 3.6182% | 1.2117% | 通过 / 通过 |
+| 单图编辑 512²，40 步 | 0.9579% | 1.6531% | 通过 / 通过 |
+| 双图编辑 128×96，40 步 | 6.4713% | 5.1181% | 未通过 / 未通过 |
+| 双图编辑 128×96，4 步 | 4.5299% | 3.9944% | 通过 / 通过 |
+
+双图 40 步未通过：INT8 最终 latent 6.4713%、像素 3.8665%；GGUF 最终 latent 5.1181%、像素 3.4671%。没有放宽阈值；`validation.json` 明确保留四项失败和 `passed: false`。上述投影检查没有发现明显的布局错误，但不能据此保证任意提示词的完整流程误差，后续仍需继续数值对齐。
+
+### 功能与兼容性
+
+- 原有 BF16 / FP8 各 85 份中间张量、8 张 PNG 与扩展前逐字节一致；两种新格式每种模式的 4 次请求输出也分别逐字节一致。
+- Qwen 子目录显式启用 CTest；最终 `qwen_image_fp8` / `qwen_image_quantized` 两项均实际执行通过（`ctest-final.log`）。
+- 新 INT8 / GGUF 单元测试覆盖合并 QKV、混合 GGUF 类型、12,288 维旋转、token 尾部、输出视图、单投影/合并缓存隔离、释放重载和坏 metadata / 错误架构拒绝。
+- 复用后端的原 H3 INT8 CPU oracle、GGUF 10 种解码及 MMQ/回退/输出视图回归通过；H3 FP8 的布局、虚拟 TP、缩放和释放回归通过。INT8/GGUF 原测试仅将工厂调用改成等价的具体后端加载，以便链接 Qwen 单独构建，不改变 oracle 与断言。
+- HTTP 同步/异步文生图、multipart 编辑、鉴权、校验、队列、取消后恢复通过；CLI 单图和双图均能运行。API / 工作室共用模型加载，无量化开关。
+- 两种格式的常驻 → 压力卸载 → 常驻，以及取消 → 恢复检查通过；LingBot 共用运行时测试通过。
+- `ldd qwen_image_server` 没有缺失依赖，没有 Torch、Python 或 cuDNN 动态库。本次不增加量化文本编码器或 Qwen 多卡支持。
+
+完整日志、初始噪声、每步快照、PNG、逐投影报告及源文件 manifest 位于 pro5000 `/workspace2/experiments/qwen-image-native/int8-gguf-20261115/`；`summary.json` 汇总同轮速度与误差。
+
+## FP8 接入（2026-11-15）
+
+此前整理的 BF16 改动已提交在 master：`745e2240`（共享显存统计与可选 BF16 归约）、`6d26e887`（Qwen BF16 推理优化）。本节是随后新增的 FP8 路径，原 BF16 模型目录保持独立。
+
+### 权重与计算路径
+
+- 使用 [Unsloth Qwen-Image-2.1-FP8](https://huggingface.co/unsloth/Qwen-Image-2.1-FP8/tree/bb21a8ba7f0371c19ad1f72c82a5e8fc10f39939) 的 `Qwen-Image-2.1-FP8.safetensors`，7,122,877,560 字节，SHA-256 `70e151cfbedd37de7f4a11bda8f58180965c85f4960584c3d10acff599fcd205`。服务器完整文件与下载源逐字节散列一致。
+- 229 个 DiT 投影使用 E4M3 权重、逐输出行 FP32 scale；68 个未量化张量保持 BF16。文本/视觉编码器和 VAE 沿用原 BF16 权重。本次未接入 FP8 文本编码器、分片 FP8 或多卡。
+- 从 safetensors dtype / scale / metadata 自动判断类型，API、CLI、工作室共用同一模型路径，不增加生产环境变量或量化开关。
+- 复用 H3 的有界权重上传、FP8 GEMM、QKV/gate-up 合并和 SM120 CUTLASS 实现。中间激活保持 BF16，GEMM 前动态逐行量化为 FP8。
+- 该文件 metadata 指定 TorchAO `TORCH` 量化路径、`hp_value_lb=1e-12`。按 [TorchAO 量化原语](https://github.com/pytorch/ao/blob/main/torchao/quantization/quant_primitives.py) 保留 BF16 的 amax、clamp 和除以 448 的舍入，再存储 FP32 scale。H3 原入口保持原来的 FP32 scale 策略。
+- 推理仍为 C++ / CUDA / cuBLAS / CUTLASS；PyTorch 仅用于开发参考与验证，不参与部署。
+
+### 同卡速度与显存
+
+物理 GPU 6，RTX PRO 5000 72GB Blackwell，CUDA 13；batch=1、seed=1234、40 步，预热 1 次后取 3 次完整请求中位数，包含 PNG 保存。两者均使用自动常驻策略、相同文本编码器与 VAE，未开 profiler。本轮未测 SGLang FP8。
+
+| 模式 | BF16 | FP8 | 加速 |
+|---|---:|---:|---:|
+| 文生图 1024×1024 | 13.5864 秒 | 8.0821 秒 | 1.68× |
+| 单图编辑 512×512，参考分辨率 512 | 3.4975 秒 | 2.0435 秒 | 1.71× |
+
+FP8 文生图三次为 `[8.0246, 8.0821, 8.1434]` 秒，编辑为 `[2.0467, 2.0399, 2.0435]` 秒。DiT 中位数分别从 13.4026 / 3.3890 秒降到 7.8990 / 1.9367 秒；文本和 VAE 耗时基本不变。两种权重的两种模式各 4 次 PNG 分别逐字节一致。
+
+每 250ms 采样的整卡峰值从 33957MiB 降至 27173MiB，减少 6784MiB（约 20.0%）；这是所测请求的峰值，不是最低显存保证。低显存策略回归中，阶段卸载归还约 23.02GB，之后恢复常驻及取消后恢复均得到一致 PNG。
+
+### 数值结果与未通过项
+
+独立参考使用官方 Diffusers BF16 模型，将相同的 229 个投影替换为 PyTorch `scaled_mm` 和上述 TorchAO 行量化规则；没有复用原生 GEMM。原生与参考共用初始噪声；使用原有分项 3%、全流程 5% 相对 L2 检查线，未放宽。
+
+- 真实 FP8 权重的 6 类投影 × 3 种行数（2、76、1024）相同输入比较，最大相对 L2 为 `3.27e-4`，即 0.0327%；覆盖 4096 / 12288 输入宽度、小型辅助投影、Q 与 MLP。
+- 文本有效行 2.637%、VAE 0.537%，通过分项检查。
+- **随机输入、32 层 DiT 分项为 7.821%，超过 3%，未通过。** 逐层诊断中，输入投影、时间嵌入与共享调制和参考逐位一致；首层 Q 投影约 `8e-6`，attention 输出约 0.122%，差异被后续量化/非线性逐层放大。该诊断不能代替整模型验收，也未将此项记为通过。
+
+| 完整流程 | 最终 latent 相对 L2 | 最大逐步相对 L2 | 像素相对 L2 | 结果 |
+|---|---:|---:|---:|---|
+| 文生图 1024×1024，40 步 | 2.001% | 2.001% | 1.185% | 通过 |
+| 单图编辑 512×512，40 步 | 1.589% | 1.589% | 0.731% | 通过 |
+| 双图编辑 128×96，40 步，参考 288 | 2.952% | 2.952% | 2.008% | 通过 |
+| 双图编辑 128×96，4 步，参考 288 | 8.609% | 8.653% | 3.456% | **超过 5%，未通过** |
+
+40 步三种模式实际使用的 prompt、条件及每步 latent 均通过 5% 检查线。完整 prompt（含不送入 DiT 的图像占位行）和像素继续保留为诊断。短步数双图与随机输入分项的超线仍未解决，因此 **FP8 暂标为实验支持，整套精度验收没有全部通过**。
+
+另行记录量化相对 BF16 的变化：同噪声原生 FP8 对原生 BF16，文生图最终 latent / 像素相对 L2 为 13.145% / 4.915%，编辑为 2.829% / 1.060%。这与“同一 FP8 权重的原生实现对独立参考”是不同的比较，不能混用。
+
+### 兼容性与运行回归
+
+- CMake 构建 generate/server/reference/FP8 test 通过；`ldd` 无缺失依赖、Torch、Python 或 cuDNN 动态库。
+- Qwen FP8 测试覆盖合并 QKV、零行/尾行、目标切片复用、缓存隔离、释放、BF16 scale 舍入/微小值及损坏 scale、错误 metadata、混合融合组拒绝。
+- H3 原 FP8 CPU oracle、QKV 布局、虚拟 TP 2/4/8 分片、FC1 顺序和释放回归通过；LingBot 共用算子回归通过。
+- 新增 FP8 路径后的 BF16 文生图/编辑共 85 份快照、8 张 PNG 与前轮已提交版本逐字节一致。
+- HTTP 鉴权、校验、同步/异步、排队、取消恢复、multipart 编辑通过；显存压力下常驻 → 阶段卸载 → 常驻及取消恢复通过。
+
+原始证据在 pro5000 `/workspace2/experiments/qwen-image-native/fp8-20261115/`：`summary.json`、`validation.json`、`validate-final.py`、`projection-final.json`、`diag/layers.json`。`validation.json` 明确保留两项数值失败。早期 FP32 scale 实验保留于 `initial-fp32-scale/`，除法试验为 `reference-div/`；这些均不是最终实现，也未计作最终精度通过。
+
 ## 提交前整理与回归（2026-11-15）
 
 在 master 上整理本批 BF16 / 常驻推理 / 算子优化改动：

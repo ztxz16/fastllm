@@ -281,7 +281,7 @@ int main() {
         }
         for (int layout : {0, 1, 2})
             checkQkvLayout(root / "qkv.safetensors", rt, layout);
-        for (int cols : {5376, 7168, 14336})
+        for (int cols : {4096, 5376, 7168, 12288, 14336})
             checkProjection(root / "projection.safetensors", rt, cols);
         fixture(root / "bad.safetensors", false, 1, true);
         Fp8Weights bad((root / "bad.safetensors").string());

@@ -79,9 +79,11 @@ class TextEncoder {
     Weights weights_;
 };
 
+class QuantizedProjections;
 class DiT {
   public:
     DiT(Runtime &, const std::string &directory);
+    ~DiT();
     Tensor forward(const Tensor &latents, const Condition &, float timestep, int height, int width,
                    KVCache *cache = nullptr);
     void unload();
@@ -89,11 +91,14 @@ class DiT {
 
   private:
     Runtime &rt_;
-    Weights weights_;
+    std::unique_ptr<Weights> weights_;
+    std::unique_ptr<QuantizedProjections> quantized_;
+    const Tensor &weight(const std::string &);
     struct Projection {
         Tensor weight, bias;
     };
     std::unordered_map<std::string, Projection> projections_;
+    Tensor linear(const Tensor &, const std::string &prefix, Tensor *output = nullptr);
     Tensor packedLinear(const Tensor &, const std::vector<std::string> &prefixes);
 };
 
