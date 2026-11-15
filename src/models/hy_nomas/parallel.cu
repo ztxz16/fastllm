@@ -66,6 +66,9 @@ struct ParallelGroup::Impl {
         bool pending=false;
     };
     std::vector<Communication> communication;
+    std::vector<Tensor> peerInputs;
+    std::vector<std::vector<cudaEvent_t>> chunkDone;
+    bool peerAvailable = false;
     Communication &beginCommunication(int rank) {
         auto &c=communication[rank];
         if(!c.stream) {
@@ -88,6 +91,12 @@ struct ParallelGroup::Impl {
         auto sorted=d; std::sort(sorted.begin(),sorted.end());
         if(sorted.front()<0 || sorted.back()>=count || std::adjacent_find(sorted.begin(),sorted.end())!=sorted.end())
             throw std::invalid_argument("tensor-parallel devices must be distinct visible CUDA indices");
+        peerInputs.resize(d.size()); chunkDone.resize(d.size());
+        peerAvailable = d.size() > 1;
+        for (int from : d) for (int to : d) if (from != to) {
+            int access = 0; check(cudaDeviceCanAccessPeer(&access, from, to));
+            peerAvailable = peerAvailable && access;
+        }
         initialize();
     }
     void initialize() {
@@ -145,6 +154,7 @@ struct ParallelGroup::Impl {
             if(c.stream) cudaStreamDestroy(c.stream);
             if(c.ready) cudaEventDestroy(c.ready);
             if(c.done) cudaEventDestroy(c.done);
+            for(auto event:chunkDone[rank]) cudaEventDestroy(event);
         }
     }
     void boundary(int rank,NcclSubmitRendezvous::Phase phase,const Tensor &x,int operation) {
@@ -182,6 +192,9 @@ void ParallelGroup::run(const std::function<void(int)> &task) {
             std::rethrow_exception(error);
         }
     },errors);
+    // All workers and their communication streams have drained at this point.
+    // A failed pre-copy rendezvous may still hold peer input references.
+    for (auto &input : i.peerInputs) input = {};
     check(cudaSetDevice(i.devices[0]));
     if(originalError) std::rethrow_exception(originalError);
     for(auto error:errors) if(error) std::rethrow_exception(error);
@@ -201,6 +214,13 @@ void ParallelGroup::sum(Tensor &x,int rank) {
     i.boundary(rank,NcclSubmitRendezvous::Before,x,1);
     check(ncclAllReduce(x.data,x.data,x.size(),type(x.dtype),ncclSum,i.comms[rank],cudaStreamPerThread));
     i.boundary(rank,NcclSubmitRendezvous::After,x,1);
+}
+void ParallelGroup::maximum(Tensor &x,int rank) {
+    auto &i=*impl_;
+    if(size()==1) return;
+    i.boundary(rank,NcclSubmitRendezvous::Before,x,10);
+    check(ncclAllReduce(x.data,x.data,x.size(),type(x.dtype),ncclMax,i.comms[rank],cudaStreamPerThread));
+    i.boundary(rank,NcclSubmitRendezvous::After,x,10);
 }
 void ParallelGroup::sumAsync(const Tensor &x,int rank) {
     if(size()==1) return;
@@ -275,7 +295,11 @@ Tensor ParallelGroup::gatherColumns(const Tensor &x,int rank,int groups,bool asy
     if(size()==1) return x;
     if(x.cols>INT_MAX/size()) throw std::invalid_argument("gathered tensor too wide");
     if(groups<1 || x.cols%groups) throw std::invalid_argument("invalid gathered projection groups");
-    Tensor packed(x.rows,x.cols*size(),x.dtype),out(x.rows,x.cols*size(),x.dtype);
+    Tensor packed(x.rows,x.cols*size(),x.dtype);
+    // A single row with one group is already in the requested order after
+    // AllGather. Sequence gathers use this layout; avoid another full copy.
+    const bool identity=x.rows==1 && groups==1;
+    Tensor out=identity?packed:Tensor(x.rows,x.cols*size(),x.dtype);
     auto &i=*impl_;
     cudaStream_t stream=cudaStreamPerThread;
     if(async) {
@@ -286,6 +310,7 @@ Tensor ParallelGroup::gatherColumns(const Tensor &x,int rank,int groups,bool asy
     i.boundary(rank,NcclSubmitRendezvous::Before,x,2);
     check(ncclAllGather(x.data,packed.data,x.size(),type(x.dtype),i.comms[rank],stream));
     i.boundary(rank,NcclSubmitRendezvous::After,x,2);
+    if(identity) return out;
     int blocks=std::min<size_t>((out.size()+255)/256,65535);
     if(x.isFloat32())
         gatherLayout<<<blocks,256,0,stream>>>((const uint32_t *)packed.data,(uint32_t *)out.data,out.size(),x.rows,x.cols,size(),groups);
@@ -293,6 +318,75 @@ Tensor ParallelGroup::gatherColumns(const Tensor &x,int rank,int groups,bool asy
         gatherLayout<<<blocks,256,0,stream>>>(packed.data,out.data,out.size(),x.rows,x.cols,size(),groups);
     check(cudaGetLastError());
     return out;
+}
+void ParallelGroup::gatherChunks(const Tensor &x, int chunks, int rank,
+                                 const std::function<void(int, const Tensor &)> &consume, bool inPlace) {
+    if (!x.data || chunks < 1 || x.rows % chunks || rank < 0 || rank >= size() ||
+        x.rows / chunks > INT_MAX / size() || !consume || (inPlace && (x.rows / chunks) % size()))
+        throw std::invalid_argument("invalid chunked peer gather");
+    auto &i = *impl_;
+    const int rows = x.rows / chunks / (inPlace ? size() : 1);
+    if (size() == 1) {
+        for (int g = 0; g < chunks; ++g) consume(g, x.rowSlice(g * rows, rows));
+        return;
+    }
+    if (!i.peerAvailable) {
+        auto gather = [&](int g) {
+            auto part = x.rowSlice((inPlace ? g * size() + rank : g) * rows, rows);
+            if (part.size() > INT_MAX) throw std::invalid_argument("peer gather chunk too large");
+            const int count = int(part.size());
+            part.rows = 1; part.cols = count;
+            auto result = gatherColumns(part, rank, 1, true);
+            result.rows = rows * size(); result.cols = x.cols;
+            return result;
+        };
+        auto pending = gather(0);
+        for (int g = 0; g < chunks; ++g) {
+            wait(rank);
+            auto current = std::move(pending);
+            if (g + 1 < chunks) pending = gather(g + 1);
+            consume(g, current);
+        }
+        return;
+    }
+    std::vector<Tensor> output;
+    enableTensorPeerAccess(x, i.devices);
+    for (int g = 0; g < chunks; ++g)
+        output.push_back(inPlace ? x.rowSlice(g * rows * size(), rows * size()) : Tensor(rows * size(), x.cols, x.dtype));
+    auto &events = i.chunkDone[rank];
+    while (events.size() < size_t(chunks)) {
+        cudaEvent_t event; check(cudaEventCreateWithFlags(&event, cudaEventDisableTiming)); events.push_back(event);
+    }
+    auto &c = i.beginCommunication(rank);
+    // Retain buffers through exception unwinding; run() drains communication
+    // before releasing them if a consumer cancels mid-pipeline.
+    c.retained.push_back(x);
+    c.retained.insert(c.retained.end(), output.begin(), output.end());
+    i.peerInputs[rank] = x;
+    i.boundary(rank, NcclSubmitRendezvous::Before, x, 9);
+    for (int source = 0; source < size(); ++source)
+        check(cudaStreamWaitEvent(c.stream, i.communication[source].ready, 0));
+    const size_t bytes = x.bytes() / chunks / (inPlace ? size() : 1);
+    for (int g = 0; g < chunks; ++g) {
+        for (int source = 0; source < size(); ++source) {
+            if (inPlace && source == rank) continue;
+            auto dst = reinterpret_cast<uint8_t *>(output[g].data) + source * bytes;
+            auto src = reinterpret_cast<const uint8_t *>(i.peerInputs[source].data) +
+                (inPlace ? g * size() + source : g) * bytes;
+            if (source == rank) check(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, c.stream));
+            else check(cudaMemcpyPeerAsync(dst, i.devices[rank], src, i.devices[source], bytes, c.stream));
+        }
+        check(cudaEventRecord(events[g], c.stream));
+    }
+    i.boundary(rank, NcclSubmitRendezvous::After, x, 9);
+    i.peerInputs[rank] = {};
+    for (int g = 0; g < chunks; ++g) {
+        check(cudaStreamWaitEvent(cudaStreamPerThread, events[g], 0));
+        consume(g, output[g]);
+    }
+    for (int source = 0; source < size(); ++source)
+        check(cudaStreamWaitEvent(cudaStreamPerThread, i.chunkDone[source][chunks - 1], 0));
+    wait(rank);
 }
 std::vector<Tensor> ParallelGroup::mapToRoot(size_t count,const std::function<Tensor(int,size_t)> &task) {
     std::vector<Tensor> local(count),result(count);
@@ -304,7 +398,9 @@ std::vector<Tensor> ParallelGroup::mapToRoot(size_t count,const std::function<Te
             int rank=j%size();
             if(rank==0) result[j]=local[j];
             else {
+                enableTensorPeerAccess(local[j], {impl_->devices[0]});
                 result[j]=Tensor(local[j].rows,local[j].cols,local[j].dtype);
+                enableTensorPeerAccess(result[j], {impl_->devices[rank]});
                 check(cudaMemcpyPeerAsync(result[j].data,impl_->devices[0],local[j].data,
                                           impl_->devices[rank],local[j].bytes(),cudaStreamPerThread));
             }
@@ -331,6 +427,7 @@ void ParallelGroup::run(const std::function<void(int)> &task) {
 Tensor ParallelGroup::broadcast(const Tensor &x,int) { return x; }
 Tensor ParallelGroup::gatherColumns(const Tensor &x,int,int,bool) { return x; }
 void ParallelGroup::sum(Tensor &,int) {}
+void ParallelGroup::maximum(Tensor &,int) {}
 void ParallelGroup::sumAsync(const Tensor &,int) {}
 Tensor ParallelGroup::sumCast(Runtime &rt,Tensor partial,const Tensor *bias,DType output,int) {
     if(bias) partial=rt.bias(partial,*bias);
@@ -340,6 +437,12 @@ void ParallelGroup::sumCastAsync(const Tensor &,const Tensor *,Tensor &,int) {
     throw std::runtime_error("asynchronous row reduction requires NCCL");
 }
 void ParallelGroup::wait(int) {}
+void ParallelGroup::gatherChunks(const Tensor &x,int chunks,int,
+                                 const std::function<void(int,const Tensor &)> &consume, bool) {
+    if (!x.data || chunks < 1 || x.rows % chunks || !consume)
+        throw std::invalid_argument("invalid chunked gather");
+    for (int g = 0; g < chunks; ++g) consume(g, x.rowSlice(g * (x.rows / chunks), x.rows / chunks));
+}
 std::vector<Tensor> ParallelGroup::mapToRoot(size_t count,const std::function<Tensor(int,size_t)> &task) {
     std::vector<Tensor> result(count);
     run([&](int rank) { for(size_t j=0;j<count;++j) result[j]=task(rank,j); });

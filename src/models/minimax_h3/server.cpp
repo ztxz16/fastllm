@@ -81,12 +81,18 @@ Json metadata(const std::shared_ptr<Job> &job) {
 }
 class Service {
   public:
-    Service(std::string model, std::string output, std::vector<int> devices, bool fp32, DType videoType,
-            std::string ffmpeg, std::string pika, double gpuMemoryLimit, double hostMemoryLimit)
-        : output_(std::move(output)), fp32_(fp32), pika_(!pika.empty()), videoType_(videoType), devices_(devices),
+    Service(ModelSource source, std::string output, std::vector<int> devices, bool fp32, DType videoType,
+            std::string ffmpeg, double gpuMemoryLimit, double hostMemoryLimit, std::string parallelMode)
+        : output_(std::move(output)), source_(std::move(source)), fp32_(fp32),
+          pika_(!source_.pikaDirectory.empty()), videoType_(videoType), devices_(std::move(devices)),
           gpuMemoryLimit_(gpuMemoryLimit), hostMemoryLimit_(hostMemoryLimit) {
+        if(parallelMode!="auto" && parallelMode!="tp" && parallelMode!="sp")
+            throw std::invalid_argument("parallel-mode must be auto, tp or sp");
+        const bool quantized=!source_.transformerWeights.empty() || !source_.referenceWeights.empty();
+        ditParallelMode_=devices_.size()==1?"single":
+            (parallelMode=="sp" || (parallelMode=="auto" && quantized))?"sp":"tp";
         std::filesystem::create_directories(output_);
-        referencesAvailable_ = std::filesystem::is_regular_file(model + "/transformer_ref/config.json");
+        referencesAvailable_ = std::filesystem::is_regular_file(source_.baseDirectory + "/transformer_ref/config.json");
         // Completed jobs have a small sidecar, so updating the inference service
         // preserves the IDs of videos already shown in the demo.
         for (const auto &entry : std::filesystem::directory_iterator(output_)) {
@@ -125,12 +131,13 @@ class Service {
             job->referenceCount = data["reference_count"].int_value();
             jobs_[id] = job;
         }
-        worker_ = std::thread([this, model, devices, fp32, videoType, ffmpeg, pika] {
+        worker_ = std::thread([this, ffmpeg, parallelMode] {
             try {
-                Pipeline pipeline(model, devices, fp32, videoType);
+                Pipeline pipeline(source_.baseDirectory, devices_, fp32_, videoType_);
+                pipeline.configureSource(source_,parallelMode);
                 pipeline.setGpuMemoryLimit(gpuMemoryLimit_);
                 pipeline.setHostMemoryLimit(hostMemoryLimit_);
-                if (pika_) pipeline.loadPika(pika);
+                if (pika_) pipeline.loadPika(source_.pikaDirectory);
                 layerStreaming_ = pipeline.layerStreaming();
                 ready_ = true;
                 for (;;) {
@@ -233,6 +240,11 @@ class Service {
                             {"precision", fp32_ ? "fp32" : "bf16"},
                             {"vae_precision", precisionName(videoType_)},
                             {"tensor_parallel_size", int(devices_.size())},
+                            {"dit_precision",source_.transformerPrecision},
+                            {"reference_dit_precision",source_.referencePrecision},
+                            {"dit_parallel_mode",ditParallelMode_},
+                            {"dit_tensor_parallel_size",ditParallelMode_=="tp"?int(devices_.size()):1},
+                            {"dit_sequence_parallel_size",ditParallelMode_=="sp"?int(devices_.size()):1},
                             {"devices", devices_},
                             {"gpu_memory_limit_gib", gpuMemoryLimit_},
                             {"host_memory_limit_gib", hostMemoryLimit_},
@@ -398,6 +410,8 @@ class Service {
 
   private:
     std::string output_, startupError_;
+    const ModelSource source_;
+    std::string ditParallelMode_;
     bool referencesAvailable_ = false;
     const bool fp32_;
     const bool pika_;
@@ -418,13 +432,24 @@ class Service {
 int main(int argc, char **argv) {
     try {
         std::string model, output = "minimax-h3-output", host = "127.0.0.1", key,
-                           demo = "tools/minimax_h3/demo.html", ffmpeg = "ffmpeg", vaePrecision, pika, baseModel;
+                           demo = "tools/minimax_h3/demo.html", ffmpeg = "ffmpeg", vaePrecision, pika, baseModel,
+                           parallelMode="auto";
         int port = 8009;
         std::vector<int> devices{0};
         bool fp32 = false;
         double gpuMemoryLimit = 0, hostMemoryLimit = 0;
         for (int i = 1; i < argc; ++i) {
             std::string arg = argv[i];
+            if (arg == "--help" || arg == "-h") {
+                std::cout << R"(Usage: minimax_h3_server --model PATH [options]
+  --host ADDRESS --port PORT --output DIRECTORY --api-key KEY
+  --device ID[,ID] --precision bf16|fp32 --vae-precision fp16|bf16|fp32
+  --gpu-memory-limit SIZE --host-memory-limit SIZE
+  --parallel-mode auto|tp|sp
+  --pika PATH --base-model PATH --ffmpeg PATH --demo PATH
+)";
+                return 0;
+            }
             if (i + 1 >= argc)
                 throw std::invalid_argument("missing value for " + arg);
             std::string v = argv[++i];
@@ -434,6 +459,8 @@ int main(int argc, char **argv) {
                 pika = v;
             else if (arg == "--base-model")
                 baseModel = v;
+            else if (arg == "--parallel-mode")
+                parallelMode=v;
             else if (arg == "--output")
                 output = v;
             else if (arg == "--host")
@@ -462,10 +489,9 @@ int main(int argc, char **argv) {
                 throw std::invalid_argument("unknown argument " + arg);
         }
         auto source = resolveModelSource(model, baseModel, pika);
-        model = source.baseDirectory;
-        pika = source.pikaDirectory;
         auto videoType = parseVideoPrecision(vaePrecision, fp32);
-        Service service(model, output, devices, fp32, videoType, ffmpeg, pika, gpuMemoryLimit, hostMemoryLimit);
+        Service service(source, output, devices, fp32, videoType, ffmpeg, gpuMemoryLimit, hostMemoryLimit,
+                        parallelMode);
         httplib::Server server;
         server.new_task_queue = [] { return new httplib::ThreadPool(8); };
         server.set_payload_max_length(size_t(256) << 20);

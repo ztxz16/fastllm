@@ -81,9 +81,6 @@ struct DeepSeekV41Model::HybridPrefillStage {
     std::mutex *hostExperts = nullptr;
     bool sampleOutput = false;
 };
-inline int V41PipelineGraphKey(int firstLayer, int rows) {
-    return (1 << 20) + 64 * firstLayer + rows;
-}
 // Decode stages share the request's KV/history, but never their CUDA scratch.
 // Borrowed outputs live in the graph workspace until the next token.
 struct DeepSeekV41Model::HybridDecodeStage {

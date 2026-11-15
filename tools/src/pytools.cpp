@@ -51,6 +51,23 @@ static thread_local std::string fastllmPytoolsWarmupError;
 static thread_local std::string fastllmPytoolsContextResult;
 static thread_local std::string fastllmPytoolsCloverError;
 
+template<class Run>
+static const char *RunCpuThreadBenchmark(Run run) {
+    static thread_local std::string result;
+    try {
+        result = run();
+    } catch (const std::exception &error) {
+        result = json11::Json(json11::Json::object{{"error", error.what()}}).dump();
+    } catch (const std::string &error) {
+        result = json11::Json(json11::Json::object{{"error", error}}).dump();
+    } catch (const char *error) {
+        result = json11::Json(json11::Json::object{{"error", error ? error : "unknown native calibration error"}}).dump();
+    } catch (...) {
+        result = "{\"error\":\"unknown native calibration exception\"}";
+    }
+    return result.c_str();
+}
+
 extern "C" {
     DLL_EXPORT bool start_autotune_recording(const char *path) {
         try { return path && fastllm::StartAutotuneRecording(path); }
@@ -99,49 +116,48 @@ extern "C" {
 
     DLL_EXPORT const char *benchmark_cpu_linear_threads(int hidden, int intermediate, int kind,
             const int *counts, int count, int budgetMs) {
-        static thread_local std::string result;
-        try {
+        return RunCpuThreadBenchmark([&] {
             if (!counts || count < 1 || count > 8 || hidden < 1 || intermediate < 1 ||
-                    budgetMs < 1 || budgetMs > 1000) return nullptr;
-            result = BenchmarkCpuLinearThreads(hidden, intermediate, kind, counts, count, budgetMs);
-            return result.c_str();
-        } catch (...) { return nullptr; }
+                    budgetMs < 1 || budgetMs > 1000)
+                throw std::invalid_argument("invalid CPU linear calibration arguments");
+            return BenchmarkCpuLinearThreads(hidden, intermediate, kind, counts, count, budgetMs);
+        });
     }
 
     DLL_EXPORT const char *benchmark_cpu_moe_threads(int hidden, int intermediate, int kind,
             int rows, int topk, const int *counts, int count, int budgetMs) {
+        return RunCpuThreadBenchmark([&]() -> std::string {
 #ifdef USE_NUMAS
-        static thread_local std::string result;
-        try {
             if (!counts || count < 1 || count > 8 || hidden < 256 || hidden > 8192 ||
-                    intermediate < 256 || intermediate > 4096 || rows < 1 || rows > 32 ||
-                    topk < 1 || topk > 16 || budgetMs < 1 || budgetMs > 1000) return nullptr;
+                    intermediate < 256 || intermediate > 4096 || rows < 1 ||
+                    topk < 1 || topk > 16 || budgetMs < 1 || budgetMs > 1000)
+                throw std::invalid_argument("invalid NUMA MoE calibration arguments");
             for (int i = 0; i < count; ++i)
-                if (counts[i] < 1 || counts[i] > 128) return nullptr;
-            result = BenchmarkCpuMoeThreads(hidden, intermediate, kind, rows, topk, counts, count, budgetMs);
-            return result.c_str();
-        } catch (...) { return nullptr; }
+                if (counts[i] < 1 || counts[i] > 128)
+                    throw std::invalid_argument("invalid NUMA thread candidate");
+            return BenchmarkCpuMoeThreads(hidden, intermediate, kind, rows, topk, counts, count, budgetMs);
 #else
-        return nullptr;
+            throw std::runtime_error("NUMA calibration requires a USE_NUMAS build");
 #endif
+        });
     }
 
     DLL_EXPORT const char *benchmark_cpu_standard_moe_threads(int hidden, int intermediate, int kind, int downKind,
             int rows, int topk, const int *counts, int count, int budgetMs) {
+        return RunCpuThreadBenchmark([&]() -> std::string {
 #ifdef USE_NUMAS
-        static thread_local std::string result;
-        try {
             if (!counts || count < 1 || count > 8 || hidden < 256 || hidden > 8192 ||
-                    intermediate < 256 || intermediate > 4096 || rows < 1 || rows > 32 ||
-                    topk < 1 || topk > 16 || budgetMs < 1 || budgetMs > 1000) return nullptr;
+                    intermediate < 256 || intermediate > 4096 || rows < 1 ||
+                    topk < 1 || topk > 16 || budgetMs < 1 || budgetMs > 1000)
+                throw std::invalid_argument("invalid standard NUMA MoE calibration arguments");
             for (int i = 0; i < count; ++i)
-                if (counts[i] < 1 || counts[i] > 128) return nullptr;
-            result = BenchmarkCpuMoeThreads(hidden, intermediate, kind, rows, topk, counts, count, budgetMs, true, downKind);
-            return result.c_str();
-        } catch (...) { return nullptr; }
+                if (counts[i] < 1 || counts[i] > 128)
+                    throw std::invalid_argument("invalid NUMA thread candidate");
+            return BenchmarkCpuMoeThreads(hidden, intermediate, kind, rows, topk, counts, count, budgetMs, true, downKind);
 #else
-        return nullptr;
+            throw std::runtime_error("NUMA calibration requires a USE_NUMAS build");
 #endif
+        });
     }
 
     DLL_EXPORT void set_cpu_low_mem(bool low) {

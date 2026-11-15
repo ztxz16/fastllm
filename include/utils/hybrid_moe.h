@@ -56,6 +56,10 @@ void RunRemoteHybridMoe(HybridMoeRemoteWorkspace &workspace,
 // Both placements use the same kernels and cache policy in NUMA-enabled builds.
 bool IsSharedHostMoeDevice(const std::string &device);
 
+// The model supplies its activation semantics; the weight backend supplies
+// any native projection/reduction semantics. Storage placement is independent.
+bool MoeHasNativeFp32Output(const Data *weight, HybridMoeMath math);
+
 // Full prefill timings are meaningful for these host-expert layouts. Keep
 // this capability independent of model names and cache capacity.
 bool HybridMoeMeasuredNativePrefill(const Data *gate, const Data *down,
@@ -141,6 +145,24 @@ public:
     void Finish(int device);
 private:
     std::map<int, HybridMoeDecodeStep> steps;
+};
+
+// Shape-sized eager entry to the same native mailbox used by full graphs.
+// All rows share one expert plan, cache lookup and NUMA batch. One workspace
+// retains only its current shape, so changing concurrency cannot accumulate
+// graph variants. Keep weights/cache owners alive until this object is released.
+class HybridMoeBatch {
+public:
+    HybridMoeBatch();
+    ~HybridMoeBatch();
+    HybridMoeBatch(const HybridMoeBatch &) = delete;
+    HybridMoeBatch &operator=(const HybridMoeBatch &) = delete;
+    bool Run(const Data &input, const Data &index, const Data &score, Data &output,
+             Data **weights, int count, int layer,
+             const std::function<void()> &launchParallel = {});
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl;
 };
 
 // Device/shape eligibility is centralized; model code only supplies placement,

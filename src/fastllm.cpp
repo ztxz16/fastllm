@@ -6,6 +6,7 @@
 
 #include "fastllm.h"
 #include "utils/inference_trace.h"
+#include "exl3.h"
 #include "kvmem.h"
 #if defined(USE_CUDA) && !defined(USE_ROCM)
 #include "devices/cuda/fastllm-fp8-auxiliary.h"
@@ -49,6 +50,7 @@
 
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
+#include "devices/cuda/fastllm-cuda-sampling.h"
 #include "fastllm-multicuda.cuh"
 #endif
 
@@ -629,6 +631,7 @@ namespace fastllm {
         {DataType::NVFP4_BLOCK_16_E8M0, {"nvfp4_block_16_e8m0"}},
         {DataType::NVFP4_BLOCK_16_E4M3, {"nvfp4_block_16_e4m3"}},
         {DataType::INT4_GROUP32, {"int4_group32"}},
+        {DataType::EXL3, {"exl3"}},
         {DataType::NVFP4_BLOCK_32_E8M0, {"nvfp4_block_32_e8m0"}},
         {DataType::INF_INT8_PERCHANNEL, {"inf_int8_perchannel"}}, {DataType::INF_INT8_GROUP128, {"inf_int8_group128"}},
         {DataType::INF_INT8_GROUP32, {"inf_int8_group32"}},
@@ -1253,6 +1256,7 @@ namespace fastllm {
         this->tpKVHeads = ori.tpKVHeads;
         this->tpHeadDim = ori.tpHeadDim;
         this->tpSplitUnit = ori.tpSplitUnit;
+        if (ori.dataType == DataType::EXL3) { blockK = ori.blockK; blockM = ori.blockM; }
         bool needRebuildGGUFTensor = ori.dataType == DataType::DATA_GGUF_FORMAT &&
                                      (this->ggmlTensor == nullptr || this->ggmlType != ori.ggmlType);
         this->isGGUFData = ori.isGGUFData || ori.dataType == DataType::DATA_GGUF_FORMAT;
@@ -1307,7 +1311,8 @@ namespace fastllm {
         }
 
         if (this->dataDevice == DataDevice::CPU) {
-            std::memcpy(this->cpuData, ori.cpuData, this->GetBytes());
+            if (ori.dataType == EXL3 && !ori.cpuData && !ori.numasData.empty()) Exl3CopyCanonical(ori, this->cpuData);
+            else std::memcpy(this->cpuData, ori.cpuData, this->GetBytes());
         } else if (this->dataDevice == DataDevice::CUDA) {
 #ifdef USE_CUDA
             FastllmCudaCopyFromDeviceToDevice(this->cudaData, ori.cudaData, this->GetBytes());
@@ -1604,6 +1609,13 @@ namespace fastllm {
             int groupCnt, int blockK, int blockM) {
         auto &data = *this;
         data.weightType = weightType;
+        if (dataType == DataType::EXL3) {
+            AssertInFastLLM(oriDataType == DataType::EXL3, "EXL3 is a source format, not a float quantizer.");
+            this->blockK = blockK; this->blockM = blockM;
+            UpdateUnitSize(); Allocate(false);
+            memcpy(cpuData, oriData, GetBytes());
+            return;
+        }
         if (dataType == oriDataType &&
             (dataType == DataType::NVFP4 || dataType == DataType::NVFP4_BLOCK_16 ||
              dataType == DataType::NVFP4_BLOCK_16_PLANAR ||
@@ -1956,6 +1968,11 @@ namespace fastllm {
     }
 
     void Data::UpdateUnitSize() {
+        if (dataType == DataType::EXL3) {
+            unitSize = unitSizeDiv = 1;
+            expansionBytes = ((dims.size() == 2 || dims.size() == 3) && blockK > 0 && blockM > 0) ? Exl3StorageBytes(*this) : 0;
+            return;
+        }
         if (this->dataType == DataType::INT4_GROUP32 && this->dims.size() >= 2) {
             const int columns = this->dims.back();
             AssertInFastLLM(columns % 32 == 0,
@@ -2244,6 +2261,7 @@ namespace fastllm {
         if (this->dims.empty() || this->strides.empty() || this->Count(0) == 0) {
             return 0;
         }
+        if (this->dataType == DataType::EXL3) return Exl3StorageBytes(*this);
         if (this->dataType == DataType::DATA_GGUF_FORMAT) {
             return ggml_nbytes((ggml_tensor*)this->ggmlTensor);
         }
@@ -2273,7 +2291,9 @@ namespace fastllm {
 
     void Data::MallocSpace(uint64_t size, bool zero) {
         this->expansionSize = size;
-        if ((this->dataType == DataType::FP8_E4M3_BLOCK_128 ||
+        if (dataType == DataType::EXL3) {
+            expansionBytes = Exl3StorageBytes(*this);
+        } else if ((this->dataType == DataType::FP8_E4M3_BLOCK_128 ||
              this->dataType == DataType::FP8_E4M3_PERCHANNEL ||
              this->dataType == DataType::NVFP4_BLOCK_16 ||
              this->dataType == DataType::NVFP4_BLOCK_16_PLANAR ||
@@ -2462,7 +2482,11 @@ namespace fastllm {
             }
         }
 
-        uint64_t oldBytes = GetBytes();
+        // Logical zero-length views can retain reserved storage (for example
+        // a speculative QSA tail after rollback). There is nothing to copy,
+        // and Count(axis) can be zero even though expansionBytes is nonzero.
+        const bool hasValues = std::all_of(this->dims.begin(), this->dims.end(),
+                                          [](int size) { return size > 0; });
         int input1Stride = this->Count(axis);
 
         this->strides.resize(dims.size(), 1);
@@ -2475,7 +2499,7 @@ namespace fastllm {
             if (this->dataDevice == DataDevice::CPU) {
                 uint8_t *old = this->cpuData;
                 MallocSpace(this->strides[0] * std::max(this->dims[0], dims[0]));
-                int outer = this->Count(0) / this->Count(axis);
+                int outer = hasValues ? this->Count(0) / this->Count(axis) : 0;
                 int input0Stride = this->Count(axis);
                 int inner = this->strides[axis];
                 int unitSize = this->unitSize;
@@ -2490,12 +2514,14 @@ namespace fastllm {
                 uint8_t *old = (uint8_t*)this->cudaData;
                 bool oldBorrowed = this->cudaDataBorrowed;
                 MallocSpace(this->strides[0] * std::max(this->dims[0], dims[0]));
-                int outer = this->Count(0) / this->Count(axis);
+                int outer = hasValues ? this->Count(0) / this->Count(axis) : 0;
                 int input0Stride = this->Count(axis);
                 int inner = this->strides[axis];
                 int unitSize = this->unitSize;
-                FastllmCudaMemcpy2DDeviceToDevice((uint8_t*)this->cudaData, input0Stride * unitSize,
-                                            (uint8_t*)old, input1Stride * unitSize, this->dims[axis] * inner * unitSize, outer);
+                if (outer > 0) {
+                    FastllmCudaMemcpy2DDeviceToDevice((uint8_t*)this->cudaData, input0Stride * unitSize,
+                                                (uint8_t*)old, input1Stride * unitSize, this->dims[axis] * inner * unitSize, outer);
+                }
                 if (!oldBorrowed) {
                     CudaFreeForData(*this, old);
                 }
@@ -2513,6 +2539,9 @@ namespace fastllm {
     }
 
     Data::~Data() {
+#ifdef USE_CUDA
+        if (this->dataType == DataType::EXL3 && !this->isFake) FastllmCudaReleaseExl3(this);
+#endif
         if (this->isDiskWeight) {
             ReleaseDiskMoeCache(this);
         }
@@ -2987,6 +3016,8 @@ namespace fastllm {
 
                         if (cpuData != nullptr) {
                             FastllmCudaCopyFromHostToDevice(this->cudaData, cpuData, copyBytes);
+                        } else if (this->dataType == EXL3 && !this->numasData.empty()) {
+                            FastllmCudaRestoreExl3Weight(*this, this->cudaData);
                         } else if (!this->numasData.empty() && this->dims.size() == 2) {
                             int numaCnt = this->numasData.size();
                             int k = this->dims[0], m = this->dims[1];
@@ -3113,6 +3144,8 @@ namespace fastllm {
                         FastllmCudaCopyFromHostToDevice(this->cudaData, this->cpuData, bytes);
                     }
                 }
+            } else if (this->dataType == EXL3 && !this->numasData.empty()) {
+                FastllmCudaRestoreExl3Weight(*this, this->cudaData, stream);
             } else {
                 int numaCnt = this->numasData.size();
                 int k = this->dims[0], m = this->dims[1];
@@ -3525,75 +3558,118 @@ namespace fastllm {
             if (!config.AllowsToolToken(token)) values[token] = -INFINITY;
     }
 
+#ifdef USE_CUDA
+    // Keep the existing top-p arithmetic and RNG on the host. Only selection
+    // moves to the GPU, so ordinary sampling reads back at most 64 candidates.
+    static bool CudaSamplingCandidates(Data &logits, int offset,
+            const GenerationConfig &config, std::vector<std::pair<float,int>> &values) {
+        if (logits.dataDevice != CUDA || logits.dataType != FLOAT32 || !logits.cudaData ||
+            logits.multiDeviceData || logits.dims.empty() || logits.dims.back() <= 0 || offset < 0 ||
+            (uint64_t(offset)+1)*logits.dims.back() > logits.Count(0) ||
+            config.tool_call_token_mask || !config.tool_call_allowed_token_ids.empty() ||
+            fabs(config.repeat_penalty - 1.0) > 1e-6) return false;
+        const int vocab = logits.dims.back();
+        const int k = std::max(1,std::min(vocab,config.top_k));
+        const float inverse = 1.0f / config.temperature;
+        if (k > FastllmCudaLogitsTopKCapacity || !std::isfinite(inverse) || inverse <= 0.f ||
+            FastllmCudaGraphIsCapturing()) return false;
+        const int device = logits.dataDeviceIds.empty() ? FastllmCudaGetDevice() : logits.dataDeviceIds[0];
+        FastllmCudaSetDevice(device);
+        struct Workspace { Data scratch, selected; };
+        static thread_local std::map<int,Workspace> workspaces;
+        auto &w = workspaces[device];
+        const size_t bytes = FastllmCudaLogitsTopKWorkspaceBytes(1,vocab);
+        if (!bytes || (bytes+3)/4 > size_t(INT_MAX)) return false;
+        auto allocate = [&](Data &data, int count) {
+            data.dataType = INT32; data.Resize({count});
+            data.ToDevice(CUDA,std::vector<int>{device},false); data.Allocate(false);
+        };
+        allocate(w.scratch,(bytes+3)/4);
+        allocate(w.selected,FastllmCudaLogitsTopKCapacity*sizeof(FastllmCudaTopKCandidate)/sizeof(int));
+        FastllmCudaTopKRow row{static_cast<const float *>(logits.cudaData)+size_t(offset)*vocab,inverse};
+        if (!FastllmCudaLogitsTopK(&row,1,vocab,
+                static_cast<FastllmCudaTopKCandidate *>(w.selected.cudaData),w.scratch.cudaData,bytes)) return false;
+        FastllmCudaTopKCandidate selected[FastllmCudaLogitsTopKCapacity];
+        FastllmCudaCopyFromDeviceToHost(selected,w.selected.cudaData,k*sizeof(selected[0]));
+        if (selected[0].token < 0) return false;
+        values.reserve(k);
+        for (int i=0;i<k;++i) values.emplace_back(selected[i].score,selected[i].token);
+        return true;
+    }
+#endif
+
     int LLMSampling(Data &logits, int outerOffset,
                     const GenerationConfig &config, const LastTokensUnit &tokens) {
-        logits.ToDevice(DataDevice::CPU);
-        int vocabSize = logits.dims.back();
-        float *base = ((float*)logits.cpuData) + outerOffset * vocabSize;
+        const int vocabSize = logits.dims.back();
+        int topk = std::max(1, std::min(vocabSize, config.top_k));
+        std::vector<std::pair<float,int>> v;
+        const bool hasToolMask = config.tool_call_token_mask || !config.tool_call_allowed_token_ids.empty();
+        bool selected = false;
+#ifdef USE_CUDA
+        selected = CudaSamplingCandidates(logits, outerOffset, config, v);
+#endif
+        if (!selected) {
+            logits.ToDevice(DataDevice::CPU);
+            float *base = ((float*)logits.cpuData) + outerOffset * vocabSize;
 
-        if (fabs(config.repeat_penalty - 1.0) > 1e-6) {
-            std::multiset<int>::iterator begin = tokens.tokenSet.begin();
-            std::multiset<int>::iterator end = tokens.tokenSet.end();
-            std::set<int> unique(tokens.tokenSet.begin(), tokens.tokenSet.end());
-            if (config.last_n <= 0) {
-                begin = unique.begin();
-                end = unique.end();
-            }
-            for (std::multiset<int>::iterator iter = begin; iter != end; ++iter) {
-                int id = *iter;
-                base[id] = (base[id] < 0 ? base[id] * config.repeat_penalty : base[id] / config.repeat_penalty);
-            }
-        }
-        float invTemp = 1.0f / config.temperature;
-        int topk = std::min(vocabSize, config.top_k);
-        if (topk <= 0) {
-            topk = 1;
-        }
-        std::vector <std::pair <float, int> > v;
-        bool hasToolMask = config.tool_call_token_mask || !config.tool_call_allowed_token_ids.empty();
-        if (topk <= 64) {
-            v.reserve(topk);
-            auto betterThan = [](const std::pair<float, int> &a,
-                                  const std::pair<float, int> &b) {
-                return a.first > b.first || (a.first == b.first && a.second < b.second);
-            };
-            std::priority_queue<
-                std::pair<float, int>,
-                std::vector<std::pair<float, int> >,
-                decltype(betterThan)> heap(betterThan);
-            for (int i = 0; i < vocabSize; i++) {
-                if (hasToolMask && !config.AllowsToolToken(i)) {
-                    continue;
+            if (fabs(config.repeat_penalty - 1.0) > 1e-6) {
+                std::multiset<int>::iterator begin = tokens.tokenSet.begin();
+                std::multiset<int>::iterator end = tokens.tokenSet.end();
+                std::set<int> unique(tokens.tokenSet.begin(), tokens.tokenSet.end());
+                if (config.last_n <= 0) {
+                    begin = unique.begin();
+                    end = unique.end();
                 }
-                std::pair<float, int> cur = std::make_pair(base[i] * invTemp, i);
-                if ((int)heap.size() < topk) {
-                    heap.push(cur);
-                    continue;
+                for (std::multiset<int>::iterator iter = begin; iter != end; ++iter) {
+                    int id = *iter;
+                    base[id] = (base[id] < 0 ? base[id] * config.repeat_penalty : base[id] / config.repeat_penalty);
                 }
-                if (betterThan(cur, heap.top())) {
+            }
+            float invTemp = 1.0f / config.temperature;
+            if (topk <= 64) {
+                v.reserve(topk);
+                auto betterThan = [](const std::pair<float, int> &a,
+                                      const std::pair<float, int> &b) {
+                    return a.first > b.first || (a.first == b.first && a.second < b.second);
+                };
+                std::priority_queue<
+                    std::pair<float, int>,
+                    std::vector<std::pair<float, int> >,
+                    decltype(betterThan)> heap(betterThan);
+                for (int i = 0; i < vocabSize; i++) {
+                    if (hasToolMask && !config.AllowsToolToken(i)) {
+                        continue;
+                    }
+                    std::pair<float, int> cur = std::make_pair(base[i] * invTemp, i);
+                    if ((int)heap.size() < topk) {
+                        heap.push(cur);
+                        continue;
+                    }
+                    if (betterThan(cur, heap.top())) {
+                        heap.pop();
+                        heap.push(cur);
+                    }
+                }
+                while (!heap.empty()) {
+                    v.push_back(heap.top());
                     heap.pop();
-                    heap.push(cur);
                 }
-            }
-            while (!heap.empty()) {
-                v.push_back(heap.top());
-                heap.pop();
-            }
-            std::sort(v.begin(), v.end(), betterThan);
-        } else {
-            v.reserve(vocabSize);
-            for (int i = 0; i < vocabSize; i++) {
-                if (hasToolMask && !config.AllowsToolToken(i)) {
-                    continue;
+                std::sort(v.begin(), v.end(), betterThan);
+            } else {
+                v.reserve(vocabSize);
+                for (int i = 0; i < vocabSize; i++) {
+                    if (hasToolMask && !config.AllowsToolToken(i)) {
+                        continue;
+                    }
+                    v.push_back(std::make_pair(-base[i] * invTemp, i));
                 }
-                v.push_back(std::make_pair(-base[i] * invTemp, i));
-            }
-            topk = std::min(topk, (int)v.size());
-            if (topk > 0) {
-                std::partial_sort(v.begin(), v.begin() + topk, v.end());
-            }
-            for (int i = 0; i < topk; i++) {
-                v[i].first = -v[i].first;
+                topk = std::min(topk, (int)v.size());
+                if (topk > 0) {
+                    std::partial_sort(v.begin(), v.begin() + topk, v.end());
+                }
+                for (int i = 0; i < topk; i++) {
+                    v[i].first = -v[i].first;
+                }
             }
         }
         AssertInFastLLM(!config.tool_call_token_mask || !v.empty(), "Empty tool grammar sampling support.");

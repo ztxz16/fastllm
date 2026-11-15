@@ -7,14 +7,14 @@ if [[ -z "${FTLLM_BUNDLE_ROOT:-}" || ! -d "${FTLLM_BUNDLE_ROOT}/runtime" ]]; the
 fi
 
 export FTLLM_HOME="$FTLLM_BUNDLE_ROOT"
-export PATH="${FTLLM_BUNDLE_ROOT}:${FTLLM_BUNDLE_ROOT}/runtime/bin:${PATH:-/usr/bin:/bin}"
+export PATH="${FTLLM_BUNDLE_ROOT}:${FTLLM_BUNDLE_ROOT}/media/bin:${FTLLM_BUNDLE_ROOT}/runtime/bin:${PATH:-/usr/bin:/bin}"
 export PYTHONDONTWRITEBYTECODE=1
 export PYTHONNOUSERSITE=1
 export PYTHONUTF8=1
 unset PYTHONHOME
 unset PYTHONPATH
 
-_ftllm_library_path="${FTLLM_BUNDLE_ROOT}/runtime/lib"
+_ftllm_library_path="${FTLLM_BUNDLE_ROOT}/runtime/lib:${FTLLM_BUNDLE_ROOT}/media/lib"
 for _ftllm_lib_dir in "${FTLLM_BUNDLE_ROOT}"/runtime/lib/python*/site-packages/nvidia/*/lib; do
     [[ -d "$_ftllm_lib_dir" ]] || continue
     _ftllm_library_path="${_ftllm_library_path}:${_ftllm_lib_dir}"

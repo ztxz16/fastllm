@@ -108,15 +108,63 @@ static __global__ void stream_k_fixup_to_output(
     }
 }
 
+template <int qk, int mmq_x, int nwarps, bool need_check,
+          typename OutputType>
+static __global__ void stream_k_fixup_small_output(
+        const float *__restrict__ source,
+        const float *__restrict__ last_tile,
+        OutputType *__restrict__ output,
+        int ne00, int ne01, int ne11, int ne0, int block_num_mmq) {
+    constexpr int mmq_y = get_mmq_y_device();
+    constexpr int blocks_per_iter = MMQ_ITER_K / qk;
+    const int64_t blocks_per_ne00 = ne00 / qk;
+
+    const int column = blockIdx.x * WARP_SIZE + threadIdx.x;
+    const int row = blockIdx.y * nwarps + threadIdx.y;
+    if (column >= ne01 || row >= ne11) return;
+    const int it = column / mmq_y, jt = row / mmq_x;
+    const int ntx = (ne11 + mmq_x - 1) / mmq_x;
+    const int nty = (ne01 + mmq_y - 1) / mmq_y;
+    const int64_t tile = int64_t(jt) * nty + it, tiles = int64_t(ntx) * nty;
+    const int begin = tile * block_num_mmq / tiles;
+    const int end = ((tile + 1) * block_num_mmq + tiles - 1) / tiles;
+    float sum = 0.f;
+    bool any = false;
+    int64_t next = int64_t(begin) * blocks_per_ne00 * tiles / block_num_mmq;
+    for (int producer = begin; producer < end; ++producer) {
+        const int64_t previous = next;
+        next = int64_t(producer + 1) * blocks_per_ne00 * tiles / block_num_mmq;
+        const int64_t first = previous - (previous % blocks_per_ne00) % blocks_per_iter;
+        const int64_t stop = next - (next % blocks_per_ne00) % blocks_per_iter;
+        if (first == stop || stop % blocks_per_ne00 == 0 || stop / blocks_per_ne00 != tile) continue;
+        any = true;
+        sum += last_tile[size_t(producer) * mmq_x * mmq_y +
+                         (row % mmq_x) * mmq_y + column % mmq_y];
+    }
+    float value = source[size_t(row) * ne0 + column];
+    if (any) value += sum;
+    output[size_t(row) * ne0 + column] = mmq_io<OutputType>::from_float(value);
+}
+
 template <int qk, int mmq_x, bool need_check, typename OutputType>
 void launch_mmq_fixup_to_output(
         const mmq_args &args, const float *last_tile, OutputType *output,
         dim3 output_tiles, int block_num_mmq, cudaStream_t stream) {
     const dim3 threads(WARP_SIZE, MMQ_NWARPS, 1);
-    stream_k_fixup_to_output<qk, mmq_x, MMQ_NWARPS, need_check, OutputType>
-        <<<output_tiles, threads, 0, stream>>>(
-            args.dst, last_tile, output,
-            args.ne00, args.ne01, args.ne11, args.ne0, block_num_mmq);
+    // Splitting the output columns into warps provides four times as many
+    // CTAs. Use it only for grids starved of parallelism relative to the
+    // producer grid; larger outputs retain the vectorized reduction.
+    if (uint64_t(output_tiles.x) * output_tiles.y * 4 < uint64_t(block_num_mmq)) {
+        stream_k_fixup_small_output<qk, mmq_x, MMQ_NWARPS, need_check, OutputType>
+            <<<dim3((args.ne01 + WARP_SIZE - 1) / WARP_SIZE,
+                    (args.ne11 + MMQ_NWARPS - 1) / MMQ_NWARPS), threads, 0, stream>>>(
+                args.dst, last_tile, output,
+                args.ne00, args.ne01, args.ne11, args.ne0, block_num_mmq);
+    } else {
+        stream_k_fixup_to_output<qk, mmq_x, MMQ_NWARPS, need_check, OutputType>
+            <<<output_tiles, threads, 0, stream>>>(args.dst, last_tile, output,
+                args.ne00, args.ne01, args.ne11, args.ne0, block_num_mmq);
+    }
 }
 
 template <typename OutputType>

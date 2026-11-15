@@ -1,9 +1,12 @@
+#include "utils/kernel_registry.h"
 #include "utils/qwen38_hybrid.h"
 #include "models/deepseekv41-indexer.cuh"
 #include "devices/cuda/fastllm-prefill-workspace.h"
 #include "gguf.h"
+#include "exl3.h"
 #include "devices/cuda/fastllm-cuda-v41-gguf.h"
 #include "devices/cuda/fastllm-cuda-gguf-projections.h"
+#include "devices/cuda/fastllm-cuda-linear-shared.h"
 #include "devices/cuda/fastllm-cuda-gguf-linear-add.h"
 #include "devices/cuda/fastllm-cuda-gdn.h"
 #include "devices/cuda/fastllm-cuda-rmsnorm-small-linear.h"
@@ -42,6 +45,46 @@ extern "C" bool FastllmCudaDeepSeekV41HcPost(const fastllm::Data&, const fastllm
 #include <thread>
 #include <tuple>
 #include <vector>
+
+bool FastllmCudaLinearShared(const fastllm::Data &input,
+        fastllm::Data *const *weights, fastllm::Data *const *outputs, int count) {
+    using namespace fastllm;
+    if (count < 2 || !weights || !outputs || input.dims.empty() || input.dims.back() <= 0) return false;
+    for (int i = 0; i < count; ++i) if (!weights[i] || !outputs[i]) return false;
+    const DataType type = weights[0]->dataType;
+    for (int i = 1; i < count; ++i) if (weights[i]->dataType != type) return false;
+    // GGUF owns its packed tensor strides and validates those through ggmlTensor.
+    if (type == DATA_GGUF_FORMAT) return FastllmCudaGGUFLinearShared(input, weights, outputs, count);
+    if (type != EXL3) return false;
+    const std::vector<int> device{FastllmCudaGetDevice()};
+    auto resident = [&](const Data &d) {
+        if (d.multiDeviceData || d.dataDevice != CUDA || d.dataDeviceIds != device || !d.cudaData ||
+            d.dims.empty() || d.strides.size() != d.dims.size()) return false;
+        uint64_t stride = 1;
+        for (int i = int(d.dims.size()) - 1; i >= 0; --i) {
+            if (d.dims[i] <= 0 || d.strides[i] != stride) return false;
+            stride *= d.dims[i];
+        }
+        return true;
+    };
+    auto floating = [](DataType t) { return t == FLOAT32 || t == FLOAT16 || t == BFLOAT16; };
+    auto overlap = [](const Data &a, const Data &b) {
+        const uintptr_t x = reinterpret_cast<uintptr_t>(a.cudaData), y = reinterpret_cast<uintptr_t>(b.cudaData);
+        return x < y + b.GetBytes() && y < x + a.GetBytes();
+    };
+    if (!resident(input) || !floating(input.dataType)) return false;
+    const uint64_t rows = input.Count(0) / input.dims.back();
+    for (int i = 0; i < count; ++i) {
+        if (!resident(*weights[i]) || !resident(*outputs[i]) ||
+            weights[i]->dims.size() != 2 || weights[i]->dims[1] != input.dims.back() ||
+            !floating(outputs[i]->dataType) || outputs[i]->dims.back() != weights[i]->dims[0] ||
+            outputs[i]->Count(0) != rows * weights[i]->dims[0] || overlap(input, *outputs[i])) return false;
+        for (int j = 0; j < count; ++j)
+            if (overlap(*weights[j], *outputs[i]) ||
+                (j < i && overlap(*outputs[j], *outputs[i]))) return false;
+    }
+    return FastllmCudaExl3LinearShared(input, weights, outputs, count);
+}
 
 #if !defined(_WIN32) && !defined(USE_ROCM)
 #include <arpa/inet.h>
@@ -1240,7 +1283,19 @@ namespace fastllm {
     }
 
     bool TryCudaTritonSmallProjection(const Data &input, Data &weight, Data &output, int groups) {
-        if (!CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON")) return false;
+        return TryCudaTritonSmallProjectionCandidate(input, weight, output, groups, false);
+    }
+    bool TryCudaTritonMxfp4Grouped(const Data &input, Data &activation, const unsigned char *records,
+            const int *slots, const int *routes, const float *scores, float *output, void *scratch,
+            int count, int hidden, int inter, int topk, size_t stride, size_t down, float limit, bool planar) {
+        return TryCudaTritonMxfp4GroupedCandidate(input, activation, records, slots, routes, scores,
+            output, scratch, count, hidden, inter, topk, stride, down, limit, planar, false);
+    }
+
+    bool TryCudaTritonSmallProjectionCandidate(const Data &input, Data &weight, Data &output, int groups, bool tuningCandidate, int blockRows) {
+        if (blockRows != 0 && blockRows != 32 && blockRows != 64) return false;
+        if (!tuningCandidate && kernels::bypassDepth) return false;
+        if (!tuningCandidate && !CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON")) return false;
         const char *flag = std::getenv("FASTLLM_CUDA_TRITON_SMALL_PROJECTION");
         if (flag && flag[0] && !CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON_SMALL_PROJECTION")) return false;
         const int arch = CudaTritonRuntimeArch(), device = FastllmCudaGetDevice();
@@ -1255,7 +1310,7 @@ namespace fastllm {
             }
             return true;
         };
-        if ((arch != 120 && arch != 121) || groups <= 0 ||
+        if ((arch != 120 && arch != 121) || groups <= 0 || groups > 65535 ||
             !local(input) || !local(weight) || !local(output) ||
             input.dataType != BFLOAT16 || output.dataType != BFLOAT16 ||
             (weight.dataType != FP8_E4M3 && weight.dataType != BFLOAT16) ||
@@ -1265,7 +1320,7 @@ namespace fastllm {
         if (n <= 0 || k <= 0 || n % 32 || k % 32 || input.Count(0) % width ||
             weight.Count(0) > INT_MAX || input.Count(0) > INT_MAX) return false;
         const uint64_t rows64 = input.Count(0) / width;
-        if (rows64 < 2 || rows64 > 16 || output.Count(0) != rows64 * groups * n) return false;
+        if (rows64 < 2 || (!blockRows && rows64 > 16) || rows64 * groups * n > INT_MAX || output.Count(0) != rows64 * groups * n) return false;
         auto overlaps = [](const Data &a, const Data &b) {
             const uintptr_t x = reinterpret_cast<uintptr_t>(a.cudaData), y = reinterpret_cast<uintptr_t>(b.cudaData);
             return x < y + b.GetBytes() && y < x + a.GetBytes();
@@ -1280,9 +1335,10 @@ namespace fastllm {
         const int bn = groups == 1 && n >= 16384 && k <= 2048 ? 64 : 32;
         const int bk = bn == 64 ? (fp8 ? 128 : 64) : (groups > 1 ? 128 : 256);
         const std::string dir = CudaTritonCacheDir();
-        const std::string base = "small_projection_v1_sm" + std::to_string(arch) + "_fp8" +
+        const std::string op = blockRows ? "batched_projection" : "small_projection";
+        const std::string base = op + "_v1_sm" + std::to_string(arch) + "_fp8" +
             std::to_string(fp8) + "_n" + std::to_string(n) + "_k" + std::to_string(k) +
-            "_bn" + std::to_string(bn) + "_bk" + std::to_string(bk) + "_w4_s3";
+            (blockRows ? "_bm" + std::to_string(blockRows) : "") + "_bn" + std::to_string(bn) + "_bk" + std::to_string(bk) + "_w4_s3";
         const std::string path = CudaTritonJoinPath(dir, base + ".json");
         static std::mutex mutex;
         static std::map<std::string, CudaTritonKernelMeta> cache;
@@ -1298,8 +1354,8 @@ namespace fastllm {
                 auto json = json11::Json::parse(body, error);
                 if (!error.empty() || !json["ok"].bool_value()) {
                     if (!CudaTritonEnsureServer()) return false;
-                    json11::Json request = json11::Json::object{{"op", "small_projection"}, {"arch", arch},
-                        {"cache_dir", dir}, {"n", n}, {"k", k}, {"fp8", fp8}, {"block_n", bn}, {"block_k", bk}};
+                    json11::Json request = json11::Json::object{{"op", op}, {"arch", arch},
+                        {"cache_dir", dir}, {"n", n}, {"k", k}, {"fp8", fp8}, {"block_n", bn}, {"block_k", bk}, {"block_m", blockRows}};
                     int status = 0;
                     if (!CudaTritonHttpRequest("POST", "/compile", request.dump(), &status, body) || status != 200)
                         return false;
@@ -1310,6 +1366,7 @@ namespace fastllm {
                 meta.shared = json["shared"].int_value(); meta.numWarps = json["num_warps"].int_value();
                 if (!error.empty() || !json["ok"].bool_value() || json["version"].int_value() != 1 ||
                     json["arch"].int_value() != arch || json["n"].int_value() != n || json["k"].int_value() != k ||
+                    (blockRows && json["block_m"].int_value() != blockRows) ||
                     json["fp8"].int_value() != fp8 || json["block_n"].int_value() != bn || json["block_k"].int_value() != bk ||
                     meta.kernelName.empty() || meta.shared < 0 || meta.shared > 101376 || meta.numWarps != 4 ||
                     !CudaTritonFileExists(meta.cubinPath)) return false;
@@ -1317,7 +1374,7 @@ namespace fastllm {
             }
         }
         return FastllmCudaTritonSmallProjection(meta.cubinPath.c_str(), meta.kernelName.c_str(), meta.shared,
-                                               input, weight, output, int(rows64), groups, n, bn);
+                                               input, weight, output, int(rows64), groups, n, bn, blockRows);
     }
 
     bool CudaTritonMxfp4GroupedEnabled() {
@@ -1328,7 +1385,9 @@ namespace fastllm {
             return false;
         if (flag && flag[0] && !CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON_MXFP4_GROUPED"))
             return false;
-        const bool explicitlyEnabled = globalEnabled || (flag && flag[0]);
+        const bool explicitlyEnabled = globalEnabled || (flag && flag[0]) ||
+            kernels::CandidateAllowed("cuda.moe.nvfp4.triton") ||
+            kernels::CandidateAllowed("cuda.moe.nvfp4.triton.batch");
         if (!explicitlyEnabled && !CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON_MXFP4_GROUPED_AUTO"))
             return false;
         const int arch = CudaTritonRuntimeArch();
@@ -1336,18 +1395,23 @@ namespace fastllm {
         return arch == 120 || (arch == 121 && explicitlyEnabled);
     }
 
-    bool TryCudaTritonMxfp4Grouped(const Data &input, Data &activation, const unsigned char *records,
+    static bool TryCudaTritonMxfp4GroupedImpl(const Data &input, Data &activation, const unsigned char *records,
                                    const int *slots, const int *routes, const float *scores, float *output,
                                    void *scratch, int count, int hidden, int inter, int topk, size_t stride,
-                                   size_t down, float limit, bool planar) {
+                                   size_t down, float limit, bool planar, bool tuningCandidate, bool batch) {
+        if (!tuningCandidate && kernels::bypassDepth) return false;
+        if (batch && !planar) return false;
         if (!CudaTritonMxfp4GroupedEnabled())
             return false;
         if (hidden != 5120 || inter != 2304 || (topk != 6 && (!planar || topk != 3)) || limit != 10.0f ||
             down != size_t(2 * inter) * (hidden / 32) * 17 ||
-            stride != down + size_t(hidden) * (inter / 32) * 17 || count < 4 || count > 48 || !records ||
+            stride != down + size_t(hidden) * (inter / 32) * 17 || count < 4 ||
+            count > (batch ? kCudaTritonMxfp4GroupedMaxRoutes : 48) || !records ||
             !slots || !routes || !scores || !output || (!planar && !scratch) || input.dataType != BFLOAT16 ||
             input.dataDevice != CUDA || !input.cudaData || input.dims.size() != 2 || input.dims[0] < 2 ||
-            input.dims[0] > 8 || input.dims[1] != hidden || activation.dataType != BFLOAT16 ||
+            (!batch && input.dims[0] > 8) ||
+            uint64_t(input.dims[0]) * topk * std::max(hidden, inter) > INT_MAX ||
+            input.dims[1] != hidden || activation.dataType != BFLOAT16 ||
             activation.dataDevice != CUDA || !activation.cudaData ||
             activation.Count(0) < size_t(input.dims[0]) * topk * inter || count > input.dims[0] * topk ||
             input.multiDeviceData || activation.multiDeviceData || input.cudaData == activation.cudaData ||
@@ -1356,9 +1420,10 @@ namespace fastllm {
             return false;
         int arch = CudaTritonRuntimeArch();
         std::string dir = CudaTritonCacheDir();
-        std::string base = planar ?
-            "mxfp4_grouped_v6_planar_sm" + std::to_string(arch) + "_h5120_i2304_k" + std::to_string(topk) + "_n32_64_k256_w4_s2" :
-            "mxfp4_grouped_v3_sm" + std::to_string(arch) + "_h5120_i2304_k6_n64_k128_w4_s3";
+        std::string base = batch ?
+            "mxfp4_grouped_batch_v2_planar_sm" + std::to_string(arch) + "_h5120_i2304_k" + std::to_string(topk) + "_m16_n32_64_k256_w4_s2" : planar ?
+            "mxfp4_grouped_v7_planar_sm" + std::to_string(arch) + "_h5120_i2304_k" + std::to_string(topk) + "_n32_64_k256_w4_s2" :
+            "mxfp4_grouped_v4_sm" + std::to_string(arch) + "_h5120_i2304_k6_n64_k128_w4_s3";
         std::string path = CudaTritonJoinPath(dir, base + ".json");
         struct Meta {
             CudaTritonKernelMeta kernels[3];
@@ -1386,7 +1451,7 @@ namespace fastllm {
                         return false;
                     }
                     json11::Json request =
-                        json11::Json::object{{"op", "mxfp4_grouped"}, {"arch", arch}, {"cache_dir", dir}, {"planar", planar}, {"topk", topk}};
+                        json11::Json::object{{"op", batch ? "mxfp4_grouped_batch" : "mxfp4_grouped"}, {"arch", arch}, {"cache_dir", dir}, {"planar", planar}, {"topk", topk}};
                     int status = 0;
                     if (!CudaTritonHttpRequest("POST", "/compile", request.dump(), &status, body) ||
                         status != 200) {
@@ -1396,7 +1461,8 @@ namespace fastllm {
                     error.clear();
                     json = json11::Json::parse(body, error);
                 }
-                bool valid = error.empty() && json["ok"].bool_value() && json["version"].int_value() == (planar ? 6 : 3) &&
+                bool valid = error.empty() && json["ok"].bool_value() && json["version"].int_value() == (batch ? 2 : planar ? 7 : 4) &&
+                             json["batch"].bool_value() == batch &&
                              json["arch"].int_value() == arch && json["planar"].bool_value() == planar &&
                              (!planar || json["topk"].int_value() == topk);
                 const char *keys[] = {"gate", planar ? "down" : "activate", "down"};
@@ -1426,6 +1492,20 @@ namespace fastllm {
         }
         return FastllmCudaTritonMxfp4Grouped(cubins, names, shared, input, activation, records, slots, routes,
                                              scores, output, scratch, count, planar);
+    }
+
+    bool TryCudaTritonMxfp4GroupedCandidate(const Data &input, Data &activation, const unsigned char *records,
+                                   const int *slots, const int *routes, const float *scores, float *output,
+                                   void *scratch, int count, int hidden, int inter, int topk, size_t stride,
+                                   size_t down, float limit, bool planar, bool tuningCandidate) {
+        return TryCudaTritonMxfp4GroupedImpl(input, activation, records, slots, routes, scores, output, scratch, count, hidden, inter, topk, stride, down, limit, planar, tuningCandidate, false);
+    }
+
+    bool TryCudaTritonMxfp4GroupedBatchCandidate(const Data &input, Data &activation, const unsigned char *records,
+                                   const int *slots, const int *routes, const float *scores, float *output,
+                                   void *scratch, int count, int hidden, int inter, int topk, size_t stride,
+                                   size_t down, float limit, bool planar, bool tuningCandidate) {
+        return TryCudaTritonMxfp4GroupedImpl(input, activation, records, slots, routes, scores, output, scratch, count, hidden, inter, topk, stride, down, limit, planar, tuningCandidate, true);
     }
 
     static bool CudaTritonRequestLinearFp8Block128Kernel(
@@ -6431,6 +6511,8 @@ namespace fastllm {
     }
 
     bool IsCudaLinearDataTypeSupported(DataType inputType, DataType weightType, DataType biasType) {
+        if (weightType == DataType::EXL3) return biasType == DataType::FLOAT32 &&
+            (inputType == DataType::FLOAT32 || inputType == DataType::FLOAT16 || inputType == DataType::BFLOAT16);
         if (biasType != DataType::FLOAT32) {
             return false;
         }
@@ -6496,6 +6578,10 @@ namespace fastllm {
     void DoCudaLinear(Data &input, Data &weight, const Data &bias, Data &output) {
         if (weight.cudaNativeNvfp4Layout && input.dataType != DataType::FLOAT16) FastllmCudaRestoreNativeNvfp4(weight);
         output.Allocate(false);
+        if (weight.dataType == DataType::EXL3) {
+            AssertInFastLLM(FastllmCudaExl3Linear(input, weight, bias, output), "EXL3 CUDA linear failed.");
+            return;
+        }
         int n = input.Count(0) / input.dims.back();
         int m = input.dims.back();
         int k = output.dims.back();
@@ -9473,8 +9559,9 @@ namespace fastllm {
         }
 
         if (deepSeekV41Mode) {
-            AssertInFastLLM(input.dataType == DataType::BFLOAT16 && output.dataType == DataType::BFLOAT16,
-                            "V4.1 NUMA GPU prefill requires BF16 activations.");
+            AssertInFastLLM(input.dataType == DataType::BFLOAT16 &&
+                            (output.dataType == DataType::BFLOAT16 || output.dataType == DataType::FLOAT32),
+                            "V4.1 NUMA GPU prefill requires BF16 input and BF16/FP32 output.");
             tempFloatOutput.dataType = DataType::FLOAT32;
             tempFloatOutput.Resize(output.dims);
             tempFloatOutput.ToDevice(DataDevice::CUDA, {curDeviceId}, false);
@@ -9484,6 +9571,8 @@ namespace fastllm {
             floatOutput.ToDevice(DataDevice::CUDA, {curDeviceId}, false);
             floatOutput.Allocate(false);
             if (setZero) FastllmCudaMemset0(floatOutput.cudaData, floatOutput.GetBytes());
+            else if (output.dataType == DataType::FLOAT32)
+                FastllmCudaCopyFromDeviceToDevice(floatOutput.cudaData, output.cudaData, output.GetBytes());
             else FastllmBF16ToFloat(output.cudaData, floatOutput.cudaData, output.Count(0));
         }
 
@@ -9654,9 +9743,9 @@ namespace fastllm {
         if (cachedPrefill) prefillCache.Finish();
 #endif
         if (accurateFp8Moe || deepSeekV41Mode) {
-            FastllmFloatToBF16(
-                floatOutput.cudaData, output.cudaData,
-                output.Count(0));
+            if (output.dataType == DataType::FLOAT32)
+                FastllmCudaCopyFromDeviceToDevice(output.cudaData, floatOutput.cudaData, output.GetBytes());
+            else FastllmFloatToBF16(floatOutput.cudaData, output.cudaData, output.Count(0));
         }
         FastllmCudaEventDestroy(computeDoneEvent);
         FastllmCudaStreamDestroy(copyStream);
@@ -10650,6 +10739,9 @@ namespace fastllm {
         if (score.dataDevice == DataDevice::CUDA)
             FastllmCudaCopyFromDeviceToHost(scores.data(), score.cudaData, scores.size() * sizeof(float));
         else std::memcpy(scores.data(), score.cpuData, scores.size() * sizeof(float));
+        // Allocation capacity is counted in elements. A prior BF16 output
+        // must release its smaller byte buffer before becoming FP32.
+        if (output.dataType != DataType::FLOAT32) output.FreeSpace();
         output.dataType = DataType::FLOAT32;
         output.UpdateUnitSize();
         output.Resize(input.dims);
@@ -10663,8 +10755,7 @@ namespace fastllm {
         }
         for (int slot = 0; slot + 1 < weightsBatch; slot += 2) {
             if (weights[slot] == nullptr || weights[slot + 1] == nullptr) continue;
-            AssertInFastLLM(weights[slot]->cudaData && weights[slot + 1]->cudaData,
-                "V4.1 MoE cannot fall back after discarding source weights. A packed kernel failed.");
+
             std::vector<int32_t> selected;
             std::vector<float> selectedScores;
             for (int row = 0; row < rows; ++row) {
@@ -10682,6 +10773,11 @@ namespace fastllm {
             }
             int count = (int)selected.size();
             if (count == 0) continue;
+            AssertInFastLLM(weights[slot]->cudaData && weights[slot + 1]->cudaData,
+                "V4.1 MoE cannot fall back after discarding source weights. A packed kernel failed.");
+            const bool exl3 = weights[slot]->dataType == DataType::EXL3;
+            AssertInFastLLM(exl3 == (weights[slot + 1]->dataType == DataType::EXL3),
+                "V4.1 EXL3 expert projections must use matching activation semantics.");
             Data rowIds(DataType::INT32, {count});
             rowIds.Allocate();
             std::memcpy(rowIds.cpuData, selected.data(), count * sizeof(int32_t));
@@ -10696,11 +10792,14 @@ namespace fastllm {
             gathered.Allocate(false);
             FastllmCudaPickInput((uint8_t *)input.cudaData, (uint8_t *)gathered.cudaData,
                 count, hidden * sizeof(uint16_t), (int *)rowIds.cudaData);
-            AssertInFastLLM(FastllmCudaDeepSeekV41QuantizeActivation(gathered, gathered),
+            if (!exl3) AssertInFastLLM(FastllmCudaDeepSeekV41QuantizeActivation(gathered, gathered),
                 "V4.1 CUDA MoE input quantization failed.");
             DoCudaLinearReshape(gathered, *weights[slot], middle);
             DoCudaLinear(gathered, *weights[slot], *GetEmptyData(), middle);
-            AssertInFastLLM(FastllmCudaDeepSeekV41SharedSwigluQuantized(
+            if (exl3) {
+                AssertInFastLLM(FastllmCudaDeepSeekV41SharedSwiglu(middle, swigluLimit, activation),
+                    "EXL3 CUDA MoE gated activation failed.");
+            } else AssertInFastLLM(FastllmCudaDeepSeekV41SharedSwigluQuantized(
                 middle, swigluLimit, activation, (const float *)routeScales.cudaData),
                 "V4.1 CUDA MoE gated activation failed.");
             DoCudaLinearReshape(activation, *weights[slot + 1], expertOut);
@@ -10711,7 +10810,7 @@ namespace fastllm {
             floatOut.Allocate(false);
             FastllmBF16ToFloat(expertOut.cudaData, floatOut.cudaData, expertOut.Count(0));
             FastllmCudaPickOutputFloat((float *)floatOut.cudaData, (float *)output.cudaData,
-                count, hidden, (int *)rowIds.cudaData, (float *)unitScales.cudaData);
+                count, hidden, (int *)rowIds.cudaData, (float *)(exl3 ? routeScales.cudaData : unitScales.cudaData));
             // The per-expert route buffers are released before the next group.
             FastllmCudaSyncDevice(device);
         }
@@ -10738,6 +10837,7 @@ namespace fastllm {
         clearIfOnOtherDevice(output);
         if (deepSeekV41) {
             AssertInFastLLM(gateType == MoeGateSwiglu, "V4.1 MoE requires SwiGLU.");
+            if (FastllmCudaExl3Moe(input, output, index, score, weights, weightsBatch, swigluLimit)) return;
 #ifndef USE_ROCM
             if (TryCudaMergeMOEV41Mxfp4Marlin(input, output, index, score, w1,
                     weights, weightsBatch, sharedScale, swigluLimit)) return;
@@ -11045,7 +11145,8 @@ namespace fastllm {
                        "CUDA MoE swigluLimit must be finite and non-negative.");
         const bool deepSeekV41 = intParams.count("deepSeekV4Mode") &&
             intParams.at("deepSeekV4Mode") && intParams.count("activationQuantBlock") &&
-            intParams.at("activationQuantBlock") == 32;
+            (intParams.at("activationQuantBlock") == 32 ||
+             (weightsBatch > 2 && weights[2] && weights[2]->dataType == DataType::EXL3));
         DoCudaMergeMOE (
             input, output, index, score, w1, w2, w3, weights, biass, sharedScale, gateType, weightsBatch, swigluLimit, deepSeekV41
         );

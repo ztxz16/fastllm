@@ -11,7 +11,7 @@ int main(int argc, char **argv) {
     try {
         GenerateOptions options;
         std::string model, output = "minimax-h3.mp4", ffmpeg = "ffmpeg", traceDirectory, initialVideo,
-                           initialAudio, vaePrecision, pika, baseModel;
+                           initialAudio, vaePrecision, pika, baseModel, parallelMode="auto";
         std::vector<int> devices{0};
         bool fp32 = false, stepsSpecified = false;
         double gpuMemoryLimit = 0, hostMemoryLimit = 0;
@@ -21,6 +21,19 @@ int main(int argc, char **argv) {
         std::vector<std::pair<Reference::Kind, std::string>> references;
         for (int i = 1; i < argc; ++i) {
             std::string arg = argv[i];
+            if (arg == "--help" || arg == "-h") {
+                std::cout << R"(Usage: minimax_h3_generate --model PATH --prompt TEXT [options]
+  --output FILE --width N --height N --frames N --steps N --seed N
+  --device ID[,ID] --precision bf16|fp32 --vae-precision fp16|bf16|fp32
+  --gpu-memory-limit SIZE --host-memory-limit SIZE --ffmpeg PATH
+  --parallel-mode auto|tp|sp
+  --pika PATH --base-model PATH --trace DIRECTORY
+  --initial-video FILE --initial-audio FILE --first-frame FILE --last-frame FILE
+  --reference-image FILE --reference-video FILE --reference-audio FILE
+  --reference-image-short-edge N --reference-video-short-edge N
+)";
+                return 0;
+            }
             if (i + 1 >= argc)
                 throw std::invalid_argument("missing value for " + arg);
             std::string v = argv[++i];
@@ -30,6 +43,8 @@ int main(int argc, char **argv) {
                 pika = v;
             else if (arg == "--base-model")
                 baseModel = v;
+            else if (arg == "--parallel-mode")
+                parallelMode=v;
             else if (arg == "--prompt")
                 options.prompt = v;
             else if (arg == "--output")
@@ -142,13 +157,15 @@ int main(int argc, char **argv) {
         };
         auto video = read(initialVideo), audio = read(initialAudio);
         Pipeline pipeline(model, devices, fp32, videoType);
+        pipeline.configureSource(source,parallelMode);
         pipeline.setGpuMemoryLimit(gpuMemoryLimit);
         pipeline.setHostMemoryLimit(hostMemoryLimit);
         if (!pika.empty()) pipeline.loadPika(pika);
         std::string last;
         int current = -1;
         std::cerr << "Precision: " << (fp32 ? "fp32" : "bf16") << ", video VAE: " << precisionName(videoType)
-                  << ", TP: " << devices.size() << "\n";
+                  << ", DiT: " << source.transformerPrecision << "/" << source.referencePrecision
+                  << ", parallel: " << pipeline.parallelMode() << " x " << devices.size() << "\n";
         auto start = std::chrono::steady_clock::now();
         auto result = pipeline.generateMP4(
             options, output, ffmpeg,

@@ -1,0 +1,363 @@
+.h3-video-workspace .h3-video-canvas {
+  min-height: 400px;
+  aspect-ratio: 16 / 10;
+}
+.h3-video-workspace .h3-stage {
+  position: sticky;
+  top: 16px;
+}
+.h3-video-canvas video {
+  display: block;
+  width: 100%;
+  height: 100%;
+  max-height: 65vh;
+  object-fit: contain;
+  background: #17251d;
+}
+.h3-video-canvas:has(video:not([hidden])) {
+  background: #17251d;
+}
+.h3-video-canvas:has(video:not([hidden])) .h3-canvas-label {
+  display: none;
+}
+.h3-film-art {
+  display: grid;
+  place-items: center;
+  position: relative;
+  width: 158px;
+  height: 104px;
+  margin: 0 auto 30px;
+  border: 1px solid #b9cbb0;
+  border-radius: 13px;
+  background: linear-gradient(140deg, #fbfff6, #dce7d1);
+  box-shadow:
+    9px 10px 0 -1px #e7eddf,
+    9px 10px 0 0 #cbd8c1;
+  transform: rotate(-5deg);
+}
+.h3-film-art::before,
+.h3-film-art::after {
+  content: "";
+  position: absolute;
+  left: 12px;
+  right: 12px;
+  height: 5px;
+  background: repeating-linear-gradient(90deg, #c2d2b6 0 9px, transparent 9px 18px);
+  border-radius: 2px;
+}
+.h3-film-art::before {
+  top: 9px;
+}
+.h3-film-art::after {
+  bottom: 9px;
+}
+.h3-film-art span {
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  border: 1px solid #b8cba9;
+  background: #f9fcf4b3;
+  color: #69875a;
+  padding-left: 3px;
+  font-size: 16px;
+}
+.h3-frame-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+.h3-video-workspace .h3-frame-slot {
+  min-width: 0;
+}
+.h3-video-workspace .h3-frame-slot .h3-field-head {
+  align-items: start;
+  gap: 4px;
+  min-height: 28px;
+}
+.h3-video-workspace .h3-frame-slot label {
+  font-size: 10px;
+}
+.h3-video-workspace .h3-frame-drop {
+  height: 92px;
+  overflow: hidden;
+  margin: 0;
+}
+.h3-frame-drop img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.h3-frame-placeholder {
+  display: grid;
+  justify-items: center;
+  gap: 8px;
+}
+.h3-frame-drop:has(img:not([hidden])) .h3-frame-placeholder {
+  display: none;
+}
+.h3-frame-name {
+  margin: 5px 0 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--h3-muted);
+  font-size: 9px;
+}
+.h3-video-workspace .h3-modes button {
+  min-width: 0;
+  white-space: normal;
+  line-height: 1.5;
+}
+.h3-video-workspace .h3-reference-drop {
+  height: auto;
+  min-height: 104px;
+  gap: 7px;
+  margin: 0;
+  padding: 15px 10px;
+}
+.h3-reference-drop b {
+  font-size: 23px;
+  font-weight: 400;
+}
+.h3-reference-drop span {
+  font-size: 12px;
+}
+.h3-reference-drop small {
+  font-size: 10px;
+  color: var(--h3-muted);
+}
+.h3-reference-list {
+  display: grid;
+  gap: 10px;
+  max-height: 420px;
+  overflow-y: auto;
+  padding: 2px;
+  scrollbar-width: thin;
+}
+.h3-reference-card {
+  min-width: 0;
+  border: 1px solid var(--h3-border);
+  border-radius: 10px;
+  padding: 10px;
+  background: var(--h3-paper);
+}
+.h3-reference-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 9px;
+}
+.h3-reference-actions {
+  display: flex;
+  gap: 4px;
+}
+.h3-video-workspace .h3-reference-head button {
+  border: 1px solid var(--h3-border);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--h3-ink);
+  min-width: 28px;
+  min-height: 28px;
+  padding: 3px 7px;
+  white-space: nowrap;
+}
+.h3-video-workspace .h3-reference-head .h3-reference-label {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--h3-green);
+  background: #eaf1e3;
+  border-color: #d6e0cd;
+}
+.h3-reference-preview {
+  display: block;
+  width: 100%;
+  border-radius: 6px;
+}
+img.h3-reference-preview,
+video.h3-reference-preview {
+  height: 130px;
+  object-fit: contain;
+  background: #e9ede5;
+}
+audio.h3-reference-preview {
+  height: 36px;
+}
+.h3-reference-name {
+  margin: 9px 0 4px;
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.h3-reference-card > small {
+  font-size: 9px;
+  color: var(--h3-muted);
+}
+.h3-reference-help summary {
+  color: var(--h3-muted);
+  font-size: 10px;
+  cursor: pointer;
+}
+.h3-reference-help {
+  margin-top: 12px;
+}
+.h3-reference-drop:focus-within {
+  outline: 2px solid #7b996b;
+  outline-offset: 3px;
+}
+.h3-video-advanced {
+  margin: -2px 0 20px;
+  border-top: 1px solid var(--h3-border);
+  padding-top: 12px;
+}
+.h3-video-advanced summary {
+  font-size: 11px;
+  color: var(--h3-muted);
+  cursor: pointer;
+}
+.h3-video-advanced .h3-row {
+  margin-top: 16px;
+}
+.h3-video-advanced .h3-field {
+  margin-bottom: 0;
+}
+.h3-video-history {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 9px;
+}
+.h3-video-history .video-job {
+  min-width: 0;
+  border: 1px solid var(--h3-border);
+  border-radius: 10px;
+  background: white;
+  padding: 12px;
+  text-align: left;
+  color: var(--h3-ink);
+}
+.h3-video-history .video-job:hover {
+  border-color: #aec3a2;
+  background: #f9fbf5;
+}
+.h3-video-history .video-job.selected {
+  border-color: #8ba276;
+  box-shadow: 0 0 0 1px #8ba276 inset;
+}
+.video-job small {
+  color: #6d8660;
+  font-size: 9px;
+}
+.video-job small::before {
+  content: "";
+  display: inline-block;
+  width: 5px;
+  height: 5px;
+  margin-right: 5px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.video-job[data-status="failed"] small {
+  color: #b46753;
+}
+.video-job[data-status="queued"] small,
+.video-job[data-status="in_progress"] small {
+  color: #aa8947;
+}
+.video-job[data-status="cancelled"] small {
+  color: #90958a;
+}
+.video-job p {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  font-size: 11px;
+  line-height: 1.7;
+  margin: 8px 0;
+}
+.video-job > span {
+  color: var(--h3-muted);
+  font-size: 9px;
+}
+.h3-agent-note {
+  border-top: 1px solid var(--h3-border);
+  padding-top: 15px;
+  margin-top: 24px;
+}
+.h3-video-workspace button:focus-visible,
+.h3-video-workspace a:focus-visible,
+.h3-video-advanced summary:focus-visible {
+  outline: 2px solid #7b996b;
+  outline-offset: 3px;
+}
+.h3-frame-drop:focus-within {
+  outline: 2px solid #7b996b;
+  outline-offset: 3px;
+}
+@media (max-width: 1100px) {
+  .h3-video-workspace .h3-video-canvas {
+    min-height: 330px;
+  }
+}
+@media (max-width: 760px) {
+  .h3-video-workspace .h3-stage {
+    position: static;
+  }
+  .h3-video-workspace .h3-video-canvas {
+    min-height: 260px;
+  }
+  .h3-video-history {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+:root[data-theme="dark"] .h3-video-workspace {
+  --h3-paper: #202821;
+  --h3-ink: #e1e9df;
+  --h3-muted: #9eaa9b;
+  --h3-border: #3d493f;
+  --h3-green: #45664c;
+}
+:root[data-theme="dark"] .h3-video-workspace .h3-reference-label {
+  background: #354435;
+  color: #ccddbf;
+  border-color: #4a5c43;
+}
+:root[data-theme="dark"] .h3-video-workspace :is(img, video).h3-reference-preview {
+  background: #17251d;
+}
+:root[data-theme="dark"] .h3-video-workspace :is(.h3-controls, .h3-progress, .video-job) {
+  background: #252e28;
+}
+:root[data-theme="dark"] .h3-video-workspace :is(input, select, textarea, .h3-modes, .h3-drop) {
+  background: #202821;
+}
+:root[data-theme="dark"]
+  .h3-video-workspace
+  :is(
+    .h3-badge,
+    .h3-presets button,
+    .h3-result-actions button,
+    .h3-result-actions a,
+    .h3-modes button[aria-pressed="true"]
+  ) {
+  background: #354435;
+  color: #ccddbf;
+  border-color: #4a5c43;
+}
+:root[data-theme="dark"] .h3-video-workspace .h3-video-canvas {
+  background: radial-gradient(ellipse at 30% 20%, #384736, #222d24);
+  border-color: var(--h3-border);
+}
+:root[data-theme="dark"] .h3-video-workspace .h3-film-art {
+  opacity: 0.7;
+}
+:root[data-theme="dark"] .h3-video-workspace .h3-empty p {
+  color: var(--h3-muted);
+}
+
+.h3-runtime { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+.h3-runtime span { padding: 4px 9px; border: 1px solid var(--h3-border); border-radius: 6px; color: var(--h3-muted); font-size: 11px; font-weight: 650; letter-spacing: .04em; }

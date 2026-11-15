@@ -1,3 +1,6 @@
+#include "devices/cuda/fastllm-kernel-benchmark.cuh"
+#include "../fastllm-bfloat16-silu.cuh"
+#include "exl3.h"
 #include "devices/cuda/glm5-next-cuda.cuh"
 #include "fastllm-cuda.cuh"
 #include "../fastllm-hybrid-prefill.cuh"
@@ -1074,7 +1077,7 @@ __global__ void DeepSeekV4PrepareMoeDownInputKernel(
         const __nv_bfloat16 *__restrict__ gateUp,
         __nv_bfloat16 *__restrict__ downInput,
         const float *__restrict__ routeScales,
-        int intermediateDimension, float swigluLimit, bool quantize) {
+        int intermediateDimension, float swigluLimit, bool quantize, const float *siluTable) {
     __shared__ float warpMax[4];
     __shared__ float quantScale;
     const int blocksPerRow = intermediateDimension / QuantBlock;
@@ -1095,8 +1098,8 @@ __global__ void DeepSeekV4PrepareMoeDownInputKernel(
     // Keep the expert's observable multiplication order: SwiGLU forms h
     // first, then the routed score is applied before the BF16 boundary.
     // Reassociating this as (score * silu) * up can change the final BF16 bit.
-    float h = (gate / (1.0f + expf(-gate))) * up;
-    float value = routeScales[row] * h;
+    float h = __fmul_rn(FastllmCudaBFloat16Silu(gate, siluTable), up);
+    float value = __fmul_rn(routeScales[row], h);
     // The expert contract has a BF16 boundary before act_quant.
     value = __bfloat162float(__float2bfloat16_rn(value));
     if (!quantize) {
@@ -1146,6 +1149,8 @@ bool DeepSeekV4PrepareMoeDownInputImpl(
         gateUp.dims[1] <= 0 || (gateUp.dims[1] & 1) != 0) {
         return false;
     }
+    const float *siluTable = FastllmCudaBFloat16SiluTable();
+    if (!siluTable) return false;
     const int rows = gateUp.dims[0];
     const int intermediateDimension = gateUp.dims[1] / 2;
     if ((activationQuantBlock != 32 && activationQuantBlock != 128) ||
@@ -1159,11 +1164,11 @@ bool DeepSeekV4PrepareMoeDownInputImpl(
     if (activationQuantBlock == 32) {
         DeepSeekV4PrepareMoeDownInputKernel<32><<<blocks, 32>>>(
             (const __nv_bfloat16*)gateUp.cudaData, (__nv_bfloat16*)downInput.cudaData,
-            routeScales, intermediateDimension, swigluLimit, quantize);
+            routeScales, intermediateDimension, swigluLimit, quantize, siluTable);
     } else {
         DeepSeekV4PrepareMoeDownInputKernel<128><<<blocks, 128>>>(
             (const __nv_bfloat16*)gateUp.cudaData, (__nv_bfloat16*)downInput.cudaData,
-            routeScales, intermediateDimension, swigluLimit, quantize);
+            routeScales, intermediateDimension, swigluLimit, quantize, siluTable);
     }
     return cudaGetLastError() == cudaSuccess;
 }
@@ -10225,6 +10230,45 @@ extern "C" bool FastllmCudaDeepSeekV4SparseAttentionDecodeCachedBatch(
     return ok;
 }
 
+namespace {
+const fastllm::kernels::Family groupedProjectionFamily{2,"linear.grouped.fp8.bf16",__DATE__ " " __TIME__,{
+    {"cuda.grouped_projection.native",json11::Json::object{{"backend","cuda"},{"description","Grouped FP8 projection"},{"graph",true}}},
+    {"cuda.projection.triton",json11::Json::object{{"backend","triton"},{"sm",json11::Json::array{120,121}},{"rows",json11::Json::array{2,16}},{"groups","dynamic"},{"graph",true}}},
+    {"cuda.projection.triton.batch32",json11::Json::object{{"backend","triton"},{"sm",json11::Json::array{120,121}},{"description","Row-tiled FP8/BF16 projection; arbitrary logical rows"},{"parameters",json11::Json::object{{"block_m",32},{"warps",4},{"stages",3}}},{"graph",true}}},
+    {"cuda.projection.triton.batch64",json11::Json::object{{"backend","triton"},{"sm",json11::Json::array{120,121}},{"description","Row-tiled FP8/BF16 projection; arbitrary logical rows"},{"parameters",json11::Json::object{{"block_m",64},{"warps",4},{"stages",3}}},{"graph",true}}}
+}};
+const bool groupedProjectionRegistered=[] {fastllm::kernels::Register(&groupedProjectionFamily);return true;}();
+}
+
+static bool TryRegisteredGroupedProjection(const fastllm::Data &input,const fastllm::Data &weight,
+        int groups,int rank,fastllm::Data &output,bool compact) {
+    using namespace fastllm;
+    if(input.dataType!=BFLOAT16 || output.dataType!=BFLOAT16 ||
+       (weight.dataType!=FP8_E4M3 && weight.dataType!=BFLOAT16) || weight.IsRepacked ||
+       (weight.dataType==FP8_E4M3 && (weight.blockM!=32 || weight.blockK!=32)))return false;
+    const int tokens=input.dims[0]*input.dims[1],hidden=(input.dims[2]/groups)*input.dims[3];
+    if(fastllm::kernels::Enabled()) {
+        struct Context {const Data &input,&weight;int groups,rank,rows;Data &output;bool compact;
+            static bool Run(void *p,int impl) {
+                auto &c=*static_cast<Context *>(p);
+                if(impl>0)return TryCudaTritonSmallProjectionCandidate(c.input,const_cast<Data &>(c.weight),c.output,c.groups,true,impl==1?0:impl==2?32:64);
+                if(c.compact)return FastllmCudaDeepSeekV41CompactWoA(c.input,c.weight,c.groups,c.rank,c.output);
+                return DeepSeekV4LaunchWoAByWeight<__nv_bfloat16>(c.input,c.weight,c.groups,c.rank,c.output,
+                    c.input.dims[0],c.input.dims[1],c.input.dims[2],c.input.dims[3]);
+            }
+            static std::string Unsupported(void *p,int impl) {
+                auto &c=*static_cast<Context *>(p);
+                return impl?fastllm::kernels::TritonSupport(c.rows,impl==1?16:INT_MAX,"FASTLLM_CUDA_TRITON_SMALL_PROJECTION"):"";
+            }
+        } context{input,weight,groups,rank,tokens,output,compact};
+        fastllm::kernels::Signature signature{{2,FastllmCudaGetDevice(),FastllmCudaRuntimeArch(),tokens,rank,hidden,groups,weight.blockM,weight.blockK,compact?0:1,int(weight.dataType),0}};
+        fastllm::kernels::CudaCase benchmark{&context,Context::Run,Context::Unsupported,output.cudaData,size_t(tokens)*groups*rank,true};
+        const int selected=fastllm::kernels::SelectCuda(groupedProjectionFamily,signature,benchmark);
+        if(selected>=0){fastllm::kernels::Bypass bypass;return fastllm::kernels::LaunchCuda(groupedProjectionFamily,benchmark,selected);}
+    }
+    return false;
+}
+
 extern "C" bool FastllmCudaDeepSeekV41CompactWoA(const fastllm::Data &input,
         const fastllm::Data &weight, int groups, int rank, fastllm::Data &output) {
     using namespace fastllm;
@@ -10250,6 +10294,7 @@ extern "C" bool FastllmCudaDeepSeekV41CompactWoA(const fastllm::Data &input,
     if (weight.extraCudaData.empty() || !weight.extraCudaData[0]) return false;
     const float *scales = static_cast<const float *>(weight.extraCudaData[0]);
     if (!DeepSeekV4PrepareCudaOutput(output, BFLOAT16, {input.dims[0], input.dims[1], groups * rank})) return false;
+    if(TryRegisteredGroupedProjection(input,weight,groups,rank,output,true))return true;
     if (tokens == 1) {
         fastllm::cuda::v41_compact::Decode<<<dim3((rank + 7) / 8, groups, tokens), 256, 0, cudaStreamPerThread>>>(
             static_cast<const __nv_bfloat16 *>(input.cudaData), static_cast<const uint8_t *>(weight.cudaData),
@@ -10306,6 +10351,8 @@ extern "C" bool FastllmCudaDeepSeekV4WoA(const fastllm::Data &o, const fastllm::
         return false;
     }
 
+    if (woA.dataType == fastllm::EXL3) return FastllmCudaExl3Grouped(o, woA, output);
+
 #ifdef FASTLLM_ENABLE_DSV4_WOA_DEEPGEMM_SM120
     // The SM120 DeepGEMM specialization produces its FP8 operand and packed
     // UE8M0 scales directly from the inverse-RoPE BF16 tensor.  Calling it
@@ -10331,6 +10378,10 @@ extern "C" bool FastllmCudaDeepSeekV4WoA(const fastllm::Data &o, const fastllm::
         }
         projectionInput = &quantizedInput;
     }
+
+    // Quantization above is part of the original WoA semantics. Compare every
+    // registered implementation on this same operand, including draft calls.
+    if (allowTriton && TryRegisteredGroupedProjection(*projectionInput,woA,groups,oRank,output,false)) return true;
 
     fastllm::Data &mutableWoA = const_cast<fastllm::Data&>(woA);
     // Preserve the FP8 path's existing activation quantization. Small grouped

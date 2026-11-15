@@ -1,3 +1,4 @@
+#include "exl3.h"
 #include "devices/cpu/cpudevice.h"
 #include "devices/cpu/computeutils.h"
 #include "utils.h"
@@ -2665,6 +2666,11 @@ namespace fastllm {
         AssertInFastLLM(weight.Count(0) == (uint64_t)groups * oRank * groupDim,
                         "DeepSeekV4WoA error: weight shape mismatch.\n");
 
+        if (weight.dataType == EXL3) {
+            output.dataType = BFLOAT16; output.Resize({bsz, seqlen, groups * oRank});
+            Exl3GroupedCPU(input, weight, output);
+            return;
+        }
         const bool profileWoALinear = GetFastllmEnv().printProfile;
         const int tokens = bsz * seqlen;
         auto *pool = GetAlivePool();

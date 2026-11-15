@@ -42,6 +42,15 @@ void TextEncoder::setHostMemoryBudget(const std::shared_ptr<nomas::HostMemoryBud
     weights_.setHostMemoryBudget(budget);
     if(prefetchedWeights_) prefetchedWeights_->shareHostCache(weights_);
 }
+void TextEncoder::cacheWeights(size_t reserveBytes, size_t maxBytes) {
+    // A changed workspace budget may recreate the device cache while the host
+    // cache is already warm. Fill the shared map before enabling the prefetch
+    // worker, just as on the first request.
+    if (weights_.enablePackedCache(reserveBytes, maxBytes))
+        cacheWarm_ = false;
+    if (prefetchedWeights_)
+        prefetchedWeights_->sharePackedCache(weights_);
+}
 Tensor TextEncoder::encodeVisual(const std::vector<int> &tokens, const std::vector<VisionInput> &images,
                                  Trace trace) {
     if (tokens.empty() || tokens.size() > 65536)
@@ -49,9 +58,7 @@ Tensor TextEncoder::encodeVisual(const std::vector<int> &tokens, const std::vect
     if (!lowMemory_ && parallel_.size() > 1 && !rt_.isFloat32()) {
         // Reserve room for the sharded DiT, replicated VAEs and activations.
         // Re-enable after cancellation/unload; uncached weights still stream.
-        weights_.enablePackedCache((size_t(16) << 30) + (size_t(40) << 30) / parallel_.size());
-        if (prefetchedWeights_)
-            prefetchedWeights_->sharePackedCache(weights_);
+        cacheWeights((size_t(16) << 30) + (size_t(40) << 30) / parallel_.size());
     }
     const std::string root = "model.language_model.";
     auto x = rt_.embedding(weights_.get(root + "embed_tokens.weight"), tokens);
@@ -105,16 +112,16 @@ Tensor TextEncoder::encodeVisual(const std::vector<int> &tokens, const std::vect
     Tensor ropePositions;
     if (!images.empty())
         ropePositions = rt_.indices(positions);
-    // Populate the CPU cache serially on the first request. Short prompts have
+    // Populate shared host/device caches serially on the first request. Short prompts have
     // too little compute to benefit from an additional staging stream.
-    bool prefetch = !lowMemory_ && prefetchedWeights_ && hostCacheWarm_ && tokens.size() >= 256;
+    bool prefetch = !lowMemory_ && prefetchedWeights_ && cacheWarm_ && tokens.size() >= 256;
     auto layerWeights = [&](int layer) -> Weights & {
         return prefetch && layer % 2 ? *prefetchedWeights_ : weights_;
     };
     auto loadLayer = [&](int layer) {
         auto scope=memoryPool_?std::make_unique<nomas::TensorPool::Scope>(*memoryPool_):nullptr;
-        // Only this worker populates the shared CPU cache. Inference reads the
-        // other, fully uploaded GPU cache and uses the main thread's cuBLAS handle.
+        // Only this worker loads missing weights. Inference reads the other,
+        // fully uploaded layer and uses the main thread's cuBLAS handle.
         auto &weights = layerWeights(layer);
         auto p = root + "layers." + std::to_string(layer) + ".";
         for (auto name : {"input_layernorm", "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj",
@@ -177,7 +184,7 @@ Tensor TextEncoder::encodeVisual(const std::vector<int> &tokens, const std::vect
             trace("layer." + std::to_string(layer), x);
         weights.erasePrefix(p);
     }
-    hostCacheWarm_ = true;
+    cacheWarm_ = true;
     // hidden_states[50] is the residual before Qwen's final norm, not last_hidden_state.
     return x;
 }

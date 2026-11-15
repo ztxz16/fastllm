@@ -86,18 +86,18 @@ __global__ __launch_bounds__(128, 1) void ProjectGateUpSingle(const void *__rest
         const float upValue = __shfl_sync(0xffffffff, value, 16);
         if (lane == 0) {
             const half g = __float2half_rn(value), u = __float2half_rn(upValue);
-            output[row] = __hmul(__hdiv(g, __hadd(__float2half(1), hexp(-g))), u);
+            output[row] = __hmul(__hdiv(g, __hadd(__float2half(1), FastllmGgufHalfExp(-g))), u);
         }
     }
 }
 
-template <ggml_type Type, int T, int KS, int Mode, bool StreamingWeights = false>
+template <ggml_type Type, int T, int KS, int Mode, bool StreamingWeights = false,
+          int Warps = BlockWarps<Type, T, Mode>, int Rows = OutputRows<Type, T, Mode>>
 __global__
-__launch_bounds__(32 * BlockWarps<Type, T, Mode>, BlockWarps<Type, T, Mode> == 8 ? 2 : 1) void Project(
+__launch_bounds__(32 * Warps, Warps == 8 ? 2 : 1) void Project(
     const void *__restrict__ weights, const void *__restrict__ upWeights, const int8_t *__restrict__ qs,
     const half2 *__restrict__ ds, const short2 *__restrict__ sums, half *__restrict__ output, int n,
     int outputStride, int runtimeK) {
-    constexpr int Warps = BlockWarps<Type, T, Mode>;
     const int K = KS ? KS : runtimeK;
     static_assert(T >= 1 && T <= 8, "planar tile must have 1..8 rows");
     __shared__ __align__(16) uint32_t table[PlanarTableWords<Type>];
@@ -106,7 +106,6 @@ __launch_bounds__(32 * BlockWarps<Type, T, Mode>, BlockWarps<Type, T, Mode> == 8
         __syncthreads();
     }
     // Small tiles can gain occupancy by keeping one output channel per warp.
-    constexpr int Rows = OutputRows<Type, T, Mode>;
     constexpr int step = Mode == 3 ? 1 : Rows;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     for (int row = (blockIdx.x * Warps + warp) * step; row < n; row += gridDim.x * Warps * step) {
@@ -162,7 +161,7 @@ __launch_bounds__(32 * BlockWarps<Type, T, Mode>, BlockWarps<Type, T, Mode> == 8
                 const float upValue = __shfl_sync(0xffffffff, value, (T + lane) & 31);
                 if (lane < T) {
                     const half gate = __float2half_rn(value), up = __float2half_rn(upValue);
-                    const half act = __hdiv(gate, __hadd(__float2half(1.0f), hexp(-gate)));
+                    const half act = __hdiv(gate, __hadd(__float2half(1.0f), FastllmGgufHalfExp(-gate)));
                     output[lane * outputStride + row] = __hmul(act, up);
                 }
             } else if (lane < Rows * T && row + lane / T < n)
@@ -204,7 +203,7 @@ __launch_bounds__(32 * BlockWarps<Type, T, Mode>, BlockWarps<Type, T, Mode> == 8
             if constexpr (Mode == 3) {
                 if (lane < T) {
                     const half gate = __float2half_rn(gateValue), up = __float2half_rn(value);
-                    const half act = __hdiv(gate, __hadd(__float2half(1.0f), hexp(-gate)));
+                    const half act = __hdiv(gate, __hadd(__float2half(1.0f), FastllmGgufHalfExp(-gate)));
                     output[lane * outputStride + row] = __hmul(act, up);
                 }
             } else if (lane < Rows * T && row + lane / T < n)

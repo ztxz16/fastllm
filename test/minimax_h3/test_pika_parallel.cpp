@@ -31,14 +31,15 @@ int main(int argc, char **argv) {
         int devices = 0;
         if (cudaGetDeviceCount(&devices) != cudaSuccess || devices != 2)
             throw std::runtime_error("Expose exactly two permitted GPUs");
-        if (argc != 3) throw std::invalid_argument("usage: minimax_h3_pika_parallel MODEL PIKA");
+        if (argc != 3 && argc != 5) throw std::invalid_argument("usage: minimax_h3_pika_parallel MODEL PIKA [FL2VA_QUANT REF2VA_QUANT]");
         ParallelGroup group({0, 1});
         for (bool reference : {false, true}) {
             std::string model = std::string(argv[1]) + (reference ? "/transformer_ref" : "/transformer");
             std::string adapter = std::string(argv[2]) + (reference ? "/ref2va" : "/fl2va");
             Runtime root(0, false), full(0, true);
             Transformer single(root, full, model);
-            single.loadPikaAdapter(adapter, reference);
+            if(argc==5) single.setQuantizedWeights(argv[reference?4:3]);
+            if(std::string(argv[2])!="-") single.loadPikaAdapter(adapter, reference);
             const auto &cfg = single.config();
             std::map<std::pair<int, int>, std::vector<float>> fp32Sums;
             for (auto reduction : {RowReduction::FP32, RowReduction::Activation}) {
@@ -49,7 +50,8 @@ int main(int argc, char **argv) {
                     fp[rank] = std::make_unique<Runtime>(rank, true);
                     dit[rank] = std::make_unique<Transformer>(*rt[rank], *fp[rank], model,
                         ParallelContext{&group, rank, reduction});
-                    dit[rank]->loadPikaAdapter(adapter, reference);
+                    if(argc==5) dit[rank]->setQuantizedWeights(argv[reference?4:3]);
+                    if(std::string(argv[2])!="-") dit[rank]->loadPikaAdapter(adapter, reference);
                 });
                 for (int rows : {67, 513, 4097}) for (int layer : {0, 25, 49}) {
                     if (rows != 67 && layer != 0) continue;
@@ -78,13 +80,14 @@ int main(int argc, char **argv) {
                     if (actual[0] != actual[1]) throw std::runtime_error("ranks differ");
                     auto key = std::make_pair(rows, layer);
                     if (reduction == RowReduction::FP32) fp32Sums[key] = actual[0];
-                    else if (fp32Sums.at(key) != actual[0])
+                    else if (std::string(argv[2])!="-" && fp32Sums.at(key) != actual[0])
                         throw std::runtime_error("Pika must retain FP32 branch sums for either caller policy");
                     double error = relativeL2(expected, actual[0]);
                     std::cout << (reference ? "ref2va" : "fl2va") << " reduction="
                         << (reduction == RowReduction::FP32 ? "fp32" : "activation")
                         << " layer=" << layer << " rows=" << rows << " relative_l2=" << error << std::endl;
-                    if (error >= .01) throw std::runtime_error("BF16 block relative L2 exceeds 0.01");
+                    const double tolerance=argc==5?.05:.01;
+                    if (error >= tolerance) throw std::runtime_error("block relative L2 exceeds tolerance");
                     root.activate();
                     single.unload();
                 }

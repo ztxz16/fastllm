@@ -57,6 +57,35 @@ if triton is not None:
 
 
     @triton.jit
+    def fastllm_batched_projection(X, W, S, Y, rows, groups, N: tl.constexpr, K: tl.constexpr,
+                                FP8: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+        # One CTA owns a complete output tile: no rounded split-K partials.
+        tiles_n = tl.cdiv(N, BN)
+        n = (tl.program_id(0) % tiles_n) * BN + tl.arange(0, BN)
+        group = tl.program_id(1)
+        m = (tl.program_id(0) // tiles_n) * BM + tl.arange(0, BM)
+        kk = tl.arange(0, BK)
+        acc = tl.zeros((BM, BN), tl.float32)
+        for tile in range(tl.cdiv(K, BK)):
+            k = tile * BK + kk
+            a = tl.load(X + (m[:, None] * groups + group) * K + k[None, :],
+                        (m[:, None] < rows) & (k[None, :] < K), other=0.0)
+            b = tl.load(W + (group * N + n[:, None]) * K + k[None, :],
+                        (n[:, None] < N) & (k[None, :] < K), other=0)
+            if FP8:
+                b = b.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+                sk = tile * (BK // 32) + tl.arange(0, BK // 32)
+                scales = tl.load(S + ((group * N + n[:, None]) // 32) * (K // 32) + sk[None, :],
+                                 (n[:, None] < N) & (sk[None, :] * 32 < K), other=0.0)
+                # Load each block scale once, then broadcast across its 32 values.
+                b = tl.reshape(tl.reshape(b, (BN, BK // 32, 32)) * scales[:, :, None],
+                               (BN, BK)).to(tl.bfloat16)
+            acc = tl.dot(a, tl.trans(b), acc)
+        tl.store(Y + (m[:, None] * groups + group) * N + n[None, :], acc.to(tl.bfloat16),
+                 (m[:, None] < rows) & (n[None, :] < N))
+
+
+    @triton.jit
     def _fastllm_mxfp4_decode_pair(packed, exponent):
         return tl.inline_asm_elementwise(
             """{
@@ -139,7 +168,7 @@ if triton is not None:
 
     @triton.jit
     def fastllm_mxfp4_grouped_activate(
-        Raw, Routes, Scores, Y, I: tl.constexpr, LIMIT: tl.constexpr, B: tl.constexpr
+        Raw, Routes, Scores, Y, Silu, I: tl.constexpr, LIMIT: tl.constexpr, B: tl.constexpr
     ):
         route = tl.load(Routes + tl.program_id(1))
         c = tl.program_id(0) * B + tl.arange(0, B)
@@ -148,7 +177,7 @@ if triton is not None:
         if LIMIT > 0:
             g = tl.minimum(g, LIMIT)
             u = tl.maximum(-LIMIT, tl.minimum(u, LIMIT))
-        val = ((g / (1 + libdevice.exp(-g)) * u) * tl.load(Scores + route)).to(tl.bfloat16).to(tl.float32)
+        val = ((tl.load(Silu + (g.to(tl.uint32, bitcast=True) >> 16)) * u) * tl.load(Scores + route)).to(tl.bfloat16).to(tl.float32)
         blocks = tl.reshape(tl.abs(val), (B // 32, 32))
         amax = tl.maximum(tl.max(blocks, 1), 1e-4) / 448.0
         bits = amax.to(tl.uint32, bitcast=True)
@@ -183,7 +212,7 @@ if triton is not None:
 
 
     @triton.jit
-    def fastllm_mxfp4_planar_grouped(X, W, Slots, Routes, Scores, Y, COUNT,
+    def fastllm_mxfp4_planar_grouped(X, W, Slots, Routes, Scores, Y, COUNT, Silu,
                                    H: tl.constexpr, I: tl.constexpr, TOPK: tl.constexpr,
                                    STRIDE: tl.constexpr, DOWN: tl.constexpr,
                                    GATE: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
@@ -227,7 +256,71 @@ if triton is not None:
                 u = up.to(tl.bfloat16).to(tl.float32)
                 value = tl.minimum(value, 10.0)
                 u = tl.maximum(-10.0, tl.minimum(u, 10.0))
-                value = ((value / (1.0 + libdevice.exp(-value)) * u) *
+                value = ((tl.load(Silu + (value.to(tl.uint32, bitcast=True) >> 16)) * u) *
+                         tl.load(Scores + route)[:, None]).to(tl.bfloat16).to(tl.float32)
+                blocks = tl.reshape(tl.abs(value), (16, BN // 32, 32))
+                amax = tl.maximum(tl.max(blocks, 2), 1e-4) / 448.0
+                bits = amax.to(tl.uint32, bitcast=True)
+                exponent = ((bits >> 23) & 255).to(tl.int32) - 127 + ((bits & 0x7fffff) != 0).to(tl.int32)
+                scales = libdevice.exp2(exponent.to(tl.float32))
+                scale = tl.reshape(tl.broadcast_to(scales[:, :, None], (16, BN // 32, 32)), (16, BN))
+                value = tl.maximum(-448.0, tl.minimum(448.0, value / scale)).to(tl.float8e4nv).to(tl.float32) * scale
+                value = value.to(tl.bfloat16)
+            tl.store(Y + route[:, None] * (I if GATE else H) + n[None, :], value, active[:, None])
+
+
+    @triton.jit
+    def fastllm_mxfp4_planar_grouped_batch(X, W, Slots, Routes, Scores, Y, COUNT, Silu,
+                                   H: tl.constexpr, I: tl.constexpr, TOPK: tl.constexpr,
+                                   STRIDE: tl.constexpr, DOWN: tl.constexpr,
+                                   GATE: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+        first = tl.program_id(1)
+        slot = tl.load(Slots + first)
+        previous = tl.load(Slots + first - 1, first > 0, other=-2)
+        # Separate 16-route tile for larger batches; keep the original kernel
+        # above unchanged. Expert runs are contiguous, but their starting
+        # offsets and lengths are dynamic and may cross any route boundary.
+        start = slot != previous
+        earlier = tl.load(Slots + first - 16, first >= 16, other=-2)
+        if slot >= 0 and slot == earlier:
+            lower = 0
+            upper = first
+            while lower < upper:
+                middle = (lower + upper) // 2
+                same = tl.load(Slots + middle) == slot
+                upper = tl.where(same, middle, upper)
+                lower = tl.where(same, lower, middle + 1)
+            start = ((first - lower) % 16) == 0
+        if slot >= 0 and start:
+            m = tl.arange(0, 16)
+            valid = (first + m < COUNT) & (m < 16)
+            active = tl.load(Slots + first + m, valid, other=-2) == slot
+            route = tl.load(Routes + first + m, valid, other=0)
+            row = route // TOPK if GATE else route
+            n = tl.program_id(0) * BN + tl.arange(0, BN)
+            K: tl.constexpr = H if GATE else I
+            N: tl.constexpr = 2 * I if GATE else H
+            acc = tl.zeros((16, BN), tl.float32)
+            if GATE:
+                up = tl.zeros((16, BN), tl.float32)
+            for begin in range(0, K, BK):
+                k = begin + 2 * tl.arange(0, BK // 2)
+                even = tl.load(X + row[:, None] * K + k[None, :], active[:, None], other=0)
+                odd = tl.load(X + row[:, None] * K + k[None, :] + 1, active[:, None], other=0)
+                we, wo = _fastllm_mxfp4_planar_tile(W, slot, n, begin, K, N,
+                                                   0 if GATE else DOWN, STRIDE, BN, BK)
+                acc = tl.dot(even, tl.trans(we), acc)
+                acc = tl.dot(odd, tl.trans(wo), acc)
+                if GATE:
+                    ue, uo = _fastllm_mxfp4_planar_tile(W, slot, n + I, begin, K, N, 0, STRIDE, BN, BK)
+                    up = tl.dot(even, tl.trans(ue), up)
+                    up = tl.dot(odd, tl.trans(uo), up)
+            value = acc.to(tl.bfloat16).to(tl.float32)
+            if GATE:
+                u = up.to(tl.bfloat16).to(tl.float32)
+                value = tl.minimum(value, 10.0)
+                u = tl.maximum(-10.0, tl.minimum(u, 10.0))
+                value = ((tl.load(Silu + (value.to(tl.uint32, bitcast=True) >> 16)) * u) *
                          tl.load(Scores + route)[:, None]).to(tl.bfloat16).to(tl.float32)
                 blocks = tl.reshape(tl.abs(value), (16, BN // 32, 32))
                 amax = tl.maximum(tl.max(blocks, 2), 1e-4) / 448.0
@@ -4761,6 +4854,55 @@ def compile_merge_moe_fp8(payload):
 
 
 
+def mxfp4_grouped_batch_cache_paths(payload):
+    arch = require_int(payload, "arch")
+    # Fixed original DSV4.1 layout and rounding, with runtime route count.
+    planar = payload.get("planar", False)
+    if not isinstance(planar, bool):
+        raise ValueError("planar must be boolean")
+    topk = payload.get("topk", 6)
+    if type(topk) is not int or topk not in ((3, 6) if planar else (6,)):
+        raise ValueError("unsupported grouped MXFP4 topk")
+    if not planar:
+        raise ValueError("grouped MXFP4 batch requires planar layout")
+    base = f"mxfp4_grouped_batch_v2_planar_sm{arch}_h5120_i2304_k{topk}_m16_n32_64_k256_w4_s2"
+    root = Path(payload["cache_dir"])
+    return {
+        name: root / f"{base}_{name}.cubin" for name in ("gate", "down")
+    }, root / f"{base}.json"
+
+
+def compile_mxfp4_grouped_batch(payload):
+    if triton is None:
+        raise RuntimeError(f"failed to import triton: {_triton_error}")
+    arch = require_int(payload, "arch")
+    if arch not in {120, 121}:
+        raise ValueError("grouped MXFP4 batch requires SM12x")
+    paths, meta_path = mxfp4_grouped_batch_cache_paths(payload)
+    if meta_path.exists() and all(p.exists() for p in paths.values()):
+        return json.loads(meta_path.read_text())
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+    h, i, topk = 5120, 2304, payload.get("topk", 6)
+    down = 2 * i * (h // 32) * 17
+    stride = down + h * (i // 32) * 17
+    infos = {}
+    for name, bn in (("gate", 32), ("down", 64)):
+        infos[name] = _compile_cubin(fastllm_mxfp4_planar_grouped_batch,
+            dict(X="*bf16", W="*u8", Slots="*i32", Routes="*i32", Scores="*fp32",
+                 Y="*bf16" if name == "gate" else "*fp32", COUNT="i32", Silu="*fp32",
+                 H="constexpr", I="constexpr", TOPK="constexpr", STRIDE="constexpr",
+                 DOWN="constexpr", GATE="constexpr", BN="constexpr", BK="constexpr"),
+            dict(H=h, I=i, TOPK=topk, STRIDE=stride, DOWN=down, GATE=name == "gate", BN=bn, BK=256),
+            arch, 4, 2, paths[name], enable_fp_fusion=False)
+    meta = dict(ok=True, op="mxfp4_grouped_batch", version=2, planar=True, batch=True,
+                arch=arch, topk=topk,
+                kernels={k: dict(cubin=str(paths[k]), kernel=v.metadata.name,
+                                 shared=int(v.metadata.shared), num_warps=int(v.metadata.num_warps))
+                         for k,v in infos.items()})
+    meta_path.write_text(json.dumps(meta, sort_keys=True))
+    return meta
+
+
 def mxfp4_grouped_cache_paths(payload):
     arch = require_int(payload, "arch")
     # Fixed original DSV4.1 layout and rounding, with runtime route count.
@@ -4770,8 +4912,8 @@ def mxfp4_grouped_cache_paths(payload):
     topk = payload.get("topk", 6)
     if type(topk) is not int or topk not in ((3, 6) if planar else (6,)):
         raise ValueError("unsupported grouped MXFP4 topk")
-    base = (f"mxfp4_grouped_v6_planar_sm{arch}_h5120_i2304_k{topk}_n32_64_k256_w4_s2" if planar else
-            f"mxfp4_grouped_v3_sm{arch}_h5120_i2304_k6_n64_k128_w4_s3")
+    base = (f"mxfp4_grouped_v7_planar_sm{arch}_h5120_i2304_k{topk}_n32_64_k256_w4_s2" if planar else
+            f"mxfp4_grouped_v4_sm{arch}_h5120_i2304_k6_n64_k128_w4_s3")
     root = Path(payload["cache_dir"])
     return {
         name: root / f"{base}_{name}.cubin" for name in (("gate", "down") if planar else ("gate", "activate", "down"))
@@ -4796,12 +4938,12 @@ def compile_mxfp4_grouped(payload):
         for name, bn in (("gate", 32), ("down", 64)):
             infos[name] = _compile_cubin(fastllm_mxfp4_planar_grouped,
                 dict(X="*bf16", W="*u8", Slots="*i32", Routes="*i32", Scores="*fp32",
-                     Y="*bf16" if name == "gate" else "*fp32", COUNT="i32",
+                     Y="*bf16" if name == "gate" else "*fp32", COUNT="i32", Silu="*fp32",
                      H="constexpr", I="constexpr", TOPK="constexpr", STRIDE="constexpr",
                      DOWN="constexpr", GATE="constexpr", BN="constexpr", BK="constexpr"),
                 dict(H=h, I=i, TOPK=topk, STRIDE=stride, DOWN=down, GATE=name == "gate", BN=bn, BK=256),
                 arch, 4, 2, paths[name], enable_fp_fusion=False)
-        meta = dict(ok=True, op="mxfp4_grouped", version=6, planar=True, arch=arch, topk=topk,
+        meta = dict(ok=True, op="mxfp4_grouped", version=7, planar=True, arch=arch, topk=topk,
                     kernels={k: dict(cubin=str(paths[k]), kernel=v.metadata.name,
                                      shared=int(v.metadata.shared), num_warps=int(v.metadata.num_warps))
                              for k,v in infos.items()})
@@ -4841,6 +4983,7 @@ def compile_mxfp4_grouped(payload):
         fastllm_mxfp4_grouped_activate,
         dict(
             Raw="*bf16",
+            Silu="*fp32",
             Routes="*i32",
             Scores="*fp32",
             Y="*bf16",
@@ -4858,7 +5001,7 @@ def compile_mxfp4_grouped(payload):
     meta = dict(
         ok=True,
         op="mxfp4_grouped",
-        version=3,
+        version=4,
         arch=arch,
         kernels={
             k: dict(
@@ -4874,29 +5017,42 @@ def compile_mxfp4_grouped(payload):
     return meta
 
 
-def compile_small_projection(payload):
+def compile_projection(payload):
     if triton is None:
         raise RuntimeError(f"failed to import triton: {_triton_error}")
     arch, n, k, bn, bk = (require_int(payload, key) for key in
                          ("arch", "n", "k", "block_n", "block_k"))
+    op = payload["op"]
+    batched = op == "batched_projection"
+    bm = require_int(payload, "block_m") if batched else 0
+    if batched and bm not in {32, 64}:
+        raise ValueError("unsupported projection row tile")
     fp8 = int(payload["fp8"])
     if arch not in {120, 121} or n <= 0 or k <= 0 or n % 32 or k % 32 or fp8 not in {0, 1}:
-        raise ValueError("small projection requires SM12x, aligned BF16 / block-32 FP8 weights")
+        raise ValueError("projection requires SM12x, aligned BF16 / block-32 FP8 weights")
     if (bn, bk) not in {(64, 64), (64, 128), (32, 128), (32, 256)}:
-        raise ValueError("unsupported small projection tile")
+        raise ValueError("unsupported projection tile")
     root = Path(payload["cache_dir"])
-    base = f"small_projection_v1_sm{arch}_fp8{fp8}_n{n}_k{k}_bn{bn}_bk{bk}_w4_s3"
+    # Keep both existing cache namespaces and specializations unchanged.
+    row_tile = f"_bm{bm}" if batched else ""
+    base = f"{op}_v1_sm{arch}_fp8{fp8}_n{n}_k{k}{row_tile}_bn{bn}_bk{bk}_w4_s3"
     cubin, meta_path = root / (base + ".cubin"), root / (base + ".json")
     if meta_path.exists() and cubin.exists():
         return json.loads(meta_path.read_text())
     root.mkdir(parents=True, exist_ok=True)
-    compiled = _compile_cubin(fastllm_small_projection,
-        dict(X="*bf16", W="*u8" if fp8 else "*bf16", S="*fp32", Y="*bf16", rows="i32", groups="i32",
-             N="constexpr", K="constexpr", FP8="constexpr", BN="constexpr", BK="constexpr"),
-        dict(N=n, K=k, FP8=bool(fp8), BN=bn, BK=bk), arch, 4, 3, cubin)
-    meta = dict(ok=True, op="small_projection", version=1, arch=arch, n=n, k=k, fp8=fp8,
+    signature = dict(X="*bf16", W="*u8" if fp8 else "*bf16", S="*fp32", Y="*bf16", rows="i32", groups="i32",
+                     N="constexpr", K="constexpr", FP8="constexpr", BN="constexpr", BK="constexpr")
+    constants = dict(N=n, K=k, FP8=bool(fp8), BN=bn, BK=bk)
+    if batched:
+        signature["BM"] = "constexpr"
+        constants["BM"] = bm
+    compiled = _compile_cubin(fastllm_batched_projection if batched else fastllm_small_projection,
+                             signature, constants, arch, 4, 3, cubin)
+    meta = dict(ok=True, op=op, version=1, arch=arch, n=n, k=k, fp8=fp8,
                 block_n=bn, block_k=bk, cubin=str(cubin), kernel=compiled.metadata.name,
                 shared=int(compiled.metadata.shared), num_warps=int(compiled.metadata.num_warps))
+    if batched:
+        meta["block_m"] = bm
     meta_path.write_text(json.dumps(meta, sort_keys=True))
     return meta
 
@@ -4904,8 +5060,10 @@ def compile_small_projection(payload):
 def handle_compile(payload):
     op = payload.get("op")
     with _compile_lock:
-        if op == "small_projection":
-            return compile_small_projection(payload)
+        if op in {"small_projection", "batched_projection"}:
+            return compile_projection(payload)
+        if op == "mxfp4_grouped_batch":
+            return compile_mxfp4_grouped_batch(payload)
         if op == "mxfp4_grouped":
             return compile_mxfp4_grouped(payload)
         if op == "linear":

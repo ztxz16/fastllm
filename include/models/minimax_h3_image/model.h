@@ -1,0 +1,137 @@
+#pragma once
+#include "models/minimax_h3/runtime.h"
+#include "models/minimax_h3_image/quantized.h"
+#include "models/minimax_h3_image/source.h"
+
+namespace fastllm::minimax_h3_image {
+using minimax_h3::DType;
+using minimax_h3::Image;
+using minimax_h3::Progress;
+using minimax_h3::Runtime;
+using minimax_h3::Tensor;
+using minimax_h3::Trace;
+using minimax_h3::Weights;
+
+struct Conditioning {
+    std::vector<int> textTags;
+    std::vector<std::pair<int, int>> grids; // Reference latent height/width, in upload order.
+};
+
+Image readImage(const std::string &path);
+Image decodeImage(const std::string &bytes);
+
+// Shared by every stage, including the standalone VAE diagnostics. Explicit
+// budgets use the same 1 GiB device / 2 GiB host allowances as the video model.
+struct MemoryPolicy {
+    MemoryPolicy(Runtime &, double gpuGiB = 0, double hostGiB = 0);
+    bool layerStreaming = false;
+    std::shared_ptr<nomas::TensorPool> pool;
+    std::shared_ptr<nomas::HostMemoryBudget> host;
+};
+
+// Native MiniMax-H3-Image checkpoint: no Diffusers weight conversion required.
+class SequenceAttentionPipeline;
+class Transformer {
+  public:
+    Transformer(Runtime &, Runtime &fp32, const std::string &model, nomas::ParallelContext = {},
+                bool sequenceParallel = false, const std::string &quantizedWeights = "");
+    void prepare(Progress = {});
+    bool prepared() const { return modulation_.size() == 50; }
+    // Valid only within one request; recomputed for each new prompt/reference set.
+    void prepareText(const Tensor &);
+    void clearText();
+    Tensor forward(const Tensor &packedLatents, const Tensor &text, int height, int width, int step,
+                   Trace = {}, const Conditioning * = nullptr);
+    const std::vector<float> &sigmas() const { return sigmas_; }
+    void setMemoryPolicy(const MemoryPolicy &);
+    // keepPrepared retains timestep tables and budgeted host weights, releasing GPU weights.
+    void unload(bool keepPrepared = false);
+
+  private:
+    Tensor attention(const Tensor &, const std::string &, const Tensor * = nullptr, const Tensor * = nullptr);
+    Tensor feedForward(const Tensor &, const std::string &);
+    Tensor refine(const Tensor &);
+    Runtime &rt_, &full_;
+    Weights weights_, fullWeights_, heads_;
+    std::unique_ptr<QuantizedWeights> quantized_;
+    nomas::ParallelContext parallel_;
+    std::vector<float> times_, sigmas_;
+    std::vector<Tensor> modulation_;
+    Tensor finalModulation_, refinedText_;
+    std::unordered_map<std::string, std::pair<Tensor, Tensor>> packedQkv_;
+    std::shared_ptr<SequenceAttentionPipeline> attentionPipeline_;
+    bool lowMemory_ = false;
+    bool sequenceParallel_ = false;
+    int sequenceRows_ = 0;
+};
+
+class VAE {
+  public:
+    VAE(Runtime &compute, Runtime &fp32, const std::string &model);
+    // Unnormalized latent pixels in HWC order; returns patch rows [H*W,3*16*16].
+    Tensor decodeTile(const Tensor &, int height, int width, Trace = {});
+    // Independent tile sequences sharing the row-wise projections.
+    Tensor decodeTiles(const Tensor &, int height, int width, int batch, Trace = {});
+    Image decode(const std::vector<float> &normalizedPackedLatents, int height, int width, Progress = {});
+    // ImageNet pixels -> sampled, FP16-rounded, normalized CHW reference latent.
+    minimax_h3::VideoTensor encode(const Image &, std::mt19937 &, Progress = {}, Trace = {});
+    void setMemoryPolicy(const MemoryPolicy &);
+    using TileRunner = std::function<Tensor(const Tensor &, int, int, int)>;
+    void setTileRunner(TileRunner runner) { tileRunner_ = std::move(runner); }
+
+  private:
+    std::string model_;
+    Runtime &rt_, &full_;
+    Weights weights_, fullWeights_;
+    std::vector<float> mean_, std_;
+    bool lowMemory_ = false;
+    std::shared_ptr<nomas::HostMemoryBudget> hostBudget_;
+    std::vector<std::pair<Tensor, Tensor>> packedQkv_;
+    std::pair<Tensor, Tensor> rope_;
+    std::pair<int, int> ropeShape_{};
+    Tensor zero_;
+    TileRunner tileRunner_;
+};
+
+struct Options {
+    std::string prompt;
+    int width = 2048, height = 2048;
+    uint64_t seed = 42;
+    std::vector<Image> images;
+    int minGenerationArea = 1024; // CLI preserves exact-size diagnostic behavior.
+    void validate() const;
+    std::pair<int, int> canvas() const; // Width, height.
+};
+
+class ParallelModel;
+class Pipeline {
+  public:
+    Pipeline(const std::string &model, int device = 0, DType vaeType = DType::BF16, double gpuMemoryLimit = 0,
+             double hostMemoryLimit = 0, const std::vector<int> &devices = {},
+             nomas::RowReduction reduction = nomas::RowReduction::Activation,
+             const std::string &parallelMode = "auto");
+    ~Pipeline();
+    const MemoryPolicy &memoryPolicy() const { return memory_; }
+    bool sequenceParallel() const { return sequenceParallel_; }
+    WeightFormat weightFormat() const { return source_.format; }
+    Image generate(const Options &, Progress = {}, Trace = {}, const std::vector<float> *text = nullptr,
+                   const std::vector<float> *noise = nullptr, bool decode = true);
+
+  private:
+    Image generateImpl(const Options &, Progress, Trace, const std::vector<float> *,
+                       const std::vector<float> *, bool);
+    ModelSource source_;
+    Runtime rt_, full_, vaeRt_;
+    MemoryPolicy memory_;
+    std::unique_ptr<minimax_h3::TextEncoder> textEncoder_;
+    size_t textCacheReserve_ = 0;
+    std::unique_ptr<Transformer> transformer_;
+    std::unique_ptr<VAE> decoder_;
+    std::unique_ptr<nomas::QwenTokenizer> tokenizer_;
+    std::vector<int> devices_;
+    double gpuMemoryLimit_ = 0;
+    nomas::RowReduction reduction_;
+    bool sequenceParallel_ = false;
+    std::unique_ptr<ParallelModel> parallel_;
+};
+} // namespace fastllm::minimax_h3_image

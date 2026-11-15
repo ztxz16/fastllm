@@ -7,6 +7,20 @@
 #include <numeric>
 #include <stdexcept>
 #include <vector>
+#include <thread>
+#include <memory>
+
+#if defined(__linux__) && !defined(USE_ROCM)
+#include <dlfcn.h>
+static int captureBegins = 0;
+extern "C" cudaError_t cudaStreamBeginCapture(cudaStream_t stream, cudaStreamCaptureMode mode) {
+    using Begin = cudaError_t (*)(cudaStream_t, cudaStreamCaptureMode);
+    static const auto begin = reinterpret_cast<Begin>(dlsym(RTLD_NEXT, "cudaStreamBeginCapture_ptsz"));
+    if (!begin) return cudaErrorNotSupported;
+    ++captureBegins;
+    return begin(stream, mode);
+}
+#endif
 
 namespace {
 void Require(bool ok, const char *why) { if (!ok) throw std::runtime_error(why); }
@@ -73,7 +87,7 @@ std::vector<double> TargetOracle(const std::vector<float> &values, float tempera
     return probs;
 }
 void ChainCase(const char *label, const std::vector<float> &p, const std::vector<float> &q,
-        float temperature = 1, int topK = 32, float topP = 1, bool indirect = false) {
+        float temperature = 1, int topK = 32, float topP = 1, bool indirect = false, int planned = 0, bool probability = false) {
     const int batch = 16384, drafts = 3, vocab = 32;
     const std::vector<float> bonus{.1f, .2f, .7f};
     const auto expected = TargetOracle(p, temperature, topK, topP);
@@ -95,7 +109,21 @@ void ChainCase(const char *label, const std::vector<float> &p, const std::vector
     Require(FastllmCudaMtpSampleDraftLogits(qlogits.p, saved.p, lse.p, ids.p, nullptr,
         qt.data(), batch * drafts, vocab), "chain draft failed");
     auto cache = saved.Read();
-    if (indirect) {
+    if (probability) {
+        const auto normalizers = lse.Read();
+        for (size_t i=0;i<cache.size();++i) cache[i]=std::exp(cache[i]-normalizers[i/vocab]);
+        Check(cudaMemcpy(saved.p,cache.data(),cache.size()*sizeof(float),cudaMemcpyHostToDevice));
+    }
+    if (planned) {
+        std::vector<FastllmMtpProposalView> views(batch);
+        for (int b = 0; b < batch; ++b)
+            views[b] = {saved.p + size_t(b) * drafts * vocab, probability ? nullptr : lse.p + b * drafts, ids.p + b * drafts};
+        std::unique_ptr<void, decltype(&FastllmCudaMtpDestroyVerifier)> plan(
+            FastllmCudaMtpCreateVerifier(), FastllmCudaMtpDestroyVerifier);
+        Require((probability ? FastllmCudaMtpVerifierEnqueueProbabilities : FastllmCudaMtpVerifierEnqueue)(plan.get(), target.p, views.data(), pt.data(), pk.data(), pp.data(),
+            batch, drafts, vocab, planned == 2), "planned chain enqueue");
+        Require(FastllmCudaMtpVerifierResolve(plan.get(), output.data(), accepted.data()), "planned chain resolve");
+    } else if (indirect) {
         std::vector<FastllmMtpProposalView> views(batch);
         for (int b = 0; b < batch; ++b)
             views[b] = {saved.p + (size_t)b * drafts * vocab, lse.p + b * drafts, ids.p + b * drafts};
@@ -169,7 +197,153 @@ void LargeVocabAndGraphCase() {
     cudaEventDestroy(start); cudaEventDestroy(end); cudaGraphExecDestroy(exec); cudaGraphDestroy(graph);
 }
 
-void IndirectBatchCase(int batch, int drafts) {
+void PlanLifecycle(bool probability = false) {
+    const int vocab = 257, batch = 4, drafts = 17, rows = batch * (drafts + 1);
+    std::vector<float> target(size_t(rows) * vocab, -INFINITY), saved(size_t(batch)*drafts*vocab, -INFINITY);
+    for (int row = 0; row < rows; ++row) { target[size_t(row)*vocab] = std::log(.7f); target[size_t(row)*vocab+1] = std::log(.3f); }
+    for (int row = 0; row < batch * drafts; ++row) saved[size_t(row)*vocab+2] = 0;
+    if (probability) for (float &x:saved) x=std::exp(x);
+    Buffer<float> p(target), q(saved), lse(std::vector<float>(batch*drafts,0));
+    Buffer<int> ids(std::vector<int>(batch*drafts,2));
+    std::vector<FastllmMtpProposalView> views(batch);
+    for (int b=0;b<batch;++b) views[b]={q.p+size_t(b)*drafts*vocab,probability ? nullptr : lse.p+b*drafts,ids.p+b*drafts};
+    std::vector<float> ts(rows,1), ps(rows,1);
+    std::vector<int> ks(rows,vocab), output(rows), accepted(batch);
+    void *plan=FastllmCudaMtpCreateVerifier();
+    int randomOnes=0;
+    for (int iteration=0;iteration<64;++iteration) {
+        // Immutable pinned inputs and device scratch must survive worker handoff.
+        auto run=[&] {
+            Check(cudaSetDevice(0));
+            std::fill(ks.begin(),ks.end(),iteration%4==0?1:vocab);
+            std::fill(ps.begin(),ps.end(),iteration%4==1?.5f:1.f);
+            ts[0]=iteration%2?.8f:1.f;
+            if (iteration%3==0) std::reverse(views.begin(),views.end());
+            Require((probability ? FastllmCudaMtpVerifierEnqueueProbabilities : FastllmCudaMtpVerifierEnqueue)(plan,p.p,views.data(),ts.data(),ks.data(),ps.data(),
+                batch,drafts,vocab,iteration%8!=0),"plan enqueue/reconfigure");
+            Require(!(probability ? FastllmCudaMtpVerifierEnqueueProbabilities : FastllmCudaMtpVerifierEnqueue)(plan,p.p,views.data(),ts.data(),ks.data(),ps.data(),
+                batch,drafts,vocab,true),"overlapping plan accepted");
+            Require(FastllmCudaMtpVerifierResolve(plan,output.data(),accepted.data()),"plan resolve/handoff");
+            for (int b=0;b<batch;++b) {
+                Require(accepted[b]==0,"disjoint plan should reject");
+                int token=output[b*(drafts+1)];
+                Require(token>=0&&token<=1,"plan target support");
+                if (iteration%4<2) Require(token==0,"changed top-k/top-p not respected");
+                else randomOnes+=token==1;
+            }
+        };
+        std::exception_ptr error;
+        std::thread worker([&] { try {run();}catch(...) {error=std::current_exception();} });
+        worker.join(); if(error)std::rethrow_exception(error);
+    }
+    Require(randomOnes>15 && randomOnes<70,"plan replay RNG distribution");
+    // Keep the graph's shape and filters fixed while replacing its input
+    // address. Each alternating buffer has disjoint target support.
+    std::vector<float> alternate(size_t(rows)*vocab,-INFINITY);
+    for(int row=0;row<rows;++row) alternate[size_t(row)*vocab+3]=0;
+    Buffer<float> p2(alternate);
+    std::fill(ts.begin(),ts.end(),1.f);std::fill(ps.begin(),ps.end(),1.f);std::fill(ks.begin(),ks.end(),vocab);
+    for(int i=0;i<12;++i) {
+        Require((probability ? FastllmCudaMtpVerifierEnqueueProbabilities : FastllmCudaMtpVerifierEnqueue)(plan,i%2?p.p:p2.p,views.data(),ts.data(),ks.data(),ps.data(),
+            batch,drafts,vocab,true),"plan input retarget");
+        Require(FastllmCudaMtpVerifierResolve(plan,output.data(),accepted.data()),"plan retarget resolve");
+        for(int b=0;b<batch;++b) Require(accepted[b]==0 && (i%2 ? output[b*(drafts+1)]<=1 : output[b*(drafts+1)]==3),
+            "retargeted graph read old input");
+    }
+
+    ts[0]=0;
+    Require(!(probability ? FastllmCudaMtpVerifierEnqueueProbabilities : FastllmCudaMtpVerifierEnqueue)(plan,p.p,views.data(),ts.data(),ks.data(),ps.data(),batch,drafts,vocab,true),
+        "invalid parameters accepted");
+    FastllmCudaMtpDestroyVerifier(plan);
+    std::puts("owned verifier lifecycle: parameter changes, graph/eager, 17 drafts, descriptor reorder, fresh workers, RNG: PASS");
+}
+
+void DrainShapeCache() {
+    const int vocab = 257;
+    for (int maximum : {4, 8, 9, 16}) for (int drafts : {1, 5, 17}) {
+        const int rows = maximum * (drafts + 1);
+        std::vector<float> logits(size_t(rows) * vocab, -INFINITY);
+        std::vector<float> probs(size_t(maximum) * drafts * vocab, 0);
+        for (int row = 0; row < rows; ++row) logits[size_t(row) * vocab] = 0;
+        for (int row = 0; row < maximum * drafts; ++row) probs[size_t(row) * vocab] = 1;
+        Buffer<float> p(logits), q(probs);
+        Buffer<int> ids(std::vector<int>(maximum * drafts, 0));
+        std::vector<FastllmMtpProposalView> views(maximum);
+        for (int b = 0; b < maximum; ++b)
+            views[b] = {q.p + size_t(b) * drafts * vocab, nullptr, ids.p + b * drafts};
+        std::vector<float> ts(rows, 1), ps(rows, 1);
+        std::vector<int> ks(rows, vocab), output(rows), accepted(maximum);
+        std::unique_ptr<void, decltype(&FastllmCudaMtpDestroyVerifier)> plan(
+            FastllmCudaMtpCreateVerifier(), FastllmCudaMtpDestroyVerifier);
+        auto run = [&](int batch, bool warm) {
+#if defined(__linux__) && !defined(USE_ROCM)
+            const int before = captureBegins;
+#endif
+            Require(FastllmCudaMtpVerifierEnqueueProbabilities(plan.get(), p.p, views.data(),
+                ts.data(), ks.data(), ps.data(), batch, drafts, vocab, true), "drain verifier enqueue");
+            Require(FastllmCudaMtpVerifierResolve(plan.get(), output.data(), accepted.data()), "drain verifier resolve");
+            for (int b = 0; b < batch; ++b) {
+                Require(accepted[b] == drafts, "drain changed acceptance");
+                for (int i = 0; i <= drafts; ++i) Require(output[b * (drafts + 1) + i] == 0, "drain changed output");
+            }
+#if defined(__linux__) && !defined(USE_ROCM)
+            if (warm) Require(captureBegins == before + 1, "initial verifier graph capture was not observed");
+            if (!warm && ((batch & (batch - 1)) == 0 || batch == maximum))
+                Require(captureBegins == before, "drain evicted a warmed regular verifier graph");
+#endif
+        };
+        for (int batch = 1; batch <= maximum; batch *= 2) run(batch, true);
+        if ((maximum & (maximum - 1)) != 0) run(maximum, true);
+        for (int wave = 0; wave < 3; ++wave) {
+            for (int batch = maximum; batch >= 1; --batch) run(batch, false);
+            run(maximum, false);
+        }
+    }
+    std::puts("verifier cache: geometric/odd maximum and repeated drain preserve hot graphs: PASS");
+}
+
+void ProbabilityPrefixes() {
+    const int vocab=257, guard=7;
+    std::unique_ptr<void,decltype(&FastllmCudaMtpDestroyVerifier)> plan(
+        FastllmCudaMtpCreateVerifier(),FastllmCudaMtpDestroyVerifier);
+    for(int batch:{1,2,3,5,9}) for(int drafts:{1,5,9,17}) {
+        const int rows=batch*(drafts+1), pitch=drafts+guard;
+        std::vector<float> q(size_t(batch)*pitch*vocab,123.f);
+        std::vector<int> ids(batch*pitch,-7);
+        for(int b=0;b<batch;++b) for(int d=0;d<drafts;++d) {
+            std::fill_n(q.data()+size_t(b*pitch+d)*vocab,vocab,0.f);
+            q[size_t(b*pitch+d)*vocab+b%3]=1;ids[b*pitch+d]=b%3;
+        }
+        Buffer<float> probabilities(q), target(size_t(rows)*vocab);
+        Buffer<int> tokens(ids);
+        std::vector<FastllmMtpProposalView> views(batch);
+        std::vector<float> logits(size_t(rows)*vocab), temperatures(rows,1), ps(rows,1);
+        std::vector<int> ks(rows,vocab), output(rows), accepted(batch);
+        for(int step=0;step<=drafts;++step) {
+            std::fill(logits.begin(),logits.end(),-INFINITY);
+            for(int b=0;b<batch;++b) {
+                const int source=(b+step)%batch, prefix=(b+step)%(drafts+1), token=source%3;
+                views[b]={probabilities.p+size_t(source)*pitch*vocab,nullptr,tokens.p+source*pitch};
+                for(int d=0;d<=drafts;++d)
+                    logits[size_t(b*(drafts+1)+d)*vocab+(d<prefix?token:token+3)]=0;
+            }
+            Check(cudaMemcpy(target.p,logits.data(),logits.size()*sizeof(float),cudaMemcpyHostToDevice));
+            Require(FastllmCudaMtpVerifierEnqueueProbabilities(plan.get(),target.p,views.data(),
+                temperatures.data(),ks.data(),ps.data(),batch,drafts,vocab,step%2),"probability prefix enqueue");
+            Require(FastllmCudaMtpVerifierResolve(plan.get(),output.data(),accepted.data()),"probability prefix resolve");
+            for(int b=0;b<batch;++b) {
+                const int prefix=(b+step)%(drafts+1), token=((b+step)%batch)%3;
+                Require(accepted[b]==prefix,"wrong probability prefix length");
+                for(int d=0;d<=drafts;++d) Require(output[b*(drafts+1)+d]==
+                    (d<prefix?token:d==prefix?token+3:-1),"probability suffix/support mismatch");
+            }
+        }
+        Require(q==probabilities.Read()&&ids==tokens.Read(),"probability verifier mutated borrowed input/guards");
+    }
+    std::puts("probability verifier: all prefixes, irregular batches, 17 drafts, descriptor remap, bounded shape reuse: PASS");
+}
+
+void IndirectBatchCase(int batch, int drafts, bool owned = false) {
     const int vocab = 257, guard = 11, pitch = drafts + guard;
     Buffer<float> cache(std::vector<float>((size_t)batch * pitch * vocab, 123)),
                   lse(std::vector<float>(batch * pitch, 123)),
@@ -220,6 +394,15 @@ void IndirectBatchCase(int batch, int drafts) {
         }
     }
     Buffer<float> p(target);
+    if (owned) {
+        std::unique_ptr<void, decltype(&FastllmCudaMtpDestroyVerifier)> plan(
+            FastllmCudaMtpCreateVerifier(), FastllmCudaMtpDestroyVerifier);
+        for (int replay=0;replay<3;++replay) {
+            Require(FastllmCudaMtpVerifierEnqueue(plan.get(),p.p,views.data(),pt.data(),pk.data(),pp.data(),
+                batch,drafts,vocab,true), "planned mixed-prefix enqueue");
+            Require(FastllmCudaMtpVerifierResolve(plan.get(),output.data(),accepted.data()), "planned mixed-prefix resolve");
+        }
+    } else
     Require(FastllmCudaMtpRejectionSamplingLogitsBatch(p.p,views.data(),pt.data(),pk.data(),pp.data(),
         output.data(),accepted.data(),batch,drafts,vocab), "indirect verification failed");
     for (int b = 0; b < batch; ++b) {
@@ -247,6 +430,20 @@ int main() {
         ChainCase("batch indirect p=q", {.6f,.3f,.1f}, {.6f,.3f,.1f}, 1, 32, 1, true);
         ChainCase("batch indirect residual", {.1f,.2f,.7f}, {.6f,.3f,.1f}, 1, 32, 1, true);
         ChainCase("batch indirect constraints", {.6f,.3f,.1f}, {.2f,.3f,.5f}, 1.5f, 2, .95f, true);
+        for (int mode : {1,2}) {
+            ChainCase("owned verifier p=q", {.6f,.3f,.1f}, {.6f,.3f,.1f}, 1, 32, 1, false, mode);
+            ChainCase("owned verifier residual", {.1f,.2f,.7f}, {.6f,.3f,.1f}, 1, 32, 1, false, mode);
+            ChainCase("owned verifier constraints", {.6f,.3f,.1f}, {.2f,.3f,.5f}, 1.5f, 2, .95f, false, mode);
+        }
+        ChainCase("probability plan equal", {.2f,.3f,.5f}, {.2f,.3f,.5f},1,32,1,true,2,true);
+        ChainCase("probability plan disjoint", {0,1,0}, {1,0,0},1,32,1,true,2,true);
+        ChainCase("probability plan filtered", {.15f,.35f,.5f}, {.4f,.3f,.3f},.8f,2,.85f,true,2,true);
+        DrainShapeCache();
+        PlanLifecycle(true);
+        ProbabilityPrefixes();
+        PlanLifecycle();
+        for (int batch : {1, 2, 4, 32}) for (int drafts : {1, 3, 17})
+            IndirectBatchCase(batch, drafts, true);
         for (int device = 0; device < devices; ++device) {
             Check(cudaSetDevice(device));
             for (int batch : {1,2,4,8,10,16,24,32})

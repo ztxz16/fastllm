@@ -51,8 +51,10 @@ template<class T,int D,bool FP32Sum,bool Batched=false> cudaError_t dispatchAtte
     if(causal)
         return SinglePrefillWithKVCacheDispatched<D,D,PosEncodingMode::kNone,false,
             MaskMode::kCausal,Attention,Params<T>,false>(p,nullptr,stream);
-    const bool smallQuery = FP32Sum && D==128 && queries>64 && queries<=256 && keys>=512 && heads==kvHeads
-                            && GetCudaComputeCapability().first==12;
+    const bool smallQuery = D==128 && heads==kvHeads &&
+        ((FP32Sum && queries>64 && queries<=256 && keys>=512) ||
+         (!FP32Sum && queries>=512 && queries<=2304 && heads<=8 && qStride>heads*3*D)) &&
+        GetCudaComputeCapability().first==12;
     return SinglePrefillWithKVCacheDispatched<D,D,PosEncodingMode::kNone,false,
         MaskMode::kNone,Attention,Params<T>,false>(p,nullptr,stream,smallQuery?64:0,smallQuery?2:0);
 }

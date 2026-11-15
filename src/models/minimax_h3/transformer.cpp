@@ -1,4 +1,5 @@
 #include "models/minimax_h3/runtime.h"
+#include "quantized.h"
 #include "json11.hpp"
 #include <algorithm>
 #include <cmath>
@@ -71,13 +72,19 @@ void PackedLayout::validate(int count) const {
             throw std::invalid_argument("invalid H3 timestep indices");
 }
 Transformer::Transformer(Runtime &rt, Runtime &fp32, const std::string &dir, nomas::ParallelContext parallel)
+    :Transformer(rt,fp32,dir,parallel,false) {}
+Transformer::Transformer(Runtime &rt, Runtime &fp32, const std::string &dir,
+                         nomas::ParallelContext parallel,bool sequenceParallel)
     : rt_(rt), fp32_(fp32), weights_(rt, componentWeights(dir)), fullWeights_(fp32, componentWeights(dir)),
-      config_(dir), parallel_(parallel) {
+      config_(dir), parallel_(parallel), sequenceParallel_(sequenceParallel && parallel.size()>1) {
     if (!fp32.isFloat32())
         throw std::invalid_argument("H3 projection runtime must be FP32");
+    if(sequenceParallel_ && rt_.dtype()!=DType::BF16)
+        throw std::invalid_argument("H3 sequence parallelism requires BF16 activations");
     if (config_.heads % parallel_.size() || config_.ffn % parallel_.size())
         throw std::invalid_argument("H3 attention heads and FFN width must divide TP size");
     auto block = [&](const std::string &p) {
+        if(sequenceParallel_) return;
         for (const char *name : {"to_q", "to_k", "to_v"})
             parallel_.columnWeights(weights_, p + ".attn." + name);
         parallel_.rowWeights(weights_, p + ".attn.to_out.0");
@@ -93,6 +100,19 @@ Transformer::Transformer(Runtime &rt, Runtime &fp32, const std::string &dir, nom
         block("token_refiner.refiner_blocks." + std::to_string(i));
     parallel_.columnWeights(weights_, "norm_out.linear");
 }
+void Transformer::setQuantizedWeights(const std::string &path) {
+    if(path.empty()) {
+        if(quantized_) { unload(); quantized_.reset(); }
+        return;
+    }
+    if(config_.hidden!=5376 || config_.heads!=56 || config_.headDim!=128 || config_.layers!=50 ||
+       config_.refiners!=2 || config_.ffn!=14336 || config_.videoDim!=96 || config_.audioDim!=32)
+        throw std::invalid_argument("quantized H3 video base dimensions do not match");
+    unload();
+    quantized_=std::make_shared<VideoProjections>(rt_,path,
+                    parallel_,sequenceParallel_);
+    quantized_->setHostMemoryBudget(hostBudget_);
+}
 Tensor Transformer::timeEmbedding(const std::vector<float> &times) {
     auto x = fp32_.timestepEmbedding(times, config_.freqDim);
     x = fp32_.activation(fullWeights_.linear(x, "time_embedder.linear_1"));
@@ -103,6 +123,7 @@ void Transformer::setHostMemoryBudget(const std::shared_ptr<nomas::HostMemoryBud
     weights_.setHostMemoryBudget(budget);
     fullWeights_.setHostMemoryBudget(budget);
     if(lora_) lora_->setHostMemoryBudget(budget);
+    if(quantized_) quantized_->setHostMemoryBudget(budget);
 }
 void Transformer::setLowMemory(bool enabled) {
     if (enabled == lowMemory_) return;
@@ -121,7 +142,33 @@ Tensor Transformer::projectModulation(int layer, const Tensor &input) {
 }
 Tensor Transformer::attention(const Tensor &x, const std::string &p, const Tensor *cs, const Tensor *sn,
                               Trace trace) {
-    auto q = linear(x, p + ".to_q"), k = linear(x, p + ".to_k"), v = linear(x, p + ".to_v");
+    Tensor q,k,v;
+    const int heads=sequenceParallel_?config_.heads:config_.heads/parallel_.size();
+    if(quantized_ && quantized_->fusedProjections() && !sequenceRows_ && !trace) {
+        auto packed=quantized_->linear(x,p+".qkv_proj");
+        const int width=heads*config_.headDim;
+        if(lora_) {
+            int column=0;
+            for(const char *name:{"to_q","to_k","to_v"}) {
+                const auto prefix=p+"."+name;
+                auto a=rt_.linear(x,lora_->get(prefix+".lora_A.default.weight"));
+                rt_.linearAddInto(a,lora_->get(prefix+".lora_B.default.weight"),packed,column);
+                column+=width;
+            }
+        }
+        rt_.qkvNormRotaryInPlace(packed,weights_.get(p+".norm_q.weight"),
+                                weights_.get(p+".norm_k.weight"),config_.qkEps,cs,sn);
+        return rowLinear(rt_.packedSelfAttention(packed,heads),p+".to_out.0");
+    }
+    if(quantized_) {
+        const auto packed=quantized_->linear(x,p+".qkv_proj");
+        const int width=heads*config_.headDim;
+        q=addLora(x,p+".to_q",rt_.columns(packed,0,width));
+        k=addLora(x,p+".to_k",rt_.columns(packed,width,width));
+        v=addLora(x,p+".to_v",rt_.columns(packed,2*width,width));
+    } else {
+        q=linear(x,p+".to_q"); k=linear(x,p+".to_k"); v=linear(x,p+".to_v");
+    }
     if (cs) {
         auto qk = rt_.qkNormRotary(q, k, weights_.get(p + ".norm_q.weight"),
                                  weights_.get(p + ".norm_k.weight"), config_.qkEps, *cs, *sn,
@@ -137,35 +184,45 @@ Tensor Transformer::attention(const Tensor &x, const std::string &p, const Tenso
         trace("k", k);
         trace("v", v);
     }
-    auto out = rt_.selfAttention(q, k, v, config_.heads / parallel_.size());
+    if(sequenceRows_) {
+        k=parallel_.gatherRows(rt_,k,sequenceRows_);
+        v=parallel_.gatherRows(rt_,v,sequenceRows_);
+    }
+    auto out = rt_.selfAttention(q, k, v, heads);
     if (trace)
         trace("attention", out);
-    return lora_ ? rowLinear(out, p + ".to_out.0") : parallel_.row(rt_, weights_, out, p + ".to_out.0");
+    return rowLinear(out, p + ".to_out.0");
 }
 Tensor Transformer::feedForward(const Tensor &x, const std::string &p) {
     std::vector<Tensor> chunks;
     Tensor out;
-    const bool overlap = !lora_ && parallel_.size() > 1 && !x.isFloat32() && x.rows > 4096;
+    const bool custom=lora_ || quantized_, sharded=!sequenceParallel_ && parallel_.size()>1;
+    const bool overlap = !custom && sharded && !x.isFloat32() && x.rows > 4096;
     Tensor reduced;
     if (!x.isFloat32() || parallel_.size() > 1)
-        out = Tensor(x.rows, config_.hidden, !lora_ && parallel_.size() > 1 ? parallel_.partialType(x.dtype) : x.dtype);
+        out = Tensor(x.rows, config_.hidden, !custom && sharded ? parallel_.partialType(x.dtype) : x.dtype);
     if (overlap)
         reduced = out.dtype == x.dtype ? out : Tensor(x.rows, config_.hidden, x.dtype);
     // Bound BF16 scratch and preserve the original sub-512 tail GEMM: folding
     // it into a larger batch selects a different reduction/rounding algorithm.
     // FP32 diagnostics retain all their original GEMM shapes.
     int chunk = x.isFloat32() ? 512 : 4096;
+    // NVFP4 calibration is collective. All sequence ranks must execute the
+    // same number of FFN chunks, including ceil-partition boundary tails.
+    const bool calibrated=sequenceParallel_ && quantized_ && quantized_->collectiveCalibration();
+    int pieces=calibrated?((sequenceRows_?(sequenceRows_+parallel_.size()-1)/parallel_.size():x.rows)+chunk-1)/chunk:0;
     for (int first = 0; first < x.rows;) {
-        int count = std::min(chunk, x.rows - first);
-        if (count > 512)
+        int count = calibrated?(x.rows-first+pieces-1)/pieces:std::min(chunk,x.rows-first);
+        if(calibrated) --pieces;
+        if (!calibrated && count > 512)
             count -= count % 512;
         auto y = linear(x.rowSlice(first, count), p + ".net.0.proj");
         if (out.data) {
             auto target = out.rowSlice(first, count);
-            if (lora_) {
-                auto value = rowLinear(rt_.siluMultiply(y), p + ".net.2");
+            if (custom) {
+                auto value = rowLinear(rt_.siluMultiply(y,quantized_ && quantized_->fusedProjections()), p + ".net.2");
                 rt_.concatInto({value}, target);
-            } else if (parallel_.size() > 1) {
+            } else if (sharded) {
                 parallel_.rowPartial(rt_, weights_, rt_.siluMultiply(y), p + ".net.2", target);
                 if (overlap) {
                     auto result = reduced.rowSlice(first, count);
@@ -183,7 +240,7 @@ Tensor Transformer::feedForward(const Tensor &x, const std::string &p) {
         return reduced;
     }
     if (out.data)
-        return !lora_ && parallel_.size() > 1 ? parallel_.finishRow(rt_, weights_, out, p + ".net.2", x.dtype) : out;
+        return !custom && sharded ? parallel_.finishRow(rt_, weights_, out, p + ".net.2", x.dtype) : out;
     return chunks.size() == 1 ? chunks[0] : rt_.concat(chunks);
 }
 Tensor Transformer::refine(const Tensor &input) {
@@ -197,6 +254,7 @@ Tensor Transformer::refine(const Tensor &input) {
         if (lowMemory_) {
             weights_.erasePrefix(p + ".");
             if (lora_) lora_->erasePrefix(p + ".");
+            if (quantized_) quantized_->erasePrefix(p + ".");
         }
     }
     return rt_.rms(x, weights_.get("token_refiner.final_norm.weight"), config_.finalEps);
@@ -265,7 +323,7 @@ void Transformer::prepare(const std::vector<std::vector<float>> &plans,
     plans_ = plans;
 }
 std::pair<Tensor, Tensor> Transformer::forward(const Tensor &video, const Tensor &audio, const Tensor &text,
-                                               const PackedLayout &layout, Trace trace) {
+                                               const PackedLayout &layout, Trace trace, std::function<void()> checkpoint) {
     if (modulation_.size() != size_t(config_.layers))
         throw std::logic_error("H3 timestep tables not prepared");
     layout.validate(outputModulation_.rows);
@@ -282,21 +340,41 @@ std::pair<Tensor, Tensor> Transformer::forward(const Tensor &video, const Tensor
     for (size_t i = 0; i < adaln.size(); ++i)
         adaln[i] = adaln[i] * 3 + layout.tags[i];
     auto idx = rt_.indices(adaln);
+    const int rows=x.rows,shardRows=(rows+parallel_.size()-1)/parallel_.size();
+    sequenceRows_=0;
+    if(sequenceParallel_ && rows>(parallel_.size()-1)*shardRows) {
+        const int start=parallel_.rank*shardRows,count=std::min(shardRows,rows-start);
+        x=x.rowSlice(start,count);
+        rope.first=rope.first.rowSlice(start,count); rope.second=rope.second.rowSlice(start,count);
+        idx=idx.rowSlice(start,count); sequenceRows_=rows;
+    }
     for (int i = 0; i < config_.layers; ++i) {
+        if(checkpoint) checkpoint();
         x = block(i, x, modulation_[i], idx, rope.first, rope.second);
-        if (trace)
-            trace("block." + std::to_string(i), x);
+        if (trace) {
+            auto observed=sequenceRows_?parallel_.gatherRows(rt_,x,rows):x;
+            trace("block."+std::to_string(i),observed);
+            // Diagnostic callbacks can replace an activation to compare each
+            // subsequent block on identical input, as in the image adapter.
+            if(sequenceRows_) x=observed.rowSlice(parallel_.rank*shardRows,x.rows);
+        }
         if (rt_.isFloat32() || lowMemory_)
             weights_.erasePrefix("transformer_blocks." + std::to_string(i) + ".");
         if (lowMemory_ && lora_)
             lora_->erasePrefix("transformer_blocks." + std::to_string(i) + ".");
+        if(lowMemory_ && quantized_)
+            quantized_->erasePrefix("transformer_blocks."+std::to_string(i)+".");
     }
+    if(sequenceRows_) x=parallel_.gatherRows(rt_,x,rows);
+    sequenceRows_=0;
     x = rt_.rmsModulateRows(x, weights_.get("norm_out.norm.weight"), config_.finalEps,
                            outputModulation_, rt_.indices(layout.timeIndices), 0, 1);
     return {fullWeights_.linear(rt_.cast(rt_.gather(x, vi), DType::FP32), "proj_out"),
             fullWeights_.linear(rt_.cast(rt_.gather(x, ai), DType::FP32), "audio_proj_out")};
 }
 void Transformer::unload() {
+    if(quantized_) quantized_->clear();
+    sequenceRows_=0;
     if (lora_) lora_->clear();
     weights_.clear();
     fullWeights_.clear();

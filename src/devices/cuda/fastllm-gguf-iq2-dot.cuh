@@ -190,4 +190,133 @@ static __device__ __forceinline__ float DotS(
     return d * sumi;
 }
 
+
+// Decode each 32-weight subgroup once, then reuse its signed integer bytes
+// for several activation rows. Scaling keeps the scalar dot's truncation.
+struct Decoded32 {
+    int values[8], lo, hi;
+    float scale;
+    template<bool XXS>
+    __device__ __forceinline__ float Dot(const block_q8_1 &x) const {
+        int a = 0, b = 0;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) a = ggml_cuda_dp4a(values[i], get_int_b4(x.qs, i), a);
+#pragma unroll
+        for (int i = 4; i < 8; ++i) b = ggml_cuda_dp4a(values[i], get_int_b4(x.qs, i), b);
+        const int sum = XXS ? ((2*lo+1)*(a+b))/8 : (a*lo+b*hi+(a+b)/2)/4;
+        return (scale * __low2float(x.ds)) * sum;
+    }
+};
+template<bool Packed>
+static __device__ __forceinline__ Decoded32 DecodeXXS(
+        const void *vbq, int kbx, int iqs, const uint64_t *grid, int row = 0) {
+    uint32_t q2, aux32;
+    float scale;
+    if constexpr (Packed) {
+        const auto &q = static_cast<const block_iq2_xxs_r4 *>(vbq)[kbx];
+        q2 = get_int_b4(q.qs, 4*(iqs/2) + row);
+        aux32 = 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const unsigned v = q.sas[16*(iqs/2) + 4*row + j], signs = v >> 1;
+            aux32 |= ((signs ^ (signs << 1)) & 127) << (7*j);
+            aux32 |= (v & 1) << (28+j);
+        }
+        scale = __half2float(q.d[row]);
+    } else {
+        const auto &q = static_cast<const block_iq2_xxs *>(vbq)[kbx];
+        q2 = get_int_b2(q.qs, iqs);
+        aux32 = get_int_b2(q.qs, iqs + 1);
+        scale = __half2float(q.d);
+    }
+
+    Decoded32 decoded;
+    decoded.scale = scale;
+    decoded.lo = aux32 >> 28; decoded.hi = 0;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const uint64_t value = grid[(q2 >> (8*j)) & 255u];
+        const unsigned s7 = (aux32 >> (7*j)) & 127u;
+        const unsigned signs = s7 | ((__popc(s7) & 1) << 7);
+        decoded.values[2*j] = PackedSign4(uint32_t(value), signs);
+        decoded.values[2*j+1] = PackedSign4(uint32_t(value >> 32), signs >> 4);
+    }
+    return decoded;
+}
+template<bool Packed>
+static __device__ __forceinline__ Decoded32 DecodeXS(
+        const void *vbq, int kbx, int iqs, const uint64_t *grid, int row = 0) {
+    uint16_t q2[4];
+    int ls0, ls1;
+    float scale;
+    if constexpr (Packed) {
+        const auto &q = static_cast<const block_iq2_xs_r4 *>(vbq)[kbx];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const unsigned v = q.qs[16*(iqs/2) + 4*row + j], signs = v >> 9;
+            q2[j] = (v & 511) | (((signs ^ (signs << 1)) & 127) << 9);
+        }
+        ls0 = q.scales[4*(iqs/2) + row] & 15;
+        ls1 = q.scales[4*(iqs/2) + row] >> 4;
+        scale = __half2float(q.d[row]);
+    } else {
+        const auto &q = static_cast<const block_iq2_xs *>(vbq)[kbx];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) q2[j] = q.qs[2*iqs + j];
+        ls0 = q.scales[iqs/2] & 15;
+        ls1 = q.scales[iqs/2] >> 4;
+        scale = __half2float(q.d);
+    }
+
+    Decoded32 decoded;
+    decoded.scale = scale;
+    decoded.lo = ls0; decoded.hi = ls1;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const uint64_t value = grid[q2[j] & 511u];
+        const unsigned s7 = q2[j] >> 9;
+        const unsigned signs = s7 | ((__popc(s7) & 1) << 7);
+        decoded.values[2*j] = PackedSign4(uint32_t(value), signs);
+        decoded.values[2*j+1] = PackedSign4(uint32_t(value >> 32), signs >> 4);
+    }
+    return decoded;
+}
+template<bool Packed>
+static __device__ __forceinline__ Decoded32 DecodeS(
+        const void *vbq, int kbx, int iqs, const uint64_t *grid, int row = 0) {
+    uint32_t qs_packed, signs_packed_32;
+    int qh, ls0, ls1;
+    float scale;
+    if constexpr (Packed) {
+        const auto &q = static_cast<const block_iq2_s_r4 *>(vbq)[kbx];
+        qs_packed = get_int_b4(q.qs, 4*(iqs/2) + row);
+        signs_packed_32 = get_int_b4(q.signs, 4*(iqs/2) + row);
+        qh = q.qh[4*(iqs/2) + row];
+        ls0 = q.scales[4*(iqs/2) + row] & 15;
+        ls1 = q.scales[4*(iqs/2) + row] >> 4;
+        scale = __half2float(q.d[row]);
+    } else {
+        const auto &q = static_cast<const block_iq2_s *>(vbq)[kbx];
+        qs_packed = get_int_b2(q.qs, iqs/2);
+        signs_packed_32 = get_int_b2(q.qs, QK_K/32 + iqs/2);
+        qh = q.qh[iqs/2];
+        ls0 = q.scales[iqs/2] & 15;
+        ls1 = q.scales[iqs/2] >> 4;
+        scale = __half2float(q.d);
+    }
+
+    Decoded32 decoded;
+    decoded.scale = scale;
+    decoded.lo = ls0; decoded.hi = ls1;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const unsigned index = ((qs_packed >> (8*j)) & 255u) | ((unsigned(qh) << (8-2*j)) & 768u);
+        const uint64_t value = grid[index];
+        const unsigned signs = (signs_packed_32 >> (8*j)) & 255u;
+        decoded.values[2*j] = PackedSign4(uint32_t(value), signs);
+        decoded.values[2*j+1] = PackedSign4(uint32_t(value >> 32), signs >> 4);
+    }
+    return decoded;
+}
+
 } // namespace iq2_decode

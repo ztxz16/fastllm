@@ -79,6 +79,13 @@ int main() {
             std::vector<int> devices(ranks);
             for(int rank=0;rank<ranks;++rank) devices[rank]=rank;
             ParallelGroup activationGroup(devices);
+            activationGroup.run([&](int rank) {
+                Runtime rt(rank,DType::FP32);
+                float values[]={1.f-rank,-5.f+rank,2.f*rank};
+                auto x=rt.upload(values,1,3);
+                activationGroup.maximum(x,rank);
+                near(rt.download(x),{1.f,float(ranks-6),float(2*(ranks-1))},0);
+            });
             for(auto dtype:{DType::BF16,DType::FP16}) {
                 Runtime root(0,dtype); Weights full(root,path);
                 for(int rows:{67,8193}) {
@@ -138,6 +145,47 @@ int main() {
                         near(rt.download(actual),expected,0);
                     });
                 }
+            for (auto dtype : {DType::FP32, DType::BF16, DType::FP16})
+                for (int chunks : {1, 3, 7}) for (bool inPlace : {false, true}) {
+                    activationGroup.run([&](int rank) {
+                        Runtime rt(rank, dtype); TensorPool pool(rank, 4u << 20); TensorPool::Scope scope(pool);
+                        const int rows = 67, cols = 32;
+                        std::vector<float> values(chunks * rows * cols);
+                        for (size_t j = 0; j < values.size(); ++j) values[j] = float(int(j % 17) - 8 + rank);
+                        Tensor input;
+                        if (inPlace) {
+                            std::vector<float> slots(chunks * rows * ranks * cols, -999);
+                            for (int g = 0; g < chunks; ++g)
+                                std::copy_n(values.data() + g * rows * cols, rows * cols,
+                                    slots.data() + (g * ranks + rank) * rows * cols);
+                            input = rt.upload(slots.data(), chunks * rows * ranks, cols);
+                        } else input = rt.upload(values.data(), chunks * rows, cols);
+                        activationGroup.gatherChunks(input, chunks, rank, [&](int g, const Tensor &out) {
+                            std::vector<float> expected(rows * ranks * cols);
+                            for (int source = 0; source < ranks; ++source)
+                                for (int j = 0; j < rows * cols; ++j)
+                                    expected[source * rows * cols + j] = float((g * rows * cols + j) % 17 - 8 + source);
+                            near(rt.download(out), expected, 0);
+                        }, inPlace);
+                    });
+                }
+            bool chunkCancelled = false;
+            try {
+                activationGroup.run([&](int rank) {
+                    Runtime rt(rank, DType::BF16);
+                    std::vector<float> values(3 * 67 * 32, float(rank));
+                    auto input = rt.upload(values.data(), 3 * 67, 32);
+                    activationGroup.gatherChunks(input, 3, rank, [&](int g, const Tensor &) {
+                        if (rank == 0 && g == 1) throw std::runtime_error("cancel chunk gather");
+                    });
+                });
+            } catch (const std::runtime_error &) { chunkCancelled = true; }
+            require(chunkCancelled, "chunk gather cancellation not propagated");
+            activationGroup.run([&](int rank) {
+                Runtime rt(rank, DType::BF16); float one = 1; auto x = rt.upload(&one, 1, 1);
+                activationGroup.sum(x, rank);
+                require(rt.download(x)[0] == ranks, "chunk gather cancellation recovery");
+            });
             bool gatherFailed=false;
             try {
                 activationGroup.run([&](int rank) {
@@ -354,6 +402,20 @@ int main() {
             Runtime rt(rank,true); float value=float(rank+1);
             auto x=rt.upload(&value,1,1); group.sum(x,rank);
             require(rt.download(x)[0]==3,"communicator did not recover");
+        });
+        failed=false;
+        try {
+            group.run([&](int rank) {
+                if(rank==0) throw std::runtime_error("injected calibration cancellation");
+                Runtime rt(rank,true);float value=1;
+                auto x=rt.upload(&value,1,1);group.maximum(x,rank);
+            });
+        } catch(const std::exception &) {failed=true;}
+        require(failed,"calibration cancellation not propagated");
+        group.run([&](int rank) {
+            Runtime rt(rank,true);float value=float(rank+1);
+            auto x=rt.upload(&value,1,1);group.maximum(x,rank);
+            require(rt.download(x)[0]==2,"calibration communicator did not recover");
         });
         failed=false;
         try {

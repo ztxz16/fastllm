@@ -55,6 +55,17 @@ def main():
         shutil.copy2(build / 'cuda/build_info.json', package / 'build_info.json')
         shutil.copy2(build / 'cuda/tools/ftllm/libfastllm_tools.so', package / 'libfastllm_tools.so')
         shutil.copy2(build / 'cpu/tools/ftllm/libfastllm_tools.so', package / 'libfastllm_tools-cpu.so')
+        for name in ('minimax_h3_server', 'minimax_h3_generate', 'minimax_h3_image_server', 'minimax_h3_image_generate'):
+            shutil.copy2(build / 'cuda/src/models/minimax_h3' / name, package / name)
+        shutil.copy2(build / 'cuda/libfastllm_minimax_h3.so', package / 'libfastllm_minimax_h3.so')
+        (package / 'h3_assets').mkdir()
+        for name in ('demo.html', 'openapi.json'):
+            shutil.copy2(source / 'tools/minimax_h3' / name, package / 'h3_assets' / name)
+        (package / 'h3_image_assets').mkdir()
+        for name in ('demo.html', 'openapi.json'):
+            shutil.copy2(source / 'tools/minimax_h3_image' / name, package / 'h3_image_assets' / name)
+        for name in ('image-workspace.js', 'image-workspace.css'):
+            shutil.copy2(source / 'tools/fastllm_pytools/ui_plugins/studio' / name, package / 'h3_image_assets' / name)
         numa = Path(output(args.cxx, '-print-file-name=libnuma.so').strip())
         if not numa.is_file():
             raise RuntimeError('libnuma.so not found; install libnuma-dev in the build environment')
@@ -82,7 +93,12 @@ def main():
             if archive.testzip() is not None:
                 raise RuntimeError('Wheel ZIP integrity check failed')
             expected = {'ftllm/libfastllm_tools.so', 'ftllm/libfastllm_tools-cpu.so',
-                        'ftllm/libnuma.so.1'}
+                        'ftllm/libnuma.so.1', 'ftllm/libfastllm_minimax_h3.so',
+                        'ftllm/minimax_h3_server', 'ftllm/minimax_h3_generate',
+                        'ftllm/h3_assets/demo.html', 'ftllm/h3_assets/openapi.json',
+                        'ftllm/minimax_h3_image_server', 'ftllm/minimax_h3_image_generate',
+                        'ftllm/h3_image_assets/demo.html', 'ftllm/h3_image_assets/openapi.json',
+                        'ftllm/h3_image_assets/image-workspace.js', 'ftllm/h3_image_assets/image-workspace.css'}
             if not expected <= set(archive.namelist()):
                 raise RuntimeError('Wheel is missing required native libraries')
         target = dest / wheel.name

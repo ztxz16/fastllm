@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "FastLLM MiniMax-H3 / Pika H3 Flex native API",
-    "version": "0.3.0",
+    "version": "0.4.0",
     "description": "Asynchronous video and stereo audio generation: text, first/last keyframes, or ordered image/video/audio references. Media uses multipart uploads; keyframes and references are mutually exclusive."
   },
   "security": [
@@ -66,7 +66,8 @@
                     },
                     "tensor_parallel_size": {
                       "type": "integer",
-                      "minimum": 1
+                      "minimum": 1,
+                      "description": "Text encoder tensor-parallel size. Use dit_parallel_mode and the DiT-specific sizes for video generation."
                     },
                     "devices": {
                       "type": "array",
@@ -86,6 +87,47 @@
                     },
                     "reference_model_available": {
                       "type": "boolean"
+                    },
+                    "dit_precision": {
+                      "type": "string",
+                      "enum": [
+                        "bf16",
+                        "fp8",
+                        "int8",
+                        "nvfp4",
+                        "mixed",
+                        "gguf"
+                      ],
+                      "description": "Detected projection weight format; mixed checkpoints select a backend per tensor. Quantized projections use BF16 activations."
+                    },
+                    "reference_dit_precision": {
+                      "type": "string",
+                      "enum": [
+                        "bf16",
+                        "fp8",
+                        "int8",
+                        "nvfp4",
+                        "mixed",
+                        "gguf"
+                      ],
+                      "description": "Detected projection weight format; mixed checkpoints select a backend per tensor. Quantized projections use BF16 activations."
+                    },
+                    "dit_parallel_mode": {
+                      "type": "string",
+                      "enum": [
+                        "single",
+                        "tp",
+                        "sp"
+                      ],
+                      "description": "Effective DiT parallelism; auto uses SP for quantized multi-GPU models and TP for BF16 models."
+                    },
+                    "dit_tensor_parallel_size": {
+                      "type": "integer",
+                      "minimum": 1
+                    },
+                    "dit_sequence_parallel_size": {
+                      "type": "integer",
+                      "minimum": 1
                     }
                   },
                   "required": [

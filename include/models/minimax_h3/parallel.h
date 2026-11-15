@@ -10,13 +10,15 @@ public:
                   nomas::RowReduction);
     ~ParallelModel();
     void loadPika(const std::string &);
+    void configureSource(const ModelSource &, bool sequenceParallel);
+    void setStreaming(bool);
     void setMemoryLimit(size_t poolBytes, const std::shared_ptr<nomas::TensorPool> &rootPool, bool streaming);
     void setHostMemoryBudget(const std::shared_ptr<nomas::HostMemoryBudget> &);
     Tensor encode(const std::vector<int> &, const std::vector<VisionInput> &, Trace);
     void prepare(const std::vector<std::vector<float>> &, bool reference,
                  std::function<void(int,int)>);
     std::pair<Tensor,Tensor> forward(const Tensor &,const Tensor &,const Tensor &,
-                                   const PackedLayout &,Trace);
+                                   const PackedLayout &,Trace, std::function<void()> checkpoint = {});
     void unload();
     void unloadVideo();
     std::vector<Tensor> videoTiles(size_t, const std::function<Tensor(VideoVAE &,size_t)> &);

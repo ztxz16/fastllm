@@ -56,6 +56,11 @@ struct Tensor {
     Tensor rowSlice(int first, int count) const;
 };
 
+// Grant peer access to this native tensor's allocation pool. Pool permissions
+// are independent of cudaDeviceEnablePeerAccess; views retain the same owner.
+// Only the explicitly supplied, peer-capable devices are mapped.
+void enableTensorPeerAccess(const Tensor &, const std::vector<int> &devices);
+
 struct RopeTable { Tensor cos, sin; };
 
 class Runtime {
@@ -70,6 +75,9 @@ public:
     Runtime(int device, DType dtype);
     Runtime(int device, DType dtype, Numerics numerics);
     void activate();
+    // Opt-in for resident BF16 models. Tune two FP32-accumulating GEMM
+    // candidates once per large aligned shape; other callers retain cuBLAS.
+    void setLinearAutotuning(bool enabled) { tuneLinear_ = enabled; }
     bool isFloat32() const { return dtype_ == DType::FP32; }
     DType dtype() const { return dtype_; }
     ~Runtime();
@@ -91,6 +99,9 @@ public:
     // its address must retain the cuBLASLt plan's 256-byte alignment.
     // Without bias, FP32 output also preserves partial sums for tensor parallelism.
     void linearInto(const Tensor &x, const Tensor &weight, Tensor &out, const Tensor *bias = nullptr);
+    // Accumulate x @ weight.T into a contiguous column range of out, using
+    // FP32 accumulation and a single final dtype rounding. Inputs cannot alias out.
+    void linearAddInto(const Tensor &x, const Tensor &weight, Tensor &out, int firstColumn = 0);
     Tensor norm(const Tensor &x, bool rms, const Tensor *weight = nullptr,
                 const Tensor *bias = nullptr, float eps = 1e-6f, int width = 0);
     Tensor activation(const Tensor &x, bool gelu = false);
@@ -100,6 +111,7 @@ public:
     Tensor siluMultiply(const Tensor &gate, const Tensor &up);
     // Packed columns are [up, gate]; no intermediate slices or copies.
     Tensor siluMultiply(const Tensor &upAndGate);
+    Tensor siluMultiply(const Tensor &packed, bool gateFirst);
     // FP32 residual/output and scale; branch may be FP32/BF16/FP16.
     // Scale is [1,cols] or [rows,cols]. Product and sum round separately.
     Tensor scaledResidual(const Tensor &fp32Residual, const Tensor &branch, const Tensor &fp32Scale);
@@ -151,6 +163,9 @@ public:
                            int queryChunk = 128, int kvHeads = 0, bool causal = false,
                            int tile = 0, int gridHeight = 0, int gridWidth = 0);
     void synchronize();
+    // Settle this stream before memory-dependent shape decisions. Includes
+    // reusable storage in its pool and respects an active GPU memory budget.
+    size_t availableMemory();
 private:
     struct LtState;
     std::unique_ptr<LtState> lt_;
@@ -158,6 +173,7 @@ private:
     int device_;
     DType dtype_;
     Numerics numerics_;
+    bool tuneLinear_ = false;
 };
 
 // One quota shared by all components and TP ranks of an inference service.
@@ -193,9 +209,12 @@ public:
     // Optional lossless host cache for callers that swap model stages.
     void offload();
     // Retain checkpoint BF16 tensors for resident inference or streamed FP32
-    // expansion. Use at most half the free memory, leaving reserveBytes.
+    // expansion. By default use half the free memory, leaving reserveBytes.
     // clear() releases both representations; clear(true) retains this cache.
     void enablePackedCache(size_t reserveBytes);
+    // An explicit cap can use more of the remaining memory. Returns true when
+    // a new cache needs population; callers must serialize its first fill.
+    bool enablePackedCache(size_t reserveBytes, size_t maxBytes);
     // Same rank/partition; cache population must be serialized, as for host caches.
     void sharePackedCache(const Weights &source);
     // Retain immutable CPU checkpoint bytes across clear(), preferring pinned

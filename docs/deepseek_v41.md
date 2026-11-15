@@ -29,11 +29,19 @@ ftllm server /path/to/model-00001-of-00002.gguf --auto \
 
 旧布局的 Engram 文件名和来源需与主干元数据一致。ISTA 六分片新版需保留主干的第 1–5 分片，以及同目录的 `DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf`；该文件作为第 6 分片，既可使用原名，也可建立 `...-00006-of-00006.gguf` 链接。新旧布局的 Engram 文件头不同，应分别保留匹配的文件。多个相同布局的量化版本可以共享一份匹配的 Engram 文件。HF 模型保留自己的 Engram 权重与配置。`--ngram_device disk` 控制 Engram 按需读取，与专家是否使用磁盘后端分别设置。
 
-自动模式默认单请求、最多 1M 原生窗口、FP4 KV 和快速 Prefill。带内置 DSpark 权重时默认使用 DSpark 5；没有草稿权重的 GGUF 不会自动开启。设备、chunk 和专家缓存以 `[auto]` 日志为准。显卡和主存能容纳专家时优先避免磁盘专家，Engram 仍可独立使用磁盘。
+GGUF Engram 支持 `IQ4_NL`、`Q5_K`、`Q6_K` 和 `MXFP8` 压缩行；加载时统一检查行解码器与块对齐，不再固定为 IQ4_NL。CPU 常驻和 `--ngram_device disk` 均只解码命中的行，保留整表的压缩存储，不依赖特定 CUDA SM 或 CPU 指令集。Unsloth 分片应完整保留，包括 Engram 所在的分片；Engram 不一定在最后一片。
 
-对于 SM120 上的单卡、单请求 HF 原生 FP4 模型，`--auto` 在 DSpark 1–7、CPU/NUMA 专家缓存开启且当前 Python 环境可用 Triton 时，自动选择 MXFP4 grouped MoE。当前形状范围是 hidden 5120、MoE intermediate 2304、主模型 top-6、草稿 top-3、SwiGLU limit 10，以及 block-32 UE8M0 专家权重。只自动启用该算子；SM121 可手动使用 `--triton`，暂不自动启用。
+[Unsloth Dynamic V3.1](https://unsloth.ai/docs/models/deepseek-v4.1-flash) 的 Engram 类型分别为：IQ1_S/IQ1_M 使用 IQ4_NL，IQ2_XXS/Q2_K_XL 使用 Q5_K，IQ3_XXS/IQ3_S 使用 Q6_K，Q3_K_XL/Q4_K_XL/Q8_K_XL 使用 MXFP8。MXFP8 的类型编号与块布局参照 [llama.cpp PR #30817](https://github.com/ggml-org/llama.cpp/pull/30817)（`b72050d03ae14bb3cb5138ecefab3f3f65157d31`）：类型 43，每 32 个 E4M3FN 数值共享一个 E8M0 scale，共 33 字节。此支持针对查表与行解码，不代表新增了 MXFP8 矩阵乘法算子。
 
-启动日志会显示 `SM120 MXFP4 grouped MoE enabled automatically`。单张可见 GPU 且现有专家缓存预算允许时，缓存策略优先容纳完整草稿专家。算子不支持当前输入或编译／加载失败时回退到原 CUDA 实现。设置 `FASTLLM_CUDA_TRITON_MXFP4_GROUPED=0` 可关闭该算子，`FASTLLM_CUDA_TRITON=0` 可关闭 Triton 自动选择；显式环境设置优先。
+混合 GGUF/MXFP4 专家可使用 CPU/NUMA 混合推理、GPU 专家缓存和完整 CUDA 图。缓存按存储后端分组，并在各组间分配同一份显存预算；纯 MXFP4 层保留原生 FP4 算子。混合层在缓存换入时只重排量化字节，不展开为浮点权重，也不重新量化。无需额外开关。
+
+自动模式默认单请求、最多 1M 原生窗口、FP4 KV 和快速 Prefill。带内置 DSpark 权重时默认使用 DSpark 5；没有草稿权重的 GGUF 不会自动开启。DSpark 置信度阈值默认 `0`，不提前截短候选，适用于 HF/NVFP4、EXL3 和 GGUF 搭配外置草稿；显式 CLI 或 JSON 阈值仍优先，CLI 可覆盖 JSON。设备、chunk 和专家缓存以 `[auto]` 日志为准。显卡和主存能容纳专家时优先避免磁盘专家，Engram 仍可独立使用磁盘。
+
+`--auto` 默认启用 `--kernel-tune quick`，在实际算子形状首次预热时校验并选择已注册的合法候选，包含普通/分组投影及专家计算；适用于单请求和并发，不按某个固定行数强制选择 Triton。不支持的架构或格式保留原实现。使用 `--kernel-tune off` 可关闭，详见[算子注册与预热选择](kernel-policy.md)。
+
+显式使用 `--kernel-tune off` 时，仍保留原有 SM120 单卡、单请求 HF 原生 FP4 自动路径：DSpark 1–7、CPU/NUMA 专家缓存开启且当前 Python 环境可用 Triton 时，自动选择 MXFP4 grouped MoE。此兼容路径的形状范围是 hidden 5120、MoE intermediate 2304、主模型 top-6、草稿 top-3、SwiGLU limit 10，以及 block-32 UE8M0 专家权重。它只自动启用该算子，SM121 不自动启用此兼容路径。
+
+此兼容路径的启动日志会显示 `SM120 MXFP4 grouped MoE enabled automatically`。单张可见 GPU 且现有专家缓存预算允许时，缓存策略优先容纳完整草稿专家。算子不支持当前输入或编译／加载失败时回退到原 CUDA 实现。设置 `FASTLLM_CUDA_TRITON_MXFP4_GROUPED=0` 可关闭该算子，`FASTLLM_CUDA_TRITON=0` 可关闭 Triton 自动选择；显式环境设置优先。
 
 上下文长度和内存预算允许时，自动规划先保证 chunk 1024，再争取每卡 3 GiB 专家缓存，之后按预计延迟选择更大的 chunk 或缓存。流式 GGUF 磁盘专家路径优先争取 chunk 4096。预算不足时允许缩小 chunk，显式指定的 chunk 和缓存参数仍优先。
 
@@ -46,8 +54,10 @@ ftllm server /path/to/model-00001-of-00002.gguf --auto \
 | 固定输入分块或 CPU 线程 | `--chunked_prefill_size 4096 --threads 32` |
 | 关闭推测解码 | `--speculative_algorithm off` |
 | 使用 5 个内置 DSpark 草稿 | `--dspark 5`，需要对应草稿权重 |
-| 调整 DSpark 阈值 | `--speculative_dspark_confidence_threshold 0.5`；`0` 关闭阈值 |
+| 调整 DSpark 阈值 | `--speculative_dspark_confidence_threshold 0.5`；自动模式默认 `0`，不按置信度截短候选 |
 | 开启 / 关闭快速 Prefill | `--fast_prefill` / `--no_fast_prefill` |
+| 关闭算子自动测速 | `--kernel-tune off`；删除此参数恢复 `quick` |
+| 强制启用 / 禁止低显存模式 | `--low_gpu_mem` / `--no-low-gpu-mem`；删除参数恢复自动规划 |
 
 如果需要突破自动检测的主存上限，可改用 `--force_ddr_limit 114g`：最终按 114 GiB 规划，不再扣除 CMA 或自动预留。它与 `--auto_host_memory_limit` 互斥，仅影响规划，不改变系统／容器硬限制；详见[主存预算说明](hybrid-auto.md)。
 
@@ -675,21 +685,57 @@ token：第一个立刻返回，其余进入请求的待发队列，调度器之
 一次多 token 与逐 token 前向会选择不同的 GEMM / MoE 路径，浮点舍入可能改变 logits，
 也可能翻转接近并列的 argmax；分布测试与浮点前向误差需要分别验证。
 
+### 多请求草稿合批
+
+单 CUDA 设备上，兼容请求在提交各自接受前缀、更新草稿 KV 后，合成一次草稿前向。
+QKV、输出投影、路由与共享专家、词表头按 `请求数 * 草稿块长度` 行执行，
+满足后端能力时只回放一次包含三层主干与采样的完整草稿图。
+temperature、top-k、top-p 相同的随机采样请求按 Markov 步骤合批：
+同一步的请求并行执行，后一步仍依赖各请求刚抽到的 token。
+
+每个请求的 KV、绝对位置、有效窗口、anchor 和条件概率 q 保持独立。
+图拥有稳定的批量缓冲区，每轮更新输入；q 在回放后保存回各请求，
+直到该请求完成下一次验证。请求换位、退出或加入不会让图继续引用已释放的请求缓冲区。
+不足一个完整窗口的请求使用各自的有效索引，不读取填充区域。
+
+驻留 NVFP4 专家按完整逻辑批次稳定排序路由，复用同一专家的权重；计算内核自行分块，
+不再由适配层切成 8 行分别调度。跨 CUDA grid 容量时仅拆分物理启动，保持全局路由顺序。
+
+批次不按某几个固定行数分派。投影 tile、采样和 MXFP8 草稿头使用实际行数；
+`--auto` 为单请求图、各并发形状的批量草稿图、KV 暂存及 q 预留显存。
+不同采样参数会分组执行；工具文本约束、TP 草稿以及不满足图/后端能力的情况保留独立草稿路径。
+贪心请求的主干仍可合批，设备上的 Markov argmax 链保留独立请求计算。
+
 ### 限制
 
 - 支持简单贪心及 CUDA 上的 temperature / top-k / top-p 采样，也支持默认工具名、参数名约束。
   重复惩罚、工具内容采样、没有前缀状态的独立 token 白名单、`output_logits`、正的
   `output_token_least`、非有限采样参数会退回普通解码；CPU 采样也走普通路径。
   与普通解码一样，`do_sample=true`、正温度且 `top_k<=1` 时将 top-k 规范化为 5；
-- 只在**单请求**前向里产生候选。批量 decode 的那一轮不投机，但仍然采集 main hidden，
-  让草稿滑窗跟上目标缓存；已经校验通过的 token 在批量路径里也能正常出队；
+- 多请求可以合批验证，每个请求保留独立的因果范围、接受长度及回滚状态。
+  待发 token 正常出队；没有候选的请求仍更新草稿滑窗；
 - 图文请求不投机；
 - 前缀缓存命中恢复出来的前缀没有草稿侧的滑窗（`main_x` 无法从目标缓存反推），
   草稿注意力只看得到恢复之后新增的位置，接受率会在最初的 `window_size` 个 token 内偏低；
 - 校验提交在首个 EOS / stop token 处截断，避免结束时缓存超出真实输出。
   请求若因长度上限在待发队列还没取完时结束，这一轮多算的 token 仍可能让缓存长度超过
   `allTokens`，该请求的前缀缓存记录会被跳过；
-- 支持与主干张量并行组合（`--tp 2`），草稿层仍在第一张卡运行；目标校验支持分段 CUDA Graph，草稿层仍逐算子执行。
+- 支持与主干张量并行组合（`--tp 2`），草稿层仍在第一张卡运行。
+  满足完整图条件时，合批目标验证只回放一次验证图，草稿也可使用完整图；
+  不支持的放置、形状或配置保留原有回退路径。
+
+单卡混合推理的整层 GPU 专家由后端按实际格式、形状和预热状态决定图支持。
+EXL3 的逻辑验证批次可以跨多个计算块，Maya 与 portable 后端均提供图就绪查询；
+GGUF 的就绪状态按已预热形状记录，支持 grouped MMQ 的形状不再受 32 行状态表限制。
+不支持的内核能力或布局继续回退，主机专家仍可通过 NUMA、GPU 缓存与动态分流执行。
+
+单卡和 TP 的多请求验证图使用独立 LRU，最多保留 `max_batch` 个合批形状，
+不限制某个具体行数。普通 decode 和单请求验证预热图单独保留。
+`--auto` 按每个合批槽最多 `max_batch * (dspark + 1)` 行预留常驻工作区，
+这部分显存不会再次分配给专家缓存；启动日志会报告槽数及最大行数。
+新形状需要淘汰旧槽时，会等待旧图执行完成再回收资源，稳定形状的回放无需这一步。
+算子直接分配显存遇到 OOM 时也会重试回收已完成、无图引用的空闲池块；
+捕获事务和分配冻结期间不回收。实际可用配置仍受模型、设备和显存容量约束。
 
 ### 调试环境变量
 
@@ -704,7 +750,6 @@ token：第一个立刻返回，其余进入请求的待发队列，调度器之
 | `FASTLLM_DSPARK_PROBE_EVERY` | 每 N 轮故意不带候选走一次普通单 token 前向，给"校验 N 个候选"提供同等缓存状态下的对照基线。默认 0（关闭），只在诊断时打开 |
 | `FASTLLM_DSPARK_STATS_FILE` | 每轮校验追加一行 `轮次 候选数 接受数`（测试用） |
 | `FASTLLM_DSPARK_FORCE_DRAFTS` | 用文件里的候选替换模型的候选，构造指定的接受长度（测试用） |
-| `FASTLLM_DSV41_DEBUG_STATE` | 每次前向后导出各层缓存长度（对比回滚是否正确） |
 
 ## 图像输入
 
@@ -900,3 +945,19 @@ bonus token 和缓存回滚；`deepseekV41OpsRegression` 检查小批量算子�
 `deepseekV41QKVPreparation` 检查投影、Norm 与量化的逐位结果、Graph 重放和拒绝路径；
 `deepseekV41FullDecode` / `deepseekV41FullDecodeStress` 覆盖旋转、KV 生命周期和图重放。
 MoE 专家计算与通信调度未在这些优化中调整。
+
+### 图缓存容量
+
+单卡 DSpark 的验证图只保留当前验证形状，草稿只保留当前合批形状；单请求草稿也复用模型级工作区。批量、输出尾部或采样配置变化时，旧图完成执行后释放，再准备新图，稳态形状复用已有图。请求自己的 KV、位置和条件概率 q 独立保留，避免请求退出、交换或形状切换破坏拒绝采样。
+
+`--auto` 按相同的驻留规则预留最大形状及请求私有数据，不再按 `max_batch` 份最大验证图或全部草稿批量形状求和。普通 decode 的预热图、PP 分段图仍独立计入；此策略没有新增环境开关或特定行数阈值。频繁改变形状会增加重新捕获成本，稳态吞吐与变批开销应分别测量。完整验证图按实际行数分配请求描述、注意力与 KV 提交数据，图缓存键不再依赖固定批量偏移。CUDA 网格维度不足时只拆分物理启动，保持完整逻辑批次和请求因果边界。
+
+CUDA 工作区记录每个捕获段实际使用的不同内存块，同一块复用时保留最大请求大小，并在该段开始捕获前准备。预留操作不读写 GPU 内容，因此可复用当前捕获事务已经保护的空闲 scratch；仍排除活跃张量和被其它图固定的块。各层串行 scratch 可以复用，不按全部分配调用求和。容量不足时保留失败回退，并输出缺失的字节数。
+
+启用 DSpark 时，预热用独立请求覆盖常见合批验证形状，包括配置的最大批量，随后才冻结算子选择。图预热与捕获使用一致的候选能力条件；只能在普通执行中运行的 MXFP8 入口在图预热作用域内同样退出，避免捕获时首次切换算子及申请另一套临时空间。该作用域不禁止预热分配、权重准备或测速，普通 prefill 仍可使用 MXFP8。沿用 `--kernel-tune`、`--kernel-policy` 与测速预算；未测或不支持的形状继续使用安全回退，不在捕获中编译或测速。
+
+### 整批专家复用
+
+GPU 缓存中的 EXL3 和 IQ2 GGUF 专家按完整逻辑批次的权重记录分组，使不同请求、验证行可以复用相同专家的权重解码。EXL3 不再在适配层按 8 行切窗；算子内部的线程块、寄存器 tile 和 CUDA 网格分片只决定物理执行方式，不构成总行数或并发数上限。NUMA 专家继续使用批量入口，驻留与异步上传分支保留各自的临时存储。
+
+EXL3 辅助工作区按容量档位预分配，已有图引用的地址保持稳定；GGUF 工作区按实际行数和 top-k 计算，混合量化类型保留兼容入口。此改动没有新增调优环境开关，普通投影仍使用原有算子选择。EXL3 的 portable 实现保留；导入算术及本地改动的出处见 `third_party/maya_exl3/NOTICE.txt`。

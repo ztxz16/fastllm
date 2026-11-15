@@ -57,10 +57,23 @@ int main() {
             rejected=std::string(e.what()).find("GPU memory budget exhausted")!=std::string::npos;
         }
         if(!rejected) throw std::runtime_error("CUDA pool exceeded its physical memory limit");
-        first={};second={};rt.synchronize();
+        first={};second={};
+        if(rt.availableMemory() != (256u<<20)) throw std::runtime_error("pending frees changed available budget");
         if(limited.reusableBytes() < (256u<<20)) throw std::runtime_error("idle reserved GPU pages were released");
         second=Tensor(12288,4096,DType::BF16);
         if(!second.data) throw std::runtime_error("bounded pool could not recover after release");
+    }
+    {
+        TensorPool reused(0,128u<<20,256u<<20,true);
+        TensorPool::Scope scope(reused);
+        Tensor scratch(12288,4096,DType::BF16);
+        if(rt.availableMemory() != (160u<<20)) throw std::runtime_error("live tensor missing from available budget");
+        if(cudaMemsetAsync(scratch.data,0,scratch.bytes(),cudaStreamPerThread)!=cudaSuccess)
+            throw std::runtime_error("scratch write failed");
+        scratch={};
+        // An exact-size host cache cannot satisfy arbitrary future shapes.
+        // Keep its held allocation accounted until the cache is trimmed.
+        if(rt.availableMemory() != (160u<<20)) throw std::runtime_error("cached block falsely counted as free");
     }
     // The optional scope must not restrict unrelated allocations afterwards.
     { Tensor unrestricted(36864,4096,DType::BF16); rt.synchronize(); }

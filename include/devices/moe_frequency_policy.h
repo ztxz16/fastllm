@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <map>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -78,9 +79,16 @@ public:
         for (auto &key : keys) key.slot = -1;
         for (int s = 0; s < int(slots.size()); ++s) {
             const int key = owners[s];
-            if (key < -1 || key >= int(keys.size()) ||
-                (key >= 0 && (keyPartitions[key] != slotPartitions[s] || keys[key].slot >= 0)))
-                throw std::invalid_argument("invalid MoE residency snapshot");
+            if (key < -1 || key >= int(keys.size()))
+                throw std::invalid_argument("invalid MoE residency snapshot: slot " + std::to_string(s) +
+                    " has key " + std::to_string(key) + " outside [-1, " + std::to_string(keys.size()) + ")");
+            if (key >= 0 && keyPartitions[key] != slotPartitions[s])
+                throw std::invalid_argument("invalid MoE residency snapshot: slot " + std::to_string(s) +
+                    " partition " + std::to_string(slotPartitions[s]) + " has key " + std::to_string(key) +
+                    " from partition " + std::to_string(keyPartitions[key]));
+            if (key >= 0 && keys[key].slot >= 0)
+                throw std::invalid_argument("invalid MoE residency snapshot: key " + std::to_string(key) +
+                    " appears in slots " + std::to_string(keys[key].slot) + " and " + std::to_string(s));
             if (!slotAvailable[s] && key >= 0)
                 throw std::invalid_argument("resident in a leased MoE slot");
             slots[s] = key;

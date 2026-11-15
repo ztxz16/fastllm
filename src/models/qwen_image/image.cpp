@@ -236,6 +236,9 @@ std::vector<uint8_t> encodePNG(const Image &image) {
     return out;
 }
 Image decodePNG(const std::string &bytes) {
+    return decodePNG(bytes, 16777216);
+}
+Image decodePNG(const std::string &bytes, size_t maxPixels) {
     auto p = reinterpret_cast<const uint8_t *>(bytes.data());
     check(bytes.size() >= 33 && std::memcmp(p, "\x89PNG\r\n\x1a\n", 8) == 0,
           "upload a PNG image (the demo converts other formats)");
@@ -253,8 +256,8 @@ Image decodePNG(const std::string &bytes) {
             check(!header && pos == 8 && n == 13);
             header = true;
             uint32_t w = be(data), h = be(data + 4);
-            check(w >= 1 && h >= 1 && w <= 8192 && h <= 8192 && uint64_t(w) * h <= 16777216,
-                  "PNG exceeds 16 megapixels");
+            check(w >= 1 && h >= 1 && w <= 8192 && h <= 8192 && uint64_t(w) * h <= maxPixels,
+                  "PNG exceeds the supported pixel limit");
             image.width = w;
             image.height = h;
             type = data[9];

@@ -1,15 +1,20 @@
 #pragma once
+#include "../linear/fastllm-exl3-shards.cuh"
 
 // Lossless inverse of NUMA's R4 packing for prefill, canonical cache admission
 // and temporary experts whose projection kernels cannot read NUMA layouts.
 // Include gguf.h before this header.
 namespace fastllm_gguf_restore {
+// Private source-layout tag, never a GGUF file type. NUMA stores adjacent
+// E2M1 nibbles followed by their E8M0 scale; cache records use GGUF ordering.
+constexpr int kNativeMxfp4 = -2;
 constexpr size_t kTileBytes = 16 * 1024;
 constexpr int kRestoreThreads = 256;
 constexpr int kWarpsPerBlock = kRestoreThreads / 32;
 
 __host__ __device__ inline int Ordinary(int type) {
     switch (type) {
+        case kNativeMxfp4: return GGML_TYPE_MXFP4;
         case GGML_TYPE_Q2_K_R4: return GGML_TYPE_Q2_K;
         case GGML_TYPE_Q3_K_R4: return GGML_TYPE_Q3_K;
         case GGML_TYPE_Q4_K_R4: return GGML_TYPE_Q4_K;
@@ -158,6 +163,11 @@ __device__ inline void Block(const uint8_t *source, uint8_t *destination,
 struct Matrix {
     int type = -1, rows = 0, columns = 0;
     size_t rowBytes = 0;
+    int exl3Bits = 0, parts = 1;
+    __host__ __device__ size_t Bytes() const {
+        return exl3Bits ? size_t(rows) * columns * exl3Bits / 16 + size_t(parts * columns + rows) * 2 :
+            size_t(rows) * rowBytes;
+    }
 };
 struct Record {
     Matrix weights[2];
@@ -171,7 +181,7 @@ __device__ void Rows(const Matrix &w, void *const *pointers,
     if (!cross) {
         // Down projections are already in row order. Copy entire shards,
         // including across row boundaries, without per-element row division.
-        const size_t units = size_t(w.rows) * w.rowBytes / shards / sizeof(Unit);
+        const size_t units = w.Bytes() / shards / sizeof(Unit);
         for (int node = 0; node < shards; ++node) {
             const auto *source = static_cast<const Unit *>(pointers[node]);
             for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -181,7 +191,7 @@ __device__ void Rows(const Matrix &w, void *const *pointers,
         return;
     }
     if constexpr (sizeof(Unit) < 16) {
-        const size_t shardBytes = size_t(w.rows) * w.rowBytes / shards;
+        const size_t shardBytes = w.Bytes() / shards;
         if (!(shardBytes & 15)) {
             // Read the packed host rows contiguously and transpose in shared memory.
             const size_t rowUnits = w.rowBytes / sizeof(Unit);
@@ -217,6 +227,27 @@ __device__ void Rows(const Matrix &w, void *const *pointers,
         const int local = physical % rowsPerShard;
         reinterpret_cast<Unit *>(destination)[i] = reinterpret_cast<const Unit *>(source)[
             size_t(local) * units + i % units];
+    }
+}
+
+// Lossless NUMA block32 -> GGUF MXFP4 conversion. Both representations
+// occupy 17 bytes per block; no floating-point conversion or host snapshot.
+__device__ inline void Mxfp4Rows(const Matrix &w, void *const *pointers,
+        uint8_t *destination, int shards, bool cross) {
+    const int blocks = w.columns / 32, rowsPerShard = w.rows / shards;
+    const size_t count = size_t(w.rows) * blocks;
+    for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < count; i += size_t(gridDim.x) * blockDim.x) {
+        const int row = i / blocks;
+        const int physical = cross ? 2 * (row % (w.rows / 2)) + row / (w.rows / 2) : row;
+        const auto *source = static_cast<const uint8_t *>(pointers[physical / rowsPerShard]) +
+            size_t(physical % rowsPerShard) * w.rowBytes + (i % blocks) * 17;
+        auto *out = destination + i * 17;
+        out[0] = source[16];
+        #pragma unroll
+        for (int j = 0; j < 16; ++j)
+            out[1+j] = ((source[j/2] >> (4*(j%2))) & 15) |
+                (((source[8+j/2] >> (4*(j%2))) & 15) << 4);
     }
 }
 
@@ -291,8 +322,13 @@ static __global__ void Records(Record layout, void *const *pointers,
         void *deviceSource = deviceRecord ? const_cast<uint8_t *>(deviceRecord + offset) : nullptr;
         void *const *sources = deviceRecord ? &deviceSource : pointers + (expert * 2 + part) * layout.shards;
         const int shards = deviceRecord ? 1 : layout.shards;
-        if (Ordinary(w.type) == w.type) {
-            const size_t alignment = part ? size_t(w.rows) * w.rowBytes / shards : w.rowBytes;
+        if (w.exl3Bits) {
+            fastllm_exl3_shards::Restore(w.rows, w.columns, w.exl3Bits, w.parts,
+                sources, layout.shards, deviceRecord ? static_cast<const uint8_t *>(deviceSource) : nullptr, output);
+        } else if (w.type == kNativeMxfp4) {
+            Mxfp4Rows(w, sources, output, shards, part == 0);
+        } else if (Ordinary(w.type) == w.type) {
+            const size_t alignment = part ? w.Bytes() / shards : w.rowBytes;
             if (!(alignment & 15)) Rows<uint4>(w, sources, output, shards, part == 0, tile);
             else if (!(alignment & 3)) Rows<uint32_t>(w, sources, output, shards, part == 0, tile);
             else Rows<uint8_t>(w, sources, output, shards, part == 0, tile);
@@ -310,7 +346,7 @@ static __global__ void Records(Record layout, void *const *pointers,
         // Slot payloads include alignment padding, just like canonical snapshots.
         if (blockIdx.x == 0) {
             const size_t end = part ? layout.stride : layout.downOffset;
-            for (size_t i = offset + w.rows * w.rowBytes + threadIdx.x; i < end; i += blockDim.x)
+            for (size_t i = offset + w.Bytes() + threadIdx.x; i < end; i += blockDim.x)
                 record[i] = 0;
         }
     }
@@ -326,7 +362,7 @@ static __global__ void NativeRecords(Record layout, void *const *pointers, uint8
     const int part = blockIdx.z;
     const auto &w = layout.weights[part];
     const size_t offset = part ? layout.downOffset : 0;
-    const size_t bytes = size_t(w.rows) * w.rowBytes / layout.shards;
+    const size_t bytes = w.Bytes() / layout.shards;
     const int requests = count ? *count : 1;
     for (int request = 0; request < requests; ++request) {
         const int expert = experts ? experts[request] : fixedExpert;
@@ -350,7 +386,7 @@ static __global__ void NativeRecords(Record layout, void *const *pointers, uint8
         }
         if (blockIdx.x == 0) {
             const size_t end = part ? layout.stride : layout.downOffset;
-            for (size_t i = offset + size_t(w.rows) * w.rowBytes + threadIdx.x; i < end; i += blockDim.x)
+            for (size_t i = offset + w.Bytes() + threadIdx.x; i < end; i += blockDim.x)
                 record[i] = 0;
         }
     }
@@ -360,8 +396,8 @@ inline cudaError_t CopyNativeRecords(const Record &layout, void *const *pointers
         uint8_t *destination, cudaStream_t stream,
         const int32_t *experts = nullptr, const int32_t *slots = nullptr,
         const int32_t *count = nullptr, const uint64_t *slotOffsets = nullptr,
-        int fixedExpert = 0, const uint8_t *promoted = nullptr, int promotedExpert = -1) {
-    NativeRecords<<<dim3(48, 1, 2), 256, 0, stream>>>(layout, pointers, destination,
+        int fixedExpert = 0, const uint8_t *promoted = nullptr, int promotedExpert = -1, int blocks = 48) {
+    NativeRecords<<<dim3(blocks, 1, 2), 256, 0, stream>>>(layout, pointers, destination,
         experts, slots, count, slotOffsets, fixedExpert, promoted, promotedExpert);
     return cudaGetLastError();
 }

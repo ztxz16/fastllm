@@ -13,6 +13,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+from cuda_runtime import check_cuda_runtime
+from video_runtime import check_video_runtime
+
 
 MIN_GLIBC = (2, 35)
 MIN_DRIVER = (525, 60, 13)
@@ -175,6 +178,18 @@ def main() -> int:
             ok(f"Python 依赖：{distribution_name} {version}")
         except importlib.metadata.PackageNotFoundError:
             fail(f"缺少 Python 依赖：{distribution_name}")
+
+    try:
+        for soname, path in check_cuda_runtime(bundle_root / "runtime").items():
+            ok(f"包内 CUDA 动态库：{soname}（{path}）")
+    except (OSError, RuntimeError) as error:
+        fail(str(error))
+
+    try:
+        for name, path in check_video_runtime(bundle_root, run=True).items():
+            ok(f"包内视频后端：{name}（{path}）")
+    except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+        fail(str(error))
 
     try:
         from ftllm_agent_runtime.runtime import PI_VERSION, PiAgentRuntime

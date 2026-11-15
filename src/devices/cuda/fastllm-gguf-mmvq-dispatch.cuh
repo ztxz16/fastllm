@@ -12,3 +12,19 @@ void mul_mat_vec_q_cuda(
 void FastllmGgufQ5KGroupedGemv(const void *weights, const void *input,
         void *output, fastllm::DataType dtype, int groups, int columns, int rows,
         int padded, int tokens, cudaStream_t stream);
+
+// Internal launch descriptors; all jobs have the same weight/output format and
+// input. Unequal output widths are mapped to contiguous CTA ranges.
+constexpr int FastllmGgufMaxSharedJobs = 8;
+struct FastllmGgufSharedMmvqJob {
+    const void *weight;
+    void *output;
+    int rows, blockEnd;
+};
+struct FastllmGgufSharedMmvqBatch {
+    FastllmGgufSharedMmvqJob jobs[FastllmGgufMaxSharedJobs];
+    int count = 0;
+};
+template <ggml_type Type, typename Output>
+bool FastllmGgufSharedMmvq(const FastllmGgufSharedMmvqBatch &batch,
+        const void *input, int columns, int tokens, cudaStream_t stream);

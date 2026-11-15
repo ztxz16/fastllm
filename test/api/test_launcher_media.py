@@ -26,12 +26,16 @@ from fastllm_pytools.tui import DeployConfig, build_fastllm_env, build_fastllm_a
 
 
 WORKER = r'''
-import argparse, json, os, time
+import argparse, base64, json, os, time
+from email.parser import BytesParser
+from email.policy import default
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 p=argparse.ArgumentParser()
 p.add_argument('--port',type=int); p.add_argument('--host'); p.add_argument('--api-key',default='')
 p.add_argument('--api_key',default=''); p.add_argument('--kind',default='video')
+p.add_argument('--device')
 args,_=p.parse_known_args(); jobs={}; started=time.monotonic()
+if args.device is not None: args.kind='image'
 class H(BaseHTTPRequestHandler):
  def log_message(self,*args): pass
  def answer(self,value,status=200,mime='application/json'):
@@ -42,18 +46,28 @@ class H(BaseHTTPRequestHandler):
    self.answer({'error':{'message':'unauthorized'}},401); return False
   return True
  def do_GET(self):
-  if self.path=='/health': return self.answer({'ready':time.monotonic()-started>float(os.environ.get('READY_DELAY','.4'))},200 if time.monotonic()-started>float(os.environ.get('READY_DELAY','.4')) else 503)
+  if self.path=='/health': return self.answer({'ready':time.monotonic()-started>float(os.environ.get('READY_DELAY','.4')), 'reference_model_available':True, 'dit_precision':'fp8', 'reference_dit_precision':'gguf', 'dit_parallel_mode':'sp', 'dit_sequence_parallel_size':2, 'dit_tensor_parallel_size':1},200 if time.monotonic()-started>float(os.environ.get('READY_DELAY','.4')) else 503)
   if not self.auth(): return
   if self.path=='/v1/models': return self.answer({'data':[{'id':'stub-'+args.kind}], 'visible':os.environ.get('CUDA_VISIBLE_DEVICES')})
-  if self.path=='/v1/videos': return self.answer({'data':list(jobs.values())})
-  if self.path.endswith('/content'): return self.answer(b'fake-mp4',mime='video/mp4')
+  if self.path in ('/v1/videos','/v1/images/jobs'): return self.answer({'data':list(jobs.values())})
+  if self.path.endswith('/content'):
+   if args.kind=='image': return self.answer(base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a5WQAAAAASUVORK5CYII='),mime='image/png')
+   return self.answer(b'fake-mp4',mime='video/mp4')
   return self.answer(jobs[self.path.split('/')[-1]])
  def do_POST(self):
   if not self.auth(): return
   if self.path.endswith('/cancel'):
    job=jobs[self.path.split('/')[-2]]; job['status']='cancelled'; return self.answer(job)
-  data=json.loads(self.rfile.read(int(self.headers.get('Content-Length','0'))))
-  job=dict(data,id='video_1_'+str(len(jobs)),status='queued' if data['prompt']=='hold' else 'completed',created_at=time.time(),progress=100,stage='done',current=6,total=6,error=None)
+  raw=self.rfile.read(int(self.headers.get('Content-Length','0')))
+  if self.headers.get('Content-Type','').startswith('multipart/form-data'):
+   message=BytesParser(policy=default).parsebytes(('Content-Type: '+self.headers['Content-Type']+'\r\n\r\n').encode()+raw)
+   data={'references':[]}
+   for part in message.iter_parts():
+    name=part.get_param('name',header='content-disposition'); content=part.get_payload(decode=True)
+    if name in ('image[]','reference'): data['references'].append({'name':part.get_filename(),'type':part.get_content_type(),'data':base64.b64encode(content).decode()})
+    else: data[name]=content.decode()
+  else: data=json.loads(raw)
+  job=dict(data,id=args.kind+'_1_'+str(len(jobs)),status='queued' if data['prompt']=='hold' else 'completed',created_at=time.time(),progress=100,stage='done',current=6,total=6,error=None)
   jobs[job['id']]=job; return self.answer(job)
 ThreadingHTTPServer((args.host,args.port),H).serve_forever()
 '''
@@ -106,6 +120,70 @@ class ServiceTest(unittest.TestCase):
             time.sleep(.05)
         self.fail(str(self.pool.state()) + str(self.pool.logs()))
 
+    def test_bundled_video_backend_is_found_without_path_and_can_be_overridden(self):
+        from fastllm_pytools import service_backends
+        binary = self.directory / "minimax_h3_server"
+        binary.touch()
+        config = SimpleNamespace(server_binary="")
+        with patch.object(service_backends, "__file__", str(self.directory / "service_backends.py")), \
+                patch.dict(os.environ, {"FTLLM_H3_SERVER": ""}), \
+                patch.object(service_backends.shutil, "which", return_value=None):
+            self.assertEqual(service_backends.H3Backend.executable(config), str(binary))
+            config.server_binary = str(self.worker)
+            self.assertEqual(service_backends.H3Backend.executable(config), str(self.worker))
+
+    def test_image_gguf_path_reaches_native_service_without_precision_flags(self):
+        model = self.directory / "image-Q4_K_M.gguf"
+        model.write_bytes(b"GGUF")  # Payload validation belongs to the native loader.
+        session = self.start("minimax_h3_image", model=str(model))
+        self.assertTrue(self.pool.service(session).state()["ready"])
+        argv = self.commands[-1][0]
+        self.assertEqual(argv[argv.index("--model") + 1], str(model))
+        self.assertNotIn("--precision", argv)
+
+    def test_quantized_video_manifest_and_parallel_mode(self):
+        from fastllm_pytools import service_backends
+        view = self.directory / "quantized-video"
+        view.mkdir()
+        manifest = view / "h3_quantization.json"
+        manifest.write_text(json.dumps({"format_version": 1, "base_model": "../base",
+                                        "pika": "../adapter", "fl2va": "../weights.safetensors"}))
+        for model in (str(view), str(manifest)):
+            config = config_from_dict(self.profile("minimax_h3", model=model, video_parallel_mode="tp", visible_gpus="4,5"))
+            command = build_fastllm_argv(config)
+            self.assertEqual(command[command.index("--parallel-mode") + 1], "tp")
+            self.assertEqual(command[command.index("--devices") + 1], "0,1")
+            self.assertEqual(service_backends.H3Backend().model_name(config), "pika-h3-flex")
+            self.assertNotIn("--precision", command)
+            self.assertEqual(validate_config(config), [])
+        config.video_parallel_mode = "invalid"
+        fields = []
+        validate_config(config, fields)
+        self.assertTrue(any("video_parallel_mode" in item["fields"] for item in fields))
+        manifest.write_text("{}")
+        self.assertEqual(service_backends.H3Backend().model_name(config), "minimax-h3")
+
+    def test_quantized_image_parallel_mode(self):
+        for mode in ("auto", "tp", "sp"):
+            config = config_from_dict(self.profile("minimax_h3_image", video_parallel_mode=mode,
+                                                   visible_gpus="6,7"))
+            command = build_fastllm_argv(config)
+            self.assertEqual(command[command.index("--devices") + 1], "0,1")
+            if mode == "auto":
+                self.assertNotIn("--parallel-mode", command)
+            else:
+                self.assertEqual(command[command.index("--parallel-mode") + 1], mode)
+            self.assertEqual(validate_config(config), [])
+        config.video_parallel_mode = "invalid"
+        fields = []
+        validate_config(config, fields)
+        self.assertTrue(any("video_parallel_mode" in item["fields"] for item in fields))
+        self.start("minimax_h3_image", video_parallel_mode="tp", visible_gpus="6,7")
+        command, environment = self.commands[-1]
+        self.assertEqual(command[command.index("--parallel-mode") + 1], "tp")
+        self.assertEqual(command[command.index("--devices") + 1], "0,1")
+        self.assertEqual(environment["CUDA_VISIBLE_DEVICES"], "6,7")
+
     def test_gpu_mask_is_composed_and_auto_configuration_preserves_it(self):
         self.assertEqual(visible_gpu_environment("1,0", {"CUDA_VISIBLE_DEVICES": "6,7"}), {"CUDA_VISIBLE_DEVICES": "7,6"})
         self.assertEqual(visible_gpu_environment("1", {"CUDA_VISIBLE_DEVICES": "GPU-a,GPU-b"}), {"CUDA_VISIBLE_DEVICES": "GPU-b"})
@@ -128,6 +206,92 @@ class ServiceTest(unittest.TestCase):
         config = config_from_dict(self.profile("minimax_h3", visible_gpus="0,1"))
         command = build_fastllm_argv(config)
         self.assertEqual(command[command.index("--devices") + 1], "0,1")
+
+    def test_image_backend_discovery_and_gpu_commands(self):
+        from fastllm_pytools import service_backends
+        binary = self.directory / "minimax_h3_image_server"
+        binary.touch()
+        config = SimpleNamespace(server_binary="")
+        with patch.object(service_backends, "__file__", str(self.directory / "service_backends.py")), \
+                patch.dict(os.environ, {"FTLLM_H3_IMAGE_SERVER": ""}), \
+                patch.object(service_backends.shutil, "which", return_value=None):
+            self.assertEqual(service_backends.H3ImageBackend.executable(config), str(binary))
+            config.server_binary = str(self.worker)
+            self.assertEqual(service_backends.H3ImageBackend.executable(config), str(self.worker))
+        config = config_from_dict(self.profile("minimax_h3_image", video_gpu_memory_limit="4", video_host_memory_limit="2", base_model="unused"))
+        command = build_fastllm_argv(config)
+        self.assertEqual(command[command.index("--device") + 1], "0")
+        self.assertNotIn("--devices", command)
+        self.assertNotIn("--base-model", command)
+        self.assertEqual(command[command.index("--gpu-memory-limit") + 1], "4")
+        self.assertEqual(command[command.index("--host-memory-limit") + 1], "2")
+        self.assertEqual(validate_config(config), [])
+        dual = config_from_dict(self.profile("minimax_h3_image", visible_gpus="0,1"))
+        with patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "4,5"}):
+            self.assertEqual(validate_config(dual), [])
+            self.assertEqual(build_fastllm_env(dual)["CUDA_VISIBLE_DEVICES"], "4,5")
+        command = build_fastllm_argv(dual)
+        self.assertEqual(command[command.index("--devices") + 1], "0,1")
+        fields = []
+        validate_config(config_from_dict(self.profile("minimax_h3_image", visible_gpus="0,1,2")), fields)
+        self.assertTrue(any("visible_gpus" in item["fields"] for item in fields))
+
+    def test_image_fp8_uses_existing_model_path(self):
+        checkpoint = self.directory / "arbitrary.safetensors"
+        checkpoint.touch()
+        config = config_from_dict(self.profile("minimax_h3_image", model=str(checkpoint)))
+        self.assertEqual(validate_config(config), [])
+        command = build_fastllm_argv(config)
+        self.assertEqual(command[command.index("--model") + 1], str(checkpoint))
+        self.assertNotIn("--fp8-weights", command)
+
+    def test_image_memory_budget_validation(self):
+        for field, values in (("video_gpu_memory_limit", ("-1", "1", "1.0000000001", "nan", "inf", "1048577")),
+                              ("video_host_memory_limit", ("-1", "1.99", "nan", "inf", "1048577"))):
+            for value in values:
+                fields = []
+                validate_config(config_from_dict(self.profile("minimax_h3_image", **{field: value})), fields)
+                self.assertTrue(any(field in error["fields"] for error in fields), (field, value))
+        for gpu, host in (("", ""), ("0", "0"), ("4.5", "2"), ("64", "16")):
+            self.assertEqual(validate_config(config_from_dict(self.profile("minimax_h3_image",
+                video_gpu_memory_limit=gpu, video_host_memory_limit=host))), [])
+
+    def test_image_api_contract_authenticated_proxy_and_cancellation(self):
+        image = self.start("minimax_h3_image")
+        info = self.client.get("/api/runtime/api-info", headers=self.headers).json()
+        self.assertEqual(info["kind"], "image")
+        self.assertEqual(info["request"]["model"], "minimax-h3-image")
+        self.assertEqual(info["defaults"]["num_inference_steps"], 6)
+        self.assertEqual(self.pool.catalog()[0]["capabilities"], ["image.generate", "image.edit"])
+        self.assertTrue(info["edit"].endswith("/v1/images/edits"))
+        self.assertEqual(info["references"]["max_count"], 16)
+        path = "/api/media/" + image + "/images/jobs"
+        self.assertEqual(self.client.get(path).status_code, 403)
+        job = self.client.post(path, headers=self.headers, json={"prompt": "test image", "size": "2048x2048"}).json()
+        self.assertEqual(self.client.get(path, headers=self.headers).json()["data"][0]["id"], job["id"])
+        content = self.client.get(path + "/" + job["id"] + "/content", headers=self.headers)
+        self.assertEqual(content.headers["content-type"], "image/png")
+        self.assertTrue(content.content.startswith(b"\x89PNG\r\n\x1a\n"))
+        held = self.client.post(path, headers=self.headers, json={"prompt": "hold"}).json()
+        cancelled = self.client.post(path + "/" + held["id"] + "/cancel", headers=self.headers)
+        self.assertEqual(cancelled.json()["status"], "cancelled")
+        self.assertEqual(self.client.post("/api/media/" + image + "/videos", headers=self.headers, json={}).status_code, 400)
+        self.assertEqual(self.client.get("/api/media/" + image + "/images/jobs/not-an-id/content", headers=self.headers).status_code, 400)
+
+    def test_image_multipart_proxy_preserves_reference_order_and_bytes(self):
+        import base64
+        image = self.start("minimax_h3_image")
+        files = [("image[]", ("first.jpg", b"jpeg fixture\x00\xff", "image/jpeg")),
+                 ("image[]", ("second.webp", b"webp fixture\x00\x80", "image/webp"))]
+        for route in ("images/jobs", "images/edits"):
+            path = "/api/media/" + image + "/" + route
+            response = self.client.post(path, headers=self.headers,
+                data={"prompt": "Compose <Picture 1> and <Picture 2>", "size": "2048x2048"}, files=files)
+            self.assertEqual(response.status_code, 200, response.text)
+            result = response.json()
+            self.assertEqual(result["prompt"], "Compose <Picture 1> and <Picture 2>")
+            self.assertEqual([(r["name"], base64.b64decode(r["data"]), r["type"]) for r in result["references"]],
+                             [item[1] for item in files])
 
     def test_services_run_and_stop_independently_with_separate_gpu_environments(self):
         with patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "6,7"}):
@@ -153,7 +317,7 @@ class ServiceTest(unittest.TestCase):
         saved = self.pool.save_profile(None, payload)
         self.assertEqual(saved["profile"]["video_host_memory_limit"], "2")
         self.assertEqual(saved["profile"]["video_gpu_memory_limit"], "4.5")
-        for invalid in ("-1", "1", "nan", "inf", "4GB", "1048577"):
+        for invalid in ("-1", "1", "1.0000000001", "nan", "inf", "4GB", "1048577"):
             fields = []
             validate_config(config_from_dict(dict(payload, video_gpu_memory_limit=invalid)), fields)
             self.assertTrue(any("video_gpu_memory_limit" in item["fields"] for item in fields), invalid)
@@ -176,6 +340,10 @@ class ServiceTest(unittest.TestCase):
         info = self.client.get("/api/runtime/api-info", headers=self.headers).json()
         self.assertEqual(info["kind"], "video")
         self.assertEqual(info["request"]["model"], "minimax-h3")
+        self.assertIn("ref2va", info["modes"])
+        self.assertEqual(info["references"]["field"], "reference")
+        self.assertEqual(info["references"]["max_count"], 12)
+        self.assertEqual(info["uploads"]["max_request_bytes"], 256 * 1024 * 1024)
         self.assertNotIn("test-service-key", json.dumps(self.pool.catalog()))
         path = "/api/media/" + video + "/videos"
         self.assertEqual(self.client.get(path).status_code, 403)
@@ -193,6 +361,47 @@ class ServiceTest(unittest.TestCase):
         active_port = self.pool.state()["endpoint"].rsplit(":", 1)[1]
         with self.assertRaises(LauncherError):
             self.pool.start(self.profile(port="0" + active_port))
+
+    def test_video_mixed_references_preserve_order_bytes_and_health(self):
+        import base64
+        video = self.start("minimax_h3")
+        path = "/api/media/" + video
+        health = self.client.get(path + "/health", headers=self.headers)
+        self.assertTrue(health.json()["reference_model_available"])
+        self.assertEqual(self.client.get(path + "/health").status_code, 403)
+        self.assertEqual(self.client.post(path + "/health", headers=self.headers).status_code, 400)
+        refs = [("scene.png", b"\x00\xffimage-one", "image/png"),
+                ("motion.mp4", b"\x00\xf0video", "video/mp4"),
+                ("person.jpg", b"\xff\xd8image-two", "image/jpeg"),
+                ("sound.wav", b"RIFF\x00audio", "audio/wav")]
+        result = self.client.post(path + "/videos", headers=self.headers,
+            data={"prompt": "Picture 2 moves like Video 1 in Picture 1, with Audio 1."},
+            files=[("reference", item) for item in refs])
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual([(r["name"], base64.b64decode(r["data"]), r["type"])
+                          for r in result.json()["references"]], refs)
+
+    def test_media_upload_limits_cover_headers_streams_and_direct_calls(self):
+        from fastllm_pytools.service_backends import media_body_limit
+        video = self.start("minimax_h3")
+        path = "/api/media/" + video + "/videos"
+        self.assertEqual(media_body_limit(path), 256 * 1024 * 1024)
+        self.assertEqual(media_body_limit("videos"), 256 * 1024 * 1024)
+        self.assertEqual(media_body_limit("/api/media/id/images/edits"), 32 * 1024 * 1024)
+        # The middleware accepts video lengths above the former 32 MiB cap.
+        response = self.client.post(path, headers={**self.headers, "Content-Length": str(33 * 1024 * 1024)},
+                                    json={"prompt": "hello"})
+        self.assertEqual(response.status_code, 200, response.text)
+        response = self.client.post(path, headers={**self.headers, "Content-Length": str(256 * 1024 * 1024 + 1)},
+                                    content=b"{}")
+        self.assertEqual(response.status_code, 413)
+        # A missing or misleading length cannot bypass the streamed-body check.
+        with patch("fastllm_pytools.launcher_services.media_body_limit", return_value=128):
+            response = self.client.post(path, headers={**self.headers, "Content-Length": "0"},
+                                        content=b"x" * 129)
+            self.assertEqual(response.status_code, 413)
+            with self.assertRaises(LauncherError):
+                self.pool.media_request(video, "POST", "videos", b"x" * 129)
 
     def test_shared_history_excludes_concurrent_writes_but_stops_only_its_owner(self):
         first = self.start()
@@ -368,6 +577,14 @@ class ServiceTest(unittest.TestCase):
             expect(page.locator('[data-field="video_host_memory_limit"]')).to_be_visible()
             page.locator('[data-field="video_host_memory_limit"]').fill("2.5")
             self.assertTrue(page.locator('[data-field="video_host_memory_limit"]').evaluate("input => input.checkValidity()"))
+            page.locator("#model-backend").select_option("minimax_h3_image")
+            expect(page.locator('[data-field="video_parallel_mode"]')).to_be_visible()
+            page.locator('[data-field="video_parallel_mode"]').select_option("tp")
+            expect(page.locator('[data-field="video_parallel_mode"]')).to_have_value("tp")
+            expect(page.locator('[data-field="video_gpu_memory_limit"]')).to_be_visible()
+            expect(page.locator('[data-field="video_host_memory_limit"]')).to_be_visible()
+            expect(page.locator('[data-field="base_model"]')).not_to_be_visible()
+            page.locator("#model-backend").select_option("minimax_h3")
             page.locator('#gpu-choices input[value="1"]').check()
             expect(page.locator('[data-field="visible_gpus"]')).to_have_value("1")
             expect(page.locator("#configuration-mode-settings")).not_to_be_visible()
@@ -382,20 +599,26 @@ class ServiceTest(unittest.TestCase):
             page.locator("#open-endpoint").click()
             expect(page.locator("#video-service")).to_have_value(video)
             expect(page.locator("#video-studio")).to_be_visible()
+            expect(page.locator("#video-runtime")).to_contain_text("FP8")
+            expect(page.locator("#video-runtime")).to_contain_text("SP × 2")
+            page.locator('#video-studio [data-mode="reference"]').click()
+            expect(page.locator("#video-runtime")).to_contain_text("GGUF")
+            page.locator('#video-studio [data-mode="text"]').click()
             page.locator("#video-prompt").fill("A cat walking")
             page.locator("#video-generate").click()
             expect(page.locator(".video-job")).to_have_count(1)
             expect(page.locator(".video-job p")).to_have_text("A cat walking")
             page.get_by_role("button", name="Preview and download").click()
-            expect(page.locator(".video-job video")).to_have_count(1)
+            expect(page.locator("#video-player")).to_be_visible()
             expect(page.get_by_role("link", name="Download video")).to_be_visible()
             page.locator("#video-prompt").fill("A second video")
             page.locator("#video-generate").click()
             expect(page.locator(".video-job")).to_have_count(2)
             expect(page.locator(".video-job p").first).to_have_text("A second video")
+            page.locator(".video-job").filter(has_text="A cat walking").click()
             page.locator("#language-select").select_option("zh-CN")
             expect(page.get_by_role("link", name="下载视频")).to_be_visible()
-            expect(page.locator(".video-job video")).to_have_count(1)
+            expect(page.locator("#video-player")).to_be_visible()
             page.locator("#language-select").select_option("en-US")
             page.locator("#studio-chat-tab").click()
             expect(page.locator("#webui-content")).to_be_visible()

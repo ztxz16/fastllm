@@ -30,7 +30,9 @@
 #include <type_traits>
 #include <vector>
 
-#if !defined(FASTLLM_CUDA_LEGACY_ONLY) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800)
+// Keep launch stubs defined in every device pass, including SM75 PTX.
+// Runtime dispatch excludes SM80-only attention on older architectures.
+#if !defined(FASTLLM_CUDA_LEGACY_ONLY)
 #define FASTLLM_NAIVE_SWA_FLASHINFER
 #include "naive-n05-swa-flashinfer.cuh"
 #endif

@@ -150,15 +150,15 @@ namespace {
     }
 
     // 第一步：每个块负责词表的一段，算 logits + bias 并做块内 argmax
-    template <typename WT>
-    __global__ void DsparkMarkovScoreKernel(const float *logits, const WT *embedWeight, const WT *headWeight,
+    template <typename ET, typename HT>
+    __global__ void DsparkMarkovScoreKernel(const float *logits, const ET *embedWeight, const HT *headWeight,
                                             const int *tokens, int step, int vocab, int rank,
                                             float *partialValue, int *partialIndex) {
         __shared__ float e[kDsparkMarkovMaxRank];
         __shared__ DsBest reduce[kDsparkMarkovThreads];
 
         const int token = tokens[step];
-        const WT *embedRow = embedWeight + (int64_t)token * rank;
+        const ET *embedRow = embedWeight + (int64_t)token * rank;
         for (int d = threadIdx.x; d < rank; d += blockDim.x) {
             e[d] = DsLoad(embedRow, d);
         }
@@ -205,13 +205,14 @@ namespace {
         return dot;
     }
 
+    template <typename ET>
     __device__ __forceinline__ DsBest DsMarkovGroupedBest(
-        const float *logits, const __nv_bfloat16 *embed, const __nv_bfloat16 *head,
+        const float *logits, const ET *embed, const __nv_bfloat16 *head,
         const int *tokens, int step, int vocab, int start, int count) {
         constexpr int lanes = 4, rank = 256, rowsPerBlock = kDsparkMarkovThreads / lanes;
         __shared__ float e[rank];
         __shared__ DsBest reduce[kDsparkMarkovThreads];
-        e[threadIdx.x] = __bfloat162float(embed[(int64_t)tokens[step] * rank + threadIdx.x]);
+        e[threadIdx.x] = DsLoad(embed + (int64_t)tokens[step] * rank, threadIdx.x);
         __syncthreads();
         const int lane = threadIdx.x % lanes;
         const int perChunk = (count + gridDim.x - 1) / gridDim.x;
@@ -229,8 +230,9 @@ namespace {
         return best;
     }
 
+    template <typename ET>
     __global__ void DsparkMarkovGroupedScoreKernel(
-        const float *logits, const __nv_bfloat16 *embed, const __nv_bfloat16 *head,
+        const float *logits, const ET *embed, const __nv_bfloat16 *head,
         const int *tokens, int step, int vocab, float *partialValue, int *partialIndex) {
         const DsBest best = DsMarkovGroupedBest(logits, embed, head, tokens, step, vocab, 0, vocab);
         if (threadIdx.x == 0) {
@@ -325,22 +327,30 @@ namespace {
         return shared[0];
     }
 
-    template<typename WT, bool GROUPED>
-    __global__ void DsparkMarkovLogitsKernel(const float *logits, const WT *embed,
-        const WT *head, const int *tokens, int step, int vocab, int rank,
-        float *scores, float *maxima, float *outEmbeds, bool roundProjection) {
+    template<typename ET, typename HT, bool GROUPED>
+    __global__ void DsparkMarkovLogitsKernel(const float *logits, const ET *embed,
+        const HT *head, const int *tokens, int step, int vocab, int rank,
+        float *scores, float *maxima, float *outEmbeds, bool roundProjection,
+        int chainLength = 0, int requestChunks = 0) {
+        const int chunks = requestChunks ? requestChunks : gridDim.x;
+        const int request = blockIdx.x / chunks, chunk = blockIdx.x % chunks;
+        logits += size_t(request) * chainLength * vocab;
+        tokens += size_t(request) * (chainLength + 1);
+        scores += size_t(request) * vocab;
+        outEmbeds += size_t(request) * chainLength * rank;
+        if (maxima) maxima += size_t(request) * chunks;
         __shared__ float e[kDsparkMarkovMaxRank];
         __shared__ float reduce[kDsparkMarkovWarps];
         for (int d = threadIdx.x; d < rank; d += blockDim.x) {
             e[d] = DsLoad(embed + (int64_t)tokens[step] * rank, d);
-            if (blockIdx.x == 0) outEmbeds[(int64_t)step * rank + d] = e[d];
+            if (chunk == 0) outEmbeds[(int64_t)step * rank + d] = e[d];
         }
         __syncthreads();
         constexpr int lanes = GROUPED ? 4 : 1;
         const int lane = threadIdx.x % lanes;
         float maximum = -INFINITY;
-        for (int v = blockIdx.x * (blockDim.x / lanes) + threadIdx.x / lanes;
-             v < vocab; v += gridDim.x * (blockDim.x / lanes)) {
+        for (int v = chunk * (blockDim.x / lanes) + threadIdx.x / lanes;
+             v < vocab; v += chunks * (blockDim.x / lanes)) {
             float dot = 0;
             if constexpr (GROUPED) {
                 dot = DsMarkovGroupedDot((const __nv_bfloat16*)head + (int64_t)v * 256, e);
@@ -349,7 +359,7 @@ namespace {
             }
             if (lane == 0) {
                 if (roundProjection) {
-                    const WT rounded = static_cast<WT>(dot);
+                    const ET rounded = static_cast<ET>(dot);
                     dot = DsLoad(&rounded, 0);
                 }
                 const float score = logits[(int64_t)step * vocab + v] + dot;
@@ -359,7 +369,7 @@ namespace {
         }
         if (maxima) {
             maximum = DsSampleBlockMax(maximum, reduce);
-            if (threadIdx.x == 0) maxima[blockIdx.x] = maximum;
+            if (threadIdx.x == 0) maxima[chunk] = maximum;
         }
     }
 
@@ -475,7 +485,7 @@ namespace {
         }
     }
 
-    template<typename WT>
+    template<typename ET, typename HT>
     bool DsLaunchSample(const Data &logits, const Data &embed, const Data &head,
         int block, float temperature, Data &tokens, Data &probs, Data *scratch, Data &outEmbeds,
         int topK, float topP, Data *samplingWorkspace) {
@@ -490,13 +500,13 @@ namespace {
         for (int step = 0; step < block; ++step) {
             float *q = (float*)probs.cudaData + (size_t)step * vocab;
             if (grouped) {
-                DsparkMarkovLogitsKernel<__nv_bfloat16, true><<<chunks, kDsparkMarkovThreads, 0, cudaStreamPerThread>>>(
-                    (const float*)logits.cudaData, (const __nv_bfloat16*)embed.cudaData,
+                DsparkMarkovLogitsKernel<ET, __nv_bfloat16, true><<<chunks, kDsparkMarkovThreads, 0, cudaStreamPerThread>>>(
+                    (const float*)logits.cudaData, (const ET*)embed.cudaData,
                     (const __nv_bfloat16*)head.cudaData, (const int*)tokens.cudaData,
                     step, vocab, rank, q, maxima, (float*)outEmbeds.cudaData, samplingWorkspace != nullptr);
             } else {
-                DsparkMarkovLogitsKernel<WT, false><<<chunks, kDsparkMarkovThreads, 0, cudaStreamPerThread>>>(
-                    (const float*)logits.cudaData, (const WT*)embed.cudaData, (const WT*)head.cudaData,
+                DsparkMarkovLogitsKernel<ET, HT, false><<<chunks, kDsparkMarkovThreads, 0, cudaStreamPerThread>>>(
+                    (const float*)logits.cudaData, (const ET*)embed.cudaData, (const HT*)head.cudaData,
                     (const int*)tokens.cudaData, step, vocab, rank, q, maxima, (float*)outEmbeds.cudaData, samplingWorkspace != nullptr);
             }
             if (samplingWorkspace) {
@@ -516,32 +526,79 @@ namespace {
         return cudaGetLastError() == cudaSuccess;
     }
 
-    template <typename WT>
+    template<typename ET, typename HT>
+    bool DsLaunchBatchSample(const Data &logits, const Data &embed, const Data &head,
+        int block, float temperature, int topK, float topP, Data &tokens, Data &probs,
+        Data &outEmbeds, Data &scores, Data &samplingWorkspace) {
+        const int batch = logits.dims[0], vocab = logits.dims[2], rank = embed.dims[1];
+        const bool grouped = DsGroupedScore(head, vocab, rank);
+        const int chunks = grouped ? kDsparkMarkovGroupedChunks : kDsparkMarkovChunks;
+        if (uint64_t(batch) * chunks > INT_MAX) return false;
+        for (int step = 0; step < block; ++step) {
+            if (grouped) {
+                DsparkMarkovLogitsKernel<ET, __nv_bfloat16, true><<<batch * chunks, kDsparkMarkovThreads, 0, cudaStreamPerThread>>>(
+                    (const float*)logits.cudaData, (const ET*)embed.cudaData, (const __nv_bfloat16*)head.cudaData,
+                    (const int*)tokens.cudaData, step, vocab, rank, (float*)scores.cudaData, nullptr,
+                    (float*)outEmbeds.cudaData, true, block, chunks);
+            } else {
+                DsparkMarkovLogitsKernel<ET, HT, false><<<batch * chunks, kDsparkMarkovThreads, 0, cudaStreamPerThread>>>(
+                    (const float*)logits.cudaData, (const ET*)embed.cudaData, (const HT*)head.cudaData,
+                    (const int*)tokens.cudaData, step, vocab, rank, (float*)scores.cudaData, nullptr,
+                    (float*)outEmbeds.cudaData, true, block, chunks);
+            }
+            if (!FastllmCudaMtpSampleDraftBatchDevice((float*)scores.cudaData,
+                    (float*)probs.cudaData + size_t(step) * vocab, temperature, topK, topP,
+                    (int*)tokens.cudaData + step + 1, batch, vocab, block * vocab, block + 1,
+                    samplingWorkspace)) return false;
+        }
+        return cudaGetLastError() == cudaSuccess;
+    }
+
+    template <typename ET, typename HT>
     void DsLaunchChain(const float *logits, const Data &embedWeight, const Data &headWeight,
                        int block, int vocab, int rank, int *tokens,
                        float *partialValue, int *partialIndex, float *outEmbeds) {
-        const WT *embedData = (const WT*)embedWeight.cudaData;
-        const WT *headData = (const WT*)headWeight.cudaData;
+        const ET *embedData = (const ET*)embedWeight.cudaData;
+        const HT *headData = (const HT*)headWeight.cudaData;
         const bool grouped = DsGroupedScore(headWeight, vocab, rank);
         const int chunks = grouped ? kDsparkMarkovGroupedChunks : kDsparkMarkovChunks;
         for (int step = 0; step < block; step++) {
             if (grouped) {
-                DsparkMarkovGroupedScoreKernel<<<chunks, kDsparkMarkovThreads>>>(
-                    logits, (const __nv_bfloat16*)embedData, (const __nv_bfloat16*)headData,
+                DsparkMarkovGroupedScoreKernel<ET><<<chunks, kDsparkMarkovThreads>>>(
+                    logits, embedData, (const __nv_bfloat16*)headData,
                     tokens, step, vocab, partialValue, partialIndex);
-            } else DsparkMarkovScoreKernel<WT><<<kDsparkMarkovChunks, kDsparkMarkovThreads>>>(
+            } else DsparkMarkovScoreKernel<ET, HT><<<kDsparkMarkovChunks, kDsparkMarkovThreads>>>(
                 logits, embedData, headData, tokens, step, vocab, rank, partialValue, partialIndex);
-            DsparkMarkovReduceKernel<WT><<<1, kDsparkMarkovThreads>>>(
+            DsparkMarkovReduceKernel<ET><<<1, kDsparkMarkovThreads>>>(
                 partialValue, partialIndex, chunks, embedData, tokens, step, rank,
                 tokens, outEmbeds);
         }
     }
 }
 
+// Embedding activations and projection weights keep their original storage
+// types. Dispatch them independently; no conversion buffer enters the graph.
+namespace {
+    template <typename T> struct DsWeightType { using Type = T; };
+    template <typename ET, typename F>
+    bool DsDispatchMarkovHead(DataType type, const F &f) {
+        if (type == DataType::BFLOAT16) return f(DsWeightType<ET>{}, DsWeightType<__nv_bfloat16>{});
+        if (type == DataType::FLOAT16) return f(DsWeightType<ET>{}, DsWeightType<half>{});
+        return f(DsWeightType<ET>{}, DsWeightType<float>{});
+    }
+    template <typename F>
+    bool DsDispatchMarkovWeights(DataType embed, DataType head, const F &f) {
+        if (embed == DataType::BFLOAT16) return DsDispatchMarkovHead<__nv_bfloat16>(head, f);
+        if (embed == DataType::FLOAT16) return DsDispatchMarkovHead<half>(head, f);
+        return DsDispatchMarkovHead<float>(head, f);
+    }
+}
+
 static bool DsMarkovSampleDevice(const Data &logits,
     const Data &embed, const Data &head, int block, float temperature,
     Data &tokens, Data &probs, Data *scratch, Data &outEmbeds,
-    int topK, float topP, Data *samplingWorkspace) {
+    int topK, float topP, Data *samplingWorkspace, Data *batchScores = nullptr) {
+    const int batch = logits.dims.size() == 3 ? logits.dims[0] : 0;
     const int device = FastllmCudaGetDevice();
     auto dense = [device](const Data &d) {
         if (!DsOnCuda(d) || d.dataDeviceIds != std::vector<int>{device} ||
@@ -556,20 +613,24 @@ static bool DsMarkovSampleDevice(const Data &logits,
     if (!std::isfinite(temperature) || temperature <= 0 || block < 1 ||
         !std::isfinite(topP) || topP <= 0 || topP > 1 ||
         !dense(logits) || logits.dataType != DataType::FLOAT32 || logits.dims.size() != 3 ||
-        logits.dims[0] != 1 || logits.dims[1] < block || !dense(embed) || !dense(head) ||
+        batch <= 0 || (!batchScores && batch != 1) || (batchScores ? logits.dims[1] != block : logits.dims[1] < block) || !dense(embed) || !dense(head) ||
         embed.dims.size() != 2 || head.dims.size() != 2 || !DsSupportedWeight(embed) ||
-        embed.dataType != head.dataType || embed.dims[0] < logits.dims[2] ||
+        !DsSupportedWeight(head) || embed.dims[0] < logits.dims[2] ||
         head.dims[0] < logits.dims[2] || embed.dims[1] != head.dims[1] ||
         embed.dims[1] > kDsparkMarkovMaxRank || !dense(tokens) ||
-        tokens.dataType != DataType::INT32 || tokens.dims != std::vector<int>{block + 1}) return false;
-    if (!DsPrepareOutput(probs, DataType::FLOAT32, {block, logits.dims[2]}) ||
+        uint64_t(batch) * block * logits.dims[2] > INT_MAX ||
+        tokens.dataType != DataType::INT32 || tokens.Count(0) != uint64_t(batch) * (block + 1)) return false;
+    if (!DsPrepareOutput(probs, DataType::FLOAT32, {batch * block, logits.dims[2]}) ||
         (scratch && !DsPrepareOutput(*scratch, DataType::FLOAT32, {kDsparkMarkovGroupedChunks + 1})) ||
-        !DsPrepareOutput(outEmbeds, DataType::FLOAT32, {1, block, embed.dims[1]})) return false;
-    if (embed.dataType == DataType::BFLOAT16)
-        return DsLaunchSample<__nv_bfloat16>(logits, embed, head, block, temperature, tokens, probs, scratch, outEmbeds, topK, topP, samplingWorkspace);
-    if (embed.dataType == DataType::FLOAT16)
-        return DsLaunchSample<half>(logits, embed, head, block, temperature, tokens, probs, scratch, outEmbeds, topK, topP, samplingWorkspace);
-    return DsLaunchSample<float>(logits, embed, head, block, temperature, tokens, probs, scratch, outEmbeds, topK, topP, samplingWorkspace);
+        !DsPrepareOutput(outEmbeds, DataType::FLOAT32, {batch, block, embed.dims[1]})) return false;
+    if (batchScores && (!samplingWorkspace ||
+        !DsPrepareOutput(*batchScores, DataType::FLOAT32, {batch, logits.dims[2]}))) return false;
+    return DsDispatchMarkovWeights(embed.dataType, head.dataType, [&](auto et, auto ht) {
+        if (batchScores) return DsLaunchBatchSample<typename decltype(et)::Type, typename decltype(ht)::Type>(
+            logits, embed, head, block, temperature, topK, topP, tokens, probs, outEmbeds, *batchScores, *samplingWorkspace);
+        return DsLaunchSample<typename decltype(et)::Type, typename decltype(ht)::Type>(
+            logits, embed, head, block, temperature, tokens, probs, scratch, outEmbeds, topK, topP, samplingWorkspace);
+    });
 }
 
 extern "C" bool FastllmCudaDeepSeekV41MarkovSampleDevice(const Data &logits,
@@ -583,6 +644,13 @@ extern "C" bool FastllmCudaDeepSeekV41MarkovFilteredSampleDevice(const Data &log
     Data &tokens, Data &probs, Data &outEmbeds, Data &samplingWorkspace) {
     return DsMarkovSampleDevice(logits, embed, head, block, temperature, tokens, probs,
         nullptr, outEmbeds, topK, topP, &samplingWorkspace);
+}
+
+extern "C" bool FastllmCudaDeepSeekV41MarkovFilteredSampleBatchDevice(const Data &logits,
+    const Data &embed, const Data &head, int block, float temperature, int topK, float topP,
+    Data &tokens, Data &probs, Data &outEmbeds, Data &scores, Data &samplingWorkspace) {
+    return DsMarkovSampleDevice(logits, embed, head, block, temperature, tokens, probs,
+        nullptr, outEmbeds, topK, topP, &samplingWorkspace, &scores);
 }
 
 extern "C" bool FastllmCudaDeepSeekV41DraftInput(const Data &embedding, const Data &metadata,
@@ -628,7 +696,7 @@ extern "C" bool FastllmCudaDeepSeekV41MarkovChainDevice(const fastllm::Data &log
     if (embedWeight.dims.size() != 2 || headWeight.dims.size() != 2) {
         return false;
     }
-    if (!DsSupportedWeight(embedWeight) || embedWeight.dataType != headWeight.dataType) {
+    if (!DsSupportedWeight(embedWeight) || !DsSupportedWeight(headWeight)) {
         return false;
     }
     const int vocab = logits.dims[2];
@@ -657,16 +725,12 @@ extern "C" bool FastllmCudaDeepSeekV41MarkovChainDevice(const fastllm::Data &log
 
     const float *logitsData = (const float*)logits.cudaData;
     float *embedsData = (float*)outEmbeds.cudaData;
-    if (embedWeight.dataType == DataType::FLOAT16) {
-        DsLaunchChain<half>(logitsData, embedWeight, headWeight, block, vocab, rank,
-                            tokens, partialValue, partialIndex, embedsData);
-    } else if (embedWeight.dataType == DataType::BFLOAT16) {
-        DsLaunchChain<__nv_bfloat16>(logitsData, embedWeight, headWeight, block, vocab, rank,
-                                     tokens, partialValue, partialIndex, embedsData);
-    } else {
-        DsLaunchChain<float>(logitsData, embedWeight, headWeight, block, vocab, rank,
-                             tokens, partialValue, partialIndex, embedsData);
-    }
+    DsDispatchMarkovWeights(embedWeight.dataType, headWeight.dataType, [&](auto et, auto ht) {
+        DsLaunchChain<typename decltype(et)::Type, typename decltype(ht)::Type>(
+            logitsData, embedWeight, headWeight, block, vocab, rank,
+            tokens, partialValue, partialIndex, embedsData);
+        return true;
+    });
 
     cudaError_t state = cudaGetLastError();
     if (state != cudaSuccess) {

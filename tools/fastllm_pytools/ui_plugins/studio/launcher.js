@@ -18,7 +18,8 @@ function renderAgentRuntime() {
   const phase = runtime.phase;
   const busy = state.agentRuntimeRequest || ["checking", "unchecked", "installing"].includes(phase);
   elements.agentRuntimeCard.classList.toggle("hidden", phase === "ready"
-    || !document.getElementById("video-studio").classList.contains("hidden"));
+    || !document.getElementById("video-studio").classList.contains("hidden")
+    || !document.getElementById("image-studio").classList.contains("hidden"));
   elements.installAgentRuntime.disabled = busy || runtime.supported === false;
   elements.installAgentRuntime.textContent = t(phase === "installing" ? "Installing…"
     : phase === "failed" ? "Retry installation" : "Install Agent dependencies");
@@ -78,7 +79,7 @@ function renderWebUIAvailability() {
   const runtime = chatRuntime();
   const ready = webuiIsReady();
   elements.openWebui.disabled = !studio.ready;
-  elements.agentRuntimeCard.classList.toggle("hidden", studio.videoMode || state.agentRuntime?.phase === "ready");
+  elements.agentRuntimeCard.classList.toggle("hidden", studio.mediaMode || state.agentRuntime?.phase === "ready");
   if ((!ready || state.webuiSessionId !== runtime?.sessionId)
       && (state.webuiSessionId || state.webuiLoading)) {
     state.webuiRequestId += 1;
@@ -90,12 +91,12 @@ function renderWebUIAvailability() {
   }
   const loaded = ready && state.webuiSessionId === runtime.sessionId
     && !state.webuiLoading && !state.webuiError;
-  elements.webuiContent.classList.toggle("hidden", !loaded || studio.videoMode);
-  elements.webuiPlaceholder.classList.toggle("hidden", loaded || studio.videoMode);
+  elements.webuiContent.classList.toggle("hidden", !loaded || studio.mediaMode);
+  elements.webuiPlaceholder.classList.toggle("hidden", loaded || studio.mediaMode);
   elements.webuiRetry.classList.toggle("hidden", !ready || !state.webuiError);
   elements.webuiStatus.textContent = state.webuiError ? localizeServerText(state.webuiError)
     : ready ? t("Opening WebUI…") : t("Start an API Server before opening WebUI.");
-  if (state.currentView === "webui" && !studio.videoMode && ready && !state.webuiLoading && !state.webuiSessionId && !state.webuiError) {
+  if (state.currentView === "webui" && !studio.mediaMode && ready && !state.webuiLoading && !state.webuiSessionId && !state.webuiError) {
     openEmbeddedWebUI();
   }
 }

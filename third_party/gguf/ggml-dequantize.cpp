@@ -4,6 +4,24 @@
 #define restrict GGML_RESTRICT
 extern float GGML_FP16_TO_FP32(ggml_half f);
 
+void dequantize_row_mxfp8(const block_mxfp8 * restrict x, float * restrict y, int64_t k) {
+    assert(k % QK_MXFP8 == 0);
+    // Reuse the portable FP8 table, with the E4M3FN reserved codes mapped to
+    // NaN. Do not change the historical FP8 decoding used by other formats.
+    static const auto fp8 = []() {
+        fastllm::FP8E4M3ToFP32Manager table;
+        table.dict[0x7f] = std::numeric_limits<float>::quiet_NaN();
+        table.dict[0xff] = -std::numeric_limits<float>::quiet_NaN();
+        return table;
+    }();
+    for (int64_t b = 0; b < k / QK_MXFP8; ++b) {
+        const float scale = x[b].e == 255 ? std::numeric_limits<float>::quiet_NaN()
+                                         : std::ldexp(1.0f, int(x[b].e) - 127);
+        for (int j = 0; j < QK_MXFP8; ++j)
+            y[b * QK_MXFP8 + j] = fp8.dict[x[b].qs[j]] * scale;
+    }
+}
+
 void ggml_fp16_to_fp32_row(const uint16_t * x, float * y, int64_t n) {
     for (int64_t i = 0; i < n; i++) {
         y[i] = GGML_FP16_TO_FP32(x[i]);

@@ -28,6 +28,7 @@ namespace fastllm {
     void RegisterHostMoeWeightBatch(const std::vector<std::pair<Data*, std::string>> &weights,
         bool unbound, const std::function<void(size_t)> &onProgress = {});
     int GetNumasMoeShardCount();
+    std::vector<std::vector<int>> GetNumasExpertWorkerIds();
     // Thread-TP models carry their own device set, independently of the
     // process-wide executor map. Borrow it for one synchronous MoE call.
     class NumasMoeCudaAssistScope {
@@ -221,17 +222,17 @@ namespace fastllm {
     // Release them explicitly while the CUDA allocator is still alive.
     void ClearNumasMoeRuntimeCache();
 
-    // Keep this bound aligned with the NUMA grouped-decode path.  It is an
-    // algorithmic limit rather than a device-specific tuning parameter.
+    // Capacity of the legacy prepared CUDA staging/TP adapter. The host
+    // grouped queue has no corresponding request-row limit.
     constexpr int kNumasMoePrefetchMaxRows = 8;
     constexpr int kNumasMoeGpuPrefillMinRows = 32;
 
-    // Whether the active CPU kernels can preserve one-token decode arithmetic
-    // for a grouped MoE batch of this size.
+    // Legacy model capability checks include the prepared CUDA adapter's
+    // capacity. Do not use these to limit the host grouped GEMM queue.
     bool CanUseNumasMoeExactSmallBatch(int rows);
 
-    // GGUF verification also preserves the single-row dot and scored BF16/Q8
-    // boundaries on AVX2. Native formats retain the AVX512-BF16 requirement.
+    // GGUF capability check for that prepared adapter, including its AVX2
+    // arithmetic contract. V4's dynamic mailbox has a separate batch path.
     bool CanUseNumasMoeExactGgufBatch(int rows, Data *const *weights, int weightsBatch);
 
     // Begin copying a contiguous CUDA MoE decode/verification batch to the

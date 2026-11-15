@@ -268,6 +268,12 @@ else:
     for libname in ["libfastllm_tools.so", "libfastllm_tools-cu11.so", "libfastllm_tools-cpu.so"]:
         try:
             fastllm_lib = _load_library(os.path.join(os.path.split(os.path.realpath(__file__))[0], libname))
+            if libname == "libfastllm_tools-cpu.so" and load_errors and any(
+                os.path.isfile(os.path.join(os.path.dirname(os.path.realpath(__file__)), name))
+                for name in ("libfastllm_tools.so", "libfastllm_tools-cu11.so")
+            ):
+                print("Warning: CUDA library loading failed; running with CPU fallback. "
+                      + "; ".join(load_errors), file=sys.stderr)
             print("Load", libname)
             succ = True
             break

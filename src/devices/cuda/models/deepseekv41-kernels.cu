@@ -1601,7 +1601,14 @@ namespace {
             int heads, int tokens, int windowRows, int ropeDim, int startPos,
             const int *devicePosition, int qBlocks) {
         constexpr int dim = 512;
-        const int block = blockIdx.x;
+        const int blocksPerRequest = qBlocks + tokens + (windowRows + 7) / 8;
+        const int request = blockIdx.x / blocksPerRequest;
+        const int block = blockIdx.x % blocksPerRequest;
+        q += size_t(request) * tokens * heads * dim;
+        kv += size_t(request) * tokens * dim;
+        window += size_t(request) * windowRows * dim;
+        table += size_t(request) * (windowRows + tokens) * dim;
+        if (devicePosition) devicePosition += request;
         if (block < qBlocks) {
             const int idx = block * blockDim.x + threadIdx.x;
             const int pairs = ropeDim / 2;
@@ -4666,13 +4673,15 @@ __global__ void V41QuantizeActivationVectorKernel(const __nv_bfloat16 *input, __
     // ---------------- WindowStore ----------------
 
     __global__ void V41WindowStoreKernel(const uint8_t *chunk, uint8_t *ring, int seqlen, int rowBytes,
-                                         int startPos, int windowSize, int firstRow, const int *devicePosition) {
-        const int b = blockIdx.y;
-        const int i = firstRow + blockIdx.x;
-        if (i >= seqlen) {
+                                         int startPos, int windowSize, int firstRow, const int *devicePosition,
+                                         const int *deviceCounts, bool batchMetadata) {
+        const int b = batchMetadata ? blockIdx.x / seqlen : blockIdx.y;
+        const int i = firstRow + (batchMetadata ? blockIdx.x % seqlen : blockIdx.x);
+        const int accepted = deviceCounts ? deviceCounts[b] : seqlen;
+        if (i >= accepted || (batchMetadata && i < accepted - windowSize)) {
             return;
         }
-        const int slot = ((devicePosition ? *devicePosition : startPos) + i) % windowSize;
+        const int slot = ((int64_t)(devicePosition ? devicePosition[batchMetadata ? b : 0] : startPos) + i) % windowSize;
         const uint8_t *src = chunk + ((uint64_t)b * seqlen + i) * rowBytes;
         uint8_t *dst = ring + ((uint64_t)b * windowSize + slot) * rowBytes;
         for (int k = threadIdx.x; k < rowBytes; k += blockDim.x) {
@@ -4791,7 +4800,8 @@ extern "C" bool FastllmCudaV41QKVNormPacked(const Data &qkv,
     const int qdim = qCount, kdim = kCount, stride = qdim + kdim;
     if (qkv.dims.back() != stride || (uintptr_t)qkv.cudaData % 4) return false;
     const uint64_t tokens = qkv.Count(0) / stride;
-    if (!tokens || tokens > 8 || &qn == qq || &qn == &kn || qq == &kn) return false;
+    if (!tokens || tokens > uint64_t(std::numeric_limits<int>::max() / 2) ||
+        &qn == qq || &qn == &kn || qq == &kn) return false;
     auto overlaps = [](const void *a, size_t na, const void *b, size_t nb) {
         const uintptr_t x = (uintptr_t)a, y = (uintptr_t)b;
         return a && b && (x <= y ? y - x < na : x - y < nb);
@@ -4854,7 +4864,8 @@ extern "C" bool FastllmCudaV41QKVNormQuant(const Data &q, const Data &kv,
     auto kdims = q.dims;
     kdims.back() = kdim;
     const auto tokens = q.Count(0) / qdim;
-    if (tokens < 1 || tokens > 8 || kdims != kv.dims || !std::isfinite(eps) || eps < 0) return false;
+    if (tokens < 1 || tokens > uint64_t(std::numeric_limits<int>::max() / 2) ||
+        kdims != kv.dims || !std::isfinite(eps) || eps < 0) return false;
     if (&qNorm == &qQuant || &qNorm == &kvNorm || &qQuant == &kvNorm || &q == &qNorm ||
         &q == &qQuant || &q == &kvNorm || &kv == &qNorm || &kv == &qQuant) return false;
     auto overlaps = [](const void *a, size_t na, const void *b, size_t nb) {
@@ -4904,7 +4915,9 @@ extern "C" bool FastllmCudaV41RouterSelectTopK(const Data &input, Data &weight,
     const int experts = weight.dims[0];
     const int rows = input.Count(0) / input.dims.back();
     const int arch = FastllmCudaRuntimeArch();
-    if (rows < 5 || rows > 8 || arch < 80) return false;
+    // Keep tall prefill matrices on GEMM; this split-K pipeline targets
+    // batches whose row count is comparable to the small router width.
+    if (rows < 5 || rows > 2 * experts || arch < 80) return false;
     const int device = FastllmCudaGetDevice();
     if (input.dataDeviceIds.empty() || input.dataDeviceIds.front() != device) return false;
     weight.ToDevice(DataDevice::CUDA, {device}, true);
@@ -4928,13 +4941,17 @@ extern "C" bool FastllmCudaV41RouterSelectTopK(const Data &input, Data &weight,
     if (target->second < 80) return false;
     const bool pdl = arch >= 90 && target->second >= 90;
     const bool cluster = pdl && arch < 100 && weight.dims[1] == 5120;
+    // Bound persistent split-K scratch, independently of the logical batch.
+    // Every graph for this thread/device retains the same stable allocation.
+    constexpr size_t partialBudget = 1024 * 1024;
+    const int chunkRows = int(partialBudget / (16 * experts * sizeof(float))) / 8 * 8;
     float *partial = nullptr;
     if (!cluster) {
         static thread_local std::map<int, std::unique_ptr<Data>> scratch;
         auto found = scratch.find(device);
         if (found == scratch.end()) {
             if (FastllmCudaGraphIsCapturingFast()) return false;
-            auto buffer = std::make_unique<Data>(DataType::FLOAT32, std::vector<int>{16, 8, 384});
+            auto buffer = std::make_unique<Data>(DataType::FLOAT32, std::vector<int>{int(partialBudget / sizeof(float))});
             buffer->ToDevice(DataDevice::CUDA, {device}, false); buffer->Allocate(false);
             found = scratch.emplace(device, std::move(buffer)).first;
         }
@@ -4942,13 +4959,18 @@ extern "C" bool FastllmCudaV41RouterSelectTopK(const Data &input, Data &weight,
     }
     const float invTemp = fabsf(temperature - 1.f) > 1e-6f ? 1.f / temperature : 1.f;
     cudaError_t status;
-    if (cluster) status = V41TcLaunchPipeline<8,8,640,1,true>(
-        (const __nv_bfloat16*)input.cudaData, (const __nv_bfloat16*)compact->cudaData,
-        partial, (float*)logits.cudaData, rows, experts, weight.dims[1], invTemp, cudaStreamPerThread, pdl);
-    else status = V41TcLaunchPipeline<4,16,128,2,false>(
-        (const __nv_bfloat16*)input.cudaData, (const __nv_bfloat16*)compact->cudaData,
-        partial, (float*)logits.cudaData, rows, experts, weight.dims[1], invTemp, cudaStreamPerThread, pdl);
-    if (status != cudaSuccess) { cudaGetLastError(); return false; }
+    for (int first = 0; first < rows; first += chunkRows) {
+        const int count = std::min(chunkRows, rows - first);
+        const auto *x = (const __nv_bfloat16*)input.cudaData + size_t(first) * weight.dims[1];
+        auto *y = (float*)logits.cudaData + size_t(first) * experts;
+        if (cluster) status = V41TcLaunchPipeline<8,8,640,1,true>(
+            x, (const __nv_bfloat16*)compact->cudaData, partial, y, count, experts,
+            weight.dims[1], invTemp, cudaStreamPerThread, pdl);
+        else status = V41TcLaunchPipeline<4,16,128,2,false>(
+            x, (const __nv_bfloat16*)compact->cudaData, partial, y, count, experts,
+            weight.dims[1], invTemp, cudaStreamPerThread, pdl);
+        if (status != cudaSuccess) { cudaGetLastError(); return false; }
+    }
     auto select = topk == 3 ? V41TcRouterTopK<128, 3> : V41TcRouterTopK<384, 6>;
 #if CUDART_VERSION >= 12000
     cudaLaunchConfig_t cfg = {}; cfg.gridDim = rows; cfg.blockDim = 32; cfg.stream = cudaStreamPerThread;
@@ -5475,14 +5497,18 @@ extern "C" bool FastllmCudaDeepSeekV41DraftRotaryTable(Data &q, Data &kv, const 
     if (V41LegacyRotary() || V41EnvOn("FASTLLM_DSV41_REFERENCE_MATH") ||
         V41EnvOn("FASTLLM_DSV41_DISABLE_FAKE_QUANT") ||
         q.dims.size() != 4 || kv.dims.size() != 3 || window.dims.size() != 3 ||
-        q.dims[0] != 1 || q.dims[1] < 1 || q.dims[1] > 8 || q.dims[2] < 1 || q.dims[2] > 128 ||
-        q.dims[3] != 512 || kv.dims != std::vector<int>({1, q.dims[1], 512}) ||
-        window.dims[0] != 1 || window.dims[1] < 1 || window.dims[1] > 1024 || window.dims[2] != 512 ||
+        q.dims[0] < 1 || q.dims[1] < 1 || q.dims[2] < 1 || q.dims[2] > 128 ||
+        q.dims[3] != 512 || kv.dims != std::vector<int>({q.dims[0], q.dims[1], 512}) ||
+        window.dims[0] != q.dims[0] || window.dims[1] < 1 || window.dims[1] > 1024 || window.dims[2] != 512 ||
         ropeDim < 2 || ropeDim > 128 || ropeDim % 2 || table.multiDeviceData || table.isFake ||
         (uintptr_t)window.cudaData % 16 || (uintptr_t)table.cudaData % 16) return false;
     const std::vector<int> device{FastllmCudaGetDevice()};
     const Data *inputs[] = {&q, &kv, &window};
-    const uint64_t tableBytes = (uint64_t)(window.dims[1] + q.dims[1]) * 512 * 2;
+    const uint64_t qTasks = uint64_t(q.dims[1]) * q.dims[2] * (ropeDim / 2);
+    const uint64_t qBlocks64 = (qTasks + 511) / 512;
+    const uint64_t blocks = uint64_t(q.dims[0]) * (qBlocks64 + q.dims[1] + (window.dims[1] + 7) / 8);
+    if (qTasks > INT_MAX || blocks > INT_MAX || q.dims[1] > INT_MAX - window.dims[1]) return false;
+    const uint64_t tableBytes = (uint64_t)q.dims[0] * (window.dims[1] + q.dims[1]) * 512 * 2;
     auto overlaps = [](const Data &a, const Data &b, uint64_t bBytes = 0) {
         const uintptr_t x = (uintptr_t)a.cudaData, y = (uintptr_t)b.cudaData;
         return x && y && x < y + (bBytes ? bBytes : b.GetBytes()) && y < x + a.GetBytes();
@@ -5499,10 +5525,10 @@ extern "C" bool FastllmCudaDeepSeekV41DraftRotaryTable(Data &q, Data &kv, const 
         }
         for (int j = 0; j < i; ++j) if (overlaps(x, *inputs[j])) return false;
     }
-    if (!V41PrepareOutput(table, DataType::BFLOAT16, {1, window.dims[1] + q.dims[1], 512})) return false;
+    if (!V41PrepareOutput(table, DataType::BFLOAT16, {q.dims[0], window.dims[1] + q.dims[1], 512})) return false;
     const auto rope = V41BuildRope(ropeDim, ropeBase, originalSeqLen, ropeFactor, betaFast, betaSlow);
-    const int qBlocks = (q.dims[1] * q.dims[2] * (ropeDim / 2) + 511) / 512;
-    V41DraftRotaryTableKernel<<<qBlocks + q.dims[1] + (window.dims[1] + 7) / 8, 512>>>(
+    const int qBlocks = int(qBlocks64);
+    V41DraftRotaryTableKernel<<<unsigned(blocks), 512>>>(
         (__nv_bfloat16*)q.cudaData, (__nv_bfloat16*)kv.cudaData, (const __nv_bfloat16*)window.cudaData,
         (__nv_bfloat16*)table.cudaData, rope, q.dims[2], q.dims[1], window.dims[1], ropeDim,
         startPos, devicePosition, qBlocks);
@@ -6556,11 +6582,14 @@ extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, co
 }
 
 static bool V41WindowStore(const fastllm::Data &chunk, fastllm::Data &ring, int startPos,
-                           int windowSize, const int *devicePosition, int rowCount) {
+                           int windowSize, const int *devicePosition, int rowCount,
+                           const int *deviceCounts = nullptr, bool batchMetadata = false) {
     if (!V41OnCuda(chunk) || chunk.dims.size() != 3 || windowSize <= 0) {
         return false;
     }
     int bsz = chunk.dims[0], seqlen = chunk.dims[1], dim = chunk.dims[2];
+    if (bsz <= 0 || seqlen <= 0 || (batchMetadata &&
+        (!devicePosition || !deviceCounts || uint64_t(bsz) * seqlen > INT32_MAX))) return false;
     if (rowCount == -1) rowCount = seqlen;
     if (rowCount < 0 || rowCount > seqlen) return false;
     if (rowCount == 0) return true;
@@ -6572,16 +6601,21 @@ static bool V41WindowStore(const fastllm::Data &chunk, fastllm::Data &ring, int 
         cudaMemset(ring.cudaData, 0, (size_t)ring.Count(0) * ring.unitSize / ring.unitSizeDiv);
     }
     int rowBytes = dim * chunk.unitSize;
-    int firstRow = std::max(0, rowCount - windowSize);
-    dim3 grid(rowCount - firstRow, bsz);
+    int firstRow = batchMetadata ? 0 : std::max(0, rowCount - windowSize);
+    dim3 grid(batchMetadata ? bsz * seqlen : rowCount - firstRow, batchMetadata ? 1 : bsz);
     V41WindowStoreKernel<<<grid, 256>>>((const uint8_t*)chunk.cudaData, (uint8_t*)ring.cudaData, seqlen, rowBytes,
-                                        startPos, windowSize, firstRow, devicePosition);
+                                        startPos, windowSize, firstRow, devicePosition, deviceCounts, batchMetadata);
     return V41CheckLaunch("WindowStore");
 }
 
 extern "C" bool FastllmCudaDeepSeekV41WindowStorePosition(const fastllm::Data &chunk, fastllm::Data &ring,
                                                         int startPos, int windowSize, const int *devicePosition) {
     return V41WindowStore(chunk, ring, startPos, windowSize, devicePosition, -1);
+}
+
+extern "C" bool FastllmCudaDeepSeekV41WindowStoreBatchPrefix(const fastllm::Data &chunk, fastllm::Data &ring,
+        int windowSize, const int *devicePositions, const int *deviceCounts) {
+    return V41WindowStore(chunk, ring, 0, windowSize, devicePositions, -1, deviceCounts, true);
 }
 
 extern "C" bool FastllmCudaDeepSeekV41WindowStore(const fastllm::Data &chunk, fastllm::Data &ring,
@@ -6923,7 +6957,7 @@ struct V41FullDecodePlan {
     bool fuseIndexBlocks = false, wideCandidateSelect = false;
     FastllmV41FullDecodeConfig config;
     FastllmV41FullDecodeBuffers buffers;
-    int device = 0, tiles = 0, splits = 8, listCap = 0, blockShift = -1;
+    int device = 0, gridY = 0, tiles = 0, splits = 8, listCap = 0, blockShift = -1;
     bool fused = false, pending = false, pvPipeline = false;
     V41RopeTable rope;
     FastllmV41FullDecodeRequest *host = nullptr, *requests = nullptr;
@@ -6965,7 +6999,9 @@ __device__ __forceinline__ void V41FullDecodeSetupRow(
         float *indexScores, float *blockScores, float *attentionScores, int tiles,
         int *candidateBlocks, int *candidateCounts) {
     const auto r = requests[i];
-    const int end = c.verifying ? requests[0].position + c.batch : r.position + 1;
+    const int begin = c.verifying ? r.chunkBegin : i;
+    const int length = r.chunkLength > 0 ? r.chunkLength : c.batch;
+    const int end = c.verifying ? requests[begin].position + length : r.position + 1;
     const int count = c.ratio ? end / c.ratio : 0;
     const int blocks = c.ratio ? (count + c.blockSize - 1) / c.blockSize : 0;
     const int maxBlocks = (c.maxKeys + c.blockSize - 1) / c.blockSize;
@@ -6974,7 +7010,7 @@ __device__ __forceinline__ void V41FullDecodeSetupRow(
     auto *out = static_cast<__nv_bfloat16 *>(b.output) + (size_t)i * c.heads * 512;
     auto *tk = c.ratio ? static_cast<int32_t *>(b.topk) + (size_t)i * c.topK : nullptr;
     auto *cand = c.ratio ? static_cast<uint8_t *>(b.candidates) + (size_t)i * maxBlocks : nullptr;
-    auto *t = transforms + i * kFullDecodeTransforms;
+    auto *t = transforms + size_t(i) * kFullDecodeTransforms;
     t[0] = {out, nullptr, c.heads, 512, r.position, 1, 1, 32};
     t[1] = {kv, static_cast<__nv_bfloat16 *>(r.windowKV), 1, 512, r.position, 0, 0, 32};
     if (c.kvSource) {
@@ -7008,8 +7044,8 @@ __device__ __forceinline__ void V41FullDecodeSetupRow(
     }
     V41AttentionDescriptor a{};
     a.q = q;
-    a.chunkKV = c.verifying ? static_cast<const __nv_bfloat16 *>(b.kv) : kv;
-    a.chunkOffset = c.verifying ? i : 0;
+    a.chunkKV = static_cast<const __nv_bfloat16 *>(b.kv) + (size_t)begin * 512;
+    a.chunkOffset = i - begin;
     a.ringKV = static_cast<const __nv_bfloat16 *>(r.windowKV);
     a.compressedKV = static_cast<const __nv_bfloat16 *>(r.compressedKV);
     if (c.ringMode) {
@@ -7034,8 +7070,8 @@ __global__ void V41FullDecodePrepareKernel(
         const FastllmV41FullDecodeRequest *requests, V41DecodeTransformDescriptor *transforms,
         V41DecodeIndexDescriptor *index, V41AttentionDescriptor *attention,
         float *indexScores, float *blockScores, float *attentionScores, int tiles,
-        V41RopeTable rope, int *candidateBlocks, int *candidateCounts) {
-    const int token = blockIdx.y;
+        V41RopeTable rope, int *candidateBlocks, int *candidateCounts, int rowOffset) {
+    const int token = rowOffset + blockIdx.y;
     if (blockIdx.x == 0 && threadIdx.x == 0)
         V41FullDecodeSetupRow(token, c, b, requests, transforms, index, attention,
                              indexScores, blockScores, attentionScores, tiles,
@@ -7127,27 +7163,29 @@ __global__ void V41FullVerifyGather(FastllmV41FullDecodeConfig c,
         FastllmV41FullDecodeBuffers b, const FastllmV41FullDecodeRequest *requests) {
     const int row = blockIdx.x, d = threadIdx.x;
     const auto r = requests[row];
-    const int tail = requests[0].position % c.ratio;
+    const int begin = r.chunkBegin, localRow = row - begin;
+    const int tail = requests[begin].position % c.ratio;
+    const size_t savedRow = size_t(2) * begin + tail + localRow;
     const float value = static_cast<const float *>(b.rawKV)[(size_t)row * 512 + d];
-    static_cast<float *>(b.savedRawKV)[(size_t)(tail + row) * 512 + d] = value;
+    static_cast<float *>(b.savedRawKV)[(size_t)savedRow * 512 + d] = value;
     if (c.ratio == 1) {
         static_cast<float *>(b.joined)[(size_t)row * 512 + d] = value;
         return;
     }
     const float score = static_cast<const float *>(b.rawScore)[(size_t)row * 512 + d];
     const bool ready = (r.position + 1) % c.ratio == 0;
-    const float previous = row ? static_cast<const float *>(b.rawKV)[(size_t)(row - 1) * 512 + d]
+    const float previous = localRow ? static_cast<const float *>(b.rawKV)[(size_t)(row - 1) * 512 + d]
                                : (tail ? static_cast<const float *>(r.rawTailKV)[d] : value);
-    const float previousScore = row ? static_cast<const float *>(b.rawScore)[(size_t)(row - 1) * 512 + d]
+    const float previousScore = localRow ? static_cast<const float *>(b.rawScore)[(size_t)(row - 1) * 512 + d]
                                     : (tail ? static_cast<const float *>(r.rawTailScore)[d] : score);
     static_cast<float *>(b.joined)[(size_t)row * 1024 + d] = ready ? previous : value;
     static_cast<float *>(b.joined)[(size_t)row * 1024 + 512 + d] = value;
     static_cast<float *>(b.scores)[(size_t)row * 1024 + d] = ready ? previousScore : score;
     static_cast<float *>(b.scores)[(size_t)row * 1024 + 512 + d] = score;
-    static_cast<float *>(b.savedRawScore)[(size_t)(tail + row) * 512 + d] = score;
-    if (row == 0 && tail) {
-        static_cast<float *>(b.savedRawKV)[d] = previous;
-        static_cast<float *>(b.savedRawScore)[d] = previousScore;
+    static_cast<float *>(b.savedRawScore)[(size_t)savedRow * 512 + d] = score;
+    if (localRow == 0 && tail) {
+        static_cast<float *>(b.savedRawKV)[size_t(2) * begin * 512 + d] = previous;
+        static_cast<float *>(b.savedRawScore)[size_t(2) * begin * 512 + d] = previousScore;
     }
 }
 
@@ -7177,7 +7215,7 @@ bool V41FullDecodeAttention(V41FullDecodePlan &p) {
 
 void *FastllmCudaV41CreateFullDecode(const FastllmV41FullDecodeConfig &c,
                                    const FastllmV41FullDecodeBuffers &b) {
-    if (FastllmCudaGraphIsCapturingFast() || c.batch <= 0 || c.batch > FastllmV41FullDecodeMaxBatch || c.heads <= 0 ||
+    if (FastllmCudaGraphIsCapturingFast() || c.batch <= 0 || c.heads <= 0 ||
         c.indexHeads <= 0 || c.ratio < 0 || c.ratio > 2 || c.window <= 0 ||
         c.maxKeys <= 0 || c.topK <= 0 || c.topK > c.maxKeys || c.blockSize <= 0 ||
         c.ropeDim <= 0 || c.ropeDim > 128 || (c.ropeDim & 1) ||
@@ -7198,6 +7236,8 @@ void *FastllmCudaV41CreateFullDecode(const FastllmV41FullDecodeConfig &c,
     auto p = std::make_unique<V41FullDecodePlan>();
     p->config = c; p->config.vectorUnpack = V41Fp4VecUnpack();
     p->buffers = b; p->device = FastllmCudaGetDevice();
+    if (cudaDeviceGetAttribute(&p->gridY, cudaDevAttrMaxGridDimY, p->device) != cudaSuccess || p->gridY < 2)
+        return nullptr;
     p->tiles = (c.window + (c.ratio ? c.topK : 0) + kMmaNC - 1) / kMmaNC;
     const int heads = (c.heads + kMmaHeads - 1) / kMmaHeads;
     // Verification rows use the same independent QK tiles and value-dimension
@@ -7205,7 +7245,7 @@ void *FastllmCudaV41CreateFullDecode(const FastllmV41FullDecodeConfig &c,
     // intact while exposing enough CTAs for small batches (including TP8).
     // Large verification batches already have enough independent CTAs and
     // retain the fused path; DSpark verification chunks contain 2--8 rows.
-    p->splits = (c.verifying && c.batch > 8) || c.batch * heads >= 128 ? 1 :
+    p->splits = (c.verifying && c.batch > 8) || int64_t(c.batch) * heads >= 128 ? 1 :
                 c.batch >= 64 ? 2 : 8;
     // Dynamic descriptors also feed the ordinary scalar kernels. A missing
     // BF16 tensor-core image (e.g. SM75) must not disable the whole graph.
@@ -7247,7 +7287,7 @@ void *FastllmCudaV41CreateFullDecode(const FastllmV41FullDecodeConfig &c,
         V41MmaKernelReady<V41IndexerScoreDecodeMmaKernel<true, true, false, false, false, true>, 256>();
     if (p->fuseIndexBlocks && p->indexPrefetch &&
         !V41MmaKernelReady<V41IndexerScoreDecodeMmaKernel<true, true, false, false, true, true>, 256>()) p->indexPrefetch = false;
-    p->indexPairs = !c.indexMode && c.verifying && c.batch >= 2 && c.batch <= 8 && c.indexSource &&
+    p->indexPairs = !c.indexMode && c.verifying && !c.segmentedVerify && c.batch >= 2 && c.batch <= 8 && c.indexSource &&
         !c.useCandidates && c.indexHeads <= 32 &&
         V41MmaKernelReady<V41IndexerScorePairKernel<false>, 256, sizeof(V41PairedIndexShared)>() &&
         (!p->fuseIndexBlocks ||
@@ -7338,10 +7378,24 @@ bool V41ValidateFullDecodeRequests(const V41FullDecodePlan *p,
     const auto &c = p->config;
     for (size_t i = 0; i < count; ++i) {
         const auto &r = requests[i];
-        if (c.verifying && (r.position != requests[0].position + (int)i ||
-            r.windowKV != requests[0].windowKV || r.compressedKV != requests[0].compressedKV ||
-            r.indexK != requests[0].indexK || r.rawTailKV != requests[0].rawTailKV ||
-            r.rawTailScore != requests[0].rawTailScore)) return false;
+        if (c.verifying) {
+            const int begin = r.chunkBegin, length = r.chunkLength > 0 ? r.chunkLength : c.batch;
+            if (begin < 0 || begin > (int)i || length < 1 || length > c.batch - begin ||
+                (int)i >= begin + length || (!c.segmentedVerify && (begin || length != c.batch))) return false;
+            const auto &first = requests[begin];
+            if (first.chunkBegin != begin || first.chunkLength != r.chunkLength ||
+                r.position != first.position + (int)i - begin ||
+                r.windowKV != first.windowKV || r.compressedKV != first.compressedKV ||
+                r.indexK != first.indexK || r.rawTailKV != first.rawTailKV ||
+                r.rawTailScore != first.rawTailScore) return false;
+            if ((int)i == begin && begin > 0) {
+                const auto &previous = requests[begin - 1];
+                if (previous.chunkBegin + previous.chunkLength != begin) return false;
+                // Distinct causal chunks cannot write the same ring concurrently.
+                for (int j = 0; j < begin; j += requests[j].chunkLength)
+                    if (requests[j].chunkLength < 1 || requests[j].windowKV == r.windowKV) return false;
+            }
+        }
         if (r.position < 1 || !r.windowKV || (c.ratio &&
             (!r.compressedKV || (r.position + 1LL) / c.ratio > c.maxKeys)) ||
             (c.indexSource && !r.indexK) ||
@@ -7390,14 +7444,45 @@ bool FastllmCudaV41UploadFullDecode(void *handle, const FastllmV41FullDecodeRequ
     return true;
 }
 
+namespace {
+// Chunk physical grid.y only. Descriptors and causal chunks keep global row
+// offsets; no logical request/verification batch is truncated or padded.
+template<class F> void V41FullDecodeRowTiles(int rows, int gridY, F &&run) {
+    for (int begin = 0; begin < rows;) {
+        const int count = std::min(rows - begin, gridY);
+        run(begin, count);
+        begin += count;
+    }
+}
+V41TopKWorkspace V41FullDecodeTopKSlice(V41TopKWorkspace w, int begin) {
+    const size_t entries = size_t(begin) * w.parts * w.width;
+    if (w.scores) w.scores += entries;
+    if (w.indices) w.indices += entries;
+    if (w.valid) w.valid += entries;
+    if (w.histograms) w.histograms += size_t(begin) * w.parts * kTopKCoarseStride;
+    if (w.counts) w.counts += begin;
+    if (w.offsets) w.offsets += size_t(begin) * (w.parts + 1);
+    return w;
+}
+template<int COMBINED = 1>
+void V41FullDecodeTransforms(const V41FullDecodePlan &p, int slot, int columns) {
+    V41FullDecodeRowTiles(p.config.batch, p.gridY / COMBINED, [&](int begin, int rows) {
+        V41DecodeTransformsKernel<kFullDecodeTransforms, COMBINED><<<dim3(columns, rows * COMBINED), 512, 0, cudaStreamPerThread>>>(
+            p.transforms + size_t(begin) * kFullDecodeTransforms + slot, p.rope, p.config.ropeDim, p.config.window);
+    });
+}
+} // namespace
+
 bool FastllmCudaV41PrepareFullDecode(void *handle) {
     auto *p = static_cast<V41FullDecodePlan *>(handle);
     if (!p || FastllmCudaGetDevice() != p->device) return false;
     const auto &c = p->config; const auto &b = p->buffers;
-    V41FullDecodePrepareKernel<<<dim3(c.heads + 1, c.batch), 512, 0, cudaStreamPerThread>>>(
-        c, b, p->requests, p->transforms, p->index, p->attention,
-        p->indexScores, p->blockScores, p->attentionScores, p->tiles, p->rope,
-        p->candidateBlocks, p->candidateCounts);
+    V41FullDecodeRowTiles(c.batch, p->gridY, [&](int begin, int rows) {
+        V41FullDecodePrepareKernel<<<dim3(c.heads + 1, rows), 512, 0, cudaStreamPerThread>>>(
+            c, b, p->requests, p->transforms, p->index, p->attention,
+            p->indexScores, p->blockScores, p->attentionScores, p->tiles, p->rope,
+            p->candidateBlocks, p->candidateCounts, begin);
+    });
     if (c.ringMode)
         V41FullVerifyPackWindow<<<c.batch, kKvQuantThreads, 0, cudaStreamPerThread>>>(c, b);
     if (c.kvSource) {
@@ -7420,90 +7505,94 @@ bool FastllmCudaV41FinishFullDecode(void *handle) {
     if (!p || FastllmCudaGetDevice() != p->device) return false;
     const auto &c = p->config; const auto &b = p->buffers;
     if (c.kvSource) {
-        V41DecodeTransformsKernel<kFullDecodeTransforms><<<dim3(1, c.batch), 512, 0, cudaStreamPerThread>>>(p->transforms + 2, p->rope, c.ropeDim, c.window);
+        V41FullDecodeTransforms(*p, 2, 1);
         if (c.indexSource)
-            V41DecodeTransformsKernel<kFullDecodeTransforms><<<dim3(1, c.batch), 512, 0, cudaStreamPerThread>>>(p->transforms + 3, p->rope, c.ropeDim, c.window);
+            V41FullDecodeTransforms(*p, 3, 1);
         if (c.ringMode)
             V41FullDecodeAppendPacked<<<c.batch, kKvQuantThreads, 0, cudaStreamPerThread>>>(c, b, p->requests);
         else V41FullDecodeAppend<<<c.batch, 512, 0, cudaStreamPerThread>>>(p->requests,
             static_cast<const __nv_bfloat16 *>(b.latents), static_cast<const __nv_bfloat16 *>(b.newIndexKeys), c.ratio, c.indexSource);
     }
     if (c.indexSource) {
-        V41DecodeTransformsKernel<kFullDecodeTransforms><<<dim3((c.indexHeads + 3) / 4, c.batch), 512, 0, cudaStreamPerThread>>>(p->transforms + 4, p->rope, c.ropeDim, c.window);
-        if (p->scalarIndex) {
-            if (V41IsSm75() && c.batch <= 8 && c.indexHeads == 32) {
-                V41IndexerScoreSmallBatch<__nv_bfloat16, __nv_bfloat16, true><<<
-                    dim3((c.maxKeys + 7) / 8, c.batch), 256, 0, cudaStreamPerThread>>>(
-                    nullptr, nullptr, nullptr, 1, 0, nullptr, nullptr, 0, 0, p->index);
+        V41FullDecodeTransforms(*p, 4, (c.indexHeads + 3) / 4);
+        V41FullDecodeRowTiles(c.batch, p->gridY, [&](int begin, int rows) {
+            auto *index = p->index + begin;
+            const auto topKWorkspace = V41FullDecodeTopKSlice(p->topKWorkspace, begin);
+            if (p->scalarIndex) {
+                if (V41IsSm75() && c.batch <= 8 && c.indexHeads == 32) {
+                    V41IndexerScoreSmallBatch<__nv_bfloat16, __nv_bfloat16, true><<<
+                        dim3((c.maxKeys + 7) / 8, rows), 256, 0, cudaStreamPerThread>>>(
+                        nullptr, nullptr, nullptr, 1, 0, nullptr, nullptr, 0, 0, index);
+                } else {
+                    V41IndexerScoreKernel<__nv_bfloat16, __nv_bfloat16, true><<<
+                        dim3((c.maxKeys + kIdxThreads - 1) / kIdxThreads, rows), kIdxThreads,
+                        size_t(c.indexHeads) * 129 * sizeof(float), cudaStreamPerThread>>>(
+                        nullptr, nullptr, nullptr, 1, c.indexHeads, 128, 0, nullptr, nullptr, 0, 0, index);
+                }
+            } else if (p->indexPairs) {
+                if (p->indexPairNarrow)
+                    V41LaunchIndexerScorePair<128>(index, rows, c.ratio, p->fuseIndexBlocks);
+                else
+                    V41LaunchIndexerScorePair<256>(index, rows, c.ratio, p->fuseIndexBlocks);
+            } else if (p->fuseIndexBlocks) {
+                if (p->indexPrefetch) {
+                    V41IndexerScoreDecodeMmaKernel<true, true, false, false, true, true><<<dim3(128, rows), 256, 0, cudaStreamPerThread>>>(
+                        nullptr, nullptr, nullptr, 0, 0, c.ratio, 0, nullptr, nullptr, 0, 0, 0, index);
+                } else {
+                    V41IndexerScoreDecodeMmaKernel<true, true, false, false, false, true><<<dim3(128, rows), 256, 0, cudaStreamPerThread>>>(
+                        nullptr, nullptr, nullptr, 0, 0, c.ratio, 0, nullptr, nullptr, 0, 0, 0, index);
+                }
+            } else if (p->candidateBlocks) {
+                if (!b.reuseCandidates)
+                    V41CompactIndexCandidates<<<rows, 256, 0, cudaStreamPerThread>>>(index, c.blockSize, c.ratio);
+                V41IndexerScoreDecodeMmaKernel<true, true, false, true><<<dim3(128, rows), 256, 0, cudaStreamPerThread>>>(
+                    nullptr, nullptr, nullptr, 0, 0, c.ratio, 0, nullptr, nullptr, 0, 0, 0, index);
+            } else if (p->indexPrefetch) {
+                V41IndexerScoreDecodeMmaKernel<true, true, false, false, true><<<dim3(128, rows), 256, 0, cudaStreamPerThread>>>(
+                    nullptr, nullptr, nullptr, 0, 0, c.ratio, 0, nullptr, nullptr, 0, 0, 0, index);
             } else {
-                V41IndexerScoreKernel<__nv_bfloat16, __nv_bfloat16, true><<<
-                    dim3((c.maxKeys + kIdxThreads - 1) / kIdxThreads, c.batch), kIdxThreads,
-                    size_t(c.indexHeads) * 129 * sizeof(float), cudaStreamPerThread>>>(
-                    nullptr, nullptr, nullptr, 1, c.indexHeads, 128, 0, nullptr, nullptr, 0, 0, p->index);
+                V41IndexerScoreDecodeMmaKernel<true, true><<<dim3(128, rows), 256, 0, cudaStreamPerThread>>>(
+                    nullptr, nullptr, nullptr, 0, 0, c.ratio, 0, nullptr, nullptr, 0, 0, 0, index);
             }
-        } else if (p->indexPairs) {
-            if (p->indexPairNarrow)
-                V41LaunchIndexerScorePair<128>(p->index, c.batch, c.ratio, p->fuseIndexBlocks);
-            else
-                V41LaunchIndexerScorePair<256>(p->index, c.batch, c.ratio, p->fuseIndexBlocks);
-        } else if (p->fuseIndexBlocks) {
-            if (p->indexPrefetch) {
-                V41IndexerScoreDecodeMmaKernel<true, true, false, false, true, true><<<dim3(128, c.batch), 256, 0, cudaStreamPerThread>>>(
-                    nullptr, nullptr, nullptr, 0, 0, c.ratio, 0, nullptr, nullptr, 0, 0, 0, p->index);
-            } else {
-                V41IndexerScoreDecodeMmaKernel<true, true, false, false, false, true><<<dim3(128, c.batch), 256, 0, cudaStreamPerThread>>>(
-                    nullptr, nullptr, nullptr, 0, 0, c.ratio, 0, nullptr, nullptr, 0, 0, 0, p->index);
+            if (c.writeCandidates) {
+                if (!p->fuseIndexBlocks)
+                    V41BlockScoreKernel<true><<<rows, 256, 0, cudaStreamPerThread>>>(nullptr, 1, 0, c.blockSize, 0, c.ratio, 0, nullptr, index);
+                if (p->wideCandidateSelect) {
+                    V41CandidateSelectKernel<true, 1024><<<rows, 1024, 0, cudaStreamPerThread>>>(nullptr, 0, c.candidateTopK, nullptr, index);
+                } else {
+                    V41CandidateSelectKernel<true><<<rows, kSelThreads, 0, cudaStreamPerThread>>>(nullptr, 0, c.candidateTopK, nullptr, index);
+                }
             }
-        } else if (p->candidateBlocks) {
-            if (!b.reuseCandidates)
-                V41CompactIndexCandidates<<<c.batch, 256, 0, cudaStreamPerThread>>>(p->index, c.blockSize, c.ratio);
-            V41IndexerScoreDecodeMmaKernel<true, true, false, true><<<dim3(128, c.batch), 256, 0, cudaStreamPerThread>>>(
-                nullptr, nullptr, nullptr, 0, 0, c.ratio, 0, nullptr, nullptr, 0, 0, 0, p->index);
-        } else if (p->indexPrefetch) {
-            V41IndexerScoreDecodeMmaKernel<true, true, false, false, true><<<dim3(128, c.batch), 256, 0, cudaStreamPerThread>>>(
-                nullptr, nullptr, nullptr, 0, 0, c.ratio, 0, nullptr, nullptr, 0, 0, 0, p->index);
-        } else {
-            V41IndexerScoreDecodeMmaKernel<true, true><<<dim3(128, c.batch), 256, 0, cudaStreamPerThread>>>(
-                nullptr, nullptr, nullptr, 0, 0, c.ratio, 0, nullptr, nullptr, 0, 0, 0, p->index);
-        }
-        if (c.writeCandidates) {
-            if (!p->fuseIndexBlocks)
-                V41BlockScoreKernel<true><<<c.batch, 256, 0, cudaStreamPerThread>>>(nullptr, 1, 0, c.blockSize, 0, c.ratio, 0, nullptr, p->index);
-            if (p->wideCandidateSelect) {
-                V41CandidateSelectKernel<true, 1024><<<c.batch, 1024, 0, cudaStreamPerThread>>>(nullptr, 0, c.candidateTopK, nullptr, p->index);
-            } else {
-                V41CandidateSelectKernel<true><<<c.batch, kSelThreads, 0, cudaStreamPerThread>>>(nullptr, 0, c.candidateTopK, nullptr, p->index);
-            }
-        }
-        if (p->topKWorkspace.global) {
-            V41TopKGlobalArgs a{nullptr, nullptr, 1, 0, 0, c.blockSize, p->blockShift,
-                0, c.ratio, 0, p->listCap, nullptr, p->index};
-            V41LaunchGlobalTopK<true>(a, p->topKWorkspace, c.batch);
-        } else if (p->topKWorkspace.compactCandidates) {
-            V41TopKCandidateGather<<<dim3(p->topKWorkspace.parts, c.batch), 256,
-                (size_t)p->listCap * sizeof(int), cudaStreamPerThread>>>(
-                p->index, c.ratio, c.blockSize, p->blockShift, p->listCap, p->topKWorkspace);
-            V41TopKKernel<true, 2, 1024><<<c.batch, 1024, 0, cudaStreamPerThread>>>(
-                nullptr, nullptr, 1, 0, 0, c.blockSize, p->blockShift, 0, c.ratio, 0,
-                p->listCap, nullptr, p->index, p->topKWorkspace);
-        } else if (p->topKMemory) {
-            V41TopKKernel<true, 1><<<dim3(p->topKWorkspace.parts, c.batch), kSelThreads,
-                (size_t)p->listCap * sizeof(int), cudaStreamPerThread>>>(
-                nullptr, nullptr, 1, 0, 0, c.blockSize, p->blockShift, 0, c.ratio, 0,
-                p->listCap, nullptr, p->index, p->topKWorkspace);
-            if (p->wideTopKMerge) {
-                V41TopKKernel<true, 2, 1024><<<c.batch, 1024, 0, cudaStreamPerThread>>>(
+            if (topKWorkspace.global) {
+                V41TopKGlobalArgs a{nullptr, nullptr, 1, 0, 0, c.blockSize, p->blockShift,
+                    0, c.ratio, 0, p->listCap, nullptr, index};
+                V41LaunchGlobalTopK<true>(a, topKWorkspace, rows);
+            } else if (topKWorkspace.compactCandidates) {
+                V41TopKCandidateGather<<<dim3(topKWorkspace.parts, rows), 256,
+                    (size_t)p->listCap * sizeof(int), cudaStreamPerThread>>>(
+                    index, c.ratio, c.blockSize, p->blockShift, p->listCap, topKWorkspace);
+                V41TopKKernel<true, 2, 1024><<<rows, 1024, 0, cudaStreamPerThread>>>(
                     nullptr, nullptr, 1, 0, 0, c.blockSize, p->blockShift, 0, c.ratio, 0,
-                    p->listCap, nullptr, p->index, p->topKWorkspace);
-            } else {
-                V41TopKKernel<true, 2><<<c.batch, kSelThreads, 0, cudaStreamPerThread>>>(
+                    p->listCap, nullptr, index, topKWorkspace);
+            } else if (p->topKMemory) {
+                V41TopKKernel<true, 1><<<dim3(topKWorkspace.parts, rows), kSelThreads,
+                    (size_t)p->listCap * sizeof(int), cudaStreamPerThread>>>(
                     nullptr, nullptr, 1, 0, 0, c.blockSize, p->blockShift, 0, c.ratio, 0,
-                    p->listCap, nullptr, p->index, p->topKWorkspace);
+                    p->listCap, nullptr, index, topKWorkspace);
+                if (p->wideTopKMerge) {
+                    V41TopKKernel<true, 2, 1024><<<rows, 1024, 0, cudaStreamPerThread>>>(
+                        nullptr, nullptr, 1, 0, 0, c.blockSize, p->blockShift, 0, c.ratio, 0,
+                        p->listCap, nullptr, index, topKWorkspace);
+                } else {
+                    V41TopKKernel<true, 2><<<rows, kSelThreads, 0, cudaStreamPerThread>>>(
+                        nullptr, nullptr, 1, 0, 0, c.blockSize, p->blockShift, 0, c.ratio, 0,
+                        p->listCap, nullptr, index, topKWorkspace);
+                }
+            } else {
+                V41TopKKernel<true, 0, 1024><<<rows, 1024, (size_t)p->listCap * sizeof(int), cudaStreamPerThread>>>(
+                    nullptr, nullptr, 1, 0, 0, c.blockSize, p->blockShift, 0, c.ratio, 0, p->listCap, nullptr, index, {});
             }
-        } else {
-            V41TopKKernel<true, 0, 1024><<<c.batch, 1024, (size_t)p->listCap * sizeof(int), cudaStreamPerThread>>>(
-                nullptr, nullptr, 1, 0, 0, c.blockSize, p->blockShift, 0, c.ratio, 0, p->listCap, nullptr, p->index, {});
-        }
+        });
     }
     const int *fallbackRows = nullptr;
 #ifdef FASTLLM_V41_FP16_ATTENTION
@@ -7544,9 +7633,9 @@ bool FastllmCudaV41FinishFullDecode(void *handle) {
     if (!attentionOk) return false;
     // Independent descriptors share one launch; each row retains its original math.
     if (c.verifying || c.ringMode) {
-        V41DecodeTransformsKernel<kFullDecodeTransforms><<<dim3(c.heads, c.batch), 512, 0, cudaStreamPerThread>>>(p->transforms, p->rope, c.ropeDim, c.window);
+        V41FullDecodeTransforms(*p, 0, c.heads);
     } else {
-        V41DecodeTransformsKernel<kFullDecodeTransforms, 2><<<dim3(c.heads, c.batch * 2), 512, 0, cudaStreamPerThread>>>(p->transforms, p->rope, c.ropeDim, c.window);
+        V41FullDecodeTransforms<2>(*p, 0, c.heads);
     }
     if (!c.verifying && c.ringMode)
         V41FullDecodeStorePackedRing<<<c.batch, 256, 0, cudaStreamPerThread>>>(c, b, p->requests);

@@ -1,6 +1,7 @@
 #include "fastllm.h"
 #include "executor.h"
 #include "utils.h"
+#include "utils/kernel_registry.h"
 #include "fastllm-cuda.cuh"
 #include "devices/cuda/fastllm-v41-full-decode.h"
 #include <thread>
@@ -371,9 +372,8 @@ static void CheckNumasPrefill(std::vector<Data *> *weights, int tables) {
         input.CopyFrom(cpuInput);
         input.ToDevice(CUDA, std::vector<int>{0});
         Data expected[3], actual[3];
-        // Use the same CPU/GPU partition and BF16 rounding in the reference,
-        // with an explicit device barrier after each layer. An all-CPU result
-        // has a different partial-sum rounding boundary in mixed execution.
+        // Check stream dependencies independently of the partition arithmetic,
+        // with an explicit device barrier after each reference layer.
         for (int layer = 0; layer < 3; ++layer) {
             RunNumasMoe(layer ? expected[layer - 1] : input, index, scores,
                         expected[layer], weights[layer % tables], layer);
@@ -391,6 +391,17 @@ static void CheckNumasPrefill(std::vector<Data *> *weights, int tables) {
                 "NUMA hybrid prefill chain differs from serialized output bits");
             ++cases;
         }
+        if (weights[0][2]->dataType == NVFP4_BLOCK_32_E8M0) {
+            Data oracle[3];
+            for (int layer = 0; layer < 3; ++layer) {
+                RunNumasMoe(layer ? oracle[layer - 1] : cpuInput, index, scores,
+                            oracle[layer], weights[layer % tables], layer);
+                oracle[layer].ToDevice(CPU);
+                const bool exact = oracle[layer].GetBytes() == actual[layer].GetBytes() &&
+                    std::memcmp(oracle[layer].cpuData, actual[layer].cpuData, actual[layer].GetBytes()) == 0;
+                Require(exact, "NVFP4 prefill partition changed BF16 rounding");
+            }
+        }
         // Also drain asynchronous reduction before shape changes / teardown.
         ClearNumasMoeRuntimeCache();
     }
@@ -402,7 +413,8 @@ static void CheckCompleteNativeGraphs(std::vector<Data *> &weights, int layer) {
     const int device = FastllmCudaGetDevice();
     Require(FastllmCudaMoeCacheFullyResident(weights.data(), weights.size()), "complete cache not recognized");
     int checks = 0;
-    for (int rows : {1, 2, 3, 5, 7, 8, 9, 16, 31, 32}) for (int topk : {1, 3, 6, 16}) {
+    for (int rows : {1, 2, 3, 5, 7, 8, 9, 16, 31, 32, 40, 65, 129, 4097}) for (int topk : {1, 3, 6, 16}) {
+        if (rows == 4097 && topk != 16) continue; // Cross the physical grid.y capacity.
         Data input(BFLOAT16, {rows, hidden}), ids(INT32, {rows, topk}), scores(FLOAT32, {rows, topk}), output;
         Gpu(input, device); Gpu(ids, device); Gpu(scores, device);
         std::vector<uint16_t> x(rows * hidden), expected(x.size()), actual(x.size());
@@ -444,13 +456,19 @@ static void CheckCompleteNativeGraphs(std::vector<Data *> &weights, int layer) {
         }
         cudaGraphExecDestroy(exec); cudaGraphDestroy(graph); FastllmCudaGraphMemoryPoolRelease(reserved);
     }
-    std::printf("COMPLETE_NATIVE_GRAPH_PASS %d replays, rows 1..32, topk 1/3/6/16\n", checks);
+    std::printf("COMPLETE_NATIVE_GRAPH_PASS %d replays, rows 1..4097, topk 1/3/6/16\n", checks);
 }
 
 static void CheckVerifierMailbox(std::vector<Data *> *weights) {
     const int hidden=weights[0][2]->dims[1], experts=weights[0].size()/2-1, topk=6;
+    const bool prepare = weights[0][2]->dataType == NVFP4_BLOCK_32_E8M0;
+    if (prepare) {
+        std::string error;
+        Require(kernels::Configure(R"({"mode":"quick","families":["moe.nvfp4.gate_swiglu_down"]})", error),
+            "verifier kernel policy configuration");
+    }
     int checks=0;
-    for (int rows : {2,3,5,6,8,9,16,32}) {
+    for (int rows : {2,3,5,6,8,9,12,16,17,24,32,48,65}) {
         Data input(BFLOAT16,{rows,hidden}), ids[2], scores[2], output[2]; Gpu(input);
         for(int l=0;l<2;++l){ids[l].dataType=INT32;ids[l].Resize({rows,topk});Gpu(ids[l]);
             scores[l].dataType=FLOAT32;scores[l].Resize({rows,topk});Gpu(scores[l]);
@@ -475,10 +493,27 @@ static void CheckVerifierMailbox(std::vector<Data *> *weights) {
         }
         input.Resize({rows, hidden - 32}); rejected(output[0]); input.Resize({rows, hidden});
         rejected(input); rejected(ids[0]); rejected(scores[0]);
+        if (prepare) {
+            for (int l=0;l<2;++l)
+                FastllmCudaPrepareNativeMoeKernelPlan(weights[l].data(), weights[l].size(), rows, topk);
+            std::string error;
+            const auto report = json11::Json::parse(kernels::Report(), error);
+            bool ready = false;
+            for (const auto &record : report["records"].array_items())
+                if (record["shape"][3].int_value() == rows && record["shape"][6].int_value() == topk)
+                    ready |= record["source"].string_value() != "fallback";
+            Require(error.empty() && ready, "expert plan missing before parent graph pool");
+        }
+        Require(FastllmCudaGraphMemoryPoolBegin(), "verifier parent graph pool");
+        const auto beforePrepare = kernels::Report();
+        FastllmCudaPrepareNativeMoeKernelPlan(weights[0].data(), weights[0].size(), rows + 100, topk);
+        Require(kernels::Report() == beforePrepare, "expert preparation entered active graph pool");
         for(int l=0;l<2;++l){
             handles[l]=FastllmCudaCreateNativeMoeFullGraph(l?output[0]:input,ids[l],scores[l],output[l],
                 weights[l].data(),weights[l].size(),l,shared,&children[l]);
             Require(handles[l]&&children[l],"verifier mailbox creation");}
+        std::vector<void *> reserved;
+        Require(FastllmCudaGraphMemoryPoolEnd(reserved), "verifier parent graph pool end");
         Check(cudaGraphDestroy(shared));
         Require(FastllmCudaGraphCompose(const_cast<const void *const *>(children),2,&graph,&exec),"verifier compose");
         Require(FastllmCudaCreateNativeMoeReplayGraph(graph,handles,2,&untimed),"verifier untimed compose");
@@ -507,8 +542,11 @@ static void CheckVerifierMailbox(std::vector<Data *> *weights) {
                 Compare(actual,expected[l],"verifier mailbox/NUMA oracle mismatch");++checks;}
         }
         FastllmCudaGraphExecDestroy(untimed);FastllmCudaGraphExecDestroy(exec);FastllmCudaGraphDestroy(graph);
+        for (void *handle : handles) FastllmCudaReleaseNativeMoeFullGraph(handle);
+        FastllmCudaGraphMemoryPoolRelease(reserved);
     }
-    std::printf("VERIFY_MAILBOX_GRAPH_PASS %d dependent layer checks; rows 2/3/5/6/8/9/16/32\n",checks);
+    if (prepare) { std::string error; Require(kernels::Configure(R"({"mode":"off"})", error), "reset kernel policy"); }
+    std::printf("VERIFY_MAILBOX_GRAPH_PASS %d dependent layer checks; rows 2/3/5/6/8/9/12/16/17/24/32/48/65\n",checks);
 }
 
 // A cache concentrated on one GPU must not disable the other prefill worker.
@@ -679,7 +717,7 @@ int main(int argc, char **argv) {
         int devices = 0;
         Check(cudaGetDeviceCount(&devices));
         if (option("--resident-budget-only") && devices < 2) return 77;
-        Require((!dual && !option("--pp-fullgraph")) || devices >= 2, "--dual requires two CUDA devices");
+        if ((dual || option("--pp-fullgraph")) && devices < 2) return 77;
         unsetenv("FASTLLM_MOE_CUDA_CACHE_BYTES_0");
         unsetenv("FASTLLM_MOE_CUDA_CACHE_BYTES_1");
         unsetenv("FASTLLM_DSV41_MOE_CACHE_MODE");
@@ -1264,8 +1302,9 @@ int main(int argc, char **argv) {
         setenv("FASTLLM_DSV41_MOE_CACHE_PREFETCH", "0", 1);
         int verifyChecks = 0;
         Data verifyOutput;
-        for (int pass = 0; pass < 21; ++pass) {
-            const int t = pass % tables, rows = std::vector<int>{8, 2, 3, 4, 5, 6, 7}[pass % 7];
+        const std::vector<int> verifyRows{8, 2, 3, 5, 7, 9, 12, 17, 24, 33, 65};
+        for (int pass = 0; pass < 3 * int(verifyRows.size()); ++pass) {
+            const int t = pass % tables, rows = verifyRows[pass % verifyRows.size()];
             const int base = pass * 7 % experts;
             std::vector<float> x(rows * hidden), route(rows * topk), expected(rows * hidden);
             std::vector<int32_t> ids(rows * topk);
@@ -1414,10 +1453,10 @@ int main(int argc, char **argv) {
                 Require(!runVerify(),
                         "verify wrong dtype accepted");
                 bx.dataType = BFLOAT16;
-                bx.dims[0] = bi.dims[0] = bs.dims[0] = 32;
-                Require(!runVerify(),
-                        "verify oversized batch accepted");
-                bx.dims[0] = bi.dims[0] = bs.dims[0] = rows;
+                // Reject inconsistent routing, not a particular batch length.
+                bi.dims[0] = rows + 1;
+                Require(!runVerify(), "verify mismatched routing rows accepted");
+                bi.dims[0] = rows;
                 Check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
                 const bool captureAccepted = runVerify();
                 cudaGraph_t graph;

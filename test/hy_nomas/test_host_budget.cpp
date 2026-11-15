@@ -21,14 +21,23 @@ struct Fixture {
         index<<"{\"weight_map\":{\"w\":\"a.safetensors\",\"v\":\"b.safetensors\"}}";
         require(bool(index),"fixture index write failed");
     }
-    void write(const std::string &file,const std::string &name) const {
-        std::string header="{\""+name+"\":{\"dtype\":\"F32\",\"shape\":[256,24576],\"data_offsets\":[0,"+
-            std::to_string(values.size()*4)+"]}}";
+    template<class T>
+    void writeTensor(const std::string &file,const std::string &name,const char *dtype,
+                     const std::vector<T> &data) const {
+        const size_t bytes=data.size()*sizeof(T);
+        std::string header="{\""+name+"\":{\"dtype\":\""+dtype+"\",\"shape\":[256,24576],\"data_offsets\":[0,"+
+            std::to_string(bytes)+"]}}";
         uint64_t length=header.size();
         std::ofstream f(file,std::ios::binary);
         f.write(reinterpret_cast<char *>(&length),8);f<<header;
-        f.write(reinterpret_cast<const char *>(values.data()),values.size()*4);
+        f.write(reinterpret_cast<const char *>(data.data()),bytes);
         require(bool(f),"fixture write failed");
+    }
+    void write(const std::string &file,const std::string &name) const {
+        writeTensor(file,name,"F32",values);
+    }
+    void writeBf16(const std::string &file,const std::string &name,uint16_t value) const {
+        writeTensor(file,name,"BF16",std::vector<uint16_t>(values.size(),value));
     }
     ~Fixture() { std::error_code error;std::filesystem::remove_all(directory,error); }
 };
@@ -99,6 +108,31 @@ int main() {
             }
             require(quota->used()==0,"recovered loader leaked quota");
         }
-        std::cout<<"PASS shared host budget, disk fallback, partitions, checkpoint shards and failed-read recovery\n";
+        {
+            // A bounded device cache must retain only the admitted checkpoint
+            // bytes across clear(true); uncached tensors still read the file.
+            Runtime bf16(0,DType::BF16);
+            TensorPool pool(0,0,size_t(64)<<20,true);
+            TensorPool::Scope scope(pool);
+            f.writeBf16(f.path,"w",0x3f00); // 0.5
+            f.writeBf16(f.directory+"/b.safetensors","v",0x3f00);
+            Weights w(bf16,f.directory);
+            w.setHostMemoryBudget(std::make_shared<HostMemoryBudget>(0));
+            const size_t cap=f.values.size()*2;
+            require(w.enablePackedCache(size_t(16)<<20,cap),"new cache must request a serial fill");
+            require(!w.enablePackedCache(size_t(16)<<20,cap),"warm cache must not request another fill");
+            require(bf16.download(w.get("w"))==std::vector<float>(f.values.size(),.5f),"cached BF16 load");
+            require(bf16.download(w.get("v"))==std::vector<float>(f.values.size(),.5f),"uncached BF16 load");
+            w.clear(true);bf16.synchronize();
+            f.writeBf16(f.path,"w",0x3e80); // 0.25, deliberately change the test oracle on disk.
+            f.writeBf16(f.directory+"/b.safetensors","v",0x3e80);
+            require(bf16.download(w.get("w"))==std::vector<float>(f.values.size(),.5f),"device cache was not retained");
+            require(bf16.download(w.get("v"))==std::vector<float>(f.values.size(),.25f),"device cache exceeded explicit cap");
+            w.clear();bf16.synchronize();
+            require(!w.enablePackedCache(size_t(64)<<20,cap),"device cache consumed reserved workspace");
+            require(w.enablePackedCache(size_t(16)<<20,cap),"recreated cache must request a serial fill");
+            require(bf16.download(w.get("w"))==std::vector<float>(f.values.size(),.25f),"cache reset retained stale weights");
+        }
+        std::cout<<"PASS host/device budgets, disk fallback, cache retention, partitions and failed-read recovery\n";
     } catch(const std::exception &e) {std::cerr<<e.what()<<'\n';return 1;}
 }

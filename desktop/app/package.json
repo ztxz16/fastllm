@@ -1,7 +1,7 @@
 {
   "name": "fastllm-launcher-desktop",
   "productName": "FastLLM Launcher",
-  "version": "1.9.0",
+  "version": "1.9.1",
   "private": true,
   "description": "Portable desktop shell for the FastLLM deployment launcher",
   "main": "main.js"

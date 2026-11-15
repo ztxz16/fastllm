@@ -57,16 +57,81 @@ struct Probe : DeepSeekV41Model {
     }
 };
 
-static void TestIQ4NL() {
-    constexpr int rows = 1057, dim = 256, rowBytes = dim / 32 * 18;
+// Independent arithmetic oracle, including E4M3FN's two NaN codes and the
+// E8M0 reserved scale. Finite values also cover signed zero and subnormals.
+static float ReferenceMXFP8(uint8_t code, uint8_t scale) {
+    if ((code & 127) == 127 || scale == 255) return std::numeric_limits<float>::quiet_NaN();
+    const int exponent = (code >> 3) & 15, mantissa = code & 7;
+    const double value = exponent ? std::ldexp(double(8 + mantissa), exponent - 10)
+                                  : std::ldexp(double(mantissa), -9);
+    return float(std::ldexp(code & 128 ? -value : value, int(scale) - 127));
+}
+
+static void TestMXFP8Decode() {
+    Check(int(GGML_TYPE_MXFP8) == 43 && ggml_blck_size(GGML_TYPE_MXFP8) == 32 &&
+          ggml_row_size(GGML_TYPE_MXFP8, 256) == 264, "MXFP8 wire format");
+    const auto decode = ggml_type_to_float(GGML_TYPE_MXFP8);
+    Check(decode != nullptr, "MXFP8 decoder registration");
+    std::vector<block_mxfp8> blocks(8);
+    std::vector<float> actual(258, 123.f);
+    for (int scale = 0; scale < 256; ++scale) {
+        for (int code = 0; code < 256; ++code) {
+            blocks[code / 32].e = uint8_t(scale);
+            blocks[code / 32].qs[code % 32] = uint8_t(code);
+        }
+        decode(blocks.data(), actual.data() + 1, 256);
+        for (int code = 0; code < 256; ++code) {
+            const float expected = ReferenceMXFP8(code, scale), value = actual[code + 1];
+            Check(std::isnan(expected) ? std::isnan(value) :
+                  (value == expected && std::signbit(value) == std::signbit(expected)), "MXFP8 scalar oracle");
+        }
+        Check(actual.front() == 123.f && actual.back() == 123.f, "MXFP8 output guard");
+    }
+    decode(blocks.data(), actual.data(), 0);
+    Check(actual.front() == 123.f, "MXFP8 empty decode");
+    std::puts("PASS MXFP8: all 65536 value/scale pairs, signed zero, NaN and output guards");
+}
+
+static void TestGGUFRows(ggml_type type) {
+    constexpr int rows = 1057, dim = 256;
+    const size_t rowBytes = ggml_row_size(type, dim);
     const int codebook[] = {-127,-104,-83,-65,-49,-35,-22,-10,1,13,25,38,53,69,89,113};
     Fixture file;
     std::vector<uint8_t> packed(rows * rowBytes);
-    for (int r = 0; r < rows; ++r) for (int b = 0; b < dim / 32; ++b) {
-        auto *block = packed.data() + r * rowBytes + b * 18;
-        uint16_t d = float_to_half(std::ldexp(1.f, -8 + (r + b) % 5));
-        memcpy(block, &d, 2);
-        for (int i = 0; i < 16; ++i) block[2 + i] = uint8_t(r * 13 + b * 19 + i * 7);
+    std::vector<float> reference(rows * dim);
+    for (int r = 0; r < rows; ++r) {
+        auto *row = packed.data() + r * rowBytes;
+        float *expected = reference.data() + r * dim;
+        if (type == GGML_TYPE_IQ4_NL) {
+            for (int b = 0; b < dim / 32; ++b) {
+                auto *block = row + b * 18;
+                const float scale = std::ldexp(1.f, -8 + (r + b) % 5);
+                uint16_t d = float_to_half(scale);
+                memcpy(block, &d, 2);
+                for (int i = 0; i < 16; ++i) {
+                    block[2 + i] = uint8_t(r * 13 + b * 19 + i * 7);
+                    expected[b * 32 + i] = scale * codebook[block[2 + i] & 15];
+                    expected[b * 32 + i + 16] = scale * codebook[block[2 + i] >> 4];
+                }
+            }
+        } else if (type == GGML_TYPE_MXFP8) {
+            for (int b = 0; b < dim / 32; ++b) {
+                auto *block = reinterpret_cast<block_mxfp8 *>(row) + b;
+                block->e = uint8_t(r + b);
+                for (int i = 0; i < 32; ++i) {
+                    block->qs[i] = uint8_t(b * 32 + i + r);
+                    expected[b * 32 + i] = ReferenceMXFP8(block->qs[i], block->e);
+                }
+            }
+        } else {
+            for (int c = 0; c < dim; ++c) expected[c] = float((r * 17 + c * 31) % 251 - 125) / 37;
+            if (type == GGML_TYPE_Q5_K) quantize_row_q5_K_ref(expected, reinterpret_cast<block_q5_K *>(row), dim);
+            else if (type == GGML_TYPE_Q6_K) quantize_row_q6_K_ref(expected, reinterpret_cast<block_q6_K *>(row), dim);
+            else throw std::runtime_error("missing GGUF test encoder");
+            // Existing K-quant decoders are the reference for row addressing,
+            // disk transport and BF16 conversion, not under test themselves.
+            ggml_type_to_float(type)(row, expected, dim);
+        }
     }
     DiskWeightPart part;
     part.fileName = file.path; part.fileOffset = 4093; part.bytes = packed.size();
@@ -79,20 +144,20 @@ static void TestIQ4NL() {
         out.write(padding.data(), padding.size());
     }
     for (bool disk : {false, true}) for (bool async : {false, true}) {
-        struct IQProbe : Probe {
-            void PrepareIQ(const std::vector<uint8_t> &packed, const DiskWeightPart &part, bool disk, bool async) {
+        struct GGUFProbe : Probe {
+            void PrepareGGUF(ggml_type type, const std::vector<uint8_t> &packed, const DiskWeightPart &part, bool disk, bool async) {
                 executionMode = async ? ExecutionMode::Hybrid : ExecutionMode::Cpu;
                 ngramDevice = disk ? "disk" : "cpu"; engram_layer_ids.assign(1, 0); engram_head_dim = dim;
                 engram_num_embeddings.assign(1, rows);
                 weight.dicts["model_directory"] = "/";
                 auto &w = weight.weight["layers.0.engram.embed.weight"];
-                w = Data(DATA_GGUF_FORMAT, GGML_TYPE_IQ4_NL, {rows, dim});
+                w = Data(DATA_GGUF_FORMAT, type, {rows, dim});
                 w.isDiskWeight = disk; w.diskWeightParts = {part};
                 if (!disk) { w.Allocate(false); memcpy(w.cpuData, packed.data(), packed.size()); }
                 OnModelWeightsLoaded();
             }
         } probe;
-        probe.PrepareIQ(packed, part, disk, async);
+        probe.PrepareGGUF(type, packed, part, disk, async);
         for (int tokens : {1, 9, 257, 1}) {
             std::vector<int64_t> ids(tokens * 24);
             for (size_t i = 0; i < ids.size(); ++i) ids[i] = i % 3 ? (i * 997 + tokens) % rows : rows - 1;
@@ -106,19 +171,18 @@ static void TestIQ4NL() {
                 work.get();
                 Check(prefetched.dims == output.dims &&
                       !memcmp(prefetched.cpuData, output.cpuData, output.GetBytes()),
-                      "background IQ4_NL gather differs from synchronous gather");
+                      "background GGUF gather differs from synchronous gather");
             }
-            Check(output.dims == std::vector<int>({1,tokens,24*dim}) && output.dataType == BFLOAT16, "IQ4_NL shape/type");
+            Check(output.dims == std::vector<int>({1,tokens,24*dim}) && output.dataType == BFLOAT16, "GGUF shape/type");
             for (size_t i = 0; i < ids.size(); ++i) for (int c = 0; c < dim; ++c) {
-                const int b = c / 32, lane = c % 32;
-                const auto *block = packed.data() + ids[i] * rowBytes + b * 18;
-                const int code = (block[2 + lane % 16] >> (lane < 16 ? 0 : 4)) & 15;
-                const float d = std::ldexp(1.f, -8 + (ids[i] + b) % 5);
-                Check(reinterpret_cast<uint16_t *>(output.cpuData)[i*dim+c] == Float32ToBFloat16RNEBits(d * codebook[code]),
-                      "IQ4_NL gather differs from scalar codebook oracle");
+                const float expected = reference[ids[i] * dim + c];
+                const uint16_t actual = reinterpret_cast<uint16_t *>(output.cpuData)[i*dim+c];
+                Check(std::isnan(expected) ? ((actual & 0x7f80) == 0x7f80 && (actual & 0x7f)) :
+                      actual == Float32ToBFloat16RNEBits(expected), "GGUF gather differs from reference");
             }
         }
     }
+    std::printf("PASS %s: CPU/disk, synchronous/background gather and repeated decode/prefill shapes\n", ggml_type_name(type));
 }
 
 static void TestNativePrefetch() {
@@ -244,12 +308,17 @@ static void TestPromptWindows() {
     std::puts("PASS Engram future-window hashes, request reset/removal and prefetch-off");
 }
 
-int main() {
+int main(int argc, char **argv) {
     try {
         SetThreads(4);
+        TestMXFP8Decode();
+        for (bool direct : {false, true}) {
+            setenv("FASTLLM_DISK_DIRECT_IO", direct ? "1" : "0", 1);
+            for (auto type : {GGML_TYPE_IQ4_NL, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_MXFP8}) TestGGUFRows(type);
+        }
+        if (argc == 2 && std::string(argv[1]) == "--gguf-only") return 0;
         TestPromptWindows();
         TestNativePrefetch();
-        TestIQ4NL();
         const FP8E4M3ToFP32Manager fp8;
         for (int threads : {1, 4}) for (bool direct : {false, true}) {
             SetThreads(threads);

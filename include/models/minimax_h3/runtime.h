@@ -9,6 +9,7 @@
 
 namespace fastllm {
 namespace minimax_h3 {
+struct ModelSource;
 using Tensor = nomas::Tensor;
 using DType = nomas::DType;
 using Weights = nomas::Weights;
@@ -38,6 +39,9 @@ class Runtime : public nomas::Runtime {
     std::pair<Tensor, Tensor> qkNormRotary(const Tensor &q, const Tensor &k, const Tensor &qWeight,
                                          const Tensor &kWeight, float eps, const Tensor &cos,
                                          const Tensor &sin, int headDim);
+    // BF16, 128-wide heads in [Q,K,V] rows. Null cos/sin normalizes refiner Q/K only.
+    void qkvNormRotaryInPlace(Tensor &, const Tensor &qWeight, const Tensor &kWeight, float eps,
+                              const Tensor *cos = nullptr, const Tensor *sin = nullptr);
     std::pair<Tensor, Tensor> ropeTable(const std::vector<float> &positions, int frequencies, float theta);
     Tensor timestepEmbedding(const std::vector<float> &times, int dimensions);
     Tensor selfAttention(const Tensor &q, const Tensor &k, const Tensor &v, int heads);
@@ -66,10 +70,14 @@ struct PackedLayout {
     std::vector<float> positions;
     void validate(int timeCount) const;
 };
+class VideoProjections;
 
 class Transformer {
   public:
     Transformer(Runtime &, Runtime &fp32, const std::string &directory, nomas::ParallelContext = {});
+    Transformer(Runtime &, Runtime &fp32, const std::string &directory, nomas::ParallelContext,
+                bool sequenceParallel);
+    void setQuantizedWeights(const std::string &);
     const TransformerConfig &config() const { return config_; }
     void setLowMemory(bool enabled);
     void setHostMemoryBudget(const std::shared_ptr<nomas::HostMemoryBudget> &);
@@ -84,11 +92,12 @@ class Transformer {
     // Identical plans reuse the exact tables until unload(), independent of the prompt.
     void prepare(const std::vector<std::vector<float>> &plans, std::function<void(int, int)> progress = {});
     std::pair<Tensor, Tensor> forward(const Tensor &video, const Tensor &audio, const Tensor &text,
-                                      const PackedLayout &, Trace trace = {});
+                                      const PackedLayout &, Trace trace = {}, std::function<void()> checkpoint = {});
     void unload();
 
   private:
     Tensor linear(const Tensor &, const std::string &);
+    Tensor addLora(const Tensor &, const std::string &, Tensor);
     Tensor rowLinear(const Tensor &, const std::string &);
     Tensor attention(const Tensor &, const std::string &, const Tensor *cos = nullptr,
                      const Tensor *sin = nullptr, Trace trace = {});
@@ -97,6 +106,7 @@ class Transformer {
     Runtime &rt_, &fp32_;
     Weights weights_, fullWeights_;
     std::unique_ptr<Weights> lora_;
+    std::shared_ptr<VideoProjections> quantized_;
     std::string loraDirectory_;
     TransformerConfig config_;
     nomas::ParallelContext parallel_;
@@ -104,6 +114,8 @@ class Transformer {
     Tensor outputModulation_;
     std::vector<std::vector<float>> plans_;
     bool lowMemory_ = false, hostCacheEnabled_ = false;
+    bool sequenceParallel_ = false;
+    int sequenceRows_ = 0;
     std::shared_ptr<nomas::HostMemoryBudget> hostBudget_;
 };
 std::string componentWeights(const std::string &directory);
@@ -157,6 +169,9 @@ class TextEncoder {
     void setLowMemory(bool enabled) { lowMemory_ = enabled; }
     void setMemoryPool(const std::shared_ptr<nomas::TensorPool> &p) { memoryPool_ = p; }
     void setHostMemoryBudget(const std::shared_ptr<nomas::HostMemoryBudget> &);
+    // Retain immutable BF16 weights while leaving reserveBytes for other stages.
+    // Without an explicit cap, use at most half the available memory.
+    void cacheWeights(size_t reserveBytes, size_t maxBytes = 0);
     void unload(bool keepPackedCache = false) {
         weights_.clear(keepPackedCache);
         if (prefetchedWeights_)
@@ -167,7 +182,7 @@ class TextEncoder {
     Runtime &rt_;
     Weights weights_;
     std::unique_ptr<Weights> prefetchedWeights_;
-    bool hostCacheWarm_ = false;
+    bool cacheWarm_ = false;
     std::shared_ptr<nomas::TensorPool> memoryPool_;
     bool lowMemory_ = false;
     nomas::ParallelContext parallel_;
@@ -187,7 +202,11 @@ class VideoVAE {
     }
     // ImageNet-normalized THWC pixels -> FP32 posterior moments (mean, log variance).
     Tensor encodeTile(const Tensor &, int frames, int height, int width, Trace trace = {});
-    VideoTensor encodeMoments(const VideoTensor &, std::function<void(int, int)> progress = {});
+    // Single-frame convolutions omit the two zero causal frames; batches never mix images.
+    // Ampere+ uses TF32 products with FP32 accumulation; encodeTile retains FP32 math.
+    Tensor encodeImageTiles(const Tensor &, int height, int width, int batch, Trace trace = {});
+    VideoTensor encodeMoments(const VideoTensor &, std::function<void(int, int)> progress = {},
+                              bool independentImages = false);
     Tensor decodeTile(const Tensor &, int frames, int height, int width, Trace trace = {});
     VideoTensor decode(const VideoTensor &, std::function<void(int, int)> progress = {});
     std::vector<uint8_t> decodeRGB(const VideoTensor &, std::function<void(int, int)> progress = {},
@@ -196,17 +215,23 @@ class VideoVAE {
         weights_.clear();
         fullWeights_.clear();
         qkv_.clear();
+        imageConvolutions_.clear();
+        imageEncoder_.reset();
         rope_ = {};
         zero_ = {};
     }
 
   private:
+    struct ImageEncoderState;
+    std::shared_ptr<ImageEncoderState> imageEncoder_;
+    Tensor encodeTiles(const Tensor &, int frames, int height, int width, bool independentImages, Trace);
     Tensor decodeTiles(const Tensor &, int frames, int height, int width, int batch, Trace trace = {});
     Tensor decodeClip(const VideoTensor &, std::function<void()> checkpoint = {});
     Tensor decodeDevice(const VideoTensor &, std::function<void(int, int)> progress,
                          std::function<void(const Tensor &)> onFrames = {});
     Runtime &rt_, &full_;
     Weights weights_, fullWeights_;
+    std::unordered_map<std::string, Tensor> imageConvolutions_;
     std::vector<std::pair<Tensor, Tensor>> qkv_;
     std::array<int, 3> ropeShape_{};
     std::pair<Tensor, Tensor> rope_;
@@ -216,6 +241,8 @@ class VideoVAE {
     bool lowMemory_ = false;
 };
 DType parseVideoPrecision(const std::string &name, bool fp32 = false);
+double validateGpuMemoryLimit(double gib);
+double validateHostMemoryLimit(double gib);
 double parseGpuMemoryLimit(const std::string &gib);
 double parseHostMemoryLimit(const std::string &gib);
 const char *precisionName(DType);
@@ -266,6 +293,10 @@ class Pipeline {
     Pipeline(const std::string &directory, const std::vector<int> &devices, bool fp32, DType videoPrecision,
              nomas::RowReduction ditReduction);
     ~Pipeline();
+    // Configure a resolved local quantized source once, before generation/budgets.
+    // auto selects SP for quantized multi-GPU DiT, otherwise the existing TP.
+    void configureSource(const ModelSource &, const std::string &parallelMode = "auto");
+    const char *parallelMode() const { return devices_.size()==1?"single":sequenceParallel_?"sp":"tp"; }
     // Per-device GiB target. Reserves 1 GiB for CUDA/cuBLAS/NCCL outside the
     // bounded tensor pool. Small budgets stream weights layer by layer.
     // Configure before generation; zero preserves the default resident path.
@@ -301,6 +332,10 @@ class Pipeline {
     std::vector<float> videoMean_, videoStd_, audioMean_, audioStd_;
     bool retainWeights_ = false;
     bool lowMemory_ = false;
+    std::vector<int> devices_;
+    bool sequenceParallel_ = false;
+    size_t residentWeightBytes_ = 0;
+    bool sourceConfigured_ = false;
     std::shared_ptr<nomas::TensorPool> memoryPool_;
     std::shared_ptr<nomas::HostMemoryBudget> hostBudget_;
     std::unique_ptr<ParallelModel> parallel_;

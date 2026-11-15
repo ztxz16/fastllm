@@ -2,6 +2,14 @@
 
 [中文](version.md)
 
+## V1.9.1
+
+- Added support for Clover, Qwen-Image, HY-Nomas, LingBot World, MiniMax-H3, and Pika-H3-Flex.
+- Improved the launcher with multi-model management, video generation, and external draft configuration.
+- Optimized speculative decoding, concurrent and hybrid inference, and improved KV caching and multi-replica deployment.
+- Improved wheel and portable packaging, including NCCL, video backends, and media-tool dependencies.
+- Fixed several bugs.
+
 ## V1.9.0
 
 - Added `--auto` for automatic parameter tuning and deployment.

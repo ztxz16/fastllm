@@ -561,6 +561,84 @@ static void pikaSampling() {
     rejects([&] { pikaSigmaSchedule(0); });
 }
 
+static void accumulatedProjections() {
+    for(auto dtype:{DType::FP32,DType::FP16,DType::BF16}) {
+        Runtime rt(0,dtype);
+        for(int rows:{1,13,47,512}) {
+            constexpr int k=128,n=257,offset=5,stride=n+11;
+            std::vector<float> xv(size_t(rows)*k),wv(n*k),initial(size_t(rows+2)*stride,-.5f);
+            for(size_t i=0;i<xv.size();++i)xv[i]=(int(i%17)-8)/16.f;
+            for(size_t i=0;i<wv.size();++i)wv[i]=(int(i%13)-6)/16.f;
+            auto x=rt.upload(xv.data(),rows,k),w=rt.upload(wv.data(),n,k);
+            auto storage=rt.upload(initial.data(),rows+2,stride),out=storage.rowSlice(1,rows);
+            auto expected=initial;
+            for(int r=0;r<rows;++r)for(int c=0;c<n;++c) {
+                float v=-.5f;
+                for(int j=0;j<k;++j)v+=xv[size_t(r)*k+j]*wv[c*k+j];
+                expected[size_t(r+1)*stride+offset+c]=v;
+            }
+            rt.linearAddInto(x,w,out,offset);
+            std::cout<<"linear_add dtype="<<int(dtype)<<" rows="<<rows;
+            equal(rt,rt.upload(expected.data(),rows+2,stride),storage);
+            std::cout<<std::endl;
+            rejects([&]{rt.linearAddInto(x,w,out,-1);});
+            rejects([&]{rt.linearAddInto(x,w,out,stride-n+1);});
+            rejects([&]{rt.linearAddInto(x,w,x);});
+        }
+    }
+    // Real projection widths with non-dyadic values check the intended change
+    // from a rounded BF16 delta followed by add to one final BF16 rounding.
+    Runtime rt(0,false);
+    for(int rows:{13,513,4096})for(int width:{7168,14336}) {
+        auto x=randomTensor(rt,rows,128),w=randomTensor(rt,width,128),base=randomTensor(rt,rows,width);
+        auto expected=rt.download(rt.add(base,rt.linear(x,w)));
+        rt.linearAddInto(x,w,base);
+        auto actual=rt.download(base);
+        double e=0,n=0;
+        for(size_t i=0;i<expected.size();++i) {
+            if(!std::isfinite(actual[i]))throw std::runtime_error("nonfinite accumulated projection");
+            e+=std::pow(double(actual[i])-expected[i],2);n+=double(expected[i])*expected[i];
+        }
+        double error=std::sqrt(e/std::max(n,1e-30));
+        std::cout<<"linear_add_bf16 rows="<<rows<<" width="<<width<<" relative_l2="<<error<<std::endl;
+        if(error>.005)throw std::runtime_error("accumulated projection L2 exceeds 0.005");
+    }
+}
+static void packedQuantizedAttention() {
+    Runtime rt(0,false);
+    for(int rows:{1,17,513})for(int heads:{1,28,56}) {
+        const int width=heads*128;
+        auto original=randomTensor(rt,rows,3*width),qw=randomTensor(rt,1,128),kw=randomTensor(rt,1,128);
+        auto q=rt.columns(original,0,width),k=rt.columns(original,width,width),v=rt.columns(original,2*width,width);
+        for(int rotary:{0,96,128}) {
+            auto packed=rt.concat({original});
+            auto cs=randomTensor(rt,rows,std::max(rotary,2)),sn=randomTensor(rt,rows,std::max(rotary,2));
+            cs=rt.cast(cs,DType::FP32);sn=rt.cast(sn,DType::FP32);
+            auto reference=rotary?rt.qkNormRotary(q,k,qw,kw,1e-5f,cs,sn,128):
+                std::make_pair(rt.rms(q,qw,1e-5f,128),rt.rms(k,kw,1e-5f,128));
+            rt.qkvNormRotaryInPlace(packed,qw,kw,1e-5f,rotary?&cs:nullptr,rotary?&sn:nullptr);
+            std::cout<<"packed_h3_qkv rows="<<rows<<" heads="<<heads<<" rotary="<<rotary;
+            equal(rt,reference.first,rt.columns(packed,0,width));
+            equal(rt,reference.second,rt.columns(packed,width,width));
+            equal(rt,v,rt.columns(packed,2*width,width));
+            equal(rt,rt.selfAttention(reference.first,reference.second,v,heads),rt.packedSelfAttention(packed,heads));
+            std::cout<<std::endl;
+        }
+        auto cs=rt.cast(randomTensor(rt,rows,96),DType::FP32);
+        rejects([&]{rt.qkvNormRotaryInPlace(original,qw,kw,1e-5f,&cs,nullptr);});
+        rejects([&]{rt.qkvNormRotaryInPlace(original,qw,kw,0);});
+    }
+    for(auto dtype:{DType::FP32,DType::FP16,DType::BF16}) {
+        Runtime r(0,dtype);
+        for(int width:{67,128,14336}) {
+            auto x=randomTensor(r,17,2*width);
+            auto gate=r.columns(x,0,width),value=r.columns(x,width,width);
+            std::cout<<"gate_first_silu dtype="<<int(dtype)<<" width="<<width;
+            equal(r,r.multiply(value,r.activation(gate)),r.siluMultiply(x,true));
+            std::cout<<std::endl;
+        }
+    }
+}
 int main() {
     try {
         int count = 0;
@@ -571,6 +649,8 @@ int main() {
             std::cerr << "Expose only the permitted GPU" << std::endl;
             return 77;
         }
+        accumulatedProjections();
+        packedQuantizedAttention();
         audioConvolution();
         videoRGB();
         packedVideoQkv();

@@ -20,6 +20,10 @@ GiB = 1 << 30
 
 class AutoConfigTest(unittest.TestCase):
     def setUp(self):
+        # These fixtures mock model loading and do not load the kernel runtime.
+        kernels = patch('fastllm_pytools.kernel_policy.configure', return_value=None)
+        kernels.start()
+        self.addCleanup(kernels.stop)
         self.g = memory.Geometry('qwen4', 4, 65536, 128, 8, 2, 64,
                                  [1024] * 4, [1 << 20] * 4, 4, 1024, 1024)
         self.costs = ([GiB] * 4, [1 << 20] * 4, 1 << 20, 1 << 20, GiB, False)
@@ -29,10 +33,10 @@ class AutoConfigTest(unittest.TestCase):
         self.hardware = info, {(a, b): True for a in info for b in info}
         self.ram = {'total': 32 * GiB, 'available': 32 * GiB}
 
-    def resolve(self, a, *, use_numa=True):
+    def resolve(self, a, *, use_numa=True, metadata=None, tensors=None):
         # Keep planning-policy fixtures independent of this host's CPU quota
         # and CUDA device count. CPU calibration has dedicated tests below.
-        with patch.object(memory, 'model_inputs', return_value=({}, [], self.g)), \
+        with patch.object(memory, 'model_inputs', return_value=(metadata or {}, tensors or [], self.g)), \
                 patch.object(memory, 'geometry', return_value=self.g), \
                 patch.object(memory, 'weight_costs', return_value=self.costs), \
                 patch.object(auto, 'cpu_threads', return_value=36), \
@@ -49,6 +53,26 @@ class AutoConfigTest(unittest.TestCase):
                                  [1024] * 8, [1 << 20] * 8, 4, 1024, 1024)
         self.costs = ([4 * GiB] * 8, [1 << 20] * 8, 1 << 20, 1 << 20, 4 * GiB, False)
         self.ram = {'total': 32 * GiB, 'available': 30 * GiB}
+
+    def test_exl3_uses_canonical_numa_weights_with_shared_cuda_cache(self):
+        self.mixed_fixture()
+        self.ram = {'total':128*GiB, 'available':120*GiB}
+        metadata = {}  # Storage capabilities come from tensors, even in mixed checkpoints.
+        tensors = [memory.Tensor('layers.0.ffn.experts.0.w1.weight', (128,128), 6656, 'EXL3')]
+        a = self.args('--device','cuda:0','--moe_device_layers','-1')
+        result = self.resolve(a,metadata=metadata,tensors=tensors)
+        self.assertEqual(result['moe_device'],'numa')
+        self.assertGreater(result['moe_cuda_cache'],0)
+        self.assertEqual(result['resident_expert_layers'],0)
+        explicit = self.resolve(self.args('--device','cuda:0','--moe_device_layers','-1',
+            '--moe_cuda_cache','1g'),metadata=metadata,tensors=tensors)
+        self.assertEqual(explicit['moe_cuda_cache'],GiB)
+        for backend in ('cpu','numa'):
+            plan = self.resolve(self.args('--moe_device',backend),metadata=metadata,tensors=tensors)
+            self.assertEqual(plan['moe_device'],backend)
+            self.assertGreater(plan['moe_cuda_cache'],0)
+        with self.assertRaisesRegex(ValueError,'storage format'):
+            self.resolve(self.args('--moe_device','disk'),metadata=metadata,tensors=tensors)
 
     def test_disk_cache_ratio_default_alias_and_validation(self):
         self.assertEqual(self.args().auto_disk_cache_ratio, .5)
@@ -535,6 +559,31 @@ class AutoConfigTest(unittest.TestCase):
         self.assertEqual(p['threads'], 6)
         self.assertEqual(p['automatic']['cpu_thread_benchmark'], detail)
 
+    def test_v41_packed_fp4_and_exl3_use_native_numa_batches(self):
+        from fastllm_pytools import cpu_tuning
+        self.g.family, self.g.hidden, self.g.intermediate, self.g.topk = 'deepseek_v41', 5120, 2304, 6
+        for kind, scale_kind, block in ((1009, 'F8_E8M0', 32), (-1, 'F8_E4M3', 16), (-6, None, None)):
+            tensors = []
+            for part, rows, columns in (('w1', 2304, 5120), ('w2', 5120, 2304)):
+                name = 'layers.0.ffn.experts.0.' + part + '.weight'
+                if scale_kind:
+                    tensors.extend([memory.Tensor(name, (rows, columns//2), rows*columns//2, 'I8'),
+                                    memory.Tensor(name[:-len('.weight')] + '.scale',
+                                                  (rows, columns//block), rows*columns//block, scale_kind)])
+                else:
+                    tensors.append(memory.Tensor(name, (rows, columns), rows*columns*3//8 + 2*(rows+columns), 'EXL3'))
+            for batch, drafts in ((1, 0), (1, 5), (4, 5), (8, 7)):
+                args = self.args('--max_batch', str(batch), '--dspark', str(drafts))
+                with self.subTest(kind=kind, batch=batch, drafts=drafts), \
+                        patch.object(memory, 'model_inputs', return_value=({'model_type': 'deepseek_v41'}, tensors, self.g)), \
+                        patch.object(auto, 'cpu_threads', return_value=124), \
+                        patch.dict(os.environ, {}, clear=True), \
+                        patch.object(cpu_tuning, 'select_threads', side_effect=RuntimeError('dispatch')) as calibrate:
+                    with self.assertRaisesRegex(RuntimeError, 'dispatch'):
+                        auto.resolve(args, self.gpu.__getitem__, hardware=self.hardware, ram=self.ram, use_numa=True)
+                calibrate.assert_called_once_with(5120, 2304, kind, 124,
+                                                 numa=True, rows=batch*(drafts+1), topk=6)
+
     def test_explicit_parameters_override_policy_even_when_equal_to_defaults(self):
         a = self.args('--device', 'cuda:1', '--tp', 'off', '--moe_cuda_cache', '0',
                       '--moe_cpu_cache', '0', '--moe_device_layers', '-1', '--ngram_device', 'cpu',
@@ -855,20 +904,29 @@ class AutoConfigTest(unittest.TestCase):
             a = self.args(*options)
             auto.apply_model_defaults(a, md)
             self.assertEqual((a.dspark, a.fast_prefill), (drafts, fast))
+            self.assertEqual(a.speculative_dspark_confidence_threshold, 0.0)
         for family in ('qwen4_exp', 'glm5_next'):
             a = self.args()
             auto.apply_model_defaults(a, {'model_type': family})
             self.assertEqual((a.dspark, a.fast_prefill), (0, False))
+            self.assertEqual(a.speculative_dspark_confidence_threshold, .5)
         a = make_normal_parser('test').parse_args(['model'])
         auto.apply_model_defaults(a, md)
         self.assertEqual((a.dspark, a.fast_prefill), (0, False))
+        self.assertEqual(a.speculative_dspark_confidence_threshold, .5)
 
     def test_deepseek_auto_defaults_reach_planner_and_runtime_with_cli_json_precedence(self):
-        cases = [({}, [], 5, True, .5),
+        cases = [({}, [], 5, True, 0),
+                 ({}, ['--dspark', '5'], 5, True, 0),
                  ({}, ['--dspark', '3', '--speculative_dspark_confidence_threshold', '.2'], 3, True, .2),
-                 ({}, ['--speculative_algorithm', 'off', '--no_fast_prefill'], 0, False, .5),
-                 ({'dspark': 0, 'fast_prefill': False}, [], 0, False, .5),
-                 ({'dspark': 0, 'fast_prefill': False}, ['--dspark', '7', '--fast_prefill'], 7, True, .5)]
+                 ({'speculative_dspark_confidence_threshold': .5}, [], 5, True, .5),
+                 ({'speculative_dspark_confidence_threshold': .5},
+                  ['--speculative-dspark-confidence-threshold', '0'], 5, True, 0),
+                 ({'speculative_dspark_confidence_threshold': 0},
+                  ['--speculative_dspark_confidence_threshold', '.5'], 5, True, .5),
+                 ({}, ['--speculative_algorithm', 'off', '--no_fast_prefill'], 0, False, 0),
+                 ({'dspark': 0, 'fast_prefill': False}, [], 0, False, 0),
+                 ({'dspark': 0, 'fast_prefill': False}, ['--dspark', '7', '--fast_prefill'], 7, True, 0)]
         for saved, cli, drafts, fast, threshold in cases:
             with self.subTest(saved=saved, cli=cli), tempfile.TemporaryDirectory() as d:
                 Path(d, 'config.json').write_text(json.dumps({'model_type': 'deepseek_v41',
@@ -899,6 +957,40 @@ class AutoConfigTest(unittest.TestCase):
                         patch.dict(sys.modules, {'ftllm': types.SimpleNamespace(llm=runtime)}), \
                         patch.dict(os.environ, {}, clear=True), redirect_stdout(io.StringIO()):
                     self.assertIs(make_normal_llm_model(a), model)
+
+    def test_deepseek_gguf_auto_threshold_reaches_external_draft_runtime(self):
+        class Planned(Exception):
+            pass
+
+        for cli, threshold in [([], 0), (['--speculative-dspark-confidence-threshold', '.5'], .5)]:
+            with self.subTest(cli=cli), tempfile.TemporaryDirectory() as d:
+                target, draft = Path(d, 'target.gguf'), Path(d, 'draft.gguf')
+                target.touch()
+                draft.touch()
+                a = make_normal_parser('test').parse_args(
+                    [str(target), '--auto', '--draft', str(draft), '--draft_tokens', '5', *cli])
+                config = {'model_type': 'deepseek_v41', 'gguf_architecture': 'deepseek41'}
+                draft_config = {'dspark_block_size': 5, 'dspark_target_layer_ids': [2, 3],
+                                'dspark_noise_token_id': 100}
+
+                def resolve(args, query):
+                    self.assertEqual(args.dspark, 5)
+                    self.assertEqual(args.speculative_algorithm, 'dspark')
+                    self.assertEqual(args.speculative_dspark_confidence_threshold, threshold)
+                    self.assertEqual(os.environ['FASTLLM_DSPARK_TOKENS'], '5')
+                    self.assertEqual(args.speculative_draft_model_path, str(draft))
+                    self.assertEqual(float(os.environ['FASTLLM_DSPARK_CONFIDENCE_THRESHOLD']), threshold)
+                    raise Planned
+
+                with patch('fastllm_pytools.util.read_gguf_metadata',
+                           return_value={'general.architecture': 'dflash'}), \
+                        patch('fastllm_pytools.util.get_gguf_model_config', return_value=config), \
+                        patch('fastllm_pytools.deepseek_v41_gguf.dspark_config', return_value=draft_config), \
+                        patch.object(auto, 'resolve', side_effect=resolve), \
+                        patch.dict(sys.modules, {'ftllm': types.SimpleNamespace(llm=MagicMock())}), \
+                        patch.dict(os.environ, {}, clear=True), redirect_stdout(io.StringIO()):
+                    with self.assertRaises(Planned):
+                        make_normal_llm_model(a)
 
     def streaming_fixture(self):
         self.g.context = 262144
@@ -1033,8 +1125,7 @@ class AutoConfigTest(unittest.TestCase):
             self.resolve(a)
             self.assertEqual(a.low_gpu_mem, extra == ('--low_gpu_mem',))
             self.assertEqual(a.cuda_embedding, extra == ('--cuda_embedding',))
-        a = self.args(*options)
-        a._auto_explicit.append('low_gpu_mem')  # an explicit JSON false is an opt-out
+        a = self.args(*options, '--no-low-gpu-mem')
         self.resolve(a)
         self.assertFalse(a.low_gpu_mem)
 
@@ -1332,7 +1423,8 @@ class NativeQwenMtpEmbeddingTest(unittest.TestCase):
             self.assertNotIn("FASTLLM_QWEN4_VISION_DEVICE", auto._qwen_hybrid_defaults(args,model,tensors,hardware,True))
         args.vision_device = None
         self.assertNotIn("FASTLLM_QWEN4_VISION_DEVICE", auto._qwen_hybrid_defaults(args,model,[],hardware,True))
-        self.assertEqual(auto._qwen_hybrid_defaults(args,model,tensors,{0:{"capability":89}},True), {})
+        self.assertEqual(auto._qwen_hybrid_defaults(args,model,tensors,{0:{"capability":89}},True),
+                         {"FASTLLM_QWEN38_HYBRID_GRAPH": "1"})
 
     def test_independent_q8_defaults_and_explicit_choices(self):
         config = json.dumps([dict(key=r"^lm_head\.weight$", dtype="ggml_q8_0")])
@@ -1442,7 +1534,7 @@ class NativeQwenMtpEmbeddingTest(unittest.TestCase):
 
 
 class HybridDispatchPolicyTest(unittest.TestCase):
-    def test_unmeasured_backends_and_shapes_keep_existing_policy(self):
+    def test_hybrid_graph_dispatch_is_independent_of_architecture(self):
         g=memory.Geometry("qwen4",48,262144,2560,512,10,640,[0]*48,[0]*48,4,155648,4096)
         a=types.SimpleNamespace(moe_device="numa",mtp=3)
         t=[memory.Tensor("blk.0.ffn_gate_exps.weight",(512,640,2560),1,"gguf:21")]
@@ -1451,8 +1543,26 @@ class HybridDispatchPolicyTest(unittest.TestCase):
         for field,value in (("family","deepseek_v41"),("layers",47),("hidden",4096),("intermediate",768),("topk",8)):
             changed=copy.copy(g);object.__setattr__(changed,field,value)
             self.assertEqual(auto._qwen_hybrid_defaults(a,changed,t,gpu,True),{})
-        for hw,numa in (({0:{"capability":120}},True),({0:{"capability":75},1:{"capability":89}},True),(gpu,False)):
+        for hw,numa in (({},True),({i:{"capability":75} for i in range(3)},True),(gpu,False)):
             self.assertEqual(auto._qwen_hybrid_defaults(a,g,t,hw,numa),{})
+        for sm in (60, 70, 75, 80, 86, 89, 90, 100, 120, 121):
+            with self.subTest(sm=sm):
+                single = auto._qwen_hybrid_defaults(a,g,t,{0:{"capability":sm}},True)
+                self.assertEqual(single["FASTLLM_QWEN38_HYBRID_GRAPH"], "1")
+                self.assertNotIn("FASTLLM_QWEN38_OWNED_PP", single)
+                native = [memory.Tensor("model.layers.0.mlp.experts.0.gateup_proj.weight",
+                                        (1280,2560),1,"nvfp4")]
+                native_defaults = auto._qwen_hybrid_defaults(a,g,native,{0:{"capability":sm}},True)
+                self.assertEqual(native_defaults["FASTLLM_QWEN38_HYBRID_GRAPH"], "1")
+                self.assertNotIn("FASTLLM_QWEN38_OWNED_PP", native_defaults)
+        for left, right in ((75,75),(75,89),(80,80),(89,89),(90,90),(120,120),(121,121)):
+            for weights in (t,native):
+                with self.subTest(architectures=(left,right),kind=weights[0].kind):
+                    dual = auto._qwen_hybrid_defaults(a,g,weights,
+                        {0:{"capability":left},1:{"capability":right}},True)
+                    for key in ("FASTLLM_QWEN38_HYBRID_GRAPH", "FASTLLM_QWEN38_OWNED_PP",
+                                "FASTLLM_QWEN38_REMOTE_GRAPH"):
+                        self.assertEqual(dual[key], "1")
         dual = auto._qwen_hybrid_defaults(a,g,t,{0:{"capability":75},1:{"capability":75}},True)
         self.assertEqual(dual["FASTLLM_QWEN38_OWNED_PP"], "1")
         self.assertEqual(dual["FASTLLM_QWEN38_REMOTE_GRAPH"], "1")

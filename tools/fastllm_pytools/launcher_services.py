@@ -4,12 +4,11 @@ import urllib.error
 import urllib.request
 
 from .launcher import LauncherError, LauncherRuntime
-from .service_backends import BACKENDS, backend_catalog
+from .service_backends import BACKENDS, backend_catalog, media_body_limit
 
 
 ACTIVE = {"starting", "running", "stopping"}
 NATIVE_AGENTS = ("harness", "opencode", "codex", "claude")
-MEDIA_BODY_LIMIT = 32 * 1024 * 1024
 MEDIA_RESULT_LIMIT = 256 * 1024 * 1024
 
 
@@ -174,8 +173,9 @@ class LauncherServicePool:
         Deliberately not a URL proxy: neither a model nor a browser can choose
         an arbitrary host/path, forward a credential, or follow a redirect.
         """
-        if data is not None and len(data) > MEDIA_BODY_LIMIT:
-            raise LauncherError("生成请求不能超过 32 MiB。")
+        limit = media_body_limit(path)
+        if data is not None and len(data) > limit:
+            raise LauncherError("生成请求不能超过 %d MiB。" % (limit // (1024 * 1024)))
         item = self.service(service_id)
         with item._lock:
             state = item.state()
@@ -201,7 +201,7 @@ class LauncherServicePool:
         except urllib.error.HTTPError as error:
             response = error
         except (OSError, urllib.error.URLError) as error:
-            raise LauncherError("无法连接视频服务：" + str(error)) from error
+            raise LauncherError("无法连接生成服务：" + str(error)) from error
         with response:
             body = response.read(MEDIA_RESULT_LIMIT + 1)
             if len(body) > MEDIA_RESULT_LIMIT:
@@ -236,9 +236,10 @@ def install_service_routes(app, pool):
     async def media(service_id: str, path: str, request: Request):
         data = bytearray()
         async for chunk in request.stream():
+            if len(data) + len(chunk) > media_body_limit(path):
+                return Response('{"error":"Request body is too large."}', status_code=413,
+                                media_type="application/json")
             data.extend(chunk)
-            if len(data) > MEDIA_BODY_LIMIT:
-                return Response(status_code=413)
         status, content_type, body = await run_in_threadpool(pool.media_request, service_id,
             request.method, path, bytes(data) if data else None,
             request.headers.get("content-type", "application/json"))

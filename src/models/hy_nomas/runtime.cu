@@ -49,6 +49,22 @@ struct MemoryPool {
     int device;
     size_t cacheLimit=0,cachedBytes=0,maxBytes=0;
     std::mutex cacheMutex;
+    std::mutex peerMutex;
+    std::vector<int> peerDevices;
+    void enablePeers(const std::vector<int> &devices) {
+        std::lock_guard<std::mutex> lock(peerMutex);
+        for(int peer:devices) {
+            if(peer==device || std::find(peerDevices.begin(),peerDevices.end(),peer)!=peerDevices.end()) continue;
+            int access=0; check(cudaDeviceCanAccessPeer(&access,peer,device));
+            if(!access) continue;
+            cudaMemAccessDesc desc{};
+            desc.location.type=cudaMemLocationTypeDevice;
+            desc.location.id=peer;
+            desc.flags=cudaMemAccessFlagsProtReadWrite;
+            check(cudaMemPoolSetAccess(handle,&desc,1));
+            peerDevices.push_back(peer);
+        }
+    }
     using FreeBlocks=std::map<size_t,std::vector<void *>>;
     std::unordered_map<uint64_t,FreeBlocks> freeBlocks;
     void *reuse(size_t bytes) {
@@ -126,6 +142,19 @@ std::shared_ptr<MemoryPool> memoryPool(int device) {
     }
     return pool;
 }
+struct TensorAllocation {
+    int device;
+    std::shared_ptr<MemoryPool> pool;
+    size_t bytes;
+    uint64_t owner;
+    void operator()(void *x) const {
+        int previous=device; cudaGetDevice(&previous);
+        if(previous==device && activePool==pool && owner==allocationThread() && pool->recycle(x,bytes)) return;
+        cudaSetDevice(device);
+        cudaFreeAsync(x,cudaStreamPerThread);
+        cudaSetDevice(previous);
+    }
+};
 std::shared_ptr<void> allocate(size_t bytes) {
     require(bytes > 0, "empty CUDA allocation");
     int device; check(cudaGetDevice(&device));
@@ -142,14 +171,7 @@ std::shared_ptr<void> allocate(size_t bytes) {
         }
         check(status);
     }
-    auto owner=allocationThread();
-    return {p, [device,pool,bytes,owner](void *x) {
-        int previous = device; cudaGetDevice(&previous);
-        if(previous==device && activePool==pool && owner==allocationThread() && pool->recycle(x,bytes)) return;
-        cudaSetDevice(device);
-        cudaFreeAsync(x,cudaStreamPerThread);
-        cudaSetDevice(previous);
-    }};
+    return {p,TensorAllocation{device,pool,bytes,allocationThread()}};
 }
 template<class T> T *as(const Tensor &x) { return reinterpret_cast<T *>(x.data); }
 B *ptr(const Tensor &x) { return reinterpret_cast<B *>(x.data); }
@@ -261,12 +283,12 @@ template<class T, bool FusedAffine=true, bool Modulate=false> __global__ void no
 }
 template<class T,int Pack> struct alignas(sizeof(T)*Pack) ElementPack { T value[Pack]; };
 template<class T,class Index,int Pack=1>
-__global__ void packedSiluMultiply(const T *x,T *out,Index n,int width) {
+__global__ void packedSiluMultiply(const T *x,T *out,Index n,int width,bool gateFirst) {
     auto input=reinterpret_cast<const ElementPack<T,Pack> *>(x);
     auto output=reinterpret_cast<ElementPack<T,Pack> *>(out);
     for(Index i=Index(blockIdx.x)*blockDim.x+threadIdx.x;i<n;i+=Index(gridDim.x)*blockDim.x) {
         Index p=(i/width)*(Index(2)*width)+i%width;
-        auto hidden=input[p], gates=input[p+width];
+        auto hidden=input[p+(gateFirst?width:0)], gates=input[p+(gateFirst?0:width)];
         ElementPack<T,Pack> result;
 #pragma unroll
         for(int j=0;j<Pack;++j) {
@@ -456,6 +478,10 @@ template<class T> __global__ void textRopeKernel(const T *x,T *y,size_t n,int co
 }
 }
 
+void enableTensorPeerAccess(const Tensor &tensor,const std::vector<int> &devices) {
+    if(auto owner=std::get_deleter<TensorAllocation>(tensor.storage)) owner->pool->enablePeers(devices);
+}
+
 TensorPool::TensorPool(int device,size_t cacheBytes,size_t maxBytes,bool reserve)
     :pool_(std::make_shared<MemoryPool>(device,maxBytes && !reserve?0:UINT64_MAX,maxBytes)) {
     require(!maxBytes || cacheBytes<=maxBytes,"tensor cache exceeds memory pool limit");
@@ -504,6 +530,7 @@ struct Runtime::LtState {
         cublasLtMatrixLayout_t a=nullptr,b=nullptr,c=nullptr;
         cublasLtMatmulPreference_t preference=nullptr;
         cublasLtMatmulAlgo_t algorithm;
+        bool fallback = false;
         ~Plan() { if(op) cublasLtMatmulDescDestroy(op); if(a) cublasLtMatrixLayoutDestroy(a); if(b) cublasLtMatrixLayoutDestroy(b); if(c) cublasLtMatrixLayoutDestroy(c); if(preference) cublasLtMatmulPreferenceDestroy(preference); }
     };
     // Fixed workspaces keep the BF16 algorithm choice reproducible. cuBLASLt
@@ -611,36 +638,95 @@ void Runtime::linearInto(const Tensor &x,const Tensor &w,Tensor &out,const Tenso
         check(cudaGetLastError()); return;
     }
     auto scalarType=x.dtype==DType::FP16 ? CUDA_R_16F : CUDA_R_16BF;
-    if(bias) {
-        auto key=std::to_string(int(x.dtype))+":"+std::to_string(x.rows)+":"+std::to_string(x.cols)+":"+std::to_string(w.rows);
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    bool tune = tuneLinear_ && !bias && x.dtype==DType::BF16 && out.dtype==x.dtype &&
+        x.rows>=1024 && x.cols>=4096 && w.rows>=4096 && x.cols%256==0 && w.rows%256==0 &&
+        ((uintptr_t(x.data)|uintptr_t(w.data)|uintptr_t(out.data))%256==0);
+    if(tune) { check(cudaStreamIsCapturing(cudaStreamPerThread,&capture)); tune=capture==cudaStreamCaptureStatusNone; }
+    if(bias || tune) {
+        const size_t workspaceBytes = tune ? size_t(32)<<20 : lt_->workspaceBytes;
+        void *workspace = tune ? lt_->blasWorkspace.get() : lt_->workspace.get();
+        auto key=std::string(tune ? "tuned:" : "bias:")+std::to_string(int(x.dtype))+":"+std::to_string(x.rows)+":"+std::to_string(x.cols)+":"+std::to_string(w.rows);
         auto &plan=lt_->plans[key];
         if(!plan) {
             auto p=std::make_unique<LtState::Plan>();
             check(cublasLtMatmulDescCreate(&p->op,CUBLAS_COMPUTE_32F,CUDA_R_32F));
             cublasOperation_t trans=CUBLAS_OP_T; check(cublasLtMatmulDescSetAttribute(p->op,CUBLASLT_MATMUL_DESC_TRANSA,&trans,sizeof(trans)));
-            cublasLtEpilogue_t epilogue=CUBLASLT_EPILOGUE_BIAS;
-            check(cublasLtMatmulDescSetAttribute(p->op,CUBLASLT_MATMUL_DESC_EPILOGUE,&epilogue,sizeof(epilogue)));
-            check(cublasLtMatmulDescSetAttribute(p->op,CUBLASLT_MATMUL_DESC_BIAS_POINTER,&bias->data,sizeof(void *)));
+            if(bias) {
+                cublasLtEpilogue_t epilogue=CUBLASLT_EPILOGUE_BIAS;
+                check(cublasLtMatmulDescSetAttribute(p->op,CUBLASLT_MATMUL_DESC_EPILOGUE,&epilogue,sizeof(epilogue)));
+                check(cublasLtMatmulDescSetAttribute(p->op,CUBLASLT_MATMUL_DESC_BIAS_POINTER,&bias->data,sizeof(void *)));
+            }
             check(cublasLtMatrixLayoutCreate(&p->a,scalarType,w.cols,w.rows,w.cols));
             check(cublasLtMatrixLayoutCreate(&p->b,scalarType,x.cols,x.rows,x.cols));
             check(cublasLtMatrixLayoutCreate(&p->c,scalarType,w.rows,x.rows,w.rows));
             check(cublasLtMatmulPreferenceCreate(&p->preference));
-            check(cublasLtMatmulPreferenceSetAttribute(p->preference,CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,&lt_->workspaceBytes,sizeof(size_t)));
+            check(cublasLtMatmulPreferenceSetAttribute(p->preference,CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,&workspaceBytes,sizeof(size_t)));
             uint32_t reduction=CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE|CUBLASLT_REDUCTION_SCHEME_NONE,alignment=256;
             check(cublasLtMatmulPreferenceSetAttribute(p->preference,CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK,&reduction,sizeof(reduction)));
             for(auto attr:{CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES,CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_B_BYTES,CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_C_BYTES,CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_D_BYTES})
                 check(cublasLtMatmulPreferenceSetAttribute(p->preference,attr,&alignment,sizeof(alignment)));
-            int count=0; cublasLtMatmulHeuristicResult_t choice{};
-            check(cublasLtMatmulAlgoGetHeuristic(reinterpret_cast<cublasLtHandle_t>(blas_),p->op,p->a,p->b,p->c,p->c,p->preference,1,&choice,&count));
-            require(count>0,"no cuBLASLt 16-bit linear algorithm"); p->algorithm=choice.algo; plan=std::move(p);
+            int count=0; cublasLtMatmulHeuristicResult_t choices[2]{};
+            check(cublasLtMatmulAlgoGetHeuristic(reinterpret_cast<cublasLtHandle_t>(blas_),p->op,p->a,p->b,p->c,p->c,p->preference,tune?2:1,choices,&count));
+            require(tune || count>0,"no cuBLASLt 16-bit linear algorithm");
+            p->fallback = count==0;
+            if(count) p->algorithm=choices[0].algo;
+            if(tune && count>1) {
+                struct Events {
+                    cudaEvent_t start=nullptr,stop=nullptr;
+                    ~Events() { if(start) cudaEventDestroy(start); if(stop) cudaEventDestroy(stop); }
+                } events;
+                check(cudaEventCreate(&events.start)); check(cudaEventCreate(&events.stop));
+                float timings[2]{};
+                // Alternate order and discard the first round: initial weight
+                // loading can leave GPU clocks low and bias a one-shot choice.
+                for(int round=0;round<3;++round) for(int j=0;j<count;++j) {
+                    int candidate=round%2 ? count-1-j : j;
+                    auto call=[&] { return cublasLtMatmul(reinterpret_cast<cublasLtHandle_t>(blas_),p->op,&one,
+                        w.data,p->a,x.data,p->b,&zero,out.data,p->c,out.data,p->c,&choices[candidate].algo,
+                        workspace,workspaceBytes,cudaStreamPerThread); };
+                    check(call());
+                    check(cudaEventRecord(events.start,cudaStreamPerThread));
+                    for(int repeat=0;repeat<3;++repeat) check(call());
+                    check(cudaEventRecord(events.stop,cudaStreamPerThread));
+                    check(cudaEventSynchronize(events.stop));
+                    float milliseconds=0;check(cudaEventElapsedTime(&milliseconds,events.start,events.stop));
+                    if(round) timings[candidate]+=milliseconds;
+                }
+                // Keep the first heuristic for differences within timing noise.
+                if(timings[1]<timings[0]*.99f) p->algorithm=choices[1].algo;
+            }
+            plan=std::move(p);
         }
-        check(cublasLtMatmulDescSetAttribute(plan->op,CUBLASLT_MATMUL_DESC_BIAS_POINTER,&bias->data,sizeof(void *)));
-        check(cublasLtMatmul(reinterpret_cast<cublasLtHandle_t>(blas_),plan->op,&one,w.data,plan->a,x.data,plan->b,&zero,
-            out.data,plan->c,out.data,plan->c,&plan->algorithm,lt_->workspace.get(),lt_->workspaceBytes,cudaStreamPerThread));
+        if(bias) check(cublasLtMatmulDescSetAttribute(plan->op,CUBLASLT_MATMUL_DESC_BIAS_POINTER,&bias->data,sizeof(void *)));
+        if(plan->fallback) {
+            check(cublasGemmEx(static_cast<cublasHandle_t>(blas_),CUBLAS_OP_T,CUBLAS_OP_N,
+                w.rows,x.rows,x.cols,&one,w.data,scalarType,w.cols,x.data,scalarType,x.cols,
+                &zero,out.data,scalarType,w.rows,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT));
+        } else check(cublasLtMatmul(reinterpret_cast<cublasLtHandle_t>(blas_),plan->op,&one,w.data,plan->a,x.data,plan->b,&zero,
+            out.data,plan->c,out.data,plan->c,&plan->algorithm,workspace,workspaceBytes,cudaStreamPerThread));
     } else {
         check(cublasGemmEx(static_cast<cublasHandle_t>(blas_),CUBLAS_OP_T,CUBLAS_OP_N,
             w.rows,x.rows,x.cols,&one,w.data,scalarType,w.cols,x.data,scalarType,x.cols,
             &zero,out.data,out.isFloat32()?CUDA_R_32F:scalarType,w.rows,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT));
+    }
+    check(cudaGetLastError());
+}
+void Runtime::linearAddInto(const Tensor &x,const Tensor &w,Tensor &out,int firstColumn) {
+    require(x.data && w.data && out.data && x.rows>0 && x.cols>0 && w.rows>0 && x.cols==w.cols &&
+            out.rows==x.rows && firstColumn>=0 && firstColumn<=out.cols && w.rows<=out.cols-firstColumn,
+            "linear accumulation shape mismatch");
+    require(x.dtype==w.dtype && out.dtype==x.dtype,"linear accumulation dtype mismatch");
+    require(out.storage!=x.storage && out.storage!=w.storage,"linear accumulation must not share input storage");
+    float one=1;
+    if(x.isFloat32()) {
+        check(cublasSgemm(static_cast<cublasHandle_t>(blas_),CUBLAS_OP_T,CUBLAS_OP_N,w.rows,x.rows,x.cols,
+            &one,as<float>(w),w.cols,as<float>(x),x.cols,&one,as<float>(out)+firstColumn,out.cols));
+    } else {
+        auto scalarType=x.dtype==DType::FP16?CUDA_R_16F:CUDA_R_16BF;
+        check(cublasGemmEx(static_cast<cublasHandle_t>(blas_),CUBLAS_OP_T,CUBLAS_OP_N,w.rows,x.rows,x.cols,
+            &one,w.data,scalarType,w.cols,x.data,scalarType,x.cols,&one,out.data+firstColumn,scalarType,
+            out.cols,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT));
     }
     check(cudaGetLastError());
 }
@@ -686,6 +772,9 @@ Tensor Runtime::siluMultiply(const Tensor &x,const Tensor &y) {
 }
 
 Tensor Runtime::siluMultiply(const Tensor &x) {
+    return siluMultiply(x,false);
+}
+Tensor Runtime::siluMultiply(const Tensor &x,bool gateFirst) {
     require(x.cols%2==0,"invalid packed SiLU width");
     Tensor out(x.rows,x.cols/2,x.dtype);
     // Vectorize 16-bit loads/stores without changing the scalar FP32 arithmetic or
@@ -693,16 +782,16 @@ Tensor Runtime::siluMultiply(const Tensor &x) {
     DISPATCH_TENSOR(x.dtype, T,
         if(sizeof(T)==2 && out.cols%8==0 && uintptr_t(as<T>(x))%16==0 && out.size()<=size_t(INT32_MAX)) {
             packedSiluMultiply<T,uint32_t,8><<<grid(out.size()/8),256,0,cudaStreamPerThread>>>(
-                as<T>(x),as<T>(out),uint32_t(out.size()/8),out.cols/8);
+                as<T>(x),as<T>(out),uint32_t(out.size()/8),out.cols/8,gateFirst);
         } else if(sizeof(T)==2 && out.cols%2==0 && uintptr_t(as<T>(x))%4==0 && out.size()<=size_t(INT32_MAX)) {
             packedSiluMultiply<T,uint32_t,2><<<grid(out.size()/2),256,0,cudaStreamPerThread>>>(
-                as<T>(x),as<T>(out),uint32_t(out.size()/2),out.cols/2);
+                as<T>(x),as<T>(out),uint32_t(out.size()/2),out.cols/2,gateFirst);
         } else if(out.size()<=size_t(INT32_MAX)) {
             packedSiluMultiply<T,uint32_t><<<grid(out.size()),256,0,cudaStreamPerThread>>>(
-                as<T>(x),as<T>(out),uint32_t(out.size()),out.cols);
+                as<T>(x),as<T>(out),uint32_t(out.size()),out.cols,gateFirst);
         } else {
             packedSiluMultiply<T,size_t><<<grid(out.size()),256,0,cudaStreamPerThread>>>(
-                as<T>(x),as<T>(out),out.size(),out.cols);
+                as<T>(x),as<T>(out),out.size(),out.cols,gateFirst);
         });
     check(cudaGetLastError()); return out;
 }
@@ -1021,6 +1110,21 @@ Tensor Runtime::attentionScaled(const Tensor &q,const Tensor &k,const Tensor &v,
     return out;
 }
 void Runtime::synchronize() { check(cudaDeviceSynchronize()); }
+size_t Runtime::availableMemory() {
+    activate();
+    check(cudaStreamSynchronize(cudaStreamPerThread));
+    auto pool=memoryPool(device_);
+    size_t free=0,total=0; check(cudaMemGetInfo(&free,&total));
+    uint64_t reserved=0,used=0;
+    check(cudaMemPoolGetAttribute(pool->handle,cudaMemPoolAttrReservedMemCurrent,&reserved));
+    check(cudaMemPoolGetAttribute(pool->handle,cudaMemPoolAttrUsedMemCurrent,&used));
+    // Host-side exact-size caches remain CUDA allocations: they cannot be
+    // assumed reusable by a different future shape. Only free CUDA pool pages
+    // are generally available without changing the cache's retention policy.
+    size_t available=free+(reserved>used?reserved-used:0);
+    if(pool->maxBytes) available=std::min(available,pool->maxBytes>used?pool->maxBytes-used:0);
+    return available;
+}
 
 bool HostMemoryBudget::acquire(size_t bytes) {
     size_t current=used_.load();
@@ -1396,8 +1500,11 @@ void Weights::shareHostCache(const Weights &source) {
     }
 }
 void Weights::enablePackedCache(size_t reserveBytes) {
+    enablePackedCache(reserveBytes, 0);
+}
+bool Weights::enablePackedCache(size_t reserveBytes, size_t maxBytes) {
     auto &i=*impl_;
-    if(i.packed) return;
+    if(i.packed) return false;
     i.rt.activate();
     size_t available=0,total=0; check(cudaMemGetInfo(&available,&total));
     if(activePool && activePool->maxBytes) {
@@ -1408,11 +1515,12 @@ void Weights::enablePackedCache(size_t reserveBytes) {
             available=activePool->maxBytes>used?activePool->maxBytes-used:0;
         }
     }
-    if(available<=reserveBytes) return;
+    if(available<=reserveBytes) return false;
     i.packed=std::make_shared<Impl::PackedCache>();
-    i.packed->budget=std::min(available/2,available-reserveBytes);
+    i.packed->budget=std::min(maxBytes ? maxBytes : available/2,available-reserveBytes);
     // A single budget is shared by every shard, including those already opened.
     for(auto &shard:i.shards) shard.second->impl_->packed=i.packed;
+    return true;
 }
 void Weights::sharePackedCache(const Weights &source) {
     impl_->checkCacheSource(*source.impl_);

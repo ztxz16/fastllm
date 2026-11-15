@@ -39,6 +39,10 @@ bool FastllmCudaMergeMOEHybridOnDevices(const fastllm::Data &input,
 // configured per-device budget instead of each allocating the entire budget.
 bool FastllmCudaSetMoeCacheBudgetFraction(fastllm::Data **weights, int count, double fraction);
 
+// Link independently budgeted storage groups belonging to one model step.
+// Begin/End on any member advances all live members, including graph users.
+bool FastllmCudaLinkMoeCacheGroups(const std::vector<const fastllm::Data *> &keys);
+
 // Attribute small-batch routes without changing cache or scheduling decisions.
 // Scopes are thread-local and nest across model callbacks.
 enum class FastllmMoeRoutePhase { Unspecified = -1, Decode, Verify, Draft, SmallPrefill };
