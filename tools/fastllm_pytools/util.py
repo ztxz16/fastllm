@@ -1044,6 +1044,16 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         help='单批 prefill 请求数上限，0仅受模型剩余请求槽位限制')
     parser.add_argument('--prefill_min_decode_requests', type=int, default=0,
                         help='只有活跃 decode 请求数达到此值才等待攒批；空闲时始终立即放行')
+    parser.add_argument('--prefill_dp_balance', choices=['true', 'false'], default='false',
+                        help='按 attention DP 协同攒批；token/请求目标仍按整个副本配置，再均分到各 DP，需各组同时达到')
+    parser.add_argument('--prefill_adaptive_requests', type=int, default=0,
+                        help='自适应攒批的整副本参考并发，0关闭；缩放放行目标和等待时间，不改变内存预算')
+    parser.add_argument('--prefill_chunked', choices=['true', 'false'], default='false',
+                        help='每个文本 prefill chunk 后返回调度器；支持 Naive TP/attention-DP 和 DSpark')
+    parser.add_argument('--prefill_chunk_max_wait_ms', type=int, default=0,
+                        help='已有 prefill chunk 等待其他请求合批的上限，0立即继续；需 prefill_chunked')
+    parser.add_argument('--prefill_fairness_ms', type=int, default=0,
+                        help='繁忙时连续 prefill 达此毫秒后安排等长 decode 时间，0关闭；需 prefill_chunked')
     fast_prefill = parser.add_mutually_exclusive_group()
     fast_prefill.add_argument('--fast_prefill', '--fast-prefill', action='store_true',
                              help='开启DeepSeek-V4.1快速 prefill；该模型的--auto默认开启，可用--no_fast_prefill关闭')
@@ -1269,6 +1279,21 @@ def make_normal_llm_model(args, startup_progress = None):
             or (prefill_batch_tokens == 0 and any(prefill_values[1:]))
             or (prefill_max_requests > 0 and prefill_batch_requests > prefill_max_requests)):
         raise ValueError("prefill coalescing requires non-negative int32 values, a positive token target, and batch_requests <= max_requests when capped")
+    prefill_scheduling = {}
+    for name in ('prefill_dp_balance', 'prefill_chunked'):
+        value = getattr(args, name, False)
+        if not isinstance(value, bool) and value not in ('true', 'false'):
+            raise ValueError(name + ' must be true or false')
+        prefill_scheduling[name] = value is True or value == 'true'
+    for name in ('prefill_adaptive_requests', 'prefill_chunk_max_wait_ms', 'prefill_fairness_ms'):
+        value = getattr(args, name, 0)
+        if type(value) is not int or not 0 <= value <= 2147483647:
+            raise ValueError(name + ' must be a non-negative int32')
+        prefill_scheduling[name] = value
+    if ((any(prefill_scheduling.values()) and prefill_batch_tokens == 0)
+            or (not prefill_scheduling['prefill_chunked'] and
+                (prefill_scheduling['prefill_chunk_max_wait_ms'] or prefill_scheduling['prefill_fairness_ms']))):
+        raise ValueError('prefill scheduling requires batching; chunk timing requires prefill_chunked')
     user_set_moe_device = bool(args.moe_device and args.moe_device != "")
     # Resolve this after loading a saved JSON configuration. An explicit zero
     # must remain an opt-out, including when another model previously used slabs.
@@ -2291,6 +2316,12 @@ def make_normal_llm_model(args, startup_progress = None):
                                           min_decode_requests=prefill_min_decode_requests)
             else:
                 model.set_prefill_batching(prefill_batch_tokens, prefill_max_wait_ms)
+        if any(prefill_scheduling.values()):
+            model.set_prefill_scheduling(balance_dp=prefill_scheduling['prefill_dp_balance'],
+                adaptive_requests=prefill_scheduling['prefill_adaptive_requests'],
+                chunked=prefill_scheduling['prefill_chunked'],
+                chunk_max_wait_ms=prefill_scheduling['prefill_chunk_max_wait_ms'],
+                fairness_ms=prefill_scheduling['prefill_fairness_ms'])
         llm.report_model_load_progress("weights_finalize", 1, 1)
         llm.report_model_load_progress("warmup", 0, 1)
         model.warmup()

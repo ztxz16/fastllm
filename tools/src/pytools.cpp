@@ -1498,6 +1498,12 @@ extern "C" {
                                                           maxRequests, minDecodeRequests);
     }
 
+    DLL_EXPORT bool set_prefill_scheduling_llm_model(int modelId, bool balanceDP, int adaptiveRequests,
+                                                     bool chunked, int chunkWaitMs, int fairnessMs) {
+        return models.GetModel(modelId)->SetPrefillScheduling(balanceDP, adaptiveRequests, chunked,
+                                                              chunkWaitMs, fairnessMs);
+    }
+
     DLL_EXPORT bool set_prefill_batching_llm_model(int modelId, int tokens, int maxWaitMs) {
         return models.GetModel(modelId)->SetPrefillBatching(tokens, maxWaitMs);
     }

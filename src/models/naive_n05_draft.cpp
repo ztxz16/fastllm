@@ -2289,7 +2289,7 @@ std::vector<int> NaiveN05FlashModel::ForwardDraftBatch(int batch, const Data &in
             AssertInFastLLM(pastKeyValues[i * block_cnt + layer].first == &(*caches[i])[layer].first &&
                 pastKeyValues[i * block_cnt + layer].second == &(*caches[i])[layer].second,
                 "DSpark batch mixed request KV descriptors.");
-        prefill |= seqLens[i] != 1 || owners[i]->committed == 0 || owners[i]->kv.empty();
+        prefill |= configs[i].prefill_chunk_remaining >= 0 || seqLens[i] != 1 || owners[i]->committed == 0 || owners[i]->kv.empty();
     }
     if (prefill) {
         // Preserve the scheduler's coalescing target while reusing KVMem's
@@ -2604,7 +2604,7 @@ int NaiveN05FlashModel::ForwardDraft(
     int limit = std::min(draftTokens, max_positions - oldLength - 1);
     if (config.output_token_limit > 0)
         limit = std::min(limit, config.output_token_limit - (oldLength - config.input_token_length) - 1);
-    if (context.committed == 0 || context.kv.empty() || inputIds.dims[1] != 1 || config.output_logits || constrained || limit <= 0) {
+    if (config.prefill_chunk_remaining >= 0 || context.committed == 0 || context.kv.empty() || inputIds.dims[1] != 1 || config.output_logits || constrained || limit <= 0) {
         TargetCapture capture;
         // Only the final draft window is used; there is no CPU prefix archive.
         // Preserve absolute position accounting while skipping invisible
@@ -2620,7 +2620,7 @@ int NaiveN05FlashModel::ForwardDraft(
             context.committed += inputIds.dims[1];
             ClearDraftPrefixHidden(context.prefixHidden);
         }
-        if (isIntermediateChunkedPrefill) return 0;
+        if (isIntermediateChunkedPrefill || config.prefill_chunk_remaining > 0) return 0;
         return SampleTarget(logits, kv, config, lastTokens, retLogits, &selection);
     }
     LastTokensUnit history = lastTokens.units.empty() ? LastTokensUnit(config.last_n) : lastTokens.units[0];

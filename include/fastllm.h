@@ -163,6 +163,9 @@ namespace fastllm {
         int output_token_limit = -1; // 最多输出多少, <= 0代表无限制
         int output_token_least = 0; // 最低输出的多少
         int input_token_length = 0;
+        // Internal scheduler marker: -1 ordinary call, 0 final prompt chunk,
+        // positive means more prompt tokens remain. Never a sampling option.
+        int prefill_chunk_remaining = -1;
         int last_n = 64; // 末尾last_n个token计入重复惩罚
         float repeat_penalty = 1.0f; // 重复惩罚系数，1.0代表不惩罚
         bool do_sample = false; // false表示贪心解码，保留前端的采样语义

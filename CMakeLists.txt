@@ -2461,7 +2461,7 @@ if (UNIT_TEST)
             if(NAIVE_DP_EXTRA STREQUAL "indexer" OR NAIVE_DP_EXTRA STREQUAL "kvmem")
                 set(NAIVE_DP_VARIANTS eager graph)
             elseif(NAIVE_DP_EXTRA STREQUAL "admission")
-                set(NAIVE_DP_VARIANTS single batch)
+                set(NAIVE_DP_VARIANTS single batch chunked)
             else()
                 set(NAIVE_DP_VARIANTS plain draft)
             endif()
@@ -2533,6 +2533,11 @@ if (UNIT_TEST)
         if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
             add_executable(naive_n05_verify_graph_test test/basic/test_naive_n05_tp_model.cpp)
             target_compile_definitions(naive_n05_verify_graph_test PRIVATE FASTLLM_TEST_VERIFY_GRAPH_HOOKS)
+            add_test(NAME naive_n05_scheduled_draft_prefill
+                COMMAND naive_n05_verify_graph_test 2 draft_prefill_batch fp8 gpu_context chunked)
+            set_tests_properties(naive_n05_scheduled_draft_prefill
+                PROPERTIES LABELS "cuda;naive" RUN_SERIAL TRUE TIMEOUT 300 SKIP_RETURN_CODE 77
+                PASS_REGULAR_EXPRESSION "DSPARK PREFIX PASS")
             foreach(NAIVE_DP_GRAPH_MODE indexer kvmem)
                 add_test(NAME naive_n05_attention_dp_capture_${NAIVE_DP_GRAPH_MODE}
                     COMMAND naive_n05_verify_graph_test 8 attention_dp_${NAIVE_DP_GRAPH_MODE} 2 graph)

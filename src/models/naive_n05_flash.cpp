@@ -569,7 +569,7 @@ int NaiveN05FlashModel::Forward(
     Data logits = tpDevices.size() > 1
         ? ForwardTensorParallel(inputIds, positionIds, pastKeyValues, generationConfig, nullptr, &selection)
         : RunTarget(inputIds, positionIds, pastKeyValues, generationConfig, nullptr);
-    if (isIntermediateChunkedPrefill) return 0;
+    if (isIntermediateChunkedPrefill || generationConfig.prefill_chunk_remaining > 0) return 0;
     int token = SampleTarget(logits, pastKeyValues, generationConfig, lastTokens, retLogits, &selection);
     if (trace) trace->Mark("sample_return_ms");
     return token;
@@ -665,6 +665,7 @@ std::vector<int> NaiveN05FlashModel::ForwardTargetBatch(int batch, const Data &i
         }
     ResetLogitsOfEOS(batch, &logits, pastKeyValues, configs);
     for (int b = 0; b < batch; ++b) {
+        if (configs[b].prefill_chunk_remaining > 0) { tokens[b] = 0; continue; }
         if (configs[b].IsSimpleGreedy()) {
             const float *row = (const float *)logits.cpuData + (size_t)b * vocab;
             // The owning TP result is already on CPU. Preserve CUDA Top1's
@@ -2128,7 +2129,7 @@ NaiveN05FlashModel::LogitsSelection NaiveN05FlashModel::SelectLogits(
     LogitsSelection selection;
     // These transforms must happen before selection. Keep the established
     // full-logits path until their branch-local GPU equivalents are available.
-    if (config.output_logits || config.output_token_least > 0 ||
+    if (config.prefill_chunk_remaining > 0 || config.output_logits || config.output_token_least > 0 ||
         std::abs(config.repeat_penalty - 1.0f) > 1e-8f ||
         !config.tool_call_allowed_token_ids.empty()) return selection;
     selection.greedy = config.IsSimpleGreedy();

@@ -345,7 +345,8 @@ class Fixture : public NaiveN05FlashModel {
             std::vector<std::pair<Data *, Data *>> &kv, const std::vector<GenerationConfig> &configs,
             const LastTokensManager &tokens = LastTokensManager(), std::vector<std::vector<float> *> *logits = nullptr) override {
         batchedPrefills += batch > 1 && std::any_of(lengths.begin(), lengths.end(), [](int n) { return n > 1; });
-        if (std::all_of(lengths.begin(), lengths.end(), [](int n) { return n == 1; }))
+        if (std::all_of(lengths.begin(), lengths.end(), [](int n) { return n == 1; }) &&
+            std::all_of(configs.begin(), configs.end(), [](const auto &c) { return c.prefill_chunk_remaining < 0; }))
             largestDecodeBatch = std::max(largestDecodeBatch.load(), batch);
         return NaiveN05FlashModel::ForwardBatch(batch, ids, masks, positions, lengths, kv, configs, tokens, logits);
     }
@@ -943,7 +944,7 @@ class Fixture : public NaiveN05FlashModel {
                   << " max_relative=" << largestLogitRelative << " max_abs=" << largestLogitAbsolute << std::endl;
     }
 
-    void DraftPrefixChecks(bool sparse = false, bool batching = false) {
+    void DraftPrefixChecks(bool sparse = false, bool batching = false, bool scheduled = false) {
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
         inspectDraftPrefixAllocations = true;
 #endif
@@ -953,8 +954,11 @@ class Fixture : public NaiveN05FlashModel {
         draftConfidenceThreshold = 0; draftTargetLayers = {0, 1};
         AddDraftTestWeights(weight, draftLayers, draftKvHeads, 256, true);
         maxBatch = batching ? 48 : 16; SetMaxTokens(131072); SetChunkedPrefillSize(batching ? 8192 : 1024);
+        if (scheduled) SetChunkedPrefillSize(1024);
         if (batching && !SetPrefillBatching(4096, 20, 4, 24, 1))
             throw std::runtime_error("DSpark rejected existing prefill options");
+        if (scheduled && !SetPrefillScheduling(false, 48, true, 1, 1))
+            throw std::runtime_error("DSpark rejected scheduled chunks");
         if (sparse) {
             KvMemConfig cfg; cfg.enabled = true; cfg.maxTokens = 8192; cfg.residentTokens = 8192;
             cfg.prefillTokens = 1024; cfg.hostBytes = 1ULL << 30; ConfigureKvMem(cfg);
@@ -2515,16 +2519,19 @@ class Fixture : public NaiveN05FlashModel {
         return result;
     }
 
-    void AttentionDPAdmission(int groups, bool batchPrefill) {
+    void AttentionDPAdmission(int groups, bool batchPrefill, bool scheduled = false) {
         ConfigureAttentionParallel(groups);
         SetSaveHistoryChat(false); maxBatch = groups * 2; max_positions = 512;
         SetMaxTokens(512); SetChunkedPrefillSize(128); WarmUp();
         useRealScheduler = true; eos_token_id = -1; eos_token_ids.clear();
         if (batchPrefill) SetPrefillBatching(1024, 10);
+        if (scheduled && !SetPrefillScheduling(true, groups * 2, true, 1, 1))
+            throw std::runtime_error("DP chunk policy rejected");
         // Each group can fit only one 512-token request. The second wave
         // must queue, while the other group continues to make progress.
         std::vector<int> handles;
         std::vector<std::vector<int>> prompts(groups * 3, std::vector<int>(448));
+        if (scheduled) for (size_t row = 0; row < prompts.size(); ++row) prompts[row].resize(385 + 32 * (row % 2));
         for (size_t row = 0; row < prompts.size(); ++row) {
             for (size_t i = 0; i < prompts[row].size(); ++i) prompts[row][i] = (i * 7 + row) % 251;
             GenerationConfig config; config.top_k = 1; config.output_logits = true;
@@ -2545,7 +2552,12 @@ class Fixture : public NaiveN05FlashModel {
                 throw std::runtime_error("DP pool completion did not finish");
         }
         ShutdownRuntime();
-        if (largestDecodeBatch > groups) throw std::runtime_error("DP pool over-admitted requests");
+        // Physical pools include the reserved partial page per request. At
+        // larger DP counts this can fit more than the nominal 512 tokens.
+        const auto *pool = GetPagedKVCacheManager(0, true);
+        const int pagesPerRequest = (prompts.front().size() + pool->pageLen - 1) / pool->pageLen;
+        const int capacity = std::min(maxBatch, groups * (pool->maxPages / pagesPerRequest));
+        if (largestDecodeBatch > capacity) throw std::runtime_error("DP pool over-admitted requests");
         for (size_t row = 0; row < prompts.size(); ++row) {
             std::vector<float> ids(prompts[row].begin(), prompts[row].end()), pos(ids.size()), logits;
             std::iota(pos.begin(), pos.end(), 0.f);
@@ -4061,7 +4073,8 @@ int main(int argc, char **argv) {
             SetCudaEmbedding(true); SetCudaGraph(true);
             Fixture fixture(ranks); fixture.SetKVCacheDataType(FP8_E4M3);
             fixture.AttentionDPAdmission(argc > 3 ? std::stoi(argv[3]) : 2,
-                argc > 4 && std::string(argv[4]) == "batch");
+                argc > 4 && (std::string(argv[4]) == "batch" || std::string(argv[4]) == "chunked"),
+                argc > 4 && std::string(argv[4]) == "chunked");
             return 0;
         }
         if (argc > 2 && (std::string(argv[2]) == "attention_dp_indexer" || std::string(argv[2]) == "attention_dp_kvmem")) {
@@ -4272,7 +4285,7 @@ int main(int argc, char **argv) {
             fixture.SetIndexerTPStorage(!sparse && !context, sparse || context);
             fixture.SetIndexerDataType(FP8_E4M3);
             if (argc > 3 && std::string(argv[3]) == "fp8") fixture.SetKVCacheDataType(FP8_E4M3);
-            fixture.DraftPrefixChecks(sparse, true); unsetenv("FASTLLM_DSPARK_TP"); return 0;
+            fixture.DraftPrefixChecks(sparse, true, argc > 5 && std::string(argv[5]) == "chunked"); unsetenv("FASTLLM_DSPARK_TP"); return 0;
         }
         if (argc > 2 && std::string(argv[2]) == "kvmem_draft_prefix") {
             SetCudaEmbedding(true); SetCudaGraph(true);

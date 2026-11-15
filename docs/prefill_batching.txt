@@ -1,0 +1,58 @@
+Prefill 攒批与分块调度
+====================
+
+默认关闭。适用于 Naive GPU TP/attention-DP，可配合 DSpark；其他模型需要实现
+相应的模型能力接口，未支持时明确拒绝配置，保持原有执行路径。
+
+原有参数的 token、请求数和最小 decode 数均使用整个副本口径：
+  --prefill_batch_tokens N          未缓存 token 放行目标，0关闭
+  --prefill_batch_requests N        请求数目标，0不设目标
+  --prefill_max_wait_ms N           最老请求的最长攒批等待，0不等待
+  --prefill_max_requests N          单批 prefill 请求上限，0只受模型并发限制
+  --prefill_min_decode_requests N   低于此活跃 decode 数不等待
+
+不开启 DP 协同时，token 或请求数任一达标即可放行。
+
+新增可选参数（不读取环境变量）：
+  --prefill_dp_balance true
+    将整副本目标均分到 attention DP 组，逐组检查 token 和请求数目标；每组
+    都满足或本组容量不足时共同放行。选请求按已有 KV owner 的预计未缓存工作
+    均衡，不迁移活动 KV。超时、低负载、整批容量不足仍允许提前执行。
+  --prefill_adaptive_requests N
+    整副本参考并发，0关闭。按实际活动请求（decode+待处理prefill）缩放目标，
+    比例限制在1/8到1；等待时间按比例缩放，但不低于min(5000,max_wait_ms)。
+    不改变硬内存预算、最大批量或上下文容量。
+  --prefill_chunked true
+    文本长请求每个chunk后交回调度器；支持不同长度、中间chunk和结束chunk合批。
+    中间chunk不采样、不输出token、不推进工具语法状态；已申请的KV和请求槽位
+    保留到继续执行或取消。多模态输入保留其原有单请求执行路径。
+  --prefill_chunk_max_wait_ms N
+    已有chunk等待其他prefill的期限；0表示立即继续。初次入队仍使用max_wait_ms。
+  --prefill_fairness_ms N
+    活跃decode达到最小数量时，累计prefill执行N毫秒后为decode保留N毫秒执行
+    时间；0关闭。只在forward边界切换，单个不可拆分forward可以超过此时间。
+
+两个chunk时间参数要求prefill_chunked=true。所有新增选项要求正的batch_tokens。
+通过启动参数、保存的JSON配置或Python model.set_prefill_scheduling(...) 设置，
+须在第一个推理请求之前完成。参数不会热修改正在执行的请求。
+
+8卡attention-DP8、EP8，参考并发256的示例：
+  --chunked_prefill_size 4096 \
+  --prefill_batch_tokens 32768 --prefill_batch_requests 16 \
+  --prefill_max_requests 24 --prefill_max_wait_ms 30000 \
+  --prefill_min_decode_requests 64 --prefill_dp_balance true \
+  --prefill_adaptive_requests 256 --prefill_chunked true \
+  --prefill_chunk_max_wait_ms 1000 --prefill_fairness_ms 1000
+
+满负载时每DP目标4096 token/2请求。总活动数为128时每DP目标2048 token/1请求，
+初次攒批等待上限15秒。超时是调度边界上的额外攒批期限，不保证整体首token延迟。
+空闲/低负载无需等待；通常达到目标即可提前执行。
+
+单请求chunk上限来自chunked_prefill_size（KVMem使用其prefill_tokens）。总批预算
+至少为max(chunked_prefill_size,prefill_batch_tokens)；DP分块调度还限制每组本轮
+token不超过总预算/DP数量。公平调度改善decode停顿，攒批改善GPU利用率，二者
+分别控制。不能仅通过增加等待时间保证满批或吞吐提高。
+
+已有inference trace的prefill_coalescing.reason可观察wait、dp_targets、timeout、
+chunk_timeout、decode_budget和capacity；query_lengths/handles/context_before可核对
+跨chunk的同一请求和实际批量，不需要新增环境变量控制攒批行为。

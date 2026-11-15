@@ -559,6 +559,11 @@ if hasattr(fastllm_lib, "set_prefill_coalescing_llm_model"):
     fastllm_lib.set_prefill_coalescing_llm_model.argtypes = [ctypes.c_int] * 6
     fastllm_lib.set_prefill_coalescing_llm_model.restype = ctypes.c_bool
 
+if hasattr(fastllm_lib, "set_prefill_scheduling_llm_model"):
+    fastllm_lib.set_prefill_scheduling_llm_model.argtypes = [ctypes.c_int, ctypes.c_bool,
+        ctypes.c_int, ctypes.c_bool, ctypes.c_int, ctypes.c_int]
+    fastllm_lib.set_prefill_scheduling_llm_model.restype = ctypes.c_bool
+
 if hasattr(fastllm_lib, "set_model_indexer_compute_dtype"):
     fastllm_lib.set_model_indexer_compute_dtype.argtypes = [ctypes.c_int, ctypes.c_char_p]
     fastllm_lib.set_model_indexer_compute_dtype.restype = ctypes.c_char_p
@@ -3714,6 +3719,28 @@ class model:
         self.prefill_batching = dict(tokens=tokens, max_wait_ms=max_wait_ms,
                                     target_requests=target_requests, max_requests=max_requests,
                                     min_decode_requests=min_decode_requests)
+
+    def set_prefill_scheduling(self, *, balance_dp=False, adaptive_requests=0,
+                              chunked=False, chunk_max_wait_ms=0, fairness_ms=0):
+        """Opt in to DP coalescing and yielding text chunks before serving.
+
+        Targets/reference concurrency use whole-replica units. DP targets are
+        divided between owners and must both be met on every available owner.
+        Fairness reserves a decode time slice after a prefill slice of the same
+        duration; individual forwards are not preempted.
+        """
+        values = (adaptive_requests, chunk_max_wait_ms, fairness_ms)
+        if (not isinstance(balance_dp, bool) or not isinstance(chunked, bool)
+                or not all(type(v) is int and 0 <= v <= 2147483647 for v in values)
+                or (not chunked and any(values[1:]))):
+            raise ValueError("Invalid prefill scheduling options; chunk timing requires chunked=True")
+        if not hasattr(fastllm_lib, "set_prefill_scheduling_llm_model"):
+            raise RuntimeError("This FastLLM library does not support prefill scheduling")
+        if not fastllm_lib.set_prefill_scheduling_llm_model(self.model, balance_dp,
+                adaptive_requests, chunked, chunk_max_wait_ms, fairness_ms):
+            raise ValueError("Configure prefill batching before scheduling; yielding chunks require a supported model and configuration before serving")
+        self.prefill_scheduling = dict(balance_dp=balance_dp, adaptive_requests=adaptive_requests,
+            chunked=chunked, chunk_max_wait_ms=chunk_max_wait_ms, fairness_ms=fairness_ms)
 
     def set_verbose(self, verbose: int):
         fastllm_lib.set_verbose_llm_model(self.model, verbose)

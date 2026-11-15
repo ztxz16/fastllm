@@ -3133,7 +3133,7 @@ namespace fastllm {
                     std::vector<float> decodePositions(fastDecodeInput ? maxBatch : 0);
                     std::vector<Data> decodePositionIds;
                     if (fastDecodeInput) decodePositionIds.reserve(maxBatch);
-                    const bool batchPrefill = maxBatch > 1 && model->SupportsPrefillBatching() &&
+                    const bool batchPrefill = (maxBatch > 1 || model->prefillScheduling.chunked) && model->SupportsPrefillBatching() &&
                                               model->prefillBatchPolicy.targetTokens > 0;
                     const bool fixedKvSlots = model->kvMemConfig.enabled && model->SupportsKvMemBatch();
                     const bool sharedKvPool = model->SupportsSharedPagedKVPool();
@@ -3145,6 +3145,11 @@ namespace fastllm {
                     LastTokensManager tokensManager;
                     tokensManager.units.reserve(maxBatch);
                     PagedPrefixPreviewExecutor prefixPreviewExecutor;
+                    const auto scheduling = model->prefillScheduling;
+                    const int prefillGroups = std::max(1, model->GetPrefillBatchGroups());
+                    const int scheduledChunk = scheduling.balanceDP
+                        ? std::min(prefillChunk, std::max(1, prefillBatchLimit / prefillGroups)) : prefillChunk;
+                    PrefillDecodeBudget decodeBudget;
                     while (true) {
                         std::unique_ptr<inference_trace::Step> trace;
                         if (traceInference) trace.reset(new inference_trace::Step());
@@ -3278,12 +3283,17 @@ namespace fastllm {
                             return extra;
                         };
                         std::map<PagedCacheManager *, long long> reservedPages;
-                        int activeDecode = 0;
+                        int activeDecode = 0, activeRequests = 0;
+                        std::vector<PrefillGroupLoad> groupLoads(prefillGroups);
                         if (batchPrefill || sharedKvPool) for (auto &entry : model->responseContextDict.dicts) {
                             auto *ctx = entry.second;
-                            if (!ctx->isEnding && ctx->curTokens > 0) {
+                            if (!ctx->isEnding && (ctx->curTokens > 0 || ctx->prefillOffset > 0)) {
                                 if (sharedKvPool) reservedPages[model->GetPagedKVCacheBudgetManager(ctx)] += remainingPages(ctx);
-                                ++activeDecode;
+                                ++activeRequests;
+                                if (ctx->curTokens > 0) {
+                                    ++activeDecode;
+                                    ++groupLoads.at(model->GetPrefillBatchGroup(ctx)).decoding;
+                                }
                             }
                         }
                         auto releasePendingPrefix = [&](ResponseContext *ctx) {
@@ -3294,7 +3304,7 @@ namespace fastllm {
                                 ReleasePagedCachePages(kv.second, true);
                             }
                             ctx->currentTokens = ctx->allTokens;
-                            ctx->cacheLen = ctx->preTokens = 0;
+                            ctx->cacheLen = ctx->preTokens = ctx->prefillOffset = 0;
                             ctx->intParams.clear();
                             model->OnResponseContextCreated(ctx);
                         };
@@ -3339,33 +3349,50 @@ namespace fastllm {
                                 auto *right = b.context;
                                 const bool lp = left->curTokens == 0, rp = right->curTokens == 0;
                                 if (lp != rp) return lp;
-                                if (lp && left->queuedAt != right->queuedAt) return left->queuedAt < right->queuedAt;
+                                if (lp) {
+                                    // A completed chunk rejoins behind work that has already
+                                    // waited. Original arrival order would let one long prompt
+                                    // monopolize its DP quota until every chunk completes.
+                                    const auto leftAt = left->prefillOffset ? left->prefillQueuedAt : left->queuedAt;
+                                    const auto rightAt = right->prefillOffset ? right->prefillQueuedAt : right->queuedAt;
+                                    if (leftAt != rightAt) return leftAt < rightAt;
+                                }
                                 return a < b;
                             });
                         } else sort(orders.begin(), orders.end());
 
                         if (trace) trace->Mark("schedule_scan_ms");
                         std::set<int> plannedPrefills;
+                        std::map<int, int> plannedTokens;
                         bool deferPrefill = false;
                         if (batchPrefill) {
                             inference_trace::DetailRegion previewRegion("prefill_preview");
-                            const auto &policy = model->prefillBatchPolicy;
-                            currentActivate = activeDecode;
-                            int slots = std::max(0, maxBatch - activeDecode);
-                            if (policy.maxRequests > 0) slots = std::min(slots, policy.maxRequests);
+                            int pendingRequests = 0;
+                            for (const auto &order : orders)
+                                pendingRequests += !order.context->isEnding && order.context->curTokens == 0;
+                            const auto policy = scheduling.Effective(model->prefillBatchPolicy,
+                                                                    activeDecode + pendingRequests);
+                            if (activeDecode < std::max(1, policy.minDecodeRequests))
+                                decodeBudget.Update(false, 0, false, scheduling.fairnessMs);
+                            const bool decodeOnly = decodeBudget.decodeDueMs > 0 && pendingRequests > 0;
+                            currentActivate = activeRequests;
+                            const int slots = std::max(0, maxBatch - activeRequests);
+                            const int requestLimit = policy.maxRequests > 0 ? policy.maxRequests : maxBatch;
                             long long pendingTokens = 0;
-                            int candidates = 0;
-                            bool capacityLimited = false;
+                            int candidates = 0, newCandidates = 0;
+                            bool capacityLimited = false, batchFull = false;
                             auto oldest = PrefillBatchPolicy::Clock::time_point::max();
+                            auto oldestChunk = oldest;
+                            std::vector<int> candidatesToAdmit;
                             PrefillBatchQueue prefillQueue;
                             for (int i = 0; i < (int)orders.size(); ++i) {
                                 const auto *ctx = orders[i].context;
                                 if (!ctx->isEnding && ctx->curTokens == 0)
                                     prefillQueue.Push(i, model->GetPrefillBatchGroup(ctx));
                             }
-                            // Idle/low-load/zero-wait paths go straight to actual
-                            // admission. Preview never owns KV or request slots.
-                            if (policy.maxWaitMs > 0 && activeDecode >= std::max(1, policy.minDecodeRequests)) {
+                            // Select without pinning KV, including idle/zero-wait admission.
+                            // A decode-only slice needs neither this plan nor prefix queries.
+                            if (!decodeOnly) {
                                 auto previewReserved = reservedPages;
                                 std::map<PagedCacheManager *, long long> availablePages;
                                 std::map<PagedCacheManager *, DenseIdSet<>> protectedDomains;
@@ -3373,53 +3400,79 @@ namespace fastllm {
                                 auto previewQueue = prefillQueue;
                                 for (int i; (i = previewQueue.Pop()) >= 0;) {
                                     auto *ctx = orders[i].context;
-                                    if (ctx->isEnding || ctx->curTokens != 0) continue;
+                                    const int group = model->GetPrefillBatchGroup(ctx);
                                     if (ctx->cacheLen + ctx->currentTokens.size() > (size_t)maxTotalLens ||
                                         ctx->cacheLen + ctx->currentTokens.size() > (size_t)maxPromptTokens) continue;
-                                    if (candidates >= slots) { capacityLimited = true; break; }
+                                    if (candidates >= requestLimit) { batchFull = capacityLimited = true; break; }
+                                    if (!ctx->prefillOffset && newCandidates >= slots) {
+                                        capacityLimited = true; continue;
+                                    }
+                                    if (scheduling.chunked && scheduling.balanceDP && groupLoads[group].tokens >=
+                                        std::max(1, prefillBatchLimit / prefillGroups)) {
+                                        groupLoads[group].capacityLimited = true;
+                                        continue;
+                                    }
                                     auto *domain = sharedKvPool ? model->GetPagedKVCacheBudgetManager(ctx) : nullptr;
                                     if (sharedKvPool && !availablePages.count(domain)) {
                                         availablePages[domain] = freePagedPages(domain);
                                         protectedDomains[domain].Reset(domain->maxPages);
                                     }
                                     std::vector<int> unreferenced;
-                                    const int prefix = PreviewResidentPrefix(model, ctx,
-                                        domain, unreferenced, previewManagers[domain],
-                                        prefixPreviewExecutor);
-                                    const int count = (int)ctx->currentTokens.size() - prefix;
-                                    const bool single = count > prefillChunk || !ctx->multimodalInput.empty();
+                                    const int prefix = ctx->prefillOffset ? 0 : PreviewResidentPrefix(model, ctx,
+                                        domain, unreferenced, previewManagers[domain], prefixPreviewExecutor);
+                                    int count = (int)ctx->currentTokens.size() - ctx->prefillOffset - prefix;
+                                    const bool chunked = scheduling.chunked && ctx->multimodalInput.empty();
+                                    const bool single = (!chunked && count > prefillChunk) || !ctx->multimodalInput.empty();
+                                    if (chunked) count = std::min(count, scheduledChunk);
+                                    if (chunked && scheduling.balanceDP && groupLoads[group].tokens + count >
+                                        std::max(1, prefillBatchLimit / prefillGroups)) {
+                                        groupLoads[group].capacityLimited = true;
+                                        continue;
+                                    }
                                     if (candidates && (single || pendingTokens + count > prefillBatchLimit)) {
                                         capacityLimited = true;
-                                        break;
+                                        if (!scheduling.balanceDP) break;
+                                        continue;
                                     }
-                                    if (sharedKvPool) {
-                                        inference_trace::DetailSpan capacityTrace("capacity_and_dedup", detail);
-                                        if (detail) detail->Count("unreferenced_pages", unreferenced.size());
+                                    if (sharedKvPool && !ctx->prefillOffset) {
                                         auto &protectedPages = protectedDomains[domain];
                                         long long pins = 0;
                                         for (int page : unreferenced) pins += !protectedPages.Contains(page);
                                         const long long growth = std::max(0LL, remainingPages(ctx) - prefix / pageLen);
                                         if (previewReserved[domain] + growth + pins > availablePages[domain]) {
-                                            capacityLimited = true;
+                                            capacityLimited = groupLoads[group].capacityLimited = true;
                                             continue;
                                         }
                                         previewReserved[domain] += growth + pins;
                                         for (int page : unreferenced) protectedPages.Insert(page);
                                     }
+                                    candidatesToAdmit.push_back(i);
                                     ++candidates;
-                                    previewQueue.AddTokens(std::min(count, prefillChunk));
-                                    pendingTokens += std::min(count, prefillChunk);
-                                    oldest = std::min(oldest, ctx->queuedAt);
-                                    // A long request occupies the entire chunked forward path.
+                                    newCandidates += ctx->prefillOffset == 0;
+                                    const int work = std::min(count, prefillChunk);
+                                    previewQueue.AddTokens(work);
+                                    pendingTokens += work;
+                                    groupLoads[group].tokens += work;
+                                    ++groupLoads[group].requests;
+                                    oldest = std::min(oldest, ctx->prefillOffset ? ctx->prefillQueuedAt : ctx->queuedAt);
+                                    if (ctx->prefillOffset) oldestChunk = std::min(oldestChunk, ctx->prefillQueuedAt);
                                     capacityLimited |= single;
-                                    if (single || pendingTokens >= policy.targetTokens ||
-                                        (policy.targetRequests > 0 && candidates >= policy.targetRequests)) break;
+                                    // Release targets decide when to run, not how many ready
+                                    // requests fit. Plan through the actual batch budget.
+                                    if (single || pendingTokens >= prefillBatchLimit) { batchFull = true; break; }
                                 }
-                                capacityLimited |= candidates >= slots;
+                                batchFull |= candidates >= requestLimit ||
+                                    (candidates > 0 && newCandidates >= slots) || pendingTokens >= prefillBatchLimit;
+                                capacityLimited |= batchFull;
                             }
-                            const char *reason = policy.Decide(pendingTokens, candidates, activeDecode,
-                                capacityLimited, oldest, PrefillBatchPolicy::Clock::now());
-                            deferPrefill = std::strcmp(reason, "wait") == 0;
+                            const auto now = PrefillBatchPolicy::Clock::now();
+                            const char *reason = scheduling.balanceDP
+                                ? DecidePrefillGroups(policy, groupLoads, batchFull, oldest, now)
+                                : policy.Decide(pendingTokens, candidates, activeDecode, capacityLimited, oldest, now);
+                            if (scheduling.chunked && oldestChunk != PrefillBatchPolicy::Clock::time_point::max() &&
+                                now - oldestChunk >= std::chrono::milliseconds(scheduling.chunkWaitMs)) reason = "chunk_timeout";
+                            if (decodeOnly) reason = "decode_budget";
+                            deferPrefill = std::strcmp(reason, "wait") == 0 || std::strcmp(reason, "decode_budget") == 0;
                             previewRegion.Stop();
                             if (trace) {
                                 trace->prefillDecision = reason;
@@ -3428,20 +3481,21 @@ namespace fastllm {
                                 trace->activeDecode = activeDecode;
                                 trace->Mark("prefill_preview_ms");
                             }
-                            // Real admission always rematches. If an earlier
-                            // admission changes the budget, the candidate is
-                            // rejected and its references are released here.
-                            // No restoration occurs on a decode-only wait pass.
-                            if (!deferPrefill && !(capacityLimited && candidates == 0)) {
+                            if (!deferPrefill) {
                                 pendingTokens = 0;
-                                for (int i; (i = prefillQueue.Pop()) >= 0;) {
-                                    if ((int)plannedPrefills.size() >= slots) break;
+                                int admitted = 0;
+                                std::vector<long long> admittedTokens(prefillGroups, 0);
+                                // Restore only selected requests. Restore may find a shorter
+                                // prefix than preview, so keep the actual token/page checks
+                                // and rollback below; an estimate never authorizes allocation.
+                                for (int i : candidatesToAdmit) {
+                                    if ((int)plannedPrefills.size() >= requestLimit) break;
                                     const auto &order = orders[i];
                                     auto *ctx = order.context;
-                                    if (ctx->isEnding || ctx->curTokens != 0) continue;
                                     if (ctx->cacheLen + ctx->currentTokens.size() > (size_t)maxTotalLens ||
                                         ctx->cacheLen + ctx->currentTokens.size() > (size_t)maxPromptTokens) continue;
-                                    if (model->DeferHistoryCacheRestore()) {
+                                    if (!ctx->prefillOffset && admitted >= slots) continue;
+                                    if (!ctx->prefillOffset && model->DeferHistoryCacheRestore()) {
                                         const auto &cache = ctx->pastKeyValues[model->kvCacheId].first;
                                         const long long before = allocatedTokens(cache);
                                         RestoreResidentPrefix(model, ctx);
@@ -3450,17 +3504,28 @@ namespace fastllm {
                                         lenSum += allocatedTokens(cache) - before;
                                     }
                                     ctx->prefillPreview.reset();
-                                    const int count = ctx->currentTokens.size();
-                                    const bool single = count > prefillChunk || !ctx->multimodalInput.empty();
-                                    if (!plannedPrefills.empty() && (single || pendingTokens + count > prefillBatchLimit)) {
-                                        releasePendingPrefix(ctx);
-                                        break;
+                                    int count = (int)ctx->currentTokens.size() - ctx->prefillOffset;
+                                    const bool chunked = scheduling.chunked && ctx->multimodalInput.empty();
+                                    const bool single = (!chunked && count > prefillChunk) || !ctx->multimodalInput.empty();
+                                    if (chunked) count = std::min(count, scheduledChunk);
+                                    const int group = model->GetPrefillBatchGroup(ctx);
+                                    if (chunked && scheduling.balanceDP && admittedTokens[group] + count >
+                                        std::max(1, prefillBatchLimit / prefillGroups)) {
+                                        if (!ctx->prefillOffset) releasePendingPrefix(ctx);
+                                        continue;
                                     }
-                                    if (sharedKvPool && !reserveSharedRequest(ctx)) continue;
+                                    if (!plannedPrefills.empty() && (single || pendingTokens + count > prefillBatchLimit)) {
+                                        if (!ctx->prefillOffset) releasePendingPrefix(ctx);
+                                        if (!scheduling.balanceDP) break;
+                                        continue;
+                                    }
+                                    if (!ctx->prefillOffset && sharedKvPool && !reserveSharedRequest(ctx)) continue;
+                                    admitted += ctx->prefillOffset == 0;
                                     plannedPrefills.insert(order.second);
-                                    prefillQueue.AddTokens(std::min(count, prefillChunk));
+                                    plannedTokens[order.second] = count;
+                                    admittedTokens[group] += count;
                                     pendingTokens += count;
-                                    if (single || pendingTokens >= policy.targetTokens) break;
+                                    if (single || pendingTokens >= (scheduling.balanceDP ? prefillBatchLimit : policy.targetTokens)) break;
                                 }
                             }
                         }
@@ -3472,7 +3537,7 @@ namespace fastllm {
                             if (isPrompt == 0 && seqLens.size() > 0) {
                                 continue;
                             }
-                            int currentMaxLen = 0;
+                            int currentMaxLen = 0, admittedNew = 0;
 
                             // for (auto &it: model->responseContextDict.dicts) {
                             for (auto &ii : orders) {
@@ -3505,7 +3570,7 @@ namespace fastllm {
                                     }
                                     int alive = 0;
                                     if (batchPrefill || sharedKvPool) {
-                                        alive = activeDecode + seqLens.size();
+                                        alive = activeRequests + admittedNew;
                                     } else for (auto &it: model->responseContextDict.dicts) {
                                         if (it.second->isEnding) {
                                             continue;
@@ -3514,7 +3579,7 @@ namespace fastllm {
                                             alive++;
                                         }
                                     }
-                                    if (alive >= maxBatch) {
+                                    if (!it.second->prefillOffset && alive >= maxBatch) {
                                         continue;
                                     }
                                 }
@@ -3596,8 +3661,15 @@ namespace fastllm {
                                     currentActivate++;
                                 }
 
+                                const bool scheduledPrefill = isPrompt && scheduling.chunked && it.second->multimodalInput.empty();
+                                const int chunkTokens = scheduledPrefill ? plannedTokens.at(it.first) : 0;
                                 generationConfigs.push_back(it.second->generationConfig);
-                                model->PrepareToolCallConstraint(it.second, generationConfigs.back());
+                                if (scheduledPrefill)
+                                    generationConfigs.back().prefill_chunk_remaining =
+                                        (int)it.second->currentTokens.size() - it.second->prefillOffset - chunkTokens;
+                                if (generationConfigs.back().prefill_chunk_remaining <= 0)
+                                    model->PrepareToolCallConstraint(it.second, generationConfigs.back());
+                                if (isPrompt && !it.second->prefillOffset) ++admittedNew;
                                 logits.push_back(CreatePendingResultLogits(it.second->generationConfig));
 
                                 SetSamplingHistory(tokensManager, handles.size(),
@@ -3605,14 +3677,25 @@ namespace fastllm {
                                 handles.push_back(it.first);
                                 selectedContexts.push_back(it.second);
 
-                                if (it.second->preTokens == 0) {
+                                if (scheduledPrefill || it.second->preTokens == 0) {
                                     it.second->intParams["add_special_tokens"] = it.second->cacheLen > 0 ? false : it.second->generationConfig.add_special_tokens;
                                     it.second->intParams["promptLen"] = it.second->cacheLen + it.second->currentTokens.size();
                                     it.second->intParams["index"] = 0;
                                 } else {
                                     it.second->intParams["index"]++;
                                 }
-                                if (fastDecodeInput && !isPrompt && it.second->multimodalInput.empty() &&
+                                if (scheduledPrefill) {
+                                    std::vector<float> positions(chunkTokens);
+                                    for (int j = 0; j < chunkTokens; ++j) {
+                                        ids.push_back(it.second->currentTokens[it.second->prefillOffset + j]);
+                                        positions[j] = it.second->cacheLen + it.second->prefillOffset + j;
+                                    }
+                                    seqLens.push_back(chunkTokens);
+                                    prefillTokens += chunkTokens;
+                                    attentionMasks.push_back(nullptr);
+                                    positionIds.push_back(new Data(FLOAT32, {1, chunkTokens}, positions));
+                                    ownedPositionIds.push_back(positionIds.back());
+                                } else if (fastDecodeInput && !isPrompt && it.second->multimodalInput.empty() &&
                                     it.second->currentTokens.size() == 1) {
                                     const size_t row = seqLens.size();
                                     decodePositions[row] = (float)it.second->intParams["promptLen"] +
@@ -3662,7 +3745,7 @@ namespace fastllm {
                                                                            &it.second->pastKeyValues[i].second));
                                 }
                                 if (isPrompt) {
-                                    cnt += it.second->currentTokens.size();
+                                    cnt += scheduledPrefill ? chunkTokens : it.second->currentTokens.size();
 
                                     if (batchPrefill ? cnt >= prefillBatchLimit || seqLens[0] > prefillChunk : cnt > 1024) {
                                         break;
@@ -3796,6 +3879,9 @@ namespace fastllm {
                                     }
                                 }
                             }
+                            decodeBudget.Update(prefillTokens > 0, std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - prefillStartTime).count(),
+                                activeDecode >= std::max(1, model->prefillBatchPolicy.minDecodeRequests), scheduling.fairnessMs);
                             if (trace) trace->Mark("forward_dispatch_ms");
                             if (model->verbose && prefillTokens > 0) {
                                 double spend = std::chrono::duration<double>(
@@ -3867,6 +3953,12 @@ namespace fastllm {
                                 inference_trace::DetailSpan tokenTrace("lookup", detail);
                                 auto &it = *model->responseContextDict.dicts.find(handles[i]);
                                 tokenTrace.Next("stop_check_and_record");
+                                if (generationConfigs[i].prefill_chunk_remaining > 0) {
+                                    it.second->prefillOffset += seqLens[i];
+                                    it.second->prefillQueuedAt = PrefillBatchPolicy::Clock::now();
+                                    continue; // No sampling, output, EOS, grammar or output-limit update.
+                                }
+                                it.second->prefillOffset = 0;
                                 int curRet = ret[i];
                                 do {
                                     if (curRet == model->eos_token_id || model->eos_token_ids.find(curRet) != model->eos_token_ids.end()) {
@@ -4469,6 +4561,16 @@ namespace fastllm {
         return this->GetChunkedPrefillSize();
     }
 
+    bool basellm::SetPrefillScheduling(bool balanceDP, int adaptiveRequests, bool chunked,
+                                       int chunkWaitMs, int fairnessMs) {
+        std::lock_guard<std::mutex> lock(mainLoopLocker);
+        if (mainLoop || prefillBatchPolicy.targetTokens <= 0 || adaptiveRequests < 0 ||
+            chunkWaitMs < 0 || fairnessMs < 0 || (!chunked && (chunkWaitMs || fairnessMs)) ||
+            (chunked && (!SupportsChunkedPrefillScheduling() || GetChunkedPrefillSize() <= 0))) return false;
+        prefillScheduling = {balanceDP, chunked, adaptiveRequests, chunkWaitMs, fairnessMs};
+        return true;
+    }
+
     bool basellm::SetPrefillBatching(int targetTokens, int maxWaitMs, int targetRequests,
                                     int maxRequests, int minDecodeRequests) {
         std::lock_guard<std::mutex> lock(mainLoopLocker);
@@ -4478,6 +4580,7 @@ namespace fastllm {
             (maxRequests > 0 && targetRequests > maxRequests) ||
             (targetTokens > 0 && !SupportsPrefillBatching())) return false;
         prefillBatchPolicy = {targetTokens, maxWaitMs, targetRequests, maxRequests, minDecodeRequests};
+        if (targetTokens == 0) prefillScheduling = {};
         return true;
     }
 

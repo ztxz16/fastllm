@@ -53,6 +53,8 @@ namespace fastllm {
                                      int &token) override;
         bool NeedAttentionMask(int, int) override { return false; }
         bool SupportsPrefillBatching() const override;
+        int GetPrefillBatchGroups() const override { return attentionDP; }
+        bool SupportsChunkedPrefillScheduling() const override { return SupportsPrefillBatching(); }
         int GetPrefillBatchGroup(const ResponseContext *context) const override;
         // Bound idle TP prefill workspace with the shared pressure-aware pool.
         bool RetainCudaWorkspace() const override { return tpDevices.size() > 1; }

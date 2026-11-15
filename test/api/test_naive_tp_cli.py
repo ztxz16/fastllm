@@ -133,6 +133,23 @@ class NaiveTensorParallelCliTest(unittest.TestCase):
             with self.subTest(changes=changes), self.assertRaisesRegex(ValueError, 'prefill'):
                 self.configure([], saved={**values, **changes})
 
+    def test_prefill_scheduling_cli_and_saved_settings(self):
+        values = dict(prefill_batch_tokens=32768, prefill_dp_balance='true',
+                      prefill_adaptive_requests=256, prefill_chunked='true',
+                      prefill_chunk_max_wait_ms=1000, prefill_fairness_ms=1000)
+        for saved in (False, True):
+            options = [] if saved else [p for k, v in values.items() for p in ('--' + k, str(v))]
+            self.configure(options, saved=values if saved else None)
+            self.loaded_model.set_prefill_scheduling.assert_called_once_with(balance_dp=True,
+                adaptive_requests=256, chunked=True, chunk_max_wait_ms=1000, fairness_ms=1000)
+        self.configure([])
+        self.loaded_model.set_prefill_scheduling.assert_not_called()
+        for changes in ({'prefill_batch_tokens': 0}, {'prefill_chunked': 'false'},
+                        {'prefill_adaptive_requests': -1}, {'prefill_dp_balance': 'invalid'},
+                        {'prefill_chunk_max_wait_ms': True}, {'prefill_fairness_ms': 2147483648}):
+            with self.subTest(changes=changes), self.assertRaisesRegex(ValueError, 'prefill'):
+                self.configure([], saved={**values, **changes})
+
     def test_tp_defaults_and_explicit_slab(self):
         for ranks in (2, 4, 8):
             for slab in (None, 0, 32):

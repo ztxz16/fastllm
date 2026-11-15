@@ -95,6 +95,9 @@ namespace fastllm {
         uint64_t generation = 0; // Distinguish a reused handle while a consumer waits.
         std::unique_ptr<PrefillPrefixPreview> prefillPreview;
         PrefillBatchPolicy::Clock::time_point queuedAt = PrefillBatchPolicy::Clock::now();
+        // Consumed tokens in currentTokens while yielding between prefill chunks.
+        int prefillOffset = 0;
+        PrefillBatchPolicy::Clock::time_point prefillQueuedAt = queuedAt;
         bool isEnding = false; // 代表这个请求已经处理完成了，不需要再forward了，但生成的token可能还没有被fetch
         bool isAbort = false; // 代表这个请求被中断了，也就是说不会再有人来fetch它了，那么推理完之后就可以删除这个请求了
         
@@ -636,6 +639,11 @@ namespace fastllm {
         // Stable attention owner while queued; cache ownership is not migrated
         // by the scheduler. Models without DP keep the single FIFO group.
         virtual int GetPrefillBatchGroup(const ResponseContext *) const { return 0; }
+        virtual int GetPrefillBatchGroups() const { return 1; }
+        // Requires absolute text positions and suppression of intermediate sampling.
+        virtual bool SupportsChunkedPrefillScheduling() const { return false; }
+        bool SetPrefillScheduling(bool balanceDP, int adaptiveRequests, bool chunked,
+                                  int chunkWaitMs, int fairnessMs);
         bool SetPrefillBatching(int targetTokens, int maxWaitMs, int targetRequests = 0,
                                int maxRequests = 0, int minDecodeRequests = 0);
         virtual int PreviewPagedPrefixCacheExtra(ResponseContext *context, int length,
@@ -808,6 +816,7 @@ namespace fastllm {
         // 分块 prefill 的切片大小（首块与后续块相同）；-1 表示使用模型默认
         int chunkedPrefillSize = -1;
         PrefillBatchPolicy prefillBatchPolicy;
+        PrefillSchedulingOptions prefillScheduling;
 
         // 由调度器在 long-prefill 的非末切片前向期间设置。支持该优化的
         // 模型可据此只更新 KV/线性状态，省去不会被消费的 lm_head 和采样。

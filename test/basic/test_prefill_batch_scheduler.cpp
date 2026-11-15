@@ -25,10 +25,21 @@ public:
     struct Event { std::vector<int> lengths; Clock::time_point time; bool prefill; };
     std::vector<Event> events;
     bool grouped = false;
+    std::atomic<bool> blockAdmission{false};
+    std::atomic<int> deferredAdmissions{0};
+    bool TryAdmitResponseContext(ResponseContext *) override {
+        if (!blockAdmission) return true;
+        ++deferredAdmissions;
+        return false;
+    }
+    int GetPrefillBatchGroups() const override { return grouped ? 4 : 1; }
+    bool SupportsChunkedPrefillScheduling() const override { return supported; }
+    std::atomic<bool> holdPrefill{false}, prefillBlocked{false};
     int GetPrefillBatchGroup(const ResponseContext *ctx) const override {
-        return grouped && !ctx->allTokens.empty() ? ctx->allTokens.back() : 0;
+        return grouped && ctx->inputTokens > 0 ? ctx->allTokens[ctx->inputTokens - 1] : 0;
     }
     std::atomic<int> restores{0};
+    std::atomic<bool> expireOnRestore{false};
     mutable std::atomic<int> previews{0};
     std::atomic<bool> holdDecode{false}, decodeBlocked{false};
     void SetPrefix(int n) { cachedPrefix = n; }
@@ -62,7 +73,7 @@ public:
         }
     }
     ~SchedulerModel() override {
-        holdDecode = false;
+        holdDecode = holdPrefill = false;
         ShutdownRuntime();
         if (previewPool.trieRoot) previewPool.EvictTrieSubtree(previewPool.trieRoot);
         previewPool.trieRoot = nullptr;
@@ -76,6 +87,7 @@ public:
     bool DeferHistoryCacheRestore() const override { return cachedPrefix > 0; }
     bool TryRestoreHistoryCache(std::vector<int> &tokens, int &length) override {
         ++restores;
+        if (expireOnRestore.exchange(false)) cachedPrefix = 0;
         const int n = cachedPrefix;
         if (n <= 0 || tokens.size() <= (size_t)n) return false;
         length = n;
@@ -99,13 +111,13 @@ public:
     }
     std::vector<int> ForwardBatch(int batch, const Data &ids, const std::vector<Data *> &,
             const std::vector<Data *> &positions, const std::vector<int> &lengths,
-            std::vector<std::pair<Data *, Data *>> &kv, const std::vector<GenerationConfig> &,
+            std::vector<std::pair<Data *, Data *>> &kv, const std::vector<GenerationConfig> &configs,
             const LastTokensManager &, std::vector<std::vector<float> *> *) override {
         bool prefill = false;
         int offset = 0;
         for (int row = 0; row < batch; ++row) {
             const int old = kv[row].first->dims.empty() ? 0 : kv[row].first->dims[1];
-            prefill |= lengths[row] > 1;
+            prefill |= lengths[row] > 1 || configs[row].prefill_chunk_remaining >= 0;
             Check(positions[row] && positions[row]->Count(0) == lengths[row], "position length mismatch");
             for (int j = 0; j < lengths[row]; ++j)
                 Check(((float *)positions[row]->cpuData)[j] == old + j, "positions crossed request boundaries");
@@ -119,6 +131,11 @@ public:
         {
             std::lock_guard<std::mutex> lock(eventsMutex);
             events.push_back({lengths, Clock::now(), prefill});
+        }
+        if (prefill) {
+            prefillBlocked = true;
+            while (holdPrefill) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            prefillBlocked = false;
         }
         if (!prefill) {
             decodeBlocked = true;
@@ -184,6 +201,25 @@ int main() {
         FastllmCudaGetFreeSizes();
         FastllmCudaTrimBigBuffer();
 #endif
+        // A model's physical slots may be full even below maxBatch. Rejected
+        // prompts must remain untouched, and decode/output consumption must
+        // continue until the model permits admission.
+        for (bool batching : {false, true}) {
+            SchedulerModel model(batching);
+            if (batching) Check(model.SetPrefillBatching(8192, 0), "slot test batching");
+            int active = Seed(model, 128);
+            Hold(model);
+            model.blockAdmission = true;
+            const size_t before = model.Events().size();
+            int pending = Launch(model, 128, 2);
+            model.holdDecode = false;
+            Wait([&] { return model.deferredAdmissions > 0 && model.Events().size() > before + 2; });
+            Check(Prefills(model, before).empty(), "unadmitted prompt reached forward");
+            model.blockAdmission = false;
+            model.WakeResponseOutput();
+            Drain(model, {pending}, 2);
+            model.AbortResponse(active);
+        }
         // Pure release policy: targets are OR conditions and deadlines belong
         // to requests; capacity and idle decode release without waiting.
         {
@@ -339,6 +375,162 @@ int main() {
             for (const auto &e : events)
                 Check(e.lengths == std::vector<int>({2048, 1024, 1024}),
                       "DP admission did not balance uncached tokens / preserve FIFO");
+        }
+        // A full DP owner must not repeatedly restore and release its waiting
+        // requests while other owners fill the batch. Exercise zero-wait and
+        // low-decode admission as well as the normal waiting path.
+        for (int wait : {0, 50}) for (int minDecode : {0, 8}) {
+            SchedulerModel model(true, 3072);
+            model.grouped = true;
+            model.maxBatch = 32;
+            model.chunkedPrefillSize = 128;
+            Check(model.SetPrefillBatching(512, wait, 0, 24, minDecode), "DP quota config");
+            Check(model.SetPrefillScheduling(true, 0, true, 0, 0), "DP quota scheduling");
+            Seed(model, 3200); Hold(model);
+            const int restored = model.restores;
+            const int previewed = model.previews;
+            const size_t start = model.Events().size();
+            std::vector<int> handles;
+            for (int owner : {0, 0, 0, 0, 1, 1, 1, 1, 3, 3, 3, 3}) {
+                GenerationConfig cfg; cfg.output_token_limit = 1;
+                cfg.add_special_tokens = false; cfg.top_k = 1;
+                std::vector<int> tokens(3200, 1); tokens.back() = owner;
+                handles.push_back(model.LaunchResponseTokens(tokens, cfg));
+            }
+            model.holdDecode = false;
+            Drain(model, handles);
+            Check(model.restores == restored + (int)handles.size(), "DP quota restored an unselected request");
+            if (wait == 0)
+                Check(model.previews == previewed + (int)handles.size(), "full DP owner kept previewing queued prefixes");
+            auto events = Prefills(model, start);
+            Check(events.size() == 4, "DP quota changed number of batches");
+            for (const auto &e : events)
+                Check(e.lengths == std::vector<int>({128, 128, 128}), "DP quota changed packed tokens");
+        }
+        // A cache disappearing after planning must use the full input, then
+        // recheck the real batch budget instead of trusting preview lengths.
+        {
+            SchedulerModel model(true, 3072);
+            model.chunkedPrefillSize = 4096;
+            Check(model.SetPrefillBatching(4096, 0), "stale plan config");
+            Seed(model, 7168); Hold(model);
+            const size_t start = model.Events().size();
+            int a = Launch(model, 4096), b = Launch(model, 4096);
+            model.expireOnRestore = true;
+            model.holdDecode = false;
+            Drain(model, {a, b});
+            auto events = Prefills(model, start);
+            Check(events.size() == 2 && events[0].lengths == std::vector<int>{4096} &&
+                  events[1].lengths == std::vector<int>{4096}, "stale admission plan changed input or budget");
+        }
+        // A mandatory decode slice must not query pending prefixes. Keep a
+        // prefill in flight long enough to owe decode, then enqueue a new hit.
+        {
+            SchedulerModel model(true, 3072);
+            model.chunkedPrefillSize = 128;
+            Check(model.SetPrefillBatching(128, 50, 0, 4, 1), "decode-only batch config");
+            Check(model.SetPrefillScheduling(false, 0, true, 0, 20), "decode-only scheduling");
+            Seed(model, 3200); Hold(model);
+            model.holdPrefill = true;
+            int a = Launch(model, 3200);
+            model.holdDecode = false;
+            Wait([&] { return model.prefillBlocked.load(); });
+            int b = Launch(model, 3200);
+            const int previews = model.previews;
+            const int restores = model.restores;
+            model.holdDecode = true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+            model.holdPrefill = false;
+            Wait([&] { return model.decodeBlocked.load(); });
+            Check(model.previews == previews && model.restores == restores,
+                  "decode-only slice scanned or restored a pending prefix");
+            model.holdDecode = false;
+            Drain(model, {a, b});
+        }
+        // A partial prefill must yield its group to older waiting work at a
+        // chunk boundary, including short cached continuations. Rejoining at
+        // the tail also lets cold requests progress under continued arrivals.
+        for (bool grouped : {false, true}) {
+            SchedulerModel model(true, 3072);
+            model.grouped = grouped;
+            model.maxBatch = 32;
+            model.chunkedPrefillSize = 128;
+            Check(model.SetPrefillBatching(grouped ? 512 : 128, 0, 0, 24), "rotation config");
+            Check(model.SetPrefillScheduling(grouped, 0, true, 0, 0), "rotation scheduling");
+            Seed(model, 3200); Hold(model);
+            const size_t from = model.Events().size();
+            int cold = Launch(model, 3072 + 1025);
+            int warm = Launch(model, 3072 + 32);
+            model.holdDecode = false;
+            Drain(model, {warm, cold});
+            auto events = Prefills(model, from);
+            Check(events.size() >= 2 && events[0].lengths == std::vector<int>{128} &&
+                  events[1].lengths == std::vector<int>{32},
+                  "long prefill monopolized the group before a short cached request");
+        }
+        // Long prompts remain admitted across scheduler iterations. One-token
+        // tails emit exactly one result and retain absolute KV positions.
+        for (int batch : {1, 2, 8}) {
+            SchedulerModel model;
+            model.maxBatch = batch;
+            model.chunkedPrefillSize = 128;
+            Check(model.SetPrefillBatching(1024, 0), "chunk batching config rejected");
+            Check(model.SetPrefillScheduling(false, 0, true, 0, 1), "chunk scheduling rejected");
+            std::vector<int> handles;
+            for (int i = 0; i < batch; ++i) handles.push_back(Launch(model, 513 + 128 * i, 3));
+            Drain(model, handles, 3);
+            for (const auto &event : Prefills(model))
+                for (int n : event.lengths) Check(n <= 128, "long prompt did not yield at chunk boundary");
+        }
+        {
+            SchedulerModel model;
+            model.chunkedPrefillSize = 128;
+            Check(model.SetPrefillBatching(1024, 0), "fairness batch config");
+            Check(model.SetPrefillScheduling(false, 0, true, 0, 1), "fairness config");
+            Seed(model, 128); Hold(model);
+            const size_t from = model.Events().size();
+            model.holdPrefill = true;
+            int h = Launch(model, 1025, 1);
+            model.holdDecode = false;
+            Wait([&] { return model.prefillBlocked.load(); });
+            std::this_thread::sleep_for(std::chrono::milliseconds(3));
+            model.holdPrefill = false;
+            Drain(model, {h});
+            auto events = model.Events();
+            bool first = false, decode = false, interleaved = false;
+            for (size_t i = from; i < events.size(); ++i) {
+                if (events[i].prefill) { if (first && decode) { interleaved = true; break; } first = true; }
+                else if (first) decode = true;
+            }
+            Check(interleaved, "long prefill starved decode");
+        }
+        {
+            SchedulerModel model;
+            model.chunkedPrefillSize = 128;
+            Check(model.SetPrefillBatching(1024, 0), "cancel batch config");
+            Check(model.SetPrefillScheduling(false, 0, true, 0, 1), "cancel chunk config");
+            model.holdPrefill = true;
+            int h = Launch(model, 1025);
+            Wait([&] { return model.prefillBlocked.load(); });
+            model.AbortResponse(h);
+            model.holdPrefill = false;
+            Drain(model, {Launch(model, 129)});
+            Check(model.Events().size() == 3, "cancelled partial prompt continued executing");
+        }
+        {
+            PrefillSchedulingOptions options{true, true, 256, 1000, 1000};
+            auto p = options.Effective({32768, 30000, 16, 24, 64}, 128);
+            Check(p.targetTokens == 16384 && p.targetRequests == 8 && p.maxWaitMs == 15000,
+                  "adaptive release target incorrect");
+            std::vector<PrefillGroupLoad> groups(8);
+            for (auto &g : groups) g.decoding = 16;
+            groups[0].tokens = 32768; groups[0].requests = 16;
+            auto t = Clock::now();
+            Check(std::string(DecidePrefillGroups(p, groups, false, t, t)) == "wait", "one DP released empty peers");
+            for (auto &g : groups) { g.tokens = 2048; g.requests = 1; }
+            Check(std::string(DecidePrefillGroups(p, groups, false, t, t)) == "dp_targets", "ready DPs did not release");
+            groups.back().tokens = 0; groups.back().requests = 0;
+            Check(std::string(DecidePrefillGroups(p, groups, false, t, t + std::chrono::seconds(15))) == "timeout", "empty DP caused starvation");
         }
         std::cout << "ALL_PASS preview/admission, capacity, requests, idle, cache invalidation, deadlines, decode, cancellation, chunking\n";
         return 0;
