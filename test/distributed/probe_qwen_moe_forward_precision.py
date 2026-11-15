@@ -124,6 +124,49 @@ def compare(label, actual, expected, width, exact=False):
                        ('exact replay gate' if exact else f'atol={ATOL}; rtol={RTOL}'))
 
 
+def compare_native_head_replay(actual, expected, width):
+    """/**
+     * 按正式JSON传输格式核验FP32输出头重放，保留格式化之前的全部误差。
+     * 正式logits经json11的%.12f发送，不能直接与未格式化的Python双精度值判等。
+     * 仅将重放值按同一格式编码；编码后必须零容差相等，且相邻FP32值不能编码
+     * 为同一数值。遇到接近零的编码歧义时拒绝精确归因，不用放宽阈值代替证据。
+     * @param actual 独立重放得到的有限FP32 logits，提升为Python float保存。
+     * @param expected 正式会话已经过JSON传输的logits，不再次格式化。
+     * @param width 词表宽度，必须与两侧形状一致。
+     * @return 精确传输比较、原始误差及编码歧义数；非法FP32或形状抛ValueError。
+     */"""
+    label = 'native_head_reproduces_traced_logits'
+    raw = compare(label, actual, expected, width, exact=True)
+    encoded, ambiguous = [], []
+    for value in actual:
+        try:
+            packed = struct.pack('<f', value)
+        except (OverflowError, struct.error) as error:
+            raise ValueError('head replay is outside finite FP32 range') from error
+        if struct.unpack('<f', packed)[0] != value:
+            raise ValueError('head replay must contain exact FP32 values')
+        text = format(value, '.12f')
+        if len(text) >= 32:
+            raise ValueError('head replay exceeds the native JSON numeric buffer')
+        wire_value = float(text)
+        encoded.append(wire_value)
+
+        bits, = struct.unpack('<I', packed)
+        neighbors = ([struct.unpack('<f', struct.pack('<I', bits + delta))[0] for delta in (-1, 1)]
+                     if value != 0 else [2.0**-149, -2.0**-149])
+        ambiguous.append(any(math.isfinite(v) and float(format(v, '.12f')) == wire_value for v in neighbors))
+
+    row = compare(label, encoded, expected, width, exact=True)
+    row.update(raw_numeric_comparison=raw, native_serialization='json11 %.12f, buffer=32',
+               serialization_ambiguous_elements=sum(ambiguous))
+    row['reason'] += '; native FP32 replay encoded with json11 %.12f; adjacent FP32 must remain distinguishable'
+    if any(ambiguous):
+        row.update(status='FAIL', failed_elements=sum(
+            a != b or uncertain for a, b, uncertain in zip(encoded, expected, ambiguous)))
+        row['reason'] += '; serialization loses FP32 identity: exact attribution unavailable'
+    return row
+
+
 def native_forward(args, output, original, ids, trace_directory=None):
     """/** 正式四rank会话只提交一个完整历史请求；用子进程环境开启采集，不修改调用者环境。 */"""
     request = copy.deepcopy(original['request'])
@@ -241,9 +284,10 @@ def main():
         report_description='保留历史失败。仅rank0完整历史Eager请求，其余rank参与EP。'
                            '不是原调度重放、完整模型验收或性能测试；不改变原阈值。')
 
-    def record(label, actual, expected, width, exact=False):
+    def record(label, actual, expected, width, exact=False, native_wire=False):
         """/** 每项立即输出并保存，包括精确差异数与末Token误差，避免后续异常丢失证据。 */"""
-        row = compare(label, actual, expected, width, exact)
+        row = (compare_native_head_replay(actual, expected, width) if native_wire else
+               compare(label, actual, expected, width, exact))
         rows.append(row)
         save_report(output, rows, metadata)
         print(f'{row["status"]}: {label}: max_abs={row["max_abs_error"]:.9g} '
@@ -313,7 +357,8 @@ def main():
         head_meta, head = head_probe(args, config, hf, native, output)
         metadata['head_reference'] = head_meta
         hf_valid = record('hf_head_reproduces_saved_logits', head['hf_head_full'], saved_hf, vocab, exact=True)
-        native_valid = record('native_head_reproduces_traced_logits', head['native_head_replay'], traced, vocab, exact=True)
+        native_valid = record('native_head_reproduces_traced_logits', head['native_head_replay'], traced, vocab,
+                              exact=True, native_wire=True)
         metadata['head_attribution_valid'] = hf_valid and native_valid and metadata['trace_attribution_valid']
         record('final_norm_accumulated', native['final_norm'], head['hf_norm'], hidden)
         record('final_norm_same_native_input', native['final_norm'], head['hf_norm_on_native'], hidden)

@@ -1,6 +1,7 @@
 """完整前向诊断的CPU检查：真实边界连续性、二进制校验、公开入口和归因门禁。"""
 
 import copy
+import ctypes
 from contextlib import redirect_stdout
 import io
 import json
@@ -139,6 +140,45 @@ class ForwardPrecisionTests(unittest.TestCase):
                                       ([float('inf')], [1.], 1), ([1.], [1.], 0)):
             with self.subTest(values=values, width=width), self.assertRaises(ValueError):
                 probe.compare('bad', values, target, width)
+
+    def test_head_gate_uses_actual_native_decimal_wire_format_without_relaxing_tolerance(self):
+        # 直接调用宿主libc的snprintf作为正式%.12f格式的oracle，不编译或加载CUDA。
+        libc = ctypes.CDLL(None)
+        actual = [struct.unpack('<f', struct.pack('<f', value))[0] for value in (.1, -.3, 2.1)]
+        expected = []
+        for value in actual:
+            buffer = ctypes.create_string_buffer(32)
+            libc.snprintf(buffer, ctypes.c_size_t(32), b'%.12f', ctypes.c_double(value))
+            expected.append(float(buffer.value))
+        raw = probe.compare('raw', actual, expected, 3, exact=True)
+        self.assertEqual(raw['status'], 'FAIL')
+        self.assertGreater(raw['max_abs_error'], 0.)
+        row = probe.compare_native_head_replay(actual, expected, 3)
+        self.assertEqual(row['status'], 'PASS')
+        self.assertEqual(row['max_abs_error'], 0.)
+        self.assertEqual(row['serialization_ambiguous_elements'], 0)
+        self.assertEqual(row['raw_numeric_comparison']['max_abs_error'], raw['max_abs_error'])
+
+        bits, = struct.unpack('<I', struct.pack('<f', actual[0]))
+        adjacent = [struct.unpack('<f', struct.pack('<I', bits+1))[0], *actual[1:]]
+        self.assertEqual(probe.compare('tolerance', adjacent, expected, 3)['status'], 'PASS')
+        row = probe.compare_native_head_replay(adjacent, expected, 3)
+        self.assertEqual(row['status'], 'FAIL')
+        self.assertEqual(row['failed_elements'], 1)
+        expected[0] += 1e-14
+        self.assertEqual(probe.compare_native_head_replay(actual, expected, 3)['status'], 'FAIL')
+
+    def test_head_gate_rejects_ambiguous_wire_identity_and_invalid_values(self):
+        for value in (0., -0., 2.**-149, -(2.**-149), 2.**-30):
+            with self.subTest(value=value):
+                row = probe.compare_native_head_replay([value], [float(format(value, '.12f'))], 1)
+                self.assertEqual(row['status'], 'FAIL')
+                self.assertEqual(row['serialization_ambiguous_elements'], 1)
+                self.assertIn('identity', row['reason'])
+        for actual, expected in (([.1], [.1]), ([float('nan')], [0.]), ([1.], [float('inf')]),
+                                  ([1e40], [1.]), ([2.**80], [1.]), ([], [])):
+            with self.subTest(actual=actual), self.assertRaises(ValueError):
+                probe.compare_native_head_replay(actual, expected, 1)
 
     def test_native_uses_public_session_and_child_only_trace_environment(self):
         args = SimpleNamespace(build=Path('/build'), model=Path('/model'), timeout=10)
