@@ -18,7 +18,7 @@ class VideoRuntimeTest(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
         paths = ["runtime/ftllm/" + name for name in
-                 ("minimax_h3_server", "minimax_h3_generate", "libfastllm_minimax_h3.so")]
+                 video.NATIVE_FILES + video.ASSETS]
         paths += ["media/bin/ffmpeg", "media/bin/ffprobe"]
         for name in paths:
             path = self.root / name
@@ -31,11 +31,21 @@ class VideoRuntimeTest(unittest.TestCase):
         self.addCleanup(lookup.stop)
 
     def test_complete_runtime(self):
-        self.assertEqual(len(video.check_video_runtime(self.root)), 5)
+        self.assertEqual(len(video.check_video_runtime(self.root)), 18)
 
     def test_missing_backend_fails(self):
         (self.root / "runtime/ftllm/minimax_h3_server").unlink()
-        with self.assertRaisesRegex(RuntimeError, "Missing bundled video runtime: minimax_h3_server"):
+        with self.assertRaisesRegex(RuntimeError, "Missing bundled media runtime: minimax_h3_server"):
+            video.check_video_runtime(self.root)
+
+    def test_missing_qwen_backend_fails(self):
+        (self.root / "runtime/ftllm/qwen_image_server").unlink()
+        with self.assertRaisesRegex(RuntimeError, "Missing bundled media runtime: qwen_image_server"):
+            video.check_video_runtime(self.root)
+
+    def test_missing_qwen_assets_fail(self):
+        (self.root / "runtime/ftllm/qwen_image_assets/openapi.json").unlink()
+        with self.assertRaisesRegex(RuntimeError, "Missing bundled media runtime: qwen_image_assets/openapi.json"):
             video.check_video_runtime(self.root)
 
     def test_external_media_tool_is_not_bundled(self):
@@ -43,7 +53,7 @@ class VideoRuntimeTest(unittest.TestCase):
         external = self.root / "outside-ffprobe"
         path.rename(external)
         path.symlink_to(external)
-        with self.assertRaisesRegex(RuntimeError, "Missing bundled video runtime: ffprobe"):
+        with self.assertRaisesRegex(RuntimeError, "Missing bundled media runtime: ffprobe"):
             video.check_video_runtime(self.root)
 
 

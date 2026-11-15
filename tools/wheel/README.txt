@@ -24,3 +24,8 @@ This is a packaging choice, not a change to kernel arithmetic or runtime dispatc
 When changing the architecture list, check native coverage with cuobjdump
 --list-elf and test on the intended hardware. GLIBC auditing and CUDA runtime
 dependencies remain handled by package_wheel.py and the normal release process.
+
+The release wheel also builds and checks the Qwen-Image-2.1 native library,
+server, generator and web/API assets. Run ftllm qwen-image server --help or
+ftllm qwen-image generate --help after installation; no Torch/Diffusers runtime
+is needed. Media targets retain their own SM80+ architecture/PTX policy.

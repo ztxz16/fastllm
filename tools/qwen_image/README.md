@@ -6,6 +6,20 @@
 
 常驻只复用模型权重；提示词、参考图和噪声仍逐请求计算。KV、RoPE 和临时张量在请求结束释放；取消或异常同时卸载权重，下一请求重新评估。临时张量在请求内通过有界显存池复用。常驻速度需要预热，不应将热启动耗时当作包含首次权重加载的耗时。
 
+## Wheel 和绿色包
+
+Linux CUDA Wheel 和绿色包内置原生后端，无需安装 PyTorch 或 Diffusers：
+
+```bash
+ftllm qwen-image server --model /path/to/Qwen-Image-2.1 --devices 0 --port 8008
+ftllm qwen-image generate --model /path/to/Qwen-Image-2.1 --devices 0 \
+  --prompt 'A red apple on a wooden table.' --output apple.png
+```
+
+服务自动使用包内的 demo 和 OpenAPI 文件，浏览器打开 `http://127.0.0.1:8008/demo`。
+`ftllm qwen-image server --help` 和 `ftllm qwen-image generate --help` 查看原生参数；
+`--devices 0,1` 开启双卡 DiT 张量并行。模型权重需另行准备，精度与硬件限制见下文。
+
 ## 构建
 
 单卡仅需要 C++17、CUDA 12.8+、cuBLAS/cuBLASLt 和 pthread；多卡还需要 NCCL 的头文件与动态库；json11、httplib、FlashInfer、CUTLASS 已在仓库中。GPU 架构按实际设备设置，RTX PRO 5000 Blackwell 为 120。

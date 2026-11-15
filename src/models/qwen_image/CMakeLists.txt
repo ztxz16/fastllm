@@ -1,8 +1,25 @@
 set_directory_properties(PROPERTIES COMPILE_OPTIONS "" COMPILE_DEFINITIONS "" INCLUDE_DIRECTORIES "")
-add_library(fastllm_qwen_image SHARED ops.cu conv.cu model.cpp pipeline.cpp parallel.cpp quantized.cpp
-    ../minimax_h3_image/fp8.cu ../minimax_h3_image/int8.cu
-    ../minimax_h3_image/gguf.cu ../minimax_h3_image/gguf_checkpoint.cpp ../minimax_h3_image/source.cpp)
-target_link_libraries(fastllm_qwen_image PUBLIC fastllm_continuous)
+if(FASTLLM_CUDA_COMPRESSION_OPTION)
+    add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:${FASTLLM_CUDA_COMPRESSION_OPTION}>)
+endif()
+# Keep exceptions, the shared CUDA runtime and exported continuous operators
+# consistent between the packaged executable and its shared library.
+string(REPLACE "-static-libgcc" "-shared-libgcc" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+string(REPLACE "--exclude-libs,ALL" "--exclude-libs,libstdc++.a:libgcc.a:libgcc_eh.a"
+    CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+set(CMAKE_CUDA_RUNTIME_LIBRARY Shared)
+set_target_properties(fastllm_continuous PROPERTIES CUDA_RUNTIME_LIBRARY Shared)
+add_library(fastllm_qwen_image SHARED ops.cu conv.cu model.cpp pipeline.cpp parallel.cpp quantized.cpp)
+if(MAKE_WHL_X86 AND BUILD_MINIMAX_H3)
+    # Wheels already ship these continuous/quantized operators in H3. Import
+    # that DSO instead of embedding another copy of the same CUDA fatbins.
+    target_link_libraries(fastllm_qwen_image PUBLIC fastllm_minimax_h3)
+else()
+    target_sources(fastllm_qwen_image PRIVATE
+        ../minimax_h3_image/fp8.cu ../minimax_h3_image/int8.cu
+        ../minimax_h3_image/gguf.cu ../minimax_h3_image/gguf_checkpoint.cpp ../minimax_h3_image/source.cpp)
+    target_link_libraries(fastllm_qwen_image PUBLIC fastllm_continuous)
+endif()
 target_include_directories(fastllm_qwen_image PRIVATE
     ${PROJECT_SOURCE_DIR}/third_party/cutlass/include ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
 target_compile_options(fastllm_qwen_image PRIVATE
@@ -10,6 +27,7 @@ target_compile_options(fastllm_qwen_image PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-ffp-contract=off>)
 set_target_properties(fastllm_qwen_image PROPERTIES CUDA_STANDARD 17 CXX_STANDARD 17
     CUDA_ARCHITECTURES "${FASTLLM_CUDA_ARCHITECTURES}" LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+if(NOT (MAKE_WHL_X86 AND BUILD_MINIMAX_H3))
 # Reuse H3's native FP8 reader/GEMM, including its cuBLAS fallback on SM89+.
 # Keep architecture-specific instantiations separate from portable kernels.
 if(FASTLLM_CUTLASS_FP8_SM120_ENABLED AND NOT CUDA_NO_TENSOR_CORE AND
@@ -54,6 +72,7 @@ if(NOT CUDA_NO_TENSOR_CORE AND CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL
     target_compile_definitions(fastllm_qwen_image PRIVATE FASTLLM_IMAGE_INT8_SCALED)
     target_sources(fastllm_qwen_image PRIVATE $<TARGET_OBJECTS:fastllm_qwen_int8_scaled>)
 endif()
+endif()
 add_executable(qwen_image_server server.cpp)
 target_include_directories(qwen_image_server PRIVATE ${PROJECT_SOURCE_DIR}/example/webui)
 target_link_libraries(qwen_image_server PRIVATE fastllm_qwen_image pthread)
@@ -61,6 +80,28 @@ set_target_properties(qwen_image_server PROPERTIES CXX_STANDARD 17)
 add_executable(qwen_image_generate ${PROJECT_SOURCE_DIR}/tools/qwen_image/generate.cpp)
 target_link_libraries(qwen_image_generate PRIVATE fastllm_qwen_image)
 set_target_properties(qwen_image_generate PROPERTIES CXX_STANDARD 17)
+
+if(MAKE_WHL_X86)
+    # BF16 image kernels require Ampere; legacy targets remain in the LLM library.
+    set(FASTLLM_QWEN_IMAGE_CUDA_ARCHITECTURES "")
+    foreach(arch IN LISTS FASTLLM_CUDA_ARCHITECTURES)
+        if(arch MATCHES "^([0-9]+)" AND CMAKE_MATCH_1 LESS 80)
+            continue()
+        endif()
+        list(APPEND FASTLLM_QWEN_IMAGE_CUDA_ARCHITECTURES "${arch}")
+    endforeach()
+    if(NOT FASTLLM_QWEN_IMAGE_CUDA_ARCHITECTURES)
+        message(FATAL_ERROR "The release Qwen Image backend requires at least one SM80+ CUDA target")
+    endif()
+    set_target_properties(fastllm_continuous fastllm_qwen_image PROPERTIES
+        CUDA_ARCHITECTURES "${FASTLLM_QWEN_IMAGE_CUDA_ARCHITECTURES}")
+    if(TARGET fastllm_qwen_gguf_mmq)
+        set_target_properties(fastllm_qwen_gguf_mmq PROPERTIES
+            CUDA_ARCHITECTURES "${FASTLLM_QWEN_IMAGE_CUDA_ARCHITECTURES}")
+    endif()
+    set_target_properties(fastllm_qwen_image qwen_image_server qwen_image_generate PROPERTIES
+        INSTALL_RPATH "$ORIGIN;$ORIGIN/../nvidia/cuda_runtime/lib;$ORIGIN/../nvidia/cublas/lib;$ORIGIN/../nvidia/nccl/lib")
+endif()
 
 if(UNIT_TEST)
     # The root enables testing after adding model subdirectories.
@@ -86,7 +127,7 @@ if(UNIT_TEST)
     target_include_directories(qwen_image_quantized_test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
     target_link_libraries(qwen_image_quantized_test PRIVATE fastllm_qwen_image cudart)
-    if(TARGET fastllm_qwen_gguf_mmq)
+    if(TARGET fastllm_qwen_gguf_mmq OR (MAKE_WHL_X86 AND BUILD_MINIMAX_H3 AND NOT CUDA_NO_TENSOR_CORE))
         target_compile_definitions(qwen_image_quantized_test PRIVATE FASTLLM_IMAGE_GGUF_MMQ)
     endif()
     set_target_properties(qwen_image_quantized_test PROPERTIES CXX_STANDARD 17)
