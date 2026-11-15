@@ -79,6 +79,7 @@ def cases():
               ("official_expert_counts", dict(experts=60, topk=4)),
               ("attention_fp16_rounding", dict(bias=False, attention_rounding=True)),
               ("qkv_bias_rounding", dict(qkv_bias_rounding=True)),
+              ("mixed_qkv_bias", dict(mixed_qkv_bias=True)),
               ("context_boundary", dict(boundary=True))]
     for name, patch, reason in [
         ("quantized", {"quantization_config": {}}, "quantized checkpoints"),
@@ -110,7 +111,8 @@ def cases():
 def make_case(directory, spec, world):
     """/** 保存固定输入和模型，故障 case 仅改变被验证的约束，不修改执行后端。 */"""
     options = {k: v for k, v in spec.items() if k in {
-        "dtype", "bias", "normalize", "experts", "topk", "tied", "indexed", "hotspot", "qkv_bias_rounding"}}
+        "dtype", "bias", "normalize", "experts", "topk", "tied", "indexed", "hotspot",
+        "qkv_bias_rounding", "mixed_qkv_bias"}}
     config, tensors = fixture(directory / "model", **options)
     config.update(spec.get("config", {}))
     tasks = tasks_for(world, spec.get("hotspot", False))

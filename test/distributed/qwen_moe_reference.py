@@ -7,7 +7,7 @@ from run_qwen3_shards import encode, decode, save_fixture
 
 
 def fixture(directory, *, dtype="F16", bias=True, normalize=False, experts=5, topk=2,
-            tied=False, indexed=False, hotspot=False, qkv_bias_rounding=False):
+            tied=False, indexed=False, hotspot=False, qkv_bias_rounding=False, mixed_qkv_bias=False):
     """/** 创建全专家小模型；权重直接按 HF 名称生成，不依赖 C++ 分片计划。 */"""
     config = dict(model_type="qwen2_moe", hidden_size=8, num_hidden_layers=2,
                   num_attention_heads=2, num_key_value_heads=1, head_dim=4,
@@ -47,6 +47,13 @@ def fixture(directory, *, dtype="F16", bias=True, normalize=False, experts=5, to
             add(p + "mlp." + name + ".gate_proj.weight", [width, 8])
             add(p + "mlp." + name + ".up_proj.weight", [width, 8])
             add(p + "mlp." + name + ".down_proj.weight", [8, width])
+
+    if mixed_qkv_bias:
+        if not bias or qkv_bias_rounding:
+            raise ValueError('mixed QKV bias fixture requires bias and ordinary seeded weights')
+        # 首层无QKV bias、第二层有；检出只按首层选后端、未warmup后续层等错误。
+        for name in ('q', 'k', 'v'):
+            del tensors[f'model.layers.0.self_attn.{name}_proj.bias']
 
     if qkv_bias_rounding:
         if dtype != 'F16' or not bias or tied:

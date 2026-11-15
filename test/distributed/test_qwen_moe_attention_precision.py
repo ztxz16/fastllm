@@ -125,6 +125,31 @@ class AttentionPrecisionTests(unittest.TestCase):
                     old = full_logits(config, tensors, ids)
                 self.assertTrue(any(abs(a-b) > .008+.008*abs(b) for a, b in zip(old, expected)))
 
+    def test_mixed_bias_gqa_fixture_checks_both_layers_and_detects_missing_bias(self):
+        """/** 混合bias模型经正式任务覆盖不等宽Q/KV、空rank、变长输入，丢弃第二层bias必须失败。 */"""
+        with tempfile.TemporaryDirectory() as temp:
+            config, tensors, tasks = make_case(Path(temp), dict(mixed_qkv_bias=True), 4)
+            self.assertNotEqual(config['num_attention_heads'], config['num_key_value_heads'])
+            without_bias = {key: value for key, value in tensors.items()
+                            if not key.endswith(('q_proj.bias', 'k_proj.bias', 'v_proj.bias'))}
+            for projection in ('q', 'k', 'v'):
+                self.assertNotIn(f'model.layers.0.self_attn.{projection}_proj.bias', tensors)
+                self.assertIn(f'model.layers.1.self_attn.{projection}_proj.bias', tensors)
+            failures, layers = 0, set()
+            for task in tasks:
+                task = dict(task, stage=1)
+                layers.add(task['layer'])
+                for rank, input_ in enumerate(task['inputs']):
+                    with self.subTest(task=task['name'], layer=task['layer'], rank=rank):
+                        expected = self.attention(config, tensors, task, input_)
+                        actual = forward(config, tensors, task, input_)['output']
+                        self.assertEqual(len(actual), len(expected))
+                        self.assertTrue(all(abs(a-b) <= .008+.008*abs(b) for a, b in zip(actual, expected)))
+                        old = forward(config, without_bias, task, input_)['output']
+                        failures += sum(abs(a-b) > .008+.008*abs(b) for a, b in zip(old, expected))
+            self.assertEqual(layers, {0, 1})
+            self.assertGreater(failures, 0)
+
 
 if __name__ == '__main__':
     unittest.main()

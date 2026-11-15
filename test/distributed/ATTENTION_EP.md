@@ -21,10 +21,22 @@
 - 任意 worker 故障使全组不可复用，回收整个进程树；不自动重试已执行请求。
 - MoE Attention保留HF FP16 Eager的中间张量精度：QK点积先转FP16，缩放后再转FP16，
   softmax以FP32计算后转FP16再与V相乘。单层、Eager及Graph使用同一路径；dense分支保持原语义。
-- MoE共享Linear使用`CUBLAS_COMPUTE_32F + CUBLAS_GEMM_DEFAULT_TENSOR_OP`，覆盖
-  Attention投影、Router、使用cuBLAS的专家投影和LM Head；沿用现有输出类型及舍入边界。
+- MoE一般Linear使用`CUBLAS_COMPUTE_32F + CUBLAS_GEMM_DEFAULT_TENSOR_OP`，覆盖
+  无偏置QKV、O投影、Router、使用cuBLAS的专家投影和LM Head；沿用现有输出类型及舍入边界。
   Dense Qwen3仍使用PEDANTIC。该选择与PyTorch 2.7.1常规FP16 GEMM配置对齐，
   不保证不同矩阵形状、融合布局或自定义Decode kernel与HF逐位一致，必须重跑完整模型验收。
+- MoE有偏置QKV采用三次独立`cublasLtMatmul`：FP16输入/输出、FP32计算、`BIAS` epilogue、
+  `beta=0`和1 MiB工作区。Q/K/V分别使用原始投影宽度及连续输出，之后仅拷贝到原Attention布局。
+  合并权重不变；偏置地址每层更新，算法按形状和实际地址对齐复用。对齐偏好与
+  [PyTorch 2.7.1 gemm_and_bias](https://github.com/pytorch/pytorch/blob/v2.7.1/aten/src/ATen/cuda/CUDABlas.cpp#L1189)一致。
+  临时与Graph资源分别管理；warmup完成算法选择，捕获期间只提交已有计划，缺计划或Lt失败
+  直接报层号/投影/形状，不fallback。新增投影缓冲和Lt工作区均计入原有512 MiB总预算。
+  本改动必须重新编译，CMake显式链接同一CUDA工具链的cuBLASLt。
+
+20261115T035744Z的独立QKV诊断在真实层13、4、7的同一HF输入上，只有`lt_separate_qkv`
+同时得到Q/K/V、Attention输出、下游router logits与专家选择的零差异；合并Lt、分离GemmEx、
+合并PyTorch Linear与FP32输出后转FP16均有差异。该证据定位了本轮修复，仍不代表原生完整层、
+完整模型或Graph/Prefix通过；独立诊断中的其他计算使用HF操作，正式验收阈值保持不变。
 
 ## 服务器执行顺序
 
@@ -318,6 +330,9 @@ HTTP 将 `run` 改为 `serve`，去掉 `--prompt`、`--max-new-tokens`，添加
   单层验收覆盖 Router、专家与层输出；全模型逐步比较独立 CPU 重算的完整 logits。
   `attention_fp16_rounding`通过正式单层入口覆盖放大的有限投影、变长/空rank与完整层；
   同一用例的CPU PyTorch检查证明缺失Attention中间FP16舍入会超过原有误差阈值。
+  `qkv_bias_rounding`继续拒绝点积先转FP16再加bias的重复舍入；`mixed_qkv_bias`首层无QKV bias、
+  第二层有bias，通过正式单层与EP1/2/4、Graph/Prefix组合检查逐层后端选择、GQA不等宽布局、
+  变长/空rank及缓存复用。CPU检查只验证用例的参考语义和检错能力，不代替服务器GPU执行。
 - 真实权重使用固定中文 JSONL 请求，独立 Transformers FP16 重算完整历史的末位置 logits。
   另外使用四个固定短序列记录全部层的真实输入、Router、共享/路由专家贡献和层输出，
   经正式单层接口进行四 rank 对照；单层检查关闭权重落盘，避免再次输出几十 GB 权重。
