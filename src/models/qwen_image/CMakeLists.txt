@@ -1,5 +1,5 @@
 set_directory_properties(PROPERTIES COMPILE_OPTIONS "" COMPILE_DEFINITIONS "" INCLUDE_DIRECTORIES "")
-add_library(fastllm_qwen_image SHARED ops.cu conv.cu model.cpp pipeline.cpp quantized.cpp
+add_library(fastllm_qwen_image SHARED ops.cu conv.cu model.cpp pipeline.cpp parallel.cpp quantized.cpp
     ../minimax_h3_image/fp8.cu ../minimax_h3_image/int8.cu
     ../minimax_h3_image/gguf.cu ../minimax_h3_image/gguf_checkpoint.cpp ../minimax_h3_image/source.cpp)
 target_link_libraries(fastllm_qwen_image PUBLIC fastllm_continuous)
@@ -65,6 +65,23 @@ set_target_properties(qwen_image_generate PROPERTIES CXX_STANDARD 17)
 if(UNIT_TEST)
     # The root enables testing after adding model subdirectories.
     enable_testing()
+    # Real model paths and two explicitly reserved GPUs are supplied by the caller.
+    add_executable(qwen_image_pipeline_parallel_test EXCLUDE_FROM_ALL
+        ${PROJECT_SOURCE_DIR}/test/qwen_image/test_pipeline_parallel.cpp)
+    target_include_directories(qwen_image_pipeline_parallel_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+    target_link_libraries(qwen_image_pipeline_parallel_test PRIVATE fastllm_qwen_image cudart)
+    set_target_properties(qwen_image_pipeline_parallel_test PROPERTIES CXX_STANDARD 17)
+    add_executable(qwen_image_parallel_test ${PROJECT_SOURCE_DIR}/test/qwen_image/test_parallel.cpp)
+    target_include_directories(qwen_image_parallel_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../minimax_h3_image ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+    target_link_libraries(qwen_image_parallel_test PRIVATE fastllm_qwen_image cudart)
+    set_target_properties(qwen_image_parallel_test PROPERTIES CXX_STANDARD 17)
+    target_compile_options(qwen_image_parallel_test PRIVATE -ffp-contract=off)
+    if(FASTLLM_NCCL_INCLUDE_DIR AND FASTLLM_NCCL_LIBRARY)
+        target_compile_definitions(qwen_image_parallel_test PRIVATE FASTLLM_QWEN_TEST_NCCL)
+    endif()
+    add_test(NAME qwen_image_parallel COMMAND qwen_image_parallel_test)
+    set_tests_properties(qwen_image_parallel PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     add_executable(qwen_image_quantized_test ${PROJECT_SOURCE_DIR}/test/qwen_image/test_quantized.cpp)
     target_include_directories(qwen_image_quantized_test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})

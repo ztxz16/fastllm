@@ -8,7 +8,7 @@
 
 ## 构建
 
-仅需要 C++17、CUDA 12.8+、cuBLAS/cuBLASLt 和 pthread；json11、httplib、FlashInfer、CUTLASS 已在仓库中。GPU 架构按实际设备设置，RTX PRO 5000 Blackwell 为 120。
+单卡仅需要 C++17、CUDA 12.8+、cuBLAS/cuBLASLt 和 pthread；多卡还需要 NCCL 的头文件与动态库；json11、httplib、FlashInfer、CUTLASS 已在仓库中。GPU 架构按实际设备设置，RTX PRO 5000 Blackwell 为 120。
 
 ```bash
 cmake -S . -B build-qwen-image \
@@ -41,9 +41,9 @@ FP8 需要支持 FP8 Tensor Core 的 SM89+ GPU；SM120 使用复用自 H3 的 CU
 - GGUF 按文件魔数和张量块类型读取，支持 F32/F16/BF16、Q4_0、Q8_0、Q2_K、Q3_K、Q4_K、Q5_K、Q6_K，允许同一层混合位宽。兼容无前缀和 `model.diffusion_model.` 前缀、合并或分开的 gate/up。要求 SM80+。小 token GEMM 复用 H3 的 MMQ；大 token 或不适用的形状使用有界 CUDA 解量化与 BF16 GEMM，权重始终以原块格式保存，不做二次量化。默认 MMQ 自动范围为 8..512 个 token；SM120 上 Q4_K 的 4096→24576 合并 gate/up 投影在缓存后的去噪阶段扩展到 1024 token，使 512² 编辑的主干也使用 MMQ；该扩展路径直接写 BF16/FP32 输出并使用经相对 L2 验证的 FMA 累加，避免大块 FP32 暂存。回退 GEMM 按形状调整分块，大 token QKV 直接写最终列区间。前缀构建保留原调度以避免误差累积，更大尺寸保留实测更快的回退路径，无需开关；范围与测速见验证记录。
 - 两种格式均计入常驻显存统计，支持阶段卸载、取消清理及恢复；不要求安装 Torch、GGUF Python 包或额外转换工具。Python 参考仅供开发验证。
 
-量化质量与实现误差的实测范围见 [验证记录](VALIDATION.md)；量化文件更小不保证更快。尚未接入 Qwen 多卡。
+量化质量与实现误差的实测范围见 [验证记录](VALIDATION.md)；量化文件更小不保证更快。DiT 支持 1 / 2 / 4 / 8 卡张量并行，四种权重格式使用相同启动方式。量化质量和并行数值限制见验证记录。
 
-## 启动与单卡隔离
+## 启动与 GPU 选择
 
 ```bash
 CUDA_VISIBLE_DEVICES=7 build-qwen-image/src/models/qwen_image/qwen_image_server \
@@ -54,6 +54,10 @@ CUDA_VISIBLE_DEVICES=7 build-qwen-image/src/models/qwen_image/qwen_image_server 
 ```
 
 `CUDA_VISIBLE_DEVICES=7` 将物理 7 号卡映射为进程内的逻辑 0 号卡。容器运行时同时使用 `--gpus device=7`，不要把 `--device` 再设为 7。可用 GPU UUID 避免编号变化。服务默认仅监听 loopback；`--api-key VALUE` 可启用 Bearer 验证。
+
+双卡使用 `CUDA_VISIBLE_DEVICES=6,7` 与 `--devices 0,1`（或 `--device 0,1`）；同样适用于生成命令行。参数始终指 CUDA 可见的逻辑编号，顺序中的第一张卡负责文本/视觉编码、参考图 VAE、采样和输出解码。部署决定设备，不增加请求级 TP 参数；文生图、单/多参考图和取消操作共用该模型实例。
+
+QKV 按完整注意力头切分，MLP 按 gate/up 分组切分。输出投影先累加 FP32 部分结果再转换；FP8/INT8 行并行输入同步量化范围，INT8 先对原始 INT32 累加量归约再缩放。量化权重在上传前切分，GGUF 保持压缩驻留。任一卡显存不足时，所有卡统一按阶段释放 DiT；请求结束或取消会清理各卡缓存。TP4/TP8 只验证布局和算子边界，实机验证以双卡记录为准。
 
 浏览器打开 `http://127.0.0.1:8008/demo`。页面支持上传参考图、设置种子、进度、取消、下载和复制 curl。浏览器将 JPEG/WebP 等输入转换为 PNG；直接 HTTP 上传需要 PNG。
 
@@ -70,7 +74,7 @@ CUDA_VISIBLE_DEVICES=7 build-qwen-image/src/models/qwen_image/qwen_image_generat
 
 ## HTTP API
 
-`GET /openapi.json` 提供 OpenAPI 3.0 定义；`GET /health` 返回 ready/loading/failed；`GET /v1/models` 返回 `qwen-image-2.1`。
+`GET /openapi.json` 提供 OpenAPI 3.0 定义；`GET /health` 返回 ready/loading/failed 和 `tensor_parallel_size`；`GET /v1/models` 返回 `qwen-image-2.1`。
 
 ```bash
 curl http://127.0.0.1:8008/v1/images/generations \
@@ -91,7 +95,7 @@ curl http://127.0.0.1:8008/v1/images/edits \
 
 同步调用可用 OpenAI 风格客户端；扩展参数通过客户端的 `extra_body` / 表单字段传递。长任务也可调用 `POST /v1/images/jobs`，JSON 为文生图，multipart 为参考图编辑。返回 HTTP 202 后轮询 `GET /v1/images/jobs/{id}`，取消用 `POST /v1/images/jobs/{id}/cancel`，下载用返回的 `url`。
 
-GPU 由一个工作线程串行执行。运行中加排队总数最多 4，超出返回 429；内存保留最近约 128 个已完成任务，PNG 持久保存在 output 目录，磁盘清理由调用方管理。取消在下一个阶段或采样步边界生效，正在运行的 CUDA 算子不会被中断。
+请求由一个工作线程串行调度，多卡使用各卡持久工作线程。运行中加排队总数最多 4，超出返回 429；内存保留最近约 128 个已完成任务，PNG 持久保存在 output 目录，磁盘清理由调用方管理。取消在下一个阶段或采样步边界生效，正在运行的 CUDA 算子不会被中断。
 
 ## 边界
 
@@ -100,7 +104,7 @@ GPU 由一个工作线程串行执行。运行中加排队总数最多 4，超�
 - 参考分辨率 256..1024，须为 32 的倍数，默认 1024。按原图长宽比调整到该面积；调整后须至少 65536 像素，极端比例或小面积会明确报错。
 - HTTP 请求最多 20MiB，参考图总计最多 1600 万像素。PNG 接收 8-bit、非 interlace 的灰度、RGB、调色板、灰度 alpha、RGBA；其他格式可用 demo 转换。
 - 暂未实现 mask inpainting、负面提示/CFG、LoRA、远程 URL 输入、视频生成。未知参数返回 400，避免静默忽略。
-- 默认 BF16 激活，支持 BF16 / 上述 FP8 / INT8 / GGUF DiT 权重；C++ Runtime / Pipeline 的 `fp32=true` 构造参数保留给 BF16 权重的数值回归，量化权重不支持此参数。尚未接入多卡。
+- 默认 BF16 激活，支持 BF16 / 上述 FP8 / INT8 / GGUF DiT 权重；C++ Runtime / Pipeline 的 `fp32=true` 构造参数保留给 BF16 权重的数值回归，量化权重不支持此参数。多卡仅切分 DiT，文本/视觉编码器和 VAE 在首卡执行。
 - 相同参数/种子在本原生后端可复现，但随机数生成器与 PyTorch 不同。跨实现精度比较必须共享初始噪声，不能只共享 seed。
 
 ## 算子复用
@@ -167,3 +171,15 @@ python test/qwen_image/compare_reference.py --model /path/to/original-bf16 \
 ```
 
 `--quantized-checkpoint` 也接收 Comfy INT8 safetensors，`compare_pipeline.py` 支持同一参数。INT8 参考以独立稠密 Hadamard 和 PyTorch 整数 GEMM 计算；GGUF 参考由 gguf-py 解码同一份权重并用 BF16 GEMM 计算，因此比较包含原生 MMQ 的激活量化误差。以上参数均只属于测试脚本，不属于部署 API。
+
+张量并行回归（原生 C++，不需要 PyTorch）：
+
+```bash
+cmake --build build-qwen-image --target qwen_image_parallel_test qwen_image_pipeline_parallel_test -j4
+CUDA_VISIBLE_DEVICES=6,7 ctest --test-dir build-qwen-image -R '^qwen_image_parallel$' --output-on-failure
+# 必须恰好可见两张已预留的卡；MODEL 可为四种已支持的目录格式。
+CUDA_VISIBLE_DEVICES=6,7 build-qwen-image/src/models/qwen_image/qwen_image_pipeline_parallel_test \
+  /path/to/model /path/to/reference1.png /path/to/reference2.png
+```
+
+单元回归覆盖分组权重切分、TP2/4/8 局部头、BF16/FP32 RoPE 尾块、跨卡 scale、INT32 原始累加归约（含超出 FP32 精确整数范围的部分和）、缩放顺序与 BF16/FP16/FP32 输出。真实模型回归比较单/双卡的 4/40 步双参考图，检查仅副卡显存受压时全卡卸载、常驻恢复和取消恢复。GPU 数量大于 2 的端到端精度/速度尚未实测；既有量化精度失败不因这些功能回归而视作通过。

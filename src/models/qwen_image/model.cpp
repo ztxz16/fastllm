@@ -105,11 +105,23 @@ Tensor TextEncoder::encode(const std::vector<int> &tokens, const std::vector<Ima
     // The diffusion checkpoint consumes the final decoder residual, before norm.
     return x;
 }
-DiT::DiT(Runtime &rt, const std::string &dir) : rt_(rt) {
+DiT::DiT(Runtime &rt, const std::string &dir, nomas::ParallelContext parallel)
+    : rt_(rt), parallel_(parallel) {
+    if (parallel.size() > 8 || 32 % parallel.size())
+        throw std::invalid_argument("Qwen Image supports TP sizes 1, 2, 4 and 8");
     const auto checkpoint = componentWeights(dir);
-    quantized_ = QuantizedProjections::load(rt, checkpoint);
+    quantized_ = QuantizedProjections::load(rt, checkpoint, parallel_);
     if (!quantized_ || !quantized_->isGguf())
         weights_ = std::make_unique<Weights>(rt, checkpoint);
+    if (weights_) {
+        for (int i = 0; i < 32; ++i) {
+            const auto p = "transformer_blocks." + std::to_string(i) + ".";
+            for (const char *suffix : {"attn.to_q", "attn.to_k", "attn.to_v", "img_mlp.gate_layer", "img_mlp.proj"})
+                parallel_.columnWeights(*weights_, p + suffix);
+            for (const char *suffix : {"attn.to_out.0", "img_mlp.out"})
+                parallel_.rowWeights(*weights_, p + suffix);
+        }
+    }
 }
 DiT::~DiT() = default;
 const Tensor &DiT::weight(const std::string &name) {
@@ -119,6 +131,12 @@ Tensor DiT::linear(const Tensor &x, const std::string &prefix, Tensor *output) {
     if (quantized_ && quantized_->contains(prefix))
         return quantized_->linear(x, {prefix}, output);
     return weights_->linear(x, prefix, false, output);
+}
+Tensor DiT::rowLinear(const Tensor &x, const std::string &prefix) {
+    if (parallel_.size() == 1) return linear(x, prefix);
+    if (!quantized_ || !quantized_->contains(prefix))
+        return parallel_.row(rt_, *weights_, x, prefix);
+    return quantized_->row(x, prefix);
 }
 void DiT::unload() {
     if (quantized_)
@@ -274,16 +292,17 @@ Tensor DiT::forward(const Tensor &latents, const Condition &cond, float timestep
         if (cache)
             cache->rope = rope;
     }
+    const int heads = 32 / parallel_.size(), channels = heads * 128;
     for (int layer = 0; layer < 32; ++layer) {
         auto p = "transformer_blocks." + std::to_string(layer) + ".";
         auto nx = rt_.normScale(x, modulation, cached ? 0 : prefix, 0);
-        Tensor q(x.rows, x.cols, x.dtype), k, v;
+        Tensor q(x.rows, channels, x.dtype), k, v;
         if (cached && cache->full) {
             k = cache->keys[layer].rowSlice(prefix, target);
             v = cache->values[layer].rowSlice(prefix, target);
         } else {
-            k = Tensor(x.rows, x.cols, x.dtype);
-            v = Tensor(x.rows, x.cols, x.dtype);
+            k = Tensor(x.rows, channels, x.dtype);
+            v = Tensor(x.rows, channels, x.dtype);
         }
         if (!rt_.isFloat32()) {
             auto qkv = packedLinear(nx, {p + "attn.to_q", p + "attn.to_k", p + "attn.to_v"});
@@ -299,7 +318,7 @@ Tensor DiT::forward(const Tensor &latents, const Condition &cond, float timestep
         if (cached) {
             k = cache->full ? cache->keys[layer] : rt_.concat({cache->keys[layer], k});
             v = cache->full ? cache->values[layer] : rt_.concat({cache->values[layer], v});
-            a = rt_.attention(q, k, v, 32);
+            a = rt_.attention(q, k, v, heads);
         } else {
             if (cache) {
                 cache->keys.push_back(cache->full ? k : rt_.concat({k.rowSlice(0, prefix)}));
@@ -317,12 +336,12 @@ Tensor DiT::forward(const Tensor &latents, const Condition &cond, float timestep
                 }
                 outputs.push_back(rt_.attention(
                     q.rowSlice(segment.start, count), k.rowSlice(0, segment.end), v.rowSlice(0, segment.end),
-                    32, mask.empty() ? nullptr : mask.data(), 128, 32, segment.text && segment.start == 0));
+                    heads, mask.empty() ? nullptr : mask.data(), 128, heads, segment.text && segment.start == 0));
             }
-            outputs.push_back(rt_.attention(q.rowSlice(prefix, target), k, v, 32));
+            outputs.push_back(rt_.attention(q.rowSlice(prefix, target), k, v, heads));
             a = rt_.concat(outputs);
         }
-        x = rt_.gatedAdd(x, linear(a, p + "attn.to_out.0"), modulation, cached ? 0 : prefix, 1);
+        x = rt_.gatedAdd(x, rowLinear(a, p + "attn.to_out.0"), modulation, cached ? 0 : prefix, 1);
         nx = rt_.normScale(x, modulation, cached ? 0 : prefix, 2);
         Tensor hidden;
         if (!rt_.isFloat32()) {
@@ -331,7 +350,7 @@ Tensor DiT::forward(const Tensor &latents, const Condition &cond, float timestep
             auto gate = linear(nx, p + "img_mlp.gate_layer");
             hidden = rt_.siluMultiply(gate, linear(nx, p + "img_mlp.proj"));
         }
-        auto mlp = linear(hidden, p + "img_mlp.out");
+        auto mlp = rowLinear(hidden, p + "img_mlp.out");
         x = rt_.gatedAdd(x, mlp, modulation, cached ? 0 : prefix, 3);
     }
     auto scale = linear(rt_.activation(temb), "norm_out.linear");

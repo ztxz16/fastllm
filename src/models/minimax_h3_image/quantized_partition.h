@@ -10,7 +10,7 @@ namespace fastllm::minimax_h3_image::detail {
 struct ProjectionSlice {
     int rows, cols, fullRows, fullCols, groups = 1, rank = 0, size = 1;
     bool rowParallel = false;
-    ProjectionSlice(const std::string &name, int n, int k, const ProjectionOptions &o)
+    ProjectionSlice(const std::string &name, int n, int k, const ProjectionOptions &o, int packedGroups = 1)
         : rows(n), cols(k), fullRows(n), fullCols(k), rank(o.rank), size(o.size) {
         if (n < 1 || k < 1 || size < 1 || rank < 0 || rank >= size)
             throw std::invalid_argument("invalid quantized matrix partition");
@@ -19,11 +19,19 @@ struct ProjectionSlice {
             const std::string s(suffix);
             return name.size() >= s.size() && name.compare(name.size()-s.size(), s.size(), s) == 0;
         };
-        rowParallel = ends(".attn.out_proj") || ends(".mlp.fc2");
-        if (ends(".attn.qkv_proj")) groups = 3;
-        else if (ends(".mlp.fc1")) groups = 2;
-        else if (!rowParallel) throw std::invalid_argument("unknown quantized TP projection: " + name);
-        if ((rowParallel ? k : n / groups) % size || n % groups)
+        if (o.qwenImage) {
+            rowParallel = ends(".attn.to_out.0") || ends(".img_mlp.out");
+            if (ends(".img_mlp.gate_up")) groups = 2;
+            else if (ends(".attn.to_q") || ends(".attn.to_k") || ends(".attn.to_v") ||
+                     ends(".img_mlp.gate_layer") || ends(".img_mlp.proj")) groups = packedGroups;
+            else if (!rowParallel) { size = 1; rank = 0; return; } // replicated input/time/output
+        } else {
+            rowParallel = ends(".attn.out_proj") || ends(".mlp.fc2");
+            if (ends(".attn.qkv_proj")) groups = 3;
+            else if (ends(".mlp.fc1")) groups = 2;
+            else if (!rowParallel) throw std::invalid_argument("unknown quantized TP projection: " + name);
+        }
+        if (groups < 1 || n % groups || (rowParallel ? k : n / groups) % size)
             throw std::invalid_argument("quantized projection does not divide TP size");
         if (rowParallel) cols /= size;
         else rows /= size;

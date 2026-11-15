@@ -46,7 +46,7 @@ __device__ __forceinline__ float activationScale(float largest, bool bf16Scale) 
     return bf16Scale ? float(B(fmaxf(largest, float(B(1e-12f))) / 448.f))
                      : fmaxf(largest / 448.f, 1e-12f);
 }
-__global__ void quantize(const B *x, uint8_t *q, float *scales, int rows, int cols, bool bf16Scale) {
+__global__ void quantize(const B *x, uint8_t *q, float *scales, int rows, int cols, bool bf16Scale, bool scaleOnly = false) {
     int row = blockIdx.x;
     float largest = 0;
     for (int c = threadIdx.x; c < cols; c += blockDim.x)
@@ -66,6 +66,7 @@ __global__ void quantize(const B *x, uint8_t *q, float *scales, int rows, int co
     float scale = maxima[0];
     if (threadIdx.x == 0)
         scales[row] = scale;
+    if (scaleOnly) return;
     for (int c = threadIdx.x; c < cols; c += blockDim.x) {
         float v = row < rows ? float(x[size_t(row) * cols + c]) / scale : 0;
         q[size_t(row) * cols + c] = __nv_cvt_float_to_fp8(v, __NV_SATFINITE, __NV_E4M3);
@@ -121,6 +122,25 @@ template <int Cols> __global__ void quantizeVector(const B *x, uint8_t *q, float
         }
     }
 }
+// Row-parallel inputs share the full row's scale. Requantize the original
+// BF16 values after the small collective, preserving vector-kernel arithmetic.
+__global__ void quantizeShared(const B *x, uint8_t *q, const float *scales, int rows, int cols) {
+    const int row = blockIdx.x;
+    const float inverse = 1.f / scales[row];
+    for (int c = threadIdx.x * 8; c < cols; c += blockDim.x * 8) {
+        uint4 values = row < rows ? *reinterpret_cast<const uint4 *>(x + size_t(row)*cols+c)
+                                 : make_uint4(0,0,0,0);
+        const auto *v = reinterpret_cast<const B *>(&values);
+        uint32_t packed[2]{};
+#pragma unroll
+        for (int j=0;j<4;++j) {
+            auto pair=__nv_cvt_float2_to_fp8x2(make_float2(float(v[j*2])*inverse,float(v[j*2+1])*inverse),
+                                               __NV_SATFINITE,__NV_E4M3);
+            packed[j/2] |= uint32_t(pair)<<((j%2)*16);
+        }
+        *reinterpret_cast<uint2 *>(q+size_t(row)*cols+c)=make_uint2(packed[0],packed[1]);
+    }
+}
 template<class Input, class Output>
 __global__ void finish(const Input *raw, const float *xs, const float *ws, Output *out, size_t count, int cols) {
     for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < count;
@@ -156,6 +176,7 @@ struct Plan {
 struct Weight {
     Tensor bytes, scales;
     int rows = 0, cols = 0;
+    bool rowParallel = false;
 };
 } // namespace
 struct Fp8Weights::Impl : detail::QuantizedCheckpoint {
@@ -241,8 +262,9 @@ struct Fp8Weights::Impl : detail::QuantizedCheckpoint {
         require(w.cols % 16 == 0 && w.rows % 16 == 0, "unaligned FP8 matrix");
         if (qkv)
             require(w.rows == 21504 && w.cols == 5376, "FP8 QKV layout");
-        detail::ProjectionSlice slice(name, w.rows, w.cols, options);
-        w.rows=slice.rows; w.cols=slice.cols;
+        detail::ProjectionSlice slice(direct ? direct->front() : name, w.rows, w.cols, options,
+                                      direct ? int(direct->size()) : 1);
+        w.rows=slice.rows; w.cols=slice.cols; w.rowParallel=slice.rowParallel;
         if(options.size>1) scales=slice.scales(scales);
         w.bytes = Tensor(w.rows, w.cols / 2);
         const bool interleavedQkv = qkv && !unsloth && !nativePackedQkv;
@@ -300,7 +322,14 @@ struct Fp8Weights::Impl : detail::QuantizedCheckpoint {
         auto *input = reinterpret_cast<const B *>(x.data);
         auto *quantized = reinterpret_cast<uint8_t *>(q.data);
         auto *scales = reinterpret_cast<float *>(scale.data);
-        if (x.cols == 4096)
+        // H3's callback calibrates NVFP4; shared FP8 scales are Qwen-specific.
+        if (w.rowParallel && options.qwenImage && options.activationMaximum) {
+            quantize<<<padded,256,0,cudaStreamPerThread>>>(input,quantized,scales,x.rows,x.cols,
+                                                         direct != nullptr,true);
+            ck(cudaGetLastError());
+            options.activationMaximum(scale);
+            quantizeShared<<<padded,256,0,cudaStreamPerThread>>>(input,quantized,scales,x.rows,x.cols);
+        } else if (x.cols == 4096)
             quantizeVector<4096><<<padded, 256, 0, cudaStreamPerThread>>>(input, quantized, scales, x.rows, direct != nullptr);
         else if (x.cols == 12288)
             quantizeVector<12288><<<padded, 256, 0, cudaStreamPerThread>>>(input, quantized, scales, x.rows, direct != nullptr);

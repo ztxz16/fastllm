@@ -235,7 +235,7 @@ class GgufWeights final : public QuantizedWeights {
         return out;
     }
     Tensor linearPacked(const Tensor &x, const std::vector<std::string> &names, Tensor *destination) override {
-        require(!names.empty() && options_.size == 1, "invalid direct GGUF projection list");
+        require(!names.empty(), "invalid direct GGUF projection list");
         if (names.size() == 1)
             return linear(x, names.front(), destination);
         bindDevice();

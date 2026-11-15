@@ -8,7 +8,7 @@ int main(int argc, char **argv) {
     try {
         GenerateOptions options;
         std::string model, output = "output.png", traceDirectory;
-        int device = 0;
+        std::vector<int> devices{0};
         for (int i = 1; i < argc; ++i) {
             std::string key = argv[i];
             if (i + 1 >= argc)
@@ -37,8 +37,8 @@ int main(int argc, char **argv) {
                 options.referenceResolution = std::stoi(value);
             else if (key == "--seed")
                 options.seed = std::stoull(value);
-            else if (key == "--device")
-                device = std::stoi(value);
+            else if (key == "--device" || key == "--devices")
+                devices = fastllm::nomas::parseParallelDevices(value);
             else
                 throw std::invalid_argument("unknown argument: " + key);
         }
@@ -55,7 +55,7 @@ int main(int argc, char **argv) {
                     throw std::runtime_error("cannot write trace: " + name);
             };
         }
-        Pipeline pipeline(model, device);
+        Pipeline pipeline(model, devices);
         auto png = encodePNG(pipeline.generate(
             options,
             [](const std::string &stage, int step, int total) {

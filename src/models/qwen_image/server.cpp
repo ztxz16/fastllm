@@ -77,11 +77,12 @@ Json metadata(const std::shared_ptr<Job> &j) {
 }
 class Service {
   public:
-    Service(std::string model, std::string output, int device) : output_(std::move(output)) {
+    Service(std::string model, std::string output, std::vector<int> devices)
+        : output_(std::move(output)), parallelSize_(devices.size()) {
         std::filesystem::create_directories(output_);
-        worker_ = std::thread([this, model, device] {
+        worker_ = std::thread([this, model, devices] {
             try {
-                Pipeline pipeline(model, device);
+                Pipeline pipeline(model, devices);
                 ready_ = true;
                 for (;;) {
                     std::shared_ptr<Job> job;
@@ -150,7 +151,8 @@ class Service {
         return Json::object{{"status", ready_                  ? "ready"
                                        : startupError_.empty() ? "loading"
                                                                : "failed"},
-                            {"error", startupError_.empty() ? Json() : Json(startupError_)}};
+                            {"error", startupError_.empty() ? Json() : Json(startupError_)},
+                            {"tensor_parallel_size", parallelSize_}};
     }
     std::shared_ptr<Job> submit(const Json &j, std::vector<Image> images = {}) {
         if (!ready_)
@@ -223,13 +225,15 @@ class Service {
     std::thread worker_;
     std::deque<std::shared_ptr<Job>> queue_;
     std::unordered_map<std::string, std::shared_ptr<Job>> jobs_;
+    const int parallelSize_;
 };
 } // namespace
 int main(int argc, char **argv) {
     try {
         std::string model, output = "./qwen-image-output", host = "127.0.0.1", key,
                            demo = "tools/qwen_image/demo.html";
-        int port = 8008, device = 0;
+        int port = 8008;
+        std::vector<int> devices{0};
         for (int i = 1; i < argc; ++i) {
             std::string arg = argv[i];
             if (i + 1 >= argc)
@@ -243,8 +247,8 @@ int main(int argc, char **argv) {
                 host = value;
             else if (arg == "--port")
                 port = std::stoi(value);
-            else if (arg == "--device")
-                device = std::stoi(value);
+            else if (arg == "--device" || arg == "--devices")
+                devices = fastllm::nomas::parseParallelDevices(value);
             else if (arg == "--api-key")
                 key = value;
             else if (arg == "--demo")
@@ -254,7 +258,7 @@ int main(int argc, char **argv) {
         }
         if (model.empty())
             throw std::invalid_argument("--model is required");
-        Service service(model, output, device);
+        Service service(model, output, devices);
         httplib::Server server;
         server.new_task_queue = [] { return new httplib::ThreadPool(8); };
         server.set_payload_max_length(20 * 1024 * 1024);

@@ -8,6 +8,7 @@
 #include <utility>
 #include <vector>
 #include "models/hy_nomas/runtime.h"
+#include "models/hy_nomas/parallel.h"
 
 namespace fastllm {
 namespace qwen_image {
@@ -82,7 +83,7 @@ class TextEncoder {
 class QuantizedProjections;
 class DiT {
   public:
-    DiT(Runtime &, const std::string &directory);
+    DiT(Runtime &, const std::string &directory, nomas::ParallelContext = {});
     ~DiT();
     Tensor forward(const Tensor &latents, const Condition &, float timestep, int height, int width,
                    KVCache *cache = nullptr);
@@ -91,6 +92,7 @@ class DiT {
 
   private:
     Runtime &rt_;
+    nomas::ParallelContext parallel_;
     std::unique_ptr<Weights> weights_;
     std::unique_ptr<QuantizedProjections> quantized_;
     const Tensor &weight(const std::string &);
@@ -99,6 +101,7 @@ class DiT {
     };
     std::unordered_map<std::string, Projection> projections_;
     Tensor linear(const Tensor &, const std::string &prefix, Tensor *output = nullptr);
+    Tensor rowLinear(const Tensor &, const std::string &);
     Tensor packedLinear(const Tensor &, const std::vector<std::string> &prefixes);
 };
 
@@ -127,9 +130,12 @@ struct GenerateOptions {
     int referenceResolution = 1024;
     void validate() const;
 };
+class ParallelDiT;
 class Pipeline {
   public:
     Pipeline(const std::string &directory, int device, bool fp32 = false);
+    Pipeline(const std::string &directory, const std::vector<int> &devices, bool fp32 = false);
+    ~Pipeline();
     Image generate(const GenerateOptions &, Progress progress = {}, Trace trace = {});
 
   private:
@@ -137,9 +143,10 @@ class Pipeline {
     nomas::TensorPool pool_;
     QwenTokenizer tokenizer_;
     TextEncoder text_;
-    DiT dit_;
+    std::unique_ptr<DiT> dit_;
+    std::unique_ptr<ParallelDiT> parallel_;
     VAE vae_;
-    size_t weightBytes_ = 0;
+    size_t weightBytes_ = 0, ditWeightBytes_ = 0;
     std::vector<float> means_, stds_;
     double baseShift_ = .5, maxShift_ = .9, baseLength_ = 256, maxLength_ = 8192, terminal_ = .02;
 };

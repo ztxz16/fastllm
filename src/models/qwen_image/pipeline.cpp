@@ -1,4 +1,5 @@
 #include "models/qwen_image/runtime.h"
+#include "parallel.h"
 #include "json11.hpp"
 #include <algorithm>
 #include <cmath>
@@ -42,13 +43,29 @@ size_t checkpointBytes(const std::string &directory) {
     return bytes;
 }
 
+int rootDevice(const std::vector<int> &devices) {
+    if (devices.empty() || devices.size() > 8 || 32 % devices.size())
+        throw std::invalid_argument("Qwen Image supports 1, 2, 4 or 8 CUDA devices");
+    for (size_t i = 0; i < devices.size(); ++i)
+        if (devices[i] < 0 || std::find(devices.begin(), devices.begin() + i, devices[i]) != devices.begin() + i)
+            throw std::invalid_argument("CUDA devices must be distinct nonnegative indices");
+    return devices.front();
+}
 } // namespace
+Pipeline::~Pipeline() = default;
 Pipeline::Pipeline(const std::string &dir, int device, bool fp32)
-    : rt_(device, fp32), pool_(device, size_t(1) << 30), tokenizer_(dir + "/processor"),
+    : Pipeline(dir, std::vector<int>{device}, fp32) {}
+Pipeline::Pipeline(const std::string &dir, const std::vector<int> &devices, bool fp32)
+    : rt_(rootDevice(devices), fp32), pool_(devices.front(), size_t(1) << 30), tokenizer_(dir + "/processor"),
       text_(rt_, dir + "/text_encoder"),
-      dit_(rt_, dir + "/transformer"), vae_(rt_, dir + "/vae") {
+      vae_(rt_, dir + "/vae") {
+    if (devices.size() == 1) dit_ = std::make_unique<DiT>(rt_, dir + "/transformer");
+    else parallel_ = std::make_unique<ParallelDiT>(dir + "/transformer", devices, fp32);
     // Checkpoint bytes conservatively include unused tensors and shard headers.
-    weightBytes_ = (checkpointBytes(dir + "/text_encoder") + checkpointBytes(dir + "/transformer") +
+    ditWeightBytes_ = checkpointBytes(dir + "/transformer") * (fp32 ? 2 : 1) / devices.size();
+    // Norms and input/time/output matrices remain replicated (under 256 MiB in BF16).
+    if (parallel_) ditWeightBytes_ += (size_t(256) << 20) * (fp32 ? 2 : 1);
+    weightBytes_ = ditWeightBytes_ + (checkpointBytes(dir + "/text_encoder") +
                     checkpointBytes(dir + "/vae")) * (fp32 ? 2 : 1);
     auto d = config(dir + "/transformer/config.json");
     if (d["_class_name"].string_value() != "QwenImage21Transformer2DModel" ||
@@ -90,7 +107,8 @@ Image Pipeline::generate(const GenerateOptions &o, Progress progress, Trace trac
     auto round = [&](float value) { return rt_.isFloat32() ? value : roundBF16(value); };
     struct UnloadWeights {
         TextEncoder &text;
-        DiT &dit;
+        DiT *dit;
+        ParallelDiT *parallel;
         VAE &vae;
         Runtime &rt;
         nomas::TensorPool &pool;
@@ -98,17 +116,18 @@ Image Pipeline::generate(const GenerateOptions &o, Progress progress, Trace trac
         ~UnloadWeights() {
             if (!keep) {
                 text.unload();
-                dit.unload();
+                if (dit) dit->unload();
                 vae.unload();
             }
             // All request-local tensors have now been released. Give unused
             // scratch pages back even after cancellation or an exception.
             try {
+                if (parallel) parallel->release(!keep);
                 rt.synchronize();
                 pool.trim();
             } catch (...) {}
         }
-    } cleanup{text_, dit_, vae_, rt_, pool_};
+    } cleanup{text_, dit_.get(), parallel_.get(), vae_, rt_, pool_};
     std::vector<Image> images;
     std::string imageTemplate;
     for (size_t i = 0; i < o.images.size(); ++i) {
@@ -149,11 +168,13 @@ Image Pipeline::generate(const GenerateOptions &o, Progress progress, Trace trac
     // Full KV for 32 layers, DiT intermediates, VAE activations and 2 GiB for
     // allocator/cuBLAS scratch. Re-evaluate for every shape and current GPU use.
     size_t workspace = (size_t(2) << 30) + scalar * (sequence * 4096 * (64 + 16) + largestPixels * 1024);
-    size_t loaded = text_.loadedBytes() + dit_.loadedBytes() + vae_.loadedBytes();
+    size_t loaded = text_.loadedBytes() + (dit_ ? dit_->loadedBytes() : parallel_->rootLoadedBytes()) + vae_.loadedBytes();
     bool resident = rt_.availableMemory() + loaded >= weightBytes_ + workspace;
+    if (parallel_) resident = parallel_->canKeep(ditWeightBytes_, workspace) && resident;
     if (!resident) {
         text_.unload();
-        dit_.unload();
+        if (dit_) dit_->unload();
+        else parallel_->release(true);
         vae_.unload();
         rt_.synchronize();
         pool_.trim();
@@ -210,18 +231,20 @@ Image Pipeline::generate(const GenerateOptions &o, Progress progress, Trace trac
     KVCache cache;
     cache.full = resident;
     auto deviceLatent = rt_.upload(latent.data(), h * w, 64);
+    if (parallel_) parallel_->prepare(cond, resident);
     for (int i = 0; i < o.steps; ++i) {
         report("denoising", i, o.steps);
         float t = round(round(sigmas[i] * 1000.f) / 1000.f);
-        auto output = dit_.forward(deviceLatent, cond, t, h, w, &cache);
+        auto output = parallel_ ? parallel_->forward(deviceLatent, t, h, w)
+                                : dit_->forward(deviceLatent, cond, t, h, w, &cache);
         float dt = sigmas[i + 1] - sigmas[i];
         rt_.eulerStep(deviceLatent, output, dt);
         if (trace)
             trace("latent.step." + std::to_string(i), rt_.download(deviceLatent));
     }
     cache = {};
-    if (!resident)
-        dit_.unload();
+    if (parallel_) parallel_->release(!resident);
+    else if (!resident) dit_->unload();
     cond = {};
     report("decoding", 0, 1);
     latent = rt_.download(deviceLatent);

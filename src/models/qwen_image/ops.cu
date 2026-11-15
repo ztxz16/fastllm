@@ -72,8 +72,8 @@ __global__ void normScaleKernel(const T *x, const T *mod, T *out, int mc, int ro
 }
 template<class T>
 __global__ void qkNormRopeKernel(const T *q, const T *k, const T *qw, const T *kw,
-                                const float *cs, const float *sn, T *oq, T *ok, int rows) {
-    int blocks = rows * 8;
+                                const float *cs, const float *sn, T *oq, T *ok, int rows, int localHeads) {
+    int blocks = rows * localHeads / 4;
     bool key = blockIdx.x >= blocks;
     int head = (int(blockIdx.x) % blocks) * 4 + threadIdx.x / 32, lane = threadIdx.x % 32;
     const T *x = key ? k : q, *w = key ? kw : qw;
@@ -90,7 +90,7 @@ __global__ void qkNormRopeKernel(const T *q, const T *k, const T *qw, const T *k
     float inv = rsqrtf(__shfl_sync(0xffffffffu, sum, 0) / 128 + 1e-6f);
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
-        int col = lane + 32 * i, pos = (head / 32) * 128 + col;
+        int col = lane + 32 * i, pos = (head / localHeads) * 128 + col;
         float value = float(T(float(T(v[i] * inv)) * float(w[col])));
         float pair = __shfl_xor_sync(0xffffffffu, value, 1);
         out[size_t(head) * 128 + col] = T(value * cs[pos] + (lane % 2 ? pair : -pair) * sn[pos]);
@@ -202,12 +202,13 @@ Tensor vaeNorm(const Tensor &x, const Tensor &w) {
 // Each half-warp processes one head using 128-bit loads/stores. Adjacent
 // RoPE pairs stay in registers; retain both BF16 normalization roundings.
 __global__ void packedQKVRopeKernel(const B *x, const B *qw, const B *kw, const float *cs, const float *sn,
-                                     B *oq, B *ok, B *ov, int rows) {
+                                     B *oq, B *ok, B *ov, int rows, int localHeads) {
     constexpr int pack = 8, lanes = 16, heads = 8;
-    int blocks = rows * 32 / heads, kind = blockIdx.x / blocks;
+    int blocks = (rows * localHeads + heads - 1) / heads, kind = blockIdx.x / blocks;
     int head = (blockIdx.x % blocks) * heads + threadIdx.x / lanes, lane = threadIdx.x % lanes;
+    if (head >= rows * localHeads) return;
     int col = lane * pack;
-    size_t base = size_t(head / 32) * 12288 + kind * 4096 + (head % 32) * 128 + col;
+    size_t base = (size_t(head / localHeads) * 3 + kind) * localHeads * 128 + (head % localHeads) * 128 + col;
     auto v = *reinterpret_cast<const Values<B, pack> *>(x + base);
     B *dst = kind == 0 ? oq : kind == 1 ? ok : ov;
     if (kind == 2) {
@@ -231,7 +232,7 @@ __global__ void packedQKVRopeKernel(const B *x, const B *qw, const B *kw, const 
     Values<B, pack> out;
 #pragma unroll
     for (int j = 0; j < pack; ++j) {
-        int pos = (head / 32) * 128 + col + j;
+        int pos = (head / localHeads) * 128 + col + j;
         out.v[j] = B(values[j] * cs[pos] + (j % 2 ? values[j ^ 1] : -values[j ^ 1]) * sn[pos]);
     }
     *reinterpret_cast<Values<B, pack> *>(dst + size_t(head) * 128 + col) = out;
@@ -397,7 +398,7 @@ Tensor Runtime::normScale(const Tensor &x, const Tensor &m, int first, int offse
 }
 void Runtime::qkNormRope(const Tensor &q, const Tensor &k, const Tensor &qw, const Tensor &kw,
                          const nomas::RopeTable &table, Tensor &oq, Tensor &ok) {
-    if (q.cols != 4096 || k.cols != q.cols || k.rows != q.rows || k.dtype != q.dtype ||
+    if (q.cols < 512 || q.cols > 4096 || q.cols % 512 || k.cols != q.cols || k.rows != q.rows || k.dtype != q.dtype ||
         qw.size() != 128 || kw.size() != 128 || qw.dtype != q.dtype || kw.dtype != q.dtype ||
         oq.rows != q.rows || ok.rows != q.rows || oq.cols != q.cols || ok.cols != q.cols ||
         oq.dtype != q.dtype || ok.dtype != q.dtype || table.cos.rows != q.rows || table.sin.rows != q.rows ||
@@ -405,25 +406,25 @@ void Runtime::qkNormRope(const Tensor &q, const Tensor &k, const Tensor &qw, con
         throw std::invalid_argument("QK norm/RoPE shape");
     dispatch(q, [&](auto *tag) {
         using T = std::remove_pointer_t<decltype(tag)>;
-        qkNormRopeKernel<<<q.rows * 16, 128, 0, cudaStreamPerThread>>>(
+        qkNormRopeKernel<<<q.rows * (q.cols / 128) / 2, 128, 0, cudaStreamPerThread>>>(
             ptr<T>(q), ptr<T>(k), ptr<T>(qw), ptr<T>(kw), ptr<float>(table.cos), ptr<float>(table.sin),
-            ptr<T>(oq), ptr<T>(ok), q.rows);
+            ptr<T>(oq), ptr<T>(ok), q.rows, q.cols / 128);
     });
     check(cudaGetLastError());
 }
 void Runtime::qkvNormRope(const Tensor &qkv, const Tensor &qw, const Tensor &kw,
                           const nomas::RopeTable &table, Tensor &q, Tensor &k, Tensor &v) {
-    if (qkv.dtype != nomas::DType::BF16 || qkv.cols != 12288 ||
-        q.cols != 4096 || k.cols != q.cols || v.cols != q.cols ||
+    if (qkv.dtype != nomas::DType::BF16 || qkv.cols != 3 * q.cols ||
+        q.cols < 512 || q.cols > 4096 || q.cols % 512 || k.cols != q.cols || v.cols != q.cols ||
         q.rows != qkv.rows || k.rows != q.rows || v.rows != q.rows ||
         qkv.dtype != q.dtype || k.dtype != q.dtype || v.dtype != q.dtype ||
         qw.size() != 128 || kw.size() != 128 || qw.dtype != q.dtype || kw.dtype != q.dtype ||
         table.cos.rows != q.rows || table.sin.rows != q.rows || table.cos.cols != 128 || table.sin.cols != 128 ||
         !table.cos.isFloat32() || !table.sin.isFloat32())
         throw std::invalid_argument("packed QKV norm/RoPE shape");
-    packedQKVRopeKernel<<<q.rows * 12, 128, 0, cudaStreamPerThread>>>(
+    packedQKVRopeKernel<<<((q.rows * (q.cols / 128) + 7) / 8) * 3, 128, 0, cudaStreamPerThread>>>(
         ptr<B>(qkv), ptr<B>(qw), ptr<B>(kw), ptr<float>(table.cos), ptr<float>(table.sin),
-        ptr<B>(q), ptr<B>(k), ptr<B>(v), q.rows);
+        ptr<B>(q), ptr<B>(k), ptr<B>(v), q.rows, q.cols / 128);
     check(cudaGetLastError());
 }
 void Runtime::eulerStep(Tensor &latent, const Tensor &noise, float dt) {

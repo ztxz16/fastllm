@@ -41,6 +41,27 @@ template<class T> __global__ void finishShard(const float *input, const float *b
         output[j]=T(x);
     }
 }
+template<class Output>
+__global__ void scaleShard(const int32_t *input,const float *xs,const float *ws,Output *output,
+                          size_t n,size_t offset,int cols) {
+    for(size_t j=size_t(blockIdx.x)*blockDim.x+threadIdx.x;j<n;j+=size_t(blockDim.x)*gridDim.x) {
+        const size_t index=offset+j;
+        const float x=xs[index/cols],w=ws[index%cols],value=float(input[j]);
+        output[j]=Output(__fmul_rn(__fmul_rn(value,x),w));
+    }
+}
+void castScaledInt32(const Tensor &input,const Tensor &xs,const Tensor &ws,Tensor &output,
+                     size_t offset,int cols) {
+    const int blocks=std::min<size_t>((input.size()+255)/256,65535);
+    auto launch=[&](auto *destination) {
+        scaleShard<<<blocks,256,0,cudaStreamPerThread>>>((const int32_t *)input.data,
+            (const float *)xs.data,(const float *)ws.data,destination,input.size(),offset,cols);
+    };
+    if(output.dtype==DType::BF16)launch((__nv_bfloat16 *)output.data);
+    else if(output.dtype==DType::FP16)launch((__half *)output.data);
+    else launch((float *)output.data);
+    check(cudaGetLastError());
+}
 void castShard(const Tensor &input,const Tensor *bias,Tensor &output,size_t offset,int cols,cudaStream_t stream) {
     size_t count=input.size();
     int blocks=std::min<size_t>((count+255)/256,65535);
@@ -255,6 +276,32 @@ Tensor ParallelGroup::sumCast(Runtime &rt,Tensor partial,const Tensor *bias,DTyp
     i.boundary(rank,NcclSubmitRendezvous::After,rounded,4);
     return result;
 }
+void ParallelGroup::sumScaledInt32(const Tensor &partial,const Tensor &xs,const Tensor &ws,
+                              Tensor &output,int rank) {
+    if(!partial.data || !xs.data || !ws.data || !output.data ||
+       !partial.isFloat32() || !xs.isFloat32() || !ws.isFloat32() ||
+       xs.size()<size_t(partial.rows) || ws.size()!=size_t(partial.cols) ||
+       partial.rows!=output.rows || partial.cols!=output.cols || partial.storage==output.storage ||
+       xs.storage==output.storage || ws.storage==output.storage)
+        throw std::invalid_argument("invalid scaled parallel reduction");
+    const bool scatter=size()>1 && !output.isFloat32() && partial.bytes()>=(1u<<20) && partial.size()%size()==0;
+    const size_t count=scatter?partial.size()/size():partial.size();
+    if(count>INT_MAX)throw std::invalid_argument("scaled parallel reduction too large");
+    Tensor reduced=scatter?Tensor(1,int(count),DType::FP32):partial;
+    Tensor rounded=scatter?Tensor(1,int(count),output.dtype):output;
+    auto &i=*impl_;
+    const int operation=scatter?13:12;
+    i.boundary(rank,NcclSubmitRendezvous::Before,partial,operation);
+    if(scatter)check(ncclReduceScatter(partial.data,reduced.data,count,ncclInt32,ncclSum,i.comms[rank],cudaStreamPerThread));
+    else if(size()>1)check(ncclAllReduce(partial.data,reduced.data,count,ncclInt32,ncclSum,i.comms[rank],cudaStreamPerThread));
+    i.boundary(rank,NcclSubmitRendezvous::After,partial,operation);
+    castScaledInt32(reduced,xs,ws,rounded,scatter?size_t(rank)*count:0,partial.cols);
+    if(scatter) {
+        i.boundary(rank,NcclSubmitRendezvous::Before,rounded,16);
+        check(ncclAllGather(rounded.data,output.data,count,type(output.dtype),i.comms[rank],cudaStreamPerThread));
+        i.boundary(rank,NcclSubmitRendezvous::After,rounded,16);
+    }
+}
 void ParallelGroup::sumCastAsync(const Tensor &partial,const Tensor *bias,Tensor &output,int rank) {
     if(!partial.data || !output.data || !partial.isFloat32() || output.isFloat32() || partial.rows!=output.rows || partial.cols!=output.cols ||
        partial.storage==output.storage || (bias && (!bias->isFloat32() || bias->size()!=size_t(partial.cols))))
@@ -428,6 +475,9 @@ Tensor ParallelGroup::broadcast(const Tensor &x,int) { return x; }
 Tensor ParallelGroup::gatherColumns(const Tensor &x,int,int,bool) { return x; }
 void ParallelGroup::sum(Tensor &,int) {}
 void ParallelGroup::maximum(Tensor &,int) {}
+void ParallelGroup::sumScaledInt32(const Tensor &,const Tensor &,const Tensor &,Tensor &,int) {
+    throw std::runtime_error("scaled parallel reduction requires NCCL");
+}
 void ParallelGroup::sumAsync(const Tensor &,int) {}
 Tensor ParallelGroup::sumCast(Runtime &rt,Tensor partial,const Tensor *bias,DType output,int) {
     if(bias) partial=rt.bias(partial,*bias);

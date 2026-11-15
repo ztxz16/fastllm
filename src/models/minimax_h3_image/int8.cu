@@ -38,7 +38,7 @@ void require(bool x, const std::string &message) {
 // registers through all four stages and row-wise quantization; no rotated
 // BF16 matrix or block-wide transpose is materialized. Preserve BF16 rounding
 // at the rotation boundary used by the native ConvRot reference.
-template <int GroupsPerWarp>
+template <int GroupsPerWarp, int Mode = 0>
 __global__ void rotateQuantize(const B *x, int8_t *q, float *scales, int rows, int cols) {
     const int row = blockIdx.x, lane = threadIdx.x % 32, warp = threadIdx.x / 32;
     constexpr int warps = 8;
@@ -89,18 +89,24 @@ __global__ void rotateQuantize(const B *x, int8_t *q, float *scales, int rows, i
         for (int j = 0; j < 8; ++j)
             largest = fmaxf(largest, fabsf(v[group][j]));
     }
-    for (int d = 16; d; d /= 2)
-        largest = fmaxf(largest, __shfl_xor_sync(0xffffffff, largest, d));
-    __shared__ float maxima[warps];
-    if (!lane)
-        maxima[warp] = largest;
-    __syncthreads();
-    largest = lane < warps ? maxima[lane] : 0;
-    for (int d = 16; d; d /= 2)
-        largest = fmaxf(largest, __shfl_xor_sync(0xffffffff, largest, d));
-    const float scale = fmaxf(largest / 127.f, 1e-12f);
-    if (!threadIdx.x)
-        scales[row] = scale;
+    float scale;
+    if constexpr (Mode == 2) {
+        scale = scales[row];
+    } else {
+        for (int d = 16; d; d /= 2)
+            largest = fmaxf(largest, __shfl_xor_sync(0xffffffff, largest, d));
+        __shared__ float maxima[warps];
+        if (!lane)
+            maxima[warp] = largest;
+        __syncthreads();
+        largest = lane < warps ? maxima[lane] : 0;
+        for (int d = 16; d; d /= 2)
+            largest = fmaxf(largest, __shfl_xor_sync(0xffffffff, largest, d));
+        scale = fmaxf(largest / 127.f, 1e-12f);
+        if (!threadIdx.x)
+            scales[row] = scale;
+    }
+    if constexpr (Mode == 1) return;
 #pragma unroll
     for (int group = 0; group < GroupsPerWarp; ++group) {
         const int offset = (group * warps + warp) * 256;
@@ -111,6 +117,34 @@ __global__ void rotateQuantize(const B *x, int8_t *q, float *scales, int rows, i
                     int8_t(max(-128, min(127, __float2int_rn(v[group][j] / scale))));
         }
     }
+}
+// Mode 0 is the original fused path. TP row projections first compute the
+// scale (1), share it across ranks, then rotate/quantize with that scale (2).
+template<int Mode = 0>
+void launchRotateQuantize(const B *input, int8_t *quantized, float *scales, int rows, int cols, int padded) {
+    const int groups = (cols / 256 + 7) / 8;
+    switch (groups) {
+    case 1:
+        rotateQuantize<1,Mode><<<padded,256,0,cudaStreamPerThread>>>(input,quantized,scales,rows,cols);
+        break;
+    case 2:
+        rotateQuantize<2,Mode><<<padded,256,0,cudaStreamPerThread>>>(input,quantized,scales,rows,cols);
+        break;
+    case 3:
+        rotateQuantize<3,Mode><<<padded,256,0,cudaStreamPerThread>>>(input,quantized,scales,rows,cols);
+        break;
+    case 4:
+        rotateQuantize<4,Mode><<<padded,256,0,cudaStreamPerThread>>>(input,quantized,scales,rows,cols);
+        break;
+    case 6:
+        rotateQuantize<6,Mode><<<padded,256,0,cudaStreamPerThread>>>(input,quantized,scales,rows,cols);
+        break;
+    case 7:
+        rotateQuantize<7,Mode><<<padded,256,0,cudaStreamPerThread>>>(input,quantized,scales,rows,cols);
+        break;
+    default: throw std::runtime_error("unsupported ConvRot width");
+    }
+    ck(cudaGetLastError());
 }
 template<class Output>
 __global__ void finish(const int32_t *raw, const float *xs, const float *ws, Output *out, size_t count, int cols) {
@@ -139,6 +173,7 @@ struct Plan {
 struct Weight {
     Tensor bytes, scales;
     int rows = 0, cols = 0;
+    bool rowParallel = false;
 };
 } // namespace
 class Int8Weights final : public QuantizedWeights {
@@ -272,7 +307,7 @@ struct Int8Weights::Impl : detail::QuantizedCheckpoint {
         rotationVerified = true;
     }
     Weight &get(const std::string &name, const std::vector<std::string> *direct = nullptr) {
-        require(!direct || (!unsloth && options.size == 1), "direct INT8 requires unpartitioned Comfy weights");
+        require(!direct || !unsloth, "direct INT8 requires Comfy weights");
         verifyUnslothRotation();
         auto found = weights.find(name);
         if (found != weights.end())
@@ -328,8 +363,9 @@ struct Int8Weights::Impl : detail::QuantizedCheckpoint {
         require(w.cols % 16 == 0 && w.rows % 16 == 0, "unaligned INT8 matrix");
         if (qkv)
             require(w.rows == 21504 && w.cols == 5376, "INT8 QKV layout");
-        detail::ProjectionSlice slice(name, w.rows, w.cols, options);
-        w.rows=slice.rows; w.cols=slice.cols;
+        detail::ProjectionSlice slice(direct ? direct->front() : name, w.rows, w.cols, options,
+                                      direct ? int(direct->size()) : 1);
+        w.rows=slice.rows; w.cols=slice.cols; w.rowParallel=slice.rowParallel;
         if(options.size>1) scales=slice.scales(scales);
         w.bytes = Tensor(w.rows, w.cols / 2);
         uploadByteMatrices(matrices, w.bytes.data, slice);
@@ -371,35 +407,21 @@ struct Int8Weights::Impl : detail::QuantizedCheckpoint {
         auto *quantized = reinterpret_cast<int8_t *>(q.data);
         auto *scales = reinterpret_cast<float *>(scale.data);
         require(x.cols % 256 == 0, "unaligned ConvRot input");
-        const int groups = (x.cols / 256 + 7) / 8;
-        switch (groups) {
-        case 1:
-            rotateQuantize<1>
-                <<<padded, 256, 0, cudaStreamPerThread>>>(input, quantized, scales, x.rows, x.cols);
-            break;
-        case 2:
-            rotateQuantize<2><<<padded,256,0,cudaStreamPerThread>>>(input,quantized,scales,x.rows,x.cols);
-            break;
-        case 3:
-            rotateQuantize<3>
-                <<<padded, 256, 0, cudaStreamPerThread>>>(input, quantized, scales, x.rows, x.cols);
-            break;
-        case 4:
-            rotateQuantize<4>
-                <<<padded, 256, 0, cudaStreamPerThread>>>(input, quantized, scales, x.rows, x.cols);
-            break;
-        case 6:
-            rotateQuantize<6><<<padded,256,0,cudaStreamPerThread>>>(input,quantized,scales,x.rows,x.cols);
-            break;
-        case 7:
-            rotateQuantize<7>
-                <<<padded, 256, 0, cudaStreamPerThread>>>(input, quantized, scales, x.rows, x.cols);
-            break;
-        default:
-            throw std::runtime_error("unsupported H3 Image ConvRot width");
+        // H3's callback calibrates NVFP4; shared INT8 scales are Qwen-specific.
+        if (w.rowParallel && options.qwenImage && options.activationMaximum) {
+            launchRotateQuantize<1>(input,quantized,scales,x.rows,x.cols,padded);
+            options.activationMaximum(scale);
+            launchRotateQuantize<2>(input,quantized,scales,x.rows,x.cols,padded);
+        } else {
+            launchRotateQuantize(input,quantized,scales,x.rows,x.cols,padded);
         }
-        ck(cudaGetLastError());
 #ifdef FASTLLM_IMAGE_INT8_SCALED
+        if (fusedGemm && w.rowParallel && options.rowReduction) {
+            Tensor raw(x.rows,w.rows,true);
+            detail::int8RawGemm(raw.data,q.data,w.bytes.data,x.rows,w.rows,w.cols,cudaStreamPerThread);
+            options.rowReduction(raw,scale,w.scales,out);
+            return out;
+        }
         if (fusedGemm) {
             detail::int8ScaledGemm(out.data, q.data, w.bytes.data, scales,
                                    reinterpret_cast<const float *>(w.scales.data), x.rows, w.rows, w.cols,
@@ -439,6 +461,10 @@ struct Int8Weights::Impl : detail::QuantizedCheckpoint {
         ck(cublasLtMatmul(handle, plan->op, &alpha, w.bytes.data, plan->a, q.data, plan->b, &beta, raw.data,
                           plan->c, raw.data, plan->c, &plan->algorithm, workspace.data, workspace.bytes(),
                           cudaStreamPerThread));
+        if (w.rowParallel && options.rowReduction) {
+            options.rowReduction(raw.rowSlice(0,x.rows),scale,w.scales,out);
+            return out;
+        }
         if(out.isFloat32())
             finish<<<4096,256,0,cudaStreamPerThread>>>((int32_t *)raw.data,(float *)scale.data,
                 (float *)w.scales.data,(float *)out.data,out.size(),w.rows);

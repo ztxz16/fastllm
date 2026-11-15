@@ -43,11 +43,12 @@ namespace detail = minimax_h3_image::detail;
 struct QuantizedProjections::Impl {
     std::set<std::string> names;
     Runtime *runtime = nullptr;
+    nomas::ParallelContext parallel;
     std::unique_ptr<minimax_h3_image::QuantizedWeights> weights;
     std::unique_ptr<detail::GgufCheckpoint> gguf;
     std::string prefix;
     std::map<std::string, Tensor> vectors;
-    void loadGguf(const std::string &path) {
+    void loadGguf(const std::string &path, const minimax_h3_image::ProjectionOptions &options) {
         gguf = std::make_unique<detail::GgufCheckpoint>(path);
         const auto &tensors = gguf->tensors();
         if (tensors.count("model.diffusion_model.img_in.weight"))
@@ -89,22 +90,36 @@ struct QuantizedProjections::Impl {
             } else
                 require(names.count(name), "missing GGUF matrix: " + name);
         }
-        weights = detail::loadGguf(path, {});
+        weights = detail::loadGguf(path, options);
     }
 };
-std::unique_ptr<QuantizedProjections> QuantizedProjections::load(Runtime &rt, const std::string &path) {
+std::unique_ptr<QuantizedProjections> QuantizedProjections::load(
+    Runtime &rt, const std::string &path, nomas::ParallelContext parallel) {
     // BF16 sharded checkpoints keep the existing loader and allocation policy.
     if (std::filesystem::is_directory(path))
         return {};
     auto impl = std::make_unique<Impl>();
     impl->runtime = &rt;
+    impl->parallel = parallel;
+    minimax_h3_image::ProjectionOptions options;
+    options.rank = parallel.rank;
+    options.size = parallel.size();
+    options.qwenImage = true;
+    if (parallel.size() > 1) {
+        options.activationMaximum = [parallel](Tensor &scale) {
+            parallel.group->maximum(scale, parallel.rank);
+        };
+        options.rowReduction = [parallel](const Tensor &raw,const Tensor &xs,const Tensor &ws,Tensor &out) {
+            parallel.group->sumScaledInt32(raw,xs,ws,out,parallel.rank);
+        };
+    }
     rt.activate();
     if (ggufMagic(path)) {
         require(!rt.isFloat32(), "GGUF checkpoints require BF16 activations");
         int device = 0;
         require(cudaGetDevice(&device) == cudaSuccess, "cannot select CUDA device");
         detail::validateGgufDevice(device);
-        impl->loadGguf(path);
+        impl->loadGguf(path, options);
         return std::unique_ptr<QuantizedProjections>(new QuantizedProjections(std::move(impl)));
     }
     detail::QuantizedCheckpoint checkpoint(path);
@@ -190,10 +205,10 @@ std::unique_ptr<QuantizedProjections> QuantizedProjections::load(Runtime &rt, co
     require(status == cudaSuccess, cudaGetErrorString(status));
     if (format == WeightFormat::INT8) {
         detail::validateInt8Device(device);
-        impl->weights = detail::loadInt8(path, {});
+        impl->weights = detail::loadInt8(path, options);
     } else {
-        minimax_h3_image::Fp8Weights::validateDevice(device);
-        impl->weights = std::make_unique<minimax_h3_image::Fp8Weights>(path);
+        minimax_h3_image::Fp8Weights::validateDevice(device, parallel.size() > 1);
+        impl->weights = std::make_unique<minimax_h3_image::Fp8Weights>(path, options);
     }
     return std::unique_ptr<QuantizedProjections>(new QuantizedProjections(std::move(impl)));
 }
@@ -208,6 +223,14 @@ Tensor QuantizedProjections::linear(const Tensor &x, const std::vector<std::stri
     for (const auto &name : names)
         actual.push_back(impl_->prefix + name);
     return impl_->weights->linearPacked(x, actual, out);
+}
+Tensor QuantizedProjections::row(const Tensor &x,const std::string &name) {
+    const auto &parallel=impl_->parallel;
+    if(parallel.size()==1 || impl_->weights->format()==minimax_h3_image::WeightFormat::INT8)
+        return linear(x,{name});
+    Tensor partial(x.rows,4096,nomas::DType::FP32);
+    linear(x,{name},&partial);
+    return parallel.group->sumCast(*impl_->runtime,std::move(partial),nullptr,x.dtype,parallel.rank);
 }
 bool QuantizedProjections::isGguf() const { return bool(impl_->gguf); }
 const Tensor &QuantizedProjections::get(const std::string &name) {

@@ -10,8 +10,13 @@ namespace fastllm::minimax_h3_image {
 struct ProjectionOptions {
     bool comfyVideo = false;
     int rank = 0, size = 1;
-    // Optional global amax for NVFP4 activation scaling across TP/SP ranks.
+    // Optional global activation range/scale across TP/SP ranks.
     std::function<void(minimax_h3::Tensor &)> activationMaximum;
+    // Set by the Qwen adapter after validating the checkpoint architecture.
+    bool qwenImage = false;
+    // Optional signed INT32 TP reduction, followed by scaling/rounding once.
+    std::function<void(const minimax_h3::Tensor &, const minimax_h3::Tensor &,
+                       const minimax_h3::Tensor &, minimax_h3::Tensor &)> rowReduction;
 };
 // One instance belongs to one runtime/stream. QKV is always [all Q, all K, all
 // V]. Allocations follow the caller's TensorPool and release with the model.
