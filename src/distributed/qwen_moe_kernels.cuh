@@ -1,7 +1,7 @@
 #ifndef FASTLLM_QWEN_MOE_KERNELS_CUH
 #define FASTLLM_QWEN_MOE_KERNELS_CUH
 
-// 仅由 qwen3_layer.cu 包含；使用同一 worker stream，FP16 输入与 FP32 累加。
+// 仅由 qwen3_layer.cu 包含；使用同一 worker stream，专家贡献按全局专家顺序逐次舍入为 FP16。
 namespace moe {
 /**
  * 计算 FP32 softmax 与 Top-K，最终路由权重转 FP16；相等概率按专家 ID 升序。
@@ -92,14 +92,25 @@ __global__ void Pack(const half *input, const int *map, half *output, int count,
     if (i < count * hidden) output[i] = input[(map[i / hidden] / topk) * hidden + i % hidden];
 }
 
-/** 将单个专家 FP16 [count,hidden] 输出乘 FP16 路由概率后舍入，累加到全组 FP32 贡献。 */
-__global__ void Scatter(const half *values, const int *map, const half *prob, float *sum,
-                        int count, int hidden, int topk) {
+/**
+ * 将加权专家输出写入独占路由槽位，不在专家所在 rank 提前求和。
+ *
+ * 每个槽位仅有一个专家及一个 owner rank；其他 rank 的槽位保持零，供
+ * ReduceScatter 返回请求所属 rank 后按全局专家顺序累加。
+ * @param values FP16 [count,hidden] 专家输出。
+ * @param map int32 [count]，元素为全组 Token 的扁平路由槽位索引。
+ * @param prob FP16 [rows,topk] 路由概率。
+ * @param contributions FP16 [rows,topk,hidden]，调用前整组置零。
+ * @param count 当前专家的有效 Token 数。
+ * @param hidden 隐藏维度。
+ */
+__global__ void Scatter(const half *values, const int *map, const half *prob, half *contributions,
+                        int count, int hidden) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < count * hidden) {
         int slot = map[i / hidden];
-        sum[(slot / topk) * hidden + i % hidden] += __half2float(__float2half_rn(
-            __half2float(values[i]) * __half2float(prob[slot])));
+        contributions[size_t(slot) * hidden + i % hidden] = __float2half_rn(
+            __half2float(values[i]) * __half2float(prob[slot]));
     }
 }
 
@@ -140,9 +151,24 @@ __global__ void DecodeGate(const half *x, const half *weight, const int *ids, ha
     activated[i] = __float2half_rn(silu * up);
 }
 
-/** 按同一设备路由索引执行 FP16 专家 Down，舍入加权结果后累加 FP32 全组贡献，无原子竞争。 */
+/**
+ * 通过设备路由执行单 Token 专家 Down，将加权结果写入独占槽位。
+ *
+ * Down 和乘路由概率分别舍入为 FP16，与 Prefill Scatter 的输出布局相同。
+ * 未选中及空闲行不写入，不读取 CPU 路由，不改变 CUDA Graph 拓扑。
+ * @param activated FP16 [rows,width] 专家激活。
+ * @param weight FP16 [hidden,width] Down 权重。
+ * @param ids int32 [rows,topk] 全组专家 ID，padding 为 -1。
+ * @param prob FP16 [rows,topk] 路由概率。
+ * @param contributions FP16 [rows,topk,hidden]，调用前整组置零。
+ * @param rows 全组预留 Token 数。
+ * @param hidden 隐藏维度。
+ * @param width 专家中间维度。
+ * @param topk 每 Token 的路由槽位数。
+ * @param expert 当前全局专家 ID。
+ */
 __global__ void DecodeDown(const half *activated, const half *weight, const int *ids, const half *prob,
-                           float *sum, int rows, int hidden, int width, int topk, int expert) {
+                           half *contributions, int rows, int hidden, int width, int topk, int expert) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= rows * hidden) return;
     int row = i / hidden, col = i % hidden;
@@ -151,10 +177,51 @@ __global__ void DecodeDown(const half *activated, const half *weight, const int 
     float value = 0;
     for (int k = 0; k < width; ++k) value += __half2float(activated[row * width + k]) * __half2float(weight[col * width + k]);
     value = __half2float(__float2half_rn(value));
-    sum[i] += __half2float(__float2half_rn(value * __half2float(prob[slot])));
+    contributions[size_t(slot) * hidden + col] = __float2half_rn(value * __half2float(prob[slot]));
 }
 
-/** 共享专家按 sigmoid(gate) 门控；与 ReduceScatter 返回的路由贡献相加，再按 FP16 语义加残差。 */
+/**
+ * 按全局专家 ID 升序逐项做 FP16 加法，复现 HF 的专家 index_add_ 舍入边界。
+ *
+ * ReduceScatter 只搬运每个槽位的单一非零贡献，不合并不同专家；本 kernel
+ * 在请求所属 rank 统一合并，结果不依赖 EP 分片或 Top-K 槽位排序。设备排序
+ * 在每次调用重做，支持 Graph 重放时路由改变；空闲行输出零。
+ * @param contributions FP16 [capacity,topk,hidden]，已完成 ReduceScatter。
+ * @param ids int32 [capacity,topk] 本 rank 专家 ID，padding 为 -1。
+ * @param routed FP32 [capacity,hidden]，保存 FP16 累加值的无损提升，兼容诊断协议。
+ * @param hidden 隐藏维度。
+ * @param topk 路由槽位数，1..256；由模型配置校验保证范围及 ID 唯一性。
+ */
+__global__ void OrderedSum(const half *contributions, const int *ids, float *routed,
+                           int hidden, int topk) {
+    __shared__ int order[256];
+    const int row = blockIdx.x;
+    const int *experts = ids + row * topk;
+    if (threadIdx.x == 0) {
+        for (int slot = 0; slot < topk; ++slot) {
+            int position = slot;
+            while (position > 0 && experts[order[position - 1]] > experts[slot]) {
+                order[position] = order[position - 1];
+                --position;
+            }
+            order[position] = slot;
+        }
+    }
+    __syncthreads();
+
+    for (int col = threadIdx.x; col < hidden; col += blockDim.x) {
+        half sum = __float2half_rn(0.0f);
+        for (int i = 0; i < topk; ++i) {
+            const int slot = order[i];
+            if (experts[slot] >= 0) {
+                sum = __hadd(sum, contributions[(size_t(row) * topk + slot) * hidden + col]);
+            }
+        }
+        routed[size_t(row) * hidden + col] = __half2float(sum);
+    }
+}
+
+/** 共享专家按 sigmoid(gate) 门控；与有序累加的路由贡献相加，再按 FP16 语义加残差。 */
 __global__ void Finish(half *x, const half *gate, half *shared, const float *routed,
                        int count, int hidden, const half *prob, int topk) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;

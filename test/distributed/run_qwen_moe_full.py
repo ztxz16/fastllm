@@ -29,6 +29,7 @@ SYNTHETIC_FIXTURES = {
     'zero_experts': dict(experts=3, topk=1), 'hotspot': dict(hotspot=True, topk=1),
     'qkv_bias_rounding': dict(qkv_bias_rounding=True),
     'mixed_qkv_bias': dict(mixed_qkv_bias=True),
+    'expert_accumulation': dict(experts=4, topk=4, expert_accumulation=True),
 }
 SYNTHETIC_CASES = {
     f'{name}_ep{world}_graph{int(graph)}_prefix{int(prefix)}': (name, world, graph, prefix)

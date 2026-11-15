@@ -7,7 +7,8 @@ from run_qwen3_shards import encode, decode, save_fixture
 
 
 def fixture(directory, *, dtype="F16", bias=True, normalize=False, experts=5, topk=2,
-            tied=False, indexed=False, hotspot=False, qkv_bias_rounding=False, mixed_qkv_bias=False):
+            tied=False, indexed=False, hotspot=False, qkv_bias_rounding=False, mixed_qkv_bias=False,
+            expert_accumulation=False):
     """/** 创建全专家小模型；权重直接按 HF 名称生成，不依赖 C++ 分片计划。 */"""
     config = dict(model_type="qwen2_moe", hidden_size=8, num_hidden_layers=2,
                   num_attention_heads=2, num_key_value_heads=1, head_dim=4,
@@ -70,6 +71,26 @@ def fixture(directory, *, dtype="F16", bias=True, normalize=False, experts=5, to
         tensors[prefix+'self_attn.v_proj.weight']['data'] = encode([512.5 if i % 8 == 0 else 0.0 for i in range(32)], dtype)
         tensors[prefix+'self_attn.v_proj.bias']['data'] = encode([-513.0]*4, dtype)
         tensors[prefix+'self_attn.o_proj.weight']['data'] = encode([64.0] + [0.0]*63, dtype)
+        tensors['lm_head.weight']['data'] = encode([4.0] + [0.0]*103, dtype)
+
+    if expert_accumulation:
+        if dtype != 'F16' or experts != 4 or topk != 4 or normalize or tied or qkv_bias_rounding or mixed_qkv_bias:
+            raise ValueError('expert accumulation fixture requires F16, four experts/topk and ordinary bias layout')
+        # 所有Token输入为全1，Attention及第二层MoE为零；第一层四专家的加权贡献
+        # 按ID依次为[2048,1,-2048,1]。HF逐次FP16得1，FP32及Top-K顺序均得2。
+        for name, tensor in tensors.items():
+            unit = name in ('model.embed_tokens.weight', 'model.norm.weight') or name.endswith('layernorm.weight')
+            tensor['data'] = encode([1.0 if unit else 0.0]*math.prod(tensor['shape']), dtype)
+        prefix = 'model.layers.0.mlp.'
+        # 非并列路由顺序为[2,0,3,1]，检出按槽位排序代替全局专家顺序的错误。
+        tensors[prefix+'gate.weight']['data'] = encode(
+            [value if col == 0 else 0.0 for value in (.5, 0, 1, .25) for col in range(8)], dtype)
+        for expert, down in enumerate((8264.0, 6.6484375, -5012.0, 5.1796875)):
+            name = prefix+f'experts.{expert}.'
+            # FP16 SiLU(16)=16，与Up=1/16相乘得到精确的1；Down仅作用于首通道。
+            tensors[name+'gate_proj.weight']['data'] = encode([16.0] + [0.0]*55, dtype)
+            tensors[name+'up_proj.weight']['data'] = encode([.0625] + [0.0]*55, dtype)
+            tensors[name+'down_proj.weight']['data'] = encode([down] + [0.0]*55, dtype)
         tensors['lm_head.weight']['data'] = encode([4.0] + [0.0]*103, dtype)
 
     directory.mkdir()
@@ -164,8 +185,8 @@ def forward(config, tensors, task, input_):
                 ids, probs = routes[i]
                 probability = probs[ids.index(e)]
                 for col in range(h):
-                    # 独立参考按全局专家顺序 FP32 累加；GPU 可按 EP 分组规约。
-                    routed[i][col] = f32(routed[i][col] + half(output[col] * probability))
+                    # HF的FP16 index_add_每加入一个专家便舍入，按全局专家ID顺序迭代。
+                    routed[i][col] = half(routed[i][col] + half(output[col] * probability))
         shared = expert(normalized, "shared_expert")
         gates = linear(normalized, weight("mlp.shared_expert_gate.weight"))
         shared = [[half(value * half(1/(1+math.exp(-gate[0])))) for value in row] for row, gate in zip(shared, gates)]

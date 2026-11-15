@@ -593,12 +593,16 @@ struct Qwen3LayerExecutor::Impl {
         half *norm = nullptr, *gathered = nullptr, *allProb = nullptr;
         half *packed = nullptr, *gateup = nullptr, *activated = nullptr, *expertOutput = nullptr;
         int *allIds = nullptr, *map = nullptr;
-        float *partial = nullptr;
+        half *contributions = nullptr, *localContributions = nullptr;
     };
     MoeWorkspace graphMoe;
 
     /**
-     * 分配 FP16 激活、路由索引及 FP32 专家累加缓冲，不执行前向。
+     * 分配 FP16 激活、独立专家贡献及路由索引，不执行前向。
+     *
+     * 贡献布局为 [全组行数,Top-K,hidden]，每槽仅一个 owner 写入；本地接收
+     * 同布局的 [capacity,Top-K,hidden]。routed 以 FP32 保存最终 FP16 累加值。
+     * 所有缓冲计入原 512 MiB 预算；Graph 使用固定地址且不在捕获中分配。
      * @param capacity 全组最大行数，至少一；等于一时使用设备路由专家内核。
      * @param persistent true 使用 Graph 固定地址池，false 使用本轮临时池。
      * @return 缓冲视图，生命周期由对应池管理；超出预算或分配失败抛异常。
@@ -618,7 +622,8 @@ struct Qwen3LayerExecutor::Impl {
         auto allIds = static_cast<int*>(Allocate(size_t(rows) * k * sizeof(int), persistent));
         auto counts = static_cast<int*>(Allocate(size_t(e) * sizeof(int), persistent));
         auto map = static_cast<int*>(Allocate(size_t(e) * rows * sizeof(int), persistent));
-        auto partial = static_cast<float*>(Allocate(size_t(rows) * h * sizeof(float), persistent));
+        auto contributions = allocHalf(size_t(rows) * k * h);
+        auto localContributions = allocHalf(size_t(capacity) * k * h);
         auto routed = static_cast<float*>(Allocate(size_t(capacity) * h * sizeof(float), persistent));
         const size_t channels = std::max(size_t(rows) * m, size_t(capacity) * sharedWidth);
         auto packed = allocHalf(size_t(rows) * h);
@@ -629,7 +634,7 @@ struct Qwen3LayerExecutor::Impl {
         auto sharedGate = allocHalf(capacity);
 
         return {logits, prob, shared, sharedGate, ids, counts, routed, norm, gathered,
-                allProb, packed, gateup, activated, expertOutput, allIds, map, partial};
+                allProb, packed, gateup, activated, expertOutput, allIds, map, contributions, localContributions};
     }
 
     /**
@@ -654,11 +659,12 @@ struct Qwen3LayerExecutor::Impl {
         auto packed = w.packed, gateup = w.gateup, activated = w.activated, expertOutput = w.expertOutput;
         auto shared = w.shared, sharedGate = w.sharedGate;
         auto ids = w.ids, allIds = w.allIds, counts = w.counts, map = w.map;
-        auto partial = w.partial, routed = w.routed;
+        auto contributions = w.contributions, localContributions = w.localContributions;
+        auto routed = w.routed;
 
         Cuda(cudaMemsetAsync(norm, 0, size_t(capacity) * h * sizeof(half), stream));
         Cuda(cudaMemsetAsync(logits, 0, size_t(capacity) * e * sizeof(half), stream));
-        Cuda(cudaMemsetAsync(partial, 0, size_t(rows) * h * sizeof(float), stream));
+        Cuda(cudaMemsetAsync(contributions, 0, size_t(rows) * k * h * sizeof(half), stream));
         if (tokens) {
             Norm<<<tokens,256,0,stream>>>(x, Weight(prefix + "post_attention_layernorm.weight", {p.hiddenSize}),
                 norm, h, h, 1, 0, p.rmsNormEps);
@@ -682,7 +688,7 @@ struct Qwen3LayerExecutor::Impl {
             auto down = Weight(name + "down_proj.weight", {p.hiddenSize, uint64_t(m)});
             if (capacity == 1) {
                 moe::DecodeGate<<<(rows*m+255)/256,256,0,stream>>>(gathered, gate, allIds, activated, rows, h, m, k, expert);
-                moe::DecodeDown<<<(rows*h+255)/256,256,0,stream>>>(activated, down, allIds, allProb, partial, rows, h, m, k, expert);
+                moe::DecodeDown<<<(rows*h+255)/256,256,0,stream>>>(activated, down, allIds, allProb, contributions, rows, h, m, k, expert);
             } else if (hostCounts[expert]) {
                 int count = hostCounts[expert];
                 const int *indices = map + expert * rows;
@@ -690,10 +696,13 @@ struct Qwen3LayerExecutor::Impl {
                 Linear(packed, gate, gateup, count, 2*m, h, false);
                 Swiglu<<<(count*m+255)/256,256,0,stream>>>(gateup, activated, count*m, m);
                 Linear(activated, down, expertOutput, count, h, m, false);
-                moe::Scatter<<<(count*h+255)/256,256,0,stream>>>(expertOutput, indices, allProb, partial, count, h, k);
+                moe::Scatter<<<(count*h+255)/256,256,0,stream>>>(expertOutput, indices, allProb, contributions, count, h);
             }
         }
-        Nccl(ncclReduceScatter(partial, routed, size_t(capacity) * h, ncclFloat, ncclSum, comm, stream));
+        // 每槽位仅一个 rank 写入有效值，通信不进行跨专家的浮点求和。
+        Nccl(ncclReduceScatter(contributions, localContributions, size_t(capacity) * k * h,
+                               ncclHalf, ncclSum, comm, stream));
+        moe::OrderedSum<<<capacity,256,0,stream>>>(localContributions, ids, routed, h, k);
         if (tokens) {
             std::string name = prefix + "mlp.shared_expert.";
             Linear(norm, Weight(name + "gateup_proj.weight", {uint64_t(2*sharedWidth), p.hiddenSize}),
