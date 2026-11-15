@@ -2,6 +2,14 @@
 
 [中文](version.md)
 
+## V1.9.2
+
+- Added support for Unsloth quantized DeepSeek-V4.1-Flash models and EXL3-format models.
+- Improved support for MiniMax-H3, MiniMax-H3-Image, and Qwen-Image-2.1, with BF16, FP8, FP4 (NVFP4), INT8, GGUF, and tensor parallelism. Availability varies by model; Qwen-Image-2.1 quantization support is experimental.
+- Optimized performance for speculative decoding, concurrent inference, and hybrid inference.
+- Added initial Attention DP support for selected models.
+- Added initial prefill/decode disaggregation support for selected models.
+
 ## V1.9.1
 
 - Added support for Clover, Qwen-Image, HY-Nomas, LingBot World, MiniMax-H3, and Pika-H3-Flex.
