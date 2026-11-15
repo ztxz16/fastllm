@@ -180,12 +180,13 @@ HF/原生残差的精确差异数和最大误差；零容差FAIL表示数值不�
 `fp32_o`在这六组输入中均与HF相同。此证据支持修正QKV的bias舍入边界，
 但剩余误差和完整模型是否通过仍须由正式验收确认。
 
-MoE正式QKV现在先把bias广播到现有输出缓冲，再调用`beta=1`的GEMM，执行
+第一轮舍入修正曾先把bias广播到现有输出缓冲，再调用`beta=1`的GEMM，执行
 `FP16(dot + bias)`，避免旧的`FP16(FP16(dot) + bias)`。每次调用都重新初始化
 缓冲，单层、prefill、decode和Graph走同一入口，不增加GPU工作区或同步。
 语义依据见[cuBLAS GEMM公式](https://docs.nvidia.com/cuda/archive/12.6.0/cublas/index.html#cublasgemmex)。
 上述探针的`split_bias`、`merged_qkv`、`combined_projections`刻意保留旧的
-单独bias操作作对照，不代表修正后的完整原生执行路径。
+单独bias操作作对照，不代表当前完整原生执行路径。后续已按本页开头说明改为
+三个独立Lt投影；有bias时由epilogue处理，无bias路径不变。
 
 `synthetic`增加`qkv_bias_rounding`用例：解析构造bias抵消，正确Attention残差
 首通道为1.03125，旧路径为1.0，在原阈值下必须失败；同时通过正式会话入口覆盖
@@ -287,6 +288,52 @@ Prompt长度、专家GEMM形状和HF缓存/完整计算的舍入差异均需结�
 最严重的五项。最大绝对误差项可能仍在相对容差内，不等同于实际超差项。
 即使受控对照通过，报告也保留原失败并返回非零，不能当成完整模型验收通过。
 此探针与trace记录仅涉及Python，更新后无须重新编译。
+
+## 正式完整前向轨迹与最终Norm/LM Head定位
+
+独立子层检查会在每层重新使用HF输入，不能观察原生误差沿24层传播。
+`20261115T044828Z_decode_probe_f3327e03`中，原生缓存和完整重算都相对HF超差，
+而两种原生模式之间在原阈值内。因此不能仅靠切换缓存参考解释失败，下一步采集
+正式`StepMoe`完整历史Eager前向中的Embedding、每层Attention残差、MoE残差，
+以及最终Norm的末Token输出。输入仍为原失败的实际Token历史。
+
+采集默认关闭，仅诊断子进程设置`FASTLLM_MOE_TRACE_DIR`。它要求Prefix/Graph关闭、
+位置零的Begin；Decode和不支持模式明确拒绝，不静默回退。快照区最多32 MiB，计入
+原有512 MiB工作区预算；源张量、算子选择、stream及计算顺序不变。每阶段只在原
+stream复制快照，无逐层同步；一次整体读回后在原有最终同步之后落盘。临时快照
+随工作区释放，异常走原worker失败清理。不允许用采集运行做性能比较。
+
+需要用户在服务器重新构建一次，然后用已有参考环境执行：
+
+```bash
+bash test/distributed/run_attention_ep_v100.sh build
+/venv/fastllm-reference-cu126/bin/python3 test/distributed/probe_qwen_moe_forward_precision.py \
+  --diagnostic test/distributed/results/20261115T043656Z_moe_precision_78444795 \
+  --model /home/models/Qwen1.5-MoE-A2.7B-Chat --build build-attention-ep-cu126
+```
+
+脚本依次运行两次普通前向及一次采集前向，三次都是正式四rank会话且仅rank0有请求。
+`plain_repeat_exact`检查跨会话稳定性，`trace_vs_plain_exact`检查采集有无扰动；
+任一失败都将`trace_attribution_valid`置为false，此时仍保存观察，但不能将轨迹
+直接归因到原失败。探针不重放原混合请求调度，也不替代原Graph/Prefix验收矩阵。
+
+HF轨迹直接来自上一轮完整HF前向的hook记录，并检查Token历史、阶段完整性和各层
+输入连续性。所有阶段报告最大/平均绝对误差、超差数、精确差异数以及末Token指标，
+原数值阈值保持`0.05 + 0.01 * abs(reference)`。阶段首次超差有助于缩小范围，
+不等于该阶段的算子必然错误；前层传播的输入差异仍须结合后续同输入对照分析。
+
+原生会话退出后，只读取最终Norm和LM Head权重，在参考环境进行独立输出头重放：
+
+- HF全行输出头必须精确复现已保存HF logits，避免把错误参考用于归因。
+- 原生GemmEx/FP32输出头重放必须精确复现实际原生logits。
+- 同一原生末层输入比较实际Norm和HF Norm；同一Norm输出比较两种输出头。
+- 单独比较HF全Token矩阵与最后一行矩阵，保留GEMM形状差异。
+
+这些独立重放只用于诊断，不修改正式后端。输出头门禁和采集门禁均通过才标记
+`head_attribution_valid=true`。旧独立子层非PASS项也打印并保存在metadata中。
+结果保留原始FP16二进制、描述与SHA-256、完整logits、输出头候选、构建缓存和
+二进制哈希，汇总生成JSON/Markdown/CSV/XLSX；每次使用新目录。保留原失败或任一
+精确门禁失败时返回非零，不能用本诊断的局部PASS宣布完整模型通过。
 
 ## 启动阶段异常的定向复现
 
