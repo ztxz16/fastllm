@@ -1013,8 +1013,12 @@ bool FastllmCudaMatMulBFloat16(const fastllm::Data &input, fastllm::Data &weight
 
 // FP16 input × BF16 weight -> FP16 output
 bool FastllmCudaHalfMatMulBFloat16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
-    FastllmCudaBF16EnsureBiasOnDevice(weight, bias, k);
-    FastllmCudaBF16EnsureBiasHalfOnDevice(weight, bias, k);
+    // Temporary weight views have no persistent bias cache. Bias-free
+    // projections must not allocate zero buffers, especially during capture.
+    if (!bias.dims.empty()) {
+        FastllmCudaBF16EnsureBiasOnDevice(weight, bias, k);
+        FastllmCudaBF16EnsureBiasHalfOnDevice(weight, bias, k);
+    }
 
     half *cudaInput = (half *)FastllmCudaPrepareInput(input);
     half *cudaOutput = (half *)FastllmCudaPrepareOutput(output);
@@ -1171,8 +1175,12 @@ bool FastllmCudaBFloat16LinearFixedRows(const fastllm::Data &input,
 }
 
 bool FastllmCudaBFloat16MatMulBFloat16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
-    FastllmCudaBF16EnsureBiasOnDevice(weight, bias, k);
-    FastllmCudaBF16EnsureBiasBf16OnDevice(weight, bias, k);
+    // Temporary weight views have no persistent bias cache. Bias-free
+    // projections must not allocate zero buffers, especially during capture.
+    if (!bias.dims.empty()) {
+        FastllmCudaBF16EnsureBiasOnDevice(weight, bias, k);
+        FastllmCudaBF16EnsureBiasBf16OnDevice(weight, bias, k);
+    }
 
     __nv_bfloat16 *cudaInput = (__nv_bfloat16 *)FastllmCudaPrepareInput(input);
     __nv_bfloat16 *cudaOutput = (__nv_bfloat16 *)FastllmCudaPrepareOutput(output);
