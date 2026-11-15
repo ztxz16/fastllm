@@ -1,6 +1,7 @@
 #include "distributed/qwen3_limits.h"
 #include "distributed/qwen3_layer.h"
 #include "process_protocol.h"
+#include "qwen_moe_qkv.cuh"
 
 #include <cuda_fp16.h>
 #include <cublas_v2.h>
@@ -36,6 +37,27 @@ void Blas(cublasStatus_t result) {
         throw std::runtime_error("Qwen3 layer cuBLAS: " + std::to_string(int(result)));
     }
 }
+
+/**
+ * 将独立连续 Q/K/V 投影逐位拷贝到 Attention 使用的行交错布局。
+ * @param q FP16 [T,qWidth]；投影完成后只读，不执行额外类型转换。
+ * @param k FP16 [T,kvWidth]。
+ * @param v FP16 [T,kvWidth]。
+ * @param qkv FP16 [T,qWidth+2*kvWidth] 输出，与三个输入不重叠。
+ * @param count T*(qWidth+2*kvWidth)，已由调用方限制在 int 范围内。
+ * @param qWidth Q 通道数。
+ * @param kvWidth K 和 V 各自的通道数，允许与 qWidth 不同。
+ */
+__global__ void PackMoeQkv(const half *q, const half *k, const half *v, half *qkv,
+                          int count, int qWidth, int kvWidth) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const int width = qWidth + 2 * kvWidth, row = i / width, col = i % width;
+    if (col < qWidth) qkv[i] = q[row * qWidth + col];
+    else if (col < qWidth + kvWidth) qkv[i] = k[row * kvWidth + col - qWidth];
+    else qkv[i] = v[row * kvWidth + col - qWidth - kvWidth];
+}
+
 void Nccl(ncclResult_t result) {
     if (result != ncclSuccess) {
         throw std::runtime_error(std::string("Qwen3 layer NCCL: ") + ncclGetErrorString(result));
@@ -247,6 +269,8 @@ struct Qwen3LayerExecutor::Impl {
     ncclComm_t comm;
     ProcessAllReduce &allReduce;
     cublasHandle_t blas = nullptr;
+    cublasLtHandle_t qkvLt = nullptr;
+    std::vector<std::unique_ptr<detail::MoeQkvLtPlan>> qkvPlans, graphQkvPlans;
     std::vector<void*> buffers;
     size_t allocated = 0;
     std::vector<half*> kvCache;
@@ -299,8 +323,8 @@ struct Qwen3LayerExecutor::Impl {
      *
      * Qwen2 MoE 使用与 HF/PyTorch 常规 FP16 GEMM 一致的 FP32 计算类型和
      * Tensor Op 算法选项。PEDANTIC 的不同累加路径会令 router 分数产生一个
-     * FP16 间隔的差异，并改变 Top-K 边界。此策略覆盖 MoE 的所有 Linear，
-     * 包括上游 Attention 投影；单层、Eager 与 Graph 共用本入口。
+     * FP16 间隔的差异，并改变 Top-K 边界。此策略覆盖一般 MoE Linear；
+     * 有偏置的 QKV 改用独立 Lt 投影，以保留 HF 的矩阵形状和 epilogue。
      * Dense Qwen3 保留 PEDANTIC 策略。复用执行器的 handle、stream 和工作区，
      * 可选 bias 先广播到输出，再以 beta=1 在 GEMM 中相加，避免点积提前转
      * FP16；无 bias 仍使用 beta=0。工作区在同 stream 内覆盖，不分配或同步；
@@ -339,6 +363,9 @@ struct Qwen3LayerExecutor::Impl {
     struct Workspace {
         half *norm = nullptr, *qkv = nullptr, *context = nullptr, *gateup = nullptr, *activated = nullptr;
         float *partial = nullptr;
+        half *qkvParts[3]{};
+        void *qkvLtWorkspace = nullptr;
+        bool persistent = false;
     };
     Workspace graphWorkspace;
 
@@ -475,17 +502,83 @@ struct Qwen3LayerExecutor::Impl {
     Workspace Prepare(uint32_t tokens, uint32_t hidden, Qwen3LayerStage stage, bool persistent = false) {
         const auto &p = weights.Plan();
         Workspace w;
+        w.persistent = persistent;
         w.norm = static_cast<half*>(Allocate(size_t(tokens) * hidden * 2, persistent));
         w.partial = static_cast<float*>(Allocate(size_t(tokens) * hidden * 4, persistent));
         if (stage != Qwen3LayerStage::Mlp) {
             w.qkv = static_cast<half*>(Allocate(size_t(tokens) * (p.queryHeadCount + 2 * p.kvHeadCount) * p.headDim * 2, persistent));
             w.context = static_cast<half*>(Allocate(size_t(tokens) * p.queryHeadCount * p.headDim * 2, persistent));
+            if (qkvLt) {
+                const uint64_t widths[] = {p.queryHeadCount * p.headDim, p.kvHeadCount * p.headDim,
+                                          p.kvHeadCount * p.headDim};
+                for (int i = 0; i < 3; ++i) {
+                    w.qkvParts[i] = static_cast<half*>(Allocate(size_t(tokens) * widths[i] * sizeof(half), persistent));
+                }
+                w.qkvLtWorkspace = Allocate(detail::MoeQkvLtPlan::kWorkspaceBytes, persistent);
+            }
         }
         if (stage != Qwen3LayerStage::Attention) {
             w.gateup = static_cast<half*>(Allocate(size_t(tokens) * p.intermediateCount * 4, persistent));
             w.activated = static_cast<half*>(Allocate(size_t(tokens) * p.intermediateCount * 2, persistent));
         }
         return w;
+    }
+
+    /**
+     * 执行 MoE 有偏置的独立 Q/K/V Lt 投影，再恢复现有 Attention 的 QKV 布局。
+     *
+     * 权重仍按行合并存储，仅切片读取；三个输出各自连续且独立 cudaMalloc 对齐。
+     * 按形状和实际地址对齐缓存算法，临时与 Graph 缓存分开。Graph warmup 建立
+     * 所有计划，捕获时缺计划直接失败；同 stream 复用 1 MiB 工作区，无中途同步。
+     *
+     * @param layer 层号，仅用于失败定位。
+     * @param tokens Token 数，必须与 prepared 工作区行数相同。
+     * @param weight 连续 FP16 [qWidth+2*kvWidth,hidden] 合并权重。
+     * @param bias 连续 FP16 [qWidth+2*kvWidth] 合并偏置，非空。
+     * @param prepared 当前 Eager 或 Graph 池拥有的缓冲；输入为 norm，输出为 qkv。
+     */
+    void ProjectMoeQkv(uint32_t layer, int tokens, const half *weight, const half *bias,
+                       const Workspace &prepared) {
+        const auto &p = weights.Plan();
+        const int h = p.hiddenSize, qw = p.queryHeadCount * p.headDim, kw = p.kvHeadCount * p.headDim;
+        const int widths[] = {qw, kw, kw}, offsets[] = {0, qw, qw + kw};
+        auto &plans = prepared.persistent ? graphQkvPlans : qkvPlans;
+        if (!qkvLt || !bias || !prepared.qkvLtWorkspace) {
+            throw std::runtime_error("MoE QKV Lt workspace/handle/bias missing");
+        }
+
+        for (int i = 0; i < 3; ++i) {
+            const auto partWeight = weight + size_t(offsets[i]) * h, partBias = bias + offsets[i];
+            auto output = prepared.qkvParts[i];
+            try {
+                detail::MoeQkvLtPlan *plan = nullptr;
+                for (const auto &candidate : plans) {
+                    if (candidate->Matches(tokens, widths[i], h, prepared.norm, partWeight, output, partBias)) {
+                        plan = candidate.get();
+                        break;
+                    }
+                }
+                if (!plan) {
+                    cudaStreamCaptureStatus capture;
+                    Cuda(cudaStreamIsCapturing(stream, &capture));
+                    if (capture != cudaStreamCaptureStatusNone) {
+                        throw std::runtime_error("QKV Lt plan missing during CUDA Graph capture");
+                    }
+                    plans.push_back(std::make_unique<detail::MoeQkvLtPlan>(qkvLt, tokens, widths[i], h,
+                        prepared.norm, partWeight, output, partBias));
+                    plan = plans.back().get();
+                }
+                plan->Run(qkvLt, stream, prepared.norm, partWeight, output, partBias, prepared.qkvLtWorkspace);
+            } catch (const std::exception &error) {
+                throw std::runtime_error("MoE layer=" + std::to_string(layer) + " projection=" +
+                    std::string(1, "QKV"[i]) + ": " + error.what());
+            }
+        }
+
+        const int count = tokens * (qw + 2 * kw);
+        PackMoeQkv<<<(count+255)/256,256,0,stream>>>(prepared.qkvParts[0], prepared.qkvParts[1],
+            prepared.qkvParts[2], prepared.qkv, count, qw, kw);
+        Cuda(cudaGetLastError());
     }
 
     struct MoeWorkspace {
@@ -635,8 +728,12 @@ struct Qwen3LayerExecutor::Impl {
         if (attention) {
             Norm<<<t,256,0,r.stream>>>(x, r.Weight(prefix + "input_layernorm.weight", {hidden}), norm, h, h, 1, 0, p.rmsNormEps);
             const auto bias = r.Weight(prefix + "self_attn.mergeqkv.bias", {uint64_t(qkvWidth)}, true);
-            r.Linear(norm, r.Weight(prefix + "self_attn.mergeqkv.weight", {uint64_t(qkvWidth), hidden}),
-                qkv, t, qkvWidth, h, false, p.model == ShardModel::Qwen2Moe ? bias : nullptr);
+            const auto weight = r.Weight(prefix + "self_attn.mergeqkv.weight", {uint64_t(qkvWidth), hidden});
+            if (bias && p.model == ShardModel::Qwen2Moe) {
+                r.ProjectMoeQkv(layer, t, weight, bias, w);
+            } else {
+                r.Linear(norm, weight, qkv, t, qkvWidth, h, false);
+            }
             if (bias && p.model == ShardModel::DenseQwen3) {
                 Bias<<<(t*qkvWidth+255)/256,256,0,r.stream>>>(qkv, bias, t*qkvWidth, qkvWidth);
             }
@@ -764,6 +861,7 @@ struct Qwen3LayerExecutor::Impl {
             Cuda(cudaGraphDestroy(graph));
             graph = nullptr;
         }
+        graphQkvPlans.clear();
         if (!graphBuffers.empty()) {
             // SetStream 将 cuBLAS 的用户工作区恢复为默认值，避免释放后继续引用。
             Blas(cublasSetStream(blas, stream));
@@ -790,6 +888,7 @@ struct Qwen3LayerExecutor::Impl {
 
     void ReleaseBuffers() {
         Cuda(cudaStreamSynchronize(stream));
+        qkvPlans.clear();
         for (auto &buffer : buffers) {
             Cuda(cudaFree(buffer));
             buffer = nullptr;
@@ -809,6 +908,14 @@ Qwen3LayerExecutor::Qwen3LayerExecutor(const Qwen3DeviceWeights &weights, cudaSt
     Blas(cublasCreate(&impl->blas));
     Blas(cublasSetStream(impl->blas, stream));
     Blas(cublasSetMathMode(impl->blas, CUBLAS_DEFAULT_MATH));
+    if (weights.Plan().model == ShardModel::Qwen2Moe) {
+        for (const auto &tensor : weights.Plan().tensors) {
+            if (tensor.name.find(".self_attn.mergeqkv.bias") != std::string::npos) {
+                Blas(cublasLtCreate(&impl->qkvLt));
+                break;
+            }
+        }
+    }
 }
 
 // 异常析构不进入可能阻塞的 CUDA 清理；worker 的失败路径退出进程回收上下文。
@@ -1242,6 +1349,10 @@ void Qwen3LayerExecutor::Clear() {
     impl->kvCache.clear();
     impl->reservedKVBytes = 0;
     impl->ReleaseBuffers();
+    if (impl->qkvLt) {
+        Blas(cublasLtDestroy(impl->qkvLt));
+        impl->qkvLt = nullptr;
+    }
     if (impl->blas) {
         Blas(cublasDestroy(impl->blas));
         impl->blas = nullptr;
