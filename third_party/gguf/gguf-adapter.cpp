@@ -191,9 +191,11 @@ namespace fastllm {
         bool found = false;
         for (const auto &task : tasks) {
             if (task.name != "engram_combined.weight") { normalized.push_back(task); continue; }
-            AssertInFastLLM(!found && task.tensor.type == GGML_TYPE_IQ4_NL && task.tensor.dims.size() == 2 &&
-                task.tensor.ne[0] == params["deepseek41.embedding_length_per_layer_input"].int_value(),
-                "DeepSeek V4.1 upstream GGUF: invalid combined Engram table.");
+            AssertInFastLLM(!found && task.tensor.dims.size() == 2 &&
+                task.tensor.ne[0] == params["deepseek41.embedding_length_per_layer_input"].int_value() &&
+                GGUFSupportsHostEmbedding(task.tensor.type, task.tensor.ne[0]),
+                "DeepSeek V4.1 upstream GGUF: invalid combined Engram table shape or unsupported row type " +
+                std::to_string(int(task.tensor.type)) + ".");
             found = true;
             int64_t row = 0;
             for (size_t i = 0; i < layers.size(); ++i) {
@@ -212,7 +214,7 @@ namespace fastllm {
             }
             AssertInFastLLM(row == task.tensor.ne[1], "DeepSeek V4.1 upstream GGUF: Engram table row mismatch.");
         }
-        AssertInFastLLM(found, "DeepSeek V4.1 upstream GGUF: missing combined Engram table (last shard).");
+        AssertInFastLLM(found, "DeepSeek V4.1 upstream GGUF: missing combined Engram table; keep all model shards.");
         tasks.swap(normalized);
     }
 

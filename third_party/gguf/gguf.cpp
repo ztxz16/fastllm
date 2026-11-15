@@ -32,6 +32,8 @@ GGML_API void        ggml_bf16_to_fp32_row(const ggml_bf16_t *bf16, float *fp32,
 std::map <ggml_type, ggml_type_traits> type_traits = {
         // Imported losslessly to native compact FP4 before execution.
         {GGML_TYPE_MXFP4, {"mxfp4", 32, 17, true, nullptr, GGML_TYPE_Q8_0}},
+        {GGML_TYPE_MXFP8, {"mxfp8", QK_MXFP8, sizeof(block_mxfp8), true,
+            nullptr, GGML_TYPE_Q8_0, (ggml_to_float_t) dequantize_row_mxfp8}},
         {GGML_TYPE_I8, {/* type_name */"i8", /* blck_size */1,
             /* type_size */ sizeof(int8_t),/* is_quantized */  false,
         }},
@@ -256,6 +258,8 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
 #else
 std::map <ggml_type, ggml_type_traits> type_traits = {
         {GGML_TYPE_MXFP4, {"mxfp4", 32, 17, true, nullptr, GGML_TYPE_Q8_0}},
+        {GGML_TYPE_MXFP8, {"mxfp8", QK_MXFP8, sizeof(block_mxfp8), true,
+            nullptr, GGML_TYPE_Q8_0, (ggml_to_float_t) dequantize_row_mxfp8}},
         {GGML_TYPE_I8, {
             .type_name                = "i8",
             .blck_size                = 1,
@@ -632,6 +636,13 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
         }},
 };
 #endif
+
+bool fastllm::GGUFSupportsHostEmbedding(ggml_type type, int64_t columns) {
+    const auto it = type_traits.find(type);
+    return it != type_traits.end() && it->second.is_quantized &&
+        it->second.to_float != nullptr && it->second.type_size > 0 &&
+        it->second.blck_size > 0 && columns > 0 && columns % it->second.blck_size == 0;
+}
 
 int64_t ggml_blck_size(enum ggml_type type) {
     return type_traits[type].blck_size;

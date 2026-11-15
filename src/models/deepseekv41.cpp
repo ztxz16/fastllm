@@ -3228,9 +3228,11 @@ namespace fastllm {
             auto gguf = this->weight.weight.find(base + "weight");
             if (gguf != this->weight.weight.end() && gguf->second.dataType == DATA_GGUF_FORMAT) {
                 Data &embedding = gguf->second;
-                AssertInFastLLM(embedding.ggmlType == GGML_TYPE_IQ4_NL && embedding.dims.size() == 2 &&
-                    embedding.dims[0] == engram_num_embeddings.at(l) && embedding.dims[1] == engram_head_dim,
-                    "DeepSeekV41: invalid GGUF Engram lookup table.");
+                AssertInFastLLM(embedding.dims.size() == 2 &&
+                    embedding.dims[0] == engram_num_embeddings.at(l) && embedding.dims[1] == engram_head_dim &&
+                    !embedding.IsRepacked && GGUFSupportsHostEmbedding(ggml_type(embedding.ggmlType), embedding.dims[1]),
+                    "DeepSeekV41: invalid GGUF Engram lookup table shape or unsupported row type " +
+                    std::to_string(embedding.ggmlType) + ".");
                 table->rows = embedding.dims[0]; table->dim = embedding.dims[1];
                 table->ggufWeight = &embedding;
                 if (embedding.isDiskWeight) {
@@ -3238,8 +3240,8 @@ namespace fastllm {
                     table->diskValueReader = std::make_unique<DiskEmbeddingRowReader>(embedding, 0);
                 } else AssertInFastLLM(embedding.cpuData != nullptr, "GGUF Engram requires host lookup storage.");
                 engramTables.push_back(std::static_pointer_cast<void>(table));
-                printf("[Fastllm] DeepSeek-V4.1: engram table for layer %d ready (IQ4_NL, %s).\n",
-                       layer, embedding.isDiskWeight ? "disk" : "CPU");
+                printf("[Fastllm] DeepSeek-V4.1: engram table for layer %d ready (%s, %s).\n",
+                       layer, ggml_type_name(ggml_type(embedding.ggmlType)), embedding.isDiskWeight ? "disk" : "CPU");
                 continue;
             }
             if (this->ngramDevice == "disk") {

@@ -1300,6 +1300,16 @@ typedef uint32_t ggml_half2;
 #define QK_K 256
 #define K_SCALE_SIZE 12
 
+// GGUF MXFP8 wire layout: E8M0 scale followed by 32 E4M3FN values.
+// Format reference: ggml-org/llama.cpp PR #30817,
+// danielhanchen/llama.cpp@b72050d03ae14bb3cb5138ecefab3f3f65157d31.
+#define QK_MXFP8 32
+typedef struct {
+    uint8_t e;
+    uint8_t qs[QK_MXFP8];
+} block_mxfp8;
+static_assert(sizeof(block_mxfp8) == 33, "wrong mxfp8 block size/padding");
+
 // llama.cpp Q2_0: four consecutive 2-bit codes per byte, {-1, 0, 1, 2} * d.
 #define QK2_0 64
 typedef struct {
@@ -1801,6 +1811,7 @@ enum ggml_type {
         //
         GGML_TYPE_I2_S    = 36,
         GGML_TYPE_Q2_0    = 42,
+        GGML_TYPE_MXFP8   = 43,
         //
         GGML_TYPE_Q8_0_X4 = 97,
         GGML_TYPE_Q8_1_X4 = 98,
@@ -1980,6 +1991,7 @@ GGML_API void dequantize_row_q2_K(const block_q2_K * GGML_RESTRICT x, float * GG
 GGML_API void dequantize_row_q3_K(const block_q3_K * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_q4_K(const block_q4_K * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_q5_K(const block_q5_K * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+GGML_API void dequantize_row_mxfp8(const block_mxfp8 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_q6_K(const block_q6_K * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_q8_K(const block_q8_K * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 
@@ -2128,6 +2140,10 @@ template <int nrc_y>
 static void mul_mat_q6_k_r4_q8_k(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x);
 
 namespace fastllm {
+    // Packed host lookup rows must have a decoder and a whole number of blocks.
+    // Repacked matmul-only types deliberately have no row decoder.
+    bool GGUFSupportsHostEmbedding(ggml_type type, int64_t columns);
+
     // Ordinary row layouts with exact FP32 CUDA lookup decoders. Keep this
     // predicate shared by import and dispatch so unsupported tables stay dense.
     inline bool GGUFSupportsCudaEmbedding(ggml_type type) {
