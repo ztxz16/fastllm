@@ -159,6 +159,25 @@ HF/原生残差的精确差异数和最大误差；零容差FAIL表示数值不�
 原验收`0.05 + 0.01 * abs(reference)`的失败数量另外保存在JSON中。每层原始JSON保存
 归一化、Q/K/V、Attention context、输出投影和残差；summary生成MD/CSV/JSON/XLSX。
 
+服务器诊断`20261115T020759Z_attention_probe_e3838df2`中，六层`hf_replay`
+均精确复现HF；单独改成QKV点积先转FP16再加bias，就重现了大部分原生差异。
+第18层相对原生的差异数从21001降至866，再结合归约顺序模拟降至219。
+`fp32_o`在这六组输入中均与HF相同。此证据支持修正QKV的bias舍入边界，
+但剩余误差和完整模型是否通过仍须由正式验收确认。
+
+MoE正式QKV现在先把bias广播到现有输出缓冲，再调用`beta=1`的GEMM，执行
+`FP16(dot + bias)`，避免旧的`FP16(FP16(dot) + bias)`。每次调用都重新初始化
+缓冲，单层、prefill、decode和Graph走同一入口，不增加GPU工作区或同步。
+语义依据见[cuBLAS GEMM公式](https://docs.nvidia.com/cuda/archive/12.6.0/cublas/index.html#cublasgemmex)。
+上述探针的`split_bias`、`merged_qkv`、`combined_projections`刻意保留旧的
+单独bias操作作对照，不代表修正后的完整原生执行路径。
+
+`synthetic`增加`qkv_bias_rounding`用例：解析构造bias抵消，正确Attention残差
+首通道为1.03125，旧路径为1.0，在原阈值下必须失败；同时通过正式会话入口覆盖
+EP1/2/4、Eager/Graph、Prefix开关和完整logits。CPU检查用独立PyTorch Linear
+核对期望值，不能代替GPU验收。此修正涉及CUDA代码，需要先重新构建，再执行
+`synthetic`、`regression`和`real`，误差容差保持不变。
+
 ## 启动阶段异常的定向复现
 
 若`ready.json`尚未产生、请求数为0，故障发生在进程组初始化或模型加载阶段，

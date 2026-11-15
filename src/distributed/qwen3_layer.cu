@@ -202,6 +202,24 @@ __global__ void Bias(T *values, const half *bias, int count, int width) {
     }
 }
 
+/**
+ * 将 bias 广播到 GEMM 的 C 矩阵，由 beta=1 在累加器中相加后统一转换输出类型。
+ *
+ * 此处只复制 FP16 bias，不读取旧输出；随后同 stream 的 GEMM 覆盖整个矩阵。
+ * 避免先将点积转 FP16、再单独加 bias 的二次舍入，支持 Graph 重放复用缓冲。
+ * @param values 行主序 [tokens,width]，T 为 half 或 float。
+ * @param bias FP16 [width]，只读且不与 values 重叠。
+ * @param count tokens*width，已由调用方检查边界。
+ * @param width 输出通道数。
+ */
+template<class T>
+__global__ void BroadcastBias(T *values, const half *bias, int count, int width) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) {
+        values[i] = T(__half2float(bias[i % width]));
+    }
+}
+
 __global__ void Residual(half *x, const float *partial, int count) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < count) {
@@ -277,14 +295,16 @@ struct Qwen3LayerExecutor::Impl {
     }
 
     /**
-     * 执行行主序线性计算 Y[T,N]=X[T,K]*W[N,K]^T。
+     * 执行行主序线性计算 Y[T,N]=X[T,K]*W[N,K]^T+bias[N]。
      *
      * Qwen2 MoE 使用与 HF/PyTorch 常规 FP16 GEMM 一致的 FP32 计算类型和
      * Tensor Op 算法选项。PEDANTIC 的不同累加路径会令 router 分数产生一个
      * FP16 间隔的差异，并改变 Top-K 边界。此策略覆盖 MoE 的所有 Linear，
      * 包括上游 Attention 投影；单层、Eager 与 Graph 共用本入口。
      * Dense Qwen3 保留 PEDANTIC 策略。复用执行器的 handle、stream 和工作区，
-     * 不在此处同步或修改输出舍入边界；cuBLAS 失败直接上抛，不切换算法重试。
+     * 可选 bias 先广播到输出，再以 beta=1 在 GEMM 中相加，避免点积提前转
+     * FP16；无 bias 仍使用 beta=0。工作区在同 stream 内覆盖，不分配或同步；
+     * cuBLAS 失败直接上抛，不切换算法重试。
      *
      * @param x 连续 FP16 激活 [T,K]。
      * @param w 连续 FP16 权重 [N,K]。
@@ -293,12 +313,23 @@ struct Qwen3LayerExecutor::Impl {
      * @param n 输出通道数 N。
      * @param k 输入通道数 K。
      * @param fp32 true 输出 FP32，用于投影中间值或 logits；false 输出 FP16。
+     * @param bias 可空的 FP16 [N]；非空时在最终输出转换前相加，不与 x/w/y 重叠。
      */
-    void Linear(const half *x, const half *w, void *y, int t, int n, int k, bool fp32) {
+    void Linear(const half *x, const half *w, void *y, int t, int n, int k, bool fp32,
+                const half *bias = nullptr) {
         const bool moe = weights.Plan().model == ShardModel::Qwen2Moe;
         const auto computeType = moe ? CUBLAS_COMPUTE_32F : CUBLAS_COMPUTE_32F_PEDANTIC;
         const auto algorithm = moe ? CUBLAS_GEMM_DEFAULT_TENSOR_OP : CUBLAS_GEMM_DEFAULT;
-        const float alpha = 1, beta = 0;
+        const float alpha = 1, beta = bias ? 1 : 0;
+
+        if (bias) {
+            if (fp32) {
+                BroadcastBias<<<(t*n+255)/256,256,0,stream>>>(static_cast<float*>(y), bias, t*n, n);
+            } else {
+                BroadcastBias<<<(t*n+255)/256,256,0,stream>>>(static_cast<half*>(y), bias, t*n, n);
+            }
+            Cuda(cudaGetLastError());
+        }
 
         Blas(cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, n, t, k, &alpha,
             w, CUDA_R_16F, k, x, CUDA_R_16F, k, &beta, y, fp32 ? CUDA_R_32F : CUDA_R_16F,
@@ -603,8 +634,10 @@ struct Qwen3LayerExecutor::Impl {
         const bool attention = stage != Qwen3LayerStage::Mlp, mlp = stage != Qwen3LayerStage::Attention;
         if (attention) {
             Norm<<<t,256,0,r.stream>>>(x, r.Weight(prefix + "input_layernorm.weight", {hidden}), norm, h, h, 1, 0, p.rmsNormEps);
-            r.Linear(norm, r.Weight(prefix + "self_attn.mergeqkv.weight", {uint64_t(qkvWidth), hidden}), qkv, t, qkvWidth, h, false);
-            if (auto bias = r.Weight(prefix + "self_attn.mergeqkv.bias", {uint64_t(qkvWidth)}, true)) {
+            const auto bias = r.Weight(prefix + "self_attn.mergeqkv.bias", {uint64_t(qkvWidth)}, true);
+            r.Linear(norm, r.Weight(prefix + "self_attn.mergeqkv.weight", {uint64_t(qkvWidth), hidden}),
+                qkv, t, qkvWidth, h, false, p.model == ShardModel::Qwen2Moe ? bias : nullptr);
+            if (bias && p.model == ShardModel::DenseQwen3) {
                 Bias<<<(t*qkvWidth+255)/256,256,0,r.stream>>>(qkv, bias, t*qkvWidth, qkvWidth);
             }
             if (p.model == ShardModel::DenseQwen3) {

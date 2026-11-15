@@ -78,6 +78,7 @@ def cases():
               ("topk_all", dict(experts=5, topk=5, normalize=True)),
               ("official_expert_counts", dict(experts=60, topk=4)),
               ("attention_fp16_rounding", dict(bias=False, attention_rounding=True)),
+              ("qkv_bias_rounding", dict(qkv_bias_rounding=True)),
               ("context_boundary", dict(boundary=True))]
     for name, patch, reason in [
         ("quantized", {"quantization_config": {}}, "quantized checkpoints"),
@@ -108,10 +109,17 @@ def cases():
 
 def make_case(directory, spec, world):
     """/** 保存固定输入和模型，故障 case 仅改变被验证的约束，不修改执行后端。 */"""
-    options = {k: v for k, v in spec.items() if k in {"dtype", "bias", "normalize", "experts", "topk", "tied", "indexed", "hotspot"}}
+    options = {k: v for k, v in spec.items() if k in {
+        "dtype", "bias", "normalize", "experts", "topk", "tied", "indexed", "hotspot", "qkv_bias_rounding"}}
     config, tensors = fixture(directory / "model", **options)
     config.update(spec.get("config", {}))
     tasks = tasks_for(world, spec.get("hotspot", False))
+    if spec.get('qkv_bias_rounding'):
+        tasks = []
+        for name, counts in (('prefill', (4, 0, 1, 2)), ('decode', (1, 0, 1, 1))):
+            for stage in (1, 0):
+                tasks.append(dict(name=f'qkv_bias_{name}_stage{stage}', layer=0, hidden=8, stage=stage,
+                    inputs=[dict(position_begin=0, hidden=[1.0]*(count*8)) for count in counts[:world]]))
     if spec.get("attention_rounding"):
         # 放大有限Q/K和V/O投影，令缺失FP16舍入的Attention在既定阈值下可被检出。
         for name, tensor in tensors.items():
