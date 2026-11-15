@@ -355,6 +355,33 @@ Token的累积误差，终端列出每个Token首次超出原阈值的位置，�
 `native_head_reproduces_traced_logits.raw_numeric_comparison`保留未编码误差和精确差异数。
 仅输出头门禁恢复PASS不代表完整模型通过；只要原数值失败仍存在，复核就返回非零。
 
+### 首次超差MoE的双输入检查
+
+`20261115T134038Z_forward_recheck_6cbcdd37`的轨迹门禁通过，最早超差为第13层MoE、
+Token索引11；第15层MoE的Token索引6也明显超差。层号和Token位置均从0开始。
+这些位置只说明首次越过原阈值，不能排除更早层的输入误差。本轮输出头的传输值
+一致，但1个近零FP32值存在编码歧义，输出头精确归因仍不可用。
+
+下面的独立诊断保留整段Token形状，分别将HF和原生的真实Attention后输入送给双方
+MoE；仅加载指定层的HF Norm/MoE权重，原生复用已有正式层检查入口。**无需重新编译**：
+
+```bash
+/venv/fastllm-reference-cu126/bin/python3 test/distributed/probe_qwen_moe_stage_inputs.py \
+  --probe test/distributed/results/20261115T132323Z_forward_probe_c0356506 \
+  --model /home/models/Qwen1.5-MoE-A2.7B-Chat --build build-attention-ep-cu126 --layers 13 15
+```
+
+`--probe`指原始轨迹目录而非复核目录。脚本验证历史哈希/轨迹门禁、当前worker哈希、
+参考环境版本，并使用原HF层所在设备。每层HF重放须精确复现已保存的所有字段，原生
+重放须精确复现正式轨迹的FP16层输出；任一不一致将该层`attribution_valid`置false。
+对FP16原生层输出仅恢复可唯一确定的JSON传输值，不对FP32输出头使用这种恢复方法。
+
+报告分别保存输入差异、HF对输入扰动的传播、同一原生输入下的实现差异、总输出差异，
+以及双方实际router、专家、权重、路由和共享专家输出。不能相加这些最大误差或失败
+元素数量；它们可能出现在不同元素上。`tokens/summary.{json,md,csv,xlsx}`保存逐Token
+结果；终端打印原首次超差Token的四组指标。所有历史失败和输出头不确定性继续保留，
+不改变原阈值；即使两层重放成功，仍会返回非零，不能代表完整模型通过。
+
 ## 启动阶段异常的定向复现
 
 若`ready.json`尚未产生、请求数为0，故障发生在进程组初始化或模型加载阶段，
