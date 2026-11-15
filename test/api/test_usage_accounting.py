@@ -394,18 +394,20 @@ def make_native_stream_model(use_hf, payload, terminal=-1, missing_terminal=Fals
     tree = ast.parse(source.read_text())
     model_class = next(n for n in tree.body
                        if isinstance(n, ast.ClassDef) and n.name == "model")
-    method = next(n for n in model_class.body
-                  if isinstance(n, ast.AsyncFunctionDef)
-                  and n.name == "stream_response_handle_async")
+    methods = [n for n in model_class.body
+               if isinstance(n, ast.AsyncFunctionDef)
+               and n.name in ("stream_response_handle_async", "_stream_response_handle_async")]
     library = ReusingFetchLibrary(payload, terminal, missing_terminal)
-    scope = {"asyncio": asyncio, "ctypes": ctypes, "fastllm_lib": library}
-    exec(compile(ast.Module(body=[method], type_ignores=[]), str(source), "exec"), scope)
+    scope = {"__name__": "fastllm_pytools.llm", "asyncio": asyncio,
+             "ctypes": ctypes, "fastllm_lib": library}
+    exec(compile(ast.Module(body=methods, type_ignores=[]), str(source), "exec"), scope)
 
     class StreamModel(FakeModel):
         model = 0
         save_history = False
         hf_tokenizer = SimpleNamespace(decode=lambda ids: bytes(ids).decode(errors="replace"))
         stream_response_handle_async = scope["stream_response_handle_async"]
+        _stream_response_handle_async = scope.get("_stream_response_handle_async")
 
         def _can_apply_hf_chat_template(self):
             return use_hf
