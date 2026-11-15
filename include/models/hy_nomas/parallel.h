@@ -24,8 +24,15 @@ public:
     void gatherChunks(const Tensor &, int chunks, int rank,
                       const std::function<void(int, const Tensor &)> &consume, bool inPlace = false);
     void sum(Tensor &, int rank);
+    // Consume activation-precision partials. Small BF16 TP2 tensors use an
+    // out-of-place peer reduction; other layouts use NCCL in place.
+    Tensor sumActivation(Tensor partial, int rank);
     // Shared scalar/range calibration for partitioned activation quantization.
     void maximum(Tensor &, int rank);
+    // INT8 row projections reduce signed INT32 storage before applying the
+    // activation/weight scales and rounding. Partial sums must fit in INT32.
+    void sumScaledInt32(const Tensor &partial, const Tensor &activationScale, const Tensor &weightScale,
+                        Tensor &output, int rank);
     // In-place AllReduce on the communication stream; wait() before consuming.
     void sumAsync(const Tensor &, int rank);
     // Sum FP32 partials before rounding. Reduce-scatter in FP32, then gather

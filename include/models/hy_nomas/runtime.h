@@ -69,14 +69,17 @@ public:
     struct Numerics {
         bool fp32SoftmaxSum = true;
         bool layerNormFMA = true;
+        // Opt-in BF16 partial sums for large, autotuned contraction GEMMs.
+        bool bf16SplitKReduction = false;
     };
     explicit Runtime(int device);
     Runtime(int device, bool fp32);
     Runtime(int device, DType dtype);
     Runtime(int device, DType dtype, Numerics numerics);
     void activate();
-    // Opt-in for resident BF16 models. Tune two FP32-accumulating GEMM
-    // candidates once per large aligned shape; other callers retain cuBLAS.
+    // Opt-in for resident BF16 models. Tune two GEMM candidates once per
+    // large aligned shape; BF16 split-K partials require a separate Numerics
+    // opt-in. Other callers retain cuBLAS and FP32 reduction.
     void setLinearAutotuning(bool enabled) { tuneLinear_ = enabled; }
     bool isFloat32() const { return dtype_ == DType::FP32; }
     DType dtype() const { return dtype_; }
@@ -206,6 +209,9 @@ public:
     // A supplied output cannot be combined with separateBias.
     Tensor linear(const Tensor &x, const std::string &prefix, bool separateBias, Tensor *out);
     void clear(bool keepPackedCache = false);
+    // Expanded device tensors currently loaded by get(), including shards.
+    // Excludes the optional packed cache and offloaded host tensors.
+    size_t loadedBytes() const;
     // Optional lossless host cache for callers that swap model stages.
     void offload();
     // Retain checkpoint BF16 tensors for resident inference or streamed FP32

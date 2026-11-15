@@ -4,9 +4,11 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 #include "models/hy_nomas/runtime.h"
+#include "models/hy_nomas/parallel.h"
 
 namespace fastllm {
 namespace qwen_image {
@@ -17,13 +19,29 @@ using QwenTokenizer = nomas::QwenTokenizer;
 
 class Runtime : public nomas::Runtime {
   public:
-    explicit Runtime(int device);
+    // BF16 activations/weights and FP32 tile accumulation. Large contraction
+    // GEMMs may use BF16 split-K partials; FP32 remains a reference mode.
+    explicit Runtime(int device, bool fp32 = false);
     // Qwen's zero-centered RMSNorm and VAE channel norm.
     Tensor specialNorm(const Tensor &, const Tensor &weight, int mode, float eps = 1e-6f);
+    Tensor vaeNormSilu(const Tensor &, const Tensor &weight);
     Tensor scale(const Tensor &, const Tensor &mod, int firstTarget, int offset);
+    Tensor normScale(const Tensor &, const Tensor &mod, int firstTarget, int offset);
+    void qkNormRope(const Tensor &q, const Tensor &k, const Tensor &qw, const Tensor &kw,
+                    const nomas::RopeTable &, Tensor &outQ, Tensor &outK);
+    // Packed projections are BF16-only; FP32 uses separate Q/K/V projections.
+    void qkvNormRope(const Tensor &qkv, const Tensor &qw, const Tensor &kw,
+                     const nomas::RopeTable &, Tensor &outQ, Tensor &outK, Tensor &outV);
+    void eulerStep(Tensor &latent, const Tensor &noise, float dt);
+    using nomas::Runtime::siluMultiply;
+    Tensor siluMultiply(const Tensor &gate, const Tensor &up);
+    Tensor siluMultiply(const Tensor &packed, bool gateFirst);
     Tensor gatedAdd(const Tensor &, const Tensor &, const Tensor &mod, int firstTarget, int offset);
     Tensor conv2d(const Tensor &, const Tensor &weight, const Tensor *bias, int height, int width, int kernel,
                   int stride = 1, int pad = 0, int padEnd = 0);
+    Tensor packConvWeight(const Tensor &, int channels);
+    Tensor packedConv2d(const Tensor &, const Tensor &weight, const Tensor *bias, int height, int width,
+                        int kernel, int stride, int pad, int padEnd);
     Tensor resize2x(const Tensor &, int height, int width);
     Tensor duplicateUpsample(const Tensor &, int height, int width, int channels, int temporalFactor);
     Tensor averageDownsample(const Tensor &, int height, int width, int channels, int spatialFactor,
@@ -41,6 +59,9 @@ struct Condition {
 };
 struct KVCache {
     std::vector<Tensor> keys, values;
+    nomas::RopeTable rope;
+    // The pipeline enables full KV buffers only when its memory estimate fits.
+    bool full = false;
 };
 using Progress = std::function<void(const std::string &, int, int)>;
 // Optional FP32 snapshots for differential tests; the server leaves this unset.
@@ -51,6 +72,7 @@ class TextEncoder {
     TextEncoder(Runtime &, const std::string &directory);
     Tensor encode(const std::vector<int> &tokens, const std::vector<Image> &images = {});
     void unload() { weights_.clear(); }
+    size_t loadedBytes() const { return weights_.loadedBytes(); }
 
   private:
     std::vector<Tensor> vision(const Image &image);
@@ -58,16 +80,29 @@ class TextEncoder {
     Weights weights_;
 };
 
+class QuantizedProjections;
 class DiT {
   public:
-    DiT(Runtime &, const std::string &directory);
+    DiT(Runtime &, const std::string &directory, nomas::ParallelContext = {});
+    ~DiT();
     Tensor forward(const Tensor &latents, const Condition &, float timestep, int height, int width,
                    KVCache *cache = nullptr);
-    void unload() { weights_.clear(); }
+    void unload();
+    size_t loadedBytes() const;
 
   private:
     Runtime &rt_;
-    Weights weights_;
+    nomas::ParallelContext parallel_;
+    std::unique_ptr<Weights> weights_;
+    std::unique_ptr<QuantizedProjections> quantized_;
+    const Tensor &weight(const std::string &);
+    struct Projection {
+        Tensor weight, bias;
+    };
+    std::unordered_map<std::string, Projection> projections_;
+    Tensor linear(const Tensor &, const std::string &prefix, Tensor *output = nullptr);
+    Tensor rowLinear(const Tensor &, const std::string &);
+    Tensor packedLinear(const Tensor &, const std::vector<std::string> &prefixes);
 };
 
 class VAE {
@@ -75,7 +110,8 @@ class VAE {
     VAE(Runtime &, const std::string &directory);
     Tensor decode(const Tensor &latents, int height, int width);
     Tensor encode(const Tensor &pixels, int height, int width);
-    void unload() { weights_.clear(); }
+    void unload();
+    size_t loadedBytes() const;
 
   private:
     Tensor conv(const Tensor &, const std::string &, int h, int w, int stride = 1, int padEnd = 0);
@@ -83,6 +119,7 @@ class VAE {
     Tensor middle(const Tensor &, const std::string &, int h, int w);
     Runtime &rt_;
     Weights weights_;
+    std::unordered_map<std::string, Tensor> packedConvs_;
 };
 
 struct GenerateOptions {
@@ -93,17 +130,23 @@ struct GenerateOptions {
     int referenceResolution = 1024;
     void validate() const;
 };
+class ParallelDiT;
 class Pipeline {
   public:
-    Pipeline(const std::string &directory, int device);
+    Pipeline(const std::string &directory, int device, bool fp32 = false);
+    Pipeline(const std::string &directory, const std::vector<int> &devices, bool fp32 = false);
+    ~Pipeline();
     Image generate(const GenerateOptions &, Progress progress = {}, Trace trace = {});
 
   private:
     Runtime rt_;
+    nomas::TensorPool pool_;
     QwenTokenizer tokenizer_;
     TextEncoder text_;
-    DiT dit_;
+    std::unique_ptr<DiT> dit_;
+    std::unique_ptr<ParallelDiT> parallel_;
     VAE vae_;
+    size_t weightBytes_ = 0, ditWeightBytes_ = 0;
     std::vector<float> means_, stds_;
     double baseShift_ = .5, maxShift_ = .9, baseLength_ = 256, maxLength_ = 8192, terminal_ = .02;
 };

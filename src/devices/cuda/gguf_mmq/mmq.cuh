@@ -21,7 +21,6 @@
 
 typedef void (*load_tiles_mmq_t)(const char * __restrict__ x, int * x_tile, const int & kbx0, const int & i_max, const int & stride);
 typedef void (*vec_dot_mmq_t)(const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int & k00);
-typedef void (*mmq_write_back_t)(const float * __restrict__ sum, float * __restrict__ dst, const int & stride, const int & i_max, const int & j_max);
 
 enum mmq_q8_1_ds_layout {
     MMQ_Q8_1_DS_LAYOUT_D4,
@@ -977,7 +976,9 @@ static __device__ __forceinline__ void vec_dot_q8_1_q8_1_dp4a(
     }
 }
 
-template <int mmq_x, int mmq_y, int nwarps>
+// Opt-in FMA for image shapes validated separately; existing LLM/H3 callers
+// retain the original accumulation order.
+template <int mmq_x, int mmq_y, int nwarps, bool fused = false>
 static __device__ __forceinline__ void vec_dot_q8_1_q8_1_mma(
     const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int & k00) {
 
@@ -1046,8 +1047,14 @@ static __device__ __forceinline__ void vec_dot_q8_1_q8_1_mma(
 
 #pragma unroll
                 for (int l = 0; l < mma_C::ne; ++l) {
-                    sum[(j0/mma_C::J + n)*mma_C::ne + l] += dmA[n][l/2][k01/QI8_1].x*dsB[l%2].x*C.x[l];
-                    sum[(j0/mma_C::J + n)*mma_C::ne + l] += dmA[n][l/2][k01/QI8_1].y*dsB[l%2].y;
+                    if constexpr (fused) {
+                        auto &v = sum[(j0/mma_C::J + n)*mma_C::ne + l];
+                        v = fmaf(dmA[n][l/2][k01/QI8_1].x*dsB[l%2].x, float(C.x[l]), v);
+                        v = fmaf(dmA[n][l/2][k01/QI8_1].y, dsB[l%2].y, v);
+                    } else {
+                        sum[(j0/mma_C::J + n)*mma_C::ne + l] += dmA[n][l/2][k01/QI8_1].x*dsB[l%2].x*C.x[l];
+                        sum[(j0/mma_C::J + n)*mma_C::ne + l] += dmA[n][l/2][k01/QI8_1].y*dsB[l%2].y;
+                    }
                 }
             }
         }
@@ -3610,9 +3617,9 @@ template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinlin
     }
 }
 
-template<int mmq_x, int mmq_y, int nwarps, bool need_check>
+template<int mmq_x, int mmq_y, int nwarps, bool need_check, typename Output = float>
 static __device__ __forceinline__ void mmq_write_back_dp4a(
-    const float * __restrict__ sum, float * __restrict__ dst, const int & stride, const int & i_max, const int & j_max) {
+    const float * __restrict__ sum, Output * __restrict__ dst, const int & stride, const int & i_max, const int & j_max) {
 
 #pragma unroll
     for (int j0 = 0; j0 < mmq_x; j0 += nwarps) {
@@ -3635,9 +3642,9 @@ static __device__ __forceinline__ void mmq_write_back_dp4a(
     }
 }
 
-template<int mmq_x, int mmq_y, int nwarps, bool need_check>
+template<int mmq_x, int mmq_y, int nwarps, bool need_check, typename Output = float>
 static __device__ __forceinline__ void mmq_write_back_mma(
-    const float * __restrict__ sum, float * __restrict__ dst, const int & stride, const int & i_max, const int & j_max) {
+    const float * __restrict__ sum, Output * __restrict__ dst, const int & stride, const int & i_max, const int & j_max) {
 
     typedef mma_int_C_I16J8 mma_C;
 
@@ -3933,9 +3940,9 @@ struct mmq_type_traits<mmq_x, mmq_y, nwarps, need_check, GGML_TYPE_IQ5_KS_R4> {
 
 template <ggml_type type, int mmq_x, int nwarps, bool need_check, bool fixup,
           template<int, int, int, bool, ggml_type> class TileTraits = mmq_type_traits,
-          bool check_y = false>
+          bool check_y = false, typename Output = float>
 static __device__ void mul_mat_q_process_tile(
-    const char * __restrict__ x, const char * __restrict__ yc, float * __restrict__ dst, float * __restrict__ tmp_fixup,
+    const char * __restrict__ x, const char * __restrict__ yc, Output * __restrict__ dst, float * __restrict__ tmp_fixup,
     const int & ne00, const int & ne01, const int & stride01, const int & ne10, const int & ne11, const int & stride11, const int & ne0,
     const int & it, const int & jt, const int & kb0_start, const int & kb0_stop) {
 
@@ -3949,10 +3956,10 @@ static __device__ void mul_mat_q_process_tile(
 
 #ifdef INT8_MMA_AVAILABLE
     constexpr vec_dot_mmq_t    vec_dot    = TileTraits<mmq_x, mmq_y, nwarps, need_check, type>::vec_dot_mma;
-    constexpr mmq_write_back_t write_back = mmq_write_back_mma<mmq_x, mmq_y, nwarps, need_check>;
+    constexpr auto write_back = mmq_write_back_mma<mmq_x, mmq_y, nwarps, need_check, Output>;
 #else
     constexpr vec_dot_mmq_t    vec_dot    = TileTraits<mmq_x, mmq_y, nwarps, need_check, type>::vec_dot_dp4a;
-    constexpr mmq_write_back_t write_back = mmq_write_back_dp4a<mmq_x, mmq_y, nwarps, need_check>;
+    constexpr auto write_back = mmq_write_back_dp4a<mmq_x, mmq_y, nwarps, need_check, Output>;
 #endif // INT8_MMA_AVAILABLE
 
     constexpr int blocks_per_iter = MMQ_ITER_K / qk;
@@ -4005,7 +4012,7 @@ static __device__ void mul_mat_q_process_tile(
         __syncthreads();
     }
 
-    if (fixup) {
+    if constexpr (fixup) {
         write_back(sum, tmp_fixup + blockIdx.x*(mmq_x*mmq_y), mmq_y, mmq_y, mmq_x);
     } else {
         write_back(sum, dst + jt*mmq_x*ne0 + it*mmq_y, ne0, tile_x_max_i, tile_y_max_j);

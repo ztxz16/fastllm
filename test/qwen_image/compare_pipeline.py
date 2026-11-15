@@ -19,18 +19,30 @@ p.add_argument("--image", action="append", default=[])
 p.add_argument("--reference-resolution", type=int, default=1024)
 p.add_argument("--height", type=int)
 p.add_argument("--steps", type=int, default=4)
+p.add_argument("--precision", choices=["bf16", "fp32"], default="bf16")
+quantized = p.add_mutually_exclusive_group()
+quantized.add_argument("--fp8-checkpoint", help="TorchAO FP8 DiT weights for the reference scaled_mm oracle")
+quantized.add_argument("--quantized-checkpoint", help="Comfy INT8 or GGUF DiT checkpoint for the independent oracle")
 a = p.parse_args()
+if (a.fp8_checkpoint or a.quantized_checkpoint) and (a.precision != "bf16" or a.cpu_offload):
+    p.error("quantized references require --precision bf16 without --cpu-offload")
 assert os.environ.get("CUDA_VISIBLE_DEVICES") and torch.cuda.device_count() == 1
 torch.set_num_threads(8)
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
-dtype = torch.float32
+dtype = torch.float32 if a.precision == "fp32" else torch.bfloat16
 root = Path(a.trace)
 pipe = QwenImage21Pipeline.from_pretrained(a.model, torch_dtype=dtype, local_files_only=True)
 if a.cpu_offload:
     pipe.enable_model_cpu_offload(gpu_id=0)
 else:
     pipe.to("cuda")
+if a.fp8_checkpoint:
+    from fp8_reference import install_fp8
+    print("FP8 reference projections:", install_fp8(pipe.transformer, a.fp8_checkpoint), flush=True)
+if a.quantized_checkpoint:
+    from quantized_reference import install_quantized
+    print("Quantized reference projections:", install_quantized(pipe.transformer, a.quantized_checkpoint), flush=True)
 latent = np.fromfile(root / "initial_latent.f32", np.float32).reshape(1, -1, 64)
 metrics = {}
 
@@ -61,12 +73,21 @@ for image in images:
     w, h, _ = calculate_dimensions(a.reference_resolution**2, image.width / image.height)
     resized.append(pipe.image_processor.resize(image, width=w, height=h))
 with torch.inference_mode():
-    features, _, _ = pipe.encode_prompt(a.prompt, image=resized or None)
+    features, _, image_slots = pipe.encode_prompt(a.prompt, image=resized or None)
     for i, image in enumerate(resized):
         pixels = pipe.image_processor.preprocess(image).unsqueeze(2).to(device="cuda", dtype=dtype)
         encoded = pipe._encode_vae_image(pixels, None).squeeze(2).permute(0, 2, 3, 1).float().cpu().numpy()
         compare("condition." + str(i), encoded, np.fromfile(root / ("condition.%d.f32" % i), np.float32))
-    compare("prompt", features.float().cpu().numpy(), np.fromfile(root / "prompt.f32", np.float32))
+    reference_features = features.float().cpu().numpy().reshape(-1, 4096)
+    native_features = np.fromfile(root / "prompt.f32", np.float32).reshape(-1, 4096)
+    if resized:
+        # Image-slot decoder residuals are replaced with VAE latents in the DiT.
+        # Keep them in the report, but validate the text rows actually consumed.
+        compare("prompt_full", reference_features, native_features)
+        text_rows = ~image_slots.detach().cpu().numpy().reshape(-1).astype(bool)
+        reference_features = reference_features[text_rows]
+        native_features = native_features[text_rows]
+    compare("prompt", reference_features, native_features)
     result = pipe(
         prompt=a.prompt,
         height=a.height or a.size,
@@ -82,5 +103,6 @@ native = np.array(Image.open(root / "native.png"))
 reference = np.array(result.images[0])
 compare("pixels", reference, native)
 (root / "pipeline-report.json").write_text(json.dumps(metrics, indent=2))
-limit = 1e-3
-assert all(v["relative_l2"] < limit for k, v in metrics.items() if k != "pixels"), metrics
+limit = 1e-3 if a.precision == "fp32" else 0.05
+diagnostics = {"pixels"} if a.precision == "fp32" else {"pixels", "prompt_full"}
+assert all(v["relative_l2"] < limit for k, v in metrics.items() if k not in diagnostics), metrics
