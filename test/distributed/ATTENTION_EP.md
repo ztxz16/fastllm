@@ -416,6 +416,39 @@ JSON/Markdown/CSV/XLSX汇总写入新目录，历史失败保持FAIL和非零返
 不能单独证明原生专家计算全部一致或宣布完整模型通过。Token 11在第0层Attention
 已经存在的输入差异需要另外处理；本检查不会消除或豁免这部分误差。
 
+## 完整前向的独立FP32专家累加实验
+
+`20261115T151031Z_moe_reduction_fd1c4eed`通过所有采集与FP16贡献重放门禁。
+第0层Token 6/11在两种输入下的FP32重放最终输出均与原生FP16值完全一致。
+整段HF输入的最终输出平均差异从`2.20054062e-6`降至`1.81339251e-8`，
+原生轨迹输入从`2.26194523e-6`降至`8.37026164e-8`；仍分别有256/986个
+输出元素数值不等，均未超原阈值。路由或共享分支不完全一致的Token分别为
+`[21]`和`[2,13,21]`。这支持第0层主要差异来自累加舍入，不证明所有层或完整模型通过。
+
+下一实验加载完整HF模型，先用原版公开入口复现相同完整历史，再观察实际专家
+贡献。原版logits、完整隐藏状态轨迹和路由记录必须精确复现历史，观察前后logits
+必须完全相同。门禁通过后，只在独立候选前向中用FP32累加每层实际FP16加权贡献，
+在加共享专家前转回FP16，再由原HF层执行残差及后续层。每层候选也必须先证明
+捕获的贡献可精确重放该次输入下的原FP16累加；原路由、专家GEMM、共享专家和
+Attention不替换。候选结束后卸载所有hook，并再次验证原版HF logits未被改变。
+
+```bash
+/venv/fastllm-reference-cu126/bin/python3 test/distributed/probe_qwen_moe_accumulation_forward.py \
+  --probe test/distributed/results/20261115T132323Z_forward_probe_c0356506 \
+  --model /home/models/Qwen1.5-MoE-A2.7B-Chat
+```
+
+该命令只运行参考模型，不重新启动FastLLM、不编译。保持原完整Token ID、eager、
+use_cache=False和原四卡按层分配，拒绝参考版本不一致或历史证据变化。
+在新建目录保存`baseline.json`/`candidate.json`完整中间结果，以及JSON/Markdown/
+CSV/XLSX汇总；终端打印原HF与候选相对历史原生轨迹、最终logits的max/mean/failed。
+逐层记录候选相对原HF的专家集合变化Token；这不是与原生专家选择的直接比较。
+
+**候选是改变累加语义的因果实验，不是新的验收参考。** 它沿HF真实专家调用顺序
+累加，不复刻原生专家批次、GEMM或NCCL归约树，仍可有其他差异。不得将候选PASS
+替代原HF验收，或据此放宽阈值；完整报告保留历史FAIL及非零退出码。实验使用历史
+完整原生轨迹比较，只支持该历史的结论，不覆盖原调度、KV Cache或CUDA Graph验收。
+
 ## 启动阶段异常的定向复现
 
 若`ready.json`尚未产生、请求数为0，故障发生在进程组初始化或模型加载阶段，
