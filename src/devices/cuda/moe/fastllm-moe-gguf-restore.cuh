@@ -5,12 +5,16 @@
 // and temporary experts whose projection kernels cannot read NUMA layouts.
 // Include gguf.h before this header.
 namespace fastllm_gguf_restore {
+// Private source-layout tag, never a GGUF file type. NUMA stores adjacent
+// E2M1 nibbles followed by their E8M0 scale; cache records use GGUF ordering.
+constexpr int kNativeMxfp4 = -2;
 constexpr size_t kTileBytes = 16 * 1024;
 constexpr int kRestoreThreads = 256;
 constexpr int kWarpsPerBlock = kRestoreThreads / 32;
 
 __host__ __device__ inline int Ordinary(int type) {
     switch (type) {
+        case kNativeMxfp4: return GGML_TYPE_MXFP4;
         case GGML_TYPE_Q2_K_R4: return GGML_TYPE_Q2_K;
         case GGML_TYPE_Q3_K_R4: return GGML_TYPE_Q3_K;
         case GGML_TYPE_Q4_K_R4: return GGML_TYPE_Q4_K;
@@ -226,6 +230,27 @@ __device__ void Rows(const Matrix &w, void *const *pointers,
     }
 }
 
+// Lossless NUMA block32 -> GGUF MXFP4 conversion. Both representations
+// occupy 17 bytes per block; no floating-point conversion or host snapshot.
+__device__ inline void Mxfp4Rows(const Matrix &w, void *const *pointers,
+        uint8_t *destination, int shards, bool cross) {
+    const int blocks = w.columns / 32, rowsPerShard = w.rows / shards;
+    const size_t count = size_t(w.rows) * blocks;
+    for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < count; i += size_t(gridDim.x) * blockDim.x) {
+        const int row = i / blocks;
+        const int physical = cross ? 2 * (row % (w.rows / 2)) + row / (w.rows / 2) : row;
+        const auto *source = static_cast<const uint8_t *>(pointers[physical / rowsPerShard]) +
+            size_t(physical % rowsPerShard) * w.rowBytes + (i % blocks) * 17;
+        auto *out = destination + i * 17;
+        out[0] = source[16];
+        #pragma unroll
+        for (int j = 0; j < 16; ++j)
+            out[1+j] = ((source[j/2] >> (4*(j%2))) & 15) |
+                (((source[8+j/2] >> (4*(j%2))) & 15) << 4);
+    }
+}
+
 // Read adjacent packed bytes once, then restore all four rows in shared memory.
 template<int Type, class Packed>
 __device__ void PackedRows(const Matrix &w, void *const *pointers,
@@ -300,6 +325,8 @@ static __global__ void Records(Record layout, void *const *pointers,
         if (w.exl3Bits) {
             fastllm_exl3_shards::Restore(w.rows, w.columns, w.exl3Bits, w.parts,
                 sources, layout.shards, deviceRecord ? static_cast<const uint8_t *>(deviceSource) : nullptr, output);
+        } else if (w.type == kNativeMxfp4) {
+            Mxfp4Rows(w, sources, output, shards, part == 0);
         } else if (Ordinary(w.type) == w.type) {
             const size_t alignment = part ? w.Bytes() / shards : w.rowBytes;
             if (!(alignment & 15)) Rows<uint4>(w, sources, output, shards, part == 0, tile);

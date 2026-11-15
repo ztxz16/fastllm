@@ -33,6 +33,8 @@ GGUF Engram 支持 `IQ4_NL`、`Q5_K`、`Q6_K` 和 `MXFP8` 压缩行；加载时�
 
 [Unsloth Dynamic V3.1](https://unsloth.ai/docs/models/deepseek-v4.1-flash) 的 Engram 类型分别为：IQ1_S/IQ1_M 使用 IQ4_NL，IQ2_XXS/Q2_K_XL 使用 Q5_K，IQ3_XXS/IQ3_S 使用 Q6_K，Q3_K_XL/Q4_K_XL/Q8_K_XL 使用 MXFP8。MXFP8 的类型编号与块布局参照 [llama.cpp PR #30817](https://github.com/ggml-org/llama.cpp/pull/30817)（`b72050d03ae14bb3cb5138ecefab3f3f65157d31`）：类型 43，每 32 个 E4M3FN 数值共享一个 E8M0 scale，共 33 字节。此支持针对查表与行解码，不代表新增了 MXFP8 矩阵乘法算子。
 
+混合 GGUF/MXFP4 专家可使用 CPU/NUMA 混合推理、GPU 专家缓存和完整 CUDA 图。缓存按存储后端分组，并在各组间分配同一份显存预算；纯 MXFP4 层保留原生 FP4 算子。混合层在缓存换入时只重排量化字节，不展开为浮点权重，也不重新量化。无需额外开关。
+
 自动模式默认单请求、最多 1M 原生窗口、FP4 KV 和快速 Prefill。带内置 DSpark 权重时默认使用 DSpark 5；没有草稿权重的 GGUF 不会自动开启。DSpark 置信度阈值默认 `0`，不提前截短候选，适用于 HF/NVFP4、EXL3 和 GGUF 搭配外置草稿；显式 CLI 或 JSON 阈值仍优先，CLI 可覆盖 JSON。设备、chunk 和专家缓存以 `[auto]` 日志为准。显卡和主存能容纳专家时优先避免磁盘专家，Engram 仍可独立使用磁盘。
 
 `--auto` 默认启用 `--kernel-tune quick`，在实际算子形状首次预热时校验并选择已注册的合法候选，包含普通/分组投影及专家计算；适用于单请求和并发，不按某个固定行数强制选择 Triton。不支持的架构或格式保留原实现。使用 `--kernel-tune off` 可关闭，详见[算子注册与预热选择](kernel-policy.md)。
@@ -62,6 +64,7 @@ GGUF Engram 支持 `IQ4_NL`、`Q5_K`、`Q6_K` 和 `MXFP8` 压缩行；加载时�
 删除显式设置即可恢复自动规划。资源上限不会限制进程的实际内存分配，也不会模拟 GPU 架构或算力。更多参数影响和启动器操作见 [`--auto` 调节指南](auto.md)。手动配置、架构与验证说明保留在下文。
 
 ## 实现与回归入口
+
 
 - `include/models/deepseekv41.h` / `src/models/deepseekv41.cpp`：模型（继承 `DeepSeekV4Model`，复用其 MoE / HC-post / WoA / 采样等基础设施）
 - `src/models/deepseekv41_vision.cpp`：视觉编码器（ViT + aligner）与图文前向 `ForwardMultimodal`
@@ -235,6 +238,7 @@ FT_NUMAS=1 OPENBLAS_NUM_THREADS=1 numactl -C 0-31 -m 0 \
 FP16 共享专家保留 block-32 激活量化、BF16 中间舍入及路由权重位置；这两种专家在 CPU 上计算。
 专家缓存未命中时默认使用 direct I/O，避免另在系统页缓存中保留整份专家；Engram 行读取仍使用系统页缓存。
 磁盘 MoE 已用独立标量计算验证，不能直接沿用 NUMA 配置的整模型精度评测结论。
+
 
 磁盘路径直接读入对齐专家缓冲，保留不对齐文件偏移、分散 gate/up 和文件尾部的普通读取回退。
 CPU 缓存按热度和最后访问时间管理，4096 次访问后衰减；预算限制专家 payload，不限制整个进程 RSS。
@@ -617,6 +621,7 @@ ftllm server /models/DeepSeek-V4.1-Flash-1017-IQ2_XXS.gguf \
 此时需要把**同一原始模型版本**的视觉路由偏置放入 mmproj（GGUF 名称为
 `blk.N.exp_probs_b_vl.bias`）。加载器会在读取大权重之前检查缺失项，不能以文本偏置替代。
 
+
 `config.json` 的 `text_config` 里 `dspark_block_size > 0` 且 checkpoint 带 `mtp.*` 权重时可以开启。
 启动加 `--speculative_algorithm dspark --dspark 5`。`--dspark N` 指每轮最多校验 N 个候选，
 运行时草稿长度取 `max(dspark_block_size, N)`：小于训练块时只校验前缀，
@@ -779,6 +784,7 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/jso
 - 带图请求不与其它请求合并 prefill；图像 span 必须落在 prompt 内（Python 侧展开时保证）；
 - 前缀缓存 / 多轮复用尚未实现，每个请求都会重新编码图像；
 - 21 环境下服务模式若加载不到 HF tokenizer，会退回 fastllm 原生 tokenizer 编码 prompt（两者对占位符的 id 相同）。
+
 
 ## 数值验证
 

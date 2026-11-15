@@ -1,5 +1,6 @@
 #include "utils/hybrid_moe.h"
 #include "utils.h"
+#include "moe_cache_config.h"
 #ifdef USE_CUDA
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/cuda/fastllm-cuda-graph-workspace.h"
@@ -9,7 +10,6 @@
 #include "devices/numas/numasdevice.h"
 #endif
 #if defined(USE_CUDA) && !defined(USE_ROCM)
-#include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/cuda/fastllm-cuda-moe-policy.h"
 #include "devices/cuda/fastllm-moe-prefetch.h"
 #endif
@@ -199,12 +199,64 @@ bool HybridMoeCachePlan::Prepare(const std::function<void()> &registerNumaWeight
             math == HybridMoeMath::DeepSeekV41, swigluLimit, math == HybridMoeMath::Glm5,
             layer.cacheDevice, math == HybridMoeMath::Qwen38FlashNext});
     }
-    // The backend retains format-dependent snapshot/registration order and
-    // publishes a cache only after validation. Failure leaves host fallback intact.
-    if (!FastllmCudaPrepareMoeCacheWithBudgets(cacheLayers.data(), static_cast<int>(cacheLayers.size()),
-            registerWeights, allowStreaming, deviceBudgets, fullyResident)) return false;
-    return FastllmCudaSetMoeCacheBudgetFraction(const_cast<Data **>(layers.front().weights),
-        layers.front().count, budgetFraction);
+    // One cache group owns one storage backend. Keep native FP4/FP8 kernels
+    // when other layers use GGUF, rather than rejecting the whole model or
+    // converting every layer to the least common representation.
+    // GGUF goes first: backends that snapshot before NUMA registration retain
+    // their original ordering. The V4.1 contract already registers first.
+    std::map<std::pair<int, int>, std::vector<FastllmCudaMoeCacheLayer>> groups;
+    for (const auto &layer : cacheLayers) {
+        if (!layer.weights || layer.weightsBatch < 4 || !layer.weights[2] || !layer.weights[3]) return false;
+        const auto *gate = layer.weights[2], *down = layer.weights[3];
+        const bool gguf = gate->dataType == DATA_GGUF_FORMAT || down->dataType == DATA_GGUF_FORMAT ||
+            gate->isGGUFData || down->isGGUFData;
+        const auto key = gguf ? std::make_pair(-1, -1) :
+            std::make_pair(int(gate->dataType), int(down->dataType));
+        groups[key].push_back(layer);
+    }
+    if (groups.size() == 1) {
+        // Preserve the original budget and registration behavior for uniform models.
+        if (!FastllmCudaPrepareMoeCacheWithBudgets(cacheLayers.data(), static_cast<int>(cacheLayers.size()),
+                registerWeights, allowStreaming, deviceBudgets, fullyResident)) return false;
+        return FastllmCudaSetMoeCacheBudgetFraction(const_cast<Data **>(layers.front().weights),
+            layers.front().count, budgetFraction);
+    }
+    if (math == HybridMoeMath::DeepSeekV41 && registerWeights) registerWeights();
+    auto bytes = [](const std::vector<FastllmCudaMoeCacheLayer> &selected, int device) {
+        long double total = 0;
+        for (const auto &layer : selected) {
+            if (device >= 0 && layer.cacheDevice >= 0 && layer.cacheDevice != device) continue;
+            for (int i = 2; i < layer.weightsBatch; ++i)
+                if (layer.weights[i]) total += layer.weights[i]->GetBytes();
+        }
+        return total;
+    };
+    const long double total = bytes(cacheLayers, -1);
+    if (!(total > 0)) return false;
+    bool prepared = true;
+    std::vector<const Data *> keys;
+    for (const auto &entry : groups) {
+        const auto &group = entry.second;
+        // Divide, never duplicate, the existing per-device budget. Account for
+        // PP ownership independently so uneven stage layouts do not waste slots.
+        std::map<int, uint64_t> budgets;
+        for (int device = 0; device < FastllmCudaGetDeviceCount(); ++device) {
+            const long double owned = bytes(cacheLayers, device), part = bytes(group, device);
+            const auto explicitBudget = deviceBudgets.find(device);
+            const uint64_t budget = explicitBudget == deviceBudgets.end()
+                ? uint64_t(GetMoeCudaCacheDeviceBytes(device) * budgetFraction) : explicitBudget->second;
+            budgets[device] = owned > 0 ? uint64_t(budget * (part / owned)) : 0;
+        }
+        const bool ok = FastllmCudaPrepareMoeCacheWithBudgets(group.data(), int(group.size()),
+            registerWeights, allowStreaming, budgets, fullyResident) &&
+            FastllmCudaSetMoeCacheBudgetFraction(const_cast<Data **>(group.front().weights),
+                group.front().weightsBatch, double(budgetFraction * (bytes(group, -1) / total)));
+        prepared = prepared && ok;
+        if (ok) keys.push_back(group.front().weights[2]);
+        std::fprintf(stderr, "[Fastllm] Expert cache storage group: %zu layers, %.3f GiB weights, %s.\n",
+            group.size(), double(bytes(group, -1) / (1ULL << 30)), ok ? "ready" : "host fallback");
+    }
+    return prepared && FastllmCudaLinkMoeCacheGroups(keys);
 #else
     return false;
 #endif

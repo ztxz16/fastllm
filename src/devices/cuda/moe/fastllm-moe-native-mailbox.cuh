@@ -1081,15 +1081,27 @@ struct NativeMoeMailbox {
         }
         return true;
     }
-    bool CreateReplay(cudaGraph_t source, void *const *handles, int count, void **result) {
-        std::lock_guard<std::recursive_mutex> lifecycle(lifecycleMutex);
-        std::vector<cudaEvent_t> events;
+    using FullGroups = std::map<NativeMoeMailbox *, std::vector<Layer *>>;
+    bool CollectFull(void *const *handles, int count, FullGroups &groups) {
         for (int i = 0; i < count; ++i) {
             auto *w = static_cast<Layer *>(handles[i]);
-            if (!w || w->owner != this || !w->fullGraph) return false;
+            if (!w || !w->owner || !w->fullGraph || w->owner->cache.device != cache.device) return false;
+            groups[w->owner].push_back(w);
+        }
+        return !groups.empty();
+    }
+    bool CreateReplay(cudaGraph_t source, void *const *handles, int count, void **result) {
+        FullGroups groups;
+        if (!CollectFull(handles, count, groups)) return false;
+        std::vector<std::unique_lock<std::recursive_mutex>> locks;
+        for (const auto &entry : groups) locks.emplace_back(entry.first->lifecycleMutex);
+        std::vector<cudaEvent_t> events;
+        for (const auto &entry : groups) for (auto *w : entry.second) {
             for (auto e : {w->begin, w->residentDone, w->uploadBegin, w->uploadDone, w->done})
                 events.push_back(e);
-            if (i + 1 < count) events.push_back(w->completed);
+            // Each backend retires its own CPU results and cache admissions.
+            // Retain its last completion even when another backend ends the graph.
+            if (w != entry.second.back()) events.push_back(w->completed);
         }
         cudaGraph_t graph = nullptr;
         cudaGraphExec_t exec = nullptr;
@@ -1101,25 +1113,35 @@ struct NativeMoeMailbox {
         return true;
     }
     bool LaunchFull(void *exec, void *const *handles, int count, bool timed) {
-        std::lock_guard<std::recursive_mutex> lifecycle(lifecycleMutex);
-        Finish(true);
-        if (!cache.frequencyActive) return false;
-        for (int i = 0; i < count; ++i) {
-            auto *w = static_cast<Layer *>(handles[i]);
-            if (!w || w->owner != this || !w->fullGraph) return false;
+        FullGroups groups;
+        if (!CollectFull(handles, count, groups)) return false;
+        // One graph launch can contain several storage backends. Arm every
+        // dispatcher first; otherwise the GPU could wait on an unstarted group.
+        // Ordered lifecycle locks preserve graph cleanup/replay exclusion.
+        std::vector<std::unique_lock<std::recursive_mutex>> locks;
+        for (const auto &entry : groups) locks.emplace_back(entry.first->lifecycleMutex);
+        for (const auto &entry : groups) {
+            entry.first->Finish(true);
+            if (!entry.first->cache.frequencyActive) return false;
         }
-        std::deque<Request> requests;
-        for (int i = 0; i < count; ++i)
-            requests.push_back({static_cast<Layer *>(handles[i]),
-                routePhase != FastllmMoeRoutePhase::Unspecified ? routePhase :
-                (static_cast<Layer *>(handles[i])->rows > 1 ? FastllmMoeRoutePhase::Verify : FastllmMoeRoutePhase::Decode)});
-        if (!dispatcher.joinable()) dispatcher = std::thread([this] { Run(); });
-        {
-            std::lock_guard<std::mutex> lock(mutex);
-            for (int i = 0; i < count; ++i) {
-                auto &w = *static_cast<Layer *>(handles[i]);
-                // Finish(true) retired every reduction. Reset before publishing
-                // the new CPU queue, so no dispatcher can consume an old flag.
+        // Complete allocations and thread creation before publishing any queue.
+        // If preparation throws, no dispatcher is left waiting for an unlaunched graph.
+        std::vector<std::deque<Request>> pending;
+        pending.reserve(groups.size());
+        for (const auto &entry : groups) {
+            auto &owner = *entry.first;
+            pending.emplace_back();
+            for (auto *w : entry.second)
+                pending.back().push_back({w, routePhase != FastllmMoeRoutePhase::Unspecified ? routePhase :
+                    (w->rows > 1 ? FastllmMoeRoutePhase::Verify : FastllmMoeRoutePhase::Decode)});
+            if (!owner.dispatcher.joinable()) owner.dispatcher = std::thread([p = &owner] { p->Run(); });
+        }
+        size_t groupIndex = 0;
+        for (const auto &entry : groups) {
+            auto &owner = *entry.first;
+            std::lock_guard<std::mutex> lock(owner.mutex);
+            for (auto *layer : entry.second) {
+                auto &w = *layer;
                 __atomic_store_n(&w.host->published, 0u, __ATOMIC_RELEASE);
                 __atomic_store_n(&w.host->computed, 0u, __ATOMIC_RELEASE);
                 if (w.rows > 1) {
@@ -1129,26 +1151,27 @@ struct NativeMoeMailbox {
                         w.host->stagedByHits[hits] = w.cost.SelectDecodeMisses(w.topk - hits, hits);
                 }
             }
-            launchCanceled.store(false, std::memory_order_release);
-            queue.swap(requests);
+            owner.launchCanceled.store(false, std::memory_order_release);
+            owner.queue.swap(pending[groupIndex++]);
         }
-        // The first GPU publication can precede cudaGraphLaunch's return.
-        // Let the dispatcher consume it without waiting for the caller's lock.
-        wake.notify_one();
+        for (const auto &entry : groups) entry.first->wake.notify_one();
         if (!FastllmCudaGraphLaunch(exec)) {
-            launchCanceled.store(true, std::memory_order_release);
-            std::unique_lock<std::mutex> lock(mutex);
-            queue.clear();
-            drained.wait(lock, [&] { return !busy; });
-            // Preserve the FastLLM error flag while allowing an explicit retry.
+            // Cancel all waiters before draining any one backend.
+            for (const auto &entry : groups)
+                entry.first->launchCanceled.store(true, std::memory_order_release);
+            for (const auto &entry : groups) {
+                auto &owner = *entry.first;
+                std::unique_lock<std::mutex> lock(owner.mutex);
+                owner.queue.clear();
+                owner.drained.wait(lock, [&] { return !owner.busy; });
+            }
             cudaGetLastError();
             return false;
         }
-        for (int i = 0; i < count; ++i) {
-            auto &w = *static_cast<Layer *>(handles[i]);
-            w.pending = true; w.timed = timed;
+        for (const auto &entry : groups) {
+            for (auto *w : entry.second) { w->pending = true; w->timed = timed; }
+            entry.first->fullLast = entry.second.back();
         }
-        fullLast = static_cast<Layer *>(handles[count - 1]);
         return true;
     }
     bool Submit(int table, const fastllm::Data &input, const fastllm::Data &index,

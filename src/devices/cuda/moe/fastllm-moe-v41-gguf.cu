@@ -39,11 +39,46 @@ __global__ void V41GGUFQuantize(const __nv_bfloat16 *input, block_q8_1 *output, 
     V41StoreQ8(x, q, c%32);
 }
 
+// E2M1 values multiplied by two are small signed integers. Four lanes
+// share a block and use the existing portable DP4A helper with Q8 activations.
+// The 17-byte GGUF blocks are not naturally aligned, so read their bytes explicitly.
+template<int LaneWidth>
+__device__ __forceinline__ float V41Mxfp4Dot(const uint8_t *weight,
+        const block_q8_1 *input, int columns) {
+    const int lane = threadIdx.x % LaneWidth, part = lane % 4;
+    float sum = 0;
+    for (int b = lane / 4; b < columns / 32; b += LaneWidth / 4) {
+        const auto *q = weight + size_t(b) * 17;
+        unsigned low = 0, high = 0;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const unsigned packed = q[1+4*part+j];
+            const unsigned lo = packed & 15, hi = packed >> 4;
+            const int a = int((0x0c08060403020100ULL >> (8*(lo&7))) & 255);
+            const int c = int((0x0c08060403020100ULL >> (8*(hi&7))) & 255);
+            low |= unsigned(uint8_t(lo&8 ? -a : a)) << (8*j);
+            high |= unsigned(uint8_t(hi&8 ? -c : c)) << (8*j);
+        }
+        int dot = ggml_cuda_dp4a(low, get_int_b4(input[b].qs, part), 0);
+        dot = ggml_cuda_dp4a(high, get_int_b4(input[b].qs, part+4), dot);
+        // Include the factor 1/2 from integer E2M1 in the exponent. E8M0
+        // code zero is 2^-127; 255 represents NaN, not a finite scale.
+        sum += q[0] == 255 ? __int_as_float(0x7fc00000) :
+            ldexpf(float(dot) * __low2float(input[b].ds), int(q[0])-128);
+    }
+    #pragma unroll
+    for (int mask = LaneWidth/2; mask; mask >>= 1)
+        sum += __shfl_xor_sync(0xffffffff, sum, mask, LaneWidth);
+    return sum;
+}
+
 // Keep projection dispatch inline: sharing the fused gate/up helper changes
 // NVCC register allocation for generic projection kernels despite equal math.
 template<ggml_type Type, int VirtualWarps = 4, int LaneWidth = 32, bool Packed = false>
 __device__ __forceinline__ float V41GGUFDot(const void *weight, const block_q8_1 *x, int columns, const uint32_t *iqGrid, int packedRow = 0) {
-    if constexpr (Type == GGML_TYPE_Q2_0) {
+    if constexpr (Type == GGML_TYPE_MXFP4) {
+        return V41Mxfp4Dot<LaneWidth>(static_cast<const uint8_t *>(weight), x, columns);
+    } else if constexpr (Type == GGML_TYPE_Q2_0) {
         return gguf_cache_q8::RowDot<Type>(weight, x, columns, nullptr);
     } else {
         constexpr int qi = [] {
@@ -119,7 +154,7 @@ __device__ __forceinline__ float V41BlockDot(const void *weight,const block_q8_1
 }
 template<ggml_type Type,int LaneWidth,bool Packed = false>
 __device__ __forceinline__ float2 V41PairDot(const void *gate,const void *up,const block_q8_1*x,int columns,const uint32_t*grid,int gateRow = 0,int upRow = 0) {
-    if constexpr(Type==GGML_TYPE_Q8_0)return make_float2(V41GGUFDot<Type,4,LaneWidth>(gate,x,columns,grid),V41GGUFDot<Type,4,LaneWidth>(up,x,columns,grid));
+    if constexpr(Type==GGML_TYPE_Q8_0 || Type==GGML_TYPE_MXFP4)return make_float2(V41GGUFDot<Type,4,LaneWidth>(gate,x,columns,grid),V41GGUFDot<Type,4,LaneWidth>(up,x,columns,grid));
     else if constexpr(Type==GGML_TYPE_Q2_0)return make_float2(V41GGUFDot<Type,1,LaneWidth>(gate,x,columns,grid),V41GGUFDot<Type,1,LaneWidth>(up,x,columns,grid));
     else {
         constexpr int qi=[] {
@@ -568,7 +603,7 @@ void ProjectGateActivation(int type, const block_q8_1 *input, __nv_bfloat16 *out
         constexpr int tile = GGML_TYPE_##Type == GGML_TYPE_IQ2_S || GGML_TYPE_##Type == GGML_TYPE_Q4_K ? 16 : 8; \
         if (hidden == 5120) { LAUNCH_GATE_ACT(Type, 5120); } else { LAUNCH_GATE_ACT(Type, 0); } break; }
         GATE_ACT(Q8_0) GATE_ACT(Q2_0) GATE_ACT(Q2_K) GATE_ACT(Q3_K) GATE_ACT(Q4_K) GATE_ACT(IQ1_S) GATE_ACT(IQ1_M)
-        GATE_ACT(IQ2_XXS) GATE_ACT(IQ2_XS) GATE_ACT(IQ2_S) GATE_ACT(IQ3_XXS)
+        GATE_ACT(IQ2_XXS) GATE_ACT(IQ2_XS) GATE_ACT(IQ2_S) GATE_ACT(IQ3_XXS) GATE_ACT(IQ3_S) GATE_ACT(MXFP4)
 #undef GATE_ACT
 #undef LAUNCH_GATE_ACT
 #undef GATE_ACT_ARGS
@@ -601,7 +636,7 @@ void Project(int type, const block_q8_1 *input, __nv_bfloat16 *output,
                 V41GGUFProjection<GGML_TYPE_##Type, false, Weights, tile, 0, full ? 4 : 8, lanes><<<dim3((rows+tile-1)/tile,routes),256,shared,cudaStreamPerThread>>>( \
                     input,output,weights,indices,experts,topk,columns,rows,ggml_row_size(GGML_TYPE_##Type,columns)); return; }
                 DOWN(Q8_0) DOWN(Q2_0) DOWN(Q2_K) DOWN(Q3_K) DOWN(Q4_K) DOWN(IQ1_S) DOWN(IQ1_M)
-                DOWN(IQ2_XXS) DOWN(IQ2_XS) DOWN(IQ2_S) DOWN(IQ3_XXS)
+                DOWN(IQ2_XXS) DOWN(IQ2_XS) DOWN(IQ2_S) DOWN(IQ3_XXS) DOWN(IQ3_S) DOWN(MXFP4)
 #undef DOWN
             }
         }
@@ -641,7 +676,7 @@ void Project(int type, const block_q8_1 *input, __nv_bfloat16 *output,
             input, output, weights, indices, experts, topk, columns, rows, \
             ggml_row_size(GGML_TYPE_##Type, columns)); break; }
         PROJECT(Q8_0) PROJECT(Q2_0) PROJECT(Q2_K) PROJECT(Q3_K) PROJECT(Q4_K) PROJECT(IQ1_S) PROJECT(IQ1_M)
-        PROJECT(IQ2_XXS) PROJECT(IQ2_XS) PROJECT(IQ2_S) PROJECT(IQ3_XXS)
+        PROJECT(IQ2_XXS) PROJECT(IQ2_XS) PROJECT(IQ2_S) PROJECT(IQ3_XXS) PROJECT(IQ3_S) PROJECT(MXFP4)
 #undef PROJECT
     }
 }
@@ -743,7 +778,8 @@ bool FastllmCudaV41GGUFSupported(int gateType, int downType) {
             type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q4_K ||
             type == GGML_TYPE_IQ1_S || type == GGML_TYPE_IQ1_M ||
             type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_XS ||
-            type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_XXS;
+            type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_XXS ||
+            type == GGML_TYPE_IQ3_S || type == GGML_TYPE_MXFP4;
     };
     return supported(gateType) && supported(downType);
 }

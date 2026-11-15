@@ -4369,7 +4369,11 @@ namespace fastllm {
             double *cpuElapsedUs = nullptr, bool canonical = false) {
         HostMoePlacementScope placement(canonical || weights[2]->hostMoeUnbound);
         const bool scoredBfloat = routeScores != nullptr;
-        const bool scoredGguf = scoredBfloat && weights[2]->dataType == DataType::DATA_GGUF_FORMAT;
+        // Either projection may require GGUF activation packing. A native gate
+        // with a GGUF down must not use the fused native BF16 down writer.
+        const bool scoredGguf = scoredBfloat &&
+            (weights[2]->dataType == DataType::DATA_GGUF_FORMAT ||
+             weights[3]->dataType == DataType::DATA_GGUF_FORMAT);
         const bool rotatedFormat = weights[2]->dataType == EXL3;
         double cpuHostStart = cpuElapsedUs ? NumasProfileNowMs() * 1000 : 0;
         double cpuWorkUs = 0;
@@ -4408,7 +4412,8 @@ namespace fastllm {
         work.gateUpOutput.resize(count * inter * 2);
         work.swigluOutput.resize(count * inter);
         work.downInput.resize(count * downBytes);
-        if (scoredGguf && activationQuantBlock == 32) {
+        if (scoredBfloat && activationQuantBlock == 32 &&
+            gateAct >= DataType::DATA_GGUF_FORMAT && gateAct < DataType::DATA_GGUF_FORMAT_END) {
             QuantizeNumasV41Input(work.realInput.data(), gateAct, 1, hidden,
                 reinterpret_cast<const uint8_t *>(input), DataType::FLOAT32);
         } else {

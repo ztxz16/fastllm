@@ -326,6 +326,7 @@ struct PageableExpertSource;
 void FinishNativeMoeMailbox(struct DeviceCache &cache, bool observe);
 
 struct DeviceCache {
+    std::vector<DeviceCache *> decodePeers;
     const OffloadGroup *recordGroup = nullptr;
     OffloadGroup *tensorParallelOwner = nullptr;
     bool attempted = false;
@@ -396,6 +397,11 @@ struct CooperativeMoe;
 struct MailboxMoe;
 struct Glm5TensorParallel;
 struct OffloadGroup {
+    // Keys are looked up through the lifetime-managed registry before use.
+    // Identity of the shared family also prevents a reused Data address from
+    // joining an unrelated model after a member has been released.
+    std::shared_ptr<std::vector<const fastllm::Data *>> family;
+    std::vector<fastllm::Data *> scopeWeights;
     OffloadLayout layout;
     // GGUF layers keep their actual record size in host storage and share
     // GPU slot partitions with other layers of the same size.
@@ -906,15 +912,18 @@ bool BindPackedHostWeights(OffloadGroup &group, const std::vector<fastllm::Data 
                     if (!AppendNumaPointers(weight, group.numaPointers, group.mappedWeights)) return false;
                     continue;
                 }
+                const int sourceType = weight.dataType == fastllm::NVFP4_BLOCK_32_E8M0
+                    ? fastllm_gguf_restore::kNativeMxfp4 : weight.ggmlType;
                 if (weight.numasData.size() != size_t(nodes) || rows % nodes ||
                     weight.cpuData || weight.GetBytes() != bytes ||
                     weight.dims.size() != 2 || weight.dims[0] != rows || weight.dims[1] != columns ||
-                    fastllm_gguf_restore::Ordinary(weight.ggmlType) !=
+                    fastllm_gguf_restore::Ordinary(sourceType) !=
                         (part ? layout.downGgmlType : layout.gateGgmlType)) return false;
-                if (fastllm_gguf_restore::Ordinary(weight.ggmlType) != weight.ggmlType &&
+                if (sourceType != fastllm_gguf_restore::kNativeMxfp4 &&
+                    fastllm_gguf_restore::Ordinary(sourceType) != sourceType &&
                     (rows % (4 * nodes) || columns % 256)) return false;
-                if (!expert) source.weights[part] = {weight.ggmlType, rows, columns, bytes / rows};
-                else if (source.weights[part].type != weight.ggmlType) return false;
+                if (!expert) source.weights[part] = {sourceType, rows, columns, bytes / rows};
+                else if (source.weights[part].type != sourceType) return false;
                 if (!AppendNumaPointers(weight, group.numaPointers, group.mappedWeights)) return false;
             }
         }
@@ -982,12 +991,23 @@ bool ValidateV41GGUFPair(fastllm::Data *gate, fastllm::Data *down,
         expected->gateBytes == observed.gateBytes && expected->downBytes == observed.downBytes);
 }
 
+// The cache format is independent of the host representation of either
+// projection. Native block32 FP4 is losslessly restored to GGUF MXFP4 on admission.
+int V41CanonicalGGUFType(const fastllm::Data *weight) {
+    if (!weight) return -1;
+    if (weight->dataType == fastllm::DATA_GGUF_FORMAT)
+        return fastllm_gguf_restore::Ordinary(weight->ggmlType);
+    if (weight->dataType == fastllm::NVFP4_BLOCK_32_E8M0 &&
+        weight->blockK == 1 && weight->blockM == 32) return GGML_TYPE_MXFP4;
+    return -1;
+}
+
 // NUMA may repack K-quants and interleave gate/up rows. Restore their original
 // quantized bytes on cache admission; no duplicate host weights or FP16 expansion.
 bool ValidateV41CanonicalGGUFPair(fastllm::Data *gate, fastllm::Data *down,
                                   const OffloadLayout *expected, OffloadLayout &observed) {
-    if (!gate || !down || gate->dataType != fastllm::DATA_GGUF_FORMAT ||
-        down->dataType != fastllm::DATA_GGUF_FORMAT ||
+    const int gateType = V41CanonicalGGUFType(gate), downType = V41CanonicalGGUFType(down);
+    if (gateType < 0 || downType < 0 ||
         gate->dataDevice != fastllm::CPU || down->dataDevice != fastllm::CPU ||
         gate->numasData.empty() || down->numasData.empty() ||
         gate->dims.size() != 2 || down->dims.size() != 2 ||
@@ -996,8 +1016,8 @@ bool ValidateV41CanonicalGGUFPair(fastllm::Data *gate, fastllm::Data *down,
         gate->dims[1]%256 || down->dims[1]%256) return false;
     observed.weightType = fastllm::DATA_GGUF_FORMAT;
     observed.deepSeekV41 = true;
-    observed.gateGgmlType = fastllm_gguf_restore::Ordinary(gate->ggmlType);
-    observed.downGgmlType = fastllm_gguf_restore::Ordinary(down->ggmlType);
+    observed.gateGgmlType = gateType;
+    observed.downGgmlType = downType;
     if (!FastllmCudaV41GGUFSupported(observed.gateGgmlType, observed.downGgmlType)) return false;
     observed.hidden = gate->dims[1]; observed.inter = down->dims[1];
     observed.gateBytes = size_t(gate->dims[0])*ggml_row_size(ggml_type(observed.gateGgmlType), observed.hidden);
@@ -2280,8 +2300,10 @@ bool FastllmCudaPrepareMoeCacheWithBudgets(
         if (!layers[layer].weights || layers[layer].weightsBatch != (experts+1)*2) return false;
         for (int position = 2; position < layers[layer].weightsBatch; position += 2) {
             const auto *gate = layers[layer].weights[position], *down = layers[layer].weights[position+1];
-            if (gate && down && gate->dataType == fastllm::DATA_GGUF_FORMAT &&
-                (gate->ggmlType != GGML_TYPE_Q2_K_R4 || down->ggmlType != GGML_TYPE_Q4_K_R4))
+            if (gate && down && (gate->dataType == fastllm::DATA_GGUF_FORMAT ||
+                    down->dataType == fastllm::DATA_GGUF_FORMAT) &&
+                (gate->dataType != fastllm::DATA_GGUF_FORMAT || down->dataType != fastllm::DATA_GGUF_FORMAT ||
+                 gate->ggmlType != GGML_TYPE_Q2_K_R4 || down->ggmlType != GGML_TYPE_Q4_K_R4))
                 canonicalV41GGUF = true;
         }
     }
@@ -2305,7 +2327,9 @@ bool FastllmCudaPrepareMoeCacheWithBudgets(
             const int position = (expert + 1) * 2;
             OffloadLayout observed;
             const bool v41GGUF = layers[0].deepSeekV41 && layers[layer].weights[position] &&
-                layers[layer].weights[position]->dataType == fastllm::DATA_GGUF_FORMAT;
+                layers[layer].weights[position+1] &&
+                (layers[layer].weights[position]->dataType == fastllm::DATA_GGUF_FORMAT ||
+                 layers[layer].weights[position+1]->dataType == fastllm::DATA_GGUF_FORMAT);
             if (!(v41GGUF ? validateV41 : ValidateWeightPair)(
                     layers[layer].weights[position],
                     layers[layer].weights[position + 1],
@@ -2373,6 +2397,7 @@ bool FastllmCudaPrepareMoeCacheWithBudgets(
         if (budget.first < 0 || budget.first >= FastllmCudaGetDeviceCount() ||
             budget.second > DeviceCacheBudgetBytes(budget.first)) return false;
     std::unique_ptr<OffloadGroup> group(new OffloadGroup());
+    group->scopeWeights.assign(layers[0].weights, layers[0].weights + layers[0].weightsBatch);
     group->qwen38FlashNext = layers[0].qwen38FlashNext;
     group->layout = layout;
     group->deviceBudgets = deviceBudgets;
@@ -2555,6 +2580,30 @@ bool FastllmCudaSetMoeCacheBudgetFraction(fastllm::Data **weights, int count, do
     if (fraction == group->budgetFraction) return true;
     if (!group->deviceCaches.empty()) return false;
     group->budgetFraction = fraction;
+    return true;
+}
+
+bool FastllmCudaLinkMoeCacheGroups(const std::vector<const fastllm::Data *> &keys) {
+    std::lock_guard<std::mutex> guard(RegistryMutex());
+    std::vector<OffloadGroup *> members;
+    for (const auto *key : keys) {
+        const auto it = TableRegistry().find(key);
+        if (it == TableRegistry().end()) return false;
+        if (std::find(members.begin(), members.end(), it->second.group) == members.end())
+            members.push_back(it->second.group);
+    }
+    if (members.empty()) return false;
+    // Repeated preparation must preserve the family used by existing graphs.
+    // Only a change of membership requires uninitialized device caches.
+    const auto &existing = members.front()->family;
+    if (existing && existing->size() == members.size() &&
+        std::all_of(members.begin(), members.end(), [&](const OffloadGroup *group) {
+            return group->family == existing;
+        })) return true;
+    for (const auto *group : members) if (!group->deviceCaches.empty()) return false;
+    auto family = std::make_shared<std::vector<const fastllm::Data *>>();
+    for (const auto *group : members) family->push_back(group->tableKeys.front());
+    for (auto *group : members) group->family = family;
     return true;
 }
 
@@ -4942,8 +4991,8 @@ void *FastllmCudaBeginMoeDecode(fastllm::Data **weights, int weightsBatch, int t
     return FastllmCudaBeginMoeDecode(weights, weightsBatch, topk, nullptr);
 }
 
-void *FastllmCudaBeginMoeDecode(fastllm::Data **weights, int weightsBatch, int topk,
-                              const std::vector<int> *devices) {
+static void *BeginMoeDecodeGroup(fastllm::Data **weights, int weightsBatch, int topk,
+                                const std::vector<int> *devices) {
     if (topk < 1 || topk > kMaxTopK) return nullptr;
     auto *group = FindHybridGroup(weights, weightsBatch);
     if (!group) return nullptr;
@@ -5001,6 +5050,30 @@ void *FastllmCudaBeginMoeDecode(fastllm::Data **weights, int weightsBatch, int t
             group->totalRecords, cache->slots, group->tableKeys.size(), topk, cache->layerSlots);
     }
     cache->decode->startUs = HybridNowUs();
+    return cache;
+}
+
+void *FastllmCudaBeginMoeDecode(fastllm::Data **weights, int weightsBatch, int topk,
+                              const std::vector<int> *devices) {
+    auto *cache = static_cast<DeviceCache *>(BeginMoeDecodeGroup(weights, weightsBatch, topk, devices));
+    if (!cache) return nullptr;
+    cache->decodePeers.clear();
+    const auto *owner = cache->recordGroup;
+    if (!owner || !owner->family) return cache;
+    std::vector<OffloadGroup *> peers;
+    {
+        std::lock_guard<std::mutex> guard(RegistryMutex());
+        for (const auto *key : *owner->family) {
+            const auto it = TableRegistry().find(key);
+            if (it != TableRegistry().end() && it->second.group != owner &&
+                it->second.group->family == owner->family) peers.push_back(it->second.group);
+        }
+    }
+    for (auto *group : peers) {
+        auto *peer = static_cast<DeviceCache *>(BeginMoeDecodeGroup(group->scopeWeights.data(),
+            int(group->scopeWeights.size()), topk, devices));
+        if (peer) cache->decodePeers.push_back(peer);
+    }
     return cache;
 }
 
@@ -5209,10 +5282,14 @@ namespace { void WaitCooperativeCpu(OffloadGroup &group); }
 #endif
 
 void FastllmCudaEndMoeDecodeOnDevice(void *state) {
-    if (state) EndDeviceMoeDecode(*static_cast<DeviceCache *>(state));
+    if (!state) return;
+    auto &cache = *static_cast<DeviceCache *>(state);
+    for (auto *peer : cache.decodePeers) EndDeviceMoeDecode(*peer);
+    cache.decodePeers.clear();
+    EndDeviceMoeDecode(cache);
 }
 
-void FastllmCudaEndMoeDecode(void *state) {
+static void EndMoeDecodeGroup(void *state) {
     if (!state) return;
     auto &cache = *static_cast<DeviceCache *>(state);
 #ifdef USE_NUMAS
@@ -5236,6 +5313,14 @@ void FastllmCudaEndMoeDecode(void *state) {
         for (auto &entry : group->deviceCaches)
             if (entry.second && entry.second->frequencyActive) EndDeviceMoeDecode(*entry.second);
     } else EndDeviceMoeDecode(cache);
+}
+
+void FastllmCudaEndMoeDecode(void *state) {
+    if (!state) return;
+    auto &cache = *static_cast<DeviceCache *>(state);
+    for (auto *peer : cache.decodePeers) EndMoeDecodeGroup(peer);
+    cache.decodePeers.clear();
+    EndMoeDecodeGroup(state);
 }
 
 namespace {
@@ -5298,6 +5383,7 @@ static void WarmupMxfp4KernelPlan(const OffloadLayout &layout,DeviceCache &cache
 void FastllmCudaWaitMoeDecodeCpu(void *state) {
 #ifdef USE_NUMAS
     if (!state) return;
+    for (auto *peer : static_cast<DeviceCache *>(state)->decodePeers) FastllmCudaWaitMoeDecodeCpu(peer);
     auto *group = static_cast<DeviceCache *>(state)->frequencyGroup;
     if (group) WaitCooperativeCpu(*group);
     FinishNativeMoeMailbox(*static_cast<DeviceCache *>(state), false);
