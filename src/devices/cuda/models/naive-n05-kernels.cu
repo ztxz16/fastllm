@@ -34,9 +34,10 @@
 #include <type_traits>
 #include <vector>
 
-// Keep launch stubs defined in every device pass, including SM75 PTX.
-// Runtime dispatch excludes SM80-only attention on older architectures.
-#if !defined(FASTLLM_CUDA_LEGACY_ONLY)
+// FlashInfer synchronization headers require SM70+. Keep the host pass
+// and SM70+ launch stubs; runtime dispatch excludes BF16 attention below SM80.
+#if !defined(FASTLLM_CUDA_LEGACY_ONLY) && \
+    (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700)
 #define FASTLLM_NAIVE_SWA_FLASHINFER
 #include "naive-n05-swa-flashinfer.cuh"
 #endif
@@ -5394,6 +5395,7 @@ bool VerifySwaQueryReuse(const fastllm::Data &query, const float *bias,
 template<bool Share16Heads>
 bool PrefetchFP4DSAAttention(const fastllm::Data &query, const float *bias,
         const std::vector<FastllmNaiveDSARow> &rows, fastllm::Data &output) {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
     namespace bulk = pipeline_bulk;
     constexpr int Heads = Share16Heads ? 16 : 8, Threads = Share16Heads ? 512 : 256;
     constexpr int Limit = bulk::FP4BatchLimit;
@@ -5410,6 +5412,9 @@ bool PrefetchFP4DSAAttention(const fastllm::Data &query, const float *bias,
             (BF16 *)output.cudaData + (size_t)first * 16 * 128, 16, 1);
     }
     return true;
+#else
+    return false;
+#endif
 }
 
 // Small batches keep the scalar reference's rounding while sharing KV across
@@ -5620,6 +5625,7 @@ void FastllmCudaNaiveBatchDSADecode(const fastllm::Data &query,
     // original scalar QK reduction, BF16 rounding, softmax and ordered PV.
     // Larger descriptors reduce launches without introducing device-side
     // descriptor storage. Lower-shared-memory kernels remain as fallbacks.
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
     constexpr int fp4BatchLimit = pipeline_bulk::BatchLimit;
     using FP4Batch = pipeline_bulk::BatchT<fp4BatchLimit>;
     constexpr size_t fp4ValueShared = sizeof(dsa::TiledValueStorage<8>);
@@ -5642,6 +5648,7 @@ void FastllmCudaNaiveBatchDSADecode(const fastllm::Data &query,
         CheckLaunch();
         return;
     }
+#endif
     if (groupedFP4 && BulkKernelSupported(dsa::GroupedValues<2048, 4, 8, true>,
             sizeof(dsa::GroupStorage<2048, 4, 8>), 90)) {
         Output(output, BFLOAT16, {1, (int)rows.size(), heads * valueDim});
