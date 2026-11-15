@@ -33,6 +33,10 @@ def capture_contributions(torch, block, norm, x):
      * 沿原版HF公开MoE前向观察每次index_add_的实际专家输出和加权输入。
      * 输入保持完整FP16 [1,tokens,hidden]，不重选专家、不替换GEMM或累加。
      * 专家hook关联实际专家ID，Mode只复制数据；成功和异常均清理hook/Mode。
+     * @param torch 已加载的参考PyTorch模块。
+     * @param block 原版HF MoE模块，包含逐专家ModuleList。
+     * @param norm 本层原版HF post-attention RMSNorm模块。
+     * @param x 完整FP16 [1,tokens,hidden] 输入，保持原设备和Token顺序。
      * @return 原观察器的完整层结果，以及实际调用顺序的专家贡献列表。
      */"""
     from torch.overrides import TorchFunctionMode
@@ -86,6 +90,12 @@ def replay_contributions(records, observed, inputs, hidden, topk, experts):
      * 用同一组真实HF加权贡献重放FP16逐次累加和FP32逐次累加。
      * 校验实际专家/Token覆盖、FP16乘权重结果、形状和有限值；保留真实专家调用顺序。
      * FP32候选不模拟原生专家GEMM、rank分组或NCCL归约树，只用于独立数值对照。
+     * @param records 按实际调用次序保存的专家ID、Token索引和FP16贡献。
+     * @param observed 同次HF前向的路由、共享专家及层输出记录。
+     * @param inputs 按行展开的FP16 [tokens,hidden] 原始层输入。
+     * @param hidden 隐藏维度，必须为正整数。
+     * @param topk 每个Token选择的专家数，必须为正且不大于experts。
+     * @param experts 模型专家总数，用于检查ID范围。
      * @return 两种候选的路由贡献及按FP16共享专家/残差语义合成的层输出。
      */"""
     if hidden <= 0 or topk <= 0 or experts < topk or not inputs or len(inputs) % hidden:
@@ -132,7 +142,13 @@ def replay_contributions(records, observed, inputs, hidden, topk, experts):
 
 
 def load_pair(pair, model, layer):
-    """/** 只读复核历史轨迹、双输入任务及原生结果，门禁失配时拒绝继续HF重放。 */"""
+    """/**
+     * 只读复核历史轨迹、双输入任务及原生结果，门禁失配时拒绝继续HF重放。
+     * @param pair 已有双输入诊断的绝对目录。
+     * @param model 本地模型绝对目录，必须与原诊断一致。
+     * @param layer 从零开始的层索引，必须已有有效重放证据。
+     * @return 原报告、配置、Token、完整双输入、HF与原生结果以及证据哈希。
+     */"""
     parent = json.loads((pair / 'summary.json').read_text())
     meta = parent['metadata']
     if meta.get('layer_attribution_valid', {}).get(str(layer)) is not True or \
