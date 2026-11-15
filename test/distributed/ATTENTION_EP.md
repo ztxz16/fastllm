@@ -19,6 +19,15 @@
 - 原生采样保留种子、temperature、top-k/top-p 语义。EOS、取消与超时在轮次边界释放 rank。
   每请求 token 队列上限 64；消费者落后导致该请求取消，不阻塞其他 rank。
 - 任意 worker 故障使全组不可复用，回收整个进程树；不自动重试已执行请求。
+- MoE专家输出与路由权重相乘后先转FP16，每个Top-K槽位单独保存，通过一次FP16
+  ReduceScatter返回请求所属rank；每槽仅一个专家owner写入，其他rank为零。
+  返回后按全局专家ID升序逐次FP16相加，保留HF `index_add_` 的逐专家舍入边界。
+  Prefill、Decode和Graph共用该合并路径，Graph每次在设备读取并排序本轮专家ID。
+  禁止先按rank累加再规约，也不能按Top-K槽位顺序累加；两者都会改变数值语义。
+  诊断中的routed_output仍传FP32，但其值为最终FP16累加值的无损提升。
+  贡献缓冲为FP16 `[capacity*ep,topk,hidden]`，接收缓冲为 `[capacity,topk,hidden]`，
+  继续计入512 MiB预算。相对旧FP32聚合通信，每Token元素载荷由 `4*hidden` 增为
+  `2*topk*hidden` 字节（Top-K=4时为两倍）；尚未测量性能，不能据此宣称优化吞吐。
 - MoE Attention保留HF FP16 Eager的中间张量精度：QK点积先转FP16，缩放后再转FP16，
   softmax以FP32计算后转FP16再与V相乘。单层、Eager及Graph使用同一路径；dense分支保持原语义。
 - MoE一般Linear使用`CUBLAS_COMPUTE_32F + CUBLAS_GEMM_DEFAULT_TENSOR_OP`，覆盖
@@ -37,6 +46,14 @@
 同时得到Q/K/V、Attention输出、下游router logits与专家选择的零差异；合并Lt、分离GemmEx、
 合并PyTorch Linear与FP32输出后转FP16均有差异。该证据定位了本轮修复，仍不代表原生完整层、
 完整模型或Graph/Prefix通过；独立诊断中的其他计算使用HF操作，正式验收阈值保持不变。
+
+20261115T153521Z的完整前向独立实验通过归因门禁：仅将HF专家累加换成FP32后，
+与保存的原生logits比较由18个超差变成0个，但候选仍有分层超差，且相对原HF有16个
+logits超差。因此该实验用于定位正式累加语义，不能替换HF验收参考。上述正式合并修复
+仍须重新编译并执行synthetic、regression和real；真实阈值继续为atol=0.05、rtol=0.01。
+synthetic新增 `expert_accumulation`：加权贡献按专家ID为 `[2048,1,-2048,1]`，正确
+FP16串行结果为1，FP32或Top-K顺序 `[2,0,3,1]` 均为2。该用例通过正式单层及完整
+生成入口覆盖EP=1/2/4、空闲rank、Prefill/Decode、Graph/Prefix及冷热复用。
 
 ## 服务器执行顺序
 

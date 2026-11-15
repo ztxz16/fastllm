@@ -6,8 +6,8 @@ import tempfile
 import unittest
 from unittest import mock
 
-from qwen3_layer_reference import half
-from qwen_moe_reference import fixture, forward, route, weights_for_rank
+from qwen3_layer_reference import half, matrix
+from qwen_moe_reference import fixture, forward, full_logits, route, weights_for_rank
 from run_qwen3_shards import encode
 from run_qwen_moe_layer import BACKEND, compare, make_case, tasks_for, verify, cases
 
@@ -85,6 +85,86 @@ class MoeReferenceTests(unittest.TestCase):
         self.assertEqual(actual["output"][:-8], after["output"][:-8])
         idle = forward(self.config, self.tensors, self.task, dict(position_begin=0, hidden=[]))
         self.assertTrue(all(not value for value in idle.values()))
+
+    def test_expert_accumulation_fixture_has_analytic_result_on_public_tasks(self):
+        """/** 解析消去用例覆盖不同EP、Prefill/Decode及空闲输入，固定原验收阈值。 */"""
+        for world in (1, 2, 4):
+            directory = self.root / f'accumulation{world}'
+            directory.mkdir()
+            config, tensors, tasks = make_case(directory,
+                dict(experts=4, topk=4, expert_accumulation=True), world)
+            for task in tasks:
+                for rank, input_ in enumerate(task['inputs']):
+                    count = len(input_['hidden']) // 8
+                    actual = forward(config, tensors, task, input_)
+                    with self.subTest(world=world, task=task['name'], rank=rank):
+                        self.assertEqual(actual['routed_output'], [1.0, *([0.0]*7)] * count)
+                        self.assertEqual(actual['output'], [2.0, *([1.0]*7)] * count)
+                        self.assertEqual(actual['selected_experts'], [2, 0, 3, 1] * count)
+            logits = full_logits(config, tensors, [1, 2, 3])
+            # 输出头读取规范化后的首通道；以解析残差[2,1,...,1]独立求期望。
+            expected = half(2 / math.sqrt(11/8 + config['rms_norm_eps'])) * 4
+            self.assertEqual(logits, [expected] + [0.0]*12)
+            with self.assertRaises(AssertionError):
+                compare([2.0], [1.0], dict(max=0., sum=0., count=0, failed=0), 'legacy FP32 reduction')
+
+    def test_expert_accumulation_fixture_matches_public_torch_operations(self):
+        """/** 用独立PyTorch CPU Linear/TopK/index_add_核对参考，并拒绝错精度及错顺序。 */"""
+        try:
+            import torch
+        except ImportError:
+            self.skipTest('requires an existing CPU PyTorch installation')
+        config, tensors = fixture(self.root / 'torch_accumulation', experts=4, topk=4, expert_accumulation=True)
+        x = torch.ones((3, 8), dtype=torch.float16)
+        prefix = 'model.layers.0.'
+        def weight(name):
+            """/** 直接读取未分片checkpoint为CPU FP16张量，保持HF布局。 */"""
+            return torch.tensor(matrix(tensors[prefix+name]), dtype=torch.float16)
+
+        normed = (x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + config['rms_norm_eps'])).half()
+        normed = normed * weight('post_attention_layernorm.weight')
+        scores = torch.nn.functional.linear(normed, weight('mlp.gate.weight'))
+        probs, ids = torch.topk(torch.softmax(scores, dim=-1, dtype=torch.float32), 4, dim=-1)
+        probs = probs.half()
+        output = torch.zeros_like(x)
+        contributions = []
+        for expert in range(4):
+            name = f'mlp.experts.{expert}.'
+            gate = torch.nn.functional.linear(normed, weight(name+'gate_proj.weight'))
+            up = torch.nn.functional.linear(normed, weight(name+'up_proj.weight'))
+            down = torch.nn.functional.linear(torch.nn.functional.silu(gate)*up, weight(name+'down_proj.weight'))
+            probability = (probs * (ids == expert)).sum(dim=-1, keepdim=True)
+            contribution = down * probability
+            contributions.append(contribution)
+            output.index_add_(0, torch.arange(len(x)), contribution)
+        self.assertEqual([value[0, 0].item() for value in contributions], [2048, 1, -2048, 1])
+        actual = forward(config, tensors, dict(layer=0, stage=2), dict(position_begin=0, hidden=x.flatten().tolist()))
+        self.assertEqual(actual['routed_output'], output.flatten().tolist())
+        self.assertEqual(actual['output'], (x+output).flatten().tolist())
+
+        old = torch.stack(contributions).float().sum(dim=0).half()
+        wrong_order = torch.zeros_like(x)
+        for expert in ids[0].tolist():
+            wrong_order.add_(contributions[expert])
+        for wrong in (old, wrong_order):
+            self.assertEqual(wrong[0, 0].item(), 2)
+            with self.assertRaises(AssertionError):
+                compare(wrong.flatten().tolist(), output.flatten().tolist(),
+                        dict(max=0., sum=0., count=0, failed=0), 'incorrect expert accumulation')
+
+    def test_expert_accumulation_case_registered_for_all_execution_modes(self):
+        """/** 正式完整生成矩阵必须包含EP=1/2/4及Graph、Prefix全部组合。 */"""
+        from run_qwen_moe_full import SYNTHETIC_CASES
+        for world in (1, 2, 4):
+            for graph in (0, 1):
+                for prefix in (0, 1):
+                    self.assertIn(f'expert_accumulation_ep{world}_graph{graph}_prefix{prefix}', SYNTHETIC_CASES)
+
+    def test_expert_accumulation_fixture_rejects_incompatible_shapes(self):
+        """/** 解析用例的精度和专家数量固定，拒绝产生失去消去语义的模型。 */"""
+        for options in (dict(experts=5), dict(topk=2), dict(dtype='BF16'), dict(normalize=True)):
+            with self.subTest(options=options), self.assertRaisesRegex(ValueError, 'accumulation fixture'):
+                fixture(self.root / 'invalid_accumulation', **dict(dict(experts=4, topk=4, expert_accumulation=True), **options))
 
     def test_nonfinite_and_shape_mismatches_fail(self):
         """/** 非有限参考值不得因 inf 容差被放行。 */"""
