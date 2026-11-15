@@ -41,13 +41,13 @@ class AttentionProbeTests(unittest.TestCase):
                 return self.o_proj(q+k+v), None
         return Attention()
 
-    def invoke(self, attention, mode, gemm=None, x=None):
+    def invoke(self, attention, mode, gemm=None, x=None, lt_gemm=None):
         """/** 固定CPU输入并经同一实验函数调用，不触发参考环境或原生二进制。 */"""
         torch = self.torch
         if x is None:
             x = torch.ones(1, 2, attention.q_proj.weight.shape[1]).half()
         return probe.attention_variant(torch, attention, x, x*.5, x,
-                                       torch.arange(x.shape[1]).reshape(1, -1), None, mode, gemm)
+                                       torch.arange(x.shape[1]).reshape(1, -1), None, mode, gemm, lt_gemm)
 
     def test_separate_bias_exposes_double_rounding(self):
         """/** 精确构造一次与两次FP16舍入的差别，确保bias实验确实改变所测因素。 */"""
@@ -77,15 +77,18 @@ class AttentionProbeTests(unittest.TestCase):
             for mode in probe.MODES:
                 with self.subTest(bias=bias, mode=mode):
                     gemm = SimpleNamespace(linear=mock.Mock(side_effect=linear))
-                    output, raw = self.invoke(attention, mode, gemm)
+                    lt_gemm = SimpleNamespace(linear=mock.Mock(side_effect=linear))
+                    output, raw = self.invoke(attention, mode, gemm, lt_gemm=lt_gemm)
                     self.assertTrue(torch.equal(output, raw['output']))
                     self.assertEqual(set(raw), {'norm', 'q', 'k', 'v', 'context', 'o', 'output'})
                     self.assertTrue(torch.equal(raw['norm'], torch.full_like(raw['norm'],
                         .5 if mode in ('native_norm', 'combined_projections', 'current_projections') else 1)))
                     calls = gemm.linear.call_args_list
                     expected_count = {'merged_qkv': 1, 'fp32_o': 1, 'combined_projections': 2,
-                                      'fused_qkv': 1, 'current_projections': 2}.get(mode, 0)
+                                      'fused_qkv': 1, 'current_projections': 2, 'fp32_qkv': 1,
+                                      'separate_fused_qkv': 3}.get(mode, 0)
                     self.assertEqual(len(calls), expected_count)
+                    self.assertEqual(lt_gemm.linear.call_count, {'lt_qkv': 1, 'lt_separate_qkv': 3}.get(mode, 0))
                     if mode in ('merged_qkv', 'combined_projections', 'fused_qkv', 'current_projections'):
                         self.assertEqual(calls[0].args[2].shape, (12, 4))
                         self.assertFalse(calls[0].kwargs.get('fp32', False))
@@ -94,6 +97,13 @@ class AttentionProbeTests(unittest.TestCase):
                     if mode in ('fp32_o', 'combined_projections', 'current_projections'):
                         self.assertTrue(calls[-1].kwargs['fp32'])
                         self.assertEqual(calls[-1].args[2].shape, (4, 4))
+                    if mode == 'fp32_qkv':
+                        self.assertTrue(calls[0].kwargs['fp32'])
+                        self.assertEqual(calls[0].kwargs['bias'] is not None, bias)
+                    if mode in ('separate_fused_qkv', 'lt_separate_qkv'):
+                        for call in calls or lt_gemm.linear.call_args_list:
+                            self.assertEqual(call.args[2].shape, (4, 4))
+                            self.assertEqual(call.kwargs['bias'] is not None, bias)
                     for module in attention.modules():
                         self.assertFalse(module._forward_hooks)
                     for key, value in attention.state_dict().items():
@@ -165,6 +175,34 @@ class AttentionProbeTests(unittest.TestCase):
             self.assertFalse(module._forward_hooks)
         with self.assertRaises(ValueError):
             self.invoke(attention, 'unknown')
+        with self.assertRaisesRegex(ValueError, 'explicit Lt backend'):
+            self.invoke(attention, 'lt_qkv')
+
+    def test_backend_modes_preserve_bias_once_and_qkv_channel_order(self):
+        """/** 非等宽Q/K/V及非零bias必须按原通道次序拼接，所有新接口保持相同数学语义。 */"""
+        torch = self.torch
+        attention = self.attention()
+        attention.k_proj = torch.nn.Linear(4, 2).half()
+        attention.v_proj = torch.nn.Linear(4, 3).half()
+        x = torch.tensor([[[1., 2., 3., 4.], [4., 3., 2., 1.]]], dtype=torch.float16)
+        with torch.no_grad():
+            for index, module in enumerate((attention.q_proj, attention.k_proj, attention.v_proj)):
+                module.weight.fill_(index+1)
+                module.bias.fill_(index+2)
+        def forward(hidden_states, **kwargs):
+            q, k, v = (module(hidden_states) for module in (attention.q_proj, attention.k_proj, attention.v_proj))
+            return attention.o_proj(q + k.sum(-1, keepdim=True) + v.sum(-1, keepdim=True)), None
+        attention.forward = forward
+        def linear(torch, x, weight, fp32=False, bias=None):
+            y = torch.nn.functional.linear(x.float(), weight.float(), None if bias is None else bias.float())
+            return y if fp32 else y.half()
+        backend = SimpleNamespace(linear=linear)
+        _, baseline = self.invoke(attention, 'hf_replay', x=x)
+        for mode in ('torch_merged_qkv', 'separate_fused_qkv', 'fp32_qkv', 'lt_qkv', 'lt_separate_qkv'):
+            _, actual = self.invoke(attention, mode, backend, x, backend)
+            for key in ('q', 'k', 'v', 'output'):
+                with self.subTest(mode=mode, key=key):
+                    self.assertTrue(torch.equal(actual[key], baseline[key]))
 
     def test_baseline_mismatch_stops_attribution(self):
         """/** 参考重放不一致时，即使实验更接近原生日志也不得继续作因果判断。 */"""
@@ -174,22 +212,43 @@ class AttentionProbeTests(unittest.TestCase):
 
     def test_missing_cuda_records_incomplete_four_format_report(self):
         """/** 无GPU提前失败也生成全部报告格式，禁止进入cuBLAS或加载完整模型。 */"""
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            argv = ['probe', '--diagnostic', str(root/'source'), '--model', str(root/'model'),
-                    '--worker', str(root/'worker'), '--output', str(root/'reports')]
-            with mock.patch('sys.argv', argv), mock.patch.object(probe, 'capture', return_value='cpu-test'), \
-                    mock.patch.object(self.torch.cuda, 'is_available', return_value=False), \
-                    mock.patch.object(probe, 'MoeGemm') as gemm, redirect_stdout(io.StringIO()):
-                self.assertEqual(probe.main(), 1)
-            gemm.assert_not_called()
-            output, = (root/'reports').iterdir()
-            report = json.loads((output/'summary.json').read_text())
-            self.assertEqual(report['status'], 'FAIL')
-            self.assertFalse(report['complete'])
-            self.assertEqual(report['expected_case_count'], 96)
-            for suffix in ('md', 'csv', 'json', 'xlsx'):
-                self.assertTrue((output/f'summary.{suffix}').is_file())
+        selections = [([], 96), (['--layers', '4', '13', '--modes', 'hf_replay', 'lt_qkv',
+                                 '--qkv-report', '--router-replay'], 40)]
+        for extra, count in selections:
+            with self.subTest(extra=extra), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                argv = ['probe', '--diagnostic', str(root/'source'), '--model', str(root/'model'),
+                        '--worker', str(root/'worker'), '--output', str(root/'reports'), *extra]
+                with mock.patch('sys.argv', argv), mock.patch.object(probe, 'capture', return_value='cpu-test'), \
+                        mock.patch.object(self.torch.cuda, 'is_available', return_value=False), \
+                        mock.patch.object(probe, 'MoeGemm') as gemm, mock.patch.object(probe, 'LtGemm') as lt, \
+                        redirect_stdout(io.StringIO()):
+                    self.assertEqual(probe.main(), 1)
+                gemm.assert_not_called()
+                lt.assert_not_called()
+                output, = (root/'reports').iterdir()
+                report = json.loads((output/'summary.json').read_text())
+                self.assertEqual(report['status'], 'FAIL')
+                self.assertFalse(report['complete'])
+                self.assertEqual(report['expected_case_count'], count)
+                for suffix in ('md', 'csv', 'json', 'xlsx'):
+                    self.assertTrue((output/f'summary.{suffix}').is_file())
+
+    def test_mode_selection_cannot_skip_or_reorder_hf_baseline(self):
+        """/** 不能通过自选实验绕过HF基线；非法顺序或重复case也保存失败报告。 */"""
+        for modes in (['fused_qkv'], ['fused_qkv', 'hf_replay'], ['hf_replay', 'hf_replay']):
+            with self.subTest(modes=modes), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                argv = ['probe', '--diagnostic', temp, '--model', temp, '--worker', temp,
+                        '--output', temp, '--modes', *modes]
+                with mock.patch('sys.argv', argv), mock.patch.object(probe, 'capture', return_value='cpu-test'), \
+                        mock.patch.object(probe, 'MoeGemm') as gemm, redirect_stdout(io.StringIO()):
+                    self.assertEqual(probe.main(), 1)
+                gemm.assert_not_called()
+                output, = root.iterdir()
+                report = json.loads((output/'summary.json').read_text())
+                self.assertEqual(report['status'], 'FAIL')
+                self.assertIn('begin with hf_replay', report['cases'][0]['reason'])
 
 
 class AttentionProbeBlasTests(unittest.TestCase):

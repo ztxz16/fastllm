@@ -7,6 +7,7 @@ import ctypes
 from datetime import datetime, timezone
 import json
 import math
+import os
 from pathlib import Path
 import shlex
 import sys
@@ -14,12 +15,14 @@ import traceback
 import uuid
 
 from probe_qwen_moe_router_precision import PedanticGemm, exact_metrics, linked_cublas, norm_variants
+from probe_qwen_moe_cublaslt import LtGemm, linked_cublaslt
 from run_process_tp import ROOT, capture, parse_report, save_report
 from run_qwen_moe_full import align_tied_routing
 
 
-MODES = ('hf_replay', 'split_bias', 'merged_qkv', 'fp32_o', 'native_norm',
-         'combined_projections', 'fused_qkv', 'current_projections')
+DEFAULT_MODES = ('hf_replay', 'split_bias', 'merged_qkv', 'fp32_o', 'native_norm',
+                 'combined_projections', 'fused_qkv', 'current_projections')
+MODES = DEFAULT_MODES + ('torch_merged_qkv', 'separate_fused_qkv', 'fp32_qkv', 'lt_qkv', 'lt_separate_qkv')
 
 
 class MoeGemm(PedanticGemm):
@@ -56,7 +59,7 @@ class MoeGemm(PedanticGemm):
         return output
 
 
-def attention_variant(torch, attention, normalized, simulated_norm, residual, positions, embeddings, mode, gemm):
+def attention_variant(torch, attention, normalized, simulated_norm, residual, positions, embeddings, mode, gemm, lt_gemm=None):
     """/**
      * 在HF独立Attention中替换一个投影因素，记录FP16残差及中间量。
      * RoPE、QK、softmax、PV仍由HF执行；组合实验也不是原生Attention重放。
@@ -67,10 +70,13 @@ def attention_variant(torch, attention, normalized, simulated_norm, residual, po
      * @param residual 双方共同的原始FP16 [1,T,H]，无padding/cache。
      * @param positions [1,T]位置；embeddings为HF产生的cos/sin。
      * @param mode MODES中的实验名称；gemm为独立MoE cuBLAS调用器。
+     * @param lt_gemm 可空的独立Lt调用器，仅lt_qkv和lt_separate_qkv使用，缺失即拒绝。
      * @return 残差输出和中间量；失败抛异常，不更换路径重试。
      */"""
     if mode not in MODES or residual.ndim != 3 or residual.shape[0] != 1 or not residual.shape[1]:
         raise ValueError('unsupported attention experiment mode/shape')
+    if mode in ('lt_qkv', 'lt_separate_qkv') and lt_gemm is None:
+        raise ValueError('cuBLASLt mode requires the explicit Lt backend')
     if any(value.shape != residual.shape or value.dtype != torch.float16 or value.device != residual.device
            for value in (normalized, simulated_norm, residual)):
         raise ValueError('attention experiment requires matching FP16 [1,T,H] inputs')
@@ -78,7 +84,8 @@ def attention_variant(torch, attention, normalized, simulated_norm, residual, po
     qkv = [attention.q_proj, attention.k_proj, attention.v_proj]
     evidence = {'norm': x.detach().clone()}
     merged = None
-    if mode in ('merged_qkv', 'combined_projections', 'fused_qkv', 'current_projections'):
+    if mode in ('merged_qkv', 'combined_projections', 'fused_qkv', 'current_projections',
+                'torch_merged_qkv', 'fp32_qkv', 'lt_qkv'):
         weight = torch.cat([module.weight for module in qkv], dim=0).contiguous()
         biases = [module.bias for module in qkv]
         bias = None
@@ -86,11 +93,16 @@ def attention_variant(torch, attention, normalized, simulated_norm, residual, po
             if any(bias is None for bias in biases):
                 raise ValueError('mixed QKV bias is not supported by the native projection')
             bias = torch.cat(biases).contiguous()
-        fused = mode in ('fused_qkv', 'current_projections')
-        merged = gemm.linear(torch, x.reshape(-1, x.shape[-1]).contiguous(), weight,
-                            bias=bias if fused else None)
-        if bias is not None and not fused:
-            merged = merged + bias
+        flat = x.reshape(-1, x.shape[-1]).contiguous()
+        if mode == 'torch_merged_qkv':
+            merged = torch.nn.functional.linear(flat, weight, bias)
+        elif mode == 'lt_qkv':
+            merged = lt_gemm.linear(torch, flat, weight, bias=bias)
+        else:
+            fused = mode in ('fused_qkv', 'current_projections', 'fp32_qkv')
+            merged = gemm.linear(torch, flat, weight, fp32=mode == 'fp32_qkv', bias=bias if fused else None).half()
+            if bias is not None and not fused:
+                merged = merged + bias
         merged = merged.split([module.weight.shape[0] for module in qkv], dim=-1)
 
     with ExitStack() as hooks:
@@ -102,6 +114,10 @@ def attention_variant(torch, attention, normalized, simulated_norm, residual, po
                         value = value + module.bias
                 elif merged is not None:
                     value = merged[index].reshape_as(value).contiguous()
+                elif mode in ('separate_fused_qkv', 'lt_separate_qkv'):
+                    backend = lt_gemm if mode == 'lt_separate_qkv' else gemm
+                    value = backend.linear(torch, args[0].reshape(-1, args[0].shape[-1]).contiguous(),
+                                           module.weight, bias=module.bias).reshape_as(value)
                 evidence[name] = value.detach().clone()
                 return value
             hooks.callback(module.register_forward_hook(projection).remove)
@@ -202,23 +218,29 @@ def main():
     parser.add_argument('--layers', type=int, nargs='+', default=[6, 9, 16, 18, 22, 23])
     parser.add_argument('--device', type=int, default=0)
     parser.add_argument('--router-replay', action='store_true', help='从Attention残差重放HF路由，并与保存的完整层路由比较')
+    parser.add_argument('--modes', nargs='+', choices=MODES, default=list(DEFAULT_MODES),
+                        help='唯一实验列表；必须以hf_replay开头，先校验参考边界')
+    parser.add_argument('--qkv-report', action='store_true', help='另外比较每种实验与HF的Q/K/V投影输出')
     parser.add_argument('--output', type=Path, default=ROOT / 'test/distributed/results')
     args = parser.parse_args()
     output = args.output.resolve() / (datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ') +
                                      '_attention_probe_' + uuid.uuid4().hex[:8])
     output.mkdir(parents=True)
     print(f'独立诊断目录：{output}', flush=True)
-    rows, gemm = [], None
+    rows, gemm, lt_gemm = [], None, None
     metadata = dict(command=shlex.join([sys.executable, *sys.argv]), git=capture(['git', 'rev-parse', 'HEAD']),
         gpu=capture(['nvidia-smi', '--query-gpu=name,uuid,driver_version', '--format=csv']),
         cuda=capture(['nvcc', '--version']), warmup=0, iterations=1, repeats=1,
-        expected_case_count=len(args.layers)*(len(MODES)*2 + (2*(len(MODES)+3) if args.router_replay else 0)),
-        layers=args.layers, modes=list(MODES), router_replay=args.router_replay,
+        expected_case_count=len(args.layers)*(len(args.modes)*(5 if args.qkv_report else 2) +
+                                              (2*(len(args.modes)+3) if args.router_replay else 0)),
+        layers=args.layers, modes=args.modes, router_replay=args.router_replay, qkv_report=args.qkv_report,
         probe_gemm='CUBLAS_COMPUTE_32F/CUBLAS_GEMM_DEFAULT_TENSOR_OP; FP16 inputs; FP16 or FP32 output',
         diagnostic=str(args.diagnostic.resolve()), model=str(args.model.resolve()),
         report_title='Attention投影独立数值诊断',
         report_description='零容差用于差异定位；HF Attention核心保留，不能替代原生后端或完整模型验收。')
     try:
+        if args.modes[0] != 'hf_replay' or len(set(args.modes)) != len(args.modes):
+            raise ValueError('modes must be unique and begin with hf_replay')
         import torch
         if not torch.cuda.is_available():
             raise RuntimeError('run in the existing CUDA reference environment on the server')
@@ -233,10 +255,17 @@ def main():
         device = torch.device('cuda', args.device)
         metadata.update(torch=torch.__version__, transformers=transformers.__version__, torch_cuda=torch.version.cuda,
                         compute_capability=torch.cuda.get_device_capability(device), seed=20261115,
+                        allow_fp16_accumulation=getattr(torch.backends.cuda.matmul, 'allow_fp16_accumulation', None),
                         allow_fp16_reduced_precision_reduction=torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction)
         library = linked_cublas(args.worker)
         gemm = MoeGemm(library, torch.cuda.current_stream().cuda_stream)
         metadata.update(cublas_path=str(library), cublas_version=gemm.version)
+        metadata['blas_environment'] = {name: os.environ.get(name) for name in (
+            'DISABLE_ADDMM_CUDA_LT', 'CUBLASLT_WORKSPACE_SIZE', 'CUBLAS_WORKSPACE_CONFIG')}
+        if any(mode in ('lt_qkv', 'lt_separate_qkv') for mode in args.modes):
+            lt_library = linked_cublaslt(library)
+            lt_gemm = LtGemm(lt_library, int(os.environ.get('CUBLASLT_WORKSPACE_SIZE', '1024'))*1024)
+            metadata.update(cublaslt_path=str(lt_library), cublaslt_version=lt_gemm.version, cublaslt_calls=lt_gemm.calls)
         cache = args.worker.parent / 'CMakeCache.txt'
         metadata['build_cache'] = cache.read_text() if cache.is_file() else 'unavailable'
 
@@ -329,9 +358,10 @@ def main():
                     compare_router(f'layer{layer}/native_boundary_vs_hf_full', native_boundary, hf_routing)
                     compare_router(f'layer{layer}/native_boundary_vs_native_full', native_boundary, native[full_name])
 
-                for mode in MODES:
+                baseline_intermediates = None
+                for mode in args.modes:
                     values, intermediates = attention_variant(torch, attention, normalized, simulated.unsqueeze(0),
-                                                              x, positions, embeddings, mode, gemm)
+                                                              x, positions, embeddings, mode, gemm, lt_gemm)
                     hf = compare(f'layer{layer}/{mode}/vs_saved_hf', values, expected)
                     actual = compare(f'layer{layer}/{mode}/vs_saved_native', values, observed)
                     raw['variants'][mode] = {key: value.cpu().tolist() for key, value in intermediates.items()}
@@ -339,6 +369,13 @@ def main():
                         (output / f'layer-{layer:02d}.json').write_text(json.dumps(raw, allow_nan=False))
                         save_report(output, rows, metadata)
                         require_hf_replay(hf)
+                        baseline_intermediates = intermediates
+                    if args.qkv_report:
+                        fields = {key: compare(f'layer{layer}/{mode}/{key}_vs_hf', intermediates[key], baseline_intermediates[key],
+                                              backend=f'independent_qkv/{mode}') for key in ('q', 'k', 'v')}
+                        print(f'  qkv layer{layer}/{mode}: ' + ' '.join(
+                            f'{key}_diff={value["failed_elements"]} {key}_max={value["max_abs_error"]:.9g}'
+                            for key, value in fields.items()), flush=True)
                     if args.router_replay:
                         routed = replay_router(torch, values, post_norm, gate, config)
                         raw['router_replay']['variants'][mode] = routed
@@ -358,9 +395,11 @@ def main():
                          failed_elements=1, reason=str(error)))
         print(f'FAIL: {error}', flush=True)
     finally:
-        if gemm is not None:
+        for backend in (lt_gemm, gemm):
+            if backend is None:
+                continue
             try:
-                gemm.close()
+                backend.close()
             except Exception as error:
                 rows.append(dict(case='probe_cleanup', backend='independent_attention_probe', status='FAIL',
                                  failed_elements=1, reason=str(error)))
