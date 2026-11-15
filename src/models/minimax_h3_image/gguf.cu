@@ -118,14 +118,18 @@ class GgufWeights final : public QuantizedWeights {
     std::map<std::string, Weight> weights_;
     cublasHandle_t handle_ = nullptr;
     Tensor workspace_;
-    int device_ = -1;
+    int device_ = -1, major_ = 0;
+    bool prefill_ = false;
     void bindDevice() {
         int device = 0;
         check(cudaGetDevice(&device));
         require(device_ < 0 || device == device_, "GGUF backend used on a different device");
         if (device_ < 0) {
             validateGgufDevice(device);
+            cudaDeviceProp prop{};
+            check(cudaGetDeviceProperties(&prop, device));
             device_ = device;
+            major_ = prop.major;
         }
     }
     Weight &get(const std::string &name) {
@@ -178,8 +182,12 @@ class GgufWeights final : public QuantizedWeights {
             workspace_ = Tensor(1, (4 << 20) / 2);
             check(cublasSetWorkspace(handle_, workspace_.data, workspace_.bytes()));
         }
-        // Keep the decode buffer bounded for all model widths.
-        constexpr int chunk = 2048;
+        // Keep the decode buffer bounded, and avoid tiny GEMMs for Qwen's
+        // middle-sized batches. H3 retains its existing 2048-row schedule.
+        int chunk = 2048;
+        if (major_ == 12 && !prefill_ && x.rows > 512 && x.rows <= 1024 &&
+            w.rows == 4096 && w.cols == 4096)
+            chunk = 4096;
         for (int row = 0; row < w.rows; row += chunk) {
             const int n = std::min(chunk, w.rows - row);
             Tensor decoded(n, w.cols);
@@ -209,6 +217,7 @@ class GgufWeights final : public QuantizedWeights {
         if(options_.comfyVideo) checkpoint_.validateVideoModel();
         else checkpoint_.validateModel();
     }
+    void setPrefill(bool prefill) override { prefill_ = prefill; }
     Tensor linear(const Tensor &x, const std::string &name, Tensor *destination) override {
         bindDevice();
         auto &w = get(name);
@@ -219,7 +228,7 @@ class GgufWeights final : public QuantizedWeights {
                     out.storage != x.storage && out.storage != w.packed.storage,
                 "GGUF output shape/alias");
 #ifdef FASTLLM_IMAGE_GGUF_MMQ
-        if (ggufMmq(x, w.packed, out, w.type))
+        if ((!prefill_ || x.rows <= 512) && ggufMmq(x, w.packed, out, w.type))
             return out;
 #endif
         decodedLinear(x, w, out, 0);
@@ -248,11 +257,17 @@ class GgufWeights final : public QuantizedWeights {
         for (const auto &name : names) {
             const auto &w = get(name);
             require(out.storage != w.packed.storage, "GGUF packed output/weight alias");
-            Tensor part(x.rows, w.rows, out.dtype);
-            linear(x, name, &part);
-            check(cudaMemcpy2DAsync(reinterpret_cast<char *>(out.data) + size_t(offset)*element,
-                size_t(columns)*element, part.data, size_t(part.cols)*element,
-                size_t(part.cols)*element, x.rows, cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+            // Q/K/V with more than 512 tokens use decoded GEMM. Write to
+            // their final columns directly instead of staging and copying.
+            if (!prefill_ && x.rows > 512 && w.rows == 4096 && w.cols == 4096) {
+                decodedLinear(x, w, out, offset);
+            } else {
+                Tensor part(x.rows, w.rows, out.dtype);
+                linear(x, name, &part);
+                check(cudaMemcpy2DAsync(reinterpret_cast<char *>(out.data) + size_t(offset)*element,
+                    size_t(columns)*element, part.data, size_t(part.cols)*element,
+                    size_t(part.cols)*element, x.rows, cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+            }
             offset += w.rows;
         }
         return out;

@@ -38,7 +38,7 @@ FP8 需要支持 FP8 Tensor Core 的 SM89+ GPU；SM120 使用复用自 H3 的 CU
 与 FP8 一样创建独立模型目录，保留原 BF16 的 `transformer/config.json`、文本/视觉编码器、VAE、processor、scheduler 和 `model_index.json`。INT8 文件放置或软链接为 `transformer/diffusion_pytorch_model.safetensors`；GGUF 文件直接放在 `transformer/`，该目录只保留一个 GGUF 文件，不放另一份 safetensors DiT。`--model` 仍选择模型根目录，API 和工作室不增加量化参数，原 BF16 / FP8 目录无需更改。
 
 - INT8 由 I8 payload、逐输出行 F32 scale 和 `comfy_quant` 的 H256 ConvRot 标记识别。原生 CUDA 旋转与动态逐行量化激活，执行 W8A8 整数 GEMM，输出 BF16；直接支持发布权重的合并 `gate_up`。要求 SM80+；未接入无旋转、非对称、分组 scale 或 INT8 文本编码器。
-- GGUF 按文件魔数和张量块类型读取，支持 F32/F16/BF16、Q4_0、Q8_0、Q2_K、Q3_K、Q4_K、Q5_K、Q6_K，允许同一层混合位宽。兼容无前缀和 `model.diffusion_model.` 前缀、合并或分开的 gate/up。要求 SM80+。小 token GEMM 复用 H3 的 MMQ；大 token 或不适用的形状使用有界 CUDA 解量化与 BF16 GEMM，权重始终以原块格式保存，不做二次量化。默认 MMQ 自动范围为 8..512 个 token；更大尺寸使用有界解量化回退，无需开关。
+- GGUF 按文件魔数和张量块类型读取，支持 F32/F16/BF16、Q4_0、Q8_0、Q2_K、Q3_K、Q4_K、Q5_K、Q6_K，允许同一层混合位宽。兼容无前缀和 `model.diffusion_model.` 前缀、合并或分开的 gate/up。要求 SM80+。小 token GEMM 复用 H3 的 MMQ；大 token 或不适用的形状使用有界 CUDA 解量化与 BF16 GEMM，权重始终以原块格式保存，不做二次量化。默认 MMQ 自动范围为 8..512 个 token；SM120 上 Q4_K 的 4096→24576 合并 gate/up 投影在缓存后的去噪阶段扩展到 1024 token，使 512² 编辑的主干也使用 MMQ；该扩展路径直接写 BF16/FP32 输出并使用经相对 L2 验证的 FMA 累加，避免大块 FP32 暂存。回退 GEMM 按形状调整分块，大 token QKV 直接写最终列区间。前缀构建保留原调度以避免误差累积，更大尺寸保留实测更快的回退路径，无需开关；范围与测速见验证记录。
 - 两种格式均计入常驻显存统计，支持阶段卸载、取消清理及恢复；不要求安装 Torch、GGUF Python 包或额外转换工具。Python 参考仅供开发验证。
 
 量化质量与实现误差的实测范围见 [验证记录](VALIDATION.md)；量化文件更小不保证更快。尚未接入 Qwen 多卡。

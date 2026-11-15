@@ -84,6 +84,61 @@ void ggufFixture(const fs::path &path, int cols = 256, int outputs = 32) {
     header.resize((header.size()+31)/32*32);
     std::ofstream f(path,std::ios::binary);f.write(header.data(),header.size());f.write(payload.data(),payload.size());
 }
+#ifdef FASTLLM_IMAGE_GGUF_MMQ
+void wideMmq(Runtime &rt, int major, const fs::path &path) {
+    // Q4_K blocks decode to one. Exercise the real gate/up dimensions and
+    // former FP32 staging boundary and direct-output tile tails, with views.
+    constexpr int cols = 4096, outputs = 24576, blockBytes = 144;
+    std::vector<uint8_t> blocks(size_t(outputs)*cols/256*blockBytes);
+    for (size_t i = 0; i < blocks.size(); i += blockBytes) {
+        blocks[i+1] = 0x3c; // FP16 d = 1, dmin = 0
+        for (int j = 0; j < 4; ++j) blocks[i+4+j] = blocks[i+12+j] = 1;
+        std::fill(blocks.begin()+i+16, blocks.begin()+i+blockBytes, uint8_t(0x11));
+    }
+    Tensor packed(outputs, cols/256*blockBytes/2);
+    require(cudaMemcpy(packed.data, blocks.data(), blocks.size(), cudaMemcpyHostToDevice) == cudaSuccess,
+            "wide GGUF upload");
+    for (int rows : {513, 641, 1024, 1025}) for (auto dtype : {DType::BF16, DType::FP32}) {
+        std::vector<float> values(size_t(rows)*cols, 1);
+        auto input = rt.upload(values.data(), rows, cols);
+        auto storage = rt.cast(rt.upload(std::vector<float>(size_t(rows+2)*outputs, -123).data(),
+                                        rows+2, outputs), dtype);
+        auto out = storage.rowSlice(1, rows);
+        const bool used = backend::ggufMmq(input, packed, out, 12);
+        require(used == (major == 12 && rows <= 1024), "wide GGUF MMQ dispatch");
+        auto actual = rt.download(storage);
+        for (size_t i = 0; i < actual.size(); ++i) {
+            const bool interior = used && i >= outputs && i < size_t(rows+1)*outputs;
+            // The Q8 activation scale is FP16, then the GEMM accumulates FP32.
+            const float expected = interior ? (dtype == DType::FP32 ? 4095.75f : 4096.f) : -123.f;
+            require(actual[i] == expected, "wide GGUF chunk/tail/output guard");
+        }
+    }
+    // Conditioning must keep the original BF16 fallback; its output is
+    // reused throughout denoising. FP32 output exposes the Q8 rounding here.
+    std::ofstream file(path, std::ios::binary);
+    auto number = [&](uint64_t v, int bytes) { for (int i=0; i<bytes; ++i) file.put(char(v>>(8*i))); };
+    number(0x46554747,4); number(3,4); number(1,8); number(0,8);
+    const std::string name = "gate_up.weight";
+    number(name.size(),8); file << name; number(2,4);
+    number(cols,8); number(outputs,8); number(12,4); number(0,8);
+    const auto position = file.tellp();
+    require(position >= 0, "wide GGUF header write");
+    for (size_t padding = (32-size_t(position)%32)%32; padding; --padding) file.put(0);
+    file.write(reinterpret_cast<const char *>(blocks.data()),blocks.size()); file.close();
+    require(bool(file), "wide GGUF fixture write");
+    auto weights = backend::loadGguf(path.string(), {});
+    auto input = rt.upload(std::vector<float>(size_t(641)*cols, 1).data(), 641, cols);
+    Tensor output(641, outputs, DType::FP32);
+    for (bool prefill : {true, false, true}) {
+        weights->setPrefill(prefill);
+        weights->linearPacked(input, {"gate_up"}, &output);
+        const float expected = !prefill && major == 12 ? 4095.75f : 4096.f;
+        for (float v : rt.download(output))
+            require(v == expected, "GGUF prefill/denoising dispatch reset");
+    }
+}
+#endif
 }
 int main() {
     int count=0;cudaDeviceProp prop{};
@@ -161,6 +216,9 @@ int main() {
             }
         }
         projections->clear(); require(projections->loadedBytes()==0, "GGUF direct QKV release");
+#ifdef FASTLLM_IMAGE_GGUF_MMQ
+        wideMmq(rt, prop.major, root/"wide.gguf");
+#endif
         fs::remove_all(root);std::cout<<"PASS Qwen INT8/ mixed GGUF packing, widths, tails, destinations, release and malformed metadata\n";
     } catch(const std::exception &e) {fs::remove_all(root);std::cerr<<e.what()<<'\n';return 1;}
 }
