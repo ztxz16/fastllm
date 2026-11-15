@@ -346,6 +346,7 @@ void FastllmCudaClearBigBufferCurrentDevice();
 void FastllmCudaClearBigBufferAll();
 #ifdef __CUDACC__
 cudaError_t FastllmCudaCheckedMalloc(void **ret, size_t size, const char *file, int line);
+cudaError_t FastllmCudaCheckedFree(void *ret);
 #endif
 enum FastllmCudaTryMallocResult {
     FASTLLM_CUDA_TRY_MALLOC_SUCCESS = 0,
@@ -2911,6 +2912,7 @@ extern __global__ void FastllmCudaBiasKernel(__nv_bfloat16* a, __nv_bfloat16* bi
 
 #ifndef FASTLLM_CUDA_NO_MALLOC_CHECK_MACRO
 #define cudaMalloc(ptr, size) FastllmCudaCheckedMalloc((void **)(ptr), (size), __FILE__, __LINE__)
+#define cudaFree(ptr) FastllmCudaCheckedFree((void *)(ptr))
 #endif
 #endif
 
