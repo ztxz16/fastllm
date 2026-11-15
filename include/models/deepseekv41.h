@@ -145,6 +145,8 @@ namespace fastllm {
     struct DeepSeekV41EngramPrefetch;
 
     struct DeepSeekV41RequestState {
+        // Released after layer views; the lease owns a bounded serving KV slot.
+        std::shared_ptr<void> storageLease;
         // MLA state is replicated only inside this request's attention TP group.
         int attentionGroup = -1;
         std::vector<std::shared_ptr<DeepSeekV41RequestState>> attentionRanks;
@@ -315,6 +317,7 @@ namespace fastllm {
         void OnResponseContextRemoved(ResponseContext *context) override;
         void OnResponseContextFinished(ResponseContext *context) override;
         bool PopPendingResponseToken(ResponseContext *context, int previousToken, int &token) override;
+        bool TryAdmitResponseContext(ResponseContext *context) override;
         bool UseGenericHistoryCache() const override { return false; }
         bool UseModelSpecificScheduler() const override { return false; }
 
@@ -322,6 +325,13 @@ namespace fastllm {
         bool UseGpuToolCallConstraints() const override { return executionMode == ExecutionMode::Gpu; }
 
     protected:
+        void PrepareServingMemory();
+        bool HasFreeRequestStorage() const;
+        std::shared_ptr<void> ReserveRequestStorage();
+        void PrepareRequestStorage(const std::shared_ptr<DeepSeekV41RequestState> &state,
+                                   std::shared_ptr<void> reservation = {});
+        std::shared_ptr<void> v41RequestStorage;
+        std::vector<std::shared_ptr<void>> v41ServingReservations;
         struct AttentionParallel;
         struct AttentionParallelFrame;
         std::shared_ptr<AttentionParallel> v41AttentionParallel;

@@ -39,6 +39,7 @@ namespace fastllm {
     DeepSeekV41DecodeWorkspace::~DeepSeekV41DecodeWorkspace() = default;
 
     void DeepSeekV41Model::OnAutoWarmupFinished() {
+        if (!std::uncaught_exceptions()) PrepareServingMemory();
         if (executionMode != ExecutionMode::Hybrid || std::uncaught_exceptions() ||
             !GetMoeCpuCacheBytes()) return;
         // Wait until temporary warmup tensors have been released before

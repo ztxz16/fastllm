@@ -607,6 +607,10 @@ namespace fastllm {
         // another request. Output queues remain available to slow consumers.
         virtual void OnResponseContextFinished(ResponseContext *context) {}
 
+        // Called by the scheduler before consuming a selected prompt. Models
+        // with fixed request storage reserve it here; false leaves work queued.
+        virtual bool TryAdmitResponseContext(ResponseContext *context) { return true; }
+
         virtual bool UseGenericHistoryCache() const { return true; }
 
         virtual std::string MakeInput(const std::string &history, int round, const std::string &input) = 0; // 根据历史信息和当前输入生成prompt

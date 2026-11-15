@@ -17,6 +17,7 @@
  */
 
 #include "fastllm-cuda.cuh"
+#include "devices/cuda/fastllm-prefill-workspace.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -3806,6 +3807,35 @@ static bool RunMarlinMoe(const fastllm::Data &input, fastllm::Data &w1,
     if (rows <= 0 || (size_t)rows * cache->hidden != input.Count(0)) {
         return false;
     }
+    struct PrefillScratch {
+        void *storage = nullptr;
+        size_t capacity = 0;
+        int device = -1;
+        fastllm::Data quantizedInput;
+        ~PrefillScratch() {
+            if (storage || quantizedInput.cudaData) {
+                int previous = FastllmCudaGetDevice();
+                FastllmCudaSetDevice(device);
+                FastllmCudaSyncCurrentThreadStream();
+                if (storage) FastllmCudaFree(storage);
+                quantizedInput.FreeSpace();
+                FastllmCudaSetDevice(previous);
+            }
+        }
+    };
+    // Every invocation on this worker uses the same per-thread CUDA stream.
+    // Reuse bounded scratch in stream order across layers. This avoids repeated
+    // allocation/event bookkeeping and the synchronous release fallback when
+    // the general allocator supplies storage that cannot be deferred.
+    static thread_local std::map<int, std::unique_ptr<PrefillScratch>> prefillScratchByDevice;
+    auto prefillScratch = [&]() -> PrefillScratch & {
+        auto &scratch = prefillScratchByDevice[cache->device];
+        if (!scratch) {
+            scratch = std::make_unique<PrefillScratch>();
+            scratch->device = cache->device;
+        }
+        return *scratch;
+    };
     const fastllm::Data *gemmInput = &input;
     // Reuse is optional; incompatible metadata must retain ordinary quantization.
     // The producer keeps the original BF16 tensor for Router and fallback paths.
@@ -3820,7 +3850,15 @@ static bool RunMarlinMoe(const fastllm::Data &input, fastllm::Data &w1,
         int bucket = 1;
         while (bucket < rows && bucket < MarlinLayerCache::kV41BatchRows) bucket *= 2;
         const bool decodeBuffer = rows <= MarlinLayerCache::kV41BatchRows;
-        fastllm::Data &quantized = decodeBuffer ? cache->decodeQuantizedInputs[bucket] : cache->quantizedInput;
+        // Prefill layers execute in order on this worker's stream. Keeping a
+        // full-batch activation per layer pins O(layers * rows * hidden) bytes
+        // and fragments the serving arena. Reuse one buffer per worker/device;
+        // graph-owned decode buckets retain their stable per-layer addresses.
+        const bool sharedPrefill = !decodeBuffer && !FastllmCudaGraphIsCapturingFast();
+        fastllm::Data &quantized = decodeBuffer ? cache->decodeQuantizedInputs[bucket] :
+            sharedPrefill ? prefillScratch().quantizedInput : cache->quantizedInput;
+        if (sharedPrefill && quantized.cudaData && quantized.expansionSize < input.Count(0))
+            fastllm::ReleasePrefillTemporary(quantized);
         quantized.dataType = input.dataType;
         quantized.Resize(decodeBuffer ? std::vector<int>{bucket, cache->hidden} : input.dims);
         quantized.ToDevice(fastllm::DataDevice::CUDA, input.dataDeviceIds, false);
@@ -3838,25 +3876,6 @@ static bool RunMarlinMoe(const fastllm::Data &input, fastllm::Data &w1,
     auto *expertIds = cache->expertIds;
     void *gateOutput = cache->gateOutput, *downOutput = cache->downOutput;
     float *temporaryOutput = cache->temporaryOutput;
-    struct PrefillScratch {
-        void *storage = nullptr;
-        size_t capacity = 0;
-        int device = -1;
-        ~PrefillScratch() {
-            if (storage) {
-                int previous = FastllmCudaGetDevice();
-                FastllmCudaSetDevice(device);
-                FastllmCudaSyncCurrentThreadStream();
-                FastllmCudaFree(storage);
-                FastllmCudaSetDevice(previous);
-            }
-        }
-    };
-    // Every invocation on this worker uses the same per-thread CUDA stream.
-    // Reuse bounded scratch in stream order across layers. This avoids repeated
-    // allocation/event bookkeeping and the synchronous release fallback when
-    // the general allocator supplies storage that cannot be deferred.
-    static thread_local std::map<int, std::unique_ptr<PrefillScratch>> prefillScratchByDevice;
     if (deepSeekV41 && rows >= 512 && !FastllmCudaGraphIsCapturingFast() &&
         PrepareMarlinMoePrefillKernel(cache->device)) {
         const int candidateRows = std::min(rows, 2048);
@@ -3870,11 +3889,7 @@ static bool RunMarlinMoe(const fastllm::Data &input, fastllm::Data &w1,
         const size_t temporaryBytes = align((size_t)cache->sms * 4 * 32 * 256 * 2 * sizeof(float));
         const size_t bytes = sortedBytes + expertBytes + gateBytes + downBytes + temporaryBytes;
         if (bytes <= (size_t)512 * 1024 * 1024) {
-            auto &scratch = prefillScratchByDevice[cache->device];
-            if (!scratch) {
-                scratch = std::make_unique<PrefillScratch>();
-                scratch->device = cache->device;
-            }
+            auto *scratch = &prefillScratch();
             if (scratch->capacity < bytes) {
                 size_t freeMemory = 0, totalMemory = 0;
                 void *replacement = nullptr;

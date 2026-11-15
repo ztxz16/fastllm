@@ -2556,6 +2556,7 @@ namespace fastllm {
                                 continue;
                             }
                         }
+                        if (!model->TryAdmitResponseContext(ctx)) continue;
                         prefillTokenCount += thisLen;
                         curBusyPages += thisPages;
                         pendingNewPages += thisPages;
@@ -3531,6 +3532,7 @@ namespace fastllm {
                         }
 
                         if (trace) trace->Mark("prefix_restore_plan_ms");
+                        bool requestStorageBlocked = false;
                         for (int isPrompt = 1; isPrompt >= 0; isPrompt--) {
                             int cnt = 0;
                             if (isPrompt && deferPrefill) continue; // Keep decoding while collecting prompts.
@@ -3647,6 +3649,10 @@ namespace fastllm {
                                     }
                                 } else {
                                     if (!batchPrefill && it.second->currentTokens.size() * 2 < currentMaxLen) {
+                                        continue;
+                                    }
+                                    if (!model->TryAdmitResponseContext(it.second)) {
+                                        requestStorageBlocked = true;
                                         continue;
                                     }
                                     currentMaxLen = std::max(currentMaxLen, (int)it.second->currentTokens.size());
@@ -4010,6 +4016,13 @@ namespace fastllm {
                             postRegion.Stop();
                             if (trace) trace->Mark("postprocess_ms");
                         } else {
+                            if (requestStorageBlocked) {
+                                // A retained slot may be released by an output
+                                // consumer or another owner. Retry without
+                                // terminating an unrelated active request.
+                                model->dictCV.wait_for(dictLocker, std::chrono::milliseconds(10));
+                                continue;
+                            }
                             // Finished requests keep their pages until the
                             // caller drains their output and removes them.
                             // Wait for that release instead of terminating a

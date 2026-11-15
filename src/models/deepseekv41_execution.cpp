@@ -123,6 +123,18 @@ namespace fastllm {
             void V41Assign(Data &dst, const Data &src, const std::vector<int> &tpDevices) {
                 if (&dst == &src) return;
     #ifdef USE_CUDA
+                if (dst.isFake && dst.isKVCache && dst.dataDevice == DataDevice::CUDA &&
+                    !dst.multiDeviceData && !src.multiDeviceData) {
+                    AssertInFastLLM(dst.dataType == src.dataType && src.GetBytes() <= dst.expansionBytes,
+                        "DeepSeekV41 reserved tensor capacity/type mismatch");
+                    dst.Resize(src.dims);
+                    if (src.GetBytes()) {
+                        if (src.dataDevice == DataDevice::CPU)
+                            FastllmCudaCopyFromHostToDevice(dst.cudaData, src.cpuData, src.GetBytes());
+                        else FastllmCudaCopyFromDeviceToDevice(dst.cudaData, src.cudaData, src.GetBytes());
+                    }
+                    return;
+                }
                 if (!tpDevices.empty() && src.multiDeviceData && src.IsTensorParallelReplicated()) {
                     V41CopyTensor(dst, src, tpDevices);
                     return;
