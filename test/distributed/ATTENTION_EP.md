@@ -325,7 +325,9 @@ HF轨迹直接来自上一轮完整HF前向的hook记录，并检查Token历史�
 原生会话退出后，只读取最终Norm和LM Head权重，在参考环境进行独立输出头重放：
 
 - HF全行输出头必须精确复现已保存HF logits，避免把错误参考用于归因。
-- 原生GemmEx/FP32输出头重放必须精确复现实际原生logits。
+- 原生GemmEx/FP32输出头重放必须精确复现正式logits的JSON传输值。正式通道使用
+  json11的`%.12f`，只对重放值使用同样编码再零容差比较，保留编码前误差。还要求
+  相邻FP32数值编码后可区分；接近零导致编码歧义时门禁仍失败，不据此作精确归因。
 - 同一原生末层输入比较实际Norm和HF Norm；同一Norm输出比较两种输出头。
 - 单独比较HF全Token矩阵与最后一行矩阵，保留GEMM形状差异。
 
@@ -334,6 +336,24 @@ HF轨迹直接来自上一轮完整HF前向的hook记录，并检查Token历史�
 结果保留原始FP16二进制、描述与SHA-256、完整logits、输出头候选、构建缓存和
 二进制哈希，汇总生成JSON/Markdown/CSV/XLSX；每次使用新目录。保留原失败或任一
 精确门禁失败时返回非零，不能用本诊断的局部PASS宣布完整模型通过。
+
+已有完整轨迹和`head-replay.json`时，可以只读复核，**无需重新编译或运行GPU**：
+
+```bash
+/venv/main/bin/python3 test/distributed/recheck_qwen_moe_forward_precision.py \
+  --probe test/distributed/results/20261115T132323Z_forward_probe_c0356506
+```
+
+原诊断目录及其引用的历史参考目录必须仍在。复核校验FP16轨迹哈希、输入历史、
+HF边界连续性、输出头元数据，并要求除修正的传输门禁外，重新计算的指标与原报告
+一致。任一不一致或资料缺失都停止归因并输出失败报告；不会把缺失数据当成PASS。
+结果写入新的`*_forward_recheck_*`目录，原始报告和日志保持原样。复核报告中
+`command/git/gpu`等字段保留原采集信息，`recheck_command/recheck_git`记录本轮CPU分析。
+
+主报告仍保留真实模型的超差；`tokens/summary.{json,md,csv,xlsx}`额外记录每层每个
+Token的累积误差，终端列出每个Token首次超出原阈值的位置，层号和Token位置从0开始。
+`native_head_reproduces_traced_logits.raw_numeric_comparison`保留未编码误差和精确差异数。
+仅输出头门禁恢复PASS不代表完整模型通过；只要原数值失败仍存在，复核就返回非零。
 
 ## 启动阶段异常的定向复现
 
