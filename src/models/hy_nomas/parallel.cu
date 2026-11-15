@@ -25,6 +25,22 @@ void check(ncclResult_t s) {
 ncclDataType_t type(DType t) {
     return t==DType::FP32?ncclFloat32:t==DType::FP16?ncclFloat16:ncclBfloat16;
 }
+// Each rank reads both BF16 shards once. Out-of-place output keeps peer reads
+// independent; the caller waits for both readers before retiring the inputs.
+__global__ void sumBf16Peers(const uint4 *a,const uint4 *b,uint4 *output,size_t count) {
+    union Pack {uint4 bits;__nv_bfloat162 values[4];};
+    for(size_t j=size_t(blockIdx.x)*blockDim.x+threadIdx.x;j<count;j+=size_t(blockDim.x)*gridDim.x) {
+        Pack x,y,z;x.bits=a[j];y.bits=b[j];
+#pragma unroll
+        for(int k=0;k<4;++k)z.values[k]=__hadd2(x.values[k],y.values[k]);
+        output[j]=z.bits;
+    }
+}
+__global__ void sumBf16PeerElements(const __nv_bfloat16 *a,const __nv_bfloat16 *b,
+                                  __nv_bfloat16 *output,size_t count) {
+    for(size_t j=size_t(blockIdx.x)*blockDim.x+threadIdx.x;j<count;j+=size_t(blockDim.x)*gridDim.x)
+        output[j]=__hadd(a[j],b[j]);
+}
 template<class T> __global__ void gatherLayout(const T *input,T *output,size_t n,int rows,int cols,int ranks,int groups) {
     for(size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;i<n;i+=size_t(blockDim.x)*gridDim.x) {
         size_t row=i/(cols*ranks),col=i%(cols*ranks);
@@ -41,13 +57,39 @@ template<class T> __global__ void finishShard(const float *input, const float *b
         output[j]=T(x);
     }
 }
+__device__ __forceinline__ float scaledInt32(int32_t value,float activationScale,float weightScale) {
+    return __fmul_rn(__fmul_rn(float(value),activationScale),weightScale);
+}
 template<class Output>
 __global__ void scaleShard(const int32_t *input,const float *xs,const float *ws,Output *output,
                           size_t n,size_t offset,int cols) {
     for(size_t j=size_t(blockIdx.x)*blockDim.x+threadIdx.x;j<n;j+=size_t(blockDim.x)*gridDim.x) {
         const size_t index=offset+j;
-        const float x=xs[index/cols],w=ws[index%cols],value=float(input[j]);
-        output[j]=Output(__fmul_rn(__fmul_rn(value,x),w));
+        output[j]=Output(scaledInt32(input[j],xs[index/cols],ws[index%cols]));
+    }
+}
+template<class Output>
+__global__ void sumScaledInt32Peers(const int32_t *a,const int32_t *b,const float *xs,const float *ws,
+                                   Output *output,size_t count,size_t offset,int cols) {
+    for(size_t j=size_t(blockIdx.x)*blockDim.x+threadIdx.x;j<count;j+=size_t(blockDim.x)*gridDim.x) {
+        const size_t index=offset+j;
+        // Sum integers before converting: FP32 partials can lose cancellation bits.
+        output[index]=Output(scaledInt32(a[index]+b[index],xs[index/cols],ws[index%cols]));
+    }
+}
+template<class Output>
+__global__ void sumScaledInt32PeerVectors(const int4 *a,const int4 *b,const float *xs,const float4 *ws,
+                                         Output *output,size_t count,size_t offset,int cols) {
+    struct alignas(sizeof(Output)*4) Pack {Output values[4];};
+    for(size_t j=size_t(blockIdx.x)*blockDim.x+threadIdx.x;j<count;j+=size_t(blockDim.x)*gridDim.x) {
+        const size_t index=offset+j;
+        const int4 x=a[index],y=b[index];const float4 w=ws[index%cols];
+        const float scale=xs[index/cols];Pack result;
+        result.values[0]=Output(scaledInt32(x.x+y.x,scale,w.x));
+        result.values[1]=Output(scaledInt32(x.y+y.y,scale,w.y));
+        result.values[2]=Output(scaledInt32(x.z+y.z,scale,w.z));
+        result.values[3]=Output(scaledInt32(x.w+y.w,scale,w.w));
+        reinterpret_cast<Pack *>(output)[index]=result;
     }
 }
 void castScaledInt32(const Tensor &input,const Tensor &xs,const Tensor &ws,Tensor &output,
@@ -89,6 +131,8 @@ struct ParallelGroup::Impl {
     std::vector<Communication> communication;
     std::vector<Tensor> peerInputs;
     std::vector<std::vector<cudaEvent_t>> chunkDone;
+    struct PeerReduction {cudaEvent_t ready=nullptr,done=nullptr;};
+    std::vector<PeerReduction> peerReduction;
     bool peerAvailable = false;
     Communication &beginCommunication(int rank) {
         auto &c=communication[rank];
@@ -112,7 +156,7 @@ struct ParallelGroup::Impl {
         auto sorted=d; std::sort(sorted.begin(),sorted.end());
         if(sorted.front()<0 || sorted.back()>=count || std::adjacent_find(sorted.begin(),sorted.end())!=sorted.end())
             throw std::invalid_argument("tensor-parallel devices must be distinct visible CUDA indices");
-        peerInputs.resize(d.size()); chunkDone.resize(d.size());
+        peerInputs.resize(d.size()); chunkDone.resize(d.size());peerReduction.resize(d.size());
         peerAvailable = d.size() > 1;
         for (int from : d) for (int to : d) if (from != to) {
             int access = 0; check(cudaDeviceCanAccessPeer(&access, from, to));
@@ -176,12 +220,31 @@ struct ParallelGroup::Impl {
             if(c.ready) cudaEventDestroy(c.ready);
             if(c.done) cudaEventDestroy(c.done);
             for(auto event:chunkDone[rank]) cudaEventDestroy(event);
+            if(peerReduction[rank].ready) cudaEventDestroy(peerReduction[rank].ready);
+            if(peerReduction[rank].done) cudaEventDestroy(peerReduction[rank].done);
         }
     }
     void boundary(int rank,NcclSubmitRendezvous::Phase phase,const Tensor &x,int operation) {
         if(x.size()>INT_MAX) throw std::invalid_argument("tensor-parallel tensor too large");
         if(!rendezvous->Wait(rank,phase,int(x.size()),operation*16+int(type(x.dtype))))
             throw std::runtime_error(rendezvous->Error());
+    }
+    void beginPeer(const Tensor &x,int rank,int operation) {
+        enableTensorPeerAccess(x,devices);
+        auto &events=peerReduction[rank];
+        if(!events.ready)check(cudaEventCreateWithFlags(&events.ready,cudaEventDisableTiming));
+        if(!events.done)check(cudaEventCreateWithFlags(&events.done,cudaEventDisableTiming));
+        peerInputs[rank]=x;
+        check(cudaEventRecord(events.ready,cudaStreamPerThread));
+        boundary(rank,NcclSubmitRendezvous::Before,x,operation);
+        check(cudaStreamWaitEvent(cudaStreamPerThread,peerReduction[1-rank].ready,0));
+    }
+    void endPeer(const Tensor &x,int rank,int operation) {
+        check(cudaEventRecord(peerReduction[rank].done,cudaStreamPerThread));
+        boundary(rank,NcclSubmitRendezvous::After,x,operation);
+        // Both readers must finish before either input can return to its pool.
+        check(cudaStreamWaitEvent(cudaStreamPerThread,peerReduction[1-rank].done,0));
+        peerInputs[rank]={};
     }
 };
 ParallelGroup::ParallelGroup(const std::vector<int> &d):impl_(new Impl(d)) {}
@@ -236,6 +299,29 @@ void ParallelGroup::sum(Tensor &x,int rank) {
     check(ncclAllReduce(x.data,x.data,x.size(),type(x.dtype),ncclSum,i.comms[rank],cudaStreamPerThread));
     i.boundary(rank,NcclSubmitRendezvous::After,x,1);
 }
+Tensor ParallelGroup::sumActivation(Tensor x,int rank) {
+    auto &i=*impl_;
+    if(size()==2 && i.peerAvailable && x.dtype==DType::BF16 && x.bytes()>0 && x.bytes()<=(8u<<20)) {
+        Tensor result(x.rows,x.cols,x.dtype);
+        i.beginPeer(x,rank,17);
+        const auto *a=i.peerInputs[0].data,*b=i.peerInputs[1].data;
+        if(x.bytes()%16==0 && reinterpret_cast<uintptr_t>(a)%16==0 && reinterpret_cast<uintptr_t>(b)%16==0) {
+            const size_t count=x.bytes()/16;
+            const int blocks=std::min<size_t>((count+511)/512,36);
+            sumBf16Peers<<<blocks,512,0,cudaStreamPerThread>>>(
+                (const uint4 *)a,(const uint4 *)b,(uint4 *)result.data,count);
+        } else {
+            const int blocks=std::min<size_t>((x.size()+511)/512,36);
+            sumBf16PeerElements<<<blocks,512,0,cudaStreamPerThread>>>(
+                (const __nv_bfloat16 *)a,(const __nv_bfloat16 *)b,(__nv_bfloat16 *)result.data,x.size());
+        }
+        check(cudaGetLastError());
+        i.endPeer(x,rank,17);
+        return result;
+    }
+    sum(x,rank);
+    return x;
+}
 void ParallelGroup::maximum(Tensor &x,int rank) {
     auto &i=*impl_;
     if(size()==1) return;
@@ -284,12 +370,47 @@ void ParallelGroup::sumScaledInt32(const Tensor &partial,const Tensor &xs,const 
        partial.rows!=output.rows || partial.cols!=output.cols || partial.storage==output.storage ||
        xs.storage==output.storage || ws.storage==output.storage)
         throw std::invalid_argument("invalid scaled parallel reduction");
+    auto &i=*impl_;
+    if(size()==2 && i.peerAvailable && partial.size()>0) {
+        // Small outputs need one fused peer pass. Large outputs sum disjoint
+        // integer halves, then exchange rounded halves to reduce PCIe traffic.
+        const bool split=partial.bytes()>=(1u<<20) && partial.size()%2==0 && !output.isFloat32();
+        const size_t count=split?partial.size()/2:partial.size(),offset=split?size_t(rank)*count:0;
+        i.beginPeer(partial,rank,18);
+        const auto *a=i.peerInputs[0].data,*b=i.peerInputs[1].data;
+        const bool vectorized=partial.cols%4==0 && count%4==0 && offset%4==0 &&
+            reinterpret_cast<uintptr_t>(a)%16==0 && reinterpret_cast<uintptr_t>(b)%16==0 &&
+            reinterpret_cast<uintptr_t>(ws.data)%16==0 && reinterpret_cast<uintptr_t>(output.data)%16==0;
+        const int blocks=std::min<size_t>(((vectorized?count/4:count)+511)/512,36);
+        auto launch=[&](auto *destination) {
+            if(vectorized)
+                sumScaledInt32PeerVectors<<<blocks,512,0,cudaStreamPerThread>>>(
+                    (const int4 *)a,(const int4 *)b,(const float *)xs.data,(const float4 *)ws.data,
+                    destination,count/4,offset/4,partial.cols/4);
+            else
+                sumScaledInt32Peers<<<blocks,512,0,cudaStreamPerThread>>>(
+                    (const int32_t *)a,(const int32_t *)b,(const float *)xs.data,(const float *)ws.data,
+                    destination,count,offset,partial.cols);
+        };
+        if(output.dtype==DType::BF16)launch((__nv_bfloat16 *)output.data);
+        else if(output.dtype==DType::FP16)launch((__half *)output.data);
+        else launch((float *)output.data);
+        check(cudaGetLastError());
+        i.endPeer(partial,rank,18);
+        if(split) {
+            i.beginPeer(output,rank,19);
+            const size_t bytes=output.bytes()/2,peerOffset=size_t(1-rank)*bytes;
+            check(cudaMemcpyPeerAsync((uint8_t *)output.data+peerOffset,i.devices[rank],
+                (const uint8_t *)i.peerInputs[1-rank].data+peerOffset,i.devices[1-rank],bytes,cudaStreamPerThread));
+            i.endPeer(output,rank,19);
+        }
+        return;
+    }
     const bool scatter=size()>1 && !output.isFloat32() && partial.bytes()>=(1u<<20) && partial.size()%size()==0;
     const size_t count=scatter?partial.size()/size():partial.size();
     if(count>INT_MAX)throw std::invalid_argument("scaled parallel reduction too large");
     Tensor reduced=scatter?Tensor(1,int(count),DType::FP32):partial;
     Tensor rounded=scatter?Tensor(1,int(count),output.dtype):output;
-    auto &i=*impl_;
     const int operation=scatter?13:12;
     i.boundary(rank,NcclSubmitRendezvous::Before,partial,operation);
     if(scatter)check(ncclReduceScatter(partial.data,reduced.data,count,ncclInt32,ncclSum,i.comms[rank],cudaStreamPerThread));
@@ -475,6 +596,7 @@ Tensor ParallelGroup::broadcast(const Tensor &x,int) { return x; }
 Tensor ParallelGroup::gatherColumns(const Tensor &x,int,int,bool) { return x; }
 void ParallelGroup::sum(Tensor &,int) {}
 void ParallelGroup::maximum(Tensor &,int) {}
+Tensor ParallelGroup::sumActivation(Tensor x,int) {return x;}
 void ParallelGroup::sumScaledInt32(const Tensor &,const Tensor &,const Tensor &,Tensor &,int) {
     throw std::runtime_error("scaled parallel reduction requires NCCL");
 }

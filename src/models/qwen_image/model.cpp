@@ -134,8 +134,17 @@ Tensor DiT::linear(const Tensor &x, const std::string &prefix, Tensor *output) {
 }
 Tensor DiT::rowLinear(const Tensor &x, const std::string &prefix) {
     if (parallel_.size() == 1) return linear(x, prefix);
-    if (!quantized_ || !quantized_->contains(prefix))
+    if (!quantized_ || !quantized_->contains(prefix)) {
+        if (!x.isFloat32()) {
+            // Keep FP32 GEMM accumulation, then communicate BF16 partials.
+            auto context = parallel_;
+            context.rowReduction = nomas::RowReduction::Activation;
+            Tensor partial(x.rows, weights_->get(prefix + ".weight").rows, x.dtype);
+            context.rowPartial(rt_, *weights_, x, prefix, partial);
+            return context.group->sumActivation(std::move(partial), context.rank);
+        }
         return parallel_.row(rt_, *weights_, x, prefix);
+    }
     return quantized_->row(x, prefix);
 }
 void DiT::unload() {

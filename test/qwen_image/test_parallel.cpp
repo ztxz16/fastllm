@@ -94,10 +94,55 @@ static void sharedScale(Runtime &rt, bool fp8) {
     }
 }
 #ifdef FASTLLM_QWEN_TEST_NCCL
+static void bf16Reduction() {
+    fastllm::nomas::ParallelGroup group({0,1});
+    // Odd counts and differently aligned views must make the same collective
+    // choice on both ranks. Include either side of the peer-reduction limit.
+    for(int count : {1,7,8,137,4096*1024,4096*1025}) {
+        const int repeats=count<1024?24:3;
+        std::vector<float> expected(count);
+        auto value=[](int rank,int index) {return bf16(std::sin(float(index)*.013f+rank)*3.7f);};
+        for(int j=0;j<count;++j) {
+            expected[j]=bf16(value(0,j)+value(1,j));
+            for(int k=1;k<repeats;++k)expected[j]=bf16(expected[j]+expected[j]);
+        }
+        group.run([&](int rank) {
+            Runtime rt(rank);
+            fastllm::nomas::TensorPool pool(rank,1u<<20);
+            fastllm::nomas::TensorPool::Scope scope(pool);
+            std::vector<float> input(count+2,-19.f);
+            for(int j=0;j<count;++j)input[j+rank]=value(rank,j);
+            auto storage=rt.upload(input.data(),count+2,1);
+            auto x=storage.rowSlice(rank,count);
+            for(int k=0;k<repeats;++k) {
+                x=group.sumActivation(std::move(x),rank);
+            }
+            require(rt.download(x)==expected,"BF16 peer reduction differs from rounded sum");
+            auto whole=rt.download(storage);
+            if(rank)require(whole.front()==-19.f,"BF16 peer reduction overwrote leading guard");
+            require(whole.back()==-19.f,"BF16 peer reduction overwrote trailing guard");
+        });
+    }
+    bool failed=false;
+    try {
+        group.run([&](int rank) {
+            Runtime rt(rank);float value=rank;auto x=rt.upload(&value,1,1);
+            x=group.sumActivation(std::move(x),rank);
+            if(rank==1)throw std::runtime_error("peer-reduction-test");
+            x=group.sumActivation(std::move(x),rank);
+        });
+    } catch(const std::exception &) {failed=true;}
+    require(failed,"BF16 reduction did not propagate rank failure");
+    group.run([&](int rank) {
+        Runtime rt(rank);float value=rank+1;auto x=rt.upload(&value,1,1);
+        x=group.sumActivation(std::move(x),rank);
+        require(rt.download(x)==std::vector<float>{3.f},"BF16 reduction recovery failed");
+    });
+}
 static void scaledReduction() {
     fastllm::nomas::ParallelGroup group({0,1});
-    for (auto shape : {std::pair<int,int>{17,64},{257,2048}})
-        for(auto dtype : {fastllm::nomas::DType::BF16,fastllm::nomas::DType::FP32}) {
+    for (auto shape : {std::pair<int,int>{1,1},{1,7},{17,64},{63,4096},{64,4096},{257,2048},{1024,4096},{1025,4096}})
+        for(auto dtype : {fastllm::nomas::DType::BF16,fastllm::nomas::DType::FP16,fastllm::nomas::DType::FP32}) {
             const auto [rows,cols]=shape;const size_t count=size_t(rows)*cols;
             std::vector<float> xs(rows),ws(cols),expected(count);
             for(int r=0;r<rows;++r)xs[r]=.017f+float(r%7)*.013f;
@@ -108,20 +153,52 @@ static void scaledReduction() {
             };
             for(size_t i=0;i<count;++i) {
                 float v=(float(value(0,i)+value(1,i))*xs[i/cols])*ws[i%cols];
-                expected[i]=dtype==fastllm::nomas::DType::BF16?bf16(v):v;
+                expected[i]=dtype==fastllm::nomas::DType::BF16?bf16(v):
+                    dtype==fastllm::nomas::DType::FP16?__half2float(__float2half_rn(v)):v;
             }
             group.run([&](int rank) {
-                Runtime rt(rank);Tensor raw(rows,cols,true),out(rows,cols,dtype);
+                Runtime rt(rank);
+                fastllm::nomas::TensorPool pool(rank,1u<<20);
+                fastllm::nomas::TensorPool::Scope scope(pool);
+                Tensor rawStorage(rows+2,cols,true);
+                auto raw=rawStorage.rowSlice(rank,rows);
+                std::vector<float> guard(size_t(rows+2)*cols,-19.f);
+                auto outputStorage=rt.cast(rt.upload(guard.data(),rows+2,cols),dtype);
+                auto out=outputStorage.rowSlice(rank,rows);
                 Tensor x(1,rows,true),w(1,cols,true);
                 std::vector<int32_t> bits(count);
                 for(size_t i=0;i<count;++i)bits[i]=value(rank,i);
-                require(cudaMemcpy(raw.data,bits.data(),count*4,cudaMemcpyHostToDevice)==cudaSuccess,"raw accumulator upload");
                 require(cudaMemcpy(x.data,xs.data(),rows*4,cudaMemcpyHostToDevice)==cudaSuccess,"activation scale upload");
                 require(cudaMemcpy(w.data,ws.data(),cols*4,cudaMemcpyHostToDevice)==cudaSuccess,"weight scale upload");
-                group.sumScaledInt32(raw,x,w,out,rank);
-                require(rt.download(out)==expected,"INT32 reduction/scaling differs from full accumulator");
+                for(int repeat=0;repeat<3;++repeat) {
+                    require(cudaMemcpy(raw.data,bits.data(),count*4,cudaMemcpyHostToDevice)==cudaSuccess,"raw accumulator upload");
+                    group.sumScaledInt32(raw,x,w,out,rank);
+                    require(rt.download(out)==expected,"INT32 reduction/scaling differs from full accumulator");
+                }
+                auto guards=rt.download(outputStorage);
+                if(rank)require(guards.front()==-19.f,"INT32 reduction overwrote leading output guard");
+                require(guards.back()==-19.f,"INT32 reduction overwrote trailing output guard");
             });
         }
+    bool failed=false;
+    try {
+        group.run([&](int rank) {
+            Runtime rt(rank,true);float one=1;auto scale=rt.upload(&one,1,1);
+            Tensor raw(1,1,true),out(1,1);int32_t value=rank+1;
+            require(cudaMemcpy(raw.data,&value,4,cudaMemcpyHostToDevice)==cudaSuccess,"raw recovery upload");
+            group.sumScaledInt32(raw,scale,scale,out,rank);
+            if(rank==1)throw std::runtime_error("scaled-peer-reduction-test");
+            group.sumScaledInt32(raw,scale,scale,out,rank);
+        });
+    } catch(const std::exception &) {failed=true;}
+    require(failed,"INT32 reduction did not propagate rank failure");
+    group.run([&](int rank) {
+        Runtime rt(rank,true);float one=1;auto scale=rt.upload(&one,1,1);
+        Tensor raw(1,1,true),out(1,1);int32_t value=rank+1;
+        require(cudaMemcpy(raw.data,&value,4,cudaMemcpyHostToDevice)==cudaSuccess,"raw recovery upload");
+        group.sumScaledInt32(raw,scale,scale,out,rank);
+        require(rt.download(out)==std::vector<float>{3.f},"INT32 reduction recovery failed");
+    });
 }
 #endif
 int main() {
@@ -149,7 +226,7 @@ int main() {
         int count=0;
         if (cudaGetDeviceCount(&count)!=cudaSuccess || !count) return 77;
 #ifdef FASTLLM_QWEN_TEST_NCCL
-        if(count>=2)scaledReduction();
+        if(count>=2){scaledReduction();bf16Reduction();}
 #endif
         Runtime rt(0), full(0,true);
         cudaDeviceProp device{};cudaGetDeviceProperties(&device,0);

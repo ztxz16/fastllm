@@ -228,9 +228,10 @@ Tensor QuantizedProjections::row(const Tensor &x,const std::string &name) {
     const auto &parallel=impl_->parallel;
     if(parallel.size()==1 || impl_->weights->format()==minimax_h3_image::WeightFormat::INT8)
         return linear(x,{name});
-    Tensor partial(x.rows,4096,nomas::DType::FP32);
-    linear(x,{name},&partial);
-    return parallel.group->sumCast(*impl_->runtime,std::move(partial),nullptr,x.dtype,parallel.rank);
+    // FP8 and GGUF round each shard to the activation type before reduction,
+    // avoiding a full-width FP32 communication buffer. INT8 reduces raw integers.
+    auto partial=linear(x,{name});
+    return parallel.group->sumActivation(std::move(partial),parallel.rank);
 }
 bool QuantizedProjections::isGguf() const { return bool(impl_->gguf); }
 const Tensor &QuantizedProjections::get(const std::string &name) {
