@@ -141,6 +141,9 @@ PyTorch Linear和使用已有worker链接的cuBLAS库、修复前参数的FP32_P
 - `fp32_o`：仅将输出投影替换成当前MoE参数的FP32输出GEMM，再转FP16加残差。
 - `native_norm`：仅替换输入归一化为256线程归约顺序的张量模拟。
 - `combined_projections`：组合上述原生归约顺序模拟、合并QKV和FP32输出投影。
+- `fused_qkv`：合并QKV并将bias广播到输出，再用`beta=1`进行GEMM，
+  对照当前MoE一次FP16舍入的投影配置；归一化和输出投影保留HF实现。
+- `current_projections`：组合归约顺序模拟、融合bias的QKV和FP32输出投影。
 
 所有实验仍使用HF的RoPE、QK、softmax和PV，**组合实验也不等于原生Attention重放**。
 输出更接近原生日志只能作为下一步定位线索，不能单凭此结果宣布原生根因或模型修复。
@@ -177,6 +180,33 @@ MoE正式QKV现在先把bias广播到现有输出缓冲，再调用`beta=1`的GE
 EP1/2/4、Eager/Graph、Prefix开关和完整logits。CPU检查用独立PyTorch Linear
 核对期望值，不能代替GPU验收。此修正涉及CUDA代码，需要先重新构建，再执行
 `synthetic`、`regression`和`real`，误差容差保持不变。
+
+新诊断`20261115T032151Z_moe_precision_6950e33c`使用失败step=1的26个Token。
+全部24层的独立Attention和独立MoE均在原阈值内，但完整层4、7出现非同分专家换序，
+完整层13的token=11把专家8换成24，随后路由输出7个、层输出5个元素超差。
+独立MoE使用HF边界时通过，只能说明该共同输入下通过，不能排除累积误差或证明
+最终logits的全部误差都由第13层导致。
+
+可打开`--router-replay`，检查每种Attention投影输出如何影响下游专家选择：
+
+```bash
+/venv/fastllm-reference-cu126/bin/python3 test/distributed/probe_qwen_moe_attention_precision.py \
+  --diagnostic test/distributed/results/20261115T032151Z_moe_precision_6950e33c \
+  --model /home/models/Qwen1.5-MoE-A2.7B-Chat \
+  --worker build-attention-ep-cu126/fastllm_tp_worker \
+  --layers 4 7 13 --router-replay
+```
+
+路由重放固定使用HF的post-Attention RMSNorm、Gate、FP32 softmax和TopK。
+首先要求保存的HF Attention边界能精确复现HF完整层router logits，专家选择只允许
+两侧都同分的换序；不满足就停止归因并保留报告。之后将保存的原生Attention输出、
+各投影实验输出分别送入同一个HF路由，记录分数、专家ID、路由权重及失败Token的
+候选专家分数。保存的原生完整层路由用于额外对照，不被替换。
+
+这只是改变Attention边界输入的独立对照，后半段使用HF实现，不能视为原生MoE重放。
+每层JSON保存原始结果，四格式summary将精确分数差异和专家选择差异分别列项；
+选择差异的`failed_elements`统计Token数，不计算专家ID的数值误差。仍不修改验收容差，
+不重新编译，也不以这些独立实验代替完整模型验收。
 
 ## 失败Decode的缓存与完整历史对照
 

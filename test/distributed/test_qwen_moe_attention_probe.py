@@ -68,8 +68,8 @@ class AttentionProbeTests(unittest.TestCase):
         """/** 检查合并/FP32投影选择、norm分支与权重只读，覆盖有无bias。 */"""
         torch = self.torch
         torch.manual_seed(17)
-        def linear(torch, x, weight, fp32=False):
-            value = torch.nn.functional.linear(x.float(), weight.float())
+        def linear(torch, x, weight, fp32=False, bias=None):
+            value = torch.nn.functional.linear(x.float(), weight.float(), None if bias is None else bias.float())
             return value if fp32 else value.half()
         for bias in (False, True):
             attention = self.attention(bias=bias)
@@ -81,20 +81,80 @@ class AttentionProbeTests(unittest.TestCase):
                     self.assertTrue(torch.equal(output, raw['output']))
                     self.assertEqual(set(raw), {'norm', 'q', 'k', 'v', 'context', 'o', 'output'})
                     self.assertTrue(torch.equal(raw['norm'], torch.full_like(raw['norm'],
-                        .5 if mode in ('native_norm', 'combined_projections') else 1)))
+                        .5 if mode in ('native_norm', 'combined_projections', 'current_projections') else 1)))
                     calls = gemm.linear.call_args_list
-                    expected_count = {'merged_qkv': 1, 'fp32_o': 1, 'combined_projections': 2}.get(mode, 0)
+                    expected_count = {'merged_qkv': 1, 'fp32_o': 1, 'combined_projections': 2,
+                                      'fused_qkv': 1, 'current_projections': 2}.get(mode, 0)
                     self.assertEqual(len(calls), expected_count)
-                    if mode in ('merged_qkv', 'combined_projections'):
+                    if mode in ('merged_qkv', 'combined_projections', 'fused_qkv', 'current_projections'):
                         self.assertEqual(calls[0].args[2].shape, (12, 4))
                         self.assertFalse(calls[0].kwargs.get('fp32', False))
-                    if mode in ('fp32_o', 'combined_projections'):
+                        self.assertEqual(calls[0].kwargs['bias'] is not None,
+                                         bias and mode in ('fused_qkv', 'current_projections'))
+                    if mode in ('fp32_o', 'combined_projections', 'current_projections'):
                         self.assertTrue(calls[-1].kwargs['fp32'])
                         self.assertEqual(calls[-1].args[2].shape, (4, 4))
                     for module in attention.modules():
                         self.assertFalse(module._forward_hooks)
                     for key, value in attention.state_dict().items():
                         self.assertTrue(torch.equal(value, saved[key]))
+
+    def test_fused_projection_adds_bias_before_the_only_half_rounding(self):
+        """/** 消去用例必须区分当前融合bias与旧单独bias，并且不会重复加bias。 */"""
+        torch = self.torch
+        attention = self.attention(width=1)
+        with torch.no_grad():
+            attention.q_proj.weight.fill_(1.0009765625)
+            attention.q_proj.bias.fill_(-1.001953125)
+        def linear(torch, x, weight, fp32=False, bias=None):
+            value = torch.nn.functional.linear(x.float(), weight.float(), None if bias is None else bias.float())
+            return value if fp32 else value.half()
+        gemm = SimpleNamespace(linear=linear)
+        x = torch.tensor([[[1.0009765625]]], dtype=torch.float16)
+        _, fused = self.invoke(attention, 'fused_qkv', gemm, x)
+        _, legacy = self.invoke(attention, 'merged_qkv', gemm, x)
+        _, hf = self.invoke(attention, 'hf_replay', x=x)
+        self.assertEqual(fused['q'].item(), 2**-20)
+        self.assertEqual(fused['q'].item(), hf['q'].item())
+        self.assertEqual(legacy['q'].item(), 0)
+
+    def test_router_replay_preserves_half_weights_and_normalization(self):
+        """/** 通过独立的常量logits检查softmax、TopK和可选归一化，再验证路由边界记录。 */"""
+        torch = self.torch
+        config = SimpleNamespace(hidden_size=1, num_experts_per_tok=2, norm_topk_prob=False)
+        hidden = torch.ones(1, 1, 1, dtype=torch.float16)
+        gate = torch.tensor([[0.], [2.], [1.], [-1.]], dtype=torch.float16)
+        output = probe.replay_router(torch, hidden, torch.nn.Identity(), gate, config)
+        self.assertEqual(output['selected_experts'], [1, 2])
+        expected = torch.softmax(gate[:, 0].float(), dim=0)[[1, 2]]
+        self.assertEqual(output['routing_weights'], expected.half().tolist())
+        config.norm_topk_prob = True
+        normalized = probe.replay_router(torch, hidden, torch.nn.Identity(), gate, config)
+        self.assertEqual(normalized['routing_weights'], (expected/expected.sum()).half().tolist())
+
+        tied = dict(router_logits=[0., 2., 2., -1.], selected_experts=[1, 2], routing_weights=[.4, .4])
+        swapped = dict(tied, selected_experts=[2, 1])
+        self.assertEqual(probe.routing_comparison('tied', tied, swapped, 4, 2)['status'], 'PASS')
+        non_tied = dict(tied, router_logits=[0., 2.001953125, 2., -1.])
+        self.assertEqual(probe.routing_comparison('order', non_tied, swapped, 4, 2)['status'], 'FAIL')
+        changed = dict(output, selected_experts=[1, 0])
+        row = probe.routing_comparison('set', changed, output, 4, 2)
+        self.assertEqual(row['failed_elements'], 1)
+        self.assertEqual(row['details'][0]['token'], 0)
+        self.assertEqual([item['expert'] for item in row['details'][0]['scores']], [0, 1, 2])
+
+    def test_router_comparison_rejects_malformed_shapes_and_ids(self):
+        """/** 拒绝不完整或超长字段及非法专家ID，避免错误切片掩盖坏输入。 */"""
+        values = dict(router_logits=[0., 2., 1., -1.], selected_experts=[1, 2], routing_weights=[.6, .2])
+        for field in values:
+            for delta in (-1, 1):
+                bad = dict(values, **{field: values[field][:-1] if delta < 0 else values[field] + [0]})
+                with self.subTest(field=field, delta=delta), self.assertRaisesRegex(ValueError, 'shape mismatch'):
+                    probe.routing_comparison('invalid', values, bad, 4, 2)
+        for expert in (-1, 4, .5, float('nan'), True):
+            bad = dict(values, selected_experts=[1, expert])
+            with self.subTest(expert=expert), self.assertRaisesRegex(ValueError, 'invalid expert ID'):
+                probe.routing_comparison('invalid', bad, values, 4, 2)
 
     def test_exception_removes_hooks_and_invalid_modes_reject(self):
         """/** 子模块异常或非法实验名称不遗留hook，不以其他后端掩盖失败。 */"""
@@ -127,7 +187,7 @@ class AttentionProbeTests(unittest.TestCase):
             report = json.loads((output/'summary.json').read_text())
             self.assertEqual(report['status'], 'FAIL')
             self.assertFalse(report['complete'])
-            self.assertEqual(report['expected_case_count'], 72)
+            self.assertEqual(report['expected_case_count'], 96)
             for suffix in ('md', 'csv', 'json', 'xlsx'):
                 self.assertTrue((output/f'summary.{suffix}').is_file())
 
@@ -155,6 +215,29 @@ class AttentionProbeBlasTests(unittest.TestCase):
         gemm.close()
         gemm.close()
         library.cublasDestroy_v2.assert_called_once()
+
+    def test_bias_broadcast_precedes_beta_one_gemm_and_invalid_bias_rejects(self):
+        """/** 检查有bias的C初始化与beta=1，覆盖FP16/FP32输出和偏置维度拒绝。 */"""
+        fixture = fixtures.RouterProbeBlasTests()
+        library = fixture.library()
+        with mock.patch('ctypes.CDLL', return_value=library):
+            gemm = probe.MoeGemm(Path('/unused'), 9876)
+        x, weight, bias = fixture.tensor((26, 2048), 1), fixture.tensor((60, 2048), 2), fixture.tensor((60,), 3)
+        for fp32 in (False, True):
+            events = []
+            output = fixture.tensor((26, 60), 4)
+            output.copy_ = mock.Mock(side_effect=lambda _: events.append('bias'))
+            library.cublasGemmEx.side_effect = lambda *args: events.append('gemm') or 0
+            torch = SimpleNamespace(float16='fp16', float32='fp32', empty=mock.Mock(return_value=output))
+            gemm.linear(torch, x, weight, fp32=fp32, bias=bias)
+            output.copy_.assert_called_once_with(bias)
+            self.assertEqual(events, ['bias', 'gemm'])
+            self.assertEqual(ctypes.cast(library.cublasGemmEx.call_args.args[13], ctypes.POINTER(ctypes.c_float))[0], 1)
+        library.cublasGemmEx.reset_mock()
+        with self.assertRaisesRegex(ValueError, 'bias'):
+            gemm.linear(torch, x, weight, bias=fixture.tensor((59,), 3))
+        library.cublasGemmEx.assert_not_called()
+        gemm.close()
 
     def test_invalid_layout_and_blas_error_do_not_fallback(self):
         """/** 无效尺寸不进入C接口，cuBLAS运行失败直接上报。 */"""
