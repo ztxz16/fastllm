@@ -3116,7 +3116,7 @@ class FastLLmCompletion:
       temperature = request.temperature if request.temperature is not None else default_gen['temperature']
       do_sample, top_p, top_k, temperature = self._normalize_sampling_args(top_p, top_k, temperature)
       frequency_penalty = default_gen['repetition_penalty']
-      max_length = request.max_tokens if request.max_tokens else 32768
+      max_length = request.max_tokens or -1
 
       # Claude Code sends effort through Anthropic output_config. Resolve it
       # with the same model-specific rules as Chat Completions, and use the
@@ -3344,7 +3344,7 @@ class FastLLmCompletion:
           elif not any(getattr(request, key) is not None for key in ("temperature", "top_p", "top_k")):
               do_sample = default_gen.get("do_sample", False)
 
-      max_length = request.max_tokens if request.max_tokens else 32768
+      max_length = request.max_tokens or -1
       min_length = request.min_tokens if request.min_tokens else 0
       stop_strings = self._normalize_stop_strings(request.stop)
       stop_token_ids = self._stop_token_ids_from_strings(stop_strings)
@@ -3554,7 +3554,7 @@ class FastLLmCompletion:
       output_tokens = usage.completion_tokens or 0
 
       finish_reason = self._chat_finish_reason(
-          output_tokens, request.max_tokens or 32768, stopped_by_stop_string)
+          output_tokens, request.max_tokens, stopped_by_stop_string)
       tool_call_info = self._parse_non_stream_tool_calls(
           result, request, finish_reason=finish_reason)
       if isinstance(tool_call_info, ErrorResponse):
@@ -3911,7 +3911,7 @@ class FastLLmCompletion:
         usage = self._chat_usage(
             handle, response_statistics, input_token_len, completion_tokens)
         finish_reason = self._chat_finish_reason(
-            usage.completion_tokens or 0, request.max_tokens or 32768,
+            usage.completion_tokens or 0, request.max_tokens,
             stopped_by_stop_string)
         final_stream_error_data = None
         if request.tools and tool_call_parser:
@@ -4046,7 +4046,7 @@ class FastLLmCompletion:
           tool_call_info = self._parse_non_stream_tool_calls(
               result, parser_request,
               finish_reason=self._chat_finish_reason(
-                  usage.output_tokens, request.max_tokens or 32768))
+                  usage.output_tokens, request.max_tokens))
           if isinstance(tool_call_info, ErrorResponse):
               return tool_call_info
       else:
@@ -4156,7 +4156,7 @@ class FastLLmCompletion:
                   handle, response_statistics, input_token_len, completion_tokens)
               diagnostics = tool_parser.finalize_stream(
                   finish_reason=self._chat_finish_reason(
-                      usage.output_tokens, request.max_tokens or 32768))
+                      usage.output_tokens, request.max_tokens))
               if diagnostics:
                   raise ValueError("Invalid tool call: " +
                                    self._format_tool_call_diagnostics(diagnostics))

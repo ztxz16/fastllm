@@ -464,7 +464,6 @@ int CloverModel::LaunchClover(const std::vector<int> &tokens, const json11::Json
     auto options = ReadOptions(j);
     GenerationConfig c;
     c.output_token_limit = Integer(j, "max_new_tokens", 24576);
-    Require(c.output_token_limit > 0, "max_new_tokens must be positive");
     c.output_token_least = Integer(j, "min_new_tokens", 0);
     c.repeat_penalty = Real(j, "repetition_penalty", 1.05f);
     c.temperature = Real(j, "temperature", 1.f);
