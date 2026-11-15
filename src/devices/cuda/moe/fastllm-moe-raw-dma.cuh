@@ -67,7 +67,7 @@ struct RawExpertDmaSource {
         if (cudaGetDeviceProperties(&properties, device) != cudaSuccess) { cudaGetLastError(); return false; }
         // The graph can wait on a concurrent upload only on devices with a
         // separate copy engine. Other devices retain mapped-kernel transfers.
-        if (!properties.deviceOverlap || properties.asyncEngineCount == 0) return false;
+        if (properties.asyncEngineCount == 0) return false;
         ownerDevice = device;
         if (storage.Allocate(sizeof(RawExpertDmaRequest)) != cudaSuccess) { cudaGetLastError(); return false; }
         host = new (storage.Host()) RawExpertDmaRequest;
