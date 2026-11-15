@@ -236,6 +236,11 @@ int main(int argc, char **argv) {
         std::vector<int> devices{0};
         for (int i = 1; i < argc; ++i) {
             std::string arg = argv[i];
+            if (arg == "--help" || arg == "-h") {
+                std::cout << "qwen_image_server --model DIR [--host 127.0.0.1 --port 8008 "
+                             "--devices 0 --output DIR --api-key KEY --demo FILE]\n";
+                return 0;
+            }
             if (i + 1 >= argc)
                 throw std::invalid_argument("missing value for " + arg);
             std::string value = argv[++i];

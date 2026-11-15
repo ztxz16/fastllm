@@ -58,6 +58,12 @@ def main():
         for name in ('minimax_h3_server', 'minimax_h3_generate', 'minimax_h3_image_server', 'minimax_h3_image_generate'):
             shutil.copy2(build / 'cuda/src/models/minimax_h3' / name, package / name)
         shutil.copy2(build / 'cuda/libfastllm_minimax_h3.so', package / 'libfastllm_minimax_h3.so')
+        for name in ('qwen_image_server', 'qwen_image_generate'):
+            shutil.copy2(build / 'cuda/src/models/qwen_image' / name, package / name)
+        shutil.copy2(build / 'cuda/libfastllm_qwen_image.so', package / 'libfastllm_qwen_image.so')
+        (package / 'qwen_image_assets').mkdir()
+        for name in ('demo.html', 'openapi.json'):
+            shutil.copy2(source / 'tools/qwen_image' / name, package / 'qwen_image_assets' / name)
         (package / 'h3_assets').mkdir()
         for name in ('demo.html', 'openapi.json'):
             shutil.copy2(source / 'tools/minimax_h3' / name, package / 'h3_assets' / name)
@@ -98,7 +104,9 @@ def main():
                         'ftllm/h3_assets/demo.html', 'ftllm/h3_assets/openapi.json',
                         'ftllm/minimax_h3_image_server', 'ftllm/minimax_h3_image_generate',
                         'ftllm/h3_image_assets/demo.html', 'ftllm/h3_image_assets/openapi.json',
-                        'ftllm/h3_image_assets/image-workspace.js', 'ftllm/h3_image_assets/image-workspace.css'}
+                        'ftllm/h3_image_assets/image-workspace.js', 'ftllm/h3_image_assets/image-workspace.css',
+                        'ftllm/libfastllm_qwen_image.so', 'ftllm/qwen_image_server', 'ftllm/qwen_image_generate',
+                        'ftllm/qwen_image_assets/demo.html', 'ftllm/qwen_image_assets/openapi.json'}
             if not expected <= set(archive.namelist()):
                 raise RuntimeError('Wheel is missing required native libraries')
         target = dest / wheel.name

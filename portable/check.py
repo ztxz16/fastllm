@@ -187,7 +187,7 @@ def main() -> int:
 
     try:
         for name, path in check_video_runtime(bundle_root, run=True).items():
-            ok(f"包内视频后端：{name}（{path}）")
+            ok(f"包内媒体后端：{name}（{path}）")
     except (OSError, RuntimeError, subprocess.SubprocessError) as error:
         fail(str(error))
 

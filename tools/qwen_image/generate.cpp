@@ -11,6 +11,12 @@ int main(int argc, char **argv) {
         std::vector<int> devices{0};
         for (int i = 1; i < argc; ++i) {
             std::string key = argv[i];
+            if (key == "--help" || key == "-h") {
+                std::cout << "qwen_image_generate --model DIR --prompt TEXT [--output output.png "
+                             "--width 1024 --height 1024 --steps 40 --seed N --devices 0 "
+                             "--image PNG --reference-resolution 1024 --trace DIR]\n";
+                return 0;
+            }
             if (i + 1 >= argc)
                 throw std::invalid_argument("missing argument");
             std::string value = argv[++i];
