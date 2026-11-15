@@ -101,10 +101,29 @@ class MoeSessionTests(unittest.TestCase):
             for i, result in enumerate(results):
                 self.assertEqual(result['token_ids'], [i + 1] * (i + 2))
                 self.assertFalse(result['states'][result['dp_rank']]['request_active'])
+                rank = result['dp_rank']
+                for step, trace in enumerate(result['steps']):
+                    evidence = trace['joint_round']
+                    self.assertEqual(evidence['actions'][rank], 1 if step == 0 else 2)
+                    self.assertEqual(evidence['submitted_token_counts'][rank], 3 if step == 0 else 1)
+                    self.assertTrue(any(evidence == dict(actions=[s['action'] for s in round_],
+                        submitted_token_counts=[len(s['token_ids']) for s in round_])
+                        for round_ in session._transport.history))
             history = session._transport.history
             self.assertTrue(any(sum(s['action'] in (1, 2) for s in steps) > 1 for steps in history))
             self.assertTrue(any(any(s['action'] == 1 for s in row) and any(s['action'] == 2 for s in row) for row in history))
             self.assertTrue(all(s['captures'] == 1 for s in session._states))
+
+    def test_joint_round_trace_is_optional_and_keeps_begin_counts(self):
+        """/** 记录提交给原生的Token数而非推测Prefix命中后的行数；非trace请求不增加诊断输出。 */"""
+        with self.session(trace=True, prefix_cache=True, routing='prefix') as session:
+            session.generate(request())
+            result = session.generate(request())
+            self.assertEqual(result['steps'][0]['joint_round']['submitted_token_counts'], [3, 0, 0, 0])
+            self.assertEqual(result['steps'][1]['joint_round']['submitted_token_counts'], [1, 0, 0, 0])
+        with self.session(trace=False) as session:
+            result = session.generate(request())
+            self.assertTrue(all('joint_round' not in step for step in result['steps']))
 
     def test_eos_and_callback_cancel_do_not_poison_peers(self):
         with self.session() as session, ThreadPoolExecutor(2) as pool:

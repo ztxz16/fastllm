@@ -284,6 +284,10 @@ class QwenMoeProcessSession:
                         if len(values) != self.config['vocab_size'] or not all(math.isfinite(x) for x in values):
                             raise RuntimeError('invalid MoE trace logits')
                         item['logits'] = values
+                        # 记录正式调度提交的联合轮次；Begin长度尚未扣除原生Prefix命中。
+                        item['joint_round'] = dict(
+                            actions=[s['action'] for s in steps],
+                            submitted_token_counts=[len(s['token_ids']) for s in steps])
                     job['steps'].append(item)
                     try:
                         job['events'].put_nowait(token)
