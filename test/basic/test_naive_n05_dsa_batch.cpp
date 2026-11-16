@@ -269,8 +269,8 @@ static void Test(int batch, int heads, int kvHeads, int dim, int vd, int capacit
 // Replace and reorder KV behind one captured graph. The original addresses
 // remain valid but contain different values, so stale kernel parameters cannot
 // pass this test accidentally.
-static void TestRebinding(int batch, int capacity, bool sparse, bool generic = false, bool contiguousSelection = false, bool fp8 = false, int sharedQueries = 1, int heads = 8) {
-    const int kvHeads = 1, dim = generic ? 128 : 192, vd = generic ? 256 : 128, stride = dim + 128;
+static void TestRebinding(int batch, int capacity, bool sparse, bool generic = false, bool contiguousSelection = false, bool fp8 = false, int sharedQueries = 1, int heads = 8, int kvHeads = 1) {
+    const int dim = generic ? 128 : 192, vd = generic ? 256 : 128, stride = kvHeads * dim + 128;
     Data q(BFLOAT16), sink(FLOAT32), live(INT32), table(INT32), maps(INT32), actual, expected;
     const bool useMaps = !generic && !contiguousSelection && !fp8 && sharedQueries == 1 && FastllmCudaNaiveDSAMapsSupported();
     std::vector<unsigned char> hostMaps(batch * FastllmNaiveDSAMapBytes);
@@ -297,7 +297,7 @@ static void TestRebinding(int batch, int capacity, bool sparse, bool generic = f
     };
     for (int i = 0; i < batch * 2; ++i) {
         uploadCache(keys[i], {1, capacity, stride}, 131 + i);
-        uploadCache(values[i], {1, capacity, vd}, 517 + i);
+        uploadCache(values[i], {1, capacity, kvHeads * vd}, 517 + i);
     }
     Data contiguousIndices(INT32);
     if (sparse && contiguousSelection) {
@@ -353,12 +353,15 @@ static void TestRebinding(int batch, int capacity, bool sparse, bool generic = f
         updateMaps();
         graph.Run();
         std::vector<uint16_t> b;
-        if (heads == 16) {
+        const bool sharedHeads = heads == 16 || kvHeads > 1;
+        if (sharedHeads) {
             b.reserve((size_t)batch * heads * vd);
-            // Sub-64-row launches retain the eight-head KV-load path. Compare
-            // the large-batch shared-head graph with that independent fallback.
+            // Multiple KV groups use the independent small-batch fallback.
+            // Its reduction differs from the bulk path; keep the original
+            // exact eight-head reference for single-KV shared-head tests.
             for (int first = 0; first < batch;) {
-                const int count = batch - first < 64 ? batch - first : 32;
+                const int count = kvHeads > 1 ? std::min(16, batch - first) :
+                    (batch - first < 64 ? batch - first : 32);
                 Data partQuery(BFLOAT16), partOutput;
                 partQuery.FakeFrom(q, (size_t)first * heads * dim * 2);
                 partQuery.Resize({1, count, heads * dim});
@@ -374,12 +377,15 @@ static void TestRebinding(int batch, int capacity, bool sparse, bool generic = f
             b = Read<uint16_t>(expected);
         }
         auto a = Read<uint16_t>(actual);
-        if (heads == 16) Require(a == b, "shared-head chunking changed fallback output bits");
-        if (contiguousSelection || sharedQueries > 1) Require(a == b, "compact attention changed output bits after rebinding");
+        if (heads == 16 && kvHeads == 1) Require(a == b, "shared-head chunking changed fallback output bits");
+        if (kvHeads == 1 && (contiguousSelection || sharedQueries > 1))
+            Require(a == b, "compact attention changed output bits after rebinding");
         double error = 0, norm = 0;
         for (size_t i = 0; i < a.size(); ++i) {
             const double delta = std::abs((double)Float(a[i]) - Float(b[i]));
-            Require(delta <= 0.009 * std::abs(Float(b[i])) + 2e-6, "indirect DSA exceeds one BF16 ULP");
+            const double tolerance = kvHeads > 1 ? .004 + .01 * std::abs(Float(b[i])) :
+                .009 * std::abs(Float(b[i])) + 2e-6;
+            Require(delta <= tolerance, "indirect DSA element error");
             error += delta * delta; norm += (double)Float(b[i]) * Float(b[i]);
         }
         Require(std::sqrt(error / std::max(norm, 1e-30)) <= .003, "indirect DSA relative error");
@@ -607,6 +613,12 @@ int main(int argc, char **argv) {
             return 77;
         FastllmCudaSetDevice(0);
         if (argc > 1 && std::strcmp(argv[1], "wide_heads") == 0) {
+            for (int heads : {32, 64})
+                for (int batch : {31, 32, 63, 64, 128, 256, 513})
+                    TestRebinding(batch, 257, true, false, false, true, 1, heads, heads / 16);
+            for (int width : {2, 4, 6, 8})
+                TestRebinding(17 * width, 4097, true, false, true, true, width, 64, 4);
+            TestRebinding(64, 257, true, false, false, true, 1, 64, 2);
             for (bool fp8 : {false, true})
                 TestRebinding(16, 4097, true, false, true, fp8, 1, 64);
             for (int heads : {16, 32, 64})

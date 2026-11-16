@@ -651,6 +651,9 @@ Graph/eager、固定 KV 归属、非首卡存活请求与空闲存储复用。
 TP 配置和 BF16/FP8 主 KV；FastKV 按 rank 交接已提交的草稿窗口，并在 D 端恢复候选
 空间和本地 Graph。KVMem 的 PD 接收适配器目前仍不接收草稿状态，FP4 KV 仍要求关闭草稿。
 
+Hopper 的 FP8 DSA 预取路径支持多个 KV group；满足 GQA/对齐条件时每组共享 KV 加载，
+其余架构与形状保持通用实现。
+
 
 ## 普通 TP 解码合批
 

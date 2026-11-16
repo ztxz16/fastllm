@@ -5283,7 +5283,10 @@ bool PrefetchDSAAttention(const fastllm::Data &query, const float *bias,
         fastllm::Data &output) {
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
     namespace bulk = pipeline_bulk;
-    if (FastllmCudaRuntimeArch() != 90 || heads != 16 || kvHeads != 1 || rows.size() < 32)
+    // Each CTA must remain within one KV group. The same pipeline works for
+    // any number of groups, including unsharded DP attention heads.
+    if (FastllmCudaRuntimeArch() != 90 || kvHeads <= 0 || heads % kvHeads ||
+        heads / kvHeads < 16 || (heads / kvHeads) % 16 || rows.size() < 32)
         return false;
     for (const auto &row : rows)
         if (!row.fp8 || !row.indices || row.selectedCount != 2048 || row.keyStride % 16 ||
