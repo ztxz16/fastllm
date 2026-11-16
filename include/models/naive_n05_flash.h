@@ -225,6 +225,8 @@ namespace fastllm {
             bool ringVerify = false; // Candidates are staged after the retained SWA ring.
             std::map<int, Data> hidden;
             std::vector<PrefixSnapshots> prefixes;
+            // Optional per-request CUDA destinations, consumed before the next forward.
+            std::vector<Data *> logitsDestinations;
         };
         struct DraftTPState;
         std::shared_ptr<DraftTPState> draftTP;
@@ -232,10 +234,10 @@ namespace fastllm {
         struct DraftWorkspace;
         // Bounded LRU; graph-owned inputs are refreshed on every replay.
         std::vector<std::shared_ptr<DraftWorkspace>> draftBatchWorkspaces;
-        std::vector<std::shared_ptr<DraftWorkspace>> draftProposalWorkspaces;
         // Graph variants execute serially and share their large activation buffers.
         std::shared_ptr<DraftWorkspace> draftBatchStorage, draftContextStorage;
         std::shared_ptr<DraftWorkspace> draftProposalStorage;
+        std::vector<std::shared_ptr<DraftWorkspace>> draftSamplingRanks;
         // Single-device draft graphs execute serially, including request churn.
         std::map<int, std::shared_ptr<void>> draftLinearGraphWorkspaces;
         struct DraftContext {
@@ -308,9 +310,11 @@ namespace fastllm {
         struct DraftRound;
         void PrepareDraftRound(DraftRound &round, const Data *preparedLogits = nullptr);
         bool PrepareDraftBatch(std::vector<std::unique_ptr<DraftRound>> &rounds, const Data &baseLogits);
-        bool PrepareDraftBatchGraph(std::vector<std::unique_ptr<DraftRound>> &rounds, const Data &baseLogits);
-        void PrepareDraftSamplingMemory(int rows, int steps, int vocab, int latentWidth);
+        bool PrepareDraftBatchLocal(const std::vector<DraftRound *> &rounds, const Data &baseLogits, int rank);
+        bool PrepareDraftBatchGraph(const std::vector<DraftRound *> &rounds, const Data &baseLogits, int rank);
+        void PrepareDraftSamplingMemory(int rows, int steps, int vocab, int latentWidth, int rank = -1);
         void PrepareDraftAcceptance(std::vector<std::unique_ptr<DraftRound>> &rounds, Data &logits);
+        void PrepareDraftAcceptanceLocal(const std::vector<DraftRound *> &rounds, Data &logits, int rank);
         int FinishDraftRound(DraftRound &round, Data &logits, TargetCapture &capture,
                              std::vector<std::pair<Data, Data>> &kv);
         std::vector<int> ForwardDraftBatch(int batch, const Data &inputIds,

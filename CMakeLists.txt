@@ -3076,6 +3076,12 @@ if (UNIT_TEST)
                 PROPERTIES LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240
                 PASS_REGULAR_EXPRESSION "DRAFT WIDE PASS")
             foreach(NAIVE_DRAFT_RANKS 2 4 8)
+                add_test(NAME naive_n05_draft_dp_sampling_${NAIVE_DRAFT_RANKS}
+                    COMMAND naive_n05_verify_graph_test ${NAIVE_DRAFT_RANKS} attention_dp_dspark ${NAIVE_DRAFT_RANKS} 3 sample graph)
+                set_tests_properties(naive_n05_draft_dp_sampling_${NAIVE_DRAFT_RANKS}
+                    PROPERTIES LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240
+                    ENVIRONMENT "FASTLLM_DSPARK_TP=dp:${NAIVE_DRAFT_RANKS}"
+                    PASS_REGULAR_EXPRESSION "ATTENTION DP DSPARK PASS")
                 add_test(NAME naive_n05_draft_dp_${NAIVE_DRAFT_RANKS}
                     COMMAND naive_n05_verify_graph_test ${NAIVE_DRAFT_RANKS} draft_dp)
                 set_tests_properties(naive_n05_draft_dp_${NAIVE_DRAFT_RANKS}
@@ -3099,6 +3105,26 @@ if (UNIT_TEST)
                         PASS_REGULAR_EXPRESSION "DRAFT (MLP )?TP[0-9]+ PASS")
                 endforeach()
             endforeach()
+            add_test(NAME naive_n05_draft_dp_rejection_target_tp
+                COMMAND naive_n05_verify_graph_test 2 attention_dp_dspark 1 3 sample graph)
+            add_test(NAME naive_n05_draft_dp_rejection_eager
+                COMMAND naive_n05_verify_graph_test 2 attention_dp_dspark 2 3 sample_oracle eager)
+            add_test(NAME naive_n05_draft_dp_rejection_fail_begin
+                COMMAND naive_n05_verify_graph_test 2 attention_dp_dspark 2 5 sample_oracle fail_begin)
+            add_test(NAME naive_n05_draft_dp_rejection_fail_instantiate
+                COMMAND naive_n05_verify_graph_test 2 attention_dp_dspark 2 7 sample_oracle fail_instantiate)
+            add_test(NAME naive_n05_draft_dp_rejection_tools
+                COMMAND naive_n05_verify_graph_test 2 attention_dp_dspark 2 5 sample_tools graph)
+            set_tests_properties(naive_n05_draft_dp_rejection_target_tp naive_n05_draft_dp_rejection_eager
+                naive_n05_draft_dp_rejection_fail_begin naive_n05_draft_dp_rejection_fail_instantiate
+                naive_n05_draft_dp_rejection_tools
+                PROPERTIES LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240
+                ENVIRONMENT "FASTLLM_DSPARK_TP=dp:2" PASS_REGULAR_EXPRESSION "ATTENTION DP DSPARK PASS")
+            add_test(NAME naive_n05_draft_dp_verify_scatter
+                COMMAND naive_n05_verify_graph_test 8 attention_dp_verify 8 fp8 scatter graph)
+            set_tests_properties(naive_n05_draft_dp_verify_scatter
+                PROPERTIES LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240
+                PASS_REGULAR_EXPRESSION "ATTENTION DP VERIFY PASS")
             foreach(NAIVE_DRAFT_STRATEGY draft_tp draft_mlp_tp)
                 foreach(NAIVE_DRAFT_FAILURE failbegin failinstantiate)
                     add_test(NAME naive_n05_${NAIVE_DRAFT_STRATEGY}_${NAIVE_DRAFT_FAILURE}

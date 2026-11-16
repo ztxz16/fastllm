@@ -142,6 +142,9 @@ struct NaiveN05FlashModel::DraftWorkspace {
     std::vector<Layer> layers;
     std::vector<ContextLayer> contextLayers;
     std::vector<std::shared_ptr<DraftWorkspace>> tpRanks;
+    std::vector<std::shared_ptr<DraftWorkspace>> proposals;
+    std::shared_ptr<void> samplingLinear;
+    Data samplingW1, samplingW2, samplingInput, samplingTarget;
     std::vector<std::pair<Data, Data>> tpKV;
     void *ready = nullptr, *done = nullptr;
     std::vector<void *> Pointers() const {
@@ -157,6 +160,7 @@ struct NaiveN05FlashModel::DraftWorkspace {
         if (device >= 0) FastllmCudaSetDevice(device);
         for (auto &graph : graphs) graph.Clear();
         proposal.graph.Clear();
+        proposals.clear();
         sampling.Clear();
         if (ready) FastllmCudaEventDestroy(ready);
         if (done) FastllmCudaEventDestroy(done);
@@ -2002,6 +2006,8 @@ struct NaiveN05FlashModel::DraftRound {
     std::vector<int> proposed;
     std::vector<std::vector<float>> q;
     Data batchProbabilities;
+    int samplingRank = -1;
+    Data targetLogits;
     std::shared_ptr<DraftWorkspace> proposalOwner;
     Data &ProposalProbabilities() {
         return proposalOwner ? batchProbabilities : context.proposalProbs;
@@ -2047,7 +2053,7 @@ void NaiveN05FlashModel::PrepareDraftRound(DraftRound &round, const Data *prepar
             baseLogits.dataType == BFLOAT16 && baseLogits.dims.size() == 3) {
         std::vector<std::unique_ptr<DraftRound>> batch;
         batch.emplace_back(new DraftRound(*this, context, config, round.lastTokens, anchor, limit));
-        if (PrepareDraftBatchGraph(batch, baseLogits)) {
+        if (PrepareDraftBatchGraph({batch.front().get()}, baseLogits, -1)) {
             auto &r = *batch.front();
             round.greedy = r.greedy; round.selection = r.selection; round.proposed = std::move(r.proposed);
             round.proposalOwner = r.proposalOwner;
@@ -2162,22 +2168,24 @@ void NaiveN05FlashModel::PrepareDraftRound(DraftRound &round, const Data *prepar
     }
 }
 
-void NaiveN05FlashModel::PrepareDraftSamplingMemory(int count, int steps, int vocab, int latentWidth) {
+void NaiveN05FlashModel::PrepareDraftSamplingMemory(int count, int steps, int vocab, int latentWidth, int rank) {
 #ifdef USE_CUDA
-    ApplyDraftDevice();
+    if (rank < 0) ApplyDraftDevice();
+    else FastllmCudaSetDevice(draftTP->devices.at(rank));
+    auto &storage = rank < 0 ? draftProposalStorage : draftSamplingRanks.at(rank);
     const int device = FastllmCudaGetDevice(), words = (vocab + 31) / 32;
-    if (!draftProposalStorage) {
-        draftProposalStorage = std::make_shared<DraftWorkspace>();
-        draftProposalStorage->device = device;
+    if (!storage) {
+        storage = std::make_shared<DraftWorkspace>();
+        storage->device = device;
     }
-    auto &shared = draftProposalStorage->sampling;
+    auto &shared = storage->sampling;
     const int rows = std::max(count, maxBatch > 0 ? maxBatch : 512);
     steps = std::max({1, steps, draftTokens});
     if (shared.rows >= rows && shared.steps >= steps && !shared.probabilities.dims.empty()) return;
     // Graph and eager/masked proposals execute serially and share this bounded
     // arena. Ragged verification groups have their own packing buffers.
-    for (auto &entry : draftProposalWorkspaces) entry->sampling.Clear();
-    draftProposalWorkspaces.clear(); shared.Clear();
+    for (auto &entry : storage->proposals) entry->sampling.Clear();
+    storage->proposals.clear(); shared.Clear();
     shared.rows = rows; shared.steps = steps;
     auto allocate = [&](Data &data, DataType type, const std::vector<int> &dims) {
         data.dataType = type; data.UpdateUnitSize(); data.Resize(dims);
@@ -2199,13 +2207,17 @@ void NaiveN05FlashModel::PrepareDraftSamplingMemory(int count, int steps, int vo
     shared.constraints = FastllmCudaCreateTokenConstraintBatch(rows, steps);
     allocate(shared.target, FLOAT32, {rows * (steps + 1), vocab});
     allocate(shared.verifyProposal, FLOAT32, {rows * steps, vocab});
+    if (rank >= 0) {
+        allocate(storage->samplingInput, BFLOAT16, {1, rows * steps, vocab});
+        allocate(storage->samplingTarget, FLOAT32, {rows * (steps + 1), vocab});
+    }
     std::vector<uint32_t> mask((size_t)rows * words, ~uint32_t(0));
     FastllmCudaCopyFromHostToDevice(shared.plainMask.cudaData, mask.data(), mask.size() * sizeof(uint32_t));
 #endif
 }
 
 bool NaiveN05FlashModel::PrepareDraftBatchGraph(
-        std::vector<std::unique_ptr<DraftRound>> &rounds, const Data &baseLogits) {
+        const std::vector<DraftRound *> &rounds, const Data &baseLogits, int rank) {
 #ifdef USE_CUDA
     const int count = rounds.size(), steps = rounds.front()->limit, vocab = baseLogits.dims.back();
     if (!GetFastllmEnv().cudaGraph || steps < 1 || vocab <= 0 || steps > INT_MAX / vocab ||
@@ -2221,25 +2233,26 @@ bool NaiveN05FlashModel::PrepareDraftBatchGraph(
         temperatures.push_back(r.config.temperature);
         constrained |= bool(r.config.tool_call_grammar);
     }
-    ApplyDraftDevice();
+    PrepareDraftSamplingMemory(count, steps, vocab, weight["dspark.markov_head.markov_w1.weight"].dims.back(), rank);
+    auto &storage = rank < 0 ? draftProposalStorage : draftSamplingRanks.at(rank);
 #ifndef USE_ROCM
-    FastllmCudaLinearGraphScope linearScope(draftLinearGraphWorkspaces[FastllmCudaGetDevice()]);
+    FastllmCudaLinearGraphScope linearScope(storage->samplingLinear);
 #endif
     const int device = FastllmCudaGetDevice(), words = (vocab + 31) / 32;
-    Data &w1 = weight["dspark.markov_head.markov_w1.weight"], &w2 = weight["dspark.markov_head.markov_w2.weight"];
+    Data &w1 = rank < 0 ? weight["dspark.markov_head.markov_w1.weight"] : storage->samplingW1;
+    Data &w2 = rank < 0 ? weight["dspark.markov_head.markov_w2.weight"] : storage->samplingW2;
     w1.ToDevice(DataDevice::CUDA, std::vector<int>{device}); w2.ToDevice(DataDevice::CUDA, std::vector<int>{device});
     std::vector<void *> inputs{w1.cudaData, w2.cudaData, baseLogits.cudaData};
-    PrepareDraftSamplingMemory(count, steps, vocab, w1.dims.back());
-    auto &shared = draftProposalStorage->sampling;
+    auto &shared = storage->sampling;
     std::shared_ptr<DraftWorkspace> state;
-    auto found = std::find_if(draftProposalWorkspaces.begin(), draftProposalWorkspaces.end(),
+    auto found = std::find_if(storage->proposals.begin(), storage->proposals.end(),
         [&](const std::shared_ptr<DraftWorkspace> &s) {
             const auto &p = s->sampling;
             return s->device == device && s->inputs == inputs && p.rows == count && p.steps == steps && p.constrained == constrained &&
                 p.base.dims == baseLogits.dims;
         });
-    if (found != draftProposalWorkspaces.end()) {
-        state = *found; draftProposalWorkspaces.erase(found);
+    if (found != storage->proposals.end()) {
+        state = *found; storage->proposals.erase(found);
     } else {
         state = std::make_shared<DraftWorkspace>(); state->device = device; state->inputs = inputs;
         auto &p = state->sampling;
@@ -2260,8 +2273,8 @@ bool NaiveN05FlashModel::PrepareDraftBatchGraph(
         p.disabled = !p.sampler;
         p.graphs.resize(1);
     }
-    draftProposalWorkspaces.push_back(state);
-    if (draftProposalWorkspaces.size() > 4) draftProposalWorkspaces.erase(draftProposalWorkspaces.begin());
+    storage->proposals.push_back(state);
+    if (storage->proposals.size() > 4) storage->proposals.erase(storage->proposals.begin());
     auto &p = state->sampling;
     if (p.disabled) return false;
     if (constrained) {
@@ -2340,15 +2353,96 @@ bool NaiveN05FlashModel::PrepareDraftBatchGraph(
 
 bool NaiveN05FlashModel::PrepareDraftBatch(std::vector<std::unique_ptr<DraftRound>> &rounds,
         const Data &baseLogits) {
+    std::vector<DraftRound *> all;
+    for (auto &round : rounds) all.push_back(round.get());
 #ifdef USE_CUDA
-    if (rounds.size() < 2 || draftConfidenceThreshold != 0 || baseLogits.dataType != BFLOAT16 ||
+    bool distributed = draftTP && draftTP->dataParallel && rounds.size() > 1 &&
+        draftConfidenceThreshold == 0 && GetCudaEmbedding() && baseLogits.dataType == BFLOAT16 &&
+        baseLogits.dataDevice == CUDA && baseLogits.dims.size() == 3 && baseLogits.dims[0] == 1;
+    int total = 0, steps = 0;
+    for (const auto &round : rounds) {
+        auto config = round->config; config.tool_call_token_mask.reset();
+        distributed = distributed && round->context.deviceRank >= 0 &&
+            round->context.deviceRank < (int)draftTP->devices.size() && round->limit > 0 &&
+            config.output_token_least == 0 &&
+            (config.IsSimpleGreedy() || SelectLogits(round->config).cudaSampling);
+        total += round->limit; steps = std::max(steps, round->limit);
+    }
+    if (distributed && total == baseLogits.dims[1]) {
+        auto &w1 = weight["dspark.markov_head.markov_w1.weight"];
+        auto &w2 = weight["dspark.markov_head.markov_w2.weight"];
+        const int vocab = baseLogits.dims.back(), ranks = draftTP->devices.size();
+        if (w1.dataType != BFLOAT16 || w2.dataType != BFLOAT16 || w1.dims.size() != 2 ||
+            w1.dims[0] != vocab || w2.dims != w1.dims)
+            return PrepareDraftBatchLocal(all, baseLogits, -1);
+        ApplyDraftDevice();
+        const std::vector<int> rootDevice{draftTP->devices.front()};
+        w1.ToDevice(CUDA, rootDevice); w2.ToDevice(CUDA, rootDevice);
+        FastllmCudaSyncCurrentThreadStream();
+        draftSamplingRanks.resize(ranks);
+        std::vector<std::vector<DraftRound *>> groups(ranks);
+        std::vector<std::vector<int>> offsets(ranks);
+        int offset = 0;
+        for (auto &round : rounds) {
+            const int rank = round->context.deviceRank;
+            groups[rank].push_back(round.get()); offsets[rank].push_back(offset);
+            offset += round->limit;
+        }
+        draftTP->Run([&](int rank) {
+            // Reserve the configured worst-case batch on each owner: cancellation
+            // or replacement may leave all live requests on a single device.
+            PrepareDraftSamplingMemory(groups[rank].size(), steps, vocab, w1.dims.back(), rank);
+            auto &storage = *draftSamplingRanks[rank];
+            auto replicate = [&](Data &out, const Data &source) {
+                if (out.cudaData) return;
+                out.dataType = source.dataType; out.Resize(source.dims);
+                out.ToDevice(CUDA, {draftTP->devices[rank]}, false); out.Allocate(false);
+                const size_t bytes = source.GetBytes();
+                AssertInFastLLM(FastllmCudaMemcpy2DDeviceToDeviceAsyncCurrentThread(
+                    out.cudaData, bytes, source.cudaData, bytes, bytes, 1), "Cannot copy draft sampling weights.");
+            };
+            replicate(storage.samplingW1, w1); replicate(storage.samplingW2, w2);
+            if (groups[rank].empty()) { FastllmCudaSyncCurrentThreadStream(); return; }
+            int rows = 0;
+            std::vector<void *> dst; std::vector<const void *> src; std::vector<size_t> bytes;
+            for (size_t i = 0; i < groups[rank].size(); ++i) {
+                auto &r = *groups[rank][i];
+                dst.push_back((uint16_t *)storage.samplingInput.cudaData + (size_t)rows * vocab);
+                src.push_back((const uint16_t *)baseLogits.cudaData + (size_t)offsets[rank][i] * vocab);
+                bytes.push_back((size_t)r.limit * vocab * sizeof(uint16_t)); rows += r.limit;
+            }
+            AssertInFastLLM(FastllmCudaBatchCopyFromDeviceToDeviceAsyncCurrentThread(
+                dst.data(), src.data(), bytes.data(), dst.size()), "Cannot distribute draft proposal logits.");
+            Data local;
+            local.FakeFrom(storage.samplingInput, 0); local.Resize({1, rows, vocab});
+            AssertInFastLLM(PrepareDraftBatchLocal(groups[rank], local, rank), "Cannot sample local draft batch.");
+            int targetRow = 0;
+            for (auto *round : groups[rank]) {
+                round->samplingRank = rank;
+                round->targetLogits.FakeFrom(storage.samplingTarget, (size_t)targetRow * vocab * sizeof(float));
+                round->targetLogits.Resize({(int)round->proposed.size() + 1, vocab});
+                targetRow += round->proposed.size() + 1;
+            }
+            FastllmCudaSyncCurrentThreadStream();
+        });
+        return true;
+    }
+#endif
+    return PrepareDraftBatchLocal(all, baseLogits, -1);
+}
+
+bool NaiveN05FlashModel::PrepareDraftBatchLocal(const std::vector<DraftRound *> &rounds,
+        const Data &baseLogits, int rank) {
+#ifdef USE_CUDA
+    if (rounds.empty() || (rank < 0 && rounds.size() < 2) || draftConfidenceThreshold != 0 || baseLogits.dataType != BFLOAT16 ||
         baseLogits.dataDevice != DataDevice::CUDA || baseLogits.dims.size() != 3 || baseLogits.dims[0] != 1)
         return false;
-    Data &w1 = weight["dspark.markov_head.markov_w1.weight"], &w2 = weight["dspark.markov_head.markov_w2.weight"];
+    Data &w1 = rank < 0 ? weight["dspark.markov_head.markov_w1.weight"] : draftSamplingRanks.at(rank)->samplingW1;
+    Data &w2 = rank < 0 ? weight["dspark.markov_head.markov_w2.weight"] : draftSamplingRanks.at(rank)->samplingW2;
     const int vocab = baseLogits.dims.back(), words = (vocab + 31) / 32;
     if (w1.dataType != BFLOAT16 || w2.dataType != BFLOAT16 || w1.dims.size() != 2 ||
         w1.dims[0] != vocab || w2.dims != w1.dims || !GetCudaEmbedding()) return false;
-    if (PrepareDraftBatchGraph(rounds, baseLogits)) return true;
+    if (PrepareDraftBatchGraph(rounds, baseLogits, rank)) return true;
     int total = 0, steps = 0;
     std::vector<int> offsets;
     std::vector<GenerationConfig> configs;
@@ -2360,20 +2454,20 @@ bool NaiveN05FlashModel::PrepareDraftBatch(std::vector<std::unique_ptr<DraftRoun
         configs.push_back(r.config);
     }
     if (total != baseLogits.dims[1]) return false;
-    ApplyDraftDevice();
+    PrepareDraftSamplingMemory(rounds.size(), steps, vocab, w1.dims.back(), rank);
+    auto &storage = rank < 0 ? draftProposalStorage : draftSamplingRanks.at(rank);
     w1.ToDevice(DataDevice::CUDA, baseLogits.dataDeviceIds); w2.ToDevice(DataDevice::CUDA, baseLogits.dataDeviceIds);
     auto allocate = [&](Data &data, DataType type, std::vector<int> dims) {
         data.dataType = type; data.UpdateUnitSize(); data.Resize(dims);
         data.ToDevice(DataDevice::CUDA, baseLogits.dataDeviceIds, false); data.Allocate(false);
     };
-    PrepareDraftSamplingMemory(rounds.size(), steps, vocab, w1.dims.back());
-    auto &shared = draftProposalStorage->sampling;
+    auto &shared = storage->sampling;
     for (size_t row = 0; row < rounds.size(); ++row) {
         auto &r = *rounds[row]; auto config = r.config; config.tool_call_token_mask.reset();
         r.vocab = vocab; r.greedy = config.IsSimpleGreedy();
         r.selection = SelectLogits(r.config, true); r.selection.count = 0; r.selection.cudaLogits = true;
         if (!r.greedy) {
-            r.proposalOwner = draftProposalStorage;
+            r.proposalOwner = storage;
             r.batchProbabilities.FakeFrom(shared.probabilities, (size_t)row * shared.steps * vocab * sizeof(float));
             r.batchProbabilities.Resize({r.limit, vocab});
         }
@@ -2452,14 +2546,57 @@ bool NaiveN05FlashModel::PrepareDraftBatch(std::vector<std::unique_ptr<DraftRoun
 
 void NaiveN05FlashModel::PrepareDraftAcceptance(std::vector<std::unique_ptr<DraftRound>> &rounds, Data &logits) {
 #ifdef USE_CUDA
+    if (draftTP && draftTP->dataParallel && !rounds.empty() &&
+        std::all_of(rounds.begin(), rounds.end(), [](const auto &r) { return r->samplingRank >= 0; })) {
+        const int ranks = draftTP->devices.size(), vocab = rounds.front()->vocab;
+        std::vector<std::vector<DraftRound *>> groups(ranks);
+        std::vector<std::vector<int>> offsets(ranks);
+        int offset = 0;
+        for (auto &round : rounds) {
+            groups[round->samplingRank].push_back(round.get());
+            offsets[round->samplingRank].push_back(offset); offset += round->proposed.size() + 1;
+        }
+        // Attention DP writes directly to these destinations. Other target
+        // layouts retain their normal gather and redistribute only at this boundary.
+        if (!logits.dims.empty()) { ApplyDraftDevice(); FastllmCudaSyncCurrentThreadStream(); }
+        draftTP->Run([&](int rank) {
+            if (groups[rank].empty()) return;
+            int rows = 0;
+            std::vector<void *> dst; std::vector<const void *> src; std::vector<size_t> bytes;
+            for (size_t i = 0; i < groups[rank].size(); ++i) {
+                auto &r = *groups[rank][i]; rows += r.proposed.size() + 1;
+                if (!logits.dims.empty()) {
+                    dst.push_back(r.targetLogits.cudaData);
+                    src.push_back((const float *)logits.cudaData + (size_t)offsets[rank][i] * vocab);
+                    bytes.push_back(r.targetLogits.GetBytes());
+                }
+            }
+            AssertInFastLLM(dst.empty() || FastllmCudaBatchCopyFromDeviceToDeviceAsyncCurrentThread(
+                dst.data(), src.data(), bytes.data(), dst.size()), "Cannot distribute target verification logits.");
+            Data local;
+            local.FakeFrom(draftSamplingRanks[rank]->samplingTarget, 0); local.Resize({rows, vocab});
+            PrepareDraftAcceptanceLocal(groups[rank], local, rank);
+            for (auto *r : groups[rank]) AssertInFastLLM(r->sampledAccepted >= 0, "Local rejection sampling incomplete.");
+            FastllmCudaSyncCurrentThreadStream();
+        });
+        return;
+    }
+#endif
+    std::vector<DraftRound *> all;
+    for (auto &round : rounds) all.push_back(round.get());
+    PrepareDraftAcceptanceLocal(all, logits, -1);
+}
+
+void NaiveN05FlashModel::PrepareDraftAcceptanceLocal(const std::vector<DraftRound *> &rounds, Data &logits, int rank) {
+#ifdef USE_CUDA
     if (logits.dataDevice != DataDevice::CUDA || logits.dataType != FLOAT32 || rounds.empty()) return;
-    ApplyDraftDevice();
     const int vocab = logits.dims.back();
     int steps = 0;
     for (const auto &round : rounds) steps = std::max(steps, (int)round->proposed.size());
     PrepareDraftSamplingMemory(rounds.size(), steps, vocab,
-        weight["dspark.markov_head.markov_w1.weight"].dims.back());
-    auto &packing = draftProposalStorage->sampling;
+        weight["dspark.markov_head.markov_w1.weight"].dims.back(), rank);
+    auto &storage = rank < 0 ? draftProposalStorage : draftSamplingRanks.at(rank);
+    auto &packing = storage->sampling;
     std::vector<int> offsets;
     std::map<std::pair<bool, int>, std::vector<int>> groups;
     auto owner = rounds.front()->proposalOwner;
@@ -2908,9 +3045,12 @@ std::vector<int> NaiveN05FlashModel::ForwardDraftBatch(int batch, const Data &in
     selection.cudaLogits = true;
     capture.verifying = true;
     capture.selection = &selection;
+    if (attentionDP > 1 && std::all_of(rounds.begin(), rounds.end(),
+            [](const auto &r) { return r->samplingRank >= 0; }))
+        for (auto &round : rounds) capture.logitsDestinations.push_back(&round->targetLogits);
     std::vector<std::pair<Data, Data>> unused;
     Data logits = RunDraftTarget(input, positions, unused, verifyConfigs[0], capture, &requests);
-    const int vocab = logits.dims.back();
+    const int vocab = rounds.front()->vocab;
     int offset = 0;
     PrepareDraftAcceptance(rounds, logits);
     if (std::all_of(rounds.begin(), rounds.end(), [](const auto &r) { return r->sampledAccepted >= 0; })) {
@@ -2929,7 +3069,8 @@ std::vector<int> NaiveN05FlashModel::ForwardDraftBatch(int batch, const Data &in
         const int i = selected[row], count = lengths[row];
         auto &context = *owners[i];
         Data rows(FLOAT32, {count, vocab});
-        rows.FakeFrom(logits, (size_t)offset * vocab * sizeof(float));
+        if (rounds[row]->samplingRank >= 0) rows.FakeFrom(rounds[row]->targetLogits, 0);
+        else rows.FakeFrom(logits, (size_t)offset * vocab * sizeof(float));
         TargetCapture features;
         features.verifying = true;
         features.ringVerify = capture.ringVerify;

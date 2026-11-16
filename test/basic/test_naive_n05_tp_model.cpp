@@ -7,6 +7,7 @@
 #include "../../src/models/naive_n05_tp.h"
 #include "../../src/models/naive_n05_parallel.h"
 #include "models/speculative_sampling.h"
+#include "models/mimo_tool_grammar.h"
 #include "utils/utils.h"
 #include <cmath>
 #include <cuda_fp16.h>
@@ -63,16 +64,53 @@ extern "C" bool FastllmCudaTopKTopPSampling(float *logits, float *temperatures,
         dlsym(RTLD_NEXT, "FastllmCudaTopKTopPSampling");
     return fn(logits, temperatures, topKs, topPs, output, batch, vocab);
 }
-static int batchedRejectionCalls = 0;
+static std::atomic<int> batchedRejectionCalls{0};
+static bool inspectDPRejection = false;
+static std::mutex rejectionMutex;
+static std::set<int> rejectionDevices;
 extern "C" bool FastllmCudaMtpRejectionSampling(float *logits, float *proposalProbs,
         const float *temperatures, const int *topKs, const float *topPs,
         const int *draftTokenIds, int *output, int *acceptedDraftTokens,
         int batch, int draftTokens, int vocabSize) {
     if (batch > 1) ++batchedRejectionCalls;
+    if (inspectDPRejection) {
+        std::vector<float> q((size_t)batch * draftTokens * vocabSize);
+        auto error = cudaMemcpy(q.data(), proposalProbs, q.size() * sizeof(float), cudaMemcpyDeviceToHost);
+        if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+        for (int row = 0; row < batch * draftTokens; ++row) {
+            double sum = 0;
+            for (int token = 0; token < vocabSize; ++token) {
+                const float x = q[(size_t)row * vocabSize + token];
+                if (!std::isfinite(x) || x < 0) throw std::runtime_error("Invalid distributed proposal probability");
+                sum += x;
+            }
+            if (std::abs(sum - 1) > 1e-4 || q[(size_t)row * vocabSize + draftTokenIds[row]] <= 0)
+                throw std::runtime_error("Distributed proposal distribution/token mismatch");
+        }
+        std::lock_guard<std::mutex> guard(rejectionMutex);
+        rejectionDevices.insert(FastllmCudaGetDevice());
+    }
+    // Tiny top-p has support only at the maximum (possibly tied). Compare
+    // against the actual target rows, not an unrelated stochastic trajectory.
+    std::vector<float> target;
+    if (inspectDPRejection && topPs[0] <= 1e-5f) {
+        target.resize((size_t)batch * (draftTokens + 1) * vocabSize);
+        auto error = cudaMemcpy(target.data(), logits, target.size() * sizeof(float), cudaMemcpyDeviceToHost);
+        if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+    }
     static auto fn = (bool (*)(float *, float *, const float *, const int *, const float *,
         const int *, int *, int *, int, int, int))dlsym(RTLD_NEXT, "FastllmCudaMtpRejectionSampling");
-    return fn(logits, proposalProbs, temperatures, topKs, topPs, draftTokenIds,
+    const bool ok = fn(logits, proposalProbs, temperatures, topKs, topPs, draftTokenIds,
               output, acceptedDraftTokens, batch, draftTokens, vocabSize);
+    if (ok && !target.empty()) for (int b = 0; b < batch; ++b)
+        for (int j = 0; j <= acceptedDraftTokens[b]; ++j) {
+            const size_t row = (size_t)b * (draftTokens + 1) + j;
+            const float *values = target.data() + row * vocabSize;
+            const int token = output[row];
+            if (*std::max_element(values, values + vocabSize) - values[token] > 1e-5f)
+                throw std::runtime_error("Distributed rejection output violates target support");
+        }
+    return ok;
 }
 static bool failVerifyBegin = false, failVerifyInstantiate = false, expectVerifyGraph = true;
 static int failGraphDevice = 3;
@@ -3352,9 +3390,10 @@ class Fixture : public NaiveN05FlashModel {
         return result;
     }
 
-    void AttentionDPSpark(int groups, int candidates, bool sample, bool finiteTopK = false) {
+    void AttentionDPSpark(int groups, int candidates, bool sample, bool finiteTopK = false, bool sampleOracle = false, bool toolGrammar = false) {
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
         const int rejectionCalls = batchedRejectionCalls;
+        inspectDPRejection = sample; rejectionDevices.clear();
 #endif
         ConfigureAttentionParallel(groups);
         draftEnabled = canDoConcurrentForward = true;
@@ -3362,50 +3401,89 @@ class Fixture : public NaiveN05FlashModel {
         draftHeads=8; draftKvHeads=2; draftHeadDim=32; draftWindow=1024;
         draftConfidenceThreshold=0; draftTargetLayers={0,1};
         AddDraftTestWeights(weight,draftLayers,draftKvHeads,256,true);
-        const int requests=groups+1;
+        std::map<std::string, std::vector<uint8_t>> markovWeights;
+        for (const char *name : {"dspark.markov_head.markov_w1.weight", "dspark.markov_head.markov_w2.weight"}) {
+            const Data &w = weight[name];
+            markovWeights[name] = std::vector<uint8_t>(w.cpuData, w.cpuData + w.GetBytes());
+        }
+        // Include multiple requests on at least one draft owner even when
+        // the target uses a single attention group (pure TP).
+        const int requests=std::max(groups,ranks)+1;
         using Cache=std::vector<std::pair<Data,Data>>;
         std::vector<Cache> caches(requests), reference(requests);
-        std::vector<int> anchors(requests), expected(requests);
+        std::vector<int> anchors(requests), expected(requests), emitted(requests, 0);
         std::vector<GenerationConfig> configs(requests);
+        std::shared_ptr<MimoToolGrammar> grammar;
+        if (toolGrammar) {
+            std::vector<std::string> vocabulary(256, "v");
+            const std::vector<std::string> markers{"<tool_call>", "<function=", "alpha", ">",
+                "<parameter=x>", "v", "</parameter>", "</function>", "</tool_call>",
+                "beta", "y", "<parameter=y>", " ", "<think>", "</think>"};
+            std::copy(markers.begin(), markers.end(), vocabulary.begin());
+            grammar = std::make_shared<MimoToolGrammar>(
+                std::map<std::string, std::vector<std::string>>{{"alpha", {"x"}}, {"beta", {"y"}}});
+            for (int i = 0; i < (int)vocabulary.size(); ++i) weight.tokenizer.Insert(vocabulary[i], i);
+        }
         for(int i=0;i<requests;++i) {
             caches[i].resize(block_cnt); reference[i].resize(block_cnt);
-            auto &cfg=configs[i]; cfg.input_token_length=19+i; cfg.output_token_limit=64;
-            cfg.top_k=sample ? (finiteTopK ? 50 : weight["lm_head.weight"].dims[0]) : 1; cfg.top_p=sample ? .95f : 1.f; cfg.temperature=sample ? 1.f : 0.f;
+            auto &cfg=configs[i]; cfg.input_token_length=19+i; cfg.output_token_limit=25+i;
+            cfg.top_k=sample ? (finiteTopK ? 50 : weight["lm_head.weight"].dims[0]) : 1; cfg.top_p=sampleOracle ? 1e-6f : sample ? .95f : 1.f; cfg.temperature=sample ? 1.f : 0.f;
+            if (grammar) {
+                cfg.tool_call_grammar = grammar;
+                cfg.tool_call_grammar_state = grammar->Advance(0, i % 3 == 0 ? "<tool_call><function=" :
+                    i % 3 == 1 ? "<tool_call><function=alpha>" : "<tool_call><function=beta><parameter=y>");
+                PrepareToolCallConstraint(cfg);
+            }
             if (cfg.IsSimpleGreedy() == sample) throw std::runtime_error("DP test sampling mode");
             std::vector<float> ids(19+i), pos(19+i); std::iota(pos.begin(),pos.end(),0.f);
             for(size_t j=0;j<ids.size();++j) ids[j]=(j+i*19)%251;
             Data input(FLOAT32,{1,(int)ids.size()},ids), positions(FLOAT32,{1,(int)ids.size()},pos);
             anchors[i]=Forward(input,Data(),positions,caches[i],cfg);
+            if (grammar) {
+                if (!cfg.AllowsToolToken(anchors[i])) throw std::runtime_error("Constrained prefill token invalid");
+                AdvanceToolCallGrammar(cfg, anchors[i]); PrepareToolCallConstraint(cfg);
+            }
             if(!sample) {
                 draftEnabled=false; expected[i]=Forward(input,Data(),positions,reference[i],cfg); draftEnabled=true;
                 if(anchors[i]!=expected[i]) throw std::runtime_error("DP draft prefill token mismatch");
             }
         }
         for(int turn=0;turn<24;++turn) {
+            std::vector<int> order;
+            for (int i = 0; i < requests; ++i)
+                if ((turn != 8 || i == requests - 1) && (turn != 9 || i % std::max(2, groups) != 0)) order.push_back(i);
+            if (turn % 2) std::reverse(order.begin(), order.end());
             std::vector<Data> positions;
             std::vector<Data*> pos;
-            std::vector<float> ids(anchors.begin(),anchors.end());
+            std::vector<float> ids;
+            std::vector<GenerationConfig> activeConfigs;
             std::vector<std::pair<Data*,Data*>> kv;
-            for(int i=0;i<requests;++i) {
-                positions.emplace_back(FLOAT32,std::vector<int>{1,1},std::vector<float>{float(configs[i].input_token_length+turn)});
+            for(int i : order) {
+                positions.emplace_back(FLOAT32,std::vector<int>{1,1},std::vector<float>{float(configs[i].input_token_length+emitted[i])});
+                ids.push_back(anchors[i]); activeConfigs.push_back(configs[i]);
                 for(auto &layer:caches[i]) kv.emplace_back(&layer.first,&layer.second);
             }
             for(auto &p:positions) pos.push_back(&p);
-            auto tokens=ForwardBatch(requests,Data(FLOAT32,{1,requests},ids),{},pos,
-                std::vector<int>(requests,1),kv,configs,LastTokensManager());
-            if(tokens.size()!=size_t(requests)) throw std::runtime_error("DP DSpark missing output");
-            for(int i=0;i<requests;++i) {
-                if(tokens[i]<0 || tokens[i]>=256) throw std::runtime_error("DP DSpark invalid token");
+            auto tokens=ForwardBatch(order.size(),Data(FLOAT32,{1,(int)order.size()},ids),{},pos,
+                std::vector<int>(order.size(),1),kv,activeConfigs,LastTokensManager());
+            if(tokens.size()!=order.size()) throw std::runtime_error("DP DSpark missing output");
+            for(size_t index=0; index<order.size(); ++index) {
+                const int i=order[index];
+                if(tokens[index]<0 || tokens[index]>=256) throw std::runtime_error("DP DSpark invalid token");
                 if(!sample) {
                     draftEnabled=false;
-                    expected[i]=Forward(Data(FLOAT32,{1,1},{float(expected[i])}),Data(),positions[i],reference[i],configs[i]);
+                    expected[i]=Forward(Data(FLOAT32,{1,1},{float(expected[i])}),Data(),positions[index],reference[i],configs[i]);
                     draftEnabled=true;
-                    if(tokens[i]!=expected[i]) throw std::runtime_error("DP DSpark greedy oracle mismatch turn="+std::to_string(turn));
+                    if(tokens[index]!=expected[i]) throw std::runtime_error("DP DSpark greedy oracle mismatch turn="+std::to_string(turn));
                 }
                 auto &ctx=*draftContexts.at(&caches[i]);
                 if(ctx.committed!=caches[i][0].first.dims[1]) throw std::runtime_error("DP draft/target commit mismatch");
+                if (grammar) {
+                    if (!configs[i].AllowsToolToken(tokens[index])) throw std::runtime_error("Distributed rejection violated grammar");
+                    AdvanceToolCallGrammar(configs[i], tokens[index]); PrepareToolCallConstraint(configs[i]);
+                }
+                anchors[i]=tokens[index]; ++emitted[i];
             }
-            anchors=tokens;
         }
         uint64_t rounds=0,proposed=0,accepted=0;
         for(auto &cache:caches) {
@@ -3414,16 +3492,29 @@ class Fixture : public NaiveN05FlashModel {
             rounds+=ctx.rounds;proposed+=ctx.proposed;accepted+=ctx.accepted;
             draftContexts.erase(&cache);
         }
+        // The first DP proposal must upload the CPU-loaded Markov weights,
+        // before replicating them to the owners. Check their exact bytes.
+        for (const auto &entry : markovWeights) {
+            Data host(weight[entry.first]); host.ToDevice(DataDevice::CPU);
+            if (host.GetBytes() != entry.second.size() ||
+                    std::memcmp(host.cpuData, entry.second.data(), entry.second.size()) != 0)
+                throw std::runtime_error("DP sampling did not preserve CPU-loaded Markov weights");
+        }
         if(draftBlock!=7 || draftTokens!=candidates) throw std::runtime_error("DP draft block size changed");
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
         if (sample && !finiteTopK && batchedRejectionCalls <= rejectionCalls)
             throw std::runtime_error("DP rejection sampling did not batch requests");
+        inspectDPRejection = false;
+        const char *draftMode = std::getenv("FASTLLM_DSPARK_TP");
+        if (sample && !finiteTopK && draftMode && std::string(draftMode).find("dp:") == 0 &&
+                rejectionDevices.size() != (size_t)std::stoi(std::string(draftMode).substr(3)))
+            throw std::runtime_error("Rejection sampling did not run on every draft owner");
 #endif
         std::cout<<"ATTENTION DP DSPARK PASS dp="<<groups<<" candidates="<<candidates
                  <<" sample="<<sample<<" finite_top_k="<<finiteTopK<<" rounds="<<rounds<<" proposed="<<proposed<<" accepted="<<accepted<<std::endl;
     }
 
-    std::vector<std::vector<float>> AttentionDPVerification(int groups, bool batched) {
+    std::vector<std::vector<float>> AttentionDPVerification(int groups, bool batched, bool scatter = false) {
         ConfigureAttentionParallel(groups);
         draftTargetLayers = {0, 1};
         using Cache = std::vector<std::pair<Data, Data>>;
@@ -3470,12 +3561,20 @@ class Fixture : public NaiveN05FlashModel {
             std::vector<std::vector<std::vector<float>>> features(order.size());
             if (batched) {
                 Cache unused; TargetCapture capture; capture.verifying = true; capture.selection = &selection;
+                const auto devices = PDDevices();
+                std::vector<Data> destinations(order.size());
+                if (scatter) for (size_t i = 0; i < order.size(); ++i) {
+                    auto &out = destinations[i]; out.dataType = FLOAT32; out.Resize({lengths[i], 256});
+                    out.ToDevice(CUDA, {devices[(order[i] + 1) % devices.size()]}, false); out.Allocate(false);
+                    capture.logitsDestinations.push_back(&out);
+                }
                 auto output = RunDraftTarget(Data(FLOAT32,{1,(int)ids.size()},ids),
                     Data(FLOAT32,{1,(int)positions.size()},positions),unused,config,capture,&batch);
-                auto all = host(output);
+                auto all = scatter ? std::vector<float>{} : host(output);
                 int offset = 0;
                 for (size_t i = 0; i < order.size(); ++i) {
-                    logits[i].assign(all.begin()+offset*256, all.begin()+(offset+lengths[i])*256);
+                    if (scatter) logits[i] = host(destinations[i]);
+                    else logits[i].assign(all.begin()+offset*256, all.begin()+(offset+lengths[i])*256);
                     for (const auto &feature : capture.hidden) {
                         auto data = host(feature.second);
                         features[i].emplace_back(data.begin()+offset*256, data.begin()+(offset+lengths[i])*256);
@@ -4975,27 +5074,36 @@ int main(int argc, char **argv) {
             return 0;
         }
         if (argc > 2 && std::string(argv[2]) == "attention_dp_dspark") {
-            SetCudaGraph(false); SetCudaEmbedding(true);
+            SetCudaGraph(argc > 6 && std::string(argv[6]) != "eager"); SetCudaEmbedding(true);
             const int groups=argc>3 ? std::stoi(argv[3]) : 2;
             const int candidates=argc>4 ? std::stoi(argv[4]) : 3;
             const bool finiteTopK=argc>5 && std::string(argv[5])=="sample_topk";
-            const bool sample=finiteTopK || (argc>5 && std::string(argv[5])=="sample");
+            const bool sampleOracle=argc>5 && std::string(argv[5])=="sample_oracle";
+            const bool toolGrammar=argc>5 && std::string(argv[5])=="sample_tools";
+            const bool sample=toolGrammar || sampleOracle || finiteTopK || (argc>5 && std::string(argv[5])=="sample");
+#ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+            failGraphDevice = ranks - 1;
+            failVerifyBegin = argc > 6 && std::string(argv[6]) == "fail_begin";
+            failVerifyInstantiate = argc > 6 && std::string(argv[6]) == "fail_instantiate";
+#endif
             Fixture fixture(ranks); fixture.SetKVCacheDataType(FP8_E4M3);
-            fixture.AttentionDPSpark(groups,candidates,sample,finiteTopK);
+            fixture.AttentionDPSpark(groups,candidates,sample,finiteTopK,sampleOracle,toolGrammar);
             return 0;
         }
         if (argc > 2 && std::string(argv[2]) == "attention_dp_verify") {
-            SetCudaGraph(false); SetCudaEmbedding(true);
+            SetCudaGraph(argc > 6 && std::string(argv[6]) == "graph"); SetCudaEmbedding(true);
             const int groups = argc > 3 ? std::stoi(argv[3]) : 2;
             const bool fp8 = argc > 4 && std::string(argv[4]) == "fp8";
+            const bool scatter = argc > 5 && std::string(argv[5]) == "scatter";
             std::vector<std::vector<float>> expected;
             { Fixture fixture(ranks); if(fp8) fixture.SetKVCacheDataType(FP8_E4M3);
-              expected=fixture.AttentionDPVerification(groups,false); }
+              expected=fixture.AttentionDPVerification(groups,scatter); }
             Fixture fixture(ranks); if(fp8) fixture.SetKVCacheDataType(FP8_E4M3);
-            auto actual=fixture.AttentionDPVerification(groups,true);
+            auto actual=fixture.AttentionDPVerification(groups,true,scatter);
             if(actual.size()!=expected.size()) throw std::runtime_error("DP verify count mismatch");
             for(size_t i=0;i<actual.size();++i) {
                 if(actual[i].size()!=expected[i].size()) throw std::runtime_error("DP verify shape mismatch");
+                if (scatter && actual[i] != expected[i]) throw std::runtime_error("Distributed verification logits differ from gathered logits");
                 RequireCloseLogits(actual[i].data(),expected[i],"DP verify logits/hidden i="+std::to_string(i));
             }
             std::cout<<"ATTENTION DP VERIFY PASS world="<<ranks<<" dp="<<groups

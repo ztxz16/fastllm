@@ -245,6 +245,16 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
     const bool distributedSampling = !isIntermediateChunkedPrefill && !capture && !sparseKv &&
         !(tpServingState && tpServingState->preparing) && state.samplingCapacity >= liveRows &&
         selection && selection->cudaSampling && !selection->cudaLogits;
+    const bool distributedVerification = verifying && capture && !capture->logitsDestinations.empty();
+    if (distributedVerification) {
+        AssertInFastLLM(batch && capture->logitsDestinations.size() == (size_t)batch->Size(),
+            "Invalid distributed verification destinations.");
+        for (int seq = 0; seq < batch->Size(); ++seq) {
+            const Data *out = capture->logitsDestinations[seq];
+            AssertInFastLLM(out && out->dataDevice == CUDA && out->dataType == FLOAT32 && out->cudaData &&
+                out->dims == std::vector<int>({batch->lengths[seq], vocab}), "Invalid local verification logits.");
+        }
+    }
     std::vector<std::vector<int>> samplingRows;
     if (distributedSampling) {
         samplingRows.resize(attentionDP);
@@ -255,7 +265,7 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
         }
     }
     Data &joined = tpSamplingLogits;
-    if (!isIntermediateChunkedPrefill && !distributedSampling) {
+    if (!isIntermediateChunkedPrefill && !distributedSampling && !distributedVerification) {
         FastllmCudaSetDevice(tpDevices.front());
         joined.dataType = FLOAT32; joined.UpdateUnitSize(); joined.Resize({outputRows, vocab});
         joined.ToDevice(CUDA, {tpDevices.front()}, false); joined.Allocate(false);
@@ -333,7 +343,22 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
         if (!isIntermediateChunkedPrefill) {
             const auto range = tpVocabRanges[rank];
             const size_t bytes = size_t(range.second - range.first) * sizeof(float);
-            if (distributedSampling) {
+            if (distributedVerification) {
+                int row = 0;
+                std::vector<void *> dst;
+                std::vector<const void *> src;
+                std::vector<size_t> dstPitch, srcPitch, widths, heights;
+                for (int seq = 0; seq < batch->Size(); ++seq) {
+                    dst.push_back((float *)capture->logitsDestinations[seq]->cudaData + range.first);
+                    src.push_back((char *)logits.cudaData + size_t(row) * bytes);
+                    dstPitch.push_back(size_t(vocab) * sizeof(float)); srcPitch.push_back(bytes);
+                    widths.push_back(bytes); heights.push_back(batch->lengths[seq]);
+                    row += batch->lengths[seq];
+                }
+                AssertInFastLLM(FastllmCudaBatchCopy2DAsyncCurrentThread(dst.data(), src.data(),
+                    dstPitch.data(), srcPitch.data(), widths.data(), heights.data(), dst.size()),
+                    "Naive verification logits redistribution failed");
+            } else if (distributedSampling) {
                 std::vector<void *> destinations;
                 std::vector<const void *> sources;
                 std::vector<size_t> sizes;
@@ -484,7 +509,7 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
         capture->hidden = std::move(captures.front().hidden);
         capture->prefixes = std::move(prefixes);
     }
-    if (isIntermediateChunkedPrefill) return Data();
+    if (isIntermediateChunkedPrefill || distributedVerification) return Data();
     if (distributedSampling) {
         selection->sampledTokens.resize(liveRows);
         state.runtime.Run([&](int rank, int) {
