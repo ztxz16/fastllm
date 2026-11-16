@@ -4,6 +4,7 @@
 #include "fastllm.h"
 
 #include <string>
+#include <functional>
 
 namespace fastllm {
 
@@ -37,6 +38,7 @@ namespace fastllm {
         bool inited = false;
         bool sync = true;
         bool enableCudaGraph = false;
+        const void *graphResourceOwner = nullptr;
         int flashInferCudaGraph = -1;
         int windowLeft = -1;
 
@@ -101,6 +103,19 @@ namespace fastllm {
     bool RunCudaAttentionBackend(CudaAttentionInvocation &invocation,
                                  std::string &actualBackend,
                                  std::string &lastError);
+
+    /**
+     * 将私有Graph计划的释放动作登记到调用方生命周期。
+     * @param owner 非空的独占Graph资源所有者；普通FT调用不指定时保持现有行为。
+     * @param cleanup 只释放该所有者的计划，调用时所有相关流必须已同步且图已销毁。
+     */
+    void RegisterCudaAttentionGraphCleanup(const void *owner, std::function<void()> cleanup);
+
+    /**
+     * 释放指定所有者的私有Graph计划；不清除其他模型共享的算子工作区。
+     * @param owner 已同步并销毁所有Graph的资源所有者；重复调用无副作用。
+     */
+    void ReleaseCudaAttentionGraphResources(const void *owner);
 
     /** 注册当前CUDA构建提供的连续与分页Attention Backend。 */
     void RegisterBuiltinCudaAttentionBackends();

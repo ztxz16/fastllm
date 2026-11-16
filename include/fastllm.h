@@ -752,6 +752,7 @@ namespace fastllm {
         std::unordered_map<uint64_t, CacheTrieNode*> children;
         CacheTrieNode *parent = nullptr;
         uint64_t edgeHash = 0;
+        std::vector<int> tokenIds;
     };
 
     // 一个带PageCache功能的Data，可以管理多个PageCache
@@ -789,7 +790,11 @@ namespace fastllm {
 
             // Trie树缓存管理
             CacheTrieNode *trieRoot = nullptr;
+            std::map<uint32_t, CacheTrieNode*> positionRoots;
             std::unordered_map<int, CacheTrieNode*> pageToTrieNode;
+            uint64_t evictedPages = 0;
+
+            ~PagedCacheManager();
 
             void SetMaxPages(int maxPages);
             int GetUnusedPageIndex(bool pick);
@@ -799,8 +804,12 @@ namespace fastllm {
             void Pick(std::vector<int> &pageIds);
 
             static uint64_t HashTokenPage(const int *tokens, int len);
-            void Record(const std::vector<int> &tokens, const std::vector<int> &pages);
-            void Query(const std::vector<int> &tokens, std::vector<int> &cachedPageIds);
+            void Record(const std::vector<int> &tokens, const std::vector<int> &pages, uint32_t position = 0);
+            void Query(const std::vector<int> &tokens, std::vector<int> &cachedPageIds, uint32_t position = 0);
+            /** 清空前缀索引，保留活动请求的页引用与页池；调用前同步设备工作。 */
+            void ClearPrefix();
+            /** 导出当前有效前缀，返回每个终点的RoPE起点和完整token序列。 */
+            std::vector<std::pair<uint32_t, std::vector<int>>> PrefixDirectory();
     };
 
     struct PartitionLinkNode {
@@ -1369,7 +1378,30 @@ namespace fastllm {
     void IA3Layer(Data &input, Data &weight, Data &ia3_l, Data &bias, Data &output,
                   std::map <std::string, std::string> ia3Config);
 
-    PagedCacheManager* AllocatePagedCacheManager(int layerIndex, 
+    /**
+     * 创建由调用方独占的FT页池，物理布局为[maxPages,pageLen,heads,dim]。
+     * 分配时切换到描述符指定设备并恢复原设备；不加入全局layer索引，调用方负责销毁。
+     * @param type 页池用途，保持FT原有KV/MLP分类。
+     * @param cacheData 逻辑[heads,tokens,dim]描述符，提供类型、头数、头维度及设备。
+     * @param pageLen 小于等于0时沿用FT配置的页大小。
+     * @param maxPages 小于等于0时按FT最大token配置或默认300页计算。
+     * @return 新页池；分配错误沿用FT错误处理，不返回不完整页池。
+     */
+    PagedCacheManager* CreatePagedCacheManager(PagedCacheManager::PagedCacheManagerType type,
+        const Data &cacheData, int pageLen = -1, int maxPages = -1);
+
+    /** 释放描述符持有的页引用；可递归处理多设备描述符，不销毁页池。 */
+    void ReleasePagedCacheReferences(Data &cache, bool clearDims = false);
+    /** 绑定并引用完整前缀页，逻辑形状为[heads,pageCount*pageLen,dim]。 */
+    void RestorePagedCachePages(Data &cache, PagedCacheManager &manager,
+        const std::vector<int> &pages, int pageCount);
+    /** 仅登记已计算的完整页；tokens可以包含尚未进入KV的末尾输出token。 */
+    void RecordPagedCachePrefix(Data &cache, const std::vector<int> &tokens, uint32_t position = 0);
+    /** 查询一组K/V描述符共同可复用的完整前缀，至少保留一个输入token。 */
+    int QueryPagedCachePrefix(const std::vector<Data*> &caches, const std::vector<int> &tokens,
+        uint32_t position = 0);
+
+    PagedCacheManager* AllocatePagedCacheManager(int layerIndex,
         PagedCacheManager::PagedCacheManagerType type, 
         const Data &cacheData, 
         int pageLen =  -1, 

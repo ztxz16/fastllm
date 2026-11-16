@@ -10,6 +10,8 @@
 
 namespace fastllm {
     namespace {
+        std::mutex graphResourceMutex;
+        std::map<const void*, std::vector<std::function<void()>>> graphResources;
         struct CachedBackend {
             CudaAttentionBackendRegistration registration;
             std::string supportReason;
@@ -90,6 +92,26 @@ namespace fastllm {
                    invocation.headDim, invocation.group, reason.c_str());
             fflush(stdout);
         }
+    }
+
+    /** 记录独占Graph计划的释放动作；在首次计划创建时登记，捕获和重放期间不登记。 */
+    void RegisterCudaAttentionGraphCleanup(const void *owner, std::function<void()> cleanup) {
+        if (!owner) return;
+        std::lock_guard<std::mutex> guard(graphResourceMutex);
+        graphResources[owner].push_back(std::move(cleanup));
+    }
+
+    /** 取出回调后释放锁再清理，避免与后端计划锁形成反向锁序。 */
+    void ReleaseCudaAttentionGraphResources(const void *owner) {
+        std::vector<std::function<void()>> callbacks;
+        {
+            std::lock_guard<std::mutex> guard(graphResourceMutex);
+            auto it = graphResources.find(owner);
+            if (it == graphResources.end()) return;
+            callbacks = std::move(it->second);
+            graphResources.erase(it);
+        }
+        for (auto &cleanup : callbacks) cleanup();
     }
 
     bool RegisterCudaAttentionBackend(

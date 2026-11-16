@@ -25,6 +25,7 @@
 
 #include "fastllm-cuda.cuh"
 #include "fastllm.h"
+#include "attention/fastllm-attention-backend.h"
 #include "utils/utils.h"
 #include "attention/fastllm-attention-dtype.cuh"
 #include "attention/fastllm-paged-attention-native.cuh"
@@ -3158,6 +3159,7 @@ void FastllmFlashInferAppendPointerKey(std::vector<uint32_t> &key,
  *                            Graph计划，非0启用；捕获期间不允许计划缓存缺失。
  * @param windowLeft          小于0表示不限制左窗口；非负时限制左侧可见范围，
  *                            该功能要求FlashInfer可用。
+ * @param graphResourceOwner 非空时将私有Graph计划绑定到调用方生命周期；调用方销毁图后显式释放。
  * @return true表示执行提交成功并完成所要求的同步，false表示显式校验失败或
  *         原生实现返回失败，原因见日志。部分非法输入及FlashInfer执行错误
  *         仍会打印日志后exit(0)，窗口回退限制通过断言报错，并非统一返回false。
@@ -3168,7 +3170,7 @@ bool FastllmCudaHalfPagedAttentionBatch(
     fastllm::Data &output,
     int group, float scale, int attentionType,
     bool inited, bool sync, bool enableCudaGraph, int flashInferCudaGraph,
-    int windowLeft) {
+    int windowLeft, const void *graphResourceOwner) {
 #ifndef FASTLLM_ENABLE_FLASHINFER
     fastllm::AssertInFastLLM(windowLeft < 0,
                              "Sliding-window paged attention requires FlashInfer.\n");
@@ -3568,6 +3570,16 @@ bool FastllmCudaHalfPagedAttentionBatch(
                 auto &device_cache = graph_plan_cache[current_device_id];
                 auto inserted = device_cache.emplace(plan_key, created);
                 entry = inserted.first->second;
+                if (inserted.second && graphResourceOwner) {
+                    fastllm::RegisterCudaAttentionGraphCleanup(graphResourceOwner,
+                        [current_device_id, plan_key]() {
+                            std::lock_guard<std::mutex> guard(plan_cache_mutex);
+                            auto device = graph_plan_cache.find(current_device_id);
+                            if (device == graph_plan_cache.end()) return;
+                            device->second.erase(plan_key);
+                            if (device->second.empty()) graph_plan_cache.erase(device);
+                        });
+                }
             }
         } else {
             constexpr size_t kMaxEagerPlanSlotsPerDevice = 32;
