@@ -7,7 +7,7 @@ FastLLM is an inference engine for running and serving language models locally. 
 - **Automatic deployment:** `--auto` plans devices, memory, expert caches, and context capacity, with optional overrides.
 - **Browser launcher:** download models, save profiles, inspect logs, and use chat or agents in Studio.
 - **Compatible APIs:** OpenAI Chat Completions, Responses, and Anthropic Messages.
-- **Multiple weight formats:** Safetensors, FastLLM, AWQ, and supported GGUF models. See the [model guides](#model-deployment-guides) for coverage.
+- **Multiple weight formats:** Safetensors, FastLLM, AWQ, supported GGUF models, and EXL3. DeepSeek-V4.1-Flash supports original checkpoints and Unsloth / GSQ-RCO quantizations; see [formats and deployment](docs/deepseek_v41_en.md#models-and-weight-formats).
 
 ## Quick start
 
@@ -97,7 +97,7 @@ For standalone chat, run `ftllm webui --api_base http://127.0.0.1:8080/v1 --api_
 | Qwen4-Exp / Qwen3.8-Flash-Next | [Flash-Next user guide](docs/qwen3.8-flash-next/README_EN.md) |
 | Qwen3.5 / Qwen3.6 / Qwen3.8 | [Qwen guide](docs/qwen3_en.md) |
 | DeepSeek-V4 / V4-Flash | [DeepSeek-V4 guide](docs/deepseek_en.md) |
-| DeepSeek-V4.1-Flash 1017 | [DeepSeek-V4.1 guide](docs/deepseek_v41_en.md) |
+| DeepSeek-V4.1-Flash 1017 (original / Unsloth / GSQ-RCO / EXL3) | [Formats, automatic deployment, and DSpark](docs/deepseek_v41_en.md) |
 | Kimi-K3 | [Kimi-K3 guide](docs/kimi_k3_en.md) |
 | GLM-5 / GLM-5.3-Flash | [GLM-5 guide](docs/glm5_en.md) |
 | Dots3-Note / Laguna | [Dots3-Note](docs/dots3_note_en.md) · [Laguna](docs/laguna_en.md) |

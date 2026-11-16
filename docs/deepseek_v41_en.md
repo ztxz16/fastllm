@@ -2,7 +2,45 @@
 
 [中文与详细实现说明](deepseek_v41.md) · [Project home](../README_EN.md) · [`--auto` tuning](auto_en.md)
 
-This guide covers DeepSeek-V4.1-Flash (`deepseek_v41`), including supported HF checkpoints and GSQ-RCO GGUF files. DeepSeek-V4 uses a different deployment path; see its [separate guide](deepseek_en.md).
+This guide covers DeepSeek-V4.1-Flash 1017 (`deepseek_v41`), including original HF checkpoints, GSQ-RCO / Unsloth GGUF, and EXL3. DeepSeek-V4 uses a different deployment path; see its [separate guide](deepseek_en.md).
+
+## Models and weight formats
+
+| Format | Path passed to `ftllm server` | Required files |
+| --- | --- | --- |
+| Original HF checkpoint | Model directory | Configuration, tokenizer, Safetensors index, and all shards; original weights already include FP8 / FP4 |
+| GSQ-RCO GGUF | Single file or first `.gguf` shard | Complete matching backbone and Engram; embedded configuration/tokenizer removes the need for `--ori` |
+| Unsloth GGUF | First shard of the selected quantization | Every shard, including Engram; optional DSpark / mmproj files are separate |
+| EXL3 | Model directory | EXL3 configuration, tokenizer, Safetensors index, and all quantized/non-quantized weights |
+
+All four use `--auto` for device and memory planning. CPU/NUMA experts, GPU expert caches, and multi-GPU paths depend on the format, hardware, and budget. Engram placement is independent of expert placement; the quantized backbone's file size is not the full memory requirement.
+
+Supported Unsloth Dynamic V3.1 variants include IQ1_S, IQ1_M, IQ2_XXS, Q2_K_XL, IQ3_XXS, IQ3_S, Q3_K_XL, Q4_K_XL, and Q8_K_XL. These are mixed-quantization releases, not a single tensor type. Keep all shards from the same release. For example:
+
+```sh
+ftllm server /path/to/DeepSeek-V4.1-Flash-1017-IQ2_XXS-00001-of-00004.gguf \
+  --auto --model_name deepseek-v4.1-flash --port 8080
+```
+
+Use the actual filename and shard count. Add matching speculative weights if needed:
+
+```sh
+ftllm server /path/to/model-00001-of-00004.gguf --auto \
+  --draft /path/to/dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf --dspark 5
+```
+
+EXL3 loads directly, without a separate ExLlamaV3/Maya runtime or conversion to GGUF:
+
+```sh
+ftllm server /path/to/DeepSeek-V4.1-Flash-EXL3 --auto \
+  --model_name deepseek-v4.1-flash --port 8080
+```
+
+Keep the repository's EXL3 configuration and complete weight set. The loader validates trellises, scales, and codebook markers; `EXL3: ... logical projections` in the startup log confirms detection. CPU/NUMA experts, GPU caching, and supported CUDA projections/MoE retain general fallbacks. See [EXL3 operator selection (Chinese)](kernel-policy.md#exl3-投影). Format support does not add every EXL3 model architecture or quantize original weights during loading.
+
+Text, tool calling, prefix reuse, hybrid inference, and TP use the model-specific deployment paths below. DSpark requires embedded `mtp.*` weights or a matching external draft. Multiple requests can batch target verification; compatible single-CUDA requests can also batch drafts and replay a full draft graph. TP drafts and unsupported combinations retain independent execution. See [draft batching and limits (Chinese)](deepseek_v41.md#多请求草稿合批).
+
+Image understanding requires original vision components or a matching `--mmproj` plus vision routing biases. Image requests currently do not speculate.
 
 ## Automatic configuration (recommended)
 
@@ -32,11 +70,11 @@ For [Unsloth Dynamic V3.1](https://unsloth.ai/docs/models/deepseek-v4.1-flash), 
 
 Mixed GGUF/MXFP4 experts support CPU/NUMA hybrid inference, GPU expert caching, and full CUDA graphs. Storage backends receive shares of one GPU cache budget; pure MXFP4 layers keep their native FP4 kernels. Mixed layers only reorder quantized bytes on cache admission, without expanding floating-point weights or requantizing. No additional switch is required.
 
-Automatic defaults are one request, up to a 1M-token native window, FP4 KV, and fast prefill. Embedded DSpark weights enable DSpark 5 by default; GGUF files without those weights do not. Check `[auto]` for the selected devices, chunks, and caches. The planner prioritizes avoiding disk experts when GPU and host memory can hold them; Engram may still use disk independently.
+Automatic defaults are one request, up to a 1M-token native window, FP4 KV, and fast prefill. Embedded DSpark weights enable DSpark 5 by default; GGUF files without those weights do not. The DSpark confidence threshold defaults to `0` (no early cutoff); explicit CLI/JSON values override it. Check `[auto]` for the selected devices, chunks, and caches. The planner prioritizes avoiding disk experts when GPU and host memory can hold them; Engram may still use disk independently.
 
 `--auto` enables `--kernel-tune quick` by default. During the first warmup for an operator shape, it validates and selects legal registered candidates, including ordinary/grouped projections and expert computation. This applies to single-request and concurrent inference without forcing Triton at a fixed row count. Unsupported architectures or formats retain their existing implementation. Use `--kernel-tune off` to disable tuning; see [operator registration and warmup selection](kernel-policy.md).
 
-Startup reports `SM120 MXFP4 grouped MoE enabled automatically`. With one visible GPU and sufficient space within the existing expert-cache budget, the cache policy prioritizes full draft residency. Unsupported inputs or compilation/loading failures fall back to built-in CUDA. Set `FASTLLM_CUDA_TRITON_MXFP4_GROUPED=0` to disable this operator, or `FASTLLM_CUDA_TRITON=0` to disable Triton automatic selection. Explicit environment settings take precedence.
+With `--kernel-tune off`, the legacy automatic SM120 MXFP4 grouped-MoE path remains available for supported single-request HF FP4 configurations with DSpark 1–7, CPU/NUMA expert caching, and Triton installed. When selected, startup reports `SM120 MXFP4 grouped MoE enabled automatically`; this is not a universal startup message. With one visible GPU and sufficient expert-cache budget, the policy prioritizes full draft residency. Unsupported inputs or compilation/loading failures fall back to built-in CUDA. See the [detailed compatibility conditions](deepseek_v41.md#自动配置推荐).
 
 ## Common adjustments
 

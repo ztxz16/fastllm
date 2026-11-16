@@ -7,7 +7,7 @@ FastLLM 是用于本地运行和服务部署的大模型推理引擎，核心运
 - **自动部署**：使用 `--auto` 规划设备、内存、专家缓存和上下文，也可覆盖常用参数。
 - **浏览器启动器**：下载模型、保存配置、查看日志，直接在工作室中对话或使用 Agent。
 - **兼容 API**：提供 OpenAI Chat Completions、Responses 和 Anthropic Messages 接口。
-- **多种权重格式**：支持 Safetensors、FastLLM、AWQ 和已适配的 GGUF，具体范围见[模型指南](#模型部署指南)。
+- **多种权重格式**：支持 Safetensors、FastLLM、AWQ、已适配的 GGUF 和 EXL3；DeepSeek-V4.1-Flash 支持原版、Unsloth 与 GSQ-RCO 量化模型，见[支持范围与部署](docs/deepseek_v41.md#模型与权重格式)。
 
 ## 快速开始
 
@@ -96,7 +96,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 | Qwen4-Exp / Qwen3.8-Flash-Next | [Flash-Next 用户手册](docs/qwen3.8-flash-next/README.md) |
 | Qwen3.5 / Qwen3.6 / Qwen3.8 | [Qwen 指南](docs/qwen3.md) |
 | DeepSeek-V4 / V4-Flash | [DeepSeek-V4 指南](docs/deepseek.md) |
-| DeepSeek-V4.1-Flash 1017 | [DeepSeek-V4.1 指南](docs/deepseek_v41.md) |
+| DeepSeek-V4.1-Flash 1017（原版 / Unsloth / GSQ-RCO / EXL3） | [格式支持、自动部署与 DSpark](docs/deepseek_v41.md) |
 | Clover-35B-A3B-Preview | [Clover 单卡指南](docs/clover.md) |
 | Kimi-K3 | [Kimi-K3 指南](docs/kimi_k3.md) |
 | GLM-5 / GLM-5.3-Flash | [GLM-5 指南](docs/glm5.md) |

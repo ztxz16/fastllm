@@ -4,6 +4,7 @@
 
 - [快速开始](../README.md)
 - [模型部署指南](../README.md#模型部署指南)
+- [DeepSeek-V4.1-Flash](deepseek_v41.md)：原版、Unsloth / GSQ-RCO GGUF、EXL3、混合推理与 DSpark
 - [HY-Nomas 世界模型与 HTTP Demo](hy_nomas.md)：原生库构建、权重准备和服务启动
 - [LingBot World 2.0 世界模型与 HTTP Demo](lingbot_world.md)：权重转换、原生推理和世界会话接口
 - [MiniMax-H3 原生音视频生成](../tools/minimax_h3/README.md)：T2VA、单卡 BF16、FP32 对比、HTTP API 与 Demo
