@@ -123,6 +123,50 @@ static void TestChunkedDecodeHandoff() {
     std::cout << "PASS PD chunked serving positions after handoff\n";
 }
 
+static void TestGroupAdmission() {
+    class GroupModel : public StateModel {
+        int next = 0;
+      public:
+        int PDGroupCount() const override { return 2; }
+        int PDRequestGroup(const ResponseContext &c) const override {
+            auto it = c.intParams.find("test_pd_group"); return it == c.intParams.end() ? 0 : it->second;
+        }
+        void OnResponseContextCreated(ResponseContext *c) override {
+            StateModel::OnResponseContextCreated(c); c->intParams["test_pd_group"] = next++ % 2;
+        }
+    } prefill, decode;
+    fastkv::Service port;
+    port.Start("127.0.0.1:0", [](const fastkv::Message &m) { return m; });
+    const auto endpoint = port.Address(); port.Stop();
+    SetPageLen(128); SetMaxTokens(128);
+    prefill.maxBatch = decode.maxBatch = 4;
+    prefill.ConfigurePD(json11::Json::object{{"role", "prefill"}, {"model_id", "groups"},
+        {"transport", "tcp"}, {"listen", endpoint}, {"chunk_tokens", 2}});
+    decode.ConfigurePD(json11::Json::object{{"role", "decode"}, {"model_id", "groups"},
+        {"transport", "tcp"}, {"prefill", json11::Json::array{endpoint}}});
+    auto begin = [&](int group) {
+        auto c = std::make_unique<ResponseContext>(); c->Init(1, FLOAT32, FLOAT32);
+        c->allTokens = c->currentTokens = {3, 7, 11}; c->inputTokens = 3;
+        c->generationConfig.output_token_limit = 1;
+        decode.OnResponseContextCreated(c.get()); c->intParams["test_pd_group"] = group;
+        decode.BeginPD(c.get()); return c;
+    };
+    auto a = begin(0), b = begin(0), c = begin(1);
+    for (int i = 0; i < 3000 && (!a->preTokens || !c->preTokens); ++i) {
+        decode.PollPD(a.get()); decode.PollPD(b.get()); decode.PollPD(c.get());
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    Check(a->preTokens == 2 && c->preTokens == 2 && !a->isEnding && !c->isEnding,
+          "independent PD groups did not progress");
+    Check(!b->preTokens && !b->isEnding, "PD overcommitted one group's pool");
+    a.reset();
+    for (int i = 0; i < 3000 && !b->preTokens; ++i) {
+        decode.PollPD(b.get()); std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    Check(b->preTokens == 2 && !b->isEnding, "PD group credit was not returned");
+    decode.StopPD(); prefill.StopPD(); SetMaxTokens(65536);
+}
+
 static void TestAdmissionLifetime() {
     class DecodeModel final : public StateModel {
       public:
@@ -913,6 +957,7 @@ int main() {
         TestPreparedPrefill();
         TestQueuedTransfers();
         TestLoadAwareRouting();
+        TestGroupAdmission();
         TestChunkedDecodeHandoff();
         std::cout << "PASS PD tensor packing, chunk positions, handoff, rejection "
                      "and cancellation\n";

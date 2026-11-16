@@ -83,6 +83,11 @@ namespace fastllm {
         bool SupportsPDKvMemDecode() const override { return true; }
         std::shared_ptr<PDReceiveState> PreparePDReceive(ResponseContext &context) override;
         std::vector<int> PDDevices() const override { return tpDevices; }
+        std::vector<int> PDRequestDevices(const ResponseContext &context) const override;
+        int PDGroupCount() const override { return attentionDP; }
+        int PDRequestGroup(const ResponseContext &context) const override { return GetPrefillBatchGroup(&context); }
+        bool SelectPDRequestGroup(ResponseContext &context, const std::vector<size_t> &available,
+                                  size_t required) override;
         bool HasPDResidentPrefixCache() const override { return saveHistoryChat && !tpPagedCaches.empty(); }
         fastkv::Message ExportPDState(ResponseContext &context) override;
         fastkv::CacheSnapshot DescribePDCache(ResponseContext &context, const fastkv::Message &state) override;

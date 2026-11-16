@@ -281,6 +281,7 @@ struct PDRuntime {
         RequestMetadata metadata;
         std::promise<fastkv::Message> result;
         std::shared_ptr<fastkv::Cancellation> cancellation;
+        std::shared_ptr<void> groupAdmission;
         std::unique_ptr<ResponseContext> context;
         fastkv::HostCache::Hit hostHit;
         std::future<fastkv::Message> hostRestore;
@@ -320,8 +321,18 @@ struct PDRuntime {
     std::vector<std::string> peers;
     std::atomic<bool> stopping{false};
     int chunk = 2048;
-    size_t tokenCapacity = 0;
-    std::unique_ptr<fastkv::Budget> slots, tokens;
+    size_t tokenCapacity = 0, totalTokenCapacity = 0;
+    std::unique_ptr<fastkv::Budget> slots;
+    std::vector<std::unique_ptr<fastkv::Budget>> groupTokens;
+    std::shared_ptr<void> ReserveGroup(basellm &model, ResponseContext &context, size_t required) {
+        std::vector<size_t> available;
+        for (const auto &budget : groupTokens) available.push_back(tokenCapacity - budget->Used());
+        if (!model.SelectPDRequestGroup(context, available, required))
+            throw fastkv::CapacityBusy("PD request group has no capacity");
+        const int group = model.PDRequestGroup(context);
+        Check(group >= 0 && size_t(group) < groupTokens.size(), "invalid request group");
+        return groupTokens[group]->Reserve(required);
+    }
     std::unique_ptr<fastkv::PrefixCache> cache;
     std::unique_ptr<fastkv::HostCache> hostCache;
     std::unique_ptr<fastkv::BufferPool> exportPool;
@@ -527,11 +538,11 @@ void PDRuntime::RunPrefill(basellm &model) {
     // entered forward yet. Both use one token budget and one retirement path.
     std::deque<Request> active, prepared;
     size_t reserved = 0, preparedTokens = 0;
-    const size_t prepareBudget = tokenCapacity / 2;
+    const size_t prepareBudget = totalTokenCapacity / 2;
     const size_t page = residentPrefix ? std::max(1, GetPageLen()) : 1;
     const size_t contextLimit = std::max(batchRequests, model.maxBatch > 0 ? model.maxBatch : 1);
     auto startHostRestore = [&](const Request &request) {
-        auto placement = PDReceivePlacement(request->hostHit.Metadata(), request->hostHit.Payloads(), model.PDDevices());
+        auto placement = PDReceivePlacement(request->hostHit.Metadata(), request->hostHit.Payloads(), model.PDRequestDevices(*request->context));
         if (placement.empty()) placement.assign(request->hostHit.Payloads(), -1);
         return hostCache->RestoreAsync(request->hostHit, std::move(placement), request->hostRestore,
                                        request->cancellation);
@@ -545,6 +556,8 @@ void PDRuntime::RunPrefill(basellm &model) {
             context->isAbort = true;
             model.OnResponseContextRemoved(context.get());
         }
+        context.reset();
+        request->groupAdmission.reset();
     };
     const auto cancelled = std::make_exception_ptr(std::runtime_error("FastKV PD: request cancelled"));
     auto complete = [&](const Request &request, fastkv::Message *restored) {
@@ -675,7 +688,9 @@ void PDRuntime::RunPrefill(basellm &model) {
                     retire(request); request->result.set_exception(error); it = prepared.erase(it);
                 }
             }
-            while (active.size() + prepared.size() < contextLimit) {
+            size_t scanned = 0;
+            { std::lock_guard<std::mutex> queueLock(prefillMutex); scanned = waiting.size(); }
+            for (; scanned > 0 && active.size() + prepared.size() < contextLimit; --scanned) {
                 const bool lookahead = int(active.size()) >= batchRequests;
                 if (lookahead && !residentPrefix) break;
                 Request request;
@@ -687,7 +702,7 @@ void PDRuntime::RunPrefill(basellm &model) {
                     // Reserve the FULL final prompt, not merely its cached
                     // portion. This leaves room to finish every admitted
                     // request and bounds queued retention independently.
-                    if (count > tokenCapacity - reserved ||
+                    if (count > totalTokenCapacity - reserved ||
                         (lookahead && (preparedTokens >= prepareBudget || count > prepareBudget - preparedTokens))) break;
                     request = std::move(waiting.front()); waiting.pop_front();
                     reserved += count;
@@ -713,6 +728,14 @@ void PDRuntime::RunPrefill(basellm &model) {
                     context.generationConfig.output_token_limit = 1;
                     context.generationConfig.input_token_length = request->input.size() + 1;
                     model.OnResponseContextCreated(&context);
+                    try { request->groupAdmission = ReserveGroup(model, context, request->reservation); }
+                    catch (const fastkv::CapacityBusy &) {
+                        retire(request);
+                        request->SetRemaining(request->input.size());
+                        std::lock_guard<std::mutex> queueLock(prefillMutex);
+                        waiting.push_back(request);
+                        continue;
+                    }
                     if (hostCache) {
                         auto latest = hostCache->Find(identity, request->input);
                         if (latest.Tokens() > request->hostHit.Tokens()) request->hostHit = std::move(latest);
@@ -944,6 +967,12 @@ void basellm::ConfigurePD(const json11::Json &config) {
         GetMaxTokens() > 0 ? size_t(GetMaxTokens()) : size_t(max_positions) * concurrent;
     if (tokensLimit > 0)
         runtime->tokenCapacity = std::min(runtime->tokenCapacity, size_t(tokensLimit));
+    const int groups = PDGroupCount();
+    Check(groups > 0 && runtime->tokenCapacity > 0 &&
+          size_t(groups) <= SIZE_MAX / runtime->tokenCapacity, "invalid PD group capacity");
+    runtime->totalTokenCapacity = runtime->tokenCapacity * groups;
+    for (int group = 0; group < groups; ++group)
+        runtime->groupTokens.emplace_back(new fastkv::Budget(runtime->tokenCapacity, "PD group token budget"));
     fastkv::Options options;
     options.workers = std::max(4, std::min(concurrent, 16));
     if (!config["transfer_workers"].is_null()) {
@@ -1012,7 +1041,6 @@ void basellm::ConfigurePD(const json11::Json &config) {
             runtime->probes.reset(new fastkv::Service(control));
         }
         runtime->slots.reset(new fastkv::Budget(concurrent, "decode request slots"));
-        runtime->tokens.reset(new fastkv::Budget(runtime->tokenCapacity, "decode token budget"));
     } else {
         if (config["chunk_tokens"].is_number())
             runtime->chunk = config["chunk_tokens"].int_value();
@@ -1163,7 +1191,10 @@ bool basellm::PollPD(ResponseContext *context) {
             if (!pending->admission) {
                 auto admission = std::make_shared<PDPending::Admission>();
                 admission->slot = pdRuntime->slots->Reserve(1);
-                admission->tokens = pdRuntime->tokens->Reserve(pending->reservation);
+                {
+                    std::lock_guard<std::mutex> lock(forwardLocker);
+                    admission->tokens = pdRuntime->ReserveGroup(*this, *context, pending->reservation);
+                }
                 context->pdAdmission = admission;
                 pending->admission = std::move(admission);
             }
@@ -1185,8 +1216,13 @@ bool basellm::PollPD(ResponseContext *context) {
             // The Exchange also holds admission until cancellation/I/O drains.
             auto lifetime = std::make_shared<std::pair<std::shared_ptr<PDPending::Admission>,
                                                        std::shared_ptr<void>>>(pending->admission, pending->route);
+            const auto devices = PDRequestDevices(*context);
+            fastkv::ReceivePlacement placement = [devices](const fastkv::Bytes &metadata,
+                                                          const std::vector<size_t> &sizes) {
+                return PDReceivePlacement(metadata, sizes.size(), devices);
+            };
             pdRuntime->service->TrySubmit(pending->peer, pending->request, pending->result,
-                                          pending->cancellation, std::move(lifetime), std::move(target));
+                pending->cancellation, std::move(lifetime), std::move(target), std::move(placement));
         } catch (const fastkv::CapacityBusy &) {
             return false;
         } catch (const std::exception &error) {

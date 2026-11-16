@@ -61,6 +61,8 @@ FASTLLM_CUDA_GRAPH=1 ftllm server MODEL --tp 8 --ep 8 --attn-dp-size 2 \
 
 GPU paged KV 和 KVMem 按组内 head 数分配。调度器为请求选择所属组的物理页池，分别预留剩余输出页；同组不足时排队，其他组仍可准入。当前 `--tokens` / `tokensLimit` 保留单组预算口径，不能把打印值直接当作全实例的已验证容量；还需计入 SWA、Indexer、页表、Graph 和草稿。KVMem 的热缓存槽保留全局请求编号，采用保守的每卡预留，不以平均分布假设缩减启动预算。
 
+纯 GPU、无草稿的 PD 部署支持不同实例数量和 DP/EP 大小，要求两端组内 Attention TP 与 KV 编码相同。请求组映射同时用于网络接收和 L2 恢复，PD 准入按组持有 token 额度；详见 [PD 部署](fastkv_pd.md#naiveattention-dp-与多副本)。传统 TP、KVMem 和草稿交接保持原协议。
+
 前缀缓存的 full KV 页、SWA 快照和草稿检查点一起校验。新请求优先留在最长驻留前缀所在的组；活动请求不迁移，不借用另一组的页号。恢复失败沿用原有的请求级错误隔离，后续请求可重新命中或 prefill。
 
 目标模型复用现有 CUDA Graph 路径，输入行置换、局部位置和长度逐轮刷新，KV 指针和容量参与验证。当前保留一个布局变体；布局变化会失效并重新预热/捕获。捕获开始或实例化失败时，各 rank 一致回退 eager。此实现不承诺任意高并发下零工作区增长，也不意味着 DP 比原 TP 更快，需要对实际输入、并发及接受率测量。

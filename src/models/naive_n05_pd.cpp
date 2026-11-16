@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <stdexcept>
 #ifdef USE_CUDA
+#include "naive_n05_tp.h"
+#include "naive_n05_parallel.h"
 #include "devices/cuda/fastllm-cuda.cuh"
 #endif
 
@@ -15,6 +17,25 @@ void CheckPD(bool ok, const char *message) {
         throw std::runtime_error(std::string("FastKV Naive: ") + message);
 }
 #ifdef USE_CUDA
+template <class Task>
+void RunPDWorkers(parallel::CudaRuntime *runtime, PersistentWorkerGroup &workers,
+        const std::vector<int> &devices, const Task &task) {
+    if (runtime) {
+        // A request owns only one group. Reuse the full runtime rather than
+        // recreating its persistent GPU workers for that subset.
+        runtime->Run([&](int, int device) {
+            auto it = std::find(devices.begin(), devices.end(), device);
+            if (it != devices.end()) task(it - devices.begin());
+        });
+    } else if (devices.size() > 1) {
+        std::vector<std::exception_ptr> errors(devices.size());
+        workers.Run(devices, task, errors);
+        for (auto error : errors) if (error) std::rethrow_exception(error);
+    } else {
+        task(0);
+    }
+}
+
 // Submit all independent ranges on the owner worker's stream. Adjacent
 // physical pages coalesce; the existing generic batch-copy kernel handles
 // the remaining fragmented spans without one CUDA API call per page.
@@ -269,8 +290,65 @@ std::shared_ptr<PDReceiveState> NaiveN05FlashModel::PreparePDReceive(ResponseCon
     return {};
 }
 
+std::vector<int> NaiveN05FlashModel::PDRequestDevices(const ResponseContext &context) const {
+    if (attentionDP > 1) {
+        CheckPD(!context.pastKeyValues.empty(), "missing request KV group");
+        const auto &devices = context.pastKeyValues.front().first.dataDeviceIds;
+        CheckPD(devices.size() == size_t(AttentionTPSize()), "invalid request KV group");
+        return devices;
+    }
+#ifdef USE_CUDA
+    if (tpDevices.empty()) return {FastllmCudaGetDevice()};
+#endif
+    return tpDevices;
+}
+
+bool NaiveN05FlashModel::SelectPDRequestGroup(ResponseContext &context,
+        const std::vector<size_t> &available, size_t required) {
+    CheckPD(available.size() == size_t(attentionDP), "invalid PD group budgets");
+    const int previous = PDRequestGroup(context);
+    if (available.at(previous) >= required) return true;
+    const int group = std::max_element(available.begin(), available.end()) - available.begin();
+    if (available[group] < required) return false;
+    // Only an unadmitted, empty context can change owner. Drop the queued
+    // prefix hint; no page or cached SWA state has been borrowed yet.
+    for (const auto &pair : context.pastKeyValues)
+        for (const Data *root : {&pair.first, &pair.second}) {
+            CheckPD(root->dims.empty() && !root->cudaData && !root->cpuData,
+                    "cannot migrate active PD KV");
+            for (const auto &entry : root->multiDeviceDatas)
+                CheckPD(entry.second->dims.empty() && entry.second->pageIndex.empty(),
+                        "cannot migrate allocated PD KV");
+        }
+    std::vector<std::pair<Data *, Data *>> roots;
+    for (auto &pair : context.pastKeyValues) {
+        for (Data *root : {&pair.first, &pair.second}) {
+            for (auto &entry : root->multiDeviceDatas) delete entry.second;
+            root->multiDeviceDatas.clear(); root->multiDeviceData = false; root->dataDeviceIds.clear();
+        }
+        roots.emplace_back(&pair.first, &pair.second);
+    }
+    InitAttentionParallelCache(roots, group);
+    std::lock_guard<std::mutex> lock(historyMutex);
+    auto it = activePrefixes.find(&context.pastKeyValues.front().first);
+    if (it != activePrefixes.end()) it->second.queued.reset();
+    return true;
+}
+
 std::string NaiveN05FlashModel::PDLayout() const {
     CheckPD(!indexerContextSharding, "Indexer context sharding needs a separate state adapter");
+    CheckPD(attentionDP == 1 || (!draftEnabled && !sparseKv),
+            "Attention DP PD currently requires GPU KV and no draft");
+    if (attentionDP > 1) {
+        // Group-local wire ranks. World/DP/EP sizes are execution details;
+        // head sharding and the state representation remain strict.
+        std::string layout = "naive-n05-group-state-v1";
+        for (int value : {block_cnt, AttentionTPSize(), int(dataType), int(kvCacheDataType),
+                          int(fp8IndexerCache), window, full.kvHeads, full.headDim, full.valueDim,
+                          sliding.kvHeads, sliding.headDim, sliding.valueDim, IndexerCacheWidth(AuxiliaryKVType())})
+            layout += ":" + std::to_string(value);
+        return layout;
+    }
     CheckPD(!(sparseKv && draftEnabled), "KVMem PD draft state transfer is not implemented");
     return std::string(tpDevices.size() > 1 ? "naive-n05-state-v3:" : "naive-n05-state-v1:") +
            std::to_string(block_cnt) + ":" +
@@ -285,7 +363,7 @@ fastkv::Message NaiveN05FlashModel::ExportPDState(ResponseContext &context) {
 #else
     CheckPD(!sparseKv, "PD prefill requires GPU KV storage");
     CheckPD(context.preTokens > 0, "empty prefill state");
-    const auto devices = tpDevices.empty() ? std::vector<int>{FastllmCudaGetDevice()} : tpDevices;
+    const auto devices = PDRequestDevices(context);
     const bool tp = tpDevices.size() > 1;
     PDStateWriter writer(PDExportPool());
     writer.metadata.String(PDLayout());
@@ -297,6 +375,7 @@ fastkv::Message NaiveN05FlashModel::ExportPDState(ResponseContext &context) {
     for (size_t i = 0; i < devices.size(); ++i) ranks.push_back(writer.Fork());
     auto pack = [&](int rank) {
         FastllmCudaSetDevice(devices[rank]);
+        const int worldRank = std::find(tpDevices.begin(), tpDevices.end(), devices[rank]) - tpDevices.begin();
         auto &output = ranks[rank];
         StateCopies copies;
         for (int layer = 0; layer < block_cnt; ++layer) {
@@ -333,10 +412,10 @@ fastkv::Message NaiveN05FlashModel::ExportPDState(ResponseContext &context) {
                                                           cache.cudaData, size_t(rows - count) * rowBytes);
                 }
             }
-            if (tp && HasLocalIndexer(layer, rank)) {
+            if (tp && HasLocalIndexer(layer, worldRank)) {
                 const auto &root = context.pastKeyValues[layer].first;
                 const auto &key = *root.multiDeviceDatas.at(devices[rank]);
-                const auto &pool = HasSeparateIndexer() ? IndexerStorage(layer, rank) : *key.pagedKVCacheData;
+                const auto &pool = HasSeparateIndexer() ? IndexerStorage(layer, worldRank) : *key.pagedKVCacheData;
                 Data compact(pool.dataType, {1, context.preTokens, IndexerCacheWidth(AuxiliaryKVType())});
                 compact.dataDevice = CUDA;
                 compact.dataDeviceIds = {devices[rank]};
@@ -348,14 +427,7 @@ fastkv::Message NaiveN05FlashModel::ExportPDState(ResponseContext &context) {
         }
         copies.Submit();
     };
-    if (tp) {
-        std::vector<std::exception_ptr> errors(devices.size());
-        tpWorkers.Run(devices, pack, errors);
-        for (auto error : errors)
-            if (error)
-                std::rethrow_exception(error);
-    } else
-        pack(0);
+    RunPDWorkers(attentionParallel ? &attentionParallel->runtime : nullptr, tpWorkers, devices, pack);
     for (auto &rank : ranks) {
         writer.metadata.Blob(rank.metadata.bytes.data(), rank.metadata.bytes.size());
         writer.metadata.U32(rank.buffers.size());
@@ -374,7 +446,7 @@ fastkv::Message NaiveN05FlashModel::ExportPDState(ResponseContext &context) {
 fastkv::CacheSnapshot NaiveN05FlashModel::DescribePDCache(ResponseContext &context, const fastkv::Message &wire) {
     auto snapshot = basellm::DescribePDCache(context, wire);
 #ifdef USE_CUDA
-    const auto devices = tpDevices.empty() ? std::vector<int>{FastllmCudaGetDevice()} : tpDevices;
+    const auto devices = PDRequestDevices(context);
     size_t index = 0;
     auto describe = [&](const Data &key, const Data &storage, int rows, bool range, int width) {
         auto &payload = snapshot.payloads.at(index++);
@@ -397,18 +469,19 @@ fastkv::CacheSnapshot NaiveN05FlashModel::DescribePDCache(ResponseContext &conte
         }
     };
     for (size_t rank = 0; rank < devices.size(); ++rank) {
+        const int worldRank = std::find(tpDevices.begin(), tpDevices.end(), devices[rank]) - tpDevices.begin();
         for (int layer = 0; layer < block_cnt; ++layer) {
             for (int part = 0; part < 2; ++part) {
                 const auto &root = part ? context.pastKeyValues[layer].second : context.pastKeyValues[layer].first;
-                const auto &cache = devices.size() > 1 ? *root.multiDeviceDatas.at(devices[rank]) : root;
+                const auto &cache = tpDevices.size() > 1 ? *root.multiDeviceDatas.at(devices[rank]) : root;
                 describe(cache, cache.pagedKVCacheData ? *cache.pagedKVCacheData : cache,
                          context.preTokens, !slidingLayers[layer],
-                         devices.size() > 1 ? std::max(1, full.kvHeads / int(devices.size())) *
+                         tpDevices.size() > 1 ? std::max(1, full.kvHeads / int(devices.size())) *
                              (part ? full.valueDim : full.headDim) : cache.dims.back());
             }
-            if (devices.size() > 1 && HasLocalIndexer(layer, rank)) {
+            if (tpDevices.size() > 1 && HasLocalIndexer(layer, worldRank)) {
                 const auto &key = *context.pastKeyValues[layer].first.multiDeviceDatas.at(devices[rank]);
-                describe(key, HasSeparateIndexer() ? IndexerStorage(layer, rank) : *key.pagedKVCacheData,
+                describe(key, HasSeparateIndexer() ? IndexerStorage(layer, worldRank) : *key.pagedKVCacheData,
                          context.preTokens, true, IndexerCacheWidth(AuxiliaryKVType()));
             }
         }
@@ -428,7 +501,7 @@ void NaiveN05FlashModel::ImportPDState(ResponseContext &context, const fastkv::M
     CheckPD(metadata.String() == PDLayout(), "incompatible state layout or TP size");
     const int length = metadata.U32();
     CheckPD(length > 0 && length == int(context.allTokens.size()) - 1, "prompt length mismatch");
-    const auto devices = tpDevices.empty() ? std::vector<int>{FastllmCudaGetDevice()} : tpDevices;
+    const auto devices = PDRequestDevices(context);
     const bool tp = tpDevices.size() > 1;
     for (int layer = 0; layer < block_cnt; ++layer) {
         for (int part = 0; part < 2; ++part) {
@@ -469,6 +542,7 @@ void NaiveN05FlashModel::ImportPDState(ResponseContext &context, const fastkv::M
     }
     auto unpack = [&](int rank) {
         FastllmCudaSetDevice(devices[rank]);
+        const int worldRank = std::find(tpDevices.begin(), tpDevices.end(), devices[rank]) - tpDevices.begin();
         PDStateReader reader(rankStates[rank]);
         StateCopies copies;
         std::vector<std::unique_ptr<Data>> imported;
@@ -492,14 +566,14 @@ void NaiveN05FlashModel::ImportPDState(ResponseContext &context, const fastkv::M
                 cache.dataType = value.dataType;
                 cache.UpdateUnitSize();
                 cache.kvCacheFp8Indexer = value.kvCacheFp8Indexer;
-                const int width = expected + (tp && !part && !slidingLayers[layer] ? LocalIndexerCacheWidth(layer, rank) : 0);
-                if (tp) cache.kvCacheFp8Indexer = !part && !slidingLayers[layer] && !HasSeparateIndexer() && fp8IndexerCache && HasLocalIndexer(layer, rank);
+                const int width = expected + (tp && !part && !slidingLayers[layer] ? LocalIndexerCacheWidth(layer, worldRank) : 0);
+                if (tp) cache.kvCacheFp8Indexer = !part && !slidingLayers[layer] && !HasSeparateIndexer() && fp8IndexerCache && HasLocalIndexer(layer, worldRank);
                 const size_t rowBytes = GetDataBytes(cache.dataType, 1, width);
                 // Placement and scatter belong to the persistent owner worker.
                 // Network workers never mutate this request's live page table.
                 value.ToDevice(CUDA, std::vector<int>{devices[rank]});
                 if (tp && !slidingLayers[layer] && !tpPagedCaches.empty()) {
-                    PreparePagedCache(cache, *tpPagedCaches[rank][layer * 2 + part], rows);
+                    PreparePagedCache(cache, *tpPagedCaches[worldRank][layer * 2 + part], rows);
                     CopyPagedRows(value, cache, *cache.pagedKVCacheData, true, copies);
                     cache.lastPageLen = (rows - 1) % cache.pageLen + 1;
                 } else {
@@ -511,7 +585,7 @@ void NaiveN05FlashModel::ImportPDState(ResponseContext &context, const fastkv::M
                         cache.dims.clear();
                         cache.expansionDims.clear();
                     }
-                    ReserveCache(cache, capacity, width);
+                    ReserveCache(cache, capacity, width, true, &context.pastKeyValues.front().first);
                     const int first = ring ? (length - rows) % window : 0;
                     const int count = ring ? std::min(rows, window - first) : rows;
                     copies.Add((char *)cache.cudaData + size_t(first) * rowBytes,
@@ -524,13 +598,13 @@ void NaiveN05FlashModel::ImportPDState(ResponseContext &context, const fastkv::M
                 cache.Resize({1, rows, width});
                 cache.isKVCache = true;
             }
-            if (tp && HasLocalIndexer(layer, rank)) {
+            if (tp && HasLocalIndexer(layer, worldRank)) {
                 imported.emplace_back(new Data());
                 Data &value = *imported.back();
                 reader.Tensor(value, true);
                 const auto &root = context.pastKeyValues[layer].first;
                 const auto &key = *root.multiDeviceDatas.at(devices[rank]);
-                const auto &pool = HasSeparateIndexer() ? IndexerStorage(layer, rank) : *key.pagedKVCacheData;
+                const auto &pool = HasSeparateIndexer() ? IndexerStorage(layer, worldRank) : *key.pagedKVCacheData;
                 CheckPD(value.dataType == pool.dataType &&
                             value.dims == std::vector<int>({1, length, IndexerCacheWidth(AuxiliaryKVType())}) &&
                             value.kvCacheFp8Indexer == fp8IndexerCache,
@@ -543,14 +617,7 @@ void NaiveN05FlashModel::ImportPDState(ResponseContext &context, const fastkv::M
         reader.End();
         copies.Submit();
     };
-    if (tp) {
-        std::vector<std::exception_ptr> errors(devices.size());
-        tpWorkers.Run(devices, unpack, errors);
-        for (auto error : errors)
-            if (error)
-                std::rethrow_exception(error);
-    } else
-        unpack(0);
+    RunPDWorkers(attentionParallel ? &attentionParallel->runtime : nullptr, tpWorkers, devices, unpack);
     const bool hasDraft = metadata.U32();
     CheckPD(hasDraft == draftEnabled, "draft mode mismatch");
     if (hasDraft) {

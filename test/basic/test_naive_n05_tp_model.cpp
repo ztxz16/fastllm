@@ -357,6 +357,11 @@ static void AddDraftTestWeights(WeightMap &weight, int layers, int kvHeads, int 
         merge({"mlp.gate_proj.weight", "mlp.up_proj.weight"}, "mlp.gateup_proj.weight");
     }
 }
+struct PDGroupRecord {
+    fastkv::Message state;
+    std::vector<int> tokens;
+    std::vector<std::vector<float>> logits;
+};
 class Fixture : public NaiveN05FlashModel {
   public:
     int ranks;
@@ -778,7 +783,106 @@ class Fixture : public NaiveN05FlashModel {
         return result;
     }
 #endif
-    void PDStateChecks(bool kvmem = false, bool rdma = false, bool layerShard = false, bool draft = false) {
+    void PreparePDGroupFixture(int dp) {
+        ConfigureAttentionParallel(dp); maxBatch = 4; SetMaxTokens(16384); WarmUp();
+    }
+    std::vector<PDGroupRecord> ExportPDGroupFixture() {
+        std::vector<PDGroupRecord> records;
+        for (int length : {1, 127, 129, 257, 3073, 4097}) {
+            ResponseContext context; context.Init(block_cnt, dataType, kvCacheDataType);
+            context.generationConfig.top_k = 1; context.generationConfig.input_token_length = length + 1;
+            context.generationConfig.output_token_limit = 8;
+            for (int i = 0; i < length; ++i) context.allTokens.push_back((i * 17 + 3) % 256);
+            OnResponseContextCreated(&context);
+            std::vector<float> ids(context.allTokens.begin(), context.allTokens.end()), positions(length);
+            std::iota(positions.begin(), positions.end(), 0.f);
+            isIntermediateChunkedPrefill = true;
+            Forward(Data(FLOAT32,{1,length},ids), Data(), Data(FLOAT32,{1,length},positions),
+                    context.pastKeyValues, context.generationConfig);
+            isIntermediateChunkedPrefill = false; context.preTokens = length;
+            PDGroupRecord record;
+            record.tokens = context.allTokens; record.tokens.push_back(42);
+            // Model runtimes exclusively own their GPU workers. Preserve an
+            // immutable wire checkpoint, then destroy P before constructing D.
+            record.state = fastkv::Snapshot(ExportPDState(context), -1);
+            context.generationConfig.output_logits = true;
+            record.logits.resize(3);
+            for (int step = 0; step < 3; ++step) {
+                SetCudaGraph(step != 0);
+                Forward(Data(FLOAT32,{1,1},{float(42+step)}), Data(), Data(FLOAT32,{1,1},{float(length+step)}),
+                        context.pastKeyValues, context.generationConfig, LastTokensManager(), &record.logits[step]);
+            }
+            records.push_back(std::move(record)); OnResponseContextRemoved(&context);
+        }
+        return records;
+    }
+    void ImportPDGroupFixture(const std::vector<PDGroupRecord> &records, bool rdma) {
+        fastkv::Options options; options.transport = rdma ? fastkv::Transport::Rdma : fastkv::Transport::Tcp;
+        fastkv::Service server(options), client(options);
+        fastkv::Message wire;
+        server.Start("127.0.0.1:0", [&](const fastkv::Message &) { return wire; });
+        for (const auto &record : records) {
+            ResponseContext context; context.Init(block_cnt, dataType, kvCacheDataType);
+            context.allTokens = record.tokens; const int length = record.tokens.size() - 1;
+            context.generationConfig.top_k = 1; context.generationConfig.output_logits = true;
+            context.generationConfig.input_token_length = length + 1; context.generationConfig.output_token_limit = 8;
+            OnResponseContextCreated(&context);
+            // Force a non-source owner to exercise request-local placement.
+            std::vector<size_t> available(PDGroupCount(), 0);
+            available[(PDRequestGroup(context) + 1) % PDGroupCount()] = 16384;
+            if (!SelectPDRequestGroup(context, available, length + 8)) throw std::runtime_error("PD group selection failed");
+            const auto devices = PDRequestDevices(context); wire = record.state;
+            fastkv::Message request; std::future<fastkv::Message> future;
+            if (!client.TrySubmit(server.Address(), request, future, {}, {}, {},
+                [devices](const fastkv::Bytes &metadata, const std::vector<size_t> &sizes) {
+                    return PDReceivePlacement(metadata, sizes.size(), devices);
+                })) throw std::runtime_error("PD cross-topology submit failed");
+            auto arrived = future.get();
+            // Exercise the same per-request map through L2 as well. Keep the
+            // checkpoint after source runtime destruction; restore onto D's group.
+            if (length == 257) {
+                fastkv::HostCache::Options cacheOptions; cacheOptions.bytes = 16 << 20;
+                fastkv::HostCache cache(cacheOptions); fastkv::CacheSnapshot snapshot; snapshot.state = wire;
+                for (const auto &buffer : wire.buffers) {
+                    fastkv::CachePayload payload;
+                    if (buffer.Size()) payload.regions.push_back({0,buffer.Size(),{}});
+                    snapshot.payloads.push_back(std::move(payload));
+                }
+                if (!cache.PublishAsync(PDLayout(), record.tokens, std::move(snapshot)))
+                    throw std::runtime_error("PD L2 publish rejected");
+                cache.Drain(); auto hit = cache.Find(PDLayout(), record.tokens);
+                if (!hit) throw std::runtime_error("PD L2 checkpoint missing");
+                std::future<fastkv::Message> restored;
+                if (!cache.RestoreAsync(hit, PDReceivePlacement(hit.Metadata(), hit.Payloads(), devices), restored))
+                    throw std::runtime_error("PD L2 restore rejected");
+                arrived = restored.get();
+            }
+            const auto locations = PDReceivePlacement(wire.metadata, wire.buffers.size(), devices);
+            for (size_t i = 0; i < arrived.buffers.size(); ++i)
+                if (arrived.buffers[i].Device() != locations[i]) throw std::runtime_error("PD cross-topology landing differs");
+            ImportPDState(context, arrived); context.preTokens = length;
+            auto exported = ExportPDState(context);
+            if (exported.metadata != wire.metadata || exported.buffers.size() != wire.buffers.size())
+                throw std::runtime_error("PD cross-topology schema differs");
+            for (size_t i = 0; i < wire.buffers.size(); ++i) {
+                std::vector<uint8_t> a(wire.buffers[i].Size()), b(exported.buffers[i].Size());
+                wire.buffers[i].Read(a.data(),0,a.size()); exported.buffers[i].Read(b.data(),0,b.size());
+                if (a != b) throw std::runtime_error("PD cross-topology state bytes differ");
+            }
+            for (int step = 0; step < 3; ++step) {
+                SetCudaGraph(step != 0); std::vector<float> actual;
+                Forward(Data(FLOAT32,{1,1},{float(42+step)}),Data(),Data(FLOAT32,{1,1},{float(length+step)}),
+                        context.pastKeyValues,context.generationConfig,LastTokensManager(),&actual);
+                if (actual.size() != record.logits[step].size()) throw std::runtime_error("PD logits missing");
+                RequireCloseLogits(actual.data(), record.logits[step], "PD cross-topology logits");
+            }
+            OnResponseContextRemoved(&context);
+        }
+        std::cout << "NAIVE PD STATE PASS cross_topology max_relative=" << largestLogitRelative
+                  << " max_abs=" << largestLogitAbsolute << std::endl;
+    }
+    void PDStateChecks(bool kvmem = false, bool rdma = false, bool layerShard = false, bool draft = false, int dp = 1) {
+        if (dp > 1) ConfigureAttentionParallel(dp);
         if (draft) {
             draftEnabled = canDoConcurrentForward = true;
             draftLayers = 2; draftBlock = 7; draftTokens = 5;
@@ -907,16 +1011,36 @@ class Fixture : public NaiveN05FlashModel {
                 // Exercise the ordinary transport placement path too. Logical
                 // rank IDs must land each draft shard on its receiving GPU.
                 wire = message;
-                fastkv::Options receiveOptions = options;
-                auto devices = destination.PDDevices();
-                if (devices.empty()) devices.push_back(FastllmCudaGetDevice());
-                receiveOptions.receivePlacement = [devices](const fastkv::Bytes &metadata,
+                auto devices = destination.PDRequestDevices(imported);
+                fastkv::ReceivePlacement placement = [devices](const fastkv::Bytes &metadata,
                                                             const std::vector<size_t> &sizes) {
                     return PDReceivePlacement(metadata, sizes.size(), devices);
                 };
-                fastkv::Service receiver(receiveOptions);
-                auto arrived = receiver.Submit(server.Address(), {}).get();
+                fastkv::Message request; std::future<fastkv::Message> future;
+                if (!client.TrySubmit(server.Address(), request, future, {}, {}, {}, placement))
+                    throw std::runtime_error("PD placement submission failed");
+                auto arrived = future.get();
+                auto locations = PDReceivePlacement(wire.metadata, wire.buffers.size(), devices);
+                for (size_t i = 0; i < arrived.buffers.size(); ++i) {
+                    if (arrived.buffers[i].Device() != locations[i]) throw std::runtime_error("PD wrong destination group");
+                    std::vector<uint8_t> before(wire.buffers[i].Size()), after(before.size());
+                    wire.buffers[i].Read(before.data(), 0, before.size());
+                    arrived.buffers[i].Read(after.data(), 0, after.size());
+                    if (before != after) throw std::runtime_error("PD group wire bytes differ");
+                }
                 destination.ImportPDState(imported, arrived);
+                if (dp > 1) {
+                    imported.preTokens = length;
+                    auto restored = destination.ExportPDState(imported);
+                    if (restored.metadata != wire.metadata || restored.buffers.size() != wire.buffers.size())
+                        throw std::runtime_error("PD imported state layout differs");
+                    for (size_t i = 0; i < restored.buffers.size(); ++i) {
+                        std::vector<uint8_t> before(wire.buffers[i].Size()), after(restored.buffers[i].Size());
+                        wire.buffers[i].Read(before.data(), 0, before.size());
+                        restored.buffers[i].Read(after.data(), 0, after.size());
+                        if (before != after) throw std::runtime_error("PD imported group state bytes differ");
+                    }
+                }
             }
             imported.preTokens = length;
             if (draft) {
@@ -4935,6 +5059,30 @@ int main(int argc, char **argv) {
             DraftFixture fixture(true, 2, 0, 5); fixture.PrefillCommitChecks(); return 0;
         }
 #endif
+        if (argc > 2 && std::string(argv[2]) == "pd_group") {
+            SetCudaEmbedding(true); SetCudaGraph(true);
+            const auto type = argc > 4 && std::string(argv[4]) == "bf16" ? BFLOAT16 : FP8_E4M3;
+            const int dp = argc > 3 ? std::stoi(argv[3]) : ranks, destination = argc > 5 ? std::stoi(argv[5]) : 0;
+            const bool rdma = argc > 6 && std::string(argv[6]) == "rdma";
+            if (destination) {
+                std::vector<PDGroupRecord> records;
+                {
+                    Fixture producer(ranks, false, true, true, true);
+                    producer.SetKVCacheDataType(type); producer.SetIndexerDataType(FP8_E4M3);
+                    producer.PreparePDGroupFixture(dp); records = producer.ExportPDGroupFixture();
+                }
+                SetCudaGraph(true);
+                Fixture consumer(destination, false, true, true, true);
+                consumer.SetKVCacheDataType(type); consumer.SetIndexerDataType(FP8_E4M3);
+                consumer.PreparePDGroupFixture(destination / (ranks / dp));
+                consumer.ImportPDGroupFixture(records, rdma);
+            } else {
+                Fixture fixture(ranks, false, true, true, true);
+                fixture.SetKVCacheDataType(type); fixture.SetIndexerDataType(FP8_E4M3);
+                fixture.PDStateChecks(false, rdma, false, false, dp);
+            }
+            return 0;
+        }
         if (argc > 2 && (std::string(argv[2]) == "pd_state" || std::string(argv[2]) == "pd_kvmem" ||
                         std::string(argv[2]) == "pd_draft")) {
             SetCudaEmbedding(true); SetCudaGraph(true);

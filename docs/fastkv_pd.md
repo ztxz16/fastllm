@@ -107,7 +107,21 @@ Attention DP 模式在导入阶段分配请求归属，由对应 GPU 的持久�
 
 Naive N0.5 的 adapter 交接各 TP rank 的逻辑 KV、完整注意力的分页内容和滑窗的时间顺序。远端页号不会直接用作本地页号。支持 BF16、FP8 和 FP4 KV，以及 replicated/layer_shard Indexer；FP4 的独立 FP8 Indexer 随主 KV 一起传输，payload 和 scale 均按原字节恢复，不重新量化。TP 交接统一使用 v3 布局。
 
-Naive 部署使用 [Naive 模板](../example/pd/naive_n05.json)，两端保持一致的 TP、激活、KV dtype 和 Indexer 配置。使用 FP4 时，两端将 `--kv_cache_dtype` 设为 `fp4`，保持 BF16 计算、TP >= 2、关闭 draft。Naive 支持 P 使用普通 GPU KV、D 使用 KVMem 的异构存储部署。Indexer context sharding、P 端 KVMem、KVMem 与 PD draft 同时启用，以及 P/D 不同 TP 或 KV 精度仍明确拒绝。
+Naive 传统 TP 部署使用 [Naive 模板](../example/pd/naive_n05.json)，两端保持一致的 TP、激活、KV dtype 和 Indexer 配置。使用 FP4 时，两端将 `--kv_cache_dtype` 设为 `fp4`，保持 BF16 计算、TP >= 2、关闭 draft。Naive 支持 P 使用普通 GPU KV、D 使用 KVMem 的异构存储部署。Indexer context sharding、P 端 KVMem、KVMem 与 PD draft 同时启用，以及 P/D 不同 TP 或 KV 精度仍明确拒绝。
+
+### Naive：Attention DP 与多副本
+
+纯 GPU、无草稿部署支持 P/D 使用不同的实例数量、Attention DP 数和 EP 数，要求两端的 **Attention TP**（`tp / attn-dp-size`）与 KV 表示相同。例如 `--tp 4 --ep 4 --attn-dp-size 4` 的两个 P 实例，可以连接 `--tp 8 --ep 8 --attn-dp-size 8` 的一个 D 实例；反向部署及两端均为 DP8/EP8 也使用同一协议。实例列表沿用 router 的 `prefill` / `decode` 数组，每个实例使用独立端口和互不重叠的 `CUDA_VISIBLE_DEVICES`。`--max_batch`、`max_inflight` 是每实例上限，不是每个 DP 组的上限。
+
+两端使用 BF16 计算、BF16/FP8 KV、`--indexer_tp_storage replicated --dspark 0`，并保持量化与窗口配置一致。DP 使用独立的 `naive-n05-group-state-v1` 布局，明确区分传统 TP 协议；布局检查保留组内 Attention TP、KV 几何及编码，不包含全局卡数和请求的物理 GPU 编号。不同 Attention TP 的重分片、DP PD 草稿、DP PD KVMem、context/layer-sharded Indexer 和 KV 精度转换尚未接入，不能靠修改 rank 数绕过兼容性检查。
+
+P 只打包请求所属 Attention 组的主 KV、Indexer 和 SWA。D 在发起 P 工作前确定请求组并取得该组 token 额度；网络按每请求的不可变设备映射接收到目标组的 GPU 暂存区，再由既有持久 GPU worker 批量恢复本地页和滑窗。当前保留 GPU staging → 页池的复制，不宣称零拷贝。RDMA 路径不经主存中转，TCP 保留通用分块中转。
+
+PD token 额度按组核算，`--tokens` / 模型计算出的 `tokensLimit` 仍是单组容量。全局请求槽与传输预算独立；未准入且没有活动 KV 的请求可以在原组不足时选择其他有容量的组。已准入请求不迁移，额度持有到 KV 和在途传输释放。P 的前缀亲和性保留；L2 恢复也使用请求所属组映射，远端页号和原始 GPU 编号不能当作当前落点。
+
+当前还有两项性能限制：GPU 常驻前缀的预览尚未按 DP 组分别查询，启用 L2 时可能触发本可避免的主存恢复；PD prefill 合批仅受全局 token 预算限制，尚未按 DP 组均衡分配，组间不均衡时可能无法使用模型的本地 MoE prefill 快路径。状态传输与续写正确性已覆盖，吞吐仍需单独评估。
+
+回归入口 `naive_n05_pd_group_*` 覆盖 DP2/4/8、跨 DP4/DP8、页边界、滑窗回绕、状态字节与 eager/Graph 续写。`pd_state_test` 检查独立组准入与额度释放；`fastkv_receive_target_test` 检查并发请求的独立接收映射及原有接收目标协议。
 
 ### Naive：GPU prefill → KVMem decode
 

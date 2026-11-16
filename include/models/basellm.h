@@ -761,6 +761,16 @@ namespace fastllm {
         virtual bool SupportsPDKvMemDecode() const { return false; }
         virtual std::shared_ptr<PDReceiveState> PreparePDReceive(ResponseContext &context) { return {}; }
         virtual std::vector<int> PDDevices() const;
+        // Wire ranks are relative to this request's state group, not the whole
+        // instance. Return an immutable device map before transfer submission.
+        virtual std::vector<int> PDRequestDevices(const ResponseContext &) const { return PDDevices(); }
+        virtual int PDGroupCount() const { return 1; }
+        virtual int PDRequestGroup(const ResponseContext &) const { return 0; }
+        // Called on the model lane before admission. Never migrate live KV.
+        virtual bool SelectPDRequestGroup(ResponseContext &context, const std::vector<size_t> &available,
+                                          size_t required) {
+            return available.at(PDRequestGroup(context)) >= required;
+        }
         virtual bool HasPDResidentPrefixCache() const { return false; }
         int RestorePDResidentPrefix(ResponseContext *context);
         // Metadata-only routing hint; does not pin pages or restore GPU state.
