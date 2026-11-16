@@ -68,6 +68,19 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
     AssertInFastLLM(!indexerLayerSharding,
         "Naive attention DP: use replicated or context-sharded Indexer storage.");
     auto &state = *attentionParallel;
+    std::vector<std::pair<Data *, Data *>> singleKV;
+    std::vector<GenerationConfig> singleConfigs;
+    std::vector<int> singleLengths;
+    TargetBatch singleBatch{singleKV, singleConfigs, singleLengths, block_cnt};
+    if (tpServingState && !batch && inputIds.dims == std::vector<int>({1, 1}) && !capture) {
+        for (auto &pair : kv) singleKV.emplace_back(&pair.first, &pair.second);
+        singleConfigs.push_back(config); singleLengths.push_back(1); batch = &singleBatch;
+    }
+    if (!capture || (!capture->verifying && !capture->collectHidden)) {
+        Data servingOutput;
+        if (ForwardAttentionParallelServing(inputIds, positions, kv, config, selection, batch, servingOutput))
+            return servingOutput;
+    }
     const auto &topology = state.runtime.Layout();
     const int sequences = batch ? batch->Size() : 1;
     const int total = inputIds.dims.at(1);
@@ -79,7 +92,7 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
     Data hostPositions(positions); hostPositions.ToDevice(CPU);
     AssertInFastLLM(hostPositions.dataType == FLOAT32 && hostPositions.Count(0) == (size_t)total,
         "Naive attention DP requires one position per input row");
-    const bool ownedDecode = batch && batch->Decode() && !verifying && !sparseKv &&
+    const bool ownedDecode = !state.servingPadded && batch && batch->Decode() && !verifying && !sparseKv &&
         mainLoop && mainLoop->get_id() == std::this_thread::get_id();
     auto matchesPlan = [&] {
         std::lock_guard<std::mutex> guard(tpRequestMutex);
@@ -136,19 +149,22 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
         }
         AssertInFastLLM(offset == total, "Naive attention DP row lengths do not match the input");
         parallel::RowPartition nextRows(attentionDP, owners);
-        if (state.rows.localToGlobal != nextRows.localToGlobal) {
+        if (!state.servingPadded && state.rows.localToGlobal != nextRows.localToGlobal) {
             // Row-transfer allocations and collective counts are graph operands.
             // Drop the old graph before changing either; shape misses stay eager.
             tpDecodeState.reset();
         }
         state.rows = std::move(nextRows);
-        if (!state.transfer) state.transfer = std::make_unique<parallel::CudaRowTransfer>(state.runtime, state.rows);
-        else state.transfer->Reset(state.rows);
+        if (!state.transfer) {
+            state.transfer = std::make_unique<parallel::CudaRowTransfer>(state.runtime, state.rows);
+            if (state.servingPadded)
+                state.transfer->ReserveFixed(tpServingState->batchBuckets.back(), size_t(embed_dim) * 2);
+        } else state.transfer->Reset(state.rows);
         state.transfer->Reserve(size_t(embed_dim) * sizeof(uint16_t));
         for (auto &group : state.groups)
             group.batch = std::make_unique<TargetBatch>(TargetBatch{group.kv, group.configs, group.lengths, block_cnt});
     }
-    if (!tpPagedCaches.empty()) {
+    if (!tpPagedCaches.empty() && !(tpServingState && tpServingState->preparing)) {
         // Reserve on every owner before any attention/world collective. Pool
         // exhaustion must fail the step before peers enter NCCL.
         std::vector<std::exception_ptr> errors(tpDevices.size());
@@ -159,6 +175,7 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
             try {
                 for (size_t row = 0; row < group.lengths.size(); ++row) {
                     const int seq = group.sequenceIndices[row], count = group.lengths[row];
+                    if (state.servingPadded && seq >= state.servingLiveRows) continue;
                     for (int layer = 0; layer < block_cnt; ++layer) {
                         const auto &cfg = slidingLayers[layer] ? sliding : full;
                         for (int part = 0; part < 2; ++part) {
@@ -199,6 +216,7 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
     if (saveHistoryChat && !verifying && (!draftEnabled ||
         (capture && capture->collectHidden && total > 1))) {
         for (int seq = 0; seq < sequences; ++seq) {
+            if (state.servingPadded && seq >= state.servingLiveRows) continue;
             const Data &first = key(seq, 0);
             prefixes[seq] = BeginPrefixSnapshots(first, first.dims.empty() ? 0 : first.dims[1],
                 batch ? batch->lengths[seq] : total);
@@ -221,6 +239,9 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
     bool graphDecode = PrepareTensorParallelDecode(inputIds, kv, verifying, fullLogits,
         cacheLengths, batch, capture && capture->collectHidden);
     state.reuseBindings = false;
+    if (state.servingPadded && !graphDecode)
+        throw AttentionParallelState::UnsupportedServingLayout{};
+    if (!graphDecode && tpServingState && tpServingState->preparing) return Data();
     // Ring candidates use the same batched SWA/commit kernels as world TP.
     // A cache without the candidate tail retains chronological verification;
     // CommitTargetCaches restores its ring after accepting the chosen rows.
@@ -269,7 +290,8 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
             FastllmCudaSyncCurrentThreadStream();
         }
     };
-    if (graphDecode && tpDecodeState->warmed && !tpDecodeState->captured && !tpDecodeState->disabled) {
+    if (graphDecode && tpDecodeState->warmed && !tpDecodeState->captured && !tpDecodeState->disabled &&
+        (!tpServingState || !tpServingState->preparing || tpServingState->capturing)) {
         auto &graph = *tpDecodeState;
         graph.mode = TPDecodeState::Prepare;
         state.runtime.Run(forwardRank);
@@ -321,6 +343,8 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
             fprintf(stderr, "[Fastllm] Naive attention DP graph unavailable; using eager.\n");
         } else graph.captured = true;
     }
+    if (state.servingPadded && !graphDecode)
+        throw AttentionParallelState::UnsupportedServingLayout{};
     if (graphDecode)
         tpDecodeState->mode = tpDecodeState->captured ? TPDecodeState::Replay : TPDecodeState::Warm;
     state.runtime.Run(forwardRank);
@@ -333,6 +357,7 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
     // Each worker owns whole requests; no root can race another rank's update.
     ForSequenceRanges(tpWorkers, tpDevices, sequences, graphDecode, [&](int begin, int end) {
         for (int seq = begin; seq < end; ++seq) {
+            if (state.servingPadded && seq >= state.servingLiveRows) continue;
             const int oldLength = graphDecode ? key(seq, 0).dims[1] : 0;
             const int count = batch ? batch->lengths[seq] : total;
             for (int layer = 0; layer < block_cnt; ++layer) {
@@ -380,7 +405,7 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
             FastllmCudaSyncCurrentThreadStream();
         });
     }
-    if (recording) for (int seq = 0; seq < sequences; ++seq)
+    if (recording) for (int seq = 0; seq < (state.servingPadded ? state.servingLiveRows : sequences); ++seq)
         FinishPrefixSnapshots(key(seq, 0), prefixes[seq], (batch ? batch->lengths[seq] : total) > 1);
     if (ownedDecode) {
         std::lock_guard<std::mutex> guard(tpRequestMutex);
@@ -401,7 +426,10 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
         selection->sampledTokens = SampleCudaLogits(joined, batch ? batch->configs : std::vector<GenerationConfig>{config});
         return Data();
     }
-    Data output(joined);
+    Data output;
+    if (state.servingPadded) {
+        output.FakeFrom(joined, 0); output.Resize(joined.dims);
+    } else output.CopyFrom(joined);
     if (!(selection && selection->cudaLogits)) output.ToDevice(CPU);
     return output;
 #endif

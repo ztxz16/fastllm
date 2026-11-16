@@ -403,6 +403,10 @@ namespace fastllm {
         Data ForwardAttentionParallel(const Data &inputIds, const Data &positions,
             std::vector<std::pair<Data, Data>> &kv, const GenerationConfig &config,
             TargetCapture *capture, LogitsSelection *selection, const TargetBatch *batch);
+        bool ForwardAttentionParallelServing(const Data &inputIds, const Data &positions,
+            std::vector<std::pair<Data, Data>> &kv, const GenerationConfig &config,
+            LogitsSelection *selection, const TargetBatch *batch, Data &output);
+        bool PrepareAttentionParallelServingDecode(const TargetBatch *batch);
         std::vector<int> tpDevices;
         std::map<int, std::shared_ptr<CudaWorkspace>> tpKVPool;
         int tpSwaCacheCapacity = 0;

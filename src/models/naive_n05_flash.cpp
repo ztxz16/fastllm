@@ -2262,6 +2262,7 @@ void NaiveN05FlashModel::WarmUp() {
         PrepareTensorParallelMemory();
         if (kvMemConfig.enabled) InitSparseKv();
         else InitTensorParallelKVPool();
+        if (!kvMemConfig.enabled) PrepareTensorParallelServing();
         return;
     }
     PrepareTensorParallelMemory();

@@ -61,11 +61,21 @@ struct NaiveN05FlashModel::AttentionParallelState {
     std::vector<GroupBatch> groups;
     std::vector<Rank> ranks;
     parallel::RowPartition rows;
+    // Serving graphs own separate DP scratch: a large prefill must not move
+    // buffers retained by a decode graph. All serving shapes share this arena.
+    std::unique_ptr<parallel::CudaRowTransfer> servingTransfer;
+    std::vector<Rank> servingRanks;
+    parallel::RowPartition servingRows;
+    std::vector<std::pair<Data, Data>> padding;
+    bool servingPadded = false;
+    int servingLiveRows = 0;
+    struct UnsupportedServingLayout {};
     std::atomic<size_t> nextGroup{0};
     DataType planKVType = DATA_AUTO_NONE;
     explicit AttentionParallelState(parallel::Topology topology)
         : runtime(topology), groups(topology.attentionDP), ranks(topology.Size()),
-          rows(topology.attentionDP, {}) {}
+          rows(topology.attentionDP, {}), servingRanks(topology.Size()),
+          servingRows(topology.attentionDP, {}) {}
 };
 }
 #endif

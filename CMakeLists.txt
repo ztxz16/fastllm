@@ -3006,6 +3006,11 @@ if (UNIT_TEST)
             add_test(NAME naive_n05_swa_dp_heads COMMAND naive_n05_swa_verify_test dp_heads)
             set_tests_properties(naive_n05_swa_dp_heads PROPERTIES LABELS "cuda;naive" RUN_SERIAL TRUE TIMEOUT 300 SKIP_RETURN_CODE 77)
             foreach(NAIVE_DP_GROUPS 2 4 8)
+                add_test(NAME naive_n05_attention_dp_serving_${NAIVE_DP_GROUPS}
+                    COMMAND naive_n05_verify_graph_test 8 attention_dp_serving ${NAIVE_DP_GROUPS})
+                set_tests_properties(naive_n05_attention_dp_serving_${NAIVE_DP_GROUPS}
+                    PROPERTIES LABELS "cuda;naive" RUN_SERIAL TRUE TIMEOUT 300 SKIP_RETURN_CODE 77
+                    PASS_REGULAR_EXPRESSION "ATTENTION DP SERVING PASS")
                 foreach(NAIVE_DP_KV bf16 fp8)
                     add_test(NAME naive_n05_attention_dp_ring_${NAIVE_DP_GROUPS}_${NAIVE_DP_KV}
                         COMMAND naive_n05_verify_graph_test 8 attention_dp_ring ${NAIVE_DP_GROUPS} ${NAIVE_DP_KV})
@@ -3013,6 +3018,11 @@ if (UNIT_TEST)
                         PROPERTIES LABELS "cuda;naive" RUN_SERIAL TRUE TIMEOUT 300 SKIP_RETURN_CODE 77)
                 endforeach()
             endforeach()
+            add_test(NAME naive_n05_attention_dp_serving_fallback
+                COMMAND naive_n05_verify_graph_test 8 attention_dp_serving 8 failinstantiate)
+            set_tests_properties(naive_n05_attention_dp_serving_fallback
+                PROPERTIES LABELS "cuda;naive" RUN_SERIAL TRUE TIMEOUT 300 SKIP_RETURN_CODE 77
+                PASS_REGULAR_EXPRESSION "ATTENTION DP SERVING PASS")
             foreach(NAIVE_DP_CASE kvmem failbegin failinstantiate)
                 add_test(NAME naive_n05_attention_dp_ring_${NAIVE_DP_CASE}
                     COMMAND naive_n05_verify_graph_test 8 attention_dp_ring 8 fp8 ${NAIVE_DP_CASE})

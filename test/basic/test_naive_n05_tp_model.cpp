@@ -119,6 +119,10 @@ struct NaiveN05GraphTestAccess {
         model.tpDevices.resize(ranks);
         std::iota(model.tpDevices.begin(), model.tpDevices.end(), 0);
     }
+    static void InitDPCache(NaiveN05FlashModel &model,
+            const std::vector<std::pair<Data *, Data *>> &roots, int group) {
+        model.InitAttentionParallelCache(roots, group);
+    }
     static bool SwaRing(const NaiveN05FlashModel &model) { return model.tpSwaRingCache; }
     static void CheckDPBindings(NaiveN05FlashModel &model, const Data &ids,
             const NaiveN05FlashModel::TargetBatch &batch, int mutation) {
@@ -2850,6 +2854,98 @@ class Fixture : public NaiveN05FlashModel {
         return result;
     }
 
+    void AttentionDPServingChecks(int groups) {
+        ConfigureAttentionParallel(groups);
+        SetIndexerDataType(FP8_E4M3); SetIndexerTPStorage(false, true);
+        maxBatch = 32; SetMaxTokens(262144); SetChunkedPrefillSize(4096);
+        WarmUp();
+#ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+        const int captures = verifyGraphCaptures;
+        if (!captures) throw std::runtime_error("DP serving captured no graphs");
+#endif
+        using Cache = std::vector<std::pair<Data, Data>>;
+        std::vector<std::vector<std::vector<float>>> reference;
+        int replayed = 0;
+        for (bool graph : {false, true}) {
+            SetCudaGraph(graph);
+            const int requests = groups * 2;
+            std::vector<Cache> caches(requests);
+            std::vector<int> past(requests, 2052);
+            GenerationConfig config; config.top_k = 1; config.repeat_penalty = 1;
+            config.input_token_length = 4096; config.output_token_limit = 128;
+            auto prefill = [&](int row, int count) {
+                if (caches[row].empty()) {
+                    caches[row].resize(block_cnt);
+                    std::vector<std::pair<Data *, Data *>> roots;
+                    for (auto &pair : caches[row]) roots.emplace_back(&pair.first, &pair.second);
+                    NaiveN05GraphTestAccess::InitDPCache(*this, roots, row % groups);
+                }
+                std::vector<float> ids(count), pos(count);
+                for (int i = 0; i < count; ++i) {
+                    pos[i] = past[row] - count + i; ids[i] = ((int)pos[i] * 7 + row) % 251;
+                }
+                Forward(Data(FLOAT32, {1, count}, ids), Data(), Data(FLOAT32, {1, count}, pos), caches[row], config);
+            };
+            for (int row = 0; row < requests; ++row) prefill(row, past[row]);
+            for (int turn = 0; turn < 12; ++turn) {
+                // Same graph with replaced bindings, row permutations, empty
+                // groups and skew; intervening prefill must not invalidate it.
+                if (turn == 4) { past[0] += 9; prefill(0, 9); }
+                if (turn == 8) { caches[requests - 1].clear(); past.back() = 2060; prefill(requests - 1, past.back()); }
+                std::vector<int> order;
+                for (int row = 0; row < requests; ++row)
+                    if (turn < 2 || turn == 9 || (turn >= 6 ? row % groups == 0 : row % 3 != turn % 3))
+                        order.push_back(row);
+                if (turn % 2) std::reverse(order.begin(), order.end());
+                std::vector<float> ids(order.size());
+                std::vector<int> lengths(order.size(), 1);
+                std::vector<Data> positions;
+                std::vector<Data *> masks(order.size(), nullptr), posPointers;
+                std::vector<std::pair<Data *, Data *>> pointers;
+                std::vector<GenerationConfig> configs(order.size(), config);
+                std::vector<std::vector<float>> logits(order.size());
+                std::vector<std::vector<float> *> outputs;
+                for (size_t i = 0; i < order.size(); ++i) {
+                    int row = order[i]; ids[i] = (past[row] * 7 + row) % 251;
+                    positions.emplace_back(FLOAT32, std::vector<int>{1, 1}, std::vector<float>{(float)past[row]});
+                    for (auto &pair : caches[row]) pointers.emplace_back(&pair.first, &pair.second);
+                    configs[i].output_logits = true; outputs.push_back(&logits[i]);
+                }
+                for (auto &pos : positions) posPointers.push_back(&pos);
+#ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+                const int before = verifyGraphLaunches;
+#endif
+                ForwardBatch(order.size(), Data(FLOAT32, {1, (int)order.size()}, ids), masks,
+                    posPointers, lengths, pointers, configs, LastTokensManager(), &outputs);
+#ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+                if (graph && !failVerifyInstantiate && verifyGraphLaunches - before != ranks)
+                    throw std::runtime_error("DP serving did not replay every rank");
+                if (graph && failVerifyInstantiate && verifyGraphLaunches != before)
+                    throw std::runtime_error("DP serving replayed a failed graph");
+                if (verifyGraphCaptures != captures) throw std::runtime_error("DP serving recaptured during churn");
+#endif
+                if (graph) {
+                    ++replayed;
+                    for (size_t i = 0; i < order.size(); ++i)
+                        RequireCloseLogits(logits[i].data(), reference[turn][i], "DP serving logits");
+                } else reference.push_back(logits);
+                for (int row : order) {
+                    ++past[row];
+                    for (int layer = 0; layer < block_cnt; ++layer)
+                    for (Data *root : {&caches[row][layer].first, &caches[row][layer].second}) {
+                        const int length = layer == 1 ? std::min(past[row], 127) : past[row];
+                        if (root->dims[1] != length || root->multiDeviceDatas.size() != (size_t)(ranks / groups))
+                            throw std::runtime_error("DP serving changed ownership or length");
+                        for (auto &local : root->multiDeviceDatas)
+                            if (local.second->dims[1] != length) throw std::runtime_error("DP local length mismatch");
+                    }
+                }
+            }
+        }
+        std::cout << "ATTENTION DP SERVING PASS dp=" << groups << " replayed=" << replayed
+                  << " relative=" << largestLogitRelative << std::endl;
+    }
+
     void AttentionDPAdmission(int groups, bool batchPrefill, bool scheduled = false) {
         ConfigureAttentionParallel(groups);
         SetSaveHistoryChat(false); maxBatch = groups * 2; max_positions = 512;
@@ -4479,6 +4575,17 @@ int main(int argc, char **argv) {
         SetThreads(4);
         SetDeviceMap({{"cuda:0", 1}});
         FastllmCudaSetDevice(0);
+        if (argc > 2 && std::string(argv[2]) == "attention_dp_serving") {
+            SetCudaEmbedding(true); SetCudaGraph(true);
+#ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+            failGraphDevice = ranks - 1;
+            failVerifyInstantiate = argc > 4 && std::string(argv[4]) == "failinstantiate";
+#endif
+            Fixture fixture(ranks, false, true, true, true);
+            fixture.SetKVCacheDataType(FP8_E4M3);
+            fixture.AttentionDPServingChecks(argc > 3 ? std::stoi(argv[3]) : ranks);
+            return 0;
+        }
         if (argc > 2 && std::string(argv[2]) == "attention_dp_ring") {
             SetCudaEmbedding(true);
             const int groups = argc > 3 ? std::stoi(argv[3]) : 8;
