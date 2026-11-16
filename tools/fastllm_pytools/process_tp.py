@@ -66,7 +66,7 @@ def native_binary(value, name):
 def validate_options(args, *, allow_dp=False):
     """进程后端仅接受已实现的参数；拒绝线程后端专用配置，绝不静默忽略。"""
     from .util import make_normal_parser, add_server_args
-    from .parallel_config import prepare_parallel_entry
+    from .parallel_config import prepare_parallel_entry, is_attention_ep
 
     prepare_parallel_entry(args)
     if getattr(args, 'dp', 1) > 1 and not allow_dp:
@@ -76,9 +76,9 @@ def validate_options(args, *, allow_dp=False):
     add_server_args(parser)
     defaults = vars(parser.parse_args([]))
     allowed = {'model', 'path', 'dp', 'attention_dp', 'ep', 'dp_routing', 'tp', 'tp_backend', 'tp_binary', 'tp_worker', 'tp_output', 'tp_timeout',
-               'tp_request_timeout', 'tp_queue_size', 'tp_request_log', 'host', 'port', 'model_name', 'cuda_graph', 'custom_allreduce'}
+               'tp_request_timeout', 'tp_queue_size', 'tp_request_log', 'host', 'port', 'model_name', 'cuda_graph', 'custom_allreduce', 'tokens', 'page_size'}
     compatible = {'dtype': ('auto', 'float16'), 'atype': ('auto', 'float16'),
-                  'kv_cache_dtype': ('auto', 'float16'), 'kv_cache_layout': ('auto', 'continuous'),
+                  'kv_cache_dtype': ('auto', 'float16'), 'kv_cache_layout': ('auto', 'continuous') if is_attention_ep(args) else ('auto', 'paged'),
                   'device': (None, ''), 'FASTLLM_ACTIVATE_NUMA': ('OFF',), 'FASTLLM_NUMA_THREADS': (27,),
                   'max_batch': (-1, 1), 'enable_thinking': ('', 'false'),
                   'prefix_cache': ('', 'false', 'true'), 'cache_history': ('', 'false'), 'cache_fast': ('', 'false')}
@@ -91,6 +91,8 @@ def validate_options(args, *, allow_dp=False):
         else:
             valid = key in defaults and value == defaults[key]
         if not valid:
+            if key == 'kv_cache_layout' and not is_attention_ep(args):
+                raise ValueError('Qwen3 process TP does not support continuous KV; use --kv-cache-layout paged or auto')
             raise ValueError(f'process TP does not support {key}={value!r}; no thread fallback')
     for key in ('FASTLLM_PREFIX_CACHE', 'FASTLLM_CUDA_GRAPH', 'FASTLLM_CUDA_CUSTOM_ALLREDUCE',
                 'FASTLLM_CUDA_TP2_P2P_ALLREDUCE'):
@@ -102,6 +104,12 @@ def validate_options(args, *, allow_dp=False):
             if key == 'FASTLLM_CUDA_CUSTOM_ALLREDUCE':
                 raise ValueError('process TP rejects FASTLLM_CUDA_CUSTOM_ALLREDUCE; use --custom-allreduce')
             raise ValueError(f'process TP does not support {key} yet')
+    if is_attention_ep(args) and any(getattr(args, k, -1) != -1 for k in ('page_size', 'tokens')):
+        raise ValueError('MoE does not support dense paged cache configuration')
+    for name in ('page_size', 'tokens'):
+        value = getattr(args, name, -1)
+        if type(value) is not int or (value != -1 and not 1 <= value <= 2147483647):
+            raise ValueError(f'{name} must be -1 or a positive int32')
     if type(getattr(args, 'custom_allreduce', False)) is not bool:
         raise ValueError('custom_allreduce must be boolean')
     if type(getattr(args, 'cuda_graph', False)) is not bool:
@@ -172,6 +180,7 @@ class ProcessTPModel:
         self._closing = False
         session_class = Qwen3ProcessSession
         session_options = dict(custom_allreduce=getattr(args, 'custom_allreduce', False))
+        session_options.update(page_size=getattr(args, 'page_size', -1), cache_tokens=getattr(args, 'tokens', -1))
         if moe:
             from contextlib import nullcontext
             from .qwen_moe_process_session import QwenMoeProcessSession

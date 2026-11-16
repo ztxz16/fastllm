@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <stdexcept>
+#include "qwen3_paged_cache.cuh"
 
 namespace fastllm {
 namespace distributed {
@@ -278,7 +279,8 @@ struct Qwen3LayerExecutor::Impl {
     uint64_t forwardTraceRound = 0;
     std::vector<void*> buffers;
     size_t allocated = 0;
-    std::vector<half*> kvCache;
+    std::vector<half*> kvCache; // MoE保留原有连续缓存。
+    std::unique_ptr<detail::ProcessPagedKV> paged;
     Qwen3RequestInfo request;
     Qwen3GraphInfo graphInfo;
     Qwen3PrefixInfo prefixInfo;
@@ -402,10 +404,27 @@ struct Qwen3LayerExecutor::Impl {
      * 模型/布局由执行器生命周期隔离，键另外包含完整 ID 前缀和 RoPE 起点。
      * @param ids 已验证的 1..2048 个 Prompt ID。
      * @param position 当前 Prompt 的 RoPE 起点。
-     * @return 实际复制的 token 数；复制到独立请求 KV，不共享可写地址。
+     * @return 实际复用的token数；dense绑定完整只读页，MoE沿用独立请求KV的快照复制。
      */
     uint32_t RestorePrefix(const std::vector<uint32_t> &ids, uint32_t position) {
         if (!prefixInfo.enabled) return 0;
+        if (paged) {
+            std::vector<int> tokens(ids.begin(), ids.end());
+            uint32_t local = paged->Query(tokens, position), reused = 0;
+            auto values = static_cast<uint32_t*>(Allocate(2 * sizeof(uint32_t)));
+            Cuda(cudaMemcpyAsync(values, &local, sizeof(local), cudaMemcpyHostToDevice, stream));
+            Nccl(ncclAllReduce(values, values + 1, 1, ncclUint32, ncclMin, comm, stream));
+            Cuda(cudaMemcpyAsync(&reused, values + 1, sizeof(reused), cudaMemcpyDeviceToHost, stream));
+            Synchronize();
+            ReleaseBuffers();
+            paged->Restore(tokens, position, reused);
+            ++prefixInfo.lookups;
+            prefixInfo.hits += reused != 0;
+            prefixInfo.reusedTokens += reused;
+            prefixInfo.lastReusedTokens = reused;
+            prefixInfo.lastComputedTokens = ids.size() - reused;
+            return reused;
+        }
         uint32_t reused = 0;
         size_t selected = 0;
         for (size_t i = 0; i < prefixes.size(); ++i) {
@@ -448,16 +467,20 @@ struct Qwen3LayerExecutor::Impl {
     }
 
     /**
-     * 在成功 Prefill 后保存不可变 Prompt KV，后续生成取消仍可复用该有效快照。
+     * 在成功Prefill后登记有效Prompt前缀，后续生成取消仍可复用已计算的部分。
      *
-     * 每条各层布局为 FP16 [promptTokens,2,localKVHeads,headDim]。最多 8 条；
-     * 使用全局 KV 头数保守计费，保证所有 rank 的 64 MiB 淘汰决策完全相同。
-     * 超过单条预算时不插入；分配或复制错误终止 worker，不假装缓存成功。
+     * Dense仅向FT索引登记完整页面，容量和淘汰沿用FT页池。
+     * MoE保留FP16 [promptTokens,2,localKVHeads,headDim]快照及原有条数/字节预算。
+     * 分配、登记或复制错误终止worker。
      * @param ids 已完成前向的原始 Prompt ID，不包含 Decode token。
      * @param position Prompt 的 RoPE 起点。
      */
     void SavePrefix(const std::vector<uint32_t> &ids, uint32_t position) {
         if (!prefixInfo.enabled) return;
+        if (paged) {
+            paged->Record(std::vector<int>(ids.begin(), ids.end()), position);
+            return;
+        }
         for (size_t i = 0; i < prefixes.size(); ++i) {
             if (prefixes[i].position == position && prefixes[i].ids == ids) {
                 std::rotate(prefixes.begin() + i, prefixes.begin() + i + 1, prefixes.end());
@@ -756,14 +779,18 @@ struct Qwen3LayerExecutor::Impl {
                 Norm<<<t*kh,256,0,r.stream>>>(qkv, r.Weight(prefix + "self_attn.k_norm.weight", {uint64_t(d)}), qkv, d, qkvWidth, kh, qw, p.rmsNormEps);
             }
             Rope<<<t*(qh+kh),256,0,r.stream>>>(qkv, qh, kh, d, qkvWidth, positionBegin, p.ropeTheta, decodeMeta);
-            half *cache = cached ? kvCache.at(layer) : nullptr;
-            const int past = cached ? request.tokens : 0;
-            if (cached) {
-                AppendKV<<<(t*2*kw+255)/256,256,0,r.stream>>>(qkv, cache, t*2*kw, 2*kw, qw, past, decodeMeta);
+            if (paged) {
+                paged->Run(layer, t, qkv, context, cached, decodeMeta != nullptr);
+            } else {
+                half *cache = cached ? kvCache.at(layer) : nullptr;
+                const int past = cached ? request.tokens : 0;
+                if (cached) {
+                    AppendKV<<<(t*2*kw+255)/256,256,0,r.stream>>>(qkv, cache, t*2*kw, 2*kw, qw, past, decodeMeta);
+                }
+                Attention<<<t*qh,256,0,r.stream>>>(qkv, context, qh, kh, d, p.queryHeadBegin, p.kvHeadBegin,
+                                                  p.queryHeads / p.kvHeads, cache, past,
+                                                  p.model == ShardModel::Qwen2Moe, decodeMeta);
             }
-            Attention<<<t*qh,256,0,r.stream>>>(qkv, context, qh, kh, d, p.queryHeadBegin, p.kvHeadBegin,
-                                              p.queryHeads / p.kvHeads, cache, past,
-                                              p.model == ShardModel::Qwen2Moe, decodeMeta);
             r.Linear(context, r.Weight(prefix + "self_attn.o_proj.weight", {hidden, uint64_t(qw)}), partial, t, h, qw, true);
             if (auto bias = r.Weight(prefix + "self_attn.o_proj.bias", {hidden}, true)) {
                 Bias<<<(t*h+255)/256,256,0,r.stream>>>(partial, bias, t*h, h);
@@ -892,6 +919,7 @@ struct Qwen3LayerExecutor::Impl {
         }
         graphBuffers.clear();
         graphAllocated = 0;
+        if (paged) paged->ReleaseGraphScratch();
         graphIds = graphMeta = nullptr;
         graphX = nullptr;
         graphLogits = nullptr;
@@ -926,6 +954,12 @@ Qwen3LayerExecutor::Qwen3LayerExecutor(const Qwen3DeviceWeights &weights, cudaSt
     }
     impl->graphInfo.enabled = cudaGraph;
     impl->prefixInfo.enabled = prefixCache;
+    if (weights.Plan().model == ShardModel::DenseQwen3) {
+        if (stream != cudaStreamPerThread) throw std::runtime_error("FT paged TP requires the worker thread default CUDA stream");
+        const auto &p = weights.Plan();
+        impl->paged.reset(new detail::ProcessPagedKV(p.layerCount, p.queryHeadCount, p.kvHeadCount, p.headDim));
+        impl->prefixInfo.directoryVersion = 2;
+    }
     if (const char *trace = std::getenv("FASTLLM_MOE_TRACE_DIR")) {
         if (*trace) {
             if (weights.Plan().model != ShardModel::Qwen2Moe || cudaGraph || prefixCache) {
@@ -947,8 +981,10 @@ Qwen3LayerExecutor::Qwen3LayerExecutor(const Qwen3DeviceWeights &weights, cudaSt
     }
 }
 
-// 异常析构不进入可能阻塞的 CUDA 清理；worker 的失败路径退出进程回收上下文。
-Qwen3LayerExecutor::~Qwen3LayerExecutor() = default;
+/** 正常卸载由Clear释放；异常析构不调用可能阻塞的CUDA清理，由worker退出回收上下文。 */
+Qwen3LayerExecutor::~Qwen3LayerExecutor() {
+    if (impl) (void)impl->paged.release();
+}
 
 std::vector<float> Qwen3LayerExecutor::Forward(uint32_t layer, uint32_t tokens, uint32_t hidden,
         uint32_t positionBegin, Qwen3LayerStage stage, const std::vector<float> &input) {
@@ -1127,16 +1163,21 @@ std::vector<float> Qwen3LayerExecutor::BeginRequest(const std::vector<uint32_t> 
             throw std::runtime_error("Qwen3 prefill token ID outside vocabulary");
         }
     }
-    const uint64_t layerBytes = uint64_t(capacity) * 2 * p.kvHeadCount * p.headDim * sizeof(half);
-    if (!layerBytes || layerBytes > 256ULL * 1024 * 1024 || p.layerCount > (256ULL * 1024 * 1024) / layerBytes) {
-        throw std::runtime_error("Qwen3 request KV exceeds 256 MiB");
-    }
-
-    // KV 生命周期跨调用，不能放入每次前向结束就释放的临时 buffers。
-    r.kvCache.resize(p.layerCount, nullptr);
-    for (auto &cache : r.kvCache) {
-        Cuda(cudaMalloc(reinterpret_cast<void**>(&cache), layerBytes));
-        r.request.deviceBytes += layerBytes;
+    if (r.paged) {
+        if (capacity > uint64_t(r.paged->PageLen()) * r.paged->MaxPages()) {
+            throw std::runtime_error("Qwen3 request exceeds FT paged pool capacity");
+        }
+        r.paged->End();
+    } else {
+        const uint64_t layerBytes = uint64_t(capacity) * 2 * p.kvHeadCount * p.headDim * sizeof(half);
+        if (!layerBytes || layerBytes > 256ULL * 1024 * 1024 || p.layerCount > (256ULL * 1024 * 1024) / layerBytes) {
+            throw std::runtime_error("Qwen3 request KV exceeds 256 MiB");
+        }
+        r.kvCache.resize(p.layerCount, nullptr);
+        for (auto &cache : r.kvCache) {
+            Cuda(cudaMalloc(reinterpret_cast<void**>(&cache), layerBytes));
+            r.request.deviceBytes += layerBytes;
+        }
     }
     r.request.active = true;
     r.request.capacity = capacity;
@@ -1169,6 +1210,7 @@ std::vector<float> Qwen3LayerExecutor::DecodeGraph(uint32_t tokenId) {
     auto &r = *impl;
     const auto &p = r.weights.Plan();
     const uint32_t meta[] = {r.request.tokens, r.request.positionBegin + r.request.tokens};
+    if (r.paged) r.paged->PrepareDecode(r.request.tokens);
     r.Validate(0, 1, p.hiddenSize, meta[1], Qwen3LayerStage::Full);
     r.Weight("model.embed_tokens.weight", {p.vocabSize, p.hiddenSize});
 
@@ -1349,6 +1391,7 @@ void Qwen3LayerExecutor::EndRequest() {
         return;
     }
     r.ReleaseGraph();
+    if (r.paged) r.paged->End();
     for (auto &cache : r.kvCache) {
         Cuda(cudaFree(cache));
         cache = nullptr;
@@ -1361,8 +1404,11 @@ Qwen3RequestInfo Qwen3LayerExecutor::RequestInfo() const {
     auto info = impl->request;
     info.graph = impl->graphInfo;
     info.graph.active = impl->graphExec != nullptr;
-    info.graph.workspaceBytes = impl->graphAllocated;
-    info.prefix = impl->prefixInfo;
+    info.graph.workspaceBytes = impl->graphAllocated + (impl->paged ? impl->paged->GraphBytes() : 0);
+    info.prefix = impl->paged ? impl->paged->Info(impl->prefixInfo) : impl->prefixInfo;
+    if (impl->paged && info.active) {
+        info.deviceBytes = info.prefix.activePages * info.prefix.pageLen * impl->weights.Plan().kvHeadCount * impl->weights.Plan().headDim * sizeof(half);
+    }
     info.reservedKVBytes = impl->reservedKVBytes;
     for (const auto &entry : impl->prefixes) {
         info.prefix.snapshots.emplace_back(entry.position, entry.ids);
@@ -1370,12 +1416,14 @@ Qwen3RequestInfo Qwen3LayerExecutor::RequestInfo() const {
     return info;
 }
 
-void Qwen3LayerExecutor::ClearPrefixCache() {
+void Qwen3LayerExecutor::ClearPrefixCache(int layer) {
     auto &r = *impl;
     if (r.weights.Plan().model == ShardModel::Qwen2Moe && r.request.active) {
         throw std::runtime_error("cannot clear MoE prefix cache during an active request");
     }
     r.Synchronize();
+    if (layer >= 0 && !r.paged) throw std::runtime_error("selective prefix clear requires dense paged TP");
+    if (r.paged) r.paged->ClearPrefix(layer);
     while (!r.prefixes.empty()) r.ErasePrefix(0);
     if (r.prefixInfo.enabled) ++r.prefixInfo.clears;
 }
@@ -1387,6 +1435,7 @@ void Qwen3LayerExecutor::Clear() {
     for (auto cache : impl->kvCache) Cuda(cudaFree(cache));
     impl->kvCache.clear();
     impl->reservedKVBytes = 0;
+    impl->paged.reset();
     impl->ReleaseBuffers();
     if (impl->qkvLt) {
         Blas(cublasLtDestroy(impl->qkvLt));

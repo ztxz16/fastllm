@@ -510,19 +510,24 @@ struct ProcessGroup::Impl {
     }
 
     /** 查询或释放请求缓存；验证各 rank 的活动状态、长度和容量一致。 */
-    std::vector<Qwen3RequestInfo> RequestStates(bool end, bool clearPrefix = false) {
+    std::vector<Qwen3RequestInfo> RequestStates(bool end, bool clearPrefix = false, int clearRank = -1, int clearLayer = -1) {
         std::lock_guard<std::mutex> lock(mutex);
         if (state != ProcessGroupState::Ready || options.controlOnly) {
             throw std::runtime_error("Qwen3 request requires a ready CUDA process TP group");
         }
+        if (clearRank < -1 || clearRank >= int(options.devices.size()) || clearLayer < -1 ||
+            (moeModel && (clearRank >= 0 || clearLayer >= 0))) throw std::invalid_argument("invalid selective prefix clear");
+        const bool clearAll = clearPrefix && clearRank < 0 && clearLayer < 0;
+        std::vector<uint8_t> clearPayload;
+        if (clearPrefix && !clearAll) { Put32(clearPayload, uint32_t(clearRank)); Put32(clearPayload, uint32_t(clearLayer)); }
         try {
             auto replies = Exchange(clearPrefix ? Kind::ClearQwen3Prefix : end ? Kind::EndQwen3Request : Kind::QueryQwen3Request,
-                clearPrefix ? Kind::Qwen3PrefixCleared : end ? Kind::Qwen3RequestEnded : Kind::Qwen3RequestState, {},
+                clearPrefix ? Kind::Qwen3PrefixCleared : end ? Kind::Qwen3RequestEnded : Kind::Qwen3RequestState, clearPayload,
                 Clock::now() + std::chrono::milliseconds(options.operationTimeoutMs));
             std::vector<Qwen3RequestInfo> result;
             for (const auto &reply : replies) {
                 const auto &bytes = reply.payload;
-                if (bytes.size() < 184 || Get32(bytes, 176) != 1 || Get32(bytes, 0) > 1 || Get32(bytes, 104) > 1 ||
+                if (bytes.size() < 184 || (Get32(bytes, 176) != 1 && Get32(bytes, 176) != 2) || Get32(bytes, 0) > 1 || Get32(bytes, 104) > 1 ||
                     Get32(bytes, 24) > 1 || Get32(bytes, 28) > 1 ||
                     Get32(bytes, 72) > 1 || Get32(bytes, 76) > 1) {
                     throw std::runtime_error("invalid Qwen3 request state header; rebuild coordinator and worker together");
@@ -536,8 +541,10 @@ struct ProcessGroup::Impl {
                 info.prefix = {Get32(bytes, 104) != 0, Get32(bytes, 108), Get64(bytes, 112),
                     Get64(bytes, 120), Get64(bytes, 128), Get64(bytes, 136), Get64(bytes, 144),
                     Get64(bytes, 152), Get64(bytes, 160), Get64(bytes, 168)};
+                info.prefix.directoryVersion = Get32(bytes, 176);
+                const bool paged = info.prefix.directoryVersion == 2;
                 const uint32_t entries = Get32(bytes, 180);
-                if (entries > 8 || entries != info.prefix.entries) {
+                if ((!paged && entries > 8) || entries > (bytes.size() - 184) / 12 || entries != info.prefix.entries) {
                     throw std::runtime_error("invalid Qwen3 prefix directory count");
                 }
                 size_t offset = 184;
@@ -558,6 +565,16 @@ struct ProcessGroup::Impl {
                 }
                 info.reservedKVBytes = Get64(bytes, offset);
                 offset += 8;
+                if (paged) {
+                    info.prefix.pageLen = Get32(bytes, offset); info.prefix.maxPages = Get32(bytes, offset + 4);
+                    info.prefix.poolBytes = Get64(bytes, offset + 8); info.prefix.activePages = Get64(bytes, offset + 16);
+                    info.prefix.cachedPages = Get64(bytes, offset + 24);
+                    auto length = Get32(bytes, offset + 32); offset += 36;
+                    if (length > bytes.size() - offset) throw std::runtime_error("invalid paged backend name");
+                    info.prefix.backend.assign(bytes.begin() + offset, bytes.begin() + offset + length); offset += length;
+                    if (!info.prefix.pageLen || !info.prefix.maxPages || info.prefix.deviceBytes > info.prefix.poolBytes ||
+                        info.deviceBytes > info.prefix.poolBytes) throw std::runtime_error("invalid FT paged resources");
+                }
                 if (offset != bytes.size()) throw std::runtime_error("trailing Qwen3 prefix directory bytes");
                 const auto &prefix = info.prefix;
                 const auto &ar = info.allReduce;
@@ -565,7 +582,7 @@ struct ProcessGroup::Impl {
                 bool invalid = info.active ?
                     (end || !info.tokens || info.tokens > info.capacity || info.capacity > kQwen3MaxContextTokens ||
                      info.positionBegin > 1048576 || info.capacity - 1 > 1048576 - info.positionBegin ||
-                     !info.deviceBytes || info.deviceBytes > (moeModel ? 512ULL : 256ULL) * 1024 * 1024) :
+                     !info.deviceBytes || (!paged && info.deviceBytes > (moeModel ? 512ULL : 256ULL) * 1024 * 1024)) :
                     (info.tokens || info.capacity || info.positionBegin || info.deviceBytes);
                 invalid = invalid || ar.enabled != options.customAllReduce || ar.active != ar.enabled ||
                     !ar.workspaceBytes || ar.workspaceBytes > 3ULL * 1024 * 1024 ||
@@ -576,13 +593,13 @@ struct ProcessGroup::Impl {
                     (g.enabled ? (!moeModel && g.eagerDecodes != 0) : (g.active || g.captures || g.replays || g.warmups)) ||
                     info.reservedKVBytes > 512ULL * 1024 * 1024 || (!moeModel && info.reservedKVBytes) ||
                     (moeModel && info.deviceBytes > info.reservedKVBytes);
-                invalid = invalid || prefix.enabled != options.prefixCache || prefix.entries > 8 ||
-                    prefix.deviceBytes > (moeModel ? 512ULL : 64ULL) * 1024 * 1024 || bool(prefix.entries) != bool(prefix.deviceBytes) ||
+                invalid = invalid || prefix.enabled != options.prefixCache || (!paged && (prefix.entries > 8 ||
+                    prefix.deviceBytes > (moeModel ? 512ULL : 64ULL) * 1024 * 1024 || bool(prefix.entries) != bool(prefix.deviceBytes))) ||
                     prefix.hits > prefix.lookups || prefix.reusedTokens < prefix.hits ||
                     prefix.lastReusedTokens >= kQwen3MaxPromptTokens || prefix.lastComputedTokens > kQwen3MaxPromptTokens ||
                     prefix.lastReusedTokens + prefix.lastComputedTokens > kQwen3MaxPromptTokens ||
                     (prefix.lookups && !prefix.lastComputedTokens) ||
-                    (clearPrefix && (prefix.entries || prefix.deviceBytes)) ||
+                    (clearAll && (prefix.entries || prefix.deviceBytes)) ||
                     (!prefix.enabled && (prefix.entries || prefix.deviceBytes || prefix.lookups || prefix.hits ||
                         prefix.reusedTokens || prefix.lastReusedTokens || prefix.lastComputedTokens || prefix.evictions || prefix.clears));
                 if (moeModel && !result.empty()) {
@@ -600,15 +617,39 @@ struct ProcessGroup::Impl {
                               ar.customCalls != first.allReduce.customCalls || ar.ncclCalls != first.allReduce.ncclCalls ||
                               ar.workspaceBytes != first.allReduce.workspaceBytes;
                     const auto &f = first.prefix;
-                    invalid = invalid || prefix.entries != f.entries || prefix.lookups != f.lookups ||
+                    invalid = invalid || (!paged && prefix.entries != f.entries) || prefix.lookups != f.lookups ||
                         prefix.hits != f.hits || prefix.reusedTokens != f.reusedTokens ||
                         prefix.lastReusedTokens != f.lastReusedTokens || prefix.lastComputedTokens != f.lastComputedTokens ||
-                        prefix.evictions != f.evictions || prefix.clears != f.clears || prefix.snapshots != f.snapshots;
+                        (!paged && (prefix.clears != f.clears || prefix.evictions != f.evictions || prefix.snapshots != f.snapshots)) ||
+                        prefix.directoryVersion != f.directoryVersion || prefix.pageLen != f.pageLen || prefix.maxPages != f.maxPages;
                 }
                 if (invalid) {
                     throw std::runtime_error("invalid/inconsistent Qwen3 request state");
                 }
                 result.push_back(info);
+            }
+            // 路由目录必须是整个TP组的交集；各rank的物理页和淘汰计数可不同。
+            if (!moeModel && !result.empty() && result.front().prefix.directoryVersion == 2) {
+                std::vector<std::pair<uint32_t, std::vector<uint32_t>>> common;
+                const auto page = result.front().prefix.pageLen;
+                for (auto entry : result.front().prefix.snapshots) {
+                    size_t length = entry.second.size();
+                    for (const auto &rank : result) {
+                        size_t best = 0;
+                        for (const auto &candidate : rank.prefix.snapshots) {
+                            if (candidate.first != entry.first) continue;
+                            size_t matched = 0;
+                            while (matched < length && matched < candidate.second.size() &&
+                                   entry.second[matched] == candidate.second[matched]) ++matched;
+                            best = std::max(best, matched / page * page);
+                        }
+                        length = std::min(length, best);
+                    }
+                    if (length) { entry.second.resize(length); common.push_back(std::move(entry)); }
+                }
+                std::sort(common.begin(), common.end());
+                common.erase(std::unique(common.begin(), common.end()), common.end());
+                for (auto &rank : result) { rank.prefix.snapshots = common; rank.prefix.entries = common.size(); }
             }
             return result;
         } catch (const std::exception &failure) {
@@ -641,6 +682,8 @@ struct ProcessGroup::Impl {
             "--cuda-graph", options.cudaGraph ? "1" : "0",
             "--custom-allreduce", options.customAllReduce ? "1" : "0",
             "--prefix-cache", options.prefixCache ? "1" : "0"};
+        if (options.pageSize) { args.push_back("--page-size"); args.push_back(std::to_string(options.pageSize)); }
+        if (options.cacheTokens) { args.push_back("--tokens"); args.push_back(std::to_string(options.cacheTokens)); }
         std::vector<char*> argv;
         for (auto &arg : args) {
             argv.push_back(&arg[0]);
@@ -1229,8 +1272,8 @@ void ProcessGroup::EndQwen3Request() {
     impl->RequestStates(true);
 }
 
-void ProcessGroup::ClearQwen3PrefixCache() {
-    impl->RequestStates(false, true);
+void ProcessGroup::ClearQwen3PrefixCache(int rank, int layer) {
+    impl->RequestStates(false, true, rank, layer);
 }
 
 std::vector<Qwen3RequestInfo> ProcessGroup::Qwen3Requests() {

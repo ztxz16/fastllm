@@ -54,7 +54,7 @@ int main(int argc, char **argv) {
             std::string key = argv[i];
             if (i + 1 == argc || (key != "--worker" && key != "--model" && key != "--tasks" &&
                 key != "--devices" && key != "--case" && key != "--reload-model" &&
-                key != "--max-logit-elements" && key != "--cuda-graph" && key != "--custom-allreduce" && key != "--prefix-cache") || !args.emplace(key, argv[i + 1]).second) {
+                key != "--max-logit-elements" && key != "--cuda-graph" && key != "--custom-allreduce" && key != "--prefix-cache" && key != "--page-size" && key != "--tokens") || !args.emplace(key, argv[i + 1]).second) {
                 throw std::runtime_error("invalid/duplicate decode checker argument");
             }
         }
@@ -73,6 +73,8 @@ int main(int argc, char **argv) {
         options.cudaGraph = args.count("--cuda-graph") && ParseCudaGraph(args.at("--cuda-graph"));
         options.customAllReduce = args.count("--custom-allreduce") && ParseCustomAllReduce(args.at("--custom-allreduce"));
         options.prefixCache = args.count("--prefix-cache") && ParsePrefixCache(args.at("--prefix-cache"));
+        options.pageSize = ParsePagedSize(args, "--page-size");
+        options.cacheTokens = ParsePagedSize(args, "--tokens");
         report["execution"] = options.cudaGraph ? "decode_cuda_graph" : "eager";
         options.workerPath = fs::absolute(args.at("--worker")).string();
         options.operationTimeoutMs = options.shutdownTimeoutMs = 30000;
@@ -137,7 +139,13 @@ int main(int argc, char **argv) {
             } else if (op == "end") {
                 group.EndQwen3Request();
             } else if (op == "clear_prefix") {
-                group.ClearQwen3PrefixCache();
+                auto selection = [&](const std::string &key, uint32_t limit) {
+                    if (task[key].is_null()) return -1;
+                    const auto value = Integer(task[key], "clear " + key);
+                    if (value > limit) throw std::runtime_error("invalid clear " + key);
+                    return int(value);
+                };
+                group.ClearQwen3PrefixCache(selection("rank", 63), selection("layer", 65535));
             } else if (op == "unload") {
                 group.UnloadQwen3();
             } else if (op == "load") {

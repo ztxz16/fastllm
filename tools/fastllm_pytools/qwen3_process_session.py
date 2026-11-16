@@ -42,7 +42,7 @@ class GenerationObserverError(RuntimeError):
 class Qwen3ProcessSession:
     """同步会话；线程调用串行化，超时或协议错误后整组回收，不自动重试请求。"""
 
-    def __init__(self, binary, worker, model, devices, output, *, timeout=1800, trace=False, cuda_graph=False, custom_allreduce=False, prefix_cache=False, environment=None, request_log=True):
+    def __init__(self, binary, worker, model, devices, output, *, timeout=1800, trace=False, cuda_graph=False, custom_allreduce=False, prefix_cache=False, environment=None, request_log=True, page_size=-1, cache_tokens=-1):
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("session timeout must be finite and positive")
         device_ids = [int(value) for value in devices.split(",")]
@@ -62,6 +62,10 @@ class Qwen3ProcessSession:
         self.custom_allreduce = custom_allreduce
         if type(prefix_cache) is not bool:
             raise ValueError('prefix_cache must be boolean')
+        for name, value in (('page_size', page_size), ('cache_tokens', cache_tokens)):
+            if type(value) is not int or (value != -1 and not 1 <= value <= 2147483647):
+                raise ValueError(f'{name} must be -1 or a positive int32')
+        self.page_size, self.cache_tokens = page_size, cache_tokens
         self.prefix_cache = prefix_cache
         self.cuda_graph = cuda_graph
         self._graph_state = None
@@ -193,6 +197,10 @@ class Qwen3ProcessSession:
                 command = [str(self.binary), "--worker", str(self.worker), "--model", str(self.model),
                            "--devices", ",".join(map(str, self.devices)), "--session-fd", str(child.fileno()),
                            "--trace-logits", "1" if self.trace else "0", "--cancel-fd", str(cancel_child.fileno())]
+                if self.page_size > 0:
+                    command += ["--page-size", str(self.page_size)]
+                if self.cache_tokens > 0:
+                    command += ["--tokens", str(self.cache_tokens)]
                 if self.cuda_graph:
                     command += ["--cuda-graph", "1"]
                 if self.custom_allreduce:
