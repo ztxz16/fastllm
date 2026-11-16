@@ -1139,6 +1139,11 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         help = "Qwen3.5 系列多卡 MTP 的 FP8 draft 输出头；1 开启，0 复用原输出头以节省显存；未指定时沿用 FASTLLM_MTP_FP8_DRAFT_HEAD（默认开启）")
     parser.add_argument("--dspark", type = int, default = 0,
                         help = "启用 DSpark 并指定每轮候选数；外置草稿配合 --draft 使用，保留 checkpoint 的训练 block size")
+    draft_parallel = parser.add_mutually_exclusive_group()
+    draft_parallel.add_argument("--dspark_tp_size", "--dspark-tp-size", type = _positive_int, default = None,
+                        help = "Naive/MiMo 外置 DSpark 草稿 TP 数，1 为单卡；默认跟随主模型 CUDA TP，布局不支持时回退单卡；兼容 FASTLLM_DSPARK_TP")
+    draft_parallel.add_argument("--dspark_dp_size", "--dspark-dp-size", type = _positive_int, default = None,
+                        help = "Naive/MiMo 外置 DSpark 草稿 DP 副本数；按完整请求分摊计算，增加 BF16 权重副本，KV 按请求分配；与草稿 TP 参数互斥")
     parser.add_argument("--speculative_algorithm", "--speculative-algorithm",
                         dest = "speculative_algorithm", type = str, default = "",
                         help = "投机解码算法；off 关闭，或选择 mtp、dspark、dflash、clover")
@@ -1529,6 +1534,12 @@ def make_normal_llm_model(args, startup_progress = None):
                 "(requested=%d, checkpoint block_size=%d)" %
                 (draft_tokens, configured_block))
         os.environ["FASTLLM_DSPARK_MODEL_PATH"] = speculative_draft_path
+        if getattr(args, "dspark_tp_size", None) is not None and getattr(args, "dspark_dp_size", None) is not None:
+            raise ValueError("dspark_tp_size and dspark_dp_size are mutually exclusive")
+        if getattr(args, "dspark_tp_size", None) is not None:
+            os.environ["FASTLLM_DSPARK_TP"] = str(args.dspark_tp_size)
+        elif getattr(args, "dspark_dp_size", None) is not None:
+            os.environ["FASTLLM_DSPARK_TP"] = "dp:" + str(args.dspark_dp_size)
         if draft_tokens > 0:
             os.environ["FASTLLM_DSPARK_TOKENS"] = str(draft_tokens)
             args.draft_tokens = draft_tokens

@@ -115,6 +115,10 @@ struct NaiveN05PrefixCacheTestAccess {
 #endif
 namespace fastllm {
 struct NaiveN05GraphTestAccess {
+    static void SetDraftDevices(NaiveN05FlashModel &model, int ranks) {
+        model.tpDevices.resize(ranks);
+        std::iota(model.tpDevices.begin(), model.tpDevices.end(), 0);
+    }
     static bool SwaRing(const NaiveN05FlashModel &model) { return model.tpSwaRingCache; }
     static void CheckDPBindings(NaiveN05FlashModel &model, const Data &ids,
             const NaiveN05FlashModel::TargetBatch &batch, int mutation) {
@@ -3956,10 +3960,22 @@ class DraftFixture : public NaiveN05FlashModel {
         }
         std::cout << "DRAFT PREFILL TAIL PASS" << std::endl;
     }
-    static void RunTPChecks(int ranks, bool mlpOnly, bool singleKV = false, int owner = 0) {
-        const std::string tp = (mlpOnly ? "mlp:" : "") + std::to_string(ranks);
+    static void RunTPChecks(int ranks, bool mlpOnly, bool singleKV = false, int owner = 0, bool automatic = false, bool dp = false) {
+        const std::string tp = (dp ? "dp:" : mlpOnly ? "mlp:" : "") + std::to_string(ranks);
         DraftFixture reference(true, singleKV ? 1 : ranks, owner);
         DraftFixture candidate(true, singleKV ? 1 : ranks, owner);
+        if (automatic) {
+            NaiveN05GraphTestAccess::SetDraftDevices(candidate, ranks);
+            DraftFixture fallback(false);
+            NaiveN05GraphTestAccess::SetDraftDevices(fallback, ranks);
+            unsetenv("FASTLLM_DSPARK_TP");
+            if (fallback.PrepareDraftTP() || fallback.weight["dspark.layers.0.mlp.down_proj.weight"].multiDeviceData)
+                throw std::runtime_error("automatic draft TP must preserve unsupported weights for fallback");
+        }
+        auto selectCandidate = [&]() {
+            if (automatic) unsetenv("FASTLLM_DSPARK_TP");
+            else setenv("FASTLLM_DSPARK_TP", tp.c_str(), 1);
+        };
         if (!FastllmInitNccl(std::vector<int>{0, 1})) throw std::runtime_error("target group init");
         const auto generation = FastllmGetNcclGeneration();
         auto bits = [](const Data &x) {
@@ -3986,7 +4002,7 @@ class DraftFixture : public NaiveN05FlashModel {
             int count = std::min(prefix, candidate.draftWindow - 1);
             Data h = hidden(count, prefix);
             setenv("FASTLLM_DSPARK_TP", "1", 1); reference.AppendDraftContext(h, prefix - count, *a);
-            setenv("FASTLLM_DSPARK_TP", tp.c_str(), 1); candidate.AppendDraftContext(h, prefix - count, *b);
+            selectCandidate(); candidate.AppendDraftContext(h, prefix - count, *b);
             if (FastllmGetNcclGeneration() != generation) throw std::runtime_error("draft replaced target group");
             for (int layer = 0; layer < candidate.draftLayers; ++layer) {
                 const std::string p = "dspark.layers." + std::to_string(layer) + ".";
@@ -3995,7 +4011,7 @@ class DraftFixture : public NaiveN05FlashModel {
                     Data &w = candidate.weight[p + name];
                     if (w.cpuData || w.cudaData || w.multiDeviceDatas.size() != (size_t)ranks)
                         throw std::runtime_error("Draft TP retained source or missing rank");
-                    const bool replicated = mlpOnly && std::string(name).find("self_attn.") == 0;
+                    const bool replicated = dp || (mlpOnly && std::string(name).find("self_attn.") == 0);
                     size_t total = 0; std::vector<uint16_t> first;
                     for (auto &entry : w.multiDeviceDatas) {
                         Data &local = *entry.second; total += local.GetBytes();
@@ -4026,7 +4042,7 @@ class DraftFixture : public NaiveN05FlashModel {
                         const Data &ka = part ? a->kv[layer].second : a->kv[layer].first;
                         const Data &kb = part ? b->kv[layer].second : b->kv[layer].first;
                         auto av = floats(ka), bv = floats(kb); std::vector<float> wanted;
-                        if (ka.dims[1] != kb.dims[1] || ka.dims[2] != (mlpOnly ? 1 : ranks) * kb.dims[2]) throw std::runtime_error("TP cache layout");
+                        if (ka.dims[1] != kb.dims[1] || ka.dims[2] != (dp || mlpOnly ? 1 : ranks) * kb.dims[2]) throw std::runtime_error("TP cache layout");
                         for (int row = 0; row < ka.dims[1]; ++row)
                             wanted.insert(wanted.end(), av.begin() + row * ka.dims[2], av.begin() + row * ka.dims[2] + kb.dims[2]);
                         RequireCloseLogits(bv.data(), wanted, "TP cache heads");
@@ -4035,7 +4051,7 @@ class DraftFixture : public NaiveN05FlashModel {
                 const int accepted = round == 3 ? 8 : round + 1;
                 Data next = hidden(accepted, prefix + round + 91);
                 setenv("FASTLLM_DSPARK_TP", "1", 1); reference.AppendDraftContext(next, a->committed, *a);
-                setenv("FASTLLM_DSPARK_TP", tp.c_str(), 1); candidate.AppendDraftContext(next, b->committed, *b);
+                selectCandidate(); candidate.AppendDraftContext(next, b->committed, *b);
                 if (cudaMemsetAsync(next.cudaData, 0, next.GetBytes(), cudaStreamPerThread) != cudaSuccess)
                     throw std::runtime_error("TP context input reuse");
                 ++checks;
@@ -4044,12 +4060,73 @@ class DraftFixture : public NaiveN05FlashModel {
         }
         if (!failVerifyBegin && !failVerifyInstantiate && verifyGraphLaunches == 0) throw std::runtime_error("no TP graph replay");
         if ((failVerifyBegin || failVerifyInstantiate) && verifyGraphLaunches != 0) throw std::runtime_error("TP graph failure not rolled back");
-        std::cout << "DRAFT " << (mlpOnly ? "MLP " : "") << "TP" << ranks << " PASS checks=" << checks << " relative=" << largestLogitRelative
+        std::cout << "DRAFT " << (mlpOnly ? "MLP " : "") << (dp ? "DP" : "TP") << ranks << " PASS checks=" << checks << " relative=" << largestLogitRelative
                   << " maximum=" << largestLogitAbsolute << " captures=" << verifyGraphCaptures << " launches=" << verifyGraphLaunches << std::endl;
         unsetenv("FASTLLM_DSPARK_TP");
     }
-    void RunWideBatchChecks() {
-        constexpr int count = 128;
+    static void RunContextTPChecks(int ranks) {
+        DraftFixture reference(true, ranks), candidate(true, ranks);
+        setenv("FASTLLM_DSPARK_TP", std::to_string(ranks).c_str(), 1);
+        auto context = candidate.CreateDraftContext();
+        Data initial(BFLOAT16, {1, 1, 256}); initial.Allocate();
+        std::memset(initial.cpuData, 0, initial.GetBytes());
+        initial.ToDevice(DataDevice::CUDA, {0});
+        candidate.AppendDraftContext(initial, 0, *context);
+        auto read = [](const Data &x) {
+            Data host(x); ToDataType(host, FLOAT32); host.ToDevice(DataDevice::CPU);
+            return std::vector<float>((float *)host.cpuData, (float *)host.cpuData + host.Count(0));
+        };
+        for (int rows : {1, 15, ranks * 16 - 1, ranks * 16, ranks * 16 + 3, 1025}) {
+            Data input(BFLOAT16, {1, rows, 512}); input.Allocate();
+            for (int i = 0; i < input.Count(0); ++i)
+                ((uint16_t *)input.cpuData)[i] = Float32ToBFloat16RNEBits(std::sin((i + rows) * .037f));
+            input.ToDevice(DataDevice::CUDA, {0});
+            Data expected, actual, referenceProjection, candidateProjection;
+            reference.ProjectDraftContext(input, referenceProjection, expected);
+            candidate.ProjectDraftContext(input, candidateProjection, actual);
+            if (cudaMemsetAsync(input.cudaData, 0, input.GetBytes(), cudaStreamPerThread) != cudaSuccess)
+                throw std::runtime_error("context input reuse");
+            auto a = read(actual), b = read(expected);
+            RequireCloseLogits(a.data(), b, "distributed context projection");
+        }
+        unsetenv("FASTLLM_DSPARK_TP");
+        std::cout << "DRAFT CONTEXT TP" << ranks << " PASS" << std::endl;
+    }
+    void RunDPStorageChecks(int ranks) {
+        std::vector<std::shared_ptr<DraftContext>> contexts;
+        Data h(BFLOAT16, {1, 3, embed_dim}); h.Allocate();
+        std::memset(h.cpuData, 0, h.GetBytes()); h.ToDevice(DataDevice::CUDA, {0});
+        for (int i = 0; i < ranks * 2 + 3; ++i) {
+            auto c = CreateDraftContext(); AppendDraftContext(h, 0, *c);
+            if (c->deviceRank != i % ranks) throw std::runtime_error("draft DP owner distribution");
+            for (auto &pair : c->kv) for (Data *cache : {&pair.first, &pair.second})
+                if (cache->dataDeviceIds != std::vector<int>{c->deviceRank})
+                    throw std::runtime_error("draft DP KV is not on its owner");
+            contexts.push_back(std::move(c));
+        }
+        for (auto &old : contexts) {
+            const int rank = old->deviceRank; void *pointer = old->kv[0].first.cudaData;
+            idleDraftContext = std::move(old);
+            auto reused = CreateDraftContext();
+            if (reused->committed || reused->deviceRank != rank || reused->kv[0].first.cudaData != pointer)
+                throw std::runtime_error("draft DP replacement lost storage ownership");
+            AppendDraftContext(h, 19, *reused);
+            if (reused->committed != 22 || reused->kv[0].first.dataDeviceIds != std::vector<int>{rank})
+                throw std::runtime_error("draft DP replacement corrupted context");
+            Data graph, eager;
+            SetCudaGraph(true); if (!RunDraftBatch({11}, {reused.get()}, graph)) throw std::runtime_error("DP survivor graph fallback");
+            SetCudaGraph(false); if (!RunDraftBatch({11}, {reused.get()}, eager)) throw std::runtime_error("DP survivor eager fallback");
+            Data a(graph), b(eager); a.ToDevice(DataDevice::CPU); b.ToDevice(DataDevice::CPU);
+            if (a.dims != b.dims || std::memcmp(a.cpuData, b.cpuData, a.GetBytes()))
+                throw std::runtime_error("draft DP non-root survivor graph/eager differs");
+        }
+        draftEnabled = true;
+        bool rejected = false;
+        try { DraftPDLayout(); } catch (const std::runtime_error &) { rejected = true; }
+        if (!rejected) throw std::runtime_error("PD accepted an unsupported draft DP layout");
+        std::cout << "DRAFT DP STORAGE PASS" << std::endl;
+    }
+    void RunWideBatchChecks(int count = 128) {
         auto read = [](const Data &x) {
             std::vector<uint16_t> bits(x.Count(0));
             if (cudaMemcpy(bits.data(), x.cudaData, bits.size() * 2, cudaMemcpyDeviceToHost) != cudaSuccess)
@@ -4080,6 +4157,12 @@ class DraftFixture : public NaiveN05FlashModel {
             AppendDraftContext(hidden, i * 1024, *contexts.back());
             anchors.push_back((i*37+11)%256);
         }
+        std::map<int, int> ownerRows;
+        for (auto *context : contexts) ++ownerRows[context->deviceRank];
+        bool dynamicBindings = true;
+        for (const auto &owner : ownerRows)
+            dynamicBindings = dynamicBindings && FastllmCudaNaiveDraftCacheBindingsSupported(
+                owner.second, draftBlock, draftHeads, draftKvHeads, draftHeadDim, draftWindow);
         int checks=0;
         for (int turn=0;turn<3;++turn) {
             Data output;
@@ -4101,7 +4184,8 @@ class DraftFixture : public NaiveN05FlashModel {
             const int permutationCaptures = verifyGraphCaptures;
             Data permuted;
             if (!RunDraftBatch(reordered,selected,permuted)) throw std::runtime_error("wide reordered draft fallback");
-            if (verifyGraphCaptures != permutationCaptures) throw std::runtime_error("request churn recaptured the draft graph");
+            if (dynamicBindings && verifyGraphCaptures != permutationCaptures)
+                throw std::runtime_error("request churn recaptured the draft graph");
             auto values=read(permuted);
             SetCudaGraph(false); Data permutedEager;
             if (!RunDraftBatch(reordered, selected, permutedEager)) throw std::runtime_error("reordered eager fallback");
@@ -4122,6 +4206,32 @@ class DraftFixture : public NaiveN05FlashModel {
                 ++checks;
             }
             for (auto &anchor : anchors) anchor=(anchor+17)%256;
+        }
+        if (dynamicBindings && ownerRows.size() > 1) {
+            // Keep the global batch size while moving one slot to another KV
+            // owner. Per-rank shapes must invalidate the previously captured graph.
+            std::shared_ptr<DraftContext> replacement;
+            do {
+                replacement = CreateDraftContext();
+                AppendDraftContext(hidden, 8192, *replacement);
+                owned.push_back(replacement);
+            } while (replacement->deviceRank == contexts.front()->deviceRank);
+            auto selected = contexts;
+            selected.front() = replacement.get();
+            const int captures = verifyGraphCaptures;
+            for (int pass = 0; pass < 2; ++pass) {
+                const auto &active = pass ? contexts : selected;
+                Data graph, eager;
+                SetCudaGraph(true);
+                if (!RunDraftBatch(anchors, active, graph)) throw std::runtime_error("DP owner replacement fallback");
+                auto values = read(graph);
+                SetCudaGraph(false);
+                if (!RunDraftBatch(anchors, active, eager)) throw std::runtime_error("DP owner replacement eager fallback");
+                equal(values, read(eager), "DP owner replacement graph/eager differs");
+                ++checks;
+            }
+            SetCudaGraph(true);
+            if (verifyGraphCaptures == captures) throw std::runtime_error("DP owner shape change reused an old graph");
         }
         std::cout << "DRAFT WIDE PASS checks=" << checks << std::endl;
     }
@@ -4578,6 +4688,35 @@ int main(int argc, char **argv) {
             fixture.RunWideBatchChecks();
             unsetenv("FASTLLM_DSPARK_TP"); return 0;
         }
+        if (argc > 2 && std::string(argv[2]) == "draft_dp") {
+            SetCudaEmbedding(true); SetCudaGraph(true);
+            DraftFixture::RunTPChecks(ranks, false, false, 0, false, true);
+            return 0;
+        }
+        if (argc > 2 && std::string(argv[2]) == "draft_dp_storage") {
+            SetCudaEmbedding(true); SetCudaGraph(true);
+            setenv("FASTLLM_DSPARK_TP", ("dp:" + std::to_string(ranks)).c_str(), 1);
+            DraftFixture fixture(true, 4);
+            fixture.RunDPStorageChecks(ranks);
+            unsetenv("FASTLLM_DSPARK_TP"); return 0;
+        }
+        if (argc > 2 && std::string(argv[2]) == "draft_dp_wide") {
+            SetCudaEmbedding(true); SetCudaGraph(true);
+            setenv("FASTLLM_DSPARK_TP", ("dp:" + std::to_string(ranks)).c_str(), 1);
+            DraftFixture fixture(true, 4, 0, 7, argc > 4 && std::string(argv[4]) == "large", 5);
+            fixture.RunWideBatchChecks(argc > 3 ? std::stoi(argv[3]) : 129);
+            unsetenv("FASTLLM_DSPARK_TP"); return 0;
+        }
+        if (argc > 2 && std::string(argv[2]) == "draft_dp_large") {
+            SetCudaEmbedding(true); SetCudaGraph(true);
+            failGraphDevice = 0;
+            failVerifyBegin = argc > 4 && std::string(argv[4]) == "failbegin";
+            failVerifyInstantiate = argc > 4 && std::string(argv[4]) == "failinstantiate";
+            setenv("FASTLLM_DSPARK_TP", ("dp:" + std::to_string(ranks)).c_str(), 1);
+            DraftFixture fixture(true, 4, 0, argc > 3 ? std::stoi(argv[3]) : 7, true);
+            fixture.RunBatchChecks();
+            unsetenv("FASTLLM_DSPARK_TP"); return 0;
+        }
         if (argc > 2 && std::string(argv[2]) == "draft_tp_large") {
             SetCudaEmbedding(true); SetCudaGraph(true);
             setenv("FASTLLM_DSPARK_TP", std::to_string(ranks).c_str(), 1);
@@ -4803,7 +4942,12 @@ int main(int argc, char **argv) {
             return 0;
         }
         const std::string draftMode = argc > 2 ? argv[2] : "";
-        if (draftMode == "draft_tp" || draftMode == "draft_mlp_tp" ||
+        if (draftMode == "draft_context_tp") {
+            SetCudaEmbedding(true); SetCudaGraph(true);
+            DraftFixture::RunContextTPChecks(ranks);
+            return 0;
+        }
+        if (draftMode == "draft_tp" || draftMode == "draft_tp_auto" || draftMode == "draft_mlp_tp" ||
             draftMode == "draft_mlp_tp_mqa" || draftMode == "draft_mlp_tp_offset") {
             const bool offset = draftMode == "draft_mlp_tp_offset";
             if (offset && devices < 3) return 77;
@@ -4811,8 +4955,8 @@ int main(int argc, char **argv) {
             failGraphDevice = offset ? 0 : ranks - 1;
             failVerifyBegin = argc > 3 && std::string(argv[3]) == "failbegin";
             failVerifyInstantiate = argc > 3 && std::string(argv[3]) == "failinstantiate";
-            DraftFixture::RunTPChecks(ranks, draftMode != "draft_tp",
-                                     draftMode == "draft_mlp_tp_mqa", offset ? 2 : 0);
+            DraftFixture::RunTPChecks(ranks, draftMode != "draft_tp" && draftMode != "draft_tp_auto",
+                                     draftMode == "draft_mlp_tp_mqa", offset ? 2 : 0, draftMode == "draft_tp_auto");
             return 0;
         }
         if (argc > 2 && std::string(argv[2]) == "draft_graph") {

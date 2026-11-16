@@ -223,6 +223,7 @@ namespace fastllm {
         };
         struct DraftTPState;
         std::shared_ptr<DraftTPState> draftTP;
+        bool draftSingleDeviceLogged = false;
         struct DraftWorkspace;
         // Bounded LRU; graph-owned inputs are refreshed on every replay.
         std::vector<std::shared_ptr<DraftWorkspace>> draftBatchWorkspaces;
@@ -234,6 +235,7 @@ namespace fastllm {
         std::map<int, std::shared_ptr<void>> draftLinearGraphWorkspaces;
         struct DraftContext {
             int committed = 0;
+            int deviceRank = -1; // Stable draft DP owner; retained with reusable KV storage.
             Data prefixHidden; // Logical prefill tail; backing belongs to the request workspace.
             std::vector<std::pair<Data, Data>> kv;
             std::shared_ptr<DraftWorkspace> workspace;
@@ -270,6 +272,7 @@ namespace fastllm {
         bool AppendDraftContextFused(Data &hidden, int start, DraftContext &context);
         void CommitDraftContext(TargetCapture &capture, int tokens, DraftContext &context,
                                 std::vector<std::pair<Data, Data>> &kv);
+        void ProjectDraftContext(Data &combined, Data &projected, Data &hidden);
         std::shared_ptr<DraftContext> CreateDraftContext();
         bool PrepareDraftTP();
         void PrepareDraftContextTP(DraftContext &context);

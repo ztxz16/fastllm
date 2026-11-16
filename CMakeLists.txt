@@ -3042,8 +3042,28 @@ if (UNIT_TEST)
                     PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
                     PASS_REGULAR_EXPRESSION "DRAFT GRAPH PASS")
             endforeach()
+            add_test(NAME naive_n05_draft_dp_bindings_2
+                COMMAND naive_n05_verify_graph_test 2 draft_dp_wide 65 large)
+            set_tests_properties(naive_n05_draft_dp_bindings_2
+                PROPERTIES LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240
+                PASS_REGULAR_EXPRESSION "DRAFT WIDE PASS")
             foreach(NAIVE_DRAFT_RANKS 2 4 8)
-                foreach(NAIVE_DRAFT_STRATEGY draft_tp draft_mlp_tp draft_mlp_tp_mqa)
+                add_test(NAME naive_n05_draft_dp_${NAIVE_DRAFT_RANKS}
+                    COMMAND naive_n05_verify_graph_test ${NAIVE_DRAFT_RANKS} draft_dp)
+                set_tests_properties(naive_n05_draft_dp_${NAIVE_DRAFT_RANKS}
+                    PROPERTIES LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240
+                    PASS_REGULAR_EXPRESSION "DRAFT DP[0-9]+ PASS")
+                add_test(NAME naive_n05_draft_dp_storage_${NAIVE_DRAFT_RANKS}
+                    COMMAND naive_n05_verify_graph_test ${NAIVE_DRAFT_RANKS} draft_dp_storage)
+                set_tests_properties(naive_n05_draft_dp_storage_${NAIVE_DRAFT_RANKS}
+                    PROPERTIES LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240
+                    PASS_REGULAR_EXPRESSION "DRAFT DP STORAGE PASS")
+                add_test(NAME naive_n05_draft_context_tp_${NAIVE_DRAFT_RANKS}
+                    COMMAND naive_n05_verify_graph_test ${NAIVE_DRAFT_RANKS} draft_context_tp)
+                set_tests_properties(naive_n05_draft_context_tp_${NAIVE_DRAFT_RANKS}
+                    PROPERTIES LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240
+                    PASS_REGULAR_EXPRESSION "DRAFT CONTEXT TP[0-9]+ PASS")
+                foreach(NAIVE_DRAFT_STRATEGY draft_tp draft_tp_auto draft_mlp_tp draft_mlp_tp_mqa)
                     add_test(NAME naive_n05_${NAIVE_DRAFT_STRATEGY}_${NAIVE_DRAFT_RANKS}
                         COMMAND naive_n05_verify_graph_test ${NAIVE_DRAFT_RANKS} ${NAIVE_DRAFT_STRATEGY})
                     set_tests_properties(naive_n05_${NAIVE_DRAFT_STRATEGY}_${NAIVE_DRAFT_RANKS}

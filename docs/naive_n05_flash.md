@@ -590,35 +590,41 @@ Graph replay 和后缀路由变化下的前缀比较仍要求逐 bit 一致。�
 `cuda_nvfp4_marlin_cross_device_rows`。`speculative_sampling` 还覆盖 CPU 概率与残差采样。
 
 
-## 草稿投影融合与独立 TP
+## 草稿投影融合与独立 TP / DP
 
 草稿 Q/K/V 与 Gate/Up 在模型加载阶段分别合并，沿用 WeightMergeRule 的所有权规则，
 合并成功后删除原条目。上下文 K/V 从合并 QKV 建立只读行视图，不另存合并权重缓存。
 BF16 草稿支持 Q/K RMSNorm、RoPE 和 KV 写入融合；SwiGLU 保留先将 SiLU 舍入为
 BF16 再相乘的数值语义。布局不满足融合条件时保留原算子路径，Graph 和 eager 均可运行。
 
-草稿并行只使用一个配置项 `FASTLLM_DSPARK_TP`：
+草稿默认跟随主模型的 CUDA TP 设备数；未配置主模型 TP 或草稿布局不支持时，
+在切分权重前回退单卡。可用 `--dspark_tp_size N`（别名 `--dspark-tp-size`）
+显式指定草稿卡数，`1` 固定单卡。CLI 优先于兼容的旧环境配置 `FASTLLM_DSPARK_TP`：
 
 | 值 | 执行方式 |
 |---|---|
-| 不设置或 `1` | 单卡草稿，兼容原默认行为 |
+| 不设置 | 自动跟随主模型 CUDA TP，不支持时回退单卡 |
+| `1` | 单卡草稿 |
 | `2`、`4` 等整数 N | QKV/Attention/O 与 MLP 均按 N 卡切分 |
 | `mlp:2`、`mlp:4` 等 `mlp:N` | 每卡计算完整 Attention 并持有完整 KV，只有 MLP 切分 |
 
 配置在草稿第一次使用多卡时固定，不支持加载后切换。Target 已配置 TP 时，草稿采用其
 设备列表的前 N 张卡；否则从草稿当前设备开始，按可见 CUDA 设备编号补齐。不会把
-target/head 的并行度改成 N。上下文 FC 和 Markov proposal 继续在草稿首卡运行。
+target/head 的并行度改成 N。Markov proposal 仍在草稿首卡运行。
+支持的 BF16 上下文 FC 按草稿设备复制，大批量已接受特征按行分给各卡投影和归一化，
+TP 模式再汇集结果供 KV 提交使用，小批次保持首卡路径；DP 模式在请求所属卡上
+直接完成 FC、归一化与 KV 投影，减少中间汇集和重复传输。权重副本与工作区纳入启动预热。
 仅 MLP TP 会产生计算所需的 Attention 副本；分片与副本都释放父投影的原始存储，
 不额外保留未分片大矩阵。
 
 并行实现按实际设备数量处理，不限定为双卡或四卡。N 不能超过可用设备数或 target TP
-设备数，MLP 中间维度必须能被 N 整除；完整 TP 还要求 Q/KV 头数能被 N 整除。
-仅 MLP TP 支持单 KV 头。当前路径要求 CUDA embedding、BF16 稠密投影、peer access，
+设备数，MLP 中间维度必须能被 N 整除；完整 TP 要求 Q 头数可分，KV 头数不足时
+在相邻 query 分片间复制完整 KV head。当前路径要求 CUDA embedding、BF16 稠密投影、peer access，
 不支持 low-memory 模式；head_dim 为 4 的倍数且不超过 256，草稿 block 在 2..31 范围。
-不符合要求时明确报错，不在已分片权重上静默退回单卡。
+显式指定不支持的布局时明确报错；自动模式仅在切分前回退，启动日志报告实际并行度。
 
-多卡上下文投影使用逐层 K/V 行视图和 batched GEMM；工作区只保留激活与小指针表，
-不缓存权重副本。草稿拥有独立通信组、持久工作线程和 Executor，不替换 target 的通信组。
+各层 K/V 投影使用权重行视图和 batched GEMM；工作区只保留激活与小指针表，
+不复制未分片的 K/V 权重。草稿拥有独立通信组、持久工作线程和 Executor，不替换 target 的通信组。
 所有从卡提交完成后首卡才允许复用输入存储。Graph 捕获失败时统一释放各卡 graph 并回退
 到相同 TP 策略的 eager 路径。未为上下文更新新增 CUDA Graph。
 
@@ -627,7 +633,19 @@ Linux CUDA CTest 中，`naive_n05_draft_fusion` 与 `naive_n05_draft_kv` 覆盖�
 覆盖完整/仅 MLP TP、MQA、2/4/8 卡、Graph/eager、捕获失败回退和非零首卡。
 TP 改变 GEMM 与跨卡归约顺序，跨策略使用既有数值容差；同一策略 Graph/eager 要求逐位一致。
 
-草稿并行度需按实际硬件和请求测量；默认不自动提高，不承诺线性加速。
+草稿并行度仍需按实际硬件和请求测量，不承诺线性加速。
+
+高并发也可显式使用 `--dspark_dp_size N`（别名 `--dspark-dp-size`），与
+`--dspark_tp_size` 互斥；旧环境入口对应 `FASTLLM_DSPARK_TP=dp:N`。
+每张卡保存完整 BF16 草稿骨干，按完整请求分摊计算，减少草稿层间归约；因此权重占用
+高于 TP。每个请求具有固定的草稿设备，KV 只保存在该设备，请求重排、取消补位和
+缓存存储复用都保留设备归属。DP 不要求 Q/KV 头数或 MLP 宽度能被副本数整除。
+结果按原请求顺序汇集，模型训练的 `block_size` 不变。
+Graph 捕获失败使用相同的 DP eager 路径；不指定 DP 时继续使用默认 TP/单卡选择。
+当前 proposal 与接受/拒绝采样仍在首卡，DP 参数只改变草稿骨干及对应 KV 的分工。
+PD 状态传输目前要求草稿使用 TP；显式草稿 DP 与 PD 的组合会在布局检查时拒绝。
+`naive_n05_draft_dp_*` 和 `naive_n05_draft_dp_storage_*` 覆盖 2/4/8 卡、
+Graph/eager、固定 KV 归属、非首卡存活请求与空闲存储复用。
 
 纯 GPU 的 [PD 分离](fastkv_pd.md) 也支持上述草稿 TP。P/D 需使用相同的草稿模型、
 TP 配置和 BF16/FP8 主 KV；FastKV 按 rank 交接已提交的草稿窗口，并在 D 端恢复候选

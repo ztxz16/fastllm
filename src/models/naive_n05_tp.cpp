@@ -388,9 +388,9 @@ void NaiveN05FlashModel::PrepareTensorParallel() {
         indexDim == 128 && indexTopK == 2048 && FastllmCudaNaiveIndexerContextSupported(tpDevices)),
         "Indexer context_shard requires the 16x128 FP8-query Indexer and CUDA SM80+ TP.");
     if (attentionDP > 1)
-        printf("[Naive parallel] world=%d attention_dp=%d attention_tp=%d moe_ep=%d moe_tp=%d dense_tp=%d draft_tp=%d\n",
+        printf("[Naive parallel] world=%d attention_dp=%d attention_tp=%d moe_ep=%d moe_tp=%d dense_tp=%d\n",
             ranks, attentionDP, AttentionTPSize(), tpEp8Mega ? ranks : 1,
-            tpEp8Mega ? 1 : ranks, ranks, ranks);
+            tpEp8Mega ? 1 : ranks, ranks);
 #ifndef USE_ROCM
     if (dataType == BFLOAT16) {
         const int previous = FastllmCudaGetDevice();
