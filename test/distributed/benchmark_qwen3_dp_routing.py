@@ -41,7 +41,8 @@ def verify(wave, requests, references, dp, tp, policy):
         report = record['report']
         prefix = report['graph'][0]['prefix_cache']
         length = prefix['last_reused_tokens']
-        require(length in (0, len(request['token_ids']) - 1), 'unexpected partial prefix in disjoint workload')
+        page = prefix.get('page_len', 1) if prefix.get('directory_version') == 2 else 1
+        require(length in (0, (len(request['token_ids']) - 1) // page * page), 'unexpected partial prefix in disjoint workload')
         state = 'warm' if length else 'cold'
         bench.check_wave(dict(records=[record]), request, references[key(request)][state]['token_ids'],
                          dp, tp, 'optimized', cache_state=state)
@@ -96,7 +97,7 @@ def main(argv=None):
                     cuda=bench.capture(['nvcc', '--version']), cuda_visible_devices=os.environ.get('CUDA_VISIBLE_DEVICES'),
                     seed=0, warmup=args.warmup, iterations=1, repeats=args.repeats, dp=args.dp, tp=args.tp,
                     expected_case_count=4, expected_waves=4 * args.repeats, completed_waves=0,
-                    dtype='FP16', kv_cache='FP16 continuous', cuda_graph=True, custom_allreduce=args.tp == 2,
+                    dtype='FP16', kv_cache='FT FP16 paged', page_size=16, cache_tokens=256, cuda_graph=True, custom_allreduce=args.tp == 2,
                     execution_order=['round_robin/c1', 'round_robin/c4', 'prefix/c1', 'prefix/c4'],
                     cache_initial_state='public clear before EVERY warmup and measured wave; empty snapshots verified',
                     cache_description='每轮先公开清缓存，再执行相同混合请求；按实际复用长度分别对照DP1冷/热基准。',
@@ -109,7 +110,7 @@ def main(argv=None):
     rows, functions, references, current = [], [], {}, None
 
     def model(dp, policy):
-        flags = bench.model_flags(args, output, dp, args.tp, 'optimized') + ['--dp-routing', policy]
+        flags = bench.model_flags(args, output, dp, args.tp, 'optimized') + ['--dp-routing', policy, '--page_size', '16', '--tokens', '256']
         return bench.make_normal_llm_model(bench.make_normal_parser('DP routing').parse_args(flags))
 
     def save_function(name, action):
@@ -135,7 +136,7 @@ def main(argv=None):
         total = sum(request['max_new_tokens'] for request in requests)
         metadata.update(requests_per_iteration=len(requests), output_tokens_per_wave=total)
         (output / 'requests.json').write_text(json.dumps(requests, ensure_ascii=False, indent=2))
-        sequence = [dict(requests[0], token_ids=[1, i, *requests[0]['token_ids'][2:]], max_new_tokens=2) for i in range(2, 12)]
+        sequence = [dict(requests[0], token_ids=[*requests[0]['token_ids'][:16], i, *requests[0]['token_ids'][17:]], max_new_tokens=2) for i in range(2, 12)]
         sequence += [sequence[0]]
         with model(1, 'round_robin') as oracle:
             oracle.session.prefix_directory()
@@ -184,7 +185,11 @@ def main(argv=None):
                         wave = bench.run_requests(engine, [requests[0]], 1)
                         (functional / 'after_cancel.raw.json').write_text(json.dumps(wave))
                         verify(wave, [requests[0]], references, args.dp, args.tp, policy)
-                        require(wave['records'][0]['report']['dp_routing']['estimated_reused_tokens'] == 63, 'valid cancelled prefill lost affinity')
+                        report = wave['records'][0]['report']
+                        prefix = report['graph'][0]['prefix_cache']
+                        page = prefix.get('page_len', 1) if prefix.get('directory_version') == 2 else 1
+                        require(report['dp_routing']['estimated_reused_tokens'] == 63 // page * page,
+                                'valid cancelled prefill lost affinity')
                         return dict(max_abs_error=0.0, mean_abs_error=0.0, failed_elements=0)
                     save_function('cancelled_prefill_reuse_output', cancel_reuse)
 

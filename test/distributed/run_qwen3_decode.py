@@ -141,13 +141,14 @@ def expectations(tasks):
     return expected
 
 
-def expected_cache(config, state, rank, world):
+def expected_cache(config, state, rank, world, page_size=None):
     if not state["active"]:
         return EMPTY.copy()
     heads = config["num_key_value_heads"]
     local_heads = 1 if world > heads else heads // world + int(rank < heads % world)
     dim = config.get("head_dim", config["hidden_size"] // config["num_attention_heads"])
-    size = config["num_hidden_layers"] * state["capacity"] * 2 * local_heads * dim * 2
+    capacity = ((state['tokens'] + page_size - 1) // page_size * page_size) if page_size else state['capacity']
+    size = config["num_hidden_layers"] * capacity * 2 * local_heads * dim * 2
     return dict(active=True, tokens=state["tokens"], capacity=state["capacity"],
                 position_begin=state["position_begin"], device_bytes=size)
 
@@ -163,7 +164,9 @@ def verify(report, devices, tasks, config):
     for task, state, result in zip(tasks, expectations(tasks), report["results"]):
         label = task["name"]
         require(result["task"] == label and result["op"] == task["op"], label + ": wrong task identity")
-        cache = [expected_cache(config, state, rank, len(devices)) for rank in range(len(devices))]
+        page = result.get('graph', [{}])[0].get('prefix_cache', {})
+        page_size = page.get('page_len') if page.get('directory_version') == 2 else None
+        cache = [expected_cache(config, state, rank, len(devices), page_size) for rank in range(len(devices))]
         require(result["cache"] == cache, label + ": incorrect KV length/allocation/lifetime")
         if "ids" in state:
             logits = result["logits"]

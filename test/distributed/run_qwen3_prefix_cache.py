@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""通过生产进程入口验证前缀快照数值、LRU、清理和模型隔离；仅使用已有产物。"""
+"""通过生产进程入口验证FT分页前缀、页面共享、淘汰及生命周期；仅使用已有产物。"""
 
 import argparse
 import copy
@@ -20,7 +20,7 @@ from fastllm_pytools.tp_graph import validate_prefix
 from qwen3_layer_reference import prefill
 
 
-def make_tasks(kind='normal'):
+def make_tasks(kind='normal', page_size=4):
     tasks = [dict(name='initial', op='query'), dict(name='initial-clear', op='clear_prefix')]
 
     def request(name, ids, position=0, decode_steps=0, clear_active=False):
@@ -34,6 +34,27 @@ def make_tasks(kind='normal'):
                 tasks.append(dict(name=name+'-clear-active', op='clear_prefix'))
         tasks.append(dict(name=name+'-end', op='end'))
 
+    if kind == 'paged_boundaries':
+        for n in (page_size-1, page_size, page_size+1, 2*page_size-1, 2*page_size, 2*page_size+1):
+            tasks.append(dict(name=f'boundary-{n}-clear', op='clear_prefix'))
+            request(f'boundary-{n}-cold', [1]*n, decode_steps=2)
+            request(f'boundary-{n}-hit', [1]*n, decode_steps=2)
+        return tasks
+    if kind == 'uneven_hits':
+        ids = [1] * (page_size+1)
+        request('uneven-cold', ids, decode_steps=1)
+        tasks.append(dict(name='clear-one-rank-layer', op='clear_prefix', rank=1, layer=0))
+        request('uneven-common-miss', ids, decode_steps=1)
+        request('uneven-common-hit', ids, decode_steps=1)
+        return tasks
+    if kind == 'pool_capacity':
+        tasks.append(dict(name='pool-capacity-rejected', op='begin', token_ids=[1]*(page_size+1),
+                          capacity=page_size+1, position_begin=0))
+        return tasks
+    if kind == 'pool_eviction':
+        for name, token in (('pool-a', 1), ('pool-b', 2), ('pool-a-evicted', 1), ('pool-a-hit', 1)):
+            request(name, [token]*(page_size+1), decode_steps=1)
+        return tasks
     if kind == 'budget':
         # 256 layers * 2 KV heads * 256 dim * K/V * FP16 = 512 KiB/token（全局保守计费）。
         # 127 -> 128 -> 129 tokens，分别在 64 MiB 边界下、边界上、边界外。
@@ -52,8 +73,8 @@ def make_tasks(kind='normal'):
         request('hit-small-custom-prefill', [1]*65, decode_steps=1)
         return tasks
     if kind == 'bad_suffix':
-        request('valid-prefix', [1,4,7], decode_steps=1)
-        tasks.append(dict(name='invalid-suffix', op='begin', token_ids=[1,4,17], position_begin=0, capacity=3))
+        request('valid-prefix', [1,4,7,9,2], decode_steps=1)
+        tasks.append(dict(name='invalid-suffix', op='begin', token_ids=[1,4,7,9,17], position_begin=0, capacity=5))
         return tasks
     if kind == 'long':
         request('long-cold', [1]*512, decode_steps=2)
@@ -64,7 +85,7 @@ def make_tasks(kind='normal'):
         request('long-after-clear', [1]*129)
         return tasks
 
-    a = [1, 4, 7, 9]
+    a = ([1, 4, 7, 9] * ((page_size + 4) // 4))[:page_size+1]
     request('cold', a, decode_steps=2)
     request('full-hit', a, decode_steps=2)
     request('extend', a+[2, 3], decode_steps=1)
@@ -76,11 +97,11 @@ def make_tasks(kind='normal'):
     request('after-clear', a)
     tasks.append(dict(name='before-lru', op='clear_prefix'))
     for i in range(8):
-        request(f'lru-{i}', [i+1, 15, 16])
-    request('lru-touch-oldest', [1, 15, 16])
-    request('lru-overflow', [9, 15, 16])
-    request('lru-survivor', [1, 15, 16])
-    request('lru-evicted-miss', [2, 15, 16])
+        request(f'lru-{i}', [i+1] + [15] * page_size)
+    request('lru-touch-oldest', [1] + [15] * page_size)
+    request('lru-overflow', [9] + [15] * page_size)
+    request('lru-survivor', [1] + [15] * page_size)
+    request('lru-evicted-miss', [2] + [15] * page_size)
     request('one-token', [1])
     request('one-token-repeat', [1])
     request('max-prompt', [1, 4]*64, decode_steps=1)
@@ -90,8 +111,66 @@ def make_tasks(kind='normal'):
     return tasks
 
 
+def verify_paged_prefix(report, tasks, config, world, *, unloaded=True):
+    """按完整token页独立计算命中，检查真实FT后端、页面资源与清理结果。"""
+    entries = set()
+    previous = None
+    require(len(report['results']) == len(tasks), 'missing paged lifecycle results')
+    for task, result in zip(tasks, report['results']):
+        states = result['graph']
+        p = states[0]['prefix_cache']
+        if p.get('directory_version') != 2:
+            require(task['op'] in ('query', 'unload', 'load'), 'request bypassed FT paged cache')
+            if task['op'] in ('unload', 'load'):
+                entries.clear()
+                previous = None
+            continue
+        validate_prefix(states, world, True)
+        page = p['page_len']
+        if task['op'] == 'begin':
+            ids, position = tuple(task['token_ids']), task.get('position_begin', 0)
+            best = 0
+            for saved, pos in entries:
+                if pos != position:
+                    continue
+                common = 0
+                for left, right in zip(saved, ids[:-1]):
+                    if left != right:
+                        break
+                    common += 1
+                best = max(best, common // page * page)
+            if task['name'].startswith('pool-'):
+                best = page if task['name'] == 'pool-a-hit' else 0
+            require(p['last_reused_tokens'] == best and p['last_computed_tokens'] == len(ids)-best,
+                    f"{task['name']}: paged reuse expected {best}, got {p}")
+            require(p['attention_backend'] in ('native_paged', 'flashinfer_paged'), 'FT backend missing')
+            entries.add((ids[:len(ids)//page*page], position))
+            if task['name'] == 'lru-overflow':
+                require(p['entries'] >= 9, 'dense paged cache retained the obsolete eight-entry limit')
+        elif task['op'] in ('clear_prefix', 'unload'):
+            entries.clear()
+            require(not p['entries'], task['name'] + ': common prefix survived clear')
+            if 'rank' not in task and 'layer' not in task:
+                require(not p['cached_pages'] and not p['device_bytes'], task['name'] + ': prefix pages survived clear')
+        if task['op'] == 'end':
+            require(all(not s['prefix_cache']['active_pages'] for s in states), task['name'] + ': page reference leaked')
+        for entry in p['snapshots']:
+            ids = tuple(entry['token_ids'])
+            require(any(pos == entry['position_begin'] and saved[:len(ids)] == ids for saved, pos in entries),
+                    task['name'] + ': directory contains uncomputed or wrong-position tokens')
+        if previous is not None and task['op'] not in ('unload', 'load'):
+            validate_prefix(states, world, True, previous=previous,
+                            cleared=task['op'] == 'clear_prefix' and 'rank' not in task and 'layer' not in task,
+                            prompt_tokens=len(task['token_ids']) if task['op'] == 'begin' else None)
+        previous = states
+    if unloaded:
+        validate_prefix(report['graph_after_unload'], world, True, reset=True)
+
+
 def verify_prefix(report, tasks, config, world, *, unloaded=True):
     """独立按 ID/位置推导最长前缀及 LRU，核对真实 GPU 字节和执行长度。"""
+    if any(r.get('graph', [{}])[0].get('prefix_cache', {}).get('directory_version') == 2 for r in report['results']):
+        return verify_paged_prefix(report, tasks, config, world, unloaded=unloaded)
     entries = []
     require(len(report['results']) == len(tasks), 'missing prefix lifecycle results')
     counters = dict(lookups=0, hits=0, reused_tokens=0, last_reused_tokens=0,
@@ -161,9 +240,11 @@ def main():
     output = args.output.resolve() / (datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')+'_prefix_'+uuid.uuid4().hex[:8])
     output.mkdir(parents=True)
     specs = [('real', {})] if args.model else [(d, dict(dtype=d)) for d in ('F16', 'BF16', 'F32')]+[
-        ('bias', dict(bias=True)), ('tied', dict(tied=True)), ('kv_replication', dict(kv=1)),
-        ('budget', dict(hidden=4, layers=256, head_dim=256, kv=2, kind='budget', gpu_reference=True)),
-        ('oversize', dict(hidden=4, layers=257, head_dim=256, kv=2, kind='oversize', gpu_reference=True)),
+        ('mha', dict(kv=6)), ('bias', dict(bias=True)), ('tied', dict(tied=True)), ('kv_replication', dict(kv=1)),
+        ('pool_eviction', dict(kind='pool_eviction', layers=1, pool_pages=2)),
+        ('pool_capacity', dict(kind='pool_capacity', layers=1, pool_pages=1)),
+        ('uneven_hits', dict(kind='uneven_hits', layers=2)),
+        ('paged_boundaries', dict(kind='paged_boundaries', layers=1, page_size=128)),
         ('wide', dict(hidden=1024, layers=1, kind='wide', gpu_reference=True)),
         ('bad_suffix', dict(kind='bad_suffix'))]
     if args.long_context:
@@ -173,7 +254,7 @@ def main():
         gpu=capture(['nvidia-smi', '--query-gpu=name,driver_version', '--format=csv,noheader']),
         cuda=capture(['nvcc', '--version']), cuda_visible_devices=os.environ.get('CUDA_VISIBLE_DEVICES'), devices=devices,
         execution='decode_cuda_graph' if args.cuda_graph else 'eager', custom_allreduce=args.custom_allreduce,
-        prefix_cache=True, kv_cache='FP16 request-local plus immutable Prompt snapshots',
+        prefix_cache=True, kv_cache='FT FP16 paged KV with shared prefix pages',
         expected_case_count=len(specs), report_title='Qwen3 cross-request prefix cache correctness',
         report_description='同一公开 Begin/Decode/Clear/End 路径；逐元素对照无前缀 NCCL Eager TP、单卡和合成模型 CPU；非性能测试。')
     rows = []
@@ -198,14 +279,17 @@ def main():
                     reload_model = directory/'reloaded-model'
                     reload_model.mkdir()
                     save_fixture(reload_model, config, updated)
-                tasks = make_tasks(spec.get('kind', 'normal'))
+                page_size = spec.get('page_size', 128 if args.model or args.long_context else 4)
+                tasks = make_tasks(spec.get('kind', 'normal'), page_size)
                 (directory/'tasks.json').write_text(json.dumps(tasks))
                 row.update(dtype=spec.get('dtype', 'model'), task_count=len(tasks), hidden=config['hidden_size'],
                            layers=config['num_hidden_layers'], input_tasks='tasks.json')
                 flags = ['--prefix-cache', '1', '--cuda-graph', str(int(args.cuda_graph)), '--custom-allreduce', str(int(args.custom_allreduce))]
+                flags += ['--page-size', str(page_size), '--tokens', str(page_size * spec.get('pool_pages', 300))]
                 code, tp = invoke(args.check.resolve(), args.worker.resolve(), model, directory, devices, 'prefix', reload_model=reload_model, extra_args=flags)
-                if spec.get('kind') == 'bad_suffix':
-                    verify_failure(code, tp, dict(reason='token ID outside vocabulary', group_failed=True), tasks)
+                if spec.get('kind') in ('bad_suffix', 'pool_capacity'):
+                    reason = 'token ID outside vocabulary' if spec['kind'] == 'bad_suffix' else 'FT paged pool capacity'
+                    verify_failure(code, tp, dict(reason=reason, group_failed=True), tasks)
                     completed = tp.get('results', [])
                     require(len(completed) == len(tasks)-1, 'failed before invalid suffix')
                     # 失败组已经被回收，没有卸载后响应；仅核对失败前实际收到的状态。
@@ -214,7 +298,7 @@ def main():
                         if 'logits' in result:
                             compare_logits(result['logits'], prefill(config, tensors, state['ids'], state['rope_position']),
                                            metrics, result['task']+' before rejection vs CPU', 0.008, 0.008)
-                    row.update(status='PASS', workers=tp['workers'], reason='invalid suffix rejected with snapshots resident; whole group reaped')
+                    row.update(status='PASS', workers=tp['workers'], reason=reason + '; whole group reaped')
                     continue
                 require(code == 0, report_error(tp))
                 row['workers'] = tp['workers']
@@ -224,13 +308,18 @@ def main():
                 if args.custom_allreduce:
                     verify_allreduce(tp, tasks, config, args.cuda_graph)
                 atol, rtol = (0.05, 0.01) if args.model else (0.008, 0.008)
-                code, eager = invoke(args.check.resolve(), args.worker.resolve(), model, directory, devices, 'eager-no-prefix', reload_model=reload_model)
+                # 无前缀/单卡参照保留相同计算输入，只将选择性清理扩展为整组清理。
+                reference_tasks = [{k: v for k, v in task.items() if k not in ('rank', 'layer')} for task in tasks]
+                reference_dir = directory/'uncached-reference'
+                reference_dir.mkdir()
+                (reference_dir/'tasks.json').write_text(json.dumps(reference_tasks))
+                code, eager = invoke(args.check.resolve(), args.worker.resolve(), model, reference_dir, devices, 'eager-no-prefix', reload_model=reload_model)
                 require(code == 0, report_error(eager))
                 verify(eager, devices, tasks, config)
                 for actual, baseline in zip(tp['results'], eager['results']):
                     if 'logits' in actual:
                         compare_logits(actual['logits'], baseline['logits'], metrics, actual['task']+' prefix vs uncached TP', atol, rtol)
-                code, single = invoke(args.check.resolve(), args.worker.resolve(), model, directory, devices[:1], 'single', reload_model=reload_model)
+                code, single = invoke(args.check.resolve(), args.worker.resolve(), model, reference_dir, devices[:1], 'single', reload_model=reload_model)
                 require(code == 0, report_error(single))
                 verify(single, devices[:1], tasks, config)
                 compare_results(tp, single, tasks, config, None if spec.get('gpu_reference') else tensors,

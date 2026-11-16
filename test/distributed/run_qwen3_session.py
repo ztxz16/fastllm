@@ -61,7 +61,7 @@ def main():
         cuda_visible_devices=os.environ.get("CUDA_VISIBLE_DEVICES"), devices=devices,
         expected_case_count=len(specs)*(16 if args.cuda_graph else 14),
         execution="decode_cuda_graph" if args.cuda_graph else "eager",
-        custom_allreduce=args.custom_allreduce, graph_warmup_per_request=1 if args.cuda_graph else 0, prefix_cache=args.prefix_cache, kv_cache="FP16 request-local + optional immutable snapshots",
+        custom_allreduce=args.custom_allreduce, graph_warmup_per_request=1 if args.cuda_graph else 0, prefix_cache=args.prefix_cache, kv_cache="FT FP16 paged KV + shared prefix pages",
         report_title="Qwen3 persistent session correctness",
         report_description="同一常驻进程组串行处理请求；小模型对照CPU，真实模型逐步单卡重放。非性能测试。")
     rows = []

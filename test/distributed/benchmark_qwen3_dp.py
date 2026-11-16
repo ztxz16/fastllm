@@ -165,6 +165,8 @@ def check_wave(wave, request, expected, dp, tp, profile, *, cache_state):
         prefix = validate_prefix(states, tp, optimized)[0]
         if optimized:
             reused = len(request['token_ids']) - 1 if cache_state == 'warm' else 0
+            if prefix.get('directory_version') == 2:
+                reused = reused // prefix['page_len'] * prefix['page_len']
             if (prefix['last_reused_tokens'] != reused or
                     prefix['last_computed_tokens'] != len(request['token_ids']) - reused):
                 raise RuntimeError(f'{cache_state} prefix cache state mismatch on request {record["index"]}, DP rank {rank}')
@@ -347,7 +349,7 @@ def main(argv=None):
                     cuda_visible_devices=os.environ.get('CUDA_VISIBLE_DEVICES'), seed=0,
                     warmup=args.warmup, iterations=args.iterations, repeats=args.repeats, requests_per_iteration=args.requests,
                     configurations=args.configurations, profiles=args.profiles, concurrency=args.concurrency,
-                    dtype='FP16', kv_cache='FP16 continuous request-local', request_log='off',
+                    dtype='FP16', kv_cache='FT FP16 paged', request_log='off',
                     timing='closed-loop fixed-work wall clock; production queue/IPC/KV lifecycle/protocol checks included',
                     synchronization='same synchronous public generate return after native completion; no added per-kernel sync',
                     cache_profiles={'common': 'prefix disabled, eager',

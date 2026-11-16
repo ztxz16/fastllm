@@ -177,6 +177,7 @@ def main():
     for name in ("generate", "worker", "model", "build-cache"):
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--devices", default="0,1")
+    parser.add_argument("--prefix-cache", action="store_true")
     parser.add_argument("--output", type=Path, default=ROOT / "test/distributed/results")
     args = parser.parse_args()
     output = args.output.resolve() / (datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "_http_" + uuid.uuid4().hex[:8])
@@ -185,7 +186,7 @@ def main():
         git_status=capture(["git", "status", "--short"]), seed=0, warmup=0, iterations=1, repeats=1,
         gpu=capture(["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv,noheader"]),
         cuda_visible_devices=os.environ.get("CUDA_VISIBLE_DEVICES"), devices=args.devices,
-        expected_case_count=17, execution="eager", prefix_cache=False, kv_cache="FP16 request-local",
+        expected_case_count=17, execution="eager", prefix_cache=args.prefix_cache, kv_cache="FT FP16 paged KV",
         report_title="Qwen3 HTTP correctness", report_description="通过正式 HTTP/会话入口验证。误差字段为输出 Token ID 的精确一致性；不代表性能。")
     rows = []
     service = server = http_thread = None
@@ -220,7 +221,8 @@ def main():
             request = prepare_request(args.model, tokenizer, None, messages=payload["messages"], max_new_tokens=32)
             references[name] = run_native(args.generate.resolve(), args.worker.resolve(), args.model.resolve(), request,
                                           args.devices, directory)
-        with Qwen3ProcessSession(args.generate, args.worker, args.model, args.devices, output / "session", timeout=180) as session:
+        with Qwen3ProcessSession(args.generate, args.worker, args.model, args.devices, output / "session", timeout=180,
+                                 prefix_cache=args.prefix_cache, page_size=4 if args.prefix_cache else -1) as session:
             service = ChatService(session, tokenizer, args.model, "qwen3", output, queue_size=2, request_timeout=120)
             try:
                 server = ChatHTTPServer(("127.0.0.1", 0), service)

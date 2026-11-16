@@ -52,8 +52,11 @@ def main():
     parser.add_argument('--cuda-graph', action='store_true')
     parser.add_argument('--custom-allreduce', action='store_true')
     parser.add_argument('--prefix-cache', action='store_true')
+    parser.add_argument('--dp-routing', choices=('round_robin', 'prefix'), default='round_robin')
     parser.add_argument('--output', type=Path, default=ROOT / 'test/distributed/results')
     args = parser.parse_args()
+    if args.dp_routing == 'prefix' and not args.prefix_cache:
+        parser.error('prefix routing requires --prefix-cache')
     if args.dp < 2 or args.tp < 1:
         parser.error('requires dp>=2 and tp>=1')
     output = args.output.resolve() / (datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ') + '_dp_' + uuid.uuid4().hex[:8])
@@ -63,7 +66,7 @@ def main():
                     cuda=capture(['nvcc', '--version']), cuda_visible_devices=os.environ.get('CUDA_VISIBLE_DEVICES'),
                     seed=0, warmup=0, iterations=1, repeats=1, dp=args.dp, tp=args.tp,
                     cuda_graph=args.cuda_graph, custom_allreduce=args.custom_allreduce, prefix_cache=args.prefix_cache,
-                    expected_case_count=10, report_title='Process DP public entrypoint',
+                    expected_case_count=11 if args.dp_routing == 'prefix' else 10, dp_routing=args.dp_routing, report_title='Process DP public entrypoint',
                     report_description='同一正式工厂 DP=1 与多副本输出精确对照；固定 Token ID、EOS、采样和执行设置。'
                                        '生命周期检查误差为 n/a，不提供性能或独立数学精度结论。')
     rows = []
@@ -93,7 +96,7 @@ def main():
         if args.custom_allreduce:
             flags += ['--custom-allreduce']
         if args.prefix_cache:
-            flags += ['--prefix-cache', 'true']
+            flags += ['--prefix-cache', 'true', '--page_size', '4']
         prompt = '请用一句话介绍你自己。'
         reference = request = expected_text = None
 
@@ -109,7 +112,7 @@ def main():
                 return verify_native(reference, reference)
         case('single_replica_reference', baseline)
 
-        flags += ['--dp', str(args.dp)]
+        flags += ['--dp', str(args.dp), '--dp-routing', args.dp_routing]
         model = None
         try:
             def startup():
@@ -147,6 +150,22 @@ def main():
                 return dict(max_abs_error=0.0, mean_abs_error=0.0, failed_elements=0,
                             dp_ranks=[r['dp_rank'] for r in reports])
             case('concurrent_outputs', concurrent)
+
+            if args.dp_routing == 'prefix':
+                def prefix_route():
+                    model.clear_prefix_cache()
+                    cold = model.generate(request)
+                    warm = model.generate(request)
+                    metrics = verify_native(warm, reference)
+                    p = warm['graph'][0]['prefix_cache']
+                    expected = (len(request['token_ids']) - 1) // p['page_len'] * p['page_len']
+                    require(p['directory_version'] == 2 and expected > 0 and p['last_reused_tokens'] == expected,
+                            'DP route did not restore complete FT pages')
+                    require(warm['dp_rank'] == cold['dp_rank'] and
+                            warm['dp_routing']['estimated_reused_tokens'] == expected,
+                            'DP route directory differs from TP common reuse')
+                    return metrics
+                case('paged_prefix_route', prefix_route)
 
             def cancellation():
                 event = threading.Event()

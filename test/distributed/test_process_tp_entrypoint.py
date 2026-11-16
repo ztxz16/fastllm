@@ -43,6 +43,19 @@ class ProcessEntryTests(unittest.TestCase):
     def args(self, extra=()):
         return make_normal_parser('test').parse_args(self.base + list(extra))
 
+    def test_paged_configuration_reaches_native_session(self):
+        with make_normal_llm_model(self.args(('--kv-cache-layout', 'paged', '--page_size', '16', '--tokens', '512'))) as model:
+            self.assertEqual((model.session.page_size, model.session.cache_tokens), (16, 512))
+            command = (model.output / 'session' / 'command.txt').read_text()
+            self.assertIn('--page-size 16', command)
+            self.assertIn('--tokens 512', command)
+
+    def test_paged_configuration_rejects_invalid_capacity(self):
+        for flag in ('--page_size', '--tokens'):
+            for value in ('0', '-2', '2147483648'):
+                with self.subTest(flag=flag, value=value), self.assertRaisesRegex(ValueError, 'positive int32'):
+                    make_normal_llm_model(self.args((flag, value)))
+
     def test_factory_reuses_native_workers_and_releases(self):
         with make_normal_llm_model(self.args()) as model:
             self.assertEqual(model.tp_backend, 'process')
@@ -135,7 +148,7 @@ class ProcessEntryTests(unittest.TestCase):
     def test_explicit_unsupported_options_rejected_before_model_load(self):
         for extra in (['--dtype', 'int4'], ['--atype', 'float32'], ['--prefix-cache', 'maybe'],
                       ['--prefix-cache-snapshot-max-records', '3'],
-                      ['--kv-cache-layout', 'paged'], ['--max_batch', '2'], ['--device', 'cpu'],
+                      ['--kv-cache-layout', 'continuous'], ['--max_batch', '2'], ['--device', 'cpu'],
                       ['--lora', 'adapter'], ['--enable_thinking', 'true'], ['--triton'],
                       ['--linear-backend', 'machete']):
             with self.subTest(extra=extra), mock.patch.object(process_tp, 'Qwen3ProcessSession') as native:

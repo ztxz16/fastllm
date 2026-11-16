@@ -52,7 +52,7 @@ def main():
         cuda=capture(['nvcc', '--version']),
         cuda_visible_devices=os.environ.get('CUDA_VISIBLE_DEVICES'), devices=args.devices,
         expected_case_count=13 if args.prefix_cache else 12, execution='decode_cuda_graph' if args.cuda_graph else 'eager',
-        custom_allreduce=args.custom_allreduce, graph_warmup_per_request=1 if args.cuda_graph else 0, prefix_cache=args.prefix_cache, kv_cache='FP16 request-local + optional immutable snapshots',
+        custom_allreduce=args.custom_allreduce, graph_warmup_per_request=1 if args.cuda_graph else 0, prefix_cache=args.prefix_cache, kv_cache='FP16 FT paged + shared prefix pages',
         report_title='FastLLM process TP public entrypoint',
         report_description='正式工厂/CLI 与原生生成的 Token ID 精确对照；不代表性能或独立数学精度验证。')
     rows = []
@@ -100,7 +100,7 @@ def main():
         if args.custom_allreduce:
             common += ['--custom-allreduce']
         if args.prefix_cache:
-            common += ['--prefix-cache', 'true']
+            common += ['--prefix-cache', 'true', '--page_size', '4']
         # 包目录自动发现产物，故意不传显式 binary/worker，验证正式打包布局。
         model = make_normal_llm_model(make_normal_parser('accept').parse_args(common + ['--tp-output', str(output / 'factory')]))
         try:
@@ -123,7 +123,9 @@ def main():
             if args.prefix_cache:
                 def clear_prefix():
                     p = model.session._graph_state[0]['prefix_cache']
-                    require(p['last_reused_tokens'] == len(request['token_ids'])-1 and p['hits'] == 1,
+                    page = p.get('page_len', 1) if p.get('directory_version') == 2 else 1
+                    expected = (len(request['token_ids'])-1) // page * page
+                    require(expected > 0 and p['last_reused_tokens'] == expected and p['hits'] == int(expected > 0),
                             'formal factory did not reuse the actual prompt')
                     model.clear_prefix_cache()
                     result = check_text()
