@@ -3006,6 +3006,11 @@ if (UNIT_TEST)
             add_test(NAME naive_n05_swa_dp_heads COMMAND naive_n05_swa_verify_test dp_heads)
             set_tests_properties(naive_n05_swa_dp_heads PROPERTIES LABELS "cuda;naive" RUN_SERIAL TRUE TIMEOUT 300 SKIP_RETURN_CODE 77)
             foreach(NAIVE_DP_GROUPS 2 4 8)
+                add_test(NAME naive_n05_attention_dp_sampling_${NAIVE_DP_GROUPS}
+                    COMMAND naive_n05_verify_graph_test 8 attention_dp_sampling ${NAIVE_DP_GROUPS})
+                set_tests_properties(naive_n05_attention_dp_sampling_${NAIVE_DP_GROUPS}
+                    PROPERTIES LABELS "cuda;naive" RUN_SERIAL TRUE TIMEOUT 300 SKIP_RETURN_CODE 77
+                    PASS_REGULAR_EXPRESSION "CUDA SAMPLING PASS")
                 add_test(NAME naive_n05_attention_dp_serving_${NAIVE_DP_GROUPS}
                     COMMAND naive_n05_verify_graph_test 8 attention_dp_serving ${NAIVE_DP_GROUPS})
                 set_tests_properties(naive_n05_attention_dp_serving_${NAIVE_DP_GROUPS}

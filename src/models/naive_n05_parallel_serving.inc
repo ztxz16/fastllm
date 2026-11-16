@@ -92,14 +92,15 @@ bool NaiveN05FlashModel::ForwardAttentionParallelServing(const Data &inputIds,
         }
     } scope(dp, tpDecodeState, batch->Size());
     tpDecodeState = found->second;
-    LogitsSelection all; all.cudaLogits = true;
+    LogitsSelection all;
+    all.cudaSampling = selection && selection->cudaSampling && !selection->cudaLogits;
+    all.cudaLogits = !all.cudaSampling;
     try {
         Data logits = ForwardAttentionParallel(Data(FLOAT32, {1, shape.graphRows}, ids),
             Data(FLOAT32, {1, shape.graphRows}, pos), kv, config, nullptr, &all, &padded);
-        logits.Resize({batch->Size(), weight["lm_head.weight"].dims[0]});
-        if (selection && selection->cudaSampling && !selection->cudaLogits) {
-            selection->sampledTokens = SampleCudaLogits(logits, batch->configs);
-        } else {
+        if (all.cudaSampling) selection->sampledTokens = std::move(all.sampledTokens);
+        else {
+            logits.Resize({batch->Size(), weight["lm_head.weight"].dims[0]});
             output.CopyFrom(logits);
             if (!(selection && selection->cudaLogits)) output.ToDevice(CPU);
         }

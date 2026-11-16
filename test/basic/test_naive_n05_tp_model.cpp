@@ -45,15 +45,18 @@ extern "C" void *FastllmCudaDirectMalloc(size_t bytes) {
     return fn(bytes);
 }
 static bool inspectGpuSampling = false;
-static std::vector<float> sampledGpuLogits;
-static int gpuSamplingCalls = 0;
+static std::mutex sampledGpuMutex;
+static std::map<int, std::vector<float>> sampledGpuLogitsByDevice;
+static std::atomic<int> gpuSamplingCalls{0};
 extern "C" bool FastllmCudaTopKTopPSampling(float *logits, float *temperatures,
         int *topKs, float *topPs, int *output, int batch, int vocab) {
     ++gpuSamplingCalls;
     if (inspectGpuSampling) {
-        sampledGpuLogits.resize((size_t)batch * vocab);
-        auto error = cudaMemcpy(sampledGpuLogits.data(), logits,
-            sampledGpuLogits.size() * sizeof(float), cudaMemcpyDeviceToHost);
+        std::lock_guard<std::mutex> guard(sampledGpuMutex);
+        auto &values = sampledGpuLogitsByDevice[FastllmCudaGetDevice()];
+        values.resize((size_t)batch * vocab);
+        auto error = cudaMemcpy(values.data(), logits,
+            values.size() * sizeof(float), cudaMemcpyDeviceToHost);
         if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
     }
     static auto fn = (bool (*)(float *, float *, int *, float *, int *, int, int))
@@ -119,6 +122,7 @@ struct NaiveN05GraphTestAccess {
         model.tpDevices.resize(ranks);
         std::iota(model.tpDevices.begin(), model.tpDevices.end(), 0);
     }
+    static int &SamplingCapacity(NaiveN05FlashModel &model) { return model.attentionParallel->samplingCapacity; }
     static void InvalidateAll(NaiveN05FlashModel &model) { model.InvalidateTensorParallelCache(); }
     static bool HasDPServingPlan(NaiveN05FlashModel &model) {
         const auto &dp = *model.attentionParallel;
@@ -1685,7 +1689,7 @@ class Fixture : public NaiveN05FlashModel {
                   << " max_relative=" << largestLogitRelative << " max_abs=" << largestLogitAbsolute << std::endl;
     }
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
-    void CudaSamplingChecks() {
+    void CudaSamplingChecks(int dp = 1) {
         // Exercise partial mask words and mixed masked/unmasked rows without
         // involving sampling (an empty support is valid for this mask API).
         {
@@ -1732,7 +1736,7 @@ class Fixture : public NaiveN05FlashModel {
         probabilities.ToDevice(DataDevice::CUDA, {0}, true);
         inspectGpuSampling = true;
         auto sampled = SampleCudaLogits(probabilities, configs);
-        if (sampledGpuLogits != values) throw std::runtime_error("input logits changed");
+        if (sampledGpuLogitsByDevice.at(0) != values) throw std::runtime_error("input logits changed");
         inspectGpuSampling = false;
         for (int group = 0; group < groups; ++group) {
             std::vector<int> counts(vocab);
@@ -1755,16 +1759,35 @@ class Fixture : public NaiveN05FlashModel {
         }
         cfg.top_k = vocab; cfg.output_token_limit = 32; cfg.input_token_length = 3;
         maxBatch = 128; SetMaxTokens(131072);
+        if (dp > 1) ConfigureAttentionParallel(dp);
         WarmUp();
         int captures = verifyGraphCaptures, checks = 0;
         using Cache = std::vector<std::pair<Data, Data>>;
         std::vector<Cache> actual(48), reference(48);
         std::vector<int> past(48, 3);
+        auto checkLogits = [&](const std::vector<std::vector<float>> &expectedRows,
+                               const std::vector<GenerationConfig> &cs, int calls, bool fallback) {
+            std::map<int, std::vector<float>> expectedDevices;
+            for (size_t row = 0; row < expectedRows.size(); ++row) {
+                const int device = dp > 1 && !fallback ? actual[row][0].first.dataDeviceIds.front() : 0;
+                auto &values = expectedDevices[device];
+                for (int id = 0; id < vocab; ++id)
+                    values.push_back(cs[row].AllowsToolToken(id) ? expectedRows[row][id] : -INFINITY);
+            }
+            if (gpuSamplingCalls != calls + (int)expectedDevices.size() || sampledGpuLogitsByDevice != expectedDevices)
+                throw std::runtime_error("DP sampling logits/masks differ from CPU reference or use wrong owners");
+        };
         inspectGpuSampling = true;
         for (int row = 0; row < 48; ++row) {
             for (int layer = 0; layer < block_cnt; ++layer) {
                 actual[row].emplace_back(Data(BFLOAT16), Data(BFLOAT16));
                 reference[row].emplace_back(Data(BFLOAT16), Data(BFLOAT16));
+            }
+            if (dp > 1) for (auto *cache : {&actual[row], &reference[row]}) {
+                std::vector<std::pair<Data *, Data *>> roots;
+                for (auto &pair : *cache) roots.emplace_back(&pair.first, &pair.second);
+                // Include empty GPU0 and skewed groups in short batches.
+                NaiveN05GraphTestAccess::InitDPCache(*this, roots, (row + 1) % dp);
             }
             Data ids(FLOAT32, {1, 3}, {float(row + 1), 2, 3});
             Data positions(FLOAT32, {1, 3}, {0, 1, 2});
@@ -1772,8 +1795,10 @@ class Fixture : public NaiveN05FlashModel {
             std::vector<float> logits;
             Forward(ids, Data(), positions, reference[row], ref, LastTokensManager(), &logits);
             int calls = gpuSamplingCalls;
+            sampledGpuLogitsByDevice.clear();
             Forward(ids, Data(), positions, actual[row], cfg);
-            if (gpuSamplingCalls != calls + 1 || sampledGpuLogits != logits)
+            const int device = dp > 1 ? actual[row][0].first.dataDeviceIds.front() : 0;
+            if (gpuSamplingCalls != calls + 1 || sampledGpuLogitsByDevice.at(device) != logits)
                 throw std::runtime_error("prefill GPU sampling logits differ from full CPU output");
             ++checks;
         }
@@ -1791,6 +1816,13 @@ class Fixture : public NaiveN05FlashModel {
                 positions[row].CopyFrom(Data(FLOAT32, {1, 1}, {float(past[row])}));
                 pos.push_back(&positions[row]); outputs.push_back(&expectedRows[row]);
                 cs[row].temperature = .5f + .3f * (row % 4); cs[row].top_p = .7f + .07f * (row % 4);
+                if (dp > 1 && row % 4 != 0) {
+                    auto mask = std::make_shared<std::vector<uint32_t>>((vocab + 31) / 32, 0);
+                    for (int id = 0; id < vocab; ++id)
+                        if (id % 7 == row % 7) (*mask)[id / 32] |= uint32_t(1) << (id % 32);
+                    cs[row].tool_call_token_mask = mask;
+                    if (row % 3 == 0) cs[row].top_k = 1;
+                }
                 refs[row] = cs[row]; refs[row].output_logits = true;
                 for (int layer = 0; layer < block_cnt; ++layer) {
                     a.emplace_back(&actual[row][layer].first, &actual[row][layer].second);
@@ -1799,17 +1831,35 @@ class Fixture : public NaiveN05FlashModel {
             }
             Data input(FLOAT32, {1, rows}, ids);
             int calls = gpuSamplingCalls, launches = verifyGraphLaunches;
+            sampledGpuLogitsByDevice.clear();
+            const bool fallback = dp > 1 && rows == 40;
+            if (fallback) NaiveN05GraphTestAccess::SamplingCapacity(*this) = 0;
+            std::vector<int> tokens;
             if (rows == 1) {
                 Forward(input, Data(), positions[0], reference[0], refs[0], LastTokensManager(), &expectedRows[0]);
-                Forward(input, Data(), positions[0], actual[0], cs[0]);
+                tokens.push_back(Forward(input, Data(), positions[0], actual[0], cs[0]));
             } else {
                 ForwardBatch(rows, input, {}, pos, std::vector<int>(rows, 1), r, refs, LastTokensManager(), &outputs);
-                ForwardBatch(rows, input, {}, pos, std::vector<int>(rows, 1), a, cs);
+                tokens = ForwardBatch(rows, input, {}, pos, std::vector<int>(rows, 1), a, cs);
             }
-            std::vector<float> expectedFlat;
-            for (auto &row : expectedRows) expectedFlat.insert(expectedFlat.end(), row.begin(), row.end());
-            if (gpuSamplingCalls != calls + 1 || sampledGpuLogits != expectedFlat)
-                throw std::runtime_error("decode GPU sampling logits differ from full CPU output");
+            if (fallback) NaiveN05GraphTestAccess::SamplingCapacity(*this) = maxBatch;
+            checkLogits(expectedRows, cs, calls, fallback);
+            for (int row = 0; row < rows; ++row) {
+                if (!cs[row].AllowsToolToken(tokens[row])) throw std::runtime_error("GPU sampling violated tool mask");
+                auto distribution = SpeculativeDistribution(expectedRows[row].data(), vocab, cs[row], LastTokensUnit());
+                if (distribution[tokens[row]] <= 0) {
+                    // FlashInfer retains probability ties at the top-k/top-p
+                    // boundary; the CPU oracle breaks ties by token ID.
+                    float boundary = INFINITY;
+                    for (int id = 0; id < vocab; ++id)
+                        if (distribution[id] > 0) boundary = std::min(boundary, expectedRows[row][id]);
+                    if (expectedRows[row][tokens[row]] != boundary)
+                        throw std::runtime_error("GPU sampling outside reference support: batch=" +
+                            std::to_string(rows) + " row=" + std::to_string(row) + " token=" +
+                            std::to_string(tokens[row]) + " score=" + std::to_string(expectedRows[row][tokens[row]]) +
+                            " boundary=" + std::to_string(boundary));
+                }
+            }
             if (ranks > 1 && verifyGraphLaunches - launches != ranks * 2) {
                 std::cerr << "rows=" << rows << " launches=" << verifyGraphLaunches - launches
                           << " expected=" << ranks * 2 << std::endl;
@@ -1820,7 +1870,7 @@ class Fixture : public NaiveN05FlashModel {
         }
         inspectGpuSampling = false;
         if (verifyGraphCaptures != captures) throw std::runtime_error("sampling parameter change recaptured graph");
-        std::cout << "CUDA SAMPLING PASS ranks=" << ranks << " draws=" << sampled.size()
+        std::cout << "CUDA SAMPLING PASS ranks=" << ranks << " dp=" << dp << " draws=" << sampled.size()
                   << " model_checks=" << checks << " no_recapture=1" << std::endl;
     }
     void ServingGraphInvalidationChecks() {
@@ -5096,10 +5146,11 @@ int main(int argc, char **argv) {
             fixture.ServingPageGrowthChecks(std::string(argv[2]) == "serving_kvmem_transition");
             return 0;
         }
-        if (argc > 2 && std::string(argv[2]) == "cuda_sampling") {
+        if (argc > 2 && (std::string(argv[2]) == "cuda_sampling" || std::string(argv[2]) == "attention_dp_sampling")) {
             SetCudaEmbedding(true); SetCudaGraph(true);
             Fixture fixture(ranks, false, true, true, true);
-            fixture.CudaSamplingChecks();
+            fixture.CudaSamplingChecks(std::string(argv[2]) == "attention_dp_sampling"
+                ? (argc > 3 ? std::stoi(argv[3]) : ranks) : 1);
             return 0;
         }
         if (argc > 2 && (std::string(argv[2]) == "history_serving" || std::string(argv[2]) == "kvmem_prefix")) {

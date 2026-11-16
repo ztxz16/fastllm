@@ -63,6 +63,10 @@ struct NaiveN05FlashModel::AttentionParallelState {
     std::vector<GroupBatch> groups;
     std::vector<Rank> ranks;
     parallel::RowPartition rows;
+    // Outside the captured model graph. Only each attention group's leader
+    // owns full-vocabulary logits; peers write their disjoint vocab columns.
+    std::vector<Data> samplingLogits;
+    int samplingCapacity = 0;
     // Serving graphs own separate DP scratch: a large prefill must not move
     // buffers retained by a decode graph. All serving shapes share this arena.
     std::unique_ptr<parallel::CudaRowTransfer> servingTransfer;

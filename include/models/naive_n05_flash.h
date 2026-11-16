@@ -399,6 +399,7 @@ namespace fastllm {
         std::shared_ptr<AttentionParallelState> attentionParallel;
         int attentionDP = 1;
         void InitAttentionParallelCache(const std::vector<std::pair<Data *, Data *>> &roots, int group = -1);
+        void PrepareAttentionParallelSampling();
         int AttentionTPSize() const { return tpDevices.size() / attentionDP; }
         Data ForwardAttentionParallel(const Data &inputIds, const Data &positions,
             std::vector<std::pair<Data, Data>> &kv, const GenerationConfig &config,

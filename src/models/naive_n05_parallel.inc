@@ -58,6 +58,30 @@ void NaiveN05FlashModel::InitAttentionParallelCache(
 #endif
 }
 
+void NaiveN05FlashModel::PrepareAttentionParallelSampling() {
+#ifdef USE_CUDA
+    if (!attentionParallel || draftEnabled || kvMemConfig.enabled ||
+        !FastllmCudaPeerAccessInit(tpDevices)) return;
+    auto &state = *attentionParallel;
+    const auto &topology = state.runtime.Layout();
+    const int rows = maxBatch > 0 ? maxBatch : 256;
+    state.samplingLogits.resize(attentionDP);
+    state.runtime.Run([&](int rank, int device) {
+        if (topology.AttentionRank(rank) != 0) return;
+        auto &logits = state.samplingLogits[topology.AttentionOwner(rank)];
+        logits.dataType = FLOAT32; logits.Resize({rows, weight["lm_head.weight"].dims[0]});
+        logits.ToDevice(CUDA, {device}, false); logits.Allocate(true);
+        // Reserve mask and sampler scratch on the same persistent worker that
+        // serves this group, before sizing KV pools or accepting requests.
+        auto mask = std::make_shared<std::vector<uint32_t>>((logits.dims.back() + 31) / 32, 0);
+        (*mask)[0] = 1;
+        GenerationConfig config; config.top_k = 1; config.tool_call_token_mask = mask;
+        SampleCudaLogits(logits, std::vector<GenerationConfig>(rows, config));
+    });
+    state.samplingCapacity = rows;
+#endif
+}
+
 Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Data &positions,
         std::vector<std::pair<Data, Data>> &kv, const GenerationConfig &config,
         TargetCapture *capture, LogitsSelection *selection, const TargetBatch *batch) {
@@ -211,8 +235,20 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
     }
     Data embedding;
     if (!GetCudaEmbedding() || GetLowMemMode()) Embedding(inputIds, weight["model.embed_tokens.weight"], embedding);
+    const bool distributedSampling = !isIntermediateChunkedPrefill && !capture && !sparseKv &&
+        !(tpServingState && tpServingState->preparing) && state.samplingCapacity >= liveRows &&
+        selection && selection->cudaSampling && !selection->cudaLogits;
+    std::vector<std::vector<int>> samplingRows;
+    if (distributedSampling) {
+        samplingRows.resize(attentionDP);
+        for (int group = 0; group < attentionDP; ++group) {
+            for (int seq : state.groups[group].sequenceIndices)
+                if (seq < liveRows) samplingRows[group].push_back(seq);
+            state.samplingLogits[group].Resize({(int)samplingRows[group].size(), vocab});
+        }
+    }
     Data &joined = tpSamplingLogits;
-    if (!isIntermediateChunkedPrefill) {
+    if (!isIntermediateChunkedPrefill && !distributedSampling) {
         FastllmCudaSetDevice(tpDevices.front());
         joined.dataType = FLOAT32; joined.UpdateUnitSize(); joined.Resize({outputRows, vocab});
         joined.ToDevice(CUDA, {tpDevices.front()}, false); joined.Allocate(false);
@@ -290,9 +326,24 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
         if (!isIntermediateChunkedPrefill) {
             const auto range = tpVocabRanges[rank];
             const size_t bytes = size_t(range.second - range.first) * sizeof(float);
-            AssertInFastLLM(FastllmCudaMemcpy2DDeviceToDeviceAsyncCurrentThread(
-                (float *)joined.cudaData + range.first, size_t(vocab) * sizeof(float),
-                logits.cudaData, bytes, bytes, outputRows), "Naive attention DP logits gather failed");
+            if (distributedSampling) {
+                std::vector<void *> destinations;
+                std::vector<const void *> sources;
+                std::vector<size_t> sizes;
+                for (int owner = 0; owner < attentionDP; ++owner)
+                    for (size_t row = 0; row < samplingRows[owner].size(); ++row) {
+                        destinations.push_back((float *)state.samplingLogits[owner].cudaData + row * vocab + range.first);
+                        sources.push_back((char *)logits.cudaData + size_t(samplingRows[owner][row]) * bytes);
+                        sizes.push_back(bytes);
+                    }
+                AssertInFastLLM(FastllmCudaBatchCopyFromDeviceToDeviceAsyncCurrentThread(
+                    destinations.data(), sources.data(), sizes.data(), sizes.size()),
+                    "Naive attention DP logits redistribution failed");
+            } else {
+                AssertInFastLLM(FastllmCudaMemcpy2DDeviceToDeviceAsyncCurrentThread(
+                    (float *)joined.cudaData + range.first, size_t(vocab) * sizeof(float),
+                    logits.cudaData, bytes, bytes, outputRows), "Naive attention DP logits gather failed");
+            }
             FastllmCudaSyncCurrentThreadStream();
         }
     };
@@ -427,9 +478,27 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
         capture->prefixes = std::move(prefixes);
     }
     if (isIntermediateChunkedPrefill) return Data();
+    if (distributedSampling) {
+        selection->sampledTokens.resize(liveRows);
+        state.runtime.Run([&](int rank, int) {
+            if (topology.AttentionRank(rank) != 0) return;
+            const int group = topology.AttentionOwner(rank);
+            const auto &rows = samplingRows[group];
+            if (rows.empty()) return;
+            std::vector<GenerationConfig> configs;
+            for (int seq : rows) configs.push_back(batch ? batch->configs[seq] : config);
+            auto tokens = SampleCudaLogits(state.samplingLogits[group], configs);
+            for (size_t row = 0; row < rows.size(); ++row) selection->sampledTokens[rows[row]] = tokens[row];
+        });
+        return Data();
+    }
     FastllmCudaSetDevice(tpDevices.front());
     if (selection && selection->cudaSampling && !selection->cudaLogits) {
-        selection->sampledTokens = SampleCudaLogits(joined, batch ? batch->configs : std::vector<GenerationConfig>{config});
+        Data logits;
+        logits.FakeFrom(joined, 0); logits.Resize({liveRows, vocab});
+        selection->sampledTokens = SampleCudaLogits(logits, batch
+            ? std::vector<GenerationConfig>(batch->configs.begin(), batch->configs.begin() + liveRows)
+            : std::vector<GenerationConfig>{config});
         return Data();
     }
     Data output;

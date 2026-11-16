@@ -2260,6 +2260,7 @@ void NaiveN05FlashModel::WarmUp() {
 #ifdef USE_CUDA
     if (attentionDP > 1) {
         PrepareTensorParallelMemory();
+        PrepareAttentionParallelSampling();
         if (kvMemConfig.enabled) InitSparseKv();
         else InitTensorParallelKVPool();
         if (!kvMemConfig.enabled) PrepareTensorParallelServing();

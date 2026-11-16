@@ -16543,7 +16543,7 @@ bool FastllmCudaTopKTopPSamplingWithTypicalAcceptance(
             typicalPosteriorThreshold, typicalPosteriorAlpha);
     }
 
-    static std::mt19937 rng(std::random_device{}());
+    static thread_local std::mt19937 rng(std::random_device{}());
     uint64_t seed = rng();
 
     cudaError_t samplingState =
