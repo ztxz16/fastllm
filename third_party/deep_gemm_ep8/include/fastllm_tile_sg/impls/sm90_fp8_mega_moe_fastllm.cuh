@@ -1761,76 +1761,90 @@ sm90_fp8_mega_moe_impl(void* y,
                                                     + sf_n_block_idx * kL2SFKBlocks + k_block_idx);
                     }
 
+                    // Keep each K64/K128 dot product and FP32 accumulation order
+                    // unchanged, but issue independent weight/scale groups together.
+                    // Prepare scales while WGMMA runs, then consume groups in order;
+                    // the stage is released only after every reader has completed.
+                    auto run_swap_ab = [&]<uint32_t N_SWAP, bool kL1>() {
+                        using SwapWGMMA = typename mma::sm90::FP8MMASelector<N_SWAP>::type;
+                        constexpr uint32_t count = SwapWGMMA::kNumAccum;
+                        constexpr uint32_t groups = kL1 || kMimo128SF ? 1 : 2;
+                        constexpr uint32_t pending = kSwapWeightHalves * groups;
+                        static_assert(count <= kSwapAccumPerHalf && pending <= 4);
+                        float partial[pending][count], scales[groups][count];
+                        #pragma unroll
+                        for (uint32_t part = 0; part < pending; ++part) {
+                            #pragma unroll
+                            for (uint32_t i = 0; i < count; ++i)
+                                ptx::warpgroup_fence_operand(partial[part][i]);
+                            ptx::warpgroup_arrive();
+                            #pragma unroll
+                            for (uint32_t k = 0; k < BLOCK_K / groups / SwapWGMMA::K; ++k) {
+                                const uint32_t offset = (part % groups) * (BLOCK_K / groups) + k * SwapWGMMA::K;
+                                auto a = mma::sm90::make_smem_desc(
+                                    smem_b[stage_idx] + smem_b_wg_offset + (part / groups) * 64 * BLOCK_K + offset, 1);
+                                auto b = mma::sm90::make_smem_desc(smem_a[stage_idx] + offset, 1);
+                                SwapWGMMA::wgmma(a, b, partial[part], k);
+                            }
+                            ptx::warpgroup_commit_batch();
+                            #pragma unroll
+                            for (uint32_t i = 0; i < count; ++i)
+                                ptx::warpgroup_fence_operand(partial[part][i]);
+                        }
+                        #pragma unroll
+                        for (uint32_t group = 0; group < groups; ++group) {
+                            #pragma unroll
+                            for (uint32_t i = 0; i < count / 4; ++i) {
+                                const uint32_t t0 = i * 8 + col_idx * 2, t1 = t0 + 1;
+                                const float a0 = t0 < valid_m ?
+                                    ptx::ld_shared(smem_sfa[stage_idx] + group * SFA_TILE_STRIDE + t0) : 0.0f;
+                                const float a1 = t1 < valid_m ?
+                                    ptx::ld_shared(smem_sfa[stage_idx] + group * SFA_TILE_STRIDE + t1) : 0.0f;
+                                scales[group][i * 4 + 0] = a0 * (kL1 ? gate_sf : l2_sf);
+                                scales[group][i * 4 + 2] = a0 * (kL1 ? up_sf : l2_sf);
+                                scales[group][i * 4 + 1] = a1 * (kL1 ? gate_sf : l2_sf);
+                                scales[group][i * 4 + 3] = a1 * (kL1 ? up_sf : l2_sf);
+                            }
+                        }
+                        auto consume = [&]<uint32_t Part>() {
+                            constexpr uint32_t half = Part / groups, group = Part % groups;
+                            ptx::warpgroup_wait<pending - Part - 1>();
+                            #pragma unroll
+                            for (uint32_t i = 0; i < count; ++i)
+                                final_accum[half * kSwapAccumPerHalf + i] += scales[group][i] * partial[Part][i];
+                        };
+                        consume.template operator()<0>();
+                        if constexpr (pending > 1) consume.template operator()<1>();
+                        if constexpr (pending > 2) consume.template operator()<2>();
+                        if constexpr (pending > 3) consume.template operator()<3>();
+                        if (lane_idx == 0) empty_barriers[stage_idx]->arrive();
+                    };
+
                     if (block_phase == sched::BlockPhase::Linear1) {
                         if constexpr (kSwapABActive) {
-                            auto run_swap_ab_l1 = [&]<uint32_t N_SWAP>() {
-                                using SwapWGMMA = typename mma::sm90::FP8MMASelector<N_SWAP>::type;
-                                constexpr uint32_t kSwapAccum = SwapWGMMA::kNumAccum;
-                                static_assert(kSwapAccum <= kSwapAccumPerHalf);
-                                #pragma unroll
-                                for (uint32_t half = 0; half < kSwapWeightHalves; ++half) {
-                                float swap_accum[kSwapAccum];
-
-                                #pragma unroll
-                                for (uint32_t i = 0; i < kSwapAccum; ++ i)
-                                    ptx::warpgroup_fence_operand(swap_accum[i]);
-                                ptx::warpgroup_arrive();
-                                #pragma unroll
-                                for (uint32_t k = 0; k < BLOCK_K / SwapWGMMA::K; ++ k) {
-                                    auto desc_a = mma::sm90::make_smem_desc(
-                                        smem_b[stage_idx] + smem_b_wg_offset + half * 64 * BLOCK_K + k * SwapWGMMA::K, 1);
-                                    auto desc_b = mma::sm90::make_smem_desc(
-                                        smem_a[stage_idx] + k * SwapWGMMA::K, 1);
-                                    SwapWGMMA::wgmma(desc_a, desc_b, swap_accum, k);
-                                }
-                                ptx::warpgroup_commit_batch();
-                                #pragma unroll
-                                for (uint32_t i = 0; i < kSwapAccum; ++ i)
-                                    ptx::warpgroup_fence_operand(swap_accum[i]);
-                                ptx::warpgroup_wait<0>();
-
-                                #pragma unroll
-                                for (uint32_t i = 0; i < kSwapAccum / 4; ++ i) {
-                                    const uint32_t token_0 = i * 8 + col_idx * 2;
-                                    const uint32_t token_1 = token_0 + 1;
-                                    const float scale_0 = token_0 < valid_m ?
-                                        ptx::ld_shared(smem_sfa[stage_idx] + token_0) : 0.0f;
-                                    const float scale_1 = token_1 < valid_m ?
-                                        ptx::ld_shared(smem_sfa[stage_idx] + token_1) : 0.0f;
-                                    final_accum[half * kSwapAccumPerHalf + i * 4 + 0] += scale_0 * gate_sf * swap_accum[i * 4 + 0];
-                                    final_accum[half * kSwapAccumPerHalf + i * 4 + 2] += scale_0 * up_sf * swap_accum[i * 4 + 2];
-                                    final_accum[half * kSwapAccumPerHalf + i * 4 + 1] += scale_1 * gate_sf * swap_accum[i * 4 + 1];
-                                    final_accum[half * kSwapAccumPerHalf + i * 4 + 3] += scale_1 * up_sf * swap_accum[i * 4 + 3];
-                                }
-
-                                } // Both weight halves have finished.
-                                if (lane_idx == 0)
-                                    empty_barriers[stage_idx]->arrive();
-                            };
-
                             const uint32_t n_swap = ((valid_m + 7u) / 8u) * 8u;
                             if constexpr (kIntermediateHidden <= 2048 and (not kMimo128SF or BLOCK_M < 64)) {
                                 if (n_swap <= 8) {
-                                    run_swap_ab_l1.template operator()<8>();
+                                    run_swap_ab.template operator()<8, true>();
                                 } else if (n_swap <= 16) {
-                                    run_swap_ab_l1.template operator()<16>();
+                                    run_swap_ab.template operator()<16, true>();
                                 } else if constexpr (BLOCK_M >= 32) {
                                     if (n_swap <= 32) {
-                                        run_swap_ab_l1.template operator()<32>();
+                                        run_swap_ab.template operator()<32, true>();
                                     } else if constexpr (BLOCK_M >= 64) {
-                                        run_swap_ab_l1.template operator()<64>();
+                                        run_swap_ab.template operator()<64, true>();
                                     }
                                 }
                             } else {
                                 switch (n_swap) {
-                                    case 8:  run_swap_ab_l1.template operator()<8>();  break;
-                                    case 16: run_swap_ab_l1.template operator()<16>(); break;
-                                    case 24: run_swap_ab_l1.template operator()<24>(); break;
-                                    case 32: run_swap_ab_l1.template operator()<32>(); break;
-                                    case 40: run_swap_ab_l1.template operator()<40>(); break;
-                                    case 48: run_swap_ab_l1.template operator()<48>(); break;
-                                    case 56: run_swap_ab_l1.template operator()<56>(); break;
-                                    default: run_swap_ab_l1.template operator()<64>(); break;
+                                    case 8:  run_swap_ab.template operator()<8, true>();  break;
+                                    case 16: run_swap_ab.template operator()<16, true>(); break;
+                                    case 24: run_swap_ab.template operator()<24, true>(); break;
+                                    case 32: run_swap_ab.template operator()<32, true>(); break;
+                                    case 40: run_swap_ab.template operator()<40, true>(); break;
+                                    case 48: run_swap_ab.template operator()<48, true>(); break;
+                                    case 56: run_swap_ab.template operator()<56, true>(); break;
+                                    default: run_swap_ab.template operator()<64, true>(); break;
                                 }
                             }
                         } else {
@@ -1870,99 +1884,29 @@ sm90_fp8_mega_moe_impl(void* y,
                         if constexpr (kSwapABActive) {
                             DG_STATIC_ASSERT(kL2ActsSFGranK == 64,
                                              "L2 swapAB assumes per-64 activation scales");
-                            auto run_swap_ab_l2 = [&]<uint32_t N_SWAP>() {
-                                using SwapWGMMA = typename mma::sm90::FP8MMASelector<N_SWAP>::type;
-                                constexpr uint32_t kSwapAccum = SwapWGMMA::kNumAccum;
-                                static_assert(kSwapAccum <= kSwapAccumPerHalf);
-                                #pragma unroll
-                                for (uint32_t half = 0; half < kSwapWeightHalves; ++half) {
-                                float swap_accum[kSwapAccum];
-
-                                auto promote_swap_accum = [&](const uint32_t& sf_group) {
-                                    #pragma unroll
-                                    for (uint32_t i = 0; i < kSwapAccum / 4; ++ i) {
-                                        const uint32_t token_0 = i * 8 + col_idx * 2;
-                                        const uint32_t token_1 = token_0 + 1;
-                                        const float scale_0 = token_0 < valid_m ?
-                                            ptx::ld_shared(smem_sfa[stage_idx] + sf_group * SFA_TILE_STRIDE + token_0) : 0.0f;
-                                        const float scale_1 = token_1 < valid_m ?
-                                            ptx::ld_shared(smem_sfa[stage_idx] + sf_group * SFA_TILE_STRIDE + token_1) : 0.0f;
-                                        final_accum[half * kSwapAccumPerHalf + i * 4 + 0] += scale_0 * l2_sf * swap_accum[i * 4 + 0];
-                                        final_accum[half * kSwapAccumPerHalf + i * 4 + 2] += scale_0 * l2_sf * swap_accum[i * 4 + 2];
-                                        final_accum[half * kSwapAccumPerHalf + i * 4 + 1] += scale_1 * l2_sf * swap_accum[i * 4 + 1];
-                                        final_accum[half * kSwapAccumPerHalf + i * 4 + 3] += scale_1 * l2_sf * swap_accum[i * 4 + 3];
-                                    }
-                                };
-
-                                #pragma unroll
-                                for (uint32_t i = 0; i < kSwapAccum; ++ i)
-                                    ptx::warpgroup_fence_operand(swap_accum[i]);
-                                ptx::warpgroup_arrive();
-                                #pragma unroll
-                                for (uint32_t k = 0; k < (kMimo128SF ? BLOCK_K : BLOCK_K / 2) / SwapWGMMA::K; ++ k) {
-                                    auto desc_a = mma::sm90::make_smem_desc(
-                                        smem_b[stage_idx] + smem_b_wg_offset + half * 64 * BLOCK_K + k * SwapWGMMA::K, 1);
-                                    auto desc_b = mma::sm90::make_smem_desc(
-                                        smem_a[stage_idx] + k * SwapWGMMA::K, 1);
-                                    SwapWGMMA::wgmma(desc_a, desc_b, swap_accum, k);
-                                }
-                                ptx::warpgroup_commit_batch();
-                                #pragma unroll
-                                for (uint32_t i = 0; i < kSwapAccum; ++ i)
-                                    ptx::warpgroup_fence_operand(swap_accum[i]);
-                                ptx::warpgroup_wait<0>();
-                                promote_swap_accum(0);
-
-                                if constexpr (not kMimo128SF) {
-                                    #pragma unroll
-                                    for (uint32_t i = 0; i < kSwapAccum; ++ i)
-                                        ptx::warpgroup_fence_operand(swap_accum[i]);
-                                    ptx::warpgroup_arrive();
-                                    #pragma unroll
-                                    for (uint32_t k = 0; k < (BLOCK_K / 2) / SwapWGMMA::K; ++ k) {
-                                        const uint32_t k_off = (BLOCK_K / 2) + k * SwapWGMMA::K;
-                                        auto desc_a = mma::sm90::make_smem_desc(
-                                            smem_b[stage_idx] + smem_b_wg_offset + half * 64 * BLOCK_K + k_off, 1);
-                                        auto desc_b = mma::sm90::make_smem_desc(
-                                            smem_a[stage_idx] + k_off, 1);
-                                        SwapWGMMA::wgmma(desc_a, desc_b, swap_accum, k);
-                                    }
-                                    ptx::warpgroup_commit_batch();
-                                    #pragma unroll
-                                    for (uint32_t i = 0; i < kSwapAccum; ++ i)
-                                        ptx::warpgroup_fence_operand(swap_accum[i]);
-                                    ptx::warpgroup_wait<0>();
-                                    promote_swap_accum(1);
-                                }
-
-                                } // Both weight halves have finished.
-                                if (lane_idx == 0)
-                                    empty_barriers[stage_idx]->arrive();
-                            };
-
                             const uint32_t n_swap = ((valid_m + 7u) / 8u) * 8u;
                             if constexpr (kIntermediateHidden <= 2048 and (not kMimo128SF or BLOCK_M < 64)) {
                                 if (n_swap <= 8) {
-                                    run_swap_ab_l2.template operator()<8>();
+                                    run_swap_ab.template operator()<8, false>();
                                 } else if (n_swap <= 16) {
-                                    run_swap_ab_l2.template operator()<16>();
+                                    run_swap_ab.template operator()<16, false>();
                                 } else if constexpr (BLOCK_M >= 32) {
                                     if (n_swap <= 32) {
-                                        run_swap_ab_l2.template operator()<32>();
+                                        run_swap_ab.template operator()<32, false>();
                                     } else if constexpr (BLOCK_M >= 64) {
-                                        run_swap_ab_l2.template operator()<64>();
+                                        run_swap_ab.template operator()<64, false>();
                                     }
                                 }
                             } else {
                                 switch (n_swap) {
-                                    case 8:  run_swap_ab_l2.template operator()<8>();  break;
-                                    case 16: run_swap_ab_l2.template operator()<16>(); break;
-                                    case 24: run_swap_ab_l2.template operator()<24>(); break;
-                                    case 32: run_swap_ab_l2.template operator()<32>(); break;
-                                    case 40: run_swap_ab_l2.template operator()<40>(); break;
-                                    case 48: run_swap_ab_l2.template operator()<48>(); break;
-                                    case 56: run_swap_ab_l2.template operator()<56>(); break;
-                                    default: run_swap_ab_l2.template operator()<64>(); break;
+                                    case 8:  run_swap_ab.template operator()<8, false>();  break;
+                                    case 16: run_swap_ab.template operator()<16, false>(); break;
+                                    case 24: run_swap_ab.template operator()<24, false>(); break;
+                                    case 32: run_swap_ab.template operator()<32, false>(); break;
+                                    case 40: run_swap_ab.template operator()<40, false>(); break;
+                                    case 48: run_swap_ab.template operator()<48, false>(); break;
+                                    case 56: run_swap_ab.template operator()<56, false>(); break;
+                                    default: run_swap_ab.template operator()<64, false>(); break;
                                 }
                             }
                         } else {
