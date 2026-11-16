@@ -3595,6 +3595,28 @@ namespace fastllm {
             if (!config.AllowsToolToken(token)) values[token] = -INFINITY;
     }
 
+    void ApplyToolTokenMasks(Data &logits, const std::vector<GenerationConfig> &configs) {
+        AssertInFastLLM(!logits.dims.empty() && logits.dataType == FLOAT32 &&
+            logits.dims.back() > 0 && logits.Count(0) / logits.dims.back() == configs.size(),
+            "Invalid tool grammar logits batch.");
+        const int vocab = logits.dims.back();
+        std::vector<const uint32_t *> masks(configs.size(), nullptr);
+        bool masked = false;
+        for (size_t row = 0; row < configs.size(); ++row) if (configs[row].tool_call_token_mask) {
+            AssertInFastLLM(configs[row].tool_call_token_mask->size() >= (size_t)(vocab + 31) / 32,
+                "Invalid tool grammar logits mask.");
+            masks[row] = configs[row].tool_call_token_mask->data(); masked = true;
+        }
+        if (!masked) return;
+#ifdef USE_CUDA
+        if (logits.dataDevice == DataDevice::CUDA) {
+            FastllmCudaSetDevice(logits.dataDeviceIds.at(0));
+            if (FastllmCudaApplyTokenMasks((float *)logits.cudaData, masks.data(), configs.size(), vocab)) return;
+        }
+#endif
+        for (size_t row = 0; row < configs.size(); ++row) ApplyToolTokenMask(logits, row, configs[row]);
+    }
+
 #ifdef USE_CUDA
     // Keep the existing top-p arithmetic and RNG on the host. Only selection
     // moves to the GPU, so ordinary sampling reads back at most 64 candidates.

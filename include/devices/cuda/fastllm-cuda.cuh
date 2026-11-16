@@ -3011,6 +3011,9 @@ bool FastllmCudaCreateNativeMoeReplayGraph(void *graph, void *const *handles, in
 
 // Host bitset, applied before temperature/top-k/top-p on the calling stream.
 void FastllmCudaApplyTokenMask(float *logits, const uint32_t *mask, int vocab);
+// One host bitset per row; nullptr leaves that row unchanged. Unsupported
+// batch geometry returns false before writing logits.
+bool FastllmCudaApplyTokenMasks(float *logits, const uint32_t *const *masks, int rows, int vocab);
 
 
 // Fused HC read. Unsupported geometry/layout returns false before any write.

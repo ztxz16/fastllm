@@ -226,6 +226,7 @@ namespace fastllm {
     };
 
     void ApplyToolTokenMask(Data &logits, int row, const GenerationConfig &config);
+    void ApplyToolTokenMasks(Data &logits, const std::vector<GenerationConfig> &configs);
 
     struct LastTokensUnit {
         int tot = 0;

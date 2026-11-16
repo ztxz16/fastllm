@@ -2177,8 +2177,8 @@ std::vector<int> NaiveN05FlashModel::SampleCudaLogits(
         temperatures[row] = configs[row].temperature;
         topPs[row] = configs[row].top_p;
         topKs[row] = std::max(1, configs[row].top_k);
-        ApplyToolTokenMask(logits, row, configs[row]);
     }
+    ApplyToolTokenMasks(logits, configs);
     AssertInFastLLM(FastllmCudaTopKTopPSampling((float *)logits.cudaData,
         temperatures.data(), topKs.data(), topPs.data(), tokens.data(), rows, vocab),
         "Naive CUDA top-p sampling failed.");

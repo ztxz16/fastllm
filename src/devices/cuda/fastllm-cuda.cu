@@ -25884,6 +25884,8 @@ bool FastllmCudaGraphAppendChild(const void *child) {
 }
 
 __global__ void FastllmApplyTokenMaskKernel(float *logits, const uint32_t *mask, int vocab) {
+    logits += (size_t)blockIdx.y * vocab;
+    mask += (size_t)blockIdx.y * ((vocab + 31) / 32);
     int token = blockIdx.x * blockDim.x + threadIdx.x;
     if (token < vocab && !(mask[token / 32] & (uint32_t(1) << (token % 32))))
         logits[token] = -CUDART_INF_F;
@@ -25898,6 +25900,27 @@ void FastllmCudaApplyTokenMask(float *logits, const uint32_t *mask, int vocab) {
     FastllmApplyTokenMaskKernel<<<(vocab + 255) / 256, 256, 0, cudaStreamPerThread>>>(
         logits, (const uint32_t *)storage.cudaData, vocab);
     checkCudaErrors("Error applying tool token mask", cudaGetLastError());
+}
+
+bool FastllmCudaApplyTokenMasks(float *logits, const uint32_t *const *masks, int rows, int vocab) {
+    if (rows <= 0 || rows > 65535 || vocab <= 0 || !logits || !masks) return false;
+    struct Workspace { fastllm::Data device{fastllm::INT32}; std::vector<uint32_t> host; };
+    static thread_local std::map<int, Workspace> workspaces;
+    const int device = FastllmCudaGetDevice(), words = (vocab + 31) / 32;
+    auto &w = workspaces[device];
+    w.host.resize((size_t)rows * words);
+    for (int row = 0; row < rows; ++row) {
+        auto *dst = w.host.data() + (size_t)row * words;
+        if (masks[row]) std::memcpy(dst, masks[row], (size_t)words * sizeof(uint32_t));
+        else std::fill(dst, dst + words, UINT32_MAX);
+    }
+    w.device.ToDevice(fastllm::CUDA, {device}, false);
+    w.device.Resize({rows, words}); w.device.Allocate(false);
+    FastllmCudaCopyFromHostToDevice(w.device.cudaData, w.host.data(), w.host.size() * sizeof(uint32_t));
+    FastllmApplyTokenMaskKernel<<<dim3((vocab + 255) / 256, rows), 256, 0, cudaStreamPerThread>>>(
+        logits, (const uint32_t *)w.device.cudaData, vocab);
+    checkCudaErrors("Error applying batched tool token masks", cudaGetLastError());
+    return true;
 }
 
 namespace {

@@ -1686,6 +1686,28 @@ class Fixture : public NaiveN05FlashModel {
     }
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
     void CudaSamplingChecks() {
+        // Exercise partial mask words and mixed masked/unmasked rows without
+        // involving sampling (an empty support is valid for this mask API).
+        {
+            const int rows = 5, vocab = 259;
+            std::vector<float> values(rows * vocab);
+            std::iota(values.begin(), values.end(), 0.0f);
+            std::vector<GenerationConfig> configs(rows);
+            for (int row = 1; row < rows; ++row) {
+                auto mask = std::make_shared<std::vector<uint32_t>>((vocab + 31) / 32, 0);
+                for (int id = 0; id < vocab; ++id)
+                    if (row == 1 || (row == 2 && id == vocab - 1) || (row == 3 && id % 3 == 0))
+                        (*mask)[id / 32] |= uint32_t(1) << (id % 32);
+                configs[row].tool_call_token_mask = mask;
+            }
+            Data cpu(FLOAT32, {rows, vocab}, values), gpu(cpu);
+            gpu.ToDevice(CUDA, {0}, true);
+            ApplyToolTokenMasks(cpu, configs); ApplyToolTokenMasks(gpu, configs);
+            gpu.ToDevice(CPU);
+            for (int i = 0; i < rows * vocab; ++i)
+                if (((float *)cpu.cpuData)[i] != ((float *)gpu.cpuData)[i])
+                    throw std::runtime_error("batched CPU/GPU tool masks differ");
+        }
         // Compare empirical GPU probabilities with the existing CPU sampling
         // oracle, with a different temperature/top-p for each group of rows.
         const int vocab = 256, groups = 6, repeats = 4096;
